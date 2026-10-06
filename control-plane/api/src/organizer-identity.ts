@@ -82,14 +82,39 @@ function rosterEntries(roster: unknown): RosterEntry[] {
     && (normalizeIdentity((e as RosterEntry).name) !== "" || normalizeIdentity((e as RosterEntry).name_en) !== ""));
 }
 
-/** Every way someone might write this traveller's own name. Never the household label alone. */
-function identityForms(entry: RosterEntry): Set<string> {
+/**
+ * The strong forms: this traveller's name(s) exactly as recorded, and name +
+ * family — never a name borrowed from somebody else's longer name. Checked
+ * ahead of `identityForms`'s weaker fallback so an exact match always wins.
+ */
+function primaryIdentityForms(entry: RosterEntry): Set<string> {
   const names = new Set([normalizeIdentity(entry.name), normalizeIdentity(entry.name_en)].filter(Boolean));
   const families = new Set([normalizeIdentity(entry.family), normalizeIdentity(entry.family_en)].filter(Boolean));
   const forms = new Set(names);
   for (const n of names) for (const f of families) forms.add(`${n} ${f}`);
-  for (const n of names) if (n.includes(" ")) forms.add(n.split(" ")[0]!);
   forms.delete("");
+  return forms;
+}
+
+/**
+ * Every way someone might write this traveller's own name, including the
+ * first word of a multi-word name ("Dror" for "Dror Elul") — never the
+ * household label alone.
+ *
+ * That fallback must never be checked AHEAD of another traveller's own,
+ * exact name (`primaryIdentityForms`), or it can make an answer permanently
+ * unsettleable: found live (#321) — a roster holding both "Dana Levi" and a
+ * separate traveller named plainly "Dana". Typing "Dana" matches the second
+ * traveller exactly, but used to be weighed equally against "Dana Levi"'s
+ * first-word fallback, so it stayed ambiguous between them forever — no
+ * typed answer could ever settle it, because the same fallback re-competes
+ * on every attempt. `resolveOrganizer` now tries `primaryIdentityForms`
+ * first and only reaches this fallback when nobody's own name matched.
+ */
+function identityForms(entry: RosterEntry): Set<string> {
+  const names = new Set([normalizeIdentity(entry.name), normalizeIdentity(entry.name_en)].filter(Boolean));
+  const forms = primaryIdentityForms(entry);
+  for (const n of names) if (n.includes(" ")) forms.add(n.split(" ")[0]!);
   return forms;
 }
 
@@ -193,6 +218,7 @@ export function resolveOrganizer(answer: string, roster: unknown): OrganizerMatc
   if (entries.length === 0) return { kind: "no_roster" };
   const candidates = statedNameCandidates(answer);
   if (candidates.length === 0) return { kind: "unmatched" };
+  const primaryForms = entries.map(primaryIdentityForms);
   const forms = entries.map(identityForms);
 
   const decide = (hits: number[]): OrganizerMatch | null => {
@@ -201,15 +227,26 @@ export function resolveOrganizer(answer: string, roster: unknown): OrganizerMatc
     return null;
   };
 
+  // An exact match against someone's own name always wins outright, even if
+  // it would ALSO match another traveller only through that traveller's
+  // weaker first-word fallback (identityForms's doc comment: #321). Only
+  // when nobody's own name matches does the fallback get to decide anything.
   for (const needle of candidates) {
-    const decided = decide(forms.flatMap((f, i) => (f.has(needle) ? [i] : [])));
+    const primaryHits = primaryForms.flatMap((f, i) => (f.has(needle) ? [i] : []));
+    const decided = decide(primaryHits)
+      ?? (primaryHits.length === 0 ? decide(forms.flatMap((f, i) => (f.has(needle) ? [i] : []))) : null);
     if (decided) return decided;
   }
   // Nothing matched as written: the same name in the other alphabet, under the
   // same rule. Reached only after every stricter reading found nobody.
   for (const needle of candidates) {
-    const decided = decide(forms.flatMap((f, i) => ([...f].some((form) => namesSoundAlike(needle, form)) ? [i] : [])));
-    if (decided) return decided;
+    const primaryHits = primaryForms.flatMap((f, i) => ([...f].some((form) => namesSoundAlike(needle, form)) ? [i] : []));
+    const primaryDecided = decide(primaryHits);
+    if (primaryDecided) return primaryDecided;
+    if (primaryHits.length === 0) {
+      const decided = decide(forms.flatMap((f, i) => ([...f].some((form) => namesSoundAlike(needle, form)) ? [i] : [])));
+      if (decided) return decided;
+    }
   }
   return { kind: "unmatched" };
 }

@@ -870,23 +870,13 @@ def _normalize_identity(value: Any) -> str:
     return " ".join(str(value or "").split()).casefold()
 
 
-def _identity_forms(
+def _primary_identity_forms(
     participant: Mapping[str, Any], *aliases: Mapping[str, Any], include_username: bool = True,
 ) -> set[str]:
-    """Every way an organizer might write THIS participant's own name.
-
-    `aliases` carries the raw intake traveler entry for the same person, and
-    is not optional decoration: `_build_participants` SLUGIFIES `family`
-    ("מרגולין" becomes "margolin") and drops `family_en` altogether, so by the
-    time a participant exists the roster no longer holds the household label
-    in the form the organizer actually typed. Matching the transformed
-    participant alone finds "רון margolin" and misses "רון מרגולין" — which is
-    the same bug in a second dimension, found while fixing the first.
-
-    Deliberately excludes the bare family/household label: "מרגולין" names a
-    household of five, not a person, and matching it would pick whichever of
-    them the roster happened to list first — precisely the silent
-    wrong-person failure `_resolve_organizers` exists to avoid.
+    """The strong forms: this participant's own name(s) and name + household,
+    exactly as recorded — never a name borrowed from somebody else's longer
+    name. `_resolve_organizers` checks these ahead of `_identity_forms`'s
+    weaker first-word fallback; see that function's docstring for why (#321).
     """
     sources = (participant, *aliases)
     names = {_normalize_identity(src.get("name")) for src in sources}
@@ -905,19 +895,51 @@ def _identity_forms(
     # mixed-script rosters that happen in practice — a Hebrew given name whose
     # household label was only ever transliterated, or the reverse.
     forms |= {f"{n} {f}" for n in names for f in families}
-    # The GIVEN NAME on its own, taken as the first token of any multi-part
-    # name. Run 14, live: the organizer answered "ניר" and matched nothing,
-    # while "Nir" would have matched — not because English is privileged, but
-    # because `name_en` happens to hold only the given name while `name` holds
-    # the full one. The organizer answered with their own first name, in the
-    # language the entire interview was conducted in, and the companion was
-    # never built.
-    #
-    # Safe to add precisely because ambiguity already fails closed: two
-    # travellers sharing a given name resolve to nobody rather than to whoever
-    # the roster lists first, which is the guarantee `_resolve_organizers`
-    # exists to keep. This widens what can match, never what happens when more
-    # than one does.
+    forms.discard("")
+    return forms
+
+
+def _identity_forms(
+    participant: Mapping[str, Any], *aliases: Mapping[str, Any], include_username: bool = True,
+) -> set[str]:
+    """Every way an organizer might write THIS participant's own name.
+
+    `aliases` carries the raw intake traveler entry for the same person, and
+    is not optional decoration: `_build_participants` SLUGIFIES `family`
+    ("מרגולין" becomes "margolin") and drops `family_en` altogether, so by the
+    time a participant exists the roster no longer holds the household label
+    in the form the organizer actually typed. Matching the transformed
+    participant alone finds "רון margolin" and misses "רון מרגולין" — which is
+    the same bug in a second dimension, found while fixing the first.
+
+    Deliberately excludes the bare family/household label: "מרגולین" names a
+    household of five, not a person, and matching it would pick whichever of
+    them the roster happened to list first — precisely the silent
+    wrong-person failure `_resolve_organizers` exists to avoid.
+
+    Adds, on top of `_primary_identity_forms`, the GIVEN NAME alone, taken as
+    the first token of any multi-part name. Run 14, live: the organizer
+    answered "ניר" and matched nothing, while "Nir" would have matched — not
+    because English is privileged, but because `name_en` happens to hold only
+    the given name while `name` holds the full one. The organizer answered
+    with their own first name, in the language the entire interview was
+    conducted in, and the companion was never built.
+
+    This fallback must never be weighed EQUALLY against another participant's
+    own, exact name. Found live (#321): a roster holding both "Dana Levi" and
+    a separate participant named plainly "Dana". Typing "Dana" matches the
+    second participant's own name exactly, but used to tie against the
+    first's first-word fallback every time — unsettleable by any typed
+    answer, because the same fallback re-competes on every retry.
+    `_resolve_organizers` now tries `_primary_identity_forms` first and only
+    reaches this fallback for a needle nobody's own name matched.
+    """
+    sources = (participant, *aliases)
+    names = {_normalize_identity(src.get("name")) for src in sources}
+    names |= {_normalize_identity(src.get("name_en")) for src in sources}
+    names.discard("")
+
+    forms = _primary_identity_forms(participant, *aliases, include_username=include_username)
     forms |= {n.split(" ", 1)[0] for n in names if " " in n}
     forms.discard("")
     return forms
@@ -1100,7 +1122,9 @@ def _resolve_organizers(data: Mapping[str, Any], participants: list[dict[str, An
             if form:
                 raw_by_name.setdefault(form, entry)
 
+    primary_forms_by_username: dict[str, set[str]] = {}
     forms_by_username: dict[str, set[str]] = {}
+    primary_names_by_username: dict[str, set[str]] = {}
     names_by_username: dict[str, set[str]] = {}
     for participant in participants:
         username = participant.get("username")
@@ -1112,7 +1136,11 @@ def _resolve_organizers(data: Mapping[str, Any], participants: list[dict[str, An
                 raw_by_name.get(_normalize_identity(participant.get("name_en"))),
             ) if raw is not None
         ]
+        primary_forms_by_username.setdefault(username, set()).update(
+            _primary_identity_forms(participant, *aliases))
         forms_by_username.setdefault(username, set()).update(_identity_forms(participant, *aliases))
+        primary_names_by_username.setdefault(username, set()).update(
+            _primary_identity_forms(participant, *aliases, include_username=False))
         names_by_username.setdefault(username, set()).update(
             _identity_forms(participant, *aliases, include_username=False))
 
@@ -1120,7 +1148,19 @@ def _resolve_organizers(data: Mapping[str, Any], participants: list[dict[str, An
     # reading that names exactly ONE traveller wins; a reading that names two
     # ends the search — a looser read must never break a tie a stricter one
     # could not.
+    #
+    # Within "as typed", an exact match against someone's own name
+    # (`_primary_identity_forms`) always wins outright, even if the SAME
+    # needle would also match a different traveller only through that
+    # traveller's weaker first-word fallback — see `_identity_forms`'s
+    # docstring (#321). Only when nobody's own name matches does the
+    # fallback get a turn to decide anything.
     for needle in candidates:
+        primary_matched = [u for u, forms in primary_forms_by_username.items() if needle in forms]
+        if len(primary_matched) == 1:
+            return primary_matched
+        if len(primary_matched) > 1:
+            return []
         matched = [u for u, forms in forms_by_username.items() if needle in forms]
         if len(matched) == 1:
             return matched
@@ -1130,8 +1170,17 @@ def _resolve_organizers(data: Mapping[str, Any], participants: list[dict[str, An
     # Nothing matched as written. The same name in the OTHER alphabet — "ניר"
     # for a roster that only ever spelled it "Nir" — under the same rule: one
     # traveller or nobody. Reached only when every stricter reading found no one,
-    # so it can never break a tie those readings refused.
+    # so it can never break a tie those readings refused. Primary-first here
+    # too, for the same reason as the as-written pass above.
     for needle in candidates:
+        primary_matched = [
+            u for u, names in primary_names_by_username.items()
+            if any(_names_sound_alike(needle, name) for name in names)
+        ]
+        if len(primary_matched) == 1:
+            return primary_matched
+        if len(primary_matched) > 1:
+            return []
         matched = [
             u for u, names in names_by_username.items()
             if any(_names_sound_alike(needle, name) for name in names)
