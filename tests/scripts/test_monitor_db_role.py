@@ -110,10 +110,11 @@ class GrantListMatchesTheCatalogue(unittest.TestCase):
             "grant list: the role reads what the monitor reads and nothing else.")
 
     def test_every_table_fleet_mcp_queries_is_schema_qualified(self):
-        """Otherwise the relation list above could miss one."""
+        """Otherwise the relation list above could miss one. The system catalogs are
+        schema-qualified too, and need no grant: they are not the control plane's tables."""
         source = SERVER.read_text()
         unqualified = [m.group(0) for m in re.finditer(r"\b(?:FROM|JOIN)\s+[A-Za-z_][A-Za-z0-9_.]*", source)
-                       if not re.search(r"\s(?:control_plane|public)\.", m.group(0))]
+                       if not re.search(r"\s(?:control_plane|public|information_schema|pg_catalog)\.", m.group(0))]
         self.assertEqual(unqualified, [],
                          "a fleet-mcp.mjs query names a table without its schema; qualify it so the "
                          "monitor role's drift guard can see it")

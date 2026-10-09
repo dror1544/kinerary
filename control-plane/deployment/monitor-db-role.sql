@@ -86,7 +86,8 @@ control_plane.notification_outbox: updated_at trip_id kind
 control_plane.telegram_chat_bindings: chat_id trip_id hermes_profile created_at closed_at closed_reason
 control_plane.trip_person_links: trip_id role verified_via
 control_plane.trips: id slug lifecycle_state created_at updated_at title destination_label start_date
-control_plane.trips: end_date reachability unreachable_reason reachability_checked_at
+control_plane.trips: end_date reachability unreachable_reason reachability_checked_at suspended_at
+control_plane.verification_evidence: trip_id check_name outcome observed_at
 public.control_plane_schema_migrations: version
 $grants$, false) AS fleet_ro_grants
 \gset
