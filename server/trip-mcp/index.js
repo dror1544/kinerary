@@ -25,7 +25,9 @@ const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
 const { createOAuthStore, redirectAllowed, isLoopbackHost, pkceMatches, authenticateClient, SCOPE, READ_SCOPE } = require('./oauth');
 const { renderAuthorizePage, renderErrorPage, renderConnectorInfoPage } = require('./authorize-page');
+const { renderConfirmationUploadPage } = require('./confirmation-upload-page');
 const { registerTools, buildInstructions } = require('./tools');
+const { readConfirmationPdf } = require('./confirmation-readback');
 const { normalizeOrganizers } = require('../../shared/agent-schema');
 
 
@@ -331,6 +333,16 @@ function registerTripMcp({
       return data;
     };
     return {
+      // Accept a filename only; URL, host, credentials and route are fixed here.
+      getConfirmation: filename => {
+        if (typeof filename !== 'string' || !/^[\p{L}\p{N}][\p{L}\p{N} ._-]{0,254}$/u.test(filename) || filename.includes('..') || filename.endsWith(' ')) {
+          throw new Error('Unsafe confirmation filename. Open the authenticated trip site to view the original.');
+        }
+        const token = jwt.sign({ username }, jwtSecret, { expiresIn: 120 });
+        return readConfirmationPdf(signal => fetch(`${siteBase}/api/bookings/confirmation/${encodeURIComponent(filename)}`, {
+          headers: { authorization: `Bearer ${token}` }, redirect: 'manual', signal,
+        }));
+      },
       get: path => call('GET', path),
       post: (path, body) => call('POST', path, body ?? {}),
       patch: (path, body) => call('PATCH', path, body ?? {}),
@@ -346,7 +358,7 @@ function registerTripMcp({
       { name: 'kinerary-trip', title: tripTitle(), version: '1.0.0' },
       { instructions: (cfg => buildInstructions(cfg, normalizeOrganizers(cfg.agent), { write }))(getPublicConfig()) },
     );
-    registerTools(server, siteClient(req.mcpGrant.username), { write });
+    registerTools(server, siteClient(req.mcpGrant.username), { write, origin });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on('close', () => { transport.close(); server.close(); });
     try {
@@ -356,6 +368,23 @@ function registerTripMcp({
       console.error('[trip-mcp] request failed:', err.message);
       if (!res.headersSent) res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: 'internal error' }, id: null });
     }
+  });
+  // The page itself contains no trip data or credential. A browser sends its
+  // own site session to the established booking routes after loading it.
+  app.get('/mcp/upload-confirmation/:id', noStore, (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isSafeInteger(id) || id < 1 || String(id) !== req.params.id) {
+      return res.status(404).json({ error: 'not_found' });
+    }
+    const nonce = crypto.randomBytes(16).toString('base64');
+    res.set('Content-Security-Policy', [
+      "default-src 'none'", "script-src 'nonce-" + nonce + "'", "style-src 'nonce-" + nonce + "'",
+      "connect-src 'self'", "form-action 'none'", "frame-ancestors 'none'", "base-uri 'none'",
+    ].join('; '));
+    res.set('X-Frame-Options', 'DENY');
+    res.set('X-Content-Type-Options', 'nosniff');
+    res.set('Referrer-Policy', 'no-referrer');
+    res.type('html').send(renderConfirmationUploadPage({ bookingId: id, nonce }));
   });
   app.options('/mcp', cors);
   // A person who opens the address in a browser (or lands on /modern/mcp,

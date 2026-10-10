@@ -4,7 +4,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type pg from "pg";
 import { CodeChallengeMethod, OAuth2Client } from "google-auth-library";
 import { issueEnrollment } from "./enrollment.js";
-import { ensureUnknownPasswordCredential, resolveOrCreateEmailAccount } from "./password-identity.js";
+import { ensureUnknownPasswordCredential, resolveOrCreateEmailAccount, verifyPasswordLogin } from "./password-identity.js";
 import { generatePlan } from "./planner.js";
 import { issueApproval } from "./plan-approval.js";
 
@@ -166,7 +166,7 @@ export class HttpRuntimeAccountAdapter implements RuntimeAccountAdapter {
 
 export interface PortalDependencies {
   db: pg.Pool;
-  google: GoogleOidcAdapter;
+  google?: GoogleOidcAdapter;
   runtimeAccounts: RuntimeAccountAdapter;
   publicOrigin: string;
   runtimeOrigin: string;
@@ -368,7 +368,56 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
     return reply.code(202).send({ accepted: true });
   });
 
+  app.get("/v1/auth/capabilities", async () => ({ google: Boolean(deps.google), emailPassword: true }));
+
+  // Bound both expensive credential checks and limiter memory. Use the socket
+  // peer from Fastify (trustProxy is off), never caller-supplied forwarding.
+  type Attempts = Map<string, { count: number; expiresAt: number }>;
+  const loginAttempts: Attempts = new Map();
+  const accountAttempts: Attempts = new Map();
+  function admitLogin(attempts: Attempts, key: string, limit: number): boolean {
+    const now = Date.now();
+    for (const [storedKey, entry] of attempts) if (entry.expiresAt <= now) attempts.delete(storedKey);
+    const previous = attempts.get(key);
+    if ((previous && previous.count >= limit) || (!previous && attempts.size >= 1024)) return false;
+    attempts.set(key, { count: (previous?.count ?? 0) + 1, expiresAt: previous?.expiresAt ?? now + 60_000 });
+    return true;
+  }
+  app.post("/v1/auth/email-password", async (request, reply) => {
+    if (!admitLogin(loginAttempts, request.ip, 100)) {
+      return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
+    }
+    // A login creates only a session, never an account or a credential.
+    const body = request.body as Record<string, unknown> | null;
+    if (!body || typeof body.email !== "string" || body.email.length > 254 ||
+        typeof body.password !== "string" || body.password.length > 1024) {
+      return reply.code(401).send({ error: "INVALID_CREDENTIALS" });
+    }
+    // Same-origin forms do not require a pre-existing session's CSRF token,
+    // but must not let another origin force the browser into a chosen account.
+    if (request.headers.origin && request.headers.origin !== deps.publicOrigin) {
+      return reply.code(403).send({ error: "ORIGIN_INVALID" });
+    }
+    if (!admitLogin(accountAttempts, sha256(body.email.trim().toLowerCase()), 10)) {
+      return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
+    }
+    const result = await verifyPasswordLogin(deps.db, body);
+    if (!result.ok) return reply.code(401).send({ error: "INVALID_CREDENTIALS" });
+    const client = await deps.db.connect();
+    try {
+      await client.query("BEGIN");
+      const user = await client.query("SELECT id FROM control_plane.users WHERE id = $1 AND status = 'active' FOR SHARE", [result.identity.providerSubjectId]);
+      if (!user.rows[0]) { await client.query("ROLLBACK"); return reply.code(401).send({ error: "INVALID_CREDENTIALS" }); }
+      const session = await createWebSession(client, user.rows[0].id, deps.sessionTtlSeconds);
+      await client.query("COMMIT");
+      setWebSessionCookies(reply, deps, session);
+      return { appPath: validatedReturnTo(body.returnTo) };
+    } catch (error) { await client.query("ROLLBACK"); throw error; }
+    finally { client.release(); }
+  });
+
   app.get("/v1/auth/google/start", async (request, reply) => {
+    if (!deps.google) return reply.code(503).send({ error: "GOOGLE_SIGN_IN_UNAVAILABLE" });
     const query = request.query as Record<string, unknown>;
     const state = base64url(24);
     const nonce = base64url(24);
@@ -383,6 +432,7 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
   });
 
   app.get("/v1/auth/google/callback", async (request, reply) => {
+    if (!deps.google) return reply.code(503).send({ error: "GOOGLE_SIGN_IN_UNAVAILABLE" });
     const query = request.query as Record<string, unknown>;
     if (typeof query.state !== "string" || typeof query.code !== "string") return reply.code(400).send({ error: "AUTH_CALLBACK_INVALID" });
     const client = await deps.db.connect();

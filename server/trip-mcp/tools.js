@@ -30,7 +30,7 @@ const withPeople = rows => {
   return Array.isArray(rows) ? rows.map(one) : one(rows);
 };
 
-function registerTools(mcp, site, { write = true } = {}) {
+function registerTools(mcp, site, { write = true, origin } = {}) {
   const ok = data => ({ content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] });
   // A read-only connection never even lists a write tool: what an assistant
   // cannot see, it cannot be talked into calling.
@@ -70,6 +70,26 @@ function registerTools(mcp, site, { write = true } = {}) {
       type: bookingType.optional(),
     }, ({ phase, type }) => site.get(`/api/bookings${qs({ phase, type })}`));
 
+  // Original file management remains organizer-only even though this is a read.
+  if (write) mcp.registerTool('get_booking_confirmation', {
+    title: 'Retrieve original booking confirmation PDF',
+    description: 'Retrieve the exact linked PDF (up to 5 MiB) with byte count and SHA-256. For larger or unsupported originals, open the authenticated trip site.',
+    annotations: { title: 'Retrieve original booking confirmation PDF', ...READ },
+    inputSchema: z.object({ booking_id: z.number().int().positive().max(Number.MAX_SAFE_INTEGER) }).strict(),
+  }, async ({ booking_id }) => {
+    let bookings;
+    try { bookings = await site.get('/api/bookings'); }
+    catch { throw new Error('Booking confirmation lookup failed. Open the authenticated trip site to view the original.'); }
+    const booking = bookings.find(b => b.id === booking_id);
+    if (!booking) throw new Error('Booking not found on this trip');
+    if (!booking.conf_file) throw new Error('Booking has no linked confirmation. Open the authenticated trip site.');
+    const { bytes, byte_count, sha256 } = await site.getConfirmation(booking.conf_file);
+    return { content: [
+      { type: 'text', text: JSON.stringify({ booking_id, byte_count, sha256 }) },
+      { type: 'resource', resource: { uri: `urn:sha256:${sha256}`, mimeType: 'application/pdf', blob: bytes.toString('base64') } },
+    ] };
+  });
+
   tool('add_booking', 'Add a booking',
     'Record a reservation with its confirmation details. A booking does not put anything on the day-by-day schedule — use add_plan_item ' +
     '(optionally with booking_id) for that.',
@@ -92,6 +112,18 @@ function registerTools(mcp, site, { write = true } = {}) {
       passengers: z.string().optional(), confirmation: z.string().optional(), pin: z.string().optional(),
       cost: z.number().optional(), notes: z.string().optional(), location_url: z.string().url().optional(),
     }, ({ id, ...fields }) => site.patch(`/api/bookings/${id}`, fields));
+
+  tool('get_booking_confirmation_upload_link', 'Upload a booking confirmation PDF',
+    'When this assistant cannot transfer the original PDF bytes, give the organizer this booking-specific link on the trip site. '
+    + 'The link is pending, not proof that a file was uploaded. Ask the organizer to open it while signed into the trip site and '
+    + 'report success only after the page says the saved PDF was verified.',
+    WRITE, { booking_id: z.number().int().positive().describe('Existing booking id from get_bookings') },
+    async ({ booking_id }) => {
+      if (!origin) throw new Error('Trip origin unavailable');
+      const bookings = await site.get('/api/bookings');
+      if (!bookings.some(booking => booking.id === booking_id)) throw new Error('Booking not found on this trip');
+      return { status: 'pending_upload', booking_id, url: origin + '/mcp/upload-confirmation/' + booking_id };
+    });
 
   tool('delete_booking', 'Delete a booking',
     'Delete a booking by id. Confirm with the organizer first.',
