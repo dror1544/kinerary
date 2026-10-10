@@ -509,6 +509,78 @@ class RecordEvidenceTests(unittest.TestCase):
             self.assertEqual(row["deployment_ref"], "rev123")
 
 
+    def test_two_writes_in_one_transaction_order_by_when_they_were_made(self) -> None:
+        """Live finding 2026-10-10: a trip's gate-time `skipped` row and its
+        post-attach `failed` row carried the IDENTICAL observed_at, so "the
+        latest attempt per check" could not tell which was later. now() is
+        the TRANSACTION's start; clock_timestamp() is the moment of the
+        write. Here the connection already holds an open transaction (the
+        first statement below opens it), so record_evidence's own
+        `conn.transaction()` is only a savepoint inside it — exactly the
+        shape that tied."""
+        trip = self.fix["trip_id"]
+        self.conn.execute("SELECT 1")  # open the outer transaction
+        verification.record_evidence(
+            self.conn, trip_id=trip, deployment_ref=None,
+            results=[verification.CheckResult(verification.MCP_ISOLATION, "skipped", "gate time")],
+        )
+        verification.record_evidence(
+            self.conn, trip_id=trip, deployment_ref=None,
+            results=[verification.CheckResult(verification.MCP_ISOLATION, "failed", "after attach")],
+        )
+        rows = self.conn.execute(
+            "SELECT outcome, observed_at FROM control_plane.verification_evidence "
+            "WHERE trip_id = %s ORDER BY observed_at",
+            (trip,),
+        ).fetchall()
+        self.assertEqual([r["outcome"] for r in rows], ["skipped", "failed"])
+        self.assertLess(rows[0]["observed_at"], rows[1]["observed_at"], "the two rows tie on observed_at")
+
+    def test_rows_of_one_call_are_distinct_and_in_result_order(self) -> None:
+        trip = self.fix["trip_id"]
+        verification.record_evidence(
+            self.conn, trip_id=trip, deployment_ref=None,
+            results=[verification.CheckResult(n, "passed", n) for n in ("a", "b", "c")],
+        )
+        rows = self.conn.execute(
+            "SELECT check_name, observed_at FROM control_plane.verification_evidence "
+            "WHERE trip_id = %s ORDER BY observed_at",
+            (trip,),
+        ).fetchall()
+        self.assertEqual([r["check_name"] for r in rows], ["a", "b", "c"])
+        self.assertEqual(len({r["observed_at"] for r in rows}), 3)
+
+    def test_latest_row_per_check_is_the_later_write_in_either_order_of_outcome(self) -> None:
+        """The selection fleet-mcp.mjs uses (`observed_at = max(observed_at)`
+        per trip and check), run against real rows: the post-attach `failed`
+        beats the earlier gate-time `skipped`, and a later `passed` beats an
+        earlier `failed` (a trip that recovered is not an incident)."""
+        trip = self.fix["trip_id"]
+        self.conn.execute("SELECT 1")
+        for check, outcome in (
+            (verification.MCP_ISOLATION, "skipped"), (verification.MCP_ISOLATION, "failed"),
+            (verification.MESSAGING_BINDING, "failed"), (verification.MESSAGING_BINDING, "passed"),
+        ):
+            verification.record_evidence(
+                self.conn, trip_id=trip, deployment_ref=None,
+                results=[verification.CheckResult(check, outcome, f"{check} {outcome}")],
+            )
+        rows = self.conn.execute(
+            """
+            SELECT ve.check_name, ve.outcome FROM control_plane.verification_evidence ve
+             WHERE ve.trip_id = %s
+               AND ve.observed_at = (SELECT max(ve2.observed_at) FROM control_plane.verification_evidence ve2
+                                      WHERE ve2.trip_id = ve.trip_id AND ve2.check_name = ve.check_name)
+             ORDER BY ve.check_name
+            """,
+            (trip,),
+        ).fetchall()
+        self.assertEqual(
+            [(r["check_name"], r["outcome"]) for r in rows],
+            sorted([(verification.MCP_ISOLATION, "failed"), (verification.MESSAGING_BINDING, "passed")]),
+        )
+
+
 @unittest.skipIf(SKIP, "CONTROL_PLANE_TEST_DATABASE_URL not set")
 class GateReadyPrivateTests(unittest.TestCase):
     @classmethod
