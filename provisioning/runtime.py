@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import json
+import ssl
 from typing import Any
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -29,3 +30,15 @@ class HttpJsonTransport:
         except HTTPError as exc:
             body = exc.read().decode(errors="replace")
             raise RuntimeError(f"{method} {path} failed with HTTP {exc.code}: {body[:500]}") from exc
+        except URLError as exc:
+            if isinstance(exc.reason, ssl.SSLCertVerificationError):
+                # The interpreter on PATH has no CA bundle (the python.org build until its
+                # "Install Certificates" step is run). Say so, instead of a bare traceback
+                # from the middle of a teardown or a deploy.
+                raise RuntimeError(
+                    f"{method} {path}: this Python cannot verify TLS certificates ({exc.reason}). "
+                    "It has no CA bundle. Run the script with the interpreter the preflight builds, "
+                    "~/.cache/kinerary-preflight/venv/bin/python, or run the python.org "
+                    "'Install Certificates.command'."
+                ) from exc
+            raise
