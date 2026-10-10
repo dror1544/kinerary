@@ -28,12 +28,12 @@ Most families plan trips in a WhatsApp group. This replaces that chaos with a pr
 | 8 | **Task management** | Pre-trip checklist with deadline badges; server-backed completion state |
 | 9 | **Venue ratings** | 5-star ratings per attraction with per-user chips |
 | 10 | **Venue comments** | Comment threads on any attraction |
-| 11 | **RSVP activities** | Sign up yes/no/maybe for optional activities; live response chips |
+| 11 | **RSVP activities** | Sign up yes/no/maybe for optional activities; live response chips. Cards come from `phases[].rsvp_activities[]` — hand-authored, or derived for a control-plane-provisioned trip from its unconfirmed attractions (see "What to fill in after scaffolding") |
 | 12 | **Photo gallery** | Drag-drop upload with progress; per-phase galleries |
 | 13 | **Immich sync** | Optional: auto-sync photos to self-hosted Immich; share links per phase |
 | 14 | **Photo reactions** | 5 emoji reactions on photos with toggle & counts |
 | 15 | **Photo comments** | Thread comments on any uploaded photo |
-| 16 | **Packing lists** | Per-phase checklists with localStorage persistence |
+| 16 | **Packing lists** | Per-phase checklists with localStorage persistence. A general list (`packing_general`, else a built-in 4-item fallback) plus each phase's `packing[]` — hand-authored, or derived per phase for a control-plane-provisioned trip (see "What to fill in after scaffolding") |
 | 17 | **Budget tracker** | Multi-phase expense breakdown; estimate vs. actual; per-person totals |
 | 18 | **Trivia game** | Real-time multiplayer family trivia via SSE; admin control; leaderboard |
 | 19 | **Booking confirmations** | All reservations with copy-to-clipboard conf codes; inline PDF viewer |
@@ -118,8 +118,8 @@ Everything trip-specific lives in **`trip/trip.config.json`**. The framework cod
     "accommodation": { "name": "Example Hotel", "confirmation": "ABC-123456", "weatherKey": "nyc" },
     "mapStop": { "lat": 40.7128, "lng": -74.006 },
     "venues": [{ "id": "ny-tms", "name": "Times Square", "url": "..." }],
-    "rsvp_activities": [],
-    "packing": []
+    "rsvp_activities": [{ "id": "ny-show", "title": { "he": "...", "en": "Broadway show" }, "date": "2027-03-12" }],
+    "packing": [[{ "he": "ביגוד", "en": "Clothing" }, { "he": "מעיל חם", "en": "Warm jacket" }]]
   }],
   "map": { "center": [38, -98], "zoom": 4, "stops": [] },
   "tasks": [],
@@ -268,6 +268,32 @@ docker compose up -d --build
 **What to fill in after scaffolding:**
 - `phases[].days[]` — day-by-day itinerary (optional, for itinerary display)
 - `phases[].venues[]` — points of interest with Maps/Waze URLs
+- `phases[].packing[]` — `[[{he,en} category, {he,en} item], ...]`. Optional by hand; a
+  control-plane-provisioned trip gets it derived (`transformer._derive_phase_packing`, #162):
+  a small fixed table picked by season bucket. Deterministic — no weather call, no model.
+  **It abstains unless the place and the season are both known** (#167, owner's rule
+  2026-09-25: "if not sure, better not to say anything than be unreasonable"). The gate is
+  `packing_climate.decide()`: only a phase that names a **city** in its table can get a list —
+  a country, region, island or territory never does, and nothing is inherited from the trip's
+  destination (the destination is used only to reject a contradicting phase and to confirm a
+  namesake such as Perth or Naples). The city must have a real winter and summer (no
+  tropical, arid, Mediterranean, monsoon, mild-winter or subpolar climate), and **every month
+  the phase covers** must fall in one season and clear that season's temperature test with a
+  0.5 °C margin; a phase that spans a season boundary, or names two places that disagree,
+  abstains. Abstaining means the `packing` key is absent, both sites fall back to the trip's
+  general list, and the transformer logs `transformer.packing_abstained` with a machine-readable
+  reason (`packing_climate.REASONS`; the worker's log format currently drops that `extra=`, so
+  the log shows that a phase abstained but not why — tracked in #201). The climate table (Köppen type and monthly means per
+  city) is recalled from published tables, not read from a dataset — source-checking its
+  borderline months is open in #201. Summer lists for non-temperate cities in their good
+  months, and a geocoder-latitude fallback (#188), are not built. The trip-level
+  `packing_general` is separate and keeps its own frontend fallback.
+- `phases[].rsvp_activities[]` — `{id, title, desc?, date?}` vote cards. Optional by hand; a
+  control-plane-provisioned trip gets them derived (`transformer.derive_rsvp_activities`,
+  #169) from its **unconfirmed** attraction-typed `travel_anchors` — a confirmed attraction is
+  already happening, so it is a Bookings row only. The id is a stable hash of what the anchor
+  is, because it is the vote's primary key in `rsvps`. Key absent, not `[]`, when a phase has none.
+  What was cut, and why: [`docs/sprint6-tracks.md`](docs/sprint6-tracks.md) Track 1a items 3–4.
 - `budget.seed_items[]` — initial budget estimates
 - `tasks[]` — pre-trip task list with deadlines
 - `bookings` — confirmed reservations with confirmation codes
@@ -280,9 +306,14 @@ docker compose up -d --build
   in trivia. Add a real photo anytime via the site's own upload/crop flow.
 - `travel_info.countries` — emergency numbers, currency, calling code per destination country.
   Don't hand-write these either: `node scripts/country-info.js "Japan"` fetches them live (free,
-  no API key). `travel_info.health`/`hospitals`/`money`/`communication`/`age_notes` are freeform
-  bilingual lists you fill in yourself — not automatable, and all optional (the Info tab hides
-  each block when its list is empty). See "Country Info" below for the full shape.
+  no API key). `travel_info.health`/`money`/`communication` fill automatically for a
+  control-plane-provisioned trip (`enrichment._enrich_destination_info`, sprint 6.1,
+  deterministic where an API answers, model-sourced and cached cross-trip at the gaps) —
+  this manual quickstart path still has no equivalent, so for a hand-scaffolded trip they
+  remain freeform bilingual lists you fill in yourself. `hospitals`/`age_notes` are excluded
+  by decision on both paths (no reliable deterministic source) and stay empty. All are
+  optional (the Info tab hides each block when its list is empty). See "Country Info" below
+  for the full shape.
 
 ---
 
@@ -451,9 +482,58 @@ hasn't been connected to any username yet — the response is meant to prompt
 
 ### Security Model
 - JWT tokens (30-day expiry); `authRequired` middleware on all private routes
-- Guest endpoints: lost & found form, photo file downloads, public trivia TV view
+- Guest endpoints (no login): the lost & found form (`POST /api/lost-found` — no rate limit, #207), the
+  public trivia TV view and its SSE stream, `GET /api/trip/logo`, `GET /api/config/roster`, and the
+  `/photo/:id?s=` share page (below). Everything else in the gallery and social surface needs a login
+  (#191, #194).
+- **Gallery and social routes need a login, and one member sees only a projection of another** (#191,
+  #194, PR #211). `/api/photos`, `/api/ratings`, `/api/reactions[/:id]`, `/api/comments/venue|photo[...]`,
+  `/api/rsvps/:id`, `/api/tasks/done` and `/api/album-share/:phase` sit behind `authRequired` — so a
+  member's JWT, the agent key or a gateway-injected session, **not** an organizer check. Anything that
+  attaches another member to a record goes through `publicUser()` (`server/public-user.js`), an
+  **allow-list** of `username`, `name`, `name_en`, `color`, `avatar_file`; a `users` column nobody names
+  there (Telegram id, Google email/sub, age, family) is never attached, whatever is added to the table
+  later. `getUser()` (the whole row minus the password hash) is for a caller's own record
+  (`/api/auth/me`) only. By design `/api/config` still gives every signed-in member `age` and `family`,
+  because the config allow-list names them (#172); that is a separate decision from `publicUser`.
+  The anonymous trivia stream's `players` are built without `family`.
+- **Photo files and share links are HMAC capabilities, not sessions** (`server/file-token.js`). Both keys
+  are derived from `JWT_SECRET` under separate labels (`kinerary:photo-file:v1`, `kinerary:photo-share:v1`),
+  so neither signature can be replayed as the other or as anything else keyed by that secret; no new
+  secret exists.
+  - *File link* — the authenticated `/api/photos` listing (and the upload response) hands out
+    `/api/photos/file/<name>?exp=&sig=` per photo, valid one hour, because an `<img>` cannot send a
+    bearer token. A missing, malformed, expired or wrong link **falls back to `authRequired`** rather than
+    being served or hard-refused itself, so a gallery left open past the hour keeps working behind the
+    gateway, which injects the session on every request; with no other credential it is a 401.
+  - *Share link* — `/photo/<id>?s=<hmac of the id>` (Facebook's crawler has no login) does **not expire**
+    and works for anyone holding it; unknown id, no signature, and a bad one all answer the same 404. Only
+    the authenticated listing hands one out. Owner decision, 2026-09-25: the link is open to everyone in
+    the group. The page's own image URL is a freshly signed one-hour file link, and its metadata is
+    HTML-escaped.
+  - **Rotating `JWT_SECRET` revokes every outstanding file and share link and logs every member out.** It does **not** revoke trip-connector (MCP) connections: their tokens are random and stored hashed, not signed with it. An organizer disconnects them from the site's connections list.
+- **Uploads and served files cannot run script.** `/api/photos/upload` accepts only
+  `jpg/jpeg/png/gif/webp/heic/heif` with an `image/*` type (SVG and HTML are refused, 400
+  `unsupported_file_type`) and stores it under a server-built name (timestamp, random, allow-listed
+  extension) — never a fragment of the uploader's filename. The file route serves only a bare filename
+  that still resolves inside the uploads directory after symlinks, with `nosniff`, `Content-Security-Policy:
+  sandbox`, and `application/octet-stream` for any active-content extension (older stored files may
+  carry those names). `/api/trip/logo` stays public (the login page draws it) but serves only an image
+  extension (`png jpg jpeg gif svg webp`) whose real path is inside the trip directory, with `nosniff`
+  and, for SVG, `sandbox`.
 - Admin: `meta.admin` in `trip.config.json` (falls back to the first participant if unset); controls trivia start/reveal/reset
 - Passwords: bcrypt-hashed; PIN codes for hotel check-in (served from config, never stored in DB)
+- **Trip config is served through an allow-list** (#172): `/api/config`, `/api/config/versions/:version`,
+  the public `/api/config/roster`, `/api/hermes/status`, the plan importers and the served itinerary all
+  project `trip.config.json` through `shared/config-visibility.js` (engine: `shared/allow-list.js`).
+  Being signed in is not a reason to see a field; being on the list is. A field the list does not
+  name is **withheld silently, on purpose** — a deny-list serves every field added after it was
+  written, which is how #172 leaked. The only signals are the server log at boot (the dropped
+  *paths*, never values) and `GET /api/config/warnings`, which carries a **count only**, because a key
+  name is itself authored config text. A new field a producer writes must be added to the list
+  (`tests/config-allow-list.test.js` fails until it is); an organizer-only field belongs in
+  `GET /api/agent/brief`. Redeploying an existing trip can hide fields it shows today — run
+  `projectConfig` on its config and read the boot log first (#200).
 - Google Sign-In (optional): ID tokens verified against Google's public keys via `google-auth-library`, no server-side secret; binds to `users.google_sub`, unique per username
 - Trip connector (optional, `server/trip-mcp/`): OAuth 2.1 with PKCE, dynamic registration limited to the hosted assistants' callbacks and loopback; opaque, hashed, revocable tokens that are never site sessions (and site sessions are never MCP tokens); anyone on the trip, read-only unless an organizer approved, re-checked on every call
 

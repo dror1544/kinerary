@@ -10,7 +10,7 @@ import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { PORTS } from './helpers/ports.js';
 import { spawn } from 'child_process';
-import { mkdtempSync, rmSync, cpSync, readFileSync } from 'fs';
+import { mkdtempSync, rmSync, cpSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -95,6 +95,40 @@ describe('POST /api/agent/participants + POST /api/auth/enroll', () => {
     const res = await api('/api/agent/participants', { method: 'POST', apiKey: AGENT_KEY, body: { username: 'dana' } });
     assert.equal(res.status, 400);
     assert.equal((await res.json()).error, 'missing_fields');
+  });
+
+  // #213: color reaches an unescaped inline style attribute on the classic
+  // client (RSVP chip, reaction tooltip, pg-avatar/vc-avatar) — refusing a
+  // non-hex value here means the API never writes a row that a renderer
+  // would later have to defend against.
+  test('rejects a color that is not a hex value — no row written', async () => {
+    const res = await api('/api/agent/participants', {
+      method: 'POST', apiKey: AGENT_KEY,
+      body: { username: 'xss-color', name: 'X', color: 'red;" onmouseover="alert(3)' },
+    });
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).error, 'invalid_color');
+
+    const cfg = JSON.parse(readFileSync(join(tripDir, 'trip.config.json'), 'utf8'));
+    assert.ok(!cfg.participants.some(p => p.username === 'xss-color'), 'the refused create must not have written a row');
+    const login = await api('/api/auth/login', { method: 'POST', body: { username: 'xss-color', password: '1234' } });
+    assert.equal(login.status, 401, 'no user row should have been inserted either');
+  });
+
+  test('accepts a well-formed short hex color', async () => {
+    const res = await api('/api/agent/participants', {
+      method: 'POST', apiKey: AGENT_KEY,
+      body: { username: 'hex-short', name: 'Hex', color: '#abc' },
+    });
+    assert.equal(res.status, 200);
+  });
+
+  test('a missing color is still allowed (optional field)', async () => {
+    const res = await api('/api/agent/participants', {
+      method: 'POST', apiKey: AGENT_KEY,
+      body: { username: 'no-color', name: 'No Color' },
+    });
+    assert.equal(res.status, 200);
   });
 
   test('organizer JWT adds a password-only participant and returns an enrollment token', async () => {
@@ -307,6 +341,115 @@ describe('POST /api/agent/participants + POST /api/auth/enroll', () => {
     assert.equal((await organizerRemoval.json()).error, 'cannot_remove_organizer');
   });
 
+  // #184 — the agent key alone must never be able to take over the
+  // organizer's account. Before this fix: the exact PoC from the issue
+  // (reset-password on the organizer via X-API-Key alone, redeem the token
+  // through /api/auth/enroll with no session, then log in as the organizer)
+  // returned 200 at every step. These prove it is now refused end to end,
+  // while the organizer's own session and ordinary-participant resets keep
+  // working.
+  test('#184: the agent key alone cannot reset the organizer\'s own credential', async () => {
+    const res = await api('/api/agent/participants/alice/reset-password', { method: 'POST', apiKey: AGENT_KEY });
+    assert.equal(res.status, 403);
+    assert.equal((await res.json()).error, 'organizer_credential_not_agent_resettable');
+    // And the refused call must not have minted a redeemable token at all —
+    // this proves there is no side door: a 403 response with a token
+    // silently attached would still be a takeover.
+    assert.equal((await api('/api/auth/login', { method: 'POST', body: { username: 'alice', password: '1234' } })).status, 200,
+      'the organizer\'s real password must still work — the refused call changed nothing');
+  });
+
+  test('#184: the same reset-password call still works for an ordinary participant via the agent key', async () => {
+    // Decision (#184 point 4): the companion legitimately resets an ordinary
+    // participant's forgotten password on the organizer's behalf — see
+    // "reset-password works for a Telegram-bound participant too" above. The
+    // organizer exclusion must not have broken that.
+    const reset = await api('/api/agent/participants/dana/reset-password', { method: 'POST', apiKey: AGENT_KEY });
+    assert.equal(reset.status, 200);
+    const { enrollment_token } = await reset.json();
+    assert.ok(typeof enrollment_token === 'string' && enrollment_token.length > 20);
+  });
+
+  test('#184: the organizer can still reset their OWN credential through their own session', async () => {
+    const reset = await api('/api/agent/participants/alice/reset-password', { method: 'POST', token: aliceToken });
+    assert.equal(reset.status, 200);
+    const { enrollment_token } = await reset.json();
+    const enroll = await api('/api/auth/enroll', { method: 'POST', body: { token: enrollment_token, password: 'alices-own-new-password' } });
+    assert.equal(enroll.status, 200);
+    const loginRes = await api('/api/auth/login', { method: 'POST', body: { username: 'alice', password: 'alices-own-new-password' } });
+    assert.equal(loginRes.status, 200, 'the organizer resetting themselves through their own session must still work');
+    // Restore, so later tests in this file that assume alice/1234 still hold.
+    const restore = await api('/api/agent/participants/alice/reset-password', { method: 'POST', token: aliceToken, body: { to: 'trip_password' } });
+    assert.equal(restore.status, 200);
+  });
+
+  test('#184: the "to: trip_password" branch is refused for the organizer through the agent key too', async () => {
+    const res = await api('/api/agent/participants/alice/reset-password', { method: 'POST', apiKey: AGENT_KEY, body: { to: 'trip_password' } });
+    assert.equal(res.status, 403);
+    assert.equal((await res.json()).error, 'organizer_credential_not_agent_resettable');
+  });
+
+  test('#184: the agent key alone cannot rebind the organizer\'s Telegram identity', async () => {
+    const res = await api('/api/agent/participants/alice/telegram', { method: 'PATCH', apiKey: AGENT_KEY, body: { telegram_id: '999888777' } });
+    assert.equal(res.status, 403);
+    assert.equal((await res.json()).error, 'organizer_credential_not_agent_resettable');
+  });
+
+  test('#184: the organizer can still rebind their OWN Telegram identity through their own session', async () => {
+    const res = await api('/api/agent/participants/alice/telegram', { method: 'PATCH', token: aliceToken, body: { telegram_id: '999888777' } });
+    assert.equal(res.status, 200);
+    const cfg = JSON.parse(readFileSync(join(tripDir, 'trip.config.json'), 'utf8'));
+    assert.equal(cfg.participants.find(p => p.username === 'alice').telegram_id, '999888777');
+  });
+
+  test('#184: rebinding an ordinary participant\'s Telegram id via the agent key still works', async () => {
+    const res = await api('/api/agent/participants/noa/telegram', { method: 'PATCH', apiKey: AGENT_KEY, body: { telegram_id: '444333222' } });
+    // noa may or may not exist depending on test order in this file (an
+    // earlier duplicate-telegram_id test used the username 'noa' without
+    // creating it); either 404 (unknown username, same as before this fix)
+    // or 200 is acceptable here — the point is it is never 403.
+    assert.notEqual(res.status, 403);
+  });
+
+  test('#184: an old/wrong-value agent key is refused on an agent route, same as a missing one — no grace period', async () => {
+    const wrongValue = await api('/api/agent/participants', { method: 'POST', apiKey: 'not-the-real-key-at-all', body: { username: 'z', name: 'Z' } });
+    assert.equal(wrongValue.status, 401);
+    // Wrong-length key exercises the branch that a naive `Buffer.byteLength`
+    // early-return could special-case — must land on the same 401, not throw.
+    const wrongLength = await api('/api/agent/participants', { method: 'POST', apiKey: AGENT_KEY + AGENT_KEY, body: { username: 'z', name: 'Z' } });
+    assert.equal(wrongLength.status, 401);
+    const tooShort = await api('/api/agent/participants', { method: 'POST', apiKey: 'x', body: { username: 'z', name: 'Z' } });
+    assert.equal(tooShort.status, 401);
+    // The real key still works — proves the comparison itself, not just the
+    // rejection path, survived the rewrite.
+    const real = await api('/api/agent/participants', { method: 'POST', apiKey: AGENT_KEY, body: { username: 'z', name: 'Z' } });
+    assert.equal(real.status, 200);
+  });
+
+  test('#184: planted-backdoor scenario from the issue — blocked for the organizer, still available for an ordinary username', async () => {
+    // The exact chain from the issue's PoC, replayed against the organizer
+    // username specifically: reset -> enroll (no session) -> login as the
+    // organizer. Every step must fail to produce organizer access.
+    const reset = await api('/api/agent/participants/alice/reset-password', { method: 'POST', apiKey: AGENT_KEY });
+    assert.equal(reset.status, 403);
+    assert.equal(reset.headers.get('content-type')?.includes('json'), true);
+
+    // No enrollment_token was ever minted for alice by this call, so there is
+    // nothing for an attacker to redeem — confirm no stray token exists by
+    // checking the response body carries none.
+    const body = await reset.json();
+    assert.equal(body.enrollment_token, undefined);
+
+    // The same mechanism against an ORDINARY username remains the supported,
+    // legitimate "planted participant" path (organizer relays it through the
+    // companion) and must still complete end to end.
+    const create = await api('/api/agent/participants', {
+      method: 'POST', apiKey: AGENT_KEY, body: { username: 'mallory', name: 'Mallory', telegram_id: '111222333' },
+    });
+    assert.equal(create.status, 200);
+    assert.equal((await create.json()).telegram_bound, true);
+  });
+
   test('DELETE removes a participant from the roster and revokes their access', async () => {
     const created = await api('/api/agent/participants', { method: 'POST', apiKey: AGENT_KEY, body: { username: 'remove-me', name: 'Remove Me', telegram_id: '888000111' } });
     assert.equal(created.status, 200);
@@ -330,5 +473,145 @@ describe('POST /api/agent/participants + POST /api/auth/enroll', () => {
     // not reassigned, so it's now free for someone else to bind instead.
     const rebind = await api('/api/agent/participants/dana/telegram', { method: 'PATCH', apiKey: AGENT_KEY, body: { telegram_id: '888000111' } });
     assert.equal(rebind.status, 200, 'the removed participant\'s telegram_id should be free to rebind elsewhere');
+  });
+
+  // #279 — DELETE scrambles the password and clears telegram_id but, until
+  // this fix, left the users row itself in place. reset-password only ever
+  // checked "does a row exist", which a removed user's row still does, so the
+  // agent key alone could fully revive a removed family member: delete them,
+  // reset-password, redeem the token via /api/auth/enroll (no session
+  // needed), then log in as them — exactly as if the delete had never
+  // happened. This replays that live sequence end to end and asserts the
+  // revival is refused at reset-password, the one route that was actually
+  // reachable (POST /api/agent/participants is already blocked earlier, by
+  // username_taken, since DELETE never removes the row).
+  test('#279: the agent key cannot revive a removed participant via reset-password', async () => {
+    const created = await api('/api/agent/participants', {
+      method: 'POST', apiKey: AGENT_KEY, body: { username: 'erin', name: 'Erin' },
+    });
+    assert.equal(created.status, 200);
+    const { enrollment_token: firstToken } = await created.json();
+    await api('/api/auth/enroll', { method: 'POST', body: { token: firstToken, password: 'erins-first-password' } });
+    assert.equal((await api('/api/auth/login', { method: 'POST', body: { username: 'erin', password: 'erins-first-password' } })).status, 200,
+      'sanity: erin can log in before removal');
+
+    const removed = await api('/api/agent/participants/erin', { method: 'DELETE', apiKey: AGENT_KEY });
+    assert.equal(removed.status, 200);
+
+    // The actual live attack: agent key alone, no organizer session, no
+    // re-creation — straight to reset-password on the now-removed username.
+    const revive = await api('/api/agent/participants/erin/reset-password', { method: 'POST', apiKey: AGENT_KEY });
+    assert.equal(revive.status, 409);
+    const reviveBody = await revive.json();
+    assert.equal(reviveBody.error, 'participant_removed');
+    // No side door: the refused call must not have minted a redeemable token.
+    assert.equal(reviveBody.enrollment_token, undefined, 'a refused reset must not leak a redeemable token');
+
+    // And the `to: trip_password` branch is refused the same way.
+    const reviveTripPassword = await api('/api/agent/participants/erin/reset-password', {
+      method: 'POST', apiKey: AGENT_KEY, body: { to: 'trip_password' },
+    });
+    assert.equal(reviveTripPassword.status, 409);
+    assert.equal((await reviveTripPassword.json()).error, 'participant_removed');
+
+    // erin genuinely cannot log in any more — not with the old password, not
+    // with the trip password, and (since no token was ever minted) not via
+    // any enrollment redemption either.
+    assert.equal((await api('/api/auth/login', { method: 'POST', body: { username: 'erin', password: 'erins-first-password' } })).status, 401);
+    assert.equal((await api('/api/auth/login', { method: 'POST', body: { username: 'erin', password: '1234' } })).status, 401);
+  });
+
+  // #279, companion case: an organizer's own JWT session must not revive a
+  // removed participant either — removal is meant to be permanent short of
+  // re-provisioning under a fresh username, not something either caller can
+  // undo through this route.
+  test('#279: an organizer\'s own session cannot revive a removed participant either', async () => {
+    const created = await api('/api/agent/participants', {
+      method: 'POST', apiKey: AGENT_KEY, body: { username: 'frank', name: 'Frank' },
+    });
+    assert.equal(created.status, 200);
+    const removed = await api('/api/agent/participants/frank', { method: 'DELETE', token: aliceToken });
+    assert.equal(removed.status, 200);
+
+    const revive = await api('/api/agent/participants/frank/reset-password', { method: 'POST', token: aliceToken });
+    assert.equal(revive.status, 409);
+    assert.equal((await revive.json()).error, 'participant_removed');
+  });
+});
+
+// #184, finding A (boundary review on PR #274): trip.config.json's
+// agent.organizers can name a username with no seeded participant row —
+// not reachable through normal provisioning (`_resolve_organizers` and
+// driver.mjs both refuse to produce that), but a hand-built or legacy config
+// can. Self-contained (own port, own fixture copy with an unseeded organizer
+// name) rather than mutating the shared single-organizer fixture the describe
+// block above depends on.
+describe('POST /api/agent/participants — cannot create an organizer account (#184, finding A)', () => {
+  let dataDir, tripDir, proc;
+  const AGENT_KEY = 'test-hermes-key';
+  const PORT2 = PORTS.agentParticipantsGhostOrganizer;
+
+  function api2(path, { method = 'GET', body, apiKey } = {}) {
+    const headers = {};
+    if (apiKey) headers['X-API-Key'] = apiKey;
+    if (body != null) headers['Content-Type'] = 'application/json';
+    return fetch(`http://localhost:${PORT2}${path}`, { method, headers, body: body != null ? JSON.stringify(body) : undefined });
+  }
+
+  before(async () => {
+    dataDir = mkdtempSync(join(tmpdir(), 'trip-ghost-organizer-data-'));
+    tripDir = mkdtempSync(join(tmpdir(), 'trip-ghost-organizer-trip-'));
+    cpSync(FIXTURES_DIR, tripDir, { recursive: true });
+
+    const cfgPath = join(tripDir, 'trip.config.json');
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'));
+    // 'ghost' is listed as an organizer but has no participant/user row —
+    // exactly the precondition the boundary review reproduced live.
+    delete cfg.agent.organizer;
+    cfg.agent.organizers = ['alice', 'ghost'];
+    writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
+
+    proc = spawn('node', [SERVER_JS], {
+      cwd: SERVER_DIR,
+      env: {
+        ...process.env, PORT: String(PORT2), TRIP_DIR: tripDir, DATA_DIR: dataDir,
+        AVATARS_DIR: join(dataDir, 'avatars'), JWT_SECRET: 'test-secret-000',
+        IMMICH_URL: '', IMMICH_API_KEY: '', HERMES_API_KEY: AGENT_KEY, SEED_PASSWORD: '1234',
+      },
+    });
+    await waitForServer(proc);
+  });
+
+  after(async () => {
+    await stop(proc);
+    rmSync(dataDir, { recursive: true, force: true });
+    rmSync(tripDir, { recursive: true, force: true });
+  });
+
+  test('the agent key cannot create a participant named after an unseeded organizer', async () => {
+    const res = await api2('/api/agent/participants', { method: 'POST', apiKey: AGENT_KEY, body: { username: 'ghost', name: 'Ghost' } });
+    assert.equal(res.status, 403);
+    assert.equal((await res.json()).error, 'organizer_credential_not_agent_resettable');
+  });
+
+  test('...and no ghost user row was created at all — login fails, not just reset-password', async () => {
+    const res = await api2('/api/auth/login', { method: 'POST', body: { username: 'ghost', password: '1234' } });
+    assert.equal(res.status, 401, 'there must be no half-created ghost account to log into');
+  });
+
+  test('the same trip.config.json cannot be used to bootstrap the takeover chain either', async () => {
+    // Replays the reviewer's live reproduction end to end and confirms every
+    // step of it now fails: create ghost -> enroll -> log in as ghost ->
+    // use ghost's JWT to reset a real participant's password.
+    const create = await api2('/api/agent/participants', { method: 'POST', apiKey: AGENT_KEY, body: { username: 'ghost', name: 'Ghost' } });
+    assert.equal(create.status, 403);
+    const body = await create.json();
+    assert.equal(body.enrollment_token, undefined, 'a refused create must not leak a redeemable token');
+  });
+
+  test('an ordinary (non-organizer) username is unaffected — the agent key can still create a normal participant', async () => {
+    const res = await api2('/api/agent/participants', { method: 'POST', apiKey: AGENT_KEY, body: { username: 'dana', name: 'Dana' } });
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).telegram_bound, false);
   });
 });

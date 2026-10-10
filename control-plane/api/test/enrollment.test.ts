@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { issueEnrollment, verifyEnrollmentToken, consumeEnrollmentInTx } from "../src/enrollment.js";
 import { applyMigrations } from "../src/migrations.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const DB_URL = testDatabaseUrl();
 const SKIP = !DB_URL;
@@ -66,6 +66,7 @@ async function teardownFixture(fixture: TestFixture) {
   await pool.query("DELETE FROM control_plane.interview_enrollments WHERE trip_id = ANY($1)", [[draftTripId, otherTripId]]);
   await pool.query("DELETE FROM control_plane.trip_memberships WHERE trip_id = ANY($1)", [[draftTripId, otherTripId]]);
   await pool.query("DELETE FROM control_plane.trips WHERE id = ANY($1)", [[draftTripId, otherTripId]]);
+  await pool.query("DELETE FROM control_plane.telegram_organizer_links WHERE user_id = ANY($1)", [[ownerId, nonOwnerId]]);
   await pool.query("DELETE FROM control_plane.user_identities WHERE user_id = ANY($1)", [[ownerId, nonOwnerId]]);
   await pool.query("DELETE FROM control_plane.users WHERE id = ANY($1)", [[ownerId, nonOwnerId]]);
 }
@@ -77,7 +78,7 @@ describe("enrollment", () => {
 
   before(async () => {
     if (SKIP) return;
-    pool = new pg.Pool({ connectionString: DB_URL, max: 3 });
+    pool = testPool({ max: 3 });
     await runMigrations(pool);
   });
 

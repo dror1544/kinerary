@@ -1,6 +1,17 @@
 # Per-trip gateway processes — the companion runtime architecture
 
-**Status: proposed architecture, not yet implemented.** Written 2026-09-06.
+**Status (checked against the tree 2026-09-25): implemented — one Hermes
+gateway process per trip; multiplexing is retained only as a rejected
+alternative** (`hermes-multiplex-execution-boundary.md`). Provisioning starts
+each trip's gateway with `hermes_cli.main --profile <name> gateway run
+--replace` (`scripts/companion-install-host.sh`); the relay routes by gateway id
+(`control-plane/api/src/relay/connector.ts`) and answers `COMPANION_PENDING`
+when a trip's gateway has no socket (`relay/normalize.ts`). **Not fully
+finished:** the optional transitional fallback for a still-multiplexing gateway
+(`relay.multiplex_gateway_id` / `fallbackGatewayId`, `config.ts`,
+`connector.ts`) is still in the code, and §11 step 6 ("delete the multiplex
+path") is not marked built; whether any deployment still sets that key is
+unchecked. §11 steps 3 and 4 carry no BUILT mark either. Written 2026-09-06.
 
 Supersedes §4 of `hermes-multiplex-execution-boundary.md` (per-profile MCP
 inside one multiplexed gateway). That analysis stays where it is, and stays
@@ -279,7 +290,23 @@ The vocabulary already exists and already fits. `normalize.ts:110`:
 |---|---|---|
 | Chat has no trip binding | `UNROUTED` | `strings.unbound` |
 | Binding exists, no companion profile | `COMPANION_PENDING` | `strings.companionPending` |
-| Profile exists, **gateway not connected** | `COMPANION_PENDING` | `strings.companionPending` |
+| Profile exists, **gateway not connected**, assistant never announced as up | `COMPANION_PENDING` | `strings.companionPending` ("still finishing your assistant") |
+| Profile exists, **gateway not connected**, assistant announced as up (an outage) | `COMPANION_PENDING` | a private chat: `companionUnavailable` ("I'm off for now — hoping to be back soon", English or Hebrew). A group: silence unless the message addresses the assistant, then the same line at most once per chat per ten minutes (`OutageNoticeLimiter`); a limited message is `ignore` with reason `COMPANION_UNAVAILABLE_NOTICE_LIMITED` |
+
+**Amended 2026-09-25 (#179, PR #215).** Originally the third row above was one
+row and said `companionPending` to everyone, which told a family talking among
+themselves "I'm still finishing your assistant" for the whole of an outage.
+`dispatch.ts` now tells the two cases apart by whether the organizer's
+`companion_ready` message was ever delivered for the trip
+(`notification_outbox`, `sent_at` set) — the router's own record that the
+assistant was announced. Without it a profile is merely stamped, and a
+first-time organizer must not hear "I'm off for now" about an assistant that has
+not come up. A trip that predates that message keeps the honest first-install
+wording during an outage, which is the safe direction. The limiter is in the
+relay process's memory, bounded to 1000 chats, and a relay restart forgets it
+(a table for a courtesy was rejected); it is a small object with one question so
+that #187 (tell the organizer once per outage, recover, escalate) can replace it
+without touching the router. #179 stays open: only this core is built.
 
 The third row is the new one, and it needs no new code path.
 `normalize.ts:276` already returns `COMPANION_PENDING` on

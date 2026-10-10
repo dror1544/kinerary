@@ -201,15 +201,25 @@ three `location` blocks added (copy them from `provisioning/adapters.py`).
   and the person's current role: an organizer who is demoted drops to read
   only, a member who is promoted stays read only until they approve again, and
   someone removed from the trip loses the connection. A read-only connection is
-  never offered a write tool or the organizer briefing.
-- Other people reach the assistant as username, name and colour only: the
-  connector strips Telegram ids, ages and emails from RSVP and comment rows,
-  whatever the underlying route returns.
+  never offered a write tool or the organizer briefing. The narrowing is applied
+  when the connection is next used: one that was not used while its organizer
+  was demoted keeps its stored write scope, so it writes again if they are
+  promoted back.
+- An assistant sees what the site shows the person who connected, and no more.
+  In RSVP and comment rows other people appear as username, name and colour
+  only: the connector strips Telegram ids, ages and emails there, whatever the
+  underlying route returns. In `get_config`, the lost-and-found list and the
+  bookings they appear exactly as on the site, which includes participants'
+  ages, families and group-visible needs, emergency-contact and accommodation
+  phone numbers, and a lost-and-found reporter's name and phone (the reporter
+  need not be on the trip). No tool returns another person's Telegram id or
+  Google email (checked on the sprint-6 tree, 2026-09-26).
 - Tokens are opaque and stored hashed. An MCP token is not a site session and a
   site session is not an MCP token.
-- Tools call the site's own routes **as the organizer** (a two-minute session
-  minted per call, over loopback), never with the agent key. Every route's own
-  checks apply and every change is recorded under the organizer's name.
+- Tools call the site's own routes **as the person who connected** (a
+  two-minute session minted per call, over loopback), never with the agent key.
+  Every route's own checks apply and every change is recorded under that
+  person's name.
 - The tool set is narrower than `mcp.js`: no companion-channel tools, no
   password resets, login links or Telegram bindings (`add_participant` drops
   the enrollment token; the organizer sends the link from the site), nothing

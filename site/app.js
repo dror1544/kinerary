@@ -143,12 +143,18 @@ function renderTaskDeadlines(lang) {
   });
 }
 
+// The social/gallery reads need a login (issues #191/#194): every one of them
+// goes through here so the bearer token travels with it.
+function authGet(url) {
+  return fetch(url, { headers: { Authorization: `Bearer ${localStorage.getItem('trip-token')}` } });
+}
+
 // ── TASK DONE ─────────────────────────────────────────────────────────────────
 let taskDoneCache = {};
 
 async function loadTaskDone() {
   try {
-    const res = await fetch('/api/tasks/done');
+    const res = await authGet('/api/tasks/done');
     const rows = await res.json();
     taskDoneCache = {};
     rows.forEach(r => { taskDoneCache[r.task_id] = r; });
@@ -1515,7 +1521,7 @@ let allRatings = {};
 
 async function loadRatings() {
   try {
-    const res = await fetch('/api/ratings');
+    const res = await authGet('/api/ratings');
     if (res.ok) allRatings = await res.json();
   } catch {}
   ['ratings-ny', 'ratings-dallas', 'ratings-colorado', 'ratings-wc'].forEach((id, i) => {
@@ -1532,11 +1538,11 @@ async function loadRatings() {
 function buildRatingChips(venueId) {
   const ratings = allRatings[venueId] || {};
   return Object.entries(ratings).map(([u, r]) => {
-    const color = window.USERS_CACHE?.[u]?.color || '#888';
+    const color = safeParticipantColor(window.USERS_CACHE?.[u]?.color || '#888');
     const name = uname(u);
     const isMe = currentUser?.username === u;
     const meLabel = (T[currentLang]||T['he']).rating_me;
-    return `<span class="rating-chip${isMe ? ' rating-chip-me' : ''}" style="background:${color}" title="${name}: ${r}★">${isMe ? meLabel : name[0]} <span class="stars-val">${r}★</span></span>`;
+    return `<span class="rating-chip${isMe ? ' rating-chip-me' : ''}" style="background:${color}" title="${escapeHtml(name)}: ${r}★">${isMe ? meLabel : escapeHtml(name[0])} <span class="stars-val">${r}★</span></span>`;
   }).join('');
 }
 
@@ -1594,8 +1600,30 @@ window.saveRating = saveRating;
    ========================================================= */
 const venueCommentsCache = {};
 
+// #213: quotes used to pass through unescaped, on the theory that every
+// caller only ever fed this into element TEXT. That stopped being true once
+// participant name/name_en started reaching attribute contexts too (RSVP
+// chip title, reaction tooltip) — an unescaped `"` there closes the
+// attribute early and lets the rest of the string become a live handler
+// (`onmouseover=`, etc). Escaping quotes in a text-only context is harmless
+// (they render as literal " / ' characters); every existing call site here
+// only ever fed element text, never markup, so none of them double-escape.
 function escapeHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return String(s ?? '')
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+// #213: color is organizer/agent-supplied (POST /api/agent/participants, or
+// a hand-edited trip.config.json) and reaches an unescaped inline
+// `style="background:${color}"` on every participant-carrying surface. The
+// API now refuses a non-hex color, but this is the render-side half of the
+// same fix — a config written before that check existed, or edited by hand,
+// must not be able to break out of the attribute either. Anything that
+// isn't `#`-prefixed hex falls back to the same neutral gray every avatar
+// already uses when color is simply missing.
+function safeParticipantColor(c) {
+  return typeof c === 'string' && /^#[0-9a-fA-F]{3,8}$/.test(c) ? c : '#888';
 }
 
 
@@ -1606,7 +1634,7 @@ async function toggleVenueComments(venueId) {
 
   if (!venueCommentsCache[venueId]) {
     try {
-      const res = await fetch(`/api/comments/venue/${venueId}`);
+      const res = await authGet(`/api/comments/venue/${venueId}`);
       venueCommentsCache[venueId] = res.ok ? await res.json() : [];
     } catch { venueCommentsCache[venueId] = []; }
   }
@@ -1630,11 +1658,11 @@ function renderVenueCommentThread(venueId) {
   if (btn) btn.textContent = `💬 ${comments.length} ${(T[currentLang]||T['he']).ph_comments} ▲`;
 
   const list = comments.map(c => {
-    const color = c.user?.color || '#888';
+    const color = safeParticipantColor(c.user?.color || '#888');
     const name  = uname(c.username, c.user);
     const time  = new Date(c.created_at).toLocaleDateString('he-IL');
     return `<div class="vc-comment">
-      <div class="vc-avatar" style="background:${color}">${name[0]}</div>
+      <div class="vc-avatar" style="background:${color}">${escapeHtml(name[0])}</div>
       <div>
         <span class="vc-name">${escapeHtml(name)}</span><span class="vc-meta">${time}</span>
         <div class="vc-body">${escapeHtml(c.body)}</div>
@@ -1693,7 +1721,7 @@ async function loadRsvps(containerId, activities) {
   // Fetch all activities for this section in parallel
   await Promise.all(activities.map(async a => {
     try {
-      const res = await fetch(`/api/rsvps/${a.id}`);
+      const res = await authGet(`/api/rsvps/${a.id}`);
       rsvpCache[a.id] = res.ok ? await res.json() : [];
     } catch { rsvpCache[a.id] = []; }
   }));
@@ -1711,9 +1739,9 @@ function renderRsvpCard(activity) {
   const statusLabel = { yes: tr.rsvp_status_yes, no: tr.rsvp_status_no, maybe: tr.rsvp_status_maybe };
   const chips = rsvps.map(r => {
     const emoji = r.status === 'yes' ? '✅' : r.status === 'no' ? '❌' : '🤔';
-    const color = r.user?.color || '#888';
+    const color = safeParticipantColor(r.user?.color || '#888');
     const name  = uname(r.username, r.user);
-    return `<span class="rsvp-chip" style="background:${color}" title="${name}: ${statusLabel[r.status] || r.status}">${emoji} ${name}</span>`;
+    return `<span class="rsvp-chip" style="background:${color}" title="${escapeHtml(name)}: ${statusLabel[r.status] || r.status}">${emoji} ${escapeHtml(name)}</span>`;
   }).join('');
 
   const btnClass = (s) => `rsvp-btn${myRsvp?.status === s ? ` active-${s}` : ''}`;
@@ -1932,7 +1960,7 @@ const ALBUM_SHARE_URLS = {};
 async function loadAlbumShareLinks() {
   for (const phase of ['ny', 'dallas', 'colorado', 'wc']) {
     try {
-      const res = await fetch(`/api/album-share/${phase}`);
+      const res = await authGet(`/api/album-share/${phase}`);
       if (!res.ok) continue;
       const { url } = await res.json();
       ALBUM_SHARE_URLS[phase] = url;
@@ -1945,14 +1973,28 @@ async function loadAlbumShareLinks() {
   }
 }
 
+// Photos the gallery has drawn, by id. Buttons pass only the (server-built,
+// numeric) id; the filename and share link are looked up here rather than being
+// written into an inline onclick string.
+const photoIndex = {};
+
 function sharePhotoFacebook(photoId) {
-  window.open(`https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(`${location.origin}/photo/${photoId}`)}`, '_blank');
+  const shareUrl = photoIndex[photoId]?.shareUrl;   // /photo/<id>?s=<capability>
+  if (!shareUrl) return;
+  window.open(`https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(`${location.origin}${shareUrl}`)}`, '_blank');
 }
 
-async function sharePhotoInstagram(filename) {
-  const photoUrl = `/api/photos/file/${filename}`;
+async function sharePhotoInstagram(photoId) {
+  const filename = photoIndex[photoId]?.filename;
+  if (!filename) return;
+  // The file route needs a login (issues #191/#194); an <img> carries a signed
+  // link, but this fetch carries the bearer token instead.
+  const photoUrl = `/api/photos/file/${encodeURIComponent(filename)}`;
+  let blob = null;
   try {
-    const blob = await fetch(photoUrl).then(r => r.blob());
+    const res = await authGet(photoUrl);
+    if (!res.ok) return;
+    blob = await res.blob();
     const ext = filename.split('.').pop() || 'jpg';
     const file = new File([blob], `photo.${ext}`, { type: blob.type });
     if (navigator.canShare?.({ files: [file] })) {
@@ -1960,9 +2002,11 @@ async function sharePhotoInstagram(filename) {
       return;
     }
   } catch (e) { if (e.name === 'AbortError') return; }
+  if (!blob) return;
   // Desktop fallback: download the image
   const a = document.createElement('a');
-  a.href = photoUrl; a.download = filename; a.click();
+  a.href = URL.createObjectURL(blob); a.download = filename; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
 }
 
 function askDeletePhoto(id) {
@@ -2002,8 +2046,9 @@ window.cancelDeletePhoto  = cancelDeletePhoto;
 window.confirmDeletePhoto = confirmDeletePhoto;
 
 function buildPhotoCard(p, reactions) {
+  photoIndex[p.id] = p;
   const tr     = T[currentLang] || T['he'];
-  const color  = p.user?.color  || '#888';
+  const color  = safeParticipantColor(p.user?.color  || '#888');
   const name   = uname(p.username, p.user);
   const date   = new Date(p.uploadedAt).toLocaleDateString('he-IL');
 
@@ -2015,7 +2060,7 @@ function buildPhotoCard(p, reactions) {
     const users = reactions?.[e] || [];
     const count = users.length;
     const active = myReactions.has(e) ? 'active' : '';
-    const tooltip = users.map(u => uname(u)).join(', ');
+    const tooltip = users.map(u => escapeHtml(uname(u))).join(', ');
     return `<button class="pg-react-btn ${active}" title="${tooltip}" onclick="togglePhotoReaction('${p.id}','${e}')">${e}${count > 0 ? `<span>${count}</span>` : ''}</button>`;
   }).join('');
 
@@ -2024,16 +2069,16 @@ function buildPhotoCard(p, reactions) {
   const isOwner = currentUser?.username === p.username;
 
   return `<div class="pg-card" id="pgcard-${p.id}">
-    <img src="/api/photos/file/${p.filename}" loading="lazy" alt="">
+    <img src="${p.url || `/api/photos/file/${p.filename}`}" loading="lazy" alt="">
     ${isOwner ? `<div class="pg-delete-wrap" id="pgdel-${p.id}">
       <button class="pg-delete-btn" onclick="askDeletePhoto('${p.id}')" title="${tr.ph_delete}">🗑️</button>
     </div>` : ''}
     <div class="pg-meta">
-      <div class="pg-avatar" style="background:${color}">${name[0]}</div>
+      <div class="pg-avatar" style="background:${color}">${escapeHtml(name[0])}</div>
       <div class="pg-info"><div class="pg-name">${escapeHtml(name)}</div><div>${date}</div></div>
       <div class="pg-share-btns">
         <button class="pg-share-btn pg-share-fb" onclick="sharePhotoFacebook('${p.id}')" title="${tr.ph_share_fb}"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/></svg></button>
-        <button class="pg-share-btn pg-share-ig" onclick="sharePhotoInstagram('${p.filename}')" title="${tr.ph_share_ig}"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.266-.057 1.645-.069 4.849-.069zm0-2.163c-3.259 0-3.667.014-4.947.072-4.358.2-6.78 2.618-6.98 6.98-.059 1.281-.073 1.689-.073 4.948 0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98 1.281.058 1.689.072 4.948.072 3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98-1.281-.059-1.69-.073-4.949-.073zm0 5.838c-3.403 0-6.162 2.759-6.162 6.162s2.759 6.163 6.162 6.163 6.162-2.759 6.162-6.163c0-3.403-2.759-6.162-6.162-6.162zm0 10.162c-2.209 0-4-1.79-4-4 0-2.209 1.791-4 4-4s4 1.791 4 4c0 2.21-1.791 4-4 4zm6.406-11.845c-.796 0-1.441.645-1.441 1.44s.645 1.44 1.441 1.44c.795 0 1.439-.645 1.439-1.44s-.644-1.44-1.439-1.44z"/></svg></button>
+        <button class="pg-share-btn pg-share-ig" onclick="sharePhotoInstagram('${p.id}')" title="${tr.ph_share_ig}"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.266-.057 1.645-.069 4.849-.069zm0-2.163c-3.259 0-3.667.014-4.947.072-4.358.2-6.78 2.618-6.98 6.98-.059 1.281-.073 1.689-.073 4.948 0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98 1.281.058 1.689.072 4.948.072 3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98-1.281-.059-1.69-.073-4.949-.073zm0 5.838c-3.403 0-6.162 2.759-6.162 6.162s2.759 6.163 6.162 6.163 6.162-2.759 6.162-6.163c0-3.403-2.759-6.162-6.162-6.162zm0 10.162c-2.209 0-4-1.79-4-4 0-2.209 1.791-4 4-4s4 1.791 4 4c0 2.21-1.791 4-4 4zm6.406-11.845c-.796 0-1.441.645-1.441 1.44s.645 1.44 1.441 1.44c.795 0 1.439-.645 1.439-1.44s-.644-1.44-1.439-1.44z"/></svg></button>
       </div>
     </div>
     <div class="pg-reaction-bar" id="pg-reactions-${p.id}">${reactionBar}</div>
@@ -2063,9 +2108,9 @@ async function loadPhaseAlbum(phase) {
   gallery.innerHTML = `<p style="color:var(--ink-2);padding:16px 0">${tr.album_loading || '...'}</p>`;
   try {
     const [photosRes, reactionsRes, commentsRes] = await Promise.all([
-      fetch(`/api/photos?phase=${phase}`),
-      fetch('/api/reactions'),
-      fetch('/api/comments/photo'),
+      authGet(`/api/photos?phase=${phase}`),
+      authGet('/api/reactions'),
+      authGet('/api/comments/photo'),
     ]);
     const photos      = photosRes.ok   ? await photosRes.json()   : [];
     const reactions   = reactionsRes.ok ? await reactionsRes.json() : {};
@@ -2087,9 +2132,9 @@ async function loadPhotosGallery(phase) {
   if (!gallery) return;
   try {
     const [photosRes, reactionsRes, commentsRes] = await Promise.all([
-      fetch(phase ? `/api/photos?phase=${phase}` : '/api/photos'),
-      fetch('/api/reactions'),
-      fetch('/api/comments/photo'),
+      authGet(phase ? `/api/photos?phase=${phase}` : '/api/photos'),
+      authGet('/api/reactions'),
+      authGet('/api/comments/photo'),
     ]);
     const photos   = photosRes.ok   ? await photosRes.json()    : [];
     allPhotoReactions          = reactionsRes.ok ? await reactionsRes.json() : {};
@@ -2128,7 +2173,7 @@ async function togglePhotoReaction(photoId, emoji) {
         const users2 = allPhotoReactions[photoId]?.[e] || [];
         const count = users2.length;
         const active = myReactions.has(e) ? 'active' : '';
-        const tooltip = users2.map(u => window.USERS_CACHE?.[u]?.name || u).join(', ');
+        const tooltip = users2.map(u => escapeHtml(window.USERS_CACHE?.[u]?.name || u)).join(', ');
         return `<button class="pg-react-btn ${active}" title="${tooltip}" onclick="togglePhotoReaction('${photoId}','${e}')">${e}${count > 0 ? `<span>${count}</span>` : ''}</button>`;
       }).join('');
     }
@@ -2142,7 +2187,7 @@ async function togglePhotoComments(photoId) {
 
   if (!photoCommentsCache[photoId]) {
     try {
-      const res = await fetch(`/api/comments/photo/${photoId}`);
+      const res = await authGet(`/api/comments/photo/${photoId}`);
       photoCommentsCache[photoId] = res.ok ? await res.json() : [];
     } catch { photoCommentsCache[photoId] = []; }
   }
@@ -2165,11 +2210,11 @@ function renderPhotoCommentThread(photoId) {
   if (btn) btn.textContent = `💬 ${comments.length} ${(T[currentLang]||T['he']).ph_comments} ▲`;
 
   const list = comments.map(c => {
-    const color = c.user?.color || '#888';
+    const color = safeParticipantColor(c.user?.color || '#888');
     const name  = uname(c.username, c.user);
     const time  = new Date(c.created_at).toLocaleDateString('he-IL');
     return `<div class="vc-comment">
-      <div class="vc-avatar" style="background:${color}">${name[0]}</div>
+      <div class="vc-avatar" style="background:${color}">${escapeHtml(name[0])}</div>
       <div>
         <span class="vc-name">${escapeHtml(name)}</span><span class="vc-meta">${time}</span>
         <div class="vc-body">${escapeHtml(c.body)}</div>
@@ -3568,8 +3613,8 @@ function renderFamilies(cfg) {
       (p.age >= 25 ? heads : kids).push(p);
     });
     const headLines = heads.map(p =>
-      `<li><strong><span class="lang-he">${p.name}</span><span class="lang-en">${p.name_en}</span></strong>${p.age ? ` (${p.age})` : ''}</li>`).join('');
-    const kidLine = kids.length ? `<li><span class="lang-he">${kids.map(p => `${p.name}${p.age ? ' ('+p.age+')' : ''}`).join(', ')}</span><span class="lang-en">${kids.map(p => `${p.name_en}${p.age ? ' ('+p.age+')' : ''}`).join(', ')}</span></li>` : '';
+      `<li><strong><span class="lang-he">${escapeHtml(p.name)}</span><span class="lang-en">${escapeHtml(p.name_en)}</span></strong>${p.age ? ` (${p.age})` : ''}</li>`).join('');
+    const kidLine = kids.length ? `<li><span class="lang-he">${kids.map(p => `${escapeHtml(p.name)}${p.age ? ' ('+p.age+')' : ''}`).join(', ')}</span><span class="lang-en">${kids.map(p => `${escapeHtml(p.name_en)}${p.age ? ' ('+p.age+')' : ''}`).join(', ')}</span></li>` : '';
     const noteHtml = fam.note ? `<div class="fam-note">${_biSpan(fam.note)}</div>` : '';
     return `<div class="fam">
       <div class="fam-letter ltr">${fam.letter}</div>

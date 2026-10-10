@@ -48,6 +48,17 @@ SCENARIOS: dict[str, dict] = {
         "expect_answers": ["destination", "departure_date", "return_date", "phases"],
         "expect_in_phases": ["Tokyo", "Hakone", "Kyoto", "Osaka"],
         "expect_planned": ["Tokyo Skytree", "TeamLab Planets"],
+        # Fact-level labels for tools/extract-eval.ts: each stop with its exact
+        # dates, the references a booking actually carries, and the ones it must
+        # NOT produce. "Quote 2026-4471" is a price quote, not a confirmation.
+        "expect_stops": [
+            {"name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23"},
+            {"name": "Hakone", "start": "2026-09-23", "end": "2026-09-24"},
+            {"name": "Kyoto", "start": "2026-09-24", "end": "2026-09-27"},
+            {"name": "Osaka", "start": "2026-09-27", "end": "2026-09-30"},
+        ],
+        "expect_refs": [],
+        "forbid_refs": ["2026-4471"],
     },
     # Scenario 2 — several documents, several formats, each carrying a
     # DIFFERENT kind of fact. The point is that one trip is assembled from all
@@ -112,6 +123,13 @@ SCENARIOS: dict[str, dict] = {
         # The flight is BOOKED — evidence of booking is a confirmation number —
         # so it belongs in travel_anchors, not in a phase's planned list.
         "expect_anchor_text": ["XR7T2Q", "LY381"],
+        "expect_stops": [
+            {"name": "Rome", "start": "2026-05-02", "end": "2026-05-06"},
+            {"name": "Florence", "start": "2026-05-06", "end": "2026-05-09"},
+            {"name": "Venice", "start": "2026-05-09", "end": "2026-05-12"},
+        ],
+        "expect_refs": ["XR7T2Q", "HTL-99117", "HTL-99118", "HTL-99119", "TK-5521", "TK-5522", "TK-5523", "TK-5524"],
+        "forbid_refs": [],
     },
     # Scenario 3 — no documents at all. Every answer typed. This is the control:
     # if it passes only when a document is uploaded, the interview is not an
@@ -123,6 +141,73 @@ SCENARIOS: dict[str, dict] = {
         "documents": {},
         "expect_answers": ["destination", "departure_date", "return_date", "phases"],
         "expect_in_phases": ["Lisbon", "Porto"],
+    },
+    # Scenario 5 — the baseline run of 2026-09-20, replayed. No documents.
+    #
+    # Every other scenario hands the interview a trip that is already decided,
+    # so the site only has to not lose anything. This one hands it a trip that
+    # is HALF decided and says so out loud, which is what a first-time organizer
+    # actually does — and it is where the run found what it found.
+    #
+    # The expectations below are what the run SHOULD have produced. Several of
+    # them fail today, deliberately: each names the issue it is waiting on, so a
+    # red line here is a tracked defect rather than a mystery. Delete none of
+    # them to make the suite green.
+    "vietnam": {
+        "destination": "Vietnam",
+        "departure_date": "2028-03-05",
+        "return_date": "2028-03-20",
+        "documents": {},
+        "expect_answers": ["destination", "departure_date", "return_date", "phases"],
+        "expect_in_phases": ["Hanoi", "Ha Long"],
+        # Named and dated in the interview, so it reaches the site — as a venue
+        # or, because it carries a date, as a day item (derive_days_from_anchors).
+        #
+        # BOTH SPELLINGS, and that is a finding rather than tidiness: the
+        # organizer wrote the Hebrew, and on 2026-09-20 the site stored that
+        # same Hebrew in the `en` side of the bilingual field as well. The
+        # earlier live run of the same interview produced a real English name
+        # for the same venue, so which one lands is not stable. Asserting one
+        # spelling would make this check fail for a reason it is not about.
+        "expect_planned": [[
+            "Thang Long Water Puppet Theatre",
+            "תיאטרון בובות המים תאנג לונג",
+        ]],
+        "expect_anchor_text": ["VN572", "VN571"],
+        "expect_site": {
+            # The organizer typed "Vietnam" when asked for a timezone. The site
+            # is what has to hold a zone something can do date maths with — the
+            # companion schedules a 07:30 briefing off this field.
+            "timezone_is_iana": True,
+            # The interview ran in Hebrew and meta.defaultLang is "he".
+            # transformer.py:1019 hardcodes the companion to "en".
+            "agent_language": "he",
+            # Four travel_anchors, none of them carrying a confirmation, are
+            # counted as "4 booking(s) already confirmed".
+            "confirmed_bookings": 0,
+            # Ten of sixteen days were explicitly left open WITH a request for
+            # a proposal (planning_help). Every day of the trip must appear on
+            # the site — in a planned stop or in one that says it is open.
+            # Undecided and absent are different things and the site showed the
+            # second (2026-09-20): six days rendered, nine simply gone, beside
+            # a return flight leaving a city no phase mentioned.
+            "days_covered": "all",
+            # Deferred by Dror on 2026-09-20 to later in sprint 6: the request
+            # is held (`planning_help`) and nothing downstream reads it, which
+            # is #117's own subject rather than a defect beside it. Reported as
+            # a known gap so a red line here is never mistaken for a
+            # regression, and so it turns green by itself when #117 lands.
+            # `confirmed_bookings` joins it only because #131 feeds the
+            # (correct) check wrong data: the interpreter writes the FLIGHT
+            # NUMBER into `confirmation`, so two anchors look booked on a trip
+            # where nothing is. The assertion stays as written — it is the
+            # truth — and goes green when #131 does.
+            # `days_covered` is NOT deferred: Dror, 2026-09-20 — "we cannot
+            # allow missing days … the first one can not be differed". What is
+            # deferred is EDITING those days on the website; the chat has to be
+            # able to address them.
+            "deferred": ["confirmed_bookings"],
+        },
     },
     # Scenario 4 — the chaos organizer (control-plane/api/tools/organizer-chaos.ts).
     # Its documents arrive OUT OF PLACE, in the middle of unrelated questions: one

@@ -13,13 +13,18 @@ class FakeTelegram implements TelegramClient {
   readonly edited: { chatId: string; messageId: string; text: string }[] = [];
   readonly typing: string[] = [];
   failSend = false;
+  /** The fixed word HttpTelegramClient returns for a call that failed this way (e.g. "TIMEOUT", "NETWORK"). */
+  sendError: string | null = null;
+  editError: string | null = null;
 
   async sendMessage(p: { chatId: string; text: string; replyTo?: string }): Promise<SendResult> {
     if (this.failSend) return { ok: false, error: "chat not found" };
+    if (this.sendError) return { ok: false, error: this.sendError };
     this.sent.push(p);
     return { ok: true, messageId: "555" };
   }
   async editMessageText(p: { chatId: string; messageId: string; text: string }): Promise<SendResult> {
+    if (this.editError) return { ok: false, error: this.editError };
     this.edited.push(p);
     return { ok: true };
   }
@@ -48,6 +53,7 @@ async function withConnector(
     interviewChats?: readonly string[];
     interviewSay?: (chatId: string, text: string) => Promise<boolean>;
     fallbackGatewayId?: string;
+    setExpectsReply?: (chatId: string, expects: boolean) => Promise<void>;
   } = {},
 ): Promise<void> {
   const telegram = new FakeTelegram();
@@ -60,6 +66,7 @@ async function withConnector(
       : {}),
     ...(options.interviewSay ? { interviewSay: options.interviewSay } : {}),
     ...(options.fallbackGatewayId ? { fallbackGatewayId: options.fallbackGatewayId } : {}),
+    ...(options.setExpectsReply ? { setExpectsReply: options.setExpectsReply } : {}),
   });
   await connector.listen();
   const port = connector.address;
@@ -347,6 +354,61 @@ describe("RelayConnector — outbound actions", () => {
     });
   });
 
+  /**
+   * Hermes' own reading of the error string the relay answers with. A MIRROR of
+   * its two predicates, copied from gateway/platforms/base.py (`_is_timeout_error`
+   * ~5472, `_is_retryable_error` ~5464, `_RETRYABLE_ERROR_PATTERNS` ~2770) - read in
+   * the Mac checkout ~/.hermes/hermes-agent @ ab0d98414 and, by the lead, in the
+   * VM's image kinerary-cp/hermes:ab0d98414-pbf43d580 (/opt/hermes), identical.
+   *
+   * What each verdict does to a companion's reply (`_send_with_retry` ~5545-5620):
+   * a TIMEOUT is returned as-is - no retry, no re-send, "the message may have been
+   * delivered"; RETRYABLE is retried with backoff; ANYTHING ELSE falls to the
+   * plain-text fallback, which re-sends the reply prefixed "(Response formatting
+   * failed, plain text:)". If Hermes changes these, change the mirror.
+   */
+  const hermesIsTimeout = (error: string) => {
+    const lowered = error.toLowerCase();
+    return lowered.includes("timed out") || lowered.includes("readtimeout") || lowered.includes("writetimeout");
+  };
+  const hermesIsRetryable = (error: string) => [
+    "connecterror", "connectionerror", "connectionreset", "connectionrefused", "connecttimeout",
+    "network", "broken pipe", "remotedisconnected", "eoferror",
+  ].some((pat) => error.toLowerCase().includes(pat));
+
+  for (const op of ["send", "edit"] as const) {
+    test(`round 2 (R5): a companion ${op} that TIMED OUT is answered with a timeout Hermes recognises - not re-sent as plain text, not retried`, async () => {
+      await withConnector(async (h) => {
+        if (op === "send") h.telegram.sendError = "TIMEOUT";
+        else h.telegram.editError = "TIMEOUT";
+        const result = await roundTrip(h, op === "send"
+          ? { op: "send", chat_id: "900", content: "hello" }
+          : { op: "edit", chat_id: "900", message_id: "7", content: "hello" });
+        assert.equal(result.success, false);
+        const error = String(result.error);
+        assert.notEqual(error, "TIMEOUT", "not the client's bare word");
+        assert.equal(hermesIsTimeout(error), true, `Hermes reads "${error}" as a timeout: returned as-is, never re-sent`);
+        assert.equal(hermesIsRetryable(error), false, `and not as retryable: "${error}"`);
+        assert.ok(!/bot|api\.telegram|https?:/i.test(error), `a fixed phrase, no URL or token: "${error}"`);
+      });
+    });
+  }
+
+  test("round 2 (R5): why the phrase - the bare word would have made Hermes re-send the reply (a duplicate if the slow send landed); NETWORK is retried, as before this PR", () => {
+    assert.equal(hermesIsTimeout("TIMEOUT"), false);
+    assert.equal(hermesIsRetryable("TIMEOUT"), false, "neither: the plain-text fallback, i.e. the reply sent again");
+    assert.equal(hermesIsTimeout("NETWORK"), false);
+    assert.equal(hermesIsRetryable("NETWORK"), true, "NETWORK is retried with backoff - unchanged by this PR");
+  });
+
+  test("round 2 (R5): the client's other fixed word reaches the gateway unchanged", async () => {
+    await withConnector(async (h) => {
+      h.telegram.sendError = "NETWORK";
+      const result = await roundTrip(h, { op: "send", chat_id: "900", content: "hello" });
+      assert.deepEqual(result, { success: false, error: "NETWORK" });
+    });
+  });
+
   test("a Telegram failure is reported as a failed result, not a dropped frame", async () => {
     await withConnector(async (h) => {
       h.telegram.failSend = true;
@@ -381,6 +443,106 @@ describe("RelayConnector — outbound actions", () => {
       await waitFor(() => frames.find((f) => f.type === "descriptor"));
       assert.equal(ws.readyState, ws.OPEN);
       ws.close();
+    });
+  });
+});
+
+describe("RelayConnector — reply-expected capture (migration 0053)", () => {
+  async function roundTrip(
+    h: Harness,
+    action: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const { ws, frames } = await dial(h.port, makeUpgradeToken("gw_1", SECRET, 300));
+    sendFrame(ws, { type: "outbound", requestId: "req_1", action });
+    const result = await waitFor(() => frames.find((f) => f.type === "outbound_result"));
+    ws.close();
+    return result.result as Record<string, unknown>;
+  }
+
+  test("a companion send with metadata.expects_reply opens the window", async () => {
+    const calls: Array<{ chatId: string; expects: boolean }> = [];
+    await withConnector(async (h) => {
+      const result = await roundTrip(h, {
+        op: "send",
+        chat_id: "901",
+        content: "what date works for everyone?",
+        metadata: { expects_reply: true },
+      });
+      assert.equal(result.success, true);
+      assert.deepEqual(calls, [{ chatId: "901", expects: true }]);
+    }, {
+      setExpectsReply: async (chatId, expects) => {
+        calls.push({ chatId, expects });
+      },
+    });
+  });
+
+  test("a companion send with no expects_reply signal clears any open window", async () => {
+    const calls: Array<{ chatId: string; expects: boolean }> = [];
+    await withConnector(async (h) => {
+      const result = await roundTrip(h, { op: "send", chat_id: "901", content: "sounds good!" });
+      assert.equal(result.success, true);
+      assert.deepEqual(calls, [{ chatId: "901", expects: false }]);
+    }, {
+      setExpectsReply: async (chatId, expects) => {
+        calls.push({ chatId, expects });
+      },
+    });
+  });
+
+  test("an interview chat never touches the reply-capture window", async () => {
+    // That branch returns to the gateway before reaching Telegram at all, so
+    // this option must never see an interview chat's send.
+    const calls: Array<{ chatId: string; expects: boolean }> = [];
+    await withConnector(async (h) => {
+      const result = await roundTrip(h, {
+        op: "send",
+        chat_id: "900",
+        content: "The next question is destination.",
+        metadata: { expects_reply: true },
+      });
+      assert.deepEqual(result, { success: true });
+      assert.deepEqual(calls, [], "the interview branch never calls setExpectsReply");
+    }, {
+      interviewChats: ["900"],
+      setExpectsReply: async (chatId, expects) => {
+        calls.push({ chatId, expects });
+      },
+    });
+  });
+
+  test("a failed send does not open or clear the window", async () => {
+    const calls: Array<{ chatId: string; expects: boolean }> = [];
+    await withConnector(async (h) => {
+      h.telegram.failSend = true;
+      const result = await roundTrip(h, {
+        op: "send",
+        chat_id: "901",
+        content: "what date works?",
+        metadata: { expects_reply: true },
+      });
+      assert.equal(result.success, false);
+      assert.deepEqual(calls, [], "nothing reached Telegram, so nothing here should change");
+    }, {
+      setExpectsReply: async (chatId, expects) => {
+        calls.push({ chatId, expects });
+      },
+    });
+  });
+
+  test("a write failure here does not turn a delivered message into a failure", async () => {
+    await withConnector(async (h) => {
+      const result = await roundTrip(h, {
+        op: "send",
+        chat_id: "901",
+        content: "what date works?",
+        metadata: { expects_reply: true },
+      });
+      assert.deepEqual(result, { success: true, message_id: "555" });
+    }, {
+      setExpectsReply: async () => {
+        throw new Error("db unavailable");
+      },
     });
   });
 });

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -97,6 +98,89 @@ class RetireInDb(unittest.TestCase):
         self.assertLess(tx.index("BEGIN"), tx.index("intake_sessions"))
         self.assertLess(tx.index("intake_sessions"), tx.index("COMMIT"))
 
+    def test_a_live_group_binding_token_is_revoked_with_the_trip(self):
+        # issue #175: a token issued into the organizer's DM stays redeemable
+        # for up to its own TTL (7-30 days) with nothing on the trip row
+        # saying it is gone. Revoking it here closes the reproduction path
+        # `redeemGroupBindingToken`'s own retired-slug check narrows but does
+        # not eliminate on its own.
+        seen: list[str] = []
+        with mock.patch.object(teardown, "psql", side_effect=lambda sql: seen.append(sql) or "0"):
+            teardown.retire_in_db({"id": "trip_abcdefgh12", "slug": "japan-2026", "orig": "japan-2026"})
+        tx = seen[-1]
+        self.assertIn(
+            "UPDATE control_plane.telegram_group_binding_tokens SET expires_at = now() "
+            "WHERE trip_id = 'trip_abcdefgh12' AND expires_at > now()",
+            tx,
+        )
+        self.assertLess(tx.index("BEGIN"), tx.index("telegram_group_binding_tokens"))
+        self.assertLess(tx.index("telegram_group_binding_tokens"), tx.index("COMMIT"))
+
+    def test_an_already_retired_trip_still_revokes_a_lingering_token(self):
+        # The fast path for a trip that is already `retired-...` (e.g. a
+        # rerun) must not skip revocation just because the slug rename is
+        # already done.
+        seen: list[str] = []
+        with mock.patch.object(teardown, "psql", side_effect=lambda sql: seen.append(sql) or "0"):
+            teardown.retire_in_db({"id": "trip_abcdefgh12", "slug": "retired-japan-2026-20260101", "orig": "japan-2026"})
+        self.assertTrue(any("telegram_group_binding_tokens" in sql for sql in seen))
+
+    def test_the_already_retired_fast_path_is_one_transaction_not_three_calls(self):
+        # A process that died between separate bare psql() calls used to be
+        # able to close bindings and sessions and still leave a live
+        # group-binding token behind — reopening the exact gap this task
+        # exists to close, by its own non-atomicity. One BEGIN...COMMIT call,
+        # the same shape the rename branch below already uses, means a crash
+        # anywhere in it leaves the database exactly as it was before.
+        seen: list[str] = []
+        with mock.patch.object(teardown, "psql", side_effect=lambda sql: seen.append(sql) or "0"):
+            teardown.retire_in_db({"id": "trip_abcdefgh12", "slug": "retired-japan-2026-20260101", "orig": "japan-2026"})
+        self.assertEqual(len(seen), 1, "exactly one psql() call for the whole fast path")
+        tx = seen[0]
+        self.assertLess(tx.index("BEGIN"), tx.index("telegram_group_binding_tokens"))
+        self.assertLess(tx.index("telegram_group_binding_tokens"), tx.index("telegram_chat_bindings"))
+        self.assertLess(tx.index("telegram_chat_bindings"), tx.index("intake_sessions"))
+        self.assertLess(tx.index("intake_sessions"), tx.index("COMMIT"))
+
+    def test_the_revoke_runs_first_in_both_branches_to_avoid_a_real_deadlock(self):
+        # regression-planner reproduced an actual `40P01: deadlock detected`
+        # against real Postgres: redeemGroupBindingToken's INSERT takes a
+        # FOR KEY SHARE lock on `trips` through its FK to it, so with the
+        # revoke last this transaction locked bindings/trips first and the
+        # token row last — the OPPOSITE order from a concurrent
+        # redeemGroupBindingToken call, which locks the token row first (its
+        # own FOR UPDATE) and then waits on `trips` through the same FK.
+        # Revoking first here matches that other transaction's order instead
+        # of opposing it, in BOTH branches — the already-retired fast path
+        # and the slug-rename path.
+        for trip in (
+            {"id": "trip_abcdefgh12", "slug": "retired-japan-2026-20260101", "orig": "japan-2026"},
+            {"id": "trip_abcdefgh12", "slug": "japan-2026", "orig": "japan-2026"},
+        ):
+            with self.subTest(slug=trip["slug"]):
+                seen: list[str] = []
+                with mock.patch.object(teardown, "psql", side_effect=lambda sql: seen.append(sql) or "0"):
+                    teardown.retire_in_db(trip)
+                tx = seen[-1]
+                self.assertLess(
+                    tx.index("BEGIN"), tx.index("telegram_group_binding_tokens"),
+                    "the revoke is not before BEGIN",
+                )
+                self.assertLess(
+                    tx.index("telegram_group_binding_tokens"), tx.index("telegram_chat_bindings"),
+                    "the revoke must run before the bindings-close, not after",
+                )
+
+    def test_the_revocation_never_touches_an_already_expired_token(self):
+        # The table's own CHECK forbids expires_at <= created_at; only
+        # touching a still-live token (expires_at > now()) is what keeps this
+        # from ever trying to set an expiry at or before creation.
+        seen: list[str] = []
+        with mock.patch.object(teardown, "psql", side_effect=lambda sql: seen.append(sql) or "0"):
+            teardown.retire_in_db({"id": "trip_abcdefgh12", "slug": "japan-2026", "orig": "japan-2026"})
+        tx = seen[-1]
+        self.assertIn("AND expires_at > now()", tx)
+
 
 class OriginalSlug(unittest.TestCase):
     def test_a_retired_slug_still_names_its_old_resources(self):
@@ -138,7 +222,7 @@ class ResourceSlug(unittest.TestCase):
 
 
 class Resolve(unittest.TestCase):
-    def fake_psql(self, trip: dict, bound: str = "", shared: str = "0", open_: str = "0"):
+    def fake_psql(self, trip: dict, bound: str = "", shared: str = "0", open_: str = "0", live_tokens: str = "0"):
         def psql(sql: str) -> str:
             if "row_to_json" in sql:
                 return json.dumps(trip)
@@ -146,6 +230,8 @@ class Resolve(unittest.TestCase):
                 return bound
             if "trip_id <>" in sql:
                 return shared
+            if "telegram_group_binding_tokens" in sql:
+                return live_tokens
             return open_
         return mock.patch.object(teardown, "psql", side_effect=psql)
 
@@ -170,6 +256,17 @@ class Resolve(unittest.TestCase):
         with self.fake_psql({"id": "trip_abcdefgh12", "slug": "japan-2026", "lifecycle_state": "ready_private"}):
             trip = teardown.resolve("japan-2026")
         self.assertEqual((trip["orig"], trip["profile"]), ("japan-2026", "japan2026"))
+
+    def test_a_live_group_binding_token_is_counted_so_the_dry_run_shows_it(self):
+        # Before this, the dry-run's "database" line could read "(nothing to
+        # do)" for a trip with zero open bindings and an already-retired slug
+        # that nonetheless still has a live group-binding token to revoke.
+        with self.fake_psql(
+            {"id": "trip_abcdefgh12", "slug": "japan-2026", "lifecycle_state": "ready_private"},
+            live_tokens="1",
+        ):
+            trip = teardown.resolve("japan-2026")
+        self.assertEqual(trip["live_group_tokens"], 1)
 
     def test_input_that_is_neither_id_nor_slug_is_refused_before_any_query(self):
         with mock.patch.object(teardown, "psql") as psql:
@@ -207,6 +304,20 @@ class KeepContainer(unittest.TestCase):
         # a first provision of japan-2026 wipes nfs/japan-2026
         self.assertEqual(lxc["nfs_host_dir"], "/mnt/pve/truenas-nfs/ref-japan-2026")
         self.assertEqual(out["npm"]["hostname"], "ref-japan-2026.example.store")
+
+    def test_a_data_dir_named_by_trip_id_is_left_where_it_is(self):
+        # The rename exists so the next trip to take this slug cannot adopt
+        # this family's data. A directory named by trip id cannot be adopted —
+        # ids are never reused — so moving it would only break the kept site's
+        # own mount for no gain.
+        import copy
+        raw = copy.deepcopy(self.RAW)
+        raw["proxmox"]["lxc"]["nfs_host_dir"] = "/mnt/pve/truenas-nfs/trip_9f2c11aa4d"
+
+        out = teardown.reference_topology(raw, "japan-2026")
+
+        self.assertEqual(out["proxmox"]["lxc"]["nfs_host_dir"], "/mnt/pve/truenas-nfs/trip_9f2c11aa4d")
+        self.assertEqual(out["name"], "ref-japan-2026", "everything else still moves")
 
     def test_the_address_and_the_path_inside_the_container_do_not_move(self):
         out = teardown.reference_topology(self.RAW, "japan-2026")
@@ -257,3 +368,152 @@ class KeepContainer(unittest.TestCase):
         topo = mock.Mock(lxc=mock.Mock(nfs_host_dir="/mnt/pve/truenas-nfs/japan-2026", nfs_mount_path="/nfs/japan-2026"))
         with self.assertRaises(RuntimeError):
             teardown.keep_container(mock.Mock(proxmox=Proxmox()), topo, "japan-2026")
+
+
+class DocumentTablesAlignment(unittest.TestCase):
+    """DOCUMENT_TABLES must name every table the document-store feature owns —
+    found independently here, from the TypeScript source, rather than from
+    DOCUMENT_TABLES itself: a table added on one side and forgotten on the
+    other must fail this test, not agree with itself.
+
+    source_artifacts is real (created in 0001_foundation.sql, not a
+    document-registry table by origin) and belongs here on its own terms —
+    document-registry.ts reads and writes it, so the same backup-before-
+    teardown obligation applies. An earlier report called it a phantom; it is
+    not. Whether teardown SHOULD back it up is a separate product question,
+    decided as: yes, for now — Dror, 2026-09-21.
+
+    intake_sessions/intake_versions/trip_memberships are excluded:
+    document-correction.ts joins against them, but they are pre-existing
+    tables the document-store feature does not own, and this test's job is
+    the tables it does.
+    """
+
+    REPO_ROOT = SCRIPT.parents[1]
+    SOURCE_FILES = (
+        "control-plane/api/src/document-registry.ts",
+        "control-plane/api/src/document-intake.ts",
+        "control-plane/api/src/answer-provenance.ts",
+        "control-plane/api/src/document-correction.ts",
+    )
+    NOT_DOCUMENT_TABLES = {"intake_sessions", "intake_versions", "trip_memberships"}
+
+    def test_document_tables_matches_every_table_the_ts_source_references(self):
+        found: set[str] = set()
+        for rel in self.SOURCE_FILES:
+            text = (self.REPO_ROOT / rel).read_text(encoding="utf-8")
+            found |= set(re.findall(r"control_plane\.([a-z_]+)", text))
+        found -= self.NOT_DOCUMENT_TABLES
+        self.assertEqual(
+            found, set(teardown.DOCUMENT_TABLES),
+            "DOCUMENT_TABLES has drifted from the tables document-registry.ts / "
+            "document-intake.ts / answer-provenance.ts / document-correction.ts "
+            "actually reference — a table added on one side and not the other "
+            "would otherwise back up nothing for it, silently.",
+        )
+
+
+class BuildProvisioner(unittest.TestCase):
+    """Teardown inspects and deletes; it never calls create_container, so it
+    never allocates. The pool it passes is therefore dead input — and a dead
+    default that names a real address is the kind that is believed later, on a
+    host whose Proxmox is shared with another stack."""
+
+    def patched_adapter(self):
+        import sys
+        sys.path[:0] = [str(teardown.REPO / "control-plane/worker"), str(teardown.REPO)]
+        import control_plane_worker.compute as compute
+        return mock.patch.object(compute, "LxcProvisionAdapter")
+
+    def build(self, env):
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(teardown, "DEPLOY_ROOT", Path(d)), \
+                mock.patch.dict(teardown.os.environ, env), \
+                self.patched_adapter() as adapter:
+            teardown.os.environ.pop("PROVISIONER_LXC_IP_POOL", None)
+            teardown.os.environ.update(env)
+            teardown.build_provisioner()
+        return adapter.call_args.kwargs
+
+    def test_a_pool_in_the_environment_is_not_adopted(self):
+        # the Mac's own pool spans .60-.99 and overlaps the VM's reserved .95-.99
+        self.assertEqual(self.build({"PROVISIONER_LXC_IP_POOL": '["192.168.0.95"]'})["ip_pool"], [])
+
+    def test_it_needs_no_pool_variable_at_all(self):
+        self.assertEqual(self.build({})["ip_pool"], [])
+
+
+class _FakeProfileDir:
+    """A profile directory that may be recreated by an external ticker at
+    chosen points in fake time — independent of when `delete()` runs, the way
+    the interviewer's own cron ticker is independent of teardown's call."""
+
+    def __init__(self, clock, recreate_at=()):
+        self.clock = clock
+        self.recreate_at = sorted(recreate_at)
+        self.present = True
+        self._fired = set()
+        self.delete_calls = 0
+
+    def is_dir(self):
+        for t in self.recreate_at:
+            if t not in self._fired and self.clock["t"] >= t:
+                self.present = True
+                self._fired.add(t)
+        return self.present
+
+    def delete(self):
+        self.delete_calls += 1
+        self.present = False
+
+
+class DeleteProfileAndWatch(unittest.TestCase):
+    """issue #352: a single delete-then-wait-then-check gave the interviewer's
+    cron ticker exactly one free shot at recreating the profile directory. The
+    fix re-deletes it every time it reappears, for the same total budget."""
+
+    def _clock(self):
+        clock = {"t": 0.0}
+        sleep = lambda dt: clock.__setitem__("t", clock["t"] + dt)  # noqa: E731
+        monotonic = lambda: clock["t"]  # noqa: E731
+        return clock, sleep, monotonic
+
+    def test_never_recreated_succeeds_with_exactly_one_delete(self):
+        clock, sleep, monotonic = self._clock()
+        fake = _FakeProfileDir(clock, recreate_at=())
+        ok, redeletes = teardown.delete_profile_and_watch(
+            Path("/irrelevant"), settle_seconds=70, delete=fake.delete, is_dir=fake.is_dir,
+            sleep=sleep, monotonic=monotonic)
+        self.assertTrue(ok)
+        self.assertEqual(redeletes, 0)
+        self.assertEqual(fake.delete_calls, 1)
+
+    def test_recreated_once_mid_window_is_redeleted_and_still_succeeds(self):
+        clock, sleep, monotonic = self._clock()
+        fake = _FakeProfileDir(clock, recreate_at=(12.0,))
+        ok, redeletes = teardown.delete_profile_and_watch(
+            Path("/irrelevant"), settle_seconds=70, delete=fake.delete, is_dir=fake.is_dir,
+            sleep=sleep, monotonic=monotonic)
+        self.assertTrue(ok)
+        self.assertEqual(redeletes, 1)
+        self.assertEqual(fake.delete_calls, 2)
+
+    def test_something_that_keeps_ticking_the_whole_window_still_fails(self):
+        clock, sleep, monotonic = self._clock()
+        ok, redeletes = teardown.delete_profile_and_watch(
+            Path("/irrelevant"), settle_seconds=70, delete=lambda: None, is_dir=lambda: True,
+            sleep=sleep, monotonic=monotonic)
+        self.assertFalse(ok)
+        self.assertEqual(redeletes, 14)  # 70s / 5s poll
+
+    def test_zero_settle_seconds_skips_the_watch_and_never_sleeps(self):
+        clock, sleep, monotonic = self._clock()
+        sleep_calls = []
+        fake = _FakeProfileDir(clock, recreate_at=())
+        ok, redeletes = teardown.delete_profile_and_watch(
+            Path("/irrelevant"), settle_seconds=0, delete=fake.delete, is_dir=fake.is_dir,
+            sleep=lambda dt: sleep_calls.append(dt), monotonic=monotonic)
+        self.assertTrue(ok)
+        self.assertEqual(redeletes, 0)
+        self.assertEqual(sleep_calls, [])
+        self.assertEqual(fake.delete_calls, 1)

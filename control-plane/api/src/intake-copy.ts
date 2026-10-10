@@ -83,6 +83,13 @@ interface QuestionCopy {
    * (`IntakeQuestion.satisfiedBy`). `{answer}` is what was written (a date as a person would say it).
    */
   unsettled?: Localised;
+  /**
+   * The other way to be unsettled — matched MORE than one, not none. Used only
+   * when `IntakeQuestion.unsettledMatchKind` reports it (`organizer_identity`'s
+   * `"ambiguous"` today); falls back to `unsettled` when absent, since every
+   * other question has only the one way to be unsettled.
+   */
+  ambiguous?: Localised;
 }
 
 export const INTAKE_COPY: Record<string, QuestionCopy> = {
@@ -217,6 +224,10 @@ export const INTAKE_COPY: Record<string, QuestionCopy> = {
       en: "“{answer}” doesn't match any of the names in the travellers list. Which of them are you? Tap your name.",
       he: "״{answer}״ לא תואם לאף אחד מהשמות ברשימת הנוסעים. מי מהם זה אתה? אפשר ללחוץ על השם שלך.",
     },
+    ambiguous: {
+      en: "More than one traveller is called “{answer}” — which one are you? Tap your name.",
+      he: "יותר מנוסע אחד נקרא ״{answer}״ — מי מהם זה אתה? אפשר ללחוץ על השם שלך.",
+    },
   },
   bot_name: {
     ask: {
@@ -305,6 +316,10 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     skip: "⤼ Skip this one",
     finish: "🏁 Finished",
     multiDone: "✔️ Done",
+    other: "✏️ Other…",
+    otherPrompt: "Tell me briefly what it is:",
+    otherNeedsReview: "I couldn't verify that right now, so I haven't saved it. Please try again in a moment.",
+    otherDoesntFit: "That doesn't look like a trip type. Briefly describe what kind of trip this is.",
     confirm: "✅ Confirm",
     keepPlanning: "✏️ Keep planning",
     recapHeader: "Here's what I have:",
@@ -343,6 +358,9 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // Typed a command mid-interview. Router-owned like every other command:
     // the interview is a conversation with buttons, and the runtime's own
     // slash surface is not part of it — see companionHelpText.
+    // A trip's EXISTING assistant is unreachable (stopped or restarting) — not the
+    // first-install wording, and no promise of a time.
+    companionUnavailable: "I'm off for now — hoping to be back soon.",
     notMyCommand: "That isn't one of my commands — just answer in the chat, or use the buttons.",
     // THE FIRST THING ANYONE SEES.
     //
@@ -386,6 +404,29 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
       "The goal is simple: you enjoy the trip — Kinerary keeps track of everything else.",
       "",
       "So send me whatever you already have, or just type \"Let's start\" and I'll take it from there.",
+    ].join("\n"),
+    // The opening for someone who has done this before: they already have a
+    // trip that was built, so every sentence explaining what Kinerary is would
+    // be telling them what they already know. Nine paragraphs of that is how a
+    // returning organizer learns the bot is not really listening.
+    //
+    // What it must say instead is the thing only a second trip raises: their
+    // first trip is not being replaced. The assistant they already talk to in
+    // this chat is about to be joined by another, and without a sentence about
+    // it the reasonable reading of "let's set up your trip" is that the old one
+    // is being overwritten.
+    //
+    // No name, deliberately. The display name on a password signup is the local
+    // part of an email address, so greeting them by it would produce "Welcome
+    // back, dror.elul+kin7" — worse than no name at all.
+    introductionReturning: [
+      "Welcome back 👋 Good to see you again.",
+      "",
+      "Let's set up your next trip, the same way as last time: one conversation, and I'll turn what you already know into a private trip site and a travel assistant for everyone coming.",
+      "",
+      "Your previous trip isn't touched — its site and its assistant stay exactly as they are. While we set this one up, messages here come to me rather than to that assistant; /trips moves between them once this trip is built.",
+      "",
+      "Send me whatever you already have — bookings, tickets, a spreadsheet, an itinerary someone put together — or just type \"Let's start\" and I'll take it from there.",
     ].join("\n"),
     // Said when the interviewer has gone quiet and the router picks the thread
     // back up. Deliberately says nothing about why: the organizer does not need
@@ -447,6 +488,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     /** Places the document means to visit but has not booked. */
     documentPlanned: "Places from the document",
     documentNothing: "I read it, but I couldn't find anything about the trip in it. No harm — I'll just ask.",
+    documentNothingNew: "I read it — everything in it matches what I already have, so there's nothing new to add. Carrying on:",
     // A reading the model was unsure of, put to the organizer instead of lost.
     // Asked when its question comes up; see renderSuggestion.
     suggestionIntro: "From your document — is this right?",
@@ -471,6 +513,117 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // refuse: someone who sent it was being helpful, and being told "no" with
     // no reason by a bot holding their other documents is unsettling.
     documentIdentity: "That looks like a passport or ID — I've left it unread. I don't need identity documents to set up the trip, so there's no reason for me to hold one. Booking confirmations, tickets and plans are the useful ones.",
+    // Said when part of a document could not be read — pages that are scans,
+    // or a file long enough that reading stopped. What was read is used; what
+    // was not must not be passed off as read, because the organizer would
+    // reasonably assume anything missing from the recap was not in the file.
+    documentPartial: "I could only read part of that — some of it is a scan, or it runs longer than I can take in one go. I've used what I could read; if something from it is missing below, tell me or send that part separately.",
+    // Said after the day-by-day, when the documents together ran past what one
+    // itinerary read takes. Not `documentPartial`: every file WAS read, so "some
+    // of it is a scan" is untrue, and said a second time after the recap it
+    // reads as the same problem twice.
+    itineraryPartial: "The day-by-day plan I added covers only part of your documents — together they run longer than I can plan from in one go. Check the days on the trip's site; for anything missing, send that document on its own.",
+    // Said when every file in a burst is one already read. Re-sending "in case
+    // it didn't arrive" is ordinary, and "I couldn't find anything" would be a
+    // false thing to say about a document that has already answered questions.
+    documentAlreadyRead: "I already have that one — I read it earlier, so nothing new to add from it. Carrying on:",
+    // Two documents disagree and neither is obviously newer — upload order is
+    // not evidence. The organizer decides; the value already held stays until
+    // they do, so an unanswered question never costs them anything.
+    documentConflict: "Two of your documents disagree about {what} for {entry}. I have {held}, but \"{document}\" says {incoming}. Which is right?",
+    documentConflictKeep: "Keep {held}",
+    documentConflictReplace: "Use {incoming}",
+    documentConflictKept: "Kept as it was.",
+    documentConflictReplaced: "Updated.",
+    documentConflictStale: "That one's already been settled.",
+    // A typed change is waiting for a yes or a no, and the interview cannot be
+    // confirmed over it (#206).
+    changePendingBlocksConfirm: "You have a change waiting — apply it or leave everything as it was first, then we can finish.",
+    "change.header": "Here's what I understood — nothing has changed yet:",
+    "change.footer": "Apply this? Tap a button, or just reply yes or no.",
+    "change.apply": "Yes, apply",
+    "change.cancel": "No, leave it as it was",
+    "change.line.field": "• {entry}: {field} {from} → {to}",
+    "change.line.add": "➕ Add {entry}",
+    "change.line.remove": "➖ Remove {entry}",
+    "change.line.replace": "🔁 Replace {from} with {to}",
+    "change.line.dropsField": "• {entry} loses its {field}",
+    "change.line.reorder": "↕ New order: {order}",
+    "change.line.unchanged": "Staying exactly as it is: {entries}",
+    "change.line.unchangedMore": "Staying exactly as it is: {entries} and {count} more.",
+    "change.field.start": "start date",
+    "change.field.end": "end date",
+    "change.field.name": "name",
+    "change.field.name_en": "English name",
+    "change.field.age": "age",
+    "change.field.family": "family",
+    "change.field.accommodation": "hotel",
+    "change.field.planned": "planned places",
+    "change.field.generic": "details",
+    "change.value.none": "(nothing)",
+    "change.warn.daysDropped": "⚠️ Days that would be dropped from {entry}: {dates}",
+    "change.warn.outsideTripDates.start": "⚠️ {entry} would start before your trip's first day ({tripDate}).",
+    "change.warn.outsideTripDates.end": "⚠️ {entry} would end after your trip's last day ({tripDate}).",
+    "change.warn.bookingInRemovedStop.unknown": "⚠️ {booking} falls inside {stop} and stays on record. I don't know its cancellation terms — check with the provider before removing.",
+    "change.warn.bookingInRemovedStop.non_refundable": "⚠️ {booking} falls inside {stop} and stays on record. My records say it is non-refundable / cannot be cancelled, but I can't know the actual terms — check with the provider before removing.",
+    "change.warn.bookingForRemovedTraveller.unknown": "⚠️ {booking} is in {traveller}'s name. I don't know its cancellation terms — check with the provider before removing.",
+    "change.warn.bookingForRemovedTraveller.non_refundable": "⚠️ {booking} is in {traveller}'s name. My records say it is non-refundable / cannot be cancelled, but I can't know the actual terms — check with the provider before removing.",
+    "change.warn.bookingInRemovedStop.more": "⚠️ …and {count} more confirmed bookings fall inside {stop} and stay on record. I don't know their cancellation terms — check them with the provider before removing.",
+    "change.warn.bookingInRemovedStop.moreNonRefundable": "⚠️ …and {count} more confirmed bookings fall inside {stop} and stay on record. My records mark {nonRefundable} of them non-refundable / not cancellable, but I can't know the actual terms — check with the provider before removing.",
+    "change.warn.bookingForRemovedTraveller.more": "⚠️ …and {count} more confirmed bookings are in {traveller}'s name. I don't know their cancellation terms — check them with the provider before removing.",
+    "change.warn.bookingForRemovedTraveller.moreNonRefundable": "⚠️ …and {count} more confirmed bookings are in {traveller}'s name. My records mark {nonRefundable} of them non-refundable / not cancellable, but I can't know the actual terms — check with the provider before removing.",
+    "change.warn.removesEverything.phases": "⚠️ This would remove every stop — your whole itinerary.",
+    "change.warn.removesEverything.travelers": "⚠️ This would remove every traveller — your whole travel party.",
+    "change.warn.bookingsWhoseNameUnknown": "⚠️ {count} confirmed booking(s) (flights or tickets): I can't tell whose name they are under. Check them before removing someone.",
+    "change.effect.organizerIdentityReopens": "I would then need to ask again which traveller is you.",
+    "change.effect.dietaryScopeNamesNobody": "The food need \"{need}\" was set for {name}, who would no longer be on the list.",
+    "change.blocked.overlap": "That would make these stops overlap: {stops}.\nPlease tell me the dates you want for all of them — I won't move any of them myself.",
+    "change.blocked.moveDated": "{stop} has dates, so its place in the order follows them. Tell me the dates you want for it and for the stops next to it.",
+    "change.blocked.datesReversed": "{stop} would end before it starts. What dates did you mean?",
+    "change.blocked.invalid": "That can't be saved as it is ({detail}). Could you say it again?",
+    "change.blocked.possibleDuplicate": "Is {name} someone already on the list ({candidates}), or a new traveller? If it's the same person, tell me what to change; if it's someone new, give me their full name.",
+    "change.blocked.generic": "I couldn't work out that change. Could you say it again in one sentence?",
+    "change.ask.which": "Which one do you mean by \"{name}\"?",
+    "change.ask.whichNone": "I couldn't find \"{name}\" among {noun}. Which one do you mean? You can tap one, or tell me.",
+    "change.ask.choose": "Which of these did you mean?",
+    "change.noun.stops": "your stops",
+    "change.noun.travellers": "your travellers",
+    "change.option.rename_stop": "Rename {from} to {to} (keep its dates)",
+    "change.option.replace_stop": "Replace {from} with a different stop, {to}",
+    "change.option.add_stop": "Add {to} as an extra stop",
+    "change.option.update_stop": "Change {from}",
+    "change.option.remove_stop": "Remove {from}",
+    "change.option.move_stop": "Move {from}",
+    "change.option.add_traveller": "Add {to} as a new traveller",
+    "change.option.update_traveller": "Change {from}",
+    "change.option.remove_traveller": "Remove {from}",
+    "change.applied": "Done — that's updated.",
+    "change.cancelled": "OK — left exactly as it was.",
+    "change.stale": "That answer changed after I showed you this, so I haven't applied anything. Here is the change again, against what I have now:",
+    "change.alreadyApplied": "That change was already applied.",
+    "change.gone": "That change is no longer waiting.",
+    "change.stillBlocked": "That change can't be applied yet — please answer the question above, or cancel it.",
+    "change.notUnderstood": "I wasn't sure what you wanted to change, so I haven't changed anything. Tell me in one sentence, for example: \"Tokyo is 20 to 25 September\" or \"Ruth is 71\".",
+    "change.notUnderstoodAbout": "I wasn't sure what you wanted to change about {what}, so I haven't changed anything. Tell me again in one sentence.",
+    "change.updated": "That change was updated after I showed you this, so I haven't applied anything. Here is the current one:",
+    "change.tooBig": "That's a lot at once — apply or cancel what's waiting first, then send the rest.",
+    "change.tooBigFresh": "That's more than I can show in one message — please send it in smaller pieces.",
+    "change.droppedTooBig": "That change got too big to show, so I dropped it — nothing was changed.",
+    "change.sessionConfirmed": "Your trip details are already confirmed, so I can't change them here.",
+    "change.uneditable": "I can't change {what} by typing — the list was saved in a form I can't edit, so nothing was changed. We can carry on from where we were.",
+    "change.sendFailed": "I couldn't show you that change just now, so it's waiting — nothing has been changed. Reply \"yes\" or \"no\" and I'll show it to you again; it's only applied after you've seen it and confirmed.",
+    "change.droppedUnshown": "I couldn't show you that change, so I've dropped it — nothing was changed. If you still want it, tell me again.",
+    "change.invalid.detail.travelers": "it would leave nobody on the trip",
+    "change.invalid.detail.generic": "it doesn't fit what I can save",
+    // What a disputed field is called in the question. A field with no label
+    // here is named generically rather than by its internal key.
+    "conflictField.start": "the start date",
+    "conflictField.end": "the end date",
+    "conflictField.date": "the date",
+    "conflictField.confirmation": "the confirmation number",
+    "conflictField.accommodation.name": "the hotel",
+    "conflictField.accommodation.confirmation": "the hotel's confirmation number",
+    "conflictField.default": "the details",
     // The three messages of an interview that can end.
     //
     // All three exist to answer the question someone actually has, which is
@@ -499,11 +652,65 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // for a button that does not exist.
     expiredWriteAfter:
       "This conversation has closed, so I can't add that to your trip. Opening a fresh interview link will pick things up again — the same kind of link that started us off. Ask whoever set your trip up for a new one, and everything you've already told me will still be there.",
+    // ── /trips and /switch ──────────────────────────────────────────────
+    // One shared bot serves every trip, so "which one is this chat on?" has no
+    // answer visible anywhere in the conversation. These are that answer.
+    tripsHeader: "Here are your trips:",
+    tripsCurrent: "← this chat",
+    tripsFooter: "Tap one to point this chat at it.",
+    // The organizer has no trips linked to this Telegram account. Says what to
+    // do about it rather than only what is missing.
+    tripsEmpty: "I don't have any trips linked to this chat yet. Open the link from your Kinerary signup and I'll set one up with you.",
+    // In a group the answer would list trips the rest of the room has no claim
+    // to — including, on a shared bot, another family's.
+    tripsInGroup: "I can only show your trips in our private chat.",
+    switchDone: "This chat is now on",
+    switchUnchanged: "This chat is already on",
+    // Bound, but nothing is behind it yet. Said at the moment of switching so
+    // it reads as a state of the trip, not as the switch having failed.
+    switchNoCompanion: "The site is ready — I'm still finishing this trip's assistant, so give me a moment before asking me about it.",
+    // ONE sentence for every refusal: not yours, and no such trip. A
+    // distinguishable refusal confirms a guess to whoever is guessing.
+    switchRefused: "I can't switch to that one. Send /trips to see the ones I have for you.",
+    switchInGroup: "I can only switch trips in our private chat — this group stays on its own trip.",
+    switchInInterview: "We're in the middle of setting up a trip. Let's finish this one first, then I can switch.",
+    // Migration 0042's reachability. Worth surfacing: this is the exact state
+    // that produced "I don't have a trip for this chat" about a site that was
+    // provisioned perfectly.
+    tripUnreachable: "(site not responding)",
+    // TRIP_MCP_BRIDGE_FAILED (#296): the site works, the companion cannot read it.
+    tripBridgeUnreachable: "(assistant can't read the trip right now)",
+
+    // A document after the trip is confirmed. Nothing it says changes the trip
+    // until the organizer approves — so every message says what WOULD change,
+    // and that nothing has yet.
+    correctionReading: "Got it — I'm reading this against your trip. I'll show you anything it would change before anything changes.",
+    correctionProposal: "{document} would update your trip:\n{changes}\n\nNothing changes until you approve.",
+    correctionConflict:
+      "{document} disagrees with your trip about {what} for {entry}: your trip has {held}, the document says {incoming}.\n\nUpdate the trip to the document's version?",
+    correctionApprove: "Approve",
+    correctionReject: "Keep as it is",
+    correctionApplied: "Done — your trip is updated. The site will refresh with it shortly.",
+    correctionAppliedSiteLater: "Done — your trip is updated. The site will show it the next time it's rebuilt.",
+    correctionRejected: "Okay — nothing changed.",
+    correctionStale:
+      "Your trip changed after I read that document, so I haven't applied it. Send the document again and I'll check it against the trip as it is now — it won't take long.",
+    correctionNotNow: "Your site is being built right now, so the trip can't change this minute. Tap Approve again in a little while.",
+    correctionFailed: "I couldn't apply that change, so nothing was changed.",
+    correctionNothingNew: "I've read it — everything in it is already in your trip, so there's nothing to change.",
+    correctionAlreadyDecided: "That one has already been decided.",
+    "correctionChange.added": "• {question}: add {entry}",
+    "correctionChange.filled": "• {question}: {entry} — add {what}",
+    "correctionChange.answered": "• {question}: {value}",
   },
   he: {
     skip: "⤼ דלג על זו",
     finish: "🏁 סיים",
     multiDone: "✔️ סיימתי",
+    other: "✏️ משהו אחר…",
+    otherPrompt: "ספרו לי בקצרה מה זה:",
+    otherNeedsReview: "לא הצלחתי לאמת את זה כרגע, לכן לא שמרתי אותו. נסו שוב בעוד רגע.",
+    otherDoesntFit: "זה לא נראה כמו סוג טיול. ספרו בקצרה איזה סוג טיול זה.",
     confirm: "✅ אישור",
     keepPlanning: "✏️ עוד לא סיימתי",
     recapHeader: "זה מה שיש לי:",
@@ -522,6 +729,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     skipOptional: "⤼ דלג",
     documentOffer: "לפני שנתחיל בפרטים — אם כבר יש לכם תוכנית, אישור הזמנה, כרטיסים או גיליון לטיול, שלחו אותו לכאן ואני אקרא אותו במקום שתקלידו הכל.",
     noDocument: "אין לי מסמך",
+    companionUnavailable: "אני לא זמין כרגע — מקווה לחזור בקרוב.",
     notMyCommand: "זו לא פקודה שלי — פשוט ענו כאן בצ'אט, או השתמשו בכפתורים.",
     introduction: [
       "היי 👋 אני עוזר הטיולים שלכם מבית Kinerary.",
@@ -542,6 +750,18 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
       "",
       "אז שלחו לי מה שכבר יש לכם, או פשוט כתבו \"בואו נתחיל\" ואני אמשיך משם.",
     ].join("\n"),
+    // Plural throughout, like every other Hebrew string here: it addresses the
+    // organizer and whoever is travelling with them, and it avoids guessing a
+    // gender the control plane has never been told.
+    introductionReturning: [
+      "ברוכים השבים 👋 כיף לראות אתכם שוב.",
+      "",
+      "בואו נקים את הטיול הבא שלכם, בדיוק כמו בפעם הקודמת: שיחה אחת, ואהפוך את מה שאתם כבר יודעים לאתר טיול פרטי ולעוזר טיולים לכל מי שנוסע.",
+      "",
+      "הטיול הקודם שלכם לא משתנה — האתר והעוזר שלו נשארים בדיוק כמו שהם. בזמן שנקים את הטיול הזה, הודעות כאן מגיעות אליי ולא לעוזר ההוא; אפשר לעבור ביניהם עם ‎/trips‎ אחרי שהטיול הזה יוקם.",
+      "",
+      "שלחו לי מה שכבר יש לכם — הזמנות, כרטיסים, קובץ אקסל, תוכנית שמישהו הכין — או פשוט כתבו \"בואו נתחיל\" ואני אמשיך משם.",
+    ].join("\n"),
     resumed: "נמשיך מכאן.",
     scopeEveryone: "כל מי שנוסע",
     beforeWeFinish: "לפני שאוכל להרכיב לכם את הטיול, נשאר דבר אחד שאני צריך:",
@@ -555,6 +775,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     documentCorrect: "אם משהו מזה לא נכון פשוט תגידו לי ואתקן — אין לחץ, גם אחר כך אפשר. בינתיים נמשיך:",
     documentPlanned: "מקומות מהמסמך",
     documentNothing: "קראתי, אבל לא מצאתי שם מידע על הטיול. לא נורא — פשוט אשאל.",
+    documentNothingNew: "קראתי — כל מה שבמסמך כבר נמצא אצלי, כך שאין מה להוסיף. ממשיכים:",
     suggestionIntro: "מהמסמך שלכם — זה נכון?",
     suggestionYes: "✅ כן, נכון",
     suggestionNo: "✏️ לא",
@@ -564,6 +785,99 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     documentExtractFailed: "קראתי, אבל לא הצלחתי להבין את זה כרגע — זה עליי, לא על הקובץ. אשאל במקום, ואפשר לשלוח שוב מאוחר יותר.",
     documentUnreadable: "לא הצלחתי לקרוא את הקובץ — יכול להיות שזו סריקה או תמונה ולא מסמך טקסט. אפשר לשלוח קובץ אחר אם יש, או שנמשיך ואשאל במקום.",
     documentIdentity: "זה נראה כמו דרכון או תעודת זהות — לא קראתי אותו. אני לא צריך מסמכי זיהוי כדי להקים את הטיול, אז אין סיבה שאחזיק אחד כזה. אישורי הזמנה, כרטיסים ותוכניות — אלה המועילים.",
+    documentPartial: "הצלחתי לקרוא רק חלק מזה — חלק מהקובץ סרוק, או שהוא ארוך מכדי לקרוא בבת אחת. השתמשתי במה שהצלחתי לקרוא; אם משהו ממנו חסר למטה, ספרו לי או שלחו את החלק הזה בנפרד.",
+    itineraryPartial: "התוכנית היומית שהוספתי מכסה רק חלק מהמסמכים — יחד הם ארוכים מכדי שאתכנן מהם בבת אחת. בדקו את הימים באתר הטיול; אם משהו חסר, שלחו את המסמך הזה לבד.",
+    documentAlreadyRead: "את זה כבר יש לי — קראתי אותו קודם, כך שאין ממנו משהו חדש להוסיף. ממשיכים:",
+    documentConflict: "שני מסמכים שלכם לא מסכימים לגבי {what} של {entry}. אצלי רשום {held}, אבל ב-\"{document}\" כתוב {incoming}. מה נכון?",
+    documentConflictKeep: "להשאיר {held}",
+    documentConflictReplace: "להחליף ל-{incoming}",
+    documentConflictKept: "נשאר כמו שהיה.",
+    documentConflictReplaced: "עודכן.",
+    documentConflictStale: "זה כבר הוכרע.",
+    changePendingBlocksConfirm: "יש שינוי שממתין לאישור — עדכנו אותו או השאירו הכול כמו שהיה, ורק אז נסיים.",
+    "change.header": "כך הבנתי — עדיין לא שיניתי כלום:",
+    "change.footer": "לעדכן? לחצו על כפתור, או פשוט ענו כן או לא.",
+    "change.apply": "כן, לעדכן",
+    "change.cancel": "לא, להשאיר כמו שהיה",
+    "change.line.field": "• {entry}: {field} {from} ← {to}",
+    "change.line.add": "➕ להוסיף {entry}",
+    "change.line.remove": "➖ להסיר {entry}",
+    "change.line.replace": "🔁 להחליף את {from} ב{to}",
+    "change.line.dropsField": "• {entry}: הסרת ה{field}",
+    "change.line.reorder": "↕ סדר חדש: {order}",
+    "change.line.unchanged": "נשאר בדיוק כמו שהוא: {entries}",
+    "change.line.unchangedMore": "נשאר בדיוק כמו שהוא: {entries} ועוד {count}.",
+    "change.field.start": "תאריך התחלה",
+    "change.field.end": "תאריך סיום",
+    "change.field.name": "שם",
+    "change.field.name_en": "שם באנגלית",
+    "change.field.age": "גיל",
+    "change.field.family": "משפחה",
+    "change.field.accommodation": "מלון",
+    "change.field.planned": "מקומות מתוכננים",
+    "change.field.generic": "פרטים",
+    "change.value.none": "(כלום)",
+    "change.warn.daysDropped": "⚠️ ימים שיוסרו מ{entry}: {dates}",
+    "change.warn.outsideTripDates.start": "⚠️ {entry} תתחיל לפני היום הראשון של הטיול ({tripDate}).",
+    "change.warn.outsideTripDates.end": "⚠️ {entry} תסתיים אחרי היום האחרון של הטיול ({tripDate}).",
+    "change.warn.bookingInRemovedStop.unknown": "⚠️ ההזמנה {booking} נופלת בתוך {stop} ונשארת ברשומה. אני לא יודע מה תנאי הביטול שלה — כדאי לבדוק מול הספק לפני שמסירים.",
+    "change.warn.bookingInRemovedStop.non_refundable": "⚠️ ההזמנה {booking} נופלת בתוך {stop} ונשארת ברשומה. לפי מה שרשום אצלי היא מסומנת כבלתי ניתנת להחזר או לביטול, אבל אני לא יכול לדעת מה התנאים בפועל — כדאי לבדוק מול הספק לפני שמסירים.",
+    "change.warn.bookingForRemovedTraveller.unknown": "⚠️ ההזמנה {booking} על שם {traveller}. אני לא יודע מה תנאי הביטול שלה — כדאי לבדוק מול הספק לפני שמסירים.",
+    "change.warn.bookingForRemovedTraveller.non_refundable": "⚠️ ההזמנה {booking} על שם {traveller}. לפי מה שרשום אצלי היא מסומנת כבלתי ניתנת להחזר או לביטול, אבל אני לא יכול לדעת מה התנאים בפועל — כדאי לבדוק מול הספק לפני שמסירים.",
+    "change.warn.bookingInRemovedStop.more": "⚠️ ועוד {count} הזמנות מאושרות נופלות בתוך {stop} ונשארות ברשומה. אני לא יודע מה תנאי הביטול שלהן — כדאי לבדוק אותן מול הספק לפני שמסירים.",
+    "change.warn.bookingInRemovedStop.moreNonRefundable": "⚠️ ועוד {count} הזמנות מאושרות נופלות בתוך {stop} ונשארות ברשומה. מבין ההזמנות שרשומות אצלי כבלתי ניתנות להחזר או לביטול: {nonRefundable}. אני לא יכול לדעת מה התנאים בפועל — כדאי לבדוק מול הספק לפני שמסירים.",
+    "change.warn.bookingForRemovedTraveller.more": "⚠️ ועוד {count} הזמנות מאושרות על שם {traveller}. אני לא יודע מה תנאי הביטול שלהן — כדאי לבדוק אותן מול הספק לפני שמסירים.",
+    "change.warn.bookingForRemovedTraveller.moreNonRefundable": "⚠️ ועוד {count} הזמנות מאושרות על שם {traveller}. מבין ההזמנות שרשומות אצלי כבלתי ניתנות להחזר או לביטול: {nonRefundable}. אני לא יכול לדעת מה התנאים בפועל — כדאי לבדוק מול הספק לפני שמסירים.",
+    "change.warn.removesEverything.phases": "⚠️ זה יסיר את כל התחנות — את כל מסלול הטיול.",
+    "change.warn.removesEverything.travelers": "⚠️ זה יסיר את כל הנוסעים — את כל הרשימה.",
+    "change.warn.bookingsWhoseNameUnknown": "⚠️ לא ברור לי על שם מי רשומות ההזמנות המאושרות (טיסות או כרטיסים): {count}. כדאי לבדוק אותן לפני שמסירים מישהו.",
+    "change.effect.organizerIdentityReopens": "אז אצטרך לשאול שוב מי מהנוסעים אתם.",
+    "change.effect.dietaryScopeNamesNobody": "הצורך התזונתי \"{need}\" הוגדר עבור {name}, שכבר לא יהיה ברשימה.",
+    "change.blocked.overlap": "זה יגרום לחפיפה בין התחנות: {stops}.\nכתבו לי את התאריכים שאתם רוצים לכולן — אני לא אזיז אף אחת מהן בעצמי.",
+    "change.blocked.moveDated": "ל{stop} יש תאריכים, אז מקומה בסדר נגזר מהם. כתבו לי את התאריכים שאתם רוצים לה ולתחנות שלידה.",
+    "change.blocked.datesReversed": "{stop} תסתיים לפני שהיא מתחילה. אילו תאריכים התכוונתם?",
+    "change.blocked.invalid": "אי אפשר לשמור את זה כמו שזה ({detail}). אפשר לנסח שוב?",
+    "change.blocked.possibleDuplicate": "האם {name} כבר ברשימה ({candidates}), או שזה נוסע חדש? אם זה אותו אדם, כתבו מה לשנות; אם זה מישהו חדש, כתבו את שמו המלא.",
+    "change.blocked.generic": "לא הצלחתי להבין את השינוי הזה. אפשר לנסח שוב במשפט אחד?",
+    "change.ask.which": "למי או למה התכוונתם ב\"{name}\"?",
+    "change.ask.whichNone": "לא מצאתי את \"{name}\" בין {noun}. למי או למה התכוונתם? אפשר ללחוץ על אחד, או לכתוב לי.",
+    "change.ask.choose": "למה התכוונתם?",
+    "change.noun.stops": "התחנות שלכם",
+    "change.noun.travellers": "הנוסעים שלכם",
+    "change.option.rename_stop": "לשנות את השם של {from} ל{to} (ולשמור על התאריכים)",
+    "change.option.replace_stop": "להחליף את {from} בתחנה אחרת, {to}",
+    "change.option.add_stop": "להוסיף את {to} כתחנה נוספת",
+    "change.option.update_stop": "לשנות את {from}",
+    "change.option.remove_stop": "להסיר את {from}",
+    "change.option.move_stop": "להזיז את {from}",
+    "change.option.add_traveller": "להוסיף את {to} כנוסע חדש",
+    "change.option.update_traveller": "לשנות את {from}",
+    "change.option.remove_traveller": "להסיר את {from}",
+    "change.applied": "בוצע — עודכן.",
+    "change.cancelled": "בסדר — נשאר בדיוק כמו שהיה.",
+    "change.stale": "התשובה השתנתה אחרי שהראיתי לכם את זה, אז לא עדכנתי כלום. הנה השינוי שוב, מול מה שיש לי עכשיו:",
+    "change.alreadyApplied": "השינוי הזה כבר בוצע.",
+    "change.gone": "השינוי הזה כבר לא ממתין.",
+    "change.stillBlocked": "אי אפשר לבצע את השינוי עדיין — ענו על השאלה למעלה, או השאירו הכול כמו שהיה.",
+    "change.notUnderstood": "לא הייתי בטוח מה רציתם לשנות, אז לא שיניתי כלום. כתבו לי במשפט אחד, למשל: \"טוקיו מה-20 עד ה-25 בספטמבר\" או \"רות בת 71\".",
+    "change.notUnderstoodAbout": "לא הייתי בטוח מה רציתם לשנות ב{what}, אז לא שיניתי כלום. כתבו לי שוב במשפט אחד.",
+    "change.updated": "השינוי הזה עודכן אחרי שהראיתי לכם אותו, אז לא עדכנתי כלום. הנה השינוי העדכני:",
+    "change.tooBig": "זה הרבה בבת אחת — קודם ענו על השינוי שממתין (לעדכן או להשאיר כמו שהיה), ואז שלחו את השאר.",
+    "change.tooBigFresh": "זה יותר מדי להצגה בהודעה אחת — שלחו את זה בחלקים קטנים יותר.",
+    "change.droppedTooBig": "השינוי הזה גדל מדי מכדי להציג אותו, אז ביטלתי אותו — לא שיניתי כלום.",
+    "change.sessionConfirmed": "פרטי הטיול כבר אושרו, ולכן אי אפשר לשנות אותם כאן.",
+    "change.uneditable": "אי אפשר לשנות את {what} בהקלדה — הרשימה נשמרה בצורה שאני לא יכול לערוך, ולכן לא שיניתי כלום. אפשר להמשיך מאיפה שעצרנו.",
+    "change.sendFailed": "לא הצלחתי להציג לכם את השינוי עכשיו, והוא ממתין. עדיין לא שיניתי כלום. ענו \"כן\" או \"לא\" ואציג אותו שוב — ורק אחרי שתראו אותו תוכלו לאשר או להשאיר הכול כמו שהיה.",
+    "change.droppedUnshown": "לא הצלחתי להראות לכם את השינוי, אז ביטלתי אותו — לא שיניתי כלום. אם עדיין תרצו אותו, כתבו לי שוב.",
+    "change.invalid.detail.travelers": "זה לא יותיר אף נוסע בטיול",
+    "change.invalid.detail.generic": "זה לא מתאים למה שאני יכול לשמור",
+    "conflictField.start": "תאריך ההתחלה",
+    "conflictField.end": "תאריך הסיום",
+    "conflictField.date": "התאריך",
+    "conflictField.confirmation": "מספר האישור",
+    "conflictField.accommodation.name": "המלון",
+    "conflictField.accommodation.confirmation": "מספר האישור של המלון",
+    "conflictField.default": "הפרטים",
     expiringSoon:
       "אם לא אשמע מכם, אסגור את השיחה בעוד כ-10 דקות — שום דבר לא הולך לאיבוד, כל מה שסיפרתם שמור. שלחו משהו ונמשיך.",
     didNotFollow: "סליחה — לא הבנתי בדיוק. הנה מה שאני מחכה לו:",
@@ -572,8 +886,72 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     expired: "סגרתי את השיחה בינתיים — כל מה שסיפרתם שמור, שום דבר לא הלך לאיבוד. כדי להמשיך צריך קישור ראיון חדש; בקשו ממי שהקים לכם את הטיול ונמשיך בדיוק מאיפה שעצרנו.",
     expiredWriteAfter:
       "השיחה הזו נסגרה, אז אני לא יכול להוסיף את זה לטיול. קישור הפעלה חדש לראיון יחזיר אותנו לאן שהיינו — אותו סוג קישור שפתח לנו את השיחה. בקשו קישור חדש ממי שהקים לכם את הטיול, וכל מה שכבר סיפרתם עדיין יהיה שם.",
+    tripsHeader: "הטיולים שלך:",
+    tripsCurrent: "← הצ׳אט הזה",
+    tripsFooter: "בחרו אחד כדי לחבר אליו את הצ׳אט הזה.",
+    tripsEmpty: "אין לי עדיין טיולים המשויכים לצ׳אט הזה. פתחו את הקישור מההרשמה ל‑Kinerary ונקים אחד יחד.",
+    tripsInGroup: "אני יכול להראות את הטיולים שלך רק בצ׳אט הפרטי בינינו.",
+    switchDone: "הצ׳אט הזה מחובר עכשיו אל",
+    switchUnchanged: "הצ׳אט הזה כבר מחובר אל",
+    switchNoCompanion: "האתר מוכן — אני עדיין מסיים את העוזר של הטיול הזה, אז תנו לי רגע לפני שתשאלו אותי עליו.",
+    switchRefused: "אני לא יכול לעבור לשם. שלחו ‎/trips‎ כדי לראות את הטיולים שיש לי עבורכם.",
+    switchInGroup: "אני יכול להחליף טיול רק בצ׳אט הפרטי בינינו — הקבוצה הזו נשארת על הטיול שלה.",
+    switchInInterview: "אנחנו באמצע הקמת טיול. בואו נסיים את זה קודם, ואז אוכל להחליף.",
+    tripUnreachable: "(האתר לא מגיב)",
+    tripBridgeUnreachable: "(לצערי אני לא יכול לקרוא את נתוני הטיול כרגע)",
+
+    correctionReading: "קיבלתי — אני קורא את זה מול הטיול שלכם. כל מה שזה ישנה אראה לכם לפני שמשהו משתנה.",
+    correctionProposal: "{document} יעדכן את הטיול שלכם:\n{changes}\n\nשום דבר לא משתנה עד שתאשרו.",
+    correctionConflict:
+      "{document} לא מסכים עם הטיול לגבי {what} של {entry}: בטיול כתוב {held}, ובמסמך {incoming}.\n\nלעדכן את הטיול לפי המסמך?",
+    correctionApprove: "לאשר",
+    correctionReject: "להשאיר כמו שזה",
+    correctionApplied: "בוצע — הטיול עודכן. האתר יתעדכן בהתאם בקרוב.",
+    correctionAppliedSiteLater: "בוצע — הטיול עודכן. האתר יציג את זה בבנייה הבאה שלו.",
+    correctionRejected: "בסדר — שום דבר לא השתנה.",
+    correctionStale:
+      "הטיול השתנה אחרי שקראתי את המסמך, אז לא החלתי את השינוי. שלחו את המסמך שוב ואבדוק אותו מול הטיול כמו שהוא עכשיו — זה לא ייקח הרבה.",
+    correctionNotNow: "האתר שלכם נבנה ממש עכשיו, אז אי אפשר לשנות את הטיול כרגע. לחצו שוב על אישור בעוד כמה דקות.",
+    correctionFailed: "לא הצלחתי להחיל את השינוי, אז שום דבר לא השתנה.",
+    correctionNothingNew: "קראתי — כל מה שבמסמך כבר נמצא בטיול, כך שאין מה לשנות.",
+    correctionAlreadyDecided: "על זה כבר הוחלט.",
+    "correctionChange.added": "• {question}: להוסיף את {entry}",
+    "correctionChange.filled": "• {question}: {entry} — להוסיף {what}",
+    "correctionChange.answered": "• {question}: {value}",
   },
 };
+
+/**
+ * What each `trips.lifecycle_state` means to the person who owns the trip.
+ *
+ * The raw enum is an engineering vocabulary — `ready_private`,
+ * `provisioning_approved` — and showing it in a trip list asks the organizer
+ * to learn a state machine to answer "is my site up?". Twelve states collapse
+ * to the handful of situations they can actually tell apart.
+ *
+ * A state with no entry falls through to the raw value rather than to a blank:
+ * a reader seeing `sealed` and not knowing what it means is a smaller failure
+ * than a trip whose status line is empty.
+ */
+const LIFECYCLE_COPY: Record<string, Localised> = {
+  pending_signup_approval: { en: "waiting for approval", he: "ממתין לאישור" },
+  draft: { en: "not started", he: "טרם התחיל" },
+  intake_in_progress: { en: "setting it up", he: "בהקמה" },
+  intake_confirmed: { en: "details confirmed", he: "הפרטים אושרו" },
+  planned: { en: "planned", he: "מתוכנן" },
+  provisioning_approved: { en: "building", he: "בבנייה" },
+  provisioning: { en: "building", he: "בבנייה" },
+  ready_private: { en: "site ready", he: "האתר מוכן" },
+  activation_approved: { en: "site ready", he: "האתר מוכן" },
+  active: { en: "live", he: "פעיל" },
+  completed: { en: "finished", he: "הסתיים" },
+  sealed: { en: "archived", he: "בארכיון" },
+};
+
+/** The organizer-facing name for a trip's lifecycle state. */
+export function lifecycleLabel(state: string, language: Language = DEFAULT_LANGUAGE): string {
+  return pick(LIFECYCLE_COPY[state], language) ?? state;
+}
 
 export function uiString(key: string, language: Language = DEFAULT_LANGUAGE): string {
   return UI_STRINGS[language]?.[key] ?? UI_STRINGS[DEFAULT_LANGUAGE][key] ?? key;
@@ -616,9 +994,22 @@ export function askText(question: IntakeQuestion, language: Language = DEFAULT_L
 /**
  * Asking again for a question whose recorded answer does not settle it, quoting
  * what was written. Falls back to the plain question.
+ *
+ * `matchKind` is `IntakeQuestion.unsettledMatchKind`'s reading of WHY the
+ * answer did not settle the question — `"ambiguous"` reads the `ambiguous`
+ * template (falling back to `unsettled` if a question has none); anything
+ * else, or absent, reads `unsettled` as before.
  */
-export function unsettledText(question: IntakeQuestion, written: string, language: Language = DEFAULT_LANGUAGE): string {
-  const template = pick(INTAKE_COPY[question.id]?.unsettled, language);
+export function unsettledText(
+  question: IntakeQuestion,
+  written: string,
+  language: Language = DEFAULT_LANGUAGE,
+  matchKind?: string,
+): string {
+  const copy = INTAKE_COPY[question.id];
+  const template = matchKind === "ambiguous"
+    ? pick(copy?.ambiguous, language) ?? pick(copy?.unsettled, language)
+    : pick(copy?.unsettled, language);
   // A stored date is YYYY-MM-DD; an organizer is never shown that form.
   const answer = readableDate(written, language) ?? written.trim();
   return template ? template.replace("{answer}", answer) : askText(question, language);

@@ -29,6 +29,28 @@ class TopologyValidationTests(unittest.TestCase):
         self.assertEqual("fixture-onboarding", topology.name)
         self.assertEqual("app", topology.lxc.name)
         self.assertEqual("site.example.invalid", topology.proxy.hostname)
+        # trip_slug is never a separate YAML key — every topology.yaml, old or
+        # new, already carries the slug as its top-level `name`.
+        self.assertEqual("fixture-onboarding", topology.lxc.trip_slug)
+
+    def test_lxc_trip_slug_is_always_the_topologys_own_name(self) -> None:
+        topology = load_topology({
+            "version": 1, "name": "tokyo-2026",
+            "proxmox": {
+                "node": "pve",
+                "lxc": {
+                    "name": "trip-tokyo-2026", "template": "t", "storage": "s",
+                    "cores": 2, "memory_mb": 1024, "disk_gb": 8, "bridge": "vmbr0",
+                    "ipv4": "dhcp", "gateway": "192.168.0.1", "nameserver": "192.168.0.41",
+                    "nfs_host_dir": "/mnt/pve/truenas-nfs/trip_9f2c11aa4d",
+                    "nfs_mount_path": "/nfs/trip_9f2c11aa4d",
+                },
+            },
+            "npm": {"hostname": "h", "forward_host": "1.2.3.4", "forward_port": 8080},
+            "cloudflare": {"tunnel_id": "t", "hostname": "h", "service": "s"},
+        })
+
+        self.assertEqual("tokyo-2026", topology.lxc.trip_slug)
 
 
 if __name__ == "__main__":

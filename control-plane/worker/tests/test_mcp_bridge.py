@@ -12,9 +12,11 @@ import json
 import subprocess
 
 from control_plane_worker.mcp_bridge import (
+    BridgeProbeError,
     NullMcpBridgeAdapter,
     ShellMcpBridgeAdapter,
     SshMcpBridgeAdapter,
+    can_probe,
     mcp_port_for_vmid,
 )
 
@@ -57,6 +59,97 @@ class SshMcpBridgeAdapterTests(unittest.TestCase):
             self.adapter().setup("japan-2026", "japan2026")
         with self.run_with(returncode=2), self.assertRaises(RuntimeError):
             self.adapter().setup("japan-2026", "japan2026")
+
+
+class SshMcpBridgeProbeTests(unittest.TestCase):
+    """`probe()` (issue #119): the same key and forced command as `setup()`,
+    asking an already-wired bridge whether it still reaches its trip. The key
+    the check needs stays on the companion host; the worker gets one line."""
+
+    def adapter(self) -> SshMcpBridgeAdapter:
+        return SshMcpBridgeAdapter(host="companion.invalid", user="svc", key_path="/keys/companion")
+
+    def run_with(self, stdout: str = "HEALTH ok\n", returncode: int = 0, stderr: str = ""):
+        return patch("control_plane_worker.mcp_bridge.subprocess.run",
+                     return_value=subprocess.CompletedProcess([], returncode, stdout, stderr))
+
+    def test_the_request_carries_only_the_slug_and_the_profile(self) -> None:
+        with self.run_with() as run:
+            self.adapter().probe("japan-2026", "japan2026")
+        payload = json.loads(run.call_args.kwargs["input"])
+        self.assertEqual(payload, {"record_type": "trip_mcp_bridge_probe", "schema_version": 1,
+                                   "slug": "japan-2026", "profile": {"name": "japan2026"}})
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[-1], "svc@companion.invalid", "no remote command: the forced command decides")
+        self.assertLessEqual(run.call_args.kwargs["timeout"], 120, "a probe must not hold the worker for minutes")
+
+    def test_health_ok_is_reachable(self) -> None:
+        with self.run_with("HEALTH ok\n"):
+            self.assertEqual(self.adapter().probe("japan-2026", "japan2026"), (True, "ok"))
+
+    def test_health_fail_carries_its_code(self) -> None:
+        for code in ("HTTP_401", "EHOSTUNREACH", "none", "NO_KEY", "BRIDGE_401", "NO_HEALTH_ROUTE", "UNRECOGNIZED"):
+            with self.subTest(code=code), self.run_with(f"HEALTH fail {code}\n"):
+                self.assertEqual(self.adapter().probe("japan-2026", "japan2026"), (False, code))
+
+    def test_unsafe_names_are_refused_before_anything_is_sent(self) -> None:
+        with self.run_with() as run:
+            for slug, profile in (("../etc", "japan2026"), ("japan-2026", "Japan 2026"), ("", "japan2026"),
+                                  ("japan-2026", "")):
+                with self.subTest(slug=slug, profile=profile), self.assertRaises(BridgeProbeError):
+                    self.adapter().probe(slug, profile)
+            run.assert_not_called()
+
+    def test_anything_but_exactly_one_verdict_line_is_a_probe_error_not_a_verdict(self) -> None:
+        # A refusal, an older host that does not know the kind, or garbage is
+        # "the question could not be asked" — it must never be read as either
+        # a healthy or a failed bridge.
+        for stdout in ("", "HEALTH ok\nHEALTH fail none\n", "HEALTH  ok\n", "HEALTH fail\n",
+                       "HEALTH fail a b\n", "HEALTH fail " + "A" * 41 + "\n", "HEALTH fail x;y\n",
+                       "WIRED japan2026\n", "health ok\n"):
+            with self.subTest(stdout=stdout), self.run_with(stdout), self.assertRaises(BridgeProbeError):
+                self.adapter().probe("japan-2026", "japan2026")
+
+    def test_a_refusal_is_a_probe_error(self) -> None:
+        with self.run_with("", returncode=2,
+                           stderr="refusing unknown request type: 'trip_mcp_bridge_probe'\n"
+                                  "companion-install-host: handoff validation failed\n"):
+            with self.assertRaises(BridgeProbeError) as ctx:
+                self.adapter().probe("japan-2026", "japan2026")
+        self.assertIn("exited 2", ctx.exception.safe_reason)
+        self.assertIn("handoff validation failed", ctx.exception.safe_reason)
+
+    def test_a_timeout_is_a_probe_error(self) -> None:
+        with patch("control_plane_worker.mcp_bridge.subprocess.run",
+                   side_effect=subprocess.TimeoutExpired(["ssh"], 45)):
+            with self.assertRaises(BridgeProbeError):
+                self.adapter().probe("japan-2026", "japan2026")
+
+    def test_the_error_carries_only_the_scripts_own_last_line_never_other_output(self) -> None:
+        # Whatever else the far side wrote is not repeated into the worker's
+        # log: only a line the forced command itself composed (its `die`
+        # prefix) is kept, bounded.
+        secret = "MCP_API_KEY=" + "cd" * 32
+        with self.run_with("", returncode=1, stderr=f"{secret}\ntraceback: {secret}\n"):
+            with self.assertRaises(BridgeProbeError) as ctx:
+                self.adapter().probe("japan-2026", "japan2026")
+        self.assertNotIn("cd" * 32, ctx.exception.safe_reason)
+        self.assertNotIn("cd" * 32, str(ctx.exception))
+        with self.run_with("", returncode=2, stderr="companion-install-host: " + "x" * 900 + "\n"):
+            with self.assertRaises(BridgeProbeError) as ctx:
+                self.adapter().probe("japan-2026", "japan2026")
+        self.assertLess(len(ctx.exception.safe_reason), 300)
+
+
+class ProbeCapabilityTests(unittest.TestCase):
+    """Which adapters can be asked at all. The sweep probes only these; the
+    Null adapter (the bridge flag off) and the local shell adapter (no host to
+    ask) are skipped, not failed."""
+
+    def test_only_the_ssh_adapter_can_probe(self) -> None:
+        self.assertTrue(can_probe(SshMcpBridgeAdapter(host="h", user="u", key_path="/k")))
+        self.assertFalse(can_probe(NullMcpBridgeAdapter()))
+        self.assertFalse(can_probe(ShellMcpBridgeAdapter(deploy_root="/nowhere", vmid_map={})))
 
 TOPOLOGY_YAML = """\
 version: 1

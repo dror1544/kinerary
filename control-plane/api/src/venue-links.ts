@@ -27,26 +27,45 @@ function normaliseName(value: unknown): string {
 /** Park venue names whose interview-time URL search was rate-limited. Never
  * clobbers a row that already has a URL (ON CONFLICT DO NOTHING). Gated on an
  * active (unconfirmed) session, like the consular endpoint. */
-export async function saveDeferredVenueLinks(
+export async function parkDeferredVenueLinks(
   db: pg.Pool,
-  rawSessionToken: string,
   destination: string,
   names: unknown,
-): Promise<{ ok: true; queued: number } | { ok: false; reason: "NOT_FOUND" | "INVALID_REQUEST" }> {
+): Promise<number> {
+  /* The persistence, without the session gating.
+   *
+   * Two callers park venue names, and only one of them speaks HTTP. The MCP
+   * tool is an untrusted caller and must prove an active session; the relay's
+   * agentless extractor is already inside that session's own turn and has no
+   * token to present. Sharing the body rather than the wrapper is what stops
+   * the second caller from being written as "like the first, but without the
+   * INSERT" — which is exactly what happened: poller.ts computed
+   * venueLinksDeferred and dropped it, so on the agentless path (the default)
+   * no venue was ever owed a URL, the background drain had nothing to retry,
+   * and enrich_config's back-fill correctly found nothing. */
   const dest = normaliseName(destination);
   const list = Array.isArray(names)
     ? [...new Set(names.map(normaliseName).filter(Boolean))].slice(0, 40)
     : [];
-  if (!dest) return { ok: false, reason: "INVALID_REQUEST" };
-  if (!(await sessionActive(db, rawSessionToken))) return { ok: false, reason: "NOT_FOUND" };
-  if (!list.length) return { ok: true, queued: 0 };
+  if (!dest || !list.length) return 0;
   await db.query(
     `INSERT INTO control_plane.venue_links (destination, venue_name, url, source)
      SELECT $1, unnest($2::text[]), NULL, 'deferred'
      ON CONFLICT (destination, venue_name) DO NOTHING`,
     [dest, list],
   );
-  return { ok: true, queued: list.length };
+  return list.length;
+}
+
+export async function saveDeferredVenueLinks(
+  db: pg.Pool,
+  rawSessionToken: string,
+  destination: string,
+  names: unknown,
+): Promise<{ ok: true; queued: number } | { ok: false; reason: "NOT_FOUND" | "INVALID_REQUEST" }> {
+  if (!normaliseName(destination)) return { ok: false, reason: "INVALID_REQUEST" };
+  if (!(await sessionActive(db, rawSessionToken))) return { ok: false, reason: "NOT_FOUND" };
+  return { ok: true, queued: await parkDeferredVenueLinks(db, destination, names) };
 }
 
 type VenueSearchFn = (names: string[], destination: string) => Promise<VenueUrlSearch>;

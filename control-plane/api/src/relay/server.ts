@@ -30,7 +30,7 @@ import { structuredLog } from "../redaction.js";
 import { resolveSecretRef } from "../secrets.js";
 import type { SignupConfig } from "../signup.js";
 import { RelayConnector } from "./connector.js";
-import { resolveChatRoute } from "../chat-router.js";
+import { resolveChatRoute, setCompanionExpectsReply } from "../chat-router.js";
 import { sayForChat,
   agentAlreadySpokeThisTurn,
   getSessionForChat,
@@ -41,7 +41,14 @@ import { MediaStore } from "./media-store.js";
 import type { BotIdentity } from "./dispatch.js";
 import { publishCommandMenu } from "./command-menu.js";
 import { startTripBotPoller } from "./poller.js";
+import { checkDocumentStore, documentStoreFromEnv } from "../document-store.js";
+import { startDocumentSweeper } from "../document-sweeper.js";
+import { codexIsolationProblem, runnerForBinding, taskTimeoutMs } from "../model-runner.js";
+import { startTaskOverrideRefresh, switchableRunner } from "../model-task-settings.js";
 import { HttpTelegramClient, TELEGRAM_API_ROOT, telegramApiRoot, type TelegramClient } from "./telegram-api.js";
+import { assistantEventsFromEnv, assistantEventsSetting } from "../analytics/emitter.js";
+import { startAssistantEventsPurge } from "../analytics/purge-schedule.js";
+import { organizerDocumentRouteFromEnv } from "../document-correction.js";
 
 const log = (line: string) => process.stderr.write(`${line}\n`);
 
@@ -90,6 +97,11 @@ interface Runtime {
   botIdentity?: BotIdentity;
   /** From `relay.interviewer_profile`; absent disables interview forwarding. */
   interviewerProfile?: string;
+  /**
+   * From `signup.super_admin_subject_digest`, whether or not signup shares this
+   * bot: it names a Telegram user, not a bot. Absent disables `/model`.
+   */
+  superAdminSubjectDigest?: string;
   /**
    * From `relay.multiplex_gateway_id`. Absent means routing is exact and a
    * trip with no gateway of its own is reported unreachable rather than
@@ -198,6 +210,9 @@ async function serveRuntime(path: string): Promise<Runtime> {
     interviewerProfile: relay.interviewer_profile,
     multiplexGatewayId: relay.multiplex_gateway_id,
     approvals,
+    ...(profile.signup?.super_admin_subject_digest
+      ? { superAdminSubjectDigest: profile.signup.super_admin_subject_digest }
+      : {}),
   };
 }
 
@@ -225,7 +240,77 @@ async function main(): Promise<void> {
   // so the platform credential never reaches the wire. The gateway fetches
   // each reference back with its own bearer.
   const mediaStore = new MediaStore();
+  // Undefined unless DOCUMENT_STORE_DIR is set. Documents are then still read
+  // and registered; their bytes are simply not kept.
+  // Originals cannot be rebuilt, so a store that is not a real, writable,
+  // mounted volume is refused. DOCUMENT_STORE_REQUIRED=1 (compose.vm.yml) makes
+  // that fatal at startup; elsewhere the relay runs without keeping originals
+  // rather than keeping them somewhere they will be lost.
+  const storeReadiness = process.env.DOCUMENT_STORE_DIR || process.env.DOCUMENT_STORE_REQUIRED === "1"
+    ? await checkDocumentStore(process.env)
+    : null;
+  if (storeReadiness && !storeReadiness.ok) {
+    const fatal = process.env.DOCUMENT_STORE_REQUIRED === "1";
+    log(structuredLog(fatal ? "error" : "warn", "relay.document_store_not_ready", {
+      reason: storeReadiness.reason,
+      detail: storeReadiness.detail,
+      hint: fatal ? "refusing to start: originals would not be kept safely" : "running without keeping originals",
+    }));
+    if (fatal) process.exit(1);
+  }
+  const documentStore = storeReadiness?.ok ? documentStoreFromEnv() : undefined;
+  // The environment's pinned models, overridable per task at runtime by the
+  // super admin (/model) — see model-task-settings.ts. Undefined when nothing is
+  // configured, which keeps the no-runner behaviour exactly as it was.
+  // Codex runs with its tools switched off by feature name, and those names are
+  // version-specific. Checked once here, only when some task is bound to codex;
+  // a mismatch refuses codex bindings loudly instead of failing every call.
+  const codexBound = Object.entries(process.env).some(([key, value]) => /_RUNNER$/.test(key) && value?.trim().toLowerCase() === "codex");
+  if (codexBound) {
+    const problem = await codexIsolationProblem(process.env.CODEX_BIN || "codex");
+    if (problem) {
+      process.env.KINERARY_CODEX_ISOLATION_UNVERIFIED = "1";
+      log(structuredLog("error", "relay.codex_isolation_unverified", {
+        detail: problem,
+        hint: "codex bindings are refused until the isolation list in model-runner.ts matches this codex",
+      }));
+    }
+  }
+  const envRunner = modelRunnerFromEnv();
+  const modelRunner = envRunner
+    ? switchableRunner(envRunner, (task, binding) =>
+        runnerForBinding(binding.runner, binding.model, taskTimeoutMs(task), task))
+    : undefined;
   const mediaBaseUrl = `http://${runtime.host === "0.0.0.0" ? "127.0.0.1" : runtime.host}:${runtime.port}`;
+
+  // Assistant events (#177): metadata-only facts about each trip's
+  // conversation, written to the control-plane database. OFF unless
+  // ASSISTANT_EVENTS_ENABLED=1 — and unset is deliberately off, the opposite
+  // of INTERPRET_*: shipping this code must never be what switches recording
+  // on. Undefined here means every hook below records nothing.
+  const assistantEvents = assistantEventsFromEnv(process.env, runtime.db, log);
+
+  // #327 precondition 1: the ONE line a restart script — or a person reading
+  // logs — can grep for to know whether THIS process records anything, so a
+  // deployment can never turn recording on silently. Deliberately its own
+  // fixed event name, separate from assistantEventsFromEnv's own log line
+  // (which the emitter owns and which also reports "no database" as
+  // effectively off): this one names only the boolean and the word "env" —
+  // never the raw setting value, which is not a secret but is also not
+  // anything a boot line needs to repeat.
+  const eventsSetting = assistantEventsSetting(process.env);
+  log(structuredLog("info", eventsSetting.enabled ? "assistant_events.enabled" : "assistant_events.disabled", {
+    enabled: eventsSetting.enabled,
+    source: "env",
+  }));
+
+  // The organizer's private-chat document route (#178): a file they send
+  // after confirmation is read here and proposed back, and an Approve
+  // re-provisions the site — a redeploy, for a live trip. OFF unless
+  // ORGANIZER_DOCUMENT_ROUTE_ENABLED=1 (exactly), so shipping this code never
+  // switches it on; off, such a file goes to the companion as before. Read
+  // once, and its state logged either way (`relay.organizer_document_route`).
+  const organizerDocumentRoute = organizerDocumentRouteFromEnv(process.env, log);
 
   const connector = new RelayConnector({
     gatewaySecrets: runtime.gatewaySecrets,
@@ -234,6 +319,7 @@ async function main(): Promise<void> {
     host: runtime.host,
     mediaStore,
     log,
+    ...(assistantEvents ? { assistantEvents } : {}),
     ...(runtime.multiplexGatewayId ? { fallbackGatewayId: runtime.multiplexGatewayId } : {}),
     // Track 4: on an interview chat the agent's words reach the organizer only
     // through `say_for_chat` / `ask_question_for_chat`, so the router keeps the
@@ -279,6 +365,11 @@ async function main(): Promise<void> {
             const said = await sayForChat(runtime.db!, chatId, text);
             return said.ok;
           },
+          // Migration 0053: lets a companion send that's a question open the
+          // one-shot reply-capture window on its chat's binding.
+          setExpectsReply: async (chatId: string, expects: boolean) => {
+            await setCompanionExpectsReply(runtime.db!, chatId, expects);
+          },
         }
       : {}),
   });
@@ -290,6 +381,9 @@ async function main(): Promise<void> {
   await connector.listen();
 
   let stopPolling: (() => void) | undefined;
+  let stopSweeping: (() => void) | undefined;
+  let stopOverrides: (() => void) | undefined;
+  let stopEventsPurge: (() => void) | undefined;
   if (runtime.db) {
     // …and poll only once the companions are back. Every restart (upgrade,
     // rollback, reboot, runner switch) otherwise answers the messages Telegram
@@ -325,12 +419,29 @@ async function main(): Promise<void> {
       interviewerProfile: runtime.interviewerProfile,
       approvals: runtime.approvals,
       media: { telegram: runtime.telegram, store: mediaStore, baseUrl: mediaBaseUrl, log },
-      // Undefined unless INTERPRET_RUNNER is set. A session flagged onto the
-      // interpret path without one still works: the router asks its own
-      // questions from intake-copy.ts, which is slower, not broken.
-      modelRunner: modelRunnerFromEnv(),
+      documentStore,
+      superAdminSubjectDigest: runtime.superAdminSubjectDigest,
+      // The switchable runner computed above, so a super admin's `/model`
+      // override reaches the trip bot poller too — not a fresh
+      // `modelRunnerFromEnv()` that would silently ignore it. Undefined unless
+      // INTERPRET_RUNNER is set. A session flagged onto the interpret path
+      // without one still works: the router asks its own questions from
+      // intake-copy.ts, which is slower, not broken.
+      modelRunner,
+      ...(assistantEvents ? { assistantEvents } : {}),
+      ...(organizerDocumentRoute ? { organizerDocumentRoute: true } : {}),
       log,
     });
+    // Clears interrupted document writes and claims — see document-sweeper.ts.
+    stopSweeping = startDocumentSweeper(runtime.db, documentStore, log);
+    // Retention for assistant events (#186): a daily purge, scheduled only
+    // when recording is on (`ASSISTANT_EVENTS_ENABLED=1`) — otherwise no timer
+    // exists. Undefined when off.
+    stopEventsPurge = startAssistantEventsPurge(process.env, runtime.db, log);
+    // Keeps a super admin's `/model` override actually in force. Without this,
+    // `/model` writes the override to the database and the switchable runner
+    // never reads it back — the command reports success and changes nothing.
+    if (modelRunner) stopOverrides = startTaskOverrideRefresh(runtime.db, modelRunner, log);
   }
 
   log(structuredLog("info", "relay.ready", {
@@ -346,8 +457,13 @@ async function main(): Promise<void> {
     process.on(signal, () => {
       log(structuredLog("info", "relay.shutting_down", { signal }));
       stopPolling?.();
-      void connector
-        .close()
+      stopSweeping?.();
+      stopOverrides?.();
+      stopEventsPurge?.();
+      // One last bounded write of what is queued; a failure only drops events.
+      void (assistantEvents?.stop() ?? Promise.resolve())
+        .catch(() => {})
+        .then(() => connector.close())
         .then(() => runtime.db?.end())
         .then(() => process.exit(0))
         .catch(() => process.exit(1));

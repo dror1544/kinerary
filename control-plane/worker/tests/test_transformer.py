@@ -7,11 +7,14 @@ import unittest
 from datetime import date
 from pathlib import Path
 
+from control_plane_worker import transformer
 from control_plane_worker.transformer import (
     _names_sound_alike,
     _resolve_organizers,
+    _stable_id,
     derive_days_from_anchors,
     derive_bookings,
+    derive_rsvp_activities,
     derive_trip_slug,
     transform_intake,
 )
@@ -209,6 +212,15 @@ class TransformerTests(unittest.TestCase):
         intake = {**JAPAN_INTAKE, "trip_type": _choice_other("Extended family reunion")}
         config = transform_intake(intake)
         self.assertIn("Extended family reunion", config["meta"]["title"])
+
+    def test_other_trip_type_reaches_the_companion_as_context(self) -> None:
+        intake = {**JAPAN_INTAKE, "trip_type": _choice_other("Extended family reunion")}
+        config = transform_intake(intake)
+        instructions = config["agent"]["standing_instructions"]
+        self.assertTrue(any(
+            item["text"]["en"] == "The organizer describes this trip as: Extended family reunion"
+            for item in instructions
+        ))
 
     def test_other_group_size_extracts_the_leading_number(self) -> None:
         # A stat "number" must actually be a number, not the organizer's
@@ -701,6 +713,22 @@ class TransformerTests(unittest.TestCase):
         self.assertEqual(config["meta"]["brand"], "FAMILY TRIP 2026")
         self.assertIn("Family Trip 2026", config["meta"]["title"])
 
+    def test_a_destination_leading_with_its_country_is_named_by_it(self) -> None:
+        # 2026-09-14, automated manual run: "Portugal — Lisbon and Porto" was titled "Family Trip 2026" and got no currency.
+        for destination, country, brand in [
+            ("Portugal — Lisbon and Porto", "Portugal", "PORTUGAL 2026"),
+            ("Japan: Tokyo, Kyoto", "Japan", "JAPAN 2026"),
+        ]:
+            with self.subTest(destination=destination):
+                config = transform_intake({**JAPAN_INTAKE, "destination": _text(destination)}, today=date(2026, 8, 20))
+                self.assertEqual(config["meta"]["brand"], brand)
+                self.assertTrue(config["meta"]["title"].startswith(brand.title()))
+                self.assertIn(country, config["travel_info"]["countries"])
+
+    def test_cities_joined_by_and_with_no_leading_country_still_use_the_trip_type(self) -> None:
+        config = transform_intake({**JAPAN_INTAKE, "destination": _text("Lisbon and Porto")}, today=date(2026, 8, 20))
+        self.assertEqual(config["meta"]["brand"], "FAMILY TRIP 2026")
+
     def test_single_word_destination_becomes_the_brand_directly(self) -> None:
         intake = {**JAPAN_INTAKE, "destination": _text("USA")}
         config = transform_intake(intake, today=date(2026, 8, 20))
@@ -752,12 +780,17 @@ class SchemaV2Tests(unittest.TestCase):
         # byte-identical output to the intake that could not have answered them.
         baseline = transform_intake({**JAPAN_INTAKE, "travelers": TRAVELERS}, today=date(2026, 8, 20))
         self.assertNotIn("agent", baseline)
+        # JAPAN_INTAKE's destination ("Japan") resolves to a real zone, so this
+        # also proves a derived-only timezone cannot leak into meta on its own
+        # — same rule as agent.timezone, now checked for the meta key too.
+        self.assertNotIn("timezone", baseline["meta"])
         for participant in baseline["participants"]:
             self.assertNotIn("needs", participant)
 
     def test_all_none_answers_produce_no_agent_block(self) -> None:
         config = self._config(dietary=_multi("none"), bot_proactive=_multi("none"))
         self.assertNotIn("agent", config)
+        self.assertNotIn("timezone", config["meta"])
 
     # ── dietary ───────────────────────────────────────────────────────────────
 
@@ -796,6 +829,33 @@ class SchemaV2Tests(unittest.TestCase):
         need = self._needs(config, "eitan")[0]
         self.assertEqual(need["type"], "allergy")
         self.assertEqual(need["severity"], "critical")
+
+    def test_a_first_name_scopes_a_need_to_a_traveller_listed_by_full_name(self) -> None:
+        # 2026-09-14, automated multi run: the scope said "Omri", the roster "Omri Levi", and the need went group-wide.
+        config = self._config(
+            travelers=_structured([
+                {"name": "Omri Levi", "age": 10, "family": "Levi"},
+                {"name": "Yael Levi", "age": 8, "family": "Levi"},
+            ]),
+            dietary=_multi("vegetarian"),
+            dietary_scope=_structured({"vegetarian": ["Omri"]}),
+        )
+        omri = next(p for p in config["participants"] if p["name"] == "Omri Levi")
+        self.assertEqual([n["text"]["en"] for n in omri.get("needs", [])], ["Vegetarian"])
+        self.assertNotIn("standing_instructions", config.get("agent") or {})
+
+    def test_a_first_name_two_travellers_share_stays_group_wide(self) -> None:
+        config = self._config(
+            travelers=_structured([
+                {"name": "Dana Levi", "age": 40, "family": "Levi"},
+                {"name": "Dana Cohen", "age": 38, "family": "Cohen"},
+            ]),
+            dietary=_multi("nut_allergy"),
+            dietary_scope=_structured({"nut_allergy": ["Dana"]}),
+        )
+        for participant in config["participants"]:
+            self.assertNotIn("needs", participant, "an ambiguous name must not pick one of them")
+        self.assertEqual(len(config["agent"]["standing_instructions"]), 1)
 
     def test_unscoped_restriction_survives_as_a_group_instruction(self) -> None:
         # Ticked but never scoped, and scoped to someone not on the roster:
@@ -894,6 +954,9 @@ class SchemaV2Tests(unittest.TestCase):
         self.assertEqual(agent["tone"], "playful")
         self.assertEqual(agent["timezone"], "Asia/Tokyo")
         self.assertEqual(agent["proactive"], {"morning_briefing": "07:30", "flight_changes": True})
+        # The site-facing field living-journey.js's tripTimeZone() actually
+        # reads — the same resolved value, projected into BOTH places.
+        self.assertEqual(config["meta"]["timezone"], "Asia/Tokyo")
 
     def test_named_assistant_without_gender_falls_back_to_neutral(self) -> None:
         # Hebrew conjugates by gender; 'neutral' is gender-avoidant phrasing,
@@ -1000,8 +1063,8 @@ class SchemaV2Tests(unittest.TestCase):
 
     def test_a_hebrew_given_name_alone_resolves(self) -> None:
         """Run 14, live: the interview asked who the organizer is and the
-        organizer typed "ניר". The roster held name="ניר סולומון",
-        name_en="Nir", username="nir" — so the ENGLISH given name matched (it
+        organizer typed "רון". The roster held name="רון מרגולין",
+        name_en="Ron", username="ron" — so the ENGLISH given name matched (it
         is already bare in name_en) and the HEBREW one did not, purely because
         `name` carries the full name and `name_en` carries only the first.
 
@@ -1013,12 +1076,12 @@ class SchemaV2Tests(unittest.TestCase):
             # The roster exactly as run 14 produced it: full Hebrew `name`,
             # given-name-only `name_en`.
             travelers=_structured([
-                {"name": "ניר סולומון", "name_en": "Nir", "family": "סולומון", "family_en": "Solomon"},
-                {"name": "אלה סולומון", "name_en": "Ela", "family": "סולומון", "family_en": "Solomon"},
+                {"name": "רון מרגולין", "name_en": "Ron", "family": "מרגולין", "family_en": "Margolin"},
+                {"name": "טלי מרגולין", "name_en": "Tali", "family": "מרגולין", "family_en": "Margolin"},
             ]),
-            organizer_identity=_text("ניר"),
+            organizer_identity=_text("רון"),
         )
-        self.assertEqual(config["agent"]["organizers"], ["nir"])
+        self.assertEqual(config["agent"]["organizers"], ["ron"])
 
     def test_a_given_name_two_travelers_share_stays_unresolved(self) -> None:
         """The reason given names were not matched in the first place, and the
@@ -1026,10 +1089,10 @@ class SchemaV2Tests(unittest.TestCase):
         to whoever the roster happens to list first."""
         config = self._config(
             travelers=_structured([
-                {"name": "ניר סולומון", "name_en": "Nir S", "family": "סולומון"},
-                {"name": "ניר כהן", "name_en": "Nir C", "family": "כהן"},
+                {"name": "רון מרגולין", "name_en": "Ron M", "family": "מרגולין"},
+                {"name": "רון כהן", "name_en": "Ron C", "family": "כהן"},
             ]),
-            organizer_identity=_text("ניר"),
+            organizer_identity=_text("רון"),
         )
         self.assertNotIn("agent", config)
 
@@ -1037,10 +1100,10 @@ class SchemaV2Tests(unittest.TestCase):
         # Adding given-name forms must not make a precise answer ambiguous.
         config = self._config(
             travelers=_structured([
-                {"name": "ניר סולומון", "name_en": "Nir S", "family": "סולומון"},
-                {"name": "ניר כהן", "name_en": "Nir C", "family": "כהן"},
+                {"name": "רון מרגולין", "name_en": "Ron M", "family": "מרגולין"},
+                {"name": "רון כהן", "name_en": "Ron C", "family": "כהן"},
             ]),
-            organizer_identity=_text("ניר כהן"),
+            organizer_identity=_text("רון כהן"),
         )
         self.assertEqual(len(config["agent"]["organizers"]), 1)
 
@@ -1048,10 +1111,10 @@ class SchemaV2Tests(unittest.TestCase):
         # A family name is not a person. Unchanged by given-name matching.
         config = self._config(
             travelers=_structured([
-                {"name": "ניר סולומון", "name_en": "Nir", "family": "סולומון"},
-                {"name": "אלה סולומון", "name_en": "Ela", "family": "סולומון"},
+                {"name": "רון מרגולין", "name_en": "Ron", "family": "מרגולין"},
+                {"name": "טלי מרגולין", "name_en": "Tali", "family": "מרגולין"},
             ]),
-            organizer_identity=_text("סולומון"),
+            organizer_identity=_text("מרגולין"),
         )
         self.assertNotIn("agent", config)
 
@@ -1080,20 +1143,20 @@ class NonLatinNameTests(unittest.TestCase):
 
     def test_supplied_english_names_become_the_usernames(self) -> None:
         config = self._config([
-            {"name": "ניר", "name_en": "Nir", "age": 56, "family": "סולומון", "family_en": "Solomon"},
-            {"name": "אלה", "name_en": "Ella", "age": 53, "family": "סולומון", "family_en": "Solomon"},
+            {"name": "רון", "name_en": "Ron", "age": 47, "family": "מרגולין", "family_en": "Margolin"},
+            {"name": "טלי", "name_en": "Tali", "age": 45, "family": "מרגולין", "family_en": "Margolin"},
         ])
 
-        self.assertEqual(["nir", "ella"], [p["username"] for p in config["participants"]])
+        self.assertEqual(["ron", "tali"], [p["username"] for p in config["participants"]])
 
     def test_family_keeps_hebrew_display_but_uses_english_where_given(self) -> None:
         config = self._config([
-            {"name": "ניר", "name_en": "Nir", "age": 56, "family": "סולומון", "family_en": "Solomon"},
+            {"name": "רון", "name_en": "Ron", "age": 47, "family": "מרגולין", "family_en": "Margolin"},
         ])
 
         family = config["families"][0]
-        self.assertEqual("סולומון", family["name"]["he"])
-        self.assertEqual("Solomon", family["name"]["en"])
+        self.assertEqual("מרגולין", family["name"]["he"])
+        self.assertEqual("Margolin", family["name"]["en"])
 
 
 class PhaseVenuesTests(unittest.TestCase):
@@ -1163,6 +1226,154 @@ class PhaseVenuesTests(unittest.TestCase):
         p = transform_intake(intake)["phases"][0]
         self.assertEqual(len(p["venues"]), 1)
         self.assertEqual(p["venues"][0]["url"], "https://www.tokyo-skytree.jp/en/")
+
+
+class PhasePackingTests(unittest.TestCase):
+    """phase.packing — readiness.tsx expects each entry to be a
+    [{he,en} category, {he,en} item] pair, exactly config.packing_general's
+    shape (see trip-web/src/readiness.tsx and its own hardcoded fallback,
+    which this deliberately does not touch).
+
+    Since #167 (2026-09-25) a list is emitted only when the phase's place and
+    season are confidently known; otherwise the key is absent and the reason
+    is logged. The full acceptance table is tests/test_packing_climate.py.
+    The tests below that used to rely on "everything unresolved is north",
+    or on a country-level answer the audit rework (same day) withdrew, now
+    name a phase the criterion keeps (Tokyo, Canberra) or state the
+    abstention reason."""
+
+    def _phase(self, destination: str, start: str, end: str, name: str = "Stop"):
+        intake = {
+            **JAPAN_INTAKE,
+            "destination": _text(destination),
+            "phases": _structured([{"name": name, "start": start, "end": end}]),
+        }
+        return transform_intake(intake)["phases"][0]
+
+    def _reason(self, destination: str, start, name: str = "Stop"):
+        from datetime import date as _date
+        start_date = _date.fromisoformat(start) if start else None
+        return transformer._phase_packing_decision(destination, start_date, None, (name,))[1]
+
+    def test_northern_hemisphere_winter_phase_gets_cold_weather_items(self) -> None:
+        # Was: bare "Japan" defaulted north. Japan runs from Hokkaido to
+        # subtropical Okinawa, so the bare country now abstains; a phase that
+        # names Tokyo is placed, and January is winter there.
+        self.assertEqual("climate_varies_by_area", self._reason("Japan", "2027-01-10"))
+        self.assertNotIn("packing", self._phase("Japan", "2027-01-10", "2027-01-17"))
+        phase = self._phase("Japan", "2027-01-10", "2027-01-17", name="Tokyo")
+        self.assertIn("packing", phase)
+        for category, item in phase["packing"]:
+            self.assertIn("he", category)
+            self.assertIn("en", category)
+            self.assertIn("he", item)
+            self.assertIn("en", item)
+        items_en = {item["en"] for _category, item in phase["packing"]}
+        self.assertIn("Warm jacket", items_en)
+        self.assertNotIn("Sunscreen", items_en)
+
+    def test_southern_hemisphere_equivalent_month_gets_hot_weather_items(self) -> None:
+        # Same calendar month, Canberra: January is high summer there. Was:
+        # the bare country "Australia" -- tropical Cairns to Tasmania -- which
+        # now abstains; so does Sydney, whose 12.5C July is no gloves winter.
+        self.assertEqual("climate_varies_by_area", self._reason("Australia", "2027-01-10"))
+        self.assertEqual("mild_winter", self._reason("Australia", "2027-07-10", name="Sydney"))
+        phase = self._phase("Australia", "2027-01-10", "2027-01-17", name="Canberra")
+        items_en = {item["en"] for _category, item in phase["packing"]}
+        self.assertIn("Sunscreen", items_en)
+        self.assertNotIn("Warm jacket", items_en)
+
+    def test_a_phase_with_no_destination_gets_no_packing_additions(self) -> None:
+        # destination is a required question, so an empty/whitespace-only
+        # typed answer still transforms rather than raising -- falls back to
+        # the "Unknown Destination" placeholder brand text elsewhere, but
+        # must not fabricate a season for it here.
+        intake = {
+            **JAPAN_INTAKE,
+            "destination": _text("   "),
+            "phases": _structured([{"name": "Stop", "start": "2027-01-10", "end": "2027-01-17"}]),
+        }
+        phase = transform_intake(intake)["phases"][0]
+        self.assertNotIn("packing", phase)
+        self.assertEqual("no_destination", self._reason("   ", "2027-01-10"))
+
+    def test_a_phase_with_no_dates_gets_no_packing_additions(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "phases": _structured([{"name": "Stop"}]),
+        }
+        phase = transform_intake(intake)["phases"][0]
+        self.assertNotIn("packing", phase)
+        self.assertEqual("no_dates", self._reason("Japan", None))
+
+    def test_packing_shares_the_general_lists_bilingual_tuple_shape(self) -> None:
+        # A named city: since the second audit no country is ever inherited.
+        self.assertEqual("climate_varies_by_area", self._reason("Germany", "2027-07-05"))
+        phase = self._phase("Germany", "2027-07-05", "2027-07-12", name="Berlin")
+        self.assertTrue(phase["packing"])
+        for pair in phase["packing"]:
+            self.assertEqual(len(pair), 2)
+            category, item = pair
+            self.assertEqual(set(category.keys()), {"he", "en"})
+            self.assertEqual(set(item.keys()), {"he", "en"})
+
+    def test_a_hebrew_typed_southern_hemisphere_destination_still_flips_the_season(self) -> None:
+        # "ניו זילנד" / "קווינסטאון" is New Zealand / Queenstown, typed in
+        # Hebrew. An English-only lookup would miss it and (before #167)
+        # default north, inverting the advice for a January (southern summer)
+        # trip. The bare countries now abstain: Australia and New Zealand
+        # both vary by area (Auckland's July is 10.9C).
+        self.assertEqual("climate_varies_by_area", self._reason("אוסטרליה", "2027-01-10"))
+        self.assertEqual("climate_varies_by_area", self._reason("ניו זילנד", "2027-01-10"))
+        phase = self._phase("ניו זילנד", "2027-01-10", "2027-01-17", name="קווינסטאון")
+        items_en = {item["en"] for _category, item in phase["packing"]}
+        self.assertIn("Sunscreen", items_en)
+        self.assertNotIn("Warm jacket", items_en)
+
+    def test_a_hebrew_typed_northern_hemisphere_destination_keeps_its_season(self) -> None:
+        # "יפן" is Japan, already aliased for currency/timezone; with a Hebrew
+        # phase name "טוקיו" the phase is placed, and January is winter.
+        self.assertEqual("climate_varies_by_area", self._reason("יפן", "2027-01-10"))
+        phase = self._phase("יפן", "2027-01-10", "2027-01-17", name="טוקיו")
+        items_en = {item["en"] for _category, item in phase["packing"]}
+        self.assertIn("Warm jacket", items_en)
+        self.assertNotIn("Sunscreen", items_en)
+
+    def test_perugia_italy_is_not_mistaken_for_peru(self) -> None:
+        # "peru" is a substring of "Perugia" — a real Italian city, not
+        # Peru. A raw substring match on the typed text would read it as Peru
+        # (tropical). It must resolve through an exact, segment-level lookup
+        # to Italy -- which since the audit rework abstains as varying by
+        # area (Sicily, Puglia), so the REASON is what proves it was Italy.
+        self.assertEqual("climate_varies_by_area", self._reason("Perugia, Italy", "2027-01-10"))
+        self.assertEqual("tropical", self._reason("Peru", "2027-01-10"))
+        self.assertNotIn("packing", self._phase("Perugia, Italy", "2027-01-10", "2027-01-17"))
+
+    def test_each_phase_is_placed_on_its_own(self) -> None:
+        # One hemisphere per TRIP served every phase before #167. A trip to
+        # two continents in one January gets winter for Munich, summer for
+        # Christchurch, and nothing for a stop it cannot place.
+        intake = {
+            **JAPAN_INTAKE,
+            "destination": _text("Germany, New Zealand"),
+            "phases": _structured([
+                {"name": "Munich", "start": "2027-01-03", "end": "2027-01-09"},
+                {"name": "Christchurch", "start": "2027-01-10", "end": "2027-01-17"},
+                {"name": "Road trip", "start": "2027-01-18", "end": "2027-01-20"},
+            ]),
+        }
+        munich, christchurch, road_trip = transform_intake(intake)["phases"]
+        self.assertIn("Warm jacket", {i["en"] for _c, i in munich["packing"]})
+        self.assertIn("Sunscreen", {i["en"] for _c, i in christchurch["packing"]})
+        self.assertNotIn("packing", road_trip)
+
+    def test_the_full_phase_name_is_read_before_its_shortened_form(self) -> None:
+        # "Perth, Scotland" shortens to "Perth" -- a city in Australia. Read
+        # short-first, a July phase in the Highlands got the southern WINTER
+        # list (audit, 2026-09-25). The full name demotes Perth as a namesake.
+        phase = self._phase("Scottish Highlands", "2027-07-10", "2027-07-17", name="Perth, Scotland")
+        self.assertEqual("Perth", phase["title"]["en"])
+        self.assertNotIn("packing", phase)
 
 
 class HomeCountryTests(unittest.TestCase):
@@ -1500,127 +1711,127 @@ class ResolveOrganizersTests(unittest.TestCase):
     """
 
     #: Run 13's actual roster, as transformed on 2026-09-06.
-    SOLOMONS = [
-        {"username": "nir", "name": "ניר", "name_en": "Nir", "family": "סולומון", "family_en": "Solomon"},
-        {"username": "ella", "name": "אלה", "name_en": "Ella", "family": "סולומון", "family_en": "Solomon"},
-        {"username": "noa", "name": "נעה", "name_en": "Noa", "family": "סולומון", "family_en": "Solomon"},
-        {"username": "maya", "name": "מאיה", "name_en": "Maya", "family": "סולומון", "family_en": "Solomon"},
-        {"username": "shai", "name": "שי", "name_en": "Shai", "family": "סולומון", "family_en": "Solomon"},
+    MARGOLINS = [
+        {"username": "ron", "name": "רון", "name_en": "Ron", "family": "מרגולין", "family_en": "Margolin"},
+        {"username": "tali", "name": "טלי", "name_en": "Tali", "family": "מרגולין", "family_en": "Margolin"},
+        {"username": "yael", "name": "יעל", "name_en": "Yael", "family": "מרגולין", "family_en": "Margolin"},
+        {"username": "dana", "name": "דנה", "name_en": "Dana", "family": "מרגולין", "family_en": "Margolin"},
+        {"username": "gal", "name": "גל", "name_en": "Gal", "family": "מרגולין", "family_en": "Margolin"},
     ]
 
     def _resolve(self, stated: str, participants=None) -> list[str]:
         return _resolve_organizers(
-            {"organizer_identity": _text(stated)}, participants or list(self.SOLOMONS)
+            {"organizer_identity": _text(stated)}, participants or list(self.MARGOLINS)
         )
 
     def test_the_run_13_answer_that_matched_nobody(self) -> None:
         # Verbatim. This returned [] on 2026-09-06 and cost the trip its
         # companion; it is the whole reason this class exists.
-        self.assertEqual(self._resolve("ניר סולומון"), ["nir"])
+        self.assertEqual(self._resolve("רון מרגולין"), ["ron"])
 
     def test_full_name_in_either_script(self) -> None:
         # Answering with your full name is the NORMAL case, not an edge one.
-        self.assertEqual(self._resolve("Nir Solomon"), ["nir"])
-        self.assertEqual(self._resolve("ניר סולומון"), ["nir"])
+        self.assertEqual(self._resolve("Ron Margolin"), ["ron"])
+        self.assertEqual(self._resolve("רון מרגולין"), ["ron"])
 
     def test_full_name_across_scripts(self) -> None:
         # Rosters are mixed in practice — a Hebrew given name whose household
         # label was only ever transliterated, or the reverse.
-        self.assertEqual(self._resolve("ניר Solomon"), ["nir"])
-        self.assertEqual(self._resolve("Nir סולומון"), ["nir"])
+        self.assertEqual(self._resolve("רון Margolin"), ["ron"])
+        self.assertEqual(self._resolve("Ron מרגולין"), ["ron"])
 
     def test_the_forms_that_already_worked_still_do(self) -> None:
-        for stated in ("ניר", "Nir", "nir"):
+        for stated in ("רון", "Ron", "ron"):
             with self.subTest(stated=stated):
-                self.assertEqual(self._resolve(stated), ["nir"])
+                self.assertEqual(self._resolve(stated), ["ron"])
 
     def test_case_and_spacing_do_not_decide_reachability(self) -> None:
-        for stated in ("  nir  solomon ", "NIR SOLOMON", "Nir  Solomon"):
+        for stated in ("  ron  margolin ", "RON MARGOLIN", "Ron  Margolin"):
             with self.subTest(stated=stated):
-                self.assertEqual(self._resolve(stated), ["nir"])
+                self.assertEqual(self._resolve(stated), ["ron"])
 
     def test_a_bare_family_name_names_a_household_not_a_person(self) -> None:
         # Five people share it. Matching would hand one of them — whichever
         # the roster listed first — the organizer's private channel.
-        self.assertEqual(self._resolve("סולומון"), [])
-        self.assertEqual(self._resolve("Solomon"), [])
+        self.assertEqual(self._resolve("מרגולין"), [])
+        self.assertEqual(self._resolve("Margolin"), [])
 
     def test_an_ambiguous_answer_is_refused_rather_than_guessed(self) -> None:
         twins = [
-            {"username": "shai_a", "name": "שי", "name_en": "Shai", "family": "כהן"},
-            {"username": "shai_b", "name": "שי", "name_en": "Shai", "family": "לוי"},
+            {"username": "gal_a", "name": "גל", "name_en": "Gal", "family": "כהן"},
+            {"username": "gal_b", "name": "גל", "name_en": "Gal", "family": "לוי"},
         ]
-        self.assertEqual(self._resolve("שי", twins), [])
+        self.assertEqual(self._resolve("גל", twins), [])
         # ...and the family name is exactly what disambiguates them.
-        self.assertEqual(self._resolve("שי כהן", twins), ["shai_a"])
+        self.assertEqual(self._resolve("גל כהן", twins), ["gal_a"])
 
     def test_someone_who_is_not_on_the_trip_matches_nobody(self) -> None:
         self.assertEqual(self._resolve("Dana Levi"), [])
 
     def test_no_answer_is_not_a_match(self) -> None:
-        self.assertEqual(_resolve_organizers({}, list(self.SOLOMONS)), [])
+        self.assertEqual(_resolve_organizers({}, list(self.MARGOLINS)), [])
         self.assertEqual(self._resolve("   "), [])
 
     def test_the_shape_the_transformer_actually_produces(self) -> None:
         # The tests above hand `_resolve_organizers` a roster carrying
-        # `family: "סולומון"`. `_build_participants` does not produce that: it
-        # SLUGIFIES family to "solomon" and drops `family_en` entirely. So a
+        # `family: "מרגולין"`. `_build_participants` does not produce that: it
+        # SLUGIFIES family to "margolin" and drops `family_en` entirely. So a
         # fix verified only against the shape above still leaves the live path
         # broken — which is exactly what happened on the first attempt at this
         # fix, caught by the provisioner integration test rather than here.
         transformed = [
-            {"username": "nir", "name": "ניר", "name_en": "Nir", "family": "solomon"},
-            {"username": "noa", "name": "נעה", "name_en": "Noa", "family": "solomon"},
+            {"username": "ron", "name": "רון", "name_en": "Ron", "family": "margolin"},
+            {"username": "yael", "name": "יעל", "name_en": "Yael", "family": "margolin"},
         ]
         intake = {
-            "organizer_identity": _text("ניר סולומון"),
+            "organizer_identity": _text("רון מרגולין"),
             "travelers": {"kind": "structured", "schema_version": 3, "data": [
-                {"name": "ניר", "name_en": "Nir", "family": "סולומון", "family_en": "Solomon"},
-                {"name": "נעה", "name_en": "Noa", "family": "סולומון", "family_en": "Solomon"},
+                {"name": "רון", "name_en": "Ron", "family": "מרגולין", "family_en": "Margolin"},
+                {"name": "יעל", "name_en": "Yael", "family": "מרגולין", "family_en": "Margolin"},
             ]},
         }
-        self.assertEqual(_resolve_organizers(intake, transformed), ["nir"])
+        self.assertEqual(_resolve_organizers(intake, transformed), ["ron"])
 
         # And the English pair, which the slug happens to resemble but which
         # must resolve through the raw roster rather than by luck.
-        intake["organizer_identity"] = _text("Nir Solomon")
-        self.assertEqual(_resolve_organizers(intake, transformed), ["nir"])
+        intake["organizer_identity"] = _text("Ron Margolin")
+        self.assertEqual(_resolve_organizers(intake, transformed), ["ron"])
 
     # 2026-09-11, the first automated full cycle: a natural answer to "which of
     # the travellers are you?" is a name WITH something around it, and every
     # one of these matched nobody — so the trip provisioned with no companion.
     def test_a_name_followed_by_a_description(self) -> None:
-        for stated in ("ניר, אבא של המשפחה", "Nir - the dad", "Nir — organizing this", "Nir (the dad)"):
+        for stated in ("רון, אבא של המשפחה", "Ron - the dad", "Ron — organizing this", "Ron (the dad)"):
             with self.subTest(stated=stated):
-                self.assertEqual(self._resolve(stated), ["nir"])
+                self.assertEqual(self._resolve(stated), ["ron"])
 
     def test_a_self_reference_in_front_of_the_name(self) -> None:
-        for stated in ("אני ניר", "זה אני, ניר", "I'm Nir", "I am Nir Solomon", "me (Nir)", "it's me, Nir"):
+        for stated in ("אני רון", "זה אני, רון", "I'm Ron", "I am Ron Margolin", "me (Ron)", "it's me, Ron"):
             with self.subTest(stated=stated):
-                self.assertEqual(self._resolve(stated), ["nir"])
+                self.assertEqual(self._resolve(stated), ["ron"])
 
     def test_the_tolerant_read_takes_the_leading_name_never_any_word(self) -> None:
-        # "Nir's wife" is NOT Nir. Only the name the sentence starts with — after
+        # "Ron's wife" is NOT Ron. Only the name the sentence starts with — after
         # an optional "I'm"/"אני" — is read; a name buried later is not.
-        self.assertEqual(self._resolve("אשתו של ניר"), [])
-        self.assertEqual(self._resolve("Nir's wife"), [])
+        self.assertEqual(self._resolve("אשתו של רון"), [])
+        self.assertEqual(self._resolve("Ron's wife"), [])
         self.assertEqual(self._resolve("the dad"), [])
-        self.assertEqual(self._resolve("Noa, Nir's wife"), ["noa"])
+        self.assertEqual(self._resolve("Yael, Ron's wife"), ["yael"])
 
     def test_the_tolerant_read_still_refuses_to_guess(self) -> None:
         twins = [
-            {"username": "shai_a", "name": "שי", "name_en": "Shai", "family": "כהן"},
-            {"username": "shai_b", "name": "שי", "name_en": "Shai", "family": "לוי"},
+            {"username": "gal_a", "name": "גל", "name_en": "Gal", "family": "כהן"},
+            {"username": "gal_b", "name": "גל", "name_en": "Gal", "family": "לוי"},
         ]
-        self.assertEqual(self._resolve("אני שי", twins), [])
-        self.assertEqual(self._resolve("Shai, the older one", twins), [])
-        self.assertEqual(self._resolve("אני שי כהן", twins), ["shai_a"])
+        self.assertEqual(self._resolve("אני גל", twins), [])
+        self.assertEqual(self._resolve("Gal, the older one", twins), [])
+        self.assertEqual(self._resolve("אני גל כהן", twins), ["gal_a"])
 
     def test_a_roster_with_no_raw_travelers_still_resolves_a_bare_name(self) -> None:
         # Older intakes, and any path that hands over participants without the
         # structured travelers answer beside them, must not regress.
-        transformed = [{"username": "nir", "name": "ניר", "name_en": "Nir", "family": "solomon"}]
-        self.assertEqual(_resolve_organizers({"organizer_identity": _text("Nir")}, transformed), ["nir"])
+        transformed = [{"username": "ron", "name": "רון", "name_en": "Ron", "family": "margolin"}]
+        self.assertEqual(_resolve_organizers({"organizer_identity": _text("Ron")}, transformed), ["ron"])
 
     def test_a_hebrew_answer_finds_a_roster_spelled_only_in_english(self) -> None:
         """2026-09-15, live: every roster name was entered in English letters
@@ -1628,17 +1839,17 @@ class ResolveOrganizersTests(unittest.TestCase):
         in Hebrew, nothing matched, and the trip provisioned with no companion.
         """
         english_only = [
-            {"username": "nir", "name": "Nir", "name_en": "Nir"},
-            {"username": "maya", "name": "Maya", "name_en": "Maya"},
+            {"username": "ron", "name": "Ron", "name_en": "Ron"},
+            {"username": "dana", "name": "Dana", "name_en": "Dana"},
         ]
-        self.assertEqual(self._resolve("ניר", english_only), ["nir"])
+        self.assertEqual(self._resolve("רון", english_only), ["ron"])
 
     def test_sound_alike_never_breaks_a_tie_an_exact_reading_refused(self) -> None:
         twins = [
-            {"username": "shai_a", "name": "שי", "name_en": "Shai", "family": "כהן"},
-            {"username": "shai_b", "name": "שי", "name_en": "Shai", "family": "לוי"},
+            {"username": "gal_a", "name": "גל", "name_en": "Gal", "family": "כהן"},
+            {"username": "gal_b", "name": "גל", "name_en": "Gal", "family": "לוי"},
         ]
-        self.assertEqual(self._resolve("Shai", twins), [])
+        self.assertEqual(self._resolve("Gal", twins), [])
 
 
 class DeriveDaysFromAnchorsTests(unittest.TestCase):
@@ -1760,6 +1971,335 @@ class DeriveDaysFromAnchorsTests(unittest.TestCase):
         self.assertEqual([i["text"]["en"] for i in items], ["From the document"])
 
 
+class DeriveRsvpActivitiesTests(unittest.TestCase):
+    """`phases[].rsvp_activities[]` had no producer at all.
+
+    The site has rendered RSVP cards since the hand-authored era (site/app.js
+    `renderRsvpCard`, trip-web `GroupActivities`), `server/server.js` has stored
+    the votes in `rsvps`, and the config schema has carried the field — and
+    `transform_intake` never emitted it, so the whole vote surface was invisible
+    on every provisioned trip. The live-trip report said it plainly: "RSVP /
+    trivia features: unused".
+
+    The source is the unconfirmed attraction-typed anchors: a confirmed one is
+    already happening, an unconfirmed one is exactly the open question.
+    """
+
+    PHASED_INTAKE = {
+        **JAPAN_INTAKE,
+        "phases": _structured([
+            {"name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23"},
+            {"name": "Kyoto", "start": "2026-09-24", "end": "2026-09-27"},
+        ]),
+    }
+
+    PHASES = [
+        {"id": "tokyo", "dates": {"start": "2026-09-19", "end": "2026-09-23"}},
+        {"id": "kyoto", "dates": {"start": "2026-09-24", "end": "2026-09-27"}},
+    ]
+
+    def _rsvps(self, anchors):
+        return derive_rsvp_activities(
+            {"phases": self.PHASES},
+            {"travel_anchors": {"kind": "structured", "schema_version": 3, "data": anchors}},
+        )
+
+    def _intake(self, anchors):
+        return {**self.PHASED_INTAKE, "travel_anchors": _structured(anchors)}
+
+    def test_an_unconfirmed_attraction_becomes_a_votable_activity_on_its_phase(self) -> None:
+        out = self._rsvps([{"type": "attraction", "name": "Sky Lagoon", "date": "2026-09-25"}])
+        self.assertEqual(sorted(out), ["kyoto"])
+        activity = out["kyoto"][0]
+        self.assertEqual(activity["title"], {"he": "Sky Lagoon", "en": "Sky Lagoon"})
+        self.assertEqual(activity["date"], "2026-09-25")
+        self.assertTrue(activity["id"])
+
+    def test_a_confirmed_attraction_is_a_booking_not_a_vote(self) -> None:
+        # Tickets are bought and seats are held: "does everyone want this?" is a
+        # question whose answer changes nothing. It stays on the Bookings tab.
+        self.assertEqual(
+            self._rsvps([{"type": "attraction", "name": "Sky Lagoon", "date": "2026-09-25",
+                          "confirmation": "SL-58213"}]),
+            {},
+        )
+
+    def test_a_placeholder_confirmation_is_not_a_confirmation(self) -> None:
+        # Same rule _has_confirmation already applies to the hero stat: a site
+        # that renders "–" for a missing confirmation must not read that anchor
+        # as booked.
+        for placeholder in ("", "  ", "-", "–", "TBD", "n/a", "none"):
+            with self.subTest(confirmation=placeholder):
+                out = self._rsvps([{"type": "attraction", "name": "Sky Lagoon",
+                                    "date": "2026-09-25", "confirmation": placeholder}])
+                self.assertEqual(len(out.get("kyoto", [])), 1, "a placeholder is not a booking")
+
+    def test_only_things_you_do_are_votable(self) -> None:
+        # Read through _ANCHOR_TYPE_MAP, never against a second word list, so
+        # every member it gains arrives here too. A flight, a hotel, a car and a
+        # whole-trip quote are not things the family votes on.
+        votable = ["attraction", "activity", "tour", "reservation", "ticket",
+                   "excursion", "event", "shuttle", "parking"]
+        for kind in votable:
+            with self.subTest(kind=kind):
+                out = self._rsvps([{"type": kind, "name": f"A {kind}", "date": "2026-09-20"}])
+                self.assertEqual([a["title"]["en"] for a in out.get("tokyo", [])], [f"A {kind}"])
+        for kind in ("flight", "hotel", "accommodation", "car", "rental", "proposal", "booking", "mystery"):
+            with self.subTest(kind=kind):
+                self.assertEqual(self._rsvps([{"type": kind, "name": f"A {kind}", "date": "2026-09-20"}]), {})
+
+    def test_the_id_is_stable_across_re_provisions(self) -> None:
+        # `rsvps` is keyed by this string alone and knows nothing about
+        # trip.config.json, so an id that changes on re-provision does not fail
+        # loudly — it orphans every vote already cast and the card comes back
+        # empty with nobody told.
+        anchors = [
+            {"type": "attraction", "name": "Sky Lagoon", "date": "2026-09-25"},
+            {"type": "activity", "detail": "TeamLab Planets — 20 Sep 2026 at 18:00"},
+        ]
+        first, second = self._rsvps(anchors), self._rsvps(anchors)
+        self.assertEqual(first, second)
+        ids = [a["id"] for phase in first.values() for a in phase]
+        self.assertEqual(len(ids), len(set(ids)), "one activity, one vote record")
+
+    def test_two_anchors_of_the_same_type_do_not_share_one_vote_record(self) -> None:
+        # The bug derive_bookings' seed_key already had and fixed: hashing the
+        # bare type gave every "activity" the same key.
+        out = self._rsvps([
+            {"type": "activity", "name": "Kinkaku-ji", "date": "2026-09-25"},
+            {"type": "activity", "name": "Fushimi Inari", "date": "2026-09-25"},
+        ])
+        self.assertEqual(len({a["id"] for a in out["kyoto"]}), 2)
+
+    def test_two_anchors_sharing_a_notes_line_are_still_two_activities(self) -> None:
+        # A structured anchor states name, date AND detail at once, and the
+        # document pass writes all three. Keying on `detail` alone collided
+        # these two onto one id, and the dedupe then dropped the second card
+        # without a word — one family vote surface quietly short a question.
+        out = self._rsvps([
+            {"type": "attraction", "name": "Kinkaku-ji", "date": "2026-09-25",
+             "detail": "Included in the city pass"},
+            {"type": "attraction", "name": "Ginkaku-ji", "date": "2026-09-26",
+             "detail": "Included in the city pass"},
+        ])
+        self.assertEqual([a["title"]["en"] for a in out["kyoto"]], ["Kinkaku-ji", "Ginkaku-ji"])
+        self.assertEqual(len({a["id"] for a in out["kyoto"]}), 2)
+
+    def test_the_same_activity_on_two_dates_is_two_questions(self) -> None:
+        out = self._rsvps([
+            {"type": "attraction", "name": "Onsen", "date": "2026-09-25"},
+            {"type": "attraction", "name": "Onsen", "date": "2026-09-26"},
+        ])
+        self.assertEqual(len({a["id"] for a in out["kyoto"]}), 2)
+
+    def test_the_date_counts_in_whichever_field_the_anchor_states_it(self) -> None:
+        # _read_anchor accepts `date`, `date_from` and `start`. Keying on the
+        # raw `date` field alone read the other two as blank, which collided
+        # one activity's two dates onto a single vote record.
+        out = self._rsvps([
+            {"type": "attraction", "name": "Onsen", "date_from": "2026-09-25"},
+            {"type": "attraction", "name": "Onsen", "start": "2026-09-26"},
+        ])
+        self.assertEqual([a["date"] for a in out["kyoto"]], ["2026-09-25", "2026-09-26"])
+        self.assertEqual(len({a["id"] for a in out["kyoto"]}), 2)
+
+    def test_the_same_date_written_two_ways_is_the_same_question(self) -> None:
+        # The id is keyed on the parsed date, so a document re-read that spells
+        # the date differently does not move a vote already cast.
+        iso = self._rsvps([{"type": "attraction", "name": "Onsen", "date": "2026-09-25"}])
+        spelled = self._rsvps([{"type": "attraction", "name": "Onsen", "date": "25 Sep 2026"}])
+        self.assertEqual(iso["kyoto"][0]["id"], spelled["kyoto"][0]["id"])
+
+    def test_a_synonym_of_the_same_type_does_not_move_the_vote(self) -> None:
+        # Both words map to "attraction", so both describe the same activity;
+        # the extraction pass picks between them run to run, and a vote already
+        # cast must not move because it did.
+        first = self._rsvps([{"type": "activity", "name": "Kinkaku-ji", "date": "2026-09-25"}])
+        again = self._rsvps([{"type": "attraction", "name": "Kinkaku-ji", "date": "2026-09-25"}])
+        self.assertEqual(first["kyoto"][0]["id"], again["kyoto"][0]["id"])
+
+    def test_tidying_a_placeholder_confirmation_does_not_orphan_the_votes(self) -> None:
+        # Every anchor here is unconfirmed by construction, so `confirmation`
+        # can only hold "" or a placeholder — no discrimination to add, and
+        # including it would move every vote to a new id the day an organizer
+        # typed "TBD" into an empty field.
+        blank = self._rsvps([{"type": "attraction", "name": "Sky Lagoon", "date": "2026-09-25"}])
+        tidied = self._rsvps([{"type": "attraction", "name": "Sky Lagoon", "date": "2026-09-25",
+                               "confirmation": "TBD"}])
+        self.assertEqual(blank["kyoto"][0]["id"], tidied["kyoto"][0]["id"])
+
+    def test_nothing_votable_produces_no_key_rather_than_an_empty_card(self) -> None:
+        self.assertEqual(self._rsvps([]), {})
+        self.assertEqual(self._rsvps([{"type": "flight", "name": "LY075", "date": "2026-09-19"}]), {})
+        config = transform_intake(self._intake([
+            {"type": "attraction", "name": "Sky Lagoon", "date": "2026-09-25", "confirmation": "SL-1"},
+        ]))
+        for phase in config["phases"]:
+            self.assertNotIn("rsvp_activities", phase)
+
+    def test_an_undated_anchor_parks_where_its_booking_row_already_parks(self) -> None:
+        # derive_bookings puts it on the first phase (bookings.phase is NOT
+        # NULL), so the family already sees it there. Dropping it here instead
+        # would hide exactly the most vote-worthy case — an attraction nobody
+        # has booked OR scheduled — from the surface built to ask about it.
+        out = self._rsvps([{"type": "activity", "detail": "Museum pass, sometime"}])
+        self.assertEqual(sorted(out), ["tokyo"])
+        self.assertNotIn("date", out["tokyo"][0], "no date is absent, never a guessed one")
+
+    def test_a_date_outside_every_phase_still_reaches_the_family(self) -> None:
+        out = self._rsvps([{"type": "activity", "detail": "Something — 30 Sep 2026"}])
+        self.assertEqual(out["tokyo"][0]["date"], "2026-09-30")
+
+    def test_the_entry_carries_only_what_the_config_schema_names(self) -> None:
+        # trip-web/src/parity-schema.ts phaseParityFields.rsvp_activities:
+        # {id, item_uid?, title, name?, desc?, price?, date?}. item_uid stays
+        # unset — there is no itinerary item to link an anchor to, and the
+        # schema's own "legacy" case omits it.
+        out = self._rsvps([
+            {"type": "attraction", "name": "Sky Lagoon", "date": "2026-09-25",
+             "detail": "Geothermal lagoon, evening slot"},
+        ])
+        activity = out["kyoto"][0]
+        self.assertLessEqual(set(activity), {"id", "title", "desc", "date"})
+        self.assertIsInstance(activity["id"], str)
+        self.assertEqual(set(activity["title"]), {"he", "en"})
+        self.assertEqual(activity["desc"], {"he": "Geothermal lagoon, evening slot",
+                                            "en": "Geothermal lagoon, evening slot"})
+
+    def test_the_description_never_just_repeats_the_title(self) -> None:
+        # A free-text anchor has no separate name: the title IS the detail, so a
+        # desc would print the same sentence twice under it.
+        out = self._rsvps([{"type": "activity", "detail": "TeamLab Planets — 20 Sep 2026 at 18:00"}])
+        self.assertNotIn("desc", out["tokyo"][0])
+
+    def test_a_detail_that_only_echoes_the_name_is_not_a_description(self) -> None:
+        # A document pass that copies the venue name into a notes field is the
+        # ordinary case, not a freak one — printing the heading again directly
+        # under the heading is not "extra context".
+        for detail in ("Sky Lagoon", "  sky   lagoon  ", "Sky Lagoon — 25 Sep 2026",
+                       "Sky Lagoon at 15:00"):
+            with self.subTest(detail=detail):
+                out = self._rsvps([{"type": "attraction", "name": "Sky Lagoon",
+                                    "date": "2026-09-25", "detail": detail}])
+                self.assertNotIn("desc", out["kyoto"][0])
+
+    def test_a_detail_that_adds_something_is_kept(self) -> None:
+        out = self._rsvps([{"type": "attraction", "name": "Sky Lagoon", "date": "2026-09-25",
+                            "detail": "Sky Lagoon — bring a towel"}])
+        self.assertEqual(out["kyoto"][0]["desc"]["en"], "Sky Lagoon — bring a towel")
+
+    def test_the_title_matches_the_day_item_the_same_anchor_produces(self) -> None:
+        # activity-rsvp.ts falls back to matching an activity to an itinerary
+        # item by phase, date and EXACT title when there is no item_uid. Both
+        # surfaces read the anchor through _read_anchor, so the Journey card for
+        # this anchor opens its RSVP rather than showing an unlinked duplicate.
+        anchors = [{"type": "activity", "detail": "TeamLab Planets — 20 Sep 2026 at 18:00"}]
+        rsvp = self._rsvps(anchors)["tokyo"][0]
+        day_item = derive_days_from_anchors(
+            {"phases": self.PHASES},
+            {"travel_anchors": {"kind": "structured", "schema_version": 3, "data": anchors}},
+        )["tokyo"][0]["items"][0]
+        self.assertEqual(rsvp["title"], day_item["text"])
+        self.assertEqual(rsvp["date"], "2026-09-20")
+
+    def test_markup_never_reaches_the_card(self) -> None:
+        # site/app.js renderRsvpCard interpolates the title into an innerHTML
+        # string, and these anchors come from a model reading an uploaded
+        # document. Same backstop _plain already gives phases[].days[].
+        out = self._rsvps([{"type": "attraction", "name": "<img src=x onerror=alert(1)>Tour",
+                            "date": "2026-09-20"}])
+        self.assertEqual(out["tokyo"][0]["title"]["en"], "img src=x onerror=alert(1)Tour")
+
+    def test_an_anchor_with_no_readable_label_is_skipped(self) -> None:
+        self.assertEqual(self._rsvps([{"type": "attraction", "date": "2026-09-20"}]), {})
+        self.assertEqual(self._rsvps(["not a dict", None, 7]), {})
+
+    def test_one_anchor_is_both_a_pending_booking_and_an_open_question(self) -> None:
+        # Deliberately not exclusive, and not duplication to be removed:
+        # Bookings is the organizer's tracking view ("what is still pending"),
+        # RSVP is the family's interactive one ("does everyone want it").
+        intake = self._intake([{"type": "attraction", "name": "Sky Lagoon", "date": "2026-09-25"}])
+        config = transform_intake(intake)
+        booking = next(b for b in derive_bookings(config, intake) if b["name"] == "Sky Lagoon")
+        self.assertIsNone(booking["confirmation"])
+        kyoto = next(p for p in config["phases"] if p["id"] == "kyoto")
+        self.assertEqual([a["title"]["en"] for a in kyoto["rsvp_activities"]], ["Sky Lagoon"])
+        # Different namespaces: a bookings seed_key is not an rsvps activity id.
+        self.assertNotEqual(booking["seed_key"], kyoto["rsvp_activities"][0]["id"])
+
+    def test_the_transformed_config_carries_the_activities_on_the_right_phases(self) -> None:
+        config = transform_intake(self._intake([
+            {"type": "activity", "detail": "Tokyo Skytree — 20 Sep 2026 at 10:00"},
+            {"type": "attraction", "name": "Kinkaku-ji", "date": "2026-09-25"},
+            {"type": "attraction", "name": "Fushimi Inari", "date": "2026-09-26", "confirmation": "FI-9"},
+        ]))
+        by_phase = {p["id"]: [a["title"]["en"] for a in p.get("rsvp_activities", [])] for p in config["phases"]}
+        self.assertEqual(by_phase["tokyo"], ["Tokyo Skytree"])
+        self.assertEqual(by_phase["kyoto"], ["Kinkaku-ji"])
+
+    def test_activities_are_listed_in_date_order_with_the_undated_last(self) -> None:
+        out = self._rsvps([
+            {"type": "attraction", "name": "Whenever"},
+            {"type": "attraction", "name": "Later", "date": "2026-09-22"},
+            {"type": "attraction", "name": "Earlier", "date": "2026-09-20"},
+        ])
+        self.assertEqual([a["title"]["en"] for a in out["tokyo"]], ["Earlier", "Later", "Whenever"])
+
+    def test_a_trip_with_no_phases_yields_nothing_rather_than_raising(self) -> None:
+        self.assertEqual(
+            derive_rsvp_activities(
+                {"phases": []},
+                {"travel_anchors": {"kind": "structured", "schema_version": 3,
+                                    "data": [{"type": "attraction", "name": "Sky Lagoon"}]}},
+            ),
+            {},
+        )
+
+
+class StableIdTests(unittest.TestCase):
+    """`_stable_id` is shared by both anchor derivations because both key
+    something that lives OUTSIDE trip.config.json by what it returns — the
+    site's `INSERT OR IGNORE ... seed_key` for a booking row, the `rsvps` table
+    for a vote. Changing the scheme is a data migration wearing a one-line diff:
+    every booking row re-inserted as a duplicate, every vote orphaned. So these
+    pin the exact strings, not only their shape.
+    """
+
+    def _bookings(self, anchors):
+        intake = {
+            **JAPAN_INTAKE,
+            "phases": _structured([{"name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23"}]),
+            "travel_anchors": _structured(anchors),
+        }
+        return derive_bookings(transform_intake(intake), intake)
+
+    def test_a_free_text_anchors_booking_key_is_the_one_it_has_always_had(self) -> None:
+        # Read off the tree before `_stable_id` was extracted out of
+        # derive_bookings. Live trips already hold these keys.
+        rows = self._bookings([
+            {"type": "activity", "detail": "Tokyo Skytree e-ticket - 20 Sep 2026 at 10:00"},
+        ])
+        self.assertEqual([b["seed_key"] for b in rows], ["anchor_433c6642c7"])
+
+    def test_a_structured_anchors_booking_key_is_the_one_it_has_always_had(self) -> None:
+        rows = self._bookings([
+            {"type": "attraction", "name": "Kinkaku-ji", "date": "2026-09-25", "confirmation": "KJ-1"},
+        ])
+        self.assertEqual([b["seed_key"] for b in rows], ["anchor_a2f04cd0cc"])
+
+    def test_the_helper_joins_its_parts_rather_than_concatenating_them(self) -> None:
+        # "ab" + "" and "a" + "b" are different anchors and must not collide.
+        self.assertNotEqual(_stable_id("x", "ab", ""), _stable_id("x", "a", "b"))
+
+    def test_a_missing_part_reads_as_empty_rather_than_as_the_word_none(self) -> None:
+        self.assertEqual(_stable_id("x", "a", None, "b"), _stable_id("x", "a", "", "b"))
+
+    def test_the_prefix_is_the_namespace_and_the_hash_is_short(self) -> None:
+        self.assertNotEqual(_stable_id("anchor", "a"), _stable_id("rsvp", "a"))
+        self.assertEqual(_stable_id("rsvp", "a"), "rsvp_" + _stable_id("anchor", "a").split("_", 1)[1])
+        self.assertTrue(re.fullmatch(r"rsvp_[0-9a-f]{10}", _stable_id("rsvp", "a")))
+
+
 _NAME_CASES = json.loads(
     (Path(__file__).resolve().parents[2] / "contracts" / "v1" / "name-matching-cases.json").read_text(encoding="utf-8")
 )
@@ -1791,3 +2331,263 @@ class NameMatchingContractTests(unittest.TestCase):
                 )
                 expected = [] if case["expect"] is None else [participants[case["expect"]]["username"]]
                 self.assertEqual(resolved, expected)
+
+
+class DestinationTrailingCountryTests(unittest.TestCase):
+    """A trip whose destination ENDS with its country is named by it.
+
+    da66df8 taught the transformer the leading shape, "Portugal — Lisbon and
+    Porto". The interview produces the other one: it normalises a spoken
+    destination into a list of stops with the country last. So a real trip on
+    2026-09-19 stored "Tokyo, Hakone, Kyoto, Osaka, Japan", was read as a plain
+    city list, and was titled "Family Trip 2027" with the country nowhere.
+
+    The phases decide which trailing element is a country, rather than a list
+    of country names — the one this module carries holds fifteen entries and
+    does not include Vietnam, so a list-based check would pass the case that
+    was reported and fail the next one.
+    """
+
+    def title(self, destination, phases):
+        from control_plane_worker.transformer import _derive_brand_and_title
+
+        return _derive_brand_and_title(destination, "Family", 2028, phases)[1]
+
+    def test_a_stop_list_ending_in_its_country_is_named_by_the_country(self):
+        self.assertEqual(
+            "Japan 2028 — Family",
+            self.title("Tokyo, Hakone, Kyoto, Osaka, Japan", ["Tokyo", "Hakone", "Kyoto", "Osaka"]),
+        )
+
+    def test_it_does_not_depend_on_the_country_being_in_any_list(self):
+        # Vietnam is absent from _KNOWN_COUNTRY_CURRENCY on purpose here.
+        self.assertEqual(
+            "Vietnam 2028 — Family",
+            self.title("Hanoi, Ha Long, Hoi An, Saigon, Vietnam", ["Hanoi", "Ha Long", "Hoi An", "Saigon"]),
+        )
+
+    def test_a_city_list_with_no_country_still_falls_back(self):
+        # Every element is a phase, so nothing trails as a country. Naming this
+        # trip "Venice" would be worse than the generic fallback.
+        self.assertEqual(
+            "Family Trip 2028 — Family",
+            self.title("Rome, Florence, Venice", ["Rome", "Florence", "Venice"]),
+        )
+
+    def test_the_leading_country_shape_is_unchanged(self):
+        self.assertEqual(
+            "Portugal 2028 — Family",
+            self.title("Portugal — Lisbon and Porto", ["Lisbon", "Porto"]),
+        )
+
+    def test_matching_ignores_case_and_surrounding_space(self):
+        self.assertEqual(
+            "Family Trip 2028 — Family",
+            self.title("Rome, Florence,  VENICE ", ["rome", "florence", "venice"]),
+        )
+
+    def test_no_phases_still_names_a_recognised_trailing_country(self):
+        self.assertEqual("Japan 2028 — Family", self.title("Tokyo, Kyoto, Japan", []))
+
+    def test_an_unrecognised_trailing_place_falls_back_rather_than_guessing(self):
+        # The guard that matters. An earlier attempt treated "not one of the
+        # phases" as proof of a country, and named trips OSAKA 2026 and
+        # PORTO 2026 the moment the phases did not list every city mentioned.
+        self.assertEqual("Family Trip 2028 — Family", self.title("Tokyo, Kyoto and Osaka", ["Tokyo"]))
+        self.assertEqual("Family Trip 2028 — Family", self.title("Lisbon and Porto", []))
+
+    def test_a_phase_named_like_a_country_is_still_not_the_country(self):
+        # Japan as a STOP rather than the trailing country: the phase check
+        # rules it out before the country list would wave it through.
+        self.assertEqual("Family Trip 2028 — Family", self.title("Tokyo, Japan", ["Tokyo", "Japan"]))
+
+
+class TripClockAndLanguage(unittest.TestCase):
+    """The two `agent` fields that described a trip other than the one they
+    were built from, until 2026-09-20."""
+
+    def test_a_typed_zone_that_is_a_zone_is_kept(self):
+        self.assertEqual("Asia/Tokyo", transformer._resolve_timezone("Asia/Tokyo", "Japan"))
+
+    def test_a_country_name_typed_as_a_zone_is_replaced_by_the_real_one(self):
+        # What an organizer actually typed when asked for a timezone. It
+        # reached the config as `agent.timezone` and left a 07:30 briefing
+        # scheduled in a zone no clock resolves.
+        self.assertEqual("Asia/Ho_Chi_Minh", transformer._resolve_timezone("Vietnam", "Vietnam"))
+
+    def test_the_zone_is_derived_when_nothing_was_typed(self):
+        self.assertEqual("Europe/Lisbon", transformer._resolve_timezone("", "Portugal — Lisbon and Porto"))
+        self.assertEqual("Asia/Tokyo", transformer._resolve_timezone("", "Tokyo, Japan"))
+
+    def test_a_destination_written_in_hebrew_resolves_the_same_as_english(self):
+        # The normal case for a Hebrew interview, and it silently lost BOTH
+        # facts: on 2026-09-20 one run stored "Vietnam" and the next stored
+        # "וייטנאם", and the Hebrew one produced no timezone and a null
+        # travel_info — so the site's currency card and conversion feature were
+        # simply absent, with nothing saying so.
+        for written in ("וייטנאם", "ויאטנם"):
+            with self.subTest(written):
+                self.assertEqual("Asia/Ho_Chi_Minh", transformer._resolve_timezone("", written))
+                self.assertEqual("VND", transformer._lookup_known_currency(written)["code"])
+
+    def test_the_currency_and_the_zone_resolve_together_or_not_at_all(self):
+        # They answer two questions about one place through one key list, so a
+        # destination cannot resolve for one and not the other.
+        for written in ("יפן", "Japan", "Tokyo, Japan", "Portugal — Lisbon and Porto"):
+            with self.subTest(written):
+                self.assertTrue(transformer._resolve_timezone("", written))
+                self.assertIsNotNone(transformer._lookup_known_currency(written))
+
+    def test_an_unmappable_destination_yields_nothing_rather_than_the_text(self):
+        # Absent is a gap something can notice. "Narnia" sitting in a field
+        # read as a zone looks answered and is not.
+        self.assertEqual("", transformer._resolve_timezone("Narnia", "Narnia"))
+
+    def test_an_unresolved_destination_leaves_both_agent_and_meta_without_a_timezone(self):
+        # Full-pipeline version of the test above: bot_name makes the agent
+        # block exist for another reason, and a typed zone that cannot
+        # resolve (transformer.timezone_unresolved fires instead of raising)
+        # must still leave BOTH agent.timezone and meta.timezone absent.
+        config = transform_intake({
+            "trip_type": _choice("family"),
+            "destination": _text("Narnia"),
+            "bot_name": _text("Sol"),
+            "timezone": _text("Narnia"),
+        }, today=date(2026, 8, 20))
+        self.assertIn("agent", config)
+        self.assertNotIn("timezone", config["agent"])
+        self.assertNotIn("timezone", config["meta"])
+
+    def test_a_derived_zone_alone_does_not_invent_an_agent_block(self):
+        # An intake that answered none of the assistant questions must produce
+        # exactly the config it did before those questions existed.
+        agent = transformer._derive_agent({"destination": {"kind": "text", "text": "Japan"}}, [], [])
+        self.assertIsNone(agent)
+
+    def test_the_companion_speaks_the_language_the_interview_was_held_in(self):
+        data = {
+            "bot_name": {"kind": "text", "text": "פאם"},
+            "destination": {"kind": "text", "text": "Vietnam"},
+        }
+        agent = transformer._derive_agent(data, [], [], "he")
+        self.assertEqual("he", agent["default_language"])
+        self.assertEqual("Asia/Ho_Chi_Minh", agent["timezone"])
+
+    def test_an_unknown_interview_language_still_falls_back_to_english(self):
+        data = {"bot_name": {"kind": "text", "text": "Sol"}}
+        self.assertEqual("en", transformer._derive_agent(data, [], [], "kl")["default_language"])
+
+
+class DaysOnNoPhaseAreShown(unittest.TestCase):
+    """A day of the trip that no phase covers must not be invisible.
+
+    On 2026-09-20 an organizer said ten of their sixteen days were undecided
+    and asked for a proposal. The site showed the six that were decided and
+    nothing at all for the rest — the trip simply appeared to be six days long,
+    beside a return flight leaving a city no phase mentioned. Absent and
+    undecided are different things and only one of them was true.
+    """
+
+    def _intake(self, phases, departure="2028-03-05", ret="2028-03-20"):
+        return {
+            **JAPAN_INTAKE,
+            "destination": {"kind": "text", "schema_version": 3, "text": "Vietnam"},
+            "departure_date": {"kind": "text", "schema_version": 3, "text": departure},
+            "return_date": {"kind": "text", "schema_version": 3, "text": ret},
+            "phases": _structured(phases),
+        }
+
+    def _build(self, phases, **kw):
+        return transformer.transform_intake(self._intake(phases, **kw))["phases"]
+
+    def test_the_days_after_the_last_phase_are_shown_as_open(self):
+        built = self._build([
+            {"name": "Hanoi", "start": "2028-03-05", "end": "2028-03-09"},
+            {"name": "Ha Long", "start": "2028-03-09", "end": "2028-03-11"},
+        ])
+        open_phases = [p for p in built if p.get("unplanned")]
+        self.assertEqual(1, len(open_phases))
+        self.assertEqual({"start": "2028-03-12", "end": "2028-03-20"}, open_phases[0]["dates"])
+        self.assertIn("9", open_phases[0]["note"]["en"])
+
+    def test_every_day_of_the_trip_belongs_to_some_phase_once_they_are_added(self):
+        # The property the site needs: no day of a stated trip is missing.
+        import datetime as dt
+        built = self._build([{"name": "Hanoi", "start": "2028-03-07", "end": "2028-03-09"}])
+        covered = set()
+        for phase in built:
+            a = dt.date.fromisoformat(phase["dates"]["start"])
+            b = dt.date.fromisoformat(phase["dates"]["end"])
+            while a <= b:
+                covered.add(a)
+                a += dt.timedelta(days=1)
+        day, last = dt.date(2028, 3, 5), dt.date(2028, 3, 20)
+        while day <= last:
+            self.assertIn(day, covered, f"{day} is on no phase")
+            day += dt.timedelta(days=1)
+
+    def test_a_gap_in_the_middle_and_one_at_the_end_are_separate_stretches(self):
+        built = self._build([
+            {"name": "Hanoi", "start": "2028-03-05", "end": "2028-03-07"},
+            {"name": "Hue", "start": "2028-03-12", "end": "2028-03-14"},
+        ])
+        gaps = [p["dates"] for p in built if p.get("unplanned")]
+        self.assertEqual(
+            [{"start": "2028-03-08", "end": "2028-03-11"},
+             {"start": "2028-03-15", "end": "2028-03-20"}],
+            gaps,
+        )
+
+    def test_a_fully_covered_trip_gains_nothing(self):
+        built = self._build([{"name": "Hanoi", "start": "2028-03-05", "end": "2028-03-20"}])
+        self.assertEqual([], [p for p in built if p.get("unplanned")])
+
+    def test_open_stretches_sit_in_trip_order_between_the_phases(self):
+        built = self._build([
+            {"name": "Hanoi", "start": "2028-03-05", "end": "2028-03-07"},
+            {"name": "Hue", "start": "2028-03-12", "end": "2028-03-20"},
+        ])
+        self.assertEqual(["hanoi", "open-days", "hue"], [p["id"] for p in built])
+
+    def test_a_trip_with_no_phases_at_all_gains_none(self):
+        # A different state, not a gap: nobody has said anything about stops,
+        # and the site already says so its own way.
+        self.assertEqual([], self._build([]))
+
+    def test_dates_the_organizer_never_gave_produce_no_gaps(self):
+        # `_resolve_dates` falls back to today+90; a gap measured against an
+        # invented range invents the days in it.
+        intake = self._intake([{"name": "Hanoi", "start": "2028-03-05", "end": "2028-03-09"}])
+        del intake["departure_date"]
+        del intake["return_date"]
+        built = transformer.transform_intake(intake)["phases"]
+        self.assertEqual([], [p for p in built if p.get("unplanned")])
+
+    def test_an_open_stretch_says_how_to_resolve_it(self):
+        built = self._build([{"name": "Hanoi", "start": "2028-03-05", "end": "2028-03-09"}])
+        note = [p for p in built if p.get("unplanned")][0]["note"]
+        for side in ("he", "en"):
+            self.assertTrue(note[side].strip(), f"{side} side is empty")
+        self.assertIn("assistant", note["en"], "it must say where the organizer can fix it")
+
+
+class ConfirmedBookingsAreConfirmed(unittest.TestCase):
+    """A travel_anchor is a fixed point in the trip, not evidence of a booking.
+
+    Counting every anchor told one family on their front page that four
+    bookings were confirmed on a trip where nothing was booked — beside map
+    stops rendered from the same anchors correctly showing no confirmation.
+    """
+
+    def test_an_anchor_with_a_confirmation_counts(self):
+        self.assertTrue(transformer._has_confirmation({"confirmation": "PH-88213"}))
+
+    def test_an_anchor_without_one_does_not(self):
+        self.assertFalse(transformer._has_confirmation({"type": "flight", "name": "VN572"}))
+
+    def test_a_placeholder_is_not_a_confirmation(self):
+        # The site renders "–" for a missing confirmation; the count must not
+        # read the same value as evidence.
+        for placeholder in ("–", "-", "  ", "n/a", "TBD", "none"):
+            with self.subTest(placeholder):
+                self.assertFalse(transformer._has_confirmation({"confirmation": placeholder}))

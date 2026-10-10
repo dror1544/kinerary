@@ -20,8 +20,11 @@ found a step that quietly undoes itself. This is that run's order, as a command:
   5. infra      Cloudflare DNS + ingress rule, NPM host, LXC — through the
                 worker's own provisioner (LxcProvisionAdapter), outside-in, so
                 auth and adapters are exactly provisioning's
-  6. database   close chat bindings (closed_reason 'trip_destroyed'), then
-                slug -> retired-<slug>-<yyyymmdd>, which frees the slug
+  6. database   revoke any still-live group-binding token FIRST (issue #175),
+                then close chat bindings (closed_reason 'trip_destroyed'),
+                then slug -> retired-<slug>-<yyyymmdd>, which frees the slug —
+                the revoke-first order avoids a real deadlock against a
+                concurrent redemption; see REVOKE_GROUP_TOKENS's comment
   7. deploy dir move kinerary-deploy/trips/<slug> out of trips/ — the IP
                 allocator claims every address it finds in there
   8. profile    hermes profile delete, then check it stays gone
@@ -64,6 +67,7 @@ import time
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 REPO = Path(__file__).resolve().parents[1]
 HOME = Path.home()
@@ -188,7 +192,14 @@ def reference_topology(raw: dict, orig: str) -> dict:
     out["name"] = ref
     lxc = out["proxmox"]["lxc"]
     lxc["name"] = ref
-    lxc["nfs_host_dir"] = f"{lxc['nfs_host_dir'].rstrip('/').rsplit('/', 1)[0]}/{ref}"
+    # A data directory named by TRIP ID cannot be adopted by the next trip of
+    # this slug — the id is unique and never reused — so it stays where it is.
+    # A slug-named one (every trip provisioned before that change) still has to
+    # move: freeing the slug is the whole point of a teardown, and the next
+    # family to name their trip the same way would land on this family's data.
+    base, _, current = lxc["nfs_host_dir"].rstrip("/").rpartition("/")
+    if not current.startswith("trip_"):
+        lxc["nfs_host_dir"] = f"{base}/{ref}"
     for section in ("npm", "cloudflare"):
         host = out.get(section, {}).get("hostname", "")
         if host.startswith(f"{orig}."):
@@ -282,6 +293,9 @@ def resolve(target: str) -> dict:
         raise Refused(f"profile {trip['profile']!r} is still bound to another trip's open chat")
     trip["open_bindings"] = int(psql(
         f"SELECT count(*) FROM control_plane.telegram_chat_bindings WHERE trip_id = '{trip['id']}' AND closed_at IS NULL") or 0)
+    trip["live_group_tokens"] = int(psql(
+        f"SELECT count(*) FROM control_plane.telegram_group_binding_tokens "
+        f"WHERE trip_id = '{trip['id']}' AND expires_at > now()") or 0)
     return trip
 
 
@@ -329,6 +343,35 @@ def s6_rescan() -> None:
                        capture_output=True)
 
 
+def delete_profile_and_watch(
+    home: Path, *, settle_seconds: float, poll_s: float = 5.0,
+    delete: Callable[[], None], is_dir: Callable[[], bool] | None = None,
+    sleep: Callable[[float], None] = time.sleep, monotonic: Callable[[], float] = time.monotonic,
+) -> tuple[bool, int]:
+    """Delete, then keep deleting it back for the whole settle window.
+
+    A single delete-then-wait-then-check gave the interviewer's cron ticker
+    exactly one free shot at recreating `home` (issue #352): the ticker can
+    fire once between the allowlist restart and it actually taking effect,
+    and that one recreation used to fail the whole teardown even when
+    nothing was left ticking by the end of the window. Re-deleting each time
+    it reappears, for the same total budget, only fails now if something
+    keeps recreating it — a real still-running supervisor, not a single lost
+    race. Returns `(ok, redeletes)`.
+    """
+    is_dir = is_dir or Path(home).is_dir
+    delete()
+    redeletes = 0
+    if settle_seconds > 0:
+        deadline = monotonic() + settle_seconds
+        while monotonic() < deadline:
+            sleep(min(poll_s, max(0.0, deadline - monotonic())))
+            if is_dir():
+                redeletes += 1
+                delete()
+    return not is_dir(), redeletes
+
+
 def listeners(port: str) -> list[str]:
     """Pids listening on a TCP port. lsof on the Mac; the Debian VM ships ss."""
     if shutil.which("lsof"):
@@ -355,7 +398,7 @@ def build_provisioner():
     adapter = LxcProvisionAdapter(
         deploy_root=str(DEPLOY_ROOT),  # the HOST path; provisioning.env's is the container's
         node=e("PROXMOX_NODE", ""), template=e("PROXMOX_LXC_TEMPLATE", ""), storage=e("PROXMOX_STORAGE", ""),
-        bridge=e("PROXMOX_BRIDGE", ""), ip_pool=json.loads(e("PROVISIONER_LXC_IP_POOL", '["192.168.0.60"]')),
+        bridge=e("PROXMOX_BRIDGE", ""), ip_pool=[],  # teardown removes resources; it never allocates an IP
         hostname_domain=e("PROVISIONER_LXC_HOSTNAME_DOMAIN", ""), tunnel_id=e("PROVISIONER_LXC_TUNNEL_ID", ""),
         npm_url=e("NPM_URL", ""), npm_api_token=e("NPM_API_TOKEN", ""),
         npm_identity=e("NPM_IDENTITY", ""), npm_secret=e("NPM_SECRET", ""),
@@ -418,6 +461,55 @@ def narrow_allowlist(profile: str) -> None:
     subprocess.run([hermes(), "--profile", "trip-intake", "gateway", "restart"], capture_output=True, text=True)
 
 
+# The document registry and what was derived from it (migrations 0052, 0053,
+# and trip_document_corrections's own). Backed up with the trip because a
+# registry row without its bytes, or bytes without their row, cannot be put
+# back together later.
+#
+# source_artifacts is NOT a phantom — it is a real per-trip provenance table
+# created in 0001_foundation.sql, unrelated to the document-registry work
+# despite the similar name, and it belongs here on its own terms. An earlier
+# report called it a phantom; that was wrong. Whether teardown SHOULD back it
+# up is a separate product question and out of scope for this port — Dror,
+# 2026-09-21.
+DOCUMENT_TABLES = (
+    "trip_documents",
+    "source_artifacts",
+    "trip_document_extractions",
+    "trip_answer_sources",
+    "trip_answer_conflicts",
+    "trip_document_corrections",
+)
+
+
+def table_exists(table: str) -> bool:
+    """An older stack has no document tables; backing one up must not fail on that."""
+    return psql(f"SELECT to_regclass('control_plane.{table}') IS NOT NULL") == "t"
+
+
+def document_store(trip: dict) -> Path | None:
+    """This trip's kept originals — DOCUMENT_STORE_DIR/<trip_id> — when a store is configured.
+
+    The same variable the relay writes originals under and the provisioner reads
+    them from. The trip id is the only path component, and it has already been
+    checked against TRIP_ID; the resolved directory must still sit directly under
+    the root.
+    """
+    load_provisioning_env()
+    root = os.environ.get("DOCUMENT_STORE_DIR", "").strip()
+    if not root or not TRIP_ID.match(trip["id"]):
+        return None
+    base = Path(root).resolve()
+    store = (base / trip["id"]).resolve()
+    return store if store.parent == base else None
+
+
+def kept_originals(store: Path | None) -> int:
+    if not store or not store.is_dir():
+        return 0
+    return sum(1 for p in store.iterdir() if p.is_file() and not p.name.startswith("."))
+
+
 def backup(trip: dict, trip_dir: Path, dest: Path) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     os.chmod(dest, 0o700)
@@ -433,10 +525,18 @@ def backup(trip: dict, trip_dir: Path, dest: Path) -> None:
         shutil.copy2(plist, dest / plist.name)
     if INTERVIEWER_CONFIG.is_file():
         shutil.copy2(INTERVIEWER_CONFIG, dest / "trip-intake-config.yaml")
-    for table in ("trips", "telegram_chat_bindings"):
+    for table in ("trips", "telegram_chat_bindings", *DOCUMENT_TABLES):
+        if table in DOCUMENT_TABLES and not table_exists(table):
+            continue
         key = "id" if table == "trips" else "trip_id"
         rows = psql(f"SELECT row_to_json(r) FROM control_plane.{table} r WHERE {key} = '{trip['id']}'")
         (dest / f"db-{table}.jsonl").write_text(rows + "\n" if rows else "")
+    # The originals themselves, as one archive: the uploads a trip was built from
+    # are the one thing about it that cannot be regenerated.
+    store = document_store(trip)
+    if kept_originals(store):
+        with tarfile.open(dest / "documents.tar.gz", "w:gz") as tar:
+            tar.add(store, arcname=f"documents/{trip['id']}")
     for f in dest.iterdir():
         os.chmod(f, 0o600)
 
@@ -449,11 +549,55 @@ CLOSE_SESSIONS = ("UPDATE control_plane.intake_sessions SET expired_at = now() "
                   "WHERE trip_id = '{id}' AND expired_at IS NULL AND state <> 'confirmed'")
 
 
+# A group-binding token (issue #175, migration 0045) is issued into the
+# organizer's DM and stays redeemable for up to its own TTL — 7 to 30 days —
+# with nothing in `trips.lifecycle_state` to say the trip it names is gone.
+# `redeemGroupBindingToken` now refuses it once the trip's slug reads
+# `retired-...` (control-plane/api/src/group-binding.ts), but that still
+# leaves a live token sitting in the table for someone to try, and try again,
+# until it expires on its own. Revoking it here — the same moment its
+# bindings and sessions close — is the proactive half of the same fix.
+# `expires_at > now()` is not protecting a CHECK constraint (the table's
+# `expires_at > created_at` cannot actually fire from this UPDATE in
+# practice) — it is there so a token that is already expired is not written
+# again for no reason.
+#
+# ORDER MATTERS: this runs FIRST in both transaction branches below, before
+# the bindings-close and slug-rename, not after. `redeemGroupBindingToken`'s
+# `INSERT INTO telegram_chat_bindings` takes a `FOR KEY SHARE` lock on the
+# referenced `trips` row as a side effect of its foreign key — regardless of
+# that function's own `NOT EXISTS` subquery correctly avoiding a direct lock
+# on `trips`. With the revoke last, this transaction locked
+# `telegram_chat_bindings`/`trips` first and `telegram_group_binding_tokens`
+# last, while a concurrent `redeemGroupBindingToken` locked its token row
+# first (via its own `FOR UPDATE`) and then, through the FK, waited on
+# `trips` — tokens-then-trips here, trips-then-tokens there: a real
+# `40P01: deadlock detected`, reproduced against Postgres by
+# regression-planner. Revoking the token FIRST here matches the OTHER
+# transaction's own lock order (token row, then anything that touches
+# `trips`), so the two can only ever queue for the same row in the same
+# order rather than each other's.
+REVOKE_GROUP_TOKENS = ("UPDATE control_plane.telegram_group_binding_tokens SET expires_at = now() "
+                       "WHERE trip_id = '{id}' AND expires_at > now()")
+
+
 def retire_in_db(trip: dict) -> str:
     if trip["slug"].startswith("retired-"):
-        psql(f"UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed' "
-             f"WHERE trip_id = '{trip['id']}' AND closed_at IS NULL")
-        psql(CLOSE_SESSIONS.format(id=trip["id"]))
+        # One transaction, not three bare calls: three separate `psql()`
+        # calls can die between any two of them, and a process that dies
+        # between the binding-close and the token-revoke leaves exactly the
+        # gap this whole task exists to close — bindings and sessions gone,
+        # a live group-binding token still sitting in the table. Same
+        # BEGIN...COMMIT shape as the rename branch below, for the same
+        # reason. The revoke runs FIRST — see REVOKE_GROUP_TOKENS's comment
+        # for why the order avoids a real deadlock against
+        # redeemGroupBindingToken.
+        psql(f"""BEGIN;
+{REVOKE_GROUP_TOKENS.format(id=trip['id'])};
+UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed'
+ WHERE trip_id = '{trip['id']}' AND closed_at IS NULL;
+{CLOSE_SESSIONS.format(id=trip['id'])};
+COMMIT;""")
         return trip["slug"]
     base = f"retired-{trip['orig']}-{datetime.now():%Y%m%d}"
     new = base
@@ -462,6 +606,7 @@ def retire_in_db(trip: dict) -> str:
             break
         new = f"{base}-{n}"
     psql(f"""BEGIN;
+{REVOKE_GROUP_TOKENS.format(id=trip['id'])};
 UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed'
  WHERE trip_id = '{trip['id']}' AND closed_at IS NULL;
 UPDATE control_plane.trips SET slug = '{new}', updated_at = now()
@@ -508,6 +653,8 @@ def main() -> int:
         topo_vmid = str((raw.get("proxmox") or {}).get("vmid") or "")
 
     b = bridge(trip_dir)
+    store = document_store(trip)
+    originals = kept_originals(store)
     plan = [
         ("allowlist", interviewer_allows(profile), f"drop {profile} from the interviewer's allowlist, restart it"),
         ("gateway", gateway_installed(profile), f"uninstall the {profile} gateway"),
@@ -516,8 +663,12 @@ def main() -> int:
          (f"Cloudflare + NPM for {orig}; KEEP the container as {reference_name(orig)} "
           f"on http://{topo.proxy.forward_host}:{topo.proxy.forward_port}/" if args.keep_container
           else f"Cloudflare + NPM + LXC for {orig}") if topo else "never provisioned"),
-        ("database", trip["open_bindings"] > 0 or not trip["slug"].startswith("retired-"),
-         f"close {trip['open_bindings']} binding(s), retire slug {trip['slug']}"),
+        ("database", trip["open_bindings"] > 0 or trip["live_group_tokens"] > 0
+         or not trip["slug"].startswith("retired-"),
+         f"close {trip['open_bindings']} binding(s), revoke {trip['live_group_tokens']} live "
+         f"group-binding token(s), retire slug {trip['slug']}"),
+        ("documents", originals > 0,
+         f"archive and remove {originals} kept original(s); registry rows stay, marked unstored"),
         ("deploy dir", trip_dir.is_dir(),
          f"move {trip_dir} to trips/{reference_name(orig)} (keeps its IP claimed)" if args.keep_container
          else f"move {trip_dir} to retired-trips/"),
@@ -614,6 +765,21 @@ def main() -> int:
     new_slug = retire_in_db(trip)
     say(f"{GREEN}✓{RESET}", f"database   bindings closed, slug -> {new_slug}")
 
+    if originals:
+        # Rows first, bytes second. If removing the files fails halfway, the
+        # registry already says the bytes are not kept and the leftovers are
+        # harmless; the other order could leave rows promising files that are
+        # gone. The rows themselves stay — intake versions still name these
+        # documents, and a reference to a document is not the document.
+        if table_exists("trip_documents"):
+            psql(f"UPDATE control_plane.trip_documents SET ingest_state = 'unstored', storage_key = NULL, "
+                 f"stored_at = NULL WHERE trip_id = '{trip['id']}' AND ingest_state = 'stored'")
+        shutil.rmtree(store)
+        gone = not store.exists()
+        failed |= not gone
+        say(f"{GREEN}✓{RESET}" if gone else f"{RED}✗{RESET}",
+            f"documents  {originals} original(s) {'removed' if gone else 'NOT fully removed'} — archived in {dest.name}")
+
     if trip_dir.is_dir() and kept:
         import yaml
         kept_dir = DEPLOY_ROOT / "trips" / kept["name"]
@@ -629,15 +795,22 @@ def main() -> int:
 
     home = PROFILES / profile
     if home.is_dir():
-        subprocess.run([hermes(), "profile", "delete", "-y", profile], capture_output=True, text=True,
-                       stdin=subprocess.DEVNULL)
-        s6_rescan()
+        def _delete_profile() -> None:
+            subprocess.run([hermes(), "profile", "delete", "-y", profile], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL)
+            s6_rescan()
+
         if args.settle_seconds > 0:
             print(f"    {DIM}watching {args.settle_seconds}s for the profile coming back…{RESET}")
-            time.sleep(args.settle_seconds)
-        if home.is_dir():
+        ok, redeletes = delete_profile_and_watch(home, settle_seconds=args.settle_seconds, delete=_delete_profile)
+        if redeletes:
+            print(f"    {DIM}profile came back {redeletes}x mid-window — deleted it again each time{RESET}")
+        if not ok:
             failed = True
-            say(f"{RED}✗{RESET}", f"profile    {home} CAME BACK — something still ticks it; nothing removed it again")
+            say(f"{RED}✗{RESET}", f"profile    {home} CAME BACK — something still ticks it; nothing removed it again"
+                + (f" ({redeletes} re-delete(s) all lost the race)" if redeletes else ""))
+        elif redeletes:
+            say(f"{GREEN}✓{RESET}", f"profile    deleted, and stayed gone (recreated {redeletes}x mid-window, re-deleted each time)")
         else:
             say(f"{GREEN}✓{RESET}", "profile    deleted, and stayed gone")
         if not MACOS:

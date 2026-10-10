@@ -61,10 +61,11 @@ cat > "$HANDOFF"
 # forbidden-key scan; this is the narrower question of whether the values that
 # become filesystem paths are safe to treat as ones.
 #
-# Two requests arrive on this key: a companion handoff (the default), and —
-# since 2026-09-11 — a `trip_mcp_bridge_request`, which carries NOTHING but a
-# trip slug and a profile name. Everything the bridge needs beyond those two
-# (the site's address, the container, the port) is read from this host's own
+# Three requests arrive on this key: a companion handoff (the default); since
+# 2026-09-11 a `trip_mcp_bridge_request`; and since 2026-09-28 a
+# `trip_mcp_bridge_probe` (issue #119). The last two carry NOTHING but a trip
+# slug and a profile name. Everything the bridge needs beyond those two (the
+# site's address, the container, the port) is read from this host's own
 # kinerary-deploy files below, never from the request.
 VALIDATED="$(
   /usr/bin/python3 - "$HANDOFF" <<'PY'
@@ -73,17 +74,22 @@ try:
     d = json.load(open(sys.argv[1]))
 except Exception as e:
     print(f"handoff is not valid JSON: {e}", file=sys.stderr); raise SystemExit(2)
+if not isinstance(d, dict):
+    print("refusing a request that is not a JSON object", file=sys.stderr); raise SystemExit(2)
 kind = d.get("record_type") or "trip_assistant_profile_input"
-if kind not in ("trip_assistant_profile_input", "trip_mcp_bridge_request"):
+if kind not in ("trip_assistant_profile_input", "trip_mcp_bridge_request", "trip_mcp_bridge_probe"):
     print(f"refusing unknown request type: {kind!r}", file=sys.stderr); raise SystemExit(2)
-name = ((d.get("profile") or {}).get("name") or "")
+profile = d.get("profile") or {}
+name = profile.get("name") if isinstance(profile, dict) else None
 # Conservative on purpose: this becomes ~/.hermes/profiles/<name>. No dots (no
 # traversal), no separators, no spaces, bounded length.
-if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,62}", name):
+if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,62}", name):
     print(f"refusing unsafe profile name: {name!r}", file=sys.stderr); raise SystemExit(2)
 slug = ""
-if kind == "trip_mcp_bridge_request":
+if kind in ("trip_mcp_bridge_request", "trip_mcp_bridge_probe"):
     slug = d.get("slug") or ""
+    if not isinstance(slug, str):
+        print(f"refusing unsafe trip slug: {slug!r}", file=sys.stderr); raise SystemExit(2)
     # Becomes ~/kinerary-deploy/trips/<slug>: the trip-slug grammar, no more.
     if not re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", slug) or len(slug) > 80:
         print(f"refusing unsafe trip slug: {slug!r}", file=sys.stderr); raise SystemExit(2)
@@ -207,7 +213,8 @@ ARCH_PROFILE="${KINERARY_ARCHITECTURE_PROFILE:-$REPO_ROOT/control-plane/deployme
 # rule docs/per-trip-gateway-architecture.md already states.
 enroll_relay() {
   local name="$1"
-  local env_file="$HOME/.hermes/profiles/$name/.env"
+  local profile_dir="$HOME/.hermes/profiles/$name"
+  local env_file="$profile_dir/.env"
 
   if [ ! -f "$ARCH_PROFILE" ]; then
     printf 'companion-install-host: no architecture profile at %s; %s left UNENROLLED (it would answer as the interviewer)\n' \
@@ -245,13 +252,27 @@ PY
     return 0
   }
 
+  # Companions write nothing on purpose (see the `skills:` block
+  # config.overlay.yaml.tpl adds), but write_file/patch stay technically
+  # reachable through the toolset — they are not what skill_manage's
+  # write_approval gate covers (tools/skill_manager_tool.py writes via
+  # atomic_write_text, a different code path). HERMES_WRITE_SAFE_ROOT scopes
+  # them to a directory of this profile's own that nothing legitimate ever
+  # writes into, so a prompt-injected document or a wrong inference that
+  # tries to write another profile's config.yaml, or this profile's own
+  # skill files, is hard-denied by Hermes itself (agent/file_safety.py)
+  # rather than merely discouraged. Created here so the value in .env always
+  # names a directory that exists.
+  local sandbox_dir="$profile_dir/write-sandbox"
+  mkdir -p "$sandbox_dir"
+
   # Rewritten in place, not appended: this runs again on every retry, and three
   # copies of GATEWAY_RELAY_ID with different values is a worse state than none.
   umask 077
   touch "$env_file"
-  /usr/bin/python3 - "$env_file" "$relay_url" "$name" "$secret" <<'PY'
+  /usr/bin/python3 - "$env_file" "$relay_url" "$name" "$secret" "$sandbox_dir" <<'PY'
 import base64, hashlib, hmac, sys
-env_path, url, gid, secret = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+env_path, url, gid, secret, sandbox_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 
 
 def control_token(gateway_id, key):
@@ -270,6 +291,12 @@ managed = {
     # The companion's `trip-control` MCP connection (companion-mcp.ts): the one
     # way it can rename itself so the router hears the new name.
     "COMPANION_CONTROL_TOKEN": control_token(gid, secret),
+    # Confines write_file/patch to this profile's own sandbox subdirectory —
+    # see the comment above this block. Only newly enrolled companions get
+    # this; a profile enrolled before this line existed is not retrofitted
+    # (this whole function only runs at install/repair time, never on a
+    # schedule against a live profile).
+    "HERMES_WRITE_SAFE_ROOT": sandbox_dir,
 }
 with open(env_path) as fh:
     lines = fh.read().splitlines()
@@ -510,14 +537,60 @@ start_gateway_supervised() {
 #
 # /health asks it: the bridge fetches its own trip's config and says whether it
 # arrived. Local to this host, so it needs no key and reveals no address.
+# The commit this script is running from — "unknown" rather than empty when
+# the checkout is not a git tree, so the field is always present and a missing
+# answer is never mistaken for a matching one.
+repo_commit() {
+  git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || printf 'unknown'
+}
+
+companion_provenance() {
+  local trip_dir="$1" profile="$2" out="$1/companion-provenance.json"
+  printf '{"repo_root":"%s","commit":"%s","branch":"%s","profile":"%s","wired_at":"%s"}\n' \
+    "$REPO_ROOT" "$(repo_commit)" \
+    "$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || printf 'unknown')" \
+    "$profile" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$out" 2>/dev/null || true
+}
+
+# BRIDGE_HEALTH is the operator-facing sentence for the install path's stderr;
+# BRIDGE_HEALTH_CODE is the one token the probe path prints. The code is the
+# only part of the bridge's answer that ever crosses back to the worker, and
+# only in the shape [A-Za-z0-9_]{1,40}: the body is another process's output,
+# and a newline or a space in it would otherwise be a forged second verdict.
+#   HTTP_<n>      the trip refused the bridge's key (HTTP_401 = key mismatch)
+#   E<errno>      the bridge could not reach the trip (EHOSTUNREACH is the Mac
+#                 Local Network grant, staging only — see CLAUDE.md)
+#   BRIDGE_401    the bridge refused the key in its own mcp/.env
+#   NO_KEY        no MCP_API_KEY beside the trip, so nothing could be asked
+#   NO_HEALTH_ROUTE  the running bridge's mcp.js predates /health (#127), so it
+#                 cannot be verified either way — NOT evidence that it is broken
+#   none          no answer at all: the bridge is not running
+#   UNRECOGNIZED  an answer, but not one of the above
+bridge_health_code() {
+  local body="$1" code=""
+  if [ -z "$body" ]; then printf 'none'; return 0; fi
+  code=$(printf '%s\n' "$body" \
+           | sed -n 's/^{.*"code":"\([A-Za-z0-9_]\{1,40\}\)"[,}].*$/\1/p' | head -1)
+  if [ -n "$code" ] && [ "$(printf '%s\n' "$body" | wc -l | tr -d ' ')" = 1 ]; then
+    printf '%s' "$code"; return 0
+  fi
+  case "$body" in
+    '{"error":"unauthorized"}') printf 'BRIDGE_401' ;;
+    *'Cannot GET /health'*) printf 'NO_HEALTH_ROUTE' ;;
+    *) printf 'UNRECOGNIZED' ;;
+  esac
+}
+
 bridge_reaches_trip() {
   local port="$1" trip_dir="$2" key="" body=""
+  BRIDGE_HEALTH_CODE=""
   # /health is behind the MCP key like every other route on that server. We are
   # on the host, beside the trip's own mcp/.env, so the key is simply here —
   # which is why the endpoint never needed an exemption in the first place.
   key=$(sed -n 's/^MCP_API_KEY=//p' "$trip_dir/mcp/.env" 2>/dev/null | head -1 | tr -d '"\r')
   if [ -z "$key" ]; then
     BRIDGE_HEALTH="no MCP_API_KEY in $trip_dir/mcp/.env"
+    BRIDGE_HEALTH_CODE="NO_KEY"
     return 1
   fi
   # `--config -` so the key arrives on stdin and never on the command line,
@@ -532,6 +605,7 @@ bridge_reaches_trip() {
     *'"ok":true'*) return 0 ;;
   esac
   BRIDGE_HEALTH="${body:-no answer from the bridge}"
+  BRIDGE_HEALTH_CODE="$(bridge_health_code "$body")"
   return 1
 }
 
@@ -561,36 +635,92 @@ gateway_registered_trip_mcp() {
 # The request names a slug and a profile. The site's address, the container
 # and the port come from this host's own topology.yaml for that slug, and the
 # profile must already be one this key installed.
-if [ "$REQUEST_KIND" = "trip_mcp_bridge_request" ]; then
+#
+# Shared by the bridge request and the bridge probe, so the two kinds cannot
+# drift in what they accept or where they look. Sets TRIP_DIR, VMID, SITE_IP,
+# SITE_PORT, MCP_PORT; dies (exit 2) on anything it cannot vouch for.
+read_trip_wiring() {
   DEPLOY_ROOT="${KINERARY_DEPLOY_ROOT:-$HOME/kinerary-deploy}"
   TRIP_DIR="$DEPLOY_ROOT/trips/$TRIP_SLUG"
   [ -f "$TRIP_DIR/topology.yaml" ] || die "no topology for $TRIP_SLUG on this host"
-  [ -d "$HOME/.hermes/profiles/$PROFILE_NAME" ] || die "no companion profile $PROFILE_NAME to wire"
-  [ -x "$DEPLOY_ROOT/setup-mcp.sh" ] || die "no setup-mcp.sh in $DEPLOY_ROOT"
+  [ -d "$HOME/.hermes/profiles/$PROFILE_NAME" ] || die "no companion profile $PROFILE_NAME on this host"
+  local py
   py="$(find_yaml_python)" || die "no python with PyYAML to read the topology"
   # Into a file, not "$( ... <<HEREDOC )": macOS /bin/bash 3.2 — which is what
   # sshd runs a forced command with — mis-parses quotes inside a here-document
   # inside a command substitution, and one apostrophe in a comment made this
   # whole script unparseable.
   "$py" - "$TRIP_DIR/topology.yaml" "$TRIP_SLUG" > "$WORK/wiring" <<'PYTOPO' || die "could not read $TRIP_SLUG's topology"
-import sys, yaml
+import re, sys, yaml
 topo = yaml.safe_load(open(sys.argv[1])) or {}
 slug = sys.argv[2]
 lxc = ((topo.get("proxmox") or {}).get("lxc") or {})
 if topo.get("name") != slug or lxc.get("name") != f"trip-{slug}":
     print(f"topology does not describe {slug}", file=sys.stderr); raise SystemExit(2)
 vmid = str((topo.get("proxmox") or {}).get("vmid") or "")
-ip = str(lxc.get("ipv4") or "").split("/")[0]
+ipv4 = str(lxc.get("ipv4") or "")
 fport = str((topo.get("npm") or {}).get("forward_port") or "")
-# The port rule is mcp_bridge.mcp_port_for_vmid's: 3000 + vmid, inside
-# 3100-3999, clear of the hand-provisioned bridges below 3100.
-if not vmid.isdigit() or not (3100 <= 3000 + int(vmid) <= 3999) or not ip or not fport.isdigit():
+# EVERY VALUE IS CHECKED AGAINST AN ASCII PATTERN before it is printed. These
+# travel tab-separated, and the fourth field is the port the bridge's KEY is
+# sent to: an address carrying a tab once shifted the fields so the trip
+# site's own port became the "MCP port". `isdigit()`/`int()` are not enough
+# either — both accept non-ASCII digits. `[0-9]` is ASCII only; fullmatch,
+# because `$` would allow a trailing newline. The values are never echoed.
+OCTET = r"(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
+ok = (
+    re.fullmatch(r"[0-9]{1,4}", vmid) is not None
+    and re.fullmatch(rf"{OCTET}(\.{OCTET}){{3}}(/[0-9]{{1,2}})?", ipv4) is not None
+    and re.fullmatch(r"[0-9]{1,5}", fport) is not None and 1 <= int(fport) <= 65535
+    # The port rule is mcp_bridge.mcp_port_for_vmid's: 3000 + vmid, inside
+    # 3100-3999, clear of the hand-provisioned bridges below 3100.
+    and 3100 <= 3000 + int(vmid) <= 3999
+)
+if not ok:
     print(f"topology for {slug} lacks a usable vmid/ip/port", file=sys.stderr); raise SystemExit(2)
-print(f"{vmid}\t{ip}\t{fport}\t{3000 + int(vmid)}")
+print(f"{vmid}\t{ipv4.split('/')[0]}\t{fport}\t{3000 + int(vmid)}")
 PYTOPO
-  WIRING="$(cat "$WORK/wiring")"
-  VMID="$(printf '%s' "$WIRING" | cut -f1)"; SITE_IP="$(printf '%s' "$WIRING" | cut -f2)"
-  SITE_PORT="$(printf '%s' "$WIRING" | cut -f3)"; MCP_PORT="$(printf '%s' "$WIRING" | cut -f4)"
+  local wiring
+  wiring="$(cat "$WORK/wiring")"
+  VMID="$(printf '%s' "$wiring" | cut -f1)"; SITE_IP="$(printf '%s' "$wiring" | cut -f2)"
+  SITE_PORT="$(printf '%s' "$wiring" | cut -f3)"; MCP_PORT="$(printf '%s' "$wiring" | cut -f4)"
+  # Belt and braces on the one value the key follows: exactly four ASCII
+  # digits, spelled out rather than [0-9], which some locales widen.
+  case "$MCP_PORT" in
+    [0123456789][0123456789][0123456789][0123456789]) ;;
+    *) die "topology for $TRIP_SLUG gave no usable bridge port" ;;
+  esac
+}
+
+# ── The bridge probe: is an already-wired bridge still reaching its trip? ─────
+#
+# Issue #119. /health used to be asked exactly once, at install, and a bridge
+# whose key was replaced afterwards — or whose host lost its route to the trip —
+# then failed every call for good while its companion answered politely that it
+# could not read the plan. The provisioner worker asks this on its idle poll
+# loop and records the answer as the trip's reachability.
+#
+# READ-ONLY, deliberately. It runs no setup-mcp.sh, restarts no bridge and no
+# gateway, writes nothing outside its own temp dir: repair is an operator's
+# decision (hard rule 2), and
+# an automatic re-wire would re-read whatever key is on disk, which is exactly
+# the thing that may be wrong. The key is read here, beside the trip, and sent
+# to the bridge on curl's stdin; it is never printed, and the worker never
+# sees it. Stdout is EXACTLY one line, `HEALTH ok` or `HEALTH fail <code>`
+# (codes: bridge_health_code). A refusal is exit 2 with no HEALTH line, so the
+# worker can tell "the bridge failed" from "the question could not be asked".
+if [ "$REQUEST_KIND" = "trip_mcp_bridge_probe" ]; then
+  read_trip_wiring
+  if bridge_reaches_trip "$MCP_PORT" "$TRIP_DIR"; then
+    printf 'HEALTH ok\n'
+  else
+    printf 'HEALTH fail %s\n' "${BRIDGE_HEALTH_CODE:-UNRECOGNIZED}"
+  fi
+  exit 0
+fi
+
+if [ "$REQUEST_KIND" = "trip_mcp_bridge_request" ]; then
+  read_trip_wiring
+  [ -x "$DEPLOY_ROOT/setup-mcp.sh" ] || die "no setup-mcp.sh in $DEPLOY_ROOT"
   # REPO_ROOT: the bridge runs this checkout's mcp.js, the same checkout whose
   # templates rendered the companion. stdin from /dev/null so the backgrounded
   # bridge does not hold this SSH session open after the script returns.
@@ -630,7 +760,17 @@ PYTOPO
           "$MCP_PORT" "$TRIP_SLUG" "$BRIDGE_HEALTH" >&2
         die "trip-mcp wired for $TRIP_SLUG but it cannot reach the trip site"
       fi
-      printf 'WIRED %s\n' "$PROFILE_NAME"
+      # WHICH CHECKOUT BUILT THIS COMPANION. The forced command in
+      # authorized_keys decides that, and on 2026-09-20 it named a feature
+      # branch 12 commits behind — so a run reported on two branches at once
+      # and nothing anywhere said so. Not the worker's log, not the trip's
+      # mcp/.env, not the profile. Hours went into establishing by hand what
+      # this one field says.
+      #
+      # Printed on the WIRED line because that is what the worker already
+      # reads, and written beside the trip because a log line ages out.
+      companion_provenance "$TRIP_DIR" "$PROFILE_NAME"
+      printf 'WIRED %s %s\n' "$PROFILE_NAME" "$(repo_commit)"
       exit 0
     fi
     # Wired but not reachable BY THE AGENT, which is the only sense that

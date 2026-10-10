@@ -46,7 +46,7 @@ Use when a user asks about the trip website itself: current published data, Tele
 4. Do **not** guess a `chat_id`.
 5. Bind only after the bot has actually seen a message in the group and you have the real negative Telegram `chat_id`.
 6. Use `mcp__trip_mcp__set_telegram_group` with the observed `chatId`.
-7. If the tool refuses with missing organizer binding, bind the organizer's Telegram first before retrying.
+7. If the tool refuses with `no_telegram_bound_organizer`, do not try to bind the organizer's Telegram yourself: `bind_participant_telegram` refuses an organizer username by design (the agent key must never be able to act on the organizer's own identity — issue #184). Tell the organizer their Telegram needs to be set at provisioning, or ask an operator to link it for them, before group binding can succeed.
 
 ## Workflow: image / hero replacement requests
 1. Inspect the live config to identify what is currently being shown:

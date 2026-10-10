@@ -27,6 +27,32 @@ python3 validate_bundle.py /tmp/familytrip-profile
 python3 -m unittest discover -s tests -v
 ```
 
+## Examples in these templates are placeholders, never people
+
+Whatever a prompt shows as an example, a model can hand back as a fact. Until
+#240, SOUL.md's example of a group-visible need was a sentence naming a person
+and a nut allergy; a companion on a trip with no recorded needs, and nobody by
+that name, told a real family a dinner had "nut-free options" for him. Write an
+example person as `<name>` and an example need as `<need>`.
+`tests/test_template.py` (`NoExamplePeople`) enforces it on the sources and on a
+rendered bundle. It reads every example shape this package uses — quotations,
+`>` blockquotes, ``` fences and "e.g." — and in any of them that mentions a
+need it refuses a capitalised name, an initial, a kin word ("for her son") and
+the names this repo's prompts have used as examples, in either script. It is a
+lint, not a proof: a name it does not know that opens a sentence, a Hebrew name
+it does not know, and an example in plain unmarked prose all pass it. Its
+header lists every gap, and the test pins each one as a case it lets through.
+
+The behavioural half is `eval/needs_eval.py`: it renders a companion for a
+fictional family with no recorded needs (and, as controls, with one real one),
+asks the `claude` and `codex` runners for dinner in English and Hebrew, and
+counts invented needs, names not on the roster and allergen claims made without
+their uncertainty. It calls live models, so it is run by hand — `--dry-run`
+first — and it is a proxy: the rendered SOUL.md as the system prompt, one turn,
+no tools, no memory, no fallback chain. It did not reproduce the incident's
+echo on either template, so it does not show that the echo got rarer; what it
+does show is in the #240 PR. Its header lists what it measures and what not.
+
 ## Create a real profile
 
 ```bash

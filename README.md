@@ -101,8 +101,8 @@ technical details (schema, endpoints, security model).
 Telegram Login can sign an already-configured participant into the same site
 session after the server verifies both Telegram's signed callback and current
 membership in a configured group. It is disabled by default; see
-[docs/telegram-sso.md](docs/telegram-sso.md) for the required environment
-values and participant binding. Do not put bot tokens, group IDs, or deployed
+[docs/archived/telegram-sso.md](docs/archived/telegram-sso.md) for the required environment
+values and participant binding (archived: the route still exists for stand-alone sites but is not used for provisioned sites). Do not put bot tokens, group IDs, or deployed
 site details in the repository.
 
 ---

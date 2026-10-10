@@ -6,7 +6,7 @@ import { buildApp } from "../src/app.js";
 import { validateArchitectureProfile } from "../src/config.js";
 import { applyMigrations } from "../src/migrations.js";
 import { sha256, type PortalDependencies } from "../src/portal.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const skip = !databaseUrl;
@@ -32,7 +32,7 @@ const profile = validateArchitectureProfile({
 function portalDeps(db: pg.Pool): PortalDependencies {
   return {
     db,
-    google: { authorizationUrl: () => "https://accounts.example.test", exchange: async () => ({ subject: "unused", displayName: "Unused" }) },
+    google: { authorizationUrl: () => "https://accounts.example.test", exchange: async () => ({ subject: "unused", displayName: "Unused", emailVerified: false }) },
     runtimeAccounts: { participantExists: async ({ runtimeUsername }) => runtimeUsername !== "missing-user", provisionParticipant: async (input) => {
       runtimeEnrollments.push(input);
       if (failNextEnrollment) { failNextEnrollment = false; throw new Error("simulated runtime reply lost"); }
@@ -54,7 +54,7 @@ async function session(userId: string, label: string) {
 
 before(async () => {
   if (skip) return;
-  pool = new pg.Pool({ connectionString: databaseUrl, max: 3 });
+  pool = testPool({ max: 3 });
   const client = await pool.connect();
   try { await applyMigrations(client, migrationsDir); } finally { client.release(); }
   await pool.query(`INSERT INTO control_plane.users(id,status,display_name) VALUES ($1,'active','Owner'),($2,'active','Member'),($3,'active','Outsider')`, [ids.owner, ids.member, ids.outsider]);
@@ -81,6 +81,7 @@ after(async () => {
   await pool.query("DELETE FROM control_plane.web_sessions WHERE user_id = ANY($1)", [[ids.owner, ids.member, ids.outsider, passwordInviteeId].filter(Boolean)]);
   await pool.query("DELETE FROM control_plane.trip_memberships WHERE trip_id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
   await pool.query("DELETE FROM control_plane.trips WHERE id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
+  await pool.query("DELETE FROM control_plane.telegram_organizer_links WHERE user_id = ANY($1)", [[ids.owner, ids.member, ids.outsider]]);
   await pool.query("DELETE FROM control_plane.user_identities WHERE user_id = ANY($1)", [[ids.owner, ids.member, ids.outsider]]);
   await pool.query("DELETE FROM control_plane.users WHERE id = ANY($1)", [[ids.owner, ids.member, ids.outsider]]);
   if (passwordInviteeId) await pool.query("DELETE FROM control_plane.users WHERE id = $1", [passwordInviteeId]);

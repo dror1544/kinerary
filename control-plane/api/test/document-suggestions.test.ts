@@ -25,7 +25,7 @@ import { MediaStore } from "../src/relay/media-store.js";
 import { advanceRouterOwnedQuestions, flushSettledInboundBursts, renderDueRouterPrompts } from "../src/relay/poller.js";
 import { DEFAULT_STRINGS } from "../src/relay/dispatch.js";
 import { uiString } from "../src/intake-copy.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -65,7 +65,7 @@ async function seed(pool: pg.Pool, chatId: string): Promise<void> {
 }
 
 async function withTwoChats(fn: (pool: pg.Pool, a: string, b: string) => Promise<void>): Promise<void> {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");

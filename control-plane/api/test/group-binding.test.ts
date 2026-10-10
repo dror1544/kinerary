@@ -11,7 +11,7 @@ import {
   redeemGroupBindingToken,
 } from "../src/group-binding.js";
 import { resolveChatRoute } from "../src/chat-router.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -22,7 +22,7 @@ const testId = (p: string) => `${p}_${randomBytes(16).toString("hex")}`;
 interface Fixture { pool: pg.Pool; tripId: string; otherTripId: string }
 
 async function withFixture(fn: (fix: Fixture) => Promise<void>): Promise<void> {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");
@@ -215,6 +215,87 @@ describe("group binding tokens", { skip: SKIP }, () => {
       assert.equal(stale.ok, false, "the superseded one stops working");
       const live = await redeemGroupBindingToken(pool, second.token, "-1002000777", "777");
       assert.equal(live.ok, true);
+    });
+  });
+
+  test("a token whose trip has been retired binds nothing", async () => {
+    // `teardown-trip.py` renames the trip's slug to `retired-<slug>-<yyyymmdd>`
+    // (issue #105) without necessarily touching `lifecycle_state`, and a token
+    // issued before teardown can stay live for up to 30 days after — the
+    // actual production reproduction path this task closes.
+    await withFixture(async ({ pool, tripId }) => {
+      const issued = await issueGroupBindingToken(pool, tripId, "777", { ttlSeconds: 3600 });
+      assert.ok(issued.ok);
+      if (!issued.ok) return;
+
+      await pool.query("UPDATE control_plane.trips SET slug = $1 WHERE id = $2", [
+        "retired-italy-20260911",
+        tripId,
+      ]);
+
+      const result = await redeemGroupBindingToken(pool, issued.token, "-1002000888", "777");
+      assert.equal(result.ok, false);
+      if (result.ok) return;
+      assert.equal(result.reason, "TRIP_RETIRED");
+
+      assert.equal((await resolveChatRoute(pool, "-1002000888")).kind, "unbound");
+    });
+  });
+
+  test("teardown-trip.py's token-revoke and a live redemption do not deadlock", async () => {
+    // A real `40P01: deadlock detected` was reproduced against Postgres
+    // (regression-planner): redeemGroupBindingToken's INSERT takes a
+    // FOR KEY SHARE lock on `trips` through its FK, while
+    // teardown-trip.py's retire_in_db used to revoke the group-binding
+    // token LAST, after locking bindings/trips — the opposite order from
+    // this function's own (token row via FOR UPDATE, then trips via the
+    // FK). The fix moved teardown's revoke to run FIRST, matching this
+    // function's order. This runs the two transactions concurrently
+    // against a real database, mirroring teardown's fixed statement order
+    // exactly, rather than only asserting SQL text/ordering against a
+    // mocked psql (which is what the earlier, mocked-only tests could not
+    // have caught).
+    await withFixture(async ({ pool, tripId }) => {
+      const issued = await issueGroupBindingToken(pool, tripId, "777", { ttlSeconds: 3600 });
+      assert.ok(issued.ok);
+      if (!issued.ok) return;
+
+      const teardownClient = await pool.connect();
+      const teardownTxn = (async () => {
+        try {
+          await teardownClient.query("BEGIN");
+          // teardown-trip.py's REVOKE_GROUP_TOKENS, now first.
+          await teardownClient.query(
+            `UPDATE control_plane.telegram_group_binding_tokens
+                SET expires_at = now()
+              WHERE trip_id = $1 AND expires_at > now()`,
+            [tripId],
+          );
+          // A short pause so the concurrent redemption below has a real
+          // chance to start and queue on the same token row before this
+          // transaction commits — without it, one transaction would
+          // usually finish before the other even begins, and the test
+          // would prove nothing about lock order.
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          // teardown-trip.py's bindings-close, now second.
+          await teardownClient.query(
+            `UPDATE control_plane.telegram_chat_bindings
+                SET closed_at = now(), closed_reason = 'trip_destroyed'
+              WHERE trip_id = $1 AND closed_at IS NULL`,
+            [tripId],
+          );
+          await teardownClient.query("COMMIT");
+        } finally {
+          teardownClient.release();
+        }
+      })();
+
+      const redemption = redeemGroupBindingToken(pool, issued.token, "-1002000999", "777");
+
+      // Promise.all rejects if either side throws — a real deadlock
+      // surfaces here as a thrown 40P01 error, not a swallowed one.
+      const [, result] = await Promise.all([teardownTxn, redemption]);
+      assert.ok(result.ok === true || result.ok === false, "settled without a deadlock error");
     });
   });
 

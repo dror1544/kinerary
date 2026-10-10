@@ -24,12 +24,15 @@
 import type pg from "pg";
 import {
   askText,
+  coerceLanguage,
   DEFAULT_LANGUAGE,
+  lifecycleLabel,
   optionLabel,
   uiString,
   type Language,
   unsettledText,
 } from "./intake-copy.js";
+import { hasEarlierBuiltTrip, LIVE_INTAKE_SESSION_PREDICATE, type OrganizerTrip } from "./organizer-trips.js";
 import type { RosterChoice } from "./organizer-identity.js";
 import {
   closeStaleSessionForChat,
@@ -39,6 +42,7 @@ import {
   type SessionView,
 } from "./interview.js";
 import { peekEnrollmentTripId } from "./enrollment.js";
+import { isPrivateChatId } from "./identity.js";
 import { structuredLog } from "./redaction.js";
 
 // ── Inbound text ─────────────────────────────────────────────────────────────
@@ -62,7 +66,19 @@ export type ParsedInbound =
        */
       malformed?: true;
     }
-  | { kind: "command"; name: string }
+  | {
+      kind: "command";
+      name: string;
+      /**
+       * The command's trailing text, trimmed; null when there was none.
+       *
+       * Captured but discarded until `/switch` needed it. It is ORDINARY
+       * MESSAGE TEXT and carries no authority whatsoever — every consumer
+       * checks it against a set derived server-side from the sender's verified
+       * identity. See organizer-trips.ts's header.
+       */
+      argument: string | null;
+    }
   | { kind: "text"; text: string };
 
 // Telegram addresses a command to a specific bot in group chats by appending
@@ -79,8 +95,7 @@ const START_PAYLOAD_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 // A Telegram group/supergroup chat id is negative; a private 1:1 chat id is a
 // positive integer. interview.ts records a chat binding only for the private
 // shape, so this must be checked BEFORE the enrollment is consumed — see
-// startFromDeepLink.
-const PRIVATE_CHAT_ID_PATTERN = /^\d{1,20}$/;
+// startFromDeepLink. The predicate itself lives in identity.ts.
 
 /**
  * Classifies one inbound message body. Returns a `start` with a null payload
@@ -95,7 +110,10 @@ export function parseInbound(raw: string): ParsedInbound {
 
   const name = (match[1] ?? "").toLowerCase();
   const rest = match[2];
-  if (name !== "start") return { kind: "command", name };
+  if (name !== "start") {
+    const argument = (rest ?? "").trim();
+    return { kind: "command", name, argument: argument || null };
+  }
 
   const payload = (rest ?? "").trim();
   if (!payload) return { kind: "start", payload: null };
@@ -319,7 +337,7 @@ export async function resolveChatRoute(db: pg.Pool, chatId: string): Promise<Cha
     // idleness", which is the same idea and always should have been.
     `SELECT id, trip_id
      FROM control_plane.intake_sessions
-     WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND expired_at IS NULL`,
+     WHERE ${LIVE_INTAKE_SESSION_PREDICATE}`,
     [chatId],
   );
   const [session] = live.rows;
@@ -355,10 +373,83 @@ export async function resolveChatRoute(db: pg.Pool, chatId: string): Promise<Cha
   return { kind: "unbound" };
 }
 
+// ── Companion reply capture ──────────────────────────────────────────────────
+
+/**
+ * How long a companion send's "I expect a reply" signal stays open. Long
+ * enough that a family reads a question and one of them answers without
+ * racing a deadline; short enough that ordinary group chatter minutes later
+ * is never mistaken for the answer.
+ */
+export const EXPECTS_REPLY_WINDOW_SECONDS = 150;
+
+/**
+ * Opens or clears the one-shot "the assistant's last message in this chat
+ * expects a reply" window on its open companion binding.
+ *
+ * Called on every companion-route send: `expects: false` clears whatever a
+ * PREVIOUS send opened, so a non-question message from the agent cancels a
+ * pending capture rather than leaving it to expire on its own. A no-op for
+ * any chat_id with no open binding — a DM has none, and neither does a
+ * closed group.
+ */
+export async function setCompanionExpectsReply(
+  db: pg.Pool,
+  chatId: string,
+  expects: boolean,
+  ttlSeconds: number = EXPECTS_REPLY_WINDOW_SECONDS,
+): Promise<void> {
+  await db.query(
+    `UPDATE control_plane.telegram_chat_bindings
+        SET awaiting_reply_since = CASE WHEN $2 THEN now() ELSE NULL END,
+            awaiting_reply_floor_seconds = CASE WHEN $2 THEN $3::integer ELSE NULL END
+      WHERE chat_id = $1 AND closed_at IS NULL`,
+    [chatId, expects, ttlSeconds],
+  );
+}
+
+/**
+ * Claims this chat's open reply-capture window, if one is open, unexpired,
+ * and the trip hasn't opted out — and clears it in the same statement
+ * either way it resolves. Meant to be called exactly once per inbound
+ * message, unconditionally, for every companion-route event: the first
+ * message after a question consumes the window regardless of its own
+ * content, so a second message minutes later — even inside the TTL — finds
+ * nothing left to claim. That is what makes this "the very next message,
+ * whoever sends it, one shot".
+ *
+ * Atomic UPDATE ... RETURNING, same shape as interview.ts's claimFloor():
+ * whether this returns true IS the row transitioning, so two concurrent
+ * reads of the same chat cannot both report a capture.
+ */
+export async function consumeExpectsReplyWindow(db: pg.Pool, chatId: string): Promise<boolean> {
+  const result = await db.query(
+    `UPDATE control_plane.telegram_chat_bindings b
+        SET awaiting_reply_since = NULL,
+            awaiting_reply_floor_seconds = NULL
+       FROM control_plane.trips t
+      WHERE b.chat_id = $1
+        AND b.closed_at IS NULL
+        AND b.trip_id = t.id
+        AND b.awaiting_reply_since IS NOT NULL
+        AND t.companion_reply_capture_enabled
+        AND b.awaiting_reply_since >= now() - make_interval(secs => COALESCE(b.awaiting_reply_floor_seconds, $2))`,
+    [chatId, EXPECTS_REPLY_WINDOW_SECONDS],
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
 // ── /start deep link ─────────────────────────────────────────────────────────
 
 export type StartLinkOutcome =
-  | { kind: "started"; sessionId: string; tripId: string; view: SessionView }
+  | {
+      kind: "started";
+      sessionId: string;
+      tripId: string;
+      view: SessionView;
+      /** They have had a trip built before, so the opening greets them as such. */
+      returning: boolean;
+    }
   | { kind: "already_in_interview"; sessionId: string; tripId: string }
   | {
       kind: "rejected";
@@ -481,7 +572,7 @@ export async function startFromDeepLink(
   // organizer with a consumed single-use enrollment and a session no chat can
   // reach — the link burnt for nothing. Refusing first keeps the link usable
   // in the DM where it belongs.
-  if (!PRIVATE_CHAT_ID_PATTERN.test(chatId)) {
+  if (!isPrivateChatId(chatId)) {
     log(structuredLog("info", "chat_router.start_link_rejected", { safe_error_code: "NOT_PRIVATE_CHAT" }));
     return { kind: "rejected", reason: "NOT_PRIVATE_CHAT" };
   }
@@ -492,13 +583,24 @@ export async function startFromDeepLink(
     return { kind: "rejected", reason: result.reason };
   }
 
+  // Which opening they meet. A failure here must not cost anyone their
+  // interview — the link has already been consumed by this point — so it falls
+  // back to the opening every first-time organizer gets.
+  let returning = false;
+  try {
+    returning = await hasEarlierBuiltTrip(db, result.view.tripId, chatId);
+  } catch {
+    returning = false;
+  }
+
   log(
     structuredLog("info", "chat_router.interview_started", {
       session_id: result.sessionId,
       trip_id: result.view.tripId,
+      returning,
     }),
   );
-  return { kind: "started", sessionId: result.sessionId, tripId: result.view.tripId, view: result.view };
+  return { kind: "started", sessionId: result.sessionId, tripId: result.view.tripId, view: result.view, returning };
 }
 
 // ── Inline keyboards ─────────────────────────────────────────────────────────
@@ -552,6 +654,11 @@ export function multiDoneCallbackData(questionId: string): string {
   return `n:${questionId}`;
 }
 
+/** `o:<questionId>` — the organizer wants to type a custom choice. */
+export function otherCallbackData(questionId: string): string {
+  return `o:${questionId}`;
+}
+
 /** `y:<questionId>` — "yes, that's right" to what a document suggested. */
 export function suggestionYesCallbackData(questionId: string): string {
   return `y:${questionId}`;
@@ -562,9 +669,28 @@ export function suggestionNoCallbackData(questionId: string): string {
   return `x:${questionId}`;
 }
 
+/**
+ * `s:<tripId>` — a tapped row in the `/trips` list, meaning "route this chat
+ * there".
+ *
+ * The trip id travels in the payload, and that is safe for exactly one reason:
+ * it is re-checked against the set derived from the TAPPER's verified Telegram
+ * id before anything is written (`switchChatToTrip`). The payload is a claim
+ * about which row was tapped, never about what the tapper may reach — the same
+ * split `parseCallbackData` already states for answers.
+ *
+ * Trip ids are `trip_` plus 32 hex, so `s:` + 37 = 39 bytes, comfortably
+ * inside Telegram's 64-byte limit; `callbackDataFits` is still asserted at the
+ * point the keyboard is built rather than assumed here.
+ */
+export function switchCallbackData(tripId: string): string {
+  return `s:${tripId}`;
+}
+
 export type ParsedCallback =
   | { kind: "answer"; questionId: string; optionId: string }
   | { kind: "toggle"; questionId: string; optionId: string }
+  | { kind: "other"; questionId: string }
   | { kind: "multi_done"; questionId: string }
   | { kind: "skip"; questionId: string }
   | { kind: "suggestion_yes"; questionId: string }
@@ -574,7 +700,45 @@ export type ParsedCallback =
   | { kind: "finish" }
   | { kind: "more" }
   | { kind: "no_document" }
+  | { kind: "switch"; tripId: string }
+  | { kind: "conflict"; conflictId: string; choice: "keep" | "replace" }
+  | { kind: "correction"; proposalId: string; choice: "approve" | "reject" }
+  | { kind: "change"; draftId: string; digest: string | null; choice: "apply" | "cancel" | "pick"; index?: number }
   | { kind: "unknown" };
+
+/**
+ * `x:<conflictId>:<k|r>` — settle a disagreement between documents: keep what is
+ * held, or take the document's value. The id names the disagreement, never the
+ * trip: which trip it belongs to still comes from the chat the tap arrived in.
+ */
+export function conflictCallbackData(conflictId: string, choice: "keep" | "replace"): string {
+  return `x:${conflictId}:${choice === "keep" ? "k" : "r"}`;
+}
+
+/**
+ * `dc:<proposalId>:<a|r>` — the organizer's decision on a change a document
+ * proposes to a CONFIRMED trip. Carries only which proposal and which choice;
+ * who may decide is established from the chat and the sender, never from this.
+ */
+export function correctionCallbackData(proposalId: string, choice: "approve" | "reject"): string {
+  return `dc:${proposalId}:${choice === "approve" ? "a" : "r"}`;
+}
+
+/**
+ * `pc:<draftId>:<digest>:a|c|r:<k>` — the organizer's answer to a typed change
+ * that is waiting for them (#206): apply it, cancel it, or pick candidate/option
+ * `k` of what it asks. The id names the draft, never the session: which session
+ * it belongs to is checked against the chat the tap arrived in, when it is
+ * applied. The digest (`draftDigest`) names WHICH VERSION of the draft the
+ * person was looking at: a follow-up merges into the same draft under the same
+ * id, and without it the old Yes would apply the new, unseen one.
+ *
+ * Length: `pc:` + `pchg_`+32 hex (37) + `:` + 8 hex + `:r:NN` = 3+37+1+8+5 = 54
+ * bytes at the widest, under Telegram's 64.
+ */
+export function changeCallbackData(draftId: string, digest: string, choice: "apply" | "cancel" | "pick", index?: number): string {
+  return choice === "pick" ? `pc:${draftId}:${digest}:r:${index ?? 0}` : `pc:${draftId}:${digest}:${choice === "apply" ? "a" : "c"}`;
+}
 
 /**
  * Parses callback_data from a tapped button. The result is a claim about
@@ -589,6 +753,31 @@ export function parseCallbackData(data: string): ParsedCallback {
   if (data === MORE_CALLBACK_DATA) return { kind: "more" };
   if (data === NO_DOCUMENT_CALLBACK_DATA) return { kind: "no_document" };
 
+  // Matched before the generic shapes below so a trip id's underscore cannot
+  // be mistaken for one of them.
+  const switched = /^s:(trip_[A-Za-z0-9]{8,64})$/.exec(data);
+  if (switched?.[1]) return { kind: "switch", tripId: switched[1] };
+
+  const conflict = /^x:([a-z]{2,12}_[A-Za-z0-9]{8,64}):([kr])$/.exec(data);
+  if (conflict?.[1] && conflict[2]) {
+    return { kind: "conflict", conflictId: conflict[1], choice: conflict[2] === "k" ? "keep" : "replace" };
+  }
+
+  const correction = /^dc:([a-z]{2,12}_[A-Za-z0-9]{8,64}):([ar])$/.exec(data);
+  if (correction?.[1] && correction[2]) {
+    return { kind: "correction", proposalId: correction[1], choice: correction[2] === "a" ? "approve" : "reject" };
+  }
+
+  // The digest is optional in the PARSE only so that a button sent before it
+  // existed is recognised as a change tap — and is then never applied (`null`
+  // matches no digest).
+  const change = /^pc:([a-z]{2,12}_[A-Za-z0-9]{8,64})(?::([0-9a-f]{8}))?:(?:([ac])|r:(\d{1,2}))$/.exec(data);
+  if (change?.[1]) {
+    const digest = change[2] ?? null;
+    if (change[4] !== undefined) return { kind: "change", draftId: change[1], digest, choice: "pick", index: Number(change[4]) };
+    return { kind: "change", draftId: change[1], digest, choice: change[3] === "a" ? "apply" : "cancel" };
+  }
+
   const pair = /^([at]):([A-Za-z0-9_]{1,64}):([A-Za-z0-9_]{1,64})$/.exec(data);
   if (pair?.[2] && pair[3]) {
     return pair[1] === "a"
@@ -596,11 +785,12 @@ export function parseCallbackData(data: string): ParsedCallback {
       : { kind: "toggle", questionId: pair[2], optionId: pair[3] };
   }
 
-  const single = /^([knyx]):([A-Za-z0-9_]{1,64})$/.exec(data);
+  const single = /^([knoyx]):([A-Za-z0-9_]{1,64})$/.exec(data);
   if (single?.[2]) {
     const questionId = single[2];
     if (single[1] === "k") return { kind: "skip", questionId };
     if (single[1] === "n") return { kind: "multi_done", questionId };
+    if (single[1] === "o") return { kind: "other", questionId };
     return single[1] === "y" ? { kind: "suggestion_yes", questionId } : { kind: "suggestion_no", questionId };
   }
 
@@ -638,9 +828,11 @@ export function renderQuestion(
   /**
    * What the record adds to this question: buttons drawn from it (the roster,
    * for the organizer), and an answer on record that did not settle it, which
-   * the question then quotes back instead of repeating itself.
+   * the question then quotes back instead of repeating itself. `unsettledKind`
+   * is `IntakeQuestion.unsettledMatchKind`'s reading of WHY, when a question
+   * has more than one way to be unsettled — see `unsettledText`.
    */
-  fromRecord: { choices?: readonly RosterChoice[]; unsettled?: string; subject?: string } = {},
+  fromRecord: { choices?: readonly RosterChoice[]; unsettled?: string; unsettledKind?: string; subject?: string } = {},
 ): RenderedQuestion {
   const rows: InlineButton[][] = [];
 
@@ -678,6 +870,9 @@ export function renderQuestion(
       const label = multi && selected.includes(option.id) ? `✅ ${text}` : text;
       rows.push([{ text: label, callback_data: data }]);
     }
+    if (!multi && question.allowsOther) {
+      rows.push([{ text: uiString("other", language), callback_data: otherCallbackData(question.id) }]);
+    }
     if (multi) {
       rows.push([{ text: uiString("multiDone", language), callback_data: multiDoneCallbackData(question.id) }]);
     }
@@ -712,7 +907,7 @@ export function renderQuestion(
   // organizer needs to know, and a sentence written before the answer landed
   // cannot know it.
   const body = fromRecord.unsettled
-    ? unsettledText(question, fromRecord.unsettled, language)
+    ? unsettledText(question, fromRecord.unsettled, language, fromRecord.unsettledKind)
     : agentText?.trim() || askText(question, language);
   // One question put once per thing it is about: "gluten-free — who is that for?"
   const text = fromRecord.subject ? `${fromRecord.subject} — ${body}` : body;
@@ -721,6 +916,23 @@ export function renderQuestion(
 
 /** Telegram's limit is 4096; the question and the buttons' copy need room too. */
 const SUGGESTION_LABEL_MAX = 3000;
+
+/**
+ * At most `max` UTF-16 units of `text` - the budget `SUGGESTION_LABEL_MAX` was
+ * written in - made of WHOLE characters. Never `text.slice(0, max)`: a cut
+ * through an emoji leaves half a surrogate pair, which is not valid UTF-8, and
+ * Telegram refuses the whole message; the label can come from a document (#225).
+ * Not `cutText` (typed-changes-render.ts, which imports this module): that counts
+ * code points, so a label of emoji could come out at twice this budget.
+ */
+export function cutWhole(text: string, max: number): string {
+  let cut = "";
+  for (const ch of text) {
+    if (cut.length + ch.length > max) break;
+    cut += ch;
+  }
+  return cut;
+}
 
 /**
  * A question asked WITH the answer a document suggested for it.
@@ -736,7 +948,7 @@ export function renderSuggestion(
   language: Language = DEFAULT_LANGUAGE,
   agentText?: string | null,
 ): RenderedQuestion {
-  const shown = label.length > SUGGESTION_LABEL_MAX ? `${label.slice(0, SUGGESTION_LABEL_MAX)}…` : label;
+  const shown = label.length > SUGGESTION_LABEL_MAX ? `${cutWhole(label, SUGGESTION_LABEL_MAX)}…` : label;
   const rows: InlineButton[][] = [[
     { text: uiString("suggestionYes", language), callback_data: suggestionYesCallbackData(question.id) },
     { text: uiString("suggestionNo", language), callback_data: suggestionNoCallbackData(question.id) },
@@ -792,7 +1004,10 @@ export function renderConfirmPrompt(
  * It belongs here for the same reason every other opening message does: the
  * router speaks first, and can be relied on to speak at all.
  */
-export function renderDocumentOffer(language: Language = DEFAULT_LANGUAGE): RenderedQuestion {
+export function renderDocumentOffer(
+  language: Language = DEFAULT_LANGUAGE,
+  returning = false,
+): RenderedQuestion {
   return {
     // One message, not two: an opening that arrives as a pair of notifications
     // reads as a bot talking AT someone, and the keyboard has to hang off
@@ -802,7 +1017,12 @@ export function renderDocumentOffer(language: Language = DEFAULT_LANGUAGE): Rend
     // what to send — `documentOffer` is no longer appended, because saying it
     // twice in one breath is how an opening starts sounding like terms and
     // conditions. See `introduction` in intake-copy.ts for what it has to do.
-    text: uiString("introduction", language),
+    // A returning organizer gets the shorter opening: they have a trip site
+    // and an assistant already, so nine paragraphs explaining what those are
+    // is a bot talking past them. What that version says instead is the one
+    // thing only a second trip raises — that the first one is not being
+    // replaced.
+    text: uiString(returning ? "introductionReturning" : "introduction", language),
     replyMarkup: {
       inline_keyboard: [[
         { text: uiString("noDocument", language), callback_data: NO_DOCUMENT_CALLBACK_DATA },
@@ -858,4 +1078,129 @@ export function renderBoundaryAsk(key: string, language: Language = DEFAULT_LANG
 /** Looks up a question by id from the canonical intake set. */
 export function findQuestion(questionId: string): IntakeQuestion | null {
   return INTAKE_QUESTIONS.find((q) => q.id === questionId) ?? null;
+}
+
+
+/**
+ * The language to answer this chat in, outside an interview.
+ *
+ * Commit f56f7b2 established that the bot answers in the organizer's language.
+ * A command surface replying in English regardless would walk that back, and
+ * `DEFAULT_STRINGS` — a flat English object — is exactly how that would happen,
+ * so command copy comes from `intake-copy.ts` and needs a language to draw it
+ * in.
+ *
+ * Order of preference, strongest evidence first:
+ *   1. What this chat's own interview recorded. `setLanguageForChat` writes
+ *      what the organizer ACTUALLY typed, so it outranks any setting.
+ *   2. The trip's stored introduction language, for a chat bound without ever
+ *      having interviewed here (a family group, or a switched DM).
+ *   3. The Telegram client locale on the update, which is the phone's setting
+ *      rather than what the person writes — a hint, and the weakest one.
+ *   4. English.
+ */
+export async function resolveChatLanguage(
+  db: pg.Pool,
+  chatId: string,
+  languageHint?: string,
+): Promise<Language> {
+  const { rows } = await db.query<{ language: string | null }>(
+    `SELECT language
+       FROM control_plane.intake_sessions
+      WHERE telegram_chat_id = $1 AND language IS NOT NULL
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [chatId],
+  );
+  const fromSession = coerceLanguage(rows[0]?.language);
+  if (fromSession) return fromSession;
+
+  const bound = await db.query<{ language: string | null }>(
+    `SELECT t.companion_intro->>'language' AS language
+       FROM control_plane.telegram_chat_bindings b
+       JOIN control_plane.trips t ON t.id = b.trip_id
+      WHERE b.chat_id = $1 AND b.closed_at IS NULL`,
+    [chatId],
+  );
+  const fromTrip = coerceLanguage(bound.rows[0]?.language);
+  if (fromTrip) return fromTrip;
+
+  return coerceLanguage(languageHint) ?? DEFAULT_LANGUAGE;
+}
+
+/** The name to call a trip in front of its organizer. */
+export function tripDisplayName(trip: Pick<OrganizerTrip, "title" | "slug">): string {
+  const title = trip.title?.trim();
+  return title && title.length > 0 ? title : trip.slug;
+}
+
+/**
+ * `trips.unreachable_reason` (migration 0042) written by the provisioner when
+ * the companion's trip-mcp bridge cannot read the trip's site
+ * (`UNREACHABLE_REASONS` in `control_plane_worker/provisioner.py`). The literal
+ * is duplicated because the two sides are different languages; the test
+ * `renderTripList — why a trip is unreachable` pins it.
+ */
+const BRIDGE_FAILED_REASON = "TRIP_MCP_BRIDGE_FAILED";
+
+/**
+ * Draws the `/trips` answer: which trips are this organizer's, what state each
+ * is in, and which one THIS chat is wired to.
+ *
+ * The marker on the current row is the part that makes `/switch` mean
+ * something rather than being abstract — without it the list answers "what do
+ * I have" but not "where am I", and the second question is the one that gets
+ * asked.
+ *
+ * Every trip gets a button, the current one included. Tapping it is answered
+ * with "already on this trip", which is a better outcome than a row that
+ * silently is not tappable and leaves the organizer wondering why.
+ */
+export function renderTripList(
+  trips: readonly OrganizerTrip[],
+  language: Language = DEFAULT_LANGUAGE,
+): RenderedQuestion {
+  if (trips.length === 0) {
+    return { text: uiString("tripsEmpty", language), replyMarkup: null };
+  }
+
+  const lines = [uiString("tripsHeader", language), ""];
+  const rows: InlineButton[][] = [];
+
+  for (const trip of trips) {
+    const name = tripDisplayName(trip);
+    const parts = [`• ${name} — ${lifecycleLabel(trip.lifecycleState, language)}`];
+    // Only ever shown when it is NOT reachable: a line saying "reachable" on
+    // every row would be noise, and this one is the exception worth reading.
+    //
+    // The wording depends on WHY. A bridge failure is the one reason where the
+    // trip's site works and only the companion cannot read it (#296), so "site
+    // not responding" would be false. Every other reason — including a NULL one —
+    // keeps the original label: an unknown reason is not evidence the site is up.
+    if (trip.reachability === "unreachable") {
+      const label = trip.unreachableReason === BRIDGE_FAILED_REASON ? "tripBridgeUnreachable" : "tripUnreachable";
+      parts.push(uiString(label, language));
+    }
+    if (trip.current) parts.push(uiString("tripsCurrent", language));
+    lines.push(parts.join(" "));
+
+    const data = switchCallbackData(trip.tripId);
+    // A payload that would not fit is dropped from the keyboard rather than
+    // sent truncated — a truncated trip id would parse as a DIFFERENT trip.
+    // Trip ids are nowhere near the limit; this is here so that stops being
+    // true loudly rather than quietly. The row still appears in the text, so
+    // the organizer can still name it to /switch.
+    if (!callbackDataFits(data)) continue;
+    rows.push([{ text: trip.current ? `✅ ${name}` : name, callback_data: data }]);
+  }
+
+  // Only worth saying when there is something to tap and a choice to make.
+  if (rows.length > 0 && trips.length > 1) {
+    lines.push("", uiString("tripsFooter", language));
+  }
+
+  return {
+    text: lines.join("\n"),
+    replyMarkup: rows.length > 0 ? { inline_keyboard: rows } : null,
+  };
 }

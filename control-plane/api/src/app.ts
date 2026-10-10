@@ -16,10 +16,28 @@ import { isInterpretPath } from "./interpret.js";
 import { saveDeferredVenueLinks } from "./venue-links.js";
 import { correctIntake } from "./intake-correction.js";
 import { issueApproval } from "./plan-approval.js";
+import { inviteOrganizer, previewInvitation } from "./organizer-invite.js";
+import {
+  JOB_STATES,
+  JOB_TYPES,
+  getDailyReport,
+  getFunnelSummary,
+  isValidReportDate,
+  listAuditEvents,
+  listJobs,
+  listRedactedFailures,
+  listReleasesForAdmin,
+  recordAdminRead,
+  type JobState,
+  type JobType,
+} from "./admin-dashboard.js";
+import { resumeTrip, retryTripViaAdmin, suspendTrip, validateSuspendReason } from "./admin-mutations.js";
 import { createOrVerifyPasswordIdentity, verifyPasswordLogin, resolveWebAuth } from "./password-identity.js";
 import { generatePlan, getPlan, listAvailableReleases, retryProvision } from "./planner.js";
 import { structuredLog } from "./redaction.js";
 import { registerPortalRoutes, type PortalDependencies } from "./portal.js";
+import { ingestHermesToolOutcomes } from "./hermes-ingest.js";
+import { timingSafeKeyMatch } from "./secure-compare.js";
 import {
   startSignup,
   processApprovalCallback,
@@ -82,6 +100,86 @@ export interface InterviewAgentDependencies {
   apiKey: string;
 }
 
+/**
+ * The operator's own routes: things a person does ABOUT an organizer rather
+ * than as one.
+ *
+ * Its own key, and not the interview agent's, because the two are different
+ * kinds of power. The interview-agent key writes inside a conversation that
+ * already exists and that a person started; this one creates a trip and an
+ * interview link for an address nobody here has ever heard from. Sharing a
+ * credential between them would mean the sidecar that answers interview
+ * questions could also mint invitations.
+ *
+ * Absent by default. A deployment that does not set the key does not have these
+ * routes at all, which is the state every deployment is in until someone
+ * decides otherwise.
+ */
+export interface OperatorDependencies {
+  db: pg.Pool;
+  /** Presented as X-API-Key. Held by the operator tool on the control-plane host, nowhere else. */
+  apiKey: string;
+  /** Seconds an issued interview link stays valid — the same TTL the organizer's own request gets. */
+  enrollmentTtlSeconds: number;
+  /** Fallback Telegram handle when the caller does not name one. */
+  botUsername?: string | null;
+}
+
+/**
+ * The super-admin dashboard's routes (Sprint 6 slice 1 + slice 2,
+ * docs/sprint6-tracks.md decision 23): jobs, funnel, versions, redacted
+ * failures, audit and the report read for every trip, not one; retry and
+ * suspend/resume mutate any trip. One key gates both — read a quiet operator
+ * dashboard, or take a mutating action with a required, audited reason — by
+ * deliberate choice (2026-10-03): this deployment has exactly one trusted
+ * operator, the dashboard already sits behind an operator allow-list page,
+ * and suspend/resume already refuse a blank reason, so a second key would add
+ * a secret to hold without changing who can act. Revisit if a second operator
+ * is ever added.
+ *
+ * A DISTINCT key from the operator's, on the same reasoning `OperatorDependencies`
+ * already states for why it does not share the interview agent's: these are
+ * different kinds of power. The operator key mints trips and invitations for
+ * addresses that have never contacted this deployment; this key reads every
+ * trip's jobs, funnel activity and audit trail at once and can suspend or
+ * retry any of them — the one key in this codebase with fleet-wide reach.
+ * Sharing either key with this one would make a leak of the smaller power
+ * also a leak of the larger one.
+ *
+ * Absent by default, like every optional block here: a deployment that has
+ * not set CONTROL_PLANE_ADMIN_KEY has none of `/v1/admin/*` at all.
+ */
+export interface AdminDependencies {
+  db: pg.Pool;
+  /** Presented as X-API-Key. Held by the operator's dashboard tooling, nowhere else. */
+  apiKey: string;
+}
+
+/**
+ * The Hermes tool-outcome ingest route (the slice #177/#326 named as still
+ * missing: an assistant-side fact the relay can never observe itself).
+ *
+ * A DISTINCT key from every other one here, for the same reason
+ * `AdminDependencies` and `OperatorDependencies` each give for not sharing
+ * theirs: a trip's own `HERMES_API_KEY` (server/server.js) is scoped to
+ * that one trip's SITE — reading/writing its photos, bookings, plan — and
+ * reusing it here would let anyone holding one trip's site key write
+ * analytics rows claiming to be a DIFFERENT trip's companion. This key
+ * authorizes exactly one thing: "I am some trip's Hermes plugin, reporting
+ * one of its own tool calls" — the request still names no trip id (see
+ * `hermes-ingest.ts`); the key only gets a caller past the door, never past
+ * the profile → trip resolution.
+ *
+ * Absent by default, like every optional block here: a deployment that has
+ * not set ASSISTANT_EVENTS_INGEST_KEY gets a 503 from this route, never a
+ * 401 that would at least confirm the route exists to brute-force against.
+ */
+export interface AssistantEventsIngestDependencies {
+  db: pg.Pool;
+  /** Presented as X-API-Key. Held by the Hermes plugin's own env, nowhere else. */
+  apiKey: string;
+}
+
 export interface AppDependencies {
   readiness?: () => Promise<Record<string, unknown>>;
   close?: () => Promise<void>;
@@ -100,6 +198,12 @@ export interface AppDependencies {
   portal?: PortalDependencies;
   /** Optional: mount the interviewer agent's chat-addressed interview routes. */
   interviewAgent?: InterviewAgentDependencies;
+  /** Optional: mount the operator's invitation routes. Off unless a key is set. */
+  operator?: OperatorDependencies;
+  /** Optional: mount the super-admin dashboard's routes (read, and slice 2's retry/suspend/resume mutations). Off unless a key is set. */
+  admin?: AdminDependencies;
+  /** Optional: mount the Hermes tool-outcome ingest route. Off unless a key is set. */
+  assistantEventsIngest?: AssistantEventsIngestDependencies;
 }
 
 // A driver's message and stack routinely carry the connection string, so the
@@ -114,20 +218,18 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
   const log = dependencies.log ?? ((line: string) => process.stderr.write(`${line}\n`));
   const app = Fastify({ logger: false });
 
+  // The route list is collected from Fastify rather than written out by hand:
+  // the hand-maintained version still advertised sprint 4 and listed none of
+  // the portal routes months after they mounted. A list that is derived cannot
+  // drift, and this endpoint has no other consumer to break.
+  const mountedRoutes = new Set<string>();
+  app.addHook("onRoute", (route) => {
+    if (route.path !== "/") mountedRoutes.add(route.path);
+  });
+
   app.get("/", async () => ({
     service: "kinerary-control-plane",
-    sprint: 4,
-    endpoints: [
-      "/healthz", "/readyz",
-      "/v1/signup", "/v1/signup/callback", "/v1/signup/status", "/v1/trips/:id",
-      "/v1/trips/:id/enrollment", "/v1/trips/:id/plan", "/v1/trips/:id/plan/retry", "/v1/trips/:id/intake/correct",
-      "/v1/interview", "/v1/interview/:sessionId", "/v1/interview/:sessionId/answer", "/v1/interview/:sessionId/confirm",
-      "/v1/interview/:sessionId/consular", "/v1/interview/:sessionId/source-document",
-      "/v1/interview/:sessionId/venue-links",
-      "/v1/plans/:planId", "/v1/plans/:planId/approve",
-      "/v1/releases",
-      "/internal/telegram-interviews/bind",
-    ],
+    endpoints: [...mountedRoutes].sort(),
   }));
 
   app.get("/healthz", async () => ({ status: "ok", service: "control-plane-api" }));
@@ -1464,6 +1566,394 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       return reply.code(409).send({ error: "CHAT_ALREADY_BOUND" });
     }
     return reply.code(201).send({ sessionId: started.sessionId, sessionToken: started.sessionToken, tripId: started.view.tripId });
+  });
+
+  // ── The operator's invitations ─────────────────────────────────────────────
+  //
+  // Two routes, and the split is the point: the first only reads. The tool an
+  // operator drives — and the monitoring agent that drives it for them — runs
+  // the preview, shows what would happen, and only then asks for the second.
+  //
+  // Neither route takes a chat id, a token, a password or a trip id. An
+  // invitation is an address and a language, and everything else about it is
+  // derived here from rows this database already holds.
+
+  function operatorAuth(request: { headers: unknown }): boolean {
+    const deps = dependencies.operator;
+    if (!deps) return false;
+    const providedKey = (request.headers as Record<string, unknown>)["x-api-key"];
+    return typeof providedKey === "string" && providedKey.length > 0 && providedKey === deps.apiKey;
+  }
+
+  app.post("/internal/operator/invitations/preview", async (request, reply) => {
+    if (!dependencies.operator) return reply.code(503).send({ error: "OPERATOR_NOT_CONFIGURED" });
+    if (!operatorAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const email = typeof body.email === "string" ? body.email : "";
+    const preview = await previewInvitation(dependencies.operator.db, email);
+    // A refused preview is still a 200: "you cannot invite this address, and
+    // here is why" is the answer the caller asked for, not a failure of the
+    // call. Only a missing key or a broken request is an error status.
+    return reply.code(200).send(preview.ok
+      ? { ok: true, plan: preview.plan }
+      : { ok: false, reason: preview.reason, detail: preview.detail, plan: preview.plan ?? null });
+  });
+
+  app.post("/internal/operator/invitations", async (request, reply) => {
+    if (!dependencies.operator) return reply.code(503).send({ error: "OPERATOR_NOT_CONFIGURED" });
+    if (!operatorAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+    const deps = dependencies.operator;
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const email = typeof body.email === "string" ? body.email : "";
+    const invitedBy = typeof body.invitedBy === "string" ? body.invitedBy : "";
+    const botUsername = typeof body.botUsername === "string" && body.botUsername.length > 0
+      ? body.botUsername
+      : deps.botUsername ?? "";
+    const result = await inviteOrganizer(
+      deps.db,
+      { email, language: typeof body.language === "string" ? body.language : undefined, botUsername, invitedBy },
+      { enrollmentTtlSeconds: deps.enrollmentTtlSeconds },
+      log,
+    );
+    if (!result.ok) {
+      // 409 for "not now" (a conversation or a build is in the way), 429 for
+      // the rate limit, 400 for a request that was never going to work.
+      const status = result.reason === "INTERVIEW_UNDERWAY" || result.reason === "TRIP_BUILDING" ? 409
+        : result.reason === "RATE_LIMITED" ? 429
+        : result.reason === "LINK_NOT_ISSUED" ? 500
+        : 400;
+      return reply.code(status).send({ error: result.reason, detail: result.detail });
+    }
+    return reply.code(201).send({
+      kind: result.kind,
+      tripId: result.tripId,
+      invitationId: result.invitationId,
+      deepLink: result.deepLink,
+      expiresAt: result.expiresAt.toISOString(),
+      language: result.language,
+      message: result.message,
+    });
+  });
+
+  // ── Super-admin dashboard, slice 1 (read-only) ───────────────────────────
+  //
+  // docs/sprint6-tracks.md decision 23. Every route here reads across ALL
+  // trips — no trip id, no binding, no member scoping — which is why the gate
+  // is a dedicated key (`AdminDependencies`, above) rather than a widened
+  // version of any existing auth. Slice 2 (suspend/retry) is below, in its
+  // own section — a mutation route, not a read, and each one documents the
+  // authorization story beyond the shared key per decision 23.
+  //
+  // Every successful read also writes one row to `control_plane.audit_events`
+  // (`recordAdminRead`) — "log who read what" — best-effort: a failure to
+  // write the audit row must never turn a successful read into a 500, so it
+  // is logged and swallowed rather than thrown.
+
+  function adminAuth(request: { headers: unknown }): boolean {
+    const deps = dependencies.admin;
+    if (!deps) return false;
+    const providedKey = (request.headers as Record<string, unknown>)["x-api-key"];
+    return typeof providedKey === "string" && providedKey.length > 0 && providedKey === deps.apiKey;
+  }
+
+  async function auditAdminRead(action: string, targetRef: string): Promise<void> {
+    try {
+      await recordAdminRead(dependencies.admin!.db, action, targetRef);
+    } catch (error) {
+      log(structuredLog("warn", "admin.audit_write_failed", {
+        safe_error_code: "ADMIN_AUDIT_WRITE_FAILED",
+        sqlstate: sqlstateOf(error),
+      }));
+    }
+  }
+
+  function parseLimit(query: Record<string, unknown>): number | undefined {
+    const raw = query.limit;
+    if (typeof raw !== "string") return undefined;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : undefined;
+  }
+
+  function parseTimestamp(raw: unknown): Date | undefined {
+    if (typeof raw !== "string" || raw.length === 0) return undefined;
+    const d = new Date(raw);
+    return Number.isNaN(d.getTime()) ? undefined : d;
+  }
+
+  // GET /v1/admin/jobs — every trip's provisioning/activation/etc. jobs.
+  // Query: tripId?, state?, jobType?, limit? (max 200), offset?
+  app.get("/v1/admin/jobs", async (request, reply) => {
+    if (!dependencies.admin) return reply.code(503).send({ error: "ADMIN_NOT_CONFIGURED" });
+    if (!adminAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const query = request.query as Record<string, unknown>;
+    const tripId = typeof query.tripId === "string" ? query.tripId : undefined;
+    const stateRaw = typeof query.state === "string" ? query.state : undefined;
+    const jobTypeRaw = typeof query.jobType === "string" ? query.jobType : undefined;
+    if (stateRaw !== undefined && !(JOB_STATES as readonly string[]).includes(stateRaw)) {
+      return reply.code(400).send({ error: "INVALID_REQUEST" });
+    }
+    if (jobTypeRaw !== undefined && !(JOB_TYPES as readonly string[]).includes(jobTypeRaw)) {
+      return reply.code(400).send({ error: "INVALID_REQUEST" });
+    }
+    const offsetRaw = query.offset;
+    const offset = typeof offsetRaw === "string" && Number.isFinite(Number(offsetRaw)) ? Number(offsetRaw) : undefined;
+
+    const result = await listJobs(dependencies.admin.db, {
+      tripId, state: stateRaw as JobState | undefined, jobType: jobTypeRaw as JobType | undefined,
+      limit: parseLimit(query), offset,
+    });
+    await auditAdminRead("admin.read.jobs", tripId ?? "all_trips");
+    return reply.code(200).send(result);
+  });
+
+  // GET /v1/admin/funnel — signup/onboarding funnel counts and conversion
+  // rates. Query: since? until? (ISO 8601 timestamps; both optional, no
+  // window means all time).
+  app.get("/v1/admin/funnel", async (request, reply) => {
+    if (!dependencies.admin) return reply.code(503).send({ error: "ADMIN_NOT_CONFIGURED" });
+    if (!adminAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const query = request.query as Record<string, unknown>;
+    const since = parseTimestamp(query.since);
+    const until = parseTimestamp(query.until);
+    if ((query.since !== undefined && since === undefined) || (query.until !== undefined && until === undefined)) {
+      return reply.code(400).send({ error: "INVALID_REQUEST" });
+    }
+
+    const summary = await getFunnelSummary(dependencies.admin.db, { since, until });
+    await auditAdminRead("admin.read.funnel", "all_trips");
+    return reply.code(200).send(summary);
+  });
+
+  // GET /v1/admin/versions — the release registry (candidate/verified/
+  // available/deprecated/retired), newest first. `promotedBy` passes through
+  // `listReleasesForAdmin`'s read-time safety net (admin-dashboard.ts) rather
+  // than the raw column, per the F1 boundary-review fix.
+  app.get("/v1/admin/versions", async (request, reply) => {
+    if (!dependencies.admin) return reply.code(503).send({ error: "ADMIN_NOT_CONFIGURED" });
+    if (!adminAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const releases = await listReleasesForAdmin(dependencies.admin.db);
+    await auditAdminRead("admin.read.versions", "all_releases");
+    return reply.code(200).send({ releases });
+  });
+
+  // GET /v1/admin/failures — recently failed jobs. Query: since? (ISO 8601),
+  // limit? (max 200). Does NOT serve `result` — see admin-dashboard.ts's
+  // module doc (F1, boundary review on PR #275): a job's `result` is
+  // caller-shaped JSON with nothing in it this route is designed to need, and
+  // `safeErrorCode` already is the safe channel for "what failed".
+  app.get("/v1/admin/failures", async (request, reply) => {
+    if (!dependencies.admin) return reply.code(503).send({ error: "ADMIN_NOT_CONFIGURED" });
+    if (!adminAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const query = request.query as Record<string, unknown>;
+    const since = parseTimestamp(query.since);
+    if (query.since !== undefined && since === undefined) return reply.code(400).send({ error: "INVALID_REQUEST" });
+
+    const result = await listRedactedFailures(dependencies.admin.db, { since, limit: parseLimit(query) });
+    await auditAdminRead("admin.read.failures", "all_trips");
+    return reply.code(200).send(result);
+  });
+
+  // GET /v1/admin/audit — the append-only audit trail. Query: since?,
+  // action?, limit? (max 200). `evidence` passes through a per-action
+  // allow-list (`EVIDENCE_ALLOWLIST` / `projectEvidence`, admin-dashboard.ts)
+  // rather than a deny-list — an action this codebase does not itself
+  // produce gets `{}`, not a best-effort scrub (F1, boundary review on PR
+  // #275). `actorRef`, `targetRef` and `action` itself all pass through
+  // `safePlain` too — none of the three carries a DB-level format CHECK, so
+  // none is served on trust (F1 round 2, findings R1/R3: `action` was still
+  // raw, and the allow-list lookup could crash on an `action` shaped like a
+  // JS built-in property name). Reading this route is itself audited, same
+  // as every other route here — an admin read of the audit trail is still a
+  // read of everyone's data.
+  app.get("/v1/admin/audit", async (request, reply) => {
+    if (!dependencies.admin) return reply.code(503).send({ error: "ADMIN_NOT_CONFIGURED" });
+    if (!adminAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const query = request.query as Record<string, unknown>;
+    const since = parseTimestamp(query.since);
+    if (query.since !== undefined && since === undefined) return reply.code(400).send({ error: "INVALID_REQUEST" });
+    const action = typeof query.action === "string" ? query.action : undefined;
+
+    const result = await listAuditEvents(dependencies.admin.db, { since, action, limit: parseLimit(query) });
+    await auditAdminRead("admin.read.audit", "all_trips");
+    return reply.code(200).send(result);
+  });
+
+  // GET /v1/admin/report — the dashboard's primary content per decision 23:
+  // a daily rollup built from what has real data today (funnel_events, jobs,
+  // releases). `notMeasuredYet` names the assistant-quality rates this is NOT
+  // computing — see admin-dashboard.ts's module doc for why. Query: date?
+  // (YYYY-MM-DD, UTC; defaults to today UTC).
+  app.get("/v1/admin/report", async (request, reply) => {
+    if (!dependencies.admin) return reply.code(503).send({ error: "ADMIN_NOT_CONFIGURED" });
+    if (!adminAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const query = request.query as Record<string, unknown>;
+    const date = typeof query.date === "string" ? query.date : new Date().toISOString().slice(0, 10);
+    if (!isValidReportDate(date)) return reply.code(400).send({ error: "INVALID_REQUEST" });
+
+    const report = await getDailyReport(dependencies.admin.db, date);
+    await auditAdminRead("admin.read.report", date);
+    return reply.code(200).send(report);
+  });
+
+  // ── Super-admin dashboard, slice 2 (suspend/retry) ───────────────────────
+  //
+  // docs/sprint6-tracks.md decision 23: "the only part that needs boundary
+  // review and server-side authorization." Each route below states its own
+  // authorization story in admin-mutations.ts — the shared key proves WHO,
+  // never WHY or UNDER WHAT CONDITIONS, which is what each mutation adds.
+  // Audited atomically with the mutation itself (admin-mutations.ts writes
+  // the audit row inside the same transaction, or best-effort right after
+  // for retry's cross-connection case) — unlike slice 1's reads, there is no
+  // separate `auditAdminMutation` call here to forget.
+
+  // POST /v1/trips/:id/plan/retry already exists for the trip's OWNER
+  // (above). This is the same mechanism (planner.ts's retryProvision, via
+  // admin-mutations.ts's thin wrapper) for an arbitrary trip, gated by the
+  // admin key instead of ownership — see admin-mutations.ts's module doc for
+  // why that reuse is correct rather than a parallel implementation.
+  app.post("/v1/admin/trips/:id/retry", async (request, reply) => {
+    if (!dependencies.admin) return reply.code(503).send({ error: "ADMIN_NOT_CONFIGURED" });
+    // #review 2026-10-03 [P1]: retryTripViaAdmin now issues the approval
+    // retryProvision alone leaves pending (see its own comment) — that
+    // needs planner.config's approval TTL/operator chat id, so this route
+    // needs planner configured too, not just admin.
+    if (!dependencies.planner) return reply.code(503).send({ error: "PLANNER_NOT_CONFIGURED" });
+    if (!adminAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const params = request.params as Record<string, unknown>;
+    const tripId = params?.id;
+    if (typeof tripId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+
+    const result = await retryTripViaAdmin(
+      dependencies.admin.db,
+      tripId,
+      dependencies.planner.config.approvalTtlSeconds,
+      dependencies.planner.config.operatorChatId,
+    );
+    if (!result.ok) {
+      const status = result.reason === "TRIP_NOT_FOUND" ? 404
+        : result.reason === "NO_COMPATIBLE_RELEASE" || result.reason === "ORGANIZER_NOT_ON_ROSTER" ? 422
+        : 409;
+      return reply.code(status).send({ error: result.reason });
+    }
+    return reply.code(201).send({
+      planId: result.planId,
+      planDigest: result.planDigest,
+      releaseId: result.releaseId,
+      jobId: result.jobId,
+      supersededPlanId: result.supersededPlanId,
+    });
+  });
+
+  // POST /v1/admin/trips/:id/suspend — pauses job claiming for this trip
+  // (migration 20261003060350's header: what suspend is and is not). Body:
+  // { reason: string } — REQUIRED, 1-500 chars, no control characters; the
+  // mandatory, audited justification that is this mutation's authorization
+  // story beyond the shared key (admin-mutations.ts's module doc). Refused
+  // with 400 before the database is ever touched when the reason does not
+  // validate.
+  app.post("/v1/admin/trips/:id/suspend", async (request, reply) => {
+    if (!dependencies.admin) return reply.code(503).send({ error: "ADMIN_NOT_CONFIGURED" });
+    if (!adminAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const params = request.params as Record<string, unknown>;
+    const tripId = params?.id;
+    if (typeof tripId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+
+    const body = request.body as Record<string, unknown> | undefined;
+    const validated = validateSuspendReason(body?.reason);
+    if (!validated.ok) return reply.code(400).send({ error: validated.error });
+
+    const result = await suspendTrip(dependencies.admin.db, tripId, validated.reason);
+    if (!result.ok) {
+      const status = result.reason === "TRIP_NOT_FOUND" ? 404 : 409;
+      return reply.code(status).send({ error: result.reason });
+    }
+    return reply.code(200).send({ tripId: result.tripId, suspendedAt: result.suspendedAt });
+  });
+
+  // POST /v1/admin/trips/:id/resume — reverses suspend. No reason required:
+  // see admin-mutations.ts's module doc for why (it only undoes a pause that
+  // was itself already justified).
+  app.post("/v1/admin/trips/:id/resume", async (request, reply) => {
+    if (!dependencies.admin) return reply.code(503).send({ error: "ADMIN_NOT_CONFIGURED" });
+    if (!adminAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const params = request.params as Record<string, unknown>;
+    const tripId = params?.id;
+    if (typeof tripId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+
+    const result = await resumeTrip(dependencies.admin.db, tripId);
+    if (!result.ok) {
+      const status = result.reason === "TRIP_NOT_FOUND" ? 404 : 409;
+      return reply.code(status).send({ error: result.reason });
+    }
+    return reply.code(200).send({ tripId: result.tripId, reapprovalNeeded: result.reapprovalNeeded });
+  });
+
+  // ── Hermes tool-outcome ingest ───────────────────────────────────────────
+  //
+  // The assistant-side half of the outcome-event pipeline (#177/#326): a
+  // companion's Hermes plugin posts a batch of `{event_id, outcome,
+  // tool_name, occurred_at?}` facts about its OWN trip-mcp tool calls —
+  // `grounded_answer`, `failed_tool` or `missing_data` (the tool worked, the
+  // trip's own data had nothing to answer with — the missing-information
+  // control loop's detection signal, decision 22), never `answered`
+  // (analytics/contract.ts). The request names the Hermes PROFILE
+  // reporting, never a trip id; `hermes-ingest.ts` resolves the one trip
+  // that profile belongs to (`trips.hermes_profile`) before anything is
+  // written.
+  //
+  // #review 2026-10-06 [N2], PR review before the sprint-6 -> main merge:
+  // this comment used to claim that resolution meant "a key leaked from one
+  // trip's companion still cannot name another trip in the body." That is
+  // false — ASSISTANT_EVENTS_INGEST_KEY is ONE shared key for every
+  // companion (see server.ts), not one per trip, so any holder of it can
+  // name ANY real profile and insert outcomes for that trip's analytics
+  // (confirmed live). The attacker gets integrity only — poisoned
+  // assistant-quality/missing-data metrics, not trip-data read access — and
+  // this is dormant today: ASSISTANT_EVENTS_INGEST_KEY is unset everywhere,
+  // so the route 503s before auth is even checked. Fixing this for real
+  // needs a credential actually scoped to one profile (a per-trip key, or
+  // an equivalent binding), which this one shared key cannot be made to do
+  // no matter how the body is re-shaped — tracked as a precondition on
+  // #327 before recording is ever turned on anywhere.
+  //
+  // Body: { profile: string, events: [{ event_id, outcome, tool_name, occurred_at? }] }
+  // (at most hermes-ingest.ts's MAX_BATCH_SIZE entries). A profile with no trip,
+  // or more than one, is a 404/409 and nothing is written; a malformed
+  // profile or batch shape is 400 before the database is touched. A
+  // per-event contract violation inside an otherwise-resolvable batch is
+  // reported in `rejected`, exactly as the relay's own emitter batches are —
+  // this never 500s for one bad row in a batch of otherwise-good ones.
+  function assistantEventsIngestAuth(request: { headers: unknown }): boolean {
+    const deps = dependencies.assistantEventsIngest;
+    if (!deps) return false;
+    const providedKey = (request.headers as Record<string, unknown>)["x-api-key"];
+    return timingSafeKeyMatch(providedKey, deps.apiKey);
+  }
+
+  app.post("/internal/assistant-events/tool-outcomes", async (request, reply) => {
+    if (!dependencies.assistantEventsIngest) return reply.code(503).send({ error: "ASSISTANT_EVENTS_INGEST_NOT_CONFIGURED" });
+    if (!assistantEventsIngestAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const result = await ingestHermesToolOutcomes(dependencies.assistantEventsIngest.db, body.profile, body.events);
+    if (!result.ok) {
+      const status = result.reason === "NO_TRIP" ? 404 : result.reason === "AMBIGUOUS_TRIP" ? 409 : 400;
+      return reply.code(status).send({ error: result.reason, ...(result.detail ? { detail: result.detail } : {}) });
+    }
+    return reply.code(200).send({
+      inserted: result.write.inserted,
+      duplicates: result.write.duplicates,
+      rejected: result.write.rejected,
+    });
   });
 
   if (dependencies.portal) { app.get("/v1/auth/telegram", async (_request, reply) => reply.code(410).send({ error: "TELEGRAM_WEB_AUTH_RETIRED" })); registerPortalRoutes(app, dependencies.portal); }

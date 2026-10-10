@@ -21,8 +21,8 @@ const BASE: CompanionIntroFacts = {
 };
 
 const TRAVELLERS = [
-  { name: "ניר סולומון", username: "nirsolomon" },
-  { name: "אלה", username: "ella" },
+  { name: "רון מרגולין", username: "ronmargolin" },
+  { name: "טלי", username: "tali" },
 ];
 
 describe("the login the introduction hands over", () => {
@@ -33,19 +33,19 @@ describe("the login the introduction hands over", () => {
   test("names the username beside the password", () => {
     const text = organizerIntroText({ ...BASE, loginUsernames: TRAVELLERS });
     assert.match(text, /Log in with your username and the password trip-seed-pw:/);
-    assert.match(text, /• ניר סולומון — nirsolomon/);
-    assert.match(text, /• אלה — ella/);
+    assert.match(text, /• רון מרגולין — ronmargolin/);
+    assert.match(text, /• טלי — tali/);
   });
 
   test("in Hebrew too", () => {
     const text = organizerIntroText({ ...BASE, language: "he", loginUsernames: TRAVELLERS });
     assert.match(text, /שם המשתמש שלכם והסיסמה trip-seed-pw:/);
-    assert.match(text, /• אלה — ella/);
+    assert.match(text, /• טלי — tali/);
   });
 
   test("the family group gets it as well — they are the ones logging in", () => {
     const text = groupIntroText({ ...BASE, loginUsernames: TRAVELLERS }, { includePassword: true });
-    assert.match(text, /• nirsolomon|• ניר סולומון — nirsolomon/);
+    assert.match(text, /• ronmargolin|• רון מרגולין — ronmargolin/);
     assert.match(text, /trip-seed-pw/);
   });
 
@@ -58,7 +58,7 @@ describe("the login the introduction hands over", () => {
   test("no password at all still says where to go", () => {
     const text = organizerIntroText({ ...BASE, loginPassword: null, loginUsernames: TRAVELLERS });
     assert.match(text, /Log in from the site itself\./);
-    assert.ok(!text.includes("nirsolomon"), "usernames are useless without the password");
+    assert.ok(!text.includes("ronmargolin"), "usernames are useless without the password");
   });
 });
 

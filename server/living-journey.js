@@ -121,6 +121,18 @@ function schema(db) {
       updated_at TEXT DEFAULT (datetime('now'))
     );
 
+    -- A dedicated single-row table, matching trip_ui_settings's own shape
+    -- ("one site-wide setting, DB-backed, PATCH to change it, no redeploy
+    -- needed"), rather than folding into trip_ui_settings itself — that table
+    -- is UI-specific by name and by the code that reads it elsewhere (see
+    -- uiSettings()). This gives future non-UI, trip-wide settings a home too.
+    CREATE TABLE IF NOT EXISTS trip_settings (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      timezone TEXT,
+      updated_by TEXT,
+      updated_at TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS itinerary_plan_versions (
       revision_id TEXT PRIMARY KEY,
       kind TEXT NOT NULL CHECK(kind IN ('original','active')),
@@ -246,6 +258,7 @@ function schema(db) {
   // Set once importPlanOnce() has made phase_plan_* the plan; never cleared.
   try { db.exec('ALTER TABLE trip_itinerary_state ADD COLUMN legacy_owns_config INTEGER NOT NULL DEFAULT 0'); } catch {}
   db.prepare('INSERT OR IGNORE INTO trip_ui_settings (id, design_variant) VALUES (1, ?)').run(normalizeUiVariant(process.env.TRIP_DESIGN_VARIANT));
+  db.prepare('INSERT OR IGNORE INTO trip_settings (id, timezone) VALUES (1, NULL)').run();
 }
 
 // What a day row says about where the family sleeps. These rows reach every
@@ -853,12 +866,49 @@ function withinFlightWindow(booking, clock = new Date()) {
   return t >= start && t <= end;
 }
 
-function tripTimeZone(config) {
-  return config.meta?.timezone || config.timezone || config.phases?.find((phase) => phase.timezone)?.timezone || 'UTC';
+// Node's equivalent of the worker's Python `_is_iana_timezone`: construct a
+// formatter for the candidate zone and let Intl itself be the validator.
+// Intl.DateTimeFormat throws a RangeError for an unrecognized `timeZone`; any
+// other failure (a non-string, for instance) is treated the same way — not a
+// valid zone — rather than propagating and turning a bad PATCH body into a 500.
+function isValidTimeZone(value) {
+  if (typeof value !== 'string' || !value.trim()) return false;
+  try {
+    new Intl.DateTimeFormat(undefined, { timeZone: value });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
-function localClock(config, date = new Date()) {
-  const timeZone = tripTimeZone(config);
+function tripSettings(db) {
+  const row = db.prepare('SELECT * FROM trip_settings WHERE id = 1').get();
+  return {
+    timezone: row?.timezone || null,
+    updated_by: row?.updated_by || null,
+    updated_at: row?.updated_at || null,
+  };
+}
+
+// The DB-backed override (set through PATCH /api/settings, live-mutable, no
+// redeploy needed) wins first; only when it is unset does this fall back to
+// the config's own timezone chain exactly as before #(this change) — a trip
+// provisioned before the override existed, or one nobody has ever corrected,
+// still resolves the same way it always did.
+function tripTimeZone(db, config) {
+  const override = db.prepare('SELECT timezone FROM trip_settings WHERE id = 1').get()?.timezone;
+  return override || config.meta?.timezone || config.timezone || config.phases?.find((phase) => phase.timezone)?.timezone || 'UTC';
+}
+
+function minutesToHHMM(minutes) {
+  const normalized = ((minutes % 1440) + 1440) % 1440;
+  const hh = String(Math.floor(normalized / 60)).padStart(2, '0');
+  const mm = String(normalized % 60).padStart(2, '0');
+  return `${hh}:${mm}`;
+}
+
+function localClock(db, config, date = new Date()) {
+  const timeZone = tripTimeZone(db, config);
   try {
     const formatter = new Intl.DateTimeFormat('en-CA', {
       timeZone,
@@ -984,7 +1034,7 @@ async function weatherObservation(db, fetchImpl, query) {
 
 function buildTodayContext(db, config) {
   const rows = activeRows(db);
-  const clock = localClock(config);
+  const clock = localClock(db, config);
   const today = clock.date;
   const datedItems = rows?.items.filter((item) => item.date).sort((a, b) => String(a.date).localeCompare(String(b.date)) || (a.time_sort ?? 99999) - (b.time_sort ?? 99999)) || [];
   // Empty itinerary days still belong to the trip. Include phase boundaries
@@ -1008,6 +1058,12 @@ function buildTodayContext(db, config) {
   return {
     today,
     time_zone: clock.time_zone,
+    // "What time is it" as a direct answer — the same `clock` object today's
+    // date and phase already came from, not a second computation, so the two
+    // can never disagree with each other. Before this, get_today had no
+    // current-time field at all, and a companion asked the time fell back to
+    // a general web search that came back stale.
+    time: minutesToHHMM(clock.minutes),
     companion_message: db.prepare('SELECT date, he, en FROM trip_daily_messages WHERE date = ?').get(today) || null,
     phase,
     first_date: firstDate,
@@ -1054,6 +1110,33 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
   app.get('/api/ui-settings', authRequired, (_req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     res.json(uiSettings(db));
+  });
+
+  // Trip-wide, DB-backed, live-mutable settings that are not UI presentation —
+  // follows trip_ui_settings's own established shape (one row, PATCH to
+  // change it, no redeploy needed). Today this is only the timezone override;
+  // a future non-UI setting belongs here too rather than growing a new table.
+  app.get('/api/settings', authRequired, (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(tripSettings(db));
+  });
+
+  app.patch('/api/settings', organizerOrAgentRequired, (req, res) => {
+    const body = req.body || {};
+    if (!isValidTimeZone(body.timezone)) {
+      return res.status(400).json({ error: 'timezone must be a valid IANA time zone identifier, e.g. "America/New_York"' });
+    }
+    // Store Intl's canonical spelling, never the caller's own — the same rule
+    // localClock already follows for what it serves (a config's timezone keys
+    // are not on the /api/config allow-list, so it serves Intl's resolved
+    // name, never the config's own spelling). "america/new_york" must not be
+    // stored verbatim just because a companion or a PATCH body happened to
+    // type it that way.
+    const canonical = new Intl.DateTimeFormat(undefined, { timeZone: body.timezone }).resolvedOptions().timeZone;
+    db.prepare(
+      "UPDATE trip_settings SET timezone = ?, updated_by = ?, updated_at = datetime('now') WHERE id = 1"
+    ).run(canonical, req.user.username);
+    res.json(tripSettings(db));
   });
 
   app.patch('/api/ui-settings', organizerOrAgentRequired, (req, res) => {
@@ -1294,7 +1377,7 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
 
   app.post('/api/agent/daily-message', organizerOrAgentRequired, (req, res) => {
     const { date, he, en } = req.body || {};
-    if (date !== localClock(config).date) return res.status(409).json({ error: 'message_date_must_match_today' });
+    if (date !== localClock(db, config).date) return res.status(409).json({ error: 'message_date_must_match_today' });
     if (![he, en].every(value => typeof value === 'string' && value.trim().length > 0 && value.trim().length <= 280)) {
       return res.status(400).json({ error: 'he_and_en_required_max_280_characters' });
     }
@@ -1433,4 +1516,4 @@ function create(options) {
   };
 }
 
-module.exports = { create };
+module.exports = { create, isValidTimeZone };

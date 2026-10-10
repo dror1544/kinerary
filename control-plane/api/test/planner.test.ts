@@ -8,7 +8,7 @@ import { issueApproval } from "../src/plan-approval.js";
 import { claimJob, heartbeat, recoverStaleLeases, recoverExpiredApprovals, completeJob, failJob } from "../src/job-queue.js";
 import { buildReleaseManifest, type PayloadSource } from "../src/release-artifact.js";
 import { promoteRelease, registerCandidateRelease } from "../src/release-registry.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const DB_URL = testDatabaseUrl();
 const SKIP = !DB_URL;
@@ -131,6 +131,7 @@ async function teardownFixture(fix: PlannerFixture) {
   await pool.query("DELETE FROM control_plane.intake_versions WHERE trip_id = $1", [tripId]);
   await pool.query("DELETE FROM control_plane.trip_memberships WHERE trip_id = $1", [tripId]);
   await pool.query("DELETE FROM control_plane.trips WHERE id = $1", [tripId]);
+  await pool.query("DELETE FROM control_plane.telegram_organizer_links WHERE user_id = $1", [ownerId]);
   await pool.query("DELETE FROM control_plane.user_identities WHERE user_id = $1", [ownerId]);
   await pool.query("DELETE FROM control_plane.users WHERE id = $1", [ownerId]);
   await pool.query("DELETE FROM control_plane.releases WHERE id = $1", [releaseId]);
@@ -143,7 +144,7 @@ describe("generatePlan", () => {
 
   before(async () => {
     if (SKIP) return;
-    pool = new pg.Pool({ connectionString: DB_URL, max: 5 });
+    pool = testPool({ max: 5 });
     await runMigrations(pool);
   });
 
@@ -426,7 +427,7 @@ describe("retryProvision", () => {
 
   before(async () => {
     if (SKIP) return;
-    pool = new pg.Pool({ connectionString: DB_URL, max: 5 });
+    pool = testPool({ max: 5 });
     await runMigrations(pool);
   });
 
@@ -711,7 +712,7 @@ describe("issueApproval", () => {
 
   before(async () => {
     if (SKIP) return;
-    pool = new pg.Pool({ connectionString: DB_URL, max: 5 });
+    pool = testPool({ max: 5 });
     await runMigrations(pool);
   });
 
@@ -811,7 +812,7 @@ describe("claimJob / heartbeat / completeJob / failJob", () => {
 
   before(async () => {
     if (SKIP) return;
-    pool = new pg.Pool({ connectionString: DB_URL, max: 5 });
+    pool = testPool({ max: 5 });
     await runMigrations(pool);
   });
 

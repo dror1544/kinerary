@@ -252,6 +252,10 @@ const photoSchema = z.object({
   caption: z.string(),
   username: z.string(),
   uploadedAt: z.string(),
+  // Short-lived signed link to the file (an <img> cannot send a bearer token). Issues #191/#194.
+  url: z.string().optional(),
+  // Capability link for the public /photo/<id> share page (no client builds one yet).
+  shareUrl: z.string().optional(),
   user: photoUserSchema,
 });
 
@@ -273,7 +277,7 @@ export type PhotoComments = Record<string, PhotoComment[]>;
  * Who can sign in, before anyone has.
  *
  * The accounts are the travellers and their usernames are DERIVED from their
- * names (`ella`, `nirsolomon`), so a person cannot guess their own — and on
+ * names (`tali`, `ronmargolin`), so a person cannot guess their own — and on
  * 2026-09-12 an organizer with the trip's password sat at this form with
  * nothing to type. `/api/config/roster` is deliberately public for exactly
  * this: names and usernames, no credentials. Classic has used it for its

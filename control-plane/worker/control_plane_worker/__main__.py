@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 from pathlib import Path
 import re
+import time
+from typing import Any, Callable
 
 from .cleanup import UnsafeCleanupError, load_test_resource_name_prefix, select_test_resources
 from .inventory import ProxmoxHttpTransport, ProxmoxInventory
@@ -29,6 +32,52 @@ def safe_failure_message(exc: BaseException) -> str:
     if isinstance(sqlstate, str) and re.fullmatch(r"[0-9A-Z]{5}", sqlstate):
         return f"{type(exc).__name__} (sqlstate {sqlstate})"
     return f"{type(exc).__name__}: operation failed, details suppressed"
+
+
+def poll_loop(
+    worker_obj: Any,
+    bridge_sweep: Any,
+    poll_seconds: float,
+    is_stopping: Callable[[], bool],
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> None:
+    """The provisioner's loop: one job at a time; when there is none, the
+    bridge probe (if due), then a sleep.
+
+    The probe runs ONLY on an idle poll, in this same thread, so it can never
+    race a provision re-wiring the same trip's bridge (issue #119). A failed
+    sweep has its own handler so the loop still sleeps after it rather than
+    spinning straight back to run_once.
+    """
+    while not is_stopping():
+        try:
+            found = worker_obj.run_once()
+            if not found:
+                try:
+                    bridge_sweep.maybe_run(should_stop=is_stopping)
+                except Exception as exc:
+                    print(json.dumps({"event": "provisioner.bridge_probe_sweep_failed",
+                                      "error": safe_failure_message(exc)}), flush=True)
+                end = monotonic() + poll_seconds
+                while not is_stopping() and monotonic() < end:
+                    sleep(min(0.25, max(0, end - monotonic())))
+        except Exception as exc:
+            print(json.dumps({"event": "provisioner.error", "error": safe_failure_message(exc)}), flush=True)
+
+
+def _non_negative_minutes(raw: str) -> float:
+    """An interval in minutes: a number, 0 or more. Anything else refuses at
+    startup rather than silently becoming a default — an unreadable value
+    quietly turning a check off is the failure this flag exists to end."""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"not a number of minutes: {raw!r}") from None
+    if value < 0 or value != value or value == float("inf"):
+        raise argparse.ArgumentTypeError(f"must be 0 (off) or a positive number of minutes: {raw!r}")
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -118,14 +167,62 @@ def build_parser() -> argparse.ArgumentParser:
                                 "PROVISIONER_LXC_IP_POOL/PROVISIONER_LXC_HOSTNAME_DOMAIN/PROVISIONER_LXC_TUNNEL_ID "
                                 "(PROVISIONER_COMPUTE_ENABLED=1)")
     provision.add_argument("--poll-seconds", type=float, default=10.0)
+    # Issue #119. ON by default, like the bridge itself: a bridge that stops
+    # reaching its trip after provisioning is otherwise found by an organizer,
+    # not by anyone who can fix it. Two consecutive failed probes mark the trip,
+    # so at 30 minutes one is found within about an hour. It only ever runs
+    # where the SSH bridge adapter is configured (see BridgeProbeSweep).
+    # `or "30"`: compose passes `${PROVISIONER_BRIDGE_PROBE_MINUTES:-}`, so an
+    # unset variable arrives as "" — which must mean the default, not a refusal
+    # that crash-loops the worker and stops provisioning. A value that IS set
+    # but is not a number of minutes still refuses at startup.
+    provision.add_argument("--bridge-probe-minutes", type=_non_negative_minutes,
+                           default=os.environ.get("PROVISIONER_BRIDGE_PROBE_MINUTES") or "30",
+                           help="when idle, re-ask every live trip's trip-mcp bridge whether it still reaches its "
+                                "trip at most this often, and record the answer as the trip's reachability — "
+                                "alert only, nothing is restarted. 0 turns it off "
+                                "(PROVISIONER_BRIDGE_PROBE_MINUTES, default 30)")
     check = subparsers.add_parser("check-database", help="verify the private worker database connection")
     check.add_argument("--database-url-file", default=os.environ.get("CONTROL_PLANE_DATABASE_URL_FILE"))
     return parser
 
 
+def _configure_logging() -> None:
+    """Without this the worker inherits Python's default root level, WARNING,
+    and every logger.info in the package is discarded.
+
+    That is not a cosmetic loss. `provisioner.mcp_bridge_wired` and
+    `mcp_bridge_skipped` are both INFO, so on 2026-09-19 a trip came up with no
+    trip-mcp and the worker's entire log for that provision was four lines —
+    none of them about the bridge. Whether the step ran, declined or was never
+    reached could not be established afterwards, because the two outcomes that
+    say which are exactly the two that were silent. The failure path
+    (`mcp_bridge_failed`) was visible the whole time, which is why nothing
+    looked broken.
+
+    INFO is the default because this is a background service whose actions are
+    only ever reconstructed from its log, and it emits a handful of lines per
+    provision rather than a stream. WORKER_LOG_LEVEL overrides it; an
+    unrecognised value falls back to INFO rather than silently disabling
+    logging, which would reintroduce the thing this exists to prevent.
+    """
+    requested = (os.environ.get("WORKER_LOG_LEVEL") or "INFO").upper()
+    level = getattr(logging, requested, None)
+    if not isinstance(level, int):
+        level = logging.INFO
+    logging.basicConfig(level=level, format=LOG_FORMAT)
+
+
+#: The worker's log line. It prints the message and NOTHING from `extra`, so a
+#: fact passed only as an extra field is invisible in the log (#292 tracks the
+#: worker-wide fix). Named so tests can render lines exactly as the worker does.
+LOG_FORMAT = "%(levelname)s %(name)s %(message)s"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    _configure_logging()
     try:
         if args.command in {"run", "check-database", "provision"} and not args.database_url_file:
             raise ValueError("--database-url-file or CONTROL_PLANE_DATABASE_URL_FILE is required")
@@ -210,6 +307,10 @@ def main(argv: list[str] | None = None) -> int:
                 vmid_map=vmid_map,
                 repo_root=args.repo_root,
                 compute=compute_adapter,
+                # The trips' NFS export as this worker sees it: originals are
+                # hard-linked into <slug>/documents instead of travelling with
+                # the deploy. Unset keeps the deploy copy.
+                trip_nfs_local_base=os.environ.get("PROVISIONER_TRIP_NFS_LOCAL_BASE") or None,
             )
             # Both default ON, so a trip onboarded through the pipeline is
             # born complete: site, companion profile, MCP bridge. The bridge
@@ -323,13 +424,85 @@ def main(argv: list[str] | None = None) -> int:
                 except Exception:
                     return None
 
+            def _destination_info_lookup(destination: str):
+                """Read-only view of control_plane.country_reference's
+                destination_info, written monthly by the API's refresh job
+                (destination-info-store.ts). Keyed by DESTINATION ALONE — the
+                same value is duplicated across every home_country row for that
+                destination, so any row answers; the freshest is taken in case a
+                fan-out was interrupted partway. A miss (or any DB error)
+                returns None and enrich_config keeps only the deterministic
+                lines it derives itself.
+
+                The key comes from the shared helper, NOT open-coded here: the
+                writers bound it at 80 characters and a reader that does not
+                would look up a key no row can hold. See country_key.py.
+
+                ERRORS ARE DELIBERATELY NOT SWALLOWED HERE. Returning None on a
+                DB failure would make a broken database indistinguishable from a
+                destination nobody has refreshed yet: both would produce the
+                same `destination_info_miss` line, so rotated credentials or a
+                network partition would log something harmless-looking on every
+                provision and nothing would say the cache was unreachable. The
+                exception propagates one frame to _enrich_destination_info,
+                which logs it as `destination_info_failed` WITH the traceback
+                and suppresses the miss line. Enrichment still cannot fail a
+                provision — enrich_config wraps the whole pass.
+
+                (The `_consular_lookup` above still swallows, which is the same
+                blind spot on the older path. Left alone deliberately: it is
+                pre-existing and feeds a live trip's embassy numbers.)"""
+                from .country_key import normalise_country_key
+                dest = normalise_country_key(destination)
+                if not dest:
+                    return None
+                import psycopg
+                with psycopg.connect(db_url) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT destination_info, destination_info_source "
+                            "FROM control_plane.country_reference "
+                            "WHERE destination_country = %s "
+                            "AND destination_info_fetched_at IS NOT NULL "
+                            "ORDER BY destination_info_fetched_at DESC LIMIT 1",
+                            (dest,),
+                        )
+                        row = cur.fetchone()
+                if row and isinstance(row[0], dict):
+                    # ONLY THE PROSE CROSSES THIS LINE. `destination_info_source`
+                    # is selected because the query is the reference read shared
+                    # with destination-info-store.ts, but it is deliberately NOT
+                    # copied into the returned dict: it holds `hermes:<profile>`,
+                    # an internal profile identifier, and anything in this dict
+                    # is one hop from a trip config and from GET /api/config,
+                    # which every authenticated family member can read.
+                    # Reviewed on #156 — it used to be copied here as
+                    # `info["source"]`. Which profile wrote a line is answered
+                    # server-side from the column itself, not on the wire.
+                    return dict(row[0])
+                return None
+
             def _enrich(config, destination):
                 return enrich_config(
                     config, destination,
                     consular_lookup=_consular_lookup,
                     venue_lookup=_venue_lookup,
+                    destination_info_lookup=_destination_info_lookup,
                 )
 
+            # Originals cannot be rebuilt. A store that is REQUIRED
+            # (DOCUMENT_STORE_REQUIRED=1, compose.vm.yml) but is not the real
+            # volume stops the worker here, exactly as it stops the relay; an
+            # optional one that is not ready is simply not used.
+            from .document_handoff import check_document_store
+            store_dir = os.environ.get("DOCUMENT_STORE_DIR", "")
+            store_required = os.environ.get("DOCUMENT_STORE_REQUIRED") == "1"
+            if store_dir or store_required:
+                store_ok, store_reason, store_detail = check_document_store(store_dir or None)
+                if not store_ok:
+                    if store_required:
+                        raise ValueError(f"document store not ready ({store_reason}): {store_detail}")
+                    store_dir = ""
             worker_obj = ProvisionerWorker(
                 db_url=db_url, deploy=deploy_adapter,
                 companion=companion_adapter, mcp_bridge=mcp_bridge_adapter,
@@ -350,26 +523,29 @@ def main(argv: list[str] | None = None) -> int:
                 # .env, read from one place so the password the organizer is
                 # told and the password the site accepts cannot drift apart.
                 seed_password=os.environ.get("PROVISIONER_SEED_PASSWORD", ""),
+                # The relay's document store. Unset provisions without source
+                # documents, which is what every trip before them had.
+                document_store_dir=store_dir,
             )
             if args.reconcile_companion:
                 print(json.dumps(worker_obj.reconcile_companion(args.reconcile_companion), sort_keys=True), flush=True)
                 return 0
-            import signal, time as _time
+            # The bridge probe (issue #119) rides the same loop, in the same
+            # thread, only when no job was found — so it can never race a
+            # provision that is re-wiring the same trip's bridge. Off, and said
+            # so at startup, wherever the adapter cannot probe (the bridge flag
+            # off, or no companion SSH host).
+            from .mcp_bridge import BridgeProbeSweep
+            bridge_sweep = BridgeProbeSweep(db_url, mcp_bridge_adapter, interval_minutes=args.bridge_probe_minutes)
+            print(bridge_sweep.describe(), flush=True)
+            import signal
             stopping = False
             def _stop(_sig: int, _frame: object) -> None:
                 nonlocal stopping
                 stopping = True
             signal.signal(signal.SIGTERM, _stop)
             signal.signal(signal.SIGINT, _stop)
-            while not stopping:
-                try:
-                    found = worker_obj.run_once()
-                    if not found:
-                        end = _time.monotonic() + args.poll_seconds
-                        while not stopping and _time.monotonic() < end:
-                            _time.sleep(min(0.25, max(0, end - _time.monotonic())))
-                except Exception as exc:
-                    print(json.dumps({"event": "provisioner.error", "error": safe_failure_message(exc)}), flush=True)
+            poll_loop(worker_obj, bridge_sweep, args.poll_seconds, lambda: stopping)
             return 0
         if args.command == "run":
             from .runtime import run

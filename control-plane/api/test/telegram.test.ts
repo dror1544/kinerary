@@ -8,7 +8,7 @@ import {
   resolveTelegramCallbackRef,
   answerTelegramCallbackQuery,
 } from "../src/adapters/telegram.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const DB_URL = testDatabaseUrl();
 const SKIP = !DB_URL;
@@ -58,7 +58,7 @@ describe("TelegramNotificationAdapter + resolveTelegramCallbackRef", () => {
 
   before(async () => {
     if (SKIP) return;
-    pool = new pg.Pool({ connectionString: DB_URL });
+    pool = testPool();
     const client = await pool.connect();
     try { await applyMigrations(client, migrationsDir); }
     finally { client.release(); }

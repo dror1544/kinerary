@@ -30,6 +30,10 @@ PATCHES = DEPLOYMENT / "hermes-patches"
 BUILD = DEPLOYMENT / "build-hermes-image.sh"
 CHECK = DEPLOYMENT / "hermes-image-check.sh"
 MANIFEST = ".kinerary-patches"
+# A verbatim copy of the Dockerfile in the pristine snapshot (`/opt/hermes-src`
+# on the VM, read 2026-09-28). A synthetic file with the same context would prove
+# nothing about whether a patch applies to the real one.
+PRISTINE_DOCKERFILE = REPO / "tests/scripts/fixtures/hermes-src/Dockerfile"
 
 FIXTURE_BEFORE = "one\ntwo\nthree\nfour\nfive\n"
 FIXTURE_AFTER = "one\ntwo\nPATCHED\nfour\nfive\n"
@@ -145,6 +149,82 @@ class ApplyingAFixturePatchSet(unittest.TestCase):
         self.assertNotEqual(first, (fresh / MANIFEST).read_text())
 
 
+class TheDockerfilePatchAppliesToTheRealDockerfile(unittest.TestCase):
+    """0003 adds `postgresql-client` because the fleet monitor's MCP shells out
+    to `psql` and the Hermes image has none. The fork is not ours, so the only
+    proof the patch lands is applying it, at fuzz 0, to the real Dockerfile.
+
+    The other patches edit gateway/ and tools/ files that this one-file fixture
+    does not carry, so the set handed to the script here is the patches that
+    touch the Dockerfile — today one; any future one is picked up by the glob and
+    has to apply in order onto the same copy."""
+
+    def setUp(self) -> None:
+        self.work = Path(tempfile.mkdtemp(prefix="hermes-dockerfile-test-"))
+        self.tree = self.work / "src"
+        self.tree.mkdir()
+        shutil.copy(PRISTINE_DOCKERFILE, self.tree / "Dockerfile")
+        self.only = self.work / "dockerfile-patches"
+        self.only.mkdir()
+        for p in patch_files():
+            if "+++ b/Dockerfile" in p.read_text():
+                shutil.copy(p, self.only / p.name)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.work, ignore_errors=True)
+
+    def apply_to_the_fixture(self) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(BUILD), "--patches", str(self.only), "--apply-only", str(self.tree)],
+            capture_output=True, text=True,
+        )
+
+    def patched_stages(self) -> tuple[str, str]:
+        """(everything before the runtime stage's FROM, the runtime stage)."""
+        result = self.apply_to_the_fixture()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = (self.tree / "Dockerfile").read_text().splitlines(keepends=True)
+        froms = [i for i, line in enumerate(lines) if line.startswith("FROM debian:")]
+        self.assertEqual(len(froms), 2, "expected the sqlite_build stage and the runtime stage")
+        return "".join(lines[: froms[-1]]), "".join(lines[froms[-1]:])
+
+    def test_0003_is_in_the_set_and_is_a_dockerfile_patch(self) -> None:
+        named = [p for p in patch_files() if p.name.startswith("0003-postgresql-client")]
+        self.assertEqual(len(named), 1, [p.name for p in patch_files()])
+        text = named[0].read_text()
+        self.assertIn("--- a/Dockerfile", text)
+        self.assertIn("+++ b/Dockerfile", text)
+
+    def test_the_dockerfile_patches_apply_cleanly_to_the_pristine_dockerfile(self) -> None:
+        self.assertTrue(list(self.only.glob("*.patch")), "no patch in the set touches the Dockerfile")
+        result = self.apply_to_the_fixture()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_runtime_stage_installs_postgresql_client_and_the_build_stage_does_not(self) -> None:
+        build_stage, runtime_stage = self.patched_stages()
+        self.assertIn("postgresql-client", runtime_stage)
+        self.assertNotIn("postgresql-client", build_stage,
+                         "the sqlite_build stage is discarded — psql there reaches nobody")
+
+    def test_it_extends_the_existing_install_and_keeps_no_install_recommends(self) -> None:
+        _, runtime_stage = self.patched_stages()
+        lines = runtime_stage.splitlines()
+        hits = [i for i, line in enumerate(lines) if "postgresql-client" in line]
+        self.assertEqual(len(hits), 1, "postgresql-client must appear exactly once in the runtime stage")
+        self.assertIn("install -y --no-install-recommends", lines[hits[0] - 1])
+        self.assertIn("ca-certificates", lines[hits[0]])
+        self.assertIn("docker-cli", lines[hits[0]], "the existing package list must be kept whole")
+
+    def test_nothing_else_in_the_dockerfile_changes(self) -> None:
+        self.patched_stages()
+        before = PRISTINE_DOCKERFILE.read_text().splitlines()
+        after = (self.tree / "Dockerfile").read_text().splitlines()
+        self.assertEqual(len(before), len(after), "an edit of one line, not a new layer")
+        changed = [(b, a) for b, a in zip(before, after) if b != a]
+        self.assertEqual(len(changed), 1, changed)
+        self.assertEqual(changed[0][1].replace(" postgresql-client", "", 1), changed[0][0])
+
+
 class CheckingWhatIsActuallyRunning(unittest.TestCase):
     """`hermes-image-check.sh` answers the question compose cannot: not which
     tag is named, but what is inside it."""
@@ -178,6 +258,57 @@ class CheckingWhatIsActuallyRunning(unittest.TestCase):
         stale = ["0" * 64 + lines[0][64:]] + lines[1:]
         result = self.run_check("\n".join(stale) + "\n")
         self.assertNotEqual(result.returncode, 0, "contents, not just names, must match")
+
+
+class CheckingThatPsqlIsInsideTheRunningImage(unittest.TestCase):
+    """The patch is only worth carrying if `psql` is really in what runs: the
+    fleet monitor's bootstrap refuses without it, and a monitor that cannot
+    reach the database reports nothing, which reads like a healthy fleet. The
+    check asks the image itself, through a stand-in `docker` on PATH."""
+
+    FAKE_DOCKER = """#!/bin/sh
+# Stand-in for docker: `exec`/`run` answer the manifest read and the psql probe.
+case "$*" in
+  *"command -v psql"*) [ "$FAKE_PSQL" = present ] && { echo /usr/bin/psql; exit 0; } || exit 1 ;;
+  *) cat "$FAKE_MANIFEST" ;;
+esac
+"""
+
+    def setUp(self) -> None:
+        self.work = Path(tempfile.mkdtemp(prefix="hermes-check-test-"))
+        bin_dir = self.work / "bin"
+        bin_dir.mkdir()
+        docker = bin_dir / "docker"
+        docker.write_text(self.FAKE_DOCKER)
+        docker.chmod(0o755)
+        (self.work / "manifest").write_text(manifest_for(patch_files()))
+        self.bin = bin_dir
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.work, ignore_errors=True)
+
+    def run_check(self, psql: str, *args: str) -> subprocess.CompletedProcess[str]:
+        env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
+                   FAKE_PSQL=psql, FAKE_MANIFEST=str(self.work / "manifest"))
+        return subprocess.run(["bash", str(CHECK), *args], capture_output=True, text=True, env=env)
+
+    def test_a_running_container_with_psql_passes(self) -> None:
+        result = self.run_check("present")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("psql", result.stdout)
+
+    def test_a_running_container_without_psql_fails_and_names_the_fix(self) -> None:
+        result = self.run_check("absent")
+        self.assertNotEqual(result.returncode, 0, "a manifest match must not hide a missing psql")
+        self.assertIn("psql", result.stderr)
+        self.assertIn("0003-postgresql-client", result.stderr)
+        self.assertIn("never", result.stderr)  # never install into the running container
+
+    def test_an_image_argument_is_probed_the_same_way(self) -> None:
+        self.assertEqual(self.run_check("present", "some/image:tag").returncode, 0)
+        result = self.run_check("absent", "some/image:tag")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("psql", result.stderr)
 
 
 class TheRepoKeepsThemConnected(unittest.TestCase):

@@ -19,7 +19,14 @@ Intake question IDs (INTAKE_SCHEMA_VERSION = 2):
   departure_date text: optional "YYYY-MM-DD" — precise departure, preferred
                  over the trip_duration placeholder logic when present
   return_date    text: optional "YYYY-MM-DD" — precise return
-  timezone       text: optional, not yet projected into trip.config.json
+  timezone       text: optional. Resolved by _resolve_timezone and projected
+                 into BOTH agent.timezone (the companion's own cron scheduling)
+                 and meta.timezone (what the site's tripTimeZone() reads for
+                 day/time logic) — the same resolved value in both places,
+                 never independently. meta.timezone is itself only a
+                 provisioning-time default: server/living-journey.js's
+                 trip_settings table can override it later without a
+                 redeploy, and that DB override always wins when set.
   travelers      structured (array): [{name, name_en?, age?, family}, ...] —
                  populates participants[]/families[]
   phases         structured (array): [{name, name_en?, start, end,
@@ -72,17 +79,25 @@ Hero `meta.brand`/`meta.title` are derived from destination + trip type + the
 departure year (e.g. "USA 2026"), not a fixed value — the site renders
 `meta.brand` as its main, prominent heading (see server/server.js and
 site/app.js's applyBrandFromConfig()). `meta.homeCurrency` and
-`travel_info.countries[*].currency` are a small static stopgap for the site's
-currency-conversion feature; see _lookup_known_currency's docstring for what's
-still missing.
+`travel_info.countries[*].currency` are a small static floor for the site's
+currency-conversion feature — `enrichment` replaces them with a live
+countries.dev hit when one resolves, and adds the Info tab's Health / Money /
+Communication lists on top (issue #156); see _lookup_known_currency's docstring
+for what this floor still covers on its own.
 """
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
+import secrets
 import unicodedata
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
+
+from . import packing_climate
+
+logger = logging.getLogger(__name__)
 
 # Required question IDs that must be present in the intake data.
 # `group_size` and `trip_duration` are deliberately NOT here: both are derived
@@ -288,6 +303,7 @@ _KNOWN_COUNTRY_CURRENCY: dict[str, dict[str, str]] = {
     "united states": {"country": "United States", "code": "USD", "symbol": "$", "currency_name": "US Dollar"},
     "america": {"country": "United States", "code": "USD", "symbol": "$", "currency_name": "US Dollar"},
     "japan": {"country": "Japan", "code": "JPY", "symbol": "¥", "currency_name": "Japanese Yen"},
+    "vietnam": {"country": "Vietnam", "code": "VND", "symbol": "₫", "currency_name": "Vietnamese Dong"},
     "italy": {"country": "Italy", "code": "EUR", "symbol": "€", "currency_name": "Euro"},
     "france": {"country": "France", "code": "EUR", "symbol": "€", "currency_name": "Euro"},
     "spain": {"country": "Spain", "code": "EUR", "symbol": "€", "currency_name": "Euro"},
@@ -301,26 +317,217 @@ _KNOWN_COUNTRY_CURRENCY: dict[str, dict[str, str]] = {
 }
 
 
+# The zone the trip is IN, keyed the same way as the currency map above and
+# deliberately sharing its country vocabulary — one destination, two facts.
+#
+# The interview asks for a timezone as free text, and an organizer who has not
+# been to the country cannot answer it: on 2026-09-20 the answer was the string
+# "Vietnam", which reached the config as `agent.timezone` and left a 07:30
+# briefing scheduled in a zone no clock resolves. Deriving beats asking, so the
+# typed answer is now only accepted when it is a real zone.
+#
+# A country spanning several zones is given the one its capital keeps, which is
+# where a trip's own clock realistically sits; anything genuinely ambiguous is
+# better left absent than guessed.
+_KNOWN_COUNTRY_TIMEZONE: dict[str, str] = {
+    "usa": "America/New_York",
+    "us": "America/New_York",
+    "united states": "America/New_York",
+    "america": "America/New_York",
+    "japan": "Asia/Tokyo",
+    "vietnam": "Asia/Ho_Chi_Minh",
+    "italy": "Europe/Rome",
+    "france": "Europe/Paris",
+    "spain": "Europe/Madrid",
+    "greece": "Europe/Athens",
+    "portugal": "Europe/Lisbon",
+    "germany": "Europe/Berlin",
+    "uk": "Europe/London",
+    "united kingdom": "Europe/London",
+    "england": "Europe/London",
+    "thailand": "Asia/Bangkok",
+    "israel": "Asia/Jerusalem",
+}
+
+
+# The destination as the ORGANIZER wrote it, mapped to the one key the tables
+# above are written in.
+#
+# Both tables key on English country names, and the interview stores the
+# destination in whatever language it was typed. Which language that is depends
+# on whether the interpreter happened to normalise it: on 2026-09-20 the same
+# scenario produced "Vietnam" on one run and "וייטנאם" on the next. The Hebrew
+# run lost BOTH facts — `travel_info` came out null, so the site's currency
+# card and its conversion feature were simply absent, and `agent.timezone` was
+# empty. Neither failure says anything; they are missing fields on a site that
+# otherwise looks complete.
+#
+# A Hebrew interview is the normal case here, so this is not an edge.
+_COUNTRY_ALIASES: dict[str, str] = {
+    "ארצות הברית": "usa", "ארהב": "usa", "אמריקה": "usa",
+    "יפן": "japan",
+    "וייטנאם": "vietnam", "ויאטנם": "vietnam", "ויטנאם": "vietnam",
+    "איטליה": "italy",
+    "צרפת": "france",
+    "ספרד": "spain",
+    "יוון": "greece",
+    "פורטוגל": "portugal",
+    "גרמניה": "germany",
+    "אנגליה": "uk", "בריטניה": "uk", "אנגליה ובריטניה": "uk",
+    "תאילנד": "thailand",
+    "ישראל": "israel",
+    # The hemisphere-only spellings that used to follow (Australia, Chile,
+    # Peru, ...) moved with the climate lookup to `packing_climate`, which
+    # keeps its own Hebrew names; tests/test_packing_climate.py holds every
+    # entry here to resolve there to the same country, so the two cannot
+    # drift apart silently.
+}
+
+
+def _country_keys(destination: str) -> list[str]:
+    """Every key worth trying for a destination, best first.
+
+    Deliberately shared by the currency and timezone lookups: they answer two
+    questions about one place, and a destination either resolves for both or
+    for neither. Keeping two spellings tables in step by hand is how one of
+    them silently stops matching."""
+    raw = (destination or "").strip()
+    tail = [part.strip() for part in raw.split(",") if part.strip()]
+    candidates = [raw, _destination_head(raw), tail[-1] if tail else ""]
+    keys: list[str] = []
+    for candidate in candidates:
+        lowered = candidate.strip().lower()
+        if not lowered:
+            continue
+        for key in (lowered, _COUNTRY_ALIASES.get(lowered.replace('"', "").replace("'", ""), "")):
+            if key and key not in keys:
+                keys.append(key)
+    return keys
+
+
+def _is_iana_timezone(value: str) -> bool:
+    """Whether something can actually be used as a clock."""
+    candidate = (value or "").strip()
+    if not candidate:
+        return False
+    try:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        ZoneInfo(candidate)
+        return True
+    except (ImportError, ZoneInfoNotFoundError, ValueError):
+        return False
+
+
+def _resolve_timezone(typed: str, destination: str) -> str:
+    """The trip's zone: what the organizer typed if it is one, else derived
+    from the destination, else nothing.
+
+    Returning "" rather than the unusable text is the point. A field that is
+    absent is a gap something can notice; a field holding "Vietnam" looks
+    answered and is read as a zone by everything downstream.
+    """
+    typed = (typed or "").strip()
+    if _is_iana_timezone(typed):
+        return typed
+    for key in _country_keys(destination):
+        zone = _KNOWN_COUNTRY_TIMEZONE.get(key)
+        if zone:
+            return zone
+    return ""
+
+
+def _has_confirmation(anchor: Any) -> bool:
+    """Whether a travel_anchor carries actual evidence of a booking.
+
+    Placeholders count as absent. A site that renders "–" for a missing
+    confirmation must not also count that anchor as confirmed — the two were
+    reading the same data and disagreeing on one page.
+    """
+    if not isinstance(anchor, Mapping):
+        return False
+    value = str(anchor.get("confirmation") or "").strip()
+    return bool(value) and value.lower() not in {"-", "\u2013", "\u2014", "none", "n/a", "tbd", "-"}
+
+
 def _lookup_known_currency(destination: str) -> dict[str, str] | None:
     """Static country-name -> currency lookup for well-known destinations.
 
-    This is a deliberately small stopgap, not the real fix: the actual
-    destination-info enrichment (currency, health/money tips, hospitals,
-    packing) was scoped as its own deterministic pass in
+    A pre-enrichment floor, not the whole story. The destination-info pass
+    scoped in
     `.hermes/plans/2026-08-06_063428-post-interview-enrichment-and-provisioning.md`
-    and never implemented or wired into this provisioner. This lookup exists
-    only so the site's currency-conversion feature (server/server.js's
-    HOME_CURRENCY/destinationCurrencyCodes, gated on travel_info.countries)
-    isn't unconditionally broken for every control-plane-provisioned trip
-    until that enrichment pass exists for real.
+    now EXISTS (issue #156): `enrichment._enrich_country` replaces this stub
+    with a live countries.dev hit whenever one resolves, and
+    `enrichment._enrich_destination_info` adds the Info tab's Health / Money /
+    Communication lists. Hospitals were dropped from that scope deliberately
+    (Dror, 2026-09-19) and are not coming — a wrong hospital name is worse than
+    no hospital name, and the emergency numbers are real.
+
+    This lookup still runs, and still matters, because it is the only source
+    reached when enrichment is disabled or countries.dev does not resolve the
+    destination: without it the site's currency-conversion feature
+    (server/server.js's HOME_CURRENCY/destinationCurrencyCodes, gated on
+    travel_info.countries) is unconditionally broken for that trip. It is also
+    what `_api_info_lines` reads in that case, so a fallback trip still gets its
+    Money line.
     """
-    return _KNOWN_COUNTRY_CURRENCY.get(destination.strip().lower())
+    for key in _country_keys(destination):
+        found = _KNOWN_COUNTRY_CURRENCY.get(key)
+        if found:
+            return found
+    return None
 
 
 _MULTI_PLACE_RE = re.compile(r",|&| and |/")
+# Only a heading separator: commas and "and" join places, they do not introduce details.
+_DESTINATION_HEAD_RE = re.compile(r"[—–:]| - ")
 
 
-def _derive_brand_and_title(destination: str, trip_type_label: str, year: int) -> tuple[str, str]:
+def _destination_head(destination: str) -> str:
+    """The place a destination leads with — "Portugal" from "Portugal — Lisbon and Porto" — or the whole text."""
+    head = _DESTINATION_HEAD_RE.split(destination, maxsplit=1)[0].strip()
+    return head or destination.strip()
+
+
+def _destination_country(destination: str, phase_names: "Sequence[str]") -> str:
+    """The country a destination TRAILS with — "Japan" from "Tokyo, Hakone,
+    Kyoto, Osaka, Japan".
+
+    `_destination_head` reads the other shape, "Portugal — Lisbon and Porto",
+    where the country leads. Both occur, and the trailing one is what the
+    interview actually produces: it normalises a spoken destination into a list
+    of stops with the country last. A real trip on 2026-09-19 stored
+    "Tokyo, Hakone, Kyoto, Osaka, Japan", was read as a plain city list, and
+    was titled "Family Trip 2027" with the country nowhere.
+
+    It has to be RECOGNISED as a country, not merely trailing. "Rome,
+    Florence, Venice" has the same shape and ends in a city; naming that trip
+    "Venice" is worse than the generic fallback. An earlier attempt here used
+    "not one of the phases" as the test, which named a trip OSAKA 2026 as soon
+    as the phases did not happen to list every city the destination mentions —
+    caught by two existing tests, and the reason this asks a country list
+    instead.
+
+    That list is the same fifteen-entry stopgap `_lookup_known_currency` uses,
+    so this inherits its limit: an unlisted country falls back to the trip
+    type rather than being named. Being wrong about which places are countries
+    is worse than being incomplete, and the real answer is the enrichment
+    pass, which resolves countries properly and runs after this.
+    """
+    parts = [p.strip() for p in _MULTI_PLACE_RE.split(destination) if p.strip()]
+    if len(parts) < 2:
+        return ""
+    trailing = parts[-1]
+    known_phases = {str(n).strip().casefold() for n in phase_names if str(n or "").strip()}
+    if trailing.casefold() in known_phases:
+        return ""  # it is one of the stops, so it is not the country
+    return trailing if trailing.strip().lower() in _KNOWN_COUNTRY_CURRENCY else ""
+
+
+
+
+def _derive_brand_and_title(
+    destination: str, trip_type_label: str, year: int, phase_names: "Sequence[str]" = (),
+) -> tuple[str, str]:
     """Derives a short Hero brand ("USA 2026") and a longer title ("USA 2026 —
     Group of Families") from the destination and trip type.
 
@@ -328,12 +535,19 @@ def _derive_brand_and_title(destination: str, trip_type_label: str, year: int) -
     destination that reads as multiple places (joined with a comma, "&", "/",
     or "and"), or is just long, falls back to the trip type as a thematic
     subject instead ("Family Trip 2026"), since a list of cities makes an
-    unreadable brand.
+    unreadable brand. A destination that leads with one place before a dash
+    or colon ("Portugal — Lisbon and Porto") is judged by that place alone.
     """
-    is_multi_place = bool(_MULTI_PLACE_RE.search(destination))
-    short_destination = _shorten_phase_name(destination, max_length=20)
-    if not is_multi_place and short_destination == destination.strip() and short_destination:
+    place = _destination_head(destination)
+    is_multi_place = bool(_MULTI_PLACE_RE.search(place))
+    short_destination = _shorten_phase_name(place, max_length=20)
+    trailing = _destination_country(destination, phase_names)
+    short_trailing = _shorten_phase_name(trailing, max_length=20) if trailing else ""
+    if not is_multi_place and short_destination == place and short_destination:
         subject = short_destination
+    elif trailing and short_trailing == trailing:
+        # A list of stops that ends with its country is named by the country.
+        subject = trailing
     else:
         subject = trip_type_label if "trip" in trip_type_label.lower() else f"{trip_type_label} Trip"
     brand = f"{subject} {year}".upper()
@@ -604,11 +818,8 @@ def _apply_dietary(
 
     visibility = _dietary_visibility(data)
     scope = _structured_dict(data, "dietary_scope")
-    by_name: dict[str, dict[str, Any]] = {}
-    for p in participants:
-        for key in (p.get("name"), p.get("name_en"), p.get("username")):
-            if isinstance(key, str) and key.strip():
-                by_name.setdefault(key.strip().casefold(), p)
+    # The same forms organizer_identity accepts, first name included; a name two travellers share matches nobody.
+    forms = [(p, _identity_forms(p)) for p in participants]
 
     instructions: list[dict[str, Any]] = []
     for option_id in selected:
@@ -619,7 +830,12 @@ def _apply_dietary(
         who = scope.get(option_id)
 
         names = who if isinstance(who, list) else []
-        matched = [p for name in names if (p := by_name.get(str(name).strip().casefold()))]
+        matched: list[dict[str, Any]] = []
+        for name in names:
+            needle = _normalize_identity(name)
+            hits = [p for p, person_forms in forms if needle in person_forms]
+            if len(hits) == 1 and hits[0] not in matched:
+                matched.append(hits[0])
 
         # Everything that isn't a resolvable list of people becomes a
         # group-wide instruction: an explicit "everyone", and equally an
@@ -648,30 +864,20 @@ def _apply_dietary(
 def _normalize_identity(value: Any) -> str:
     """Casefolded, whitespace-collapsed form used to compare stated names.
 
-    Internal whitespace is collapsed rather than merely stripped so "ניר
-    סולומון" and "ניר  סולומון" are the same needle. A name is typed by a
+    Internal whitespace is collapsed rather than merely stripped so "רון
+    מרגולין" and "רון  מרגולין" are the same needle. A name is typed by a
     person, once, into a chat.
     """
     return " ".join(str(value or "").split()).casefold()
 
 
-def _identity_forms(
+def _primary_identity_forms(
     participant: Mapping[str, Any], *aliases: Mapping[str, Any], include_username: bool = True,
 ) -> set[str]:
-    """Every way an organizer might write THIS participant's own name.
-
-    `aliases` carries the raw intake traveler entry for the same person, and
-    is not optional decoration: `_build_participants` SLUGIFIES `family`
-    ("סולומון" becomes "solomon") and drops `family_en` altogether, so by the
-    time a participant exists the roster no longer holds the household label
-    in the form the organizer actually typed. Matching the transformed
-    participant alone finds "ניר solomon" and misses "ניר סולומון" — which is
-    the same bug in a second dimension, found while fixing the first.
-
-    Deliberately excludes the bare family/household label: "סולומון" names a
-    household of five, not a person, and matching it would pick whichever of
-    them the roster happened to list first — precisely the silent
-    wrong-person failure `_resolve_organizers` exists to avoid.
+    """The strong forms: this participant's own name(s) and name + household,
+    exactly as recorded — never a name borrowed from somebody else's longer
+    name. `_resolve_organizers` checks these ahead of `_identity_forms`'s
+    weaker first-word fallback; see that function's docstring for why (#321).
     """
     sources = (participant, *aliases)
     names = {_normalize_identity(src.get("name")) for src in sources}
@@ -690,19 +896,51 @@ def _identity_forms(
     # mixed-script rosters that happen in practice — a Hebrew given name whose
     # household label was only ever transliterated, or the reverse.
     forms |= {f"{n} {f}" for n in names for f in families}
-    # The GIVEN NAME on its own, taken as the first token of any multi-part
-    # name. Run 14, live: the organizer answered "ניר" and matched nothing,
-    # while "Nir" would have matched — not because English is privileged, but
-    # because `name_en` happens to hold only the given name while `name` holds
-    # the full one. The organizer answered with their own first name, in the
-    # language the entire interview was conducted in, and the companion was
-    # never built.
-    #
-    # Safe to add precisely because ambiguity already fails closed: two
-    # travellers sharing a given name resolve to nobody rather than to whoever
-    # the roster lists first, which is the guarantee `_resolve_organizers`
-    # exists to keep. This widens what can match, never what happens when more
-    # than one does.
+    forms.discard("")
+    return forms
+
+
+def _identity_forms(
+    participant: Mapping[str, Any], *aliases: Mapping[str, Any], include_username: bool = True,
+) -> set[str]:
+    """Every way an organizer might write THIS participant's own name.
+
+    `aliases` carries the raw intake traveler entry for the same person, and
+    is not optional decoration: `_build_participants` SLUGIFIES `family`
+    ("מרגולין" becomes "margolin") and drops `family_en` altogether, so by the
+    time a participant exists the roster no longer holds the household label
+    in the form the organizer actually typed. Matching the transformed
+    participant alone finds "רון margolin" and misses "רון מרגולין" — which is
+    the same bug in a second dimension, found while fixing the first.
+
+    Deliberately excludes the bare family/household label: "מרגולین" names a
+    household of five, not a person, and matching it would pick whichever of
+    them the roster happened to list first — precisely the silent
+    wrong-person failure `_resolve_organizers` exists to avoid.
+
+    Adds, on top of `_primary_identity_forms`, the GIVEN NAME alone, taken as
+    the first token of any multi-part name. Run 14, live: the organizer
+    answered "ניר" and matched nothing, while "Nir" would have matched — not
+    because English is privileged, but because `name_en` happens to hold only
+    the given name while `name` holds the full one. The organizer answered
+    with their own first name, in the language the entire interview was
+    conducted in, and the companion was never built.
+
+    This fallback must never be weighed EQUALLY against another participant's
+    own, exact name. Found live (#321): a roster holding both "Dana Levi" and
+    a separate participant named plainly "Dana". Typing "Dana" matches the
+    second participant's own name exactly, but used to tie against the
+    first's first-word fallback every time — unsettleable by any typed
+    answer, because the same fallback re-competes on every retry.
+    `_resolve_organizers` now tries `_primary_identity_forms` first and only
+    reaches this fallback for a needle nobody's own name matched.
+    """
+    sources = (participant, *aliases)
+    names = {_normalize_identity(src.get("name")) for src in sources}
+    names |= {_normalize_identity(src.get("name_en")) for src in sources}
+    names.discard("")
+
+    forms = _primary_identity_forms(participant, *aliases, include_username=include_username)
     forms |= {n.split(" ", 1)[0] for n in names if " " in n}
     forms.discard("")
     return forms
@@ -885,7 +1123,9 @@ def _resolve_organizers(data: Mapping[str, Any], participants: list[dict[str, An
             if form:
                 raw_by_name.setdefault(form, entry)
 
+    primary_forms_by_username: dict[str, set[str]] = {}
     forms_by_username: dict[str, set[str]] = {}
+    primary_names_by_username: dict[str, set[str]] = {}
     names_by_username: dict[str, set[str]] = {}
     for participant in participants:
         username = participant.get("username")
@@ -897,7 +1137,11 @@ def _resolve_organizers(data: Mapping[str, Any], participants: list[dict[str, An
                 raw_by_name.get(_normalize_identity(participant.get("name_en"))),
             ) if raw is not None
         ]
+        primary_forms_by_username.setdefault(username, set()).update(
+            _primary_identity_forms(participant, *aliases))
         forms_by_username.setdefault(username, set()).update(_identity_forms(participant, *aliases))
+        primary_names_by_username.setdefault(username, set()).update(
+            _primary_identity_forms(participant, *aliases, include_username=False))
         names_by_username.setdefault(username, set()).update(
             _identity_forms(participant, *aliases, include_username=False))
 
@@ -905,7 +1149,19 @@ def _resolve_organizers(data: Mapping[str, Any], participants: list[dict[str, An
     # reading that names exactly ONE traveller wins; a reading that names two
     # ends the search — a looser read must never break a tie a stricter one
     # could not.
+    #
+    # Within "as typed", an exact match against someone's own name
+    # (`_primary_identity_forms`) always wins outright, even if the SAME
+    # needle would also match a different traveller only through that
+    # traveller's weaker first-word fallback — see `_identity_forms`'s
+    # docstring (#321). Only when nobody's own name matches does the
+    # fallback get a turn to decide anything.
     for needle in candidates:
+        primary_matched = [u for u, forms in primary_forms_by_username.items() if needle in forms]
+        if len(primary_matched) == 1:
+            return primary_matched
+        if len(primary_matched) > 1:
+            return []
         matched = [u for u, forms in forms_by_username.items() if needle in forms]
         if len(matched) == 1:
             return matched
@@ -915,8 +1171,17 @@ def _resolve_organizers(data: Mapping[str, Any], participants: list[dict[str, An
     # Nothing matched as written. The same name in the OTHER alphabet — "ניר"
     # for a roster that only ever spelled it "Nir" — under the same rule: one
     # traveller or nobody. Reached only when every stricter reading found no one,
-    # so it can never break a tie those readings refused.
+    # so it can never break a tie those readings refused. Primary-first here
+    # too, for the same reason as the as-written pass above.
     for needle in candidates:
+        primary_matched = [
+            u for u, names in primary_names_by_username.items()
+            if any(_names_sound_alike(needle, name) for name in names)
+        ]
+        if len(primary_matched) == 1:
+            return primary_matched
+        if len(primary_matched) > 1:
+            return []
         matched = [
             u for u, names in names_by_username.items()
             if any(_names_sound_alike(needle, name) for name in names)
@@ -932,6 +1197,7 @@ def _derive_agent(
     data: Mapping[str, Any],
     participants: list[dict[str, Any]],
     dietary_instructions: list[dict[str, Any]],
+    language: str | None = None,
 ) -> dict[str, Any] | None:
     """Builds trip.config.json's `agent` block from the assistant questions.
 
@@ -958,11 +1224,36 @@ def _derive_agent(
         agent["gender"] = gender if gender in _AGENT_GENDERS else "neutral"
         tone = _text_value(data["bot_tone"]) if isinstance(data.get("bot_tone"), Mapping) else ""
         agent["tone"] = tone if tone in _AGENT_TONES else "warm"
-        agent["default_language"] = "en"
+        # The language the interview was actually held in — the same value
+        # meta.defaultLang gets, through the same resolver, so the two halves
+        # of one file cannot disagree.
+        #
+        # This was hardcoded to "en" until 2026-09-20, when a Hebrew interview
+        # produced a config whose meta said `he` and whose companion said `en`.
+        # Nothing failed; the assistant simply answered a Hebrew family in
+        # English, which reads as the product being wrong rather than
+        # misconfigured.
+        agent["default_language"] = _resolve_language(language)
 
-    tz = _text_value(data["timezone"]).strip() if isinstance(data.get("timezone"), Mapping) else ""
+    typed_tz = _text_value(data["timezone"]).strip() if isinstance(data.get("timezone"), Mapping) else ""
+    destination = _text_value(data["destination"]) if isinstance(data.get("destination"), Mapping) else ""
+    # A DERIVED zone must not be the thing that brings an agent block into
+    # existence: an intake that answered none of the assistant questions still
+    # has to produce exactly the config it did before those questions existed
+    # (see this function's contract, and the two tests that assert it). A zone
+    # the organizer TYPED is an answer, so it may.
+    tz = _resolve_timezone(typed_tz, destination) if (typed_tz or agent) else ""
     if tz:
         agent["timezone"] = tz
+    elif typed_tz:
+        # Dropped rather than carried: see _resolve_timezone. Logged because a
+        # destination nobody has mapped yet is the only way to get here, and
+        # that is worth knowing rather than discovering from a briefing that
+        # never arrives.
+        logger.warning(
+            "transformer.timezone_unresolved",
+            extra={"typed": typed_tz, "destination": destination},
+        )
 
     proactive = {
         key: _PROACTIVE_VALUES[key]
@@ -973,6 +1264,20 @@ def _derive_agent(
         agent["proactive"] = proactive
 
     instructions = list(dietary_instructions)
+    # A custom trip type is more than branding. The companion needs the
+    # organizer's actual framing — e.g. an extended-family reunion behaves
+    # differently from the preset "Family" trip — when it makes suggestions.
+    # It is kept verbatim in both language slots: it was reviewed by the
+    # interviewer before storage, but translating a personal description would
+    # still put words in the organizer's mouth.
+    trip_type = data.get("trip_type")
+    if isinstance(trip_type, Mapping) and trip_type.get("kind") == "choice_other":
+        custom_type = str(trip_type.get("other_text") or "").strip()
+        if custom_type:
+            instructions.append(_instruction({
+                "en": f"The organizer describes this trip as: {custom_type}",
+                "he": f"המארגן מתאר את הטיול כך: {custom_type}",
+            }))
     pace = _text_value(data["trip_pace"]) if isinstance(data.get("trip_pace"), Mapping) else ""
     if pace in _PACE_TEXT:
         instructions.append(_instruction(_PACE_TEXT[pace]))
@@ -1195,12 +1500,208 @@ def _normalise_venues(raw_venues: Any) -> list[dict[str, Any]]:
     return out
 
 
-def _derive_phases(phases: list[Any]) -> list[dict[str, Any]]:
+def _open_day_phases(
+    phases: list[dict[str, Any]], departure: str, ret: str,
+) -> list[dict[str, Any]]:
+    """Phases for the days of the trip that no phase covers.
+
+    A DAY OF THE TRIP THAT IS ON NO PHASE MUST NOT BE INVISIBLE. On 2026-09-20
+    an organizer said, in as many words, that ten of their sixteen days were
+    undecided and asked for a proposal. The site showed the six that were
+    decided and nothing at all for the rest — no gap, no note, no sign that
+    nine days existed. The trip simply appeared to be six days long, beside a
+    return flight departing a city no phase mentioned.
+
+    Absent and undecided are different things, and only one of them is true.
+    These phases say the second out loud: the days are real, they belong to the
+    trip, and nothing is planned on them yet.
+
+    `unplanned: true` marks them as the site's own inference rather than
+    something the organizer said, so a later pass — the companion, or the
+    editing surface this is the placeholder for — can replace or shrink one
+    without guessing which phases were authored.
+
+    Contiguous gaps become one phase each: three separate open days in a row
+    are one open stretch, not three tabs.
+    """
+    # A trip with NO phases at all is a different state, not a gap: nobody has
+    # said anything about stops yet, and the site already says so its own way
+    # ("nothing was named, so nothing is served — the companion offers a
+    # draft"). Filling it with one open stretch spanning the whole trip would
+    # be this function answering a question it was not asked.
+    if not phases or not departure or not ret:
+        return []
+    try:
+        first, last = date.fromisoformat(departure[:10]), date.fromisoformat(ret[:10])
+    except ValueError:
+        return []
+    if last < first:
+        return []
+
+    covered: set[date] = set()
+    for phase in phases:
+        dates = phase.get("dates") or {}
+        try:
+            start = date.fromisoformat(str(dates.get("start") or "")[:10])
+            end = date.fromisoformat(str(dates.get("end") or "")[:10])
+        except ValueError:
+            continue
+        day = start
+        while day <= end:
+            covered.add(day)
+            day += timedelta(days=1)
+
+    gaps: list[list[date]] = []
+    day = first
+    while day <= last:
+        if day not in covered:
+            if gaps and gaps[-1][-1] == day - timedelta(days=1):
+                gaps[-1].append(day)
+            else:
+                gaps.append([day])
+        day += timedelta(days=1)
+
+    out: list[dict[str, Any]] = []
+    for index, gap in enumerate(gaps, start=1):
+        suffix = "" if len(gaps) == 1 else f"-{index}"
+        out.append({
+            "id": f"open-days{suffix}",
+            "unplanned": True,
+            "title": {"he": "ימים שעוד לא תוכננו", "en": "Days not planned yet"},
+            "tabLabel": "?",
+            "dates": {"start": gap[0].isoformat(), "end": gap[-1].isoformat()},
+            "note": {
+                "he": f"{len(gap)} ימים בטיול שעוד לא שויכו לתחנה. אפשר לדבר עם "
+                      f"העוזר כדי לשבץ אותם לתחנה קיימת או לפתוח תחנה חדשה.",
+                "en": f"{len(gap)} day(s) of this trip do not belong to a stop yet. "
+                      f"Talk to your assistant to add them to one, or open a new stop.",
+            },
+        })
+    return out
+
+
+# Whether a phase's season is knowable at all -- and in which hemisphere -- is
+# `packing_climate.decide()`'s question, not this module's (issue #167). Until
+# 2026-09-25 it was answered here by a southern-country list with everything
+# else defaulting north: Thailand in January got "Warm jacket, Gloves", a trip
+# to "Sydney" was read as northern, "Chile, Spain" and "Spain, Chile" landed in
+# opposite hemispheres, and one hemisphere served every phase of a trip. The
+# owner's rule replaced the default: if not sure, say nothing.
+
+
+def _season_bucket(month: int, hemisphere: str) -> str:
+    """A coarse meteorological-season bucket for one calendar month in one
+    hemisphere -- "cold"/"hot"/"rainy"/"moderate". It lives in
+    `packing_climate.season_bucket`, because the gate that decides whether a
+    bucket is reasonable for a place has to test the SAME months against it;
+    this name stays for the callers and tests that use it.
+
+    Winter -> cold and summer -> hot swap between hemispheres, as real
+    seasons do. Spring keeps "rainy" and autumn keeps "moderate" in BOTH
+    hemispheres -- there is no equally-ordinary idiom for "rainy autumn" to
+    swap to instead, and inventing one would be exactly the destination-
+    specific guessing this bucket is deliberately not doing.
+    """
+    return packing_climate.season_bucket(month, hemisphere)
+
+
+def _phase_months(start: date | None, end: date | None) -> list[int]:
+    """Every calendar month a phase touches, start to end, at most twelve.
+    Each list covers three months and a phase can straddle two lists, so the
+    gate has to see all of them, not the start month alone."""
+    if start is None:
+        return []
+    if end is None or end < start:
+        end = start
+    months: list[int] = []
+    year, month = start.year, start.month
+    while (year, month) <= (end.year, end.month) and len(months) < 12:
+        months.append(month)
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+    return months
+
+
+# [{he,en} category, {he,en} item] pairs, the exact tuple shape
+# readiness.tsx's packing renderer expects for `config.packing_general` and
+# every `phase.packing` alike. "moderate" deliberately stays short -- nothing
+# specific to add on top of the trip-level general list readiness.tsx already
+# falls back to on its own (documents/passport/insurance/charger/meds).
+_PACKING_ITEMS_BY_SEASON: dict[str, list[tuple[dict[str, str], dict[str, str]]]] = {
+    "hot": [
+        ({"he": "בריאות", "en": "Health"}, {"he": "קרם הגנה", "en": "Sunscreen"}),
+        ({"he": "ביגוד", "en": "Clothing"}, {"he": "בגדים קלים ונושמים", "en": "Light, breathable clothing"}),
+        ({"he": "אביזרים", "en": "Accessories"}, {"he": "משקפי שמש וכובע", "en": "Sunglasses and a hat"}),
+    ],
+    "cold": [
+        ({"he": "ביגוד", "en": "Clothing"}, {"he": "מעיל חם", "en": "Warm jacket"}),
+        ({"he": "ביגוד", "en": "Clothing"}, {"he": "שכבות לבוש", "en": "Layers"}),
+        ({"he": "אביזרים", "en": "Accessories"}, {"he": "כפפות", "en": "Gloves"}),
+    ],
+    "rainy": [
+        ({"he": "אביזרים", "en": "Accessories"}, {"he": "מטריה או מעיל גשם", "en": "Umbrella or rain jacket"}),
+        ({"he": "ביגוד", "en": "Clothing"}, {"he": "נעליים אטומות למים", "en": "Waterproof footwear"}),
+    ],
+    "moderate": [
+        ({"he": "ביגוד", "en": "Clothing"}, {"he": "שכבה קלה נוספת", "en": "A light layer"}),
+    ],
+}
+
+
+def _phase_packing_decision(
+    destination: str, start: date | None, end: date | None, phase_names: Sequence[str] = (),
+    fallback_names: Sequence[str] = (),
+) -> tuple[list[list[dict[str, str]]], str | None]:
+    """A phase's climate-appropriate packing additions AND, when there are
+    none, why: `(items, None)` or `([], reason)`, the reason drawn from
+    `packing_climate.REASONS`. The reason is for logs and tests only; it is
+    never written into the trip config.
+
+    The additions layer on top of the trip-level general list (readiness.tsx's
+    `config.packing_general`, which has its own frontend fallback and is out
+    of this function's scope). Deterministic only: a small fixed item table
+    keyed on a coarse season bucket (hemisphere x month) -- never a live
+    weather call, never a model call, never a network call.
+
+    Emitted ONLY when `packing_climate.decide()` is sure of the place and its
+    season in EVERY month the phase covers (issue #167): a phase that
+    straddles two season buckets, or has one month the bucket is wrong for,
+    abstains. `phase_names` are the phase's FULL names and `fallback_names`
+    the shortened forms, read only when no full name places anything -- so
+    "Perth, Scotland" decides before the "Perth" it shortens to can. A Tokyo
+    phase in a trip to "Japan" gets a list; a phase that names no known city
+    never does, whatever the destination. Everything else abstains, and an absent
+    `phase.packing` is what both sites already degrade to: readiness.tsx and
+    classic app.js render a phase's packing only when it has items.
+    """
+    decision = packing_climate.decide(
+        destination, phase_names, _phase_months(start, end), fallback_names=fallback_names,
+    )
+    if decision.reason is not None or decision.hemisphere is None or start is None:
+        return [], decision.reason or packing_climate.UNRESOLVED
+    bucket = _season_bucket(start.month, decision.hemisphere)
+    items = _PACKING_ITEMS_BY_SEASON.get(bucket) or []
+    return [[dict(category), dict(item)] for category, item in items], None
+
+
+def _derive_phase_packing(
+    destination: str, start: date | None, end: date | None, phase_names: Sequence[str] = (),
+    fallback_names: Sequence[str] = (),
+) -> list[list[dict[str, str]]]:
+    """The items half of `_phase_packing_decision` -- `[]` means abstain."""
+    return _phase_packing_decision(destination, start, end, phase_names, fallback_names)[0]
+
+
+def _derive_phases(phases: list[Any], destination: str = "") -> list[dict[str, Any]]:
     """Turns the phases[] intake answer into trip.config.json's phases[]
     shape — logistics fields, plus a day-by-day `days[]` when the intake
     carries one (extracted from an uploaded plan document at interview time).
     Hero images and map coordinates still need external lookups this
     transformer deliberately doesn't perform (see module docstring).
+
+    `destination` is the trip's raw (pre-"Unknown Destination"-fallback)
+    typed answer, threaded through only so each phase's `packing` additions
+    (see _phase_packing_decision) can place the phase; nothing else here reads
+    it. Passing "" is the "no destination" case that suppresses packing.
 
     Consecutive stops that shorten to the same location (a group split like
     "Dallas (boys...)" immediately followed by "Dallas (all travelers)") are
@@ -1281,6 +1782,23 @@ def _derive_phases(phases: list[Any]) -> list[dict[str, Any]]:
         venues = _normalise_venues(entry["venues"])
         if venues:
             phase["venues"] = venues
+
+        packing, abstained = _phase_packing_decision(
+            destination, entry["start"], entry["end"],
+            # Full names decide: shortening cuts at the comma, and "Perth,
+            # Scotland" shortened is a city on the other side of the world.
+            phase_names=(entry["full_en"], entry["full_he"]),
+            fallback_names=(entry["short_en"], entry["short_he"]),
+        )
+        if packing:
+            phase["packing"] = packing
+        else:
+            # The only trace of an abstention: the site simply shows no
+            # per-phase list, which is also what a bug would look like.
+            logger.info(
+                "transformer.packing_abstained",
+                extra={"phase": phase_id, "reason": abstained},
+            )
 
         acc_for_note = phase.get("accommodation") or {}
         hotel_he = str(acc_for_note.get("name") or "")
@@ -1434,13 +1952,18 @@ def transform_intake(
         raise ValueError(f"intake is missing required questions: {sorted(missing)}")
 
     today = today or date.today()
-    destination = _text_value(data["destination"]).strip() or "Unknown Destination"
+    destination_raw = _text_value(data["destination"]).strip()
+    destination = destination_raw or "Unknown Destination"
     trip_type_label = _resolve_trip_type(data["trip_type"])
     group_size_label = _resolve_group_size(data)
 
     departure_date, return_date, total_days = _resolve_dates(data, today)
 
-    brand, title = _derive_brand_and_title(destination, trip_type_label, departure_date.year)
+    brand, title = _derive_brand_and_title(
+        destination, trip_type_label, departure_date.year,
+        [str(ph.get("name") or ph.get("name_en") or "") for ph in _structured_list(data, "phases")
+         if isinstance(ph, Mapping)],
+    )
     departure_iso = datetime(
         departure_date.year, departure_date.month, departure_date.day,
         0, 0, 0, tzinfo=timezone.utc,
@@ -1468,9 +1991,14 @@ def transform_intake(
     # Mutates participants in place to attach needs[], and hands back whatever
     # applies to the whole group for the agent block to carry instead.
     dietary_instructions = _apply_dietary(data, participants)
-    agent = _derive_agent(data, participants, dietary_instructions)
+    agent = _derive_agent(data, participants, dietary_instructions, language)
+    # The SAME resolved value _derive_agent already decided (see its own
+    # "must not create a block that wouldn't otherwise exist" contract) —
+    # read back off the dict it wrote, not re-resolved here, so meta.timezone
+    # and agent.timezone can never disagree about what was typed or derived.
+    resolved_timezone = (agent or {}).get("timezone", "")
 
-    phases = _derive_phases(_structured_list(data, "phases"))
+    phases = _derive_phases(_structured_list(data, "phases"), destination_raw)
 
     # A day-by-day from the dated anchors, for every phase that does not
     # already have one. Extracted days WIN: `extract_itinerary`'s pass over an
@@ -1485,11 +2013,53 @@ def transform_intake(
         if derived and not phase.get("days"):
             phase["days"] = derived
 
+    # The votable half of the same anchors, from the same reading of them: the
+    # unconfirmed attractions, which are the ones still open to a "shall we?".
+    # Same insertion point and same reason as the days above — it needs the real
+    # phases with their ids and date ranges, which `_derive_phases` has just
+    # settled. Absent rather than empty when a phase has none: an empty
+    # `rsvp_activities` is a heading over no cards, not a statement.
+    anchor_rsvps = derive_rsvp_activities({"phases": phases}, data)
+    for phase in phases:
+        derived = anchor_rsvps.get(str(phase.get("id")))
+        if derived and not phase.get("rsvp_activities"):
+            phase["rsvp_activities"] = derived
+
+    # AFTER the real phases are settled, and in trip order. A day of the trip
+    # that belongs to no phase is shown as an open stretch rather than not
+    # shown at all — see _open_day_phases for the run that made this necessary.
+    #
+    # ONLY AGAINST DATES THE ORGANIZER GAVE. `_resolve_dates` falls back to
+    # `today + 90 days` when they did not, and a gap measured against an
+    # invented range invents the days in it: a test fixture with no dates and
+    # phases in September produced a fortnight of "unplanned" days three months
+    # away. A day is missing only if the trip is known to contain it.
+    stated_departure = _parse_iso_date(_text_value(data.get("departure_date", {})))
+    stated_return = _parse_iso_date(_text_value(data.get("return_date", {})))
+    if stated_departure and stated_return:
+        phases = sorted(
+            phases + _open_day_phases(
+                phases, stated_departure.isoformat(), stated_return.isoformat(),
+            ),
+            key=lambda ph: str((ph.get("dates") or {}).get("start") or ""),
+        )
+
     # Only a count, never the organizer's free text — same reasoning as above.
+    #
+    # CONFIRMED means confirmed. This counted every travel_anchor until
+    # 2026-09-20, when a trip with nothing booked told its family on the front
+    # page that four bookings were confirmed — while the map stops rendered
+    # from the same anchors correctly showed `conf: "–"` beside it.
+    #
+    # An anchor is a fixed point in the trip, not evidence of a booking; the
+    # schema's own rule is that a confirmation is what makes it one. With none,
+    # the stat is dropped rather than shown as zero: "0 bookings confirmed" is
+    # a true sentence nobody needs on a hero strip.
     travel_anchors = _structured_list(data, "travel_anchors")
-    if travel_anchors:
+    confirmed = [a for a in travel_anchors if _has_confirmation(a)]
+    if confirmed:
         stats.append({
-            "number": str(len(travel_anchors)),
+            "number": str(len(confirmed)),
             "description": {"en": "booking(s) already confirmed", "he": "הזמנות מאושרות"},
         })
 
@@ -1509,6 +2079,20 @@ def transform_intake(
             "departure": departure_iso,
             "returnDate": return_date.strftime("%Y-%m-%d"),
             "totalDays": total_days,
+            # An opaque per-render token, never derived from anything
+            # guessable (never dates, never the trip id) — PR review before
+            # the sprint-6 -> main merge, 2026-10-06 [N1]: the verification
+            # gate's /api/config/deployment-identity route used to serve
+            # `departure`/`returnDate` directly, unauthenticated, so anyone
+            # who knew a trip's hostname learned exactly when that family is
+            # away. A hash of the dates wouldn't have fixed it either —
+            # there are only a few thousand plausible departure/return
+            # pairs, trivially brute-forced with no secret salt. This value
+            # carries no information about the trip at all; the worker
+            # compares it against the one it just generated for THIS
+            # render, in memory, the same way it already compares
+            # `departure`/`returnDate` via `config["meta"]`.
+            "deploymentNonce": secrets.token_hex(16),
             # Not derived from the intake — there's no "organizer's home
             # currency" question yet. Every real trip on this platform so far
             # is an Israeli family traveling elsewhere, so ILS is the
@@ -1534,6 +2118,19 @@ def transform_intake(
     # as different statements about the trip.
     if agent:
         config["agent"] = agent
+
+    # Closes the gap this file used to document at its own top: a resolved
+    # zone reached agent.timezone (the companion's cron scheduling) but never
+    # the site-facing field living-journey.js's tripTimeZone() actually reads,
+    # so a newly provisioned trip's website silently ran on UTC regardless of
+    # what was typed or derivable. `config["meta"]` always exists (unlike
+    # `agent`), so the same rule from _derive_agent applies here to the KEY,
+    # not the block: a derived-only zone must not appear unless the same
+    # conditions that let it appear on agent.timezone were already met — which
+    # `resolved_timezone` being non-empty already proves, since it is read
+    # from that same dict.
+    if resolved_timezone:
+        config["meta"]["timezone"] = resolved_timezone
 
     currency = _lookup_known_currency(destination)
     if currency:
@@ -1682,8 +2279,66 @@ def _phase_id_for_date(phases: list[dict[str, Any]], when: date) -> str | None:
     return None
 
 
+def _stable_id(prefix: str, *parts: Any) -> str:
+    """A short, deterministic id for a derived row, hashed from what the row IS.
+
+    Both callers key something that lives OUTSIDE trip.config.json by the string
+    this returns — the site's `INSERT OR IGNORE ... seed_key` for a booking row,
+    the `rsvps` table for a vote — so re-provisioning the same intake has to
+    produce the same string again or the row is duplicated and the votes are
+    orphaned. Neither failure is loud.
+
+    One helper rather than the same three lines twice, so a change to the
+    scheme cannot be made in one caller and forgotten in the other. The joined
+    parts are the caller's business; the hashing is not.
+    """
+    identity = "|".join(str(part or "") for part in parts)
+    return f"{prefix}_{hashlib.sha1(identity.encode('utf-8')).hexdigest()[:10]}"
+
+
+def _first_phase_id(phases: list[Any], default: str) -> str:
+    """The phase an anchor parks on when its own date maps to none of them.
+
+    Both anchor derivations need somewhere to put an undated item rather than
+    dropping it — `bookings.phase` is `TEXT NOT NULL`, and a vote card nobody
+    can see is a question nobody gets asked. `default` is what to say when the
+    trip has no phases at all: a literal the site will accept for bookings,
+    and "" for callers that would rather emit nothing.
+    """
+    return str(phases[0].get("id")) if phases and phases[0].get("id") else default
+
+
+# These two are the only pieces pulled out of the walk `derive_days_from_anchors`,
+# `derive_bookings` and `derive_rsvp_activities` otherwise each repeat in full:
+# read `travel_anchors`, run each entry through `_read_anchor`, map its date to
+# a phase, decide what to keep. Three call sites sharing a loop shape is not
+# yet unified into one traversal — deliberately, a carry-forward from #169's
+# review rather than an oversight. Revisit if a FOURTH consumer of
+# `travel_anchors` needs the same shape; three is a coincidence, four is a
+# pattern worth the indirection a shared walker would cost.
+
+
 _ANCHOR_TIME_RE = re.compile(r"\bat\s+([0-2]?\d:[0-5]\d)\b", re.IGNORECASE)
 _CLOCK_RE = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
+
+
+def _anchor_label_text(text: Any) -> str:
+    """An anchor's free text as it should be SHOWN: the date and the time taken
+    out, because both are carried structurally beside it — printing "at 10:00"
+    next to a 10:00 slot is the same fact twice.
+
+    Split out of `_read_anchor` so the vote card's title and the detail it is
+    compared against are produced by one function, rather than by two that can
+    disagree about whether they are the same text.
+    """
+    stripped = _ANCHOR_TIME_RE.sub("", _ANCHOR_DATE_RE.sub("", str(text or "")))
+    return stripped.strip(" —-—,;:").strip()
+
+
+def _squash(text: Any) -> str:
+    """Text reduced to what it SAYS — case folded, runs of whitespace collapsed.
+    For asking whether two strings are the same sentence; never for display."""
+    return " ".join(str(text or "").casefold().split())
 
 
 def _read_anchor(raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -1716,8 +2371,7 @@ def _read_anchor(raw: Mapping[str, Any]) -> dict[str, Any]:
     clock = stated_time if _CLOCK_RE.match(stated_time) else (time_match.group(1) if time_match else None)
     # The date and time are represented structurally, so strip them from the
     # label rather than printing "at 10:00" beside a 10:00 slot.
-    label = _ANCHOR_TIME_RE.sub("", _ANCHOR_DATE_RE.sub("", name or detail))
-    label = label.strip(" \u2014-—,;:").strip()
+    label = _anchor_label_text(name or detail)
     return {"type": anchor_type, "detail": detail, "name": name, "when": when,
             "time": clock, "label": label}
 
@@ -1790,6 +2444,142 @@ def derive_days_from_anchors(
     return out
 
 
+#: The canonical anchor type that names something you DO, rather than where you
+#: sleep, how you get there, or what a quote costs. Read through
+#: _ANCHOR_TYPE_MAP rather than against a second list of words, so every member
+#: that map gains ("event", "shuttle" and "parking" arrived in #109) arrives
+#: here the same day — a taxonomy short a member is the shape of #115.
+_VOTABLE_ANCHOR_TYPE = "attraction"
+
+
+def derive_rsvp_activities(
+    config: Mapping[str, Any], data: Mapping[str, Any]
+) -> dict[str, list[dict[str, Any]]]:
+    """The family's "shall we actually do this?" list, per phase, from the
+    anchors. No model.
+
+    `phases[].rsvp_activities[]` had no producer at all. The site has rendered
+    vote cards since the hand-authored era (`site/app.js` renderRsvpCard;
+    trip-web's `GroupActivities`), `server/server.js` has stored the answers in
+    `rsvps`, and the config schema has carried the field — and this transformer
+    never wrote it, so the whole RSVP surface was invisible on every provisioned
+    trip. The live-trip report put it as "RSVP/trivia features: unused".
+
+    WHICH ANCHORS. Attraction-typed ones carrying NO confirmation. That is this
+    file's own existing line rather than a new one: an anchor is a fixed point
+    in the trip, not evidence of a booking, and the schema's rule is that a
+    confirmation is what makes it one (see the confirmed-count stat in
+    `transform_intake`, and `_has_confirmation`, which already reads a
+    placeholder as absent). A CONFIRMED attraction is already happening —
+    tickets bought, seats held — so asking the family to vote on it is asking a
+    question whose answer changes nothing; it belongs on the Bookings tab only.
+    An UNCONFIRMED one is exactly where "does everyone want this?" is real.
+
+    DELIBERATELY NOT EXCLUSIVE with `derive_bookings`. The same unconfirmed
+    anchor stays a Bookings row AND becomes a vote. Two views of one fact, not
+    duplication to be removed: Bookings is the organizer's tracking view ("what
+    is still pending"), RSVP is the family-facing interactive one ("does
+    everyone want it"). Changing either to hide the other loses a real surface.
+
+    THE ID IS THE VOTE'S PRIMARY KEY. `rsvps` is keyed by the activity id string
+    alone (`/api/rsvps/:activityId`) and knows nothing about trip.config.json,
+    so an id that moves on re-provision does not fail loudly — it orphans every
+    vote already cast and the card comes back empty with nobody told. So it is a
+    hash of what the anchor IS, through the same `_stable_id` `derive_bookings`
+    keys its rows with — over the name, the stated date and the free text
+    TOGETHER, because a structured anchor states all three and keying on any one
+    of them lets two different activities collide on one vote record.
+
+    Two fields are deliberately left out of that identity, for the same reason
+    in both cases: they cannot tell two of these anchors apart, and they CAN
+    change under one. The confirmation, because everything here is unconfirmed
+    by construction and so it holds only "" or a placeholder — an organizer
+    tidying an empty field into "TBD" must not move a live vote. And the type
+    word, because the filter above has already fixed the canonical type at
+    "attraction", so all the raw word could contribute is the synonym drift
+    between two extraction runs of one document ("activity" this time,
+    "attraction" the next).
+
+    `item_uid` is left unset: there is no itinerary item an anchor is a link to
+    (the field exists for a day-plan item marked votable), and the schema's own
+    legacy case omits it. `activity-rsvp.ts` then matches by phase, date and
+    exact title — which lines up, because the title here is the same `_read_anchor`
+    label `derive_days_from_anchors` puts on the day.
+
+    Returns {phase_id: activities[]}, date order with the undated last.
+    """
+    phases = list(config.get("phases") or [])
+    fallback_phase = _first_phase_id(phases, "")
+    by_phase: dict[str, list[dict[str, Any]]] = {}
+    seen: set[str] = set()
+
+    for raw in _structured_list(data, "travel_anchors"):
+        if not isinstance(raw, dict):
+            continue
+        anchor = _read_anchor(raw)
+        if _ANCHOR_TYPE_MAP.get(anchor["type"]) != _VOTABLE_ANCHOR_TYPE:
+            continue
+        if _has_confirmation(raw):
+            continue
+        title = _bilingual_text(anchor["label"])
+        if not title:
+            continue  # nothing to put on the card; a bare type is not a question
+        when = anchor["when"]
+        # Undated, or dated outside every phase: parked on the first phase,
+        # exactly where `derive_bookings` already parks the same anchor's row.
+        # Dropping it instead would hide the MOST vote-worthy case — an
+        # attraction nobody has booked or even scheduled — from the surface
+        # built to ask about it, and the family already sees it on phase 1.
+        phase_id = (_phase_id_for_date(phases, when) if when else None) or fallback_phase
+        if not phase_id:
+            continue
+        # EVERY field the anchor states, not the first one that is non-empty.
+        # A structured anchor can carry name, date AND detail at once (the
+        # document-extraction path writes all three), so keying on `detail`
+        # alone would give two different activities that happen to share a notes
+        # line one id — and the dedupe below would then silently drop the second
+        # one's card.
+        #
+        # The date is `_read_anchor`'s PARSED one, not the raw field: it is the
+        # same date whether the organizer's document said "20 Sep 2026" or
+        # "2026-09-20", and it is still there when the anchor states it as
+        # `date_from` or `start` — both shapes this file already reads, and
+        # both of which a raw `date` lookup would read as blank, colliding one
+        # activity's two dates onto one vote.
+        #
+        # Two fields are deliberately absent, for one reason twice: neither can
+        # tell two of THESE anchors apart, and both can change under one. The
+        # canonical type, because the filter above has already fixed it at
+        # "attraction", so all the raw word could add is the synonym drift
+        # between two extraction runs ("activity" this time, "attraction" the
+        # next). The confirmation, because everything here is unconfirmed.
+        activity_id = _stable_id(
+            "rsvp", anchor["name"], when.isoformat() if when else "", anchor["detail"],
+        )
+        if activity_id in seen:
+            continue  # one activity, one vote record — never two cards sharing one
+        seen.add(activity_id)
+        activity: dict[str, Any] = {"id": activity_id, "title": title}
+        # Only when it says something the title does not. A free-text anchor's
+        # label IS its detail, and a document pass that copies the venue name
+        # into a notes field produces the same text twice — either way a desc
+        # would print the heading again directly under the heading. Compared
+        # after the same date/time stripping the title had, so "Sky Lagoon" and
+        # "Sky Lagoon — 5 Mar 2027" are recognised as the one sentence they are.
+        desc = _bilingual_text(_anchor_label_text(anchor["detail"]))
+        if desc and _squash(desc["en"]) == _squash(title["en"]):
+            desc = None
+        if desc:
+            activity["desc"] = desc
+        if when:
+            activity["date"] = when.isoformat()
+        by_phase.setdefault(phase_id, []).append(activity)
+
+    for activities in by_phase.values():
+        activities.sort(key=lambda a: ("date" not in a, a.get("date") or ""))
+    return by_phase
+
+
 def _same_place(a: str, b: str) -> bool:
     """Whether two booking names name the same place: "Hotel Artemide" and
     "Hotel Artemide, Rome" do; "OMO3 Asakusa" and "Park Hyatt Tokyo" do not."""
@@ -1799,7 +2589,11 @@ def _same_place(a: str, b: str) -> bool:
     return bool(x and y) and (x in y or y in x)
 
 
-def derive_bookings(config: Mapping[str, Any], data: Mapping[str, Any]) -> list[dict[str, Any]]:
+def derive_bookings(
+    config: Mapping[str, Any],
+    data: Mapping[str, Any],
+    documents: Any = None,
+) -> list[dict[str, Any]]:
     """Build bookings.json rows from an already-transformed config plus the raw
     intake answers.
 
@@ -1814,13 +2608,17 @@ def derive_bookings(config: Mapping[str, Any], data: Mapping[str, Any]) -> list[
     Every row carries a deterministic `seed_key` so re-provisioning the same
     intake is idempotent against the site's `INSERT OR IGNORE ... seed_key`.
 
+    `documents` (a `document_handoff.DocumentLinks`) adds `conf_file` — the
+    published source document — to a row whose provenance names one. Without it
+    no row carries the key at all, exactly as before.
+
     `bookings.phase` is `TEXT NOT NULL` on the site, so an anchor that maps to
     no phase (undated, or a whole-trip proposal) is parked on the first phase
     rather than dropped — it still shows on the Bookings tab, which is the
     point.
     """
     phases = list(config.get("phases") or [])
-    fallback_phase = str(phases[0].get("id")) if phases and phases[0].get("id") else "trip"
+    fallback_phase = _first_phase_id(phases, "trip")
     bookings: list[dict[str, Any]] = []
     hotel_row: dict[str, dict[str, Any]] = {}
 
@@ -1850,8 +2648,11 @@ def derive_bookings(config: Mapping[str, Any], data: Mapping[str, Any]) -> list[
             "seed_key": f"hotel_{phase.get('id')}",
         })
         hotel_row[str(phase.get("id"))] = bookings[-1]
+        stay_file = documents.for_phase(str(phase.get("id"))) if documents is not None else None
+        if stay_file:
+            bookings[-1]["conf_file"] = stay_file
 
-    for raw in _structured_list(data, "travel_anchors"):
+    for index, raw in enumerate(_structured_list(data, "travel_anchors")):
         if not isinstance(raw, dict):
             continue
         anchor = _read_anchor(raw)
@@ -1868,15 +2669,19 @@ def derive_bookings(config: Mapping[str, Any], data: Mapping[str, Any]) -> list[
         # number; a different hotel in the same phase is a split stay and keeps
         # its own.
         own = hotel_row.get(phase_id or "")
+        anchor_file = documents.for_anchor(index) if documents is not None else None
         if own and _ANCHOR_TYPE_MAP.get(anchor_type) == "hotel" and _same_place(own["name"], name):
             own["confirmation"] = own["confirmation"] or raw.get("confirmation")
+            # The voucher behind the anchor is the voucher behind the stay.
+            if anchor_file and not own.get("conf_file"):
+                own["conf_file"] = anchor_file
             continue
         # A free-text anchor keeps the key it has always had, so re-provisioning
         # an existing trip stays idempotent. A structured one has no `detail`;
         # hashing the type alone gave every "activity" the SAME key, and the
         # site's INSERT OR IGNORE kept one of them.
-        identity = detail or "|".join(
-            str(part) for part in (anchor_type, anchor["name"], raw.get("date") or "", raw.get("confirmation") or "")
+        identity = (detail,) if detail else (
+            anchor_type, anchor["name"], raw.get("date") or "", raw.get("confirmation") or "",
         )
         bookings.append({
             "phase": phase_id or fallback_phase,
@@ -1891,7 +2696,9 @@ def derive_bookings(config: Mapping[str, Any], data: Mapping[str, Any]) -> list[
             # If the anchor names a venue the itinerary already links, reuse
             # that link rather than leaving the row with a bare 📍.
             "location_url": _config_venue_link(f"{name} {detail}", phases),
-            "seed_key": "anchor_" + hashlib.sha1(identity.encode("utf-8")).hexdigest()[:10],
+            "seed_key": _stable_id("anchor", *identity),
         })
+        if anchor_file:
+            bookings[-1]["conf_file"] = anchor_file
 
     return bookings

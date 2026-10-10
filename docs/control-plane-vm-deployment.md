@@ -8,7 +8,7 @@ this page is the durable part.
 VM 110 `kinerary-cp` runs the whole Kinerary runtime under Docker Compose:
 PostgreSQL, migrations, API, provisioning worker, the relay (the router), the
 interview MCP sidecar, and Hermes. It is a stepping stone: when the k3s track
-(`k3s-home-deployment-sprint-plan.md` D1) builds `kinerary-prod`, workloads
+(`future/k3s-home-deployment-sprint-plan.md` D1) builds `kinerary-prod`, workloads
 move there and this VM is destroyed.
 
 ## Why the Mac is no longer needed
@@ -44,6 +44,47 @@ Only SSH is reachable from the LAN. Everything Kinerary listens on loopback:
 
 The relay, sidecar and Hermes use **host networking** so they share the VM's
 loopback; postgres/api/worker stay on compose networks.
+
+### This VM does not inherit the trips' NFS mount, and never will
+
+A trip's site is an **LXC container**. Proxmox mounts the TrueNAS export once on
+the **host** (`/mnt/pve/truenas-nfs/…`), and every trip container receives it as
+an `mp0` mountpoint — see `provisioning/adapters.py:97-99`. A trip therefore has
+document storage without doing anything, which is why trip sites can serve
+documents today.
+
+`kinerary-cp` is a **full VM**. A VM has its own kernel and its own mount table,
+so it inherits nothing from the Proxmox host's. It needs its **own NFS client
+mount of the same export**.
+
+That is a difference in the class of guest, not a misconfiguration somebody once
+made. Every future control-plane VM will need this, and a rebuilt one will need
+it again. So it is automated rather than written down as steps:
+
+```bash
+DOCUMENT_STORE_NFS_SOURCE=<host>:/<export> \
+DOCUMENT_STORE_MOUNT=/srv/kinerary-nfs \
+DOCUMENT_STORE_ENV_FILE=/opt/kinerary-deploy/vm.env \
+sudo -E scripts/bootstrap-document-store.sh            # --check first; it changes nothing
+```
+
+The script installs the NFS client, writes one `/etc/fstab` line so the mount
+survives a reboot, mounts it, creates the `.kinerary-document-store` marker on
+the real volume, and then verifies the host against **the same contract the
+product enforces at runtime** — `check_document_store()` in
+`control_plane_worker/document_handoff.py` and `checkDocumentStore` in
+`document-store.ts`: configured → exists → is a directory → carries the marker →
+writable → on a mount of its own. It is idempotent, and it refuses rather than
+guessing any address.
+
+**Why the marker matters.** Its only job is to be *absent* when the export is not
+mounted. Without it a service starting against an empty local directory would
+quietly write a family's documents to a filesystem the next redeploy discards.
+`DOCUMENT_STORE_REQUIRED=1` turns that into a loud startup failure instead.
+
+As of 2026-09-19 this VM has none of it — no `nfs-common`, no fstab entry, no
+mount, and no `KINERARY_NFS_ROOT` in `vm.env`. Document intake cannot deploy here
+until the above has run.
 
 ## Layout
 
@@ -100,11 +141,13 @@ interview stalled. The relay and sidecar therefore get
 per interpret call at default effort, 15.2 s with it (Mac: 13.1 s), and the
 mapping matched the Mac's.
 
-The relay's credential is `CLAUDE_CODE_OAUTH_TOKEN`. `model-runner.ts`'s
-`hermeticEnv` strips a calling Claude Code session's `CLAUDE_CODE_*` variables
-from the nested CLI but keeps that one — on the Mac the CLI uses the keychain,
-here the token is its only credential, and losing it made every interpret call
-`FAILED`.
+The relay's credential is `CLAUDE_CODE_OAUTH_TOKEN`. The nested CLI gets an
+allow-listed environment (`claudeChildEnv` over `structuringChildEnv` in
+`model-runner.ts`; see "Environment of every model child" in
+`docs/document-intake-operations.md`), which carries that token and
+`CLAUDE_CONFIG_DIR` but none of a calling Claude Code session's other
+`CLAUDE_CODE_*` variables — on the Mac the CLI uses the keychain, here the token
+is its only credential, and losing it made every interpret call `FAILED`.
 
 ### Checks that actually answer the question
 
@@ -219,11 +262,40 @@ is kept **pristine**: everything we add to the fork lives as a patch in
 `control-plane/deployment/hermes-patches/`, and the build applies them.
 
 ```bash
-control-plane/deployment/build-hermes-image.sh            # build + verify, print the tag
-control-plane/deployment/build-hermes-image.sh --set-rev  # + write HERMES_REV into vm.env
-$C up -d --wait hermes                                    # the deploy — restarts every gateway
-control-plane/deployment/hermes-image-check.sh            # what is RUNNING carries these patches
+# 1. Build, from a tree of the revision that carries the patch set. Changes nothing that runs.
+git -C /opt/kinerary fetch
+git -C /opt/kinerary worktree add --detach /var/tmp/hermes-build-<rev> <rev>
+sudo /var/tmp/hermes-build-<rev>/control-plane/deployment/build-hermes-image.sh   # prints the tag; NO --set-rev
+# 2. Deploy through the release tool, which recreates Hermes last.
+sudo kinerary-cp-release upgrade <rev> --hermes-rev <tag> --dry-run   # <tag> is what follows "kinerary-cp/hermes:"
+sudo kinerary-cp-release upgrade <rev> --hermes-rev <tag>             # restarts every gateway
+# 3. What is RUNNING carries these patches
+control-plane/deployment/hermes-image-check.sh
 ```
+
+**The release tool never builds the image.** `upgrade --hermes-rev <tag>` refuses
+in Prepare when `kinerary-cp/hermes:<tag>` is absent (`vm-release.py:1488-1491`),
+recreates Hermes last, after the relay restart (`start_switched`,
+`vm-release.py:1239-1254`), and records `hermes_from` and `hermes_to` in its
+history (`vm-release.py:1523,1530`), which is how `rollback` flips the tag back
+(`vm-release.py:1590-1597`; it fails if the old image is gone, and Hermes images
+are never pruned). A person types this: the `trip-monitor` gate accepts only a
+hex `--hermes-rev` (`vm-release.py:554`), which a patch-set tag is not.
+
+**Do not use `build-hermes-image.sh --set-rev` on this VM.** It edits
+`HERMES_REV` in `vm.env` (`build-hermes-image.sh:141-143`) outside the tool's
+history. Run before an upgrade, the upgrade sees no Hermes change
+(`vm-release.py:1488`), leaves the container alone, and `verify` fails on the
+image tag (`vm-release.py:1317`). Run after a release, a later `rollback` of
+that release silently reverts Hermes, because it takes the target from the
+history row's `hermes_from` (`vm-release.py:1590`).
+
+**Build from a tree that has the newest patch, never from `/opt/kinerary`
+unless it does.** The script reads the patch set from the checkout it lives in
+(`build-hermes-image.sh:26-28`) and tags `<base>-p<hash of the set>` (line 111).
+Built from a tree lacking the newest patch, it re-tags the previous image and
+overwrites the rollback target. Remove the build tree afterwards
+(`git -C /opt/kinerary worktree remove /var/tmp/hermes-build-<rev>`).
 
 The script copies the snapshot, applies every patch in order onto the copy
 (refusing anything that does not apply cleanly — an already-patched tree means
@@ -289,11 +361,179 @@ takes a PDF from the family group to a booking a family member downloads.
 So a change we make to the fork survives only if it is written down here:
 every one lives as a patch in `control-plane/deployment/hermes-patches/`, with
 that directory's README carrying the build, test and rollout steps. Re-apply
-them after any refresh of the snapshot — `HERMES_REV` is then `<sha>-<name>`,
-and a bare sha means the patches are gone. Currently carried:
-`0001-tool-call-payload-key-aliases` (`ab0d98414-toolcall-alias2`), without
-which a deferred tool call whose payload the model spelled `parameters` is
-silently never invoked.
+them after any refresh of the snapshot — `HERMES_REV` is then
+`<sha>-p<hash of the patch set>`, and a bare sha means the patches are gone.
+Currently carried: `0001-tool-call-payload-key-aliases`, without which a
+deferred tool call whose payload the model spelled `parameters` is silently
+never invoked; `0002-relay-media-dir` (above); and `0003-postgresql-client`,
+the `psql` the fleet monitor's MCP shells out to. The image running on
+2026-09-28 was `ab0d98414-pbf43d580` (the 0001+0002 set, per the regression
+plan `docs/test-reports/regression-plan-2026-09-28-saturday-window-monitor-and-hermes-image.md`
+section 5); an image built with 0003 has another hash, so until it is deployed
+`hermes-image-check.sh` reports the running set as different from the
+checkout's (`hermes-image-check.sh:52-55`).
+
+### The fleet monitor — bootstrapped, not assembled
+
+```bash
+/opt/kinerary-deploy/bootstrap-monitor.sh            # build it; gateway stays stopped
+/opt/kinerary-deploy/bootstrap-monitor.sh --check    # what is missing, changes nothing
+/opt/kinerary-deploy/bootstrap-monitor.sh --start-gateway
+```
+
+Part of bringing this VM up, not a thing to remember: profile, skill, config,
+MCP servers and both schedules, idempotent, so rebuilding the VM is one command
+rather than a page of steps. Run it after the stack is up.
+
+**It is split across the two repositories on purpose.** The mechanism is
+`scripts/bootstrap-fleet-monitor.sh` in the product repo and names no host,
+container, uid or path — it refuses rather than defaulting to somebody's
+machine. `kinerary-deploy/bootstrap-monitor.sh` is the half that knows this VM,
+and it is private for the same reason `deploy.sh` and `bring-up.sh` are.
+
+It belongs here rather than on the Mac because it watches production, and on
+the Mac it watched production *through an SSH tunnel, while the laptop was
+awake* — so the fleet went unwatched exactly when nobody was looking.
+
+Three things it decides, each of which has an obvious wrong answer:
+
+- **It reads the database over host-networked loopback** —
+  `.local-secrets/control_plane_database_url_host`, the relay's own view, at
+  `127.0.0.1:5433`. The fleet MCP can also `docker exec` into postgres, and that
+  is the answer to refuse: Hermes gets no Docker socket (safety rule 6). The MCP
+  still opens every connection read-only through `PGOPTIONS`.
+- **It needs `psql` inside the Hermes container**, because the MCP shells out
+  to it and the image is not ours. Without it the MCP reads nothing and reports
+  nothing — which looks exactly like a healthy fleet. The image carries it since
+  patch `0003-postgresql-client` (PR #293), so it is no longer added by hand:
+  an image built without 0003 has none, and `hermes-image-check.sh` fails naming
+  that patch (`hermes-image-check.sh:36-66`). Never install it into the running
+  container, which loses it on the next recreate. The bootstrap's own proof is
+  step 7, the MCP reading the control plane (`bootstrap-fleet-monitor.sh:192-199`).
+- **It does not start the gateway.** The monitor has its own bot, and Telegram
+  gives each update to one `getUpdates` loop. Stop the Mac's
+  (`hermes -p trip-monitor gateway stop`) before `--start-gateway` here.
+
+Three things it does not do or does not know, found in the 2026-09-28
+regression plan (`docs/test-reports/regression-plan-2026-09-28-saturday-window-monitor-and-hermes-image.md`,
+section 2):
+
+- **The profile blocks the way back.** `rollback --restore-db` refuses when a
+  Hermes profile exists that was not in the dump's `profiles.txt`
+  (`vm-release.py:1615-1621`), and `vm-restore-snapshot.sh` refuses when a
+  profile directory was born after the snapshot (`vm-restore-snapshot.sh:171-177`).
+  A bootstrapped `trip-monitor` is such a profile. Bootstrap the monitor only
+  after an upgrade has soaked; to go back past it, `hermes profile delete
+  trip-monitor` first, then rescan the supervisor
+  (`/command/s6-svscanctl -an /run/service`, as in "Tearing a trip down"). Plain
+  keep-DB `rollback` is unaffected.
+- **The container runs in UTC** (the plan's reading, 2026-09-28; `compose.vm.yml`
+  sets no `TZ`). Set the profile's `timezone` (or `HERMES_TIMEZONE`), or the
+  digest's `0 9 * * *` (`bootstrap-fleet-monitor.sh:177`) fires at 09:00 UTC. The
+  bootstrap sets no timezone.
+- **Toolsets and persona.** The profile must have
+  `agent.disabled_toolsets: [terminal, code_execution]` (see "trip-monitor
+  manages releases too" for why) and the checkout's
+  `.agents/skills/trip-fleet-monitor/SOUL.md` installed as the profile SOUL.
+  `bootstrap-fleet-monitor.sh` does neither (`hermes profile create` seeds a
+  default SOUL, and `install-hermes-skill.sh` manages only the skill; issue #302).
+  Until #302 lands the private deployment wrapper does it. Read both back with
+  `hermes -p trip-monitor config get agent.disabled_toolsets` and a `diff` of
+  the profile's SOUL against the checkout's before `--start-gateway`.
+
+Issue filing is optional and off unless `/opt/kinerary-deploy/issue-target.json`
+exists: without it the monitor still watches and still reports to the operator
+chat, it just cannot open a GitHub issue. The token is a fine-grained PAT scoped
+to Issues on one repository — never the `gh` CLI's login. See the skill's
+Install section.
+
+### The fleet monitor's database role
+
+**Why.** Every Hermes profile, the traveller-facing companions included, runs in
+the one `hermes` container as uid 10000 over the one data mount
+`/opt/hermes-data:/opt/data` (`compose.vm.yml:385-406`), and the fork's image
+sets `HERMES_WRITE_SAFE_ROOT=/opt/data` (`Dockerfile:379`, as carried in
+`tests/scripts/fixtures/hermes-src/`), so the monitor's `fleet-stacks.json` sits
+where a companion's file tools reach. The URL in it must therefore not be the
+relay's read-write login, and the MCP's read-only `PGOPTIONS` is only a session
+default an inherited value replaces (`fleet-mcp.mjs:338`; issue #302, regression
+plan 2026-09-28 finding 3).
+
+**What it is.** `control-plane/deployment/monitor-db-role.sql` creates
+`kinerary_fleet_ro`: `LOGIN NOINHERIT`, no other attribute, no memberships,
+connection limit 20, `default_transaction_read_only = on`,
+`statement_timeout = 20s`, and `SELECT` on exactly the 92 columns of the 14
+relations the fleet MCP reads — column-level, so `trips.companion_intro` (each
+site's password), `intake_sessions.answers` and people's names stay unreadable
+(the file's header). It also takes `TEMPORARY` on the database from `PUBLIC`,
+which affects every role that is neither a superuser nor the database's owner:
+read `\du` first. It is not a migration: a role is cluster-wide and carries a
+password, and a stack without a monitor needs none (same header).
+`tests/scripts/test_monitor_db_role.py` holds the list to what `fleet-mcp.mjs`
+queries, and fails when a query needs a column the role lacks or the role holds
+one no query needs. Such a change is not live until the role is re-applied here:
+until then that tool fails with "permission denied" (`fleet-mcp.mjs:347`), never
+an empty answer. One ordering follows from the grant list naming
+`control_plane.assistant_events` (migration `20260925143012`, which ships with
+Release A): apply the role **after** that migration has run, because the apply
+fails on a database that has no such table. Until then the statistics tool's
+companion-usage section says "not available — this database has no
+assistant_events table yet"; after the migration and before the re-apply it says
+"could not be read (permission denied for table assistant_events)", and the rest
+of the digest is unaffected either way.
+
+**Applying it.** The mechanism is `scripts/create-monitor-db-role.sh`, which
+names no host, container or path and refuses when a value is unset. The values
+are this VM's, so they belong in the private `kinerary-deploy`, in a wrapper
+that is not in this repository and, as of 2026-09-28, not yet written. What it
+sets:
+
+| Variable | This VM | Source |
+|---|---|---|
+| `PSQL_CMD` | `docker exec -i kinerary-cp-postgres-1 psql -X -U kinerary_control_plane -d kinerary_control_plane` | the name `vm-relay-restart.sh:28` uses; the image's `POSTGRES_USER` (`compose.vm.yml:33`) is a superuser, which the script needs to read `pg_authid` |
+| `MONITOR_DB_HOST`, `MONITOR_DB_PORT` | `127.0.0.1`, `5433` | the published loopback port (`compose.vm.yml:42`), which Hermes reaches on the host network (`compose.vm.yml:386`) |
+| `MONITOR_DB_NAME` | `kinerary_control_plane` | `compose.vm.yml:32` |
+| `MONITOR_DB_URL_FILE` | `/opt/kinerary/control-plane/deployment/.local-secrets/fleet_monitor_database_url` | beside the other compose secrets ([Layout](#layout)), outside `/opt/hermes-data` |
+| `MONITOR_DB_URL_OWNER` | `debian` | that directory's owner ([Layout](#layout)); written mode 0600 |
+
+Run it with `sudo`, `--check` first, and only with the owner's yes: creating the
+role is a production database write. The script creates or corrects the role,
+sets a password only when the role is new or the file does not hold its
+password, writes the URL with `umask 077` through a temporary file moved into
+place after the transaction commits, and prints the role and the path, never the
+URL. The password is 32 bytes from `openssl rand`; PostgreSQL is sent only a
+SCRAM verifier computed by the script, so no server log can hold it.
+
+Then point the bootstrap at the file: `FLEET_DB_URL_FILE` is what
+`bootstrap-fleet-monitor.sh` reads (`bootstrap-fleet-monitor.sh:72`). It leaves
+an existing `fleet-stacks.json` alone (`bootstrap-fleet-monitor.sh:121-122`), so
+to move a monitor already bootstrapped with the read-write URL, remove the
+profile's `fleet-stacks.json` and run the bootstrap again. Its step 7 reads the
+control plane through the MCP with the new URL (`bootstrap-fleet-monitor.sh:193-199`).
+
+**Rotating.** `create-monitor-db-role.sh --rotate` sets a new password and
+replaces the file. The profile's `fleet-stacks.json` still holds the old URL, so
+remove it and rerun the bootstrap straight after; until then every monitor query
+fails authentication. The MCP opens a fresh `psql` for each query
+(`fleet-mcp.mjs:328`), so no open session keeps the old password working.
+
+**Verifying.** `create-monitor-db-role.sh --check` changes nothing. It checks the
+file (mode 600, owner, and that its user, address and password are the role's,
+by recomputing the stored SCRAM verifier) and the role (attributes, settings, no
+memberships or owned objects, no `CREATE` or `TEMPORARY`, every column readable
+exactly when the list names it, nothing writable, no `SECURITY DEFINER` function
+it can call). Then, as the role, inside a transaction that is rolled back and is
+not read-only, it tries an `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`,
+`CREATE TABLE`, `CREATE TEMPORARY TABLE` and two reads outside the list, and
+requires every one to be refused with "permission denied". It exits 1 naming
+each difference; a run without `--check` corrects them.
+
+What it does not cover: the URL is still readable by every profile, so a
+companion can read what the monitor reads, including the uploaded document text
+inside `intake_sessions.source_document` (the MCP reads only its filename and
+length, but a column grant cannot narrow a JSON value), companion bug-report
+text, and Telegram chat ids. A client can also override `statement_timeout`, so
+the connection limit is what bounds load.
 
 ## Companion host
 
@@ -385,11 +625,46 @@ sudo kinerary-cp-release prune --dry-run
    trip-intake's `*_for_chat` tools, Hermes credentials, and every live trip's
    companion connection and trip-mcp bridge. Dror gets the result on Telegram.
 
+**A trip marked `TRIP_MCP_BRIDGE_FAILED` is not skipped by any of this**
+(issue #193): `restart-bridges`, `verify`'s bridge check and the relay's
+post-restart wait all still include it, because that mark is exactly what
+the operator's own repair path — `setup-mcp.sh --restart-only` (see "A
+Mac-provisioned companion that cannot read its own trip", staging only) or
+its VM equivalent — exists to fix. Fixing the bridge does not clear the
+mark by itself, though: the repair step to reach for is
+`python -m control_plane_worker provision --reconcile-companion <trip_id>`
+(the flag belongs to the `provision` subcommand; run it in the worker
+container, whose environment carries the database URL, deploy root and VM map)
+— it writes `reachability` back to `reachable` (`provisioner.py`'s
+`reconcile_companion` via `_attach_companion`), and it is the one place that
+does so *only after confirming the bridge it just wired is actually healthy*,
+never unconditionally. Run it after the bridge repair, or the trip stays flagged
+unreachable — and reported as such by the fleet monitor — even though
+nothing is wrong with it any more. (`switch-trip-chat.py` also writes
+`reachability = 'reachable'` when it rebinds a chat to an installed
+companion, but with no bridge-health check at all — it is not a substitute
+for this step, and clearing a genuinely-broken bridge's mark that way is a
+known gap, tracked separately as #287.)
+
 **What trips notice.** Websites: nothing. The bot pauses for the relay
 restart. Since the relay waits for the live trips' companions to reconnect
 before polling (`RELAY_GATEWAY_WAIT_SECONDS`, default 40), messages sent in the
 window wait at Telegram rather than getting "try again". Companions and site AI
-features restart only when `HERMES_REV` changes.
+features restart only when `HERMES_REV` changes, and **that is not queued**: the
+wait above belongs to a relay restart, and nothing holds updates back while
+Hermes is recreated. On the 2026-09-18 recreate the Japan companion's gateway log runs from SIGTERM at
+20:26:00.575 to "relay connected" at 20:26:17.009, about 16 s (measured for the
+2026-09-28 regression plan). A message addressed to a companion in that window
+gets the generic companion-unavailable reply and the turn is lost, and a turn
+in flight is killed: Docker's default 10 s stop grace applies, since
+`compose.vm.yml` sets no `stop_grace_period`, and companion turns have taken
+20-42 s. The release tool's guard checks interview turns (`cmd_upgrade` calls
+`guard_interview`, `vm-release.py:850-859,1499`), not companion turns, and the relay has
+none either, so before a Hermes recreate check for a live companion
+conversation yourself: each live companion's `gateway.log`, last 15 minutes,
+for `inbound message` or `response ready`. Wait it out. If a turn is lost
+anyway the relay logs `trip_bot.update_shape`; the organizer resends, nothing
+is replayed.
 
 **Three ways back:**
 
@@ -438,6 +713,70 @@ Every new migration declares `-- rollback: compatible — <why>` or
 `-- rollback: breaking — <what>`, enforced by
 `control-plane/api/test/migration-rollback.test.ts`. The tool treats an
 undeclared one as breaking.
+
+**Ordering on the Mac stack.** On the VM the tool migrates before it restarts
+the relay (step 4). By hand, do the same: a relay started against a schema
+without a table it reads fails on every message that reads it. For typed
+interview changes (PR #199, `20260925180000_intake_pending_changes.sql`) that is
+`42P01` on every typed interview message. Rebuild and start the API first, then
+restart the relay.
+
+**Rolling back past PR #199.** The migration is `compatible`, so the database
+is kept, and the old relay never reads `intake_pending_changes`. A `pending`
+change is then orphaned unseen, and the old Confirm does not check for one, so
+an organizer who confirms loses a waiting change without being told. Before
+rolling back, count them:
+`SELECT count(*) FROM control_plane.intake_pending_changes WHERE status='pending'`,
+and tell any organizer who has one (cancelling drafts is a write and needs
+approval). Rolling forward again is harmless. Source: the regression plan
+`docs/test-reports/regression-plan-2026-09-26-pr199-round3.md` §3, whose reading
+of the VM release order was carried from an earlier pass, not re-read.
+
+After the first real interview on a build that has #199, grep the relay log for
+`interview.change_floor_taken_back`, `interview.change_dropped_unshowable` and
+`trip_bot.floor_lost`.
+
+**A chat whose Telegram sends keep failing can refuse a relay restart (PR #234,
+issue #225).** A router step Telegram will not take (a rate limit over the cap, a
+5xx, a timeout) is retried by the relay itself, and while it is being retried the
+chat is `awaiting = 'machine'`, which is exactly what `vm-relay-restart.sh` and
+`kinerary-cp-release`'s interview guard refuse on. The refusal runs from the
+first failure until the eighth (a retry episode) and then clears at once: giving
+up, or a permanent refusal (a 400), leaves the turn with the organizer, so there
+is no five-minute tail. **Derived from the code, not measured:** about 265 s, and
+278 s as a safe ceiling (the regression plan
+`docs/test-reports/regression-plan-2026-09-26-pr234-relay-send-hardening.md`,
+§4 of its round 2, has the arithmetic; not repeated here).
+
+- `kinerary-cp-release upgrade` checks the guard at step 2 while the **old**
+  relay, which has no retry machinery, still runs; it then restarts the relay
+  with `--force-live`. So Release A itself is unaffected by this. What can meet
+  it is a relay-only restart after Release A, `vm-interview-runner.sh`, the next
+  upgrade, or a rollback of Release A.
+- Checklist line: on a refusal saying "an interview is mid-turn (chat X)", wait 5
+  minutes and re-run `--dry-run`. If it is still refused after two re-runs,
+  `grep -E 'step_send_(failed|abandoned)'` on the relay log. Repeated failures
+  mean Telegram is failing that chat and a restart will not fix it: postpone. Use
+  `--force-live` only after the organizer has been told.
+- The retry record lives in the relay process, so a restart forgets it: a
+  refused summary is not re-sent after a restart until the organizer writes.
+
+**After a build that has #230 and #234, grep the relay log** (in addition to the
+three names above) for: `telegram_api.rate_limited`, `telegram_api.call_timed_out`,
+`trip_bot.step_send_failed` (carries `permanent` and `skipped`),
+`trip_bot.step_send_abandoned`, `trip_bot.step_retry_failed`,
+`stalled_turn_recovery_failed`, `interview.change_floor_taken_back` (carries
+`reply`), `interview.change_displaced_moved` (carries `during_send`),
+`interview.change_show_failed` (carries `permanent`) and `trip_bot.floor_lost`;
+and Hermes' own log for `trying plain-text fallback` and `relay outbound timed
+out`. Relay log lines carry **no timestamp**, so use `docker logs -t` on the
+running container **before the next restart**: `vm-relay-restart.sh` appends the
+outgoing relay's log to `/var/log/kinerary/relay.log` with `docker logs` and no
+`-t` (read in the script), so the timestamps are gone once it is archived. A
+healthy first interview shows none of the failure names; `"skipped":true` on a
+healthy bot would mean a 400 on a document disagreement's own text. What the
+retries do, and why the classification is the way it is, is in
+`docs/sprint6-tracks.md` decision 40, not here.
 
 A code-only rollback keeps the newer database, and old code tolerates it only
 because the migrations said so. It also means **the newest `available` site
@@ -532,6 +871,74 @@ status, plan and dry-run, plus **request**. It never gets **approve**.
   `terminal` and `code_execution`; otherwise it could reach the VM with the
   fleet key (`debian`, which has sudo) and skip the gate.
 
+## Where a trip's data lives, and what that name means
+
+Each trip has a directory on the TrueNAS share, bind-mounted into its
+container: the site's SQLite database, uploaded photos, booking confirmations.
+It outlives the container by design — a redeploy replaces the code, never the
+family's data.
+
+**New trips are named by trip id on both sides of the NFS mount** — the host
+directory (`/mnt/pve/truenas-nfs/trip_<id>`) and the path the container sees it
+at (`/nfs/trip_<id>`, mp0). Neither reads as a slug in `pct config` any more; a
+`TRIP.txt` written into the directory at create time names the slug, so the
+share still stays browsable. The slug survives in exactly one other place —
+the container's own filesystem, where `deploy.sh` puts the git-tracked
+`trips/<slug>/` content (`TRIP_DIR=/opt/kinerary/trips/<slug>`) — because that
+one is not NFS, and is not reused the way a slug's NFS directory would be.
+
+The reason is that a slug is not an identity. It comes from the organizer's
+answers, and teardown deliberately frees it (`retired-<slug>-<date>`) so the
+name can be used again. Two safeguards used to stand between a reused slug and
+the previous family's data: teardown renaming the directory, and a first
+provision wiping it. Both are mechanisms that have to work; an id cannot
+collide in the first place.
+
+**An existing trip keeps its directory, forever.** The path is recorded in that
+trip's `topology.yaml` when it is first provisioned, and every later
+provision — an upgrade, a redeploy, a retry — reads that file. Nothing
+recomputes a name for a trip that already has one, and
+`test_a_trip_that_already_has_a_topology_keeps_its_data_dir` is there to keep
+it that way: recomputing would point a running family's site at an empty
+directory, and it would come back with no participants, no photos, and a login
+nobody has.
+
+So **upgrading software on a live site changes nothing about this** — deploys
+send code, and the mount comes from the topology.
+
+**Uploaded documents live one level inside the same NFS directory, in a
+`documents` subdirectory — not the trip id or slug directly.** The worker's
+`ShellDeployAdapter._trip_nfs_documents_dir` (`control-plane/worker/control_plane_worker/provisioner.py`)
+reads the directory name `topology.yaml` actually recorded for this trip —
+trip-id-shaped for a trip provisioned after PR #89, slug-shaped for one
+provisioned before it — via `_trip_nfs_dirname`, then joins `documents` onto
+it: `<nfs_host_dir>/documents`. It never derives the name from `trip_id`
+itself, for the same reason the directory above does not: `trip_id` is known
+on every deploy, but the directory is only trip-id-shaped for a topology built
+after that change. If the worker cannot see that directory on its own
+filesystem, it logs a warning and falls back to publishing documents into the
+deploy directory instead (`documents_dir` under `TRIP_DIR`) — slower, and not
+hardlinked, but not silently missing.
+
+### Renaming an existing trip's directory (optional, deliberate)
+
+Only worth doing to retire the old naming; nothing requires it. The trip must
+be down for the move, because the container holds its database open and NFS
+turns deletions-in-use into `.nfs*` placeholders:
+
+```bash
+# on the Proxmox host, with the trip's vmid and its new id-shaped name
+pct stop <vmid>
+mv /mnt/pve/truenas-nfs/<slug> /mnt/pve/truenas-nfs/trip_<id>
+pct set <vmid> --mp0 /mnt/pve/truenas-nfs/trip_<id>,mp=/nfs/trip_<id>
+pct start <vmid>
+```
+
+Then update both `nfs_host_dir` and `nfs_mount_path` in
+`~/kinerary-deploy/trips/<slug>/topology.yaml` to match, or the next provision
+will recreate the old directory and serve an empty site. Verify before walking
+away: the site answers, and its bookings and participants are still there.
+
 ## Boot order on the Proxmox host
 
 Set 2026-09-13, after a host reboot brought back only the guests with `onboot`
@@ -583,6 +990,32 @@ the VM with every step green and the infrastructure back to its baseline.
 scenario produced `portugal-lisbon-and-porto-2026` — the same slug the Mac's
 run of that scenario produces. A VM run and a Mac run of the same scenario
 would fight over one hostname, NPM host and ingress rule: never overlap them.
+
+## Inviting an organizer
+
+Only a person who already has an account can mint their own interview link, so
+onboarding somebody new used to mean signing up on their behalf and keeping a
+password they never chose. `kinerary-invite` (`control-plane/deployment/vm-invite.py`)
+calls the control plane's operator route instead:
+
+```bash
+kinerary-invite preview someone@example.com                              # reads, changes nothing
+kinerary-invite create someone@example.com --language he --invited-by dror
+```
+
+It prints the link and a message to forward, and sends nothing itself. Three
+outcomes, decided by what the address already has: a first trip, a fresh link
+for a draft they never started (no second trip), or a second trip for someone
+whose first was built — who then meets a shorter opening in the interview.
+
+Set `CONTROL_PLANE_OPERATOR_KEY` in `vm.env` **and restart the API**: without
+it the routes are not mounted at all, and a key on one side only reads as a
+401. The fleet monitor reaches the same tool through the `cpinvite` forced
+command — install and rules in `.agents/skills/organizer-invites/SKILL.md`.
+
+There is no password reset behind any of this. The control plane has no such
+route for organizers, and an invited account is deliberately given no password
+credential at all.
 
 ## Manual test
 
@@ -687,8 +1120,11 @@ so the Mac stops depending on a coding-session preference.
 Not done. Gates, in order:
 
 1. The VM's branch must carry every migration the Mac's database has applied —
-   today the Mac has `0050_telegram_organizer_links.sql`, the VM's branch does
-   not.
+   today the Mac has `0050_telegram_organizer_links.sql`, which PR #47 renamed
+   `0052_telegram_organizer_links.sql`. The VM's branch needs the 0052 file.
+   The Mac's leftover `0050_…` row names a file that no longer exists and is not
+   a gap to close: the renamed file is safe to re-run, and does exactly that on
+   the Mac.
 2. No interview mid-turn (`intake_sessions.awaiting = 'machine'`).
 3. Stop the Mac's relay, sidecar, trip-intake gateway and compose stack — only
    one `getUpdates` loop may own `@Kinerary_bot`.

@@ -32,6 +32,7 @@ const fetch                  = require('node-fetch');
 const crypto                 = require('crypto');
 const { execFile }           = require('child_process');
 const pdfParse               = require('pdf-parse');
+const { hermesChildEnv }     = require('../shared/child-env.js');
 
 const MCP_PORT    = parseInt(process.env.MCP_PORT || '3001');
 const API_BASE    = (process.env.API_BASE_URL || 'http://trip-server:3000').replace(/\/$/, '');
@@ -249,14 +250,17 @@ mcp.tool('set_telegram_group',
   'Bind the trip\'s Telegram group once it exists, turning on Telegram Login for the site — e.g. once the organizer creates the group, ' +
   'adds this bot, and you observe a message there. Pass the chat_id you saw it on (a negative number — group and supergroup chat IDs ' +
   'always are). Verifies live that a Telegram-bound organizer is actually an active member of that chat before accepting it, so it will ' +
-  'refuse a wrong or made-up chat_id. Requires an organizer to already have a telegram_id bound (bind_participant_telegram) — bind the ' +
-  'organizer first if this fails with no_telegram_bound_organizer.', {
+  'refuse a wrong or made-up chat_id. Requires an organizer to ALREADY have a telegram_id set — from provisioning, or linked by an ' +
+  'operator; there is no self-service way for an organizer to set this yet. You cannot set it for them: bind_participant_telegram ' +
+  'refuses an organizer username on purpose (the agent key must never be able to act on the organizer\'s own identity — issue #184). ' +
+  'If this fails with no_telegram_bound_organizer, tell the organizer it needs to be set at provisioning, or ask an operator to link ' +
+  'it for them; that is not something you can do on their behalf.', {
   chatId: z.string().describe('Telegram chat_id of the group, e.g. "-1002345678901" — negative, as seen on an incoming message\'s chat.id'),
   chatTitle: z.string().optional().describe('Group title, for confirmation purposes only — not verified against Telegram'),
 }, async ({ chatId, chatTitle }) => ok(await apiPost('/api/agent/telegram-group', { chat_id: chatId, chat_title: chatTitle })));
 
 mcp.tool('get_today',
-  'Read the trip clock date, active plan for today, next activity, and today\'s companion_message. Use this date when publishing a daily message.', {},
+  'Read the trip clock date, current time, active plan for today, next activity, and today\'s companion_message, all in the trip\'s own timezone. This directly answers "what time is it" / "what time is it there" for this trip — read this instead of a general web search. Use this date when publishing a daily message. If the timezone looks wrong (e.g. it should be where the family actually is), use set_trip_timezone to correct it rather than working around it.', {},
   async () => ok(await apiGet('/api/today')));
 
 mcp.tool('get_companion_inbox',
@@ -278,6 +282,11 @@ mcp.tool('set_companion_connection',
     group_url: z.string().nullable().optional(), bot_username: z.string().nullable().optional(),
     binding_command: z.string().nullable().optional(), binding_expires_at: z.string().nullable().optional(),
   }, async args => ok(await apiPost('/api/agent/companion/connection', args)));
+
+mcp.tool('set_trip_timezone',
+  'Change the trip\'s own canonical timezone — the one get_today, day/night state and every trip-local time on the site are computed from. Use this when a traveler or organizer says the trip\'s time or timezone looks wrong, or names where they actually are (e.g. "we\'re in Miami now, not wherever this thinks we are"). Takes effect immediately, no redeploy needed. This is a structural, trip-wide setting, not a personal display preference for one member — do not use it to answer "what\'s MY local time". Pass a real IANA timezone identifier (e.g. "America/New_York", "Asia/Jerusalem"); an invalid one is rejected and nothing changes. Returns the confirmed value — read it back to confirm to whoever asked.', {
+    timezone: z.string().min(1).describe('IANA timezone identifier, e.g. "America/New_York", "Asia/Jerusalem", "Asia/Ho_Chi_Minh"'),
+  }, async ({ timezone }) => ok(await apiPatch('/api/settings', { timezone })));
 
 mcp.tool('publish_daily_message',
   'Publish one short, warm encouragement on the trip Today page. Read get_today first; use its exact today date. ' +
@@ -516,6 +525,17 @@ mcp.tool('add_trivia_question',
 
 // ── Phase plan items ──────────────────────────────────────────────────────────
 
+// Hermes hands any mcp_-prefixed tool's result to the model inline only up to
+// DEFAULT_MCP_RESULT_SIZE_CHARS = 50,000 characters (external fact — read from
+// ~/.hermes/hermes-agent/tools/budget_config.py, not part of this repo — and
+// exposed here as mcp__trip_mcp__get_phase_plan); past that it spills the
+// result to a file and hands the model a path instead. On a large trip the
+// no-argument, no-date get_phase_plan call crossed that threshold, and the
+// companion worked around it by reading the spillover file itself and writing
+// a private skill to parse it (issue #310). 40,000 leaves a safety margin
+// under the real 50,000-char cutoff.
+const PHASE_PLAN_SAFE_LIMIT = 40_000;
+
 mcp.tool('get_phase_plan',
   'THE ACTIVE PLAN for a phase — the live day-by-day schedule the family actually sees, including AI enrichment and every organizer ' +
   'edit. Read this before answering or changing anything about what happens on a given day. ' +
@@ -528,11 +548,17 @@ mcp.tool('get_phase_plan',
   'It holds the note (why) and previous (what it said before, shown struck through on the site). ' +
   'These are what you relay to the organizer after a schedule change; do not silently pass over them. ' +
   'item.status is "confirmed" or "needs_review" (auto-migrated or agent-derived content awaiting organizer review). ' +
-  'Also the read-back tool: after any plan edit, call this and check the dates and headlines actually say what you intended.',
+  'Also the read-back tool: after any plan edit, call this and check the dates and headlines actually say what you intended. ' +
+  'On a large trip, calling this with neither argument can be too big to return in one go — pass phase_id, date, or both to keep ' +
+  'the answer to the day(s) you actually need; date alone (no phase_id) is how you find which phase covers a date you don\'t know yet.',
   {
     phase_id: z.string().describe('Phase id from get_config (e.g. "la", "honolulu"). Omit to get all phases.').optional(),
+    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD').optional()
+      .describe('Limit the result to one date (YYYY-MM-DD). With phase_id, filters that phase\'s items and day down to just this date. ' +
+        'Without phase_id, returns only the phase(s) that actually cover this date — every other phase is left out entirely, ' +
+        'rather than coming back with empty items/days.'),
   },
-  async ({ phase_id }) => {
+  async ({ phase_id, date }) => {
     // Items and headlines are two tables and two endpoints, but one answer to
     // "what does this day look like" — an agent given only the items cannot see
     // that the headline still names the old plan.
@@ -543,14 +569,43 @@ mcp.tool('get_phase_plan',
       ]);
       return { phase_id: id, days, items };
     };
-    if (phase_id) return ok(await load(phase_id));
+    const filterToDate = (plan, d) => ({
+      ...plan,
+      items: plan.items.filter(item => item.date === d),
+      days: plan.days.filter(day => day.date === d),
+    });
+    if (phase_id) {
+      const plan = await load(phase_id);
+      return ok(date ? filterToDate(plan, date) : plan);
+    }
     const cfg = await apiGet('/api/config');
     const phases = cfg.phases || [];
     // Fetched together rather than awaited one at a time — an 8-phase trip was
     // paying 8 sequential round trips for reads that don't depend on each other.
     const plans = await Promise.all(phases.map(p => load(p.id)));
     const results = {};
-    phases.forEach((p, i) => { results[p.id] = plans[i]; });
+    phases.forEach((p, i) => {
+      let plan = plans[i];
+      if (date) {
+        plan = filterToDate(plan, date);
+        // The point of allowing date alone: a caller who knows the date but not
+        // the phase gets back only the phase(s) that cover it, not an empty
+        // items/days entry for every phase that doesn't.
+        if (plan.items.length === 0 && plan.days.length === 0) return;
+      }
+      results[p.id] = plan;
+    });
+    // Only the no-phase_id, no-date shape (today's only calling shape before
+    // this fix) can still be arbitrarily large on a big trip — passing either
+    // argument already bounds the result. See PHASE_PLAN_SAFE_LIMIT above.
+    if (!date) {
+      const size = JSON.stringify(results).length;
+      if (size >= PHASE_PLAN_SAFE_LIMIT) {
+        throw new Error(
+          "This trip's full plan is too large to return at once. Ask for one phase_id, or one phase_id plus a date, instead."
+        );
+      }
+    }
     return ok(results);
   });
 
@@ -784,6 +839,28 @@ function requireSiteOrAgentKey(req, res, next) {
 const HERMES_EXTRACT_PROFILE = process.env.HERMES_EXTRACT_PROFILE || '';
 const HERMES_BIN             = process.env.HERMES_BIN || 'hermes';
 
+// The environment the Hermes child (runHermesExtract, below) may see — an
+// ALLOW-list, matching the pattern control-plane/api/src/model-runner.ts
+// established for the same class of child reading untrusted organizer/
+// document text (structuringChildEnv / claudeChildEnv / codexChildEnv,
+// #153/#58): the base set every such child needs (how to find its own
+// executable, a place to write, a locale, certificates) plus HERMES_HOME — a
+// config-directory location, the same kind of variable as CODEX_HOME, not a
+// credential; Hermes reads its own provider keys from ~/.hermes/.env, never
+// from this process's environment. A deny-list cannot be audited here
+// either — issue #183: this bridge's own secrets, HERMES_API_KEY (its MCP
+// auth key) and API_BASE_URL (the trip site it talks to), must never reach a
+// process fed a stranger's uploaded PDF, and neither should anything else
+// this process happens to hold. Before that fix, execFile below passed no
+// `env` option at all — Node treats that as "inherit everything" — so a
+// prompt injection in an uploaded document ran inside a process that could
+// see both.
+//
+// SHARED, not a copy (#284): this used to be a byte-for-byte duplicate of
+// control-plane/api/src/model-runner.ts's STRUCTURING_BASE_ENV + hermesChildEnv
+// (#153/#58) — now both pull from ../shared/child-env.js (required at the top
+// of this file), the one place the allow-list is defined.
+
 async function extractPdfText(buf) {
   const { text } = await pdfParse(buf);
   return text.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim().slice(0, 20000);
@@ -803,7 +880,7 @@ function runHermesExtract(prompt, { timeoutMs = 45000 } = {}) {
     execFile(
       HERMES_BIN,
       ['-p', HERMES_EXTRACT_PROFILE, 'chat', '-q', prompt, '-Q', '--ignore-rules', '--reasoning', 'none'],
-      { timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 },
+      { timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024, env: hermesChildEnv() },
       (err, stdout, stderr) => {
         if (!err) return resolve(stdout);
         if (err.code === 'ENOENT') return reject(new Error(`hermes CLI not found on this host (HERMES_BIN=${HERMES_BIN})`));

@@ -2,7 +2,7 @@
 name: trip-daily-planning
 description: Trip planning skill — general overview, day-by-day plans, weather, and group-ready messages from verified itinerary data.
 version: 1.2.0
-author: Nahum / Hermes
+author: Kinerary / Hermes
 license: MIT
 metadata:
   hermes:

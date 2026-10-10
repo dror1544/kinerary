@@ -348,8 +348,8 @@ no deployment commands required from the organizer or family.
 > chance to fire, because a defect one step upstream skipped the companion
 > first: `_resolve_organizers` (`transformer.py:649-656`) matches
 > `organizer_identity` only against `{name, name_en, username}` — **never
-> `name + family`**. The organizer answered "ניר סולומון" against a participant
-> named "ניר"/"Nir"/`nir`, so nothing matched, `agent.organizers` was unset,
+> `name + family`**. The organizer answered "רון מרגולין" against a participant
+> named "רון"/"Ron"/`ron`, so nothing matched, `agent.organizers` was unset,
 > `build_companion_handoff` returned `None`, and the companion was skipped.
 > `assistant_names` is empty and `telegram_chat_bindings` is 0 — the organizer
 > messages the bot and gets "I don't have a trip for this chat."
@@ -511,7 +511,8 @@ out of 4.5).
 
 As of 2026-08-30 every item below is `built` except one low-visual residual
 (`follow-on`): **prose anchor extraction**. The `separate build` (site
-live-plan enrichment worker) stays out of 4.5.
+live-plan enrichment worker) stayed out of 4.5 and was built separately on
+2026-09-12 — see its row.
 
 | Item | Tag | Notes |
 |---|---|---|
@@ -528,7 +529,37 @@ live-plan enrichment worker) stays out of 4.5.
 | Phase narrative blurb | `built` | `transformer._phase_note_text` writes a readable blurb ("4 nights in Tokyo, 6 Sep–10 Sep. Staying at …. 3 days planned") with any trimmed name context as a trailing clause, replacing the raw concat. |
 | Persist the raw uploaded document | `built` | Migration 0024 adds `intake_sessions.source_document` + `intake_versions.source_document` (jsonb `{filename,text,savedAt}`). `POST /v1/interview/:id/source-document` stages it; `extract_itinerary` forwards the document after extracting (best-effort); `confirmIntake` copies session → version. Sibling column — outside the `data` canonical-safety CHECK and the digest. |
 | Structured budget | `built` | Optional `budget_detail` structured question → `transformer._derive_budget` projects `config.budget` (`party_size` / `phases` / `phase_labels` / `seed_items`), the shape `server.js` seeds `budget_items` from. Categories validated to the site's set; `amount 0 + estimate` → a "fill-in" row; `seed_key` stable for idempotent re-seed. No `INTAKE_SCHEMA_VERSION` bump (additive-optional). |
-| Site live-plan enrichment worker | `separate build` | The trip site already has the DB hooks — `phase_plan_items` / `phase_plan_days` with `enrichment_status` (`none/pending/done/failed`), `review_status`, `config_ref` dedup, day-headline correction trail. A worker that calls a model post-deploy to detect ticketing needs, re-enrich, and feed the in-app review queue is its own sprint, not 4.5. |
+| Destination info: Health / Money / Communication | `separate build` — **BUILT (2026-09-22)** | Sourced from Sprint 6 Track 1a item 1 (`docs/sprint6-tracks.md`), not part of 4.5's original scope, but the same enrichment mechanism as the rows above: `enrichment._enrich_destination_info` in `control_plane_worker/enrichment.py`, wired into `enrich_config`, reads a cross-trip cache in `control_plane.country_reference` (extended in place, not a second table — decided 2026-09-22, migration `20260922120000_destination_info.sql`) filled by a monthly timer inside the control-plane API (`destination-info-store.ts`'s `refreshStaleDestinationInfo`, ticked from `server.ts`) rather than at interview time — Health/Money/Communication depend on no interview answer, and the refresh has to run when no interview session exists. A second staleness clock, `destination_info_fetched_at`, is kept separate from consular's `fetched_at` so refreshing prose never re-dates consular contacts as freshly verified. Deterministic-first, same posture as the rest of this table: facts from APIs where one exists, model prose only at the gaps, provenance marked in the data. **Hospitals and Age notes are excluded by decision, not deferred** — no deterministic API source exists for either (a hospital name or a legal age limit), so an included line would only ever be unverifiable model prose shown to families as fact; confirmed 2026-09-22. |
+| Per-phase packing lists | `separate build` — **BUILT (2026-09-23; reworked to abstain 2026-09-25)** | Sourced from Sprint 6 Track 1a item 3 (`docs/sprint6-tracks.md`, #162, PR #165, merge `20f7419`; reworked by PR #197, merge `283ca64`, which closed #167), not part of 4.5's original scope, but the same "fill a thin provisioned config" purpose as the rows above. `transformer._derive_phase_packing` emits `phase.packing` — `[{he,en} category, {he,en} item]` pairs, the shape `readiness.tsx` reads — only when `packing_climate.decide()` is sure of the place and of the season in every month the phase covers, mapped to a small fixed bilingual table (`_PACKING_ITEMS_BY_SEASON`). Deterministic: no network, no model. **There is no default hemisphere: an unsure phase gets no list, and the site shows what it already shows for a phase with no `packing`.** Only a *named city* in a fixed climate table ever gets a list (a country never does, and nothing is inherited from the trip's destination); the city must be temperate with no dry season, and every month the phase covers must fall in one season bucket and pass its temperature test with a margin. Tropical, arid, Mediterranean, summer-rain, mild-winter, cool-summer, subpolar, shoulder-month, multi-season, ambiguous, namesake and unlisted-island cases all abstain with a named reason (logged, not shown). The UK stays temperate, with the Isles of Scilly as the named exception (Dror, 2026-09-25). **Not built:** lists for non-temperate regimes (Sydney, Rome, Seoul in their good months), a richer season-to-items table, coverage measured on real destinations, and the geocoder-latitude idea (that is #188). **Remaining scope is #201:** source-check the eight emitting entries within 0.7 °C of a threshold before the VM is upgraded to a release carrying this, confirm no live trip already carries `phase.packing`, put the abstention reason in the production log line, and the owner's open question on a warm ceiling for spring and autumn. Trip-level `config.packing_general` is untouched and keeps its own frontend fallback. |
+| Group activity votes (RSVP activities) | `separate build` — **BUILT (2026-09-23)** | Sourced from Sprint 6 Track 1a item 4 (`docs/sprint6-tracks.md`, #169, PR #171, merge `0bba091`). `transformer.derive_rsvp_activities`, called from `transform_intake` beside the anchor-derived days, writes `phases[].rsvp_activities[]` (`{id, title, desc?, date?}`) from the **unconfirmed, attraction-typed `travel_anchors`** (through `_ANCHOR_TYPE_MAP`). Not exclusive with `derive_bookings`: the same anchor stays a Bookings row and also becomes a vote. An undated anchor, or one dated in no phase, parks on the first phase — the same place `derive_bookings` parks it. The vote id is a stable hash (`_stable_id("rsvp", …)`) because the `rsvps` table keys votes by that string alone and a moving id would orphan votes silently. The site already rendered the field (`site/app.js`, `trip-web/src/activity-rsvp.ts`); nothing was producing it. **Cut:** a *confirmed* attraction is never a vote (Bookings only); only `attraction`-typed anchors — nothing is voted on from flights, hotels, cars, or from `phases[].venues[]` / extracted `days[]` items; `item_uid` is left unset, so `activity-rsvp.ts` matches on phase + date + exact title; a phase with no such anchor has the key absent, not `[]`; the three anchor walks are not unified into one traversal (revisit only if a fourth consumer appears). |
+| Site live-plan enrichment worker | `separate build` — **BUILT (2026-09-12)** | The post-deploy judge, and the queue its proposals wait in. `control-plane/api/src/plan-review.ts` reads the deployed `trip.config.json` plus the confirmed intake and the uploaded document, and files PROPOSALS — never edits to a live trip. Deterministic half (no model, runs everywhere): the arrival with no landing on it (timed from a `travel_anchors` flight, asked for when there is none), the check-in that was never written down (by hotel name, deliberately with no time and a question for the hour), the transfer between two legs that nothing describes, a blank day, a day out of clock order, a place on `venues[]` that no day mentions, a venue link the day line never got, a ticketing question for a venue with no URL, a day too full or too long for the `trip_pace` they answered (budget tightened by a young child or a `constraints` note, both quoted), and a hop between two districts with no time to make it. Model half (task `plan_review` through `model-runner.ts`, `PLAN_REVIEW_RUNNER`/`PLAN_REVIEW_MODEL`): day headlines, orderings and additions, each through `interpret.ts`'s own gate — `evidenceAppears`, `exampleEchoes`, plus a refusal of any URL and of any place the trip does not already name. Storage: migration 0050 (`plan_reviews`, `plan_review_proposals`, `trips.plan_snapshot`), keyed by the proposal's content fingerprint so a re-review dedups, with an organizer's accept/dismiss sticky across passes. The provisioner stores the config it shipped (`_record_plan_snapshot`, best-effort); `runPendingPlanReviews` on a 5-minute loop in `server.ts` does the rest. **Not yet built**: nothing applies an accepted patch, and nothing surfaces the queue to the organizer — no route, no companion tool. The trip site's own `phase_plan_items`/`phase_plan_days` hooks this row names are still unused by it. |
+
+> **Ship rules-only for now — decided 2026-09-15, after a live comparison against
+> today's per-item `/enrich`.** Full test: `docs/test-reports/plan-review-vs-enrich-comparison-2026-09-15.md`.
+> Both were run against the same `kinerary-extract` Hermes profile on the Mac mini
+> only (no VM). Headline finding: the **deterministic half alone** produced 33
+> real, evidence-backed proposals on the `japan-2025` fixture for zero model
+> calls — arrival, check-in, ordering, unscheduled venues, pace fit, all of it
+> arithmetic over data the trip already has. The **model half added nothing**
+> beyond that on the same run (4 phase calls, `rejected: 0`, `modelUsed: false`)
+> — not proven worthless, just not proven worth its cost yet; a fixture with a
+> gap only a model could catch (e.g. a document naming something the config
+> doesn't) would be needed to tell "rules already cover everything" apart from
+> "the model underperforms this task," and that has not been run.
+>
+> So: this row ships with `PLAN_REVIEW_RUNNER` **left unset in every deployment
+> config** — which the code already degrades to cleanly (`modelSkipped: NO_RUNNER`,
+> never a silent downgrade) — until a harder fixture justifies turning the model
+> half on. `/enrich` itself is unchanged and keeps doing its own job (today's
+> fallback, `gpt-5.6-luna-900k` via `openai-codex` since `kinerary-extract`'s
+> primary OpenRouter id is broken — same finding as the 2026-09-13 report —
+> returned three verified-live links on this run, a real improvement over that
+> report's OpenRouter result of 4-of-6 dead). One thing worth carrying back into
+> `/enrich`, separately from this row: its only guard on model output today is
+> "starts with `http(s)`", where this module's gate (no invented place, no
+> model-supplied URL, every claim needs a quotable source) is strictly
+> stronger — the dead-link finding in the 09-13 report is exactly the failure
+> mode that gate exists to prevent.
 
 #### §4.5-i. Itinerary-from-document spec (`this step`)
 
@@ -860,7 +891,7 @@ contexts and test groups without creating a per-trip Telegram bot.
 > Merged into `integration/sprint-5-plus`: #66 (the VM stack, document
 > suggestions, the bot swap, the reply-thread fix) and #63. Still to land
 > before `main` (#40): #47 and #64, which conflict with integration — see
-> `docs/sprint5-closeout-handoff.md`. Follow-ups that do not block the sprint:
+> `docs/test-reports/sprint5-closeout-handoff.md`. Follow-ups that do not block the sprint:
 > #65, #67, #68, #69.
 >
 > The box below is the 2026-09-02 snapshot, kept for history.
@@ -868,7 +899,7 @@ contexts and test groups without creating a per-trip Telegram bot.
 > **Status as of 2026-09-02 — partially delivered, PR #29 open against
 > `integration/sprint-5-plus` (16 commits, unreviewed).** Working detail,
 > landmines and the bring-up runbook live in
-> `docs/sprint5-next-session-brief.md`; this box is only the scoreboard.
+> `docs/test-reports/sprint5-next-session-brief.md`; this box is only the scoreboard.
 >
 > **Built and in the PR:**
 > - the shared Trip Bot router — deterministic layer (`chat-router.ts`,
@@ -897,6 +928,19 @@ contexts and test groups without creating a per-trip Telegram bot.
 > Half B (two live Hermes profiles, no private-memory leakage) tests an
 > upstream property and belongs as a one-time live verification, not a suite.
 >
+> **`/select` is BUILT, under the name `/switch`** — c3ac940, PR #47
+> (`feat/trip-bot-trip-commands`).
+> `docs/trip-bot-command-surface.md` designs the organizer command surface
+> Dror asked for — `/trips`, `/switch`, `/interview`, `/group`, `/url` — plus
+> Telegram's own command menu. `/trips`, `/switch` (alias `/select`) and the
+> menu shipped; `/group` already worked; `/interview` is kept for later and
+> `/url` was dropped, since `/help` already gives the site address (Dror,
+> 2026-09-13). It also built a **prerequisite this box never named**: the
+> router could not resolve a Telegram sender to a `user_id` at all. That is
+> migration 0052's
+> `telegram_organizer_links` — its own many-`user_id`s-per-person table, not a
+> row in `user_identities`, whose unique constraint allows only one.
+>
 > **Deferred with a reason:** the richer router-issued
 > organizer/trip/channel/role/lifecycle capability. What ships stamps a
 > *profile name*. Whether that suffices for the exit gate is undecided — see
@@ -906,9 +950,9 @@ contexts and test groups without creating a per-trip Telegram bot.
 > remaining piece of this sprint.
 >
 > **2026-09-04 — Track 4 supersedes Track 3, by Dror's decision.** Six live
-> runs in one day (`docs/signup-test-run1..6-raw-notes.md`) reached a confirmed
+> runs in one day (`docs/test-reports/signup-test-run1..6-raw-notes.md`) reached a confirmed
 > intake twice, and one of those needed two manual database unblocks. The
-> analysis is `docs/interview-design-review.md`: these are not six unrelated
+> analysis is `docs/test-reports/interview-design-review.md`: these are not six unrelated
 > defects but four missing pieces of the contract between the router and the
 > interviewer. Track 3's remaining UX items are absorbed into Track 4 rather
 > than fixed one at a time — fixing them one at a time is what produced runs
@@ -1056,7 +1100,7 @@ buttons, less voice).
 
 **A1–A3+B all shipped and reached a clean `intake_confirmed` on run 9
 (2026-09-05)** — the first confirmation since run 4, and the first with no
-manual database intervention. `interview-design-review.md`'s exit gate
+manual database intervention. `docs/test-reports/interview-design-review.md`'s exit gate
 ("two consecutive live runs... no manual database intervention") is one run
 into two.
 
@@ -1096,7 +1140,7 @@ Automated tests:
 produces one turn and no duplicate question.
 
 **Track 5, live: two clean `intake_confirmed` runs in a row (run 9, run 10)**
-— `interview-design-review.md`'s exit gate ("two consecutive live runs... no
+— `docs/test-reports/interview-design-review.md`'s exit gate ("two consecutive live runs... no
 manual database intervention") is now met.
 
 Two small UX fixes shipped alongside Track 5 from run 10's report, both
@@ -1175,7 +1219,7 @@ answered. This is an onboarding-reliability issue and should be resolved
 **before live onboarding scales**.
 
 **But not by building more watchdog machinery.**
-`docs/agent-runtime-position-paper-review.md` §4 puts Track 6's remaining work
+`docs/future/agent-runtime-position-paper-review.md` §4 puts Track 6's remaining work
 in its *Stop* column — "this is precisely what a graph migration deletes" — and
 §2.1 reads run 12's two `404 NOT_FOUND`s as an **`ExecutionContext` failure**,
 stated exactly: `/internal/interview/agent/current/*` resolves "which interview
@@ -1241,9 +1285,14 @@ Build:
 - Create provider-neutral messaging bindings and the shared Trip Bot router.
   Bind `provider + bot identity + chat ID` to exactly one trip only after a
   signed organizer action and permission verification.
-- Implement private `/select` over owned trips with signed callbacks. Private
+- Implement private `/select` over owned trips with callback buttons. Private
   selection is independent from group routing, and reviewed reassignment
-  preserves binding history.
+  preserves binding history. *(Amended 2026-09-13, Dror's decision — this said
+  "signed callbacks". A switch button's payload only names a row: the tap is
+  re-authorized from the tapper's verified Telegram id against their own trips,
+  so a forged payload selects nothing a typed `/switch <slug>` could not, and a
+  signature would protect nothing. Signed, expiring actions remain the rule
+  wherever the payload itself carries authority — signup approval, enrollment.)*
 - Keep intake, organizer-private and group-chat sessions/policies separate.
   Add the private owner-only Super Bot for redacted alerts and narrow
   plan/approve/execute operations. Dedicated-bot support remains optional.
@@ -1313,9 +1362,7 @@ Build:
   path work — the MCP tools stopped taking a chat id the agent provably cannot
   know, and the interview is addressed by the router's open turn instead. That
   is correct for **one organizer at a time**: two concurrent interviews resolve
-  ambiguously and are refused, by design. Making it correct for many is
-  `docs/interviewer-lifecycle-design.md`, scheduled as Sprint 6.5, and its
-  seven decision points are to be settled after Sprint 5 closes.
+  ambiguously and are refused, by design. *(Superseded 2026-09-09. The agent-less interview (`docs/interview-without-an-agent.md`, live by default since 2026-09-09) took the agent out of the default path. There is no open turn to resolve, and concurrent interviews are kept apart by chat (`intake_sessions_live_chat_idx`, migration 0049). The one-at-a-time limit survives only on the agent path, which ends when that document's §8 benchmark lets Hermes leave the intake path. The per-interview-profile design is archived at `docs/archived/interviewer-lifecycle-design.md`.)*
 
 Automated tests:
 
@@ -1410,27 +1457,105 @@ own completeness check. Not met while the SOUL gap above stands.
 **Goal:** complete the end-to-end lifecycle and prove operations can safely
 observe, pause and recover it.
 
+> **How this work is organised — five tracks (2026-09-19).** The build list
+> below is unchanged and remains the authority on *what* Sprint 6 delivers. It is
+> executed as five tracks with different goals, audiences and shipping cadences,
+> defined in **`docs/sprint6-tracks.md`** — read that before picking anything up.
+>
+> | Track | Goal | Ships |
+> |---|---|---|
+> | 1 — Trip UI/UX | Day-of usefulness for the traveler | site items continuously; transformer items to one pilot trip, then the fleet |
+> | 2 — Landing page, accounts, monitoring, data | Does the product actually work? | to the VM at sprint end, via `kinerary-cp-release` |
+> | 3 — Model efficiency and cost | Make model spend real, predictable, attributable | harness → recommendation → instrumentation |
+> | 4 — Housekeeping | Truthful backlog, live trips stop breaking, clean tree, docs aligned | front-loaded, then small |
+> | 5 — Exit gate | Prove the lifecycle end to end | last |
+>
+> Where this section's own bullets land: the verification aggregator, the
+> dashboard, the runbook, the outcome events, the daily report and the
+> missing-information control loop are all **track 2**; the demo rehearsal, the
+> `japan-2026` full cycle and the automated test list are **track 5**; the
+> activation bullet stays superseded. **Nothing in this build list is track 1, 3
+> or 4** — those fill from the Sprint 5 carry-forward, the §4.5 enrichment
+> residue and the open issue list, and the added and removed items are recorded
+> in `docs/sprint6-tracks.md` rather than edited into this section.
+>
+> The tracks are meant to **run in parallel**; that file names the few places
+> they contend — chiefly migration numbering, PR #92 gating the model work, and
+> provisioning infrastructure being single-threaded.
+
+
 Build:
 
-- Implement a verification aggregator requiring release compatibility,
+- **Implement a verification aggregator requiring release compatibility,
   runtime/service health, rendered trip data, MCP/context/profile isolation,
-  messaging binding and backup checkpoint before `ready_private`.
+  messaging binding and backup checkpoint before `ready_private`. — BUILT
+  (2026-10-03).** PR #343: `control_plane_worker/verification.py`, six named
+  checks, each recorded as a `control_plane.verification_evidence` row every
+  run. **Hard-gated** (block `ready_private` on failure): release
+  compatibility, runtime health, rendered trip data — the last reviewed twice
+  after the initial build: round 1 added a roster-identity comparison (a
+  misrouted or stale deployment could otherwise pass against another trip's
+  data), round 2 added a second comparison against the deploying plan's own
+  departure/return date, via a new unauthenticated route,
+  `GET /api/config/deployment-identity` (`server/server.js`) — roster alone
+  doesn't distinguish two trips for the *same* family. **Recorded as an
+  honest `skipped`, not faked:** `mcp_isolation` and `messaging_binding`
+  cannot be truthfully checked before `_attach_companion` runs, which happens
+  *after* the `ready_private` commit by deliberate, incident-dated design
+  (2026-09-06, 2026-09-20); both get a real, informational (non-blocking)
+  pass right after attach instead. **Cut, and currently unowned:**
+  `backup_checkpoint` has no mechanism to check against anywhere in this
+  codebase — no `backup_checkpoints` table, no per-trip snapshot or backup
+  event exists — so it is recorded as a permanent, honest `skipped` rather
+  than a fabricated pass, per the module's own docstring. No sprint or issue
+  currently owns building that mechanism; see Decisions needed.
 - Generate a separate, expiring activation plan with the exact logical
   hostname/TLS/upstream intent. Apply it only from a distinct approval.
-- Add super-admin lifecycle dashboard: funnel/state, jobs/blocked actions,
+- **Add super-admin lifecycle dashboard: funnel/state, jobs/blocked actions,
   release/resource versions, redacted failures, health, audit trail and
-  bounded analytics. Add suspend/retry controls with server-side authorization.
-  This dashboard stays **operator-only**. The **organizer-facing** view — the
-  landing SPA now in-tree at `web/` — reads the same aggregator but through a
+  bounded analytics. Add suspend/retry controls with server-side
+  authorization. — BUILT, operator-only half (slice 1: read-only
+  `/v1/admin/*` + one operator page, PR #275, merged 2026-09-27; slice 2:
+  suspend/retry, PR #348, merged 2026-10-03).** Per `docs/sprint6-tracks.md`
+  decision 23: built in two slices, "built as specified" kept, only the order
+  changed. Slice 2 adds `control-plane/api/src/admin-mutations.ts` and
+  migration `20261003060350_trip_suspend.sql`
+  (`control_plane.trip_suspension_history`, a durable, dashboard-excluded
+  record of every suspension reason, kept separate so resume never erases
+  it). Suspend is deliberately narrow — it pauses job *claiming* for the
+  trip only; it does not touch the live site or its data, and does not stop
+  the relay engaging the trip's companion (the migration's own comment calls
+  wiring the relay to this flag a real future option, not this slice's
+  scope). Went through a boundary review (findings fixed before merge: a
+  race between job claiming and suspend, malformed-id audit-log pollution, a
+  Unicode control-character validation gap, and an unaudited refusal path)
+  and two further rounds of review after that: round 1 found admin Retry
+  created a job but never queued it (left stuck `pending_approval`) — fixed
+  by having `retryTripViaAdmin` issue the approval itself; round 2 found
+  resume was permanently erasing the suspension justification — fixed by the
+  new history table above. This dashboard stays **operator-only**. The
+  **organizer-facing** view — the landing SPA now in-tree at `web/` — reads
+  the same aggregator but through a
   separate, organizer-scoped projection and its own auth surface. Whether that
   projection is built here (cheap once the aggregator exists) or deferred to
   the post-MVP web track is an open decision — see §5's Landing SPA note
   (points 1–2), `docs/landing-page-plan.md`,
   `docs/web-control-plane-integration-plan.md`.
-- Document a runbook for failed provisioning, stale worker lease, failed
+- **Document a runbook for failed provisioning, stale worker lease, failed
   activation, cleanup, upgrade rehearsal and rollback. No automatic
-  destructive rollback.
-- Emit the assistant-experience **outcome** events defined in
+  destructive rollback. — BUILT (2026-10-04).** `docs/control-plane-ops-runbook.md`.
+  Per `docs/sprint6-tracks.md`'s "Monitoring" section, cleanup and
+  upgrade/rollback were already covered elsewhere (`teardown-trip.py`,
+  `kinerary-cp-release`) and are linked rather than duplicated; failed
+  activation has no runbook because activation itself is superseded (see
+  above). Writing the failed-provisioning and stale-lease sections surfaced
+  a real gap, now fixed: `recoverStaleLeases` — described in its own code
+  comments as "the real safety net" for a worker that dies mid-job — was
+  never actually called outside a test. A dead worker's job stayed `leased`
+  forever. It now runs on a 2-minute timer in the API process
+  (`server.ts`), unconditionally, the same pattern every other background
+  loop there already uses.
+- **Emit the assistant-experience outcome events defined in
   `trip-assistant-experience-metrics.md` — grounded, partial and
   missing-data answers, unanswered group mentions, organizer follow-up
   requested/answered, post-write verification passed/failed — inside the base
@@ -1439,15 +1564,58 @@ Build:
   rate, traveler self-service rate and post-write trust rate from them, grouped
   by trip, phase, day, channel, user role and topic so a quality problem can be
   attributed to platform reliability, website data gaps, organizer workflow
-  friction or assistant behaviour.
+  friction or assistant behaviour. — The assistant-side (Hermes) half is BUILT
+  (2026-10-03); the bullet as a whole is still partial.** The relay-side half
+  (base event envelope, response rate) was already built in an earlier,
+  separate PR before this round of work, per issue #177, PR #181 (merged
+  2026-09-25) — no change here. This round, PR #347 adds the assistant-side
+  half: a new Hermes plugin (`.agents/hermes-plugins/assistant-events/`) and
+  an authenticated ingest route, `POST
+  /internal/assistant-events/tool-outcomes`
+  (`control-plane/api/src/hermes-ingest.ts`). The brief's implied outcome
+  name "answered" is permanently banned by an existing guardrail test
+  (`analytics/contract.ts` refuses the literal word `answered` for any
+  source, forever); the actual name shipped is `grounded_answer`, which the
+  derived-rate name `grounded_answer_rate` (already named in
+  `analytics/rates.ts` before this PR, as a `not_measurable` placeholder)
+  already anticipated. **Outcome vocabulary shipped so far is narrower than
+  this bullet's full scope:** `tool_call_completed` currently carries only
+  `grounded_answer` and `failed_tool` (`analytics/contract.ts`) — a distinct
+  `missing_data` outcome is split out of `failed_tool` only by PR #351 (open,
+  not yet merged; see the missing-information bullet below), and no outcome
+  exists yet for "partial", organizer follow-up requested/answered, or
+  post-write verification passed/failed. **Off by default everywhere**
+  (`ASSISTANT_EVENTS_ENABLED` unset; not enabled in any deployment). Of the
+  five derived rates, only response rate is computed from real events today;
+  `grounded_answer_rate` and `missing_data_rate` move off `not_measurable`
+  only once PR #351 merges; traveler self-service rate and post-write trust
+  rate have no event source at all yet and stay `not_measurable`, per this
+  section's own automated-test requirement (an unmeasured rate must say so,
+  never fabricate a number).
 - Add the daily control-plan report to the dashboard: usage, value delivered,
   information quality, learning and enrichment, and organizer enablement —
   including the top missing items to request and the traveler value each one
   unlocks.
-- Implement the missing-information control loop: detect a missing fact while
+- **Implement the missing-information control loop: detect a missing fact while
   answering, convert it into a focused organizer request naming the smallest
   artifact that unlocks the most value, and track whether the request was
-  fulfilled.
+  fulfilled. — Narrowed scope BUILT and merged (PR #351, 2026-10-03).** Per
+  `docs/sprint6-tracks.md` decision 22, the loop was cut for Sprint 6 to:
+  detect a missing fact, record it, and show the top missing items in the
+  daily report; the focused organizer request and tracking whether it was
+  fulfilled move to the next sprint — that narrowing, not this update, is
+  what is built. The narrowed scope is on PR #351
+  (`feat/missing-info-control-loop`, merged as `ed7709a`): a new
+  `missing_data` outcome on `tool_call_completed` events
+  (split out of what used to be folded into `failed_tool`), a new required
+  `tool_name` field, `grounded_answer_rate`/`missing_data_rate` in
+  `analytics/rates.ts` moving off `not_measurable` to real computed rates,
+  and the "Top 3 missing items to request from the organizer" line in the
+  daily report (`analytics/report.ts`) going from a hardcoded "no data
+  recorded" to a real ranked list. **Not built, and not claimed here:** the
+  organizer-request-generation and fulfillment-tracking thirds of this
+  bullet as originally written — those are explicitly deferred to next
+  sprint per decision 22, unchanged by this PR.
 
 Automated tests:
 
@@ -1465,42 +1633,34 @@ Automated tests:
 
 Manual tests:
 
+> **Superseded (decision 27, `docs/sprint6-tracks.md`, 2026-09-26).** The
+> `japan-2026` re-provision below, the activation rejection rehearsal and the
+> activation approval replay/expiry test are **dropped** — `japan-2026`
+> collided with the live trip's own slug and dates, and the activation design
+> itself is superseded (see the bullet above). The deliberately-failed
+> health check and the worker-restart-before-a-clean-retry steps **stay**.
+> What replaces the re-provision: a full-cycle run of the `multi` or `manual`
+> scenario on a **fresh** container proves the same thing — no hand-seeded
+> state anywhere in the row — without needing a live slug at all, and this
+> now also runs nightly on the Mac (`~/kinerary-nightly`). **That half is
+> proven: `scripts/preflight-deploy.sh --deploy --auto --scenario multi
+> --cleanup` went fully green end to end on 2026-10-04** (signup → interview
+> → document extraction → provisioning → the verification gate → site
+> content/venue/booking checks → companion + trip-mcp), on a freshly
+> allocated container (vmid 105), with the row the pipeline actually
+> produced. **Not yet exercised:** the deliberately-failed-health-check and
+> worker-restart-before-a-clean-retry rehearsal that decision 27 keeps in
+> scope — `test_verification.py` covers the unit-level shape of a failed
+> health check, but no run has yet restarted the worker mid-job and watched
+> it claim and retry cleanly.
+
 - perform the complete demo rehearsal with two people: organizer executes
   signup/interview/confirm/group actions; super-admin reviews the two approval
   gates and observes the dashboard;
-- test an activation rejection, a deliberately failed health check and a
-  worker restart before approving a clean retry;
+- test a deliberately failed health check and a worker restart before
+  approving a clean retry;
 - after success, open the non-production trip URL, exercise a safe companion
   request, verify monitoring, then suspend/archive and run labelled cleanup.
-- **Re-provision `japan-2026` through the full cycle onto a fresh
-  control-plane-managed container** (decided 2026-09-02). This is the first
-  trip to go end to end — signup → interview → intake → plan → approve →
-  provision → verify → activate — with no hand-seeded state anywhere in it.
-
-  The reason it is worth doing on *this* slug: the compute half already works
-  for it and the intake half never ran. `LxcProvisionAdapter` really did
-  allocate vmid 101 at `192.168.0.60` and write its `topology.yaml`, and the
-  container is serving on both the LAN and `japan-2026.ara-united.store`. But
-  the trip row is `trip_japan2026seed0000000000000a`, hand-seeded with empty
-  `title`, `destination_label`, `start_date` and `end_date` so the Sprint 5
-  router had a binding target for the live group test. A full cycle replaces
-  that stub with a row the pipeline actually produced, which is precisely the
-  "without manual database changes" clause in the exit gate below.
-
-  Three things to get right when it runs:
-
-  - **Provision onto a NEW container, not vmid 101.** Do not add `japan-2026`
-    to `PROVISIONER_VMID_MAP` to force reuse — a static entry means "legacy,
-    hand-provisioned", and using one here would skip the very allocation path
-    under test. Let Phase G allocate the next free IP in the 60-99 pool.
-  - **The existing container and its chat binding are LIVE.** A real family
-    supergroup is bound to the seed trip. Cutting over means a reviewed
-    reassignment, which is still unbuilt (see Sprint 5's "who closes a
-    binding"), so plan the binding move explicitly rather than letting the
-    provisioner attempt it — `bind_chat_to_trip` refuses to move a chat to a
-    different trip by design, and correctly so.
-  - **Keep the old container until the new one verifies**, then run labelled
-    cleanup on it. Two trips must not answer on one hostname mid-cutover.
 
 Exit gate: the complete demo script passes, its evidence is retained, cleanup
 is verified, and the team can repeat the run without manual database changes.
@@ -1598,93 +1758,9 @@ cutover:
   `.lan` zone.
 
 
-### Sprint 6.5 — Ephemeral interviewer, deterministic orchestrator, judging loop
+### Sprint 6.5 — Ephemeral interviewer, deterministic orchestrator, judging loop — WITHDRAWN (superseded 2026-09-09)
 
-**Full design, A/B and decision points: `docs/interviewer-lifecycle-design.md`.**
-Proposed by Dror 2026-09-03 after the first live end-to-end interview failed.
-Sequenced after Sprint 5 deliberately — Sprint 5 ships an interim that is
-correct for one organizer at a time; this is what makes it correct for many.
-
-**Goal:** give the agent layer the lifecycle every other part of the pipeline
-already has. An interviewer is rendered per interview, holds no state, is
-destroyed at handover, and every interview — finished or abandoned — is
-measured and judged.
-
-**Why, in one line:** on 2026-09-03 the deterministic layer did everything
-right and the interview still failed, because the profile had drifted for
-months, described a flow that no longer existed, and inherited another
-conversation's session. None of those are bugs code review could catch; they
-are properties of long-lived hand-maintained state.
-
-Build:
-
-- **Interview lifecycle in the control plane** — `pending → rendered →
-  interviewing → { confirmed | abandoned } → judged → reaped`, owned by the
-  existing worker. Deterministic: create, render, hand over, destroy, TTL,
-  sweep. No LLM decides a transition.
-- **Per-interview rendered profile**, reusing the provisioner's existing
-  `RenderProfileAdapter`. The chat id and session id are baked in at render
-  time — which is what makes the agent's write path work at all, since the
-  agent provably cannot learn its own chat id (verified 2026-09-03: nothing
-  renders it into the prompt). Note `source.profile` resolves via
-  `profile_exists()` on disk, NOT the allowlist, so this needs no allowlist
-  edit and no gateway restart per interview.
-- **Abandonment tracking** — today an organizer who stops answering leaves a
-  row in `interviewing` forever, indistinguishable from one still in progress.
-  Record where they stopped.
-- **Interview metrics**, folded into `docs/trip-bot-analytics-and-metrics-design.md`
-  §7/§8 with bounded labels: started/completed/abandoned, abandoned-at-question
-  (the drop-off point), duration by outcome, answers-recorded, unclosed turns,
-  write failures by reason, corrections per question.
-  `interview_answers_recorded_total` is the one that would have made the
-  2026-09-03 failure visible — a turn opened, zero answers written, and the
-  session declared complete.
-- **Judge agent (strong model), offline** — never in the organizer's path, so
-  it may be slow and expensive. Runs on abandoned interviews too, since that is
-  where the material is. Emits: what went wrong, whether the fault was
-  template/model/pipeline, a proposed template diff with rationale, and a
-  survey across recent interviews for the super admin.
-- **Gated template promotion** — the judge proposes, a human promotes, through
-  the candidate → eval → promotion shape the release pipeline already uses. A
-  judge editing the live template unattended reproduces the 2026-09-03 failure
-  mode with a faster loop.
-- **Localised question catalogue on the same loop (#41).** All 23 prompts and
-  every option label are literal English strings today. Localising them needs
-  per-language files plus an agent that realigns the others when the English
-  source changes — which is the judge loop with a different input, so it shares
-  the mechanism rather than growing a second one. `option_id` is NEVER
-  translated: ids land in the immutable intake and are what the transformer
-  reads, so only labels vary. A language file whose source has moved is worse
-  than a missing one, because nothing looks wrong — the organizer is simply
-  asked last month's question, so staleness has to be a gate condition.
-
-Automated tests:
-
-- lifecycle transitions, including TTL-driven abandonment and idempotent reap;
-- a rendered interviewer profile carries its chat/session binding and cannot be
-  rendered without one;
-- two concurrent interviews render two profiles and neither can read or write
-  the other's intake (the two-trip matrix shape, at profile level);
-- abandonment is recorded with the question the organizer stopped at;
-- metrics labels stay within `INTAKE_QUESTIONS` (bounded-label rule);
-- a judge-proposed template change cannot reach the live template without an
-  explicit promotion.
-
-Manual tests:
-
-- a real interview abandoned halfway shows the correct drop-off question;
-- the judge's suggestions on that interview are actionable by the super admin;
-- an organizer starting a second trip gets a genuinely fresh interviewer.
-
-**Open decision points before this can start** — all eight are stated in full
-in `docs/interviewer-lifecycle-design.md`, and each changes the shape of the
-build: whether the ephemeral path replaces or coexists with the shared one;
-the interview TTL and whether "abandoned" is terminal or resumable; who may
-promote a template change and against what eval; how much transcript the judge
-may see and for how long; per-interview vs batched judging; whether the render
-step reuses the provisioner's adapter; whether the judge owns translation alignment or that is a
-separate lane (#41); and whether the un-namespaced session id is worth fixing
-upstream for the long-lived companion profiles that keep it.
+Archived design: `docs/archived/interviewer-lifecycle-design.md`. It was proposed to give a Hermes interviewer a lifecycle. `docs/interview-without-an-agent.md` removed the interviewer instead, so most of this sprint has nothing left to act on: per-interview rendered profile, chat id written into it, render/destroy lifecycle — rejected (no agent on the default path; `SESSION_NOT_AGENT_WRITABLE` in app.ts); lifecycle and TTL — idle expiry with a warning (migration 0049), orthogonal to `state` by decision; concurrency — kept apart by chat on the default path, still refused (409 AMBIGUOUS) on the agent path until Hermes leaves the intake path (§8 benchmark); localised question catalogue (#41) — built as `intake-copy.ts` (en/he) with completeness tests; template promotion — interview behaviour is code, so promotion is a reviewed commit plus `kinerary-cp-release`. **Still open, not scheduled here:** (1) unfinished-interview measurement (the question people stop at, and outcome by duration) — a requirement (Dror, 2026-09-09) whose shape is undecided, homed in `docs/interview-without-an-agent.md` §8b, partial coverage today in `fleet-mcp.mjs` `statistics`/`stalled_interviews` — **owned by Sprint 6 Track 2 (Dror, 2026-09-25; see `docs/sprint6-tracks.md`)**; (2) an offline judge of interview transcripts that proposes interview changes — not built, not restated since the agent-less switch (restated 2026-09-25 as issue #198, to be designed together with #117's pre-summary judge; see `docs/sprint6-tracks.md`, track owner undecided); it is not `plan-review.ts` (which judges a deployed plan) and not #117's pre-summary pass (which judges one interview's content in the organizer's path) — the owner decides whether it is still wanted; (3) un-namespaced Hermes session ids for companion profiles — a companion concern, homed with the companion work.
 
 ### Sprint 7 — Post-trip debrief and reviewed learning
 
@@ -1840,12 +1916,23 @@ that branch) so it evolves on this line rather than diverging. The SPA ships
 here **ahead of its control-plane wiring**: the endpoints it calls
 (`web/src/api.ts`) are not yet mounted on this branch's control-plane API.
 Until then the SPA builds and tests in isolation (its own CI job) but is not
-wired to a live control plane. Landing-spa's parallel early control-plane
+wired to a live control plane.
+
+**Superseded 2026-09-19 — the wiring landed.** `control-plane/api/src/portal.ts`
+mounts every endpoint `web/src/api.ts` calls, registered from `app.ts` whenever
+`profile.web` is configured, with `portal.test.ts` and `portal-db.test.ts`
+covering it. The paragraph above describes the branch as it was; it is kept
+because the *decisions* after it are still open, but the SPA is wired. What is
+genuinely missing is narrower: the richer trip-card model and the action surface
+in `docs/web-control-plane-integration-plan.md` §8, and organizer email/password
+signup (four of its nine account endpoints exist).
+
+Landing-spa's parallel early control-plane
 implementation (`portal.ts`, `runtime-gateway/`, a second `0021` migration) is
 deliberately **not** merged — this branch's Sprints 1–4.5 control-plane is
 authoritative.
 
-Three connection points between the SPA and the control plane are **open
+Four connection points between the SPA and the control plane are **open
 future decisions**. They are recorded here so they are not lost; each is
 revisited in a dedicated post-MVP web track *unless* the note below says a
 coming sprint is the right place to start it:
@@ -1874,6 +1961,18 @@ coming sprint is the right place to start it:
    intake flow is a smaller addition there than as its own track. What starts
    the intake (the SPA vs. the Telegram router) and where the organizer's
    verified chat id is captured are the sub-decisions.
+4. **A Telegram Mini App over the same console** *(raised 2026-09-10)*. A mini
+   app managing trips is the SPA's pages in a Telegram webview over
+   `portal.ts`'s existing organizer-scoped read model — which is why it is
+   recorded here rather than as its own thing. It is a **discussion, not a
+   plan**, and it has one blocking question ahead of any estimate: a mini app
+   authenticates by verifying `initData`, which is Telegram-derived web
+   authentication, and this deployment retired exactly that
+   (`/v1/auth/telegram` → 410, and Telegram SSO is permanently ruled out). The
+   retired path was a *per-trip site* widget and the structural objection may
+   not carry over to one bot and one control-plane origin — but that is a
+   ruling for Dror, not an inference. Discussion and the remaining open
+   questions: `docs/trip-bot-command-surface.md` §10.
 
 After the MVP, connected services should arrive in separately reviewed tracks:
 

@@ -32,14 +32,21 @@ import {
   renderQuestion,
   resolveChatRoute,
   startFromDeepLink,
+  type ChatRoute,
   type InlineKeyboard,
   migrateChatBinding,
   companionIntroFacts,
   companionIntroLoginUsernames,
   resolveTripPerson,
+  renderTripList,
+  resolveChatLanguage,
+  tripDisplayName,
+  consumeExpectsReplyWindow,
 } from "../chat-router.js";
+import { listOrganizerTrips, switchChatToTrip, type OrganizerTrip } from "../organizer-trips.js";
 import { isAddressedToAssistant } from "./addressing.js";
-import { coerceLanguage, uiString } from "../intake-copy.js";
+import { classifyTrigger, inboundFacts, type InboundFacts } from "../analytics/relay-facts.js";
+import { coerceLanguage, uiString, type Language } from "../intake-copy.js";
 import {
   companionHelpText,
   groupBindingCommand,
@@ -60,6 +67,7 @@ import {
   attachMedia,
   botJoinedGroup,
   describeAttachment,
+  mapChatType,
   migrationOf,
   normalizeUpdate,
   toWireEventWithMedia,
@@ -69,8 +77,14 @@ import {
   type TelegramUpdate,
 } from "./normalize.js";
 import type { HeldAttachment, PendingAttachments } from "./pending-attachments.js";
+import type { GroupContext } from "./group-context.js";
 import { getSessionForChat, setFinishRequestedForChat, type SessionView } from "../interview.js";
-import type { WireMessageEvent } from "./protocol.js";
+import { organizerDocumentRoute } from "../document-correction.js";
+import { visionProcessingConfig } from "../document-vision.js";
+import { digestTelegramId } from "../identity.js";
+import type { StructuredModelRunner } from "../model-runner.js";
+import { handleModelCommand, isSwitchableRunner } from "../model-task-settings.js";
+import type { ChatType, WireMessageEvent } from "./protocol.js";
 
 /** A message the connector should send itself, rather than routing to an agent. */
 export interface DirectReply {
@@ -81,9 +95,12 @@ export interface DirectReply {
 
 export type DispatchDecision =
   /** Hand this turn to the Hermes gateway as an `inbound` frame. */
-  | { kind: "to_gateway"; event: WireMessageEvent }
-  /** The connector answers this one itself. */
-  | { kind: "reply"; reply: DirectReply }
+  | { kind: "to_gateway"; event: WireMessageEvent; analytics?: InboundFacts }
+  /**
+   * The connector answers this one itself. `analytics` is set only on the
+   * companion-unreachable answer, which is a lost turn (#177).
+   */
+  | { kind: "reply"; reply: DirectReply; analytics?: InboundFacts }
   | {
       /**
        * The bot has just been added to a group bound to a trip: send the
@@ -108,6 +125,22 @@ export type DispatchDecision =
     }
   /** The organizer typed /done or /summary — show the recap, whatever else is going on. */
   | { kind: "show_summary"; chatId: string; view: SessionView }
+  /**
+   * A tapped button the ROUTER has already acted on, with the sentence saying
+   * what happened.
+   *
+   * Distinct from `reply` because a callback query must also be answered, or
+   * Telegram leaves the button spinning on the organizer's phone for as long
+   * as it takes them to give up on it.
+   */
+  | {
+      kind: "callback_reply";
+      chatId: string;
+      callbackQueryId: string;
+      text: string;
+    }
+  /** A tap that is answered (the spinner stops) and gets NO message in the chat. */
+  | { kind: "callback_ack"; callbackQueryId: string; text: string }
   /** A tapped inline button that belongs to the interview flow. */
   | {
       kind: "interview_callback";
@@ -159,10 +192,32 @@ export type DispatchDecision =
        */
       hadAttachment: boolean;
     }
+  /**
+   * A document the organizer sent their companion after the trip was
+   * confirmed. Read and PROPOSED, never written — see document-correction.ts.
+   */
+  | {
+      kind: "document_correction";
+      chatId: string;
+      tripId: string;
+      sessionId: string;
+      language: Language;
+      event: WireMessageEvent;
+      analytics?: InboundFacts;
+    }
+  /** The organizer's Approve / Keep on one of those proposals. */
+  | {
+      kind: "correction_callback";
+      chatId: string;
+      callbackQueryId: string;
+      proposalId: string;
+      choice: "approve" | "reject";
+      fromId: string;
+    }
   /** A signup-approval callback — the pre-existing telegram-poller path. */
   | { kind: "approval_callback"; callbackQueryId: string; data: string; fromId: string }
   /** Nothing to do. */
-  | { kind: "ignore"; reason: string };
+  | { kind: "ignore"; reason: string; analytics?: InboundFacts };
 
 /**
  * Who the assistant is on this platform, for the group relevance gate.
@@ -298,6 +353,14 @@ export interface DispatchOptions {
    */
   pendingAttachments?: PendingAttachments;
   /**
+   * What the family said in a group while nobody was addressing the assistant,
+   * carried onto the next message that does. Owned by the poller for the same
+   * reason as the attachments above: it has to outlive one update. Absent,
+   * unaddressed turns are simply forgotten, which is the behaviour before
+   * 2026-09-20.
+   */
+  groupContext?: GroupContext;
+  /**
    * Whether a trip's companion gateway is connected right now.
    *
    * Injected rather than looked up so the router keeps its property of
@@ -320,6 +383,87 @@ export interface DispatchOptions {
   groupIntroIncludesPassword?: boolean;
   /** How long a group-binding token stays valid. Defaults to a week. */
   groupBindingTtlSeconds?: number;
+  /**
+   * The signup super admin, as the subject digest approvals are checked
+   * against. Absent means nobody may switch models from a chat.
+   */
+  superAdminSubjectDigest?: string;
+  /** The relay's runner. `/model` can switch it only when it is switchable. */
+  modelRunner?: StructuredModelRunner;
+  /**
+   * Attach an `analytics` descriptor — metadata only, see
+   * analytics/relay-facts.ts — to the companion-route decisions, for the
+   * relay's assistant events (#177). Absent or false, the default: every
+   * decision is exactly what it was before this option existed, and no extra
+   * lookup is made. True adds one read (the sender's trip person link) for an
+   * unaddressed group message and one (the chat's route) for a
+   * companion-unreachable answer; a failed read drops the descriptor, never
+   * the decision.
+   */
+  assistantEvents?: boolean;
+  /**
+   * Per-chat limit on the generic "assistant is down" line. Absent, the relay
+   * process's own is used; tests pass a fresh one.
+   */
+  outageNotices?: OutageNoticeLimiter;
+  /**
+   * The organizer's private-chat document route (#178) — a file the organizer
+   * sends after confirmation, read by the relay and proposed back to them,
+   * whose Approve re-provisions the site. ON only when exactly `true`, which
+   * the relay passes only for ORGANIZER_DOCUMENT_ROUTE_ENABLED=1
+   * (document-correction.ts). Absent or false, the default: such a file takes
+   * the companion route, exactly as before #178.
+   */
+  organizerDocumentRoute?: boolean;
+}
+
+/**
+ * At most one "the assistant is down" line per chat per window (#179).
+ *
+ * In memory, in the relay process, bounded: the oldest chat is evicted first.
+ * A relay restart forgets it and may repeat one line - accepted, because the
+ * alternative is a table for a courtesy. Deliberately a small object with one
+ * question (`allow`) and a clock, so an outage-state design (#187: tell the
+ * organizer once per outage, recover, escalate) can replace it without
+ * touching the router.
+ */
+export class OutageNoticeLimiter {
+  static readonly WINDOW_MS = 10 * 60 * 1000;
+  static readonly MAX_CHATS = 1000;
+  private readonly lastSent = new Map<string, number>();
+  private readonly now: () => number;
+
+  constructor(options: { now?: () => number } = {}) {
+    this.now = options.now ?? Date.now;
+  }
+
+  /** True, and starts the window, when this chat may be told now. */
+  allow(chatId: string): boolean {
+    const at = this.now();
+    const last = this.lastSent.get(chatId);
+    if (last !== undefined && at - last < OutageNoticeLimiter.WINDOW_MS) return false;
+    // Re-insert so Map order is "told longest ago first".
+    this.lastSent.delete(chatId);
+    this.lastSent.set(chatId, at);
+    while (this.lastSent.size > OutageNoticeLimiter.MAX_CHATS) {
+      const oldest = this.lastSent.keys().next().value;
+      if (oldest === undefined) break;
+      this.lastSent.delete(oldest);
+    }
+    return true;
+  }
+}
+
+/** The relay process's own, used when a caller supplies none. */
+const processOutageNotices = new OutageNoticeLimiter();
+
+/** Whether a message replies to something the assistant itself sent. */
+function repliesToAssistant(message: TelegramMessage, botIdentity: BotIdentity): boolean {
+  const repliedTo = message.reply_to_message?.from;
+  if (!repliedTo) return false;
+  // Precise when we know our own id: a reply to some OTHER bot in the group is
+  // not a reply to us.
+  return botIdentity.id ? String(repliedTo.id) === botIdentity.id : Boolean(repliedTo.is_bot);
 }
 
 export async function dispatchUpdate(
@@ -330,7 +474,7 @@ export async function dispatchUpdate(
   botIdentity: BotIdentity = {},
   options: DispatchOptions = {},
 ): Promise<DispatchDecision> {
-  if (update.callback_query) return dispatchCallback(db, update);
+  if (update.callback_query) return dispatchCallback(db, update, log);
 
   // Added to a group. If that group is already bound to a trip, this is the
   // companion's arrival and it introduces itself; if it is not, saying so is
@@ -406,7 +550,7 @@ export async function dispatchUpdate(
         if (!outcome.view.nextQuestion) {
           return { kind: "reply", reply: { chatId, text: strings.badLink } };
         }
-        const rendered = renderDocumentOffer(outcome.view.language);
+        const rendered = renderDocumentOffer(outcome.view.language, outcome.returning);
         return {
           kind: "reply",
           reply: { chatId, text: rendered.text, replyMarkup: rendered.replyMarkup ?? undefined },
@@ -434,6 +578,27 @@ export async function dispatchUpdate(
           },
         };
     }
+  }
+
+  // `/models` and `/model`: which model serves each task, switched at runtime.
+  //
+  // The super admin only, in their own DM with the bot, identified by the
+  // Telegram sender id Telegram itself delivered — the same digest signup
+  // approvals are checked against, never anything written in the message. For
+  // anyone else, or anywhere else, this branch does not exist: the command falls
+  // through to the answer every other unknown command gets, so asking reveals
+  // nothing about who may switch models or that anyone can.
+  if (
+    parsed.kind === "command"
+    && (parsed.name === "model" || parsed.name === "models")
+    && message.chat?.type === "private"
+    && options.superAdminSubjectDigest
+    && message.from?.id !== undefined
+    && digestTelegramId(String(message.from.id)) === options.superAdminSubjectDigest
+  ) {
+    const runner = isSwitchableRunner(options.modelRunner) ? options.modelRunner : undefined;
+    const text = await handleModelCommand(db, runner, parsed, options.superAdminSubjectDigest, log);
+    return { kind: "reply", reply: { chatId, text } };
   }
 
   // A way to the summary that depends on nothing else working.
@@ -599,6 +764,60 @@ export async function dispatchUpdate(
     };
   }
 
+  // "Which trips are mine, and which one is this chat on?" — the two questions
+  // a shared bot otherwise gives an organizer no way to ask. See
+  // organizer-trips.ts for why the answer is derived from the sender's
+  // verified Telegram id rather than from anything typed.
+  if (
+    parsed.kind === "command" &&
+    (parsed.name === "trips" || parsed.name === "switch" || parsed.name === "select")
+  ) {
+    const senderId = message.from?.id === undefined ? null : String(message.from.id);
+    const language = await resolveChatLanguage(db, chatId, message.from?.language_code);
+
+    // DM only, both commands. For /trips because the list would expose trips
+    // the rest of the room has no claim to; for /switch because a group's
+    // binding belongs to the family, not to whoever typed — on a shared bot,
+    // one member could otherwise move the room to another organizer's trip.
+    if (message.chat?.type !== "private" || !senderId) {
+      return {
+        kind: "reply",
+        reply: {
+          chatId,
+          text: uiString(parsed.name === "trips" ? "tripsInGroup" : "switchInGroup", language),
+        },
+      };
+    }
+
+    const trips = await listOrganizerTrips(db, senderId, chatId);
+
+    // `/switch <something>` is the only path that takes an argument. Without
+    // one, /switch and /trips are the same thing: the list, with a button per
+    // row. That is deliberate — buttons remove the guessing a typed name
+    // invites. They are NOT signed, by decision (2026-09-13): a payload only
+    // names a row, and the callback branch re-authorizes every tap from the
+    // tapper's verified id, exactly as if they had typed the name.
+    const target = parsed.name === "trips" ? null : resolveTripArgument(trips, parsed.argument);
+    if (!target) {
+      if (parsed.name !== "trips" && parsed.argument) {
+        // They named something, and it is not one of theirs. Same sentence a
+        // non-existent trip gets.
+        log(structuredLog("info", "trip_bot.switch_refused", { reason: "NO_MATCH" }));
+        return { kind: "reply", reply: { chatId, text: uiString("switchRefused", language) } };
+      }
+      const rendered = renderTripList(trips, language);
+      return {
+        kind: "reply",
+        reply: { chatId, text: rendered.text, replyMarkup: rendered.replyMarkup ?? undefined },
+      };
+    }
+
+    return {
+      kind: "reply",
+      reply: { chatId, text: await applySwitch(db, senderId, chatId, target, language, log) },
+    };
+  }
+
   if (parsed.kind === "command" && (parsed.name === "done" || parsed.name === "summary")) {
     const route = await resolveChatRoute(db, chatId);
     if (route.kind === "interview") {
@@ -655,36 +874,87 @@ export async function dispatchUpdate(
     // has to actually address the assistant, or the shared bot answers a
     // family talking among themselves. See addressing.ts for why this cannot
     // be left to Hermes's mention_patterns under the relay.
-    const repliedTo = message.reply_to_message?.from;
-    const isReplyToAssistant = repliedTo
-      ? botIdentity.id
-        // Precise when we know our own id: a reply to some OTHER bot in the
-        // group is not a reply to us.
-        ? String(repliedTo.id) === botIdentity.id
-        : Boolean(repliedTo.is_bot)
-      : false;
+    const isReplyToAssistant = repliesToAssistant(message, botIdentity);
 
-    const addressed = isAddressedToAssistant({
-      chatType: outcome.event.source.chat_type,
-      text: outcome.event.text,
-      assistantNames: outcome.route.kind === "companion" ? outcome.route.assistantNames : [],
-      botUsername: botIdentity.username,
-      isReplyToAssistant,
-    });
+    // Migration 0053: the assistant's own last message here may have asked a
+    // question it wants answered, in which case the VERY NEXT message in this
+    // chat is addressed to it, whoever sends it — no @mention/name/reply-to
+    // needed. Attempted unconditionally, ahead of the ordinary gate below: the
+    // atomic claim also clears the window on a hit, so a second message, even
+    // one still inside the window, finds nothing left to claim (one-shot).
+    // `route.kind === "companion"` is structural, not a real branch here —
+    // normalizeUpdate never reaches this point for an interview or unbound
+    // chat — mirrored only to match the ternary just below it.
+    const capturedAsReply =
+      outcome.route.kind === "companion" ? await consumeExpectsReplyWindow(db, chatId) : false;
+
+    const addressed =
+      capturedAsReply ||
+      isAddressedToAssistant({
+        chatType: outcome.event.source.chat_type,
+        text: outcome.event.text,
+        assistantNames: outcome.route.kind === "companion" ? outcome.route.assistantNames : [],
+        botUsername: botIdentity.username,
+        isReplyToAssistant,
+      });
     const senderId = outcome.event.source.user_id;
+    // #177: the gate's verdict, as metadata. Only ever called through
+    // `withAnalytics`, which never calls it while assistant events are off.
+    // The text is taken here, before anything is prefixed to it.
+    const heardText = outcome.event.text;
+    const routedTripId = outcome.route.kind === "companion" ? outcome.route.tripId : null;
+    const seen = (linkRole: string | null | undefined): InboundFacts => {
+      if (!routedTripId) throw new Error("NOT_COMPANION_ROUTE");
+      return inboundFacts({
+        tripId: routedTripId,
+        // Telegram's own type for the channel; the gate's mapped one for the trigger.
+        telegramChatType: message.chat?.type,
+        trigger: classifyTrigger({
+          addressed,
+          capturedAsReply,
+          chatType: outcome.event.source.chat_type,
+          text: heardText,
+          assistantNames: outcome.route.kind === "companion" ? outcome.route.assistantNames : [],
+          botUsername: botIdentity.username,
+          isReplyToAssistant,
+        }),
+        linkRole,
+        attachmentKind: outcome.attachment?.kind ?? null,
+        textLength: heardText.length,
+      });
+    };
     if (!addressed) {
       // Not for the assistant, so nothing is downloaded. A DOCUMENT is still
       // remembered, by reference, for its sender's next addressed message —
       // "send the file, then say what it is for" is one interaction to the
       // person doing it. Photos are not: in a family group they are the family
       // talking, and a photo followed by an unrelated question is the common case.
+      // Remembered, not delivered. Nothing is sent and no model turn happens;
+      // this only means the NEXT addressed message knows what it is replying
+      // into. Groups only — a DM is addressed by construction, so nothing is
+      // ever dropped there.
+      if (options.groupContext && outcome.event.source.chat_type !== "dm" && outcome.event.text) {
+        options.groupContext.hold(
+          chatId,
+          outcome.event.source.user_name || "someone",
+          outcome.event.text,
+        );
+      }
+      const held = Boolean(options.pendingAttachments && senderId && outcome.attachment?.kind === "document");
       if (options.pendingAttachments && senderId && outcome.attachment?.kind === "document") {
         options.pendingAttachments.hold(chatId, senderId, outcome.attachment, {
           ...(message.caption ? { caption: message.caption } : {}),
         });
         log(structuredLog("info", "trip_bot.attachment_held", { kind: outcome.attachment.kind }));
       }
-      return { kind: "ignore", reason: "NOT_ADDRESSED" };
+      return {
+        kind: "ignore",
+        reason: "NOT_ADDRESSED",
+        ...(await withAnalytics(options.assistantEvents, log, async () => ({
+          ...seen(senderId && routedTripId ? (await resolveTripPerson(db, routedTripId, senderId))?.role : null),
+          ...(held ? { documentHeld: true } : {}),
+        }))),
+      };
     }
 
     // WHOSE VOICE THIS IS, when the trip knows. `user_name` arrives from
@@ -696,13 +966,88 @@ export async function dispatchUpdate(
     // update carries. Unknown senders keep their Telegram name: it is what
     // their family calls them, and the alternative is a blank where a person
     // should be.
+    let senderLinkRole: string | null = null;
     if (outcome.route.kind === "companion" && outcome.event.source.user_id) {
       const person = await resolveTripPerson(
         db, outcome.route.tripId, outcome.event.source.user_id,
       );
+      senderLinkRole = person?.role ?? null;
       if (person?.displayName) {
         outcome.event.source.user_name = person.displayName;
         log(structuredLog("info", "trip_bot.sender_identified", { role: person.role }));
+      }
+    }
+    // A FILE FROM THE ORGANIZER, AFTER CONFIRMATION, is this relay's to read —
+    // proposed back to them for approval, never handed to the companion to
+    // write onto the site on its own. Only the organizer's own private chat,
+    // from the organizer; a group's or a member's file keeps its route.
+    // ONLY WITH THE ROUTE SWITCHED ON (ORGANIZER_DOCUMENT_ROUTE_ENABLED=1): an
+    // Approve re-provisions the site, which on a live trip is a mid-trip
+    // redeploy. Off — the default — `organizerDocumentRoute` answers null
+    // before anything is downloaded, and the file takes the companion route
+    // below exactly as it did before #178.
+    if (outcome.route.kind === "companion") {
+      const organizer = await organizerDocumentRoute(db, {
+        tripId: outcome.route.tripId,
+        chatId,
+        chatType: message.chat?.type,
+        fromId: message.from?.id === undefined ? undefined : String(message.from.id),
+        // The message's OWN attachment, as normalisation described it. The wire
+        // event has no media yet - `attachMedia` runs only once the turn is
+        // known to go somewhere - so asking it (as this did until #178) was
+        // always "no media", and this route never fired.
+        mediaKinds: outcome.attachment ? [outcome.attachment.kind] : [],
+        hasMedia: outcome.attachment !== null,
+        hasRunner: Boolean(options.modelRunner),
+        canReadImages: visionProcessingConfig(options.modelRunner) !== null,
+        // Strictly `true`: absent — every caller that never heard of the flag —
+        // is off.
+        enabled: options.organizerDocumentRoute === true,
+        log,
+      });
+      // The reader needs the file itself, so re-host it now. A download that
+      // failed leaves nothing to read: fall through to the companion, which
+      // tells the organizer it could not read the file.
+      const readable = organizer && outcome.attachment
+        ? await attachMedia(
+            outcome.event,
+            [{ ...outcome.attachment, ...(message.caption ? { caption: message.caption } : {}) }],
+            options.media,
+          )
+        : null;
+      if (organizer && readable && (readable.media_urls?.length ?? 0) > 0) {
+        return {
+          kind: "document_correction",
+          chatId,
+          tripId: outcome.route.tripId,
+          sessionId: organizer.sessionId,
+          language: organizer.language,
+          event: readable,
+          // The route itself proves the organizer: their own private chat,
+          // from them, on the trip's confirmed interview chat.
+          ...(await withAnalytics(options.assistantEvents, log, () => ({
+            ...seen("organizer"),
+            documents: outcome.attachment ? 1 : 0,
+          }))),
+        };
+      }
+    }
+
+    // The turns this message is a reply INTO. Prefixed onto the text rather
+    // than carried in its own field because the gateway forwards `text` and
+    // nothing else reaches the model — a new inbound field would be ignored
+    // exactly as `expects_reply` was (#122). Clearly fenced and named as
+    // overheard so it reads as background, never as something said to the
+    // assistant or asked of it. Empty when there is nothing to carry, so a
+    // quiet group's turns look exactly as they did before.
+    if (options.groupContext && outcome.event.source.chat_type !== "dm") {
+      const overheard = options.groupContext.take(chatId);
+      if (overheard.length) {
+        const lines = overheard.map((m) => `${m.sender}: ${m.text}`).join("\n");
+        outcome.event.text =
+          `[overheard in the group since you last spoke — background only, not addressed to you]\n` +
+          `${lines}\n[end of overheard]\n\n${outcome.event.text}`;
+        log(structuredLog("info", "trip_bot.group_context_carried", { turns: overheard.length }));
       }
     }
 
@@ -713,7 +1058,16 @@ export async function dispatchUpdate(
         replied: attachments.replied,
       }));
     }
-    return { kind: "to_gateway", event: await attachMedia(outcome.event, attachments.list, options.media) };
+    const forwarded = await attachMedia(outcome.event, attachments.list, options.media);
+    return {
+      kind: "to_gateway",
+      event: forwarded,
+      ...(await withAnalytics(options.assistantEvents, log, () => ({
+        ...seen(senderLinkRole),
+        attachmentsJoined: attachments.joined,
+        documents: (forwarded.media ?? []).filter((m) => m.kind === "document").length,
+      }))),
+    };
   }
 
   switch (outcome.reason) {
@@ -751,11 +1105,139 @@ export async function dispatchUpdate(
     }
     case "UNROUTED":
       return { kind: "reply", reply: { chatId, text: strings.unbound } };
-    case "COMPANION_PENDING":
-      return { kind: "reply", reply: { chatId, text: strings.companionPending } };
+    case "COMPANION_PENDING": {
+      // Two different situations arrive here, and the family is owed different
+      // words for each:
+      //   - the trip has NO companion yet (never installed, or mid-install):
+      //     the honest "still finishing your assistant", said to whoever writes;
+      //   - the trip HAS one and its gateway is not connected right now (an
+      //     outage or a restart): the generic line - and never to a family
+      //     talking among themselves (#179).
+      const route = await resolveChatRoute(db, chatId);
+      const chatType = mapChatType(
+        message.chat?.type,
+        message.is_topic_message === true && message.message_thread_id !== undefined,
+      );
+      // The relevance gate's verdict, once, for the reply decision and for the
+      // record. The expects-reply window is not consulted (claiming it is a
+      // write): during an outage the assistant has said nothing to be replied to.
+      const gate = {
+        chatType,
+        text,
+        assistantNames: route.kind === "companion" ? route.assistantNames : [],
+        botUsername: botIdentity.username,
+        isReplyToAssistant: repliesToAssistant(message, botIdentity),
+      };
+      const addressed = route.kind === "companion" && isAddressedToAssistant(gate);
+      const facts = () => companionPendingFacts(db, route, message, gate, addressed);
+
+      // "Has this trip's assistant ever been announced as up?" - the organizer's
+      // `companion_ready` message, sent only after the companion exists. Without
+      // it a profile is merely stamped: a first-time organizer must not be told
+      // "I'm off for now" about an assistant that has not come up yet. Trips
+      // that predate that message also keep the honest wording during an outage
+      // (the safe direction).
+      const announced = route.kind === "companion" && route.hermesProfile
+        ? await companionAnnounced(db, route.tripId)
+        : false;
+      if (route.kind !== "companion" || !announced) {
+        return {
+          kind: "reply",
+          reply: { chatId, text: strings.companionPending },
+          ...(await withAnalytics(options.assistantEvents, log, facts)),
+        };
+      }
+
+      if (chatType !== "dm" && !addressed) {
+        // Chatter is never answered, outage or not.
+        return {
+          kind: "ignore",
+          reason: "NOT_ADDRESSED",
+          ...(await withAnalytics(options.assistantEvents, log, facts)),
+        };
+      }
+      if (chatType !== "dm" && !(options.outageNotices ?? processOutageNotices).allow(chatId)) {
+        // Addressed, but this chat was told a moment ago. NO analytics on
+        // purpose: an `ignore` carrying facts is recorded as chatter, and this
+        // was a lost turn - an absent event undercounts, a wrong one misleads.
+        return { kind: "ignore", reason: "COMPANION_UNAVAILABLE_NOTICE_LIMITED" };
+      }
+      const intro = await companionIntroFacts(db, route.tripId);
+      return {
+        kind: "reply",
+        reply: { chatId, text: uiString("companionUnavailable", intro?.language === "he" ? "he" : "en") },
+        ...(await withAnalytics(options.assistantEvents, log, facts)),
+      };
+    }
     default:
       return { kind: "ignore", reason: outcome.reason };
   }
+}
+
+/**
+ * The `analytics` field to spread into a decision — or nothing (#177).
+ *
+ * Off, it returns `{}` without calling `build`, so the decision is exactly
+ * what it was before assistant events existed. On, a `build` that throws (a
+ * failed lookup, a route that is not a companion's) costs the descriptor and
+ * a log line, never the decision.
+ */
+async function withAnalytics(
+  enabled: boolean | undefined,
+  log: (line: string) => void,
+  build: () => InboundFacts | Promise<InboundFacts>,
+): Promise<{ analytics?: InboundFacts }> {
+  if (!enabled) return {};
+  try {
+    return { analytics: await build() };
+  } catch (error) {
+    log(structuredLog("warn", "trip_bot.assistant_event_facts_failed", {
+      safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+    }));
+    return {};
+  }
+}
+
+/** Whether the organizer has been told this trip's assistant is up (outbox `companion_ready`, delivered). */
+async function companionAnnounced(db: pg.Pool, tripId: string): Promise<boolean> {
+  const { rows } = await db.query(
+    `SELECT 1 FROM control_plane.notification_outbox
+      WHERE trip_id = $1 AND notification_type = 'companion_ready' AND sent_at IS NOT NULL
+      LIMIT 1`,
+    [tripId],
+  );
+  return rows.length > 0;
+}
+
+/**
+ * The facts of a message the router answered, or deliberately did not, because
+ * the companion is not connected - a lost turn when it was addressed. The
+ * verdict is the caller's, computed once (see the COMPANION_PENDING case), so
+ * the record and the reply cannot disagree about who was addressed.
+ */
+async function companionPendingFacts(
+  db: pg.Pool,
+  route: ChatRoute,
+  message: TelegramMessage,
+  gate: {
+    chatType: ChatType;
+    text: string;
+    assistantNames: readonly string[];
+    botUsername?: string;
+    isReplyToAssistant: boolean;
+  },
+  addressed: boolean,
+): Promise<InboundFacts> {
+  if (route.kind !== "companion") throw new Error("NOT_COMPANION_ROUTE");
+  const senderId = message.from?.id === undefined ? null : String(message.from.id);
+  return inboundFacts({
+    tripId: route.tripId,
+    telegramChatType: message.chat?.type,
+    trigger: classifyTrigger({ addressed, capturedAsReply: false, ...gate }),
+    linkRole: senderId ? (await resolveTripPerson(db, route.tripId, senderId))?.role : null,
+    attachmentKind: describeAttachment(message)?.kind ?? null,
+    textLength: gate.text.length,
+  });
 }
 
 /**
@@ -820,12 +1302,150 @@ function attachmentsForAddressedTurn(
  * interview; it can only claim an option within whatever session its own chat
  * already owns.
  */
-async function dispatchCallback(db: pg.Pool, update: TelegramUpdate): Promise<DispatchDecision> {
+/**
+ * Resolves `/switch <text>` to one of the organizer's OWN trips, or to nothing.
+ *
+ * EXACT matches only, against the trips already derived from the sender's
+ * verified identity. Fuzzy or prefix matching is what turns "switch me to
+ * japan" into a silent move to the wrong japan-2026-something, and a routing
+ * mistake here is invisible — the next answer is simply about a different
+ * trip. When two of the organizer's trips answer to the same name the argument
+ * is ambiguous, so it resolves to nothing and they get the tappable list,
+ * where the rows are distinguishable.
+ *
+ * Never widens the set it is given. That is the property that matters; the
+ * matching rules are just how a row inside it gets picked.
+ */
+function resolveTripArgument(
+  trips: readonly OrganizerTrip[],
+  argument: string | null,
+): OrganizerTrip | null {
+  if (!argument) return null;
+  const needle = argument.trim().toLowerCase();
+  if (!needle) return null;
+
+  const matches = trips.filter(
+    (trip) =>
+      trip.slug.toLowerCase() === needle ||
+      tripDisplayName(trip).toLowerCase() === needle ||
+      trip.tripId === argument.trim(),
+  );
+  return matches.length === 1 ? (matches[0] ?? null) : null;
+}
+
+/**
+ * Performs the switch and returns the sentence to send.
+ *
+ * The refusal branches all answer with copy that says what to do next, because
+ * the states they describe are ones the organizer can act on: finish the
+ * interview, or look at the list. `NOT_YOURS` deliberately reads the same as a
+ * trip that does not exist.
+ */
+async function applySwitch(
+  db: pg.Pool,
+  senderId: string,
+  chatId: string,
+  target: OrganizerTrip,
+  language: Language,
+  log: (line: string) => void,
+): Promise<string> {
+  const outcome = await switchChatToTrip(db, senderId, chatId, target.tripId);
+  const name = tripDisplayName(target);
+
+  switch (outcome.kind) {
+    case "unchanged":
+      return `${uiString("switchUnchanged", language)} ${name}.`;
+    case "refused":
+      log(structuredLog("info", "trip_bot.switch_refused", { reason: outcome.reason }));
+      return uiString(
+        outcome.reason === "IN_INTERVIEW"
+          ? "switchInInterview"
+          : outcome.reason === "NOT_PRIVATE_CHAT"
+            ? "switchInGroup"
+            : "switchRefused",
+        language,
+      );
+    case "switched": {
+      log(structuredLog("info", "trip_bot.switched", {
+        trip_id: outcome.tripId,
+        had_previous: outcome.previousTripId !== null,
+        has_companion: outcome.hermesProfile !== null,
+      }));
+      const lines = [`${uiString("switchDone", language)} ${name}.`];
+      // Said at the moment of switching rather than left for the organizer to
+      // discover by asking a question and being told the assistant is pending.
+      // A trip can be provisioned perfectly and still have no companion
+      // reachable from a chat that has never had one (migration 0043).
+      if (!outcome.hermesProfile) lines.push("", uiString("switchNoCompanion", language));
+      return lines.join("\n");
+    }
+  }
+}
+
+async function dispatchCallback(
+  db: pg.Pool,
+  update: TelegramUpdate,
+  log: (line: string) => void,
+): Promise<DispatchDecision> {
   const callback = update.callback_query;
   if (!callback?.data) return { kind: "ignore", reason: "NO_CALLBACK_DATA" };
 
   const chatId = callback.message?.chat?.id;
   const parsed = parseCallbackData(callback.data);
+
+  // Handled BEFORE the interview block below, which would otherwise swallow a
+  // trip-switch tap as a stale interview button — the chat performing a switch
+  // has no live interview by definition.
+  //
+  // Identity is `callback.from.id` — the person who TAPPED — not the chat id.
+  // They are the same in a DM, and taking the tapper is the form that stays
+  // correct if that ever stops being true. The same provenance
+  // `processApprovalCallback` already relies on.
+  if (parsed.kind === "switch" && chatId !== undefined && chatId !== null) {
+    const fromId = callback.from?.id;
+    if (fromId === undefined || fromId === null) return { kind: "ignore", reason: "NO_CALLBACK_SENDER" };
+    const senderId = String(fromId);
+    const language = await resolveChatLanguage(db, String(chatId), callback.from?.language_code);
+
+    // Re-derived server-side. The payload said WHICH ROW was tapped; whether
+    // that row is reachable by this sender is decided here, from their
+    // verified id, exactly as if they had typed the name.
+    const trips = await listOrganizerTrips(db, senderId, String(chatId));
+    const target = trips.find((trip) => trip.tripId === parsed.tripId);
+    if (!target) {
+      log(structuredLog("info", "trip_bot.switch_refused", { reason: "NOT_YOURS" }));
+      return {
+        kind: "callback_reply",
+        chatId: String(chatId),
+        callbackQueryId: callback.id,
+        text: uiString("switchRefused", language),
+      };
+    }
+    return {
+      kind: "callback_reply",
+      chatId: String(chatId),
+      callbackQueryId: callback.id,
+      text: await applySwitch(db, senderId, String(chatId), target, language, log),
+    };
+  }
+
+  // A document correction is answered from a CONFIRMED trip's chat, which by
+  // definition has no live interview any more — the generic block below would
+  // find `route.kind !== "interview"` and discard the tap as a stale interview
+  // button. Handled first, and unconditionally: the proposal row itself names
+  // its trip (`getCorrection`), and `applyCorrectionCallback` does its own
+  // organizer/chat authorization, so nothing here needs the chat's route.
+  if (parsed.kind === "correction" && chatId !== undefined && chatId !== null) {
+    const fromId = callback.from?.id;
+    return {
+      kind: "correction_callback",
+      chatId: String(chatId),
+      callbackQueryId: callback.id,
+      proposalId: parsed.proposalId,
+      choice: parsed.choice,
+      fromId: fromId === undefined || fromId === null ? "" : String(fromId),
+    };
+  }
 
   if (parsed.kind !== "unknown" && chatId !== undefined && chatId !== null) {
     const route = await resolveChatRoute(db, String(chatId));
@@ -838,6 +1458,16 @@ async function dispatchCallback(db: pg.Pool, update: TelegramUpdate): Promise<Di
         data: callback.data,
         sessionId: route.sessionId,
         ...(messageId !== undefined && messageId !== null ? { messageId: String(messageId) } : {}),
+      };
+    }
+    // A typed-change button (`pc:`) is ANSWERED, never dropped: an ignored tap
+    // leaves the button spinning for whoever pressed it (#206). Answered ONLY: a
+    // forged tap must not make the bot post into a chat it is merely a member of.
+    if (parsed.kind === "change") {
+      return {
+        kind: "callback_ack",
+        callbackQueryId: callback.id,
+        text: uiString("change.gone", await resolveChatLanguage(db, String(chatId), callback.from?.language_code)),
       };
     }
     // An interview-shaped callback from a chat with no live interview is

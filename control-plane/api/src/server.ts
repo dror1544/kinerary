@@ -1,10 +1,14 @@
-import { buildApp, type SignupDependencies, type InterviewDependencies, type PlannerDependencies, type ProvisionerDependencies, type ChatRoutingDependencies, type InterviewAgentDependencies } from "./app.js";
+import { buildApp, type SignupDependencies, type InterviewDependencies, type PlannerDependencies, type ProvisionerDependencies, type ChatRoutingDependencies, type InterviewAgentDependencies, type OperatorDependencies, type AdminDependencies, type AssistantEventsIngestDependencies } from "./app.js";
 import { createNotificationAdapter } from "./adapters/notification.js";
 import { loadArchitectureProfile, validateBeforeProvider } from "./config.js";
 import { createDatabasePool, databaseReadiness } from "./database.js";
 import { dispatchPendingTripNotifications } from "./outbox-dispatcher.js";
+import { recoverStaleLeases, recoverExpiredApprovals } from "./job-queue.js";
+import { destinationInfoSearchConfigured, refreshStaleDestinationInfo } from "./destination-info-store.js";
 import { venueLinkSearchConfigured } from "./itinerary-extract.js";
 import { resolvePendingVenueLinks } from "./venue-links.js";
+import { modelRunnerFromEnv } from "./model-runner.js";
+import { runPendingPlanReviews } from "./plan-review-store.js";
 import { structuredLog } from "./redaction.js";
 import { resolveSecretRef } from "./secrets.js";
 import { deleteWebhookIfPresent, startTelegramApprovalPoller } from "./telegram-poller.js";
@@ -136,6 +140,78 @@ if (interviewAgentKey) {
   interviewAgent = { db: pool, apiKey: interviewAgentKey };
 }
 
+// The operator's invitation routes, which create a trip and an interview link
+// for someone who has never contacted this deployment. Mounted only where the
+// key is set, which means the Mac's stack does not have them because a shell
+// was open; it has them because somebody put the key in that host's env file.
+//
+// The TTL is the signup profile's own enrollment TTL, not a second setting: an
+// invited link and an organizer's own link expire the same way, or an operator
+// is quoting an expiry the system does not honour.
+let operator: OperatorDependencies | undefined;
+const operatorKey = process.env.CONTROL_PLANE_OPERATOR_KEY;
+if (operatorKey) {
+  operator = {
+    db: pool,
+    apiKey: operatorKey,
+    enrollmentTtlSeconds: profile.signup?.enrollment_ttl_seconds ?? 86400,
+    // A fallback only. The tool resolves the handle from the bot token itself,
+    // which is the one source that cannot be stale after a rename.
+    botUsername: profile.web?.telegram_bot_username ?? process.env.TELEGRAM_BOT_USERNAME ?? null,
+  };
+}
+
+// The super-admin dashboard's routes (Sprint 6 slice 1 + slice 2, decision 23
+// in docs/sprint6-tracks.md): read across every trip at once, and mutate
+// (retry/suspend/resume) any one of them. One key gates both — see
+// `AdminDependencies`'s own comment for why. A key distinct from the
+// operator's, on the same reasoning `AdminDependencies` states: this is a
+// different kind of power from minting one invitation, and sharing a
+// credential between them would make a leak of either a leak of both.
+// Absent, like every optional block here, means no `/v1/admin/*` route
+// mounts at all.
+let admin: AdminDependencies | undefined;
+const adminKey = process.env.CONTROL_PLANE_ADMIN_KEY;
+if (adminKey) {
+  admin = { db: pool, apiKey: adminKey };
+}
+
+// The Hermes tool-outcome ingest route (AssistantEventsIngestDependencies,
+// app.ts). A key distinct from the admin/operator ones above and from any
+// trip's own HERMES_API_KEY — see that interface's own comment for why.
+// Absent, like every optional block here, means the route 503s rather than
+// accepting or even confirming its own existence.
+let assistantEventsIngest: AssistantEventsIngestDependencies | undefined;
+const assistantEventsIngestKey = process.env.ASSISTANT_EVENTS_INGEST_KEY;
+if (assistantEventsIngestKey) {
+  assistantEventsIngest = { db: pool, apiKey: assistantEventsIngestKey };
+}
+
+// Every comment above asserts these are distinct keys — nothing checked it.
+// An operator who copy-pastes the same value into two of these env vars
+// (or a deploy template that defaults more than one to the same secret)
+// would silently let one credential pass as another: an ingest key
+// granted admin, or an interview-agent key granted the operator's. Fail
+// loud at boot rather than discover it from an audit log.
+{
+  const named: Array<[string, string | undefined]> = [
+    ["CONTROL_PLANE_CHAT_ROUTING_KEY", chatRoutingKey],
+    ["CONTROL_PLANE_INTERVIEW_AGENT_KEY", interviewAgentKey],
+    ["CONTROL_PLANE_OPERATOR_KEY", operatorKey],
+    ["CONTROL_PLANE_ADMIN_KEY", adminKey],
+    ["ASSISTANT_EVENTS_INGEST_KEY", assistantEventsIngestKey],
+  ];
+  const seen = new Map<string, string>();
+  for (const [name, value] of named) {
+    if (!value) continue;
+    const collidesWith = seen.get(value);
+    if (collidesWith) {
+      throw new Error(`${name} must not equal ${collidesWith} — each shared secret must be distinct`);
+    }
+    seen.set(value, name);
+  }
+}
+
 const app = buildApp(profile, {
   readiness: () => databaseReadiness(pool),
   close: () => pool.end(),
@@ -146,6 +222,9 @@ const app = buildApp(profile, {
   chatRouting,
   portal,
   interviewAgent,
+  operator,
+  admin,
+  assistantEventsIngest,
 });
 
 // Dispatches trip notifications (e.g. "your site is ready") that the worker
@@ -179,6 +258,64 @@ if (signup) {
   timer.unref();
 }
 
+// Reclaims jobs whose worker died mid-run. `claimJob` sets a 900s lease
+// (provisioner.py's LEASE_SECONDS) renewed by a heartbeat while the worker is
+// alive; job-queue.ts's own comments and provisioner.py's call it "the real
+// safety net" for a dead worker, but until now nothing ever called it outside
+// a test — a worker that crashed left its job `leased` forever, with no
+// automatic retry and no terminal failure either. Runs unconditionally, like
+// the plan-review loop: lease recovery depends on no optional profile.
+{
+  let recovering = false;
+  const STALE_LEASE_POLL_INTERVAL_MS = 2 * 60_000;
+  const timer = setInterval(() => {
+    if (recovering) return;
+    recovering = true;
+    recoverStaleLeases(pool)
+      .then((count) => {
+        if (count > 0) {
+          process.stderr.write(`${structuredLog("warn", "job_queue.stale_leases_recovered", { count })}\n`);
+        }
+      })
+      .catch((error) => {
+        process.stderr.write(`${structuredLog("error", "job_queue.stale_lease_recovery_error", {
+          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        })}\n`);
+      })
+      .finally(() => { recovering = false; });
+  }, STALE_LEASE_POLL_INTERVAL_MS);
+  timer.unref();
+}
+
+// Reverts a plan (and its job) whose approval expired before anyone acted on
+// it. Same "no production caller" gap as recoverStaleLeases above, found in
+// the same PR review (2026-10-06 [P2]): resumeTrip (admin-mutations.ts) now
+// does this inline for the one trip it is resuming, but a plan can also sit
+// expired without ever being suspended at all — an organizer who approved
+// and then did nothing. Runs unconditionally, same reasoning as the lease
+// recovery above.
+{
+  let reverting = false;
+  const EXPIRED_APPROVAL_POLL_INTERVAL_MS = 2 * 60_000;
+  const timer = setInterval(() => {
+    if (reverting) return;
+    reverting = true;
+    recoverExpiredApprovals(pool)
+      .then((count) => {
+        if (count > 0) {
+          process.stderr.write(`${structuredLog("warn", "job_queue.expired_approvals_reverted", { count })}\n`);
+        }
+      })
+      .catch((error) => {
+        process.stderr.write(`${structuredLog("error", "job_queue.expired_approval_revert_error", {
+          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        })}\n`);
+      })
+      .finally(() => { reverting = false; });
+  }, EXPIRED_APPROVAL_POLL_INTERVAL_MS);
+  timer.unref();
+}
+
 // Retries venue ticket/official-URL lookups parked in venue_links because the
 // interview-time web search was rate-limited. Same single-process overlap guard
 // as the outbox loop. Only runs when a search profile is configured.
@@ -196,6 +333,78 @@ if (venueLinkSearchConfigured()) {
       })
       .finally(() => { draining = false; });
   }, VENUE_LINK_POLL_INTERVAL_MS);
+  timer.unref();
+}
+
+// Re-verifies destination info (the Info tab's Health / Money / Communication
+// lists) for every destination in country_reference, monthly, and fans each
+// answer out to every home-country row for that destination. Migration 0023
+// shipped `fetched_at` in 2026-08 and nothing has ever refreshed a row since;
+// this is that job for the destination-info half. See destination-info-store.ts
+// for why the WRITE lives on a timer here rather than in an interview-time MCP
+// tool the way consular contacts do.
+//
+// The tick is hourly, not monthly: the age test is in the query
+// (DESTINATION_INFO_MAX_AGE_DAYS), so the interval only decides how promptly a
+// newly-inserted row gets its first fill. A monthly timer in a process that
+// restarts on every deploy would in practice never fire.
+if (destinationInfoSearchConfigured()) {
+  let refreshing = false;
+  const DESTINATION_INFO_POLL_INTERVAL_MS = 60 * 60_000;
+  const timer = setInterval(() => {
+    if (refreshing) return;
+    refreshing = true;
+    refreshStaleDestinationInfo(pool, undefined, (line) => process.stderr.write(`${line}\n`))
+      .catch((error) => {
+        process.stderr.write(`${structuredLog("error", "destination_info.refresh_loop_error", {
+          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        })}\n`);
+      })
+      .finally(() => { refreshing = false; });
+  }, DESTINATION_INFO_POLL_INTERVAL_MS);
+  timer.unref();
+} else {
+  // UNSET IS A DOWNGRADE, NOT AN ERROR — and this is the line that says so.
+  // With no search profile the loop simply does not exist, every Info tab keeps
+  // only its API-sourced lines, and nothing anywhere distinguishes that from
+  // "every destination is up to date". One startup line is the whole difference
+  // between a deployment that knows the prose half is off and one that finds
+  // out from a family asking why the Info tab is thin.
+  process.stderr.write(`${structuredLog("warn", "destination_info.refresh_disabled", {
+    reason: "no HERMES_DESTINATION_INFO_PROFILE or HERMES_SEARCH_PROFILE",
+  })}\n`);
+}
+
+// Reviews the plan of every trip that has been provisioned (or re-provisioned)
+// since its last review, and files what it finds as proposals — never as edits
+// to a live trip. See plan-review.ts for what it looks for and plan-review-
+// store.ts for the queue's rules.
+//
+// Runs UNCONDITIONALLY, unlike the venue-link drain above. The deterministic
+// half of the review needs no model, and a deployment with no `plan_review`
+// runner configured still gets every finding that is arithmetic over the
+// config — the missing check-in, the day out of clock order, the place on the
+// list that is on no day. Gating the whole loop on a runner would have made
+// "no model configured" and "your plan is fine" look identical, which is the
+// shape of the downgrade CLAUDE.md's interview section was written about.
+{
+  let reviewing = false;
+  const PLAN_REVIEW_POLL_INTERVAL_MS = 5 * 60_000;
+  const planReviewRunner = modelRunnerFromEnv();
+  const timer = setInterval(() => {
+    if (reviewing) return;
+    reviewing = true;
+    runPendingPlanReviews(pool, {
+      runner: planReviewRunner,
+      log: (line) => process.stderr.write(`${line}\n`),
+    })
+      .catch((error) => {
+        process.stderr.write(`${structuredLog("error", "plan_review.loop_error", {
+          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        })}\n`);
+      })
+      .finally(() => { reviewing = false; });
+  }, PLAN_REVIEW_POLL_INTERVAL_MS);
   timer.unref();
 }
 

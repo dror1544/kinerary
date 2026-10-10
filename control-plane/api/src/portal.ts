@@ -4,6 +4,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type pg from "pg";
 import { CodeChallengeMethod, OAuth2Client } from "google-auth-library";
 import { issueEnrollment } from "./enrollment.js";
+import { ensureUnknownPasswordCredential, resolveOrCreateEmailAccount } from "./password-identity.js";
 import { generatePlan } from "./planner.js";
 import { issueApproval } from "./plan-approval.js";
 
@@ -77,6 +78,13 @@ export interface GoogleIdentity {
   subject: string;
   displayName: string;
   email?: string;
+  /**
+   * Google's own `email_verified` claim, and only ever true when it said so.
+   * `exchange` rejects an explicit false, but the claim can also be absent —
+   * and "absent" must not read as "verified" at the one call site that uses
+   * this to decide whether two accounts are the same person.
+   */
+  emailVerified: boolean;
 }
 
 export interface GoogleOidcAdapter {
@@ -114,6 +122,7 @@ export class GoogleOidcClient implements GoogleOidcAdapter {
       subject: payload.sub,
       displayName: payload.name?.slice(0, 120) || payload.email?.split("@")[0]?.slice(0, 120) || "Kinerary organizer",
       email: payload.email,
+      emailVerified: payload.email_verified === true,
     };
   }
 }
@@ -261,6 +270,20 @@ async function requireMutation(request: FastifyRequest, reply: FastifyReply, dep
   return user;
 }
 
+/**
+ * An account with no email behind it — a Google sign-in whose address Google
+ * would not vouch for. It gets its own user, as it always has, because there
+ * is nothing here to tie it to anyone.
+ */
+async function createBareUser(client: pg.PoolClient, displayName: string): Promise<string> {
+  const userId = opaque("user");
+  await client.query(
+    "INSERT INTO control_plane.users(id, status, display_name) VALUES ($1, 'active', $2)",
+    [userId, displayName],
+  );
+  return userId;
+}
+
 async function membership(deps: PortalDependencies, tripId: string, userId: string) {
   const result = await deps.db.query<{ role: string; dashboard_access: boolean; runtime_access: boolean }>(
     `SELECT role, dashboard_access, runtime_access FROM control_plane.trip_memberships
@@ -376,8 +399,28 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
         "SELECT user_id FROM control_plane.user_identities WHERE provider = 'google' AND provider_subject_digest = $1", [subjectDigest]);
       let userId = identities.rows[0]?.user_id;
       if (!userId) {
-        userId = opaque("user");
-        await client.query("INSERT INTO control_plane.users(id, status, display_name) VALUES ($1, 'active', $2)", [userId, identity.displayName]);
+        // First Google sign-in for this Google account. If Google has VERIFIED
+        // an address for it, that address already names an organizer account
+        // here — one they signed up for, or one an operator invited — and this
+        // is the same person arriving by a different door. Attach the Google
+        // identity to that account instead of starting a third one beside it.
+        //
+        // Safe in the direction that matters: Google proving the address is a
+        // stronger claim than this system has ever had for it, since signup
+        // itself never verifies an email. An unverified or absent claim falls
+        // through to a fresh account, which is the old behavior.
+        if (identity.email && identity.emailVerified) {
+          userId = await resolveOrCreateEmailAccount(client, identity.email, identity.displayName);
+          // The account must not be claimable by asserting its address. Without
+          // this, an account reachable only by Google would sit there with no
+          // password credential, and `POST /v1/signup` with that email would
+          // set one — handing a stranger who knows the address everything this
+          // person owns. A credential nobody knows closes that; they sign in
+          // with Google, and password recovery later gives them one they chose.
+          await ensureUnknownPasswordCredential(client, userId, identity.email);
+        } else {
+          userId = await createBareUser(client, identity.displayName);
+        }
         await client.query(
           "INSERT INTO control_plane.user_identities(id, user_id, provider, provider_subject_digest, verified_at) VALUES ($1, $2, 'google', $3, now())",
           [opaque("idnt"), userId, subjectDigest],

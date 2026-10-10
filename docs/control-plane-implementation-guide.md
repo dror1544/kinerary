@@ -129,6 +129,8 @@ Per-trip isolated runtime
   └─ supervised health/readiness services
 ```
 
+> **Note, 2026-09-25:** "Telegram login verification" in the diagram above no longer exists. `GET /v1/auth/telegram` answers `410 TELEGRAM_WEB_AUTH_RETIRED` (`control-plane/api/src/app.ts:1562`, registered when the portal is configured). Web sign-in is Google or email/password through `portal.ts`. `GET /v1/signup/status` (`app.ts`) is still served. The diagram is left as the original target.
+
 The general architecture requires these roles, not a named local technology:
 
 | General role | Local MVP adapter | Future cloud adapter examples |
@@ -436,9 +438,11 @@ Messaging is provider-neutral in the registry and lifecycle.
 - Before establishment, a signed enrollment routes a private DM to an
   intake-only session. After establishment, a group binding routes to the
   organizer profile with one exact trip context.
-- Private `/select` lists only owned trips using signed, expiring callbacks and
-  changes one selected DM context. It never changes group bindings or trip
-  lifecycle state.
+- Private `/select` lists only owned trips as callback buttons and changes one
+  selected DM context. It never changes group bindings or trip lifecycle state.
+  The buttons are not signed (amended 2026-09-13): a payload only names a row,
+  and every tap is re-authorized from the tapper's verified Telegram id. Signed,
+  expiring actions stay the rule where the payload itself carries authority.
 - A group binding maps `bot identity + chat ID` to exactly one trip. Reviewed
   reassignment closes the prior binding, retains history, verifies the new
   context and announces the change.
@@ -556,7 +560,7 @@ not required for lifecycle automation.
 Illustrative public operations:
 
 ```text
-POST /v1/auth/telegram
+POST /v1/auth/telegram   # RETIRED 2026-09: now GET, answers 410 TELEGRAM_WEB_AUTH_RETIRED
 POST /v1/trips
 POST /v1/trips/{tripId}/interview-enrollments
 GET  /v1/trips/{tripId}

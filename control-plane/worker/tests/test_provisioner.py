@@ -21,7 +21,9 @@ from control_plane_worker.provisioner import (
     BindingRefused,
     DeployAdapter,
     ProvisionerWorker,
+    TripRetired,
     bind_chat_to_trip,
+    _record_trip_companion,
     attach_profile_to_orphan_bindings,
 )
 from control_plane_worker.release_source import ReleaseSourceError
@@ -37,10 +39,21 @@ SKIP = not DB_URL
 # ── Fake deploy adapter ───────────────────────────────────────────────────────
 
 class FakeDeployAdapter:
-    def __init__(self, fail: bool = False, error_code: str = "FAKE_DEPLOY_FAILURE") -> None:
+    def __init__(
+        self,
+        fail: bool = False,
+        error_code: str = "FAKE_DEPLOY_FAILURE",
+        health_ok: bool = True,
+        roster_participants: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.deployed: list[dict[str, Any]] = []
         self._fail = fail
         self._error_code = error_code
+        # Backs this adapter's own `http_get` below — lets a test simulate
+        # the deployed site failing its own /api/health or serving an empty
+        # roster, without a real network call. Defaults are the happy path.
+        self._health_ok = health_ok
+        self._roster_participants = roster_participants
 
     def deploy(
         self,
@@ -50,6 +63,8 @@ class FakeDeployAdapter:
         first_provision: bool = False,
         sidecars: dict[str, Any] | None = None,
         source_dir: str | None = None,
+        documents: Any = None,
+        trip_id: str | None = None,
     ) -> str:
         if self._fail:
             exc = RuntimeError("simulated deploy failure")
@@ -58,8 +73,41 @@ class FakeDeployAdapter:
         self.deployed.append({
             "slug": slug, "config": config, "first_provision": first_provision,
             "sidecars": sidecars or {}, "source_dir": source_dir,
+            "documents": list(documents or []), "trip_id": trip_id,
         })
         return f"https://{slug}.test.example"
+
+    def http_get(self, url: str) -> tuple[int, str]:
+        """Doubles as the verification aggregator's HTTP transport for the
+        fake URL `deploy()` just invented. `ProvisionerWorker.__init__`
+        prefers the deploy adapter's own `http_get` (when present) over a
+        real network call — exactly so every one of this file's existing
+        call sites, which never heard of verification, keeps exercising the
+        happy path without being touched one by one."""
+        if not self._health_ok:
+            return 503, '{"ok": false}'
+        if url.endswith("/api/health"):
+            return 200, '{"ok": true}'
+        if url.endswith("/api/config/roster"):
+            participants = self._roster_participants
+            if participants is None:
+                config = self.deployed[-1]["config"] if self.deployed else {}
+                participants = [
+                    {"username": p.get("username"), "name": p.get("name")}
+                    for p in (config.get("participants") or [])
+                ] or [{"username": "organizer", "name": "Organizer"}]
+            return 200, json.dumps({"participants": participants})
+        if url.endswith("/api/config/deployment-identity"):
+            # #review 2026-10-03 [P2], round 2 (updated #review 2026-10-06
+            # [N1]): mirrors the real server/server.js route this
+            # verification check now also probes, reading the same deployed
+            # config's meta the way the roster branch above reads its
+            # participants. The real route now serves an opaque
+            # deploymentNonce rather than raw dates; this fake does too.
+            config = self.deployed[-1]["config"] if self.deployed else {}
+            meta = config.get("meta") or {}
+            return 200, json.dumps({"deploymentNonce": meta.get("deploymentNonce")})
+        return 404, "not found"
 
 
 # ── Fixture helpers ───────────────────────────────────────────────────────────
@@ -188,6 +236,10 @@ def teardown_fixture(conn: psycopg.Connection, fix: dict) -> None:
             cur.execute("DELETE FROM control_plane.intake_versions WHERE trip_id = %s", (trip_id,))
             cur.execute("DELETE FROM control_plane.runtime_routes WHERE trip_id = %s", (trip_id,))
             cur.execute("DELETE FROM control_plane.trip_memberships WHERE trip_id = %s", (trip_id,))
+            # The verification aggregator (Sprint 6) now writes one row per
+            # check on every happy-path run_once(), which FK-references trips —
+            # so every fixture that ever reached _complete leaves rows here.
+            cur.execute("DELETE FROM control_plane.verification_evidence WHERE trip_id = %s", (trip_id,))
             cur.execute("DELETE FROM control_plane.trips WHERE id = %s", (trip_id,))
             cur.execute("DELETE FROM control_plane.releases WHERE id = %s", (fix["release_id"],))
             cur.execute("DELETE FROM control_plane.users WHERE id = %s", (fix["user_id"],))
@@ -307,11 +359,45 @@ class ProvisionerHappyPathTests(unittest.TestCase):
         # later correction cannot produce a replacement plan for the trip.
         self.assertEqual(row["status"], "executed")
 
+    def test_happy_path_stores_the_deployed_plan_for_the_review_pass(self) -> None:
+        # The post-deploy plan review (control-plane/api/src/plan-review.ts)
+        # runs on its own loop, long after this job, and needs the config that
+        # was actually deployed. This function is the only place it exists.
+        self.worker.run_once()
+        row = self.conn.execute(
+            "SELECT plan_snapshot, plan_snapshot_at FROM control_plane.trips WHERE id = %s",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertIsNotNone(row["plan_snapshot_at"])
+        self.assertEqual(
+            row["plan_snapshot"]["meta"]["title"],
+            self.fake_deploy.deployed[0]["config"]["meta"]["title"],
+        )
+
+    def test_a_worker_newer_than_the_schema_still_finishes_the_deploy(self) -> None:
+        # The exact failure this guard is for: a worker that knows about
+        # plan_snapshot talking to a database that has not run migration 0050.
+        # The snapshot is lost, which costs a review; the job must still be
+        # marked succeeded, which is only true because the write happens
+        # outside the transaction that succeeds it.
+        self.conn.execute("ALTER TABLE control_plane.trips DROP COLUMN plan_snapshot")
+        self.conn.commit()
+        try:
+            self.worker.run_once()
+            row = self.conn.execute(
+                "SELECT state FROM control_plane.jobs WHERE id = %s", (self.fix["job_id"],),
+            ).fetchone()
+            self.assertEqual("succeeded", row["state"])
+        finally:
+            self.conn.execute("ALTER TABLE control_plane.trips ADD COLUMN plan_snapshot jsonb")
+            self.conn.commit()
+
     def test_happy_path_calls_deploy_adapter_with_slug_and_config(self) -> None:
         self.worker.run_once()
         self.assertEqual(len(self.fake_deploy.deployed), 1)
         deployed = self.fake_deploy.deployed[0]
         self.assertIn("prov-test-", deployed["slug"])
+        self.assertEqual(self.fix["trip_id"], deployed["trip_id"])
         config = deployed["config"]
         self.assertIn("meta", config)
         # Year is derived from the (real) departure date, so check the parts
@@ -381,6 +467,90 @@ class ProvisionerHappyPathTests(unittest.TestCase):
         # Default fixture intake has no phases and no anchors.
         self.worker.run_once()
         self.assertNotIn("bookings.json", self.fake_deploy.deployed[0]["sidecars"])
+        self.assertEqual([], self.fake_deploy.deployed[0]["documents"])
+        self.assertNotIn("documents.json", self.fake_deploy.deployed[0]["sidecars"])
+
+    def _seed_voucher(self, store: str, *, storage_trip: str | None = None) -> tuple[str, str]:
+        """A stored voucher for the fixture trip, and the manifest that names it."""
+        trip_id = self.fix["trip_id"]
+        content = b"%PDF-1.4 Gracery voucher"
+        hexdigest = hashlib.sha256(content).hexdigest()
+        document_id = f"doc_{rnd()}"
+        key_trip = storage_trip or trip_id
+        os.makedirs(os.path.join(store, key_trip), exist_ok=True)
+        with open(os.path.join(store, key_trip, f"{hexdigest}.pdf"), "wb") as fh:
+            fh.write(content)
+        manifest = {
+            "documents": [{
+                "documentId": document_id, "digest": f"sha256:{hexdigest}", "filename": "Gracery voucher.pdf",
+                "byteSize": len(content), "mime": "application/pdf", "stored": True,
+            }],
+            "sources": [{
+                "questionId": "phases", "index": 0, "documentId": document_id,
+                "disposition": "filled", "paths": ["accommodation"],
+            }],
+        }
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO control_plane.trip_documents
+                         (id, trip_id, content_digest, byte_size, mime, storage_key, ingest_state, stored_at)
+                       VALUES (%s, %s, %s, %s, 'application/pdf', %s, 'stored', now())""",
+                    (document_id, trip_id, f"sha256:{hexdigest}", len(content), f"{key_trip}/{hexdigest}.pdf"),
+                )
+                cur.execute(
+                    "UPDATE control_plane.intake_versions SET source_document = %s::jsonb WHERE id = %s",
+                    (json.dumps(manifest), self.fix["intake_id"]),
+                )
+        return document_id, f"{hexdigest}.pdf"
+
+    def _with_a_stay(self) -> None:
+        teardown_fixture(self.conn, self.fix)
+        self.fix = setup_fixture(self.conn, intake={
+            **JAPAN_INTAKE,
+            "phases": {"kind": "structured", "schema_version": 3, "data": [
+                {"name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23",
+                 "accommodation": {"name": "Hotel Gracery Shinjuku", "confirmation": "GR-4471"}},
+            ]},
+        })
+
+    def test_source_documents_are_published_and_linked_to_what_they_support(self) -> None:
+        import tempfile
+        self._with_a_stay()
+        with tempfile.TemporaryDirectory() as store:
+            _, file_name = self._seed_voucher(store)
+            worker = ProvisionerWorker(
+                db_url=DB_URL, deploy=self.fake_deploy, worker_id="test-provisioner", document_store_dir=store,
+            )
+            worker.run_once()
+
+        deployed = self.fake_deploy.deployed[0]
+        self.assertEqual([file_name], [doc.file_name for doc in deployed["documents"]])
+        tokyo = next(p for p in deployed["config"]["phases"] if p["id"] == "tokyo")
+        self.assertEqual(file_name, tokyo["accommodation"]["pdf"], "the hotel card opens its voucher")
+        hotel = next(b for b in deployed["sidecars"]["bookings.json"] if b["type"] == "hotel")
+        self.assertEqual(file_name, hotel["conf_file"])
+        sidecar = deployed["sidecars"]["documents.json"]
+        self.assertEqual("Gracery voucher.pdf", sidecar[0]["filename"])
+        self.assertIn({"kind": "booking", "seed_key": "hotel_tokyo"}, sidecar[0]["links"])
+        self.assertIn({"kind": "phase", "id": "tokyo"}, sidecar[0]["links"])
+
+    def test_a_storage_key_naming_another_trip_is_never_published(self) -> None:
+        import tempfile
+        self._with_a_stay()
+        with tempfile.TemporaryDirectory() as store:
+            # The row is this trip's, but its key points into another trip's
+            # directory — a corrupt or tampered row. It must not be followed.
+            self._seed_voucher(store, storage_trip=f"trip_{rnd()}")
+            worker = ProvisionerWorker(
+                db_url=DB_URL, deploy=self.fake_deploy, worker_id="test-provisioner", document_store_dir=store,
+            )
+            worker.run_once()
+
+        deployed = self.fake_deploy.deployed[0]
+        self.assertEqual([], deployed["documents"])
+        self.assertNotIn("pdf", next(p for p in deployed["config"]["phases"] if p["id"] == "tokyo")["accommodation"])
+        self.assertNotIn("documents.json", deployed["sidecars"])
 
     def test_enrich_hook_receives_the_config_and_destination(self) -> None:
         seen: dict[str, Any] = {}
@@ -466,6 +636,76 @@ class ProvisionerHappyPathTests(unittest.TestCase):
             (self.fix["job_id"],),
         ).fetchone()
         self.assertEqual(row["state"], "queued")
+
+    def test_no_claimable_job_when_trip_suspended(self) -> None:
+        # Sprint 6 slice 2 admin dashboard (migration 20261003060350):
+        # _claim() mirrors job-queue.ts's claimJob() in excluding a
+        # suspended trip's jobs. Approval is untouched and valid — suspend is
+        # what alone must stop the claim.
+        self.conn.execute(
+            "UPDATE control_plane.trips SET suspended_at = now(), suspended_reason = 'test pause' WHERE id = %s",
+            (self.fix["trip_id"],),
+        )
+        self.conn.commit()
+        result = self.worker.run_once()
+        self.assertFalse(result)
+        row = self.conn.execute(
+            "SELECT state FROM control_plane.jobs WHERE id = %s",
+            (self.fix["job_id"],),
+        ).fetchone()
+        self.assertEqual(row["state"], "queued")
+
+        # Resuming (clearing both columns together, same pairing the
+        # migration's CHECK enforces) makes the job claimable again.
+        self.conn.execute(
+            "UPDATE control_plane.trips SET suspended_at = NULL, suspended_reason = NULL WHERE id = %s",
+            (self.fix["trip_id"],),
+        )
+        self.conn.commit()
+        result = self.worker.run_once()
+        self.assertTrue(result)
+
+    def test_claim_cannot_win_a_race_against_a_suspend_still_mid_transaction(self) -> None:
+        # The race the boundary review proved live (2026-10-03) against this
+        # exact production path. Tested against _claim() directly (not
+        # run_once(), which also WORKS a claimed job afterward — a later step
+        # in that pipeline touches the trips row too, so once _claim() wins
+        # the race it then genuinely blocks on holder's own lock for the rest
+        # of the job, which is a real but separate behaviour from the race
+        # this test is pinning).
+        #
+        # holder mirrors suspendTrip's TS equivalent's opening move exactly:
+        # BEGIN, then the same `SELECT ... FOR UPDATE` on the trips row, held
+        # open. Before the fix (_claim's own FOR UPDATE OF j, pa only), a
+        # concurrent _claim() call claimed the job in ~0.05s with no regard
+        # for that lock. After the fix (FOR UPDATE OF j, pa, t), it must skip
+        # the row instead.
+        holder = psycopg.connect(DB_URL, row_factory=dict_row)
+        try:
+            holder.execute(
+                "SELECT suspended_at FROM control_plane.trips WHERE id = %s FOR UPDATE",
+                (self.fix["trip_id"],),
+            )
+
+            with psycopg.connect(DB_URL, row_factory=dict_row) as claim_conn:
+                claimed = self.worker._claim(claim_conn)
+            self.assertIsNone(claimed, "a claim must not win while the trip row is locked by an in-flight suspend")
+
+            row = self.conn.execute(
+                "SELECT state FROM control_plane.jobs WHERE id = %s",
+                (self.fix["job_id"],),
+            ).fetchone()
+            self.assertEqual(row["state"], "queued")
+        finally:
+            # Release the held lock without ever actually suspending the
+            # trip — this test only needs to prove the lock window matters.
+            holder.rollback()
+            holder.close()
+
+        # With the lock released and the trip never actually suspended, a
+        # normal claim now succeeds — proving the fix doesn't over-block.
+        result = self.worker.run_once()
+        self.assertTrue(result)
 
 
 @unittest.skipIf(SKIP, "CONTROL_PLANE_TEST_DATABASE_URL not set")
@@ -678,11 +918,11 @@ COMPANION_INTAKE = {
 FULL_NAME_ORGANIZER_INTAKE = {
     **COMPANION_INTAKE,
     "travelers": {"kind": "structured", "schema_version": 1, "data": [
-        {"name": "ניר", "name_en": "Nir", "age": 56, "family": "סולומון", "family_en": "Solomon"},
-        {"name": "נעה", "name_en": "Noa", "age": 25, "family": "סולומון", "family_en": "Solomon"},
+        {"name": "רון", "name_en": "Ron", "age": 47, "family": "מרגולין", "family_en": "Margolin"},
+        {"name": "יעל", "name_en": "Yael", "age": 21, "family": "מרגולין", "family_en": "Margolin"},
     ]},
-    "organizer_identity": {"kind": "text", "schema_version": 1, "text": "ניר סולומון"},
-    "dietary_scope": {"kind": "structured", "schema_version": 1, "data": {"vegetarian": ["נעה"]}},
+    "organizer_identity": {"kind": "text", "schema_version": 1, "text": "רון מרגולין"},
+    "dietary_scope": {"kind": "structured", "schema_version": 1, "data": {"vegetarian": ["יעל"]}},
 }
 
 
@@ -928,6 +1168,63 @@ class CompanionProfileTests(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(row)
 
+    def test_the_bridge_is_re_run_after_every_deploy_never_before_it(self) -> None:
+        """Issue #119, design (d): no stored copy of the trip's agent key. The
+        bridge re-reads the container's CURRENT key each time its setup runs,
+        so what keeps it fresh is ORDER: a deploy (which may bootstrap, and
+        so mint a key) is always followed by exactly one bridge setup, in the
+        same run, and never preceded by one that would then go stale."""
+        events: list[str] = []
+
+        class OrderedDeploy(FakeDeployAdapter):
+            def deploy(self, slug, config, **kw):
+                events.append("deploy")
+                return super().deploy(slug, config, **kw)
+
+        class OrderedBridge(FakeMcpBridgeAdapter):
+            def setup(self, slug, profile_name):
+                events.append("bridge")
+                return super().setup(slug, profile_name)
+
+        bridge = OrderedBridge()
+        worker = ProvisionerWorker(
+            db_url=DB_URL, deploy=OrderedDeploy(), worker_id="test-bridge-order",
+            companion=FakeCompanionProfileAdapter(), mcp_bridge=bridge,
+        )
+        self.assertTrue(worker.run_once())
+        self.assertEqual(events, ["deploy", "bridge"])
+        self.assertEqual(len(bridge.calls), 1)
+
+    def test_no_bridge_run_when_the_deploy_did_not_complete(self) -> None:
+        bridge = FakeMcpBridgeAdapter()
+        worker = ProvisionerWorker(
+            db_url=DB_URL, deploy=FakeDeployAdapter(fail=True), worker_id="test-bridge-nodeploy",
+            companion=FakeCompanionProfileAdapter(), mcp_bridge=bridge,
+        )
+        worker.run_once()
+        self.assertEqual(bridge.calls, [])
+
+    def test_a_bridge_failure_is_not_logged_with_a_key(self) -> None:
+        key = "ab" * 32
+
+        class LeakyBridge:
+            def setup(self, slug, profile_name):
+                # What the adapter raises is the bridge's own stderr tail; the
+                # worker must record a reason, not repeat detail.
+                raise RuntimeError("trip-mcp bridge over ssh exited 1: boom")
+
+        with self.assertLogs("control_plane_worker.provisioner", level="WARNING") as cm:
+            ProvisionerWorker(
+                db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-bridge-nokey",
+                companion=FakeCompanionProfileAdapter(), mcp_bridge=LeakyBridge(),
+            ).run_once()
+        self.assertNotIn(key, "\n".join(cm.output))
+        state = self.conn.execute(
+            "SELECT unreachable_reason FROM control_plane.trips WHERE id = %s",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertEqual(state["unreachable_reason"], "TRIP_MCP_BRIDGE_FAILED")
+
     def test_a_failing_bridge_does_not_block_the_chat_binding_or_the_job(self) -> None:
         companion = FakeCompanionProfileAdapter()
 
@@ -951,6 +1248,16 @@ class CompanionProfileTests(unittest.TestCase):
             "SELECT state FROM control_plane.jobs WHERE trip_id = %s", (self.fix["trip_id"],),
         ).fetchone()
         self.assertEqual(job_state["state"], "succeeded")
+        # A FACT, and it survives the binding that succeeded after it: the
+        # 'reachable' write beside the binding used to erase it (issue #119).
+        state = self.conn.execute(
+            "SELECT reachability, unreachable_reason FROM control_plane.trips WHERE id = %s",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertEqual(
+            (state["reachability"], state["unreachable_reason"]),
+            ("unreachable", "TRIP_MCP_BRIDGE_FAILED"),
+        )
 
     def test_a_chat_already_serving_another_trip_is_not_taken(self) -> None:
         """The provisioner must not retarget a chat that is in force for another
@@ -1084,8 +1391,18 @@ class SlugPromotionTests(unittest.TestCase):
             # a suffix that was no longer available and failed on data rather
             # than behaviour. The property is "collisions are suffixed", not
             # "the suffix is 2".
+            #
+            # #342: the YEAR was hardcoded here too (`japan-2026-\d+`), which
+            # is the same class of date bomb one level up. JAPAN_INTAKE names
+            # no explicit date, so derive_trip_slug's own fallback
+            # (`_resolve_dates`: departure = today + 90 days) decides the
+            # year — found live on 2026-10-03, when today + 90 days first
+            # crossed into January and every slug this test produces became
+            # `japan-2027*`, not `japan-2026*`. The property is "some year",
+            # not "2026" specifically — same reasoning as the suffix number,
+            # one component over.
             self.assertTrue(
-                any(re.fullmatch(r"japan-2026-\d+", s) for s in slugs),
+                any(re.fullmatch(r"japan-\d{4}-\d+", s) for s in slugs),
                 f"expected a numeric-suffixed slug among {slugs}",
             )
         finally:
@@ -1336,6 +1653,122 @@ class ShellDeployAdapterSidecarTests(unittest.TestCase):
                 self.assertEqual([], json.load(fh))
 
 
+class ShellDeployAdapterDocumentPlacementTests(unittest.TestCase):
+    """An original goes to the trip's own NFS directory as a hard link — one
+    physical copy shared with the control plane's store — and beside the config
+    only when the trip's NFS directory cannot take it."""
+
+    def _document(self, store_dir: str, text: bytes = b"Hotel Artemide - confirmation HTL-99117"):
+        import hashlib
+
+        from control_plane_worker.document_handoff import TripDocumentFile
+
+        digest = hashlib.sha256(text).hexdigest()
+        source = os.path.join(store_dir, f"{digest}.txt")
+        with open(source, "wb") as fh:
+            fh.write(text)
+        return TripDocumentFile(
+            document_id="doc_" + "a" * 32, file_name=f"{digest}.txt", source_path=source,
+            content_digest=f"sha256:{digest}", filename="Artemide.txt", mime="text/plain",
+        )
+
+    def _deploy(self, adapter, documents) -> None:
+        from unittest import mock
+
+        from control_plane_worker.provisioner import ShellDeployAdapter
+
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch("control_plane_worker.provisioner.subprocess.run", return_value=completed), \
+             mock.patch.object(ShellDeployAdapter, "_private_url", return_value="https://italy-2026.example"):
+            adapter.deploy("italy-2026", {"meta": {"title": "Italy"}}, documents=documents)
+
+    def test_hard_linked_into_the_trip_nfs_directory_with_no_second_copy(self) -> None:
+        import tempfile
+
+        from control_plane_worker.provisioner import ShellDeployAdapter
+
+        with tempfile.TemporaryDirectory() as root:
+            deploy_root = os.path.join(root, "deploy")
+            nfs = os.path.join(root, "nfs")
+            store = os.path.join(nfs, ".kinerary-document-store", "trip_" + "b" * 32)
+            os.makedirs(deploy_root)
+            os.makedirs(os.path.join(nfs, "italy-2026"))
+            os.makedirs(store)
+            document = self._document(store)
+            adapter = ShellDeployAdapter(
+                deploy_root=deploy_root, vmid_map={"italy-2026": "101"}, repo_root="/repo",
+                trip_nfs_local_base=nfs,
+            )
+            self._deploy(adapter, [document])
+
+            published = os.path.join(nfs, "italy-2026", "documents", document.file_name)
+            self.assertTrue(os.path.isfile(published))
+            self.assertEqual(os.stat(published).st_ino, os.stat(document.source_path).st_ino, "one physical copy")
+            self.assertFalse(
+                os.path.exists(os.path.join(deploy_root, "trips", "italy-2026", "documents", document.file_name)),
+                "no second copy travels with the deploy",
+            )
+
+    def test_publishes_to_the_trip_id_directory_when_that_is_what_topology_recorded(self) -> None:
+        # A trip provisioned after NFS directories moved to trip id has a
+        # topology.yaml naming its directory `trip_<hex>`, not its slug —
+        # documents must follow that file, not assume the slug.
+        import tempfile
+
+        from control_plane_worker.provisioner import ShellDeployAdapter
+
+        with tempfile.TemporaryDirectory() as root:
+            deploy_root = os.path.join(root, "deploy")
+            nfs = os.path.join(root, "nfs")
+            store = os.path.join(root, "store")
+            trip_dir = os.path.join(deploy_root, "trips", "italy-2026")
+            os.makedirs(trip_dir)
+            os.makedirs(os.path.join(nfs, "trip_9f2c11aa4d"))
+            os.makedirs(store)
+            with open(os.path.join(trip_dir, "topology.yaml"), "w", encoding="utf-8") as fh:
+                fh.write(
+                    "version: 1\nname: italy-2026\nproxmox:\n  node: pve\n  lxc:\n"
+                    "    name: trip-italy-2026\n    nfs_host_dir: /mnt/pve/truenas-nfs/trip_9f2c11aa4d\n"
+                    "    nfs_mount_path: /nfs/trip_9f2c11aa4d\n"
+                )
+            document = self._document(store)
+            adapter = ShellDeployAdapter(
+                deploy_root=deploy_root, vmid_map={"italy-2026": "101"}, repo_root="/repo",
+                trip_nfs_local_base=nfs,
+            )
+            self._deploy(adapter, [document])
+
+            published = os.path.join(nfs, "trip_9f2c11aa4d", "documents", document.file_name)
+            self.assertTrue(os.path.isfile(published), "followed topology.yaml's trip-id directory")
+            self.assertFalse(
+                os.path.exists(os.path.join(nfs, "italy-2026")),
+                "never guessed the slug once a topology.yaml said otherwise",
+            )
+
+    def test_falls_back_beside_the_config_when_the_trip_nfs_directory_is_not_visible(self) -> None:
+        import tempfile
+
+        from control_plane_worker.provisioner import ShellDeployAdapter
+
+        with tempfile.TemporaryDirectory() as root:
+            deploy_root = os.path.join(root, "deploy")
+            nfs = os.path.join(root, "nfs")
+            store = os.path.join(root, "store")
+            os.makedirs(deploy_root)
+            os.makedirs(nfs)  # the export, but no italy-2026 directory in it
+            os.makedirs(store)
+            document = self._document(store)
+            adapter = ShellDeployAdapter(
+                deploy_root=deploy_root, vmid_map={"italy-2026": "101"}, repo_root="/repo",
+                trip_nfs_local_base=nfs,
+            )
+            self._deploy(adapter, [document])
+
+            beside_config = os.path.join(deploy_root, "trips", "italy-2026", "documents", document.file_name)
+            self.assertTrue(os.path.isfile(beside_config))
+            self.assertFalse(os.path.exists(os.path.join(nfs, "italy-2026")), "never a look-alike trip directory")
+
+
 @unittest.skipIf(SKIP, "CONTROL_PLANE_TEST_DATABASE_URL not set")
 class ChatBindingLifecycleTests(unittest.TestCase):
     """A reassignment must CLOSE the old binding rather than overwrite it, and
@@ -1431,6 +1864,46 @@ class ChatBindingLifecycleTests(unittest.TestCase):
         self.assertEqual(self._open_row()["trip_id"], self.fix_a["trip_id"])
         self.assertEqual(self._open_row()["hermes_profile"], "companion-a")
 
+    def test_binding_a_new_chat_to_a_retired_trip_is_refused_and_logged(self) -> None:
+        # Issue #105, production 2026-09-18: a chat with NO open binding at
+        # all got one against a trip `teardown-trip.py` had already renamed
+        # `retired-<slug>-<yyyymmdd>` eight minutes earlier. This is the
+        # fourth case in the docstring, checked before the other three
+        # because it does not depend on whether a binding already exists.
+        retired_slug = f"retired-italy-2026-{rnd(4)}"
+        retired = setup_fixture(self.conn, slug=retired_slug)
+        with self.assertLogs("control_plane_worker.provisioner", level="ERROR") as logs:
+            with self.assertRaises(TripRetired) as caught:
+                bind_chat_to_trip(self.conn, self.chat_id, retired["trip_id"], "companion-x")
+        self.assertEqual(caught.exception.chat_id, self.chat_id)
+        self.assertEqual(caught.exception.trip_id, retired["trip_id"])
+        self.assertEqual(caught.exception.slug, retired_slug)
+        # Logged, not silent — the issue's own suggested fix says this.
+        self.assertTrue(any("binding_refused_trip_retired" in line for line in logs.output))
+
+        # Nothing was written at all.
+        self.assertEqual(len(self._rows()), 0)
+        teardown_fixture(self.conn, retired)
+
+    def test_retargeting_to_a_retired_trip_is_refused_even_with_allow_retarget(self) -> None:
+        # A retired trip is never a valid target, even for the one flag that
+        # exists specifically to let a chat move to a genuinely newer trip.
+        # The organizer's own chat must not be handed to a trip that no
+        # longer has a deploy directory, a container or a companion.
+        retired = setup_fixture(self.conn, slug=f"retired-france-2026-{rnd(4)}")
+        self._age_trip(self.fix_a["trip_id"], 3)
+        bind_chat_to_trip(self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a")
+
+        with self.assertRaises(TripRetired):
+            bind_chat_to_trip(
+                self.conn, self.chat_id, retired["trip_id"], "companion-x",
+                allow_retarget=True,
+            )
+        # The existing binding is untouched.
+        self.assertEqual(len(self._rows()), 1)
+        self.assertEqual(self._open_row()["trip_id"], self.fix_a["trip_id"])
+        teardown_fixture(self.conn, retired)
+
     def _age_trip(self, trip_id: str, hours: int) -> None:
         """Put a trip's creation that many hours in the past, so "newer" is a
         fact the test states rather than one it hopes two inserts produced."""
@@ -1510,6 +1983,74 @@ class ChatBindingLifecycleTests(unittest.TestCase):
         self.assertEqual(len(history), 1)
         self.assertEqual(history[0]["trip_id"], self.fix_a["trip_id"])
         self.assertEqual(history[0]["closed_reason"], "organizer_reassigned")
+
+    def _make_b_the_newer_trip(self) -> None:
+        """The order the retarget rail turns on: B created after A."""
+        self.conn.rollback()
+        with self.conn.transaction():
+            self.conn.execute(
+                "UPDATE control_plane.trips SET created_at = now() - interval '1 day' WHERE id = %s",
+                (self.fix_a["trip_id"],),
+            )
+            self.conn.execute(
+                "UPDATE control_plane.trips SET created_at = now() WHERE id = %s",
+                (self.fix_b["trip_id"],),
+            )
+
+    def test_the_organizers_own_chat_follows_them_to_their_next_trip(self) -> None:
+        # The case a second trip always produces: their DM is bound to trip A
+        # when trip B is built, and they have just finished answering an
+        # interview for trip B. Refusing here is what left a returning
+        # organizer with a site link and no introduction at all.
+        self._make_b_the_newer_trip()
+        bind_chat_to_trip(self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a")
+
+        outcome = bind_chat_to_trip(
+            self.conn, self.chat_id, self.fix_b["trip_id"], "companion-b", allow_retarget=True,
+        )
+        self.assertEqual(outcome, "retargeted")
+
+        open_row = self._open_row()
+        self.assertEqual(open_row["trip_id"], self.fix_b["trip_id"])
+        self.assertEqual(open_row["hermes_profile"], "companion-b")
+
+        # The first trip keeps its history and its reason, so a switch back has
+        # something to read and nothing about trip A is silently erased.
+        closed = [r for r in self._rows() if r["closed_at"] is not None]
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(closed[0]["trip_id"], self.fix_a["trip_id"])
+        self.assertEqual(closed[0]["closed_reason"], "retargeted_to_newer_trip")
+
+    def test_an_older_trip_can_never_take_the_chat_back(self) -> None:
+        # A repair or a re-provision of the trip they moved on FROM must not
+        # steal the chat from the trip they moved on TO, even though it reaches
+        # the same call site with the same flag.
+        self._make_b_the_newer_trip()
+        bind_chat_to_trip(self.conn, self.chat_id, self.fix_b["trip_id"], "companion-b")
+
+        with self.assertRaises(BindingRefused):
+            bind_chat_to_trip(
+                self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a", allow_retarget=True,
+            )
+        self.assertEqual(self._open_row()["trip_id"], self.fix_b["trip_id"])
+
+    def test_without_the_flag_a_second_trip_is_still_refused(self) -> None:
+        # Every other caller — a family group above all — keeps the refusal.
+        self._make_b_the_newer_trip()
+        bind_chat_to_trip(self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a")
+        with self.assertRaises(BindingRefused):
+            bind_chat_to_trip(self.conn, self.chat_id, self.fix_b["trip_id"], "companion-b")
+
+    def test_a_trip_records_the_companion_it_was_built_with(self) -> None:
+        # Written whatever happens to a binding: a refused binding used to mean
+        # the profile's name existed nowhere in this database, and /switch had
+        # nothing to bind the chat to.
+        _record_trip_companion(self.conn, self.fix_a["trip_id"], "companion-a")
+        row = self.conn.execute(
+            "SELECT hermes_profile FROM control_plane.trips WHERE id = %s",
+            (self.fix_a["trip_id"],),
+        ).fetchone()
+        self.assertEqual(row["hermes_profile"], "companion-a")
 
     def test_only_one_binding_per_chat_can_be_open(self) -> None:
         # Migration 0029's partial unique index is the backstop under a race
@@ -1681,7 +2222,7 @@ class OrganizerFullNameReachesCompanionTests(unittest.TestCase):
             len(companion.installed), 1,
             "the companion was never invoked — organizer resolution stopped the chain again",
         )
-        self.assertEqual(companion.installed[0]["organizer"]["display_name"], "ניר")
+        self.assertEqual(companion.installed[0]["organizer"]["display_name"], "רון")
 
         row = self.conn.execute(
             "SELECT chat_id FROM control_plane.telegram_chat_bindings "
@@ -1843,6 +2384,29 @@ class ReachabilityTests(unittest.TestCase):
         finally:
             self._cleanup(fix)
 
+    def test_a_retired_trip_is_named_distinctly_from_a_binding_failure(self) -> None:
+        # Issue #105, code review follow-up: TripRetired must not fall into
+        # the generic BINDING_FAILED bucket. BINDING_FAILED implies a
+        # technical, retriable fault; a torn-down trip is never retriable —
+        # trip-fleet-monitor's triage reads `unreachable_reason` and would
+        # treat a permanently gone trip as a glitch worth re-provisioning.
+        fix = setup_fixture(self.conn, intake=FULL_NAME_ORGANIZER_INTAKE, slug=f"retired-japan-2026-{rnd(4)}")
+        self._with_chat(fix)
+        try:
+            with self.assertLogs("control_plane_worker.provisioner", level="ERROR") as logs:
+                ProvisionerWorker(
+                    db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-reach-retired",
+                    companion=FakeCompanionProfileAdapter(),
+                ).run_once()
+            self.assertEqual(
+                self._reachability(fix["trip_id"]),
+                ("unreachable", "TRIP_RETIRED"),
+            )
+            self.assertTrue(any("binding_refused_trip_retired" in line for line in logs.output))
+            self.assertTrue(any("companion_binding_trip_retired" in line for line in logs.output))
+        finally:
+            self._cleanup(fix)
+
     def test_the_database_refuses_an_unreachable_trip_with_no_reason(self) -> None:
         # The invariant, enforced where it cannot be forgotten: "unreachable"
         # without a reason is the silent failure this whole change exists to
@@ -1887,7 +2451,7 @@ class InterviewChatIsTheOrganizerChatTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.fix = setup_fixture(self.conn, intake=FULL_NAME_ORGANIZER_INTAKE)
-        self.chat_id = "830000" + rnd(3)
+        self.chat_id = "830000" + str(secrets.randbelow(1000000)).zfill(6)
         # An interview conducted in a known, verified chat — and an owner with
         # NO telegram identity, which is what the password stopgap produces.
         # `enrollment_id` is required but nothing here reads it; the session
@@ -1922,6 +2486,11 @@ class InterviewChatIsTheOrganizerChatTests(unittest.TestCase):
         teardown_fixture(self.conn, self.fix)
 
     def test_the_interview_chat_binds_the_companion(self) -> None:
+        self.conn.execute(
+            "UPDATE control_plane.trips SET notification_chat_id_hint = '999999999' WHERE id = %s",
+            (self.fix["trip_id"],),
+        )
+        self.conn.commit()
         companion = FakeCompanionProfileAdapter()
         ProvisionerWorker(
             db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-interview-chat",
@@ -1942,6 +2511,45 @@ class InterviewChatIsTheOrganizerChatTests(unittest.TestCase):
             (self.fix["trip_id"],),
         ).fetchone()
         self.assertEqual((state["reachability"], state["unreachable_reason"]), ("reachable", None))
+
+        person = self.conn.execute(
+            "SELECT telegram_user_id FROM control_plane.trip_person_links WHERE trip_id = %s",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertEqual(person["telegram_user_id"], self.chat_id)
+
+    def test_unverified_hint_cannot_bind_or_identify_an_organizer(self) -> None:
+        self.conn.execute(
+            "UPDATE control_plane.intake_sessions SET telegram_chat_id = NULL WHERE id = %s",
+            (self.session_id,),
+        )
+        self.conn.execute(
+            "UPDATE control_plane.trips SET notification_chat_id_hint = %s WHERE id = %s",
+            (self.chat_id, self.fix["trip_id"]),
+        )
+        self.conn.commit()
+        ProvisionerWorker(
+            db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-unverified-hint",
+            companion=FakeCompanionProfileAdapter(),
+        ).run_once()
+
+        for table in ("telegram_chat_bindings", "trip_person_links"):
+            rows = self.conn.execute(
+                f"SELECT id FROM control_plane.{table} WHERE trip_id = %s",
+                (self.fix["trip_id"],),
+            ).fetchall()
+            self.assertEqual(rows, [], f"unverified hint must not create {table}")
+        state = self.conn.execute(
+            "SELECT reachability, unreachable_reason FROM control_plane.trips WHERE id = %s",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertEqual((state["reachability"], state["unreachable_reason"]),
+                         ("unreachable", "NO_ORGANIZER_CHAT"))
+        notifications = self.conn.execute(
+            "SELECT kind, recipient FROM control_plane.notification_outbox WHERE trip_id = %s",
+            (self.fix["trip_id"],),
+        ).fetchall()
+        self.assertEqual(notifications, [{"kind": "provisioning_complete", "recipient": self.chat_id}])
 
     def test_a_verified_telegram_identity_still_wins(self) -> None:
         # Provenance order, not convenience: an identity on the account is a

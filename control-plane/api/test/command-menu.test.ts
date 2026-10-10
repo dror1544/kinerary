@@ -5,7 +5,7 @@ import type { TelegramClient } from "../src/relay/telegram-api.js";
 
 // What the router answers itself (relay/dispatch.ts). Anything else a menu
 // offers is a command the command gate refuses.
-const ROUTER_COMMANDS = new Set(["help", "name", "group"]);
+const ROUTER_COMMANDS = new Set(["help", "name", "group", "trips", "switch"]);
 
 describe("routerCommandMenus — the menu is the router's, not Hermes's", () => {
   test("every advertised command is one the router handles", () => {
@@ -16,11 +16,29 @@ describe("routerCommandMenus — the menu is the router's, not Hermes's", () => 
     }
   });
 
-  test("/name is offered everywhere; /group only outside groups", () => {
+  test("/name is offered everywhere; /group, /trips and /switch only outside groups", () => {
+    // /trips would list trips the rest of a room has no claim to, and a group's
+    // binding is the family's — not one member's to /switch.
     for (const menu of routerCommandMenus()) {
       const names = menu.commands.map((c) => c.command);
       assert.ok(names.includes("name"), `${menu.scope} lacks /name`);
-      assert.equal(names.includes("group"), menu.scope !== "all_group_chats", `${menu.scope} /group placement`);
+      for (const outsideGroups of ["group", "trips", "switch"]) {
+        assert.equal(names.includes(outsideGroups), menu.scope !== "all_group_chats", `${menu.scope} /${outsideGroups} placement`);
+      }
+    }
+  });
+
+  test("/done is not offered — it means something only mid-interview", () => {
+    for (const menu of routerCommandMenus()) {
+      assert.equal(menu.commands.some((c) => c.command === "done"), false, `${menu.scope} offers /done`);
+    }
+  });
+
+  test("the Hebrew descriptions are actually Hebrew, not English twice", () => {
+    for (const menu of routerCommandMenus().filter((m) => m.languageCode === "he")) {
+      for (const { command, description } of menu.commands) {
+        assert.match(description, /[\u0590-\u05FF]/, `${menu.scope} /${command}`);
+      }
     }
   });
 

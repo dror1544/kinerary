@@ -20,12 +20,19 @@ jobs:
   # GitHub Actions service containers expose ports on the runner's localhost,
   # so both PostgreSQL and dev-mode Vault are reachable in the same job.
   # Locally the two services live on separate networks (Postgres internal,
-  # Vault published to loopback), so no single local run covers all 118 tests;
+  # Vault published to loopback), so no single local run covers every test;
   # CI closes that gap.
+  #
+  # timeout-minutes is a wall-clock guard for the whole job, not the per-file
+  # hang bound (that is --test-timeout, in package.json). The suite is about
+  # 1,950 tests and this job took 9-13.5 minutes on 2026-09-26 (9m11s, 9m37s,
+  # 11m19s, 11m47s, 13m21s); one run of a docs-only PR was cancelled at the old
+  # 15-minute limit while still running, with no failing test in its log. Raise
+  # it rather than trim the suite, as CLAUDE.md says of --test-timeout.
   api:
     name: TypeScript API
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
 
     services:
       postgres:
@@ -84,7 +91,7 @@ jobs:
         run: node_modules/.bin/tsc --noEmit
         working-directory: control-plane/api
 
-      - name: Test (all 118 — PostgreSQL + Vault on localhost)
+      - name: Test (PostgreSQL + Vault on localhost)
         run: npm test
         working-directory: control-plane/api
         env:

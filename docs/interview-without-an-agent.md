@@ -201,7 +201,15 @@ its own prior rather than from what the organizer wrote.
   wrong answer.
 - **Already answered** → a change, not a write. Mid-interview overwrites are not
   applied silently; the router confirms. (Distinct from the post-confirmation
-  path, which is `intake-correction.ts` and creates a new intake version.)
+  path, which is `intake-correction.ts` and creates a new intake version.) For a
+  typed change to the held **stops or travellers** (#206, PR #199) that
+  confirmation is a stored draft, not a guess: the model proposes a short list
+  of operations, code resolves each reference against what is held and validates
+  the result, the person is shown exactly that difference, and exactly that is
+  applied only after they say yes. The draft lives in
+  `control_plane.intake_pending_changes` (`typed-changes.ts`,
+  `typed-changes-store.ts`), and while one waits the recap's Confirm is refused
+  and the change is shown instead. Nothing else in this section changed.
 - **`unclear[]`** → the router asks that question next, which is what it would
   have done anyway. `unclear` is a scheduling hint, not an error.
 - **`{ ok: false }`** → the router proceeds on its own copy. The interview
@@ -405,6 +413,14 @@ measured.** What data to collect is deliberately not settled here; this records
 the requirement and what already exists to answer it, so the discussion starts
 from facts rather than from scratch.
 
+**Owner: Track 2 (Dror, 2026-09-25).** Measuring unfinished interviews belongs to
+Track 2. An **offline judge** that reads each whole interview transcript after it
+ends — was data missed, was data given late, can it now change the captured plan —
+is also wanted, in Sprint 6, and is tracked as #198. It is the offline sibling of
+#117's pre-summary judge and is to be designed together with it. **Track 2 owns
+the pair** (Dror, 2026-09-25). Whether its findings may touch a confirmed
+(immutable) intake version is not decided.
+
 An abandoned interview is the failure mode nobody sees. A wrong answer gets
 corrected on the recap and a stall gets reported within minutes, but somebody
 who stops at question nine and never comes back leaves no complaint — and by
@@ -507,10 +523,10 @@ an organizer checks before committing, and it came out like this:
 
 ```
 • יעד            Japan
-• נוסעים          Nir Solomon, Ela, Noa, Maya, Shai
+• נוסעים          Ron Margolin, Tali, Yael, Dana, Gal
 • אזור זמן        Asia/Tokyo
 • תאריך יציאה     2026-09-19
-• למי זה נוגע     kosher_style: everyone, lactose_free: Noa
+• למי זה נוגע     kosher_style: everyone, lactose_free: Yael
 ```
 
 Hebrew labels, English values, and one line of raw option ids. The organizer

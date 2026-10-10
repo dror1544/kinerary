@@ -122,6 +122,7 @@ services:
       # the Hermes container instead of a launchd plist.
       PROVISIONER_COMPANION_PROFILE_ENABLED: ${PROVISIONER_COMPANION_PROFILE_ENABLED:-0}
       PROVISIONER_MCP_BRIDGE_ENABLED: ${PROVISIONER_MCP_BRIDGE_ENABLED:-0}
+      PROVISIONER_BRIDGE_PROBE_MINUTES: ${PROVISIONER_BRIDGE_PROBE_MINUTES:-}
       # Companion host = this VM, reached from the container as
       # host.docker.internal (extra_hosts below). The key is VM-only — it never
       # authorizes into the Mac — and ~hermes/.ssh/authorized_keys pins it to one
@@ -215,6 +216,12 @@ services:
       # (2026-09-11: at default effort the VM mapped answers to the wrong question).
       # Explicit here so this VM matches the Mac on purpose, not by inheritance.
       CLAUDE_CONFIG_DIR: /home/node/.claude-config
+      # #327: analytics/emitter.ts's own off-by-default switch. Empty default
+      # (never `:?`) on purpose — unset must stay OFF so shipping this image is
+      # never what starts recording a family's conversation (see emitter.ts's
+      # own doc comment, property 1). Turning it on anywhere real is a separate,
+      # deliberate step that still waits on retention and the family-notice work.
+      ASSISTANT_EVENTS_ENABLED: ${ASSISTANT_EVENTS_ENABLED:-}
     # CLAUDE_CODE_OAUTH_TOKEN, minted with `claude setup-token`; and
     # OPENROUTER_API_KEY — the same key Hermes holds, since an API key has no
     # rotating state (codex and anthropic OAuth are each logged into separately:

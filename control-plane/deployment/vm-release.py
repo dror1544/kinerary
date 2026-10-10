@@ -1268,10 +1268,21 @@ class ControlPlane:
         return events
 
     def live_companions(self) -> List[Tuple[str, str]]:
+        # A trip marked TRIP_MCP_BRIDGE_FAILED still counts as live here: its
+        # companion answers, only the trip-mcp bridge is down, and that is the
+        # exact case `restart-bridges` and `verify` exist to repair (issue
+        # #193). Genuinely `unreachable` for any other reason is still
+        # excluded — waiting on those would cost every trip the full timeout
+        # for a companion that was never coming back.
+        #
+        # The same special case, for the same reason, lives in
+        # control-plane/api/src/relay/gateway-wait.ts's expectedGatewayProfiles
+        # — if another UNREACHABLE_REASONS value ever needs the same
+        # treatment, update both queries together.
         rows = self.psql(
             "SELECT DISTINCT t.slug || '|' || b.hermes_profile FROM control_plane.telegram_chat_bindings b "
             "JOIN control_plane.trips t ON t.id = b.trip_id WHERE b.closed_at IS NULL AND b.hermes_profile IS NOT NULL "
-            "AND t.reachability <> 'unreachable' ORDER BY 1")
+            "AND (t.reachability <> 'unreachable' OR t.unreachable_reason = 'TRIP_MCP_BRIDGE_FAILED') ORDER BY 1")
         return [tuple(row.split("|", 1)) for row in rows.splitlines() if "|" in row]  # type: ignore[misc]
 
     def verify(self) -> bool:

@@ -8,8 +8,14 @@ enrichment error must never fail a provision job.
 """
 from __future__ import annotations
 
+import logging
+import pathlib
+import re
 import unittest
+import urllib.parse
+from unittest import mock
 
+from control_plane_worker import enrichment
 from control_plane_worker.enrichment import enrich_config
 
 
@@ -316,6 +322,67 @@ class VenueEnrichmentTests(unittest.TestCase):
         self.assertIn("waze.com/ul?q=Tokyo%20Skytree", v["waze"])
         self.assertEqual("https://www.tokyo-skytree.jp/en/", v["url"])  # untouched
 
+    def test_a_venue_with_no_link_anywhere_takes_the_website_osm_has(self) -> None:
+        # The case every provisioned trip was in: no documents, so the
+        # cross-trip venue_links store is empty, so nothing set `url` and the
+        # place card had no way to say where to buy a ticket.
+        cfg = _config()
+        cfg["phases"][0]["venues"] = [
+            {"id": "skytree", "name": {"he": "סקייטרי", "en": "Tokyo Skytree"}},
+        ]
+        http = FakeHttp({
+            "q=Tokyo%2C+Japan": NOMINATIM_TOKYO,
+            "q=Kyoto": NOMINATIM_KYOTO,
+            "q=Tokyo+Skytree": [{
+                "lat": "35.7101", "lon": "139.8107", "display_name": "Tokyo Skytree",
+                "extratags": {"website": "https://www.tokyo-skytree.jp/en/"},
+            }],
+        })
+        out = enrich_config(cfg, "Japan", http=http, pause=0)
+        self.assertEqual("https://www.tokyo-skytree.jp/en/", out["phases"][0]["venues"][0]["url"])
+        # Where it came from, so a derived link is never mistaken for one a
+        # person supplied — and so nothing downstream reads it as "tickets".
+        self.assertEqual("osm-website", out["phases"][0]["venues"][0]["url_source"])
+        geocodes = [c for c in http.calls if "nominatim" in c]
+        self.assertTrue(geocodes, "the venue was geocoded")
+        self.assertTrue(all("extratags=1" in c for c in geocodes),
+                        "the website rides on the request already being made")
+
+    def test_a_bare_hostname_is_made_into_a_real_url(self) -> None:
+        cfg = _config()
+        cfg["phases"][0]["venues"] = [{"id": "x", "name": {"en": "Somewhere Museum"}}]
+        http = FakeHttp({"q=Somewhere+Museum": [{
+            "lat": "1", "lon": "2", "extratags": {"contact:website": "www.somewhere.example"},
+        }]})
+        out = enrich_config(cfg, "Japan", http=http, pause=0)
+        self.assertEqual("https://www.somewhere.example", out["phases"][0]["venues"][0]["url"])
+
+    def test_a_tagged_value_that_is_not_a_url_is_discarded_rather_than_guessed(self) -> None:
+        # A broken link on a place card is worse than no link: the family finds
+        # out by tapping it.
+        cfg = _config()
+        cfg["phases"][0]["venues"] = [{"id": "x", "name": {"en": "Somewhere Museum"}}]
+        http = FakeHttp({"q=Somewhere+Museum": [{
+            "lat": "1", "lon": "2", "extratags": {"website": "ask at the desk"},
+        }]})
+        out = enrich_config(cfg, "Japan", http=http, pause=0)
+        self.assertNotIn("url", out["phases"][0]["venues"][0])
+
+    def test_osm_never_overrides_a_url_that_is_already_there(self) -> None:
+        # The store holds links a person or a document supplied. This is the
+        # floor, not the preference.
+        cfg = _config()
+        cfg["phases"][0]["venues"] = [
+            {"id": "x", "name": {"en": "Somewhere Museum"}, "url": "https://from-the-document.example"},
+        ]
+        http = FakeHttp({"q=Somewhere+Museum": [{
+            "lat": "1", "lon": "2", "extratags": {"website": "https://osm.example"},
+        }]})
+        out = enrich_config(cfg, "Japan", http=http, pause=0)
+        self.assertEqual("https://from-the-document.example", out["phases"][0]["venues"][0]["url"])
+        self.assertNotIn("url_source", out["phases"][0]["venues"][0],
+                         "a link that was already there is not ours to label")
+
     def test_a_hand_authored_venue_maps_link_is_kept(self) -> None:
         cfg = _config()
         cfg["phases"][0]["venues"] = [
@@ -566,6 +633,349 @@ class ConsularContactsTests(unittest.TestCase):
         self.assertNotIn("emergency_contacts", out.get("travel_info", {}))
 
 
+class DestinationInfoTests(unittest.TestCase):
+    """Health / Money / Communication on the site's Info tab (issue #156).
+
+    Two halves with different provenance and different costs: the API half is
+    derived per trip from the country entry countries.dev already returned, the
+    model half is prose read from the cross-trip country_reference cache. Every
+    line says which it is, because the model half is advisory and a wrong line
+    has to be traceable to its source.
+    """
+
+    JP_HTTP = {
+        "countries.dev/name/Japan": COUNTRIES_DEV_JAPAN,
+        "emergencynumberapi.com/api/country/JP": EMERGENCY_JP,
+    }
+
+    # `source` is KEPT in this fixture on purpose even though nothing should
+    # read it: it is the hostile input. A cache row really can carry a
+    # `hermes:<profile>` identifier, and the tests below prove it never reaches
+    # a line object. Deleting it from the fixture would make those tests
+    # vacuous.
+    CACHED = {
+        "health": [{"he": "מי הברז ראויים לשתייה", "en": "Tap water is safe to drink"}],
+        "money": [{"he": "מזומן עדיין נפוץ", "en": "Cash is still widely used"}],
+        "communication": [{"he": "eSIM זמין לתיירים", "en": "eSIM is available for visitors"}],
+        "source": "hermes:search",
+    }
+
+    def _out(self, **kw):
+        return enrich_config(_config(), kw.pop("destination", "Japan"),
+                             http=FakeHttp(kw.pop("routes", self.JP_HTTP)), pause=0, **kw)
+
+    def test_api_lines_come_from_the_country_entry_with_no_lookup_at_all(self) -> None:
+        info = self._out()["travel_info"]
+        self.assertTrue(any("JPY" in i["en"] for i in info["money"]))
+        self.assertTrue(any("+81" in i["en"] for i in info["communication"]))
+        self.assertTrue(any("119" in i["en"] for i in info["health"]))
+        for key in ("health", "money", "communication"):
+            for item in info[key]:
+                self.assertEqual("api", item["source"])
+
+    def test_model_lines_are_appended_and_marked_model(self) -> None:
+        info = self._out(destination_info_lookup=lambda d: self.CACHED)["travel_info"]
+        money = info["money"]
+        self.assertEqual("api", money[0]["source"])
+        self.assertEqual("model", money[-1]["source"])
+        self.assertEqual("Cash is still widely used", money[-1]["en"])
+        # Coarse, not the profile name. See the leak test below.
+        self.assertEqual("model", money[-1]["origin"])
+
+    def test_the_search_profile_name_never_reaches_a_line(self) -> None:
+        """THE LEAK THIS ASSERTION REPLACED.
+
+        `origin` used to be copied from the cache row's
+        `destination_info_source` column, which holds `hermes:<profile>` — an
+        env-supplied internal profile identifier. Every line carrying it went
+        into trip.config.json and out through sanitizeConfig(), which is a
+        DENY-list and so passes anything it was not told to remove, to
+        GET /api/config — readable by ANY authenticated family member, because
+        `authRequired` is not an organizer check. Neither renderer reads
+        `origin` at all, so it was internal naming on the wire for nothing.
+
+        Caught in review on #156 while still latent (no deployment sets a
+        search profile yet, so no model line exists in production). This test
+        is what keeps it that way.
+        """
+        info = self._out(destination_info_lookup=lambda d: self.CACHED)["travel_info"]
+        every_value = [
+            value
+            for key in ("health", "money", "communication")
+            for line in info[key]
+            for value in line.values()
+        ]
+        self.assertTrue(every_value)
+        for value in every_value:
+            self.assertNotIn("hermes", value.lower(), f"profile identifier leaked: {value!r}")
+        # And positively: the model half says "model" and nothing finer.
+        for key in ("health", "money", "communication"):
+            for line in info[key]:
+                if line["source"] == "model":
+                    self.assertEqual("model", line["origin"])
+
+    def test_an_arbitrary_cache_source_cannot_become_an_origin(self) -> None:
+        """Not just `hermes:` — the clamp is an ALLOW-list, so a cache row
+        carrying anything at all in `source` still produces the coarse value.
+        A deny-list would have to anticipate the next leaky string."""
+        hostile = dict(self.CACHED, source="postgres://user:pw@10.0.0.4/db")
+        info = self._out(destination_info_lookup=lambda d: hostile)["travel_info"]
+        for key in ("health", "money", "communication"):
+            for line in info[key]:
+                self.assertIn(line["origin"], enrichment._INFO_ORIGINS)
+                self.assertNotIn("postgres", line["origin"])
+
+    def test_an_unrecognised_origin_is_rejected_loudly_not_quietly(self) -> None:
+        """The clamp lives in `_info_line`, the one point every line passes
+        through, and it complains rather than downgrading in silence — a quiet
+        coarsening would hide the very reintroduction the allow-list exists to
+        catch."""
+        with self.assertLogs("control_plane_worker.enrichment", level="WARNING") as logs:
+            line = enrichment._info_line("א", "a", "model", "hermes:leaked")
+        self.assertEqual("model", line["origin"])
+        self.assertTrue(
+            any("info_origin_rejected" in r.getMessage() for r in logs.records),
+            [r.getMessage() for r in logs.records],
+        )
+
+    def test_every_origin_this_module_emits_is_on_the_allow_list(self) -> None:
+        """Guards the other direction: the clamp silently coarsening a
+        LEGITIMATE origin would lose the api half's provenance without any test
+        noticing, since both values are plausible strings."""
+        info = self._out(destination_info_lookup=lambda d: self.CACHED)["travel_info"]
+        seen = {line["origin"] for key in ("health", "money", "communication") for line in info[key]}
+        self.assertTrue(seen)
+        self.assertTrue(seen <= enrichment._INFO_ORIGINS, seen - enrichment._INFO_ORIGINS)
+        # The api half must still be finer-grained than "api" — that is the
+        # provenance the brief asked for, and it names public APIs, not us.
+        self.assertIn("countries.dev", seen)
+
+    def test_every_line_carries_both_languages_the_site_renders(self) -> None:
+        info = self._out(destination_info_lookup=lambda d: self.CACHED)["travel_info"]
+        for key in ("health", "money", "communication"):
+            self.assertTrue(info[key], key)
+            for item in info[key]:
+                self.assertIsInstance(item["he"], str)
+                self.assertIsInstance(item["en"], str)
+                self.assertTrue(item["he"] and item["en"], item)
+
+    def test_the_cache_is_asked_for_the_country_not_the_whole_itinerary(self) -> None:
+        """country_reference is keyed by destination_country, but the value the
+        provisioner passes is the organizer's raw answer — a city list with the
+        country last. Asking the cache for "tokyo, hakone, kyoto, osaka, japan"
+        misses every time."""
+        seen = []
+        self._out(destination="Tokyo, Hakone, Kyoto, Osaka, Japan",
+                  destination_info_lookup=lambda d: seen.append(d) or self.CACHED)
+        self.assertEqual(["Japan"], seen)
+
+    def test_a_cache_miss_still_leaves_the_api_lines(self) -> None:
+        info = self._out(destination_info_lookup=lambda d: None)["travel_info"]
+        self.assertTrue(info["money"])
+        self.assertTrue(all(i["source"] == "api" for i in info["money"]))
+
+    def test_a_cache_miss_is_logged_rather_than_silent(self) -> None:
+        with self.assertLogs("control_plane_worker.enrichment", level="WARNING") as logs:
+            self._out(destination_info_lookup=lambda d: None)
+        self.assertTrue(any("destination_info_miss" in r.getMessage() for r in logs.records))
+
+    def test_markup_in_model_prose_is_stripped(self) -> None:
+        poisoned = {"health": [{"he": "<script>alert(1)</script> רע", "en": "<img src=x> bad"}]}
+        info = self._out(destination_info_lookup=lambda d: poisoned)["travel_info"]
+        model = [i for i in info["health"] if i["source"] == "model"]
+        self.assertTrue(model)
+        self.assertNotIn("<", model[0]["en"] + model[0]["he"])
+
+    def test_internal_whitespace_is_collapsed_like_the_typescript_producer(self) -> None:
+        """Both halves of one list must normalise the same way.
+
+        The model half goes through `plainText` in hermes-search.ts, which
+        collapses runs of whitespace; `_info_line` did not, so an API-derived
+        value carrying a newline or a double space rendered differently from the
+        model line directly beneath it in the SAME list. Both reach `_biSpan` in
+        site/app.js, which interpolates into raw HTML — where a newline is not a
+        line break, just inconsistent spacing.
+        """
+        ragged = {"health": [{"he": "  מי\n\tהברז   ראויים  ", "en": "\n Tap   water \tis  safe \n"}]}
+        info = self._out(destination_info_lookup=lambda d: ragged)["travel_info"]
+        line = [i for i in info["health"] if i["source"] == "model"][0]
+        self.assertEqual("Tap water is safe", line["en"])
+        self.assertEqual("מי הברז ראויים", line["he"])
+
+    def test_the_api_half_is_collapsed_too_not_just_the_model_half(self) -> None:
+        """The half that actually regressed. A currency name arriving from
+        countries.dev with a stray newline produced a money line whose spacing
+        disagreed with the model money line under it."""
+        cfg = _config()
+        cfg["travel_info"] = {"countries": {"Vietnam": {
+            "currency": {"code": "VND", "symbol": "₫", "name": "Vietnamese\n  Dong"}}}}
+        out = enrich_config(cfg, "Atlantis", http=FakeHttp({}), pause=0,
+                            destination_info_lookup=lambda d: None)
+        money = out["travel_info"]["money"][0]
+        self.assertEqual("api", money["source"])
+        self.assertIn("Vietnamese Dong", money["en"])
+        self.assertNotIn("\n", money["en"])
+        self.assertNotIn("  ", money["en"])
+
+    def test_the_length_cap_counts_rendered_characters_not_whitespace(self) -> None:
+        """Bounding LAST is why the order in _info_plain matters: a line padded
+        with 400 spaces must not be truncated to nothing visible."""
+        padded = {"money": [{"he": "מ", "en": " " * 400 + "Cash is common"}]}
+        info = self._out(destination_info_lookup=lambda d: padded)["travel_info"]
+        line = [i for i in info["money"] if i["source"] == "model"][0]
+        self.assertEqual("Cash is common", line["en"])
+
+    def test_hospitals_are_never_produced_even_if_the_cache_offers_them(self) -> None:
+        """Dropped deliberately (Dror, 2026-09-19): a plausible-but-wrong
+        hospital name is a failure mode not worth carrying, and the emergency
+        numbers are what matter in an emergency."""
+        offered = dict(self.CACHED, hospitals=[{"area": "Tokyo", "name": "Invented General"}])
+        info = self._out(destination_info_lookup=lambda d: offered)["travel_info"]
+        self.assertNotIn("hospitals", info)
+
+    def test_a_raising_lookup_never_propagates_and_keeps_the_api_lines(self) -> None:
+        def boom(destination):
+            raise RuntimeError("cache on fire")
+        info = self._out(destination_info_lookup=boom)["travel_info"]
+        self.assertTrue(info["money"])
+
+    def test_an_unreachable_cache_is_NOT_reported_as_a_plain_miss(self) -> None:
+        """A broken database and a never-refreshed destination produce the same
+        thin Info tab, so the log is the only thing that separates them. If the
+        reader swallowed its own errors — or if this pass logged both lines —
+        rotated credentials would show up as a harmless "miss" on every single
+        provision and nothing would say the cache was unreachable."""
+        def boom(destination):
+            raise RuntimeError("connection refused")
+        with self.assertLogs("control_plane_worker.enrichment", level="WARNING") as logs:
+            self._out(destination_info_lookup=boom)
+        messages = [r.getMessage() for r in logs.records]
+        self.assertIn("enrichment.destination_info_failed", messages)
+        self.assertNotIn("enrichment.destination_info_miss", messages)
+
+    def test_a_genuine_miss_is_NOT_reported_as_a_failure(self) -> None:
+        """The other direction: a destination simply not in the cache must not
+        raise an operator's alarm about a broken one."""
+        with self.assertLogs("control_plane_worker.enrichment", level="WARNING") as logs:
+            self._out(destination_info_lookup=lambda d: None)
+        messages = [r.getMessage() for r in logs.records]
+        self.assertIn("enrichment.destination_info_miss", messages)
+        self.assertNotIn("enrichment.destination_info_failed", messages)
+
+    def test_no_country_and_no_cache_writes_no_lists_at_all(self) -> None:
+        """This module does not invent facts: a country that will not resolve
+        and a cache with nothing in it produce no Info tab lists, not empty
+        ones (an empty list renders as an empty section)."""
+        out = enrich_config(_config(), "Atlantis", http=FakeHttp({}), pause=0,
+                            destination_info_lookup=lambda d: None)
+        # Not merely "no lists" — no travel_info at all. An empty dict here is
+        # itself a regression: two resilience tests assert the key is absent
+        # when nothing resolved, and a bare setdefault broke both.
+        self.assertNotIn("travel_info", out)
+
+    def test_the_transformers_static_currency_floor_still_yields_a_money_line(self) -> None:
+        """When countries.dev does not resolve, _enrich_country returns None and
+        the API lines have to come from whatever the transformer left behind.
+        That fallback is resolved once, explicitly, in enrich_config — this is
+        the test that it is still wired, since the entry now arrives as an
+        argument rather than being read back out of the config."""
+        cfg = _config()
+        cfg["travel_info"] = {"countries": {"Vietnam": {
+            "currency": {"code": "VND", "symbol": "₫", "name": "Vietnamese Dong"}}}}
+        out = enrich_config(cfg, "Atlantis", http=FakeHttp({}), pause=0,
+                            destination_info_lookup=lambda d: None)
+        money = out["travel_info"]["money"]
+        self.assertTrue(any("VND" in i["en"] for i in money), money)
+        self.assertEqual("api", money[0]["source"])
+
+    def test_the_api_lines_follow_the_live_entry_not_the_stale_stub(self) -> None:
+        """A live hit REPLACES the transformer's stub, so the Info lines must
+        describe the live country, not the one the stub named."""
+        cfg = _config()
+        cfg["travel_info"] = {"countries": {"Vietnam": {
+            "currency": {"code": "VND", "symbol": "₫", "name": "Vietnamese Dong"}}}}
+        out = enrich_config(cfg, "Japan", http=FakeHttp(self.JP_HTTP), pause=0)
+        money = out["travel_info"]["money"]
+        self.assertTrue(any("JPY" in i["en"] for i in money), money)
+        self.assertFalse(any("VND" in i["en"] for i in money), money)
+
+    def test_consular_contacts_and_info_lists_coexist(self) -> None:
+        """_enrich_country REPLACES travel_info wholesale, so anything written
+        before it is lost. Both later passes must survive each other."""
+        out = enrich_config(_config(), "Japan", http=FakeHttp(self.JP_HTTP), pause=0,
+                            consular_lookup=lambda d, h: ConsularContactsTests.JP_IL,
+                            destination_info_lookup=lambda d: self.CACHED)
+        info = out["travel_info"]
+        self.assertTrue(info["emergency_contacts"])
+        self.assertTrue(info["countries"])
+        self.assertTrue(info["health"])
+
+
+class InfoCapConsistencyTests(unittest.TestCase):
+    """The worker's ceilings on a cached Info row and the TypeScript producer's
+    caps are the same two numbers in two languages that cannot see each other.
+
+    Nothing links them but this test. Raising `MAX_ITEMS_PER_LIST` in
+    destination-info.ts alone would store 8 lines and silently show 6; lowering
+    the worker's alone would silently drop lines that were paid for. Both are
+    invisible from the site — a shorter list looks exactly like a shorter
+    answer. So the link is asserted against the real file rather than written
+    down in a comment and trusted.
+    """
+
+    TS_SOURCE = (
+        pathlib.Path(__file__).resolve().parents[3]
+        / "control-plane" / "api" / "src" / "destination-info.ts"
+    )
+
+    def _ts_constant(self, name: str) -> int:
+        """Reads the constant out of the TypeScript source.
+
+        Regex-over-source is a stopgap, and its specific fragility is that a
+        harmless refactor can hide the value: `= 6 as const`, a computed
+        expression, or a move to another module would all read as "not found".
+        That is why the miss is an explicit FAILURE with the file named, not a
+        skip or a default — a vacuous pass here would silently retire the only
+        link between the two languages. The tolerated forms are a bare integer
+        with optional `as const`; anything else must update this reader.
+        """
+        source = self.TS_SOURCE.read_text(encoding="utf-8")
+        match = re.search(rf"\b{name}\s*=\s*(\d+)\s*(?:as\s+const\s*)?;", source)
+        self.assertIsNotNone(
+            match,
+            f"{name} not found as a plain integer in {self.TS_SOURCE} — if it was "
+            f"refactored, update this reader rather than deleting the assertion",
+        )
+        return int(match.group(1))
+
+    def test_the_producer_file_is_where_we_think_it_is(self) -> None:
+        # A moved or renamed file would make the two asserts below vacuous.
+        self.assertTrue(self.TS_SOURCE.is_file(), self.TS_SOURCE)
+
+    def test_items_per_list_cap_matches_the_typescript_producer(self) -> None:
+        self.assertEqual(self._ts_constant("MAX_ITEMS_PER_LIST"),
+                         enrichment._MAX_INFO_ITEMS_PER_LIST)
+
+    def test_item_character_cap_matches_the_typescript_producer(self) -> None:
+        self.assertEqual(self._ts_constant("MAX_ITEM_CHARS"),
+                         enrichment._MAX_INFO_ITEM_CHARS)
+
+    def test_the_cap_is_actually_applied_to_an_oversized_cache_row(self) -> None:
+        """The row comes back from a database, so "the writer promised" is not a
+        bound — a row written by an older or wider producer must still be cut."""
+        oversized = {
+            "health": [{"he": f"ש{i}", "en": f"line {i}"} for i in range(20)],
+            "money": [{"he": "מ" * 900, "en": "x" * 900}],
+            "source": "hermes:search",
+        }
+        out = enrich_config(_config(), "Japan", http=FakeHttp({}), pause=0,
+                            destination_info_lookup=lambda d: oversized)
+        info = out["travel_info"]
+        self.assertEqual(enrichment._MAX_INFO_ITEMS_PER_LIST, len(info["health"]))
+        self.assertEqual(enrichment._MAX_INFO_ITEM_CHARS, len(info["money"][0]["en"]))
+        self.assertEqual(enrichment._MAX_INFO_ITEM_CHARS, len(info["money"][0]["he"]))
+
+
 class ResilienceTests(unittest.TestCase):
     def test_a_raising_http_client_never_propagates(self) -> None:
         http = FakeHttp({}, boom=True)
@@ -589,3 +999,162 @@ class ResilienceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GeocodeMissIsVisible(unittest.TestCase):
+    """A lookup that returns nothing must leave a trace.
+
+    On 2026-09-19 a trip was provisioned while the geocoder was unavailable and
+    came out with no mapStop on any phase and no map at all — with not one line
+    in the worker log, because `_geocode_place` returning None is not an
+    exception and nothing logged the miss (issue #112). Enrichment still
+    degrades rather than failing; it just has to say so.
+    """
+
+    def _config(self):
+        return {"phases": [{"id": "tokyo", "title": {"en": "Tokyo", "he": "Tokyo"}}]}
+
+    def test_a_phase_that_resolves_nowhere_is_logged(self):
+        from control_plane_worker import enrichment
+
+        with self.assertLogs("control_plane_worker.enrichment", level="WARNING") as captured:
+            out = enrichment.enrich_config(self._config(), "Japan", http=lambda url: None, pause=0)
+        self.assertNotIn("mapStop", out["phases"][0], "precondition: nothing should have resolved")
+        self.assertTrue(
+            any("geocode_miss" in r.getMessage() for r in captured.records),
+            f"no geocode_miss logged; got {[r.getMessage() for r in captured.records]}",
+        )
+
+    def test_a_phase_that_resolves_logs_no_miss(self):
+        from control_plane_worker import enrichment
+
+        def http(url):
+            return [{"lat": "35.68", "lon": "139.76", "display_name": "Tokyo"}]
+
+        with self.assertLogs("control_plane_worker.enrichment", level="WARNING") as captured:
+            logging.getLogger("control_plane_worker.enrichment").warning("sentinel")
+            out = enrichment.enrich_config(self._config(), "Japan", http=http, pause=0)
+        self.assertIn("mapStop", out["phases"][0])
+        self.assertFalse(
+            any("geocode_miss" in r.getMessage() for r in captured.records),
+            "logged a miss for a phase that resolved",
+        )
+
+    def test_a_transport_failure_is_distinguished_from_an_empty_result(self):
+        """429 and 'no such place' both yield None downstream; only one is
+        worth retrying, so they must not look identical in the log."""
+        from control_plane_worker import enrichment
+
+        import urllib.error
+
+        def boom(req, timeout=None):
+            raise urllib.error.HTTPError(req.full_url, 429, "Too Many Requests", {}, None)
+
+        with mock.patch.object(enrichment.urllib.request, "urlopen", boom):
+            with self.assertLogs("control_plane_worker.enrichment", level="WARNING") as captured:
+                self.assertIsNone(enrichment._default_http("https://nominatim.openstreetmap.org/search?q=x"))
+        messages = [r.getMessage() for r in captured.records]
+        self.assertTrue(any("http_failed" in m for m in messages), messages)
+        self.assertEqual(429, next(getattr(r, "status", None) for r in captured.records))
+
+
+class WorkerLogLevel(unittest.TestCase):
+    """INFO must reach the log. `provisioner.mcp_bridge_wired` and
+    `mcp_bridge_skipped` are both INFO, and with Python's default root level of
+    WARNING they were discarded — so a trip that came up with no trip-mcp left
+    no trace of which of the two happened (2026-09-19)."""
+
+    def _configure(self, env):
+        """Apply _configure_logging under `env` and report the level it set,
+        leaving the root logger exactly as it was — otherwise this class would
+        reconfigure logging for every test that runs after it."""
+        import os
+
+        from control_plane_worker.__main__ import _configure_logging
+
+        root = logging.getLogger()
+        saved_level, saved_handlers = root.level, root.handlers[:]
+        try:
+            root.handlers = []
+            with mock.patch.dict(os.environ, env, clear=False):
+                if "WORKER_LOG_LEVEL" not in env:
+                    os.environ.pop("WORKER_LOG_LEVEL", None)
+                _configure_logging()
+                return root.level
+        finally:
+            root.setLevel(saved_level)
+            root.handlers = saved_handlers
+
+    def test_info_is_the_default(self):
+        self.assertEqual(logging.INFO, self._configure({}))
+
+    def test_the_level_can_be_raised_or_lowered(self):
+        self.assertEqual(logging.DEBUG, self._configure({"WORKER_LOG_LEVEL": "DEBUG"}))
+        self.assertEqual(logging.WARNING, self._configure({"WORKER_LOG_LEVEL": "warning"}))
+
+    def test_an_unrecognised_value_falls_back_to_info_not_to_silence(self):
+        # A typo must not disable logging — that is the failure this prevents.
+        self.assertEqual(logging.INFO, self._configure({"WORKER_LOG_LEVEL": "verbose"}))
+
+
+class LocationQueriesDoNotRepeatThemselves(unittest.TestCase):
+    """A phase must not ask the geocoder for the whole itinerary.
+
+    Organizers answer the destination with a list — "Tokyo, Hakone, Kyoto,
+    Osaka, Japan". The query was f"{label}, {destination}", so the Tokyo phase
+    asked for "Tokyo, Tokyo, Hakone, Kyoto, Osaka, Japan": its own city twice,
+    then three cities it is not in. Nominatim returns nothing for that and
+    _default_http reports nothing as None, so on 2026-09-19 every phase of a
+    real trip silently lost its coordinates and the site showed no map.
+    """
+
+    DEST = "Tokyo, Hakone, Kyoto, Osaka, Japan"
+
+    def test_the_phase_city_is_not_repeated(self):
+        from control_plane_worker.enrichment import _destination_anchor, _location_query
+
+        q = _location_query("Tokyo", _destination_anchor(self.DEST))
+        self.assertEqual("Tokyo, Japan", q)
+        self.assertEqual(1, q.lower().count("tokyo"), q)
+
+    def test_other_phases_cities_are_not_dragged_in(self):
+        from control_plane_worker.enrichment import _destination_anchor, _location_query
+
+        q = _location_query("Tokyo", _destination_anchor(self.DEST))
+        for elsewhere in ("Hakone", "Kyoto", "Osaka"):
+            self.assertNotIn(elsewhere, q, f"{elsewhere} is not in the Tokyo phase")
+
+    def test_a_single_country_destination_still_anchors(self):
+        from control_plane_worker.enrichment import _destination_anchor, _location_query
+
+        self.assertEqual("Rome, Italy", _location_query("Rome", _destination_anchor("Italy")))
+
+    def test_deduplication_ignores_case_and_whitespace(self):
+        from control_plane_worker.enrichment import _location_query
+
+        self.assertEqual("Tokyo, Japan", _location_query("Tokyo", " tokyo ", "TOKYO, Japan"))
+
+    def test_an_empty_destination_leaves_just_the_label(self):
+        from control_plane_worker.enrichment import _destination_anchor, _location_query
+
+        self.assertEqual("Tokyo", _location_query("Tokyo", _destination_anchor("")))
+
+    def test_a_venue_query_carries_its_own_city_and_country_only(self):
+        from control_plane_worker.enrichment import enrich_config
+
+        asked: list[str] = []
+
+        def http(url):
+            asked.append(urllib.parse.unquote(urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get("q", [""])[0]))
+            return None
+
+        cfg = {"phases": [{
+            "id": "tokyo", "title": {"en": "Tokyo", "he": "Tokyo"},
+            "venues": [{"name": {"en": "Tokyo Skytree"}}],
+        }]}
+        out = enrich_config(cfg, self.DEST, http=http, pause=0)
+        maps = out["phases"][0]["venues"][0]["maps"]
+        target = urllib.parse.unquote(urllib.parse.parse_qs(urllib.parse.urlsplit(maps).query)["query"][0])
+        self.assertEqual("Tokyo Skytree, Tokyo, Japan", target)
+        for q in asked:
+            self.assertNotIn("Kyoto", q, f"a Tokyo phase asked for Kyoto: {q}")

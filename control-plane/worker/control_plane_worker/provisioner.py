@@ -20,7 +20,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, Protocol
+from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 import psycopg
 from psycopg.rows import dict_row
@@ -31,13 +31,21 @@ from .companion_profile import (
     build_companion_handoff,
 )
 from .compute import ComputeAdapter, NullComputeAdapter
-from .mcp_bridge import McpBridgeAdapter, NullMcpBridgeAdapter
+from .mcp_bridge import McpBridgeAdapter, NullMcpBridgeAdapter, log_fields
 from .release_source import ReleaseSourceError, materialize_release_source
+from . import verification
 from .transformer import (
     derive_bookings,
     derive_trip_slug,
     intake_destination,
     transform_intake,
+)
+from .document_handoff import (
+    TripDocumentFile,
+    build_document_links,
+    documents_manifest,
+    load_trip_documents,
+    publish_document,
 )
 
 # (config, destination) -> config. See ProvisionerWorker.__init__ for why this
@@ -56,6 +64,15 @@ DRAFT_SLUG_PREFIX = "draft-"
 # Bounded so a pathological base cannot spin the worker.
 SLUG_COLLISION_LIMIT = 100
 
+# #review 2026-10-03: found live — gate_ready_private's runtime_health/
+# rendered_data probes used to run the instant deploy() returned, with no
+# grace period for ordinary DNS/NPM/Cloudflare propagation lag behind a
+# freshly deployed, genuinely-healthy trip. Up to a minute of retrying
+# before a hard-gate failure is accepted as real; see verification.py's
+# `_retrying` for why only these two checks get this at all.
+VERIFICATION_RETRY_ATTEMPTS = 6
+VERIFICATION_RETRY_DELAY_S = 10.0
+
 
 class DeployAdapter(Protocol):
     """Deploys a trip config and returns the private URL."""
@@ -68,6 +85,8 @@ class DeployAdapter(Protocol):
         first_provision: bool = False,
         sidecars: Mapping[str, Any] | None = None,
         source_dir: str | None = None,
+        documents: Sequence[TripDocumentFile] | None = None,
+        trip_id: str | None = None,
     ) -> str: ...
 
 
@@ -95,8 +114,17 @@ UNREACHABLE_REASONS = {
     # The chat is already bound to a different trip; moving it is a reviewed
     # organizer action this job has no standing to perform.
     "BINDING_REFUSED",
-    # The binding write itself failed.
+    # The binding write itself failed — a technical, retriable fault.
     "BINDING_FAILED",
+    # The trip has been torn down (`teardown-trip.py`, slug renamed
+    # `retired-<slug>-<yyyymmdd>`). Distinct from BINDING_FAILED on purpose:
+    # that one implies retrying might help, and retrying THIS one cannot —
+    # the deploy directory, container and Hermes profile are already gone.
+    # See TripRetired and issue #105.
+    "TRIP_RETIRED",
+    # The companion is installed but its trip-mcp bridge could not be wired —
+    # every trip tool will fail while the companion answers normally.
+    "TRIP_MCP_BRIDGE_FAILED",
 }
 
 
@@ -151,6 +179,177 @@ def _record_reachability(
         })
 
 
+#: /health codes that mean the trip SITE did not answer the bridge — the hop
+#: after the bridge. mcp.js's /health fetches the site's /api/config (5s
+#: timeout) and reports the fetch's own error code; these are the network
+#: errnos Node and undici raise, plus ETIMEDOUT for its timeout.
+_SITE_ERRNO = {"ETIMEDOUT", "ECONNREFUSED", "ECONNRESET", "ENOTFOUND", "EAI_AGAIN",
+               "ENETUNREACH", "ENETDOWN", "EHOSTDOWN", "ECONNABORTED", "EPIPE"}
+
+
+def _bridge_failure_class(code: str) -> str:
+    """Which hop failed: "key", "site", "mac_route", "bridge", or "other"."""
+    if code in ("HTTP_401", "HTTP_403"):
+        return "key"
+    if code == "EHOSTUNREACH":
+        return "mac_route"
+    if (code in _SITE_ERRNO or code.startswith("UND_ERR_")
+            or (code.startswith("HTTP_5") and len(code) == 8 and code[5:].isdigit())):
+        return "site"
+    if code in ("none", "NO_KEY", "BRIDGE_401"):
+        return "bridge"
+    return "other"
+
+
+def bridge_probe_consequence(code: str, trip_id: str, slug: str) -> str:
+    """The alert text for a trip marked TRIP_MCP_BRIDGE_FAILED by the probe.
+
+    CODE-AWARE, because /health is two hops (bridge -> site) and the right
+    repair depends on which one failed. A site outage (container, NFS,
+    Proxmox) fails /health exactly as a broken bridge does, and sending the
+    operator to `restart-bridges` for it restarts a live companion and fixes
+    nothing. Repair stays an operator's act; nothing here restarts anything.
+    """
+    trip_env = (
+        f"Check first for a trips/{slug}/trip.env in the deploy directory: setup-mcp.sh prefers it over the "
+        f"container's own key, so a stale one re-applies the wrong key on every repair"
+    )
+    rewire = (
+        f"kinerary-cp-release restart-bridges on the control-plane VM; if it persists, re-wire from scratch "
+        f"with python -m control_plane_worker provision --reconcile-companion {trip_id}"
+    )
+    kind = _bridge_failure_class(code)
+    if kind == "key":
+        what = (f"the trip refused the bridge's key ({code}): the key the bridge holds is not the one the "
+                f"trip's container accepts. Repair by re-wiring the bridge: {rewire}. {trip_env}")
+    elif kind == "site":
+        what = (f"the trip's site did not answer through the bridge ({code}) — check the site first (its "
+                f"container, its NFS mount, its Proxmox host); restarting the bridge will not fix a dead site. "
+                f"If the site answers and this persists, the bridge is the next suspect")
+    elif kind == "mac_route":
+        what = (f"the bridge cannot route to the trip's address ({code}). On a Mac companion host this is the "
+                f"Local Network permission a bridge started over SSH lacks, not the key: restart the bridge "
+                f"from a Terminal (setup-mcp.sh --restart-only --trip-dir ./trips/{slug}). On a Linux host it "
+                f"usually means the trip's container is down — check the site first")
+    elif code == "none":
+        what = (f"the bridge did not answer at all (none): it is not running. Restart it: {rewire}. {trip_env}")
+    elif code == "NO_KEY":
+        what = (f"the companion host has no MCP_API_KEY for this trip's bridge (NO_KEY): it was never wired "
+                f"or its mcp/.env is gone. Re-wire it: {rewire}. {trip_env}")
+    elif code == "BRIDGE_401":
+        what = (f"the bridge refused the key in its own mcp/.env (BRIDGE_401): the file changed after the "
+                f"bridge started. Restart it: {rewire}. {trip_env}")
+    else:
+        what = (f"the bridge's /health reported {code}. Check the site first, then the bridge "
+                f"(kinerary-cp-release restart-bridges)")
+    return f"the companion answers normally but cannot read this trip — {what}"
+
+
+def record_bridge_probe(
+    conn: Any,
+    trip_id: str,
+    *,
+    ok: bool,
+    code: str = "",
+    confirmed: bool = False,
+    slug: str = "",
+) -> str:
+    """Records one bridge-probe verdict (issue #119) — CONDITIONALLY, never the
+    unconditional overwrite `_record_reachability` performs.
+
+    - Every verdict stamps `reachability_checked_at`, so "when was this last
+      looked at" is answerable from the row the fleet monitor already prints.
+    - A failure marks the trip `unreachable`/`TRIP_MCP_BRIDGE_FAILED` only when
+      `confirmed` (the caller counted two failed verdicts with no successful
+      verdict between them — see BridgeProbeSweep) AND only when the row says
+      `reachable` right now. Any other
+      reason — NO_ORGANIZER_CHAT, BINDING_REFUSED, … — is the provisioning
+      path's finding and is never replaced; `unknown` is the fail-safe default
+      and a probe has no standing to decide it.
+    - A success clears `unreachable` back to `reachable` only when the reason
+      is TRIP_MCP_BRIDGE_FAILED. The provisioning path records that reason only
+      when the chat binding beside it succeeded (a later binding failure
+      replaces it), so clearing it cannot uncover a masked second fault.
+
+    One reason for every failure code, not a TRIP_MCP_KEY_MISMATCH for
+    HTTP_401: `restart-bridges`, `verify` and the relay's wait select
+    TRIP_MCP_BRIDGE_FAILED trips (#193) and would silently skip a new reason.
+    The code travels in the log line and the consequence text instead.
+
+    The check-and-set is one UPDATE with the condition in its WHERE, so a
+    concurrent writer (switch-trip-chat.py, a reconcile) is never overwritten
+    by a stale read. Returns "marked", "cleared", "unchanged" or
+    "write_failed"; never raises.
+    """
+    try:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                if ok:
+                    cur.execute(
+                        """UPDATE control_plane.trips
+                              SET reachability = 'reachable',
+                                  unreachable_reason = NULL,
+                                  reachability_checked_at = now()
+                            WHERE id = %s
+                              AND reachability = 'unreachable'
+                              AND unreachable_reason = 'TRIP_MCP_BRIDGE_FAILED'
+                        RETURNING id""",
+                        (trip_id,),
+                    )
+                    changed = cur.fetchone() is not None
+                elif confirmed:
+                    cur.execute(
+                        """UPDATE control_plane.trips
+                              SET reachability = 'unreachable',
+                                  unreachable_reason = 'TRIP_MCP_BRIDGE_FAILED',
+                                  reachability_checked_at = now()
+                            WHERE id = %s
+                              AND reachability = 'reachable'
+                        RETURNING id""",
+                        (trip_id,),
+                    )
+                    changed = cur.fetchone() is not None
+                else:
+                    changed = False
+                if not changed:
+                    cur.execute(
+                        "UPDATE control_plane.trips SET reachability_checked_at = now() WHERE id = %s",
+                        (trip_id,),
+                    )
+    except Exception as exc:
+        # Class and SQLSTATE only, no traceback: a driver's text is not
+        # something this line vouches for (__main__.safe_failure_message).
+        sqlstate = getattr(exc, "sqlstate", None)
+        logger.warning(log_fields(
+            "provisioner.reachability_write_failed", slug=slug, trip_id=trip_id, source="bridge_probe",
+            error=type(exc).__name__, sqlstate=sqlstate if isinstance(sqlstate, str) else None,
+            effect="this verdict was not recorded; the next sweep asks again",
+        ), extra={"trip_id": trip_id, "slug": slug, "source": "bridge_probe"})
+        return "write_failed"
+
+    if not changed:
+        return "unchanged"
+    if ok:
+        logger.info(log_fields(
+            "provisioner.trip_reachable", slug=slug, trip_id=trip_id, source="bridge_probe",
+            cleared="TRIP_MCP_BRIDGE_FAILED",
+        ), extra={"trip_id": trip_id, "slug": slug, "source": "bridge_probe"})
+        return "cleared"
+    consequence = bridge_probe_consequence(code, trip_id, slug)
+    logger.warning(log_fields(
+        "provisioner.trip_unreachable", slug=slug, trip_id=trip_id, source="bridge_probe",
+        reason="TRIP_MCP_BRIDGE_FAILED", code=code, repair=consequence,
+    ), extra={
+        "trip_id": trip_id,
+        "slug": slug,
+        "source": "bridge_probe",
+        "reason": "TRIP_MCP_BRIDGE_FAILED",
+        "code": code,
+        "consequence": consequence,
+    })
+    return "marked"
+
+
 class ShellDeployAdapter:
     """Calls kinerary-deploy/deploy.sh via subprocess.
 
@@ -164,12 +363,82 @@ class ShellDeployAdapter:
         repo_root: str | None = None,
         timeout: int = 300,
         compute: ComputeAdapter | None = None,
+        trip_nfs_local_base: str | None = None,
     ) -> None:
         self._deploy_root = deploy_root
         self._vmid_map = vmid_map
         self._repo_root = repo_root or os.environ.get("REPO_ROOT", "")
         self._timeout = timeout
         self._compute = compute or NullComputeAdapter()
+        # The trips' NFS export as THIS process sees it — the directory whose
+        # per-trip subdirectories Proxmox mounts into each container, named by
+        # slug or by trip id depending on when each trip's topology.yaml was
+        # built (see `_trip_nfs_dirname`). Unset: the worker cannot reach trip
+        # NFS directories, and documents travel with the deploy instead.
+        self._trip_nfs_local_base = trip_nfs_local_base or os.environ.get("PROVISIONER_TRIP_NFS_LOCAL_BASE") or None
+
+    def _trip_nfs_dirname(self, slug: str) -> str | None:
+        """The last path segment of this trip's `nfs_host_dir`, read from its
+        own topology.yaml — the file `LxcProvisionAdapter._build_topology`
+        calls the truth: "a later upgrade or redeploy reads that file, never
+        this function" (compute.py). A trip provisioned before NFS
+        directories moved to trip id has a slug-shaped directory there
+        forever; one provisioned after has a trip-id-shaped one
+        (`trip_<hex>`). Reconstructing the name from `trip_id` instead would
+        get every already-provisioned trip wrong: `trip_id` is known on every
+        deploy, but the directory is only actually trip-id-shaped for a
+        topology built after that change.
+
+        Hand-parsed line by line, like `_private_url` below, rather than
+        through `provisioning.models.load_topology` — that raises on a
+        legacy topology with no `nfs_host_dir` at all (pre-Phase-G trips
+        hand-written before this field existed), which is exactly the file
+        this has to tolerate.
+        """
+        topology_path = os.path.join(self._deploy_root, "trips", slug, "topology.yaml")
+        try:
+            with open(topology_path, encoding="utf-8") as fh:
+                for line in fh:
+                    stripped = line.strip()
+                    if stripped.startswith("nfs_host_dir:"):
+                        value = stripped.split(":", 1)[1].strip()
+                        if value and not value.startswith("$"):
+                            return value.rstrip("/").rsplit("/", 1)[-1]
+                        return None
+        except FileNotFoundError:
+            pass
+        return None
+
+    def _trip_nfs_documents_dir(self, slug: str) -> str | None:
+        """The trip's NFS documents directory as this worker sees it, or None."""
+        if not self._trip_nfs_local_base:
+            return None
+        # The directory topology.yaml actually recorded, trip-id-shaped or
+        # slug-shaped; falling back to the slug itself when there is no
+        # topology yet to read — a vmid_map trip never gets one — or it names
+        # nothing usable (an unresolved ${VAR}, say).
+        dirname = self._trip_nfs_dirname(slug) or slug
+        # A path component, never a path: the same guard as the NFS reset in
+        # provisioning/adapters.py, widened for a trip-id name (which has an
+        # underscore, so plain `.isalnum()` after stripping hyphens rejects it).
+        if (
+            not dirname
+            or dirname != dirname.lower()
+            or dirname in (".", "..")
+            or dirname.startswith("-")
+            or not dirname.replace("-", "").replace("_", "").isalnum()
+        ):
+            return None
+        trip_nfs = os.path.join(self._trip_nfs_local_base, dirname)
+        # The compute adapter creates the trip's NFS directory. One this worker
+        # cannot see means it is not looking at the same export, and creating a
+        # look-alike would publish documents the container never mounts.
+        if not os.path.isdir(trip_nfs):
+            logger.warning(
+                "provisioner.trip_nfs_dir_not_visible", extra={"slug": slug, "dirname": dirname}
+            )
+            return None
+        return os.path.join(trip_nfs, "documents")
 
     def deploy(
         self,
@@ -179,6 +448,8 @@ class ShellDeployAdapter:
         first_provision: bool = False,
         sidecars: Mapping[str, Any] | None = None,
         source_dir: str | None = None,
+        documents: Sequence[TripDocumentFile] | None = None,
+        trip_id: str | None = None,
     ) -> str:
         # A static vmid_map entry (the two legacy, hand-provisioned trips)
         # always wins; a slug with no entry falls to the compute adapter —
@@ -187,7 +458,7 @@ class ShellDeployAdapter:
         # only reaches the compute path (a vmid_map trip is a long-lived hand
         # box whose data is never reset here).
         vmid = self._vmid_map.get(slug) or self._compute.create_container(
-            slug, first_provision=first_provision
+            slug, first_provision=first_provision, trip_id=trip_id,
         )
 
         trip_dir = os.path.join(self._deploy_root, "trips", slug)
@@ -202,6 +473,51 @@ class ShellDeployAdapter:
         for name, payload in (sidecars or {}).items():
             with open(os.path.join(trip_dir, name), "w", encoding="utf-8") as fh:
                 json.dump(payload, fh, ensure_ascii=False, indent=2)
+
+        # The trip's source documents, under their content-addressed names.
+        #
+        # FIRST CHOICE: the trip's own NFS directory, which the container
+        # already mounts. Hard-linked there from the control plane's store, both
+        # names point at ONE physical copy on the export: no second copy, no
+        # transfer, and the site reads it from its mount (TRIP_DOCUMENTS_DIR).
+        # The container still sees only its own trip's directory; the store
+        # stays outside every trip's mount.
+        #
+        # FALLBACK, per document: beside the config, which deploy.sh carries onto
+        # the container — when this worker cannot see the trip's NFS directory,
+        # or the export refuses the write (root squashing, say). A document that
+        # cannot be published either way is logged and left out, never a failed
+        # deploy.
+        if documents:
+            nfs_documents_dir = self._trip_nfs_documents_dir(slug)
+            documents_dir = os.path.join(trip_dir, "documents")
+            published: dict[str, int] = {}
+            for document in documents:
+                strategy: str | None = None
+                if nfs_documents_dir:
+                    try:
+                        strategy = f"nfs_{publish_document(document, nfs_documents_dir)}"
+                    except (OSError, ValueError):
+                        logger.warning(
+                            "provisioner.document_nfs_publish_failed",
+                            extra={"slug": slug, "document_id": document.document_id},
+                            exc_info=True,
+                        )
+                if strategy is None:
+                    try:
+                        strategy = publish_document(document, documents_dir)
+                    except (OSError, ValueError):
+                        logger.warning(
+                            "provisioner.document_not_published",
+                            extra={"slug": slug, "document_id": document.document_id},
+                            exc_info=True,
+                        )
+                        continue
+                published[strategy] = published.get(strategy, 0) + 1
+            logger.info(
+                "provisioner.documents_published",
+                extra={"slug": slug, **{f"documents_{how}": count for how, count in published.items()}},
+            )
 
         deploy_sh = os.path.join(self._deploy_root, "deploy.sh")
         env = {**os.environ}
@@ -277,6 +593,32 @@ class BindingRefused(Exception):
         self.chat_id = chat_id
         self.existing_trip_id = existing_trip_id
         self.requested_trip_id = requested_trip_id
+
+
+class TripRetired(Exception):
+    """The REQUESTED trip has been torn down.
+
+    Sibling of `BindingRefused`, not a case of it: that exception is about a
+    chat already committed to a different trip. This one fires even for a
+    chat with no open binding at all — the trip itself is the problem, and no
+    signed organizer action can retry it away, because `teardown-trip.py` has
+    already deleted the deploy directory, the container and the Hermes
+    profile behind it.
+
+    `teardown-trip.py` renames the trip's slug to `retired-<orig-slug>-<yyyymmdd>`
+    as the durable signal (issue #105) — `lifecycle_state` is not necessarily
+    updated, so the slug prefix is what this checks. Production evidence,
+    2026-09-18: a fourth binding was created against a trip eight minutes
+    after its other three were closed with `closed_reason = 'trip_destroyed'`,
+    silently re-routing a group's messages to a companion that no longer
+    existed.
+    """
+
+    def __init__(self, chat_id: str, trip_id: str, slug: str) -> None:
+        super().__init__("target trip has been torn down")
+        self.chat_id = chat_id
+        self.trip_id = trip_id
+        self.slug = slug
 
 
 def attach_profile_to_orphan_bindings(
@@ -368,6 +710,27 @@ def link_organizer_person(
     return True
 
 
+def _record_trip_companion(
+    conn: psycopg.Connection, trip_id: str, hermes_profile: str
+) -> None:
+    """Writes the companion this trip was built with onto the trip itself.
+
+    Separate from any binding on purpose (migration 20260922060000): routing can be
+    refused, closed or moved, and none of that changes which profile was
+    installed for this trip.
+    """
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE control_plane.trips
+                SET    hermes_profile = %s, updated_at = now()
+                WHERE  id = %s AND hermes_profile IS DISTINCT FROM %s
+                """,
+                (hermes_profile, trip_id, hermes_profile),
+            )
+
+
 def bind_chat_to_trip(
     conn: psycopg.Connection,
     chat_id: str,
@@ -385,10 +748,21 @@ def bind_chat_to_trip(
     retried later without first reconstructing routing.
 
     Returns the outcome as a short string for logging: "created", "unchanged",
-    or "profile_rebound".
+    "profile_rebound" or "retargeted".
 
-    Three cases, and the distinction between the last two is the whole point:
+    Three cases, and the distinction between the last two is the whole point —
+    plus a fourth that is checked before any of them, because it does not
+    depend on whether a binding already exists at all:
 
+      target trip retired -> refuse and log, always. See TripRetired. A trip
+                              whose slug has been renamed `retired-<slug>-
+                              <yyyymmdd>` by `teardown-trip.py` (issue #105)
+                              has no deploy directory, container or Hermes
+                              profile left behind it — binding a chat to it,
+                              new or retargeted, only routes real messages to
+                              nothing and costs every relay restart the full
+                              gateway-wait timeout for a companion that can
+                              never reconnect.
       no open binding      -> open one.
       same trip            -> not a reassignment. Identical profile is a
                               no-op (a re-provision of an unchanged trip);
@@ -412,13 +786,43 @@ def bind_chat_to_trip(
     every other chat — a family group actively using trip A is exactly what
     BindingRefused exists to protect, and no group binding passes this flag.
 
+    On this branch the displaced trip is NOT stranded: `/trips` and `/switch`
+    exist here, and `trips.hermes_profile` (migration 20260922060000) is what
+    lets a switch back find the companion that serves it.
+
     Runs in one transaction and takes FOR UPDATE on the open row, so two
     provisions racing for the same chat serialise here instead of both
     believing they won. The partial unique index from migration 0029 is the
     backstop if they somehow don't.
+
+    The retired-trip slug SELECT above has no equivalent lock: FOR UPDATE
+    protects two `bind_chat_to_trip` calls racing each other, not this call
+    racing a concurrent `teardown-trip.py` run — nothing here takes a lock on
+    the TRIPS row, only on the binding row, so a teardown that renames the
+    slug between this SELECT and the INSERT below would not be seen. Accepted
+    as a narrow residual risk rather than closed: the production case this
+    fix answers (issue #105) was an eight-minute gap between teardown and the
+    stray binding, not a race decided by microseconds, and actually closing
+    it would mean locking the trips row itself and `teardown-trip.py`
+    cooperating with that lock — a bigger transactional change than this fix
+    is meant to be.
     """
     with conn.transaction():
         with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT slug FROM control_plane.trips WHERE id = %s",
+                (trip_id,),
+            )
+            trip_row = cur.fetchone()
+            if trip_row is not None and trip_row["slug"].startswith("retired-"):
+                logger.error("provisioner.binding_refused_trip_retired", extra={
+                    "chat_id": chat_id,
+                    "trip_id": trip_id,
+                    "slug": trip_row["slug"],
+                    "consequence": "no binding opened; the trip was torn down",
+                })
+                raise TripRetired(chat_id, trip_id, trip_row["slug"])
+
             cur.execute(
                 """
                 SELECT id, trip_id, hermes_profile
@@ -453,7 +857,6 @@ def bind_chat_to_trip(
                         existing["id"],
                     ),
                 )
-
             cur.execute(
                 """
                 INSERT INTO control_plane.telegram_chat_bindings
@@ -585,7 +988,7 @@ class _LeaseHeartbeat:
                 )
 
 
-def _organizer_recipient_chat_id(cur: Any, trip_id: str) -> str | None:
+def _organizer_chat_ids(cur: Any, trip_id: str) -> tuple[str | None, str | None]:
     """The chat a trip's organizer is reached in — see the preference order in `_complete`.
 
     One query for provisioning and for `reconcile_companion`, so a trip repaired
@@ -615,8 +1018,16 @@ def _organizer_recipient_chat_id(cur: Any, trip_id: str) -> str | None:
     )
     row = cur.fetchone()
     if not row:
-        return None
-    return row["provider_subject_id"] or row["interview_chat_id"] or row["notification_chat_id_hint"]
+        return None, None
+    # Only these two values have authenticated provenance. The hint may receive
+    # a notification, but must never establish a routing or person identity.
+    verified = row["provider_subject_id"] or row["interview_chat_id"]
+    return verified, verified or row["notification_chat_id_hint"]
+
+
+def _organizer_recipient_chat_id(cur: Any, trip_id: str) -> str | None:
+    """The delivery recipient, which may use the unverified hint as fallback."""
+    return _organizer_chat_ids(cur, trip_id)[1]
 
 
 class ProvisionerWorker:
@@ -650,8 +1061,17 @@ class ProvisionerWorker:
         materialize: MaterializeFn | None = None,
         operator_chat_id: str | None = None,
         seed_password: str | None = None,
+        document_store_dir: str | None = None,
+        verification_http_get: "verification.HttpGetFn | None" = None,
+        verification_retry_attempts: int | None = None,
+        verification_retry_delay_s: float | None = None,
+        verification_sleep: "verification.SleepFn | None" = None,
     ) -> None:
         self._db_url = db_url
+        # Where the control plane keeps uploaded originals (DOCUMENT_STORE_DIR,
+        # the same root the relay writes to). Unset: a trip is provisioned with
+        # no source documents, exactly as before documents were kept at all.
+        self._document_store_dir = document_store_dir or os.environ.get("DOCUMENT_STORE_DIR") or None
         self._deploy = deploy
         # Raw Telegram chat id for the operator's own copy of the provisioning
         # outcome. None (the default, and every existing test) enqueues no
@@ -677,6 +1097,31 @@ class ProvisionerWorker:
         self._materialize = materialize or (
             lambda revision, digest: materialize_release_source(self._repo_root, revision, digest)
         )
+        # Explicit override first, then whatever the deploy adapter itself
+        # knows how to answer for the URL it just handed back (FakeDeployAdapter
+        # in tests implements `http_get` for exactly this reason — it is the
+        # one object that knows its own invented URL is not real), then a real
+        # network GET. Unlike companion/mcp_bridge this signal needs no LAN/SSH
+        # infra a deployment might lack — every `private_url` is reachable the
+        # same way an organizer's own browser reaches it — so the real check is
+        # ON by default in every deployment, with no extra wiring required.
+        self._verification_http_get = (
+            verification_http_get or getattr(deploy, "http_get", None) or verification.default_http_get
+        )
+        # #review 2026-10-03: injectable for the same reason verification_http_get
+        # is — a FakeDeployAdapter's http_get answers instantly, in-memory, so a
+        # test deliberately simulating an unhealthy site must not ALSO wait
+        # through the real production retry budget (up to a minute of real
+        # time.sleep) to prove the gate still fails. Defaults are the real
+        # values; every existing test that does not override these keeps its
+        # old, fast, unretried behavior.
+        self._verification_retry_attempts = (
+            verification_retry_attempts if verification_retry_attempts is not None else VERIFICATION_RETRY_ATTEMPTS
+        )
+        self._verification_retry_delay_s = (
+            verification_retry_delay_s if verification_retry_delay_s is not None else VERIFICATION_RETRY_DELAY_S
+        )
+        self._verification_sleep = verification_sleep or time.sleep
 
     # ── public API ──────────────────────────────────────────────────────────────
 
@@ -723,6 +1168,9 @@ class ProvisionerWorker:
 
             # Load intake answers from intake_versions.data.
             answers = self._load_intake_data(conn, intake_version_id)
+            # And the documents that version was confirmed with, with which
+            # answer each one supports.
+            manifest = self._load_intake_source_document(conn, intake_version_id)
 
             # Transform to trip.config.json. The language comes from the
             # intake VERSION, not the session — the session does not survive a
@@ -768,9 +1216,24 @@ class ProvisionerWorker:
                 "version": 1, "tripId": trip_id, "owner": owner,
             }
 
-            bookings = derive_bookings(config, answers)
+            # The confirmed version's source documents: published beside the
+            # config, the voucher that supplied a stay shown on its hotel card,
+            # a ticket on its booking, and everything each document supports
+            # in documents.json.
+            trip_documents = load_trip_documents(conn, trip_id, manifest, self._document_store_dir)
+            links = build_document_links(
+                config, answers, manifest, {doc.document_id: doc for doc in trip_documents},
+            )
+            for phase in config.get("phases") or []:
+                stay_file = links.for_phase(str(phase.get("id")))
+                if stay_file and isinstance(phase.get("accommodation"), dict):
+                    phase["accommodation"]["pdf"] = stay_file
+
+            bookings = derive_bookings(config, answers, links)
             if bookings:
                 sidecars["bookings.json"] = bookings
+            if trip_documents:
+                sidecars["documents.json"] = documents_manifest(links, bookings)
 
             # The slug assigned at signup approval is a placeholder — the
             # destination and dates were not known yet. Now that the intake
@@ -794,16 +1257,76 @@ class ProvisionerWorker:
                     first_provision=bool(plan_desired.get("first_provision", False)),
                     sidecars=sidecars,
                     source_dir=source_dir,
+                    documents=trip_documents,
+                    # Names the trip's data directory on a FIRST provision; an
+                    # existing trip's directory comes from its topology file.
+                    trip_id=trip_id,
                 )
             finally:
                 if source_dir:
                     shutil.rmtree(source_dir, ignore_errors=True)
 
+            # Verification aggregator (Sprint 6, docs/sprint6-tracks.md:472):
+            # a real gate before `ready_private`, not the unconditional UPDATE
+            # that used to be here. Hard-gates on the three signals checkable
+            # now that the site is actually deployed — release compatibility,
+            # runtime health, rendered data — and records (never fabricates)
+            # the other three. Raises VerificationFailed (safe_error_code
+            # VERIFICATION_FAILED) on a hard-gate miss, caught by this
+            # function's own handler below exactly like a materialize
+            # failure: the job fails/retries and the trip stays where it was.
+            # See verification.py's module docstring for why isolation,
+            # messaging binding and backup checkpoint are not hard-gated yet.
+            deployment_ref = plan_desired.get("release_source_revision") or plan_desired.get("release_id")
+            # #review 2026-10-03 [P2], round 1: rendered_data used to accept
+            # ANY reachable trip's nonempty roster, so a misrouted
+            # private_url (a stale ingress entry, two trips racing onto the
+            # same address) could pass this check against another trip's
+            # data entirely. expected_usernames is THIS deploy's own
+            # participant list.
+            # #review 2026-10-03 [P2], round 2: usernames alone do not
+            # identify the TRIP -- a second trip for the same family shares
+            # them. expected_deployment_nonce (THIS deploy's own
+            # config["meta"]["deploymentNonce"], generated fresh per render
+            # by transformer.py) cannot collide between two distinct real
+            # trips, or two distinct deploys, the way a roster can. Carries
+            # no information about the trip itself (#review 2026-10-06 [N1]
+            # -- this used to be the deploy's own departure/returnDate,
+            # served back by an unauthenticated route; see verification.py's
+            # docstring for why that leaked real information and this
+            # doesn't).
+            expected_usernames = frozenset(
+                p.get("username") for p in (config.get("participants") or [])
+                if isinstance(p, dict) and p.get("username")
+            )
+            meta = config.get("meta") or {}
+            verification.gate_ready_private(
+                conn, trip_id=trip_id, deployment_ref=deployment_ref,
+                plan_desired=plan_desired, private_url=private_url,
+                http_get=self._verification_http_get,
+                expected_usernames=expected_usernames,
+                expected_deployment_nonce=meta.get("deploymentNonce"),
+                retry_attempts=self._verification_retry_attempts,
+                retry_delay_s=self._verification_retry_delay_s,
+                sleep=self._verification_sleep,
+            )
+
             # Commit success.
             self._complete(
                 conn, job_id, plan_id, trip_id, private_url,
                 slug=slug, config=config, intake_version_id=intake_version_id,
+                deployment_ref=deployment_ref,
             )
+
+            # Hand the deployed plan to the post-deploy review pass
+            # (control-plane/api/src/plan-review.ts). Deliberately AFTER
+            # _complete and in its own transaction: this worker can be newer
+            # than the schema it is talking to, and an UPDATE naming a column
+            # that migration 0050 has not added yet would abort the
+            # transaction that marks the job succeeded — turning a finished
+            # deploy into a failed one over a nice-to-have. Same posture as
+            # the enrichment call above: never fatal.
+            self._record_plan_snapshot(conn, trip_id, config)
 
             logger.info(
                 "provisioner.job_succeeded",
@@ -849,6 +1372,18 @@ class ProvisionerWorker:
     # ── DB operations (mirror job-queue.ts) ────────────────────────────────────
 
     def _claim(self, conn: psycopg.Connection) -> dict | None:
+        # Also excludes a suspended trip's jobs (`trips.suspended_at`,
+        # migration 20261003060350, Sprint 6 slice 2 admin dashboard) — kept
+        # identical to job-queue.ts's claimJob() per this class's own
+        # docstring ("the claim/complete/fail logic mirrors job-queue.ts
+        # exactly"), including the same fix: `t` is named in `FOR UPDATE OF`
+        # alongside `j`/`pa` so `SKIP LOCKED` also covers it. Without `t`
+        # here a concurrent suspendTrip()'s own `SELECT ... FOR UPDATE` on
+        # the trips row would not block or skip this claim at all — proven
+        # live (#review 2026-10-03): this exact query claimed a job in 0.05s
+        # while a held suspend transaction on that trip was still 4s from
+        # committing. With `t` locked too, that claim now SKIPs the row
+        # instead while the suspend is in flight.
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
@@ -858,14 +1393,16 @@ class ProvisionerWorker:
                     FROM   control_plane.jobs j
                     JOIN   control_plane.plans p ON p.id = j.plan_id
                     JOIN   control_plane.plan_approvals pa ON pa.plan_id = j.plan_id
+                    JOIN   control_plane.trips t ON t.id = j.trip_id
                     WHERE  j.state = 'queued'
                       AND  j.job_type = 'provision'
                       AND  pa.used_at IS NULL
                       AND  pa.expires_at > now()
                       AND  pa.plan_digest = p.digest
+                      AND  t.suspended_at IS NULL
                     ORDER BY j.created_at
                     LIMIT  1
-                    FOR UPDATE OF j, pa SKIP LOCKED
+                    FOR UPDATE OF j, pa, t SKIP LOCKED
                     """,
                 )
                 row = cur.fetchone()
@@ -1022,6 +1559,24 @@ class ProvisionerWorker:
                 )
             return data
 
+    def _load_intake_source_document(
+        self, conn: psycopg.Connection, intake_version_id: str
+    ) -> dict[str, Any] | None:
+        """The document manifest an intake version was confirmed with.
+
+        NULL for a version confirmed with no documents, and a plain
+        ``{filename, text}`` for one staged on the agent path — neither names
+        registry documents, and both simply produce no links.
+        """
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT source_document FROM control_plane.intake_versions WHERE id = %s",
+                (intake_version_id,),
+            )
+            row = cur.fetchone()
+        value = (row or {}).get("source_document")
+        return value if isinstance(value, dict) else None
+
     def _load_intake_provenance(self, conn: psycopg.Connection, intake_version_id: str) -> dict[str, Any]:
         """digest/confirmed_at/schema_version for the companion-profile
         handoff's `source` block — kept separate from _load_intake_data since
@@ -1040,6 +1595,43 @@ class ProvisionerWorker:
                 "schema_version": row["schema_version"],
             }
 
+    def _record_plan_snapshot(
+        self, conn: psycopg.Connection, trip_id: str, config: Mapping[str, Any],
+    ) -> None:
+        """Store the trip.config.json this deploy actually shipped.
+
+        The post-deploy plan review needs three things at once — the built
+        config, the confirmed intake and the uploaded document — and until now
+        the only place all three existed together was ``_work_claimed_job``,
+        mid-deploy. The other two are already stored; this is the one that was
+        not, because it is derivable and re-deriving it means running the
+        transformer, which only exists on this side.
+
+        Never served to a client. Same rule, and the same reason, as the trip
+        site's ``sanitizeConfig()``: no raw trip.config.json value reaches a
+        reader. The review is read back as findings, never as config.
+
+        Best-effort by construction — a snapshot that does not land costs a
+        review, not a deploy, so every failure is swallowed with a warning.
+        The column may simply not exist yet on a database this worker is newer
+        than.
+        """
+        try:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE control_plane.trips "
+                        "SET plan_snapshot = %s::jsonb, plan_snapshot_at = now(), updated_at = now() "
+                        "WHERE id = %s",
+                        (json.dumps(config), trip_id),
+                    )
+        except Exception:
+            logger.warning(
+                "provisioner.plan_snapshot_failed",
+                extra={"trip_id": trip_id},
+                exc_info=True,
+            )
+
     def _complete(
         self,
         conn: psycopg.Connection,
@@ -1050,6 +1642,7 @@ class ProvisionerWorker:
         slug: str,
         config: dict[str, Any],
         intake_version_id: str,
+        deployment_ref: str | None = None,
     ) -> None:
         result_json = json.dumps({"private_url": private_url})
         with conn.transaction():
@@ -1145,7 +1738,7 @@ class ProvisionerWorker:
                 # known chat still ended with "no organizer chat id" and an
                 # unbindable companion. The chat was never unknown — it was in
                 # intake_sessions the whole time.
-                recipient_chat_id = _organizer_recipient_chat_id(cur, trip_id)
+                verified_organizer_chat_id, recipient_chat_id = _organizer_chat_ids(cur, trip_id)
 
                 # The facts the organizer's introduction is composed from
                 # (docs/companion-introduction-design.md). Composed API-side,
@@ -1174,7 +1767,7 @@ class ProvisionerWorker:
                     "login_password": self._seed_password or None,
                     # WHO to log in as. The seed password is shared, so the
                     # username is the only thing telling two travellers apart —
-                    # and it is derived from their name (`ella`, `nirsolomon`),
+                    # and it is derived from their name (`tali`, `ronmargolin`),
                     # not chosen, so it cannot be guessed from the site. The
                     # modern site has no name picker either, which on
                     # 2026-09-12 left an organizer with a password and no idea
@@ -1231,7 +1824,8 @@ class ProvisionerWorker:
         self._attach_companion(
             conn, trip_id=trip_id, slug=slug, config=config,
             intake_version_id=intake_version_id, private_url=private_url,
-            recipient_chat_id=recipient_chat_id, intro_facts=intro_facts,
+            recipient_chat_id=recipient_chat_id, verified_organizer_chat_id=verified_organizer_chat_id,
+            intro_facts=intro_facts, deployment_ref=deployment_ref,
         )
 
     def reconcile_companion(self, trip_id: str) -> dict[str, Any]:
@@ -1288,11 +1882,12 @@ class ProvisionerWorker:
                 )
 
             with conn.cursor(row_factory=dict_row) as cur:
-                recipient_chat_id = _organizer_recipient_chat_id(cur, trip_id)
+                verified_organizer_chat_id, recipient_chat_id = _organizer_chat_ids(cur, trip_id)
             hermes_profile = self._attach_companion(
                 conn, trip_id=trip_id, slug=trip["slug"], config=config,
                 intake_version_id=version["id"], private_url=job["private_url"],
-                recipient_chat_id=recipient_chat_id, intro_facts=dict(trip["companion_intro"] or {}),
+                recipient_chat_id=recipient_chat_id, verified_organizer_chat_id=verified_organizer_chat_id,
+                intro_facts=dict(trip["companion_intro"] or {}),
                 introduce_once=True,
             )
             reach = conn.execute(
@@ -1319,8 +1914,10 @@ class ProvisionerWorker:
         intake_version_id: str,
         private_url: str,
         recipient_chat_id: str | None,
+        verified_organizer_chat_id: str | None,
         intro_facts: dict,
         introduce_once: bool = False,
+        deployment_ref: str | None = None,
     ) -> str | None:
         """The companion half of provisioning: profile, trip tools, chat binding,
         organizer link, introduction, reachability. Returns the profile, or None.
@@ -1342,6 +1939,10 @@ class ProvisionerWorker:
         # presenting as two. `hermes_profile` stays None when the companion
         # did not install, and the binding is opened anyway.
         hermes_profile: str | None = None
+        # Set when the trip-mcp bridge raised. Read where 'reachable' is
+        # written, so a successful chat binding cannot overwrite the fact that
+        # the companion cannot read its own trip (issue #119).
+        bridge_failed = False
         try:
             provenance = self._load_intake_provenance(conn, intake_version_id)
             handoff = build_companion_handoff(
@@ -1388,6 +1989,15 @@ class ProvisionerWorker:
                         consequence="no companion profile adapter is configured for this deployment",
                     )
                 else:
+                    # The trip's own record of its companion, written the
+                    # moment the profile exists and BEFORE any chat is bound
+                    # (migration 20260922060000). Until now this name lived only on a
+                    # binding row, so a trip whose binding was refused — a
+                    # returning organizer's second trip, every time — kept no
+                    # record of the companion sitting installed on the host
+                    # beside it, and `/switch` had nothing to bind to.
+                    _record_trip_companion(conn, trip_id, hermes_profile)
+
                     # Independently gated and independently non-fatal: a
                     # trip-mcp wiring failure must not block the chat binding
                     # below — the organizer should still land in the right
@@ -1397,13 +2007,39 @@ class ProvisionerWorker:
                         wired = self._mcp_bridge.setup(slug, hermes_profile)
                         logger.info(
                             "provisioner.mcp_bridge_wired" if wired else "provisioner.mcp_bridge_skipped",
-                            extra={"trip_id": trip_id, "hermes_profile": hermes_profile},
+                            extra={
+                                "trip_id": trip_id,
+                                "hermes_profile": hermes_profile,
+                                # Which checkout built this companion. The
+                                # install host chooses it through its own
+                                # forced command, so this is the only place the
+                                # worker can learn it.
+                                "built_from": getattr(self._mcp_bridge, "built_from", "unreported"),
+                            },
                         )
                     except Exception:
+                        bridge_failed = True
                         logger.warning(
                             "provisioner.mcp_bridge_failed",
                             extra={"trip_id": trip_id, "hermes_profile": hermes_profile},
                             exc_info=True,
+                        )
+                        # A FACT, not only a log line. The branch above, for a
+                        # missing companion, records one for exactly this
+                        # reason — "without this the run would report success
+                        # with no companion and nothing said about it" — and
+                        # this branch did not, so a companion that could not
+                        # reach its own trip was handed over as ready and the
+                        # only trace was a WARNING inside the worker's
+                        # container. Found live 2026-09-20, after hours spent
+                        # establishing by hand what this row would have said.
+                        _record_reachability(
+                            conn, trip_id, reachable=False,
+                            reason="TRIP_MCP_BRIDGE_FAILED",
+                            consequence=(
+                                "the companion is installed but cannot read this trip: "
+                                "every trip tool will fail while it answers normally"
+                            ),
                         )
 
                     # The assistant's wake-words, recorded as a ROUTING fact
@@ -1449,14 +2085,14 @@ class ProvisionerWorker:
             )
 
         # ── The chat binding, attempted whatever the companion did ──────────
-        if not recipient_chat_id:
+        if not verified_organizer_chat_id:
             if hermes_profile:
                 # A companion exists and nobody can talk to it. A different
                 # retry from every other reason here: nothing is broken, an
                 # organizer chat id is simply not known yet.
                 _record_reachability(
                     conn, trip_id, reachable=False, reason="NO_ORGANIZER_CHAT",
-                    consequence="a companion exists but no organizer chat id is known to bind it to",
+                    consequence="a companion exists but no verified organizer chat id is known to bind it to",
                 )
         else:
             try:
@@ -1464,22 +2100,28 @@ class ProvisionerWorker:
                 # of the interview they just finished. See bind_chat_to_trip —
                 # it still refuses unless THIS trip is the newer one, and no
                 # group binding ever reaches here.
-                previous_trip_id = _bound_trip_id(conn, recipient_chat_id)
+                #
+                # Read BEFORE the call, unconditionally: bind_chat_to_trip
+                # closes the displaced row, so afterwards this query would
+                # find nothing (or the new trip) instead of what was lost.
+                previous_trip_id = _bound_trip_id(conn, verified_organizer_chat_id)
                 outcome = bind_chat_to_trip(
-                    conn, recipient_chat_id, trip_id, hermes_profile,
+                    conn, verified_organizer_chat_id, trip_id, hermes_profile,
                     allow_retarget=True,
                 )
                 if outcome == "retargeted":
-                    # Loud on purpose: another trip just lost this chat, and on
-                    # this branch there is no way back from the chat itself.
-                    # /trips and /switch are PR #47; until that lands, moving
-                    # the binding back is an operator action. Nothing else in
-                    # the system would record that it happened.
+                    # Loud on purpose: another trip just lost this chat. Here
+                    # they can take it back with /switch, and the introduction
+                    # about to be sent says so — closing the binding already
+                    # records that it happened, but previous_trip_id puts the
+                    # displaced trip in the LOG LINE, so an operator reading
+                    # logs does not have to go to the database to learn what
+                    # was taken.
                     logger.warning("provisioner.organizer_chat_retargeted", extra={
                         "trip_id": trip_id,
-                        "chat_id": recipient_chat_id,
+                        "chat_id": verified_organizer_chat_id,
                         "previous_trip_id": previous_trip_id,
-                        "consequence": "the organizer's chat now talks to this trip; the previous trip is no longer reachable from it",
+                        "consequence": "the organizer's chat now talks to this trip; /trips moves back to the previous one",
                     })
                 # The same chat, as a PERSON. Deliberately here and not in its
                 # own step: the two facts are one fact — this chat is the
@@ -1499,7 +2141,7 @@ class ProvisionerWorker:
                     )
                     try:
                         linked = link_organizer_person(
-                            conn, trip_id, recipient_chat_id,
+                            conn, trip_id, verified_organizer_chat_id,
                             organizer_username, organizer_display,
                         )
                         logger.info(
@@ -1539,7 +2181,7 @@ class ProvisionerWorker:
                     # group-binding token, and a second one is a second token.
                     if not (introduce_once and self._companion_intro_queued(conn, trip_id)):
                         self._enqueue_companion_intro(
-                            conn, trip_id, recipient_chat_id, intro_facts,
+                            conn, trip_id, verified_organizer_chat_id, intro_facts,
                         )
                     logger.info("provisioner.companion_profile_bound", extra={
                         "trip_id": trip_id,
@@ -1551,7 +2193,14 @@ class ProvisionerWorker:
                     # that actually installed — never later, from the presence
                     # of a binding row. A binding can outlive the profile it
                     # points at, and can now legitimately exist without one.
-                    _record_reachability(conn, trip_id, reachable=True)
+                    #
+                    # Except after a bridge that raised: that run already wrote
+                    # TRIP_MCP_BRIDGE_FAILED, and a bound chat says nothing
+                    # about whether the companion can read the trip. Writing
+                    # 'reachable' here erased the fact in the common case, so
+                    # the fleet monitor never saw it (issue #119).
+                    if not bridge_failed:
+                        _record_reachability(conn, trip_id, reachable=True)
                 else:
                     logger.info("provisioner.chat_bound_without_companion", extra={
                         "trip_id": trip_id,
@@ -1572,6 +2221,24 @@ class ProvisionerWorker:
                     conn, trip_id, reachable=False, reason="BINDING_REFUSED",
                     consequence="the chat is bound to another trip; reassignment needs an organizer action",
                 )
+            except TripRetired as retired:
+                # Not a bug and not retryable — and NOT the same as
+                # BINDING_FAILED, which implies a technical, retriable fault.
+                # This trip has been torn down; `bind_chat_to_trip` already
+                # logged the refusal itself (issue #105), this only records
+                # the distinct reason so an operator or trip-fleet-monitor
+                # reading `unreachable_reason` does not treat a permanently
+                # gone trip as a glitch worth re-provisioning.
+                logger.error("provisioner.companion_binding_trip_retired", extra={
+                    "trip_id": trip_id,
+                    "slug": retired.slug,
+                    "hermes_profile": hermes_profile,
+                    "consequence": "trip was torn down; no binding was opened and none should be retried",
+                })
+                _record_reachability(
+                    conn, trip_id, reachable=False, reason="TRIP_RETIRED",
+                    consequence="the trip has been torn down; retrying will not help",
+                )
             except Exception:
                 logger.error("provisioner.companion_binding_failed", extra={
                     "trip_id": trip_id,
@@ -1582,6 +2249,24 @@ class ProvisionerWorker:
                     conn, trip_id, reachable=False, reason="BINDING_FAILED",
                     consequence="the chat binding write failed; the trip has no routing",
                 )
+
+        # Real evidence for the two signals the pre-ready_private gate could
+        # only record as `skipped` (verification.py's module docstring says
+        # why): now that the companion/bridge/binding steps above have all
+        # been attempted, mcp_isolation and messaging_binding can be checked
+        # for real. Informational only — never reverts ready_private, and a
+        # recording failure must not cost the trip its companion, so this is
+        # best-effort like every other side effect in this function.
+        try:
+            verification.record_post_attach_evidence(
+                conn, trip_id=trip_id, deployment_ref=deployment_ref,
+                slug=slug, hermes_profile=hermes_profile, mcp_bridge_adapter=self._mcp_bridge,
+            )
+        except Exception:
+            logger.warning(
+                "provisioner.post_attach_verification_failed",
+                extra={"trip_id": trip_id}, exc_info=True,
+            )
         return hermes_profile
 
     def _enqueue_operator_notification(

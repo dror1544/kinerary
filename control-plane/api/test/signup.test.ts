@@ -16,7 +16,7 @@ import {
 } from "../src/signup.js";
 import { buildApp, type SignupDependencies } from "../src/app.js";
 import { validateArchitectureProfile } from "../src/config.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const skip = !databaseUrl;
@@ -117,7 +117,7 @@ after(() => {
 // ── Service-layer tests ─────────────────────────────────────────────────────
 
 test("autoApprove grants the trip at signup, with no operator and no outbox row", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -172,7 +172,7 @@ test("autoApprove grants the trip at signup, with no operator and no outbox row"
 });
 
 test("without autoApprove the operator is still asked", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -197,7 +197,7 @@ test("without autoApprove the operator is still asked", { skip }, async () => {
 });
 
 test("verified signup creates one pending request and one outbox notification", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -228,7 +228,7 @@ test("verified signup creates one pending request and one outbox notification", 
 });
 
 test("signup persists a real, sendable chat id alongside the identity digest", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -254,7 +254,7 @@ test("signup persists a real, sendable chat id alongside the identity digest", {
 });
 
 test("repeated signup reuses pending request without new notification", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -280,7 +280,7 @@ test("repeated signup reuses pending request without new notification", { skip }
 });
 
 test("approval callback creates draft trip and membership exactly once", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -315,7 +315,7 @@ test("approval callback creates draft trip and membership exactly once", { skip 
 });
 
 test("rejection callback blocks enrollment; no draft trip created", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -345,7 +345,7 @@ test("rejection callback blocks enrollment; no draft trip created", { skip }, as
 });
 
 test("callback with wrong sender identity is refused", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -376,7 +376,7 @@ test("callback with wrong sender identity is refused", { skip }, async () => {
 });
 
 test("callback with altered action token is refused", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -403,7 +403,7 @@ test("callback with altered action token is refused", { skip }, async () => {
 });
 
 test("expired action token is refused", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -437,7 +437,7 @@ test("expired action token is refused", { skip }, async () => {
 });
 
 test("owner reads approved draft; different user and unauthenticated cannot", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -478,7 +478,7 @@ test("owner reads approved draft; different user and unauthenticated cannot", { 
 });
 
 test("notification failure is logged but does not roll back the signup request", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -542,7 +542,7 @@ const testArchitectureProfile = validateArchitectureProfile({
 });
 
 test("POST /v1/signup returns awaiting_approval for a fresh valid login", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -573,7 +573,7 @@ test("POST /v1/signup returns awaiting_approval for a fresh valid login", { skip
 });
 
 test("POST /v1/signup rejects a tampered Telegram payload", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -602,7 +602,7 @@ test("POST /v1/signup rejects a tampered Telegram payload", { skip }, async () =
 });
 
 test("POST /v1/signup/callback approves request and is idempotent on replay", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -650,7 +650,7 @@ test("POST /v1/signup/callback resolves a short telegram_callback_refs ref to th
   // callback_data is never the raw signed token (too long for Telegram's
   // 64-byte limit — see db/migrations/0014) but a short ref that the real
   // TelegramNotificationAdapter would have written when it sent the message.
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -690,7 +690,7 @@ test("POST /v1/signup/callback resolves a short telegram_callback_refs ref to th
 });
 
 test("POST /v1/signup/callback rejects an unknown ref the same way it rejects a garbage token", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -723,7 +723,7 @@ test("POST /v1/signup/callback rejects an unknown ref the same way it rejects a 
 });
 
 test("POST /v1/signup/callback is refused without a valid webhook secret header", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -770,7 +770,7 @@ test("POST /v1/signup/callback is refused without a valid webhook secret header"
 });
 
 test("POST /v1/signup/callback derives the sender from the verified webhook payload, not from client input", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -818,7 +818,7 @@ test("POST /v1/signup/callback derives the sender from the verified webhook payl
 });
 
 test("GET /v1/trips/:id is membership-scoped", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -872,7 +872,7 @@ test("GET /v1/trips/:id is membership-scoped", { skip }, async () => {
 });
 
 test("GET /v1/signup/status reflects current state without starting a new request", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -909,7 +909,7 @@ test("GET /v1/signup/status reflects current state without starting a new reques
 });
 
 test("password-authenticated signups can poll status and read their trip", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -979,7 +979,7 @@ test("password-authenticated signups can poll status and read their trip", { ski
 });
 
 test("rejected request FK integrity: re-signup after cooldown preserves old rows", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -1031,7 +1031,7 @@ test("rejected request FK integrity: re-signup after cooldown preserves old rows
 });
 
 test("expired pending request FK integrity: re-signup after expiry preserves old rows", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -1113,7 +1113,7 @@ test("POST /v1/signup without signup config returns 503", async () => {
 });
 
 test("API responses do not expose Telegram numeric IDs or raw action secrets", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);

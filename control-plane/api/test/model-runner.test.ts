@@ -25,8 +25,12 @@ import {
   openRouterKey,
   openRouterRunner,
   openRouterSpec,
+  quotaFallbackRunner,
   reasonForStatus,
+  runnerForBinding,
   worthRetrying,
+  type RunnerFailure,
+  type RunnerResult,
   type StructuredModelRunner,
 } from "../src/model-runner.js";
 
@@ -255,6 +259,107 @@ describe("composeRunners", () => {
   });
 });
 
+/**
+ * decision 48 (docs/sprint6-tracks.md #48): production document reading may
+ * escalate — ONCE, only on a quota limit, only after the primary's own
+ * same-model retry has given up — to a second, explicitly configured runner.
+ * Not the 2026-09-07 failure the module header warns about: that was an
+ * unannounced mid-call swap under the same identity; this is a visible,
+ * logged, single hop to a runner an operator named on purpose.
+ *
+ * A stub that always answers the same fixed `RunnerResult`, so these tests
+ * exercise the wrapper's own decision logic and nothing about a real
+ * provider.
+ */
+function fixedRunner<T>(result: RunnerResult<T>): StructuredModelRunner & { calls: unknown[] } {
+  const calls: unknown[] = [];
+  return {
+    calls,
+    describe: () => ({ provider: "fixed", model: "fixed" }),
+    async run() {
+      calls.push(1);
+      return result as RunnerResult<never>;
+    },
+  } as StructuredModelRunner & { calls: unknown[] };
+}
+
+describe("quotaFallbackRunner", () => {
+  const req = { task: "extract_intake", prompt: "p", parse: identity };
+
+  test("primary succeeds: fallback never called, result is primary's, no fallback marker", async () => {
+    const primary = fixedRunner<{ a: number }>({ ok: true, value: { a: 1 }, attempts: 1, ms: 0 });
+    const fallback = fixedRunner<{ a: number }>({ ok: true, value: { a: 2 }, attempts: 1, ms: 0 });
+    const runner = quotaFallbackRunner(primary, fallback, "extract_intake");
+    const result = await runner.run(req);
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.ok && result.value, { a: 1 });
+    assert.equal(fallback.calls.length, 0);
+    assert.equal(result.ok && "usedFallback" in result ? result.usedFallback : undefined, undefined);
+  });
+
+  const nonQuotaReasons: RunnerFailure[] = ["FAILED", "TIMED_OUT", "UPSTREAM_ERROR", "BAD_OUTPUT", "UNAUTHORIZED", "NOT_CONFIGURED"];
+  for (const reason of nonQuotaReasons) {
+    test(`primary ${reason}: fallback never called, primary's failure surfaces unchanged`, async () => {
+      const primary = fixedRunner({ ok: false, reason, detail: "d", attempts: 1, ms: 0 });
+      const fallback = fixedRunner({ ok: true, value: "should never be reached", attempts: 1, ms: 0 });
+      const runner = quotaFallbackRunner(primary, fallback, "extract_intake");
+      const result = await runner.run(req);
+      assert.equal(result.ok, false);
+      assert.equal(result.ok === false && result.reason, reason);
+      assert.equal(fallback.calls.length, 0, `a ${reason} must never reach the fallback — only RATE_LIMITED may`);
+    });
+  }
+
+  test("primary RATE_LIMITED, fallback configured and succeeds: fallback's result returned and marked", async () => {
+    const primary = fixedRunner({ ok: false, reason: "RATE_LIMITED" as RunnerFailure, detail: "429", attempts: 3, ms: 10 });
+    const fallback = fixedRunner<{ a: string }>({ ok: true, value: { a: "fb" }, attempts: 1, ms: 0 });
+    const runner = quotaFallbackRunner(primary, fallback, "extract_intake");
+    const result = await runner.run(req);
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.ok && result.value, { a: "fb" });
+    assert.equal(fallback.calls.length, 1);
+    assert.equal(result.ok && result.usedFallback, true);
+  });
+
+  test("primary RATE_LIMITED, fallback also RATE_LIMITED: the fallback's failure surfaces, exactly one hop", async () => {
+    const primary = fixedRunner({ ok: false, reason: "RATE_LIMITED" as RunnerFailure, detail: "429 primary", attempts: 3, ms: 0 });
+    const fallback = fixedRunner({ ok: false, reason: "RATE_LIMITED" as RunnerFailure, detail: "429 fallback", attempts: 2, ms: 0 });
+    const runner = quotaFallbackRunner(primary, fallback, "extract_intake");
+    const result = await runner.run(req);
+    assert.equal(result.ok, false);
+    assert.equal(result.ok === false && result.reason, "RATE_LIMITED");
+    assert.equal(result.ok === false && result.detail, "429 fallback", "the fallback's own failure, not the primary's");
+    assert.equal(fallback.calls.length, 1, "exactly one fallback hop — never a fallback of the fallback");
+    assert.equal((result as { usedFallback?: boolean }).usedFallback, true);
+  });
+
+  test("describe names the primary's pin — the fallback is an escalation path, not a re-pin", () => {
+    const primary = fixedRunner({ ok: true, value: 1, attempts: 1, ms: 0 });
+    const fallback: StructuredModelRunner = {
+      describe: () => ({ provider: "should-not-be-read", model: "should-not-be-read" }),
+      run: async () => ({ ok: true, value: 2 as never, attempts: 1, ms: 0 }),
+    };
+    const runner = quotaFallbackRunner(primary, fallback, "extract_intake");
+    assert.deepEqual(runner.describe?.("extract_intake"), { provider: "fixed", model: "fixed" });
+  });
+
+  // The fallback binding is built by the identical `runnerForBinding` the
+  // primary uses, so FORBIDDEN_MODELS and the attachment-runner guard apply
+  // automatically — there is no second gate to forget.
+  test("the fallback binding is refused by the same guards as the primary — forbidden model, and codex cannot attach files", () => {
+    assert.equal(
+      runnerForBinding("openrouter", "openrouter/auto", 1000, "extract_intake", { OPENROUTER_API_KEY: "sk-x" }),
+      undefined,
+      "a model that picks a model is refused whichever side of the fallback wiring names it",
+    );
+    assert.equal(
+      runnerForBinding("codex", "gpt-5.6-luna", 1000, "read_image", {}),
+      undefined,
+      "codex cannot attach files — the same guard the fallback binding would be built through",
+    );
+  });
+});
+
 describe("modelRunnerFromEnv", () => {
   test("nothing configured means no runner at all", () => {
     assert.equal(modelRunnerFromEnv({}), undefined);
@@ -322,7 +427,11 @@ describe("claude effort", () => {
   async function echoCli(): Promise<string> {
     const dir = await mkdtemp(join(tmpdir(), "kinerary-fake-claude-"));
     const bin = join(dir, "claude");
-    await writeFile(bin, `#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({ args: process.argv.slice(2) }));\n`);
+    // Every claude call now asks for `--output-format json`, so the answer
+    // arrives inside a `result` event rather than on bare stdout. The fake has
+    // to speak that shape or `claudeStreamAnswer` reports "no result event in
+    // stream" — which is the adapter working, not the fake being clever.
+    await writeFile(bin, `#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({\n  type: "result", subtype: "success", is_error: false,\n  result: JSON.stringify({ args: process.argv.slice(2) }),\n}));\n`);
     await chmod(bin, 0o755);
     return bin;
   }
@@ -334,16 +443,35 @@ describe("claude effort", () => {
     return (result.value as { args: string[] }).args;
   }
 
-  test("no effort configured leaves the invocation exactly as it was", () => {
+  test("no effort configured leaves the SETTINGS exactly as they were", () => {
     // The VM takes its effort from CLAUDE_CONFIG_DIR's settings.json. Ignoring
     // settings when nobody asked would silently drop that to the CLI default —
     // the effort at which the VM once mapped answers to the wrong question.
-    assert.deepEqual(claudeSpec("m").args("PROMPT", "m"), ["-p", "PROMPT", "--model", "m"]);
+    // That is about `--setting-sources`, and it is the assertion below; the
+    // tools and output format are not settings and apply to every call.
+    const args = claudeSpec("m").args("PROMPT", "m");
+    assert.ok(!args.includes("--setting-sources"), "settings dropped with nobody asking");
+    assert.ok(!args.includes("--strict-mcp-config"));
+    assert.deepEqual(args, ["-p", "PROMPT", "--model", "m", "--tools", "", "--output-format", "json"]);
+  });
+
+  test("every call is toolless and reports its usage, effort or no effort", () => {
+    // A structuring call reads untrusted document text, so it gets no tools at
+    // all — print mode still offers the read-only ones. `--output-format json`
+    // is what makes the usage readable rather than guessed. Both were added
+    // after this file's effort tests were written, and both have to hold on
+    // the effort path too: the flags that matter most for a document are the
+    // ones the pinned-effort calls also carry.
+    for (const args of [claudeSpec("m").args("P", "m"), claudeSpec("m", 1000, "claude", "medium").args("P", "m")]) {
+      assert.deepEqual(args.slice(args.indexOf("--tools"), args.indexOf("--tools") + 4),
+                       ["--tools", "", "--output-format", "json"]);
+    }
   });
 
   test("an explicit effort is passed, and personal settings and connectors are not loaded", () => {
     assert.deepEqual(claudeSpec("m", 1000, "claude", "medium").args("PROMPT", "m"), [
-      "-p", "PROMPT", "--model", "m", "--effort", "medium", "--setting-sources", "", "--strict-mcp-config",
+      "-p", "PROMPT", "--model", "m", "--tools", "", "--output-format", "json",
+      "--effort", "medium", "--setting-sources", "", "--strict-mcp-config",
     ]);
   });
 
@@ -366,7 +494,8 @@ describe("claude effort", () => {
       { CLAUDE_BIN: bin, INTERPRET_RUNNER: "claude", INTERPRET_MODEL: "m", EXTRACT_RUNNER: "claude", EXTRACT_MODEL: "m", INTERPRET_EFFORT: "low" },
       "extract",
     );
-    assert.deepEqual(args, ["-p", "PROMPT", "--model", "m"]);
+    assert.deepEqual(args, ["-p", "PROMPT", "--model", "m", "--tools", "", "--output-format", "json"]);
+    assert.ok(!args.includes("--effort"), "the other task's effort leaked");
   });
 
   test("a misspelt effort refuses to start rather than failing every call", () => {

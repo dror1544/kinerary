@@ -57,7 +57,7 @@ DEPLOY = re.compile(
     # The production control plane's release tool: every verb that moves the
     # running version, the database, the trip bridges, or deletes a way back.
     # Anywhere on the line, not only at a command position, because it is run
-    # through ssh ("ssh debian@vm sudo kinerary-cp-release upgrade …"). Its
+    # through ssh ("ssh <host> sudo kinerary-cp-release upgrade …"). Its
     # --dry-run, and status/plan/verify, stay prompt-free.
     r'|\S*(?:vm-release\.py|kinerary-cp-release)\b(?![^\n;&|]*--dry-run\b)[^\n;&|]*'
     r'\b(?:upgrade|rollback|prune|install|restart-bridges)\b'
@@ -70,7 +70,86 @@ DEPLOY = re.compile(
     # A vzdump into an NFS share froze the host's storage VM, every NFS mount and
     # the control-plane VM on 2026-09-13; any vzdump, direct or over ssh, is a
     # question for a person.
-    r'|(?:' + CMDPOS + r'|\bssh\b[^\n;&|]*\s)(?:sudo\s+)?vzdump\b')
+    r'|(?:' + CMDPOS + r'|\bssh\b[^\n;&|]*\s)(?:sudo\s+)?vzdump\b'
+    # Promoting a release to 'available' ships code. That is the pool
+    # generatePlan() selects from, so from this moment every trip built or
+    # rebuilt runs this tree — while trips already provisioned stay on the
+    # release they were pinned to. The earlier hops (candidate -> verified)
+    # are checkpoints and reach nobody, so only 'available' prompts.
+    r'|' + CMDPOS + r'[^\n;&|]*\brelease\b[^\n;&|]*\bpromote\b[^\n;&|]*--to[=\s]+available\b')
+
+# A commit by another name. Each of these creates or rewrites commits on the
+# current branch, so each is hard rule 1 by a route on which the word "commit"
+# never appears: a merge lands a whole branch at once; cherry-pick and revert
+# write new commits; rebase and am rewrite or append them; `gh pr merge` does
+# the merge on GitHub, where no local git hook runs at all. Verified
+# 2026-09-20: every one of them classified as `none`, so an integrator agent
+# with Bash could have landed work on the integration branch with no prompt.
+#
+# The read-only relatives stay quiet, because a prompt on a read teaches people
+# to click through: merge-tree and merge-base compute, --abort and --quit undo,
+# `gh pr view/diff/checks` read. `(?![\w-])` is what keeps `merge-tree` out.
+MERGE = re.compile(
+    CMDPOS + r'(?:sudo\s+)?git\b(?:\s+-\S+(?:\s+\S+)?)*\s+(?:merge|cherry-pick|revert|rebase|am)(?![\w-])'
+    r'(?![^\n;&|]*--(?:abort|quit)\b)'
+    r'|' + CMDPOS + r'gh\s+pr\s+merge\b')
+# Pushing publishes. After it the commits exist for everyone who fetches, and a
+# force push rewrites what they already had.
+PUSH = re.compile(CMDPOS + r'(?:sudo\s+)?git\b(?:\s+-\S+(?:\s+\S+)?)*\s+push(?![\w-])')
+
+# --normalize: rewrite the inert shapes sessions actually type into the plain form
+# the hook's exemptions match (2026-09-26, from the decision log: 8 of 9 prompts
+# in 90 minutes were for commits the exemptions meant to allow). Only two things
+# are rewritten, and both are inert:
+#   * a heredoc message with a QUOTED delimiter -- -m "$(cat <<'EOF' ... EOF)" --
+#     whose body the shell passes through literally, becomes -m 'msg';
+#   * a trailing output filter -- 2>&1, | tail -N, | head -N, | grep -v '<text>' --
+#     is dropped: it only shapes what is printed, never what is committed.
+# Anything else is left as it is, so it fails the exemption and is asked.
+#
+# The heredoc ends where the SHELL ends it: at the FIRST line equal to the
+# delimiter. Anything after that line inside the $( ) is executed, so a message is
+# rewritten only when its first terminator line is followed by nothing but the
+# closing )". A terminator is recognised by the classifier's own looser rule
+# (^\s*D\s*$, as strip_heredocs uses), so the two can never disagree about where a
+# heredoc ends. Any anomaly leaves the whole command as typed, which then fails the
+# exemption and is asked. (#242 review, 2026-09-26: a non-greedy regex read to the
+# LAST delimiter and erased a hidden `git push --force origin main` as "body".)
+HEREDOC_OPEN = re.compile(r'"\$\(cat <<[ \t]*([\'"])([A-Za-z_][A-Za-z0-9_]*)\1\n')
+HEREDOC_CLOSE = re.compile(r'\s*\)"')
+FILTER = (r'(?:\s*2>&1'
+          r'|\s*\|\s*(?:tail|head)\s+-n?\s*\d+'
+          r"|\s*\|\s*grep\s+-[vEiF]*v[vEiF]*\s+'[^'\n]*')")
+TRAILING_FILTERS = re.compile(r'(?:' + FILTER + r')+\s*$')
+
+
+def normalize_heredocs(cmd: str) -> str:
+    out, i = [], 0
+    while True:
+        m = HEREDOC_OPEN.search(cmd, i)
+        if not m:
+            out.append(cmd[i:])
+            return "".join(out)
+        terminator = re.compile(r'^[ \t]*' + re.escape(m.group(2)) + r'[ \t]*$', re.M)
+        end = terminator.search(cmd, m.end())
+        if not end:
+            return cmd                                  # never closed: leave it as typed
+        close = HEREDOC_CLOSE.match(cmd, end.end())
+        if not close:
+            return cmd                                  # something runs after the heredoc
+        out.append(cmd[i:m.start()])
+        out.append("'msg'")
+        i = close.end()
+
+
+def normalize(cmd: str) -> str:
+    cmd = cmd.strip()
+    return TRAILING_FILTERS.sub("", normalize_heredocs(cmd)).strip()
+
+
+if len(sys.argv) > 1 and sys.argv[1] == "--normalize":
+    sys.stdout.write(normalize(sys.stdin.read()))
+    sys.exit(0)
 
 raw = strip_heredocs(sys.stdin.read())
 
@@ -79,9 +158,16 @@ raw = strip_heredocs(sys.stdin.read())
 # one keystroke, while a missed deploy breaks hard rule 2. Commit is matched
 # with quotes stripped, because "git commit" inside quotes is nearly always
 # prose, and a spurious refusal there blocks real work.
+# Merge and push follow commit's rule: quotes stripped, prose does not prompt.
+# Order is by consequence, so `git push && deploy.sh` is a deploy and
+# `git merge x && git commit` is a commit.
 if DEPLOY.search(raw):
     print("deploy")
 elif COMMIT.search(strip_quotes(raw)):
     print("commit")
+elif MERGE.search(strip_quotes(raw)):
+    print("merge")
+elif PUSH.search(strip_quotes(raw)):
+    print("push")
 else:
     print("none")
