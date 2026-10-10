@@ -198,7 +198,7 @@ const redact = (label, value, note) => ({
   log:  `${label} "${value}"${note ? ` ${note}` : ''}`,
   api:  `${label} (value withheld — check the server log)${note ? ` ${note}` : ''}`,
 });
-(TRIP_CONFIG.participants || []).forEach(p => {
+(TRIP_CONFIG.participants || []).forEach((p, participantIndex) => {
   (p.needs || []).forEach(n => {
     const issues = [];
     if (!NEED_TYPES.includes(n.type)) issues.push(redact('unknown type', n.type));
@@ -211,7 +211,8 @@ const redact = (label, value, note) => ({
       // urgent, never what category — but the raw field is whatever the config
       // author typed, and "crticial" is a config value like any other. The
       // invariant this endpoint holds is simply: no raw config values, ever.
-      CONFIG_WARNINGS.push({ username: p.username, severity: normalizeSeverity(n.severity), issue: issue.api });
+      // Identify the entry by its array index, never its configured username.
+      CONFIG_WARNINGS.push({ scope: 'participant', participantIndex, severity: normalizeSeverity(n.severity), issue: issue.api });
     }
   });
 });
@@ -2322,7 +2323,7 @@ app.post('/api/bookings/extract', authRequired, extractUpload.single('file'), as
 const confUpload = multer({
   storage: multer.diskStorage({
     destination: (_req, _file, cb) => cb(null, CONF_DIR),
-    filename: (req, _file, cb) => cb(null, `booking-${req.params.id}-${Date.now()}.pdf`),
+    filename: (req, _file, cb) => cb(null, `booking-${req.params.id}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.pdf`),
   }),
   fileFilter: (_req, file, cb) => cb(null, file.mimetype === 'application/pdf'),
   limits: { fileSize: 50 * 1024 * 1024 },
@@ -2403,9 +2404,26 @@ app.delete('/api/bookings/:id', organizerOrAgentRequired, (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/bookings/:id/confirmation', organizerOrAgentRequired, confUpload.single('file'), (req, res) => {
+app.post('/api/bookings/:id/confirmation', organizerOrAgentRequired, (req, res, next) => {
+  // Multer writes to disk before the handler. Reject an absent booking before
+  // accepting its bytes, then still check the UPDATE in case it was deleted.
+  if (!db.prepare('SELECT id FROM bookings WHERE id = ?').get(req.params.id)) {
+    return res.status(404).json({ error: 'booking not found' });
+  }
+  next();
+}, confUpload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'pdf file required' });
-  db.prepare('UPDATE bookings SET conf_file = ? WHERE id = ?').run(req.file.filename, req.params.id);
+  let result;
+  try {
+    result = db.prepare('UPDATE bookings SET conf_file = ? WHERE id = ?').run(req.file.filename, req.params.id);
+  } catch (error) {
+    fs.unlinkSync(req.file.path);
+    throw error;
+  }
+  if (!result.changes) {
+    fs.unlinkSync(req.file.path);
+    return res.status(404).json({ error: 'booking not found' });
+  }
   res.json({ ok: true, conf_file: req.file.filename });
 });
 
@@ -2413,7 +2431,12 @@ function protectedDocumentResponse(res, filePath, disposition = 'attachment') {
   let stat;
   try { stat = fs.statSync(filePath); } catch { return res.status(404).json({ error: 'not found' }); }
   if (!stat.isFile()) return res.status(404).json({ error: 'not found' });
-  const filename = path.basename(filePath).replace(/["\\\r\n]/g, '_');
+  const filename = path.basename(filePath).replace(/["\\\x00-\x1f\x7f]/g, '_');
+  // HTTP header values must be ASCII. Keep a conservative fallback for older
+  // clients and preserve the original Unicode name through RFC 5987 encoding.
+  const asciiFilename = filename.replace(/[^\x20-\x7e]/g, '_');
+  const encodedFilename = encodeURIComponent(filename).replace(/[!'()*]/g,
+    char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
   const contentTypes = {
     '.pdf': 'application/pdf',
     '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -2434,7 +2457,7 @@ function protectedDocumentResponse(res, filePath, disposition = 'attachment') {
     '.pkpass': 'application/vnd.apple.pkpass',
   };
   res.setHeader('Content-Type', contentTypes[path.extname(filePath).toLowerCase()] || 'application/octet-stream');
-  res.setHeader('Content-Disposition', `${disposition}; filename="${filename}"`);
+  res.setHeader('Content-Disposition', `${disposition}; filename="${asciiFilename}"; filename*=UTF-8''${encodedFilename}`);
   res.setHeader('Cache-Control', 'private, no-store');
   res.setHeader('X-Content-Type-Options', 'nosniff');
   return fs.createReadStream(filePath).pipe(res);
