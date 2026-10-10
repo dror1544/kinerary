@@ -554,3 +554,100 @@ describe('boot-time plan import — malformed entries degrade to dropped fields'
     assert.equal(day?.lodging_context?.name, 'Hotel-B');
   });
 });
+
+// ── Stop overrides (stop editing after the interview, S2/S3) ──────────────────
+// The override layer is merged into the config BEFORE sanitizeConfig(), so the
+// allow-list applies to its result unchanged. Two things it must never add: a
+// PIN (a door code is not trip UI data — refused at the write, never copied
+// from a booking) and provenance (who set it, from which booking, the base it
+// was set over) — that is for organizer/agent routes, never /api/config.
+describe('stop overrides — a PIN is never accepted or served, provenance never reaches /api/config', () => {
+  const PORT = PORTS.configAllowListStops;
+  const BASE = `http://localhost:${PORT}`;
+  let dataDir, proc, bob, alice;
+  async function login(username) {
+    for (let i = 0; i < 30; i++) {
+      const r = await fetch(`${BASE}/api/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password: '1234' }) });
+      if (r.ok) return (await r.json()).token;
+      await new Promise(res => setTimeout(res, 100));
+    }
+    return null;
+  }
+  const call = async (path, { method = 'GET', token, body } = {}) => {
+    const res = await fetch(`${BASE}${path}`, { method,
+      headers: { Authorization: `Bearer ${token}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+      body: body ? JSON.stringify(body) : undefined });
+    return { status: res.status, text: await res.text() };
+  };
+
+  before(async () => {
+    dataDir = mkdtempSync(join(tmpdir(), 'trip-allow-list-stops-'));
+    const tripDir = join(dataDir, 'trip');
+    cpSync(join(HERE, 'fixtures'), tripDir, { recursive: true });
+    mkdirSync(join(dataDir, 'site'), { recursive: true });
+    proc = spawn('node', [join(REPO, 'server', 'server.js')], {
+      cwd: join(REPO, 'server'),
+      env: { ...process.env, PORT: String(PORT), TRIP_DIR: tripDir, DATA_DIR: dataDir,
+        SITE_DIR: join(dataDir, 'site'), AVATARS_DIR: join(dataDir, 'avatars'),
+        JWT_SECRET: 'test-secret-000', IMMICH_URL: '', IMMICH_API_KEY: '',
+        HERMES_API_KEY: 'test-hermes-key', SEED_PASSWORD: '1234' },
+    });
+    let log = '';
+    proc.stderr.on('data', c => { log += c; });
+    proc.stdout.on('data', c => { log += c; });
+    await new Promise((resolve, reject) => {
+      const t = setInterval(() => { if (log.includes('Trip server running on')) { clearInterval(t); resolve(); } }, 20);
+      proc.on('exit', code => { clearInterval(t); reject(new Error(`server exited ${code}: ${log.slice(-400)}`)); });
+      setTimeout(() => { clearInterval(t); reject(new Error(`boot timeout: ${log.slice(-400)}`)); }, 10_000);
+    });
+    alice = await login('alice');
+    bob = await login('bob');
+    assert.ok(alice && bob);
+  });
+  after(() => {
+    proc?.kill('SIGTERM');
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  test('a PIN in a stop write is refused, and its value is served nowhere', async () => {
+    const r = await call('/api/stops/ny', { method: 'PATCH', token: alice,
+      body: { accommodation: { name: 'Hotel X', pin: 'STOP-PIN-SECRET' } } });
+    assert.equal(r.status, 400);
+    assert.equal(JSON.parse(r.text).error, 'pin_not_accepted');
+    for (const [path, token] of [['/api/config', bob], ['/api/stops', alice]]) {
+      assert.ok(!(await call(path, { token })).text.includes('STOP-PIN-SECRET'), path);
+    }
+  });
+
+  test('a stop set from a booking carries neither the booking\'s PIN nor its notes, to anyone', async () => {
+    const made = await call('/api/bookings', { method: 'POST', token: alice, body: {
+      phase: 'ny', type: 'hotel', name: 'Hotel Override', date_from: '2027-03-11', date_to: '2027-03-14',
+      confirmation: 'OVR-1', pin: 'BOOKING-PIN-SECRET', notes: 'BOOKING-NOTES-SECRET' } });
+    const { id } = JSON.parse(made.text);
+    const linked = await call('/api/stops/ny/from-booking', { method: 'POST', token: alice, body: { booking_id: id } });
+    assert.equal(linked.status, 200, linked.text);
+    for (const [path, token] of [['/api/config', bob], ['/api/stops', alice], ['/api/stops/ny/history', alice]]) {
+      const { text } = await call(path, { token });
+      for (const s of ['BOOKING-PIN-SECRET', 'BOOKING-NOTES-SECRET']) assert.ok(!text.includes(s), `${path}: ${s}`);
+    }
+    const ny = JSON.parse((await call('/api/config', { token: bob })).text).phases.find(p => p.id === 'ny');
+    assert.equal(ny.accommodation.name, 'Hotel Override');
+    assert.ok(!('pin' in ny.accommodation));
+  });
+
+  test('provenance is organizer/agent-only: /api/config carries no override metadata', async () => {
+    const served = JSON.parse((await call('/api/config', { token: bob })).text);
+    const ny = served.phases.find(p => p.id === 'ny');
+    for (const key of ['booking_id', 'base_digest', 'updated_by', 'updated_at', 'kind', 'override', 'conflict', 'history', 'booking_out_of_sync']) {
+      assert.ok(!(key in ny), `phase carries ${key}`);
+    }
+    const text = JSON.stringify(served);
+    assert.ok(!/base_digest|booking_out_of_sync|updated_by/.test(text), 'no provenance anywhere in the served config');
+    // The organizer view does carry it — that is where it belongs.
+    const stops = JSON.parse((await call('/api/stops', { token: alice })).text);
+    const listed = stops.stops.find(s => s.id === 'ny');
+    assert.equal(listed.override.updated_by, 'alice');
+    assert.ok(Number.isInteger(listed.override.booking_id));
+  });
+});

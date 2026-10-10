@@ -7,11 +7,14 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
-import { startTestServer, stopTestServer, api, loginAsAlice } from './helpers/server.js';
+import { createRequire } from 'module';
+import { startTestServer, stopTestServer, api, loginAsAlice, testTripDir } from './helpers/server.js';
 import { PORTS } from './helpers/ports.js';
 
 let token;
 const HERE = dirname(fileURLToPath(import.meta.url));
+// The trip server's own SQLite binding (tests/ has none of its own).
+const Database = createRequire(import.meta.url)('../server/node_modules/better-sqlite3');
 
 before(async () => {
   // A non-empty HERMES_URL puts the plan layer in its normal "an enrichment
@@ -1454,11 +1457,19 @@ describe('Phase plan migration', () => {
   });
 
   test('skips a booking whose phase is not in trip.config.json', async () => {
-    await api('/api/bookings', {
+    // POST /api/bookings now refuses an unknown phase, so a row like this can
+    // only come from before that check (or a config that dropped a stop) —
+    // plant it the way such a row exists: directly in the trip DB.
+    const refused = await api('/api/bookings', {
       method: 'POST', token,
-      body: { phase: 'not-a-configured-phase', type: 'other', name: 'מחוץ לקונפיג',
-              notes: 'ד'.repeat(120) },
+      body: { phase: 'not-a-configured-phase', type: 'other', name: 'מחוץ לקונפיג', notes: 'ד'.repeat(120) },
     });
+    assert.equal(refused.status, 400);
+    const db = new Database(join(dirname(testTripDir()), 'trip.db'));
+    try {
+      db.prepare("INSERT INTO bookings (phase, type, name, notes, created_by) VALUES ('not-a-configured-phase', 'other', 'מחוץ לקונפיג', ?, 'alice')")
+        .run('ד'.repeat(120));
+    } finally { db.close(); }
     const { created, skipped } = await (await api('/api/phase-plan/import-from-bookings',
       { method: 'POST', token })).json();
     assert.ok(!created.some(i => i.text_he.includes('מחוץ לקונפיג')),
