@@ -36,6 +36,15 @@ function csrfToken() {
     ?.split("=")[1];
 }
 
+export class ApiError extends Error {
+  constructor(public readonly code: string, message: string) { super(message); }
+}
+
+export type InterviewLinkState = {
+  activeEnrollment: { id: string; expiresAt: string } | null;
+  recoverable: boolean; hasInterview: boolean; telegramChatUrl: string;
+};
+
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
@@ -51,9 +60,14 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
       INVALID_CREDENTIALS: "Email or password is incorrect.",
       SIGN_IN_RATE_LIMITED: "Too many sign-in attempts. Please try again in a minute.",
       GOOGLE_SIGN_IN_UNAVAILABLE: "Google sign-in is not available here.",
+      ACTIVE_ENROLLMENT_EXISTS: "An interview link already exists. You can replace a lost link before the interview starts.",
+      TRIP_NOT_DRAFT: "Your interview has already started. Continue in your existing Telegram chat.",
+      INTERVIEW_ALREADY_STARTED: "Your interview has already started. Continue in your existing Telegram chat.",
+      ENROLLMENT_NOT_REPLACEABLE: "This link changed or was already used. Check the trip status before continuing.",
+      ENROLLMENT_BUSY: "Trip setup is changing. Please try again.",
       ORIGIN_INVALID: "Please sign in from the Kinerary website.",
     };
-    throw new Error(messages[payload.error] || payload.message || payload.error || "The request could not be completed.");
+    throw new ApiError(typeof payload.error === "string" ? payload.error : "REQUEST_FAILED", messages[payload.error] || payload.message || payload.error || "The request could not be completed.");
   }
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;

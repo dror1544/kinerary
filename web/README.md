@@ -23,8 +23,19 @@ issue the real session cookie, and mutations require its CSRF token.
 The account UI lists membership-scoped trips, creates draft trips, presents a
 clickable private Telegram interview link, and shows provisioning plans for
 review. Creating a draft does not provision a site. An interview link is held
-only while its page remains mounted: open it before reloading, since an unused
-active enrollment cannot currently be reissued. Recovery needs a separate flow.
+only while its page remains mounted. After a reload, requesting another link
+reports the existing enrollment; the owner can explicitly replace a lost unused
+link. Replacement invalidates the old link and leaves the draft unchanged.
+Links for an interview that has already started cannot be replaced: continue in
+the existing Telegram chat. Expired links use ordinary preparation.
+
+Owner-scoped `GET /v1/trips/:id/interview-link` returns metadata without a token;
+CSRF-protected `POST /v1/trips/:id/interview-link/replace` requires the expected
+enrollment ID and atomically replaces only an unexpired unused link on a draft
+with an active owner, dashboard access, and no existing interview. A competing
+update returns a conflict for a refreshed, explicit retry; neither route resets
+an interview or reconstructs or persists the original plaintext token, and
+ordinary issuance keeps its existing conflict behavior.
 
 Organizer email/password signup and password recovery remain unavailable in
 this SPA: `/sign-up` and `/forgot-password` redirect to `/sign-in`. Existing

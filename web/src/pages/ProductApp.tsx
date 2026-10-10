@@ -4,15 +4,16 @@ import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Link, Navigate, useLocation, useNavigate, useParams } from "react-router-dom";
 import { z } from "zod";
-import { api, getMe, getTrip, getTrips, passwordSignIn, signIn, getAuthCapabilities, emailPasswordSignIn, safeReturnTo, type TripSummary } from "../api";
+import { api, getMe, getTrip, getTrips, passwordSignIn, signIn, getAuthCapabilities, emailPasswordSignIn, safeReturnTo, type TripSummary, type InterviewLinkState, ApiError } from "../api";
 import { Brand } from "../components/Brand";
 
 export type ProductView = "sign-in" | "trips" | "new-trip" | "trip" | "runtime" | "join";
 
 export default function ProductApp({ view }: { view: ProductView }) {
+  const { tripId } = useParams();
   if (view === "sign-in") return <SignIn />;
   if (view === "join") return <Join />;
-  return <Protected>{view === "trips" ? <Trips /> : view === "new-trip" ? <NewTrip /> : view === "trip" ? <TripSetup /> : <Runtime />}</Protected>;
+  return <Protected>{view === "trips" ? <Trips /> : view === "new-trip" ? <NewTrip /> : view === "trip" ? <TripSetup key={tripId} /> : <Runtime />}</Protected>;
 }
 
 function SignIn() {
@@ -28,7 +29,7 @@ function SignIn() {
     navigate(safeReturnTo(appPath));
   };
   const emailLogin = useMutation({ mutationFn: (values: { email: string; password: string }) => emailPasswordSignIn({ ...values, returnTo }), onSuccess: finishLogin });
-  const tripId = returnTo.match(/^\/trips\/(trip_[A-Za-z0-9]{8,64})(?:\/app)?/)?.[1] ?? "";
+  const tripId = returnTo.match(/^\/(?:mini-app\/)?trips\/(trip_[A-Za-z0-9]{8,64})(?:\/app)?/)?.[1] ?? "";
   const passwordForm = useForm<{ runtimeUsername: string; password: string }>({ defaultValues: { runtimeUsername: "", password: "" } });
   const passwordLogin = useMutation({
     mutationFn: (values: { runtimeUsername: string; password: string }) => passwordSignIn({ tripId, returnTo, ...values }),
@@ -113,12 +114,30 @@ function TripSetup() {
   const { tripId = "" } = useParams();
   const queryClient = useQueryClient();
   const detail = useQuery({ queryKey: ["trip", tripId], queryFn: () => getTrip(tripId), refetchInterval: 5000 });
-  const interview = useMutation({ mutationFn: () => api<{ deepLink: string }>(`/v1/trips/${tripId}/interview-link`, { method: "POST" }) });
+  const [linkConflict, setLinkConflict] = useState(false);
+  const linkState = useQuery({ queryKey: ["interview-link", tripId], queryFn: () => api<InterviewLinkState>(`/v1/trips/${tripId}/interview-link`), enabled: detail.data?.permissions.role === "owner" && (linkConflict || Boolean(detail.data?.interview)), retry: false });
+  const refreshLinkState = () => { setLinkConflict(true); void queryClient.invalidateQueries({ queryKey: ["interview-link", tripId] }); void queryClient.invalidateQueries({ queryKey: ["trip", tripId] }); };
+  const interview = useMutation({ mutationFn: () => api<{ deepLink: string }>(`/v1/trips/${tripId}/interview-link`, { method: "POST" }), onError: error => {
+    if (error instanceof ApiError && ["ACTIVE_ENROLLMENT_EXISTS", "TRIP_NOT_DRAFT"].includes(error.code)) refreshLinkState();
+  } });
+  const replaceLink = useMutation({ mutationFn: () => api<{ deepLink: string }>(`/v1/trips/${tripId}/interview-link/replace`, { method: "POST", body: JSON.stringify({ expectedEnrollmentId: linkState.data?.activeEnrollment?.id }) }), onError: refreshLinkState, onSuccess: () => { interview.reset(); setLinkConflict(false); } });
   const provision = useMutation({ mutationFn: () => api(`/v1/trips/${tripId}/provisioning-request`, { method: "POST" }), onSuccess: () => queryClient.invalidateQueries({ queryKey: ["trip", tripId] }) });
   if (detail.isPending) return <main className="dashboard-main">Loading trip…</main>;
   if (detail.isError) return <main className="dashboard-main"><Notice>Trip not found or unavailable.</Notice></main>;
   const trip = detail.data;
-  return <main className="dashboard-main"><Link className="back-link" to="/trips">← My trips</Link><div className="page-title"><div><p className="eyebrow">Trip setup</p><h1>{trip.title}</h1><p>{trip.destination}</p><p>{trip.startDate || "Start date to confirm"} → {trip.endDate || "End date to confirm"} · {humanize(trip.tripType)} trip</p></div>{trip.runtimeReady && <Link className="button" to={`/trips/${trip.id}/app`}>Open trip</Link>}</div><div className="setup-layout"><section className="workflow-card"><h2>Setup progress</h2><WorkflowStep done={Boolean(trip.interview)} title="Start your private planning interview" detail={trip.interview ? `Interview ${humanize(trip.interview.state)}` : "Continue in the shared Kinerary Telegram bot."}>{interview.data ? <a className="button button-small" href={interview.data.deepLink} target="_blank" rel="noopener noreferrer">Open Telegram interview</a> : <button className="button button-small" onClick={() => interview.mutate()} disabled={interview.isPending}>{interview.isPending ? "Preparing interview…" : "Prepare Telegram interview"}</button>}</WorkflowStep><WorkflowStep done={trip.lifecycleState !== "draft" && trip.lifecycleState !== "intake_in_progress"} title="Confirm the trip outline" detail="The normalized summary becomes available here after confirmation." /><WorkflowStep done={Boolean(trip.provisioning)} title="Create the provisioning plan" detail="Kinerary pins an exact release and the resources your trip needs, for you to review before anything is built.">{trip.nextAction === "request_provisioning" && <button className="button button-small" onClick={() => provision.mutate()} disabled={provision.isPending}>Create plan</button>}</WorkflowStep><WorkflowStep done={Boolean(trip.provisioning) && trip.provisioning!.planStatus !== "pending_approval"} title="Review and approve the plan" detail={trip.provisioning ? humanize(trip.provisioning.jobState || trip.provisioning.planStatus) : "Available once the plan exists. You approve it yourself — nobody else has to sign off."}><PlanReview trip={trip} tripId={tripId} /></WorkflowStep>{trip.provisioning?.safeErrorCode && <Notice>Setup needs attention: {humanize(trip.provisioning.safeErrorCode)}</Notice>}{(interview.isError || provision.isError) && <Notice>{(interview.error || provision.error)?.message}</Notice>}</section><InvitePanel trip={trip} /></div></main>;
+  const alreadyStarted = Boolean(trip.interview) || Boolean(linkState.data?.hasInterview) || trip.lifecycleState !== "draft";
+  const currentLink = replaceLink.data || interview.data;
+  const interviewAction = trip.permissions.role !== "owner" ? null : alreadyStarted ? <>
+    <p>Continue your interview in your existing Telegram chat. Your answers stay in that conversation.</p>
+    {linkState.data && <a className="button button-small" href={linkState.data.telegramChatUrl} target="_blank" rel="noopener noreferrer">Continue in Telegram</a>}
+  </> : currentLink ? <a className="button button-small" href={currentLink.deepLink} target="_blank" rel="noopener noreferrer">Open Telegram interview</a> : linkConflict && linkState.isPending ? <p>Checking the existing interview link…</p> : linkState.data?.recoverable ? <>
+    <p>Replacing invalidates the previous unused link. Your trip outline stays unchanged.</p>
+    <button className="button button-small" onClick={() => replaceLink.mutate()} disabled={replaceLink.isPending}>{replaceLink.isPending ? "Replacing link…" : "Replace lost interview link"}</button>
+  </> : <>
+    {linkConflict && linkState.data && !linkState.data.activeEnrollment && <p>The previous link is no longer active. Prepare a new interview link.</p>}
+    <button className="button button-small" onClick={() => interview.mutate()} disabled={interview.isPending}>{interview.isPending ? "Preparing interview…" : "Prepare Telegram interview"}</button>
+  </>;
+  return <main className="dashboard-main"><Link className="back-link" to="/trips">← My trips</Link><div className="page-title"><div><p className="eyebrow">Trip setup</p><h1>{trip.title}</h1><p>{trip.destination}</p><p>{trip.startDate || "Start date to confirm"} → {trip.endDate || "End date to confirm"} · {humanize(trip.tripType)} trip</p></div>{trip.runtimeReady && <Link className="button" to={`/trips/${trip.id}/app`}>Open trip</Link>}</div><div className="setup-layout"><section className="workflow-card"><h2>Setup progress</h2><WorkflowStep done={Boolean(trip.interview)} title="Start your private planning interview" detail={trip.interview ? `Interview ${humanize(trip.interview.state)}` : "Continue in the shared Kinerary Telegram bot."}>{interviewAction}</WorkflowStep><WorkflowStep done={trip.lifecycleState !== "draft" && trip.lifecycleState !== "intake_in_progress"} title="Confirm the trip outline" detail="The normalized summary becomes available here after confirmation." /><WorkflowStep done={Boolean(trip.provisioning)} title="Create the provisioning plan" detail="Kinerary pins an exact release and the resources your trip needs, for you to review before anything is built.">{trip.nextAction === "request_provisioning" && <button className="button button-small" onClick={() => provision.mutate()} disabled={provision.isPending}>Create plan</button>}</WorkflowStep><WorkflowStep done={Boolean(trip.provisioning) && trip.provisioning!.planStatus !== "pending_approval"} title="Review and approve the plan" detail={trip.provisioning ? humanize(trip.provisioning.jobState || trip.provisioning.planStatus) : "Available once the plan exists. You approve it yourself — nobody else has to sign off."}><PlanReview trip={trip} tripId={tripId} /></WorkflowStep>{trip.provisioning?.safeErrorCode && <Notice>Setup needs attention: {humanize(trip.provisioning.safeErrorCode)}</Notice>}{(interview.isError || replaceLink.isError || linkState.isError || provision.isError) && <Notice>{(replaceLink.error || linkState.error || interview.error || provision.error)?.message}</Notice>}</section><InvitePanel trip={trip} /></div></main>;
 }
 
 function PlanReview({ trip, tripId }: { trip: TripSummary; tripId: string }) {

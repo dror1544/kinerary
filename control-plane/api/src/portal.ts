@@ -3,7 +3,7 @@ import { promisify } from "node:util";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type pg from "pg";
 import { CodeChallengeMethod, OAuth2Client } from "google-auth-library";
-import { issueEnrollment } from "./enrollment.js";
+import { issueEnrollment, replaceEnrollment } from "./enrollment.js";
 import { ensureUnknownPasswordCredential, resolveOrCreateEmailAccount, verifyPasswordLogin } from "./password-identity.js";
 import { generatePlan } from "./planner.js";
 import { issueApproval } from "./plan-approval.js";
@@ -604,6 +604,43 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
     if (!result.ok) return reply.code(409).send({ error: result.reason });
     await recordFunnelEvent(deps.db, "interview_launched", { userId: user.id, tripId });
     return reply.code(201).send({
+      enrollmentId: result.enrollmentId,
+      deepLink: `https://t.me/${deps.telegramBotUsername}?start=${encodeURIComponent(result.token)}`,
+      expiresAt: result.expiresAt.toISOString(),
+    });
+  });
+
+  // Safe recovery metadata only: the original plaintext enrollment is never
+  // persisted, reconstructed, or returned here.
+  app.get("/v1/trips/:id/interview-link", async (request, reply) => {
+    const user = await requireUser(request, reply, deps); if (!user) return;
+    const tripId = (request.params as { id?: string }).id ?? "";
+    const result = await deps.db.query<{ lifecycle_state: string; id: string | null; expires_at: Date | null; has_interview: boolean }>(
+      `SELECT t.lifecycle_state,e.id,e.expires_at,
+         EXISTS(SELECT 1 FROM control_plane.intake_sessions s WHERE s.trip_id=t.id) AS has_interview
+       FROM control_plane.trips t
+       JOIN control_plane.trip_memberships m ON m.trip_id=t.id
+       LEFT JOIN control_plane.interview_enrollments e ON e.trip_id=t.id AND e.state='issued' AND e.expires_at>now()
+       WHERE t.id=$1 AND m.user_id=$2 AND m.status='active' AND m.role='owner' AND m.dashboard_access=true`, [tripId,user.id]);
+    const row = result.rows[0]; if (!row) return reply.code(404).send({ error: "NOT_FOUND" });
+    return reply.header("cache-control", "private, no-store").send({
+      activeEnrollment: row.id ? { id: row.id, expiresAt: row.expires_at!.toISOString() } : null,
+      recoverable: Boolean(row.id) && row.lifecycle_state === "draft" && !row.has_interview,
+      hasInterview: row.has_interview,
+      telegramChatUrl: `https://t.me/${deps.telegramBotUsername}`,
+    });
+  });
+
+  app.post("/v1/trips/:id/interview-link/replace", async (request, reply) => {
+    const user = await requireMutation(request, reply, deps); if (!user) return;
+    const tripId = (request.params as { id?: string }).id ?? "";
+    const expectedEnrollmentId = (request.body as { expectedEnrollmentId?: unknown } | null)?.expectedEnrollmentId;
+    if (typeof expectedEnrollmentId !== "string" || !/^enrl_[A-Za-z0-9]{8,64}$/.test(expectedEnrollmentId)) {
+      return reply.code(400).send({ error: "INVALID_REQUEST" });
+    }
+    const result = await replaceEnrollment(deps.db, user.id, tripId, expectedEnrollmentId, { enrollmentTtlSeconds: deps.enrollmentTtlSeconds });
+    if (!result.ok) return reply.code(result.reason === "NOT_OWNER" ? 404 : 409).send({ error: result.reason === "NOT_OWNER" ? "NOT_FOUND" : result.reason });
+    return reply.header("cache-control", "private, no-store").code(201).send({
       enrollmentId: result.enrollmentId,
       deepLink: `https://t.me/${deps.telegramBotUsername}?start=${encodeURIComponent(result.token)}`,
       expiresAt: result.expiresAt.toISOString(),

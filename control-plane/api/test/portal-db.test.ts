@@ -450,3 +450,52 @@ test("existing organizer email login keeps canonical identity and authorizes a C
     await app.close();
   }
 });
+
+test("lost interview recovery is owner-only, CSRF-protected and explicit; expired links use ordinary issuance", { skip }, async () => {
+  const app = buildApp(profile, { portal: portalDeps(pool) });
+  const owner = await session(ids.owner, "recovery"); const outsider = await session(ids.outsider, "recoveryother");
+  let tripId: string | undefined;
+  try {
+    const headers = { cookie: owner.cookie, "x-csrf-token": owner.csrf };
+    const created = await app.inject({ method: "POST", url: "/v1/trips", headers, payload: { destination: "Recovery test", tripType: "family" } });
+    assert.equal(created.statusCode, 201); tripId = created.json().id;
+    const url = `/v1/trips/${tripId}/interview-link`;
+    const issued = await app.inject({ method: "POST", url, headers }); assert.equal(issued.statusCode, 201);
+    const oldId = issued.json().enrollmentId;
+    assert.equal((await app.inject({ method: "POST", url, headers })).json().error, "ACTIVE_ENROLLMENT_EXISTS");
+    assert.equal((await app.inject({ url })).statusCode, 401);
+    assert.equal((await app.inject({ url, headers: { cookie: outsider.cookie } })).statusCode, 404);
+    const metadata = await app.inject({ url, headers }); assert.equal(metadata.statusCode, 200);
+    assert.equal(metadata.headers['cache-control'], 'private, no-store');
+    assert.deepEqual(metadata.json().activeEnrollment, { id: oldId, expiresAt: issued.json().expiresAt });
+    assert.equal(metadata.json().recoverable, true);
+    assert.doesNotMatch(metadata.body, /start=|token|token_digest/);
+    const replace = { method: "POST" as const, url: url + "/replace", payload: { expectedEnrollmentId: oldId } };
+    assert.equal((await app.inject({ ...replace, headers: { cookie: owner.cookie } })).statusCode, 403);
+    assert.equal((await app.inject({ ...replace, headers: { cookie: outsider.cookie, "x-csrf-token": outsider.csrf } })).statusCode, 404);
+    assert.equal((await app.inject({ ...replace, headers, payload: {} })).statusCode, 400);
+    const next = await app.inject({ ...replace, headers }); assert.equal(next.statusCode, 201);
+    assert.notEqual(next.json().deepLink, issued.json().deepLink);
+    const { verifyEnrollmentToken } = await import('../src/enrollment.js');
+    assert.deepEqual(await verifyEnrollmentToken(pool, new URL(issued.json().deepLink).searchParams.get('start')!), { ok: false, reason: 'REVOKED' });
+    assert.equal((await app.inject({ ...replace, headers })).statusCode, 409);
+    await pool.query("UPDATE control_plane.interview_enrollments SET expires_at=now()-interval '1 second' WHERE trip_id=$1 AND state='issued'", [tripId]);
+    const expired = await app.inject({ url, headers }); assert.equal(expired.json().recoverable, false); assert.equal(expired.json().activeEnrollment, null);
+    const fresh = await app.inject({ method: 'POST', url, headers }); assert.equal(fresh.statusCode, 201);
+    const { startSession } = await import('../src/interview.js');
+    assert.ok((await startSession(pool, new URL(fresh.json().deepLink).searchParams.get('start')!)).ok);
+    const active = await app.inject({ url, headers }); assert.equal(active.json().hasInterview, true); assert.equal(active.json().recoverable, false);
+    const snapshot = (await pool.query('SELECT state,answers FROM control_plane.intake_sessions WHERE trip_id=$1', [tripId])).rows;
+    assert.equal((await app.inject({ ...replace, headers, payload: { expectedEnrollmentId: fresh.json().enrollmentId } })).statusCode, 409);
+    assert.deepEqual((await pool.query('SELECT state,answers FROM control_plane.intake_sessions WHERE trip_id=$1', [tripId])).rows, snapshot);
+  } finally {
+    if (tripId) {
+      await pool.query('DELETE FROM control_plane.intake_sessions WHERE trip_id=$1', [tripId]);
+      await pool.query('DELETE FROM control_plane.interview_enrollments WHERE trip_id=$1', [tripId]);
+      await pool.query('DELETE FROM control_plane.funnel_events WHERE trip_id=$1', [tripId]);
+      await pool.query('DELETE FROM control_plane.trip_memberships WHERE trip_id=$1', [tripId]);
+      await pool.query('DELETE FROM control_plane.trips WHERE id=$1', [tripId]);
+    }
+    await app.close();
+  }
+});
