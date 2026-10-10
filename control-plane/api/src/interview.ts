@@ -1967,6 +1967,161 @@ export async function undeferAllForChat(db: pg.Pool, chatId: string): Promise<vo
   await updateUiStateForChat(db, chatId, (ui) => ({ ...ui, deferred: [] }));
 }
 
+// ── Asking a required question again: what is still missing ─────────────────
+//
+// Live, in Hebrew, 2026-10-10: the organizer answered the stops question with
+// "we sleep in X and day-trip to the villages, no plan yet", the reader said
+// `unclear`, and the router sent the IDENTICAL question back, twice more. They
+// had followed the conversation and were told nothing about what was wrong.
+//
+// A re-ask leads with one of these lines, above the same question and its
+// buttons: it acknowledges the reply and names the piece still missing. The
+// table is CLOSED and the line is chosen by code — keyed by question id, with a
+// sub-gap where a question has more than one way to be incomplete (the router's
+// `reaskGap` picks it). The reader's own `why` is never shown: the model never
+// addresses the organizer (interpret.ts header), so it may only select a key.
+//
+// Two phrasings per gap, alternated by attempt, so a second miss reads
+// differently from the first and no two consecutive messages are the same.
+// Hebrew addresses the organizer in the plural, like the rest of the copy.
+// Accommodation is never named as missing: the stops question asks for it only
+// "if already booked", and demanding it would contradict the question.
+//
+// Every required question has its own entry (pinned by
+// interview-reask-gap.test.ts); `choice` covers a required choice question with
+// none, and `*` is the last resort that the test keeps from ever being reached
+// by a required question.
+
+/** The re-ask lines: gap key → language → [first phrasing, second phrasing]. */
+export const REASK_GAP_PHRASES: Readonly<Record<string, Readonly<Record<Language, readonly [string, string]>>>> = {
+  "phases.dates": {
+    en: [
+      "Thanks, that helps. What I'm still missing is the dates — roughly from when to when you'll be in each place. An estimate is fine.",
+      "Just the dates and this part is done — even rough ones, like \"the first week of August\", are enough.",
+    ],
+    he: [
+      "תודה, זה עוזר. מה שעוד חסר לי זה התאריכים — בערך מתי עד מתי תהיו בכל מקום. מספיק תאריך משוער.",
+      "רק התאריכים והחלק הזה מוכן — גם משהו משוער, כמו \"השבוע הראשון של אוגוסט\", מספיק.",
+    ],
+  },
+  "phases.places": {
+    en: [
+      "Thanks, that helps. What I'm still missing is where you'll be staying along the way — the town or area you'll be based in for each part of the trip, in order.",
+      "To lay the trip out I need the places you'll sleep — just the town or area for each part, in order. Day trips can wait.",
+    ],
+    he: [
+      "תודה, זה עוזר. מה שעוד חסר לי זה איפה תהיו לאורך הדרך — העיר או האזור שבו תהיו בכל חלק של הטיול, לפי הסדר.",
+      "כדי לפרוש את הטיול אני צריך את המקומות שבהם תלונו — רק העיר או האזור לכל חלק, לפי הסדר. טיולי יום אפשר להשאיר לאחר כך.",
+    ],
+  },
+  phases: {
+    en: [
+      "Thanks, that helps. To set up the stops I still need two things: the places, in order, and roughly when you'll be in each one.",
+      "Nearly there with the stops — a place and rough dates for each part of the trip is all I need. Where you sleep can come later if it isn't booked.",
+    ],
+    he: [
+      "תודה, זה עוזר. כדי לסדר את התחנות חסרים לי עוד שני דברים: המקומות לפי הסדר, ובערך מתי תהיו בכל אחד מהם.",
+      "כמעט סיימנו עם התחנות — מקום ותאריכים משוערים לכל חלק של הטיול זה כל מה שצריך. איפה ישנים אפשר להוסיף אחר כך, אם עוד לא הזמנתם.",
+    ],
+  },
+  destination: {
+    en: [
+      "Thanks. What I still need is where the trip is — a country, a region or a city is enough.",
+      "Just the destination for now — the country or the main city you're heading to.",
+    ],
+    he: [
+      "תודה. מה שעוד חסר לי זה לאן הטיול — מספיק מדינה, אזור או עיר.",
+      "רק היעד בינתיים — המדינה או העיר העיקרית שאליה אתם נוסעים.",
+    ],
+  },
+  departure_date: {
+    en: [
+      "Thanks. What I still need is the day the trip starts — a day and a month is enough.",
+      "Just the start date — for example \"12 August\".",
+    ],
+    he: [
+      "תודה. מה שעוד חסר לי זה היום שבו הטיול מתחיל — מספיק יום וחודש.",
+      "רק תאריך היציאה — למשל \"12 באוגוסט\".",
+    ],
+  },
+  return_date: {
+    en: [
+      "Thanks. What I still need is the day you head home — a day and a month is enough.",
+      "Just the return date — for example \"26 August\".",
+    ],
+    he: [
+      "תודה. מה שעוד חסר לי זה היום שבו אתם חוזרים הביתה — מספיק יום וחודש.",
+      "רק תאריך החזרה — למשל \"26 באוגוסט\".",
+    ],
+  },
+  travelers: {
+    en: [
+      "Thanks. What I still need is who's coming — a name for each person (ages help too).",
+      "Just the names of everyone travelling, and I'll take it from there.",
+    ],
+    he: [
+      "תודה. מה שעוד חסר לי זה מי נוסע — שם לכל אחד (גם גילים עוזרים).",
+      "רק השמות של כל מי שנוסע, ומשם אני ממשיך.",
+    ],
+  },
+  organizer_identity: {
+    en: [
+      "Thanks. What I still need is which of the travellers is talking to me.",
+      "Just tell me which name on the list is yours.",
+    ],
+    he: [
+      "תודה. מה שעוד חסר לי זה מי מבין הנוסעים מדבר איתי.",
+      "רק תגידו איזה שם ברשימה הוא שלכם.",
+    ],
+  },
+  bot_name: {
+    en: [
+      "Thanks. What I still need is a name for the trip assistant — the name the family would actually type.",
+      "Just a name for the assistant — anything short the family will use.",
+    ],
+    he: [
+      "תודה. מה שעוד חסר לי זה שם לעוזר של הטיול — השם שהמשפחה באמת תקליד.",
+      "רק שם לעוזר — משהו קצר שהמשפחה תשתמש בו.",
+    ],
+  },
+  choice: {
+    en: [
+      "Thanks. I still need you to pick one of the options below — tap it, or say it in your own words.",
+      "Just one of the options below and we'll move on — tapping it is quickest.",
+    ],
+    he: [
+      "תודה. עוד חסר לי שתבחרו אחת מהאפשרויות למטה — אפשר להקיש עליה או לכתוב במילים שלכם.",
+      "רק אחת מהאפשרויות למטה ונמשיך — הכי מהיר להקיש עליה.",
+    ],
+  },
+  "*": {
+    en: [
+      "Thanks. This one is still open, and I need it before we can finish:",
+      "One more go at this one — a short answer is fine:",
+    ],
+    he: [
+      "תודה. השאלה הזאת עוד פתוחה, ואני צריך אותה לפני שנסיים:",
+      "עוד ניסיון בשאלה הזאת — מספיקה תשובה קצרה:",
+    ],
+  },
+};
+
+/**
+ * The line that leads a re-ask: `gap` is a key of `REASK_GAP_PHRASES`
+ * ("phases.dates", "destination"), `attempt` counts from 1 and alternates the
+ * two phrasings. An unknown sub-gap falls back to its question's own entry, a
+ * choice question with no entry to `choice`, anything else to `*`.
+ */
+export function reaskLead(gap: string, attempt: number, language: Language): string {
+  const questionId = gap.split(".")[0]!;
+  const entry = REASK_GAP_PHRASES[gap]
+    ?? REASK_GAP_PHRASES[questionId]
+    ?? (INTAKE_QUESTIONS.find((q) => q.id === questionId)?.type === "choice" ? REASK_GAP_PHRASES.choice : undefined)
+    ?? REASK_GAP_PHRASES["*"]!;
+  const phrasings = entry[language] ?? entry[DEFAULT_LANGUAGE];
+  return phrasings[(Math.max(1, Math.floor(attempt)) - 1) % phrasings.length]!;
+}
+
 /** The optional question the interviewer nominated, if it is still askable. */
 function pendingAskQuestion(
   answers: AnswerStore,
