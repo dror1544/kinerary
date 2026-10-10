@@ -1,165 +1,144 @@
 # Kinerary
 
-*Kin + itinerary.* A private, collaborative trip website for families and
-friend groups — itinerary, bookings, live weather, a budget tracker, photo
-sharing, and an optional multiplayer trivia game. One JSON file per trip;
-no code changes needed to plan your own.
+*Kin + itinerary.* A private trip command center and family travel companion.
+It keeps a group aligned before, during and after a trip — most of all when
+plans change.
 
-See [FRAMEWORK.md](FRAMEWORK.md) for the full architecture and feature list.
-This file is the quick-start.
+## What it is
 
----
+Most trip tools help you build an itinerary. Kinerary helps the group follow it
+when reality changes.
 
-## Quick start
+- **For the organizer** — the person holding the trip together gets a private
+  control plane (sources, corrections, approvals) and keeps control of every
+  change.
+- **For everyone else** — a simple trip site, and a calm companion in the group
+  chat that answers "what are we doing today?" or "what should I bring?" from
+  the real plan.
+- **Private by default** — the group sees clean answers only. Booking
+  references, private notes and personal constraints stay with the organizer.
 
-There are two ways to create a trip. Both produce the same thing: a
-`trips/<your-slug>/trip.config.json` the site reads from.
+A trip is one config file, `trips/<slug>/trip.config.json`, rendered by a
+shared site and server: itinerary, bookings, live weather, a budget tracker,
+photo sharing and an optional trivia game, in Hebrew and English. Organizers
+can create a trip through a Telegram interview (the control plane) or locally,
+as below.
 
-### Option A — with an AI coding assistant (recommended)
+What it holds to: the organizer keeps control and the group gets simplicity;
+reliability beats breadth; privacy by default; integrate with the tools people
+already use instead of replacing them.
 
-If you have [Claude Code](https://claude.com/product/claude-code) (or
-another agent that can run this repo's Claude Code skills), open this
-repo and either type `/create-trip` or just say something like *"help me
-create a trip to Italy for my family."* It'll interview you — trip
-basics, who's coming, each destination, and how much depth you want (a
-lean logistics-only trip vs. the full trivia/RSVP/budget experience) —
-then scaffold and self-verify the config against the real server and
-render code before handing it back to you. See
-[.claude/skills/create-trip/SKILL.md](.claude/skills/create-trip/SKILL.md)
-for exactly how it works, including the actual commands it runs.
+**Status:** an MVP, run on small family-and-friends trips. New organizers are
+approved by hand: signup is approval-gated.
 
-You don't need to know JSON, or even open a code editor, for this path —
-the conversation *is* the interface. The assistant looks up map
-coordinates, finds and verifies royalty-free hero photos, and fills in
-sensible defaults for anything you skip.
+## Setup
 
-This step — scaffolding a brand-new trip — needs local filesystem and shell
-access, so it's a **Claude Code** (or another local coding agent) job. Once
-the trip exists, day-to-day management (add a booking, answer "where are we
-eating tonight", control the trivia game) can be handed to **Claude Cowork**
-instead, including from your phone with your computer off — see
-[mcp/README.md](mcp/README.md) for connecting it as a custom connector.
+Architecture and the full feature list are in [FRAMEWORK.md](FRAMEWORK.md).
 
-### Option B — manual CLI wizard
+### Requirements
 
-No AI assistant needed:
+- Docker with Compose v2 (`docker compose`) — builds and runs the site.
+- Node.js 20 or newer — the trip scaffolding scripts and the tests (CI runs the
+  tests on Node 20).
+- Optional: [Claude Code](https://claude.com/product/claude-code) for the
+  guided path below.
+
+### 1. Create a trip
+
+Either way produces `trips/<slug>/trip.config.json` (plus
+`trivia_questions.json`), which is what the site reads.
+
+**With an AI coding assistant (recommended).** Open this repo in Claude Code and
+type `/create-trip`, or say *"help me create a trip to Italy for my family."*
+It interviews you about the trip, who is coming, each destination and how much
+depth you want, then scaffolds the config and checks it against the real server
+and render code. See
+[.claude/skills/create-trip/SKILL.md](.claude/skills/create-trip/SKILL.md) for
+what it runs. Scaffolding needs local filesystem and shell access; once the trip
+exists, day-to-day management can be handed to an agent that connects through
+[mcp/README.md](mcp/README.md).
+
+**With the CLI wizard.**
+
 ```bash
 node scripts/new-trip.js
-# Prompts for trip name, participants, families, phases (dates, accommodation, hero image)
-# → trips/<slug>/trip.config.json + trips/<slug>/trivia_questions.json
 ```
 
-Already have a trip planned in Obsidian notes? Import it as a starting
-skeleton instead of starting blank (works with either option above):
+Already have a trip planned in Obsidian notes? Import it as a starting skeleton
+with either route:
+
 ```bash
 node scripts/obsidian-to-config.js /path/to/your/vault/trip-folder trips/<slug>
 ```
 
-### Preview it
+Hero images (`hero.photo`, `meta.homePhoto`, `meta.mapPhoto`) must come from a
+royalty-free source. The built-in examples use [Unsplash](https://unsplash.com/license),
+and the `/create-trip` skill only uses photo URLs it found and confirmed resolve.
 
-`server/server.js` is API-only — it doesn't serve the site's HTML/CSS/JS
-itself, so run it behind the nginx container (which does), not standalone:
+### 2. Configure
+
 ```bash
-TRIP_DIR_HOST=./trips/<slug> docker compose up -d --build
-# → http://localhost:8081 (see docker-compose.override.yml for the port)
+cp .env.example .env
 ```
 
-**Logging in:** for local previewing, set `SEED_PASSWORD=1234` (or any value
-you like) in `.env` before the first boot, then log in as any participant
-(username from `trip.config.json`) with that password to look around. Leave
-`SEED_PASSWORD` unset for a trip that's actually going to real people — each
-participant then gets an independent, unrecoverable random password instead
-of one shared, guessable default, and password login stays unavailable for
-them until they sign in via Telegram or Google and set their own from the
-avatar screen (click your avatar in the side menu → "🔑 Change password").
+Compose reads `.env`, so it must exist. Set **`JWT_SECRET`** to a long random
+value (for example `openssl rand -hex 32`). If it is unset the server falls back
+to a built-in development secret, which is only acceptable for a throwaway
+local preview.
 
-### Connecting Google Sign-In (optional)
+For a local preview, also set `SEED_PASSWORD` to any value before the first boot
+and log in as any participant (username from `trip.config.json`) with it. Leave
+`SEED_PASSWORD` unset for a trip real people will use: each participant then gets
+an independent random password, and password login stays unavailable for them
+until they sign in another way and set their own (avatar menu → "Change
+password").
 
-Password login always works — this just adds "Continue with Google" as an
-extra option, bound to an already-seeded account (never a way to self-register).
+### 3. Run it
 
-1. Go to the [Google Cloud Console credentials page](https://console.cloud.google.com/apis/credentials)
-   and create an OAuth client ID, type **"Web application"**.
-2. Under **Authorized JavaScript origins**, add the exact URL your site runs
-   at (e.g. `http://localhost:8081` for local testing, or your real domain
-   once deployed).
-3. Copy the client ID (looks like `xxxx.apps.googleusercontent.com`) — this
-   is a public identifier, not a secret, but it still belongs in `.env`, not
-   committed to git.
-4. Add to `.env`: `GOOGLE_CLIENT_ID=xxxx.apps.googleusercontent.com`
-5. Restart the server container so it picks up the new env var:
-   `docker compose up -d --force-recreate trip-server`
-   (a plain `restart` does *not* reload `.env` — it needs to recreate the container)
+```bash
+TRIP_DIR_HOST=./trips/<slug> docker compose up -d --build
+# → http://localhost:8081
+```
 
-Without a Client ID, the Google button simply doesn't render — nothing else
-changes. The `/create-trip` interview can walk you through this same setup
-when scaffolding a new trip; see [FRAMEWORK.md](FRAMEWORK.md) for the full
-technical details (schema, endpoints, security model).
+`server/server.js` is API-only; the nginx container serves the site, so run both
+through Compose rather than starting the server alone. State lives in
+`server/data`. Stop with `docker compose down`. If `TRIP_DIR_HOST` is unset,
+Compose falls back to `./trip`, a name this repo reserves — always set it.
 
-### Connecting Telegram Login SSO (optional)
+To reach the site from outside your own network, put a tunnel or a reverse proxy
+with TLS in front of it. It is two containers and a SQLite file, so any host that
+runs Docker Compose will do.
 
-Telegram Login can sign an already-configured participant into the same site
-session after the server verifies both Telegram's signed callback and current
-membership in a configured group. It is disabled by default; see
-[docs/archived/telegram-sso.md](docs/archived/telegram-sso.md) for the required environment
-values and participant binding (archived: the route still exists for stand-alone sites but is not used for provisioned sites). Do not put bot tokens, group IDs, or deployed
-site details in the repository.
+### Optional integrations
 
----
+All are off unless configured; every setting is documented in `.env.example`.
 
-## Hosting options
+- **Google sign-in** adds "Continue with Google" for an already-seeded account.
+  Create an OAuth client ID of type "Web application" in the
+  [Google Cloud console](https://console.cloud.google.com/apis/credentials), add
+  your site's exact URL under Authorized JavaScript origins, put the client ID in
+  `.env` as `GOOGLE_CLIENT_ID`, then run
+  `docker compose up -d --force-recreate trip-server` (a plain `restart` does not
+  reload `.env`).
+- **An agent for bookings and trip questions**, and the connector that lets
+  members use their own Claude or ChatGPT: see [mcp/README.md](mcp/README.md).
 
-The app is two containers (nginx + Node/Express, see `docker-compose.yml`)
-plus a SQLite file — there's no managed database to provision. Pick based
-on how much you want to manage vs. how reachable it needs to be:
+### Tests
 
-| Option | Effort | Reachable by | Notes |
-|---|---|---|---|
-| **Local only** | None | Just you, on your machine | `docker compose up -d`, `http://localhost:8080`. Good for trying it out; your family can't reach it. |
-| **Home server / NAS / Raspberry Pi** | Low–medium | Your family, from anywhere | Same `docker compose up -d`, plus a tunnel (Cloudflare Tunnel, Tailscale Funnel) so you don't have to open firewall ports or manage a public IP. |
-| **A small VPS** | Medium | Anyone with the URL | Any $5–6/mo box (Hetzner, DigitalOcean, Linode) running Docker Compose, with a domain and TLS in front (Caddy, or Cloudflare). Most reliable for a trip your whole family relies on. |
-| **PaaS (Railway, Fly.io, Render, etc.)** | Low | Anyone with the URL | Least ops if you don't want to manage a server at all — worth checking each provider's current multi-container support before committing, since this hasn't been tested against a specific one here. |
+```bash
+cd tests && npm install && npm test
+```
 
-Whichever you pick, set `TRIP_DIR_HOST` (or edit `docker-compose.yml`
-directly) to point at your trip's folder — see `FRAMEWORK.md`'s
-Infrastructure section for the exact Compose block.
+## Going further
 
-If you want an AI agent (Claude Cowork, a local agent like Hermes/OpenClaw,
-or your own) to help manage bookings and answer trip questions on your
-behalf, it talks to the site through `mcp/` — see
-[mcp/README.md](mcp/README.md) for local-agent vs. Cowork/remote-connector
-setup, including the exact steps to add it as a Cowork custom connector.
-
-### Option C — let an agent run the interview over chat
-
-Instead of you running `/create-trip` locally, an agent can conduct the whole
-interview in a Telegram DM with the organizer and provision the site itself.
-That needs a second, privileged MCP server — it writes files and restarts
-containers, so it runs on the site host, on its own port with its own key, and
-is never exposed publicly. See [mcp/PROVISIONING.md](mcp/PROVISIONING.md) to
-stand it up and
-[docs/hermes-interviewer-agent.md](docs/hermes-interviewer-agent.md) for the
-agent itself, including its system prompt.
-
-Both docs are deployment-neutral — substitute `<SITE_HOST>` and `<REPO_ROOT>`
-and they apply to any install, not just the one they were written on.
-
----
-
-## Photos
-
-Hero images (`hero.photo`, `meta.homePhoto`, `meta.mapPhoto`) should come
-from a royalty-free source — [Unsplash](https://unsplash.com/license) is
-what the built-in examples use: free for commercial and non-commercial
-use, no permission or attribution required. The `/create-trip` skill
-enforces this — it never invents a photo URL from memory, only ones it
-found via search and confirmed actually resolve (see
-[INTERVIEW.md](.claude/skills/create-trip/INTERVIEW.md)'s hard rule on
-this). If you source images yourself, keep them royalty-free too — this
-project ships as open source and its example trips' images need to stay
-freely redistributable.
-
----
+- **The full platform** — the Telegram interview, provisioning, per-trip
+  companions and monitoring — is the control plane. How the interview works:
+  [docs/interview-without-an-agent.md](docs/interview-without-an-agent.md).
+  Running it: [docs/control-plane-vm-deployment.md](docs/control-plane-vm-deployment.md).
+  Repository layout and migrations: [control-plane/README.md](control-plane/README.md).
+- **Agent-side trip creation** needs a privileged server that must never be
+  exposed publicly: [mcp/PROVISIONING.md](mcp/PROVISIONING.md).
+- **Working on the project, including with agents**: [CLAUDE.md](CLAUDE.md).
 
 ## License
 
