@@ -138,6 +138,11 @@ export const PORTS = {
   mcpPhasePlanLarge:       28309,  // tests/mcp-phase-plan.test.js — issue #310, safety-net fixture
   mcpTripTimezone:         28311,  // tests/mcp-trip-timezone.test.js
   lostFound:               28312,  // tests/lost-found.test.js — issue #207
+  // Stop editing after the interview (server slices S1–S3).
+  tripStops:               28313,  // tests/trip-stops-http.test.js — main flow
+  tripStopsGolden:         28314,  // tests/trip-stops-http.test.js — byte-identical /api/config, one server at a time
+  itineraryMoveDay:        28315,  // tests/itinerary-move-day.test.js
+  configAllowListStops:    28316,  // tests/config-allow-list.test.js — stop overrides never serve pin/provenance
 
   // ── Stand-ins for services the server calls out to ─────────────────────
   bookingExtractMockHermes: 28103,
