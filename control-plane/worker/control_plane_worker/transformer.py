@@ -76,7 +76,9 @@ Everything the v2 questions write into `agent.standing_instructions[]` carries
 carry the organizer's own `dietary_visibility` choice, as participant needs do.
 
 Hero `meta.brand`/`meta.title` are derived from destination + trip type + the
-departure year (e.g. "USA 2026"), not a fixed value — the site renders
+departure year (e.g. "USA 2026"), or — for a list of places with no country —
+from the stop the trip is based in (see "The trip's essence" below; the slug
+follows the same order), not a fixed value — the site renders
 `meta.brand` as its main, prominent heading (see server/server.js and
 site/app.js's applyBrandFromConfig()). `meta.homeCurrency` and
 `travel_info.countries[*].currency` are a small static floor for the site's
@@ -523,10 +525,129 @@ def _destination_country(destination: str, phase_names: "Sequence[str]") -> str:
     return trailing if trailing.strip().lower() in _KNOWN_COUNTRY_CURRENCY else ""
 
 
+# ── The trip's essence: which stop the trip IS ──────────────────────────────
+#
+# The trip's name — its slug, its title and brand, and the stop the main hero
+# photo is taken from — must come from where the trip is, never from whichever
+# stop happens to be first. Live run, 2026-10-10: a trip to Alsace, sleeping in
+# Colmar and flying in via Frankfurt, answered the destination in Hebrew only;
+# Hebrew slugifies to nothing, the slug fell back to the FIRST stop's latin
+# name, and the trip became `frankfurt-2026` — named after the airport it
+# landed at. The interview now keeps a gateway out of the stops, but identity
+# must not depend on that: the stop holding the most nights is the trip's base,
+# and a one-night gateway cannot outrank it.
+#
+# One ranking, two callers: the raw intake stops (slug, title) and the
+# transformed config phases (`essence_phase_id`, for the hero). Both producers
+# — the agentless path's `planned[]` stops and the agent path's `venues[]`
+# stops — write the only fields read here: a name and a date range.
+
+
+def _stop_nights(start: date | None, end: date | None) -> int:
+    """Nights in a stop's range; an undated or same-day stop holds none."""
+    if start and end and end > start:
+        return (end - start).days
+    return 0
+
+
+def _rank_by_essence(stops: "Sequence[tuple[str, int]]") -> tuple[list[tuple[int, int]], int]:
+    """Ranks `(place key, nights)` pairs, given in trip order.
+
+    Returns each distinct place once — as `(index of its first visit, its total
+    nights)` — best first, plus the nights across every place. Visits to one
+    place are summed: New York at both ends of a trip is one base, not two
+    short stays. Ties, including a trip with no dates at all, keep trip order,
+    which is the only deterministic tiebreak left when nothing else tells the
+    places apart. An empty key is no place and is skipped.
+    """
+    totals: dict[str, int] = {}
+    first_visit: dict[str, int] = {}
+    for index, (key, nights) in enumerate(stops):
+        if not key:
+            continue
+        totals[key] = totals.get(key, 0) + nights
+        first_visit.setdefault(key, index)
+    ranked = sorted(
+        ((index, totals[key]) for key, index in first_visit.items()),
+        key=lambda pair: (-pair[1], pair[0]),
+    )
+    return ranked, sum(totals.values())
+
+
+def _intake_stops_by_essence(data: Mapping[str, Any]) -> tuple[list[tuple[Mapping[str, Any], int]], int]:
+    """The intake's stops, best first, as `(stop, total nights)`, plus the
+    nights across all of them. Keyed the way `_derive_phases` merges stops: the
+    shortened latin name, case-folded."""
+    stops = [s for s in _structured_list(data, "phases") if isinstance(s, Mapping)]
+    keyed = [
+        (
+            _shorten_phase_name(str(s.get("name_en") or s.get("name") or "").strip()).casefold()
+            if str(s.get("name_en") or s.get("name") or "").strip() else "",
+            _stop_nights(_parse_iso_date(s.get("start")), _parse_iso_date(s.get("end"))),
+        )
+        for s in stops
+    ]
+    ranked, total = _rank_by_essence(keyed)
+    return [(stops[index], nights) for index, nights in ranked], total
+
+
+def _dominant_base_name(data: Mapping[str, Any]) -> str:
+    """The stop the trip is BASED in, as the organizer wrote its name — only
+    when it holds more than half of the trip's nights.
+
+    "We sleep in Colmar and visit the villages" is one base; Tokyo 4, Kyoto 5,
+    Osaka 3 nights is a tour with no base, and naming it after Kyoto would be a
+    guess dressed as a fact. Undated stops hold no nights, so they never make a
+    base."""
+    ranked, total = _intake_stops_by_essence(data)
+    if not ranked or total <= 0:
+        return ""
+    stop, nights = ranked[0]
+    if nights * 2 <= total:
+        return ""
+    return str(stop.get("name") or stop.get("name_en") or "").strip()
+
+
+def essence_phase_id(phases: "Sequence[Any]") -> str | None:
+    """The id of the config phase the trip is based in — the stop with the
+    most nights, visits to one place summed, ties in trip order — or None.
+
+    For the trip-wide hero photo. The site's home hero falls back to
+    `phases[0].hero.photo` when `meta.homePhoto` is absent (trip-web's
+    `heroCandidates`), so without this the trip's main photo is whichever stop
+    sorts first: on 2026-10-10, the airport the family landed at. The
+    `unplanned` open-days placeholder is the site's own inference, not a
+    place, and is never the essence."""
+    real = [p for p in phases if isinstance(p, Mapping) and not p.get("unplanned") and p.get("id")]
+    keyed = []
+    for phase in real:
+        title = phase.get("title") if isinstance(phase.get("title"), Mapping) else {}
+        dates = phase.get("dates") if isinstance(phase.get("dates"), Mapping) else {}
+        key = str(title.get("en") or title.get("he") or phase.get("id") or "").strip().casefold()
+        keyed.append((key, _stop_nights(
+            _parse_iso_date(str(dates.get("start") or "")[:10]),
+            _parse_iso_date(str(dates.get("end") or "")[:10]),
+        )))
+    ranked, _ = _rank_by_essence(keyed)
+    return str(real[ranked[0][0]]["id"]) if ranked else None
+
+
+def _known_country_slug(destination: str) -> str:
+    """A non-latin destination that NAMES a country the tables know ("יפן"),
+    slugged by that country's key ("japan"). The destination is still the
+    trip's first source of identity when it is written in Hebrew; only a
+    place no table knows falls through to the trip's base stop."""
+    for key in _country_keys(destination):
+        if key in _KNOWN_COUNTRY_TIMEZONE or key in _KNOWN_COUNTRY_CURRENCY:
+            slug = _slug_words(key)
+            if slug:
+                return slug
+    return ""
 
 
 def _derive_brand_and_title(
     destination: str, trip_type_label: str, year: int, phase_names: "Sequence[str]" = (),
+    base_name: str = "",
 ) -> tuple[str, str]:
     """Derives a short Hero brand ("USA 2026") and a longer title ("USA 2026 —
     Group of Families") from the destination and trip type.
@@ -537,17 +658,27 @@ def _derive_brand_and_title(
     subject instead ("Family Trip 2026"), since a list of cities makes an
     unreadable brand. A destination that leads with one place before a dash
     or colon ("Portugal — Lisbon and Porto") is judged by that place alone.
+
+    `base_name` is the stop the trip is based in, when one holds most of its
+    nights (`_dominant_base_name`). It names a multi-place destination that has
+    no trailing country — "אלזס, קולמר" with every night in Colmar is the
+    Colmar trip — instead of the trip-type theme. It never overrides a
+    destination that names the trip by itself: the destination comes first.
     """
     place = _destination_head(destination)
     is_multi_place = bool(_MULTI_PLACE_RE.search(place))
     short_destination = _shorten_phase_name(place, max_length=20)
     trailing = _destination_country(destination, phase_names)
     short_trailing = _shorten_phase_name(trailing, max_length=20) if trailing else ""
+    short_base = _shorten_phase_name(base_name, max_length=20) if base_name.strip() else ""
     if not is_multi_place and short_destination == place and short_destination:
         subject = short_destination
     elif trailing and short_trailing == trailing:
         # A list of stops that ends with its country is named by the country.
         subject = trailing
+    elif short_base:
+        # A list of places with one base: the trip is where it sleeps.
+        subject = short_base
     else:
         subject = trip_type_label if "trip" in trip_type_label.lower() else f"{trip_type_label} Trip"
     brand = f"{subject} {year}".upper()
@@ -576,20 +707,27 @@ def derive_trip_slug(data: Mapping[str, Any], today: date | None = None) -> str:
     today = today or date.today()
     departure_date, _, _ = _resolve_dates(data, today)
 
-    destination = _slug_words(_text_value(data.get("destination", {})))
+    destination_text = _text_value(data.get("destination", {}))
+    destination = _slug_words(destination_text)
     if len(destination) > 40:
         destination = destination[:40].rstrip("-")
     if not destination:
+        # Written in Hebrew, but naming a country the tables know: still the
+        # destination, so still the slug ("יפן" is japan-2026).
+        destination = _known_country_slug(destination_text)
+    if not destination:
         # A destination written entirely in non-latin script slugifies to
-        # nothing. Before falling back to a generic word, try the phase names:
-        # a trip whose destination is "יפן" usually still has a phase called
-        # "Tokyo", and "tokyo-2026" is a URL the family recognises where
+        # nothing. Before falling back to a generic word, try the stops: "a
+        # trip to Alsace sleeping in Colmar" has a stop whose latin name is
+        # "Colmar", and "colmar-2026" is a URL the family recognises where
         # "trip-2026" is one they cannot tell from anyone else's (capture
-        # ledger, General #4). Phases are checked in order and the first one
-        # that slugifies to anything wins.
-        for phase in _structured_list(data, "phases"):
-            if not isinstance(phase, Mapping):
-                continue
+        # ledger, General #4).
+        #
+        # The trip's BASE first — the stop with the most nights — never simply
+        # the first stop: on 2026-10-10 the first stop was the airport the
+        # family flew into, and the trip became frankfurt-2026. The first
+        # stop in that ranking whose name slugifies to anything wins.
+        for phase, _nights in _intake_stops_by_essence(data)[0]:
             for key in ("name_en", "name"):
                 candidate = _slug_words(str(phase.get(key) or ""))
                 if candidate:
@@ -1963,6 +2101,7 @@ def transform_intake(
         destination, trip_type_label, departure_date.year,
         [str(ph.get("name") or ph.get("name_en") or "") for ph in _structured_list(data, "phases")
          if isinstance(ph, Mapping)],
+        base_name=_dominant_base_name(data),
     )
     departure_iso = datetime(
         departure_date.year, departure_date.month, departure_date.day,

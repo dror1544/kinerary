@@ -42,6 +42,8 @@ import urllib.request
 from collections.abc import Mapping
 from typing import Any, Callable
 
+from .transformer import essence_phase_id
+
 logger = logging.getLogger("control_plane_worker.enrichment")
 
 # A callable that takes a URL and returns parsed JSON, or None for any
@@ -487,6 +489,20 @@ def enrich_config(
                     }
         except Exception:
             logger.warning("enrichment.hero_failed", extra={"phase": phase.get("id")}, exc_info=True)
+
+    # The trip-wide (home) hero. The site otherwise takes `phases[0].hero.photo`, so the
+    # main photo of a trip that lands at one airport and sleeps in another town would be
+    # the airport's. The base is the stop with the most nights (transformer.essence_phase_id).
+    try:
+        meta = out.get("meta")
+        if isinstance(meta, dict) and not meta.get("homePhoto"):
+            base_id = essence_phase_id(out.get("phases") or [])
+            base = next((p for p in out.get("phases") or [] if isinstance(p, dict) and p.get("id") == base_id), None)
+            photo = ((base or {}).get("hero") or {}).get("photo")
+            if photo:
+                meta["homePhoto"] = photo
+    except Exception:
+        logger.warning("enrichment.home_photo_failed", exc_info=True)
 
     try:
         _build_map(out)
