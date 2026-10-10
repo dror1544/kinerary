@@ -91,8 +91,19 @@ fail() { printf '%s[fail]%s %s\n' "$C_R" "$C_X" "$1"; FAILED=1; }
 note() { printf '%s[note]%s %s\n' "$C_Y" "$C_X" "$1"; }
 die()  { fail "$1"; exit 1; }
 
+# Wall-clock per step, so a slow run says where it went. SECONDS is bash's own
+# counter (whole seconds, no external process); each timed step is recorded and
+# the whole table is printed by housekeeping, so an interrupted or failed run
+# still shows what it spent.
+SECONDS=0
+TIMINGS=()
+fmt_dur() { local t=$1; if [ "$t" -ge 60 ]; then printf '%dm%02ds' $((t / 60)) $((t % 60)); else printf '%ds' "$t"; fi; }
+record_time() { TIMINGS+=("$2|$1"); }   # record_time <label> <seconds>
+
 FAILED=0
-RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/kinerary-preflight.XXXXXX")"
+# macOS sets TMPDIR with a trailing slash; strip it so the printed paths have one.
+TMP_BASE="${TMPDIR:-/tmp}"; TMP_BASE="${TMP_BASE%/}"
+RUN_DIR="$(mktemp -d "$TMP_BASE/kinerary-preflight.XXXXXX")"
 LOGS="$RUN_DIR/logs"; mkdir -p "$LOGS"
 
 # ── Housekeeping ─────────────────────────────────────────────────────────────
@@ -105,6 +116,12 @@ MODERN_WAS_CLEAN=0
 housekeeping() {
   local code=$?
   trap - EXIT INT TERM
+  if [ "${#TIMINGS[@]}" -gt 0 ]; then
+    step "Timings"
+    local row
+    for row in "${TIMINGS[@]}"; do printf '  %8s  %s\n' "$(fmt_dur "${row%%|*}")" "${row#*|}"; done
+    printf '  %8s  %s\n' "$(fmt_dur "$SECONDS")" "total (wall clock)"
+  fi
   step "Housekeeping"
   if [ -n "$TEST_DB" ]; then
     docker exec "$TEST_PG" psql -U postgres -q -c "DROP DATABASE IF EXISTS \"$TEST_DB\" WITH (FORCE)" >/dev/null 2>&1 \
@@ -126,8 +143,9 @@ trap 'exit 130' INT TERM
 run() {  # run <label> <dir> <command...>
   local label="$1" dir="$2"; shift 2
   local log="$LOGS/$(printf '%s' "$label" | tr -c 'A-Za-z0-9._-' '_').log"
-  if ( cd "$dir" && "$@" ) >"$log" 2>&1; then pass "$label"
-  else fail "$label  (log: $log)"; tail -25 "$log" | sed 's/^/       /'; fi
+  local t0=$SECONDS took
+  if ( cd "$dir" && "$@" ) >"$log" 2>&1; then took=$((SECONDS - t0)); record_time "$label" "$took"; pass "$label  ($(fmt_dur "$took"))"
+  else took=$((SECONDS - t0)); record_time "$label (failed)" "$took"; fail "$label  ($(fmt_dur "$took"), log: $log)"; tail -25 "$log" | sed 's/^/       /'; fi
 }
 
 # ── Dependencies: provided, not assumed ──────────────────────────────────────
@@ -329,8 +347,10 @@ E2E_ARGS=(--scenario "$SCENARIO")
 # populated): the cycle itself survived on it because everything it touches is
 # local HTTP, and the teardown it spawns died on the first HTTPS call, three
 # scenarios running, leaving three provisioned trips behind.
+e2e_t0=$SECONDS
 "$PY" -u scripts/e2e-full-cycle.py "${E2E_ARGS[@]}"
 e2e=$?
+record_time "signup to working companion ($SCENARIO)" "$((SECONDS - e2e_t0))"
 [ "$e2e" = 0 ] || { FAILED=1; exit "$e2e"; }
 if [ "$SCENARIO" = all ]; then walked="every scenario walked"; else walked="the $SCENARIO trip walked"; fi
 printf '\n%s[ ok ]%s deployed, verified, and %s end to end.\n' "$C_G" "$C_X" "$walked"
