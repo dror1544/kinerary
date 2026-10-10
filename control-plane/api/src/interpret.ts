@@ -1256,6 +1256,60 @@ function dataJsonExample(data: unknown): string {
   return `"dataJson":${JSON.stringify(JSON.stringify(data))}`;
 }
 
+/**
+ * What is NOT a stop — one rule, said in both prompts that read for stops.
+ *
+ * It lived only in the document prompt. A typed answer went to a prompt that had
+ * never been told, and a live Hebrew run (2026-10-10) paid for it: an organizer
+ * who flew into one city, collected a car, drove to the town they would sleep in
+ * and drove back to fly home had the trip stored as [gateway, town, gateway] —
+ * three stops, none dated. Shared here so the two prompts cannot drift on it.
+ */
+const GATEWAY_IS_NOT_A_STOP: readonly string[] = [
+  `- A FLIGHT is not a stop. Landing in a city and flying home from it does`,
+  `  not make the whole trip one stop in that city. Collecting a rental car`,
+  `  there and handing it back there is no stay either: a city that is only`,
+  `  where they land, pick up the car, return it or fly home from is never a`,
+  `  stop — least of all the first stop and the last one.`,
+];
+
+/**
+ * How a typed answer about stops is read. Only included when stops are being
+ * asked for (`phases` outstanding): every other question's prompt is spared it.
+ *
+ * The three rules each come from one live message (2026-10-10, Hebrew, two
+ * couples in one town with day trips to nearby markets): "we will sleep in X
+ * and tour the villages from there, we have no organised plan yet" came back as
+ * `unclear`, with the model's own reasons "no date range or accommodation" and
+ * "states no firm plan exists". The examples below deliberately name no real
+ * trip: a prompt example reaches answers (`exampleEchoes`).
+ */
+function stopsSection(): string[] {
+  return [
+    `ABOUT STOPS (the "phases" question). A stop is a place they SLEEP, not every`,
+    `place the message names:`,
+    `- If they sleep in one place for the whole trip and go out from it ("we`,
+    `  sleep in A and visit the villages around it", "based in A, with day`,
+    `  trips"), that is ONE stop: A. Its dates are the dates of the whole trip —`,
+    `  take them from the departure and return dates listed below under`,
+    `  "Already answered", or from the message. The villages, towns, markets and`,
+    `  sights visited from the base are NOT stops: leave them out, or put them in`,
+    `  that stop's "planned" list only when the message names them.`,
+    ...GATEWAY_IS_NOT_A_STOP,
+    `  "Landing in A, picking up a car, driving to B, back to A to fly home" is`,
+    `  ONE stop, B. Never write A as a first stop and a last stop. A flight or a`,
+    `  car with its own date may go in "travel_anchors" if that question is`,
+    `  listed below; otherwise leave it out.`,
+    `- "We have no plan yet", "nothing organised", "we'll decide there" says the`,
+    `  itinerary is open. It does not leave the question unanswered: if the`,
+    `  message names where they sleep, propose that stop. "unclear" is for a`,
+    `  message that names no place to stay.`,
+    `- A stop with no dates of its own gets none unless it is the only stop, in`,
+    `  which case it takes the trip's dates. Never invent a hotel or a date.`,
+    ``,
+  ];
+}
+
 function changesHeld(held: BuildInterpretPromptArgs["heldLists"]): boolean {
   return Boolean(held && (held.stops.length > 0 || held.travellers.length > 0));
 }
@@ -1426,12 +1480,20 @@ export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
     `  shown on their trip's site; a translation there is a sentence they never`,
     `  wrote appearing under their name, in a conversation held in Hebrew.`,
     `  Normalise there; leave "evidence" as they wrote it.`,
-    `- Use the exact option ids given. Never invent one. If they meant something not`,
-    `  listed and the question allows it, use kind "choice_other".`,
+    `- Use the exact option ids given. Never invent one. Match an option by MEANING,`,
+    `  not by its label: the person may use other words, a plural, a different`,
+    `  form, or another language than the label's — "couples" or "זוגות" is the`,
+    `  option labelled Couple; "two families" is the one labelled Group of`,
+    `  families. If one listed option fits, answer kind "choice" with its id.`,
+    `  Use kind "choice_other" ONLY when no listed option fits what they meant`,
+    `  and the question allows it. When they say what it is NOT as well ("X, not`,
+    `  Y"), the answer is what it IS. The kind they NAME decides, not the people`,
+    `  they add to explain it ("a Y trip, there will be N of us" is still Y).`,
     `- "confidence" is 0..1: how sure you are this is what they meant, not how sure`,
     `  you are that you understood the words.`,
     `- If the message gestures at a question without settling it, put it in "unclear".`,
     ``,
+    ...(asked.some((q) => q.id === "phases") ? stopsSection() : []),
     `Questions still outstanding:`,
     ...asked.map(describeQuestion),
     ``,
@@ -1444,7 +1506,16 @@ export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
           changesHeld(args.heldLists)
             ? `propose only what is being ADDED or CHANGED, not the whole list. (The stops and the travellers are not here: change them with operations, above.)`
             : `propose only what is being ADDED or CHANGED, not the whole list.`,
-          ...args.correctable.map((q) => `- id: ${q.id}  (currently: ${q.current.replace(/\s+/g, " ").trim().slice(0, 160)})`),
+          // A question with listed options shows them here as well. Without them
+          // "a couples trip, not family" (trip_type, currently Family) had no option
+          // id to land on and came back as choice_other "זוגות" — 2026-10-10, live.
+          ...args.correctable.flatMap((q) => {
+            const options = all.find((a) => a.id === q.id)?.options;
+            return [
+              `- id: ${q.id}  (currently: ${q.current.replace(/\s+/g, " ").trim().slice(0, 160)})`,
+              ...(options?.length ? [`  options: ${options.map((o) => `${o.id} = ${o.label}`).join(" | ")}`] : []),
+            ];
+          }),
           ``,
         ]
       : []),
@@ -1623,8 +1694,7 @@ export function buildExtractIntakePrompt(args: {
     `  visit INSIDE a stop, not a stop, and gives neither its start nor its end:`,
     `  put it in that stop's "planned" list (or travel_anchors, if it is booked)`,
     `  and give the stop its name only.`,
-    `- A FLIGHT is not a stop. Landing in a city and flying home from it does`,
-    `  not make the whole trip one stop in that city.`,
+    ...GATEWAY_IS_NOT_A_STOP,
     `- A range given for the WHOLE trip answers both the departure date and the`,
     `  return date; propose both. A hotel stay, one stop, a ticket, a car rental`,
     `  or one flight within the trip does not set the trip's dates.`,
