@@ -5,6 +5,7 @@ import pg from "pg";
 import { buildApp } from "../src/app.js";
 import { validateArchitectureProfile } from "../src/config.js";
 import { applyMigrations } from "../src/migrations.js";
+import { createOrVerifyPasswordIdentity } from "../src/password-identity.js";
 import { sha256, type PortalDependencies } from "../src/portal.js";
 import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
@@ -383,4 +384,118 @@ test("with no operator chat id configured, approval still succeeds and simply en
        WHERE notification_type = 'operator_provisioning_approved'`);
     assert.equal(after.rows[0].count, before.rows[0].count, "no operator row was added");
   } finally { await app.close(); }
+});
+
+
+test("existing organizer email login keeps canonical identity and authorizes a CSRF-protected new trip and interview", { skip }, async () => {
+  const email = `portal-${suffix}@example.test`;
+  const password = "existing-organizer-secret";
+  const seeded = await createOrVerifyPasswordIdentity(pool, { email, password });
+  assert.ok(seeded.ok);
+  const userId = seeded.identity.providerSubjectId;
+  const app = buildApp(profile, { portal: { ...portalDeps(pool), google: undefined } });
+  let tripId: string | undefined;
+  try {
+    const before = await pool.query("SELECT count(*)::int AS count FROM control_plane.users");
+    const login = await app.inject({ method: "POST", url: "/v1/auth/email-password", payload: { email: email.toUpperCase(), password, returnTo: "//attacker.test" } });
+    assert.equal(login.statusCode, 200);
+    assert.equal(login.json().appPath, "/trips");
+    const lines = login.headers["set-cookie"];
+    assert.ok(Array.isArray(lines));
+    assert.match(lines[0], /HttpOnly/);
+    assert.match(lines[0], /SameSite=Lax/);
+    const cookie = lines.map(line => line.split(";", 1)[0]).join("; ");
+    const csrf = decodeURIComponent(lines.find(line => line.startsWith("kit_csrf="))!.split(";", 1)[0].slice("kit_csrf=".length));
+    const me = await app.inject({ url: "/v1/me", headers: { cookie } });
+    assert.equal(me.statusCode, 200);
+    assert.equal(me.json().id, userId);
+    assert.equal((await pool.query("SELECT count(*)::int AS count FROM control_plane.users")).rows[0].count, before.rows[0].count);
+    const payload = { destination: "Rome", startDate: "2027-03-01", endDate: "2027-03-09", tripType: "family" };
+    assert.equal((await app.inject({ method: "POST", url: "/v1/trips", headers: { cookie }, payload })).statusCode, 403);
+    const created = await app.inject({ method: "POST", url: "/v1/trips", headers: { cookie, "x-csrf-token": csrf }, payload });
+    assert.equal(created.statusCode, 201);
+    tripId = created.json().id;
+    const detail = await app.inject({ url: `/v1/trips/${tripId}`, headers: { cookie } });
+    assert.equal(detail.statusCode, 200);
+    assert.equal(detail.json().destination, "Rome");
+    assert.equal(detail.json().startDate, "2027-03-01");
+    const interview = await app.inject({ method: "POST", url: `/v1/trips/${tripId}/interview-link`, headers: { cookie, "x-csrf-token": csrf } });
+    assert.equal(interview.statusCode, 201);
+    assert.match(interview.json().deepLink, /^https:\/\/t\.me\/kinerary_bot\?start=/);
+    for (const input of [{ email, password: "wrong" }, { email: "unknown@example.test", password }, { email, password: "x".repeat(1025) }]) {
+      const response = await app.inject({ method: "POST", url: "/v1/auth/email-password", payload: input });
+      assert.equal(response.statusCode, 401);
+      assert.deepEqual(response.json(), { error: "INVALID_CREDENTIALS" });
+      assert.equal(response.headers["set-cookie"], undefined);
+    }
+    const crossOrigin = await app.inject({ method: "POST", url: "/v1/auth/email-password", headers: { origin: "https://attacker.test" }, payload: { email, password } });
+    assert.equal(crossOrigin.statusCode, 403);
+    await pool.query("UPDATE control_plane.users SET status = 'suspended' WHERE id = $1", [userId]);
+    const inactive = await app.inject({ method: "POST", url: "/v1/auth/email-password", payload: { email, password } });
+    assert.equal(inactive.statusCode, 401);
+    assert.deepEqual(inactive.json(), { error: "INVALID_CREDENTIALS" });
+    assert.equal((await app.inject({ url: "/v1/me", headers: { cookie } })).statusCode, 401);
+  } finally {
+    if (tripId) {
+      await pool.query("DELETE FROM control_plane.funnel_events WHERE trip_id = $1", [tripId]);
+      await pool.query("DELETE FROM control_plane.interview_enrollments WHERE trip_id = $1", [tripId]);
+      await pool.query("DELETE FROM control_plane.trip_memberships WHERE trip_id = $1", [tripId]);
+      await pool.query("DELETE FROM control_plane.trips WHERE id = $1", [tripId]);
+    }
+    await pool.query("DELETE FROM control_plane.funnel_events WHERE user_id = $1", [userId]);
+    await pool.query("DELETE FROM control_plane.web_sessions WHERE user_id = $1", [userId]);
+    await pool.query("DELETE FROM control_plane.password_credentials WHERE user_id = $1", [userId]);
+    await pool.query("DELETE FROM control_plane.user_identities WHERE user_id = $1", [userId]);
+    await pool.query("DELETE FROM control_plane.users WHERE id = $1", [userId]);
+    await app.close();
+  }
+});
+
+test("lost interview recovery is owner-only, CSRF-protected and explicit; expired links use ordinary issuance", { skip }, async () => {
+  const app = buildApp(profile, { portal: portalDeps(pool) });
+  const owner = await session(ids.owner, "recovery"); const outsider = await session(ids.outsider, "recoveryother");
+  let tripId: string | undefined;
+  try {
+    const headers = { cookie: owner.cookie, "x-csrf-token": owner.csrf };
+    const created = await app.inject({ method: "POST", url: "/v1/trips", headers, payload: { destination: "Recovery test", tripType: "family" } });
+    assert.equal(created.statusCode, 201); tripId = created.json().id;
+    const url = `/v1/trips/${tripId}/interview-link`;
+    const issued = await app.inject({ method: "POST", url, headers }); assert.equal(issued.statusCode, 201);
+    const oldId = issued.json().enrollmentId;
+    assert.equal((await app.inject({ method: "POST", url, headers })).json().error, "ACTIVE_ENROLLMENT_EXISTS");
+    assert.equal((await app.inject({ url })).statusCode, 401);
+    assert.equal((await app.inject({ url, headers: { cookie: outsider.cookie } })).statusCode, 404);
+    const metadata = await app.inject({ url, headers }); assert.equal(metadata.statusCode, 200);
+    assert.equal(metadata.headers['cache-control'], 'private, no-store');
+    assert.deepEqual(metadata.json().activeEnrollment, { id: oldId, expiresAt: issued.json().expiresAt });
+    assert.equal(metadata.json().recoverable, true);
+    assert.doesNotMatch(metadata.body, /start=|token|token_digest/);
+    const replace = { method: "POST" as const, url: url + "/replace", payload: { expectedEnrollmentId: oldId } };
+    assert.equal((await app.inject({ ...replace, headers: { cookie: owner.cookie } })).statusCode, 403);
+    assert.equal((await app.inject({ ...replace, headers: { cookie: outsider.cookie, "x-csrf-token": outsider.csrf } })).statusCode, 404);
+    assert.equal((await app.inject({ ...replace, headers, payload: {} })).statusCode, 400);
+    const next = await app.inject({ ...replace, headers }); assert.equal(next.statusCode, 201);
+    assert.notEqual(next.json().deepLink, issued.json().deepLink);
+    const { verifyEnrollmentToken } = await import('../src/enrollment.js');
+    assert.deepEqual(await verifyEnrollmentToken(pool, new URL(issued.json().deepLink).searchParams.get('start')!), { ok: false, reason: 'REVOKED' });
+    assert.equal((await app.inject({ ...replace, headers })).statusCode, 409);
+    await pool.query("UPDATE control_plane.interview_enrollments SET expires_at=now()-interval '1 second' WHERE trip_id=$1 AND state='issued'", [tripId]);
+    const expired = await app.inject({ url, headers }); assert.equal(expired.json().recoverable, false); assert.equal(expired.json().activeEnrollment, null);
+    const fresh = await app.inject({ method: 'POST', url, headers }); assert.equal(fresh.statusCode, 201);
+    const { startSession } = await import('../src/interview.js');
+    assert.ok((await startSession(pool, new URL(fresh.json().deepLink).searchParams.get('start')!)).ok);
+    const active = await app.inject({ url, headers }); assert.equal(active.json().hasInterview, true); assert.equal(active.json().recoverable, false);
+    const snapshot = (await pool.query('SELECT state,answers FROM control_plane.intake_sessions WHERE trip_id=$1', [tripId])).rows;
+    assert.equal((await app.inject({ ...replace, headers, payload: { expectedEnrollmentId: fresh.json().enrollmentId } })).statusCode, 409);
+    assert.deepEqual((await pool.query('SELECT state,answers FROM control_plane.intake_sessions WHERE trip_id=$1', [tripId])).rows, snapshot);
+  } finally {
+    if (tripId) {
+      await pool.query('DELETE FROM control_plane.intake_sessions WHERE trip_id=$1', [tripId]);
+      await pool.query('DELETE FROM control_plane.interview_enrollments WHERE trip_id=$1', [tripId]);
+      await pool.query('DELETE FROM control_plane.funnel_events WHERE trip_id=$1', [tripId]);
+      await pool.query('DELETE FROM control_plane.trip_memberships WHERE trip_id=$1', [tripId]);
+      await pool.query('DELETE FROM control_plane.trips WHERE id=$1', [tripId]);
+    }
+    await app.close();
+  }
 });

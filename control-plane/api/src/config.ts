@@ -82,8 +82,8 @@ export const architectureProfileSchema = z.object({
   web: z.object({
     public_origin: z.string().url(),
     runtime_origin: z.string().url(),
-    google_client_id_secret_ref: secretReference,
-    google_client_secret_ref: secretReference,
+    google_client_id_secret_ref: secretReference.optional(),
+    google_client_secret_ref: secretReference.optional(),
     runtime_exchange_key_secret_ref: secretReference,
     runtime_upstream_host_suffixes: z.array(z.string().min(1).max(253).regex(/^[A-Za-z0-9.-]+$/)).min(1),
     telegram_bot_username: z.string().regex(/^[A-Za-z0-9_]{5,32}$/),
@@ -91,7 +91,9 @@ export const architectureProfileSchema = z.object({
     // is approved by the trip's own organizer; the operator is notified, not
     // asked. See docs/landing-page-plan.md.
     session_ttl_seconds: z.number().int().min(3600).max(2592000).default(604800),
-  }).strict().optional(),
+  }).strict().refine((web) => Boolean(web.google_client_id_secret_ref) === Boolean(web.google_client_secret_ref), {
+    message: "Google client ID and secret references must be configured together",
+  }).optional(),
   /**
    * The Trip Bot relay connector — the WebSocket server Hermes's gateway dials
    * OUT to, plus the shared bot token the connector polls.
