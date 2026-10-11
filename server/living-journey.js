@@ -275,17 +275,29 @@ function schema(db) {
 // whose dates are wrong-shaped loses them to the allow-list and then matches
 // every night (the second boundary review measured it picking that hotel over
 // the right one).
+//
+// Inside a legacy multi-hotel stop the night rule is the one nightStop() uses
+// across stops: on a changeover date (one hotel's check-out is the next one's
+// check-in) the night is the hotel checked INTO. Only when no hotel runs past
+// the date does one that ends on it count. Before 2026-10-11 the first
+// inclusive match won, which put the changeover night in the hotel just left.
 function dayContextForPhase(rawPhase, date) {
   const rawAccommodation = rawPhase?.accommodation;
   const rawHotels = rawPhase?.hotels;
   let chosen = null;
   if (rawAccommodation) chosen = { accommodation: rawAccommodation };
   else if (Array.isArray(rawHotels)) {
-    const index = rawHotels.findIndex((h) => {
-      const from = h?.date_from || h?.check_in || h?.from;
-      const to = h?.date_to || h?.check_out || h?.to;
-      return (!from || from <= date) && (!to || date <= to);
+    const bounds = (h) => ({ from: h?.date_from || h?.check_in || h?.from, to: h?.date_to || h?.check_out || h?.to });
+    let index = rawHotels.findIndex((h) => {
+      const { from, to } = bounds(h);
+      return (!from || from <= date) && (!to || date < to || from === to);
     });
+    if (index < 0) {
+      index = rawHotels.findIndex((h) => {
+        const { from, to } = bounds(h);
+        return (!from || from <= date) && (!to || date <= to);
+      });
+    }
     if (index >= 0) chosen = { hotels: [rawHotels[index]] };
   }
   const projected = chosen ? publicPart('phase', chosen) : undefined;
@@ -301,6 +313,51 @@ function dayContextForPhase(rawPhase, date) {
     // already stored; nothing new is written to it.
     pickup_context: null,
   };
+}
+
+// A stop's dated range, or null — the same test as trip-web/src/stops.ts
+// stopDatesOf: both ends ISO dates, start <= end.
+function stopRange(phase) {
+  const start = phase?.dates?.start || phase?.start;
+  const end = phase?.dates?.end || phase?.end;
+  return typeof start === 'string' && typeof end === 'string' && ISO_DATE_RE.test(start) && ISO_DATE_RE.test(end) && start <= end
+    ? { start, end } : null;
+}
+
+// The stop whose night `date` is, in a list of RAW phases — the rule
+// trip-web/src/stops.ts tonightLodging applies, so the server and the Modern
+// client name the same stop. A night belongs to the stop that starts on or
+// before it and ends after it: on a transfer day (A ends where B starts, as
+// configs and splits write it) the night is B's. Only when no stop runs past
+// the date does a stop that ends on it count (a config that writes the last
+// night as the end date). The day's own stop wins a tie; otherwise the first
+// in config order. Null when no dated stop covers the date.
+function nightStop(phases, date, ownPhaseId) {
+  if (typeof date !== 'string' || !ISO_DATE_RE.test(date)) return null;
+  const dated = (Array.isArray(phases) ? phases : [])
+    .map((phase) => ({ phase, range: stopRange(phase) }))
+    .filter((p) => p.range);
+  const prefer = (list) => list.find((p) => p.phase?.id === ownPhaseId) || list[0];
+  const night = prefer(dated.filter((p) => p.range.start <= date && (date < p.range.end || p.range.start === p.range.end)))
+    || prefer(dated.filter((p) => p.range.start <= date && date <= p.range.end));
+  return night ? night.phase : null;
+}
+
+// A day row with its lodging computed NOW, from the effective config, rather
+// than the copy stored when the row was written. That copy is null after any
+// Classic/MCP plan write (rowsFromLegacyPlan re-derives the rows without it,
+// and importPlanOnce does that at every boot) and stale after a stop edit — a
+// hotel set, a split. The stop covering the night decides, even when it has no
+// hotel: a stop with none never inherits another stop's stored hotel. The
+// stored copy is kept only when no dated stop covers the date (a trip whose
+// stops have no dates yet). The value comes from dayContextForPhase on the raw
+// stop — choose on raw, serve the projection — and publicDayContext projects
+// it again on the way out, so nothing reaches the payload but the three public
+// fields it carried before.
+function withServedLodging(day, phases) {
+  const stop = nightStop(phases, day.date, day.phase_id);
+  if (!stop) return day;
+  return { ...day, lodging_context: readJson(dayContextForPhase(stop, day.date).lodging_context, null) };
 }
 
 // The member-facing view of a stored day's context. Rows written before the
@@ -570,7 +627,10 @@ function markProvenance(db, payload) {
   };
 }
 
-function serializeItinerary(db, rows, { includeOriginal = false } = {}) {
+// `config` is the effective (raw-shaped) config the participant view computes
+// each night's lodging from; /api/itinerary/original (includeOriginal) serves
+// the immutable snapshot as stored and takes none.
+function serializeItinerary(db, rows, { includeOriginal = false, config = null } = {}) {
   // A booking imported for organizer review is not participant-visible yet.
   // Every participant-facing itinerary projection must enforce that boundary;
   // filtering only /api/bookings leaked draft details through attached cards.
@@ -582,8 +642,8 @@ function serializeItinerary(db, rows, { includeOriginal = false } = {}) {
     source_config_version: rows.version.source_config_version,
     // The participant-facing projection enforces the day-context shape on
     // stored rows too; /api/itinerary/original (organizer-or-agent) is left as
-    // it was.
-    days: includeOriginal ? rows.days : rows.days.map(publicDayContext),
+    // it was. Lodging is computed from the trip as it is now (withServedLodging).
+    days: includeOriginal ? rows.days : rows.days.map((day) => publicDayContext(config ? withServedLodging(day, config.phases) : day)),
     items: rows.items.map((item) => ({
       ...item,
       booking: item.booking_id ? bookingsById.get(item.booking_id) || null : null,
@@ -1209,7 +1269,9 @@ function registerRoutes({ app, db, config, getConfig, raw, fetchImpl, mediaDir, 
   app.get('/api/itinerary/active', authRequired, (req, res) => {
     const rows = activeRows(db);
     if (!rows) return res.status(404).json({ error: 'itinerary_not_ready' });
-    const payload = serializeItinerary(db, rows);
+    // The ETag is over the payload, so a stop edit — which changes the lodging
+    // served, not the plan revision — is a new ETag, never a 304.
+    const payload = serializeItinerary(db, rows, { config: cfg() });
     const etag = etagForPayload(payload);
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('ETag', etag);

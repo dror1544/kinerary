@@ -389,7 +389,7 @@ describe('GET /api/config and /api/config/versions/:version — hostile config o
     const db = new Database(join(dataDir, 'trip.db'));
     const { active_version_id: active } = db.prepare('SELECT active_version_id FROM trip_itinerary_state WHERE id = 1').get();
     db.prepare('INSERT INTO itinerary_plan_days (revision_id, phase_id, date, label_he, label_en, lodging_context, pickup_context, sort_order) VALUES (?,?,?,?,?,?,?,?)')
-      .run(active, 'ny', '2027-03-13', null, null,
+      .run(active, 'ny', '2027-03-15', null, null,
         JSON.stringify({ name: { he: 'x', en: 'y', internal: 'STORED-LODGING-SECRET' }, door: 'STORED-EXTRA-SECRET' }),
         JSON.stringify({ driver_phone: 'STORED-PICKUP-SECRET' }), 99);
     db.close();
@@ -404,7 +404,7 @@ describe('GET /api/config and /api/config/versions/:version — hostile config o
     const imported = body.days.find(d => d.phase_id === 'ny' && d.date === '2027-03-11');
     assert.deepEqual(imported?.lodging_context?.name, { he: 'מלון מרידיאן', en: 'Hotel Meridian' },
       'the allow-listed lodging name still reaches the imported day');
-    const stored = body.days.find(d => d.date === '2027-03-13');
+    const stored = body.days.find(d => d.date === '2027-03-15');
     assert.deepEqual(stored.lodging_context, { name: { he: 'x', en: 'y' }, address: null, location_url: null });
     const today = await (await fetch(`${BASE}/api/today`, { headers: { Authorization: `Bearer ${bob}` } })).json();
     assert.deepEqual(leaked(today), []);

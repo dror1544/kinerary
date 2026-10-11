@@ -149,6 +149,8 @@ export const PORTS = {
   mcpTripStopsLive:        28319,  // mcp/mcp.js against the real trip server below
   mcpTripStopsSite:        28320,  // the real trip server mcpTripStopsLive talks to
   stopFollowups:           28321,  // tests/stop-followups.test.js — split-then-link, gershayim (second review 2026-10-11)
+  // "Tonight:" lodging computed at serve time — tests/tonight-lodging.test.js.
+  tonightLodging:          28322,
 
   // ── Stand-ins for services the server calls out to ─────────────────────
   bookingExtractMockHermes: 28103,
