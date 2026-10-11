@@ -148,6 +148,8 @@ export const PORTS = {
   mcpTripStops:            28318,  // mcp/mcp.js against a stand-in site
   mcpTripStopsLive:        28319,  // mcp/mcp.js against the real trip server below
   mcpTripStopsSite:        28320,  // the real trip server mcpTripStopsLive talks to
+  // "Tonight:" lodging computed at serve time — tests/tonight-lodging.test.js.
+  tonightLodging:          28321,
 
   // ── Stand-ins for services the server calls out to ─────────────────────
   bookingExtractMockHermes: 28103,
