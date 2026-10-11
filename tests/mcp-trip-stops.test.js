@@ -110,12 +110,12 @@ describe('mcp/mcp.js stop tools — against a stand-in trip site', () => {
           orphaned_overrides: [],
         });
       }
-      // The real write refuses any ASCII " in stop text (server/trip-structure.js
-      // UNSAFE_LINE_RE); the stand-in does the same, so what the tools send is
-      // what is judged.
+      // The real write refuses < and > in stop text (server/trip-structure.js
+      // UNSAFE_LINE_RE) and accepts a " as typed; the stand-in does the same,
+      // so what the tools send is what is judged.
       const stopText = [body?.title, body?.new_stop, body?.accommodation].map(v => JSON.stringify(v ?? '')).join('');
-      if ((req.method === 'PATCH' || req.url.endsWith('/split')) && stopText.includes('\\"')) {
-        return send(res, 400, { error: 'invalid_text', field: 'title', detail: 'text may not contain < > " or control characters (for a Hebrew abbreviation use ״, U+05F4)' });
+      if ((req.method === 'PATCH' || req.url.endsWith('/split')) && /[<>]/.test(stopText)) {
+        return send(res, 400, { error: 'invalid_text', field: 'title', detail: 'text may not contain < > or control characters' });
       }
       if (req.method === 'PATCH' && req.url === '/api/stops/colmar') {
         if (body?.dates && body.dates.end > '2026-12-07') return send(res, 400, { error: 'dates_outside_trip', trip: { start: '2026-12-02', end: '2026-12-07' } });
@@ -352,44 +352,37 @@ describe('mcp/mcp.js stop tools — against a stand-in trip site', () => {
     assert.match(linked, /already sets another stop/);
   });
 
-  test('Hebrew abbreviations typed with an ASCII " are sent with ״ (U+05F4) — in every free-text field of update_stop', async () => {
-    parseToolJson(await mcpCallTool('update_stop', {
-      phase_id: 'colmar', title_he: 'טיסה לארה"ב דרך חו"ל', title_en: 'Colmar',
-      accommodation: {
-        name: { he: 'מלון ת"א', en: 'Hotel TLV' }, address: 'רח׳ הרצל 1, ראשל"צ', confirmation: 'אב"ג-1',
-        description: { he: 'קרוב לבע"מ', en: 'Near the office' }, note: 'חו"ל', dates: 'א"ב"ג', guests: 4,
-        location_url: 'https://maps.example/colmar',
-      },
-    }));
-    const sent = last().body;
-    assert.equal(sent.title.he, 'טיסה לארה״ב דרך חו״ל', 'both occurrences');
-    assert.equal(sent.title.en, 'Colmar');
-    assert.deepEqual(sent.accommodation, {
-      name: { he: 'מלון ת״א', en: 'Hotel TLV' }, address: 'רח׳ הרצל 1, ראשל״צ', confirmation: 'אב״ג-1',
-      description: { he: 'קרוב לבע״מ', en: 'Near the office' }, note: 'חו״ל', dates: 'א״ב״ג', guests: 4,
+  test('Hebrew abbreviations typed with an ASCII " are sent exactly as typed — in every free-text field of update_stop', async () => {
+    const accommodation = {
+      name: { he: 'מלון ת"א', en: 'Hotel "TLV"' }, address: 'רח׳ הרצל 1, ראשל"צ', confirmation: 'אב"ג-1',
+      description: { he: 'קרוב לבע"מ', en: 'Near the office' }, note: '55" TV', dates: 'א"ב"ג', guests: 4,
       location_url: 'https://maps.example/colmar',
-    });
+    };
+    parseToolJson(await mcpCallTool('update_stop', { phase_id: 'colmar', title_he: 'טיסה לארה"ב דרך חו"ל', title_en: 'say "hi"', accommodation }));
+    const sent = last().body;
+    assert.deepEqual(sent.title, { he: 'טיסה לארה"ב דרך חו"ל', en: 'say "hi"' });
+    assert.deepEqual(sent.accommodation, accommodation);
+    assert.ok(!JSON.stringify(sent).includes('\u05F4'), 'no gershayim was written in');
   });
 
-  test('split_stop: the new stop\'s title and accommodation get the same rewrite', async () => {
+  test('split_stop: the new stop\'s title and accommodation are sent as typed too', async () => {
     parseToolJson(await mcpCallTool('split_stop', {
       phase_id: 'colmar', at_date: '2026-12-06', title_he: 'ליד נתב"ג', title_en: 'Near the airport', accommodation: { name: 'מלון ת"א' },
     }));
-    assert.deepEqual(last().body.new_stop, { title: { he: 'ליד נתב״ג', en: 'Near the airport' }, accommodation: { name: 'מלון ת״א' } });
+    assert.deepEqual(last().body.new_stop, { title: { he: 'ליד נתב"ג', en: 'Near the airport' }, accommodation: { name: 'מלון ת"א' } });
   });
 
-  test('any other " is sent as typed, and the server\'s refusal reaches the model with what to do', async () => {
+  test('a < or > is sent as typed, and the server\'s refusal reaches the model with what to do', async () => {
     for (const args of [
-      { phase_id: 'colmar', title_he: 'קולמר', title_en: 'Colmar "old town"' },        // Latin-Latin
-      { phase_id: 'colmar', title_he: 'ת"a', title_en: 'Colmar' },                     // mixed
-      { phase_id: 'colmar', accommodation: { name: 'Hotel', note: 'a 55" TV' } },       // digit-Latin
-      { phase_id: 'colmar', title_he: 'ת"א" onmouseover=alert(1)', title_en: 'x' },    // a second quote
+      { phase_id: 'colmar', title_he: 'קולמר', title_en: 'Colmar <old town>' },
+      { phase_id: 'colmar', title_he: 'ת"א<img src=x onerror=alert(1)>', title_en: 'x' },
+      { phase_id: 'colmar', accommodation: { name: 'Hotel', note: '"><svg onload=alert(1)>' } },
     ]) {
       const message = parseToolError(await mcpCallTool('update_stop', args));
       assert.match(message, /invalid_text/, JSON.stringify(args));
-      assert.match(message, /single quotes/, 'the hint says what to do');
-      const sent = JSON.stringify(last().body);
-      assert.ok(sent.includes('\\"'), `the " was not rewritten away: ${sent}`);
+      assert.match(message, /Remove the < or >/, 'the hint says what to do');
+      assert.doesNotMatch(message, /gershayim|single quotes/, 'no stale advice about quotes');
+      assert.ok(/[<>]/.test(JSON.stringify(last().body)), 'sent as typed, not cleaned');
     }
   });
 
@@ -552,15 +545,24 @@ describe('mcp/mcp.js stop tools — against the real trip server (the colmar tri
     assert.equal((await items()).find(i => i.text_en === 'Check-in — Hotel Colmar Centre')?.phase_id, 'colmar');
   });
 
-  test('update_stop: a Hebrew abbreviation typed with " is stored with ״; any other " is refused readably, nothing stored', async () => {
-    const result = parseToolJson(await mcpCallTool('update_stop', { phase_id: 'colmar', title_he: 'קולמר (ליד ארה"ב?)', title_en: 'Colmar old town' }));
-    assert.equal(result.stop.title.he, 'קולמר (ליד ארה״ב?)');
-    assert.equal((await phase('colmar')).title.he, 'קולמר (ליד ארה״ב?)');
-    const refused = parseToolError(await mcpCallTool('update_stop', { phase_id: 'colmar', title_he: 'קולמר', title_en: 'Colmar "old town"' }));
+  test('update_stop and split_stop: ארה"ב reaches the stored stop exactly as typed; a < is refused readably, nothing stored', async () => {
+    const result = parseToolJson(await mcpCallTool('update_stop', { phase_id: 'colmar', title_he: 'קולמר (ליד ארה"ב?)', title_en: 'Colmar "old town"' }));
+    assert.deepEqual(result.stop.title, { he: 'קולמר (ליד ארה"ב?)', en: 'Colmar "old town"' });
+    assert.deepEqual((await phase('colmar')).title, { he: 'קולמר (ליד ארה"ב?)', en: 'Colmar "old town"' });
+
+    const split = parseToolJson(await mcpCallTool('split_stop', {
+      phase_id: 'colmar', at_date: '2026-12-05', title_he: 'ארה"ב', title_en: 'USA trip', accommodation: { name: 'מלון ת"א' },
+    }));
+    const newId = split.stops[1].id;
+    const created = await phase(newId);
+    assert.deepEqual(created.title, { he: 'ארה"ב', en: 'USA trip' });
+    assert.equal(created.accommodation.name, 'מלון ת"א');
+
+    const refused = parseToolError(await mcpCallTool('update_stop', { phase_id: 'colmar', title_he: 'קולמר', title_en: 'Colmar <old town>' }));
     assert.match(refused, /400 invalid_text/);
     assert.match(refused, /title\.en/);
-    assert.match(refused, /single quotes/);
-    assert.equal((await phase('colmar')).title.en, 'Colmar old town', 'nothing stored');
+    assert.match(refused, /Remove the < or >/);
+    assert.equal((await phase('colmar')).title.en, 'Colmar "old town"', 'nothing stored');
   });
 
   test('update_stop accommodation takes a bilingual name, as the server\'s text fields do, and replaces the whole accommodation', async () => {
@@ -671,22 +673,19 @@ describe('server/trip-mcp/tools.js stop tools — absent on a read-only connecti
     } finally { await close(); }
   });
 
-  test('organizer (write): Hebrew abbreviations are sent with ״ in update_stop and split_stop; any other " is sent as typed', async () => {
+  test('organizer (write): text with a " is sent exactly as typed in update_stop and split_stop', async () => {
     const { client, site, close } = await connect(true);
     try {
       const call = async (name, args) => {
         const r = await client.callTool({ name, arguments: args });
         assert.notEqual(r.isError, true, `${name}: ${r.content?.[0]?.text}`);
       };
-      await call('update_stop', { phase_id: 'colmar', title_he: 'ארה"ב וחו"ל', title_en: 'say "hi"',
-        accommodation: { name: { he: 'מלון ת"א', en: 'a"b' }, address: 'ראשל"צ', note: '55" TV', location_url: 'https://maps.example/x' } });
+      const accommodation = { name: { he: 'מלון ת"א', en: 'a"b' }, address: 'ראשל"צ', note: '55" TV', location_url: 'https://maps.example/x' };
+      await call('update_stop', { phase_id: 'colmar', title_he: 'ארה"ב וחו"ל', title_en: 'say "hi"', accommodation });
       await call('split_stop', { phase_id: 'colmar', at_date: '2026-12-06', title_he: 'ליד נתב"ג', accommodation: { name: 'בע"מ' } });
       const [patch, split] = site.calls.filter(c => c.method !== 'GET');
-      assert.deepEqual(patch.body, {
-        title: { he: 'ארה״ב וחו״ל', en: 'say "hi"' },
-        accommodation: { name: { he: 'מלון ת״א', en: 'a"b' }, address: 'ראשל״צ', note: '55" TV', location_url: 'https://maps.example/x' },
-      });
-      assert.deepEqual(split.body, { at: '2026-12-06', new_stop: { title: { he: 'ליד נתב״ג' }, accommodation: { name: 'בע״מ' } } });
+      assert.deepEqual(patch.body, { title: { he: 'ארה"ב וחו"ל', en: 'say "hi"' }, accommodation });
+      assert.deepEqual(split.body, { at: '2026-12-06', new_stop: { title: { he: 'ליד נתב"ג' }, accommodation: { name: 'בע"מ' } } });
     } finally { await close(); }
   });
 
@@ -696,7 +695,7 @@ describe('server/trip-mcp/tools.js stop tools — absent on a read-only connecti
       for (const [bookingId, code, words] of [
         [8, 'booking_belongs_to_another_stop', /filed under another stop/],
         [11, 'booking_linked_to_another_stop', /already sets another stop/],
-        [13, 'invalid_text', /single quotes/],
+        [13, 'invalid_text', /Remove the < or >/],
         [14, 'invalid_link', /http/],
       ]) {
         const r = await client.callTool({ name: 'set_stop_from_booking', arguments: { phase_id: 'colmar', booking_id: bookingId } });
