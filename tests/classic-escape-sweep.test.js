@@ -678,3 +678,38 @@ describe('weather and the dormant renderers', () => {
     });
   }
 });
+
+// Fourth boundary review, 2026-10-11 (the three items it left).
+describe('ids in request paths, a depth cap on day text, and heroPhotoCss', () => {
+  test('config ids are URL-encoded wherever they go into a fetch path', () => {
+    // A task id such as "../../api/ui-settings/hero/revert?" must not turn the organizer's click
+    // into a request to another endpoint.
+    assert.ok(!SRC.includes('`/api/tasks/${taskId}'), 'task id raw in a path');
+    assert.ok(!SRC.includes('`/api/comments/venue/${venueId}'), 'venue id raw in a path');
+    assert.ok(!SRC.includes('`/api/rsvps/${a.id}'), 'activity id raw in a path');
+    assert.ok(!SRC.includes('`/api/rsvps/${activityId}'), 'activity id raw in a path');
+    assert.ok(SRC.includes('`/api/tasks/${encodeURIComponent(taskId)}/done`'));
+    assert.equal((SRC.match(/\/api\/comments\/venue\/\$\{encodeURIComponent\(venueId\)\}/g) || []).length, 2);
+    assert.equal((SRC.match(/\/api\/rsvps\/\$\{encodeURIComponent\((?:a\.id|activityId)\)\}/g) || []).length, 2);
+  });
+
+  test('_safeInlineHtml keeps going on absurdly deep nesting and still emits only text', () => {
+    const { ctx } = sandbox(['_safeInlineHtml']);
+    const deep = '<b>'.repeat(5000) + 'deep <img src=x onerror=alert(1)> text' + '</b>'.repeat(5000);
+    let out;
+    assert.doesNotThrow(() => { out = ctx._safeInlineHtml(deep); });
+    assert.ok(!/<img/i.test(out), out.slice(0, 200));
+    assert.ok(out.includes('deep'), 'the text survives');
+    // the ordinary case is unchanged
+    assert.equal(ctx._safeInlineHtml('a <b>b</b> &amp; <a href="https://x.example/p">l</a>'),
+      'a <b>b</b> &amp; <a href="https://x.example/p" target="_blank" rel="noopener">l</a>');
+  });
+
+  test('heroPhotoCss: a protocol-relative URL is not a same-site path', () => {
+    const { ctx } = sandbox(['heroPhotoCss']);
+    assert.equal(ctx.heroPhotoCss('//evil.example/track.gif'), 'none');
+    assert.equal(ctx.heroPhotoCss('/assets/hero.jpg'), 'url("/assets/hero.jpg")');
+    assert.equal(ctx.heroPhotoCss('https://img.example/a.jpg'), 'url("https://img.example/a.jpg")');
+    assert.equal(ctx.heroPhotoCss('javascript:alert(1)'), 'none');
+  });
+});

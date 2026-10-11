@@ -195,7 +195,7 @@ function renderTaskDoneState() {
 async function toggleTaskDone(taskId) {
   if (!currentUser) return;
   try {
-    const res = await fetch(`/api/tasks/${taskId}/done`, {
+    const res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/done`, {
       method: 'POST',
       headers: { Authorization: 'Bearer ' + localStorage.getItem('trip-token') }
     });
@@ -1299,7 +1299,7 @@ function setHero(tabId) {
 // same-site path is no image at all.
 function heroPhotoCss(photo) {
   const s = String(photo ?? '').trim();
-  const url = safeUrl(s) || (s.startsWith('/') ? s : '');
+  const url = safeUrl(s) || (s.startsWith('/') && !s.startsWith('//') ? s : '');  // same-site path, never protocol-relative
   if (!url) return 'none';
   return `url("${url.replace(/["'()\\\s]/g, c => '%' + c.charCodeAt(0).toString(16).padStart(2, '0').toUpperCase())}")`;
 }
@@ -1672,7 +1672,7 @@ async function toggleVenueComments(venueId) {
 
   if (!venueCommentsCache[venueId]) {
     try {
-      const res = await authGet(`/api/comments/venue/${venueId}`);
+      const res = await authGet(`/api/comments/venue/${encodeURIComponent(venueId)}`);
       venueCommentsCache[venueId] = res.ok ? await res.json() : [];
     } catch { venueCommentsCache[venueId] = []; }
   }
@@ -1727,7 +1727,7 @@ async function submitVenueComment(venueId) {
   if (!body) return;
   const token = localStorage.getItem('trip-token');
   try {
-    const res = await fetch(`/api/comments/venue/${venueId}`, {
+    const res = await fetch(`/api/comments/venue/${encodeURIComponent(venueId)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify({ body })
@@ -1760,7 +1760,7 @@ async function loadRsvps(containerId, activities) {
   // Fetch all activities for this section in parallel
   await Promise.all(activities.map(async a => {
     try {
-      const res = await authGet(`/api/rsvps/${a.id}`);
+      const res = await authGet(`/api/rsvps/${encodeURIComponent(a.id)}`);
       rsvpCache[a.id] = res.ok ? await res.json() : [];
     } catch { rsvpCache[a.id] = []; }
   }));
@@ -1804,7 +1804,7 @@ async function setRsvp(activityId, status) {
   if (!currentUser) return;
   const token = localStorage.getItem('trip-token');
   try {
-    const res = await fetch(`/api/rsvps/${activityId}`, {
+    const res = await fetch(`/api/rsvps/${encodeURIComponent(activityId)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify({ status })
@@ -3731,20 +3731,37 @@ function _safeInlineHtml(html) {
   doc.body.innerHTML = String(html ?? '');
   const KEEP = ['b', 'strong', 'i', 'em'];
   const DROP = ['script', 'style', 'template', 'noscript', 'iframe', 'object', 'embed'];
-  const walk = (node) => Array.from(node.childNodes).map(n => {
+  // A depth cap: browsers stop nesting at 512, but a recursive walk over a deeper tree
+  // (a hostile document) would overflow the stack and stop the page's init. Past the cap
+  // only the text survives, escaped.
+  const MAX_DEPTH = 64;
+  const walk = (node, depth = 0) => Array.from(node.childNodes).map(n => {
     if (n.nodeType === 3) return esc(n.nodeValue);
     if (n.nodeType !== 1) return '';
+    if (depth >= MAX_DEPTH) {
+      // text only, collected without recursion (textContent itself recurses in some engines)
+      const stack = [n]; let text = '';
+      while (stack.length) {
+        const cur = stack.pop();
+        if (cur.nodeType === 3) { text += cur.nodeValue; continue; }
+        if (cur.nodeType !== 1) continue;
+        const t = String(cur.tagName).toLowerCase();
+        if (DROP.includes(t)) continue;
+        for (let i = cur.childNodes.length - 1; i >= 0; i--) stack.push(cur.childNodes[i]);
+      }
+      return esc(text);
+    }
     const tag = String(n.tagName).toLowerCase();
     if (DROP.includes(tag)) return '';
     if (tag === 'br') return '<br>';
-    const inner = walk(n);
+    const inner = walk(n, depth + 1);
     if (tag === 'a') {
       const href = safeUrl(n.getAttribute('href'));
       return href ? `<a href="${esc(href)}" target="_blank" rel="noopener">${inner}</a>` : inner;
     }
     return KEEP.includes(tag) ? `<${tag}>${inner}</${tag}>` : inner;
   }).join('');
-  return walk(doc.body);
+  return walk(doc.body, 0);
 }
 
 function _biHtml(obj) {
