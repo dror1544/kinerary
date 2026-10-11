@@ -1013,6 +1013,18 @@ function renderReveal(state) {
 // Both maps are populated from /api/config in loadAllPlayers() — never hardcode
 // a trip's families/participants here, every trip has a different roster.
 let FAMILY_EN = {};
+// The leaderboard and game-over rows are built with innerHTML from the game
+// state the server broadcasts. Nothing in that state can carry markup today
+// (the server strips `family` and computes the score), but every value that
+// reaches those templates goes through one of these two, so it stays inert if
+// the state ever changes (review 2026-10-11).
+function escHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function scoreNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
 function familyLabel(f) {
   if (!f) return '';
   if (isScreenMode) return `${f} / ${FAMILY_EN[f] || f}`;
@@ -1056,7 +1068,7 @@ function renderLeaderboard(state) {
     row.className = 'lb-row';
     row.style.animationDelay = `${idx * 0.06}s`;
     const name = lang === 'he' ? p.name : (p.name_en || p.name);
-    const delta = p.delta || 0;
+    const delta = scoreNum(p.delta);
     const deltaClass = delta > 0 ? 'pos' : delta < 0 ? 'neg' : 'zer';
     const deltaText = delta > 0 ? `+${delta}` : delta < 0 ? `${delta}` : '';
     const medals = ['🥇','🥈','🥉'];
@@ -1065,10 +1077,10 @@ function renderLeaderboard(state) {
       <div class="lb-av-wrap"></div>
       <div class="lb-info">
         <div class="lb-name"></div>
-        <div class="lb-fam">${familyLabel(p.family)}</div>
+        <div class="lb-fam">${escHtml(familyLabel(p.family))}</div>
       </div>
       <div style="text-align:right">
-        <div class="lb-score">${p.score}</div>
+        <div class="lb-score">${scoreNum(p.score)}</div>
         <div class="lb-delta ${deltaClass}">${deltaText}</div>
       </div>
     `;
@@ -1095,7 +1107,7 @@ function renderGameOver(state) {
     const slot = document.createElement('div');
     slot.className = `podium-slot p${rank+1}`;
     const crowns = ['👑','🥈','🥉'];
-    slot.innerHTML = `<div class="pcrown">${crowns[rank]}</div><div class="pav-wrap"></div><div class="pname"></div><div class="pscore">${p.score}</div>`;
+    slot.innerHTML = `<div class="pcrown">${crowns[rank]}</div><div class="pav-wrap"></div><div class="pname"></div><div class="pscore">${scoreNum(p.score)}</div>`;
     slot.querySelector('.pname').appendChild(screenEl(p.name, p.name_en || p.name));
     slot.querySelector('.pav-wrap').appendChild(buildAvatar(username, 'pav', p.color || '#888', name));
     podium.appendChild(slot);
@@ -1107,7 +1119,7 @@ function renderGameOver(state) {
     const name = lang === 'he' ? p.name : (p.name_en || p.name);
     const row = document.createElement('div');
     row.className = 'lb-row';
-    row.innerHTML = `<div class="lb-rank">${idx+4}</div><div class="lb-av-wrap"></div><div class="lb-info"><div class="lb-name"></div><div class="lb-fam">${familyLabel(p.family)}</div></div><div class="lb-score">${p.score}</div>`;
+    row.innerHTML = `<div class="lb-rank">${idx+4}</div><div class="lb-av-wrap"></div><div class="lb-info"><div class="lb-name"></div><div class="lb-fam">${escHtml(familyLabel(p.family))}</div></div><div class="lb-score">${scoreNum(p.score)}</div>`;
     row.querySelector('.lb-name').appendChild(screenEl(p.name, p.name_en || p.name));
     row.querySelector('.lb-av-wrap').appendChild(buildAvatar(username, 'lb-av', p.color || '#888', name));
     goList.appendChild(row);
