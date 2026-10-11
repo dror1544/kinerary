@@ -1577,6 +1577,11 @@ function buildRatingChips(venueId) {
 function renderRatings(containerId, venues) {
   const c = document.getElementById(containerId);
   if (!c) return;
+  // A stop with no venues (or a legacy fixed-name element with no VENUES
+  // entry) has nothing to render. Throwing here used to abort loadRatings()
+  // before its config-driven loop, so every later stop lost its ratings.
+  if (!Array.isArray(venues)) return;
+  venues = venues.filter(v => v && typeof v === 'object');
   // A venue's id, name and links are config text the provisioner writes from
   // the interview or a document: every attribute is escaped, a link must be
   // http(s), and the id reaches saveRating/toggleVenueComments through a
@@ -1817,14 +1822,22 @@ async function setRsvp(activityId, status) {
     if (existing >= 0) rsvpCache[activityId][existing] = entry;
     else rsvpCache[activityId].push(entry);
 
-    // Find which section this activity belongs to and re-render the card only
-    const allActivities = [...RSVP_ACTIVITIES.co, ...RSVP_ACTIVITIES.wc];
-    const activity = allActivities.find(a => a.id === activityId);
+    // Find the activity on whichever stop carries it and re-render that card
+    // only. This used to spread RSVP_ACTIVITIES.co / .wc — two legacy stop
+    // names a config-built trip does not have — and the TypeError was
+    // swallowed below, so the card never showed the answer. The id arrives
+    // from a data- attribute, a string, while the config may hold a number.
+    const activity = Object.values(RSVP_ACTIVITIES)
+      .flatMap(list => (Array.isArray(list) ? list : []))
+      .find(a => a && String(a.id) === String(activityId));
     if (activity) {
       const card = document.getElementById(`rsvp-card-${activityId}`);
       if (card) card.outerHTML = renderRsvpCard(activity);
     }
-  } catch {}
+  } catch (e) {
+    // Not silent: a swallowed error here is how the card stopped refreshing.
+    console.warn('RSVP update failed:', e);
+  }
 }
 window.setRsvp = setRsvp;
 
@@ -4619,9 +4632,11 @@ window.addEventListener('load', async () => {
   loadUsersCache();
   loadRatings();
   loadTaskDone();
-  // Load RSVPs for all phases that have activities
+  // Load RSVPs for all phases that have activities, into the `rsvp-<id>`
+  // container buildPhaseNav() creates for the stop (this loaded `rsvps-<id>`,
+  // which no page has, so a config-built stop never showed its RSVP card).
   (window.TRIP_CONFIG?.phases || []).forEach(p => {
-    if (p.rsvp_activities?.length) loadRsvps(`rsvps-${p.id}`, RSVP_ACTIVITIES[p.id] || []);
+    if (p.rsvp_activities?.length) loadRsvps(`rsvp-${p.id}`, RSVP_ACTIVITIES[p.id] || []);
   });
   if (document.querySelector('#photos.section.active')) loadPhotosGallery();
   loadLostFound();
