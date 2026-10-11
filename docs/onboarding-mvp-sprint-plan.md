@@ -600,7 +600,11 @@ live-plan enrichment worker) stayed out of 4.5 and was built separately on
   and re-expanding entity from every `label`/`text`.** `renderDays` sends config
   `days` text through `_biSpan`, which emits raw HTML (deliberate for
   hand-authored config — `server.js:2879` says so), so unsanitised model output
-  there is an XSS sink. `--ignore-rules` + the single-turn call handle injection
+  there is an XSS sink. *(Update, Sprint 6, PR #363: the Classic site no longer
+  emits config day text raw — `renderDays` rebuilds it from an allow-list in
+  `_biHtml()`/`_safeInlineHtml()` (text, http(s) links, `b/strong/i/em/br`), so the sink
+  is closed at the renderer too; stripping at the producer stays as the second layer.)*
+  `--ignore-rules` + the single-turn call handle injection
   *into an agent*; this handles injection *into the page*. A venue `url` also
   passes `acceptableVenueUrl()` — http(s) + real host, and **not** a personal
   booking docket / reservation link (`travelbooster`, `paxFileNum`, `bookingId`,

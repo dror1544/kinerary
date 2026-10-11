@@ -93,18 +93,27 @@ Two kinds of expectation, and the difference is the point:
 
 | Kind | Expectations | Today |
 |---|---|---|
-| **Hard** (interview shape) | trip type is the `couple` option and the typed answer was understood without the button; exactly one stop, dated with the whole trip; the gateway city is not a stop; a dated flight in and out with the gateway named on them; every trip day covered; a hotel booking the companion was told about is recorded with both dates; after the change of stops, no trip day has disappeared | The shape ones are expected red until `fix/interview-trip-shape` lands, then green |
+| **Hard** (interview shape) | trip type is the `couple` option and the typed answer was understood without the button; exactly one stop, dated with the whole trip; the gateway city is not a stop; a dated flight in and out with the gateway named on them; every trip day covered; a hotel booking the companion was told about is recorded with both dates; after the change of stops, no trip day has disappeared | The shape rows are the defects the Sprint 6 interview fixes (PR #360) address: red without them, expected green with them. No live `star` run has been recorded yet; the first one is what proves it |
 | **Deferred**, with a written reason | two rooms visible; the booking reaching the base stop's accommodation; check-in and check-out plan items; the stay splitting into two stops with the right dates | Reported as `known gap, deferred (<name>): …` with its reason; each goes green by itself, and says so (`deferred check now PASSES`), when the capability lands |
 
 The rental car is reported and never failed on. A deferral is never a deletion:
 it keeps running, and each one carries a reason (`tests/scripts/test_e2e_star.py`
-fails a `star` deferral that has none). The stop-editing ones carry "stop editing after the
-interview not built (owner decision pending; deferred past Sprint 6 on
-2026-09-22)".
+fails a `star` deferral that has none). The stop-editing ones still carry the reason
+"stop editing after the interview not built (owner decision pending; deferred past
+Sprint 6 on 2026-09-22)" — **that text is now out of date**: stop editing is built
+(PR #362: `set_stop_from_booking` creates the check-in and check-out items and sets the
+stop's hotel and dates; `split_stop` splits the stay). So on a live run those rows are
+expected to pass and be reported as `deferred check now PASSES`; taking them off the
+deferred list (and rewording the reason in
+`control-plane/api/test/fixtures/make_documents.py`) is a separate step after the first
+green live run. "Two rooms visible" is a different case: a stop's accommodation can now carry a `rooms`
+value (`update_stop`), but `set_stop_from_booking` does not copy a room count from a
+booking, and where "two rooms" is meant to live is still a product decision nobody has
+recorded.
 
-`star` is deliberately outside `--scenario all` and the nightly: it cannot go
-green yet, and a scenario that is red for known reasons has to be asked for by
-name. Bring it into `all` when the hard rows pass.
+`star` is deliberately outside `--scenario all` and the nightly: a scenario not yet
+proven green on a live run has to be asked for by name. Bring it into `all` when the
+hard rows pass live.
 
 ## B. A person's run
 
