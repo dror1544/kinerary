@@ -13,7 +13,7 @@ standard library. A fixture generator that needs `pip install` is a fixture
 generator that gets skipped in CI.
 
 Usage:
-    make_documents.py <scenario> <out-dir>      # japan | multi | chaos | (manual: none)
+    make_documents.py <scenario> <out-dir>      # japan | multi | chaos | (manual, vietnam, star: none)
 """
 from __future__ import annotations
 
@@ -22,6 +22,11 @@ import zipfile
 from pathlib import Path
 
 # ── The facts. Documents and assertions are both generated from these ────────
+
+# One sentence, reused: a deferral is a named reason, not a bare name.
+STOP_EDITING_DEFERRED = (
+    "stop editing after the interview not built "
+    "(owner decision pending; deferred past Sprint 6 on 2026-09-22)")
 
 SCENARIOS: dict[str, dict] = {
     # Scenario 1 — one PDF, the shape of the real Yapan Tours booking that
@@ -207,6 +212,115 @@ SCENARIOS: dict[str, dict] = {
             # deferred is EDITING those days on the website; the chat has to be
             # able to address them.
             "deferred": ["confirmed_bookings"],
+        },
+    },
+    # Scenario 6 — "star": a couples trip that sleeps in ONE town and day-trips
+    # from it, flying in and out of a gateway city with ONE rental car picked up
+    # and returned there. From the owner's manual run of 2026-10-10 (Alsace, two
+    # couples), whose findings are what the expectations below are made of.
+    #
+    # The trip is invented: December 2027, not the owner's real December 2026,
+    # and made-up surnames — a fixture that shares a live trip's cities AND dates
+    # collided once already (the japan fixture; see nightly-e2e.sh). Colmar is
+    # the base, Frankfurt the gateway. No documents: every answer is typed, and
+    # the trip_type answer is typed IN WORDS (organizer-scenarios.ts
+    # `typedChoice`), the way the owner phrased it, because the button was never
+    # the failure.
+    #
+    # TWO KINDS OF EXPECTATION, and the difference is the point:
+    #   * HARD — the interview-shape ones. They fail today and are expected to go
+    #     green when fix/interview-trip-shape lands (prompt rules for
+    #     base-with-day-trips, gateway-not-a-stop, option matching). Do not defer
+    #     them: they are the defects this scenario exists to catch.
+    #   * DEFERRED, with a reason — what cannot pass because the capability does
+    #     not exist. Each still RUNS and reports as a known gap, and says so on
+    #     the day it starts passing. Delete none of them to make a run green.
+    "star": {
+        "destination": "France - Alsace",
+        "departure_date": "2027-12-02",
+        "return_date": "2027-12-09",
+        "documents": {},
+        "expect_answers": ["destination", "departure_date", "return_date", "phases"],
+        "expect_in_phases": ["Colmar"],
+        # Both legs, as the organizer gave them; they are travel_anchors, not stops.
+        "expect_anchor_text": ["LY8801", "LY8802"],
+        "expect_site": {
+            # "טיול זוגות ולא משפחה, נהיה שני זוגות" must land on the `couple`
+            # option (finding 2): a free-text "other" would title the trip with
+            # the organizer's sentence.
+            "trip_type": "couple",
+            # Findings 1 and 3: ONE stop — the base — dated with the whole trip.
+            # "We sleep in Colmar and day-trip, no fixed plan yet" is a stop; the
+            # day trips are not.
+            "stops": [{"name": ["Colmar", "קולמר"], "start": "2027-12-02", "end": "2027-12-09"}],
+            # The gateway city is where the flights land, not where anyone stays.
+            "not_stops": ["Frankfurt", "פרנקפורט"],
+            # Arrival and departure are travel_anchors: a dated flight in and out,
+            # and the gateway named on them (finding 3).
+            "flight_anchors": {"in": "2027-12-02", "out": "2027-12-09",
+                               "gateway": ["Frankfurt", "FRA", "פרנקפורט"]},
+            # Every day of the trip is on the site. Never deferrable (Dror,
+            # 2026-09-20: "we cannot allow missing days").
+            "days_covered": "all",
+            # The typed trip_type was understood without the organizer falling
+            # back to the button (organizer-scenarios.ts, TYPED_CHOICE_TRIES).
+            "typed_choice_understood": True,
+            # Two rooms in one hotel. No field on a stop holds a room count —
+            # accommodation is {name, name_en, confirmation} — so where it should
+            # live is a product decision nobody has made. Deferred rather than
+            # hard because a hard check here would pin that decision by accident;
+            # it still runs and goes green by itself if a note or booking keeps it.
+            "rooms_visible": True,
+            # Reported, never failed on: the owner calls the one rental car
+            # "usually not mandatory".
+            "report": ["car"],
+            "deferred": {
+                "rooms_visible": (
+                    "no field on a stop carries a room count (accommodation is name, name_en, "
+                    "confirmation); where 'two rooms' should live is a product decision not yet made"),
+            },
+        },
+        # After the build: the organizer tells the COMPANION, in Hebrew, about a
+        # hotel booking and then a change of stops. Asserted on the site, never on
+        # the chat's words.
+        "after_companion": {
+            "hotel": {"name": "Hotel Vignoble Dore", "check_in": "2027-12-02",
+                      "check_out": "2027-12-09", "rooms": 2},
+            "booking_message": (
+                "הזמנו מלון בקולמר: Hotel Vignoble Dore, שני חדרים, צ'ק-אין ב-2 בדצמבר 2027 "
+                "וצ'ק-אאוט ב-9 בדצמבר 2027. תוסיף את ההזמנה לטיול, ותעדכן את התחנה בקולמר ואת התוכנית."),
+            "change_message": (
+                "שינוי תוכניות: את הלילה האחרון, בין ה-8 ל-9 בדצמבר, אנחנו ישנים ליד שדה התעופה "
+                "בפרנקפורט. תפצל בבקשה את השהות לשתי תחנות: קולמר עד ה-8 בדצמבר, ופרנקפורט "
+                "שדה התעופה מה-8 עד ה-9, ותעדכן את הצ'ק-אאוט במלון בקולמר ל-8 בדצמבר."),
+            "expect": {
+                # The companion has a tool that adds a booking, so this is hard.
+                "hotel_booking_recorded": True,
+                # The booking must reach the base stop (finding 4). No companion
+                # tool or site route edits a stop's accommodation or dates.
+                "base_stop_accommodation": True,
+                # Findings 4 and 5a: the companion adds a check-in plan item only
+                # after a second request, and never the check-out.
+                "checkin_plan_item": True,
+                "checkout_plan_item": True,
+                # The stay splits in two, with the right dates (finding 6).
+                "stops_after_change": [
+                    {"name": ["Colmar", "קולמר"], "start": "2027-12-02", "end": "2027-12-08"},
+                    {"name": ["Frankfurt", "פרנקפורט"], "start": "2027-12-08", "end": "2027-12-09"},
+                ],
+                # Whatever the companion does, no day of the trip may disappear.
+                "days_covered": "all",
+                "deferred": {
+                    "base_stop_accommodation": STOP_EDITING_DEFERRED,
+                    "stops_after_change": STOP_EDITING_DEFERRED,
+                    "checkin_plan_item": (
+                        "the companion adds the check-in plan item only after a second request "
+                        "(owner's manual test 2026-10-10, finding 4); companion behaviour, not built"),
+                    "checkout_plan_item": (
+                        "the companion adds a check-in plan item and never the check-out "
+                        "(owner's manual test 2026-10-10, finding 5a); companion behaviour, not built"),
+                },
+            },
         },
     },
     # Scenario 4 — the chaos organizer (control-plane/api/tools/organizer-chaos.ts).
