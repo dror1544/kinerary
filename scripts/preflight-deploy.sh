@@ -18,7 +18,9 @@
 #       returned, never by name (scripts/teardown-trip.py). Nothing that existed
 #       before the run is touched.
 #
-#   --scenario japan|multi|manual|chaos|vietnam|all|none   the trip to walk (default japan);
+#   --scenario japan|multi|manual|chaos|vietnam|star|all|none   the trip to walk (default japan);
+#                                        star = couples, one base with day trips, then changes by chat
+#                                        (needs --auto; not part of `all` until its known gaps close)
 #                                        chaos = an organizer who does not follow (needs --auto)
 #                                        none = deploy + automated checks only
 #   --auto                               an automated organizer plays the person
@@ -64,15 +66,19 @@ while [ $# -gt 0 ]; do
     --deploy) DEPLOY=1 ;;
     --cleanup) CLEANUP=1 ;;
     --auto) AUTO=1 ;;
-    --scenario) SCENARIO="${2:?--scenario needs japan|multi|manual|chaos|vietnam|all|none}"; shift ;;
+    --scenario) SCENARIO="${2:?--scenario needs japan|multi|manual|chaos|vietnam|star|all|none}"; shift ;;
     -h|--help) sed -n '2,48p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
   esac
   shift
 done
-case "$SCENARIO" in japan|multi|manual|chaos|vietnam|all|none) ;; *) echo "--scenario must be japan|multi|manual|chaos|vietnam|all|none" >&2; exit 2 ;; esac
+case "$SCENARIO" in japan|multi|manual|chaos|vietnam|star|all|none) ;; *) echo "--scenario must be japan|multi|manual|chaos|vietnam|star|all|none" >&2; exit 2 ;; esac
 if [ "$SCENARIO" = chaos ] && [ "$AUTO" = 0 ]; then
   echo "--scenario chaos is the automated organizer misbehaving on purpose; it needs --auto" >&2
+  exit 2
+fi
+if [ "$SCENARIO" = star ] && [ "$AUTO" = 0 ]; then
+  echo "--scenario star speaks as the organizer on both sides of the build; it needs --auto" >&2
   exit 2
 fi
 if [ "$SCENARIO" = all ] && [ "$AUTO" = 0 ]; then
