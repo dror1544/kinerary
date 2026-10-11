@@ -1,9 +1,11 @@
 import { datesInPhase, phaseDates } from "./phase-calendar";
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { ArrowLeft, ArrowRight } from "lucide-react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type ActiveItinerary, type TripConfig } from "./api";
 import { useLiveEditGuard } from "./live-updates";
+import { StopsEditor } from "./stops-editor";
+import { describeStopError, getStops, moveDay, stopTitle, STOP_CHANGE_KEYS, type StopRefusal } from "./stops";
 import {
   bi,
   tr,
@@ -16,15 +18,81 @@ import {
 
 const RESTORE_PATH = "/api/itinerary/restore-original";
 
+// A whole day — its items and its headline — to another stop, in one plan
+// revision (POST /api/itinerary/move-day). The editor could swap two days
+// inside one stop but not move a day between stops (run notes F6). When both
+// days carry a headline the server asks which one stays; so does this.
+function MoveDay({ phase, date, revision, targets, lang, onMoved }: {
+  phase: string;
+  date: string;
+  revision: string;
+  targets: Array<{ id: string; title: string }>;
+  lang: Lang;
+  onMoved: (text: string) => void;
+}) {
+  const client = useQueryClient();
+  const [to, setTo] = useState("");
+  const [refusal, setRefusal] = useState<StopRefusal | null>(null);
+  const selectId = useId();
+  const chosen = targets.some((t) => t.id === to) ? to : "";
+  const targetTitle = targets.find((t) => t.id === chosen)?.title || chosen;
+  const mutation = useMutation({
+    mutationFn: (headline?: "keep_target" | "take_source") =>
+      moveDay({ from_phase_id: phase, to_phase_id: chosen, date, ...(headline ? { headline } : {}) }, revision),
+    onMutate: () => setRefusal(null),
+    onSuccess: async (result) => {
+      await Promise.all(STOP_CHANGE_KEYS.map((key) => client.invalidateQueries({ queryKey: [key] })));
+      onMoved(tr(lang,
+        `Day moved to ${targetTitle}. ${result.review?.status === "queued" ? "Descriptions that mention a day are being re-read." : ""}`.trim(),
+        `היום הועבר אל ${targetTitle}. ${result.review?.status === "queued" ? "תיאורים שמזכירים יום נבדקים מחדש." : ""}`.trim()));
+    },
+    onError: (error) => setRefusal(describeStopError(error, lang)),
+  });
+  const label = (l: { label_he?: string | null; label_en?: string | null }) =>
+    (lang === "he" ? l.label_he || l.label_en : l.label_en || l.label_he) || "";
+  return (
+    <div className="move-day">
+      <label htmlFor={selectId}>{tr(lang, "Move this day to stop", "העברת היום לתחנה")}</label>
+      <select id={selectId} value={chosen} onChange={(e) => setTo(e.target.value)}>
+        <option value="">{tr(lang, "Choose a stop", "בחירת תחנה")}</option>
+        {targets.map((t) => <option key={t.id} value={t.id}>{t.title}</option>)}
+      </select>
+      <button type="button" disabled={!revision || !chosen || mutation.isPending} onClick={() => mutation.mutate(undefined)}>
+        {tr(lang, "Move day", "העברת היום")}
+      </button>
+      {refusal?.kind === "headline" ? (
+        <div role="alert">
+          <p>{tr(lang,
+            `Both days have a headline. This day: “${label(refusal.source)}”. ${targetTitle} on that day: “${label(refusal.target)}”. Which one stays?`,
+            `לשני הימים יש כותרת. היום הזה: ״${label(refusal.source)}״. ${targetTitle} באותו יום: ״${label(refusal.target)}״. איזו נשארת?`)}</p>
+          <div className="parity-actions">
+            <button type="button" onClick={() => mutation.mutate("keep_target")}>{tr(lang, "Keep the target day's headline", "להשאיר את הכותרת של יום היעד")}</button>
+            <button type="button" onClick={() => mutation.mutate("take_source")}>{tr(lang, "Use this day's headline", "להשתמש בכותרת של היום הזה")}</button>
+          </div>
+        </div>
+      ) : refusal?.kind === "stale" ? (
+        <p role="alert">{tr(lang, "The plan changed since you chose this day. Choose the day again to load the latest plan.", "המסלול השתנה מאז שבחרתם את היום. בחרו את היום שוב כדי לטעון את המסלול העדכני.")}</p>
+      ) : refusal?.kind === "message" ? (
+        <p role="alert">{refusal.text}</p>
+      ) : null}
+    </div>
+  );
+}
+
 export function PlanTools({
   itinerary,
   config,
   lang,
+  isOrganizer = false,
 }: {
   itinerary?: ActiveItinerary;
   config?: TripConfig;
   lang: Lang;
+  isOrganizer?: boolean;
 }) {
+  const [moveNotice, setMoveNotice] = useState("");
+  // Same query (and key) as the stops editor: one request serves both.
+  const stops = useQuery({ queryKey: ["stops"], queryFn: getStops, enabled: isOrganizer });
   const [phase, setPhase] = useState(config?.phases?.[0]?.id || "");
   const [dateA, setDateA] = useState(""),
     [dateB, setDateB] = useState("");
@@ -102,7 +170,15 @@ export function PlanTools({
     datesInPhase(phaseConfig?.dates || { start: phaseConfig?.start, end: phaseConfig?.end }),
     persistedDays.map((d) => d.date),
   ).map((date) => persistedDays.find((d) => d.date === date) || { phase_id: phase, date });
+  // A day can go to any real stop but its own. The stop list says which are
+  // real (the computed open-days stretch is not a place to send a day); the
+  // config is the fallback while it loads.
+  const moveTargets = (stops.data?.stops
+    ? stops.data.stops.filter((s) => !s.unplanned).map((s) => ({ id: s.id, title: stopTitle(s.stop, lang) }))
+    : (config?.phases || []).map((p) => ({ id: p.id, title: bi(p.title, lang) || p.id }))
+  ).filter((t) => t.id !== phase);
   function selectDay(value: string) {
+    setMoveNotice("");
     setDateA(value);
     setDateB("");
     const d = selectedDays.find((d) => d.date === value);
@@ -141,6 +217,7 @@ export function PlanTools({
         {lang === "he" ? <ArrowRight size={18} aria-hidden="true" /> : <ArrowLeft size={18} aria-hidden="true" />}
         {tr(lang, "Back to trip planning", "חזרה לתכנון הטיול")}
       </a>
+      <StopsEditor isOrganizer={isOrganizer} lang={lang} />
       <Section title={tr(lang, "Organizer plan tools", "כלי מסלול למארגן")}>
         <div className="parity-fields">
           <label>
@@ -212,6 +289,19 @@ export function PlanTools({
               {tr(lang, "Swap these days", "החלפת הימים")}
             </button>
 
+            <MoveDay
+              phase={phase}
+              date={dateA}
+              revision={revision}
+              targets={moveTargets}
+              lang={lang}
+              onMoved={(text) => {
+                setMoveNotice(text);
+                setDateA("");
+                setDateB("");
+              }}
+            />
+
             <button
               onClick={() => {
                 setDateA("");
@@ -226,6 +316,7 @@ export function PlanTools({
             </button>
           </>
         )}
+        {moveNotice ? <p role="status">{moveNotice}</p> : null}
         <ActionState action={label} lang={lang} />
         <ActionState action={action} lang={lang} />
       </Section>
