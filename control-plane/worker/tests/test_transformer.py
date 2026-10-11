@@ -132,9 +132,11 @@ class TransformerTests(unittest.TestCase):
     def test_non_latin_destination_falls_back_to_a_phase_name(self) -> None:
         # "trip-2026" is a URL a family cannot tell from anyone else's; a
         # phase name is one they recognise (capture ledger, General #4).
+        # The destination is a Hebrew place no table resolves: "יפן" itself now
+        # resolves through the country aliases (TripIdentityFromEssenceTests).
         intake = {
             **JAPAN_INTAKE,
-            "destination": _text("יפן"),
+            "destination": _text("המזרח הרחוק"),
             "phases": _structured([
                 {"name": "טוקיו", "name_en": "Tokyo"},
                 {"name": "Kyoto"},
@@ -145,7 +147,7 @@ class TransformerTests(unittest.TestCase):
     def test_phase_fallback_skips_phases_that_slugify_to_nothing(self) -> None:
         intake = {
             **JAPAN_INTAKE,
-            "destination": _text("יפן"),
+            "destination": _text("המזרח הרחוק"),
             "phases": _structured([{"name": "טוקיו"}, {"name": "Kyoto"}]),
         }
         self.assertEqual(derive_trip_slug(intake, today=date(2026, 8, 20)), "kyoto-2026")
@@ -153,7 +155,7 @@ class TransformerTests(unittest.TestCase):
     def test_generic_fallback_remains_when_nothing_is_latin(self) -> None:
         intake = {
             **JAPAN_INTAKE,
-            "destination": _text("יפן"),
+            "destination": _text("המזרח הרחוק"),
             "phases": _structured([{"name": "טוקיו"}]),
         }
         self.assertEqual(derive_trip_slug(intake, today=date(2026, 8, 20)), "trip-2026")
@@ -2591,3 +2593,190 @@ class ConfirmedBookingsAreConfirmed(unittest.TestCase):
         for placeholder in ("–", "-", "  ", "n/a", "TBD", "none"):
             with self.subTest(placeholder):
                 self.assertFalse(transformer._has_confirmation({"confirmation": placeholder}))
+
+
+def _stop(name: str, name_en: str | None = None, start: str | None = None, end: str | None = None, **extra) -> dict:
+    stop: dict = {"name": name}
+    if name_en:
+        stop["name_en"] = name_en
+    if start:
+        stop["start"] = start
+    if end:
+        stop["end"] = end
+    stop.update(extra)
+    return stop
+
+
+class TripIdentityFromEssenceTests(unittest.TestCase):
+    """The trip's name — its slug, its title and brand, and the stop the main
+    hero photo is taken from — comes from where the trip IS, never from
+    whichever stop happens to be first.
+
+    Live run, 2026-10-10: a trip to Alsace sleeping in Colmar and flying in via
+    Frankfurt answered the destination in Hebrew only ("אלזס, קולמר"). Hebrew
+    slugifies to nothing, so `derive_trip_slug` took the FIRST stop's latin
+    name — Frankfurt, the arrival gateway — and the trip became
+    `frankfurt-2026`. The interview now keeps a gateway out of the stops, but
+    the trip's identity must not depend on that: the stop holding most of the
+    nights is the trip's base, and a one-night gateway can never outrank it.
+
+    Both producers write the fields read here (name, name_en, start, end): the
+    agentless path's `planned[]` stops and the agent path's `venues[]` stops are
+    each exercised below.
+    """
+
+    TODAY = date(2026, 8, 20)
+
+    def colmar_intake(self, destination: str = "אלזס, קולמר", *, gateway_first: bool = True) -> dict:
+        stops = []
+        if gateway_first:
+            # The worst case: the gateway did reach the stops, and first.
+            stops.append(_stop("פרנקפורט", "Frankfurt", "2026-10-01", "2026-10-02"))
+        stops.append(_stop(
+            "קולמר", "Colmar", "2026-10-02" if gateway_first else "2026-10-01", "2026-10-09",
+            planned=["Petite Venise"],
+        ))
+        return {
+            **JAPAN_INTAKE,
+            "trip_type": _choice("couple"),
+            "destination": _text(destination),
+            "departure_date": _text("2026-10-01"),
+            "return_date": _text("2026-10-09"),
+            "phases": _structured(stops),
+        }
+
+    # ── slug ────────────────────────────────────────────────────────────────
+
+    def test_hebrew_destination_with_a_gateway_first_is_named_by_its_base(self) -> None:
+        self.assertEqual(derive_trip_slug(self.colmar_intake(), today=self.TODAY), "colmar-2026")
+
+    def test_hebrew_destination_without_the_gateway_is_named_by_its_base(self) -> None:
+        intake = self.colmar_intake(gateway_first=False)
+        self.assertEqual(derive_trip_slug(intake, today=self.TODAY), "colmar-2026")
+
+    def test_a_latin_destination_still_wins_over_every_stop(self) -> None:
+        self.assertEqual(
+            derive_trip_slug(self.colmar_intake("Alsace"), today=self.TODAY), "alsace-2026",
+        )
+
+    def test_hebrew_only_destination_takes_the_longest_stop_not_the_first(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "destination": _text("אלזס"),
+            "departure_date": _text("2026-10-01"),
+            "return_date": _text("2026-10-10"),
+            "phases": _structured([
+                _stop("שטרסבורג", "Strasbourg", "2026-10-01", "2026-10-03"),
+                _stop("קולמר", "Colmar", "2026-10-03", "2026-10-10"),
+            ]),
+        }
+        self.assertEqual(derive_trip_slug(intake, today=self.TODAY), "colmar-2026")
+
+    def test_a_city_visited_twice_counts_all_its_nights(self) -> None:
+        # New York 2 + 2 nights outranks Boston's 3, though no single visit
+        # does and Boston comes first.
+        intake = {
+            **JAPAN_INTAKE,
+            "destination": _text("החוף המזרחי"),
+            "departure_date": _text("2026-10-01"),
+            "return_date": _text("2026-10-09"),
+            "phases": _structured([
+                _stop("בוסטון", "Boston", "2026-10-01", "2026-10-04"),
+                _stop("ניו יורק", "New York", "2026-10-04", "2026-10-06"),
+                _stop("פילדלפיה", "Philadelphia", "2026-10-06", "2026-10-07"),
+                _stop("ניו יורק", "New York", "2026-10-07", "2026-10-09"),
+            ]),
+        }
+        self.assertEqual(derive_trip_slug(intake, today=self.TODAY), "new-york-2026")
+
+    def japan_stops(self, *, agent_shape: bool = False) -> list[dict]:
+        def extra(place: str) -> dict:
+            # The agent path writes venues[{name,time}], the agentless planned[].
+            return {"venues": [{"name": place, "time": "10:00"}]} if agent_shape else {"planned": [place]}
+
+        return [
+            _stop("טוקיו", "Tokyo", "2026-11-01", "2026-11-05", **extra("Tokyo Skytree")),
+            _stop("קיוטו", "Kyoto", "2026-11-05", "2026-11-10", **extra("Kinkaku-ji")),
+            _stop("אוסקה", "Osaka", "2026-11-10", "2026-11-13", **extra("Osaka Castle")),
+        ]
+
+    def test_a_multi_stop_latin_destination_keeps_the_destination_slug(self) -> None:
+        for agent_shape in (False, True):
+            with self.subTest(agent_shape=agent_shape):
+                intake = {**JAPAN_INTAKE, "phases": _structured(self.japan_stops(agent_shape=agent_shape))}
+                self.assertEqual(derive_trip_slug(intake, today=self.TODAY), "japan-2026")
+
+    def test_a_hebrew_country_name_is_the_destination_not_a_stop(self) -> None:
+        # "יפן" is a country the alias table already knows; the destination is
+        # Japan, so the slug is too — not whichever city is longest or first.
+        intake = {**JAPAN_INTAKE, "destination": _text("יפן"), "phases": _structured(self.japan_stops())}
+        self.assertEqual(derive_trip_slug(intake, today=self.TODAY), "japan-2026")
+
+    def test_undated_stops_fall_back_to_trip_order(self) -> None:
+        # No dates means no nights to compare: trip order is the only tiebreak
+        # left, and it is deterministic.
+        intake = {
+            **JAPAN_INTAKE,
+            "destination": _text("המזרח הרחוק"),
+            "phases": _structured([_stop("Tokyo"), _stop("Kyoto")]),
+        }
+        self.assertEqual(derive_trip_slug(intake, today=self.TODAY), "tokyo-2026")
+
+    # ── title and brand ─────────────────────────────────────────────────────
+
+    def test_a_multi_place_hebrew_destination_is_titled_by_its_dominant_base(self) -> None:
+        meta = transform_intake(self.colmar_intake(), today=self.TODAY)["meta"]
+        self.assertEqual(meta["brand"], "קולמר 2026")
+        self.assertEqual(meta["title"], "קולמר 2026 — Couple")
+        self.assertNotIn("FRANKFURT", meta["brand"].upper())
+
+    def test_a_multi_place_latin_destination_is_titled_by_its_dominant_base(self) -> None:
+        intake = self.colmar_intake("Alsace, Colmar")
+        intake["phases"] = _structured([
+            _stop("Frankfurt", None, "2026-10-01", "2026-10-02"),
+            _stop("Colmar", None, "2026-10-02", "2026-10-09"),
+        ])
+        meta = transform_intake(intake, today=self.TODAY)["meta"]
+        self.assertEqual(meta["brand"], "COLMAR 2026")
+
+    def test_a_single_place_destination_still_names_the_trip(self) -> None:
+        meta = transform_intake(self.colmar_intake("Alsace"), today=self.TODAY)["meta"]
+        self.assertEqual(meta["brand"], "ALSACE 2026")
+
+    def test_a_balanced_city_list_keeps_the_generic_title(self) -> None:
+        # No stop holds most of the nights, so none of them is the trip's
+        # essence; naming it after one would be a guess.
+        intake = {
+            **JAPAN_INTAKE,
+            "destination": _text("Rome, Florence, Venice"),
+            "departure_date": _text("2026-10-01"),
+            "return_date": _text("2026-10-09"),
+            "phases": _structured([
+                _stop("Rome", None, "2026-10-01", "2026-10-04"),
+                _stop("Florence", None, "2026-10-04", "2026-10-07"),
+                _stop("Venice", None, "2026-10-07", "2026-10-09"),
+            ]),
+        }
+        self.assertEqual(transform_intake(intake, today=self.TODAY)["meta"]["brand"], "FAMILY TRIP 2026")
+
+    # ── the stop the main hero is taken from ────────────────────────────────
+
+    def test_essence_phase_is_the_base_not_the_gateway(self) -> None:
+        config = transform_intake(self.colmar_intake(), today=self.TODAY)
+        self.assertEqual(config["phases"][0]["id"], "frankfurt", "fixture: the gateway sorts first")
+        self.assertEqual(transformer.essence_phase_id(config["phases"]), "colmar")
+
+    def test_essence_phase_ignores_the_open_days_placeholder(self) -> None:
+        # Undecided days are the site's own inference, not a place.
+        phases = [
+            {"id": "colmar", "title": {"en": "Colmar"}, "dates": {"start": "2026-10-01", "end": "2026-10-03"}},
+            {"id": "open-days", "unplanned": True, "title": {"en": "Days not planned yet"},
+             "dates": {"start": "2026-10-03", "end": "2026-10-12"}},
+        ]
+        self.assertEqual(transformer.essence_phase_id(phases), "colmar")
+
+    def test_essence_phase_is_none_without_a_real_stop(self) -> None:
+        self.assertIsNone(transformer.essence_phase_id([]))
+        self.assertIsNone(transformer.essence_phase_id([
+            {"id": "open-days", "unplanned": True, "title": {"en": "Days not planned yet"}},
+        ]))

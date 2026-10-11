@@ -230,6 +230,37 @@ class HeroPhotoTests(unittest.TestCase):
         out = enrich_config(cfg, "Japan", http=http, pause=0)
         self.assertEqual("https://example.com/mine.jpg", out["phases"][0]["hero"]["photo"])
 
+    def test_home_photo_is_the_base_stops_not_the_first_stops(self) -> None:
+        # Land at one airport, sleep in another town: the trip's main photo is the town's.
+        cfg = {
+            "meta": {"title": "Alsace 2026"},
+            "phases": [
+                {"id": "gateway", "title": {"he": "Gateway", "en": "Gateway"}, "tabLabel": "GATEWAY",
+                 "dates": {"start": "2026-12-01", "end": "2026-12-02"}},
+                {"id": "base", "title": {"he": "Base", "en": "Base"}, "tabLabel": "BASE",
+                 "dates": {"start": "2026-12-02", "end": "2026-12-07"}},
+            ],
+        }
+        http = FakeHttp({
+            "page/summary/Gateway": {"title": "Gateway", "originalimage": {"source": "https://upload.wikimedia.org/gateway.jpg"}},
+            "page/summary/Base": {"title": "Base", "originalimage": {"source": "https://upload.wikimedia.org/base.jpg"}},
+        })
+        out = enrich_config(cfg, "Alsace", http=http, pause=0)
+        self.assertEqual("https://upload.wikimedia.org/gateway.jpg", out["phases"][0]["hero"]["photo"])
+        self.assertEqual("https://upload.wikimedia.org/base.jpg", out["meta"]["homePhoto"])
+
+    def test_an_existing_home_photo_is_left_alone(self) -> None:
+        cfg = _config()
+        cfg["meta"]["homePhoto"] = "https://example.com/mine.jpg"
+        http = FakeHttp({"page/summary/Tokyo": WIKI_TOKYO})
+        out = enrich_config(cfg, "Japan", http=http, pause=0)
+        self.assertEqual("https://example.com/mine.jpg", out["meta"]["homePhoto"])
+
+    def test_no_base_photo_means_no_home_photo(self) -> None:
+        http = FakeHttp({"page/summary/Tokyo": {"title": "Tokyo"}})
+        out = enrich_config(_config(), "Japan", http=http, pause=0)
+        self.assertNotIn("homePhoto", out["meta"])
+
     def test_hebrew_only_phase_title_queries_hebrew_wikipedia(self) -> None:
         # A phase with no English title must not be sent to en.wikipedia.org
         # (guaranteed 404 -> no hero). It should hit he.wikipedia.org instead.
