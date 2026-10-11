@@ -143,6 +143,7 @@ export const PORTS = {
   tripStopsGolden:         28314,  // tests/trip-stops-http.test.js — byte-identical /api/config, one server at a time
   itineraryMoveDay:        28315,  // tests/itinerary-move-day.test.js
   configAllowListStops:    28316,  // tests/config-allow-list.test.js — stop overrides never serve pin/provenance
+  tripStopsHardening:      28317,  // tests/trip-stops-http.test.js — boundary review 2026-10-11 (stored XSS, prototype keys)
 
   // ── Stand-ins for services the server calls out to ─────────────────────
   bookingExtractMockHermes: 28103,

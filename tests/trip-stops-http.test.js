@@ -28,6 +28,7 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { PORTS } from './helpers/ports.js';
 import { publicConfig } from '../shared/config-visibility.js';
+import { createRenderContext } from './helpers/dom.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, '..');
@@ -61,7 +62,7 @@ function colmarConfig() {
 }
 
 // ── a trip server of our own ────────────────────────────────────────────────
-async function boot(config, port, { dataDir } = {}) {
+async function boot(config, port, { dataDir, env = {} } = {}) {
   dataDir = dataDir || mkdtempSync(join(tmpdir(), 'trip-stops-'));
   const tripDir = join(dataDir, 'trip');
   mkdirSync(tripDir, { recursive: true });
@@ -73,7 +74,7 @@ async function boot(config, port, { dataDir } = {}) {
     env: { ...process.env, PORT: String(port), TRIP_DIR: tripDir, DATA_DIR: dataDir,
       SITE_DIR: join(dataDir, 'site'), AVATARS_DIR: join(dataDir, 'avatars'),
       JWT_SECRET: 'test-secret-000', IMMICH_URL: '', IMMICH_API_KEY: '', HERMES_URL: '',
-      HERMES_API_KEY: AGENT_KEY, SEED_PASSWORD: '1234' },
+      HERMES_API_KEY: AGENT_KEY, SEED_PASSWORD: '1234', ...env },
   });
   let log = '';
   proc.stdout.on('data', c => { log += c; });
@@ -485,5 +486,143 @@ describe('re-provision under an override (decision 2): the override wins, the co
       assert.ok(!warnings.text.includes('colmar'), 'a stop id is authored text: count only for members');
       assert.deepEqual((await server.call('/api/stops', { apiKey: AGENT_KEY })).body.orphaned_overrides, ['colmar']);
     } finally { await server.stop(); }
+  });
+});
+
+// ── boundary review 2026-10-11: hardening, over HTTP ────────────────────────
+// The reviewer's own hostile bodies, sent the way the companion would send
+// them (agent key) and the way an organizer would (JWT): every one is refused
+// with a readable code naming the field, and nothing reaches /api/config. Then
+// a hostile value planted straight in the DB — what the unhardened code could
+// have stored — is shown to render as text in the Classic site, not as markup.
+describe('boundary review 2026-10-11 — hostile stop text is refused, and Classic escapes what is already stored', () => {
+  const XSS = '<img src=x onerror=alert(document.cookie)>';
+  let server, alice, bob;
+  const agent = { apiKey: AGENT_KEY };
+  const servedText = async () => (await server.call('/api/config', { token: bob })).text;
+  const overrides = () => {
+    const db = new Database(join(server.dataDir, 'trip.db'), { readonly: true });
+    try { return db.prepare('SELECT COUNT(*) n FROM trip_stop_overrides').get().n; } finally { db.close(); }
+  };
+
+  before(async () => {
+    // An Immich URL nothing listens on: the album routes must answer without
+    // ever reaching it for an id the trip does not have.
+    // Colmar dated, so a split reaches the new stop's fields.
+    const cfg = colmarConfig();
+    cfg.phases[1].dates = { start: '2026-12-02', end: '2026-12-07' };
+    server = await boot(cfg, PORTS.tripStopsHardening, { env: { IMMICH_URL: 'http://127.0.0.1:9', IMMICH_API_KEY: 'test-immich' } });
+    alice = await server.login('alice');
+    bob = await server.login('bob');
+  });
+  after(async () => { await server?.stop(); });
+
+  test('finding 1: the reviewer\'s PATCH and split bodies are all 400, naming the field; nothing is stored', async () => {
+    const cases = [
+      [{ title: XSS }, 'invalid_text', 'title'],
+      [{ title: { he: 'קולמר', en: XSS } }, 'invalid_text', 'title.en'],
+      [{ tabLabel: '"><svg onload=alert(1)>' }, 'invalid_text', 'tabLabel'],
+      [{ emoji: '<b>' }, 'invalid_text', 'emoji'],
+      [{ accommodation: { name: { he: XSS, en: 'Hotel' }, address: 'x' } }, 'invalid_text', 'accommodation.name.he'],
+      [{ accommodation: { name: 'Hotel', description: { he: 'x', en: '<script>alert(1)</script>' } } }, 'invalid_text', 'accommodation.description.en'],
+      [{ accommodation: { name: 'Hotel', location_url: 'https://maps.example/x"onmouseover="alert(1)' } }, 'invalid_link', 'accommodation.location_url'],
+      [{ accommodation: { name: 'Hotel', maps: 'javascript:alert(1)' } }, 'invalid_link', 'accommodation.maps'],
+      [{ accommodation: { name: 'Hotel', constructor: 'x' } }, 'unknown_accommodation_field', 'constructor'],
+    ];
+    for (const [body, error, field] of cases) {
+      for (const who of [agent, { token: alice }]) {
+        const r = await server.call('/api/stops/colmar', { method: 'PATCH', ...who, body });
+        assert.equal(r.status, 400, `${JSON.stringify(body)}: ${r.text}`);
+        assert.deepEqual([r.body.error, r.body.field], [error, field]);
+      }
+    }
+    const split = await server.call('/api/stops/colmar/split', { method: 'POST', ...agent,
+      body: { at: '2026-12-04', new_stop: { title: XSS } } });
+    assert.equal(split.status, 400, split.text);
+    assert.deepEqual([split.body.error, split.body.field], ['invalid_text', 'new_stop.title']);
+    assert.equal(overrides(), 0, 'no override row was written');
+    const text = await servedText();
+    for (const needle of ['onerror', 'onmouseover', '<script', '<svg', 'javascript:']) assert.ok(!text.includes(needle), needle);
+  });
+
+  test('finding 1: a hotel booking with a hostile name makes from-booking refuse (400), not store', async () => {
+    const created = await server.call('/api/bookings', { method: 'POST', token: alice, body: {
+      phase: 'colmar', type: 'hotel', name: `Hotel ${XSS}`, date_from: '2026-12-02', date_to: '2026-12-07' } });
+    assert.equal(created.status, 200, created.text);
+    const r = await server.call('/api/stops/colmar/from-booking', { method: 'POST', ...agent, body: { booking_id: created.body.id } });
+    assert.equal(r.status, 400, r.text);
+    assert.deepEqual([r.body.error, r.body.field, r.body.source], ['invalid_text', 'accommodation.name', 'booking']);
+    assert.equal(overrides(), 0);
+    assert.ok(!(await server.call('/api/itinerary/active', agent)).text.includes(`booking_${created.body.id}_checkin`), 'no check-in item');
+    assert.ok(!(await servedText()).includes('onerror'));
+  });
+
+  test('a value the old code could have stored is served as data, and the Classic renderer shows it as text', async () => {
+    // Planted past the validation, as 1fdfe13 would have stored it. A history
+    // row moves the revision, which is what the layer's cache is keyed on.
+    const db = new Database(join(server.dataDir, 'trip.db'));
+    try {
+      db.prepare("INSERT INTO trip_stop_overrides (phase_id, kind, fields, updated_by) VALUES ('colmar', 'config', ?, 'old-code')").run(JSON.stringify({
+        title: { he: XSS, en: XSS }, tabLabel: '"><svg onload=alert(1)>', emoji: '<b>',
+        accommodation: { name: XSS, address: XSS, phone: '"><img src=x onerror=alert(2)>', confirmation: XSS,
+          maps: 'https://maps.example/x"onmouseover="alert(3)', waze: 'javascript:alert(4)', description: XSS, dates: XSS },
+      }));
+      db.prepare("INSERT INTO trip_stop_history (phase_id, action, actor) VALUES ('colmar', 'update', 'old-code')").run();
+    } finally { db.close(); }
+    const cfg = (await server.call('/api/config', { token: bob })).body;
+    const colmar = cfg.phases.find(p => p.id === 'colmar');
+    assert.equal(colmar.title.en, XSS, 'served verbatim: the allow-list passes text, the renderer escapes it');
+
+    const html = '<div id="home-phases"></div><div id="photo-uploads"></div><div id="hotel-colmar"></div><div id="labels"></div>';
+    const googleMapsUrl = (q) => (q ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(q)}` : null);
+    const { document, ctx } = createRenderContext(html, cfg, 'en', { googleMapsUrl, bkConfUrls: () => null, bkEsc: (s) => String(s ?? '') });
+    ctx.renderHomePhases(cfg);
+    ctx.renderPhotoUploads(cfg);
+    ctx.renderPhaseHotelCard(colmar);
+    document.getElementById('labels').innerHTML = ctx.accommodationAnchors(cfg).map(a => a.phaseLabel).join('');
+    const body = document.body;
+    assert.equal(body.querySelectorAll('img, svg, script, b').length, 0, body.innerHTML);
+    for (const el of body.querySelectorAll('*')) {
+      for (const attr of el.getAttributeNames()) assert.ok(!/^on/i.test(attr) || attr === 'onchange', `${el.tagName} ${attr}`);
+    }
+    for (const a of body.querySelectorAll('a[href]')) assert.match(a.getAttribute('href'), /^(https?:|tel:|#)/, a.outerHTML);
+    assert.ok(!body.querySelector('a[href^="javascript:"]'), 'the javascript: waze link is not rendered');
+    assert.ok(body.textContent.includes(XSS), 'the stored text is shown, as text');
+  });
+
+  test('finding 5: an album id named after a prototype member is not an album (no Immich call, no function leaked)', async () => {
+    for (const id of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) {
+      const r = await server.call(`/api/album-share/${id}`, { token: bob });
+      assert.equal(r.status, 404, `${id}: ${r.text}`);
+      assert.ok(!r.text.includes('native code'), r.text);
+    }
+  });
+
+  test('finding 5: id-keyed maps a member writes to — ratings, reactions, photo comments — take `__proto__` as data', async () => {
+    assert.equal((await server.call('/api/ratings', { method: 'POST', token: bob, body: { venue: '__proto__', rating: 5 } })).status, 200);
+    const ratings = await server.call('/api/ratings', { token: bob });
+    assert.equal(ratings.status, 200);
+    assert.equal(ratings.text, '{"__proto__":{"bob":5}}', 'stored as a venue, not written onto Object.prototype');
+
+    assert.equal((await server.call('/api/reactions/__proto__', { method: 'POST', token: bob, body: { emoji: '__proto__' } })).status, 200);
+    const reactions = await server.call('/api/reactions', { token: bob });
+    assert.equal(reactions.status, 200, reactions.text);
+    assert.equal(reactions.text, '{"__proto__":{"__proto__":["bob"]}}');
+    const one = await server.call('/api/reactions/__proto__', { token: bob });
+    assert.equal(one.status, 200, one.text);
+
+    assert.equal((await server.call('/api/comments/photo/__proto__', { method: 'POST', token: bob, body: { body: 'hi' } })).status, 200);
+    const comments = await server.call('/api/comments/photo', { token: bob });
+    assert.equal(comments.status, 200, comments.text);
+    assert.ok(comments.text.startsWith('{"__proto__":[{'), comments.text);
+  });
+
+  test('finding 4: revert with nothing to revert is 200 unchanged, and the revision does not move', async () => {
+    const before = (await server.call('/api/stops', agent)).body.revision;
+    const r = await server.call('/api/stops/frankfurt/revert', { method: 'POST', ...agent, body: {} });
+    assert.equal(r.status, 200, r.text);
+    assert.equal(r.body.unchanged, true);
+    assert.equal((await server.call('/api/stops', agent)).body.revision, before);
+    assert.deepEqual((await server.call('/api/stops/frankfurt/history', agent)).body.history, []);
   });
 });
