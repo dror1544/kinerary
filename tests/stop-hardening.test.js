@@ -333,3 +333,175 @@ describe('finding 5 — a stop id named after a prototype member is refused', ()
     assert.match(r.body.stops[1].id, /^[a-z0-9][a-z0-9-]*$/);
   });
 });
+
+// ── follow-ups of the fifth boundary review (PR #364), 2026-10-11 ───────────
+// The stop layer is the twin of server/text-rules.js: the same regexes, the
+// same safeLink(). Its refusals keep their shape ({ error, field, detail }, no
+// bilingual message — the stop routes never carried one); an invisible
+// character gets its own detail.
+const INVISIBLE_DETAIL = 'text may not contain invisible characters that change its direction or display (U+200B, U+2028, U+2029, U+202A-U+202E, U+2060, U+2066-U+2069, U+FEFF)';
+const INVISIBLE_CPS = [0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069, 0x2028, 0x2029, 0xFEFF, 0x200B, 0x2060];
+
+describe('follow-up 1 — invisible and direction-changing characters in stop text are refused (invalid_text, own detail)', () => {
+  const at = (cp) => `Col${String.fromCodePoint(cp)}mar`;
+  const bodies = (v) => [
+    [{ title: v }, 'title'], [{ title: { he: 'קולמר', en: v } }, 'title.en'], [{ tabLabel: v }, 'tabLabel'], [{ emoji: v }, 'emoji'],
+    [{ accommodation: { name: v } }, 'accommodation.name'], [{ accommodation: { name: 'H', address: v } }, 'accommodation.address'],
+    [{ accommodation: { name: 'H', confirmation: v } }, 'accommodation.confirmation'],
+    [{ accommodation: { name: 'H', description: v } }, 'accommodation.description'],
+    [{ accommodation: { name: 'H', note: { he: v, en: 'x' } } }, 'accommodation.note.he'],
+  ];
+  for (const cp of INVISIBLE_CPS) {
+    test(`U+${cp.toString(16).toUpperCase()} in every text field (multi-line ones too) → 400 invalid_text, nothing stored`, () => {
+      const { structure, counts } = make();
+      for (const [body, field] of bodies(at(cp))) {
+        const r = structure.ops.update('colmar', body, 'alice');
+        assert.equal(r.status, 400, `${field}: ${JSON.stringify(r.body)}`);
+        assert.deepEqual([r.body.error, r.body.field, r.body.detail], ['invalid_text', field, INVISIBLE_DETAIL], field);
+        assert.equal(r.body.message, undefined, 'the stop layer keeps its shape: no message');
+      }
+      assert.deepEqual(counts(), NOTHING);
+    });
+  }
+
+  test('split and from-booking refuse it too', () => {
+    const { structure, counts, booking } = make();
+    let r = structure.ops.split('colmar', { at: '2026-12-05', new_stop: { title: 'Air\u202Eport' } }, 'alice');
+    assert.deepEqual([r.status, r.body.error, r.body.field, r.body.detail], [400, 'invalid_text', 'new_stop.title', INVISIBLE_DETAIL]);
+    const id = booking({ name: 'Hotel\u200B Colmar' });
+    r = structure.ops.fromBooking('colmar', { booking_id: id }, 'alice');
+    assert.deepEqual([r.status, r.body.error, r.body.field, r.body.source], [400, 'invalid_text', 'accommodation.name', 'booking']);
+    assert.deepEqual(counts(), NOTHING);
+  });
+
+  test('< > and control characters keep their own detail', () => {
+    const { structure } = make();
+    assert.equal(structure.ops.update('colmar', { title: 'a<b\u202E' }, 'alice').body.detail, 'text may not contain < > or control characters');
+    assert.equal(structure.ops.update('colmar', { tabLabel: 'a\nb' }, 'alice').body.detail, 'text may not contain < > or control characters');
+  });
+
+  test('Hebrew with RLM / LRM / ALM / ZWNJ, and a ZWJ emoji, are stored exactly as typed', () => {
+    const { structure } = make();
+    const acc = { name: { he: 'מלון\u200F Hilton\u200E', en: 'Hilton\u200E' }, address: 'רחוב הרצל\u200F 5', description: 'فندق\u061C\nمی\u200Cخواهم' };
+    const body = { title: { he: 'קולמר\u200F (Colmar)\u200E', en: 'Colmar' }, tabLabel: 'קולמר\u200F', emoji: '👨\u200D👩\u200D👧', accommodation: acc };
+    const r = structure.ops.update('colmar', body, 'alice');
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    const colmar = structure.effectiveConfig().phases.find(p => p.id === 'colmar');
+    assert.deepEqual([colmar.title, colmar.tabLabel, colmar.emoji], [body.title, body.tabLabel, body.emoji]);
+    assert.deepEqual(colmar.accommodation, acc);
+  });
+});
+
+describe('follow-up 3 — CRLF in a stop\'s description/note is normalised to \\n; one-line fields still refuse CR', () => {
+  test('description and note, as a string and as { he, en }: \\r\\n and \\r are stored as \\n', () => {
+    const { structure } = make();
+    const r = structure.ops.update('colmar', { accommodation: { name: 'H', description: 'a\r\nb\rc', note: { he: 'שורה\r\nשנייה', en: 'one\rtwo' } } }, 'alice');
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    const acc = structure.effectiveConfig().phases.find(p => p.id === 'colmar').accommodation;
+    assert.equal(acc.description, 'a\nb\nc');
+    assert.deepEqual(acc.note, { he: 'שורה\nשנייה', en: 'one\ntwo' });
+  });
+
+  test('a CR in a one-line field is still refused', () => {
+    const { structure, counts } = make();
+    for (const [body, field] of [[{ title: 'a\rb' }, 'title'], [{ accommodation: { name: 'H', address: 'a\r\nb' } }, 'accommodation.address'], [{ tabLabel: 'A\rB' }, 'tabLabel']]) {
+      const r = structure.ops.update('colmar', body, 'alice');
+      assert.deepEqual([r.status, r.body.error, r.body.field], [400, 'invalid_text', field]);
+    }
+    assert.deepEqual(counts(), NOTHING);
+  });
+});
+
+describe('follow-up 4 — a stop link the URL parser would rewrite is refused; legitimate links stored as typed', () => {
+  const bad = ['https:\\\\evil.example', 'https:evil.example', 'https:/evil.example', 'https:///evil.example', 'https://.', 'https://a..b',
+    'https://.evil.example', 'https://exa\u200Bmple.com', 'https://exa\u00ADmple.com', 'https://%65vil.example', 'https://evil．．example'];
+  const good = ['http://[::1]/', 'https://xn--bcher-kva.example/', 'https://bücher.example/x', 'https://user:pass@maps.example/x',
+    'HTTPS://Maps.Example/x', 'https://maps.example./x'];
+  for (const link of bad) {
+    test(`accommodation.maps = ${JSON.stringify(link)} → 400 invalid_link, nothing stored`, () => {
+      const { structure, counts } = make();
+      const r = structure.ops.update('colmar', { accommodation: { name: 'H', maps: link } }, 'alice');
+      assert.deepEqual([r.status, r.body.error, r.body.field], [400, 'invalid_link', 'accommodation.maps'], JSON.stringify(r.body));
+      assert.deepEqual(counts(), NOTHING);
+    });
+  }
+  test('legitimate links are stored exactly as typed (trimmed), never rewritten to url.href', () => {
+    for (const link of good) {
+      const { structure } = make();
+      const r = structure.ops.update('colmar', { accommodation: { name: 'H', location_url: ` ${link}  ` } }, 'alice');
+      assert.equal(r.status, 200, `${link}: ${JSON.stringify(r.body)}`);
+      assert.equal(structure.effectiveConfig().phases.find(p => p.id === 'colmar').accommodation.location_url, link);
+    }
+  });
+  test('from-booking: a booking link stored before this change with a backslash is refused, said, not copied', () => {
+    const { structure, counts, booking } = make();
+    const id = booking({ location_url: 'https:\\\\evil.example' });
+    const r = structure.ops.fromBooking('colmar', { booking_id: id }, 'alice');
+    assert.deepEqual([r.status, r.body.error, r.body.field, r.body.source], [400, 'invalid_link', 'accommodation.location_url', 'booking']);
+    assert.deepEqual(counts(), NOTHING);
+  });
+});
+
+describe('the twins — server/text-rules.js and server/trip-structure.js carry the same rules, byte for byte', () => {
+  const { readFileSync } = require('node:fs');
+  const src = (f) => readFileSync(new URL(`../server/${f}`, import.meta.url), 'utf8');
+  const textRules = src('text-rules.js');
+  const stopLayer = src('trip-structure.js');
+  const constant = (code, name) => {
+    const m = new RegExp(`^const ${name} = .*;$`, 'm').exec(code);
+    assert.ok(m, `const ${name} not found`);
+    return m[0];
+  };
+  const fn = (code, name) => {
+    const start = code.search(new RegExp(`^function ${name}\\(`, 'm'));
+    assert.notEqual(start, -1, `function ${name} not found`);
+    return code.slice(start, code.indexOf('\n}\n', start) + 2);
+  };
+
+  for (const name of ['UNSAFE_LINE_RE', 'UNSAFE_MULTILINE_RE', 'INVISIBLE_RE', 'TEXT_DETAIL', 'INVISIBLE_DETAIL', 'LINK_DETAIL', 'LINK_HOST_HIDDEN_RE', 'LINK_LABEL_DOT_RE', 'toLf']) {
+    test(`const ${name} is identical in both files`, () => {
+      assert.equal(constant(stopLayer, name), constant(textRules, name));
+    });
+  }
+  for (const name of ['safeLink', 'textDetail']) {
+    test(`function ${name}() is identical in both files`, () => {
+      assert.equal(fn(stopLayer, name), fn(textRules, name));
+    });
+  }
+});
+
+describe('safeLink refuses every character the URL parser deletes from a host (enumerated against this Node)', () => {
+  test('for every code point c where new URL("https://a" + c + "b.com").hostname === "ab.com", safeLink refuses the link', () => {
+    const { safeLink } = require('../server/text-rules.js');
+    const deleted = [];
+    for (let cp = 0x21; cp <= 0x10FFFF; cp++) {
+      if (cp >= 0xD800 && cp <= 0xDFFF) continue;
+      const link = `https://a${String.fromCodePoint(cp)}b.com/`;
+      let host;
+      try { host = new URL(link).hostname; } catch { continue; }
+      if (host === 'ab.com') {
+        deleted.push(cp);
+        assert.equal(safeLink(link), undefined, `U+${cp.toString(16).toUpperCase()} is deleted by the parser but the link was accepted`);
+      }
+    }
+    assert.ok(deleted.length >= 10, `enumeration found ${deleted.length} deleted characters`);
+    assert.ok(deleted.includes(0xAD) && deleted.includes(0x200B), 'soft hyphen and zero-width space are among them');
+  });
+
+  test('every code point the parser turns into a label dot counts as a dot for the empty-label rule', () => {
+    const { safeLink } = require('../server/text-rules.js');
+    let dots = 0;
+    for (let cp = 0x21; cp <= 0x10FFFF; cp++) {
+      if (cp >= 0xD800 && cp <= 0xDFFF) continue;
+      const c = String.fromCodePoint(cp);
+      let host;
+      try { host = new URL(`https://a${c}b.com/`).hostname; } catch { continue; }
+      if (host === 'a.b.com') {
+        dots++;
+        assert.equal(safeLink(`https://a${c}${c}b.com/`), undefined, `U+${cp.toString(16).toUpperCase()} doubled makes an empty label`);
+        assert.equal(safeLink(`https://${c}b.com/`), undefined, `U+${cp.toString(16).toUpperCase()} leading makes an empty label`);
+      }
+    }
+    assert.ok(dots >= 4, `found ${dots} dot characters`);
+  });
+});

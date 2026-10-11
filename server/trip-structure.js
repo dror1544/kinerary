@@ -76,10 +76,30 @@ const MULTILINE_KEYS = new Set(['description', 'note']);
 // in trip-web) — proven sink by sink, attributes included, in
 // tests/stop-xss-render.test.js. Links are a different kind of value and keep
 // refusing quotes (safeLink below): a link goes into an href as it stands.
-const UNSAFE_LINE_RE = /[<>\u0000-\u001F\u007F-\u009F]/;
-const UNSAFE_MULTILINE_RE = /[<>\u0000-\u0009\u000B-\u001F\u007F-\u009F]/;
+//
+// Fifth boundary review (2026-10-11), the same three follow-ups as the booking
+// rules in server/text-rules.js (which explains each): invisible and
+// direction-changing characters are refused too (U+202A-U+202E, U+2066-U+2069,
+// U+2028/U+2029, U+FEFF, U+200B, U+2060 — never LRM, RLM, ALM, ZWNJ or ZWJ,
+// which Hebrew and emoji are typed with), with their own `detail` and the same
+// invalid_text code — the stop routes answer { error, field, detail } and no
+// bilingual message, and keep that shape; a description's or note's \r\n and
+// lone \r become \n before the check (toLf); and a link the URL parser would
+// have to rewrite is refused.
+// TWIN: UNSAFE_LINE_RE, UNSAFE_MULTILINE_RE, INVISIBLE_RE, TEXT_DETAIL,
+// INVISIBLE_DETAIL, LINK_DETAIL, LINK_HOST_HIDDEN_RE, LINK_LABEL_DOT_RE, toLf,
+// textDetail() and safeLink() are byte-identical copies of the same names in
+// server/text-rules.js; tests/stop-hardening.test.js ("the twins") compares
+// them. Change one, change both.
+const UNSAFE_LINE_RE = /[<>\u0000-\u001F\u007F-\u009F\u200B\u2028\u2029\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/;
+const UNSAFE_MULTILINE_RE = /[<>\u0000-\u0009\u000B-\u001F\u007F-\u009F\u200B\u2028\u2029\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/;
+const INVISIBLE_RE = /[\u200B\u2028\u2029\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/;
 const TEXT_DETAIL = 'text may not contain < > or control characters';
-const LINK_DETAIL = 'a link must be an absolute http(s) URL with a host, and no quotes, < >, or whitespace';
+const INVISIBLE_DETAIL = 'text may not contain invisible characters that change its direction or display (U+200B, U+2028, U+2029, U+202A-U+202E, U+2060, U+2066-U+2069, U+FEFF)';
+const LINK_DETAIL = 'a link must start with http:// or https://, name its host as the browser will use it, and contain no quotes, backslashes, < >, or whitespace';
+const LINK_HOST_HIDDEN_RE = /[\u00AD\u034F\u180B-\u180D\u180F\u200B\u2028\u2029\u202A-\u202E\u2060\u2064\u2066-\u2069\uFE00-\uFE0F\uFEFF\u{1BCA0}-\u{1BCA3}\u{E0100}-\u{E01EF}]/u;
+const LINK_LABEL_DOT_RE = /[.。．｡]/;
+const toLf = (s) => s.replace(/\r\n?/g, '\n');
 const STOP_FIELDS = ['dates', 'accommodation', 'title', 'tabLabel', 'emoji'];
 const OPEN_TITLE = { he: 'ימים שעוד לא תוכננו', en: 'Days not planned yet' };
 // The same sentence the provisioner writes, so an unchanged trip serves
@@ -173,26 +193,59 @@ function scalarValue(v) {
 }
 const fail = (status, error, extra = {}) => ({ status, body: { error, ...extra } });
 
-// The path of the first string in `value` (a string, or a { he, en } pair)
-// that carries text a browser could read as markup — or null.
+// The first string in `value` (a string, or a { he, en } pair) that carries
+// text a browser could read as markup, or that renders other than it reads:
+// { field: its path, detail } — or null.
 function unsafeTextAt(value, path, { multiline = false } = {}) {
   const re = multiline ? UNSAFE_MULTILINE_RE : UNSAFE_LINE_RE;
-  if (typeof value === 'string') return re.test(value) ? path : null;
+  if (typeof value === 'string') return re.test(value) ? { field: path, detail: textDetail(value, multiline) } : null;
   if (isObj(value)) {
-    for (const k of Object.keys(value)) if (typeof value[k] === 'string' && re.test(value[k])) return `${path}.${k}`;
+    for (const k of Object.keys(value)) {
+      if (typeof value[k] === 'string' && re.test(value[k])) return { field: `${path}.${k}`, detail: textDetail(value[k], multiline) };
+    }
   }
   return null;
 }
-const invalidText = (field) => fail(400, 'invalid_text', { field, detail: TEXT_DETAIL });
+const invalidText = ({ field, detail }) => fail(400, 'invalid_text', { field, detail });
+// A multi-line value (a string or a { he, en } pair) with its line endings
+// normalised to \n; anything else as given.
+function lfValue(value) {
+  if (typeof value === 'string') return toLf(value);
+  if (!isObj(value)) return value;
+  const out = {};
+  for (const k of Object.keys(value)) out[k] = typeof value[k] === 'string' ? toLf(value[k]) : value[k];
+  return out;
+}
+
+// The detail for a refused string (twin of text-rules.js): the invisible-
+// character one only when nothing a person can see — < >, or a line break in
+// a one-line field — explains the refusal.
+function textDetail(s, multiline) {
+  if (/[<>]/.test(s) || (!multiline && /[\n\r]/.test(s)) || !INVISIBLE_RE.test(s)) return TEXT_DETAIL;
+  return INVISIBLE_DETAIL;
+}
 
 // A link a renderer can put in an href as it stands: parsed by the WHATWG URL
-// parser (not a prefix check, which passed `https://x/"onmouseover=…`),
+// parser (not a prefix check alone, which passed `https://x/"onmouseover=…`),
 // http(s) with a host, and none of the characters that end an attribute or a
-// URL in markup. Returned as typed (trimmed), never rewritten.
+// URL in markup. Since the fifth review it must also go where it reads: the
+// literal `http://` or `https://`, no backslash, and a host the parser does
+// not have to rewrite (no empty label, no `%`, no character it deletes) —
+// `https:\\evil.com` and `https://.` parsed, as something else. Returned as
+// typed (trimmed), never rewritten to url.href.
 function safeLink(raw) {
   if (typeof raw !== 'string') return undefined;
   const s = raw.trim();
-  if (!s || s.length > 2000 || /[\s"'<>`\u0000-\u001F\u007F-\u009F]/.test(s)) return undefined;
+  if (!s || s.length > 2000 || /[\s"'<>`\\\u0000-\u001F\u007F-\u009F]/.test(s)) return undefined;
+  const authority = /^https?:\/\/([^/?#]*)/i.exec(s)?.[1];
+  if (authority === undefined) return undefined;
+  const hostPort = authority.slice(authority.lastIndexOf('@') + 1);
+  if (!hostPort.startsWith('[')) {
+    const host = hostPort.replace(/:\d*$/, '');
+    const labels = host.split(LINK_LABEL_DOT_RE);
+    if (labels.length > 1 && labels[labels.length - 1] === '') labels.pop();
+    if (!host || host.includes('%') || LINK_HOST_HIDDEN_RE.test(host) || labels.some(l => !l)) return undefined;
+  }
   let url;
   try { url = new URL(s); } catch { return undefined; }
   if ((url.protocol !== 'http:' && url.protocol !== 'https:') || !url.hostname) return undefined;
@@ -206,10 +259,13 @@ function validateAccommodation(value, path = 'accommodation') {
   // it is never stored even in the organizer-only history.
   if (Object.hasOwn(value, 'pin')) return { error: fail(400, 'pin_not_accepted') };
   const out = {};
-  for (const [key, raw] of Object.entries(value)) {
+  for (const [key, given] of Object.entries(value)) {
     if (!Object.hasOwn(ACCOMMODATION_KEYS, key)) return { error: fail(400, 'unknown_accommodation_field', { field: key }) };
     const kind = ACCOMMODATION_KEYS[key];
-    if (raw === null || raw === '') continue;
+    if (given === null || given === '') continue;
+    // A client's CRLF in a description or note is a line ending, not a hidden
+    // control character: normalised before the check, stored as \n.
+    const raw = MULTILINE_KEYS.has(key) ? lfValue(given) : given;
     const field = `${path}.${key}`;
     let v;
     if (kind === 'url') {

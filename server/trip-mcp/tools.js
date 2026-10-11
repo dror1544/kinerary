@@ -402,8 +402,8 @@ const STOP_REFUSAL_HINTS = {
   same_phase: 'from_phase_id and to_phase_id are the same stop.',
   booking_belongs_to_another_stop: 'That booking is filed under another stop (named in "stop"); linking it here would move that stop\'s check-in and check-out, so it is refused. Ask the organizer which stop the hotel is for. If it is this one, the organizer first changes the booking\'s stop to this one on the site (the booking\'s edit form), then call set_stop_from_booking again. A booking filed under the stop this one was split from links without that.',
   booking_linked_to_another_stop: 'That booking already sets another stop (named in "stop") — its dates and hotel — and one booking shapes one stop, so it is refused. Tell the organizer. It is freed only when that stop is set from a different hotel booking (set_stop_from_booking on that stop) or its change is undone from the stop\'s history on the site; update_stop does not free it. Then link it here.',
-  invalid_text: 'Stop text may not contain < or > or control characters (a line break only in description and note); the field is named in "field". Quotes are fine and are stored as typed (ארה"ב, 55" TV). Remove the < or > (say "less than" / "more than" in words if it matters), then resend. If "source" is "booking", the text is the booking\'s own: fix the booking (update_booking) first.',
-  invalid_link: 'A link (named in "field") must be a full http(s) address with no quotes, spaces or < >. Resend it without that link or with a clean one; if "source" is "booking", fix the booking\'s location_url (update_booking) first.',
+  invalid_text: 'Stop text may not contain < or > or control characters (a line break only in description and note), nor invisible characters that change its direction or display ("detail" says which); the field is named in "field". Quotes are fine and are stored as typed (ארה"ב, 55" TV). Remove the < or > (say "less than" / "more than" in words if it matters), then resend. If "source" is "booking", the text is the booking\'s own: fix the booking (update_booking) first.',
+  invalid_link: 'A link (named in "field") must be a full address starting http:// or https://, with a real host and no quotes, spaces, backslashes or < >. Resend it without that link or with a clean one; if "source" is "booking", fix the booking\'s location_url (update_booking) first.',
 };
 
 // Stop text is sent to the route exactly as the model gives it: a `"`
@@ -430,10 +430,11 @@ function explainStopRefusal(err) {
 // survives siteClient()'s 300-character cap; it is lifted out here and named,
 // so the assistant relays it rather than paraphrasing the JSON.
 const WRITE_REFUSAL_HINTS = {
-  invalid_text: 'The text in "field" has a character the site does not store: < or >, or a control character (a line break is allowed only in notes). Quotes are fine and are stored as typed (ארה"ב, 55" TV).',
-  invalid_link: 'The link in "field" must be a full http(s) address with no quotes, spaces or < >.',
+  invalid_text: 'The text in "field" has a character the site does not store: < or >, a control character (a line break is allowed only in notes), or an invisible character that changes the text\'s direction or display (often pasted in; Hebrew\'s own RLM/LRM marks are fine). Quotes are fine and are stored as typed (ארה"ב, 55" TV).',
+  invalid_link: 'The link in "field" must be a full address starting http:// or https://, with a real host and no quotes, spaces, backslashes or < >.',
   invalid_date: 'The date in "field" must be YYYY-MM-DD (a real date).',
   text_too_long: 'The text in "field" is longer than the site keeps.',
+  invalid_type: 'The booking "type" must be exactly one of flight, hotel, car, attraction, other (one lowercase string).',
   text_required: 'The name cannot be empty.',
   missing_fields: 'A required field is missing.',
 };
