@@ -1649,9 +1649,13 @@ app.post('/api/auth/avatar/upload', authRequired,
 // ── RATINGS ───────────────────────────────────────────────────────────────────
 app.get('/api/ratings', authRequired, (_req, res) => {
   const rows = db.prepare('SELECT venue, username, stars FROM ratings').all();
-  const result = {};
+  // Null-prototype maps: a member chooses the venue id, and on a plain object
+  // `__proto__` IS Object.prototype — the next line would have written every
+  // rater's name onto every object in this process (boundary review
+  // 2026-10-11, finding 5; the same for the photo maps below).
+  const result = Object.create(null);
   for (const r of rows) {
-    if (!result[r.venue]) result[r.venue] = {};
+    if (!result[r.venue]) result[r.venue] = Object.create(null);
     result[r.venue][r.username] = r.stars;
   }
   res.json(result);
@@ -1896,9 +1900,10 @@ app.post('/api/rsvps/:activityId', authRequired, (req, res) => {
 // Bulk fetch — all reactions for all photos (or filtered by comma-separated IDs)
 app.get('/api/reactions', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM photo_reactions').all();
-  const grouped = {};
+  // Photo ids and emoji are request text; see /api/ratings for why null-prototype.
+  const grouped = Object.create(null);
   for (const r of rows) {
-    if (!grouped[r.photo_id]) grouped[r.photo_id] = {};
+    if (!grouped[r.photo_id]) grouped[r.photo_id] = Object.create(null);
     if (!grouped[r.photo_id][r.emoji]) grouped[r.photo_id][r.emoji] = [];
     grouped[r.photo_id][r.emoji].push(r.username);
   }
@@ -1907,8 +1912,8 @@ app.get('/api/reactions', authRequired, (req, res) => {
 
 app.get('/api/reactions/:photoId', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM photo_reactions WHERE photo_id = ?').all(req.params.photoId);
-  // Group by emoji: { '❤️': [{ username, user }], ... }
-  const grouped = {};
+  // Group by emoji: { '❤️': [{ username, user }], ... } — null-prototype, as above.
+  const grouped = Object.create(null);
   for (const r of rows) {
     if (!grouped[r.emoji]) grouped[r.emoji] = [];
     grouped[r.emoji].push({ username: r.username, user: publicUser(getUser(r.username)) || { username: r.username } });
@@ -1933,7 +1938,7 @@ app.post('/api/reactions/:photoId', authRequired, (req, res) => {
 // Bulk fetch — all photo comments (for gallery preload)
 app.get('/api/comments/photo', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM photo_comments ORDER BY created_at ASC').all();
-  const grouped = {};
+  const grouped = Object.create(null); // keyed by a request-chosen photo id; see /api/ratings
   for (const c of rows) {
     if (!grouped[c.photo_id]) grouped[c.photo_id] = [];
     grouped[c.photo_id].push({ ...c, user: publicUser(getUser(c.username)) || { username: c.username } });
@@ -1996,7 +2001,11 @@ function sectionName(phaseId) {
 }
 
 // Album IDs are looked up by name (or created) on first use — see getOrCreateAlbum().
-const ALBUM_IDS = {};
+// Null-prototype, like SHARE_KEYS: both are keyed by a phase id from the
+// request, and on a plain object `constructor` was already "cached" — the
+// album-share route answered a member with Object's own source in the URL and
+// never looked for an album (boundary review 2026-10-11, finding 5).
+const ALBUM_IDS = Object.create(null);
 
 async function getOrCreateAlbum(phase) {
   if (ALBUM_IDS[phase]) return ALBUM_IDS[phase];
@@ -2018,7 +2027,7 @@ async function getOrCreateAlbum(phase) {
   return created.id;
 }
 
-const SHARE_KEYS = {};
+const SHARE_KEYS = Object.create(null);
 const IMMICH_EXTERNAL = process.env.IMMICH_EXTERNAL_URL || IMMICH_URL;
 
 async function getOrCreateShareLink(phase) {

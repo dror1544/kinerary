@@ -37,16 +37,40 @@ const { moveDayRows } = require('./living-journey');
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const STOP_ID_RE = /^[a-z0-9][a-z0-9-]{0,47}$/;
+// A stop id is used as a key wherever a phase is looked up by id — a plain
+// object keyed by `constructor` answers with Object's own constructor
+// (boundary review 2026-10-11, finding 5). Refused whatever the case, since
+// STOP_ID_RE only lets lowercase through anyway.
+const RESERVED_STOP_IDS = new Set([...Object.getOwnPropertyNames(Object.prototype), 'prototype'].map(s => s.toLowerCase()));
+const isReservedStopId = (id) => RESERVED_STOP_IDS.has(String(id).toLowerCase());
 const MAX_TEXT = 300;
-const URL_FIELDS = new Set(['location_url', 'maps', 'waze', 'url']);
 // The accommodation an override may carry: the allow-list's ACCOMMODATION
 // fields an organizer can sensibly type, minus `pin` (refused outright) and the
 // legacy/derived ones (notes list, weatherKey, pdf, hotel, title, mapsUrl).
-const ACCOMMODATION_KEYS = {
+// Null prototype, and read with Object.hasOwn: a key named `constructor` or
+// `toString` is not a field (finding 2).
+const ACCOMMODATION_KEYS = Object.assign(Object.create(null), {
   name: 'text', name_en: 'scalar', type: 'scalar', address: 'scalar', phone: 'scalar',
   confirmation: 'scalar', location_url: 'url', maps: 'url', waze: 'url', url: 'url',
   guests: 'scalar', rooms: 'scalar', cost: 'scalar', dates: 'text', description: 'text', note: 'text',
-};
+});
+// Free text that may run over several lines; every other text field is one line.
+const MULTILINE_KEYS = new Set(['description', 'note']);
+
+// STORED TEXT IS NEVER MARKUP (boundary review 2026-10-11, finding 1). Every
+// value a stop write accepts reaches /api/config, and a renderer that builds
+// HTML from it — the Classic site did, unescaped — turns `<img onerror=…>` into
+// script in every member's browser. The agent key is enough to write a stop,
+// and the companion holding it reads text travellers typed, so this is one
+// prompt injection away. Refused at the write, not cleaned: a silently altered
+// value is the failure this repository keeps paying for. `<`, `>` and `"` are
+// what it takes to open a tag or leave an attribute; control characters have
+// no business in a title. A newline is allowed only in the multi-line fields.
+// `&` and `'` stay: names carry them, and every renderer escapes them anyway.
+const UNSAFE_LINE_RE = /[<>"\u0000-\u001F\u007F-\u009F]/;
+const UNSAFE_MULTILINE_RE = /[<>"\u0000-\u0009\u000B-\u001F\u007F-\u009F]/;
+const TEXT_DETAIL = 'text may not contain < > " or control characters (for a Hebrew abbreviation use ״, U+05F4)';
+const LINK_DETAIL = 'a link must be an absolute http(s) URL with a host, and no quotes, < >, or whitespace';
 const STOP_FIELDS = ['dates', 'accommodation', 'title', 'tabLabel', 'emoji'];
 const OPEN_TITLE = { he: 'ימים שעוד לא תוכננו', en: 'Days not planned yet' };
 // The same sentence the provisioner writes, so an unchanged trip serves
@@ -140,7 +164,33 @@ function scalarValue(v) {
 }
 const fail = (status, error, extra = {}) => ({ status, body: { error, ...extra } });
 
-function validateAccommodation(value) {
+// The path of the first string in `value` (a string, or a { he, en } pair)
+// that carries text a browser could read as markup — or null.
+function unsafeTextAt(value, path, { multiline = false } = {}) {
+  const re = multiline ? UNSAFE_MULTILINE_RE : UNSAFE_LINE_RE;
+  if (typeof value === 'string') return re.test(value) ? path : null;
+  if (isObj(value)) {
+    for (const k of Object.keys(value)) if (typeof value[k] === 'string' && re.test(value[k])) return `${path}.${k}`;
+  }
+  return null;
+}
+const invalidText = (field) => fail(400, 'invalid_text', { field, detail: TEXT_DETAIL });
+
+// A link a renderer can put in an href as it stands: parsed by the WHATWG URL
+// parser (not a prefix check, which passed `https://x/"onmouseover=…`),
+// http(s) with a host, and none of the characters that end an attribute or a
+// URL in markup. Returned as typed (trimmed), never rewritten.
+function safeLink(raw) {
+  if (typeof raw !== 'string') return undefined;
+  const s = raw.trim();
+  if (!s || s.length > 2000 || /[\s"'<>`\u0000-\u001F\u007F-\u009F]/.test(s)) return undefined;
+  let url;
+  try { url = new URL(s); } catch { return undefined; }
+  if ((url.protocol !== 'http:' && url.protocol !== 'https:') || !url.hostname) return undefined;
+  return s;
+}
+
+function validateAccommodation(value, path = 'accommodation') {
   if (value === null) return { value: null };
   if (!isObj(value)) return { error: fail(400, 'invalid_accommodation', { detail: 'accommodation must be an object or null' }) };
   // A door code is not trip UI data. Refused by name, before anything else, so
@@ -148,13 +198,19 @@ function validateAccommodation(value) {
   if (Object.hasOwn(value, 'pin')) return { error: fail(400, 'pin_not_accepted') };
   const out = {};
   for (const [key, raw] of Object.entries(value)) {
+    if (!Object.hasOwn(ACCOMMODATION_KEYS, key)) return { error: fail(400, 'unknown_accommodation_field', { field: key }) };
     const kind = ACCOMMODATION_KEYS[key];
-    if (!kind) return { error: fail(400, 'unknown_accommodation_field', { field: key }) };
     if (raw === null || raw === '') continue;
+    const field = `${path}.${key}`;
     let v;
-    if (kind === 'text') v = textValue(raw);
-    else if (kind === 'url') v = typeof raw === 'string' && /^https?:\/\//i.test(raw.trim()) && raw.length <= 2000 ? raw.trim() : undefined;
-    else v = scalarValue(raw);
+    if (kind === 'url') {
+      v = safeLink(raw);
+      if (v === undefined) return { error: fail(400, 'invalid_link', { field, detail: LINK_DETAIL }) };
+    } else {
+      const bad = unsafeTextAt(raw, field, { multiline: MULTILINE_KEYS.has(key) });
+      if (bad) return { error: invalidText(bad) };
+      v = kind === 'text' ? textValue(raw) : scalarValue(raw);
+    }
     if (v === undefined) return { error: fail(400, 'invalid_accommodation', { field: key }) };
     out[key] = v;
   }
@@ -175,7 +231,9 @@ function validateDates(value) {
 // The editable fields of a stop, from a request body. Strict: a key the layer
 // does not know is refused, not ignored — a silently dropped field is the
 // failure this repository keeps paying for.
-function validateStopFields(body, { allowed = STOP_FIELDS, extra = [] } = {}) {
+// `prefix` names where the fields sit in the request (`new_stop.` for a split),
+// so a refusal says which field it was.
+function validateStopFields(body, { allowed = STOP_FIELDS, extra = [], prefix = '' } = {}) {
   if (!isObj(body)) return { error: fail(400, 'invalid_body') };
   for (const key of Object.keys(body)) {
     if (!allowed.includes(key) && !extra.includes(key)) return { error: fail(400, 'unknown_field', { field: key }) };
@@ -187,17 +245,21 @@ function validateStopFields(body, { allowed = STOP_FIELDS, extra = [] } = {}) {
     fields.dates = r.value;
   }
   if (body.accommodation !== undefined) {
-    const r = validateAccommodation(body.accommodation);
+    const r = validateAccommodation(body.accommodation, `${prefix}accommodation`);
     if (r.error) return r;
     fields.accommodation = r.value;
   }
   if (body.title !== undefined) {
+    const bad = unsafeTextAt(body.title, `${prefix}title`);
+    if (bad) return { error: invalidText(bad) };
     const t = textValue(body.title);
     if (t === undefined || (typeof t === 'string' && t.length > 120)) return { error: fail(400, 'invalid_title') };
     fields.title = t;
   }
   for (const [key, max] of [['tabLabel', 40], ['emoji', 16]]) {
     if (body[key] === undefined) continue;
+    const bad = unsafeTextAt(body[key], `${prefix}${key}`);
+    if (bad) return { error: invalidText(bad) };
     if (typeof body[key] !== 'string' || !body[key].trim() || body[key].length > max) return { error: fail(400, `invalid_${key}`) };
     fields[key] = body[key].trim();
   }
@@ -283,6 +345,7 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
     historyFor: db.prepare('SELECT id, phase_id, action, before_state, after_state, actor, note, created_at FROM trip_stop_history WHERE phase_id = ? ORDER BY id ASC'),
     historyRow: db.prepare('SELECT * FROM trip_stop_history WHERE id = ?'),
     reparent: db.prepare('UPDATE trip_stop_overrides SET after_phase_id = ? WHERE after_phase_id = ?'),
+    linkedElsewhere: db.prepare('SELECT phase_id FROM trip_stop_overrides WHERE booking_id = ? AND phase_id <> ? ORDER BY rowid LIMIT 1'),
   };
   const base = () => baseConfig() || {};
   const rowsOf = () => journey()?.activeRows?.() || { days: [], items: [] };
@@ -610,18 +673,19 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
       if (!(dates.start < at && at < dates.end)) return fail(400, 'split_date_not_inside_stop', { stop: dates });
       const ns = isObj(body.new_stop) ? body.new_stop : {};
       const { id: wantedId, ...rest } = ns;
-      const v = validateStopFields(rest, { allowed: ['title', 'tabLabel', 'emoji', 'accommodation'] });
+      const v = validateStopFields(rest, { allowed: ['title', 'tabLabel', 'emoji', 'accommodation'], prefix: 'new_stop.' });
       if (v.error) return v.error;
       if (!v.fields.title) return fail(400, 'new_stop_title_required');
       let newId;
       if (wantedId !== undefined) {
         if (typeof wantedId !== 'string' || !STOP_ID_RE.test(wantedId) || /^open-days/.test(wantedId)) return fail(400, 'invalid_stop_id');
+        if (isReservedStopId(wantedId)) return fail(400, 'invalid_stop_id', { detail: 'a reserved name' });
         if (isPhase(wantedId) || q.override.get(wantedId)) return fail(409, 'stop_id_taken');
         newId = wantedId;
       } else {
         const title = v.fields.title;
         const seed = slugify(typeof title === 'string' ? title : title.en || '') || `${id}-2`;
-        const root = /^open-days/.test(seed) ? `${id}-2` : seed;
+        const root = /^open-days/.test(seed) || isReservedStopId(seed) ? `${id}-2` : seed;
         newId = root;
         for (let n = 2; isPhase(newId) || q.override.get(newId); n++) newId = `${root}-${n}`;
       }
@@ -662,27 +726,43 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
       const bookingId = Number(body.booking_id);
       if (!Number.isInteger(bookingId) || bookingId <= 0 || typeof body.booking_id === 'boolean') return fail(400, 'invalid_booking_id');
       if (body.create_items !== undefined && typeof body.create_items !== 'boolean') return fail(400, 'invalid_create_items');
-      const booking = db.prepare('SELECT id, type, name, date_from, date_to, confirmation, location_url, review_status FROM bookings WHERE id = ?').get(bookingId);
+      const booking = db.prepare('SELECT id, phase, type, name, date_from, date_to, confirmation, location_url, review_status FROM bookings WHERE id = ?').get(bookingId);
       if (!booking) return fail(404, 'booking_not_found');
       // A draft is still in organizer review: it shapes nothing. Nothing of it
       // is echoed back either.
       if ((booking.review_status || 'approved') !== 'approved') return fail(409, 'booking_is_draft');
       if (booking.type !== 'hotel') return fail(400, 'booking_not_hotel');
+      // A booking shapes only its own stop (finding 3): one filed under another
+      // stop, or already linked to one, would otherwise move that stop's
+      // check-in and check-out here. A booking filed under no stop — a
+      // trip-wide bucket, or the computed open days — may be linked anywhere,
+      // once. The same stop again stays idempotent.
+      if (typeof booking.phase === 'string' && booking.phase !== id && isStop(booking.phase)) {
+        return fail(409, 'booking_belongs_to_another_stop', { stop: booking.phase });
+      }
+      const linked = q.linkedElsewhere.get(bookingId, id);
+      if (linked) return fail(409, 'booking_linked_to_another_stop', { stop: linked.phase_id });
       const start = isoDay(booking.date_from);
       const end = isoDay(booking.date_to);
       if (!start || !end || start > end) return fail(400, 'booking_has_no_dates');
       const dates = { start, end };
       const bad = rangeError(dates);
       if (bad) return bad;
+      // From the booking: its name, confirmation and map link. Never its PIN
+      // and never its notes — neither is trip UI data. Each goes through the
+      // same validation a PATCH does: a booking name is typed text too, and a
+      // hostile one is refused here rather than stored (finding 1). A link
+      // that is not one used to be dropped without a word; now it is said.
+      const copied = { type: 'hotel', name: String(booking.name || '').slice(0, MAX_TEXT) };
+      if (booking.confirmation) copied.confirmation = String(booking.confirmation).slice(0, MAX_TEXT);
+      if (typeof booking.location_url === 'string' && booking.location_url.trim()) copied.location_url = booking.location_url;
+      const checked = validateAccommodation(copied);
+      if (checked.error) return { ...checked.error, body: { ...checked.error.body, source: 'booking' } };
+      const accommodation = checked.value;
       if (!revisionMatches(ifMatch)) return stale();
       const uids = { checkin: `booking_${bookingId}_checkin`, checkout: `booking_${bookingId}_checkout` };
       const plan = outsidePlan(id, dates, body.on_outside, { ignore: Object.values(uids) });
       if (plan.error) return plan.error;
-      // From the booking: its name, confirmation and map link. Never its PIN
-      // and never its notes — neither is trip UI data.
-      const accommodation = { type: 'hotel', name: String(booking.name || '').slice(0, MAX_TEXT) };
-      if (booking.confirmation) accommodation.confirmation = String(booking.confirmation).slice(0, MAX_TEXT);
-      if (typeof booking.location_url === 'string' && /^https?:\/\//i.test(booking.location_url)) accommodation.location_url = booking.location_url;
       const createItems = body.create_items !== false;
       return atomically(() => {
         write(id, nextOverride(id, { dates, accommodation }, { booking_id: bookingId }), 'from_booking', actor, `booking ${bookingId}`);
@@ -720,6 +800,11 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
         return fail(409, 'added_stop_has_no_base', { detail: 'an added stop is removed with DELETE' });
       }
       if (!revisionMatches(ifMatch)) return stale();
+      // Back to the config with no override: the stop already IS the config.
+      // Nothing is written — no null->null history row, no new revision
+      // (finding 4) — and the answer is the stop as it stands, like any
+      // idempotent write that finds its work done.
+      if (!target && !existing) return { status: 200, body: { revision: revision(), stop: stopSummary(id), unchanged: true } };
       const newDates = target
         ? (Object.hasOwn(target.fields || {}, 'dates') ? target.fields.dates : phaseDates(basePhase(id)))
         : phaseDates(basePhase(id));
@@ -810,13 +895,15 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
     if (!Number.isInteger(id)) return null;
     const booking = db.prepare("SELECT id, date_from, date_to, COALESCE(review_status, 'approved') AS review_status FROM bookings WHERE id = ?").get(id);
     if (!booking || booking.review_status !== 'approved') return null;
-    const want = { [`booking_${id}_checkin`]: isoDay(booking.date_from), [`booking_${id}_checkout`]: isoDay(booking.date_to) };
-    const items = (rowsOf().items || []).filter(i => Object.hasOwn(want, i.item_uid));
-    if (!items.some(i => want[i.item_uid] && want[i.item_uid] !== i.date)) return null;
+    // A Map, not an object literal: every item uid is looked up in it, and an
+    // object answers `constructor` with a function.
+    const want = new Map([[`booking_${id}_checkin`, isoDay(booking.date_from)], [`booking_${id}_checkout`, isoDay(booking.date_to)]]);
+    const items = (rowsOf().items || []).filter(i => want.has(i.item_uid));
+    if (!items.some(i => want.get(i.item_uid) && want.get(i.item_uid) !== i.date)) return null;
     return atomically(() => applyItinerary(actor, `Booking ${id} dates changed`, rows => {
       const left = [];
       for (const item of rows.items) {
-        const date = want[item.item_uid];
+        const date = want.get(item.item_uid);
         if (!date || item.date === date) continue;
         left.push({ phase_id: item.phase_id, date: item.date });
         item.date = date;

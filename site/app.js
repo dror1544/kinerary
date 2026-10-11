@@ -1227,10 +1227,13 @@ function buildMapPopup(s, lang) {
   const hasConf = s.conf && s.conf !== '–';
   // Enriched stops can arrive without every field; skip a line rather than
   // print "undefined", and only claim "private stay" when there's no hotel at all.
-  const lines = [`<strong style="font-size:1.05em">${s.emoji || '📍'} ${name}</strong>`];
-  if (s.dates) lines.push(`📅 ${s.dates}`);
-  if (s.hotel) lines.push(`🏨 ${s.hotel}`);
-  if (hasConf) lines.push(`✅ ${confLabel}: <code>${s.conf}</code>`);
+  // A stop's name, dates, hotel and confirmation come from /api/config, where a
+  // stop write or a hand-authored config can put any text: escaped, always
+  // (boundary review 2026-10-11 — a popup is innerHTML like any other).
+  const lines = [`<strong style="font-size:1.05em">${esc(s.emoji || '📍')} ${esc(name)}</strong>`];
+  if (s.dates) lines.push(`📅 ${esc(s.dates)}`);
+  if (s.hotel) lines.push(`🏨 ${esc(s.hotel)}`);
+  if (hasConf) lines.push(`✅ ${confLabel}: <code>${esc(s.conf)}</code>`);
   else if (!s.hotel) lines.push(`🏠 ${privateStay}`);
   return `<div dir="${dir}" style="min-width:180px;font-family:'Heebo',sans-serif">${lines.join('<br>')}</div>`;
 }
@@ -1341,7 +1344,7 @@ function initMap() {
 
   MAP_STOPS.forEach((s, i) => {
     const icon = L.divIcon({
-      html: `<div style="background:${s.color};color:#fff;border-radius:50%;width:38px;height:38px;display:flex;align-items:center;justify-content:center;font-size:1.2em;box-shadow:0 4px 12px rgba(0,0,0,.35);border:2px solid #fff">${s.emoji}</div>`,
+      html: `<div style="background:${s.color};color:#fff;border-radius:50%;width:38px;height:38px;display:flex;align-items:center;justify-content:center;font-size:1.2em;box-shadow:0 4px 12px rgba(0,0,0,.35);border:2px solid #fff">${esc(s.emoji)}</div>`,
       iconSize: [38, 38], iconAnchor: [19, 19], className: ''
     });
     const marker = L.marker([s.lat, s.lng], { icon }).addTo(map);
@@ -1391,7 +1394,7 @@ async function loadWx(id) {
         <span class="wt">${Math.round(days.temperature_2m_max[i])}° / ${Math.round(days.temperature_2m_min[i])}°</span>
         <span class="wd">${dayName(t)}<br>${t.slice(5)}</span>
       </div>`).join('');
-    el.innerHTML = `<strong>${loc.name} — ${trWx.wx_forecast.replace('🌤 ', '')} 7 days</strong><div class="wx-days">${daysHtml}</div>`;
+    el.innerHTML = `<strong>${esc(loc.name)} — ${trWx.wx_forecast.replace('🌤 ', '')} 7 days</strong><div class="wx-days">${daysHtml}</div>`;
     el.dataset.loaded = '1';
   } catch (e) {
     el.innerHTML = `<span style="color:var(--urgent)">${trWx.wx_error}</span>`;
@@ -3152,14 +3155,16 @@ function buildPhaseNav(cfg) {
     });
   }
 
-  // 2. Side menu phase links
+  // 2. Side menu phase links. Every stop field is escaped: a stop's title, tab
+  // label and emoji are text an organizer or the companion wrote after the
+  // interview (boundary review 2026-10-11, finding 1), and this is innerHTML.
   const smPhaseLinks = document.getElementById('sm-phase-links');
   if (smPhaseLinks) {
     smPhaseLinks.innerHTML = phases.map(p => {
-      const emoji = p.emoji || '📍';
-      return `<a class="sm-link" data-tab="${p.id}">` +
-        `<span class="lang-he">${emoji} ${p.title?.he || p.tabLabel}</span>` +
-        `<span class="lang-en">${emoji} ${p.title?.en || p.tabLabel}</span></a>`;
+      const emoji = esc(p.emoji || '📍');
+      return `<a class="sm-link" data-tab="${esc(p.id)}">` +
+        `<span class="lang-he">${emoji} ${esc(p.title?.he || p.tabLabel)}</span>` +
+        `<span class="lang-en">${emoji} ${esc(p.title?.en || p.tabLabel)}</span></a>`;
     }).join('');
     smPhaseLinks.querySelectorAll('a[data-tab]').forEach(a => {
       a.addEventListener('click', () => switchTab(a.dataset.tab));
@@ -3174,8 +3179,8 @@ function buildPhaseNav(cfg) {
     sec.className = 'section';
     sec.id = p.id;
     sec.innerHTML = `<div class="sec-body"><div class="sec-inner">` +
-      `<h2 class="section-h2"><span class="lang-he">${p.title?.he || p.tabLabel}</span>` +
-      `<span class="lang-en">${p.title?.en || p.tabLabel}</span></h2>` +
+      `<h2 class="section-h2"><span class="lang-he">${esc(p.title?.he || p.tabLabel)}</span>` +
+      `<span class="lang-en">${esc(p.title?.en || p.tabLabel)}</span></h2>` +
       (p.note ? `<p class="phase-note"><span class="lang-he">${esc(p.note.he ?? p.note)}</span><span class="lang-en">${esc(p.note.en ?? p.note.he ?? p.note)}</span></p>` : '') +
       `<div id="hotel-${p.id}"></div>` +
       `<div id="sched-${p.id}"></div>` +
@@ -3432,9 +3437,9 @@ function renderHomePhases(cfg) {
         ? `${p.dates.start.slice(5).replace('-','/')} — ${p.dates.end.slice(5).replace('-','/')}`
         : '');
     const count = p.participants?.length;
-    return `<div class="phase" data-tab="${p.id}" role="button" tabindex="0">
-      <div class="ph-date">${display}</div>
-      <div class="ph-place">${p.emoji || ''} ${_biSpan(p.title || { he: p.tabLabel, en: p.tabLabel })}</div>
+    return `<div class="phase" data-tab="${esc(p.id)}" role="button" tabindex="0">
+      <div class="ph-date">${esc(display)}</div>
+      <div class="ph-place">${esc(p.emoji || '')} ${_biText(p.title || { he: p.tabLabel, en: p.tabLabel })}</div>
       ${count ? `<div class="ph-people"><span class="lang-he">${count} נפשות</span><span class="lang-en">${count} people</span></div>` : ''}
     </div>`;
   }).join('');
@@ -3465,7 +3470,8 @@ function accommodationAnchors(cfg) {
       type: 'hotel',
       phaseId: p.id,
       name,
-      phaseLabel: `${p.emoji || ''} ${_biSpan(p.title || { he: p.tabLabel, en: p.tabLabel })}`,
+      // HTML (renderHomeOverview puts it in a cell as is), so built escaped.
+      phaseLabel: `${esc(p.emoji || '')} ${_biText(p.title || { he: p.tabLabel, en: p.tabLabel })}`,
       date_from: p.dates?.start || null,
       date_to: p.dates?.end || null,
       confirmation: acc.confirmation || null,
@@ -3496,7 +3502,7 @@ function bookingAnchors(cfg, bookings) {
   return bookings.filter(isAnchorBooking).map(b => {
     const phase = (cfg.phases || []).find(p => p.id === b.phase);
     const phaseLabel = phase
-      ? `${phase.emoji || ''} ${_biSpan(phase.title || { he: phase.tabLabel, en: phase.tabLabel })}`
+      ? `${esc(phase.emoji || '')} ${_biText(phase.title || { he: phase.tabLabel, en: phase.tabLabel })}`
       : esc((PHASE_LABELS[b.phase] || {})[currentLang] || b.phase);
     return { ...b, phaseLabel };
   });
@@ -3580,6 +3586,18 @@ function _biSpan(obj) {
   return `<span class="lang-he">${obj.he || ''}</span><span class="lang-en">${obj.en || ''}</span>`;
 }
 
+// _biSpan() for text that has NOT been escaped yet — a stop's title,
+// accommodation and the like, straight from /api/config. _biSpan() itself
+// stays as it is: several callers hand it markup they already escaped (the
+// plan list), and escaping again there would show "&amp;" on screen.
+// Boundary review 2026-10-11, finding 1: stop text is written after the
+// interview by an organizer or the companion, so it is never markup here.
+function _biText(obj) {
+  if (!obj) return '';
+  if (typeof obj !== 'object') return esc(obj);
+  return `<span class="lang-he">${esc(obj.he || '')}</span><span class="lang-en">${esc(obj.en || '')}</span>`;
+}
+
 function renderStats(cfg) {
   const el = document.getElementById('stat-strip');
   if (!el || !cfg?.stats?.length) return;
@@ -3654,8 +3672,12 @@ function renderPhaseHotelCard(phase) {
   if (!el || !phase.accommodation) return;
   const acc = phase.accommodation;
 
-  const nameHe = _bi(acc.name, 'he');
-  const nameEn = _bi(acc.name, 'en');
+  // Every value below is escaped where it lands, and every link passes
+  // safeUrl() first: the accommodation is text an organizer or the companion
+  // can set after the interview (PATCH /api/stops, from-booking), and this
+  // card is innerHTML (boundary review 2026-10-11, finding 1).
+  const nameHe = esc(_bi(acc.name, 'he'));
+  const nameEn = esc(_bi(acc.name, 'en'));
   const addr = acc.address || '';
   const conf = acc.confirmation;
   const pin = acc.pin;
@@ -3663,32 +3685,35 @@ function renderPhaseHotelCard(phase) {
   const guests = acc.guests;
   const rooms = acc.rooms;
   const phone = acc.phone;
-  const mapsUrl = acc.mapsUrl || acc.maps || (addr ? googleMapsUrl(addr) : null);
-  const wazeUrl = acc.waze;
-  const weatherKey = acc.weatherKey;
+  const mapsUrl = safeUrl(acc.mapsUrl || acc.maps || (addr ? googleMapsUrl(addr) : null));
+  const wazeUrl = safeUrl(acc.waze);
+  // The weather key lands inside an inline onclick — a JS string in an
+  // attribute, where esc() is not enough (&#39; is decoded back to ' before
+  // the handler runs). Only a plain token gets the button.
+  const weatherKey = /^[A-Za-z0-9_-]+$/.test(String(acc.weatherKey ?? '')) ? acc.weatherKey : null;
   const pdfFile = acc.pdf;
 
   let metaHtml = '';
-  if (acc.dates) metaHtml += `<span class="tag">📅 ${_biSpan(acc.dates)}</span>`;
-  if (guests) metaHtml += `<span class="tag">👥 <span class="lang-he">${guests} אורחים</span><span class="lang-en">${guests} guests</span></span>`;
-  if (rooms) metaHtml += `<span class="tag">🛏️ <span class="lang-he">${rooms} חדרים</span><span class="lang-en">${rooms} rooms</span></span>`;
-  if (conf && pin) metaHtml += `<span class="tag g">✅ <span class="lang-he">אישור: </span><span class="lang-en">Conf: </span><strong>${conf}</strong> · PIN: <strong>${pin}</strong></span>`;
-  else if (conf) metaHtml += `<span class="tag g">✅ <span class="lang-he">אישור: </span><span class="lang-en">Conf: </span><strong>${conf}</strong></span>`;
-  if (cost) metaHtml += `<span class="tag">💰 $${cost.toLocaleString()}</span>`;
+  if (acc.dates) metaHtml += `<span class="tag">📅 ${_biText(acc.dates)}</span>`;
+  if (guests) metaHtml += `<span class="tag">👥 <span class="lang-he">${esc(guests)} אורחים</span><span class="lang-en">${esc(guests)} guests</span></span>`;
+  if (rooms) metaHtml += `<span class="tag">🛏️ <span class="lang-he">${esc(rooms)} חדרים</span><span class="lang-en">${esc(rooms)} rooms</span></span>`;
+  if (conf && pin) metaHtml += `<span class="tag g">✅ <span class="lang-he">אישור: </span><span class="lang-en">Conf: </span><strong>${esc(conf)}</strong> · PIN: <strong>${esc(pin)}</strong></span>`;
+  else if (conf) metaHtml += `<span class="tag g">✅ <span class="lang-he">אישור: </span><span class="lang-en">Conf: </span><strong>${esc(conf)}</strong></span>`;
+  if (cost) metaHtml += `<span class="tag">💰 $${esc(cost.toLocaleString())}</span>`;
   (acc.notes || []).forEach(n => {
     const cls = n.style === 'warn' ? 'r' : (n.style === 'alert' ? 'r' : '');
-    metaHtml += `<span class="tag${cls ? ' '+cls : ''}">${_biSpan(n.text)}</span>`;
+    metaHtml += `<span class="tag${cls ? ' '+cls : ''}">${_biText(n.text)}</span>`;
   });
 
   const pdfUrls = bkConfUrls(pdfFile);
   const pdfHtml = pdfUrls ? `<span class="conf-pdf-pair"><a class="conf-pdf" href="#" data-authed-document="${bkEsc(pdfUrls.view)}" data-document-action="view" title="View">👁</a><a class="conf-pdf" href="#" data-authed-document="${bkEsc(pdfUrls.download)}" data-document-action="download" data-document-filename="${bkEsc(pdfFile)}" title="Download">⬇</a></span>` : '';
-  const navHtml = (mapsUrl || wazeUrl || weatherKey) ? `<div class="loc-nav-row" style="margin-top:10px">${mapsUrl ? `<a class="btn" href="${mapsUrl}" target="_blank">🗺️ Google Maps</a>` : ''}${wazeUrl ? `<a class="btn" href="${wazeUrl}" target="_blank">🔵 Waze</a>` : ''}${weatherKey ? `<button class="btn" type="button" onclick="loadWx('${weatherKey}')">🌤️ תחזית</button>` : ''}</div>${weatherKey ? `<div id="wx-${weatherKey}" class="wx-panel" style="display:none"></div>` : ''}` : '';
-  const descHtml = acc.description ? `<p>${_biSpan(acc.description)}</p>` : '';
+  const navHtml = (mapsUrl || wazeUrl || weatherKey) ? `<div class="loc-nav-row" style="margin-top:10px">${mapsUrl ? `<a class="btn" href="${esc(mapsUrl)}" target="_blank">🗺️ Google Maps</a>` : ''}${wazeUrl ? `<a class="btn" href="${esc(wazeUrl)}" target="_blank">🔵 Waze</a>` : ''}${weatherKey ? `<button class="btn" type="button" onclick="loadWx('${weatherKey}')">🌤️ תחזית</button>` : ''}</div>${weatherKey ? `<div id="wx-${weatherKey}" class="wx-panel" style="display:none"></div>` : ''}` : '';
+  const descHtml = acc.description ? `<p>${_biText(acc.description)}</p>` : '';
   const icon = acc.type === 'private' ? '🏠' : '🏨';
 
   el.innerHTML = `<div class="hotel-card">
     <h4>${icon} <span class="lang-he">${nameHe}</span><span class="lang-en">${nameEn}</span></h4>
-    ${addr ? `<p>${addr}${phone ? ` · <a class="inline" href="tel:${phone}">${phone}</a>` : ''}</p>` : ''}
+    ${addr ? `<p>${esc(addr)}${phone ? ` · <a class="inline" href="tel:${esc(phone)}">${esc(phone)}</a>` : ''}</p>` : ''}
     ${descHtml}
     <div class="hotel-meta">${metaHtml}${pdfHtml}</div>
     ${navHtml}
@@ -3707,7 +3732,7 @@ function renderPhotoUploads(cfg) {
       ? `${p.dates.start.slice(5).replace('-','/')}–${p.dates.end.slice(5).replace('-','/')}`
       : '';
     return `<div class="mini">
-      <h4>${p.emoji || ''} ${_biSpan(p.title || { he: phaseLabel, en: phaseLabel })}${dateRange ? ` (${dateRange})` : ''}</h4>
+      <h4>${esc(p.emoji || '')} ${_biText(p.title || { he: phaseLabel, en: phaseLabel })}${dateRange ? ` (${esc(dateRange)})` : ''}</h4>
       <label class="photo-upload-area" data-phase="${pid}">
         <input type="file" multiple accept="image/*" onchange="uploadPhotos('${pid}',this)"/>
         <div class="icon ltr">+</div>

@@ -299,7 +299,8 @@ describe('validation', () => {
     ['a PIN is never accepted', { accommodation: { name: 'H', pin: '1234' } }, 400, 'pin_not_accepted'],
     ['an unknown accommodation field is refused, not dropped', { accommodation: { name: 'H', door_code: 'x' } }, 400, 'unknown_accommodation_field'],
     ['an unknown body field is refused', { colour: 'red' }, 400, 'unknown_field'],
-    ['a non-http link is refused', { accommodation: { name: 'H', location_url: 'javascript:alert(1)' } }, 400, 'invalid_accommodation'],
+    // invalid_link since the 2026-10-11 boundary review (tests/stop-hardening.test.js has the rest).
+    ['a non-http link is refused', { accommodation: { name: 'H', location_url: 'javascript:alert(1)' } }, 400, 'invalid_link'],
     ['reversed dates are refused', { dates: { start: '2026-12-05', end: '2026-12-03' } }, 400, 'invalid_dates'],
     ['dates outside the trip are refused (decision 4)', { dates: { start: '2026-12-01', end: '2026-12-03' } }, 400, 'dates_outside_trip'],
     ['an empty body is refused', {}, 400, 'no_fields'],
