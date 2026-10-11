@@ -155,3 +155,167 @@ describe('Classic functions outside the render region escape stop text too', () 
     assert.ok(el.textContent.includes(XSS));
   });
 });
+
+// ── A " or ' in stop text (owner decision 2026-10-11) ──────────────────────
+// The write stores a `"` and a `'` exactly as typed (ארה"ב, ת"א, 55" TV): only
+// `<`, `>` and control characters are refused. So every Classic sink that puts
+// stop text in HTML has to keep a quote inside its attribute. These are the
+// values that would leave one if a sink did not escape quotes, run through
+// every sink above PLUS each attribute sink a stop field reaches:
+//   - renderPhaseHotelCard: href="tel:<phone>"; href="<Maps>" built from the
+//     address (googleMapsUrl, encodeURIComponent then esc); href="<Waze>";
+//   - renderHomeOverview → bookingRefBadges: the 📍 href built from the
+//     accommodation's address, and the confirmation badge.
+// No other attribute carries stop text: data-tab / id / data-phase hold the
+// stop id (STOP_ID_RE: lowercase letters, digits, dashes), the only inline
+// handlers (loadWx, uploadPhotos) take a weather key that must match
+// /^[A-Za-z0-9_-]+$/ and a short id no stop write can set, and the countdown's
+// aria-label/title are translation strings.
+const QUOTED = [
+  'x" onmouseover="alert(1)',
+  "' autofocus onfocus='alert(1)",
+  'ת"א onmouseover=alert(1)',
+  'ארה"ב',
+  `"' onload="alert(1)" '`,
+];
+
+// Nothing came out of the planted text: no element, no handler, no autofocus,
+// no attribute whose NAME is a fragment of the value.
+function assertQuoteInert(root, { allowHandlers = [] } = {}) {
+  assert.equal(root.querySelectorAll('img, svg, script, iframe, b, u').length, 0, root.innerHTML);
+  for (const el of root.querySelectorAll('*')) {
+    for (const attr of el.getAttributeNames()) {
+      assert.ok(!/^on/i.test(attr) || allowHandlers.includes(attr), `${el.tagName} carries ${attr}: ${el.outerHTML}`);
+      assert.ok(!/autofocus|alert|["'=()]/i.test(attr), `${el.tagName} grew an attribute named ${attr}: ${el.outerHTML}`);
+    }
+  }
+  for (const a of root.querySelectorAll('a[href]')) assert.match(a.getAttribute('href'), /^(https?:|tel:|#)/, a.outerHTML);
+}
+
+const quotedPhase = (v) => ({
+  id: 'colmar',
+  title: { he: v, en: v },
+  tabLabel: v,
+  emoji: v,
+  dates: { start: '2026-12-02', end: '2026-12-07' },
+  accommodation: {
+    type: 'hotel', name: { he: v, en: v }, address: v, phone: v, confirmation: v, cost: v, guests: v, rooms: v,
+    dates: { he: v, en: v }, description: { he: v, en: v }, waze: 'https://waze.com/ul?ll=1,2&navigate=yes',
+  },
+});
+const mapsFor = (v) => `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(v)}`;
+
+describe('the escapers every stop sink uses turn both quotes into entities', () => {
+  const { ctx } = sandbox(['esc', 'escapeHtml', 'bkEsc']);
+  for (const name of ['esc', 'escapeHtml', 'bkEsc']) {
+    test(name, () => {
+      assert.equal(ctx[name](`a&b<c>d"e'f`), 'a&amp;b&lt;c&gt;d&quot;e&#39;f');
+      assert.equal(ctx[name]('ת"א'), 'ת&quot;א');
+    });
+  }
+});
+
+describe('Classic: a stored " or \' in stop text stays text — element text and attributes', () => {
+  for (const v of QUOTED) {
+    test(`renderPhaseHotelCard: ${JSON.stringify(v)} in name, address, phone (tel: href), Maps href, confirmation, dates, description`, () => {
+      const phase = quotedPhase(v);
+      const { document, ctx } = createRenderContext('<div id="hotel-colmar"></div>', { phases: [phase] }, 'en', RENDER_EXTRAS);
+      ctx.renderPhaseHotelCard(phase);
+      const el = document.getElementById('hotel-colmar');
+      assertQuoteInert(el);
+      assert.equal(el.querySelector('h4 .lang-he').textContent, v);
+      assert.equal(el.querySelector('h4 .lang-en').textContent, v);
+      assert.equal(el.querySelector('a[href^="tel:"]').getAttribute('href'), `tel:${v}`, 'the phone stays inside its href');
+      assert.equal(el.querySelector('a[href^="tel:"]').textContent, v);
+      assert.equal(el.querySelector('a[href^="https://www.google.com/maps"]').getAttribute('href'), mapsFor(v), 'the address stays inside the Maps href');
+      assert.equal(el.querySelector('a[href^="https://waze"]').getAttribute('href'), 'https://waze.com/ul?ll=1,2&navigate=yes', 'a clean link is unchanged');
+      assert.equal(el.querySelector('.tag.g strong').textContent, v, 'the confirmation');
+      assert.ok(el.querySelector('.hotel-card > p').textContent.startsWith(v), 'the address line');
+      assert.equal(el.querySelector('.hotel-card > p + p .lang-en').textContent, v, 'the description');
+      assert.equal(el.querySelectorAll('.tag')[0].querySelector('.lang-en').textContent, v, 'the accommodation dates');
+    });
+
+    test(`renderHomePhases, renderPhotoUploads, overview labels and renderHomeOverview: ${JSON.stringify(v)}`, () => {
+      const phase = quotedPhase(v);
+      const cfg = { phases: [phase] };
+      const html = '<div id="home-phases"></div><div id="photo-uploads"></div><div id="labels"></div><div id="home-overview"></div>';
+      const { document, ctx } = createRenderContext(html, cfg, 'en', { ...RENDER_EXTRAS, TYPE_ICONS: { hotel: 'H' } });
+      // The real badge builder and its escapers, not RENDER_EXTRAS' stand-ins.
+      vm.runInContext(['bkEsc', 'bkSafeUrl', 'bkConfUrls', 'bookingRefBadges'].map(extractFunction).join('\n'), ctx);
+      ctx.renderHomePhases(cfg);
+      ctx.renderPhotoUploads(cfg);
+      document.getElementById('labels').innerHTML = ctx.accommodationAnchors(cfg).map(a => a.phaseLabel).join('|');
+      const booking = { type: 'hotel', name: v, phase: 'colmar', date_from: '2026-12-02', confirmation: v, location_url: 'https://maps.example/b' };
+      ctx.renderHomeOverview(cfg, [...ctx.accommodationAnchors(cfg), ...ctx.bookingAnchors(cfg, [booking])]);
+      assertQuoteInert(document.body, { allowHandlers: ['onchange'] });
+      assert.equal(document.querySelector('#home-phases .ph-place .lang-en').textContent, v);
+      assert.ok(document.querySelector('#home-phases .ph-place').firstChild.textContent.trim().startsWith(v), 'the emoji');
+      assert.equal(document.querySelector('#photo-uploads h4 .lang-he').textContent, v);
+      assert.equal(document.getElementById('labels').querySelector('.lang-en').textContent, v);
+      const overview = document.getElementById('home-overview');
+      const rows = overview.querySelectorAll('tr');
+      assert.equal(rows.length, 3, 'header + the stop\'s own hotel + the booking');
+      for (const row of [rows[1], rows[2]]) {
+        assert.ok(row.children[1].textContent.endsWith(v), 'the hotel name');
+        assert.equal(row.children[2].querySelector('.lang-en').textContent, v, 'the stop label');
+        assert.equal(row.querySelector('.conf').textContent, v, 'the confirmation badge');
+      }
+      assert.deepEqual([...overview.querySelectorAll('a[href]')].map(a => a.getAttribute('href')).sort(), [mapsFor(v), 'https://maps.example/b'].sort(),
+        'the 📍 hrefs: the address stays inside its href; a clean link is unchanged');
+    });
+
+    test(`buildPhaseNav: ${JSON.stringify(v)} in the tab, the side menu and the section heading`, () => {
+      const html = '<nav class="topnav"><a data-tab="mapview">MAP</a></nav><div id="sm-phase-links"></div><section id="bookings"></section>';
+      const { ctx, document } = sandbox(['buildPhaseNav', 'esc'], { switchTab: () => {} }, html);
+      ctx.buildPhaseNav({ phases: [quotedPhase(v)] });
+      assertQuoteInert(document.body);
+      assert.equal(document.querySelector('.topnav a[data-tab="colmar"]').textContent, v);
+      assert.equal(document.querySelector('#sm-phase-links .lang-he').textContent, `${v} ${v}`);
+      assert.equal(document.querySelector('#sm-phase-links a').getAttribute('data-tab'), 'colmar');
+      assert.equal(document.querySelector('#colmar h2 .lang-en').textContent, v);
+    });
+
+    test(`buildMapPopup and the map marker: ${JSON.stringify(v)}`, () => {
+      const stop = { lat: 48, lng: 7, emoji: v, name_he: v, name_en: v, dates: v, hotel: v, conf: v, color: '#0a0f1c' };
+      const icons = [];
+      const popups = [];
+      const L = {
+        map: () => ({ setView() { return this; } }),
+        tileLayer: () => ({ addTo() { return this; } }),
+        polyline: () => ({ addTo() { return this; } }),
+        divIcon: (o) => { icons.push(o.html); return o; },
+        marker: () => ({ addTo() { return this; }, bindPopup(h) { popups.push(h); return this; } }),
+      };
+      const { ctx, document } = sandbox(['initMap', 'buildMapPopup', 'esc'], { L, MAP_STOPS: [stop], mapMarkers: [], currentLang: 'he' });
+      ctx.initMap();
+      for (const html of [icons[0], popups[0], ctx.buildMapPopup(stop, 'en')]) {
+        const div = document.createElement('div');
+        div.innerHTML = html;
+        assertQuoteInert(div);
+        assert.ok(div.textContent.includes(v), div.innerHTML);
+      }
+      const div = document.createElement('div');
+      div.innerHTML = popups[0];
+      assert.equal(div.querySelector('code').textContent, v, 'the confirmation');
+    });
+
+    test(`loadWx and the trip clock: ${JSON.stringify(v)} as the stop's name`, async () => {
+      const T = { en: { wx_loading: '…', wx_forecast: 'Forecast', wx_error: 'error', cd_open_phase: 'Open' } };
+      const daily = { time: ['2026-12-02'], weathercode: [0], temperature_2m_max: [5], temperature_2m_min: [1] };
+      const { ctx, document } = sandbox(['loadWx', 'esc', 'tick', 'setClockTarget'], {
+        T, currentLang: 'en', WX_LOCS: { k: { name: v, lat: 1, lng: 2 } },
+        fetch: async () => ({ json: async () => ({ daily }) }), wxIcon: () => '☀', dayName: () => 'Wed',
+        tripClockState: () => ({ state: 'during', phase: quotedPhase(v), day: 1, totalDays: 6 }),
+      }, '<div id="wx-k" style="display:none"></div><div id="hero-countdown"><span id="cd-live-phase"></span></div>');
+      await ctx.loadWx('k');
+      const wx = document.getElementById('wx-k');
+      assertQuoteInert(wx);
+      assert.ok(wx.querySelector('strong').textContent.startsWith(`${v} — `), wx.innerHTML);
+      ctx.window.TRIP_CONFIG = {};
+      ctx.tick();
+      assert.equal(document.getElementById('cd-live-phase').textContent, `${v} ${v}`);
+      assertQuoteInert(document.getElementById('hero-countdown'));
+      assert.equal(document.getElementById('hero-countdown').getAttribute('data-phase-tab'), 'colmar');
+    });
+  }
+});

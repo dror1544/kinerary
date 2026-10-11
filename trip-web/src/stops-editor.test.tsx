@@ -11,7 +11,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import App from "./App";
 import { PlanTools } from "./plan-tools";
-import { hebrewGershayim, StopsEditor } from "./stops-editor";
+import { StopsEditor } from "./stops-editor";
 import { tokenStore } from "./api";
 import type { StopsPayload } from "./stops";
 
@@ -248,31 +248,11 @@ describe("editing a stop", () => {
   });
 });
 
-describe("Hebrew abbreviations typed with an ASCII quote (second boundary review, 2026-10-11)", () => {
-  // The server refuses every ASCII " in stop text and is not relaxed for
-  // Hebrew; the editor rewrites a " between two Hebrew letters to ״ (U+05F4)
-  // before sending, and only that.
-  const G = "״";
-  it.each([
-    ['ארה"ב', `ארה${G}ב`],
-    ['ת"א', `ת${G}א`],
-    ['חו"ל', `חו${G}ל`],
-    ['בע"מ', `בע${G}מ`],
-    ['ראשל"צ', `ראשל${G}צ`],
-    ['טיסה לארה"ב דרך חו"ל', `טיסה לארה${G}ב דרך חו${G}ל`],
-    ['א"ב"ג', `א${G}ב${G}ג`],
-    ['55" TV', '55" TV'],
-    ['say "hi"', 'say "hi"'],
-    ['ת"a', 'ת"a'],
-    ['a"ת', 'a"ת'],
-    ['"תל אביב"', '"תל אביב"'],
-    ['ת" א', 'ת" א'],
-    ['ת"א onmouseover=alert(1)', `ת${G}א onmouseover=alert(1)`],
-  ])("hebrewGershayim(%j) is %j", (input, want) => {
-    expect(hebrewGershayim(input)).toBe(want);
-  });
-
-  it("the edit form sends the title and every accommodation text field rewritten; any other quote as typed", async () => {
+describe("text with an ASCII quote is sent and shown exactly as typed (owner decision, 2026-10-11)", () => {
+  // ארה"ב, ת"א, בע"מ and 55" TV are ordinary text. The server stores a " as
+  // typed (it refuses only < > and control characters), so the editor sends
+  // it as typed — no rewriting to ״ — and React renders it as text.
+  it("the edit form sends the title and every accommodation text field as typed", async () => {
     const server = stubServer({
       "GET /api/stops": [() => json(stopsPayload())],
       "PATCH /api/stops/colmar": [() => json({ revision: "st-4", stop: colmar.stop })],
@@ -287,12 +267,13 @@ describe("Hebrew abbreviations typed with an ASCII quote (second boundary review
     fireEvent.click(screen.getByRole("button", { name: "Save stop" }));
     await waitFor(() => expect(server.writes()).toHaveLength(1));
     expect(server.writes()[0].body).toEqual({
-      title: { he: `קולמר וחו${G}ל`, en: "Colmar" },
-      accommodation: { name: `מלון ת${G}א`, address: `רח׳ הרצל 1, ראשל${G}צ`, confirmation: 'AB"12', location_url: "https://maps.example/colmar" },
+      title: { he: 'קולמר וחו"ל', en: "Colmar" },
+      accommodation: { name: 'מלון ת"א', address: 'רח׳ הרצל 1, ראשל"צ', confirmation: 'AB"12', location_url: "https://maps.example/colmar" },
     });
+    expect(JSON.stringify(server.writes()[0].body)).not.toContain("\u05F4");
   });
 
-  it("an unchanged field is not sent just because it would be rewritten", async () => {
+  it("an unchanged quoted field is not sent", async () => {
     const quoted = { ...colmar, stop: { ...colmar.stop, title: { he: 'ארה"ב', en: "USA" } } };
     const server = stubServer({
       "GET /api/stops": [() => json(stopsPayload({ stops: [quoted] }))],
@@ -300,13 +281,14 @@ describe("Hebrew abbreviations typed with an ASCII quote (second boundary review
     });
     renderEditor();
     fireEvent.click(await screen.findByRole("button", { name: "Edit USA" }));
+    expect(screen.getByLabelText("Hebrew title")).toHaveValue('ארה"ב');
     fireEvent.change(screen.getByLabelText("Last day"), { target: { value: "2026-12-05" } });
     fireEvent.click(screen.getByRole("button", { name: "Save stop" }));
     await waitFor(() => expect(server.writes()).toHaveLength(1));
     expect(server.writes()[0].body).toEqual({ dates: { start: "2026-12-02", end: "2026-12-05" } });
   });
 
-  it("the split form sends the new stop's title rewritten", async () => {
+  it("the split form sends the new stop's title as typed", async () => {
     const server = stubServer({
       "GET /api/stops": [() => json(stopsPayload())],
       "POST /api/stops/colmar/split": [() => json({ revision: "st-5", stops: [], moved: { items: [], days: [] } }, 201)],
@@ -318,7 +300,62 @@ describe("Hebrew abbreviations typed with an ASCII quote (second boundary review
     fireEvent.change(screen.getByLabelText("New stop title (English)"), { target: { value: 'Near "the" airport' } });
     fireEvent.click(screen.getByRole("button", { name: "Split the stop" }));
     await waitFor(() => expect(server.writes()).toHaveLength(1));
-    expect(server.writes()[0].body).toEqual({ at: "2026-12-05", new_stop: { title: { he: `ליד נתב${G}ג`, en: 'Near "the" airport' } } });
+    expect(server.writes()[0].body).toEqual({ at: "2026-12-05", new_stop: { title: { he: 'ליד נתב"ג', en: 'Near "the" airport' } } });
+  });
+
+  // No element and no handler came out of a stored quote: React sets text and
+  // attributes through the DOM, never by building markup.
+  function assertInert(root: HTMLElement) {
+    expect(root.querySelectorAll("img[src='x'], svg[onload], script").length).toBe(0);
+    for (const el of Array.from(root.querySelectorAll("*"))) {
+      for (const attr of el.getAttributeNames()) {
+        expect(/^on/i.test(attr) || attr === "autofocus" || /["']/.test(attr), `${el.tagName} carries ${attr}`).toBe(false);
+      }
+    }
+  }
+  const HOSTILE_EN = 'x" onmouseover="alert(1)';
+  const HOSTILE_HE = 'ת"א onmouseover=alert(1)';
+  const HOSTILE_SINGLE = "' autofocus onfocus='alert(1)";
+
+  it("the stop list shows a quoted title and hotel name as text, with nothing live in them", async () => {
+    const hostile = { ...colmar, stop: { ...colmar.stop, title: { he: HOSTILE_HE, en: HOSTILE_EN }, accommodation: { name: HOSTILE_SINGLE, address: 'רח׳ הרצל 1, ת"א' } } };
+    stubServer({ "GET /api/stops": [() => json(stopsPayload({ stops: [hostile] }))] });
+    renderEditor();
+    const row = await screen.findByRole("article", { name: HOSTILE_EN });
+    expect(row).toHaveTextContent(HOSTILE_SINGLE);
+    expect(within(row).getByRole("button", { name: `Edit ${HOSTILE_EN}` })).toBeInTheDocument();
+    assertInert(document.body);
+  });
+
+  it("the member's site (Modern map list) renders quoted stop text from /api/config as text, attributes included", async () => {
+    stubServer({
+      "GET /api/auth/me": [() => json({ username: "bob", is_organizer: false })],
+      "GET /api/config": [() => json({ meta: { title: "Alsace", defaultLang: "en" }, phases: [
+        { id: "colmar", title: { he: HOSTILE_HE, en: HOSTILE_EN }, tabLabel: 'ת"א', emoji: '"', dates: { start: "2026-12-02", end: "2026-12-06" },
+          mapStop: { lat: 48.08, lng: 7.36 }, accommodation: { name: { he: 'מלון ת"א', en: HOSTILE_SINGLE }, address: `55" TV St ${HOSTILE_SINGLE}` } },
+      ] })],
+      "GET /api/itinerary/active": [() => json({ revision: "r1", days: [], items: [] })],
+      "GET /api/itinerary/original": [() => json({ revision: "r0", days: [], items: [] })],
+      "GET /api/today": [() => json({ today: "2026-11-01", phase: "pre_trip", countdown_days: 31, current: null, next: null, events: [], flights: [] })],
+      "GET /api/ui-settings": [() => json({ design_variant: "modern", hero: { url: null, focal_x: 50, focal_y: 50 } })],
+      "GET /api/hermes/status": [() => json({ identity: { name: "Kin" }, available: false, ask_in_telegram: false, telegram_username: null, verification_freshness: { open_issues: 0, checked_at: "" } })],
+      "GET /api/events": [() => new Response(null, { status: 204 })],
+      "GET /api/companion/conversation": [() => json({ messages: [] })],
+    });
+    tokenStore.set("member-session");
+    window.location.hash = "#map";
+    render(<QueryClientProvider client={client()}><App /></QueryClientProvider>);
+    // The title in the button's text and in its aria-label attribute; the
+    // hotel name and the address as text; the address inside a Maps href,
+    // percent-encoded — each exactly what was stored.
+    const button = await screen.findByRole("button", { name: `Show ${HOSTILE_EN} on the map` });
+    expect(button).toHaveTextContent(HOSTILE_EN);
+    expect(button.getAttribute("aria-label")).toBe(`Show ${HOSTILE_EN} on the map`);
+    const card = button.closest("article")!;
+    expect(card.querySelector("p")!.textContent).toBe(`${HOSTILE_SINGLE} · 55" TV St ${HOSTILE_SINGLE}`);
+    expect(within(card as HTMLElement).getByRole("link", { name: /Google Maps/ }).getAttribute("href"))
+      .toBe(`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`55" TV St ${HOSTILE_SINGLE}`)}`);
+    assertInert(document.body);
   });
 });
 

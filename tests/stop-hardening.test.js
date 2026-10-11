@@ -85,7 +85,7 @@ describe('finding 1 — stop text carrying markup or control characters is refus
   const cases = [
     ['title (string)', { title: XSS }, 'title'],
     ['title.en', { title: { he: 'קולמר', en: XSS } }, 'title.en'],
-    ['title.he with a quote', { title: { he: 'a"b', en: 'ok' } }, 'title.he'],
+    ['title.he with a <', { title: { he: 'a<b', en: 'ok' } }, 'title.he'],
     ['tabLabel', { tabLabel: '"><svg onload=alert(1)>' }, 'tabLabel'],
     ['emoji', { emoji: '<b>' }, 'emoji'],
     ['title with a NUL', { title: 'Col\u0000mar' }, 'title'],
@@ -94,10 +94,10 @@ describe('finding 1 — stop text carrying markup or control characters is refus
     ['accommodation.name', { accommodation: { name: XSS } }, 'accommodation.name'],
     ['accommodation.name.he (nested)', { accommodation: { name: { he: XSS, en: 'Hotel' } } }, 'accommodation.name.he'],
     ['accommodation.name_en', { accommodation: { name: 'Hotel', name_en: '</span><script>alert(1)</script>' } }, 'accommodation.name_en'],
-    ['accommodation.address', { accommodation: { name: 'Hotel', address: '1 Rue "x" onmouseover=alert(1)' } }, 'accommodation.address'],
+    ['accommodation.address', { accommodation: { name: 'Hotel', address: '1 Rue "x"><svg onload=alert(1)>' } }, 'accommodation.address'],
     ['accommodation.phone', { accommodation: { name: 'Hotel', phone: '"><img src=x onerror=alert(1)>' } }, 'accommodation.phone'],
     ['accommodation.confirmation', { accommodation: { name: 'Hotel', confirmation: '<i>X</i>' } }, 'accommodation.confirmation'],
-    ['accommodation.type', { accommodation: { name: 'Hotel', type: 'hotel"' } }, 'accommodation.type'],
+    ['accommodation.type', { accommodation: { name: 'Hotel', type: 'hotel>' } }, 'accommodation.type'],
     ['accommodation.cost', { accommodation: { name: 'Hotel', cost: '<b>100</b>' } }, 'accommodation.cost'],
     ['accommodation.guests', { accommodation: { name: 'Hotel', guests: '4>' } }, 'accommodation.guests'],
     ['accommodation.rooms', { accommodation: { name: 'Hotel', rooms: '<2' } }, 'accommodation.rooms'],
@@ -112,7 +112,10 @@ describe('finding 1 — stop text carrying markup or control characters is refus
       assert.equal(r.status, 400, JSON.stringify(r.body));
       assert.equal(r.body.error, 'invalid_text');
       assert.equal(r.body.field, field);
-      assert.match(r.body.detail, /< > "/);
+      assert.match(r.body.detail, /< >/);
+      // A `"` is no longer refused (owner decision 2026-10-11), so the
+      // refusal does not name it, nor point at a gershayim rewrite.
+      assert.doesNotMatch(r.body.detail, /"|U\+05F4|\u05F4/);
       assert.deepEqual(counts(), NOTHING);
     });
   }
@@ -153,6 +156,36 @@ describe('finding 1 — stop text carrying markup or control characters is refus
     const colmar = effectiveConfig().phases.find(p => p.id === 'colmar');
     assert.deepEqual(colmar.accommodation, acc);
     assert.equal(colmar.title.en, "Colmar & Riquewihr's");
+  });
+
+  // Owner decision 2026-10-11: Hebrew typed with an ASCII `"` (ארה"ב, ת"א,
+  // בע"מ) and `55" TV` are stored exactly as typed — never refused, never
+  // rewritten. A quote alone opens no element; every renderer escapes it
+  // (tests/stop-xss-render.test.js proves the Classic sinks, attributes too).
+  test('a " in any free-text field is accepted and stored exactly as typed', () => {
+    const { structure } = make();
+    const acc = {
+      name: { he: 'מלון ת"א', en: 'Hotel "TLV"' }, name_en: 'x" onmouseover="alert(1)', address: '1 Rue "x" onmouseover=alert(1)',
+      phone: '+972 "3"', confirmation: 'אב"ג-778', type: 'hotel"', cost: '55" TV', guests: '4"', rooms: '"2"',
+      dates: { he: 'ב"ה', en: '"2–7 Dec"' }, description: 'קרוב לבע"מ\n55" TV', note: "' autofocus onfocus='alert(1)",
+    };
+    const body = { title: { he: 'ארה"ב', en: 'say "hi"' }, tabLabel: 'ת"א', emoji: '"', accommodation: acc };
+    const r = structure.ops.update('colmar', body, 'alice');
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    const colmar = structure.effectiveConfig().phases.find(p => p.id === 'colmar');
+    assert.deepEqual(colmar.title, body.title);
+    assert.equal(colmar.tabLabel, 'ת"א');
+    assert.equal(colmar.emoji, '"');
+    assert.deepEqual(colmar.accommodation, acc);
+  });
+
+  test('split: a new stop titled ארה"ב is created with the title as typed', () => {
+    const { structure } = make();
+    const r = structure.ops.split('colmar', { at: '2026-12-05', new_stop: { title: { he: 'ארה"ב', en: 'USA' }, accommodation: { name: 'מלון ת"א' } } }, 'alice');
+    assert.equal(r.status, 201, JSON.stringify(r.body));
+    const created = structure.effectiveConfig().phases.find(p => p.id === r.body.stops[1].id);
+    assert.deepEqual(created.title, { he: 'ארה"ב', en: 'USA' });
+    assert.equal(created.accommodation.name, 'מלון ת"א');
   });
 
   test('split: a hostile new stop title or link is refused under new_stop.*, and nothing is split', () => {

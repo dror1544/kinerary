@@ -12,13 +12,14 @@
  *     filed under an unrelated stop, or already linked to another stop, is still
  *     refused — and the parent's own check-in/check-out items are not touched.
  *
- * (B) GERSHAYIM. The write refuses `"` (defence in depth: it is what it takes to
- *     leave an attribute), which also refused ordinary Hebrew typed with an
- *     ASCII quote: ארה"ב, ת"א, חו"ל. The server is NOT relaxed — "a Hebrew
- *     letter on both sides" is bypassable (`ת"א onmouseover=alert(1)` is still a
- *     quote inside an attribute). The clients rewrite such a `"` to ״ (U+05F4)
- *     before sending; from-booking, whose text comes from a stored booking and
- *     not from a client, applies the same rewrite to that text only.
+ * (B) A QUOTE IS TEXT (owner decision, 2026-10-11). The write used to refuse
+ *     `"` (defence in depth: it is what it takes to leave an attribute), which
+ *     also refused ordinary Hebrew typed with an ASCII quote: ארה"ב, ת"א, בע"מ,
+ *     and `55" TV`. A follow-up rewrote such a `"` to ״ in the clients; the
+ *     owner rejected both — text is stored exactly as typed. `<`, `>` and
+ *     control characters are still refused, and links still refuse quotes.
+ *     That a stored `"` cannot leave an attribute is the renderers' job, and
+ *     tests/stop-xss-render.test.js proves it sink by sink.
  *
  * Unit tests on createTripStructure (no HTTP), then the same flow over HTTP on
  * a real trip server.
@@ -37,10 +38,9 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, '..');
 const require = createRequire(import.meta.url);
 const Database = require('../server/node_modules/better-sqlite3');
-const { createTripStructure, hebrewGershayim } = require('../server/trip-structure.js');
+const { createTripStructure } = require('../server/trip-structure.js');
 
 const clone = (v) => JSON.parse(JSON.stringify(v));
-const GERSHAYIM = '״';
 
 function colmarConfig() {
   return {
@@ -242,79 +242,99 @@ describe('(A) a booking filed under the stop a new stop was split from links to 
   });
 });
 
-// ── (B) gershayim ───────────────────────────────────────────────────────────
-describe('(B) hebrewGershayim — an ASCII " between two Hebrew letters, and only there, becomes ״', () => {
-  const cases = [
-    ['ארה"ב', `ארה${GERSHAYIM}ב`],
-    ['ת"א', `ת${GERSHAYIM}א`],
-    ['חו"ל', `חו${GERSHAYIM}ל`],
-    ['בע"מ', `בע${GERSHAYIM}מ`],
-    ['ראשל"צ', `ראשל${GERSHAYIM}צ`],
-    ['טיסה לארה"ב דרך חו"ל', `טיסה לארה${GERSHAYIM}ב דרך חו${GERSHAYIM}ל`],      // two
-    ['א"ב"ג', `א${GERSHAYIM}ב${GERSHAYIM}ג`],                                    // adjacent
-    ['55" TV', '55" TV'],                                                           // Latin/digit
-    ['say "hi"', 'say "hi"'],                                                       // Latin-Latin
-    ['a"b', 'a"b'],
-    ['ת"a', 'ת"a'],                                                                 // mixed
-    ['a"ת', 'a"ת'],
-    ['"תל אביב"', '"תל אביב"'],                                                     // quote at the edges
-    ['ת" א', 'ת" א'],                                                               // a space after
-    ['ת""א', 'ת""א'],                                                               // two quotes
-    ['ת״א', 'ת״א'],                                                                 // already gershayim
-    ['ת"א onmouseover=alert(1)', `ת${GERSHAYIM}א onmouseover=alert(1)`],            // inert once rewritten
-    ['x" onmouseover="alert(1)', 'x" onmouseover="alert(1)'],
-  ];
-  for (const [input, want] of cases) {
-    test(JSON.stringify(input), () => assert.equal(hebrewGershayim(input), want));
+// ── (B) a " is stored as typed ──────────────────────────────────────────────
+describe('(B) Hebrew typed with an ASCII " is stored exactly as typed — never refused, never rewritten', () => {
+  for (const [name, body] of [
+    ['ארה"ב in a title', { title: { he: 'ארה"ב', en: 'USA' } }],
+    ['ת"א as a plain string title', { title: 'ת"א' }],
+    ['two abbreviations and a Latin quote', { title: { he: 'טיסה לארה"ב דרך חו"ל', en: 'say "hi"' } }],
+    ['a tab label', { tabLabel: 'ת"א' }],
+    ['an accommodation name, address and confirmation', { accommodation: { name: { he: 'מלון ת"א', en: 'Hotel "TLV"' }, address: 'רח\' הרצל 1, ראשל"צ', confirmation: 'אב"ג-1' } }],
+    ['a multi-line description and a note', { accommodation: { name: 'Hotel', description: { he: 'קרוב לבע"מ\n55" TV', en: '55" TV' }, note: 'חו"ל' } }],
+    ['the reviewer\'s quote-only bypass (inert: the renderers escape it)', { title: { he: 'ת"א onmouseover=alert(1)', en: 'x" onmouseover="alert(1)' } }],
+  ]) {
+    test(`PATCH ${name} → 200, stored and served as typed`, () => {
+      const { structure } = make();
+      const r = structure.ops.update('colmar', body, 'alice');
+      assert.equal(r.status, 200, JSON.stringify(r.body));
+      const colmar = structure.effectiveConfig().phases.find(p => p.id === 'colmar');
+      for (const [k, v] of Object.entries(body)) assert.deepEqual(colmar[k], v, k);
+    });
   }
-  test('non-strings pass through', () => {
-    for (const v of [undefined, null, 4, true]) assert.equal(hebrewGershayim(v), v);
+
+  test('split: a new stop titled ת"א, its hotel מלון ת"א, are stored as typed', () => {
+    const { structure } = make();
+    const newId = splitColmar(structure, '2026-12-05', { title: { he: 'ת"א', en: 'TLV' }, accommodation: { name: 'מלון ת"א' } });
+    const created = structure.effectiveConfig().phases.find(p => p.id === newId);
+    assert.deepEqual(created.title, { he: 'ת"א', en: 'TLV' });
+    assert.equal(created.accommodation.name, 'מלון ת"א');
+  });
+
+  test('the rewriting helper is gone from the module', () => {
+    assert.equal(require('../server/trip-structure.js').hebrewGershayim, undefined);
   });
 });
 
-describe('(B) the server is not relaxed: a " sent directly is refused, Hebrew or not', () => {
+describe('(B) every other protection is unchanged: < > and control characters are refused, quote or no quote', () => {
   for (const [name, body, field] of [
-    ['the reviewer\'s bypass', { title: { he: 'ת"א onmouseover=alert(1)', en: 'Tel Aviv' } }, 'title.he'],
-    ['a plain Hebrew abbreviation', { title: { he: 'ארה"ב', en: 'USA' } }, 'title.he'],
-    ['in an accommodation name', { accommodation: { name: 'מלון ת"א' } }, 'accommodation.name'],
+    ['an element with a Hebrew abbreviation in front', { title: { he: 'ת"א<img src=x onerror=alert(1)>', en: 'x' } }, 'title.he'],
+    ['the classic attribute-then-element break', { tabLabel: '"><svg onload=alert(1)>' }, 'tabLabel'],
+    ['a < in a title', { title: 'Colmar < Strasbourg' }, 'title'],
+    ['a > in a hotel name', { accommodation: { name: 'מלון ת"א >' } }, 'accommodation.name'],
+    ['a control character next to a quote', { title: { he: 'ארה"ב\u0000', en: 'USA' } }, 'title.he'],
+    ['a newline in a one-line field', { tabLabel: 'ת"א\nx' }, 'tabLabel'],
   ]) {
-    test(`PATCH ${name} → 400 invalid_text`, () => {
-      const { structure } = make();
+    test(`PATCH ${name} → 400 invalid_text, with no gershayim hint`, () => {
+      const { structure, db } = make();
       const r = structure.ops.update('colmar', body, 'alice');
       assert.equal(r.status, 400, JSON.stringify(r.body));
       assert.deepEqual([r.body.error, r.body.field], ['invalid_text', field]);
-      assert.match(r.body.detail, /U\+05F4/);
+      assert.equal(r.body.detail, 'text may not contain < > or control characters');
+      assert.equal(db.prepare('SELECT COUNT(*) n FROM trip_stop_overrides').get().n, 0);
     });
   }
-  test('split: the bypass in a new stop title → 400 invalid_text', () => {
+  test('split: an element in a new stop title → 400 invalid_text', () => {
     const { structure } = make();
-    const r = structure.ops.split('colmar', { at: '2026-12-05', new_stop: { title: { he: 'ת"א onmouseover=alert(1)' } } }, 'alice');
+    const r = structure.ops.split('colmar', { at: '2026-12-05', new_stop: { title: { he: '"><svg onload=alert(1)>' } } }, 'alice');
     assert.deepEqual([r.status, r.body.error, r.body.field], [400, 'invalid_text', 'new_stop.title.he']);
   });
-  test('the same text with ״ is accepted', () => {
+  test('a link still refuses a " — links are unchanged', () => {
     const { structure } = make();
-    const r = structure.ops.update('colmar', { title: { he: `ארה${GERSHAYIM}ב`, en: 'USA' } }, 'alice');
-    assert.equal(r.status, 200, JSON.stringify(r.body));
+    const r = structure.ops.update('colmar', { accommodation: { name: 'מלון ת"א', location_url: 'https://maps.example/ת"א' } }, 'alice');
+    assert.deepEqual([r.status, r.body.error, r.body.field], [400, 'invalid_link', 'accommodation.location_url']);
   });
 });
 
-describe('(B) from-booking applies the same rewrite to booking-derived text, and refuses every other "', () => {
-  test('a booking named מלון ת"א links, stored as מלון ת״א; its Hebrew confirmation likewise', () => {
+describe('(B) from-booking copies a booking\'s name and confirmation as typed', () => {
+  test('a booking named מלון ת"א links, stored as מלון ת"א; its Hebrew confirmation likewise', () => {
     const { structure, booking, db } = make();
     const id = booking({ name: 'מלון ת"א', confirmation: 'אב"ג-778' });
     const r = structure.ops.fromBooking('colmar', { booking_id: id }, 'alice');
     assert.equal(r.status, 200, JSON.stringify(r.body));
     const acc = structure.effectiveConfig().phases.find(p => p.id === 'colmar').accommodation;
-    assert.equal(acc.name, `מלון ת${GERSHAYIM}א`);
-    assert.equal(acc.confirmation, `אב${GERSHAYIM}ג-778`);
-    assert.equal(db.prepare('SELECT name FROM bookings WHERE id = ?').get(id).name, 'מלון ת"א', 'the booking itself is not rewritten');
+    assert.equal(acc.name, 'מלון ת"א');
+    assert.equal(acc.confirmation, 'אב"ג-778');
+    assert.equal(db.prepare('SELECT name FROM bookings WHERE id = ?').get(id).name, 'מלון ת"א');
   });
 
+  for (const [name, row, field, want] of [
+    ['55" TV', { name: 'Hotel 55" TV' }, 'name', 'Hotel 55" TV'],
+    ['a Latin attribute break (inert: the renderers escape it)', { name: 'x" onmouseover="alert(1)' }, 'name', 'x" onmouseover="alert(1)'],
+    ['a Latin confirmation with a quote', { confirmation: 'AB"12' }, 'confirmation', 'AB"12'],
+  ]) {
+    test(`${name} → 200, stored as typed`, () => {
+      const { structure, booking } = make();
+      const id = booking(row);
+      const r = structure.ops.fromBooking('colmar', { booking_id: id }, 'alice');
+      assert.equal(r.status, 200, JSON.stringify(r.body));
+      assert.equal(structure.effectiveConfig().phases.find(p => p.id === 'colmar').accommodation[field], want);
+    });
+  }
+
   for (const [name, row, field] of [
-    ['55" TV', { name: 'Hotel 55" TV' }, 'accommodation.name'],
-    ['a quote after the Hebrew abbreviation', { name: 'מלון ת"א" onmouseover=alert(1)' }, 'accommodation.name'],
-    ['a Latin attribute break', { name: 'x" onmouseover="alert(1)' }, 'accommodation.name'],
-    ['a Latin confirmation with a quote', { confirmation: 'AB"12' }, 'accommodation.confirmation'],
+    ['an element after the abbreviation', { name: 'מלון ת"א<img src=x onerror=alert(1)>' }, 'accommodation.name'],
+    ['a > in the confirmation', { confirmation: 'AB">12' }, 'accommodation.confirmation'],
+    ['a control character', { name: 'מלון ת"א\u0007' }, 'accommodation.name'],
   ]) {
     test(`${name} → 400 invalid_text, source booking, nothing written`, () => {
       const { structure, booking, db } = make();
@@ -325,16 +345,6 @@ describe('(B) from-booking applies the same rewrite to booking-derived text, and
       assert.equal(db.prepare('SELECT COUNT(*) n FROM trip_stop_overrides').get().n, 0);
     });
   }
-
-  test('the reviewer\'s bypass as a booking name is inert once rewritten: no " reaches the stop', () => {
-    const { structure, booking } = make();
-    const id = booking({ name: 'ת"א onmouseover=alert(1)' });
-    const r = structure.ops.fromBooking('colmar', { booking_id: id }, 'alice');
-    assert.equal(r.status, 200, JSON.stringify(r.body));
-    const served = JSON.stringify(structure.effectiveConfig());
-    assert.ok(!served.includes('ת"א'), 'no ASCII quote stored');
-    assert.equal(structure.effectiveConfig().phases.find(p => p.id === 'colmar').accommodation.name, `ת${GERSHAYIM}א onmouseover=alert(1)`);
-  });
 });
 
 // ── the same over HTTP, on a real trip server ───────────────────────────────
@@ -460,19 +470,28 @@ describe('over HTTP: split Colmar, then link the airport hotel filed under Colma
       'Colmar\'s hotel check-in/check-out are exactly as they were before the link');
   });
 
-  test('the reviewer\'s bypass, sent directly, is refused: PATCH and split', async () => {
-    const patch = await server.call('/api/stops/colmar', { method: 'PATCH', token: alice, body: { title: { he: 'ת"א onmouseover=alert(1)', en: 'x' } } });
-    assert.deepEqual([patch.status, patch.body.error, patch.body.field], [400, 'invalid_text', 'title.he']);
-    const split = await server.call('/api/stops/colmar/split', { method: 'POST', body: { at: '2026-12-04', new_stop: { title: 'ת"א onmouseover=alert(1)' } } });
-    assert.deepEqual([split.status, split.body.error, split.body.field], [400, 'invalid_text', 'new_stop.title']);
-    assert.ok(!(await server.call('/api/config', { token: alice })).text.includes('onmouseover'));
+  test('PATCH ארה"ב over HTTP → 200, and /api/config serves it as typed', async () => {
+    const patch = await server.call('/api/stops/frankfurt', { method: 'PATCH', token: alice, body: { title: { he: 'ארה"ב', en: 'USA' }, tabLabel: 'ת"א' } });
+    assert.equal(patch.status, 200, patch.text);
+    const cfg = (await server.call('/api/config', { token: alice })).body;
+    const f = cfg.phases.find(p => p.id === 'frankfurt');
+    assert.deepEqual([f.title, f.tabLabel], [{ he: 'ארה"ב', en: 'USA' }, 'ת"א']);
   });
 
-  test('a booking named מלון ת"א links over HTTP, served with ״', async () => {
+  test('an element, sent directly, is still refused: PATCH and split', async () => {
+    const patch = await server.call('/api/stops/colmar', { method: 'PATCH', token: alice, body: { title: { he: 'ת"א <img src=x onerror=alert(1)>', en: 'x' } } });
+    assert.deepEqual([patch.status, patch.body.error, patch.body.field], [400, 'invalid_text', 'title.he']);
+    const split = await server.call('/api/stops/colmar/split', { method: 'POST', body: { at: '2026-12-04', new_stop: { title: '"><svg onload=alert(1)>' } } });
+    assert.deepEqual([split.status, split.body.error, split.body.field], [400, 'invalid_text', 'new_stop.title']);
+    const text = (await server.call('/api/config', { token: alice })).text;
+    for (const needle of ['onerror', '<svg', '<img']) assert.ok(!text.includes(needle), needle);
+  });
+
+  test('a booking named מלון ת"א links over HTTP, served as typed', async () => {
     const id = await addHotel({ phase: 'frankfurt', name: 'מלון ת"א', date_from: '2026-12-02', date_to: '2026-12-03' });
     const r = await server.call('/api/stops/frankfurt/from-booking', { method: 'POST', token: alice, body: { booking_id: id } });
     assert.equal(r.status, 200, r.text);
     const cfg = (await server.call('/api/config', { token: alice })).body;
-    assert.equal(cfg.phases.find(p => p.id === 'frankfurt').accommodation.name, `מלון ת${GERSHAYIM}א`);
+    assert.equal(cfg.phases.find(p => p.id === 'frankfurt').accommodation.name, 'מלון ת"א');
   });
 });

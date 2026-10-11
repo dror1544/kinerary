@@ -63,30 +63,22 @@ const MULTILINE_KEYS = new Set(['description', 'note']);
 // script in every member's browser. The agent key is enough to write a stop,
 // and the companion holding it reads text travellers typed, so this is one
 // prompt injection away. Refused at the write, not cleaned: a silently altered
-// value is the failure this repository keeps paying for. `<`, `>` and `"` are
-// what it takes to open a tag or leave an attribute; control characters have
-// no business in a title. A newline is allowed only in the multi-line fields.
-// `&` and `'` stay: names carry them, and every renderer escapes them anyway.
-const UNSAFE_LINE_RE = /[<>"\u0000-\u001F\u007F-\u009F]/;
-const UNSAFE_MULTILINE_RE = /[<>"\u0000-\u0009\u000B-\u001F\u007F-\u009F]/;
-const TEXT_DETAIL = 'text may not contain < > " or control characters (for a Hebrew abbreviation use ״, U+05F4)';
-
-// HEBREW ABBREVIATIONS (second boundary review, 2026-10-11). Hebrew writes
-// ארה"ב, ת"א, חו"ל with gershayim (״, U+05F4), and most keyboards type it as an
-// ASCII `"` — which the rule above refuses. The rule is NOT relaxed for
-// "a Hebrew letter on both sides": `ת"א onmouseover=alert(1)` passes that test
-// and is still a quote leaving an attribute. Instead the text is REWRITTEN
-// before it is checked, by whoever wrote it: a `"` directly between two Hebrew
-// letters (U+05D0–U+05EA) becomes ״, and every other `"` stays and is refused.
-// The rewritten text carries no quote at all, so nothing is weakened.
-// The clients do it before sending (they wrote the text); the server does it
-// here ONLY for text it copies from a stored booking (from-booking), which no
-// client sent. A PATCH or split body is never rewritten — refused as sent.
-// Twins, kept identical by hand (each package runs without the others'
-// node_modules): hebrewGershayim in mcp/mcp.js, server/trip-mcp/tools.js and
-// trip-web/src/stops-editor.tsx.
-const HEBREW_GERSHAYIM_RE = /(?<=[א-ת])"(?=[א-ת])/g;
-const hebrewGershayim = (s) => (typeof s === 'string' ? s.replace(HEBREW_GERSHAYIM_RE, '״') : s);
+// value is the failure this repository keeps paying for. `<` and `>` are what
+// it takes to open a tag; control characters have no business in a title. A
+// newline is allowed only in the multi-line fields.
+// `"`, `'` and `&` are TEXT, stored exactly as typed (owner decision,
+// 2026-10-11). Hebrew abbreviations are typed with an ASCII quote — ארה"ב,
+// ת"א, בע"מ — and so is `55" TV`. Refusing the quote refused ordinary Hebrew,
+// and the client-side rewrite to ״ that followed changed what people typed;
+// the owner rejected both. A quote cannot open an element, and keeping it
+// inside an attribute is the renderers' job: every sink that puts stop text in
+// HTML escapes `"` and `'` (site/app.js esc() / escapeHtml() / bkEsc(), React
+// in trip-web) — proven sink by sink, attributes included, in
+// tests/stop-xss-render.test.js. Links are a different kind of value and keep
+// refusing quotes (safeLink below): a link goes into an href as it stands.
+const UNSAFE_LINE_RE = /[<>\u0000-\u001F\u007F-\u009F]/;
+const UNSAFE_MULTILINE_RE = /[<>\u0000-\u0009\u000B-\u001F\u007F-\u009F]/;
+const TEXT_DETAIL = 'text may not contain < > or control characters';
 const LINK_DETAIL = 'a link must be an absolute http(s) URL with a host, and no quotes, < >, or whitespace';
 const STOP_FIELDS = ['dates', 'accommodation', 'title', 'tabLabel', 'emoji'];
 const OPEN_TITLE = { he: 'ימים שעוד לא תוכננו', en: 'Days not planned yet' };
@@ -785,12 +777,10 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
       // same validation a PATCH does: a booking name is typed text too, and a
       // hostile one is refused here rather than stored (finding 1). A link
       // that is not one used to be dropped without a word; now it is said.
-      // The name and confirmation get the Hebrew-abbreviation rewrite first
-      // (hebrewGershayim above): no client wrote them, so no client could
-      // have. Only a `"` between two Hebrew letters changes; any other is
-      // still refused. The booking row itself is left as typed.
-      const copied = { type: 'hotel', name: hebrewGershayim(String(booking.name || '').slice(0, MAX_TEXT)) };
-      if (booking.confirmation) copied.confirmation = hebrewGershayim(String(booking.confirmation).slice(0, MAX_TEXT));
+      // Copied as typed: a `"` in a booking's name (מלון ת"א) is text here
+      // exactly as it is in a PATCH (UNSAFE_LINE_RE above).
+      const copied = { type: 'hotel', name: String(booking.name || '').slice(0, MAX_TEXT) };
+      if (booking.confirmation) copied.confirmation = String(booking.confirmation).slice(0, MAX_TEXT);
       if (typeof booking.location_url === 'string' && booking.location_url.trim()) copied.location_url = booking.location_url;
       const checked = validateAccommodation(copied);
       if (checked.error) return { ...checked.error, body: { ...checked.error.body, source: 'booking' } };
@@ -1060,4 +1050,4 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
   };
 }
 
-module.exports = { createTripStructure, openNote, phaseDates, hebrewGershayim };
+module.exports = { createTripStructure, openNote, phaseDates };
