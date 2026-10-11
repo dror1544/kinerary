@@ -3027,6 +3027,19 @@ function hideBookingForm() {
   document.getElementById('bk-overlay').style.display = 'none';
 }
 
+// A save the server refused for its text (server/text-rules.js) carries a
+// message in Hebrew and English naming the field and what to fix; shown in
+// the page's language. Anything else — no message, a 500, a body that is not
+// JSON — keeps the generic error. The caller puts it in with textContent.
+async function bookingSaveRefusal(r, tr) {
+  try {
+    const m = (await r.json())?.message;
+    const text = m && typeof m === 'object' ? (m[currentLang] || m.he || m.en) : null;
+    if (typeof text === 'string' && text) return text;
+  } catch { /* not JSON */ }
+  return tr.bk_err_server;
+}
+
 async function submitBooking() {
   const tr = T[currentLang] || T['he'];
   const id       = document.getElementById('bk-id').value;
@@ -3052,10 +3065,10 @@ async function submitBooking() {
     let newId = id;
     if (id) {
       const r = await fetch(`/api/bookings/${id}`, { method: 'PATCH', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-      if (!r.ok) throw new Error();
+      if (!r.ok) { errEl.textContent = await bookingSaveRefusal(r, tr); return; }
     } else {
       const r = await fetch('/api/bookings', { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-      if (!r.ok) throw new Error();
+      if (!r.ok) { errEl.textContent = await bookingSaveRefusal(r, tr); return; }
       const data = await r.json();
       newId = data.id;
     }

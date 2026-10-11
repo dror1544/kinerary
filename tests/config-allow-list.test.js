@@ -436,15 +436,19 @@ describe('GET /api/config and /api/config/versions/:version — hostile config o
 
   // LAST in this describe: it appends a participant, which writes a new config version.
   test('/api/config/roster (no auth) serves only scalar roster fields', async () => {
-    // An organizer or the agent can append a participant whose name is not a
-    // string. The config write lands before the users-table insert fails, so
-    // until a restart the roster used to serve the object whole.
-    await fetch(`${BASE}/api/agent/participants`, { method: 'POST',
+    // An organizer or the agent could append a participant whose name is not a
+    // string. The config write landed before the users-table insert failed, so
+    // until a restart the roster used to serve the object whole. Since
+    // write-time validation (server/text-rules.js) the route refuses a name
+    // that is not text before anything is written, so nothing is appended.
+    const res = await fetch(`${BASE}/api/agent/participants`, { method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-API-Key': 'test-hermes-key' },
       body: JSON.stringify({ username: 'mallory', name: { he: 'מ', leak: 'ROSTER-SECRET' } }) });
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).error, 'invalid_text');
     const roster = await (await fetch(`${BASE}/api/config/roster`)).text();
     assert.ok(!roster.includes('ROSTER-SECRET'), roster);
-    assert.ok(JSON.parse(roster).participants.some(p => p.username === 'mallory'), 'the appended participant is still listed');
+    assert.ok(!JSON.parse(roster).participants.some(p => p.username === 'mallory'), 'the refused participant was never appended');
   });
 });
 

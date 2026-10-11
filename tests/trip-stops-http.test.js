@@ -546,9 +546,19 @@ describe('boundary review 2026-10-11 — hostile stop text is refused, and Class
   });
 
   test('finding 1: a hotel booking with a hostile name makes from-booking refuse (400), not store', async () => {
-    const created = await server.call('/api/bookings', { method: 'POST', token: alice, body: {
-      phase: 'colmar', type: 'hotel', name: `Hotel ${XSS}`, date_from: '2026-12-02', date_to: '2026-12-07' } });
-    assert.equal(created.status, 200, created.text);
+    // POST /api/bookings itself refuses this name since write-time validation
+    // (server/text-rules.js, tests/write-validation.test.js), so the booking
+    // is planted as older code could have stored it: from-booking's own check
+    // is what still stands between such a row and the stop.
+    assert.equal((await server.call('/api/bookings', { method: 'POST', token: alice, body: {
+      phase: 'colmar', type: 'hotel', name: `Hotel ${XSS}`, date_from: '2026-12-02', date_to: '2026-12-07' } })).status, 400);
+    const db = new Database(join(server.dataDir, 'trip.db'));
+    let plantedId;
+    try {
+      plantedId = Number(db.prepare("INSERT INTO bookings (phase,type,name,date_from,date_to,created_by) VALUES ('colmar','hotel',?,'2026-12-02','2026-12-07','old-code')")
+        .run(`Hotel ${XSS}`).lastInsertRowid);
+    } finally { db.close(); }
+    const created = { body: { id: plantedId } };
     const r = await server.call('/api/stops/colmar/from-booking', { method: 'POST', ...agent, body: { booking_id: created.body.id } });
     assert.equal(r.status, 400, r.text);
     assert.deepEqual([r.body.error, r.body.field, r.body.source], ['invalid_text', 'accommodation.name', 'booking']);

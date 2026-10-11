@@ -151,6 +151,11 @@ export const PORTS = {
   stopFollowups:           28321,  // tests/stop-followups.test.js — split-then-link, gershayim (second review 2026-10-11)
   // "Tonight:" lodging computed at serve time — tests/tonight-lodging.test.js.
   tonightLodging:          28322,
+  // Write-time validation of booking and participant text, bilingual refusals
+  // — tests/write-validation.test.js.
+  writeValidation:         28323,  // the trip server
+  writeValidationExtract:  28324,  // stand-in for the extraction service (extract-draft)
+  writeValidationMcp:      28325,  // mcp/mcp.js against that trip server
 
   // ── Stand-ins for services the server calls out to ─────────────────────
   bookingExtractMockHermes: 28103,
