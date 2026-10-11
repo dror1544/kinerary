@@ -167,7 +167,33 @@ const STOP_REFUSAL_HINTS = {
   day_not_found: 'Nothing is planned on that date under from_phase_id — read get_phase_plan to see which stop holds it.',
   unknown_phase: 'from_phase_id is not a phase of this trip — call get_stops.',
   same_phase: 'from_phase_id and to_phase_id are the same stop.',
+  booking_belongs_to_another_stop: 'That booking is filed under another stop (named in "stop"); linking it here would move that stop\'s check-in and check-out, so it is refused. Ask the organizer which stop the hotel is for. If it is this one, the organizer first changes the booking\'s stop to this one on the site (the booking\'s edit form), then call set_stop_from_booking again. A booking filed under the stop this one was split from links without that.',
+  booking_linked_to_another_stop: 'That booking already sets another stop (named in "stop") — its dates and hotel — and one booking shapes one stop, so it is refused. Tell the organizer. It is freed only when that stop is set from a different hotel booking (set_stop_from_booking on that stop) or its change is undone from the stop\'s history on the site; update_stop does not free it. Then link it here.',
+  invalid_text: 'Stop text may not contain < > or a double quote (") or control characters; the field is named in "field". For a Hebrew abbreviation (ארה״ב, ת״א) write the gershayim ״ — this tool already turns a " between two Hebrew letters into ״. Any other ": remove it or use single quotes, then resend. If "source" is "booking", the text is the booking\'s own: fix the booking (update_booking) first.',
+  invalid_link: 'A link (named in "field") must be a full http(s) address with no quotes, spaces or < >. Resend it without that link or with a clean one; if "source" is "booking", fix the booking\'s location_url (update_booking) first.',
 };
+
+// HEBREW ABBREVIATIONS. The trip site refuses any ASCII `"` in stop text — it
+// is what it takes to leave an HTML attribute — and that is not relaxed for
+// Hebrew (`ת"א onmouseover=…` still breaks out). But Hebrew abbreviations are
+// typed with one (ארה"ב, ת"א, חו"ל), so this tool rewrites a `"` directly
+// BETWEEN two Hebrew letters (U+05D0–U+05EA) to the gershayim ״ (U+05F4)
+// before sending, and nothing else: any other `"` reaches the site and is
+// refused with invalid_text. Twins, kept identical by hand (each package runs
+// without the others' node_modules): hebrewGershayim in
+// server/trip-structure.js, server/trip-mcp/tools.js and
+// trip-web/src/stops-editor.tsx.
+const HEBREW_GERSHAYIM_RE = /(?<=[א-ת])"(?=[א-ת])/g;
+const hebrewGershayim = (s) => (typeof s === 'string' ? s.replace(HEBREW_GERSHAYIM_RE, '״') : s);
+// A string or a { he, en } pair; anything else as it came.
+const gershayimText = (v) => (v && typeof v === 'object' && !Array.isArray(v)
+  ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, hebrewGershayim(x)]))
+  : hebrewGershayim(v));
+// Every free-text field of an accommodation; links are left exactly as given.
+const ACCOMMODATION_LINKS = new Set(['location_url', 'maps', 'waze', 'url']);
+const gershayimAccommodation = (acc) => (acc && typeof acc === 'object'
+  ? Object.fromEntries(Object.entries(acc).map(([k, v]) => [k, ACCOMMODATION_LINKS.has(k) ? v : gershayimText(v)]))
+  : acc);
 
 function stopRefusal(method, path, status, data, text) {
   const code = data && typeof data === 'object' ? data.error : null;
@@ -843,7 +869,10 @@ mcp.tool('update_stop',
   accommodation: accommodationSchema.nullable().optional().describe('Where the family sleeps at this stop — replaces the whole accommodation; null removes it'),
   on_outside: onOutside,
   revision: stopRevision,
-}, async ({ phase_id, start, end, title_he, title_en, accommodation, on_outside, revision }) => {
+}, async ({ phase_id, start, end, title_he: rawTitleHe, title_en: rawTitleEn, accommodation: rawAccommodation, on_outside, revision }) => {
+  const title_he = hebrewGershayim(rawTitleHe);
+  const title_en = hebrewGershayim(rawTitleEn);
+  const accommodation = gershayimAccommodation(rawAccommodation);
   const halfDates = (start === undefined) !== (end === undefined);
   const halfTitle = (title_he === undefined) !== (title_en === undefined);
   if (start === undefined && end === undefined && title_he === undefined && title_en === undefined && accommodation === undefined) {
@@ -896,7 +925,10 @@ mcp.tool('split_stop',
   accommodation: accommodationSchema.optional().describe('Where the family sleeps at the new stop'),
   booking_id: bookingId.optional().describe('A hotel booking (get_bookings) to link to the NEW stop after the split'),
   revision: stopRevision,
-}, async ({ phase_id, at_date, title_he, title_en, accommodation, booking_id, revision }) => {
+}, async ({ phase_id, at_date, title_he: rawTitleHe, title_en: rawTitleEn, accommodation: rawAccommodation, booking_id, revision }) => {
+  const title_he = hebrewGershayim(rawTitleHe);
+  const title_en = hebrewGershayim(rawTitleEn);
+  const accommodation = gershayimAccommodation(rawAccommodation);
   if (!title_he && !title_en) throw new Error('The new stop needs a title: give title_he and/or title_en. Nothing was changed.');
   const new_stop = { title: { ...(title_he ? { he: title_he } : {}), ...(title_en ? { en: title_en } : {}) } };
   if (accommodation !== undefined) new_stop.accommodation = accommodation;

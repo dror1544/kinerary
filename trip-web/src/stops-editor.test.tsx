@@ -11,7 +11,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import App from "./App";
 import { PlanTools } from "./plan-tools";
-import { StopsEditor } from "./stops-editor";
+import { hebrewGershayim, StopsEditor } from "./stops-editor";
 import { tokenStore } from "./api";
 import type { StopsPayload } from "./stops";
 
@@ -245,6 +245,80 @@ describe("editing a stop", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save stop" }));
     await waitFor(() => expect(server.writes()).toHaveLength(2));
     expect(server.writes()[1].ifMatch).toBe('"st-9"');
+  });
+});
+
+describe("Hebrew abbreviations typed with an ASCII quote (second boundary review, 2026-10-11)", () => {
+  // The server refuses every ASCII " in stop text and is not relaxed for
+  // Hebrew; the editor rewrites a " between two Hebrew letters to ״ (U+05F4)
+  // before sending, and only that.
+  const G = "״";
+  it.each([
+    ['ארה"ב', `ארה${G}ב`],
+    ['ת"א', `ת${G}א`],
+    ['חו"ל', `חו${G}ל`],
+    ['בע"מ', `בע${G}מ`],
+    ['ראשל"צ', `ראשל${G}צ`],
+    ['טיסה לארה"ב דרך חו"ל', `טיסה לארה${G}ב דרך חו${G}ל`],
+    ['א"ב"ג', `א${G}ב${G}ג`],
+    ['55" TV', '55" TV'],
+    ['say "hi"', 'say "hi"'],
+    ['ת"a', 'ת"a'],
+    ['a"ת', 'a"ת'],
+    ['"תל אביב"', '"תל אביב"'],
+    ['ת" א', 'ת" א'],
+    ['ת"א onmouseover=alert(1)', `ת${G}א onmouseover=alert(1)`],
+  ])("hebrewGershayim(%j) is %j", (input, want) => {
+    expect(hebrewGershayim(input)).toBe(want);
+  });
+
+  it("the edit form sends the title and every accommodation text field rewritten; any other quote as typed", async () => {
+    const server = stubServer({
+      "GET /api/stops": [() => json(stopsPayload())],
+      "PATCH /api/stops/colmar": [() => json({ revision: "st-4", stop: colmar.stop })],
+    });
+    renderEditor();
+    fireEvent.click(await screen.findByRole("button", { name: "Edit Colmar" }));
+    fireEvent.change(screen.getByLabelText("Hebrew title"), { target: { value: 'קולמר וחו"ל' } });
+    fireEvent.change(screen.getByLabelText("Hotel name"), { target: { value: 'מלון ת"א' } });
+    fireEvent.change(screen.getByLabelText("Address"), { target: { value: 'רח׳ הרצל 1, ראשל"צ' } });
+    fireEvent.change(screen.getByLabelText("Confirmation number"), { target: { value: 'AB"12' } });
+    fireEvent.change(screen.getByLabelText("Map link"), { target: { value: "https://maps.example/colmar" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save stop" }));
+    await waitFor(() => expect(server.writes()).toHaveLength(1));
+    expect(server.writes()[0].body).toEqual({
+      title: { he: `קולמר וחו${G}ל`, en: "Colmar" },
+      accommodation: { name: `מלון ת${G}א`, address: `רח׳ הרצל 1, ראשל${G}צ`, confirmation: 'AB"12', location_url: "https://maps.example/colmar" },
+    });
+  });
+
+  it("an unchanged field is not sent just because it would be rewritten", async () => {
+    const quoted = { ...colmar, stop: { ...colmar.stop, title: { he: 'ארה"ב', en: "USA" } } };
+    const server = stubServer({
+      "GET /api/stops": [() => json(stopsPayload({ stops: [quoted] }))],
+      "PATCH /api/stops/colmar": [() => json({ revision: "st-4", stop: colmar.stop })],
+    });
+    renderEditor();
+    fireEvent.click(await screen.findByRole("button", { name: "Edit USA" }));
+    fireEvent.change(screen.getByLabelText("Last day"), { target: { value: "2026-12-05" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save stop" }));
+    await waitFor(() => expect(server.writes()).toHaveLength(1));
+    expect(server.writes()[0].body).toEqual({ dates: { start: "2026-12-02", end: "2026-12-05" } });
+  });
+
+  it("the split form sends the new stop's title rewritten", async () => {
+    const server = stubServer({
+      "GET /api/stops": [() => json(stopsPayload())],
+      "POST /api/stops/colmar/split": [() => json({ revision: "st-5", stops: [], moved: { items: [], days: [] } }, 201)],
+    });
+    renderEditor();
+    fireEvent.click(await screen.findByRole("button", { name: "Split Colmar" }));
+    fireEvent.change(screen.getByLabelText("Split on"), { target: { value: "2026-12-05" } });
+    fireEvent.change(screen.getByLabelText("New stop title (Hebrew)"), { target: { value: 'ליד נתב"ג' } });
+    fireEvent.change(screen.getByLabelText("New stop title (English)"), { target: { value: 'Near "the" airport' } });
+    fireEvent.click(screen.getByRole("button", { name: "Split the stop" }));
+    await waitFor(() => expect(server.writes()).toHaveLength(1));
+    expect(server.writes()[0].body).toEqual({ at: "2026-12-05", new_stop: { title: { he: `ליד נתב${G}ג`, en: 'Near "the" airport' } } });
   });
 });
 

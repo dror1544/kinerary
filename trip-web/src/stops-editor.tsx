@@ -19,6 +19,40 @@ import {
   type StopRefusal, type StopsPayload,
 } from "./stops";
 
+// HEBREW ABBREVIATIONS. The server refuses any ASCII `"` in stop text (it is
+// what it takes to leave an HTML attribute) and is not relaxed for Hebrew:
+// `ת"א onmouseover=…` would pass "a Hebrew letter on both sides". But Hebrew
+// abbreviations are typed with one (ארה"ב, ת"א, חו"ל), so the editor rewrites a
+// `"` directly BETWEEN two Hebrew letters (U+05D0–U+05EA) to the gershayim ״
+// (U+05F4) before sending, and nothing else: any other `"` is sent as typed and
+// refused by the server. Twins, kept identical by hand (each package runs
+// without the others' modules): hebrewGershayim in server/trip-structure.js,
+// mcp/mcp.js and server/trip-mcp/tools.js.
+const HEBREW_GERSHAYIM_RE = /(?<=[א-ת])"(?=[א-ת])/g;
+export const hebrewGershayim = (s: string): string => s.replace(HEBREW_GERSHAYIM_RE, "״");
+const gershayimText = <T,>(v: T): T => {
+  if (typeof v === "string") return hebrewGershayim(v) as T;
+  if (v && typeof v === "object" && !Array.isArray(v)) {
+    return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, typeof x === "string" ? hebrewGershayim(x) : x])) as T;
+  }
+  return v;
+};
+const ACCOMMODATION_LINKS = new Set(["location_url", "maps", "waze", "url"]);
+// The fields of a stop write as they are sent: every free-text field (title,
+// tab label, the accommodation's text) rewritten; dates, emoji and links as
+// they are. Applied to what is about to be sent, so a field that did not
+// change is still not sent.
+function withGershayim(fields: StopFields): StopFields {
+  const out: StopFields = { ...fields };
+  if (out.title !== undefined) out.title = gershayimText(out.title);
+  if (out.tabLabel !== undefined) out.tabLabel = hebrewGershayim(out.tabLabel);
+  if (out.accommodation) {
+    out.accommodation = Object.fromEntries(Object.entries(out.accommodation)
+      .map(([k, v]) => [k, ACCOMMODATION_LINKS.has(k) ? v : gershayimText(v)])) as StopAccommodation;
+  }
+  return out;
+}
+
 const DateRange = ({ dates, lang }: { dates?: StopDates | null; lang: Lang }) =>
   dates ? <bdi dir="ltr">{dates.start} – {dates.end}</bdi> : <>{tr(lang, "No dates yet", "עדיין אין תאריכים")}</>;
 
@@ -197,7 +231,7 @@ function EditStopForm({ entry, payload, lang, onClose, onReload }: {
   }
 
   function save() {
-    const fields = body();
+    const fields = withGershayim(body());
     if (!Object.keys(fields).length) return write.say(tr(lang, "Nothing changed — there is nothing to save.", "לא שונה דבר — אין מה לשמור."));
     const rev = revision;
     setNotice("");
@@ -306,7 +340,7 @@ function SplitStopForm({ entry, payload, lang, onClose, onDone, reload }: {
       if (!at) return write.say(tr(lang, "Choose the day to split on.", "יש לבחור את היום שבו מפצלים."));
       if (!title) return write.say(tr(lang, "The new stop needs a title.", "לתחנה החדשה נדרשת כותרת."));
       const rev = payload.revision;
-      write.run(() => splitStop(entry.id, { at, new_stop: { title } }, rev));
+      write.run(() => splitStop(entry.id, { at, new_stop: { title: gershayimText(title) } }, rev));
     }} onKeyDown={(e) => { if (e.key === "Escape") onClose(); }}>
       <p className="stop-hint">{tr(lang, "The new stop starts on the chosen day; this stop ends that morning. Everything planned after it moves to the new stop.", "התחנה החדשה מתחילה ביום שנבחר; התחנה הזו מסתיימת באותו בוקר. כל מה שמתוכנן אחריו עובר לתחנה החדשה.")}</p>
       <div className="parity-fields">
