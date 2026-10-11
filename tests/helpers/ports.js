@@ -144,6 +144,10 @@ export const PORTS = {
   itineraryMoveDay:        28315,  // tests/itinerary-move-day.test.js
   configAllowListStops:    28316,  // tests/config-allow-list.test.js — stop overrides never serve pin/provenance
   tripStopsHardening:      28317,  // tests/trip-stops-http.test.js — boundary review 2026-10-11 (stored XSS, prototype keys)
+  // Stop editing from the companion (slice S4) — tests/mcp-trip-stops.test.js.
+  mcpTripStops:            28318,  // mcp/mcp.js against a stand-in site
+  mcpTripStopsLive:        28319,  // mcp/mcp.js against the real trip server below
+  mcpTripStopsSite:        28320,  // the real trip server mcpTripStopsLive talks to
 
   // ── Stand-ins for services the server calls out to ─────────────────────
   bookingExtractMockHermes: 28103,
