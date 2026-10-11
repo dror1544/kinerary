@@ -70,6 +70,23 @@ const MULTILINE_KEYS = new Set(['description', 'note']);
 const UNSAFE_LINE_RE = /[<>"\u0000-\u001F\u007F-\u009F]/;
 const UNSAFE_MULTILINE_RE = /[<>"\u0000-\u0009\u000B-\u001F\u007F-\u009F]/;
 const TEXT_DETAIL = 'text may not contain < > " or control characters (for a Hebrew abbreviation use ״, U+05F4)';
+
+// HEBREW ABBREVIATIONS (second boundary review, 2026-10-11). Hebrew writes
+// ארה"ב, ת"א, חו"ל with gershayim (״, U+05F4), and most keyboards type it as an
+// ASCII `"` — which the rule above refuses. The rule is NOT relaxed for
+// "a Hebrew letter on both sides": `ת"א onmouseover=alert(1)` passes that test
+// and is still a quote leaving an attribute. Instead the text is REWRITTEN
+// before it is checked, by whoever wrote it: a `"` directly between two Hebrew
+// letters (U+05D0–U+05EA) becomes ״, and every other `"` stays and is refused.
+// The rewritten text carries no quote at all, so nothing is weakened.
+// The clients do it before sending (they wrote the text); the server does it
+// here ONLY for text it copies from a stored booking (from-booking), which no
+// client sent. A PATCH or split body is never rewritten — refused as sent.
+// Twins, kept identical by hand (each package runs without the others'
+// node_modules): hebrewGershayim in mcp/mcp.js, server/trip-mcp/tools.js and
+// trip-web/src/stops-editor.tsx.
+const HEBREW_GERSHAYIM_RE = /(?<=[א-ת])"(?=[א-ת])/g;
+const hebrewGershayim = (s) => (typeof s === 'string' ? s.replace(HEBREW_GERSHAYIM_RE, '״') : s);
 const LINK_DETAIL = 'a link must be an absolute http(s) URL with a host, and no quotes, < >, or whitespace';
 const STOP_FIELDS = ['dates', 'accommodation', 'title', 'tabLabel', 'emoji'];
 const OPEN_TITLE = { he: 'ימים שעוד לא תוכננו', en: 'Days not planned yet' };
@@ -737,7 +754,22 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
       // check-in and check-out here. A booking filed under no stop — a
       // trip-wide bucket, or the computed open days — may be linked anywhere,
       // once. The same stop again stays idempotent.
-      if (typeof booking.phase === 'string' && booking.phase !== id && isStop(booking.phase)) {
+      //
+      // One exception (second review, 2026-10-11): a booking filed under the
+      // stop THIS stop was split from. "The last night near the airport" is
+      // still Colmar when the organizer adds its hotel, so the hotel is filed
+      // under Colmar — and split_stop's own booking link was refused every
+      // time. Only the direct parent of an added stop qualifies (not a
+      // grandparent, not a sibling), and only while the booking is not linked
+      // to any stop: one that already shapes the parent stays refused below
+      // (booking_linked_to_another_stop), so the parent's hotel is never
+      // pulled out from under it. Such a booking is re-filed under this stop
+      // inside the same transaction — see `refile` below.
+      const own = parseRow(q.override.get(id));
+      const splitFrom = own?.kind === 'added' ? own.after_phase_id : null;
+      const elsewhere = typeof booking.phase === 'string' && booking.phase !== id && isStop(booking.phase);
+      const refile = elsewhere && splitFrom !== null && booking.phase === splitFrom;
+      if (elsewhere && !refile) {
         return fail(409, 'booking_belongs_to_another_stop', { stop: booking.phase });
       }
       const linked = q.linkedElsewhere.get(bookingId, id);
@@ -753,8 +785,12 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
       // same validation a PATCH does: a booking name is typed text too, and a
       // hostile one is refused here rather than stored (finding 1). A link
       // that is not one used to be dropped without a word; now it is said.
-      const copied = { type: 'hotel', name: String(booking.name || '').slice(0, MAX_TEXT) };
-      if (booking.confirmation) copied.confirmation = String(booking.confirmation).slice(0, MAX_TEXT);
+      // The name and confirmation get the Hebrew-abbreviation rewrite first
+      // (hebrewGershayim above): no client wrote them, so no client could
+      // have. Only a `"` between two Hebrew letters changes; any other is
+      // still refused. The booking row itself is left as typed.
+      const copied = { type: 'hotel', name: hebrewGershayim(String(booking.name || '').slice(0, MAX_TEXT)) };
+      if (booking.confirmation) copied.confirmation = hebrewGershayim(String(booking.confirmation).slice(0, MAX_TEXT));
       if (typeof booking.location_url === 'string' && booking.location_url.trim()) copied.location_url = booking.location_url;
       const checked = validateAccommodation(copied);
       if (checked.error) return { ...checked.error, body: { ...checked.error.body, source: 'booking' } };
@@ -764,14 +800,30 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
       const plan = outsidePlan(id, dates, body.on_outside, { ignore: Object.values(uids) });
       if (plan.error) return plan.error;
       const createItems = body.create_items !== false;
+      // A re-filed booking's check-in/check-out items already on the parent
+      // (a former link, since replaced, left them there) go with it even when
+      // no item is to be created: dated in this stop's range, they would sit
+      // on a stop whose dates no longer hold them.
+      const strayItems = refile && !createItems
+        && (rowsOf().items || []).some(i => (i.item_uid === uids.checkin || i.item_uid === uids.checkout) && i.phase_id !== id);
       return atomically(() => {
-        write(id, nextOverride(id, { dates, accommodation }, { booking_id: bookingId }), 'from_booking', actor, `booking ${bookingId}`);
+        // Re-filed with the link, in the same transaction, so the booking is
+        // listed, matched and counted under the stop it now shapes: the
+        // bookings list (GET /api/bookings?phase=), the plan's booking
+        // matcher (bookings of the item's own stop) and removing a stop
+        // (stop_in_use) all read bookings.phase. Left under the parent, the
+        // next from-booking on the parent would also re-link it there and
+        // move this stop's check-in and check-out — what finding 3 refuses.
+        // The organizer can file it elsewhere again from the booking itself.
+        if (refile) db.prepare('UPDATE bookings SET phase = ? WHERE id = ?').run(id, bookingId);
+        write(id, nextOverride(id, { dates, accommodation }, { booking_id: bookingId }), 'from_booking', actor,
+          refile ? `booking ${bookingId} (re-filed from ${booking.phase})` : `booking ${bookingId}`);
         cache = null;
         let itineraryRevision = null;
-        if (createItems || (plan.mode === 'move' && plan.moveDates.length)) {
+        if (createItems || strayItems || (plan.mode === 'move' && plan.moveDates.length)) {
           itineraryRevision = applyItinerary(actor, `Stop ${id} set from booking ${bookingId}`, rows => {
             if (plan.mode === 'move' && plan.moveDates.length) moveDaysInRows(rows, id, plan.target, plan.moveDates);
-            if (createItems) upsertBookingItems(rows, id, booking, uids);
+            if (createItems || strayItems) upsertBookingItems(rows, id, booking, uids, { create: createItems });
           });
         }
         if (plan.mode === 'move' && plan.moveDates.length) { queuePhaseReview(id); queuePhaseReview(plan.target); }
@@ -851,7 +903,10 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
     },
   };
 
-  function upsertBookingItems(rows, stopId, booking, uids) {
+  // `create: false` only re-points the booking's items that already exist
+  // (a re-filed booking whose items were left on the stop it came from); it
+  // never adds one the caller asked not to have.
+  function upsertBookingItems(rows, stopId, booking, uids, { create = true } = {}) {
     const name = String(booking.name || '').slice(0, 200);
     const specs = [
       { uid: uids.checkin, date: isoDay(booking.date_from), time: 'afternoon', he: `צ׳ק-אין — ${name}`, en: `Check-in — ${name}` },
@@ -859,6 +914,7 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
     ];
     for (const spec of specs) {
       const existing = rows.items.find(i => i.item_uid === spec.uid);
+      if (!existing && !create) continue;
       if (existing) {
         // Idempotent: same item, re-pointed at the booking's current date and
         // this stop. Wording an organizer edited is left alone.
@@ -1004,4 +1060,4 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
   };
 }
 
-module.exports = { createTripStructure, openNote, phaseDates };
+module.exports = { createTripStructure, openNote, phaseDates, hebrewGershayim };

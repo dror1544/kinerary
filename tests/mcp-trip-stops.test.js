@@ -110,6 +110,13 @@ describe('mcp/mcp.js stop tools — against a stand-in trip site', () => {
           orphaned_overrides: [],
         });
       }
+      // The real write refuses any ASCII " in stop text (server/trip-structure.js
+      // UNSAFE_LINE_RE); the stand-in does the same, so what the tools send is
+      // what is judged.
+      const stopText = [body?.title, body?.new_stop, body?.accommodation].map(v => JSON.stringify(v ?? '')).join('');
+      if ((req.method === 'PATCH' || req.url.endsWith('/split')) && stopText.includes('\\"')) {
+        return send(res, 400, { error: 'invalid_text', field: 'title', detail: 'text may not contain < > " or control characters (for a Hebrew abbreviation use ״, U+05F4)' });
+      }
       if (req.method === 'PATCH' && req.url === '/api/stops/colmar') {
         if (body?.dates && body.dates.end > '2026-12-07') return send(res, 400, { error: 'dates_outside_trip', trip: { start: '2026-12-02', end: '2026-12-07' } });
         if (body?.dates?.start === '2026-12-04' && !body.on_outside) return send(res, 409, { error: 'items_outside_stop', items: OUTSIDE_ITEMS });
@@ -128,6 +135,8 @@ describe('mcp/mcp.js stop tools — against a stand-in trip site', () => {
       const fromBooking = /^\/api\/stops\/(colmar|near-the-airport)\/from-booking$/.exec(req.url);
       if (req.method === 'POST' && fromBooking) {
         if (body.booking_id === 7) return send(res, 409, { error: 'booking_is_draft' });
+        if (body.booking_id === 8) return send(res, 409, { error: 'booking_belongs_to_another_stop', stop: 'frankfurt' });
+        if (body.booking_id === 11) return send(res, 409, { error: 'booking_linked_to_another_stop', stop: 'colmar' });
         return send(res, 200, { revision: 'st-7', stop: { id: fromBooking[1], dates: { start: '2026-12-06', end: '2026-12-07' } }, items: { checkin: `booking_${body.booking_id}_checkin`, checkout: `booking_${body.booking_id}_checkout` } });
       }
       if (req.method === 'POST' && req.url === '/api/itinerary/move-day') {
@@ -333,6 +342,57 @@ describe('mcp/mcp.js stop tools — against a stand-in trip site', () => {
     assert.equal(last().body.headline, 'take_source');
   });
 
+  test('split_stop: a booking filed under, or linked to, another stop — the refusal says in words what to do', async () => {
+    const belongs = parseToolJson(await mcpCallTool('split_stop', { phase_id: 'colmar', at_date: '2026-12-06', title_en: 'Near the airport', booking_id: 8 }));
+    assert.equal(belongs.booking_link.error, 'booking_belongs_to_another_stop');
+    assert.match(belongs.booking_link.message, /filed under another stop/);
+    assert.match(belongs.booking_link.message, /set_stop_from_booking/);
+    const linked = parseToolError(await mcpCallTool('set_stop_from_booking', { phase_id: 'colmar', booking_id: 11 }));
+    assert.match(linked, /booking_linked_to_another_stop/);
+    assert.match(linked, /already sets another stop/);
+  });
+
+  test('Hebrew abbreviations typed with an ASCII " are sent with ״ (U+05F4) — in every free-text field of update_stop', async () => {
+    parseToolJson(await mcpCallTool('update_stop', {
+      phase_id: 'colmar', title_he: 'טיסה לארה"ב דרך חו"ל', title_en: 'Colmar',
+      accommodation: {
+        name: { he: 'מלון ת"א', en: 'Hotel TLV' }, address: 'רח׳ הרצל 1, ראשל"צ', confirmation: 'אב"ג-1',
+        description: { he: 'קרוב לבע"מ', en: 'Near the office' }, note: 'חו"ל', dates: 'א"ב"ג', guests: 4,
+        location_url: 'https://maps.example/colmar',
+      },
+    }));
+    const sent = last().body;
+    assert.equal(sent.title.he, 'טיסה לארה״ב דרך חו״ל', 'both occurrences');
+    assert.equal(sent.title.en, 'Colmar');
+    assert.deepEqual(sent.accommodation, {
+      name: { he: 'מלון ת״א', en: 'Hotel TLV' }, address: 'רח׳ הרצל 1, ראשל״צ', confirmation: 'אב״ג-1',
+      description: { he: 'קרוב לבע״מ', en: 'Near the office' }, note: 'חו״ל', dates: 'א״ב״ג', guests: 4,
+      location_url: 'https://maps.example/colmar',
+    });
+  });
+
+  test('split_stop: the new stop\'s title and accommodation get the same rewrite', async () => {
+    parseToolJson(await mcpCallTool('split_stop', {
+      phase_id: 'colmar', at_date: '2026-12-06', title_he: 'ליד נתב"ג', title_en: 'Near the airport', accommodation: { name: 'מלון ת"א' },
+    }));
+    assert.deepEqual(last().body.new_stop, { title: { he: 'ליד נתב״ג', en: 'Near the airport' }, accommodation: { name: 'מלון ת״א' } });
+  });
+
+  test('any other " is sent as typed, and the server\'s refusal reaches the model with what to do', async () => {
+    for (const args of [
+      { phase_id: 'colmar', title_he: 'קולמר', title_en: 'Colmar "old town"' },        // Latin-Latin
+      { phase_id: 'colmar', title_he: 'ת"a', title_en: 'Colmar' },                     // mixed
+      { phase_id: 'colmar', accommodation: { name: 'Hotel', note: 'a 55" TV' } },       // digit-Latin
+      { phase_id: 'colmar', title_he: 'ת"א" onmouseover=alert(1)', title_en: 'x' },    // a second quote
+    ]) {
+      const message = parseToolError(await mcpCallTool('update_stop', args));
+      assert.match(message, /invalid_text/, JSON.stringify(args));
+      assert.match(message, /single quotes/, 'the hint says what to do');
+      const sent = JSON.stringify(last().body);
+      assert.ok(sent.includes('\\"'), `the " was not rewritten away: ${sent}`);
+    }
+  });
+
   test('a trip site with no stop routes yet (built before them) is named as such, not as an unknown stop', async () => {
     const message = parseToolError(await mcpCallTool('set_stop_from_booking', { phase_id: 'frankfurt2', booking_id: 3 }));
     assert.match(message, /404/);
@@ -482,6 +542,25 @@ describe('mcp/mcp.js stop tools — against the real trip server (the colmar tri
     assert.deepEqual(cfg.phases.find(p => p.id === 'colmar').dates, { start: '2026-12-03', end: '2026-12-06' });
     assert.deepEqual(cfg.phases.find(p => p.id === newId).dates, { start: '2026-12-06', end: '2026-12-07' });
     assert.equal((await items()).find(i => i.text_en === 'Fly home').phase_id, newId);
+    // The airport hotel was filed under Colmar; linked to the new stop, it is
+    // re-filed there. Colmar's own hotel keeps Colmar, and its check-in.
+    const filed = async (p) => (await site.call(`/api/bookings?phase=${p}`)).body.map(b => b.name);
+    assert.deepEqual(await filed(newId), ['Airport Hotel']);
+    assert.ok((await filed('colmar')).includes('Hotel Colmar Centre'));
+    assert.ok(!(await filed('colmar')).includes('Airport Hotel'));
+    assert.equal(cfg.phases.find(p => p.id === 'colmar').accommodation.name, 'Hotel Colmar Centre');
+    assert.equal((await items()).find(i => i.text_en === 'Check-in — Hotel Colmar Centre')?.phase_id, 'colmar');
+  });
+
+  test('update_stop: a Hebrew abbreviation typed with " is stored with ״; any other " is refused readably, nothing stored', async () => {
+    const result = parseToolJson(await mcpCallTool('update_stop', { phase_id: 'colmar', title_he: 'קולמר (ליד ארה"ב?)', title_en: 'Colmar old town' }));
+    assert.equal(result.stop.title.he, 'קולמר (ליד ארה״ב?)');
+    assert.equal((await phase('colmar')).title.he, 'קולמר (ליד ארה״ב?)');
+    const refused = parseToolError(await mcpCallTool('update_stop', { phase_id: 'colmar', title_he: 'קולמר', title_en: 'Colmar "old town"' }));
+    assert.match(refused, /400 invalid_text/);
+    assert.match(refused, /title\.en/);
+    assert.match(refused, /single quotes/);
+    assert.equal((await phase('colmar')).title.en, 'Colmar old town', 'nothing stored');
   });
 
   test('update_stop accommodation takes a bilingual name, as the server\'s text fields do, and replaces the whole accommodation', async () => {
@@ -511,6 +590,10 @@ describe('server/trip-mcp/tools.js stop tools — absent on a read-only connecti
         return { revision: 'st-4', stops: [{ id: 'colmar', kind: 'config', unplanned: false, stop: COLMAR }] };
       }
       if (path === '/api/stops/colmar/from-booking' && body.booking_id === 7) refuse(method, path, 409, { error: 'booking_is_draft' });
+      if (path === '/api/stops/colmar/from-booking' && body.booking_id === 8) refuse(method, path, 409, { error: 'booking_belongs_to_another_stop', stop: 'frankfurt' });
+      if (path === '/api/stops/colmar/from-booking' && body.booking_id === 11) refuse(method, path, 409, { error: 'booking_linked_to_another_stop', stop: 'near-the-airport' });
+      if (path === '/api/stops/colmar/from-booking' && body.booking_id === 13) refuse(method, path, 400, { error: 'invalid_text', field: 'accommodation.name', source: 'booking' });
+      if (path === '/api/stops/colmar/from-booking' && body.booking_id === 14) refuse(method, path, 400, { error: 'invalid_link', field: 'accommodation.location_url', source: 'booking' });
       if (path === '/api/stops/colmar' && body?.dates?.start === '2026-12-04' && !body.on_outside) refuse(method, path, 409, { error: 'items_outside_stop', items: OUTSIDE_ITEMS });
       if (path === '/api/stops/colmar/split') return { stops: [COLMAR, { id: 'near-the-airport' }] };
       return { ok: true, stop: { id: 'colmar' } };
@@ -585,6 +668,42 @@ describe('server/trip-mcp/tools.js stop tools — absent on a read-only connecti
         { method: 'POST', path: '/api/stops/colmar/from-booking', body: { booking_id: 12, create_items: false } },
         { method: 'POST', path: '/api/itinerary/move-day', body: { from_phase_id: 'colmar', date: '2026-12-05', to_phase_id: 'frankfurt' } },
       ]);
+    } finally { await close(); }
+  });
+
+  test('organizer (write): Hebrew abbreviations are sent with ״ in update_stop and split_stop; any other " is sent as typed', async () => {
+    const { client, site, close } = await connect(true);
+    try {
+      const call = async (name, args) => {
+        const r = await client.callTool({ name, arguments: args });
+        assert.notEqual(r.isError, true, `${name}: ${r.content?.[0]?.text}`);
+      };
+      await call('update_stop', { phase_id: 'colmar', title_he: 'ארה"ב וחו"ל', title_en: 'say "hi"',
+        accommodation: { name: { he: 'מלון ת"א', en: 'a"b' }, address: 'ראשל"צ', note: '55" TV', location_url: 'https://maps.example/x' } });
+      await call('split_stop', { phase_id: 'colmar', at_date: '2026-12-06', title_he: 'ליד נתב"ג', accommodation: { name: 'בע"מ' } });
+      const [patch, split] = site.calls.filter(c => c.method !== 'GET');
+      assert.deepEqual(patch.body, {
+        title: { he: 'ארה״ב וחו״ל', en: 'say "hi"' },
+        accommodation: { name: { he: 'מלון ת״א', en: 'a"b' }, address: 'ראשל״צ', note: '55" TV', location_url: 'https://maps.example/x' },
+      });
+      assert.deepEqual(split.body, { at: '2026-12-06', new_stop: { title: { he: 'ליד נתב״ג' }, accommodation: { name: 'בע״מ' } } });
+    } finally { await close(); }
+  });
+
+  test('organizer (write): the four refusals the hardening added each say what to do', async () => {
+    const { client, close } = await connect(true);
+    try {
+      for (const [bookingId, code, words] of [
+        [8, 'booking_belongs_to_another_stop', /filed under another stop/],
+        [11, 'booking_linked_to_another_stop', /already sets another stop/],
+        [13, 'invalid_text', /single quotes/],
+        [14, 'invalid_link', /http/],
+      ]) {
+        const r = await client.callTool({ name: 'set_stop_from_booking', arguments: { phase_id: 'colmar', booking_id: bookingId } });
+        assert.equal(r.isError, true, code);
+        assert.match(r.content[0].text, new RegExp(code));
+        assert.match(r.content[0].text.split('\n').slice(1).join('\n'), words, `${code}: the hint, not the echoed body`);
+      }
     } finally { await close(); }
   });
 
