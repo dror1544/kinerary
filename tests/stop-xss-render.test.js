@@ -168,8 +168,9 @@ describe('Classic functions outside the render region escape stop text too', () 
 //     accommodation's address, and the confirmation badge.
 // No other attribute carries stop text: data-tab / id / data-phase hold the
 // stop id (STOP_ID_RE: lowercase letters, digits, dashes), the only inline
-// handlers (loadWx, uploadPhotos) take a weather key that must match
-// /^[A-Za-z0-9_-]+$/ and a short id no stop write can set, and the countdown's
+// handler left (loadWx) takes a weather key that must match
+// /^[A-Za-z0-9_-]+$/ — the photo upload's phase id reaches uploadPhotos as a
+// data- attribute since the third review (runDataAction) — and the countdown's
 // aria-label/title are translation strings.
 const QUOTED = [
   'x" onmouseover="alert(1)',
@@ -318,4 +319,78 @@ describe('Classic: a stored " or \' in stop text stays text — element text and
       assert.equal(document.getElementById('hero-countdown').getAttribute('data-phase-tab'), 'colmar');
     });
   }
+});
+
+// ── Third boundary review 2026-10-11, finding D: the day schedule ──────────
+// renderDays put a config day's label, an item's time and text, and a planned
+// place's name into innerHTML raw. The provisioner writes all of them from the
+// interview or an uploaded document (through an LLM), so a hostile document
+// can reach them. Labels, times and place names are plain text. An ITEM's
+// text is an HTML fragment by contract — hand-authored trips link places
+// inline, and POST /api/phase-plan/export-to-config writes escaped text plus
+// <a> links into it — so it is rebuilt from an allow-list (http(s) links,
+// b/strong/i/em/br) rather than escaped: a link the organizer authored stays
+// a link, an & written as &amp; still shows once, and nothing else survives.
+const DAY_HOSTILE = [XSS, ...QUOTED, 'javascript:alert(1)', "x');alert(1);//"];
+const DAY_EXTRAS = { isOrganizer: false, PHASE_PLAN: {}, PHASE_PLAN_DAYS: {} };
+
+function renderSchedule(phase) {
+  const { document, ctx } = createRenderContext(`<div id="sched-${phase.id}"></div>`, { phases: [phase] }, 'en', DAY_EXTRAS);
+  ctx.renderDays(phase);
+  return document.getElementById(`sched-${phase.id}`);
+}
+
+describe('renderDays: config day label, item time and text, planned places (finding D)', () => {
+  for (const v of DAY_HOSTILE) {
+    test(`${JSON.stringify(v)} as a day label, an item time and an item text`, () => {
+      const el = renderSchedule({ id: 'ny', days: [{ date: '2027-03-11', label: { he: v, en: v }, items: [{ time: v, text: { he: v, en: v }, maps: 'javascript:alert(2)' }] }] });
+      assertQuoteInert(el);
+      assert.equal(el.querySelector('.day-label .lang-en').textContent, v, 'the label, as text');
+      const li = el.querySelector('li');
+      assert.equal(li.querySelector('strong').textContent, v, 'the time, as text');
+      assert.equal(li.querySelectorAll('a').length, 0, 'the javascript: map link is dropped');
+      // An item's text is an HTML fragment: a planted element is dropped, not
+      // created; anything that is not markup is shown exactly as typed.
+      const shown = li.querySelector('.lang-en').textContent;
+      assert.equal(shown, v.startsWith('<img') ? '' : v);
+    });
+
+    test(`${JSON.stringify(v)} as a planned place's name, with hostile links`, () => {
+      const el = renderSchedule({ id: 'tokyo', venues: [{ name: { he: v, en: v }, maps: v, waze: 'javascript:alert(3)', tickets: 'https://t.example/" onmouseover="alert(4)' }] });
+      assertQuoteInert(el);
+      const li = el.querySelector('.phase-places-block li');
+      assert.equal(li.querySelector('.lang-en').textContent, v);
+      assert.deepEqual([...li.querySelectorAll('a[href]')].map(a => a.getAttribute('href')), ['https://t.example/" onmouseover="alert(4)']);
+    });
+  }
+
+  test('an item\'s authored markup: an http(s) link stays a link, everything else is reduced to its text', () => {
+    const text = 'Visit <a href="https://www.google.com/maps/search/?q=Central+Park&amp;z=1" target="_blank" rel="noopener">Central Park</a> &amp; ' +
+      '<a href="javascript:alert(1)">the zoo</a>, <a href="https://x.example/" onclick="alert(2)" style="color:red">the pier</a>, ' +
+      '<strong>bold</strong> <span onmouseover="alert(3)">span</span> &amp;amp; <script>alert(4)</script>end';
+    const el = renderSchedule({ id: 'ny', days: [{ date: '2027-03-11', items: [{ time: '11:00', text: { he: text, en: text } }] }] });
+    assertQuoteInert(el);
+    const en = el.querySelector('li .lang-en');
+    assert.equal(en.textContent, 'Visit Central Park & the zoo, the pier, bold span &amp; end');
+    const links = [...en.querySelectorAll('a')];
+    assert.deepEqual(links.map(a => [a.getAttribute('href'), a.textContent, a.getAttribute('target'), a.getAttribute('rel')]), [
+      ['https://www.google.com/maps/search/?q=Central+Park&z=1', 'Central Park', '_blank', 'noopener'],
+      ['https://x.example/', 'the pier', '_blank', 'noopener'],
+    ]);
+    assert.ok(!links[1].hasAttribute('style'), 'no attribute is carried over from the authored tag');
+    assert.equal(en.querySelectorAll('strong').length, 1, 'plain formatting survives, with no attributes');
+    assert.equal(en.querySelectorAll('span, script').length, 0);
+  });
+
+  test('positive control: the fixture\'s schedule renders as before', () => {
+    const fixture = JSON.parse(readFileSync(join(HERE, 'fixtures', 'trip.config.json'), 'utf8'));
+    const ny = fixture.phases.find(p => p.id === 'ny');
+    const el = renderSchedule(ny);
+    assert.equal(el.querySelector('.day-label .lang-en').textContent, 'Sun 11/3 — New York');
+    const park = [...el.querySelectorAll('li')].find(li => li.textContent.includes('Central Park'));
+    assert.equal(park.querySelector('strong').textContent, '11:00');
+    assert.equal(park.querySelector('.lang-en a').getAttribute('href'), 'https://www.google.com/maps/search/Central+Park');
+    assert.equal(park.querySelector('.lang-en').textContent, 'Visit Central Park');
+    assert.equal(park.querySelector('.lang-he').textContent, 'ביקור ב־Central Park');
+  });
 });
