@@ -37,6 +37,19 @@ export const tokenStore = {
  */
 export const UNAUTHORIZED_EVENT = "kinerary:unauthorized";
 
+/**
+ * A refusal the server explained. `message` stays the server's error code (as
+ * every caller already reads it); `status` and `payload` carry the rest — the
+ * stop routes answer "items outside the new dates" WITH the list of items, and
+ * a message alone would drop the part the organizer has to decide about.
+ */
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number, readonly payload: Record<string, unknown>) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
 
   const headers = new Headers(init.headers);
@@ -57,7 +70,7 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
       tokenStore.clear();
       window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
     }
-    throw new Error(payload.error || "Request failed");
+    throw new ApiError(payload.error || "Request failed", response.status, payload && typeof payload === "object" ? payload : {});
   }
   return response.status === 204 ? (undefined as T) : response.json();
 }
