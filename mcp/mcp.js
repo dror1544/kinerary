@@ -136,6 +136,71 @@ async function apiGetBuffer(path) {
   return r.buffer();
 }
 
+// ── Stop routes: refusals reach the model whole ──────────────────────────────
+// The stop routes refuse with structured bodies the model has to act on — a
+// 409 lists every plan item a shrink would strand, a stale revision says to
+// re-read. errorSuffix() above caps a body at 300 characters, which cuts that
+// list off mid-item, so these calls read the whole body and say, per refusal
+// code, what to do next. The twin of this table is STOP_REFUSAL_HINTS in
+// server/trip-mcp/tools.js (the site's own MCP): the two servers run from
+// different checkouts and node_modules, so neither can require the other.
+const STOP_REFUSAL_HINTS = {
+  items_outside_stop: 'Plan items would fall outside the stop\'s new dates — every one is listed in "items". Tell the organizer which, then resend with on_outside: "keep" (they stay on this stop) or "move_to:<stop id>" (their days move to that stop).',
+  dates_outside_trip: 'A stop\'s dates must lie inside the trip\'s own dates ("trip" in the response). Stop editing never extends the trip.',
+  stops_changed_reload_before_retry: 'Someone changed the trip\'s stops since they were read. Call get_stops again, check the change still makes sense, and retry with the new revision.',
+  itinerary_changed_reload_before_retry: 'The plan changed since it was read. Re-read it and retry.',
+  booking_is_draft: 'That booking is still a draft awaiting the organizer\'s review; a draft shapes nothing. It can be linked once the organizer approves it.',
+  booking_not_hotel: 'Only a hotel booking can set a stop\'s dates and accommodation.',
+  booking_has_no_dates: 'The booking has no check-in/check-out dates. Fix the booking (update_booking date_from/date_to) first.',
+  booking_not_found: 'No booking with that id — call get_bookings.',
+  unknown_stop: 'No stop with that id — call get_stops for the valid ids.',
+  unplanned_stop_is_computed: 'That is the computed "days not planned yet" block, not a stop. Cover those days by changing a real stop\'s dates or splitting one, or move a planned day onto a stop with move_plan_day.',
+  stop_has_no_dates: 'This stop has no dates yet. Set them first, with update_stop (start and end) or set_stop_from_booking.',
+  split_date_not_inside_stop: 'at_date must be strictly after the stop\'s first day and strictly before its last, so both stops keep at least one night.',
+  new_stop_title_required: 'The new stop needs a title (title_he and/or title_en).',
+  stop_id_taken: 'That stop id is already in use.',
+  pin_not_accepted: 'A door code or PIN is never stored on a stop — it stays on the booking.',
+  unknown_accommodation_field: 'The accommodation carried a field a stop does not hold (named in "field").',
+  invalid_accommodation: 'An accommodation field has the wrong shape (named in "field"): text up to 300 characters; links must be http(s).',
+  invalid_on_outside: 'on_outside is "keep" or "move_to:<another stop\'s id>", and move_to must name a real stop other than this one.',
+  target_day_has_headline: 'Both stops already have a headline for that day (both are in the response). Ask the organizer which to keep, then resend with headline: "keep_target" or "take_source".',
+  day_not_found: 'Nothing is planned on that date under from_phase_id — read get_phase_plan to see which stop holds it.',
+  unknown_phase: 'from_phase_id is not a phase of this trip — call get_stops.',
+  same_phase: 'from_phase_id and to_phase_id are the same stop.',
+};
+
+function stopRefusal(method, path, status, data, text) {
+  const code = data && typeof data === 'object' ? data.error : null;
+  let hint = code ? STOP_REFUSAL_HINTS[code] : null;
+  // Express's own 404 for a route it does not have is HTML, not our JSON. On a
+  // stop route that means the trip SITE predates stop editing — the bridge is
+  // refreshed per trip (setup-mcp.sh) but the site only by a redeploy — and
+  // reading it as "unknown stop" would send the model hunting for an id.
+  if (!code && status === 404) {
+    hint = 'This trip\'s site does not have stop editing yet: it was built before the release that added it. Tell the organizer the stops cannot be changed from chat until the site is redeployed; do not retry.';
+  }
+  const shown = data !== null ? JSON.stringify(data) : String(text || '').trim();
+  const err = new Error(
+    `Refused by the trip site: ${method} ${path} → ${status}${code ? ` ${code}` : ''}.` +
+    `${hint ? ` ${hint}` : ''}\nServer response: ${shown.slice(0, 6000)}`
+  );
+  err.status = status;
+  err.code = code;
+  err.body = data;
+  return err;
+}
+
+async function stopsApi(method, path, body, { ifMatch } = {}) {
+  const headers = h();
+  if (ifMatch) headers['if-match'] = `"${ifMatch}"`;
+  const r = await fetchTrip(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  const text = await r.text();
+  let data = null;
+  try { data = JSON.parse(text); } catch { /* not JSON — kept as text */ }
+  if (!r.ok) throw stopRefusal(method, path, r.status, data, text);
+  return data;
+}
+
 const IMAGE_MIME_BY_EXT = {
   '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
   '.gif': 'image/gif', '.webp': 'image/webp', '.heic': 'image/heic', '.heif': 'image/heif',
@@ -377,7 +442,9 @@ mcp.tool('get_bookings', 'Get trip bookings (flights, hotels, cars, attractions)
 mcp.tool('add_booking',
   'Record a reservation — a flight, hotel, car or ticketed attraction with a confirmation to keep. ' +
   'A booking is not part of the active plan and does not put anything on the family\'s day-by-day schedule: to make something ' +
-  'appear on a day, use add_plan_item (optionally passing booking_id to show this confirmation inline).', {
+  'appear on a day, use add_plan_item (optionally passing booking_id to show this confirmation inline). ' +
+  'A hotel booking does not change a stop either: the stop\'s dates and where the family sleeps stay as they were. If the organizer ' +
+  'means this hotel to be that stop\'s (its nights, its accommodation), call set_stop_from_booking with the new booking\'s id afterwards.', {
   phase:        z.string().describe('Phase id from trip.config.json (see get_config), plus "intl_flights" for international flights'),
   type:         z.enum(['flight','hotel','car','attraction','other']).describe('Booking type'),
   name:         z.string().describe('Booking name / description'),
@@ -401,7 +468,10 @@ mcp.tool('update_booking',
   'day looks like returns 200, changes the booking, and changes nothing anyone sees. ' +
   'Every itinerary change goes to the active plan — a day\'s route, moving or swapping two days, fixing "today\'s" or "tomorrow\'s" ' +
   'plan: use swap_plan_days, update_plan_item, add_plan_item, delete_plan_item. Never edit the original plan to satisfy one. ' +
-  'Use update_booking when what is actually wrong is the reservation.', {
+  'Use update_booking when what is actually wrong is the reservation. ' +
+  'Changing a hotel booking\'s dates does not change the stop it belongs to: the booking\'s own check-in/check-out items follow it, ' +
+  'but the stop keeps its dates (get_stops then shows booking_out_of_sync). If the organizer means the stop to follow, call ' +
+  'set_stop_from_booking again afterwards.', {
   id:           z.number().describe('Booking ID from get_bookings'),
   name:         z.string().optional(),
   date_from:    z.string().optional(),
@@ -698,6 +768,199 @@ mcp.tool('delete_plan_item',
     id:       z.number().describe('Plan item ID from get_phase_plan'),
   },
   async ({ phase_id, id }) => ok(await apiDelete(`/api/phases/${phase_id}/plan/${id}`)));
+
+// ── Stops ─────────────────────────────────────────────────────────────────────
+// A trip's STRUCTURE — which stops it has, their nights, where the family
+// sleeps — edited after the interview through the site's stop routes
+// (server/trip-structure.js), which merge an override over trip.config.json so
+// a rebuild does not lose it. Each tool is one route; the route is the
+// authority on every rule, and its refusals reach the model whole (stopsApi).
+// The site's own MCP (server/trip-mcp/tools.js) offers the same five tools.
+//
+// Ids: the server's stop ids are lowercase letters, digits and hyphens, up to
+// 48 characters (STOP_ID_RE; a split's generated id is a 40-character slug
+// plus "-N"). Checked here so a path can never be steered by an id.
+const stopId = z.string().regex(/^[a-z0-9-]{1,48}$/, 'a stop id is lowercase letters, digits and hyphens (see get_stops)');
+const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD');
+const bookingId = z.number().int().positive();
+const stopRevision = z.string().regex(/^st-\d+$/, 'revision is the "revision" get_stops returned, e.g. "st-12"').optional()
+  .describe('Optional: the revision get_stops returned. If the stops changed since, the write is refused instead of overwriting someone else\'s change.');
+const onOutside = z.string().regex(/^(keep|move_to:[a-z0-9-]{1,48})$/, 'on_outside is "keep" or "move_to:<stop id>"').optional()
+  .describe('Only after a refusal listed plan items outside the new dates, and the organizer chose: "keep" leaves them on this stop; "move_to:<stop id>" moves their days to that stop.');
+const stopTitle = z.string().trim().min(1).max(120);
+const accText = z.string().max(300);
+const accUrl = z.string().url().regex(/^https?:\/\//i, 'links must be http(s)');
+// The server's "text" kind: one string, or { he, en }.
+const accLangText = z.union([accText.min(1), z.object({ he: accText.optional(), en: accText.optional() }).strict()]);
+// The fields a stop's accommodation holds — the server's ACCOMMODATION_KEYS.
+// Strict: an unknown key is refused here rather than silently dropped, and
+// `pin` is not among them on purpose (a door code is never stop data).
+const accommodationSchema = z.object({
+  name: accLangText.describe('Hotel / apartment name — a string, or { he, en }'),
+  name_en: accText.optional(), type: accText.optional().describe('e.g. "hotel", "apartment"'),
+  address: accText.optional(), phone: accText.optional(), confirmation: accText.optional(),
+  location_url: accUrl.optional().describe('Google Maps / Waze link to the place itself'),
+  maps: accUrl.optional(), waze: accUrl.optional(), url: accUrl.optional().describe('The place\'s own website'),
+  guests: z.union([accText, z.number()]).optional(), rooms: z.union([accText, z.number()]).optional(),
+  cost: z.union([accText, z.number()]).optional(),
+  dates: accLangText.optional(), description: accLangText.optional(), note: accLangText.optional(),
+}).strict();
+const enc = s => encodeURIComponent(String(s));
+
+// The stop as it is now, for filling in what a partial update did not say.
+async function currentStop(phase_id) {
+  const list = await stopsApi('GET', '/api/stops');
+  const entry = (list?.stops || []).find(s => s.id === phase_id);
+  if (!entry) throw new Error(`There is no stop "${phase_id}" on this trip — call get_stops for the valid ids. Nothing was changed.`);
+  if (entry.unplanned) throw new Error(`"${phase_id}" is the computed "days not planned yet" block, not a stop: change a real stop's dates or split one to cover those days. Nothing was changed.`);
+  return { stop: entry.stop || {}, revision: list.revision };
+}
+
+mcp.tool('get_stops',
+  'The trip\'s STOPS — the places it is made of, each with its nights (dates), its accommodation and its title — as the site shows them ' +
+  'now, plus "revision" (pass it to a stop write to refuse rather than overwrite a change made meanwhile) and the trip\'s own dates. ' +
+  'Read this before changing a stop, and to find stop ids. Per stop: kind "config" (from the trip\'s setup), "added" (split off later) or ' +
+  '"computed" (the "days not planned yet" block — not a stop, cannot be edited); "override" says what was changed since setup and by whom; ' +
+  '"conflict" means a rebuild changed a field the organizer had already changed (theirs is kept — tell the organizer); ' +
+  '"booking_out_of_sync" means the hotel booking a stop was set from now has other dates — set_stop_from_booking again re-applies it. ' +
+  'Organizer-only information: do not post "override", "conflict" or who changed what into the family group.', {},
+  async () => ok(await stopsApi('GET', '/api/stops')));
+
+mcp.tool('update_stop',
+  'Change one stop: its dates (start/end — the nights there), its title, and/or its accommodation. Use for "we arrive in Colmar on the 3rd", ' +
+  '"rename the stop", "we are staying at X there". Send only what changes: give just start or just end and the other is kept; give one ' +
+  'language of the title and the other is kept. accommodation REPLACES the stop\'s whole accommodation (null removes it) — include every ' +
+  'field that should remain. A hotel BOOKING is linked with set_stop_from_booking instead, which also adds check-in/check-out. ' +
+  'It refuses: dates outside the trip\'s own dates (the trip is never extended); a range that would leave plan items outside it — the ' +
+  'refusal lists them; tell the organizer, then resend with on_outside; a PIN or door code; the computed "days not planned yet" block; and, ' +
+  'with revision, a stop list that changed since you read it. ' +
+  'Returns the effective stop as the site now shows it — read it back to the organizer rather than trusting the success.', {
+  phase_id: stopId.describe('Stop id from get_stops'),
+  start: isoDate.optional().describe('First day at this stop, YYYY-MM-DD'),
+  end: isoDate.optional().describe('Last day at this stop (the check-out / travel day), YYYY-MM-DD'),
+  title_he: stopTitle.optional().describe('Stop title in Hebrew'),
+  title_en: stopTitle.optional().describe('Stop title in English'),
+  accommodation: accommodationSchema.nullable().optional().describe('Where the family sleeps at this stop — replaces the whole accommodation; null removes it'),
+  on_outside: onOutside,
+  revision: stopRevision,
+}, async ({ phase_id, start, end, title_he, title_en, accommodation, on_outside, revision }) => {
+  const halfDates = (start === undefined) !== (end === undefined);
+  const halfTitle = (title_he === undefined) !== (title_en === undefined);
+  if (start === undefined && end === undefined && title_he === undefined && title_en === undefined && accommodation === undefined) {
+    throw new Error('Nothing to change: give start/end, a title, or accommodation.');
+  }
+  let ifMatch = revision;
+  let current = null;
+  if (halfDates || halfTitle) {
+    // Read-then-write: sent under the revision it was read at, so a change
+    // made in between is refused rather than half-overwritten.
+    current = await currentStop(phase_id);
+    ifMatch = ifMatch || current.revision;
+  }
+  const body = {};
+  if (start !== undefined || end !== undefined) {
+    const s = start ?? current?.stop?.dates?.start;
+    const e = end ?? current?.stop?.dates?.end;
+    if (!s || !e) throw new Error(`Stop "${phase_id}" has no dates yet, so both start and end are needed. Nothing was changed.`);
+    body.dates = { start: s, end: e };
+  }
+  if (title_he !== undefined || title_en !== undefined) {
+    const was = current?.stop?.title;
+    const keep = lang => (typeof was === 'string' ? was : was?.[lang]);
+    const title = {};
+    const he = title_he ?? keep('he');
+    const en = title_en ?? keep('en');
+    if (he) title.he = he;
+    if (en) title.en = en;
+    body.title = title;
+  }
+  if (accommodation !== undefined) body.accommodation = accommodation;
+  if (on_outside !== undefined) body.on_outside = on_outside;
+  return ok(await stopsApi('PATCH', `/api/stops/${enc(phase_id)}`, body, { ifMatch }));
+});
+
+mcp.tool('split_stop',
+  'Split one stop in two at a date — "the last night near the airport", "two nights in Strasbourg in the middle of Colmar". The stop ends on ' +
+  'at_date and a NEW stop, right after it, runs from at_date to the old end; plan items and headlines dated after at_date move to the new ' +
+  'stop (at_date itself, the transfer day, stays with the first), and both stops are queued for a wording review. ' +
+  'Give the new stop a title (title_he and/or title_en), and optionally its accommodation; with booking_id, that hotel booking is then ' +
+  'linked to the new stop exactly as set_stop_from_booking would (its dates, its accommodation, check-in/check-out). ' +
+  'It refuses: a stop with no dates yet; an at_date not strictly inside the stop (both must keep a night); no title; the computed ' +
+  '"days not planned yet" block. If the split succeeds but the booking link is refused, the result says so under "booking_link" — the split ' +
+  'stands; do not split again, fix the booking and call set_stop_from_booking on the new stop. ' +
+  'Returns both stops as the site now shows them — read them back to the organizer.', {
+  phase_id: stopId.describe('Stop id from get_stops — the stop to split'),
+  at_date: isoDate.describe('The day the new stop begins (and the first one ends), YYYY-MM-DD'),
+  title_he: stopTitle.optional().describe('New stop title in Hebrew'),
+  title_en: stopTitle.optional().describe('New stop title in English'),
+  accommodation: accommodationSchema.optional().describe('Where the family sleeps at the new stop'),
+  booking_id: bookingId.optional().describe('A hotel booking (get_bookings) to link to the NEW stop after the split'),
+  revision: stopRevision,
+}, async ({ phase_id, at_date, title_he, title_en, accommodation, booking_id, revision }) => {
+  if (!title_he && !title_en) throw new Error('The new stop needs a title: give title_he and/or title_en. Nothing was changed.');
+  const new_stop = { title: { ...(title_he ? { he: title_he } : {}), ...(title_en ? { en: title_en } : {}) } };
+  if (accommodation !== undefined) new_stop.accommodation = accommodation;
+  const split = await stopsApi('POST', `/api/stops/${enc(phase_id)}/split`, { at: at_date, new_stop }, { ifMatch: revision });
+  if (booking_id === undefined) return ok(split);
+  const newId = split?.stops?.[1]?.id;
+  try {
+    const booking = await stopsApi('POST', `/api/stops/${enc(newId)}/from-booking`, { booking_id });
+    return ok({ split, booking });
+  } catch (err) {
+    if (!err.status) throw err;
+    // The split committed; only the link was refused. Reporting the whole
+    // call as an error would read as "nothing happened" and invite a second
+    // split.
+    return ok({
+      split,
+      booking_link: {
+        refused: true, status: err.status, error: err.code || null, response: err.body ?? null,
+        message: `The split DID happen: "${newId}" is a new stop. Linking booking ${booking_id} to it was refused (${err.code || err.status}). ` +
+          `${STOP_REFUSAL_HINTS[err.code] || ''} Once fixed, call set_stop_from_booking with phase_id "${newId}"; do not split again.`.trim(),
+      },
+    });
+  }
+});
+
+mcp.tool('set_stop_from_booking',
+  'Make an approved HOTEL booking that stop\'s: the stop\'s dates become the booking\'s check-in to check-out, its accommodation becomes the ' +
+  'hotel (name, confirmation, map link — never the PIN or the booking notes), and one check-in item (on check-in day) and one check-out item ' +
+  '(on check-out day) are put on the plan, linked to the booking. Idempotent: running it again re-applies the booking\'s current dates and ' +
+  'never duplicates the items. This is how "we booked the hotel for 2–7 Dec" becomes the stop the family sees — adding the booking alone ' +
+  'changes no stop. It always sets both the dates and the accommodation; to change only the accommodation, use update_stop. ' +
+  'It refuses: a booking still in draft (awaiting the organizer\'s review); a booking that is not a hotel or has no dates; dates outside ' +
+  'the trip\'s own dates; a range that would leave plan items outside the stop — the refusal lists them; tell the organizer, then resend ' +
+  'with on_outside. Returns the effective stop and the check-in/check-out item ids — read them back to the organizer.', {
+  phase_id: stopId.describe('Stop id from get_stops'),
+  booking_id: bookingId.describe('Hotel booking id from get_bookings'),
+  add_checkin_checkout: z.boolean().optional().describe('Default true. false links the booking without putting check-in/check-out on the plan.'),
+  on_outside: onOutside,
+  revision: stopRevision,
+}, async ({ phase_id, booking_id, add_checkin_checkout, on_outside, revision }) => {
+  const body = { booking_id };
+  if (add_checkin_checkout !== undefined) body.create_items = add_checkin_checkout;
+  if (on_outside !== undefined) body.on_outside = on_outside;
+  return ok(await stopsApi('POST', `/api/stops/${enc(phase_id)}/from-booking`, body, { ifMatch: revision }));
+});
+
+mcp.tool('move_plan_day',
+  'Move one whole day of the ACTIVE PLAN — every item on that date and its headline — from one stop to another, in one change. This is how ' +
+  'a day filed under the computed "days not planned yet" block is given to a stop, or a day is re-filed after stops changed. It changes ' +
+  'which stop the day belongs to, not its date (to exchange two dates inside one stop, use swap_plan_days). Both stops are queued for a ' +
+  'wording review: re-read their plans shortly and tell the organizer about any `correction`. ' +
+  'It refuses: a target that is not a real stop (the computed block cannot receive a day); a date with nothing on it under from_phase_id; ' +
+  'the same stop twice; and, when both stops already have a headline for that day, it refuses until you pass headline. ' +
+  'Returns what moved — read get_phase_plan for the target stop back to the organizer.', {
+  from_phase_id: stopId.describe('The stop (or the computed open-days block) the day is under now'),
+  date: isoDate.describe('The day to move, YYYY-MM-DD'),
+  to_phase_id: stopId.describe('The stop it should belong to — a real stop from get_stops'),
+  headline: z.enum(['keep_target', 'take_source']).optional()
+    .describe('Only after a refusal said both stops have a headline for the day: keep_target keeps the target stop\'s, take_source brings this one\'s.'),
+}, async ({ from_phase_id, date, to_phase_id, headline }) => {
+  const body = { from_phase_id, date, to_phase_id };
+  if (headline !== undefined) body.headline = headline;
+  return ok(await stopsApi('POST', '/api/itinerary/move-day', body));
+});
 
 mcp.tool('import_plan_from_bookings',
   'Migration tool: scan all bookings that have long notes (>80 chars) and create phase_plan_items from them. ' +
