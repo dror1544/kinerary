@@ -68,3 +68,26 @@ it('holds affected queries during editing and applies pending changes after clos
   await vi.advanceTimersByTimeAsync(150);
   expect(invalidate.mock.calls.map(call => call[0]?.queryKey)).toEqual([['bookings']]);
 });
+
+it('a stop change refreshes the effective config, the itinerary and today — the Journey tab follows without a reload', async () => {
+  vi.useFakeTimers();
+  let source!: ReadableStreamDefaultController<Uint8Array>;
+  vi.stubGlobal('fetch', vi.fn(async () => new Response(new ReadableStream<Uint8Array>({ start(controller) { source = controller; } }), { headers: { 'content-type': 'text/event-stream' } })));
+  const client = new QueryClient();
+  const invalidate = vi.spyOn(client, 'invalidateQueries');
+  stop = startTripUpdates(client);
+  await vi.advanceTimersByTimeAsync(0);
+  const emit = (event: string, revisions: Record<string, number>) => source.enqueue(new TextEncoder().encode(`event: ${event}\ndata: ${JSON.stringify({ revisions })}\n\n`));
+  emit('ready', { stops: 0, itinerary: 0 });
+  await vi.advanceTimersByTimeAsync(150);
+  invalidate.mockClear();
+  emit('change', { stops: 1, itinerary: 0 });
+  await vi.advanceTimersByTimeAsync(150);
+  const keys = invalidate.mock.calls.map(call => call[0]?.queryKey?.[0]);
+  expect(keys).toEqual(expect.arrayContaining(['config', 'itinerary', 'today', 'stops']));
+  // A plan change can recompute the open-days stretch in the config too.
+  invalidate.mockClear();
+  emit('change', { stops: 1, itinerary: 1 });
+  await vi.advanceTimersByTimeAsync(150);
+  expect(invalidate.mock.calls.map(call => call[0]?.queryKey?.[0])).toContain('config');
+});
