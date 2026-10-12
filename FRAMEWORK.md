@@ -564,7 +564,7 @@ hasn't been connected to any username yet — the response is meant to prompt
 
 ### Security Model
 - JWT tokens (30-day expiry); `authRequired` middleware on all private routes
-- Guest endpoints (no login): the lost & found form (`POST /api/lost-found` — no rate limit, #207), the
+- Guest endpoints (no login): the lost & found form (`POST /api/lost-found` — no login by design; text rules at the write, 5 accepted reports per hour per client address (set `TRUST_PROXY_HOPS` behind a proxy that appends to `X-Forwarded-For`, otherwise every visitor shares one bucket) and at most 200 open entries, #207), the
   public trivia TV view and its SSE stream, `GET /api/trip/logo`, `GET /api/config/roster`, and the
   `/photo/:id?s=` share page (below). Everything else in the gallery and social surface needs a login
   (#191, #194).
