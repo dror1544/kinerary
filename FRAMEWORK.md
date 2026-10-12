@@ -10,7 +10,7 @@ Most families plan trips in a WhatsApp group. This replaces that chaos with a pr
 
 **Who it's for:** A trip organizer who can set up Docker and edit JSON. Participants need only a phone or browser — no installs, no accounts to create (organizer seeds all users).
 
-**Scale:** Designed for 2–30 people across 1–6 trip phases, with 11 DB tables and 24 features under the hood — scales down just as well to a 2-person trip (see `trips/japan-2025/`) as up to a large multi-family group.
+**Scale:** Designed for 2–30 people across 1–6 trip phases, with 31 DB tables and 26 features under the hood — scales down just as well to a 2-person trip (see `trips/japan-2025/`) as up to a large multi-family group.
 
 ---
 
@@ -51,8 +51,8 @@ Most families plan trips in a WhatsApp group. This replaces that chaos with a pr
 
 ```
 Browser
-  ↓ HTTP (port 8080)
-nginx (Alpine Docker)
+  ↓ HTTP (host port 8081)
+nginx (Alpine Docker, :80 inside)
   ↓ /api/*        ↓ /*
 Node.js Server   Static Files
 (Express, :3000) (site/, bind-mount)
@@ -73,14 +73,14 @@ site/
   manifest.json       — PWA manifest
 server/
   server.js           — Express routes, SQLite schema, SSE, Immich, auth middleware
-  trivia_questions.json — Question bank (40 Q&A per trip)
   data/trip.db        — SQLite database (not in git)
-trip/
+trips/<slug>/
   trip.config.json    — Single source of truth (see below)
+  trivia_questions.json — Question bank (40 Q&A per trip)
 scripts/
   new-trip.js         — Interactive CLI to scaffold a new trip config
   obsidian-to-config.js — Obsidian markdown vault → skeleton config
-docker-compose.yml    — nginx + node services; TRIP_DIR env for config path
+docker-compose.yml    — nginx + node services; TRIP_DIR_HOST selects the trip directory
 nginx.conf            — Reverse proxy, SSE buffering, file upload limits
 ```
 
@@ -88,7 +88,7 @@ nginx.conf            — Reverse proxy, SSE buffering, file upload limits
 
 ## Config-Driven Architecture
 
-Everything trip-specific lives in **`trip/trip.config.json`**. The framework code never stores trip data.
+Everything trip-specific lives in **`trips/<slug>/trip.config.json`**. The framework code never stores trip data.
 
 ```json
 {
@@ -257,12 +257,9 @@ code. See `.claude/skills/create-trip/SKILL.md`.
 TRIP_DIR=./trips/my-trip node server/server.js
 
 # Docker (production)
-# Set TRIP_DIR in docker-compose.yml and map the trip directory as a volume:
-# volumes:
-#   - ./trips/my-trip:/trip:ro
-# environment:
-#   TRIP_DIR: /trip
-docker compose up -d --build
+# docker-compose.yml mounts ${TRIP_DIR_HOST} read-only at /trip and sets TRIP_DIR=/trip.
+# TRIP_DIR_HOST defaults to ./trip, a name reserved for the unset case — always set it:
+TRIP_DIR_HOST=./trips/my-trip docker compose up -d --build
 ```
 
 **What to fill in after scaffolding:**
@@ -435,23 +432,23 @@ Two ways to use it, same server either way:
 ## Infrastructure Details
 
 ### Docker Compose
-- **nginx** (`:8080`) — reverse proxy, static file server
+- **nginx** (`:8081` on the host, `:80` in the container) — reverse proxy, static file server
 - **node** (`:3000` internal) — Express API server
-- Volumes: `site/` read-only into nginx; `trip/` read-only at `$TRIP_DIR`; `server/data/` for SQLite
+- Volumes: `site/` read-only into nginx; the trip directory (`$TRIP_DIR_HOST`) read-only at `/trip`; `server/data/` for SQLite
 
 ### nginx — Critical Settings
 ```nginx
 # SSE routes must bypass buffering
-location /api/trivia/events {
+location ~ ^/api/(events$|trivia/(events|public-events)) {
     proxy_buffering off;
     proxy_cache off;
 }
 
-# File uploads
+# File uploads (inside `location /api/`)
 client_max_body_size 500m;
 
-# PDF inline display
-add_header Content-Disposition inline;
+# Booking documents and PDFs are proxied to Express, which authenticates them
+# and sets Content-Disposition itself — nginx never reads them from disk.
 ```
 
 ### Immich (optional photo sync)
@@ -539,7 +536,7 @@ hasn't been connected to any username yet — the response is meant to prompt
 
 ---
 
-## Database Schema (13 tables)
+## Database Schema (31 tables; 35 with the trip connector on)
 
 | Table | Purpose |
 |---|---|
@@ -556,6 +553,20 @@ hasn't been connected to any username yet — the response is meant to prompt
 | `trivia_scores` | Game history with rank and score |
 | `phase_plan_items` | The active plan: one row per activity, dated into a phase |
 | `phase_plan_days` | The active plan's day headlines — one per (phase, date), shown above its items |
+| `phase_plan_import_log` | Which bookings the one-off plan import already consumed |
+| `bookings` | Reservations: supplier, confirmation, cost, passengers, document |
+| `trip_config_versions` | Saved copies of `trip.config.json`, one row per version |
+| `itinerary_plan_versions` / `itinerary_plan_days` / `itinerary_plan_items` | Immutable original/active itinerary revisions (triggers refuse update and delete) |
+| `trip_itinerary_state` | Which revision is the original and which is active |
+| `trip_moments` | Draft or published trip moments |
+| `trip_quality_issues` | Itinerary quality findings (engine, user or Hermes), with status |
+| `trip_daily_messages` | One bilingual message per date |
+| `trip_ui_settings` / `trip_settings` | Single-row site settings: design variant, hero media, timezone |
+| `provider_observations` | Cached external-provider answers, with expiry |
+| `trip_resource_revisions` | Change counters behind the live-update events |
+| `control_plane_identities` | Maps a control-plane user to a local username and role |
+| `companion_conversation` / `companion_inbox_status` / `companion_connection` | The shared companion thread and its group-connection state |
+| `mcp_oauth_clients` / `_codes` / `_grants` / `_tokens` | Trip connector OAuth state — created only when the connector is enabled (`TRIP_MCP_ENABLED` and a valid `PUBLIC_ORIGIN`) |
 
 ---
 
