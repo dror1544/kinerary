@@ -604,7 +604,14 @@ hasn't been connected to any username yet — the response is meant to prompt
   extension (`png jpg jpeg gif svg webp`) whose real path is inside the trip directory, with `nosniff`
   and, for SVG, `sandbox`.
 - Admin: `meta.admin` in `trip.config.json` (falls back to the first participant if unset); controls trivia start/reveal/reset
-- Passwords: bcrypt-hashed; PIN codes for hotel check-in (served from config, never stored in DB)
+- Passwords and PINs, two different things:
+  - **Participant logins** (the password or PIN a family member signs in with): bcrypt-hashed, never stored in clear
+    and never served.
+  - **Hotel PINs and door codes** exist in two places. `accommodation.pin` in `trip.config.json` is withheld by the
+    config allow-list (never served) and the stop layer refuses to accept one (`pin_not_accepted`). A booking's `pin`
+    is a column of the `bookings` table, written by an organizer or the companion (text-validated at the write); it is
+    stored in the site database and served to signed-in family members by `GET /api/bookings`, by design (owner
+    decision, 2026-10-11). `GET /api/bookings` omits drafts for everyone but organizers.
 - **Trip config is served through an allow-list** (#172): `/api/config`, `/api/config/versions/:version`,
   the public `/api/config/roster`, `/api/hermes/status`, the plan importers and the served itinerary all
   project `trip.config.json` through `shared/config-visibility.js` (engine: `shared/allow-list.js`).
