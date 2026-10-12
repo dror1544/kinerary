@@ -4,10 +4,10 @@
  */
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'fs';
+import { readFileSync, readdirSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
-import { startTestServer, stopTestServer, api, loginAsAlice } from './helpers/server.js';
+import { startTestServer, stopTestServer, api, loginAsAlice, testTripDir } from './helpers/server.js';
 import { PORTS } from './helpers/ports.js';
 
 let token;
@@ -300,7 +300,7 @@ describe('GET /api/config/warnings', () => {
     const res = await api('/api/config/warnings', { token });
     assert.equal(res.status, 200);
     const warnings = await res.json();
-    const eveWarnings = warnings.filter(w => w.username === 'eve');
+    const eveWarnings = warnings.filter(w => w.scope === 'participant' && w.participantIndex === 2);
     // eve's 4 fixture needs contribute 5 issues between them:
     //   [1] malformed entry      → unknown type, unknown severity, missing text (3)
     //   [2] garbage visibility   → unknown visibility (1)
@@ -322,6 +322,9 @@ describe('GET /api/config/warnings', () => {
     for (const raw of ['unrecognized-type', 'crticial', 'porcupine']) {
       assert.ok(!body.includes(raw), `raw config value "${raw}" leaked into /api/config/warnings`);
     }
+    for (const username of ['eve', 'alice', 'bob']) {
+      assert.ok(!body.includes(JSON.stringify(username)), `participant username ${username} leaked`);
+    }
     assert.ok(body.includes('value withheld'), 'expected the redaction marker so the organizer knows where to look');
   });
 
@@ -335,7 +338,8 @@ describe('GET /api/config/warnings', () => {
   test('alice has no warnings (no needs at all)', async () => {
     const res = await api('/api/config/warnings', { token });
     const warnings = await res.json();
-    assert.ok(!warnings.some(w => w.username === 'alice'));
+    assert.ok(!warnings.some(w => w.scope === 'participant' && w.participantIndex === 0));
+    assert.ok(!warnings.some(w => 'username' in w));
   });
 
   test('reports the agent block\'s malformed fields', async () => {
@@ -458,15 +462,42 @@ describe('GET /api/bookings — auth', () => {
 // ── GET /api/bookings/confirmation/:fn — auth ─────────────────────────────────
 describe('GET /api/bookings/confirmation/:fn — auth', () => {
   let confFile;
+  const pdf = Buffer.from('%PDF-1.4 test confirmation original');
+
+  function confirmationForm() {
+    const form = new FormData();
+    form.append('file', new Blob([pdf], { type: 'application/pdf' }), 'test.pdf');
+    return form;
+  }
+
+  function uploadedFiles() {
+    return readdirSync(join(dirname(testTripDir()), 'confirmations')).sort();
+  }
 
   before(async () => {
     const all = await (await api('/api/bookings', { token })).json();
     const seed = all.find(b => b.seed_key === 'test-seed-hotel-nyc');
-    const form = new FormData();
-    form.append('file', new Blob([Buffer.from('%PDF-1.4 test')], { type: 'application/pdf' }), 'test.pdf');
-    const uploadRes = await api(`/api/bookings/${seed.id}/confirmation`, { method: 'POST', token, body: form });
+    const uploadRes = await api(`/api/bookings/${seed.id}/confirmation`, { method: 'POST', token, body: confirmationForm() });
     assert.equal(uploadRes.status, 200);
     ({ conf_file: confFile } = await uploadRes.json());
+    const linked = await (await api('/api/bookings', { token })).json();
+    assert.equal(linked.find(b => b.id === seed.id)?.conf_file, confFile);
+  });
+
+  test('rejects an absent booking and leaves no uploaded confirmation', async () => {
+    const before = uploadedFiles();
+    const res = await api('/api/bookings/999999999/confirmation', { method: 'POST', token, body: confirmationForm() });
+    assert.equal(res.status, 404);
+    assert.deepEqual(uploadedFiles(), before);
+  });
+
+  test('rejects a member upload before writing a file', async () => {
+    const login = await api('/api/auth/login', { method: 'POST', body: { username: 'bob', password: '1234' } });
+    const bobToken = (await login.json()).token;
+    const before = uploadedFiles();
+    const res = await api('/api/bookings/1/confirmation', { method: 'POST', token: bobToken, body: confirmationForm() });
+    assert.equal(res.status, 403);
+    assert.deepEqual(uploadedFiles(), before);
   });
 
   test('returns 401 without any auth', async () => {
@@ -477,6 +508,22 @@ describe('GET /api/bookings/confirmation/:fn — auth', () => {
   test('returns 200 with a valid Bearer token', async () => {
     const res = await api(`/api/bookings/confirmation/${confFile}`, { token });
     assert.equal(res.status, 200);
+    assert.equal(res.headers.get('content-type'), 'application/pdf');
+    assert.deepEqual(Buffer.from(await res.arrayBuffer()), pdf);
+  });
+
+  test('keeps the prior original readable after replacing the booking link', async () => {
+    const all = await (await api('/api/bookings', { token })).json();
+    const seed = all.find(b => b.seed_key === 'test-seed-hotel-nyc');
+    const replacement = await api(`/api/bookings/${seed.id}/confirmation`, { method: 'POST', token, body: confirmationForm() });
+    assert.equal(replacement.status, 200);
+    const { conf_file: latest } = await replacement.json();
+    assert.notEqual(latest, confFile, 'replacement must use a distinct filename');
+    const linked = await (await api('/api/bookings', { token })).json();
+    assert.equal(linked.find(b => b.id === seed.id)?.conf_file, latest);
+    const previous = await api(`/api/bookings/confirmation/${confFile}`, { token });
+    assert.equal(previous.status, 200);
+    assert.deepEqual(Buffer.from(await previous.arrayBuffer()), pdf);
   });
 
   test('returns 200 with a ?_t= query token (shared authRequired path, used by SSE — not by the booking-file links, which fetch with a header instead)', async () => {

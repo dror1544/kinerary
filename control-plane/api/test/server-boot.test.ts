@@ -101,6 +101,7 @@ async function bootServer(profile: Record<string, unknown>, port: number): Promi
       CONTROL_PLANE_DATABASE_URL: "postgresql://unused.invalid:5432/unused",
       CONTROL_PLANE_TELEGRAM_BOT_TOKEN: "12345678:AAFakeBootTestBotToken",
       CONTROL_PLANE_ACTION_SECRET: "boot-test-action-secret",
+      KINERARY_TEST_RUNTIME_EXCHANGE_KEY: "boot-runtime-exchange-secret",
       CONTROL_PLANE_TELEGRAM_WEBHOOK_SECRET: "boot-test-webhook-secret",
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -250,6 +251,7 @@ test("the real server entrypoint refuses to start when a signup secret cannot be
         // secret must stop the boot rather than yield a half-configured
         // server that 503s at request time.
         CONTROL_PLANE_ACTION_SECRET: "boot-test-action-secret",
+      KINERARY_TEST_RUNTIME_EXCHANGE_KEY: "boot-runtime-exchange-secret",
         CONTROL_PLANE_TELEGRAM_WEBHOOK_SECRET: "boot-test-webhook-secret",
         CONTROL_PLANE_TELEGRAM_BOT_TOKEN: "",
       },
@@ -343,4 +345,21 @@ test("the real server entrypoint boots when several shared secret keys are all g
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+
+test("the real portal server boots without Google credentials and advertises email login", async () => {
+  const port = await freePort(), workerPort = await freePort();
+  const server = await bootServer({ ...baseProfile(port, workerPort), web: {
+    public_origin: `http://127.0.0.1:${port}`, runtime_origin: "http://127.0.0.1:4320",
+    runtime_exchange_key_secret_ref: "env://KINERARY_TEST_RUNTIME_EXCHANGE_KEY",
+    runtime_upstream_host_suffixes: ["internal"], telegram_bot_username: "kinerary_bot",
+  } }, port);
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/v1/auth/capabilities`);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { google: false, emailPassword: true });
+    const google = await fetch(`http://127.0.0.1:${port}/v1/auth/google/start`);
+    assert.equal(google.status, 503);
+  } finally { await server.stop(); }
 });

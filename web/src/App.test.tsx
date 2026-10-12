@@ -7,6 +7,7 @@ import { App } from "./App";
 function renderRoute(route: string, authenticated = false) {
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
+    if (url === "/v1/auth/capabilities") return new Response(JSON.stringify({ google: true, emailPassword: true }));
     if (url === "/v1/me") return new Response(authenticated ? JSON.stringify({ id: "user_test", displayName: "Test Organizer" }) : JSON.stringify({ error: "AUTHENTICATION_REQUIRED" }), { status: authenticated ? 200 : 401, headers: { "content-type": "application/json" } });
     if (url === "/v1/trips") return new Response(JSON.stringify({ trips: [] }), { status: 200, headers: { "content-type": "application/json" } });
     return new Response(JSON.stringify({ error: "NOT_FOUND" }), { status: 404, headers: { "content-type": "application/json" } });
@@ -69,7 +70,7 @@ describe("Kinerary SPA routes", () => {
   it("renders the sign-in route directly", async () => {
     renderRoute("/sign-in");
     expect(await screen.findByRole("heading", { name: /sign in to continue/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /continue with google/i })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: /continue with google/i })).toBeInTheDocument();
   });
 
   it("renders the authenticated trip dashboard", async () => {
