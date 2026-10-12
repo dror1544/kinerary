@@ -220,7 +220,7 @@ async function stopsApi(method, path, body, { ifMatch } = {}) {
 // the model what to do with it. The twin of this table is WRITE_REFUSAL_HINTS
 // in server/trip-mcp/tools.js.
 const WRITE_REFUSAL_HINTS = {
-  invalid_text: 'The text in "field" has a character the site does not store: < or >, a control character (a line break is allowed only in notes), or an invisible character that changes the text\'s direction or display (often pasted in; Hebrew\'s own RLM/LRM marks are fine). Quotes are fine and are stored as typed (ארה"ב, 55" TV).',
+  invalid_text: 'The text in "field" has a character the site does not store: < or >, a control character (a line break is allowed only in notes), or an invisible character that changes the text\'s direction or display (often pasted in; Hebrew\'s own RLM/LRM marks are fine, except in a confirmation number or PIN, which take none). Quotes are fine and are stored as typed (ארה"ב, 55" TV).',
   invalid_link: 'The link in "field" must be a full address starting http:// or https://, with a real host and no quotes, spaces, backslashes or < >.',
   invalid_date: 'The date in "field" must be YYYY-MM-DD (a real date).',
   text_too_long: 'The text in "field" is longer than the site keeps ("max" characters).',
