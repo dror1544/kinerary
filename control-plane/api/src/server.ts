@@ -119,8 +119,11 @@ if (chatRoutingKey) {
 
 let portal: PortalDependencies | undefined;
 if (profile.web) {
-  const [googleClientId, googleClientSecret, runtimeExchangeKey] = await Promise.all([resolveSecretRef(profile.web.google_client_id_secret_ref), resolveSecretRef(profile.web.google_client_secret_ref), resolveSecretRef(profile.web.runtime_exchange_key_secret_ref)]);
-  portal = { db: pool, google: new GoogleOidcClient(googleClientId, googleClientSecret, `${profile.web.public_origin}/v1/auth/google/callback`), runtimeAccounts: new HttpRuntimeAccountAdapter(profile.web.runtime_origin, runtimeExchangeKey), publicOrigin: profile.web.public_origin, runtimeOrigin: profile.web.runtime_origin, runtimeExchangeKey, runtimeUpstreamHostSuffixes: profile.web.runtime_upstream_host_suffixes, telegramBotUsername: profile.web.telegram_bot_username, sessionTtlSeconds: profile.web.session_ttl_seconds, enrollmentTtlSeconds: profile.signup?.enrollment_ttl_seconds ?? 86400, approvalTtlSeconds: 86400, operatorChatId };
+  const runtimeExchangeKey = await resolveSecretRef(profile.web.runtime_exchange_key_secret_ref);
+  const google = profile.web.google_client_id_secret_ref && profile.web.google_client_secret_ref
+    ? new GoogleOidcClient(await resolveSecretRef(profile.web.google_client_id_secret_ref), await resolveSecretRef(profile.web.google_client_secret_ref), `${profile.web.public_origin}/v1/auth/google/callback`)
+    : undefined;
+  portal = { db: pool, google, runtimeAccounts: new HttpRuntimeAccountAdapter(profile.web.runtime_origin, runtimeExchangeKey), publicOrigin: profile.web.public_origin, runtimeOrigin: profile.web.runtime_origin, runtimeExchangeKey, runtimeUpstreamHostSuffixes: profile.web.runtime_upstream_host_suffixes, telegramBotUsername: profile.web.telegram_bot_username, sessionTtlSeconds: profile.web.session_ttl_seconds, enrollmentTtlSeconds: profile.signup?.enrollment_ttl_seconds ?? 86400, approvalTtlSeconds: 86400, operatorChatId };
 }
 
 // The interviewer agent's chat-addressed interview routes, which the MCP

@@ -285,7 +285,10 @@ export async function verifyPasswordLogin(
     [emailDigest],
   );
   const [row] = result.rows;
-  if (!row || !(await verifyPassword(payload.password, row.password_hash))) {
+  // Missing addresses do the same scrypt work as an incorrect password on an
+  // existing credential. The dummy result can never authenticate an account.
+  const matches = await verifyPassword(payload.password, row?.password_hash ?? `scrypt:unregistered-email-dummy:${Buffer.alloc(32).toString("base64url")}`);
+  if (!row || !matches) {
     return { ok: false, error: "PASSWORD_LOGIN_INVALID_CREDENTIALS" };
   }
   return { ok: true, identity: passwordIdentity(row.user_id, payload.email, emailDigest) };

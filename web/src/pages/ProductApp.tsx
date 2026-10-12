@@ -4,7 +4,7 @@ import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Link, Navigate, useLocation, useNavigate, useParams } from "react-router-dom";
 import { z } from "zod";
-import { api, getMe, getTrip, getTrips, passwordSignIn, signIn, type TripSummary } from "../api";
+import { api, getMe, getTrip, getTrips, passwordSignIn, signIn, getAuthCapabilities, emailPasswordSignIn, safeReturnTo, type TripSummary } from "../api";
 import { Brand } from "../components/Brand";
 
 export type ProductView = "sign-in" | "trips" | "new-trip" | "trip" | "runtime" | "join";
@@ -18,22 +18,39 @@ export default function ProductApp({ view }: { view: ProductView }) {
 function SignIn() {
   const navigate = useNavigate();
   const me = useQuery({ queryKey: ["me"], queryFn: getMe, retry: false });
-  const returnTo = new URLSearchParams(useLocation().search).get("return_to") || "/trips";
+  const queryClient = useQueryClient();
+  const capabilities = useQuery({ queryKey: ["auth-capabilities"], queryFn: getAuthCapabilities, retry: false });
+  const returnTo = safeReturnTo(new URLSearchParams(useLocation().search).get("return_to"));
+  const emailForm = useForm<{ email: string; password: string }>({ defaultValues: { email: "", password: "" } });
+  const finishLogin = async ({ appPath }: { appPath: string }) => {
+    queryClient.clear();
+    await queryClient.fetchQuery({ queryKey: ["me"], queryFn: getMe });
+    navigate(safeReturnTo(appPath));
+  };
+  const emailLogin = useMutation({ mutationFn: (values: { email: string; password: string }) => emailPasswordSignIn({ ...values, returnTo }), onSuccess: finishLogin });
   const tripId = returnTo.match(/^\/trips\/(trip_[A-Za-z0-9]{8,64})(?:\/app)?/)?.[1] ?? "";
   const passwordForm = useForm<{ runtimeUsername: string; password: string }>({ defaultValues: { runtimeUsername: "", password: "" } });
   const passwordLogin = useMutation({
     mutationFn: (values: { runtimeUsername: string; password: string }) => passwordSignIn({ tripId, returnTo, ...values }),
-    onSuccess: ({ appPath }) => navigate(appPath),
+    onSuccess: finishLogin,
   });
-  if (me.data) return <Navigate replace to={returnTo.startsWith("/") ? returnTo : "/trips"} />;
+  if (me.data) return <Navigate replace to={returnTo} />;
   return (
     <div className="product-shell">
       <header className="product-header"><Brand /></header>
       <main className="placeholder-card">
         <p className="eyebrow">Kinerary personal space</p>
         <h1>Sign in to continue</h1>
-        <p>Use Google to create trips, follow setup, and invite the people traveling with you. Telegram is only used for the planning interview.</p>
-        <button className="button wide" onClick={() => signIn(returnTo)}>Continue with Google</button>
+        <p>Sign in with your existing organizer account to create trips and follow setup. The planning interview continues privately in Telegram.</p>
+        {capabilities.isPending && <p>Loading sign-in options…</p>}
+        {capabilities.isError && <Notice>Sign-in is unavailable. Please retry once the service is connected.</Notice>}
+        {capabilities.data?.emailPassword && <form className="compact-form" onSubmit={emailForm.handleSubmit(value => emailLogin.mutate(value))}>
+          <label>Email<input required type="email" maxLength={254} autoComplete="username" {...emailForm.register("email")} /></label>
+          <label>Account password<input required type="password" maxLength={1024} autoComplete="current-password" {...emailForm.register("password")} /></label>
+          <button className="button wide" disabled={emailLogin.isPending}>{emailLogin.isPending ? "Signing in…" : "Sign in"}</button>
+          {emailLogin.isError && <Notice>{emailLogin.error.message}</Notice>}
+        </form>}
+        {capabilities.data?.google && <button className="button wide" onClick={() => signIn(returnTo)}>Continue with Google</button>}
         {tripId && <form className="compact-form" onSubmit={passwordForm.handleSubmit((value) => passwordLogin.mutate(value))}>
           <label>Trip username<input required pattern="[a-z0-9][a-z0-9._-]{1,63}" autoComplete="username" {...passwordForm.register("runtimeUsername")} /></label>
           <label>Password<input required minLength={8} type="password" autoComplete="current-password" {...passwordForm.register("password")} /></label>
@@ -96,12 +113,12 @@ function TripSetup() {
   const { tripId = "" } = useParams();
   const queryClient = useQueryClient();
   const detail = useQuery({ queryKey: ["trip", tripId], queryFn: () => getTrip(tripId), refetchInterval: 5000 });
-  const interview = useMutation({ mutationFn: () => api<{ deepLink: string }>(`/v1/trips/${tripId}/interview-link`, { method: "POST" }), onSuccess: ({ deepLink }) => window.open(deepLink, "_blank", "noopener,noreferrer") });
+  const interview = useMutation({ mutationFn: () => api<{ deepLink: string }>(`/v1/trips/${tripId}/interview-link`, { method: "POST" }) });
   const provision = useMutation({ mutationFn: () => api(`/v1/trips/${tripId}/provisioning-request`, { method: "POST" }), onSuccess: () => queryClient.invalidateQueries({ queryKey: ["trip", tripId] }) });
   if (detail.isPending) return <main className="dashboard-main">Loading trip…</main>;
   if (detail.isError) return <main className="dashboard-main"><Notice>Trip not found or unavailable.</Notice></main>;
   const trip = detail.data;
-  return <main className="dashboard-main"><Link className="back-link" to="/trips">← My trips</Link><div className="page-title"><div><p className="eyebrow">Trip setup</p><h1>{trip.title}</h1><p>{trip.destination}</p></div>{trip.runtimeReady && <Link className="button" to={`/trips/${trip.id}/app`}>Open trip</Link>}</div><div className="setup-layout"><section className="workflow-card"><h2>Setup progress</h2><WorkflowStep done={Boolean(trip.interview)} title="Start your private planning interview" detail={trip.interview ? `Interview ${humanize(trip.interview.state)}` : "Continue in the shared Kinerary Telegram bot."}><button className="button button-small" onClick={() => interview.mutate()} disabled={interview.isPending}>Open Telegram interview</button></WorkflowStep><WorkflowStep done={trip.lifecycleState !== "draft" && trip.lifecycleState !== "intake_in_progress"} title="Confirm the trip outline" detail="The normalized summary becomes available here after confirmation." /><WorkflowStep done={Boolean(trip.provisioning)} title="Create the provisioning plan" detail="Kinerary pins an exact release and the resources your trip needs, for you to review before anything is built.">{trip.nextAction === "request_provisioning" && <button className="button button-small" onClick={() => provision.mutate()} disabled={provision.isPending}>Create plan</button>}</WorkflowStep><WorkflowStep done={Boolean(trip.provisioning) && trip.provisioning!.planStatus !== "pending_approval"} title="Review and approve the plan" detail={trip.provisioning ? humanize(trip.provisioning.jobState || trip.provisioning.planStatus) : "Available once the plan exists. You approve it yourself — nobody else has to sign off."}><PlanReview trip={trip} tripId={tripId} /></WorkflowStep>{trip.provisioning?.safeErrorCode && <Notice>Setup needs attention: {humanize(trip.provisioning.safeErrorCode)}</Notice>}{(interview.isError || provision.isError) && <Notice>{(interview.error || provision.error)?.message}</Notice>}</section><InvitePanel trip={trip} /></div></main>;
+  return <main className="dashboard-main"><Link className="back-link" to="/trips">← My trips</Link><div className="page-title"><div><p className="eyebrow">Trip setup</p><h1>{trip.title}</h1><p>{trip.destination}</p><p>{trip.startDate || "Start date to confirm"} → {trip.endDate || "End date to confirm"} · {humanize(trip.tripType)} trip</p></div>{trip.runtimeReady && <Link className="button" to={`/trips/${trip.id}/app`}>Open trip</Link>}</div><div className="setup-layout"><section className="workflow-card"><h2>Setup progress</h2><WorkflowStep done={Boolean(trip.interview)} title="Start your private planning interview" detail={trip.interview ? `Interview ${humanize(trip.interview.state)}` : "Continue in the shared Kinerary Telegram bot."}>{interview.data ? <a className="button button-small" href={interview.data.deepLink} target="_blank" rel="noopener noreferrer">Open Telegram interview</a> : <button className="button button-small" onClick={() => interview.mutate()} disabled={interview.isPending}>{interview.isPending ? "Preparing interview…" : "Prepare Telegram interview"}</button>}</WorkflowStep><WorkflowStep done={trip.lifecycleState !== "draft" && trip.lifecycleState !== "intake_in_progress"} title="Confirm the trip outline" detail="The normalized summary becomes available here after confirmation." /><WorkflowStep done={Boolean(trip.provisioning)} title="Create the provisioning plan" detail="Kinerary pins an exact release and the resources your trip needs, for you to review before anything is built.">{trip.nextAction === "request_provisioning" && <button className="button button-small" onClick={() => provision.mutate()} disabled={provision.isPending}>Create plan</button>}</WorkflowStep><WorkflowStep done={Boolean(trip.provisioning) && trip.provisioning!.planStatus !== "pending_approval"} title="Review and approve the plan" detail={trip.provisioning ? humanize(trip.provisioning.jobState || trip.provisioning.planStatus) : "Available once the plan exists. You approve it yourself — nobody else has to sign off."}><PlanReview trip={trip} tripId={tripId} /></WorkflowStep>{trip.provisioning?.safeErrorCode && <Notice>Setup needs attention: {humanize(trip.provisioning.safeErrorCode)}</Notice>}{(interview.isError || provision.isError) && <Notice>{(interview.error || provision.error)?.message}</Notice>}</section><InvitePanel trip={trip} /></div></main>;
 }
 
 function PlanReview({ trip, tripId }: { trip: TripSummary; tripId: string }) {
@@ -171,12 +188,14 @@ function Runtime() {
 
 function Join() {
   const navigate = useNavigate();
-  const token = new URLSearchParams(location.hash.slice(1)).get("token") || "";
+  const token = new URLSearchParams(useLocation().hash.slice(1)).get("token") || "";
+  const capabilities = useQuery({ queryKey: ["auth-capabilities"], queryFn: getAuthCapabilities, retry: false });
   const inspect = useQuery({ queryKey: ["invite", token], queryFn: () => api<{ tripTitle: string; displayName: string; status: string }>("/v1/site-invites/inspect", { method: "POST", body: JSON.stringify({ token }) }), enabled: Boolean(token), retry: false });
   const [method, setMethod] = useState<"google" | "password">("google");
   const [password, setPassword] = useState("");
-  const redeem = useMutation({ mutationFn: () => api<{ appPath: string }>("/v1/site-invites/redeem", { method: "POST", body: JSON.stringify({ token, method, ...(method === "password" ? { password } : {}) }) }), onSuccess: ({ appPath }) => navigate(appPath), onError: (error) => { if (method === "google" && error.message.includes("GOOGLE_SIGN_IN_REQUIRED")) signIn(`/join#token=${token}`); } });
-  return <div className="product-shell"><header className="product-header"><Brand /></header><main className="placeholder-card"><p className="eyebrow">Private invitation</p>{!token || inspect.isError ? <><h1>This invitation is unavailable</h1><p>Ask the organizer for a fresh link.</p></> : inspect.isPending ? <p>Checking invitation…</p> : <><h1>Join {inspect.data.tripTitle}</h1><p>This invitation is intended for {inspect.data.displayName}.</p><div className="method-tabs"><button className={method === "google" ? "active" : ""} onClick={() => setMethod("google")}>Use Google</button><button className={method === "password" ? "active" : ""} onClick={() => setMethod("password")}>Use a password</button></div>{method === "password" && <label className="standalone-field">Choose a password<input type="password" minLength={8} value={password} onChange={(event) => setPassword(event.target.value)} /></label>}<button className="button wide" onClick={() => redeem.mutate()} disabled={redeem.isPending || inspect.data.status !== "unused"}>Join this trip</button>{redeem.isError && <Notice>{redeem.error.message}</Notice>}</>}</main></div>;
+  useEffect(() => { if (capabilities.data && !capabilities.data.google) setMethod("password"); }, [capabilities.data]);
+  const redeem = useMutation({ mutationFn: () => api<{ appPath: string }>("/v1/site-invites/redeem", { method: "POST", body: JSON.stringify({ token, method, ...(method === "password" ? { password } : {}) }) }), onSuccess: ({ appPath }) => navigate(safeReturnTo(appPath)), onError: (error) => { if (method === "google" && error.message.includes("GOOGLE_SIGN_IN_REQUIRED")) signIn(`/join#token=${token}`); } });
+  return <div className="product-shell"><header className="product-header"><Brand /></header><main className="placeholder-card"><p className="eyebrow">Private invitation</p>{!token || inspect.isError ? <><h1>This invitation is unavailable</h1><p>Ask the organizer for a fresh link.</p></> : inspect.isPending ? <p>Checking invitation…</p> : <><h1>Join {inspect.data.tripTitle}</h1><p>This invitation is intended for {inspect.data.displayName}.</p>{capabilities.isPending && <p>Loading sign-in options…</p>}{capabilities.isError && <Notice>Sign-in is unavailable. Please retry once the service is connected.</Notice>}<div className="method-tabs">{capabilities.data?.google && <button className={method === "google" ? "active" : ""} onClick={() => setMethod("google")}>Use Google</button>}<button className={method === "password" ? "active" : ""} onClick={() => setMethod("password")}>Use a password</button></div>{method === "password" && <label className="standalone-field">Choose a password<input type="password" minLength={8} value={password} onChange={(event) => setPassword(event.target.value)} /></label>}<button className="button wide" onClick={() => redeem.mutate()} disabled={redeem.isPending || !capabilities.data || inspect.data.status !== "unused"}>Join this trip</button>{redeem.isError && <Notice>{redeem.error.message}</Notice>}</>}</main></div>;
 }
 
 function Notice({ children }: { children: React.ReactNode }) { return <div className="notice" role="alert">{children}</div>; }
