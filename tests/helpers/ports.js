@@ -178,6 +178,15 @@ export const PORTS = {
   lostFoundHardening:       28331,  // the trip server (text rules, MCP, Classic)
   lostFoundHardeningMcp:    28332,  // mcp/mcp.js against it
   lostFoundHardeningBounds: 28333,  // a second trip server: rate limit and open-entry cap
+  // Boundary review of PR #377: the limiter's client address behind a proxy
+  // (TRUST_PROXY_HOPS) and the bounded get_lost_found — tests/lost-found-proxy.test.js.
+  lostFoundProxyDefault:    28336,  // TRUST_PROXY_HOPS unset
+  lostFoundProxyOneHop:     28337,  // TRUST_PROXY_HOPS=1
+  lostFoundProxyTwoHops:    28338,  // TRUST_PROXY_HOPS=2
+  lostFoundProxyInvalid:    28339,  // invalid values, one server at a time
+  lostFoundBoundsSite:      28340,  // GET ?open= ?limit= ?count=1
+  lostFoundBoundsMcpSite:   28341,  // the trip server mcp/mcp.js reads
+  lostFoundBoundsMcp:       28342,  // mcp/mcp.js against it
 
   // ── Stand-ins for services the server calls out to ─────────────────────
   bookingExtractMockHermes: 28103,

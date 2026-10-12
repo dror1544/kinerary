@@ -2176,10 +2176,76 @@ const LOST_FOUND_RATE_WINDOW_MS = 60 * 60 * 1000;
 const LOST_FOUND_MAX_TRACKED_ADDRESSES = 1000;
 const lostFoundWrites = new Map();
 // The table as a whole: at most this many OPEN (unresolved) entries. The
-// per-address limit above does not bound a caller with many addresses, and
-// every visitor behind one proxy shares an address; this does. A resolved
-// entry does not count, so a member resolving one reopens the form.
+// per-address limit above does not bound a caller with many addresses; this
+// does, so it bounds how much a flood can STORE. It does not protect real
+// finders: when every visitor reaches the server from one proxy address
+// (TRUST_PROXY_HOPS unset behind a reverse proxy, see clientAddress below),
+// five junk reports an hour fill that one per-address bucket and every other
+// finder, member and the companion's post_lost_found gets 429 rate_limited
+// long before this cap is reached. Only the right client address fixes that.
+// A resolved entry does not count, so a member resolving one reopens the form.
 const LOST_FOUND_MAX_OPEN = 200;
+
+// ── The client address the limiter keys on ──────────────────────────────────
+// Trip sites run behind reverse proxies (the repository's nginx.conf, and a
+// front proxy such as Nginx Proxy Manager), so the socket address is a
+// proxy's, the same for every visitor. TRUST_PROXY_HOPS says how many proxies
+// in front of this server APPEND the visitor's address to X-Forwarded-For
+// (nginx: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`).
+// With N > 0 the client is the Nth entry from the RIGHT — the one the
+// outermost trusted proxy wrote — never the leftmost, which the client itself
+// can write. Express's `trust proxy` = N picks the same entry, but it is
+// deliberately not set: it would also change req.protocol (the /photo share
+// page's URLs) and req.hostname for every route, and this setting is about one
+// rate limit. 0 (unset, the default): X-Forwarded-For is ignored and the key
+// is req.ip, exactly as before. Too high a number lets a visitor choose their
+// own address — a proxy that passes the header through without appending (the
+// repository's own nginx.conf does) does not count.
+const TRUST_PROXY_HOPS = (() => {
+  const raw = process.env.TRUST_PROXY_HOPS;
+  if (raw === undefined || raw === '') return 0;
+  if (/^[0-3]$/.test(raw)) return Number(raw);
+  console.warn(`TRUST_PROXY_HOPS=${JSON.stringify(raw)} is not a whole number from 0 to 3 — using 0: ` +
+    'X-Forwarded-For is ignored and every visitor behind a proxy shares one lost-and-found rate-limit bucket.');
+  return 0;
+})();
+if (TRUST_PROXY_HOPS > 0) {
+  console.log(`lost-and-found rate limit: TRUST_PROXY_HOPS=${TRUST_PROXY_HOPS} — keyed on X-Forwarded-For entry ${TRUST_PROXY_HOPS} from the right`);
+}
+// Each misconfiguration is said once per process, not per request.
+const clientAddressWarned = new Set();
+function warnClientAddressOnce(key, message) {
+  if (clientAddressWarned.has(key)) return;
+  clientAddressWarned.add(key);
+  console.warn(message);
+}
+// At most an IPv6 address with a zone; anything longer is not an address
+// a proxy wrote, and bounding it bounds the map's keys.
+const CLIENT_ADDRESS_MAX_LENGTH = 64;
+function clientAddress(req) {
+  const header = req.headers['x-forwarded-for'];
+  const entries = typeof header === 'string' ? header.split(',').map(s => s.trim()).filter(Boolean) : [];
+  if (TRUST_PROXY_HOPS === 0) {
+    if (entries.length) {
+      warnClientAddressOnce('hops0', 'lost-and-found: a request arrived with X-Forwarded-For but TRUST_PROXY_HOPS is 0, ' +
+        'so the rate limit keys on the proxy\'s address and every visitor behind it shares one bucket of ' +
+        `${LOST_FOUND_RATE_LIMIT} reports an hour. Set TRUST_PROXY_HOPS to the number of proxies that append to X-Forwarded-For.`);
+    }
+    return req.ip;
+  }
+  if (entries.length < TRUST_PROXY_HOPS) {
+    // No header at all is a direct caller (the companion's MCP server on the
+    // same host): its socket address is its own. Some entries, but fewer than
+    // the hops, means the setting is higher than this chain — fall back to the
+    // socket rather than to an entry the client may have written.
+    if (entries.length) {
+      warnClientAddressOnce('short', `lost-and-found: a request carried fewer X-Forwarded-For entries (${entries.length}) ` +
+        `than TRUST_PROXY_HOPS=${TRUST_PROXY_HOPS}; keyed on the socket address. Is TRUST_PROXY_HOPS higher than the proxies in front of this site?`);
+    }
+    return req.socket.remoteAddress;
+  }
+  return entries[entries.length - TRUST_PROXY_HOPS].slice(0, CLIENT_ADDRESS_MAX_LENGTH);
+}
 
 // The refusals that are not about one field, in both languages, addressed to
 // the finder the way text-rules.js addresses a person.
@@ -2222,11 +2288,9 @@ app.post('/api/lost-found', (req, res) => {
   const now = Date.now();
   evictLostFoundBuckets(now);
 
-  // No `trust proxy` is set anywhere in this server, and trip sites sit
-  // behind nginx/NPM in production — see the #207 handover for what that
-  // means for this address (every visitor to one trip's proxy shares a
-  // single req.ip today; fixing that is a separate, deployment-wide change).
-  const address = req.ip;
+  // The real client when TRUST_PROXY_HOPS says how to find it; req.ip (the
+  // proxy's address, behind one) when it is 0 — see clientAddress above.
+  const address = clientAddress(req);
   const bucket = pruneLostFoundBucket(lostFoundWrites.get(address) || [], now);
   if (bucket.length >= LOST_FOUND_RATE_LIMIT) {
     const retryAfterMs = LOST_FOUND_RATE_WINDOW_MS - (now - bucket[0]);
@@ -2274,8 +2338,41 @@ app.post('/api/lost-found', (req, res) => {
   res.json({ ok: true, id: result.lastInsertRowid });
 });
 
+// Without open, limit or count: every entry, newest first — what the Classic
+// page reads, unchanged (any other parameter is ignored, as it always was).
+// The MCP tools ask for a bounded set instead (get_lost_found in mcp/mcp.js
+// and server/trip-mcp/tools.js): ?open=1 open entries only, ?open=0 resolved
+// only, ?limit=N the N newest (1..500; with open alone, at most 500), and
+// ?count=1 just `{ open, resolved }`. One of the three that is present but
+// not one of those values is refused, never silently ignored.
+const LOST_FOUND_MAX_LIMIT = 500;
+const LOST_FOUND_QUERY_KEYS = ['open', 'limit', 'count'];
 app.get('/api/lost-found', authRequired, (req, res) => {
-  const rows = db.prepare('SELECT * FROM lost_found ORDER BY created_at DESC').all();
+  const q = req.query;
+  const given = LOST_FOUND_QUERY_KEYS.filter(k => q[k] !== undefined);
+  if (!given.length) {
+    const rows = db.prepare('SELECT * FROM lost_found ORDER BY created_at DESC').all();
+    return res.json(rows);
+  }
+  const bad = (detail) => res.status(400).json({ error: 'invalid_query', detail });
+  for (const key of given) {
+    if (typeof q[key] !== 'string') return bad(`"${key}" must be given once, as text`);
+  }
+  if (q.count !== undefined) {
+    if (q.count !== '1' || given.length > 1) return bad('count must be 1, with neither open nor limit');
+    const n = db.prepare('SELECT COALESCE(SUM(COALESCE(resolved, 0) = 0), 0) AS open, COALESCE(SUM(COALESCE(resolved, 0) != 0), 0) AS resolved FROM lost_found').get();
+    return res.json({ open: n.open, resolved: n.resolved });
+  }
+  if (q.open !== undefined && q.open !== '0' && q.open !== '1') return bad('open must be 1 (open only) or 0 (resolved only)');
+  let limit = LOST_FOUND_MAX_LIMIT;
+  if (q.limit !== undefined) {
+    if (!/^[1-9]\d{0,2}$/.test(q.limit) || Number(q.limit) > LOST_FOUND_MAX_LIMIT) {
+      return bad(`limit must be a whole number from 1 to ${LOST_FOUND_MAX_LIMIT}`);
+    }
+    limit = Number(q.limit);
+  }
+  const where = q.open === '1' ? 'WHERE COALESCE(resolved, 0) = 0' : q.open === '0' ? 'WHERE COALESCE(resolved, 0) != 0' : '';
+  const rows = db.prepare(`SELECT * FROM lost_found ${where} ORDER BY created_at DESC, id DESC LIMIT ?`).all(limit);
   res.json(rows);
 });
 
