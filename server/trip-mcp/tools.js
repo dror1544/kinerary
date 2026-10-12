@@ -43,7 +43,7 @@ const withPeople = rows => {
 // Scotland and Wales are shown VISIBLY — U+1F3F4 then [gbeng] / [gbsct] /
 // [gbwls] — and every other tag character is dropped. Nothing else changes:
 // only the tag block, and ordinary text comes out byte for byte. Idempotent.
-// TWIN: RGI_SUBDIVISION_FLAG_RE, TAG_BLOCK_RE and visibleTags() are
+// TWIN: RGI_SUBDIVISION_FLAG_RE, TAG_BLOCK_RE, visibleTags() and toolError() are
 // byte-identical in mcp/mcp.js (the companion's MCP server); change both
 // (tests/mcp-tag-output.test.js compares them).
 const RGI_SUBDIVISION_FLAG_RE = /\u{1F3F4}(\u{E0067}\u{E0062}(?:\u{E0065}\u{E006E}\u{E0067}|\u{E0073}\u{E0063}\u{E0074}|\u{E0077}\u{E006C}\u{E0073}))\u{E007F}/gu;
@@ -62,15 +62,26 @@ function visibleTags(value) {
   return value;
 }
 
+// Every tool's error path, the twin of its output path (code review of PR
+// #375, 2026-10-12). A tool that throws used to reach the model through the
+// MCP SDK's own handler, which writes the message as it stands — and a refusal
+// can quote stored text (move-day's 409 names both stops' headlines; a stop's
+// 409 lists the plan items it would strand). This is what that handler
+// writes, isError included, with the tag block made visible or dropped.
+// TWIN: byte-identical in mcp/mcp.js and server/trip-mcp/tools.js.
+function toolError(err) {
+  return { content: [{ type: 'text', text: visibleTags(err instanceof Error ? err.message : String(err)) }], isError: true };
+}
+
 function registerTools(mcp, site, { write = true } = {}) {
   // Every tool's one output path: the site's answer, with the tag block made
-  // visible or dropped (visibleTags above).
+  // visible or dropped (visibleTags above); and its one error path, toolError.
   const ok = data => ({ content: [{ type: 'text', text: JSON.stringify(visibleTags(data), null, 2) }] });
   // A read-only connection never even lists a write tool: what an assistant
   // cannot see, it cannot be talked into calling.
   const tool = (name, title, description, annotations, inputSchema, run) => {
     if (!annotations.readOnlyHint && !write) return;
-    mcp.registerTool(name, { title, description, annotations: { title, ...annotations }, inputSchema }, async args => ok(await run(args || {})));
+    mcp.registerTool(name, { title, description, annotations: { title, ...annotations }, inputSchema }, async args => { try { return ok(await run(args || {})); } catch (err) { return toolError(err); } });
   };
   const qs = obj => {
     const s = new URLSearchParams(Object.entries(obj).filter(([, v]) => v !== undefined && v !== '')).toString();
@@ -551,4 +562,4 @@ function buildInstructions(config, organizers, { write = true } = {}) {
   ].join('\n').replace(/\n{3,}/g, '\n\n');
 }
 
-module.exports = { registerTools, buildInstructions };
+module.exports = { registerTools, buildInstructions, visibleTags };
