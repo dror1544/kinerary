@@ -28,8 +28,8 @@
 // and isolates, the BOM, zero-width space, word joiner, U+2061-U+2064 (U+2063
 // INVISIBLE SEPARATOR), the soft hyphen, U+034F, the Hangul fillers (U+115F,
 // U+1160, U+3164, U+FFA0), U+17B4/U+17B5, the Mongolian selectors, the
-// variation selectors and the tag characters (U+E0000-U+E0FFF, which also
-// makes a subdivision flag such as England's refused) — plus some that are
+// variation selectors and the tag characters (U+E0000-U+E0FFF; a well-formed
+// subdivision flag such as England's is the one exception, FLAGS below) — plus some that are
 // not default-ignorable but render as nothing or as blank: the line and
 // paragraph separators (U+2028/U+2029), U+2800 BRAILLE PATTERN BLANK,
 // U+FFFC, and (second boundary re-check of PR #373, 2026-10-12) U+070F SYRIAC
@@ -46,6 +46,28 @@
 // name of a lone RLM, or of U+0301 alone, renders as nothing. A real name that
 // merely CONTAINS them — niqqud, a VS16 heart, a Persian ZWNJ word, a combining
 // accent on a letter — is not blank, and is stored as typed.
+//
+// FLAGS (owner decision, 2026-10-12: "subdivision-flag emoji must NOT be
+// refused in stored text; keep every other protection"). England, Scotland and
+// Wales are emoji TAG SEQUENCES: U+1F3F4 WAVING BLACK FLAG, then tag letters,
+// then U+E007F CANCEL TAG — England is U+1F3F4 + g b e n g (U+E0067 U+E0062
+// U+E0065 U+E006E U+E0067) + U+E007F. The tag characters are invisible on their
+// own and stay refused on their own; the well-formed sequence renders as a flag.
+// FLAG_TAG_SRC is that one shape, written once: U+1F3F4 IMMEDIATELY followed by
+// 1-32 tag characters from U+E0030-E0039 / U+E0061-E007A, then U+E007F.
+// withoutFlags() — the helper every text rule here runs through — takes each
+// such sequence out of the string being checked (it stands in as U+FFFD, a
+// visible character no rule refuses and no sequence starts with), and the
+// rules above run on what is left. So a text value is accepted when the string
+// minus its valid flag sequences passes them, and is stored exactly as typed.
+// Everything else that touches a tag character is still refused: a lone tag,
+// tags after any other base, a run with no U+E007F, a tag outside the set, a
+// terminator with no base, a second run glued after the terminator, a VS16 or a
+// ZWJ inside the run, more than 32 tags. A flag alone is not blank (it is a
+// flag). Not in a CODE (below): a confirmation number or a PIN is checked as
+// sent, so a flag there is refused — a code has no use for one. Not in a LINK
+// HOST: safeLink() never calls withoutFlags(), and the URL parser refuses tag
+// characters in a host (tests/invisible-text.test.js pins it).
 //
 // CODES (same re-check). A confirmation number and a PIN (spec `code: true`)
 // refuse the allowed marks too (CODE_MARKS_RE), with the invisible-character
@@ -70,8 +92,8 @@
 //
 // TWIN: ALLOWED_MARKS, INVISIBLE_SRC, UNSAFE_LINE_RE, UNSAFE_MULTILINE_RE, INVISIBLE_RE,
 // BLANK_ALL_RE, CODE_MARKS_RE, TEXT_DETAIL, INVISIBLE_DETAIL, CODE_DETAIL, LINK_DETAIL,
-// LINK_HOST_HIDDEN_RE, LINK_LABEL_DOT_RE, toLf, isBlankText, textDetail() and
-// safeLink() are copies of the same names in
+// LINK_HOST_HIDDEN_RE, LINK_LABEL_DOT_RE, FLAG_TAG_SRC, FLAG_TAG_RE, withoutFlags,
+// toLf, isBlankText, textDetail() and safeLink() are copies of the same names in
 // server/trip-structure.js (the stop layer), duplicated rather than imported
 // because that file belongs to another line of work and exports none of them.
 // Change one, change both: tests/stop-hardening.test.js ("the twins") compares
@@ -93,10 +115,15 @@ const CODE_DETAIL = 'a confirmation number or PIN may not contain invisible char
 const LINK_DETAIL = 'a link must start with http:// or https://, name its host as the browser will use it, and contain no quotes, backslashes, < >, or whitespace';
 const LINK_HOST_HIDDEN_RE = /[\u00AD\u034F\u180B-\u180D\u180F\u200B\u2028\u2029\u202A-\u202E\u2060\u2064\u2066-\u2069\u2800\uFE00-\uFE0F\uFEFF\u{16FE4}\u{1BCA0}-\u{1BCA3}\u{E0100}-\u{E01EF}]/u;
 const LINK_LABEL_DOT_RE = /[.。．｡]/;
+// The well-formed emoji tag sequence, and the string every text rule checks
+// (FLAGS above). FLAG_TAG_RE is global: replace() and split() only, never test().
+const FLAG_TAG_SRC = String.raw`\u{1F3F4}[\u{E0030}-\u{E0039}\u{E0061}-\u{E007A}]{1,32}\u{E007F}`;
+const FLAG_TAG_RE = new RegExp(FLAG_TAG_SRC, 'gu');
+const withoutFlags = (s) => s.replace(FLAG_TAG_RE, '\u{FFFD}');
 const toLf = (s) => s.replace(/\r\n?/g, '\n');
 // Nothing a person would see is left once whitespace, the refused set, the
-// allowed marks and combining marks are taken out (BLANK above).
-const isBlankText = (s) => !s.replace(BLANK_ALL_RE, '');
+// allowed marks and combining marks are taken out (BLANK above). A flag is seen.
+const isBlankText = (s) => !withoutFlags(s).replace(BLANK_ALL_RE, '');
 const DATE_DETAIL = 'a date must be YYYY-MM-DD';
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -259,8 +286,12 @@ function checkField(field, value, spec) {
   // CRLF and a lone CR are a client's line ending, not a hidden character:
   // normalised before the check (and the length) in a multi-line field.
   if (multiline) s = toLf(s);
-  if ((multiline ? UNSAFE_MULTILINE_RE : UNSAFE_LINE_RE).test(s)) {
-    return { error: refusal('invalid_text', field, label, textReason(s, multiline), { detail: textDetail(s, multiline) }) };
+  // A well-formed flag is text, not a hidden character (FLAGS above): the rules
+  // run on the string minus its flags. A code is checked as sent — a flag in a
+  // confirmation number or PIN is refused with its tag characters.
+  const checked = spec.code ? s : withoutFlags(s);
+  if ((multiline ? UNSAFE_MULTILINE_RE : UNSAFE_LINE_RE).test(checked)) {
+    return { error: refusal('invalid_text', field, label, textReason(checked, multiline), { detail: textDetail(checked, multiline) }) };
   }
   // A code is not text in a language: the marks RTL text is typed with only
   // reorder its digits (CODES above). The invisible-character message.
@@ -308,19 +339,29 @@ function requiredRefusal(error, field, specs) {
 // the list that no test compared.
 // A code field also loses the allowed marks (CODES), and a value left blank
 // (BLANK) is no value — so a drafted name of RLM LRM is the route's 422.
+// A well-formed flag (FLAGS) is KEPT in a text field — the draft is split
+// around each one (FLAG_SPLIT_RE, built from FLAG_TAG_SRC) and only the text
+// between them is stripped — and removed whole from a code field, which the
+// write would refuse it in. The length clamp can cut a flag in half, so the
+// clamped value is scrubbed again: the half loses its tag characters.
 const STRIP_LINE_RE = new RegExp(UNSAFE_LINE_RE.source, 'gu');
 const STRIP_MULTILINE_RE = new RegExp(UNSAFE_MULTILINE_RE.source, 'gu');
 const STRIP_CODE_MARKS_RE = new RegExp(CODE_MARKS_RE.source, 'gu');
+const FLAG_SPLIT_RE = new RegExp(`(${FLAG_TAG_SRC})`, 'u');
 function cleanText(value, spec) {
   if (typeof value === 'number' && Number.isFinite(value)) value = String(value);
   if (typeof value !== 'string') return null;
   const multiline = spec.kind === 'multiline';
+  const strip = (t) => t.replace(multiline ? STRIP_MULTILINE_RE : STRIP_LINE_RE, '');
+  // split() with a capture group: the odd parts are the flags, kept as they are.
+  const scrub = (t) => (spec.code ? strip(t.replace(FLAG_TAG_RE, ''))
+    : t.split(FLAG_SPLIT_RE).map((part, i) => (i % 2 ? part : strip(part))).join(''));
   let s = value.replace(/\r\n?/g, '\n').replace(/\t/g, ' ');
   if (!multiline) s = s.replace(/\n+/g, ' ');
-  s = s.replace(multiline ? STRIP_MULTILINE_RE : STRIP_LINE_RE, '');
+  s = scrub(s);
   if (spec.code) s = s.replace(STRIP_CODE_MARKS_RE, '');
   s = s.trim();
-  if (charCount(s) > spec.max) s = [...s].slice(0, spec.max).join('').trim();
+  if (charCount(s) > spec.max) s = scrub([...s].slice(0, spec.max).join('')).trim();
   return s && !isBlankText(s) ? s : null;
 }
 const cleanDate = (value) => (typeof value === 'string' ? isoDay(value.trim()) : null);
@@ -330,5 +371,5 @@ module.exports = {
   BOOKING_FIELDS, PARTICIPANT_FIELDS, BOOKING_TYPES,
   UNSAFE_LINE_RE, UNSAFE_MULTILINE_RE, INVISIBLE_RE, TEXT_DETAIL, INVISIBLE_DETAIL, CODE_DETAIL, LINK_DETAIL,
   safeLink, isoDay, checkField, checkFields, isBlank, requiredRefusal, refusal, bookingTypeRefusal,
-  cleanText, cleanDate, cleanLink,
+  cleanText, cleanDate, cleanLink, withoutFlags,
 };

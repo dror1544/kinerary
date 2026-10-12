@@ -101,10 +101,19 @@ const CODE_KEYS = new Set(['confirmation']);
 // of a { he, en } pair is stored as '' exactly as a whitespace one always was —
 // and accommodation.confirmation refuses the allowed marks too (invalid_text,
 // CODE_DETAIL): they reorder a code's digits on a right-to-left page.
+// Subdivision flags (owner decision, 2026-10-12), text-rules.js's FLAGS: a
+// well-formed emoji tag sequence (England, Scotland, Wales: U+1F3F4, 1-32 tag
+// characters from U+E0030-E0039 / U+E0061-E007A, U+E007F) is a visible flag,
+// not a hidden character. unsafeTextAt() and the blank check run on the value
+// minus its flags (withoutFlags), so a title, tab label, emoji or accommodation
+// text carrying one is stored as typed, and a flag alone is not blank. A lone
+// or malformed tag run is still refused, and accommodation.confirmation (a
+// code) is checked as sent, so a flag there is refused. A link host never
+// goes through withoutFlags.
 // TWIN: ALLOWED_MARKS, INVISIBLE_SRC, UNSAFE_LINE_RE, UNSAFE_MULTILINE_RE, INVISIBLE_RE,
 // BLANK_ALL_RE, CODE_MARKS_RE, TEXT_DETAIL, INVISIBLE_DETAIL, CODE_DETAIL, LINK_DETAIL,
-// LINK_HOST_HIDDEN_RE, LINK_LABEL_DOT_RE, toLf, isBlankText, textDetail() and
-// safeLink() are byte-identical copies of the same names in
+// LINK_HOST_HIDDEN_RE, LINK_LABEL_DOT_RE, FLAG_TAG_SRC, FLAG_TAG_RE, withoutFlags,
+// toLf, isBlankText, textDetail() and safeLink() are byte-identical copies of the same names in
 // server/text-rules.js; tests/stop-hardening.test.js ("the twins") compares
 // them. Change one, change both.
 const ALLOWED_MARKS = String.raw`\u200C-\u200F\u061C\uFE0F`;
@@ -120,8 +129,13 @@ const CODE_DETAIL = 'a confirmation number or PIN may not contain invisible char
 const LINK_DETAIL = 'a link must start with http:// or https://, name its host as the browser will use it, and contain no quotes, backslashes, < >, or whitespace';
 const LINK_HOST_HIDDEN_RE = /[\u00AD\u034F\u180B-\u180D\u180F\u200B\u2028\u2029\u202A-\u202E\u2060\u2064\u2066-\u2069\u2800\uFE00-\uFE0F\uFEFF\u{16FE4}\u{1BCA0}-\u{1BCA3}\u{E0100}-\u{E01EF}]/u;
 const LINK_LABEL_DOT_RE = /[.。．｡]/;
+// The well-formed emoji tag sequence, and the string every text rule checks
+// (FLAGS above). FLAG_TAG_RE is global: replace() and split() only, never test().
+const FLAG_TAG_SRC = String.raw`\u{1F3F4}[\u{E0030}-\u{E0039}\u{E0061}-\u{E007A}]{1,32}\u{E007F}`;
+const FLAG_TAG_RE = new RegExp(FLAG_TAG_SRC, 'gu');
+const withoutFlags = (s) => s.replace(FLAG_TAG_RE, '\u{FFFD}');
 const toLf = (s) => s.replace(/\r\n?/g, '\n');
-const isBlankText = (s) => !s.replace(BLANK_ALL_RE, '');
+const isBlankText = (s) => !withoutFlags(s).replace(BLANK_ALL_RE, '');
 const STOP_FIELDS = ['dates', 'accommodation', 'title', 'tabLabel', 'emoji'];
 const OPEN_TITLE = { he: 'ימים שעוד לא תוכננו', en: 'Days not planned yet' };
 // The same sentence the provisioner writes, so an unchanged trip serves
@@ -238,13 +252,20 @@ const fail = (status, error, extra = {}) => ({ status, body: { error, ...extra }
 
 // The first string in `value` (a string, or a { he, en } pair) that carries
 // text a browser could read as markup, or that renders other than it reads:
-// { field: its path, detail } — or null.
-function unsafeTextAt(value, path, { multiline = false } = {}) {
+// { field: its path, detail } — or null. Checked minus its well-formed flags
+// (withoutFlags, FLAGS above); a `code` value is checked as sent, so a flag in
+// a confirmation number is refused.
+function unsafeTextAt(value, path, { multiline = false, code = false } = {}) {
   const re = multiline ? UNSAFE_MULTILINE_RE : UNSAFE_LINE_RE;
-  if (typeof value === 'string') return re.test(value) ? { field: path, detail: textDetail(value, multiline) } : null;
+  const at = (s, field) => {
+    const checked = code ? s : withoutFlags(s);
+    return re.test(checked) ? { field, detail: textDetail(checked, multiline) } : null;
+  };
+  if (typeof value === 'string') return at(value, path);
   if (isObj(value)) {
     for (const k of Object.keys(value)) {
-      if (typeof value[k] === 'string' && re.test(value[k])) return { field: `${path}.${k}`, detail: textDetail(value[k], multiline) };
+      const bad = typeof value[k] === 'string' ? at(value[k], `${path}.${k}`) : null;
+      if (bad) return bad;
     }
   }
   return null;
@@ -315,7 +336,7 @@ function validateAccommodation(value, path = 'accommodation') {
       v = safeLink(raw);
       if (v === undefined) return { error: fail(400, 'invalid_link', { field, detail: LINK_DETAIL }) };
     } else {
-      const bad = unsafeTextAt(raw, field, { multiline: MULTILINE_KEYS.has(key) });
+      const bad = unsafeTextAt(raw, field, { multiline: MULTILINE_KEYS.has(key), code: CODE_KEYS.has(key) });
       if (bad) return { error: invalidText(bad) };
       if (CODE_KEYS.has(key) && typeof raw === 'string' && CODE_MARKS_RE.test(raw)) return { error: invalidText({ field, detail: CODE_DETAIL }) };
       v = kind === 'text' ? textValue(raw) : scalarValue(raw);

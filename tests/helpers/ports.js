@@ -162,6 +162,9 @@ export const PORTS = {
   // A plan date must be a day on the calendar, on every plan route (second
   // boundary re-check of PR #373) — tests/calendar-routes.test.js.
   calendarRoutes:          28327,
+  // Subdivision flags (emoji tag sequences) in stop text, over HTTP (owner
+  // decision, 2026-10-12) — tests/emoji-flags-http.test.js.
+  emojiFlagsHttp:          28328,
 
   // ── Stand-ins for services the server calls out to ─────────────────────
   bookingExtractMockHermes: 28103,

@@ -826,6 +826,109 @@ describe('POST /api/agent/participants — names', () => {
   });
 });
 
+// ── subdivision flags (owner decision, 2026-10-12) ──────────────────────────
+// England, Scotland and Wales are emoji TAG SEQUENCES: U+1F3F4, tag letters,
+// U+E007F. Their tag characters are refused alone; the well-formed sequence is
+// a visible flag and is stored as typed (server/text-rules.js, withoutFlags).
+// The rule is enumerated in invisible-text.test.js; these are the routes.
+describe('subdivision flags — accepted as typed in booking and participant text over HTTP; malformed and in codes refused', () => {
+  const tagsOf = (s) => [...s].map(c => 0xE0000 + c.codePointAt(0));
+  const flag = (region) => String.fromCodePoint(0x1F3F4, ...tagsOf(region), 0xE007F);
+  const ENGLAND = flag('gbeng'), SCOTLAND = flag('gbsct'), WALES = flag('gbwls');
+  const FLAG_TEXT = { name: `מלון The Savoy ${ENGLAND}`, passengers: `Dan ${SCOTLAND}, Dana ${WALES}`, notes: `שורה ראשונה ${WALES}\nsecond line ${ENGLAND}` };
+  const MALFORMED = [
+    ['lone U+E0041', `ab${String.fromCodePoint(0xE0041)}cd`],
+    ['unterminated', String.fromCodePoint(0x1F3F4, ...tagsOf('gbeng'))],
+    ['glued second run', ENGLAND + String.fromCodePoint(...tagsOf('gbsct'), 0xE007F)],
+    ['ZWJ inside', String.fromCodePoint(0x1F3F4, 0xE0067, 0x200D, 0xE0062, 0xE007F)],
+  ];
+  const memberSees = async (id) => (await api('/api/bookings', { token: bob })).body.find(b => b.id === id);
+
+  test('POST: a flag in name, passengers and notes is stored and served to a member exactly as typed (organizer and agent key)', async () => {
+    for (const who of [{ token: alice }, { apiKey: AGENT_KEY }]) {
+      const r = await api('/api/bookings', { method: 'POST', ...who, body: base(FLAG_TEXT) });
+      assert.equal(r.status, 200, r.text);
+      const row = bookingRow(r.body.id);
+      for (const f of Object.keys(FLAG_TEXT)) assert.equal(row[f], FLAG_TEXT[f], `${f} stored as typed`);
+      const seen = await memberSees(r.body.id);
+      for (const f of Object.keys(FLAG_TEXT)) assert.equal(seen[f], FLAG_TEXT[f], `${f} read back by a member as typed`);
+    }
+    const alone = await asAgent('/api/bookings', { method: 'POST', body: base({ name: ENGLAND }) });
+    assert.equal(alone.status, 200, `a flag alone is a name, not blank: ${alone.text}`);
+    assert.equal(bookingRow(alone.body.id).name, ENGLAND);
+  });
+
+  test('PATCH: a flag in name, passengers and notes is stored and served to a member exactly as typed', async () => {
+    const id = (await asAgent('/api/bookings', { method: 'POST', body: base({ name: 'Flag Patch' }) })).body.id;
+    const r = await api(`/api/bookings/${id}`, { method: 'PATCH', token: alice, body: FLAG_TEXT });
+    assert.equal(r.status, 200, r.text);
+    const seen = await memberSees(id);
+    for (const f of Object.keys(FLAG_TEXT)) {
+      assert.equal(bookingRow(id)[f], FLAG_TEXT[f]);
+      assert.equal(seen[f], FLAG_TEXT[f]);
+    }
+  });
+
+  test('malformed tag runs are refused in name, passengers and notes (POST and PATCH): 400 invalid_text, the invisible-character message; nothing stored', async () => {
+    const before = bookingCount();
+    const id = (await asAgent('/api/bookings', { method: 'POST', body: base({ name: 'Flag Refuse' }) })).body.id;
+    const row = bookingRow(id);
+    for (const field of ['name', 'passengers', 'notes']) {
+      for (const [what, value] of MALFORMED) {
+        for (const [method, path] of [['POST', '/api/bookings'], ['PATCH', `/api/bookings/${id}`]]) {
+          const r = await asAgent(path, { method, body: method === 'POST' ? base({ [field]: value }) : { [field]: value } });
+          assert.equal(r.status, 400, `${method} ${field}/${what}: ${r.text}`);
+          assert.deepEqual([r.body.error, r.body.field, r.body.detail], ['invalid_text', field, INVISIBLE_DETAIL], `${method} ${field}/${what}`);
+          assert.match(r.body.message.en, /hidden character/);
+          assertBilingual(r.body, `${method} ${field}/${what}`);
+        }
+      }
+    }
+    assert.equal(bookingCount(), before + 1, 'only the base row was written');
+    assert.deepEqual(bookingRow(id), row, 'the PATCHed row is unchanged');
+  });
+
+  test('a flag in a confirmation number or a PIN is refused (a code has no use for one), POST and PATCH', async () => {
+    const id = (await asAgent('/api/bookings', { method: 'POST', body: base({ name: 'Flag Code' }) })).body.id;
+    for (const field of CODE_FIELDS) {
+      for (const value of [ENGLAND, `AB${WALES}12`]) {
+        for (const [method, path] of [['POST', '/api/bookings'], ['PATCH', `/api/bookings/${id}`]]) {
+          const r = await asAgent(path, { method, body: method === 'POST' ? base({ [field]: value }) : { [field]: value } });
+          assert.deepEqual([r.status, r.body.error, r.body.field, r.body.detail], [400, 'invalid_text', field, INVISIBLE_DETAIL], `${method} ${field}: ${r.text}`);
+          assertBilingual(r.body, `${method} ${field}`);
+        }
+      }
+    }
+  });
+
+  test('a participant named with a flag is created, and a member reads the name back exactly as typed; a malformed one is refused', async () => {
+    const u = `flag${Date.now().toString(36)}`;
+    const body = { username: u, name: `דן ${ENGLAND}`, name_en: `Dan ${SCOTLAND}`, family: `family ${WALES}` };
+    const r = await asAgent('/api/agent/participants', { method: 'POST', body });
+    assert.equal(r.status, 200, r.text);
+    const stored = JSON.parse(readFileSync(join(tripDir, 'trip.config.json'), 'utf8')).participants.find(p => p.username === u);
+    assert.deepEqual([stored.name, stored.name_en, stored.family], [body.name, body.name_en, body.family]);
+    const served = (await api('/api/config', { token: bob })).body.participants.find(p => p.username === u);
+    assert.deepEqual([served.name, served.name_en], [body.name, body.name_en], 'a member reads it as typed');
+    const alone = await asAgent('/api/agent/participants', { method: 'POST', body: { username: `${u}b`, name: WALES } });
+    assert.equal(alone.status, 200, `a flag alone is a name: ${alone.text}`);
+    for (const [what, value] of MALFORMED) {
+      const bad = await asAgent('/api/agent/participants', { method: 'POST', body: { username: `${u}x`, name: value } });
+      assert.deepEqual([bad.status, bad.body.error, bad.body.field, bad.body.detail], [400, 'invalid_text', 'name', INVISIBLE_DETAIL], `${what}: ${bad.text}`);
+    }
+  });
+
+  test('extract-draft keeps a flag in the name, passengers and notes, and strips it whole from a confirmation and a PIN', async () => {
+    nextExtraction = { phase: 'ny', type: 'hotel', name: `The Savoy ${ENGLAND}`, passengers: `Dan ${SCOTLAND}`, notes: `one ${WALES}\ntwo`,
+      confirmation: `AB${ENGLAND}12`, pin: `12${WALES}34` };
+    const r = await asAgent('/api/bookings/extract-draft', { method: 'POST', body: { url: 'https://example.com/conf' } });
+    assert.equal(r.status, 201, r.text);
+    const b = r.body.booking;
+    assert.deepEqual([b.name, b.passengers, b.notes, b.confirmation, b.pin],
+      [`The Savoy ${ENGLAND}`, `Dan ${SCOTLAND}`, `one ${WALES}\ntwo`, 'AB12', '1234']);
+  });
+});
+
 // ── 2. extract-draft ─────────────────────────────────────────────────────────
 describe('POST /api/bookings/extract-draft — cleans an LLM extraction instead of refusing it', () => {
   test('< > and control characters are removed, lengths clamped, a bad date dropped; the organizer gets a usable draft', async () => {

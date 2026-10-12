@@ -30,6 +30,19 @@
  * vowels (U+17B4, U+17B5) are already default-ignorable, so they are not listed
  * twice.
  *
+ * And one exception, on top of all of it (owner decision, 2026-10-12):
+ *   FLAGS   = a tag character (U+E0000-E007F) is refused as a lone character —
+ *             but a WELL-FORMED emoji tag sequence is a visible subdivision
+ *             flag, not a hidden character: U+1F3F4 immediately followed by 1-32
+ *             tag characters from U+E0030-E0039 / U+E0061-E007A and then U+E007F
+ *             (England, Scotland, Wales). Each such sequence is taken out of the
+ *             string (withoutFlags) before the rules above run on the rest, so
+ *             the stored text is: the string minus its valid flag sequences
+ *             passes every rule above. A flag alone is not blank. A code field
+ *             (confirmation, PIN) does not get the exception.
+ * So the enumerations below test the CHARACTER rule on lone characters, and
+ * the SEQUENCE rule is tested separately ("subdivision flags").
+ *
  * Two enumerations, on purpose: one against this Node's own
  * \p{Default_Ignorable_Code_Point} (the regex is built from that rule), and
  * one against a PINNED list of ranges (Unicode 17, the set Node 22 ships). A
@@ -90,7 +103,10 @@ const inRanges = (rs, cp) => rs.some(([a, b]) => cp >= a && cp <= b);
 const REFUSED = [];
 for (const cp of codePoints()) if (rules.INVISIBLE_RE.test(ch(cp))) REFUSED.push(cp);
 
-describe('the refused set — Default_Ignorable_Code_Point minus the allowed marks, plus the blank-looking extras', () => {
+// The CHARACTER rule, one lone character at a time. A tag character that sits
+// inside a well-formed flag sequence is the one exception; it is the SEQUENCE
+// rule's, tested in "subdivision flags" below.
+describe('the refused set (lone characters) — Default_Ignorable_Code_Point minus the allowed marks, plus the blank-looking extras; minus a tag character inside a valid flag sequence (tested separately)', () => {
   test('INVISIBLE_RE refuses exactly (DI − ALLOWED) ∪ EXTRA, over every code point', () => {
     const expected = [];
     for (const cp of codePoints()) {
@@ -174,11 +190,172 @@ describe('text people type with the allowed marks is stored as typed', () => {
     });
   }
 
-  test('a subdivision flag (England) is REFUSED: its tag characters are refused with the rest of U+E0000-E0FFF', () => {
-    const england = [0x1F3F4, 0xE0067, 0xE0062, 0xE0065, 0xE006E, 0xE0067, 0xE007F].map(ch).join('');
-    const r = rules.checkField('name', `${england} London`, rules.BOOKING_FIELDS.name);
-    assert.equal(r.error?.error, 'invalid_text');
-    assert.equal(r.error.detail, rules.INVISIBLE_DETAIL);
+});
+
+// ── subdivision flags (owner decision, 2026-10-12) ───────────────────────────
+// Until this decision a subdivision flag was refused with the rest of the tag
+// characters. It renders as a flag: accepted wherever text is, as typed —
+// and only in its well-formed shape. Every malformed shape stays refused.
+const BLACK_FLAG = 0x1F3F4, CANCEL = 0xE007F;
+const tagsOf = (s) => [...s].map(c => 0xE0000 + c.codePointAt(0));
+const flag = (region) => String.fromCodePoint(BLACK_FLAG, ...tagsOf(region), CANCEL);
+const ENGLAND = flag('gbeng'), SCOTLAND = flag('gbsct'), WALES = flag('gbwls');
+const FLAGS = [['England', ENGLAND], ['Scotland', SCOTLAND], ['Wales', WALES]];
+// The valid tag set inside a sequence: digits U+E0030-E0039, letters U+E0061-E007A.
+const VALID_TAG = (cp) => (cp >= 0xE0030 && cp <= 0xE0039) || (cp >= 0xE0061 && cp <= 0xE007A);
+// Malformed: each must be refused wherever a flag is accepted.
+const MALFORMED = [
+  ['a lone tag character', `x${ch(0xE0041)}y`],
+  ['tag letters after a base that is not U+1F3F4', String.fromCodePoint(0x1F3F3, ...tagsOf('gbeng'), CANCEL)],
+  ['tag letters after a letter', String.fromCodePoint(0x41, ...tagsOf('gbeng'), CANCEL)],
+  ['a sequence not terminated by U+E007F', String.fromCodePoint(BLACK_FLAG, ...tagsOf('gbeng'))],
+  ['a sequence terminated by a space', `${String.fromCodePoint(BLACK_FLAG, ...tagsOf('gbeng'))} London`],
+  ['U+E0001 LANGUAGE TAG inside', String.fromCodePoint(BLACK_FLAG, 0xE0001, ...tagsOf('gbeng'), CANCEL)],
+  ['U+E0020 TAG SPACE inside', String.fromCodePoint(BLACK_FLAG, 0xE0067, 0xE0020, 0xE0062, CANCEL)],
+  ['an uppercase tag letter (U+E0041-E005A is outside the set)', String.fromCodePoint(BLACK_FLAG, 0xE0047, 0xE0042, 0xE0045, 0xE004E, 0xE0047, CANCEL)],
+  ['U+E007E TAG TILDE inside', String.fromCodePoint(BLACK_FLAG, 0xE0067, 0xE007E, CANCEL)],
+  ['U+E002F TAG SOLIDUS inside', String.fromCodePoint(BLACK_FLAG, 0xE0067, 0xE002F, CANCEL)],
+  ['U+E003A TAG COLON inside', String.fromCodePoint(BLACK_FLAG, 0xE0067, 0xE003A, CANCEL)],
+  ['a terminator without a base', `x${ch(CANCEL)}`],
+  ['a terminator right after the base (no tag letters)', String.fromCodePoint(BLACK_FLAG, CANCEL)],
+  ['a second tag run glued after the terminator', ENGLAND + String.fromCodePoint(...tagsOf('gbsct'), CANCEL)],
+  ['a lone tag letter glued after the terminator', ENGLAND + ch(0xE0067)],
+  ['a variation selector inside the tag run', String.fromCodePoint(BLACK_FLAG, 0xE0067, 0xFE0F, 0xE0062, 0xE0065, 0xE006E, 0xE0067, CANCEL)],
+  ['a VS16 between the base and the tag run', String.fromCodePoint(BLACK_FLAG, 0xFE0F, ...tagsOf('gbeng'), CANCEL)],
+  ['a ZWJ inside the tag run', String.fromCodePoint(BLACK_FLAG, 0xE0067, 0x200D, 0xE0062, 0xE0065, 0xE006E, 0xE0067, CANCEL)],
+  ['a ZWJ before the terminator', String.fromCodePoint(BLACK_FLAG, ...tagsOf('gbeng'), 0x200D, CANCEL)],
+  ['33 tag characters (more than 32)', String.fromCodePoint(BLACK_FLAG, ...tagsOf('a'.repeat(33)), CANCEL)],
+  ['two terminators', String.fromCodePoint(BLACK_FLAG, ...tagsOf('gbeng'), CANCEL, CANCEL)],
+];
+const TEXT_SPECS = [['name', rules.BOOKING_FIELDS.name], ['passengers', rules.BOOKING_FIELDS.passengers], ['notes', rules.BOOKING_FIELDS.notes],
+  ['name', rules.PARTICIPANT_FIELDS.name], ['name_en', rules.PARTICIPANT_FIELDS.name_en], ['family', rules.PARTICIPANT_FIELDS.family]];
+const CODE_SPECS = [['confirmation', rules.BOOKING_FIELDS.confirmation], ['pin', rules.BOOKING_FIELDS.pin]];
+
+describe('subdivision flags — a well-formed emoji tag sequence is accepted as typed; every malformed one is refused', () => {
+  for (const [name, f] of FLAGS) {
+    test(`${name}: alone, with Hebrew and English around it, and beside other emoji — stored as typed in every text field; not blank; a draft keeps it`, () => {
+      const values = [f, `${f} London`, `טיול ל${f} עם המשפחה`, `Cardiff ${f}${ch(0x200F)} קרדיף`, `${f}${f}`, `${ch(0x1F1EE)}${ch(0x1F1F1)} ${f} ${ch(0x2764)}${ch(0xFE0F)}`,
+        `${f}${ch(0x200D)}${ch(0x1F469)}`];
+      for (const value of values) {
+        for (const [field, spec] of TEXT_SPECS) {
+          assert.deepEqual(rules.checkField(field, value, spec), { value }, `${field}: ${JSON.stringify(value)}`);
+          assert.equal(rules.cleanText(value, spec), value, `a draft keeps it: ${field}`);
+        }
+        assert.equal(rules.isBlank(value), false, JSON.stringify(value));
+      }
+      assert.deepEqual(rules.checkField('notes', `line one ${f}\nline two`, rules.BOOKING_FIELDS.notes), { value: `line one ${f}\nline two` });
+    });
+  }
+
+  test('a flag alone is not blank (it is a flag); a value of only tag characters, or only a terminator, still is', () => {
+    for (const [, f] of FLAGS) for (const v of [f, ` ${f} `]) assert.equal(rules.isBlank(v), false, JSON.stringify(v));
+    for (const v of [String.fromCodePoint(...tagsOf('gbeng'), CANCEL), ch(CANCEL), ` ${ch(0xE0067)} `]) assert.equal(rules.isBlank(v), true, JSON.stringify(v));
+  });
+
+  for (const [what, value] of MALFORMED) {
+    test(`refused: ${what} → invalid_text, the invisible-character message, in every text field; a draft drops the tag characters`, () => {
+      for (const [field, spec] of TEXT_SPECS) {
+        const r = rules.checkField(field, value, spec);
+        assert.ok(r.error, `${field} accepted ${what}`);
+        assert.deepEqual([r.error.error, r.error.detail], ['invalid_text', rules.INVISIBLE_DETAIL], `${field}: ${what}`);
+        assert.match(r.error.message.en, /hidden character/);
+        // What a draft keeps must pass the write: a malformed sequence leaves
+        // no tag character behind (a valid flag inside it may stay).
+        const cleaned = rules.cleanText(value, spec);
+        if (cleaned !== null) assert.deepEqual(rules.checkField(field, cleaned, spec), { value: cleaned }, `the draft of ${what} passes the write`);
+      }
+    });
+  }
+
+  test('enumerated: every code point U+E0000-E0FFF as the one tag inside U+1F3F4 ... U+E007F — accepted exactly for U+E0030-E0039 and U+E0061-E007A', () => {
+    const accepted = [];
+    for (let cp = 0xE0000; cp <= 0xE0FFF; cp++) {
+      const v = String.fromCodePoint(BLACK_FLAG, cp, CANCEL);
+      if (!rules.checkField('name', v, rules.BOOKING_FIELDS.name).error) accepted.push(cp);
+    }
+    assert.equal(show(ranges(accepted)), 'U+E0030-U+E0039 U+E0061-U+E007A');
+  });
+
+  test('1 to 32 tag characters are a flag; 33 are not', () => {
+    for (const n of [1, 2, 5, 32]) {
+      const v = String.fromCodePoint(BLACK_FLAG, ...tagsOf('a'.repeat(n)), CANCEL);
+      assert.deepEqual(rules.checkField('notes', v, rules.BOOKING_FIELDS.notes), { value: v }, `${n} tags`);
+    }
+    const v33 = String.fromCodePoint(BLACK_FLAG, ...tagsOf('a'.repeat(33)), CANCEL);
+    assert.equal(rules.checkField('notes', v33, rules.BOOKING_FIELDS.notes).error?.error, 'invalid_text');
+  });
+
+  test('every refused character, put inside a flag (after the base, between tags, before the terminator) or glued after it, is still refused', () => {
+    const tags = tagsOf('gbeng');
+    for (const cp of REFUSED) {
+      const inside = VALID_TAG(cp) ? [] : [
+        String.fromCodePoint(BLACK_FLAG, cp, ...tags, CANCEL),
+        String.fromCodePoint(BLACK_FLAG, tags[0], cp, ...tags.slice(1), CANCEL),
+        String.fromCodePoint(BLACK_FLAG, ...tags, cp, CANCEL),
+      ];
+      for (const v of [...inside, `${ENGLAND}${ch(cp)}`, `${ch(cp)}${ENGLAND}`]) {
+        const r = rules.checkField('name', v, rules.BOOKING_FIELDS.name);
+        assert.equal(r.error?.error, 'invalid_text', `${hex(cp)} in ${[...v].map(c => hex(c.codePointAt(0))).join(' ')}`);
+      }
+    }
+  });
+
+  test('< > and a line break beside a flag keep their own refusal and message', () => {
+    let r = rules.checkField('name', `${ENGLAND}<b>`, rules.BOOKING_FIELDS.name);
+    assert.deepEqual([r.error.error, r.error.detail], ['invalid_text', rules.TEXT_DETAIL]);
+    assert.match(r.error.message.en, /< or >/);
+    r = rules.checkField('name', `${ENGLAND}\nx`, rules.BOOKING_FIELDS.name);
+    assert.match(r.error.message.en, /single line/);
+  });
+
+  test('the length cap counts the flag\'s code points (7 for England) — a cap is never bypassed by a flag', () => {
+    const spec = rules.PARTICIPANT_FIELDS.name; // max 80
+    const fits = `${'a'.repeat(73)}${ENGLAND}`;
+    assert.deepEqual(rules.checkField('name', fits, spec), { value: fits });
+    assert.equal(rules.checkField('name', `a${fits}`, spec).error?.error, 'text_too_long');
+  });
+
+  test('code fields refuse a flag: a confirmation number or a PIN has no use for one (invalid_text, invisible message)', () => {
+    for (const [field, spec] of CODE_SPECS) {
+      for (const [, f] of FLAGS) {
+        for (const v of [`AB${f}12`, f]) {
+          const r = rules.checkField(field, v, spec);
+          assert.ok(r.error, `${field} accepted ${JSON.stringify(v)}`);
+          assert.deepEqual([r.error.error, r.error.field, r.error.detail], ['invalid_text', field, rules.INVISIBLE_DETAIL]);
+          assert.match(r.error.message.en, /hidden character/);
+        }
+      }
+    }
+  });
+
+  test('extract-draft: a flag is kept in a name, passengers and notes, and stripped whole from a confirmation or a PIN', () => {
+    assert.equal(rules.cleanText(`Hotel ${ENGLAND}${ch(0x200B)}`, rules.BOOKING_FIELDS.name), `Hotel ${ENGLAND}`);
+    assert.equal(rules.cleanText(`Dan ${WALES}, Dana ${SCOTLAND}`, rules.BOOKING_FIELDS.passengers), `Dan ${WALES}, Dana ${SCOTLAND}`);
+    assert.equal(rules.cleanText(`one ${ENGLAND}\r\ntwo${ch(0x2063)}`, rules.BOOKING_FIELDS.notes), `one ${ENGLAND}\ntwo`);
+    assert.equal(rules.cleanText(`AB${ENGLAND}12`, rules.BOOKING_FIELDS.confirmation), 'AB12');
+    assert.equal(rules.cleanText(`12${WALES}34`, rules.BOOKING_FIELDS.pin), '1234');
+    assert.equal(rules.cleanText(ENGLAND, rules.BOOKING_FIELDS.confirmation), null, 'a code of a flag alone cleans to nothing');
+  });
+
+  test('extract-draft: a length clamp that would cut a flag in half leaves no tag character behind', () => {
+    const spec = rules.PARTICIPANT_FIELDS.name; // max 80
+    const cleaned = rules.cleanText(`${'a'.repeat(77)}${ENGLAND}`, spec); // the clamp falls inside the flag
+    assert.equal(cleaned, `${'a'.repeat(77)}${ch(BLACK_FLAG)}`);
+    assert.deepEqual(rules.checkField('name', cleaned, spec), { value: cleaned }, 'the draft passes the write');
+  });
+
+  test('withoutFlags (the helper every rule runs through) takes each well-formed sequence out once, and is idempotent', () => {
+    const glued = ENGLAND + String.fromCodePoint(...tagsOf('gbsct'), CANCEL);
+    const once = rules.withoutFlags(glued);
+    assert.equal(rules.withoutFlags(once), once, 'a second pass changes nothing');
+    assert.ok(rules.INVISIBLE_RE.test(once), 'the glued run is still there to be refused');
+    assert.equal(rules.INVISIBLE_RE.test(rules.withoutFlags(`${ENGLAND} ${WALES}`)), false);
+  });
+
+  test('a flag in a link HOST is still refused; a link is not text', () => {
+    for (const [, f] of FLAGS) {
+      for (const link of [`https://a${f}b.com/`, `https://${f}.example/`, `https://maps.${f}/x`]) assert.equal(rules.safeLink(link), undefined, link);
+    }
   });
 });
 

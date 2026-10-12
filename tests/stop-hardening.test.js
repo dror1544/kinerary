@@ -470,7 +470,8 @@ describe('the twins — server/text-rules.js and server/trip-structure.js carry 
   };
 
   for (const name of ['ALLOWED_MARKS', 'INVISIBLE_SRC', 'UNSAFE_LINE_RE', 'UNSAFE_MULTILINE_RE', 'INVISIBLE_RE', 'BLANK_ALL_RE', 'CODE_MARKS_RE',
-    'TEXT_DETAIL', 'INVISIBLE_DETAIL', 'CODE_DETAIL', 'LINK_DETAIL', 'LINK_HOST_HIDDEN_RE', 'LINK_LABEL_DOT_RE', 'toLf', 'isBlankText']) {
+    'TEXT_DETAIL', 'INVISIBLE_DETAIL', 'CODE_DETAIL', 'LINK_DETAIL', 'LINK_HOST_HIDDEN_RE', 'LINK_LABEL_DOT_RE', 'toLf', 'isBlankText',
+    'FLAG_TAG_SRC', 'FLAG_TAG_RE', 'withoutFlags']) {
     test(`const ${name} is identical in both files`, () => {
       assert.equal(constant(stopLayer, name), constant(textRules, name));
     });
@@ -499,6 +500,22 @@ describe('the twins — server/text-rules.js and server/trip-structure.js carry 
     assert.equal(constant(textRules, 'STRIP_LINE_RE'), "const STRIP_LINE_RE = new RegExp(UNSAFE_LINE_RE.source, 'gu');");
     assert.equal(constant(textRules, 'STRIP_MULTILINE_RE'), "const STRIP_MULTILINE_RE = new RegExp(UNSAFE_MULTILINE_RE.source, 'gu');");
   });
+  // Subdivision flags (owner decision, 2026-10-12): the well-formed sequence is
+  // written ONCE per file (FLAG_TAG_SRC), its one helper (withoutFlags) is built
+  // from it, and the draft cleaner's split is built from it too.
+  test('the flag sequence is written once per file, and every helper that knows it is built from FLAG_TAG_SRC', () => {
+    for (const code of [textRules, stopLayer]) {
+      assert.equal((code.match(/\\u\{1F3F4\}/g) || []).length, 1, 'the base, as an escape, is written once (in FLAG_TAG_SRC)');
+      assert.match(constant(code, 'FLAG_TAG_SRC'), /^const FLAG_TAG_SRC = String\.raw`\\u\{1F3F4\}\[\\u\{E0030\}-\\u\{E0039\}\\u\{E0061\}-\\u\{E007A\}\]\{1,32\}\\u\{E007F\}`;$/);
+      assert.match(constant(code, 'FLAG_TAG_RE'), /FLAG_TAG_SRC/);
+      assert.match(constant(code, 'withoutFlags'), /FLAG_TAG_RE/);
+      assert.match(constant(code, 'isBlankText'), /withoutFlags\(/, 'the blank check sees a flag as visible');
+    }
+    assert.match(constant(textRules, 'FLAG_SPLIT_RE'), /FLAG_TAG_SRC/);
+    // Every place a text regex is applied in the stop layer applies it to the
+    // string minus its flags — or, for a code, to the raw string on purpose.
+    assert.match(fn(stopLayer, 'unsafeTextAt'), /withoutFlags\(/);
+  });
 });
 
 describe('boundary re-check of PR #371 — the widened invisible set, in the stop layer', () => {
@@ -514,13 +531,10 @@ describe('boundary re-check of PR #371 — the widened invisible set, in the sto
     assert.deepEqual(counts(), NOTHING);
   });
 
-  test('a tag character (U+E0041) in a stop title is refused; so is a subdivision flag in the emoji field (it is built from tag characters)', () => {
+  test('a lone tag character (U+E0041) in a stop title is refused (a well-formed subdivision flag is not: see "subdivision flags" below)', () => {
     const { structure, counts } = make();
-    let r = structure.ops.update('colmar', { title: `Col${ch(0xE0041)}mar` }, 'alice');
+    const r = structure.ops.update('colmar', { title: `Col${ch(0xE0041)}mar` }, 'alice');
     assert.deepEqual([r.status, r.body.error, r.body.field, r.body.detail], [400, 'invalid_text', 'title', INVISIBLE_DETAIL]);
-    const england = [0x1F3F4, 0xE0067, 0xE0062, 0xE0065, 0xE006E, 0xE0067, 0xE007F].map(ch).join('');
-    r = structure.ops.update('colmar', { emoji: england }, 'alice');
-    assert.deepEqual([r.status, r.body.error, r.body.field], [400, 'invalid_text', 'emoji']);
     assert.deepEqual(counts(), NOTHING);
   });
 
@@ -627,6 +641,97 @@ describe('re-check of #373 — a stop value made only of allowed marks or combin
     const id = booking({ confirmation: `123${ch(0x200F)}456` });
     const r = structure.ops.fromBooking('colmar', { booking_id: id }, 'alice');
     assert.deepEqual([r.status, r.body.error, r.body.field, r.body.source], [400, 'invalid_text', 'accommodation.confirmation', 'booking']);
+    assert.deepEqual(counts(), NOTHING);
+  });
+});
+
+// ── subdivision flags (owner decision, 2026-10-12) ───────────────────────────
+// A well-formed emoji tag sequence (U+1F3F4, 1-32 tag characters from
+// U+E0030-E0039 / U+E0061-E007A, U+E007F) is a visible flag: accepted in every
+// stop text field, as typed. A lone or malformed tag run stays refused, and so
+// does any flag in accommodation.confirmation (a code). The whole rule is
+// enumerated in invisible-text.test.js; here it is pinned on the stop layer.
+describe('subdivision flags — England, Scotland and Wales in stop text are stored as typed; malformed tag runs and a flag in a confirmation are refused', () => {
+  const ch = (cp) => String.fromCodePoint(cp);
+  const tagsOf = (s) => [...s].map(c => 0xE0000 + c.codePointAt(0));
+  const flag = (region) => String.fromCodePoint(0x1F3F4, ...tagsOf(region), 0xE007F);
+  const FLAGS = [['England', flag('gbeng')], ['Scotland', flag('gbsct')], ['Wales', flag('gbwls')]];
+  const MALFORMED = [
+    ['a lone tag character', `Col${ch(0xE0041)}mar`],
+    ['an unterminated sequence', String.fromCodePoint(0x1F3F4, ...tagsOf('gbeng'))],
+    ['tag letters after another base', String.fromCodePoint(0x1F3F3, ...tagsOf('gbeng'), 0xE007F)],
+    ['an uppercase tag letter', String.fromCodePoint(0x1F3F4, 0xE0047, 0xE0042, 0xE007F)],
+    ['a terminator without a base', `x${ch(0xE007F)}`],
+    ['a second tag run glued after the terminator', flag('gbeng') + String.fromCodePoint(...tagsOf('gbsct'), 0xE007F)],
+    ['a ZWJ inside the tag run', String.fromCodePoint(0x1F3F4, 0xE0067, 0x200D, 0xE0062, 0xE007F)],
+    ['a VS16 inside the tag run', String.fromCodePoint(0x1F3F4, 0xE0067, 0xFE0F, 0xE0062, 0xE007F)],
+  ];
+
+  for (const [name, f] of FLAGS) {
+    test(`${name}: title (string and { he, en }), tabLabel, emoji, accommodation name/address/description/note — stored and served exactly as typed`, () => {
+      const { structure } = make();
+      const title = { he: `קולמר ${f}`, en: `Colmar ${f}` };
+      const accommodation = { name: `מלון ${f} Hotel`, address: `1 Main St ${f}`, description: `שורה ${f}\nline two`, note: { he: f, en: `note ${f}` } };
+      const body = { title, tabLabel: `COLMAR ${f}`, emoji: f, accommodation };
+      const r = structure.ops.update('colmar', body, 'alice');
+      assert.equal(r.status, 200, JSON.stringify(r.body));
+      const colmar = structure.effectiveConfig().phases.find(p => p.id === 'colmar');
+      assert.deepEqual([colmar.title, colmar.tabLabel, colmar.emoji, colmar.accommodation], [title, body.tabLabel, f, accommodation]);
+      // A flag alone is a title: not blank.
+      const alone = structure.ops.update('colmar', { title: f }, 'alice');
+      assert.equal(alone.status, 200, JSON.stringify(alone.body));
+      assert.equal(structure.effectiveConfig().phases.find(p => p.id === 'colmar').title, f);
+    });
+  }
+
+  test('split: a new stop titled with a flag is created, its title and emoji as typed', () => {
+    const { structure } = make();
+    const title = `Edinburgh ${flag('gbsct')}`;
+    const r = structure.ops.split('colmar', { at: '2026-12-05', new_stop: { title, emoji: flag('gbsct') } }, 'alice');
+    assert.equal(r.status, 201, JSON.stringify(r.body));
+    const added = structure.effectiveConfig().phases.find(p => p.title === title);
+    assert.ok(added, 'the new stop carries the flag title');
+    assert.equal(added.emoji, flag('gbsct'));
+  });
+
+  test('from-booking: a booking named with a flag becomes the stop\'s accommodation name, as typed', () => {
+    const { structure, booking } = make();
+    const name = `The Savoy ${flag('gbeng')}`;
+    const r = structure.ops.fromBooking('colmar', { booking_id: booking({ name }) }, 'alice');
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.equal(structure.effectiveConfig().phases.find(p => p.id === 'colmar').accommodation.name, name);
+  });
+
+  for (const [what, v] of MALFORMED) {
+    test(`refused: ${what} — in title, tabLabel, emoji, accommodation name and description → 400 invalid_text, the invisible detail; nothing stored`, () => {
+      const { structure, counts } = make();
+      for (const [body, field] of [[{ title: v }, 'title'], [{ title: { he: 'קולמר', en: v } }, 'title.en'], [{ tabLabel: v }, 'tabLabel'],
+        [{ emoji: v }, 'emoji'], [{ accommodation: { name: v } }, 'accommodation.name'], [{ accommodation: { name: 'H', description: v } }, 'accommodation.description']]) {
+        const r = structure.ops.update('colmar', body, 'alice');
+        assert.deepEqual([r.status, r.body.error, r.body.field, r.body.detail], [400, 'invalid_text', field, INVISIBLE_DETAIL], `${what} in ${field}`);
+      }
+      assert.deepEqual(counts(), NOTHING);
+    });
+  }
+
+  test('accommodation.confirmation refuses a flag (a code has no use for one): 400 invalid_text; from-booking refuses a booking confirmation carrying one', () => {
+    const { structure, counts, booking } = make();
+    for (const [, f] of FLAGS) {
+      for (const v of [f, `AB${f}12`]) {
+        const r = structure.ops.update('colmar', { accommodation: { name: 'H', confirmation: v } }, 'alice');
+        assert.deepEqual([r.status, r.body.error, r.body.field, r.body.detail], [400, 'invalid_text', 'accommodation.confirmation', INVISIBLE_DETAIL]);
+      }
+    }
+    const id = booking({ confirmation: `AB${flag('gbeng')}12` }); // planted directly: the booking route refuses it
+    const r = structure.ops.fromBooking('colmar', { booking_id: id }, 'alice');
+    assert.deepEqual([r.status, r.body.error, r.body.field, r.body.source], [400, 'invalid_text', 'accommodation.confirmation', 'booking']);
+    assert.deepEqual(counts(), NOTHING);
+  });
+
+  test('a flag in a stop link host is still refused (invalid_link)', () => {
+    const { structure, counts } = make();
+    const r = structure.ops.update('colmar', { accommodation: { name: 'H', maps: `https://a${flag('gbeng')}b.com/` } }, 'alice');
+    assert.deepEqual([r.status, r.body.error, r.body.field], [400, 'invalid_link', 'accommodation.maps']);
     assert.deepEqual(counts(), NOTHING);
   });
 });
