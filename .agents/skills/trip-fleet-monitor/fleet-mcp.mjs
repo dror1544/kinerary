@@ -1641,7 +1641,7 @@ async function loadAlerts(stack, h) {
 
   const [
     unreachable, jobs, notifications, stuck, awaiting, companionless, modelFailing, reported,
-    verificationFailed, awaitingApproval,
+    verificationFailed, bridgeCheckFailed, awaitingApproval,
   ] = await Promise.all([
     runSql(stack, `SELECT t.slug, coalesce(t.unreachable_reason,'-')
                      FROM control_plane.trips t
@@ -1727,6 +1727,31 @@ async function loadAlerts(stack, h) {
                           AND ${real}
                         ORDER BY t.slug, ve.check_name;`)
       : Promise.resolve([]),
+    // A live trip whose companion bridge is broken. mcp_isolation is NOT
+    // hard-gated: the companion attaches after ready_private commits, so the
+    // gate records it 'skipped' and record_post_attach_evidence records the
+    // real result afterwards (verification.py, deliberately informational —
+    // it never reverts ready_private). Nothing alerted on that real result,
+    // so a trip whose bridge cannot reach its own trip was visible only in
+    // the evidence table (live, 2026-10-10). Only the LATEST row counts, so
+    // the earlier 'skipped' never fires and a bridge that was repaired and
+    // re-checked clears. If two rows tie on observed_at (a same-microsecond
+    // write; record_evidence uses clock_timestamp() so this is not expected)
+    // both are "latest" and a 'failed' among them still alerts — fail loud,
+    // not quiet. Reads only columns already granted to the monitor role
+    // (monitor-db-role.sql: trip_id, check_name, outcome, observed_at).
+    hasVerification
+      ? runSql(stack, `SELECT t.slug,
+                              to_char(ve.observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI') || ' UTC'
+                         FROM control_plane.verification_evidence ve
+                         JOIN control_plane.trips t ON t.id = ve.trip_id
+                        WHERE ve.check_name = 'mcp_isolation'
+                          AND ve.outcome = 'failed'
+                          AND ve.observed_at = (SELECT max(ve2.observed_at) FROM control_plane.verification_evidence ve2
+                                                 WHERE ve2.trip_id = ve.trip_id AND ve2.check_name = ve.check_name)
+                          AND ${tripClassSql(stack)} = 'live'
+                        ORDER BY t.slug;`)
+      : Promise.resolve([]),
     // A job sitting in waiting_for_user_action for a while — a fresh plan
     // nobody has approved yet, or (2026-10-06) an approval that expired,
     // including while the trip was suspended: resumeTrip reverts that case
@@ -1744,7 +1769,7 @@ async function loadAlerts(stack, h) {
   ]);
   return {
     unreachable, jobs, notifications, stuck, awaiting, companionless, modelFailing, reported,
-    verificationFailed, awaitingApproval,
+    verificationFailed, awaitingApproval, bridgeCheckFailed,
   };
 }
 
@@ -1760,7 +1785,7 @@ async function loadAlerts(stack, h) {
  */
 function alertSections({
   unreachable, jobs, notifications, stuck, awaiting, companionless, modelFailing, reported,
-  verificationFailed, awaitingApproval,
+  verificationFailed, awaitingApproval, bridgeCheckFailed,
 }) {
   return [
     { title: "UNREACHABLE", label: "unreachable", rows: unreachable,
@@ -1779,6 +1804,13 @@ function alertSections({
     { title: "VERIFICATION FAILED", label: "verification failed", rows: verificationFailed,
       text: (r) => `${r[0]} — ${r[1]} failed as of ${r[2]}`,
       digest: (r) => `${md(r[0])} — ${md(r[1])} failed as of ${md(r[2])}` },
+    // Not VERIFICATION FAILED: that one is the three hard-gated checks, where
+    // the trip was held back. This is the post-attach check, which cannot hold
+    // anything back — the site is up and the trip is ready_private — so what
+    // is broken is the companion's way of reading its own trip. (2026-10-10)
+    { title: "COMPANION BRIDGE CHECK FAILED", label: "companion bridge check failed", rows: bridgeCheckFailed,
+      text: (r) => `${r[0]} — mcp_isolation failed as of ${r[1]}; the site is up, but its companion's bridge could not be confirmed able to reach the trip`,
+      digest: (r) => `${md(r[0])} — mcp_isolation failed as of ${md(r[1])}; the site is up, but its companion's bridge could not be confirmed able to reach the trip` },
     // Distinct from a suspend/resume cycle, which handles its own expired
     // approval inline (admin-mutations.ts) — this is the trip that was never
     // suspended at all and just sat unapproved too long. (2026-10-06)

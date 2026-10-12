@@ -446,7 +446,20 @@ def record_evidence(
 ) -> None:
     """One verification_evidence row per result, in its own transaction —
     written whether the outcome is passed, failed OR skipped. This is the
-    table's entire reason to exist: a failure recorded, never swallowed."""
+    table's entire reason to exist: a failure recorded, never swallowed.
+
+    `observed_at` is `clock_timestamp()`, NOT `now()`: `now()` is the start of
+    the enclosing TRANSACTION, and this function's own `conn.transaction()` is
+    only a savepoint when the caller already holds one — so a gate-time
+    `skipped` row and the real result written afterwards carried the identical
+    instant (live, 2026-10-10: eight rows, one timestamp), and "the latest
+    attempt per check" (fleet-mcp.mjs `max(observed_at)`) could not order
+    them. `clock_timestamp()` is the moment of the INSERT itself, so rows
+    order by when they were written. A true tie (two writes inside the same
+    microsecond) is not engineered away — it cannot be broken without a
+    schema change (`id` is random, `created_at` is a `now()` default and ties
+    the same way) — and the reader treats it fail-loud: both rows are "the
+    latest", so a `failed` among them still alerts."""
     with conn.transaction():
         with conn.cursor() as cur:
             for result in results:
@@ -455,7 +468,7 @@ def record_evidence(
                     """
                     INSERT INTO control_plane.verification_evidence
                       (id, trip_id, deployment_ref, check_name, outcome, evidence_digest, observed_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, now())
+                    VALUES (%s, %s, %s, %s, %s, %s, clock_timestamp())
                     """,
                     (
                         _generate_evidence_id(), trip_id, deployment_ref,
