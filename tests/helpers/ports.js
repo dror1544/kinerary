@@ -173,6 +173,11 @@ export const PORTS = {
   // refusals carry tag text, so every error helper in mcp/mcp.js is reached.
   mcpErrorTagsSite:      28334,  // the stand-in site
   mcpErrorTagsMcp:       28335,  // mcp/mcp.js against it
+  // The public lost-and-found form: write-time text rules, abuse bounds, and
+  // the finder-submitted label on the model's copy — tests/lost-found-hardening.test.js.
+  lostFoundHardening:       28331,  // the trip server (text rules, MCP, Classic)
+  lostFoundHardeningMcp:    28332,  // mcp/mcp.js against it
+  lostFoundHardeningBounds: 28333,  // a second trip server: rate limit and open-entry cap
 
   // ── Stand-ins for services the server calls out to ─────────────────────
   bookingExtractMockHermes: 28103,

@@ -2142,12 +2142,21 @@ app.post('/api/upload', authRequired, upload.array('files'), async (req, res) =>
 // stranger can reach the form, so a script can too — this section bounds and
 // rate-limits what an anonymous caller can write, without adding auth.
 
-// Field caps (trimmed lengths) — generous for a name/phone/short description,
-// tight enough that a script cannot use this form to stash arbitrary text.
-const LOST_FOUND_MAX_NAME = 80;
-const LOST_FOUND_MAX_PHONE = 32;
-const LOST_FOUND_MAX_ITEM = 200;
-const LOST_FOUND_MAX_LOCATION = 200;
+// Field rules (owner decision, 2026-10-12: the form stays WITHOUT login, and
+// what a stranger types is held to the bookings' write-time rules). Each field
+// is checked by server/text-rules.js against LOST_FOUND_FIELDS — its cap (the
+// ones #207 set: name 80, phone 32, location 200, item 200), no < >, no
+// control or invisible characters (the three standard flags are text), the
+// item multi-line because the form's description is a textarea — and refused
+// with the bookings' 400 shape, { error, field, message: { he, en }, detail },
+// which the Classic form shows in the page's language. Values are trimmed
+// before the check, as this route always stored them. Rows stored before the
+// rule are never rewritten, and nothing on the read path checks them.
+//
+// The companion still reads whatever passes: words cannot be refused. Its MCP
+// tools label every entry as finder-submitted, untrusted text
+// (LOST_FOUND_SOURCE in mcp/mcp.js and server/trip-mcp/tools.js).
+
 // Small cap on the whole request body — four short strings never need more
 // than a few hundred bytes; this catches an oversized payload before it is
 // even validated. Not a replacement for the global 30mb express.json()
@@ -2157,13 +2166,38 @@ const LOST_FOUND_MAX_BODY_BYTES = 4096;
 // In-memory, per-address rate limit: 5 ACCEPTED writes per rolling hour.
 // Deliberately no dependency and no persistence — an abuse bound on a small
 // social feature, not a security control, so resetting on every restart is
-// fine. `address -> [timestamp, ...]` of accepted writes, oldest first.
+// fine. `address -> [timestamp, ...]` of accepted writes, oldest first. A
+// refused report (400, 413, 429) is not counted. The 429 says why, in both
+// languages (LOST_FOUND_MESSAGES below).
 const LOST_FOUND_RATE_LIMIT = 5;
 const LOST_FOUND_RATE_WINDOW_MS = 60 * 60 * 1000;
 // Bounds the map itself: a flood of distinct addresses (not just repeats
 // from one) must not grow this without limit for the life of the process.
 const LOST_FOUND_MAX_TRACKED_ADDRESSES = 1000;
 const lostFoundWrites = new Map();
+// The table as a whole: at most this many OPEN (unresolved) entries. The
+// per-address limit above does not bound a caller with many addresses, and
+// every visitor behind one proxy shares an address; this does. A resolved
+// entry does not count, so a member resolving one reopens the form.
+const LOST_FOUND_MAX_OPEN = 200;
+
+// The refusals that are not about one field, in both languages, addressed to
+// the finder the way text-rules.js addresses a person.
+const LOST_FOUND_MESSAGES = {
+  rate_limited: {
+    he: 'נשלחו מכאן יותר מדי דיווחים בשעה האחרונה. נסו שוב מאוחר יותר.',
+    en: 'Too many reports were sent from here in the last hour. Try again later.',
+  },
+  lost_found_full: {
+    he: 'רשימת האבדות והמציאות מלאה כרגע. נסו שוב מאוחר יותר.',
+    en: 'The lost-and-found list is full right now. Try again later.',
+  },
+  body_too_large: {
+    he: 'הדיווח ארוך מדי. קצרו אותו ונסו שוב.',
+    en: 'The report is too long. Shorten it and try again.',
+  },
+};
+const lostFoundRefusal = (error) => ({ error, message: LOST_FOUND_MESSAGES[error] });
 
 function pruneLostFoundBucket(timestamps, now) {
   while (timestamps.length && now - timestamps[0] >= LOST_FOUND_RATE_WINDOW_MS) timestamps.shift();
@@ -2197,35 +2231,42 @@ app.post('/api/lost-found', (req, res) => {
   if (bucket.length >= LOST_FOUND_RATE_LIMIT) {
     const retryAfterMs = LOST_FOUND_RATE_WINDOW_MS - (now - bucket[0]);
     res.set('Retry-After', String(Math.max(1, Math.ceil(retryAfterMs / 1000))));
-    return res.status(429).json({ error: 'rate_limited' });
+    return res.status(429).json(lostFoundRefusal('rate_limited'));
   }
 
   const contentLength = Number(req.headers['content-length'] || 0);
   if (contentLength > LOST_FOUND_MAX_BODY_BYTES) {
-    return res.status(413).json({ error: 'body_too_large' });
+    return res.status(413).json(lostFoundRefusal('body_too_large'));
   }
 
-  const { name, phone, item, location } = req.body || {};
-  if (typeof name !== 'string' || typeof item !== 'string') {
-    return res.status(400).json({ error: 'name and item are required' });
+  // Every field is text or absent (null and undefined: phone and location
+  // are optional); anything else — a number, an array better-sqlite3 would
+  // flatten, an object — is refused, naming the field. Then trimmed, then the
+  // required pair, then the text rules (Field rules above).
+  const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+  const fields = textRules.LOST_FOUND_FIELDS;
+  const values = {};
+  for (const [field, spec] of Object.entries(fields)) {
+    const v = Object.hasOwn(body, field) ? body[field] : undefined;
+    if (v === undefined || v === null) { values[field] = ''; continue; }
+    if (typeof v !== 'string') {
+      return res.status(400).json(textRules.refusal('invalid_text', field, spec.label, 'type', { detail: 'must be text' }));
+    }
+    values[field] = v.trim();
   }
-  if (phone != null && typeof phone !== 'string') return res.status(400).json({ error: 'phone must be a string' });
-  if (location != null && typeof location !== 'string') return res.status(400).json({ error: 'location must be a string' });
+  for (const field of ['name', 'item']) {
+    if (textRules.isBlank(values[field])) return res.status(400).json(textRules.requiredRefusal('missing_fields', field, fields));
+  }
+  const checked = textRules.checkFields(values, fields);
+  if (checked.error) return res.status(400).json(checked.error);
+  const v = checked.values;
 
-  const trimmedName = name.trim();
-  const trimmedItem = item.trim();
-  const trimmedPhone = (typeof phone === 'string' ? phone : '').trim();
-  const trimmedLocation = (typeof location === 'string' ? location : '').trim();
-
-  if (!trimmedName || !trimmedItem) return res.status(400).json({ error: 'name and item are required' });
-  if (trimmedName.length > LOST_FOUND_MAX_NAME) return res.status(400).json({ error: 'name too long' });
-  if (trimmedItem.length > LOST_FOUND_MAX_ITEM) return res.status(400).json({ error: 'item too long' });
-  if (trimmedPhone.length > LOST_FOUND_MAX_PHONE) return res.status(400).json({ error: 'phone too long' });
-  if (trimmedLocation.length > LOST_FOUND_MAX_LOCATION) return res.status(400).json({ error: 'location too long' });
+  const open = db.prepare('SELECT COUNT(*) AS n FROM lost_found WHERE COALESCE(resolved, 0) = 0').get().n;
+  if (open >= LOST_FOUND_MAX_OPEN) return res.status(429).json(lostFoundRefusal('lost_found_full'));
 
   const result = db.prepare(
     "INSERT INTO lost_found (name, phone, item, location) VALUES (?,?,?,?)"
-  ).run(trimmedName, trimmedPhone, trimmedItem, trimmedLocation);
+  ).run(v.name, v.phone, v.item, v.location);
 
   bucket.push(now);
   lostFoundWrites.set(address, bucket);
