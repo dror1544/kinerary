@@ -81,25 +81,29 @@ const MULTILINE_KEYS = new Set(['description', 'note']);
 //
 // Fifth boundary review (2026-10-11), the same three follow-ups as the booking
 // rules in server/text-rules.js (which explains each): invisible and
-// direction-changing characters are refused too (U+202A-U+202E, U+2066-U+2069,
-// U+2028/U+2029, U+FEFF, U+200B, U+2060 — never LRM, RLM, ALM, ZWNJ or ZWJ,
-// which Hebrew and emoji are typed with), with their own `detail` and the same
+// blank-looking characters are refused too (every Default_Ignorable_Code_Point,
+// plus U+2028/U+2029, U+2800 and U+FFFC, since the boundary re-check of PR #371
+// — never LRM, RLM, ALM, ZWNJ, ZWJ or VS16, which Hebrew, Arabic, Persian and
+// emoji are typed with; text-rules.js lists the set), with their own `detail` and the same
 // invalid_text code — the stop routes answer { error, field, detail } and no
 // bilingual message, and keep that shape; a description's or note's \r\n and
 // lone \r become \n before the check (toLf); and a link the URL parser would
 // have to rewrite is refused.
-// TWIN: UNSAFE_LINE_RE, UNSAFE_MULTILINE_RE, INVISIBLE_RE, TEXT_DETAIL,
+// A title, tab label or emoji made only of such characters is therefore
+// refused as invalid_text before textValue()'s blank check could see it.
+// TWIN: INVISIBLE_SRC, UNSAFE_LINE_RE, UNSAFE_MULTILINE_RE, INVISIBLE_RE, TEXT_DETAIL,
 // INVISIBLE_DETAIL, LINK_DETAIL, LINK_HOST_HIDDEN_RE, LINK_LABEL_DOT_RE, toLf,
 // textDetail() and safeLink() are byte-identical copies of the same names in
 // server/text-rules.js; tests/stop-hardening.test.js ("the twins") compares
 // them. Change one, change both.
-const UNSAFE_LINE_RE = /[<>\u0000-\u001F\u007F-\u009F\u200B\u2028\u2029\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/;
-const UNSAFE_MULTILINE_RE = /[<>\u0000-\u0009\u000B-\u001F\u007F-\u009F\u200B\u2028\u2029\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/;
-const INVISIBLE_RE = /[\u200B\u2028\u2029\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/;
+const INVISIBLE_SRC = String.raw`(?![\u200C-\u200F\u061C\uFE0F])[\p{Default_Ignorable_Code_Point}\u2028\u2029\u2800\uFFFC]`;
+const UNSAFE_LINE_RE = new RegExp(String.raw`[<>\u0000-\u001F\u007F-\u009F]|` + INVISIBLE_SRC, 'u');
+const UNSAFE_MULTILINE_RE = new RegExp(String.raw`[<>\u0000-\u0009\u000B-\u001F\u007F-\u009F]|` + INVISIBLE_SRC, 'u');
+const INVISIBLE_RE = new RegExp(INVISIBLE_SRC, 'u');
 const TEXT_DETAIL = 'text may not contain < > or control characters';
-const INVISIBLE_DETAIL = 'text may not contain invisible characters that change its direction or display (U+200B, U+2028, U+2029, U+202A-U+202E, U+2060, U+2066-U+2069, U+FEFF)';
+const INVISIBLE_DETAIL = 'text may not contain invisible or blank-looking characters (zero-width, bidi, filler, tag or variation characters); LRM, RLM, ALM, ZWNJ, ZWJ and U+FE0F are allowed';
 const LINK_DETAIL = 'a link must start with http:// or https://, name its host as the browser will use it, and contain no quotes, backslashes, < >, or whitespace';
-const LINK_HOST_HIDDEN_RE = /[\u00AD\u034F\u180B-\u180D\u180F\u200B\u2028\u2029\u202A-\u202E\u2060\u2064\u2066-\u2069\uFE00-\uFE0F\uFEFF\u{1BCA0}-\u{1BCA3}\u{E0100}-\u{E01EF}]/u;
+const LINK_HOST_HIDDEN_RE = /[\u00AD\u034F\u180B-\u180D\u180F\u200B\u2028\u2029\u202A-\u202E\u2060\u2064\u2066-\u2069\u2800\uFE00-\uFE0F\uFEFF\u{1BCA0}-\u{1BCA3}\u{E0100}-\u{E01EF}]/u;
 const LINK_LABEL_DOT_RE = /[.。．｡]/;
 const toLf = (s) => s.replace(/\r\n?/g, '\n');
 const STOP_FIELDS = ['dates', 'accommodation', 'title', 'tabLabel', 'emoji'];

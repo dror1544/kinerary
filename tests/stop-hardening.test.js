@@ -339,8 +339,17 @@ describe('finding 5 — a stop id named after a prototype member is refused', ()
 // same safeLink(). Its refusals keep their shape ({ error, field, detail }, no
 // bilingual message — the stop routes never carried one); an invisible
 // character gets its own detail.
-const INVISIBLE_DETAIL = 'text may not contain invisible characters that change its direction or display (U+200B, U+2028, U+2029, U+202A-U+202E, U+2060, U+2066-U+2069, U+FEFF)';
-const INVISIBLE_CPS = [0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069, 0x2028, 0x2029, 0xFEFF, 0x200B, 0x2060];
+const INVISIBLE_DETAIL = 'text may not contain invisible or blank-looking characters (zero-width, bidi, filler, tag or variation characters); LRM, RLM, ALM, ZWNJ, ZWJ and U+FE0F are allowed';
+// The base set, then one or more of every class the boundary re-check of PR
+// #371 found accepted (the whole set is enumerated in invisible-text.test.js):
+// soft hyphen, CGJ, Hangul fillers, Khmer inherent vowels, Mongolian
+// selectors, U+2061-U+2064 (U+2063 INVISIBLE SEPARATOR), the deprecated format
+// characters, variation selectors (not VS16), noncharacter-range ignorables,
+// shorthand format controls, musical format controls, tag characters,
+// supplementary variation selectors, braille blank, object replacement.
+const INVISIBLE_CPS = [0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069, 0x2028, 0x2029, 0xFEFF, 0x200B, 0x2060,
+  0x00AD, 0x034F, 0x115F, 0x1160, 0x3164, 0xFFA0, 0x17B4, 0x17B5, 0x180B, 0x180E, 0x2061, 0x2063, 0x2064, 0x2065, 0x206A, 0x206F,
+  0xFE00, 0xFE0E, 0xFFF0, 0x1BCA0, 0x1D173, 0xE0001, 0xE0041, 0xE007F, 0xE0100, 0xE0FFF, 0x2800, 0xFFFC];
 
 describe('follow-up 1 — invisible and direction-changing characters in stop text are refused (invalid_text, own detail)', () => {
   const at = (cp) => `Col${String.fromCodePoint(cp)}mar`;
@@ -458,7 +467,7 @@ describe('the twins — server/text-rules.js and server/trip-structure.js carry 
     return code.slice(start, code.indexOf('\n}\n', start) + 2);
   };
 
-  for (const name of ['UNSAFE_LINE_RE', 'UNSAFE_MULTILINE_RE', 'INVISIBLE_RE', 'TEXT_DETAIL', 'INVISIBLE_DETAIL', 'LINK_DETAIL', 'LINK_HOST_HIDDEN_RE', 'LINK_LABEL_DOT_RE', 'toLf']) {
+  for (const name of ['INVISIBLE_SRC', 'UNSAFE_LINE_RE', 'UNSAFE_MULTILINE_RE', 'INVISIBLE_RE', 'TEXT_DETAIL', 'INVISIBLE_DETAIL', 'LINK_DETAIL', 'LINK_HOST_HIDDEN_RE', 'LINK_LABEL_DOT_RE', 'toLf']) {
     test(`const ${name} is identical in both files`, () => {
       assert.equal(constant(stopLayer, name), constant(textRules, name));
     });
@@ -468,6 +477,54 @@ describe('the twins — server/text-rules.js and server/trip-structure.js carry 
       assert.equal(fn(stopLayer, name), fn(textRules, name));
     });
   }
+  // Since the boundary re-check of PR #371 the invisible list is written ONCE
+  // per file (INVISIBLE_SRC) and every regex is built from it — no second or
+  // third copy of the list a twin comparison could miss.
+  test('every text regex of both files is built from INVISIBLE_SRC, and the draft cleaners from the write\'s own regexes', () => {
+    for (const code of [textRules, stopLayer]) {
+      for (const name of ['UNSAFE_LINE_RE', 'UNSAFE_MULTILINE_RE', 'INVISIBLE_RE']) {
+        assert.match(constant(code, name), /INVISIBLE_SRC/, `${name} is built from INVISIBLE_SRC`);
+      }
+      assert.equal((code.match(/Default_Ignorable_Code_Point}/g) || []).length, 1, 'the property is named once');
+    }
+    assert.equal(constant(textRules, 'STRIP_LINE_RE'), "const STRIP_LINE_RE = new RegExp(UNSAFE_LINE_RE.source, 'gu');");
+    assert.equal(constant(textRules, 'STRIP_MULTILINE_RE'), "const STRIP_MULTILINE_RE = new RegExp(UNSAFE_MULTILINE_RE.source, 'gu');");
+  });
+});
+
+describe('boundary re-check of PR #371 — the widened invisible set, in the stop layer', () => {
+  const ch = (cp) => String.fromCodePoint(cp);
+  test('a stop title of a lone U+3164 / U+2800 / U+200B is refused (invalid_text), not stored as a blank-looking title', () => {
+    const { structure, counts } = make();
+    for (const cp of [0x3164, 0x2800, 0x200B, 0xFFA0]) {
+      for (const [body, field] of [[{ title: ch(cp) }, 'title'], [{ title: { he: ch(cp), en: ch(cp) } }, 'title.he'], [{ tabLabel: ch(cp) }, 'tabLabel'], [{ accommodation: { name: ch(cp) } }, 'accommodation.name']]) {
+        const r = structure.ops.update('colmar', body, 'alice');
+        assert.deepEqual([r.status, r.body.error, r.body.field, r.body.detail], [400, 'invalid_text', field, INVISIBLE_DETAIL], `${field}/U+${cp.toString(16)}`);
+      }
+    }
+    assert.deepEqual(counts(), NOTHING);
+  });
+
+  test('a tag character (U+E0041) in a stop title is refused; so is a subdivision flag in the emoji field (it is built from tag characters)', () => {
+    const { structure, counts } = make();
+    let r = structure.ops.update('colmar', { title: `Col${ch(0xE0041)}mar` }, 'alice');
+    assert.deepEqual([r.status, r.body.error, r.body.field, r.body.detail], [400, 'invalid_text', 'title', INVISIBLE_DETAIL]);
+    const england = [0x1F3F4, 0xE0067, 0xE0062, 0xE0065, 0xE006E, 0xE0067, 0xE007F].map(ch).join('');
+    r = structure.ops.update('colmar', { emoji: england }, 'alice');
+    assert.deepEqual([r.status, r.body.error, r.body.field], [400, 'invalid_text', 'emoji']);
+    assert.deepEqual(counts(), NOTHING);
+  });
+
+  test('VS16, flag and ZWJ emoji, and Hebrew with RLM/LRM, are stored exactly as typed', () => {
+    for (const emoji of [ch(0x2764) + ch(0xFE0F), ch(0x1F1EE) + ch(0x1F1F1), [0x1F468, 0x200D, 0x1F469, 0x200D, 0x1F467].map(ch).join(''), '1' + ch(0xFE0F) + ch(0x20E3)]) {
+      const { structure } = make();
+      const title = { he: `קולמר${ch(0x200F)} (Colmar)${ch(0x200E)}`, en: `Colmar ${emoji}` };
+      const r = structure.ops.update('colmar', { emoji, title, accommodation: { name: `מלון${ch(0x200F)} ${emoji}` } }, 'alice');
+      assert.equal(r.status, 200, JSON.stringify(r.body));
+      const colmar = structure.effectiveConfig().phases.find(p => p.id === 'colmar');
+      assert.deepEqual([colmar.emoji, colmar.title, colmar.accommodation.name], [emoji, title, `מלון${ch(0x200F)} ${emoji}`]);
+    }
+  });
 });
 
 describe('safeLink refuses every character the URL parser deletes from a host (enumerated against this Node)', () => {

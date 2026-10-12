@@ -22,12 +22,22 @@
 // INVISIBLE CHARACTERS (fifth boundary review, 2026-10-11). A name or a
 // confirmation number that RENDERS differently from what it contains is a
 // display spoof: U+202E reverses what follows it, U+200B splits a number where
-// nobody can see it split. Refused, in one-line fields and in notes alike: the
-// bidi embeddings and overrides (U+202A-U+202E), the isolates (U+2066-U+2069),
-// the line and paragraph separators (U+2028/U+2029), the BOM (U+FEFF), the
-// zero-width space (U+200B) and the word joiner (U+2060). NOT refused, because
-// Hebrew and other RTL text is typed with them: LRM (U+200E), RLM (U+200F),
-// ALM (U+061C), ZWNJ (U+200C) and ZWJ (U+200D, also inside emoji).
+// nobody can see it split. Refused, in one-line fields and in notes alike
+// (INVISIBLE_SRC, widened by the boundary re-check of PR #371, 2026-10-12):
+// every Unicode Default_Ignorable_Code_Point — the bidi embeddings, overrides
+// and isolates, the BOM, zero-width space, word joiner, U+2061-U+2064 (U+2063
+// INVISIBLE SEPARATOR), the soft hyphen, U+034F, the Hangul fillers (U+115F,
+// U+1160, U+3164, U+FFA0), U+17B4/U+17B5, the Mongolian selectors, the
+// variation selectors and the tag characters (U+E0000-U+E0FFF, which also
+// makes a subdivision flag such as England's refused) — plus three that are
+// not default-ignorable but render as nothing or as blank: the line and
+// paragraph separators (U+2028/U+2029), U+2800 BRAILLE PATTERN BLANK and
+// U+FFFC. NOT refused, because people type with them: LRM (U+200E) and RLM
+// (U+200F) in Hebrew mixed with English, ALM (U+061C) in Arabic, ZWNJ (U+200C)
+// in Persian, ZWJ (U+200D) in emoji sequences, and VS16 (U+FE0F), the emoji
+// presentation selector (a heart is U+2764 U+FE0F). The set is enumerated over
+// every code point, and pinned to Unicode 17, in tests/invisible-text.test.js.
+// A value made only of whitespace and these characters is blank (isBlank).
 //
 // LINE ENDINGS. A multi-line field's \r\n and lone \r become \n before it is
 // checked (toLf), so an API or MCP client that sends CRLF is not refused for a
@@ -38,11 +48,13 @@
 // `https:///evil.com` and `https://.` all parse, as something else. safeLink()
 // wants the literal `http://` or `https://`, no backslash, and a host typed as
 // the browser will use it — no empty label, no `%`, and no character the
-// parser silently deletes (LINK_HOST_HIDDEN_RE: the invisible set above, the
-// soft hyphen, and the rest of what UTS #46 maps to nothing — enumerated
-// against Node's own parser in tests/stop-hardening.test.js).
+// parser silently deletes (LINK_HOST_HIDDEN_RE: what UTS #46 maps to nothing,
+// enumerated against Node's own parser in tests/stop-hardening.test.js, and
+// U+2800, which the parser keeps as a blank-looking letter). Every character
+// INVISIBLE_SRC refuses in text is refused in a host too — checked code point
+// by code point in tests/invisible-text.test.js.
 //
-// TWIN: UNSAFE_LINE_RE, UNSAFE_MULTILINE_RE, INVISIBLE_RE, TEXT_DETAIL,
+// TWIN: INVISIBLE_SRC, UNSAFE_LINE_RE, UNSAFE_MULTILINE_RE, INVISIBLE_RE, TEXT_DETAIL,
 // INVISIBLE_DETAIL, LINK_DETAIL, LINK_HOST_HIDDEN_RE, LINK_LABEL_DOT_RE, toLf,
 // textDetail() and safeLink() are copies of the same names in
 // server/trip-structure.js (the stop layer), duplicated rather than imported
@@ -53,13 +65,14 @@
 // calls this file: reading an old value can never fail on it.
 'use strict';
 
-const UNSAFE_LINE_RE = /[<>\u0000-\u001F\u007F-\u009F\u200B\u2028\u2029\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/;
-const UNSAFE_MULTILINE_RE = /[<>\u0000-\u0009\u000B-\u001F\u007F-\u009F\u200B\u2028\u2029\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/;
-const INVISIBLE_RE = /[\u200B\u2028\u2029\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/;
+const INVISIBLE_SRC = String.raw`(?![\u200C-\u200F\u061C\uFE0F])[\p{Default_Ignorable_Code_Point}\u2028\u2029\u2800\uFFFC]`;
+const UNSAFE_LINE_RE = new RegExp(String.raw`[<>\u0000-\u001F\u007F-\u009F]|` + INVISIBLE_SRC, 'u');
+const UNSAFE_MULTILINE_RE = new RegExp(String.raw`[<>\u0000-\u0009\u000B-\u001F\u007F-\u009F]|` + INVISIBLE_SRC, 'u');
+const INVISIBLE_RE = new RegExp(INVISIBLE_SRC, 'u');
 const TEXT_DETAIL = 'text may not contain < > or control characters';
-const INVISIBLE_DETAIL = 'text may not contain invisible characters that change its direction or display (U+200B, U+2028, U+2029, U+202A-U+202E, U+2060, U+2066-U+2069, U+FEFF)';
+const INVISIBLE_DETAIL = 'text may not contain invisible or blank-looking characters (zero-width, bidi, filler, tag or variation characters); LRM, RLM, ALM, ZWNJ, ZWJ and U+FE0F are allowed';
 const LINK_DETAIL = 'a link must start with http:// or https://, name its host as the browser will use it, and contain no quotes, backslashes, < >, or whitespace';
-const LINK_HOST_HIDDEN_RE = /[\u00AD\u034F\u180B-\u180D\u180F\u200B\u2028\u2029\u202A-\u202E\u2060\u2064\u2066-\u2069\uFE00-\uFE0F\uFEFF\u{1BCA0}-\u{1BCA3}\u{E0100}-\u{E01EF}]/u;
+const LINK_HOST_HIDDEN_RE = /[\u00AD\u034F\u180B-\u180D\u180F\u200B\u2028\u2029\u202A-\u202E\u2060\u2064\u2066-\u2069\u2800\uFE00-\uFE0F\uFEFF\u{1BCA0}-\u{1BCA3}\u{E0100}-\u{E01EF}]/u;
 const LINK_LABEL_DOT_RE = /[.。．｡]/;
 const toLf = (s) => s.replace(/\r\n?/g, '\n');
 const DATE_DETAIL = 'a date must be YYYY-MM-DD';
@@ -245,8 +258,13 @@ function checkFields(body, specs) {
   return { values };
 }
 
-// A required text field that is missing or only whitespace.
-const isBlank = (v) => v === undefined || v === null || (typeof v === 'string' && !v.trim());
+// A required text field that is missing, or made only of whitespace and the
+// invisible characters the write refuses: a booking name of a lone U+3164
+// HANGUL FILLER or U+2800 BRAILLE BLANK looks empty, so it is the empty-field
+// refusal (text_required / missing_fields), not the hidden-character one
+// (boundary re-check of PR #371).
+const INVISIBLE_ALL_RE = new RegExp(INVISIBLE_SRC, 'gu');
+const isBlank = (v) => v === undefined || v === null || (typeof v === 'string' && !v.replace(INVISIBLE_ALL_RE, '').trim());
 function requiredRefusal(error, field, specs) {
   return refusal(error, field, specs[field].label, 'required');
 }
@@ -260,8 +278,12 @@ function requiredRefusal(error, field, specs) {
 // organizer reviews every draft before it is approved. A number (a PDF's
 // confirmation number or PIN, read as a JSON number) is kept as its text, as
 // POST /api/bookings keeps it; NaN and Infinity are not text.
-const STRIP_LINE_RE = /[<>\u0000-\u001F\u007F-\u009F\u200B\u2028\u2029\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/g;
-const STRIP_MULTILINE_RE = /[<>\u0000-\u0009\u000B-\u001F\u007F-\u009F\u200B\u2028\u2029\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/g;
+// The strip regexes are BUILT from the write's own (UNSAFE_*_RE, which carry
+// INVISIBLE_SRC), so the draft can never keep a character the write refuses;
+// until the boundary re-check of PR #371 they were a hand-kept third copy of
+// the list that no test compared.
+const STRIP_LINE_RE = new RegExp(UNSAFE_LINE_RE.source, 'gu');
+const STRIP_MULTILINE_RE = new RegExp(UNSAFE_MULTILINE_RE.source, 'gu');
 function cleanText(value, spec) {
   if (typeof value === 'number' && Number.isFinite(value)) value = String(value);
   if (typeof value !== 'string') return null;
