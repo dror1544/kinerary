@@ -209,6 +209,49 @@ async function stopsApi(method, path, body, { ifMatch } = {}) {
   return data;
 }
 
+// ── Booking and participant writes: the refusal a person can act on ─────────
+// POST/PATCH /api/bookings and POST /api/agent/participants refuse text with
+// < > or control characters, a bad link, a bad date or an over-long value, and
+// say so in Hebrew AND English (`message: { he, en }`, server/text-rules.js).
+// The site is the single source of the rule; this bridge only reads the whole
+// body (errorSuffix() above cuts it at 300 characters, mid-message) and tells
+// the model what to do with it. The twin of this table is WRITE_REFUSAL_HINTS
+// in server/trip-mcp/tools.js.
+const WRITE_REFUSAL_HINTS = {
+  invalid_text: 'The text in "field" has a character the site does not store: < or >, or a control character (a line break is allowed only in notes). Quotes are fine and are stored as typed (ארה"ב, 55" TV).',
+  invalid_link: 'The link in "field" must be a full http(s) address with no quotes, spaces or < >.',
+  invalid_date: 'The date in "field" must be YYYY-MM-DD (a real date).',
+  text_too_long: 'The text in "field" is longer than the site keeps ("max" characters).',
+  text_required: 'The name cannot be empty.',
+  missing_fields: 'A required field is missing (named in "field" when it is the name).',
+};
+const RELAY_HINT = 'Nothing was saved. Tell the organizer, in their language, what "message" says (message.he in Hebrew, message.en in English) — ' +
+  'do not guess a fix to their text and resend it without asking; once they give the corrected value, try again.';
+
+async function writeApi(method, path, body) {
+  const r = await fetchTrip(path, { method, headers: h(), body: JSON.stringify(body) });
+  const text = await r.text();
+  let data = null;
+  try { data = JSON.parse(text); } catch { /* not JSON — kept as text */ }
+  if (r.ok) return data;
+  const code = data && typeof data === 'object' ? data.error : null;
+  const message = data && typeof data.message === 'object' && data.message ? data.message : null;
+  const hint = code && WRITE_REFUSAL_HINTS[code] ? WRITE_REFUSAL_HINTS[code] : null;
+  const lines = [`Refused by the trip site: ${method} ${path} → ${r.status}${code ? ` ${code}` : ''}${data?.field ? ` (field "${data.field}")` : ''}.`];
+  if (hint) lines.push(hint);
+  if (message) {
+    lines.push(RELAY_HINT);
+    if (typeof message.he === 'string') lines.push(`message.he: ${message.he}`);
+    if (typeof message.en === 'string') lines.push(`message.en: ${message.en}`);
+  }
+  lines.push(`Server response: ${(data !== null ? JSON.stringify(data) : String(text || '').trim()).slice(0, 4000)}`);
+  const err = new Error(lines.join('\n'));
+  err.status = r.status;
+  err.code = code;
+  err.body = data;
+  throw err;
+}
+
 const IMAGE_MIME_BY_EXT = {
   '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
   '.gif': 'image/gif', '.webp': 'image/webp', '.heic': 'image/heic', '.heif': 'image/heif',
@@ -288,7 +331,7 @@ mcp.tool('add_participant',
   family: z.string().optional().describe('Family group key from get_config'),
   telegramId: z.string().optional().describe('Numeric Telegram user ID — omit for the password-only path'),
 }, async ({ username, name, nameEn, color, family, telegramId }) =>
-  ok(await apiPost('/api/agent/participants', { username, name, name_en: nameEn, color, family, telegram_id: telegramId })));
+  ok(await writeApi('POST', '/api/agent/participants', { username, name, name_en: nameEn, color, family, telegram_id: telegramId })));
 
 mcp.tool('reset_participant_password',
   'Trigger a password reset for an existing participant (Telegram-bound or not — they may still want a password fallback). ' +
@@ -466,7 +509,7 @@ mcp.tool('add_booking',
   apple_wallet_url:  z.string().url().optional().describe('Apple Wallet pass URL (.pkpass)'),
   google_wallet_url: z.string().url().optional().describe('Google Wallet pass URL'),
   location_url:      z.string().url().optional().describe('Location URL (Google Maps, Waze, etc.)'),
-}, async (args) => ok(await apiPost('/api/bookings', args)));
+}, async (args) => ok(await writeApi('POST', '/api/bookings', args)));
 
 mcp.tool('update_booking',
   'Update the booking record itself — supplier, confirmation number, PIN, cost, passengers, the dates the reservation covers, voucher/wallet links. ' +
@@ -492,7 +535,7 @@ mcp.tool('update_booking',
   apple_wallet_url:  z.string().url().optional(),
   google_wallet_url: z.string().url().optional(),
   location_url:      z.string().url().optional(),
-}, async ({ id, ...fields }) => ok(await apiPatch(`/api/bookings/${id}`, fields)));
+}, async ({ id, ...fields }) => ok(await writeApi('PATCH', `/api/bookings/${id}`, fields)));
 
 mcp.tool('delete_booking', 'Delete a non-seed booking by ID (seed bookings cannot be deleted)', {
   id: z.number().describe('Booking ID from get_bookings'),

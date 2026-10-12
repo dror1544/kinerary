@@ -18,6 +18,7 @@ const { AGENT_TONES, AGENT_GENDERS, PROACTIVE_KEYS, normalizeInstructionVisibili
 const { repairDayStamp, stampRest } = require('../shared/day-stamp');
 const { projectConfig, publicConfig, publicPart } = require('../shared/config-visibility');
 const { publicUser } = require('./public-user');
+const textRules = require('./text-rules');
 const { createFileTokens, createShareTokens } = require('./file-token');
 
 const app = express();
@@ -1184,7 +1185,9 @@ const ENROLLMENT_TTL_MS = 30 * 60 * 1000;
 // collected here or in chat.
 app.post('/api/agent/participants', organizerOrAgentRequired, async (req, res) => {
   const { username, name, name_en, color, family, telegram_id } = req.body || {};
-  if (!username || !name) return res.status(400).json({ error: 'missing_fields' });
+  if (!username || !name) {
+    return res.status(400).json(!name && username ? textRules.requiredRefusal('missing_fields', 'name', textRules.PARTICIPANT_FIELDS) : { error: 'missing_fields' });
+  }
   const uname = String(username).toLowerCase().trim();
   if (!/^[a-z0-9_-]+$/.test(uname)) return res.status(400).json({ error: 'invalid_username' });
   // #213: color reaches the classic client's inline `style="background:${color}"`
@@ -1195,6 +1198,13 @@ app.post('/api/agent/participants', organizerOrAgentRequired, async (req, res) =
   if (color != null && color !== '' && !/^#[0-9a-fA-F]{3,8}$/.test(color)) {
     return res.status(400).json({ error: 'invalid_color' });
   }
+  // Names are shown on every participant-carrying surface and written into
+  // trip.config.json: refused at the write if they carry < > or control
+  // characters, with the reason in Hebrew and English (server/text-rules.js).
+  // Quotes are text — אבי "הגדול" is stored as typed.
+  if (textRules.isBlank(name)) return res.status(400).json(textRules.requiredRefusal('missing_fields', 'name', textRules.PARTICIPANT_FIELDS));
+  const names = textRules.checkFields(req.body, textRules.PARTICIPANT_FIELDS);
+  if (names.error) return res.status(400).json(names.error);
   // #184 (boundary review on PR #274, finding A): if trip.config.json's
   // agent.organizers names a username with no seeded participant row yet,
   // the normal `username_taken` check below does nothing to stop the agent
@@ -1225,7 +1235,10 @@ app.post('/api/agent/participants', organizerOrAgentRequired, async (req, res) =
     return res.status(409).json({ error: 'telegram_id_taken' });
   }
 
-  const participant = { username: uname, name, name_en: name_en || null, color: color || null, family: family || null, telegram_id: tgId };
+  const participant = {
+    username: uname, name: names.values.name, name_en: names.values.name_en || null,
+    color: color || null, family: names.values.family || null, telegram_id: tgId,
+  };
 
   TRIP_CONFIG.participants = TRIP_CONFIG.participants || [];
   TRIP_CONFIG.participants.push(participant);
@@ -2423,10 +2436,22 @@ app.post('/api/bookings/extract-draft', organizerOrAgentRequired, extractUpload.
     if (!knownPhase(phase) || !validTypes.has(type) || !name) {
       return res.status(422).json({ error: 'Extraction needs a valid phase, type, and name before a draft can be created', extracted });
     }
-    const text = (key) => typeof extracted[key] === 'string' && extracted[key].trim() ? extracted[key].trim() : null;
+    // Nobody typed this text — an LLM read it off a PDF — so it is CLEANED,
+    // not refused: < > and control characters removed, lengths clamped, a
+    // date that is not YYYY-MM-DD dropped (server/text-rules.js). Refusing
+    // would leave the organizer with no draft; every draft is reviewed
+    // before it is approved. The name is cleaned before the emptiness check,
+    // so a name that was nothing but markup is the same 422 as no name.
+    const F = textRules.BOOKING_FIELDS;
+    const text = (key) => textRules.cleanText(extracted[key], F[key]);
+    const cleanName = textRules.cleanText(name, F.name);
+    if (!cleanName) {
+      return res.status(422).json({ error: 'Extraction needs a valid phase, type, and name before a draft can be created', extracted });
+    }
     const result = db.prepare(
       "INSERT INTO bookings (phase,type,name,date_from,date_to,passengers,confirmation,pin,notes,cost,created_by,review_status) VALUES (?,?,?,?,?,?,?,?,?,?,?, 'draft')"
-    ).run(phase, type, name, text('date_from'), text('date_to'), text('passengers'), text('confirmation'), text('pin'), text('notes'), 0, req.user.username);
+    ).run(phase, type, cleanName, textRules.cleanDate(extracted.date_from), textRules.cleanDate(extracted.date_to),
+      text('passengers'), text('confirmation'), text('pin'), text('notes'), 0, req.user.username);
     const booking = db.prepare('SELECT * FROM bookings WHERE id = ?').get(result.lastInsertRowid);
     res.status(201).json({ ok: true, booking, extracted });
   } catch (e) {
@@ -2443,26 +2468,47 @@ app.post('/api/bookings/:id/approve', organizerOrAgentRequired, (req, res) => {
 
 app.post('/api/bookings', organizerOrAgentRequired, (req, res) => {
   const { phase, type, name, date_from, date_to, passengers, confirmation, pin, notes, cost, apple_wallet_url, google_wallet_url, location_url } = req.body || {};
-  if (!phase || !type || !name) return res.status(400).json({ error: 'phase, type, name required' });
+  if (!phase || !type || !name) {
+    const body = { error: 'phase, type, name required' };
+    if (phase && type) Object.assign(body, textRules.requiredRefusal(body.error, 'name', textRules.BOOKING_FIELDS));
+    return res.status(400).json(body);
+  }
   // A booking filed under a phase the trip does not have is shown under no
   // stop and imported nowhere (see import-from-bookings below). The extract
   // draft already refused one; this route and PATCH did not.
   if (!knownBookingPhase(phase)) return res.status(400).json({ error: 'unknown phase' });
+  // Every free-text field, link and date is checked at the write, and a
+  // refusal names the field and says what to fix in Hebrew and English
+  // (server/text-rules.js). The mcp booking tools call this route, so this is
+  // the one place the rule lives.
+  if (textRules.isBlank(name)) return res.status(400).json(textRules.requiredRefusal('text_required', 'name', textRules.BOOKING_FIELDS));
+  const checked = textRules.checkFields(req.body, textRules.BOOKING_FIELDS);
+  if (checked.error) return res.status(400).json(checked.error);
+  const v = checked.values;
   const result = db.prepare(
     'INSERT INTO bookings (phase,type,name,date_from,date_to,passengers,confirmation,pin,notes,cost,apple_wallet_url,google_wallet_url,location_url,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
-  ).run(phase, type, name, date_from || null, date_to || null, passengers || null,
-    confirmation || null, pin || null, notes || null, parseFloat(cost) || 0,
-    apple_wallet_url || null, google_wallet_url || null, location_url || null, req.user.username);
+  ).run(phase, type, v.name, v.date_from || null, v.date_to || null, v.passengers || null,
+    v.confirmation || null, v.pin || null, v.notes || null, parseFloat(cost) || 0,
+    v.apple_wallet_url || null, v.google_wallet_url || null, v.location_url || null, req.user.username);
   res.json({ ok: true, id: result.lastInsertRowid });
 });
 
 app.patch('/api/bookings/:id', organizerOrAgentRequired, (req, res) => {
   const fields = ['phase','type','name','date_from','date_to','passengers','confirmation','pin','notes','cost','apple_wallet_url','google_wallet_url','location_url'];
   if (req.body.phase !== undefined && !knownBookingPhase(req.body.phase)) return res.status(400).json({ error: 'unknown phase' });
+  // The same checks as POST, on the fields this PATCH carries; one bad field
+  // refuses the whole PATCH. null and '' keep their old meaning (clear).
+  if (req.body.name !== undefined && textRules.isBlank(req.body.name)) {
+    return res.status(400).json(textRules.requiredRefusal('text_required', 'name', textRules.BOOKING_FIELDS));
+  }
+  const checked = textRules.checkFields(req.body, textRules.BOOKING_FIELDS);
+  if (checked.error) return res.status(400).json(checked.error);
   const updates = [];
   const params = [];
   for (const f of fields) {
-    if (req.body[f] !== undefined) { updates.push(`${f} = ?`); params.push(f === 'cost' ? parseFloat(req.body[f]) || 0 : req.body[f]); }
+    if (req.body[f] === undefined) continue;
+    updates.push(`${f} = ?`);
+    params.push(f === 'cost' ? parseFloat(req.body[f]) || 0 : Object.hasOwn(checked.values, f) ? checked.values[f] : req.body[f]);
   }
   if (!updates.length) return res.status(400).json({ error: 'no fields to update' });
   params.push(req.params.id);

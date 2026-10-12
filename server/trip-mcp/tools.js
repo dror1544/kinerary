@@ -70,6 +70,13 @@ function registerTools(mcp, site, { write = true } = {}) {
       type: bookingType.optional(),
     }, ({ phase, type }) => site.get(`/api/bookings${qs({ phase, type })}`));
 
+  // A booking or participant write the site refuses carries a message in
+  // Hebrew and English; writeCall() turns it into something the assistant can
+  // relay (explainWriteRefusal below).
+  const writeCall = async fn => {
+    try { return await fn(); } catch (err) { throw explainWriteRefusal(err); }
+  };
+
   tool('add_booking', 'Add a booking',
     'Record a reservation with its confirmation details. A booking does not put anything on the day-by-day schedule — use add_plan_item ' +
     '(optionally with booking_id) for that. A hotel booking does not change a stop either (its dates, where the family sleeps); if the ' +
@@ -82,7 +89,7 @@ function registerTools(mcp, site, { write = true } = {}) {
       passengers: z.string().optional(), confirmation: z.string().optional(), pin: z.string().optional(),
       cost: z.number().optional().describe('Cost in USD'), notes: z.string().optional(),
       location_url: z.string().url().optional().describe('Google Maps or Waze link to the place itself'),
-    }, args => site.post('/api/bookings', args));
+    }, args => writeCall(() => site.post('/api/bookings', args)));
 
   tool('update_booking', 'Update a booking',
     'Change the reservation record itself (supplier, confirmation, dates it covers, cost). This is NOT how the itinerary changes: the site shows ' +
@@ -93,7 +100,7 @@ function registerTools(mcp, site, { write = true } = {}) {
       name: z.string().optional(), date_from: date.optional(), date_to: date.optional(),
       passengers: z.string().optional(), confirmation: z.string().optional(), pin: z.string().optional(),
       cost: z.number().optional(), notes: z.string().optional(), location_url: z.string().url().optional(),
-    }, ({ id, ...fields }) => site.patch(`/api/bookings/${id}`, fields));
+    }, ({ id, ...fields }) => writeCall(() => site.patch(`/api/bookings/${id}`, fields)));
 
   tool('delete_booking', 'Delete a booking',
     'Delete a booking by id. Confirm with the organizer first.',
@@ -335,7 +342,7 @@ function registerTools(mcp, site, { write = true } = {}) {
       username: z.string().regex(/^[a-z0-9_-]+$/).describe('Lowercase letters, numbers, _ or -'),
       name: z.string().min(1), nameEn: z.string().optional(), color: z.string().optional(), family: z.string().optional(),
     }, async ({ nameEn, ...rest }) => {
-      const { enrollment_token: _secret, expires_in_seconds: _ttl, ...result } = await site.post('/api/agent/participants', { ...rest, name_en: nameEn });
+      const { enrollment_token: _secret, expires_in_seconds: _ttl, ...result } = await writeCall(() => site.post('/api/agent/participants', { ...rest, name_en: nameEn }));
       return { ...result, next_step: 'The organizer sends a sign-in link from the site: More → Signing in → One-time link.' };
     });
 
@@ -411,6 +418,49 @@ function explainStopRefusal(err) {
   const code = /"error":"([a-z_]+)"/.exec(m[2])?.[1] || null;
   const hint = code ? STOP_REFUSAL_HINTS[code] : null;
   const out = new Error(`Refused by the trip site: ${err.message}${hint ? `\n${hint}` : ''}`);
+  out.status = Number(m[1]);
+  out.code = code;
+  return out;
+}
+
+// What to do about each refusal POST/PATCH /api/bookings and
+// POST /api/agent/participants return (server/text-rules.js). The twin of
+// WRITE_REFUSAL_HINTS in mcp/mcp.js. The site puts `message: { he, en }`
+// right after the code and the field, ahead of `detail`, so the human message
+// survives siteClient()'s 300-character cap; it is lifted out here and named,
+// so the assistant relays it rather than paraphrasing the JSON.
+const WRITE_REFUSAL_HINTS = {
+  invalid_text: 'The text in "field" has a character the site does not store: < or >, or a control character (a line break is allowed only in notes). Quotes are fine and are stored as typed (ארה"ב, 55" TV).',
+  invalid_link: 'The link in "field" must be a full http(s) address with no quotes, spaces or < >.',
+  invalid_date: 'The date in "field" must be YYYY-MM-DD (a real date).',
+  text_too_long: 'The text in "field" is longer than the site keeps.',
+  text_required: 'The name cannot be empty.',
+  missing_fields: 'A required field is missing.',
+};
+const WRITE_RELAY_HINT = 'Nothing was saved. Tell the organizer, in their language, what the message says (Hebrew or English below); ' +
+  'do not guess a fix to their text and resend it without asking.';
+
+function explainWriteRefusal(err) {
+  const m = /→ (\d{3}) ([\s\S]*)$/.exec(err?.message || '');
+  if (!m) return err;
+  const body = m[2];
+  const code = /"error":"([a-z_]+)"/.exec(body)?.[1] || null;
+  // JSON string values, read even from a body cut short; unescaped by JSON.parse.
+  const str = key => {
+    const hit = new RegExp(`"${key}":"((?:[^"\\\\]|\\\\.)*)"`).exec(body);
+    if (!hit) return null;
+    try { return JSON.parse(`"${hit[1]}"`); } catch { return null; }
+  };
+  const he = str('he');
+  const en = str('en');
+  const lines = [`Refused by the trip site: ${err.message}`];
+  if (code && WRITE_REFUSAL_HINTS[code]) lines.push(WRITE_REFUSAL_HINTS[code]);
+  if (he || en) {
+    lines.push(WRITE_RELAY_HINT);
+    if (he) lines.push(`Hebrew: ${he}`);
+    if (en) lines.push(`English: ${en}`);
+  }
+  const out = new Error(lines.join('\n'));
   out.status = Number(m[1]);
   out.code = code;
   return out;
