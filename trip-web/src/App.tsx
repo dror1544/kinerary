@@ -12,6 +12,7 @@ import { Readiness, CurrencyConverter } from "./readiness";
 import { GroupActivities, LostFound, ActivityRsvp, VenueFeedback } from "./group-utilities";
 import { Account, GoogleSignIn, Enrollment } from "./account";
 import { PlanTools } from "./plan-tools";
+import { lodgingName, tonightLodging } from "./stops";
 import { AssistantConnect } from "./assistant-connect";
 import { Trivia } from "./trivia";
 import { heroCandidates, useHeroPhoto } from "./hero-photo";
@@ -803,6 +804,9 @@ export function JourneyView({
     venueId: venueForItem(item, config)?.id,
   }])), [config, itinerary]);
   const day = days.find((entry) => entry.date === activeDate && (!activePhase?.id || entry.phase_id === activePhase.id));
+  // From the stop that covers tonight in the effective config (refetched on
+  // every stop change), not only the copy stored on the day row at import.
+  const tonight = lodgingName(tonightLodging(config?.phases, day, activePhase?.id, activeDate), lang);
   const daySpineRef = useRef<HTMLElement>(null);
   const handledFocus = useRef<JourneyFocus | null>(null);
   const initializedForTripDate = useRef(false);
@@ -983,7 +987,7 @@ export function JourneyView({
             {isOrganizer && <a className="journey-settings" href="#plan-tools" aria-label={copy(lang, "Plan settings", "הגדרות מסלול")}><Settings size={20} aria-hidden="true" /></a>}
           </div>
           <h2>{(lang === "he" ? day?.label_he || day?.label_en : day?.label_en || day?.label_he) || copy(lang,"Daily itinerary","מסלול יומי")}</h2>
-          {day?.lodging_context?.name ? <p>{copy(lang,"Tonight:","הלילה:")} {text(day.lodging_context.name, lang)}</p> : null}
+          {tonight ? <p>{copy(lang,"Tonight:","הלילה:")} {tonight}</p> : null}
           {isOrganizer ? <button className="secondary-action journey-edit-trigger" type="button" onClick={beginNew}><Plus size={17} /> {copy(lang, "Add itinerary item", "הוספת פריט למסלול")}</button> : null}
           <label className="mobile-day-picker">
             <span>{copy(lang, "Day", "יום")}</span>
@@ -2628,7 +2632,7 @@ export default function App() {
     activities: <GroupActivities config={config.data} currentUser={me.data} lang={lang}/>,
     lostfound: <LostFound lang={lang}/>,
     trivia: <Trivia config={config.data} currentUser={me.data} lang={lang}/>,
-    "plan-tools": me.data?.is_organizer ? <PlanTools config={config.data} itinerary={itinerary.data} lang={lang}/> : <p>{copy(lang,"Organizer access required.","נדרשת הרשאת מארגן.")}</p>,
+    "plan-tools": me.data?.is_organizer ? <PlanTools isOrganizer config={config.data} itinerary={itinerary.data} lang={lang}/> : <p>{copy(lang,"Organizer access required.","נדרשת הרשאת מארגן.")}</p>,
   }[activeModule] : null;
   const content = moduleContent || tabContent;
 
