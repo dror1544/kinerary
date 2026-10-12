@@ -388,6 +388,8 @@ const STOP_REFUSAL_HINTS = {
   booking_not_found: 'No booking with that id — call get_bookings.',
   unknown_stop: 'No stop with that id — call get_stops.',
   unplanned_stop_is_computed: 'That is the computed "days not planned yet" block, not a stop. Change a real stop\'s dates, split one, or move a day with move_plan_day.',
+  invalid_dates: 'Stop dates are { start, end }, each YYYY-MM-DD and a real calendar day (no February 30 — the site checks the calendar), start <= end. Ask the organizer which day they meant.',
+  invalid_split_date: 'at_date must be YYYY-MM-DD and a real calendar day (the site checks the calendar). Ask the organizer which day they meant.',
   stop_has_no_dates: 'This stop has no dates yet; set them with update_stop or set_stop_from_booking first.',
   split_date_not_inside_stop: 'at_date must be strictly inside the stop, so both stops keep a night.',
   new_stop_title_required: 'The new stop needs a title.',

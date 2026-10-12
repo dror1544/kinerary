@@ -37,6 +37,8 @@ const { moveDayRows } = require('./living-journey');
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const STOP_ID_RE = /^[a-z0-9][a-z0-9-]{0,47}$/;
+// The ids withOpenDays() issues: `open-days`, `open-days-2`, …
+const OPEN_DAYS_ID_RE = /^open-days(?:-[1-9]\d{0,3})?$/;
 // A stop id is used as a key wherever a phase is looked up by id — a plain
 // object keyed by `constructor` answers with Object's own constructor
 // (boundary review 2026-10-11, finding 5). Refused whatever the case, since
@@ -117,9 +119,28 @@ const readJson = (v, fallback) => { if (v == null) return fallback; try { return
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const sameJson = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 
+// A YYYY-MM-DD string that names a day on the calendar. The shape alone is
+// not enough, and neither is Date.parse: '2027-02-30' parses (it rolls over to
+// March 2), and was stored as February 30 (review of #362, finding 4). The day
+// has to come back unchanged from the round trip. The same check as
+// server/text-rules.js's date rule (#364); not shared with it, because that
+// file's exports are the twin rules and are not edited from here.
+function isCalendarDay(s) {
+  if (typeof s !== 'string' || !ISO_DATE_RE.test(s)) return false;
+  const t = Date.parse(`${s}T00:00:00Z`);
+  return !Number.isNaN(t) && new Date(t).toISOString().slice(0, 10) === s;
+}
+// A day READ from somewhere the layer does not control — the config, a
+// booking row, a plan row — which may carry a time after the date.
 function isoDay(value) {
   const s = typeof value === 'string' ? value.slice(0, 10) : '';
-  return ISO_DATE_RE.test(s) && !Number.isNaN(Date.parse(`${s}T00:00:00Z`)) ? s : null;
+  return isCalendarDay(s) ? s : null;
+}
+// A day a caller SENDS: exactly YYYY-MM-DD, nothing after it, on the calendar.
+// Every date input of the stop layer goes through this one (stop dates, a
+// split's `at`).
+function inputDay(value) {
+  return isCalendarDay(value) ? value : null;
 }
 function addDays(day, n) {
   const d = new Date(`${day}T00:00:00Z`);
@@ -285,10 +306,10 @@ function validateAccommodation(value, path = 'accommodation') {
 function validateDates(value) {
   if (value === null) return { value: null };
   if (!isObj(value)) return { error: fail(400, 'invalid_dates') };
-  const start = typeof value.start === 'string' && ISO_DATE_RE.test(value.start) ? isoDay(value.start) : null;
-  const end = typeof value.end === 'string' && ISO_DATE_RE.test(value.end) ? isoDay(value.end) : null;
+  const start = inputDay(value.start);
+  const end = inputDay(value.end);
   if (!start || !end || start > end || Object.keys(value).some(k => !['start', 'end'].includes(k))) {
-    return { error: fail(400, 'invalid_dates', { detail: 'dates must be { start, end } as YYYY-MM-DD, start <= end' }) };
+    return { error: fail(400, 'invalid_dates', { detail: 'dates must be { start, end } as YYYY-MM-DD, real calendar days, start <= end' }) };
   }
   return { value: { start, end } };
 }
@@ -355,9 +376,13 @@ function applyFields(phase, fields) {
   const out = { ...phase };
   if (Object.hasOwn(fields, 'dates')) {
     if (fields.dates === null) {
+      // Deleted, never set to null (review of #362, finding 1): a legacy
+      // phase's top-level start/end served as null fails the Modern site's
+      // config schema (trip-web/src/api.ts: optional strings), and with it
+      // the whole config on the next refetch. Absent is what "no dates" is.
       delete out.dates;
-      if (typeof out.start === 'string' && out.start) out.start = null;
-      if (typeof out.end === 'string' && out.end) out.end = null;
+      delete out.start;
+      delete out.end;
     } else {
       // `dates.display` is text written for the old range; it does not survive.
       out.dates = { start: fields.dates.start, end: fields.dates.end };
@@ -534,19 +559,54 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
   function basePhase(id) {
     return (base().phases || []).find(p => p?.id === id) || null;
   }
-  // A phase id any route may file plan rows under: a stop as it is now, or
-  // any phase the config itself names (an open-days id the computation no
-  // longer produces stays reachable, so nothing filed under it is orphaned).
+  // A phase id any route may file plan rows under: a stop as it is now, any
+  // phase the config itself names (an open-days id the computation no longer
+  // produces stays reachable, so nothing filed under it is orphaned), or a
+  // computed open-days id something saved still names (below).
   function isPhase(id) {
     if (typeof id !== 'string' || !id) return false;
-    return Boolean(effectivePhase(id) || basePhase(id));
+    return Boolean(effectivePhase(id) || basePhase(id) || referencedComputed(id));
   }
   // A real stop: not a computed open-days phase.
   function isStop(id) {
     return typeof id === 'string' && current().realIds.has(id);
   }
   function isComputed(id) {
-    return isUnplanned(effectivePhase(id)) || isUnplanned(basePhase(id));
+    return isUnplanned(effectivePhase(id)) || isUnplanned(basePhase(id)) || referencedComputed(id);
+  }
+
+  // A COMPUTED ID OUTLIVES ITS GAP WHILE ROWS USE IT (review of #362,
+  // finding 2). The open-days ids are numbered by position: date a stop in
+  // the middle of the open days and they become open-days-1 / open-days-2;
+  // a plan row filed under open-days-2 keeps that id. Extend the stop to the
+  // trip's end and the one gap left is plain `open-days` again — and
+  // open-days-2 was no phase at all: every Classic/MCP plan route and
+  // move-day refused it, and the row could be neither read, edited, deleted
+  // nor moved off. So an open-days id that a plan item, a day headline
+  // (active plan or the Classic tables) or a booking still names stays
+  // reachable — an EMPTY day row does not count, as in withOpenDays(): it is
+  // what a moved or deleted item leaves behind, holds nothing to reach, and
+  // would otherwise keep the id alive for good —
+  // derived from the rows on each lookup, not stored: no marker table, no
+  // rewrite of anyone's rows, and it lapses by itself once the last row
+  // moves off. It stays computed, never a stop (PATCH/split/from-booking/
+  // revert/DELETE answer unplanned_stop_is_computed), and it is not added to
+  // the config: /api/config serves only the gaps that exist.
+  // Only where the config carries the open-days convention (the layer never
+  // invents it), and only for an id of the shape the computation issues; a
+  // real stop of that name is refused at split and is a stop anyway.
+  function referencedComputed(id) {
+    if (typeof id !== 'string' || !OPEN_DAYS_ID_RE.test(id)) return false;
+    if (!(base().phases || []).some(isUnplanned)) return false;
+    if (current().realIds.has(id) || effectivePhase(id) || basePhase(id)) return false;
+    const rows = rowsOf();
+    if ((rows.items || []).some(i => i?.phase_id === id)
+      || (rows.days || []).some(d => d?.phase_id === id && (d.label_he || d.label_en))) return true;
+    // A table that does not exist (a unit test's database) names nothing.
+    const names = (sql) => { try { return Boolean(db.prepare(sql).get(id)); } catch { return false; } };
+    return names('SELECT 1 FROM phase_plan_items WHERE phase_id = ? LIMIT 1')
+      || names("SELECT 1 FROM phase_plan_days WHERE phase_id = ? AND (COALESCE(label_he, '') <> '' OR COALESCE(label_en, '') <> '') LIMIT 1")
+      || names('SELECT 1 FROM bookings WHERE phase = ? LIMIT 1');
   }
 
   // ── reading the plan ───────────────────────────────────────────────────────
@@ -729,7 +789,7 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
       if (missing) return missing;
       if (!isObj(body)) return fail(400, 'invalid_body');
       for (const key of Object.keys(body)) if (!['at', 'new_stop'].includes(key)) return fail(400, 'unknown_field', { field: key });
-      const at = typeof body.at === 'string' && ISO_DATE_RE.test(body.at) ? isoDay(body.at) : null;
+      const at = inputDay(body.at);
       if (!at) return fail(400, 'invalid_split_date');
       const dates = phaseDates(effectivePhase(id));
       if (!dates) return fail(400, 'stop_has_no_dates');
@@ -888,12 +948,33 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
       for (const key of Object.keys(body)) if (!['history_id', 'on_outside'].includes(key)) return fail(400, 'unknown_field', { field: key });
       const existing = parseRow(q.override.get(id));
       let target = null;
+      let droppedLink = null;
       if (body.history_id !== undefined) {
         const hid = Number(body.history_id);
         const row = Number.isInteger(hid) ? q.historyRow.get(hid) : null;
         if (!row || row.phase_id !== id) return fail(404, 'history_entry_not_found');
         target = readJson(row.after_state, null);
         if (!target) return fail(409, 'history_entry_has_no_state');
+        // A snapshot that links a booking carries the link as it stood THEN.
+        // Written back unchecked, it put two stops on one hotel (review of
+        // #362, finding 3): restore A's old link after the hotel moved to B,
+        // and A's next refresh fails with booking_linked_to_another_stop. So
+        // the restore asks what from-booking asks, refusing — before any
+        // write — what from-booking would refuse. A booking deleted since is
+        // no link at all: the rest of the snapshot is restored without it.
+        if (target.booking_id != null) {
+          const linkedBooking = db.prepare('SELECT id, phase FROM bookings WHERE id = ?').get(target.booking_id);
+          if (!linkedBooking) {
+            droppedLink = target.booking_id;
+            target = { ...target, booking_id: null };
+          } else {
+            if (typeof linkedBooking.phase === 'string' && linkedBooking.phase !== id && isStop(linkedBooking.phase)) {
+              return fail(409, 'booking_belongs_to_another_stop', { stop: linkedBooking.phase });
+            }
+            const linked = q.linkedElsewhere.get(linkedBooking.id, id);
+            if (linked) return fail(409, 'booking_linked_to_another_stop', { stop: linked.phase_id });
+          }
+        }
       } else if (existing?.kind === 'added' || !basePhase(id)) {
         return fail(409, 'added_stop_has_no_base', { detail: 'an added stop is removed with DELETE' });
       }
@@ -916,7 +997,9 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
           const digests = {};
           for (const key of Object.keys(target.fields || {})) digests[key] = digest(baseValue(bp, key));
           write(id, { ...target, after_phase_id: target.after_phase_id ?? existing?.after_phase_id ?? null, base_digest: digests },
-            'revert', actor, `to history ${body.history_id}`);
+            'revert', actor, droppedLink === null
+              ? `to history ${body.history_id}`
+              : `to history ${body.history_id} (booking ${droppedLink} no longer exists; restored without the link)`);
         } else {
           write(id, null, 'revert', actor, 'to the config');
         }
