@@ -1,6 +1,6 @@
 # Control-plane runbook — failed provisioning, stale lease, cleanup, upgrade, rollback
 
-Sprint 6's build list calls for this runbook and never got one — the six
+Sprint 6's build list calls for this runbook and never got one — the
 topics below exist scattered across code comments, `CLAUDE.md` and other
 docs; this is the single page that names which one to read for which
 symptom. Each section says only what is not already written better
@@ -25,6 +25,47 @@ way `CLAUDE.md`'s "the containers mount a checkout" section already says —
 `WORKER_REPO_ROOT_HOST=$PWD BUILDX_CONFIG=~/.docker/buildx-local docker
 compose -f control-plane/deployment/compose.local.yml up -d --build
 --wait` — not a targeted `up -d api`.
+
+## A change that reaches a trip in pieces — the order to refresh them
+
+Some changes ship in more than one place, and each place has its own refresh. The
+stop-editing release (Sprint 6, PRs #360–#364) is the worked example: a new site
+payload, new tools on the companion's bridge, new instructions for the companion, a
+new monitor alert, and changes to the relay and the worker. Each step depends on the
+one before it — the bridge's tools call routes only the new site serves, and the
+companion's instructions name tools only the new bridge offers — so refresh them in
+this order, per trip:
+
+1. **Site payload** (`server/`, `site/`, the built Modern bundle). It reaches a trip
+   only when **that trip is redeployed**; promoting a release to `available` changes
+   only trips built or rebuilt afterwards. Nothing changes for a trip until then.
+2. **MCP bridge** (`mcp/mcp.js`, a process per trip):
+   the deployment's `setup-mcp.sh --restart-only --trip-dir <the trip's deploy directory>`
+   (it lives with the deployment's own scripts, not in this repository), then confirm
+   the bridge's `GET /health` (it answers "can you reach your trip", not "are you
+   listening"). On macOS staging run it from a Terminal that has the Local Network
+   permission — a bridge started over SSH serves loopback but cannot reach its trip
+   (`CLAUDE.md`, "A Mac-provisioned companion that cannot read its own trip").
+3. **Companion profile** (`profile-templates/familytrip-companion/`: SOUL, skills,
+   scripts such as the KML export). A live conversation keeps the system prompt Hermes
+   saved on its first turn, so new instructions reach a family group only after
+   `scripts/companion-refresh-prompts.sh <profile>` clears it and restarts the gateway.
+
+Each of the following is its own step, in whatever order suits, and none is implied by
+the three above:
+
+- **Fleet-monitor skill** (a new alert, a changed query):
+  `scripts/install-hermes-skill.sh trip-fleet-monitor <profile>`; `--check` reports
+  drift, and `--capture` first if the profile was edited in place. Until it is
+  installed the monitor does not see the change.
+- **Relay** (interview changes, such as how a typed answer is read or what a re-ask
+  says): restart it — `scripts/relay-restart.sh` for the local stack,
+  `control-plane/deployment/vm-relay-restart.sh` on the VM.
+- **Worker** (trip identity, verification evidence): restart it. Identity changes
+  (name, slug, home photo) affect **new trips only**.
+
+Each of these touches a running trip or service, so each is a deploy under hard rule 2
+of `CLAUDE.md`: ask before running it.
 
 ## Failed provisioning
 
