@@ -365,7 +365,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS bookings (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     phase        TEXT NOT NULL,
-    type         TEXT NOT NULL CHECK(type IN ('flight','hotel','car','attraction','other')),
+    type         TEXT NOT NULL CHECK(type IN (${textRules.BOOKING_TYPES.map(t => `'${t}'`).join(',')})),
     name         TEXT NOT NULL,
     date_from    TEXT,
     date_to      TEXT,
@@ -2432,7 +2432,7 @@ app.post('/api/bookings/extract-draft', organizerOrAgentRequired, extractUpload.
     const phase = typeof extracted.phase === 'string' ? extracted.phase : '';
     const type = typeof extracted.type === 'string' ? extracted.type : 'other';
     const name = typeof extracted.name === 'string' ? extracted.name.trim() : '';
-    const validTypes = new Set(['flight', 'hotel', 'car', 'attraction', 'other']);
+    const validTypes = new Set(textRules.BOOKING_TYPES);
     if (!knownPhase(phase) || !validTypes.has(type) || !name) {
       return res.status(422).json({ error: 'Extraction needs a valid phase, type, and name before a draft can be created', extracted });
     }
@@ -2477,6 +2477,11 @@ app.post('/api/bookings', organizerOrAgentRequired, (req, res) => {
   // stop and imported nowhere (see import-from-bookings below). The extract
   // draft already refused one; this route and PATCH did not.
   if (!knownBookingPhase(phase)) return res.status(400).json({ error: 'unknown phase' });
+  // A type outside the schema's list was a SQLite CHECK failure (500), and an
+  // array (["hotel"]) was flattened by better-sqlite3 and stored. Refused here,
+  // in both languages, from the same list the CHECK is built from.
+  const badType = textRules.bookingTypeRefusal(type);
+  if (badType) return res.status(400).json(badType);
   // Every free-text field, link and date is checked at the write, and a
   // refusal names the field and says what to fix in Hebrew and English
   // (server/text-rules.js). The mcp booking tools call this route, so this is
@@ -2496,6 +2501,12 @@ app.post('/api/bookings', organizerOrAgentRequired, (req, res) => {
 app.patch('/api/bookings/:id', organizerOrAgentRequired, (req, res) => {
   const fields = ['phase','type','name','date_from','date_to','passengers','confirmation','pin','notes','cost','apple_wallet_url','google_wallet_url','location_url'];
   if (req.body.phase !== undefined && !knownBookingPhase(req.body.phase)) return res.status(400).json({ error: 'unknown phase' });
+  // A type this PATCH carries must be one of the list — null included, which
+  // was a NOT NULL failure (500).
+  if (req.body.type !== undefined) {
+    const badType = textRules.bookingTypeRefusal(req.body.type);
+    if (badType) return res.status(400).json(badType);
+  }
   // The same checks as POST, on the fields this PATCH carries; one bad field
   // refuses the whole PATCH. null and '' keep their old meaning (clear).
   if (req.body.name !== undefined && textRules.isBlank(req.body.name)) {

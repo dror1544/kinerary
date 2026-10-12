@@ -19,31 +19,88 @@
 // Links are a different kind of value and DO refuse quotes: a link goes into an
 // href as it stands.
 //
-// TWIN: UNSAFE_LINE_RE, UNSAFE_MULTILINE_RE, TEXT_DETAIL, LINK_DETAIL and
-// safeLink() are copies of the same names in server/trip-structure.js (the
-// stop layer), duplicated rather than imported because that file belongs to
-// another line of work and exports none of them. Change one, change both.
+// INVISIBLE CHARACTERS (fifth boundary review, 2026-10-11). A name or a
+// confirmation number that RENDERS differently from what it contains is a
+// display spoof: U+202E reverses what follows it, U+200B splits a number where
+// nobody can see it split. Refused, in one-line fields and in notes alike: the
+// bidi embeddings and overrides (U+202A-U+202E), the isolates (U+2066-U+2069),
+// the line and paragraph separators (U+2028/U+2029), the BOM (U+FEFF), the
+// zero-width space (U+200B) and the word joiner (U+2060). NOT refused, because
+// Hebrew and other RTL text is typed with them: LRM (U+200E), RLM (U+200F),
+// ALM (U+061C), ZWNJ (U+200C) and ZWJ (U+200D, also inside emoji).
+//
+// LINE ENDINGS. A multi-line field's \r\n and lone \r become \n before it is
+// checked (toLf), so an API or MCP client that sends CRLF is not refused for a
+// "hidden control character" it cannot see. A one-line field refuses both.
+//
+// LINKS are stored as typed, so a link is refused when the URL parser would
+// have to REWRITE it to accept it: `https:\\evil.com`, `https:evil.com`,
+// `https:///evil.com` and `https://.` all parse, as something else. safeLink()
+// wants the literal `http://` or `https://`, no backslash, and a host typed as
+// the browser will use it — no empty label, no `%`, and no character the
+// parser silently deletes (LINK_HOST_HIDDEN_RE: the invisible set above, the
+// soft hyphen, and the rest of what UTS #46 maps to nothing — enumerated
+// against Node's own parser in tests/stop-hardening.test.js).
+//
+// TWIN: UNSAFE_LINE_RE, UNSAFE_MULTILINE_RE, INVISIBLE_RE, TEXT_DETAIL,
+// INVISIBLE_DETAIL, LINK_DETAIL, LINK_HOST_HIDDEN_RE, LINK_LABEL_DOT_RE, toLf,
+// textDetail() and safeLink() are copies of the same names in
+// server/trip-structure.js (the stop layer), duplicated rather than imported
+// because that file belongs to another line of work and exports none of them.
+// Change one, change both: tests/stop-hardening.test.js ("the twins") compares
+// them byte for byte.
 // Existing stored data is never rewritten here, and nothing on the read path
 // calls this file: reading an old value can never fail on it.
 'use strict';
 
-const UNSAFE_LINE_RE = /[<>\u0000-\u001F\u007F-\u009F]/;
-const UNSAFE_MULTILINE_RE = /[<>\u0000-\u0009\u000B-\u001F\u007F-\u009F]/;
+const UNSAFE_LINE_RE = /[<>\u0000-\u001F\u007F-\u009F\u200B\u2028\u2029\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/;
+const UNSAFE_MULTILINE_RE = /[<>\u0000-\u0009\u000B-\u001F\u007F-\u009F\u200B\u2028\u2029\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/;
+const INVISIBLE_RE = /[\u200B\u2028\u2029\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/;
 const TEXT_DETAIL = 'text may not contain < > or control characters';
-const LINK_DETAIL = 'a link must be an absolute http(s) URL with a host, and no quotes, < >, or whitespace';
+const INVISIBLE_DETAIL = 'text may not contain invisible characters that change its direction or display (U+200B, U+2028, U+2029, U+202A-U+202E, U+2060, U+2066-U+2069, U+FEFF)';
+const LINK_DETAIL = 'a link must start with http:// or https://, name its host as the browser will use it, and contain no quotes, backslashes, < >, or whitespace';
+const LINK_HOST_HIDDEN_RE = /[\u00AD\u034F\u180B-\u180D\u180F\u200B\u2028\u2029\u202A-\u202E\u2060\u2064\u2066-\u2069\uFE00-\uFE0F\uFEFF\u{1BCA0}-\u{1BCA3}\u{E0100}-\u{E01EF}]/u;
+const LINK_LABEL_DOT_RE = /[.。．｡]/;
+const toLf = (s) => s.replace(/\r\n?/g, '\n');
 const DATE_DETAIL = 'a date must be YYYY-MM-DD';
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-// A link a renderer can put in an href as it stands (twin of trip-structure.js).
+// The detail for a refused string (twin of trip-structure.js): the invisible-
+// character one only when nothing a person can see — < >, or a line break in
+// a one-line field — explains the refusal.
+function textDetail(s, multiline) {
+  if (/[<>]/.test(s) || (!multiline && /[\n\r]/.test(s)) || !INVISIBLE_RE.test(s)) return TEXT_DETAIL;
+  return INVISIBLE_DETAIL;
+}
+
+// A link a renderer can put in an href as it stands, going where it reads
+// (twin of trip-structure.js). Returned as typed (trimmed), never rewritten.
 function safeLink(raw) {
   if (typeof raw !== 'string') return undefined;
   const s = raw.trim();
-  if (!s || s.length > 2000 || /[\s"'<>`\u0000-\u001F\u007F-\u009F]/.test(s)) return undefined;
+  if (!s || s.length > 2000 || /[\s"'<>`\\\u0000-\u001F\u007F-\u009F]/.test(s)) return undefined;
+  const authority = /^https?:\/\/([^/?#]*)/i.exec(s)?.[1];
+  if (authority === undefined) return undefined;
+  const hostPort = authority.slice(authority.lastIndexOf('@') + 1);
+  if (!hostPort.startsWith('[')) {
+    const host = hostPort.replace(/:\d*$/, '');
+    const labels = host.split(LINK_LABEL_DOT_RE);
+    if (labels.length > 1 && labels[labels.length - 1] === '') labels.pop();
+    if (!host || host.includes('%') || LINK_HOST_HIDDEN_RE.test(host) || labels.some(l => !l)) return undefined;
+  }
   let url;
   try { url = new URL(s); } catch { return undefined; }
   if ((url.protocol !== 'http:' && url.protocol !== 'https:') || !url.hostname) return undefined;
   return s;
 }
+
+// The booking types, ONE list: server/server.js builds the bookings table's
+// CHECK constraint from it (byte for byte the text it always had), and
+// POST/PATCH /api/bookings refuse anything else with a bilingual 400 instead
+// of letting SQLite answer 500. The MCP tools' z.enum lists cannot require
+// this file (other checkouts); tests/write-validation.test.js pins them to it.
+const BOOKING_TYPES = Object.freeze(['flight', 'hotel', 'car', 'attraction', 'other']);
+const BOOKING_TYPE_LABEL = { he: 'סוג ההזמנה', en: 'booking type' };
 
 function isoDay(value) {
   return typeof value === 'string' && ISO_DATE_RE.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`))
@@ -91,9 +148,17 @@ const MESSAGES = {
     he: `השדה '${l.he}' מכיל תו בקרה נסתר שאסור. הקלידו את הטקסט מחדש ונסו שוב.`,
     en: `The '${l.en}' field contains a hidden control character that isn't allowed. Retype the text and try again.`,
   }),
+  invisible: (l) => ({
+    he: `השדה '${l.he}' מכיל תו נסתר שמשנה את כיוון הטקסט או את מראהו. הקלידו אותו מחדש, בלי להדביק.`,
+    en: `The '${l.en}' field has a hidden character that changes the text's direction or look. Retype it without pasting.`,
+  }),
   type: (l) => ({
     he: `השדה '${l.he}' צריך להכיל טקסט.`,
     en: `The '${l.en}' field must be text.`,
+  }),
+  booking_type: (l) => ({
+    he: `השדה '${l.he}' צריך להיות אחד מהבאים: ${BOOKING_TYPES.join(', ')}. בחרו אחד מהם ונסו שוב.`,
+    en: `The '${l.en}' field must be one of: ${BOOKING_TYPES.join(', ')}. Pick one and try again.`,
   }),
   too_long: (l, max) => ({
     he: `השדה '${l.he}' ארוך מדי: עד ${max} תווים. קצרו אותו ונסו שוב.`,
@@ -126,7 +191,15 @@ function refusal(error, field, label, reason, { detail, max } = {}) {
 function textReason(s, multiline) {
   if (/[<>]/.test(s)) return 'angle';
   if (!multiline && /[\n\r]/.test(s)) return 'newline';
+  if (INVISIBLE_RE.test(s)) return 'invisible';
   return 'control';
+}
+
+// A booking's `type`: one of BOOKING_TYPES, as a string — not an array that
+// better-sqlite3 would flatten, not null. Returns the 400 body, or null.
+function bookingTypeRefusal(value) {
+  if (typeof value === 'string' && BOOKING_TYPES.includes(value)) return null;
+  return refusal('invalid_type', 'type', BOOKING_TYPE_LABEL, 'booking_type', { detail: `must be one of: ${BOOKING_TYPES.join(', ')}` });
 }
 
 // One field. Absent (undefined), null and '' are not checked — the routes keep
@@ -148,8 +221,11 @@ function checkField(field, value, spec) {
   if (typeof s === 'number' && Number.isFinite(s)) s = String(s);
   if (typeof s !== 'string') return { error: refusal('invalid_text', field, label, 'type', { detail: 'must be text' }) };
   const multiline = kind === 'multiline';
+  // CRLF and a lone CR are a client's line ending, not a hidden character:
+  // normalised before the check (and the length) in a multi-line field.
+  if (multiline) s = toLf(s);
   if ((multiline ? UNSAFE_MULTILINE_RE : UNSAFE_LINE_RE).test(s)) {
-    return { error: refusal('invalid_text', field, label, textReason(s, multiline), { detail: TEXT_DETAIL }) };
+    return { error: refusal('invalid_text', field, label, textReason(s, multiline), { detail: textDetail(s, multiline) }) };
   }
   if (charCount(s) > max) return { error: refusal('text_too_long', field, label, 'too_long', { detail: `at most ${max} characters`, max }) };
   return { value: s };
@@ -178,12 +254,16 @@ function requiredRefusal(error, field, specs) {
 // ── extract-draft: clean, never refuse ───────────────────────────────────────
 // The draft route's text was read off a PDF by an LLM: nobody typed it, and a
 // refusal would leave the organizer with no draft. So each field is cleaned —
-// `<`, `>` and control characters removed (a line break becomes a space in a
-// one-line field, and stays in notes), the length clamped — and a bad date or
-// link is dropped. The organizer reviews every draft before it is approved.
-const STRIP_LINE_RE = /[<>\u0000-\u001F\u007F-\u009F]/g;
-const STRIP_MULTILINE_RE = /[<>\u0000-\u0009\u000B-\u001F\u007F-\u009F]/g;
+// `<`, `>`, control characters and the invisible characters the write refuses
+// removed (a line break becomes a space in a one-line field, and stays in
+// notes), the length clamped — and a bad date or link is dropped. The
+// organizer reviews every draft before it is approved. A number (a PDF's
+// confirmation number or PIN, read as a JSON number) is kept as its text, as
+// POST /api/bookings keeps it; NaN and Infinity are not text.
+const STRIP_LINE_RE = /[<>\u0000-\u001F\u007F-\u009F\u200B\u2028\u2029\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/g;
+const STRIP_MULTILINE_RE = /[<>\u0000-\u0009\u000B-\u001F\u007F-\u009F\u200B\u2028\u2029\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/g;
 function cleanText(value, spec) {
+  if (typeof value === 'number' && Number.isFinite(value)) value = String(value);
   if (typeof value !== 'string') return null;
   const multiline = spec.kind === 'multiline';
   let s = value.replace(/\r\n?/g, '\n').replace(/\t/g, ' ');
@@ -196,8 +276,8 @@ const cleanDate = (value) => (typeof value === 'string' ? isoDay(value.trim()) :
 const cleanLink = (value) => safeLink(value) ?? null;
 
 module.exports = {
-  BOOKING_FIELDS, PARTICIPANT_FIELDS,
-  UNSAFE_LINE_RE, UNSAFE_MULTILINE_RE, TEXT_DETAIL, LINK_DETAIL,
-  safeLink, isoDay, checkField, checkFields, isBlank, requiredRefusal, refusal,
+  BOOKING_FIELDS, PARTICIPANT_FIELDS, BOOKING_TYPES,
+  UNSAFE_LINE_RE, UNSAFE_MULTILINE_RE, INVISIBLE_RE, TEXT_DETAIL, INVISIBLE_DETAIL, LINK_DETAIL,
+  safeLink, isoDay, checkField, checkFields, isBlank, requiredRefusal, refusal, bookingTypeRefusal,
   cleanText, cleanDate, cleanLink,
 };
