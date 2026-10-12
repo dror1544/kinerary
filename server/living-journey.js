@@ -3,6 +3,9 @@ const path = require('path');
 const crypto = require('crypto');
 const { publicPart } = require('../shared/config-visibility');
 const { projectAgent } = require('../shared/agent-schema');
+// Every plan date a route below is SENT must be a day on the calendar, not
+// only the shape (second boundary re-check of PR #373); reads keep ISO_DATE_RE.
+const { isCalendarDay, CALENDAR_DAY_DETAIL } = require('./calendar-day');
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 // "<phase>|<YYYY-MM-DD>|<index>" — the identity a config-imported item keeps
@@ -1316,7 +1319,8 @@ function registerRoutes({ app, db, config, getConfig, raw, fetchImpl, mediaDir, 
 
   app.patch('/api/itinerary/days', organizerOrAgentRequired, itineraryRevisionMatches, (req, res) => {
     const { phase_id, date, label_he, label_en } = req.body || {};
-    if (!phase_id || !ISO_DATE_RE.test(date || '') || typeof label_he !== 'string' || typeof label_en !== 'string') return res.status(400).json({ error: 'invalid_day' });
+    if (phase_id && !isCalendarDay(date)) return res.status(400).json({ error: 'invalid_day', field: 'date', detail: CALENDAR_DAY_DETAIL });
+    if (!phase_id || typeof label_he !== 'string' || typeof label_en !== 'string') return res.status(400).json({ error: 'invalid_day' });
     const phase = cfg().phases?.find(phase => phase.id === phase_id);
     const start = phase?.dates?.start || phase?.start;
     const end = phase?.dates?.end || phase?.end || start;
@@ -1340,7 +1344,7 @@ function registerRoutes({ app, db, config, getConfig, raw, fetchImpl, mediaDir, 
     const body = req.body || {};
     const bad = requireFields(body, ['phase_id', 'date', 'text_he']);
     if (bad) return res.status(400).json({ error: bad });
-    if (!ISO_DATE_RE.test(body.date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+    if (!isCalendarDay(body.date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD', field: 'date', detail: CALENDAR_DAY_DETAIL });
     // A phase id no route can reach would file the item where nothing shows it.
     if (!isKnownPhase(body.phase_id)) return res.status(400).json({ error: 'unknown phase' });
     const uid = revisionId('item');
@@ -1383,7 +1387,7 @@ function registerRoutes({ app, db, config, getConfig, raw, fetchImpl, mediaDir, 
         return res.status(400).json({ error: `${field} must not be empty` });
       }
     }
-    if (body.date !== undefined && !ISO_DATE_RE.test(body.date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+    if (body.date !== undefined && !isCalendarDay(body.date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD', field: 'date', detail: CALENDAR_DAY_DETAIL });
     // Accepted since the PATCH existed, never checked: a typo moved the item to
     // a phase no route can reach (run notes F6). Checked against the trip as it
     // is now — an added stop is a valid target, an unknown string is not.
@@ -1450,7 +1454,12 @@ function registerRoutes({ app, db, config, getConfig, raw, fetchImpl, mediaDir, 
 
   app.post('/api/itinerary/swap-days', organizerOrAgentRequired, itineraryRevisionMatches, (req, res) => {
     const { phase_id, date_a, date_b } = req.body || {};
-    if (!phase_id || !ISO_DATE_RE.test(date_a || '') || !ISO_DATE_RE.test(date_b || '') || date_a === date_b) {
+    if (phase_id) {
+      for (const [field, value] of [['date_a', date_a], ['date_b', date_b]]) {
+        if (!isCalendarDay(value)) return res.status(400).json({ error: 'phase_id, date_a and date_b are required', field, detail: CALENDAR_DAY_DETAIL });
+      }
+    }
+    if (!phase_id || date_a === date_b) {
       return res.status(400).json({ error: 'phase_id, date_a and date_b are required' });
     }
     const nextId = cloneWith(db, req.user.username, 'Organizer swapped itinerary days', (rows) => {
@@ -1477,7 +1486,7 @@ function registerRoutes({ app, db, config, getConfig, raw, fetchImpl, mediaDir, 
   app.post('/api/itinerary/move-day', organizerOrAgentRequired, itineraryRevisionMatches, (req, res) => {
     const body = req.body || {};
     const { from_phase_id: from, to_phase_id: to, date } = body;
-    if (typeof date !== 'string' || !ISO_DATE_RE.test(date)) return res.status(400).json({ error: 'invalid_date' });
+    if (!isCalendarDay(date)) return res.status(400).json({ error: 'invalid_date', field: 'date', detail: CALENDAR_DAY_DETAIL });
     if (!isKnownPhase(from)) return res.status(400).json({ error: 'unknown_phase', field: 'from_phase_id' });
     // The target must be a real stop: a computed open-days phase is not a
     // place a day can be assigned to.

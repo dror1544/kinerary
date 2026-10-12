@@ -29,6 +29,22 @@
  *     over to March 2), so February 30 passed and was stored. Every date the
  *     stop layer takes must now survive a YYYY-MM-DD round trip.
  *
+ * Then the second boundary re-check of PR #373 (2026-10-12):
+ *
+ * (5) RESTORING A SNAPSHOT TODAY'S RULES REFUSE. A history snapshot written by
+ *     an older server (a title with U+2063, a tab label of U+3164, February 30)
+ *     was written back unchecked by a revert. Every restored field now goes
+ *     through the same validation a PATCH does, and a refused one is 400
+ *     history_entry_invalid naming the field and the underlying refusal — no
+ *     override written, no history row, no new revision. history_id is a
+ *     positive whole number or a string of digits, nothing looser.
+ *
+ * (6) THE REFERENCED-ID LOOKUP IS CHEAP. An open-days-N lookup re-read every
+ *     plan row and ran three queries, on every call. The set of open-days ids
+ *     anything names is computed once per state of the data and cached; a
+ *     second lookup does no row scan at all, and the set still lapses the moment
+ *     the last row moves away.
+ *
  * Unit tests on createTripStructure, then each scenario over HTTP on a real
  * trip server.
  */
@@ -321,6 +337,179 @@ describe('(4) a date that is not on the calendar is refused, not stored', () => 
   });
 });
 
+// ── (5) restoring a snapshot today's rules refuse ───────────────────────────
+const ch = (cp) => String.fromCodePoint(cp);
+const INVISIBLE_DETAIL = 'text may not contain invisible or blank-looking characters (zero-width, bidi, filler, tag or variation characters); LRM, RLM, ALM, ZWNJ, ZWJ and U+FE0F are allowed';
+const CODE_DETAIL = 'a confirmation number or PIN may not contain invisible characters, not even LRM, RLM, ALM, ZWNJ, ZWJ or U+FE0F';
+
+// What a pre-PR server left behind: the override it stored and the history
+// row it wrote for it. Returns the history id.
+function plantOldWrite(db, phaseId, fields) {
+  db.prepare(`INSERT INTO trip_stop_overrides (phase_id, kind, fields, base_digest, updated_by) VALUES (?, 'config', ?, '{}', 'old-server')
+    ON CONFLICT(phase_id) DO UPDATE SET fields = excluded.fields`).run(phaseId, JSON.stringify(fields));
+  return Number(db.prepare("INSERT INTO trip_stop_history (phase_id, action, before_state, after_state, actor) VALUES (?, 'update', NULL, ?, 'old-server')")
+    .run(phaseId, JSON.stringify({ kind: 'config', fields, after_phase_id: null, booking_id: null })).lastInsertRowid);
+}
+
+describe('(5) a restored snapshot goes through today\'s rules before it is written', () => {
+  const cases = [
+    ['a title with U+2063', { title: `Bergen${ch(0x2063)}` }, 'title', 'invalid_text', INVISIBLE_DETAIL],
+    ['a tab label of U+3164', { tabLabel: ch(0x3164) }, 'tabLabel', 'invalid_text', INVISIBLE_DETAIL],
+    ['an accommodation name with U+2800', { accommodation: { name: `Hotel${ch(0x2800)}` } }, 'accommodation.name', 'invalid_text', INVISIBLE_DETAIL],
+    ['a note with U+00AD', { accommodation: { name: 'H', note: `late${ch(0x00AD)} check-in` } }, 'accommodation.note', 'invalid_text', INVISIBLE_DETAIL],
+    ['dates ending on February 30', { dates: { start: '2027-02-21', end: '2027-02-30' } }, 'dates', 'invalid_dates', undefined],
+    ['a title of a lone RLM', { title: ch(0x200F) }, 'title', 'invalid_title', undefined],
+    ['a confirmation with an RLM', { accommodation: { name: 'H', confirmation: `123${ch(0x200F)}456` } }, 'accommodation.confirmation', 'invalid_text', CODE_DETAIL],
+  ];
+  for (const [what, fields, field, cause, detail] of cases) {
+    test(`${what} → 400 history_entry_invalid (field ${field}, cause ${cause}); no override change, no history row, same revision`, () => {
+      const { db, structure, historyCount, override } = make(febConfig());
+      const hid = plantOldWrite(db, 'bergen', fields);
+      // The organizer has since PATCHed a clean value; the bad snapshot is history.
+      assert.equal(structure.ops.update('bergen', { title: 'Bergen' }, 'alice').status, 200);
+      const before = { history: historyCount(), override: override('bergen'), revision: structure.revision() };
+      const r = structure.ops.revert('bergen', { history_id: hid, on_outside: 'keep' }, 'alice');
+      assert.equal(r.status, 400, JSON.stringify(r.body));
+      assert.deepEqual([r.body.error, r.body.history_id, r.body.field, r.body.cause], ['history_entry_invalid', hid, field, cause], JSON.stringify(r.body));
+      if (detail) assert.equal(r.body.detail, detail);
+      assert.deepEqual({ history: historyCount(), override: override('bergen'), revision: structure.revision() }, before);
+    });
+  }
+
+  test('the reviewer\'s repro, all at once — refused, and the way out still works: back to the config, or PATCH a fixed value', () => {
+    const { db, structure, historyCount, override, phase } = make(febConfig());
+    const hid = plantOldWrite(db, 'bergen', {
+      title: `Bergen${ch(0x2063)}`, tabLabel: ch(0x3164),
+      accommodation: { name: `Hotel${ch(0x2800)}`, note: `a${ch(0x00AD)}b` }, dates: { start: '2027-02-21', end: '2027-02-30' },
+    });
+    const n = historyCount();
+    const r = structure.ops.revert('bergen', { history_id: hid, on_outside: 'keep' }, 'alice');
+    assert.deepEqual([r.status, r.body.error], [400, 'history_entry_invalid']);
+    assert.equal(historyCount(), n);
+    const toConfig = structure.ops.revert('bergen', {}, 'alice');
+    assert.equal(toConfig.status, 200, JSON.stringify(toConfig.body));
+    assert.equal(override('bergen'), null);
+    assert.equal(phase('bergen').title.en, 'Bergen');
+    assert.equal(structure.ops.update('bergen', { title: 'Bergen centre' }, 'alice').status, 200);
+  });
+
+  test('a clean snapshot still restores, with every field', () => {
+    const { db, structure, phase } = make(febConfig());
+    const fields = { title: { he: `ברגן${ch(0x200F)}`, en: 'Bergen' }, tabLabel: 'BGO', accommodation: { name: 'Hotel Bryggen', confirmation: 'AB-12' },
+      dates: { start: '2027-02-21', end: '2027-02-28' } };
+    const hid = plantOldWrite(db, 'bergen', fields);
+    assert.equal(structure.ops.update('bergen', { title: 'Other', dates: { start: '2027-02-20', end: '2027-03-10' } }, 'alice').status, 200);
+    const r = structure.ops.revert('bergen', { history_id: hid, on_outside: 'keep' }, 'alice');
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    const b = phase('bergen');
+    assert.deepEqual([b.title, b.tabLabel, b.accommodation, b.dates], [fields.title, fields.tabLabel, fields.accommodation, fields.dates]);
+  });
+
+  test('history_id: only a positive whole number or a string of digits; everything looser → 400 invalid_history_id, nothing written', () => {
+    const { db, structure, historyCount } = make(febConfig());
+    const hid = plantOldWrite(db, 'bergen', { title: 'Bergen old' });
+    assert.equal(hid, 1);
+    const n = historyCount();
+    for (const bad of [true, false, [1], ['1'], '0x1', ' 1 ', '1 ', '+1', '-1', '1.0', '1e0', '', 0, -1, 1.5, NaN, null, {}, { id: 1 }, '٣', Number.MAX_SAFE_INTEGER + 2]) {
+      const r = structure.ops.revert('bergen', { history_id: bad }, 'alice');
+      assert.deepEqual([r.status, r.body.error], [400, 'invalid_history_id'], `${JSON.stringify(bad)}: ${JSON.stringify(r.body)}`);
+    }
+    assert.equal(historyCount(), n);
+    assert.equal(structure.ops.revert('bergen', { history_id: 999 }, 'alice').body.error, 'history_entry_not_found');
+    assert.equal(structure.ops.revert('bergen', { history_id: '1' }, 'alice').status, 200);
+    assert.equal(structure.ops.revert('bergen', { history_id: 1 }, 'alice').status, 200);
+    assert.equal(structure.ops.revert('bergen', { history_id: '0001' }, 'alice').status, 200, 'ASCII digits, leading zeros included');
+  });
+});
+
+// ── (6) the referenced-id lookup does not re-read the plan on every call ────
+function makeCounted(config) {
+  const raw = new Database(':memory:');
+  raw.exec(`
+    CREATE TABLE bookings (id INTEGER PRIMARY KEY AUTOINCREMENT, phase TEXT, type TEXT, name TEXT, date_from TEXT,
+      date_to TEXT, confirmation TEXT, pin TEXT, notes TEXT, location_url TEXT, review_status TEXT DEFAULT 'approved');
+    CREATE TABLE phase_plan_items (id INTEGER PRIMARY KEY AUTOINCREMENT, phase_id TEXT, date TEXT, text_he TEXT);
+    CREATE TABLE phase_plan_days (phase_id TEXT, date TEXT, label_he TEXT, label_en TEXT, PRIMARY KEY (phase_id, date));
+  `);
+  const scans = { rows: 0, sql: 0 };
+  // Every statement that reads a row table the lookup consults is counted when it runs.
+  const counting = (stmt) => new Proxy(stmt, {
+    get(target, key) {
+      const v = target[key];
+      if (typeof v !== 'function') return v;
+      if (['get', 'all', 'iterate'].includes(key)) return (...args) => { scans.sql++; return v.apply(target, args); };
+      return v.bind(target);
+    },
+  });
+  const db = new Proxy(raw, {
+    get(target, key) {
+      if (key === 'prepare') return (sql) => { const st = target.prepare(sql); return /phase_plan_items|phase_plan_days|\bbookings\b/.test(sql) ? counting(st) : st; };
+      const v = target[key];
+      return typeof v === 'function' ? v.bind(target) : v;
+    },
+  });
+  const journey = fakeJourney();
+  const activeRows = journey.activeRows.bind(journey);
+  journey.activeRows = () => { scans.rows++; return activeRows(); };
+  const base = clone(config);
+  const structure = createTripStructure({ db, baseConfig: () => base, journey: () => journey, queuePhaseReview: () => {} });
+  const reset = () => { scans.rows = 0; scans.sql = 0; };
+  return { raw, structure, journey, scans, reset };
+}
+
+describe('(6) an open-days-N lookup is answered from a cached set, not a scan per call', () => {
+  function orphaned() {
+    const ctx = makeCounted(openDaysConfig());
+    const { structure, journey } = ctx;
+    assert.equal(structure.ops.update('florence', { dates: { start: '2027-03-06', end: '2027-03-07' } }, 'alice').status, 200);
+    journey.rows.items.push(planItem('open-days-2', '2027-03-09', 'item-od2'));
+    journey.changes++;
+    assert.equal(structure.ops.update('florence', { dates: { start: '2027-03-06', end: '2027-03-10' } }, 'alice').status, 200);
+    return ctx;
+  }
+
+  test('after one lookup, lookups of ids nothing names (open-days-9999, -1000.., -3) and of the referenced one do ZERO row scans', () => {
+    const { structure, scans, reset } = orphaned();
+    assert.equal(structure.isPhase('open-days-9999'), false, 'warm-up');
+    reset();
+    for (let i = 0; i < 50; i++) {
+      assert.equal(structure.isPhase('open-days-9999'), false);
+      assert.equal(structure.isPhase(`open-days-${1000 + i}`), false);
+      assert.equal(structure.isPhase('open-days-3'), false);
+      assert.equal(structure.isPhase('open-days-2'), true);
+    }
+    assert.deepEqual(scans, { rows: 0, sql: 0 }, 'no plan read and no row query on a warm lookup');
+  });
+
+  test('the first lookup after a change reads once, for every id — not once per id', () => {
+    const { structure, journey, scans, reset } = orphaned();
+    journey.changes++;
+    reset();
+    for (const id of ['open-days-9999', 'open-days-7', 'open-days-2', 'open-days-12']) structure.isPhase(id);
+    assert.ok(scans.rows <= 2, `plan read ${scans.rows} times`);
+    assert.ok(scans.sql <= 3, `row queries: ${scans.sql}`);
+  });
+
+  test('still correct: the id lapses right after its last row moves away, and a booking or a Classic row filed under it brings it back', () => {
+    const { raw, structure, journey } = orphaned();
+    assert.equal(structure.isPhase('open-days-2'), true);
+    journey.rows.items = journey.rows.items.map(i => ({ ...i, phase_id: 'florence' }));
+    journey.changes++;
+    assert.equal(structure.isPhase('open-days-2'), false, 'nothing names it any more');
+    raw.prepare("INSERT INTO bookings (phase, type, name) VALUES ('open-days-2', 'other', 'Ferry')").run();
+    assert.equal(structure.isPhase('open-days-2'), true, 'a booking filed under it (no journey change)');
+    raw.prepare('DELETE FROM bookings').run();
+    assert.equal(structure.isPhase('open-days-2'), false);
+    raw.prepare("INSERT INTO phase_plan_items (phase_id, date, text_he) VALUES ('open-days-2', '2027-03-09', 'x')").run();
+    assert.equal(structure.isPhase('open-days-2'), true, 'a Classic plan row');
+    raw.prepare('DELETE FROM phase_plan_items').run();
+    raw.prepare("INSERT INTO phase_plan_days (phase_id, date, label_he, label_en) VALUES ('open-days-2', '2027-03-09', NULL, NULL)").run();
+    assert.equal(structure.isPhase('open-days-2'), false, 'an empty Classic day row names nothing');
+    raw.prepare("UPDATE phase_plan_days SET label_en = 'Day trip'").run();
+    assert.equal(structure.isPhase('open-days-2'), true, 'a Classic headline does');
+  });
+});
+
 // ── over HTTP ───────────────────────────────────────────────────────────────
 const AGENT_KEY = 'agent-key-review-fixes';
 
@@ -375,6 +564,7 @@ async function boot(port) {
   };
   return {
     call,
+    dataDir,
     async login(username) {
       for (let i = 0; i < 40; i++) {
         const r = await call('/api/auth/login', { method: 'POST', body: { username, password: '1234' } });
@@ -481,6 +671,32 @@ describe('over HTTP: the four review scenarios on a real trip server', () => {
     // Re-linking A from the booking agrees with the refusal.
     const relink = await server.call('/api/stops/a/from-booking', { method: 'POST', token: alice, body: { booking_id: hotel } });
     assert.deepEqual([relink.status, relink.body.error], [409, 'booking_linked_to_another_stop']);
+  });
+
+  test('(5) a snapshot a pre-PR server stored (U+2063, U+3164, U+2800, U+00AD, Feb 30) → restore 400 history_entry_invalid; members see nothing of it', async () => {
+    // Planted as the old server would have left them: the override and its history row.
+    const db = new Database(join(server.dataDir, 'trip.db'));
+    let hid;
+    try {
+      hid = plantOldWrite(db, 'legacy', { title: `Legacy${ch(0x2063)}`, tabLabel: ch(0x3164),
+        accommodation: { name: `Hotel${ch(0x2800)}`, note: `a${ch(0x00AD)}b` }, dates: { start: '2027-02-11', end: '2027-02-30' } });
+    } finally { db.close(); }
+    // The organizer cleans the stop up from today's server.
+    assert.equal((await server.call('/api/stops/legacy/revert', { method: 'POST', token: alice, body: {} })).status, 200);
+    const stopsBefore = (await server.call('/api/stops', { token: alice })).body;
+    const configBefore = (await server.call('/api/config', { token: alice })).text;
+
+    const r = await server.call('/api/stops/legacy/revert', { method: 'POST', token: alice, body: { history_id: hid, on_outside: 'keep' } });
+    assert.equal(r.status, 400, r.text);
+    assert.equal(r.body.error, 'history_entry_invalid');
+    assert.equal(r.body.history_id, hid);
+    assert.ok(['title', 'tabLabel', 'dates', 'accommodation.name', 'accommodation.note'].includes(r.body.field), r.text);
+    const stopsAfter = (await server.call('/api/stops', { token: alice })).body;
+    assert.equal(stopsAfter.revision, stopsBefore.revision, 'no history row, no new revision');
+    assert.equal((await server.call('/api/config', { token: alice })).text, configBefore, 'the served config is unchanged');
+
+    const loose = await server.call('/api/stops/legacy/revert', { method: 'POST', token: alice, body: { history_id: true } });
+    assert.deepEqual([loose.status, loose.body.error], [400, 'invalid_history_id'], loose.text);
   });
 
 });

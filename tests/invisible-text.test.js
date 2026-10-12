@@ -14,6 +14,18 @@
  *   ALLOWED = ZWNJ, ZWJ, LRM, RLM, ALM, VS16 — RTL text and emoji are typed with them
  *   EXTRA   = U+2028/U+2029 (refused before this change, not default-ignorable)
  *             U+2800 BRAILLE PATTERN BLANK, U+FFFC OBJECT REPLACEMENT CHARACTER
+ *             U+070F SYRIAC ABBREVIATION MARK and U+16FE4 KHITAN FILLER, which
+ *             Chromium draws at zero width, and U+FFF9-U+FFFB, the interlinear
+ *             annotation marks (second boundary re-check of PR #373, 2026-10-12)
+ *
+ * And two rules that sit on top of it (same re-check):
+ *   BLANK   = a value made only of whitespace, the refused set, the ALLOWED
+ *             marks and combining marks (\p{M}) is blank — a name of a lone RLM
+ *             or a lone U+0301 renders as nothing. A real name that CONTAINS them
+ *             (niqqud, a VS16 heart, a Persian ZWNJ word, e + U+0301) is not.
+ *   CODES   = a confirmation number or a PIN also refuses the ALLOWED marks: RLM
+ *             and ALM reorder digits inside a right-to-left page (123 RLM 456
+ *             shows as 456123), and a code has no use for any of the six.
  * The Hangul fillers (U+115F, U+1160, U+3164, U+FFA0) and the Khmer inherent
  * vowels (U+17B4, U+17B5) are already default-ignorable, so they are not listed
  * twice.
@@ -46,16 +58,16 @@ const ALLOWED = new Map([
   [0x061C, 'ALM — Arabic mixed with numbers'],
   [0xFE0F, 'VS16 — emoji presentation (❤️ is U+2764 U+FE0F)'],
 ]);
-const EXTRA = [0x2028, 0x2029, 0x2800, 0xFFFC];
+const EXTRA = [0x070F, 0x2028, 0x2029, 0x2800, 0xFFF9, 0xFFFA, 0xFFFB, 0xFFFC, 0x16FE4];
 
 // Default_Ignorable_Code_Point as of Unicode 17 (Node 22.23, ICU 78.2).
 const PINNED_DI = [[0x00AD, 0x00AD], [0x034F, 0x034F], [0x061C, 0x061C], [0x115F, 0x1160], [0x17B4, 0x17B5], [0x180B, 0x180F],
   [0x200B, 0x200F], [0x202A, 0x202E], [0x2060, 0x206F], [0x3164, 0x3164], [0xFE00, 0xFE0F], [0xFEFF, 0xFEFF], [0xFFA0, 0xFFA0],
   [0xFFF0, 0xFFF8], [0x1BCA0, 0x1BCA3], [0x1D173, 0x1D17A], [0xE0000, 0xE0FFF]];
 // What the rule refuses, written out.
-const PINNED_REFUSED = [[0x00AD, 0x00AD], [0x034F, 0x034F], [0x115F, 0x1160], [0x17B4, 0x17B5], [0x180B, 0x180F], [0x200B, 0x200B],
+const PINNED_REFUSED = [[0x00AD, 0x00AD], [0x034F, 0x034F], [0x070F, 0x070F], [0x115F, 0x1160], [0x17B4, 0x17B5], [0x180B, 0x180F], [0x200B, 0x200B],
   [0x2028, 0x202E], [0x2060, 0x206F], [0x2800, 0x2800], [0x3164, 0x3164], [0xFE00, 0xFE0E], [0xFEFF, 0xFEFF],
-  [0xFFA0, 0xFFA0], [0xFFF0, 0xFFF8], [0xFFFC, 0xFFFC], [0x1BCA0, 0x1BCA3], [0x1D173, 0x1D17A], [0xE0000, 0xE0FFF]];
+  [0xFFA0, 0xFFA0], [0xFFF0, 0xFFFC], [0x16FE4, 0x16FE4], [0x1BCA0, 0x1BCA3], [0x1D173, 0x1D17A], [0xE0000, 0xE0FFF]];
 
 function* codePoints() {
   for (let cp = 0; cp <= 0x10FFFF; cp++) {
@@ -105,11 +117,12 @@ describe('the refused set — Default_Ignorable_Code_Point minus the allowed mar
   });
 
   test('every character the re-check reported as accepted is refused now (except the allowed marks and the visible format signs)', () => {
-    // From the review's scan. U+0600-0605, U+06DD, U+070F, U+0890-0891,
-    // U+08E2, U+110BD, U+110CD, U+13430-1343F and U+FFF9-FFFB are format
-    // characters that are NOT default-ignorable — most draw a visible sign —
-    // and stay outside the brief's set (named in the handover).
-    const reported = [0x00AD, 0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x180B, 0x180C, 0x180D, 0x180E, 0x180F,
+    // From the review's scan. U+0600-0605, U+06DD, U+0890-0891, U+08E2,
+    // U+110BD, U+110CD and U+13430-1343F are format characters that are NOT
+    // default-ignorable and draw a visible sign — outside the set. U+070F and
+    // U+FFF9-FFFB joined it with the second re-check of PR #373 (U+070F draws
+    // at zero width in Chromium; the annotation marks hide what they bracket).
+    const reported = [0x070F, 0xFFF9, 0xFFFA, 0xFFFB, 0x16FE4, 0x00AD, 0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x180B, 0x180C, 0x180D, 0x180E, 0x180F,
       0x2061, 0x2062, 0x2063, 0x2064, 0x2065, 0x206A, 0x206B, 0x206C, 0x206D, 0x206E, 0x206F, 0x3164, 0xFFA0,
       0xFE00, 0xFE0E, 0xFFF0, 0xFFF8, 0x1BCA0, 0x1BCA3, 0x1D173, 0x1D17A, 0xE0000, 0xE0001, 0xE0041, 0xE007F, 0xE0100, 0xE0FFF,
       0x2800, 0xFFFC];
@@ -185,10 +198,88 @@ describe('blank — a value made only of whitespace and refused characters is bl
     assert.equal(rules.isBlank('   '), true);
     assert.equal(rules.isBlank(undefined), true);
     assert.equal(rules.isBlank(null), true);
-    // An allowed mark alone is not blank-by-rule: it is not refused, and the
-    // write stores it. (A name of a lone RLM is an edge nobody has typed; it is
-    // left to the write's own rules rather than widened here.)
-    assert.equal(rules.isBlank(ch(0x200F)), false);
+  });
+});
+
+// Second boundary re-check of PR #373: "names made only of allowed marks are
+// accepted" — a booking name of a lone RLM, or of U+0301 alone, came back 200.
+describe('blank, widened — the allowed marks and combining marks alone are blank too', () => {
+  const MARK_ONLY = [[0x200F], [0x200E, 0x200F], [0x200D], [0xFE0F], [0x061C], [0x200C], [0x0301], [0x070F], [0x16FE4],
+    [0x05B8], [0x05BC, 0x05B8], [0x20E3], [0x0301, 0x0301, 0x0300]];
+  test('each value the re-check reported (and niqqud or an enclosing keycap with no letter) is blank — alone, among spaces, mixed', () => {
+    for (const cps of MARK_ONLY) {
+      const v = cps.map(ch).join('');
+      for (const x of [v, ` ${v} `, `${v}\t${ch(0x3164)}`]) assert.equal(rules.isBlank(x), true, `${cps.map(hex).join(' ')}: ${JSON.stringify(x)}`);
+    }
+    assert.equal(rules.isBlank(` ${ch(0x0301)} `), true, "' U+0301 ' is blank");
+    assert.equal(rules.isBlank(`${ch(0x200F)}${ch(0x200E)}`), true, 'RLM LRM (what extract-draft stored) is blank');
+  });
+  test('every allowed mark and every combining mark (\\p{M}), alone, is blank', () => {
+    for (const cp of ALLOWED.keys()) assert.equal(rules.isBlank(ch(cp)), true, hex(cp));
+    const M = new RegExp('\\p{M}', 'u');
+    let n = 0;
+    for (const cp of codePoints()) if (M.test(ch(cp))) { assert.equal(rules.isBlank(ch(cp)), true, hex(cp)); n++; }
+    assert.ok(n > 2000, `enumerated ${n} combining marks`);
+  });
+  test('a real name that merely CONTAINS marks is not blank', () => {
+    const names = [
+      `${ch(0x05E9)}${ch(0x05B8)}${ch(0x05DC)}${ch(0x05D5)}${ch(0x05B9)}${ch(0x05DD)}`, // Hebrew with niqqud
+      `${ch(0x2764)}${ch(0xFE0F)}`,                                                       // a VS16 heart, the emoji alone
+      `${ch(0x0645)}${ch(0x06CC)}${ch(0x200C)}${ch(0x062E)}${ch(0x0648)}${ch(0x0627)}${ch(0x0647)}${ch(0x0645)}`, // Persian ZWNJ word
+      `Cafe${ch(0x0301)}`,                                                                // a combining accent on a base letter
+      `${ch(0x1F468)}${ch(0x200D)}${ch(0x1F469)}`,                                        // a ZWJ emoji
+      `1${ch(0xFE0F)}${ch(0x20E3)}`,                                                      // a keycap
+      `${ch(0x05D3)}${ch(0x05DF)}${ch(0x200F)}`,                                          // Hebrew + RLM
+    ];
+    for (const v of names) {
+      assert.equal(rules.isBlank(v), false, JSON.stringify(v));
+      assert.deepEqual(rules.checkField('name', v, rules.BOOKING_FIELDS.name), { value: v }, `stored as typed: ${JSON.stringify(v)}`);
+      assert.deepEqual(rules.checkField('name', v, rules.PARTICIPANT_FIELDS.name), { value: v });
+    }
+  });
+  test('extract-draft: a name made only of marks cleans to nothing (null, which the route answers 422)', () => {
+    for (const cps of MARK_ONLY) assert.equal(rules.cleanText(cps.map(ch).join(''), rules.BOOKING_FIELDS.name), null, cps.map(hex).join(' '));
+    assert.equal(rules.cleanText(`${ch(0x200F)}${ch(0x200E)}`, rules.BOOKING_FIELDS.name), null);
+    assert.equal(rules.cleanText(`Dan${ch(0x200F)}`, rules.BOOKING_FIELDS.name), `Dan${ch(0x200F)}`, 'a real name keeps its mark');
+  });
+});
+
+// RLM and ALM reorder digits inside a right-to-left container: 123 RLM 456
+// shows as 456123 on a Hebrew page, and the site renders a confirmation number
+// with no bidi isolation. A code has no use for any of the six marks.
+describe('code fields — a confirmation number and a PIN refuse the allowed marks too', () => {
+  const CODE_FIELDS = [['confirmation', rules.BOOKING_FIELDS.confirmation], ['pin', rules.BOOKING_FIELDS.pin]];
+  test('each of LRM, RLM, ALM, ZWNJ, ZWJ, VS16 inside a confirmation number or a PIN → invalid_text, the invisible message, the code detail', () => {
+    for (const [field, spec] of CODE_FIELDS) {
+      for (const cp of ALLOWED.keys()) {
+        const r = rules.checkField(field, `123${ch(cp)}456`, spec);
+        assert.ok(r.error, `${field}/${hex(cp)} accepted`);
+        assert.deepEqual([r.error.error, r.error.field, r.error.detail], ['invalid_text', field, rules.CODE_DETAIL], `${field}/${hex(cp)}`);
+        assert.match(r.error.message.en, /hidden character/);
+        assert.match(r.error.message.he, /תו נסתר/);
+      }
+    }
+  });
+  test('the same marks in a name, passengers or notes are stored as typed (the other direction)', () => {
+    for (const cp of ALLOWED.keys()) {
+      const v = `${ch(0x05D3)}${ch(0x05DF)}${ch(cp)} 5`;
+      for (const field of ['name', 'passengers', 'notes']) {
+        assert.deepEqual(rules.checkField(field, v, rules.BOOKING_FIELDS[field]), { value: v }, `${field}/${hex(cp)}`);
+      }
+    }
+  });
+  test('a plain code, a Hebrew-lettered code and a numeric one are still accepted', () => {
+    for (const [field, spec] of CODE_FIELDS) {
+      for (const v of ['ABC123', 'LY-001', `${ch(0x05D0)}${ch(0x05D1)}-12`, 4321]) {
+        assert.equal(rules.checkField(field, v, spec).error, undefined, `${field}: ${v}`);
+      }
+    }
+  });
+  test('extract-draft strips the six marks from a code (the write would refuse them), and keeps them in a name', () => {
+    const marks = [...ALLOWED.keys()].map(ch).join('');
+    assert.equal(rules.cleanText(`123${marks}456`, rules.BOOKING_FIELDS.confirmation), '123456');
+    assert.equal(rules.cleanText(`12${marks}34`, rules.BOOKING_FIELDS.pin), '1234');
+    assert.equal(rules.cleanText(`x${marks}y`, rules.BOOKING_FIELDS.name), `x${marks}y`);
   });
 });
 

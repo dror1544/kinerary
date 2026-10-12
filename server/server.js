@@ -2731,6 +2731,12 @@ function joinBooking(item, { includeDrafts = false } = {}) {
 
 const PLAN_STATUSES = new Set(['confirmed', 'needs_review']);
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+// A plan date a Classic handler is SENT must be a day on the calendar, not only
+// the shape (second boundary re-check of PR #373). Refused with the route's own
+// error, plus `field` and `detail`. Reads keep ISO_DATE_RE: a row an older
+// server stored on 2027-02-30 is served as it is.
+const { isCalendarDay, CALENDAR_DAY_DETAIL } = require('./calendar-day');
+const planDateRefusal = (error, field) => ({ error, field, detail: CALENDAR_DAY_DETAIL });
 // 24-hour HH:MM. Matches what <input type="time"> submits and what the config
 // schedule already uses, so a DB plan item sorts against the same shape.
 const HHMM_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
@@ -2779,9 +2785,11 @@ function planFieldError(body, { requireText }) {
     const v = body[f];
     if (v !== undefined && v !== null && !isStr(v)) return `${f} must be a string`;
   }
+  // The one refusal here that is an object: it names its field (the routes
+  // send a string refusal as { error }).
   const d = body.date;
-  if (d !== undefined && d !== null && d !== '' && (!isStr(d) || !ISO_DATE_RE.test(d))) {
-    return 'date must be YYYY-MM-DD';
+  if (d !== undefined && d !== null && d !== '' && !isCalendarDay(d)) {
+    return planDateRefusal('date must be YYYY-MM-DD', 'date');
   }
   const t = body.time;
   if (t !== undefined && t !== null && t !== '' && (!isStr(t) || !isValidPlanTime(t))) {
@@ -2892,7 +2900,7 @@ app.post('/api/phases/:phase_id/plan', organizerOrAgentRequired, (req, res) => {
   if (!knownPhase(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
   const body = req.body || {};
   const bad = planFieldError(body, { requireText: true });
-  if (bad) return res.status(400).json({ error: bad });
+  if (bad) return res.status(400).json(typeof bad === 'string' ? { error: bad } : bad);
   const { date, time, text_he, text_en, location_url, booking_id, status, sort_order,
           waze_url, website_url, ticket_url } = body;
   const result = db.prepare(
@@ -2931,7 +2939,7 @@ app.patch('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res)
   if (!knownPhase(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
   const body = req.body || {};
   const bad = planFieldError(body, { requireText: false });
-  if (bad) return res.status(400).json({ error: bad });
+  if (bad) return res.status(400).json(typeof bad === 'string' ? { error: bad } : bad);
   if (body.text_he !== undefined && !String(body.text_he).trim()) {
     return res.status(400).json({ error: 'text_he cannot be empty' });
   }
@@ -3024,7 +3032,7 @@ app.patch('/api/phases/:phase_id/plan/days/:date', organizerOrAgentRequired, (re
   const phaseId = req.params.phase_id;
   if (!knownPhase(phaseId)) return res.status(400).json({ error: 'unknown phase' });
   const { date } = req.params;
-  if (!ISO_DATE_RE.test(date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+  if (!isCalendarDay(date)) return res.status(400).json(planDateRefusal('date must be YYYY-MM-DD', 'date'));
   const body = req.body || {};
   for (const f of ['label_he', 'label_en']) {
     if (body[f] !== undefined && body[f] !== null && typeof body[f] !== 'string') {
@@ -3082,9 +3090,7 @@ app.post('/api/phases/:phase_id/plan/swap-days', organizerOrAgentRequired, (req,
   if (!knownPhase(phaseId)) return res.status(400).json({ error: 'unknown phase' });
   const { date_a, date_b } = req.body || {};
   for (const [name, v] of [['date_a', date_a], ['date_b', date_b]]) {
-    if (typeof v !== 'string' || !ISO_DATE_RE.test(v)) {
-      return res.status(400).json({ error: `${name} must be YYYY-MM-DD` });
-    }
+    if (!isCalendarDay(v)) return res.status(400).json(planDateRefusal(`${name} must be YYYY-MM-DD`, name));
   }
   if (date_a === date_b) return res.status(400).json({ error: 'date_a and date_b must differ' });
 

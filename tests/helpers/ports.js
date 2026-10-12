@@ -159,6 +159,9 @@ export const PORTS = {
   // The four P2 findings of the automated review of PR #362 (stop editing)
   // — tests/stop-review-fixes.test.js.
   stopReviewFixes:         28326,
+  // A plan date must be a day on the calendar, on every plan route (second
+  // boundary re-check of PR #373) — tests/calendar-routes.test.js.
+  calendarRoutes:          28327,
 
   // ── Stand-ins for services the server calls out to ─────────────────────
   bookingExtractMockHermes: 28103,
