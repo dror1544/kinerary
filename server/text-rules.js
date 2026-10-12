@@ -165,8 +165,8 @@ const MESSAGES = {
     en: `The '${l.en}' field is too long: up to ${max} characters. Shorten it and try again.`,
   }),
   link: (l) => ({
-    he: `הקישור בשדה '${l.he}' לא תקין: צריך כתובת https:// מלאה, בלי רווחים, מירכאות או < >.`,
-    en: `The '${l.en}' link isn't valid: use a full https:// address, with no spaces, quotes or < >.`,
+    he: `הקישור בשדה '${l.he}' לא תקין: צריך כתובת מלאה ב-http:// או https://, בלי רווחים, מירכאות או < >.`,
+    en: `The '${l.en}' link isn't valid: use a full http:// or https:// address, no spaces, quotes or < >.`,
   }),
   date: (l) => ({
     he: `השדה '${l.he}' צריך להכיל תאריך תקין בצורה YYYY-MM-DD (למשל 2026-12-02).`,

@@ -242,6 +242,16 @@ describe('POST /api/bookings — links, dates, lengths', () => {
     for (const f of LINK_FIELDS) assert.equal(row[f], good);
   });
 
+  test('the link refusal names both accepted schemes — safeLink accepts http:// and https:// (#364 review)', async () => {
+    const r = await asAgent('/api/bookings', { method: 'POST', body: base({ [LINK_FIELDS[0]]: 'ftp://maps.example/x' }) });
+    assert.equal(r.status, 400, r.text);
+    assert.match(r.body.message.en, /http:\/\/ or https:\/\//);
+    assert.ok(r.body.message.he.includes('http:// או https://'), r.body.message.he);
+    // and the claim is true: an http:// link is accepted
+    const ok = await asAgent('/api/bookings', { method: 'POST', body: base({ [LINK_FIELDS[0]]: 'http://127.0.0.1:3000/a' }) });
+    assert.equal(ok.status, 200, ok.text);
+  });
+
   test('dates must be a real YYYY-MM-DD', async () => {
     for (const field of ['date_from', 'date_to']) {
       for (const value of ['2026-13-01', '2026-02-30', '12/02/2026', '2026-12-02T10:00', '<b>', '2026-1-2']) {
