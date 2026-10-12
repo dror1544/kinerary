@@ -59,11 +59,25 @@ const LINK_FIELDS = ['location_url', 'google_wallet_url', 'apple_wallet_url'];
 // Characters that change how text renders without being seen (follow-up 1 of
 // the fifth boundary review, 2026-10-11): bidi embeddings/overrides, isolates,
 // line/paragraph separators, BOM, zero-width space, word joiner.
-const INVISIBLE = [0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069, 0x2028, 0x2029, 0xFEFF, 0x200B, 0x2060]
-  .map(cp => [`U+${cp.toString(16).toUpperCase()}`, `ab${String.fromCodePoint(cp)}cd`]);
+// Widened by the boundary re-check of PR #371 (2026-10-12) to every
+// Default_Ignorable_Code_Point but the allowed marks, plus U+2800 and U+FFFC:
+// one or more of every class it found accepted follows the base set (the whole
+// set is enumerated, code point by code point, in invisible-text.test.js).
+const INVISIBLE_CPS = [0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069, 0x2028, 0x2029, 0xFEFF, 0x200B, 0x2060,
+  0x00AD, 0x034F, 0x115F, 0x1160, 0x3164, 0xFFA0, 0x17B4, 0x17B5, 0x180E, 0x2061, 0x2063, 0x2064, 0x206A, 0x206F,
+  0xFE00, 0xFE0E, 0xFFF0, 0x1BCA0, 0x1D173, 0xE0001, 0xE0041, 0xE0100, 0xE0FFF, 0x2800, 0xFFFC,
+  // Second re-check of PR #373: zero-width in Chromium, and the annotation marks.
+  0x070F, 0x16FE4, 0xFFF9, 0xFFFA, 0xFFFB];
+const INVISIBLE = INVISIBLE_CPS.map(cp => [`U+${cp.toString(16).toUpperCase()}`, `ab${String.fromCodePoint(cp)}cd`]);
 // The marks RTL text legitimately carries: LRM, RLM, ALM, ZWNJ, ZWJ. Stored as typed.
 const RTL_MARKED = ['מלון\u200F Hilton\u200E תל אביב', 'טיסה LY\u200E-001\u200F', 'فندق\u061C 5', 'می\u200Cخواهم', '👨\u200D👩\u200D👧 משפחה'];
-const INVISIBLE_DETAIL = 'text may not contain invisible characters that change its direction or display (U+200B, U+2028, U+2029, U+202A-U+202E, U+2060, U+2066-U+2069, U+FEFF)';
+// And emoji typed with the allowed VS16 / ZWJ, and a flag (re-check of #371).
+RTL_MARKED.push(`${String.fromCodePoint(0x2764, 0xFE0F)} Paris`, `${String.fromCodePoint(0x1F1EE, 0x1F1F1)} טיסה`, `1${String.fromCodePoint(0xFE0F, 0x20E3)} first`);
+const INVISIBLE_DETAIL = 'text may not contain invisible or blank-looking characters (zero-width, bidi, filler, tag or variation characters); LRM, RLM, ALM, ZWNJ, ZWJ and U+FE0F are allowed';
+// A confirmation number and a PIN refuse the allowed marks too (second re-check
+// of PR #373): RLM and ALM reorder the digits of a code on a Hebrew page.
+const CODE_DETAIL = 'a confirmation number or PIN may not contain invisible characters, not even LRM, RLM, ALM, ZWNJ, ZWJ or U+FE0F';
+const CODE_FIELDS = ['confirmation', 'pin'];
 const BOOKING_TYPES = ['flight', 'hotel', 'car', 'attraction', 'other'];
 // Links the WHATWG parser accepts by REWRITING them — refused, since the link
 // is stored as typed (follow-up 4).
@@ -242,6 +256,16 @@ describe('POST /api/bookings — links, dates, lengths', () => {
     for (const f of LINK_FIELDS) assert.equal(row[f], good);
   });
 
+  test('the link refusal names both accepted schemes — safeLink accepts http:// and https:// (#364 review)', async () => {
+    const r = await asAgent('/api/bookings', { method: 'POST', body: base({ [LINK_FIELDS[0]]: 'ftp://maps.example/x' }) });
+    assert.equal(r.status, 400, r.text);
+    assert.match(r.body.message.en, /http:\/\/ or https:\/\//);
+    assert.ok(r.body.message.he.includes('http:// או https://'), r.body.message.he);
+    // and the claim is true: an http:// link is accepted
+    const ok = await asAgent('/api/bookings', { method: 'POST', body: base({ [LINK_FIELDS[0]]: 'http://127.0.0.1:3000/a' }) });
+    assert.equal(ok.status, 200, ok.text);
+  });
+
   test('dates must be a real YYYY-MM-DD', async () => {
     for (const field of ['date_from', 'date_to']) {
       for (const value of ['2026-13-01', '2026-02-30', '12/02/2026', '2026-12-02T10:00', '<b>', '2026-1-2']) {
@@ -373,11 +397,13 @@ describe('follow-up 1 — invisible and direction-changing characters are refuse
     assert.ok(zw.body.message.he.startsWith("השדה 'קוד PIN' מכיל תו נסתר"), zw.body.message.he);
   });
 
+  // Every text field but the two code fields, which refuse the marks (below).
   test('Hebrew carrying RLM / LRM / ALM / ZWNJ / ZWJ, mixed with English, is stored exactly as typed — POST and PATCH', async () => {
+    const WORDS = TEXT_FIELDS.filter(f => !CODE_FIELDS.includes(f));
     for (const value of RTL_MARKED) {
-      const r = await api('/api/bookings', { method: 'POST', token: alice, body: base(Object.fromEntries(TEXT_FIELDS.map(f => [f, value]))) });
+      const r = await api('/api/bookings', { method: 'POST', token: alice, body: base(Object.fromEntries(WORDS.map(f => [f, value]))) });
       assert.equal(r.status, 200, `${JSON.stringify(value)}: ${r.text}`);
-      for (const f of TEXT_FIELDS) assert.equal(bookingRow(r.body.id)[f], value, `${f} stored as typed`);
+      for (const f of WORDS) assert.equal(bookingRow(r.body.id)[f], value, `${f} stored as typed`);
       const p = await asAgent(`/api/bookings/${r.body.id}`, { method: 'PATCH', body: { passengers: `${value} ${value}` } });
       assert.equal(p.status, 200, p.text);
       assert.equal(bookingRow(r.body.id).passengers, `${value} ${value}`);
@@ -534,6 +560,183 @@ describe('follow-up 5 — extract-draft keeps a numeric confirmation/PIN, and dr
     assert.equal(cleanText(0, F.pin), '0');
     assert.equal(cleanText(12.5, F.pin), '12.5');
     for (const v of [NaN, Infinity, -Infinity, { a: 1 }, ['1'], true]) assert.equal(cleanText(v, F.pin), null, String(v));
+  });
+});
+
+// ── boundary re-check of PR #371 (2026-10-12) ───────────────────────────────
+describe('re-check of #371 — a name made only of invisible or blank-looking characters is EMPTY; drafts drop the whole set', () => {
+  const ch = (cp) => String.fromCodePoint(cp);
+  const REQUIRED_EN = (label) => `The '${label}' field can't be empty. Fill it in and try again.`;
+
+  test('POST /api/bookings: a name of a lone U+3164 / U+2800 / U+200B / U+FEFF (or several, among spaces) → 400 text_required; nothing stored', async () => {
+    const before = bookingCount();
+    for (const name of [ch(0x3164), ch(0x2800), ch(0x200B), ch(0xFEFF), ch(0x00AD), ` ${ch(0x3164)} ${ch(0xFFA0)} `, ch(0xE0041).repeat(3)]) {
+      for (const who of [{ token: alice }, { apiKey: AGENT_KEY }]) {
+        const r = await api('/api/bookings', { method: 'POST', ...who, body: base({ name }) });
+        assert.equal(r.status, 400, `${JSON.stringify(name)}: ${r.text}`);
+        assert.deepEqual([r.body.error, r.body.field], ['text_required', 'name'], JSON.stringify(name));
+        assertBilingual(r.body, JSON.stringify(name));
+        assert.equal(r.body.message.en, REQUIRED_EN('booking name'));
+      }
+    }
+    assert.equal(bookingCount(), before);
+  });
+
+  test('PATCH /api/bookings/:id: renaming to a lone U+2800 → 400 text_required; the row is unchanged', async () => {
+    const id = (await asAgent('/api/bookings', { method: 'POST', body: base({ name: 'Blank Patch' }) })).body.id;
+    const row = bookingRow(id);
+    for (const name of [ch(0x2800), ch(0x3164), ch(0x200B)]) {
+      const r = await asAgent(`/api/bookings/${id}`, { method: 'PATCH', body: { name } });
+      assert.deepEqual([r.status, r.body.error, r.body.field], [400, 'text_required', 'name'], r.text);
+      assertBilingual(r.body, 'PATCH blank name');
+    }
+    assert.deepEqual(bookingRow(id), row);
+  });
+
+  test('POST /api/agent/participants: a name of a lone U+200B / U+3164 → 400 missing_fields with the empty-field message; nobody added', async () => {
+    const before = readFileSync(join(tripDir, 'trip.config.json'), 'utf8');
+    let n = 0;
+    for (const name of [ch(0x200B), ch(0x3164), `${ch(0x2800)} `]) {
+      const r = await asAgent('/api/agent/participants', { method: 'POST', body: { username: `blank${n++}x`, name } });
+      assert.deepEqual([r.status, r.body.error, r.body.field], [400, 'missing_fields', 'name'], r.text);
+      assert.equal(r.body.message.en, REQUIRED_EN('participant name'));
+      assertBilingual(r.body, 'blank participant');
+    }
+    assert.equal(readFileSync(join(tripDir, 'trip.config.json'), 'utf8'), before);
+  });
+
+  test('a visible name carrying one is still the hidden-character refusal, not the empty one', async () => {
+    const r = await asAgent('/api/bookings', { method: 'POST', body: base({ name: `Hotel${ch(0x3164)}` }) });
+    assert.deepEqual([r.status, r.body.error, r.body.detail], [400, 'invalid_text', INVISIBLE_DETAIL]);
+  });
+
+  test('extract-draft: every class of the widened set is removed from a draft; RLM/LRM/ZWJ/VS16 kept; a name of fillers alone is 422', async () => {
+    const junk = INVISIBLE_CPS.map(ch).join('');
+    const keep = `${ch(0x200F)}${ch(0x200E)}${ch(0x200D)}${ch(0xFE0F)}`;
+    nextExtraction = { phase: 'ny', type: 'hotel', name: `Hotel${junk} Plaza${keep}`, confirmation: `AB${ch(0x2063)}12`, passengers: `Dan${ch(0x00AD)} Cohen`, notes: `one${junk}\ntwo` };
+    const r = await asAgent('/api/bookings/extract-draft', { method: 'POST', body: { url: 'https://example.com/conf' } });
+    assert.equal(r.status, 201, r.text);
+    const b = r.body.booking;
+    assert.deepEqual([b.name, b.confirmation, b.passengers, b.notes], [`Hotel Plaza${keep}`, 'AB12', 'Dan Cohen', 'one\ntwo']);
+    nextExtraction = { phase: 'ny', type: 'hotel', name: `${ch(0x3164)}${ch(0x2800)}` };
+    const blank = await asAgent('/api/bookings/extract-draft', { method: 'POST', body: { url: 'https://example.com/conf' } });
+    assert.equal(blank.status, 422, blank.text);
+  });
+
+  test('the invisible-character message still fits siteClient\'s 300 characters, for every class, on every field', () => {
+    const rules = require('../server/text-rules.js');
+    let checked = 0;
+    for (const specs of [rules.BOOKING_FIELDS, rules.PARTICIPANT_FIELDS]) {
+      for (const [field, spec] of Object.entries(specs)) {
+        if (spec.kind !== 'line' && spec.kind !== 'multiline') continue;
+        for (const cp of INVISIBLE_CPS) {
+          const body = rules.checkField(field, `a${ch(cp)}b`, spec).error;
+          assert.equal(body?.detail, INVISIBLE_DETAIL, `${field}/U+${cp.toString(16)}`);
+          const json = JSON.stringify(body);
+          const en = JSON.stringify(body.message.en).slice(1, -1);
+          assert.ok(json.indexOf(en) + en.length <= 300, `${field}/U+${cp.toString(16)}: message ends past 300:\n${json}`);
+          checked++;
+        }
+      }
+    }
+    assert.ok(checked >= 8 * INVISIBLE_CPS.length, `checked ${checked}`);
+  });
+});
+
+// ── second boundary re-check of PR #373 (2026-10-12) ─────────────────────────
+describe('re-check of #373 — a name made only of allowed marks or combining marks is EMPTY; codes refuse the marks', () => {
+  const ch = (cp) => String.fromCodePoint(cp);
+  const REQUIRED_EN = (label) => `The '${label}' field can't be empty. Fill it in and try again.`;
+  // The values the re-check reported as stored (booking name, participant name).
+  const MARKS_ONLY = [[0x200F], [0x200E, 0x200F], [0x200D], [0xFE0F], [0x061C], [0x200C], [0x0301], [0x05B8]].map(cps => cps.map(ch).join(''));
+  MARKS_ONLY.push(` ${ch(0x0301)} `);
+
+  test('POST and PATCH /api/bookings: a name of nothing but marks → 400 text_required, both languages; nothing stored', async () => {
+    const before = bookingCount();
+    const id = (await asAgent('/api/bookings', { method: 'POST', body: base({ name: 'Marks Patch' }) })).body.id;
+    const row = bookingRow(id);
+    for (const name of MARKS_ONLY) {
+      for (const r of [
+        await api('/api/bookings', { method: 'POST', token: alice, body: base({ name }) }),
+        await asAgent('/api/bookings', { method: 'POST', body: base({ name }) }),
+        await asAgent(`/api/bookings/${id}`, { method: 'PATCH', body: { name } }),
+      ]) {
+        assert.deepEqual([r.status, r.body.error, r.body.field], [400, 'text_required', 'name'], `${JSON.stringify(name)}: ${r.text}`);
+        assertBilingual(r.body, JSON.stringify(name));
+        assert.equal(r.body.message.en, REQUIRED_EN('booking name'));
+      }
+    }
+    assert.equal(bookingCount(), before + 1);
+    assert.deepEqual(bookingRow(id), row);
+  });
+
+  test('POST /api/agent/participants: a name of nothing but marks → 400 missing_fields with the empty-field message; nobody added', async () => {
+    const before = readFileSync(join(tripDir, 'trip.config.json'), 'utf8');
+    let n = 0;
+    for (const name of MARKS_ONLY) {
+      const r = await asAgent('/api/agent/participants', { method: 'POST', body: { username: `marks${n++}x`, name } });
+      assert.deepEqual([r.status, r.body.error, r.body.field], [400, 'missing_fields', 'name'], `${JSON.stringify(name)}: ${r.text}`);
+      assert.equal(r.body.message.en, REQUIRED_EN('participant name'));
+    }
+    assert.equal(readFileSync(join(tripDir, 'trip.config.json'), 'utf8'), before);
+  });
+
+  test('a real name carrying marks is stored as typed: Hebrew with niqqud and RLM, a Persian ZWNJ word, an accent on a letter', async () => {
+    for (const name of [`${ch(0x05E9)}${ch(0x05B8)}${ch(0x05DC)}${ch(0x05D5)}${ch(0x05B9)}${ch(0x05DD)}${ch(0x200F)} Hotel`,
+      `${ch(0x0645)}${ch(0x06CC)}${ch(0x200C)}${ch(0x062E)}${ch(0x0648)}${ch(0x0627)}${ch(0x0647)}${ch(0x0645)}`, `Cafe${ch(0x0301)}`, `${ch(0x2764)}${ch(0xFE0F)}`]) {
+      const r = await asAgent('/api/bookings', { method: 'POST', body: base({ name }) });
+      assert.equal(r.status, 200, `${JSON.stringify(name)}: ${r.text}`);
+      assert.equal(bookingRow(r.body.id).name, name);
+    }
+  });
+
+  test('confirmation / PIN with an RLM (or any of the six marks) → 400 invalid_text, the invisible message, the code detail — POST and PATCH; nothing stored', async () => {
+    const before = bookingCount();
+    const id = (await asAgent('/api/bookings', { method: 'POST', body: base({ name: 'Code Patch', confirmation: 'AB123' }) })).body.id;
+    const row = bookingRow(id);
+    for (const field of CODE_FIELDS) {
+      for (const cp of [0x200E, 0x200F, 0x061C, 0x200C, 0x200D, 0xFE0F]) {
+        const value = `123${ch(cp)}456`;
+        for (const r of [
+          await api('/api/bookings', { method: 'POST', token: alice, body: base({ [field]: value }) }),
+          await asAgent(`/api/bookings/${id}`, { method: 'PATCH', body: { [field]: value } }),
+        ]) {
+          assert.deepEqual([r.status, r.body.error, r.body.field, r.body.detail], [400, 'invalid_text', field, CODE_DETAIL], `${field}/U+${cp.toString(16)}: ${r.text}`);
+          assertBilingual(r.body, `${field}/U+${cp.toString(16)}`);
+          assert.match(r.body.message.en, /hidden character/);
+        }
+      }
+    }
+    assert.equal(bookingCount(), before + 1);
+    assert.deepEqual(bookingRow(id), row);
+  });
+
+  test('the other direction: a Hebrew booking name, passengers and notes with an RLM are stored as typed, next to a plain confirmation', async () => {
+    const name = `${ch(0x05DE)}${ch(0x05DC)}${ch(0x05D5)}${ch(0x05DF)}${ch(0x200F)} Hilton`;
+    const r = await asAgent('/api/bookings', { method: 'POST', body: base({ name, passengers: `${ch(0x05D3)}${ch(0x05DF)}${ch(0x200F)} Cohen`, notes: `${ch(0x05E7)}${ch(0x200F)} 5`, confirmation: 'LY-001', pin: '1234' }) });
+    assert.equal(r.status, 200, r.text);
+    const row = bookingRow(r.body.id);
+    assert.deepEqual([row.name, row.confirmation, row.pin], [name, 'LY-001', '1234']);
+  });
+
+  test('extract-draft: a name of RLM LRM (what it stored before) is 422; marks in a drafted confirmation are dropped, kept in the name', async () => {
+    nextExtraction = { phase: 'ny', type: 'hotel', name: `${ch(0x200F)}${ch(0x200E)}` };
+    const blank = await asAgent('/api/bookings/extract-draft', { method: 'POST', body: { url: 'https://example.com/conf' } });
+    assert.equal(blank.status, 422, blank.text);
+    nextExtraction = { phase: 'ny', type: 'hotel', name: `Plaza${ch(0x200F)}`, confirmation: `123${ch(0x200F)}456`, pin: `12${ch(0x061C)}34` };
+    const r = await asAgent('/api/bookings/extract-draft', { method: 'POST', body: { url: 'https://example.com/conf' } });
+    assert.equal(r.status, 201, r.text);
+    assert.deepEqual([r.body.booking.name, r.body.booking.confirmation, r.body.booking.pin], [`Plaza${ch(0x200F)}`, '123456', '1234']);
+  });
+
+  test('the code-field refusal still fits siteClient\'s 300 characters', () => {
+    const rules = require('../server/text-rules.js');
+    for (const field of CODE_FIELDS) {
+      const body = rules.checkField(field, `1${ch(0x200F)}2`, rules.BOOKING_FIELDS[field]).error;
+      const json = JSON.stringify(body);
+      const en = JSON.stringify(body.message.en).slice(1, -1);
+      assert.ok(json.indexOf(en) + en.length <= 300, json);
+    }
   });
 });
 

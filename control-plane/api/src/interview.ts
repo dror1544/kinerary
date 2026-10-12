@@ -2011,17 +2011,17 @@ export const REASK_GAP_PHRASES: Readonly<Record<string, Readonly<Record<Language
     ],
     he: [
       "תודה, זה עוזר. מה שעוד חסר לי זה איפה תהיו לאורך הדרך — העיר או האזור שבו תהיו בכל חלק של הטיול, לפי הסדר.",
-      "כדי לפרוש את הטיול אני צריך את המקומות שבהם תלונו — רק העיר או האזור לכל חלק, לפי הסדר. טיולי יום אפשר להשאיר לאחר כך.",
+      "כדי לסדר את מסלול הטיול אני צריך את המקומות שבהם תלונו — רק העיר או האזור לכל חלק, לפי הסדר. טיולי יום אפשר להשאיר לאחר כך.",
     ],
   },
   phases: {
     en: [
       "Thanks, that helps. To set up the stops I still need two things: the places, in order, and roughly when you'll be in each one.",
-      "Nearly there with the stops — a place and rough dates for each part of the trip is all I need. Where you sleep can come later if it isn't booked.",
+      "Nearly there with the stops — a place and rough dates for each part of the trip is all I need. You can add the hotel name later if you have not booked it yet.",
     ],
     he: [
       "תודה, זה עוזר. כדי לסדר את התחנות חסרים לי עוד שני דברים: המקומות לפי הסדר, ובערך מתי תהיו בכל אחד מהם.",
-      "כמעט סיימנו עם התחנות — מקום ותאריכים משוערים לכל חלק של הטיול זה כל מה שצריך. איפה ישנים אפשר להוסיף אחר כך, אם עוד לא הזמנתם.",
+      "כמעט סיימנו עם התחנות — מקום ותאריכים משוערים לכל חלק של הטיול זה כל מה שצריך. את שם המלון אפשר להוסיף אחר כך, אם עוד לא הזמנתם.",
     ],
   },
   destination: {
@@ -2076,12 +2076,12 @@ export const REASK_GAP_PHRASES: Readonly<Record<string, Readonly<Record<Language
   },
   bot_name: {
     en: [
-      "Thanks. What I still need is a name for the trip assistant — the name the family would actually type.",
-      "Just a name for the assistant — anything short the family will use.",
+      "Thanks. What I still need is a name for the trip assistant — the name the travellers would actually type.",
+      "Just a name for the assistant — anything short the travellers will use.",
     ],
     he: [
-      "תודה. מה שעוד חסר לי זה שם לעוזר של הטיול — השם שהמשפחה באמת תקליד.",
-      "רק שם לעוזר — משהו קצר שהמשפחה תשתמש בו.",
+      "תודה. מה שעוד חסר לי זה שם לעוזר של הטיול — השם שהנוסעים באמת יקלידו.",
+      "רק שם לעוזר — משהו קצר שהנוסעים ישתמשו בו.",
     ],
   },
   choice: {

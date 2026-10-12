@@ -572,6 +572,19 @@ describe('mcp/mcp.js stop tools — against the real trip server (the colmar tri
     assert.deepEqual(result.stop.accommodation, { name: { he: 'מלון קולמר', en: 'Hotel Colmar' }, type: 'hotel' });
     assert.deepEqual((await phase('colmar')).accommodation, { name: { he: 'מלון קולמר', en: 'Hotel Colmar' }, type: 'hotel' });
   });
+
+  // Review of #362, finding 4: the tool schemas check the shape only; the site
+  // checks the calendar, and its refusal reaches the model saying so.
+  test('update_stop and split_stop: a day that is not on the calendar passes the shape check, the site refuses it, the hint names the calendar', async () => {
+    const before = (await phase('colmar')).dates;
+    const dates = parseToolError(await mcpCallTool('update_stop', { phase_id: 'colmar', start: '2026-12-02', end: '2026-12-32' }));
+    assert.match(dates, /400 invalid_dates/);
+    assert.match(dates, /real calendar day/);
+    assert.deepEqual((await phase('colmar')).dates, before, 'nothing stored');
+    const split = parseToolError(await mcpCallTool('split_stop', { phase_id: 'colmar', at_date: '2026-11-31', title_en: 'X' }));
+    assert.match(split, /400 invalid_split_date/);
+    assert.match(split, /real calendar day/);
+  });
 });
 
 // ── 3. server/trip-mcp/tools.js — write gating and routes ────────────────────
@@ -597,6 +610,8 @@ describe('server/trip-mcp/tools.js stop tools — absent on a read-only connecti
       if (path === '/api/stops/colmar/from-booking' && body.booking_id === 13) refuse(method, path, 400, { error: 'invalid_text', field: 'accommodation.name', source: 'booking' });
       if (path === '/api/stops/colmar/from-booking' && body.booking_id === 14) refuse(method, path, 400, { error: 'invalid_link', field: 'accommodation.location_url', source: 'booking' });
       if (path === '/api/stops/colmar' && body?.dates?.start === '2026-12-04' && !body.on_outside) refuse(method, path, 409, { error: 'items_outside_stop', items: OUTSIDE_ITEMS });
+      if (path === '/api/stops/colmar' && body?.dates?.end === '2026-12-32') refuse(method, path, 400, { error: 'invalid_dates' });
+      if (path === '/api/stops/colmar/split' && body.at === '2026-11-31') refuse(method, path, 400, { error: 'invalid_split_date' });
       if (path === '/api/stops/colmar/split') return { stops: [COLMAR, { id: 'near-the-airport' }] };
       return { ok: true, stop: { id: 'colmar' } };
     };
@@ -727,6 +742,16 @@ describe('server/trip-mcp/tools.js stop tools — absent on a read-only connecti
       assert.equal(outside.isError, true);
       assert.match(outside.content[0].text, /items_outside_stop/);
       assert.match(outside.content[0].text, /on_outside/);
+      // Review of #362, finding 4: shape-valid, calendar-invalid — the site's
+      // refusal carries the calendar hint.
+      const dates = await client.callTool({ name: 'update_stop', arguments: { phase_id: 'colmar', start: '2026-12-02', end: '2026-12-32' } });
+      assert.equal(dates.isError, true);
+      assert.match(dates.content[0].text, /invalid_dates/);
+      assert.match(dates.content[0].text, /real calendar day/);
+      const at = await client.callTool({ name: 'split_stop', arguments: { phase_id: 'colmar', at_date: '2026-11-31', title_en: 'x' } });
+      assert.equal(at.isError, true);
+      assert.match(at.content[0].text, /invalid_split_date/);
+      assert.match(at.content[0].text, /real calendar day/);
     } finally { await close(); }
   });
 });

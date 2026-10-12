@@ -388,6 +388,8 @@ const STOP_REFUSAL_HINTS = {
   booking_not_found: 'No booking with that id — call get_bookings.',
   unknown_stop: 'No stop with that id — call get_stops.',
   unplanned_stop_is_computed: 'That is the computed "days not planned yet" block, not a stop. Change a real stop\'s dates, split one, or move a day with move_plan_day.',
+  invalid_dates: 'Stop dates are { start, end }, each YYYY-MM-DD and a real calendar day (no February 30 — the site checks the calendar), start <= end. Ask the organizer which day they meant.',
+  invalid_split_date: 'at_date must be YYYY-MM-DD and a real calendar day (the site checks the calendar). Ask the organizer which day they meant.',
   stop_has_no_dates: 'This stop has no dates yet; set them with update_stop or set_stop_from_booking first.',
   split_date_not_inside_stop: 'at_date must be strictly inside the stop, so both stops keep a night.',
   new_stop_title_required: 'The new stop needs a title.',
@@ -430,7 +432,7 @@ function explainStopRefusal(err) {
 // survives siteClient()'s 300-character cap; it is lifted out here and named,
 // so the assistant relays it rather than paraphrasing the JSON.
 const WRITE_REFUSAL_HINTS = {
-  invalid_text: 'The text in "field" has a character the site does not store: < or >, a control character (a line break is allowed only in notes), or an invisible character that changes the text\'s direction or display (often pasted in; Hebrew\'s own RLM/LRM marks are fine). Quotes are fine and are stored as typed (ארה"ב, 55" TV).',
+  invalid_text: 'The text in "field" has a character the site does not store: < or >, a control character (a line break is allowed only in notes), or an invisible character that changes the text\'s direction or display (often pasted in; Hebrew\'s own RLM/LRM marks are fine, except in a confirmation number or PIN, which take none). Quotes are fine and are stored as typed (ארה"ב, 55" TV).',
   invalid_link: 'The link in "field" must be a full address starting http:// or https://, with a real host and no quotes, spaces, backslashes or < >.',
   invalid_date: 'The date in "field" must be YYYY-MM-DD (a real date).',
   text_too_long: 'The text in "field" is longer than the site keeps.',

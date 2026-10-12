@@ -155,6 +155,8 @@ const STOP_REFUSAL_HINTS = {
   booking_not_found: 'No booking with that id — call get_bookings.',
   unknown_stop: 'No stop with that id — call get_stops for the valid ids.',
   unplanned_stop_is_computed: 'That is the computed "days not planned yet" block, not a stop. Cover those days by changing a real stop\'s dates or splitting one, or move a planned day onto a stop with move_plan_day.',
+  invalid_dates: 'A stop\'s dates are { start, end }, each YYYY-MM-DD and a real calendar day (no February 30, no April 31 — the site checks the calendar, not only the shape), with start on or before end. Ask the organizer for the day they meant; do not guess one.',
+  invalid_split_date: 'at_date must be YYYY-MM-DD and a real calendar day (the site checks the calendar, not only the shape: 2027-02-30 is refused). Ask the organizer for the day they meant.',
   stop_has_no_dates: 'This stop has no dates yet. Set them first, with update_stop (start and end) or set_stop_from_booking.',
   split_date_not_inside_stop: 'at_date must be strictly after the stop\'s first day and strictly before its last, so both stops keep at least one night.',
   new_stop_title_required: 'The new stop needs a title (title_he and/or title_en).',
@@ -218,7 +220,7 @@ async function stopsApi(method, path, body, { ifMatch } = {}) {
 // the model what to do with it. The twin of this table is WRITE_REFUSAL_HINTS
 // in server/trip-mcp/tools.js.
 const WRITE_REFUSAL_HINTS = {
-  invalid_text: 'The text in "field" has a character the site does not store: < or >, a control character (a line break is allowed only in notes), or an invisible character that changes the text\'s direction or display (often pasted in; Hebrew\'s own RLM/LRM marks are fine). Quotes are fine and are stored as typed (ארה"ב, 55" TV).',
+  invalid_text: 'The text in "field" has a character the site does not store: < or >, a control character (a line break is allowed only in notes), or an invisible character that changes the text\'s direction or display (often pasted in; Hebrew\'s own RLM/LRM marks are fine, except in a confirmation number or PIN, which take none). Quotes are fine and are stored as typed (ארה"ב, 55" TV).',
   invalid_link: 'The link in "field" must be a full address starting http:// or https://, with a real host and no quotes, spaces, backslashes or < >.',
   invalid_date: 'The date in "field" must be YYYY-MM-DD (a real date).',
   text_too_long: 'The text in "field" is longer than the site keeps ("max" characters).',

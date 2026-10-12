@@ -37,6 +37,8 @@ const { moveDayRows } = require('./living-journey');
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const STOP_ID_RE = /^[a-z0-9][a-z0-9-]{0,47}$/;
+// The ids withOpenDays() issues: `open-days`, `open-days-2`, …
+const OPEN_DAYS_ID_RE = /^open-days(?:-[1-9]\d{0,3})?$/;
 // A stop id is used as a key wherever a phase is looked up by id — a plain
 // object keyed by `constructor` answers with Object's own constructor
 // (boundary review 2026-10-11, finding 5). Refused whatever the case, since
@@ -56,6 +58,8 @@ const ACCOMMODATION_KEYS = Object.assign(Object.create(null), {
 });
 // Free text that may run over several lines; every other text field is one line.
 const MULTILINE_KEYS = new Set(['description', 'note']);
+// A code, not text in a language: refuses the allowed marks too (CODE_MARKS_RE).
+const CODE_KEYS = new Set(['confirmation']);
 
 // STORED TEXT IS NEVER MARKUP (boundary review 2026-10-11, finding 1). Every
 // value a stop write accepts reaches /api/config, and a renderer that builds
@@ -79,27 +83,45 @@ const MULTILINE_KEYS = new Set(['description', 'note']);
 //
 // Fifth boundary review (2026-10-11), the same three follow-ups as the booking
 // rules in server/text-rules.js (which explains each): invisible and
-// direction-changing characters are refused too (U+202A-U+202E, U+2066-U+2069,
-// U+2028/U+2029, U+FEFF, U+200B, U+2060 — never LRM, RLM, ALM, ZWNJ or ZWJ,
-// which Hebrew and emoji are typed with), with their own `detail` and the same
+// blank-looking characters are refused too (every Default_Ignorable_Code_Point,
+// plus U+2028/U+2029, U+2800 and U+FFFC, since the boundary re-check of PR #371,
+// and U+070F, U+16FE4 and U+FFF9-U+FFFB since the second re-check of #373
+// — never LRM, RLM, ALM, ZWNJ, ZWJ or VS16, which Hebrew, Arabic, Persian and
+// emoji are typed with; text-rules.js lists the set), with their own `detail` and the same
 // invalid_text code — the stop routes answer { error, field, detail } and no
 // bilingual message, and keep that shape; a description's or note's \r\n and
 // lone \r become \n before the check (toLf); and a link the URL parser would
 // have to rewrite is refused.
-// TWIN: UNSAFE_LINE_RE, UNSAFE_MULTILINE_RE, INVISIBLE_RE, TEXT_DETAIL,
-// INVISIBLE_DETAIL, LINK_DETAIL, LINK_HOST_HIDDEN_RE, LINK_LABEL_DOT_RE, toLf,
-// textDetail() and safeLink() are byte-identical copies of the same names in
+// A title, tab label or emoji made only of such characters is therefore
+// refused as invalid_text before textValue()'s blank check could see it.
+// Second boundary re-check of PR #373 (2026-10-12), text-rules.js's BLANK and
+// CODES: a text value made only of whitespace, the allowed marks and combining
+// marks (\p{M}) is blank — the field's own blank refusal (invalid_title,
+// invalid_tabLabel, invalid_emoji, invalid_accommodation), and a blank member
+// of a { he, en } pair is stored as '' exactly as a whitespace one always was —
+// and accommodation.confirmation refuses the allowed marks too (invalid_text,
+// CODE_DETAIL): they reorder a code's digits on a right-to-left page.
+// TWIN: ALLOWED_MARKS, INVISIBLE_SRC, UNSAFE_LINE_RE, UNSAFE_MULTILINE_RE, INVISIBLE_RE,
+// BLANK_ALL_RE, CODE_MARKS_RE, TEXT_DETAIL, INVISIBLE_DETAIL, CODE_DETAIL, LINK_DETAIL,
+// LINK_HOST_HIDDEN_RE, LINK_LABEL_DOT_RE, toLf, isBlankText, textDetail() and
+// safeLink() are byte-identical copies of the same names in
 // server/text-rules.js; tests/stop-hardening.test.js ("the twins") compares
 // them. Change one, change both.
-const UNSAFE_LINE_RE = /[<>\u0000-\u001F\u007F-\u009F\u200B\u2028\u2029\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/;
-const UNSAFE_MULTILINE_RE = /[<>\u0000-\u0009\u000B-\u001F\u007F-\u009F\u200B\u2028\u2029\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/;
-const INVISIBLE_RE = /[\u200B\u2028\u2029\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/;
+const ALLOWED_MARKS = String.raw`\u200C-\u200F\u061C\uFE0F`;
+const INVISIBLE_SRC = String.raw`(?![${ALLOWED_MARKS}])[\p{Default_Ignorable_Code_Point}\u070F\u2028\u2029\u2800\uFFF9-\uFFFC\u{16FE4}]`;
+const UNSAFE_LINE_RE = new RegExp(String.raw`[<>\u0000-\u001F\u007F-\u009F]|` + INVISIBLE_SRC, 'u');
+const UNSAFE_MULTILINE_RE = new RegExp(String.raw`[<>\u0000-\u0009\u000B-\u001F\u007F-\u009F]|` + INVISIBLE_SRC, 'u');
+const INVISIBLE_RE = new RegExp(INVISIBLE_SRC, 'u');
+const BLANK_ALL_RE = new RegExp(String.raw`[\s\p{M}${ALLOWED_MARKS}]|` + INVISIBLE_SRC, 'gu');
+const CODE_MARKS_RE = new RegExp(`[${ALLOWED_MARKS}]`, 'u');
 const TEXT_DETAIL = 'text may not contain < > or control characters';
-const INVISIBLE_DETAIL = 'text may not contain invisible characters that change its direction or display (U+200B, U+2028, U+2029, U+202A-U+202E, U+2060, U+2066-U+2069, U+FEFF)';
+const INVISIBLE_DETAIL = 'text may not contain invisible or blank-looking characters (zero-width, bidi, filler, tag or variation characters); LRM, RLM, ALM, ZWNJ, ZWJ and U+FE0F are allowed';
+const CODE_DETAIL = 'a confirmation number or PIN may not contain invisible characters, not even LRM, RLM, ALM, ZWNJ, ZWJ or U+FE0F';
 const LINK_DETAIL = 'a link must start with http:// or https://, name its host as the browser will use it, and contain no quotes, backslashes, < >, or whitespace';
-const LINK_HOST_HIDDEN_RE = /[\u00AD\u034F\u180B-\u180D\u180F\u200B\u2028\u2029\u202A-\u202E\u2060\u2064\u2066-\u2069\uFE00-\uFE0F\uFEFF\u{1BCA0}-\u{1BCA3}\u{E0100}-\u{E01EF}]/u;
+const LINK_HOST_HIDDEN_RE = /[\u00AD\u034F\u180B-\u180D\u180F\u200B\u2028\u2029\u202A-\u202E\u2060\u2064\u2066-\u2069\u2800\uFE00-\uFE0F\uFEFF\u{16FE4}\u{1BCA0}-\u{1BCA3}\u{E0100}-\u{E01EF}]/u;
 const LINK_LABEL_DOT_RE = /[.。．｡]/;
 const toLf = (s) => s.replace(/\r\n?/g, '\n');
+const isBlankText = (s) => !s.replace(BLANK_ALL_RE, '');
 const STOP_FIELDS = ['dates', 'accommodation', 'title', 'tabLabel', 'emoji'];
 const OPEN_TITLE = { he: 'ימים שעוד לא תוכננו', en: 'Days not planned yet' };
 // The same sentence the provisioner writes, so an unchanged trip serves
@@ -117,9 +139,28 @@ const readJson = (v, fallback) => { if (v == null) return fallback; try { return
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const sameJson = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 
+// A YYYY-MM-DD string that names a day on the calendar. The shape alone is
+// not enough, and neither is Date.parse: '2027-02-30' parses (it rolls over to
+// March 2), and was stored as February 30 (review of #362, finding 4). The day
+// has to come back unchanged from the round trip. The same check as
+// server/text-rules.js's date rule (#364); not shared with it, because that
+// file's exports are the twin rules and are not edited from here.
+function isCalendarDay(s) {
+  if (typeof s !== 'string' || !ISO_DATE_RE.test(s)) return false;
+  const t = Date.parse(`${s}T00:00:00Z`);
+  return !Number.isNaN(t) && new Date(t).toISOString().slice(0, 10) === s;
+}
+// A day READ from somewhere the layer does not control — the config, a
+// booking row, a plan row — which may carry a time after the date.
 function isoDay(value) {
   const s = typeof value === 'string' ? value.slice(0, 10) : '';
-  return ISO_DATE_RE.test(s) && !Number.isNaN(Date.parse(`${s}T00:00:00Z`)) ? s : null;
+  return isCalendarDay(s) ? s : null;
+}
+// A day a caller SENDS: exactly YYYY-MM-DD, nothing after it, on the calendar.
+// Every date input of the stop layer goes through this one (stop dates, a
+// split's `at`).
+function inputDay(value) {
+  return isCalendarDay(value) ? value : null;
 }
 function addDays(day, n) {
   const d = new Date(`${day}T00:00:00Z`);
@@ -172,15 +213,17 @@ function schema(db) {
 }
 
 // ── validation ───────────────────────────────────────────────────────────────
+// Blank (isBlankText) is what whitespace alone always was: a lone string is
+// refused, a { he, en } member is stored as ''.
 function textValue(v) {
-  if (typeof v === 'string') return v.trim() && v.length <= MAX_TEXT ? v.trim() : undefined;
+  if (typeof v === 'string') return !isBlankText(v) && v.length <= MAX_TEXT ? v.trim() : undefined;
   if (isObj(v)) {
     const keys = Object.keys(v);
     if (!keys.length || keys.some(k => !['he', 'en'].includes(k))) return undefined;
     const out = {};
     for (const k of keys) {
       if (typeof v[k] !== 'string' || v[k].length > MAX_TEXT) return undefined;
-      out[k] = v[k].trim();
+      out[k] = isBlankText(v[k]) ? '' : v[k].trim();
     }
     return Object.values(out).some(Boolean) ? out : undefined;
   }
@@ -274,6 +317,7 @@ function validateAccommodation(value, path = 'accommodation') {
     } else {
       const bad = unsafeTextAt(raw, field, { multiline: MULTILINE_KEYS.has(key) });
       if (bad) return { error: invalidText(bad) };
+      if (CODE_KEYS.has(key) && typeof raw === 'string' && CODE_MARKS_RE.test(raw)) return { error: invalidText({ field, detail: CODE_DETAIL }) };
       v = kind === 'text' ? textValue(raw) : scalarValue(raw);
     }
     if (v === undefined) return { error: fail(400, 'invalid_accommodation', { field: key }) };
@@ -285,10 +329,10 @@ function validateAccommodation(value, path = 'accommodation') {
 function validateDates(value) {
   if (value === null) return { value: null };
   if (!isObj(value)) return { error: fail(400, 'invalid_dates') };
-  const start = typeof value.start === 'string' && ISO_DATE_RE.test(value.start) ? isoDay(value.start) : null;
-  const end = typeof value.end === 'string' && ISO_DATE_RE.test(value.end) ? isoDay(value.end) : null;
+  const start = inputDay(value.start);
+  const end = inputDay(value.end);
   if (!start || !end || start > end || Object.keys(value).some(k => !['start', 'end'].includes(k))) {
-    return { error: fail(400, 'invalid_dates', { detail: 'dates must be { start, end } as YYYY-MM-DD, start <= end' }) };
+    return { error: fail(400, 'invalid_dates', { detail: 'dates must be { start, end } as YYYY-MM-DD, real calendar days, start <= end' }) };
   }
   return { value: { start, end } };
 }
@@ -325,7 +369,7 @@ function validateStopFields(body, { allowed = STOP_FIELDS, extra = [], prefix = 
     if (body[key] === undefined) continue;
     const bad = unsafeTextAt(body[key], `${prefix}${key}`);
     if (bad) return { error: invalidText(bad) };
-    if (typeof body[key] !== 'string' || !body[key].trim() || body[key].length > max) return { error: fail(400, `invalid_${key}`) };
+    if (typeof body[key] !== 'string' || isBlankText(body[key]) || body[key].length > max) return { error: fail(400, `invalid_${key}`) };
     fields[key] = body[key].trim();
   }
   return { fields };
@@ -337,6 +381,40 @@ function parseOnOutside(value) {
   const m = typeof value === 'string' ? /^move_to:(.+)$/.exec(value) : null;
   if (m) return { mode: 'move', target: m[1] };
   return { error: true };
+}
+
+// A history id as a caller sends it: a positive safe integer, as a JSON number
+// or as a string of ASCII digits. Number() took `true` as 1 and [7], "0x7" and
+// " 7 " as 7 (second boundary re-check of PR #373); anything but these two
+// shapes is null, and the route answers invalid_history_id.
+function historyIdOf(value) {
+  const n = typeof value === 'number' ? value : typeof value === 'string' && /^[0-9]+$/.test(value) ? Number(value) : NaN;
+  return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
+// A snapshot's fields, checked as a PATCH of them would be today. A snapshot
+// is what an OLDER server stored: one that let U+2063 into a title, U+3164 into
+// a tab label or February 30 into the dates (second boundary re-check of PR
+// #373) would write them back on a restore. Returns { fields } — what today's
+// rules make of them, the value written — or { error }: 400
+// history_entry_invalid, naming the snapshot field and carrying the refusal
+// it got (`cause`, `detail`), so the organizer knows which value to fix.
+function recheckSnapshot(fields, historyId) {
+  if (!isObj(fields)) return { fields: {} };
+  const out = {};
+  for (const key of Object.keys(fields)) {
+    const r = validateStopFields({ [key]: fields[key] });
+    if (r.error) {
+      const inner = r.error.body;
+      const at = typeof inner.field === 'string' && inner.field !== key && !inner.field.startsWith(`${key}.`) ? `${key}.${inner.field}` : inner.field || key;
+      return { error: fail(400, 'history_entry_invalid', {
+        history_id: historyId, field: at, cause: inner.error, ...(inner.detail ? { detail: inner.detail } : {}),
+        hint: 'this snapshot breaks a rule added since it was saved: revert to the config (no history_id) or PATCH a corrected value',
+      }) };
+    }
+    Object.assign(out, r.fields);
+  }
+  return { fields: out };
 }
 
 function slugify(text) {
@@ -355,9 +433,13 @@ function applyFields(phase, fields) {
   const out = { ...phase };
   if (Object.hasOwn(fields, 'dates')) {
     if (fields.dates === null) {
+      // Deleted, never set to null (review of #362, finding 1): a legacy
+      // phase's top-level start/end served as null fails the Modern site's
+      // config schema (trip-web/src/api.ts: optional strings), and with it
+      // the whole config on the next refetch. Absent is what "no dates" is.
       delete out.dates;
-      if (typeof out.start === 'string' && out.start) out.start = null;
-      if (typeof out.end === 'string' && out.end) out.end = null;
+      delete out.start;
+      delete out.end;
     } else {
       // `dates.display` is text written for the old range; it does not survive.
       out.dates = { start: fields.dates.start, end: fields.dates.end };
@@ -407,6 +489,7 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
     remove: db.prepare('DELETE FROM trip_stop_overrides WHERE phase_id = ?'),
     history: db.prepare('INSERT INTO trip_stop_history (phase_id, action, before_state, after_state, actor, note) VALUES (?, ?, ?, ?, ?, ?)'),
     maxHistory: db.prepare('SELECT COALESCE(MAX(id), 0) AS id FROM trip_stop_history'),
+    totalChanges: db.prepare('SELECT total_changes() AS n'),
     historyFor: db.prepare('SELECT id, phase_id, action, before_state, after_state, actor, note, created_at FROM trip_stop_history WHERE phase_id = ? ORDER BY id ASC'),
     historyRow: db.prepare('SELECT * FROM trip_stop_history WHERE id = ?'),
     reparent: db.prepare('UPDATE trip_stop_overrides SET after_phase_id = ? WHERE after_phase_id = ?'),
@@ -534,19 +617,80 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
   function basePhase(id) {
     return (base().phases || []).find(p => p?.id === id) || null;
   }
-  // A phase id any route may file plan rows under: a stop as it is now, or
-  // any phase the config itself names (an open-days id the computation no
-  // longer produces stays reachable, so nothing filed under it is orphaned).
+  // A phase id any route may file plan rows under: a stop as it is now, any
+  // phase the config itself names (an open-days id the computation no longer
+  // produces stays reachable, so nothing filed under it is orphaned), or a
+  // computed open-days id something saved still names (below).
   function isPhase(id) {
     if (typeof id !== 'string' || !id) return false;
-    return Boolean(effectivePhase(id) || basePhase(id));
+    return Boolean(effectivePhase(id) || basePhase(id) || referencedComputed(id));
   }
   // A real stop: not a computed open-days phase.
   function isStop(id) {
     return typeof id === 'string' && current().realIds.has(id);
   }
   function isComputed(id) {
-    return isUnplanned(effectivePhase(id)) || isUnplanned(basePhase(id));
+    return isUnplanned(effectivePhase(id)) || isUnplanned(basePhase(id)) || referencedComputed(id);
+  }
+
+  // A COMPUTED ID OUTLIVES ITS GAP WHILE ROWS USE IT (review of #362,
+  // finding 2). The open-days ids are numbered by position: date a stop in
+  // the middle of the open days and they become open-days-1 / open-days-2;
+  // a plan row filed under open-days-2 keeps that id. Extend the stop to the
+  // trip's end and the one gap left is plain `open-days` again — and
+  // open-days-2 was no phase at all: every Classic/MCP plan route and
+  // move-day refused it, and the row could be neither read, edited, deleted
+  // nor moved off. So an open-days id that a plan item, a day headline
+  // (active plan or the Classic tables) or a booking still names stays
+  // reachable — an EMPTY day row does not count, as in withOpenDays(): it is
+  // what a moved or deleted item leaves behind, holds nothing to reach, and
+  // would otherwise keep the id alive for good —
+  // derived from the rows on each lookup, not stored: no marker table, no
+  // rewrite of anyone's rows, and it lapses by itself once the last row
+  // moves off. It stays computed, never a stop (PATCH/split/from-booking/
+  // revert/DELETE answer unplanned_stop_is_computed), and it is not added to
+  // the config: /api/config serves only the gaps that exist.
+  // Only where the config carries the open-days convention (the layer never
+  // invents it), and only for an id of the shape the computation issues; a
+  // real stop of that name is refused at split and is a stop anyway.
+  //
+  // CHEAP (second boundary re-check of PR #373). The lookup used to re-read
+  // every row of the plan and run three queries on EVERY call, so a member
+  // asking for open-days-9999 cost ~55x an unknown id on a 20,000-item plan.
+  // Now the set of open-days ids anything names is built once per state of
+  // the data and kept (referencedIds): every lookup until the data changes is
+  // a Set lookup, with no row read at all, whatever the id. The state is
+  // keyed by the stop history's revision, the active plan's revision and
+  // SQLite's total_changes() — this connection's count of every row any
+  // INSERT, UPDATE or DELETE touched, the Classic tables and bookings
+  // included — so the id still lapses the moment its last row moves away.
+  // (The server opens the trip database once, so no write escapes the
+  // counter.) A numeric bound on N was considered and not used: a range that
+  // shrank on a rebuild would orphan rows filed under a higher id, which is
+  // the bug finding 2 fixed.
+  let referenced = null;
+  function referencedIds() {
+    const key = `${q.maxHistory.get().id}|${journey()?.activeRevision?.() ?? ''}|${q.totalChanges.get().n}`;
+    if (referenced && referenced.key === key) return referenced.ids;
+    const ids = new Set();
+    const rows = rowsOf();
+    for (const i of rows.items || []) if (typeof i?.phase_id === 'string' && OPEN_DAYS_ID_RE.test(i.phase_id)) ids.add(i.phase_id);
+    for (const d of rows.days || []) if (typeof d?.phase_id === 'string' && OPEN_DAYS_ID_RE.test(d.phase_id) && (d.label_he || d.label_en)) ids.add(d.phase_id);
+    // A table that does not exist (a unit test's database) names nothing.
+    const named = (sql) => { try { return db.prepare(sql).all().map(r => r.id); } catch { return []; } };
+    for (const id of [
+      ...named("SELECT DISTINCT phase_id AS id FROM phase_plan_items WHERE phase_id LIKE 'open-days%'"),
+      ...named("SELECT DISTINCT phase_id AS id FROM phase_plan_days WHERE phase_id LIKE 'open-days%' AND (COALESCE(label_he, '') <> '' OR COALESCE(label_en, '') <> '')"),
+      ...named("SELECT DISTINCT phase AS id FROM bookings WHERE phase LIKE 'open-days%'"),
+    ]) if (typeof id === 'string' && OPEN_DAYS_ID_RE.test(id)) ids.add(id);
+    referenced = { key, ids };
+    return ids;
+  }
+  function referencedComputed(id) {
+    if (typeof id !== 'string' || !OPEN_DAYS_ID_RE.test(id)) return false;
+    if (!(base().phases || []).some(isUnplanned)) return false;
+    if (current().realIds.has(id) || effectivePhase(id) || basePhase(id)) return false;
+    return referencedIds().has(id);
   }
 
   // ── reading the plan ───────────────────────────────────────────────────────
@@ -729,7 +873,7 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
       if (missing) return missing;
       if (!isObj(body)) return fail(400, 'invalid_body');
       for (const key of Object.keys(body)) if (!['at', 'new_stop'].includes(key)) return fail(400, 'unknown_field', { field: key });
-      const at = typeof body.at === 'string' && ISO_DATE_RE.test(body.at) ? isoDay(body.at) : null;
+      const at = inputDay(body.at);
       if (!at) return fail(400, 'invalid_split_date');
       const dates = phaseDates(effectivePhase(id));
       if (!dates) return fail(400, 'stop_has_no_dates');
@@ -888,12 +1032,40 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
       for (const key of Object.keys(body)) if (!['history_id', 'on_outside'].includes(key)) return fail(400, 'unknown_field', { field: key });
       const existing = parseRow(q.override.get(id));
       let target = null;
+      let droppedLink = null;
       if (body.history_id !== undefined) {
-        const hid = Number(body.history_id);
-        const row = Number.isInteger(hid) ? q.historyRow.get(hid) : null;
+        const hid = historyIdOf(body.history_id);
+        if (hid === null) return fail(400, 'invalid_history_id', { detail: 'history_id is a positive whole number: a JSON number, or a string of digits' });
+        const row = q.historyRow.get(hid);
         if (!row || row.phase_id !== id) return fail(404, 'history_entry_not_found');
         target = readJson(row.after_state, null);
         if (!target) return fail(409, 'history_entry_has_no_state');
+        // Today's rules, before anything else is asked of the snapshot: a
+        // refused field is refused before any write, and what is written is
+        // what a PATCH of the same values would store.
+        const checked = recheckSnapshot(target.fields, hid);
+        if (checked.error) return checked.error;
+        target = { ...target, fields: checked.fields };
+        // A snapshot that links a booking carries the link as it stood THEN.
+        // Written back unchecked, it put two stops on one hotel (review of
+        // #362, finding 3): restore A's old link after the hotel moved to B,
+        // and A's next refresh fails with booking_linked_to_another_stop. So
+        // the restore asks what from-booking asks, refusing — before any
+        // write — what from-booking would refuse. A booking deleted since is
+        // no link at all: the rest of the snapshot is restored without it.
+        if (target.booking_id != null) {
+          const linkedBooking = db.prepare('SELECT id, phase FROM bookings WHERE id = ?').get(target.booking_id);
+          if (!linkedBooking) {
+            droppedLink = target.booking_id;
+            target = { ...target, booking_id: null };
+          } else {
+            if (typeof linkedBooking.phase === 'string' && linkedBooking.phase !== id && isStop(linkedBooking.phase)) {
+              return fail(409, 'booking_belongs_to_another_stop', { stop: linkedBooking.phase });
+            }
+            const linked = q.linkedElsewhere.get(linkedBooking.id, id);
+            if (linked) return fail(409, 'booking_linked_to_another_stop', { stop: linked.phase_id });
+          }
+        }
       } else if (existing?.kind === 'added' || !basePhase(id)) {
         return fail(409, 'added_stop_has_no_base', { detail: 'an added stop is removed with DELETE' });
       }
@@ -916,7 +1088,9 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
           const digests = {};
           for (const key of Object.keys(target.fields || {})) digests[key] = digest(baseValue(bp, key));
           write(id, { ...target, after_phase_id: target.after_phase_id ?? existing?.after_phase_id ?? null, base_digest: digests },
-            'revert', actor, `to history ${body.history_id}`);
+            'revert', actor, droppedLink === null
+              ? `to history ${body.history_id}`
+              : `to history ${body.history_id} (booking ${droppedLink} no longer exists; restored without the link)`);
         } else {
           write(id, null, 'revert', actor, 'to the config');
         }
