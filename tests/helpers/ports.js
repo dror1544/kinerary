@@ -165,6 +165,10 @@ export const PORTS = {
   // Subdivision flags (emoji tag sequences) in stop text, over HTTP (owner
   // decision, 2026-10-12) — tests/emoji-flags-http.test.js.
   emojiFlagsHttp:          28328,
+  // Tool output with the Unicode tag block made visible or dropped (boundary
+  // re-check of PR #375) — tests/mcp-tag-output.test.js.
+  mcpTagOutputSite:        28329,  // the real trip server
+  mcpTagOutputMcp:         28330,  // mcp/mcp.js against it
 
   // ── Stand-ins for services the server calls out to ─────────────────────
   bookingExtractMockHermes: 28103,

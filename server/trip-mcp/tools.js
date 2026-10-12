@@ -30,8 +30,42 @@ const withPeople = rows => {
   return Array.isArray(rows) ? rows.map(one) : one(rows);
 };
 
+// What the model reads (boundary re-check of PR #375, 2026-10-12). Every
+// string in a tool's output — values and keys, at any depth — loses the Unicode
+// tag block (U+E0000-U+E007F) before it is serialised. A tag character is an
+// invisible copy of an ASCII character, so a run of them carries text a person
+// never sees and a model may still read ("ASCII smuggling"): the re-check
+// stored a booking whose "flag" spelled an instruction to call delete_booking,
+// and this output handed it to the companion verbatim. The site's write rules
+// now accept only the three standard subdivision flags (server/text-rules.js,
+// FLAGS), but text stored before them, and channels they never covered
+// (lost-and-found, venue comments), still hold whatever was sent. So England,
+// Scotland and Wales are shown VISIBLY — U+1F3F4 then [gbeng] / [gbsct] /
+// [gbwls] — and every other tag character is dropped. Nothing else changes:
+// only the tag block, and ordinary text comes out byte for byte. Idempotent.
+// TWIN: RGI_SUBDIVISION_FLAG_RE, TAG_BLOCK_RE and visibleTags() are
+// byte-identical in mcp/mcp.js (the companion's MCP server); change both
+// (tests/mcp-tag-output.test.js compares them).
+const RGI_SUBDIVISION_FLAG_RE = /\u{1F3F4}(\u{E0067}\u{E0062}(?:\u{E0065}\u{E006E}\u{E0067}|\u{E0073}\u{E0063}\u{E0074}|\u{E0077}\u{E006C}\u{E0073}))\u{E007F}/gu;
+const TAG_BLOCK_RE = /[\u{E0000}-\u{E007F}]/gu;
+function visibleTags(value) {
+  // What JSON.stringify would write for it (a Date's string, say), once.
+  if (value && typeof value === 'object' && typeof value.toJSON === 'function') value = value.toJSON();
+  if (typeof value === 'string') {
+    return value
+      .replace(RGI_SUBDIVISION_FLAG_RE, (_, tags) => `\u{1F3F4}[${String.fromCodePoint(...[...tags].map(c => c.codePointAt(0) - 0xE0000))}]`)
+      .replace(TAG_BLOCK_RE, '');
+  }
+  if (Array.isArray(value)) return value.map(v => visibleTags(v));
+  // Object.fromEntries, not assignment: a "__proto__" key stays a key.
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([k, v]) => [visibleTags(k), visibleTags(v)]));
+  return value;
+}
+
 function registerTools(mcp, site, { write = true } = {}) {
-  const ok = data => ({ content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] });
+  // Every tool's one output path: the site's answer, with the tag block made
+  // visible or dropped (visibleTags above).
+  const ok = data => ({ content: [{ type: 'text', text: JSON.stringify(visibleTags(data), null, 2) }] });
   // A read-only connection never even lists a write tool: what an assistant
   // cannot see, it cannot be talked into calling.
   const tool = (name, title, description, annotations, inputSchema, run) => {

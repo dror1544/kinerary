@@ -28,8 +28,8 @@
 // and isolates, the BOM, zero-width space, word joiner, U+2061-U+2064 (U+2063
 // INVISIBLE SEPARATOR), the soft hyphen, U+034F, the Hangul fillers (U+115F,
 // U+1160, U+3164, U+FFA0), U+17B4/U+17B5, the Mongolian selectors, the
-// variation selectors and the tag characters (U+E0000-U+E0FFF; a well-formed
-// subdivision flag such as England's is the one exception, FLAGS below) — plus some that are
+// variation selectors and the tag characters (U+E0000-U+E0FFF; the three
+// standard subdivision flags are the one exception, FLAGS below) — plus some that are
 // not default-ignorable but render as nothing or as blank: the line and
 // paragraph separators (U+2028/U+2029), U+2800 BRAILLE PATTERN BLANK,
 // U+FFFC, and (second boundary re-check of PR #373, 2026-10-12) U+070F SYRIAC
@@ -47,23 +47,34 @@
 // merely CONTAINS them — niqqud, a VS16 heart, a Persian ZWNJ word, a combining
 // accent on a letter — is not blank, and is stored as typed.
 //
-// FLAGS (owner decision, 2026-10-12: "subdivision-flag emoji must NOT be
-// refused in stored text; keep every other protection"). England, Scotland and
-// Wales are emoji TAG SEQUENCES: U+1F3F4 WAVING BLACK FLAG, then tag letters,
-// then U+E007F CANCEL TAG — England is U+1F3F4 + g b e n g (U+E0067 U+E0062
-// U+E0065 U+E006E U+E0067) + U+E007F. The tag characters are invisible on their
-// own and stay refused on their own; the well-formed sequence renders as a flag.
-// FLAG_TAG_SRC is that one shape, written once: U+1F3F4 IMMEDIATELY followed by
-// 1-32 tag characters from U+E0030-E0039 / U+E0061-E007A, then U+E007F.
+// FLAGS (owner decision, 2026-10-12: "subdivision-flag emoji should not be
+// refused"; narrowed to the standard list by the boundary re-check of PR #375,
+// same day). England, Scotland and Wales are emoji TAG SEQUENCES: U+1F3F4
+// WAVING BLACK FLAG, then tag letters, then U+E007F CANCEL TAG — England is
+// U+1F3F4 + g b e n g (U+E0067 U+E0062 U+E0065 U+E006E U+E0067) + U+E007F. The
+// tag characters are invisible on their own and stay refused on their own; the
+// sequence renders as a flag. They are the only subdivision flags in the
+// standard (RGI) emoji list, and FLAG_TAG_SRC is exactly those three
+// sequences, written once: U+1F3F4, g b, then e n g / s c t / w l s, U+E007F.
+// Not a SHAPE: the rule it replaces accepted U+1F3F4 + any 1-32 tag letters or
+// digits + U+E007F, and every tag letter is an invisible copy of an ASCII
+// letter or digit — so a "flag" could carry 32 hidden characters spelling an
+// instruction ("ASCII smuggling"), and the re-check of #375 proved one stored,
+// read back by members byte for byte, and handed to the companion's model in
+// its tool output. Any other tag run, however well-formed, is refused like any
+// other hidden character. (The model's side of the same channel, for text
+// stored before this rule: visibleTags() in mcp/mcp.js.)
 // withoutFlags() — the helper every text rule here runs through — takes each
 // such sequence out of the string being checked (it stands in as U+FFFD, a
 // visible character no rule refuses and no sequence starts with), and the
 // rules above run on what is left. So a text value is accepted when the string
-// minus its valid flag sequences passes them, and is stored exactly as typed.
+// minus its standard flags passes them, and is stored exactly as typed.
 // Everything else that touches a tag character is still refused: a lone tag,
-// tags after any other base, a run with no U+E007F, a tag outside the set, a
-// terminator with no base, a second run glued after the terminator, a VS16 or a
-// ZWJ inside the run, more than 32 tags. A flag alone is not blank (it is a
+// tags after any other base, a run with no U+E007F, a terminator with no base,
+// a second run glued after the terminator, a VS16 or a ZWJ inside the run, and
+// every sequence that is not one of the three — U+1F3F4 + i g n o r e +
+// U+E007F, Northern Ireland's g b n i r (a real region, not in the standard
+// list), California's u s c a. A flag alone is not blank (it is a
 // flag). Not in a CODE (below): a confirmation number or a PIN is checked as
 // sent, so a flag there is refused — a code has no use for one. Not in a LINK
 // HOST: safeLink() never calls withoutFlags(), and the URL parser refuses tag
@@ -93,7 +104,8 @@
 // TWIN: ALLOWED_MARKS, INVISIBLE_SRC, UNSAFE_LINE_RE, UNSAFE_MULTILINE_RE, INVISIBLE_RE,
 // BLANK_ALL_RE, CODE_MARKS_RE, TEXT_DETAIL, INVISIBLE_DETAIL, CODE_DETAIL, LINK_DETAIL,
 // LINK_HOST_HIDDEN_RE, LINK_LABEL_DOT_RE, FLAG_TAG_SRC, FLAG_TAG_RE, withoutFlags,
-// toLf, isBlankText, textDetail() and safeLink() are copies of the same names in
+// toLf, isBlankText, STRIP_LINE_RE, STRIP_MULTILINE_RE, FLAG_SPLIT_RE, textDetail(),
+// scrubText() and safeLink() are copies of the same names in
 // server/trip-structure.js (the stop layer), duplicated rather than imported
 // because that file belongs to another line of work and exports none of them.
 // Change one, change both: tests/stop-hardening.test.js ("the twins") compares
@@ -115,9 +127,10 @@ const CODE_DETAIL = 'a confirmation number or PIN may not contain invisible char
 const LINK_DETAIL = 'a link must start with http:// or https://, name its host as the browser will use it, and contain no quotes, backslashes, < >, or whitespace';
 const LINK_HOST_HIDDEN_RE = /[\u00AD\u034F\u180B-\u180D\u180F\u200B\u2028\u2029\u202A-\u202E\u2060\u2064\u2066-\u2069\u2800\uFE00-\uFE0F\uFEFF\u{16FE4}\u{1BCA0}-\u{1BCA3}\u{E0100}-\u{E01EF}]/u;
 const LINK_LABEL_DOT_RE = /[.。．｡]/;
-// The well-formed emoji tag sequence, and the string every text rule checks
-// (FLAGS above). FLAG_TAG_RE is global: replace() and split() only, never test().
-const FLAG_TAG_SRC = String.raw`\u{1F3F4}[\u{E0030}-\u{E0039}\u{E0061}-\u{E007A}]{1,32}\u{E007F}`;
+// The three standard subdivision flags, and the string every text rule checks
+// (FLAGS above). FLAG_TAG_RE is global: replace(), split() and matchAll() only,
+// never test().
+const FLAG_TAG_SRC = String.raw`\u{1F3F4}\u{E0067}\u{E0062}(?:\u{E0065}\u{E006E}\u{E0067}|\u{E0073}\u{E0063}\u{E0074}|\u{E0077}\u{E006C}\u{E0073})\u{E007F}`;
 const FLAG_TAG_RE = new RegExp(FLAG_TAG_SRC, 'gu');
 const withoutFlags = (s) => s.replace(FLAG_TAG_RE, '\u{FFFD}');
 const toLf = (s) => s.replace(/\r\n?/g, '\n');
@@ -286,7 +299,7 @@ function checkField(field, value, spec) {
   // CRLF and a lone CR are a client's line ending, not a hidden character:
   // normalised before the check (and the length) in a multi-line field.
   if (multiline) s = toLf(s);
-  // A well-formed flag is text, not a hidden character (FLAGS above): the rules
+  // A standard flag is text, not a hidden character (FLAGS above): the rules
   // run on the string minus its flags. A code is checked as sent — a flag in a
   // confirmation number or PIN is refused with its tag characters.
   const checked = spec.code ? s : withoutFlags(s);
@@ -339,23 +352,29 @@ function requiredRefusal(error, field, specs) {
 // the list that no test compared.
 // A code field also loses the allowed marks (CODES), and a value left blank
 // (BLANK) is no value — so a drafted name of RLM LRM is the route's 422.
-// A well-formed flag (FLAGS) is KEPT in a text field — the draft is split
+// A standard flag (FLAGS) is KEPT in a text field — the draft is split
 // around each one (FLAG_SPLIT_RE, built from FLAG_TAG_SRC) and only the text
-// between them is stripped — and removed whole from a code field, which the
-// write would refuse it in. The length clamp can cut a flag in half, so the
-// clamped value is scrubbed again: the half loses its tag characters.
+// between them is stripped (scrubText) — and removed whole from a code field,
+// which the write would refuse it in. The length clamp can cut a flag in half,
+// so the clamped value is scrubbed again: the half loses its tag characters.
 const STRIP_LINE_RE = new RegExp(UNSAFE_LINE_RE.source, 'gu');
 const STRIP_MULTILINE_RE = new RegExp(UNSAFE_MULTILINE_RE.source, 'gu');
 const STRIP_CODE_MARKS_RE = new RegExp(CODE_MARKS_RE.source, 'gu');
 const FLAG_SPLIT_RE = new RegExp(`(${FLAG_TAG_SRC})`, 'u');
+// `t` with every character the write refuses in a text field removed, its
+// standard flags kept whole (twin of trip-structure.js, which scrubs the
+// booking name it copies into plan items with it).
+function scrubText(t, multiline) {
+  const strip = (part) => part.replace(multiline ? STRIP_MULTILINE_RE : STRIP_LINE_RE, '');
+  // split() with a capture group: the odd parts are the flags, kept as they are.
+  return t.split(FLAG_SPLIT_RE).map((part, i) => (i % 2 ? part : strip(part))).join('');
+}
 function cleanText(value, spec) {
   if (typeof value === 'number' && Number.isFinite(value)) value = String(value);
   if (typeof value !== 'string') return null;
   const multiline = spec.kind === 'multiline';
   const strip = (t) => t.replace(multiline ? STRIP_MULTILINE_RE : STRIP_LINE_RE, '');
-  // split() with a capture group: the odd parts are the flags, kept as they are.
-  const scrub = (t) => (spec.code ? strip(t.replace(FLAG_TAG_RE, ''))
-    : t.split(FLAG_SPLIT_RE).map((part, i) => (i % 2 ? part : strip(part))).join(''));
+  const scrub = (t) => (spec.code ? strip(t.replace(FLAG_TAG_RE, '')) : scrubText(t, multiline));
   let s = value.replace(/\r\n?/g, '\n').replace(/\t/g, ' ');
   if (!multiline) s = s.replace(/\n+/g, ' ');
   s = scrub(s);
