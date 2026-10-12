@@ -171,8 +171,8 @@ export const PORTS = {
   mcpTagOutputMcp:         28330,  // mcp/mcp.js against it
   // The same for tool ERRORS (code review of PR #375): a stand-in site whose
   // refusals carry tag text, so every error helper in mcp/mcp.js is reached.
-  mcpErrorTagsSite:        28331,  // the stand-in site
-  mcpErrorTagsMcp:         28332,  // mcp/mcp.js against it
+  mcpErrorTagsSite:      28334,  // the stand-in site
+  mcpErrorTagsMcp:       28335,  // mcp/mcp.js against it
 
   // ── Stand-ins for services the server calls out to ─────────────────────
   bookingExtractMockHermes: 28103,
