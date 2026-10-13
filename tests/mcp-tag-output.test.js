@@ -356,15 +356,24 @@ describe('mcp/mcp.js against the real trip server — no tag character reaches t
     assert.ok(stopsText.includes(SEEN.scotland));
   });
 
-  test('get_lost_found and get_venue_comments — channels the write rules never covered: the hidden run is gone, England shows', async () => {
-    const lf = await site.call('/api/lost-found', { method: 'POST', body: { name: `Dana ${ENGLAND}`, item: `blue bag ${HIDDEN_LONG}`, location: `lobby ${HIDDEN}` } });
+  test('get_lost_found and get_venue_comments — text stored before the write rules: the hidden run is gone, England shows', async () => {
+    // Lost-and-found now refuses a hidden run at the write (tests/lost-found-hardening.test.js)
+    // and takes England; a row an older site stored still holds one.
+    const refused = await site.call('/api/lost-found', { method: 'POST', body: { name: 'Dana', item: `blue bag ${HIDDEN_LONG}` } });
+    assert.deepEqual([refused.status, refused.body.error, refused.body.field], [400, 'invalid_text', 'item'], refused.text);
+    const lf = await site.call('/api/lost-found', { method: 'POST', body: { name: `Dana ${ENGLAND}`, item: 'blue bag', location: 'lobby' } });
     assert.equal(lf.status, 200, lf.text);
+    const plantedLf = Number(db.prepare('INSERT INTO lost_found (name, item, location) VALUES (?,?,?)')
+      .run('Eli', `blue bag ${HIDDEN_LONG}`, `lobby ${HIDDEN}`).lastInsertRowid);
     const lfText = toolText(await mcpCallTool('get_lost_found', {}));
     assert.equal(hasTag(lfText), false);
-    const entry = JSON.parse(lfText).find(e => e.id === lf.body.id);
-    assert.deepEqual([entry.name, entry.item, entry.location], [`Dana ${SEEN.england}`, `blue bag ${ch(0x1F3F4)}`, `lobby ${ch(0x1F3F4)}`]);
+    const entries = JSON.parse(lfText);
+    const entry = entries.find(e => e.id === lf.body.id);
+    assert.deepEqual([entry.name, entry.item, entry.location], [`Dana ${SEEN.england}`, 'blue bag', 'lobby']);
+    const planted = entries.find(e => e.id === plantedLf);
+    assert.deepEqual([planted.item, planted.location], [`blue bag ${ch(0x1F3F4)}`, `lobby ${ch(0x1F3F4)}`]);
     // Stored as sent: the site keeps it (the read path is unchanged).
-    assert.equal(db.prepare('SELECT item FROM lost_found WHERE id = ?').get(lf.body.id).item, `blue bag ${HIDDEN_LONG}`);
+    assert.equal(db.prepare('SELECT item FROM lost_found WHERE id = ?').get(plantedLf).item, `blue bag ${HIDDEN_LONG}`);
 
     db.prepare('INSERT INTO venue_comments (venue, username, body) VALUES (?,?,?)').run('roemer', 'alice', `lovely ${WALES} ${HIDDEN}`);
     const vcText = toolText(await mcpCallTool('get_venue_comments', { venueId: 'roemer' }));
@@ -535,7 +544,9 @@ describe('server/trip-mcp/tools.js — the same output path, on a real McpServer
       assert.equal(JSON.parse(cfg).phases[0].title.he, `קולמר ${SEEN.wales}`);
       const lf = await call('get_lost_found');
       assert.equal(hasTag(lf), false);
-      assert.deepEqual(JSON.parse(lf)[0], { id: 3, name: `Dana ${SEEN.england}`, item: `bag ${ch(0x1F3F4)}` });
+      // `source` is the finder-submitted label (tests/lost-found-hardening.test.js).
+      assert.deepEqual(JSON.parse(lf)[0], { source: JSON.parse(lf)[0].source, id: 3, name: `Dana ${SEEN.england}`, item: `bag ${ch(0x1F3F4)}` });
+      assert.match(JSON.parse(lf)[0].source, /^finder-submitted/);
       const vc = await call('get_venue_comments', { venueId: 'roemer' });
       assert.equal(hasTag(vc), false);
       assert.equal(JSON.parse(vc)[0].body, `nice ${ch(0x1F3F4)}`);

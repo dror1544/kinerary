@@ -173,6 +173,22 @@ export const PORTS = {
   // refusals carry tag text, so every error helper in mcp/mcp.js is reached.
   mcpErrorTagsSite:      28334,  // the stand-in site
   mcpErrorTagsMcp:       28335,  // mcp/mcp.js against it
+  // The public lost-and-found form: write-time text rules, abuse bounds, and
+  // the finder-submitted label on the model's copy — tests/lost-found-hardening.test.js.
+  lostFoundHardening:       28331,  // the trip server (text rules, MCP, Classic)
+  lostFoundHardeningMcp:    28332,  // mcp/mcp.js against it
+  lostFoundHardeningBounds: 28333,  // a second trip server: rate limit and open-entry cap
+  // Boundary review of PR #377: the limiter's client address behind a proxy
+  // (TRUST_PROXY_HOPS) and the bounded get_lost_found — tests/lost-found-proxy.test.js.
+  lostFoundProxyDefault:    28336,  // TRUST_PROXY_HOPS unset
+  lostFoundProxyOneHop:     28337,  // TRUST_PROXY_HOPS=1
+  lostFoundProxyTwoHops:    28338,  // TRUST_PROXY_HOPS=2
+  lostFoundProxyInvalid:    28339,  // invalid values, one server at a time
+  lostFoundBoundsSite:      28340,  // GET ?open= ?limit= ?count=1
+  lostFoundBoundsMcpSite:   28341,  // the trip server mcp/mcp.js reads
+  lostFoundBoundsMcp:       28342,  // mcp/mcp.js against it
+  // Review of the hardening itself: GET serves a column allow-list.
+  lostFoundColumnsSite:     28343,  // the trip server, with an extra column added
 
   // ── Stand-ins for services the server calls out to ─────────────────────
   bookingExtractMockHermes: 28103,

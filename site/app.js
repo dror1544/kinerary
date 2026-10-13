@@ -2420,6 +2420,16 @@ async function submitLostFound() {
       body: JSON.stringify({ name, phone, location, item }),
     });
     const data = await res.json().catch(() => ({}));
+    // A report the server refused (its text, the hourly limit, a full list)
+    // says why in Hebrew and English; shown in the page's language, as text
+    // (showErr uses textContent). Anything else keeps the generic error.
+    const m = data && typeof data.message === 'object' ? data.message : null;
+    const refusal = m ? (m[currentLang] || m.he || m.en) : null;
+    if (!res.ok && typeof refusal === 'string' && refusal) {
+      showErr(refusal);
+      if (btn) btn.disabled = false;
+      return;
+    }
     if (!res.ok) throw new Error(data.error || `שגיאה ${res.status}`);
     if (err) { err.style.color = 'var(--ok)'; err.textContent = tr.lf_success || '✅ הדיווח נשלח!'; }
     if (btn) btn.style.display = 'none';

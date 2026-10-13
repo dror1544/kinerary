@@ -19,6 +19,7 @@ const { repairDayStamp, stampRest } = require('../shared/day-stamp');
 const { projectConfig, publicConfig, publicPart } = require('../shared/config-visibility');
 const { publicUser } = require('./public-user');
 const textRules = require('./text-rules');
+const { rateLimitKey } = require('./client-address');
 const { createFileTokens, createShareTokens } = require('./file-token');
 
 const app = express();
@@ -2142,12 +2143,21 @@ app.post('/api/upload', authRequired, upload.array('files'), async (req, res) =>
 // stranger can reach the form, so a script can too — this section bounds and
 // rate-limits what an anonymous caller can write, without adding auth.
 
-// Field caps (trimmed lengths) — generous for a name/phone/short description,
-// tight enough that a script cannot use this form to stash arbitrary text.
-const LOST_FOUND_MAX_NAME = 80;
-const LOST_FOUND_MAX_PHONE = 32;
-const LOST_FOUND_MAX_ITEM = 200;
-const LOST_FOUND_MAX_LOCATION = 200;
+// Field rules (owner decision, 2026-10-12: the form stays WITHOUT login, and
+// what a stranger types is held to the bookings' write-time rules). Each field
+// is checked by server/text-rules.js against LOST_FOUND_FIELDS — its cap (the
+// ones #207 set: name 80, phone 32, location 200, item 200), no < >, no
+// control or invisible characters (the three standard flags are text), the
+// item multi-line because the form's description is a textarea — and refused
+// with the bookings' 400 shape, { error, field, message: { he, en }, detail },
+// which the Classic form shows in the page's language. Values are trimmed
+// before the check, as this route always stored them. Rows stored before the
+// rule are never rewritten, and nothing on the read path checks them.
+//
+// The companion still reads whatever passes: words cannot be refused. Its MCP
+// tools label every entry as finder-submitted, untrusted text
+// (LOST_FOUND_SOURCE in mcp/mcp.js and server/trip-mcp/tools.js).
+
 // Small cap on the whole request body — four short strings never need more
 // than a few hundred bytes; this catches an oversized payload before it is
 // even validated. Not a replacement for the global 30mb express.json()
@@ -2157,13 +2167,114 @@ const LOST_FOUND_MAX_BODY_BYTES = 4096;
 // In-memory, per-address rate limit: 5 ACCEPTED writes per rolling hour.
 // Deliberately no dependency and no persistence — an abuse bound on a small
 // social feature, not a security control, so resetting on every restart is
-// fine. `address -> [timestamp, ...]` of accepted writes, oldest first.
+// fine. `address -> [timestamp, ...]` of accepted writes, oldest first. A
+// refused report (400, 413, 429) is not counted. The 429 says why, in both
+// languages (LOST_FOUND_MESSAGES below).
 const LOST_FOUND_RATE_LIMIT = 5;
 const LOST_FOUND_RATE_WINDOW_MS = 60 * 60 * 1000;
 // Bounds the map itself: a flood of distinct addresses (not just repeats
 // from one) must not grow this without limit for the life of the process.
 const LOST_FOUND_MAX_TRACKED_ADDRESSES = 1000;
 const lostFoundWrites = new Map();
+// The table as a whole: at most this many OPEN (unresolved) entries. The
+// per-address limit above does not bound a caller with many addresses; this
+// does, so it bounds how much a flood can STORE. It does not protect real
+// finders: when every visitor reaches the server from one proxy address
+// (TRUST_PROXY_HOPS unset behind a reverse proxy, see clientAddress below),
+// five junk reports an hour fill that one per-address bucket and every other
+// finder, member and the companion's post_lost_found gets 429 rate_limited
+// long before this cap is reached. Only the right client address fixes that.
+// A resolved entry does not count, so a member resolving one reopens the form.
+const LOST_FOUND_MAX_OPEN = 200;
+
+// ── The client address the limiter keys on ──────────────────────────────────
+// Trip sites run behind reverse proxies (the repository's nginx.conf, and
+// whatever fronts it), so the socket address is a proxy's, the same for every
+// visitor. TRUST_PROXY_HOPS says how many proxies in front of this server
+// APPEND the visitor's address to X-Forwarded-For (nginx: `proxy_set_header
+// X-Forwarded-For $proxy_add_x_forwarded_for`) — a CDN or tunnel edge counts
+// like any other. A proxy that instead REWRITES the header from a value the
+// client can send (an X-Real-IP, say) is not one that appends: counting it
+// lets the client pick its own bucket. The count is only right when the entry
+// Nth from the right is one the outermost trusted proxy wrote, which the
+// operator confirms with a live probe (.env.example).
+// With N > 0 the client is the Nth entry from the RIGHT — the one the
+// outermost trusted proxy wrote — never the leftmost, which the client itself
+// can write. Express's `trust proxy` = N picks the same entry, but it is
+// deliberately not set: it would also change req.protocol (the /photo share
+// page's URLs) and req.hostname for every route, and this setting is about one
+// rate limit. 0 (unset, the default): X-Forwarded-For is ignored and the key
+// is req.ip, exactly as before. Too high a number lets a visitor choose their
+// own address — a proxy that passes the header through without appending (the
+// repository's own nginx.conf does) does not count.
+const TRUST_PROXY_HOPS = (() => {
+  const raw = process.env.TRUST_PROXY_HOPS;
+  if (raw === undefined || raw === '') return 0;
+  if (/^[0-3]$/.test(raw)) return Number(raw);
+  console.warn(`TRUST_PROXY_HOPS=${JSON.stringify(raw)} is not a whole number from 0 to 3 — using 0: ` +
+    'X-Forwarded-For is ignored and every visitor behind a proxy shares one lost-and-found rate-limit bucket.');
+  return 0;
+})();
+if (TRUST_PROXY_HOPS > 0) {
+  console.log(`lost-and-found rate limit: TRUST_PROXY_HOPS=${TRUST_PROXY_HOPS} — keyed on X-Forwarded-For entry ${TRUST_PROXY_HOPS} from the right`);
+}
+// Each misconfiguration is said once per process, not per request.
+const clientAddressWarned = new Set();
+function warnClientAddressOnce(key, message) {
+  if (clientAddressWarned.has(key)) return;
+  clientAddressWarned.add(key);
+  console.warn(message);
+}
+// At most an IPv6 address with a zone; anything longer is not an address
+// a proxy wrote, and bounding it bounds the map's keys.
+const CLIENT_ADDRESS_MAX_LENGTH = 64;
+function clientAddress(req) {
+  // Keyed per client — an IPv6 one per /64, an IPv4-mapped one as its IPv4 —
+  // whichever of the three ways below found the address (client-address.js).
+  return rateLimitKey(clientAddressRaw(req));
+}
+function clientAddressRaw(req) {
+  const header = req.headers['x-forwarded-for'];
+  const entries = typeof header === 'string' ? header.split(',').map(s => s.trim()).filter(Boolean) : [];
+  if (TRUST_PROXY_HOPS === 0) {
+    if (entries.length) {
+      warnClientAddressOnce('hops0', 'lost-and-found: a request arrived with X-Forwarded-For but TRUST_PROXY_HOPS is 0, ' +
+        'so the rate limit keys on the proxy\'s address and every visitor behind it shares one bucket of ' +
+        `${LOST_FOUND_RATE_LIMIT} reports an hour. Set TRUST_PROXY_HOPS to the number of proxies that append to X-Forwarded-For.`);
+    }
+    return req.ip;
+  }
+  if (entries.length < TRUST_PROXY_HOPS) {
+    // No header at all is a direct caller (the companion's MCP server on the
+    // same host): its socket address is its own. Some entries, but fewer than
+    // the hops, means the setting is higher than this chain — fall back to the
+    // socket rather than to an entry the client may have written.
+    if (entries.length) {
+      warnClientAddressOnce('short', `lost-and-found: a request carried fewer X-Forwarded-For entries (${entries.length}) ` +
+        `than TRUST_PROXY_HOPS=${TRUST_PROXY_HOPS}; keyed on the socket address. Is TRUST_PROXY_HOPS higher than the proxies in front of this site?`);
+    }
+    return req.socket.remoteAddress;
+  }
+  return entries[entries.length - TRUST_PROXY_HOPS].slice(0, CLIENT_ADDRESS_MAX_LENGTH);
+}
+
+// The refusals that are not about one field, in both languages, addressed to
+// the finder the way text-rules.js addresses a person.
+const LOST_FOUND_MESSAGES = {
+  rate_limited: {
+    he: 'נשלחו מכאן יותר מדי דיווחים בשעה האחרונה. נסו שוב מאוחר יותר.',
+    en: 'Too many reports were sent from here in the last hour. Try again later.',
+  },
+  lost_found_full: {
+    he: 'רשימת האבדות והמציאות מלאה כרגע. נסו שוב מאוחר יותר.',
+    en: 'The lost-and-found list is full right now. Try again later.',
+  },
+  body_too_large: {
+    he: 'הדיווח ארוך מדי. קצרו אותו ונסו שוב.',
+    en: 'The report is too long. Shorten it and try again.',
+  },
+};
+const lostFoundRefusal = (error) => ({ error, message: LOST_FOUND_MESSAGES[error] });
 
 function pruneLostFoundBucket(timestamps, now) {
   while (timestamps.length && now - timestamps[0] >= LOST_FOUND_RATE_WINDOW_MS) timestamps.shift();
@@ -2188,44 +2299,49 @@ app.post('/api/lost-found', (req, res) => {
   const now = Date.now();
   evictLostFoundBuckets(now);
 
-  // No `trust proxy` is set anywhere in this server, and trip sites sit
-  // behind nginx/NPM in production — see the #207 handover for what that
-  // means for this address (every visitor to one trip's proxy shares a
-  // single req.ip today; fixing that is a separate, deployment-wide change).
-  const address = req.ip;
+  // The real client when TRUST_PROXY_HOPS says how to find it; req.ip (the
+  // proxy's address, behind one) when it is 0 — see clientAddress above.
+  const address = clientAddress(req);
   const bucket = pruneLostFoundBucket(lostFoundWrites.get(address) || [], now);
   if (bucket.length >= LOST_FOUND_RATE_LIMIT) {
     const retryAfterMs = LOST_FOUND_RATE_WINDOW_MS - (now - bucket[0]);
     res.set('Retry-After', String(Math.max(1, Math.ceil(retryAfterMs / 1000))));
-    return res.status(429).json({ error: 'rate_limited' });
+    return res.status(429).json(lostFoundRefusal('rate_limited'));
   }
 
   const contentLength = Number(req.headers['content-length'] || 0);
   if (contentLength > LOST_FOUND_MAX_BODY_BYTES) {
-    return res.status(413).json({ error: 'body_too_large' });
+    return res.status(413).json(lostFoundRefusal('body_too_large'));
   }
 
-  const { name, phone, item, location } = req.body || {};
-  if (typeof name !== 'string' || typeof item !== 'string') {
-    return res.status(400).json({ error: 'name and item are required' });
+  // Every field is text or absent (null and undefined: phone and location
+  // are optional); anything else — a number, an array better-sqlite3 would
+  // flatten, an object — is refused, naming the field. Then trimmed, then the
+  // required pair, then the text rules (Field rules above).
+  const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+  const fields = textRules.LOST_FOUND_FIELDS;
+  const values = {};
+  for (const [field, spec] of Object.entries(fields)) {
+    const v = Object.hasOwn(body, field) ? body[field] : undefined;
+    if (v === undefined || v === null) { values[field] = ''; continue; }
+    if (typeof v !== 'string') {
+      return res.status(400).json(textRules.refusal('invalid_text', field, spec.label, 'type', { detail: 'must be text' }));
+    }
+    values[field] = v.trim();
   }
-  if (phone != null && typeof phone !== 'string') return res.status(400).json({ error: 'phone must be a string' });
-  if (location != null && typeof location !== 'string') return res.status(400).json({ error: 'location must be a string' });
+  for (const field of ['name', 'item']) {
+    if (textRules.isBlank(values[field])) return res.status(400).json(textRules.requiredRefusal('missing_fields', field, fields));
+  }
+  const checked = textRules.checkFields(values, fields);
+  if (checked.error) return res.status(400).json(checked.error);
+  const v = checked.values;
 
-  const trimmedName = name.trim();
-  const trimmedItem = item.trim();
-  const trimmedPhone = (typeof phone === 'string' ? phone : '').trim();
-  const trimmedLocation = (typeof location === 'string' ? location : '').trim();
-
-  if (!trimmedName || !trimmedItem) return res.status(400).json({ error: 'name and item are required' });
-  if (trimmedName.length > LOST_FOUND_MAX_NAME) return res.status(400).json({ error: 'name too long' });
-  if (trimmedItem.length > LOST_FOUND_MAX_ITEM) return res.status(400).json({ error: 'item too long' });
-  if (trimmedPhone.length > LOST_FOUND_MAX_PHONE) return res.status(400).json({ error: 'phone too long' });
-  if (trimmedLocation.length > LOST_FOUND_MAX_LOCATION) return res.status(400).json({ error: 'location too long' });
+  const open = db.prepare('SELECT COUNT(*) AS n FROM lost_found WHERE COALESCE(resolved, 0) = 0').get().n;
+  if (open >= LOST_FOUND_MAX_OPEN) return res.status(429).json(lostFoundRefusal('lost_found_full'));
 
   const result = db.prepare(
     "INSERT INTO lost_found (name, phone, item, location) VALUES (?,?,?,?)"
-  ).run(trimmedName, trimmedPhone, trimmedItem, trimmedLocation);
+  ).run(v.name, v.phone, v.item, v.location);
 
   bucket.push(now);
   lostFoundWrites.set(address, bucket);
@@ -2233,8 +2349,45 @@ app.post('/api/lost-found', (req, res) => {
   res.json({ ok: true, id: result.lastInsertRowid });
 });
 
+// Without open, limit or count: every entry, newest first — what the Classic
+// page reads, unchanged (any other parameter is ignored, as it always was).
+// The MCP tools ask for a bounded set instead (get_lost_found in mcp/mcp.js
+// and server/trip-mcp/tools.js): ?open=1 open entries only, ?open=0 resolved
+// only, ?limit=N the N newest (1..500; with open alone, at most 500), and
+// ?count=1 just `{ open, resolved }`. One of the three that is present but
+// not one of those values is refused, never silently ignored.
+const LOST_FOUND_MAX_LIMIT = 500;
+// The columns the endpoint serves — an allow-list, not SELECT *: a column added
+// to the table later (a note, a contact) reaches no member and no model until
+// it is added here on purpose. A constant, never built from a request.
+const LOST_FOUND_COLUMNS = 'id, name, phone, item, location, resolved, created_at';
+const LOST_FOUND_QUERY_KEYS = ['open', 'limit', 'count'];
 app.get('/api/lost-found', authRequired, (req, res) => {
-  const rows = db.prepare('SELECT * FROM lost_found ORDER BY created_at DESC').all();
+  const q = req.query;
+  const given = LOST_FOUND_QUERY_KEYS.filter(k => q[k] !== undefined);
+  if (!given.length) {
+    const rows = db.prepare(`SELECT ${LOST_FOUND_COLUMNS} FROM lost_found ORDER BY created_at DESC`).all();
+    return res.json(rows);
+  }
+  const bad = (detail) => res.status(400).json({ error: 'invalid_query', detail });
+  for (const key of given) {
+    if (typeof q[key] !== 'string') return bad(`"${key}" must be given once, as text`);
+  }
+  if (q.count !== undefined) {
+    if (q.count !== '1' || given.length > 1) return bad('count must be 1, with neither open nor limit');
+    const n = db.prepare('SELECT COALESCE(SUM(COALESCE(resolved, 0) = 0), 0) AS open, COALESCE(SUM(COALESCE(resolved, 0) != 0), 0) AS resolved FROM lost_found').get();
+    return res.json({ open: n.open, resolved: n.resolved });
+  }
+  if (q.open !== undefined && q.open !== '0' && q.open !== '1') return bad('open must be 1 (open only) or 0 (resolved only)');
+  let limit = LOST_FOUND_MAX_LIMIT;
+  if (q.limit !== undefined) {
+    if (!/^[1-9]\d{0,2}$/.test(q.limit) || Number(q.limit) > LOST_FOUND_MAX_LIMIT) {
+      return bad(`limit must be a whole number from 1 to ${LOST_FOUND_MAX_LIMIT}`);
+    }
+    limit = Number(q.limit);
+  }
+  const where = q.open === '1' ? 'WHERE COALESCE(resolved, 0) = 0' : q.open === '0' ? 'WHERE COALESCE(resolved, 0) != 0' : '';
+  const rows = db.prepare(`SELECT ${LOST_FOUND_COLUMNS} FROM lost_found ${where} ORDER BY created_at DESC, id DESC LIMIT ?`).all(limit);
   res.json(rows);
 });
 

@@ -206,6 +206,19 @@ const PARTICIPANT_FIELDS = {
   family:  { kind: 'line', max: 80, label: { he: 'משפחה', en: 'family' } },
 };
 
+// The PUBLIC lost-and-found form (POST /api/lost-found takes no login, by the
+// owner's decision of 2026-10-12): a stranger who found something types these,
+// and the companion reads them. The caps are the ones the route already had
+// (issue #207); the item is the form's three-row textarea, so it is multi-line.
+// A phone is a code: RLM or ALM would reorder its digits on a Hebrew page, and
+// a flag has no use in it. Labels name the fields the way the form asks for them.
+const LOST_FOUND_FIELDS = {
+  name:     { kind: 'line', max: 80, label: { he: 'השם שלך', en: 'your name' } },
+  phone:    { kind: 'line', max: 32, code: true, label: { he: 'מספר טלפון', en: 'phone number' } },
+  location: { kind: 'line', max: 200, label: { he: 'איפה מצאת', en: 'where you found it' } },
+  item:     { kind: 'multiline', max: 200, label: { he: 'תיאור הפריט', en: 'item description' } },
+};
+
 // ── the human message, in both languages ─────────────────────────────────────
 // Hebrew is written for an organizer (plural imperative, the way the site
 // already addresses people); English is plain. Both name the field the way
@@ -387,7 +400,7 @@ const cleanDate = (value) => (typeof value === 'string' ? isoDay(value.trim()) :
 const cleanLink = (value) => safeLink(value) ?? null;
 
 module.exports = {
-  BOOKING_FIELDS, PARTICIPANT_FIELDS, BOOKING_TYPES,
+  BOOKING_FIELDS, PARTICIPANT_FIELDS, LOST_FOUND_FIELDS, BOOKING_TYPES,
   UNSAFE_LINE_RE, UNSAFE_MULTILINE_RE, INVISIBLE_RE, TEXT_DETAIL, INVISIBLE_DETAIL, CODE_DETAIL, LINK_DETAIL,
   safeLink, isoDay, checkField, checkFields, isBlank, requiredRefusal, refusal, bookingTypeRefusal,
   cleanText, cleanDate, cleanLink, withoutFlags,
