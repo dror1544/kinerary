@@ -186,6 +186,84 @@ describe('TRUST_PROXY_HOPS=1: one bucket per real client, the right-most entry d
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
+// Review finding F2: an IPv6 client controls its whole /64, so one bucket per
+// full address is 2^64 buckets per attacker. The key is the /64.
+describe('the rate-limit key: an IPv6 address is keyed on its /64, IPv4 is unchanged', () => {
+  const { rateLimitKey } = require('../server/client-address.js');
+
+  test('IPv4 is the address itself, as before', () => {
+    assert.equal(rateLimitKey('203.0.113.7'), '203.0.113.7');
+    assert.equal(rateLimitKey('127.0.0.1'), '127.0.0.1');
+  });
+
+  test('two addresses in one /64 share a key, however they are written', () => {
+    const k = rateLimitKey('2001:db8:1:2::1');
+    assert.equal(rateLimitKey('2001:db8:1:2:ffff:ffff:ffff:ffff'), k);
+    assert.equal(rateLimitKey('2001:0DB8:0001:0002:0000:0000:0000:0001'), k);
+    assert.equal(rateLimitKey('2001:db8:1:2:aaaa:bbbb:cccc:dddd'), k);
+    assert.equal(rateLimitKey('[2001:db8:1:2::9]'), k, 'brackets');
+    assert.equal(rateLimitKey('[2001:db8:1:2::9]:51234'), k, 'brackets and a port');
+    assert.equal(rateLimitKey('2001:db8:1:2::9%eth0'), k, 'a zone');
+  });
+
+  test('different /64s get different keys', () => {
+    const base = rateLimitKey('2001:db8:1:2::1');
+    for (const other of ['2001:db8:1:3::1', '2001:db8:2:2::1', '2001:db9:1:2::1', '3001:db8:1:2::1', '2001:db8:1::1']) {
+      assert.notEqual(rateLimitKey(other), base, other);
+    }
+  });
+
+  test(':: compression is expanded: ::1, :: and a leading :: are the first /64 of all zeros', () => {
+    assert.equal(rateLimitKey('::1'), rateLimitKey('::2'));
+    assert.equal(rateLimitKey('::1'), rateLimitKey('::'));
+    assert.equal(rateLimitKey('::1'), rateLimitKey('0:0:0:0:5:6:7:8'));
+    assert.equal(rateLimitKey('2001:db8::'), rateLimitKey('2001:db8:0:0:1::'));
+    assert.notEqual(rateLimitKey('2001:db8::'), rateLimitKey('2001:db8:0:1::'));
+    assert.notEqual(rateLimitKey('::1'), '127.0.0.1');
+  });
+
+  test('IPv4-mapped IPv6 is the IPv4 address: the same bucket as the plain form', () => {
+    assert.equal(rateLimitKey('::ffff:203.0.113.7'), '203.0.113.7');
+    assert.equal(rateLimitKey('::FFFF:203.0.113.7'), '203.0.113.7');
+    assert.equal(rateLimitKey('::ffff:cb00:7107'), '203.0.113.7', 'the hex spelling');
+    assert.equal(rateLimitKey('0:0:0:0:0:ffff:203.0.113.7'), '203.0.113.7');
+    assert.equal(rateLimitKey('[::ffff:203.0.113.7]:80'), '203.0.113.7');
+    assert.equal(rateLimitKey('203.0.113.7:8080'), '203.0.113.7', 'an IPv4 with a port');
+    assert.notEqual(rateLimitKey('::ffff:203.0.113.8'), rateLimitKey('::ffff:203.0.113.7'), 'two mapped hosts are two clients');
+  });
+
+  test('anything that is not an address is kept as written (bounded), not collapsed with others', () => {
+    assert.equal(rateLimitKey('unknown'), 'unknown');
+    assert.notEqual(rateLimitKey('unknown'), rateLimitKey('other'));
+    assert.equal(rateLimitKey(undefined), undefined);
+  });
+});
+
+describe('TRUST_PROXY_HOPS=1 over HTTP: a /64 is one client', () => {
+  let site;
+  before(async () => { site = await bootTripServer(PORTS.lostFoundProxyOneHop, { TRUST_PROXY_HOPS: '1' }); });
+  after(async () => { await site?.stop(); });
+
+  test('five reports from five addresses in one /64 fill one bucket; another /64 and an IPv4 are untouched', async () => {
+    for (let i = 1; i <= 5; i++) {
+      const r = await site.post({ xff: `2001:db8:aa:bb::${i}` });
+      assert.equal(r.status, 200, r.text);
+    }
+    const sixth = await site.post({ xff: '2001:db8:aa:bb:dead:beef:cafe:f00d' });
+    assert.equal(sixth.status, 429, 'a new address in the same /64 shares the bucket');
+    assert.equal((await site.post({ xff: '[2001:db8:aa:bb::77]:4000' })).status, 429, 'with brackets and a port');
+    assert.equal((await site.post({ xff: '2001:db8:aa:bc::1' })).status, 200, 'the next /64 is another client');
+    assert.equal((await site.post({ xff: '203.0.113.200' })).status, 200, 'IPv4 is its own bucket');
+  });
+
+  test('an IPv4-mapped address and the plain IPv4 are one bucket', async () => {
+    await fill(site, { xff: '::ffff:198.51.100.77' }, 5);
+    assert.equal((await site.post({ xff: '198.51.100.77' })).status, 429);
+    assert.equal((await site.post({ xff: '198.51.100.78' })).status, 200);
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
 describe('TRUST_PROXY_HOPS=2: the second entry from the right', () => {
   let site;
   before(async () => { site = await bootTripServer(PORTS.lostFoundProxyTwoHops, { TRUST_PROXY_HOPS: '2' }); });
@@ -463,5 +541,37 @@ describe('server/trip-mcp/tools.js get_lost_found on a real McpServer: the same 
       assert.match(d, /100/);
       assert.match(d, /truncated/);
     } finally { await client.close(); }
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Review finding F4: GET /api/lost-found named no columns, so a column added to
+// the table later (an internal note, a contact the finder gave) would be served
+// to every member and handed to the model. The columns are an allow-list.
+describe('GET /api/lost-found serves an explicit set of columns', () => {
+  let site;
+  before(async () => {
+    site = await bootTripServer(PORTS.lostFoundColumnsSite);
+    seed(site.db, { open: 2, resolved: 2 });
+    site.db.exec('ALTER TABLE lost_found ADD COLUMN internal_note TEXT');
+    site.db.exec("UPDATE lost_found SET internal_note = 'secret-marker-9f3'");
+  });
+  after(async () => { await site?.stop(); });
+
+  const ALLOWED = ['created_at', 'id', 'item', 'location', 'name', 'phone', 'resolved'];
+
+  for (const path of ['/api/lost-found', '/api/lost-found?open=1', '/api/lost-found?open=0', '/api/lost-found?limit=3']) {
+    test(`${path}: only id, name, phone, item, location, resolved, created_at`, async () => {
+      const r = await site.agent(path);
+      assert.equal(r.status, 200, r.text);
+      assert.ok(r.body.length > 0);
+      assert.ok(!r.text.includes('secret-marker-9f3'), 'the extra column is not served');
+      for (const row of r.body) assert.deepEqual(Object.keys(row).sort(), ALLOWED);
+    });
+  }
+
+  test('the counts still answer', async () => {
+    const r = await site.agent('/api/lost-found?count=1');
+    assert.deepEqual(r.body, { open: 2, resolved: 2 });
   });
 });

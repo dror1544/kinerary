@@ -187,6 +187,8 @@ export const PORTS = {
   lostFoundBoundsSite:      28340,  // GET ?open= ?limit= ?count=1
   lostFoundBoundsMcpSite:   28341,  // the trip server mcp/mcp.js reads
   lostFoundBoundsMcp:       28342,  // mcp/mcp.js against it
+  // Review of the hardening itself: GET serves a column allow-list.
+  lostFoundColumnsSite:     28343,  // the trip server, with an extra column added
 
   // ── Stand-ins for services the server calls out to ─────────────────────
   bookingExtractMockHermes: 28103,

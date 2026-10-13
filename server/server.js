@@ -19,6 +19,7 @@ const { repairDayStamp, stampRest } = require('../shared/day-stamp');
 const { projectConfig, publicConfig, publicPart } = require('../shared/config-visibility');
 const { publicUser } = require('./public-user');
 const textRules = require('./text-rules');
+const { rateLimitKey } = require('./client-address');
 const { createFileTokens, createShareTokens } = require('./file-token');
 
 const app = express();
@@ -2187,11 +2188,16 @@ const lostFoundWrites = new Map();
 const LOST_FOUND_MAX_OPEN = 200;
 
 // ── The client address the limiter keys on ──────────────────────────────────
-// Trip sites run behind reverse proxies (the repository's nginx.conf, and a
-// front proxy such as Nginx Proxy Manager), so the socket address is a
-// proxy's, the same for every visitor. TRUST_PROXY_HOPS says how many proxies
-// in front of this server APPEND the visitor's address to X-Forwarded-For
-// (nginx: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`).
+// Trip sites run behind reverse proxies (the repository's nginx.conf, and
+// whatever fronts it), so the socket address is a proxy's, the same for every
+// visitor. TRUST_PROXY_HOPS says how many proxies in front of this server
+// APPEND the visitor's address to X-Forwarded-For (nginx: `proxy_set_header
+// X-Forwarded-For $proxy_add_x_forwarded_for`) — a CDN or tunnel edge counts
+// like any other. A proxy that instead REWRITES the header from a value the
+// client can send (an X-Real-IP, say) is not one that appends: counting it
+// lets the client pick its own bucket. The count is only right when the entry
+// Nth from the right is one the outermost trusted proxy wrote, which the
+// operator confirms with a live probe (.env.example).
 // With N > 0 the client is the Nth entry from the RIGHT — the one the
 // outermost trusted proxy wrote — never the leftmost, which the client itself
 // can write. Express's `trust proxy` = N picks the same entry, but it is
@@ -2223,6 +2229,11 @@ function warnClientAddressOnce(key, message) {
 // a proxy wrote, and bounding it bounds the map's keys.
 const CLIENT_ADDRESS_MAX_LENGTH = 64;
 function clientAddress(req) {
+  // Keyed per client — an IPv6 one per /64, an IPv4-mapped one as its IPv4 —
+  // whichever of the three ways below found the address (client-address.js).
+  return rateLimitKey(clientAddressRaw(req));
+}
+function clientAddressRaw(req) {
   const header = req.headers['x-forwarded-for'];
   const entries = typeof header === 'string' ? header.split(',').map(s => s.trim()).filter(Boolean) : [];
   if (TRUST_PROXY_HOPS === 0) {
@@ -2346,12 +2357,16 @@ app.post('/api/lost-found', (req, res) => {
 // ?count=1 just `{ open, resolved }`. One of the three that is present but
 // not one of those values is refused, never silently ignored.
 const LOST_FOUND_MAX_LIMIT = 500;
+// The columns the endpoint serves — an allow-list, not SELECT *: a column added
+// to the table later (a note, a contact) reaches no member and no model until
+// it is added here on purpose. A constant, never built from a request.
+const LOST_FOUND_COLUMNS = 'id, name, phone, item, location, resolved, created_at';
 const LOST_FOUND_QUERY_KEYS = ['open', 'limit', 'count'];
 app.get('/api/lost-found', authRequired, (req, res) => {
   const q = req.query;
   const given = LOST_FOUND_QUERY_KEYS.filter(k => q[k] !== undefined);
   if (!given.length) {
-    const rows = db.prepare('SELECT * FROM lost_found ORDER BY created_at DESC').all();
+    const rows = db.prepare(`SELECT ${LOST_FOUND_COLUMNS} FROM lost_found ORDER BY created_at DESC`).all();
     return res.json(rows);
   }
   const bad = (detail) => res.status(400).json({ error: 'invalid_query', detail });
@@ -2372,7 +2387,7 @@ app.get('/api/lost-found', authRequired, (req, res) => {
     limit = Number(q.limit);
   }
   const where = q.open === '1' ? 'WHERE COALESCE(resolved, 0) = 0' : q.open === '0' ? 'WHERE COALESCE(resolved, 0) != 0' : '';
-  const rows = db.prepare(`SELECT * FROM lost_found ${where} ORDER BY created_at DESC, id DESC LIMIT ?`).all(limit);
+  const rows = db.prepare(`SELECT ${LOST_FOUND_COLUMNS} FROM lost_found ${where} ORDER BY created_at DESC, id DESC LIMIT ?`).all(limit);
   res.json(rows);
 });
 
