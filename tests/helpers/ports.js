@@ -162,6 +162,17 @@ export const PORTS = {
   // A plan date must be a day on the calendar, on every plan route (second
   // boundary re-check of PR #373) — tests/calendar-routes.test.js.
   calendarRoutes:          28327,
+  // Subdivision flags (emoji tag sequences) in stop text, over HTTP (owner
+  // decision, 2026-10-12) — tests/emoji-flags-http.test.js.
+  emojiFlagsHttp:          28328,
+  // Tool output with the Unicode tag block made visible or dropped (boundary
+  // re-check of PR #375) — tests/mcp-tag-output.test.js.
+  mcpTagOutputSite:        28329,  // the real trip server
+  mcpTagOutputMcp:         28330,  // mcp/mcp.js against it
+  // The same for tool ERRORS (code review of PR #375): a stand-in site whose
+  // refusals carry tag text, so every error helper in mcp/mcp.js is reached.
+  mcpErrorTagsSite:      28334,  // the stand-in site
+  mcpErrorTagsMcp:       28335,  // mcp/mcp.js against it
 
   // ── Stand-ins for services the server calls out to ─────────────────────
   bookingExtractMockHermes: 28103,

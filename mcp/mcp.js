@@ -260,13 +260,74 @@ const IMAGE_MIME_BY_EXT = {
   '.gif': 'image/gif', '.webp': 'image/webp', '.heic': 'image/heic', '.heif': 'image/heif',
 };
 
+// What the model reads (boundary re-check of PR #375, 2026-10-12). Every
+// string in a tool's output — values and keys, at any depth — loses the Unicode
+// tag block (U+E0000-U+E007F) before it is serialised. A tag character is an
+// invisible copy of an ASCII character, so a run of them carries text a person
+// never sees and a model may still read ("ASCII smuggling"): the re-check
+// stored a booking whose "flag" spelled an instruction to call delete_booking,
+// and this output handed it to the companion verbatim. The site's write rules
+// now accept only the three standard subdivision flags (server/text-rules.js,
+// FLAGS), but text stored before them, and channels they never covered
+// (lost-and-found, venue comments), still hold whatever was sent. So England,
+// Scotland and Wales are shown VISIBLY — U+1F3F4 then [gbeng] / [gbsct] /
+// [gbwls] — and every other tag character is dropped. Nothing else changes:
+// only the tag block, and ordinary text comes out byte for byte. Idempotent.
+// TWIN: RGI_SUBDIVISION_FLAG_RE, TAG_BLOCK_RE, visibleTags() and toolError() are
+// byte-identical in server/trip-mcp/tools.js (the site's own MCP endpoint); change both
+// (tests/mcp-tag-output.test.js compares them).
+const RGI_SUBDIVISION_FLAG_RE = /\u{1F3F4}(\u{E0067}\u{E0062}(?:\u{E0065}\u{E006E}\u{E0067}|\u{E0073}\u{E0063}\u{E0074}|\u{E0077}\u{E006C}\u{E0073}))\u{E007F}/gu;
+const TAG_BLOCK_RE = /[\u{E0000}-\u{E007F}]/gu;
+function visibleTags(value) {
+  // What JSON.stringify would write for it (a Date's string, say), once.
+  if (value && typeof value === 'object' && typeof value.toJSON === 'function') value = value.toJSON();
+  if (typeof value === 'string') {
+    return value
+      .replace(RGI_SUBDIVISION_FLAG_RE, (_, tags) => `\u{1F3F4}[${String.fromCodePoint(...[...tags].map(c => c.codePointAt(0) - 0xE0000))}]`)
+      .replace(TAG_BLOCK_RE, '');
+  }
+  if (Array.isArray(value)) return value.map(v => visibleTags(v));
+  // Object.fromEntries, not assignment: a "__proto__" key stays a key.
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([k, v]) => [visibleTags(k), visibleTags(v)]));
+  return value;
+}
+
+// Every tool's error path, the twin of its output path (code review of PR
+// #375, 2026-10-12). A tool that throws used to reach the model through the
+// MCP SDK's own handler, which writes the message as it stands — and a refusal
+// can quote stored text (move-day's 409 names both stops' headlines; a stop's
+// 409 lists the plan items it would strand). This is what that handler
+// writes, isError included, with the tag block made visible or dropped.
+// TWIN: byte-identical in mcp/mcp.js and server/trip-mcp/tools.js.
+function toolError(err) {
+  return { content: [{ type: 'text', text: visibleTags(err instanceof Error ? err.message : String(err)) }], isError: true };
+}
+
+// The one output path of every tool here: what the trip site answered, with
+// the tag block made visible or dropped (visibleTags above).
 function ok(data) {
-  return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+  return { content: [{ type: 'text', text: JSON.stringify(visibleTags(data), null, 2) }] };
+}
+
+// Every handler registered on this server — the ones below and any added
+// later — throws into toolError() rather than into the SDK's own handler, so
+// no error helper here (errorSuffix, stopRefusal, writeApi, a plain throw)
+// can carry a tag character to the model. The handler is a tool's last
+// argument, whichever of the SDK's tool() overloads (or registerTool) is used.
+function guardTools(mcp) {
+  for (const method of ['tool', 'registerTool']) {
+    const register = mcp[method].bind(mcp);
+    mcp[method] = (...args) => {
+      const handler = args.pop();
+      return register(...args, async (...a) => { try { return await handler(...a); } catch (err) { return toolError(err); } });
+    };
+  }
+  return mcp;
 }
 
 // ── MCP server + tools ────────────────────────────────────────────────────────
 function buildMcpServer() {
-const mcp = new McpServer({ name: 'trip-site', version: '1.0.0' });
+const mcp = guardTools(new McpServer({ name: 'trip-site', version: '1.0.0' }));
 
 mcp.tool('health_check', 'Check if the trip server is online and Immich is reachable. Also reports Telegram setup state: telegramBotUsername (non-null once the bot is fully live) and telegramGroupBound (true once set_telegram_group has bound the chat_id) — check this before assuming Telegram login is ready, or before troubleshooting why it isn\'t.', {},
   async () => ok(await apiGet('/api/health')));

@@ -101,10 +101,27 @@ const CODE_KEYS = new Set(['confirmation']);
 // of a { he, en } pair is stored as '' exactly as a whitespace one always was —
 // and accommodation.confirmation refuses the allowed marks too (invalid_text,
 // CODE_DETAIL): they reorder a code's digits on a right-to-left page.
+// Subdivision flags (owner decision, 2026-10-12; narrowed by the boundary
+// re-check of PR #375, same day), text-rules.js's FLAGS: the three standard
+// (RGI) subdivision flags — England, Scotland, Wales: U+1F3F4, g b + e n g /
+// s c t / w l s as tag letters, U+E007F — are visible flags, not hidden
+// characters. unsafeTextAt() and the blank check run on the value minus its
+// flags (withoutFlags), so a title, tab label, emoji or accommodation text
+// carrying one is stored as typed, and a flag alone is not blank. Any other
+// tag run is refused, well-formed or not: every tag letter is an invisible
+// ASCII letter, and a "flag" of the old shape (any 1-32 tags) carried a hidden
+// instruction to the companion's model. accommodation.confirmation (a code)
+// is checked as sent, so a flag there is refused. A link host never goes
+// through withoutFlags.
+// A booking's name copied into its check-in and check-out plan items
+// (upsertBookingItems) is cut by code points, never inside a flag (clampText),
+// and scrubbed of what the write refuses (scrubText): those items are written
+// without the stop-text check.
 // TWIN: ALLOWED_MARKS, INVISIBLE_SRC, UNSAFE_LINE_RE, UNSAFE_MULTILINE_RE, INVISIBLE_RE,
 // BLANK_ALL_RE, CODE_MARKS_RE, TEXT_DETAIL, INVISIBLE_DETAIL, CODE_DETAIL, LINK_DETAIL,
-// LINK_HOST_HIDDEN_RE, LINK_LABEL_DOT_RE, toLf, isBlankText, textDetail() and
-// safeLink() are byte-identical copies of the same names in
+// LINK_HOST_HIDDEN_RE, LINK_LABEL_DOT_RE, FLAG_TAG_SRC, FLAG_TAG_RE, withoutFlags,
+// toLf, isBlankText, STRIP_LINE_RE, STRIP_MULTILINE_RE, FLAG_SPLIT_RE, textDetail(),
+// scrubText() and safeLink() are byte-identical copies of the same names in
 // server/text-rules.js; tests/stop-hardening.test.js ("the twins") compares
 // them. Change one, change both.
 const ALLOWED_MARKS = String.raw`\u200C-\u200F\u061C\uFE0F`;
@@ -120,8 +137,17 @@ const CODE_DETAIL = 'a confirmation number or PIN may not contain invisible char
 const LINK_DETAIL = 'a link must start with http:// or https://, name its host as the browser will use it, and contain no quotes, backslashes, < >, or whitespace';
 const LINK_HOST_HIDDEN_RE = /[\u00AD\u034F\u180B-\u180D\u180F\u200B\u2028\u2029\u202A-\u202E\u2060\u2064\u2066-\u2069\u2800\uFE00-\uFE0F\uFEFF\u{16FE4}\u{1BCA0}-\u{1BCA3}\u{E0100}-\u{E01EF}]/u;
 const LINK_LABEL_DOT_RE = /[.。．｡]/;
+// The three standard subdivision flags, and the string every text rule checks
+// (FLAGS above). FLAG_TAG_RE is global: replace(), split() and matchAll() only,
+// never test().
+const FLAG_TAG_SRC = String.raw`\u{1F3F4}\u{E0067}\u{E0062}(?:\u{E0065}\u{E006E}\u{E0067}|\u{E0073}\u{E0063}\u{E0074}|\u{E0077}\u{E006C}\u{E0073})\u{E007F}`;
+const FLAG_TAG_RE = new RegExp(FLAG_TAG_SRC, 'gu');
+const withoutFlags = (s) => s.replace(FLAG_TAG_RE, '\u{FFFD}');
 const toLf = (s) => s.replace(/\r\n?/g, '\n');
-const isBlankText = (s) => !s.replace(BLANK_ALL_RE, '');
+const isBlankText = (s) => !withoutFlags(s).replace(BLANK_ALL_RE, '');
+const STRIP_LINE_RE = new RegExp(UNSAFE_LINE_RE.source, 'gu');
+const STRIP_MULTILINE_RE = new RegExp(UNSAFE_MULTILINE_RE.source, 'gu');
+const FLAG_SPLIT_RE = new RegExp(`(${FLAG_TAG_SRC})`, 'u');
 const STOP_FIELDS = ['dates', 'accommodation', 'title', 'tabLabel', 'emoji'];
 const OPEN_TITLE = { he: 'ימים שעוד לא תוכננו', en: 'Days not planned yet' };
 // The same sentence the provisioner writes, so an unchanged trip serves
@@ -238,13 +264,20 @@ const fail = (status, error, extra = {}) => ({ status, body: { error, ...extra }
 
 // The first string in `value` (a string, or a { he, en } pair) that carries
 // text a browser could read as markup, or that renders other than it reads:
-// { field: its path, detail } — or null.
-function unsafeTextAt(value, path, { multiline = false } = {}) {
+// { field: its path, detail } — or null. Checked minus its standard flags
+// (withoutFlags, FLAGS above); a `code` value is checked as sent, so a flag in
+// a confirmation number is refused.
+function unsafeTextAt(value, path, { multiline = false, code = false } = {}) {
   const re = multiline ? UNSAFE_MULTILINE_RE : UNSAFE_LINE_RE;
-  if (typeof value === 'string') return re.test(value) ? { field: path, detail: textDetail(value, multiline) } : null;
+  const at = (s, field) => {
+    const checked = code ? s : withoutFlags(s);
+    return re.test(checked) ? { field, detail: textDetail(checked, multiline) } : null;
+  };
+  if (typeof value === 'string') return at(value, path);
   if (isObj(value)) {
     for (const k of Object.keys(value)) {
-      if (typeof value[k] === 'string' && re.test(value[k])) return { field: `${path}.${k}`, detail: textDetail(value[k], multiline) };
+      const bad = typeof value[k] === 'string' ? at(value[k], `${path}.${k}`) : null;
+      if (bad) return bad;
     }
   }
   return null;
@@ -266,6 +299,31 @@ function lfValue(value) {
 function textDetail(s, multiline) {
   if (/[<>]/.test(s) || (!multiline && /[\n\r]/.test(s)) || !INVISIBLE_RE.test(s)) return TEXT_DETAIL;
   return INVISIBLE_DETAIL;
+}
+
+// `t` with every character the write refuses in a text field removed, its
+// standard flags kept whole (twin of text-rules.js, where cleanText() uses it).
+function scrubText(t, multiline) {
+  const strip = (part) => part.replace(multiline ? STRIP_MULTILINE_RE : STRIP_LINE_RE, '');
+  // split() with a capture group: the odd parts are the flags, kept as they are.
+  return t.split(FLAG_SPLIT_RE).map((part, i) => (i % 2 ? part : strip(part))).join('');
+}
+
+// At most `max` CODE POINTS of `s` — never half of a surrogate pair — and never
+// cut inside a standard flag: a flag the cut would fall in is dropped whole.
+// (A UTF-16 slice of a 120-character booking name could stop in the middle of
+// England's 7 code points, leaving orphan tag characters the write refuses,
+// or in the middle of an emoji's surrogate pair, a U+FFFD.)
+function clampText(s, max) {
+  const cps = [...s];
+  if (cps.length <= max) return s;
+  let end = max;
+  for (const m of s.matchAll(FLAG_TAG_RE)) {
+    const start = [...s.slice(0, m.index)].length;
+    if (start >= end) break;
+    if (start + [...m[0]].length > end) { end = start; break; }
+  }
+  return cps.slice(0, end).join('');
 }
 
 // A link a renderer can put in an href as it stands: parsed by the WHATWG URL
@@ -315,7 +373,7 @@ function validateAccommodation(value, path = 'accommodation') {
       v = safeLink(raw);
       if (v === undefined) return { error: fail(400, 'invalid_link', { field, detail: LINK_DETAIL }) };
     } else {
-      const bad = unsafeTextAt(raw, field, { multiline: MULTILINE_KEYS.has(key) });
+      const bad = unsafeTextAt(raw, field, { multiline: MULTILINE_KEYS.has(key), code: CODE_KEYS.has(key) });
       if (bad) return { error: invalidText(bad) };
       if (CODE_KEYS.has(key) && typeof raw === 'string' && CODE_MARKS_RE.test(raw)) return { error: invalidText({ field, detail: CODE_DETAIL }) };
       v = kind === 'text' ? textValue(raw) : scalarValue(raw);
@@ -1127,7 +1185,10 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
   // (a re-filed booking whose items were left on the stop it came from); it
   // never adds one the caller asked not to have.
   function upsertBookingItems(rows, stopId, booking, uids, { create = true } = {}) {
-    const name = String(booking.name || '').slice(0, 200);
+    // A booking's name is typed text the stop-text check never sees here: cut
+    // by code points, never inside a flag, and scrubbed of what the write
+    // refuses — a name stored before the write rules may carry anything.
+    const name = scrubText(clampText(String(booking.name || ''), 200), false).trim();
     const specs = [
       { uid: uids.checkin, date: isoDay(booking.date_from), time: 'afternoon', he: `צ׳ק-אין — ${name}`, en: `Check-in — ${name}` },
       { uid: uids.checkout, date: isoDay(booking.date_to), time: 'morning', he: `צ׳ק-אאוט — ${name}`, en: `Check-out — ${name}` },
