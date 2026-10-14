@@ -2,6 +2,7 @@ import { spawn, execFileSync } from 'child_process';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { PORTS, TRIP_BRIDGE_PORT_RANGE } from './ports.js';
+import { assertPortFree } from './port-guard.js';
 
 /**
  * Who is listening on this port, as a sentence, or null if we cannot tell.
@@ -73,6 +74,7 @@ let BASE_URL = `http://localhost:${DEFAULT_TEST_PORT}`;
 
 export async function startTestMcp(extraEnv = {}) {
   const port = extraEnv.MCP_PORT || DEFAULT_TEST_PORT;
+  await assertPortFree(port);
   BASE_URL = `http://localhost:${port}`;
   return new Promise((resolve, reject) => {
     let startupTimer;

@@ -13,7 +13,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
 import { MCP_API_KEY, TRIP_API_KEY, startTestMcp, stopTestMcp, mcpCallTool } from './helpers/mcp.js';
-import { PORTS } from './helpers/ports.js';
+import { freePort } from './helpers/port-guard.js';
 
 const require = createRequire(import.meta.url);
 const { isValidTimeZone } = require('../server/living-journey.js');
@@ -72,7 +72,7 @@ describe('set_trip_timezone', () => {
       apiServer.listen(0, '127.0.0.1', resolve);
     });
     apiBaseUrl = `http://127.0.0.1:${apiServer.address().port}`;
-    await startTestMcp({ API_BASE_URL: apiBaseUrl, MCP_PORT: String(PORTS.mcpTripTimezone), MCP_API_KEY });
+    await startTestMcp({ API_BASE_URL: apiBaseUrl, MCP_PORT: String(await freePort()), MCP_API_KEY });
   });
 
   after(async () => {

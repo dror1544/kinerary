@@ -23,7 +23,7 @@ import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { join, dirname } from 'node:path';
 import { createRequire } from 'node:module';
-import { PORTS } from './helpers/ports.js';
+import { freePort } from './helpers/port-guard.js';
 import { startTestServer, stopTestServer, api, loginAsAlice, testTripDir } from './helpers/server.js';
 
 const require = createRequire(import.meta.url);
@@ -56,7 +56,7 @@ async function state() {
 }
 
 before(async () => {
-  await startTestServer({ PORT: String(PORTS.calendarRoutes) });
+  await startTestServer({ PORT: String(await freePort()) });
   alice = await loginAsAlice();
 });
 after(() => stopTestServer());
