@@ -10,7 +10,7 @@
  * (Node's equivalent of the worker's _is_iana_timezone), and the DB override
  * winning over the config's own fallback chain in buildTodayContext.
  */
-import { PORTS } from './helpers/ports.js';
+import { freePort } from './helpers/port-guard.js';
 import assert from 'node:assert/strict';
 import { before, after, test } from 'node:test';
 import { createRequire } from 'node:module';
@@ -44,7 +44,7 @@ test('isValidTimeZone rejects garbage, a country name, and empty/missing values'
 // ── GET/PATCH /api/settings, over the real running server ──────────────────
 
 let token;
-before(async () => { await startTestServer({ HOST: '127.0.0.1', PORT: PORTS.tripTimezone }); token = await loginAsAlice(); });
+before(async () => { await startTestServer({ HOST: '127.0.0.1', PORT: await freePort() }); token = await loginAsAlice(); });
 after(stopTestServer);
 
 test('GET /api/settings starts with no timezone override', async () => {

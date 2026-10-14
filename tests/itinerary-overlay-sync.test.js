@@ -23,7 +23,7 @@
  */
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { PORTS } from './helpers/ports.js';
+import { freePort } from './helpers/port-guard.js';
 import { startTestServer, stopTestServer, api } from './helpers/server.js';
 
 // Matches HERMES_API_KEY in startTestServer() — the service-account path, so
@@ -34,7 +34,7 @@ const CONFIG_DAY = '2027-03-11';
 
 const active = async () => (await api('/api/itinerary/active', { apiKey: AGENT_KEY })).json();
 
-before(async () => { await startTestServer({ PORT: String(PORTS.itineraryOverlaySync) }); });
+before(async () => { await startTestServer({ PORT: String(await freePort()) }); });
 after(() => stopTestServer());
 
 describe('A. A Classic edit adds to the itinerary instead of replacing it', () => {

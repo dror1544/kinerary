@@ -15,7 +15,17 @@
  * letting a duplicate surface later as a flaky EADDRINUSE.
  *
  * Only fixed ports belong here. A stand-in that binds port 0 and reads its
- * address back cannot collide, and needs no entry.
+ * address back cannot collide, and needs no entry. Neither does a test whose
+ * server needs no known port: `await freePort()` (helpers/port-guard.js) takes
+ * whatever the OS has free, so a LEAKED server from an earlier or another
+ * worktree's run cannot hold it — which is what fixed ports are exposed to,
+ * and why a test that can use one should (control-plane-session, hero-http,
+ * calendar-routes... did, 2026-10-13).
+ *
+ * A fixed port that something already holds is named, not discovered as an
+ * EADDRINUSE cascade: `npm test` runs check-free-ports.js first (pretest),
+ * and startTestServer()/startTestMcp() call assertPortFree() before spawning.
+ * Both name the holder's pid and command and say how to stop it.
  *
  * Adding a test that binds a port: add a named entry here, and import it.
  * Never write a port literal in a test file. That rule is not style: a literal
@@ -75,8 +85,6 @@ export const EPHEMERAL_RANGE_FIRST = 32768;
 export const TRIP_BRIDGE_PORT_RANGE = { first: 3100, last: 3999 };
 
 export const PORTS = {
-  companionControl:        28201,
-  companionConversation:   28202,
   // ── Full trip servers ──────────────────────────────────────────────────
   telegramSso:             28095,
   telegramSsoConfigResync: 28100,
@@ -91,7 +99,6 @@ export const PORTS = {
   errorHandling:           28105,
   currencyRates:           28107,
   scheduleReviewServer:    28109,
-  itineraryOverlaySync:    28113,
   planSingleSource:        28119,
   planSingleSourceBoot:    28120,
   itineraryPlanLayerServer: 28118,
@@ -100,15 +107,8 @@ export const PORTS = {
   configAllowListPromote:  28127,  // tests/config-allow-list.test.js — malformed plan config, issue #172
   galleryBoundary:         28128,  // tests/gallery-boundary.test.js — issues #191/#194
   galleryHardening:        28129,  // tests/gallery-hardening.test.js — boundary audit round 2 of #191/#194
-  // tests/trip-documents.test.js
-  tripDocuments:           28299,
-  tripTimezone:            28310,  // tests/trip-timezone.test.js
-
   modernParity:            28298,
-  modernEnrichment:        28194,
-  heroHttp:                28196,
   tripEventsHttp:          28198,
-  controlPlaneSession:     28296,
   tripMcpEnabled:          28304,
   tripMcpDisabled:         28305,
   tripMcpPublicOrigin:     28306,
@@ -122,21 +122,17 @@ export const PORTS = {
   configDayLinksSeeded:    28115,
 
   // ── MCP servers ────────────────────────────────────────────────────────
-  controlPlaneSessionMcp:  28295,
   groupDocumentMcp:        28293,
   mcpExtract:              28106,
   mcpExtractEmpty:         28300,
   mcpExtractEnv:           28301,  // tests/mcp-extract-env.test.js — issue #183
   itineraryPlanLayerMcp:   28108,
   mcpDefault:              28117,
-  mcpBookingConfirmation:  28116,
-  mcpBudget:               28121,
   mcpHealthUnreachable:    28122,
   mcpHealthReachable:      28123,
   mcpHealthAuth:           28125,
   mcpPhasePlan:            28308,  // tests/mcp-phase-plan.test.js — issue #310
   mcpPhasePlanLarge:       28309,  // tests/mcp-phase-plan.test.js — issue #310, safety-net fixture
-  mcpTripTimezone:         28311,  // tests/mcp-trip-timezone.test.js
   lostFound:               28312,  // tests/lost-found.test.js — issue #207
   // Stop editing after the interview (server slices S1–S3).
   tripStops:               28313,  // tests/trip-stops-http.test.js — main flow
@@ -159,9 +155,6 @@ export const PORTS = {
   // The four P2 findings of the automated review of PR #362 (stop editing)
   // — tests/stop-review-fixes.test.js.
   stopReviewFixes:         28326,
-  // A plan date must be a day on the calendar, on every plan route (second
-  // boundary re-check of PR #373) — tests/calendar-routes.test.js.
-  calendarRoutes:          28327,
   // Subdivision flags (emoji tag sequences) in stop text, over HTTP (owner
   // decision, 2026-10-12) — tests/emoji-flags-http.test.js.
   emojiFlagsHttp:          28328,

@@ -4,6 +4,7 @@ import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { PORTS } from './ports.js';
+import { assertPortFree } from './port-guard.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURES_DIR = join(HERE, '..', 'fixtures');
@@ -22,6 +23,10 @@ let tripDir = null;
 let BASE_URL = `http://localhost:${DEFAULT_TEST_PORT}`;
 
 export async function startTestServer(extraEnv = {}) {
+  const port = extraEnv.PORT || DEFAULT_TEST_PORT;
+  // A leaked server holding this port would otherwise surface as EADDRINUSE
+  // and "exited before becoming ready"; this names the holder instead.
+  await assertPortFree(port);
   dataDir = mkdtempSync(join(tmpdir(), 'trip-test-'));
   // The trip dir is a throwaway copy, never the committed fixtures directory.
   // Endpoints that persist config changes (participant binding, plan export)
@@ -33,7 +38,6 @@ export async function startTestServer(extraEnv = {}) {
   mkdirSync(join(siteDir, 'confirmations'), { recursive: true });
   writeFileSync(join(siteDir, 'confirmations', 'static-test.pdf'), '%PDF-1.4 static confirmation');
   writeFileSync(join(siteDir, 'private-guide.docx'), 'private test document');
-  const port = extraEnv.PORT || DEFAULT_TEST_PORT;
   BASE_URL = `http://localhost:${port}`;
 
   return new Promise((resolve, reject) => {
