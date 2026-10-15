@@ -570,7 +570,13 @@ describe('mcp/mcp.js stop tools — against the real trip server (the colmar tri
       phase_id: 'colmar', accommodation: { name: { he: 'מלון קולמר', en: 'Hotel Colmar' }, type: 'hotel' },
     }));
     assert.deepEqual(result.stop.accommodation, { name: { he: 'מלון קולמר', en: 'Hotel Colmar' }, type: 'hotel' });
-    assert.deepEqual((await phase('colmar')).accommodation, { name: { he: 'מלון קולמר', en: 'Hotel Colmar' }, type: 'hotel' });
+    // The stored hotel is what the tool echoes; the served config also carries
+    // the hotel's resolved map and Waze links (server/hotel-place.js).
+    const served = (await phase('colmar')).accommodation;
+    const { location_url, waze, ...rest } = served;
+    assert.deepEqual(rest, { name: { he: 'מלון קולמר', en: 'Hotel Colmar' }, type: 'hotel' });
+    assert.match(location_url, /^https:\/\/www\.google\.com\/maps\/search\/\?api=1&query=Hotel%20Colmar/);
+    assert.match(waze, /^https:\/\/waze\.com\/ul\?q=Hotel%20Colmar/);
   });
 
   // Review of #362, finding 4: the tool schemas check the shape only; the site

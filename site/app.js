@@ -2851,11 +2851,18 @@ function bookingRefBadges(b) {
   const googleWalletBadge = googleWalletUrl
     ? `<a href="${googleWalletUrl}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;text-decoration:none;margin-right:4px;vertical-align:middle"><img src="/google-wallet-badge.svg" alt="Add to Google Wallet" style="height:52px;display:block"></a>`
     : '';
-  const locationUrl = bkEsc(bkSafeUrl(b.location_url));
+  // A hotel booking also carries `place` (server/hotel-place.js): its own link,
+  // or a search for its name and town, plus Waze — the same ones every screen
+  // opens. location_url stays what is stored, so the edit form is untouched.
+  const locationUrl = bkEsc(bkSafeUrl(b.location_url || b.place?.maps_url));
   const locationBadge = locationUrl
     ? `<a href="${locationUrl}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;gap:2px;color:var(--accent);font-size:12px;text-decoration:none;vertical-align:middle;margin-right:4px" title="Location">📍</a>`
     : '';
-  return `${confBadge}${pdfLink}${appleWalletBadge}${googleWalletBadge}${locationBadge}`;
+  const wazeUrl = bkEsc(bkSafeUrl(b.place?.waze_url));
+  const wazeBadge = wazeUrl
+    ? `<a href="${wazeUrl}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;gap:2px;color:var(--accent);font-size:12px;text-decoration:none;vertical-align:middle;margin-right:4px" title="Waze">🔵</a>`
+    : '';
+  return `${confBadge}${pdfLink}${appleWalletBadge}${googleWalletBadge}${locationBadge}${wazeBadge}`;
 }
 
 function buildBookingRow(b, canEdit) {
@@ -3635,7 +3642,7 @@ function accommodationAnchors(cfg) {
       date_to: p.dates?.end || null,
       confirmation: acc.confirmation || null,
       conf_file: acc.pdf || null,
-      location_url: acc.mapsUrl || acc.maps || (acc.address ? googleMapsUrl(acc.address) : null),
+      location_url: acc.location_url || acc.mapsUrl || acc.maps || (acc.address ? googleMapsUrl(acc.address) : null),
     };
   }).filter(Boolean);
 }
@@ -3908,7 +3915,10 @@ function renderPhaseHotelCard(phase) {
   const guests = acc.guests;
   const rooms = acc.rooms;
   const phone = acc.phone;
-  const mapsUrl = safeUrl(acc.mapsUrl || acc.maps || (addr ? googleMapsUrl(addr) : null));
+  // location_url first: it is what a stop's hotel carries once the stop layer
+  // wrote it (server/hotel-place.js resolves it, with `waze`, for every hotel a
+  // booking or the companion set) — the same links the other screens open.
+  const mapsUrl = safeUrl(acc.location_url || acc.mapsUrl || acc.maps || (addr ? googleMapsUrl(addr) : null));
   const wazeUrl = safeUrl(acc.waze);
   // The weather key lands inside an inline onclick — a JS string in an
   // attribute, where esc() is not enough (&#39; is decoded back to ' before

@@ -229,9 +229,12 @@ describe('GET /api/itinerary/active: "Tonight" is computed from the effective co
     assert.equal(tonight(body, 'paris', '2026-12-01'), 'Hotel Override');
     assert.equal(tonight(body, 'paris', '2026-12-02'), 'Hotel Override');
     assert.deepEqual(body.days.find(d => d.phase_id === 'paris' && d.date === '2026-12-02').lodging_context,
-      { name: 'Hotel Override', address: '2 Rue Override', location_url: 'https://maps.example/override' });
+      { name: 'Hotel Override', address: '2 Rue Override', location_url: 'https://maps.example/override',
+        // A hotel the stop layer wrote also carries its Waze link, resolved from
+        // the name and address (server/hotel-place.js); the file's hotels do not.
+        waze_url: 'https://waze.com/ul?q=Hotel%20Override%2C%202%20Rue%20Override&navigate=yes' });
     assert.ok(!text.includes('Hotel Paris') && !text.includes('1 Rue Example'), 'nothing of the replaced hotel rides along');
-    assert.ok(!text.includes('CONF-OVERRIDE-SECRET'), 'only the three day-context fields are served');
+    assert.ok(!text.includes('CONF-OVERRIDE-SECRET'), 'only the day-context fields are served');
     assert.equal(tonight(body, 'paris', '2026-12-04'), 'Lyon Hotel A', 'the transfer day is still Lyon\'s night');
   });
 

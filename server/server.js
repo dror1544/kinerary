@@ -12,6 +12,7 @@ const { OAuth2Client } = require('google-auth-library');
 const livingJourney = require('./living-journey');
 const { createTripEvents } = require('./trip-events');
 const { createTripStructure } = require('./trip-structure');
+const { createHotelPlaces } = require('./hotel-place');
 const { createControlPlaneAuth } = require('./control-plane-auth');
 const { NEED_TYPES, NEED_SEVERITIES, VISIBILITIES, normalizeSeverity, normalizeVisibility } = require('../shared/needs-schema');
 const { AGENT_TONES, AGENT_GENDERS, PROACTIVE_KEYS, normalizeInstructionVisibility, normalizeTone, normalizeGender, normalizeOrganizers } = require('../shared/agent-schema');
@@ -806,7 +807,9 @@ function sanitizeConfig(cfg) {
 app.get('/api/config', authRequired, (_req, res) => {
   // The stop layer is merged in FIRST, then the allow-list applies to the
   // result exactly as it applies to the file (server/trip-structure.js).
-  const safe = sanitizeConfig(effectiveConfig());
+  // A hotel the stop layer wrote is resolved to its map and Waze links first
+  // (server/hotel-place.js); the allow-list then applies to the result as ever.
+  const safe = sanitizeConfig(hotelPlaces.hydrateConfig(effectiveConfig()));
   safe.trivia_available = TRIVIA_QUESTIONS.length > 0;
   // Every reload must see this deploy's config, not a stale copy some
   // intermediary (browser, Cloudflare, a reverse proxy in front of it)
@@ -982,7 +985,18 @@ function agentActingOnOrganizer(req, uname) {
   return Boolean(req.user?.isAgent) && normalizeOrganizers(TRIP_CONFIG.agent).includes(uname);
 }
 
+// One answer to "where is this hotel": name, Google Maps, Waze — the same on
+// every screen (server/hotel-place.js). Lazy over the stop layer, which is
+// created below: nothing here is called before the server is listening.
+const hotelPlaces = createHotelPlaces({
+  getConfig: () => effectiveConfig(),
+  sources: () => tripStructure.accommodationSources(),
+  // An APPROVED booking only: a draft is organizer-private and shapes nothing.
+  bookingById: (id) => db.prepare("SELECT id, type, name, phase, location_url FROM bookings WHERE id = ? AND COALESCE(review_status, 'approved') = 'approved'").get(id) || null,
+});
+
 const journey = livingJourney.create({
+  hotelPlaces,
   db,
   // The FILE: what the original plan is imported from at first boot.
   config: TRIP_CONFIG,
@@ -1110,7 +1124,7 @@ try { require('./trip-mcp').registerTripMcp({
   userExists: username => Boolean(getUser(username)) && (TRIP_CONFIG.participants || []).some(p => p.username === username),
   // Never the raw config: whatever the connector says about the trip is what
   // /api/config already says to a signed-in member — the trip as it is now.
-  getPublicConfig: () => sanitizeConfig(effectiveConfig()),
+  getPublicConfig: () => sanitizeConfig(hotelPlaces.hydrateConfig(effectiveConfig())),
   authRequired,
   listenPort: process.env.PORT || 3000,
   listenHost: process.env.HOST,
@@ -2576,7 +2590,9 @@ app.get('/api/bookings', authRequired, (req, res) => {
   if (type)  { wheres.push('type = ?');  params.push(type);  }
   if (wheres.length) sql += ' WHERE ' + wheres.join(' AND ');
   sql += ' ORDER BY date_from, id';
-  res.json(db.prepare(sql).all(...params));
+  // A hotel booking also says where it is (`place`); location_url stays what
+  // is stored, so an edit form never saves a derived link back.
+  res.json(db.prepare(sql).all(...params).map((booking) => hotelPlaces.decorateBooking(booking)));
 });
 
 app.post('/api/bookings/extract-draft', organizerOrAgentRequired, extractUpload.single('file'), async (req, res) => {
@@ -2876,10 +2892,15 @@ function joinBooking(item, { includeDrafts = false } = {}) {
   const withCorr = withCorrection(item);
   if (!item.booking_id) return withCorr;
   const bk = db.prepare(
-    'SELECT id, name, confirmation, conf_file FROM bookings WHERE id = ?' +
+    'SELECT id, name, confirmation, conf_file, type, phase, location_url FROM bookings WHERE id = ?' +
     (includeDrafts ? '' : " AND COALESCE(review_status, 'approved') = 'approved'")
   ).get(item.booking_id);
-  return { ...withCorr, booking: bk || null };
+  if (!bk) return { ...withCorr, booking: null };
+  // A hotel's check-in/check-out resolve its place the way every other screen
+  // does (server/hotel-place.js); the card keeps its four fields plus `place`.
+  const { type, phase, location_url, ...card } = bk;
+  const place = hotelPlaces.decorateBooking(bk).place;
+  return { ...hotelPlaces.decorateItem(withCorr, bk), booking: place ? { ...card, place } : card };
 }
 
 const PLAN_STATUSES = new Set(['confirmed', 'needs_review']);

@@ -310,6 +310,9 @@ function dayContextForPhase(rawPhase, date) {
       name: accommodation.name || accommodation.hotel || accommodation.title || null,
       address: accommodation.address || null,
       location_url: accommodation.location_url || accommodation.url || null,
+      // Only when the hotel has one (the stop layer's hotel resolves it, see
+      // server/hotel-place.js) — a stored context stays the three fields it was.
+      ...(accommodation.waze ? { waze_url: accommodation.waze } : {}),
     }) : null,
     // phases[].pickup is not on the allow-list: no producer writes it, nothing
     // renders it, and it has no shape to allow. The column stays for rows
@@ -369,7 +372,7 @@ function withServedLodging(day, phases) {
 function publicDayContext(day) {
   const lodging = day.lodging_context && typeof day.lodging_context === 'object' ? day.lodging_context : null;
   const accommodation = lodging ? publicPart('phase', { accommodation: {
-    name: lodging.name, address: lodging.address, location_url: lodging.location_url,
+    name: lodging.name, address: lodging.address, location_url: lodging.location_url, waze: lodging.waze_url,
   } })?.accommodation : null;
   return {
     ...day,
@@ -377,6 +380,8 @@ function publicDayContext(day) {
       name: accommodation.name ?? null,
       address: accommodation.address ?? null,
       location_url: accommodation.location_url ?? null,
+      // A Waze link rides along only when the hotel has one.
+      ...(accommodation.waze ? { waze_url: accommodation.waze } : {}),
     } : null,
     pickup_context: null,
   };
@@ -633,7 +638,7 @@ function markProvenance(db, payload) {
 // `config` is the effective (raw-shaped) config the participant view computes
 // each night's lodging from; /api/itinerary/original (includeOriginal) serves
 // the immutable snapshot as stored and takes none.
-function serializeItinerary(db, rows, { includeOriginal = false, config = null } = {}) {
+function serializeItinerary(db, rows, { includeOriginal = false, config = null, hotelPlaces = null } = {}) {
   // A booking imported for organizer review is not participant-visible yet.
   // Every participant-facing itinerary projection must enforce that boundary;
   // filtering only /api/bookings leaked draft details through attached cards.
@@ -652,7 +657,21 @@ function serializeItinerary(db, rows, { includeOriginal = false, config = null }
       booking: item.booking_id ? bookingsById.get(item.booking_id) || null : null,
     })),
   };
-  return includeOriginal ? payload : markProvenance(db, payload);
+  if (includeOriginal) return payload;
+  const marked = markProvenance(db, payload);
+  if (!hotelPlaces) return marked;
+  // After provenance, which compares an item's link with the original's: a link
+  // resolved at serve time is not an edit. A hotel's items (check-in, check-out,
+  // anything attached to the booking) get the hotel's links where they have none,
+  // and the booking card says where the hotel is — server/hotel-place.js.
+  return {
+    ...marked,
+    items: marked.items.map((item) => {
+      if (!item.booking) return item;
+      const place = hotelPlaces.decorateBooking(item.booking).place;
+      return { ...hotelPlaces.decorateItem(item, item.booking), booking: place ? { ...item.booking, place } : item.booking };
+    }),
+  };
 }
 
 function issueFingerprint(issue) {
@@ -1095,7 +1114,15 @@ async function weatherObservation(db, fetchImpl, query) {
   }
 }
 
-function buildTodayContext(db, config) {
+// An item with its hotel's links, for the routes that serve raw plan rows
+// (/api/today): the same decoration the active itinerary applies.
+function withHotelPlace(db, item, hotelPlaces) {
+  if (!hotelPlaces || !item?.booking_id) return item;
+  const booking = db.prepare("SELECT id, type, name, phase, location_url FROM bookings WHERE id = ? AND COALESCE(review_status, 'approved') = 'approved'").get(item.booking_id);
+  return hotelPlaces.decorateItem(item, booking);
+}
+
+function buildTodayContext(db, config, { hotelPlaces = null } = {}) {
   const rows = activeRows(db);
   const clock = localClock(db, config);
   const today = clock.date;
@@ -1132,9 +1159,9 @@ function buildTodayContext(db, config) {
     first_date: firstDate,
     last_date: lastDate,
     countdown_days: firstDate ? Math.ceil((new Date(`${firstDate}T00:00:00Z`) - new Date(`${today}T00:00:00Z`)) / 86400000) : null,
-    current: todayItems[0] || null,
-    next: nextItem,
-    events: todayItems,
+    current: todayItems[0] ? withHotelPlace(db, todayItems[0], hotelPlaces) : null,
+    next: nextItem ? withHotelPlace(db, nextItem, hotelPlaces) : null,
+    events: todayItems.map((item) => withHotelPlace(db, item, hotelPlaces)),
     flights: flightToday,
   };
 }
@@ -1186,7 +1213,7 @@ function moveDayRows(rows, { from, to, date, lodging, headline }) {
   return { items: moved, headline: headlineMoved };
 }
 
-function registerRoutes({ app, db, config, getConfig, raw, fetchImpl, mediaDir, authRequired, organizerOrAgentRequired, requestItemEnrichment, phaseKnown, stopKnown, onPhasesReshuffled, reviewConfigured }) {
+function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImpl, mediaDir, authRequired, organizerOrAgentRequired, requestItemEnrichment, phaseKnown, stopKnown, onPhasesReshuffled, reviewConfigured }) {
   // The trip as it is now. server.js passes the effective config (the file
   // with the stop layer merged over it, server/trip-structure.js); a caller
   // that passes only `config` gets exactly that object, as before.
@@ -1274,7 +1301,7 @@ function registerRoutes({ app, db, config, getConfig, raw, fetchImpl, mediaDir, 
     if (!rows) return res.status(404).json({ error: 'itinerary_not_ready' });
     // The ETag is over the payload, so a stop edit — which changes the lodging
     // served, not the plan revision — is a new ETag, never a 304.
-    const payload = serializeItinerary(db, rows, { config: cfg() });
+    const payload = serializeItinerary(db, rows, { config: hotelPlaces ? hotelPlaces.hydrateConfig(cfg()) : cfg(), hotelPlaces });
     const etag = etagForPayload(payload);
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('ETag', etag);
@@ -1557,7 +1584,7 @@ function registerRoutes({ app, db, config, getConfig, raw, fetchImpl, mediaDir, 
 
   app.get('/api/today', authRequired, (_req, res) => {
     res.setHeader('Cache-Control', 'no-store');
-    res.json(buildTodayContext(db, cfg()));
+    res.json(buildTodayContext(db, cfg(), { hotelPlaces }));
   });
 
   app.get('/api/confirmations/summary', authRequired, (_req, res) => {

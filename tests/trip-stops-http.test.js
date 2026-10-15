@@ -243,7 +243,8 @@ describe('stop editing on the colmar trip', () => {
     assert.deepEqual(r.body.items, { checkin: `booking_${hotelId}_checkin`, checkout: `booking_${hotelId}_checkout` });
     const colmar = await phase('colmar');
     assert.deepEqual(colmar.dates, { start: '2026-12-02', end: '2026-12-07' });
-    assert.deepEqual(colmar.accommodation, { type: 'hotel', name: 'Hotel Colmar Centre', confirmation: 'HCC-778', location_url: 'https://maps.example/colmar-centre' });
+    // The booking's own link is kept; Waze is resolved beside it (server/hotel-place.js).
+    assert.deepEqual(colmar.accommodation, { type: 'hotel', name: 'Hotel Colmar Centre', confirmation: 'HCC-778', location_url: 'https://maps.example/colmar-centre', waze: 'https://waze.com/ul?q=Hotel%20Colmar%20Centre%2C%20Colmar&navigate=yes' });
     assert.deepEqual(await unplanned(), []);
     const text = JSON.stringify(await config());
     assert.ok(!text.includes('DOOR-PIN-5521') && !text.includes('private booking notes'));
