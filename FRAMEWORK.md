@@ -455,7 +455,8 @@ instance talks to one trip via `API_BASE_URL`.
 
 The site also serves its **own** MCP endpoint, for a trip member's own Claude
 or ChatGPT rather than the companion (`server/trip-mcp/`, off unless
-`TRIP_MCP_ENABLED` and `PUBLIC_ORIGIN` are set): read and write for an
+`TRIP_MCP_ENABLED` and `PUBLIC_ORIGIN` are set; the provisioner writes both for
+every new trip): read and write for an
 organizer, read only for everyone else. It is its own OAuth 2.1 authorization
 server: the person adds `<site>/mcp` (the More tab has an "Add to Claude"
 install link), signs in with their site login, and approves. Tools call the

@@ -102,6 +102,20 @@ class LxcProvisionAdapterTests(unittest.TestCase):
             topology_path = os.path.join(deploy_root, "trips", "tokyo-2026", "topology.yaml")
             self.assertTrue(os.path.exists(topology_path))
 
+    def test_a_new_trips_site_is_told_its_public_origin_so_the_member_connector_turns_on(self) -> None:
+        # server/trip-mcp is off unless the site's .env carries PUBLIC_ORIGIN;
+        # the bootstrap writes it from this field, and the OAuth issuer the
+        # assistants see must equal the host the trip is actually served on.
+        with tempfile.TemporaryDirectory() as deploy_root:
+            provisioner = FakeProvisioner(vmid="205")
+            adapter = _adapter(deploy_root, provisioner=provisioner)
+
+            adapter.create_container("tokyo-2026")
+
+            topology, _ = provisioner.apply_calls[0]
+            self.assertTrue(topology.proxy.hostname)
+            self.assertEqual(f"https://{topology.proxy.hostname}", topology.lxc.public_origin)
+
     def test_a_new_trips_data_dir_and_its_mount_are_both_named_by_trip_id(self) -> None:
         # A slug is the organizer's words and is deliberately reusable: teardown
         # frees it, so the next family naming their trip the same way would land

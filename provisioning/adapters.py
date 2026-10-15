@@ -213,6 +213,7 @@ class ProxmoxLxcAdapter:
         """Run the (idempotent) app-environment bootstrap against a container
         that already exists — the in-place converge path for a half-built one.
         Starts the container first if it is stopped."""
+        self._trip_mcp_env_lines(spec)
         record = self.inspect(spec)
         if record is None:
             raise RuntimeError(
@@ -242,7 +243,35 @@ class ProxmoxLxcAdapter:
             self.ssh.run(f"pct stop {shlex.quote(record['vmid'])}")
         self._reset_trip_data(spec.nfs_host_dir)
 
+    # A plain https origin: scheme, a DNS-shaped host, nothing else. The value
+    # lands in an UNQUOTED .env heredoc that a shell expands, so anything else
+    # (a $, a backtick, a newline, a path, a port) must never get that far.
+    _PUBLIC_ORIGIN = re.compile(r"https://[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*")
+
+    def _trip_mcp_env_lines(self, spec: LxcSpec) -> str:
+        """The two .env lines that switch on the site's member MCP connector
+        (server/trip-mcp: organizers read and write, members read only), or ""
+        for a spec with no public origin.
+
+        The connector is off unless BOTH are set, and off is silent: nginx
+        routes /mcp and /oauth/ to Express, which answers 404, and the
+        "Connect your AI assistant" card shows nothing. A trip built by the
+        control plane therefore had it only if someone edited its .env by
+        hand. A malformed origin raises rather than being dropped, for the
+        same reason: the failure would otherwise be invisible."""
+        if not spec.public_origin:
+            return ""
+        if not self._PUBLIC_ORIGIN.fullmatch(spec.public_origin):
+            raise ValueError(
+                f"public_origin must be a plain https origin (https://<host>, no path or port), "
+                f"got {spec.public_origin!r}"
+            )
+        return f"TRIP_MCP_ENABLED=1\nPUBLIC_ORIGIN={spec.public_origin}\n"
+
     def create(self, spec: LxcSpec) -> None:
+        # Before anything is created: a bad origin must not leave a half-built
+        # container behind.
+        self._trip_mcp_env_lines(spec)
         if self._reset_data:
             self._reset_trip_data(spec.nfs_host_dir)
         self.ssh.run(f"mkdir -p {shlex.quote(spec.nfs_host_dir)}")
@@ -381,7 +410,7 @@ DATA_DIR={spec.nfs_mount_path}/server-data
 TRIP_DOCUMENTS_DIR={spec.nfs_mount_path}/documents
 PORT=3000
 TRIP_DESIGN_VARIANT=modern
-JWT_SECRET=${{JWT_SECRET}}
+{self._trip_mcp_env_lines(spec)}JWT_SECRET=${{JWT_SECRET}}
 HERMES_API_KEY=${{HERMES_API_KEY}}
 ENVEOF
 {seed_password_line}{exchange_key_line}  chmod 600 {app_dir}/.env

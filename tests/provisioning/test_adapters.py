@@ -5,6 +5,7 @@ import re
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 
 from provisioning.adapters import (
     CloudflareTunnelDnsAdapter,
@@ -262,6 +263,47 @@ class AdapterTests(unittest.TestCase):
         # password containing a dollar sign.
         self.assertIn("'s3cret pw$x'", bootstrap)
         self.assertIn("SEED_PASSWORD=%s", bootstrap)
+
+    def test_a_new_trip_site_turns_the_member_connector_on(self) -> None:
+        # The trip site serves its own MCP endpoint (server/trip-mcp, #220) so
+        # every member can connect Claude or ChatGPT: organizers read and write,
+        # members read only. It is OFF unless the site's .env carries BOTH
+        # TRIP_MCP_ENABLED and PUBLIC_ORIGIN, and nothing warns when they are
+        # missing: the nginx routes are there, Express answers 404, and the
+        # "Connect your AI assistant" card shows nothing. Orlando had them added
+        # by hand; a trip the control plane builds got neither.
+        ssh = FakeProxmoxSsh(nextid="203")
+        spec = replace(LXC_SPEC, public_origin="https://tokyo-2026.example.test")
+
+        ProxmoxLxcAdapter(ssh).create(spec)
+
+        bootstrap = ssh.commands[3]
+        env_block = bootstrap.split("cat > /opt/kinerary/.env <<ENVEOF\n", 1)[1].split("\nENVEOF", 1)[0]
+        self.assertIn("TRIP_MCP_ENABLED=1", env_block.splitlines())
+        self.assertIn("PUBLIC_ORIGIN=https://tokyo-2026.example.test", env_block.splitlines())
+
+    def test_a_site_with_no_known_public_origin_leaves_the_connector_off(self) -> None:
+        # A hand-built spec (no topology hostname) must not guess an origin: the
+        # connector's OAuth issuer is that origin, so a wrong one is worse than off.
+        ssh = FakeProxmoxSsh(nextid="203")
+
+        ProxmoxLxcAdapter(ssh).create(LXC_SPEC)
+
+        env_block = ssh.commands[3].split("cat > /opt/kinerary/.env <<ENVEOF\n", 1)[1].split("\nENVEOF", 1)[0]
+        self.assertNotIn("TRIP_MCP_ENABLED", env_block)
+        self.assertNotIn("PUBLIC_ORIGIN", env_block)
+
+    def test_a_public_origin_that_is_not_a_plain_https_origin_is_refused_loudly(self) -> None:
+        # The .env heredoc is unquoted, so the value is expanded by a shell. A
+        # hostname with $, a backtick, a space, a path or http:// is a bug in the
+        # caller; silently dropping it would leave the connector off with
+        # nothing to say so.
+        for bad in ("http://x.example.test", "https://x.example.test/t/abc", "https://$(id).example.test",
+                    "https://x.example.test\nJWT_SECRET=oops", "https://a b.example.test", "x.example.test"):
+            with self.subTest(origin=bad):
+                ssh = FakeProxmoxSsh(nextid="203")
+                with self.assertRaises(ValueError):
+                    ProxmoxLxcAdapter(ssh).create(replace(LXC_SPEC, public_origin=bad))
 
     def test_exchange_key_is_private_and_shell_quoted(self) -> None:
         ssh = FakeProxmoxSsh(nextid="203")
