@@ -447,6 +447,40 @@ function phaseDatesProblem(data: unknown): string | null {
   return null;
 }
 
+/**
+ * The stops whose place is written only in a non-Latin script and carry no
+ * `name_en` — by the name the organizer wrote them.
+ *
+ * Every stop of a non-English interview is supposed to carry the place's common
+ * English name: the site's English side, the trip's slug and title and the
+ * enrichment lookups all read it, and a Hebrew-only stop gives them nothing.
+ * The star e2e (2026-10-15) lost it in 2 of 3 Hebrew runs, the model leaving
+ * `name_en` out of a stop where the third run wrote the English name.
+ *
+ * Reported, never rejected: refusing the answer would drop every stop and re-ask
+ * the organizer for something they already said, to repair a field that is the
+ * reader's job and not theirs. See the log at confirmation, and the transformer,
+ * which names the trip from the stop's own words when this field is missing.
+ *
+ * A name in Latin script needs no second one; `name_en` only matters where the
+ * first name is not English-readable. Anything that is not a stop list reports
+ * nothing.
+ */
+export function stopsMissingEnglishName(data: unknown): string[] {
+  if (!Array.isArray(data)) return [];
+  const missing: string[] = [];
+  for (const stop of data) {
+    if (!stop || typeof stop !== "object") continue;
+    const s = stop as Record<string, unknown>;
+    if (typeof s.name !== "string") continue;
+    const name = s.name.trim();
+    if (!/\p{L}/u.test(name) || /\p{Script=Latin}/u.test(name)) continue;
+    if (typeof s.name_en === "string" && s.name_en.trim() !== "") continue;
+    missing.push(name);
+  }
+  return missing;
+}
+
 function anchorDatesProblem(data: unknown): string | null {
   if (!Array.isArray(data)) return null;
   for (const [i, anchor] of data.entries()) {
@@ -643,7 +677,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     // and its own schema. `_derive_phases` still reads `days` off this answer —
     // that is how the folded result gets in — it is simply not this call's job
     // to produce them.
-    prompt: "Where are you going, and when? List each stop: a short place name (city or region — e.g. \"Dallas\", not \"Dallas (boys; Mavericks game September 6)\"), date range, and accommodation (with confirmation number) if already booked. Keep any extra context — who's on this leg, an event, a plan detail — out of the name; it's fine to just not record it structurally.",
+    prompt: "Where are you going, and when? List each stop: a short place name (city or region — e.g. \"Dallas\", not \"Dallas (boys; Mavericks game September 6)\") as the organizer wrote it, its common English name as name_en (every stop has one, whatever language the interview is in — when the name is not in Latin script, write the English name yourself), date range, and accommodation (with confirmation number) if already booked. Keep any extra context — who's on this leg, an event, a plan detail — out of the name; it's fine to just not record it structurally.",
     dataShape: "array",
     // `planned` holds places the trip means to visit on this leg but has NOT
     // booked. The distinction from `travel_anchors` is EVIDENCE OF BOOKING —
@@ -4517,6 +4551,21 @@ async function confirmIntakeVia(
       intake_version_id: versionId,
       version: nextVersion,
     }));
+
+    // LOUD, NOT BLOCKING. A stop in non-Latin script with no English name gives
+    // the site no English side and the trip no English slug or title, and
+    // nothing else would ever say so (star e2e, 2026-10-15). A count only: the
+    // names are the organizer's, and the count is what tells an operator to look.
+    const phasesAnswer = session.answers.phases;
+    const unnamed = phasesAnswer?.kind === "structured" ? stopsMissingEnglishName(phasesAnswer.data) : [];
+    if (unnamed.length > 0) {
+      log(structuredLog("warn", "interview.stop_without_english_name", {
+        session_id: session.id,
+        trip_id: session.trip_id,
+        intake_version_id: versionId,
+        stops_missing_name_en: unnamed.length,
+      }));
+    }
 
     return { ok: true, sessionId: session.id, intakeVersionId: versionId, digest: intakeDigest, versionNumber: nextVersion };
   } catch (error) {

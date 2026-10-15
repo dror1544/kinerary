@@ -1302,6 +1302,31 @@ const GATEWAY_IS_NOT_A_STOP: readonly string[] = [
 ];
 
 /**
+ * Every stop carries the place's English name — one rule, said in both prompts
+ * that write stops (and again in the operation that adds one).
+ *
+ * Star e2e, 2026-10-15: a Hebrew interview confirmed the stop "קולמר" with no
+ * `name_en` in 2 of 3 runs, the third wrote "Colmar". The field was shown only
+ * inside the question's example JSON, where a model working in Hebrew can leave
+ * it out without contradicting a word it was told. The site's English side, the
+ * trip's slug and title and the enrichment lookups all read it.
+ *
+ * It is a prompt rule and a code check, not a schema `required`: stops travel
+ * inside the `dataJson` STRING, which strict structured output cannot look into
+ * (see `INTERPRET_OUTPUT_SCHEMA`). The placeholders are not places, on purpose:
+ * a real place in a prompt is a place `exampleEchoes` can catch in an answer.
+ * `stopsMissingEnglishName` (interview.ts) is the check, logged at confirmation.
+ */
+const STOP_HAS_ENGLISH_NAME: readonly string[] = [
+  `- Every stop carries "name_en": the place's common English name, whatever`,
+  `  language the message is in. "name" stays exactly as the person wrote it`,
+  `  (never translated); "name_en" is the English name for the same place. A`,
+  `  name already in Latin script is repeated as "name_en". When the person`,
+  `  wrote the place in another script, write its English name yourself — never`,
+  `  leave "name_en" out. Never invent a place that was not named.`,
+];
+
+/**
  * A booked flight or car keeps its PLACES — one rule, said wherever a prompt can
  * write a travel_anchors entry.
  *
@@ -1367,6 +1392,7 @@ function stopsSection(): string[] {
     `  message that names no place to stay.`,
     `- A stop with no dates of its own gets none unless it is the only stop, in`,
     `  which case it takes the trip's dates. Never invent a hotel or a date.`,
+    ...STOP_HAS_ENGLISH_NAME,
     ``,
   ];
 }
@@ -1408,7 +1434,9 @@ export function changeSection(held: BuildInterpretPromptArgs["heldLists"]): stri
     `used: we will ask them which.`,
     ``,
     `The operations — exactly these, with exactly these keys:`,
-    `- add_stop  {"op":"add_stop","fields":{"name":"Nara","start":"2026-09-27","end":"2026-09-28"},"after":{"name":"Kyoto"}}`,
+    `- add_stop  {"op":"add_stop","fields":{"name":"Nara","name_en":"Nara","start":"2026-09-27","end":"2026-09-28"},"after":{"name":"Kyoto"}}`,
+    `    "name_en" is the place's common English name, as for every stop; the person's own`,
+    `    spelling stays in "name".`,
     `    A place or visit IN ADDITION to the ones listed: "we also want Nara", "another three days`,
     `    at the end for Tokyo", "we come back to Tokyo", "Tokyo again". A RETURN to a place that is`,
     `    already listed is add_stop — never update_stop. "after" and the dates are optional.`,
@@ -1756,6 +1784,7 @@ export function buildExtractIntakePrompt(args: {
     `  its start and end. The same city on two separate date ranges is two stops.`,
     `  A stop's accommodation may be named with no confirmation; leave`,
     `  "confirmation" out rather than borrow another code from the document.`,
+    ...STOP_HAS_ENGLISH_NAME,
     `- A STOP'S DATES come only from something that states the stay: a hotel's`,
     `  check-in and check-out, or a plan's line giving the stay ("Lisbon 11-14`,
     `  June"). An attraction, ticket, tour or dinner with a date or time is a`,
