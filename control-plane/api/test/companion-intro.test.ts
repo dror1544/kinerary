@@ -313,7 +313,7 @@ describe("the group-binding token in the organizer's message", () => {
     // across a phone screen, and getting it slightly wrong produces a token
     // that simply does not work with nothing to explain why. One long-press,
     // one Copy.
-    const messages = organizerIntroMessages(WITH_TOKEN);
+    const messages = organizerIntroMessages(WITH_TOKEN).map((m) => m.text);
     assert.equal(messages.length, 2);
     assert.equal(messages[1], "/group KIN-ABCD2345");
     assert.doesNotMatch(messages[0]!, /KIN-ABCD2345/, "the prose does not repeat it");
@@ -344,7 +344,7 @@ describe("the group-binding token in the organizer's message", () => {
   test("with no token issued, there is one message and no invented step", () => {
     const messages = organizerIntroMessages({ ...BASE, tripSlug: "japan-2026" });
     assert.equal(messages.length, 1);
-    const text = messages[0]!;
+    const text = messages[0]!.text;
     assert.doesNotMatch(text, /KIN-/);
     // The add-link half still stands on its own.
     assert.match(text, /startgroup/);
@@ -353,13 +353,13 @@ describe("the group-binding token in the organizer's message", () => {
   test("the token still reaches the organizer when no add-link can be built", () => {
     // No bot username means no deep link, but binding an already-added bot is
     // exactly the case the token exists for.
-    const messages = organizerIntroMessages({ ...WITH_TOKEN, botUsername: null });
+    const messages = organizerIntroMessages({ ...WITH_TOKEN, botUsername: null }).map((m) => m.text);
     assert.doesNotMatch(messages[0]!, /t\.me/);
     assert.equal(messages[1], "/group KIN-ABCD2345");
   });
 
   test("Hebrew carries the same steps, and the same copyable line", () => {
-    const messages = organizerIntroMessages({ ...WITH_TOKEN, assistantName: "ריו", language: "he" });
+    const messages = organizerIntroMessages({ ...WITH_TOKEN, assistantName: "ריו", language: "he" }).map((m) => m.text);
     assert.match(messages[0]!, /[֐-׿]/);
     assert.ok(
       messages[0]!.indexOf("מנהל") < messages[0]!.indexOf("הבאה"),
@@ -367,5 +367,118 @@ describe("the group-binding token in the organizer's message", () => {
     );
     // The command is not translated: it is typed at a machine, not read.
     assert.equal(messages[1], "/group KIN-ABCD2345");
+  });
+});
+
+describe("copyable login: password and usernames as code spans", () => {
+  const PW = "ykxg-d263-qtw2-y3rq";
+  const FACTS: CompanionIntroFacts = {
+    ...BASE,
+    loginPassword: PW,
+    loginUsernames: [{ name: "Ella", username: "ella" }, { name: "Tali", username: "tali" }],
+    tripSlug: "japan-2026",
+    groupBindingToken: "KIN-ABCD2345",
+  };
+
+  test("English: the introduction is HTML, with the password and each username in <code>", () => {
+    const [intro] = organizerIntroMessages(FACTS);
+    assert.equal(intro!.parseMode, "HTML");
+    assert.match(intro!.text, new RegExp(`the password <code>${PW}</code>:`));
+    assert.match(intro!.text, /• Ella — <code>ella<\/code>/);
+    assert.match(intro!.text, /• Tali — <code>tali<\/code>/);
+  });
+
+  test("Hebrew: same spans, same sentence", () => {
+    const [intro] = organizerIntroMessages({ ...FACTS, language: "he" });
+    assert.equal(intro!.parseMode, "HTML");
+    assert.match(intro!.text, new RegExp(`והסיסמה <code>${PW}</code>:`));
+    assert.match(intro!.text, /• Ella — <code>ella<\/code>/);
+  });
+
+  test("the no-usernames fallback sentence also carries the password in a code span", () => {
+    const [intro] = organizerIntroMessages({ ...FACTS, loginUsernames: [] });
+    assert.match(intro!.text, new RegExp(`the password: <code>${PW}</code>`));
+  });
+
+  test("there is NO separate password message: the owner chose tap-to-copy in the greeting", () => {
+    const messages = organizerIntroMessages(FACTS);
+    assert.equal(messages.length, 2, "introduction + binding line only");
+    assert.equal(messages[1]!.text, "/group KIN-ABCD2345");
+    assert.equal(messages[1]!.parseMode, undefined, "the binding line stays plain text");
+    assert.ok(!messages.slice(1).some((m) => m.text.includes(PW)), "the password is not repeated");
+  });
+
+  test("no password: no code spans", () => {
+    for (const language of ["en", "he"] as const) {
+      const messages = organizerIntroMessages({ ...FACTS, loginPassword: null, language });
+      assert.doesNotMatch(messages[0]!.text, /<code>/);
+    }
+  });
+
+  test("every other character of the greeting survives HTML mode unharmed", () => {
+    // Quotes, parentheses, dots, dashes and the bullet are all inert in Telegram
+    // HTML; only & < > are special and those are escaped. The Pin-messages line
+    // is the one with quotes AND parentheses.
+    const [he] = organizerIntroMessages({ ...FACTS, language: "he" });
+    assert.match(he!.text, /"הצמדת הודעות" \(Pin messages\)/);
+    const [en] = organizerIntroMessages(FACTS);
+    assert.match(en!.text, /"Pin messages" permission/);
+    // No tag other than <code> exists in either message.
+    for (const m of [he!, en!]) {
+      assert.deepEqual([...new Set([...m.text.matchAll(/<\/?([a-zA-Z]+)/g)].map((x) => x[1]))], ["code"]);
+    }
+  });
+
+  test("Hebrew: the password sits mid-sentence between spaces, a colon straight after the span", () => {
+    const [he] = organizerIntroMessages({ ...FACTS, language: "he" });
+    assert.ok(
+      he!.text.includes(`הכניסה לאתר — שם המשתמש שלכם והסיסמה <code>${PW}</code>:\n• Ella — <code>ella</code>`),
+      "exact line",
+    );
+  });
+
+  test("everything else in the HTML message is escaped, including markup in names and titles", () => {
+    const [intro] = organizerIntroMessages({
+      ...FACTS,
+      tripTitle: "A&B <b>Trip</b>",
+      loginUsernames: [{ name: "x <i>y</i>", username: "a&b" }],
+    });
+    assert.doesNotMatch(intro!.text, /<b>|<i>/);
+    assert.match(intro!.text, /A&amp;B &lt;b&gt;Trip&lt;\/b&gt;/);
+    assert.match(intro!.text, /<code>a&amp;b<\/code>/);
+    // The add-to-group link contains a raw ampersand in its query.
+    assert.match(intro!.text, /startgroup=japan-2026&amp;admin=/);
+  });
+
+  test("a code span cannot be broken out of by hostile characters in a value", () => {
+    const [intro] = organizerIntroMessages({
+      ...FACTS,
+      loginUsernames: [{ name: "n", username: "</code><b>x" }],
+    });
+    assert.doesNotMatch(intro!.text, /<b>/);
+    assert.match(intro!.text, /<code>&lt;\/code&gt;&lt;b&gt;x<\/code>/);
+  });
+
+  test("plainText is the same message with no markup at all", () => {
+    const [intro] = organizerIntroMessages(FACTS);
+    assert.ok(intro!.plainText);
+    assert.doesNotMatch(intro!.plainText!, /<code>|&amp;|&lt;/);
+    assert.match(intro!.plainText!, new RegExp(`the password ${PW}:`));
+    assert.match(intro!.plainText!, /• Ella — ella/);
+    assert.match(intro!.plainText!, /startgroup=japan-2026&admin=/);
+  });
+
+  test("the text-only entry point is still plain: no tags, no stray marker characters", () => {
+    const text = organizerIntroText(FACTS);
+    assert.doesNotMatch(text, /<code>|[\u0001\u0002]/);
+    assert.match(text, new RegExp(`the password ${PW}:`));
+  });
+
+  test("the GROUP introduction is untouched: plain text, same wording, same include-password switch", () => {
+    const withPw = groupIntroText(FACTS, { includePassword: true });
+    assert.doesNotMatch(withPw, /<code>|[\u0001\u0002]/);
+    assert.match(withPw, new RegExp(`the password ${PW}:`));
+    const without = groupIntroText(FACTS, { includePassword: false });
+    assert.ok(!without.includes(PW), "excluded exactly as before");
   });
 });

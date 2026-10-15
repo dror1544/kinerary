@@ -64,6 +64,39 @@ export interface CompanionIntroFacts {
 }
 
 /**
+ * COPYABLE SPANS. A value someone has to copy off a phone (the generated
+ * password, a username) is marked here, once, with a pair of control characters
+ * that no fact can contain, and rendered afterwards by whoever knows the
+ * destination: `renderPlain` drops the marks, `renderHtml` escapes the text and
+ * turns each pair into Telegram's `<code>`, where a tap copies the span.
+ *
+ * Marking rather than writing `<code>` inline keeps one text builder serving
+ * both the organizer's HTML message and the group's plain one, and means the
+ * HTML escape runs over the WHOLE message exactly once: a value cannot smuggle a
+ * tag in, because by the time tags exist it has already been escaped.
+ */
+const SPAN_OPEN = "\u0001";
+const SPAN_CLOSE = "\u0002";
+
+function copyable(value: string): string {
+  const clean = value.replace(/[\u0001\u0002]/g, "");
+  return clean ? `${SPAN_OPEN}${clean}${SPAN_CLOSE}` : "";
+}
+
+function renderPlain(marked: string): string {
+  return marked.replace(/[\u0001\u0002]/g, "");
+}
+
+/** Telegram HTML reserves exactly these three; `&` first so the others survive. */
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function renderHtml(marked: string): string {
+  return escapeHtml(marked).replace(/\u0001/g, "<code>").replace(/\u0002/g, "</code>");
+}
+
+/**
  * The login block: the password, and the name each person types to use it.
  *
  * Every traveller shares one password, so the username is the only thing that
@@ -77,14 +110,14 @@ function loginLines(facts: CompanionIntroFacts): string[] {
   const people = (facts.loginUsernames ?? []).filter((p) => p.username);
   if (people.length === 0) {
     return [he
-      ? `הכניסה עם השם שלכם והסיסמה: ${facts.loginPassword}`
-      : `Log in with your name and the password: ${facts.loginPassword}`];
+      ? `הכניסה עם השם שלכם והסיסמה: ${copyable(facts.loginPassword)}`
+      : `Log in with your name and the password: ${copyable(facts.loginPassword)}`];
   }
   return [
     he
-      ? `הכניסה לאתר — שם המשתמש שלכם והסיסמה ${facts.loginPassword}:`
-      : `Log in with your username and the password ${facts.loginPassword}:`,
-    ...people.map((p) => `• ${p.name} — ${p.username}`),
+      ? `הכניסה לאתר — שם המשתמש שלכם והסיסמה ${copyable(facts.loginPassword)}:`
+      : `Log in with your username and the password ${copyable(facts.loginPassword)}:`,
+    ...people.map((p) => `• ${p.name} — ${copyable(p.username)}`),
   ];
 }
 
@@ -174,6 +207,11 @@ function listJoin(items: readonly string[], lang: "he" | "en"): string {
  * merely reassuring.
  */
 export function organizerIntroText(facts: CompanionIntroFacts): string {
+  return renderPlain(organizerIntroMarked(facts));
+}
+
+/** The organizer's setup message with its copyable spans still marked. */
+function organizerIntroMarked(facts: CompanionIntroFacts): string {
   const he = facts.language === "he";
   const title = facts.tripTitle?.trim() || null;
   const addUrl = groupAddUrl(facts.botUsername, facts.tripSlug ?? "");
@@ -401,7 +439,7 @@ export function groupIntroText(
     if (schedule.length) {
       parts.push("", `אשלח לכאן מיוזמתי: ${listJoin(schedule, "he")}.`);
     }
-    return parts.join("\n");
+    return renderPlain(parts.join("\n"));
   }
 
   parts.push(
@@ -432,7 +470,7 @@ export function groupIntroText(
   if (schedule.length) {
     parts.push("", `I'll post ${listJoin(schedule, "en")} here without being asked.`);
   }
-  return parts.join("\n");
+  return renderPlain(parts.join("\n"));
 }
 
 /**
@@ -454,15 +492,34 @@ export function groupBindingCommand(token: string): string {
   return `/group ${token}`;
 }
 
+/** One message to send, and how to send it. */
+export interface IntroMessage {
+  text: string;
+  /** Present when `text` is Telegram HTML; absent means send as plain text. */
+  parseMode?: "HTML";
+  /** What to send instead if Telegram refuses the HTML: same words, no markup. */
+  plainText?: string;
+}
+
 /**
- * The organizer's introduction, as the messages to send in order.
+ * The organizer's introduction, as the messages to send in order: the
+ * introduction itself (Telegram HTML, with the generated password and each
+ * username as `<code>` spans, so a tap copies the span), then the group-binding
+ * line when a token was issued.
  *
- * One message when there is no token to hand over, two when there is — the
- * second being nothing but the line to copy.
+ * A separate password-only message was built and dropped on the owner's
+ * decision (2026-10-15: "tap to copy in the greeting is better"). The binding
+ * line stays separate because it is a command to post, not a value to read.
+ *
+ * Order is part of the contract: the dispatcher sends them one after another,
+ * and the introduction points at "my next message".
  */
-export function organizerIntroMessages(facts: CompanionIntroFacts): string[] {
-  const messages = [organizerIntroText(facts)];
-  if (facts.groupBindingToken) messages.push(groupBindingCommand(facts.groupBindingToken));
+export function organizerIntroMessages(facts: CompanionIntroFacts): IntroMessage[] {
+  const marked = organizerIntroMarked(facts);
+  const messages: IntroMessage[] = [
+    { text: renderHtml(marked), parseMode: "HTML", plainText: renderPlain(marked) },
+  ];
+  if (facts.groupBindingToken) messages.push({ text: groupBindingCommand(facts.groupBindingToken) });
   return messages;
 }
 

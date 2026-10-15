@@ -1,7 +1,7 @@
 import type pg from "pg";
 import type { NotificationAdapter } from "./signup.js";
 import { structuredLog } from "./redaction.js";
-import { organizerIntroMessages, type ProactiveSettings } from "./companion-intro.js";
+import { organizerIntroMessages, type IntroMessage, type ProactiveSettings } from "./companion-intro.js";
 import { issueGroupBindingToken } from "./group-binding.js";
 
 interface OutboxRow {
@@ -86,7 +86,7 @@ function operatorMessageTextFor(row: OutboxRow): string | null {
  * notification_type this dispatcher doesn't know how to word yet (the row is
  * marked 'skipped', not retried forever).
  */
-function messageTextFor(row: OutboxRow, options?: DispatchOptions): string | string[] | null {
+function messageTextFor(row: OutboxRow, options?: DispatchOptions): string | IntroMessage[] | null {
   if (row.notification_type.startsWith("operator_")) return operatorMessageTextFor(row);
   if (row.notification_type === "provisioning_complete" || row.notification_type === "companion_ready") {
     const url = row.payload && typeof row.payload.private_url === "string" ? row.payload.private_url : null;
@@ -217,14 +217,20 @@ export async function dispatchPendingTripNotifications(
     try {
       // A list when the introduction hands over a group-binding token: the
       // token goes in its own message so it is one long-press and one Copy,
-      // rather than a drag-select across a paragraph on a phone.
+      // rather than a drag-select across a paragraph on a phone. (The password
+      // is copied from its code span in the introduction itself.)
       //
       // Sent in order, and the row is only marked sent once ALL of them are.
       // A retry may therefore repeat the prose — which is the right trade:
       // a duplicated paragraph is noise, while a token that never arrived is
       // an organizer who cannot set up their group at all.
-      for (const part of Array.isArray(text) ? text : [text]) {
-        await notification.sendMessage({ chatId: row.recipient, text: part });
+      for (const part of Array.isArray(text) ? text : [{ text } as IntroMessage]) {
+        await notification.sendMessage({
+          chatId: row.recipient,
+          text: part.text,
+          ...(part.parseMode ? { parseMode: part.parseMode } : {}),
+          ...(part.plainText !== undefined ? { plainText: part.plainText } : {}),
+        });
       }
       await db.query(
         "UPDATE control_plane.notification_outbox SET state = 'sent', sent_at = now(), updated_at = now() WHERE id = $1",
