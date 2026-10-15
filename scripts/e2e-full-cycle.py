@@ -27,7 +27,9 @@ and answers written down in control-plane/api/test/fixtures/make_documents.py,
 so the run can assert that a place named in a document reached the phase page.
 `star` (needs --auto) is a couples trip from ONE base with day trips: it checks
 the SHAPE of the built site, then tells the companion in chat about a hotel
-booking and a change of stops and checks the site followed. What cannot pass
+booking and a change of stops, asks it to plan one day, and checks the site
+followed (on macOS it first restarts the trip's bridge from this process, which
+holds the Local Network grant the worker's SSH-launched one lacks). What cannot pass
 yet is a named deferral that still runs and reports as a known gap.
 `own` is the other case — a person answering about a trip they actually mean to
 take. Nothing about it is scripted and nothing here knows the destination, so
@@ -48,6 +50,7 @@ import base64
 import datetime as dt
 import json
 import os
+import platform
 import re
 import secrets
 import shutil
@@ -1260,6 +1263,85 @@ def stage_served(ctx: dict) -> None:
           f"/api/itinerary/active returned {str(itinerary)[:120]}")
 
 
+# ── The trip-mcp bridge on macOS (Local Network grant) ───────────────────────
+#
+# CLAUDE.md, "A Mac-provisioned companion that cannot read its own trip": the
+# worker wires the bridge over SSH, and macOS grants Local Network access per
+# responsible process, so that bridge serves MCP on loopback and fails every
+# call through to the trip's LAN address with EHOSTUNREACH. A process launched
+# from THIS run's own context has the grant, so on a Mac the run restarts the
+# bridge itself — with the deploy wrapper's documented command — and then asks
+# the bridge's /health whether it can reach its trip. Anywhere else the
+# provisioner's own check (companion-install-host.sh) already did that.
+
+def bridge_restart_command(system: str, deploy_root: Path, slug: str, repo: Path) -> "dict | None":
+    """The command that restarts this trip's bridge from the run's own process,
+    or None when this is not macOS. Pure: it decides, it does not run."""
+    if system != "Darwin":
+        return None
+    trip_dir = deploy_root / "trips" / slug
+    return {"argv": [str(deploy_root / "setup-mcp.sh"), "--restart-only", "--trip-dir", str(trip_dir)],
+            "env": {"REPO_ROOT": str(repo)}, "trip_dir": trip_dir}
+
+
+def _env_file_value(path: Path, key: str) -> str:
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return ""
+    for line in lines:
+        if line.startswith(f"{key}="):
+            return line.split("=", 1)[1].strip().strip('"').strip("\r")
+    return ""
+
+
+def bridge_health(port: str, key: str, run=subprocess.run) -> "tuple[bool, str]":
+    """Ask the bridge's /health whether it can reach its trip. The key goes to
+    curl on STDIN (`--config -`), never on the command line where `ps` shows it."""
+    config = (f'url = "http://127.0.0.1:{port}/health"\nheader = "X-API-Key: {key}"\n'
+              "silent\nshow-error\nmax-time = 15\n")
+    body = run(["curl", "--config", "-"], input=config, capture_output=True, text=True).stdout or ""
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return False, body.strip()[:200] or "no answer from the bridge"
+    return (isinstance(parsed, dict) and parsed.get("ok") is True), body.strip()[:200]
+
+
+def stage_bridge_reach(ctx: dict, system: "str | None" = None, run=subprocess.run, sleep=time.sleep,
+                       deploy_root: "Path | None" = None, repo: "Path | None" = None) -> bool:
+    """On macOS, restart the trip's bridge from this process and assert that it
+    can reach the trip. Returns whether it ran (False off macOS, doing nothing)."""
+    plan = bridge_restart_command(platform.system() if system is None else system, deploy_root or DEPLOY_ROOT,
+                                  str(ctx["slug"]), repo or REPO)
+    if plan is None:
+        return False
+    stage("The bridge — restarted from this process, so it holds the Local Network grant (macOS)")
+    trip_dir: Path = plan["trip_dir"]
+    key = _env_file_value(trip_dir / "mcp" / ".env", "MCP_API_KEY")
+    check(bool(key), "the bridge has an MCP key beside the trip",
+          f"no MCP_API_KEY in {trip_dir}/mcp/.env — the provisioner never wired this trip's bridge")
+    log = Path(tempfile.mkdtemp(prefix="kinerary-e2e-bridge-")) / "setup-mcp.log"
+    with open(log, "w") as out:
+        result = run(plan["argv"], env={**os.environ, **plan["env"]}, stdin=subprocess.DEVNULL,
+                     stdout=out, stderr=subprocess.STDOUT, timeout=180)
+    tail = log.read_text()[-400:].replace(key, "***")
+    shutil.rmtree(log.parent, ignore_errors=True)
+    check(result.returncode == 0, "setup-mcp.sh --restart-only restarted the bridge",
+          f"setup-mcp.sh --restart-only failed:\n{tail}")
+    port = _env_file_value(trip_dir / "mcp" / ".env", "MCP_PORT") or str(3000 + int(ctx["vmid"]))
+    healthy, body = False, ""
+    for _ in range(5):
+        healthy, body = bridge_health(port, key, run=run)
+        if healthy:
+            break
+        sleep(2)
+    check(healthy, f"the bridge on :{port} reaches the trip site (/health ok)",
+          f"the bridge on :{port} cannot reach the trip even when restarted from this process "
+          f"— /health said: {body.replace(key, '***')}")
+    return True
+
+
 def stage_companion(ctx: dict) -> None:
     stage("The companion — installed, rendered, running, routable")
     slug = ctx["slug"]
@@ -1580,6 +1662,59 @@ def plan_item_verdict(items: list, day: str, kind: str) -> Verdict:
                    f"{len(items)} in the plan)")
 
 
+def _item_text(item: dict) -> str:
+    return f"{item.get('text_en') or ''} {item.get('text_he') or ''}"
+
+
+def day_plan_verdict(items: list, day: str, places: list, name: str = "day_plan_applied") -> Verdict:
+    """`day` of the ACTIVE itinerary has an item naming every place in `places`.
+
+    `items` are GET /api/itinerary/active's `items`; each entry of `places` is
+    one place's spellings (Latin and Hebrew), and either names it. A place found
+    only on another day is reported as such: the companion planned it, on the
+    wrong day, which is a different defect from not planning it.
+    """
+    on_day = [i for i in items if str(i.get("date") or "")[:10] == day]
+    missing, elsewhere = [], []
+    for place in places:
+        spellings = _spellings(place)
+        if any(_mentions(_item_text(i), s) for i in on_day for s in spellings):
+            continue
+        missing.append(spellings[0])
+        days = sorted({str(i.get("date") or "(undated)")[:10] for i in items
+                       if any(_mentions(_item_text(i), s) for s in spellings)})
+        if days:
+            elsewhere.append(f"{spellings[0]} is planned on {', '.join(days)}")
+    first = [_spellings(p)[0] for p in places]
+    if not missing:
+        return Verdict(name, True, f"{day} has plan items for {' and '.join(first)} ({len(on_day)} item(s) that day)",
+                       "")
+    detail = f"{day} has no plan item naming {' or '.join(missing)} ({len(on_day)} item(s) that day, " \
+             f"{len(items)} in the plan)"
+    if elsewhere:
+        detail += "; wrong day: " + "; ".join(elsewhere)
+    return Verdict(name, False, "", detail)
+
+
+def _checkin_out_keys(plan: list) -> "set[tuple]":
+    return {(str(i.get("date") or "")[:10], i.get("text_en") or "", i.get("text_he") or "")
+            for i in plan if _CHECK_IN_RE.search(_item_text(i)) or _CHECK_OUT_RE.search(_item_text(i))}
+
+
+def checkin_out_kept_verdict(before: list, after: list) -> Verdict:
+    """Planning a day must not take away the hotel's check-in / check-out items
+    that were on the plan before it. Compared to the plan just BEFORE the day
+    plan, not to the booking's dates: the change of stops legitimately moves the
+    check-out, and that is not this step's doing."""
+    was, now = _checkin_out_keys(before), _checkin_out_keys(after)
+    lost = sorted(was - now)
+    return Verdict("checkin_checkout_kept", bool(was) and not lost,
+                   f"the day plan left the {len(was)} check-in/check-out item(s) as they were",
+                   "there were no check-in/check-out items to keep" if not was else
+                   "the day plan removed or changed check-in/check-out item(s): "
+                   + "; ".join(f"{d} {en or he}" for d, en, he in lost))
+
+
 def days_verdict(config: dict, start: str, end: str, name: str = "days_covered") -> Verdict:
     """Every day from `start` to `end` is on some stop."""
     if not (start and end):
@@ -1612,6 +1747,16 @@ def after_change_verdicts(expect: dict, config: dict, start: str, end: str) -> "
     return out
 
 
+def after_plan_verdicts(expect: dict, day_plan: dict, active_items: list,
+                        plan_before: list, plan_after: list) -> "list[Verdict]":
+    out = []
+    if expect.get("day_plan_applied"):
+        out.append(day_plan_verdict(active_items, day_plan["date"], day_plan["places"]))
+    if expect.get("checkin_plan_item") or expect.get("checkout_plan_item"):
+        out.append(checkin_out_kept_verdict(plan_before, plan_after))
+    return out
+
+
 def site_get(base: str, path: str, token: str):
     out = subprocess.run(["curl", "-s", "-m", "30", f"{base}{path}", "-H", f"Authorization: Bearer {token}"],
                          capture_output=True, text=True).stdout
@@ -1637,8 +1782,8 @@ def served_state(base: str, token: str) -> "tuple[dict, list, list]":
 
 
 def stage_companion_changes(ctx: dict, auto: "Auto", spec: dict) -> None:
-    """Tell the companion about a hotel booking and then a change of stops, and
-    check the SITE followed — never the chat's words.
+    """Tell the companion about a hotel booking, then a change of stops, then ask
+    it to plan one day, and check the SITE followed — never the chat's words.
 
     Most of what the second half asks for cannot pass today: no companion tool
     or site route edits a stop's dates, boundaries or accommodation. Those are
@@ -1646,7 +1791,7 @@ def stage_companion_changes(ctx: dict, auto: "Auto", spec: dict) -> None:
     them as known gaps rather than failing, and keeps asserting them for the day
     they go green.
     """
-    stage("The companion — a hotel booking, then a change of stops, through chat")
+    stage("The companion — a hotel booking, a change of stops, then a day plan, through chat")
     after = spec["after_companion"]
     hotel, expect = after["hotel"], after["expect"]
     chat = ctx["chat"]
@@ -1668,6 +1813,18 @@ def stage_companion_changes(ctx: dict, auto: "Auto", spec: dict) -> None:
     tell("change of stops", after["change_message"])
     config, bookings, plan = served_state(base, token)
     verdicts += after_change_verdicts(expect, config, trip_start, trip_end)
+
+    if "plan_message" in after:
+        # The organizer asks for one day's plan. What is read back is the ACTIVE
+        # itinerary — what the site renders — not the chat, and not only the
+        # per-phase plan the hotel step read.
+        plan_before = plan
+        tell("day plan", after["plan_message"])
+        _, _, plan_after = served_state(base, token)
+        active = site_get(base, "/api/itinerary/active", token)
+        if not isinstance(active, dict) or not isinstance(active.get("items"), list):
+            raise Failed(f"/api/itinerary/active served no items: {str(active)[:160]}")
+        verdicts += after_plan_verdicts(expect, after["day_plan"], active["items"], plan_before, plan_after)
 
     report_verdicts(verdicts, deferred_with_reasons(expect), ctx)
 
@@ -1791,6 +1948,7 @@ def run_scenario(scenario: str, args: argparse.Namespace, auto: "Auto | None", c
         stage_site(ctx)
         stage_own_content(ctx) if scenario == OWN else stage_content(ctx, scenario)
         stage_served(ctx)
+        stage_bridge_reach(ctx)
         stage_companion(ctx)
         stage_mcp(ctx)
         if getattr(args, "documents", False):

@@ -95,10 +95,25 @@ class StarFixture(unittest.TestCase):
         self.assertEqual(deferred["stops_after_change"], reason)
         self.assertEqual(fixtures().STOP_EDITING_DEFERRED, reason)
 
-    def test_the_checkout_item_has_its_own_reason(self) -> None:
-        deferred = self.spec["after_companion"]["expect"]["deferred"]
-        self.assertIn("checkout_plan_item", deferred)
-        self.assertNotIn("stop editing", deferred["checkout_plan_item"])
+    def test_the_checkin_and_checkout_items_are_hard_since_2026_10_15(self) -> None:
+        # One hotel message now produces both items live (owner, 2026-10-15), so
+        # the deferrals came off. Putting either back would hide a regression.
+        expect = self.spec["after_companion"]["expect"]
+        for name in ("checkin_plan_item", "checkout_plan_item"):
+            self.assertTrue(expect[name])
+            self.assertNotIn(name, expect["deferred"])
+
+    def test_the_day_plan_is_asked_in_hebrew_for_the_third_of_december(self) -> None:
+        after = self.spec["after_companion"]
+        self.assertTrue(after["expect"]["day_plan_applied"])
+        self.assertNotIn("day_plan_applied", after["expect"]["deferred"], "a hard check, not a deferral")
+        self.assertEqual(after["day_plan"]["date"], "2027-12-03")
+        self.assertRegex(after["plan_message"], "[֐-׿]")
+        self.assertIn("3 בדצמבר 2027", after["plan_message"])
+        names = [spellings[0] for spellings in after["day_plan"]["places"]]
+        self.assertEqual(names, ["Riquewihr", "Kaysersberg"])
+        for spellings in after["day_plan"]["places"]:
+            self.assertTrue(any(not x.isascii() for x in spellings), "a Hebrew spelling too")
 
     def test_the_interview_shape_expectations_are_hard_not_deferred(self) -> None:
         # They are expected to go green when fix/interview-trip-shape lands.
@@ -487,31 +502,62 @@ class StarThroughTheChecker(unittest.TestCase):
 class StarCompanionStage(unittest.TestCase):
     """stage_companion_changes with the chat and the site stubbed."""
 
+    CHECK_IN = {"date": "2027-12-02", "text_en": "Check-in at Hotel Vignoble Dore", "text_he": ""}
+    CHECK_OUT = {"date": "2027-12-09", "text_en": "Check-out from Hotel Vignoble Dore", "text_he": ""}
+
     def setUp(self) -> None:
         self.mod = load()
         self.spec = fixtures().SCENARIOS["star"]
         self.hotel = self.spec["after_companion"]["hotel"]
 
-    def run_stage(self, bookings, replies=True):
+    def run_stage(self, bookings, replies=True, plan=None, active=None, plan_after=None):
         mod = self.mod
         config = {"phases": [COLMAR]}
+        plan = [self.CHECK_IN, self.CHECK_OUT] if plan is None else plan
+        states = iter([plan, plan, plan if plan_after is None else plan_after])
+        said = []
         mod.site_login = lambda ctx: ("http://x", "t")
-        mod.served_state = lambda base, token: (config, bookings, [])
-        mod.converse = lambda auto, chat, text, **kw: {
+        mod.served_state = lambda base, token: (config, bookings, next(states))
+        mod.site_get = lambda base, path, token: {"items": self.planned() if active is None else active}
+        mod.converse = lambda auto, chat, text, **kw: said.append(text) or {
             "replies": ["ok"] if replies else [], "approvals": 0, "timed_out": not replies}
         ctx = {"chat": "9000", "config": config}
         mod.stage_companion_changes(ctx, object(), self.spec)
+        ctx["said"] = said
         return ctx
+
+    def planned(self, day="2027-12-03"):
+        return [{"date": day, "text_en": "Morning: Riquewihr", "text_he": ""},
+                {"date": day, "text_en": "", "text_he": "אחר הצהריים: קייזרסברג, שוק חג המולד"}]
 
     def booking(self):
         return [{"type": "hotel", "name": self.hotel["name"], "date_from": self.hotel["check_in"],
                  "date_to": self.hotel["check_out"]}]
 
-    def test_everything_the_companion_cannot_do_yet_is_a_known_gap_not_a_failure(self) -> None:
+    def test_only_what_the_companion_cannot_do_yet_is_a_known_gap_not_a_failure(self) -> None:
         ctx = self.run_stage(self.booking())
         self.assertEqual(sorted(name for name, _ in ctx["known_gaps"]),
-                         ["base_stop_accommodation", "checkin_plan_item", "checkout_plan_item",
-                          "stops_after_change"])
+                         ["base_stop_accommodation", "stops_after_change"])
+
+    def test_the_organizer_says_the_three_things_in_order(self) -> None:
+        after = self.spec["after_companion"]
+        ctx = self.run_stage(self.booking())
+        self.assertEqual(ctx["said"], [after["booking_message"], after["change_message"], after["plan_message"]])
+
+    def test_a_missing_checkin_item_is_now_a_hard_failure(self) -> None:
+        with self.assertRaises(self.mod.Failed) as caught:
+            self.run_stage(self.booking(), plan=[self.CHECK_OUT])
+        self.assertIn("checkin_plan_item", str(caught.exception))
+
+    def test_a_missing_day_plan_is_a_hard_failure(self) -> None:
+        with self.assertRaises(self.mod.Failed) as caught:
+            self.run_stage(self.booking(), active=[])
+        self.assertIn("day_plan_applied", str(caught.exception))
+
+    def test_a_day_plan_that_took_away_the_checkout_is_a_hard_failure(self) -> None:
+        with self.assertRaises(self.mod.Failed) as caught:
+            self.run_stage(self.booking(), plan_after=[self.CHECK_IN])
+        self.assertIn("checkin_checkout_kept", str(caught.exception))
 
     def test_a_booking_the_companion_failed_to_record_is_a_real_failure(self) -> None:
         with self.assertRaises(self.mod.Failed) as caught:
@@ -521,6 +567,56 @@ class StarCompanionStage(unittest.TestCase):
     def test_a_companion_that_never_answers_is_a_failure(self) -> None:
         with self.assertRaises(self.mod.Failed):
             self.run_stage(self.booking(), replies=False)
+
+
+class DayPlan(unittest.TestCase):
+    """day_plan_verdict: the active itinerary names each place on the asked day."""
+
+    PLACES = [["Riquewihr", "ריקוויר"], ["Kaysersberg", "קייזרסברג"]]
+
+    def setUp(self) -> None:
+        self.mod = load()
+
+    def verdict(self, items):
+        return self.mod.day_plan_verdict(items, "2027-12-03", self.PLACES)
+
+    def test_both_places_on_the_day_pass_in_either_script(self) -> None:
+        v = self.verdict([{"date": "2027-12-03", "text_en": "Riquewihr markets", "text_he": ""},
+                          {"date": "2027-12-03", "text_en": None, "text_he": "קייזרסברג"}])
+        self.assertTrue(v.passed, v.bad)
+        self.assertEqual(v.name, "day_plan_applied")
+
+    def test_a_plan_that_never_arrived_fails_and_says_nothing_was_planned(self) -> None:
+        v = self.verdict([{"date": "2027-12-02", "text_en": "Check-in", "text_he": ""}])
+        self.assertFalse(v.passed)
+        self.assertIn("Riquewihr or Kaysersberg", v.bad)
+        self.assertNotIn("wrong day", v.bad)
+
+    def test_one_place_missing_fails_and_names_that_one(self) -> None:
+        v = self.verdict([{"date": "2027-12-03", "text_en": "Riquewihr", "text_he": ""}])
+        self.assertFalse(v.passed)
+        self.assertIn("Kaysersberg", v.bad)
+        self.assertNotIn("Riquewihr or", v.bad)
+
+    def test_the_right_places_on_the_wrong_day_fail_and_say_which_day(self) -> None:
+        v = self.verdict([{"date": "2027-12-04", "text_en": "Riquewihr", "text_he": ""},
+                          {"date": "2027-12-04", "text_en": "Kaysersberg", "text_he": ""}])
+        self.assertFalse(v.passed)
+        self.assertIn("wrong day", v.bad)
+        self.assertIn("Riquewihr is planned on 2027-12-04", v.bad)
+
+    def test_a_latin_name_is_a_word_not_a_substring(self) -> None:
+        v = self.verdict([{"date": "2027-12-03", "text_en": "Riquewihrs and Kaysersbergs", "text_he": ""}])
+        self.assertFalse(v.passed)
+
+    def test_check_in_and_out_items_left_alone_pass_and_removed_ones_fail(self) -> None:
+        before = [{"date": "2027-12-02", "text_en": "Check-in", "text_he": ""},
+                  {"date": "2027-12-09", "text_en": "", "text_he": "צ'ק-אאוט"}]
+        added = before + [{"date": "2027-12-03", "text_en": "Riquewihr", "text_he": ""}]
+        self.assertTrue(self.mod.checkin_out_kept_verdict(before, added).passed)
+        self.assertFalse(self.mod.checkin_out_kept_verdict(before, added[:1]).passed)
+        self.assertFalse(self.mod.checkin_out_kept_verdict([], added).passed,
+                         "nothing to keep means the earlier step failed, not that this one passed")
 
 
 class FakeAuto:

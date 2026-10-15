@@ -293,14 +293,30 @@ SCENARIOS: dict[str, dict] = {
                 "שינוי תוכניות: את הלילה האחרון, בין ה-8 ל-9 בדצמבר, אנחנו ישנים ליד שדה התעופה "
                 "בפרנקפורט. תפצל בבקשה את השהות לשתי תחנות: קולמר עד ה-8 בדצמבר, ופרנקפורט "
                 "שדה התעופה מה-8 עד ה-9, ותעדכן את הצ'ק-אאוט במלון בקולמר ל-8 בדצמבר."),
+            # Then a day plan. The built trip has no day plans on purpose (the
+            # organizer said "no fixed plan yet"), so this is the only way a day
+            # gets one. Owner, 2026-10-15: add this step and verify it was applied.
+            # Asserted on GET /api/itinerary/active: `date` must carry an item
+            # naming each place, by either spelling.
+            "plan_message": (
+                "בוא נתכנן יום אחד: ב-3 בדצמבר 2027 בבוקר נבקר בריקוויר (Riquewihr), "
+                "ואחר הצהריים בקייזרסברג (Kaysersberg) בשוק חג המולד. "
+                "תוסיף את זה לתוכנית של היום הזה."),
+            "day_plan": {
+                "date": "2027-12-03",
+                "places": [["Riquewihr", "ריקוויר", "ריקווייר"],
+                           ["Kaysersberg", "קייזרסברג", "קיסרסברג"]],
+            },
             "expect": {
                 # The companion has a tool that adds a booking, so this is hard.
                 "hotel_booking_recorded": True,
                 # The booking must reach the base stop (finding 4). No companion
                 # tool or site route edits a stop's accommodation or dates.
                 "base_stop_accommodation": True,
-                # Findings 4 and 5a: the companion adds a check-in plan item only
-                # after a second request, and never the check-out.
+                # Findings 4 and 5a, HARD since 2026-10-15: one hotel message now
+                # produces both the check-in (2 Dec) and the check-out (9 Dec)
+                # plan items live. Re-asserted after the day plan, so a plan step
+                # that disturbs them fails too.
                 "checkin_plan_item": True,
                 "checkout_plan_item": True,
                 # The stay splits in two, with the right dates (finding 6).
@@ -308,17 +324,13 @@ SCENARIOS: dict[str, dict] = {
                     {"name": ["Colmar", "קולמר"], "start": "2027-12-02", "end": "2027-12-08"},
                     {"name": ["Frankfurt", "פרנקפורט"], "start": "2027-12-08", "end": "2027-12-09"},
                 ],
+                # The day plan was applied: each place is on that day's plan.
+                "day_plan_applied": True,
                 # Whatever the companion does, no day of the trip may disappear.
                 "days_covered": "all",
                 "deferred": {
                     "base_stop_accommodation": STOP_EDITING_DEFERRED,
                     "stops_after_change": STOP_EDITING_DEFERRED,
-                    "checkin_plan_item": (
-                        "the companion adds the check-in plan item only after a second request "
-                        "(owner's manual test 2026-10-10, finding 4); companion behaviour, not built"),
-                    "checkout_plan_item": (
-                        "the companion adds a check-in plan item and never the check-out "
-                        "(owner's manual test 2026-10-10, finding 5a); companion behaviour, not built"),
                 },
             },
         },
