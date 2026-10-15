@@ -286,6 +286,139 @@ describe('a hotel booking that carries its own link: that link, everywhere', () 
     const views = await readEveryView(server, bob);
     assertAllAgree(views, { maps: link, waze: 'https://waze.com/ul?ll=48.0802%2C7.3601&navigate=yes' });
   });
+
+  test('an item whose link came from the booking is flagged too: it is the hotel\'s link, not the item\'s own', async () => {
+    const active = (await server.call('/api/itinerary/active', { token: bob })).body;
+    for (const kind of ['checkin', 'checkout']) {
+      const item = active.items.find(i => i.item_uid.endsWith(`_${kind}`));
+      assert.equal(item.location_derived, true, kind);
+    }
+  });
+});
+
+// Boundary review of PR #397, finding 1: a link that came from the stop or the
+// booking (not a derived search) must be flagged too, or the Modern editor
+// prefills it and an edit freezes it into the item row.
+describe('editing a hotel item never freezes the hotel\'s link into it', () => {
+  let server, alice, bob;
+  const L1 = 'https://www.google.com/maps/place/Dore/@48.0802,7.3601,17z';
+  const L2 = 'https://www.google.com/maps/place/Dore/@48.1111,7.4222,17z';
+  const stopLink = (location_url) => server.call('/api/stops/colmar', { method: 'PATCH', token: alice, body: { accommodation: { type: 'hotel', name: HOTEL, confirmation: 'VD-1', location_url } } });
+  const itemsNow = async () => {
+    const items = (await server.call('/api/itinerary/active', { token: bob })).body.items;
+    return { checkin: items.find(i => i.item_uid.endsWith('_checkin')), checkout: items.find(i => i.item_uid.endsWith('_checkout')) };
+  };
+  before(async () => {
+    server = await boot(colmarConfig(), PORTS.hotelOnePlace);
+    alice = await server.login('alice');
+    bob = await server.login('bob');
+    const created = await server.call('/api/bookings', { method: 'POST', token: alice, body: { phase: 'colmar', type: 'hotel', name: HOTEL, date_from: IN, date_to: OUT, confirmation: 'VD-1' } });
+    assert.equal((await server.call('/api/stops/colmar/from-booking', { method: 'POST', token: alice, body: { booking_id: created.body.id } })).status, 200);
+  });
+  after(async () => { await server?.stop(); });
+
+  test('stop link L1 -> edit the check-in as the Modern editor does -> stop link L2: both items follow L2', async () => {
+    assert.equal((await stopLink(L1)).status, 200);
+    const { checkin } = await itemsNow();
+    assert.equal(checkin.location_url, L1);
+    assert.equal(checkin.location_derived, true, 'a link from the stop is flagged, not only a derived search');
+    // The editor prefills location_url "" when the flag is set, and sends null.
+    const edited = await server.call(`/api/itinerary/items/${checkin.item_uid}`, { method: 'PATCH', token: alice, body: {
+      text_he: checkin.text_he, text_en: `${checkin.text_en} (late)`, location_url: checkin.location_derived ? null : checkin.location_url } });
+    assert.equal(edited.status, 200, edited.text);
+    const db = new Database(join(server.dataDir, 'trip.db'), { readonly: true });
+    const { active_version_id: rev } = db.prepare('SELECT active_version_id FROM trip_itinerary_state WHERE id = 1').get();
+    const row = db.prepare("SELECT location_url, waze_url FROM itinerary_plan_items WHERE revision_id = ? AND item_uid LIKE '%\\_checkin' ESCAPE '\\'").get(rev);
+    db.close();
+    assert.equal(row.location_url, null, 'the edit did not store L1 in the item row');
+    assert.equal((await stopLink(L2)).status, 200);
+    const now = await itemsNow();
+    assert.equal(now.checkin.text_en.endsWith('(late)'), true, 'the edit itself was kept');
+    assert.equal(now.checkin.location_url, L2, 'check-in follows the new link');
+    assert.equal(now.checkout.location_url, L2, 'check-out follows the new link');
+  });
+});
+
+// Finding 2: a booking's name is not validated at the booking write the way a
+// stop's is; the fallback into the served config must not carry what the stop
+// write would refuse.
+describe('the booking-name fallback in /api/config is validated like a stop\'s hotel name', () => {
+  let server, alice, bob, bookingId;
+  before(async () => {
+    server = await boot(colmarConfig(), PORTS.hotelOnePlace);
+    alice = await server.login('alice');
+    bob = await server.login('bob');
+    bookingId = (await server.call('/api/bookings', { method: 'POST', token: alice, body: { phase: 'colmar', type: 'hotel', name: HOTEL, date_from: IN, date_to: OUT } })).body.id;
+    assert.equal((await server.call('/api/stops/colmar/from-booking', { method: 'POST', token: alice, body: { booking_id: bookingId } })).status, 200);
+    // The stop's hotel loses its name but keeps the booking link.
+    const p = await server.call('/api/stops/colmar', { method: 'PATCH', token: alice, body: { accommodation: { type: 'hotel', address: '1 Rue du Lac' } } });
+    assert.equal(p.status, 200, p.text);
+  });
+  after(async () => { await server?.stop(); });
+  const rename = (name) => {
+    const db = new Database(join(server.dataDir, 'trip.db'));
+    db.prepare('UPDATE bookings SET name = ? WHERE id = ?').run(name, bookingId);
+    db.close();
+  };
+  const colmarAcc = async () => {
+    const r = await server.call('/api/config', { token: bob });
+    return { acc: r.body.phases.find(p => p.id === 'colmar').accommodation, text: r.text };
+  };
+
+  test('a clean booking name is the fallback', async () => {
+    rename(HOTEL);
+    assert.equal((await colmarAcc()).acc.name, HOTEL);
+  });
+
+  test('an old row with markup, a bidi override, a zero-width space and 6000 characters is not served', async () => {
+    rename(`<script>alert(1)</script>‮​${'x'.repeat(6000)}`);
+    const { acc, text } = await colmarAcc();
+    assert.equal(acc.name, undefined, 'no name rather than a refused one');
+    assert.ok(!text.includes('<script>') && !text.includes('‮') && !text.includes('​'), 'nothing of it reaches /api/config');
+    assert.ok(text.length < 20000, 'and not 6000 characters of it');
+    // The address still resolves the place.
+    assert.match(acc.location_url, /query=1%20Rue%20du%20Lac$/);
+  });
+});
+
+// Finding 3: the resolver reads the allow-list projection (the same gate the
+// config goes through), so what it can serve is bounded by the allow-list.
+describe('the resolver works from the allow-list projection', () => {
+  const { createHotelPlaces } = require('../server/hotel-place.js');
+  test('a non-string address is not used, and withheld keys never reach a resolved place', () => {
+    const phase = { id: 'colmar', title: { he: 'קולמר', en: 'Colmar' },
+      accommodation: { name: HOTEL, pin: 'PIN-LEAK-1', door_code: 'DOOR-LEAK-2', notes_internal: 'NOTE-LEAK-3', address: { not: 'a string' } } };
+    const booking = { id: 1, type: 'hotel', name: HOTEL, phase: 'colmar', location_url: null };
+    const places = createHotelPlaces({ getConfig: () => ({ phases: [phase] }), sources: () => new Map([['colmar', { booking_id: 1 }]]), bookingById: () => booking });
+    const place = places.forBooking(booking);
+    assert.ok(!/LEAK/.test(JSON.stringify(place)), JSON.stringify(place));
+    assert.equal(place.maps_url, `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${HOTEL}, Colmar`)}`);
+  });
+});
+
+// Finding 4: the active itinerary's booking card must carry the booking's own
+// stop, so a hotel not linked to a stop keeps ITS town.
+describe('a hotel booking not linked to a stop keeps its own town on the itinerary', () => {
+  let server, alice, bob;
+  before(async () => {
+    server = await boot(colmarConfig(), PORTS.hotelOnePlace);
+    alice = await server.login('alice');
+    bob = await server.login('bob');
+    const b = await server.call('/api/bookings', { method: 'POST', token: alice, body: { phase: 'colmar', type: 'hotel', name: HOTEL, date_from: IN, date_to: OUT } });
+    // Filed under Colmar, not linked to any stop, shown on an item under Basel.
+    const item = await server.call('/api/phases/basel/plan', { method: 'POST', token: alice, body: { date: '2090-03-12', time: '10:00', text_he: 'דלפק', text_en: 'Desk', booking_id: b.body.id } });
+    assert.equal(item.status, 201, item.text);
+  });
+  after(async () => { await server?.stop(); });
+  test('active itinerary, Classic plan and bookings all search "<hotel>, Colmar"', async () => {
+    const want = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${HOTEL}, Colmar`)}`;
+    const active = (await server.call('/api/itinerary/active', { token: bob })).body.items.find(i => i.text_en === 'Desk');
+    assert.equal(active.booking.place.maps_url, want);
+    assert.equal(active.location_url, want);
+    const classic = (await server.call('/api/phases/basel/plan', { token: bob })).body.find(i => i.text_en === 'Desk');
+    assert.equal(classic.booking.place.maps_url, want);
+    assert.equal((await server.call('/api/bookings', { token: bob })).body.find(x => x.type === 'hotel').place.maps_url, want);
+  });
 });
 
 describe('resolveHotelPlace (the one resolver)', () => {
@@ -339,5 +472,8 @@ describe('Classic site: the hotel card, the anchors and the bookings tab open th
     assert.ok(html.includes(`href="${MAPS.replace(/&/g, '&amp;')}"`) || html.includes(`href="${MAPS}"`), html);
     assert.ok(html.includes('title="Waze"') && html.includes('waze.com/ul?q='), html);
     assert.ok(!run({ id: 2, type: 'flight', name: 'LY1', location_url: null }).includes('href='), 'a booking with no place shows no location badge');
+    // An old stored link that is not http(s) must not hide the resolved one.
+    const stale = run({ id: 3, type: 'hotel', name: HOTEL, location_url: 'ftp://old.example/x', place: { maps_url: MAPS, waze_url: WAZE } });
+    assert.ok(stale.includes('google.com/maps/search') && !stale.includes('ftp://'), stale);
   });
 });

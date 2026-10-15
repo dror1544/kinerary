@@ -1353,4 +1353,6 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
   };
 }
 
-module.exports = { createTripStructure, openNote, phaseDates };
+// validateAccommodation, safeLink and clampText are also what server/hotel-place.js
+// holds the links and names it serves to — the stop write's own rules.
+module.exports = { createTripStructure, openNote, phaseDates, validateAccommodation, safeLink, clampText };

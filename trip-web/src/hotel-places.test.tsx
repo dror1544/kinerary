@@ -1,6 +1,6 @@
 // One hotel, one place: the screens agree on where it is (server/hotel-place.js
 // resolves the links; these tests pin what each screen does with them).
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { JourneyView, MapView, UpcomingActivity, mapPins } from "./App";
@@ -61,5 +61,27 @@ describe("Map tab", () => {
     expect(mapPins(config({ ...resolved, location_url: own }, town), [], "en")[0]).toMatchObject({ id: "stay:colmar", lat: 48.0911, lng: 7.359 });
     expect(mapPins(config(resolved, town), [], "en")[0]).toMatchObject({ id: "stay:colmar", lat: 48.0794, lng: 7.3585 });
     expect(mapPins(config(resolved), [], "en")).toEqual([]);
+  });
+});
+
+describe("Journey item editor", () => {
+  const edit = (item: ItineraryItem) => {
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <JourneyView itinerary={{ revision: "t", days: [{ phase_id: "colmar", date: "2090-03-10", label_en: "Arrive" }], items: [item] }}
+          config={config(resolved)} lang="en" isOrganizer onHeroPhaseChange={() => {}} focus={{ phaseId: "colmar", date: "2090-03-10" }} />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Edit$/ }));
+    return screen.getByLabelText("Google Maps or location link") as HTMLInputElement;
+  };
+  const base: ItineraryItem = { item_uid: "booking_1_checkin", phase_id: "colmar", date: "2090-03-10", time: "afternoon", item_type: "booking", text_he: "צ׳ק-אין", text_en: "Check-in", waze_url: WAZE };
+
+  it("does not prefill a hotel link the server resolved (from the stop, the booking or a search), so saving cannot freeze it into the item", () => {
+    expect(edit({ ...base, location_url: "https://www.google.com/maps/place/Dore/@48.08,7.36,17z", location_derived: true }).value).toBe("");
+  });
+
+  it("still prefills a link stored on the item itself", () => {
+    expect(edit({ ...base, location_url: "https://maps.example/reception" }).value).toBe("https://maps.example/reception");
   });
 });

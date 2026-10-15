@@ -642,7 +642,7 @@ function serializeItinerary(db, rows, { includeOriginal = false, config = null, 
   // A booking imported for organizer review is not participant-visible yet.
   // Every participant-facing itinerary projection must enforce that boundary;
   // filtering only /api/bookings leaked draft details through attached cards.
-  const bookingsById = new Map(db.prepare("SELECT id, type, name, date_from, date_to, confirmation, conf_file, location_url, google_wallet_url, apple_wallet_url, pkpass_file FROM bookings WHERE COALESCE(review_status, 'approved') = 'approved'").all().map((booking) => [booking.id, booking]));
+  const bookingsById = new Map(db.prepare("SELECT id, type, name, phase, date_from, date_to, confirmation, conf_file, location_url, google_wallet_url, apple_wallet_url, pkpass_file FROM bookings WHERE COALESCE(review_status, 'approved') = 'approved'").all().map((booking) => [booking.id, booking]));
   const payload = {
     revision: rows.version.revision_id,
     kind: rows.version.kind,

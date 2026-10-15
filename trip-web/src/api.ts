@@ -154,8 +154,9 @@ export const itemSchema = z.object({
   waze_url: z.string().nullable().optional(),
   website_url: z.string().nullable().optional(),
   ticket_url: z.string().nullable().optional(),
-  // True when location_url was resolved at serve time (a hotel's search link),
-  // not typed by anyone: an editor must not save it back as if it were.
+  // True when location_url was resolved at serve time from the hotel (its stop's
+  // link, its booking's link, or a search for its name), not stored on the item:
+  // an editor must not prefill it, or saving would freeze it into the item.
   location_derived: z.boolean().optional(),
   extra_links: z.array(extraLinkSchema).nullable().optional(),
   booking: z.object({

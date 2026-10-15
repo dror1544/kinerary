@@ -2854,7 +2854,7 @@ function bookingRefBadges(b) {
   // A hotel booking also carries `place` (server/hotel-place.js): its own link,
   // or a search for its name and town, plus Waze — the same ones every screen
   // opens. location_url stays what is stored, so the edit form is untouched.
-  const locationUrl = bkEsc(bkSafeUrl(b.location_url || b.place?.maps_url));
+  const locationUrl = bkEsc(bkSafeUrl(b.location_url) || bkSafeUrl(b.place?.maps_url));
   const locationBadge = locationUrl
     ? `<a href="${locationUrl}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;gap:2px;color:var(--accent);font-size:12px;text-decoration:none;vertical-align:middle;margin-right:4px" title="Location">📍</a>`
     : '';

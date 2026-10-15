@@ -24,18 +24,25 @@
 // when a link somebody supplied carries them (…/@lat,lng… or ?ll=lat,lng), and
 // then Waze is pointed at them. Nothing here calls an external service.
 
+const { publicPart } = require('../shared/config-visibility');
+const { validateAccommodation, safeLink, clampText } = require('./trip-structure');
+
 const MAPS_SEARCH = 'https://www.google.com/maps/search/?api=1&query=';
 const WAZE = 'https://waze.com/ul';
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
-// A link worth putting in an href: http(s) only. A stored `javascript:` or
-// `data:` link is dropped here, so no route serves one back.
+// A link worth putting in an href: the stop write's own rule (safeLink in
+// server/trip-structure.js) — http(s) with a real host, no quotes, brackets or
+// whitespace. A stored `javascript:` or `data:` link, or an old row with a quote
+// in it, is dropped here, so no route serves one back.
 function httpUrl(value) {
-  if (typeof value !== 'string') return null;
-  const v = value.trim();
-  return /^https?:\/\/\S+$/i.test(v) ? v : null;
+  return safeLink(value) ?? null;
 }
+
+// The part of a stop the allow-list serves (the same gate /api/config applies).
+// The resolver reads only this, so it can serve nothing the config would not.
+const publicStop = (phase) => (isObj(phase) ? publicPart('phase', phase) || null : null);
 
 // A bilingual config text ({he, en}) or a plain string, as one string.
 function textOf(value, prefer = 'en') {
@@ -122,7 +129,7 @@ function resolveHotelPlace({ booking = null, accommodation = null, phase = null 
 //   bookingById(id)   → an APPROVED booking row, or null (a draft is not served)
 function createHotelPlaces({ getConfig, sources, bookingById }) {
   const phases = () => (getConfig()?.phases || []);
-  const phaseById = (id) => phases().find((p) => p?.id === id) || null;
+  const phaseById = (id) => publicStop(phases().find((p) => p?.id === id));
 
   // The stop this booking is linked to, if any.
   function linkedStop(bookingId) {
@@ -153,12 +160,19 @@ function createHotelPlaces({ getConfig, sources, bookingById }) {
     const list = config.phases.map((phase) => {
       const source = src.get(phase?.id);
       if (!source || !isObj(phase.accommodation)) return phase;
-      const booking = source.booking_id != null ? bookingById(source.booking_id) : null;
-      const place = resolveHotelPlace({ booking, accommodation: phase.accommodation, phase });
+      const row = source.booking_id != null ? bookingById(source.booking_id) : null;
+      // A booking's name is typed text the booking write does not hold to the
+      // stop's rules (an old row may carry markup, a bidi override, 6000
+      // characters). It is the fallback name only if the stop write would accept
+      // it; otherwise there is no fallback, and nothing of it feeds the links.
+      const cleanName = row ? validateAccommodation({ name: clampText(String(row.name ?? ''), 300) }).value?.name : undefined;
+      const booking = row ? { ...row, name: cleanName || '' } : null;
+      const pub = publicStop(phase);
+      const place = resolveHotelPlace({ booking, accommodation: pub?.accommodation, phase: pub });
       if (!place) return phase;
       changed = true;
       const acc = { ...phase.accommodation, location_url: place.maps_url, waze: place.waze_url };
-      if (!textOf(acc.name) && !textOf(acc.name_en) && booking?.name) acc.name = booking.name;
+      if (!textOf(acc.name) && !textOf(acc.name_en) && cleanName) acc.name = cleanName;
       return { ...phase, accommodation: acc };
     });
     return changed ? { ...config, phases: list } : config;
@@ -181,8 +195,11 @@ function createHotelPlaces({ getConfig, sources, bookingById }) {
       ...item,
       location_url: place.maps_url,
       waze_url: httpUrl(item.waze_url) || place.waze_url,
-      // So an editor does not save a derived link back as if somebody typed it.
-      ...(!own && place.derived.maps ? { location_derived: true } : {}),
+      // The link served is the hotel's, resolved now — whether searched for or
+      // supplied by the stop or the booking. Flagged so the editor does not
+      // prefill it and an edit does not freeze it into the item row (it would
+      // then ignore a later edit of the stop's link).
+      location_derived: true,
     };
   }
 
