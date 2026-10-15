@@ -117,6 +117,9 @@ class Verdict(NamedTuple):
     passed: bool
     good: str
     bad: str
+    # A passing verdict that is information rather than a tick: printed as a
+    # note ("· ..."), not a pass mark. The check behind it was still made.
+    reported: bool = False
 
 
 def deferred_with_reasons(expect: dict) -> dict[str, str]:
@@ -158,7 +161,7 @@ def report_verdicts(verdicts: "list[Verdict]", deferred: dict[str, str], ctx: di
                 note(f"known gap, deferred ({v.name}): {v.bad}" + (f" — {reason}" if reason else ""))
                 ctx.setdefault("known_gaps", []).append((v.name, reason))
         elif v.passed:
-            ok(v.good)
+            (note if v.reported else ok)(v.good)
         else:
             print(f"  {RED}✗{RESET} {v.name}: {v.bad}")
     hard, _, _ = sort_verdicts(verdicts, deferred)
@@ -970,14 +973,45 @@ def rooms_verdict(config: dict, bookings: list) -> Verdict:
                    "the organizer said one hotel, two rooms; 'two rooms' is on no stop and in no booking")
 
 
-def trip_type_verdict(intake: dict, want: str) -> Verdict:
-    """The trip type was recorded as the OPTION, not as free text describing it."""
+def trip_type_flagged(config: "dict | None", words: str) -> bool:
+    """The companion was told the trip type is an open question: the config's
+    agent block carries a standing instruction marked `open_question:
+    "trip_type"` that quotes the organizer's words in both languages."""
+    agent = (config or {}).get("agent")
+    if not isinstance(agent, dict):
+        return False
+    for ins in agent.get("standing_instructions") or ():
+        if not isinstance(ins, dict) or ins.get("open_question") != "trip_type":
+            continue
+        text = ins.get("text") if isinstance(ins.get("text"), dict) else {}
+        if words and all(words in str(text.get(lang) or "") for lang in ("en", "he")):
+            return True
+    return False
+
+
+def trip_type_verdict(intake: dict, want: str, config: "dict | None" = None) -> Verdict:
+    """The trip type is the option, or, when the organizer's words matched no
+    option, those words kept and flagged for the companion.
+
+    Owner decision 2026-10-15: the trip type never blocks the build. Free text
+    is no longer a failure; it is REPORTED, and the run still fails when the
+    words did not reach the companion as an open question (a free-text trip
+    type that is unflagged would be silently treated as settled). Any other
+    recorded option than `want`, or nothing, still fails.
+    """
     answer = (intake or {}).get("trip_type") or {}
     kind = answer.get("kind")
+    if kind == "choice_other":
+        words = str(answer.get("other_text") or "").strip()
+        return Verdict(
+            "trip_type", trip_type_flagged(config, words),
+            f"trip_type left as the organizer's words {words!r}; flagged for the companion",
+            f"trip_type was left as the organizer's words {words!r} but the config carries no "
+            f"open-question instruction for the companion (agent.standing_instructions entry "
+            f"with open_question=trip_type quoting those words), so it would be treated as settled",
+            reported=True)
     if kind == "choice":
         recorded = f"option {answer.get('option_id')!r}"
-    elif kind == "choice_other":
-        recorded = f"free text {answer.get('other_text')!r}"
     else:
         recorded = "nothing"
     return Verdict("trip_type", kind == "choice" and answer.get("option_id") == want,
@@ -1007,7 +1041,7 @@ def site_shape_verdicts(config: dict, bookings: list, intake: dict, findings: "d
     out: "list[Verdict]" = []
     phases = config.get("phases") or []
     if "trip_type" in expect:
-        out.append(trip_type_verdict(intake, expect["trip_type"]))
+        out.append(trip_type_verdict(intake, expect["trip_type"], config))
     if "stops" in expect:
         out.append(stops_verdict(phases, expect["stops"]))
     if "not_stops" in expect:
