@@ -1274,6 +1274,38 @@ const GATEWAY_IS_NOT_A_STOP: readonly string[] = [
 ];
 
 /**
+ * A booked flight or car keeps its PLACES — one rule, said wherever a prompt can
+ * write a travel_anchors entry.
+ *
+ * The other half of GATEWAY_IS_NOT_A_STOP. A city that is only where they land
+ * is not a stop, so the flights are the one place the site can name it; the
+ * star e2e (2026-10-14) and the owner's run of 2026-10-10 got {type: flight,
+ * name: "LY8801"} from "LY8801 from A to B on 2 December" and the site showed a
+ * bare flight number with the gateway nowhere on it. The placeholders are
+ * letters on purpose: a real city in a prompt is a city `exampleEchoes` can
+ * catch in an answer. Whether a model follows this is only measurable live.
+ */
+const ANCHOR_KEEPS_PLACES: readonly string[] = [
+  `- A FLIGHT in travel_anchors keeps its route in "name": the flight number, then`,
+  `  where it leaves from and where it lands, as the person wrote them, joined by`,
+  `  " → " — "XY123 A → B". Use no comma, colon, semicolon or dash between the`,
+  `  places. If they named only one end, write only that end ("XY123 → B");`,
+  `  never fill in a place they did not say.`,
+  `- A rental car keeps where it is picked up and where it is returned, in`,
+  `  "name", in the person's own words and language: the car as they called it,`,
+  `  then the pick-up place and, if they said one, the return place. Never fill`,
+  `  in a place they did not say.`,
+];
+
+/**
+ * A booking section for a prompt that asks for travel_anchors but not for stops
+ * (stops carry the same rule inside `stopsSection`).
+ */
+function bookingsSection(): string[] {
+  return [`ABOUT BOOKINGS (the "travel_anchors" question):`, ...ANCHOR_KEEPS_PLACES, ``];
+}
+
+/**
  * How a typed answer about stops is read. Only included when stops are being
  * asked for (`phases` outstanding): every other question's prompt is spared it.
  *
@@ -1300,6 +1332,7 @@ function stopsSection(): string[] {
     `  ONE stop, B. Never write A as a first stop and a last stop. A flight or a`,
     `  car with its own date may go in "travel_anchors" if that question is`,
     `  listed below; otherwise leave it out.`,
+    ...ANCHOR_KEEPS_PLACES,
     `- "We have no plan yet", "nothing organised", "we'll decide there" says the`,
     `  itinerary is open. It does not leave the question unanswered: if the`,
     `  message names where they sleep, propose that stop. "unclear" is for a`,
@@ -1494,6 +1527,7 @@ export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
     `- If the message gestures at a question without settling it, put it in "unclear".`,
     ``,
     ...(asked.some((q) => q.id === "phases") ? stopsSection() : []),
+    ...(asked.some((q) => q.id === "travel_anchors") && !asked.some((q) => q.id === "phases") ? bookingsSection() : []),
     `Questions still outstanding:`,
     ...asked.map(describeQuestion),
     ``,
@@ -1717,6 +1751,7 @@ export function buildExtractIntakePrompt(args: {
     `  has no whole-trip dates, and the date is not on the weekday list, write`,
     `  it as --MM-DD ("check-in 9 August" is --08-09): the year is completed`,
     `  from the rest of the trip.`,
+    ...ANCHOR_KEEPS_PLACES,
     `- One booking is one travel_anchors entry, even when the document also`,
     `  describes the event or place it is for: a parking pass for a match is`,
     `  one anchor, not one for the match and another for the parking.`,

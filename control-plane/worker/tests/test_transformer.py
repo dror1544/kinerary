@@ -1525,6 +1525,53 @@ class DeriveBookingsTests(unittest.TestCase):
         # same seed_key and the site's INSERT OR IGNORE kept only one.
         self.assertEqual(len({r["seed_key"] for r in rows.values()}), 2)
 
+    def test_a_flight_anchor_keeps_its_route_and_so_does_the_car(self) -> None:
+        # The star e2e, 2026-10-14 (and the owner's run of 2026-10-10): flights
+        # to and from a gateway city that is NOT a stop reached the site as a
+        # bare "LY8801", so the gateway appeared nowhere. The route is part of
+        # the anchor's name (interpret.ts says so); the site must show it whole.
+        # Hebrew, because the organizer's words are kept as typed.
+        intake = {
+            **self.PHASED_INTAKE,
+            "travel_anchors": _structured([
+                {"type": "flight", "name": "LY8801 תל אביב → פרנקפורט", "date": "2026-09-19", "time": "07:10"},
+                {"type": "flight", "name": "LY8802 פרנקפורט → תל אביב", "date": "2026-09-27", "time": "15:40"},
+                {"type": "car", "name": "רכב שכור, איסוף בפרנקפורט", "date": "2026-09-19"},
+            ]),
+        }
+        rows = self._bookings(intake)
+        flights = [b for b in rows if b["type"] == "flight"]
+        self.assertEqual(
+            ["LY8801 תל אביב → פרנקפורט", "LY8802 פרנקפורט → תל אביב"],
+            sorted(b["name"] for b in flights),
+        )
+        text = " ".join(f"{b['name']} {b['notes'] or ''}" for b in flights)
+        self.assertIn("פרנקפורט", text, "the gateway is on the flights (e2e gateway_in_anchors)")
+        self.assertIn("תל אביב", text)
+        car = next(b for b in rows if b["type"] == "car")
+        self.assertIn("פרנקפורט", f"{car['name']} {car['notes'] or ''}", "the pick-up place survives")
+
+    def test_a_structured_name_the_shortener_cuts_is_kept_whole_in_notes(self) -> None:
+        # _shorten_phase_name cuts at a comma, colon, dash or semicolon and caps
+        # the length, which is right for a nav tab and wrong for "LY8801 A, B":
+        # whatever it dropped was the destination. The full words go to notes
+        # rather than being lost; a name it leaves alone gets no duplicate.
+        long_route = "LY8801 נמל התעופה בן גוריון תל אביב — פרנקפורט אם מיין"
+        intake = {
+            **self.PHASED_INTAKE,
+            "travel_anchors": _structured([
+                {"type": "flight", "name": long_route, "date": "2026-09-19"},
+                {"type": "flight", "name": "LY8802 פרנקפורט, תל אביב", "date": "2026-09-27"},
+                {"type": "attraction", "name": "Tokyo Skytree", "date": "2026-09-20"},
+            ]),
+        }
+        rows = {b["date_from"]: b for b in self._bookings(intake) if b["type"] != "hotel"}
+        for day, full in (("2026-09-19", long_route), ("2026-09-27", "LY8802 פרנקפורט, תל אביב")):
+            row = rows[day]
+            self.assertIn("פרנקפורט", f"{row['name']} {row['notes'] or ''}")
+            self.assertEqual(full, row["notes"])
+        self.assertIsNone(rows["2026-09-20"]["notes"], "a name left whole is not repeated in notes")
+
     def test_every_kind_the_question_invites_is_typed_a_booking_not_other(self) -> None:
         # The question names these by name, so the model emits them verbatim.
         # Each one missing from _ANCHOR_TYPE_MAP fell to "other": the

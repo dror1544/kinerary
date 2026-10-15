@@ -2802,6 +2802,16 @@ def derive_bookings(
         # it is a range endpoint, so don't pin it to a single day or phase.
         when = None if anchor_type == "proposal" else anchor["when"]
         name = _shorten_phase_name(anchor["name"] or detail, max_length=60) if (anchor["name"] or detail) else ""
+        # The shortener is for a nav-tab label: it cuts at a comma, colon or dash
+        # and caps the length. On a structured anchor that dropped the end of
+        # "LY8801 A, B" — the destination (star e2e, 2026-10-14). What it cut
+        # goes to notes, so the row still says what the organizer said. A name
+        # it left whole is not repeated, and a free-text anchor already has its
+        # whole text in `detail`.
+        # (Not folded into `detail`: that feeds the seed_key, and a re-provisioned
+        # trip must keep the keys it has.)
+        whole_name = anchor["name"]
+        notes_text = detail or (whole_name if whole_name and name != whole_name else "")
         phase_id = _phase_id_for_date(phases, when) if when else None
         # The same hotel often arrives twice — as the phase's accommodation and
         # as a dated anchor holding the booking number. One row, carrying the
@@ -2830,7 +2840,7 @@ def derive_bookings(
             "date_to": None,
             "passengers": None,
             "confirmation": raw.get("confirmation"),
-            "notes": detail or None,
+            "notes": notes_text or None,
             "cost": 0,
             # If the anchor names a venue the itinerary already links, reuse
             # that link rather than leaving the row with a bare 📍.
