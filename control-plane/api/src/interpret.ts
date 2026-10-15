@@ -1477,6 +1477,8 @@ export function changeSection(held: BuildInterpretPromptArgs["heldLists"]): stri
     `     -> [{"op":"choose","options":[{"op":"rename_stop","target":{"name":"Hakone"},"name":"Nagoya"},`,
     `         {"op":"replace_stop","target":{"name":"Hakone"},"fields":{"name":"Nagoya"}},`,
     `         {"op":"add_stop","fields":{"name":"Nagoya"}}]}]`,
+    `  "we're staying at Hotel X in Kyoto"`,
+    `     -> [{"op":"update_stop","target":{"name":"Kyoto"},"fields":{"accommodation":{"name":"Hotel X"}}}]`,
     `  "Ruth is 71"  (there may be two Ruths — give the name as written)`,
     `     -> [{"op":"update_traveller","target":{"name":"Ruth"},"fields":{"age":71}}]`,
     `  "my daughter Ella Cohen, 9, is joining"`,
@@ -1487,6 +1489,8 @@ export function changeSection(held: BuildInterpretPromptArgs["heldLists"]): stri
     `     -> [{"op":"update_stop","target":{"name":"טוקיו"},"fields":{"start":"2026-09-20","end":"2026-09-25"}}]`,
     `  "עוד שלושה ימים בסוף בטוקיו"   (another three days at the end, in Tokyo)`,
     `     -> [{"op":"add_stop","fields":{"name":"טוקיו"}}]`,
+    `  "נישן במלון X בקיוטו"   (we sleep at Hotel X in Kyoto)`,
+    `     -> [{"op":"update_stop","target":{"name":"קיוטו"},"fields":{"accommodation":{"name":"X"}}}]`,
     `  "רות בת 71"   (Ruth is 71)`,
     `     -> [{"op":"update_traveller","target":{"name":"רות"},"fields":{"age":71}}]`,
     `  "אנחנו לא נוסעים לקיוטו"   (we are not going to Kyoto)`,
@@ -1530,7 +1534,60 @@ export interface BuildInterpretPromptArgs {
    * not. Short answers are most of how people actually reply.
    */
   onScreen?: string | null;
+  /**
+   * The summary (or the "more, or the summary?" offer) is what is on screen.
+   *
+   * Then a typed message is not a reply to one question: it is something to ADD
+   * to, or CHANGE in, everything already held. Live, 2026-10-15: at the summary
+   * the organizer said which hotel they were sleeping at, and the reader — shown
+   * only the questions still unanswered, with the answered ones as "correct
+   * only if plainly corrected" — found nowhere to put it and returned nothing.
+   * Given this, every answerable question is described in full, answered or
+   * not, and a hotel is told where it lives (a stop's accommodation).
+   */
+  summaryOnScreen?: boolean;
+  /** Ids of the questions that already have an answer. Read only with `summaryOnScreen`. */
+  answered?: readonly string[];
   questions?: readonly IntakeQuestion[];
+}
+
+/**
+ * The questions a message typed at the summary may answer or change, besides
+ * the ones still outstanding: what a document can answer, and the two the
+ * organizer volunteers most ("also, we'd love…"). Router-owned questions (who
+ * the organizer is, how the assistant sounds) are deliberately not here.
+ */
+function summaryAnswerableIds(): ReadonlySet<string> {
+  return new Set([...DOCUMENT_ANSWERABLE_QUESTION_IDS, "trip_interests", "trip_pace"]);
+}
+
+/**
+ * What to tell the reader when the summary is on the organizer's screen. A
+ * hotel is the case that failed, so it is named, with where it goes and what to
+ * do when the stop cannot be told. Said without real places: a prompt example
+ * reaches answers (`exampleEchoes`).
+ */
+function summarySection(held: BuildInterpretPromptArgs["heldLists"]): string[] {
+  const stopsHeld = (held?.stops.length ?? 0) > 0;
+  return [
+    `THE SUMMARY IS ON THEIR SCREEN. They have just been shown everything we hold and are now`,
+    `ADDING to it or CHANGING it. So this message is not a reply to one question: it is new`,
+    `information about the trip, and it may belong to ANY question below, answered already or not.`,
+    `Read it for what it adds. Do not leave it out because the question already has an answer.`,
+    `- A HOTEL, or any place they will sleep ("we're staying at Hotel X in A", "נישן במלון X ב-A"),`,
+    stopsHeld
+      ? `  is the ACCOMMODATION of the stop in that place: an update_stop operation (see the operations`
+        + ` below) with "accommodation": {"name":"Hotel X"}, adding "confirmation" only if they gave a`
+        + ` code. Its target is the stop whose place the message names, or the only stop when there is`
+        + ` just one. It is not a stop of its own, and it is not a travel_anchors entry unless it is a`
+        + ` booking with a code or a date of its own.`
+      : `  is the "accommodation" of the stop in that place, inside "phases".`,
+    `- If it plainly is a hotel (or another addition) but you cannot tell WHICH stop or question it`,
+    `  belongs to, do not guess: put the question it most likely belongs to in "unclear" with a`,
+    `  "why", and propose nothing.`,
+    `- A message that adds nothing about the trip is still answered with silence.`,
+    ``,
+  ];
 }
 
 /**
@@ -1540,7 +1597,15 @@ export interface BuildInterpretPromptArgs {
  */
 export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
   const all = args.questions ?? INTAKE_QUESTIONS;
-  const asked = all.filter((q) => args.outstanding.includes(q.id));
+  // At the summary, the answered questions a message can add to are described in
+  // full too — except the stops and the travellers once held, which change only
+  // through operations (`changeSection`), never as a proposal.
+  const answeredToo = args.summaryOnScreen
+    ? new Set((args.answered ?? []).filter((id) => summaryAnswerableIds().has(id)
+        && !(id === "phases" && (args.heldLists?.stops.length ?? 0) > 0)
+        && !(id === "travelers" && (args.heldLists?.travellers.length ?? 0) > 0)))
+    : new Set<string>();
+  const asked = all.filter((q) => args.outstanding.includes(q.id) || answeredToo.has(q.id));
   const onScreen = args.onScreen && args.outstanding.includes(args.onScreen)
     ? all.find((q) => q.id === args.onScreen)
     : undefined;
@@ -1548,6 +1613,7 @@ export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
     `You are reading one message from someone planning a trip, written in ${languageName(args.language)}.`,
     `Decide which of the questions below it answers. Answer ONLY with JSON.`,
     ``,
+    ...(args.summaryOnScreen ? summarySection(args.heldLists) : []),
     ...(onScreen
       ? [
           `They were just asked "${onScreen.prompt.replace(/\s+/g, " ").trim()}" (id: ${onScreen.id}),`,
@@ -1590,15 +1656,19 @@ export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
     ``,
     ...(asked.some((q) => q.id === "phases") ? stopsSection() : []),
     ...(asked.some((q) => q.id === "travel_anchors") && !asked.some((q) => q.id === "phases") ? bookingsSection() : []),
-    `Questions still outstanding:`,
+    args.summaryOnScreen ? `Questions (answered already or not):` : `Questions still outstanding:`,
     ...asked.map(describeQuestion),
     ``,
     ...changeSection(args.heldLists),
     ...(args.correctable?.length
       ? [
-          `Already answered — propose one of these ONLY if this message plainly corrects it`,
-          `("actually…", "no, it's…", "add…", "make it…"). A passing mention is not a correction,`,
-          `and a message that merely repeats what they already said is not one either. For a list,`,
+          args.summaryOnScreen
+            ? `Already answered — propose one of these if this message ADDS to it or CHANGES it ("also…", "add…", "actually…", "make it…"). A message that merely repeats what they already said adds nothing. For a list,`
+            : `Already answered — propose one of these ONLY if this message plainly corrects it`,
+          ...(args.summaryOnScreen ? [] : [
+            `("actually…", "no, it's…", "add…", "make it…"). A passing mention is not a correction,`,
+            `and a message that merely repeats what they already said is not one either. For a list,`,
+          ]),
           changesHeld(args.heldLists)
             ? `propose only what is being ADDED or CHANGED, not the whole list. (The stops and the travellers are not here: change them with operations, above.)`
             : `propose only what is being ADDED or CHANGED, not the whole list.`,
