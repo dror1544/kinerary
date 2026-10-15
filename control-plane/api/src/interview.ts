@@ -1589,7 +1589,16 @@ function describeStructured(data: unknown): string {
     }
     const record = item as Record<string, unknown>;
     const named = NAME_KEYS.map((k) => record[k]).find((v) => typeof v === "string" && v.trim() !== "");
-    if (typeof named === "string") return named.trim();
+    if (typeof named === "string") {
+      // A stop shows where they sleep. The summary is what an immutable version
+      // is approved from, and a hotel added there (2026-10-15) was invisible on
+      // it: the organizer could not tell whether it had landed.
+      const stay = record.accommodation;
+      const hotel = stay && typeof stay === "object" && !Array.isArray(stay)
+        ? (stay as Record<string, unknown>).name
+        : undefined;
+      return typeof hotel === "string" && hotel.trim() !== "" ? `${named.trim()} (${hotel.trim()})` : named.trim();
+    }
     // No conventional name: show the first short scalar rather than nothing.
     const scalar = Object.values(record).find(
       (v) => (typeof v === "string" && v.trim() !== "" && v.length <= 60) || typeof v === "number",

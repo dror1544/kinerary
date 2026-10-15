@@ -3326,6 +3326,11 @@ async function runInterpretPath(
       onScreen,
       messageIds,
       heldLists: held,
+      // The summary (or the "more, or the summary?" offer) is what the organizer
+      // is looking at: what they type is then something to ADD or CHANGE, and the
+      // reader is given every answerable question for it (2026-10-15).
+      summaryOnScreen: session.ok && (session.view.state === "awaiting_confirmation" || boundaryOnScreen(session.view) !== null),
+      answered: state.answered,
       // What they have already told us, so "actually, it's only my wife" is
       // something the model can propose at all (2026-09-16).
       correctable: recorded
@@ -4223,7 +4228,14 @@ async function restateExpectation(
   // together?") is the boundary too, and restating an optional question under
   // it would answer a choice they were in the middle of making.
   const offerOnScreen = boundaryOnScreen(view) !== null;
-  const question = offerOnScreen
+  // THE SUMMARY IS ON SCREEN, so the summary is what is restated. Its session
+  // still has optional questions "remaining" (finishing skips them, it does not
+  // answer them), and restating the first of those put a fresh question where
+  // the summary was - live, 2026-10-15, under a message that was trying to add a
+  // hotel: the organizer was sent back into the interview and then to the
+  // summary again, and gave up. The state is the summary's, whatever is left.
+  const atSummary = view.state === "awaiting_confirmation";
+  const question = offerOnScreen || atSummary
     ? null
     : view.nextQuestion ?? view.pendingAsk ?? view.optionalRemaining[0] ?? null;
 
@@ -4239,7 +4251,16 @@ async function restateExpectation(
   // outstanding question's turn to be restated for an unrelated reason.
   const unsettledHere = question ? view.unsettled?.[question.id] : undefined;
   const skipLead = reason === "NOT_UNDERSTOOD" && Boolean(unsettledHere);
-  const lead = skipLead ? null : uiString(reason === "EXPIRING" ? "stillWaitingBeforeExpiry" : "didNotFollow", view.language);
+  // AT THE SUMMARY a typed message that put nothing on record is not a failure to
+  // follow: they are looking at everything and may well be adding to it. The lead
+  // says how to (live, 2026-10-15: "I didn't follow" at the summary, twice, and the
+  // hotel they were trying to add was never recorded).
+  const lead = skipLead
+    ? null
+    : uiString(
+      reason === "EXPIRING" ? "stillWaitingBeforeExpiry" : atSummary ? "recapNothingCaptured" : "didNotFollow",
+      view.language,
+    );
 
   let rendered: RenderedQuestion;
   if (question) {
@@ -4520,6 +4541,16 @@ async function settleBoundary(
   // sentence, a detail landing from it means they were understood.
   if (args.captured.length > 0) {
     return (await speakBoundary(deps, chatId, view, "moreOrSummary", OPTIONAL_OFFER_PROMPT))
+      ? "spoke" : "not_settled";
+  }
+
+  // THEY TOLD US SOMETHING ABOUT THE TRIP AND NONE OF IT COULD BE PLACED. The
+  // reader says `answer_only` - there is a detail in this message - and nothing
+  // was captured from it (a hotel with no stop named, 2026-10-15). "I didn't
+  // quite follow" is false: they were followed, the detail just has nowhere to
+  // go yet. Say so, show how to say it, and keep both exits underneath.
+  if (intent === "answer_only" && confidence >= BOUNDARY_CONFIRM_CONFIDENCE) {
+    return (await speakBoundary(deps, chatId, view, "couldNotPlace", OPTIONAL_OFFER_PROMPT))
       ? "spoke" : "not_settled";
   }
 
