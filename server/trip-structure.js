@@ -1303,6 +1303,18 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
     return q.overrides.all().map(parseRow).filter(o => o.kind === 'config' && !baseIds.has(o.phase_id)).map(o => o.phase_id);
   }
 
+  // The stops whose hotel the stop layer wrote or linked to a booking, as
+  // Map<stop id, { booking_id }>. server/hotel-place.js resolves a hotel's map
+  // and Waze links for exactly these (a hotel the config file carries is served
+  // as the file has it). Read-only provenance: nothing here is served itself.
+  function accommodationSources() {
+    const out = new Map();
+    for (const o of q.overrides.all().map(parseRow)) {
+      if (o.booking_id != null || (isObj(o.fields) && Object.hasOwn(o.fields, 'accommodation'))) out.set(o.phase_id, { booking_id: o.booking_id });
+    }
+    return out;
+  }
+
   function historyOf(id) {
     return q.historyFor.all(id).map(row => ({
       id: row.id, action: row.action, actor: row.actor, note: row.note, created_at: row.created_at,
@@ -1336,9 +1348,11 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
   }
 
   return {
-    effectiveConfig, isPhase, isStop, revision, listStops, historyOf, ops, registerRoutes, onBookingChanged, orphanedOverrides,
+    effectiveConfig, isPhase, isStop, revision, listStops, historyOf, ops, registerRoutes, onBookingChanged, orphanedOverrides, accommodationSources,
     phaseTitle: (id) => effectivePhase(id)?.title || null,
   };
 }
 
-module.exports = { createTripStructure, openNote, phaseDates };
+// validateAccommodation, safeLink and clampText are also what server/hotel-place.js
+// holds the links and names it serves to — the stop write's own rules.
+module.exports = { createTripStructure, openNote, phaseDates, validateAccommodation, safeLink, clampText };

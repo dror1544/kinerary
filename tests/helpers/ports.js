@@ -182,6 +182,9 @@ export const PORTS = {
   lostFoundBoundsMcp:       28342,  // mcp/mcp.js against it
   // Review of the hardening itself: GET serves a column allow-list.
   lostFoundColumnsSite:     28343,  // the trip server, with an extra column added
+  // One hotel, one place — a companion-added hotel resolves to the same name
+  // and links in every view — tests/hotel-one-place.test.js.
+  hotelOnePlace:            28351,
 
   // ── Stand-ins for services the server calls out to ─────────────────────
   bookingExtractMockHermes: 28103,

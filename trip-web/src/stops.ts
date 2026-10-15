@@ -148,7 +148,7 @@ export function stopDatesOf(phase: { dates?: { start?: string; end?: string }; s
 // the night is B's. Only when no stop runs past the date does a stop that ends
 // on it count (a config that writes the last night as the end date). The day's
 // own stop wins a tie. Config without dated stops: the stored copy, as before.
-export type Lodging = { name?: unknown; name_en?: string | null; address?: unknown; location_url?: string | null };
+export type Lodging = { name?: unknown; name_en?: string | null; address?: unknown; location_url?: string | null; waze_url?: string | null };
 export function tonightLodging(phases: TripConfig["phases"], day: Pick<ItineraryDay, "phase_id" | "date" | "lodging_context"> | undefined, phaseId: string | undefined, date: string): Lodging | null {
   const stored = (day?.lodging_context ?? null) as Lodging | null;
   const dated = (phases || [])
@@ -160,7 +160,7 @@ export function tonightLodging(phases: TripConfig["phases"], day: Pick<Itinerary
     || prefer(dated.filter(p => p.dates.start <= date && date <= p.dates.end));
   if (!night) return stored;
   const acc = night.phase.accommodation;
-  if (acc && (acc.name || acc.name_en)) return { name: acc.name, name_en: acc.name_en, address: acc.address, location_url: acc.location_url };
+  if (acc && (acc.name || acc.name_en)) return { name: acc.name, name_en: acc.name_en, address: acc.address, location_url: acc.location_url, waze_url: acc.waze };
   // The stop has no hotel the site's config carries (a legacy multi-hotel
   // phase is read on the server): the stored copy, but only if it was written
   // for this very stop — never another stop's hotel after a split.

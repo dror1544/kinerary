@@ -107,6 +107,9 @@ export const configSchema = z.object({
       name_en: z.string().optional(),
       address: z.string().optional(),
       location_url: z.string().optional(),
+      // The hotel's Waze link — supplied, or resolved on the server from its
+      // name and town (server/hotel-place.js); the same one on every screen.
+      waze: z.string().optional(),
     }).optional(),
   })).optional(),
   agent: z.object({
@@ -130,6 +133,14 @@ const extraLinkSchema = z.object({
   href: z.string().optional(),
 }).passthrough();
 
+// Where a hotel booking is, as the server resolves it (server/hotel-place.js).
+const hotelPlaceSchema = z.object({
+  name: z.string().optional(),
+  maps_url: z.string(),
+  waze_url: z.string(),
+  derived: z.boolean().optional(),
+});
+
 export const itemSchema = z.object({
   item_uid: z.string(),
   phase_id: z.string(),
@@ -143,6 +154,10 @@ export const itemSchema = z.object({
   waze_url: z.string().nullable().optional(),
   website_url: z.string().nullable().optional(),
   ticket_url: z.string().nullable().optional(),
+  // True when location_url was resolved at serve time from the hotel (its stop's
+  // link, its booking's link, or a search for its name), not stored on the item:
+  // an editor must not prefill it, or saving would freeze it into the item.
+  location_derived: z.boolean().optional(),
   extra_links: z.array(extraLinkSchema).nullable().optional(),
   booking: z.object({
     id: z.number(),
@@ -154,6 +169,7 @@ export const itemSchema = z.object({
     google_wallet_url: z.string().nullable().optional(),
     apple_wallet_url: z.string().nullable().optional(),
     pkpass_file: z.string().nullable().optional(),
+    place: hotelPlaceSchema.optional(),
   }).nullable().optional(),
   confirmation_state: z.string().optional(),
   provenance: z.object({ status: z.string() }).optional(),
@@ -176,7 +192,7 @@ export type ItineraryDay = {
   date: string;
   label_he?: string | null;
   label_en?: string | null;
-  lodging_context?: { name?: z.infer<typeof bilingualSchema> | null; address?: z.infer<typeof bilingualSchema> | null; location_url?: string | null } | null;
+  lodging_context?: { name?: z.infer<typeof bilingualSchema> | null; address?: z.infer<typeof bilingualSchema> | null; location_url?: string | null; waze_url?: string | null } | null;
 };
 
 export type ActiveItinerary = {
@@ -228,6 +244,7 @@ const bookingSchema = z.object({
   apple_wallet_url: z.string().nullable().optional(),
   pkpass_file: z.string().nullable().optional(),
   notes: z.string().nullable().optional(),
+  place: hotelPlaceSchema.optional(),
   review_status: z.enum(["approved", "draft"]).optional(),
 });
 
