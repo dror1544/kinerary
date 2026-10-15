@@ -481,6 +481,44 @@ export function stopsMissingEnglishName(data: unknown): string[] {
   return missing;
 }
 
+/**
+ * How many travellers lack a name in the interview's language, and how many lack
+ * the Latin form — counted, never named.
+ *
+ * Every traveller carries `name` in the interview's own language and script and
+ * `name_en` in Latin letters (the owner's manual test, 2026-10-15: four
+ * travellers confirmed in two scripts, two of them with no `name_en`). The site's
+ * roster, the intro's login list and the login names read these fields, and a
+ * Hebrew-only traveller gave the login nothing Latin to be made from.
+ *
+ * Reported, never rejected, for the reason `stopsMissingEnglishName` gives: a
+ * rejection would drop the whole roster and re-ask the organizer for names they
+ * already said, to repair a field that is the interviewer's job. An English
+ * interview has no second name to owe — a Latin `name` is its own Latin form.
+ * A language whose script is not known here is only checked for the Latin form.
+ * Anything that is not a roster counts nothing.
+ */
+export function travelersMissingNames(
+  data: unknown,
+  language: string,
+): { missingInterviewLanguageName: number; missingEnglishName: number } {
+  const gap = { missingInterviewLanguageName: 0, missingEnglishName: 0 };
+  if (!Array.isArray(data) || language === "en") return gap;
+  const script = INTERVIEW_NAME_SCRIPT[language];
+  for (const person of data) {
+    if (!person || typeof person !== "object") continue;
+    const p = person as Record<string, unknown>;
+    if (typeof p.name !== "string" || !/\p{L}/u.test(p.name)) continue;
+    if (script && !script.test(p.name)) gap.missingInterviewLanguageName += 1;
+    const latin = typeof p.name_en === "string" && /\p{Script=Latin}/u.test(p.name_en);
+    if (!latin) gap.missingEnglishName += 1;
+  }
+  return gap;
+}
+
+/** The letters a name must contain to be written in an interview's language. */
+const INTERVIEW_NAME_SCRIPT: Record<string, RegExp> = { he: /\p{Script=Hebrew}/u };
+
 function anchorDatesProblem(data: unknown): string | null {
   if (!Array.isArray(data)) return null;
   for (const [i, anchor] of data.entries()) {
@@ -650,7 +688,14 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     // spelling the organizer can glance at and correct costs them one word
     // ("Sagi, not Sagie") instead of a whole list. Answers overwrite, so a
     // correction arriving later is a plain re-submit of this question.
-    prompt: "Who's coming? List each person's name, age, and family/household group. If the names aren't in Latin script, transliterate them YOURSELF and submit that as each person's English spelling — then show the organizer the spellings you chose so they can correct any you got wrong. Never ask them to write the names out a second time.",
+    //
+    // BOTH NAMES, ALWAYS (owner's manual test, 2026-10-15). `name` is in the
+    // language and script of the interview, `name_en` is the Latin form: a
+    // ticket's exact spelling when a document printed one, a transliteration
+    // otherwise. A Hebrew interview confirmed two travellers in English letters
+    // (off the tickets) and two in Hebrew with no name_en — a roster in two
+    // scripts and two site logins with no Latin form to be derived from.
+    prompt: "Who's coming? List each person's name, age, and family/household group. Every person gets two names: \"name\" in the language of this interview, in its own script (a name given in Latin letters is rewritten in that script — a transliteration, never a translation), and \"name_en\" in Latin letters — copied exactly as printed when a document spelled it (a ticket's spelling is the passport's), otherwise transliterated YOURSELF. Show the organizer the spellings you chose so they can correct any you got wrong, and never ask them to write the names out a second time.",
     dataShape: "array",
     dataExample: "[{\"name\": \"נועה ברק\", \"name_en\": \"Noa Barak\", \"age\": 12, \"family\": \"Barak\"}]",
     required: true,
@@ -4714,6 +4759,23 @@ async function confirmIntakeVia(
         trip_id: session.trip_id,
         intake_version_id: versionId,
         stops_missing_name_en: unnamed.length,
+      }));
+    }
+
+    // The same, for travellers: `name` in the interview's language, `name_en` in
+    // Latin letters (owner's manual test, 2026-10-15). Counts only — these are
+    // people's names.
+    const travelersAnswer = session.answers.travelers;
+    const nameGap = travelersAnswer?.kind === "structured"
+      ? travelersMissingNames(travelersAnswer.data, coerceLanguage(session.language) ?? DEFAULT_LANGUAGE)
+      : { missingInterviewLanguageName: 0, missingEnglishName: 0 };
+    if (nameGap.missingInterviewLanguageName > 0 || nameGap.missingEnglishName > 0) {
+      log(structuredLog("warn", "interview.traveler_without_name_form", {
+        session_id: session.id,
+        trip_id: session.trip_id,
+        intake_version_id: versionId,
+        travelers_missing_interview_language_name: nameGap.missingInterviewLanguageName,
+        travelers_missing_name_en: nameGap.missingEnglishName,
       }));
     }
 

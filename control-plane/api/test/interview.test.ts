@@ -1192,6 +1192,65 @@ describe("getSession / submitAnswer / confirmIntake (DB)", () => {
     }
   });
 
+  test("confirming a Hebrew interview whose travellers lack a form of their name still confirms, and says so by count", { skip: SKIP }, async () => {
+    // Owner's manual test, 2026-10-15: a Hebrew interview confirmed
+    // [{Dror Aloul, name_en}, {Hagit Mali Aloul, name_en}, {צחי סער}, {ליאב סער}] —
+    // two in English letters, two in Hebrew with no name_en. Loud, not blocking,
+    // and the log carries counts, never the family's names.
+    const fix = await setupFixture(pool);
+    try {
+      const token = await issuedEnrollmentToken(fix);
+      const started = await startSession(fix.pool, token, () => {}, undefined, CHAT_ID);
+      if (!started.ok) throw new Error("unreachable");
+      await setLanguageForChat(fix.pool, CHAT_ID, "he");
+      await answerAllRequiredQuestions(fix.pool, started.sessionToken);
+      const roster = await submitAnswer(fix.pool, started.sessionToken, "travelers", null, undefined, undefined, [
+        { name: "Dror Aloul", name_en: "Dror Aloul" },
+        { name: "Hagit Mali Aloul", name_en: "Hagit Mali Aloul" },
+        { name: "צחי סער" },
+        { name: "ליאב סער" },
+      ]);
+      assert.equal(roster.ok, true);
+      assert.equal((await submitAnswer(fix.pool, started.sessionToken, "organizer_identity", "Dror Aloul")).ok, true);
+
+      const lines: string[] = [];
+      const confirmed = await confirmIntake(fix.pool, started.sessionToken, (line) => lines.push(line));
+      assert.equal(confirmed.ok, true);
+
+      const warn = lines.find((l) => l.includes("interview.traveler_without_name_form"));
+      assert.ok(warn, `expected a traveler_without_name_form warning, got: ${lines.join(" | ")}`);
+      assert.match(warn, /"travelers_missing_interview_language_name":2/);
+      assert.match(warn, /"travelers_missing_name_en":2/);
+      for (const word of ["Dror", "Aloul", "צחי", "סער"]) {
+        assert.equal(warn.includes(word), false, `the log carries counts, not ${word}`);
+      }
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("confirming travellers who each carry both names logs no warning", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const token = await issuedEnrollmentToken(fix);
+      const started = await startSession(fix.pool, token, () => {}, undefined, CHAT_ID);
+      if (!started.ok) throw new Error("unreachable");
+      await setLanguageForChat(fix.pool, CHAT_ID, "he");
+      await answerAllRequiredQuestions(fix.pool, started.sessionToken);
+      await submitAnswer(fix.pool, started.sessionToken, "travelers", null, undefined, undefined, [
+        { name: "דרור אלול", name_en: "Dror Aloul" },
+        { name: "צחי סער", name_en: "Tzachi Saar" },
+      ]);
+      await submitAnswer(fix.pool, started.sessionToken, "organizer_identity", "דרור אלול");
+      const lines: string[] = [];
+      const confirmed = await confirmIntake(fix.pool, started.sessionToken, (line) => lines.push(line));
+      assert.equal(confirmed.ok, true);
+      assert.equal(lines.some((l) => l.includes("traveler_without_name_form")), false);
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
   test("Telegram's own locale draws the first message before the agent reports one", { skip: SKIP }, async () => {
     // The file acknowledgement exists to arrive BEFORE the model has read
     // anything — so it cannot wait for the interviewer to report a language.
