@@ -257,6 +257,9 @@ class LxcProvisionAdapter:
                 nfs_host_dir=f"{self._nfs_host_base}/{trip_id or slug}",
                 nfs_mount_path=f"{self._nfs_mount_base}/{trip_id or slug}",
                 trip_slug=slug,
+                # The same host NPM and the tunnel serve the trip on, so the
+                # member MCP connector's OAuth issuer is a name assistants reach.
+                public_origin=f"https://{hostname}",
             ),
             # forward_host is the container's IP, deliberately not its LXC name.
             # No trip-* hostname resolves on this LAN — the containers hold

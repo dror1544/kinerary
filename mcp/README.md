@@ -201,7 +201,17 @@ The site's **More** tab has a "Connect your AI assistant" card:
 The card also lists connected assistants with **Disconnect**: organizers see
 everyone's, anyone else sees their own.
 
-**Turning it on for a trip** — both in that trip's `.env`, then restart:
+**Trips the control plane builds have it on** — the container bootstrap
+(`provisioning/adapters.py`) writes both lines below into a new trip's `.env`,
+with `PUBLIC_ORIGIN` taken from the trip's own public hostname (the one NPM and
+the tunnel serve it on). It is written only when the `.env` is first created, so
+a trip built before this existed, or by hand, still needs the lines added; its
+nginx also needs the `/mcp`, `/oauth/` and `/.well-known/oauth-` blocks the
+same template carries. Members sign in on the consent page with a site password
+or Google, so a trip with neither (random seeded passwords, no
+`GOOGLE_CLIENT_ID`) can show the card yet have nobody able to approve.
+
+**Turning it on for a trip by hand** — both in that trip's `.env`, then restart:
 
 ```
 TRIP_MCP_ENABLED=1
