@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { buildExtractIntakePrompt, buildInterpretPrompt } from "../src/interpret.js";
+import { INTAKE_QUESTIONS } from "../src/interview.js";
 
 /**
  * The chat-answer prompt's rules about the SHAPE of a trip and about matching a
@@ -128,5 +129,48 @@ describe("one rule, two prompts: the document prompt agrees on flights and cars"
   test("both say a rental car's pick-up and return city is not a stop either", () => {
     assert.match(doc, /rental car/i);
     assert.match(chat, /rental car/i);
+  });
+});
+
+describe("a booked flight or car keeps its places (star e2e, 2026-10-14)", () => {
+  // The organizer typed "LY8801 from A to B on 2 December" and the confirmed
+  // intake kept {type: flight, name: "LY8801", ...}: the route was dropped, so
+  // the site's flight row was a bare number and the gateway city appeared
+  // nowhere, although it is deliberately not a stop. The rule is in the prompt;
+  // whether a model follows it is measured live (scripts/e2e-full-cycle.py,
+  // gateway_in_anchors) because CI has no model.
+  const doc = flat(buildExtractIntakePrompt({ documentText: "x", outstanding: ["travel_anchors"], language: "en" }));
+  const stops = flat(buildInterpretPrompt(PHASES_SCREEN));
+  const bookings = flat(buildInterpretPrompt({ sourceText: "x", outstanding: ["travel_anchors"], language: "he" }));
+
+  for (const [where, text] of [["stops", stops], ["bookings", bookings], ["document", doc]] as const) {
+    test(`the ${where} prompt says a flight's name carries where it leaves from and lands`, () => {
+      assert.match(text, /A FLIGHT in travel_anchors keeps its route in "name"/);
+      assert.match(text, /XY123 A → B/);
+    });
+
+    test(`the ${where} prompt says a car keeps its pick-up and return place, and invents none`, () => {
+      assert.match(text, /rental car keeps where it is picked up and where it is returned/i);
+      assert.match(text, /never fill in a place they did not say/i);
+    });
+  }
+
+  test("the route rule is not spent on a prompt that asks for neither stops nor bookings", () => {
+    const other = buildInterpretPrompt({ sourceText: "x", outstanding: ["destination"], language: "en" });
+    assert.equal(other.includes("keeps its route"), false);
+  });
+
+  test("the travel_anchors example shows a flight carrying its route", () => {
+    const q = INTAKE_QUESTIONS.find((x) => x.id === "travel_anchors")!;
+    const rows = JSON.parse(q.dataExample!) as Record<string, string>[];
+    const flight = rows.find((r) => r.type === "flight");
+    assert.ok(flight, "a flight is in the example");
+    assert.match(flight.name!, /→/);
+  });
+
+  test("the route rule names no real trip, so it cannot be echoed into an answer", () => {
+    for (const word of ["Colmar", "Frankfurt", "Alsace", "קולמר", "פרנקפורט", "אלזס", "LY88"]) {
+      for (const text of [stops, bookings, doc]) assert.equal(text.includes(word), false, word);
+    }
   });
 });

@@ -688,7 +688,12 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     // a value is a value a model can copy. The transformer reads any type
     // (`_read_anchor`); hotel, car and proposal stay out of the day plan, and
     // an optional HH:MM `time` puts a booked visit at its hour.
-    dataExample: "[{\"type\": \"attraction\", \"name\": \"Sky Lagoon\", \"date\": \"2027-03-05\", \"time\": \"15:00\", \"confirmation\": \"SL-58213\"}]",
+    //
+    // A flight carries its ROUTE in `name`, and a car its pick-up place (star
+    // e2e, 2026-10-14: "LY8801" alone left the gateway city off the site). The
+    // route is in the name, not in new fields, because the transformer already
+    // shows a name and no validator or site shape has to learn a key.
+    dataExample: "[{\"type\": \"attraction\", \"name\": \"Sky Lagoon\", \"date\": \"2027-03-05\", \"time\": \"15:00\", \"confirmation\": \"SL-58213\"}, {\"type\": \"flight\", \"name\": \"FI305 Oslo → Reykjavik\", \"date\": \"2027-03-04\", \"time\": \"09:30\"}, {\"type\": \"car\", \"name\": \"Rental car pick-up Keflavik airport\", \"date\": \"2027-03-04\"}]",
     required: false,
     // A flight number is not a confirmation, and that is a rule, not a
     // judgement — see withoutFlightNumbersAsConfirmations (#131).
