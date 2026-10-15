@@ -564,6 +564,9 @@ export async function applyDecision(
           outstanding: [question.id],
           answered: [],
           pendingQuestionId: question.id,
+          // They pressed Other: free text is what they chose, so the
+          // typed-choice safety net must not turn it into an option.
+          literalOther: true,
         });
         // Preserve exactly what the organizer wrote. The model validates the
         // meaning; it is not allowed to paraphrase a personal trip descriptor
