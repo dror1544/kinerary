@@ -1050,6 +1050,87 @@ export function isFlightDesignator(value: string): boolean {
     || /^[A-Z]{3}\d{1,4}[A-Z]?$/.test(cleaned);
 }
 
+// ── A flight the organizer typed is never lost because the model did not file it ──
+//
+// Live, star e2e, 2026-10-15 (2 runs of 6): the organizer typed both flights
+// inside the answer to the stops question. The reader sometimes proposed the
+// stops only; `travel_anchors` is optional, so nothing ever asked for it, the
+// organizer confirmed, and both flights were nowhere in the config. Whether a
+// typed flight reaches `travel_anchors` was a model judgement, and this is the
+// deterministic floor under it: a designator found in what the organizer TYPED
+// that no `travel_anchors` entry carries is asked about, once, before the
+// summary. The detector never files anything — the organizer's answer does.
+
+/**
+ * Flight designators in text the organizer typed, normalised ("LY8801"), in
+ * order of first appearance.
+ *
+ * DELIBERATELY NARROWER than `isFlightDesignator`, which judges a field that is
+ * already known to be a booking reference. Free text is full of things that
+ * wear the same shape — "USD 1500", "DEC 15", "B737", "MP3", "NY 2027" — and a
+ * wrong hit costs the organizer a question, so:
+ *  - capital letters only, with the code and the number glued or joined by a
+ *    hyphen ("LY8801", "LY-8801"); a space is not accepted, because it is what
+ *    makes a currency and a month read as a flight;
+ *  - at least two digits, and three when the airline code itself carries a
+ *    digit ("U2", "9W") — "A320" and "B737" are aircraft, not services;
+ *  - not part of a longer word or number.
+ * What this misses is left to the reader, as it always was. A single-digit
+ * flight number ("LY1") is one of those.
+ */
+export function flightDesignatorsIn(text: string): string[] {
+  const found: string[] = [];
+  const pattern = /(?<![A-Za-z0-9])([A-Z]{2,3}|[A-Z][0-9]|[0-9][A-Z])-?([0-9]{1,4})(?![A-Za-z0-9])/g;
+  for (const match of text.matchAll(pattern)) {
+    const code = match[1]!;
+    const digits = match[2]!;
+    const needed = /[0-9]/.test(code) ? 3 : 2;
+    if (digits.length < needed) continue;
+    const designator = `${code}${digits}`;
+    if (!isFlightDesignator(designator)) continue;
+    if (!found.includes(designator)) found.push(designator);
+  }
+  return found;
+}
+
+/** Is this designator named anywhere in the organizer's bookings? Any spelling, any case. */
+function designatorInAnchors(designator: string, answers: AnswerStore): boolean {
+  const answer = answers.travel_anchors;
+  if (!answer || answer.kind !== "structured") return false;
+  const haystack = JSON.stringify(answer.data ?? null).toUpperCase();
+  const spelled = designator.split("").join("[\\s\\-_.]?");
+  return new RegExp(`(?<![A-Z0-9])${spelled}(?![0-9])`).test(haystack);
+}
+
+/**
+ * The flights the organizer typed that the bookings do not carry and that have
+ * not been asked about yet. Empty is the normal state. "Asked" is once and for
+ * good: an organizer who answers that they are not booked is believed, and the
+ * interview never goes round again.
+ */
+export function flightsOwed(answers: AnswerStore, ui: InterviewUiState): string[] {
+  const asked = new Set(ui.flightsAsked ?? []);
+  return (ui.typedFlights ?? []).filter((d) => !asked.has(d) && !designatorInAnchors(d, answers));
+}
+
+/** Words for "you mentioned these flights — say them again as bookings", one or several. */
+const FLIGHTS_OWED_PHRASES: Readonly<Record<Language, { one: string; many: string }>> = {
+  en: {
+    one: "You mentioned flight {flights}. So that I don't lose it, tell me about it again with its date and route (and a confirmation number, if you have one) — or tell me it isn't booked yet.",
+    many: "You mentioned the flights {flights}. So that I don't lose them, tell me about each one again with its date and route (and a confirmation number, if you have one) — or tell me they aren't booked yet.",
+  },
+  he: {
+    one: "הזכרתם את הטיסה {flights}. כדי שלא אפספס אותה, כתבו לי עליה שוב עם התאריך והמסלול (ומספר אישור, אם יש) — או כתבו שעוד לא הזמנתם.",
+    many: "הזכרתם את הטיסות {flights}. כדי שלא אפספס אותן, כתבו לי על כל אחת מהן שוב עם התאריך והמסלול (ומספר אישור, אם יש) — או כתבו שעוד לא הזמנתם.",
+  },
+};
+
+/** The line that leads the bookings question when typed flights are owed. */
+export function flightsOwedLead(designators: readonly string[], language: Language): string {
+  const phrases = FLIGHTS_OWED_PHRASES[language] ?? FLIGHTS_OWED_PHRASES[DEFAULT_LANGUAGE];
+  return (designators.length === 1 ? phrases.one : phrases.many).replace("{flights}", designators.join(", "));
+}
+
 /**
  * Keeps a flight number out of a booking's `confirmation`.
  *
@@ -1623,6 +1704,12 @@ export interface SessionView {
   /** True once the "essentials done" choice has been put to the organizer. */
   offeredMore: boolean;
   /**
+   * Flights the organizer typed that the bookings do not carry and that have not
+   * been asked about — see `flightsOwed`. The router asks the bookings question
+   * about them before the interview can reach its summary. Absent or empty: none.
+   */
+  flightsOwed?: string[];
+  /**
    * Where the interview is, as a phase it entered rather than a value
    * recomputed from the answers. The source of truth; `state` is its
    * projection into the older three-value vocabulary.
@@ -1723,6 +1810,14 @@ function currentSelections(answers: AnswerStore): Record<string, string[]> {
  */
 export interface InterviewUiState {
   finishRequested?: boolean;
+  /**
+   * Flight designators found in what the organizer TYPED, normalised ("LY8801").
+   * Written by the interpret path as a message arrives, before the reader has a
+   * say, so a flight the reader did not file is still known — see `flightsOwed`.
+   */
+  typedFlights?: string[];
+  /** The typed flights the organizer has been asked about. Once is enough. */
+  flightsAsked?: string[];
   skipped?: string[];
   /**
    * Required questions that were asked and not answered, stepped aside so the
@@ -1890,8 +1985,14 @@ function parseUiState(raw: unknown): InterviewUiState {
   const deferred = Array.isArray(record.deferred)
     ? record.deferred.filter((id): id is string => typeof id === "string")
     : undefined;
+  const designators = (value: unknown): string[] =>
+    Array.isArray(value) ? value.filter((d): d is string => typeof d === "string" && /^[A-Z0-9]{4,8}$/.test(d)) : [];
+  const typedFlights = designators(record.typed_flights);
+  const flightsAsked = designators(record.flights_asked);
   return {
     ...(record.finish_requested === true ? { finishRequested: true } : {}),
+    ...(typedFlights.length > 0 ? { typedFlights } : {}),
+    ...(flightsAsked.length > 0 ? { flightsAsked } : {}),
     ...(skipped && skipped.length > 0 ? { skipped } : {}),
     ...(deferred && deferred.length > 0 ? { deferred } : {}),
     ...(typeof record.pending_ask === "string" ? { pendingAsk: record.pending_ask } : {}),
@@ -1911,6 +2012,8 @@ function parseUiState(raw: unknown): InterviewUiState {
 function serializeUiState(ui: InterviewUiState): string {
   return JSON.stringify({
     ...(ui.finishRequested ? { finish_requested: true } : {}),
+    ...(ui.typedFlights && ui.typedFlights.length > 0 ? { typed_flights: ui.typedFlights } : {}),
+    ...(ui.flightsAsked && ui.flightsAsked.length > 0 ? { flights_asked: ui.flightsAsked } : {}),
     ...(ui.skipped && ui.skipped.length > 0 ? { skipped: ui.skipped } : {}),
     ...(ui.deferred && ui.deferred.length > 0 ? { deferred: ui.deferred } : {}),
     ...(ui.pendingAsk ? { pending_ask: ui.pendingAsk } : {}),
@@ -2301,7 +2404,14 @@ export function nextPhase(
 
   if (current === "essentials") return requiredDone ? "optional" : "essentials";
 
+  // TYPED FLIGHTS NOT YET ASKED ABOUT hold the interview open. Finishing, or
+  // running out of optional questions, would otherwise reach a summary that
+  // lacks a flight the organizer wrote — and a confirmed intake is immutable.
+  // Asking is what releases it (`flightsAsked`), so this cannot hold forever.
+  const flightsPending = flightsOwed(answers, ui).length > 0;
+
   if (current === "optional") {
+    if (flightsPending) return "optional";
     if (ui.finishRequested) return "recap";
     // Running out is the other way in. Confirmation is gated on the REQUIRED
     // set alone, so arriving here early skips nothing that matters.
@@ -2309,8 +2419,9 @@ export function nextPhase(
   }
 
   // recap: the organizer either confirms (handled by confirmIntake, which sets
-  // the phase directly) or reopens the questions with Keep planning.
-  return ui.finishRequested ? "recap" : "optional";
+  // the phase directly) or reopens the questions with Keep planning. A flight
+  // typed while the summary is up reopens them too, until it has been asked about.
+  return ui.finishRequested && !flightsPending ? "recap" : "optional";
 }
 
 /**
@@ -2343,6 +2454,8 @@ function deriveSessionState(
   const allRequired = questions.filter((q) => q.required);
   const allAnswered = allRequired.every((q) => isAnswered(q, answers));
   if (!allAnswered) return "interviewing";
+  // Same hold as `nextPhase`: the stored `state` must not run ahead of the phase.
+  if (flightsOwed(answers, ui).length > 0) return "interviewing";
   if (ui.finishRequested) return "awaiting_confirmation";
   return unansweredOptionalQuestions(answers, questions, ui).length === 0
     ? "awaiting_confirmation"
@@ -3203,6 +3316,7 @@ function buildSessionView(
     selections: currentSelections(answers),
     language,
     offeredMore: ui.offeredMore === true,
+    flightsOwed: flightsOwed(answers, ui),
     lastPrompt: ui.lastPrompt ?? null,
     phase,
     awaiting,
@@ -3869,6 +3983,42 @@ export async function recordLastPromptForChat(
   key: string,
 ): Promise<void> {
   await updateUiStateForChat(db, chatId, (ui) => ({ ...ui, lastPrompt: key }));
+}
+
+/**
+ * Notes the flight designators in a message the organizer typed, BEFORE the
+ * reader's proposals are applied, so a flight the reader leaves out is still
+ * known to the interview. Returns the designators this message carried.
+ *
+ * Records nothing about the trip — only that these were said. The phase is
+ * re-evaluated because a flight typed while the summary is up reopens the
+ * questions (`nextPhase`).
+ */
+export async function noteTypedFlightsForChat(
+  db: pg.Pool,
+  chatId: string,
+  text: string,
+): Promise<string[]> {
+  const found = flightDesignatorsIn(text);
+  if (found.length === 0) return [];
+  await updateUiStateForChat(db, chatId, (ui) => ({
+    ...ui,
+    typedFlights: [...new Set([...(ui.typedFlights ?? []), ...found])].slice(-40),
+  }));
+  await advancePhaseForChat(db, chatId);
+  return found;
+}
+
+/** Records that the organizer has been asked about these flights, so it is never asked twice. */
+export async function markFlightsAskedForChat(
+  db: pg.Pool,
+  chatId: string,
+  designators: readonly string[],
+): Promise<void> {
+  await updateUiStateForChat(db, chatId, (ui) => ({
+    ...ui,
+    flightsAsked: [...new Set([...(ui.flightsAsked ?? []), ...designators])].slice(-40),
+  }));
 }
 
 /** Records that the "essentials done" choice has been shown, so it is shown once. */

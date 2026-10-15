@@ -78,6 +78,9 @@ import {
   deferredRequired,
   undeferAllForChat,
   reaskLead,
+  flightsOwedLead,
+  markFlightsAskedForChat,
+  noteTypedFlightsForChat,
   buildRecap,
   selectedOptionIds,
   setFinishRequestedForChat,
@@ -2866,6 +2869,15 @@ export const MAX_CONSECUTIVE_REASKS = 2;
 // `:raised` — brought back at the boundary under the blocker line.
 const REASK_SUFFIX = /:(?:reask:(\d+)|raised)$/;
 
+/**
+ * The prompt key of the bookings question when it is asked BECAUSE the organizer
+ * typed a flight the bookings do not carry. Its own key, not `q:travel_anchors`:
+ * the plain question may already be on screen (or have been passed over) when
+ * the flight arrives, and the dedupe would then swallow the one question that
+ * keeps the flight from being lost.
+ */
+export const FLIGHTS_PROMPT = "q:travel_anchors:flights";
+
 /** A prompt key without its re-ask suffix: the key the question itself would carry. */
 export function stripReask(prompt: string | null | undefined): string {
   return (prompt ?? "").replace(REASK_SUFFIX, "");
@@ -3222,6 +3234,21 @@ async function runInterpretPath(
     }
   }
 
+  // A FLIGHT THEY TYPED IS NOTED BEFORE THE MODEL SPEAKS. Whether the reader
+  // files it under `travel_anchors` is its judgement (live, 2026-10-15: two runs
+  // in six filed the stops and left both flights out, and the confirmed intake
+  // had no bookings at all). Noting it here, from the organizer's own words and
+  // by code, is what lets `sendNextStep` ask about it whatever the reader did —
+  // including when the reader failed, or was never configured. Idempotent, so a
+  // replayed burst notes nothing twice.
+  const typedFlights = await noteTypedFlightsForChat(deps.db, burst.chatId, sourceText);
+  if (typedFlights.length > 0) {
+    log(structuredLog("info", "interview.typed_flights_noted", {
+      session_id: burst.sessionId,
+      flights: typedFlights,
+    }));
+  }
+
   // The crash window: the model answered and the commit did not land. Its
   // PROPOSALS were stored; its operations were not, so a stored reading with no
   // proposals is asked again rather than resumed as "the model said nothing".
@@ -3518,6 +3545,12 @@ async function runInterpretPath(
       session_id: burst.sessionId,
       question_id: onScreen,
     }));
+    // The bookings question just asked about a typed flight was passed over: the
+    // organizer has answered it (their own words, not filing them), and that
+    // was the hold on the summary. A skip does not move the phase by itself.
+    if (onScreen === "travel_anchors" && session.ok && session.view.lastPrompt === FLIGHTS_PROMPT) {
+      await advancePhaseForChat(deps.db, burst.chatId);
+    }
   }
 
   // THE SILENCE. A REQUIRED question cannot be skipped, so when the organizer
@@ -4929,10 +4962,20 @@ export async function sendNextStep(
   // of a reading ("shall I put your summary together?") leaves the choice just
   // as open. Without it the walk would ask an optional question on top of a
   // question the organizer is in the middle of answering.
-  const offerOutstanding = onInterpretPath && boundaryOnScreen(view) !== null;
+  // A FLIGHT THE ORGANIZER TYPED AND THE BOOKINGS DO NOT CARRY is asked about
+  // before anything else optional - before the offer, the walk, and the summary
+  // (`nextPhase` holds the phase here until it has been asked). Once: `sendNextStep`
+  // marks it asked when the question is delivered, and it is never owed again.
+  const owedFlights = onInterpretPath && view.state === "interviewing" && view.phase === "optional" && !view.nextQuestion
+    ? view.flightsOwed ?? []
+    : [];
+  const flightQuestion = owedFlights.length > 0 ? INTAKE_QUESTIONS.find((q) => q.id === "travel_anchors") ?? null : null;
+
+  const offerOutstanding = onInterpretPath && !flightQuestion && boundaryOnScreen(view) !== null;
 
   const question =
     view.nextQuestion
+    ?? flightQuestion
     ?? view.pendingAsk
     ?? (offerOutstanding
       ? null
@@ -4952,7 +4995,7 @@ export async function sendNextStep(
   // loop this branch exists to end.
   const promptKey = offerOutstanding
     ? view.lastPrompt ?? OPTIONAL_OFFER_PROMPT
-    : routerPromptKey(view, question);
+    : flightQuestion ? FLIGHTS_PROMPT : routerPromptKey(view, question);
   // A re-ask of this question (`…:reask:<n>`, `…:raised`) IS this question on
   // screen: compared without its suffix, or a tick would send the plain
   // question straight back on top of the re-ask.
@@ -5145,7 +5188,7 @@ export async function sendNextStep(
     // the summary.
     // Interpret path only: with an interviewer, the agent nominates the optional
     // questions and the boundary message below is still the router's one offer.
-    const announcesOptional = onInterpretPath && !question.required && view.state === "interviewing" && !view.nextQuestion
+    const announcesOptional = onInterpretPath && !flightQuestion && !question.required && view.state === "interviewing" && !view.nextQuestion
       && (view.pendingEntry === "optional" || (view.pendingEntry === null && !view.offeredMore));
     if (announcesOptional) {
       // THE BOUNDARY IS ITS OWN MESSAGE, and it asks nothing yet. Folding it
@@ -5162,7 +5205,7 @@ export async function sendNextStep(
       // `offerOutstanding` above is what keeps it unasked until they choose.
       return sendOptionalOffer(view, chatId, deps);
     }
-    text = rendered.text;
+    text = flightQuestion ? `${flightsOwedLead(owedFlights, view.language)}\n\n${rendered.text}` : rendered.text;
     replyMarkup = rendered.replyMarkup ?? undefined;
     // The nomination is spent once it has been ASKED - cleared below, after the
     // send, not here: a send Telegram did not take has asked nothing, and the
@@ -5183,6 +5226,14 @@ export async function sendNextStep(
   // or (refused for good) to the organizer's next message, and a caller that
   // read `false` as "nothing was said" would say "I didn't follow" over it.
   if ((await deliverStep(view, chatId, deps, promptKey, { text, replyMarkup })) !== "delivered") return true;
+  if (flightQuestion) {
+    // Asked, so never owed again: an answer files them, and "not booked" is believed.
+    await markFlightsAskedForChat(deps.db, chatId, owedFlights);
+    (deps.log ?? (() => {}))(structuredLog("info", "interview.typed_flights_asked", {
+      session_id: view.sessionId,
+      flights: owedFlights,
+    }));
+  }
   if (askedNomination) {
     // Only if it is still THIS nomination: one made while the send was in
     // flight is a new one, and is not ours to clear.
