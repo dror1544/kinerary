@@ -586,7 +586,13 @@ BOOTSTRAP_INNER
         if record is None:
             return None
         read = "grep '^SEED_PASSWORD=' /opt/kinerary/.env || true"
-        output = self.ssh.run(f"pct exec {shlex.quote(record['vmid'])} -- sh -c {shlex.quote(read)}")
+        try:
+            output = self.ssh.run(f"pct exec {shlex.quote(record['vmid'])} -- sh -c {shlex.quote(read)}")
+        except RuntimeError:
+            # The transport's error text quotes the command's output, which here
+            # is the password itself; the worker logs job failures with their
+            # exception text, so the detail must not travel with it.
+            raise RuntimeError(f"could not read the site password of container {record['vmid']}") from None
         for line in output.splitlines():
             if line.startswith("SEED_PASSWORD="):
                 return line.split("=", 1)[1].strip() or None

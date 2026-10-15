@@ -380,6 +380,25 @@ class AdapterTests(unittest.TestCase):
         # no such container -> None, not an exception
         self.assertIsNone(ProxmoxLxcAdapter(FakeProxmoxSsh()).site_password(LXC_SPEC))
 
+    def test_a_failed_password_read_does_not_carry_the_password_in_its_error(self) -> None:
+        # The ssh transport quotes the command's output in its error, and the
+        # worker logs job failures with their text: a read that exits non-zero
+        # after printing the password must not put it in that text.
+        class Failing(FakeProxmoxSsh):
+            def run(self, command, *, secrets=()):
+                if command.startswith("pct exec 201 -- ") and "/opt/kinerary/.env" in command:
+                    raise RuntimeError("ssh command failed (exit 255): SEED_PASSWORD=ab2c-d3ef-gh4j-km5n")
+                return super().run(command, secrets=secrets)
+
+        spec = LxcSpec(
+            "trip-kinerary", "pve", "t", "s", 2, 1024, 8, "vmbr0", "ip", "gw", "ns", "h", "m", "kinerary",
+        )
+        with self.assertRaises(RuntimeError) as caught:
+            ProxmoxLxcAdapter(Failing()).site_password(spec)
+        self.assertNotIn("ab2c", str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertTrue(caught.exception.__suppress_context__)
+
     def test_exchange_key_is_private_and_shell_quoted(self) -> None:
         ssh = FakeProxmoxSsh(nextid="203")
         adapter = ProxmoxLxcAdapter(ssh, control_plane_exchange_key="exchange $key")
