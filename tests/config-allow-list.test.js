@@ -223,6 +223,19 @@ describe('publicAgent — allow-list, not deny-list', () => {
     });
   });
 
+  test('an unresolved-trip-type open question is for the companion, never served to the site', () => {
+    // The transformer marks a typed trip type that matched no option with
+    // `open_question: "trip_type"` on an ORGANIZER-ONLY standing instruction.
+    // Organizer-only is withheld; and even if the entry were group-visible the
+    // marker is not on the allow-list, so it would still not be served.
+    const asked = { visibility: 'organizer', open_question: 'trip_type',
+      text: { he: 'OPEN-HE', en: 'OPEN-EN' } };
+    const hidden = publicAgent({ name: 'x', standing_instructions: [asked] });
+    assert.ok(!('standing_instructions' in hidden), JSON.stringify(hidden));
+    const shared = publicAgent({ name: 'x', standing_instructions: [{ ...asked, visibility: 'group' }] });
+    assert.deepEqual(shared.standing_instructions, [{ visibility: 'group', text: asked.text }]);
+  });
+
   test('a missing block is still undefined, and an all-hidden instruction list drops its key', () => {
     assert.equal(publicAgent(undefined), undefined);
     assert.equal(publicAgent('not an object'), undefined);

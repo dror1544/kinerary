@@ -1408,14 +1408,37 @@ def _derive_agent(
     # It is kept verbatim in both language slots: it was reviewed by the
     # interviewer before storage, but translating a personal description would
     # still put words in the organizer's mouth.
+    #
+    # It is also an OPEN QUESTION, not just flavour (owner's decision,
+    # 2026-10-15): the trip type never blocks the build, but it shapes later
+    # planning (pace, who the suggestions are for), and words that matched none
+    # of the options have not been settled into one. The entry is marked
+    # `open_question: "trip_type"` so a reader (the e2e run, the companion's
+    # private context) can tell "left as the organizer's words" from ordinary
+    # context, and its text tells the companion to settle it in conversation.
+    # Organizer-only like every instruction here: the marker is for the
+    # companion, and the words themselves already show in the trip title.
     trip_type = data.get("trip_type")
     if isinstance(trip_type, Mapping) and trip_type.get("kind") == "choice_other":
         custom_type = str(trip_type.get("other_text") or "").strip()
         if custom_type:
-            instructions.append(_instruction({
-                "en": f"The organizer describes this trip as: {custom_type}",
-                "he": f"המארגן מתאר את הטיול כך: {custom_type}",
-            }))
+            instruction = _instruction({
+                "en": (
+                    f'The organizer described this trip as "{custom_type}", which is not one of '
+                    "the standard trip types, so the trip type is not settled. It affects how you "
+                    "plan (pace, and who suggestions are for). Settle it naturally early in the "
+                    "conversation, for example by asking who is travelling and what pace suits "
+                    "them, then save the answer as a trip rule."
+                ),
+                "he": (
+                    f'המארגן תיאר את הטיול כך: "{custom_type}" — זה לא אחד מסוגי הטיול הרגילים, '
+                    "ולכן סוג הטיול עדיין לא סגור. זה משפיע על התכנון (קצב, ולמי מיועדות ההצעות). "
+                    "כדאי להבהיר זאת בשיחה בשלב מוקדם ובאופן טבעי, למשל מי נוסע ואיזה קצב מתאים, "
+                    "ואז לשמור את התשובה ככלל של הטיול."
+                ),
+            })
+            instruction["open_question"] = "trip_type"
+            instructions.append(instruction)
     pace = _text_value(data["trip_pace"]) if isinstance(data.get("trip_pace"), Mapping) else ""
     if pace in _PACE_TEXT:
         instructions.append(_instruction(_PACE_TEXT[pace]))

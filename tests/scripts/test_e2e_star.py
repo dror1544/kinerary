@@ -304,15 +304,64 @@ class Rooms(unittest.TestCase):
 
 
 class TripType(unittest.TestCase):
-    def test_the_option_is_what_counts_not_free_text(self) -> None:
+    WORDS = "שני זוגות, בלי ילדים"
+
+    def flagged_config(self, words=WORDS, **over):
+        entry = {"visibility": "organizer", "open_question": "trip_type",
+                 "text": {"en": f'The organizer described this trip as "{words}"', "he": f'המארגן תיאר: "{words}"'}}
+        entry.update(over)
+        return {"agent": {"standing_instructions": [entry]}}
+
+    def test_a_chosen_option_is_checked_against_the_one_expected(self) -> None:
         mod = load()
         good = {"trip_type": {"kind": "choice", "option_id": "couple"}}
-        other = {"trip_type": {"kind": "choice_other", "other_text": "טיול זוגות"}}
         family = {"trip_type": {"kind": "choice", "option_id": "family"}}
-        self.assertTrue(mod.trip_type_verdict(good, "couple").passed)
-        self.assertFalse(mod.trip_type_verdict(other, "couple").passed)
+        verdict = mod.trip_type_verdict(good, "couple")
+        self.assertTrue(verdict.passed)
+        self.assertFalse(verdict.reported)
         self.assertFalse(mod.trip_type_verdict(family, "couple").passed)
         self.assertFalse(mod.trip_type_verdict({}, "couple").passed)
+
+    def test_free_text_is_reported_not_failed_when_the_companion_was_told(self) -> None:
+        # Owner decision 2026-10-15: the trip type never blocks the build.
+        intake = {"trip_type": {"kind": "choice_other", "other_text": self.WORDS}}
+        verdict = load().trip_type_verdict(intake, "couple", self.flagged_config())
+        self.assertTrue(verdict.passed)
+        self.assertTrue(verdict.reported)
+        self.assertEqual(
+            verdict.good,
+            f"trip_type left as the organizer's words {self.WORDS!r}; flagged for the companion")
+
+    def test_free_text_the_companion_was_not_told_about_still_fails(self) -> None:
+        mod = load()
+        intake = {"trip_type": {"kind": "choice_other", "other_text": self.WORDS}}
+        for config in (None, {}, {"agent": {}},
+                       {"agent": {"standing_instructions": [{"text": {"en": self.WORDS, "he": self.WORDS}}]}},
+                       self.flagged_config(open_question="pace"),
+                       self.flagged_config(words="something else entirely")):
+            with self.subTest(config=config):
+                verdict = mod.trip_type_verdict(intake, "couple", config)
+                self.assertFalse(verdict.passed)
+                self.assertIn("treated as settled", verdict.bad)
+
+    def test_the_marker_must_quote_the_words_in_both_languages(self) -> None:
+        intake = {"trip_type": {"kind": "choice_other", "other_text": self.WORDS}}
+        config = self.flagged_config()
+        config["agent"]["standing_instructions"][0]["text"]["he"] = "אין כאן את המילים"
+        self.assertFalse(load().trip_type_verdict(intake, "couple", config).passed)
+
+    def test_the_reported_line_is_a_note_not_a_tick(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+        mod = load()
+        intake = {"trip_type": {"kind": "choice_other", "other_text": self.WORDS}}
+        verdict = mod.trip_type_verdict(intake, "couple", self.flagged_config())
+        out = io.StringIO()
+        with redirect_stdout(out):
+            mod.report_verdicts([verdict], {}, {})
+        self.assertIn("·", out.getvalue())
+        self.assertNotIn("✓", out.getvalue())
+        self.assertIn("flagged for the companion", out.getvalue())
 
     def test_a_button_fallback_is_a_failure_of_the_typed_answer(self) -> None:
         mod = load()
@@ -396,6 +445,20 @@ class StarThroughTheChecker(unittest.TestCase):
         ctx = self.ctx()
         self.mod._check_site_expectations(ctx, self.spec["expect_site"])
         self.assertEqual([name for name, _ in ctx["known_gaps"]], ["rooms_visible"])
+
+    def test_a_free_text_trip_type_the_companion_was_told_about_does_not_fail_the_run(self) -> None:
+        words = "שני זוגות"
+        config = {**self.config, "agent": {"standing_instructions": [
+            {"visibility": "organizer", "open_question": "trip_type",
+             "text": {"en": f'described as "{words}"', "he": f'תיאר "{words}"'}}]}}
+        ctx = self.ctx(config=config, intake={"trip_type": {"kind": "choice_other", "other_text": words}})
+        self.mod._check_site_expectations(ctx, self.spec["expect_site"])
+
+    def test_a_free_text_trip_type_nobody_flagged_still_fails_the_run(self) -> None:
+        ctx = self.ctx(intake={"trip_type": {"kind": "choice_other", "other_text": "שני זוגות"}})
+        with self.assertRaises(self.mod.Failed) as caught:
+            self.mod._check_site_expectations(ctx, self.spec["expect_site"])
+        self.assertIn("trip_type:", str(caught.exception))
 
     def test_the_owners_manual_run_fails_loudly_on_every_shape_defect_at_once(self) -> None:
         # Gateway as two extra stops, all undated, trip type as free text, no

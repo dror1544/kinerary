@@ -215,14 +215,41 @@ class TransformerTests(unittest.TestCase):
         config = transform_intake(intake)
         self.assertIn("Extended family reunion", config["meta"]["title"])
 
-    def test_other_trip_type_reaches_the_companion_as_context(self) -> None:
-        intake = {**JAPAN_INTAKE, "trip_type": _choice_other("Extended family reunion")}
-        config = transform_intake(intake)
-        instructions = config["agent"]["standing_instructions"]
-        self.assertTrue(any(
-            item["text"]["en"] == "The organizer describes this trip as: Extended family reunion"
-            for item in instructions
-        ))
+    def _trip_type_instructions(self, trip_type: dict) -> list:
+        config = transform_intake({**JAPAN_INTAKE, "trip_type": trip_type})
+        instructions = (config.get("agent") or {}).get("standing_instructions", [])
+        return [i for i in instructions if i.get("open_question") == "trip_type"]
+
+    def test_unresolved_trip_type_reaches_the_companion_as_an_open_question(self) -> None:
+        # The organizer's typed trip type matched no option (choice_other). It
+        # must not block the build, and it must not look settled: the companion
+        # is told it is open, with the organizer's words verbatim, in both
+        # languages, and is told to settle it in conversation.
+        found = self._trip_type_instructions(_choice_other("שני זוגות, בלי ילדים"))
+        self.assertEqual(len(found), 1)
+        text = found[0]["text"]
+        for lang in ("en", "he"):
+            self.assertIn("שני זוגות, בלי ילדים", text[lang])
+        self.assertIn("not settled", text["en"])
+        self.assertIn("early in the conversation", text["en"])
+
+    def test_unresolved_trip_type_marker_is_organizer_only(self) -> None:
+        # The marker is for the companion. Organizer-only keeps it off the
+        # site through sanitizeConfig / agent-schema (group-visible only).
+        (found,) = self._trip_type_instructions(_choice_other("Extended family reunion"))
+        self.assertEqual(found["visibility"], "organizer")
+
+    def test_unresolved_trip_type_keeps_the_words_in_the_title(self) -> None:
+        config = transform_intake({**JAPAN_INTAKE, "trip_type": _choice_other("Extended family reunion")})
+        self.assertIn("Extended family reunion", config["meta"]["title"])
+
+    def test_a_chosen_trip_type_carries_no_open_question(self) -> None:
+        for option in ("family", "group_of_families", "couple"):
+            with self.subTest(option=option):
+                self.assertEqual(self._trip_type_instructions(_choice(option)), [])
+
+    def test_a_blank_typed_trip_type_adds_no_empty_question(self) -> None:
+        self.assertEqual(self._trip_type_instructions(_choice_other("   ")), [])
 
     def test_other_group_size_extracts_the_leading_number(self) -> None:
         # A stat "number" must actually be a number, not the organizer's

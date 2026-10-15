@@ -144,6 +144,61 @@ class BuildCompanionHandoffTests(unittest.TestCase):
             self.assertNotIn(forbidden, blob.lower())
 
 
+class UnresolvedTripTypeReachesTheCompanionTests(unittest.TestCase):
+    """The organizer typed a trip type that matched no option. The transformer
+    marks it as an open question; this is the render the companion reads."""
+
+    TEMPLATE = Path(__file__).resolve().parents[3] / "profile-templates" / "familytrip-companion"
+
+    def _rendered_private_context(self, trip_type: dict) -> dict:
+        import subprocess
+        import sys
+        import tempfile
+
+        from control_plane_worker.transformer import transform_intake
+
+        intake = {
+            "trip_type": trip_type,
+            "destination": {"kind": "text", "schema_version": 1, "text": "Japan"},
+            "trip_duration": {"kind": "choice", "option_id": "two_weeks", "schema_version": 1, "other_text": None},
+        }
+        produced = (transform_intake(intake).get("agent") or {}).get("standing_instructions", [])
+        config = {**FULL_CONFIG, "agent": {**FULL_CONFIG["agent"], "standing_instructions": produced}}
+        handoff = build_companion_handoff(
+            trip_id="trip_abc", slug="tokyo-2026", config=config,
+            intake_version_id="intk_abc", intake_schema_version=2,
+            intake_digest="sha256:" + "a" * 64, confirmed_at="2026-01-01T00:00:00+00:00",
+            canonical_site_url="https://tokyo-2026.example",
+        )
+        assert handoff is not None
+        with tempfile.TemporaryDirectory() as tmp:
+            src, out = Path(tmp) / "in.json", Path(tmp) / "bundle"
+            src.write_text(json.dumps(handoff))
+            done = subprocess.run(
+                [sys.executable, str(self.TEMPLATE / "render_profile.py"), "--input", str(src), "--output", str(out)],
+                text=True, capture_output=True,
+            )
+            self.assertEqual(done.returncode, 0, done.stderr)
+            return json.loads((out / "references" / "interview-context.private.json").read_text())
+
+    def test_a_typed_trip_type_is_an_open_question_in_the_rendered_private_context(self) -> None:
+        private = self._rendered_private_context(
+            {"kind": "choice_other", "option_id": None, "schema_version": 1, "other_text": "two couples, no kids"}
+        )
+        asked = [i for i in private["organizer_private"]["standing_instructions"]
+                 if i.get("open_question") == "trip_type"]
+        self.assertEqual(len(asked), 1)
+        self.assertIn("two couples, no kids", asked[0]["text"]["en"])
+        self.assertEqual(asked[0]["visibility"], "organizer")
+
+    def test_a_chosen_trip_type_renders_no_open_question(self) -> None:
+        private = self._rendered_private_context(
+            {"kind": "choice", "option_id": "couple", "schema_version": 1, "other_text": None}
+        )
+        instructions = private["organizer_private"].get("standing_instructions", [])
+        self.assertEqual([i for i in instructions if i.get("open_question")], [])
+
+
 class SlugifyProfileNameTests(unittest.TestCase):
     def test_strips_hyphens_and_stays_in_bounds(self) -> None:
         self.assertRegex(_slugify_profile_name("tokyo-kyoto-2026"), r"^[a-z][a-z0-9]{2,31}$")
