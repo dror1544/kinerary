@@ -28,6 +28,7 @@ import {
   type AnswerStore,
 } from "./interview.js";
 import { addUsage, type ModelUsage, type RunnerFailure, type StructuredModelRunner } from "./model-runner.js";
+import { resolveTypedOption } from "./choice-aliases.js";
 import { parseOps, type HeldItem, type Op } from "./typed-changes.js";
 import {
   identityFold,
@@ -704,6 +705,13 @@ export interface ApplyProposalsContext {
   answers?: AnswerStore;
   unclear?: readonly UnclearQuestion[];
   questions?: readonly IntakeQuestion[];
+  /**
+   * The organizer pressed a choice's Other button, so free text is the answer
+   * they chose and the caller is checking that their words are one. Skips the
+   * typed-choice safety net: "extended family reunion" typed there must stay
+   * free text, not become the Family option.
+   */
+  literalOther?: boolean;
   /** Default 0.7. One threshold, not a per-question table, until there is
    *  evidence a per-question one is needed. */
   minConfidence?: number;
@@ -838,6 +846,25 @@ function validateProposed(
 }
 
 /**
+ * The safety net behind the interpret prompt's "match an option by meaning".
+ *
+ * The model is told that "two couples" is the Couple option, and about half the
+ * time it answers choice_other "שני זוגות" instead (star e2e, 2026-10-15): free
+ * text on the site where the option belonged. When a choice question's answer
+ * comes back as choice_other and its text plainly names exactly ONE of the
+ * question's own options (`choice-aliases.ts`, negation handled), it becomes
+ * that option. Anything else — nothing named, two named, a word for another kind
+ * of trip — stays exactly as the model said. A model's `choice` is never touched.
+ */
+function settleTypedChoice(proposal: ProposedAnswer, questions: readonly IntakeQuestion[]): ProposedAnswer {
+  if (proposal.value.kind !== "choice_other") return proposal;
+  const question = questions.find((q) => q.id === proposal.questionId);
+  if (question?.type !== "choice" || !question.options?.length) return proposal;
+  const optionId = resolveTypedOption(question.id, proposal.value.otherText, question.options.map((o) => o.id));
+  return optionId ? { ...proposal, value: { kind: "choice", optionId } } : proposal;
+}
+
+/**
  * Decides what, if anything, a set of proposals is allowed to write. Pure.
  *
  * Order matters and is cheapest-and-most-decisive first: a proposal for a
@@ -845,10 +872,11 @@ function validateProposed(
  * validating it.
  */
 export function applyProposals(
-  proposals: readonly ProposedAnswer[],
+  modelProposals: readonly ProposedAnswer[],
   ctx: ApplyProposalsContext,
 ): ProposalDecisions {
   const questions = ctx.questions ?? INTAKE_QUESTIONS;
+  const proposals = ctx.literalOther ? [...modelProposals] : modelProposals.map((p) => settleTypedChoice(p, questions));
   const minConfidence = ctx.minConfidence ?? DEFAULT_MIN_CONFIDENCE;
   const outstanding = new Set(ctx.outstanding);
   const answered = new Set(ctx.answered);
@@ -1518,6 +1546,12 @@ export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
     `  form, or another language than the label's — "couples" or "זוגות" is the`,
     `  option labelled Couple; "two families" is the one labelled Group of`,
     `  families. If one listed option fits, answer kind "choice" with its id.`,
+    ...(asked.some((q) => q.id === "trip_type" && q.options?.some((o) => o.id === "couple"))
+      ? [
+          `  Two couples travelling together ("שני זוגות", "two couples") is the option`,
+          `  labelled Couple — answer kind "choice", not "choice_other".`,
+        ]
+      : []),
     `  Use kind "choice_other" ONLY when no listed option fits what they meant`,
     `  and the question allows it. When they say what it is NOT as well ("X, not`,
     `  Y"), the answer is what it IS. The kind they NAME decides, not the people`,
