@@ -463,9 +463,9 @@ export function evidenceAppears(evidence: string, source: string): boolean {
 /**
  * Keys whose values the system ASKS the model to produce, not to quote.
  *
- * `travelers`' own prompt says it outright: "If the names aren't in Latin
- * script, transliterate them YOURSELF and submit that as each person's English
- * spelling." A transliteration is derived by construction — it cannot appear in
+ * `travelers`' own prompt says it outright: `name_en` is the Latin form of the
+ * name, "otherwise transliterated YOURSELF" (and `name` the interview-language
+ * form; see `travelerNamesRule`). A transliteration is derived by construction — it cannot appear in
  * a Hebrew source, and requiring it to is requiring the model to disobey the
  * instruction it was given.
  *
@@ -1327,6 +1327,62 @@ const STOP_HAS_ENGLISH_NAME: readonly string[] = [
 ];
 
 /**
+ * Every traveller's name is in the interview's language, with the Latin form
+ * beside it — one rule, said in both prompts that write travellers.
+ *
+ * Owner's manual test, 2026-10-15: a Hebrew interview with a flight-ticket
+ * document confirmed four travellers, two read off the tickets in English
+ * ({name: "Dror Aloul", name_en: "Dror Aloul"}) and two the organizer typed in
+ * Hebrew with no name_en. The site's roster, the intro's login list and the
+ * companion each showed a mix of scripts, and the two Hebrew-only people had no
+ * Latin form for their login. The owner: "It was best that it normalized the
+ * name to the interview language."
+ *
+ * So `name` is the language and script of the interview, and `name_en` is the
+ * Latin form — the ticket's exact spelling when a document printed one (it is
+ * what the passport says), a transliteration when only Hebrew was written. A
+ * transliteration is derived by construction, which is why `name_en` is in
+ * `DERIVED_KEYS`; the Hebrew `name` of a ticket's Latin name is derived the same
+ * way and cannot be a copy of anything in the prompt, because the prompt names
+ * no one. The placeholders here are not people, on purpose.
+ *
+ * A prompt rule and a code check, not a schema `required`: travellers travel
+ * inside the `dataJson` STRING. `travelersMissingNames` (interview.ts) is the
+ * check, logged at confirmation.
+ */
+export function travelerNamesRule(language: string): string[] {
+  const script = TRAVELER_NAME_SCRIPT[language];
+  const lines = language === "en"
+    ? [
+        `- Every traveller carries "name" and "name_en". In this interview "name" and`,
+        `  "name_en" are both the name in Latin letters; a name given in another`,
+        `  script is transliterated into Latin letters by you.`,
+      ]
+    : [
+        `- Every traveller carries two names. "name" is written in ${script ?? `the language and script of this interview (${languageName(language)})`},`,
+        `  the language the interview is held in, whatever script the message or`,
+        `  document printed it in: a name given in Latin letters is rewritten in that`,
+        `  script (a transliteration of the sound, never a translation).`,
+        `  "name_en" is the same person's name in Latin letters.`,
+      ];
+  return [
+    ...lines,
+    `- When the message or document printed the name in Latin letters (a ticket, a`,
+    `  booking, a name typed in Latin letters), copy those letters EXACTLY as printed into`,
+    `  "name_en" — never respell them, they are what the passport says. When the name`,
+    `  was written only in another script, write its Latin transliteration yourself.`,
+    `  Never leave either field out. Never invent a traveller that was not named.`,
+  ];
+}
+
+const TRAVELER_NAME_SCRIPT: Record<string, string> = { he: "Hebrew letters" };
+
+/** The typed-answer prompt's section for travellers: only spent when they are asked for. */
+function travelersSection(language: string): string[] {
+  return [`ABOUT TRAVELLERS (the "travelers" question):`, ...travelerNamesRule(language), ``];
+}
+
+/**
  * A booked flight or car keeps its PLACES — one rule, said wherever a prompt can
  * write a travel_anchors entry.
  *
@@ -1655,6 +1711,7 @@ export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
     `- If the message gestures at a question without settling it, put it in "unclear".`,
     ``,
     ...(asked.some((q) => q.id === "phases") ? stopsSection() : []),
+    ...(asked.some((q) => q.id === "travelers") ? travelersSection(args.language) : []),
     ...(asked.some((q) => q.id === "travel_anchors") && !asked.some((q) => q.id === "phases") ? bookingsSection() : []),
     args.summaryOnScreen ? `Questions (answered already or not):` : `Questions still outstanding:`,
     ...asked.map(describeQuestion),
@@ -1897,6 +1954,7 @@ export function buildExtractIntakePrompt(args: {
     `  there, so the organizer can be asked for names rather than for a count`,
     `  the document already gave.`,
     ``,
+    ...(asked.some((q) => q.id === "travelers") ? travelersSection(args.language) : []),
     `Questions the interview still needs:`,
     ...asked.map(describeQuestion),
     ``,

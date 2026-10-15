@@ -1188,6 +1188,83 @@ class NonLatinNameTests(unittest.TestCase):
         self.assertEqual("Margolin", family["name"]["en"])
 
 
+class TravelerLoginUsernameTests(unittest.TestCase):
+    """The site login of a traveller whose name is not in Latin letters.
+
+    Owner's manual test, 2026-10-15 (colmar-2026): the intro listed
+    Dror Aloul — droraloul, Hagit Mali Aloul — hagitmalialoul, צחי סער — traveler,
+    ליאב סער — traveler3. `_slugify` returns the literal "traveler" for anything
+    with no a-z0-9, and the collision suffix made the second "traveler3": two
+    logins the family could not tell from each other or from anyone's.
+
+    A login is ASCII, derived from a name, and stable: the same intake gives the
+    same usernames every time it is rendered, because the site's accounts are
+    keyed by them. A name that already had a Latin form keeps its login exactly.
+    """
+
+    def _usernames(self, travelers: list[dict]) -> list[str]:
+        config = transform_intake({**JAPAN_INTAKE, "travelers": _structured(travelers)}, today=date(2026, 8, 20))
+        return [p["username"] for p in config["participants"]]
+
+    AS_CONFIRMED = [
+        {"name": "Dror Aloul", "name_en": "Dror Aloul"},
+        {"name": "Hagit Mali Aloul", "name_en": "Hagit Mali Aloul"},
+        {"name": "צחי סער"},
+        {"name": "ליאב סער"},
+    ]
+    NORMALISED = [
+        {"name": "דרור אלול", "name_en": "Dror Aloul"},
+        {"name": "חגית מלי אלול", "name_en": "Hagit Mali Aloul"},
+        {"name": "צחי סער", "name_en": "Tzachi Saar"},
+        {"name": "ליאב סער", "name_en": "Liav Saar"},
+    ]
+
+    def test_names_with_a_latin_form_keep_the_login_they_always_had(self) -> None:
+        for roster in (self.AS_CONFIRMED, self.NORMALISED):
+            with self.subTest(first=roster[0]["name"]):
+                self.assertEqual(["droraloul", "hagitmalialoul"], self._usernames(roster)[:2])
+
+    def test_a_latin_form_beside_the_interview_language_name_makes_the_login(self) -> None:
+        self.assertEqual(
+            ["droraloul", "hagitmalialoul", "tzachisaar", "liavsaar"],
+            self._usernames(self.NORMALISED),
+        )
+
+    def test_hebrew_only_travellers_get_distinct_recognisable_ascii_logins_not_traveler(self) -> None:
+        usernames = self._usernames(self.AS_CONFIRMED)
+        self.assertEqual(4, len(set(usernames)))
+        for username in usernames:
+            self.assertRegex(username, r"^[a-z0-9]+$")
+            self.assertNotRegex(username, r"^traveler\d*$")
+        # Recognisable: the transliteration of the name, so "ליאב" reads as liav.
+        self.assertTrue(usernames[3].startswith("liav"), usernames[3])
+        self.assertTrue(usernames[2].startswith("tz"), usernames[2])
+
+    def test_the_same_intake_renders_the_same_logins_every_time(self) -> None:
+        for roster in (self.AS_CONFIRMED, self.NORMALISED):
+            self.assertEqual(self._usernames(roster), self._usernames(roster))
+
+    def test_two_hebrew_only_people_with_the_same_name_still_get_two_logins(self) -> None:
+        usernames = self._usernames([{"name": "צחי סער"}, {"name": "צחי סער"}])
+        self.assertEqual(2, len(set(usernames)))
+
+    def test_a_name_in_no_script_we_can_read_falls_back_to_a_numbered_guest(self) -> None:
+        # Last resort, and distinct: guest<position>, never "traveler".
+        self.assertEqual(["guest1", "guest2"], self._usernames([{"name": "李明"}, {"name": "محمد"}]))
+
+    def test_the_intro_login_list_reads_in_the_interview_language(self) -> None:
+        # provisioner.py builds login_usernames from participants[].name, which is
+        # the interview language's name — and the roster match still finds both.
+        config = transform_intake(
+            {**JAPAN_INTAKE, "travelers": _structured(self.NORMALISED)}, today=date(2026, 8, 20),
+        )
+        self.assertEqual(
+            [("דרור אלול", "droraloul"), ("חגית מלי אלול", "hagitmalialoul"),
+             ("צחי סער", "tzachisaar"), ("ליאב סער", "liavsaar")],
+            [(p["name"], p["username"]) for p in config["participants"]],
+        )
+
+
 class PhaseVenuesTests(unittest.TestCase):
     def _phase(self, venues):
         intake = {**JAPAN_INTAKE, "phases": _structured([

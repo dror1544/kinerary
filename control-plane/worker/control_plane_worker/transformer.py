@@ -266,6 +266,45 @@ def _slugify(value: str) -> str:
     return slug or "traveler"
 
 
+#: Hebrew letters as ASCII, for a LOGIN only. It is a spelling a family can
+#: recognise ("ליאב" -> "liav"), not a pronunciation guide: no niqqud, vav is "o",
+#: yod is "i", alef and ayin are "a". It exists so that a traveller whose name
+#: has no Latin form still gets a login that is theirs; the display name and the
+#: roster match never read it.
+_HEBREW_LOGIN_LETTERS: dict[str, str] = {
+    "א": "a", "ע": "a", "ב": "b", "ג": "g", "ד": "d", "ה": "h", "ו": "o", "ז": "z",
+    "ח": "ch", "ט": "t", "י": "i", "כ": "k", "ך": "k", "ל": "l", "מ": "m", "ם": "m",
+    "נ": "n", "ן": "n", "ס": "s", "פ": "p", "ף": "f", "צ": "tz", "ץ": "tz", "ק": "k",
+    "ר": "r", "ש": "sh", "ת": "t",
+}
+
+
+def _username_base(name_en: str, name: str) -> str:
+    """The login a traveller's name makes, or "" when it makes none.
+
+    Latin letters first and exactly as they always were (`droraloul`) — a login
+    already printed in an intro message must not move when a trip is rendered
+    again. Only a name with no Latin letters at all falls through to the Hebrew
+    transliteration, where `_slugify` used to return the literal "traveler".
+    """
+    for candidate in (name_en, name):
+        slug = re.sub(r"[^a-z0-9]+", "", candidate.strip().lower())
+        if slug:
+            return slug
+    for candidate in (name_en, name):
+        # A word-final bet is a "v" in names (ליאב Liav, יעקב Yaakov), a "b" elsewhere.
+        slug = "".join(
+            "".join(
+                "v" if ch == "ב" and i == len(word) - 1 and len(word) > 1 else _HEBREW_LOGIN_LETTERS.get(ch, "")
+                for i, ch in enumerate(word)
+            )
+            for word in candidate.split()
+        )
+        if slug:
+            return slug
+    return ""
+
+
 def _slug_words(value: str) -> str:
     """Lowercase into dash-separated alphanumeric segments.
 
@@ -771,7 +810,10 @@ def _derive_participants_and_families(travelers: list[Any]) -> tuple[list[dict[s
         family_en = str(raw.get("family_en") or family_raw).strip()
         family_key = _slugify(family_en)
 
-        username = _slugify(name_en or name)
+        # Last resort, for a name in a script this module cannot read: guest<N>,
+        # numbered by position so it is distinct and the same on every render.
+        # Never "traveler", which two people could share and nobody could tell.
+        username = _username_base(name_en, name) or f"guest{index + 1}"
         if username in used_usernames:
             username = f"{username}{index}"
         used_usernames.add(username)
