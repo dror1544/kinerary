@@ -73,8 +73,11 @@ the only new Telegram surface this needs.
 
 ## 4. The password question — a real decision
 
-`PROVISIONER_SEED_PASSWORD` is the shared family login. It reaches the site
-through `compute.py` and is deliberately not in the companion handoff today.
+The trip's site password is the shared family login. *As built (2026-10-15):*
+it is generated per trip at bootstrap (`provisioning.adapters.generate_site_password`),
+written only to that site's container `.env`, and read back by the worker after
+deploy into `trips.companion_intro.login_password`; the deployment-wide
+`PROVISIONER_SEED_PASSWORD` that this section was written about is retired.
 
 Putting it in the **organizer's DM** is uncontroversial.
 

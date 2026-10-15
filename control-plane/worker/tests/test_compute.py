@@ -13,8 +13,14 @@ from control_plane_worker.compute import LxcProvisionAdapter, NullComputeAdapter
 
 
 class FakeProxmox:
-    def __init__(self, vmid: str | None = "999", *, exists_before_apply: bool = True) -> None:
+    def __init__(
+        self, vmid: str | None = "999", *, exists_before_apply: bool = True,
+        password: str | None = "ab2c-d3ef-gh4j-km5n",
+    ) -> None:
         self.vmid = vmid
+        # What the container's own .env holds, as ProxmoxLxcAdapter.site_password
+        # would read it back.
+        self.password = password
         self.inspected: list = []
         self.reset_calls: list = []
         # A container left behind by a failed earlier attempt is visible to
@@ -33,10 +39,16 @@ class FakeProxmox:
     def reset_trip_data(self, spec):
         self.reset_calls.append(spec)
 
+    def site_password(self, spec):
+        return self.password
+
 
 class FakeProvisioner:
-    def __init__(self, vmid: str | None = "999", *, exists_before_apply: bool = True) -> None:
-        self.proxmox = FakeProxmox(vmid, exists_before_apply=exists_before_apply)
+    def __init__(
+        self, vmid: str | None = "999", *, exists_before_apply: bool = True,
+        password: str | None = "ab2c-d3ef-gh4j-km5n",
+    ) -> None:
+        self.proxmox = FakeProxmox(vmid, exists_before_apply=exists_before_apply, password=password)
         self.apply_calls: list = []
 
     def apply(self, topology, *, execute: bool) -> None:
@@ -310,3 +322,80 @@ class NpmTokenMintingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SitePasswordTests(unittest.TestCase):
+    """The login password is per trip and lives on the trip's own container; this
+    adapter only reports it. There is no deployment-wide value any more."""
+
+    def test_reports_the_password_the_container_holds_after_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as deploy_root:
+            adapter = _adapter(deploy_root, provisioner=FakeProvisioner(password="k7mq-x3ra-pw9d-hn4t"))
+            adapter.create_container("tokyo-2026")
+            self.assertEqual("k7mq-x3ra-pw9d-hn4t", adapter.site_login_password("tokyo-2026"))
+
+    def test_two_trips_report_their_own_passwords(self) -> None:
+        with tempfile.TemporaryDirectory() as deploy_root:
+            adapter = _adapter(deploy_root)
+            adapter._provisioner_factory = lambda: FakeProvisioner(password="aaaa-bbbb-cccc-dddd")
+            adapter.create_container("tokyo-2026")
+            adapter._provisioner_factory = lambda: FakeProvisioner(password="eeee-ffff-gggg-hhhh")
+            adapter.create_container("kyoto-2026")
+
+            self.assertEqual("aaaa-bbbb-cccc-dddd", adapter.site_login_password("tokyo-2026"))
+            self.assertEqual("eeee-ffff-gggg-hhhh", adapter.site_login_password("kyoto-2026"))
+
+    def test_a_site_with_no_password_in_its_env_reports_none_not_a_guess(self) -> None:
+        with tempfile.TemporaryDirectory() as deploy_root:
+            adapter = _adapter(deploy_root, provisioner=FakeProvisioner(password=None))
+            adapter.create_container("tokyo-2026")
+            self.assertIsNone(adapter.site_login_password("tokyo-2026"))
+
+    def test_a_trip_never_created_here_reports_none(self) -> None:
+        with tempfile.TemporaryDirectory() as deploy_root:
+            self.assertIsNone(_adapter(deploy_root).site_login_password("never-seen"))
+
+    def test_the_null_adapter_has_no_password_to_report(self) -> None:
+        self.assertIsNone(NullComputeAdapter().site_login_password("tokyo-2026"))
+
+    def test_a_deployment_wide_seed_password_can_no_longer_be_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as deploy_root:
+            with self.assertRaises(TypeError):
+                LxcProvisionAdapter(
+                    deploy_root=deploy_root, node="pve", template="t", storage="s", bridge="b",
+                    ip_pool=["192.168.0.210"], hostname_domain="x.example", tunnel_id="t",
+                    npm_url="https://npm.example", npm_api_token="x",
+                    cloudflare_zone_id="z", cloudflare_api_token="c",
+                    seed_password="shared",  # type: ignore[call-arg]
+                )
+
+    def test_creating_a_container_logs_no_password(self) -> None:
+        import logging
+
+        class Capture(logging.Handler):
+            def __init__(self) -> None:
+                super().__init__(logging.DEBUG)
+                self.seen: list[str] = []
+
+            def emit(self, record: logging.LogRecord) -> None:
+                self.seen.append(record.getMessage() + " " + repr(record.__dict__))
+
+        capture = Capture()
+        root = logging.getLogger()
+        previous = root.level
+        root.addHandler(capture)
+        root.setLevel(logging.DEBUG)
+        try:
+            with tempfile.TemporaryDirectory() as deploy_root:
+                adapter = _adapter(deploy_root, provisioner=FakeProvisioner(password="canary-0000-pass-word"))
+                adapter.create_container("tokyo-2026")
+                adapter.site_login_password("tokyo-2026")
+                # and it is not written beside the topology the deploy repository tracks
+                for dirpath, _dirs, files in os.walk(deploy_root):
+                    for name in files:
+                        with open(os.path.join(dirpath, name)) as handle:
+                            self.assertNotIn("canary-0000", handle.read())
+        finally:
+            root.removeHandler(capture)
+            root.setLevel(previous)
+        self.assertEqual([], [line for line in capture.seen if "canary-0000" in line])

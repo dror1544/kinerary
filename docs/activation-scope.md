@@ -64,8 +64,9 @@ executed end to end.
 
 **Already armed, and worth knowing before scoping:**
 `PROVISIONER_COMPUTE_ENABLED=1` (real LXC + NPM + Cloudflare provisioning is
-on); `PROVISIONER_SEED_PASSWORD` is set, so a provisioned site *does* have a
-working shared-password login; chat routing is built and tested
+on); a provisioned site *does* have a working password login (as of 2026-10-15 a
+per-trip generated password, no longer the deployment-wide
+`PROVISIONER_SEED_PASSWORD`, which is retired); chat routing is built and tested
 (`chat-router.ts`, relay dispatch, the wake-word group gate, 10 isolation
 tests); the companion bundle and MCP bridge scripts are complete.
 

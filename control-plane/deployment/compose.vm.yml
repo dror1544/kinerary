@@ -148,6 +148,8 @@ services:
       PROVISIONER_LXC_IP_POOL: ${PROVISIONER_LXC_IP_POOL:-}
       PROVISIONER_LXC_HOSTNAME_DOMAIN: ${PROVISIONER_LXC_HOSTNAME_DOMAIN:-}
       PROVISIONER_LXC_TUNNEL_ID: ${PROVISIONER_LXC_TUNNEL_ID:-}
+      # RETIRED (2026-10-15): ignored - every new trip site generates its own
+      # password. Passed through only so the worker warns if it is still set.
       PROVISIONER_SEED_PASSWORD: ${PROVISIONER_SEED_PASSWORD:-}
       CONTROL_PLANE_OPERATOR_CHAT_ID: ${CONTROL_PLANE_OPERATOR_CHAT_ID:-}
       NPM_URL: ${NPM_URL:-}

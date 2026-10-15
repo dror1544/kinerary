@@ -440,6 +440,14 @@ class ShellDeployAdapter:
             return None
         return os.path.join(trip_nfs, "documents")
 
+    def site_login_password(self, slug: str) -> str | None:
+        """The login password of a site this adapter's compute side built. A
+        vmid_map trip is a hand-built box: nothing generated its password, so
+        there is none to report (and none is guessed)."""
+        if self._vmid_map.get(slug):
+            return None
+        return self._compute.site_login_password(slug)
+
     def deploy(
         self,
         slug: str,
@@ -1060,7 +1068,6 @@ class ProvisionerWorker:
         repo_root: str | None = None,
         materialize: MaterializeFn | None = None,
         operator_chat_id: str | None = None,
-        seed_password: str | None = None,
         document_store_dir: str | None = None,
         verification_http_get: "verification.HttpGetFn | None" = None,
         verification_retry_attempts: int | None = None,
@@ -1078,12 +1085,6 @@ class ProvisionerWorker:
         # operator row at all — the organizer notification is unaffected either
         # way, and nothing in the job path reads these rows back.
         self._operator_chat_id = operator_chat_id or None
-        # The shared site login, carried into the organizer's introduction so
-        # they can be TOLD the password rather than walked through finding it.
-        # It is the SAME value the compute adapter bakes into the site's .env —
-        # passed here rather than re-read, so the two can never disagree.
-        # Empty (the default, and every existing test) simply omits the line.
-        self._seed_password = seed_password or None
         self._worker_id = worker_id or f"{self.DEFAULT_WORKER_ID_PREFIX}_{secrets.token_hex(8)}"
         self._companion = companion or NullCompanionProfileAdapter()
         self._mcp_bridge = mcp_bridge or NullMcpBridgeAdapter()
@@ -1266,6 +1267,13 @@ class ProvisionerWorker:
                 if source_dir:
                     shutil.rmtree(source_dir, ignore_errors=True)
 
+            # The login password THIS trip's site was built with, read back from
+            # the site itself so the organizer is told the value it accepts
+            # (first provision: the one just generated; re-provision: the one
+            # people already use). Per trip - there is no deployment-wide one.
+            # Held in a local and passed on; never logged.
+            site_password = self._site_login_password(slug)
+
             # Verification aggregator (Sprint 6, docs/sprint6-tracks.md:472):
             # a real gate before `ready_private`, not the unconditional UPDATE
             # that used to be here. Hard-gates on the three signals checkable
@@ -1315,7 +1323,7 @@ class ProvisionerWorker:
             self._complete(
                 conn, job_id, plan_id, trip_id, private_url,
                 slug=slug, config=config, intake_version_id=intake_version_id,
-                deployment_ref=deployment_ref,
+                deployment_ref=deployment_ref, site_password=site_password,
             )
 
             # Hand the deployed plan to the post-deploy review pass
@@ -1341,6 +1349,12 @@ class ProvisionerWorker:
                 exc_info=True,
             )
             self._fail(conn, job_id, plan_id, error_code)
+
+    def _site_login_password(self, slug: str) -> str | None:
+        """Ask the deploy adapter for this trip's site password. An adapter that
+        has no such notion (a fake, a hand-built trip) simply reports none."""
+        reader = getattr(self._deploy, "site_login_password", None)
+        return reader(slug) if callable(reader) else None
 
     def _materialize_release_if_verified(
         self, plan_desired: Mapping[str, Any], job_id: str,
@@ -1643,6 +1657,7 @@ class ProvisionerWorker:
         config: dict[str, Any],
         intake_version_id: str,
         deployment_ref: str | None = None,
+        site_password: str | None = None,
     ) -> None:
         result_json = json.dumps({"private_url": private_url})
         with conn.transaction():
@@ -1745,10 +1760,12 @@ class ProvisionerWorker:
                 # from these — never by the agent, because every line is a fact
                 # that is worse than useless if invented.
                 #
-                # `login_password` is the shared seed login. It is already on
-                # the site's .env; carrying it here is what lets the organizer
-                # be TOLD it rather than having to be walked through finding
-                # it. Absent, the wording falls back to "log in from the site".
+                # `login_password` is this trip's own login (read back from the
+                # site's .env after deploy; one per trip since 2026-10-15). It is
+                # carried here so the organizer can be TOLD it rather than walked
+                # through finding it. Absent - a site built before per-trip
+                # passwords, whose value cannot be recovered - the wording falls
+                # back to "log in from the site".
                 agent_cfg = config.get("agent") or {}
                 meta_cfg = config.get("meta") or {}
                 # NOT enqueued here. See the companion block below: the
@@ -1764,7 +1781,7 @@ class ProvisionerWorker:
                     "trip_slug": slug,
                     "language": meta_cfg.get("defaultLang")
                     if meta_cfg.get("defaultLang") in ("he", "en") else "en",
-                    "login_password": self._seed_password or None,
+                    "login_password": site_password or None,
                     # WHO to log in as. The seed password is shared, so the
                     # username is the only thing telling two travellers apart —
                     # and it is derived from their name (`tali`, `ronmargolin`),

@@ -219,6 +219,20 @@ def _configure_logging() -> None:
 LOG_FORMAT = "%(levelname)s %(name)s %(message)s"
 
 
+def _warn_if_retired_seed_password_is_set() -> None:
+    """PROVISIONER_SEED_PASSWORD used to become the login of EVERY new trip site.
+    It is gone: each site generates its own. A deployment that still has it set
+    would otherwise believe it was in force - nothing would error, the new trips
+    would just have different passwords - so say, at startup, that it is
+    ignored. Names the variable, never its value."""
+    if os.environ.get("PROVISIONER_SEED_PASSWORD"):
+        logging.getLogger("control_plane_worker").warning(
+            "PROVISIONER_SEED_PASSWORD is set but ignored: every new trip site now generates its "
+            "own login password and the organizer is told it. Remove the variable from the "
+            "deployment's environment."
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -240,6 +254,7 @@ def main(argv: list[str] | None = None) -> int:
             from .provisioner import ProvisionerWorker, ShellDeployAdapter
             from .runtime import read_secret_file
             db_url = read_secret_file(args.database_url_file)
+            _warn_if_retired_seed_password_is_set()
             # Off by default: an unconfigured deployment keeps the pre-Phase-G
             # behavior exactly (a slug missing from --vmid-map fails loudly
             # instead of a real LXC/NPM/Cloudflare create happening).
@@ -288,14 +303,9 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                     gateway=os.environ.get("PROXMOX_GATEWAY", "192.168.0.1"),
                     nameserver=os.environ.get("PROXMOX_NAMESERVER", "192.168.0.41"),
-                    # Shared onboarding password for a new site's participants.
-                    # Unset keeps server.js's safe default (independent random
-                    # per-user passwords) — but note that with Telegram SSO
-                    # ruled out and Google unconfigured, unset currently means
-                    # the provisioned site has no login path at all. A real
-                    # member/organizer signup flow is the actual fix; this is a
-                    # stopgap so a provisioned trip is reachable.
-                    seed_password=os.environ.get("PROVISIONER_SEED_PASSWORD", ""),
+                    # No site password is configured here: each new site
+                    # generates its own at bootstrap (provisioning.adapters),
+                    # and the worker reads it back to tell the organizer.
                     control_plane_exchange_key=os.environ.get("CONTROL_PLANE_EXCHANGE_KEY", ""),
                     nfs_host_base=os.environ.get("PROVISIONER_NFS_HOST_BASE", "/mnt/pve/truenas-nfs"),
                     nfs_mount_base=os.environ.get("PROVISIONER_NFS_MOUNT_BASE", "/nfs"),
@@ -519,10 +529,6 @@ def main(argv: list[str] | None = None) -> int:
                 # halves of one run land in one place. Unset simply enqueues no
                 # operator rows.
                 operator_chat_id=os.environ.get("CONTROL_PLANE_OPERATOR_CHAT_ID", ""),
-                # The same value the compute adapter bakes into the new site's
-                # .env, read from one place so the password the organizer is
-                # told and the password the site accepts cannot drift apart.
-                seed_password=os.environ.get("PROVISIONER_SEED_PASSWORD", ""),
                 # The relay's document store. Unset provisions without source
                 # documents, which is what every trip before them had.
                 document_store_dir=store_dir,

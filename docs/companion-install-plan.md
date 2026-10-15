@@ -136,9 +136,11 @@ demonstrate.
 - **B3** — `activation-scope.md` is explicit that the seed password already
   gives first access; B3 buys the clean per-member path, not the ability to get
   in. Note this is an *operational* fact, not a code one:
-  `PROVISIONER_SEED_PASSWORD` empty means, per `compose.local.yml:173-177`, the
-  site has no usable login at all. It is set on the running stack. It should be
-  asserted somewhere, not remembered.
+  a site built before 2026-10-15 got `PROVISIONER_SEED_PASSWORD` (one value for
+  every trip; empty meant no usable login at all). That variable is retired: each
+  site now generates its own password at bootstrap, and `stage_served` in
+  `scripts/e2e-full-cycle.py` asserts that the one the organizer is told is the
+  one the container's `.env` holds.
 - **B5, B6** — both are trip N+1 problems (port collision, manual allowlisting).
   A first family is trip N.
 - **Activation states** — see the top of this file.
