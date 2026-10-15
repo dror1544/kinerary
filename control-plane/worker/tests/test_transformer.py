@@ -2854,3 +2854,70 @@ class TripIdentityFromEssenceTests(unittest.TestCase):
         self.assertIsNone(transformer.essence_phase_id([
             {"id": "open-days", "unplanned": True, "title": {"en": "Days not planned yet"}},
         ]))
+
+
+class StopWithoutEnglishNameTests(unittest.TestCase):
+    """A stop the interview confirmed with NO `name_en` still names the trip.
+
+    Star e2e, 2026-10-15 (2 of 3 Hebrew runs): destination "אלזס, צרפת" and one
+    stop {"name": "קולמר", ...} with no English name. The interview now asks for
+    `name_en` on every stop; this is the net under it, for the run where the
+    model leaves it out anyway.
+
+    The fallback is NOT transliteration. A slug is [a-z0-9-] (the trips.slug
+    CHECK), so a Hebrew place cannot be spelled into one without inventing an
+    English spelling, which is the failure the interview rule exists to prevent.
+    What it does instead: a country the destination names (France) gives the
+    slug; otherwise the slug is generic and the year distinguishes it; the TITLE
+    and BRAND keep the stop's own words, so the place is never dropped; and the
+    phase carries the organizer's name on both language sides, not a blank.
+
+    These stops carry neither `planned` nor `venues`, which is the shape of the
+    live intake; the two producers write the same name fields read here.
+    """
+
+    TODAY = date(2026, 10, 15)
+
+    def live_intake(self, destination: str = "אלזס, צרפת", *, name_en: str | None = None) -> dict:
+        # The exact answers of the failing runs: a couple, one Hebrew stop.
+        return {
+            **JAPAN_INTAKE,
+            "trip_type": _choice("couple"),
+            "destination": _text(destination),
+            "departure_date": _text("2027-12-02"),
+            "return_date": _text("2027-12-09"),
+            "phases": _structured([_stop("קולמר", name_en, "2027-12-02", "2027-12-09")]),
+        }
+
+    def test_a_country_the_destination_names_gives_the_slug(self) -> None:
+        self.assertEqual(derive_trip_slug(self.live_intake(), today=self.TODAY), "france-2027")
+
+    def test_the_title_and_brand_keep_the_place_instead_of_a_generic_trip(self) -> None:
+        meta = transform_intake(self.live_intake(), today=self.TODAY)["meta"]
+        self.assertEqual(meta["brand"], "קולמר 2027")
+        self.assertEqual(meta["title"], "קולמר 2027 — Couple")
+        self.assertNotIn("Couple Trip", meta["title"])
+
+    def test_the_phase_keeps_the_organizers_name_on_both_sides(self) -> None:
+        phase = transform_intake(self.live_intake(), today=self.TODAY)["phases"][0]
+        self.assertEqual(phase["title"], {"he": "קולמר", "en": "קולמר"})
+        self.assertEqual(phase["dates"], {"start": "2027-12-02", "end": "2027-12-09"})
+
+    def test_a_destination_no_table_knows_gets_a_generic_valid_slug_and_still_a_titled_trip(self) -> None:
+        intake = self.live_intake("אלזס")
+        slug = derive_trip_slug(intake, today=self.TODAY)
+        self.assertEqual(slug, "trip-2027")
+        self.assertRegex(slug, r"^[a-z0-9]+(-[a-z0-9]+)*$")
+        self.assertEqual(transform_intake(intake, today=self.TODAY)["meta"]["brand"], "אלזס 2027")
+
+    def test_with_the_english_name_the_slug_and_phase_use_it(self) -> None:
+        # The case the interview fix produces: same answers, name_en present.
+        intake = self.live_intake("אלזס", name_en="Colmar")
+        self.assertEqual(derive_trip_slug(intake, today=self.TODAY), "colmar-2027")
+        phase = transform_intake(intake, today=self.TODAY)["phases"][0]
+        self.assertEqual(phase["title"]["en"], "Colmar")
+        self.assertEqual(phase["id"], "colmar")
+
+    def test_the_hero_stop_is_still_found_without_an_english_name(self) -> None:
+        config = transform_intake(self.live_intake(), today=self.TODAY)
+        self.assertEqual(transformer.essence_phase_id(config["phases"]), config["phases"][0]["id"])
