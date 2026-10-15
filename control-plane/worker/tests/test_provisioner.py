@@ -1044,6 +1044,91 @@ class CompanionProfileTests(unittest.TestCase):
             ["Eitan", "Noa"],
         )
 
+    def test_the_organizer_is_told_the_password_this_trips_site_was_built_with(self) -> None:
+        """Per-trip login (2026-10-15, was one deployment-wide value).
+
+        The password in the introduction is read back from the deploy adapter
+        AFTER the site is up — the value the container's own .env holds — not
+        taken from the worker's environment. Delivery is the existing private
+        channel: `companion_ready`, addressed to the organizer's verified chat
+        and nowhere else; `provisioning_complete` (the site-ready line) carries
+        the URL only.
+        """
+        class PasswordedDeploy(FakeDeployAdapter):
+            def site_login_password(self, slug: str) -> str | None:
+                return f"pw-for-{slug}"
+
+        deploy = PasswordedDeploy()
+        worker = ProvisionerWorker(
+            db_url=DB_URL, deploy=deploy, worker_id="test-site-password",
+            companion=FakeCompanionProfileAdapter(),
+        )
+        worker.run_once()
+
+        slug = deploy.deployed[0]["slug"]
+        intro = self.conn.execute(
+            "SELECT companion_intro FROM control_plane.trips WHERE id = %s", (self.fix["trip_id"],),
+        ).fetchone()["companion_intro"]
+        self.assertEqual(f"pw-for-{slug}", intro["login_password"])
+
+        rows = self.conn.execute(
+            "SELECT notification_type, recipient, payload FROM control_plane.notification_outbox "
+            "WHERE trip_id = %s", (self.fix["trip_id"],),
+        ).fetchall()
+        by_type = {row["notification_type"]: row for row in rows}
+        # The password rides only the organizer's private introduction.
+        self.assertEqual(f"pw-for-{slug}", by_type["companion_ready"]["payload"]["login_password"])
+        self.assertEqual(self.chat_id, by_type["companion_ready"]["recipient"])
+        self.assertNotIn("login_password", by_type["provisioning_complete"]["payload"])
+        for row in rows:
+            if row["notification_type"].startswith("operator_"):
+                self.assertNotIn(f"pw-for-{slug}", json.dumps(row["payload"]))
+
+    def test_a_deploy_that_reports_no_password_leaves_the_line_out_not_invented(self) -> None:
+        deploy = FakeDeployAdapter()  # no site_login_password at all
+        ProvisionerWorker(
+            db_url=DB_URL, deploy=deploy, worker_id="test-site-password-none",
+            companion=FakeCompanionProfileAdapter(),
+        ).run_once()
+        intro = self.conn.execute(
+            "SELECT companion_intro FROM control_plane.trips WHERE id = %s", (self.fix["trip_id"],),
+        ).fetchone()["companion_intro"]
+        self.assertIsNone(intro["login_password"])
+
+    def test_the_worker_no_longer_accepts_a_deployment_wide_seed_password(self) -> None:
+        with self.assertRaises(TypeError):
+            ProvisionerWorker(
+                db_url=DB_URL, deploy=FakeDeployAdapter(), seed_password="shared",  # type: ignore[call-arg]
+            )
+
+    def test_provisioning_logs_no_site_password(self) -> None:
+        import logging
+
+        seen: list[str] = []
+
+        class Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                seen.append(record.getMessage() + " " + repr(record.__dict__))
+
+        class PasswordedDeploy(FakeDeployAdapter):
+            def site_login_password(self, slug: str) -> str | None:
+                return "canary-site-pass-1234"
+
+        root = logging.getLogger()
+        handler, previous = Capture(logging.DEBUG), root.level
+        root.addHandler(handler)
+        root.setLevel(logging.DEBUG)
+        try:
+            ProvisionerWorker(
+                db_url=DB_URL, deploy=PasswordedDeploy(), worker_id="test-site-password-log",
+                companion=FakeCompanionProfileAdapter(),
+            ).run_once()
+        finally:
+            root.removeHandler(handler)
+            root.setLevel(previous)
+        self.assertTrue(seen, "the capture saw nothing - the test is vacuous")
+        self.assertEqual([], [line for line in seen if "canary-site-pass" in line])
+
     def test_the_organizer_is_recorded_as_a_person_not_only_as_a_route(self) -> None:
         """The chat binding says WHERE a message routes. This says WHO sent it.
 

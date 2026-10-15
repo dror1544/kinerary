@@ -191,11 +191,11 @@ services:
       RPI_SSH_KEY: /root/.ssh/id_ed25519_rpi4_hermes
       PROVISIONER_LXC_IP_POOL: ${PROVISIONER_LXC_IP_POOL:-}
       PROVISIONER_LXC_HOSTNAME_DOMAIN: ${PROVISIONER_LXC_HOSTNAME_DOMAIN:-}
-      # Shared onboarding password baked into a new site's .env. Empty (the
-      # default) keeps server.js's independent random per-user passwords —
-      # which today means the site has no usable login at all, since Telegram
-      # SSO is ruled out and Google is unconfigured. Stopgap until a real
-      # member/organizer signup flow exists.
+      # RETIRED (2026-10-15). This used to become the login of EVERY new trip
+      # site. Each site now generates its own password at bootstrap and the
+      # organizer is told it; this value is ignored. It is still passed through
+      # only so the worker can say so at startup if a deployment sets it
+      # (otherwise the change would be silent). Remove it from provisioning.env.
       PROVISIONER_SEED_PASSWORD: ${PROVISIONER_SEED_PASSWORD:-}
       CONTROL_PLANE_EXCHANGE_KEY: ${CONTROL_PLANE_EXCHANGE_KEY:-}
       # Operator's Telegram chat id for the provisioning-outcome DM. The API

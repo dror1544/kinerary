@@ -1185,8 +1185,17 @@ def stage_served(ctx: dict) -> None:
         capture_output=True, text=True,
     ).stdout
     password = next((l.split("=", 1)[1].strip() for l in env.splitlines() if l.startswith("SEED_PASSWORD=")), "")
-    check(bool(password), "the site has a shared password to log in with",
+    check(bool(password), "the site has a password to log in with",
           "no SEED_PASSWORD in the container's .env — nobody can log in to this trip at all")
+    # One password PER TRIP since 2026-10-15, generated at bootstrap. What the
+    # organizer is told (companion_intro, delivered in their private chat) has to
+    # be the one this site accepts - the worker reads it back from the container
+    # for exactly that reason - or the introduction hands out a login that fails.
+    told = psql(
+        f"SELECT companion_intro->>'login_password' FROM control_plane.trips WHERE id='{ctx['trip_id']}'") or ""
+    check(told == password, "the password the organizer is told is the one the site accepts",
+          "companion_intro.login_password differs from the container's SEED_PASSWORD "
+          "(or is missing) - the organizer's introduction carries a login that will not work")
 
     username = next((p.get("username") for p in (ctx["config"].get("participants") or []) if p.get("username")), "")
     check(bool(username), f"a traveller to log in as ({username})", "the config has no participant with a username")
@@ -1409,7 +1418,7 @@ def stage_mcp(ctx: dict) -> None:
 def site_login(ctx: dict) -> "tuple[str, str]":
     """A traveller's own session on the trip site: (base url, bearer token).
 
-    The same door stage_served uses — the shared password out of the
+    The same door stage_served uses — the trip's own password out of the
     container's own .env, and a participant from the trip's config.
     """
     base = f"http://{ctx['ip']}:8080"

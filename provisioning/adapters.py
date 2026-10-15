@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import re
+import secrets
 import shlex
 import subprocess
 import time
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 import yaml
 
@@ -138,6 +139,32 @@ class JsonTransport(Protocol):
                 params: dict[str, str] | None = None) -> dict[str, Any] | list[Any]: ...
 
 
+# Lower-case letters and digits with the look-alikes taken out (0/o, 1/l/i): a
+# trip's password is read out of a chat message and typed on a phone, so every
+# symbol has to be unambiguous at a glance. 31 symbols.
+_SITE_PASSWORD_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
+_SITE_PASSWORD_GROUPS = 4
+_SITE_PASSWORD_GROUP_LEN = 4
+
+
+def generate_site_password() -> str:
+    """A fresh login password for ONE trip site: 16 characters in four groups
+    of four (`k7mq-x3ra-pw9d-hn4t`), ~79 bits from the OS CSPRNG.
+
+    Grouped because it is typed by a person from a message; lower-case and
+    look-alike-free because there is no shift key to get wrong and nothing to
+    confuse; dashes only, so it needs no quoting anywhere it travels (the
+    bootstrap still quotes it - see `_bootstrap_app_environment`).
+
+    One per trip, never shared: a single deployment-wide value used to become
+    the first password of every site, so anyone who had ever been a member of
+    one trip could log in to the next as any participant."""
+    return "-".join(
+        "".join(secrets.choice(_SITE_PASSWORD_ALPHABET) for _ in range(_SITE_PASSWORD_GROUP_LEN))
+        for _ in range(_SITE_PASSWORD_GROUPS)
+    )
+
+
 def _result(response: dict[str, Any] | list[Any]) -> Any:
     return response.get("result", response.get("data", [])) if isinstance(response, dict) else response
 
@@ -156,14 +183,20 @@ class ProxmoxLxcAdapter:
     plain `mkdir`, not a separate TrueNAS-side provisioning step.
     """
 
-    def __init__(self, ssh: SshTransport, seed_password: str = "", reset_data: bool = False, control_plane_exchange_key: str = "") -> None:
+    def __init__(
+        self, ssh: SshTransport, reset_data: bool = False, control_plane_exchange_key: str = "",
+        password_factory: Callable[[], str] = generate_site_password,
+    ) -> None:
         self.ssh = ssh
-        # Optional shared onboarding password for the new site's participants.
-        # Deliberately NOT part of LxcSpec/Topology: those are serialized to
-        # kinerary-deploy/trips/<slug>/topology.yaml, which is a tracked file in
-        # a git repository — a secret must not travel that way. Empty keeps
-        # server.js's safe default (independent random per-user passwords).
-        self._seed_password = seed_password
+        # Each new site is born with its OWN login password (`SEED_PASSWORD` in
+        # its .env, which server.js seeds every participant with on first boot),
+        # made by this factory at bootstrap. It is a constructor argument only so
+        # a test can supply a value with awkward characters; nothing reads it
+        # from the environment - a deployment-wide value is exactly what this
+        # replaced. Deliberately NOT part of LxcSpec/Topology: those are
+        # serialized to kinerary-deploy/trips/<slug>/topology.yaml, a tracked
+        # file in a git repository - a secret must not travel that way.
+        self._password_factory = password_factory
         if "\n" in control_plane_exchange_key or "\r" in control_plane_exchange_key:
             raise ValueError("control-plane exchange key must be one line")
         self._control_plane_exchange_key = control_plane_exchange_key
@@ -353,12 +386,17 @@ class ProxmoxLxcAdapter:
         trip_slug = spec.trip_slug
         app_dir = "/opt/kinerary"
         avatars_dir = f"{spec.nfs_mount_path}/media/avatars"
+        # A candidate only: it lands in .env solely when .env does not exist yet
+        # (the `[ ! -f ... ]` guard below). A re-provision of a live site finds
+        # its .env and leaves it alone, so the password people already use is
+        # never rotated by a rebuild.
+        #
         # Appended with printf rather than written inside the heredoc above:
         # that heredoc is unquoted (it has to expand ${JWT_SECRET}), so a
         # password containing $ or ` would be mangled or executed there.
+        seed_password = self._password_factory()
         seed_password_line = (
-            f"  printf 'SEED_PASSWORD=%s\\n' {shlex.quote(self._seed_password)} >> {app_dir}/.env\n"
-            if self._seed_password else ""
+            f"  printf 'SEED_PASSWORD=%s\\n' {shlex.quote(seed_password)} >> {app_dir}/.env\n"
         )
         exchange_key_line = (
             f"  printf 'CONTROL_PLANE_EXCHANGE_KEY=%s\\n' {shlex.quote(self._control_plane_exchange_key)} >> {app_dir}/.env\n"
@@ -557,8 +595,37 @@ BOOTSTRAP_INNER
         # run()'s redaction is opt-in per call, not enforced by anything —
         # any future self.ssh.run() call whose script embeds a secret must
         # list it in secrets= too, the same way this one does.
-        secrets = tuple(s for s in (self._seed_password, self._control_plane_exchange_key) if s)
+        secrets = tuple(s for s in (seed_password, self._control_plane_exchange_key) if s)
         self.ssh.run(script, secrets=secrets)
+
+    def site_password(self, spec: LxcSpec) -> str | None:
+        """The login password the site in this container actually accepts, read
+        from its own .env - so what the organizer is told cannot drift from
+        what the site was seeded with, on a first provision or a re-provision.
+
+        None when there is no such container, or its .env carries no
+        SEED_PASSWORD (a site built before per-trip passwords: its participants
+        were seeded with whatever was current then, which cannot be recovered
+        from here and must not be guessed). An ssh failure raises: "no password
+        to report" and "could not look" are different answers.
+
+        The command carries no secret; the secret comes back on stdout and is
+        returned, never logged."""
+        record = self.inspect(spec)
+        if record is None:
+            return None
+        read = "grep '^SEED_PASSWORD=' /opt/kinerary/.env || true"
+        try:
+            output = self.ssh.run(f"pct exec {shlex.quote(record['vmid'])} -- sh -c {shlex.quote(read)}")
+        except RuntimeError:
+            # The transport's error text quotes the command's output, which here
+            # is the password itself; the worker logs job failures with their
+            # exception text, so the detail must not travel with it.
+            raise RuntimeError(f"could not read the site password of container {record['vmid']}") from None
+        for line in output.splitlines():
+            if line.startswith("SEED_PASSWORD="):
+                return line.split("=", 1)[1].strip() or None
+        return None
 
     def _reset_trip_data(self, nfs_host_dir: str) -> None:
         """Wipe the trip's persisted app state (SQLite DB under server-data/)

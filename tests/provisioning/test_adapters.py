@@ -13,6 +13,7 @@ from provisioning.adapters import (
     ProxmoxLxcAdapter,
     SubprocessSshTransport,
     _truncate_middle,
+    generate_site_password,
 )
 from provisioning.models import CloudflareSpec, LxcSpec, ProxySpec
 
@@ -223,9 +224,9 @@ class AdapterTests(unittest.TestCase):
         # container that has none. Every hand-built trip container (CT201) has
         # these; CT101, the first adapter-built one, did not. Found 2026-08-28.
         self.assertIn("build-essential", bootstrap)
-        # No seed password configured -> the site keeps its safe default of
-        # per-user random passwords.
-        self.assertNotIn("SEED_PASSWORD", bootstrap)
+        # Every site is born with its OWN generated login (see
+        # test_every_new_site_gets_its_own_generated_password).
+        self.assertIn("SEED_PASSWORD=%s", bootstrap)
         # A HERMES_API_KEY is always written so the site can accept agent/MCP
         # calls at all — without it the Sprint 5 companion wiring would have to
         # redeploy every container just to add one. Generated locally on the
@@ -246,23 +247,158 @@ class AdapterTests(unittest.TestCase):
         self.assertIn("trip: tokyo-2026", marker_write)
         self.assertIn(f"container: {LXC_SPEC.name}", marker_write)
 
-    def test_seed_password_is_written_into_the_site_env_when_configured(self) -> None:
-        # Without it a provisioned site has NO way in at all: Telegram SSO is
-        # ruled out by the shared-bot routing, Google is unconfigured, and
-        # server.js seeds unrecoverable random passwords when SEED_PASSWORD is
-        # unset — and only ever seeds while the users table is empty, so it
-        # cannot be fixed after the fact. Confirmed live on CT101 2026-08-28.
+    # ── per-trip site password ────────────────────────────────────────────
+    # Until 2026-10-15 one deployment-wide PROVISIONER_SEED_PASSWORD became the
+    # login of EVERY new trip site: anyone who had ever been a member of one
+    # trip could log in to the next, as any participant. Each site now gets its
+    # own, generated at bootstrap.
+
+    @staticmethod
+    def _seed_value(bootstrap: str) -> str:
+        # printf 'SEED_PASSWORD=%s\n' <quoted value> >> /opt/kinerary/.env
+        match = re.search(r"printf 'SEED_PASSWORD=%s\\n' (\S+) >> /opt/kinerary/\.env", bootstrap)
+        assert match, "bootstrap script does not write SEED_PASSWORD"
+        return match.group(1).strip("'")
+
+    def test_every_new_site_gets_its_own_generated_password(self) -> None:
+        first_ssh, second_ssh = FakeProxmoxSsh(nextid="203"), FakeProxmoxSsh(nextid="204")
+        ProxmoxLxcAdapter(first_ssh).create(LXC_SPEC)
+        ProxmoxLxcAdapter(second_ssh).create(LXC_SPEC)
+
+        first = self._seed_value(first_ssh.commands[3])
+        second = self._seed_value(second_ssh.commands[3])
+
+        self.assertNotEqual(first, second)
+        for value in (first, second):
+            self.assertRegex(value, r"^[a-z2-9]{4}(-[a-z2-9]{4}){3}$")
+
+    def test_generated_password_is_human_typeable_and_strong(self) -> None:
+        # Typed on a phone from a chat message: lower-case, digits, grouped by
+        # four, and none of the characters people misread (0/o, 1/l/i). 16
+        # characters over a 31-symbol alphabet is ~79 bits, from `secrets`.
+        values = {generate_site_password() for _ in range(200)}
+        self.assertEqual(200, len(values))
+        alphabet = set("".join(values).replace("-", ""))
+        self.assertTrue(alphabet.isdisjoint(set("01oli")), alphabet)
+        for value in values:
+            self.assertRegex(value, r"^[a-z2-9]{4}(-[a-z2-9]{4}){3}$")
+
+    def test_a_shared_deployment_wide_seed_password_can_no_longer_be_passed_in(self) -> None:
+        # The env var is gone from the worker; the adapter must not keep a
+        # back door that a caller could still wire it through.
+        with self.assertRaises(TypeError):
+            ProxmoxLxcAdapter(FakeProxmoxSsh(), seed_password="shared")  # type: ignore[call-arg]
+
+    def test_password_is_shell_quoted_and_appended_not_interpolated_into_the_heredoc(self) -> None:
+        # The heredoc that writes .env is unquoted (it expands ${JWT_SECRET}),
+        # so a value containing $ or ` would be mangled there. The injectable
+        # factory lets this test use exactly such a value.
         ssh = FakeProxmoxSsh(nextid="203")
-        adapter = ProxmoxLxcAdapter(ssh, seed_password="s3cret pw$x")
-
-        adapter.create(LXC_SPEC)
-
+        ProxmoxLxcAdapter(ssh, password_factory=lambda: "s3cret pw$x").create(LXC_SPEC)
         bootstrap = ssh.commands[3]
-        # Shell-quoted, and appended rather than interpolated into the heredoc:
-        # that heredoc is unquoted so ${...} expands, which would corrupt any
-        # password containing a dollar sign.
         self.assertIn("'s3cret pw$x'", bootstrap)
         self.assertIn("SEED_PASSWORD=%s", bootstrap)
+        self.assertNotIn("SEED_PASSWORD=s3cret", bootstrap)
+
+    def _run_env_block(self, script: str, tmp: str) -> None:
+        """Run the part of the bootstrap script that writes .env, for real, in a
+        scratch directory — the only way to test the keep-if-present guard
+        rather than the text that implements it."""
+        match = re.search(r"^if \[ ! -f /opt/kinerary/\.env \]; then\n.*?^fi\n", script, re.S | re.M)
+        assert match, "no .env guard block in the bootstrap script"
+        block = match.group(0).replace("/opt/kinerary", tmp)
+        subprocess.run(["bash", "-euo", "pipefail", "-c", block], check=True, capture_output=True)
+
+    def test_reprovisioning_an_existing_site_keeps_its_password(self) -> None:
+        # People already log in with it. A second bootstrap (needs_bootstrap's
+        # converge path, or any redeploy) generates a NEW candidate password but
+        # must leave the .env it finds exactly as it was.
+        first_ssh, second_ssh = FakeProxmoxSsh(nextid="203"), FakeProxmoxSsh(nextid="203")
+        ProxmoxLxcAdapter(first_ssh).create(LXC_SPEC)
+        ProxmoxLxcAdapter(second_ssh).create(LXC_SPEC)
+        first, second = first_ssh.commands[3], second_ssh.commands[3]
+        self.assertNotEqual(self._seed_value(first), self._seed_value(second))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._run_env_block(first, tmp)
+            with open(os.path.join(tmp, ".env")) as handle:
+                env_after_first = handle.read()
+            self.assertIn(f"SEED_PASSWORD={self._seed_value(first)}\n", env_after_first)
+
+            self._run_env_block(second, tmp)  # re-provision
+            with open(os.path.join(tmp, ".env")) as handle:
+                env_after_second = handle.read()
+
+        self.assertEqual(env_after_first, env_after_second)
+        self.assertNotIn(self._seed_value(second), env_after_second)
+
+    def test_env_with_the_password_is_private(self) -> None:
+        ssh = FakeProxmoxSsh(nextid="203")
+        ProxmoxLxcAdapter(ssh).create(LXC_SPEC)
+        with tempfile.TemporaryDirectory() as tmp:
+            self._run_env_block(ssh.commands[3], tmp)
+            self.assertEqual(0o600, os.stat(os.path.join(tmp, ".env")).st_mode & 0o777)
+
+    def test_the_generated_password_is_listed_for_redaction(self) -> None:
+        # run()'s redaction is opt-in per call: the password this script embeds
+        # has to be named, or a failing bootstrap that echoes it reaches logs.
+        seen: list[tuple[str, ...]] = []
+
+        class Recording(FakeProxmoxSsh):
+            def run(self, command, *, secrets=()):
+                if "BOOTSTRAP_INNER" in command:
+                    seen.append(secrets)
+                return super().run(command, secrets=secrets)
+
+        ssh = Recording(nextid="203")
+        ProxmoxLxcAdapter(ssh).create(LXC_SPEC)
+        self.assertEqual(1, len(seen))
+        self.assertIn(self._seed_value(ssh.commands[3]), seen[0])
+
+    def test_site_password_reads_back_what_the_container_holds(self) -> None:
+        # The organizer must be told the password the site accepts, not one the
+        # control plane remembers: read it from the container's own .env.
+        class Reading(FakeProxmoxSsh):
+            def __init__(self, env: str) -> None:
+                super().__init__()
+                self.env = env
+
+            def run(self, command, *, secrets=()):
+                if command.startswith("pct exec 201 -- ") and "/opt/kinerary/.env" in command:
+                    self.commands.append(command)
+                    return self.env
+                return super().run(command, secrets=secrets)
+
+        spec = LxcSpec(
+            "trip-kinerary", "pve", "t", "s", 2, 1024, 8, "vmbr0", "ip", "gw", "ns", "h", "m", "kinerary",
+        )
+        ssh = Reading("SEED_PASSWORD=ab2c-d3ef-gh4j-km5n\n")
+        self.assertEqual("ab2c-d3ef-gh4j-km5n", ProxmoxLxcAdapter(ssh).site_password(spec))
+        # nothing secret travels in the command that reads it
+        self.assertNotIn("ab2c", ssh.commands[-1])
+        # a legacy site whose .env carries no SEED_PASSWORD has none to report
+        self.assertIsNone(ProxmoxLxcAdapter(Reading("PORT=3000\n")).site_password(spec))
+        # no such container -> None, not an exception
+        self.assertIsNone(ProxmoxLxcAdapter(FakeProxmoxSsh()).site_password(LXC_SPEC))
+
+    def test_a_failed_password_read_does_not_carry_the_password_in_its_error(self) -> None:
+        # The ssh transport quotes the command's output in its error, and the
+        # worker logs job failures with their text: a read that exits non-zero
+        # after printing the password must not put it in that text.
+        class Failing(FakeProxmoxSsh):
+            def run(self, command, *, secrets=()):
+                if command.startswith("pct exec 201 -- ") and "/opt/kinerary/.env" in command:
+                    raise RuntimeError("ssh command failed (exit 255): SEED_PASSWORD=ab2c-d3ef-gh4j-km5n")
+                return super().run(command, secrets=secrets)
+
+        spec = LxcSpec(
+            "trip-kinerary", "pve", "t", "s", 2, 1024, 8, "vmbr0", "ip", "gw", "ns", "h", "m", "kinerary",
+        )
+        with self.assertRaises(RuntimeError) as caught:
+            ProxmoxLxcAdapter(Failing()).site_password(spec)
+        self.assertNotIn("ab2c", str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertTrue(caught.exception.__suppress_context__)
 
     def test_a_new_trip_site_turns_the_member_connector_on(self) -> None:
         # The trip site serves its own MCP endpoint (server/trip-mcp, #220) so
@@ -396,7 +532,7 @@ class AdapterTests(unittest.TestCase):
         transport = SubprocessSshTransport("h", "u", "/k")
         completed = mock.Mock(returncode=0, stdout="203\n", stderr="")
         adapter = ProxmoxLxcAdapter(
-            transport, seed_password="s3cret pw$x", control_plane_exchange_key="exchange $key",
+            transport, password_factory=lambda: "s3cret pw$x", control_plane_exchange_key="exchange $key",
         )
         with mock.patch("provisioning.adapters.subprocess.run", return_value=completed) as run:
             adapter.create(LXC_SPEC)
@@ -447,7 +583,7 @@ class AdapterTests(unittest.TestCase):
             return mock.Mock(returncode=0, stdout="203\n", stderr="")
 
         adapter = ProxmoxLxcAdapter(
-            transport, seed_password="s3cret pw$x", control_plane_exchange_key="exchange $key",
+            transport, password_factory=lambda: "s3cret pw$x", control_plane_exchange_key="exchange $key",
         )
         with mock.patch("provisioning.adapters.subprocess.run", side_effect=fake_run):
             with self.assertRaises(RuntimeError) as caught:
