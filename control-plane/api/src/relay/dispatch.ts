@@ -47,6 +47,7 @@ import {
 } from "../chat-router.js";
 import { listOrganizerTrips, switchChatToTrip, type OrganizerTrip } from "../organizer-trips.js";
 import { isAddressedToAssistant } from "./addressing.js";
+import { conversationMark } from "./stay-silent.js";
 import { classifyTrigger, inboundFacts, type InboundFacts } from "../analytics/relay-facts.js";
 import { coerceLanguage, uiString, type Language } from "../intake-copy.js";
 import {
@@ -930,10 +931,22 @@ export async function dispatchUpdate(
     // member the assistant is in conversation with here, inside the window?
     // The sender is the Telegram user id the update carried, never anything
     // read from the text. A pure read - the forward below is what renews it.
-    const capturedByConversation =
-      !addressedOtherwise && inGroup && senderId
-        ? await inCompanionConversation(db, chatId, senderId)
-        : false;
+    //
+    // A failed lookup degrades to "not in the window" - today's behaviour -
+    // rather than failing the whole update: a relay that runs before the
+    // migration is applied (a restart applies none) would otherwise throw on
+    // every untagged group message and lose its held documents and overheard
+    // context with them. Same rule as the writes.
+    let capturedByConversation = false;
+    if (!addressedOtherwise && inGroup && senderId) {
+      try {
+        capturedByConversation = await inCompanionConversation(db, chatId, senderId);
+      } catch (error) {
+        log(structuredLog("warn", "trip_bot.conversation_window_read_failed", {
+          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        }));
+      }
+    }
     if (capturedByConversation) log(structuredLog("info", "trip_bot.conversation_window_hit", {}));
     const addressed = addressedOtherwise || capturedByConversation;
     // #177: the gate's verdict, as metadata. Only ever called through
@@ -996,8 +1009,8 @@ export async function dispatchUpdate(
       };
     }
 
-    // This sender is now the one the assistant is talking with in this group:
-    // open the conversation window (or move it to them, or extend it). Written
+    // This sender is now one of the members the assistant is talking with in this group:
+    // they join the conversation (nobody is displaced) and its shared deadline is extended. Written
     // when the message is FORWARDED, not when the assistant answers, so a
     // follow-up sent while it is still working counts. Whatever route
     // addressed the message - name, mention, reply, the "?" window or this
@@ -1086,6 +1099,18 @@ export async function dispatchUpdate(
           }))),
         };
       }
+    }
+
+    // A message that got here ONLY because its sender is in conversation with
+    // the assistant (no name, @mention, reply-to or "?" window) is marked, so the
+    // companion can tell a remark to the family from a message to it, and may
+    // answer with the silence sentinel (stay-silent.ts; the connector drops it).
+    // Named / mentioned / replying messages are never marked. Text is the only
+    // field that reaches the model, so the mark is a fenced line on the text,
+    // put on BEFORE the overheard block so that block still leads. An empty
+    // text (a photo or file with no caption) gets the mark alone.
+    if (capturedByConversation) {
+      outcome.event.text = `${conversationMark()}\n\n${outcome.event.text}`.trimEnd();
     }
 
     // The turns this message is a reply INTO. Prefixed onto the text rather

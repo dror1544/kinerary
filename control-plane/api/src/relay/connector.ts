@@ -24,6 +24,7 @@ import { createServer, type IncomingMessage, type Server } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import { structuredLog } from "../redaction.js";
 import { detectInternalLeak } from "./internal-leak.js";
+import { silenceVerdict } from "./stay-silent.js";
 import {
   decodeFrame,
   encodeFrame,
@@ -467,12 +468,26 @@ export class RelayConnector {
           return { success: true };
         }
 
-        const leak = detectInternalLeak(action.content);
+        // The companion chose not to answer a message in the conversation
+        // window that was not meant for it (stay-silent.ts). Nothing goes to
+        // Telegram, success goes back to the gateway (its per-request future has
+        // to resolve), and NOTHING else changes: the conversation window is not
+        // renewed and the "?" window is neither opened nor cleared, because the
+        // companion said nothing. Booleans only in the log.
+        const verdict = silenceVerdict(action.content);
+        if (verdict.kind === "silent") {
+          this.log(structuredLog("info", "trip_bot.companion_stayed_silent", { silent: true }));
+          this.options.assistantEvents?.replySent(action.chat_id, "suppressed", action.content.length, action.reply_to);
+          return { success: true };
+        }
+        const content = verdict.content;
+
+        const leak = detectInternalLeak(content);
         if (leak.leaks) {
           this.log(structuredLog("warn", "relay.internal_leak_suppressed", {
             matched: leak.term ?? "",
           }));
-          this.options.assistantEvents?.replySent(action.chat_id, "suppressed", action.content.length, action.reply_to);
+          this.options.assistantEvents?.replySent(action.chat_id, "suppressed", content.length, action.reply_to);
           // Reported as delivered on purpose: the gateway's per-request future
           // has to resolve, and this is not a transport failure it could
           // usefully retry.
@@ -503,15 +518,15 @@ export class RelayConnector {
           // message reached the organizer as "יש בעיה טכנית עם הדפדפן שלי\." and
           // a link written "japan\-2026\.ara\-united\.store". Raw here; the
           // dialect is honoured one layer down, once.
-          text: action.content,
+          text: content,
           replyTo: action.reply_to,
           parseMode: "MarkdownV2",
         }).catch((error: unknown) => {
-          this.options.assistantEvents?.replySent(action.chat_id, "failed", action.content.length, action.reply_to);
+          this.options.assistantEvents?.replySent(action.chat_id, "failed", content.length, action.reply_to);
           throw error;
         });
         this.options.assistantEvents?.replySent(
-          action.chat_id, sent.ok ? "delivered" : "failed", action.content.length, action.reply_to,
+          action.chat_id, sent.ok ? "delivered" : "failed", content.length, action.reply_to,
         );
         // Only a message that actually reached Telegram may open (or clear) a
         // capture window — a failed send asked nothing, so nothing here
@@ -549,13 +564,21 @@ export class RelayConnector {
           : { success: false, error: gatewayError(sent.error, "SEND_FAILED") };
       }
       case "edit": {
+        // The sentinel must not reach the chat through an edit either (a
+        // streaming reply edits a message into its final text). Silence on an
+        // edit leaves the message as it stands.
+        const editVerdict = silenceVerdict(action.content);
+        if (editVerdict.kind === "silent") {
+          this.log(structuredLog("info", "trip_bot.companion_stayed_silent", { silent: true }));
+          return { success: true };
+        }
         const edited = await telegram.editMessageText({
           chatId: action.chat_id,
           messageId: action.message_id,
           // Same reason as `send`: an edit is agent prose too, and an edit that
           // fails to parse leaves the ORIGINAL message on screen, so the loss
           // is even quieter. Escaped once, by telegram-api.ts.
-          text: action.content,
+          text: editVerdict.content,
           parseMode: "MarkdownV2",
         });
         return edited.ok ? { success: true } : { success: false, error: gatewayError(edited.error, "EDIT_FAILED") };

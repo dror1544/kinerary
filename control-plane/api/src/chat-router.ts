@@ -439,10 +439,10 @@ export async function consumeExpectsReplyWindow(db: pg.Pool, chatId: string): Pr
   return (result.rowCount ?? 0) > 0;
 }
 
-// ── Companion conversation window (per person) ──────────────────────────────
+// ── Companion conversation window (the members it is talking with) ───────────
 
 /**
- * How long, after the companion last spoke in a group, the member it is in
+ * How long, after the companion last spoke in a group, the members it is in
  * conversation with can keep talking to it without naming it (owner's
  * decision, 2026-10-16). A constant, like `EXPECTS_REPLY_WINDOW_SECONDS`:
  * there is no environment knob for the sibling window, so there is none here.
@@ -452,16 +452,27 @@ export async function consumeExpectsReplyWindow(db: pg.Pool, chatId: string): Pr
 export const CONVERSATION_WINDOW_SECONDS = 300;
 
 /**
+ * The most members one chat's conversation holds; past it the member who has
+ * been in longest without a message is dropped. A family trip group is a
+ * handful of people, rarely more than a dozen; 20 clears every real one with
+ * room, while a 200-member group cannot grow a row's array without bound, nor
+ * let a whole channel talk to the assistant unnamed.
+ */
+export const CONVERSATION_MAX_MEMBERS = 20;
+
+/**
  * Records that a message from `userId` was just forwarded to the companion in
- * this group: they become the chat's one conversation partner and the window
- * opens (or is extended) to `ttlSeconds` from now. That is what makes a
- * message sent while the companion is still working count — the window opens
- * on the forward, not on the companion's answer.
+ * this group: they JOIN the chat's conversation (nobody is displaced) and the
+ * one shared deadline is opened or extended to `ttlSeconds` from now. That is
+ * what makes a message sent while the companion is still working count — the
+ * window opens on the forward, not on the companion's answer.
  *
- * The same partner's deadline only ever moves LATER (`GREATEST`), so a second
- * message sent while a long turn is running cannot shorten what the
- * companion's own send already pushed out; a different partner REPLACES the
- * previous one outright — one current partner per chat.
+ * An expired window is dead whatever ids it still lists: a forward after expiry
+ * starts a FRESH set holding only this member. While open, the member moves to
+ * the end of the (oldest-first) set, and the set is capped at
+ * `CONVERSATION_MAX_MEMBERS`, oldest dropped. The deadline only ever moves
+ * LATER (`GREATEST`), so a second message sent while a long turn is running
+ * cannot shorten what the companion's own send already pushed out.
  *
  * Writes nothing when the trip has opted out of reply capture
  * (`companion_reply_capture_enabled`, migration 0053): that switch is the
@@ -474,30 +485,38 @@ export async function openCompanionConversation(
   chatId: string,
   userId: string,
   ttlSeconds: number = CONVERSATION_WINDOW_SECONDS,
+  maxMembers: number = CONVERSATION_MAX_MEMBERS,
 ): Promise<void> {
   await db.query(
     `UPDATE control_plane.telegram_chat_bindings b
-        SET conversation_until = CASE
-              WHEN b.conversation_user_id IS NOT DISTINCT FROM $2
-                THEN GREATEST(COALESCE(b.conversation_until, now()), now() + make_interval(secs => $3::integer))
+        SET conversation_user_ids = (
+              SELECT v[GREATEST(1, cardinality(v) - $4::integer + 1):cardinality(v)]
+                FROM (SELECT array_remove(
+                               CASE WHEN b.conversation_until > now()
+                                    THEN COALESCE(b.conversation_user_ids, ARRAY[]::text[])
+                                    ELSE ARRAY[]::text[] END,
+                               $2::text) || $2::text AS v) s
+            ),
+            conversation_until = CASE
+              WHEN b.conversation_until > now()
+                THEN GREATEST(b.conversation_until, now() + make_interval(secs => $3::integer))
               ELSE now() + make_interval(secs => $3::integer)
-            END,
-            conversation_user_id = $2
+            END
        FROM control_plane.trips t
       WHERE b.chat_id = $1
         AND b.closed_at IS NULL
         AND b.trip_id = t.id
         AND t.companion_reply_capture_enabled`,
-    [chatId, userId, ttlSeconds],
+    [chatId, userId, ttlSeconds, maxMembers],
   );
 }
 
 /**
- * The companion's send reached Telegram: push the deadline to `ttlSeconds`
- * from now — but only for a conversation that is STILL OPEN at the moment of
- * the send. A proactive message long after the last exchange (a daily post, a
- * reminder) would otherwise resurrect a stale partner and let them speak to
- * the assistant unnamed for another five minutes. Keeps the partner; a chat
+ * The companion's send reached Telegram: push the shared deadline to
+ * `ttlSeconds` from now — but only for a conversation that is STILL OPEN at the
+ * moment of the send. A proactive message long after the last exchange (a daily
+ * post, a reminder) would otherwise resurrect stale members and let them speak
+ * to the assistant unnamed for another five minutes. Keeps the members; a chat
  * with no conversation, or no open binding, is a no-op.
  *
  * Independent of `setCompanionExpectsReply`: a non-question send clears the
@@ -513,18 +532,19 @@ export async function renewCompanionConversation(
         SET conversation_until = now() + make_interval(secs => $2::integer)
       WHERE chat_id = $1
         AND closed_at IS NULL
-        AND conversation_user_id IS NOT NULL
+        AND cardinality(conversation_user_ids) > 0
         AND conversation_until > now()`,
     [chatId, ttlSeconds],
   );
 }
 
 /**
- * Is `userId` the member the companion is in conversation with here, with the
- * window still open and the trip not opted out? A pure read — it does not
- * consume anything; the hit's own forward renews the window
- * (`openCompanionConversation`). `userId` is the Telegram sender id the
- * dispatcher took from the update, never from message text.
+ * Is `userId` one of the members the companion is in conversation with here,
+ * with the window still open and the trip not opted out? A pure read — it does
+ * not consume anything; the hit's own forward renews the window
+ * (`openCompanionConversation`). An expired window reads as empty whatever ids
+ * it still lists. `userId` is the Telegram sender id the dispatcher took from
+ * the update, never from message text.
  */
 export async function inCompanionConversation(
   db: pg.Pool,
@@ -538,8 +558,8 @@ export async function inCompanionConversation(
       WHERE b.chat_id = $1
         AND b.closed_at IS NULL
         AND t.companion_reply_capture_enabled
-        AND b.conversation_user_id = $2
         AND b.conversation_until > now()
+        AND $2::text = ANY(b.conversation_user_ids)
       LIMIT 1`,
     [chatId, userId],
   );

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { WebSocket } from "ws";
 import { RelayConnector } from "../src/relay/connector.js";
+import { SILENCE_SENTINEL } from "../src/relay/stay-silent.js";
 import { makeUpgradeToken, type WireMessageEvent } from "../src/relay/protocol.js";
 import type { ChatInfo, SendResult, TelegramClient } from "../src/relay/telegram-api.js";
 
@@ -546,6 +547,55 @@ describe("RelayConnector — reply-expected capture (migration 0053)", () => {
       renewConversation: async (chatId) => { renewed.push(chatId); },
       setExpectsReply: async (_chatId, e) => { expects.push(e); },
     });
+  });
+
+  test("the silence sentinel is dropped: nothing sent, success returned, no renewal, '?' window untouched", async () => {
+    const renewed: string[] = [];
+    const expects: boolean[] = [];
+    const lines: string[] = [];
+    await withConnector(async (h) => {
+      for (const content of [SILENCE_SENTINEL, `  ${SILENCE_SENTINEL}\n`]) {
+        const result = await roundTrip(h, { op: "send", chat_id: "901", content });
+        assert.equal(result.success, true, "the gateway's request resolves");
+      }
+      assert.deepEqual(h.telegram.sent, [], "nothing reached Telegram");
+      assert.deepEqual(renewed, [], "silence does not renew the conversation");
+      assert.deepEqual(expects, [], "and neither opens nor clears the '?' window");
+      assert.equal(lines.filter((l) => l.includes("trip_bot.companion_stayed_silent")).length, 2);
+      assert.ok(lines.every((l) => !l.includes("901")), "no chat id in the log");
+    }, {
+      renewConversation: async (chatId) => { renewed.push(chatId); },
+      setExpectsReply: async (_c, e) => { expects.push(e); },
+      log: (l) => lines.push(l),
+    });
+  });
+
+  test("text that merely contains the sentinel is delivered WITHOUT the token, never with it", async () => {
+    await withConnector(async (h) => {
+      await roundTrip(h, { op: "send", chat_id: "901", content: `Saturday is free. ${SILENCE_SENTINEL}` });
+      assert.equal(h.telegram.sent.length, 1);
+      assert.equal(h.telegram.sent[0]!.text, "Saturday is free.", "the answer survives, the control token does not");
+      await roundTrip(h, { op: "send", chat_id: "901", content: "about [[KINERARY]] nothing" });
+      assert.equal(h.telegram.sent[1]!.text, "about [[KINERARY]] nothing", "other bracketed text is untouched");
+    }, {});
+  });
+
+  test("a sentinel never reaches the chat through an edit, or half-streamed", async () => {
+    await withConnector(async (h) => {
+      const edit = await roundTrip(h, { op: "edit", chat_id: "901", message_id: "7", content: SILENCE_SENTINEL });
+      assert.equal(edit.success, true);
+      assert.deepEqual(h.telegram.edited, []);
+      const mixed = await roundTrip(h, { op: "edit", chat_id: "901", message_id: "7", content: `Done. ${SILENCE_SENTINEL}` });
+      assert.equal(mixed.success, true);
+      assert.equal(h.telegram.edited[0]!.text, "Done.");
+      // A streaming adapter's first chunk can be the opening of the sentinel.
+      for (const partial of ["[[", "[[KINERARY_STAY", SILENCE_SENTINEL.slice(0, -1)]) {
+        await roundTrip(h, { op: "send", chat_id: "901", content: partial });
+      }
+      assert.deepEqual(h.telegram.sent, [], "no fragment of the token is ever sent");
+      await roundTrip(h, { op: "send", chat_id: "901", content: "[" });
+      assert.equal(h.telegram.sent.length, 1, "but an ordinary one-character message is");
+    }, {});
   });
 
   test("a failed send does not renew the conversation window", async () => {

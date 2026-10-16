@@ -278,7 +278,7 @@ describe("an itinerary PDF sent to the family group reaches the trip's plan", { 
     // when no conversation is open - so the window is closed first, as it
     // would be five minutes after the assistant's last message.
     await pool.query(
-      "UPDATE control_plane.telegram_chat_bindings SET conversation_user_id = NULL, conversation_until = NULL WHERE chat_id = $1",
+      "UPDATE control_plane.telegram_chat_bindings SET conversation_user_ids = NULL, conversation_until = NULL WHERE chat_id = $1",
       [GROUP],
     );
 

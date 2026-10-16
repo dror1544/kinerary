@@ -15,6 +15,8 @@ import {
 import { dispatchUpdate, DEFAULT_STRINGS, OutageNoticeLimiter } from "../src/relay/dispatch.js";
 import { uiString } from "../src/intake-copy.js";
 import { GroupContext } from "../src/relay/group-context.js";
+import { PendingAttachments } from "../src/relay/pending-attachments.js";
+import { conversationMark, SILENCE_SENTINEL } from "../src/relay/stay-silent.js";
 import { confirmIntakeForChat, getSessionForChat, submitAnswerForChat } from "../src/interview.js";
 import { issueGroupBindingToken } from "../src/group-binding.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
@@ -1454,19 +1456,24 @@ describe("companion conversation window through dispatchUpdate", { skip: SKIP },
       assert.equal((await dispatch(fix, from(chat, "Friday works for us", NOA), lines)).kind, "to_gateway", "anyone's next message after a '?'");
       assert.ok(lines.some((l) => l.includes("trip_bot.reply_window_hit")), "the one-shot window now logs its hit");
       assert.ok(!lines.some((l) => l.includes("trip_bot.conversation_window_hit")), "and that was not the conversation window");
-      assert.deepEqual(await dispatch(fix, from(chat, "oh and also", DROR)), { kind: "ignore", reason: "NOT_ADDRESSED" }, "Dror is no longer the partner");
-      assert.equal((await dispatch(fix, from(chat, "is it far?", NOA))).kind, "to_gateway", "Noa now is");
+      assert.equal((await dispatch(fix, from(chat, "oh and also", DROR))).kind, "to_gateway", "Dror is still in the conversation: Noa joined, nobody was displaced");
+      assert.equal((await dispatch(fix, from(chat, "is it far?", NOA))).kind, "to_gateway", "and Noa is in");
     });
   });
 
-  test("another member addressing the companion by name moves the conversation to them", async () => {
+  test("another member addressing the companion by name joins the conversation; the first is still in", async () => {
     await withFixture(async (fix) => {
       const chat = "-1003000007";
       await bindNamed(fix, chat);
       await dispatch(fix, from(chat, "Liv, hello", DROR));
       await dispatch(fix, from(chat, "Liv, what about me?", NOA));
-      assert.deepEqual(await dispatch(fix, from(chat, "still there?", DROR)), { kind: "ignore", reason: "NOT_ADDRESSED" });
+      assert.equal((await dispatch(fix, from(chat, "still there?", DROR))).kind, "to_gateway", "Dror was not displaced");
       assert.equal((await dispatch(fix, from(chat, "thanks", NOA))).kind, "to_gateway");
+      assert.deepEqual(
+        await dispatch(fix, from(chat, "what are we doing", 999)),
+        { kind: "ignore", reason: "NOT_ADDRESSED" },
+        "a third member who never addressed it is not in",
+      );
     });
   });
 
@@ -1506,9 +1513,94 @@ describe("companion conversation window through dispatchUpdate", { skip: SKIP },
       await bindCompanion(fix, chat, "companion-colmar");
       assert.equal((await dispatchUpdate(fix.pool, msg(chat, "hello there", "private"))).kind, "to_gateway");
       const r = await fix.pool.query(
-        "SELECT conversation_user_id FROM control_plane.telegram_chat_bindings WHERE chat_id = $1", [chat],
+        "SELECT conversation_user_ids FROM control_plane.telegram_chat_bindings WHERE chat_id = $1", [chat],
       );
-      assert.equal(r.rows[0].conversation_user_id, null);
+      assert.equal(r.rows[0].conversation_user_ids, null);
+    });
+  });
+
+  test("an untagged document from the partner INSIDE the window is forwarded, not held", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1003000012";
+      await bindNamed(fix, chat);
+      await dispatch(fix, from(chat, "Liv, I am about to send the booking", DROR));
+      const lines: string[] = [];
+      const file = {
+        update_id: 4,
+        message: {
+          message_id: 10,
+          from: { id: DROR, first_name: "Dror" },
+          chat: { id: chat, type: "supergroup" },
+          document: { file_id: "BQAC-x", file_name: "booking.pdf", mime_type: "application/pdf" },
+        },
+      } as TelegramUpdate;
+      const decision = await dispatch(fix, file, lines, { pendingAttachments: new PendingAttachments() });
+      assert.equal(decision.kind, "to_gateway", "in conversation, the file goes straight to the companion");
+      assert.ok(!lines.some((l) => l.includes("trip_bot.attachment_held")), "and is not held for a later message");
+    });
+  });
+
+  test("a failing window lookup degrades to NOT_ADDRESSED - held and overheard as before - not a failed update", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1003000013";
+      await bindNamed(fix, chat);
+      await dispatch(fix, from(chat, "Liv, hello", DROR));
+      // The relay running before the migration: the columns are not there. The
+      // lookup (and the write) throw; the router must carry on as it did before.
+      await fix.pool.query(
+        "ALTER TABLE control_plane.telegram_chat_bindings RENAME COLUMN conversation_until TO conversation_until_gone",
+      );
+      try {
+        const lines: string[] = [];
+        const ctx = new GroupContext();
+        const pending = new PendingAttachments();
+        const text = await dispatch(fix, from(chat, "what about the museum", DROR), lines, { groupContext: ctx });
+        assert.deepEqual(text, { kind: "ignore", reason: "NOT_ADDRESSED" });
+        assert.ok(lines.some((l) => l.includes("trip_bot.conversation_window_read_failed")), "the failure is loud");
+        assert.equal(ctx.take(chat).length, 1, "overheard context is kept, as before");
+
+        const file = {
+          update_id: 5,
+          message: {
+            message_id: 11,
+            from: { id: DROR, first_name: "Dror" },
+            chat: { id: chat, type: "supergroup" },
+            document: { file_id: "BQAC-y", file_name: "booking.pdf", mime_type: "application/pdf" },
+          },
+        } as TelegramUpdate;
+        const held = await dispatch(fix, file, lines, { pendingAttachments: pending });
+        assert.deepEqual(held, { kind: "ignore", reason: "NOT_ADDRESSED" });
+        assert.ok(lines.some((l) => l.includes("trip_bot.attachment_held")), "the document is held, as before");
+      } finally {
+        await fix.pool.query(
+          "ALTER TABLE control_plane.telegram_chat_bindings RENAME COLUMN conversation_until_gone TO conversation_until",
+        );
+      }
+    });
+  });
+
+  test("only a window-only forward carries the not-addressed mark; named and '?' ones never do", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1003000014";
+      await bindNamed(fix, chat);
+      const text = (d: { kind: string }) => (d as { event?: { text?: string } }).event?.text ?? "";
+      const named = await dispatch(fix, from(chat, "Liv, hello", DROR));
+      assert.equal(text(named), "Liv, hello", "a named message is not marked");
+      const windowOnly = await dispatch(fix, from(chat, "and what about Saturday", DROR));
+      assert.equal(windowOnly.kind, "to_gateway");
+      assert.ok(text(windowOnly).startsWith(conversationMark()), "the window-only forward is marked");
+      assert.ok(text(windowOnly).endsWith("and what about Saturday"), "and the message itself is intact");
+      assert.ok(text(windowOnly).includes(SILENCE_SENTINEL), "and the mark names the way to stay silent");
+      // Answering a '?' is addressed by the router's own rule: unmarked.
+      await setCompanionExpectsReply(fix.pool, chat, true);
+      const answer = await dispatch(fix, from(chat, "Friday works", NOA));
+      assert.equal(text(answer), "Friday works", "a '?' window answer is not marked");
+      // The overheard block still leads; the mark sits beside the message.
+      const ctx = new GroupContext();
+      ctx.hold(chat, "Someone", "we should leave early");
+      const withCtx = text(await dispatch(fix, from(chat, "ok thanks", DROR), [], { groupContext: ctx }));
+      assert.ok(withCtx.startsWith("[overheard in the group"), "overheard first");
+      assert.ok(withCtx.indexOf(conversationMark()) > withCtx.indexOf("[end of overheard]"), "then the mark");
     });
   });
 
