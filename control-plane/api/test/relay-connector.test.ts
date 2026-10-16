@@ -54,6 +54,8 @@ async function withConnector(
     interviewSay?: (chatId: string, text: string) => Promise<boolean>;
     fallbackGatewayId?: string;
     setExpectsReply?: (chatId: string, expects: boolean) => Promise<void>;
+    renewConversation?: (chatId: string) => Promise<void>;
+    log?: (line: string) => void;
   } = {},
 ): Promise<void> {
   const telegram = new FakeTelegram();
@@ -67,6 +69,8 @@ async function withConnector(
     ...(options.interviewSay ? { interviewSay: options.interviewSay } : {}),
     ...(options.fallbackGatewayId ? { fallbackGatewayId: options.fallbackGatewayId } : {}),
     ...(options.setExpectsReply ? { setExpectsReply: options.setExpectsReply } : {}),
+    ...(options.renewConversation ? { renewConversation: options.renewConversation } : {}),
+    ...(options.log ? { log: options.log } : {}),
   });
   await connector.listen();
   const port = connector.address;
@@ -528,6 +532,62 @@ describe("RelayConnector — reply-expected capture (migration 0053)", () => {
         calls.push({ chatId, expects });
       },
     });
+  });
+
+  test("a delivered send renews the conversation window, question or not", async () => {
+    const renewed: string[] = [];
+    const expects: boolean[] = [];
+    await withConnector(async (h) => {
+      await roundTrip(h, { op: "send", chat_id: "901", content: "sounds good." });
+      await roundTrip(h, { op: "send", chat_id: "901", content: "what date works?", metadata: { expects_reply: true } });
+      assert.deepEqual(renewed, ["901", "901"], "renewal is independent of the '?' window: a statement renews too");
+      assert.deepEqual(expects, [false, true], "and the '?' window keeps clearing/opening on its own");
+    }, {
+      renewConversation: async (chatId) => { renewed.push(chatId); },
+      setExpectsReply: async (_chatId, e) => { expects.push(e); },
+    });
+  });
+
+  test("a failed send does not renew the conversation window", async () => {
+    const renewed: string[] = [];
+    await withConnector(async (h) => {
+      h.telegram.failSend = true;
+      const result = await roundTrip(h, { op: "send", chat_id: "901", content: "hello" });
+      assert.equal(result.success, false);
+      assert.deepEqual(renewed, []);
+    }, { renewConversation: async (chatId) => { renewed.push(chatId); } });
+  });
+
+  test("an interview chat never renews the conversation window", async () => {
+    const renewed: string[] = [];
+    await withConnector(async (h) => {
+      await roundTrip(h, { op: "send", chat_id: "900", content: "The next question is destination." });
+      assert.deepEqual(renewed, []);
+    }, { interviewChats: ["900"], renewConversation: async (chatId) => { renewed.push(chatId); } });
+  });
+
+  test("a renewal write failure does not turn a delivered message into a failure, and is logged", async () => {
+    const lines: string[] = [];
+    await withConnector(async (h) => {
+      const result = await roundTrip(h, { op: "send", chat_id: "901", content: "hello" });
+      assert.deepEqual(result, { success: true, message_id: "555" });
+      assert.ok(lines.some((l) => l.includes("relay.conversation_renew_failed")));
+    }, {
+      renewConversation: async () => { throw new Error("db unavailable"); },
+      log: (l) => lines.push(l),
+    });
+  });
+
+  test("opening the '?' window is logged (a boolean, no ids); a non-question send logs nothing of the kind", async () => {
+    const lines: string[] = [];
+    await withConnector(async (h) => {
+      await roundTrip(h, { op: "send", chat_id: "901", content: "statement." });
+      assert.ok(!lines.some((l) => l.includes("relay.reply_window_opened")));
+      await roundTrip(h, { op: "send", chat_id: "901", content: "what date?", metadata: { expects_reply: true } });
+      const opened = lines.filter((l) => l.includes("relay.reply_window_opened"));
+      assert.equal(opened.length, 1);
+      assert.ok(!opened[0]!.includes("901"), "no chat id in the line");
+    }, { setExpectsReply: async () => {}, log: (l) => lines.push(l) });
   });
 
   test("a write failure here does not turn a delivered message into a failure", async () => {

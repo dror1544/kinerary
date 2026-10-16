@@ -164,6 +164,16 @@ export interface ConnectorOptions {
    */
   setExpectsReply?: (chatId: string, expects: boolean) => Promise<void>;
   /**
+   * Called after every companion send that reached Telegram, to renew the
+   * per-person conversation window on the chat's binding (the member the
+   * assistant is talking with keeps being heard without its name for five
+   * minutes after its last message). Unlike `setExpectsReply` it does not
+   * depend on whether the message was a question. Same failure rule: a write
+   * error is logged and never turns a delivered message into a failure. Never
+   * called on an interview chat.
+   */
+  renewConversation?: (chatId: string) => Promise<void>;
+  /**
    * The relay's assistant-event emitter (#177), told what became of each
    * companion `send` once Telegram has answered. Synchronous and unable to
    * throw, so the reply's own result is never delayed by it. Absent — the
@@ -512,8 +522,24 @@ export class RelayConnector {
         if (sent.ok && this.options.setExpectsReply) {
           try {
             await this.options.setExpectsReply(action.chat_id, action.expectsReply);
+            // The "?" window is the only one of the two that was invisible: a
+            // missed capture could not be told from a window that never opened.
+            if (action.expectsReply) this.log(structuredLog("info", "relay.reply_window_opened", { expects: true }));
           } catch (error) {
             this.log(structuredLog("warn", "relay.expects_reply_write_failed", {
+              safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+            }));
+          }
+        }
+        // The per-person conversation window: every delivered companion send,
+        // question or not, pushes its deadline out (a no-op unless a
+        // conversation is open). Separate from the "?" window above on
+        // purpose - a statement clears that one and must not touch this one.
+        if (sent.ok && this.options.renewConversation) {
+          try {
+            await this.options.renewConversation(action.chat_id);
+          } catch (error) {
+            this.log(structuredLog("warn", "relay.conversation_renew_failed", {
               safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
             }));
           }

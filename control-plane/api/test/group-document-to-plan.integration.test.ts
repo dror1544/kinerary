@@ -272,6 +272,16 @@ describe("an itinerary PDF sent to the family group reaches the trip's plan", { 
         id: "9000",
       }, { media, pendingAttachments: pending });
 
+    // The previous test left this organizer in conversation with the assistant
+    // (the per-person window, 2026-10-16), in which an untagged file would be
+    // forwarded at once. This test is about the HELD document - a file sent
+    // when no conversation is open - so the window is closed first, as it
+    // would be five minutes after the assistant's last message.
+    await pool.query(
+      "UPDATE control_plane.telegram_chat_bindings SET conversation_user_id = NULL, conversation_until = NULL WHERE chat_id = $1",
+      [GROUP],
+    );
+
     await send({
       message_id: 11,
       from: { id: ORGANIZER, first_name: "Organizer" },

@@ -47,6 +47,8 @@ export interface TriggerInput {
   addressed: boolean;
   /** The one-shot reply window claimed this message (migration 0053). */
   capturedAsReply: boolean;
+  /** The sender is the assistant's current conversation partner in this group, inside the window. */
+  capturedByConversation?: boolean;
   /** The MAPPED wire type the gate itself saw (`dm`, `group`, …). */
   chatType: string | undefined;
   text: string;
@@ -67,6 +69,10 @@ export function classifyTrigger(input: TriggerInput): TriggerType {
   if (input.isReplyToAssistant) return "reply_to_bot";
   if (mentionsUsername(input.text, input.botUsername)) return "mention";
   if (input.assistantNames.some((name) => mentionsName(input.text, name))) return "name";
+  // Admitted by none of the gate's own predicates, only by the sender being the
+  // assistant's current conversation partner (dispatch computes it last, and
+  // only when every route above refused, so the order here cannot misname it).
+  if (input.capturedByConversation) return "conversation_window";
   return "unclassified";
 }
 

@@ -439,6 +439,113 @@ export async function consumeExpectsReplyWindow(db: pg.Pool, chatId: string): Pr
   return (result.rowCount ?? 0) > 0;
 }
 
+// ── Companion conversation window (per person) ──────────────────────────────
+
+/**
+ * How long, after the companion last spoke in a group, the member it is in
+ * conversation with can keep talking to it without naming it (owner's
+ * decision, 2026-10-16). A constant, like `EXPECTS_REPLY_WINDOW_SECONDS`:
+ * there is no environment knob for the sibling window, so there is none here.
+ * The length is applied at WRITE time (`conversation_until`), so the read
+ * carries no length of its own.
+ */
+export const CONVERSATION_WINDOW_SECONDS = 300;
+
+/**
+ * Records that a message from `userId` was just forwarded to the companion in
+ * this group: they become the chat's one conversation partner and the window
+ * opens (or is extended) to `ttlSeconds` from now. That is what makes a
+ * message sent while the companion is still working count — the window opens
+ * on the forward, not on the companion's answer.
+ *
+ * The same partner's deadline only ever moves LATER (`GREATEST`), so a second
+ * message sent while a long turn is running cannot shorten what the
+ * companion's own send already pushed out; a different partner REPLACES the
+ * previous one outright — one current partner per chat.
+ *
+ * Writes nothing when the trip has opted out of reply capture
+ * (`companion_reply_capture_enabled`, migration 0053): that switch is the
+ * trip's "do not let unaddressed messages in" setting and covers this window
+ * too. Filters on `closed_at IS NULL` like every column on this table.
+ * Atomic single UPDATE; a chat with no open binding is a no-op.
+ */
+export async function openCompanionConversation(
+  db: pg.Pool,
+  chatId: string,
+  userId: string,
+  ttlSeconds: number = CONVERSATION_WINDOW_SECONDS,
+): Promise<void> {
+  await db.query(
+    `UPDATE control_plane.telegram_chat_bindings b
+        SET conversation_until = CASE
+              WHEN b.conversation_user_id IS NOT DISTINCT FROM $2
+                THEN GREATEST(COALESCE(b.conversation_until, now()), now() + make_interval(secs => $3::integer))
+              ELSE now() + make_interval(secs => $3::integer)
+            END,
+            conversation_user_id = $2
+       FROM control_plane.trips t
+      WHERE b.chat_id = $1
+        AND b.closed_at IS NULL
+        AND b.trip_id = t.id
+        AND t.companion_reply_capture_enabled`,
+    [chatId, userId, ttlSeconds],
+  );
+}
+
+/**
+ * The companion's send reached Telegram: push the deadline to `ttlSeconds`
+ * from now — but only for a conversation that is STILL OPEN at the moment of
+ * the send. A proactive message long after the last exchange (a daily post, a
+ * reminder) would otherwise resurrect a stale partner and let them speak to
+ * the assistant unnamed for another five minutes. Keeps the partner; a chat
+ * with no conversation, or no open binding, is a no-op.
+ *
+ * Independent of `setCompanionExpectsReply`: a non-question send clears the
+ * one-shot "?" window and must not touch this one.
+ */
+export async function renewCompanionConversation(
+  db: pg.Pool,
+  chatId: string,
+  ttlSeconds: number = CONVERSATION_WINDOW_SECONDS,
+): Promise<void> {
+  await db.query(
+    `UPDATE control_plane.telegram_chat_bindings
+        SET conversation_until = now() + make_interval(secs => $2::integer)
+      WHERE chat_id = $1
+        AND closed_at IS NULL
+        AND conversation_user_id IS NOT NULL
+        AND conversation_until > now()`,
+    [chatId, ttlSeconds],
+  );
+}
+
+/**
+ * Is `userId` the member the companion is in conversation with here, with the
+ * window still open and the trip not opted out? A pure read — it does not
+ * consume anything; the hit's own forward renews the window
+ * (`openCompanionConversation`). `userId` is the Telegram sender id the
+ * dispatcher took from the update, never from message text.
+ */
+export async function inCompanionConversation(
+  db: pg.Pool,
+  chatId: string,
+  userId: string,
+): Promise<boolean> {
+  const result = await db.query(
+    `SELECT 1
+       FROM control_plane.telegram_chat_bindings b
+       JOIN control_plane.trips t ON t.id = b.trip_id
+      WHERE b.chat_id = $1
+        AND b.closed_at IS NULL
+        AND t.companion_reply_capture_enabled
+        AND b.conversation_user_id = $2
+        AND b.conversation_until > now()
+      LIMIT 1`,
+    [chatId, userId],
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
 // ── /start deep link ─────────────────────────────────────────────────────────
 
 export type StartLinkOutcome =

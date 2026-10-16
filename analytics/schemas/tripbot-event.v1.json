@@ -47,7 +47,7 @@
       "enum": ["group", "organizer_dm", "other", "unclassified", null]
     },
     "trigger_type": {
-      "enum": ["dm", "mention", "name", "reply_to_bot", "reply_window", "not_addressed", "unclassified", null]
+      "enum": ["dm", "mention", "name", "reply_to_bot", "reply_window", "conversation_window", "not_addressed", "unclassified", null]
     },
     "requester_role": {
       "enum": ["organizer", "participant", "unknown", "unclassified", null]

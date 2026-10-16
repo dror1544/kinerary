@@ -42,6 +42,8 @@ import {
   resolveChatLanguage,
   tripDisplayName,
   consumeExpectsReplyWindow,
+  inCompanionConversation,
+  openCompanionConversation,
 } from "../chat-router.js";
 import { listOrganizerTrips, switchChatToTrip, type OrganizerTrip } from "../organizer-trips.js";
 import { isAddressedToAssistant } from "./addressing.js";
@@ -908,7 +910,12 @@ export async function dispatchUpdate(
     const capturedAsReply =
       outcome.route.kind === "companion" ? await consumeExpectsReplyWindow(db, chatId) : false;
 
-    const addressed =
+    // Booleans only in the log: no chat or user id beyond what other events carry.
+    if (capturedAsReply) log(structuredLog("info", "trip_bot.reply_window_hit", {}));
+
+    const senderId = outcome.event.source.user_id;
+    const inGroup = outcome.route.kind === "companion" && outcome.event.source.chat_type !== "dm";
+    const addressedOtherwise =
       capturedAsReply ||
       isAddressedToAssistant({
         chatType: outcome.event.source.chat_type,
@@ -917,7 +924,18 @@ export async function dispatchUpdate(
         botUsername: botIdentity.username,
         isReplyToAssistant,
       });
-    const senderId = outcome.event.source.user_id;
+
+    // The per-person conversation window (2026-10-16). Consulted LAST, only for
+    // a group message every other route has refused: is the sender the one
+    // member the assistant is in conversation with here, inside the window?
+    // The sender is the Telegram user id the update carried, never anything
+    // read from the text. A pure read - the forward below is what renews it.
+    const capturedByConversation =
+      !addressedOtherwise && inGroup && senderId
+        ? await inCompanionConversation(db, chatId, senderId)
+        : false;
+    if (capturedByConversation) log(structuredLog("info", "trip_bot.conversation_window_hit", {}));
+    const addressed = addressedOtherwise || capturedByConversation;
     // #177: the gate's verdict, as metadata. Only ever called through
     // `withAnalytics`, which never calls it while assistant events are off.
     // The text is taken here, before anything is prefixed to it.
@@ -932,6 +950,7 @@ export async function dispatchUpdate(
         trigger: classifyTrigger({
           addressed,
           capturedAsReply,
+          capturedByConversation,
           chatType: outcome.event.source.chat_type,
           text: heardText,
           assistantNames: outcome.route.kind === "companion" ? outcome.route.assistantNames : [],
@@ -975,6 +994,22 @@ export async function dispatchUpdate(
           ...(held ? { documentHeld: true } : {}),
         }))),
       };
+    }
+
+    // This sender is now the one the assistant is talking with in this group:
+    // open the conversation window (or move it to them, or extend it). Written
+    // when the message is FORWARDED, not when the assistant answers, so a
+    // follow-up sent while it is still working counts. Whatever route
+    // addressed the message - name, mention, reply, the "?" window or this
+    // window itself. A failed write is logged and never costs the message.
+    if (inGroup && senderId) {
+      try {
+        await openCompanionConversation(db, chatId, senderId);
+      } catch (error) {
+        log(structuredLog("warn", "trip_bot.conversation_window_write_failed", {
+          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        }));
+      }
     }
 
     // WHOSE VOICE THIS IS, when the trip knows. `user_name` arrives from

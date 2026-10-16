@@ -59,6 +59,7 @@ export const TRIGGER_TYPES = [
   "name",
   "reply_to_bot",
   "reply_window",
+  "conversation_window",
   "not_addressed",
   "unclassified",
 ] as const;
