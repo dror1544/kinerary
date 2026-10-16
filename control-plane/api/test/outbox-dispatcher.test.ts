@@ -345,18 +345,64 @@ test("companion-ready introduces the assistant and hands over the token", { skip
       async sendMessage(p) { sent.push(p); },
     }, () => {}, { botUsername: "Kinerary_bot" });
 
-    // Two messages: the introduction (password in a code span), then the line
-    // to copy on its own.
-    assert.equal(sent.length, 2);
+    // Three messages: the introduction (password in a code span), the line to
+    // copy on its own, then the password on its own.
+    assert.equal(sent.length, 3);
     assert.match(sent[0]!.text, /Rio/);
     assert.match(sent[0]!.text, /<code>seed-pw<\/code>/);
     assert.match(sent[1]!.text, /^\/group KIN-/, "the copyable command, alone");
+    assert.equal(sent[2]!.text, "seed-pw", "the password, alone, last");
 
     const { rowCount } = await pool.query(
       "SELECT 1 FROM control_plane.telegram_group_binding_tokens WHERE trip_id = $1",
       [tripId],
     );
     assert.equal(rowCount, 1, "exactly one live token for the trip");
+  } finally {
+    await pool.end();
+  }
+});
+
+test("companion-ready is marked sent only after the password message too; a failure there retries every part", { skip }, async () => {
+  const pool = testPool();
+  const client = await pool.connect();
+  try {
+    await resetDb(client);
+    await applyMigrations(client, migrationsDir);
+    client.release();
+
+    const tripId = await insertTrip(pool);
+    const notifId = await insertOutboxRow(pool, tripId, "companion_ready", "555000111", {
+      private_url: "https://example.test/trip",
+      assistant_name: "Rio",
+      trip_title: "Japan 2026",
+      trip_slug: "japan-2026",
+      language: "en",
+      login_password: "seed-pw",
+    });
+
+    // The LAST part (the password) fails on the first pass.
+    const sent: string[] = [];
+    let failPassword = true;
+    const adapter = {
+      async sendApprovalRequest() {},
+      async sendMessage(p: { chatId: string; text: string }) {
+        if (p.text === "seed-pw" && failPassword) throw new Error("simulated send failure");
+        sent.push(p.text);
+      },
+    };
+    await dispatchPendingTripNotifications(pool, adapter, () => {}, { botUsername: "Kinerary_bot" });
+    let row = await pool.query("SELECT state, attempt FROM control_plane.notification_outbox WHERE id = $1", [notifId]);
+    assert.equal(row.rows[0].state, "pending", "not sent while the password message has not gone");
+    assert.equal(sent.length, 2, "introduction and binding line went out before it");
+
+    // The retry repeats all parts, and only then is the row sent.
+    failPassword = false;
+    await dispatchPendingTripNotifications(pool, adapter, () => {}, { botUsername: "Kinerary_bot" });
+    row = await pool.query("SELECT state FROM control_plane.notification_outbox WHERE id = $1", [notifId]);
+    assert.equal(row.rows[0].state, "sent");
+    assert.equal(sent.length, 5, "2 from the first pass + all 3 again");
+    assert.equal(sent[4], "seed-pw");
   } finally {
     await pool.end();
   }
@@ -394,15 +440,15 @@ test("the greeting reaches Telegram's sendMessage as HTML with the password and 
       const adapter = new TelegramNotificationAdapter({ botToken: "bot-token", superAdminChatId: "1", db: pool });
       await dispatchPendingTripNotifications(pool, adapter, () => {}, { botUsername: "Kinerary_bot" });
 
-      assert.equal(posted.length, 2, "introduction, then the binding line");
+      assert.equal(posted.length, 3, "introduction, the binding line, then the password alone");
       assert.match(posted[0]!.url, /\/botbot-token\/sendMessage$/);
       const intro = posted[0]!.body;
       assert.equal(intro.chat_id, "555000111");
       assert.equal(intro.parse_mode, "HTML");
       const text = String(intro.text);
       const loginLine = language === "he"
-        ? `הכניסה לאתר — שם המשתמש שלכם והסיסמה <code>${GENERATED_PASSWORD}</code>:`
-        : `Log in with your username and the password <code>${GENERATED_PASSWORD}</code>:`;
+        ? `הכניסה לאתר — שם המשתמש שלכם והסיסמה <code>${GENERATED_PASSWORD}</code> (היא גם מופיעה בהודעה נפרדת למטה, להעתקה):`
+        : `Log in with your username and the password <code>${GENERATED_PASSWORD}</code> (it's also in a separate message below, to copy):`;
       assert.ok(text.includes(`${loginLine}\n• Ella — <code>ella</code>\n• Tali — <code>tali</code>`), text);
       // The query-string ampersand is escaped, and no other tag exists.
       assert.match(text, /startgroup=japan-2026&amp;admin=pin_messages\+invite_users/);
@@ -412,6 +458,12 @@ test("the greeting reaches Telegram's sendMessage as HTML with the password and 
       );
       assert.equal(posted[1]!.body.parse_mode, undefined, "the binding line is plain");
       assert.match(String(posted[1]!.body.text), /^\/group KIN-/);
+      // The password's own message: exactly the password, and no parse_mode on
+      // the wire, so Telegram treats it as plain text.
+      assert.equal(posted[2]!.body.chat_id, "555000111");
+      assert.equal(posted[2]!.body.text, GENERATED_PASSWORD);
+      assert.equal(posted[2]!.body.parse_mode, undefined, "the password message is plain");
+      assert.ok(!("parse_mode" in posted[2]!.body), "no parse_mode key at all");
     } finally {
       mock.restoreAll();
       await pool.end();
