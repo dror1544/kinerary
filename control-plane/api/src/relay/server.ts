@@ -30,7 +30,7 @@ import { structuredLog } from "../redaction.js";
 import { resolveSecretRef } from "../secrets.js";
 import type { SignupConfig } from "../signup.js";
 import { RelayConnector } from "./connector.js";
-import { resolveChatRoute, setCompanionExpectsReply } from "../chat-router.js";
+import { renewCompanionConversation, resolveChatRoute, setCompanionExpectsReply } from "../chat-router.js";
 import { sayForChat,
   agentAlreadySpokeThisTurn,
   getSessionForChat,
@@ -369,6 +369,11 @@ async function main(): Promise<void> {
           // one-shot reply-capture window on its chat's binding.
           setExpectsReply: async (chatId: string, expects: boolean) => {
             await setCompanionExpectsReply(runtime.db!, chatId, expects);
+          },
+          // The per-person conversation window: any delivered companion send
+          // renews it, so the member it is talking with can keep going unnamed.
+          renewConversation: async (chatId: string) => {
+            await renewCompanionConversation(runtime.db!, chatId);
           },
         }
       : {}),

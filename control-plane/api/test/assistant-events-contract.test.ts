@@ -384,6 +384,11 @@ describe("classifyTrigger records the gate, it does not re-decide it", () => {
     assert.equal(classifyTrigger({ ...base, isReplyToAssistant: true, text: "@Kinerary_bot" }), "reply_to_bot");
     assert.equal(classifyTrigger({ ...base, text: "@kinerary_bot what's on today" }), "mention");
     assert.equal(classifyTrigger({ ...base, text: "ליב, מה התוכנית?" }), "name");
+    assert.equal(classifyTrigger({ ...base, text: "nothing here", capturedByConversation: true }), "conversation_window",
+      "admitted only by the per-person conversation window");
+    assert.equal(classifyTrigger({ ...base, text: "Liv, hi", capturedByConversation: true }), "name",
+      "a named message is a name even if the window is also open");
+    assert.equal(classifyTrigger({ ...base, chatType: "dm", capturedByConversation: true }), "dm");
     assert.equal(classifyTrigger({ ...base, text: "nothing here" }), "unclassified",
       "addressed for a reason this cannot name: said so, not guessed");
   });
