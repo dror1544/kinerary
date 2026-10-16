@@ -81,6 +81,21 @@ export function extractGroupBindingToken(text: string | null | undefined): strin
   return match ? `KIN-${match[1]!.toUpperCase()}` : null;
 }
 
+/**
+ * The binding token a `/start` payload IS, canonicalised, or null.
+ *
+ * For the one-tap add link (`?startgroup=<token>`): Telegram adds the bot to
+ * the chosen group and posts `/start@<bot> <token>` there, from the person who
+ * added it. The payload has to be EXACTLY a token — not a longer string that
+ * happens to contain one — so that nothing but a payload we issued reaches the
+ * redemption path. `extractGroupBindingToken` is looser on purpose (people
+ * paste a token amid words); a deep-link payload is machine-made and is not.
+ */
+export function groupBindingTokenFromStartPayload(payload: string | null | undefined): string | null {
+  const token = extractGroupBindingToken(payload);
+  return token !== null && token.toUpperCase() === (payload ?? "").trim().toUpperCase() ? token : null;
+}
+
 export type GroupBindingIssueResult =
   | { ok: true; token: string; expiresAt: Date }
   | { ok: false; reason: "TRIP_NOT_FOUND" };
@@ -319,6 +334,10 @@ export async function redeemGroupBindingToken(
       }
     }
 
+    // The token is NOT consumed here, on purpose. Owner decision 2026-10-16:
+    // one trip may bind several groups; the token stays reusable until
+    // expiry, re-issue (`/group`) or revoke (teardown). Its protection is the
+    // sender check above, not single use.
     await client.query(
       `UPDATE control_plane.telegram_group_binding_tokens
           SET last_used_at = now(), use_count = use_count + 1

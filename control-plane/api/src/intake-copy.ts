@@ -675,6 +675,11 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // In a group the answer would list trips the rest of the room has no claim
     // to — including, on a shared bot, another family's.
     tripsInGroup: "I can only show your trips in our private chat.",
+    // The bot was just added to a group no trip is bound to. Owner's wording
+    // (2026-10-16). It is what the one-tap add link meets first: Telegram
+    // posts the binding key a moment AFTER the join, so this must not say
+    // "open the link from your signup".
+    joinedUnbound: "Happy to join your group, but I need the trip joining key to be helpful.",
     switchDone: "This chat is now on",
     switchUnchanged: "This chat is already on",
     // Bound, but nothing is behind it yet. Said at the moment of switching so
@@ -904,6 +909,9 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     tripsFooter: "בחרו אחד כדי לחבר אליו את הצ׳אט הזה.",
     tripsEmpty: "אין לי עדיין טיולים המשויכים לצ׳אט הזה. פתחו את הקישור מההרשמה ל‑Kinerary ונקים אחד יחד.",
     tripsInGroup: "אני יכול להראות את הטיולים שלך רק בצ׳אט הפרטי בינינו.",
+    // Owner's wording, masculine like the strings around it: no trip is known
+    // for this chat, so there is no stated bot_gender to honour.
+    joinedUnbound: "שמח להצטרף לקבוצה, אבל אני צריך את מפתח ההצטרפות לטיול כדי לעזור.",
     switchDone: "הצ׳אט הזה מחובר עכשיו אל",
     switchUnchanged: "הצ׳אט הזה כבר מחובר אל",
     switchNoCompanion: "האתר מוכן — אני עדיין מסיים את העוזר של הטיול הזה, אז תנו לי רגע לפני שתשאלו אותי עליו.",

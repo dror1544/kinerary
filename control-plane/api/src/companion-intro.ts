@@ -46,7 +46,11 @@ export interface CompanionIntroFacts {
   loginUsernames?: readonly { name: string; username: string }[] | null;
   /** The shared bot's @username, for the add-to-group link. */
   botUsername?: string | null;
-  /** Payload for the add-to-group deep link — the trip slug. */
+  /**
+   * Payload for the add-to-group deep link when NO binding token was issued —
+   * the trip slug. With a token the link carries the token instead, so that
+   * tapping it binds the group by itself.
+   */
   tripSlug?: string | null;
   organizerName?: string | null;
   proactive?: ProactiveSettings | null;
@@ -220,7 +224,13 @@ export function organizerIntroText(facts: CompanionIntroFacts): string {
 function organizerIntroMarked(facts: CompanionIntroFacts): string {
   const he = facts.language === "he";
   const title = facts.tripTitle?.trim() || null;
-  const addUrl = groupAddUrl(facts.botUsername, facts.tripSlug ?? "");
+  // The link's payload is the group-binding token whenever one was issued: then
+  // the link BINDS (Telegram posts `/start@bot <token>` in the chosen group,
+  // from the organizer, and the relay redeems it). The trip slug was the
+  // payload before and nothing consumed it; it stays only as the no-token
+  // fallback so that case is unchanged.
+  const addUrl = groupAddUrl(facts.botUsername, facts.groupBindingToken ?? facts.tripSlug ?? "");
+  const oneTap = Boolean(addUrl && facts.groupBindingToken);
   const schedule = scheduleLines(facts.proactive, facts.language);
   const parts: string[] = [];
 
@@ -240,7 +250,18 @@ function organizerIntroMarked(facts: CompanionIntroFacts): string {
     if (schedule.length) {
       parts.push("", `אשלח מיוזמתי: ${listJoin(schedule, "he")}.`);
     }
-    if (addUrl || facts.groupBindingToken) {
+    if (oneTap) {
+      parts.push(
+        "",
+        "כדי שאהיה גם בקבוצה המשפחתית או קבוצת הטיול — מספיק קישור אחד:",
+        `1. לוחצים על הקישור: ${addUrl}`,
+        "   טלגרם יאפשר לבחור קבוצה קיימת (או לפתוח קבוצה חדשה קודם) ולהוסיף אותי אליה.",
+        "2. כשטלגרם שואל אילו הרשאות לתת לי — הופכים אותי למנהל ומשאירים דלוקה הרשאת \"הצמדת הודעות\" (Pin messages) — זה מה שנותן לי להצמיד את הודעת הפתיחה, כדי שכולם ימצאו בקלות את האתר והפרטים החשובים. אין צורך להדליק שום הרשאה אחרת.",
+        "3. זהו. אני אתחבר לקבוצה בעצמי ואציג את עצמי שם — אין מה להדביק.",
+        "",
+        `הקישור לא עובד, או שאני כבר בקבוצה? מוסיפים אותי ידנית (@${facts.botUsername}), הופכים אותי למנהל, ואז בקבוצה עצמה — לא כאן — מעתיקים את השורה המלאה מההודעה הבאה שלי ומדביקים אותה שם. שלחתם אותה מוקדם מדי? משלימים את ההוספה וההרשאה ומדביקים שוב.`,
+      );
+    } else if (addUrl || facts.groupBindingToken) {
       parts.push("", "כדי שאהיה גם בקבוצה המשפחתית או קבוצת הטיול:");
       if (facts.botUsername) {
         parts.push(
@@ -281,7 +302,18 @@ function organizerIntroMarked(facts: CompanionIntroFacts): string {
   if (schedule.length) {
     parts.push("", `I'll send you ${listJoin(schedule, "en")} without being asked.`);
   }
-  if (addUrl || facts.groupBindingToken) {
+  if (oneTap) {
+    parts.push(
+      "",
+      "To bring me into the family or trip group — one link is all it takes:",
+      `1. Tap this link: ${addUrl}`,
+      "   Telegram lets you pick the group (an existing one, or make a new one first) and add me to it.",
+      "2. When Telegram asks which rights to give me, make me an admin and keep the \"Pin messages\" permission on — that's what lets me pin the welcome message, so everyone can find the site and the essentials at a glance. Nothing else needs to be switched on.",
+      "3. That's it. I'll connect to the group on my own and say hello there — nothing to paste.",
+      "",
+      `Link doesn't work, or I'm already in the group? Add @${facts.botUsername} yourself, make me an admin, then, in that group — not here — copy the whole line from my next message and paste it in. Sent it too early? Finish adding me and the permission, then paste it again.`,
+    );
+  } else if (addUrl || facts.groupBindingToken) {
     parts.push("", "To bring me into the family or trip group:");
     if (facts.botUsername) {
       parts.push(

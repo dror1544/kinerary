@@ -451,7 +451,11 @@ test("the greeting reaches Telegram's sendMessage as HTML with the password and 
         : `Log in with your username and the password <code>${GENERATED_PASSWORD}</code> (it's also in a separate message below, to copy):`;
       assert.ok(text.includes(`${loginLine}\n• Ella — <code>ella</code>\n• Tali — <code>tali</code>`), text);
       // The query-string ampersand is escaped, and no other tag exists.
-      assert.match(text, /startgroup=japan-2026&amp;admin=pin_messages\+invite_users/);
+      // The link's payload is the binding token itself (the same one in the
+      // line posted next), not the trip slug.
+      const linkToken = /startgroup=(KIN-[A-HJ-NP-Z2-9]{8})&amp;admin=pin_messages\+invite_users/.exec(text)?.[1];
+      assert.ok(linkToken, text);
+      assert.equal(String(posted[1]!.body.text), `/group ${linkToken}`);
       assert.deepEqual(
         [...new Set([...text.matchAll(/<\/?([a-zA-Z]+)/g)].map((m) => m[1]))],
         ["code"],
@@ -468,5 +472,100 @@ test("the greeting reaches Telegram's sendMessage as HTML with the password and 
       mock.restoreAll();
       await pool.end();
     }
+  }
+});
+
+// The add-to-group link needs the bot's @username. A deployment profile that
+// omits `web.telegram_bot_username` used to drop the link with nothing in any
+// log (owner's Mac staging greeting, 2026-10-16: step 1 just said "add me to
+// the group"). The handle is now derived from the bot token when the profile
+// does not carry it, and a greeting that still goes out without one says so.
+async function companionReadyFixture(pool: pg.Pool): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await resetDb(client);
+    await applyMigrations(client, migrationsDir);
+  } finally {
+    client.release();
+  }
+  const tripId = await insertTrip(pool);
+  await insertOutboxRow(pool, tripId, "companion_ready", "555000111", {
+    private_url: "https://example.test/trip",
+    assistant_name: "Rio",
+    trip_title: "Japan 2026",
+    trip_slug: "japan-2026",
+    language: "en",
+  });
+}
+
+test("no configured handle: the link is built from the handle the resolver derives", { skip }, async () => {
+  const pool = testPool();
+  try {
+    await companionReadyFixture(pool);
+    const sent: Array<{ text: string }> = [];
+    let asked = 0;
+    await dispatchPendingTripNotifications(pool, {
+      async sendApprovalRequest() {},
+      async sendMessage(p) { sent.push(p); },
+    }, () => {}, { resolveBotUsername: async () => { asked += 1; return "Derived_bot"; } });
+    assert.equal(asked, 1);
+    assert.match(sent[0]!.text, /https:\/\/t\.me\/Derived_bot\?startgroup=KIN-[A-HJ-NP-Z2-9]{8}&/);
+  } finally {
+    await pool.end();
+  }
+});
+
+test("a configured handle wins and the resolver is never asked", { skip }, async () => {
+  const pool = testPool();
+  try {
+    await companionReadyFixture(pool);
+    const sent: Array<{ text: string }> = [];
+    let asked = 0;
+    await dispatchPendingTripNotifications(pool, {
+      async sendApprovalRequest() {},
+      async sendMessage(p) { sent.push(p); },
+    }, () => {}, { botUsername: "Kinerary_bot", resolveBotUsername: async () => { asked += 1; return "Other_bot"; } });
+    assert.equal(asked, 0);
+    assert.match(sent[0]!.text, /t\.me\/Kinerary_bot\?startgroup=/);
+  } finally {
+    await pool.end();
+  }
+});
+
+test("no handle anywhere: the greeting still goes out, and the missing link is logged, not silent", { skip }, async () => {
+  const pool = testPool();
+  try {
+    await companionReadyFixture(pool);
+    const sent: Array<{ text: string }> = [];
+    const lines: string[] = [];
+    await dispatchPendingTripNotifications(pool, {
+      async sendApprovalRequest() {},
+      async sendMessage(p) { sent.push(p); },
+    }, (line) => lines.push(line), { resolveBotUsername: async () => null });
+    assert.match(sent[0]!.text, /Rio/);
+    assert.doesNotMatch(sent[0]!.text, /t\.me/);
+    assert.ok(
+      lines.some((l) => l.includes("outbox.bot_username_unavailable") && l.includes('"level":"warn"')),
+      lines.join("\n"),
+    );
+  } finally {
+    await pool.end();
+  }
+});
+
+test("a resolver that throws is the same as no handle: logged, and the greeting is not lost", { skip }, async () => {
+  const pool = testPool();
+  try {
+    await companionReadyFixture(pool);
+    const sent: Array<{ text: string }> = [];
+    const lines: string[] = [];
+    await dispatchPendingTripNotifications(pool, {
+      async sendApprovalRequest() {},
+      async sendMessage(p) { sent.push(p); },
+    }, (line) => lines.push(line), { resolveBotUsername: async () => { throw new Error("getMe 502"); } });
+    assert.equal(sent.length >= 1, true);
+    assert.ok(lines.some((l) => l.includes("outbox.bot_username_unavailable")), lines.join("\n"));
+  } finally {
+    await pool.end();
   }
 });

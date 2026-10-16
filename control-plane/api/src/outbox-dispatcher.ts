@@ -150,6 +150,12 @@ export interface DispatchOptions {
    * that paragraph.
    */
   botUsername?: string | null;
+  /**
+   * Asked for the handle when `botUsername` is absent (see `bot-username.ts`):
+   * a profile without `web.telegram_bot_username` must not silently lose the
+   * add-to-group link. A null or a throw is logged, never swallowed quietly.
+   */
+  resolveBotUsername?: () => Promise<string | null>;
   /** How long an issued group-binding token stays valid. Defaults to 30 days. */
   groupBindingTtlSeconds?: number;
   /**
@@ -206,7 +212,27 @@ export async function dispatchPendingTripNotifications(
         }));
       }
     }
-    const text = messageTextFor(row, { ...options, groupBindingToken });
+    // The add-to-group link needs the bot's handle. Only the companion
+    // introduction carries that link, so only it asks — and when no handle can
+    // be had the introduction still goes (the manual /group line still works),
+    // but the missing link is said out loud: it used to vanish without a trace.
+    let botUsername = options?.botUsername ?? null;
+    if (!botUsername && row.notification_type === "companion_ready" && options?.resolveBotUsername) {
+      try {
+        botUsername = await options.resolveBotUsername();
+      } catch (error) {
+        log(structuredLog("warn", "outbox.bot_username_resolver_threw", {
+          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        }));
+      }
+    }
+    if (!botUsername && row.notification_type === "companion_ready") {
+      log(structuredLog("warn", "outbox.bot_username_unavailable", {
+        notification_id: row.id,
+        effect: "introduction sent without the one-tap add-to-group link",
+      }));
+    }
+    const text = messageTextFor(row, { ...options, botUsername, groupBindingToken });
     if (!row.recipient || !text || (Array.isArray(text) && text.length === 0)) {
       await db.query(
         "UPDATE control_plane.notification_outbox SET state = 'skipped', updated_at = now() WHERE id = $1 AND state = 'pending'",

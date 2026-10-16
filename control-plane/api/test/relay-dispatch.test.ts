@@ -947,6 +947,202 @@ describe("the companion arriving in a group", { skip: SKIP }, () => {
     });
   });
 
+  describe("the one-tap add link: /start@bot <token> posted in the group by Telegram", () => {
+    // Telegram, on `?startgroup=<payload>`, adds the bot and then posts
+    // `/start@<bot> <payload>` in that group, from the person who added it.
+    const BOT = { id: "8463178587", username: "Kinerary_bot" };
+    const startInGroup = (chatId: string, payload: string, fromId = 777, chatType = "supergroup") => ({
+      update_id: 95,
+      message: {
+        message_id: 9,
+        chat: { id: chatId, type: chatType },
+        from: { id: fromId, is_bot: false, first_name: "Dror" },
+        text: payload === "" ? "/start@Kinerary_bot" : `/start@Kinerary_bot ${payload}`,
+      },
+    }) as never;
+
+    async function withIntro(fix: Fixture): Promise<void> {
+      await fix.pool.query(
+        `UPDATE control_plane.trips SET companion_intro = $2::jsonb WHERE id = $1`,
+        [fix.tripId, JSON.stringify({
+          assistant_name: "Rio", trip_title: "Japan 2026", private_url: "https://japan-2026.example",
+          language: "en", login_password: "seed-pw",
+        })],
+      );
+    }
+    const bindingsFor = async (fix: Fixture, chatId: string) => (await fix.pool.query(
+      "SELECT trip_id FROM control_plane.telegram_chat_bindings WHERE chat_id = $1 AND closed_at IS NULL",
+      [chatId],
+    )).rows;
+
+    test("binds the group and greets it, exactly like /group <token> from the same sender", async () => {
+      await withFixture(async (fix) => {
+        await withIntro(fix);
+        const issued = await issueGroupBindingToken(fix.pool, fix.tripId, "777", { ttlSeconds: 3600 });
+        assert.equal(issued.ok, true);
+        if (!issued.ok) return;
+
+        const viaStart = await dispatchUpdate(
+          fix.pool, startInGroup("-1002000501", issued.token), undefined, undefined, BOT,
+        );
+        assert.equal(viaStart.kind, "group_intro");
+        if (viaStart.kind !== "group_intro") return;
+        assert.equal(viaStart.chatId, "-1002000501");
+        assert.match(viaStart.text, /Rio/);
+        assert.deepEqual((await bindingsFor(fix, "-1002000501")).map((r) => r.trip_id), [fix.tripId]);
+
+        // The decision is the one the /group path makes for the same token.
+        const viaGroup = await dispatchUpdate(
+          fix.pool,
+          { update_id: 96, message: { message_id: 10, chat: { id: "-1002000502", type: "supergroup" },
+            from: { id: 777, is_bot: false, first_name: "Dror" }, text: `/group ${issued.token}` } } as never,
+          undefined, undefined, BOT,
+        );
+        assert.equal(viaGroup.kind, "group_intro");
+        if (viaGroup.kind !== "group_intro") return;
+        assert.equal(viaStart.text, viaGroup.text);
+        assert.equal(viaStart.pin, viaGroup.pin);
+      });
+    });
+
+    test("a lowercase payload (phone keyboards) binds too", async () => {
+      await withFixture(async (fix) => {
+        await withIntro(fix);
+        const issued = await issueGroupBindingToken(fix.pool, fix.tripId, "777", { ttlSeconds: 3600 });
+        if (!issued.ok) throw new Error("issue failed");
+        const d = await dispatchUpdate(
+          fix.pool, startInGroup("-1002000503", issued.token.toLowerCase()), undefined, undefined, BOT,
+        );
+        assert.equal(d.kind, "group_intro");
+        assert.equal((await bindingsFor(fix, "-1002000503")).length, 1);
+      });
+    });
+
+    test("a different person's tap (someone the token was not issued to) binds nothing and gets the flat refusal", async () => {
+      await withFixture(async (fix) => {
+        await withIntro(fix);
+        const issued = await issueGroupBindingToken(fix.pool, fix.tripId, "777", { ttlSeconds: 3600 });
+        if (!issued.ok) throw new Error("issue failed");
+        const d = await dispatchUpdate(
+          fix.pool, startInGroup("-1002000504", issued.token, 4242), undefined, undefined, BOT,
+        );
+        assert.equal(d.kind === "reply" && d.reply.text, DEFAULT_STRINGS.groupTokenRefused);
+        assert.equal((await bindingsFor(fix, "-1002000504")).length, 0);
+      });
+    });
+
+    test("an expired token, an unknown token and a retired trip's token are all refused with the same sentence", async () => {
+      await withFixture(async (fix) => {
+        await withIntro(fix);
+        const issued = await issueGroupBindingToken(fix.pool, fix.tripId, "777", { ttlSeconds: 3600 });
+        if (!issued.ok) throw new Error("issue failed");
+        await fix.pool.query(
+          `UPDATE control_plane.telegram_group_binding_tokens
+              SET created_at = now() - interval '2 hours', expires_at = now() - interval '1 hour'
+            WHERE trip_id = $1`,
+          [fix.tripId],
+        );
+        const expired = await dispatchUpdate(
+          fix.pool, startInGroup("-1002000505", issued.token), undefined, undefined, BOT,
+        );
+        const unknown = await dispatchUpdate(
+          fix.pool, startInGroup("-1002000506", "KIN-ZZZZZZZZ"), undefined, undefined, BOT,
+        );
+        // A live token whose trip has since been retired by teardown.
+        const fresh = await issueGroupBindingToken(fix.pool, fix.tripId, "777", { ttlSeconds: 3600 });
+        if (!fresh.ok) throw new Error("issue failed");
+        await fix.pool.query(
+          "UPDATE control_plane.trips SET slug = 'retired-' || slug || '-20261016' WHERE id = $1", [fix.tripId],
+        );
+        const retired = await dispatchUpdate(
+          fix.pool, startInGroup("-1002000510", fresh.token), undefined, undefined, BOT,
+        );
+        for (const d of [expired, unknown, retired]) {
+          assert.equal(d.kind === "reply" && d.reply.text, DEFAULT_STRINGS.groupTokenRefused);
+        }
+        for (const id of ["-1002000505", "-1002000506", "-1002000510"]) {
+          assert.equal((await bindingsFor(fix, id)).length, 0);
+        }
+      });
+    });
+
+    test("a group already bound to a DIFFERENT trip is refused: a link is not authority over someone else's binding", async () => {
+      await withFixture(async (fix) => {
+        await withIntro(fix);
+        const otherTrip = testId("trip");
+        await fix.pool.query(
+          "INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ($1, $2, 'draft')",
+          [otherTrip, otherTrip.replace(/_/g, "-")],
+        );
+        await fix.pool.query(
+          "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), '-1002000507', $1, 'other')",
+          [otherTrip],
+        );
+        const issued = await issueGroupBindingToken(fix.pool, fix.tripId, "777", { ttlSeconds: 3600 });
+        if (!issued.ok) throw new Error("issue failed");
+        const d = await dispatchUpdate(
+          fix.pool, startInGroup("-1002000507", issued.token), undefined, undefined, BOT,
+        );
+        assert.equal(d.kind === "reply" && d.reply.text, DEFAULT_STRINGS.groupTokenRefused);
+        assert.deepEqual((await bindingsFor(fix, "-1002000507")).map((r) => r.trip_id), [otherTrip]);
+      });
+    });
+
+    test("the same link tapped again is the supported re-bind: it greets again, nothing is duplicated", async () => {
+      await withFixture(async (fix) => {
+        await withIntro(fix);
+        const issued = await issueGroupBindingToken(fix.pool, fix.tripId, "777", { ttlSeconds: 3600 });
+        if (!issued.ok) throw new Error("issue failed");
+        for (let i = 0; i < 2; i += 1) {
+          const d = await dispatchUpdate(
+            fix.pool, startInGroup("-1002000508", issued.token), undefined, undefined, BOT,
+          );
+          assert.equal(d.kind, "group_intro");
+        }
+        assert.equal((await bindingsFor(fix, "-1002000508")).length, 1);
+      });
+    });
+
+    test("a /start payload in a group that is NOT a binding token is unchanged: the old answer, nothing bound", async () => {
+      // `?startgroup=<slug>` was the payload before; nothing consumed it. In a
+      // group it was answered with "do this in a private chat" — and still is.
+      await withFixture(async (fix) => {
+        for (const payload of ["japan-2026", "KIN-ZZZZZZZ", "KIN-ZZZZZZZZZ", "x".repeat(43), ""]) {
+          const d = await dispatchUpdate(
+            fix.pool, startInGroup("-1002000509", payload), undefined, undefined, BOT,
+          );
+          assert.equal(d.kind, "reply", payload);
+          assert.notEqual(d.kind === "reply" && d.reply.text, DEFAULT_STRINGS.groupTokenRefused);
+        }
+        assert.equal((await bindingsFor(fix, "-1002000509")).length, 0);
+      });
+    });
+
+    test("PRIVATE chat /start <token> is still onboarding, never a group binding", async () => {
+      await withFixture(async (fix) => {
+        await withIntro(fix);
+        const issued = await issueGroupBindingToken(fix.pool, fix.tripId, "777", { ttlSeconds: 3600 });
+        if (!issued.ok) throw new Error("issue failed");
+        const dm = "700000777";
+        const d = await dispatchUpdate(
+          fix.pool,
+          { update_id: 97, message: { message_id: 11, chat: { id: dm, type: "private" },
+            from: { id: 777, is_bot: false, first_name: "Dror" }, text: `/start ${issued.token}` } } as never,
+          undefined, undefined, BOT,
+        );
+        // The enrollment path owns it: an unrecognised payload there is a bad
+        // link. It is not redeemed, and the DM is not bound.
+        assert.equal(d.kind, "reply");
+        assert.equal(d.kind === "reply" && d.reply.text, DEFAULT_STRINGS.badLink);
+        assert.equal((await bindingsFor(fix, dm)).length, 0);
+        const live = await fix.pool.query(
+          "SELECT use_count FROM control_plane.telegram_group_binding_tokens WHERE trip_id = $1", [fix.tripId],
+        );
+        assert.equal(live.rows[0].use_count, 0, "not redeemed");
+      });
+    });
+  });
+
   test("the password can be withheld from the group by one option", async () => {
     await withFixture(async (fix) => {
       const chatId = "-1002000888";
@@ -981,6 +1177,54 @@ describe("the companion arriving in a group", { skip: SKIP }, () => {
         fix.pool, joinUpdate("-1002000999"), undefined, undefined, { id: "8463178587" },
       );
       assert.equal(decision.kind, "reply");
+    });
+  });
+
+  test("joining a group that is not bound yet asks for the trip joining key, in the adder's language (owner's wording, 2026-10-16)", async () => {
+    // The one-tap link adds the bot, THEN Telegram posts `/start@bot <token>`.
+    // The join arrives first, so what it says must not contradict the binding
+    // that follows ("open the link from your signup" would).
+    await withFixture(async (fix) => {
+      const en = await dispatchUpdate(
+        fix.pool, joinUpdate("-1002000998"), undefined, undefined, { id: "8463178587" },
+      );
+      assert.equal(
+        en.kind === "reply" && en.reply.text,
+        "Happy to join your group, but I need the trip joining key to be helpful.",
+      );
+      const he = await dispatchUpdate(
+        fix.pool,
+        { ...(joinUpdate("-1002000997") as object), my_chat_member: {
+          ...(joinUpdate("-1002000997") as { my_chat_member: object }).my_chat_member,
+          from: { id: 77, is_bot: false, first_name: "דרור", language_code: "he" },
+        } } as never,
+        undefined, undefined, { id: "8463178587" },
+      );
+      assert.equal(
+        he.kind === "reply" && he.reply.text,
+        "שמח להצטרף לקבוצה, אבל אני צריך את מפתח ההצטרפות לטיול כדי לעזור.",
+      );
+      // And the key that follows binds and greets, as before.
+      await fix.pool.query(
+        `UPDATE control_plane.trips SET companion_intro = $2::jsonb WHERE id = $1`,
+        [fix.tripId, JSON.stringify({ assistant_name: "Rio", language: "en", private_url: "https://x.example" })],
+      );
+      const issued = await issueGroupBindingToken(fix.pool, fix.tripId, "77", { ttlSeconds: 3600 });
+      if (!issued.ok) throw new Error("issue failed");
+      const bound = await dispatchUpdate(
+        fix.pool,
+        { update_id: 98, message: { message_id: 12, chat: { id: "-1002000998", type: "supergroup" },
+          from: { id: 77, is_bot: false, first_name: "Dror" }, text: `/start@Kinerary_bot ${issued.token}` } } as never,
+        undefined, undefined, { id: "8463178587", username: "Kinerary_bot" },
+      );
+      assert.equal(bound.kind, "group_intro");
+    });
+  });
+
+  test("ordinary messages in an unbound chat keep the old 'no trip for this chat' text; only the join changed", async () => {
+    await withFixture(async (fix) => {
+      const decision = await dispatchUpdate(fix.pool, msg("-1002000996", "/name Rio", "supergroup"));
+      assert.equal(decision.kind === "reply" && decision.reply.text, DEFAULT_STRINGS.unbound);
     });
   });
 
