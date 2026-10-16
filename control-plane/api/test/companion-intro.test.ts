@@ -32,14 +32,14 @@ describe("the login the introduction hands over", () => {
   // there was nothing to pick from and nothing to type.
   test("names the username beside the password", () => {
     const text = organizerIntroText({ ...BASE, loginUsernames: TRAVELLERS });
-    assert.match(text, /Log in with your username and the password trip-seed-pw:/);
+    assert.match(text, /Log in with your username and the password trip-seed-pw \(it's also in a separate message below, to copy\):/);
     assert.match(text, /• רון מרגולין — ronmargolin/);
     assert.match(text, /• טלי — tali/);
   });
 
   test("in Hebrew too", () => {
     const text = organizerIntroText({ ...BASE, language: "he", loginUsernames: TRAVELLERS });
-    assert.match(text, /שם המשתמש שלכם והסיסמה trip-seed-pw:/);
+    assert.match(text, /שם המשתמש שלכם והסיסמה trip-seed-pw \(היא גם מופיעה בהודעה נפרדת למטה, להעתקה\):/);
     assert.match(text, /• טלי — tali/);
   });
 
@@ -319,8 +319,9 @@ describe("the group-binding token in the organizer's message", () => {
     // that simply does not work with nothing to explain why. One long-press,
     // one Copy.
     const messages = organizerIntroMessages(WITH_TOKEN).map((m) => m.text);
-    assert.equal(messages.length, 2);
-    assert.equal(messages[1], "/group KIN-ABCD2345");
+    assert.equal(messages.length, 3, "introduction, binding line, password on its own");
+    assert.equal(messages[1], "/group KIN-ABCD2345", "the binding line is immediately after the introduction");
+    assert.equal(messages[2], "trip-seed-pw", "the password message is last");
     // The token appears in the introduction ONLY inside the one-tap link's
     // payload; no loose copy of it sits in the prose.
     assert.equal(messages[0]!.split("KIN-ABCD2345").length - 1, 1, "once, in the link");
@@ -349,9 +350,10 @@ describe("the group-binding token in the organizer's message", () => {
     assert.match(text, /again/i);
   });
 
-  test("with no token issued, there is one message and no invented step", () => {
+  test("with no token issued, there is no invented step (the introduction, then the password alone)", () => {
     const messages = organizerIntroMessages({ ...BASE, tripSlug: "japan-2026" });
-    assert.equal(messages.length, 1);
+    assert.equal(messages.length, 2);
+    assert.equal(messages[1]!.text, "trip-seed-pw");
     const text = messages[0]!.text;
     assert.doesNotMatch(text, /KIN-/);
     // The add-link half still stands on its own.
@@ -419,7 +421,7 @@ describe("copyable login: password and usernames as code spans", () => {
   test("English: the introduction is HTML, with the password and each username in <code>", () => {
     const [intro] = organizerIntroMessages(FACTS);
     assert.equal(intro!.parseMode, "HTML");
-    assert.match(intro!.text, new RegExp(`the password <code>${PW}</code>:`));
+    assert.match(intro!.text, new RegExp(`the password <code>${PW}</code> \\(it's also in a separate message below, to copy\\):`));
     assert.match(intro!.text, /• Ella — <code>ella<\/code>/);
     assert.match(intro!.text, /• Tali — <code>tali<\/code>/);
   });
@@ -427,21 +429,62 @@ describe("copyable login: password and usernames as code spans", () => {
   test("Hebrew: same spans, same sentence", () => {
     const [intro] = organizerIntroMessages({ ...FACTS, language: "he" });
     assert.equal(intro!.parseMode, "HTML");
-    assert.match(intro!.text, new RegExp(`והסיסמה <code>${PW}</code>:`));
+    assert.match(intro!.text, new RegExp(`והסיסמה <code>${PW}</code> \\(היא גם מופיעה בהודעה נפרדת למטה, להעתקה\\):`));
     assert.match(intro!.text, /• Ella — <code>ella<\/code>/);
   });
 
   test("the no-usernames fallback sentence also carries the password in a code span", () => {
     const [intro] = organizerIntroMessages({ ...FACTS, loginUsernames: [] });
-    assert.match(intro!.text, new RegExp(`the password: <code>${PW}</code>`));
+    assert.match(intro!.text, new RegExp(`the password: <code>${PW}</code> \\(it's also in a separate message below, to copy\\)`));
   });
 
-  test("there is NO separate password message: the owner chose tap-to-copy in the greeting", () => {
+  test("the password is ALSO its own last message: exactly the password, plain text", () => {
+    // The owner's client does not copy a code span on tap; long-press -> Copy on
+    // a message that is only the password copies exactly it (2026-10-16).
     const messages = organizerIntroMessages(FACTS);
-    assert.equal(messages.length, 2, "introduction + binding line only");
+    assert.equal(messages.length, 3, "introduction, binding line, password");
     assert.equal(messages[1]!.text, "/group KIN-ABCD2345");
     assert.equal(messages[1]!.parseMode, undefined, "the binding line stays plain text");
-    assert.ok(!messages.slice(1).some((m) => m.text.includes(PW)), "the password is not repeated");
+    assert.equal(messages[2]!.text, PW, "no label, no punctuation, no spaces");
+    assert.equal(messages[2]!.parseMode, undefined, "no parse mode");
+    assert.equal(messages[2]!.plainText, undefined, "nothing to fall back from");
+    assert.ok(!messages[1]!.text.includes(PW), "the binding line does not carry it");
+  });
+
+  test("order with a token: introduction, /group line, password; without: introduction, password", () => {
+    const withToken = organizerIntroMessages(FACTS).map((m) => m.text);
+    assert.match(withToken[0]!, /next message/i);
+    assert.match(withToken[1]!, /^\/group KIN-/);
+    assert.equal(withToken[2], PW);
+    const noToken = organizerIntroMessages({ ...FACTS, groupBindingToken: null }).map((m) => m.text);
+    assert.equal(noToken.length, 2);
+    assert.equal(noToken[1], PW);
+  });
+
+  test("no password: no password message and no pointer to one", () => {
+    for (const language of ["en", "he"] as const) {
+      const withToken = organizerIntroMessages({ ...FACTS, loginPassword: null, language });
+      assert.equal(withToken.length, 2, "introduction + binding line only");
+      assert.match(withToken[1]!.text, /^\/group KIN-/);
+      assert.doesNotMatch(withToken[0]!.text, /separate message|הודעה נפרדת/);
+      const noToken = organizerIntroMessages({ ...FACTS, loginPassword: null, groupBindingToken: null, language });
+      assert.equal(noToken.length, 1);
+    }
+  });
+
+  test("the pointer to the separate message appears with a password, in both languages", () => {
+    const [en] = organizerIntroMessages(FACTS);
+    assert.match(en!.text, /also in a separate message below, to copy/);
+    const [he] = organizerIntroMessages({ ...FACTS, language: "he" });
+    assert.match(he!.text, /היא גם מופיעה בהודעה נפרדת למטה, להעתקה/);
+    // The code span stays in place.
+    assert.match(en!.text, new RegExp(`<code>${PW}</code>`));
+  });
+
+  test("the group's arrival message is unchanged: no pointer to a message that is never sent there", () => {
+    const text = groupIntroText({ ...FACTS, groupBindingToken: null }, { includePassword: true });
+    assert.doesNotMatch(text, /separate message|הודעה נפרדת/);
+    assert.match(text, new RegExp(`the password ${PW}:`));
   });
 
   test("no password: no code spans", () => {
@@ -465,10 +508,10 @@ describe("copyable login: password and usernames as code spans", () => {
     }
   });
 
-  test("Hebrew: the password sits mid-sentence between spaces, a colon straight after the span", () => {
+  test("Hebrew: the password sits mid-sentence between spaces, the pointer then the colon", () => {
     const [he] = organizerIntroMessages({ ...FACTS, language: "he" });
     assert.ok(
-      he!.text.includes(`הכניסה לאתר — שם המשתמש שלכם והסיסמה <code>${PW}</code>:\n• Ella — <code>ella</code>`),
+      he!.text.includes(`הכניסה לאתר — שם המשתמש שלכם והסיסמה <code>${PW}</code> (היא גם מופיעה בהודעה נפרדת למטה, להעתקה):\n• Ella — <code>ella</code>`),
       "exact line",
     );
   });
@@ -499,7 +542,7 @@ describe("copyable login: password and usernames as code spans", () => {
     const [intro] = organizerIntroMessages(FACTS);
     assert.ok(intro!.plainText);
     assert.doesNotMatch(intro!.plainText!, /<code>|&amp;|&lt;/);
-    assert.match(intro!.plainText!, new RegExp(`the password ${PW}:`));
+    assert.match(intro!.plainText!, new RegExp(`the password ${PW} \\(it's also in a separate message below, to copy\\):`));
     assert.match(intro!.plainText!, /• Ella — ella/);
     assert.match(intro!.plainText!, /startgroup=KIN-ABCD2345&admin=/);
   });
@@ -507,7 +550,7 @@ describe("copyable login: password and usernames as code spans", () => {
   test("the text-only entry point is still plain: no tags, no stray marker characters", () => {
     const text = organizerIntroText(FACTS);
     assert.doesNotMatch(text, /<code>|[\u0001\u0002]/);
-    assert.match(text, new RegExp(`the password ${PW}:`));
+    assert.match(text, new RegExp(`the password ${PW} \\(it's also in a separate message below, to copy\\):`));
   });
 
   test("the GROUP introduction is untouched: plain text, same wording, same include-password switch", () => {

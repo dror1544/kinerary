@@ -241,15 +241,17 @@ export async function dispatchPendingTripNotifications(
       continue;
     }
     try {
-      // A list when the introduction hands over a group-binding token: the
-      // token goes in its own message so it is one long-press and one Copy,
-      // rather than a drag-select across a paragraph on a phone. (The password
-      // is copied from its code span in the introduction itself.)
+      // A list when the introduction hands over a group-binding token and/or a
+      // password: each goes in its own message so it is one long-press and one
+      // Copy, rather than a drag-select across a paragraph on a phone (a
+      // `<code>` span in the introduction does not copy on tap on every client).
+      // Order: introduction, binding line, password.
       //
       // Sent in order, and the row is only marked sent once ALL of them are.
-      // A retry may therefore repeat the prose — which is the right trade:
-      // a duplicated paragraph is noise, while a token that never arrived is
-      // an organizer who cannot set up their group at all.
+      // A retry therefore repeats every part, the password message included —
+      // which is the right trade: a duplicated paragraph is noise, while a
+      // token or password that never arrived is an organizer who cannot set up
+      // their group or log in at all.
       for (const part of Array.isArray(text) ? text : [{ text } as IntroMessage]) {
         await notification.sendMessage({
           chatId: row.recipient,

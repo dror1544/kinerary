@@ -108,19 +108,25 @@ function renderHtml(marked: string): string {
  * nobody can guess it. An empty list falls back to the old wording, which is
  * what a trip with no seeded accounts still gets.
  */
-function loginLines(facts: CompanionIntroFacts): string[] {
+function loginLines(facts: CompanionIntroFacts, options: { ownMessage?: boolean } = {}): string[] {
   const he = facts.language === "he";
   if (!facts.loginPassword) return [he ? "הכניסה מהאתר עצמו." : "Log in from the site itself."];
+  // Only the organizer's setup message is followed by the password on its own
+  // (`organizerIntroMessages`); the group's arrival message is not, so it must
+  // not point at a message that never comes.
+  const pointer = options.ownMessage
+    ? (he ? " (היא גם מופיעה בהודעה נפרדת למטה, להעתקה)" : " (it's also in a separate message below, to copy)")
+    : "";
   const people = (facts.loginUsernames ?? []).filter((p) => p.username);
   if (people.length === 0) {
     return [he
-      ? `הכניסה עם השם שלכם והסיסמה: ${copyable(facts.loginPassword)}`
-      : `Log in with your name and the password: ${copyable(facts.loginPassword)}`];
+      ? `הכניסה עם השם שלכם והסיסמה: ${copyable(facts.loginPassword)}${pointer}`
+      : `Log in with your name and the password: ${copyable(facts.loginPassword)}${pointer}`];
   }
   return [
     he
-      ? `הכניסה לאתר — שם המשתמש שלכם והסיסמה ${copyable(facts.loginPassword)}:`
-      : `Log in with your username and the password ${copyable(facts.loginPassword)}:`,
+      ? `הכניסה לאתר — שם המשתמש שלכם והסיסמה ${copyable(facts.loginPassword)}${pointer}:`
+      : `Log in with your username and the password ${copyable(facts.loginPassword)}${pointer}:`,
     ...people.map((p) => `• ${p.name} — ${copyable(p.username)}`),
   ];
 }
@@ -240,7 +246,7 @@ function organizerIntroMarked(facts: CompanionIntroFacts): string {
       "",
       `האתר: ${facts.siteUrl}`,
     );
-    parts.push(...loginLines(facts));
+    parts.push(...loginLines(facts, { ownMessage: true }));
     if (schedule.length) {
       parts.push("", `אשלח מיוזמתי: ${listJoin(schedule, "he")}.`);
     }
@@ -292,7 +298,7 @@ function organizerIntroMarked(facts: CompanionIntroFacts): string {
     "",
     `The site: ${facts.siteUrl}`,
   );
-  parts.push(...loginLines(facts));
+  parts.push(...loginLines(facts, { ownMessage: true }));
   if (schedule.length) {
     parts.push("", `I'll send you ${listJoin(schedule, "en")} without being asked.`);
   }
@@ -536,15 +542,21 @@ export interface IntroMessage {
 /**
  * The organizer's introduction, as the messages to send in order: the
  * introduction itself (Telegram HTML, with the generated password and each
- * username as `<code>` spans, so a tap copies the span), then the group-binding
- * line when a token was issued.
+ * username as `<code>` spans), then the group-binding line when a token was
+ * issued, then — last, when a password is configured — the password on its own.
  *
- * A separate password-only message was built and dropped on the owner's
- * decision (2026-10-15: "tap to copy in the greeting is better"). The binding
- * line stays separate because it is a command to post, not a value to read.
+ * The password is in the introduction twice on purpose. A `<code>` span is
+ * accepted by Telegram (verified 2026-10-16) but tapping it does not copy on
+ * the owner's client; only whole-message copy works there. So the password is
+ * ALSO a message of its own — exactly the password, plain text, no label, no
+ * punctuation — and long-press, Copy, takes exactly it. (An earlier decision,
+ * 2026-10-15, dropped such a message in favour of tap-to-copy; superseded
+ * 2026-10-16.) The binding line is a command to post, so it stays separate too.
  *
  * Order is part of the contract: the dispatcher sends them one after another,
- * and the introduction points at "my next message".
+ * and the introduction points at "my next message" for the binding line, so
+ * that line must stay immediately after the introduction; the password goes
+ * last. Organizer chat only — `groupIntroText` never sends the password alone.
  */
 export function organizerIntroMessages(facts: CompanionIntroFacts): IntroMessage[] {
   const marked = organizerIntroMarked(facts);
@@ -552,6 +564,7 @@ export function organizerIntroMessages(facts: CompanionIntroFacts): IntroMessage
     { text: renderHtml(marked), parseMode: "HTML", plainText: renderPlain(marked) },
   ];
   if (facts.groupBindingToken) messages.push({ text: groupBindingCommand(facts.groupBindingToken) });
+  if (facts.loginPassword) messages.push({ text: facts.loginPassword });
   return messages;
 }
 
