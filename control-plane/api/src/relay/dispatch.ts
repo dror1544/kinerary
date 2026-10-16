@@ -58,6 +58,7 @@ import {
 import { getAssistantNames, parseAssistantNames, setAssistantNames } from "../assistant-names.js";
 import {
   extractGroupBindingToken,
+  groupBindingTokenFromStartPayload,
   groupBindingTokenIsOwn,
   issueGroupBindingToken,
   redeemGroupBindingToken,
@@ -536,7 +537,19 @@ export async function dispatchUpdate(
   const text = message.text ?? message.caption ?? "";
   const parsed = parseInbound(text);
 
-  if (parsed.kind === "start") {
+  // The one-tap add-to-group link. Telegram answers `?startgroup=<token>` by
+  // adding the bot to the group the organizer picked and then posting
+  // `/start@<bot> <token>` THERE, from the organizer. That is a group-binding
+  // redemption, not the onboarding `/start` below: it is claimed here, only in a
+  // non-private chat and only when the payload is exactly a binding token, and
+  // it falls through to the same redemption `/group <token>` goes through. A
+  // private `/start <anything>` never gets here (the enrollment path owns it),
+  // and a group `/start` with any other payload keeps its old answer.
+  const groupStartToken = parsed.kind === "start" && message.chat?.type !== "private"
+    ? groupBindingTokenFromStartPayload(parsed.payload)
+    : null;
+
+  if (parsed.kind === "start" && !groupStartToken) {
     const outcome = await startFromDeepLink(db, chatId, parsed.payload, log, message.from?.language_code);
     switch (outcome.kind) {
       case "started": {
@@ -629,7 +642,7 @@ export async function dispatchUpdate(
   // bot IS an admin (admins see every message). The instructions teach the
   // command, which is the form that always arrives.
   const postedToken = message.chat?.type !== "private"
-    ? extractGroupBindingToken(text)
+    ? groupStartToken ?? extractGroupBindingToken(text)
     : null;
   if (postedToken) {
     const senderId = message.from?.id === undefined ? null : String(message.from.id);

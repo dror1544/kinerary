@@ -72,6 +72,11 @@ describe("groupAddUrl", () => {
     assert.equal(url, "https://t.me/Kinerary_bot?startgroup=trip_abc&admin=pin_messages+invite_users");
   });
 
+  test("a binding token fits the payload alphabet and rides in the link unchanged", () => {
+    const url = groupAddUrl("Kinerary_bot", "KIN-ABCD2345");
+    assert.equal(url, "https://t.me/Kinerary_bot?startgroup=KIN-ABCD2345&admin=pin_messages+invite_users");
+  });
+
   test("without a bot username there is no link to give", () => {
     // Better to omit the line than to render a t.me/undefined.
     assert.equal(groupAddUrl(null, "trip_abc"), null);
@@ -316,7 +321,10 @@ describe("the group-binding token in the organizer's message", () => {
     const messages = organizerIntroMessages(WITH_TOKEN).map((m) => m.text);
     assert.equal(messages.length, 2);
     assert.equal(messages[1], "/group KIN-ABCD2345");
-    assert.doesNotMatch(messages[0]!, /KIN-ABCD2345/, "the prose does not repeat it");
+    // The token appears in the introduction ONLY inside the one-tap link's
+    // payload; no loose copy of it sits in the prose.
+    assert.equal(messages[0]!.split("KIN-ABCD2345").length - 1, 1, "once, in the link");
+    assert.match(messages[0]!, /startgroup=KIN-ABCD2345&amp;admin=/, "HTML-escaped ampersand");
     assert.match(messages[0]!, /next message/i, "and points at where it is");
   });
 
@@ -356,6 +364,34 @@ describe("the group-binding token in the organizer's message", () => {
     const messages = organizerIntroMessages({ ...WITH_TOKEN, botUsername: null }).map((m) => m.text);
     assert.doesNotMatch(messages[0]!, /t\.me/);
     assert.equal(messages[1], "/group KIN-ABCD2345");
+  });
+
+  test("the one link is the primary path: tap, pick the group, allow pinning, done", () => {
+    const text = organizerIntroText(WITH_TOKEN);
+    // The link binds by itself, so its payload is the group-binding token and
+    // NOT the trip slug.
+    assert.match(text, /https:\/\/t\.me\/Kinerary_bot\?startgroup=KIN-ABCD2345&admin=pin_messages\+invite_users/);
+    assert.doesNotMatch(text, /startgroup=japan-2026/);
+    assert.match(text, /1\. Tap this link/);
+    assert.match(text, /nothing to copy or paste/i);
+    // The manual line is the FALLBACK, and the copy says so.
+    assert.ok(text.indexOf("startgroup") < text.indexOf("next message"), "link first, manual line after");
+    assert.match(text, /doesn't work|already in the group/i);
+  });
+
+  test("Hebrew: the same one-link primary path, with the manual line as the fallback", () => {
+    const text = organizerIntroText({ ...WITH_TOKEN, assistantName: "ריו", language: "he" });
+    assert.match(text, /startgroup=KIN-ABCD2345&admin=/);
+    assert.doesNotMatch(text, /startgroup=japan-2026/);
+    assert.match(text, /1\. לוחצים על הקישור/);
+    assert.match(text, /אין מה להעתיק/);
+    assert.ok(text.indexOf("startgroup") < text.indexOf("הבאה"), "link first in Hebrew too");
+  });
+
+  test("a token with no bot username keeps the manual steps: there is no link to lead with", () => {
+    const text = organizerIntroText({ ...WITH_TOKEN, botUsername: null });
+    assert.doesNotMatch(text, /t\.me|Tap this link|startgroup/);
+    assert.match(text, /next message/i);
   });
 
   test("Hebrew carries the same steps, and the same copyable line", () => {
@@ -447,7 +483,7 @@ describe("copyable login: password and usernames as code spans", () => {
     assert.match(intro!.text, /A&amp;B &lt;b&gt;Trip&lt;\/b&gt;/);
     assert.match(intro!.text, /<code>a&amp;b<\/code>/);
     // The add-to-group link contains a raw ampersand in its query.
-    assert.match(intro!.text, /startgroup=japan-2026&amp;admin=/);
+    assert.match(intro!.text, /startgroup=KIN-ABCD2345&amp;admin=/);
   });
 
   test("a code span cannot be broken out of by hostile characters in a value", () => {
@@ -465,7 +501,7 @@ describe("copyable login: password and usernames as code spans", () => {
     assert.doesNotMatch(intro!.plainText!, /<code>|&amp;|&lt;/);
     assert.match(intro!.plainText!, new RegExp(`the password ${PW}:`));
     assert.match(intro!.plainText!, /• Ella — ella/);
-    assert.match(intro!.plainText!, /startgroup=japan-2026&admin=/);
+    assert.match(intro!.plainText!, /startgroup=KIN-ABCD2345&admin=/);
   });
 
   test("the text-only entry point is still plain: no tags, no stray marker characters", () => {

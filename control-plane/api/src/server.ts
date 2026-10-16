@@ -3,6 +3,7 @@ import { createNotificationAdapter } from "./adapters/notification.js";
 import { loadArchitectureProfile, validateBeforeProvider } from "./config.js";
 import { createDatabasePool, databaseReadiness } from "./database.js";
 import { dispatchPendingTripNotifications } from "./outbox-dispatcher.js";
+import { createBotUsernameResolver } from "./bot-username.js";
 import { recoverStaleLeases, recoverExpiredApprovals } from "./job-queue.js";
 import { destinationInfoSearchConfigured, refreshStaleDestinationInfo } from "./destination-info-store.js";
 import { venueLinkSearchConfigured } from "./itinerary-extract.js";
@@ -233,6 +234,11 @@ const app = buildApp(profile, {
 // sufficient (single API process today).
 if (signup) {
   const notification = signup.notification;
+  const resolveBotUsername = createBotUsernameResolver({
+    configured: profile.web?.telegram_bot_username ?? process.env.TELEGRAM_BOT_USERNAME ?? null,
+    botToken: signup.botToken,
+    log: (line) => process.stderr.write(`${line}\n`),
+  });
   let dispatching = false;
   const OUTBOX_POLL_INTERVAL_MS = 10_000;
   const timer = setInterval(() => {
@@ -246,7 +252,11 @@ if (signup) {
       // profile rather than stored per outbox row: it belongs to the
       // deployment, and a row written before a bot rename would otherwise hand
       // an organizer a link to a handle that no longer resolves.
-      { botUsername: profile.web?.telegram_bot_username ?? null },
+      // The profile's `web` block is optional, so on its own the handle was
+      // missing from any deployment that omitted it, and the link vanished with
+      // nothing logged. The resolver prefers what the deployment states and
+      // otherwise asks the bot itself (getMe on the signup token), cached.
+      { resolveBotUsername },
     )
       .catch((error) => {
         process.stderr.write(`${structuredLog("error", "outbox.dispatch_loop_error", {
