@@ -345,10 +345,11 @@ test("companion-ready introduces the assistant and hands over the token", { skip
       async sendMessage(p) { sent.push(p); },
     }, () => {}, { botUsername: "Kinerary_bot" });
 
-    // Two messages: the introduction, then the line to copy on its own.
+    // Two messages: the introduction (password in a code span), then the line
+    // to copy on its own.
     assert.equal(sent.length, 2);
     assert.match(sent[0]!.text, /Rio/);
-    assert.match(sent[0]!.text, /seed-pw/);
+    assert.match(sent[0]!.text, /<code>seed-pw<\/code>/);
     assert.match(sent[1]!.text, /^\/group KIN-/, "the copyable command, alone");
 
     const { rowCount } = await pool.query(
@@ -358,5 +359,62 @@ test("companion-ready introduces the assistant and hands over the token", { skip
     assert.equal(rowCount, 1, "exactly one live token for the trip");
   } finally {
     await pool.end();
+  }
+});
+
+const GENERATED_PASSWORD = "ykxg-d263-qtw2-y3rq";
+const LOGINS = [{ name: "Ella", username: "ella" }, { name: "Tali", username: "tali" }];
+
+test("the greeting reaches Telegram's sendMessage as HTML with the password and usernames in <code> (he and en)", { skip }, async () => {
+  // The wire payload, not the adapter call: what is POSTed to api.telegram.org.
+  const { mock } = await import("node:test");
+  const { TelegramNotificationAdapter } = await import("../src/adapters/telegram.js");
+  for (const language of ["en", "he"] as const) {
+    const pool = testPool();
+    const client = await pool.connect();
+    const posted: Array<{ url: string; body: Record<string, unknown> }> = [];
+    mock.method(globalThis, "fetch", async (url: string, init?: RequestInit) => {
+      posted.push({ url, body: JSON.parse(String(init?.body)) });
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    });
+    try {
+      await resetDb(client);
+      await applyMigrations(client, migrationsDir);
+      client.release();
+      const tripId = await insertTrip(pool);
+      await insertOutboxRow(pool, tripId, "companion_ready", "555000111", {
+        private_url: "https://example.test/trip",
+        assistant_name: "Rio",
+        trip_title: "Japan 2026",
+        trip_slug: "japan-2026",
+        language,
+        login_password: GENERATED_PASSWORD,
+        login_usernames: LOGINS,
+      });
+      const adapter = new TelegramNotificationAdapter({ botToken: "bot-token", superAdminChatId: "1", db: pool });
+      await dispatchPendingTripNotifications(pool, adapter, () => {}, { botUsername: "Kinerary_bot" });
+
+      assert.equal(posted.length, 2, "introduction, then the binding line");
+      assert.match(posted[0]!.url, /\/botbot-token\/sendMessage$/);
+      const intro = posted[0]!.body;
+      assert.equal(intro.chat_id, "555000111");
+      assert.equal(intro.parse_mode, "HTML");
+      const text = String(intro.text);
+      const loginLine = language === "he"
+        ? `הכניסה לאתר — שם המשתמש שלכם והסיסמה <code>${GENERATED_PASSWORD}</code>:`
+        : `Log in with your username and the password <code>${GENERATED_PASSWORD}</code>:`;
+      assert.ok(text.includes(`${loginLine}\n• Ella — <code>ella</code>\n• Tali — <code>tali</code>`), text);
+      // The query-string ampersand is escaped, and no other tag exists.
+      assert.match(text, /startgroup=japan-2026&amp;admin=pin_messages\+invite_users/);
+      assert.deepEqual(
+        [...new Set([...text.matchAll(/<\/?([a-zA-Z]+)/g)].map((m) => m[1]))],
+        ["code"],
+      );
+      assert.equal(posted[1]!.body.parse_mode, undefined, "the binding line is plain");
+      assert.match(String(posted[1]!.body.text), /^\/group KIN-/);
+    } finally {
+      mock.restoreAll();
+      await pool.end();
+    }
   }
 });

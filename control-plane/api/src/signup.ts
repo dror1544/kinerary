@@ -19,7 +19,17 @@ export interface NotificationAdapter {
     expiresAt: Date;
   }): Promise<void>;
   /** A plain, unstructured DM to an arbitrary chat id — e.g. the outbox dispatcher's trip notifications. */
-  sendMessage(params: { chatId: string; text: string }): Promise<void>;
+  sendMessage(params: {
+    chatId: string;
+    text: string;
+    /** "HTML" when `text` carries Telegram HTML (e.g. `<code>` spans); omitted = plain text. */
+    parseMode?: "HTML";
+    /**
+     * Sent instead, as plain text, if Telegram rejects the HTML: the words
+     * arrive and the formatting is lost, rather than the message not arriving.
+     */
+    plainText?: string;
+  }): Promise<void>;
 }
 
 export interface SignupConfig {
