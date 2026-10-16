@@ -57,6 +57,34 @@ describe("createBotUsernameResolver", () => {
     assert.equal(await resolve(), "Later_bot");
   });
 
+  test("a getMe that never answers is cut off at the timeout: null, logged, aborted, and not cached", async () => {
+    // It runs inside the outbox loop's single-flight guard; a stalled Telegram
+    // endpoint must not hold every later tick for Node's default.
+    let n = 0;
+    let signalSeen: AbortSignal | undefined;
+    const lines: string[] = [];
+    const resolve = createBotUsernameResolver({
+      configured: null,
+      botToken: "tok",
+      timeoutMs: 40,
+      log: (l) => lines.push(l),
+      fetchImpl: ((_url: string, init?: RequestInit) => {
+        n += 1;
+        if (n === 1) {
+          signalSeen = init?.signal ?? undefined;
+          return new Promise(() => {}); // never settles, and ignores the signal
+        }
+        return Promise.resolve(new Response(JSON.stringify({ ok: true, result: { username: "Later_bot" } }), { status: 200 }));
+      }) as unknown as typeof fetch,
+    });
+    const started = Date.now();
+    assert.equal(await resolve(), null);
+    assert.ok(Date.now() - started < 2000, "returned promptly");
+    assert.equal(signalSeen?.aborted, true, "the request was aborted");
+    assert.ok(lines.some((l) => l.includes("bot_username.getme_failed") && l.includes("TimeoutError")), lines.join("\n"));
+    assert.equal(await resolve(), "Later_bot", "the failure was not cached");
+  });
+
   test("a network error is null, never a throw", async () => {
     const resolve = createBotUsernameResolver({
       configured: undefined,

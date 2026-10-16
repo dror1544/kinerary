@@ -22,6 +22,8 @@ import { structuredLog } from "./redaction.js";
 /** Telegram's own rule for a username, and the one `config.ts` applies to the profile field. */
 const BOT_USERNAME = /^[A-Za-z0-9_]{5,32}$/;
 
+const GETME_TIMEOUT_MS = 5000;
+
 function normalise(value: string | null | undefined): string | null {
   const handle = (value ?? "").trim().replace(/^@/, "");
   return BOT_USERNAME.test(handle) ? handle : null;
@@ -32,6 +34,8 @@ export interface BotUsernameOptions {
   configured?: string | null;
   /** The bot's token. Used only to ask `getMe`; never logged or returned. */
   botToken?: string | null;
+  /** How long `getMe` may take before it counts as a failure. Default 5s. */
+  timeoutMs?: number;
   /** For tests. */
   fetchImpl?: typeof fetch;
   log?: (line: string) => void;
@@ -47,13 +51,31 @@ export function createBotUsernameResolver(options: BotUsernameOptions): () => Pr
     if (configured) return configured;
     if (derived) return derived;
     if (!options.botToken) return null;
+    // Bounded: this runs inside the outbox loop's single-flight guard, so a
+    // stalled endpoint would otherwise hold every later tick for Node's default
+    // (minutes). The abort signal stops the request; the race with a timer
+    // bounds the whole call even for a fetch that ignores the signal.
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const response = await doFetch(`${TELEGRAM_API_ROOT}/bot${options.botToken}/getMe`);
-      if (!response.ok) {
-        log(structuredLog("warn", "bot_username.getme_failed", { http_status: response.status }));
-        return null;
-      }
-      const body = (await response.json()) as { ok?: boolean; result?: { username?: string } };
+      const timedOut = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          const error = new Error("getMe timed out");
+          error.name = "TimeoutError";
+          reject(error);
+        }, options.timeoutMs ?? GETME_TIMEOUT_MS);
+      });
+      const ask = async () => {
+        const response = await doFetch(`${TELEGRAM_API_ROOT}/bot${options.botToken}/getMe`, { signal: controller.signal });
+        if (!response.ok) {
+          log(structuredLog("warn", "bot_username.getme_failed", { http_status: response.status }));
+          return null;
+        }
+        return (await response.json()) as { ok?: boolean; result?: { username?: string } };
+      };
+      const body = await Promise.race([ask(), timedOut]);
+      if (!body) return null;
       const handle = body.ok ? normalise(body.result?.username) : null;
       if (!handle) {
         log(structuredLog("warn", "bot_username.getme_unusable", {}));
@@ -68,6 +90,8 @@ export function createBotUsernameResolver(options: BotUsernameOptions): () => Pr
         safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
       }));
       return null;
+    } finally {
+      clearTimeout(timer);
     }
   };
 }
