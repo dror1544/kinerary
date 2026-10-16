@@ -189,6 +189,17 @@ second message. The trip slug, the payload before this, had no consumer: in a
 group it only drew "let's do this in a private chat"; it survives as the payload
 only when no token could be issued.
 
+**Several groups per trip, by decision.** The token stays reusable until expiry,
+re-issue or revoke (owner decision 2026-10-16: one trip may bind several
+groups). Its protection is the sender check, not single use.
+
+**The join message.** The join arrives before the `/start@bot <token>` that
+binds it, so the reply to the bot being added to a not-yet-bound group is
+"Happy to join your group, but I need the trip joining key to be helpful."
+(Hebrew in the same register, chosen by the adder's Telegram locale), not the
+old "open the link from your signup". Ordinary messages in an unbound chat keep
+the old text.
+
 **The link needs the bot's handle.** It comes from `web.telegram_bot_username`
 (or `TELEGRAM_BOT_USERNAME`), and when neither is set from `getMe` on the
 signup bot token, cached (`bot-username.ts`). If no handle can be had the

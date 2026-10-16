@@ -484,7 +484,14 @@ export async function dispatchUpdate(
   if (joined) {
     const route = await resolveChatRoute(db, joined.chatId);
     if (route.kind !== "companion") {
-      return { kind: "reply", reply: { chatId: joined.chatId, text: strings.unbound } };
+      // Not `strings.unbound` ("open the link from your signup"): with the
+      // one-tap add link the binding key arrives right after this join, and
+      // that sentence would contradict it. Ordinary messages in an unbound
+      // chat keep `strings.unbound`; only the join has the owner's wording.
+      // The language is the adder's Telegram locale — the only evidence a
+      // chat with no trip has.
+      const language = coerceLanguage(update.my_chat_member?.from?.language_code) ?? "en";
+      return { kind: "reply", reply: { chatId: joined.chatId, text: uiString("joinedUnbound", language) } };
     }
     const facts = await companionIntroFacts(db, route.tripId);
     const assistantName = typeof facts?.assistant_name === "string" ? facts.assistant_name : null;

@@ -1180,6 +1180,54 @@ describe("the companion arriving in a group", { skip: SKIP }, () => {
     });
   });
 
+  test("joining a group that is not bound yet asks for the trip joining key, in the adder's language (owner's wording, 2026-10-16)", async () => {
+    // The one-tap link adds the bot, THEN Telegram posts `/start@bot <token>`.
+    // The join arrives first, so what it says must not contradict the binding
+    // that follows ("open the link from your signup" would).
+    await withFixture(async (fix) => {
+      const en = await dispatchUpdate(
+        fix.pool, joinUpdate("-1002000998"), undefined, undefined, { id: "8463178587" },
+      );
+      assert.equal(
+        en.kind === "reply" && en.reply.text,
+        "Happy to join your group, but I need the trip joining key to be helpful.",
+      );
+      const he = await dispatchUpdate(
+        fix.pool,
+        { ...(joinUpdate("-1002000997") as object), my_chat_member: {
+          ...(joinUpdate("-1002000997") as { my_chat_member: object }).my_chat_member,
+          from: { id: 77, is_bot: false, first_name: "דרור", language_code: "he" },
+        } } as never,
+        undefined, undefined, { id: "8463178587" },
+      );
+      assert.equal(
+        he.kind === "reply" && he.reply.text,
+        "שמח להצטרף לקבוצה, אבל אני צריך את מפתח ההצטרפות לטיול כדי לעזור.",
+      );
+      // And the key that follows binds and greets, as before.
+      await fix.pool.query(
+        `UPDATE control_plane.trips SET companion_intro = $2::jsonb WHERE id = $1`,
+        [fix.tripId, JSON.stringify({ assistant_name: "Rio", language: "en", private_url: "https://x.example" })],
+      );
+      const issued = await issueGroupBindingToken(fix.pool, fix.tripId, "77", { ttlSeconds: 3600 });
+      if (!issued.ok) throw new Error("issue failed");
+      const bound = await dispatchUpdate(
+        fix.pool,
+        { update_id: 98, message: { message_id: 12, chat: { id: "-1002000998", type: "supergroup" },
+          from: { id: 77, is_bot: false, first_name: "Dror" }, text: `/start@Kinerary_bot ${issued.token}` } } as never,
+        undefined, undefined, { id: "8463178587", username: "Kinerary_bot" },
+      );
+      assert.equal(bound.kind, "group_intro");
+    });
+  });
+
+  test("ordinary messages in an unbound chat keep the old 'no trip for this chat' text; only the join changed", async () => {
+    await withFixture(async (fix) => {
+      const decision = await dispatchUpdate(fix.pool, msg("-1002000996", "/name Rio", "supergroup"));
+      assert.equal(decision.kind === "reply" && decision.reply.text, DEFAULT_STRINGS.unbound);
+    });
+  });
+
   test("a promotion to admin is not a second arrival", async () => {
     // Re-introducing on every permissions change would be noise in a live
     // family group.

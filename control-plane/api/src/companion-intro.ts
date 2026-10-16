@@ -257,7 +257,7 @@ function organizerIntroMarked(facts: CompanionIntroFacts): string {
         `1. לוחצים על הקישור: ${addUrl}`,
         "   טלגרם יאפשר לבחור קבוצה קיימת (או לפתוח קבוצה חדשה קודם) ולהוסיף אותי אליה.",
         "2. כשטלגרם שואל אילו הרשאות לתת לי — הופכים אותי למנהל ומשאירים דלוקה הרשאת \"הצמדת הודעות\" (Pin messages) — זה מה שנותן לי להצמיד את הודעת הפתיחה, כדי שכולם ימצאו בקלות את האתר והפרטים החשובים. אין צורך להדליק שום הרשאה אחרת.",
-        "3. זהו. אני אתחבר לקבוצה בעצמי ואציג את עצמי שם — אין מה להעתיק או להדביק.",
+        "3. זהו. אני אתחבר לקבוצה בעצמי ואציג את עצמי שם — אין מה להדביק.",
         "",
         `הקישור לא עובד, או שאני כבר בקבוצה? מוסיפים אותי ידנית (@${facts.botUsername}), הופכים אותי למנהל, ואז בקבוצה עצמה — לא כאן — מעתיקים את השורה המלאה מההודעה הבאה שלי ומדביקים אותה שם. שלחתם אותה מוקדם מדי? משלימים את ההוספה וההרשאה ומדביקים שוב.`,
       );
@@ -309,7 +309,7 @@ function organizerIntroMarked(facts: CompanionIntroFacts): string {
       `1. Tap this link: ${addUrl}`,
       "   Telegram lets you pick the group (an existing one, or make a new one first) and add me to it.",
       "2. When Telegram asks which rights to give me, make me an admin and keep the \"Pin messages\" permission on — that's what lets me pin the welcome message, so everyone can find the site and the essentials at a glance. Nothing else needs to be switched on.",
-      "3. That's it. I'll connect to the group on my own and say hello there — nothing to copy or paste.",
+      "3. That's it. I'll connect to the group on my own and say hello there — nothing to paste.",
       "",
       `Link doesn't work, or I'm already in the group? Add @${facts.botUsername} yourself, make me an admin, then, in that group — not here — copy the whole line from my next message and paste it in. Sent it too early? Finish adding me and the permission, then paste it again.`,
     );

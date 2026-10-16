@@ -334,6 +334,10 @@ export async function redeemGroupBindingToken(
       }
     }
 
+    // The token is NOT consumed here, on purpose. Owner decision 2026-10-16:
+    // one trip may bind several groups; the token stays reusable until
+    // expiry, re-issue (`/group`) or revoke (teardown). Its protection is the
+    // sender check above, not single use.
     await client.query(
       `UPDATE control_plane.telegram_group_binding_tokens
           SET last_used_at = now(), use_count = use_count + 1

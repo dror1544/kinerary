@@ -375,7 +375,8 @@ describe("the group-binding token in the organizer's message", () => {
     assert.match(text, /https:\/\/t\.me\/Kinerary_bot\?startgroup=KIN-ABCD2345&admin=pin_messages\+invite_users/);
     assert.doesNotMatch(text, /startgroup=japan-2026/);
     assert.match(text, /1\. Tap this link/);
-    assert.match(text, /nothing to copy or paste/i);
+    assert.match(text, /nothing to paste/i);
+    assert.doesNotMatch(text, /nothing to copy/i, "the password line says 'to copy'; step 3 must not contradict it");
     // The manual line is the FALLBACK, and the copy says so.
     assert.ok(text.indexOf("startgroup") < text.indexOf("next message"), "link first, manual line after");
     assert.match(text, /doesn't work|already in the group/i);
@@ -386,7 +387,8 @@ describe("the group-binding token in the organizer's message", () => {
     assert.match(text, /startgroup=KIN-ABCD2345&admin=/);
     assert.doesNotMatch(text, /startgroup=japan-2026/);
     assert.match(text, /1\. לוחצים על הקישור/);
-    assert.match(text, /אין מה להעתיק/);
+    assert.match(text, /אין מה להדביק/);
+    assert.doesNotMatch(text, /אין מה להעתיק/);
     assert.ok(text.indexOf("startgroup") < text.indexOf("הבאה"), "link first in Hebrew too");
   });
 
