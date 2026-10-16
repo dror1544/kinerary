@@ -58,7 +58,7 @@ const GROUP_DAY: DayRollup = {
   assistant_tool_outcomes: { grounded_answer: 0, failed_tool: 0, missing_data: 0, missing_data_by_tool: {} },
 };
 
-const ALL_SECTION_TITLES = ["Usage", "Value Delivered", "Information Quality", "Learning and Enrichment", "Organizer Enablement"];
+const ALL_SECTION_TITLES = ["Usage", "Group Judge", "Value Delivered", "Information Quality", "Learning and Enrichment", "Organizer Enablement"];
 
 function sectionsByTitle(report: DailyReport): Map<string, DailyReport["sections"][number]> {
   return new Map(report.sections.map((s) => [s.title, s]));

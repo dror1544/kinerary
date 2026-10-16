@@ -28,7 +28,7 @@ import {
 import { structuredLog } from "./redaction.js";
 
 /** The tasks an override may name. */
-export const SWITCHABLE_TASKS = ["interpret", "extract_intake", "extract_itinerary", "read_image"] as const;
+export const SWITCHABLE_TASKS = ["interpret", "extract_intake", "extract_itinerary", "read_image", "group_judge"] as const;
 export type SwitchableTask = (typeof SWITCHABLE_TASKS)[number];
 
 export const RUNNER_KINDS = ["claude", "codex", "openrouter", "hermes"] as const;

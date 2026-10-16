@@ -44,16 +44,26 @@ import {
   consumeExpectsReplyWindow,
   inCompanionConversation,
   openCompanionConversation,
+  groupListenEnabled,
+  setGroupListen,
+  isTripOrganizer,
+  tripLanguage,
 } from "../chat-router.js";
 import { listOrganizerTrips, switchChatToTrip, type OrganizerTrip } from "../organizer-trips.js";
 import { isAddressedToAssistant } from "./addressing.js";
 import { conversationMark } from "./stay-silent.js";
-import { classifyTrigger, inboundFacts, type InboundFacts } from "../analytics/relay-facts.js";
+import type { GroupJudge, JudgeOutcome } from "./group-judge.js";
+import { classifyTrigger, inboundFacts, type InboundFacts, type JudgeFacts } from "../analytics/relay-facts.js";
 import { coerceLanguage, uiString, type Language } from "../intake-copy.js";
 import {
   companionHelpText,
   groupBindingCommand,
   groupIntroText,
+  listenChanged,
+  listenInPrivateChat,
+  listenRefused,
+  listenStatus,
+  listenUsage,
   renameConfirmation,
   renameRefused,
   renameUsage,
@@ -419,6 +429,14 @@ export interface DispatchOptions {
    * the companion route, exactly as before #178.
    */
   organizerDocumentRoute?: boolean;
+  /**
+   * The group judge (relay/group-judge.ts): asked, last of all, whether an
+   * unaddressed group message is meant for the assistant. Absent - JUDGE_RUNNER
+   * unset, the default - nothing is asked and an unaddressed message is
+   * NOT_ADDRESSED exactly as before. Injected, like the runner, so this module
+   * stays testable without a network.
+   */
+  groupJudge?: GroupJudge;
 }
 
 /**
@@ -760,6 +778,40 @@ export async function dispatchUpdate(
     }
   }
 
+  // `/listen`, `/listen on`, `/listen off`: the organizer's switch for the group
+  // judge in THIS group (relay/group-judge.ts). Anyone may read the setting;
+  // only the trip's organizer - a fact from the control plane's own links, never
+  // from the message - may change it. Router-owned like /name: it changes what
+  // the router hears, and Hermes' own command surface is not ours to extend.
+  if (parsed.kind === "command" && parsed.name === "listen") {
+    const route = await resolveChatRoute(db, chatId);
+    if (route.kind === "unbound") {
+      return { kind: "reply", reply: { chatId, text: strings.unbound } };
+    }
+    if (route.kind === "companion") {
+      const language = await tripLanguage(db, route.tripId);
+      if (message.chat?.type === "private") {
+        return { kind: "reply", reply: { chatId, text: listenInPrivateChat(language) } };
+      }
+      const argument = (parsed.argument ?? "").trim().toLowerCase();
+      if (!argument) {
+        const on = await groupListenEnabled(db, chatId).catch(() => false);
+        return { kind: "reply", reply: { chatId, text: listenStatus(language, on) } };
+      }
+      if (argument !== "on" && argument !== "off") {
+        return { kind: "reply", reply: { chatId, text: listenUsage(language) } };
+      }
+      const senderId = message.from?.id === undefined ? null : String(message.from.id);
+      if (!senderId || !(await isTripOrganizer(db, route.tripId, senderId))) {
+        log(structuredLog("info", "trip_bot.listen_refused", { reason: "NOT_ORGANIZER" }));
+        return { kind: "reply", reply: { chatId, text: listenRefused(language) } };
+      }
+      const changed = await setGroupListen(db, chatId, argument === "on");
+      log(structuredLog("info", "trip_bot.listen_changed", { enabled: argument === "on", changed }));
+      return { kind: "reply", reply: { chatId, text: listenChanged(language, argument === "on") } };
+    }
+  }
+
   // The organizer asking for a group-binding token, in their own DM. Router-
   // owned rather than agent-owned for the same reason the introduction is: the
   // token is a credential, and one the agent got slightly wrong is a token that
@@ -948,7 +1000,22 @@ export async function dispatchUpdate(
       }
     }
     if (capturedByConversation) log(structuredLog("info", "trip_bot.conversation_window_hit", {}));
-    const addressed = addressedOtherwise || capturedByConversation;
+
+    // The group judge (2026-10-16): LAST of all, and only for a group message
+    // every rule above has refused. Existing rules first - anything one of them
+    // addressed never reaches a model. Text and captions only: an uncaptioned
+    // photo or file has nothing to judge and keeps today's hold-until-addressed
+    // behaviour. Every way it can fail ends in NOT_ADDRESSED.
+    let capturedByJudge = false;
+    let judged: JudgeOutcome | null = null;
+    if (
+      !addressedOtherwise && !capturedByConversation && inGroup && senderId &&
+      options.groupJudge?.model() && outcome.route.kind === "companion" && judgeableText(outcome.event.text)
+    ) {
+      judged = await askGroupJudge(db, options.groupJudge, outcome.route, chatId, outcome.event.text, log);
+      capturedByJudge = judged?.kind === "yes";
+    }
+    const addressed = addressedOtherwise || capturedByConversation || capturedByJudge;
     // #177: the gate's verdict, as metadata. Only ever called through
     // `withAnalytics`, which never calls it while assistant events are off.
     // The text is taken here, before anything is prefixed to it.
@@ -956,7 +1023,7 @@ export async function dispatchUpdate(
     const routedTripId = outcome.route.kind === "companion" ? outcome.route.tripId : null;
     const seen = (linkRole: string | null | undefined): InboundFacts => {
       if (!routedTripId) throw new Error("NOT_COMPANION_ROUTE");
-      return inboundFacts({
+      const facts = inboundFacts({
         tripId: routedTripId,
         // Telegram's own type for the channel; the gate's mapped one for the trigger.
         telegramChatType: message.chat?.type,
@@ -964,6 +1031,7 @@ export async function dispatchUpdate(
           addressed,
           capturedAsReply,
           capturedByConversation,
+          capturedByJudge,
           chatType: outcome.event.source.chat_type,
           text: heardText,
           assistantNames: outcome.route.kind === "companion" ? outcome.route.assistantNames : [],
@@ -974,6 +1042,14 @@ export async function dispatchUpdate(
         attachmentKind: outcome.attachment?.kind ?? null,
         textLength: heardText.length,
       });
+      // Memory-only keys (relay-facts.ts): they let the emitter notice that the
+      // same sender, right after a judge_no, then addressed the assistant by name.
+      return {
+        ...facts,
+        chatKey: chatId,
+        ...(senderId ? { senderKey: senderId } : {}),
+        ...(judged ? { judge: judgeFactsOf(judged) } : {}),
+      };
     };
     if (!addressed) {
       // Not for the assistant, so nothing is downloaded. A DOCUMENT is still
@@ -1109,7 +1185,10 @@ export async function dispatchUpdate(
     // field that reaches the model, so the mark is a fenced line on the text,
     // put on BEFORE the overheard block so that block still leads. An empty
     // text (a photo or file with no caption) gets the mark alone.
-    if (capturedByConversation) {
+    // The judge's yes is marked the same way, for the same reason: the companion
+    // is told it was not addressed by name and may stay silent (the second guard
+    // against a wrong yes).
+    if (capturedByConversation || capturedByJudge) {
       outcome.event.text = `${conversationMark()}\n\n${outcome.event.text}`.trimEnd();
     }
 
@@ -1252,6 +1331,63 @@ export async function dispatchUpdate(
     default:
       return { kind: "ignore", reason: outcome.reason };
   }
+}
+
+/** A message worth a model call: it carries at least one letter or digit. A lone emoji or "?" is a reaction. */
+function judgeableText(text: string): boolean {
+  return /[\p{L}\p{N}]/u.test(text);
+}
+
+/**
+ * Asks the judge about one unaddressed group message, or returns null when it
+ * must not be asked: the group said `/listen off`, the trip opted out of reply
+ * capture, or the setting could not be read (fail closed - a relay running
+ * ahead of its migration judges nothing). Logs the verdict and its speed, never
+ * the text.
+ */
+async function askGroupJudge(
+  db: pg.Pool,
+  judge: GroupJudge,
+  route: Extract<ChatRoute, { kind: "companion" }>,
+  chatId: string,
+  text: string,
+  log: (line: string) => void,
+): Promise<JudgeOutcome | null> {
+  try {
+    if (!(await groupListenEnabled(db, chatId))) return null;
+  } catch (error) {
+    log(structuredLog("warn", "trip_bot.group_judge_listen_read_failed", {
+      safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+    }));
+    return null;
+  }
+  const language = await tripLanguage(db, route.tripId).catch(() => "en" as const);
+  const judged = await judge.judge({ chatId, text, assistantNames: route.assistantNames, language });
+  log(structuredLog("info", "trip_bot.group_judged", {
+    verdict: judged.kind,
+    latency_ms: judged.ms,
+    model: judged.model,
+    ...(judged.kind === "fallback" ? { reason: judged.reason } : { confidence: judged.confidence }),
+    ...(judged.kind === "no" && judged.belowThreshold ? { below_threshold: true } : {}),
+  }));
+  return judged;
+}
+
+/** A judge outcome as the analytics descriptor names it. */
+function judgeFactsOf(judged: JudgeOutcome): JudgeFacts {
+  const base = { latencyMs: judged.ms, model: judged.model };
+  if (judged.kind === "yes") {
+    return { ...base, outcome: "judge_yes", confidencePct: Math.round(judged.confidence * 100) };
+  }
+  if (judged.kind === "no") {
+    return {
+      ...base,
+      outcome: "judge_no",
+      confidencePct: Math.round(judged.confidence * 100),
+      ...(judged.belowThreshold ? { belowThreshold: true } : {}),
+    };
+  }
+  return { ...base, outcome: "judge_fallback", fallbackReason: judged.reason };
 }
 
 /**

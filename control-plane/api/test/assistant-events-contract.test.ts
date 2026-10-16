@@ -276,7 +276,7 @@ describe("validateAssistantEvent", () => {
     assert.deepEqual(validateAssistantEvent(valid({ trip_id: null })), { ok: false, reason: "MISSING:trip_id" });
   });
 
-  test("metadata holds only named, bounded numbers and a boolean", () => {
+  test("metadata holds only named, bounded values - whole numbers, booleans, a closed set, a restricted model id", () => {
     assert.deepEqual(validateAssistantEvent(valid({ metadata: { filename: "voucher.pdf" } })), { ok: false, reason: "UNKNOWN_METADATA_FIELD" });
     assert.deepEqual(validateAssistantEvent(valid({ metadata: { documents: "2" } })), { ok: false, reason: "BAD:metadata.documents" });
     assert.deepEqual(validateAssistantEvent(valid({ metadata: { documents: 99 } })), { ok: false, reason: "BAD:metadata.documents" });

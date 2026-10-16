@@ -14,6 +14,8 @@
  * /switch appear only outside groups — /group mints a binding token in the
  * organizer's DM, /trips would list trips the rest of the room has no claim
  * to, and a group's binding is the family's, not one member's to /switch.
+ * /listen is the opposite case: it appears in groups only, being one group's
+ * setting, changed there by the trip's organizer.
  *
  * `/start` is deliberately absent. Telegram surfaces its own Start button, and
  * a menu entry for a command that does nothing without a token is a dead end.
@@ -40,6 +42,7 @@ const DESCRIPTIONS = {
   en: {
     help: "What I can do",
     name: "Show or change my name",
+    listen: "Whether I answer without my name (organizer)",
     group: "Connect me to your family group",
     trips: "Your trips, and which one this chat is on",
     switch: "Point this chat at a different trip",
@@ -47,6 +50,7 @@ const DESCRIPTIONS = {
   he: {
     help: "מה אני יודע לעשות",
     name: "להציג או לשנות את השם שלי",
+    listen: "האם אענה גם בלי שם (המארגן)",
     group: "לחבר אותי לקבוצה המשפחתית",
     trips: "להציג את הטיולים שלך ולאיזה מהם הצ׳אט הזה מחובר",
     switch: "לחבר את הצ׳אט הזה לטיול אחר",
@@ -71,7 +75,13 @@ export function routerCommandMenus(): CommandMenu[] {
     menus.push(
       { scope: "default", languageCode, commands: privateChat },
       { scope: "all_private_chats", languageCode, commands: privateChat },
-      { scope: "all_group_chats", languageCode, commands: everywhere },
+      // /listen is the organizer's switch for one GROUP; in a private chat it only
+      // says so, which is not worth a menu entry.
+      {
+        scope: "all_group_chats",
+        languageCode,
+        commands: [...everywhere, { command: "listen", description: text.listen }],
+      },
     );
   }
   return menus;

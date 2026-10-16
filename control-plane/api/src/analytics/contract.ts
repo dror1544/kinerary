@@ -14,7 +14,8 @@
  * (#156): a deny-list passes whatever it was never told to remove. Nothing here
  * can carry text, a chat id, a Telegram user id, a name, a filename, a URL, a
  * digest of any of those, or a tool argument/result — there is no field for
- * them, and `metadata` accepts only bounded numbers and one boolean.
+ * them, and `metadata` accepts only bounded numbers, booleans, a fixed set of
+ * failure reasons and one model identifier (see METADATA_FIELDS).
  *
  * **The relay never claims `answered`, and neither does this contract — on
  * purpose, for anyone.** It sees whether a reply reached Telegram; it cannot
@@ -44,6 +45,9 @@ export const EVENT_TYPES = [
   "reply_sent",
   "relay_tool_completed",
   "tool_call_completed",
+  // The group judge's decision on one unaddressed group message, and — later,
+  // about an earlier decision — whether it turned out to be a miss (below).
+  "group_judged",
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 
@@ -60,6 +64,8 @@ export const TRIGGER_TYPES = [
   "reply_to_bot",
   "reply_window",
   "conversation_window",
+  // Admitted only by the group judge (relay/group-judge.ts): none of the rules above applied.
+  "judge",
   "not_addressed",
   "unclassified",
 ] as const;
@@ -82,6 +88,14 @@ export const OUTCOMES = [
   "no_new_information",
   "grounded_answer",
   "missing_data",
+  // group_judged only. yes: judged for the assistant (and forwarded). no: judged
+  // not for it, or yes below the confidence threshold. fallback: no usable
+  // answer (timeout, error, unparseable, rate limited) - handled as no.
+  // missed: a LATER event about an earlier judge_no, see EVENT_RULES.
+  "judge_yes",
+  "judge_no",
+  "judge_fallback",
+  "judge_missed",
 ] as const;
 export type Outcome = (typeof OUTCOMES)[number];
 
@@ -151,11 +165,33 @@ export type EventField = (typeof EVENT_FIELDS)[number];
 
 export const REQUIRED_FIELDS = ["event_id", "occurred_at", "source_service", "event_type", "outcome"] as const;
 
-/** The only keys `metadata` may hold, with their bounds. Numbers and a boolean — nothing textual. */
+/**
+ * The only keys `metadata` may hold, with their bounds. Whole numbers and
+ * booleans, plus two judge keys that are text-shaped but closed: a fixed set of
+ * failure reasons, and the configured model id (deployment configuration - a
+ * short identifier from an alphabet with no space in it, so nothing a traveller
+ * typed can ride in it). Never a free string.
+ */
+export const JUDGE_FALLBACK_REASONS = ["timeout", "error", "unparseable", "rate_limited"] as const;
+export type JudgeFallbackReason = (typeof JUDGE_FALLBACK_REASONS)[number];
+
+/** Same expression as the migration's CHECK on `metadata.judge_model`. */
+export const JUDGE_MODEL_PATTERN = "^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,79}$";
+const JUDGE_MODEL = new RegExp(JUDGE_MODEL_PATTERN);
+
+/** Whether a model id may be recorded as `metadata.judge_model`; one that may not is left out, not the event. */
+export function isJudgeModelId(value: string): boolean {
+  return JUDGE_MODEL.test(value);
+}
+
 export const METADATA_FIELDS = {
   attachments_joined: { type: "integer", min: 0, max: 20 },
   documents: { type: "integer", min: 0, max: 20 },
   document_held: { type: "boolean" },
+  judge_confidence_pct: { type: "integer", min: 0, max: 100 },
+  judge_model: { type: "string", pattern: JUDGE_MODEL_PATTERN },
+  judge_fallback_reason: { type: "enum", values: JUDGE_FALLBACK_REASONS },
+  judge_below_threshold: { type: "boolean" },
 } as const;
 export type MetadataField = keyof typeof METADATA_FIELDS;
 
@@ -163,6 +199,10 @@ export interface EventMetadata {
   attachments_joined?: number;
   documents?: number;
   document_held?: boolean;
+  judge_confidence_pct?: number;
+  judge_model?: string;
+  judge_fallback_reason?: JudgeFallbackReason;
+  judge_below_threshold?: boolean;
 }
 
 export const MAX_LATENCY_MS = 86_400_000;
@@ -218,6 +258,18 @@ export const EVENT_RULES: Record<EventType, { outcomes: readonly Outcome[]; requ
   tool_call_completed: {
     outcomes: ["grounded_answer", "failed_tool", "missing_data"],
     required: ["trip_id", "tool_name"],
+  },
+  // The group judge (relay/group-judge.ts) - a fact about a message NO rule had
+  // addressed to the assistant. judge_yes / judge_no / judge_fallback describe
+  // that message (response_latency_ms is the judge's own); judge_yes carries the
+  // turn_id of the request_forwarded row it caused, which is how the report ties
+  // it to the reply that followed. judge_missed is written later, about an earlier
+  // judge_no: the same sender's next message in that chat, within three minutes,
+  // was addressed by name, @mention or reply (response_latency_ms = the gap).
+  // The dimensions are those of the message the event is written on.
+  group_judged: {
+    outcomes: ["judge_yes", "judge_no", "judge_fallback", "judge_missed"],
+    required: INBOUND_DIMENSIONS,
   },
 };
 
@@ -367,22 +419,35 @@ function validMetadata(value: unknown): EventMetadata {
   // Absent is `{}`; present must be an object — `null` included, as the schema says.
   if (value === undefined) return {};
   if (!isPlainObject(value)) throw new ContractError("BAD:metadata");
-  const out: EventMetadata = {};
+  const out: Record<string, number | boolean | string> = {};
   for (const [key, raw] of Object.entries(value)) {
     if (!Object.hasOwn(METADATA_FIELDS, key)) throw new ContractError("UNKNOWN_METADATA_FIELD");
-    const rule = METADATA_FIELDS[key as MetadataField];
-    if (rule.type === "boolean") {
-      if (typeof raw !== "boolean") throw new ContractError(`BAD:metadata.${key}`);
-      out.document_held = raw;
-    } else {
-      if (typeof raw !== "number" || !Number.isInteger(raw) || raw < rule.min || raw > rule.max) {
-        throw new ContractError(`BAD:metadata.${key}`);
-      }
-      (out as Record<string, number>)[key] = raw;
+    const rule: MetadataRule = METADATA_FIELDS[key as MetadataField];
+    const bad = () => new ContractError(`BAD:metadata.${key}`);
+    switch (rule.type) {
+      case "boolean":
+        if (typeof raw !== "boolean") throw bad();
+        break;
+      case "integer":
+        if (typeof raw !== "number" || !Number.isInteger(raw) || raw < rule.min || raw > rule.max) throw bad();
+        break;
+      case "string":
+        if (typeof raw !== "string" || !JUDGE_MODEL.test(raw)) throw bad();
+        break;
+      case "enum":
+        if (typeof raw !== "string" || !(rule.values as readonly string[]).includes(raw)) throw bad();
+        break;
     }
+    out[key] = raw as number | boolean | string;
   }
-  return out;
+  return out as EventMetadata;
 }
+
+type MetadataRule =
+  | { readonly type: "integer"; readonly min: number; readonly max: number }
+  | { readonly type: "boolean" }
+  | { readonly type: "string"; readonly pattern: string }
+  | { readonly type: "enum"; readonly values: readonly string[] };
 
 // ── Mapping relay facts onto the vocabulary — unknown resolves to `unclassified` ──
 

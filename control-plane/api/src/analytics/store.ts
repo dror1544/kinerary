@@ -115,6 +115,21 @@ export async function writeAssistantEvents(db: WriterDb, input: readonly unknown
 
 export const DEFAULT_RETENTION_DAYS = 90;
 
+/** A `DayRollup.judge` with nothing in it. */
+export function emptyJudgeRollup(): DayRollup["judge"] {
+  return {
+    yes: 0,
+    no: 0,
+    below_threshold: 0,
+    fallback: 0,
+    fallback_by_reason: {},
+    missed: 0,
+    over_eager: 0,
+    latency_ms: [],
+    by_model: {},
+  };
+}
+
 /**
  * Deletes events older than the cutoff (design §10: rows without text or
  * direct identifiers live 90–180 days). Returns how many went.
@@ -205,6 +220,33 @@ export interface DayRollup {
     /** `missing_data` only, by which tool returned nothing — the report's "top missing items" source. */
     missing_data_by_tool: Record<string, number>;
   };
+  /**
+   * The group judge's decisions that day (`group_judged`, relay/group-judge.ts):
+   * the volume, and the live accuracy PROXIES - not accuracy. `missed` is the
+   * false-negative proxy (the judge said no and the same sender's next message
+   * within three minutes addressed the assistant by name, @mention or reply);
+   * `over_eager` the false-positive proxy (the judge said yes and the
+   * companion's only reply to that turn was the silence sentinel, which the
+   * relay records as a suppressed reply). Both undercount: a miss nobody
+   * repeats, or a yes the companion answered needlessly, shows in neither. The
+   * labelled benchmark (tools/judge-benchmark.ts) is where precision and recall are
+   * measured. Absent traffic is all zeros, never a fabricated rate.
+   */
+  judge: {
+    yes: number;
+    /** judge_no events, `below_threshold` of them a yes the model gave with too little confidence. */
+    no: number;
+    below_threshold: number;
+    /** No usable answer: timeout, error, unparseable, rate limited - all handled as "not addressed". */
+    fallback: number;
+    fallback_by_reason: Record<string, number>;
+    missed: number;
+    over_eager: number;
+    /** The judge's own latency, one per decision (yes, no and fallback), in event order. */
+    latency_ms: number[];
+    /** Decisions by configured model id (`unknown` when the event carried none). */
+    by_model: Record<string, number>;
+  };
 }
 
 interface EventRow {
@@ -262,7 +304,11 @@ export async function rollupAssistantEvents(
   // Replies to the window's own turns, wherever in time they landed — a reply
   // to a 23:58 question can fall after `to`. Read by turn_id, not by window.
   const handoffs = res.rows.filter((r) => r.event_type === "request_forwarded" && r.turn_id);
-  const turnIds = [...new Set(handoffs.map((r) => r.turn_id as string))];
+  // A judge_yes names the turn it caused: its replies are read too, to see
+  // whether the companion answered or stayed silent.
+  const judgedYes = res.rows.filter((r) => r.event_type === "group_judged" && r.outcome === "judge_yes" && r.turn_id);
+  const withTurns = [...handoffs, ...judgedYes];
+  const turnIds = [...new Set(withTurns.map((r) => r.turn_id as string))];
   const repliesByTurn = new Map<string, { outcome: string; response_latency_ms: number | null }[]>();
   if (turnIds.length > 0) {
     // Bounded below by the earliest hand-off and to the window's trips, so the
@@ -275,8 +321,8 @@ export async function rollupAssistantEvents(
           AND event_type = 'reply_sent'
           AND turn_id = ANY($3::uuid[])`,
       [
-        [...new Set(handoffs.map((r) => r.trip_id))],
-        new Date(Math.min(...handoffs.map((r) => new Date(r.occurred_at).getTime()))),
+        [...new Set(withTurns.map((r) => r.trip_id))],
+        new Date(Math.min(...withTurns.map((r) => new Date(r.occurred_at).getTime()))),
         turnIds,
       ],
     );
@@ -316,6 +362,7 @@ export async function rollupAssistantEvents(
           missing_data: 0,
           missing_data_by_tool: {},
         },
+        judge: emptyJudgeRollup(),
       };
       days.set(key, day);
     }
@@ -403,6 +450,33 @@ export async function rollupAssistantEvents(
             (day.assistant_tool_outcomes.missing_data_by_tool[tool] ?? 0) + 1;
         }
         break;
+      case "group_judged": {
+        const judge = day.judge;
+        if (row.outcome === "judge_missed") {
+          judge.missed += 1;
+          break;
+        }
+        const model = typeof row.metadata?.judge_model === "string" ? row.metadata.judge_model : "unknown";
+        judge.by_model[model] = (judge.by_model[model] ?? 0) + 1;
+        if (row.response_latency_ms !== null) judge.latency_ms.push(row.response_latency_ms);
+        if (row.outcome === "judge_yes") {
+          judge.yes += 1;
+          // Over-eager: the companion's replies to this turn were all
+          // suppressed (the sentinel) and none reached the family.
+          const replies = repliesByTurn.get(row.turn_id ?? "") ?? [];
+          if (replies.some((r) => r.outcome === "reply_suppressed") && !replies.some((r) => r.outcome === "reply_delivered")) {
+            judge.over_eager += 1;
+          }
+        } else if (row.outcome === "judge_no") {
+          judge.no += 1;
+          if (row.metadata?.judge_below_threshold === true) judge.below_threshold += 1;
+        } else if (row.outcome === "judge_fallback") {
+          judge.fallback += 1;
+          const reason = typeof row.metadata?.judge_fallback_reason === "string" ? row.metadata.judge_fallback_reason : "unknown";
+          judge.fallback_by_reason[reason] = (judge.fallback_by_reason[reason] ?? 0) + 1;
+        }
+        break;
+      }
       default:
         // An event type this rollup does not know is not silently folded into
         // one it does. The contract refuses unknown types on write, so this is

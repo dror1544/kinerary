@@ -42,7 +42,7 @@ import {
   type SessionView,
 } from "./interview.js";
 import { peekEnrollmentTripId } from "./enrollment.js";
-import { isPrivateChatId } from "./identity.js";
+import { digestTelegramId, isPrivateChatId } from "./identity.js";
 import { structuredLog } from "./redaction.js";
 
 // ── Inbound text ─────────────────────────────────────────────────────────────
@@ -564,6 +564,80 @@ export async function inCompanionConversation(
     [chatId, userId],
   );
   return (result.rowCount ?? 0) > 0;
+}
+
+// ── The group judge's per-group switch (/listen) ─────────────────────────────
+
+/**
+ * May the relay ask the group judge about an unaddressed message in this chat?
+ *
+ * True only for an open binding whose `listen_judge_enabled` is on AND whose
+ * trip has not opted out of reply capture: `companion_reply_capture_enabled`
+ * is the trip's "do not let unaddressed messages in" switch (0053) and covers
+ * every window the relay adds, the judge included. A chat with no open binding
+ * reads false. THROWS on a failed read (a relay that runs ahead of its
+ * migration): the caller treats that as "no judge", never as "judge".
+ */
+export async function groupListenEnabled(db: pg.Pool, chatId: string): Promise<boolean> {
+  const result = await db.query<{ on: boolean }>(
+    `SELECT (b.listen_judge_enabled AND t.companion_reply_capture_enabled) AS on
+       FROM control_plane.telegram_chat_bindings b
+       JOIN control_plane.trips t ON t.id = b.trip_id
+      WHERE b.chat_id = $1 AND b.closed_at IS NULL
+      LIMIT 1`,
+    [chatId],
+  );
+  return result.rows[0]?.on === true;
+}
+
+/** Sets the group's judge switch. Returns false when the chat has no open binding. */
+export async function setGroupListen(db: pg.Pool, chatId: string, enabled: boolean): Promise<boolean> {
+  const result = await db.query(
+    `UPDATE control_plane.telegram_chat_bindings
+        SET listen_judge_enabled = $2
+      WHERE chat_id = $1 AND closed_at IS NULL`,
+    [chatId, enabled],
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
+/**
+ * Is this Telegram sender an organizer of this trip?
+ *
+ * Two proofs, either enough, both server-side facts and neither read from the
+ * message: the trip's own person link says so (0051, written at provisioning),
+ * or the sender's verified Telegram identity (0052) belongs to a user holding
+ * an active OWNER membership on this trip. Unknown, an anonymous group admin
+ * and a failed lookup are all "no" - a command that changes how the whole room
+ * is listened to is not offered to a stranger.
+ */
+export async function isTripOrganizer(db: pg.Pool, tripId: string, telegramUserId: string): Promise<boolean> {
+  if (!tripId || !telegramUserId) return false;
+  if ((await resolveTripPerson(db, tripId, telegramUserId))?.role === "organizer") return true;
+  if (!isPrivateChatId(telegramUserId)) return false;
+  const result = await db.query(
+    `SELECT 1
+       FROM control_plane.telegram_organizer_links l
+       JOIN control_plane.trip_memberships m ON m.user_id = l.user_id
+      WHERE l.telegram_subject_digest = $2
+        AND m.trip_id = $1 AND m.role = 'owner' AND m.status = 'active'
+      LIMIT 1`,
+    [tripId, digestTelegramId(telegramUserId)],
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
+/**
+ * The trip's language, "he" or "en" - the only fact of `companion_intro` the
+ * judge needs. A narrow read on purpose: the whole column carries the shared
+ * site login (`companionIntroFacts`).
+ */
+export async function tripLanguage(db: pg.Pool, tripId: string): Promise<"he" | "en"> {
+  const { rows } = await db.query<{ language: string | null }>(
+    "SELECT companion_intro ->> 'language' AS language FROM control_plane.trips WHERE id = $1",
+    [tripId],
+  );
+  return rows[0]?.language === "he" ? "he" : "en";
 }
 
 // ── /start deep link ─────────────────────────────────────────────────────────

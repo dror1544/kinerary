@@ -26,7 +26,7 @@
  * rollup change, because `store.ts` is out of this slice's paths — see the
  * handover.
  */
-import type { ChannelRoleCounts, DayRollup } from "./store.js";
+import { emptyJudgeRollup, type ChannelRoleCounts, type DayRollup } from "./store.js";
 
 /** A rate honestly computed from the relay's own counts. `value` is `null`,
  * never `0` or `NaN`, when the denominator is zero — a trip with no traffic
@@ -76,6 +76,25 @@ export interface RelayReadOutcomes {
   by_outcome: Record<string, Rate>;
 }
 
+export interface JudgeRates {
+  /** yes + no + fallback: every message the judge was asked about. */
+  decisions: number;
+  /** yes / decisions. */
+  yes_rate: Rate;
+  /** fallback / decisions - timeouts, errors, unparseable answers and rate limits. */
+  fallback_rate: Rate;
+  /** Fallbacks by reason, as counts. Empty when there were none. */
+  fallback_by_reason: Record<string, number>;
+  /** missed / no - the false-negative PROXY: of the judge's nos, the share the same sender repeated by name within three minutes. */
+  missed_proxy: Rate;
+  /** over_eager / yes - the false-positive PROXY: of the judge's yeses, the share the companion answered with silence. */
+  over_eager_proxy: Rate;
+  latency_p50_ms: Rate;
+  latency_p95_ms: Rate;
+  /** Decisions by configured model id. */
+  by_model: Record<string, number>;
+}
+
 export interface DayRates {
   trip_id: string;
   local_day: string;
@@ -101,6 +120,9 @@ export interface DayRates {
   grounded_answer_rate: Rate;
   /** missing_data / (grounded_answer + failed_tool + missing_data) — the missing-information control loop's detection rate. */
   missing_data_rate: Rate;
+
+  /** The group judge (relay/group-judge.ts) - volume, speed and the live accuracy proxies. */
+  judge: JudgeRates;
 
   not_measurable: {
     traveller_self_service_rate: NotMeasurable;
@@ -151,6 +173,22 @@ function channelRoleRate(cell: ChannelRoleCounts): ChannelRoleRate {
 export const RELAY_RESTART_CAVEAT =
   "a relay restart loses in-memory reply attribution; on a day the relay restarted, unanswered/lost-turn counts (and every rate derived from them) are an upper bound, not an exact count";
 
+function judgeRates(judge: DayRollup["judge"]): JudgeRates {
+  const decisions = judge.yes + judge.no + judge.fallback;
+  const sorted = [...judge.latency_ms].sort((a, b) => a - b);
+  return {
+    decisions,
+    yes_rate: rate(judge.yes, decisions),
+    fallback_rate: rate(judge.fallback, decisions),
+    fallback_by_reason: { ...judge.fallback_by_reason },
+    missed_proxy: rate(judge.missed, judge.no),
+    over_eager_proxy: rate(judge.over_eager, judge.yes),
+    latency_p50_ms: percentileRate(sorted, 50),
+    latency_p95_ms: percentileRate(sorted, 95),
+    by_model: { ...judge.by_model },
+  };
+}
+
 /**
  * Every rate the relay's own facts can honestly support, for one trip's one
  * local day — from a `DayRollup` alone, nothing re-queried.
@@ -185,6 +223,7 @@ export function deriveRates(rollup: DayRollup): DayRates {
     by_channel_role: rollup.by_channel_role.map(channelRoleRate),
     grounded_answer_rate: rate(grounded_answer, toolCallsTotal),
     missing_data_rate: rate(missing_data, toolCallsTotal),
+    judge: judgeRates(rollup.judge ?? emptyJudgeRollup()),
     not_measurable: {
       traveller_self_service_rate: notMeasurable(),
       post_write_trust_rate: notMeasurable(),
@@ -225,5 +264,6 @@ export function emptyDayRollup(tripId: string, localDay: string): DayRollup {
       missing_data: 0,
       missing_data_by_tool: {},
     },
+    judge: emptyJudgeRollup(),
   };
 }

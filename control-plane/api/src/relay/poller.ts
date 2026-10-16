@@ -172,6 +172,7 @@ import { parkDeferredVenueLinks } from "../venue-links.js";
 import { provisionOnConfirm } from "../planner.js";
 import type { RosterChoice } from "../organizer-identity.js";
 import type { RelayAssistantEvents, RelayToolOutcome } from "../analytics/emitter.js";
+import type { GroupJudge } from "./group-judge.js";
 
 /**
  * Reading a booking PDF and turning it into answers took ~94 seconds on the
@@ -290,6 +291,12 @@ export interface TripBotPollerDeps {
    * into it is synchronous and cannot throw; see analytics/emitter.ts.
    */
   assistantEvents?: RelayAssistantEvents;
+  /**
+   * The group judge (group-judge.ts), or absent - the default: an unaddressed
+   * group message is then NOT_ADDRESSED exactly as before it existed. Built by
+   * server.ts from the same runner as every other task (JUDGE_RUNNER).
+   */
+  groupJudge?: GroupJudge;
   /**
    * The organizer's private-chat document route, from
    * ORGANIZER_DOCUMENT_ROUTE_ENABLED (document-correction.ts). Absent — the
@@ -5408,6 +5415,7 @@ export function startTripBotPoller(
             ...(deps.modelRunner ? { modelRunner: deps.modelRunner } : {}),
             // Descriptors only when something will record them (#177).
             ...(deps.assistantEvents ? { assistantEvents: true } : {}),
+            ...(deps.groupJudge ? { groupJudge: deps.groupJudge } : {}),
             ...(deps.organizerDocumentRoute === true ? { organizerDocumentRoute: true } : {}),
             // Asked per update rather than cached: a gateway can stop between
             // one message and the next, and a stale "reachable" spends the

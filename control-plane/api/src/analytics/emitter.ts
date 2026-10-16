@@ -33,6 +33,7 @@ import type pg from "pg";
 import { structuredLog } from "../redaction.js";
 import {
   boundedCount,
+  isJudgeModelId,
   lengthBucketOf,
   MAX_LATENCY_MS,
   validateAssistantEvent,
@@ -41,7 +42,7 @@ import {
   type EventType,
   type Outcome,
 } from "./contract.js";
-import type { InboundFacts } from "./relay-facts.js";
+import type { InboundFacts, JudgeFacts } from "./relay-facts.js";
 import { writeAssistantEvents, type WriteResult } from "./store.js";
 
 /** Where flushed batches go. The database in production; anything in a test. */
@@ -121,6 +122,15 @@ interface ChatContext {
 
 const LOG_EVERY_MS = 60_000;
 
+/**
+ * How long after a judge_no the same sender's next message still counts as the
+ * "missed" proxy (a judge said no, and they had to say it by name).
+ */
+export const JUDGE_MISSED_WINDOW_MS = 3 * 60_000;
+
+/** The triggers that mean the sender addressed the assistant themselves. */
+const SELF_ADDRESSED: ReadonlySet<string> = new Set(["name", "mention", "reply_to_bot"]);
+
 export class RelayAssistantEvents implements ReplyObserver {
   private readonly sink: AssistantEventSink;
   private readonly log: (line: string) => void;
@@ -139,6 +149,8 @@ export class RelayAssistantEvents implements ReplyObserver {
   private readonly openTurns = new Map<string, OpenTurn[]>();
   private readonly lastAnswered = new Map<string, { turn: OpenTurn; until: number }>();
   private readonly chats = new Map<string, ChatContext>();
+  /** (chat, sender) -> when the judge last said no to that sender's message and nothing has been heard from them since. Memory only. */
+  private readonly judgeNos = new Map<string, number>();
   private inFlight: Promise<void> | null = null;
   /** The sink write still running, whether awaited (inFlight) or abandoned at its timeout. */
   private outstanding: Promise<void> | null = null;
@@ -183,6 +195,14 @@ export class RelayAssistantEvents implements ReplyObserver {
       this.enqueue("ignored_not_addressed", "ignored_not_addressed", facts, {
         metadata: facts.documentHeld ? { document_held: true } : {},
       });
+      if (facts.judge) this.enqueueJudge(facts);
+      // The sender spoke again without addressing the assistant: whatever the
+      // judge said before is no longer their NEXT message's to be compared with.
+      const key = senderKeyOf(facts);
+      if (key) {
+        if (facts.judge?.outcome === "judge_no") this.touch(this.judgeNos, key, this.now());
+        else this.judgeNos.delete(key);
+      }
     });
   }
 
@@ -193,8 +213,10 @@ export class RelayAssistantEvents implements ReplyObserver {
   handedOff(chatKey: string, facts: InboundFacts, delivered: boolean, messageId?: string): void {
     this.guard(() => {
       this.rememberChat(chatKey, facts);
+      this.noteSenderSpoke(facts);
       if (!delivered) {
         this.enqueue("turn_lost", "lost_gateway_unavailable", facts, {});
+        if (facts.judge) this.enqueueJudge(facts);
         return;
       }
       const turn: OpenTurn = { turnId: this.newId(), at: this.now(), facts, ...(messageId ? { messageId } : {}) };
@@ -209,6 +231,10 @@ export class RelayAssistantEvents implements ReplyObserver {
           documents: boundedCount(facts.documents ?? 0),
         },
       });
+      // The judge's yes carries the SAME turn id as the request it caused, so
+      // the report can see what the companion did with it (a suppressed reply
+      // is the over-eager proxy).
+      if (facts.judge) this.enqueueJudge(facts, turn.turnId);
     });
   }
 
@@ -315,6 +341,34 @@ export class RelayAssistantEvents implements ReplyObserver {
         metadata: {},
         tool_name: null,
       });
+    });
+  }
+
+  /**
+   * This sender's message was handed to the assistant. If the judge said no to
+   * their previous message a moment ago and THIS one addressed the assistant
+   * themselves (name, @mention, reply), the judge missed: recorded once, as an
+   * event about the earlier decision.
+   */
+  private noteSenderSpoke(facts: InboundFacts): void {
+    const key = senderKeyOf(facts);
+    if (!key) return;
+    const before = this.judgeNos.get(key);
+    this.judgeNos.delete(key);
+    if (before === undefined || !SELF_ADDRESSED.has(facts.triggerType)) return;
+    const gap = this.now() - before;
+    if (gap < 0 || gap > JUDGE_MISSED_WINDOW_MS) return;
+    this.enqueue("group_judged", "judge_missed", facts, { latencyMs: gap });
+  }
+
+  /** The judge's decision about the message `facts` describes. */
+  private enqueueJudge(facts: InboundFacts, turnId?: string): void {
+    const judge = facts.judge;
+    if (!judge) return;
+    this.enqueue("group_judged", judge.outcome, facts, {
+      ...(turnId ? { turnId } : {}),
+      latencyMs: judge.latencyMs,
+      metadata: judgeMetadata(judge),
     });
   }
 
@@ -530,6 +584,23 @@ function sleep(ms: number): Promise<void> {
     const timer = setTimeout(resolve, ms);
     timer.unref?.();
   });
+}
+
+/** `chat\0sender` for the missed-proxy map, or null when the facts carry no key. */
+function senderKeyOf(facts: InboundFacts): string | null {
+  return facts.chatKey && facts.senderKey ? `${facts.chatKey}\u0000${facts.senderKey}` : null;
+}
+
+/** The judge's bounded metadata. A model id the contract would refuse is left out; the decision is still recorded. */
+function judgeMetadata(judge: JudgeFacts): EventMetadata {
+  return {
+    ...(judge.confidencePct !== undefined
+      ? { judge_confidence_pct: Math.min(100, Math.max(0, Math.round(judge.confidencePct))) }
+      : {}),
+    ...(judge.model && isJudgeModelId(judge.model) ? { judge_model: judge.model } : {}),
+    ...(judge.fallbackReason ? { judge_fallback_reason: judge.fallbackReason } : {}),
+    ...(judge.belowThreshold ? { judge_below_threshold: true } : {}),
+  };
 }
 
 function clampLatency(ms: number): number {

@@ -901,6 +901,14 @@ export interface HttpSpec {
    */
   jsonMode: boolean;
   maxOutputTokens?: number;
+  /**
+   * OpenRouter provider routing, sent as the request's `provider` object. Only a
+   * task that has a reason sets it (`OPENROUTER_TASK_OPTIONS`): the group judge
+   * sends `{ data_collection: "deny" }` because it reads family chatter. Routing
+   * WITHIN one model - which host serves it - never a different model, so it is
+   * not the fallback the note in `callOpenRouter` forbids.
+   */
+  provider?: Readonly<Record<string, unknown>>;
 }
 
 export function openRouterSpec(
@@ -992,6 +1000,7 @@ async function callOpenRouter(
     // Token counts and the charged cost come back on the response.
     usage: { include: true },
     ...(spec.maxOutputTokens ? { max_tokens: spec.maxOutputTokens } : {}),
+    ...(spec.provider ? { provider: spec.provider } : {}),
     // NOTE: deliberately no `models: [...]` fallback array. OpenRouter's own
     // model-fallback is precisely the thing that finished an interview under a
     // different model on 2026-09-07. Provider routing WITHIN one model is fine
@@ -1365,6 +1374,9 @@ export const DEFAULT_PLAN_REVIEW_MODEL = "minimax/minimax-m3";
  */
 export const FORBIDDEN_MODELS: ReadonlySet<string> = new Set(["openrouter/auto", "openrouter/auto-beta"]);
 
+/** The judge's default hard timeout. The turn waits on it, so it is short on purpose. */
+export const GROUP_JUDGE_TIMEOUT_MS = 3_000;
+
 /**
  * Every task a model can be pinned to, and how the environment names it.
  *
@@ -1391,7 +1403,37 @@ export const MODEL_TASKS: readonly {
   // is codex on most stacks, and codex cannot take the file (ATTACHMENT_RUNNERS).
   // No OpenRouter default either — no vision model has been measured yet.
   { task: "read_image", prefix: "VISION", timeoutMs: 90_000 },
+  // The group judge (relay/group-judge.ts): "is this unaddressed group message
+  // for the trip assistant?" Inherits nothing - it must never ride on INTERPRET_*
+  // or EXTRACT_* (a metered, slow model on every line of family chatter) - and has
+  // NO default model: which free model is good enough is a measurement
+  // (tools/judge-benchmark.ts), so JUDGE_MODEL is configuration or the judge is off.
+  // 3s is a hard ceiling; the target is p95 under 1.5s.
+  { task: "group_judge", prefix: "JUDGE", timeoutMs: GROUP_JUDGE_TIMEOUT_MS },
 ];
+
+/**
+ * Per-task OpenRouter options, applied by `runnerForBinding` to OpenRouter
+ * bindings only (the other runners have no equivalent). Absent task = the
+ * defaults every task has always had.
+ *
+ * `group_judge`: one attempt (a retry doubles a latency the turn is waiting on,
+ * and a failed judge fails closed anyway), a small answer, and the provider
+ * routed with data collection DENIED - the judge reads what a family wrote to
+ * each other, so a provider that may log or train on prompts is not eligible.
+ * The cost of that: OpenRouter then serves the model only from endpoints that
+ * do not collect, and answers 404 when there are none; many `:free` models have
+ * only collecting endpoints. That is an error, which the judge turns into
+ * "not addressed" - the safe direction - but it means a free model has to be
+ * chosen against this constraint (tools/judge-benchmark.ts shows the error count).
+ */
+export const OPENROUTER_TASK_OPTIONS: Readonly<Record<string, Partial<HttpSpec>>> = {
+  group_judge: {
+    maxAttempts: 1,
+    maxOutputTokens: 256,
+    provider: { data_collection: "deny" },
+  },
+};
 
 /** A task's timeout: its own `<PREFIX>_TIMEOUT_MS`, else what it inherits, else its default. */
 export function taskTimeoutMs(task: string, env: NodeJS.ProcessEnv = process.env): number {
@@ -1431,7 +1473,7 @@ export function runnerForBinding(
   if (kind === "openrouter") {
     const key = openRouterKey(env);
     if (!key) return undefined;
-    return openRouterRunner({ [task]: openRouterSpec(model, key, timeoutMs) });
+    return openRouterRunner({ [task]: openRouterSpec(model, key, timeoutMs, OPENROUTER_TASK_OPTIONS[task] ?? {}) });
   }
   if (kind === "codex") return codexRunner({ [task]: codexSpec(model, timeoutMs, { bin: env.CODEX_BIN || "codex" }) });
   // `<TASK>_EFFORT`, read here because this is now the ONE place a claude

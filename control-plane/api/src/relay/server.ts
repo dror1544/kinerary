@@ -49,6 +49,7 @@ import { HttpTelegramClient, TELEGRAM_API_ROOT, telegramApiRoot, type TelegramCl
 import { assistantEventsFromEnv, assistantEventsSetting } from "../analytics/emitter.js";
 import { startAssistantEventsPurge } from "../analytics/purge-schedule.js";
 import { organizerDocumentRouteFromEnv } from "../document-correction.js";
+import { groupJudgeFromEnv } from "./group-judge.js";
 
 const log = (line: string) => process.stderr.write(`${line}\n`);
 
@@ -281,6 +282,11 @@ async function main(): Promise<void> {
     ? switchableRunner(envRunner, (task, binding) =>
         runnerForBinding(binding.runner, binding.model, taskTimeoutMs(task), task))
     : undefined;
+  // The group judge: asked, last of all, whether an unaddressed group message
+  // is meant for the assistant. Its model is the `group_judge` task
+  // (JUDGE_RUNNER / JUDGE_MODEL / JUDGE_TIMEOUT_MS / JUDGE_MIN_CONFIDENCE);
+  // unset it is OFF, said once here, never an error.
+  const groupJudge = groupJudgeFromEnv(modelRunner, process.env, log);
   const mediaBaseUrl = `http://${runtime.host === "0.0.0.0" ? "127.0.0.1" : runtime.host}:${runtime.port}`;
 
   // Assistant events (#177): metadata-only facts about each trip's
@@ -434,6 +440,7 @@ async function main(): Promise<void> {
       // intake-copy.ts, which is slower, not broken.
       modelRunner,
       ...(assistantEvents ? { assistantEvents } : {}),
+      ...(groupJudge ? { groupJudge } : {}),
       ...(organizerDocumentRoute ? { organizerDocumentRoute: true } : {}),
       log,
     });
