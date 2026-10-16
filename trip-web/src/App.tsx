@@ -1208,12 +1208,26 @@ function bookingState(booking: Booking) {
   return "needs-review";
 }
 
+// The installed (home-screen) app: both the iOS flag and the standard media
+// query, as Classic's isStandaloneAppMode does. The manifest is shared, so
+// Modern installs as a standalone app too.
+function isStandaloneAppMode() {
+  return (window.navigator as Navigator & { standalone?: boolean }).standalone === true
+    || (typeof window.matchMedia === "function" && window.matchMedia("(display-mode: standalone)").matches);
+}
+
 function AuthenticatedDocumentAction({ url, filename, download, label }: { url: string; filename: string; download?: boolean; label: React.ReactNode }) {
   const [error, setError] = useState("");
+  // Fetch first, then open a tab with the blob URL already in hand. Opening a
+  // blank tab before the fetch and filling it in afterwards left that tab blank
+  // — the bug Classic's openAuthedBlob (site/app.js) already fixed. A slow
+  // fetch can outlast the click's activation, after which window.open is
+  // silently blocked (and with "noopener" it returns null either way, so its
+  // result says nothing), so when activation cannot be confirmed — or in the
+  // installed app, where a second window is unwanted — the document opens in
+  // this tab instead.
   const open = async () => {
     setError("");
-    const documentWindow = download ? null : window.open("", "_blank");
-    if (documentWindow) documentWindow.opener = null;
     try {
       const blob = await getAuthenticatedDocument(url);
       const objectUrl = URL.createObjectURL(blob);
@@ -1221,15 +1235,16 @@ function AuthenticatedDocumentAction({ url, filename, download, label }: { url: 
         const link = document.createElement("a");
         link.href = objectUrl;
         link.download = filename;
+        document.body.appendChild(link);
         link.click();
-      } else if (documentWindow) {
-        documentWindow.location.replace(objectUrl);
+        link.remove();
+      } else if (!isStandaloneAppMode() && (navigator.userActivation?.isActive ?? false)) {
+        window.open(objectUrl, "_blank", "noopener");
       } else {
         window.location.assign(objectUrl);
       }
       window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
     } catch (reason) {
-      documentWindow?.close();
       setError(reason instanceof Error ? reason.message : "Could not retrieve document");
     }
   };
