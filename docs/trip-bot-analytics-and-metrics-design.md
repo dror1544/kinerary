@@ -985,7 +985,11 @@ the setting unset the same week writes nothing.
   `channel_post`). Both are carry-forward. `requester_role` has
   `unclassified` in place of `unauthorized`. `trigger_type` adds `name`
   (addressed by the assistant's name), `reply_window` (the one-shot reply
-  window, migration 0053) and `not_addressed`. In every field an input the
+  window, migration 0053), `conversation_window` (a message admitted only
+  because its sender is in the companion's conversation window: merged in
+  PR #406, migration `20261016120000`, reported when none of the gate's own
+  predicates applied, so it cannot misname a mention or a reply) and
+  `not_addressed`. In every field an input the
   mapper does not recognise becomes `unclassified` — never a real bucket — so
   a new chat type or attachment kind shows up as a visible count.
 - **The gate is recorded, never re-decided.** `addressed` comes from dispatch;
@@ -1317,3 +1321,44 @@ Open items for later slices:
   this in production — nothing does yet, the CLI is the only caller; the
   dashboard that would render `DailyReport` for a person (§14's next slice,
   explicitly out of these paths — nothing under `web/` changed).
+
+### 16.9 Group participation: conversation window (merged) and the judge (pending)
+
+Owner's decisions of 2026-10-16 and the reasoning:
+`docs/group-participation-design.md`. This section records only what they do to
+the event record.
+
+**Merged, PR #406 (sprint branch; not on `main`, not deployed).**
+
+- `trigger_type` has a new closed value, `conversation_window` (migration
+  `20261016120000`; `analytics/schemas/tripbot-event.v1.json` and
+  `analytics/contract.ts` updated). It is given to a message admitted only
+  because its sender is in the companion's conversation window. `classifyTrigger`
+  tests it last, after `reply_window`, `reply_to_bot`, `mention` and `name`, so
+  a message that qualified by any of those is never named for the window. The
+  reason for a new value, from the migration: calling such a message any of the
+  others would make the trigger mix lie about how people reach the assistant.
+- When the companion answers a window-admitted message with the stay-silent
+  sentinel, the connector records `reply_sent` with outcome `suppressed` and the
+  content length of the sentinel (`connector.ts`), the same outcome the
+  internal-leak suppression uses. A rollup therefore cannot tell a stayed-silent
+  send from a leak suppression by outcome alone; the log line
+  `trip_bot.companion_stayed_silent` is the separate trace. Not decided here
+  whether that needs its own outcome: it matters for the judge's "over-eager"
+  proxy below.
+
+**Pending #407 (draft, unmerged): not built, nothing below exists in the tree.**
+Names and shapes of the judge's events are not decided; only what must be
+measurable is:
+
+| Measure | Definition (owner, 2026-10-16) |
+|---|---|
+| Judge precision / recall | offline, `tools/judge-benchmark.ts` on a 60-message synthetic Hebrew/English set; targets precision at least 90%, recall at least 75% |
+| Judge latency | p95 at most 1.5 s; hard timeout 3 s |
+| Missed (live proxy) | after a judge-no, the same sender re-addresses the companion within 3 minutes |
+| Over-eager (live proxy) | after a judge-yes, the companion stayed silent |
+| Proactive level lowered | the rate of groups lowering their `/proactive` level, as a signal |
+
+A "Judge" section in the daily report is wanted (section 16.8's report is where
+it would go). Still privacy-bound by section 16.1: any judge event holds no
+message text, as for every other event.
