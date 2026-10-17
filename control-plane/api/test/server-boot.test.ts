@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -344,3 +344,70 @@ test("the real server entrypoint boots when several shared secret keys are all g
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+/**
+ * The boot tests above prove server.ts mounts the operator and admin routes
+ * when CONTROL_PLANE_OPERATOR_KEY / CONTROL_PLANE_ADMIN_KEY are set in the
+ * process's own env — but nothing proved those two keys ever REACH the
+ * container's env in the first place. Today's regression plan found exactly
+ * that gap live: compose.vm.yml's `api:` service had no passthrough for
+ * either, so every operator-key-gated route (including #410's
+ * trip-force-clear) 503'd on the VM no matter what vm.env held. This is a
+ * plain-text check on the compose files rather than a `docker compose up`
+ * boot, because nothing in this repo runs compose in CI and adding that
+ * weight for two YAML lines would be disproportionate — see the handover for
+ * this task for why that tradeoff was made explicitly, not by default.
+ */
+function extractServiceBlock(composeText: string, serviceName: string): string {
+  const lines = composeText.split("\n");
+  const startIndex = lines.findIndex((line) => line === `  ${serviceName}:`);
+  assert.notEqual(startIndex, -1, `service '${serviceName}' not found in compose file`);
+  let endIndex = lines.length;
+  for (let i = startIndex + 1; i < lines.length; i++) {
+    // A line indented exactly two spaces, with non-whitespace next, is the
+    // next top-level service (or top-level key like `secrets:`/`networks:`).
+    if (/^ {2}\S/.test(lines[i])) {
+      endIndex = i;
+      break;
+    }
+  }
+  return lines.slice(startIndex, endIndex).join("\n");
+}
+
+for (const composeFile of ["compose.vm.yml", "compose.local.yml"]) {
+  test(`${composeFile}'s api service passes CONTROL_PLANE_OPERATOR_KEY and CONTROL_PLANE_ADMIN_KEY through, optionally`, async () => {
+    const composePath = fileURLToPath(new URL(`../../deployment/${composeFile}`, import.meta.url));
+    const composeText = await readFile(composePath, "utf8");
+    const apiBlock = extractServiceBlock(composeText, "api");
+
+    // Present, and optional (`:-`) — server.ts treats an unset operator or
+    // admin key as "route stays unmounted, 503", not a boot failure, so `:?`
+    // (which fails `docker compose up` outright) would be wrong here. See
+    // server.ts's operatorKey/adminKey blocks for why.
+    assert.match(
+      apiBlock,
+      /CONTROL_PLANE_OPERATOR_KEY: \$\{CONTROL_PLANE_OPERATOR_KEY:-\}/,
+      `${composeFile}'s api service must pass CONTROL_PLANE_OPERATOR_KEY through as an optional var`,
+    );
+    assert.match(
+      apiBlock,
+      /CONTROL_PLANE_ADMIN_KEY: \$\{CONTROL_PLANE_ADMIN_KEY:-\}/,
+      `${composeFile}'s api service must pass CONTROL_PLANE_ADMIN_KEY through as an optional var`,
+    );
+
+    // Neither of the two most-privileged API keys should be wired into any
+    // OTHER service in this file — they gate api-only routes, and a stray
+    // passthrough elsewhere would widen who can present them.
+    const withoutApiBlock = composeText.replace(apiBlock, "");
+    assert.doesNotMatch(
+      withoutApiBlock,
+      /CONTROL_PLANE_OPERATOR_KEY/,
+      `${composeFile} must not reference CONTROL_PLANE_OPERATOR_KEY outside the api service`,
+    );
+    assert.doesNotMatch(
+      withoutApiBlock,
+      /CONTROL_PLANE_ADMIN_KEY/,
+      `${composeFile} must not reference CONTROL_PLANE_ADMIN_KEY outside the api service`,
+    );
+  });
+}
