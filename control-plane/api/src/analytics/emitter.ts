@@ -42,7 +42,7 @@ import {
   type EventType,
   type Outcome,
 } from "./contract.js";
-import type { InboundFacts, JudgeFacts } from "./relay-facts.js";
+import type { InboundFacts, JudgeFacts, LevelChangeFacts } from "./relay-facts.js";
 import { writeAssistantEvents, type WriteResult } from "./store.js";
 
 /** Where flushed batches go. The database in production; anything in a test. */
@@ -235,6 +235,34 @@ export class RelayAssistantEvents implements ReplyObserver {
       // the report can see what the companion did with it (a suppressed reply
       // is the over-eager proxy).
       if (facts.judge) this.enqueueJudge(facts, turn.turnId);
+    });
+  }
+
+  /**
+   * An organizer set a group's proactive level. One event, no chat and no
+   * person: the trip, which way it moved, and the new level - so the daily
+   * report can show how many groups turn the assistant down.
+   */
+  proactiveLevelChanged(change: LevelChangeFacts): void {
+    this.guard(() => {
+      this.push({
+        event_id: this.newId(),
+        trip_id: change.tripId,
+        occurred_at: new Date(this.now()).toISOString(),
+        source_service: "relay",
+        event_type: "proactive_level_changed",
+        turn_id: null,
+        channel_type: "group",
+        trigger_type: null,
+        // The command is organizer-only (dispatch checks it), so the role is a fact.
+        requester_role: "organizer",
+        outcome: change.direction === "raised" ? "level_raised" : "level_lowered",
+        response_latency_ms: null,
+        message_length_bucket: null,
+        media_kind: null,
+        metadata: { proactive_level: change.level },
+        tool_name: null,
+      });
     });
   }
 

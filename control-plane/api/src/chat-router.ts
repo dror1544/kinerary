@@ -373,6 +373,28 @@ export async function resolveChatRoute(db: pg.Pool, chatId: string): Promise<Cha
   return { kind: "unbound" };
 }
 
+// ── The proactive level (/proactive) ─────────────────────────────────────────
+
+/**
+ * How much a group wants the assistant to take part (owner's decision,
+ * 2026-10-16) - a PREFERENCE per group binding, not a privacy switch:
+ *
+ *   1 only when called: its name, an @mention, a reply to one of its messages;
+ *   2 follows the conversation: 1, plus the one-shot "?" window (0053) and the
+ *     conversation window (0053+1); no judge - the behaviour before the judge;
+ *   3 joins in: 2, plus the group judge asking whether a message is for it.
+ *     The default.
+ *
+ * The gates are `AND b.proactive_level >= N` inside the statements that already
+ * read the binding, so a level costs no extra query; only the judge, which is a
+ * model call anyway, reads the level on its own (`groupProactiveLevel`).
+ */
+export const PROACTIVE_ONLY_WHEN_CALLED = 1;
+export const PROACTIVE_FOLLOWS_CONVERSATION = 2;
+export const PROACTIVE_JOINS_IN = 3;
+export const DEFAULT_PROACTIVE_LEVEL = PROACTIVE_JOINS_IN;
+export type ProactiveLevel = 1 | 2 | 3;
+
 // ── Companion reply capture ──────────────────────────────────────────────────
 
 /**
@@ -433,6 +455,7 @@ export async function consumeExpectsReplyWindow(db: pg.Pool, chatId: string): Pr
         AND b.trip_id = t.id
         AND b.awaiting_reply_since IS NOT NULL
         AND t.companion_reply_capture_enabled
+        AND b.proactive_level >= ${PROACTIVE_FOLLOWS_CONVERSATION}
         AND b.awaiting_reply_since >= now() - make_interval(secs => COALESCE(b.awaiting_reply_floor_seconds, $2))`,
     [chatId, EXPECTS_REPLY_WINDOW_SECONDS],
   );
@@ -506,7 +529,8 @@ export async function openCompanionConversation(
       WHERE b.chat_id = $1
         AND b.closed_at IS NULL
         AND b.trip_id = t.id
-        AND t.companion_reply_capture_enabled`,
+        AND t.companion_reply_capture_enabled
+        AND b.proactive_level >= ${PROACTIVE_FOLLOWS_CONVERSATION}`,
     [chatId, userId, ttlSeconds, maxMembers],
   );
 }
@@ -558,6 +582,7 @@ export async function inCompanionConversation(
       WHERE b.chat_id = $1
         AND b.closed_at IS NULL
         AND t.companion_reply_capture_enabled
+        AND b.proactive_level >= ${PROACTIVE_FOLLOWS_CONVERSATION}
         AND b.conversation_until > now()
         AND $2::text = ANY(b.conversation_user_ids)
       LIMIT 1`,
@@ -566,39 +591,65 @@ export async function inCompanionConversation(
   return (result.rowCount ?? 0) > 0;
 }
 
-// ── The group judge's per-group switch (/listen) ─────────────────────────────
+// ── /proactive: reading and setting the level ───────────────────────────────
 
 /**
- * May the relay ask the group judge about an unaddressed message in this chat?
- *
- * True only for an open binding whose `listen_judge_enabled` is on AND whose
- * trip has not opted out of reply capture: `companion_reply_capture_enabled`
- * is the trip's "do not let unaddressed messages in" switch (0053) and covers
- * every window the relay adds, the judge included. A chat with no open binding
- * reads false. THROWS on a failed read (a relay that runs ahead of its
- * migration): the caller treats that as "no judge", never as "judge".
+ * The level the relay ACTS on in this chat: 1, 2 or 3, or null when the chat has
+ * no open binding. A trip that opted out of reply capture
+ * (`companion_reply_capture_enabled`, 0053) reads as level 1: that switch already
+ * turns off both windows, and the judge is the third way an unaddressed message
+ * gets in, so a trip that said "do not let unaddressed messages in" is
+ * "only when called" whatever level was set on its group. THROWS on a failed read
+ * (a relay running ahead of its migration); the caller treats that as "no judge".
  */
-export async function groupListenEnabled(db: pg.Pool, chatId: string): Promise<boolean> {
-  const result = await db.query<{ on: boolean }>(
-    `SELECT (b.listen_judge_enabled AND t.companion_reply_capture_enabled) AS on
+export async function groupProactiveLevel(db: pg.Pool, chatId: string): Promise<ProactiveLevel | null> {
+  const result = await db.query<{ level: number }>(
+    `SELECT CASE WHEN t.companion_reply_capture_enabled THEN b.proactive_level ELSE 1 END AS level
        FROM control_plane.telegram_chat_bindings b
        JOIN control_plane.trips t ON t.id = b.trip_id
       WHERE b.chat_id = $1 AND b.closed_at IS NULL
       LIMIT 1`,
     [chatId],
   );
-  return result.rows[0]?.on === true;
+  const level = result.rows[0]?.level;
+  return level === 1 || level === 2 || level === 3 ? level : null;
 }
 
-/** Sets the group's judge switch. Returns false when the chat has no open binding. */
-export async function setGroupListen(db: pg.Pool, chatId: string, enabled: boolean): Promise<boolean> {
-  const result = await db.query(
-    `UPDATE control_plane.telegram_chat_bindings
-        SET listen_judge_enabled = $2
-      WHERE chat_id = $1 AND closed_at IS NULL`,
-    [chatId, enabled],
+/** The level the organizer SET on this chat's binding, for `/proactive` to show; null without an open binding. */
+export async function groupProactiveLevelSetting(db: pg.Pool, chatId: string): Promise<ProactiveLevel | null> {
+  const result = await db.query<{ level: number }>(
+    `SELECT proactive_level AS level FROM control_plane.telegram_chat_bindings
+      WHERE chat_id = $1 AND closed_at IS NULL LIMIT 1`,
+    [chatId],
   );
-  return (result.rowCount ?? 0) > 0;
+  const level = result.rows[0]?.level;
+  return level === 1 || level === 2 || level === 3 ? level : null;
+}
+
+/**
+ * Sets the group's level. Returns the level it had before (so the caller can say
+ * whether this was a raise or a lowering), or null when the chat has no open
+ * binding and nothing changed. One statement: the old value is read from the same
+ * row version the update replaces.
+ */
+export async function setGroupProactiveLevel(
+  db: pg.Pool,
+  chatId: string,
+  level: ProactiveLevel,
+): Promise<ProactiveLevel | null> {
+  const result = await db.query<{ previous: number }>(
+    `UPDATE control_plane.telegram_chat_bindings b
+        SET proactive_level = $2
+       FROM (SELECT id, proactive_level AS previous
+               FROM control_plane.telegram_chat_bindings
+              WHERE chat_id = $1 AND closed_at IS NULL
+              FOR UPDATE) old
+      WHERE b.id = old.id
+      RETURNING old.previous AS previous`,
+    [chatId, level],
+  );
+  const previous = result.rows[0]?.previous;
+  return previous === 1 || previous === 2 || previous === 3 ? previous : null;
 }
 
 /**
@@ -609,7 +660,7 @@ export async function setGroupListen(db: pg.Pool, chatId: string, enabled: boole
  * or the sender's verified Telegram identity (0052) belongs to a user holding
  * an active OWNER membership on this trip. Unknown, an anonymous group admin
  * and a failed lookup are all "no" - a command that changes how the whole room
- * is listened to is not offered to a stranger.
+ * is involved is not offered to a stranger.
  */
 export async function isTripOrganizer(db: pg.Pool, tripId: string, telegramUserId: string): Promise<boolean> {
   if (!tripId || !telegramUserId) return false;

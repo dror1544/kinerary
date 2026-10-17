@@ -44,8 +44,11 @@ import {
   consumeExpectsReplyWindow,
   inCompanionConversation,
   openCompanionConversation,
-  groupListenEnabled,
-  setGroupListen,
+  groupProactiveLevel,
+  groupProactiveLevelSetting,
+  setGroupProactiveLevel,
+  PROACTIVE_JOINS_IN,
+  type ProactiveLevel,
   isTripOrganizer,
   tripLanguage,
 } from "../chat-router.js";
@@ -53,17 +56,16 @@ import { listOrganizerTrips, switchChatToTrip, type OrganizerTrip } from "../org
 import { isAddressedToAssistant } from "./addressing.js";
 import { conversationMark } from "./stay-silent.js";
 import type { GroupJudge, JudgeOutcome } from "./group-judge.js";
-import { classifyTrigger, inboundFacts, type InboundFacts, type JudgeFacts } from "../analytics/relay-facts.js";
+import { classifyTrigger, inboundFacts, type InboundFacts, type JudgeFacts, type LevelChangeFacts } from "../analytics/relay-facts.js";
 import { coerceLanguage, uiString, type Language } from "../intake-copy.js";
 import {
   companionHelpText,
   groupBindingCommand,
   groupIntroText,
-  listenChanged,
-  listenInPrivateChat,
-  listenRefused,
-  listenStatus,
-  listenUsage,
+  proactiveChanged,
+  proactiveInPrivateChat,
+  proactiveRefused,
+  proactiveStatus,
   renameConfirmation,
   renameRefused,
   renameUsage,
@@ -114,7 +116,7 @@ export type DispatchDecision =
    * The connector answers this one itself. `analytics` is set only on the
    * companion-unreachable answer, which is a lost turn (#177).
    */
-  | { kind: "reply"; reply: DirectReply; analytics?: InboundFacts }
+  | { kind: "reply"; reply: DirectReply; analytics?: InboundFacts; levelChange?: LevelChangeFacts }
   | {
       /**
        * The bot has just been added to a group bound to a trip: send the
@@ -778,12 +780,13 @@ export async function dispatchUpdate(
     }
   }
 
-  // `/listen`, `/listen on`, `/listen off`: the organizer's switch for the group
-  // judge in THIS group (relay/group-judge.ts). Anyone may read the setting;
-  // only the trip's organizer - a fact from the control plane's own links, never
-  // from the message - may change it. Router-owned like /name: it changes what
-  // the router hears, and Hermes' own command surface is not ours to extend.
-  if (parsed.kind === "command" && parsed.name === "listen") {
+  // `/proactive`, `/proactive 1|2|3`: how much the assistant takes part in THIS
+  // group (chat-router.ts, PROACTIVE_*). A preference, not a privacy switch.
+  // Anyone may read it; only the trip's organizer - a fact from the control
+  // plane's own links, never from the message - may change it. Router-owned like
+  // /name: it changes what the router hears, and Hermes' own command surface is
+  // not ours to extend.
+  if (parsed.kind === "command" && parsed.name === "proactive") {
     const route = await resolveChatRoute(db, chatId);
     if (route.kind === "unbound") {
       return { kind: "reply", reply: { chatId, text: strings.unbound } };
@@ -791,24 +794,31 @@ export async function dispatchUpdate(
     if (route.kind === "companion") {
       const language = await tripLanguage(db, route.tripId);
       if (message.chat?.type === "private") {
-        return { kind: "reply", reply: { chatId, text: listenInPrivateChat(language) } };
+        return { kind: "reply", reply: { chatId, text: proactiveInPrivateChat(language) } };
       }
-      const argument = (parsed.argument ?? "").trim().toLowerCase();
-      if (!argument) {
-        const on = await groupListenEnabled(db, chatId).catch(() => false);
-        return { kind: "reply", reply: { chatId, text: listenStatus(language, on) } };
-      }
-      if (argument !== "on" && argument !== "off") {
-        return { kind: "reply", reply: { chatId, text: listenUsage(language) } };
+      const argument = (parsed.argument ?? "").trim();
+      const requested = argument === "1" || argument === "2" || argument === "3" ? (Number(argument) as ProactiveLevel) : null;
+      // Nothing, or something that is not 1, 2 or 3: the options. A read never needs a role.
+      if (requested === null) {
+        const current = (await groupProactiveLevelSetting(db, chatId).catch(() => null)) ?? PROACTIVE_JOINS_IN;
+        return { kind: "reply", reply: { chatId, text: proactiveStatus(language, current) } };
       }
       const senderId = message.from?.id === undefined ? null : String(message.from.id);
       if (!senderId || !(await isTripOrganizer(db, route.tripId, senderId))) {
-        log(structuredLog("info", "trip_bot.listen_refused", { reason: "NOT_ORGANIZER" }));
-        return { kind: "reply", reply: { chatId, text: listenRefused(language) } };
+        log(structuredLog("info", "trip_bot.proactive_refused", { reason: "NOT_ORGANIZER" }));
+        return { kind: "reply", reply: { chatId, text: proactiveRefused(language) } };
       }
-      const changed = await setGroupListen(db, chatId, argument === "on");
-      log(structuredLog("info", "trip_bot.listen_changed", { enabled: argument === "on", changed }));
-      return { kind: "reply", reply: { chatId, text: listenChanged(language, argument === "on") } };
+      const previous = await setGroupProactiveLevel(db, chatId, requested);
+      log(structuredLog("info", "trip_bot.proactive_changed", { level: requested, previous }));
+      return {
+        kind: "reply",
+        reply: { chatId, text: proactiveChanged(language, requested) },
+        // Counts only: how many groups turn it down is a KPI. A repeat of the
+        // current level is not a change.
+        ...(options.assistantEvents && previous !== null && previous !== requested
+          ? { levelChange: { tripId: route.tripId, level: requested, direction: requested > previous ? "raised" as const : "lowered" as const } }
+          : {}),
+      };
     }
   }
 
@@ -960,8 +970,21 @@ export async function dispatchUpdate(
     // `route.kind === "companion"` is structural, not a real branch here —
     // normalizeUpdate never reaches this point for an interview or unbound
     // chat — mirrored only to match the ternary just below it.
-    const capturedAsReply =
-      outcome.route.kind === "companion" ? await consumeExpectsReplyWindow(db, chatId) : false;
+    //
+    // It now also reads the group's proactive level (level 1 admits nothing
+    // through it), a column a relay running ahead of its migration does not have:
+    // a failed claim degrades to "no window", as the conversation window's reads
+    // below do, rather than failing the update.
+    let capturedAsReply = false;
+    if (outcome.route.kind === "companion") {
+      try {
+        capturedAsReply = await consumeExpectsReplyWindow(db, chatId);
+      } catch (error) {
+        log(structuredLog("warn", "trip_bot.reply_window_read_failed", {
+          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        }));
+      }
+    }
 
     // Booleans only in the log: no chat or user id beyond what other events carry.
     if (capturedAsReply) log(structuredLog("info", "trip_bot.reply_window_hit", {}));
@@ -1340,10 +1363,10 @@ function judgeableText(text: string): boolean {
 
 /**
  * Asks the judge about one unaddressed group message, or returns null when it
- * must not be asked: the group said `/listen off`, the trip opted out of reply
- * capture, or the setting could not be read (fail closed - a relay running
- * ahead of its migration judges nothing). Logs the verdict and its speed, never
- * the text.
+ * must not be asked: the group's level is below 3 (`/proactive`; a trip that
+ * opted out of reply capture reads as level 1), or the level could not be read
+ * (fail closed - a relay running ahead of its migration judges nothing). Logs
+ * the verdict and its speed, never the text.
  */
 async function askGroupJudge(
   db: pg.Pool,
@@ -1354,9 +1377,9 @@ async function askGroupJudge(
   log: (line: string) => void,
 ): Promise<JudgeOutcome | null> {
   try {
-    if (!(await groupListenEnabled(db, chatId))) return null;
+    if ((await groupProactiveLevel(db, chatId)) !== PROACTIVE_JOINS_IN) return null;
   } catch (error) {
-    log(structuredLog("warn", "trip_bot.group_judge_listen_read_failed", {
+    log(structuredLog("warn", "trip_bot.group_judge_level_read_failed", {
       safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
     }));
     return null;

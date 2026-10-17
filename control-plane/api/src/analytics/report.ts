@@ -161,8 +161,33 @@ function judgeSection(rollup: DayRollup, rates: DayRates): ReportSection {
         ? noDataLine("Yes below the confidence threshold, handled as no")
         : line("Yes below the confidence threshold, handled as no", fmtCount(rollup.judge?.below_threshold ?? 0)),
       none ? noDataLine("Model") : line("Model", models || "unknown"),
+      ...proactiveLines(rollup),
     ],
   };
+}
+
+/**
+ * The proactive level (`/proactive`): where the groups stand now, and how many
+ * were moved up or down that day. A group turning the assistant down is the
+ * signal that it is not welcome; a quiet day with no events says "no data", not
+ * zero changes, as everywhere in this report. The distribution is a snapshot of
+ * the open group bindings when the report was read (DayRollup.proactive).
+ */
+function proactiveLines(rollup: DayRollup): ReportLine[] {
+  const p = rollup.proactive;
+  const groups = Object.entries(p?.groups_by_level ?? {}).sort(([a], [b]) => a.localeCompare(b));
+  const changes = (p?.raised ?? 0) + (p?.lowered ?? 0);
+  return [
+    groups.length === 0
+      ? noDataLine("Groups by proactive level, now (1 only when called, 2 follows the conversation, 3 joins in)")
+      : line(
+          "Groups by proactive level, now (1 only when called, 2 follows the conversation, 3 joins in)",
+          groups.map(([level, n]) => `${level}: ${n}`).join(", "),
+        ),
+    changes === 0
+      ? noDataLine("Proactive level changes")
+      : line("Proactive level changes", `raised ${p.raised}, lowered ${p.lowered}`),
+  ];
 }
 
 /** Every OTHER line here still needs an assistant-side judgement this slice has no source for. */

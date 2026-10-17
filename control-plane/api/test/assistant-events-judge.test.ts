@@ -221,6 +221,48 @@ describe("RelayAssistantEvents records the judge", () => {
   });
 });
 
+describe("the proactive level change is an event - counts only", () => {
+  const change = (over: Record<string, unknown> = {}) => ({
+    event_id: randomUUID(), trip_id: TRIP, occurred_at: "2026-10-16T10:00:00.000Z", source_service: "relay",
+    event_type: "proactive_level_changed", turn_id: null, channel_type: "group", trigger_type: null,
+    requester_role: "organizer", outcome: "level_lowered", response_latency_ms: null,
+    message_length_bucket: null, media_kind: null, metadata: { proactive_level: 1 }, ...over,
+  });
+
+  test("validates with its level; the level is required and bounded 1..3; outcomes are its own", () => {
+    assert.ok(validateAssistantEvent(change()).ok);
+    assert.ok(validateAssistantEvent(change({ outcome: "level_raised", metadata: { proactive_level: 3 } })).ok);
+    for (const bad of [
+      change({ metadata: {} }),
+      change({ metadata: { proactive_level: 0 } }),
+      change({ metadata: { proactive_level: 4 } }),
+      change({ metadata: { proactive_level: "2" } }),
+      change({ outcome: "dispatched" }),
+      change({ outcome: "judge_no" }),
+      change({ requester_role: null }),
+      change({ event_type: "group_judged", outcome: "level_raised" }),
+    ]) {
+      assert.equal(validateAssistantEvent(bad).ok, false, JSON.stringify(bad));
+    }
+    const { metadata: _drop, ...noMetadata } = change();
+    assert.equal(validateAssistantEvent(noMetadata).ok, false, "absent metadata is not a level");
+  });
+
+  test("the emitter writes one event per change, with no chat, no person and no text", async () => {
+    const sink = recordingSink();
+    const events = new RelayAssistantEvents({ sink, flushIntervalMs: 0 });
+    events.proactiveLevelChanged({ tripId: TRIP, level: 1, direction: "lowered" });
+    events.proactiveLevelChanged({ tripId: TRIP, level: 3, direction: "raised" });
+    const rows = await drain(events, sink);
+    assert.deepEqual(rows.map((r) => [r.event_type, r.outcome, r.metadata.proactive_level, r.channel_type, r.requester_role]), [
+      ["proactive_level_changed", "level_lowered", 1, "group", "organizer"],
+      ["proactive_level_changed", "level_raised", 3, "group", "organizer"],
+    ]);
+    assert.equal(events.stats.rejected, 0);
+    assert.ok(rows.every((r) => r.turn_id === null && r.message_length_bucket === null && r.trigger_type === null));
+  });
+});
+
 // ── DB-backed ───────────────────────────────────────────────────────────────
 
 const databaseUrl = testDatabaseUrl();
@@ -271,6 +313,7 @@ describe("the table and the rollup", { skip: SKIP }, () => {
       await insert(row(tripId, {}));
       await insert(row(tripId, { outcome: "judge_fallback", metadata: { judge_fallback_reason: "rate_limited" } }));
       await insert(row(tripId, { trigger_type: "judge", outcome: "judge_yes" }));
+      await insert(row(tripId, { event_type: "proactive_level_changed", outcome: "level_lowered", trigger_type: null, response_latency_ms: null, message_length_bucket: null, media_kind: null, requester_role: "organizer", metadata: { proactive_level: 1 } }));
       for (const bad of [
         row(tripId, { metadata: { judge_model: "has a space" } as never }),
         row(tripId, { metadata: { judge_fallback_reason: "because" } as never }),
@@ -280,6 +323,9 @@ describe("the table and the rollup", { skip: SKIP }, () => {
         row(tripId, { outcome: "dispatched" }),
         row(tripId, { event_type: "ignored_not_addressed", outcome: "judge_no" }),
         row(tripId, { requester_role: null }),
+        row(tripId, { event_type: "proactive_level_changed", outcome: "level_raised", trigger_type: null, metadata: {} }),
+        row(tripId, { event_type: "proactive_level_changed", outcome: "level_raised", trigger_type: null, metadata: { proactive_level: 4 } as never }),
+        row(tripId, { event_type: "proactive_level_changed", outcome: "judge_no", trigger_type: null, metadata: { proactive_level: 2 } }),
       ]) {
         await assert.rejects(insert(bad), /violates check constraint/, JSON.stringify(bad.metadata) + bad.outcome);
       }
@@ -354,7 +400,35 @@ describe("the table and the rollup", { skip: SKIP }, () => {
       assert.match(value(/Fallbacks/), /12\.5% \(1\/8\) - timeout 1/);
       assert.match(value(/Model/), /vendor\/free-model:free \(8\)/);
       assert.match(markdown, /## Group Judge/);
-      assert.ok(!/-?\d{9,}/.test(markdown), "no id-shaped number in the report");
+      // The header names the trip, whose random hex id can itself hold a long digit run: strip it first.
+      assert.ok(!/-?\d{9,}/.test(markdown.split(tripId).join("")), "no id-shaped number in the report");
+    });
+  });
+
+  test("the rollup counts level changes, and snapshots the open GROUP bindings by level", async () => {
+    await withDb(async (pool, tripId) => {
+      const bind = (chat: string, level: number, closed = false) => pool.query(
+        `INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile, proactive_level, closed_at, closed_reason)
+         VALUES ('tcb_' || md5(random()::text), $1, $2, 'p', $3, CASE WHEN $4 THEN now() ELSE NULL END, CASE WHEN $4 THEN 'test' ELSE NULL END)`,
+        [chat, tripId, level, closed],
+      );
+      await bind("-1001", 3);
+      await bind("-1002", 3);
+      await bind("-1003", 1);
+      await bind("-1004", 2, true); // closed: not counted
+      await bind("5551", 1); // a private chat: not a group
+      const change = (outcome: "level_raised" | "level_lowered", level: number) => row(tripId, {
+        event_type: "proactive_level_changed", outcome, trigger_type: null, response_latency_ms: null, message_length_bucket: null,
+        media_kind: null, requester_role: "organizer", metadata: { proactive_level: level },
+      });
+      await writeAssistantEvents(pool, [change("level_lowered", 1), change("level_lowered", 2), change("level_raised", 3)]);
+      const [day] = await rollupAssistantEvents(pool, { tripId, timeZone: "UTC" });
+      assert.deepEqual(day!.proactive, { raised: 1, lowered: 2, groups_by_level: { "1": 1, "3": 2 } });
+
+      const section = renderDailyReport(day!).json.sections.find((s) => s.title === "Group Judge")!;
+      const value = (label: RegExp) => section.lines.find((l) => label.test(l.label))!.value;
+      assert.equal(value(/Groups by proactive level/), "1: 1, 3: 2");
+      assert.equal(value(/Proactive level changes/), "raised 1, lowered 2");
     });
   });
 

@@ -115,6 +115,11 @@ export async function writeAssistantEvents(db: WriterDb, input: readonly unknown
 
 export const DEFAULT_RETENTION_DAYS = 90;
 
+/** A `DayRollup.proactive` with nothing in it. */
+export function emptyProactiveRollup(): DayRollup["proactive"] {
+  return { raised: 0, lowered: 0, groups_by_level: {} };
+}
+
 /** A `DayRollup.judge` with nothing in it. */
 export function emptyJudgeRollup(): DayRollup["judge"] {
   return {
@@ -247,6 +252,21 @@ export interface DayRollup {
     /** Decisions by configured model id (`unknown` when the event carried none). */
     by_model: Record<string, number>;
   };
+  /**
+   * How much the groups want the assistant to take part (`/proactive`). `raised`
+   * and `lowered` are that day's level changes, counted from
+   * `proactive_level_changed` events; lowering is the number that says whether
+   * the assistant is welcome. `groups_by_level` is NOT from events: it is a
+   * SNAPSHOT of the trip's open group bindings at the moment the rollup is read
+   * (the level lives on the binding, and no table of history exists), so it is
+   * the same on every day of one read and absent for an empty day.
+   */
+  proactive: {
+    raised: number;
+    lowered: number;
+    /** Open group bindings by level, "1" | "2" | "3". Empty when not read. */
+    groups_by_level: Record<string, number>;
+  };
 }
 
 interface EventRow {
@@ -363,6 +383,7 @@ export async function rollupAssistantEvents(
           missing_data_by_tool: {},
         },
         judge: emptyJudgeRollup(),
+        proactive: emptyProactiveRollup(),
       };
       days.set(key, day);
     }
@@ -477,11 +498,33 @@ export async function rollupAssistantEvents(
         }
         break;
       }
+      case "proactive_level_changed":
+        if (row.outcome === "level_raised") day.proactive.raised += 1;
+        else if (row.outcome === "level_lowered") day.proactive.lowered += 1;
+        break;
       default:
         // An event type this rollup does not know is not silently folded into
         // one it does. The contract refuses unknown types on write, so this is
         // a newer writer ahead of an older reader.
         break;
+    }
+  }
+
+  // The groups' CURRENT levels, one read for every trip in the result. Group chat
+  // ids are negative; a private chat's binding is not a group and has no level to show.
+  const tripIds = [...new Set([...days.values()].map((d) => d.trip_id))];
+  if (tripIds.length > 0) {
+    const levels = await db.query<{ trip_id: string; level: number; groups: number }>(
+      `SELECT trip_id, proactive_level AS level, count(*)::int AS groups
+         FROM control_plane.telegram_chat_bindings
+        WHERE trip_id = ANY($1::text[]) AND closed_at IS NULL AND chat_id LIKE '-%'
+        GROUP BY trip_id, proactive_level`,
+      [tripIds],
+    );
+    for (const day of days.values()) {
+      for (const r of levels.rows.filter((x) => x.trip_id === day.trip_id)) {
+        day.proactive.groups_by_level[String(r.level)] = r.groups;
+      }
     }
   }
 

@@ -36,7 +36,8 @@
         "reply_sent",
         "relay_tool_completed",
         "tool_call_completed",
-        "group_judged"
+        "group_judged",
+        "proactive_level_changed"
       ]
     },
     "turn_id": {
@@ -72,7 +73,9 @@
         "judge_yes",
         "judge_no",
         "judge_fallback",
-        "judge_missed"
+        "judge_missed",
+        "level_raised",
+        "level_lowered"
       ]
     },
     "response_latency_ms": {
@@ -97,7 +100,8 @@
         "judge_confidence_pct": { "type": "integer", "minimum": 0, "maximum": 100 },
         "judge_model": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,79}$" },
         "judge_fallback_reason": { "enum": ["timeout", "error", "unparseable", "rate_limited"] },
-        "judge_below_threshold": { "type": "boolean" }
+        "judge_below_threshold": { "type": "boolean" },
+        "proactive_level": { "type": "integer", "minimum": 1, "maximum": 3 }
       }
     },
     "tool_name": {
@@ -218,6 +222,19 @@
           "requester_role": { "type": "string" },
           "message_length_bucket": { "type": "string" },
           "media_kind": { "type": "string" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "event_type": { "const": "proactive_level_changed" } } },
+      "then": {
+        "required": ["trip_id", "channel_type", "requester_role", "metadata"],
+        "properties": {
+          "outcome": { "enum": ["level_raised", "level_lowered"] },
+          "trip_id": { "type": "string" },
+          "channel_type": { "type": "string" },
+          "requester_role": { "type": "string" },
+          "metadata": { "required": ["proactive_level"] }
         }
       }
     },

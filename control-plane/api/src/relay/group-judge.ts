@@ -7,8 +7,8 @@
  * The judge never decides what the assistant says; it decides whether the
  * relay hands the message over. Everything about it fails closed:
  *
- *   - not configured, a group that said `/listen off`, a trip that opted out of
- *     reply capture, a rate-limited chat, a timeout, an error, a reply that is
+ *   - not configured, a group whose `/proactive` level is below 3, a trip that
+ *     opted out of reply capture, a rate-limited chat, a timeout, an error, a reply that is
  *     not the exact JSON verdict, a confidence below the threshold -> the
  *     message is NOT_ADDRESSED, exactly as it was before this module existed;
  *   - a YES is not the end: the message goes to the companion with the

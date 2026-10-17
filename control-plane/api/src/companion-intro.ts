@@ -608,7 +608,7 @@ export function companionHelpText(facts: {
     );
     if (facts.siteUrl) parts.push("", `האתר של הטיול: ${facts.siteUrl}`);
     parts.push("", "‎/name — לשנות את השם שלי.");
-    if (!facts.isPrivateChat) parts.push("", "‎/listen — להחליט אם אענה גם כשלא פונים אליי בשם (ההגדרה בידי מי שארגן את הטיול).");
+    if (!facts.isPrivateChat) parts.push("", "‎/proactive — רמת המעורבות שלי בשיחה בקבוצה (1–3)");
     if (facts.isPrivateChat) parts.push("", "‎/group — לחבר אותי לקבוצה המשפחתית שלכם.");
     return parts.join("\n");
   }
@@ -620,7 +620,7 @@ export function companionHelpText(facts: {
   );
   if (facts.siteUrl) parts.push("", `The trip site: ${facts.siteUrl}`);
   parts.push("", "/name — change what I'm called.");
-  if (!facts.isPrivateChat) parts.push("", "/listen — whether I also answer when I'm not addressed by name (the trip organizer's setting).");
+  if (!facts.isPrivateChat) parts.push("", "/proactive — how much I join the conversation in the group (1-3)");
   if (facts.isPrivateChat) parts.push("", "/group — connect me to your family group.");
   return parts.join("\n");
 }
@@ -648,55 +648,52 @@ export function renameUsage(language: "he" | "en", current: readonly string[]): 
 }
 
 /**
- * Replies to `/listen`, the organizer's switch for the group judge
- * (relay/group-judge.ts). Router-composed like `/name`: the answer says what
- * the room will now do, in the trip's language. The status text also says, once,
- * what "listening" means - that the text of a message that does not name the
- * assistant is read by a small AI service to decide whether it is for the
- * assistant - because a family is entitled to know that before it is told it is on.
+ * Replies to `/proactive`, the organizer's preference for how much the
+ * assistant takes part in one group (chat-router.ts, PROACTIVE_*). Router-composed
+ * like `/name`: a preference stated plainly, in the trip's language, neutral in
+ * gender, with no explanation of how it is done - the owner's decision is that a
+ * family should not have to understand the mechanism to choose a level.
  */
-export function listenStatus(language: "he" | "en", enabled: boolean): string {
-  if (language === "he") {
-    return enabled
-      ? "ההאזנה בקבוצה פעילה: הודעה שנראית מכוונת אליי — שאלה על הטיול, או משהו להוסיף או להזכיר — תקבל מענה גם בלי שפונים אליי בשם. כדי להחליט, הטקסט של הודעה שלא פונה אליי בשם נקרא על ידי שירות בינה מלאכותית קטן; אנחנו לא שומרים אותו. לכיבוי: ‎/listen off"
-      : "ההאזנה בקבוצה כבויה: אני עונה רק כשפונים אליי בשם, מתייגים אותי, עונים להודעה שלי, או כשאני כבר באמצע שיחה איתכם. להפעלה: ‎/listen on";
-  }
-  return enabled
-    ? "I'm listening in this group: a message that looks meant for me - a question about the trip, or something to add or remind you about - gets an answer even without my name. To decide, the text of a message that doesn't name me is read by a small AI service; we don't store it. To turn it off: /listen off"
-    : "Listening is off in this group: I answer only when you use my name, tag me, reply to one of my messages, or I'm already in a conversation with you. To turn it on: /listen on";
+export function proactiveStatus(language: "he" | "en", level: 1 | 2 | 3): string {
+  return language === "he"
+    ? `רמת המעורבות שלי בקבוצה: ${level}\n` +
+      "1 — רק כשפונים אליי (שם, תיוג או תגובה להודעה שלי)\n" +
+      "2 — גם בהמשך שיחה שהתחלנו, ובתשובה לשאלה ששאלתי\n" +
+      "3 — גם כשנראה שמשהו מיועד לי (ברירת מחדל)\n" +
+      "לשינוי: ‎/proactive 1, 2 או 3"
+    : `My involvement in this group: level ${level}\n` +
+      "1 - only when you call me (my name, a tag, or a reply to one of my messages)\n" +
+      "2 - also in a conversation we've started, and when I've asked a question\n" +
+      "3 - also when something looks meant for me (default)\n" +
+      "To change: /proactive 1, 2 or 3";
 }
 
-/** `/listen on|off` took effect. */
-export function listenChanged(language: "he" | "en", enabled: boolean): string {
-  if (language === "he") {
-    return enabled
-      ? "✅ ההאזנה בקבוצה הופעלה. הודעות שנראות מכוונות אליי יקבלו מענה גם בלי שם. לכיבוי: ‎/listen off"
-      : "✅ ההאזנה בקבוצה כובתה. מעכשיו אענה רק כשפונים אליי בשם, מתייגים אותי או עונים להודעה שלי. להפעלה: ‎/listen on";
-  }
-  return enabled
-    ? "✅ Listening is on in this group. I'll answer messages that look meant for me, even without my name. To turn it off: /listen off"
-    : "✅ Listening is off in this group. From now on I answer only when you use my name, tag me, or reply to one of my messages. To turn it on: /listen on";
+/** What a level means, in a few words, for the confirmation. */
+function proactiveShort(language: "he" | "en", level: 1 | 2 | 3): string {
+  const he = ["רק כשפונים אליי", "גם בהמשך שיחה", "גם כשנראה שמשהו מיועד לי"] as const;
+  const en = ["only when called", "also in a conversation", "also when something looks meant for me"] as const;
+  return (language === "he" ? he : en)[level - 1]!;
+}
+
+/** `/proactive N` took effect. */
+export function proactiveChanged(language: "he" | "en", level: 1 | 2 | 3): string {
+  return language === "he"
+    ? `✅ מעכשיו רמה ${level}: ${proactiveShort(language, level)}`
+    : `✅ Level ${level} from now on: ${proactiveShort(language, level)}`;
 }
 
 /** A member who is not the trip's organizer tried to change it. */
-export function listenRefused(language: "he" | "en"): string {
+export function proactiveRefused(language: "he" | "en"): string {
   return language === "he"
-    ? "רק מי שארגן את הטיול יכול לשנות את זה. אפשר לראות את ההגדרה הנוכחית עם ‎/listen."
-    : "Only the trip organizer can change this. Anyone can see the current setting with /listen.";
+    ? "רק מי שארגן את הטיול יכול לשנות את זה. אפשר לראות את ההגדרה עם ‎/proactive."
+    : "Only the trip organizer can change this. You can see the setting with /proactive.";
 }
 
-/** `/listen` in a private chat, where there is no group to listen in. */
-export function listenInPrivateChat(language: "he" | "en"): string {
+/** `/proactive` in a private chat, where there is no group to set it for. */
+export function proactiveInPrivateChat(language: "he" | "en"): string {
   return language === "he"
-    ? "‎/listen שייך לקבוצה המשפחתית — שלחו אותו שם."
-    : "/listen belongs to the family group - send it there.";
-}
-
-/** `/listen` with something other than on or off. */
-export function listenUsage(language: "he" | "en"): string {
-  return language === "he"
-    ? "‎/listen on — אענה גם להודעות שנראות מכוונות אליי, בלי שם\n‎/listen off — אענה רק כשפונים אליי בשם, מתייגים אותי או עונים להודעה שלי"
-    : "/listen on - I answer messages that look meant for me, even without my name\n/listen off - I answer only when you use my name, tag me, or reply to one of my messages";
+    ? "‎/proactive שייך לקבוצה — שלחו אותו שם."
+    : "/proactive belongs to the group - send it there.";
 }
 
 /** One message for every refused name: the rule is short enough to state whole. */

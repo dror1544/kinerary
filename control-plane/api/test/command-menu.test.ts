@@ -5,7 +5,7 @@ import type { TelegramClient } from "../src/relay/telegram-api.js";
 
 // What the router answers itself (relay/dispatch.ts). Anything else a menu
 // offers is a command the command gate refuses.
-const ROUTER_COMMANDS = new Set(["help", "name", "listen", "group", "trips", "switch"]);
+const ROUTER_COMMANDS = new Set(["help", "name", "proactive", "group", "trips", "switch"]);
 
 describe("routerCommandMenus — the menu is the router's, not Hermes's", () => {
   test("every advertised command is one the router handles", () => {
@@ -28,10 +28,10 @@ describe("routerCommandMenus — the menu is the router's, not Hermes's", () => 
     }
   });
 
-  test("/listen is offered in groups only - it is one group's setting, changed there by the organizer", () => {
+  test("/proactive is offered in groups only - it is one group's preference, set there by the organizer", () => {
     for (const menu of routerCommandMenus()) {
       const names = menu.commands.map((c) => c.command);
-      assert.equal(names.includes("listen"), menu.scope === "all_group_chats", `${menu.scope} /listen placement`);
+      assert.equal(names.includes("proactive"), menu.scope === "all_group_chats", `${menu.scope} /proactive placement`);
     }
   });
 

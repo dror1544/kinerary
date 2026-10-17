@@ -44,6 +44,16 @@ export interface JudgeFacts {
   fallbackReason?: JudgeFallbackReason;
 }
 
+/**
+ * An organizer changed a group's proactive level (`/proactive N`). Counts only:
+ * the trip, the new level and which way it moved - no chat, no person.
+ */
+export interface LevelChangeFacts {
+  tripId: string;
+  level: 1 | 2 | 3;
+  direction: "raised" | "lowered";
+}
+
 /** The analytics descriptor a decision carries when assistant events are on. */
 export interface InboundFacts {
   tripId: string;

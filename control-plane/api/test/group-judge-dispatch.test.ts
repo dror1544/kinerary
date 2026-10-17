@@ -1,7 +1,8 @@
 /**
  * The group judge through `dispatchUpdate` (DB-backed): where it sits in the
  * order of the gate, what a yes / no / failure does to a message, the
- * per-group `/listen` switch and who may flip it, and every path that must NOT
+ * per-group `/proactive` level (1 only when called, 2 follows the conversation, 3 joins in)
+ * and who may set it, and every path that must NOT
  * ask a model. Units of the judge itself are in group-judge.test.ts.
  *
  * Owner's decision, 2026-10-16: a group message no rule addressed goes to a
@@ -294,17 +295,18 @@ describe("the group judge in the gate", { skip: SKIP }, () => {
     });
   });
 
-  test("a failing /listen read (relay ahead of its migration) is NOT_ADDRESSED and loud, never a judge call", async () => {
+  test("a failing level read (relay ahead of its migration) is NOT_ADDRESSED and loud, never a judge call", async () => {
     await withFixture(async (fix) => {
       const chat = "-1004000009";
       await bindNamed(fix, chat);
-      await fix.pool.query("ALTER TABLE control_plane.telegram_chat_bindings RENAME COLUMN listen_judge_enabled TO listen_judge_enabled_gone");
+      await fix.pool.query("ALTER TABLE control_plane.telegram_chat_bindings RENAME COLUMN proactive_level TO proactive_level_gone");
       const judge = scripted(YES);
       const lines: string[] = [];
       const decision = await dispatch(fix, from(chat, "what time is check-in?"), { groupJudge: judge }, lines);
       assert.deepEqual(decision, { kind: "ignore", reason: "NOT_ADDRESSED" });
       assert.equal(judge.calls.length, 0);
-      assert.ok(lines.some((l) => l.includes("trip_bot.group_judge_listen_read_failed")));
+      assert.ok(lines.some((l) => l.includes("trip_bot.group_judge_level_read_failed")));
+      assert.ok(lines.some((l) => l.includes("trip_bot.reply_window_read_failed")), "the '?' window claim degrades loudly too, not as a failed update");
     });
   });
 
@@ -345,9 +347,9 @@ describe("the group judge in the gate", { skip: SKIP }, () => {
   });
 });
 
-describe("/listen - the organizer's switch for one group", { skip: SKIP }, () => {
+describe("/proactive - how much the assistant takes part in one group", { skip: SKIP }, () => {
   const column = async (fix: Fixture, chat: string) =>
-    (await fix.pool.query("SELECT listen_judge_enabled AS on FROM control_plane.telegram_chat_bindings WHERE chat_id = $1", [chat])).rows[0].on as boolean;
+    (await fix.pool.query("SELECT proactive_level AS level FROM control_plane.telegram_chat_bindings WHERE chat_id = $1", [chat])).rows[0].level as number;
   const reply = (d: unknown) => (d as { reply?: { text: string } }).reply?.text ?? "";
   const linkOrganizer = (fix: Fixture, telegramId: number) => fix.pool.query(
     `INSERT INTO control_plane.trip_person_links
@@ -355,12 +357,16 @@ describe("/listen - the organizer's switch for one group", { skip: SKIP }, () =>
      VALUES ('tpl_' || md5(random()::text), $1, $2, 'ron', 'Ron', 'organizer', 'interview_chat')`,
     [fix.tripId, String(telegramId)],
   );
+  const setLevel = (fix: Fixture, chat: string, level: number) =>
+    fix.pool.query("UPDATE control_plane.telegram_chat_bindings SET proactive_level = $2 WHERE chat_id = $1", [chat, level]);
 
-  test("default ON for every group binding", async () => {
+  test("the default is level 3 for every group binding, and the column refuses anything outside 1..3", async () => {
     await withFixture(async (fix) => {
       const chat = "-1005000001";
       await bindNamed(fix, chat);
-      assert.equal(await column(fix, chat), true);
+      assert.equal(await column(fix, chat), 3);
+      await assert.rejects(setLevel(fix, chat, 0), /violates check constraint/);
+      await assert.rejects(setLevel(fix, chat, 4), /violates check constraint/);
     });
   });
 
@@ -369,35 +375,38 @@ describe("/listen - the organizer's switch for one group", { skip: SKIP }, () =>
       const chat = "-1005000002";
       await bindNamed(fix, chat);
       const lines: string[] = [];
-      const decision = await dispatch(fix, from(chat, "/listen off", NOA), {}, lines);
+      const decision = await dispatch(fix, from(chat, "/proactive 1", NOA), { assistantEvents: true }, lines);
       assert.equal(decision.kind, "reply");
       assert.match(reply(decision), /Only the trip organizer can change this/);
-      assert.equal(await column(fix, chat), true);
-      assert.ok(lines.some((l) => l.includes("trip_bot.listen_refused")));
+      assert.equal(await column(fix, chat), 3);
+      assert.ok(lines.some((l) => l.includes("trip_bot.proactive_refused")));
+      assert.equal((decision as { levelChange?: unknown }).levelChange, undefined, "a refusal is not a change");
     });
   });
 
-  test("the organizer (by trip person link) turns it off and on; the judge follows, and it persists per binding", async () => {
+  test("the organizer sets 1, 2, 3; it persists; anyone can read it; a repeat is not a change", async () => {
     await withFixture(async (fix) => {
       const chat = "-1005000003";
       await bindNamed(fix, chat);
       await linkOrganizer(fix, DROR);
-      const judge = scripted(YES);
+      const change = (d: unknown) => (d as { levelChange?: { level: number; direction: string; tripId: string } }).levelChange;
 
-      const off = await dispatch(fix, from(chat, "/listen off", DROR));
-      assert.match(reply(off), /Listening is off in this group/);
-      assert.equal(await column(fix, chat), false);
-      assert.deepEqual(await dispatch(fix, from(chat, "what time is check-in?", NOA), { groupJudge: judge }), { kind: "ignore", reason: "NOT_ADDRESSED" });
-      assert.equal(judge.calls.length, 0, "/listen off: no judge");
+      const one = await dispatch(fix, from(chat, "/proactive 1", DROR), { assistantEvents: true });
+      assert.match(reply(one), /Level 1 from now on: only when called/);
+      assert.equal(await column(fix, chat), 1);
+      assert.deepEqual(change(one), { tripId: fix.tripId, level: 1, direction: "lowered" });
 
-      const status = await dispatch(fix, from(chat, "/listen", NOA));
-      assert.match(reply(status), /Listening is off/, "anyone can read the setting");
+      assert.match(reply(await dispatch(fix, from(chat, "/proactive", NOA))), /My involvement in this group: level 1\n1 - .*\n2 - .*\n3 - .*\(default\)/s, "anyone can read it");
 
-      const on = await dispatch(fix, from(chat, "/listen@KinneryBot on", DROR));
-      assert.match(reply(on), /Listening is on in this group/);
-      assert.equal(await column(fix, chat), true);
-      assert.equal((await dispatch(fix, from(chat, "what time is check-in?", NOA), { groupJudge: judge })).kind, "to_gateway");
-      assert.equal(judge.calls.length, 1);
+      const two = await dispatch(fix, from(chat, "/proactive@KinneryBot 2", DROR), { assistantEvents: true });
+      assert.match(reply(two), /Level 2 from now on: also in a conversation/);
+      assert.deepEqual(change(two), { tripId: fix.tripId, level: 2, direction: "raised" });
+
+      const again = await dispatch(fix, from(chat, "/proactive 2", DROR), { assistantEvents: true });
+      assert.equal(change(again), undefined, "setting the level it already has is not a change");
+      const quiet = await dispatch(fix, from(chat, "/proactive 3", DROR));
+      assert.equal(change(quiet), undefined, "and without assistant events there is no descriptor at all");
+      assert.equal(await column(fix, chat), 3);
     });
   });
 
@@ -409,41 +418,49 @@ describe("/listen - the organizer's switch for one group", { skip: SKIP }, () =>
         "INSERT INTO control_plane.telegram_organizer_links(id, user_id, telegram_subject_digest, verified_via) VALUES ($1, $2, $3, 'enrollment_redemption')",
         [testId("tol"), fix.userId, digestTelegramId(String(DROR))],
       );
-      assert.match(reply(await dispatch(fix, from(chat, "/listen off", DROR))), /Listening is off/);
-      assert.equal(await column(fix, chat), false);
+      assert.match(reply(await dispatch(fix, from(chat, "/proactive 1", DROR))), /Level 1/);
+      assert.equal(await column(fix, chat), 1);
     });
   });
 
-  test("an unknown argument gets the usage; /listen in a private chat or an unbound chat says so", async () => {
+  test("anything but 1, 2 or 3 shows the options and changes nothing; private and unbound chats say so", async () => {
     await withFixture(async (fix) => {
       const chat = "-1005000005";
       await bindNamed(fix, chat);
-      assert.match(reply(await dispatch(fix, from(chat, "/listen maybe", DROR))), /\/listen on .*\n\/listen off/);
-      assert.equal(await column(fix, chat), true);
+      await linkOrganizer(fix, DROR);
+      for (const arg of ["maybe", "0", "4", "on", "off", "2 3"]) {
+        assert.match(reply(await dispatch(fix, from(chat, `/proactive ${arg}`, DROR))), /To change: \/proactive 1, 2 or 3/, arg);
+      }
+      assert.equal(await column(fix, chat), 3);
 
       const dm = "9000002";
       await fix.pool.query(
         "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, 'companion-colmar')",
         [dm, fix.tripId],
       );
-      assert.match(reply(await dispatch(fix, privateMsg(dm, "/listen off"))), /belongs to the family group/);
-      assert.equal(await column(fix, dm), true, "a DM binding is untouched");
+      assert.match(reply(await dispatch(fix, privateMsg(dm, "/proactive 1"))), /belongs to the group/);
+      assert.equal(await column(fix, dm), 3, "a DM binding is untouched");
 
-      const unbound = await dispatch(fix, from("-1005999999", "/listen off", DROR));
+      const unbound = await dispatch(fix, from("-1005999999", "/proactive 1", DROR));
       assert.equal(unbound.kind, "reply");
-      assert.doesNotMatch(reply(unbound), /Listening/);
+      assert.doesNotMatch(reply(unbound), /involvement|Level/);
     });
   });
 
-  test("replies in the trip's language (Hebrew)", async () => {
+  test("replies in the trip's language (Hebrew) and never mentions how it works", async () => {
     await withFixture(async (fix) => {
       const chat = "-1005000006";
       await bindNamed(fix, chat);
       await linkOrganizer(fix, DROR);
       await fix.pool.query("UPDATE control_plane.trips SET companion_intro = '{\"language\":\"he\"}'::jsonb WHERE id = $1", [fix.tripId]);
-      assert.match(reply(await dispatch(fix, from(chat, "/listen off", DROR))), /[֐-׿]/);
-      assert.match(reply(await dispatch(fix, from(chat, "/listen", NOA))), /כבויה/);
-      assert.match(reply(await dispatch(fix, from(chat, "/listen off", NOA))), /רק מי שארגן את הטיול/);
+      const set = reply(await dispatch(fix, from(chat, "/proactive 1", DROR)));
+      const status = reply(await dispatch(fix, from(chat, "/proactive", NOA)));
+      const refused = reply(await dispatch(fix, from(chat, "/proactive 2", NOA)));
+      assert.match(set, /מעכשיו רמה 1: רק כשפונים אליי/);
+      assert.match(status, /רמת המעורבות שלי בקבוצה: 1/);
+      assert.match(refused, /רק מי שארגן את הטיול/);
+      const all = [set, status, refused, reply(await dispatch(fix, from(chat, "/proactive@KinneryBot", NOA)))].join("\n");
+      assert.doesNotMatch(all, /בינה מלאכותית|AI|model|מודל|נשמר|stor/i, "a preference, not a disclosure");
     });
   });
 
@@ -451,25 +468,126 @@ describe("/listen - the organizer's switch for one group", { skip: SKIP }, () =>
     await withFixture(async (fix) => {
       const chat = "-1005000007";
       await bindNamed(fix, chat);
-      assert.match(reply(await dispatch(fix, from(chat, "/help", DROR))), /\/listen/);
+      assert.match(reply(await dispatch(fix, from(chat, "/help", DROR))), /\/proactive/);
       const dm = "9000003";
       await fix.pool.query(
         "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, 'companion-colmar')",
         [dm, fix.tripId],
       );
-      assert.doesNotMatch(reply(await dispatch(fix, privateMsg(dm, "/help"))), /\/listen/);
+      assert.doesNotMatch(reply(await dispatch(fix, privateMsg(dm, "/help"))), /\/proactive/);
     });
   });
 
-  test("a chat moved to a new id (group becomes supergroup) keeps its setting", async () => {
+  test("a chat moved to a new id (group becomes supergroup) keeps its level", async () => {
     await withFixture(async (fix) => {
       const chat = "-1005000008";
       await bindNamed(fix, chat);
       await linkOrganizer(fix, DROR);
-      await dispatch(fix, from(chat, "/listen off", DROR));
+      await dispatch(fix, from(chat, "/proactive 1", DROR));
       const { migrateChatBinding } = await import("../src/chat-router.js");
       assert.equal(await migrateChatBinding(fix.pool, chat, "-1005999008"), true);
-      assert.equal(await column(fix, "-1005999008"), false);
+      assert.equal(await column(fix, "-1005999008"), 1);
+    });
+  });
+});
+
+// What each level lets in, through dispatchUpdate - the gate the preference is for.
+describe("the proactive level gates what reaches the assistant", { skip: SKIP }, () => {
+  const setLevel = (fix: Fixture, chat: string, level: number) =>
+    fix.pool.query("UPDATE control_plane.telegram_chat_bindings SET proactive_level = $2 WHERE chat_id = $1", [chat, level]);
+  const ignored = { kind: "ignore", reason: "NOT_ADDRESSED" };
+  const bot = { id: "4242", username: "KinneryBot" };
+
+  test("LEVEL 1 - only when called: name, @mention and reply are heard; the '?' window and the conversation window are not; no judge", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1006000001";
+      await bindNamed(fix, chat);
+      await setLevel(fix, chat, 1);
+      const judge = scripted(YES);
+      const options = { groupJudge: judge };
+
+      assert.equal((await dispatch(fix, from(chat, "Liv, what time is check-in?", NOA), options, [], bot)).kind, "to_gateway", "by name");
+      assert.equal((await dispatch(fix, from(chat, "@KinneryBot what time is check-in?", NOA), options, [], bot)).kind, "to_gateway", "by @mention");
+      const reply = from(chat, "ok thanks", NOA, {}, { reply_to_message: { message_id: 1, from: { id: 4242, is_bot: true } } });
+      assert.equal((await dispatch(fix, reply, options, [], bot)).kind, "to_gateway", "by replying to the assistant");
+
+      // Being addressed does not open a conversation window at level 1.
+      assert.equal(await inCompanionConversation(fix.pool, chat, String(NOA)), false, "no window was opened");
+      assert.deepEqual(await dispatch(fix, from(chat, "and what about Saturday", NOA), options, [], bot), ignored, "no conversation window");
+
+      // Nor does the '?' one-shot window admit anything.
+      await setCompanionExpectsReply(fix.pool, chat, true);
+      assert.deepEqual(await dispatch(fix, from(chat, "Friday works", DROR), options, [], bot), ignored, "no '?' window");
+      assert.equal(judge.calls.length, 0, "and the judge is never asked");
+    });
+  });
+
+  test("LEVEL 2 - follows the conversation: the '?' window and the conversation window work; the judge is never asked", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1006000002";
+      await bindNamed(fix, chat);
+      await setLevel(fix, chat, 2);
+      const judge = scripted(YES);
+      const options = { groupJudge: judge };
+
+      assert.equal((await dispatch(fix, from(chat, "Liv, hello", DROR), options)).kind, "to_gateway");
+      assert.equal((await dispatch(fix, from(chat, "and what about Saturday", DROR), options)).kind, "to_gateway", "the conversation window");
+      await setCompanionExpectsReply(fix.pool, chat, true);
+      assert.equal((await dispatch(fix, from(chat, "Friday works", NOA), options)).kind, "to_gateway", "the '?' window");
+
+      assert.deepEqual(await dispatch(fix, from(chat, "what time is check-in at the hotel?", 999), options), ignored, "a stranger's unaddressed message is not judged");
+      assert.equal(judge.calls.length, 0, "level 2 never calls the judge");
+    });
+  });
+
+  test("LEVEL 3 - joins in: everything level 2 does, and the judge is asked", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1006000003";
+      await bindNamed(fix, chat);
+      const judge = scripted(YES);
+      const options = { groupJudge: judge };
+      assert.equal((await dispatch(fix, from(chat, "what time is check-in at the hotel?", NOA), options)).kind, "to_gateway");
+      assert.equal(judge.calls.length, 1);
+      await dispatch(fix, from(chat, "Liv, hello", DROR), options);
+      assert.equal((await dispatch(fix, from(chat, "and Saturday", DROR), options)).kind, "to_gateway", "the conversation window still works");
+      assert.equal(judge.calls.length, 1, "and costs no call");
+    });
+  });
+
+  test("lowering the level takes effect on the very next message; raising it back restores the windows", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1006000004";
+      await bindNamed(fix, chat);
+      await fix.pool.query(
+        `INSERT INTO control_plane.trip_person_links
+           (id, trip_id, telegram_user_id, participant_username, display_name, role, verified_via)
+         VALUES ('tpl_' || md5(random()::text), $1, $2, 'ron', 'Ron', 'organizer', 'interview_chat')`,
+        [fix.tripId, String(DROR)],
+      );
+      const judge = scripted(YES);
+      const options = { groupJudge: judge };
+      await dispatch(fix, from(chat, "Liv, hello", DROR), options);
+      assert.equal((await dispatch(fix, from(chat, "and Saturday", DROR), options)).kind, "to_gateway", "level 3: inside the window");
+      await dispatch(fix, from(chat, "/proactive 1", DROR), options);
+      assert.deepEqual(await dispatch(fix, from(chat, "and Sunday", DROR), options), ignored, "level 1: the open window no longer admits");
+      await dispatch(fix, from(chat, "/proactive 2", DROR), options);
+      assert.equal((await dispatch(fix, from(chat, "and Monday", DROR), options)).kind, "to_gateway", "level 2: the window is heard again");
+      assert.equal(judge.calls.length, 0);
+    });
+  });
+
+  test("a trip that opted out of reply capture behaves as level 1 whatever its group says", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1006000005";
+      await bindNamed(fix, chat);
+      await fix.pool.query("UPDATE control_plane.trips SET companion_reply_capture_enabled = false WHERE id = $1", [fix.tripId]);
+      const { groupProactiveLevel, groupProactiveLevelSetting } = await import("../src/chat-router.js");
+      assert.equal(await groupProactiveLevel(fix.pool, chat), 1, "the level it acts on");
+      assert.equal(await groupProactiveLevelSetting(fix.pool, chat), 3, "the level the organizer set, which /proactive shows");
+      const judge = scripted(YES);
+      await dispatch(fix, from(chat, "Liv, hello", DROR), { groupJudge: judge });
+      assert.deepEqual(await dispatch(fix, from(chat, "and Saturday", DROR), { groupJudge: judge }), ignored);
+      assert.equal(judge.calls.length, 0);
     });
   });
 });

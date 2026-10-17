@@ -26,7 +26,7 @@
  * rollup change, because `store.ts` is out of this slice's paths — see the
  * handover.
  */
-import { emptyJudgeRollup, type ChannelRoleCounts, type DayRollup } from "./store.js";
+import { emptyJudgeRollup, emptyProactiveRollup, type ChannelRoleCounts, type DayRollup } from "./store.js";
 
 /** A rate honestly computed from the relay's own counts. `value` is `null`,
  * never `0` or `NaN`, when the denominator is zero — a trip with no traffic
@@ -265,5 +265,6 @@ export function emptyDayRollup(tripId: string, localDay: string): DayRollup {
       missing_data_by_tool: {},
     },
     judge: emptyJudgeRollup(),
+    proactive: emptyProactiveRollup(),
   };
 }

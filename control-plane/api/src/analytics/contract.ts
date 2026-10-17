@@ -48,6 +48,8 @@ export const EVENT_TYPES = [
   // The group judge's decision on one unaddressed group message, and — later,
   // about an earlier decision — whether it turned out to be a miss (below).
   "group_judged",
+  // An organizer set a group's proactive level (/proactive N). Counts only.
+  "proactive_level_changed",
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 
@@ -96,6 +98,9 @@ export const OUTCOMES = [
   "judge_no",
   "judge_fallback",
   "judge_missed",
+  // proactive_level_changed only: which way the organizer moved the level.
+  "level_raised",
+  "level_lowered",
 ] as const;
 export type Outcome = (typeof OUTCOMES)[number];
 
@@ -192,6 +197,8 @@ export const METADATA_FIELDS = {
   judge_model: { type: "string", pattern: JUDGE_MODEL_PATTERN },
   judge_fallback_reason: { type: "enum", values: JUDGE_FALLBACK_REASONS },
   judge_below_threshold: { type: "boolean" },
+  // proactive_level_changed: the NEW level (1 only when called, 2 follows the conversation, 3 joins in).
+  proactive_level: { type: "integer", min: 1, max: 3 },
 } as const;
 export type MetadataField = keyof typeof METADATA_FIELDS;
 
@@ -203,6 +210,7 @@ export interface EventMetadata {
   judge_model?: string;
   judge_fallback_reason?: JudgeFallbackReason;
   judge_below_threshold?: boolean;
+  proactive_level?: number;
 }
 
 export const MAX_LATENCY_MS = 86_400_000;
@@ -270,6 +278,14 @@ export const EVENT_RULES: Record<EventType, { outcomes: readonly Outcome[]; requ
   group_judged: {
     outcomes: ["judge_yes", "judge_no", "judge_fallback", "judge_missed"],
     required: INBOUND_DIMENSIONS,
+  },
+  // /proactive N (dispatch.ts): the trip, which way it moved (the outcome) and the
+  // new level (metadata.proactive_level, required - validateAssistantEvent and the
+  // table's CHECK both insist). No chat, no person, no message: how many groups turn
+  // the assistant down is a KPI, who did it is not recorded.
+  proactive_level_changed: {
+    outcomes: ["level_raised", "level_lowered"],
+    required: ["trip_id", "channel_type", "requester_role", "metadata"],
   },
 };
 
@@ -397,6 +413,9 @@ export function validateAssistantEvent(raw: unknown): ValidationResult {
     if (!rules.outcomes.includes(event.outcome)) return { ok: false, reason: "OUTCOME_NOT_ALLOWED_FOR_TYPE" };
     for (const field of rules.required) {
       if (event[field] === null || event[field] === undefined) return { ok: false, reason: `MISSING:${field}` };
+    }
+    if (event.event_type === "proactive_level_changed" && event.metadata.proactive_level === undefined) {
+      return { ok: false, reason: "MISSING:metadata.proactive_level" };
     }
     return { ok: true, event };
   } catch (error) {

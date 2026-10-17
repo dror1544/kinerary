@@ -415,6 +415,8 @@ export async function applyDecision(
       });
       // Carried only by the companion-unreachable answer: a lost turn.
       if (decision.analytics) deps.assistantEvents?.companionUnreachable(decision.reply.chatId, decision.analytics);
+      // An organizer's /proactive change: counted, never identified.
+      if (decision.levelChange) deps.assistantEvents?.proactiveLevelChanged(decision.levelChange);
       return;
 
     case "to_gateway": {
