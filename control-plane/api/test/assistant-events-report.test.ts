@@ -28,7 +28,7 @@ const DM_DAY: DayRollup = {
   requests_to_relay: 4,
   turns: { reply_delivered_substantive_outcome_unknown: 0, unanswered: 0, lost: 0 },
   reply_latency_ms: [],
-  replies: { delivered: 0, failed: 0, suppressed: 0, unattributed_delivered: 0 },
+  replies: { delivered: 0, failed: 0, suppressed: 0, unattributed_delivered: 0, silent_on_addressed: 0 },
   documents: {
     held: 0, joined: 0, forwarded: 0,
     forwarded_reply_delivered_substantive_outcome_unknown: 0, forwarded_unanswered: 0,
@@ -49,7 +49,7 @@ const GROUP_DAY: DayRollup = {
   requests_to_relay: 0,
   turns: { reply_delivered_substantive_outcome_unknown: 4, unanswered: 1, lost: 1 },
   reply_latency_ms: [45_000, 12_000, 30_000, 8_000],
-  replies: { delivered: 5, failed: 0, suppressed: 0, unattributed_delivered: 0 },
+  replies: { delivered: 5, failed: 0, suppressed: 0, unattributed_delivered: 0, silent_on_addressed: 0 },
   documents: {
     held: 1, joined: 1, forwarded: 1,
     forwarded_reply_delivered_substantive_outcome_unknown: 1, forwarded_unanswered: 0,

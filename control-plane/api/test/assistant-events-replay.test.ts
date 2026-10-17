@@ -482,7 +482,7 @@ describe("the week, replayed through the relay", () => {
       assert.equal(group.requests_forwarded, 5, "attach-it, three questions, the one never answered");
       assert.deepEqual(group.turns, { reply_delivered_substantive_outcome_unknown: 4, unanswered: 1, lost: 1 });
       assert.deepEqual(group.reply_latency_ms, [45_000, 12_000, 30_000, 8_000], "one per replied turn, first reply");
-      assert.deepEqual(group.replies, { delivered: 5, failed: 0, suppressed: 0, unattributed_delivered: 0 },
+      assert.deepEqual(group.replies, { delivered: 5, failed: 0, suppressed: 0, unattributed_delivered: 0, silent_on_addressed: 0 },
         "five messages for four turns: the last answer ran to two");
       assert.deepEqual(group.by_channel_role, [
         { channel_type: "group", requester_role: "organizer", not_addressed: 3, forwarded: 3, to_relay: 0, lost: 1 },

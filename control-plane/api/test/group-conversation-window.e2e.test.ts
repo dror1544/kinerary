@@ -47,7 +47,7 @@ import { RelayConnector } from "../src/relay/connector.js";
 import { GroupContext } from "../src/relay/group-context.js";
 import { startTripBotPoller } from "../src/relay/poller.js";
 import { makeUpgradeToken, type WireMessageEvent } from "../src/relay/protocol.js";
-import { conversationMark, SILENCE_SENTINEL } from "../src/relay/stay-silent.js";
+import { addressedMark, conversationMark, reactionAnswerMark, SILENCE_SENTINEL } from "../src/relay/stay-silent.js";
 import { HttpTelegramClient } from "../src/relay/telegram-api.js";
 import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
@@ -162,6 +162,7 @@ describe("group conversation window - the real relay, a fake Telegram and a scri
   const groupContext = new GroupContext();
   const logs: string[] = [];
   let tripId = "";
+  let botUsername = "";
   // The stand-in's record of what the bot sent outlives a test; each test reads from here.
   let sentFloor = 0;
 
@@ -289,6 +290,7 @@ describe("group conversation window - the real relay, a fake Telegram and a scri
 
     const me = await telegram.getMe();
     assert.ok(me, "the stand-in answers getMe");
+    botUsername = me!.username;
     stopPolling = startTripBotPoller({
       db: pool,
       telegram,
@@ -333,7 +335,11 @@ describe("group conversation window - the real relay, a fake Telegram and a scri
     assert.equal(event.source.chat_id, GROUP);
     assert.equal(event.source.user_id, ANN.id);
     assert.equal(event.source.profile, PROFILE);
-    assert.equal(event.text, "Liv what time does the museum open", "a message that named the companion is not marked");
+    assert.equal(
+      event.text,
+      `${addressedMark(botUsername)}\n\nLiv what time does the museum open`,
+      "a message that named the companion carries the addressed mark (with the bot's handle) and nothing else",
+    );
     assert.equal(count("trip_bot.conversation_window_hit"), 0, "and it did not come in through the window");
     assert.deepEqual((await window()).ids, [ANN.id], "the forward put Ann in the conversation");
   });
@@ -380,7 +386,7 @@ describe("group conversation window - the real relay, a fake Telegram and a scri
     const [named] = inboundAfter(mark);
     assert.ok(named, "naming the companion gets Ben through");
     assert.ok(named.text.includes("Liv can you book it for six"));
-    assert.ok(!named.text.includes(conversationMark()), "and that message is not marked");
+    assert.ok(!named.text.includes(conversationMark()), "and that message is not window-marked (it carries the addressed mark instead)");
     assert.ok(named.text.includes("Ben: sounds nice to me"), "the line he said before is carried as overheard background");
     assert.deepEqual((await window()).ids, [ANN.id, BEN.id], "Ben joined; nobody was displaced");
 
@@ -562,5 +568,73 @@ describe("group conversation window - the real relay, a fake Telegram and a scri
     const mark = companion.inbound.length;
     await type(ANN, "and one more thing");
     assert.equal(inboundAfter(mark).length, 0, "the opt-out covers the conversation window too");
+  });
+
+  test("9. A3 of the staging run: an @mention of the bot reaches the companion marked explicit, with its handle; a sentinel back is dropped AND counted", async () => {
+    const mark = companion.inbound.length;
+    await type(ANN, `@${botUsername} איפה המלון ביחס למרכז העיר?`);
+    const [event] = inboundAfter(mark);
+    assert.ok(event, "the mention was forwarded");
+    assert.ok(event.text.startsWith(addressedMark(botUsername)), "explicit marker first");
+    assert.ok(event.text.includes(`@${botUsername}`), "the companion is told its own handle");
+    assert.ok(event.text.endsWith("איפה המלון ביחס למרכז העיר?"));
+    assert.ok(!event.text.includes(conversationMark()), "and it is not a window forward");
+
+    // The defect itself: the companion answers the addressed turn with the sentinel.
+    const before = (await sent()).length;
+    const result = await companion.say(SILENCE_SENTINEL, { reply_to: event.message_id });
+    assert.equal(result.success, true);
+    assert.equal((await sent()).length, before, "still nothing is sent - there is no answer to invent");
+    assert.equal(count("trip_bot.silence_on_addressed_turn"), 1, "but it is logged as a defect");
+    assert.equal(count("trip_bot.companion_stayed_silent"), 1);
+
+    // The same sentinel on a window forward is the ordinary, legitimate silence.
+    await type(ANN, "ok so we will probably take the early one");
+    const windowTurn = companion.inbound.at(-1)!;
+    assert.ok(windowTurn.text.startsWith(conversationMark()));
+    await companion.say(SILENCE_SENTINEL, { reply_to: windowTurn.message_id });
+    assert.equal(count("trip_bot.silence_on_addressed_turn"), 1, "no new defect");
+    assert.equal(count("trip_bot.companion_stayed_silent"), 2);
+  });
+
+  test("10. emoji: a laugh in the window is not forwarded; a thumbs-up to the companion's question is the answer; after a statement it is not", async () => {
+    await type(ANN, "Liv suggest a dinner place");
+    await companion.say("There is a good winstub near the cathedral");
+
+    let mark = companion.inbound.length;
+    await type(ANN, "😂");
+    assert.equal(inboundAfter(mark).length, 0, "a bare laugh is a reaction: NOT_ADDRESSED");
+    assert.equal(notAddressed(), 1);
+    assert.equal(count("trip_bot.reaction_not_forwarded"), 1);
+
+    mark = companion.inbound.length;
+    await type(ANN, "👍");
+    assert.equal(inboundAfter(mark).length, 0, "a thumbs-up to a statement is a reaction");
+
+    // The companion asks a question: the "?" window is open, and a 👍 is consent.
+    await companion.say("לעדכן את האתר?");
+    mark = companion.inbound.length;
+    await type(BEN, "👍");
+    const [yes] = inboundAfter(mark);
+    assert.ok(yes, "the thumbs-up reached the companion");
+    assert.ok(yes.text.startsWith(reactionAnswerMark()), "told it answers the question");
+    assert.ok(yes.text.endsWith("👍"));
+    assert.equal(count("trip_bot.reply_window_hit"), 1);
+
+    // One shot: the next 👍 finds no question pending.
+    mark = companion.inbound.length;
+    await type(CLEO, "👍");
+    assert.equal(inboundAfter(mark).length, 0);
+  });
+
+  test("11. emoji-only Telegram reply to a companion question is addressed explicitly; to a statement it is not", async () => {
+    let mark = companion.inbound.length;
+    await type(DAN, "👍", { replyToMessageId: 5, replyToText: "Should I update the website?" });
+    const [yes] = inboundAfter(mark);
+    assert.ok(yes, "a thumbs-up replying to a question reached the companion");
+    assert.ok(yes.text.startsWith(addressedMark(botUsername)));
+    mark = companion.inbound.length;
+    await type(DAN, "👍", { replyToMessageId: 6, replyToText: "Done, the website is updated." });
+    assert.equal(inboundAfter(mark).length, 0, "a thumbs-up replying to a statement is a reaction");
   });
 });

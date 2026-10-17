@@ -960,6 +960,10 @@ the setting unset the same week writes nothing.
   exists; the version lives in the schema's file name (`tripbot-event.v1.json`).
   (§5.1's example carries `"schema_version": 1`; this contract does not.) The
   Hermes slice adds its own `source_service` value.
+- *(Later additions: the judge's keys and `proactive_level`, and from 2026-10-17
+  `silent_on_addressed`, a boolean on a `reply_suppressed` row - the companion
+  answered a turn that named it with the silence sentinel; see
+  `docs/group-participation-design.md` 2a.)*
 - **`metadata` is JSON-typed with exactly three keys**, `attachments_joined`
   (0–20), `documents` (0–20) and `document_held` (boolean) — numbers and one
   boolean, so nothing textual can ride in it. Enforced by the validator and by

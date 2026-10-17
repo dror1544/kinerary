@@ -249,7 +249,7 @@ export function emptyDayRollup(tripId: string, localDay: string): DayRollup {
     requests_to_relay: 0,
     turns: { reply_delivered_substantive_outcome_unknown: 0, unanswered: 0, lost: 0 },
     reply_latency_ms: [],
-    replies: { delivered: 0, failed: 0, suppressed: 0, unattributed_delivered: 0 },
+    replies: { delivered: 0, failed: 0, suppressed: 0, unattributed_delivered: 0, silent_on_addressed: 0 },
     documents: {
       held: 0,
       joined: 0,

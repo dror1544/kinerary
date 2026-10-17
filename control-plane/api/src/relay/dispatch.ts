@@ -54,7 +54,7 @@ import {
 } from "../chat-router.js";
 import { listOrganizerTrips, switchChatToTrip, type OrganizerTrip } from "../organizer-trips.js";
 import { isAddressedToAssistant } from "./addressing.js";
-import { conversationMark } from "./stay-silent.js";
+import { addressedMark, conversationMark, reactionAnswerMark } from "./stay-silent.js";
 import type { GroupJudge, JudgeOutcome } from "./group-judge.js";
 import { classifyTrigger, inboundFacts, type InboundFacts, type JudgeFacts, type LevelChangeFacts } from "../analytics/relay-facts.js";
 import { coerceLanguage, uiString, type Language } from "../intake-copy.js";
@@ -101,7 +101,7 @@ import { visionProcessingConfig } from "../document-vision.js";
 import { digestTelegramId } from "../identity.js";
 import type { StructuredModelRunner } from "../model-runner.js";
 import { handleModelCommand, isSwitchableRunner } from "../model-task-settings.js";
-import type { ChatType, WireMessageEvent } from "./protocol.js";
+import { looksLikeAQuestion, type ChatType, type WireMessageEvent } from "./protocol.js";
 
 /** A message the connector should send itself, rather than routing to an agent. */
 export interface DirectReply {
@@ -112,7 +112,18 @@ export interface DirectReply {
 
 export type DispatchDecision =
   /** Hand this turn to the Hermes gateway as an `inbound` frame. */
-  | { kind: "to_gateway"; event: WireMessageEvent; analytics?: InboundFacts }
+  | {
+      kind: "to_gateway";
+      event: WireMessageEvent;
+      analytics?: InboundFacts;
+      /**
+       * True when the group message was addressed to the assistant EXPLICITLY (its
+       * name, an @mention, a reply to its message) and so carries the
+       * `addressedMark`. The connector remembers it per chat: a silence reply to
+       * such a turn is a defect, not a judgement call (stay-silent.ts).
+       */
+      explicit?: boolean;
+    }
   /**
    * The connector answers this one itself. `analytics` is set only on the
    * companion-unreachable answer, which is a lost turn (#177).
@@ -1019,6 +1030,37 @@ export async function dispatchUpdate(
     // through it), a column a relay running ahead of its migration does not have:
     // a failed claim degrades to "no window", as the conversation window's reads
     // below do, rather than failing the update.
+    const senderId = outcome.event.source.user_id;
+    const inGroup = outcome.route.kind === "companion" && outcome.event.source.chat_type !== "dm";
+    // EXPLICIT addressing: the assistant's name, an @mention of the bot, or a reply
+    // to one of its messages. Decided on the message alone - no window, no model.
+    const explicitlyAddressed = isAddressedToAssistant({
+      chatType: outcome.event.source.chat_type,
+      text: outcome.event.text,
+      assistantNames: outcome.route.kind === "companion" ? outcome.route.assistantNames : [],
+      botUsername: botIdentity.username,
+      isReplyToAssistant,
+    });
+    // A group message with no letter or digit and no attachment (a laugh, a
+    // thumbs-up, a lone "?") is a reaction, not a request - EXCEPT as the answer
+    // to a question the assistant asked ("Should I update the site?" - 👍 is
+    // consent, owner's decision 2026-10-17). Exactly two things make one an
+    // answer: the one-shot "?" window is open (the assistant's latest send ended
+    // in a question, unanswered, inside 150 s - consumed below, as for any
+    // message), or it is a Telegram reply to an assistant message that itself
+    // ended in a question. Anything else - a laugh, a thumbs-up to a statement,
+    // a reply to a statement - is chatter: the conversation window and the judge
+    // never admit it. "The assistant's latest message was a question" is NOT
+    // stored anywhere new: the "?" window IS that state, and a reply carries the
+    // text it replies to.
+    const reactionOnly = inGroup && !outcome.attachment && outcome.event.text.trim() !== "" &&
+      !judgeableText(outcome.event.text);
+    const repliedToText = message.reply_to_message?.text ?? message.reply_to_message?.caption ?? "";
+    const reactionAnswersQuestion = reactionOnly && isReplyToAssistant && looksLikeAQuestion(repliedToText);
+    // Explicit addressing as it counts for THIS message: a reaction that replies
+    // to a statement is not explicit, whoever's message it replies to.
+    const explicitHere = explicitlyAddressed && (!reactionOnly || reactionAnswersQuestion);
+
     let capturedAsReply = false;
     if (outcome.route.kind === "companion") {
       try {
@@ -1033,17 +1075,8 @@ export async function dispatchUpdate(
     // Booleans only in the log: no chat or user id beyond what other events carry.
     if (capturedAsReply) log(structuredLog("info", "trip_bot.reply_window_hit", {}));
 
-    const senderId = outcome.event.source.user_id;
-    const inGroup = outcome.route.kind === "companion" && outcome.event.source.chat_type !== "dm";
-    const addressedOtherwise =
-      capturedAsReply ||
-      isAddressedToAssistant({
-        chatType: outcome.event.source.chat_type,
-        text: outcome.event.text,
-        assistantNames: outcome.route.kind === "companion" ? outcome.route.assistantNames : [],
-        botUsername: botIdentity.username,
-        isReplyToAssistant,
-      });
+    if (reactionOnly && !capturedAsReply && !explicitHere) log(structuredLog("info", "trip_bot.reaction_not_forwarded", {}));
+    const addressedOtherwise = capturedAsReply || explicitHere;
 
     // The per-person conversation window (2026-10-16). Consulted LAST, only for
     // a group message every other route has refused: is the sender the one
@@ -1057,7 +1090,7 @@ export async function dispatchUpdate(
     // every untagged group message and lose its held documents and overheard
     // context with them. Same rule as the writes.
     let capturedByConversation = false;
-    if (!addressedOtherwise && inGroup && senderId) {
+    if (!addressedOtherwise && inGroup && senderId && !reactionOnly) {
       try {
         capturedByConversation = await inCompanionConversation(db, chatId, senderId);
       } catch (error) {
@@ -1136,7 +1169,9 @@ export async function dispatchUpdate(
       // this only means the NEXT addressed message knows what it is replying
       // into. Groups only — a DM is addressed by construction, so nothing is
       // ever dropped there.
-      if (options.groupContext && outcome.event.source.chat_type !== "dm" && outcome.event.text) {
+      // A bare reaction (an emoji, a "?") is not kept either: it adds nothing the
+      // companion could use and would only lengthen the block that leads its prompt.
+      if (options.groupContext && outcome.event.source.chat_type !== "dm" && outcome.event.text && !reactionOnly) {
         options.groupContext.hold(
           chatId,
           outcome.event.source.user_name || "someone",
@@ -1256,7 +1291,7 @@ export async function dispatchUpdate(
     // the assistant (no name, @mention, reply-to or "?" window) is marked, so the
     // companion can tell a remark to the family from a message to it, and may
     // answer with the silence sentinel (stay-silent.ts; the connector drops it).
-    // Named / mentioned / replying messages are never marked. Text is the only
+    // Named / mentioned / replying messages never get this mark (see addressedMark below). Text is the only
     // field that reaches the model, so the mark is a fenced line on the text,
     // put on BEFORE the overheard block so that block still leads. An empty
     // text (a photo or file with no caption) gets the mark alone.
@@ -1265,6 +1300,23 @@ export async function dispatchUpdate(
     // against a wrong yes).
     if (capturedByConversation || capturedByJudge) {
       outcome.event.text = `${conversationMark()}\n\n${outcome.event.text}`.trimEnd();
+    }
+    // The opposite fence (2026-10-17, A3 of the staging run): a group message
+    // that EXPLICITLY addressed the assistant - its name, an @mention, a reply to
+    // it - says so. The companion's prompt never named its own @handle, so it read
+    // "@<bot> where is the hotel?" as meant for someone else and answered with the
+    // silence sentinel, twice. Said as a fenced line on the text (the only field
+    // that reaches the model), carrying the bot's handle so the companion learns
+    // it, and ordered exactly like the conversation mark. The "?" window is NOT
+    // explicit - the next message after a question may be anyone's remark - so it
+    // keeps today's unmarked form. A DM is addressed by construction, never marked.
+    const explicit = inGroup && explicitHere;
+    if (explicit) {
+      outcome.event.text = `${addressedMark(botIdentity.username)}\n\n${outcome.event.text}`.trimEnd();
+    } else if (inGroup && reactionOnly && capturedAsReply) {
+      // A reaction that took the "?" window: not addressed by name, so a silence
+      // is allowed, but it is told what the bare emoji answers.
+      outcome.event.text = `${reactionAnswerMark()}\n\n${outcome.event.text}`.trimEnd();
     }
 
     // The turns this message is a reply INTO. Prefixed onto the text rather
@@ -1296,6 +1348,7 @@ export async function dispatchUpdate(
     return {
       kind: "to_gateway",
       event: forwarded,
+      ...(explicit ? { explicit: true } : {}),
       ...(await withAnalytics(options.assistantEvents, log, () => ({
         ...seen(senderLinkRole),
         attachmentsJoined: attachments.joined,

@@ -108,6 +108,13 @@ function usageSection(rollup: DayRollup, rates: DayRates): ReportSection {
         fmtCount(rollup.replies.failed),
         rollup.replies.delivered + rollup.replies.failed + rollup.replies.suppressed === 0,
       ),
+      // A defect count (target 0): the companion answered a message that named
+      // it with the silence sentinel, so the family got nothing.
+      line(
+        "Silent on a message that named the assistant",
+        fmtCount(rollup.replies.silent_on_addressed),
+        rollup.replies.delivered + rollup.replies.failed + rollup.replies.suppressed === 0,
+      ),
     ],
   };
 }

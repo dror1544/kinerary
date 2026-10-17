@@ -295,7 +295,7 @@ function statesExpectsReply(metadata: unknown): boolean {
  * loose rule would make a chatty assistant capture the family's next sentence
  * every time, which is the behaviour addressing.ts exists to prevent.
  */
-function looksLikeAQuestion(content: string): boolean {
+export function looksLikeAQuestion(content: string): boolean {
   const trimmed = content.trimEnd();
   if (!trimmed) return false;
   // "?" Latin/Hebrew, "؟" Arabic, "？" full-width. Hebrew writes "?" but the

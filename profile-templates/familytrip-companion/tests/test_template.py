@@ -37,6 +37,24 @@ class Tests(unittest.TestCase):
    soul=(o/'SOUL.md').read_text()
    self.assertIn(expected,soul,tone); self.assertNotIn(forbidden,soul,tone)
    self.assertIn('tone is set too, not defaulted',soul,tone)
+ def test_soul_group_silence_rules(self):
+  # The 2026-10-17 staging run: the companion answered a message that @mentioned
+  # it with the silence sentinel (twice), and joked at an emoji. The rendered
+  # SOUL must (a) say a line starting `[addressed to you directly` is ALWAYS
+  # answered, (b) give concrete cases that DO get the sentinel, (c) keep a
+  # thank-you OUT of them (owner, 17 Oct: a brief warm reply is right), and
+  # (d) no longer tell the companion to answer "when in doubt" for remarks.
+  td,o,c=self.go(); self.addCleanup(td.cleanup); self.assertEqual(c.returncode,0,c.stderr)
+  soul=(o/'SOUL.md').read_text()
+  sec=soul.split('## In a conversation in the group, not every line is meant for you')[1].split('\n## ')[0]
+  self.assertIn('`[addressed to you directly`',sec); self.assertIn('`[not addressed to you by name`',sec); self.assertIn('`[a reaction sent right after your last question`',sec)
+  self.assertRegex(sec,r'always\*\* for you: answer it\. Never reply with the\s+silence marker')
+  self.assertIn('[[KINERARY_STAY_SILENT]]',sec)
+  silent=sec.split('These must get the silence marker:')[1].split('- **When it is a toss-up')[0]
+  for needle in ('"😂"','"we\'ll leave at nine"','"who has the tickets?"','remark to another member'): self.assertIn(needle,silent)
+  self.assertNotIn('thank',silent.lower()); self.assertIn('thank-you to you',sec)
+  self.assertNotIn('When in doubt, and a short answer would help, answer',sec)
+  self.assertIn('Telegram handle',sec)
  def test_profile_description_is_yaml_safe(self):
   d=json.loads((ROOT/'example.handoff.json').read_text()); d['profile']['description']='A trip: "quoted"'; td,o,c=self.go(d); self.addCleanup(td.cleanup); self.assertEqual(c.returncode,0,c.stderr); self.assertIn('description: "A trip: \\"quoted\\""',(o/'profile.yaml').read_text())
  def test_rendered_overlay_gates_skill_manage_writes(self):

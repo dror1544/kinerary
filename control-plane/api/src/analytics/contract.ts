@@ -199,6 +199,9 @@ export const METADATA_FIELDS = {
   judge_below_threshold: { type: "boolean" },
   // proactive_level_changed: the NEW level (1 only when called, 2 follows the conversation, 3 joins in).
   proactive_level: { type: "integer", min: 1, max: 3 },
+  // reply_sent / reply_suppressed: the companion stayed silent on a turn that
+  // named it (name, @mention, reply to it) - a defect the daily report counts.
+  silent_on_addressed: { type: "boolean" },
 } as const;
 export type MetadataField = keyof typeof METADATA_FIELDS;
 
@@ -211,6 +214,7 @@ export interface EventMetadata {
   judge_fallback_reason?: JudgeFallbackReason;
   judge_below_threshold?: boolean;
   proactive_level?: number;
+  silent_on_addressed?: boolean;
 }
 
 export const MAX_LATENCY_MS = 86_400_000;

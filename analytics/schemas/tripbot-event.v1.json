@@ -101,7 +101,8 @@
         "judge_model": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,79}$" },
         "judge_fallback_reason": { "enum": ["timeout", "error", "unparseable", "rate_limited", "circuit_open", "queue_full"] },
         "judge_below_threshold": { "type": "boolean" },
-        "proactive_level": { "type": "integer", "minimum": 1, "maximum": 3 }
+        "proactive_level": { "type": "integer", "minimum": 1, "maximum": 3 },
+        "silent_on_addressed": { "type": "boolean" }
       }
     },
     "tool_name": {

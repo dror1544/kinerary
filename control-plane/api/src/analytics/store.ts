@@ -194,7 +194,7 @@ export interface DayRollup {
   };
   /** Time from hand-off to first delivered reply, one per replied turn, in hand-off order. */
   reply_latency_ms: number[];
-  replies: { delivered: number; failed: number; suppressed: number; unattributed_delivered: number };
+  replies: { delivered: number; failed: number; suppressed: number; unattributed_delivered: number; silent_on_addressed: number };
   documents: {
     /** Sent to a group without addressing the assistant; kept for the sender's next addressed message. */
     held: number;
@@ -367,7 +367,7 @@ export async function rollupAssistantEvents(
         requests_to_relay: 0,
         turns: { reply_delivered_substantive_outcome_unknown: 0, unanswered: 0, lost: 0 },
         reply_latency_ms: [],
-        replies: { delivered: 0, failed: 0, suppressed: 0, unattributed_delivered: 0 },
+        replies: { delivered: 0, failed: 0, suppressed: 0, unattributed_delivered: 0, silent_on_addressed: 0 },
         documents: {
           held: 0,
           joined: 0,
@@ -452,7 +452,12 @@ export async function rollupAssistantEvents(
           day.replies.delivered += 1;
           if (!row.turn_id) day.replies.unattributed_delivered += 1;
         } else if (row.outcome === "failed_delivery") day.replies.failed += 1;
-        else if (row.outcome === "reply_suppressed") day.replies.suppressed += 1;
+        else if (row.outcome === "reply_suppressed") {
+          day.replies.suppressed += 1;
+          // The companion answered a message that NAMED it with the silence
+          // sentinel: a defect count, not a judgement call (relay/stay-silent.ts).
+          if (row.metadata?.silent_on_addressed === true) day.replies.silent_on_addressed += 1;
+        }
         break;
       case "relay_tool_completed":
         // One per read the relay ran (one upload burst), by its outcome.
