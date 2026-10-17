@@ -1,3 +1,5 @@
+> Describes the agent-driven interview path. Since 2026-09-09 new sessions default to the deterministic router (`docs/interview-without-an-agent.md`) when `INTERPRET_PATH_DEFAULT=1`; this path applies when it is unset.
+
 # The interviewer agent — Hermes + Telegram
 
 How to stand up an agent on a Hermes instance that runs the trip-creation
@@ -246,7 +248,7 @@ rm -rf trips/<throwaway-slug>
   `set_telegram_group` tool with that `chat_id` (and the group's title) —
   once, unprompted, not waiting to be asked.** This is the one Telegram
   setting that can't be known at deploy time (see "Binding the group" in
-  [docs/telegram-sso.md](telegram-sso.md)) — the interviewer here can't do
+  [docs/archived/telegram-sso.md](archived/telegram-sso.md)) — the interviewer here can't do
   it, since it only ever DMs the organizer and is never a group member.
   Until the companion profile exists and does this, binding stays a manual
   step: a human runs the `curl` example in that doc, or calls the same

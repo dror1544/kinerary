@@ -39,7 +39,7 @@ import type { TelegramMessage } from "../src/relay/normalize.js";
 import { PendingAttachments } from "../src/relay/pending-attachments.js";
 import { makeUpgradeToken } from "../src/relay/protocol.js";
 import { minimalPdf } from "./support/minimal-pdf.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 // The trip-site suite's own harness: a real server.js on a throwaway copy of
 // tests/fixtures, and a real mcp.js pointed at it.
 // @ts-expect-error — plain JS helpers, no type declarations
@@ -99,7 +99,7 @@ describe("an itinerary PDF sent to the family group reaches the trip's plan", { 
   const mediaStore = new MediaStore();
 
   before(async () => {
-    pool = new pg.Pool({ connectionString: databaseUrl });
+    pool = testPool();
     const client = await pool.connect();
     try {
       await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");
@@ -271,6 +271,16 @@ describe("an itinerary PDF sent to the family group reaches the trip's plan", { 
         username: "Kinerary_bot",
         id: "9000",
       }, { media, pendingAttachments: pending });
+
+    // The previous test left this organizer in conversation with the assistant
+    // (the per-person window, 2026-10-16), in which an untagged file would be
+    // forwarded at once. This test is about the HELD document - a file sent
+    // when no conversation is open - so the window is closed first, as it
+    // would be five minutes after the assistant's last message.
+    await pool.query(
+      "UPDATE control_plane.telegram_chat_bindings SET conversation_user_ids = NULL, conversation_until = NULL WHERE chat_id = $1",
+      [GROUP],
+    );
 
     await send({
       message_id: 11,

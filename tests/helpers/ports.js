@@ -15,7 +15,17 @@
  * letting a duplicate surface later as a flaky EADDRINUSE.
  *
  * Only fixed ports belong here. A stand-in that binds port 0 and reads its
- * address back cannot collide, and needs no entry.
+ * address back cannot collide, and needs no entry. Neither does a test whose
+ * server needs no known port: `await freePort()` (helpers/port-guard.js) takes
+ * whatever the OS has free, so a LEAKED server from an earlier or another
+ * worktree's run cannot hold it — which is what fixed ports are exposed to,
+ * and why a test that can use one should (control-plane-session, hero-http,
+ * calendar-routes... did, 2026-10-13).
+ *
+ * A fixed port that something already holds is named, not discovered as an
+ * EADDRINUSE cascade: `npm test` runs check-free-ports.js first (pretest),
+ * and startTestServer()/startTestMcp() call assertPortFree() before spawning.
+ * Both name the holder's pid and command and say how to stop it.
  *
  * Adding a test that binds a port: add a named entry here, and import it.
  * Never write a port literal in a test file. That rule is not style: a literal
@@ -24,15 +34,15 @@
  * port as `itineraryOverlaySync` — a real duplicate that `assertUnique()`
  * could not report, because only one of the two was ever declared here.
  *
- * ── WHY 38000 AND NOT 3000 ────────────────────────────────────────────────
+ * ── WHY 28000 AND NOT 3000, AND NOT 38000 ────────────────────────────────
  *
  * The suite used to allocate upward from 3095, which put 29 of these entries
  * inside 3100-3999 — and that block is not ours. Every provisioned trip runs
- * its own trip-mcp bridge on `3000 + vmid` (mcp_bridge.py's
- * `mcp_port_for_vmid`, clamped to 3100-3999), on the same Mac where these
- * tests run. Proxmox hands out VMIDs from 100 upward, so the live allocation
- * mapped almost one-to-one onto the old test block: VMID 104, 105, 106, 107
- * were all in use at once on 2026-09-18, and 3106 is `mcpExtract`.
+ * its own trip-mcp bridge on `3000 + vmid` (mcp_port_for_vmid, clamped to
+ * 3100-3999), on the same Mac where these tests run. Proxmox hands out VMIDs
+ * from 100 upward, so the live allocation mapped almost one-to-one onto the
+ * old test block: VMID 104, 105, 106, 107 were all in use at once on
+ * 2026-09-18, and 3106 is `mcpExtract`.
  *
  * It bit exactly as you would expect and read as something else entirely:
  * `trip-mcp exited with code 1 before becoming ready`, no mention of a port,
@@ -42,82 +52,147 @@
  * The TESTS moved rather than the bridges, because a bridge port is not free
  * to change: it is derived from the container, written into every companion's
  * profile config and recorded in topology.yaml, so moving it would orphan
- * the bridges already deployed. A test port is a named constant behind
- * `assertUnique()` with a rule that no test may write a literal, so moving it
- * costs one file. `assertClearOfTripBridges()` keeps it moved.
+ * the bridges already deployed. `assertClearOfTripBridges()` keeps it moved.
  *
- * 38000+ is clear of the bridge range, of the legacy shared bridges (3001,
- * 3011, 3013), of the control plane (4310-4312, 4399) and of its databases
- * (5433, 5434), and is comfortably below the ephemeral range macOS allocates
- * from (49152+), so nothing here can collide with an outbound socket either.
+ * The first move went to 38000+, reasoning only about macOS, whose ephemeral
+ * (outbound) range is 49152-65535. CI runs on Linux, whose default
+ * `ip_local_port_range` is 32768-60999, and 38000+ is INSIDE it. Several test
+ * files bind port 0 or open many outbound connections at
+ * --test-concurrency=4, so the kernel can hand one of them a number in this
+ * table an instant before a test server binds it. Observed once on CI
+ * (run 36181059100: EADDRINUSE on 38202, then "Server exited with code 1
+ * before becoming ready"; an earlier PR hit 38194). That causal theory was
+ * NOT reproduced — it cannot be on macOS — it is the explanation that fits
+ * the log, and the fix is to make it impossible.
+ *
+ * So the table now lives at 28000+: below 32768, hence clear of the Linux
+ * range and of macOS's, clear of the trip bridges (3100-3999), the legacy
+ * shared bridges (3001, 3011, 3013), the control plane (4310-4312, 4399),
+ * its databases (5433, 5434) and the usual dev ports (3000, 5173, 8080).
+ * assertBelowEphemeralRange() keeps it there.
  */
 
 /**
  * Ports a provisioned trip's own trip-mcp bridge can take, from
  * `mcp_port_for_vmid`. Not ours to bind, on any machine that provisions trips.
  */
+/**
+ * First port of Linux's default ephemeral range (`ip_local_port_range`,
+ * 32768-60999). macOS's (49152+) starts higher, so this is the binding limit.
+ */
+export const EPHEMERAL_RANGE_FIRST = 32768;
+
 export const TRIP_BRIDGE_PORT_RANGE = { first: 3100, last: 3999 };
 
 export const PORTS = {
-  companionControl:        38201,
-  companionConversation:   38202,
   // ── Full trip servers ──────────────────────────────────────────────────
-  telegramSso:             38095,
-  telegramSsoConfigResync: 38100,
-  telegramSsoGroupBind:    38102,
-  multiOrganizer:          38096,
-  configVersionsRestart:   38097,
-  configVersionsBoot:      38098,
-  serverDefault:           38099,  // helpers/server.js fallback — server.test.js
-  agentParticipants:       38101,
-  bookingExtractServer:    38104,
-  errorHandling:           38105,
-  currencyRates:           38107,
-  scheduleReviewServer:    38109,
-  itineraryOverlaySync:    38113,
-  planSingleSource:        38119,
-  planSingleSourceBoot:    38120,
-  itineraryPlanLayerServer: 38118,
-  configDayLinksServer:    38114,
-  configAllowList:         38126,  // tests/config-allow-list.test.js — hostile config, issue #172
-  configAllowListPromote:  38127,  // tests/config-allow-list.test.js — malformed plan config, issue #172
-
-  modernParity:            38298,
-  modernEnrichment:        38194,
-  heroHttp:                38196,
-  tripEventsHttp:          38198,
-  controlPlaneSession:     38296,
-  tripMcpEnabled:          38300,
-  tripMcpDisabled:         38301,
-  tripMcpPublicOrigin:     38302,
-  tripMcpNoSdk:            38303,
+  telegramSso:             28095,
+  telegramSsoConfigResync: 28100,
+  telegramSsoGroupBind:    28102,
+  multiOrganizer:          28096,
+  configVersionsRestart:   28097,
+  configVersionsBoot:      28098,
+  serverDefault:           28099,  // helpers/server.js fallback — server.test.js
+  agentParticipants:       28101,
+  agentParticipantsGhostOrganizer: 28131,
+  bookingExtractServer:    28104,
+  errorHandling:           28105,
+  currencyRates:           28107,
+  scheduleReviewServer:    28109,
+  planSingleSource:        28119,
+  planSingleSourceBoot:    28120,
+  itineraryPlanLayerServer: 28118,
+  configDayLinksServer:    28114,
+  configAllowList:         28126,  // tests/config-allow-list.test.js — hostile config, issue #172
+  configAllowListPromote:  28127,  // tests/config-allow-list.test.js — malformed plan config, issue #172
+  galleryBoundary:         28128,  // tests/gallery-boundary.test.js — issues #191/#194
+  galleryHardening:        28129,  // tests/gallery-hardening.test.js — boundary audit round 2 of #191/#194
+  modernParity:            28298,
+  tripEventsHttp:          28198,
+  tripMcpEnabled:          28304,
+  tripMcpDisabled:         28305,
+  tripMcpPublicOrigin:     28306,
+  tripMcpNoSdk:            28307,
   // control-plane/api/test/group-document-to-plan.integration.test.ts
-  groupDocumentServer:     38294,
+  groupDocumentServer:     28294,
 
   // Servers a single describe() spawns with a patched config of its own.
-  currencyRatesUsdHome:    38111,
-  currencyRatesUsdOnly:    38112,
-  configDayLinksSeeded:    38115,
+  currencyRatesUsdHome:    28111,
+  currencyRatesUsdOnly:    28112,
+  configDayLinksSeeded:    28115,
 
   // ── MCP servers ────────────────────────────────────────────────────────
-  controlPlaneSessionMcp:  38295,
-  groupDocumentMcp:        38293,
-  mcpExtract:              38106,
-  itineraryPlanLayerMcp:   38108,
-  mcpDefault:              38117,
-  mcpBookingConfirmation:  38116,
-  mcpBudget:               38121,
-  mcpHealthUnreachable:    38122,
-  mcpHealthReachable:      38123,
-  mcpHealthAuth:           38125,
+  groupDocumentMcp:        28293,
+  mcpExtract:              28106,
+  mcpExtractEmpty:         28300,
+  mcpExtractEnv:           28301,  // tests/mcp-extract-env.test.js — issue #183
+  itineraryPlanLayerMcp:   28108,
+  mcpDefault:              28117,
+  mcpHealthUnreachable:    28122,
+  mcpHealthReachable:      28123,
+  mcpHealthAuth:           28125,
+  mcpPhasePlan:            28308,  // tests/mcp-phase-plan.test.js — issue #310
+  mcpPhasePlanLarge:       28309,  // tests/mcp-phase-plan.test.js — issue #310, safety-net fixture
+  lostFound:               28312,  // tests/lost-found.test.js — issue #207
+  // Stop editing after the interview (server slices S1–S3).
+  tripStops:               28313,  // tests/trip-stops-http.test.js — main flow
+  tripStopsGolden:         28314,  // tests/trip-stops-http.test.js — byte-identical /api/config, one server at a time
+  itineraryMoveDay:        28315,  // tests/itinerary-move-day.test.js
+  configAllowListStops:    28316,  // tests/config-allow-list.test.js — stop overrides never serve pin/provenance
+  tripStopsHardening:      28317,  // tests/trip-stops-http.test.js — boundary review 2026-10-11 (stored XSS, prototype keys)
+  // Stop editing from the companion (slice S4) — tests/mcp-trip-stops.test.js.
+  mcpTripStops:            28318,  // mcp/mcp.js against a stand-in site
+  mcpTripStopsLive:        28319,  // mcp/mcp.js against the real trip server below
+  mcpTripStopsSite:        28320,  // the real trip server mcpTripStopsLive talks to
+  stopFollowups:           28321,  // tests/stop-followups.test.js — split-then-link, gershayim (second review 2026-10-11)
+  // "Tonight:" lodging computed at serve time — tests/tonight-lodging.test.js.
+  tonightLodging:          28322,
+  // Write-time validation of booking and participant text, bilingual refusals
+  // — tests/write-validation.test.js.
+  writeValidation:         28323,  // the trip server
+  writeValidationExtract:  28324,  // stand-in for the extraction service (extract-draft)
+  writeValidationMcp:      28325,  // mcp/mcp.js against that trip server
+  // The four P2 findings of the automated review of PR #362 (stop editing)
+  // — tests/stop-review-fixes.test.js.
+  stopReviewFixes:         28326,
+  // Subdivision flags (emoji tag sequences) in stop text, over HTTP (owner
+  // decision, 2026-10-12) — tests/emoji-flags-http.test.js.
+  emojiFlagsHttp:          28328,
+  // Tool output with the Unicode tag block made visible or dropped (boundary
+  // re-check of PR #375) — tests/mcp-tag-output.test.js.
+  mcpTagOutputSite:        28329,  // the real trip server
+  mcpTagOutputMcp:         28330,  // mcp/mcp.js against it
+  // The same for tool ERRORS (code review of PR #375): a stand-in site whose
+  // refusals carry tag text, so every error helper in mcp/mcp.js is reached.
+  mcpErrorTagsSite:      28334,  // the stand-in site
+  mcpErrorTagsMcp:       28335,  // mcp/mcp.js against it
+  // The public lost-and-found form: write-time text rules, abuse bounds, and
+  // the finder-submitted label on the model's copy — tests/lost-found-hardening.test.js.
+  lostFoundHardening:       28331,  // the trip server (text rules, MCP, Classic)
+  lostFoundHardeningMcp:    28332,  // mcp/mcp.js against it
+  lostFoundHardeningBounds: 28333,  // a second trip server: rate limit and open-entry cap
+  // Boundary review of PR #377: the limiter's client address behind a proxy
+  // (TRUST_PROXY_HOPS) and the bounded get_lost_found — tests/lost-found-proxy.test.js.
+  lostFoundProxyDefault:    28336,  // TRUST_PROXY_HOPS unset
+  lostFoundProxyOneHop:     28337,  // TRUST_PROXY_HOPS=1
+  lostFoundProxyTwoHops:    28338,  // TRUST_PROXY_HOPS=2
+  lostFoundProxyInvalid:    28339,  // invalid values, one server at a time
+  lostFoundBoundsSite:      28340,  // GET ?open= ?limit= ?count=1
+  lostFoundBoundsMcpSite:   28341,  // the trip server mcp/mcp.js reads
+  lostFoundBoundsMcp:       28342,  // mcp/mcp.js against it
+  // Review of the hardening itself: GET serves a column allow-list.
+  lostFoundColumnsSite:     28343,  // the trip server, with an extra column added
+  // One hotel, one place — a companion-added hotel resolves to the same name
+  // and links in every view — tests/hotel-one-place.test.js.
+  hotelOnePlace:            28351,
 
   // ── Stand-ins for services the server calls out to ─────────────────────
-  bookingExtractMockHermes: 38103,
-  mcpHealthTripSite:        38124,
-  scheduleReviewMockHermes: 38110,
+  bookingExtractMockHermes: 28103,
+  mcpHealthTripSite:        28124,
+  scheduleReviewMockHermes: 28110,
 };
 
-function assertUnique(table) {
+export function assertUnique(table) {
   const owner = new Map();
   for (const [name, port] of Object.entries(table)) {
     if (owner.has(port)) {
@@ -140,7 +215,7 @@ function assertUnique(table) {
  * from a neighbour fails at import instead of failing for whoever next runs
  * the suite beside a live trip.
  */
-function assertClearOfTripBridges(table) {
+export function assertClearOfTripBridges(table) {
   const { first, last } = TRIP_BRIDGE_PORT_RANGE;
   const clashes = Object.entries(table)
     .filter(([, port]) => port >= first && port <= last)
@@ -150,10 +225,31 @@ function assertClearOfTripBridges(table) {
       `helpers/ports.js: ${clashes.length} test port(s) fall inside ${first}-${last}, ` +
       'which belongs to provisioned trips\' trip-mcp bridges (mcp_port_for_vmid = 3000 + vmid): ' +
       `${clashes.join(', ')}. A trip on that VMID makes the test fail as "exited before ` +
-      'becoming ready" with no mention of a port. Allocate from 38000 instead.'
+      'becoming ready" with no mention of a port. Allocate from 28000 instead.'
+    );
+  }
+}
+
+/**
+ * No test port may sit in the OS's ephemeral range: [32768, 60999] on Linux
+ * (CI), 49152+ on macOS. Anything at or above 32768 can be handed by the
+ * kernel to an outbound connection or a port-0 listener an instant before a
+ * test server binds it, which fails as a random EADDRINUSE on whichever file
+ * lost the race. See the comment at the top of this file.
+ */
+export function assertBelowEphemeralRange(table) {
+  const bad = Object.entries(table)
+    .filter(([, port]) => port >= EPHEMERAL_RANGE_FIRST)
+    .map(([name, port]) => `${name} (${port})`);
+  if (bad.length > 0) {
+    throw new Error(
+      `helpers/ports.js: ${bad.length} test port(s) are >= ${EPHEMERAL_RANGE_FIRST}, inside the ` +
+      'Linux ephemeral range 32768-60999 (and macOS 49152+), where the kernel can hand the ' +
+      `port to another socket before the test binds it: ${bad.join(', ')}. Allocate from 28000.`
     );
   }
 }
 
 assertUnique(PORTS);
 assertClearOfTripBridges(PORTS);
+assertBelowEphemeralRange(PORTS);

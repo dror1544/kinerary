@@ -1,5 +1,7 @@
 # B1 — the companion cannot be installed
 
+**Status (checked 2026-09-25): built via the SSH-bridge fork, not the tooled-worker recommendation in §2.** The worker SSHes out to the host and runs `scripts/companion-install-host.sh` (`control-plane/worker/control_plane_worker/companion_profile.py`). §3 describes the tooled-worker path that was not taken; it is not a plan for future work. Reason for the choice (Dror, 2026-09-25): the fastest route was taken; he has no preference for SSH; it was chosen for speed and was not compared against the tooled worker. He is open to doing it properly if that makes sense. Issue #127 tracks the checkout-selection weakness of the SSH forced command.
+
 **Scope: `activation-scope.md` §3 finding B1, and nothing beyond it.** Written
 2026-09-06 after run 13. This is a build plan; `activation-scope.md` remains
 the authority on what activation *is*, and its instruction stands — a
@@ -66,6 +68,23 @@ and supervision. That is new surface, not an existing pattern.
 **Recommendation: the tooled worker.** It is the option that matches the shape
 the worker already has.
 
+*Not the fork that shipped. `d2b8817` ("feat(provisioning): materialize a
+companion on the host, over a restricted key", 2026-09-06) and `9a0139f`
+("fix(companion): the trip-mcp bridge is wired where node and Hermes are",
+2026-09-11) are both ancestors of `integration/sprint-6` — the worker instead
+SSHes out to the host over a forced-command key
+(`control_plane_worker/companion_profile.py`) and runs
+`scripts/companion-install-host.sh`; `render_profile.py` never runs inside the
+worker container. Found and cross-checked 2026-09-22 while re-verifying A3 of
+`docs/onboarding-to-active-plan.md` (§2 there). Decided; reason, given by Dror on
+2026-09-25: "we took the fastest route" — chosen for speed, not compared against
+the tooled worker, and he has no preference for SSH (open to doing it properly
+if it makes sense; #127). Recommendation left
+as written rather than rewritten, matching this repo's convention of
+annotating a superseded decision in place rather than editing history; §3
+below ("the work") describes the tooled-worker path that was not the one
+built and is not a plan for future work.*
+
 ## 3. The work
 
 1. **Worker image** — add `node` and the `hermes` CLI to
@@ -117,9 +136,11 @@ demonstrate.
 - **B3** — `activation-scope.md` is explicit that the seed password already
   gives first access; B3 buys the clean per-member path, not the ability to get
   in. Note this is an *operational* fact, not a code one:
-  `PROVISIONER_SEED_PASSWORD` empty means, per `compose.local.yml:173-177`, the
-  site has no usable login at all. It is set on the running stack. It should be
-  asserted somewhere, not remembered.
+  a site built before 2026-10-15 got `PROVISIONER_SEED_PASSWORD` (one value for
+  every trip; empty meant no usable login at all). That variable is retired: each
+  site now generates its own password at bootstrap, and `stage_served` in
+  `scripts/e2e-full-cycle.py` asserts that the one the organizer is told is the
+  one the container's `.env` holds.
 - **B5, B6** — both are trip N+1 problems (port collision, manual allowlisting).
   A first family is trip N.
 - **Activation states** — see the top of this file.

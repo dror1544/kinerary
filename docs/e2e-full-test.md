@@ -64,11 +64,56 @@ with one row per scenario (`japan`, `multi`, `manual` → `green`) and
 | | |
 |---|---|
 | `--scenario japan\|multi\|manual\|own\|all` | `japan`: a booking PDF. `multi`: several documents and stops. `manual`: every answer typed. `own`: a person's real trip. |
+| `--scenario star` | a couples trip from ONE base with day trips, then a change of stops through the companion. Needs `--auto`; **not** part of `all` or the nightly (see "The `star` scenario"). |
 | `--auto` | the automated organizer plays the person |
 | `--stop-after confirm` | stop at the confirmed intake: no plan, no job, Proxmox untouched |
 | `--teardown` / `--keep` | remove what the run created / leave it running |
 | `--wait-minutes N` | how long to wait for a person to confirm (default 30) |
 | `--trip-name "…"` | the name the signup form would have carried |
+
+## The `star` scenario
+
+Two couples, December 2027, one town they sleep in the whole trip and day-trip
+from, flying in and out of a gateway city with one rental car collected and
+returned there. It is the owner's manual run of 2026-10-10 replayed with made-up
+people (`control-plane/api/test/fixtures/make_documents.py`, `"star"`;
+`control-plane/api/tools/organizer-scenarios.ts`).
+
+```bash
+scripts/e2e-full-cycle.py --scenario star --auto --teardown
+```
+
+It runs in two halves. **The interview** is Hebrew, typed, with the trip type
+said in words ("a couples trip, not a family") instead of tapped. **After the
+build** the organizer tells the companion about a hotel booking and then a
+change of stops, and everything is asserted on the site a traveller reads, never
+on the chat.
+
+Two kinds of expectation, and the difference is the point:
+
+| Kind | Expectations | Today |
+|---|---|---|
+| **Hard** (interview shape) | trip type is the `couple` option and the typed answer was understood without the button; exactly one stop, dated with the whole trip; the gateway city is not a stop; a dated flight in and out with the gateway named on them; every trip day covered; a hotel booking the companion was told about is recorded with both dates; after the change of stops, no trip day has disappeared | The shape rows are the defects the Sprint 6 interview fixes (PR #360) address: red without them, expected green with them. No live `star` run has been recorded yet; the first one is what proves it |
+| **Deferred**, with a written reason | two rooms visible; the booking reaching the base stop's accommodation; check-in and check-out plan items; the stay splitting into two stops with the right dates | Reported as `known gap, deferred (<name>): …` with its reason; each goes green by itself, and says so (`deferred check now PASSES`), when the capability lands |
+
+The rental car is reported and never failed on. A deferral is never a deletion:
+it keeps running, and each one carries a reason (`tests/scripts/test_e2e_star.py`
+fails a `star` deferral that has none). The stop-editing ones still carry the reason
+"stop editing after the interview not built (owner decision pending; deferred past
+Sprint 6 on 2026-09-22)" — **that text is now out of date**: stop editing is built
+(PR #362: `set_stop_from_booking` creates the check-in and check-out items and sets the
+stop's hotel and dates; `split_stop` splits the stay). So on a live run those rows are
+expected to pass and be reported as `deferred check now PASSES`; taking them off the
+deferred list (and rewording the reason in
+`control-plane/api/test/fixtures/make_documents.py`) is a separate step after the first
+green live run. "Two rooms visible" is a different case: a stop's accommodation can now carry a `rooms`
+value (`update_stop`), but `set_stop_from_booking` does not copy a room count from a
+booking, and where "two rooms" is meant to live is still a product decision nobody has
+recorded.
+
+`star` is deliberately outside `--scenario all` and the nightly: a scenario not yet
+proven green on a live run has to be asked for by name. Bring it into `all` when the
+hard rows pass live.
 
 ## B. A person's run
 

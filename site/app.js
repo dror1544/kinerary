@@ -101,7 +101,7 @@ function applyLang(lang) {
   // re-render dynamically-built album share links in current language
   for (const [phase, url] of Object.entries(ALBUM_SHARE_URLS || {})) {
     if (!url) continue;
-    const link = `<a class="album-share-btn" href="${url}" target="_blank">${tr.album_open}</a>`;
+    const link = albumShareLinkHtml(url, tr.album_open);
     document.querySelectorAll(`[data-album-phase="${phase}"]`).forEach(el => { el.innerHTML = link; });
   }
 }
@@ -143,12 +143,18 @@ function renderTaskDeadlines(lang) {
   });
 }
 
+// The social/gallery reads need a login (issues #191/#194): every one of them
+// goes through here so the bearer token travels with it.
+function authGet(url) {
+  return fetch(url, { headers: { Authorization: `Bearer ${localStorage.getItem('trip-token')}` } });
+}
+
 // ── TASK DONE ─────────────────────────────────────────────────────────────────
 let taskDoneCache = {};
 
 async function loadTaskDone() {
   try {
-    const res = await fetch('/api/tasks/done');
+    const res = await authGet('/api/tasks/done');
     const rows = await res.json();
     taskDoneCache = {};
     rows.forEach(r => { taskDoneCache[r.task_id] = r; });
@@ -170,13 +176,17 @@ function renderTaskDoneState() {
         deadlineEl.className = 'badge bg';
         deadlineEl.textContent = '✅ בוצע';
       }
+      // Third boundary review 2026-10-11, finding B: the participant name
+      // went into title="" raw, so a name holding a " grew this button an
+      // onmouseover. The task id rides a data- attribute to runDataAction(),
+      // never an inline JS string (config text, see runDataAction).
       const who = done.user ? done.user.name : done.done_by;
-      cell.innerHTML = `<button class="task-done-btn done" onclick="toggleTaskDone('${tid}')" title="בוצע על ידי ${who}">↩ בטל</button>`;
+      cell.innerHTML = `<button class="task-done-btn done" data-act="task-done" data-arg="${escapeHtml(tid)}" title="בוצע על ידי ${escapeHtml(who)}">↩ בטל</button>`;
     } else {
       row.classList.remove('task-done');
       renderTaskDeadlines(currentLang); // restore deadline badge
       cell.innerHTML = currentUser
-        ? `<button class="task-done-btn" onclick="toggleTaskDone('${tid}')">✓ בוצע</button>`
+        ? `<button class="task-done-btn" data-act="task-done" data-arg="${escapeHtml(tid)}">✓ בוצע</button>`
         : '';
     }
   });
@@ -185,7 +195,7 @@ function renderTaskDoneState() {
 async function toggleTaskDone(taskId) {
   if (!currentUser) return;
   try {
-    const res = await fetch(`/api/tasks/${taskId}/done`, {
+    const res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/done`, {
       method: 'POST',
       headers: { Authorization: 'Bearer ' + localStorage.getItem('trip-token') }
     });
@@ -1221,10 +1231,13 @@ function buildMapPopup(s, lang) {
   const hasConf = s.conf && s.conf !== '–';
   // Enriched stops can arrive without every field; skip a line rather than
   // print "undefined", and only claim "private stay" when there's no hotel at all.
-  const lines = [`<strong style="font-size:1.05em">${s.emoji || '📍'} ${name}</strong>`];
-  if (s.dates) lines.push(`📅 ${s.dates}`);
-  if (s.hotel) lines.push(`🏨 ${s.hotel}`);
-  if (hasConf) lines.push(`✅ ${confLabel}: <code>${s.conf}</code>`);
+  // A stop's name, dates, hotel and confirmation come from /api/config, where a
+  // stop write or a hand-authored config can put any text: escaped, always
+  // (boundary review 2026-10-11 — a popup is innerHTML like any other).
+  const lines = [`<strong style="font-size:1.05em">${esc(s.emoji || '📍')} ${esc(name)}</strong>`];
+  if (s.dates) lines.push(`📅 ${esc(s.dates)}`);
+  if (s.hotel) lines.push(`🏨 ${esc(s.hotel)}`);
+  if (hasConf) lines.push(`✅ ${confLabel}: <code>${esc(s.conf)}</code>`);
   else if (!s.hotel) lines.push(`🏠 ${privateStay}`);
   return `<div dir="${dir}" style="min-width:180px;font-family:'Heebo',sans-serif">${lines.join('<br>')}</div>`;
 }
@@ -1250,8 +1263,12 @@ function setHero(tabId) {
   const cta = document.getElementById('hero-cta');
   const countdown = document.querySelector('.hero-countdown');
 
-  if (img) img.style.backgroundImage = `url("${h.photo}")`;
-  if (headline) headline.innerHTML = `${h.title}<span class="dot">.</span>`;
+  // The hero title, call-to-action and photo come from trip.config.json (a
+  // phase's hero, meta.brand), which the provisioner writes from the interview
+  // and documents: text is escaped where it lands, and the photo has to be an
+  // http(s) or same-site path whose quotes/parens cannot close the url().
+  if (img) img.style.backgroundImage = heroPhotoCss(h.photo);
+  if (headline) headline.innerHTML = `${esc(h.title)}<span class="dot">.</span>`;
   const i18n = h._i18n; // bilingual source from config (preferred over T)
   // A per-phase hero built by provision-time enrichment carries only photo +
   // title — no label/sub/blurb/cta. `textContent = undefined` prints the literal
@@ -1265,7 +1282,7 @@ function setHero(tabId) {
     const ctaText = (i18n?.cta?.[currentLang]) || tr[`hero_${k}_cta`] || h.cta || '';
     if (ctaText) {
       const arrow = currentLang === 'he' ? '←' : '→';
-      cta.innerHTML = `${ctaText} <span class="arrow">${arrow}</span>`;
+      cta.innerHTML = `${esc(ctaText)} <span class="arrow">${arrow}</span>`;
       cta.hidden = false;
     } else {
       cta.hidden = true;
@@ -1274,6 +1291,17 @@ function setHero(tabId) {
   if (countdown) countdown.style.display = h.countdown ? '' : 'none';
   const heroRight = document.querySelector('.hero-right');
   if (heroRight) heroRight.classList.toggle('meta-centered', tabId === 'photos');
+}
+
+// A CSS url() for the hero background, or 'none'. Percent-encoding the
+// characters that could end the quoted url() (or start a second one) keeps a
+// stored value to exactly one image; anything that is not http(s) or a
+// same-site path is no image at all.
+function heroPhotoCss(photo) {
+  const s = String(photo ?? '').trim();
+  const url = safeUrl(s) || (s.startsWith('/') && !s.startsWith('//') ? s : '');  // same-site path, never protocol-relative
+  if (!url) return 'none';
+  return `url("${url.replace(/["'()\\\s]/g, c => '%' + c.charCodeAt(0).toString(16).padStart(2, '0').toUpperCase())}")`;
 }
 
 function switchTab(tabId) {
@@ -1335,7 +1363,7 @@ function initMap() {
 
   MAP_STOPS.forEach((s, i) => {
     const icon = L.divIcon({
-      html: `<div style="background:${s.color};color:#fff;border-radius:50%;width:38px;height:38px;display:flex;align-items:center;justify-content:center;font-size:1.2em;box-shadow:0 4px 12px rgba(0,0,0,.35);border:2px solid #fff">${s.emoji}</div>`,
+      html: `<div style="background:${s.color};color:#fff;border-radius:50%;width:38px;height:38px;display:flex;align-items:center;justify-content:center;font-size:1.2em;box-shadow:0 4px 12px rgba(0,0,0,.35);border:2px solid #fff">${esc(s.emoji)}</div>`,
       iconSize: [38, 38], iconAnchor: [19, 19], className: ''
     });
     const marker = L.marker([s.lat, s.lng], { icon }).addTo(map);
@@ -1383,9 +1411,9 @@ async function loadWx(id) {
       <div class="wx-day">
         <span class="wi">${wxIcon(days.weathercode[i])}</span>
         <span class="wt">${Math.round(days.temperature_2m_max[i])}° / ${Math.round(days.temperature_2m_min[i])}°</span>
-        <span class="wd">${dayName(t)}<br>${t.slice(5)}</span>
+        <span class="wd">${dayName(t)}<br>${esc(String(t).slice(5))}</span>
       </div>`).join('');
-    el.innerHTML = `<strong>${loc.name} — ${trWx.wx_forecast.replace('🌤 ', '')} 7 days</strong><div class="wx-days">${daysHtml}</div>`;
+    el.innerHTML = `<strong>${esc(loc.name)} — ${trWx.wx_forecast.replace('🌤 ', '')} 7 days</strong><div class="wx-days">${daysHtml}</div>`;
     el.dataset.loaded = '1';
   } catch (e) {
     el.innerHTML = `<span style="color:var(--urgent)">${trWx.wx_error}</span>`;
@@ -1403,22 +1431,28 @@ const WX_CACHE = {};
 // static per-phase sections removed from index.html. venues[] in trip.config.json
 // is the config-driven equivalent for a real trip's points of interest.
 
+// Dormant (nothing defines POI_DATA any more), but escaped like every other
+// renderer: a link that is not http(s) gets no button at all.
 function _buildPoiBody(poi) {
+  const link = (url, label) => {
+    const safe = safeUrl(url);
+    return safe ? `<a class="btn poi-btn" href="${esc(safe)}" target="_blank" rel="noopener">${label}</a>` : '';
+  };
   const venueRow = (v) => `
-    <div class="poi-venue-name">${v.name}</div>
+    <div class="poi-venue-name">${esc(v.name)}</div>
     <div class="poi-links">
-      <a class="btn poi-btn" href="${v.maps}" target="_blank">🗺️ Maps</a>
-      <a class="btn poi-btn" href="${v.waze}" target="_blank">🔵 Waze</a>
-      ${v.tickets ? `<a class="btn poi-btn" href="${v.tickets}" target="_blank">🎫 אתר / כרטיסים</a>` : ''}
+      ${link(v.maps, '🗺️ Maps')}
+      ${link(v.waze, '🔵 Waze')}
+      ${link(v.tickets, '🎫 אתר / כרטיסים')}
     </div>`;
   let html = '';
   if (poi.venues) {
     html = poi.venues.map((v, i) => (i > 0 ? '<hr class="poi-sep">' : '') + venueRow(v)).join('');
   } else {
     html = `<div class="poi-links">
-      <a class="btn poi-btn" href="${poi.maps}" target="_blank">🗺️ Maps</a>
-      <a class="btn poi-btn" href="${poi.waze}" target="_blank">🔵 Waze</a>
-      ${poi.tickets ? `<a class="btn poi-btn" href="${poi.tickets.url}" target="_blank">🎫 ${poi.tickets.label}</a>` : ''}
+      ${link(poi.maps, '🗺️ Maps')}
+      ${link(poi.waze, '🔵 Waze')}
+      ${poi.tickets ? link(poi.tickets.url, `🎫 ${esc(poi.tickets.label)}`) : ''}
     </div>`;
   }
   if (poi.wx) html += '<div class="poi-wx-wrap"></div>';
@@ -1437,7 +1471,7 @@ async function _loadPoiWeather(wxWrap, wxKey) {
       WX_CACHE[wxKey] = await (await fetch(url)).json();
     }
     const d = WX_CACHE[wxKey].daily;
-    wxWrap.innerHTML = `<div class="loc-wx-label">${trPoi.wx_forecast}</div><div class="loc-wx-days">${d.time.slice(0,7).map((t,i) => `<div class="loc-wx-day"><span class="wi">${wxIcon(d.weathercode[i])}</span><div class="wt">${Math.round(d.temperature_2m_max[i])}°/${Math.round(d.temperature_2m_min[i])}°</div><div class="wd">${i === 0 ? (currentLang === 'he' ? 'היום' : 'Today') : dayName(t)}</div></div>`).join('')}</div>`;
+    wxWrap.innerHTML = `<div class="loc-wx-label">${trPoi.wx_forecast}</div><div class="loc-wx-days">${d.time.slice(0,7).map((t,i) => `<div class="loc-wx-day"><span class="wi">${wxIcon(d.weathercode[i])}</span><div class="wt">${Math.round(d.temperature_2m_max[i])}°/${Math.round(d.temperature_2m_min[i])}°</div><div class="wd">${i === 0 ? (currentLang === 'he' ? 'היום' : 'Today') : esc(dayName(t))}</div></div>`).join('')}</div>`;
   } catch(e) {
     wxWrap.innerHTML = `<span style="color:var(--urgent);font-size:12px">${trPoi.wx_error}</span>`;
   }
@@ -1493,7 +1527,7 @@ async function toggleLocPanel(btn) {
       <div class="loc-wx-day">
         <span class="wi">${wxIcon(days.weathercode[i])}</span>
         <div class="wt">${Math.round(days.temperature_2m_max[i])}° / ${Math.round(days.temperature_2m_min[i])}°</div>
-        <div class="wd">${labels[i]}<br><span style="font-family:var(--font-mono)">${t.slice(5)}</span></div>
+        <div class="wd">${labels[i]}<br><span style="font-family:var(--font-mono)">${esc(String(t).slice(5))}</span></div>
         ${days.precipitation_sum[i] > 0.1 ? `<div class="rain">🌧️ ${days.precipitation_sum[i].toFixed(1)} mm</div>` : ''}
       </div>`).join('');
     wxWrap.innerHTML = `<div class="loc-wx-label">${trLoc.wx_forecast}</div><div class="loc-wx-days">${html}</div>`;
@@ -1515,7 +1549,7 @@ let allRatings = {};
 
 async function loadRatings() {
   try {
-    const res = await fetch('/api/ratings');
+    const res = await authGet('/api/ratings');
     if (res.ok) allRatings = await res.json();
   } catch {}
   ['ratings-ny', 'ratings-dallas', 'ratings-colorado', 'ratings-wc'].forEach((id, i) => {
@@ -1532,45 +1566,60 @@ async function loadRatings() {
 function buildRatingChips(venueId) {
   const ratings = allRatings[venueId] || {};
   return Object.entries(ratings).map(([u, r]) => {
-    const color = window.USERS_CACHE?.[u]?.color || '#888';
+    const color = safeParticipantColor(window.USERS_CACHE?.[u]?.color || '#888');
     const name = uname(u);
     const isMe = currentUser?.username === u;
     const meLabel = (T[currentLang]||T['he']).rating_me;
-    return `<span class="rating-chip${isMe ? ' rating-chip-me' : ''}" style="background:${color}" title="${name}: ${r}★">${isMe ? meLabel : name[0]} <span class="stars-val">${r}★</span></span>`;
+    return `<span class="rating-chip${isMe ? ' rating-chip-me' : ''}" style="background:${color}" title="${escapeHtml(name)}: ${escapeHtml(r)}★">${isMe ? meLabel : escapeHtml(name[0])} <span class="stars-val">${escapeHtml(r)}★</span></span>`;
   }).join('');
 }
 
 function renderRatings(containerId, venues) {
   const c = document.getElementById(containerId);
   if (!c) return;
+  // A stop with no venues (or a legacy fixed-name element with no VENUES
+  // entry) has nothing to render. Throwing here used to abort loadRatings()
+  // before its config-driven loop, so every later stop lost its ratings.
+  if (!Array.isArray(venues)) return;
+  venues = venues.filter(v => v && typeof v === 'object');
+  // A venue's id, name and links are config text the provisioner writes from
+  // the interview or a document: every attribute is escaped, a link must be
+  // http(s), and the id reaches saveRating/toggleVenueComments through a
+  // data- attribute (runDataAction), never inside an inline JS string.
   c.innerHTML = venues.map(v => {
     const myRating = currentUser ? (allRatings[v.id]?.[currentUser.username] || 0) : 0;
-    const stars = [5, 4, 3, 2, 1].map(n => `<input type="radio" id="${v.id}-s${n}" name="${v.id}" value="${n}" ${myRating == n ? 'checked' : ''}><label for="${v.id}-s${n}">★</label>`).join('');
+    const id = escapeHtml(v.id);
+    const stars = [5, 4, 3, 2, 1].map(n => `<input type="radio" id="${id}-s${n}" name="${id}" value="${n}" ${myRating == n ? 'checked' : ''}><label for="${id}-s${n}">★</label>`).join('');
     const chips = buildRatingChips(v.id);
     const tr = T[currentLang] || T['he'];
     const vname = typeof v.name === 'object' ? (v.name[currentLang] || v.name.he || v.name.en) : v.name;
+    const mapsUrl = safeUrl(v.maps);
+    const wazeUrl = safeUrl(v.waze);
+    const siteUrl = safeUrl(v.url);
     const navLinks = [
-      v.maps ? `<a class="btn poi-btn" href="${esc(v.maps)}" target="_blank" rel="noopener">🗺️ ${esc(tr.venue_maps || 'Maps')}</a>` : '',
-      v.waze ? `<a class="btn poi-btn" href="${esc(v.waze)}" target="_blank" rel="noopener">🔵 Waze</a>` : '',
-      /^https?:\/\//i.test(v.url || '') ? `<a class="btn poi-btn" href="${esc(v.url)}" target="_blank" rel="noopener">🎫 ${esc(tr.venue_site || 'Site / tickets')}</a>` : '',
+      mapsUrl ? `<a class="btn poi-btn" href="${escapeHtml(mapsUrl)}" target="_blank" rel="noopener">🗺️ ${escapeHtml(tr.venue_maps || 'Maps')}</a>` : '',
+      wazeUrl ? `<a class="btn poi-btn" href="${escapeHtml(wazeUrl)}" target="_blank" rel="noopener">🔵 Waze</a>` : '',
+      siteUrl ? `<a class="btn poi-btn" href="${escapeHtml(siteUrl)}" target="_blank" rel="noopener">🎫 ${escapeHtml(tr.venue_site || 'Site / tickets')}</a>` : '',
     ].filter(Boolean).join('');
-    return `<div class="rating-card" id="rc-${v.id}">
-      <h4>${esc(vname)}</h4>
+    return `<div class="rating-card" id="rc-${id}">
+      <h4>${escapeHtml(vname)}</h4>
       ${navLinks ? `<div class="poi-links">${navLinks}</div>` : ''}
       <div class="stars">${stars}</div>
-      <textarea class="rating-note" id="note-${v.id}" placeholder="${esc(tr.rating_note_ph)}"></textarea>
+      <textarea class="rating-note" id="note-${id}" placeholder="${escapeHtml(tr.rating_note_ph)}"></textarea>
       <br>
-      <button class="save-btn" onclick="saveRating('${v.id}')">${esc(tr.rating_save)}</button>
-      <span class="saved-msg" id="saved-${v.id}">${esc(tr.rating_saved)}</span>
-      <div class="rating-others" id="ro-${v.id}">${chips}</div>
-      <button class="vc-toggle" id="vc-toggle-${v.id}" onclick="toggleVenueComments('${v.id}')">💬 ${(T[currentLang]||T['he']).ph_comments}</button>
-      <div class="vc-thread" id="vc-thread-${v.id}"></div>
+      <button class="save-btn" data-act="rating-save" data-arg="${id}">${escapeHtml(tr.rating_save)}</button>
+      <span class="saved-msg" id="saved-${id}">${escapeHtml(tr.rating_saved)}</span>
+      <div class="rating-others" id="ro-${id}">${chips}</div>
+      <button class="vc-toggle" id="vc-toggle-${id}" data-act="venue-comments" data-arg="${id}">💬 ${(T[currentLang]||T['he']).ph_comments}</button>
+      <div class="vc-thread" id="vc-thread-${id}"></div>
     </div>`;
   }).join('');
 }
 
 async function saveRating(id) {
-  const stars = document.querySelector(`input[name="${id}"]:checked`)?.value;
+  // Looked up through the card's element id, not a selector built from the
+  // venue id: a quote in a config-written id is not a selector to inject into.
+  const stars = document.getElementById(`rc-${id}`)?.querySelector('input[type="radio"]:checked')?.value;
   if (!stars || !currentUser) return;
   const token = localStorage.getItem('trip-token');
   try {
@@ -1594,8 +1643,30 @@ window.saveRating = saveRating;
    ========================================================= */
 const venueCommentsCache = {};
 
+// #213: quotes used to pass through unescaped, on the theory that every
+// caller only ever fed this into element TEXT. That stopped being true once
+// participant name/name_en started reaching attribute contexts too (RSVP
+// chip title, reaction tooltip) — an unescaped `"` there closes the
+// attribute early and lets the rest of the string become a live handler
+// (`onmouseover=`, etc). Escaping quotes in a text-only context is harmless
+// (they render as literal " / ' characters); every existing call site here
+// only ever fed element text, never markup, so none of them double-escape.
 function escapeHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return String(s ?? '')
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+// #213: color is organizer/agent-supplied (POST /api/agent/participants, or
+// a hand-edited trip.config.json) and reaches an unescaped inline
+// `style="background:${color}"` on every participant-carrying surface. The
+// API now refuses a non-hex color, but this is the render-side half of the
+// same fix — a config written before that check existed, or edited by hand,
+// must not be able to break out of the attribute either. Anything that
+// isn't `#`-prefixed hex falls back to the same neutral gray every avatar
+// already uses when color is simply missing.
+function safeParticipantColor(c) {
+  return typeof c === 'string' && /^#[0-9a-fA-F]{3,8}$/.test(c) ? c : '#888';
 }
 
 
@@ -1606,7 +1677,7 @@ async function toggleVenueComments(venueId) {
 
   if (!venueCommentsCache[venueId]) {
     try {
-      const res = await fetch(`/api/comments/venue/${venueId}`);
+      const res = await authGet(`/api/comments/venue/${encodeURIComponent(venueId)}`);
       venueCommentsCache[venueId] = res.ok ? await res.json() : [];
     } catch { venueCommentsCache[venueId] = []; }
   }
@@ -1630,11 +1701,11 @@ function renderVenueCommentThread(venueId) {
   if (btn) btn.textContent = `💬 ${comments.length} ${(T[currentLang]||T['he']).ph_comments} ▲`;
 
   const list = comments.map(c => {
-    const color = c.user?.color || '#888';
+    const color = safeParticipantColor(c.user?.color || '#888');
     const name  = uname(c.username, c.user);
     const time  = new Date(c.created_at).toLocaleDateString('he-IL');
     return `<div class="vc-comment">
-      <div class="vc-avatar" style="background:${color}">${name[0]}</div>
+      <div class="vc-avatar" style="background:${color}">${escapeHtml(name[0])}</div>
       <div>
         <span class="vc-name">${escapeHtml(name)}</span><span class="vc-meta">${time}</span>
         <div class="vc-body">${escapeHtml(c.body)}</div>
@@ -1643,11 +1714,12 @@ function renderVenueCommentThread(venueId) {
   }).join('');
 
   const trC = T[currentLang] || T['he'];
+  const vid = escapeHtml(venueId);
   const inputHtml = currentUser ? `
     <div class="vc-input-row">
-      <input class="vc-input" id="vc-input-${venueId}" type="text" placeholder="${trC.ph_comment_ph}"
-        onkeydown="if(event.key==='Enter')submitVenueComment('${venueId}')">
-      <button class="vc-send" onclick="submitVenueComment('${venueId}')">${trC.ph_send}</button>
+      <input class="vc-input" id="vc-input-${vid}" type="text" placeholder="${trC.ph_comment_ph}"
+        data-act-enter="venue-comment" data-arg="${vid}">
+      <button class="vc-send" data-act="venue-comment" data-arg="${vid}">${trC.ph_send}</button>
     </div>` : '';
 
   thread.innerHTML = list + inputHtml;
@@ -1660,7 +1732,7 @@ async function submitVenueComment(venueId) {
   if (!body) return;
   const token = localStorage.getItem('trip-token');
   try {
-    const res = await fetch(`/api/comments/venue/${venueId}`, {
+    const res = await fetch(`/api/comments/venue/${encodeURIComponent(venueId)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify({ body })
@@ -1693,7 +1765,7 @@ async function loadRsvps(containerId, activities) {
   // Fetch all activities for this section in parallel
   await Promise.all(activities.map(async a => {
     try {
-      const res = await fetch(`/api/rsvps/${a.id}`);
+      const res = await authGet(`/api/rsvps/${encodeURIComponent(a.id)}`);
       rsvpCache[a.id] = res.ok ? await res.json() : [];
     } catch { rsvpCache[a.id] = []; }
   }));
@@ -1711,20 +1783,23 @@ function renderRsvpCard(activity) {
   const statusLabel = { yes: tr.rsvp_status_yes, no: tr.rsvp_status_no, maybe: tr.rsvp_status_maybe };
   const chips = rsvps.map(r => {
     const emoji = r.status === 'yes' ? '✅' : r.status === 'no' ? '❌' : '🤔';
-    const color = r.user?.color || '#888';
+    const color = safeParticipantColor(r.user?.color || '#888');
     const name  = uname(r.username, r.user);
-    return `<span class="rsvp-chip" style="background:${color}" title="${name}: ${statusLabel[r.status] || r.status}">${emoji} ${name}</span>`;
+    return `<span class="rsvp-chip" style="background:${color}" title="${escapeHtml(name)}: ${escapeHtml(statusLabel[r.status] || r.status)}">${emoji} ${escapeHtml(name)}</span>`;
   }).join('');
 
   const btnClass = (s) => `rsvp-btn${myRsvp?.status === s ? ` active-${s}` : ''}`;
+  // An activity's id, title, date and price are config text (rsvp_activities):
+  // escaped, and the id reaches setRsvp() as data (runDataAction).
+  const aid = escapeHtml(activity.id);
 
-  return `<div class="rsvp-card" id="rsvp-card-${activity.id}">
-    <div class="rsvp-title">${title}</div>
-    <div class="rsvp-meta">📅 ${activity.date} · ${price}</div>
+  return `<div class="rsvp-card" id="rsvp-card-${aid}">
+    <div class="rsvp-title">${escapeHtml(title)}</div>
+    <div class="rsvp-meta">📅 ${escapeHtml(activity.date)} · ${escapeHtml(price)}</div>
     ${currentUser ? `<div class="rsvp-btns">
-      <button class="${btnClass('yes')}"   onclick="setRsvp('${activity.id}','yes'  )">${tr.rsvp_yes}</button>
-      <button class="${btnClass('no')}"    onclick="setRsvp('${activity.id}','no'   )">${tr.rsvp_no}</button>
-      <button class="${btnClass('maybe')}" onclick="setRsvp('${activity.id}','maybe')">${tr.rsvp_maybe}</button>
+      <button class="${btnClass('yes')}"   data-act="rsvp" data-arg="${aid}" data-arg2="yes">${tr.rsvp_yes}</button>
+      <button class="${btnClass('no')}"    data-act="rsvp" data-arg="${aid}" data-arg2="no">${tr.rsvp_no}</button>
+      <button class="${btnClass('maybe')}" data-act="rsvp" data-arg="${aid}" data-arg2="maybe">${tr.rsvp_maybe}</button>
     </div>` : ''}
     ${chips ? `<div class="rsvp-responses">${chips}</div>` : ''}
   </div>`;
@@ -1734,7 +1809,7 @@ async function setRsvp(activityId, status) {
   if (!currentUser) return;
   const token = localStorage.getItem('trip-token');
   try {
-    const res = await fetch(`/api/rsvps/${activityId}`, {
+    const res = await fetch(`/api/rsvps/${encodeURIComponent(activityId)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify({ status })
@@ -1747,14 +1822,22 @@ async function setRsvp(activityId, status) {
     if (existing >= 0) rsvpCache[activityId][existing] = entry;
     else rsvpCache[activityId].push(entry);
 
-    // Find which section this activity belongs to and re-render the card only
-    const allActivities = [...RSVP_ACTIVITIES.co, ...RSVP_ACTIVITIES.wc];
-    const activity = allActivities.find(a => a.id === activityId);
+    // Find the activity on whichever stop carries it and re-render that card
+    // only. This used to spread RSVP_ACTIVITIES.co / .wc — two legacy stop
+    // names a config-built trip does not have — and the TypeError was
+    // swallowed below, so the card never showed the answer. The id arrives
+    // from a data- attribute, a string, while the config may hold a number.
+    const activity = Object.values(RSVP_ACTIVITIES)
+      .flatMap(list => (Array.isArray(list) ? list : []))
+      .find(a => a && String(a.id) === String(activityId));
     if (activity) {
       const card = document.getElementById(`rsvp-card-${activityId}`);
       if (card) card.outerHTML = renderRsvpCard(activity);
     }
-  } catch {}
+  } catch (e) {
+    // Not silent: a swallowed error here is how the card stopped refreshing.
+    console.warn('RSVP update failed:', e);
+  }
 }
 window.setRsvp = setRsvp;
 
@@ -1790,15 +1873,18 @@ function renderPacking(containerId, items) {
     const item = itemObj[lang] || itemObj.he;
     (cats[cat] = cats[cat] || []).push({ key: itemObj.he, label: item });
   });
+  // Category and item are config text (packing_general, phases[].packing);
+  // the storage key built from the item reaches the change handler as data
+  // (runDataAction), never inside an inline JS string.
   c.innerHTML = Object.entries(cats).map(([cat, itms]) => `
     <div class="pack-cat">
-      <h4>${cat}</h4>
+      <h4>${escapeHtml(cat)}</h4>
       ${itms.map(({ key, label }) => {
         const storeKey = `pack-${containerId}-${key}`;
         const checked = localStorage.getItem(storeKey) === '1';
         return `<div class="pack-item">
-          <input type="checkbox" id="${storeKey}" ${checked ? 'checked' : ''} onchange="localStorage.setItem('${storeKey}',this.checked?'1':'0')">
-          <label for="${storeKey}">${label}</label>
+          <input type="checkbox" id="${escapeHtml(storeKey)}" ${checked ? 'checked' : ''} data-act-change="pack" data-arg="${escapeHtml(storeKey)}">
+          <label for="${escapeHtml(storeKey)}">${escapeHtml(label)}</label>
         </div>`;
       }).join('')}
     </div>`).join('');
@@ -1844,7 +1930,7 @@ async function uploadPhotos(phase, input) {
     <div class="upload-progress-title">${uploadTitle}</div>
     ${files.map((f, i) => `<div class="upload-row" id="${progressId}-${i}">
       <span class="upload-spinner">⏳</span>
-      <span class="upload-fname">${f.name}</span>
+      <span class="upload-fname">${escapeHtml(f.name)}</span>
       <div class="upload-bar-wrap"><div class="upload-bar" id="${progressId}-bar-${i}"></div></div>
     </div>`).join('')}
   </div>`;
@@ -1929,15 +2015,22 @@ const REACTION_EMOJIS = ['❤️','😂','🔥','😍','👏'];
 
 const ALBUM_SHARE_URLS = {};
 
+// The share link GET /api/album-share/:phase hands back: an http(s) url
+// escaped into its href, or no link at all (applyLang re-renders the same).
+function albumShareLinkHtml(url, label) {
+  const safe = safeUrl(url);
+  return safe ? `<a class="album-share-btn" href="${escapeHtml(safe)}" target="_blank" rel="noopener">${label}</a>` : '';
+}
+
 async function loadAlbumShareLinks() {
   for (const phase of ['ny', 'dallas', 'colorado', 'wc']) {
     try {
-      const res = await fetch(`/api/album-share/${phase}`);
+      const res = await authGet(`/api/album-share/${phase}`);
       if (!res.ok) continue;
       const { url } = await res.json();
       ALBUM_SHARE_URLS[phase] = url;
       const label = (T[currentLang] || T['he']).album_open;
-      const link = `<a class="album-share-btn" href="${url}" target="_blank">${label}</a>`;
+      const link = albumShareLinkHtml(url, label);
       document.querySelectorAll(`[data-album-phase="${phase}"]`).forEach(el => { el.innerHTML = link; });
     } catch {
       document.querySelectorAll(`[data-album-phase="${phase}"]`).forEach(el => { el.innerHTML = ''; });
@@ -1945,14 +2038,28 @@ async function loadAlbumShareLinks() {
   }
 }
 
+// Photos the gallery has drawn, by id. Buttons pass only the (server-built,
+// numeric) id; the filename and share link are looked up here rather than being
+// written into an inline onclick string.
+const photoIndex = {};
+
 function sharePhotoFacebook(photoId) {
-  window.open(`https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(`${location.origin}/photo/${photoId}`)}`, '_blank');
+  const shareUrl = photoIndex[photoId]?.shareUrl;   // /photo/<id>?s=<capability>
+  if (!shareUrl) return;
+  window.open(`https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(`${location.origin}${shareUrl}`)}`, '_blank');
 }
 
-async function sharePhotoInstagram(filename) {
-  const photoUrl = `/api/photos/file/${filename}`;
+async function sharePhotoInstagram(photoId) {
+  const filename = photoIndex[photoId]?.filename;
+  if (!filename) return;
+  // The file route needs a login (issues #191/#194); an <img> carries a signed
+  // link, but this fetch carries the bearer token instead.
+  const photoUrl = `/api/photos/file/${encodeURIComponent(filename)}`;
+  let blob = null;
   try {
-    const blob = await fetch(photoUrl).then(r => r.blob());
+    const res = await authGet(photoUrl);
+    if (!res.ok) return;
+    blob = await res.blob();
     const ext = filename.split('.').pop() || 'jpg';
     const file = new File([blob], `photo.${ext}`, { type: blob.type });
     if (navigator.canShare?.({ files: [file] })) {
@@ -1960,9 +2067,11 @@ async function sharePhotoInstagram(filename) {
       return;
     }
   } catch (e) { if (e.name === 'AbortError') return; }
+  if (!blob) return;
   // Desktop fallback: download the image
   const a = document.createElement('a');
-  a.href = photoUrl; a.download = filename; a.click();
+  a.href = URL.createObjectURL(blob); a.download = filename; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
 }
 
 function askDeletePhoto(id) {
@@ -1971,15 +2080,15 @@ function askDeletePhoto(id) {
   if (!wrap) return;
   wrap.innerHTML = `
     <span class="pg-delete-confirm-txt">${tr.ph_delete_confirm}</span>
-    <button class="pg-delete-confirm-yes" onclick="confirmDeletePhoto('${id}')" title="${tr.ph_delete_yes}">✓</button>
-    <button class="pg-delete-confirm-no"  onclick="cancelDeletePhoto('${id}')"  title="${tr.ph_delete_no}">✕</button>`;
+    <button class="pg-delete-confirm-yes" data-act="photo-del-yes" data-arg="${escapeHtml(id)}" title="${tr.ph_delete_yes}">✓</button>
+    <button class="pg-delete-confirm-no"  data-act="photo-del-no" data-arg="${escapeHtml(id)}"  title="${tr.ph_delete_no}">✕</button>`;
 }
 
 function cancelDeletePhoto(id) {
   const tr = T[currentLang] || T['he'];
   const wrap = document.getElementById(`pgdel-${id}`);
   if (!wrap) return;
-  wrap.innerHTML = `<button class="pg-delete-btn" onclick="askDeletePhoto('${id}')" title="${tr.ph_delete}">🗑️</button>`;
+  wrap.innerHTML = `<button class="pg-delete-btn" data-act="photo-del-ask" data-arg="${escapeHtml(id)}" title="${tr.ph_delete}">🗑️</button>`;
 }
 
 async function confirmDeletePhoto(id) {
@@ -2002,43 +2111,49 @@ window.cancelDeletePhoto  = cancelDeletePhoto;
 window.confirmDeletePhoto = confirmDeletePhoto;
 
 function buildPhotoCard(p, reactions) {
+  photoIndex[p.id] = p;
   const tr     = T[currentLang] || T['he'];
-  const color  = p.user?.color  || '#888';
+  const color  = safeParticipantColor(p.user?.color  || '#888');
   const name   = uname(p.username, p.user);
   const date   = new Date(p.uploadedAt).toLocaleDateString('he-IL');
 
   const myReactions = new Set(
     REACTION_EMOJIS.filter(e => reactions?.[e]?.includes(currentUser?.username))
   );
+  // The id, url and filename come from GET /api/photos: escaped into every
+  // attribute, and the id reaches each button's handler as data
+  // (runDataAction), never inside an inline JS string.
+  const pid = escapeHtml(p.id);
 
   const reactionBar = REACTION_EMOJIS.map(e => {
     const users = reactions?.[e] || [];
     const count = users.length;
     const active = myReactions.has(e) ? 'active' : '';
-    const tooltip = users.map(u => uname(u)).join(', ');
-    return `<button class="pg-react-btn ${active}" title="${tooltip}" onclick="togglePhotoReaction('${p.id}','${e}')">${e}${count > 0 ? `<span>${count}</span>` : ''}</button>`;
+    const tooltip = users.map(u => escapeHtml(uname(u))).join(', ');
+    return `<button class="pg-react-btn ${active}" title="${tooltip}" data-act="photo-react" data-arg="${pid}" data-arg2="${e}">${e}${count > 0 ? `<span>${count}</span>` : ''}</button>`;
   }).join('');
 
   const commentCount = photoCommentsCache[p.id]?.length ?? 0;
 
   const isOwner = currentUser?.username === p.username;
+  const src = p.url || `/api/photos/file/${encodeURIComponent(p.filename ?? '')}`;
 
-  return `<div class="pg-card" id="pgcard-${p.id}">
-    <img src="/api/photos/file/${p.filename}" loading="lazy" alt="">
-    ${isOwner ? `<div class="pg-delete-wrap" id="pgdel-${p.id}">
-      <button class="pg-delete-btn" onclick="askDeletePhoto('${p.id}')" title="${tr.ph_delete}">🗑️</button>
+  return `<div class="pg-card" id="pgcard-${pid}">
+    <img src="${escapeHtml(src)}" loading="lazy" alt="">
+    ${isOwner ? `<div class="pg-delete-wrap" id="pgdel-${pid}">
+      <button class="pg-delete-btn" data-act="photo-del-ask" data-arg="${pid}" title="${tr.ph_delete}">🗑️</button>
     </div>` : ''}
     <div class="pg-meta">
-      <div class="pg-avatar" style="background:${color}">${name[0]}</div>
+      <div class="pg-avatar" style="background:${color}">${escapeHtml(name[0])}</div>
       <div class="pg-info"><div class="pg-name">${escapeHtml(name)}</div><div>${date}</div></div>
       <div class="pg-share-btns">
-        <button class="pg-share-btn pg-share-fb" onclick="sharePhotoFacebook('${p.id}')" title="${tr.ph_share_fb}"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/></svg></button>
-        <button class="pg-share-btn pg-share-ig" onclick="sharePhotoInstagram('${p.filename}')" title="${tr.ph_share_ig}"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.266-.057 1.645-.069 4.849-.069zm0-2.163c-3.259 0-3.667.014-4.947.072-4.358.2-6.78 2.618-6.98 6.98-.059 1.281-.073 1.689-.073 4.948 0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98 1.281.058 1.689.072 4.948.072 3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98-1.281-.059-1.69-.073-4.949-.073zm0 5.838c-3.403 0-6.162 2.759-6.162 6.162s2.759 6.163 6.162 6.163 6.162-2.759 6.162-6.163c0-3.403-2.759-6.162-6.162-6.162zm0 10.162c-2.209 0-4-1.79-4-4 0-2.209 1.791-4 4-4s4 1.791 4 4c0 2.21-1.791 4-4 4zm6.406-11.845c-.796 0-1.441.645-1.441 1.44s.645 1.44 1.441 1.44c.795 0 1.439-.645 1.439-1.44s-.644-1.44-1.439-1.44z"/></svg></button>
+        <button class="pg-share-btn pg-share-fb" data-act="photo-fb" data-arg="${pid}" title="${tr.ph_share_fb}"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/></svg></button>
+        <button class="pg-share-btn pg-share-ig" data-act="photo-ig" data-arg="${pid}" title="${tr.ph_share_ig}"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.266-.057 1.645-.069 4.849-.069zm0-2.163c-3.259 0-3.667.014-4.947.072-4.358.2-6.78 2.618-6.98 6.98-.059 1.281-.073 1.689-.073 4.948 0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98 1.281.058 1.689.072 4.948.072 3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98-1.281-.059-1.69-.073-4.949-.073zm0 5.838c-3.403 0-6.162 2.759-6.162 6.162s2.759 6.163 6.162 6.163 6.162-2.759 6.162-6.163c0-3.403-2.759-6.162-6.162-6.162zm0 10.162c-2.209 0-4-1.79-4-4 0-2.209 1.791-4 4-4s4 1.791 4 4c0 2.21-1.791 4-4 4zm6.406-11.845c-.796 0-1.441.645-1.441 1.44s.645 1.44 1.441 1.44c.795 0 1.439-.645 1.439-1.44s-.644-1.44-1.439-1.44z"/></svg></button>
       </div>
     </div>
-    <div class="pg-reaction-bar" id="pg-reactions-${p.id}">${reactionBar}</div>
-    <button class="vc-toggle pg-ct" id="pg-ct-${p.id}" onclick="togglePhotoComments('${p.id}')">💬 ${commentCount} ${tr.ph_comments}</button>
-    <div class="vc-thread" id="pg-thread-${p.id}"></div>
+    <div class="pg-reaction-bar" id="pg-reactions-${pid}">${reactionBar}</div>
+    <button class="vc-toggle pg-ct" id="pg-ct-${pid}" data-act="photo-comments" data-arg="${pid}">💬 ${commentCount} ${tr.ph_comments}</button>
+    <div class="vc-thread" id="pg-thread-${pid}"></div>
   </div>`;
 }
 
@@ -2063,9 +2178,9 @@ async function loadPhaseAlbum(phase) {
   gallery.innerHTML = `<p style="color:var(--ink-2);padding:16px 0">${tr.album_loading || '...'}</p>`;
   try {
     const [photosRes, reactionsRes, commentsRes] = await Promise.all([
-      fetch(`/api/photos?phase=${phase}`),
-      fetch('/api/reactions'),
-      fetch('/api/comments/photo'),
+      authGet(`/api/photos?phase=${phase}`),
+      authGet('/api/reactions'),
+      authGet('/api/comments/photo'),
     ]);
     const photos      = photosRes.ok   ? await photosRes.json()   : [];
     const reactions   = reactionsRes.ok ? await reactionsRes.json() : {};
@@ -2087,9 +2202,9 @@ async function loadPhotosGallery(phase) {
   if (!gallery) return;
   try {
     const [photosRes, reactionsRes, commentsRes] = await Promise.all([
-      fetch(phase ? `/api/photos?phase=${phase}` : '/api/photos'),
-      fetch('/api/reactions'),
-      fetch('/api/comments/photo'),
+      authGet(phase ? `/api/photos?phase=${phase}` : '/api/photos'),
+      authGet('/api/reactions'),
+      authGet('/api/comments/photo'),
     ]);
     const photos   = photosRes.ok   ? await photosRes.json()    : [];
     allPhotoReactions          = reactionsRes.ok ? await reactionsRes.json() : {};
@@ -2128,8 +2243,8 @@ async function togglePhotoReaction(photoId, emoji) {
         const users2 = allPhotoReactions[photoId]?.[e] || [];
         const count = users2.length;
         const active = myReactions.has(e) ? 'active' : '';
-        const tooltip = users2.map(u => window.USERS_CACHE?.[u]?.name || u).join(', ');
-        return `<button class="pg-react-btn ${active}" title="${tooltip}" onclick="togglePhotoReaction('${photoId}','${e}')">${e}${count > 0 ? `<span>${count}</span>` : ''}</button>`;
+        const tooltip = users2.map(u => escapeHtml(window.USERS_CACHE?.[u]?.name || u)).join(', ');
+        return `<button class="pg-react-btn ${active}" title="${tooltip}" data-act="photo-react" data-arg="${escapeHtml(photoId)}" data-arg2="${e}">${e}${count > 0 ? `<span>${count}</span>` : ''}</button>`;
       }).join('');
     }
   } catch {}
@@ -2142,7 +2257,7 @@ async function togglePhotoComments(photoId) {
 
   if (!photoCommentsCache[photoId]) {
     try {
-      const res = await fetch(`/api/comments/photo/${photoId}`);
+      const res = await authGet(`/api/comments/photo/${photoId}`);
       photoCommentsCache[photoId] = res.ok ? await res.json() : [];
     } catch { photoCommentsCache[photoId] = []; }
   }
@@ -2165,11 +2280,11 @@ function renderPhotoCommentThread(photoId) {
   if (btn) btn.textContent = `💬 ${comments.length} ${(T[currentLang]||T['he']).ph_comments} ▲`;
 
   const list = comments.map(c => {
-    const color = c.user?.color || '#888';
+    const color = safeParticipantColor(c.user?.color || '#888');
     const name  = uname(c.username, c.user);
     const time  = new Date(c.created_at).toLocaleDateString('he-IL');
     return `<div class="vc-comment">
-      <div class="vc-avatar" style="background:${color}">${name[0]}</div>
+      <div class="vc-avatar" style="background:${color}">${escapeHtml(name[0])}</div>
       <div>
         <span class="vc-name">${escapeHtml(name)}</span><span class="vc-meta">${time}</span>
         <div class="vc-body">${escapeHtml(c.body)}</div>
@@ -2178,11 +2293,12 @@ function renderPhotoCommentThread(photoId) {
   }).join('');
 
   const trPC = T[currentLang] || T['he'];
+  const pid = escapeHtml(photoId);
   const inputHtml = currentUser ? `
     <div class="vc-input-row">
-      <input class="vc-input" id="pg-input-${photoId}" type="text" placeholder="${trPC.ph_comment_ph}"
-        onkeydown="if(event.key==='Enter')submitPhotoComment('${photoId}')">
-      <button class="vc-send" onclick="submitPhotoComment('${photoId}')">${trPC.ph_send}</button>
+      <input class="vc-input" id="pg-input-${pid}" type="text" placeholder="${trPC.ph_comment_ph}"
+        data-act-enter="photo-comment" data-arg="${pid}">
+      <button class="vc-send" data-act="photo-comment" data-arg="${pid}">${trPC.ph_send}</button>
     </div>` : '';
 
   thread.innerHTML = list + inputHtml;
@@ -2218,6 +2334,52 @@ window.toggleTaskDone       = toggleTaskDone;
 
 window.triggerUpload = triggerUpload;
 window.uploadPhotos = uploadPhotos;
+
+// One delegated listener for every rendered control that carries an id.
+//
+// These used to be inline handlers built as onclick="fn('${id}')" — a JS
+// string inside an HTML attribute. Escaping for HTML is not escaping for JS:
+// &#39; is decoded back to ' before the handler runs, so a task, venue,
+// activity or photo-phase id from trip.config.json (or a booking/photo id from
+// the API) could close the string and run code (third boundary review,
+// 2026-10-11). A rendered element now says WHAT it does in data-act /
+// data-act-change / data-act-enter and carries its id, HTML-escaped, in
+// data-arg (data-arg2). The browser decodes the attribute, this function
+// passes the exact value on, and only the names in the switch can be called.
+// Numeric ids (bookings, budget rows, lost & found) are passed as numbers, as
+// the inline handlers did.
+function runDataAction(ev) {
+  const kind = ev.type === 'change' ? 'actChange' : ev.type === 'keydown' ? 'actEnter' : 'act';
+  if (kind === 'actEnter' && ev.key !== 'Enter') return;
+  const attr = { act: 'data-act', actChange: 'data-act-change', actEnter: 'data-act-enter' }[kind];
+  const el = ev.target?.closest?.(`[${attr}]`);
+  if (!el) return;
+  const { arg, arg2 } = el.dataset;
+  switch (el.dataset[kind]) {
+    case 'task-done':      return toggleTaskDone(arg);
+    case 'rating-save':    return saveRating(arg);
+    case 'venue-comments': return toggleVenueComments(arg);
+    case 'venue-comment':  return submitVenueComment(arg);
+    case 'rsvp':           return setRsvp(arg, arg2);
+    case 'photo-react':    return togglePhotoReaction(arg, arg2);
+    case 'photo-del-ask':  return askDeletePhoto(arg);
+    case 'photo-del-yes':  return confirmDeletePhoto(arg);
+    case 'photo-del-no':   return cancelDeletePhoto(arg);
+    case 'photo-fb':       return sharePhotoFacebook(arg);
+    case 'photo-ig':       return sharePhotoInstagram(arg);
+    case 'photo-comments': return togglePhotoComments(arg);
+    case 'photo-comment':  return submitPhotoComment(arg);
+    case 'lf-resolve':     return toggleLfResolve(Number(arg), Number(arg2));
+    case 'budget-edit':    return startEditBudget(Number(arg), Number(arg2));
+    case 'budget-del':     return deleteBudgetItem(Number(arg));
+    case 'budget-save':    return saveBudgetEdit(Number(arg));
+    case 'booking-edit':   return editBooking(Number(arg));
+    case 'booking-del':    return deleteBooking(Number(arg));
+    case 'pack':           return localStorage.setItem(arg, el.checked ? '1' : '0');
+    case 'upload':         return uploadPhotos(arg, el);
+  }
+}
+['click', 'change', 'keydown'].forEach(type => document.addEventListener(type, runDataAction));
 
 /* =========================================================
    LOST & FOUND
@@ -2258,6 +2420,16 @@ async function submitLostFound() {
       body: JSON.stringify({ name, phone, location, item }),
     });
     const data = await res.json().catch(() => ({}));
+    // A report the server refused (its text, the hourly limit, a full list)
+    // says why in Hebrew and English; shown in the page's language, as text
+    // (showErr uses textContent). Anything else keeps the generic error.
+    const m = data && typeof data.message === 'object' ? data.message : null;
+    const refusal = m ? (m[currentLang] || m.he || m.en) : null;
+    if (!res.ok && typeof refusal === 'string' && refusal) {
+      showErr(refusal);
+      if (btn) btn.disabled = false;
+      return;
+    }
     if (!res.ok) throw new Error(data.error || `שגיאה ${res.status}`);
     if (err) { err.style.color = 'var(--ok)'; err.textContent = tr.lf_success || '✅ הדיווח נשלח!'; }
     if (btn) btn.style.display = 'none';
@@ -2337,8 +2509,10 @@ async function loadLostFound() {
     const tr = T[currentLang];
     const locale = currentLang === 'he' ? 'he-IL' : 'en-US';
     if (!items.length) { list.innerHTML = `<p style="color:var(--ink-2);text-align:center;padding:40px 0">${tr.lf_empty}</p>`; return; }
+    // A report's id reaches toggleLfResolve() as data (runDataAction): POST
+    // /api/lost-found takes no login, so nothing in a card is trusted.
     list.innerHTML = items.map(i => `
-      <div class="lf-card ${i.resolved ? 'lf-resolved' : ''}" id="lf-card-${i.id}">
+      <div class="lf-card ${i.resolved ? 'lf-resolved' : ''}" id="lf-card-${escapeHtml(i.id)}">
         <div class="lf-card-header">
           <span class="lf-status-dot ${i.resolved ? 'resolved' : 'open'}"></span>
           <strong class="lf-finder">${escapeHtml(i.name)}</strong>
@@ -2347,7 +2521,7 @@ async function loadLostFound() {
         <div class="lf-card-item">🎒 ${escapeHtml(i.item)}</div>
         ${i.location ? `<div class="lf-card-loc">📍 ${escapeHtml(i.location)}</div>` : ''}
         ${i.phone ? `<div class="lf-card-contact">📞 <a href="tel:${encodeURIComponent(i.phone)}">${escapeHtml(i.phone)}</a></div>` : ''}
-        <button class="lf-resolve-btn" onclick="toggleLfResolve(${i.id}, ${i.resolved ? 0 : 1})">
+        <button class="lf-resolve-btn" data-act="lf-resolve" data-arg="${escapeHtml(i.id)}" data-arg2="${i.resolved ? 0 : 1}">
           ${i.resolved ? tr.lf_reopen : tr.lf_resolve}
         </button>
       </div>`).join('');
@@ -2409,31 +2583,38 @@ async function loadBudget() {
       const phaseItems = byPhase[phase] || [];
       if (!phaseItems.length) continue;
       const phaseMeta = BUDGET_PHASES[phase];
+      // Labels are config text (budget.phase_labels); a row's id and amount
+      // come from GET /api/budget, which an agent tool can write. The amount
+      // is made a number before it is summed or printed (a string amount used
+      // to concatenate into the total and print as markup), and the id
+      // reaches its handlers as data (runDataAction).
       const phaseLabel = isHe ? phaseMeta.label : phaseMeta.en;
       let phaseTotal = 0;
       let rows = '';
       for (const item of phaseItems) {
         const icon = BUDGET_CAT_ICON[item.category] || '📌';
-        const isUnknown = item.is_estimate && item.amount === 0;
-        const amtStr = isUnknown ? '?' : (item.is_estimate ? `~$${item.amount.toLocaleString()}` : `$${item.amount.toLocaleString()}`);
+        const amount = Number(item.amount) || 0;
+        const isUnknown = item.is_estimate && amount === 0;
+        const amtStr = isUnknown ? '?' : (item.is_estimate ? `~$${amount.toLocaleString()}` : `$${amount.toLocaleString()}`);
         if (isUnknown) missingItems.push(item.description);
-        if (!isUnknown) phaseTotal += item.amount;
+        if (!isUnknown) phaseTotal += amount;
         const amtClass = isUnknown ? 'budget-unknown' : item.is_estimate ? 'budget-est' : '';
-        rows += `<tr class="${isUnknown ? 'budget-row-missing' : ''}" id="brow-${item.id}">
+        const bid = escapeHtml(item.id);
+        rows += `<tr class="${isUnknown ? 'budget-row-missing' : ''}" id="brow-${bid}">
           <td class="budget-icon-cell">${icon}</td>
           <td class="budget-desc">${escapeHtml(item.description)}</td>
-          <td class="budget-amount ${amtClass}" id="bamt-${item.id}">${amtStr}</td>
+          <td class="budget-amount ${amtClass}" id="bamt-${bid}">${amtStr}</td>
           ${token ? `<td class="budget-actions">
-            <button class="budget-edit-btn" onclick="startEditBudget(${item.id},${item.amount})" title="ערוך">✏️</button>
-            <button class="budget-del-btn" onclick="deleteBudgetItem(${item.id})" title="מחק">×</button>
+            <button class="budget-edit-btn" data-act="budget-edit" data-arg="${bid}" data-arg2="${amount}" title="ערוך">✏️</button>
+            <button class="budget-del-btn" data-act="budget-del" data-arg="${bid}" title="מחק">×</button>
           </td>` : '<td></td>'}
         </tr>`;
-        grandTotal += isUnknown ? 0 : item.amount;
+        grandTotal += isUnknown ? 0 : amount;
       }
 
       html += `<div class="budget-phase-card">
         <div class="budget-phase-header">
-          <span class="budget-phase-label">${phaseLabel}</span>
+          <span class="budget-phase-label">${escapeHtml(phaseLabel)}</span>
           <span class="budget-phase-subtotal">$${phaseTotal.toLocaleString()}</span>
         </div>
         <table class="budget-table"><tbody>${rows}</tbody></table>
@@ -2463,7 +2644,7 @@ async function loadBudget() {
 
   } catch (e) {
     const trBErr = T[currentLang] || T['he'];
-    content.innerHTML = `<p style="color:var(--urgent)">${trBErr.budget_error_txt} — ${e.message}</p>`;
+    content.innerHTML = `<p style="color:var(--urgent)">${trBErr.budget_error_txt} — ${escapeHtml(e.message)}</p>`;
   }
 }
 
@@ -2503,8 +2684,8 @@ function startEditBudget(id, currentAmount) {
   const amtCell = document.getElementById(`bamt-${id}`);
   if (!amtCell) return;
   amtCell.innerHTML = `
-    <input class="budget-edit-input" id="bedit-${id}" type="number" min="0" step="1" value="${currentAmount}" />
-    <button class="budget-save-btn" onclick="saveBudgetEdit(${id})">✓</button>
+    <input class="budget-edit-input" id="bedit-${escapeHtml(id)}" type="number" min="0" step="1" value="${escapeHtml(currentAmount)}" />
+    <button class="budget-save-btn" data-act="budget-save" data-arg="${escapeHtml(id)}">✓</button>
     <button class="budget-cancel-btn" onclick="loadBudget()">✕</button>`;
   document.getElementById(`bedit-${id}`)?.focus();
 }
@@ -2670,11 +2851,18 @@ function bookingRefBadges(b) {
   const googleWalletBadge = googleWalletUrl
     ? `<a href="${googleWalletUrl}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;text-decoration:none;margin-right:4px;vertical-align:middle"><img src="/google-wallet-badge.svg" alt="Add to Google Wallet" style="height:52px;display:block"></a>`
     : '';
-  const locationUrl = bkEsc(bkSafeUrl(b.location_url));
+  // A hotel booking also carries `place` (server/hotel-place.js): its own link,
+  // or a search for its name and town, plus Waze — the same ones every screen
+  // opens. location_url stays what is stored, so the edit form is untouched.
+  const locationUrl = bkEsc(bkSafeUrl(b.location_url) || bkSafeUrl(b.place?.maps_url));
   const locationBadge = locationUrl
     ? `<a href="${locationUrl}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;gap:2px;color:var(--accent);font-size:12px;text-decoration:none;vertical-align:middle;margin-right:4px" title="Location">📍</a>`
     : '';
-  return `${confBadge}${pdfLink}${appleWalletBadge}${googleWalletBadge}${locationBadge}`;
+  const wazeUrl = bkEsc(bkSafeUrl(b.place?.waze_url));
+  const wazeBadge = wazeUrl
+    ? `<a href="${wazeUrl}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;gap:2px;color:var(--accent);font-size:12px;text-decoration:none;vertical-align:middle;margin-right:4px" title="Waze">🔵</a>`
+    : '';
+  return `${confBadge}${pdfLink}${appleWalletBadge}${googleWalletBadge}${locationBadge}${wazeBadge}`;
 }
 
 function buildBookingRow(b, canEdit) {
@@ -2683,18 +2871,23 @@ function buildBookingRow(b, canEdit) {
   // date_from/date_to are accepted by POST/PATCH /api/bookings with no
   // format validation, so they're just as attacker-controlled as name.
   const dates = bkEsc([b.date_from, b.date_to].filter(Boolean).join(' → '));
-  const pinBadge = b.pin ? `<span style="margin-right:6px;font-size:12px;color:var(--ink-2)">PIN: ${b.pin}</span>` : '';
+  // PIN and passengers are free text too (third boundary review 2026-10-11,
+  // finding A): the organizer/agent key writes them through POST/PATCH
+  // /api/bookings and the mcp booking tools, and the extract-draft route fills
+  // them from an uploaded PDF. The id reaches edit/delete as data
+  // (runDataAction), never inside an inline handler.
+  const pinBadge = b.pin ? `<span style="margin-right:6px;font-size:12px;color:var(--ink-2)">PIN: ${bkEsc(b.pin)}</span>` : '';
   const costStr = b.cost ? `$${Number(b.cost).toLocaleString()}` : '–';
   const editBtn = canEdit
-    ? `<button onclick="editBooking(${b.id})" style="border:none;background:none;cursor:pointer;font-size:13px;color:var(--accent);padding:0 4px" title="Edit">✏️</button>`
+    ? `<button data-act="booking-edit" data-arg="${bkEsc(b.id)}" style="border:none;background:none;cursor:pointer;font-size:13px;color:var(--accent);padding:0 4px" title="Edit">✏️</button>`
     : '';
   const delBtn = (canEdit && !b.seed_key)
-    ? `<button onclick="deleteBooking(${b.id})" style="border:none;background:none;cursor:pointer;font-size:13px;color:var(--warn);padding:0 4px" title="Delete">🗑️</button>`
+    ? `<button data-act="booking-del" data-arg="${bkEsc(b.id)}" style="border:none;background:none;cursor:pointer;font-size:13px;color:var(--warn);padding:0 4px" title="Delete">🗑️</button>`
     : '';
   return `<tr style="${cancelled ? 'opacity:0.55;text-decoration:line-through' : ''}">
     <td>${icon} ${bkEsc(b.name)}</td>
     <td style="white-space:nowrap">${dates || '–'}</td>
-    <td>${b.passengers || '–'}</td>
+    <td>${b.passengers ? bkEsc(b.passengers) : '–'}</td>
     <td>${bookingRefBadges(b)}${pinBadge}</td>
     <td style="white-space:nowrap">${costStr}</td>
     <td style="white-space:nowrap">${editBtn}${delBtn}</td>
@@ -2725,8 +2918,9 @@ async function loadBookings() {
     let html = '';
     for (const phase of phaseOrder) {
       if (!byPhase[phase]) continue;
+      // A booking's phase is whatever its writer sent, not only a config id.
       const label = (PHASE_LABELS[phase] || {})[currentLang] || phase;
-      html += `<h3 class="section-h3">${label}</h3>`;
+      html += `<h3 class="section-h3">${bkEsc(label)}</h3>`;
       html += `<div class="tbl-wrap"><table>
         <tr><th>${tr.th_name || 'הזמנה'}</th><th>${tr.th_dates || 'תאריכים'}</th><th>${tr.th_passengers}</th><th>${tr.th_conf}</th><th>${tr.th_cost}</th><th></th></tr>
         ${byPhase[phase].map(b => buildBookingRow(b, canEdit)).join('')}
@@ -2863,6 +3057,19 @@ function hideBookingForm() {
   document.getElementById('bk-overlay').style.display = 'none';
 }
 
+// A save the server refused for its text (server/text-rules.js) carries a
+// message in Hebrew and English naming the field and what to fix; shown in
+// the page's language. Anything else — no message, a 500, a body that is not
+// JSON — keeps the generic error. The caller puts it in with textContent.
+async function bookingSaveRefusal(r, tr) {
+  try {
+    const m = (await r.json())?.message;
+    const text = m && typeof m === 'object' ? (m[currentLang] || m.he || m.en) : null;
+    if (typeof text === 'string' && text) return text;
+  } catch { /* not JSON */ }
+  return tr.bk_err_server;
+}
+
 async function submitBooking() {
   const tr = T[currentLang] || T['he'];
   const id       = document.getElementById('bk-id').value;
@@ -2888,10 +3095,10 @@ async function submitBooking() {
     let newId = id;
     if (id) {
       const r = await fetch(`/api/bookings/${id}`, { method: 'PATCH', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-      if (!r.ok) throw new Error();
+      if (!r.ok) { errEl.textContent = await bookingSaveRefusal(r, tr); return; }
     } else {
       const r = await fetch('/api/bookings', { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-      if (!r.ok) throw new Error();
+      if (!r.ok) { errEl.textContent = await bookingSaveRefusal(r, tr); return; }
       const data = await r.json();
       newId = data.id;
     }
@@ -3081,7 +3288,7 @@ function populatePhaseSectionDropdowns(cfg, lang) {
     if (!sel) return;
     sel.innerHTML = phaseOrder.map(phase => {
       const lbl = phaseLabels[phase];
-      return `<option value="${phase}">${lbl?.[useLang] || lbl?.he || phase}</option>`;
+      return `<option value="${escapeHtml(phase)}">${escapeHtml(lbl?.[useLang] || lbl?.he || phase)}</option>`;
     }).join('');
   });
 }
@@ -3107,14 +3314,16 @@ function buildPhaseNav(cfg) {
     });
   }
 
-  // 2. Side menu phase links
+  // 2. Side menu phase links. Every stop field is escaped: a stop's title, tab
+  // label and emoji are text an organizer or the companion wrote after the
+  // interview (boundary review 2026-10-11, finding 1), and this is innerHTML.
   const smPhaseLinks = document.getElementById('sm-phase-links');
   if (smPhaseLinks) {
     smPhaseLinks.innerHTML = phases.map(p => {
-      const emoji = p.emoji || '📍';
-      return `<a class="sm-link" data-tab="${p.id}">` +
-        `<span class="lang-he">${emoji} ${p.title?.he || p.tabLabel}</span>` +
-        `<span class="lang-en">${emoji} ${p.title?.en || p.tabLabel}</span></a>`;
+      const emoji = esc(p.emoji || '📍');
+      return `<a class="sm-link" data-tab="${esc(p.id)}">` +
+        `<span class="lang-he">${emoji} ${esc(p.title?.he || p.tabLabel)}</span>` +
+        `<span class="lang-en">${emoji} ${esc(p.title?.en || p.tabLabel)}</span></a>`;
     }).join('');
     smPhaseLinks.querySelectorAll('a[data-tab]').forEach(a => {
       a.addEventListener('click', () => switchTab(a.dataset.tab));
@@ -3129,15 +3338,17 @@ function buildPhaseNav(cfg) {
     sec.className = 'section';
     sec.id = p.id;
     sec.innerHTML = `<div class="sec-body"><div class="sec-inner">` +
-      `<h2 class="section-h2"><span class="lang-he">${p.title?.he || p.tabLabel}</span>` +
-      `<span class="lang-en">${p.title?.en || p.tabLabel}</span></h2>` +
+      `<h2 class="section-h2"><span class="lang-he">${esc(p.title?.he || p.tabLabel)}</span>` +
+      `<span class="lang-en">${esc(p.title?.en || p.tabLabel)}</span></h2>` +
       (p.note ? `<p class="phase-note"><span class="lang-he">${esc(p.note.he ?? p.note)}</span><span class="lang-en">${esc(p.note.en ?? p.note.he ?? p.note)}</span></p>` : '') +
-      `<div id="hotel-${p.id}"></div>` +
-      `<div id="sched-${p.id}"></div>` +
-      `<div id="rsvp-${p.id}"></div>` +
-      `<div id="pack-${p.id}"></div>` +
-      `<div id="ratings-${p.id}"></div>` +
-      `<div id="photos-${p.id}"></div>` +
+      // The stop id is escaped into each container id too; getElementById()
+      // with the raw id still finds them.
+      `<div id="hotel-${esc(p.id)}"></div>` +
+      `<div id="sched-${esc(p.id)}"></div>` +
+      `<div id="rsvp-${esc(p.id)}"></div>` +
+      `<div id="pack-${esc(p.id)}"></div>` +
+      `<div id="ratings-${esc(p.id)}"></div>` +
+      `<div id="photos-${esc(p.id)}"></div>` +
       `</div></div>`;
     if (beforeSection) beforeSection.parentNode.insertBefore(sec, beforeSection);
   });
@@ -3251,16 +3462,17 @@ function buildGlobalsFromConfig(cfg) {
   // Budget h2 and note from config
   const budgetH2 = document.getElementById('budget-h2');
   if (budgetH2 && (cfg.meta?.title || cfg.budget?.scope_note)) {
-    const title = cfg.meta?.title || '';
+    // meta.title and the scope note are config text the provisioner writes.
+    const title = esc(cfg.meta?.title || '');
     const sn = cfg.budget?.scope_note || {};
-    budgetH2.innerHTML = `<span class="lang-he">${title}${sn.he ? ' · ' + sn.he : ''}</span>` +
-      `<span class="lang-en">${title}${sn.en ? ' · ' + sn.en : ''}</span>`;
+    budgetH2.innerHTML = `<span class="lang-he">${title}${sn.he ? ' · ' + esc(sn.he) : ''}</span>` +
+      `<span class="lang-en">${title}${sn.en ? ' · ' + esc(sn.en) : ''}</span>`;
   }
   const budgetNote = document.getElementById('budget-note');
   if (budgetNote && cfg.budget?.scope_note) {
     const sn = cfg.budget.scope_note;
-    budgetNote.innerHTML = `<span class="lang-he">💡 ${sn.he || ''}</span>` +
-      `<span class="lang-en">💡 ${sn.en || ''}</span>`;
+    budgetNote.innerHTML = `<span class="lang-he">💡 ${esc(sn.he || '')}</span>` +
+      `<span class="lang-en">💡 ${esc(sn.en || '')}</span>`;
   }
 
   // Build phase navigation (nav tabs, side menu, dynamic sections)
@@ -3280,10 +3492,11 @@ function buildGlobalsFromConfig(cfg) {
 // what tests/helpers/dom.js extracts, so leaving them outside made the render
 // code untestable in isolation.
 //
-// escapeHtml() elsewhere only ever fed element text, so it leaves quotes alone
-// and assumes a string. Plan items come from the DB and the AI extraction path,
-// where a value can land in an attribute and can be a number or object — so
-// this one escapes quotes too and coerces first.
+// Same rules as escapeHtml() (outside this region) and bkEsc(): & < > " '
+// become entities, and a number or object is coerced to a string first, so
+// the result is safe in element text and in a double- or single-quoted
+// attribute. It is NOT safe inside an inline JS string — that is what
+// runDataAction's data- attributes are for.
 function esc(s) {
   return String(s ?? '')
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -3307,7 +3520,10 @@ function applyBrandFromConfig(cfg) {
   if (appleMeta) appleMeta.content = brand;
 
   const brandEl = document.getElementById('topbar-brand');
-  if (brandEl) brandEl.innerHTML = `${brand} <span class="reg">®</span>`;
+  // meta.brand / meta.title are config text: escaped wherever they reach
+  // markup (here, the trivia link and the footer). HERO.home.title keeps the
+  // raw brand; setHero() escapes it where it lands.
+  if (brandEl) brandEl.innerHTML = `${esc(brand)} <span class="reg">®</span>`;
 
   const loginTitleEl = document.querySelector('[data-i18n="login_title"]');
   if (loginTitleEl) loginTitleEl.textContent = brand;
@@ -3365,13 +3581,13 @@ function applyBrandFromConfig(cfg) {
   const triviaSection = document.getElementById('sm-trivia-section');
   if (triviaSection) triviaSection.style.display = cfg.trivia_available ? '' : 'none';
   const triviaLink = document.getElementById('sm-trivia-link');
-  if (triviaLink && cfg.trivia_available) triviaLink.innerHTML = `🏆 ${brand} Quiz`;
+  if (triviaLink && cfg.trivia_available) triviaLink.innerHTML = `🏆 ${esc(brand)} Quiz`;
 
   const footerEl = document.getElementById('site-footer');
   if (footerEl) {
     const sep = '<span class="sep">●</span>';
     footerEl.innerHTML = [
-      brand,
+      esc(brand),
       cfg.phases?.length ? `${cfg.phases.length} ${cfg.phases.length === 1 ? 'destination' : 'destinations'}` : '',
       nPeople ? `${nPeople} ${nPeople === 1 ? 'traveler' : 'travelers'}` : '',
     ].filter(Boolean).join(` ${sep} `);
@@ -3387,9 +3603,9 @@ function renderHomePhases(cfg) {
         ? `${p.dates.start.slice(5).replace('-','/')} — ${p.dates.end.slice(5).replace('-','/')}`
         : '');
     const count = p.participants?.length;
-    return `<div class="phase" data-tab="${p.id}" role="button" tabindex="0">
-      <div class="ph-date">${display}</div>
-      <div class="ph-place">${p.emoji || ''} ${_biSpan(p.title || { he: p.tabLabel, en: p.tabLabel })}</div>
+    return `<div class="phase" data-tab="${esc(p.id)}" role="button" tabindex="0">
+      <div class="ph-date">${esc(display)}</div>
+      <div class="ph-place">${esc(p.emoji || '')} ${_biText(p.title || { he: p.tabLabel, en: p.tabLabel })}</div>
       ${count ? `<div class="ph-people"><span class="lang-he">${count} נפשות</span><span class="lang-en">${count} people</span></div>` : ''}
     </div>`;
   }).join('');
@@ -3420,12 +3636,13 @@ function accommodationAnchors(cfg) {
       type: 'hotel',
       phaseId: p.id,
       name,
-      phaseLabel: `${p.emoji || ''} ${_biSpan(p.title || { he: p.tabLabel, en: p.tabLabel })}`,
+      // HTML (renderHomeOverview puts it in a cell as is), so built escaped.
+      phaseLabel: `${esc(p.emoji || '')} ${_biText(p.title || { he: p.tabLabel, en: p.tabLabel })}`,
       date_from: p.dates?.start || null,
       date_to: p.dates?.end || null,
       confirmation: acc.confirmation || null,
       conf_file: acc.pdf || null,
-      location_url: acc.mapsUrl || acc.maps || (acc.address ? googleMapsUrl(acc.address) : null),
+      location_url: acc.location_url || acc.mapsUrl || acc.maps || (acc.address ? googleMapsUrl(acc.address) : null),
     };
   }).filter(Boolean);
 }
@@ -3451,7 +3668,7 @@ function bookingAnchors(cfg, bookings) {
   return bookings.filter(isAnchorBooking).map(b => {
     const phase = (cfg.phases || []).find(p => p.id === b.phase);
     const phaseLabel = phase
-      ? `${phase.emoji || ''} ${_biSpan(phase.title || { he: phase.tabLabel, en: phase.tabLabel })}`
+      ? `${esc(phase.emoji || '')} ${_biText(phase.title || { he: phase.tabLabel, en: phase.tabLabel })}`
       : esc((PHASE_LABELS[b.phase] || {})[currentLang] || b.phase);
     return { ...b, phaseLabel };
   });
@@ -3529,19 +3746,95 @@ function _bi(obj, lang) {
   return obj[lang] || obj.he || '';
 }
 
+// Markup in, markup out: for text the caller has ALREADY escaped (the plan
+// list, a corrected line, a day headline) or a translation constant. Never
+// hand it a value straight from the server — use _biText() for plain text and
+// _biHtml() for a config day item's HTML fragment (third boundary review,
+// 2026-10-11, removed every such call).
 function _biSpan(obj) {
   if (!obj) return '';
   if (typeof obj === 'string') return obj;
   return `<span class="lang-he">${obj.he || ''}</span><span class="lang-en">${obj.en || ''}</span>`;
 }
 
+// A config day item's text is an HTML fragment by contract, not plain text:
+// hand-authored trips link places inline (<a href="https://maps…">Central
+// Park</a>), and POST /api/phase-plan/export-to-config writes the text
+// HTML-escaped plus <a> links back into phases[].days[].items[].text.
+// Escaping it would print those tags and show "&amp;"; passing it through raw
+// let a document-extracted item carry a live <img onerror>. So it is parsed in
+// an inert document (no script runs, nothing loads) and rebuilt from an
+// allow-list: text, http(s) links (only href is kept; target/rel are ours),
+// and b/strong/i/em/br with no attributes. Any other element is reduced to
+// its text; script/style/template content is dropped. Benign text shows
+// exactly as the raw innerHTML used to show it, because the browser parsed
+// it then too.
+function _safeInlineHtml(html) {
+  const doc = document.implementation.createHTMLDocument('');
+  doc.body.innerHTML = String(html ?? '');
+  const KEEP = ['b', 'strong', 'i', 'em'];
+  const DROP = ['script', 'style', 'template', 'noscript', 'iframe', 'object', 'embed'];
+  // A depth cap: browsers stop nesting at 512, but a recursive walk over a deeper tree
+  // (a hostile document) would overflow the stack and stop the page's init. Past the cap
+  // only the text survives, escaped.
+  const MAX_DEPTH = 64;
+  const walk = (node, depth = 0) => Array.from(node.childNodes).map(n => {
+    if (n.nodeType === 3) return esc(n.nodeValue);
+    if (n.nodeType !== 1) return '';
+    if (depth >= MAX_DEPTH) {
+      // text only, collected without recursion (textContent itself recurses in some engines)
+      const stack = [n]; let text = '';
+      while (stack.length) {
+        const cur = stack.pop();
+        if (cur.nodeType === 3) { text += cur.nodeValue; continue; }
+        if (cur.nodeType !== 1) continue;
+        const t = String(cur.tagName).toLowerCase();
+        if (DROP.includes(t)) continue;
+        for (let i = cur.childNodes.length - 1; i >= 0; i--) stack.push(cur.childNodes[i]);
+      }
+      return esc(text);
+    }
+    const tag = String(n.tagName).toLowerCase();
+    if (DROP.includes(tag)) return '';
+    if (tag === 'br') return '<br>';
+    const inner = walk(n, depth + 1);
+    if (tag === 'a') {
+      const href = safeUrl(n.getAttribute('href'));
+      return href ? `<a href="${esc(href)}" target="_blank" rel="noopener">${inner}</a>` : inner;
+    }
+    return KEEP.includes(tag) ? `<${tag}>${inner}</${tag}>` : inner;
+  }).join('');
+  return walk(doc.body, 0);
+}
+
+function _biHtml(obj) {
+  if (!obj) return '';
+  if (typeof obj !== 'object') return _safeInlineHtml(obj);
+  return `<span class="lang-he">${_safeInlineHtml(obj.he || '')}</span><span class="lang-en">${_safeInlineHtml(obj.en || '')}</span>`;
+}
+
+// _biSpan() for text that has NOT been escaped yet — a stop's title,
+// accommodation and the like, straight from /api/config. _biSpan() itself
+// stays as it is: several callers hand it markup they already escaped (the
+// plan list), and escaping again there would show "&amp;" on screen.
+// Boundary review 2026-10-11, finding 1: stop text is written after the
+// interview by an organizer or the companion, so it is never markup here.
+function _biText(obj) {
+  if (!obj) return '';
+  if (typeof obj !== 'object') return esc(obj);
+  return `<span class="lang-he">${esc(obj.he || '')}</span><span class="lang-en">${esc(obj.en || '')}</span>`;
+}
+
 function renderStats(cfg) {
   const el = document.getElementById('stat-strip');
   if (!el || !cfg?.stats?.length) return;
+  // Stats, alerts, families, tasks and travel info below are config text the
+  // provisioner writes from the interview and documents: plain text, escaped
+  // (third boundary review 2026-10-11, finding D).
   el.innerHTML = cfg.stats.map(s => `
     <div>
-      <h2 class="ltr">${s.number}</h2>
-      <p><span class="lang-he">${s.description?.he || ''}</span><span class="lang-en">${s.description?.en || ''}</span></p>
+      <h2 class="ltr">${esc(s.number)}</h2>
+      <p><span class="lang-he">${esc(s.description?.he || '')}</span><span class="lang-en">${esc(s.description?.en || '')}</span></p>
     </div>`).join('');
 }
 
@@ -3550,8 +3843,8 @@ function renderAlerts(cfg) {
   if (!el || !cfg?.alerts) return;
   const { booked, pending } = cfg.alerts;
   let html = '';
-  if (booked) html += `<div class="alert alert-s"><span class="lang-he">${booked.he || ''}</span><span class="lang-en">${booked.en || ''}</span></div>`;
-  if (pending) html += `<div class="alert alert-w"><span class="lang-he">${pending.he || ''}</span><span class="lang-en">${pending.en || ''}</span></div>`;
+  if (booked) html += `<div class="alert alert-s"><span class="lang-he">${esc(booked.he || '')}</span><span class="lang-en">${esc(booked.en || '')}</span></div>`;
+  if (pending) html += `<div class="alert alert-w"><span class="lang-he">${esc(pending.he || '')}</span><span class="lang-en">${esc(pending.en || '')}</span></div>`;
   el.innerHTML = html;
 }
 
@@ -3568,14 +3861,14 @@ function renderFamilies(cfg) {
       (p.age >= 25 ? heads : kids).push(p);
     });
     const headLines = heads.map(p =>
-      `<li><strong><span class="lang-he">${p.name}</span><span class="lang-en">${p.name_en}</span></strong>${p.age ? ` (${p.age})` : ''}</li>`).join('');
-    const kidLine = kids.length ? `<li><span class="lang-he">${kids.map(p => `${p.name}${p.age ? ' ('+p.age+')' : ''}`).join(', ')}</span><span class="lang-en">${kids.map(p => `${p.name_en}${p.age ? ' ('+p.age+')' : ''}`).join(', ')}</span></li>` : '';
-    const noteHtml = fam.note ? `<div class="fam-note">${_biSpan(fam.note)}</div>` : '';
+      `<li><strong><span class="lang-he">${escapeHtml(p.name)}</span><span class="lang-en">${escapeHtml(p.name_en)}</span></strong>${p.age ? ` (${escapeHtml(p.age)})` : ''}</li>`).join('');
+    const kidLine = kids.length ? `<li><span class="lang-he">${kids.map(p => `${escapeHtml(p.name)}${p.age ? ' ('+escapeHtml(p.age)+')' : ''}`).join(', ')}</span><span class="lang-en">${kids.map(p => `${escapeHtml(p.name_en)}${p.age ? ' ('+escapeHtml(p.age)+')' : ''}`).join(', ')}</span></li>` : '';
+    const noteHtml = fam.note ? `<div class="fam-note">${_biText(fam.note)}</div>` : '';
     return `<div class="fam">
-      <div class="fam-letter ltr">${fam.letter}</div>
+      <div class="fam-letter ltr">${esc(fam.letter)}</div>
       <div class="fam-content">
-        <h4>${_biSpan(fam.name)}</h4>
-        <div class="fam-count">${_biSpan(fam.description)}</div>
+        <h4>${_biText(fam.name)}</h4>
+        <div class="fam-count">${_biText(fam.description)}</div>
         <ul>${headLines}${kidLine}</ul>
         ${noteHtml}
       </div>
@@ -3587,10 +3880,10 @@ function renderTasks(cfg) {
   const el = document.getElementById('tasks-table-wrap');
   if (!el || !cfg?.tasks?.length) return;
   const rows = cfg.tasks.map(t => `
-    <tr data-tid="${t.id}">
-      <td>${_biSpan(t.text)}</td>
-      <td>${_biSpan(t.owner)}</td>
-      <td><span class="task-deadline" data-deadline="${t.deadline || ''}"></span></td>
+    <tr data-tid="${esc(t.id)}">
+      <td>${_biText(t.text)}</td>
+      <td>${_biText(t.owner)}</td>
+      <td><span class="task-deadline" data-deadline="${esc(t.deadline || '')}"></span></td>
       <td class="task-done-cell"></td>
     </tr>`).join('');
   el.innerHTML = `<table>
@@ -3609,8 +3902,12 @@ function renderPhaseHotelCard(phase) {
   if (!el || !phase.accommodation) return;
   const acc = phase.accommodation;
 
-  const nameHe = _bi(acc.name, 'he');
-  const nameEn = _bi(acc.name, 'en');
+  // Every value below is escaped where it lands, and every link passes
+  // safeUrl() first: the accommodation is text an organizer or the companion
+  // can set after the interview (PATCH /api/stops, from-booking), and this
+  // card is innerHTML (boundary review 2026-10-11, finding 1).
+  const nameHe = esc(_bi(acc.name, 'he'));
+  const nameEn = esc(_bi(acc.name, 'en'));
   const addr = acc.address || '';
   const conf = acc.confirmation;
   const pin = acc.pin;
@@ -3618,32 +3915,38 @@ function renderPhaseHotelCard(phase) {
   const guests = acc.guests;
   const rooms = acc.rooms;
   const phone = acc.phone;
-  const mapsUrl = acc.mapsUrl || acc.maps || (addr ? googleMapsUrl(addr) : null);
-  const wazeUrl = acc.waze;
-  const weatherKey = acc.weatherKey;
+  // location_url first: it is what a stop's hotel carries once the stop layer
+  // wrote it (server/hotel-place.js resolves it, with `waze`, for every hotel a
+  // booking or the companion set) — the same links the other screens open.
+  const mapsUrl = safeUrl(acc.location_url || acc.mapsUrl || acc.maps || (addr ? googleMapsUrl(addr) : null));
+  const wazeUrl = safeUrl(acc.waze);
+  // The weather key lands inside an inline onclick — a JS string in an
+  // attribute, where esc() is not enough (&#39; is decoded back to ' before
+  // the handler runs). Only a plain token gets the button.
+  const weatherKey = /^[A-Za-z0-9_-]+$/.test(String(acc.weatherKey ?? '')) ? acc.weatherKey : null;
   const pdfFile = acc.pdf;
 
   let metaHtml = '';
-  if (acc.dates) metaHtml += `<span class="tag">📅 ${_biSpan(acc.dates)}</span>`;
-  if (guests) metaHtml += `<span class="tag">👥 <span class="lang-he">${guests} אורחים</span><span class="lang-en">${guests} guests</span></span>`;
-  if (rooms) metaHtml += `<span class="tag">🛏️ <span class="lang-he">${rooms} חדרים</span><span class="lang-en">${rooms} rooms</span></span>`;
-  if (conf && pin) metaHtml += `<span class="tag g">✅ <span class="lang-he">אישור: </span><span class="lang-en">Conf: </span><strong>${conf}</strong> · PIN: <strong>${pin}</strong></span>`;
-  else if (conf) metaHtml += `<span class="tag g">✅ <span class="lang-he">אישור: </span><span class="lang-en">Conf: </span><strong>${conf}</strong></span>`;
-  if (cost) metaHtml += `<span class="tag">💰 $${cost.toLocaleString()}</span>`;
+  if (acc.dates) metaHtml += `<span class="tag">📅 ${_biText(acc.dates)}</span>`;
+  if (guests) metaHtml += `<span class="tag">👥 <span class="lang-he">${esc(guests)} אורחים</span><span class="lang-en">${esc(guests)} guests</span></span>`;
+  if (rooms) metaHtml += `<span class="tag">🛏️ <span class="lang-he">${esc(rooms)} חדרים</span><span class="lang-en">${esc(rooms)} rooms</span></span>`;
+  if (conf && pin) metaHtml += `<span class="tag g">✅ <span class="lang-he">אישור: </span><span class="lang-en">Conf: </span><strong>${esc(conf)}</strong> · PIN: <strong>${esc(pin)}</strong></span>`;
+  else if (conf) metaHtml += `<span class="tag g">✅ <span class="lang-he">אישור: </span><span class="lang-en">Conf: </span><strong>${esc(conf)}</strong></span>`;
+  if (cost) metaHtml += `<span class="tag">💰 $${esc(cost.toLocaleString())}</span>`;
   (acc.notes || []).forEach(n => {
     const cls = n.style === 'warn' ? 'r' : (n.style === 'alert' ? 'r' : '');
-    metaHtml += `<span class="tag${cls ? ' '+cls : ''}">${_biSpan(n.text)}</span>`;
+    metaHtml += `<span class="tag${cls ? ' '+cls : ''}">${_biText(n.text)}</span>`;
   });
 
   const pdfUrls = bkConfUrls(pdfFile);
   const pdfHtml = pdfUrls ? `<span class="conf-pdf-pair"><a class="conf-pdf" href="#" data-authed-document="${bkEsc(pdfUrls.view)}" data-document-action="view" title="View">👁</a><a class="conf-pdf" href="#" data-authed-document="${bkEsc(pdfUrls.download)}" data-document-action="download" data-document-filename="${bkEsc(pdfFile)}" title="Download">⬇</a></span>` : '';
-  const navHtml = (mapsUrl || wazeUrl || weatherKey) ? `<div class="loc-nav-row" style="margin-top:10px">${mapsUrl ? `<a class="btn" href="${mapsUrl}" target="_blank">🗺️ Google Maps</a>` : ''}${wazeUrl ? `<a class="btn" href="${wazeUrl}" target="_blank">🔵 Waze</a>` : ''}${weatherKey ? `<button class="btn" type="button" onclick="loadWx('${weatherKey}')">🌤️ תחזית</button>` : ''}</div>${weatherKey ? `<div id="wx-${weatherKey}" class="wx-panel" style="display:none"></div>` : ''}` : '';
-  const descHtml = acc.description ? `<p>${_biSpan(acc.description)}</p>` : '';
+  const navHtml = (mapsUrl || wazeUrl || weatherKey) ? `<div class="loc-nav-row" style="margin-top:10px">${mapsUrl ? `<a class="btn" href="${esc(mapsUrl)}" target="_blank">🗺️ Google Maps</a>` : ''}${wazeUrl ? `<a class="btn" href="${esc(wazeUrl)}" target="_blank">🔵 Waze</a>` : ''}${weatherKey ? `<button class="btn" type="button" onclick="loadWx('${weatherKey}')">🌤️ תחזית</button>` : ''}</div>${weatherKey ? `<div id="wx-${weatherKey}" class="wx-panel" style="display:none"></div>` : ''}` : '';
+  const descHtml = acc.description ? `<p>${_biText(acc.description)}</p>` : '';
   const icon = acc.type === 'private' ? '🏠' : '🏨';
 
   el.innerHTML = `<div class="hotel-card">
     <h4>${icon} <span class="lang-he">${nameHe}</span><span class="lang-en">${nameEn}</span></h4>
-    ${addr ? `<p>${addr}${phone ? ` · <a class="inline" href="tel:${phone}">${phone}</a>` : ''}</p>` : ''}
+    ${addr ? `<p>${esc(addr)}${phone ? ` · <a class="inline" href="tel:${esc(phone)}">${esc(phone)}</a>` : ''}</p>` : ''}
     ${descHtml}
     <div class="hotel-meta">${metaHtml}${pdfHtml}</div>
     ${navHtml}
@@ -3661,14 +3964,17 @@ function renderPhotoUploads(cfg) {
     const dateRange = (p.dates?.start && p.dates?.end)
       ? `${p.dates.start.slice(5).replace('-','/')}–${p.dates.end.slice(5).replace('-','/')}`
       : '';
+    // The phase id (short_id / id from config) reaches uploadPhotos() as data
+    // (runDataAction's 'upload'), never inside an inline onchange string.
+    const phaseAttr = esc(pid);
     return `<div class="mini">
-      <h4>${p.emoji || ''} ${_biSpan(p.title || { he: phaseLabel, en: phaseLabel })}${dateRange ? ` (${dateRange})` : ''}</h4>
-      <label class="photo-upload-area" data-phase="${pid}">
-        <input type="file" multiple accept="image/*" onchange="uploadPhotos('${pid}',this)"/>
+      <h4>${esc(p.emoji || '')} ${_biText(p.title || { he: phaseLabel, en: phaseLabel })}${dateRange ? ` (${esc(dateRange)})` : ''}</h4>
+      <label class="photo-upload-area" data-phase="${phaseAttr}">
+        <input type="file" multiple accept="image/*" data-act-change="upload" data-arg="${phaseAttr}"/>
         <div class="icon ltr">+</div>
         <p data-i18n="upload_click">${tr.upload_click || 'לחץ לבחירת תמונות'}</p>
       </label>
-      <div id="album-link-${pid}" class="album-share-link" data-album-phase="${pid}"></div>
+      <div id="album-link-${phaseAttr}" class="album-share-link" data-album-phase="${phaseAttr}"></div>
     </div>`;
   }).join('');
 }
@@ -3732,12 +4038,12 @@ function renderInfo(cfg) {
       const currencyLine = c.currency ? `${c.currency.symbol || ''} ${c.currency.name}`.trim() : '';
       const rateLine = c.currency?.code ? formatCurrencyRateLine(c.currency.code) : '';
       return `<div class="mini">
-        <h4>${c.flag ? c.flag + ' ' : ''}${name}</h4>
-        <p>📞 <strong class="ltr">${emergencyLine}</strong></p>
-        <p>${[currencyLine, c.callingCode].filter(Boolean).join(' · ')}</p>
-        ${rateLine ? `<p class="ltr" style="font-size:12px;color:var(--ink-2)">${rateLine}</p>` : ''}
+        <h4>${c.flag ? esc(c.flag) + ' ' : ''}${esc(name)}</h4>
+        <p>📞 <strong class="ltr">${esc(emergencyLine)}</strong></p>
+        <p>${[currencyLine, c.callingCode].filter(Boolean).map(esc).join(' · ')}</p>
+        ${rateLine ? `<p class="ltr" style="font-size:12px;color:var(--ink-2)">${esc(rateLine)}</p>` : ''}
       </div>`;
-    }).join('') + emergencyContacts.map(c => `<div class="mini"><h4>${_biSpan(c.name)}</h4><p>📞 <a class="ltr" href="tel:${c.phone}">${c.phone}</a></p></div>`).join('');
+    }).join('') + emergencyContacts.map(c => `<div class="mini"><h4>${_biText(c.name)}</h4><p>📞 <a class="ltr" href="tel:${esc(c.phone)}">${esc(c.phone)}</a></p></div>`).join('');
   }
   const emrgBlock = document.getElementById('info-block-emrg');
   if (emrgBlock) emrgBlock.style.display = (Object.keys(ti.countries || {}).length || (ti.emergency_contacts || []).length) ? '' : 'none';
@@ -3750,13 +4056,13 @@ function renderInfo(cfg) {
     if (el) el.innerHTML = has ? items.map(render).join('') : '';
   };
 
-  listBlock('info-block-health', 'info-health', ti.health, item => `<li>${_biSpan(item)}</li>`);
+  listBlock('info-block-health', 'info-health', ti.health, item => `<li>${_biText(item)}</li>`);
   listBlock('info-block-hosp', 'info-hospitals', ti.hospitals,
-    h => `<li><strong>${_biSpan(h.area)}:</strong> ${h.name}</li>`);
-  listBlock('info-block-money', 'info-money', ti.money, item => `<li>${_biSpan(item)}</li>`);
-  listBlock('info-block-comm', 'info-communication', ti.communication, item => `<li>${_biSpan(item)}</li>`);
+    h => `<li><strong>${_biText(h.area)}:</strong> ${esc(h.name)}</li>`);
+  listBlock('info-block-money', 'info-money', ti.money, item => `<li>${_biText(item)}</li>`);
+  listBlock('info-block-comm', 'info-communication', ti.communication, item => `<li>${_biText(item)}</li>`);
   listBlock('info-block-age', 'info-age-notes', ti.age_notes,
-    n => `<li><strong>${_biSpan(n.who)}</strong> — ${_biSpan(n.note)}</li>`);
+    n => `<li><strong>${_biText(n.who)}</strong> — ${_biText(n.note)}</li>`);
 }
 
 // ── TELEGRAM LOGIN WIDGET ──────────────────────────────────────────────────────
@@ -4252,10 +4558,12 @@ function renderDays(phase) {
               const safe = safeUrl(u);
               return safe ? `<a class="poi-btn day-item-link" href="${esc(safe)}" target="_blank" rel="noopener">${icon}</a>` : '';
             }).join('');
-          return `<li>${item.time ? `<strong>${item.time}</strong> — ` : ''}${_biSpan(item.text)}${nav ? ` <span class="day-item-links">${nav}</span>` : ''}</li>`;
+          // The time and the label are plain text; the item's text is an HTML
+          // fragment by contract and goes through the allow-list (_biHtml).
+          return `<li>${item.time ? `<strong>${esc(item.time)}</strong> — ` : ''}${_biHtml(item.text)}${nav ? ` <span class="day-item-links">${nav}</span>` : ''}</li>`;
         }).join('');
         return { date: day.date || '', html: `<div class="day-block">
-          <div class="day-label">${_biSpan(day.label)}</div>
+          <div class="day-label">${_biText(day.label)}</div>
           <ul>${items}</ul>
         </div>` };
       });
@@ -4293,7 +4601,7 @@ function renderDays(phase) {
           const safe = safeUrl(u);
           return safe ? `<a class="poi-btn day-item-link" href="${esc(safe)}" target="_blank" rel="noopener">${icon}</a>` : '';
         }).join('');
-      return `<li>${_biSpan(v.name)}${nav ? ` <span class="day-item-links">${nav}</span>` : ''}</li>`;
+      return `<li>${_biText(v.name)}${nav ? ` <span class="day-item-links">${nav}</span>` : ''}</li>`;
     }).join('');
     html += `<div class="day-block phase-places-block">
       <div class="day-label"><span class="lang-he">מקומות שתוכננו — עוד אין תוכנית יומית</span><span class="lang-en">Planned places — no day-by-day yet</span></div>
@@ -4357,9 +4665,11 @@ window.addEventListener('load', async () => {
   loadUsersCache();
   loadRatings();
   loadTaskDone();
-  // Load RSVPs for all phases that have activities
+  // Load RSVPs for all phases that have activities, into the `rsvp-<id>`
+  // container buildPhaseNav() creates for the stop (this loaded `rsvps-<id>`,
+  // which no page has, so a config-built stop never showed its RSVP card).
   (window.TRIP_CONFIG?.phases || []).forEach(p => {
-    if (p.rsvp_activities?.length) loadRsvps(`rsvps-${p.id}`, RSVP_ACTIVITIES[p.id] || []);
+    if (p.rsvp_activities?.length) loadRsvps(`rsvp-${p.id}`, RSVP_ACTIVITIES[p.id] || []);
   });
   if (document.querySelector('#photos.section.active')) loadPhotosGallery();
   loadLostFound();
@@ -4510,30 +4820,32 @@ function openBookingModal(bkId) {
 
   body.innerHTML = data.items.map(item => {
     const icon = BK_TYPE_ICON[item.type] || '📋';
+    // Dormant (BOOKING_DATA is empty), escaped anyway: if this is revived from
+    // cfg.bookings, as the note above suggests, every field is free text.
     const confHtml = item.conf ? `
       <div class="bkm-row">
         <span class="bkm-label">${lang === 'he' ? 'אישור' : 'Conf'}</span>
-        <code class="bkm-conf">${item.conf}</code>
-        <button class="bkm-copy" data-copy="${item.conf}" title="Copy">⧉</button>
-        ${item.pin ? `<span class="bkm-label">PIN</span><code class="bkm-pin">${item.pin}</code>` : ''}
+        <code class="bkm-conf">${bkEsc(item.conf)}</code>
+        <button class="bkm-copy" data-copy="${bkEsc(item.conf)}" title="Copy">⧉</button>
+        ${item.pin ? `<span class="bkm-label">PIN</span><code class="bkm-pin">${bkEsc(item.pin)}</code>` : ''}
       </div>` : '';
     const metaHtml = (item.dates || item.cost || item.info) ? `
       <div class="bkm-row bkm-meta">
-        ${item.dates ? `<span>${item.dates}</span>` : ''}
-        ${item.info  ? `<span class="bkm-info">${item.info[lang] || item.info.he}</span>` : ''}
-        ${item.cost  ? `<span class="bkm-cost">${item.cost}</span>` : ''}
+        ${item.dates ? `<span>${bkEsc(item.dates)}</span>` : ''}
+        ${item.info  ? `<span class="bkm-info">${bkEsc(item.info[lang] || item.info.he)}</span>` : ''}
+        ${item.cost  ? `<span class="bkm-cost">${bkEsc(item.cost)}</span>` : ''}
       </div>` : '';
-    const noteHtml = item.note ? `<div class="bkm-note">${item.note[lang] || item.note.he}</div>` : '';
+    const noteHtml = item.note ? `<div class="bkm-note">${bkEsc(item.note[lang] || item.note.he)}</div>` : '';
     const pdfsHtml = item.pdfs && item.pdfs.length ? `
       <div class="bkm-pdfs">${item.pdfs.map(p => `
         <span class="bkm-pdf-pair">
-          <span class="bkm-pdf-name">📄 ${p.label}</span>
+          <span class="bkm-pdf-name">📄 ${bkEsc(p.label)}</span>
           <a class="bkm-pdf-btn" href="#" data-authed-document="${bkEsc(bkConfUrls(p.file).view)}" data-document-action="view">👁 View</a>
           <a class="bkm-pdf-btn bkm-pdf-dl" href="#" data-authed-document="${bkEsc(bkConfUrls(p.file).download)}" data-document-action="download" data-document-filename="${bkEsc(p.file)}">⬇ Download</a>
         </span>`).join('')}
       </div>` : '';
-    return `<div class="bkm-item bkm-type-${item.type}">
-      <div class="bkm-name">${icon} ${item.name}</div>
+    return `<div class="bkm-item bkm-type-${bkEsc(item.type)}">
+      <div class="bkm-name">${icon} ${bkEsc(item.name)}</div>
       ${confHtml}${metaHtml}${noteHtml}${pdfsHtml}
     </div>`;
   }).join('');

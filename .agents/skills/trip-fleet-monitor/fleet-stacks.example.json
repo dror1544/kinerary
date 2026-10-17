@@ -24,7 +24,18 @@
     "field separator and {pgoptions} the read-only connection options.",
     "",
     "Binaries are found on PATH, with FLEET_SSH_BIN / FLEET_DOCKER_BIN /",
-    "FLEET_PSQL_BIN as overrides. Nothing here hardcodes a path.",
+    "FLEET_PSQL_BIN / FLEET_SH_BIN as overrides. Nothing here hardcodes a path.",
+    "",
+    "'hermes_logs_dir' (optional) turns on the 'statistics' tool's tool-usage",
+    "section: an absolute path, on the host this stack's 'ssh' block reaches (or",
+    "on this machine directly if there is no 'ssh' block), to the PARENT",
+    "directory holding one subdirectory per Hermes profile, each with",
+    "logs/agent.log[.N] inside. It is an interim, log-derived source (approved",
+    "2026-09-28, to be dropped once a proper Hermes-hook pipeline exists) — read",
+    "with the same 'ssh' plumbing as the database (sudo unless ssh.sudo is",
+    "false), never through psql. Absent on a stack means tool usage is simply",
+    "not configured there; the statistics tool says so in words rather than",
+    "showing zeros.",
     "",
     "Every <angle-bracket> value is a placeholder. Real hosts, container names",
     "and key names belong in the private deployment config, never in this repo."
@@ -43,7 +54,8 @@
         "key": "~/.ssh/<key for that user>",
         "sudo": true,
         "connect_timeout": 10
-      }
+      },
+      "hermes_logs_dir": "<absolute path on the control-plane host to the parent of the per-profile Hermes log dirs — optional, omit to leave tool usage unconfigured>"
     },
 
     "local": {

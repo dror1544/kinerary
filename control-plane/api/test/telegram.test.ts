@@ -8,7 +8,7 @@ import {
   resolveTelegramCallbackRef,
   answerTelegramCallbackQuery,
 } from "../src/adapters/telegram.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const DB_URL = testDatabaseUrl();
 const SKIP = !DB_URL;
@@ -58,7 +58,7 @@ describe("TelegramNotificationAdapter + resolveTelegramCallbackRef", () => {
 
   before(async () => {
     if (SKIP) return;
-    pool = new pg.Pool({ connectionString: DB_URL });
+    pool = testPool();
     const client = await pool.connect();
     try { await applyMigrations(client, migrationsDir); }
     finally { client.release(); }
@@ -140,6 +140,57 @@ describe("TelegramNotificationAdapter + resolveTelegramCallbackRef", () => {
       assert.equal(calls[0].body.chat_id, "777000111");
       assert.equal(calls[0].body.text, "Your trip site is ready: https://example.test");
       assert.equal(calls[0].body.reply_markup, undefined);
+    } finally {
+      mock.restoreAll();
+    }
+  });
+
+  test("sendMessage with parseMode HTML sends parse_mode and the HTML text untouched", { skip: SKIP }, async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    mock.method(globalThis, "fetch", async (_url: string, init?: RequestInit) => {
+      calls.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    });
+    try {
+      const adapter = new TelegramNotificationAdapter({ botToken: "bot-token", superAdminChatId: "391627336", db: pool });
+      await adapter.sendMessage({
+        chatId: "777000111", text: "<code>ykxg-d263-qtw2-y3rq</code>", parseMode: "HTML", plainText: "ykxg-d263-qtw2-y3rq",
+      });
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0].parse_mode, "HTML");
+      assert.equal(calls[0].text, "<code>ykxg-d263-qtw2-y3rq</code>");
+    } finally {
+      mock.restoreAll();
+    }
+  });
+
+  test("sendMessage: Telegram refusing the HTML re-sends the same words as plain text", { skip: SKIP }, async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    mock.method(globalThis, "fetch", async (_url: string, init?: RequestInit) => {
+      calls.push(JSON.parse(String(init?.body)));
+      return calls.length === 1
+        ? new Response("Bad Request: can't parse entities: Unsupported start tag", { status: 400 })
+        : new Response(JSON.stringify({ ok: true }), { status: 200 });
+    });
+    try {
+      const adapter = new TelegramNotificationAdapter({ botToken: "bot-token", superAdminChatId: "391627336", db: pool });
+      await adapter.sendMessage({ chatId: "777000111", text: "<code>pw</code>", parseMode: "HTML", plainText: "pw" });
+      assert.equal(calls.length, 2);
+      assert.equal(calls[1].parse_mode, undefined);
+      assert.equal(calls[1].text, "pw");
+    } finally {
+      mock.restoreAll();
+    }
+  });
+
+  test("sendMessage: an HTML send that fails for any other reason still throws", { skip: SKIP }, async () => {
+    mock.method(globalThis, "fetch", async () => new Response("Bad Request: chat not found", { status: 400 }));
+    try {
+      const adapter = new TelegramNotificationAdapter({ botToken: "bot-token", superAdminChatId: "391627336", db: pool });
+      await assert.rejects(
+        () => adapter.sendMessage({ chatId: "777000111", text: "<code>pw</code>", parseMode: "HTML", plainText: "pw" }),
+        /telegram sendMessage failed: HTTP 400/,
+      );
     } finally {
       mock.restoreAll();
     }

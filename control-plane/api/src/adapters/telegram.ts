@@ -89,21 +89,54 @@ export class TelegramNotificationAdapter implements NotificationAdapter {
     }
   }
 
-  /** A plain DM to an arbitrary chat id — no callback refs, no approval-flow bookkeeping. */
-  async sendMessage(params: { chatId: string; text: string }): Promise<void> {
-    const response = await fetch(`${TELEGRAM_API_ROOT}/bot${this.config.botToken}/sendMessage`, {
+  /**
+   * A DM to an arbitrary chat id — no callback refs, no approval-flow
+   * bookkeeping. Plain text unless `parseMode: "HTML"`, which the caller has
+   * escaped itself (companion-intro.ts does, over the whole message).
+   *
+   * If Telegram rejects HTML it could not parse, the same words go again as
+   * `plainText` with no parse_mode: the formatting is a nicety and the
+   * password is not, so a message must never be lost to its own markup.
+   */
+  async sendMessage(params: {
+    chatId: string;
+    text: string;
+    parseMode?: "HTML";
+    plainText?: string;
+  }): Promise<void> {
+    const post = (body: Record<string, unknown>) => fetch(`${TELEGRAM_API_ROOT}/bot${this.config.botToken}/sendMessage`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: params.chatId, text: params.text }),
+      body: JSON.stringify(body),
     });
-    if (!response.ok) {
+    let response = await post({
+      chat_id: params.chatId,
+      text: params.text,
+      ...(params.parseMode ? { parse_mode: params.parseMode } : {}),
+    });
+    if (!response.ok && params.parseMode) {
       const detail = await response.text().catch(() => "");
-      this.config.log?.(structuredLog("error", "telegram.send_message_failed", {
-        status: response.status,
-        detail: detail.slice(0, 300),
-      }));
-      throw new Error(`telegram sendMessage failed: HTTP ${response.status}`);
+      if (response.status === 400 && detail.toLowerCase().includes("can't parse entities")) {
+        this.config.log?.(structuredLog("warn", "telegram.send_message_html_fallback", {
+          status: response.status,
+        }));
+        response = await post({ chat_id: params.chatId, text: params.plainText ?? params.text });
+      } else {
+        this.failSend(response.status, detail);
+      }
     }
+    if (!response.ok) {
+      this.failSend(response.status, await response.text().catch(() => ""));
+    }
+  }
+
+  private failSend(status: number, detail: string): never {
+    this.config.log?.(structuredLog("error", "telegram.send_message_failed", {
+      status,
+      // Telegram's error body is safe to include verbatim, as above.
+      detail: detail.slice(0, 300),
+    }));
+    throw new Error(`telegram sendMessage failed: HTTP ${status}`);
   }
 }
 

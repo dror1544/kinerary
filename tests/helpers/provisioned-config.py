@@ -157,6 +157,7 @@ def provisioned(phases, language, **overrides):
         config, "Japan", http=FakeHttp(), pause=0,
         consular_lookup=lambda dest, home: CONSULAR,
         venue_lookup=lambda dest, names: {"teamlab planets": "https://www.teamlab.art/e/planets/"},
+        destination_info_lookup=lambda country: DESTINATION_INFO,
     )
 
 

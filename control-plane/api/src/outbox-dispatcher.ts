@@ -1,7 +1,7 @@
 import type pg from "pg";
 import type { NotificationAdapter } from "./signup.js";
 import { structuredLog } from "./redaction.js";
-import { organizerIntroMessages, type ProactiveSettings } from "./companion-intro.js";
+import { organizerIntroMessages, type IntroMessage, type ProactiveSettings } from "./companion-intro.js";
 import { issueGroupBindingToken } from "./group-binding.js";
 
 interface OutboxRow {
@@ -86,7 +86,7 @@ function operatorMessageTextFor(row: OutboxRow): string | null {
  * notification_type this dispatcher doesn't know how to word yet (the row is
  * marked 'skipped', not retried forever).
  */
-function messageTextFor(row: OutboxRow, options?: DispatchOptions): string | string[] | null {
+function messageTextFor(row: OutboxRow, options?: DispatchOptions): string | IntroMessage[] | null {
   if (row.notification_type.startsWith("operator_")) return operatorMessageTextFor(row);
   if (row.notification_type === "provisioning_complete" || row.notification_type === "companion_ready") {
     const url = row.payload && typeof row.payload.private_url === "string" ? row.payload.private_url : null;
@@ -150,6 +150,12 @@ export interface DispatchOptions {
    * that paragraph.
    */
   botUsername?: string | null;
+  /**
+   * Asked for the handle when `botUsername` is absent (see `bot-username.ts`):
+   * a profile without `web.telegram_bot_username` must not silently lose the
+   * add-to-group link. A null or a throw is logged, never swallowed quietly.
+   */
+  resolveBotUsername?: () => Promise<string | null>;
   /** How long an issued group-binding token stays valid. Defaults to 30 days. */
   groupBindingTtlSeconds?: number;
   /**
@@ -206,7 +212,27 @@ export async function dispatchPendingTripNotifications(
         }));
       }
     }
-    const text = messageTextFor(row, { ...options, groupBindingToken });
+    // The add-to-group link needs the bot's handle. Only the companion
+    // introduction carries that link, so only it asks — and when no handle can
+    // be had the introduction still goes (the manual /group line still works),
+    // but the missing link is said out loud: it used to vanish without a trace.
+    let botUsername = options?.botUsername ?? null;
+    if (!botUsername && row.notification_type === "companion_ready" && options?.resolveBotUsername) {
+      try {
+        botUsername = await options.resolveBotUsername();
+      } catch (error) {
+        log(structuredLog("warn", "outbox.bot_username_resolver_threw", {
+          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        }));
+      }
+    }
+    if (!botUsername && row.notification_type === "companion_ready") {
+      log(structuredLog("warn", "outbox.bot_username_unavailable", {
+        notification_id: row.id,
+        effect: "introduction sent without the one-tap add-to-group link",
+      }));
+    }
+    const text = messageTextFor(row, { ...options, botUsername, groupBindingToken });
     if (!row.recipient || !text || (Array.isArray(text) && text.length === 0)) {
       await db.query(
         "UPDATE control_plane.notification_outbox SET state = 'skipped', updated_at = now() WHERE id = $1 AND state = 'pending'",
@@ -215,16 +241,24 @@ export async function dispatchPendingTripNotifications(
       continue;
     }
     try {
-      // A list when the introduction hands over a group-binding token: the
-      // token goes in its own message so it is one long-press and one Copy,
-      // rather than a drag-select across a paragraph on a phone.
+      // A list when the introduction hands over a group-binding token and/or a
+      // password: each goes in its own message so it is one long-press and one
+      // Copy, rather than a drag-select across a paragraph on a phone (a
+      // `<code>` span in the introduction does not copy on tap on every client).
+      // Order: introduction, binding line, password.
       //
       // Sent in order, and the row is only marked sent once ALL of them are.
-      // A retry may therefore repeat the prose — which is the right trade:
-      // a duplicated paragraph is noise, while a token that never arrived is
-      // an organizer who cannot set up their group at all.
-      for (const part of Array.isArray(text) ? text : [text]) {
-        await notification.sendMessage({ chatId: row.recipient, text: part });
+      // A retry therefore repeats every part, the password message included —
+      // which is the right trade: a duplicated paragraph is noise, while a
+      // token or password that never arrived is an organizer who cannot set up
+      // their group or log in at all.
+      for (const part of Array.isArray(text) ? text : [{ text } as IntroMessage]) {
+        await notification.sendMessage({
+          chatId: row.recipient,
+          text: part.text,
+          ...(part.parseMode ? { parseMode: part.parseMode } : {}),
+          ...(part.plainText !== undefined ? { plainText: part.plainText } : {}),
+        });
       }
       await db.query(
         "UPDATE control_plane.notification_outbox SET state = 'sent', sent_at = now(), updated_at = now() WHERE id = $1",

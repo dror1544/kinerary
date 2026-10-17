@@ -31,7 +31,7 @@ import {
   PENDING_ATTACHMENTS_PER_SENDER,
   PendingAttachments,
 } from "../src/relay/pending-attachments.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -155,7 +155,7 @@ interface Fixture {
 }
 
 async function withGroupTrip(fn: (fix: Fixture) => Promise<void>): Promise<void> {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");
@@ -250,7 +250,7 @@ describe("a document and the instruction that follows it", () => {
 
       assert.equal(decision.kind, "to_gateway");
       if (decision.kind !== "to_gateway") return;
-      assert.equal(decision.event.text, "ליב, שלבי את המסלול באתר", "the instruction is the turn's text");
+      assert.ok(decision.event.text.endsWith("ליב, שלבי את המסלול באתר"), "the instruction is the turn text (after the addressed mark)");
       assert.equal(decision.event.message_type, "document");
       assert.equal(decision.event.media_urls?.length, 1);
       assert.equal(decision.event.media?.[0]?.filename, "japan-itinerary.pdf");
@@ -423,7 +423,7 @@ describe("a document and the instruction that follows it", () => {
       const decision = await send(groupMessage(NIR, { document: ITINERARY, caption: "Liv, add this" }));
       assert.equal(decision.kind, "to_gateway");
       if (decision.kind !== "to_gateway") return;
-      assert.equal(decision.event.text, "Liv, add this");
+      assert.ok(decision.event.text.endsWith("Liv, add this"), "the caption is the turn text (after the addressed mark)");
       assert.equal(decision.event.media?.[0]?.caption, "Liv, add this");
       assert.deepEqual(media.fetched, [ITINERARY.file_id]);
     });

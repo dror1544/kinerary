@@ -130,6 +130,54 @@ Multiple concurrent sessions (a local agent and a remote connector at the
 same time) are supported — each `/sse` connection gets its own MCP server
 instance server-side.
 
+## Stop tools — changing the trip's structure after the interview
+
+A trip's *stops* — the places it is made of, with their nights and where the
+family sleeps — used to be fixed when the interview ended. Five tools change them.
+Each is one call to a stop route of the trip site (organizer/agent only; design in
+[FRAMEWORK.md](../FRAMEWORK.md#stops-after-the-interview--the-override-layer)), and
+the route is the authority on every rule, so a refusal reaches the model whole.
+They are on this server (the companion's bridge, `mcp.js`) and, on an organizer's
+write connection, on the site's own connector ([below](#trip-connector-claude-chatgpt));
+the connector's versions take no `revision` argument.
+
+| Tool | Arguments | Does |
+|---|---|---|
+| `get_stops` | none | The stops as the site shows them, each with `kind` (`config`, `added`, or `computed` — the "days not planned yet" block, which is not a stop), what was overridden and by whom, a `conflict` when a rebuild changed something already changed, `booking_out_of_sync`, plus the trip's dates and a `revision` (`st-N`) |
+| `update_stop` | `phase_id`; `start`/`end` (YYYY-MM-DD); `title_he`/`title_en`; `accommodation` (replaces the whole object, `null` removes it); `on_outside`; `revision` | Change a stop's nights, title and/or accommodation. Give only what changes: one of `start`/`end`, or one language of the title, keeps the other |
+| `split_stop` | `phase_id`; `at_date`; `title_he`/`title_en` (one required); `accommodation`; `booking_id`; `revision` | End the stop on `at_date` and create the next stop from it; plan items and headlines after `at_date` move with it. With `booking_id` the hotel is then linked to the new stop; if only that link is refused the split stands and the result says so under `booking_link` |
+| `set_stop_from_booking` | `phase_id`; `booking_id`; `add_checkin_checkout` (default true); `on_outside`; `revision` | Make an approved hotel booking the stop's: its dates become check-in to check-out, its accommodation the hotel (name, confirmation, map link), and one check-in and one check-out item go on the plan, once however often it is repeated |
+| `move_plan_day` | `from_phase_id`; `date`; `to_phase_id`; `headline` (`keep_target` or `take_source`) | Move a whole day of the active plan — items and headline — to another stop; its date does not change (`swap_plan_days` exchanges two dates inside one stop) |
+
+**A hotel booking does not change a stop.** `add_booking` and `update_booking` record
+a reservation and nothing more; the tool descriptions say so. The link is
+`set_stop_from_booking`, and it is explicit: nothing guesses which stop a hotel is
+for. After editing a booked hotel's dates, `get_stops` reports the stop
+`booking_out_of_sync` until `set_stop_from_booking` is called again.
+
+What the stop tools refuse (each with a message that says what to do next): dates
+outside the trip's own dates (the trip is never extended); a range that would leave
+plan items outside the stop — the refusal lists them, and only after the organizer
+chooses is the call resent with `on_outside` `keep` or `move_to:<stop id>`; a PIN or
+door code anywhere in a stop; text with `<`, `>` or control characters, and links that
+are not plain http(s) addresses; a stop with no dates (for a split); a booking that is
+a draft, is not a hotel, has no dates, is filed under another stop, or already shapes
+another stop; the computed block as a target; a `revision` that is out of date (read
+`get_stops` again). `"` in a title is kept as typed. The stop tools return the
+effective stop, and the instructions tell the companion to read it back to the
+organizer rather than trust the success.
+
+**Write refusals now carry both languages.** `add_booking`, `update_booking` and
+`add_participant` call routes that check the text they are given
+(`server/text-rules.js`): `<`, `>` and control characters (a line break only in
+`notes`), links that are not full http(s) addresses, dates that are not a real
+`YYYY-MM-DD`, over-long values. Quotes, `&` and emoji are text and are stored as typed.
+A refusal is a 400 with `{ error, field, message: { he, en }, detail }`. This server
+hands the model the whole refusal (it would otherwise be cut at 300 characters
+mid-message) and tells it to relay `message.he` or `message.en` in the organizer's
+language and not to guess a fix to their text. The site's connector does the same.
+Nothing is saved when a field is refused, and nothing is rewritten.
+
 ## Trip connector (Claude, ChatGPT)
 
 The trip site itself serves an MCP endpoint at `<site>/mcp` for **everyone on
@@ -153,7 +201,17 @@ The site's **More** tab has a "Connect your AI assistant" card:
 The card also lists connected assistants with **Disconnect**: organizers see
 everyone's, anyone else sees their own.
 
-**Turning it on for a trip** — both in that trip's `.env`, then restart:
+**Trips the control plane builds have it on** — the container bootstrap
+(`provisioning/adapters.py`) writes both lines below into a new trip's `.env`,
+with `PUBLIC_ORIGIN` taken from the trip's own public hostname (the one NPM and
+the tunnel serve it on). It is written only when the `.env` is first created, so
+a trip built before this existed, or by hand, still needs the lines added; its
+nginx also needs the `/mcp`, `/oauth/` and `/.well-known/oauth-` blocks the
+same template carries. Members sign in on the consent page with a site password
+or Google, so a trip with neither (random seeded passwords, no
+`GOOGLE_CLIENT_ID`) can show the card yet have nobody able to approve.
+
+**Turning it on for a trip by hand** — both in that trip's `.env`, then restart:
 
 ```
 TRIP_MCP_ENABLED=1
@@ -201,15 +259,25 @@ three `location` blocks added (copy them from `provisioning/adapters.py`).
   and the person's current role: an organizer who is demoted drops to read
   only, a member who is promoted stays read only until they approve again, and
   someone removed from the trip loses the connection. A read-only connection is
-  never offered a write tool or the organizer briefing.
-- Other people reach the assistant as username, name and colour only: the
-  connector strips Telegram ids, ages and emails from RSVP and comment rows,
-  whatever the underlying route returns.
+  never offered a write tool or the organizer briefing. The narrowing is applied
+  when the connection is next used: one that was not used while its organizer
+  was demoted keeps its stored write scope, so it writes again if they are
+  promoted back.
+- An assistant sees what the site shows the person who connected, and no more.
+  In RSVP and comment rows other people appear as username, name and colour
+  only: the connector strips Telegram ids, ages and emails there, whatever the
+  underlying route returns. In `get_config`, the lost-and-found list and the
+  bookings they appear exactly as on the site, which includes participants'
+  ages, families and group-visible needs, emergency-contact and accommodation
+  phone numbers, and a lost-and-found reporter's name and phone (the reporter
+  need not be on the trip). No tool returns another person's Telegram id or
+  Google email (checked on the sprint-6 tree, 2026-09-26).
 - Tokens are opaque and stored hashed. An MCP token is not a site session and a
   site session is not an MCP token.
-- Tools call the site's own routes **as the organizer** (a two-minute session
-  minted per call, over loopback), never with the agent key. Every route's own
-  checks apply and every change is recorded under the organizer's name.
+- Tools call the site's own routes **as the person who connected** (a
+  two-minute session minted per call, over loopback), never with the agent key.
+  Every route's own checks apply and every change is recorded under that
+  person's name.
 - The tool set is narrower than `mcp.js`: no companion-channel tools, no
   password resets, login links or Telegram bindings (`add_participant` drops
   the enrollment token; the organizer sends the link from the site), nothing

@@ -14,7 +14,7 @@ import {
   promoteRelease,
   registerCandidateRelease,
 } from "../src/release-registry.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const DB_URL = testDatabaseUrl();
 const SKIP = !DB_URL;
@@ -65,7 +65,7 @@ describe("release registry + promotion", () => {
 
   before(async () => {
     if (SKIP) return;
-    pool = new pg.Pool({ connectionString: DB_URL, max: 5 });
+    pool = testPool({ max: 5 });
     const client = await pool.connect();
     try { await applyMigrations(client, migrationsDir); } finally { client.release(); }
   });

@@ -78,6 +78,34 @@ agent:
     - terminal
     - code_execution
 
+# `write_file`, `patch` and `skill_manage` are deliberately NOT in
+# disabled_toolsets above — the companion still needs read_file,
+# search_files, skill_view and memory, and disabling a whole toolset would
+# take those too. Measured against real fleet usage (`tool usage`, #312/#313,
+# 2026-09-29): the three WRITE actions have no legitimate use on a trip
+# companion. write_file/patch: zero calls, ever. skill_manage: one call,
+# ever — the companion writing itself an undesired workaround skill, not a
+# designed use.
+#
+# `skill_manage`'s create/edit/patch/delete/write_file/remove_file actions go
+# through Hermes's own approval gate (tools/write_approval.py) when this is
+# on: instead of applying, the write is STAGED (under
+# <profile>/pending/skills/<id>.json) and nothing auto-approves it, so a
+# prompt-injected document or a wrong inference can propose a skill change but
+# never land one. read_file, search_files, skill_view and memory are
+# unaffected — only the write actions of skill_manage are gated.
+#
+# write_file/patch are a separate code path this gate does not reach
+# (tools/skill_manager_tool.py writes via atomic_write_text, not through
+# write_approval). Those two are confined instead by HERMES_WRITE_SAFE_ROOT,
+# set in the profile's .env at enrollment time — not here, see
+# scripts/companion-install-host.sh's enroll_relay(). Scoped to a directory
+# nothing legitimate ever writes into, so a write anywhere else — another
+# profile's config.yaml, this profile's own skill files — is hard-denied by
+# Hermes itself (agent/file_safety.py) rather than staged.
+skills:
+  write_approval: true
+
 # Sessions must NOT accumulate forever, and Hermes will not stop them on its
 # own: SessionResetPolicy defaults to mode "none" — "sessions never auto-reset
 # unless the user opts in" (changed from "both" in July 2026 because permanent

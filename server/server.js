@@ -11,11 +11,17 @@ const Database = require('better-sqlite3');
 const { OAuth2Client } = require('google-auth-library');
 const livingJourney = require('./living-journey');
 const { createTripEvents } = require('./trip-events');
+const { createTripStructure } = require('./trip-structure');
+const { createHotelPlaces } = require('./hotel-place');
 const { createControlPlaneAuth } = require('./control-plane-auth');
 const { NEED_TYPES, NEED_SEVERITIES, VISIBILITIES, normalizeSeverity, normalizeVisibility } = require('../shared/needs-schema');
 const { AGENT_TONES, AGENT_GENDERS, PROACTIVE_KEYS, normalizeInstructionVisibility, normalizeTone, normalizeGender, normalizeOrganizers } = require('../shared/agent-schema');
 const { repairDayStamp, stampRest } = require('../shared/day-stamp');
 const { projectConfig, publicConfig, publicPart } = require('../shared/config-visibility');
+const { publicUser } = require('./public-user');
+const textRules = require('./text-rules');
+const { rateLimitKey } = require('./client-address');
+const { createFileTokens, createShareTokens } = require('./file-token');
 
 const app = express();
 // Default (100kb) is too small for /api/bookings/extract, which the browser
@@ -59,6 +65,10 @@ app.use('/modern', express.static(path.join(SITE_DIR, 'modern'), { index: 'index
 const IMMICH_URL    = (process.env.IMMICH_URL || '').replace(/\/$/, '');
 const IMMICH_KEY    = process.env.IMMICH_API_KEY || '';
 const JWT_SECRET    = process.env.JWT_SECRET || 'trip-dev-secret-change-me';
+// Signed, short-lived photo-file links (server/file-token.js) — keyed from JWT_SECRET.
+const fileTokens = createFileTokens(JWT_SECRET);
+// Non-expiring capability links for /photo/:id (server/file-token.js), a different label.
+const shareTokens = createShareTokens(JWT_SECRET);
 const HERMES_KEY    = process.env.HERMES_API_KEY || '';
 // Optional shared onboarding password for a fresh DB's seeded users. Leave
 // unset in production once Telegram/Google login is live — each participant
@@ -66,6 +76,25 @@ const HERMES_KEY    = process.env.HERMES_API_KEY || '';
 // default (see initData()).
 const SEED_PASSWORD = process.env.SEED_PASSWORD || '';
 const AGENT_USER    = { username: 'hermes', name: 'Hermes', family: 'system', isAgent: true };
+
+// Constant-time comparison for a caller-supplied secret against a configured
+// one (#184). Plain `===` on the raw strings leaks a timing signal proportional
+// to how many leading bytes match, and crypto.timingSafeEqual() throws outright
+// on a length mismatch — which itself would leak the real key's length unless
+// every caller handled that branch identically. Hashing both sides to a fixed
+// 32-byte SHA-256 digest first sidesteps both: the digests being compared are
+// always the same length regardless of what the caller sent, so
+// timingSafeEqual() never throws and the comparison's cost is the same
+// whether the supplied value is empty, too short, too long, or byte-for-byte
+// wrong. `expected` empty means the feature is unconfigured — refuse without
+// ever touching the (irrelevant) supplied value's content.
+function timingSafeKeyMatch(supplied, expected) {
+  if (!expected) return false;
+  const suppliedStr = typeof supplied === 'string' ? supplied : '';
+  const suppliedDigest = crypto.createHash('sha256').update(suppliedStr).digest();
+  const expectedDigest = crypto.createHash('sha256').update(expected).digest();
+  return crypto.timingSafeEqual(suppliedDigest, expectedDigest);
+}
 
 // Optional: "Sign in with Google" as an alternate login method bound to an
 // already-predefined user (see /api/auth/google-link). Unset → feature is
@@ -320,6 +349,7 @@ db.exec(`
     amount      REAL NOT NULL DEFAULT 0,
     is_estimate INTEGER DEFAULT 0,
     seed_key    TEXT UNIQUE,
+    created_by  TEXT,
     created_at  TEXT DEFAULT (datetime('now'))
   );
 
@@ -337,7 +367,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS bookings (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     phase        TEXT NOT NULL,
-    type         TEXT NOT NULL CHECK(type IN ('flight','hotel','car','attraction','other')),
+    type         TEXT NOT NULL CHECK(type IN (${textRules.BOOKING_TYPES.map(t => `'${t}'`).join(',')})),
     name         TEXT NOT NULL,
     date_from    TEXT,
     date_to      TEXT,
@@ -367,6 +397,19 @@ for (const [col, decl] of [
   ['review_status', "TEXT NOT NULL DEFAULT 'approved'"],
 ]) {
   try { db.exec(`ALTER TABLE bookings ADD COLUMN ${col} ${decl}`); } catch {}
+}
+
+// Issue #173: budget_items had no owner column at all, so PATCH/DELETE could
+// only ever be all-or-nothing (authRequired) rather than row-scoped. NULL —
+// not a sentinel string — is deliberate: every row that predates this column
+// (seeded at boot, or written by an already-deployed server) has no creator
+// to attribute, and NULL is exactly what "nobody recorded" should mean. No
+// backfill is possible or attempted; the row-ownership check below treats a
+// NULL created_by as organizer/agent-only rather than everyone's or nobody's.
+for (const [col, decl] of [
+  ['created_by', 'TEXT'],
+]) {
+  try { db.exec(`ALTER TABLE budget_items ADD COLUMN ${col} ${decl}`); } catch {}
 }
 
 // ── TRIP CONFIG VERSIONING ────────────────────────────────────────────────────
@@ -407,6 +450,16 @@ try { db.exec('ALTER TABLE users ADD COLUMN google_email TEXT'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN google_picture TEXT'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN telegram_id TEXT'); } catch {}
 try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id) WHERE telegram_id IS NOT NULL'); } catch {}
+// #279: DELETE /api/agent/participants/:username revokes access (scrambles
+// the password, clears telegram_id) but never deletes the users row —
+// photos/bookings/ratings reference the username by text, so a hard delete
+// would orphan that history. Without a marker, that left nothing to stop a
+// later reset-password from handing the same row a fresh working password,
+// exactly as if the delete had never happened. NULL means "never removed";
+// set once, at delete time, and never cleared — removal is permanent short
+// of re-provisioning under a fresh username, not something this column is
+// meant to undo.
+try { db.exec('ALTER TABLE users ADD COLUMN removed_at TEXT'); } catch {}
 try { db.exec(`CREATE TABLE IF NOT EXISTS phase_plan_items (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   phase_id     TEXT NOT NULL,
@@ -680,6 +733,9 @@ dataReady.catch(console.error);
 const controlPlaneAuth = createControlPlaneAuth({ app, db, tripDir: TRIP_DIR, config: () => TRIP_CONFIG, ready: dataReady, jwtSecret: JWT_SECRET });
 
 // ── HELPERS ───────────────────────────────────────────────────────────────────
+// The caller's OWN record, whole minus the password hash — /api/auth/me and
+// nothing else. Anything attached to ANOTHER member's activity goes through
+// publicUser() (server/public-user.js), an allow-list (#191).
 function getUser(username) {
   const u = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
   if (!u) return null;
@@ -691,7 +747,7 @@ function getUser(username) {
 function authRequired(req, res, next) {
   // API key path — for the hermes agent (non-user service account)
   const apiKey = req.headers['x-api-key'];
-  if (HERMES_KEY && apiKey === HERMES_KEY) {
+  if (timingSafeKeyMatch(apiKey, HERMES_KEY)) {
     req.user = AGENT_USER;
     return next();
   }
@@ -749,7 +805,11 @@ function sanitizeConfig(cfg) {
 })();
 
 app.get('/api/config', authRequired, (_req, res) => {
-  const safe = sanitizeConfig(TRIP_CONFIG);
+  // The stop layer is merged in FIRST, then the allow-list applies to the
+  // result exactly as it applies to the file (server/trip-structure.js).
+  // A hotel the stop layer wrote is resolved to its map and Waze links first
+  // (server/hotel-place.js); the allow-list then applies to the result as ever.
+  const safe = sanitizeConfig(hotelPlaces.hydrateConfig(effectiveConfig()));
   safe.trivia_available = TRIVIA_QUESTIONS.length > 0;
   // Every reload must see this deploy's config, not a stale copy some
   // intermediary (browser, Cloudflare, a reverse proxy in front of it)
@@ -837,6 +897,30 @@ app.get('/api/config/roster', (_req, res) => {
   res.json({ participants: roster });
 });
 
+// #review 2026-10-03 [P2]: the verification worker's rendered_data check
+// compared the roster above against the deploying plan's expected
+// participants, but two trips for the SAME family can share an identical
+// roster — a private_url misrouted to a sibling trip, or a stale deployment
+// of one, would still pass. Originally served departure/returnDate, since
+// those cannot collide between two distinct real trips for one family the
+// way a roster can.
+//
+// #review 2026-10-06 [N1], PR review before the sprint-6 -> main merge: that
+// served the family's actual travel dates with no authentication — anyone
+// who knew the hostname learned exactly when the family is away. A hash of
+// the dates would not have fixed it: there are only a few thousand plausible
+// departure/return pairs, trivially brute-forced with no secret salt. Now
+// serves `deploymentNonce` instead — an opaque value carrying no information
+// about the trip, generated fresh per render (transformer.py) and compared
+// by the worker against the one it just generated for THIS deploy. Still its
+// own route rather than folded into /api/config/roster above, for the same
+// reason as before: that route's own comment says its whole point is "the
+// four fields a login picker needs," and this exists for a different reason.
+app.get('/api/config/deployment-identity', (_req, res) => {
+  const meta = publicConfig(TRIP_CONFIG).meta || {};
+  res.json({ deploymentNonce: meta.deploymentNonce ?? null });
+});
+
 // Stage 1 groundwork: read-only access to stored config history for a future
 // diff view. Content is scrubbed the same way as /api/config; authRequired
 // here is defense-in-depth, not the safety boundary.
@@ -865,7 +949,7 @@ app.get('/api/config/warnings', authRequired, (_req, res) => {
 //     organizer-only needs at all — they were stored and visible to nobody.
 function organizerOrAgentRequired(req, res, next) {
   const apiKey = req.headers['x-api-key'];
-  if (HERMES_KEY && apiKey === HERMES_KEY) { req.user = AGENT_USER; return next(); }
+  if (timingSafeKeyMatch(apiKey, HERMES_KEY)) { req.user = AGENT_USER; return next(); }
 
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : (req.query._t || null);
@@ -884,9 +968,44 @@ function organizerOrAgentRequired(req, res, next) {
   next();
 }
 
+// #184 — the agent key authenticates a service account, not a person: unlike
+// an organizer's own JWT (which proves a specific browser session that person
+// logged into), the key alone proves nothing about who is actually asking.
+// Three agent routes below let the caller act ON a username that names a
+// configured organizer — reset-password, telegram rebind, and (boundary
+// review on PR #274, finding A) participant creation, where the target
+// "already exists" only after this call returns — and in every one, acting
+// through the agent key alone is how #184 took the account over outright:
+// mint a reset token with only the key, redeem it via /api/auth/enroll
+// (which needs no session at all), then log in as the organizer. Route
+// through this before doing anything organizer-specific. req.user.isAgent is
+// only ever true on the X-API-Key path (see AGENT_USER above) — an
+// organizer's own session reaching the same route is unaffected.
+function agentActingOnOrganizer(req, uname) {
+  return Boolean(req.user?.isAgent) && normalizeOrganizers(TRIP_CONFIG.agent).includes(uname);
+}
+
+// One answer to "where is this hotel": name, Google Maps, Waze — the same on
+// every screen (server/hotel-place.js). Lazy over the stop layer, which is
+// created below: nothing here is called before the server is listening.
+const hotelPlaces = createHotelPlaces({
+  getConfig: () => effectiveConfig(),
+  sources: () => tripStructure.accommodationSources(),
+  // An APPROVED booking only: a draft is organizer-private and shapes nothing.
+  bookingById: (id) => db.prepare("SELECT id, type, name, phase, location_url FROM bookings WHERE id = ? AND COALESCE(review_status, 'approved') = 'approved'").get(id) || null,
+});
+
 const journey = livingJourney.create({
+  hotelPlaces,
   db,
+  // The FILE: what the original plan is imported from at first boot.
   config: TRIP_CONFIG,
+  // The trip as it is now — every route reads this one (server/trip-structure.js).
+  getConfig: () => effectiveConfig(),
+  phaseKnown: (id) => tripStructure.isPhase(id),
+  stopKnown: (id) => tripStructure.isStop(id),
+  onPhasesReshuffled: (phaseIds) => { for (const id of new Set(phaseIds)) queuePhaseReview(id); kickEnrichmentSoon(); },
+  reviewConfigured: () => Boolean(HERMES_URL),
   raw: TRIP_CONFIG_RAW,
   fetchImpl: fetch,
   mediaDir: MEDIA_DIR,
@@ -909,8 +1028,46 @@ const journey = livingJourney.create({
   },
 });
 
-// Install after livingJourney creates its tables. This runtime and its auth
-// credentials belong to exactly one trip; clients cannot select another DB.
+// ── STOP EDITING AFTER THE INTERVIEW ─────────────────────────────────────────
+// The provisioner rewrites trip.config.json on every rebuild; the trip's stops
+// (their dates, their hotel, stops split off them) are edited in this SQLite
+// instead and merged over the file here. effectiveConfig() is what every
+// reader of the trip's phases uses; anything served to a member still goes
+// through sanitizeConfig() on it, so the allow-list is unchanged. The file
+// itself (TRIP_CONFIG) stays what the original plan, participants, agent and
+// meta are read from — the layer never changes those.
+const tripStructure = createTripStructure({
+  db,
+  baseConfig: () => TRIP_CONFIG,
+  journey: () => journey,
+  queuePhaseReview: (id) => queuePhaseReview(id),
+  reviewConfigured: () => Boolean(HERMES_URL),
+});
+function effectiveConfig() {
+  return tripStructure.effectiveConfig();
+}
+// A rebuild that drops a stop an organizer edited leaves its override with
+// nothing to apply to; it is not served. Say so at boot rather than let the
+// edit vanish quietly: ids in the log (organizer-only by definition), a count
+// in /api/config/warnings (every member reads it; a stop id is authored text).
+(() => {
+  const orphans = tripStructure.orphanedOverrides();
+  if (!orphans.length) return;
+  console.warn(`stop overrides: ${orphans.length} refer to a stop trip.config.json no longer has — not served: ${orphans.join(', ')}`);
+  CONFIG_WARNINGS.push({ scope: 'stops', issue: `${orphans.length} stop override(s) refer to a stop the config no longer has (stop ids in the server log)` });
+})();
+function knownPhase(id) {
+  return tripStructure.isPhase(id);
+}
+// Bookings also file under the two trip-wide buckets every client offers.
+const BOOKING_TRIP_WIDE_PHASES = new Set(['intl_flights', 'general']);
+function knownBookingPhase(id) {
+  return typeof id === 'string' && (BOOKING_TRIP_WIDE_PHASES.has(id) || knownPhase(id));
+}
+
+// Install after livingJourney and the stop layer create their tables. This
+// runtime and its auth credentials belong to exactly one trip; clients cannot
+// select another DB.
 const tripEvents = createTripEvents(db);
 app.get('/api/events', authRequired, (req, res) => {
   const header = req.headers.authorization || '';
@@ -950,6 +1107,9 @@ app.post('/api/ui-settings/hero', organizerOrAgentRequired, heroUpload.single('h
 });
 
 journey.registerRoutes(app, { authRequired, organizerOrAgentRequired });
+// GET /api/stops and the stop writes: organizer or agent only — provenance,
+// conflicts and history are never served to a member.
+tripStructure.registerRoutes(app, { organizerOrAgentRequired });
 require('./companion-conversation').registerCompanionConversation({ app, db, authRequired, organizerOrAgentRequired });
 require('./companion-control').registerCompanionControl({ app, authRequired, organizerOrAgentRequired, fetchImpl: fetch });
 // A trip member's own Claude or ChatGPT (organizers read and write, everyone
@@ -963,8 +1123,8 @@ try { require('./trip-mcp').registerTripMcp({
   organizers: () => normalizeOrganizers(TRIP_CONFIG.agent),
   userExists: username => Boolean(getUser(username)) && (TRIP_CONFIG.participants || []).some(p => p.username === username),
   // Never the raw config: whatever the connector says about the trip is what
-  // /api/config already says to a signed-in member.
-  getPublicConfig: () => sanitizeConfig(TRIP_CONFIG),
+  // /api/config already says to a signed-in member — the trip as it is now.
+  getPublicConfig: () => sanitizeConfig(hotelPlaces.hydrateConfig(effectiveConfig())),
   authRequired,
   listenPort: process.env.PORT || 3000,
   listenHost: process.env.HOST,
@@ -1040,10 +1200,48 @@ const ENROLLMENT_TTL_MS = 30 * 60 * 1000;
 // collected here or in chat.
 app.post('/api/agent/participants', organizerOrAgentRequired, async (req, res) => {
   const { username, name, name_en, color, family, telegram_id } = req.body || {};
-  if (!username || !name) return res.status(400).json({ error: 'missing_fields' });
+  if (!username || !name) {
+    return res.status(400).json(!name && username ? textRules.requiredRefusal('missing_fields', 'name', textRules.PARTICIPANT_FIELDS) : { error: 'missing_fields' });
+  }
   const uname = String(username).toLowerCase().trim();
   if (!/^[a-z0-9_-]+$/.test(uname)) return res.status(400).json({ error: 'invalid_username' });
+  // #213: color reaches the classic client's inline `style="background:${color}"`
+  // on every participant-carrying surface (RSVP chip, reaction tooltip,
+  // pg-avatar/vc-avatar). The renderer now escapes and falls back to a
+  // neutral default too, but refusing an unrecognized value here means a bad
+  // color never reaches trip.config.json in the first place.
+  if (color != null && color !== '' && !/^#[0-9a-fA-F]{3,8}$/.test(color)) {
+    return res.status(400).json({ error: 'invalid_color' });
+  }
+  // Names are shown on every participant-carrying surface and written into
+  // trip.config.json: refused at the write if they carry < > or control
+  // characters, with the reason in Hebrew and English (server/text-rules.js).
+  // Quotes are text — אבי "הגדול" is stored as typed.
+  if (textRules.isBlank(name)) return res.status(400).json(textRules.requiredRefusal('missing_fields', 'name', textRules.PARTICIPANT_FIELDS));
+  const names = textRules.checkFields(req.body, textRules.PARTICIPANT_FIELDS);
+  if (names.error) return res.status(400).json(names.error);
+  // #184 (boundary review on PR #274, finding A): if trip.config.json's
+  // agent.organizers names a username with no seeded participant row yet,
+  // the normal `username_taken` check below does nothing to stop the agent
+  // key from CREATING that account — and the row it creates is a full
+  // organizer (organizerOrAgentRequired admits it exactly like the real one),
+  // which can then use agentActingOnOrganizer's own guard as a floor, not a
+  // ceiling: reset-password and telegram-rebind still refuse the agent key
+  // against the REAL organizer, but this freshly-created one is not the
+  // agent key acting on an organizer from this route's point of view — it's
+  // creating one. Not reachable through normal provisioning (`_resolve_organizers`
+  // and driver.mjs both refuse to produce an organizer name with no seeded
+  // participant), but a hand-built or legacy trip.config.json can still have
+  // one, so this is defense-in-depth, not a live path today.
+  if (agentActingOnOrganizer(req, uname)) {
+    return res.status(403).json({ error: 'organizer_credential_not_agent_resettable' });
+  }
 
+  // #279: this also already refuses to resurrect a removed username — DELETE
+  // never removes the row (see the removed_at column), so it still "exists"
+  // here and username_taken fires first. Confirmed by investigation, not
+  // changed: the actual live gap was reset-password, which checked only
+  // row-existence and is now gated on removed_at too.
   if (db.prepare('SELECT 1 FROM users WHERE username = ?').get(uname)) {
     return res.status(409).json({ error: 'username_taken' });
   }
@@ -1052,7 +1250,10 @@ app.post('/api/agent/participants', organizerOrAgentRequired, async (req, res) =
     return res.status(409).json({ error: 'telegram_id_taken' });
   }
 
-  const participant = { username: uname, name, name_en: name_en || null, color: color || null, family: family || null, telegram_id: tgId };
+  const participant = {
+    username: uname, name: names.values.name, name_en: names.values.name_en || null,
+    color: color || null, family: names.values.family || null, telegram_id: tgId,
+  };
 
   TRIP_CONFIG.participants = TRIP_CONFIG.participants || [];
   TRIP_CONFIG.participants.push(participant);
@@ -1086,8 +1287,28 @@ app.post('/api/agent/participants', organizerOrAgentRequired, async (req, res) =
 // user — the row already exists, only its password needs to change.
 app.post('/api/agent/participants/:username/reset-password', organizerOrAgentRequired, async (req, res) => {
   const uname = String(req.params.username).toLowerCase().trim();
-  if (!db.prepare('SELECT 1 FROM users WHERE username = ?').get(uname)) {
+  const existing = db.prepare('SELECT removed_at FROM users WHERE username = ?').get(uname);
+  if (!existing) {
     return res.status(404).json({ error: 'user_not_found' });
+  }
+  // #279: DELETE /api/agent/participants/:username never removes the users
+  // row (see the removed_at ALTER TABLE comment) — it only scrambles the
+  // password and clears telegram_id. Without this check, this was the one
+  // live path back in: the row still "exists" for the check above, so
+  // reset-password would mint a fresh, fully working enrollment token for a
+  // participant the organizer explicitly removed. Checked before the
+  // organizer-takeover guard below on purpose — a removed username has no
+  // credential to protect from the agent key either way, and the more
+  // specific refusal is the more honest one.
+  if (existing.removed_at) {
+    return res.status(409).json({ error: 'participant_removed' });
+  }
+  // #184: the agent has no legitimate need to reset an organizer's own
+  // credential, and letting it do so is a full account takeover — see
+  // agentActingOnOrganizer() above. The organizer resetting THEMSELVES
+  // through their own JWT session is unaffected.
+  if (agentActingOnOrganizer(req, uname)) {
+    return res.status(403).json({ error: 'organizer_credential_not_agent_resettable' });
   }
 
   // `to: 'trip_password'` — back to the password the trip was seeded with.
@@ -1136,6 +1357,16 @@ app.patch('/api/agent/participants/:username/telegram', organizerOrAgentRequired
   if (!participant || !db.prepare('SELECT 1 FROM users WHERE username = ?').get(uname)) {
     return res.status(404).json({ error: 'user_not_found' });
   }
+  // #184: rebinding an organizer's Telegram identity through the agent key
+  // alone is the same takeover shape as agent-key reset-password — it hands
+  // whoever holds the key (or, per verifyTelegramLogin's live membership
+  // check, whoever controls that Telegram account and is in the trip's group)
+  // a working login as the organizer, and silently breaks the organizer's own
+  // existing Telegram login in the process. The organizer rebinding their OWN
+  // Telegram identity through their own JWT session is unaffected.
+  if (agentActingOnOrganizer(req, uname)) {
+    return res.status(403).json({ error: 'organizer_credential_not_agent_resettable' });
+  }
   const conflict = db.prepare('SELECT username FROM users WHERE telegram_id = ? AND username != ?').get(tgId, uname);
   if (conflict) return res.status(409).json({ error: 'telegram_id_taken' });
 
@@ -1148,11 +1379,15 @@ app.patch('/api/agent/participants/:username/telegram', organizerOrAgentRequired
 
 // Removes a participant from the trip: drops them from trip.config.json and
 // revokes DB-level access (clears telegram_id, replaces the password with a
-// fresh unusable random hash) rather than deleting the users row outright —
-// photos/bookings/ratings reference the username by text, and a hard delete
-// would orphan that history. Blocks removing a currently-configured
-// organizer; that's a deliberate, separate decision, not something that
-// should fall out of a generic remove call.
+// fresh unusable random hash, stamps removed_at) rather than deleting the
+// users row outright — photos/bookings/ratings reference the username by
+// text, and a hard delete would orphan that history. #279: removed_at is
+// what keeps that revocation real — reset-password (and nothing else reached
+// through the agent key, see its own comment) refuses once it is set, so the
+// row's continued existence can no longer be used to hand this username a
+// fresh working login. Blocks removing a currently-configured organizer;
+// that's a deliberate, separate decision, not something that should fall out
+// of a generic remove call.
 app.delete('/api/agent/participants/:username', organizerOrAgentRequired, async (req, res) => {
   const uname = String(req.params.username).toLowerCase().trim();
   const idx = (TRIP_CONFIG.participants || []).findIndex(p => p.username === uname);
@@ -1166,7 +1401,10 @@ app.delete('/api/agent/participants/:username', organizerOrAgentRequired, async 
   persistConfigChange();
 
   const randomPasswordHash = await bcrypt.hash(crypto.randomBytes(24).toString('hex'), 10);
-  db.prepare('UPDATE users SET telegram_id = NULL, password = ? WHERE username = ?').run(randomPasswordHash, uname);
+  // #279: removed_at is what makes this revocation survive a later
+  // reset-password — see the ALTER TABLE comment above. Set unconditionally;
+  // there is no un-remove route, so this never needs to be cleared back.
+  db.prepare("UPDATE users SET telegram_id = NULL, password = ?, removed_at = datetime('now') WHERE username = ?").run(randomPasswordHash, uname);
 
   res.json({
     ok: true, username: uname,
@@ -1250,11 +1488,27 @@ require('./site-icons').registerSiteIcons(app, {
   tripDir: TRIP_DIR, siteDir: SITE_DIR, getLogo: () => TRIP_CONFIG.meta?.logo,
 });
 
+// Image extensions only. meta.logo is a config value, and realpath containment
+// alone still lets it name trip.config.json, .env or a script that sits INSIDE
+// the trip directory; the extension allow-list is what stops that.
+const LOGO_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp']);
+
 app.get('/api/trip/logo', (_req, res) => {
   const logoFile = TRIP_CONFIG.meta?.logo;
-  if (!logoFile) return res.status(404).end();
-  const logoPath = path.join(TRIP_DIR, logoFile);
-  if (!fs.existsSync(logoPath)) return res.status(404).end();
+  if (!logoFile || typeof logoFile !== 'string') return res.status(404).end();
+  // Public on purpose: the login page and the trivia TV screen draw it before
+  // any login. So the file must (1) resolve INSIDE the trip directory, symlinks
+  // followed (same check as site-icons.js) and (2) be an image by extension.
+  let logoPath;
+  try {
+    const root = fs.realpathSync(TRIP_DIR);
+    logoPath = fs.realpathSync(path.resolve(root, logoFile));
+    if (!logoPath.startsWith(root + path.sep)) return res.status(404).end();
+  } catch { return res.status(404).end(); }
+  const ext = path.extname(logoPath).toLowerCase();
+  if (!LOGO_EXTENSIONS.has(ext)) return res.status(404).end();
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  if (ext === '.svg') res.setHeader('Content-Security-Policy', 'sandbox');
   res.sendFile(logoPath);
 });
 
@@ -1421,11 +1675,15 @@ app.post('/api/auth/avatar/upload', authRequired,
 );
 
 // ── RATINGS ───────────────────────────────────────────────────────────────────
-app.get('/api/ratings', (_req, res) => {
+app.get('/api/ratings', authRequired, (_req, res) => {
   const rows = db.prepare('SELECT venue, username, stars FROM ratings').all();
-  const result = {};
+  // Null-prototype maps: a member chooses the venue id, and on a plain object
+  // `__proto__` IS Object.prototype — the next line would have written every
+  // rater's name onto every object in this process (boundary review
+  // 2026-10-11, finding 5; the same for the photo maps below).
+  const result = Object.create(null);
   for (const r of rows) {
-    if (!result[r.venue]) result[r.venue] = {};
+    if (!result[r.venue]) result[r.venue] = Object.create(null);
     result[r.venue][r.username] = r.stars;
   }
   res.json(result);
@@ -1439,18 +1697,32 @@ app.post('/api/ratings', authRequired, (req, res) => {
 });
 
 // ── PHOTOS ────────────────────────────────────────────────────────────────────
+const PHOTO_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.heif']);
+function photoExtension(originalname) {
+  const ext = path.extname(String(originalname || '')).toLowerCase();
+  return PHOTO_EXTENSIONS.has(ext) ? ext : '';
+}
 const photoUpload = multer({
   storage: multer.diskStorage({
     destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
+    // The stored name is built here from a fixed alphabet plus an extension
+    // from the allow-list — never a fragment of the uploader's originalname,
+    // which used to reach classic's inline onclick and the served Content-Type.
     filename: (_req, file, cb) => {
-      const ext = path.extname(file.originalname);
-      cb(null, `${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`);
+      cb(null, `${Date.now()}-${Math.random().toString(36).slice(2)}${photoExtension(file.originalname)}`);
     }
   }),
+  // SVG and HTML are deliberately absent: both run script when opened.
+  fileFilter: (req, file, cb) => {
+    const ok = photoExtension(file.originalname) && /^image\//i.test(file.mimetype || '');
+    if (!ok) req.photoRejected = true;
+    cb(null, Boolean(ok));
+  },
   limits: { fileSize: 50 * 1024 * 1024 }
 });
 
 app.post('/api/photos/upload', authRequired, photoUpload.single('photo'), async (req, res) => {
+  if (req.photoRejected) return res.status(400).json({ error: 'unsupported_file_type' });
   if (!req.file) return res.status(400).json({ error: 'no_file' });
   const { phase, caption } = req.body || {};
   const now = new Date().toISOString();
@@ -1460,8 +1732,8 @@ app.post('/api/photos/upload', authRequired, photoUpload.single('photo'), async 
     'INSERT INTO photos (id, filename, original_name, phase, caption, username, uploaded_at) VALUES (?,?,?,?,?,?,?)'
   ).run(id, req.file.filename, req.file.originalname, phase || 'general', caption || '', req.user.username, now);
 
-  const safeUser = getUser(req.user.username) || { username: req.user.username };
-  res.json({ ok: true, photo: { id, filename: req.file.filename, originalName: req.file.originalname, phase: phase || 'general', caption: caption || '', username: req.user.username, uploadedAt: now, user: safeUser } });
+  const safeUser = publicUser(getUser(req.user.username)) || { username: req.user.username };
+  res.json({ ok: true, photo: { id, filename: req.file.filename, originalName: req.file.originalname, phase: phase || 'general', caption: caption || '', username: req.user.username, uploadedAt: now, url: photoFileUrl(req.file.filename), shareUrl: photoShareUrl(id), user: safeUser } });
 
   // Push to Immich in background (non-blocking)
   if (IMMICH_URL && IMMICH_KEY) {
@@ -1504,7 +1776,22 @@ app.post('/api/photos/upload', authRequired, photoUpload.single('photo'), async 
   }
 });
 
-app.get('/api/photos', (req, res) => {
+// A signed link for one gallery file: an <img> cannot send a bearer token, so
+// the (authenticated) listing carries the credential in the URL instead. The
+// file route below serves only a valid, unexpired one or an authenticated call.
+function photoFileUrl(filename, atMs) {
+  const { exp, sig } = fileTokens.sign(filename, atMs);
+  return `/api/photos/file/${encodeURIComponent(filename)}?exp=${exp}&sig=${sig}`;
+}
+
+// The link a member shares (Facebook button): /photo/<id>?s=<hmac of the id>.
+// Public by design — the crawler has no login — but not guessable, and only an
+// authenticated listing ever hands one out.
+function photoShareUrl(id) {
+  return `/photo/${encodeURIComponent(id)}?s=${shareTokens.sign(String(id))}`;
+}
+
+app.get('/api/photos', authRequired, (req, res) => {
   const { phase } = req.query;
   const rows = phase
     ? db.prepare('SELECT * FROM photos WHERE phase = ? ORDER BY uploaded_at DESC').all(phase)
@@ -1518,15 +1805,53 @@ app.get('/api/photos', (req, res) => {
     caption: p.caption,
     username: p.username,
     uploadedAt: p.uploaded_at,
-    user: getUser(p.username) || { username: p.username },
+    url: photoFileUrl(p.filename),
+    shareUrl: photoShareUrl(p.id),
+    user: publicUser(getUser(p.username)) || { username: p.username },
   }));
   res.json(photos);
 });
 
-app.get('/api/photos/file/:filename', (req, res) => {
-  const filePath = path.join(UPLOADS_DIR, path.basename(req.params.filename));
-  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'not_found' });
-  res.sendFile(filePath);
+// Credential is EITHER a valid signed link (exp+sig, from the listing above) OR
+// ordinary authentication (member JWT, agent key, gateway-injected session,
+// ?_t=). A link that is bad or expired never overrides authentication: it just
+// falls back to authRequired, which refuses when there is nothing else. (A
+// gallery left open past the link's hour must keep its images behind the
+// gateway, where the session is injected on every request.) A forged link with
+// no credential is refused, never served.
+function photoFileAccess(req, res, next) {
+  const { exp, sig } = req.query;
+  if (exp !== undefined || sig !== undefined) {
+    if (fileTokens.verify(req.params.filename, exp, sig)) return next();
+  }
+  return authRequired(req, res, next);
+}
+
+// Types that run script when a browser opens them. Files stored before uploads
+// were filtered may still carry these names; they are never sent with a
+// renderable type.
+const ACTIVE_CONTENT_EXTENSIONS = new Set(['.html', '.htm', '.xhtml', '.svg', '.xml', '.js', '.mjs']);
+
+app.get('/api/photos/file/:filename', photoFileAccess, (req, res) => {
+  // The name is never trusted as a path: it must be a bare filename, and the
+  // resolved file must still sit inside UPLOADS_DIR after symlinks are followed.
+  const name = req.params.filename;
+  if (!name || name !== path.basename(name)) return res.status(404).json({ error: 'not_found' });
+  let filePath;
+  try {
+    const root = fs.realpathSync(UPLOADS_DIR);
+    filePath = fs.realpathSync(path.join(root, name));
+    if (!filePath.startsWith(root + path.sep)) return res.status(404).json({ error: 'not_found' });
+  } catch { return res.status(404).json({ error: 'not_found' }); }
+  const safeName = name.replace(/[^A-Za-z0-9._-]/g, '_');
+  const headers = {
+    'X-Content-Type-Options': 'nosniff',
+    'Content-Security-Policy': 'sandbox',
+    'Content-Disposition': `inline; filename="${safeName}"`,
+    'Cache-Control': 'private, max-age=300',
+  };
+  if (ACTIVE_CONTENT_EXTENSIONS.has(path.extname(name).toLowerCase())) headers['Content-Type'] = 'application/octet-stream';
+  res.sendFile(filePath, { headers, cacheControl: false });
 });
 
 app.delete('/api/photos/:id', authRequired, async (req, res) => {
@@ -1559,9 +1884,9 @@ app.delete('/api/photos/:id', authRequired, async (req, res) => {
 });
 
 // ── VENUE COMMENTS ────────────────────────────────────────────────────────────
-app.get('/api/comments/venue/:venueId', (req, res) => {
+app.get('/api/comments/venue/:venueId', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM venue_comments WHERE venue = ? ORDER BY created_at ASC').all(req.params.venueId);
-  const comments = rows.map(c => ({ ...c, user: getUser(c.username) || { username: c.username } }));
+  const comments = rows.map(c => ({ ...c, user: publicUser(getUser(c.username)) || { username: c.username } }));
   res.json(comments);
 });
 
@@ -1572,7 +1897,7 @@ app.post('/api/comments/venue/:venueId', authRequired, (req, res) => {
     "INSERT INTO venue_comments (venue, username, body, created_at) VALUES (?,?,?,datetime('now'))"
   ).run(req.params.venueId, req.user.username, body.trim());
   const row = db.prepare('SELECT * FROM venue_comments WHERE id = ?').get(result.lastInsertRowid);
-  res.json({ ...row, user: getUser(req.user.username) });
+  res.json({ ...row, user: publicUser(getUser(req.user.username)) });
 });
 
 app.delete('/api/comments/venue/:id', authRequired, (req, res) => {
@@ -1584,9 +1909,9 @@ app.delete('/api/comments/venue/:id', authRequired, (req, res) => {
 });
 
 // ── RSVPs ─────────────────────────────────────────────────────────────────────
-app.get('/api/rsvps/:activityId', (req, res) => {
+app.get('/api/rsvps/:activityId', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM rsvps WHERE activity = ?').all(req.params.activityId);
-  const rsvps = rows.map(r => ({ ...r, user: getUser(r.username) || { username: r.username } }));
+  const rsvps = rows.map(r => ({ ...r, user: publicUser(getUser(r.username)) || { username: r.username } }));
   res.json(rsvps);
 });
 
@@ -1601,24 +1926,25 @@ app.post('/api/rsvps/:activityId', authRequired, (req, res) => {
 
 // ── PHOTO REACTIONS ───────────────────────────────────────────────────────────
 // Bulk fetch — all reactions for all photos (or filtered by comma-separated IDs)
-app.get('/api/reactions', (req, res) => {
+app.get('/api/reactions', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM photo_reactions').all();
-  const grouped = {};
+  // Photo ids and emoji are request text; see /api/ratings for why null-prototype.
+  const grouped = Object.create(null);
   for (const r of rows) {
-    if (!grouped[r.photo_id]) grouped[r.photo_id] = {};
+    if (!grouped[r.photo_id]) grouped[r.photo_id] = Object.create(null);
     if (!grouped[r.photo_id][r.emoji]) grouped[r.photo_id][r.emoji] = [];
     grouped[r.photo_id][r.emoji].push(r.username);
   }
   res.json(grouped);
 });
 
-app.get('/api/reactions/:photoId', (req, res) => {
+app.get('/api/reactions/:photoId', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM photo_reactions WHERE photo_id = ?').all(req.params.photoId);
-  // Group by emoji: { '❤️': [{ username, user }], ... }
-  const grouped = {};
+  // Group by emoji: { '❤️': [{ username, user }], ... } — null-prototype, as above.
+  const grouped = Object.create(null);
   for (const r of rows) {
     if (!grouped[r.emoji]) grouped[r.emoji] = [];
-    grouped[r.emoji].push({ username: r.username, user: getUser(r.username) || { username: r.username } });
+    grouped[r.emoji].push({ username: r.username, user: publicUser(getUser(r.username)) || { username: r.username } });
   }
   res.json(grouped);
 });
@@ -1638,19 +1964,19 @@ app.post('/api/reactions/:photoId', authRequired, (req, res) => {
 
 // ── PHOTO COMMENTS ────────────────────────────────────────────────────────────
 // Bulk fetch — all photo comments (for gallery preload)
-app.get('/api/comments/photo', (req, res) => {
+app.get('/api/comments/photo', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM photo_comments ORDER BY created_at ASC').all();
-  const grouped = {};
+  const grouped = Object.create(null); // keyed by a request-chosen photo id; see /api/ratings
   for (const c of rows) {
     if (!grouped[c.photo_id]) grouped[c.photo_id] = [];
-    grouped[c.photo_id].push({ ...c, user: getUser(c.username) || { username: c.username } });
+    grouped[c.photo_id].push({ ...c, user: publicUser(getUser(c.username)) || { username: c.username } });
   }
   res.json(grouped);
 });
 
-app.get('/api/comments/photo/:photoId', (req, res) => {
+app.get('/api/comments/photo/:photoId', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM photo_comments WHERE photo_id = ? ORDER BY created_at ASC').all(req.params.photoId);
-  const comments = rows.map(c => ({ ...c, user: getUser(c.username) || { username: c.username } }));
+  const comments = rows.map(c => ({ ...c, user: publicUser(getUser(c.username)) || { username: c.username } }));
   res.json(comments);
 });
 
@@ -1661,7 +1987,7 @@ app.post('/api/comments/photo/:photoId', authRequired, (req, res) => {
     "INSERT INTO photo_comments (photo_id, username, body, created_at) VALUES (?,?,?,datetime('now'))"
   ).run(req.params.photoId, req.user.username, body.trim());
   const row = db.prepare('SELECT * FROM photo_comments WHERE id = ?').get(result.lastInsertRowid);
-  res.json({ ...row, user: getUser(req.user.username) });
+  res.json({ ...row, user: publicUser(getUser(req.user.username)) });
 });
 
 app.delete('/api/comments/photo/:id', authRequired, (req, res) => {
@@ -1673,9 +1999,9 @@ app.delete('/api/comments/photo/:id', authRequired, (req, res) => {
 });
 
 // ── TASK DONE ─────────────────────────────────────────────────────────────────
-app.get('/api/tasks/done', (req, res) => {
+app.get('/api/tasks/done', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM task_done ORDER BY done_at ASC').all();
-  res.json(rows.map(r => ({ ...r, user: getUser(r.done_by) })));
+  res.json(rows.map(r => ({ ...r, user: publicUser(getUser(r.done_by)) })));
 });
 
 app.post('/api/tasks/:taskId/done', authRequired, (req, res) => {
@@ -1687,7 +2013,7 @@ app.post('/api/tasks/:taskId/done', authRequired, (req, res) => {
   } else {
     db.prepare("INSERT OR REPLACE INTO task_done (task_id, done_by, done_at) VALUES (?,?,datetime('now'))").run(taskId, req.user.username);
     const row = db.prepare('SELECT * FROM task_done WHERE task_id = ?').get(taskId);
-    res.json({ done: true, ...row, user: getUser(req.user.username) });
+    res.json({ done: true, ...row, user: publicUser(getUser(req.user.username)) });
   }
 });
 
@@ -1695,16 +2021,23 @@ app.post('/api/tasks/:taskId/done', authRequired, (req, res) => {
 // Album display names, derived from trip.config.json phases — never hardcode
 // one trip's phase ids/labels here, since every trip has a different set.
 const TRIP_BRAND = TRIP_CONFIG.meta?.brand || TRIP_CONFIG.meta?.title || 'Trip';
-const SECTION_NAMES = Object.fromEntries(
-  (TRIP_CONFIG.phases || []).map(p => [p.id, `${TRIP_BRAND} — ${p.title?.he || p.title?.en || p.tabLabel || p.id}`])
-);
+// Read from the trip as it is now, not frozen at boot: a stop split off after
+// the interview gets its own album like any other.
+function sectionName(phaseId) {
+  const p = (effectiveConfig().phases || []).find(phase => phase?.id === phaseId);
+  return p ? `${TRIP_BRAND} — ${p.title?.he || p.title?.en || p.tabLabel || p.id}` : null;
+}
 
 // Album IDs are looked up by name (or created) on first use — see getOrCreateAlbum().
-const ALBUM_IDS = {};
+// Null-prototype, like SHARE_KEYS: both are keyed by a phase id from the
+// request, and on a plain object `constructor` was already "cached" — the
+// album-share route answered a member with Object's own source in the URL and
+// never looked for an album (boundary review 2026-10-11, finding 5).
+const ALBUM_IDS = Object.create(null);
 
 async function getOrCreateAlbum(phase) {
   if (ALBUM_IDS[phase]) return ALBUM_IDS[phase];
-  const name = SECTION_NAMES[phase];
+  const name = sectionName(phase);
   if (!name) return null;
   // Search existing albums
   const listRes = await fetch(`${IMMICH_URL}/api/albums`, { headers: { 'x-api-key': IMMICH_KEY } });
@@ -1722,7 +2055,7 @@ async function getOrCreateAlbum(phase) {
   return created.id;
 }
 
-const SHARE_KEYS = {};
+const SHARE_KEYS = Object.create(null);
 const IMMICH_EXTERNAL = process.env.IMMICH_EXTERNAL_URL || IMMICH_URL;
 
 async function getOrCreateShareLink(phase) {
@@ -1745,14 +2078,16 @@ async function getOrCreateShareLink(phase) {
   return created2.key;
 }
 
-app.get('/api/album-share/:phase', async (req, res) => {
+app.get('/api/album-share/:phase', authRequired, async (req, res) => {
   if (!IMMICH_URL || !IMMICH_KEY) return res.status(503).json({ error: 'Immich not configured' });
   try {
     const key = await getOrCreateShareLink(req.params.phase);
     if (!key) return res.status(404).json({ error: 'Album not found' });
     res.json({ url: `${IMMICH_EXTERNAL}/share/${key}` });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    // e.message carries the internal Immich URL on a connection failure; log it, do not serve it.
+    console.error('album-share failed:', e.message);
+    res.status(502).json({ error: 'album_unavailable' });
   }
 });
 
@@ -1817,17 +2152,256 @@ app.post('/api/upload', authRequired, upload.array('files'), async (req, res) =>
 });
 
 // ── LOST & FOUND ──────────────────────────────────────────────────────────────
+// POST stays open with no login by owner decision (issue #207, 2026-09-27): a
+// finder is a stranger who reports what they found on the trip's website. A
+// stranger can reach the form, so a script can too — this section bounds and
+// rate-limits what an anonymous caller can write, without adding auth.
+
+// Field rules (owner decision, 2026-10-12: the form stays WITHOUT login, and
+// what a stranger types is held to the bookings' write-time rules). Each field
+// is checked by server/text-rules.js against LOST_FOUND_FIELDS — its cap (the
+// ones #207 set: name 80, phone 32, location 200, item 200), no < >, no
+// control or invisible characters (the three standard flags are text), the
+// item multi-line because the form's description is a textarea — and refused
+// with the bookings' 400 shape, { error, field, message: { he, en }, detail },
+// which the Classic form shows in the page's language. Values are trimmed
+// before the check, as this route always stored them. Rows stored before the
+// rule are never rewritten, and nothing on the read path checks them.
+//
+// The companion still reads whatever passes: words cannot be refused. Its MCP
+// tools label every entry as finder-submitted, untrusted text
+// (LOST_FOUND_SOURCE in mcp/mcp.js and server/trip-mcp/tools.js).
+
+// Small cap on the whole request body — four short strings never need more
+// than a few hundred bytes; this catches an oversized payload before it is
+// even validated. Not a replacement for the global 30mb express.json()
+// limit (shared by every route), just a much tighter bound for this one.
+const LOST_FOUND_MAX_BODY_BYTES = 4096;
+
+// In-memory, per-address rate limit: 5 ACCEPTED writes per rolling hour.
+// Deliberately no dependency and no persistence — an abuse bound on a small
+// social feature, not a security control, so resetting on every restart is
+// fine. `address -> [timestamp, ...]` of accepted writes, oldest first. A
+// refused report (400, 413, 429) is not counted. The 429 says why, in both
+// languages (LOST_FOUND_MESSAGES below).
+const LOST_FOUND_RATE_LIMIT = 5;
+const LOST_FOUND_RATE_WINDOW_MS = 60 * 60 * 1000;
+// Bounds the map itself: a flood of distinct addresses (not just repeats
+// from one) must not grow this without limit for the life of the process.
+const LOST_FOUND_MAX_TRACKED_ADDRESSES = 1000;
+const lostFoundWrites = new Map();
+// The table as a whole: at most this many OPEN (unresolved) entries. The
+// per-address limit above does not bound a caller with many addresses; this
+// does, so it bounds how much a flood can STORE. It does not protect real
+// finders: when every visitor reaches the server from one proxy address
+// (TRUST_PROXY_HOPS unset behind a reverse proxy, see clientAddress below),
+// five junk reports an hour fill that one per-address bucket and every other
+// finder, member and the companion's post_lost_found gets 429 rate_limited
+// long before this cap is reached. Only the right client address fixes that.
+// A resolved entry does not count, so a member resolving one reopens the form.
+const LOST_FOUND_MAX_OPEN = 200;
+
+// ── The client address the limiter keys on ──────────────────────────────────
+// Trip sites run behind reverse proxies (the repository's nginx.conf, and
+// whatever fronts it), so the socket address is a proxy's, the same for every
+// visitor. TRUST_PROXY_HOPS says how many proxies in front of this server
+// APPEND the visitor's address to X-Forwarded-For (nginx: `proxy_set_header
+// X-Forwarded-For $proxy_add_x_forwarded_for`) — a CDN or tunnel edge counts
+// like any other. A proxy that instead REWRITES the header from a value the
+// client can send (an X-Real-IP, say) is not one that appends: counting it
+// lets the client pick its own bucket. The count is only right when the entry
+// Nth from the right is one the outermost trusted proxy wrote, which the
+// operator confirms with a live probe (.env.example).
+// With N > 0 the client is the Nth entry from the RIGHT — the one the
+// outermost trusted proxy wrote — never the leftmost, which the client itself
+// can write. Express's `trust proxy` = N picks the same entry, but it is
+// deliberately not set: it would also change req.protocol (the /photo share
+// page's URLs) and req.hostname for every route, and this setting is about one
+// rate limit. 0 (unset, the default): X-Forwarded-For is ignored and the key
+// is req.ip, exactly as before. Too high a number lets a visitor choose their
+// own address — a proxy that passes the header through without appending (the
+// repository's own nginx.conf does) does not count.
+const TRUST_PROXY_HOPS = (() => {
+  const raw = process.env.TRUST_PROXY_HOPS;
+  if (raw === undefined || raw === '') return 0;
+  if (/^[0-3]$/.test(raw)) return Number(raw);
+  console.warn(`TRUST_PROXY_HOPS=${JSON.stringify(raw)} is not a whole number from 0 to 3 — using 0: ` +
+    'X-Forwarded-For is ignored and every visitor behind a proxy shares one lost-and-found rate-limit bucket.');
+  return 0;
+})();
+if (TRUST_PROXY_HOPS > 0) {
+  console.log(`lost-and-found rate limit: TRUST_PROXY_HOPS=${TRUST_PROXY_HOPS} — keyed on X-Forwarded-For entry ${TRUST_PROXY_HOPS} from the right`);
+}
+// Each misconfiguration is said once per process, not per request.
+const clientAddressWarned = new Set();
+function warnClientAddressOnce(key, message) {
+  if (clientAddressWarned.has(key)) return;
+  clientAddressWarned.add(key);
+  console.warn(message);
+}
+// At most an IPv6 address with a zone; anything longer is not an address
+// a proxy wrote, and bounding it bounds the map's keys.
+const CLIENT_ADDRESS_MAX_LENGTH = 64;
+function clientAddress(req) {
+  // Keyed per client — an IPv6 one per /64, an IPv4-mapped one as its IPv4 —
+  // whichever of the three ways below found the address (client-address.js).
+  return rateLimitKey(clientAddressRaw(req));
+}
+function clientAddressRaw(req) {
+  const header = req.headers['x-forwarded-for'];
+  const entries = typeof header === 'string' ? header.split(',').map(s => s.trim()).filter(Boolean) : [];
+  if (TRUST_PROXY_HOPS === 0) {
+    if (entries.length) {
+      warnClientAddressOnce('hops0', 'lost-and-found: a request arrived with X-Forwarded-For but TRUST_PROXY_HOPS is 0, ' +
+        'so the rate limit keys on the proxy\'s address and every visitor behind it shares one bucket of ' +
+        `${LOST_FOUND_RATE_LIMIT} reports an hour. Set TRUST_PROXY_HOPS to the number of proxies that append to X-Forwarded-For.`);
+    }
+    return req.ip;
+  }
+  if (entries.length < TRUST_PROXY_HOPS) {
+    // No header at all is a direct caller (the companion's MCP server on the
+    // same host): its socket address is its own. Some entries, but fewer than
+    // the hops, means the setting is higher than this chain — fall back to the
+    // socket rather than to an entry the client may have written.
+    if (entries.length) {
+      warnClientAddressOnce('short', `lost-and-found: a request carried fewer X-Forwarded-For entries (${entries.length}) ` +
+        `than TRUST_PROXY_HOPS=${TRUST_PROXY_HOPS}; keyed on the socket address. Is TRUST_PROXY_HOPS higher than the proxies in front of this site?`);
+    }
+    return req.socket.remoteAddress;
+  }
+  return entries[entries.length - TRUST_PROXY_HOPS].slice(0, CLIENT_ADDRESS_MAX_LENGTH);
+}
+
+// The refusals that are not about one field, in both languages, addressed to
+// the finder the way text-rules.js addresses a person.
+const LOST_FOUND_MESSAGES = {
+  rate_limited: {
+    he: 'נשלחו מכאן יותר מדי דיווחים בשעה האחרונה. נסו שוב מאוחר יותר.',
+    en: 'Too many reports were sent from here in the last hour. Try again later.',
+  },
+  lost_found_full: {
+    he: 'רשימת האבדות והמציאות מלאה כרגע. נסו שוב מאוחר יותר.',
+    en: 'The lost-and-found list is full right now. Try again later.',
+  },
+  body_too_large: {
+    he: 'הדיווח ארוך מדי. קצרו אותו ונסו שוב.',
+    en: 'The report is too long. Shorten it and try again.',
+  },
+};
+const lostFoundRefusal = (error) => ({ error, message: LOST_FOUND_MESSAGES[error] });
+
+function pruneLostFoundBucket(timestamps, now) {
+  while (timestamps.length && now - timestamps[0] >= LOST_FOUND_RATE_WINDOW_MS) timestamps.shift();
+  return timestamps;
+}
+
+// Drops any bucket whose writes have all aged out, then — only if the map is
+// still oversized (many distinct addresses, not just repeat offenders) —
+// evicts the oldest-inserted entries outright. Map preserves insertion
+// order, so this is a real "oldest first" eviction, not an arbitrary one.
+function evictLostFoundBuckets(now) {
+  for (const [address, timestamps] of lostFoundWrites) {
+    pruneLostFoundBucket(timestamps, now);
+    if (!timestamps.length) lostFoundWrites.delete(address);
+  }
+  while (lostFoundWrites.size > LOST_FOUND_MAX_TRACKED_ADDRESSES) {
+    lostFoundWrites.delete(lostFoundWrites.keys().next().value);
+  }
+}
+
 app.post('/api/lost-found', (req, res) => {
-  const { name, phone, item, location } = req.body || {};
-  if (!name?.trim() || !item?.trim()) return res.status(400).json({ error: 'name and item are required' });
+  const now = Date.now();
+  evictLostFoundBuckets(now);
+
+  // The real client when TRUST_PROXY_HOPS says how to find it; req.ip (the
+  // proxy's address, behind one) when it is 0 — see clientAddress above.
+  const address = clientAddress(req);
+  const bucket = pruneLostFoundBucket(lostFoundWrites.get(address) || [], now);
+  if (bucket.length >= LOST_FOUND_RATE_LIMIT) {
+    const retryAfterMs = LOST_FOUND_RATE_WINDOW_MS - (now - bucket[0]);
+    res.set('Retry-After', String(Math.max(1, Math.ceil(retryAfterMs / 1000))));
+    return res.status(429).json(lostFoundRefusal('rate_limited'));
+  }
+
+  const contentLength = Number(req.headers['content-length'] || 0);
+  if (contentLength > LOST_FOUND_MAX_BODY_BYTES) {
+    return res.status(413).json(lostFoundRefusal('body_too_large'));
+  }
+
+  // Every field is text or absent (null and undefined: phone and location
+  // are optional); anything else — a number, an array better-sqlite3 would
+  // flatten, an object — is refused, naming the field. Then trimmed, then the
+  // required pair, then the text rules (Field rules above).
+  const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+  const fields = textRules.LOST_FOUND_FIELDS;
+  const values = {};
+  for (const [field, spec] of Object.entries(fields)) {
+    const v = Object.hasOwn(body, field) ? body[field] : undefined;
+    if (v === undefined || v === null) { values[field] = ''; continue; }
+    if (typeof v !== 'string') {
+      return res.status(400).json(textRules.refusal('invalid_text', field, spec.label, 'type', { detail: 'must be text' }));
+    }
+    values[field] = v.trim();
+  }
+  for (const field of ['name', 'item']) {
+    if (textRules.isBlank(values[field])) return res.status(400).json(textRules.requiredRefusal('missing_fields', field, fields));
+  }
+  const checked = textRules.checkFields(values, fields);
+  if (checked.error) return res.status(400).json(checked.error);
+  const v = checked.values;
+
+  const open = db.prepare('SELECT COUNT(*) AS n FROM lost_found WHERE COALESCE(resolved, 0) = 0').get().n;
+  if (open >= LOST_FOUND_MAX_OPEN) return res.status(429).json(lostFoundRefusal('lost_found_full'));
+
   const result = db.prepare(
     "INSERT INTO lost_found (name, phone, item, location) VALUES (?,?,?,?)"
-  ).run(name.trim(), (phone || '').trim(), item.trim(), (location || '').trim());
+  ).run(v.name, v.phone, v.item, v.location);
+
+  bucket.push(now);
+  lostFoundWrites.set(address, bucket);
+
   res.json({ ok: true, id: result.lastInsertRowid });
 });
 
+// Without open, limit or count: every entry, newest first — what the Classic
+// page reads, unchanged (any other parameter is ignored, as it always was).
+// The MCP tools ask for a bounded set instead (get_lost_found in mcp/mcp.js
+// and server/trip-mcp/tools.js): ?open=1 open entries only, ?open=0 resolved
+// only, ?limit=N the N newest (1..500; with open alone, at most 500), and
+// ?count=1 just `{ open, resolved }`. One of the three that is present but
+// not one of those values is refused, never silently ignored.
+const LOST_FOUND_MAX_LIMIT = 500;
+// The columns the endpoint serves — an allow-list, not SELECT *: a column added
+// to the table later (a note, a contact) reaches no member and no model until
+// it is added here on purpose. A constant, never built from a request.
+const LOST_FOUND_COLUMNS = 'id, name, phone, item, location, resolved, created_at';
+const LOST_FOUND_QUERY_KEYS = ['open', 'limit', 'count'];
 app.get('/api/lost-found', authRequired, (req, res) => {
-  const rows = db.prepare('SELECT * FROM lost_found ORDER BY created_at DESC').all();
+  const q = req.query;
+  const given = LOST_FOUND_QUERY_KEYS.filter(k => q[k] !== undefined);
+  if (!given.length) {
+    const rows = db.prepare(`SELECT ${LOST_FOUND_COLUMNS} FROM lost_found ORDER BY created_at DESC`).all();
+    return res.json(rows);
+  }
+  const bad = (detail) => res.status(400).json({ error: 'invalid_query', detail });
+  for (const key of given) {
+    if (typeof q[key] !== 'string') return bad(`"${key}" must be given once, as text`);
+  }
+  if (q.count !== undefined) {
+    if (q.count !== '1' || given.length > 1) return bad('count must be 1, with neither open nor limit');
+    const n = db.prepare('SELECT COALESCE(SUM(COALESCE(resolved, 0) = 0), 0) AS open, COALESCE(SUM(COALESCE(resolved, 0) != 0), 0) AS resolved FROM lost_found').get();
+    return res.json({ open: n.open, resolved: n.resolved });
+  }
+  if (q.open !== undefined && q.open !== '0' && q.open !== '1') return bad('open must be 1 (open only) or 0 (resolved only)');
+  let limit = LOST_FOUND_MAX_LIMIT;
+  if (q.limit !== undefined) {
+    if (!/^[1-9]\d{0,2}$/.test(q.limit) || Number(q.limit) > LOST_FOUND_MAX_LIMIT) {
+      return bad(`limit must be a whole number from 1 to ${LOST_FOUND_MAX_LIMIT}`);
+    }
+    limit = Number(q.limit);
+  }
+  const where = q.open === '1' ? 'WHERE COALESCE(resolved, 0) = 0' : q.open === '0' ? 'WHERE COALESCE(resolved, 0) != 0' : '';
+  const rows = db.prepare(`SELECT ${LOST_FOUND_COLUMNS} FROM lost_found ${where} ORDER BY created_at DESC, id DESC LIMIT ?`).all(limit);
   res.json(rows);
 });
 
@@ -1839,12 +2413,18 @@ app.patch('/api/lost-found/:id', authRequired, (req, res) => {
 
 // ── PER-PHOTO SHARE PAGE (Open Graph tags for Facebook) ──────────────────────
 app.get('/photo/:id', (req, res) => {
-  const photo = db.prepare('SELECT * FROM photos WHERE id = ?').get(req.params.id);
+  // Capability link: the signature is the credential. Unknown id, no signature,
+  // a bad one and another photo's all answer the same 404, so the page never
+  // confirms that an id exists.
+  const photo = shareTokens.verify(req.params.id, req.query.s)
+    ? db.prepare('SELECT * FROM photos WHERE id = ?').get(req.params.id) : null;
   if (!photo) return res.status(404).send('Not found');
   const origin = process.env.PUBLIC_ORIGIN || `${req.protocol}://${req.get('host')}`;
-  const imgUrl = `${origin}/api/photos/file/${encodeURIComponent(photo.filename)}`;
-  const pageUrl = `${origin}/photo/${photo.id}`;
-  const brand = TRIP_CONFIG.meta?.brand || TRIP_CONFIG.meta?.title || 'Trip';
+  const esc = (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  // Signed like the listing's links: the raw file route is no longer public.
+  const imgUrl = esc(`${origin}${photoFileUrl(photo.filename)}`);
+  const pageUrl = esc(`${origin}${photoShareUrl(photo.id)}`);
+  const brand = esc(TRIP_CONFIG.meta?.brand || TRIP_CONFIG.meta?.title || 'Trip');
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(`<!DOCTYPE html><html><head>
 <meta charset="UTF-8">
@@ -1865,17 +2445,49 @@ app.get('/photo/:id', (req, res) => {
 });
 
 // ── BUDGET ────────────────────────────────────────────────────────────────────
+// Issue #173: PATCH/DELETE were gated by authRequired alone — every family
+// member, not just the organizer, could silently rewrite or erase ANY OTHER
+// member's line, including the organizer's. budget_items has no owner column
+// at all yet, unlike the comment/photo routes this now matches the shape of.
+//
+// Owner decision 2026-09-25 (issue #173): row ownership, not
+// organizerOrAgentRequired — a member may still add and edit their OWN
+// lines; the organizer and the agent key may touch any line; POST stays
+// authRequired (adding a cost is not the sensitive action, rewriting or
+// erasing someone else's is). A row with no recorded creator — every line
+// seeded at boot, and any line the agent key authors without a requesting
+// member named (mcp/mcp.js's add_budget_item does not pass one along today)
+// — is organizer/agent-only, the same as before this fix for everyone else:
+// nobody's line becomes "anyone's to edit" by virtue of predating the column.
+function isOrganizerOrAgent(req) {
+  return Boolean(req.user?.isAgent) || normalizeOrganizers(TRIP_CONFIG.agent).includes(req.user?.username);
+}
+function canEditBudgetItem(req, row) {
+  return isOrganizerOrAgent(req) || row.created_by === req.user?.username;
+}
+
 app.get('/api/budget', authRequired, (req, res) => {
-  res.json(db.prepare('SELECT * FROM budget_items ORDER BY phase, id').all());
+  // Reading the budget stays trip-wide — every family member could always see
+  // every line, and #173 is about who may WRITE one, not who may see it.
+  // can_edit is server-computed so a client never has to reimplement the
+  // ownership rule above just to decide whether to show its own edit button.
+  const rows = db.prepare('SELECT * FROM budget_items ORDER BY phase, id').all();
+  res.json(rows.map(row => ({ ...row, can_edit: canEditBudgetItem(req, row) })));
 });
 
 app.post('/api/budget', authRequired, (req, res) => {
   const { phase, category, description, amount, is_estimate } = req.body || {};
   if (!phase || !category || !description || amount === undefined)
     return res.status(400).json({ error: 'phase, category, description, amount required' });
+  // The agent key has no "requesting member" of its own to attribute a line
+  // to, so an agent-authored row lands with no creator — organizer/agent-only,
+  // same as a seeded row. A family member's own POST (through this route
+  // directly, or through server/trip-mcp/tools.js, which always calls AS
+  // that person) is attributed to them and stays theirs to edit.
+  const createdBy = req.user?.isAgent ? null : req.user?.username ?? null;
   const result = db.prepare(
-    'INSERT INTO budget_items (phase,category,description,amount,is_estimate) VALUES (?,?,?,?,?)'
-  ).run(phase, category, description, parseFloat(amount) || 0, is_estimate ? 1 : 0);
+    'INSERT INTO budget_items (phase,category,description,amount,is_estimate,created_by) VALUES (?,?,?,?,?,?)'
+  ).run(phase, category, description, parseFloat(amount) || 0, is_estimate ? 1 : 0, createdBy);
   res.json({ ok: true, id: result.lastInsertRowid });
 });
 
@@ -1883,6 +2495,9 @@ app.patch('/api/budget/:id', authRequired, (req, res) => {
   const { amount, description } = req.body || {};
   if (amount === undefined && description === undefined)
     return res.status(400).json({ error: 'amount or description required' });
+  const row = db.prepare('SELECT * FROM budget_items WHERE id = ?').get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'not_found' });
+  if (!canEditBudgetItem(req, row)) return res.status(403).json({ error: 'forbidden' });
   if (amount !== undefined)
     db.prepare('UPDATE budget_items SET amount=? WHERE id=?').run(parseFloat(amount) || 0, req.params.id);
   if (description !== undefined)
@@ -1891,6 +2506,9 @@ app.patch('/api/budget/:id', authRequired, (req, res) => {
 });
 
 app.delete('/api/budget/:id', authRequired, (req, res) => {
+  const row = db.prepare('SELECT * FROM budget_items WHERE id = ?').get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'not_found' });
+  if (!canEditBudgetItem(req, row)) return res.status(403).json({ error: 'forbidden' });
   db.prepare('DELETE FROM budget_items WHERE id = ?').run(req.params.id);
   res.json({ ok: true });
 });
@@ -1972,7 +2590,9 @@ app.get('/api/bookings', authRequired, (req, res) => {
   if (type)  { wheres.push('type = ?');  params.push(type);  }
   if (wheres.length) sql += ' WHERE ' + wheres.join(' AND ');
   sql += ' ORDER BY date_from, id';
-  res.json(db.prepare(sql).all(...params));
+  // A hotel booking also says where it is (`place`); location_url stays what
+  // is stored, so an edit form never saves a derived link back.
+  res.json(db.prepare(sql).all(...params).map((booking) => hotelPlaces.decorateBooking(booking)));
 });
 
 app.post('/api/bookings/extract-draft', organizerOrAgentRequired, extractUpload.single('file'), async (req, res) => {
@@ -1981,14 +2601,26 @@ app.post('/api/bookings/extract-draft', organizerOrAgentRequired, extractUpload.
     const phase = typeof extracted.phase === 'string' ? extracted.phase : '';
     const type = typeof extracted.type === 'string' ? extracted.type : 'other';
     const name = typeof extracted.name === 'string' ? extracted.name.trim() : '';
-    const validTypes = new Set(['flight', 'hotel', 'car', 'attraction', 'other']);
-    if (!VALID_PLAN_PHASES.has(phase) || !validTypes.has(type) || !name) {
+    const validTypes = new Set(textRules.BOOKING_TYPES);
+    if (!knownPhase(phase) || !validTypes.has(type) || !name) {
       return res.status(422).json({ error: 'Extraction needs a valid phase, type, and name before a draft can be created', extracted });
     }
-    const text = (key) => typeof extracted[key] === 'string' && extracted[key].trim() ? extracted[key].trim() : null;
+    // Nobody typed this text — an LLM read it off a PDF — so it is CLEANED,
+    // not refused: < > and control characters removed, lengths clamped, a
+    // date that is not YYYY-MM-DD dropped (server/text-rules.js). Refusing
+    // would leave the organizer with no draft; every draft is reviewed
+    // before it is approved. The name is cleaned before the emptiness check,
+    // so a name that was nothing but markup is the same 422 as no name.
+    const F = textRules.BOOKING_FIELDS;
+    const text = (key) => textRules.cleanText(extracted[key], F[key]);
+    const cleanName = textRules.cleanText(name, F.name);
+    if (!cleanName) {
+      return res.status(422).json({ error: 'Extraction needs a valid phase, type, and name before a draft can be created', extracted });
+    }
     const result = db.prepare(
       "INSERT INTO bookings (phase,type,name,date_from,date_to,passengers,confirmation,pin,notes,cost,created_by,review_status) VALUES (?,?,?,?,?,?,?,?,?,?,?, 'draft')"
-    ).run(phase, type, name, text('date_from'), text('date_to'), text('passengers'), text('confirmation'), text('pin'), text('notes'), 0, req.user.username);
+    ).run(phase, type, cleanName, textRules.cleanDate(extracted.date_from), textRules.cleanDate(extracted.date_to),
+      text('passengers'), text('confirmation'), text('pin'), text('notes'), 0, req.user.username);
     const booking = db.prepare('SELECT * FROM bookings WHERE id = ?').get(result.lastInsertRowid);
     res.status(201).json({ ok: true, booking, extracted });
   } catch (e) {
@@ -2005,25 +2637,65 @@ app.post('/api/bookings/:id/approve', organizerOrAgentRequired, (req, res) => {
 
 app.post('/api/bookings', organizerOrAgentRequired, (req, res) => {
   const { phase, type, name, date_from, date_to, passengers, confirmation, pin, notes, cost, apple_wallet_url, google_wallet_url, location_url } = req.body || {};
-  if (!phase || !type || !name) return res.status(400).json({ error: 'phase, type, name required' });
+  if (!phase || !type || !name) {
+    const body = { error: 'phase, type, name required' };
+    if (phase && type) Object.assign(body, textRules.requiredRefusal(body.error, 'name', textRules.BOOKING_FIELDS));
+    return res.status(400).json(body);
+  }
+  // A booking filed under a phase the trip does not have is shown under no
+  // stop and imported nowhere (see import-from-bookings below). The extract
+  // draft already refused one; this route and PATCH did not.
+  if (!knownBookingPhase(phase)) return res.status(400).json({ error: 'unknown phase' });
+  // A type outside the schema's list was a SQLite CHECK failure (500), and an
+  // array (["hotel"]) was flattened by better-sqlite3 and stored. Refused here,
+  // in both languages, from the same list the CHECK is built from.
+  const badType = textRules.bookingTypeRefusal(type);
+  if (badType) return res.status(400).json(badType);
+  // Every free-text field, link and date is checked at the write, and a
+  // refusal names the field and says what to fix in Hebrew and English
+  // (server/text-rules.js). The mcp booking tools call this route, so this is
+  // the one place the rule lives.
+  if (textRules.isBlank(name)) return res.status(400).json(textRules.requiredRefusal('text_required', 'name', textRules.BOOKING_FIELDS));
+  const checked = textRules.checkFields(req.body, textRules.BOOKING_FIELDS);
+  if (checked.error) return res.status(400).json(checked.error);
+  const v = checked.values;
   const result = db.prepare(
     'INSERT INTO bookings (phase,type,name,date_from,date_to,passengers,confirmation,pin,notes,cost,apple_wallet_url,google_wallet_url,location_url,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
-  ).run(phase, type, name, date_from || null, date_to || null, passengers || null,
-    confirmation || null, pin || null, notes || null, parseFloat(cost) || 0,
-    apple_wallet_url || null, google_wallet_url || null, location_url || null, req.user.username);
+  ).run(phase, type, v.name, v.date_from || null, v.date_to || null, v.passengers || null,
+    v.confirmation || null, v.pin || null, v.notes || null, parseFloat(cost) || 0,
+    v.apple_wallet_url || null, v.google_wallet_url || null, v.location_url || null, req.user.username);
   res.json({ ok: true, id: result.lastInsertRowid });
 });
 
 app.patch('/api/bookings/:id', organizerOrAgentRequired, (req, res) => {
   const fields = ['phase','type','name','date_from','date_to','passengers','confirmation','pin','notes','cost','apple_wallet_url','google_wallet_url','location_url'];
+  if (req.body.phase !== undefined && !knownBookingPhase(req.body.phase)) return res.status(400).json({ error: 'unknown phase' });
+  // A type this PATCH carries must be one of the list — null included, which
+  // was a NOT NULL failure (500).
+  if (req.body.type !== undefined) {
+    const badType = textRules.bookingTypeRefusal(req.body.type);
+    if (badType) return res.status(400).json(badType);
+  }
+  // The same checks as POST, on the fields this PATCH carries; one bad field
+  // refuses the whole PATCH. null and '' keep their old meaning (clear).
+  if (req.body.name !== undefined && textRules.isBlank(req.body.name)) {
+    return res.status(400).json(textRules.requiredRefusal('text_required', 'name', textRules.BOOKING_FIELDS));
+  }
+  const checked = textRules.checkFields(req.body, textRules.BOOKING_FIELDS);
+  if (checked.error) return res.status(400).json(checked.error);
   const updates = [];
   const params = [];
   for (const f of fields) {
-    if (req.body[f] !== undefined) { updates.push(`${f} = ?`); params.push(f === 'cost' ? parseFloat(req.body[f]) || 0 : req.body[f]); }
+    if (req.body[f] === undefined) continue;
+    updates.push(`${f} = ?`);
+    params.push(f === 'cost' ? parseFloat(req.body[f]) || 0 : Object.hasOwn(checked.values, f) ? checked.values[f] : req.body[f]);
   }
   if (!updates.length) return res.status(400).json({ error: 'no fields to update' });
   params.push(req.params.id);
   db.prepare(`UPDATE bookings SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+  // A hotel linked to a stop carries a check-in and a check-out item; they
+  // follow the booking's dates (server/trip-structure.js onBookingChanged).
+  if (req.body.date_from !== undefined || req.body.date_to !== undefined) tripStructure.onBookingChanged(req.params.id, req.user.username);
   res.json({ ok: true });
 });
 
@@ -2049,6 +2721,19 @@ function protectedDocumentResponse(res, filePath, disposition = 'attachment') {
   const contentTypes = {
     '.pdf': 'application/pdf',
     '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    '.txt': 'text/plain; charset=utf-8',
+    // A photographed confirmation. Raster types only: .svg stays unmapped for
+    // the same reason .html does — it can carry script.
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.webp': 'image/webp',
+    '.gif': 'image/gif',
+    // .html is deliberately NOT here. A booking page an organizer saved from
+    // their browser is a real source document, and served as text/html on this
+    // origin it would run its own scripts with a trip member's session. It
+    // falls through to application/octet-stream, which with nosniff is a
+    // download and never a page.
     '.md': 'text/markdown; charset=utf-8',
     '.pkpass': 'application/vnd.apple.pkpass',
   };
@@ -2059,11 +2744,34 @@ function protectedDocumentResponse(res, filePath, disposition = 'attachment') {
   return fs.createReadStream(filePath).pipe(res);
 }
 
+// Where a trip's source documents are, in the order they are looked for.
+// Provisioning hard-links each original into the trip's own NFS directory — one
+// physical copy, shared with the control plane's store — and names it in
+// TRIP_DOCUMENTS_DIR. A container created before that variable existed still
+// has DATA_DIR=<its NFS dir>/server-data, so the same directory is derived from
+// it. A trip whose documents could not be linked carries a copy beside its
+// config instead.
+const TRIP_DOCUMENT_DIRS = [
+  process.env.TRIP_DOCUMENTS_DIR,
+  path.basename(DATA_DIR) === 'server-data' ? path.join(path.dirname(DATA_DIR), 'documents') : null,
+  path.join(TRIP_DIR, 'documents'),
+].filter((dir, index, all) => typeof dir === 'string' && dir !== '' && all.indexOf(dir) === index);
+
+function tripDocumentPath(file) {
+  for (const dir of TRIP_DOCUMENT_DIRS) {
+    const candidate = path.join(dir, file);
+    try { if (fs.statSync(candidate).isFile()) return candidate; } catch { /* not in this one */ }
+  }
+  return null;
+}
+
 function confirmationPath(filename, { staticOnly = false } = {}) {
   const safeName = path.basename(filename);
   const candidates = staticOnly
     ? [path.join(STATIC_CONFIRMATIONS_DIR, safeName)]
-    : [path.join(CONF_DIR, safeName), path.join(STATIC_CONFIRMATIONS_DIR, safeName)];
+    // TRIP_DIR/documents holds the source documents a provisioned trip was
+    // built from, under content-addressed names — see documents.json.
+    : [path.join(CONF_DIR, safeName), ...TRIP_DOCUMENT_DIRS.map((dir) => path.join(dir, safeName)), path.join(STATIC_CONFIRMATIONS_DIR, safeName)];
   return candidates.find(candidate => {
     try { return fs.statSync(candidate).isFile(); } catch { return false; }
   }) || candidates[0];
@@ -2074,6 +2782,40 @@ function confirmationPath(filename, { staticOnly = false } = {}) {
 // UI call site use the same Authorization-header blob flow.
 app.get('/api/bookings/confirmation/:fn', authRequired, (req, res) => {
   return protectedDocumentResponse(res, confirmationPath(req.params.fn), 'inline');
+});
+
+// The source documents a provisioned trip was built from, and what each one
+// supports — documents.json, written by the provisioner beside the config. A
+// booking has one conf_file and a hotel card one link; this is where "this
+// voucher supports that stay AND that booking" reaches the site.
+//
+// Behind the same authentication as every other trip document, and it lists
+// only content-addressed names that are actually present: a manifest line
+// naming anything else is dropped, never followed, so this can never become a
+// way to probe or reach a path.
+const TRIP_DOCUMENT_FILE = /^[a-f0-9]{64}\.(pdf|docx|xlsx|html|txt|png|jpg|webp|gif)$/;
+app.get('/api/trip-documents', authRequired, (_req, res) => {
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(path.join(TRIP_DIR, 'documents.json'), 'utf8'));
+  } catch {
+    return res.json([]);
+  }
+  if (!Array.isArray(manifest)) return res.json([]);
+  const present = (file) => tripDocumentPath(file) !== null;
+  const links = (raw) => (Array.isArray(raw) ? raw : []).flatMap((link) => {
+    if (link?.kind === 'phase' && typeof link.id === 'string') return [{ kind: 'phase', id: link.id }];
+    if (link?.kind === 'booking' && typeof link.seed_key === 'string') return [{ kind: 'booking', seed_key: link.seed_key }];
+    return [];
+  });
+  res.json(manifest
+    .filter((doc) => typeof doc?.file === 'string' && TRIP_DOCUMENT_FILE.test(doc.file) && present(doc.file))
+    .map((doc) => ({
+      file: doc.file,
+      filename: typeof doc.filename === 'string' ? doc.filename : null,
+      mime: typeof doc.mime === 'string' ? doc.mime : null,
+      links: links(doc.links),
+    })));
 });
 
 // Preserve old bookmarks/links, but route them through the same authentication
@@ -2104,7 +2846,10 @@ app.get('/api/bookings/wallet-apple/:fn', authRequired, (req, res) => {
 });
 
 // ── PHASE PLAN ITEMS ──────────────────────────────────────────────────────────
-const VALID_PLAN_PHASES = new Set((TRIP_CONFIG.phases || []).map(p => p.id));
+// Which phase ids a plan row may be filed under is knownPhase() (above): the
+// trip's stops as they are now, plus every phase the config names. It was a
+// Set frozen at boot, so a stop split off after the interview could hold no
+// plan at all.
 
 // Surfaces a reviewer's rewrite as one object rather than four loose columns,
 // so a caller can test `item.correction` instead of knowing the schema. The
@@ -2147,14 +2892,25 @@ function joinBooking(item, { includeDrafts = false } = {}) {
   const withCorr = withCorrection(item);
   if (!item.booking_id) return withCorr;
   const bk = db.prepare(
-    'SELECT id, name, confirmation, conf_file FROM bookings WHERE id = ?' +
+    'SELECT id, name, confirmation, conf_file, type, phase, location_url FROM bookings WHERE id = ?' +
     (includeDrafts ? '' : " AND COALESCE(review_status, 'approved') = 'approved'")
   ).get(item.booking_id);
-  return { ...withCorr, booking: bk || null };
+  if (!bk) return { ...withCorr, booking: null };
+  // A hotel's check-in/check-out resolve its place the way every other screen
+  // does (server/hotel-place.js); the card keeps its four fields plus `place`.
+  const { type, phase, location_url, ...card } = bk;
+  const place = hotelPlaces.decorateBooking(bk).place;
+  return { ...hotelPlaces.decorateItem(withCorr, bk), booking: place ? { ...card, place } : card };
 }
 
 const PLAN_STATUSES = new Set(['confirmed', 'needs_review']);
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+// A plan date a Classic handler is SENT must be a day on the calendar, not only
+// the shape (second boundary re-check of PR #373). Refused with the route's own
+// error, plus `field` and `detail`. Reads keep ISO_DATE_RE: a row an older
+// server stored on 2027-02-30 is served as it is.
+const { isCalendarDay, CALENDAR_DAY_DETAIL } = require('./calendar-day');
+const planDateRefusal = (error, field) => ({ error, field, detail: CALENDAR_DAY_DETAIL });
 // 24-hour HH:MM. Matches what <input type="time"> submits and what the config
 // schedule already uses, so a DB plan item sorts against the same shape.
 const HHMM_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
@@ -2203,9 +2959,11 @@ function planFieldError(body, { requireText }) {
     const v = body[f];
     if (v !== undefined && v !== null && !isStr(v)) return `${f} must be a string`;
   }
+  // The one refusal here that is an object: it names its field (the routes
+  // send a string refusal as { error }).
   const d = body.date;
-  if (d !== undefined && d !== null && d !== '' && (!isStr(d) || !ISO_DATE_RE.test(d))) {
-    return 'date must be YYYY-MM-DD';
+  if (d !== undefined && d !== null && d !== '' && !isCalendarDay(d)) {
+    return planDateRefusal('date must be YYYY-MM-DD', 'date');
   }
   const t = body.time;
   if (t !== undefined && t !== null && t !== '' && (!isStr(t) || !isValidPlanTime(t))) {
@@ -2238,7 +2996,7 @@ function planFieldError(body, { requireText }) {
 }
 
 app.get('/api/phases/:phase_id/plan', authRequired, (req, res) => {
-  if (!VALID_PLAN_PHASES.has(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
+  if (!knownPhase(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
   const rows = db.prepare(
     // time_sort, not time: a rough token would otherwise sort lexically, putting
     // "afternoon" before "morning". COALESCE parks untimed items at the end.
@@ -2252,7 +3010,7 @@ app.get('/api/phases/:phase_id/plan', authRequired, (req, res) => {
 // Day headlines for a phase. Separate from the item list so /plan keeps its
 // array shape, which the agent tools and existing callers rely on.
 app.get('/api/phases/:phase_id/plan/days', authRequired, (req, res) => {
-  if (!VALID_PLAN_PHASES.has(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
+  if (!knownPhase(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
   res.json(db.prepare(
     'SELECT phase_id, date, label_he, label_en, enrichment_status, ' +
     'label_he_prev, label_en_prev, correction_note, corrected_at, review_status ' +
@@ -2313,10 +3071,10 @@ function ensurePlanDay(phaseId, date) {
 }
 
 app.post('/api/phases/:phase_id/plan', organizerOrAgentRequired, (req, res) => {
-  if (!VALID_PLAN_PHASES.has(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
+  if (!knownPhase(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
   const body = req.body || {};
   const bad = planFieldError(body, { requireText: true });
-  if (bad) return res.status(400).json({ error: bad });
+  if (bad) return res.status(400).json(typeof bad === 'string' ? { error: bad } : bad);
   const { date, time, text_he, text_en, location_url, booking_id, status, sort_order,
           waze_url, website_url, ticket_url } = body;
   const result = db.prepare(
@@ -2352,10 +3110,10 @@ app.post('/api/phases/:phase_id/plan', organizerOrAgentRequired, (req, res) => {
 });
 
 app.patch('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res) => {
-  if (!VALID_PLAN_PHASES.has(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
+  if (!knownPhase(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
   const body = req.body || {};
   const bad = planFieldError(body, { requireText: false });
-  if (bad) return res.status(400).json({ error: bad });
+  if (bad) return res.status(400).json(typeof bad === 'string' ? { error: bad } : bad);
   if (body.text_he !== undefined && !String(body.text_he).trim()) {
     return res.status(400).json({ error: 'text_he cannot be empty' });
   }
@@ -2368,8 +3126,15 @@ app.patch('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res)
   const existing = db.prepare('SELECT id, date FROM phase_plan_items WHERE id = ? AND phase_id = ?')
     .get(req.params.id, req.params.phase_id);
   if (!existing) return res.status(404).json({ error: 'not found' });
+  // Moving an item to another stop (run notes F6: this PATCH did not accept
+  // phase_id at all). The target is checked like the route's own phase.
+  if (body.phase_id !== undefined && (typeof body.phase_id !== 'string' || !knownPhase(body.phase_id))) {
+    return res.status(400).json({ error: 'unknown phase' });
+  }
+  const targetPhase = body.phase_id !== undefined ? body.phase_id : req.params.phase_id;
+  const phaseMoved = targetPhase !== req.params.phase_id;
 
-  const allowed = ['date','time','text_he','text_en','location_url','booking_id','status','sort_order',
+  const allowed = ['phase_id','date','time','text_he','text_en','location_url','booking_id','status','sort_order',
                    'waze_url','website_url','ticket_url','enrichment_status'];
   const updates = [];
   const params = [];
@@ -2396,20 +3161,30 @@ app.patch('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res)
   }
   if (!updates.length) return res.status(400).json({ error: 'no fields to update' });
   params.push(req.params.id, req.params.phase_id);
-  db.prepare(`UPDATE phase_plan_items SET ${updates.join(', ')} WHERE id = ? AND phase_id = ?`).run(...params);
-  // Moving a single item to another date is a schedule change too, and carries
-  // the same risk of leaving "tomorrow we…" behind on a neighbouring day.
-  // Only when the date actually moved — a text or link edit isn't a reshuffle.
   const dateMoved = body.date !== undefined && body.date !== existing.date;
-  if (dateMoved) { queuePhaseReview(req.params.phase_id); kickEnrichmentSoon(); }
+  db.transaction(() => {
+    db.prepare(`UPDATE phase_plan_items SET ${updates.join(', ')} WHERE id = ? AND phase_id = ?`).run(...params);
+    // A moved item needs a day to land on in its new stop.
+    if (phaseMoved) ensurePlanDay(targetPhase, body.date !== undefined ? body.date || null : existing.date);
+    // Moving a single item to another date is a schedule change too, and carries
+    // the same risk of leaving "tomorrow we…" behind on a neighbouring day.
+    // Only when the date actually moved — a text or link edit isn't a reshuffle.
+    // Moving it to another stop changes both stops' schedules.
+    if (dateMoved || phaseMoved) queuePhaseReview(req.params.phase_id);
+    if (phaseMoved) queuePhaseReview(targetPhase);
+  })();
+  if (dateMoved || phaseMoved) kickEnrichmentSoon();
   const updated = db.prepare('SELECT * FROM phase_plan_items WHERE id = ? AND phase_id = ?')
-    .get(req.params.id, req.params.phase_id);
+    .get(req.params.id, targetPhase);
   journey.syncFromLegacy('legacy-plan-update');
-  res.json({ ...joinBooking(updated, { includeDrafts: true }), ...(dateMoved ? { review: { status: HERMES_URL ? 'queued' : 'unavailable', scope: 'phase' } } : {}) });
+  const review = phaseMoved
+    ? { review: { status: HERMES_URL ? 'queued' : 'unavailable', scope: 'phases', phases: [req.params.phase_id, targetPhase] } }
+    : dateMoved ? { review: { status: HERMES_URL ? 'queued' : 'unavailable', scope: 'phase' } } : {};
+  res.json({ ...joinBooking(updated, { includeDrafts: true }), ...review });
 });
 
 app.delete('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res) => {
-  if (!VALID_PLAN_PHASES.has(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
+  if (!knownPhase(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
   const row = db.prepare('SELECT id FROM phase_plan_items WHERE id = ? AND phase_id = ?').get(req.params.id, req.params.phase_id);
   if (!row) return res.status(404).json({ error: 'not found' });
   db.prepare('DELETE FROM phase_plan_items WHERE id = ?').run(req.params.id);
@@ -2429,9 +3204,9 @@ app.delete('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res
 // overwrite path that was missing.
 app.patch('/api/phases/:phase_id/plan/days/:date', organizerOrAgentRequired, (req, res) => {
   const phaseId = req.params.phase_id;
-  if (!VALID_PLAN_PHASES.has(phaseId)) return res.status(400).json({ error: 'unknown phase' });
+  if (!knownPhase(phaseId)) return res.status(400).json({ error: 'unknown phase' });
   const { date } = req.params;
-  if (!ISO_DATE_RE.test(date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+  if (!isCalendarDay(date)) return res.status(400).json(planDateRefusal('date must be YYYY-MM-DD', 'date'));
   const body = req.body || {};
   for (const f of ['label_he', 'label_en']) {
     if (body[f] !== undefined && body[f] !== null && typeof body[f] !== 'string') {
@@ -2486,12 +3261,10 @@ app.patch('/api/phases/:phase_id/plan/days/:date', organizerOrAgentRequired, (re
 // together, in one transaction, or nothing does.
 app.post('/api/phases/:phase_id/plan/swap-days', organizerOrAgentRequired, (req, res) => {
   const phaseId = req.params.phase_id;
-  if (!VALID_PLAN_PHASES.has(phaseId)) return res.status(400).json({ error: 'unknown phase' });
+  if (!knownPhase(phaseId)) return res.status(400).json({ error: 'unknown phase' });
   const { date_a, date_b } = req.body || {};
   for (const [name, v] of [['date_a', date_a], ['date_b', date_b]]) {
-    if (typeof v !== 'string' || !ISO_DATE_RE.test(v)) {
-      return res.status(400).json({ error: `${name} must be YYYY-MM-DD` });
-    }
+    if (!isCalendarDay(v)) return res.status(400).json(planDateRefusal(`${name} must be YYYY-MM-DD`, name));
   }
   if (date_a === date_b) return res.status(400).json({ error: 'date_a and date_b must differ' });
 
@@ -2613,7 +3386,7 @@ async function enrichOne(item) {
       date: item.date || null,
       // Phase title gives the model the city/region, without which "the museum"
       // is unresolvable.
-      context: (TRIP_CONFIG.phases || []).find(p => p.id === item.phase_id)?.title || null,
+      context: tripStructure.phaseTitle(item.phase_id),
     }),
     // Must outlast trip-mcp's own 90s CLI budget, or this side gives up while
     // the model is still legitimately working and the item looks like a failure.
@@ -2706,7 +3479,7 @@ async function enrichDay(day) {
     body: JSON.stringify({
       kind: 'day',
       date: day.date,
-      context: (TRIP_CONFIG.phases || []).find(p => p.id === day.phase_id)?.title || null,
+      context: tripStructure.phaseTitle(day.phase_id),
       items: items.map(i => ({ time: i.time, text: i.text_en || i.text_he })),
     }),
     timeout: 100000,
@@ -2882,7 +3655,7 @@ async function reviewPhase(phaseId, days) {
     headers: { 'X-API-Key': HERMES_KEY, 'Content-Type': 'application/json' },
     body: JSON.stringify({
       kind: 'schedule_review',
-      context: (TRIP_CONFIG.phases || []).find(p => p.id === phaseId)?.title || null,
+      context: tripStructure.phaseTitle(phaseId),
       days,
     }),
     timeout: 120000,
@@ -3196,6 +3969,11 @@ function promoteConfigDays(createdBy, { queueEnrichment = true } = {}) {
   // 2026-09-25 it read the raw values: a one-element array passed httpOrNull's
   // regex and bound in SQLite as a plain value (stored, then served), and a
   // two-element one crashed boot with "Too many parameter values".
+  //
+  // The FILE, deliberately, not effectiveConfig(): this imports the original
+  // day plan (phases[].days[]), which the stop layer never carries — an
+  // override changes a stop's dates and hotel, never its days, and config_ref
+  // is keyed by the file's own positions.
   for (const rawPhase of (TRIP_CONFIG.phases || [])) {
     const phaseId = publicPart('phase', { id: rawPhase?.id })?.id;
     if (phaseId == null) continue;
@@ -3308,8 +4086,13 @@ function escapeConfigAttr(s) {
 app.post('/api/phase-plan/export-to-config', organizerOrAgentRequired, (req, res) => {
   if (!TRIP_CONFIG_RAW) return res.status(503).json({ error: 'trip config not loaded' });
   const phases = [];
+  // The EFFECTIVE phases are what gets written: the stops as the site shows
+  // them now (dates, hotels and stops set after the interview, open days
+  // recomputed), not the file as it was booted. A copy — the effective config
+  // is shared, and nothing is written unless something is exported.
+  const exportedPhases = JSON.parse(JSON.stringify(effectiveConfig().phases || []));
 
-  for (const phase of (TRIP_CONFIG.phases || [])) {
+  for (const phase of exportedPhases) {
     const items = db.prepare(
       'SELECT * FROM phase_plan_items WHERE phase_id = ? AND date IS NOT NULL ' +
       'ORDER BY date ASC, sort_order ASC, COALESCE(time_sort, 99999) ASC, id ASC'
@@ -3343,6 +4126,7 @@ app.post('/api/phase-plan/export-to-config', organizerOrAgentRequired, (req, res
   }
 
   if (!phases.length) return res.status(400).json({ error: 'no dated plan items to export' });
+  TRIP_CONFIG.phases = exportedPhases;
   persistConfigChange();
   const restorePoint = journey.setRestorePoint(req.user.username);
   const version = db.prepare('SELECT version FROM trip_config_versions ORDER BY version DESC LIMIT 1').get()?.version;
@@ -3363,7 +4147,7 @@ app.post('/api/phase-plan/import-from-bookings', organizerOrAgentRequired, (req,
     // for the Bookings tab dropping off-config phases). Importing one produced
     // a row that GET/PATCH/DELETE all reject as 'unknown phase' — unreachable
     // forever. Skip it and say so.
-    if (!VALID_PLAN_PHASES.has(bk.phase)) {
+    if (!knownPhase(bk.phase)) {
       skipped.push({ booking_id: bk.id, reason: 'phase not in trip config' });
       continue;
     }
@@ -3524,7 +4308,11 @@ function triviaPublicState() {
     pausedRemainingMs: triviaState.pausedRemainingMs,
     question,
     nextPersons: nextQ ? nextQ.persons : null,
-    players: triviaState.players,
+    // Built without `family`: this state also goes to the anonymous TV stream.
+    players: Object.fromEntries(Object.entries(triviaState.players).map(([u, p]) => {
+      const { family: _family, ...shown } = p;
+      return [u, shown];
+    })),
     myAnswer: null // client fills this in
   };
 }

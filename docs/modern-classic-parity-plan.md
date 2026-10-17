@@ -1,13 +1,12 @@
 # Modern / Classic parity implementation plan
 
-Prepared 2026-09-11 against `2500e07`; reconciled 2026-09-12 onto fetched Sprint 5 `63f8bcc`.
+Reconciled 2026-09-12 onto fetched Sprint 5 `63f8bcc` (first written 2026-09-11 against `2500e07`).
 Worktree: `.claude/worktrees/spa-parity`; branch: `feat/spa-parity`.
 Status: Sprint 5 and parity combined in this worktree, conflicts resolved, build and local regression suites passed. Deployed/provider acceptance remains open.
-No commit or live deployment performed.
 
 Modern already provides Today/Journey, itinerary item editing, booking
 management and extraction, 2D/3D maps, basic budget management, photos with
-comments/reactions, and live updates. The older HTML forward plan includes
+comments/reactions, and live updates. The older HTML forward plan (now `docs/archived/modern-trip-spa-forward-plan.html`) includes
 historical gaps that these implementations have closed.
 
 ## Implementation sequence
@@ -310,3 +309,49 @@ Implemented the recommended pre-merge fixes:
 Validation: all 109 SPA tests pass (16 files), TypeScript/production build passes, source diff checks pass. Added checks for cleared-day editing, captured revisions on both mutation paths, absent revisions, date union, malformed URLs, Trivia new-game vs phase lifecycle and idle timer/connected polling behavior. Existing activity matching and draft retention suites remain green. Live disposable-demo HTTP: anonymous trivia SSE 401; fixture member 200, text/event-stream, valid initial state frame. No runtime/auth route changes or deployment.
 
 Deferred nonblocking work: avatar discovery caching, the runtime existence-query optimization, bilingual/schema consolidation and cosmetic tuple/ternary/re-export cleanup. Bilingual fallback order currently produces equivalent results for the supported languages. Panel draft-retention behavior is preserved. No review comments were posted.
+
+## Decisions carried forward
+
+From `modern-trip-spa-forward-plan.html` (archived at
+`docs/archived/modern-trip-spa-forward-plan.html`), which this plan superseded.
+They are recorded here because the parity plan did not carry them. Sources are
+that document's "Decisions from organizer review", "Parity backlog", "Design
+interview prompts" and "Acceptance gate" sections (2026-09-07); whether the
+current Modern code still honours each was not re-checked in this pass.
+
+Decisions:
+
+- **(a) Budget stays its own module.** Budget and costs never appear inside daily
+  plan cards; Modern's Budget lives under More/Organizer.
+- **(b) Navigation.** Keep the four-tab mobile structure (Today, Journey, Moments,
+  More) plus a top menu for direct links and settings (language, logout).
+- **(c) The bot name is display-only in Modern.** It comes from the trip-creation
+  interview; Modern shows it and opens Telegram. Organizer bot-setting
+  improvements need Hermes changes and are future scope.
+- **(d) Classic is organizer-only.** It is the rollback and editing access for
+  organizers, not a fallback for members.
+- **(f) Acceptance gate for making Modern the default.** Modern becomes selectable
+  for production trips only when every Classic workflow has Modern parity or a
+  consciously accepted organizer-only Classic fallback; it becomes the default
+  only after one real test trip validates mobile, RTL/LTR, offline read
+  behaviour, operational links, privacy and organizer rollback. (The section
+  "Remaining acceptance before retiring Classic" above does not mention offline
+  read behaviour or the single-real-trip gate.)
+
+Intent, not decided or not built:
+
+- **(e) Moments should suggest memories** — from photos, ratings, group-chat
+  signals and the active trip day — rather than offer a blank writing box.
+  Unbuilt intent.
+- **(g) Open design questions, unanswered in the source:** which not-yet-modern
+  modules show to members as "coming next"; the Bookings card layout and
+  extraction flow; whether Today's top of screen is a countdown/story card, an
+  operations dashboard or a "what now?" assistant; and what Journey phases
+  represent (destinations, chapters, hotels, transport legs, or a mix). Also
+  deferred: trivia achievements/avatar-game ideas, and a post-trip recap as the
+  home for social feedback (RSVPs, ratings, comments).
+
+**UNVERIFIED:** the source's claim that "fresh provisioned trips default to Modern
+at the root, successful provisioning registers the runtime route, and the portal
+fails closed until that route is actually ready". It was not checked against the
+tree and is not asserted here.

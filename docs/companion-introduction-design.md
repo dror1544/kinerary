@@ -1,6 +1,6 @@
 # The companion's first message
 
-**Status: design, not implemented.** Written 2026-09-07, from a live-run
+**Status: BUILT — composed by the control plane in `control-plane/api/src/companion-intro.ts`, sent from `control-plane/api/src/relay/dispatch.ts`; §7 (group binding) built 2026-09-07.** (Checked against the tree 2026-09-25. The paragraph below "Today it sits silent" describes the state when this was written.) Written 2026-09-07, from a live-run
 request: when a new trip companion comes to life it must introduce itself
 rather than sit silent until spoken to.
 
@@ -73,8 +73,11 @@ the only new Telegram surface this needs.
 
 ## 4. The password question — a real decision
 
-`PROVISIONER_SEED_PASSWORD` is the shared family login. It reaches the site
-through `compute.py` and is deliberately not in the companion handoff today.
+The trip's site password is the shared family login. *As built (2026-10-15):*
+it is generated per trip at bootstrap (`provisioning.adapters.generate_site_password`),
+written only to that site's container `.env`, and read back by the worker after
+deploy into `trips.companion_intro.login_password`; the deployment-wide
+`PROVISIONER_SEED_PASSWORD` that this section was written about is retired.
 
 Putting it in the **organizer's DM** is uncontroversial.
 
@@ -91,6 +94,12 @@ this message changes with it.
 
 **Decision needed:** password in the group message, or "ask <organizer> for the
 login" with the password only in the DM.
+
+*As built (checked 2026-09-25):* `groupIntroText` takes `includePassword`, and
+`relay/dispatch.ts` passes `options.groupIntroIncludesPassword ?? true` — so both
+variants exist and the default puts the password in the group message. Whether
+that default is the owner's ruling on this question is not recorded here — ask
+Dror.
 
 ## 5. The trigger
 
@@ -160,9 +169,47 @@ outright: a token is not authority over a binding somebody else made.
 `/group` in the organizer's DM issues a fresh one at any time; asking again
 supersedes rather than accumulates.
 
+**One link instead of a pasted line (2026-10-16).** The introduction's primary
+path is the add-to-group link with the token as its payload:
+`https://t.me/<bot>?startgroup=KIN-XXXXXXXX&admin=pin_messages+invite_users`.
+The token (`KIN-` plus eight characters from `A-Z` without `I`/`O` and `2-9`;
+12 characters in all) is already a legal Telegram start payload (`A-Za-z0-9_-`,
+at most 64), so it rides unencoded. Telegram adds the bot to the
+group the organizer picked and then posts `/start@<bot> KIN-XXXXXXXX` there,
+from the organizer. `dispatchUpdate` claims that message — only in a non-private
+chat, only when the payload is *exactly* a token — and sends it through the same
+`redeemGroupBindingToken` call `/group <token>` uses, so the sender check,
+expiry, retired-trip check, "bound to a different trip" refusal, single flat
+refusal sentence, greeting and pin are all the same code, not a copy. The
+payload adds no authority of its own: someone else tapping a forwarded link is
+`WRONG_SENDER`. A private-chat `/start <anything>` is untouched (onboarding owns
+it), and a group `/start` with any other payload keeps the answer it had. The
+`/group KIN-…` line stays as the fallback and is still sent as the introduction's
+second message. The trip slug, the payload before this, had no consumer: in a
+group it only drew "let's do this in a private chat"; it survives as the payload
+only when no token could be issued.
+
+**Several groups per trip, by decision.** The token stays reusable until expiry,
+re-issue or revoke (owner decision 2026-10-16: one trip may bind several
+groups). Its protection is the sender check, not single use.
+
+**The join message.** The join arrives before the `/start@bot <token>` that
+binds it, so the reply to the bot being added to a not-yet-bound group is
+"Happy to join your group, but I need the trip joining key to be helpful."
+(Hebrew in the same register, chosen by the adder's Telegram locale), not the
+old "open the link from your signup". Ordinary messages in an unbound chat keep
+the old text.
+
+**The link needs the bot's handle.** It comes from `web.telegram_bot_username`
+(or `TELEGRAM_BOT_USERNAME`), and when neither is set from `getMe` on the
+signup bot token, cached (`bot-username.ts`). If no handle can be had the
+introduction still goes out without the link and the dispatcher logs
+`outbox.bot_username_unavailable`.
+
 ## 8. Not in scope
 
 Re-sending on re-provision (an organizer who re-runs setup should not get a
-second identical DM), and the `?startgroup` payload being used to bind
-automatically. The second is now moot as well as deferred — the token does the
-binding, with an identity check a link payload could not carry.
+second identical DM). The `?startgroup` payload binding automatically was
+deferred here and is now built (§7, "One link instead of a pasted line"): the
+payload is the token, and the identity check still happens at redemption, in the
+group, against the Telegram sender id.

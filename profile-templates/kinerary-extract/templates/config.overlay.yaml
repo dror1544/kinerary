@@ -1,7 +1,10 @@
 # Merge deliberately into the fresh profile config. Secrets are absent.
 # Model routing for this Kinerary installation — credentials configured separately.
 model:
-  default: minimax/minimax-m3:free
+  # `minimax/minimax-m3:free` was pinned here and on OpenRouter there is no
+  # such id, so every call fell through the chain below from the day this was
+  # written. The bare id is what model-runner.ts pins (DEFAULT_EXTRACT_MODEL).
+  default: minimax/minimax-m3
   provider: openrouter
 fallback_providers:
   # Vision / multimodal — primary for image/PDF/web extraction

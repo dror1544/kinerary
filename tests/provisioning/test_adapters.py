@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import os
 import re
+import subprocess
+import tempfile
 import unittest
+from dataclasses import replace
 
 from provisioning.adapters import (
     CloudflareTunnelDnsAdapter,
@@ -9,6 +13,7 @@ from provisioning.adapters import (
     ProxmoxLxcAdapter,
     SubprocessSshTransport,
     _truncate_middle,
+    generate_site_password,
 )
 from provisioning.models import CloudflareSpec, LxcSpec, ProxySpec
 
@@ -42,7 +47,7 @@ class FakeSshTransport:
         self.restart_count = 0
         self._active = True
 
-    def run(self, command: str) -> str:
+    def run(self, command: str, *, secrets: tuple[str, ...] = ()) -> str:
         self.commands.append(command)
         if command == f"sudo -n cat {self.config_path}":
             return self.files[self.config_path]
@@ -70,7 +75,7 @@ class FakeSshTransport:
 LXC_SPEC = LxcSpec(
     "trip-tokyo-2026", "pve", "local:vztmpl/debian.tar.zst", "local-lvm", 2, 1024, 8, "vmbr0",
     "192.168.0.60/24", "192.168.0.1", "192.168.0.41",
-    "/mnt/pve/truenas-nfs/tokyo-2026", "/nfs/tokyo-2026",
+    "/mnt/pve/truenas-nfs/tokyo-2026", "/nfs/tokyo-2026", "tokyo-2026",
 )
 
 # Real `pct list` output (2026-08-25, read-only inspection of the actual
@@ -99,7 +104,7 @@ class FakeProxmoxSsh:
         self.bootstrapped = bootstrapped
         self.commands: list[str] = []
 
-    def run(self, command: str) -> str:
+    def run(self, command: str, *, secrets: tuple[str, ...] = ()) -> str:
         self.commands.append(command)
         if command == "pct list":
             return self.pct_list_output
@@ -108,6 +113,8 @@ class FakeProxmoxSsh:
         if command.startswith("mkdir -p "):
             return ""
         if command.startswith("rm -rf "):
+            return ""
+        if command.startswith("printf %s ") and "TRIP.txt" in command:
             return ""
         if command.startswith("pct create ") and " && pct start " in command:
             return ""
@@ -217,9 +224,9 @@ class AdapterTests(unittest.TestCase):
         # container that has none. Every hand-built trip container (CT201) has
         # these; CT101, the first adapter-built one, did not. Found 2026-08-28.
         self.assertIn("build-essential", bootstrap)
-        # No seed password configured -> the site keeps its safe default of
-        # per-user random passwords.
-        self.assertNotIn("SEED_PASSWORD", bootstrap)
+        # Every site is born with its OWN generated login (see
+        # test_every_new_site_gets_its_own_generated_password).
+        self.assertIn("SEED_PASSWORD=%s", bootstrap)
         # A HERMES_API_KEY is always written so the site can accept agent/MCP
         # calls at all — without it the Sprint 5 companion wiring would have to
         # redeploy every container just to add one. Generated locally on the
@@ -231,23 +238,208 @@ class AdapterTests(unittest.TestCase):
         # their Classic front door until an organizer changes it explicitly.
         self.assertIn("TRIP_DESIGN_VARIANT=modern", bootstrap)
 
-    def test_seed_password_is_written_into_the_site_env_when_configured(self) -> None:
-        # Without it a provisioned site has NO way in at all: Telegram SSO is
-        # ruled out by the shared-bot routing, Google is unconfigured, and
-        # server.js seeds unrecoverable random passwords when SEED_PASSWORD is
-        # unset — and only ever seeds while the users table is empty, so it
-        # cannot be fixed after the fact. Confirmed live on CT101 2026-08-28.
+        # Both NFS paths are trip-id-shaped in general, so the marker is the
+        # recovery path for the slug — read from spec.trip_slug, not derived
+        # from nfs_mount_path (LXC_SPEC's happens to still look like a slug,
+        # but the two are independent now).
+        marker_write = ssh.commands[4]
+        self.assertIn("TRIP.txt", marker_write)
+        self.assertIn("trip: tokyo-2026", marker_write)
+        self.assertIn(f"container: {LXC_SPEC.name}", marker_write)
+
+    # ── per-trip site password ────────────────────────────────────────────
+    # Until 2026-10-15 one deployment-wide PROVISIONER_SEED_PASSWORD became the
+    # login of EVERY new trip site: anyone who had ever been a member of one
+    # trip could log in to the next, as any participant. Each site now gets its
+    # own, generated at bootstrap.
+
+    @staticmethod
+    def _seed_value(bootstrap: str) -> str:
+        # printf 'SEED_PASSWORD=%s\n' <quoted value> >> /opt/kinerary/.env
+        match = re.search(r"printf 'SEED_PASSWORD=%s\\n' (\S+) >> /opt/kinerary/\.env", bootstrap)
+        assert match, "bootstrap script does not write SEED_PASSWORD"
+        return match.group(1).strip("'")
+
+    def test_every_new_site_gets_its_own_generated_password(self) -> None:
+        first_ssh, second_ssh = FakeProxmoxSsh(nextid="203"), FakeProxmoxSsh(nextid="204")
+        ProxmoxLxcAdapter(first_ssh).create(LXC_SPEC)
+        ProxmoxLxcAdapter(second_ssh).create(LXC_SPEC)
+
+        first = self._seed_value(first_ssh.commands[3])
+        second = self._seed_value(second_ssh.commands[3])
+
+        self.assertNotEqual(first, second)
+        for value in (first, second):
+            self.assertRegex(value, r"^[a-z2-9]{4}(-[a-z2-9]{4}){3}$")
+
+    def test_generated_password_is_human_typeable_and_strong(self) -> None:
+        # Typed on a phone from a chat message: lower-case, digits, grouped by
+        # four, and none of the characters people misread (0/o, 1/l/i). 16
+        # characters over a 31-symbol alphabet is ~79 bits, from `secrets`.
+        values = {generate_site_password() for _ in range(200)}
+        self.assertEqual(200, len(values))
+        alphabet = set("".join(values).replace("-", ""))
+        self.assertTrue(alphabet.isdisjoint(set("01oli")), alphabet)
+        for value in values:
+            self.assertRegex(value, r"^[a-z2-9]{4}(-[a-z2-9]{4}){3}$")
+
+    def test_a_shared_deployment_wide_seed_password_can_no_longer_be_passed_in(self) -> None:
+        # The env var is gone from the worker; the adapter must not keep a
+        # back door that a caller could still wire it through.
+        with self.assertRaises(TypeError):
+            ProxmoxLxcAdapter(FakeProxmoxSsh(), seed_password="shared")  # type: ignore[call-arg]
+
+    def test_password_is_shell_quoted_and_appended_not_interpolated_into_the_heredoc(self) -> None:
+        # The heredoc that writes .env is unquoted (it expands ${JWT_SECRET}),
+        # so a value containing $ or ` would be mangled there. The injectable
+        # factory lets this test use exactly such a value.
         ssh = FakeProxmoxSsh(nextid="203")
-        adapter = ProxmoxLxcAdapter(ssh, seed_password="s3cret pw$x")
-
-        adapter.create(LXC_SPEC)
-
+        ProxmoxLxcAdapter(ssh, password_factory=lambda: "s3cret pw$x").create(LXC_SPEC)
         bootstrap = ssh.commands[3]
-        # Shell-quoted, and appended rather than interpolated into the heredoc:
-        # that heredoc is unquoted so ${...} expands, which would corrupt any
-        # password containing a dollar sign.
         self.assertIn("'s3cret pw$x'", bootstrap)
         self.assertIn("SEED_PASSWORD=%s", bootstrap)
+        self.assertNotIn("SEED_PASSWORD=s3cret", bootstrap)
+
+    def _run_env_block(self, script: str, tmp: str) -> None:
+        """Run the part of the bootstrap script that writes .env, for real, in a
+        scratch directory — the only way to test the keep-if-present guard
+        rather than the text that implements it."""
+        match = re.search(r"^if \[ ! -f /opt/kinerary/\.env \]; then\n.*?^fi\n", script, re.S | re.M)
+        assert match, "no .env guard block in the bootstrap script"
+        block = match.group(0).replace("/opt/kinerary", tmp)
+        subprocess.run(["bash", "-euo", "pipefail", "-c", block], check=True, capture_output=True)
+
+    def test_reprovisioning_an_existing_site_keeps_its_password(self) -> None:
+        # People already log in with it. A second bootstrap (needs_bootstrap's
+        # converge path, or any redeploy) generates a NEW candidate password but
+        # must leave the .env it finds exactly as it was.
+        first_ssh, second_ssh = FakeProxmoxSsh(nextid="203"), FakeProxmoxSsh(nextid="203")
+        ProxmoxLxcAdapter(first_ssh).create(LXC_SPEC)
+        ProxmoxLxcAdapter(second_ssh).create(LXC_SPEC)
+        first, second = first_ssh.commands[3], second_ssh.commands[3]
+        self.assertNotEqual(self._seed_value(first), self._seed_value(second))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._run_env_block(first, tmp)
+            with open(os.path.join(tmp, ".env")) as handle:
+                env_after_first = handle.read()
+            self.assertIn(f"SEED_PASSWORD={self._seed_value(first)}\n", env_after_first)
+
+            self._run_env_block(second, tmp)  # re-provision
+            with open(os.path.join(tmp, ".env")) as handle:
+                env_after_second = handle.read()
+
+        self.assertEqual(env_after_first, env_after_second)
+        self.assertNotIn(self._seed_value(second), env_after_second)
+
+    def test_env_with_the_password_is_private(self) -> None:
+        ssh = FakeProxmoxSsh(nextid="203")
+        ProxmoxLxcAdapter(ssh).create(LXC_SPEC)
+        with tempfile.TemporaryDirectory() as tmp:
+            self._run_env_block(ssh.commands[3], tmp)
+            self.assertEqual(0o600, os.stat(os.path.join(tmp, ".env")).st_mode & 0o777)
+
+    def test_the_generated_password_is_listed_for_redaction(self) -> None:
+        # run()'s redaction is opt-in per call: the password this script embeds
+        # has to be named, or a failing bootstrap that echoes it reaches logs.
+        seen: list[tuple[str, ...]] = []
+
+        class Recording(FakeProxmoxSsh):
+            def run(self, command, *, secrets=()):
+                if "BOOTSTRAP_INNER" in command:
+                    seen.append(secrets)
+                return super().run(command, secrets=secrets)
+
+        ssh = Recording(nextid="203")
+        ProxmoxLxcAdapter(ssh).create(LXC_SPEC)
+        self.assertEqual(1, len(seen))
+        self.assertIn(self._seed_value(ssh.commands[3]), seen[0])
+
+    def test_site_password_reads_back_what_the_container_holds(self) -> None:
+        # The organizer must be told the password the site accepts, not one the
+        # control plane remembers: read it from the container's own .env.
+        class Reading(FakeProxmoxSsh):
+            def __init__(self, env: str) -> None:
+                super().__init__()
+                self.env = env
+
+            def run(self, command, *, secrets=()):
+                if command.startswith("pct exec 201 -- ") and "/opt/kinerary/.env" in command:
+                    self.commands.append(command)
+                    return self.env
+                return super().run(command, secrets=secrets)
+
+        spec = LxcSpec(
+            "trip-kinerary", "pve", "t", "s", 2, 1024, 8, "vmbr0", "ip", "gw", "ns", "h", "m", "kinerary",
+        )
+        ssh = Reading("SEED_PASSWORD=ab2c-d3ef-gh4j-km5n\n")
+        self.assertEqual("ab2c-d3ef-gh4j-km5n", ProxmoxLxcAdapter(ssh).site_password(spec))
+        # nothing secret travels in the command that reads it
+        self.assertNotIn("ab2c", ssh.commands[-1])
+        # a legacy site whose .env carries no SEED_PASSWORD has none to report
+        self.assertIsNone(ProxmoxLxcAdapter(Reading("PORT=3000\n")).site_password(spec))
+        # no such container -> None, not an exception
+        self.assertIsNone(ProxmoxLxcAdapter(FakeProxmoxSsh()).site_password(LXC_SPEC))
+
+    def test_a_failed_password_read_does_not_carry_the_password_in_its_error(self) -> None:
+        # The ssh transport quotes the command's output in its error, and the
+        # worker logs job failures with their text: a read that exits non-zero
+        # after printing the password must not put it in that text.
+        class Failing(FakeProxmoxSsh):
+            def run(self, command, *, secrets=()):
+                if command.startswith("pct exec 201 -- ") and "/opt/kinerary/.env" in command:
+                    raise RuntimeError("ssh command failed (exit 255): SEED_PASSWORD=ab2c-d3ef-gh4j-km5n")
+                return super().run(command, secrets=secrets)
+
+        spec = LxcSpec(
+            "trip-kinerary", "pve", "t", "s", 2, 1024, 8, "vmbr0", "ip", "gw", "ns", "h", "m", "kinerary",
+        )
+        with self.assertRaises(RuntimeError) as caught:
+            ProxmoxLxcAdapter(Failing()).site_password(spec)
+        self.assertNotIn("ab2c", str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertTrue(caught.exception.__suppress_context__)
+
+    def test_a_new_trip_site_turns_the_member_connector_on(self) -> None:
+        # The trip site serves its own MCP endpoint (server/trip-mcp, #220) so
+        # every member can connect Claude or ChatGPT: organizers read and write,
+        # members read only. It is OFF unless the site's .env carries BOTH
+        # TRIP_MCP_ENABLED and PUBLIC_ORIGIN, and nothing warns when they are
+        # missing: the nginx routes are there, Express answers 404, and the
+        # "Connect your AI assistant" card shows nothing. Orlando had them added
+        # by hand; a trip the control plane builds got neither.
+        ssh = FakeProxmoxSsh(nextid="203")
+        spec = replace(LXC_SPEC, public_origin="https://tokyo-2026.example.test")
+
+        ProxmoxLxcAdapter(ssh).create(spec)
+
+        bootstrap = ssh.commands[3]
+        env_block = bootstrap.split("cat > /opt/kinerary/.env <<ENVEOF\n", 1)[1].split("\nENVEOF", 1)[0]
+        self.assertIn("TRIP_MCP_ENABLED=1", env_block.splitlines())
+        self.assertIn("PUBLIC_ORIGIN=https://tokyo-2026.example.test", env_block.splitlines())
+
+    def test_a_site_with_no_known_public_origin_leaves_the_connector_off(self) -> None:
+        # A hand-built spec (no topology hostname) must not guess an origin: the
+        # connector's OAuth issuer is that origin, so a wrong one is worse than off.
+        ssh = FakeProxmoxSsh(nextid="203")
+
+        ProxmoxLxcAdapter(ssh).create(LXC_SPEC)
+
+        env_block = ssh.commands[3].split("cat > /opt/kinerary/.env <<ENVEOF\n", 1)[1].split("\nENVEOF", 1)[0]
+        self.assertNotIn("TRIP_MCP_ENABLED", env_block)
+        self.assertNotIn("PUBLIC_ORIGIN", env_block)
+
+    def test_a_public_origin_that_is_not_a_plain_https_origin_is_refused_loudly(self) -> None:
+        # The .env heredoc is unquoted, so the value is expanded by a shell. A
+        # hostname with $, a backtick, a space, a path or http:// is a bug in the
+        # caller; silently dropping it would leave the connector off with
+        # nothing to say so.
+        for bad in ("http://x.example.test", "https://x.example.test/t/abc", "https://$(id).example.test",
+                    "https://x.example.test\nJWT_SECRET=oops", "https://a b.example.test", "x.example.test"):
+            with self.subTest(origin=bad):
+                ssh = FakeProxmoxSsh(nextid="203")
+                with self.assertRaises(ValueError):
+                    ProxmoxLxcAdapter(ssh).create(replace(LXC_SPEC, public_origin=bad))
 
     def test_exchange_key_is_private_and_shell_quoted(self) -> None:
         ssh = FakeProxmoxSsh(nextid="203")
@@ -304,6 +496,172 @@ class AdapterTests(unittest.TestCase):
                 transport.run("git pull")
         self.assertIn("repository not found", str(caught.exception))
         self.assertIn("exit 2", str(caught.exception))
+
+    # ── #185: the command never reaches ssh's argv ────────────────────────
+    def test_run_sends_the_command_on_stdin_never_in_ssh_argv(self) -> None:
+        # Anything passed to run() previously became the final element of
+        # ssh's own argv (subprocess.run(["ssh", ..., host, command])), which
+        # a local `ps`/process listing, or any logging of the invoked argv,
+        # would show in full — including any secret embedded in the command
+        # text. `ssh ... bash -s` with the command fed on stdin never puts it
+        # on the command line at all.
+        from unittest import mock
+
+        transport = SubprocessSshTransport("h", "u", "/k")
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        secret_bearing_command = "printf 'SEED_PASSWORD=%s\\n' 'tr0ub4dor&3' >> /opt/kinerary/.env"
+        with mock.patch("provisioning.adapters.subprocess.run", return_value=completed) as run:
+            transport.run(secret_bearing_command)
+
+        argv = run.call_args[0][0]
+        kwargs = run.call_args[1]
+        self.assertNotIn(secret_bearing_command, argv)
+        self.assertFalse(any("tr0ub4dor&3" in part for part in argv))
+        self.assertEqual(secret_bearing_command, kwargs.get("input"))
+        # The remote side still runs it as a shell script, read from stdin.
+        self.assertIn("bash", argv)
+        self.assertIn("-s", argv)
+
+    def test_bootstrap_secrets_never_reach_ssh_argv_end_to_end(self) -> None:
+        # The concrete exposure #185 was filed against: the whole bootstrap
+        # script — which embeds SEED_PASSWORD and CONTROL_PLANE_EXCHANGE_KEY
+        # via _bootstrap_app_environment — must never appear in any argv
+        # subprocess.run is called with, across a full create().
+        from unittest import mock
+
+        transport = SubprocessSshTransport("h", "u", "/k")
+        completed = mock.Mock(returncode=0, stdout="203\n", stderr="")
+        adapter = ProxmoxLxcAdapter(
+            transport, password_factory=lambda: "s3cret pw$x", control_plane_exchange_key="exchange $key",
+        )
+        with mock.patch("provisioning.adapters.subprocess.run", return_value=completed) as run:
+            adapter.create(LXC_SPEC)
+
+        for call in run.call_args_list:
+            argv = call.args[0]
+            self.assertFalse(any("s3cret pw$x" in part for part in argv))
+            self.assertFalse(any("exchange $key" in part for part in argv))
+        # The bootstrap script (carrying both secrets) reached the transport
+        # on stdin, not argv — confirms the assertion above isn't vacuous.
+        bootstrap_call = next(
+            call for call in run.call_args_list
+            if isinstance(call.kwargs.get("input"), str) and "BOOTSTRAP_INNER" in call.kwargs["input"]
+        )
+        self.assertIn("s3cret pw$x", bootstrap_call.kwargs["input"])
+        self.assertIn("exchange $key", bootstrap_call.kwargs["input"])
+
+    def test_failed_run_redacts_secrets_from_the_raised_error(self) -> None:
+        # A RuntimeError's text reaches worker logs. If the failing script's
+        # own stdout happened to echo a secret (a debug trace, an accidental
+        # echo), the raised error must not repeat it.
+        from unittest import mock
+
+        transport = SubprocessSshTransport("h", "u", "/k")
+        completed = mock.Mock(
+            returncode=1, stdout="+ printf SEED_PASSWORD=tr0ub4dor&3\nmkdir: Permission denied", stderr="",
+        )
+        with mock.patch("provisioning.adapters.subprocess.run", return_value=completed):
+            with self.assertRaises(RuntimeError) as caught:
+                transport.run("some script", secrets=("tr0ub4dor&3",))
+
+        self.assertNotIn("tr0ub4dor&3", str(caught.exception))
+        self.assertIn("Permission denied", str(caught.exception))
+
+    def test_bootstrap_failure_redacts_seed_password_and_exchange_key_from_the_error(self) -> None:
+        from unittest import mock
+
+        transport = SubprocessSshTransport("h", "u", "/k")
+
+        def fake_run(argv, **kwargs):
+            script = kwargs.get("input", "")
+            if "BOOTSTRAP_INNER" in script:
+                return mock.Mock(
+                    returncode=1,
+                    stdout="SEED_PASSWORD=s3cret pw$x CONTROL_PLANE_EXCHANGE_KEY=exchange $key failed",
+                    stderr="",
+                )
+            return mock.Mock(returncode=0, stdout="203\n", stderr="")
+
+        adapter = ProxmoxLxcAdapter(
+            transport, password_factory=lambda: "s3cret pw$x", control_plane_exchange_key="exchange $key",
+        )
+        with mock.patch("provisioning.adapters.subprocess.run", side_effect=fake_run):
+            with self.assertRaises(RuntimeError) as caught:
+                adapter.create(LXC_SPEC)
+
+        self.assertNotIn("s3cret pw$x", str(caught.exception))
+        self.assertNotIn("exchange $key", str(caught.exception))
+
+    def _assert_timeout_error_is_redacted(self, timed_out, canary: str = "tr0ub4dor&3") -> str:
+        from unittest import mock
+
+        transport = SubprocessSshTransport("h", "u", "/k")
+        with mock.patch("provisioning.adapters.subprocess.run", side_effect=timed_out):
+            with self.assertRaises(RuntimeError) as caught:
+                transport.run("some script", secrets=(canary,))
+        text = str(caught.exception)
+        self.assertIn("timed out", text)
+        self.assertNotIn(canary, text)
+        return text
+
+    # subprocess.TimeoutExpired keeps .stdout/.stderr as BYTES even when
+    # subprocess.run(..., text=True) was used (Python 3.9-3.12, POSIX), so a
+    # test that builds it with str output never exercises the real type. These
+    # cases do. Added after PR #285 review found that str.replace(secret, ...)
+    # on bytes raised TypeError instead of redacting.
+    def test_timeout_with_bytes_stdout_is_redacted(self) -> None:
+        text = self._assert_timeout_error_is_redacted(subprocess.TimeoutExpired(
+            cmd=["ssh"], timeout=900,
+            output=b"+ printf SEED_PASSWORD=tr0ub4dor&3\nstill apt-get installing",
+        ))
+        self.assertIn("apt-get installing", text)
+        self.assertIn("[REDACTED]", text)
+
+    def test_timeout_with_bytes_stderr_is_redacted(self) -> None:
+        text = self._assert_timeout_error_is_redacted(subprocess.TimeoutExpired(
+            cmd=["ssh"], timeout=900, output=None,
+            stderr=b"debug: key=tr0ub4dor&3\nW: still waiting on dpkg lock",
+        ))
+        self.assertIn("dpkg lock", text)
+        self.assertIn("[REDACTED]", text)
+
+    def test_timeout_with_non_utf8_bytes_does_not_crash_and_is_redacted(self) -> None:
+        text = self._assert_timeout_error_is_redacted(subprocess.TimeoutExpired(
+            cmd=["ssh"], timeout=900,
+            output=b"\xff\xfe before tr0ub4dor&3 after \xff\xfe",
+        ))
+        self.assertIn("before", text)
+        self.assertIn("after", text)
+
+    def test_timeout_with_str_output_is_still_redacted(self) -> None:
+        # Some Python versions / callers hand back str; both must work.
+        text = self._assert_timeout_error_is_redacted(subprocess.TimeoutExpired(
+            cmd=["ssh"], timeout=900,
+            output="+ printf SEED_PASSWORD=tr0ub4dor&3\nstill apt-get installing",
+        ))
+        self.assertIn("apt-get installing", text)
+
+    def test_real_ssh_child_that_prints_and_hangs_is_redacted(self) -> None:
+        # No mock of subprocess: a fake `ssh` earlier on PATH prints the canary
+        # and hangs, so the TimeoutExpired is the one Python really raises.
+        # `exec sleep` matters: without it the killed shell's `sleep` child
+        # keeps the pipe open and subprocess.run blocks until it exits.
+        from unittest import mock
+
+        canary = "canary-secret-7f3a"
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = os.path.join(tmp, "ssh")
+            with open(fake, "w") as handle:
+                handle.write(f"#!/bin/sh\necho {canary}\nexec sleep 30\n")
+            os.chmod(fake, 0o755)
+            transport = SubprocessSshTransport("h", "u", "/k", command_timeout=1)
+            with mock.patch.dict(os.environ, {"PATH": tmp + os.pathsep + os.environ["PATH"]}):
+                with self.assertRaises(RuntimeError) as caught:
+                    transport.run("some script", secrets=(canary,))
+
+        self.assertIn("timed out", str(caught.exception))
+        self.assertNotIn(canary, str(caught.exception))
+        self.assertIn("[REDACTED]", str(caught.exception))
 
     def test_reset_data_wipes_server_data_and_media_before_anything_else(self) -> None:
         # The NFS dir outlives a container, so a failed earlier provision can
@@ -405,6 +763,60 @@ class AdapterTests(unittest.TestCase):
         adapter.delete(LXC_SPEC)
 
         self.assertFalse(any("pct stop" in c or "pct destroy" in c for c in ssh.commands))
+
+    # ── #119: what a second bootstrap does to the site's agent key ───────────
+    def _env_block(self, tmp: str) -> str:
+        """The `.env`-minting part of the real bootstrap script (from its guard
+        to the systemd unit), retargeted at a temp directory, so the test runs
+        the shell the container would run rather than reading it."""
+        ssh = FakeProxmoxSsh(nextid="203")
+        spec = LxcSpec(
+            "trip-tokyo-2026", "pve", "local:vztmpl/debian.tar.zst", "local-lvm", 2, 1024, 8,
+            "vmbr0", "192.0.2.60/24", "192.0.2.1", "192.0.2.2",
+            "/srv/nfs/tokyo-2026", f"{tmp}/nfs", "tokyo-2026",
+        )
+        ProxmoxLxcAdapter(ssh).create(spec)
+        script = ssh.commands[3].replace("/opt/kinerary", f"{tmp}/app")
+        start = script.index(f"if [ ! -f {tmp}/app/.env ]")
+        end = script.index("cat > /etc/systemd/system/kinerary-server.service")
+        return script[start:end]
+
+    def _key(self, tmp: str) -> str:
+        with open(f"{tmp}/app/.env") as fh:
+            return re.search(r"^HERMES_API_KEY=(\S+)$", fh.read(), re.M).group(1)
+
+    def test_a_bootstrap_after_the_env_file_is_lost_mints_a_new_key_and_prints_none(self) -> None:
+        """Documents WHY the worker must re-run the bridge after a bootstrap
+        (the key changes) and that nothing the script prints carries a key
+        (its stdout reaches RuntimeError text, and so worker logs)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(f"{tmp}/app"); os.makedirs(f"{tmp}/nfs")
+            block = self._env_block(tmp)
+            outs = []
+            keys = []
+            for _ in range(2):
+                proc = subprocess.run(
+                    ["bash", "-c", "set -euo pipefail\n" + block],
+                    capture_output=True, text=True, check=True,
+                )
+                outs.append(proc.stdout + proc.stderr)
+                keys.append(self._key(tmp))
+                os.remove(f"{tmp}/app/.env")
+            self.assertNotEqual(keys[0], keys[1])
+            for out in outs:
+                for k in keys:
+                    self.assertNotIn(k, out)
+            # No key is kept anywhere but the site's own .env (no stored copy).
+            self.assertEqual(os.listdir(f"{tmp}/nfs"), [])
+
+    def test_the_bootstrap_script_never_traces_or_echoes_the_key(self) -> None:
+        ssh = FakeProxmoxSsh(nextid="203")
+        ProxmoxLxcAdapter(ssh).create(LXC_SPEC)
+        script = ssh.commands[3]
+        self.assertNotIn("set -x", script)
+        for line in script.splitlines():
+            if "HERMES_API_KEY" in line:
+                self.assertNotRegex(line, r"\b(echo|printf|tee|logger)\b", line)
 
     def test_needs_bootstrap_is_false_for_an_absent_container(self) -> None:
         adapter = ProxmoxLxcAdapter(FakeProxmoxSsh())

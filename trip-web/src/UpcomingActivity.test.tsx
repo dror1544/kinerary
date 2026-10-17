@@ -14,18 +14,65 @@ it("opens the exact plan item and keeps Maps independent", () => {
   fireEvent.click(screen.getByRole("button", { name: "View Temple in the plan" }));
   expect(open).toHaveBeenCalledWith({ phaseId: "kyoto", date: "2026-09-13", itemUid: "activity-2" });
 });
-it("opens an authenticated confirmation for viewing without editing or navigating the plan", async () => {
-  const open = vi.fn();
-  const replace = vi.fn();
-  vi.spyOn(window, "open").mockReturnValue({ opener: null, location: { replace }, close: vi.fn() } as unknown as Window);
+// What the document opens in depends on the browser, so each test pins one
+// browser state: activation still live (new tab), expired (this tab), or the
+// installed home-screen app (this tab, whatever the activation).
+const browser = ({ active, standalone = false }: { active: boolean; standalone?: boolean }) => {
+  const windowOpen = vi.spyOn(window, "open").mockReturnValue(null);
+  const assign = vi.fn();
+  vi.stubGlobal("navigator", Object.assign(Object.create(navigator), { userActivation: { isActive: active } }));
+  vi.stubGlobal("matchMedia", vi.fn(() => ({ matches: standalone })));
+  vi.stubGlobal("location", { ...window.location, assign });
   vi.stubGlobal("URL", Object.assign(URL, { createObjectURL: vi.fn(() => "blob:confirmation"), revokeObjectURL: vi.fn() }));
   vi.mocked(getAuthenticatedDocument).mockResolvedValue(new Blob(["confirmation"], { type: "application/pdf" }));
-  render(<UpcomingActivity item={item} lang="en" onOpenItinerary={open} />);
+  return { windowOpen, assign };
+};
+const viewConfirmation = (onOpenItinerary = vi.fn()) => {
+  render(<UpcomingActivity item={item} lang="en" onOpenItinerary={onOpenItinerary} />);
   fireEvent.click(screen.getByRole("button", { name: "View confirmation" }));
-  await waitFor(() => expect(replace).toHaveBeenCalledWith("blob:confirmation"));
+  return onOpenItinerary;
+};
+it("opens an authenticated confirmation for viewing without editing or navigating the plan", async () => {
+  const { windowOpen, assign } = browser({ active: true });
+  const open = viewConfirmation();
+  // One tab, opened with the document already in hand — never a blank tab
+  // opened before the fetch and filled in after it (that tab stayed blank).
+  await waitFor(() => expect(windowOpen).toHaveBeenCalledWith("blob:confirmation", "_blank", "noopener"));
+  expect(windowOpen).toHaveBeenCalledTimes(1);
+  expect(assign).not.toHaveBeenCalled();
   expect(getAuthenticatedDocument).toHaveBeenCalledWith("/api/bookings/confirmation/temple.pdf");
   expect(open).not.toHaveBeenCalled();
   expect(screen.queryByRole("button", { name: /download|edit/i })).not.toBeInTheDocument();
+});
+it("opens nothing until the document has arrived", async () => {
+  const { windowOpen } = browser({ active: true });
+  let arrive!: (blob: Blob) => void;
+  vi.mocked(getAuthenticatedDocument).mockReturnValue(new Promise<Blob>((resolve) => { arrive = resolve; }));
+  viewConfirmation();
+  await waitFor(() => expect(getAuthenticatedDocument).toHaveBeenCalled());
+  expect(windowOpen).not.toHaveBeenCalled();
+  arrive(new Blob(["confirmation"], { type: "application/pdf" }));
+  await waitFor(() => expect(windowOpen).toHaveBeenCalledWith("blob:confirmation", "_blank", "noopener"));
+});
+it("opens the confirmation in this tab when the click's activation has expired", async () => {
+  const { windowOpen, assign } = browser({ active: false });
+  viewConfirmation();
+  await waitFor(() => expect(assign).toHaveBeenCalledWith("blob:confirmation"));
+  expect(windowOpen).not.toHaveBeenCalled();
+});
+it("opens the confirmation in this tab in the installed app, even with live activation", async () => {
+  const { windowOpen, assign } = browser({ active: true, standalone: true });
+  viewConfirmation();
+  await waitFor(() => expect(assign).toHaveBeenCalledWith("blob:confirmation"));
+  expect(windowOpen).not.toHaveBeenCalled();
+});
+it("says so when the confirmation cannot be fetched, and opens nothing", async () => {
+  const { windowOpen, assign } = browser({ active: true });
+  vi.mocked(getAuthenticatedDocument).mockRejectedValue(new Error("Confirmation not found"));
+  viewConfirmation();
+  expect(await screen.findByText("Confirmation not found")).toBeInTheDocument();
+  expect(windowOpen).not.toHaveBeenCalled();
+  expect(assign).not.toHaveBeenCalled();
 });
 it("omits absent confirmations and searches Maps when no location is stored", () => {
   render(<UpcomingActivity item={{ ...item, booking: null, location_url: null }} config={{ phases: [{ id: "kyoto", title: "Kyoto" }] }} lang="en" onOpenItinerary={vi.fn()} />);

@@ -38,7 +38,7 @@ import {
   agentAlreadySpokeThisTurn,
   sayForChat
 } from "../src/interview.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -89,7 +89,7 @@ async function seedInterview(pool: pg.Pool, chatId: string): Promise<Chat> {
 }
 
 async function withTwoInterviews(fn: (fix: Fixture) => Promise<void>): Promise<void> {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");

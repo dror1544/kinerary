@@ -2,7 +2,7 @@
 name: trip-kml-export
 description: Export trip places to KML (hotels, attractions, restaurants, or all) and send the file to the group or organizer.
 version: 1.0.0
-author: Nahum / Hermes
+author: Kinerary / Hermes
 license: MIT
 metadata:
   hermes:
@@ -43,8 +43,11 @@ bookings = mcp__trip_mcp__get_bookings()   # may be empty — that's ok
 ```
 
 ### 2. Run the export script
+The script lives in this skill's own folder. `skill_view("trip-kml-export")` returns that folder as
+`skill_dir`; build the path from it. There is no environment variable for it.
+
 ```bash
-SCRIPT="$PROFILE_SKILLS_DIR/travel/trip-kml-export/scripts/trip_kml_export.py"
+SCRIPT="<skill_dir>/scripts/trip_kml_export.py"
 OUTPUT="/tmp/trip_export_$(date +%s).kml"
 
 echo '{"config": <config_json>, "bookings": <bookings_json>}' \
@@ -60,7 +63,7 @@ bookings_json = ...   # list/dict from get_bookings
 
 payload = json.dumps({"config": config_json, "bookings": bookings_json}, ensure_ascii=False)
 output_path = f"/tmp/trip_{int(time.time())}.kml"
-script = "$PROFILE_SKILLS_DIR/travel/trip-kml-export/scripts/trip_kml_export.py"
+script = f"{skill_dir}/scripts/trip_kml_export.py"   # skill_dir from skill_view("trip-kml-export")
 
 result = subprocess.run(
     ["python3", script, "--filter", FILTER_MODE, "--output", output_path],
@@ -77,7 +80,7 @@ print(meta)   # {"ok": true, "file": "...", "placemarks": N, "trip": "..."}
 
 ### 4. Send the file
 - **To the group** (if organizer approved or request came from group): send as file attachment via Telegram — include a short message with the filter label and a usage tip.
-- **To the organizer only** (if in doubt): send privately to שירן.
+- **To the organizer only** (if in doubt): send privately to the organizer.
 
 **Message template (group):**
 ```
@@ -105,8 +108,14 @@ Hermes will deliver it as a file attachment.
 
 ## Coordinate coverage note
 The script extracts coordinates from:
-- Phase `accommodation` objects (hotels)
-- Bookings with `lat`/`lon`/`latitude`/`longitude` fields
+- Phase `hotels[]` entries, or else the phase's `accommodation` (hotels); a hotel with no coordinates of its
+  own takes its stop's coordinates, then the stop's `mapStop` pin
+- Bookings with `lat`/`lon`/`lng`/`latitude`/`longitude` fields
+
+## Language
+Names and descriptions in the file are in the trip's own language only (`meta.defaultLang`; without it, Hebrew
+when the trip has any Hebrew text, else English). A bilingual value uses the other language only when the trip's
+language is missing for it. Pass `get_config` as it comes — do not translate or merge the two languages yourself.
 
 **If a place has no coordinates** — it is silently skipped (not included in KML). After export, tell the user how many places were exported. If the count seems low, check whether the missing places have coordinates in the config/bookings and offer to look up their coordinates via the `maps` skill and update them.
 

@@ -34,6 +34,13 @@ import {
   type ChaosCheck,
   type ChaosMove,
 } from "./organizer-chaos.js";
+import {
+  STAR_SCENARIO,
+  buildFindings,
+  choiceAnswer,
+  type Scenario,
+  type TypedFallback,
+} from "./organizer-scenarios.js";
 
 const arg = (name: string, fallback = "") => {
   const i = process.argv.indexOf(`--${name}`);
@@ -51,6 +58,8 @@ const chaos = scenarioName === "chaos";
 const turnSeconds = Number(arg("turn-seconds", chaos ? "480" : "240"));
 const totalMinutes = Number(arg("minutes", chaos ? "60" : "30"));
 const reportPath = arg("report");
+/** Where to write what this organizer observed about itself (see buildFindings). */
+const findingsPath = arg("findings");
 const databaseUrl = process.env.CONTROL_PLANE_DATABASE_URL;
 
 // ── The scenarios: what this organizer says, by question ─────────────────────
@@ -59,15 +68,10 @@ const databaseUrl = process.env.CONTROL_PLANE_DATABASE_URL;
 // scripts the answers its documents carry, in case the router asks anyway —
 // being asked twice is a finding the transcript shows, not a stuck run.
 
-interface Scenario {
-  language: "he" | "en";
-  documents: boolean;
-  text: Record<string, string>;
-  choice: Record<string, string>;
-  multi: Record<string, string[]>;
-}
-
+// The Scenario type, and the `star` scenario, live in organizer-scenarios.ts so
+// a test can import them: this file runs an interview the moment it loads.
 const SCENARIOS: Record<string, Scenario> = {
+  star: STAR_SCENARIO,
   japan: {
     language: "he",
     documents: true,
@@ -118,6 +122,66 @@ const SCENARIOS: Record<string, Scenario> = {
     },
     choice: { trip_type: "family", bot_gender: "female", bot_tone: "playful", trip_pace: "balanced", dietary_visibility: "group" },
     multi: { dietary: ["vegetarian", "nut_allergy"] },
+  },
+  // Scenario 5 — Dror's own baseline run, 2026-09-20, replayed verbatim.
+  //
+  // The others all describe a trip that is ALREADY DECIDED: every phase has a
+  // city and a pair of dates, so the interview only has to write down what it
+  // is told. This one does not, and that is the whole reason it exists. Half
+  // the trip is planned and half is explicitly open, the organizer says so in
+  // as many words and asks for a proposal, and one dietary need belongs to one
+  // traveller and not the rest.
+  //
+  // Answers are the ones that actually reached `intake_sessions.answers` on
+  // that run, in the phrasings that produced them — `timezone` included. It
+  // reads "Vietnam", which is not a timezone, because that is what an organizer
+  // typed when asked; the fixture keeps it so the SITE is what has to end up
+  // with a real zone. Normalising it here would test the fixture instead.
+  vietnam: {
+    language: "he",
+    documents: false,
+    text: {
+      destination: "וייטנאם",
+      // The phrasing the organizer actually gave, and the one that was stored.
+      //
+      // Their first answer was "בתחילת מרץ" — early March — and the exact date
+      // came only when the interview asked again. A scenario answers each
+      // question once, so it cannot replay a two-turn exchange; and the vague
+      // form is not a gate-worthy input anyway. It was tried: one run resolved
+      // it to 2028-03-01 (wrong — the trip starts on the 5th) and the next
+      // returned `unclear`, on identical input. A required field whose value
+      // depends on model whim cannot decide whether a build is green.
+      //
+      // Loose date PARSING belongs in a test that asserts parsing. What this
+      // scenario still carries is the other real shape: a return date written
+      // in English in the middle of a Hebrew interview.
+      departure_date: "5.3.28",
+      return_date: "until March 20",
+      travelers: "דרור אלול, שירן אלול, נועם אלול, יעל אלול ומשה אלול",
+      // SIX of sixteen days. The rest is the next answer's problem, on purpose.
+      // The flights and the show are in the run's own travel_anchors, so the
+      // organizer gave them; which turn they were typed in is not recorded, so
+      // they ride with the phases answer here. Note the return leg departs
+      // SAIGON — the trip's own anchors prove a city no phase covers.
+      phases:
+        "האנוי 5-9 במרץ, ואז הא לונג 9-11 במרץ. " +
+        "טיסה VN572 מתל אביב להאנוי ב-5 במרץ ב-06:40, " +
+        "וחזרה VN571 מסייגון לתל אביב ב-20 במרץ ב-23:15. " +
+        "הזמנתי הצגה בתיאטרון בובות המים תאנג לונג ב-6 במרץ ב-18:00.",
+      planning_help: "עשרה ימים בהוי אן וסייגון - לא הוחלט איך לחלק, מבקש הצעת חלוקה",
+      bot_name: "פאם",
+      organizer_identity: "דרור אלול",
+      dietary_scope: "רק נועם צמחוני",
+      timezone: "Vietnam",
+    },
+    choice: {
+      trip_type: "family",
+      bot_gender: "female",
+      bot_tone: "warm",
+      trip_pace: "balanced",
+      dietary_visibility: "group",
+    },
+    multi: { dietary: ["vegetarian"], bot_proactive: ["morning_briefing"] },
   },
   manual: {
     language: "en",
@@ -278,6 +342,10 @@ const MIME: Record<string, string> = {
 /** What the phone says its language is. The chaos organizer's is English whatever it writes (2026-09-15). */
 let phoneLanguage = "en";
 const tries = new Map<string, number>();
+/** How often each choice question has been answered in words (organizer-scenarios.ts). */
+const typedTries = new Map<string, number>();
+/** Typed choices that were never understood and had to be tapped — reported in --findings. */
+const typedFallbacks: TypedFallback[] = [];
 const movesRun: string[] = [];
 
 /** One misbehaviour, and whatever the interview says back to it. */
@@ -336,9 +404,28 @@ async function answer(q: IntakeQuestion, s: Scenario, suggestions: SessionView["
     return true;
   }
   if (q.type === "choice") {
-    const option = s.choice[q.id] ?? q.options?.[0]?.id;
-    if (!option) throw new Stalled(`${q.id} has no options to choose from`);
-    if (!(await tap(`a:${q.id}:${option}`))) return notYet();
+    let plan;
+    try {
+      plan = choiceAnswer(q, s, typedTries.get(q.id) ?? 0);
+    } catch (error) {
+      throw new Stalled(error instanceof Error ? error.message : String(error));
+    }
+    if (plan.kind === "type") {
+      // A choice answered in words, the way a person would. The interview may
+      // re-ask (it did, verbatim, on the owner's run); choiceAnswer caps how
+      // often this is repeated before the button is used.
+      typedTries.set(q.id, (typedTries.get(q.id) ?? 0) + 1);
+      await type(plan.text, phoneLanguage);
+    } else {
+      if (!(await tap(`a:${q.id}:${plan.option}`))) return notYet();
+      if (plan.fallback) {
+        // Reported, not hidden: the run goes on so the site can be checked, and
+        // e2e-full-cycle.py turns this into a failed expectation.
+        const typed = s.typedChoice?.[q.id] ?? "";
+        typedFallbacks.push({ question: q.id, text: typed, tries: typedTries.get(q.id) ?? 0 });
+        say(`  FINDING: ${q.id} was typed ${typedTries.get(q.id)} time(s) ("${typed}") and not understood; the button was tapped instead`);
+      }
+    }
   } else if (q.type === "multi_choice") {
     const picks = s.multi[q.id];
     if (!picks) {
@@ -378,7 +465,7 @@ async function answer(q: IntakeQuestion, s: Scenario, suggestions: SessionView["
 async function main(): Promise<number> {
   const s = SCENARIOS[scenarioName];
   if (!s || !token || !databaseUrl) {
-    console.error("usage: CONTROL_PLANE_DATABASE_URL=… auto-organizer.ts --scenario japan|multi|manual|chaos --token T [--docs DIR] [--report FILE]");
+    console.error("usage: CONTROL_PLANE_DATABASE_URL=… auto-organizer.ts --scenario japan|multi|manual|chaos|vietnam|star --token T [--docs DIR] [--report FILE] [--findings FILE]");
     return 2;
   }
   const deadline = Date.now() + totalMinutes * 60_000;
@@ -445,7 +532,10 @@ async function main(): Promise<number> {
         await drain();
         continue;
       }
-      await settle(before, `answering ${q.id}`, chaos ? since : undefined);
+      // A typed choice can be answered with the SAME question again, which
+      // changes nothing on the session — as after chaos, a reply is progress.
+      const typedChoice = q.type === "choice" && Boolean(s.typedChoice?.[q.id]);
+      await settle(before, `answering ${q.id}`, chaos || typedChoice ? since : undefined);
       const late = CHAOS_LATE_CORRECTIONS.find((c) => c.after === q.id && !lateCorrectionsSent.has(c.after));
       if (chaos && late) {
         const now = await view();
@@ -478,6 +568,9 @@ async function main(): Promise<number> {
   if (!asked.has("organizer_identity")) say("  organizer_identity: inferred, not asked");
   console.log(JSON.stringify({ event: "organizer.confirmed", scenario: scenarioName, sessionId,
     asked: [...asked], unknownTelegramMethods: unknown }));
+  // Always written when asked for, even if empty: a missing file must mean
+  // "the organizer died", never "nothing to report".
+  if (findingsPath) await writeFile(findingsPath, JSON.stringify(buildFindings(typedFallbacks)));
   if (!chaos) return 0;
 
   const intake = await pool.query(

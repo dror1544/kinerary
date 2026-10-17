@@ -7,7 +7,7 @@
  */
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { PORTS } from './helpers/ports.js';
+import { freePort } from './helpers/port-guard.js';
 import { createServer } from 'node:http';
 import { startTestMcp, stopTestMcp, mcpCallTool, TRIP_API_KEY } from './helpers/mcp.js';
 
@@ -63,7 +63,7 @@ describe('get_booking_confirmation MCP tool', () => {
     });
     const address = apiServer.address();
     apiBaseUrl = `http://127.0.0.1:${address.port}`;
-    await startTestMcp({ API_BASE_URL: apiBaseUrl, MCP_PORT: String(PORTS.mcpBookingConfirmation) });
+    await startTestMcp({ API_BASE_URL: apiBaseUrl, MCP_PORT: String(await freePort()) });
   });
 
   after(async () => {

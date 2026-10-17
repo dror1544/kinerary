@@ -5,7 +5,7 @@ import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
 import { verifyTelegramLogin, digestTelegramId, type VerifiedTelegramIdentity } from "../src/identity.js";
 import { createOrVerifyPasswordIdentity, verifyPasswordLogin, resolveWebAuth } from "../src/password-identity.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const skip = !databaseUrl;
@@ -17,7 +17,7 @@ async function resetDb(client: pg.PoolClient) {
 }
 
 async function freshPool(): Promise<pg.Pool> {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   await resetDb(client);
   await applyMigrations(client, migrationsDir);

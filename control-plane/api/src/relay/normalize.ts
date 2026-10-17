@@ -485,15 +485,18 @@ export async function normalizeUpdate(
 
   // Installed is not running. Under one gateway process per trip
   // (`docs/per-trip-gateway-architecture.md`) a stopped companion is an
-  // ordinary, recoverable state — `gateway start`, no re-provision — and the
-  // organizer is owed the same honest answer as for a trip whose companion was
-  // never installed: same reason code, same reply, no new vocabulary.
+  // ordinary, recoverable state — `gateway start`, no re-provision. It shares
+  // the reason code of a trip whose companion was never installed, so
+  // normalisation stays one decision: "no assistant can take this turn".
   //
-  // Deliberately NOT its own reason: from the organizer's side "my assistant
-  // isn't answering yet" is one situation, and splitting it would leak our
-  // process model into their chat. The distinction that matters operationally
-  // is already recorded — as reachability (migration 0042), where it can be
-  // acted on.
+  // Deliberately NOT its own reason HERE: the reply is chosen one layer down.
+  // `dispatch.ts` (COMPANION_PENDING) tells the two apart — a trip whose
+  // assistant was never announced as up gets the "still finishing" wording,
+  // while one that was announced and is now unreachable gets the shorter
+  // "I'm off for now" line (`companionUnavailable`), at most once per chat per
+  // window and never to a family talking among themselves (#178, #179). The
+  // operational distinction is also recorded as reachability (migration 0042),
+  // where it can be acted on.
   if (canReach && !canReach(route.hermesProfile)) {
     return { kind: "dropped", reason: "COMPANION_PENDING" };
   }

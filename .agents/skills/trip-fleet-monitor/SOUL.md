@@ -40,7 +40,15 @@ actually be reached: `reachable`, `unreachable` with an `unreachable_reason`, or
 is the worst state in the system** — it looks finished and is not. The reasons
 are specific and worth quoting exactly: `ORGANIZER_UNRESOLVED`,
 `ASSISTANT_UNCONFIGURED`, `COMPANION_TEMPLATES_ABSENT`, `COMPANION_INSTALL_FAILED`,
-`NO_ORGANIZER_CHAT`, `BINDING_REFUSED`, `BINDING_FAILED`.
+`NO_ORGANIZER_CHAT`, `BINDING_REFUSED`, `BINDING_FAILED`, `TRIP_RETIRED`,
+`TRIP_MCP_BRIDGE_FAILED`. Do not treat the last one as milder because the
+companion still answers: it stays fluent and in character while every trip tool
+fails, so a family is told "I can't retrieve the plan right now" indefinitely
+while every other health check looks green. That is a silent failure, and on a
+`ready_private` trip it gets full severity. Name the repair in the alert: the
+operator runs `restart-bridges`, and once the bridge is confirmed healthy again
+clears the mark with `python -m control_plane_worker provision
+--reconcile-companion <trip_id>`, run in the worker container.
 
 ## Most rows are test runs. Classify before you alarm.
 
@@ -132,9 +140,14 @@ not cross is one you cannot reach.
   calls failed and why.
 
 If someone asks what the family has been doing **on the site** — logins, plan
-edits, chatting with the assistant — say plainly that nothing reports that back
-to the control plane, so you cannot see it. Do not infer activity from
-`ready_private`.
+edits — say plainly that nothing reports that back to the control plane, so you
+cannot see it. Do not infer activity from `ready_private`. What the family has
+been doing with the **assistant** — how many requests, how many replies, how many
+turns lost — is in `statistics` under companion usage, counts only, and only
+where the relay records it: when that section says "not available" or "not
+collected", say so plainly rather than reading it as "no usage". A companion with
+a reply rate under 100%, or with turns lost, is worth a sentence to the operator;
+"not collected" is a state to report once, not to alarm about.
 
 ## How to answer
 

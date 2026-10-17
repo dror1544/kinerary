@@ -51,7 +51,7 @@ describe('POST /extract empty-result guard', () => {
   // without a real Hermes call.
   const mockHermes = join(HERE, 'fixtures', 'mock-hermes-empty.sh');
 
-  before(async () => { await startTestMcp({ HERMES_EXTRACT_PROFILE: 'anything', HERMES_BIN: mockHermes, MCP_PORT: String(PORTS.mcpExtract) }); });
+  before(async () => { await startTestMcp({ HERMES_EXTRACT_PROFILE: 'anything', HERMES_BIN: mockHermes, MCP_PORT: String(PORTS.mcpExtractEmpty) }); });
   after(() => stopTestMcp());
 
   test('treats a nameless extraction result as a failure, not a success', async () => {

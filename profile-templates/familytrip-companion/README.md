@@ -27,6 +27,51 @@ python3 validate_bundle.py /tmp/familytrip-profile
 python3 -m unittest discover -s tests -v
 ```
 
+## Examples in these templates are placeholders, never people
+
+Whatever a prompt shows as an example, a model can hand back as a fact. Until
+#240, SOUL.md's example of a group-visible need was a sentence naming a person
+and a nut allergy; a companion on a trip with no recorded needs, and nobody by
+that name, told a real family a dinner had "nut-free options" for him. Write an
+example person as `<name>` and an example need as `<need>`.
+`tests/test_template.py` (`NoExamplePeople`) enforces it on the sources and on a
+rendered bundle. It reads every example shape this package uses — quotations,
+`>` blockquotes, ``` fences and "e.g." — and in any of them that mentions a
+need it refuses a capitalised name, an initial, a kin word ("for her son") and
+the names this repo's prompts have used as examples, in either script. It is a
+lint, not a proof: a name it does not know that opens a sentence, a Hebrew name
+it does not know, and an example in plain unmarked prose all pass it. Its
+header lists every gap, and the test pins each one as a case it lets through.
+
+The behavioural half is `eval/needs_eval.py`: it renders a companion for a
+fictional family with no recorded needs (and, as controls, with one real one),
+asks the `claude` and `codex` runners for dinner in English and Hebrew, and
+counts invented needs, names not on the roster and allergen claims made without
+their uncertainty. It calls live models, so it is run by hand — `--dry-run`
+first — and it is a proxy: the rendered SOUL.md as the system prompt, one turn,
+no tools, no memory, no fallback chain. It did not reproduce the incident's
+echo on either template, so it does not show that the echo got rarer; what it
+does show is in the #240 PR. Its header lists what it measures and what not.
+
+## Stops: a booking is not a change to the Journey tab
+
+On 2026-10-10 a companion recorded an organizer's hotel, said it was added, and
+the Journey tab did not move. SOUL.md's **Stops** section now says that a hotel
+booking is linked to its stop (`set_stop_from_booking`), that a stop is changed
+with `get_stops` then `update_stop`, `split_stop` or `move_plan_day`, that only
+the organizer asks for those in their private chat, and that nothing is called
+done before it is read back. The procedure — each refusal and what to say, when
+to confirm first, the split-date rule — is in the operations skill's **Stops**
+section, so the always-loaded SOUL stays short. `tests/test_stop_editing.py`
+pins both on the rendered text in every language and persona variant.
+
+`eval/stop_editing_cases.json` holds the behavioural cases — hotel, last night
+near the airport, moving a Tuesday, and the organizer-only redirects — with the
+tool calls each one expects. It is written and checked for consistency by the
+same test file, but **not run**: it needs the stop tools on the trip connection
+and a live model, and no runner exists yet (`eval/needs_eval.py` is the one to
+follow). Its header says what a runner must do.
+
 ## Create a real profile
 
 ```bash
