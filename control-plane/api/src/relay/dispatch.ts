@@ -44,16 +44,29 @@ import {
   consumeExpectsReplyWindow,
   inCompanionConversation,
   openCompanionConversation,
+  groupProactiveLevel,
+  groupProactiveLevelSetting,
+  setGroupProactiveLevel,
+  PROACTIVE_JOINS_IN,
+  type ProactiveLevel,
+  isTripOrganizer,
+  tripLanguage,
 } from "../chat-router.js";
 import { listOrganizerTrips, switchChatToTrip, type OrganizerTrip } from "../organizer-trips.js";
 import { isAddressedToAssistant } from "./addressing.js";
 import { conversationMark } from "./stay-silent.js";
-import { classifyTrigger, inboundFacts, type InboundFacts } from "../analytics/relay-facts.js";
+import type { GroupJudge, JudgeOutcome } from "./group-judge.js";
+import { classifyTrigger, inboundFacts, type InboundFacts, type JudgeFacts, type LevelChangeFacts } from "../analytics/relay-facts.js";
 import { coerceLanguage, uiString, type Language } from "../intake-copy.js";
 import {
   companionHelpText,
   groupBindingCommand,
   groupIntroText,
+  proactiveChanged,
+  proactiveInPrivateChat,
+  proactiveRefused,
+  proactiveStatus,
+  proactiveUnavailable,
   renameConfirmation,
   renameRefused,
   renameUsage,
@@ -104,7 +117,13 @@ export type DispatchDecision =
    * The connector answers this one itself. `analytics` is set only on the
    * companion-unreachable answer, which is a lost turn (#177).
    */
-  | { kind: "reply"; reply: DirectReply; analytics?: InboundFacts }
+  | { kind: "reply"; reply: DirectReply; analytics?: InboundFacts; levelChange?: LevelChangeFacts }
+  /**
+   * Only with `deferJudge`: the message needs the group judge and the caller must not
+   * block on it. `ask` makes the model call (queued and bounded by the judge itself)
+   * and never throws; see `DispatchOptions.deferJudge`.
+   */
+  | { kind: "judge_pending"; chatId: string; ask: () => Promise<JudgeOutcome> }
   | {
       /**
        * The bot has just been added to a group bound to a trip: send the
@@ -419,6 +438,33 @@ export interface DispatchOptions {
    * the companion route, exactly as before #178.
    */
   organizerDocumentRoute?: boolean;
+  /**
+   * The group judge (relay/group-judge.ts): asked, last of all, whether an
+   * unaddressed group message is meant for the assistant. Absent - JUDGE_RUNNER
+   * unset, the default - nothing is asked and an unaddressed message is
+   * NOT_ADDRESSED exactly as before. Injected, like the runner, so this module
+   * stays testable without a network.
+   */
+  groupJudge?: GroupJudge;
+  /**
+   * Do not wait for the judge. When a group message reaches the judge step, return
+   * `{ kind: "judge_pending", ask }` instead of awaiting the model; the caller runs
+   * `ask()` OFF its loop (the poller does, one chain per chat so a chat's messages
+   * keep their order), then calls `dispatchUpdate` again for the same update with
+   * `judgedOutcome` set to the result. Absent or false - the default, and every
+   * test and tool that calls this directly - the judge is awaited right here.
+   *
+   * The second call is safe because everything before the judge step is a read for a
+   * message that reaches it: it was not addressed, so the "?" window claim found
+   * nothing to consume and the conversation window did not list the sender.
+   */
+  deferJudge?: boolean;
+  /**
+   * The judge's verdict on THIS update, from a `judge_pending` round trip. `null` is
+   * "not asked or no usable answer": the message is NOT_ADDRESSED. Set, it replaces
+   * the call; the judge is never asked twice.
+   */
+  judgedOutcome?: JudgeOutcome | null;
 }
 
 /**
@@ -760,6 +806,66 @@ export async function dispatchUpdate(
     }
   }
 
+  // `/proactive`, `/proactive 1|2|3`: how much the assistant takes part in THIS
+  // group (chat-router.ts, PROACTIVE_*). A preference, not a privacy switch.
+  // Anyone may read it; only the trip's organizer - a fact from the control
+  // plane's own links, never from the message - may change it. Router-owned like
+  // /name: it changes what the router hears, and Hermes' own command surface is
+  // not ours to extend.
+  if (parsed.kind === "command" && parsed.name === "proactive") {
+    const route = await resolveChatRoute(db, chatId);
+    if (route.kind === "unbound") {
+      return { kind: "reply", reply: { chatId, text: strings.unbound } };
+    }
+    if (route.kind === "companion") {
+      const language = await tripLanguage(db, route.tripId);
+      if (message.chat?.type === "private") {
+        return { kind: "reply", reply: { chatId, text: proactiveInPrivateChat(language) } };
+      }
+      const argument = (parsed.argument ?? "").trim();
+      const requested = argument === "1" || argument === "2" || argument === "3" ? (Number(argument) as ProactiveLevel) : null;
+      // Nothing, or something that is not 1, 2 or 3: the options. A read never needs a role.
+      if (requested === null) {
+        const current = (await groupProactiveLevelSetting(db, chatId).catch(() => null)) ?? PROACTIVE_JOINS_IN;
+        return { kind: "reply", reply: { chatId, text: proactiveStatus(language, current) } };
+      }
+      const senderId = message.from?.id === undefined ? null : String(message.from.id);
+      if (!senderId || !(await isTripOrganizer(db, route.tripId, senderId))) {
+        log(structuredLog("info", "trip_bot.proactive_refused", { reason: "NOT_ORGANIZER" }));
+        return { kind: "reply", reply: { chatId, text: proactiveRefused(language) } };
+      }
+      // A relay running ahead of its migration has no such column: say so to the
+      // organizer instead of failing the update (and saying nothing).
+      let previous: ProactiveLevel | null;
+      try {
+        // Keyed by the trip the organizer check above authorised, not by the chat
+        // alone: the chat may have been re-bound to another trip since.
+        previous = await setGroupProactiveLevel(db, chatId, requested, route.tripId);
+      } catch (error) {
+        log(structuredLog("warn", "trip_bot.proactive_write_failed", {
+          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        }));
+        return { kind: "reply", reply: { chatId, text: proactiveUnavailable(language) } };
+      }
+      if (previous === null) {
+        // No open binding of THIS trip on this chat any more: nothing was written.
+        log(structuredLog("info", "trip_bot.proactive_not_changed", { reason: "NO_MATCHING_BINDING" }));
+        return { kind: "reply", reply: { chatId, text: proactiveUnavailable(language) } };
+      }
+      // (`level` is a field structuredLog strips: it indexes the line.)
+      log(structuredLog("info", "trip_bot.proactive_changed", { proactive_level: requested, previous_level: previous }));
+      return {
+        kind: "reply",
+        reply: { chatId, text: proactiveChanged(language, requested) },
+        // Counts only: how many groups turn it down is a KPI. A repeat of the
+        // current level is not a change.
+        ...(options.assistantEvents && previous !== null && previous !== requested
+          ? { levelChange: { tripId: route.tripId, level: requested, direction: requested > previous ? "raised" as const : "lowered" as const } }
+          : {}),
+      };
+    }
+  }
+
   // The organizer asking for a group-binding token, in their own DM. Router-
   // owned rather than agent-owned for the same reason the introduction is: the
   // token is a credential, and one the agent got slightly wrong is a token that
@@ -908,8 +1014,21 @@ export async function dispatchUpdate(
     // `route.kind === "companion"` is structural, not a real branch here —
     // normalizeUpdate never reaches this point for an interview or unbound
     // chat — mirrored only to match the ternary just below it.
-    const capturedAsReply =
-      outcome.route.kind === "companion" ? await consumeExpectsReplyWindow(db, chatId) : false;
+    //
+    // It now also reads the group's proactive level (level 1 admits nothing
+    // through it), a column a relay running ahead of its migration does not have:
+    // a failed claim degrades to "no window", as the conversation window's reads
+    // below do, rather than failing the update.
+    let capturedAsReply = false;
+    if (outcome.route.kind === "companion") {
+      try {
+        capturedAsReply = await consumeExpectsReplyWindow(db, chatId);
+      } catch (error) {
+        log(structuredLog("warn", "trip_bot.reply_window_read_failed", {
+          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        }));
+      }
+    }
 
     // Booleans only in the log: no chat or user id beyond what other events carry.
     if (capturedAsReply) log(structuredLog("info", "trip_bot.reply_window_hit", {}));
@@ -948,7 +1067,30 @@ export async function dispatchUpdate(
       }
     }
     if (capturedByConversation) log(structuredLog("info", "trip_bot.conversation_window_hit", {}));
-    const addressed = addressedOtherwise || capturedByConversation;
+
+    // The group judge (2026-10-16): LAST of all, and only for a group message
+    // every rule above has refused. Existing rules first - anything one of them
+    // addressed never reaches a model. Text and captions only: an uncaptioned
+    // photo or file has nothing to judge and keeps today's hold-until-addressed
+    // behaviour. Every way it can fail ends in NOT_ADDRESSED.
+    let capturedByJudge = false;
+    let judged: JudgeOutcome | null = null;
+    if (
+      !addressedOtherwise && !capturedByConversation && inGroup && senderId &&
+      options.groupJudge?.model() && outcome.route.kind === "companion" && judgeableText(outcome.event.text)
+    ) {
+      if (options.judgedOutcome !== undefined) {
+        // Second pass of a deferred judgement: the verdict is already in.
+        judged = options.judgedOutcome;
+      } else {
+        const ask = await prepareGroupJudge(db, options.groupJudge, outcome.route, chatId, outcome.event.text, log);
+        if (ask === null) judged = null;
+        else if (options.deferJudge) return { kind: "judge_pending", chatId, ask };
+        else judged = await ask();
+      }
+      capturedByJudge = judged?.kind === "yes";
+    }
+    const addressed = addressedOtherwise || capturedByConversation || capturedByJudge;
     // #177: the gate's verdict, as metadata. Only ever called through
     // `withAnalytics`, which never calls it while assistant events are off.
     // The text is taken here, before anything is prefixed to it.
@@ -956,7 +1098,7 @@ export async function dispatchUpdate(
     const routedTripId = outcome.route.kind === "companion" ? outcome.route.tripId : null;
     const seen = (linkRole: string | null | undefined): InboundFacts => {
       if (!routedTripId) throw new Error("NOT_COMPANION_ROUTE");
-      return inboundFacts({
+      const facts = inboundFacts({
         tripId: routedTripId,
         // Telegram's own type for the channel; the gate's mapped one for the trigger.
         telegramChatType: message.chat?.type,
@@ -964,6 +1106,7 @@ export async function dispatchUpdate(
           addressed,
           capturedAsReply,
           capturedByConversation,
+          capturedByJudge,
           chatType: outcome.event.source.chat_type,
           text: heardText,
           assistantNames: outcome.route.kind === "companion" ? outcome.route.assistantNames : [],
@@ -974,6 +1117,14 @@ export async function dispatchUpdate(
         attachmentKind: outcome.attachment?.kind ?? null,
         textLength: heardText.length,
       });
+      // Memory-only keys (relay-facts.ts): they let the emitter notice that the
+      // same sender, right after a judge_no, then addressed the assistant by name.
+      return {
+        ...facts,
+        chatKey: chatId,
+        ...(senderId ? { senderKey: senderId } : {}),
+        ...(judged ? { judge: judgeFactsOf(judged) } : {}),
+      };
     };
     if (!addressed) {
       // Not for the assistant, so nothing is downloaded. A DOCUMENT is still
@@ -1109,7 +1260,10 @@ export async function dispatchUpdate(
     // field that reaches the model, so the mark is a fenced line on the text,
     // put on BEFORE the overheard block so that block still leads. An empty
     // text (a photo or file with no caption) gets the mark alone.
-    if (capturedByConversation) {
+    // The judge's yes is marked the same way, for the same reason: the companion
+    // is told it was not addressed by name and may stay silent (the second guard
+    // against a wrong yes).
+    if (capturedByConversation || capturedByJudge) {
       outcome.event.text = `${conversationMark()}\n\n${outcome.event.text}`.trimEnd();
     }
 
@@ -1252,6 +1406,67 @@ export async function dispatchUpdate(
     default:
       return { kind: "ignore", reason: outcome.reason };
   }
+}
+
+/** A message worth a model call: it carries at least one letter or digit. A lone emoji or "?" is a reaction. */
+function judgeableText(text: string): boolean {
+  return /[\p{L}\p{N}]/u.test(text);
+}
+
+/**
+ * Prepares the judge's question about one unaddressed group message: null when it
+ * must not be asked - the group's level is below 3 (`/proactive`; a trip that opted
+ * out of reply capture reads as level 1), or the level could not be read (fail
+ * closed: a relay running ahead of its migration judges nothing) - otherwise the
+ * function that asks. The reads happen here, now; only the model call is left to
+ * `ask`, which never throws, logs the verdict and its speed (never the text), and
+ * may be run later and off the caller's loop.
+ */
+async function prepareGroupJudge(
+  db: pg.Pool,
+  judge: GroupJudge,
+  route: Extract<ChatRoute, { kind: "companion" }>,
+  chatId: string,
+  text: string,
+  log: (line: string) => void,
+): Promise<(() => Promise<JudgeOutcome>) | null> {
+  try {
+    if ((await groupProactiveLevel(db, chatId)) !== PROACTIVE_JOINS_IN) return null;
+  } catch (error) {
+    log(structuredLog("warn", "trip_bot.group_judge_level_read_failed", {
+      safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+    }));
+    return null;
+  }
+  const language = await tripLanguage(db, route.tripId).catch(() => "en" as const);
+  return async () => {
+    const judged = await judge.judge({ chatId, text, assistantNames: route.assistantNames, language });
+    log(structuredLog("info", "trip_bot.group_judged", {
+      verdict: judged.kind,
+      latency_ms: judged.ms,
+      model: judged.model,
+      ...(judged.kind === "fallback" ? { reason: judged.reason } : { confidence: judged.confidence }),
+      ...(judged.kind === "no" && judged.belowThreshold ? { below_threshold: true } : {}),
+    }));
+    return judged;
+  };
+}
+
+/** A judge outcome as the analytics descriptor names it. */
+function judgeFactsOf(judged: JudgeOutcome): JudgeFacts {
+  const base = { latencyMs: judged.ms, model: judged.model };
+  if (judged.kind === "yes") {
+    return { ...base, outcome: "judge_yes", confidencePct: Math.round(judged.confidence * 100) };
+  }
+  if (judged.kind === "no") {
+    return {
+      ...base,
+      outcome: "judge_no",
+      confidencePct: Math.round(judged.confidence * 100),
+      ...(judged.belowThreshold ? { belowThreshold: true } : {}),
+    };
+  }
+  return { ...base, outcome: "judge_fallback", fallbackReason: judged.reason };
 }
 
 /**

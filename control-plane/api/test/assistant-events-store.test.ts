@@ -156,6 +156,8 @@ describe("control_plane.assistant_events", () => {
           batch.push(event(tripId, {
             event_type: type, outcome, turn_id: randomUUID(),
             tool_name: type === "tool_call_completed" ? "get_today" : null,
+            // proactive_level_changed names the new level; the contract and the table both insist.
+            ...(type === "proactive_level_changed" ? { metadata: { proactive_level: 2 } } : {}),
           }));
         }
       }

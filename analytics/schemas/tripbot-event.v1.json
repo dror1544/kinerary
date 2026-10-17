@@ -35,7 +35,9 @@
         "turn_lost",
         "reply_sent",
         "relay_tool_completed",
-        "tool_call_completed"
+        "tool_call_completed",
+        "group_judged",
+        "proactive_level_changed"
       ]
     },
     "turn_id": {
@@ -47,7 +49,7 @@
       "enum": ["group", "organizer_dm", "other", "unclassified", null]
     },
     "trigger_type": {
-      "enum": ["dm", "mention", "name", "reply_to_bot", "reply_window", "conversation_window", "not_addressed", "unclassified", null]
+      "enum": ["dm", "mention", "name", "reply_to_bot", "reply_window", "conversation_window", "judge", "not_addressed", "unclassified", null]
     },
     "requester_role": {
       "enum": ["organizer", "participant", "unknown", "unclassified", null]
@@ -67,7 +69,13 @@
         "correction_proposed",
         "no_new_information",
         "grounded_answer",
-        "missing_data"
+        "missing_data",
+        "judge_yes",
+        "judge_no",
+        "judge_fallback",
+        "judge_missed",
+        "level_raised",
+        "level_lowered"
       ]
     },
     "response_latency_ms": {
@@ -82,13 +90,18 @@
       "enum": ["none", "photo", "document", "audio", "other", "unclassified", null]
     },
     "metadata": {
-      "description": "Bounded counts and flags for a document's fate. Numbers and booleans only, so nothing textual can ride in it.",
+      "description": "Bounded counts and flags for a document's fate, and the group judge's bounded facts. Numbers and booleans, a fixed set of failure reasons, and one model identifier from a restricted alphabet with no space in it (deployment configuration, never anything a traveller typed) - so no sentence can ride in it.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "attachments_joined": { "type": "integer", "minimum": 0, "maximum": 20 },
         "documents": { "type": "integer", "minimum": 0, "maximum": 20 },
-        "document_held": { "type": "boolean" }
+        "document_held": { "type": "boolean" },
+        "judge_confidence_pct": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "judge_model": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,79}$" },
+        "judge_fallback_reason": { "enum": ["timeout", "error", "unparseable", "rate_limited", "circuit_open", "queue_full"] },
+        "judge_below_threshold": { "type": "boolean" },
+        "proactive_level": { "type": "integer", "minimum": 1, "maximum": 3 }
       }
     },
     "tool_name": {
@@ -194,6 +207,34 @@
           "outcome": { "enum": ["failed_tool", "blocked_by_policy", "correction_proposed", "no_new_information"] },
           "trip_id": { "type": "string" },
           "turn_id": { "type": "string" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "event_type": { "const": "group_judged" } } },
+      "then": {
+        "required": ["trip_id", "channel_type", "trigger_type", "requester_role", "message_length_bucket", "media_kind"],
+        "properties": {
+          "outcome": { "enum": ["judge_yes", "judge_no", "judge_fallback", "judge_missed"] },
+          "trip_id": { "type": "string" },
+          "channel_type": { "type": "string" },
+          "trigger_type": { "type": "string" },
+          "requester_role": { "type": "string" },
+          "message_length_bucket": { "type": "string" },
+          "media_kind": { "type": "string" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "event_type": { "const": "proactive_level_changed" } } },
+      "then": {
+        "required": ["trip_id", "channel_type", "requester_role", "metadata"],
+        "properties": {
+          "outcome": { "enum": ["level_raised", "level_lowered"] },
+          "trip_id": { "type": "string" },
+          "channel_type": { "type": "string" },
+          "requester_role": { "type": "string" },
+          "metadata": { "required": ["proactive_level"] }
         }
       }
     },

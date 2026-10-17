@@ -42,7 +42,7 @@ import {
   type SessionView,
 } from "./interview.js";
 import { peekEnrollmentTripId } from "./enrollment.js";
-import { isPrivateChatId } from "./identity.js";
+import { digestTelegramId, isPrivateChatId } from "./identity.js";
 import { structuredLog } from "./redaction.js";
 
 // ── Inbound text ─────────────────────────────────────────────────────────────
@@ -373,6 +373,28 @@ export async function resolveChatRoute(db: pg.Pool, chatId: string): Promise<Cha
   return { kind: "unbound" };
 }
 
+// ── The proactive level (/proactive) ─────────────────────────────────────────
+
+/**
+ * How much a group wants the assistant to take part (owner's decision,
+ * 2026-10-16) - a PREFERENCE per group binding, not a privacy switch:
+ *
+ *   1 only when called: its name, an @mention, a reply to one of its messages;
+ *   2 follows the conversation: 1, plus the one-shot "?" window (0053) and the
+ *     conversation window (0053+1); no judge - the behaviour before the judge;
+ *   3 joins in: 2, plus the group judge asking whether a message is for it.
+ *     The default.
+ *
+ * The gates are `AND b.proactive_level >= N` inside the statements that already
+ * read the binding, so a level costs no extra query; only the judge, which is a
+ * model call anyway, reads the level on its own (`groupProactiveLevel`).
+ */
+export const PROACTIVE_ONLY_WHEN_CALLED = 1;
+export const PROACTIVE_FOLLOWS_CONVERSATION = 2;
+export const PROACTIVE_JOINS_IN = 3;
+export const DEFAULT_PROACTIVE_LEVEL = PROACTIVE_JOINS_IN;
+export type ProactiveLevel = 1 | 2 | 3;
+
 // ── Companion reply capture ──────────────────────────────────────────────────
 
 /**
@@ -433,6 +455,7 @@ export async function consumeExpectsReplyWindow(db: pg.Pool, chatId: string): Pr
         AND b.trip_id = t.id
         AND b.awaiting_reply_since IS NOT NULL
         AND t.companion_reply_capture_enabled
+        AND b.proactive_level >= ${PROACTIVE_FOLLOWS_CONVERSATION}
         AND b.awaiting_reply_since >= now() - make_interval(secs => COALESCE(b.awaiting_reply_floor_seconds, $2))`,
     [chatId, EXPECTS_REPLY_WINDOW_SECONDS],
   );
@@ -506,7 +529,8 @@ export async function openCompanionConversation(
       WHERE b.chat_id = $1
         AND b.closed_at IS NULL
         AND b.trip_id = t.id
-        AND t.companion_reply_capture_enabled`,
+        AND t.companion_reply_capture_enabled
+        AND b.proactive_level >= ${PROACTIVE_FOLLOWS_CONVERSATION}`,
     [chatId, userId, ttlSeconds, maxMembers],
   );
 }
@@ -558,12 +582,123 @@ export async function inCompanionConversation(
       WHERE b.chat_id = $1
         AND b.closed_at IS NULL
         AND t.companion_reply_capture_enabled
+        AND b.proactive_level >= ${PROACTIVE_FOLLOWS_CONVERSATION}
         AND b.conversation_until > now()
         AND $2::text = ANY(b.conversation_user_ids)
       LIMIT 1`,
     [chatId, userId],
   );
   return (result.rowCount ?? 0) > 0;
+}
+
+// ── /proactive: reading and setting the level ───────────────────────────────
+
+/**
+ * The level the relay ACTS on in this chat: 1, 2 or 3, or null when the chat has
+ * no open binding. A trip that opted out of reply capture
+ * (`companion_reply_capture_enabled`, 0053) reads as level 1: that switch already
+ * turns off both windows, and the judge is the third way an unaddressed message
+ * gets in, so a trip that said "do not let unaddressed messages in" is
+ * "only when called" whatever level was set on its group. THROWS on a failed read
+ * (a relay running ahead of its migration); the caller treats that as "no judge".
+ */
+export async function groupProactiveLevel(db: pg.Pool, chatId: string): Promise<ProactiveLevel | null> {
+  const result = await db.query<{ level: number }>(
+    `SELECT CASE WHEN t.companion_reply_capture_enabled THEN b.proactive_level ELSE 1 END AS level
+       FROM control_plane.telegram_chat_bindings b
+       JOIN control_plane.trips t ON t.id = b.trip_id
+      WHERE b.chat_id = $1 AND b.closed_at IS NULL
+      LIMIT 1`,
+    [chatId],
+  );
+  const level = result.rows[0]?.level;
+  return level === 1 || level === 2 || level === 3 ? level : null;
+}
+
+/** The level the organizer SET on this chat's binding, for `/proactive` to show; null without an open binding. */
+export async function groupProactiveLevelSetting(db: pg.Pool, chatId: string): Promise<ProactiveLevel | null> {
+  const result = await db.query<{ level: number }>(
+    `SELECT proactive_level AS level FROM control_plane.telegram_chat_bindings
+      WHERE chat_id = $1 AND closed_at IS NULL LIMIT 1`,
+    [chatId],
+  );
+  const level = result.rows[0]?.level;
+  return level === 1 || level === 2 || level === 3 ? level : null;
+}
+
+/**
+ * Sets the group's level. Returns the level it had before (so the caller can say
+ * whether this was a raise or a lowering), or null when nothing changed.
+ *
+ * Keyed by chat AND by `tripId`: the trip the caller authorised the organizer
+ * against. The organizer check and this write are separate statements, and a chat
+ * can be re-bound to another trip between them (a different organizer redeeming a
+ * group token); keyed by chat alone, the first trip's organizer would then set the
+ * second trip's level. With the trip in the WHERE the write simply finds no row.
+ * One statement: the old value is read from the same row version it replaces.
+ */
+export async function setGroupProactiveLevel(
+  db: pg.Pool,
+  chatId: string,
+  level: ProactiveLevel,
+  tripId: string,
+): Promise<ProactiveLevel | null> {
+  const result = await db.query<{ previous: number }>(
+    `UPDATE control_plane.telegram_chat_bindings b
+        SET proactive_level = $2
+       FROM (SELECT id, proactive_level AS previous
+               FROM control_plane.telegram_chat_bindings
+              WHERE chat_id = $1 AND trip_id = $3 AND closed_at IS NULL
+              FOR UPDATE) old
+      WHERE b.id = old.id
+      RETURNING old.previous AS previous`,
+    [chatId, level, tripId],
+  );
+  const previous = result.rows[0]?.previous;
+  return previous === 1 || previous === 2 || previous === 3 ? previous : null;
+}
+
+/**
+ * Is this Telegram sender an organizer of this trip?
+ *
+ * Two proofs, either enough, both server-side facts and neither read from the
+ * message: the trip's own person link says so (0051, written at provisioning),
+ * or the sender's verified Telegram identity (0052) belongs to a user holding
+ * an active OWNER membership on this trip. Unknown, an anonymous group admin
+ * and a failed lookup are all "no" - a command that changes how the whole room
+ * is involved is not offered to a stranger.
+ *
+ * Deliberately restrictive: only an ACTIVE membership with role 'owner' counts
+ * (an 'organizer'-role membership, a revoked or invited owner, a plain member are
+ * all "no"), and a person link must say 'organizer'. A failed lookup is "no".
+ */
+export async function isTripOrganizer(db: pg.Pool, tripId: string, telegramUserId: string): Promise<boolean> {
+  if (!tripId || !telegramUserId) return false;
+  if ((await resolveTripPerson(db, tripId, telegramUserId))?.role === "organizer") return true;
+  if (!isPrivateChatId(telegramUserId)) return false;
+  const result = await db.query(
+    `SELECT 1
+       FROM control_plane.telegram_organizer_links l
+       JOIN control_plane.trip_memberships m ON m.user_id = l.user_id
+      WHERE l.telegram_subject_digest = $2
+        AND m.trip_id = $1 AND m.role = 'owner' AND m.status = 'active'
+      LIMIT 1`,
+    [tripId, digestTelegramId(telegramUserId)],
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
+/**
+ * The trip's language, "he" or "en" - the only fact of `companion_intro` the
+ * judge needs. A narrow read on purpose: the whole column carries the shared
+ * site login (`companionIntroFacts`).
+ */
+export async function tripLanguage(db: pg.Pool, tripId: string): Promise<"he" | "en"> {
+  const { rows } = await db.query<{ language: string | null }>(
+    "SELECT companion_intro ->> 'language' AS language FROM control_plane.trips WHERE id = $1",
+    [tripId],
+  );
+  return rows[0]?.language === "he" ? "he" : "en";
 }
 
 // ── /start deep link ─────────────────────────────────────────────────────────
