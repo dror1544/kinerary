@@ -70,6 +70,16 @@ services:
       CONTROL_PLANE_ARCHITECTURE_PROFILE: /run/config/architecture.json
       CONTROL_PLANE_CHAT_ROUTING_KEY: ${CONTROL_PLANE_CHAT_ROUTING_KEY:-}
       CONTROL_PLANE_INTERVIEW_AGENT_KEY: ${CONTROL_PLANE_INTERVIEW_AGENT_KEY:-}
+      # The operator's invitation routes (OperatorDependencies, server.ts) —
+      # /internal/operator/invitations and #410's trip-force-clear — and the
+      # super-admin dashboard's routes (AdminDependencies). Both optional, like
+      # every other block here: server.ts mounts nothing and the routes 503
+      # when the key is unset, rather than failing startup — so `:-`, not
+      # `:?`, matches how server.ts itself treats a missing key. Before this
+      # line neither key ever reached this container, so every operator- and
+      # admin-gated route 503'd on the VM regardless of vm.env.
+      CONTROL_PLANE_OPERATOR_KEY: ${CONTROL_PLANE_OPERATOR_KEY:-}
+      CONTROL_PLANE_ADMIN_KEY: ${CONTROL_PLANE_ADMIN_KEY:-}
       # Unlike compose.local.yml there is no default of 1 here: a deployment
       # only ever selects a manifest-backed, digest-verified release.
       CONTROL_PLANE_ALLOW_UNSEALED_RELEASE: ${CONTROL_PLANE_ALLOW_UNSEALED_RELEASE:-}

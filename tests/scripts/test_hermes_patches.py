@@ -30,9 +30,10 @@ PATCHES = DEPLOYMENT / "hermes-patches"
 BUILD = DEPLOYMENT / "build-hermes-image.sh"
 CHECK = DEPLOYMENT / "hermes-image-check.sh"
 MANIFEST = ".kinerary-patches"
-# A verbatim copy of the Dockerfile in the pristine snapshot (`/opt/hermes-src`
-# on the VM, read 2026-09-28). A synthetic file with the same context would prove
-# nothing about whether a patch applies to the real one.
+# A verbatim copy of the Dockerfile at upstream 4097709b0c (the revision the patch
+# set is rebased onto, 2026-10-03; it was the VM snapshot's ab0d984145 Dockerfile
+# until then). A synthetic file with the same context would prove nothing about
+# whether a patch applies to the real one.
 PRISTINE_DOCKERFILE = REPO / "tests/scripts/fixtures/hermes-src/Dockerfile"
 
 FIXTURE_BEFORE = "one\ntwo\nthree\nfour\nfive\n"
@@ -180,7 +181,10 @@ class TheDockerfilePatchAppliesToTheRealDockerfile(unittest.TestCase):
         )
 
     def patched_stages(self) -> tuple[str, str]:
-        """(everything before the runtime stage's FROM, the runtime stage)."""
+        """(everything before the runtime stage's FROM, the runtime stage). At
+        4097709b0c the runtime stage is `runtime_base`, the second `FROM debian:`;
+        the stages built on top of it (`FROM runtime_base`, `FROM python_deps`)
+        follow it in this slice and must not mention the package either."""
         result = self.apply_to_the_fixture()
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = (self.tree / "Dockerfile").read_text().splitlines(keepends=True)

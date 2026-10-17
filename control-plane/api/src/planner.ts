@@ -158,6 +158,61 @@ export async function generatePlan(
   const client = await db.connect();
   try {
     await client.query("BEGIN");
+
+    // R4-1 (boundary review, 2026-10-14): the pre-checks above (including the
+    // `lifecycle_state` read at the top of this function) are all UNLOCKED
+    // and run before this transaction even opens. That is fine for the fast,
+    // common-case rejection they give a caller, but it is not what actually
+    // prevents a race — reproduced live, twice, against this exact function
+    // and `trip-clear.ts`'s `executeClear`: an operator's clear call locked
+    // and found no job, and in the window before it committed, a concurrent
+    // `generatePlan` (this function, from the organizer's own interview
+    // confirmation, or an admin retry) inserted a brand-new job — one
+    // `FOR UPDATE` can never see, because the row didn't exist yet when the
+    // lock was taken. This function must re-read `lifecycle_state` UNDER
+    // THAT SAME LOCK, inside its own transaction, as the authoritative
+    // check, not rely on the unlocked read above — that is what the code
+    // right below does.
+    //
+    // CORRECTED (boundary review round 12, 2026-10-15): this comment used
+    // to say `executeClear` closes its own half by locking `trips` BEFORE
+    // it ever reads `jobs` — that was round 4's FIRST attempt, and round 5
+    // found it deadlocks against four other real transactions that all lock
+    // something else before `trips` (R4-2, see trip-clear.ts's own module
+    // doc). What actually shipped is the opposite order: `executeClear`
+    // locks `jobs` (among other things) FIRST, `trips` LAST like every
+    // other transaction that touches it, then does a PLAIN (lockless)
+    // re-read of `jobs` once `trips` is held — and it is THAT late re-read,
+    // not a trips-before-jobs lock order, that closes this function's own
+    // race from the other side: with `trips` locked by whichever side gets
+    // there first, the two transactions still genuinely serialize, just via
+    // the opposite lock order than this comment used to claim. If
+    // `executeClear` wins, this read below sees `draft` (not
+    // `intake_confirmed`) and refuses — the job this finding was about is
+    // never created. If this function wins, `executeClear`'s own `trips`
+    // lock blocks until this transaction commits, then its LATE, PLAIN
+    // re-read of `jobs` (not a second `FOR UPDATE` — see trip-clear.ts for
+    // why) sees the job this INSERT is about to create and refuses to
+    // proceed instead of clearing a trip whose provisioning just started.
+    const lockedTrip = await client.query<{ lifecycle_state: string }>(
+      "SELECT lifecycle_state FROM control_plane.trips WHERE id = $1 FOR UPDATE",
+      [tripId],
+    );
+    const locked = lockedTrip.rows[0];
+    if (!locked || locked.lifecycle_state !== "intake_confirmed") {
+      await client.query("ROLLBACK");
+      // Same reasoning as the unlocked racedPlan re-check above: a trip that
+      // moved past intake_confirmed because a concurrent generatePlan won is
+      // reported as PLAN_ALREADY_PENDING, not TRIP_NOT_CONFIRMED, if that
+      // plan is findable; otherwise (e.g. a clear reverted it to draft)
+      // TRIP_NOT_CONFIRMED is the honest answer.
+      const racedPlan = await db.query(
+        "SELECT id FROM control_plane.plans WHERE trip_id = $1 AND status IN ('pending_approval', 'approved') LIMIT 1",
+        [tripId],
+      );
+      return { ok: false, reason: racedPlan.rows.length > 0 ? "PLAN_ALREADY_PENDING" : "TRIP_NOT_CONFIRMED" };
+    }
+
     // The partial unique index plans_trip_active_idx enforces one active plan
     // per trip atomically. If a concurrent generatePlan races past the pre-checks
     // above and inserts first, this INSERT gets SQLSTATE 23505.
