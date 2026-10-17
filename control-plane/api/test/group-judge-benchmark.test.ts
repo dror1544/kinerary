@@ -142,6 +142,30 @@ describe("runBenchmark - scoring", () => {
     assert.equal(report.meetsTargets.p95, false, "2 s is over the 1.5 s target");
   });
 
+  test("with a CLI runner (claude, codex) it uses the CLI's 8 s budget, not the HTTP 3 s, and never opens the breaker on a failing model", async () => {
+    const seen: (number | undefined)[] = [];
+    let failing = true;
+    const make = (provider: string): StructuredModelRunner => ({
+      describe: (task) => (task === JUDGE_TASK ? { provider, model: "m" } : null),
+      run: (async (req: StructuredModelRequest<unknown>) => {
+        seen.push(req.timeoutMs);
+        if (failing) return { ok: false, reason: "UPSTREAM_ERROR", attempts: 1, ms: 1 };
+        return { ok: true, value: req.parse({ for_assistant: false, confidence: 0.9 }), attempts: 1, ms: 1 };
+      }) as unknown as StructuredModelRunner["run"],
+    });
+    for (const provider of ["claude", "codex"]) {
+      seen.length = 0;
+      const report = await runBenchmark({ runner: make(provider), cases: SMALL });
+      assert.ok(seen.every((t) => t === 8000), `${provider}: ${JSON.stringify([...new Set(seen)])}`);
+      assert.equal(report.errors.byReason.error, 20, "all 20 were really called and counted as errors - no circuit_open");
+      assert.equal(report.errors.byReason.circuit_open, undefined);
+    }
+    seen.length = 0;
+    failing = false;
+    await runBenchmark({ runner: make("openrouter"), cases: SMALL.slice(0, 2) });
+    assert.deepEqual([...new Set(seen)], [3000]);
+  });
+
   test("an unbound judge task refuses to run rather than scoring nothing", async () => {
     const runner = { describe: () => null, run: async () => ({ ok: false as const, reason: "NOT_CONFIGURED" as const, attempts: 0, ms: 0 }) } as StructuredModelRunner;
     await assert.rejects(runBenchmark({ runner, cases: SMALL }), /no binding/);

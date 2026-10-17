@@ -6,13 +6,16 @@
  *
  *   JUDGE_RUNNER=openrouter JUDGE_MODEL=<model id> \
  *   OPENROUTER_API_KEY_FILE=<path to a file holding the key> \
+ *   (or JUDGE_RUNNER=claude JUDGE_MODEL=claude-haiku-4-5-20251001 [JUDGE_EFFORT=low],
+ *    or JUDGE_RUNNER=codex [JUDGE_MODEL=gpt-5.6-luna] [JUDGE_EFFORT=low]: the CLI logins, no key) \
  *     node --import tsx tools/judge-benchmark.ts \
  *     [--set tools/judge-benchmark/starter-set.jsonl] [--reps 1] \
  *     [--min-confidence 0.7] [--names "Solo,סולו"] [--timeout-ms 3000] \
  *     [--json] [--strict]
  *
  * Uses the SAME binding the relay would (`modelRunnerFromEnv`, task
- * `group_judge`): JUDGE_RUNNER / JUDGE_MODEL / JUDGE_TIMEOUT_MS, including the
+ * `group_judge`): JUDGE_RUNNER / JUDGE_MODEL / JUDGE_TIMEOUT_MS (default 3 s for openrouter,
+ * 8 s for claude and codex; ceilings 3 s and 10 s), including the
  * OpenRouter provider routing (data collection denied unless
  * JUDGE_DATA_COLLECTION=allow). The key is read from a FILE
  * (OPENROUTER_API_KEY_FILE): never put it on a command line, where `ps` and
@@ -27,7 +30,7 @@
  */
 import { readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { modelRunnerFromEnv } from "../src/model-runner.js";
+import { codexIsolationProblem, modelRunnerFromEnv } from "../src/model-runner.js";
 import { formatReport, parseCases, runBenchmark } from "../src/relay/group-judge-benchmark.js";
 
 function flags(argv: string[]): Map<string, string> {
@@ -46,6 +49,12 @@ function flags(argv: string[]): Map<string, string> {
 async function main(): Promise<void> {
   const f = flags(process.argv.slice(2));
   const setPath = f.get("set") ?? fileURLToPath(new URL("./judge-benchmark/starter-set.jsonl", import.meta.url));
+  // codex only runs after the same check the relay does at start: a codex that does not
+  // know every feature the tool-disabling list names is no binding at all.
+  if ((process.env.JUDGE_RUNNER ?? "").trim().toLowerCase() === "codex") {
+    const problem = await codexIsolationProblem(process.env.CODEX_BIN || "codex");
+    if (problem) process.env.KINERARY_CODEX_ISOLATION_UNVERIFIED = "1";
+  }
   const runner = modelRunnerFromEnv();
   if (!runner?.describe?.("group_judge")) {
     console.error("the group_judge task has no binding: set JUDGE_RUNNER and JUDGE_MODEL (and OPENROUTER_API_KEY_FILE for openrouter)");

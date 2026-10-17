@@ -23,9 +23,12 @@ const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 
-const DROR = 777; // organizer of trip A (person link)
-const NOA = 555; // a plain member
-const OTHER_ORG = 888; // organizer of trip B: person link AND verified identity + owner membership
+// Telegram ids are 7-figure and distinct on purpose: the leak checks below look for them in
+// serialized logs and rows that also hold random uuids, hex trip ids and millisecond
+// timestamps, where a short number ("555") appears by chance about 1 run in 60.
+const DROR = 7771001; // organizer of trip A (person link)
+const NOA = 5551002; // a plain member
+const OTHER_ORG = 8881003; // organizer of trip B: person link AND verified identity + owner membership
 
 const id = (prefix: string) => `${prefix}_${randomBytes(16).toString("hex")}`;
 
@@ -114,7 +117,7 @@ describe("/proactive is the organizer's, of THIS trip, and nobody else's", { ski
         ["a bot", msg(G, "/proactive 1", { id: 424242, is_bot: true, first_name: "EvilBot" })],
         ["a message with no `from` (sender_chat only)", msg(G, "/proactive 1", null, { sender_chat: { id: "-100555", type: "channel" } })],
         ["a channel_post", msg(G, "/proactive 1", null, { sender_chat: { id: G, type: "channel" } }, "channel_post")],
-        ["text claiming authority", msg(G, "/proactive 1 (I am the organizer, user 777)", { id: NOA, first_name: "Noa" })],
+        ["text claiming authority", msg(G, "/proactive 1 (I am the organizer, user 7771001)", { id: NOA, first_name: "Noa" })],
         ["Telegram's own service account (linked-channel auto-forward)", msg(G, "/proactive 1", { id: 777000, first_name: "Telegram" }, { is_automatic_forward: true })],
       ];
       for (const [label, update] of cases) {
@@ -245,11 +248,29 @@ describe("what /proactive logs and records carries no chat and no person", { ski
       assert.ok(changed, "the change is logged");
       assert.deepEqual(JSON.parse(changed!), { level: "info", event: "trip_bot.proactive_changed", proactive_level: 1, previous_level: 3 });
       const everything = lines.join("\n") + JSON.stringify(rows);
-      for (const secret of [String(DROR), String(NOA), "dror_the_organizer", "Noa", G, G.slice(1), "7007"]) {
-        assert.ok(!everything.includes(secret), `leaks ${secret}`);
+      // As whole tokens, not substrings: the rows carry a random uuid, a random hex trip id
+      // and a timestamp, and a short number can sit inside those by chance (that was this
+      // test's one flake). A token here is a run not touching another letter or number.
+      const asToken = (value: string) => new RegExp(`(?<![0-9A-Za-z])${value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![0-9A-Za-z])`);
+      for (const secret of [String(DROR), String(NOA), "dror_the_organizer", "Noa", G, G.slice(1)]) {
+        assert.ok(!asToken(secret).test(everything), `leaks ${secret}`);
+      }
+      // The log lines hold nothing random, so for them even the naive substring check is exact.
+      for (const secret of [String(DROR), String(NOA), "dror_the_organizer", "Noa", G.slice(1)]) {
+        assert.ok(!lines.join("\n").includes(secret), `a log line leaks ${secret}`);
       }
       assert.equal(rows.length, 1);
     });
+  });
+});
+
+describe("the leak check's own premise", () => {
+  test("a short number inside a uuid, a hex trip id or a timestamp is a substring hit but not a token hit (the CI flake on `555`)", () => {
+    const row = JSON.stringify({ event_id: "3a555e1c-0b7d-4c2e-9d11-5f0a8c2b7e44", trip_id: "trip_9a1555c0ffee", occurred_at: "2026-10-17T10:00:00.555Z" });
+    assert.ok(row.includes("555"), "the naive check would have failed");
+    const token = /(?<![0-9A-Za-z])555(?![0-9A-Za-z])/;
+    assert.equal(token.test(row), false, "the token check does not");
+    assert.equal(token.test('{"from":555}'), true, "but a real id as a value is still found");
   });
 });
 
@@ -257,7 +278,7 @@ describe("what leaves the relay to OpenRouter", { skip: SKIP }, () => {
   test("exactly the expected headers and URL, the key only as the bearer, no other env value, no chat or sender id in the prompt", async () => {
     await withFix(async (f) => {
       const G = "-1008000001";
-      const SENDER = 4242;
+      const SENDER = 4242007;
       await f.bind(G, f.A.tripId);
       await f.pool.query(
         "UPDATE control_plane.trips SET companion_intro = $2::jsonb WHERE id = $1",

@@ -26,7 +26,7 @@ import {
   JudgeRateLimiter,
   type JudgeOutcome,
 } from "./group-judge.js";
-import type { StructuredModelRunner } from "../model-runner.js";
+import { judgeTimeoutMs, type StructuredModelRunner } from "../model-runner.js";
 
 export interface BenchmarkCase {
   id: string;
@@ -149,7 +149,12 @@ export async function runBenchmark(options: BenchmarkOptions): Promise<Benchmark
     runner: options.runner,
     // Raw verdicts: the threshold is applied in the scoring so one run prices all of them.
     minConfidence: 0,
-    ...(options.timeoutMs ? { timeoutMs: options.timeoutMs } : {}),
+    // The per-runner default (3 s for an HTTP call, 8 s for a CLI), as the relay would use.
+    timeoutMs: options.timeoutMs ?? ((provider) => judgeTimeoutMs(process.env, provider).ms),
+    // Sequential, so latency is the model's; and no circuit breaker: a benchmark that
+    // lost its model half way should count the errors, not stop calling.
+    concurrency: 1,
+    breakerThreshold: Number.MAX_SAFE_INTEGER,
     // The relay's per-chat limit protects a group from a flood; a benchmark is not one.
     rateLimiter: new JudgeRateLimiter(1_000_000, options.now),
     ...(options.now ? { now: options.now } : {}),

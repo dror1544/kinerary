@@ -21,6 +21,7 @@ import {
   ATTACHMENT_TASKS,
   FORBIDDEN_MODELS,
   codexIsolationProblem,
+  isJudgeRunner,
   type RunnerResult,
   type StructuredModelRequest,
   type StructuredModelRunner,
@@ -278,10 +279,10 @@ export async function handleModelCommand(
     if (FORBIDDEN_MODELS.has(binding.model)) {
       return `${binding.model} picks a model per request, which is a silent fallback. Name a model.`;
     }
-    // The judge is asked while the serial poll loop waits, with a 3 s ceiling; only
-    // an HTTP runner can meet that. Said plainly, before the generic refusal.
-    if (task === "group_judge" && binding.runner !== "openrouter") {
-      return `group_judge takes only an openrouter model (openrouter:<model>): it is asked while the chat waits, with a 3 second limit, and ${binding.runner} cannot meet that. Nothing changed.`;
+    // The judge takes openrouter, claude or codex (a quick completion with no tools);
+    // hermes is an agent runtime. Said plainly, before the generic refusal.
+    if (task === "group_judge" && !isJudgeRunner(binding.runner)) {
+      return `group_judge takes only openrouter:<model>, claude:<model> or codex:<model>: ${binding.runner} is an agent runtime, not a quick completion. Nothing changed.`;
     }
     if (!runner.canServe(task, binding)) {
       const why = ATTACHMENT_TASKS.has(task) && !ATTACHMENT_RUNNERS.has(binding.runner)

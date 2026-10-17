@@ -118,6 +118,12 @@ export type DispatchDecision =
    * companion-unreachable answer, which is a lost turn (#177).
    */
   | { kind: "reply"; reply: DirectReply; analytics?: InboundFacts; levelChange?: LevelChangeFacts }
+  /**
+   * Only with `deferJudge`: the message needs the group judge and the caller must not
+   * block on it. `ask` makes the model call (queued and bounded by the judge itself)
+   * and never throws; see `DispatchOptions.deferJudge`.
+   */
+  | { kind: "judge_pending"; chatId: string; ask: () => Promise<JudgeOutcome> }
   | {
       /**
        * The bot has just been added to a group bound to a trip: send the
@@ -440,6 +446,25 @@ export interface DispatchOptions {
    * stays testable without a network.
    */
   groupJudge?: GroupJudge;
+  /**
+   * Do not wait for the judge. When a group message reaches the judge step, return
+   * `{ kind: "judge_pending", ask }` instead of awaiting the model; the caller runs
+   * `ask()` OFF its loop (the poller does, one chain per chat so a chat's messages
+   * keep their order), then calls `dispatchUpdate` again for the same update with
+   * `judgedOutcome` set to the result. Absent or false - the default, and every
+   * test and tool that calls this directly - the judge is awaited right here.
+   *
+   * The second call is safe because everything before the judge step is a read for a
+   * message that reaches it: it was not addressed, so the "?" window claim found
+   * nothing to consume and the conversation window did not list the sender.
+   */
+  deferJudge?: boolean;
+  /**
+   * The judge's verdict on THIS update, from a `judge_pending` round trip. `null` is
+   * "not asked or no usable answer": the message is NOT_ADDRESSED. Set, it replaces
+   * the call; the judge is never asked twice.
+   */
+  judgedOutcome?: JudgeOutcome | null;
 }
 
 /**
@@ -1054,7 +1079,15 @@ export async function dispatchUpdate(
       !addressedOtherwise && !capturedByConversation && inGroup && senderId &&
       options.groupJudge?.model() && outcome.route.kind === "companion" && judgeableText(outcome.event.text)
     ) {
-      judged = await askGroupJudge(db, options.groupJudge, outcome.route, chatId, outcome.event.text, log);
+      if (options.judgedOutcome !== undefined) {
+        // Second pass of a deferred judgement: the verdict is already in.
+        judged = options.judgedOutcome;
+      } else {
+        const ask = await prepareGroupJudge(db, options.groupJudge, outcome.route, chatId, outcome.event.text, log);
+        if (ask === null) judged = null;
+        else if (options.deferJudge) return { kind: "judge_pending", chatId, ask };
+        else judged = await ask();
+      }
       capturedByJudge = judged?.kind === "yes";
     }
     const addressed = addressedOtherwise || capturedByConversation || capturedByJudge;
@@ -1381,20 +1414,22 @@ function judgeableText(text: string): boolean {
 }
 
 /**
- * Asks the judge about one unaddressed group message, or returns null when it
- * must not be asked: the group's level is below 3 (`/proactive`; a trip that
- * opted out of reply capture reads as level 1), or the level could not be read
- * (fail closed - a relay running ahead of its migration judges nothing). Logs
- * the verdict and its speed, never the text.
+ * Prepares the judge's question about one unaddressed group message: null when it
+ * must not be asked - the group's level is below 3 (`/proactive`; a trip that opted
+ * out of reply capture reads as level 1), or the level could not be read (fail
+ * closed: a relay running ahead of its migration judges nothing) - otherwise the
+ * function that asks. The reads happen here, now; only the model call is left to
+ * `ask`, which never throws, logs the verdict and its speed (never the text), and
+ * may be run later and off the caller's loop.
  */
-async function askGroupJudge(
+async function prepareGroupJudge(
   db: pg.Pool,
   judge: GroupJudge,
   route: Extract<ChatRoute, { kind: "companion" }>,
   chatId: string,
   text: string,
   log: (line: string) => void,
-): Promise<JudgeOutcome | null> {
+): Promise<(() => Promise<JudgeOutcome>) | null> {
   try {
     if ((await groupProactiveLevel(db, chatId)) !== PROACTIVE_JOINS_IN) return null;
   } catch (error) {
@@ -1404,15 +1439,17 @@ async function askGroupJudge(
     return null;
   }
   const language = await tripLanguage(db, route.tripId).catch(() => "en" as const);
-  const judged = await judge.judge({ chatId, text, assistantNames: route.assistantNames, language });
-  log(structuredLog("info", "trip_bot.group_judged", {
-    verdict: judged.kind,
-    latency_ms: judged.ms,
-    model: judged.model,
-    ...(judged.kind === "fallback" ? { reason: judged.reason } : { confidence: judged.confidence }),
-    ...(judged.kind === "no" && judged.belowThreshold ? { below_threshold: true } : {}),
-  }));
-  return judged;
+  return async () => {
+    const judged = await judge.judge({ chatId, text, assistantNames: route.assistantNames, language });
+    log(structuredLog("info", "trip_bot.group_judged", {
+      verdict: judged.kind,
+      latency_ms: judged.ms,
+      model: judged.model,
+      ...(judged.kind === "fallback" ? { reason: judged.reason } : { confidence: judged.confidence }),
+      ...(judged.kind === "no" && judged.belowThreshold ? { below_threshold: true } : {}),
+    }));
+    return judged;
+  };
 }
 
 /** A judge outcome as the analytics descriptor names it. */

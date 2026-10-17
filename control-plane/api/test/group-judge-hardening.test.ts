@@ -13,7 +13,10 @@ import {
   parseJudgeVerdict,
 } from "../src/relay/group-judge.js";
 import {
+  CODEX_LUNA_MODEL,
+  isJudgeRunner,
   judgeDataCollection,
+  judgeEffort,
   judgeTimeoutMs,
   modelRunnerFromEnv,
   OPENROUTER_TASK_OPTIONS,
@@ -24,6 +27,7 @@ import {
   type StructuredModelRunner,
 } from "../src/model-runner.js";
 import { handleModelCommand, switchableRunner } from "../src/model-task-settings.js";
+import { withFakeBinDir, writeFakeBin } from "./support/child-env-harness.js";
 import { JUDGE_FALLBACK_REASONS } from "../src/analytics/contract.js";
 
 const pick = (out: { kind: string; reason?: string }) =>
@@ -54,6 +58,8 @@ describe("parseJudgeVerdict - fenced text (liquid-style answers)", () => {
       "```JSON\n" + body + "\n```\n",
       "```\n" + body + "\n```",
       "  ```json\n{\n  \"for_assistant\": true,\n  \"confidence\": 0.9\n}\n```  ",
+      "```json\n" + body + "\n```\n\nThe message asks about check-in times, so it is for the assistant.",
+      "```json\n" + body + "\n``` and that is my answer",
       "```json" + body + "```",
     ]) {
       assert.deepEqual(parseJudgeVerdict(text), expected, JSON.stringify(text));
@@ -65,8 +71,10 @@ describe("parseJudgeVerdict - fenced text (liquid-style answers)", () => {
       "```json\n{\n  \"ok\": true\n",
       "```json\n{\"ok\": true}\n```",
       `Sure! ${body}`,
-      "```json\n" + body + "\n``` and that is my answer",
       `${body} ${body}`,
+      "```json\n" + body + "\n``` then another: ```json\n" + body + "\n```",
+      "```json\n" + body + "\n```\nOr maybe {\"for_assistant\": false, \"confidence\": 1}",
+      "Here you go:\n```json\n" + body + "\n```",
       "```json\n" + body,
       '```json\n{"for_assistant": "true", "confidence": 0.9}\n```',
       '```json\n{"for_assistant": true, "confidence": 1.5}\n```',
@@ -161,18 +169,33 @@ describe("JUDGE_DATA_COLLECTION - deny by default, allow when the owner says so,
   });
 });
 
-describe("JUDGE_TIMEOUT_MS is clamped to (0, 3000]", () => {
-  test("above clamps to 3000, junk and non-positive read as 3000, in range is kept", () => {
-    assert.deepEqual(judgeTimeoutMs({ JUDGE_TIMEOUT_MS: "10000" }), { ms: 3000, clamped: "above" });
-    assert.deepEqual(judgeTimeoutMs({ JUDGE_TIMEOUT_MS: "3001" }), { ms: 3000, clamped: "above" });
-    assert.deepEqual(judgeTimeoutMs({ JUDGE_TIMEOUT_MS: "3000" }), { ms: 3000, clamped: null });
-    assert.deepEqual(judgeTimeoutMs({ JUDGE_TIMEOUT_MS: "1500" }), { ms: 1500, clamped: null });
-    for (const bad of ["0", "-5", "abc", "NaN"]) assert.deepEqual(judgeTimeoutMs({ JUDGE_TIMEOUT_MS: bad }), { ms: 3000, clamped: "invalid" }, bad);
-    assert.deepEqual(judgeTimeoutMs({}), { ms: 3000, clamped: null });
+describe("JUDGE_TIMEOUT_MS is clamped per runner: openrouter (0, 3000], claude and codex (0, 10000] with a default of 8000", () => {
+  test("openrouter and unknown kinds: above 3000 clamps, junk reads as 3000, in range is kept", () => {
+    for (const kind of [undefined, "openrouter", "fake"]) {
+      assert.deepEqual(judgeTimeoutMs({ JUDGE_TIMEOUT_MS: "10000" }, kind), { ms: 3000, clamped: "above", ceiling: 3000 }, String(kind));
+      assert.deepEqual(judgeTimeoutMs({ JUDGE_TIMEOUT_MS: "3000" }, kind), { ms: 3000, clamped: null, ceiling: 3000 });
+      assert.deepEqual(judgeTimeoutMs({ JUDGE_TIMEOUT_MS: "1500" }, kind), { ms: 1500, clamped: null, ceiling: 3000 });
+      assert.deepEqual(judgeTimeoutMs({}, kind), { ms: 3000, clamped: null, ceiling: 3000 });
+      for (const bad of ["0", "-5", "abc", "NaN"]) assert.deepEqual(judgeTimeoutMs({ JUDGE_TIMEOUT_MS: bad }, kind), { ms: 3000, clamped: "invalid", ceiling: 3000 }, bad);
+    }
   });
 
-  test("it applies where the binding is built: taskTimeoutMs, and the abort the OpenRouter call is given", async () => {
+  test("claude and codex: default 8000, ceiling 10000, junk reads as 8000", () => {
+    for (const kind of ["claude", "codex"]) {
+      assert.deepEqual(judgeTimeoutMs({}, kind), { ms: 8000, clamped: null, ceiling: 10000 }, kind);
+      assert.deepEqual(judgeTimeoutMs({ JUDGE_TIMEOUT_MS: "6000" }, kind), { ms: 6000, clamped: null, ceiling: 10000 });
+      assert.deepEqual(judgeTimeoutMs({ JUDGE_TIMEOUT_MS: "10000" }, kind), { ms: 10000, clamped: null, ceiling: 10000 });
+      assert.deepEqual(judgeTimeoutMs({ JUDGE_TIMEOUT_MS: "10001" }, kind), { ms: 10000, clamped: "above", ceiling: 10000 });
+      assert.deepEqual(judgeTimeoutMs({ JUDGE_TIMEOUT_MS: "60000" }, kind), { ms: 10000, clamped: "above", ceiling: 10000 });
+      for (const bad of ["0", "-5", "abc"]) assert.deepEqual(judgeTimeoutMs({ JUDGE_TIMEOUT_MS: bad }, kind), { ms: 8000, clamped: "invalid", ceiling: 10000 }, bad);
+    }
+  });
+
+  test("it applies where the binding is built: taskTimeoutMs follows JUDGE_RUNNER, and the OpenRouter call is aborted at 3 s", async () => {
     assert.equal(taskTimeoutMs("group_judge", { JUDGE_TIMEOUT_MS: "9000" }), 3000);
+    assert.equal(taskTimeoutMs("group_judge", { JUDGE_RUNNER: "claude", JUDGE_TIMEOUT_MS: "9000" }), 9000);
+    assert.equal(taskTimeoutMs("group_judge", { JUDGE_RUNNER: "codex" }), 8000);
+    assert.equal(taskTimeoutMs("group_judge", { JUDGE_RUNNER: "claude", JUDGE_TIMEOUT_MS: "99999" }), 10000);
     let aborted = false;
     const started = Date.now();
     const hang = ((_u: string, init?: { signal?: AbortSignal }) =>
@@ -192,45 +215,161 @@ describe("JUDGE_TIMEOUT_MS is clamped to (0, 3000]", () => {
     assert.ok(Date.now() - started < 8_000, "cut at about 3 s, not 60 s");
   });
 
-  test("a clamped value is warned about once at start", () => {
+  test("the hard stop follows the bound runner's kind, and a clamped value is warned about once at start", () => {
     const lines: string[] = [];
     groupJudgeFromEnv(boundRunner(), { JUDGE_TIMEOUT_MS: "20000" }, (l) => lines.push(l));
     assert.equal(lines.filter((l) => l.includes("judge_timeout_clamped")).length, 1);
     assert.match(lines.join("\n"), /"effective_ms":3000/);
+    assert.match(lines.join("\n"), /above the 3000 ms ceiling/);
+    const cli = (provider: string): StructuredModelRunner => ({
+      describe: (task) => (task === JUDGE_TASK ? { provider, model: "m" } : null),
+      run: (async () => ({ ok: false })) as unknown as StructuredModelRunner["run"],
+    });
+    const claudeLines: string[] = [];
+    groupJudgeFromEnv(cli("claude"), { JUDGE_TIMEOUT_MS: "20000" }, (l) => claudeLines.push(l));
+    assert.match(claudeLines.join("\n"), /"effective_ms":10000/);
+    assert.match(claudeLines.join("\n"), /above the 10000 ms ceiling/);
+    const quiet: string[] = [];
+    groupJudgeFromEnv(cli("codex"), {}, (l) => quiet.push(l));
+    assert.ok(!quiet.some((l) => l.includes("clamped")));
+    assert.match(quiet.join("\n"), /"runner":"codex","timeout_ms":8000/);
+    assert.match(quiet.join("\n"), /"effort":"low"/, "the CLI runners' start line states the effort");
+    assert.ok(!quiet.join("\n").includes("data_collection"), "and not the OpenRouter-only policy");
     const fine: string[] = [];
     groupJudgeFromEnv(boundRunner(), { JUDGE_TIMEOUT_MS: "1500" }, (l) => fine.push(l));
     assert.ok(!fine.some((l) => l.includes("clamped")));
   });
 });
 
-describe("the judge runs on an HTTP runner only", () => {
-  test("claude, codex and hermes are no binding for group_judge, by env or by override - and still serve other tasks", () => {
-    for (const kind of ["claude", "codex", "hermes"]) {
-      assert.equal(runnerForBinding(kind, "m", 3000, "group_judge", {}), undefined, kind);
-    }
-    assert.ok(runnerForBinding("openrouter", "vendor/m", 3000, "group_judge", { OPENROUTER_API_KEY: "sk" }));
-    assert.equal(modelRunnerFromEnv({ JUDGE_RUNNER: "claude", JUDGE_MODEL: "claude-sonnet-5" }), undefined);
-    assert.ok(runnerForBinding("claude", "claude-sonnet-5", 45000, "interpret", {}));
+describe("the judge takes openrouter, claude or codex - never hermes", () => {
+  const ENV = { OPENROUTER_API_KEY: "sk" } as NodeJS.ProcessEnv;
+
+  test("the allow matrix at the binding: openrouter, claude and codex build; hermes does not; other tasks keep hermes", () => {
+    assert.ok(runnerForBinding("openrouter", "vendor/m", 3000, "group_judge", ENV));
+    assert.ok(runnerForBinding("claude", "claude-haiku-4-5-20251001", 3000, "group_judge", {}));
+    assert.ok(runnerForBinding("codex", "gpt-5.6-luna", 3000, "group_judge", {}));
+    assert.equal(runnerForBinding("hermes", "profile", 3000, "group_judge", {}), undefined);
+    assert.equal(isJudgeRunner("hermes"), false);
+    assert.ok(runnerForBinding("hermes", "profile", 45000, "interpret", {}), "hermes still serves the tasks it served");
   });
 
-  test("/model group_judge refuses claude:, codex: and hermes: with a clear reply, and writes nothing", async () => {
+  test("the allow matrix from the environment: JUDGE_RUNNER=claude or codex binds (codex defaults to the luna model), hermes does not", () => {
+    assert.deepEqual(modelRunnerFromEnv({ JUDGE_RUNNER: "claude", JUDGE_MODEL: "claude-haiku-4-5-20251001" })?.describe?.("group_judge"), { provider: "claude", model: "claude-haiku-4-5-20251001" });
+    assert.deepEqual(modelRunnerFromEnv({ JUDGE_RUNNER: "codex" })?.describe?.("group_judge"), { provider: "codex", model: CODEX_LUNA_MODEL });
+    assert.deepEqual(modelRunnerFromEnv({ JUDGE_RUNNER: "codex", JUDGE_MODEL: "gpt-6-luna" })?.describe?.("group_judge"), { provider: "codex", model: "gpt-6-luna" });
+    assert.equal(modelRunnerFromEnv({ JUDGE_RUNNER: "hermes", JUDGE_MODEL: "profile" }), undefined);
+    assert.equal(modelRunnerFromEnv({ JUDGE_RUNNER: "claude" }), undefined, "claude has no default model: configuration, not a guess");
+  });
+
+  test("/model group_judge: openrouter, claude and codex are accepted (they reach the database); hermes is refused with the reason and writes nothing", async () => {
     const runner = switchableRunner(boundRunner(), (task, b) => runnerForBinding(b.runner, b.model, taskTimeoutMs(task), task, { OPENROUTER_API_KEY: "sk" }));
-    const db = new Proxy({}, { get: () => { throw new Error("a refused binding touched the database"); } }) as never;
-    for (const kind of ["claude", "codex", "hermes"]) {
-      const reply = await handleModelCommand(db, runner, { name: "model", args: `group_judge ${kind}:some-model` }, "sha256:" + "0".repeat(64));
-      assert.match(reply, /group_judge takes only an openrouter model/, kind);
-      assert.match(reply, new RegExp(`${kind} cannot meet that`), kind);
-      assert.match(reply, /Nothing changed/);
+    const touched = () => new Proxy({}, { get: () => { throw new Error("DB-TOUCHED"); } }) as never;
+    const admin = "sha256:" + "0".repeat(64);
+    const verified = async () => null;
+    for (const binding of ["openrouter:vendor/m", "claude:claude-haiku-4-5-20251001", "codex:gpt-5.6-luna"]) {
+      await assert.rejects(handleModelCommand(touched(), runner, { name: "model", args: `group_judge ${binding}` }, admin, () => {}, verified), /DB-TOUCHED/, binding);
     }
+    const reply = await handleModelCommand(touched(), runner, { name: "model", args: "group_judge hermes:profile" }, admin, () => {}, verified);
+    assert.match(reply, /group_judge takes only openrouter:<model>, claude:<model> or codex:<model>/);
+    assert.match(reply, /hermes is an agent runtime/);
+    assert.match(reply, /Nothing changed/);
     assert.equal(runner.effective("group_judge").source, "environment");
   });
 
-  test("an unusable JUDGE_RUNNER=claude is named at start as unusable, and says why", () => {
-    const lines: string[] = [];
+  test("codex for the judge stays behind the isolation gate: an unverified codex is no binding, and /model runs the probe", async () => {
+    assert.equal(runnerForBinding("codex", "gpt-5.6-luna", 8000, "group_judge", { KINERARY_CODEX_ISOLATION_UNVERIFIED: "1" }), undefined);
+    assert.equal(modelRunnerFromEnv({ JUDGE_RUNNER: "codex", KINERARY_CODEX_ISOLATION_UNVERIFIED: "1" }), undefined);
+    const runner = switchableRunner(boundRunner(), (task, b) => runnerForBinding(b.runner, b.model, taskTimeoutMs(task), task, {}));
+    const touched = new Proxy({}, { get: () => { throw new Error("DB-TOUCHED"); } }) as never;
+    const reply = await handleModelCommand(touched, runner, { name: "model", args: "group_judge codex:gpt-5.6-luna" }, "sha256:" + "0".repeat(64), () => {}, async () => "codex does not know isolation feature(s): shell_tool");
+    assert.match(reply, /cannot serve calls/);
+    assert.match(reply, /shell_tool/);
+    assert.match(reply, /Nothing changed/);
+  });
+
+  test("an unusable JUDGE_RUNNER (hermes, or claude without a model) is named at start as unusable", () => {
     const none: StructuredModelRunner = { describe: () => null, run: (async () => ({ ok: false })) as unknown as StructuredModelRunner["run"] };
-    groupJudgeFromEnv(none, { JUDGE_RUNNER: "claude" }, (l) => lines.push(l));
-    assert.match(lines.join("\n"), /judge_unusable/);
-    assert.match(lines.join("\n"), /only an HTTP runner can meet the 3 s limit/);
+    for (const runnerName of ["hermes", "claude"]) {
+      const lines: string[] = [];
+      groupJudgeFromEnv(none, { JUDGE_RUNNER: runnerName }, (l) => lines.push(l));
+      assert.match(lines.join("\n"), /judge_unusable/, runnerName);
+      assert.match(lines.join("\n"), /openrouter, claude or codex/, runnerName);
+    }
+  });
+});
+
+describe("the CLI runners as the judge: what the call looks like", () => {
+  /** What a fake CLI hands back: the verdict, plus the argv it was started with. */
+  const withArgv = (parsed: unknown) => parsed as { for_assistant?: boolean; confidence?: number; argv: string[] };
+  const parseWithArgv = (raw: unknown) => {
+    const o = withArgv(raw);
+    return { verdict: parseJudgeVerdict(raw), argv: o.argv };
+  };
+
+  test("claude: haiku-style model, effort low by default (so settings, hooks and MCP are dropped), no tools, one attempt; fence plus trailing prose is read", async () => {
+    await withFakeBinDir("kinerary-judge-claude-", async (dir) => {
+      const bin = await writeFakeBin(dir, "claude", [
+        "const argv = process.argv.slice(2);",
+        'const verdict = { for_assistant: true, confidence: 0.9, argv };',
+        'const text = "```json\\n" + JSON.stringify(verdict) + "\\n```\\n\\nThe message asks about check-in, so it is for the assistant.";',
+        'process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: text }));',
+      ]);
+      const runner = runnerForBinding("claude", "claude-haiku-4-5-20251001", 8000, "group_judge", { CLAUDE_BIN: bin });
+      const result = await runner!.run({ task: "group_judge", prompt: "PROMPT", parse: parseWithArgv });
+      assert.equal(result.ok, true, result.ok ? "" : `${result.reason}: ${result.detail}`);
+      if (!result.ok) return;
+      const { verdict, argv } = result.value;
+      assert.deepEqual(verdict, { forAssistant: true, confidence: 0.9 });
+      assert.equal(argv[argv.indexOf("--model") + 1], "claude-haiku-4-5-20251001");
+      assert.equal(argv[argv.indexOf("--effort") + 1], "low");
+      assert.equal(argv[argv.indexOf("--tools") + 1], "", "no tools");
+      assert.ok(argv.includes("--strict-mcp-config") && argv.includes("--setting-sources"), "no MCP, no personal settings");
+      assert.equal(result.attempts, 1, "one attempt: a retry would double the wait");
+    });
+  });
+
+  test("claude: JUDGE_EFFORT overrides the default, a typo is refused at build time", () => {
+    assert.ok(runnerForBinding("claude", "m", 8000, "group_judge", { JUDGE_EFFORT: "medium" }));
+    assert.throws(() => runnerForBinding("claude", "m", 8000, "group_judge", { JUDGE_EFFORT: "fast" }), /not an effort level/);
+    assert.equal(judgeEffort({}), "low");
+    assert.equal(judgeEffort({ JUDGE_EFFORT: "HIGH" }), "high");
+  });
+
+  test("codex: the lowest effort the catalog offers, the same isolation flags, one attempt, and its answer is parsed", async () => {
+    await withFakeBinDir("kinerary-judge-codex-", async (dir) => {
+      const bin = await writeFakeBin(dir, "codex", [
+        "const argv = process.argv.slice(2);",
+        "const out = argv[argv.indexOf('-o') + 1];",
+        "require('fs').writeFileSync(out, JSON.stringify({ for_assistant: false, confidence: 0.8, argv }));",
+      ]);
+      const runner = runnerForBinding("codex", CODEX_LUNA_MODEL, 8000, "group_judge", { CODEX_BIN: bin });
+      const result = await runner!.run({ task: "group_judge", prompt: "PROMPT", parse: parseWithArgv, schema: { type: "object" } });
+      assert.equal(result.ok, true, result.ok ? "" : `${result.reason}: ${result.detail}`);
+      if (!result.ok) return;
+      const { verdict, argv } = result.value;
+      assert.deepEqual(verdict, { forAssistant: false, confidence: 0.8 });
+      assert.equal(argv[argv.indexOf("-m") + 1], "gpt-5.6-luna");
+      assert.ok(argv.some((a, i) => a === 'model_reasoning_effort="low"' && argv[i - 1] === "-c"), "the lowest level in the catalog");
+      for (const flag of ["--ignore-user-config", "--ignore-rules", "--ephemeral", "--skip-git-repo-check"]) assert.ok(argv.includes(flag), flag);
+      assert.ok(argv.some((a, i) => a === "--disable" && argv[i + 1] === "shell_tool"), "the isolation list every codex task gets");
+      assert.ok(argv.some((a, i) => a === "-c" && argv[i + 1] === "mcp_servers={}"));
+      assert.equal(argv[argv.indexOf("-s") + 1], "read-only");
+      assert.equal(result.attempts, 1);
+    });
+  });
+
+  test("codex: another task's call carries no effort flag at all", async () => {
+    await withFakeBinDir("kinerary-judge-codex2-", async (dir) => {
+      const bin = await writeFakeBin(dir, "codex", [
+        "const argv = process.argv.slice(2);",
+        "const out = argv[argv.indexOf('-o') + 1];",
+        "require('fs').writeFileSync(out, JSON.stringify({ argv }));",
+      ]);
+      const runner = runnerForBinding("codex", CODEX_LUNA_MODEL, 8000, "interpret", { CODEX_BIN: bin });
+      const result = await runner!.run({ task: "interpret", prompt: "P", parse: (raw) => raw as { argv: string[] } });
+      assert.equal(result.ok, true);
+      if (result.ok) assert.ok(!result.value.argv.some((a) => a.includes("model_reasoning_effort")));
+    });
   });
 });
 

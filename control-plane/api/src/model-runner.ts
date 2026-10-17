@@ -685,7 +685,17 @@ export interface CodexSpec {
   maxAttempts: number;
   /** Where the process runs. Neutral by default so no repo rules apply. */
   cwd: string;
+  /**
+   * `model_reasoning_effort`, passed as `-c model_reasoning_effort="<level>"`.
+   * Absent: whatever the model's catalog default is (medium for the luna models).
+   * Set by the group judge, which wants the lowest the catalog offers.
+   */
+  effort?: CodexEffort;
 }
+
+/** The levels `codex debug models` lists across the catalog (2026-10-17, codex-cli 0.160.0): `low` is the lowest anywhere. */
+export const CODEX_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+export type CodexEffort = (typeof CODEX_EFFORT_LEVELS)[number];
 
 /**
  * Disable every Codex agent capability that could act on untrusted document
@@ -780,6 +790,7 @@ async function runCodexOnce(spec: CodexSpec, req: { prompt: string; schema?: Rec
     "--ephemeral",
     "--ignore-rules",
     ...CODEX_ISOLATION_ARGS,
+    ...(spec.effort ? ["-c", `model_reasoning_effort="${spec.effort}"`] : []),
     "-o", answerPath,
   ];
   if (req.schema) {
@@ -1455,26 +1466,61 @@ export function judgeDataCollection(env: NodeJS.ProcessEnv = process.env): { pol
   return { policy: "deny", invalid: raw !== "" && raw !== "deny" };
 }
 
+/** What may serve the judge. Hermes is refused: an agent runtime is neither fast nor a plain completion. */
+export const JUDGE_RUNNERS = ["openrouter", "claude", "codex"] as const;
+export type JudgeRunnerKind = (typeof JUDGE_RUNNERS)[number];
+export function isJudgeRunner(kind: string): kind is JudgeRunnerKind {
+  return (JUDGE_RUNNERS as readonly string[]).includes(kind);
+}
+
+/** A CLI runner starts a process and logs in: its judge budget is longer than an HTTP call's. */
+export const JUDGE_CLI_DEFAULT_TIMEOUT_MS = 8_000;
+export const JUDGE_CLI_MAX_TIMEOUT_MS = 10_000;
+
 /**
- * The judge's timeout: `JUDGE_TIMEOUT_MS` clamped to (0, 3000]. The turn waits
- * on the judge and the poll loop is serial, so 3 s is a hard ceiling, not a
- * default: a larger value clamps to it, and a missing, zero, negative or
- * non-numeric one is the ceiling too. `clamped` says which, for one warning.
+ * The judge's timeout, per runner kind: `JUDGE_TIMEOUT_MS` clamped to (0, ceiling].
+ *
+ * - openrouter (and any kind this does not know): default and ceiling 3000 ms.
+ *   An HTTP call to a small model has no excuse for more, and the turn waits.
+ * - claude / codex: default 8000, ceiling 10000. A CLI start plus login measured
+ *   5.1-7.4 s on 2026-10-17; the owner accepted missing the 1.5 s target on this
+ *   path. The turn does NOT wait on it any more (the poller runs the judge off its
+ *   loop, per chat), so the ceiling bounds how long ONE chat's follow-ups queue.
+ *
+ * A missing, zero, negative or non-numeric value is the default; `clamped` says
+ * which, for one start-up warning.
  */
-export function judgeTimeoutMs(env: NodeJS.ProcessEnv = process.env): { ms: number; clamped: "above" | "invalid" | null } {
+export function judgeTimeoutMs(
+  env: NodeJS.ProcessEnv = process.env,
+  kind?: string,
+): { ms: number; clamped: "above" | "invalid" | null; ceiling: number } {
+  const cli = kind === "claude" || kind === "codex";
+  const ceiling = cli ? JUDGE_CLI_MAX_TIMEOUT_MS : GROUP_JUDGE_TIMEOUT_MS;
+  const fallback = cli ? JUDGE_CLI_DEFAULT_TIMEOUT_MS : GROUP_JUDGE_TIMEOUT_MS;
   const raw = (env.JUDGE_TIMEOUT_MS ?? "").trim();
-  if (raw === "") return { ms: GROUP_JUDGE_TIMEOUT_MS, clamped: null };
+  if (raw === "") return { ms: fallback, clamped: null, ceiling };
   const value = Number(raw);
-  if (!Number.isFinite(value) || value <= 0) return { ms: GROUP_JUDGE_TIMEOUT_MS, clamped: "invalid" };
-  if (value > GROUP_JUDGE_TIMEOUT_MS) return { ms: GROUP_JUDGE_TIMEOUT_MS, clamped: "above" };
-  return { ms: value, clamped: null };
+  if (!Number.isFinite(value) || value <= 0) return { ms: fallback, clamped: "invalid", ceiling };
+  if (value > ceiling) return { ms: ceiling, clamped: "above", ceiling };
+  return { ms: value, clamped: null, ceiling };
+}
+
+/**
+ * The judge's effort, for the CLI runners: `JUDGE_EFFORT`, default `low` (the owner's
+ * "fast"). Claude's levels are `low|medium|high|xhigh|max`; codex's catalog starts
+ * at `low` too, so one default serves both. A value that is not a level THROWS, as
+ * `claudeEffort` does for every task: a typo must not silently become the personal
+ * settings' effort.
+ */
+export function judgeEffort(env: NodeJS.ProcessEnv = process.env): ClaudeEffort {
+  return claudeEffort("JUDGE_EFFORT", env) ?? "low";
 }
 
 /** A task's timeout: its own `<PREFIX>_TIMEOUT_MS`, else what it inherits, else its default. */
 export function taskTimeoutMs(task: string, env: NodeJS.ProcessEnv = process.env): number {
   const spec = MODEL_TASKS.find((t) => t.task === task);
   if (!spec) return DEFAULT_TIMEOUT_MS;
-  if (task === "group_judge") return judgeTimeoutMs(env).ms;
+  if (task === "group_judge") return judgeTimeoutMs(env, (env.JUDGE_RUNNER ?? "").trim().toLowerCase()).ms;
   const own = Number(env[`${spec.prefix}_TIMEOUT_MS`]);
   if (own > 0) return own;
   const inherited = spec.inherits ? Number(env[`${spec.inherits}_TIMEOUT_MS`]) : 0;
@@ -1506,22 +1552,29 @@ export function runnerForBinding(
   // feature (codexIsolationProblem): codex is then no binding at all, rather
   // than one that fails every call or runs with tools switched on.
   if (kind === "codex" && env.KINERARY_CODEX_ISOLATION_UNVERIFIED === "1") return undefined;
-  // The judge is asked while the serial poll loop waits, with a 3 s ceiling. A CLI
-  // runner (claude, codex, hermes) starts a process and cannot meet that, so it is
-  // no binding at all - env or `/model` - rather than one that blocks every group
-  // message for its whole timeout.
-  if (task === "group_judge" && kind !== "openrouter") return undefined;
+  // The judge takes openrouter, claude or codex; hermes is no binding for it, by env
+  // or by `/model`. Its timeout is the per-runner clamp, whatever the caller passed.
+  const judge = task === "group_judge";
+  if (judge && !isJudgeRunner(kind)) return undefined;
+  if (judge) timeoutMs = judgeTimeoutMs(env, kind).ms;
   if (kind === "openrouter") {
     const key = openRouterKey(env);
     if (!key) return undefined;
     const extra: Partial<HttpSpec> = { ...(OPENROUTER_TASK_OPTIONS[task] ?? {}) };
-    if (task === "group_judge") {
-      timeoutMs = Math.min(timeoutMs, GROUP_JUDGE_TIMEOUT_MS);
-      if (judgeDataCollection(env).policy === "allow") delete extra.provider;
-    }
+    if (judge && judgeDataCollection(env).policy === "allow") delete extra.provider;
     return openRouterRunner({ [task]: openRouterSpec(model, key, timeoutMs, extra) });
   }
-  if (kind === "codex") return codexRunner({ [task]: codexSpec(model, timeoutMs, { bin: env.CODEX_BIN || "codex" }) });
+  if (kind === "codex") {
+    // Same gate and same isolation as every other codex task (the unverified flag
+    // above, CODEX_ISOLATION_ARGS in the call). The judge adds the lowest reasoning
+    // effort and a single attempt: a retry doubles a wait the chat is queued behind.
+    return codexRunner({
+      [task]: codexSpec(model, timeoutMs, {
+        bin: env.CODEX_BIN || "codex",
+        ...(judge ? { maxAttempts: 1, effort: judgeEffort(env) } : {}),
+      }),
+    });
+  }
   // `<TASK>_EFFORT`, read here because this is now the ONE place a claude
   // binding is built. It used to be read where modelRunnerFromEnv built its own
   // runners; moving the construction without moving this would leave every call
@@ -1529,7 +1582,9 @@ export function runnerForBinding(
   // is not an error, just a slower and differently-behaved model (see
   // claudeSpec, and the 143s-against-a-60s-limit run of 2026-09-16).
   if (kind === "claude") {
-    const effort = claudeEffortForTask(task, env);
+    // The judge defaults to `low`: fast, and with an effort set the call also ignores
+    // personal settings, hooks and connectors (see claudeSpec). No tools, no MCP.
+    const effort = judge ? judgeEffort(env) : claudeEffortForTask(task, env);
     // Unset is not an error, it is a downgrade: the call then runs on the
     // process's personal settings.json, hooks and MCP connectors. Said once
     // per task per process, because this is rebuilt often.
@@ -1541,7 +1596,8 @@ export function runnerForBinding(
         consequence: "claude -p runs on this process's personal settings, hooks and MCP connectors",
       }));
     }
-    return cliRunner({ [task]: claudeSpec(model, timeoutMs, env.CLAUDE_BIN || "claude", effort) });
+    const spec = claudeSpec(model, timeoutMs, env.CLAUDE_BIN || "claude", effort);
+    return cliRunner({ [task]: judge ? { ...spec, maxAttempts: 1 } : spec });
   }
   if (kind === "hermes") return cliRunner({ [task]: hermesSpec(model, timeoutMs, env.HERMES_BIN || "hermes") });
   return undefined;
@@ -1620,7 +1676,7 @@ export function modelRunnerFromEnv(env: NodeJS.ProcessEnv = process.env): Struct
       (env[`${source}_MODEL`] || "").trim() ||
       (kind === "openrouter" ? openRouterModel ?? "" : kind === "codex" ? CODEX_LUNA_MODEL : "");
     if (!model) continue;
-    const runner = build(kind, model, task === "group_judge" ? judgeTimeoutMs(env).ms : Number(env[`${source}_TIMEOUT_MS`] || timeoutMs), task);
+    const runner = build(kind, model, task === "group_judge" ? judgeTimeoutMs(env, kind).ms : Number(env[`${source}_TIMEOUT_MS`] || timeoutMs), task);
     if (!runner) continue;
 
     // The quota-only fallback (decision 48). A separate axis from the primary

@@ -5332,6 +5332,107 @@ export function startTripBotPoller(
       timer.unref?.();
     });
 
+  /**
+   * The chats with a group-judge call out, each as the tail of a promise chain.
+   *
+   * The judge is a model call that can take seconds (a CLI runner measured 5-7 s),
+   * and this loop is the one consumer of the bot's update stream: awaiting it here
+   * would stall every chat, interviews and DMs included. So a message that needs the
+   * judge is parked on its chat's chain (`enqueueInLane`) and the loop moves on; that
+   * message's own decision is made, and applied, when the verdict is in. Only that
+   * chat waits - its later updates are chained behind it, in arrival order - and the
+   * judge itself bounds how many calls run at once (JUDGE_CONCURRENCY) and how many
+   * wait for a slot.
+   *
+   * ACKNOWLEDGEMENT. The offset above is advanced when an update is RECEIVED, before
+   * it is handled, for every update (so a poisoned one cannot wedge the bot). A
+   * parked message is no different: Telegram will not redeliver it, and a relay that
+   * stops while its judgement is out loses it - which for an unaddressed group
+   * message is exactly the judge-failed outcome, NOT_ADDRESSED, with only that one
+   * message's overheard context and held attachment missing. Acknowledging later
+   * would not be safer: a redelivered update would run the whole gate twice.
+   */
+  const judgeLanes = new Map<string, Promise<void>>();
+
+  function chatOf(update: TelegramUpdate): string | null {
+    try {
+      const u = update as {
+        message?: { chat?: { id?: unknown } };
+        callback_query?: { message?: { chat?: { id?: unknown } } };
+        my_chat_member?: { chat?: { id?: unknown } };
+      };
+      const id = u.message?.chat?.id ?? u.callback_query?.message?.chat?.id ?? u.my_chat_member?.chat?.id;
+      return id === undefined || id === null ? null : String(id);
+    } catch {
+      // A malformed update has no lane; handleUpdate meets (and logs) the same fault.
+      return null;
+    }
+  }
+
+  function enqueueInLane(chat: string, work: () => Promise<void>): void {
+    const previous = judgeLanes.get(chat) ?? Promise.resolve();
+    // `work` never rejects (handleUpdate catches); the catch is belt and braces.
+    const next: Promise<void> = previous.then(work).catch(() => {}).then(() => {
+      if (judgeLanes.get(chat) === next) judgeLanes.delete(chat);
+    });
+    judgeLanes.set(chat, next);
+  }
+
+  /**
+   * One update, start to finish: dispatch it, act on the decision. With `defer`, a
+   * message that needs the judge is parked on its chat's chain instead of awaited.
+   */
+  async function handleUpdate(update: TelegramUpdate, defer: boolean): Promise<void> {
+    try {
+      const options = {
+        interviewerProfile: deps.interviewerProfile,
+        media: deps.media,
+        pendingAttachments,
+        groupContext,
+        ...(deps.superAdminSubjectDigest ? { superAdminSubjectDigest: deps.superAdminSubjectDigest } : {}),
+        ...(deps.modelRunner ? { modelRunner: deps.modelRunner } : {}),
+        // Descriptors only when something will record them (#177).
+        ...(deps.assistantEvents ? { assistantEvents: true } : {}),
+        ...(deps.groupJudge ? { groupJudge: deps.groupJudge } : {}),
+        ...(deps.organizerDocumentRoute === true ? { organizerDocumentRoute: true } : {}),
+        // Asked per update rather than cached: a gateway can stop between
+        // one message and the next, and a stale "reachable" spends the
+        // organizer's turn on a socket that is gone.
+        ...(deps.connector.canReachProfile
+          ? { canReachProfile: (profile: string) => deps.connector.canReachProfile!(profile) }
+          : {}),
+      };
+      const decision = await dispatchUpdate(deps.db, update, strings, log, deps.botIdentity ?? {}, {
+        ...options,
+        ...(defer ? { deferJudge: true } : {}),
+      });
+      if (decision.kind === "judge_pending") {
+        const chat = decision.chatId;
+        enqueueInLane(chat, async () => {
+          // `ask` does not throw; a verdict that cannot be had is "no usable answer".
+          const judged = await decision.ask().catch(() => null);
+          try {
+            const final = await dispatchUpdate(deps.db, update, strings, log, deps.botIdentity ?? {}, {
+              ...options,
+              judgedOutcome: judged,
+            });
+            await applyDecision(final, deps);
+          } catch (error) {
+            log(structuredLog("error", "trip_bot.update_failed", {
+              safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+            }));
+          }
+        });
+        return;
+      }
+      await applyDecision(decision, deps);
+    } catch (error) {
+      log(structuredLog("error", "trip_bot.update_failed", {
+        safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+      }));
+    }
+  }
+
   async function run(): Promise<void> {
     // Telegram refuses getUpdates outright while a webhook is registered for
     // the same token, so this must happen before the first poll, not per tick.
@@ -5407,31 +5508,16 @@ export function startTripBotPoller(
             }));
           }
         }
-        try {
-          const decision = await dispatchUpdate(deps.db, update, strings, log, deps.botIdentity ?? {}, {
-            interviewerProfile: deps.interviewerProfile,
-            media: deps.media,
-            pendingAttachments,
-            groupContext,
-            ...(deps.superAdminSubjectDigest ? { superAdminSubjectDigest: deps.superAdminSubjectDigest } : {}),
-            ...(deps.modelRunner ? { modelRunner: deps.modelRunner } : {}),
-            // Descriptors only when something will record them (#177).
-            ...(deps.assistantEvents ? { assistantEvents: true } : {}),
-            ...(deps.groupJudge ? { groupJudge: deps.groupJudge } : {}),
-            ...(deps.organizerDocumentRoute === true ? { organizerDocumentRoute: true } : {}),
-            // Asked per update rather than cached: a gateway can stop between
-            // one message and the next, and a stale "reachable" spends the
-            // organizer's turn on a socket that is gone.
-            ...(deps.connector.canReachProfile
-              ? { canReachProfile: (profile: string) => deps.connector.canReachProfile!(profile) }
-              : {}),
-          });
-          await applyDecision(decision, deps);
-        } catch (error) {
-          log(structuredLog("error", "trip_bot.update_failed", {
-            safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
-          }));
+        // A chat whose judge call is still out holds its later updates behind it, so
+        // a follow-up cannot overtake the message it follows; every other chat, and
+        // every DM, goes straight on. See `judgeLanes`.
+        const chat = chatOf(update);
+        const tail = chat ? judgeLanes.get(chat) : undefined;
+        if (chat && tail) {
+          enqueueInLane(chat, () => handleUpdate(update, false));
+          continue;
         }
+        await handleUpdate(update, true);
       }
 
       // Unconditional, even at zero. `await` on an already-resolved promise

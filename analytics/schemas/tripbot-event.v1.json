@@ -99,7 +99,7 @@
         "document_held": { "type": "boolean" },
         "judge_confidence_pct": { "type": "integer", "minimum": 0, "maximum": 100 },
         "judge_model": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,79}$" },
-        "judge_fallback_reason": { "enum": ["timeout", "error", "unparseable", "rate_limited", "circuit_open"] },
+        "judge_fallback_reason": { "enum": ["timeout", "error", "unparseable", "rate_limited", "circuit_open", "queue_full"] },
         "judge_below_threshold": { "type": "boolean" },
         "proactive_level": { "type": "integer", "minimum": 1, "maximum": 3 }
       }

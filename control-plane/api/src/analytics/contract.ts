@@ -177,7 +177,7 @@ export const REQUIRED_FIELDS = ["event_id", "occurred_at", "source_service", "ev
  * short identifier from an alphabet with no space in it, so nothing a traveller
  * typed can ride in it). Never a free string.
  */
-export const JUDGE_FALLBACK_REASONS = ["timeout", "error", "unparseable", "rate_limited", "circuit_open"] as const;
+export const JUDGE_FALLBACK_REASONS = ["timeout", "error", "unparseable", "rate_limited", "circuit_open", "queue_full"] as const;
 export type JudgeFallbackReason = (typeof JUDGE_FALLBACK_REASONS)[number];
 
 /** Same expression as the migration's CHECK on `metadata.judge_model`. */
