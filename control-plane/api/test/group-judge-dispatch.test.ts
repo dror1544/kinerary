@@ -464,6 +464,26 @@ describe("/proactive - how much the assistant takes part in one group", { skip: 
     });
   });
 
+  test("a relay running ahead of its migration answers politely instead of failing the update", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1005000009";
+      await bindNamed(fix, chat);
+      await linkOrganizer(fix, DROR);
+      await fix.pool.query("ALTER TABLE control_plane.telegram_chat_bindings RENAME COLUMN proactive_level TO proactive_level_gone");
+      const lines: string[] = [];
+      const decision = await dispatch(fix, from(chat, "/proactive 1", DROR), { assistantEvents: true }, lines);
+      assert.equal(decision.kind, "reply", "an answer, not a thrown update");
+      assert.match(reply(decision), /couldn't change that right now/);
+      assert.equal((decision as { levelChange?: unknown }).levelChange, undefined, "and no change is counted");
+      assert.ok(lines.some((l) => l.includes("trip_bot.proactive_write_failed")), "and it is loud");
+      // The read side degrades the same way: the options are shown, at the default.
+      assert.match(reply(await dispatch(fix, from(chat, "/proactive", NOA))), /level 3/);
+
+      await fix.pool.query("UPDATE control_plane.trips SET companion_intro = '{\"language\":\"he\"}'::jsonb WHERE id = $1", [fix.tripId]);
+      assert.match(reply(await dispatch(fix, from(chat, "/proactive 1", DROR))), /לא הצלחתי לשנות את זה כרגע/);
+    });
+  });
+
   test("is listed in the group /help, and not in a private one", async () => {
     await withFixture(async (fix) => {
       const chat = "-1005000007";

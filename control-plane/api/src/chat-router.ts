@@ -628,25 +628,31 @@ export async function groupProactiveLevelSetting(db: pg.Pool, chatId: string): P
 
 /**
  * Sets the group's level. Returns the level it had before (so the caller can say
- * whether this was a raise or a lowering), or null when the chat has no open
- * binding and nothing changed. One statement: the old value is read from the same
- * row version the update replaces.
+ * whether this was a raise or a lowering), or null when nothing changed.
+ *
+ * Keyed by chat AND by `tripId`: the trip the caller authorised the organizer
+ * against. The organizer check and this write are separate statements, and a chat
+ * can be re-bound to another trip between them (a different organizer redeeming a
+ * group token); keyed by chat alone, the first trip's organizer would then set the
+ * second trip's level. With the trip in the WHERE the write simply finds no row.
+ * One statement: the old value is read from the same row version it replaces.
  */
 export async function setGroupProactiveLevel(
   db: pg.Pool,
   chatId: string,
   level: ProactiveLevel,
+  tripId: string,
 ): Promise<ProactiveLevel | null> {
   const result = await db.query<{ previous: number }>(
     `UPDATE control_plane.telegram_chat_bindings b
         SET proactive_level = $2
        FROM (SELECT id, proactive_level AS previous
                FROM control_plane.telegram_chat_bindings
-              WHERE chat_id = $1 AND closed_at IS NULL
+              WHERE chat_id = $1 AND trip_id = $3 AND closed_at IS NULL
               FOR UPDATE) old
       WHERE b.id = old.id
       RETURNING old.previous AS previous`,
-    [chatId, level],
+    [chatId, level, tripId],
   );
   const previous = result.rows[0]?.previous;
   return previous === 1 || previous === 2 || previous === 3 ? previous : null;
@@ -661,6 +667,10 @@ export async function setGroupProactiveLevel(
  * an active OWNER membership on this trip. Unknown, an anonymous group admin
  * and a failed lookup are all "no" - a command that changes how the whole room
  * is involved is not offered to a stranger.
+ *
+ * Deliberately restrictive: only an ACTIVE membership with role 'owner' counts
+ * (an 'organizer'-role membership, a revoked or invited owner, a plain member are
+ * all "no"), and a person link must say 'organizer'. A failed lookup is "no".
  */
 export async function isTripOrganizer(db: pg.Pool, tripId: string, telegramUserId: string): Promise<boolean> {
   if (!tripId || !telegramUserId) return false;

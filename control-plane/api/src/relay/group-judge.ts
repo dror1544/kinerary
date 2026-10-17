@@ -32,6 +32,8 @@
 import { structuredLog } from "../redaction.js";
 import {
   GROUP_JUDGE_TIMEOUT_MS,
+  judgeDataCollection,
+  judgeTimeoutMs,
   type RunnerFailure,
   type StructuredModelRunner,
 } from "../model-runner.js";
@@ -75,8 +77,26 @@ export interface JudgeVerdict {
  * confidence of 7, a missing field, an array - is null, which the caller reads
  * as "no usable answer". Extra keys (a model explaining itself) are ignored,
  * not trusted.
+ *
+ * Also accepts the answer as TEXT: surrounding whitespace and one markdown code
+ * fence (```json ... ``` or ``` ... ```) around exactly one JSON object are
+ * removed first - some small models fence their JSON whatever the prompt says.
+ * Nothing else is tolerated: prose around it, two objects, a fence left open.
+ * (The HTTP runner already cuts the first `{` to the last `}` before calling
+ * this, so a fenced reply arrives here as an object; the text form is for the
+ * runners and wrappers that hand over what the model wrote.)
  */
-export function parseJudgeVerdict(raw: unknown): JudgeVerdict | null {
+export function parseJudgeVerdict(input: unknown): JudgeVerdict | null {
+  let raw = input;
+  if (typeof raw === "string") {
+    const text = raw.trim();
+    const fenced = /^```(?:json)?[ \t]*\r?\n?([\s\S]*?)\r?\n?[ \t]*```$/i.exec(text);
+    try {
+      raw = JSON.parse((fenced ? fenced[1]! : text).trim());
+    } catch {
+      return null;
+    }
+  }
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
   const { for_assistant: forAssistant, confidence } = raw as Record<string, unknown>;
   if (typeof forAssistant !== "boolean") return null;
@@ -188,7 +208,16 @@ export interface GroupJudgeOptions {
   timeoutMs?: number;
   rateLimiter?: JudgeRateLimiter;
   now?: () => number;
+  /** Consecutive timeouts/errors that open the circuit. Default 5. */
+  breakerThreshold?: number;
+  /** How long the circuit stays open before one probe call. Default 5 minutes. */
+  breakerCooldownMs?: number;
+  /** Where the circuit's open / close lines go (once each, not per message). */
+  log?: (line: string) => void;
 }
+
+export const DEFAULT_BREAKER_THRESHOLD = 5;
+export const DEFAULT_BREAKER_COOLDOWN_MS = 5 * 60_000;
 
 function reasonOf(failure: RunnerFailure): JudgeFallbackReason {
   switch (failure) {
@@ -211,6 +240,53 @@ export function createGroupJudge(options: GroupJudgeOptions): GroupJudge {
   const limiter = options.rateLimiter ?? new JudgeRateLimiter();
   const now = options.now ?? Date.now;
   const modelNow = () => options.runner.describe?.(JUDGE_TASK)?.model ?? null;
+  const log = options.log ?? (() => {});
+
+  // The circuit breaker. A provider that is down, over its daily cap or timing
+  // out would otherwise cost every unaddressed group message its full wait while
+  // the serial poll loop stands still. After `threshold` consecutive failures
+  // (timeout, error, or the provider's own rate limit - NOT a bad answer, which
+  // means the model is reachable) no call is made for `cooldownMs`; then ONE probe
+  // goes through, and its result closes the circuit or re-arms the cool-down.
+  // While open every message is a judge_fallback with reason circuit_open, so the
+  // report shows the outage instead of a silent gap. In memory: a restart closes it.
+  const threshold = Math.max(1, options.breakerThreshold ?? DEFAULT_BREAKER_THRESHOLD);
+  const cooldownMs = options.breakerCooldownMs ?? DEFAULT_BREAKER_COOLDOWN_MS;
+  const breaker = { failures: 0, openUntil: null as number | null, probing: false };
+  const breakerGate = (): "pass" | "probe" | "open" => {
+    if (breaker.openUntil === null) return "pass";
+    if (now() < breaker.openUntil) return "open";
+    if (breaker.probing) return "open";
+    breaker.probing = true;
+    return "probe";
+  };
+  const breakerRecord = (failed: boolean) => {
+    if (!failed) {
+      breaker.failures = 0;
+      breaker.probing = false;
+      if (breaker.openUntil !== null) {
+        breaker.openUntil = null;
+        log(structuredLog("info", "relay.group_judge_circuit_closed", { task: JUDGE_TASK }));
+      }
+      return;
+    }
+    if (breaker.openUntil !== null) {
+      // The probe failed: stay open for another cool-down, without a second line.
+      breaker.openUntil = now() + cooldownMs;
+      breaker.probing = false;
+      return;
+    }
+    breaker.failures += 1;
+    if (breaker.failures >= threshold) {
+      breaker.openUntil = now() + cooldownMs;
+      log(structuredLog("warn", "relay.group_judge_circuit_open", {
+        task: JUDGE_TASK,
+        consecutive_failures: breaker.failures,
+        cooldown_seconds: Math.round(cooldownMs / 1000),
+        consequence: "the judge makes no calls until the cool-down ends; unaddressed group messages are ignored",
+      }));
+    }
+  };
 
   return {
     model: modelNow,
@@ -219,7 +295,12 @@ export function createGroupJudge(options: GroupJudgeOptions): GroupJudge {
       const model = modelNow() ?? "unknown";
       const started = now();
       const elapsed = () => Math.max(0, now() - started);
+      const gate = breakerGate();
+      if (gate === "open") return { kind: "fallback", reason: "circuit_open", ms: 0, model };
       if (!limiter.allow(input.chatId)) {
+        // Our own per-chat limit, decided before any call: neither a failure nor
+        // a success of the provider. A probe that never went out must not stay claimed.
+        if (gate === "probe") breaker.probing = false;
         return { kind: "fallback", reason: "rate_limited", ms: 0, model };
       }
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -237,12 +318,21 @@ export function createGroupJudge(options: GroupJudgeOptions): GroupJudge {
           timeoutMs,
         });
         const result = await Promise.race([run, hardStop]);
-        if (result === "timeout") return { kind: "fallback", reason: "timeout", ms: elapsed(), model };
-        if (!result.ok) return { kind: "fallback", reason: reasonOf(result.reason), ms: elapsed(), model };
+        if (result === "timeout") {
+          breakerRecord(true);
+          return { kind: "fallback", reason: "timeout", ms: elapsed(), model };
+        }
+        if (!result.ok) {
+          const reason = reasonOf(result.reason);
+          breakerRecord(reason !== "unparseable");
+          return { kind: "fallback", reason, ms: elapsed(), model };
+        }
+        breakerRecord(false);
         const { forAssistant, confidence } = result.value;
         if (forAssistant && confidence >= minConfidence) return { kind: "yes", confidence, ms: elapsed(), model };
         return { kind: "no", confidence, ms: elapsed(), model, belowThreshold: forAssistant };
       } catch {
+        breakerRecord(true);
         return { kind: "fallback", reason: "error", ms: elapsed(), model };
       } finally {
         if (timer) clearTimeout(timer);
@@ -269,10 +359,29 @@ export function groupJudgeFromEnv(
   log: (line: string) => void,
 ): GroupJudge | undefined {
   const named = (env.JUDGE_RUNNER ?? "").trim();
+  // A timeout above 3 s would let the judge hold the serial poll loop longer than
+  // the design allows: clamped, and said once.
+  const timeout = judgeTimeoutMs(env);
+  if (timeout.clamped) {
+    log(structuredLog("warn", "model_runner.judge_timeout_clamped", {
+      variable: "JUDGE_TIMEOUT_MS",
+      reason: timeout.clamped === "above" ? "above the 3000 ms ceiling" : "not a positive number",
+      effective_ms: timeout.ms,
+    }));
+  }
+  const dataCollection = judgeDataCollection(env);
+  if (dataCollection.invalid) {
+    log(structuredLog("warn", "model_runner.judge_data_collection_invalid", {
+      variable: "JUDGE_DATA_COLLECTION",
+      accepted: "deny | allow",
+      effective: dataCollection.policy,
+    }));
+  }
   const judge = runner ? createGroupJudge({
     runner,
     minConfidence: judgeMinConfidence(env),
-    ...(Number(env.JUDGE_TIMEOUT_MS) > 0 ? { timeoutMs: Number(env.JUDGE_TIMEOUT_MS) } : {}),
+    timeoutMs: timeout.ms,
+    log,
   }) : undefined;
   const model = judge?.model() ?? null;
   if (judge && model) {
@@ -280,6 +389,9 @@ export function groupJudgeFromEnv(
       enabled: true,
       model,
       min_confidence: judgeMinConfidence(env),
+      timeout_ms: timeout.ms,
+      // The effective OpenRouter provider policy for the judge, stated once.
+      data_collection: dataCollection.policy,
     }));
     return judge;
   }
@@ -287,7 +399,7 @@ export function groupJudgeFromEnv(
     task: JUDGE_TASK,
     variable: "JUDGE_RUNNER / JUDGE_MODEL",
     consequence: named
-      ? "JUDGE_RUNNER is set but names no usable binding (no model, a missing key, or a forbidden model): the group judge is off"
+      ? "JUDGE_RUNNER is set but names no usable binding (no model, a missing key, a forbidden model, or a runner other than openrouter - only an HTTP runner can meet the 3 s limit): the group judge is off"
       : "the group judge is off: an unaddressed group message is not asked about, and is ignored unless it names the assistant",
   }));
   // A runner exists, so keep the judge dormant: `/model group_judge ...` can

@@ -689,6 +689,13 @@ export function proactiveRefused(language: "he" | "en"): string {
     : "Only the trip organizer can change this. You can see the setting with /proactive.";
 }
 
+/** The change could not be saved (the store is unavailable, e.g. a relay running ahead of its migration). */
+export function proactiveUnavailable(language: "he" | "en"): string {
+  return language === "he"
+    ? "לא הצלחתי לשנות את זה כרגע. נסו שוב עוד מעט."
+    : "I couldn't change that right now. Please try again in a little while.";
+}
+
 /** `/proactive` in a private chat, where there is no group to set it for. */
 export function proactiveInPrivateChat(language: "he" | "en"): string {
   return language === "he"

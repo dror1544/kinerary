@@ -135,7 +135,7 @@ ALTER TABLE control_plane.assistant_events
     CASE
       WHEN NOT metadata ? 'judge_fallback_reason' THEN true
       WHEN jsonb_typeof(metadata -> 'judge_fallback_reason') <> 'string' THEN false
-      ELSE (metadata ->> 'judge_fallback_reason') IN ('timeout', 'error', 'unparseable', 'rate_limited')
+      ELSE (metadata ->> 'judge_fallback_reason') IN ('timeout', 'error', 'unparseable', 'rate_limited', 'circuit_open')
     END
   );
 

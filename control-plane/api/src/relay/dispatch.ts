@@ -66,6 +66,7 @@ import {
   proactiveInPrivateChat,
   proactiveRefused,
   proactiveStatus,
+  proactiveUnavailable,
   renameConfirmation,
   renameRefused,
   renameUsage,
@@ -808,8 +809,26 @@ export async function dispatchUpdate(
         log(structuredLog("info", "trip_bot.proactive_refused", { reason: "NOT_ORGANIZER" }));
         return { kind: "reply", reply: { chatId, text: proactiveRefused(language) } };
       }
-      const previous = await setGroupProactiveLevel(db, chatId, requested);
-      log(structuredLog("info", "trip_bot.proactive_changed", { level: requested, previous }));
+      // A relay running ahead of its migration has no such column: say so to the
+      // organizer instead of failing the update (and saying nothing).
+      let previous: ProactiveLevel | null;
+      try {
+        // Keyed by the trip the organizer check above authorised, not by the chat
+        // alone: the chat may have been re-bound to another trip since.
+        previous = await setGroupProactiveLevel(db, chatId, requested, route.tripId);
+      } catch (error) {
+        log(structuredLog("warn", "trip_bot.proactive_write_failed", {
+          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        }));
+        return { kind: "reply", reply: { chatId, text: proactiveUnavailable(language) } };
+      }
+      if (previous === null) {
+        // No open binding of THIS trip on this chat any more: nothing was written.
+        log(structuredLog("info", "trip_bot.proactive_not_changed", { reason: "NO_MATCHING_BINDING" }));
+        return { kind: "reply", reply: { chatId, text: proactiveUnavailable(language) } };
+      }
+      // (`level` is a field structuredLog strips: it indexes the line.)
+      log(structuredLog("info", "trip_bot.proactive_changed", { proactive_level: requested, previous_level: previous }));
       return {
         kind: "reply",
         reply: { chatId, text: proactiveChanged(language, requested) },

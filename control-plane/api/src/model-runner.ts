@@ -1430,15 +1430,51 @@ export const MODEL_TASKS: readonly {
 export const OPENROUTER_TASK_OPTIONS: Readonly<Record<string, Partial<HttpSpec>>> = {
   group_judge: {
     maxAttempts: 1,
-    maxOutputTokens: 256,
+    // The verdict is ~20 tokens, but a REASONING model spends its reasoning
+    // against this same budget before it writes `content`, and a budget gone
+    // before the answer is an empty completion (a fallback). 512 leaves room for
+    // a short reasoning pass; a longer one is an error the benchmark will show.
+    maxOutputTokens: 512,
     provider: { data_collection: "deny" },
   },
 };
+
+/**
+ * `JUDGE_DATA_COLLECTION`: `deny` (the default) asks OpenRouter to route the
+ * judge only to providers that do not collect prompts; `allow` omits the field.
+ * Any other value reads as `deny` (the stricter reading) and says so in
+ * `invalid`, so a typo is not silently the permissive one. Judge only.
+ *
+ * Why it can be `allow`: with deny, a measured 2026-10-17 benchmark found no
+ * usable free model (the free endpoints are the collecting ones). Whether that
+ * trade is acceptable is the owner's call, made per deployment in this variable.
+ */
+export function judgeDataCollection(env: NodeJS.ProcessEnv = process.env): { policy: "deny" | "allow"; invalid: boolean } {
+  const raw = (env.JUDGE_DATA_COLLECTION ?? "").trim().toLowerCase();
+  if (raw === "allow") return { policy: "allow", invalid: false };
+  return { policy: "deny", invalid: raw !== "" && raw !== "deny" };
+}
+
+/**
+ * The judge's timeout: `JUDGE_TIMEOUT_MS` clamped to (0, 3000]. The turn waits
+ * on the judge and the poll loop is serial, so 3 s is a hard ceiling, not a
+ * default: a larger value clamps to it, and a missing, zero, negative or
+ * non-numeric one is the ceiling too. `clamped` says which, for one warning.
+ */
+export function judgeTimeoutMs(env: NodeJS.ProcessEnv = process.env): { ms: number; clamped: "above" | "invalid" | null } {
+  const raw = (env.JUDGE_TIMEOUT_MS ?? "").trim();
+  if (raw === "") return { ms: GROUP_JUDGE_TIMEOUT_MS, clamped: null };
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) return { ms: GROUP_JUDGE_TIMEOUT_MS, clamped: "invalid" };
+  if (value > GROUP_JUDGE_TIMEOUT_MS) return { ms: GROUP_JUDGE_TIMEOUT_MS, clamped: "above" };
+  return { ms: value, clamped: null };
+}
 
 /** A task's timeout: its own `<PREFIX>_TIMEOUT_MS`, else what it inherits, else its default. */
 export function taskTimeoutMs(task: string, env: NodeJS.ProcessEnv = process.env): number {
   const spec = MODEL_TASKS.find((t) => t.task === task);
   if (!spec) return DEFAULT_TIMEOUT_MS;
+  if (task === "group_judge") return judgeTimeoutMs(env).ms;
   const own = Number(env[`${spec.prefix}_TIMEOUT_MS`]);
   if (own > 0) return own;
   const inherited = spec.inherits ? Number(env[`${spec.inherits}_TIMEOUT_MS`]) : 0;
@@ -1470,10 +1506,20 @@ export function runnerForBinding(
   // feature (codexIsolationProblem): codex is then no binding at all, rather
   // than one that fails every call or runs with tools switched on.
   if (kind === "codex" && env.KINERARY_CODEX_ISOLATION_UNVERIFIED === "1") return undefined;
+  // The judge is asked while the serial poll loop waits, with a 3 s ceiling. A CLI
+  // runner (claude, codex, hermes) starts a process and cannot meet that, so it is
+  // no binding at all - env or `/model` - rather than one that blocks every group
+  // message for its whole timeout.
+  if (task === "group_judge" && kind !== "openrouter") return undefined;
   if (kind === "openrouter") {
     const key = openRouterKey(env);
     if (!key) return undefined;
-    return openRouterRunner({ [task]: openRouterSpec(model, key, timeoutMs, OPENROUTER_TASK_OPTIONS[task] ?? {}) });
+    const extra: Partial<HttpSpec> = { ...(OPENROUTER_TASK_OPTIONS[task] ?? {}) };
+    if (task === "group_judge") {
+      timeoutMs = Math.min(timeoutMs, GROUP_JUDGE_TIMEOUT_MS);
+      if (judgeDataCollection(env).policy === "allow") delete extra.provider;
+    }
+    return openRouterRunner({ [task]: openRouterSpec(model, key, timeoutMs, extra) });
   }
   if (kind === "codex") return codexRunner({ [task]: codexSpec(model, timeoutMs, { bin: env.CODEX_BIN || "codex" }) });
   // `<TASK>_EFFORT`, read here because this is now the ONE place a claude
@@ -1574,7 +1620,7 @@ export function modelRunnerFromEnv(env: NodeJS.ProcessEnv = process.env): Struct
       (env[`${source}_MODEL`] || "").trim() ||
       (kind === "openrouter" ? openRouterModel ?? "" : kind === "codex" ? CODEX_LUNA_MODEL : "");
     if (!model) continue;
-    const runner = build(kind, model, Number(env[`${source}_TIMEOUT_MS`] || timeoutMs), task);
+    const runner = build(kind, model, task === "group_judge" ? judgeTimeoutMs(env).ms : Number(env[`${source}_TIMEOUT_MS`] || timeoutMs), task);
     if (!runner) continue;
 
     // The quota-only fallback (decision 48). A separate axis from the primary

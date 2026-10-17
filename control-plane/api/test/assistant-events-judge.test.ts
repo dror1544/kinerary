@@ -66,6 +66,7 @@ describe("the contract admits the judge's events - and only those", () => {
       assert.ok(validateAssistantEvent(base({ outcome })).ok, outcome);
     }
     assert.ok(validateAssistantEvent(base({ outcome: "judge_fallback", metadata: { judge_fallback_reason: "timeout" } })).ok);
+    assert.ok(validateAssistantEvent(base({ outcome: "judge_fallback", metadata: { judge_fallback_reason: "circuit_open" } })).ok, "an open circuit is recorded, not a silent gap");
     assert.ok(validateAssistantEvent(base({ metadata: { judge_below_threshold: true, judge_confidence_pct: 65 } })).ok);
   });
 
@@ -312,6 +313,7 @@ describe("the table and the rollup", { skip: SKIP }, () => {
       );
       await insert(row(tripId, {}));
       await insert(row(tripId, { outcome: "judge_fallback", metadata: { judge_fallback_reason: "rate_limited" } }));
+      await insert(row(tripId, { outcome: "judge_fallback", response_latency_ms: 0, metadata: { judge_fallback_reason: "circuit_open", judge_model: "vendor/m" } }));
       await insert(row(tripId, { trigger_type: "judge", outcome: "judge_yes" }));
       await insert(row(tripId, { event_type: "proactive_level_changed", outcome: "level_lowered", trigger_type: null, response_latency_ms: null, message_length_bucket: null, media_kind: null, requester_role: "organizer", metadata: { proactive_level: 1 } }));
       for (const bad of [

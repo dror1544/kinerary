@@ -4,7 +4,8 @@
  * errors against the owner's targets (precision >= 90%, recall >= 75%, p95 <=
  * 1.5 s, hard timeout 3 s). See src/relay/group-judge-benchmark.ts.
  *
- *   JUDGE_RUNNER=openrouter JUDGE_MODEL=<model id> OPENROUTER_API_KEY=... \
+ *   JUDGE_RUNNER=openrouter JUDGE_MODEL=<model id> \
+ *   OPENROUTER_API_KEY_FILE=<path to a file holding the key> \
  *     node --import tsx tools/judge-benchmark.ts \
  *     [--set tools/judge-benchmark/starter-set.jsonl] [--reps 1] \
  *     [--min-confidence 0.7] [--names "Solo,סולו"] [--timeout-ms 3000] \
@@ -12,8 +13,11 @@
  *
  * Uses the SAME binding the relay would (`modelRunnerFromEnv`, task
  * `group_judge`): JUDGE_RUNNER / JUDGE_MODEL / JUDGE_TIMEOUT_MS, including the
- * OpenRouter provider routing with data collection denied. Compare candidate
- * models by running it once per JUDGE_MODEL.
+ * OpenRouter provider routing (data collection denied unless
+ * JUDGE_DATA_COLLECTION=allow). The key is read from a FILE
+ * (OPENROUTER_API_KEY_FILE): never put it on a command line, where `ps` and
+ * shell history keep it. Compare candidate models by running it once per
+ * JUDGE_MODEL.
  *
  * A HARNESS, not a test: it calls a live model and spends whatever it costs (a
  * free model costs nothing but is rate limited, and a rate limit shows up here
@@ -44,7 +48,7 @@ async function main(): Promise<void> {
   const setPath = f.get("set") ?? fileURLToPath(new URL("./judge-benchmark/starter-set.jsonl", import.meta.url));
   const runner = modelRunnerFromEnv();
   if (!runner?.describe?.("group_judge")) {
-    console.error("the group_judge task has no binding: set JUDGE_RUNNER and JUDGE_MODEL (and OPENROUTER_API_KEY for openrouter)");
+    console.error("the group_judge task has no binding: set JUDGE_RUNNER and JUDGE_MODEL (and OPENROUTER_API_KEY_FILE for openrouter)");
     process.exitCode = 2;
     return;
   }
