@@ -25,7 +25,9 @@
  * person in the room rather than the chat itself, so `fromId` says who is
  * talking, and `chatTitle` names the room. `message` and `document` also take
  * `caption` and `replyToMessageId` (+ `replyToFileId` / `replyToFromId`), which
- * is how "<assistant>, add this" in reply to a PDF is played.
+ * is how "<assistant>, add this" in reply to a PDF is played. `fromName` sets the
+ * sender's first name (default "E2E Organizer"), so a room with several members
+ * can be told apart in what the relay forwards.
  *
  * Loopback only. The relay sends the real bot token in every path; it is
  * accepted and never logged or stored.
@@ -65,8 +67,8 @@ function push(update: Omit<Update, "update_id">): void {
   for (const wake of waiters.splice(0)) wake();
 }
 
-function person(chatId: string, languageCode = "en") {
-  return { id: Number(chatId), is_bot: false, first_name: "E2E Organizer", language_code: languageCode };
+function person(chatId: string, languageCode = "en", firstName = "E2E Organizer") {
+  return { id: Number(chatId), is_bot: false, first_name: firstName, language_code: languageCode };
 }
 
 /** The `document` field of a message carrying a file this stand-in already holds. */
@@ -192,7 +194,7 @@ async function control(path: string, req: IncomingMessage, url: URL, res: Server
     : { id: Number(chatId), type: "private" };
   const base = {
     message_id: nextMessageId++, date: Math.floor(Date.now() / 1000), chat,
-    from: person(fromId, String(p.languageCode ?? "en")),
+    from: person(fromId, String(p.languageCode ?? "en"), p.fromName === undefined ? undefined : String(p.fromName)),
     ...(p.replyToMessageId
       ? { reply_to_message: { message_id: Number(p.replyToMessageId), date: Math.floor(Date.now() / 1000), chat,
           from: p.replyToFromId === undefined ? BOT : person(String(p.replyToFromId)),
