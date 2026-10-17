@@ -24,7 +24,7 @@
  * where a file has to earn the assistant's attention. There the sender is a
  * person in the room rather than the chat itself, so `fromId` says who is
  * talking, and `chatTitle` names the room. `message` and `document` also take
- * `caption` and `replyToMessageId` (+ `replyToFileId` / `replyToFromId`), which
+ * `caption` and `replyToMessageId` (+ `replyToFileId` / `replyToFromId` / `replyToText`), which
  * is how "<assistant>, add this" in reply to a PDF is played. `fromName` sets the
  * sender's first name (default "E2E Organizer"), so a room with several members
  * can be told apart in what the relay forwards.
@@ -198,6 +198,7 @@ async function control(path: string, req: IncomingMessage, url: URL, res: Server
     ...(p.replyToMessageId
       ? { reply_to_message: { message_id: Number(p.replyToMessageId), date: Math.floor(Date.now() / 1000), chat,
           from: p.replyToFromId === undefined ? BOT : person(String(p.replyToFromId)),
+          ...(p.replyToText !== undefined ? { text: String(p.replyToText) } : {}),
           ...(p.replyToFileId ? documentOf(String(p.replyToFileId)) : {}) } }
       : {}),
   };

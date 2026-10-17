@@ -76,6 +76,41 @@ markers, so it passes through Hermes untouched and the relay drops it.
 A live companion gets it only when it is re-rendered; until then a window-admitted
 message reaches a companion that was never told it may stay silent.
 
+## 2a. Explicit addressing is explicit; reactions are not requests (staging run, 2026-10-17)
+
+**What the run found.** A member wrote `@<bot> <question>` twice and the companion
+answered with the silence sentinel both times: its prompt named neither the bot's
+`@handle` nor anything it could match the mention against, and it had learnt the
+sentinel from the window mark. A laugh emoji in the window got a joke.
+
+**Decisions.**
+- A group message that names the assistant, @mentions the bot or replies to its
+  message (never the windows, the "?" window or the judge) is prefixed
+  `[addressed to you directly ...]`, which forbids the sentinel for that turn and
+  carries the bot's handle (from `getMe`, so it differs per deployment and is never
+  hardcoded). The handle goes in the line, not substituted into the member's text:
+  the words reach the model as typed, and the handle is learnt from any explicit turn.
+- If the companion still answers such a turn with the sentinel, nothing is sent (no
+  answer can be invented), `trip_bot.silence_on_addressed_turn` is logged, and the
+  `reply_sent` / `reply_suppressed` event carries `metadata.silent_on_addressed`
+  (migration `20261017120000`); the daily report's Usage section counts them as a
+  defect (target 0). The connector remembers per chat whether each forwarded turn was
+  explicit, matched by the reply's `reply_to`, else the latest forwarded turn.
+- A group message with no letter or digit (and no attachment) is a reaction. The
+  conversation window and the judge never admit one, and it is not kept as overheard
+  context. It is forwarded only as the answer to a question the companion asked: the
+  one-shot "?" window is open (then it is marked `[a reaction sent right after your
+  last question ...]`), or it is a Telegram reply to a companion message that itself
+  ended in a question (then it is explicit). A thumbs-up to "Should I update the
+  site?" is consent; a thumbs-up to a statement is not a message.
+- A thank-you to the companion is answered briefly and warmly; the SOUL does not list
+  it among the cases that get the sentinel.
+
+**A live companion keeps the old rule** until a new Hermes session starts for each
+member of the group (the gateway keeps one session per member per group, and a
+continuing session reuses its stored system prompt verbatim). Ending the session
+rows in the companion's `state.db` makes the next message start a fresh one.
+
 ## 3. The judge (pending, unmerged: PR #407, draft, being reworked)
 
 Nothing in this section is shipped. It records the owner's decision so the

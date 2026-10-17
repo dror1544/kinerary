@@ -205,7 +205,7 @@ import { isPermanentRefusal, type SendResult, type TelegramClient } from "./tele
 
 /** Just the part of RelayConnector this needs, so tests need no socket. */
 export interface InboundSink {
-  pushInbound(event: WireMessageEvent): boolean;
+  pushInbound(event: WireMessageEvent, turn?: { explicit?: boolean }): boolean;
   /**
    * Whether a turn for this trip would reach a running companion.
    *
@@ -420,7 +420,7 @@ export async function applyDecision(
       return;
 
     case "to_gateway": {
-      const delivered = deps.connector.pushInbound(decision.event);
+      const delivered = deps.connector.pushInbound(decision.event, { explicit: decision.explicit === true });
       if (decision.analytics) {
         deps.assistantEvents?.handedOff(decision.event.source.chat_id, decision.analytics, delivered, decision.event.message_id);
       }

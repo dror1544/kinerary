@@ -59,7 +59,13 @@ export type ReplyDelivery = "delivered" | "failed" | "suppressed";
  * depends on this, not on the class.
  */
 export interface ReplyObserver {
-  replySent(chatKey: string, delivery: ReplyDelivery, contentLength: number, replyTo?: string): void;
+  replySent(chatKey: string, delivery: ReplyDelivery, contentLength: number, replyTo?: string, flags?: ReplyFlags): void;
+}
+
+/** What else is known about a companion reply. */
+export interface ReplyFlags {
+  /** The companion answered a turn that NAMED it with the silence sentinel: a defect (relay/stay-silent.ts). */
+  silentOnAddressed?: boolean;
 }
 
 /** A request the relay handles itself; handed back when its tool finishes. */
@@ -305,7 +311,7 @@ export class RelayAssistantEvents implements ReplyObserver {
 
   // ── Outbound: called by connector.ts after Telegram answered a `send` ─────
 
-  replySent(chatKey: string, delivery: ReplyDelivery, contentLength: number, replyTo?: string): void {
+  replySent(chatKey: string, delivery: ReplyDelivery, contentLength: number, replyTo?: string, flags?: ReplyFlags): void {
     this.guard(() => {
       const now = this.now();
       const open = this.pruneOpenTurns(chatKey, now);
@@ -366,7 +372,7 @@ export class RelayAssistantEvents implements ReplyObserver {
         response_latency_ms: turn ? clampLatency(now - turn.at) : null,
         message_length_bucket: lengthBucketOf(contentLength),
         media_kind: null,
-        metadata: {},
+        metadata: flags?.silentOnAddressed === true && delivery === "suppressed" ? { silent_on_addressed: true } : {},
         tool_name: null,
       });
     });

@@ -25,13 +25,108 @@ export const SILENCE_SENTINEL = "[[KINERARY_STAY_SILENT]]";
 /**
  * The line prefixed to a message admitted ONLY by the conversation window. A
  * message that named the assistant, @mentioned it, replied to it or answered
- * its "?" is never marked: those are addressed to it by definition.
+ * its "?" never gets this mark: a name, @mention or reply gets `addressedMark`, an answer to its "?" gets none.
  */
 export function conversationMark(): string {
   return (
     `[not addressed to you by name — sent in an ongoing conversation with you; ` +
     `reply only if it is meant for you, otherwise reply with exactly ${SILENCE_SENTINEL} and nothing else]`
   );
+}
+
+/**
+ * The opposite fence: the line prefixed to a GROUP message that addressed the
+ * assistant explicitly - by name, by @mention of the bot, or as a reply to one of
+ * its messages (never the windows, never the judge).
+ *
+ * It exists because the companion cannot otherwise tell. On 2026-10-17 a member
+ * wrote "@<bot> where is the hotel relative to the centre?" and the companion,
+ * whose prompt contained neither the bot's @handle nor its name, answered with
+ * the sentinel both times: it had learnt the sentinel from the window mark and
+ * read a mention it did not recognise as meant for someone else. So the line says it plainly, forbids the sentinel for this
+ * turn, and tells the companion its own Telegram handle - which differs per
+ * deployment, so it comes from the bot's identity (getMe), never from a constant.
+ * The handle goes in this line rather than being substituted into the member's
+ * text: the words reach the model exactly as typed, and the handle is learnt from
+ * any explicit turn, whichever way it was addressed.
+ *
+ * Starts with `[addressed to you directly` - profile-templates' SOUL names that
+ * exact prefix, so the two change together.
+ */
+export function addressedMark(botUsername?: string): string {
+  // Telegram usernames are [A-Za-z0-9_]; anything else is dropped, not trusted into a prompt.
+  const handle = (botUsername ?? "").trim().replace(/^@/, "").replace(/[^A-Za-z0-9_]/g, "");
+  const who = handle ? ` In Telegram you are @${handle}.` : "";
+  return (
+    `[addressed to you directly — this message is for you; answer it. ` +
+    `Never reply with ${SILENCE_SENTINEL} to it.${who}]`
+  );
+}
+
+/**
+ * The line prefixed to a bare reaction (an emoji, a "?") that took the one-shot
+ * "?" window: the assistant's last message ended in a question, and a thumbs-up
+ * to "Should I update the site?" is the answer. Without it the companion sees
+ * "👍" with no sign of what it answers. Not an explicit address - the reaction
+ * might be any member's - so a silence stays allowed.
+ */
+export function reactionAnswerMark(): string {
+  return (
+    `[a reaction sent right after your last question — read it as a reply to that question ` +
+    `(a thumbs-up is yes), and act on it]`
+  );
+}
+
+/** How long a forwarded turn is remembered for the "was it explicit?" question. */
+const TURN_MEMORY_MS = 30 * 60_000;
+const TURNS_PER_CHAT = 8;
+const MAX_CHATS = 500;
+
+/**
+ * Which forwarded group turns were explicit, per chat, so the connector can tell
+ * "the companion stayed silent on a message that was not for it" (fine) from "the
+ * companion stayed silent on one that named it" (a defect we cannot repair - there
+ * is no answer to invent - but must count).
+ *
+ * Correlation: the reply's `reply_to` names the inbound message id when the
+ * gateway sends it, so that exact turn is looked up; without it (or with an id we
+ * no longer hold) the LATEST forwarded turn in the chat decides. The latest-turn
+ * fallback can only err towards "explicit" when an explicit turn is followed by a
+ * window turn the companion then silences - an over-count of one defect, never a
+ * dropped or invented answer. In memory only, bounded, keyed by chat id exactly as
+ * the emitter's reply attribution is; no text is ever stored.
+ */
+export class ExplicitTurns {
+  private readonly chats = new Map<string, Array<{ messageId: string | undefined; explicit: boolean; at: number }>>();
+
+  constructor(private readonly now: () => number = Date.now) {}
+
+  note(chatId: string, messageId: string | undefined, explicit: boolean): void {
+    const list = this.chats.get(chatId) ?? [];
+    list.push({ messageId, explicit, at: this.now() });
+    while (list.length > TURNS_PER_CHAT) list.shift();
+    // Re-insert so the map's order is least-recently-noted first.
+    this.chats.delete(chatId);
+    this.chats.set(chatId, list);
+    while (this.chats.size > MAX_CHATS) {
+      const oldest = this.chats.keys().next().value;
+      if (oldest === undefined) break;
+      this.chats.delete(oldest);
+    }
+  }
+
+  /** Whether the turn a reply answers was explicit; false when nothing is known. */
+  wasExplicit(chatId: string, replyTo?: string): boolean {
+    const list = this.chats.get(chatId);
+    if (!list) return false;
+    const cutoff = this.now() - TURN_MEMORY_MS;
+    const live = list.filter((t) => t.at >= cutoff);
+    if (replyTo) {
+      const hit = live.find((t) => t.messageId === replyTo);
+      if (hit) return hit.explicit;
+    }
+    return live.length > 0 ? live[live.length - 1]!.explicit : false;
+  }
 }
 
 export type SilenceVerdict =

@@ -24,7 +24,7 @@ import { createServer, type IncomingMessage, type Server } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import { structuredLog } from "../redaction.js";
 import { detectInternalLeak } from "./internal-leak.js";
-import { silenceVerdict } from "./stay-silent.js";
+import { ExplicitTurns, silenceVerdict } from "./stay-silent.js";
 import {
   decodeFrame,
   encodeFrame,
@@ -197,6 +197,8 @@ export class RelayConnector {
    */
   private readonly gateways = new Map<string, Set<WebSocket>>();
   private readonly log: (line: string) => void;
+  /** Which forwarded group turns named the assistant, so a silence reply to one is counted (stay-silent.ts). */
+  private readonly explicitTurns = new ExplicitTurns();
   private readonly path: string;
 
   constructor(private readonly options: ConnectorOptions) {
@@ -477,7 +479,15 @@ export class RelayConnector {
         const verdict = silenceVerdict(action.content);
         if (verdict.kind === "silent") {
           this.log(structuredLog("info", "trip_bot.companion_stayed_silent", { silent: true }));
-          this.options.assistantEvents?.replySent(action.chat_id, "suppressed", action.content.length, action.reply_to);
+          // Silence on a message that NAMED the assistant is a defect, not a
+          // judgement call: nothing can be sent (no answer to invent), but it is
+          // logged and recorded so the daily report counts it. Booleans only.
+          const onAddressed = this.explicitTurns.wasExplicit(action.chat_id, action.reply_to);
+          if (onAddressed) this.log(structuredLog("warn", "trip_bot.silence_on_addressed_turn", { silent: true }));
+          this.options.assistantEvents?.replySent(
+            action.chat_id, "suppressed", action.content.length, action.reply_to,
+            onAddressed ? { silentOnAddressed: true } : undefined,
+          );
           return { success: true };
         }
         const content = verdict.content;
@@ -611,7 +621,7 @@ export class RelayConnector {
    * should tell the organizer rather than leave them waiting on an answer that
    * will never come.
    */
-  pushInbound(event: WireMessageEvent): boolean {
+  pushInbound(event: WireMessageEvent, turn?: { explicit?: boolean }): boolean {
     const profile = event.source.profile;
     const targets = this.socketsFor(profile);
     let delivered = false;
@@ -619,6 +629,12 @@ export class RelayConnector {
       if (ws.readyState !== ws.OPEN) continue;
       this.send(ws, { type: "inbound", event });
       delivered = true;
+    }
+    // Remembered only for a turn that reached a companion, and only when the
+    // caller says what it was (a group turn): the companion's silence reply is
+    // judged against it in performAction.
+    if (delivered && turn && event.source.chat_id) {
+      this.explicitTurns.note(event.source.chat_id, event.message_id, turn.explicit === true);
     }
     if (!delivered) {
       this.log(
