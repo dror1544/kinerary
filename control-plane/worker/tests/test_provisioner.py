@@ -1253,6 +1253,22 @@ class CompanionProfileTests(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(row)
 
+    def test_the_bridge_log_line_names_the_checkout_that_built_it_in_the_message(self) -> None:
+        """#127/#201: the worker's LOG_FORMAT drops `extra=`, so `built_from`
+        has to be in the rendered message or nothing shows which checkout built
+        a companion."""
+        class StampedBridge(FakeMcpBridgeAdapter):
+            built_from = "checkout-under-test"
+        worker = ProvisionerWorker(
+            db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-bridge-log",
+            companion=FakeCompanionProfileAdapter(), mcp_bridge=StampedBridge(),
+        )
+        with self.assertLogs("control_plane_worker.provisioner", level="INFO") as logs:
+            worker.run_once()
+        wired = [r.getMessage() for r in logs.records if "mcp_bridge_wired" in r.getMessage()]
+        self.assertEqual(1, len(wired), [r.getMessage() for r in logs.records])
+        self.assertIn("built_from=checkout-under-test", wired[0])
+
     def test_the_bridge_is_re_run_after_every_deploy_never_before_it(self) -> None:
         """Issue #119, design (d): no stored copy of the trip's agent key. The
         bridge re-reads the container's CURRENT key each time its setup runs,
