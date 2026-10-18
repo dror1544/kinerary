@@ -10,7 +10,7 @@ Most families plan trips in a WhatsApp group. This replaces that chaos with a pr
 
 **Who it's for:** A trip organizer who can set up Docker and edit JSON. Participants need only a phone or browser — no installs, no accounts to create (organizer seeds all users).
 
-**Scale:** Designed for 2–30 people across 1–6 trip phases, with 11 DB tables and 24 features under the hood — scales down just as well to a 2-person trip (see `trips/japan-2025/`) as up to a large multi-family group.
+**Scale:** Designed for 2–30 people across 1–6 trip phases, with 37 DB tables and 27 features under the hood (see [Database Schema](#database-schema)) — scales down just as well to a 2-person trip (see `trips/japan-2025/`) as up to a large multi-family group.
 
 ---
 
@@ -44,6 +44,7 @@ Most families plan trips in a WhatsApp group. This replaces that chaos with a pr
 | 24 | **Config-driven** | All trip data in `trip.config.json`; served via `/api/config`; no code changes needed for a new trip |
 | 25 | **Country info** | Emergency numbers, currency, calling code per destination country — auto-fetched live via `scripts/country-info.js`, not hardcoded |
 | 26 | **Agent integration (MCP)** | Standalone MCP server (`mcp/`) giving an agent read/write access to a trip's bookings, photos, tasks, ratings, and comments — local agent or remote connector (e.g. Claude Cowork); see [Agent Integration (MCP)](#agent-integration-mcp) |
+| 27 | **Stop editing after the interview** | An organizer (or the companion acting for one) can change a stop's dates and hotel, set a stop from a hotel booking, split a stay, and move a day between stops — kept in the site's own database so a rebuild does not lose it; see [Stops after the interview](#stops-after-the-interview--the-override-layer) |
 
 ---
 
@@ -51,8 +52,8 @@ Most families plan trips in a WhatsApp group. This replaces that chaos with a pr
 
 ```
 Browser
-  ↓ HTTP (port 8080)
-nginx (Alpine Docker)
+  ↓ HTTP (host port 8081)
+nginx (Alpine Docker, :80 inside)
   ↓ /api/*        ↓ /*
 Node.js Server   Static Files
 (Express, :3000) (site/, bind-mount)
@@ -73,14 +74,16 @@ site/
   manifest.json       — PWA manifest
 server/
   server.js           — Express routes, SQLite schema, SSE, Immich, auth middleware
-  trivia_questions.json — Question bank (40 Q&A per trip)
+  trip-structure.js   — Stop override layer: effectiveConfig(), the stop routes, split / set-from-booking / revert
+  text-rules.js       — Write-time rules for booking and participant text; the Hebrew + English refusal
   data/trip.db        — SQLite database (not in git)
-trip/
+trips/<slug>/
   trip.config.json    — Single source of truth (see below)
+  trivia_questions.json — Question bank (40 Q&A per trip)
 scripts/
   new-trip.js         — Interactive CLI to scaffold a new trip config
   obsidian-to-config.js — Obsidian markdown vault → skeleton config
-docker-compose.yml    — nginx + node services; TRIP_DIR env for config path
+docker-compose.yml    — nginx + node services; TRIP_DIR_HOST selects the trip directory
 nginx.conf            — Reverse proxy, SSE buffering, file upload limits
 ```
 
@@ -88,7 +91,7 @@ nginx.conf            — Reverse proxy, SSE buffering, file upload limits
 
 ## Config-Driven Architecture
 
-Everything trip-specific lives in **`trip/trip.config.json`**. The framework code never stores trip data.
+Everything trip-specific lives in **`trips/<slug>/trip.config.json`**. The framework code never stores trip data. (The one layer on top: stop edits made after the interview are kept in the site's database and merged over the file — see [Stops after the interview](#stops-after-the-interview--the-override-layer).)
 
 ```json
 {
@@ -139,6 +142,71 @@ Everything trip-specific lives in **`trip/trip.config.json`**. The framework cod
 | Venues, POIs, RSVP activities | API route handlers |
 | Budget seed items | i18n machinery |
 | Trivia participants, question count | SSE trivia engine |
+
+### Stops after the interview — the override layer
+
+A trip built by the control plane has its `trip.config.json` **rewritten on every
+rebuild**, so an edit to a stop in that file is lost the next time the trip is
+rebuilt; the site's SQLite file survives it. Stops (`phases[]`: which exist, their
+dates, where the family sleeps) are therefore edited in the database and merged over
+the file. The alternative of rewriting the config file was rejected for that reason
+(recorded in the header of `server/trip-structure.js`).
+
+- **Storage.** `trip_stop_overrides` (one row per stop that differs from the config,
+  `kind` `config` or `added`) and `trip_stop_history` (append-only: database triggers
+  refuse an update or a delete). Created inline at boot, like the other site tables.
+- **`effectiveConfig()`** (`server/trip-structure.js`) returns the config with the
+  overrides merged in, and every reader of the trip's structure uses it. **It is
+  merged before `sanitizeConfig()`, never after**, so the allow-list in
+  `shared/config-visibility.js` applies to the result unchanged and is untouched by
+  this feature. The layer only writes fields that list already names (dates,
+  accommodation, title, tabLabel, emoji); who changed a stop, over which booking, and
+  the history are never put in the config and are served only by the organizer/agent
+  routes below. With no override and no computed block, `/api/config` is
+  byte-identical to the file's (pinned by golden tests).
+- **"Days not assigned to a stop" is computed.** The provisioner writes a synthetic
+  `unplanned: true` phase (`open-days`) per stretch of trip days no stop covers, with
+  the count written into its note. When a config carries that convention, the layer
+  recomputes those phases from the stops' dates and from the days the active plan has
+  on real stops, so the count clears as days are covered. A config without the
+  convention is served as authored. Such a phase is not a stop and cannot be edited.
+- **Rebuild conflicts.** If a rebuild changes a field an organizer had already
+  changed, the organizer's value wins and `GET /api/stops` reports a `conflict` with
+  the rebuilt value; the editor offers to keep or take it.
+- **Routes** — all behind `organizerOrAgentRequired` (401 anonymous, 403 for a member's
+  JWT; **not** `authRequired`):
+
+  | Route | Does |
+  |---|---|
+  | `GET /api/stops` | The effective stops with provenance, conflicts, `booking_out_of_sync`, and a `revision` (`st-N`, also the ETag) |
+  | `GET /api/stops/:id/history` | The stop's append-only history |
+  | `PATCH /api/stops/:id` | Change dates, title, tabLabel, emoji, accommodation (accommodation replaces whole) |
+  | `POST /api/stops/:id/split` | End the stop at a date and create the next stop from it; later days move with it |
+  | `POST /api/stops/:id/from-booking` | Set the stop's dates and accommodation from an approved hotel booking; creates one check-in and one check-out item (`booking_<id>_checkin` / `_checkout`), idempotent |
+  | `POST /api/stops/:id/revert` | Restore a history state, or (no `history_id`) go back to the config; an added stop is removed with DELETE |
+  | `DELETE /api/stops/:id` | Remove a stop this layer added, only while nothing refers to it |
+  | `POST /api/itinerary/move-day` (in `server/living-journey.js`) | Move a whole day (items and headline) to another stop; revision-checked against the itinerary; refuses a headline clash until `headline` is `keep_target` or `take_source`; queues both stops for a wording review |
+
+  A write carrying `If-Match: st-N` that is out of date is refused with 409
+  `stops_changed_reload_before_retry`. Refusals worth knowing: dates outside the trip's
+  own dates (400 `dates_outside_trip`); a range that leaves plan items outside it (409
+  `items_outside_stop`, listing them, until the caller sends `on_outside` as `keep` or
+  `move_to:<stop>`); a PIN or door code (`pin_not_accepted`, never stored, not even in
+  the history); a draft, non-hotel or other-stop booking on `from-booking`; markup or
+  control characters in stop text; a link that is not a plain http(s) address.
+  An itinerary item's `phase_id` (create and edit) and a booking's `phase` are now also
+  checked against the trip's known phases (400 `unknown phase`).
+- **The booking → stop link is explicit.** Adding or editing a hotel booking changes no
+  stop; only `from-booking` (or the companion's `set_stop_from_booking`) does. One
+  booking shapes one stop. If the booking's dates change later, its own check-in/out
+  items follow and `GET /api/stops` reports the stop out of sync until `from-booking` is
+  run again.
+- **Live updates.** Changes to either table bump the `stops` resource (`server/trip-events.js`);
+  the Modern client refetches the config, itinerary, today and stop lists on it.
+- **"Tonight:"** on the Journey is computed at serve time from the effective stops
+  (`server/living-journey.js`), not from a copy stored when the trip was built.
+- **Companion.** The same five operations are MCP tools — see
+  [Agent Integration (MCP)](#agent-integration-mcp).
 
 ---
 
@@ -257,12 +325,9 @@ code. See `.claude/skills/create-trip/SKILL.md`.
 TRIP_DIR=./trips/my-trip node server/server.js
 
 # Docker (production)
-# Set TRIP_DIR in docker-compose.yml and map the trip directory as a volume:
-# volumes:
-#   - ./trips/my-trip:/trip:ro
-# environment:
-#   TRIP_DIR: /trip
-docker compose up -d --build
+# docker-compose.yml mounts ${TRIP_DIR_HOST} read-only at /trip and sets TRIP_DIR=/trip.
+# TRIP_DIR_HOST defaults to ./trip, a name reserved for the unset case — always set it:
+TRIP_DIR_HOST=./trips/my-trip docker compose up -d --build
 ```
 
 **What to fill in after scaffolding:**
@@ -387,12 +452,27 @@ instance talks to one trip via `API_BASE_URL`.
 
 The site also serves its **own** MCP endpoint, for a trip member's own Claude
 or ChatGPT rather than the companion (`server/trip-mcp/`, off unless
-`TRIP_MCP_ENABLED` and `PUBLIC_ORIGIN` are set): read and write for an
+`TRIP_MCP_ENABLED` and `PUBLIC_ORIGIN` are set; the provisioner writes both for
+every new trip): read and write for an
 organizer, read only for everyone else. It is its own OAuth 2.1 authorization
 server: the person adds `<site>/mcp` (the More tab has an "Add to Claude"
 install link), signs in with their site login, and approves. Tools call the
 site's routes as that person, not as the agent. Details: `mcp/README.md`,
 "Trip connector".
+
+**Stop tools.** Five tools change the trip's structure after the interview, each one
+call to a route in [Stops after the interview](#stops-after-the-interview--the-override-layer):
+`get_stops`, `update_stop`, `split_stop`, `set_stop_from_booking`, `move_plan_day`. They
+are on the companion's bridge (`mcp/mcp.js`) and on the site's own connector (offered
+only on an organizer's write connection — the routes are organizer/agent only). A hotel
+*booking* alone never changes a stop; `set_stop_from_booking` does. Arguments and
+refusals: `mcp/README.md`, "Stop tools".
+
+**Write refusals carry both languages.** `POST/PATCH /api/bookings` and
+`POST /api/agent/participants` (so the booking and participant tools) check their text
+at the write (`server/text-rules.js`). A refusal is
+`{ error, field, message: { he, en }, detail }` with status 400; the bridges pass both
+languages to the model so the companion can relay the one the organizer uses.
 
 ### Original plan vs active plan — the vocabulary
 
@@ -435,23 +515,23 @@ Two ways to use it, same server either way:
 ## Infrastructure Details
 
 ### Docker Compose
-- **nginx** (`:8080`) — reverse proxy, static file server
+- **nginx** (`:8081` on the host, `:80` in the container) — reverse proxy, static file server
 - **node** (`:3000` internal) — Express API server
-- Volumes: `site/` read-only into nginx; `trip/` read-only at `$TRIP_DIR`; `server/data/` for SQLite
+- Volumes: `site/` read-only into nginx; the trip directory (`$TRIP_DIR_HOST`) read-only at `/trip`; `server/data/` for SQLite
 
 ### nginx — Critical Settings
 ```nginx
 # SSE routes must bypass buffering
-location /api/trivia/events {
+location ~ ^/api/(events$|trivia/(events|public-events)) {
     proxy_buffering off;
     proxy_cache off;
 }
 
-# File uploads
+# File uploads (inside `location /api/`)
 client_max_body_size 500m;
 
-# PDF inline display
-add_header Content-Disposition inline;
+# Booking documents and PDFs are proxied to Express, which authenticates them
+# and sets Content-Disposition itself — nginx never reads them from disk.
 ```
 
 ### Immich (optional photo sync)
@@ -482,7 +562,7 @@ hasn't been connected to any username yet — the response is meant to prompt
 
 ### Security Model
 - JWT tokens (30-day expiry); `authRequired` middleware on all private routes
-- Guest endpoints (no login): the lost & found form (`POST /api/lost-found` — no rate limit, #207), the
+- Guest endpoints (no login): the lost & found form (`POST /api/lost-found` — no login by design; text rules at the write, 5 accepted reports per hour per client address (set `TRUST_PROXY_HOPS` behind a proxy that appends to `X-Forwarded-For`, otherwise every visitor shares one bucket) and at most 200 open entries, #207), the
   public trivia TV view and its SSE stream, `GET /api/trip/logo`, `GET /api/config/roster`, and the
   `/photo/:id?s=` share page (below). Everything else in the gallery and social surface needs a login
   (#191, #194).
@@ -522,7 +602,14 @@ hasn't been connected to any username yet — the response is meant to prompt
   extension (`png jpg jpeg gif svg webp`) whose real path is inside the trip directory, with `nosniff`
   and, for SVG, `sandbox`.
 - Admin: `meta.admin` in `trip.config.json` (falls back to the first participant if unset); controls trivia start/reveal/reset
-- Passwords: bcrypt-hashed; PIN codes for hotel check-in (served from config, never stored in DB)
+- Passwords and PINs, two different things:
+  - **Participant logins** (the password or PIN a family member signs in with): bcrypt-hashed, never stored in clear
+    and never served.
+  - **Hotel PINs and door codes** exist in two places. `accommodation.pin` in `trip.config.json` is withheld by the
+    config allow-list (never served) and the stop layer refuses to accept one (`pin_not_accepted`). A booking's `pin`
+    is a column of the `bookings` table, written by an organizer or the companion (text-validated at the write); it is
+    stored in the site database and served to signed-in family members by `GET /api/bookings`, by design (owner
+    decision, 2026-10-11). `GET /api/bookings` omits drafts for everyone but organizers.
 - **Trip config is served through an allow-list** (#172): `/api/config`, `/api/config/versions/:version`,
   the public `/api/config/roster`, `/api/hermes/status`, the plan importers and the served itinerary all
   project `trip.config.json` through `shared/config-visibility.js` (engine: `shared/allow-list.js`).
@@ -534,12 +621,40 @@ hasn't been connected to any username yet — the response is meant to prompt
   (`tests/config-allow-list.test.js` fails until it is); an organizer-only field belongs in
   `GET /api/agent/brief`. Redeploying an existing trip can hide fields it shows today — run
   `projectConfig` on its config and read the boot log first (#200).
+- **Stored text is never markup, and the stop layer sits under the allow-list.** Two
+  layers, because the first alone is not enough:
+  - *At the write.* Stop text (title, tab label, emoji, accommodation) and booking and
+    participant free text are **refused**, not cleaned, if they carry `<`, `>` or a
+    control character (a line break only in booking notes); a link must be an absolute
+    http(s) address with no quotes, spaces or `<>`; dates must be `YYYY-MM-DD`; lengths
+    are capped. Quotes, `&` and emoji are text and are stored as typed (Hebrew
+    abbreviations carry an ASCII quote). The one exception is the PDF-fill route
+    (`extract-draft`), where an LLM — not a person — produced the text: it is cleaned,
+    and the organizer reviews every draft. Nothing on the read path calls these rules,
+    so an old stored value can never fail to load. Booking and participant refusals
+    are bilingual (`message: { he, en }`); stop refusals carry `error`, `field` and
+    `detail`. `GET /api/bookings` still serves `pin`, `notes` and `location_url` to
+    signed-in members — the owner decided on 2026-10-11 that this is intended.
+  - *At every Classic sink.* `site/app.js` escapes each server value where it draws it
+    (`esc()`, `_biText()`), checks links with `safeUrl()`, rebuilds a config day's HTML
+    from an allow-list (text, http(s) links, `b/strong/i/em/br`), and wires buttons
+    through one delegated handler reading `data-act` attributes rather than ids in
+    inline script. `_biSpan()` is for text already escaped or a translation constant
+    only. The Modern site renders through React, which escapes.
+  - `effectiveConfig()` (stop layer) is merged **before** `sanitizeConfig()`: the
+    allow-list invariant above holds for stop edits with no new list entry.
 - Google Sign-In (optional): ID tokens verified against Google's public keys via `google-auth-library`, no server-side secret; binds to `users.google_sub`, unique per username
 - Trip connector (optional, `server/trip-mcp/`): OAuth 2.1 with PKCE, dynamic registration limited to the hosted assistants' callbacks and loopback; opaque, hashed, revocable tokens that are never site sessions (and site sessions are never MCP tokens); anyone on the trip, read-only unless an organizer approved, re-checked on every call
 
 ---
 
-## Database Schema (13 tables)
+## Database Schema
+
+The server creates 37 tables in all; the list is every `CREATE TABLE` under `server/`
+(`git grep -h -o -E "CREATE TABLE( IF NOT EXISTS)? +[a-z_]+ *\(" -- server | sort -u | wc -l`;
+4 of those — the `mcp_oauth_*` tables — exist only when the trip connector is enabled).
+The table below names the ones the features in this guide rest on, not all of them — the
+rest are described beside the code that creates them.
 
 | Table | Purpose |
 |---|---|
@@ -556,6 +671,22 @@ hasn't been connected to any username yet — the response is meant to prompt
 | `trivia_scores` | Game history with rank and score |
 | `phase_plan_items` | The active plan: one row per activity, dated into a phase |
 | `phase_plan_days` | The active plan's day headlines — one per (phase, date), shown above its items |
+| `trip_stop_overrides` | Stop edits made after the interview: one row per stop that differs from the config (`config` or `added`), merged by `effectiveConfig()` |
+| `trip_stop_history` | Append-only record of every stop change (who, what, before and after); triggers refuse update and delete |
+| `phase_plan_import_log` | Which bookings the one-off plan import already consumed |
+| `bookings` | Reservations: supplier, confirmation, cost, passengers, document |
+| `trip_config_versions` | Saved copies of `trip.config.json`, one row per version |
+| `itinerary_plan_versions` / `itinerary_plan_days` / `itinerary_plan_items` | Immutable original/active itinerary revisions (triggers refuse update and delete) |
+| `trip_itinerary_state` | Which revision is the original and which is active |
+| `trip_moments` | Draft or published trip moments |
+| `trip_quality_issues` | Itinerary quality findings (engine, user or Hermes), with status |
+| `trip_daily_messages` | One bilingual message per date |
+| `trip_ui_settings` / `trip_settings` | Single-row site settings: design variant, hero media, timezone |
+| `provider_observations` | Cached external-provider answers, with expiry |
+| `trip_resource_revisions` | Change counters behind the live-update events |
+| `control_plane_identities` | Maps a control-plane user to a local username and role |
+| `companion_conversation` / `companion_inbox_status` / `companion_connection` | The shared companion thread and its group-connection state |
+| `mcp_oauth_clients` / `_codes` / `_grants` / `_tokens` | Trip connector OAuth state — created only when the connector is enabled (`TRIP_MCP_ENABLED` and a valid `PUBLIC_ORIGIN`) |
 
 ---
 

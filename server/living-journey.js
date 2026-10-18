@@ -3,6 +3,9 @@ const path = require('path');
 const crypto = require('crypto');
 const { publicPart } = require('../shared/config-visibility');
 const { projectAgent } = require('../shared/agent-schema');
+// Every plan date a route below is SENT must be a day on the calendar, not
+// only the shape (second boundary re-check of PR #373); reads keep ISO_DATE_RE.
+const { isCalendarDay, CALENDAR_DAY_DETAIL } = require('./calendar-day');
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 // "<phase>|<YYYY-MM-DD>|<index>" — the identity a config-imported item keeps
@@ -275,17 +278,29 @@ function schema(db) {
 // whose dates are wrong-shaped loses them to the allow-list and then matches
 // every night (the second boundary review measured it picking that hotel over
 // the right one).
+//
+// Inside a legacy multi-hotel stop the night rule is the one nightStop() uses
+// across stops: on a changeover date (one hotel's check-out is the next one's
+// check-in) the night is the hotel checked INTO. Only when no hotel runs past
+// the date does one that ends on it count. Before 2026-10-11 the first
+// inclusive match won, which put the changeover night in the hotel just left.
 function dayContextForPhase(rawPhase, date) {
   const rawAccommodation = rawPhase?.accommodation;
   const rawHotels = rawPhase?.hotels;
   let chosen = null;
   if (rawAccommodation) chosen = { accommodation: rawAccommodation };
   else if (Array.isArray(rawHotels)) {
-    const index = rawHotels.findIndex((h) => {
-      const from = h?.date_from || h?.check_in || h?.from;
-      const to = h?.date_to || h?.check_out || h?.to;
-      return (!from || from <= date) && (!to || date <= to);
+    const bounds = (h) => ({ from: h?.date_from || h?.check_in || h?.from, to: h?.date_to || h?.check_out || h?.to });
+    let index = rawHotels.findIndex((h) => {
+      const { from, to } = bounds(h);
+      return (!from || from <= date) && (!to || date < to || from === to);
     });
+    if (index < 0) {
+      index = rawHotels.findIndex((h) => {
+        const { from, to } = bounds(h);
+        return (!from || from <= date) && (!to || date <= to);
+      });
+    }
     if (index >= 0) chosen = { hotels: [rawHotels[index]] };
   }
   const projected = chosen ? publicPart('phase', chosen) : undefined;
@@ -295,6 +310,9 @@ function dayContextForPhase(rawPhase, date) {
       name: accommodation.name || accommodation.hotel || accommodation.title || null,
       address: accommodation.address || null,
       location_url: accommodation.location_url || accommodation.url || null,
+      // Only when the hotel has one (the stop layer's hotel resolves it, see
+      // server/hotel-place.js) — a stored context stays the three fields it was.
+      ...(accommodation.waze ? { waze_url: accommodation.waze } : {}),
     }) : null,
     // phases[].pickup is not on the allow-list: no producer writes it, nothing
     // renders it, and it has no shape to allow. The column stays for rows
@@ -303,13 +321,58 @@ function dayContextForPhase(rawPhase, date) {
   };
 }
 
+// A stop's dated range, or null — the same test as trip-web/src/stops.ts
+// stopDatesOf: both ends ISO dates, start <= end.
+function stopRange(phase) {
+  const start = phase?.dates?.start || phase?.start;
+  const end = phase?.dates?.end || phase?.end;
+  return typeof start === 'string' && typeof end === 'string' && ISO_DATE_RE.test(start) && ISO_DATE_RE.test(end) && start <= end
+    ? { start, end } : null;
+}
+
+// The stop whose night `date` is, in a list of RAW phases — the rule
+// trip-web/src/stops.ts tonightLodging applies, so the server and the Modern
+// client name the same stop. A night belongs to the stop that starts on or
+// before it and ends after it: on a transfer day (A ends where B starts, as
+// configs and splits write it) the night is B's. Only when no stop runs past
+// the date does a stop that ends on it count (a config that writes the last
+// night as the end date). The day's own stop wins a tie; otherwise the first
+// in config order. Null when no dated stop covers the date.
+function nightStop(phases, date, ownPhaseId) {
+  if (typeof date !== 'string' || !ISO_DATE_RE.test(date)) return null;
+  const dated = (Array.isArray(phases) ? phases : [])
+    .map((phase) => ({ phase, range: stopRange(phase) }))
+    .filter((p) => p.range);
+  const prefer = (list) => list.find((p) => p.phase?.id === ownPhaseId) || list[0];
+  const night = prefer(dated.filter((p) => p.range.start <= date && (date < p.range.end || p.range.start === p.range.end)))
+    || prefer(dated.filter((p) => p.range.start <= date && date <= p.range.end));
+  return night ? night.phase : null;
+}
+
+// A day row with its lodging computed NOW, from the effective config, rather
+// than the copy stored when the row was written. That copy is null after any
+// Classic/MCP plan write (rowsFromLegacyPlan re-derives the rows without it,
+// and importPlanOnce does that at every boot) and stale after a stop edit — a
+// hotel set, a split. The stop covering the night decides, even when it has no
+// hotel: a stop with none never inherits another stop's stored hotel. The
+// stored copy is kept only when no dated stop covers the date (a trip whose
+// stops have no dates yet). The value comes from dayContextForPhase on the raw
+// stop — choose on raw, serve the projection — and publicDayContext projects
+// it again on the way out, so nothing reaches the payload but the three public
+// fields it carried before.
+function withServedLodging(day, phases) {
+  const stop = nightStop(phases, day.date, day.phase_id);
+  if (!stop) return day;
+  return { ...day, lodging_context: readJson(dayContextForPhase(stop, day.date).lodging_context, null) };
+}
+
 // The member-facing view of a stored day's context. Rows written before the
 // import read the allow-list are still in the database (and restore-original
 // copies them forward), so the served shape is enforced here too.
 function publicDayContext(day) {
   const lodging = day.lodging_context && typeof day.lodging_context === 'object' ? day.lodging_context : null;
   const accommodation = lodging ? publicPart('phase', { accommodation: {
-    name: lodging.name, address: lodging.address, location_url: lodging.location_url,
+    name: lodging.name, address: lodging.address, location_url: lodging.location_url, waze: lodging.waze_url,
   } })?.accommodation : null;
   return {
     ...day,
@@ -317,6 +380,8 @@ function publicDayContext(day) {
       name: accommodation.name ?? null,
       address: accommodation.address ?? null,
       location_url: accommodation.location_url ?? null,
+      // A Waze link rides along only when the hotel has one.
+      ...(accommodation.waze ? { waze_url: accommodation.waze } : {}),
     } : null,
     pickup_context: null,
   };
@@ -570,11 +635,14 @@ function markProvenance(db, payload) {
   };
 }
 
-function serializeItinerary(db, rows, { includeOriginal = false } = {}) {
+// `config` is the effective (raw-shaped) config the participant view computes
+// each night's lodging from; /api/itinerary/original (includeOriginal) serves
+// the immutable snapshot as stored and takes none.
+function serializeItinerary(db, rows, { includeOriginal = false, config = null, hotelPlaces = null } = {}) {
   // A booking imported for organizer review is not participant-visible yet.
   // Every participant-facing itinerary projection must enforce that boundary;
   // filtering only /api/bookings leaked draft details through attached cards.
-  const bookingsById = new Map(db.prepare("SELECT id, type, name, date_from, date_to, confirmation, conf_file, location_url, google_wallet_url, apple_wallet_url, pkpass_file FROM bookings WHERE COALESCE(review_status, 'approved') = 'approved'").all().map((booking) => [booking.id, booking]));
+  const bookingsById = new Map(db.prepare("SELECT id, type, name, phase, date_from, date_to, confirmation, conf_file, location_url, google_wallet_url, apple_wallet_url, pkpass_file FROM bookings WHERE COALESCE(review_status, 'approved') = 'approved'").all().map((booking) => [booking.id, booking]));
   const payload = {
     revision: rows.version.revision_id,
     kind: rows.version.kind,
@@ -582,14 +650,28 @@ function serializeItinerary(db, rows, { includeOriginal = false } = {}) {
     source_config_version: rows.version.source_config_version,
     // The participant-facing projection enforces the day-context shape on
     // stored rows too; /api/itinerary/original (organizer-or-agent) is left as
-    // it was.
-    days: includeOriginal ? rows.days : rows.days.map(publicDayContext),
+    // it was. Lodging is computed from the trip as it is now (withServedLodging).
+    days: includeOriginal ? rows.days : rows.days.map((day) => publicDayContext(config ? withServedLodging(day, config.phases) : day)),
     items: rows.items.map((item) => ({
       ...item,
       booking: item.booking_id ? bookingsById.get(item.booking_id) || null : null,
     })),
   };
-  return includeOriginal ? payload : markProvenance(db, payload);
+  if (includeOriginal) return payload;
+  const marked = markProvenance(db, payload);
+  if (!hotelPlaces) return marked;
+  // After provenance, which compares an item's link with the original's: a link
+  // resolved at serve time is not an edit. A hotel's items (check-in, check-out,
+  // anything attached to the booking) get the hotel's links where they have none,
+  // and the booking card says where the hotel is — server/hotel-place.js.
+  return {
+    ...marked,
+    items: marked.items.map((item) => {
+      if (!item.booking) return item;
+      const place = hotelPlaces.decorateBooking(item.booking).place;
+      return { ...hotelPlaces.decorateItem(item, item.booking), booking: place ? { ...item.booking, place } : item.booking };
+    }),
+  };
 }
 
 function issueFingerprint(issue) {
@@ -1032,7 +1114,15 @@ async function weatherObservation(db, fetchImpl, query) {
   }
 }
 
-function buildTodayContext(db, config) {
+// An item with its hotel's links, for the routes that serve raw plan rows
+// (/api/today): the same decoration the active itinerary applies.
+function withHotelPlace(db, item, hotelPlaces) {
+  if (!hotelPlaces || !item?.booking_id) return item;
+  const booking = db.prepare("SELECT id, type, name, phase, location_url FROM bookings WHERE id = ? AND COALESCE(review_status, 'approved') = 'approved'").get(item.booking_id);
+  return hotelPlaces.decorateItem(item, booking);
+}
+
+function buildTodayContext(db, config, { hotelPlaces = null } = {}) {
   const rows = activeRows(db);
   const clock = localClock(db, config);
   const today = clock.date;
@@ -1069,9 +1159,9 @@ function buildTodayContext(db, config) {
     first_date: firstDate,
     last_date: lastDate,
     countdown_days: firstDate ? Math.ceil((new Date(`${firstDate}T00:00:00Z`) - new Date(`${today}T00:00:00Z`)) / 86400000) : null,
-    current: todayItems[0] || null,
-    next: nextItem,
-    events: todayItems,
+    current: todayItems[0] ? withHotelPlace(db, todayItems[0], hotelPlaces) : null,
+    next: nextItem ? withHotelPlace(db, nextItem, hotelPlaces) : null,
+    events: todayItems.map((item) => withHotelPlace(db, item, hotelPlaces)),
     flights: flightToday,
   };
 }
@@ -1094,7 +1184,44 @@ function confirmationSummary(db) {
   });
 }
 
-function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequired, organizerOrAgentRequired, requestItemEnrichment }) {
+// Moves every item and the headline of one day from one phase to another, in
+// a writable copy of the active rows. A headline already on the target day is
+// a conflict the caller resolves: `headline` is 'keep_target' or
+// 'take_source'; anything else with two headlines throws a 409-shaped error.
+function moveDayRows(rows, { from, to, date, lodging, headline }) {
+  const moved = [];
+  for (const item of rows.items) {
+    if (item.phase_id === from && item.date === date) { item.phase_id = to; moved.push(item.item_uid); }
+  }
+  const src = rows.days.find(day => day.phase_id === from && day.date === date);
+  const dst = rows.days.find(day => day.phase_id === to && day.date === date);
+  let headlineMoved = false;
+  if (src && dst) {
+    const srcHas = Boolean(src.label_he || src.label_en);
+    const dstHas = Boolean(dst.label_he || dst.label_en);
+    if (srcHas && (!dstHas || headline === 'take_source')) {
+      dst.label_he = src.label_he; dst.label_en = src.label_en; headlineMoved = true;
+    }
+    rows.days = rows.days.filter(day => day !== src);
+  } else if (src) {
+    src.phase_id = to;
+    Object.assign(src, lodging || {});
+    headlineMoved = Boolean(src.label_he || src.label_en);
+  } else if (moved.length && !dst) {
+    rows.days.push({ phase_id: to, date, label_he: null, label_en: null, lodging_context: null, pickup_context: null, ...(lodging || {}), sort_order: rows.days.length });
+  }
+  return { items: moved, headline: headlineMoved };
+}
+
+function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImpl, mediaDir, authRequired, organizerOrAgentRequired, requestItemEnrichment, phaseKnown, stopKnown, onPhasesReshuffled, reviewConfigured }) {
+  // The trip as it is now. server.js passes the effective config (the file
+  // with the stop layer merged over it, server/trip-structure.js); a caller
+  // that passes only `config` gets exactly that object, as before.
+  const cfg = () => (getConfig ? getConfig() : config);
+  // A phase id a plan row may be filed under. Without the stop layer: any
+  // phase the config names.
+  const isKnownPhase = (id) => typeof id === 'string' && (phaseKnown ? phaseKnown(id) : (cfg().phases || []).some(p => p?.id === id));
+  const isKnownStop = (id) => typeof id === 'string' && (stopKnown ? stopKnown(id) : (cfg().phases || []).some(p => p?.id === id && p?.unplanned !== true));
   app.get('/api/ui-bootstrap', (_req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     res.json({
@@ -1172,7 +1299,9 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
   app.get('/api/itinerary/active', authRequired, (req, res) => {
     const rows = activeRows(db);
     if (!rows) return res.status(404).json({ error: 'itinerary_not_ready' });
-    const payload = serializeItinerary(db, rows);
+    // The ETag is over the payload, so a stop edit — which changes the lodging
+    // served, not the plan revision — is a new ETag, never a 304.
+    const payload = serializeItinerary(db, rows, { config: hotelPlaces ? hotelPlaces.hydrateConfig(cfg()) : cfg(), hotelPlaces });
     const etag = etagForPayload(payload);
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('ETag', etag);
@@ -1217,8 +1346,9 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
 
   app.patch('/api/itinerary/days', organizerOrAgentRequired, itineraryRevisionMatches, (req, res) => {
     const { phase_id, date, label_he, label_en } = req.body || {};
-    if (!phase_id || !ISO_DATE_RE.test(date || '') || typeof label_he !== 'string' || typeof label_en !== 'string') return res.status(400).json({ error: 'invalid_day' });
-    const phase = config.phases?.find(phase => phase.id === phase_id);
+    if (phase_id && !isCalendarDay(date)) return res.status(400).json({ error: 'invalid_day', field: 'date', detail: CALENDAR_DAY_DETAIL });
+    if (!phase_id || typeof label_he !== 'string' || typeof label_en !== 'string') return res.status(400).json({ error: 'invalid_day' });
+    const phase = cfg().phases?.find(phase => phase.id === phase_id);
     const start = phase?.dates?.start || phase?.start;
     const end = phase?.dates?.end || phase?.end || start;
     const existing = activeRows(db)?.days.some(day => day.phase_id === phase_id && day.date === date);
@@ -1241,7 +1371,9 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
     const body = req.body || {};
     const bad = requireFields(body, ['phase_id', 'date', 'text_he']);
     if (bad) return res.status(400).json({ error: bad });
-    if (!ISO_DATE_RE.test(body.date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+    if (!isCalendarDay(body.date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD', field: 'date', detail: CALENDAR_DAY_DETAIL });
+    // A phase id no route can reach would file the item where nothing shows it.
+    if (!isKnownPhase(body.phase_id)) return res.status(400).json({ error: 'unknown phase' });
     const uid = revisionId('item');
     const nextId = cloneWith(db, req.user.username, 'Organizer added itinerary item', (rows) => {
       if (!rows.days.some((day) => day.phase_id === body.phase_id && day.date === body.date)) {
@@ -1282,7 +1414,11 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
         return res.status(400).json({ error: `${field} must not be empty` });
       }
     }
-    if (body.date !== undefined && !ISO_DATE_RE.test(body.date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+    if (body.date !== undefined && !isCalendarDay(body.date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD', field: 'date', detail: CALENDAR_DAY_DETAIL });
+    // Accepted since the PATCH existed, never checked: a typo moved the item to
+    // a phase no route can reach (run notes F6). Checked against the trip as it
+    // is now — an added stop is a valid target, an unknown string is not.
+    if (body.phase_id !== undefined && !isKnownPhase(body.phase_id.trim())) return res.status(400).json({ error: 'unknown phase' });
     let touched = false;
     let titleChanged = false;
     const nextId = cloneWith(db, req.user.username, 'Organizer edited itinerary item', (rows) => {
@@ -1345,7 +1481,12 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
 
   app.post('/api/itinerary/swap-days', organizerOrAgentRequired, itineraryRevisionMatches, (req, res) => {
     const { phase_id, date_a, date_b } = req.body || {};
-    if (!phase_id || !ISO_DATE_RE.test(date_a || '') || !ISO_DATE_RE.test(date_b || '') || date_a === date_b) {
+    if (phase_id) {
+      for (const [field, value] of [['date_a', date_a], ['date_b', date_b]]) {
+        if (!isCalendarDay(value)) return res.status(400).json({ error: 'phase_id, date_a and date_b are required', field, detail: CALENDAR_DAY_DETAIL });
+      }
+    }
+    if (!phase_id || date_a === date_b) {
       return res.status(400).json({ error: 'phase_id, date_a and date_b are required' });
     }
     const nextId = cloneWith(db, req.user.username, 'Organizer swapped itinerary days', (rows) => {
@@ -1364,6 +1505,61 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
     res.json({ revision: nextId });
   });
 
+  // A whole day — its items and its headline — moves to another stop, in one
+  // revision. swap-days swaps two dates inside ONE phase; this is the move
+  // across stops that did not exist (run notes F6). Both stops are queued for
+  // wording review in the same transaction: "tomorrow we drive to Colmar" is
+  // wrong once the day belongs to another stop.
+  app.post('/api/itinerary/move-day', organizerOrAgentRequired, itineraryRevisionMatches, (req, res) => {
+    const body = req.body || {};
+    const { from_phase_id: from, to_phase_id: to, date } = body;
+    if (!isCalendarDay(date)) return res.status(400).json({ error: 'invalid_date', field: 'date', detail: CALENDAR_DAY_DETAIL });
+    if (!isKnownPhase(from)) return res.status(400).json({ error: 'unknown_phase', field: 'from_phase_id' });
+    // The target must be a real stop: a computed open-days phase is not a
+    // place a day can be assigned to.
+    if (!isKnownStop(to)) return res.status(400).json({ error: 'unknown_stop', field: 'to_phase_id' });
+    if (from === to) return res.status(400).json({ error: 'same_phase' });
+    if (body.headline !== undefined && !['keep_target', 'take_source'].includes(body.headline)) {
+      return res.status(400).json({ error: 'invalid_headline', detail: 'headline is "keep_target" or "take_source"' });
+    }
+    const rows = activeRows(db);
+    const hasItems = rows.items.some(item => item.phase_id === from && item.date === date);
+    const src = rows.days.find(day => day.phase_id === from && day.date === date);
+    if (!hasItems && !src) return res.status(404).json({ error: 'day_not_found' });
+    const dst = rows.days.find(day => day.phase_id === to && day.date === date);
+    if ((src?.label_he || src?.label_en) && (dst?.label_he || dst?.label_en) && !body.headline) {
+      return res.status(409).json({
+        error: 'target_day_has_headline',
+        source: { label_he: src.label_he, label_en: src.label_en },
+        target: { label_he: dst.label_he, label_en: dst.label_en },
+        detail: 'resend with headline: "keep_target" or "take_source"',
+      });
+    }
+    const target = (cfg().phases || []).find(phase => phase?.id === to);
+    let moved;
+    let revision;
+    db.transaction(() => {
+      // Adopt Classic-written rows first, as restore-original does: the
+      // projection below only re-files rows it can identify.
+      updateLegacyFromActive(db);
+      revision = cloneWith(db, req.user.username, `Moved ${date} from ${from} to ${to}`, (next) => {
+        moved = moveDayRows(next, { from, to, date, lodging: dayContextForPhase(target, date), headline: body.headline });
+      });
+      updateLegacyFromActive(db);
+      onPhasesReshuffled?.([from, to]);
+    })();
+    const configured = Boolean(reviewConfigured?.());
+    res.json({
+      revision, phase_id: to, date, moved,
+      review: {
+        status: configured ? 'queued' : 'unavailable', scope: 'phases', phases: [from, to],
+        detail: configured
+          ? 'Descriptions mentioning a day may now be wrong. Re-read both stops\' plans shortly.'
+          : 'No reviewer configured — descriptions were not checked for stale day references.',
+      },
+    });
+  });
+
   app.post('/api/itinerary/restore-original', organizerOrAgentRequired, itineraryRevisionMatches, (req, res) => {
     const saved = getVersionRows(db, getState(db).original_version_id);
     // Adopt Classic-written rows first: the projection below only deletes rows it can identify.
@@ -1377,7 +1573,7 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
 
   app.post('/api/agent/daily-message', organizerOrAgentRequired, (req, res) => {
     const { date, he, en } = req.body || {};
-    if (date !== localClock(db, config).date) return res.status(409).json({ error: 'message_date_must_match_today' });
+    if (date !== localClock(db, cfg()).date) return res.status(409).json({ error: 'message_date_must_match_today' });
     if (![he, en].every(value => typeof value === 'string' && value.trim().length > 0 && value.trim().length <= 280)) {
       return res.status(400).json({ error: 'he_and_en_required_max_280_characters' });
     }
@@ -1388,7 +1584,7 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
 
   app.get('/api/today', authRequired, (_req, res) => {
     res.setHeader('Cache-Control', 'no-store');
-    res.json(buildTodayContext(db, config));
+    res.json(buildTodayContext(db, cfg(), { hotelPlaces }));
   });
 
   app.get('/api/confirmations/summary', authRequired, (_req, res) => {
@@ -1416,7 +1612,7 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
       // it is an internal Hermes identifier (the `hermes:<profile>` shape #156
       // was about), no client reads it, and no producer writes it.
       identity: {
-        name: projectAgent(config.agent)?.name || 'Hermes',
+        name: projectAgent(cfg().agent)?.name || 'Hermes',
       },
       available: Boolean(process.env.HERMES_URL || process.env.HERMES_API_KEY),
       ask_in_telegram: Boolean(process.env.TELEGRAM_BOT_USERNAME),
@@ -1478,9 +1674,10 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
   app.patch('/api/moments/:id', authRequired, (req, res) => {
     const row = db.prepare('SELECT * FROM trip_moments WHERE id = ?').get(req.params.id);
     if (!row) return res.status(404).json({ error: 'not found' });
-    const organizers = Array.isArray(config.agent?.organizers)
-      ? config.agent.organizers
-      : [config.agent?.organizer].filter(Boolean);
+    const { agent } = cfg();
+    const organizers = Array.isArray(agent?.organizers)
+      ? agent.organizers
+      : [agent?.organizer].filter(Boolean);
     if (row.author !== req.user.username && !organizers.includes(req.user.username) && !req.user.isAgent) return res.status(403).json({ error: 'forbidden' });
     db.prepare("UPDATE trip_moments SET caption = COALESCE(?, caption), body = COALESCE(?, body), visibility = COALESCE(?, visibility), updated_at = datetime('now') WHERE id = ?")
       .run(req.body?.caption ?? null, req.body?.body ?? null, ['draft', 'published'].includes(req.body?.visibility) ? req.body.visibility : null, req.params.id);
@@ -1490,9 +1687,10 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
   app.delete('/api/moments/:id', authRequired, (req, res) => {
     const row = db.prepare('SELECT * FROM trip_moments WHERE id = ?').get(req.params.id);
     if (!row) return res.status(404).json({ error: 'not found' });
-    const organizers = Array.isArray(config.agent?.organizers)
-      ? config.agent.organizers
-      : [config.agent?.organizer].filter(Boolean);
+    const { agent } = cfg();
+    const organizers = Array.isArray(agent?.organizers)
+      ? agent.organizers
+      : [agent?.organizer].filter(Boolean);
     if (row.author !== req.user.username && !organizers.includes(req.user.username) && !req.user.isAgent) return res.status(403).json({ error: 'forbidden' });
     db.prepare('DELETE FROM trip_moments WHERE id = ?').run(req.params.id);
     res.json({ ok: true });
@@ -1513,7 +1711,23 @@ function create(options) {
     importPlanOnce: (promoteFromConfig) => importPlanOnce(db, promoteFromConfig),
     setRestorePoint: (author) => setRestorePoint(db, author),
     uiSettings: () => uiSettings(db),
+    // For server/trip-structure.js: read the active plan, and change it the
+    // way every Modern write does — a new immutable revision, projected into
+    // the Classic tables (adopting Classic-written rows first). Callers run
+    // it inside their own transaction when it is one half of a larger write.
+    activeRows: () => activeRows(db),
+    activeRevision: () => getState(db)?.active_version_id ?? null,
+    applyChange: (author, note, transform) => {
+      let id;
+      db.transaction(() => {
+        updateLegacyFromActive(db);
+        id = cloneWith(db, author, note, transform);
+        updateLegacyFromActive(db);
+      })();
+      return id;
+    },
+    dayContext: (rawPhase, date) => dayContextForPhase(rawPhase, date),
   };
 }
 
-module.exports = { create, isValidTimeZone };
+module.exports = { create, isValidTimeZone, moveDayRows };

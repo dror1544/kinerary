@@ -236,41 +236,60 @@ class RenderedDataCheckTests(unittest.TestCase):
         result = verification.check_rendered_data(get, "https://trip.example", frozenset())
         self.assertEqual(result.outcome, "passed")
 
-    def test_passes_when_departure_and_return_date_both_match(self) -> None:
+    def test_passes_when_the_deployment_nonce_matches(self) -> None:
         get = FakeGet()
         get.set("/api/config/roster", 200, json.dumps({"participants": [{"username": "tali"}]}))
-        get.set(
-            "/api/config/deployment-identity", 200,
-            json.dumps({"departure": "2027-03-10T06:00:00+03:00", "returnDate": "2027-03-20"}),
-        )
+        get.set("/api/config/deployment-identity", 200, json.dumps({"deploymentNonce": "abc123"}))
         result = verification.check_rendered_data(
-            get, "https://trip.example", frozenset({"tali"}),
-            expected_departure="2027-03-10T06:00:00+03:00", expected_return_date="2027-03-20",
+            get, "https://trip.example", frozenset({"tali"}), expected_deployment_nonce="abc123",
         )
         self.assertEqual(result.outcome, "passed")
+
+    def test_a_404_on_deployment_identity_degrades_to_roster_only_rather_than_failing(self) -> None:
+        """PR review before the sprint-6 -> main merge, 2026-10-06 (P1): the
+        planner still considers older manifest-backed releases compatible,
+        and the worker can materialize exactly one of them -- a real site
+        with no bug at all, just predating this route. A roster match is
+        still required and still ran; this is strictly less protection than
+        a newer release gets, never less than that older release ever had."""
+        get = FakeGet()
+        get.set("/api/config/roster", 200, json.dumps({"participants": [{"username": "tali"}]}))
+        get.set("/api/config/deployment-identity", 404, "Not Found")
+        result = verification.check_rendered_data(
+            get, "https://trip.example", frozenset({"tali"}), expected_deployment_nonce="abc123",
+        )
+        self.assertEqual(result.outcome, "passed")
+        self.assertIn("404", result.evidence)
+
+    def test_a_non_404_error_on_deployment_identity_still_fails(self) -> None:
+        """The route existing and erroring is new evidence of a real
+        problem -- unlike a 404, it must not be waved through."""
+        get = FakeGet()
+        get.set("/api/config/roster", 200, json.dumps({"participants": [{"username": "tali"}]}))
+        get.set("/api/config/deployment-identity", 500, "boom")
+        result = verification.check_rendered_data(
+            get, "https://trip.example", frozenset({"tali"}), expected_deployment_nonce="abc123",
+        )
+        self.assertEqual(result.outcome, "failed")
 
     def test_fails_when_the_matching_roster_belongs_to_a_sibling_trip_for_the_same_family(self) -> None:
         """#review 2026-10-03 [P2], round 2: a SECOND trip for the same
         family can share its roster exactly -- round 1's username comparison
-        alone would pass against the wrong trip. departure/returnDate cannot
-        collide between two distinct real trips for one family."""
+        alone would pass against the wrong trip. The deployment nonce cannot
+        collide between two distinct real deploys the way a roster can."""
         get = FakeGet()
         get.set("/api/config/roster", 200, json.dumps({"participants": [{"username": "tali"}]}))
-        get.set(
-            "/api/config/deployment-identity", 200,
-            json.dumps({"departure": "2028-07-01T06:00:00+03:00", "returnDate": "2028-07-10"}),
-        )
+        get.set("/api/config/deployment-identity", 200, json.dumps({"deploymentNonce": "a-different-nonce"}))
         result = verification.check_rendered_data(
-            get, "https://trip.example", frozenset({"tali"}),
-            expected_departure="2027-03-10T06:00:00+03:00", expected_return_date="2027-03-20",
+            get, "https://trip.example", frozenset({"tali"}), expected_deployment_nonce="abc123",
         )
         self.assertEqual(result.outcome, "failed")
         self.assertIn("deployment identity mismatch", result.evidence)
 
-    def test_still_passes_with_no_expected_dates_to_compare(self) -> None:
-        """Matching round 1's own fallback: expected_departure/
-        expected_return_date both None skips this half of the comparison
-        rather than failing retroactively."""
+    def test_still_passes_with_no_expected_nonce_to_compare(self) -> None:
+        """Matching round 1's own fallback: expected_deployment_nonce being
+        None skips this half of the comparison rather than failing
+        retroactively."""
         get = FakeGet()
         get.set("/api/config/roster", 200, json.dumps({"participants": [{"username": "tali"}]}))
         result = verification.check_rendered_data(get, "https://trip.example", frozenset({"tali"}))
@@ -488,6 +507,78 @@ class RecordEvidenceTests(unittest.TestCase):
         for row in rows:
             self.assertRegex(row["evidence_digest"], r"^sha256:[a-f0-9]{64}$")
             self.assertEqual(row["deployment_ref"], "rev123")
+
+
+    def test_two_writes_in_one_transaction_order_by_when_they_were_made(self) -> None:
+        """Live finding 2026-10-10: a trip's gate-time `skipped` row and its
+        post-attach `failed` row carried the IDENTICAL observed_at, so "the
+        latest attempt per check" could not tell which was later. now() is
+        the TRANSACTION's start; clock_timestamp() is the moment of the
+        write. Here the connection already holds an open transaction (the
+        first statement below opens it), so record_evidence's own
+        `conn.transaction()` is only a savepoint inside it — exactly the
+        shape that tied."""
+        trip = self.fix["trip_id"]
+        self.conn.execute("SELECT 1")  # open the outer transaction
+        verification.record_evidence(
+            self.conn, trip_id=trip, deployment_ref=None,
+            results=[verification.CheckResult(verification.MCP_ISOLATION, "skipped", "gate time")],
+        )
+        verification.record_evidence(
+            self.conn, trip_id=trip, deployment_ref=None,
+            results=[verification.CheckResult(verification.MCP_ISOLATION, "failed", "after attach")],
+        )
+        rows = self.conn.execute(
+            "SELECT outcome, observed_at FROM control_plane.verification_evidence "
+            "WHERE trip_id = %s ORDER BY observed_at",
+            (trip,),
+        ).fetchall()
+        self.assertEqual([r["outcome"] for r in rows], ["skipped", "failed"])
+        self.assertLess(rows[0]["observed_at"], rows[1]["observed_at"], "the two rows tie on observed_at")
+
+    def test_rows_of_one_call_are_distinct_and_in_result_order(self) -> None:
+        trip = self.fix["trip_id"]
+        verification.record_evidence(
+            self.conn, trip_id=trip, deployment_ref=None,
+            results=[verification.CheckResult(n, "passed", n) for n in ("a", "b", "c")],
+        )
+        rows = self.conn.execute(
+            "SELECT check_name, observed_at FROM control_plane.verification_evidence "
+            "WHERE trip_id = %s ORDER BY observed_at",
+            (trip,),
+        ).fetchall()
+        self.assertEqual([r["check_name"] for r in rows], ["a", "b", "c"])
+        self.assertEqual(len({r["observed_at"] for r in rows}), 3)
+
+    def test_latest_row_per_check_is_the_later_write_in_either_order_of_outcome(self) -> None:
+        """The selection fleet-mcp.mjs uses (`observed_at = max(observed_at)`
+        per trip and check), run against real rows: the post-attach `failed`
+        beats the earlier gate-time `skipped`, and a later `passed` beats an
+        earlier `failed` (a trip that recovered is not an incident)."""
+        trip = self.fix["trip_id"]
+        self.conn.execute("SELECT 1")
+        for check, outcome in (
+            (verification.MCP_ISOLATION, "skipped"), (verification.MCP_ISOLATION, "failed"),
+            (verification.MESSAGING_BINDING, "failed"), (verification.MESSAGING_BINDING, "passed"),
+        ):
+            verification.record_evidence(
+                self.conn, trip_id=trip, deployment_ref=None,
+                results=[verification.CheckResult(check, outcome, f"{check} {outcome}")],
+            )
+        rows = self.conn.execute(
+            """
+            SELECT ve.check_name, ve.outcome FROM control_plane.verification_evidence ve
+             WHERE ve.trip_id = %s
+               AND ve.observed_at = (SELECT max(ve2.observed_at) FROM control_plane.verification_evidence ve2
+                                      WHERE ve2.trip_id = ve.trip_id AND ve2.check_name = ve.check_name)
+             ORDER BY ve.check_name
+            """,
+            (trip,),
+        ).fetchall()
+        self.assertEqual(
+            [(r["check_name"], r["outcome"]) for r in rows],
+            sorted([(verification.MCP_ISOLATION, "failed"), (verification.MESSAGING_BINDING, "passed")]),
+        )
 
 
 @unittest.skipIf(SKIP, "CONTROL_PLANE_TEST_DATABASE_URL not set")

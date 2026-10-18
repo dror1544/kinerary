@@ -10,6 +10,9 @@ const TABLES = {
   itinerary_plan_items: 'itinerary', itinerary_plan_days: 'itinerary',
   trip_itinerary_state: 'itinerary', trip_moments: 'moments',
   trip_ui_settings: 'ui', trip_daily_messages: 'daily-message',
+  // The stop layer (server/trip-structure.js): a change here changes what
+  // GET /api/config serves, so a client refetches the config on 'stops'.
+  trip_stop_overrides: 'stops', trip_stop_history: 'stops',
 };
 
 function createTripEvents(db, { tables = TABLES, pollMs = 250 } = {}) {

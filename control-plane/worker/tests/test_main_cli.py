@@ -11,6 +11,7 @@ than trusting a comment.
 """
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 import unittest
@@ -191,6 +192,35 @@ class TemplatesDirResolutionTests(unittest.TestCase):
             os.path.isdir(os.path.join(repo_root, "profile-templates", "familytrip-companion")),
             "profile-templates/familytrip-companion moved; the default derivation needs updating",
         )
+
+
+class RetiredSeedPasswordTests(unittest.TestCase):
+    def test_a_leftover_variable_is_reported_as_ignored_without_its_value(self) -> None:
+        from control_plane_worker.__main__ import _warn_if_retired_seed_password_is_set
+
+        with mock.patch.dict(os.environ, {"PROVISIONER_SEED_PASSWORD": "canary-shared-pw"}):
+            with self.assertLogs("control_plane_worker", level="WARNING") as logs:
+                _warn_if_retired_seed_password_is_set()
+        text = "\n".join(logs.output)
+        self.assertIn("PROVISIONER_SEED_PASSWORD", text)
+        self.assertIn("ignored", text)
+        self.assertNotIn("canary-shared-pw", text)
+
+    def test_unset_says_nothing(self) -> None:
+        from control_plane_worker.__main__ import _warn_if_retired_seed_password_is_set
+
+        env = {k: v for k, v in os.environ.items() if k != "PROVISIONER_SEED_PASSWORD"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            with self.assertLogs("control_plane_worker", level="WARNING") as logs:
+                logging.getLogger("control_plane_worker").warning("sentinel")
+                _warn_if_retired_seed_password_is_set()
+        self.assertEqual(1, len(logs.output))
+
+    def test_the_worker_no_longer_reads_the_variable_into_any_adapter(self) -> None:
+        import inspect
+        from control_plane_worker import __main__ as entry
+
+        self.assertNotIn("seed_password=", inspect.getsource(entry.main))
 
 
 if __name__ == "__main__":

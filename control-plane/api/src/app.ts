@@ -17,6 +17,7 @@ import { saveDeferredVenueLinks } from "./venue-links.js";
 import { correctIntake } from "./intake-correction.js";
 import { issueApproval } from "./plan-approval.js";
 import { inviteOrganizer, previewInvitation } from "./organizer-invite.js";
+import { executeClear, previewClear } from "./trip-clear.js";
 import {
   JOB_STATES,
   JOB_TYPES,
@@ -1635,6 +1636,95 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     });
   });
 
+  // ── The operator's force-clear ───────────────────────────────────────────
+  //
+  // Issue #378. Same operator key and gate as the invitations routes just
+  // above — see `OperatorDependencies`'s own module doc in this file for why
+  // one key covers both: an operator tool that can mint an invitation for an
+  // address nobody has heard from is already the trusted party this
+  // capability is scoped to, and a second key would add a secret to hold
+  // without changing who can act (the same reasoning `AdminDependencies`
+  // states for its own two mutation routes). See trip-clear.ts's own module
+  // doc for what this does, what it deliberately bypasses, and what it
+  // cannot reach from this process.
+  app.post("/internal/operator/trips/:tripId/clear/preview", async (request, reply) => {
+    if (!dependencies.operator) return reply.code(503).send({ error: "OPERATOR_NOT_CONFIGURED" });
+    if (!operatorAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const params = request.params as Record<string, unknown>;
+    const tripId = params?.tripId;
+    if (typeof tripId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+
+    // F7 (boundary review, 2026-10-13): Fastify's default error serializer
+    // puts a thrown error's own `message` straight into the response body —
+    // for a raw `pg` error that is the driver's text, which can carry a
+    // constraint name or column value. Caught here so this route never does
+    // that; see `sqlstateOf`'s own comment for why only the SQLSTATE is safe
+    // to log at all.
+    try {
+      const preview = await previewClear(dependencies.operator.db, tripId);
+      if (!preview.ok && preview.reason === "TRIP_NOT_FOUND") {
+        return reply.code(404).send({ error: preview.reason, detail: preview.detail });
+      }
+      // A refusal that still carries a plan (EVER_PROVISIONED,
+      // PROFILE_SHARED_WITH_ANOTHER_TRIP, OPEN_INTERVIEW_BINDING,
+      // JOB_IN_PROGRESS — every previewClear refusal reason except
+      // TRIP_NOT_FOUND, handled separately just above) is a 200, same
+      // posture as the invitations preview: "here is what would happen, and
+      // here is why it would not" is the answer this call asked for, not a
+      // failure of the call itself. UNREVOKED_SESSION is executeClear-only
+      // (discovered mid-transaction, after trips is locked) and never
+      // reaches previewClear at all.
+      return reply.code(200).send(preview.ok
+        ? { ok: true, plan: preview.plan }
+        : { ok: false, reason: preview.reason, detail: preview.detail, plan: preview.plan });
+    } catch (error) {
+      log(structuredLog("error", "operator.clear_trip_preview_failed", {
+        safe_error_code: "CLEAR_PREVIEW_FAILED",
+        sqlstate: sqlstateOf(error),
+      }));
+      return reply.code(500).send({ error: "CLEAR_PREVIEW_FAILED" });
+    }
+  });
+
+  app.post("/internal/operator/trips/:tripId/clear", async (request, reply) => {
+    if (!dependencies.operator) return reply.code(503).send({ error: "OPERATOR_NOT_CONFIGURED" });
+    if (!operatorAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const params = request.params as Record<string, unknown>;
+    const tripId = params?.tripId;
+    if (typeof tripId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const confirm = typeof body.confirm === "string" ? body.confirm : "";
+
+    // F7 — see the preview route's own comment just above.
+    try {
+      const result = await executeClear(dependencies.operator.db, tripId, confirm, "operator:api-key");
+      if (!result.ok) {
+        const status = result.reason === "TRIP_NOT_FOUND" ? 404
+          : result.reason === "CONFIRMATION_REQUIRED" ? 400
+          // CONFIRMATION_MISMATCH, EVER_PROVISIONED, PROFILE_SHARED_WITH_ANOTHER_TRIP,
+          // OPEN_INTERVIEW_BINDING, JOB_IN_PROGRESS, UNREVOKED_SESSION
+          : 409;
+        return reply.code(status).send({ error: result.reason, detail: result.detail });
+      }
+      return reply.code(200).send({
+        tripId: result.tripId,
+        archiveId: result.archiveId,
+        slugBefore: result.slugBefore,
+        slugAfter: result.slugAfter,
+        stepsPerformed: result.stepsPerformed,
+      });
+    } catch (error) {
+      log(structuredLog("error", "operator.clear_trip_failed", {
+        safe_error_code: "CLEAR_FAILED",
+        sqlstate: sqlstateOf(error),
+      }));
+      return reply.code(500).send({ error: "CLEAR_FAILED" });
+    }
+  });
+
   // ── Super-admin dashboard, slice 1 (read-only) ───────────────────────────
   //
   // docs/sprint6-tracks.md decision 23. Every route here reads across ALL
@@ -1894,7 +1984,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       const status = result.reason === "TRIP_NOT_FOUND" ? 404 : 409;
       return reply.code(status).send({ error: result.reason });
     }
-    return reply.code(200).send({ tripId: result.tripId });
+    return reply.code(200).send({ tripId: result.tripId, reapprovalNeeded: result.reapprovalNeeded });
   });
 
   // ── Hermes tool-outcome ingest ───────────────────────────────────────────
@@ -1908,8 +1998,22 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
   // (analytics/contract.ts). The request names the Hermes PROFILE
   // reporting, never a trip id; `hermes-ingest.ts` resolves the one trip
   // that profile belongs to (`trips.hermes_profile`) before anything is
-  // written, so a key leaked from one trip's companion still cannot name
-  // another trip in the body.
+  // written.
+  //
+  // #review 2026-10-06 [N2], PR review before the sprint-6 -> main merge:
+  // this comment used to claim that resolution meant "a key leaked from one
+  // trip's companion still cannot name another trip in the body." That is
+  // false — ASSISTANT_EVENTS_INGEST_KEY is ONE shared key for every
+  // companion (see server.ts), not one per trip, so any holder of it can
+  // name ANY real profile and insert outcomes for that trip's analytics
+  // (confirmed live). The attacker gets integrity only — poisoned
+  // assistant-quality/missing-data metrics, not trip-data read access — and
+  // this is dormant today: ASSISTANT_EVENTS_INGEST_KEY is unset everywhere,
+  // so the route 503s before auth is even checked. Fixing this for real
+  // needs a credential actually scoped to one profile (a per-trip key, or
+  // an equivalent binding), which this one shared key cannot be made to do
+  // no matter how the body is re-shaped — tracked as a precondition on
+  // #327 before recording is ever turned on anywhere.
   //
   // Body: { profile: string, events: [{ event_id, outcome, tool_name, occurred_at? }] }
   // (at most hermes-ingest.ts's MAX_BATCH_SIZE entries). A profile with no trip,

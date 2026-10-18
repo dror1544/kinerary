@@ -12,6 +12,7 @@ import { Readiness, CurrencyConverter } from "./readiness";
 import { GroupActivities, LostFound, ActivityRsvp, VenueFeedback } from "./group-utilities";
 import { Account, GoogleSignIn, Enrollment } from "./account";
 import { PlanTools } from "./plan-tools";
+import { lodgingName, tonightLodging } from "./stops";
 import { AssistantConnect } from "./assistant-connect";
 import { Trivia } from "./trivia";
 import { heroCandidates, useHeroPhoto } from "./hero-photo";
@@ -635,6 +636,7 @@ export function UpcomingActivity({ item, config, lang, onOpenItinerary }: {
   const destination = text(phase?.title, lang);
   const mapUrl = safeExternalUrl(item.location_url) || safeExternalUrl(item.booking?.location_url)
     || `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent([title, destination].filter(Boolean).join(", "))}`;
+  const wazeUrl = safeExternalUrl(item.waze_url) || safeExternalUrl(item.booking?.place?.waze_url);
   const confirmationUrl = safeFileUrl("/api/bookings/confirmation", item.booking?.conf_file);
   return <article className="timeline-item compact upcoming-activity">
     <div className="time-rail"><span>{itineraryTimeLabel(item.time, lang)}</span><i /></div>
@@ -644,6 +646,7 @@ export function UpcomingActivity({ item, config, lang, onOpenItinerary }: {
       <small className="upcoming-plan-hint">{copy(lang, "View in plan", "פתיחה בתוכנית")}</small>
       <div className="item-actions upcoming-actions">
         <a className="item-action" href={mapUrl} target="_blank" rel="noreferrer"><MapPin size={15} />Google Maps</a>
+        {wazeUrl && <a className="item-action" href={wazeUrl} target="_blank" rel="noreferrer"><Navigation size={15} />Waze</a>}
         {confirmationUrl && <AuthenticatedDocumentAction url={confirmationUrl} filename={item.booking!.conf_file!} label={<><ShieldCheck size={15} />{copy(lang, "View confirmation", "צפייה באישור")}</>} />}
       </div>
     </div>
@@ -803,6 +806,13 @@ export function JourneyView({
     venueId: venueForItem(item, config)?.id,
   }])), [config, itinerary]);
   const day = days.find((entry) => entry.date === activeDate && (!activePhase?.id || entry.phase_id === activePhase.id));
+  // From the stop that covers tonight in the effective config (refetched on
+  // every stop change), not only the copy stored on the day row at import.
+  const tonightPlace = tonightLodging(config?.phases, day, activePhase?.id, activeDate);
+  const tonight = lodgingName(tonightPlace, lang);
+  // The same links the hotel has on every other screen (server/hotel-place.js).
+  const tonightMapUrl = safeExternalUrl(tonightPlace?.location_url);
+  const tonightWazeUrl = safeExternalUrl(tonightPlace?.waze_url);
   const daySpineRef = useRef<HTMLElement>(null);
   const handledFocus = useRef<JourneyFocus | null>(null);
   const initializedForTripDate = useRef(false);
@@ -938,7 +948,9 @@ export function JourneyView({
       text_en: item.text_en || "",
       time: item.time || "",
       item_type: item.item_type || "activity",
-      location_url: item.location_url || "",
+      // A hotel's link resolved at serve time was never typed by anyone: saving
+      // the item must not turn it into a stored one.
+      location_url: item.location_derived ? "" : item.location_url || "",
     });
     setTimeMode(roughTimes.includes(item.time as (typeof roughTimes)[number]) ? "rough" : item.time ? "exact" : "none");
     setEditing(item);
@@ -983,7 +995,10 @@ export function JourneyView({
             {isOrganizer && <a className="journey-settings" href="#plan-tools" aria-label={copy(lang, "Plan settings", "הגדרות מסלול")}><Settings size={20} aria-hidden="true" /></a>}
           </div>
           <h2>{(lang === "he" ? day?.label_he || day?.label_en : day?.label_en || day?.label_he) || copy(lang,"Daily itinerary","מסלול יומי")}</h2>
-          {day?.lodging_context?.name ? <p>{copy(lang,"Tonight:","הלילה:")} {text(day.lodging_context.name, lang)}</p> : null}
+          {tonight ? <p className="tonight-lodging">{copy(lang,"Tonight:","הלילה:")} {tonight}
+            {tonightMapUrl ? <> · <a href={tonightMapUrl} target="_blank" rel="noreferrer">{copy(lang, "Map", "מפה")}</a></> : null}
+            {tonightWazeUrl ? <> · <a href={tonightWazeUrl} target="_blank" rel="noreferrer">Waze</a></> : null}
+          </p> : null}
           {isOrganizer ? <button className="secondary-action journey-edit-trigger" type="button" onClick={beginNew}><Plus size={17} /> {copy(lang, "Add itinerary item", "הוספת פריט למסלול")}</button> : null}
           <label className="mobile-day-picker">
             <span>{copy(lang, "Day", "יום")}</span>
@@ -1193,12 +1208,26 @@ function bookingState(booking: Booking) {
   return "needs-review";
 }
 
+// The installed (home-screen) app: both the iOS flag and the standard media
+// query, as Classic's isStandaloneAppMode does. The manifest is shared, so
+// Modern installs as a standalone app too.
+function isStandaloneAppMode() {
+  return (window.navigator as Navigator & { standalone?: boolean }).standalone === true
+    || (typeof window.matchMedia === "function" && window.matchMedia("(display-mode: standalone)").matches);
+}
+
 function AuthenticatedDocumentAction({ url, filename, download, label }: { url: string; filename: string; download?: boolean; label: React.ReactNode }) {
   const [error, setError] = useState("");
+  // Fetch first, then open a tab with the blob URL already in hand. Opening a
+  // blank tab before the fetch and filling it in afterwards left that tab blank
+  // — the bug Classic's openAuthedBlob (site/app.js) already fixed. A slow
+  // fetch can outlast the click's activation, after which window.open is
+  // silently blocked (and with "noopener" it returns null either way, so its
+  // result says nothing), so when activation cannot be confirmed — or in the
+  // installed app, where a second window is unwanted — the document opens in
+  // this tab instead.
   const open = async () => {
     setError("");
-    const documentWindow = download ? null : window.open("", "_blank");
-    if (documentWindow) documentWindow.opener = null;
     try {
       const blob = await getAuthenticatedDocument(url);
       const objectUrl = URL.createObjectURL(blob);
@@ -1206,15 +1235,16 @@ function AuthenticatedDocumentAction({ url, filename, download, label }: { url: 
         const link = document.createElement("a");
         link.href = objectUrl;
         link.download = filename;
+        document.body.appendChild(link);
         link.click();
-      } else if (documentWindow) {
-        documentWindow.location.replace(objectUrl);
+        link.remove();
+      } else if (!isStandaloneAppMode() && (navigator.userActivation?.isActive ?? false)) {
+        window.open(objectUrl, "_blank", "noopener");
       } else {
         window.location.assign(objectUrl);
       }
       window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
     } catch (reason) {
-      documentWindow?.close();
       setError(reason instanceof Error ? reason.message : "Could not retrieve document");
     }
   };
@@ -1224,7 +1254,8 @@ function AuthenticatedDocumentAction({ url, filename, download, label }: { url: 
 function BookingActions({ booking, lang }: { booking: Booking; lang: Lang }) {
   const confirmationUrl = safeFileUrl("/api/bookings/confirmation", booking.conf_file);
   const appleWalletUrl = safeFileUrl("/api/bookings/wallet-apple", booking.pkpass_file);
-  const locationUrl = safeExternalUrl(booking.location_url);
+  const locationUrl = safeExternalUrl(booking.location_url) || safeExternalUrl(booking.place?.maps_url);
+  const wazeUrl = safeExternalUrl(booking.place?.waze_url);
   const googleWalletUrl = safeExternalUrl(booking.google_wallet_url);
   const walletUrl = safeExternalUrl(booking.apple_wallet_url) || appleWalletUrl;
   return (
@@ -1232,6 +1263,7 @@ function BookingActions({ booking, lang }: { booking: Booking; lang: Lang }) {
       {confirmationUrl ? <AuthenticatedDocumentAction url={confirmationUrl} filename={booking.conf_file || "confirmation.pdf"} label={<><ShieldCheck size={15} /> {copy(lang,"Confirmation","אישור")}</>} /> : null}
       {confirmationUrl ? <AuthenticatedDocumentAction url={confirmationUrl} filename={booking.conf_file || "confirmation.pdf"} download label={<><Download size={15} /> {copy(lang,"Download","הורדה")}</>} /> : null}
       {locationUrl ? <a href={locationUrl} target="_blank" rel="noreferrer"><MapPin size={15} /> Google Maps</a> : null}
+      {wazeUrl ? <a href={wazeUrl} target="_blank" rel="noreferrer"><Navigation size={15} /> Waze</a> : null}
       {googleWalletUrl ? <a href={googleWalletUrl} target="_blank" rel="noreferrer"><TicketCheck size={15} /> Google Wallet</a> : null}
       {walletUrl ? (booking.pkpass_file ? <AuthenticatedDocumentAction url={appleWalletUrl} filename={booking.pkpass_file} download label={<><TicketCheck size={15} /> Apple Wallet</>} /> : <a href={walletUrl} target="_blank" rel="noreferrer"><TicketCheck size={15} /> Apple Wallet</a>) : null}
     </div>
@@ -1629,8 +1661,11 @@ export function mapPins(config: TripConfig | undefined, items: ItineraryItem[] |
   const configuredPhaseIds = new Set((config?.phases || []).map((phase) => phase.id));
   const orderedPins = (config?.phases || []).flatMap((phase) => {
     const phasePins: MapPin[] = [];
-    const lat = phase.mapStop?.lat;
-    const lng = phase.mapStop?.lng;
+    // The hotel's own coordinates (from its map link) come first; the stop's
+    // town pin is only the fallback. Never a coordinate nobody supplied.
+    const hotelCoordinates = coordinatesFromLocationUrl(phase.accommodation?.location_url);
+    const lat = hotelCoordinates?.lat ?? phase.mapStop?.lat;
+    const lng = hotelCoordinates?.lng ?? phase.mapStop?.lng;
     const phaseDate = phase.start || dailyMapStops(items).find((item) => item.phase_id === phase.id)?.date;
     if (validCoordinates(lat ?? Number.NaN, lng ?? Number.NaN)) {
       const accommodation = text(phase.accommodation?.name, lang) || phase.accommodation?.name_en || text(phase.mapStop?.name, lang) || text(phase.title, lang) || phase.id;
@@ -1848,8 +1883,12 @@ export function InteractiveMap({
   );
 }
 
-function MapView({ config, itinerary, lang, onOpenItinerary }: { config?: TripConfig; itinerary?: ActiveItinerary; lang: Lang; onOpenItinerary: (pin: MapPin) => void }) {
-  const phaseStops = (config?.phases || []).filter((phase) => typeof phase.mapStop?.lat === "number" && typeof phase.mapStop?.lng === "number");
+export function MapView({ config, itinerary, lang, onOpenItinerary }: { config?: TripConfig; itinerary?: ActiveItinerary; lang: Lang; onOpenItinerary: (pin: MapPin) => void }) {
+  // A stop belongs here when it has a map pin OR a named hotel: a hotel the
+  // companion added has links (server/hotel-place.js) even where the stop has no
+  // coordinates, and used to get no card at all.
+  const phaseStops = (config?.phases || []).filter((phase) => (typeof phase.mapStop?.lat === "number" && typeof phase.mapStop?.lng === "number")
+    || Boolean(text(phase.accommodation?.name, "en") || phase.accommodation?.name_en));
   const dailyStops = dailyMapStops(itinerary?.items);
   const pins = useMemo(() => mapPins(config, itinerary?.items, lang), [config, itinerary?.items, lang]);
   const mapPanelRef = useRef<HTMLElement>(null);
@@ -1878,10 +1917,21 @@ function MapView({ config, itinerary, lang, onOpenItinerary }: { config?: TripCo
       ) : <p className="empty-state">{lang === "he" ? "נוסיף מפה ברגע שיהיו קואורדינטות לתחנות הטיול." : "A map will appear once the trip has confirmed stop coordinates."}</p>}
       <div className="module-grid">
         {phaseStops.map((phase) => {
-          const ll = `${phase.mapStop?.lat},${phase.mapStop?.lng}`;
           const accommodationName = text(phase.accommodation?.name, lang) || phase.accommodation?.name_en || text(phase.mapStop?.name, lang) || text(phase.title, lang) || phase.id;
-          const destination = phase.accommodation?.location_url || `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(phase.accommodation?.address || ll)}`;
-          const wazeDestination = `https://waze.com/ul?ll=${encodeURIComponent(ll)}&navigate=yes`;
+          // The server resolves the hotel's links (server/hotel-place.js), so
+          // this card, Today, Journey and the booking all open the same place.
+          // The fallbacks are for a hotel the config file itself carries.
+          const hotelCoordinates = coordinatesFromLocationUrl(phase.accommodation?.location_url);
+          const stopLat = hotelCoordinates?.lat ?? phase.mapStop?.lat;
+          const stopLng = hotelCoordinates?.lng ?? phase.mapStop?.lng;
+          const hasCoordinates = validCoordinates(stopLat ?? Number.NaN, stopLng ?? Number.NaN);
+          const ll = hasCoordinates ? `${stopLat},${stopLng}` : "";
+          const hotelLabel = phase.accommodation?.name_en || text(phase.accommodation?.name, "en");
+          const searchText = phase.accommodation?.address || [hotelLabel, text(phase.title, "en")].filter(Boolean).join(", ") || ll || accommodationName;
+          const destination = safeExternalUrl(phase.accommodation?.location_url) || `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(searchText)}`;
+          const wazeDestination = safeExternalUrl(phase.accommodation?.waze) || (hasCoordinates
+            ? `https://waze.com/ul?ll=${encodeURIComponent(ll)}&navigate=yes`
+            : `https://waze.com/ul?q=${encodeURIComponent(searchText)}&navigate=yes`);
           return (
             <article className="map-anchor" key={phase.id}>
               <span className="booking-type">{lang === "he" ? "שלב" : "Phase"}</span>
@@ -2628,7 +2678,7 @@ export default function App() {
     activities: <GroupActivities config={config.data} currentUser={me.data} lang={lang}/>,
     lostfound: <LostFound lang={lang}/>,
     trivia: <Trivia config={config.data} currentUser={me.data} lang={lang}/>,
-    "plan-tools": me.data?.is_organizer ? <PlanTools config={config.data} itinerary={itinerary.data} lang={lang}/> : <p>{copy(lang,"Organizer access required.","נדרשת הרשאת מארגן.")}</p>,
+    "plan-tools": me.data?.is_organizer ? <PlanTools isOrganizer config={config.data} itinerary={itinerary.data} lang={lang}/> : <p>{copy(lang,"Organizer access required.","נדרשת הרשאת מארגן.")}</p>,
   }[activeModule] : null;
   const content = moduleContent || tabContent;
 

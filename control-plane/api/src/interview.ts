@@ -447,6 +447,78 @@ function phaseDatesProblem(data: unknown): string | null {
   return null;
 }
 
+/**
+ * The stops whose place is written only in a non-Latin script and carry no
+ * `name_en` — by the name the organizer wrote them.
+ *
+ * Every stop of a non-English interview is supposed to carry the place's common
+ * English name: the site's English side, the trip's slug and title and the
+ * enrichment lookups all read it, and a Hebrew-only stop gives them nothing.
+ * The star e2e (2026-10-15) lost it in 2 of 3 Hebrew runs, the model leaving
+ * `name_en` out of a stop where the third run wrote the English name.
+ *
+ * Reported, never rejected: refusing the answer would drop every stop and re-ask
+ * the organizer for something they already said, to repair a field that is the
+ * reader's job and not theirs. See the log at confirmation, and the transformer,
+ * which names the trip from the stop's own words when this field is missing.
+ *
+ * A name in Latin script needs no second one; `name_en` only matters where the
+ * first name is not English-readable. Anything that is not a stop list reports
+ * nothing.
+ */
+export function stopsMissingEnglishName(data: unknown): string[] {
+  if (!Array.isArray(data)) return [];
+  const missing: string[] = [];
+  for (const stop of data) {
+    if (!stop || typeof stop !== "object") continue;
+    const s = stop as Record<string, unknown>;
+    if (typeof s.name !== "string") continue;
+    const name = s.name.trim();
+    if (!/\p{L}/u.test(name) || /\p{Script=Latin}/u.test(name)) continue;
+    if (typeof s.name_en === "string" && s.name_en.trim() !== "") continue;
+    missing.push(name);
+  }
+  return missing;
+}
+
+/**
+ * How many travellers lack a name in the interview's language, and how many lack
+ * the Latin form — counted, never named.
+ *
+ * Every traveller carries `name` in the interview's own language and script and
+ * `name_en` in Latin letters (the owner's manual test, 2026-10-15: four
+ * travellers confirmed in two scripts, two of them with no `name_en`). The site's
+ * roster, the intro's login list and the login names read these fields, and a
+ * Hebrew-only traveller gave the login nothing Latin to be made from.
+ *
+ * Reported, never rejected, for the reason `stopsMissingEnglishName` gives: a
+ * rejection would drop the whole roster and re-ask the organizer for names they
+ * already said, to repair a field that is the interviewer's job. An English
+ * interview has no second name to owe — a Latin `name` is its own Latin form.
+ * A language whose script is not known here is only checked for the Latin form.
+ * Anything that is not a roster counts nothing.
+ */
+export function travelersMissingNames(
+  data: unknown,
+  language: string,
+): { missingInterviewLanguageName: number; missingEnglishName: number } {
+  const gap = { missingInterviewLanguageName: 0, missingEnglishName: 0 };
+  if (!Array.isArray(data) || language === "en") return gap;
+  const script = INTERVIEW_NAME_SCRIPT[language];
+  for (const person of data) {
+    if (!person || typeof person !== "object") continue;
+    const p = person as Record<string, unknown>;
+    if (typeof p.name !== "string" || !/\p{L}/u.test(p.name)) continue;
+    if (script && !script.test(p.name)) gap.missingInterviewLanguageName += 1;
+    const latin = typeof p.name_en === "string" && /\p{Script=Latin}/u.test(p.name_en);
+    if (!latin) gap.missingEnglishName += 1;
+  }
+  return gap;
+}
+
+/** The letters a name must contain to be written in an interview's language. */
+const INTERVIEW_NAME_SCRIPT: Record<string, RegExp> = { he: /\p{Script=Hebrew}/u };
+
 function anchorDatesProblem(data: unknown): string | null {
   if (!Array.isArray(data)) return null;
   for (const [i, anchor] of data.entries()) {
@@ -616,7 +688,14 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     // spelling the organizer can glance at and correct costs them one word
     // ("Sagi, not Sagie") instead of a whole list. Answers overwrite, so a
     // correction arriving later is a plain re-submit of this question.
-    prompt: "Who's coming? List each person's name, age, and family/household group. If the names aren't in Latin script, transliterate them YOURSELF and submit that as each person's English spelling — then show the organizer the spellings you chose so they can correct any you got wrong. Never ask them to write the names out a second time.",
+    //
+    // BOTH NAMES, ALWAYS (owner's manual test, 2026-10-15). `name` is in the
+    // language and script of the interview, `name_en` is the Latin form: a
+    // ticket's exact spelling when a document printed one, a transliteration
+    // otherwise. A Hebrew interview confirmed two travellers in English letters
+    // (off the tickets) and two in Hebrew with no name_en — a roster in two
+    // scripts and two site logins with no Latin form to be derived from.
+    prompt: "Who's coming? List each person's name, age, and family/household group. Every person gets two names: \"name\" in the language of this interview, in its own script (a name given in Latin letters is rewritten in that script — a transliteration, never a translation), and \"name_en\" in Latin letters — copied exactly as printed when a document spelled it (a ticket's spelling is the passport's), otherwise transliterated YOURSELF. Show the organizer the spellings you chose so they can correct any you got wrong, and never ask them to write the names out a second time.",
     dataShape: "array",
     dataExample: "[{\"name\": \"נועה ברק\", \"name_en\": \"Noa Barak\", \"age\": 12, \"family\": \"Barak\"}]",
     required: true,
@@ -643,7 +722,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     // and its own schema. `_derive_phases` still reads `days` off this answer —
     // that is how the folded result gets in — it is simply not this call's job
     // to produce them.
-    prompt: "Where are you going, and when? List each stop: a short place name (city or region — e.g. \"Dallas\", not \"Dallas (boys; Mavericks game September 6)\"), date range, and accommodation (with confirmation number) if already booked. Keep any extra context — who's on this leg, an event, a plan detail — out of the name; it's fine to just not record it structurally.",
+    prompt: "Where are you going, and when? List each stop: a short place name (city or region — e.g. \"Dallas\", not \"Dallas (boys; Mavericks game September 6)\") as the organizer wrote it, its common English name as name_en (every stop has one, whatever language the interview is in — when the name is not in Latin script, write the English name yourself), date range, and accommodation (with confirmation number) if already booked. Keep any extra context — who's on this leg, an event, a plan detail — out of the name; it's fine to just not record it structurally.",
     dataShape: "array",
     // `planned` holds places the trip means to visit on this leg but has NOT
     // booked. The distinction from `travel_anchors` is EVIDENCE OF BOOKING —
@@ -688,7 +767,12 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     // a value is a value a model can copy. The transformer reads any type
     // (`_read_anchor`); hotel, car and proposal stay out of the day plan, and
     // an optional HH:MM `time` puts a booked visit at its hour.
-    dataExample: "[{\"type\": \"attraction\", \"name\": \"Sky Lagoon\", \"date\": \"2027-03-05\", \"time\": \"15:00\", \"confirmation\": \"SL-58213\"}]",
+    //
+    // A flight carries its ROUTE in `name`, and a car its pick-up place (star
+    // e2e, 2026-10-14: "LY8801" alone left the gateway city off the site). The
+    // route is in the name, not in new fields, because the transformer already
+    // shows a name and no validator or site shape has to learn a key.
+    dataExample: "[{\"type\": \"attraction\", \"name\": \"Sky Lagoon\", \"date\": \"2027-03-05\", \"time\": \"15:00\", \"confirmation\": \"SL-58213\"}, {\"type\": \"flight\", \"name\": \"FI305 Oslo → Reykjavik\", \"date\": \"2027-03-04\", \"time\": \"09:30\"}, {\"type\": \"car\", \"name\": \"Rental car pick-up Keflavik airport\", \"date\": \"2027-03-04\"}]",
     required: false,
     // A flight number is not a confirmation, and that is a rule, not a
     // judgement — see withoutFlightNumbersAsConfirmations (#131).
@@ -1009,6 +1093,87 @@ export function isFlightDesignator(value: string): boolean {
   // characters is always a letter. Without it `12345` read as a designator.
   return /^(?=.{0,1}[A-Z])[A-Z0-9]{2}\d{1,4}[A-Z]?$/.test(cleaned)
     || /^[A-Z]{3}\d{1,4}[A-Z]?$/.test(cleaned);
+}
+
+// ── A flight the organizer typed is never lost because the model did not file it ──
+//
+// Live, star e2e, 2026-10-15 (2 runs of 6): the organizer typed both flights
+// inside the answer to the stops question. The reader sometimes proposed the
+// stops only; `travel_anchors` is optional, so nothing ever asked for it, the
+// organizer confirmed, and both flights were nowhere in the config. Whether a
+// typed flight reaches `travel_anchors` was a model judgement, and this is the
+// deterministic floor under it: a designator found in what the organizer TYPED
+// that no `travel_anchors` entry carries is asked about, once, before the
+// summary. The detector never files anything — the organizer's answer does.
+
+/**
+ * Flight designators in text the organizer typed, normalised ("LY8801"), in
+ * order of first appearance.
+ *
+ * DELIBERATELY NARROWER than `isFlightDesignator`, which judges a field that is
+ * already known to be a booking reference. Free text is full of things that
+ * wear the same shape — "USD 1500", "DEC 15", "B737", "MP3", "NY 2027" — and a
+ * wrong hit costs the organizer a question, so:
+ *  - capital letters only, with the code and the number glued or joined by a
+ *    hyphen ("LY8801", "LY-8801"); a space is not accepted, because it is what
+ *    makes a currency and a month read as a flight;
+ *  - at least two digits, and three when the airline code itself carries a
+ *    digit ("U2", "9W") — "A320" and "B737" are aircraft, not services;
+ *  - not part of a longer word or number.
+ * What this misses is left to the reader, as it always was. A single-digit
+ * flight number ("LY1") is one of those.
+ */
+export function flightDesignatorsIn(text: string): string[] {
+  const found: string[] = [];
+  const pattern = /(?<![A-Za-z0-9])([A-Z]{2,3}|[A-Z][0-9]|[0-9][A-Z])-?([0-9]{1,4})(?![A-Za-z0-9])/g;
+  for (const match of text.matchAll(pattern)) {
+    const code = match[1]!;
+    const digits = match[2]!;
+    const needed = /[0-9]/.test(code) ? 3 : 2;
+    if (digits.length < needed) continue;
+    const designator = `${code}${digits}`;
+    if (!isFlightDesignator(designator)) continue;
+    if (!found.includes(designator)) found.push(designator);
+  }
+  return found;
+}
+
+/** Is this designator named anywhere in the organizer's bookings? Any spelling, any case. */
+function designatorInAnchors(designator: string, answers: AnswerStore): boolean {
+  const answer = answers.travel_anchors;
+  if (!answer || answer.kind !== "structured") return false;
+  const haystack = JSON.stringify(answer.data ?? null).toUpperCase();
+  const spelled = designator.split("").join("[\\s\\-_.]?");
+  return new RegExp(`(?<![A-Z0-9])${spelled}(?![0-9])`).test(haystack);
+}
+
+/**
+ * The flights the organizer typed that the bookings do not carry and that have
+ * not been asked about yet. Empty is the normal state. "Asked" is once and for
+ * good: an organizer who answers that they are not booked is believed, and the
+ * interview never goes round again.
+ */
+export function flightsOwed(answers: AnswerStore, ui: InterviewUiState): string[] {
+  const asked = new Set(ui.flightsAsked ?? []);
+  return (ui.typedFlights ?? []).filter((d) => !asked.has(d) && !designatorInAnchors(d, answers));
+}
+
+/** Words for "you mentioned these flights — say them again as bookings", one or several. */
+const FLIGHTS_OWED_PHRASES: Readonly<Record<Language, { one: string; many: string }>> = {
+  en: {
+    one: "You mentioned flight {flights}. So that I don't lose it, tell me about it again with its date and route (and a confirmation number, if you have one) — or tell me it isn't booked yet.",
+    many: "You mentioned the flights {flights}. So that I don't lose them, tell me about each one again with its date and route (and a confirmation number, if you have one) — or tell me they aren't booked yet.",
+  },
+  he: {
+    one: "הזכרתם את הטיסה {flights}. כדי שלא אפספס אותה, כתבו לי עליה שוב עם התאריך והמסלול (ומספר אישור, אם יש) — או כתבו שעוד לא הזמנתם.",
+    many: "הזכרתם את הטיסות {flights}. כדי שלא אפספס אותן, כתבו לי על כל אחת מהן שוב עם התאריך והמסלול (ומספר אישור, אם יש) — או כתבו שעוד לא הזמנתם.",
+  },
+};
+
+/** The line that leads the bookings question when typed flights are owed. */
+export function flightsOwedLead(designators: readonly string[], language: Language): string {
+  const phrases = FLIGHTS_OWED_PHRASES[language] ?? FLIGHTS_OWED_PHRASES[DEFAULT_LANGUAGE];
+  return (designators.length === 1 ? phrases.one : phrases.many).replace("{flights}", designators.join(", "));
 }
 
 /**
@@ -1469,7 +1634,16 @@ function describeStructured(data: unknown): string {
     }
     const record = item as Record<string, unknown>;
     const named = NAME_KEYS.map((k) => record[k]).find((v) => typeof v === "string" && v.trim() !== "");
-    if (typeof named === "string") return named.trim();
+    if (typeof named === "string") {
+      // A stop shows where they sleep. The summary is what an immutable version
+      // is approved from, and a hotel added there (2026-10-15) was invisible on
+      // it: the organizer could not tell whether it had landed.
+      const stay = record.accommodation;
+      const hotel = stay && typeof stay === "object" && !Array.isArray(stay)
+        ? (stay as Record<string, unknown>).name
+        : undefined;
+      return typeof hotel === "string" && hotel.trim() !== "" ? `${named.trim()} (${hotel.trim()})` : named.trim();
+    }
     // No conventional name: show the first short scalar rather than nothing.
     const scalar = Object.values(record).find(
       (v) => (typeof v === "string" && v.trim() !== "" && v.length <= 60) || typeof v === "number",
@@ -1584,6 +1758,12 @@ export interface SessionView {
   /** True once the "essentials done" choice has been put to the organizer. */
   offeredMore: boolean;
   /**
+   * Flights the organizer typed that the bookings do not carry and that have not
+   * been asked about — see `flightsOwed`. The router asks the bookings question
+   * about them before the interview can reach its summary. Absent or empty: none.
+   */
+  flightsOwed?: string[];
+  /**
    * Where the interview is, as a phase it entered rather than a value
    * recomputed from the answers. The source of truth; `state` is its
    * projection into the older three-value vocabulary.
@@ -1684,6 +1864,14 @@ function currentSelections(answers: AnswerStore): Record<string, string[]> {
  */
 export interface InterviewUiState {
   finishRequested?: boolean;
+  /**
+   * Flight designators found in what the organizer TYPED, normalised ("LY8801").
+   * Written by the interpret path as a message arrives, before the reader has a
+   * say, so a flight the reader did not file is still known — see `flightsOwed`.
+   */
+  typedFlights?: string[];
+  /** The typed flights the organizer has been asked about. Once is enough. */
+  flightsAsked?: string[];
   skipped?: string[];
   /**
    * Required questions that were asked and not answered, stepped aside so the
@@ -1851,8 +2039,14 @@ function parseUiState(raw: unknown): InterviewUiState {
   const deferred = Array.isArray(record.deferred)
     ? record.deferred.filter((id): id is string => typeof id === "string")
     : undefined;
+  const designators = (value: unknown): string[] =>
+    Array.isArray(value) ? value.filter((d): d is string => typeof d === "string" && /^[A-Z0-9]{4,8}$/.test(d)) : [];
+  const typedFlights = designators(record.typed_flights);
+  const flightsAsked = designators(record.flights_asked);
   return {
     ...(record.finish_requested === true ? { finishRequested: true } : {}),
+    ...(typedFlights.length > 0 ? { typedFlights } : {}),
+    ...(flightsAsked.length > 0 ? { flightsAsked } : {}),
     ...(skipped && skipped.length > 0 ? { skipped } : {}),
     ...(deferred && deferred.length > 0 ? { deferred } : {}),
     ...(typeof record.pending_ask === "string" ? { pendingAsk: record.pending_ask } : {}),
@@ -1872,6 +2066,8 @@ function parseUiState(raw: unknown): InterviewUiState {
 function serializeUiState(ui: InterviewUiState): string {
   return JSON.stringify({
     ...(ui.finishRequested ? { finish_requested: true } : {}),
+    ...(ui.typedFlights && ui.typedFlights.length > 0 ? { typed_flights: ui.typedFlights } : {}),
+    ...(ui.flightsAsked && ui.flightsAsked.length > 0 ? { flights_asked: ui.flightsAsked } : {}),
     ...(ui.skipped && ui.skipped.length > 0 ? { skipped: ui.skipped } : {}),
     ...(ui.deferred && ui.deferred.length > 0 ? { deferred: ui.deferred } : {}),
     ...(ui.pendingAsk ? { pending_ask: ui.pendingAsk } : {}),
@@ -1965,6 +2161,161 @@ export async function deferQuestionForChat(
  */
 export async function undeferAllForChat(db: pg.Pool, chatId: string): Promise<void> {
   await updateUiStateForChat(db, chatId, (ui) => ({ ...ui, deferred: [] }));
+}
+
+// ── Asking a required question again: what is still missing ─────────────────
+//
+// Live, in Hebrew, 2026-10-10: the organizer answered the stops question with
+// "we sleep in X and day-trip to the villages, no plan yet", the reader said
+// `unclear`, and the router sent the IDENTICAL question back, twice more. They
+// had followed the conversation and were told nothing about what was wrong.
+//
+// A re-ask leads with one of these lines, above the same question and its
+// buttons: it acknowledges the reply and names the piece still missing. The
+// table is CLOSED and the line is chosen by code — keyed by question id, with a
+// sub-gap where a question has more than one way to be incomplete (the router's
+// `reaskGap` picks it). The reader's own `why` is never shown: the model never
+// addresses the organizer (interpret.ts header), so it may only select a key.
+//
+// Two phrasings per gap, alternated by attempt, so a second miss reads
+// differently from the first and no two consecutive messages are the same.
+// Hebrew addresses the organizer in the plural, like the rest of the copy.
+// Accommodation is never named as missing: the stops question asks for it only
+// "if already booked", and demanding it would contradict the question.
+//
+// Every required question has its own entry (pinned by
+// interview-reask-gap.test.ts); `choice` covers a required choice question with
+// none, and `*` is the last resort that the test keeps from ever being reached
+// by a required question.
+
+/** The re-ask lines: gap key → language → [first phrasing, second phrasing]. */
+export const REASK_GAP_PHRASES: Readonly<Record<string, Readonly<Record<Language, readonly [string, string]>>>> = {
+  "phases.dates": {
+    en: [
+      "Thanks, that helps. What I'm still missing is the dates — roughly from when to when you'll be in each place. An estimate is fine.",
+      "Just the dates and this part is done — even rough ones, like \"the first week of August\", are enough.",
+    ],
+    he: [
+      "תודה, זה עוזר. מה שעוד חסר לי זה התאריכים — בערך מתי עד מתי תהיו בכל מקום. מספיק תאריך משוער.",
+      "רק התאריכים והחלק הזה מוכן — גם משהו משוער, כמו \"השבוע הראשון של אוגוסט\", מספיק.",
+    ],
+  },
+  "phases.places": {
+    en: [
+      "Thanks, that helps. What I'm still missing is where you'll be staying along the way — the town or area you'll be based in for each part of the trip, in order.",
+      "To lay the trip out I need the places you'll sleep — just the town or area for each part, in order. Day trips can wait.",
+    ],
+    he: [
+      "תודה, זה עוזר. מה שעוד חסר לי זה איפה תהיו לאורך הדרך — העיר או האזור שבו תהיו בכל חלק של הטיול, לפי הסדר.",
+      "כדי לסדר את מסלול הטיול אני צריך את המקומות שבהם תלונו — רק העיר או האזור לכל חלק, לפי הסדר. טיולי יום אפשר להשאיר לאחר כך.",
+    ],
+  },
+  phases: {
+    en: [
+      "Thanks, that helps. To set up the stops I still need two things: the places, in order, and roughly when you'll be in each one.",
+      "Nearly there with the stops — a place and rough dates for each part of the trip is all I need. You can add the hotel name later if you have not booked it yet.",
+    ],
+    he: [
+      "תודה, זה עוזר. כדי לסדר את התחנות חסרים לי עוד שני דברים: המקומות לפי הסדר, ובערך מתי תהיו בכל אחד מהם.",
+      "כמעט סיימנו עם התחנות — מקום ותאריכים משוערים לכל חלק של הטיול זה כל מה שצריך. את שם המלון אפשר להוסיף אחר כך, אם עוד לא הזמנתם.",
+    ],
+  },
+  destination: {
+    en: [
+      "Thanks. What I still need is where the trip is — a country, a region or a city is enough.",
+      "Just the destination for now — the country or the main city you're heading to.",
+    ],
+    he: [
+      "תודה. מה שעוד חסר לי זה לאן הטיול — מספיק מדינה, אזור או עיר.",
+      "רק היעד בינתיים — המדינה או העיר העיקרית שאליה אתם נוסעים.",
+    ],
+  },
+  departure_date: {
+    en: [
+      "Thanks. What I still need is the day the trip starts — a day and a month is enough.",
+      "Just the start date — for example \"12 August\".",
+    ],
+    he: [
+      "תודה. מה שעוד חסר לי זה היום שבו הטיול מתחיל — מספיק יום וחודש.",
+      "רק תאריך היציאה — למשל \"12 באוגוסט\".",
+    ],
+  },
+  return_date: {
+    en: [
+      "Thanks. What I still need is the day you head home — a day and a month is enough.",
+      "Just the return date — for example \"26 August\".",
+    ],
+    he: [
+      "תודה. מה שעוד חסר לי זה היום שבו אתם חוזרים הביתה — מספיק יום וחודש.",
+      "רק תאריך החזרה — למשל \"26 באוגוסט\".",
+    ],
+  },
+  travelers: {
+    en: [
+      "Thanks. What I still need is who's coming — a name for each person (ages help too).",
+      "Just the names of everyone travelling, and I'll take it from there.",
+    ],
+    he: [
+      "תודה. מה שעוד חסר לי זה מי נוסע — שם לכל אחד (גם גילים עוזרים).",
+      "רק השמות של כל מי שנוסע, ומשם אני ממשיך.",
+    ],
+  },
+  organizer_identity: {
+    en: [
+      "Thanks. What I still need is which of the travellers is talking to me.",
+      "Just tell me which name on the list is yours.",
+    ],
+    he: [
+      "תודה. מה שעוד חסר לי זה מי מבין הנוסעים מדבר איתי.",
+      "רק תגידו איזה שם ברשימה הוא שלכם.",
+    ],
+  },
+  bot_name: {
+    en: [
+      "Thanks. What I still need is a name for the trip assistant — the name the travellers would actually type.",
+      "Just a name for the assistant — anything short the travellers will use.",
+    ],
+    he: [
+      "תודה. מה שעוד חסר לי זה שם לעוזר של הטיול — השם שהנוסעים באמת יקלידו.",
+      "רק שם לעוזר — משהו קצר שהנוסעים ישתמשו בו.",
+    ],
+  },
+  choice: {
+    en: [
+      "Thanks. I still need you to pick one of the options below — tap it, or say it in your own words.",
+      "Just one of the options below and we'll move on — tapping it is quickest.",
+    ],
+    he: [
+      "תודה. עוד חסר לי שתבחרו אחת מהאפשרויות למטה — אפשר להקיש עליה או לכתוב במילים שלכם.",
+      "רק אחת מהאפשרויות למטה ונמשיך — הכי מהיר להקיש עליה.",
+    ],
+  },
+  "*": {
+    en: [
+      "Thanks. This one is still open, and I need it before we can finish:",
+      "One more go at this one — a short answer is fine:",
+    ],
+    he: [
+      "תודה. השאלה הזאת עוד פתוחה, ואני צריך אותה לפני שנסיים:",
+      "עוד ניסיון בשאלה הזאת — מספיקה תשובה קצרה:",
+    ],
+  },
+};
+
+/**
+ * The line that leads a re-ask: `gap` is a key of `REASK_GAP_PHRASES`
+ * ("phases.dates", "destination"), `attempt` counts from 1 and alternates the
+ * two phrasings. An unknown sub-gap falls back to its question's own entry, a
+ * choice question with no entry to `choice`, anything else to `*`.
+ */
+export function reaskLead(gap: string, attempt: number, language: Language): string {
+  const questionId = gap.split(".")[0]!;
+  const entry = REASK_GAP_PHRASES[gap]
+    ?? REASK_GAP_PHRASES[questionId]
+    ?? (INTAKE_QUESTIONS.find((q) => q.id === questionId)?.type === "choice" ? REASK_GAP_PHRASES.choice : undefined)
+    ?? REASK_GAP_PHRASES["*"]!;
+  const phrasings = entry[language] ?? entry[DEFAULT_LANGUAGE];
+  return phrasings[(Math.max(1, Math.floor(attempt)) - 1) % phrasings.length]!;
 }
 
 /** The optional question the interviewer nominated, if it is still askable. */
@@ -2107,7 +2458,14 @@ export function nextPhase(
 
   if (current === "essentials") return requiredDone ? "optional" : "essentials";
 
+  // TYPED FLIGHTS NOT YET ASKED ABOUT hold the interview open. Finishing, or
+  // running out of optional questions, would otherwise reach a summary that
+  // lacks a flight the organizer wrote — and a confirmed intake is immutable.
+  // Asking is what releases it (`flightsAsked`), so this cannot hold forever.
+  const flightsPending = flightsOwed(answers, ui).length > 0;
+
   if (current === "optional") {
+    if (flightsPending) return "optional";
     if (ui.finishRequested) return "recap";
     // Running out is the other way in. Confirmation is gated on the REQUIRED
     // set alone, so arriving here early skips nothing that matters.
@@ -2115,8 +2473,9 @@ export function nextPhase(
   }
 
   // recap: the organizer either confirms (handled by confirmIntake, which sets
-  // the phase directly) or reopens the questions with Keep planning.
-  return ui.finishRequested ? "recap" : "optional";
+  // the phase directly) or reopens the questions with Keep planning. A flight
+  // typed while the summary is up reopens them too, until it has been asked about.
+  return ui.finishRequested && !flightsPending ? "recap" : "optional";
 }
 
 /**
@@ -2149,6 +2508,8 @@ function deriveSessionState(
   const allRequired = questions.filter((q) => q.required);
   const allAnswered = allRequired.every((q) => isAnswered(q, answers));
   if (!allAnswered) return "interviewing";
+  // Same hold as `nextPhase`: the stored `state` must not run ahead of the phase.
+  if (flightsOwed(answers, ui).length > 0) return "interviewing";
   if (ui.finishRequested) return "awaiting_confirmation";
   return unansweredOptionalQuestions(answers, questions, ui).length === 0
     ? "awaiting_confirmation"
@@ -3009,6 +3370,7 @@ function buildSessionView(
     selections: currentSelections(answers),
     language,
     offeredMore: ui.offeredMore === true,
+    flightsOwed: flightsOwed(answers, ui),
     lastPrompt: ui.lastPrompt ?? null,
     phase,
     awaiting,
@@ -3675,6 +4037,42 @@ export async function recordLastPromptForChat(
   key: string,
 ): Promise<void> {
   await updateUiStateForChat(db, chatId, (ui) => ({ ...ui, lastPrompt: key }));
+}
+
+/**
+ * Notes the flight designators in a message the organizer typed, BEFORE the
+ * reader's proposals are applied, so a flight the reader leaves out is still
+ * known to the interview. Returns the designators this message carried.
+ *
+ * Records nothing about the trip — only that these were said. The phase is
+ * re-evaluated because a flight typed while the summary is up reopens the
+ * questions (`nextPhase`).
+ */
+export async function noteTypedFlightsForChat(
+  db: pg.Pool,
+  chatId: string,
+  text: string,
+): Promise<string[]> {
+  const found = flightDesignatorsIn(text);
+  if (found.length === 0) return [];
+  await updateUiStateForChat(db, chatId, (ui) => ({
+    ...ui,
+    typedFlights: [...new Set([...(ui.typedFlights ?? []), ...found])].slice(-40),
+  }));
+  await advancePhaseForChat(db, chatId);
+  return found;
+}
+
+/** Records that the organizer has been asked about these flights, so it is never asked twice. */
+export async function markFlightsAskedForChat(
+  db: pg.Pool,
+  chatId: string,
+  designators: readonly string[],
+): Promise<void> {
+  await updateUiStateForChat(db, chatId, (ui) => ({
+    ...ui,
+    flightsAsked: [...new Set([...(ui.flightsAsked ?? []), ...designators])].slice(-40),
+  }));
 }
 
 /** Records that the "essentials done" choice has been shown, so it is shown once. */
@@ -4357,6 +4755,38 @@ async function confirmIntakeVia(
       intake_version_id: versionId,
       version: nextVersion,
     }));
+
+    // LOUD, NOT BLOCKING. A stop in non-Latin script with no English name gives
+    // the site no English side and the trip no English slug or title, and
+    // nothing else would ever say so (star e2e, 2026-10-15). A count only: the
+    // names are the organizer's, and the count is what tells an operator to look.
+    const phasesAnswer = session.answers.phases;
+    const unnamed = phasesAnswer?.kind === "structured" ? stopsMissingEnglishName(phasesAnswer.data) : [];
+    if (unnamed.length > 0) {
+      log(structuredLog("warn", "interview.stop_without_english_name", {
+        session_id: session.id,
+        trip_id: session.trip_id,
+        intake_version_id: versionId,
+        stops_missing_name_en: unnamed.length,
+      }));
+    }
+
+    // The same, for travellers: `name` in the interview's language, `name_en` in
+    // Latin letters (owner's manual test, 2026-10-15). Counts only — these are
+    // people's names.
+    const travelersAnswer = session.answers.travelers;
+    const nameGap = travelersAnswer?.kind === "structured"
+      ? travelersMissingNames(travelersAnswer.data, coerceLanguage(session.language) ?? DEFAULT_LANGUAGE)
+      : { missingInterviewLanguageName: 0, missingEnglishName: 0 };
+    if (nameGap.missingInterviewLanguageName > 0 || nameGap.missingEnglishName > 0) {
+      log(structuredLog("warn", "interview.traveler_without_name_form", {
+        session_id: session.id,
+        trip_id: session.trip_id,
+        intake_version_id: versionId,
+        travelers_missing_interview_language_name: nameGap.missingInterviewLanguageName,
+        travelers_missing_name_en: nameGap.missingEnglishName,
+      }));
+    }
 
     return { ok: true, sessionId: session.id, intakeVersionId: versionId, digest: intakeDigest, versionNumber: nextVersion };
   } catch (error) {

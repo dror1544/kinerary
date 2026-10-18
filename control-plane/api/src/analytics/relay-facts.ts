@@ -22,9 +22,37 @@ import {
   type ChannelType,
   type LengthBucket,
   type MediaKindClass,
+  type JudgeFallbackReason,
   type RequesterRole,
   type TriggerType,
 } from "./contract.js";
+
+/**
+ * What the group judge decided about this message (relay/group-judge.ts), as
+ * metadata: the outcome, how long it took, which model, how sure it was. No
+ * text. Present only on a message the judge was actually asked about.
+ */
+export interface JudgeFacts {
+  outcome: "judge_yes" | "judge_no" | "judge_fallback";
+  latencyMs: number;
+  /** The configured model id, or null when the runner would not say. */
+  model: string | null;
+  /** 0..100, for yes and no. */
+  confidencePct?: number;
+  /** A yes the model gave with less confidence than the threshold - recorded as judge_no. */
+  belowThreshold?: boolean;
+  fallbackReason?: JudgeFallbackReason;
+}
+
+/**
+ * An organizer changed a group's proactive level (`/proactive N`). Counts only:
+ * the trip, the new level and which way it moved - no chat, no person.
+ */
+export interface LevelChangeFacts {
+  tripId: string;
+  level: 1 | 2 | 3;
+  direction: "raised" | "lowered";
+}
 
 /** The analytics descriptor a decision carries when assistant events are on. */
 export interface InboundFacts {
@@ -40,6 +68,18 @@ export interface InboundFacts {
   attachmentsJoined?: number;
   /** Documents the turn carries to its handler, joined ones included. */
   documents?: number;
+  /** The judge's decision about this message, when it was asked. */
+  judge?: JudgeFacts;
+  /**
+   * IN MEMORY ONLY, never a field of any event: which chat and which sender this
+   * message was, so the emitter can notice that the same sender's next message,
+   * a moment after a judge_no, did address the assistant by name (the judge's
+   * "missed" proxy). They live in the emitter's bounded maps exactly as the
+   * chat key of a reply does, and `enqueue` builds every event field by field,
+   * so nothing here can reach a row.
+   */
+  chatKey?: string;
+  senderKey?: string;
 }
 
 export interface TriggerInput {
@@ -47,6 +87,10 @@ export interface TriggerInput {
   addressed: boolean;
   /** The one-shot reply window claimed this message (migration 0053). */
   capturedAsReply: boolean;
+  /** The sender is the assistant's current conversation partner in this group, inside the window. */
+  capturedByConversation?: boolean;
+  /** The group judge said yes to a message every rule above had refused. */
+  capturedByJudge?: boolean;
   /** The MAPPED wire type the gate itself saw (`dm`, `group`, …). */
   chatType: string | undefined;
   text: string;
@@ -67,6 +111,12 @@ export function classifyTrigger(input: TriggerInput): TriggerType {
   if (input.isReplyToAssistant) return "reply_to_bot";
   if (mentionsUsername(input.text, input.botUsername)) return "mention";
   if (input.assistantNames.some((name) => mentionsName(input.text, name))) return "name";
+  // Admitted by none of the gate's own predicates, only by the sender being the
+  // assistant's current conversation partner (dispatch computes it last, and
+  // only when every route above refused, so the order here cannot misname it).
+  if (input.capturedByConversation) return "conversation_window";
+  // Same reasoning, one step later: the judge is asked last of all.
+  if (input.capturedByJudge) return "judge";
   return "unclassified";
 }
 

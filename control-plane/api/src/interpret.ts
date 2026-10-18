@@ -28,6 +28,7 @@ import {
   type AnswerStore,
 } from "./interview.js";
 import { addUsage, type ModelUsage, type RunnerFailure, type StructuredModelRunner } from "./model-runner.js";
+import { resolveTypedOption } from "./choice-aliases.js";
 import { parseOps, type HeldItem, type Op } from "./typed-changes.js";
 import {
   identityFold,
@@ -462,9 +463,9 @@ export function evidenceAppears(evidence: string, source: string): boolean {
 /**
  * Keys whose values the system ASKS the model to produce, not to quote.
  *
- * `travelers`' own prompt says it outright: "If the names aren't in Latin
- * script, transliterate them YOURSELF and submit that as each person's English
- * spelling." A transliteration is derived by construction — it cannot appear in
+ * `travelers`' own prompt says it outright: `name_en` is the Latin form of the
+ * name, "otherwise transliterated YOURSELF" (and `name` the interview-language
+ * form; see `travelerNamesRule`). A transliteration is derived by construction — it cannot appear in
  * a Hebrew source, and requiring it to is requiring the model to disobey the
  * instruction it was given.
  *
@@ -704,6 +705,13 @@ export interface ApplyProposalsContext {
   answers?: AnswerStore;
   unclear?: readonly UnclearQuestion[];
   questions?: readonly IntakeQuestion[];
+  /**
+   * The organizer pressed a choice's Other button, so free text is the answer
+   * they chose and the caller is checking that their words are one. Skips the
+   * typed-choice safety net: "extended family reunion" typed there must stay
+   * free text, not become the Family option.
+   */
+  literalOther?: boolean;
   /** Default 0.7. One threshold, not a per-question table, until there is
    *  evidence a per-question one is needed. */
   minConfidence?: number;
@@ -838,6 +846,25 @@ function validateProposed(
 }
 
 /**
+ * The safety net behind the interpret prompt's "match an option by meaning".
+ *
+ * The model is told that "two couples" is the Couple option, and about half the
+ * time it answers choice_other "שני זוגות" instead (star e2e, 2026-10-15): free
+ * text on the site where the option belonged. When a choice question's answer
+ * comes back as choice_other and its text plainly names exactly ONE of the
+ * question's own options (`choice-aliases.ts`, negation handled), it becomes
+ * that option. Anything else — nothing named, two named, a word for another kind
+ * of trip — stays exactly as the model said. A model's `choice` is never touched.
+ */
+function settleTypedChoice(proposal: ProposedAnswer, questions: readonly IntakeQuestion[]): ProposedAnswer {
+  if (proposal.value.kind !== "choice_other") return proposal;
+  const question = questions.find((q) => q.id === proposal.questionId);
+  if (question?.type !== "choice" || !question.options?.length) return proposal;
+  const optionId = resolveTypedOption(question.id, proposal.value.otherText, question.options.map((o) => o.id));
+  return optionId ? { ...proposal, value: { kind: "choice", optionId } } : proposal;
+}
+
+/**
  * Decides what, if anything, a set of proposals is allowed to write. Pure.
  *
  * Order matters and is cheapest-and-most-decisive first: a proposal for a
@@ -845,10 +872,11 @@ function validateProposed(
  * validating it.
  */
 export function applyProposals(
-  proposals: readonly ProposedAnswer[],
+  modelProposals: readonly ProposedAnswer[],
   ctx: ApplyProposalsContext,
 ): ProposalDecisions {
   const questions = ctx.questions ?? INTAKE_QUESTIONS;
+  const proposals = ctx.literalOther ? [...modelProposals] : modelProposals.map((p) => settleTypedChoice(p, questions));
   const minConfidence = ctx.minConfidence ?? DEFAULT_MIN_CONFIDENCE;
   const outstanding = new Set(ctx.outstanding);
   const answered = new Set(ctx.answered);
@@ -1256,6 +1284,175 @@ function dataJsonExample(data: unknown): string {
   return `"dataJson":${JSON.stringify(JSON.stringify(data))}`;
 }
 
+/**
+ * What is NOT a stop — one rule, said in both prompts that read for stops.
+ *
+ * It lived only in the document prompt. A typed answer went to a prompt that had
+ * never been told, and a live Hebrew run (2026-10-10) paid for it: an organizer
+ * who flew into one city, collected a car, drove to the town they would sleep in
+ * and drove back to fly home had the trip stored as [gateway, town, gateway] —
+ * three stops, none dated. Shared here so the two prompts cannot drift on it.
+ */
+const GATEWAY_IS_NOT_A_STOP: readonly string[] = [
+  `- A FLIGHT is not a stop. Landing in a city and flying home from it does`,
+  `  not make the whole trip one stop in that city. Collecting a rental car`,
+  `  there and handing it back there is no stay either: a city that is only`,
+  `  where they land, pick up the car, return it or fly home from is never a`,
+  `  stop — least of all the first stop and the last one.`,
+];
+
+/**
+ * Every stop carries the place's English name — one rule, said in both prompts
+ * that write stops (and again in the operation that adds one).
+ *
+ * Star e2e, 2026-10-15: a Hebrew interview confirmed the stop "קולמר" with no
+ * `name_en` in 2 of 3 runs, the third wrote "Colmar". The field was shown only
+ * inside the question's example JSON, where a model working in Hebrew can leave
+ * it out without contradicting a word it was told. The site's English side, the
+ * trip's slug and title and the enrichment lookups all read it.
+ *
+ * It is a prompt rule and a code check, not a schema `required`: stops travel
+ * inside the `dataJson` STRING, which strict structured output cannot look into
+ * (see `INTERPRET_OUTPUT_SCHEMA`). The placeholders are not places, on purpose:
+ * a real place in a prompt is a place `exampleEchoes` can catch in an answer.
+ * `stopsMissingEnglishName` (interview.ts) is the check, logged at confirmation.
+ */
+const STOP_HAS_ENGLISH_NAME: readonly string[] = [
+  `- Every stop carries "name_en": the place's common English name, whatever`,
+  `  language the message is in. "name" stays exactly as the person wrote it`,
+  `  (never translated); "name_en" is the English name for the same place. A`,
+  `  name already in Latin script is repeated as "name_en". When the person`,
+  `  wrote the place in another script, write its English name yourself — never`,
+  `  leave "name_en" out. Never invent a place that was not named.`,
+];
+
+/**
+ * Every traveller's name is in the interview's language, with the Latin form
+ * beside it — one rule, said in both prompts that write travellers.
+ *
+ * Owner's manual test, 2026-10-15: a Hebrew interview with a flight-ticket
+ * document confirmed four travellers, two read off the tickets in English
+ * ({name: "Dror Aloul", name_en: "Dror Aloul"}) and two the organizer typed in
+ * Hebrew with no name_en. The site's roster, the intro's login list and the
+ * companion each showed a mix of scripts, and the two Hebrew-only people had no
+ * Latin form for their login. The owner: "It was best that it normalized the
+ * name to the interview language."
+ *
+ * So `name` is the language and script of the interview, and `name_en` is the
+ * Latin form — the ticket's exact spelling when a document printed one (it is
+ * what the passport says), a transliteration when only Hebrew was written. A
+ * transliteration is derived by construction, which is why `name_en` is in
+ * `DERIVED_KEYS`; the Hebrew `name` of a ticket's Latin name is derived the same
+ * way and cannot be a copy of anything in the prompt, because the prompt names
+ * no one. The placeholders here are not people, on purpose.
+ *
+ * A prompt rule and a code check, not a schema `required`: travellers travel
+ * inside the `dataJson` STRING. `travelersMissingNames` (interview.ts) is the
+ * check, logged at confirmation.
+ */
+export function travelerNamesRule(language: string): string[] {
+  const script = TRAVELER_NAME_SCRIPT[language];
+  const lines = language === "en"
+    ? [
+        `- Every traveller carries "name" and "name_en". In this interview "name" and`,
+        `  "name_en" are both the name in Latin letters; a name given in another`,
+        `  script is transliterated into Latin letters by you.`,
+      ]
+    : [
+        `- Every traveller carries two names. "name" is written in ${script ?? `the language and script of this interview (${languageName(language)})`},`,
+        `  the language the interview is held in, whatever script the message or`,
+        `  document printed it in: a name given in Latin letters is rewritten in that`,
+        `  script (a transliteration of the sound, never a translation).`,
+        `  "name_en" is the same person's name in Latin letters.`,
+      ];
+  return [
+    ...lines,
+    `- When the message or document printed the name in Latin letters (a ticket, a`,
+    `  booking, a name typed in Latin letters), copy those letters EXACTLY as printed into`,
+    `  "name_en" — never respell them, they are what the passport says. When the name`,
+    `  was written only in another script, write its Latin transliteration yourself.`,
+    `  Never leave either field out. Never invent a traveller that was not named.`,
+  ];
+}
+
+const TRAVELER_NAME_SCRIPT: Record<string, string> = { he: "Hebrew letters" };
+
+/** The typed-answer prompt's section for travellers: only spent when they are asked for. */
+function travelersSection(language: string): string[] {
+  return [`ABOUT TRAVELLERS (the "travelers" question):`, ...travelerNamesRule(language), ``];
+}
+
+/**
+ * A booked flight or car keeps its PLACES — one rule, said wherever a prompt can
+ * write a travel_anchors entry.
+ *
+ * The other half of GATEWAY_IS_NOT_A_STOP. A city that is only where they land
+ * is not a stop, so the flights are the one place the site can name it; the
+ * star e2e (2026-10-14) and the owner's run of 2026-10-10 got {type: flight,
+ * name: "LY8801"} from "LY8801 from A to B on 2 December" and the site showed a
+ * bare flight number with the gateway nowhere on it. The placeholders are
+ * letters on purpose: a real city in a prompt is a city `exampleEchoes` can
+ * catch in an answer. Whether a model follows this is only measurable live.
+ */
+const ANCHOR_KEEPS_PLACES: readonly string[] = [
+  `- A FLIGHT in travel_anchors keeps its route in "name": the flight number, then`,
+  `  where it leaves from and where it lands, as the person wrote them, joined by`,
+  `  " → " — "XY123 A → B". Use no comma, colon, semicolon or dash between the`,
+  `  places. If they named only one end, write only that end ("XY123 → B");`,
+  `  never fill in a place they did not say.`,
+  `- A rental car keeps where it is picked up and where it is returned, in`,
+  `  "name", in the person's own words and language: the car as they called it,`,
+  `  then the pick-up place and, if they said one, the return place. Never fill`,
+  `  in a place they did not say.`,
+];
+
+/**
+ * A booking section for a prompt that asks for travel_anchors but not for stops
+ * (stops carry the same rule inside `stopsSection`).
+ */
+function bookingsSection(): string[] {
+  return [`ABOUT BOOKINGS (the "travel_anchors" question):`, ...ANCHOR_KEEPS_PLACES, ``];
+}
+
+/**
+ * How a typed answer about stops is read. Only included when stops are being
+ * asked for (`phases` outstanding): every other question's prompt is spared it.
+ *
+ * The three rules each come from one live message (2026-10-10, Hebrew, two
+ * couples in one town with day trips to nearby markets): "we will sleep in X
+ * and tour the villages from there, we have no organised plan yet" came back as
+ * `unclear`, with the model's own reasons "no date range or accommodation" and
+ * "states no firm plan exists". The examples below deliberately name no real
+ * trip: a prompt example reaches answers (`exampleEchoes`).
+ */
+function stopsSection(): string[] {
+  return [
+    `ABOUT STOPS (the "phases" question). A stop is a place they SLEEP, not every`,
+    `place the message names:`,
+    `- If they sleep in one place for the whole trip and go out from it ("we`,
+    `  sleep in A and visit the villages around it", "based in A, with day`,
+    `  trips"), that is ONE stop: A. Its dates are the dates of the whole trip —`,
+    `  take them from the departure and return dates listed below under`,
+    `  "Already answered", or from the message. The villages, towns, markets and`,
+    `  sights visited from the base are NOT stops: leave them out, or put them in`,
+    `  that stop's "planned" list only when the message names them.`,
+    ...GATEWAY_IS_NOT_A_STOP,
+    `  "Landing in A, picking up a car, driving to B, back to A to fly home" is`,
+    `  ONE stop, B. Never write A as a first stop and a last stop. A flight or a`,
+    `  car with its own date may go in "travel_anchors" if that question is`,
+    `  listed below; otherwise leave it out.`,
+    ...ANCHOR_KEEPS_PLACES,
+    `- "We have no plan yet", "nothing organised", "we'll decide there" says the`,
+    `  itinerary is open. It does not leave the question unanswered: if the`,
+    `  message names where they sleep, propose that stop. "unclear" is for a`,
+    `  message that names no place to stay.`,
+    `- A stop with no dates of its own gets none unless it is the only stop, in`,
+    `  which case it takes the trip's dates. Never invent a hotel or a date.`,
+    ...STOP_HAS_ENGLISH_NAME,
+    ``,
+  ];
+}
+
 function changesHeld(held: BuildInterpretPromptArgs["heldLists"]): boolean {
   return Boolean(held && (held.stops.length > 0 || held.travellers.length > 0));
 }
@@ -1293,7 +1490,9 @@ export function changeSection(held: BuildInterpretPromptArgs["heldLists"]): stri
     `used: we will ask them which.`,
     ``,
     `The operations — exactly these, with exactly these keys:`,
-    `- add_stop  {"op":"add_stop","fields":{"name":"Nara","start":"2026-09-27","end":"2026-09-28"},"after":{"name":"Kyoto"}}`,
+    `- add_stop  {"op":"add_stop","fields":{"name":"Nara","name_en":"Nara","start":"2026-09-27","end":"2026-09-28"},"after":{"name":"Kyoto"}}`,
+    `    "name_en" is the place's common English name, as for every stop; the person's own`,
+    `    spelling stays in "name".`,
     `    A place or visit IN ADDITION to the ones listed: "we also want Nara", "another three days`,
     `    at the end for Tokyo", "we come back to Tokyo", "Tokyo again". A RETURN to a place that is`,
     `    already listed is add_stop — never update_stop. "after" and the dates are optional.`,
@@ -1334,6 +1533,8 @@ export function changeSection(held: BuildInterpretPromptArgs["heldLists"]): stri
     `     -> [{"op":"choose","options":[{"op":"rename_stop","target":{"name":"Hakone"},"name":"Nagoya"},`,
     `         {"op":"replace_stop","target":{"name":"Hakone"},"fields":{"name":"Nagoya"}},`,
     `         {"op":"add_stop","fields":{"name":"Nagoya"}}]}]`,
+    `  "we're staying at Hotel X in Kyoto"`,
+    `     -> [{"op":"update_stop","target":{"name":"Kyoto"},"fields":{"accommodation":{"name":"Hotel X"}}}]`,
     `  "Ruth is 71"  (there may be two Ruths — give the name as written)`,
     `     -> [{"op":"update_traveller","target":{"name":"Ruth"},"fields":{"age":71}}]`,
     `  "my daughter Ella Cohen, 9, is joining"`,
@@ -1344,6 +1545,8 @@ export function changeSection(held: BuildInterpretPromptArgs["heldLists"]): stri
     `     -> [{"op":"update_stop","target":{"name":"טוקיו"},"fields":{"start":"2026-09-20","end":"2026-09-25"}}]`,
     `  "עוד שלושה ימים בסוף בטוקיו"   (another three days at the end, in Tokyo)`,
     `     -> [{"op":"add_stop","fields":{"name":"טוקיו"}}]`,
+    `  "נישן במלון X בקיוטו"   (we sleep at Hotel X in Kyoto)`,
+    `     -> [{"op":"update_stop","target":{"name":"קיוטו"},"fields":{"accommodation":{"name":"X"}}}]`,
     `  "רות בת 71"   (Ruth is 71)`,
     `     -> [{"op":"update_traveller","target":{"name":"רות"},"fields":{"age":71}}]`,
     `  "אנחנו לא נוסעים לקיוטו"   (we are not going to Kyoto)`,
@@ -1387,7 +1590,60 @@ export interface BuildInterpretPromptArgs {
    * not. Short answers are most of how people actually reply.
    */
   onScreen?: string | null;
+  /**
+   * The summary (or the "more, or the summary?" offer) is what is on screen.
+   *
+   * Then a typed message is not a reply to one question: it is something to ADD
+   * to, or CHANGE in, everything already held. Live, 2026-10-15: at the summary
+   * the organizer said which hotel they were sleeping at, and the reader — shown
+   * only the questions still unanswered, with the answered ones as "correct
+   * only if plainly corrected" — found nowhere to put it and returned nothing.
+   * Given this, every answerable question is described in full, answered or
+   * not, and a hotel is told where it lives (a stop's accommodation).
+   */
+  summaryOnScreen?: boolean;
+  /** Ids of the questions that already have an answer. Read only with `summaryOnScreen`. */
+  answered?: readonly string[];
   questions?: readonly IntakeQuestion[];
+}
+
+/**
+ * The questions a message typed at the summary may answer or change, besides
+ * the ones still outstanding: what a document can answer, and the two the
+ * organizer volunteers most ("also, we'd love…"). Router-owned questions (who
+ * the organizer is, how the assistant sounds) are deliberately not here.
+ */
+function summaryAnswerableIds(): ReadonlySet<string> {
+  return new Set([...DOCUMENT_ANSWERABLE_QUESTION_IDS, "trip_interests", "trip_pace"]);
+}
+
+/**
+ * What to tell the reader when the summary is on the organizer's screen. A
+ * hotel is the case that failed, so it is named, with where it goes and what to
+ * do when the stop cannot be told. Said without real places: a prompt example
+ * reaches answers (`exampleEchoes`).
+ */
+function summarySection(held: BuildInterpretPromptArgs["heldLists"]): string[] {
+  const stopsHeld = (held?.stops.length ?? 0) > 0;
+  return [
+    `THE SUMMARY IS ON THEIR SCREEN. They have just been shown everything we hold and are now`,
+    `ADDING to it or CHANGING it. So this message is not a reply to one question: it is new`,
+    `information about the trip, and it may belong to ANY question below, answered already or not.`,
+    `Read it for what it adds. Do not leave it out because the question already has an answer.`,
+    `- A HOTEL, or any place they will sleep ("we're staying at Hotel X in A", "נישן במלון X ב-A"),`,
+    stopsHeld
+      ? `  is the ACCOMMODATION of the stop in that place: an update_stop operation (see the operations`
+        + ` below) with "accommodation": {"name":"Hotel X"}, adding "confirmation" only if they gave a`
+        + ` code. Its target is the stop whose place the message names, or the only stop when there is`
+        + ` just one. It is not a stop of its own, and it is not a travel_anchors entry unless it is a`
+        + ` booking with a code or a date of its own.`
+      : `  is the "accommodation" of the stop in that place, inside "phases".`,
+    `- If it plainly is a hotel (or another addition) but you cannot tell WHICH stop or question it`,
+    `  belongs to, do not guess: put the question it most likely belongs to in "unclear" with a`,
+    `  "why", and propose nothing.`,
+    `- A message that adds nothing about the trip is still answered with silence.`,
+    ``,
+  ];
 }
 
 /**
@@ -1397,7 +1653,15 @@ export interface BuildInterpretPromptArgs {
  */
 export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
   const all = args.questions ?? INTAKE_QUESTIONS;
-  const asked = all.filter((q) => args.outstanding.includes(q.id));
+  // At the summary, the answered questions a message can add to are described in
+  // full too — except the stops and the travellers once held, which change only
+  // through operations (`changeSection`), never as a proposal.
+  const answeredToo = args.summaryOnScreen
+    ? new Set((args.answered ?? []).filter((id) => summaryAnswerableIds().has(id)
+        && !(id === "phases" && (args.heldLists?.stops.length ?? 0) > 0)
+        && !(id === "travelers" && (args.heldLists?.travellers.length ?? 0) > 0)))
+    : new Set<string>();
+  const asked = all.filter((q) => args.outstanding.includes(q.id) || answeredToo.has(q.id));
   const onScreen = args.onScreen && args.outstanding.includes(args.onScreen)
     ? all.find((q) => q.id === args.onScreen)
     : undefined;
@@ -1405,6 +1669,7 @@ export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
     `You are reading one message from someone planning a trip, written in ${languageName(args.language)}.`,
     `Decide which of the questions below it answers. Answer ONLY with JSON.`,
     ``,
+    ...(args.summaryOnScreen ? summarySection(args.heldLists) : []),
     ...(onScreen
       ? [
           `They were just asked "${onScreen.prompt.replace(/\s+/g, " ").trim()}" (id: ${onScreen.id}),`,
@@ -1426,25 +1691,54 @@ export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
     `  shown on their trip's site; a translation there is a sentence they never`,
     `  wrote appearing under their name, in a conversation held in Hebrew.`,
     `  Normalise there; leave "evidence" as they wrote it.`,
-    `- Use the exact option ids given. Never invent one. If they meant something not`,
-    `  listed and the question allows it, use kind "choice_other".`,
+    `- Use the exact option ids given. Never invent one. Match an option by MEANING,`,
+    `  not by its label: the person may use other words, a plural, a different`,
+    `  form, or another language than the label's — "couples" or "זוגות" is the`,
+    `  option labelled Couple; "two families" is the one labelled Group of`,
+    `  families. If one listed option fits, answer kind "choice" with its id.`,
+    ...(asked.some((q) => q.id === "trip_type" && q.options?.some((o) => o.id === "couple"))
+      ? [
+          `  Two couples travelling together ("שני זוגות", "two couples") is the option`,
+          `  labelled Couple — answer kind "choice", not "choice_other".`,
+        ]
+      : []),
+    `  Use kind "choice_other" ONLY when no listed option fits what they meant`,
+    `  and the question allows it. When they say what it is NOT as well ("X, not`,
+    `  Y"), the answer is what it IS. The kind they NAME decides, not the people`,
+    `  they add to explain it ("a Y trip, there will be N of us" is still Y).`,
     `- "confidence" is 0..1: how sure you are this is what they meant, not how sure`,
     `  you are that you understood the words.`,
     `- If the message gestures at a question without settling it, put it in "unclear".`,
     ``,
-    `Questions still outstanding:`,
+    ...(asked.some((q) => q.id === "phases") ? stopsSection() : []),
+    ...(asked.some((q) => q.id === "travelers") ? travelersSection(args.language) : []),
+    ...(asked.some((q) => q.id === "travel_anchors") && !asked.some((q) => q.id === "phases") ? bookingsSection() : []),
+    args.summaryOnScreen ? `Questions (answered already or not):` : `Questions still outstanding:`,
     ...asked.map(describeQuestion),
     ``,
     ...changeSection(args.heldLists),
     ...(args.correctable?.length
       ? [
-          `Already answered — propose one of these ONLY if this message plainly corrects it`,
-          `("actually…", "no, it's…", "add…", "make it…"). A passing mention is not a correction,`,
-          `and a message that merely repeats what they already said is not one either. For a list,`,
+          args.summaryOnScreen
+            ? `Already answered — propose one of these if this message ADDS to it or CHANGES it ("also…", "add…", "actually…", "make it…"). A message that merely repeats what they already said adds nothing. For a list,`
+            : `Already answered — propose one of these ONLY if this message plainly corrects it`,
+          ...(args.summaryOnScreen ? [] : [
+            `("actually…", "no, it's…", "add…", "make it…"). A passing mention is not a correction,`,
+            `and a message that merely repeats what they already said is not one either. For a list,`,
+          ]),
           changesHeld(args.heldLists)
             ? `propose only what is being ADDED or CHANGED, not the whole list. (The stops and the travellers are not here: change them with operations, above.)`
             : `propose only what is being ADDED or CHANGED, not the whole list.`,
-          ...args.correctable.map((q) => `- id: ${q.id}  (currently: ${q.current.replace(/\s+/g, " ").trim().slice(0, 160)})`),
+          // A question with listed options shows them here as well. Without them
+          // "a couples trip, not family" (trip_type, currently Family) had no option
+          // id to land on and came back as choice_other "זוגות" — 2026-10-10, live.
+          ...args.correctable.flatMap((q) => {
+            const options = all.find((a) => a.id === q.id)?.options;
+            return [
+              `- id: ${q.id}  (currently: ${q.current.replace(/\s+/g, " ").trim().slice(0, 160)})`,
+              ...(options?.length ? [`  options: ${options.map((o) => `${o.id} = ${o.label}`).join(" | ")}`] : []),
+            ];
+          }),
           ``,
         ]
       : []),
@@ -1617,14 +1911,14 @@ export function buildExtractIntakePrompt(args: {
     `  its start and end. The same city on two separate date ranges is two stops.`,
     `  A stop's accommodation may be named with no confirmation; leave`,
     `  "confirmation" out rather than borrow another code from the document.`,
+    ...STOP_HAS_ENGLISH_NAME,
     `- A STOP'S DATES come only from something that states the stay: a hotel's`,
     `  check-in and check-out, or a plan's line giving the stay ("Lisbon 11-14`,
     `  June"). An attraction, ticket, tour or dinner with a date or time is a`,
     `  visit INSIDE a stop, not a stop, and gives neither its start nor its end:`,
     `  put it in that stop's "planned" list (or travel_anchors, if it is booked)`,
     `  and give the stop its name only.`,
-    `- A FLIGHT is not a stop. Landing in a city and flying home from it does`,
-    `  not make the whole trip one stop in that city.`,
+    ...GATEWAY_IS_NOT_A_STOP,
     `- A range given for the WHOLE trip answers both the departure date and the`,
     `  return date; propose both. A hotel stay, one stop, a ticket, a car rental`,
     `  or one flight within the trip does not set the trip's dates.`,
@@ -1647,6 +1941,7 @@ export function buildExtractIntakePrompt(args: {
     `  has no whole-trip dates, and the date is not on the weekday list, write`,
     `  it as --MM-DD ("check-in 9 August" is --08-09): the year is completed`,
     `  from the rest of the trip.`,
+    ...ANCHOR_KEEPS_PLACES,
     `- One booking is one travel_anchors entry, even when the document also`,
     `  describes the event or place it is for: a parking pass for a match is`,
     `  one anchor, not one for the match and another for the parking.`,
@@ -1659,6 +1954,7 @@ export function buildExtractIntakePrompt(args: {
     `  there, so the organizer can be asked for names rather than for a count`,
     `  the document already gave.`,
     ``,
+    ...(asked.some((q) => q.id === "travelers") ? travelersSection(args.language) : []),
     `Questions the interview still needs:`,
     ...asked.map(describeQuestion),
     ``,

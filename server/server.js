@@ -11,12 +11,16 @@ const Database = require('better-sqlite3');
 const { OAuth2Client } = require('google-auth-library');
 const livingJourney = require('./living-journey');
 const { createTripEvents } = require('./trip-events');
+const { createTripStructure } = require('./trip-structure');
+const { createHotelPlaces } = require('./hotel-place');
 const { createControlPlaneAuth } = require('./control-plane-auth');
 const { NEED_TYPES, NEED_SEVERITIES, VISIBILITIES, normalizeSeverity, normalizeVisibility } = require('../shared/needs-schema');
 const { AGENT_TONES, AGENT_GENDERS, PROACTIVE_KEYS, normalizeInstructionVisibility, normalizeTone, normalizeGender, normalizeOrganizers } = require('../shared/agent-schema');
 const { repairDayStamp, stampRest } = require('../shared/day-stamp');
 const { projectConfig, publicConfig, publicPart } = require('../shared/config-visibility');
 const { publicUser } = require('./public-user');
+const textRules = require('./text-rules');
+const { rateLimitKey } = require('./client-address');
 const { createFileTokens, createShareTokens } = require('./file-token');
 
 const app = express();
@@ -364,7 +368,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS bookings (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     phase        TEXT NOT NULL,
-    type         TEXT NOT NULL CHECK(type IN ('flight','hotel','car','attraction','other')),
+    type         TEXT NOT NULL CHECK(type IN (${textRules.BOOKING_TYPES.map(t => `'${t}'`).join(',')})),
     name         TEXT NOT NULL,
     date_from    TEXT,
     date_to      TEXT,
@@ -802,7 +806,11 @@ function sanitizeConfig(cfg) {
 })();
 
 app.get('/api/config', authRequired, (_req, res) => {
-  const safe = sanitizeConfig(TRIP_CONFIG);
+  // The stop layer is merged in FIRST, then the allow-list applies to the
+  // result exactly as it applies to the file (server/trip-structure.js).
+  // A hotel the stop layer wrote is resolved to its map and Waze links first
+  // (server/hotel-place.js); the allow-list then applies to the result as ever.
+  const safe = sanitizeConfig(hotelPlaces.hydrateConfig(effectiveConfig()));
   safe.trivia_available = TRIVIA_QUESTIONS.length > 0;
   // Every reload must see this deploy's config, not a stale copy some
   // intermediary (browser, Cloudflare, a reverse proxy in front of it)
@@ -894,17 +902,24 @@ app.get('/api/config/roster', (_req, res) => {
 // compared the roster above against the deploying plan's expected
 // participants, but two trips for the SAME family can share an identical
 // roster — a private_url misrouted to a sibling trip, or a stale deployment
-// of one, would still pass. departure/returnDate are the one pair of
-// already-allow-listed (shared/config-visibility.js) fields that cannot
-// collide between two distinct real trips the way a family's own roster
-// can. Deliberately its own route rather than folded into /api/config/roster
-// above: that route's whole point, stated in its own comment, is "the
-// four fields a login picker needs" — these two exist for a different
-// reason (deployment identity, not login) and mixing the two would make
-// neither route's surface obvious at a glance any more.
+// of one, would still pass. Originally served departure/returnDate, since
+// those cannot collide between two distinct real trips for one family the
+// way a roster can.
+//
+// #review 2026-10-06 [N1], PR review before the sprint-6 -> main merge: that
+// served the family's actual travel dates with no authentication — anyone
+// who knew the hostname learned exactly when the family is away. A hash of
+// the dates would not have fixed it: there are only a few thousand plausible
+// departure/return pairs, trivially brute-forced with no secret salt. Now
+// serves `deploymentNonce` instead — an opaque value carrying no information
+// about the trip, generated fresh per render (transformer.py) and compared
+// by the worker against the one it just generated for THIS deploy. Still its
+// own route rather than folded into /api/config/roster above, for the same
+// reason as before: that route's own comment says its whole point is "the
+// four fields a login picker needs," and this exists for a different reason.
 app.get('/api/config/deployment-identity', (_req, res) => {
   const meta = publicConfig(TRIP_CONFIG).meta || {};
-  res.json({ departure: meta.departure ?? null, returnDate: meta.returnDate ?? null });
+  res.json({ deploymentNonce: meta.deploymentNonce ?? null });
 });
 
 // Stage 1 groundwork: read-only access to stored config history for a future
@@ -971,9 +986,27 @@ function agentActingOnOrganizer(req, uname) {
   return Boolean(req.user?.isAgent) && normalizeOrganizers(TRIP_CONFIG.agent).includes(uname);
 }
 
+// One answer to "where is this hotel": name, Google Maps, Waze — the same on
+// every screen (server/hotel-place.js). Lazy over the stop layer, which is
+// created below: nothing here is called before the server is listening.
+const hotelPlaces = createHotelPlaces({
+  getConfig: () => effectiveConfig(),
+  sources: () => tripStructure.accommodationSources(),
+  // An APPROVED booking only: a draft is organizer-private and shapes nothing.
+  bookingById: (id) => db.prepare("SELECT id, type, name, phase, location_url FROM bookings WHERE id = ? AND COALESCE(review_status, 'approved') = 'approved'").get(id) || null,
+});
+
 const journey = livingJourney.create({
+  hotelPlaces,
   db,
+  // The FILE: what the original plan is imported from at first boot.
   config: TRIP_CONFIG,
+  // The trip as it is now — every route reads this one (server/trip-structure.js).
+  getConfig: () => effectiveConfig(),
+  phaseKnown: (id) => tripStructure.isPhase(id),
+  stopKnown: (id) => tripStructure.isStop(id),
+  onPhasesReshuffled: (phaseIds) => { for (const id of new Set(phaseIds)) queuePhaseReview(id); kickEnrichmentSoon(); },
+  reviewConfigured: () => Boolean(HERMES_URL),
   raw: TRIP_CONFIG_RAW,
   fetchImpl: fetch,
   mediaDir: MEDIA_DIR,
@@ -996,8 +1029,46 @@ const journey = livingJourney.create({
   },
 });
 
-// Install after livingJourney creates its tables. This runtime and its auth
-// credentials belong to exactly one trip; clients cannot select another DB.
+// ── STOP EDITING AFTER THE INTERVIEW ─────────────────────────────────────────
+// The provisioner rewrites trip.config.json on every rebuild; the trip's stops
+// (their dates, their hotel, stops split off them) are edited in this SQLite
+// instead and merged over the file here. effectiveConfig() is what every
+// reader of the trip's phases uses; anything served to a member still goes
+// through sanitizeConfig() on it, so the allow-list is unchanged. The file
+// itself (TRIP_CONFIG) stays what the original plan, participants, agent and
+// meta are read from — the layer never changes those.
+const tripStructure = createTripStructure({
+  db,
+  baseConfig: () => TRIP_CONFIG,
+  journey: () => journey,
+  queuePhaseReview: (id) => queuePhaseReview(id),
+  reviewConfigured: () => Boolean(HERMES_URL),
+});
+function effectiveConfig() {
+  return tripStructure.effectiveConfig();
+}
+// A rebuild that drops a stop an organizer edited leaves its override with
+// nothing to apply to; it is not served. Say so at boot rather than let the
+// edit vanish quietly: ids in the log (organizer-only by definition), a count
+// in /api/config/warnings (every member reads it; a stop id is authored text).
+(() => {
+  const orphans = tripStructure.orphanedOverrides();
+  if (!orphans.length) return;
+  console.warn(`stop overrides: ${orphans.length} refer to a stop trip.config.json no longer has — not served: ${orphans.join(', ')}`);
+  CONFIG_WARNINGS.push({ scope: 'stops', issue: `${orphans.length} stop override(s) refer to a stop the config no longer has (stop ids in the server log)` });
+})();
+function knownPhase(id) {
+  return tripStructure.isPhase(id);
+}
+// Bookings also file under the two trip-wide buckets every client offers.
+const BOOKING_TRIP_WIDE_PHASES = new Set(['intl_flights', 'general']);
+function knownBookingPhase(id) {
+  return typeof id === 'string' && (BOOKING_TRIP_WIDE_PHASES.has(id) || knownPhase(id));
+}
+
+// Install after livingJourney and the stop layer create their tables. This
+// runtime and its auth credentials belong to exactly one trip; clients cannot
+// select another DB.
 const tripEvents = createTripEvents(db);
 app.get('/api/events', authRequired, (req, res) => {
   const header = req.headers.authorization || '';
@@ -1037,6 +1108,9 @@ app.post('/api/ui-settings/hero', organizerOrAgentRequired, heroUpload.single('h
 });
 
 journey.registerRoutes(app, { authRequired, organizerOrAgentRequired });
+// GET /api/stops and the stop writes: organizer or agent only — provenance,
+// conflicts and history are never served to a member.
+tripStructure.registerRoutes(app, { organizerOrAgentRequired });
 require('./companion-conversation').registerCompanionConversation({ app, db, authRequired, organizerOrAgentRequired });
 require('./companion-control').registerCompanionControl({ app, authRequired, organizerOrAgentRequired, fetchImpl: fetch });
 // A trip member's own Claude or ChatGPT (organizers read and write, everyone
@@ -1050,8 +1124,8 @@ try { require('./trip-mcp').registerTripMcp({
   organizers: () => normalizeOrganizers(TRIP_CONFIG.agent),
   userExists: username => Boolean(getUser(username)) && (TRIP_CONFIG.participants || []).some(p => p.username === username),
   // Never the raw config: whatever the connector says about the trip is what
-  // /api/config already says to a signed-in member.
-  getPublicConfig: () => sanitizeConfig(TRIP_CONFIG),
+  // /api/config already says to a signed-in member — the trip as it is now.
+  getPublicConfig: () => sanitizeConfig(hotelPlaces.hydrateConfig(effectiveConfig())),
   authRequired,
   listenPort: process.env.PORT || 3000,
   listenHost: process.env.HOST,
@@ -1127,7 +1201,9 @@ const ENROLLMENT_TTL_MS = 30 * 60 * 1000;
 // collected here or in chat.
 app.post('/api/agent/participants', organizerOrAgentRequired, async (req, res) => {
   const { username, name, name_en, color, family, telegram_id } = req.body || {};
-  if (!username || !name) return res.status(400).json({ error: 'missing_fields' });
+  if (!username || !name) {
+    return res.status(400).json(!name && username ? textRules.requiredRefusal('missing_fields', 'name', textRules.PARTICIPANT_FIELDS) : { error: 'missing_fields' });
+  }
   const uname = String(username).toLowerCase().trim();
   if (!/^[a-z0-9_-]+$/.test(uname)) return res.status(400).json({ error: 'invalid_username' });
   // #213: color reaches the classic client's inline `style="background:${color}"`
@@ -1138,6 +1214,13 @@ app.post('/api/agent/participants', organizerOrAgentRequired, async (req, res) =
   if (color != null && color !== '' && !/^#[0-9a-fA-F]{3,8}$/.test(color)) {
     return res.status(400).json({ error: 'invalid_color' });
   }
+  // Names are shown on every participant-carrying surface and written into
+  // trip.config.json: refused at the write if they carry < > or control
+  // characters, with the reason in Hebrew and English (server/text-rules.js).
+  // Quotes are text — אבי "הגדול" is stored as typed.
+  if (textRules.isBlank(name)) return res.status(400).json(textRules.requiredRefusal('missing_fields', 'name', textRules.PARTICIPANT_FIELDS));
+  const names = textRules.checkFields(req.body, textRules.PARTICIPANT_FIELDS);
+  if (names.error) return res.status(400).json(names.error);
   // #184 (boundary review on PR #274, finding A): if trip.config.json's
   // agent.organizers names a username with no seeded participant row yet,
   // the normal `username_taken` check below does nothing to stop the agent
@@ -1168,7 +1251,10 @@ app.post('/api/agent/participants', organizerOrAgentRequired, async (req, res) =
     return res.status(409).json({ error: 'telegram_id_taken' });
   }
 
-  const participant = { username: uname, name, name_en: name_en || null, color: color || null, family: family || null, telegram_id: tgId };
+  const participant = {
+    username: uname, name: names.values.name, name_en: names.values.name_en || null,
+    color: color || null, family: names.values.family || null, telegram_id: tgId,
+  };
 
   TRIP_CONFIG.participants = TRIP_CONFIG.participants || [];
   TRIP_CONFIG.participants.push(participant);
@@ -1592,9 +1678,13 @@ app.post('/api/auth/avatar/upload', authRequired,
 // ── RATINGS ───────────────────────────────────────────────────────────────────
 app.get('/api/ratings', authRequired, (_req, res) => {
   const rows = db.prepare('SELECT venue, username, stars FROM ratings').all();
-  const result = {};
+  // Null-prototype maps: a member chooses the venue id, and on a plain object
+  // `__proto__` IS Object.prototype — the next line would have written every
+  // rater's name onto every object in this process (boundary review
+  // 2026-10-11, finding 5; the same for the photo maps below).
+  const result = Object.create(null);
   for (const r of rows) {
-    if (!result[r.venue]) result[r.venue] = {};
+    if (!result[r.venue]) result[r.venue] = Object.create(null);
     result[r.venue][r.username] = r.stars;
   }
   res.json(result);
@@ -1839,9 +1929,10 @@ app.post('/api/rsvps/:activityId', authRequired, (req, res) => {
 // Bulk fetch — all reactions for all photos (or filtered by comma-separated IDs)
 app.get('/api/reactions', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM photo_reactions').all();
-  const grouped = {};
+  // Photo ids and emoji are request text; see /api/ratings for why null-prototype.
+  const grouped = Object.create(null);
   for (const r of rows) {
-    if (!grouped[r.photo_id]) grouped[r.photo_id] = {};
+    if (!grouped[r.photo_id]) grouped[r.photo_id] = Object.create(null);
     if (!grouped[r.photo_id][r.emoji]) grouped[r.photo_id][r.emoji] = [];
     grouped[r.photo_id][r.emoji].push(r.username);
   }
@@ -1850,8 +1941,8 @@ app.get('/api/reactions', authRequired, (req, res) => {
 
 app.get('/api/reactions/:photoId', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM photo_reactions WHERE photo_id = ?').all(req.params.photoId);
-  // Group by emoji: { '❤️': [{ username, user }], ... }
-  const grouped = {};
+  // Group by emoji: { '❤️': [{ username, user }], ... } — null-prototype, as above.
+  const grouped = Object.create(null);
   for (const r of rows) {
     if (!grouped[r.emoji]) grouped[r.emoji] = [];
     grouped[r.emoji].push({ username: r.username, user: publicUser(getUser(r.username)) || { username: r.username } });
@@ -1876,7 +1967,7 @@ app.post('/api/reactions/:photoId', authRequired, (req, res) => {
 // Bulk fetch — all photo comments (for gallery preload)
 app.get('/api/comments/photo', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM photo_comments ORDER BY created_at ASC').all();
-  const grouped = {};
+  const grouped = Object.create(null); // keyed by a request-chosen photo id; see /api/ratings
   for (const c of rows) {
     if (!grouped[c.photo_id]) grouped[c.photo_id] = [];
     grouped[c.photo_id].push({ ...c, user: publicUser(getUser(c.username)) || { username: c.username } });
@@ -1931,16 +2022,23 @@ app.post('/api/tasks/:taskId/done', authRequired, (req, res) => {
 // Album display names, derived from trip.config.json phases — never hardcode
 // one trip's phase ids/labels here, since every trip has a different set.
 const TRIP_BRAND = TRIP_CONFIG.meta?.brand || TRIP_CONFIG.meta?.title || 'Trip';
-const SECTION_NAMES = Object.fromEntries(
-  (TRIP_CONFIG.phases || []).map(p => [p.id, `${TRIP_BRAND} — ${p.title?.he || p.title?.en || p.tabLabel || p.id}`])
-);
+// Read from the trip as it is now, not frozen at boot: a stop split off after
+// the interview gets its own album like any other.
+function sectionName(phaseId) {
+  const p = (effectiveConfig().phases || []).find(phase => phase?.id === phaseId);
+  return p ? `${TRIP_BRAND} — ${p.title?.he || p.title?.en || p.tabLabel || p.id}` : null;
+}
 
 // Album IDs are looked up by name (or created) on first use — see getOrCreateAlbum().
-const ALBUM_IDS = {};
+// Null-prototype, like SHARE_KEYS: both are keyed by a phase id from the
+// request, and on a plain object `constructor` was already "cached" — the
+// album-share route answered a member with Object's own source in the URL and
+// never looked for an album (boundary review 2026-10-11, finding 5).
+const ALBUM_IDS = Object.create(null);
 
 async function getOrCreateAlbum(phase) {
   if (ALBUM_IDS[phase]) return ALBUM_IDS[phase];
-  const name = SECTION_NAMES[phase];
+  const name = sectionName(phase);
   if (!name) return null;
   // Search existing albums
   const listRes = await fetch(`${IMMICH_URL}/api/albums`, { headers: { 'x-api-key': IMMICH_KEY } });
@@ -1958,7 +2056,7 @@ async function getOrCreateAlbum(phase) {
   return created.id;
 }
 
-const SHARE_KEYS = {};
+const SHARE_KEYS = Object.create(null);
 const IMMICH_EXTERNAL = process.env.IMMICH_EXTERNAL_URL || IMMICH_URL;
 
 async function getOrCreateShareLink(phase) {
@@ -2060,12 +2158,21 @@ app.post('/api/upload', authRequired, upload.array('files'), async (req, res) =>
 // stranger can reach the form, so a script can too — this section bounds and
 // rate-limits what an anonymous caller can write, without adding auth.
 
-// Field caps (trimmed lengths) — generous for a name/phone/short description,
-// tight enough that a script cannot use this form to stash arbitrary text.
-const LOST_FOUND_MAX_NAME = 80;
-const LOST_FOUND_MAX_PHONE = 32;
-const LOST_FOUND_MAX_ITEM = 200;
-const LOST_FOUND_MAX_LOCATION = 200;
+// Field rules (owner decision, 2026-10-12: the form stays WITHOUT login, and
+// what a stranger types is held to the bookings' write-time rules). Each field
+// is checked by server/text-rules.js against LOST_FOUND_FIELDS — its cap (the
+// ones #207 set: name 80, phone 32, location 200, item 200), no < >, no
+// control or invisible characters (the three standard flags are text), the
+// item multi-line because the form's description is a textarea — and refused
+// with the bookings' 400 shape, { error, field, message: { he, en }, detail },
+// which the Classic form shows in the page's language. Values are trimmed
+// before the check, as this route always stored them. Rows stored before the
+// rule are never rewritten, and nothing on the read path checks them.
+//
+// The companion still reads whatever passes: words cannot be refused. Its MCP
+// tools label every entry as finder-submitted, untrusted text
+// (LOST_FOUND_SOURCE in mcp/mcp.js and server/trip-mcp/tools.js).
+
 // Small cap on the whole request body — four short strings never need more
 // than a few hundred bytes; this catches an oversized payload before it is
 // even validated. Not a replacement for the global 30mb express.json()
@@ -2075,13 +2182,114 @@ const LOST_FOUND_MAX_BODY_BYTES = 4096;
 // In-memory, per-address rate limit: 5 ACCEPTED writes per rolling hour.
 // Deliberately no dependency and no persistence — an abuse bound on a small
 // social feature, not a security control, so resetting on every restart is
-// fine. `address -> [timestamp, ...]` of accepted writes, oldest first.
+// fine. `address -> [timestamp, ...]` of accepted writes, oldest first. A
+// refused report (400, 413, 429) is not counted. The 429 says why, in both
+// languages (LOST_FOUND_MESSAGES below).
 const LOST_FOUND_RATE_LIMIT = 5;
 const LOST_FOUND_RATE_WINDOW_MS = 60 * 60 * 1000;
 // Bounds the map itself: a flood of distinct addresses (not just repeats
 // from one) must not grow this without limit for the life of the process.
 const LOST_FOUND_MAX_TRACKED_ADDRESSES = 1000;
 const lostFoundWrites = new Map();
+// The table as a whole: at most this many OPEN (unresolved) entries. The
+// per-address limit above does not bound a caller with many addresses; this
+// does, so it bounds how much a flood can STORE. It does not protect real
+// finders: when every visitor reaches the server from one proxy address
+// (TRUST_PROXY_HOPS unset behind a reverse proxy, see clientAddress below),
+// five junk reports an hour fill that one per-address bucket and every other
+// finder, member and the companion's post_lost_found gets 429 rate_limited
+// long before this cap is reached. Only the right client address fixes that.
+// A resolved entry does not count, so a member resolving one reopens the form.
+const LOST_FOUND_MAX_OPEN = 200;
+
+// ── The client address the limiter keys on ──────────────────────────────────
+// Trip sites run behind reverse proxies (the repository's nginx.conf, and
+// whatever fronts it), so the socket address is a proxy's, the same for every
+// visitor. TRUST_PROXY_HOPS says how many proxies in front of this server
+// APPEND the visitor's address to X-Forwarded-For (nginx: `proxy_set_header
+// X-Forwarded-For $proxy_add_x_forwarded_for`) — a CDN or tunnel edge counts
+// like any other. A proxy that instead REWRITES the header from a value the
+// client can send (an X-Real-IP, say) is not one that appends: counting it
+// lets the client pick its own bucket. The count is only right when the entry
+// Nth from the right is one the outermost trusted proxy wrote, which the
+// operator confirms with a live probe (.env.example).
+// With N > 0 the client is the Nth entry from the RIGHT — the one the
+// outermost trusted proxy wrote — never the leftmost, which the client itself
+// can write. Express's `trust proxy` = N picks the same entry, but it is
+// deliberately not set: it would also change req.protocol (the /photo share
+// page's URLs) and req.hostname for every route, and this setting is about one
+// rate limit. 0 (unset, the default): X-Forwarded-For is ignored and the key
+// is req.ip, exactly as before. Too high a number lets a visitor choose their
+// own address — a proxy that passes the header through without appending (the
+// repository's own nginx.conf does) does not count.
+const TRUST_PROXY_HOPS = (() => {
+  const raw = process.env.TRUST_PROXY_HOPS;
+  if (raw === undefined || raw === '') return 0;
+  if (/^[0-3]$/.test(raw)) return Number(raw);
+  console.warn(`TRUST_PROXY_HOPS=${JSON.stringify(raw)} is not a whole number from 0 to 3 — using 0: ` +
+    'X-Forwarded-For is ignored and every visitor behind a proxy shares one lost-and-found rate-limit bucket.');
+  return 0;
+})();
+if (TRUST_PROXY_HOPS > 0) {
+  console.log(`lost-and-found rate limit: TRUST_PROXY_HOPS=${TRUST_PROXY_HOPS} — keyed on X-Forwarded-For entry ${TRUST_PROXY_HOPS} from the right`);
+}
+// Each misconfiguration is said once per process, not per request.
+const clientAddressWarned = new Set();
+function warnClientAddressOnce(key, message) {
+  if (clientAddressWarned.has(key)) return;
+  clientAddressWarned.add(key);
+  console.warn(message);
+}
+// At most an IPv6 address with a zone; anything longer is not an address
+// a proxy wrote, and bounding it bounds the map's keys.
+const CLIENT_ADDRESS_MAX_LENGTH = 64;
+function clientAddress(req) {
+  // Keyed per client — an IPv6 one per /64, an IPv4-mapped one as its IPv4 —
+  // whichever of the three ways below found the address (client-address.js).
+  return rateLimitKey(clientAddressRaw(req));
+}
+function clientAddressRaw(req) {
+  const header = req.headers['x-forwarded-for'];
+  const entries = typeof header === 'string' ? header.split(',').map(s => s.trim()).filter(Boolean) : [];
+  if (TRUST_PROXY_HOPS === 0) {
+    if (entries.length) {
+      warnClientAddressOnce('hops0', 'lost-and-found: a request arrived with X-Forwarded-For but TRUST_PROXY_HOPS is 0, ' +
+        'so the rate limit keys on the proxy\'s address and every visitor behind it shares one bucket of ' +
+        `${LOST_FOUND_RATE_LIMIT} reports an hour. Set TRUST_PROXY_HOPS to the number of proxies that append to X-Forwarded-For.`);
+    }
+    return req.ip;
+  }
+  if (entries.length < TRUST_PROXY_HOPS) {
+    // No header at all is a direct caller (the companion's MCP server on the
+    // same host): its socket address is its own. Some entries, but fewer than
+    // the hops, means the setting is higher than this chain — fall back to the
+    // socket rather than to an entry the client may have written.
+    if (entries.length) {
+      warnClientAddressOnce('short', `lost-and-found: a request carried fewer X-Forwarded-For entries (${entries.length}) ` +
+        `than TRUST_PROXY_HOPS=${TRUST_PROXY_HOPS}; keyed on the socket address. Is TRUST_PROXY_HOPS higher than the proxies in front of this site?`);
+    }
+    return req.socket.remoteAddress;
+  }
+  return entries[entries.length - TRUST_PROXY_HOPS].slice(0, CLIENT_ADDRESS_MAX_LENGTH);
+}
+
+// The refusals that are not about one field, in both languages, addressed to
+// the finder the way text-rules.js addresses a person.
+const LOST_FOUND_MESSAGES = {
+  rate_limited: {
+    he: 'נשלחו מכאן יותר מדי דיווחים בשעה האחרונה. נסו שוב מאוחר יותר.',
+    en: 'Too many reports were sent from here in the last hour. Try again later.',
+  },
+  lost_found_full: {
+    he: 'רשימת האבדות והמציאות מלאה כרגע. נסו שוב מאוחר יותר.',
+    en: 'The lost-and-found list is full right now. Try again later.',
+  },
+  body_too_large: {
+    he: 'הדיווח ארוך מדי. קצרו אותו ונסו שוב.',
+    en: 'The report is too long. Shorten it and try again.',
+  },
+};
+const lostFoundRefusal = (error) => ({ error, message: LOST_FOUND_MESSAGES[error] });
 
 function pruneLostFoundBucket(timestamps, now) {
   while (timestamps.length && now - timestamps[0] >= LOST_FOUND_RATE_WINDOW_MS) timestamps.shift();
@@ -2106,44 +2314,49 @@ app.post('/api/lost-found', (req, res) => {
   const now = Date.now();
   evictLostFoundBuckets(now);
 
-  // No `trust proxy` is set anywhere in this server, and trip sites sit
-  // behind nginx/NPM in production — see the #207 handover for what that
-  // means for this address (every visitor to one trip's proxy shares a
-  // single req.ip today; fixing that is a separate, deployment-wide change).
-  const address = req.ip;
+  // The real client when TRUST_PROXY_HOPS says how to find it; req.ip (the
+  // proxy's address, behind one) when it is 0 — see clientAddress above.
+  const address = clientAddress(req);
   const bucket = pruneLostFoundBucket(lostFoundWrites.get(address) || [], now);
   if (bucket.length >= LOST_FOUND_RATE_LIMIT) {
     const retryAfterMs = LOST_FOUND_RATE_WINDOW_MS - (now - bucket[0]);
     res.set('Retry-After', String(Math.max(1, Math.ceil(retryAfterMs / 1000))));
-    return res.status(429).json({ error: 'rate_limited' });
+    return res.status(429).json(lostFoundRefusal('rate_limited'));
   }
 
   const contentLength = Number(req.headers['content-length'] || 0);
   if (contentLength > LOST_FOUND_MAX_BODY_BYTES) {
-    return res.status(413).json({ error: 'body_too_large' });
+    return res.status(413).json(lostFoundRefusal('body_too_large'));
   }
 
-  const { name, phone, item, location } = req.body || {};
-  if (typeof name !== 'string' || typeof item !== 'string') {
-    return res.status(400).json({ error: 'name and item are required' });
+  // Every field is text or absent (null and undefined: phone and location
+  // are optional); anything else — a number, an array better-sqlite3 would
+  // flatten, an object — is refused, naming the field. Then trimmed, then the
+  // required pair, then the text rules (Field rules above).
+  const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+  const fields = textRules.LOST_FOUND_FIELDS;
+  const values = {};
+  for (const [field, spec] of Object.entries(fields)) {
+    const v = Object.hasOwn(body, field) ? body[field] : undefined;
+    if (v === undefined || v === null) { values[field] = ''; continue; }
+    if (typeof v !== 'string') {
+      return res.status(400).json(textRules.refusal('invalid_text', field, spec.label, 'type', { detail: 'must be text' }));
+    }
+    values[field] = v.trim();
   }
-  if (phone != null && typeof phone !== 'string') return res.status(400).json({ error: 'phone must be a string' });
-  if (location != null && typeof location !== 'string') return res.status(400).json({ error: 'location must be a string' });
+  for (const field of ['name', 'item']) {
+    if (textRules.isBlank(values[field])) return res.status(400).json(textRules.requiredRefusal('missing_fields', field, fields));
+  }
+  const checked = textRules.checkFields(values, fields);
+  if (checked.error) return res.status(400).json(checked.error);
+  const v = checked.values;
 
-  const trimmedName = name.trim();
-  const trimmedItem = item.trim();
-  const trimmedPhone = (typeof phone === 'string' ? phone : '').trim();
-  const trimmedLocation = (typeof location === 'string' ? location : '').trim();
-
-  if (!trimmedName || !trimmedItem) return res.status(400).json({ error: 'name and item are required' });
-  if (trimmedName.length > LOST_FOUND_MAX_NAME) return res.status(400).json({ error: 'name too long' });
-  if (trimmedItem.length > LOST_FOUND_MAX_ITEM) return res.status(400).json({ error: 'item too long' });
-  if (trimmedPhone.length > LOST_FOUND_MAX_PHONE) return res.status(400).json({ error: 'phone too long' });
-  if (trimmedLocation.length > LOST_FOUND_MAX_LOCATION) return res.status(400).json({ error: 'location too long' });
+  const open = db.prepare('SELECT COUNT(*) AS n FROM lost_found WHERE COALESCE(resolved, 0) = 0').get().n;
+  if (open >= LOST_FOUND_MAX_OPEN) return res.status(429).json(lostFoundRefusal('lost_found_full'));
 
   const result = db.prepare(
     "INSERT INTO lost_found (name, phone, item, location) VALUES (?,?,?,?)"
-  ).run(trimmedName, trimmedPhone, trimmedItem, trimmedLocation);
+  ).run(v.name, v.phone, v.item, v.location);
 
   bucket.push(now);
   lostFoundWrites.set(address, bucket);
@@ -2151,8 +2364,45 @@ app.post('/api/lost-found', (req, res) => {
   res.json({ ok: true, id: result.lastInsertRowid });
 });
 
+// Without open, limit or count: every entry, newest first — what the Classic
+// page reads, unchanged (any other parameter is ignored, as it always was).
+// The MCP tools ask for a bounded set instead (get_lost_found in mcp/mcp.js
+// and server/trip-mcp/tools.js): ?open=1 open entries only, ?open=0 resolved
+// only, ?limit=N the N newest (1..500; with open alone, at most 500), and
+// ?count=1 just `{ open, resolved }`. One of the three that is present but
+// not one of those values is refused, never silently ignored.
+const LOST_FOUND_MAX_LIMIT = 500;
+// The columns the endpoint serves — an allow-list, not SELECT *: a column added
+// to the table later (a note, a contact) reaches no member and no model until
+// it is added here on purpose. A constant, never built from a request.
+const LOST_FOUND_COLUMNS = 'id, name, phone, item, location, resolved, created_at';
+const LOST_FOUND_QUERY_KEYS = ['open', 'limit', 'count'];
 app.get('/api/lost-found', authRequired, (req, res) => {
-  const rows = db.prepare('SELECT * FROM lost_found ORDER BY created_at DESC').all();
+  const q = req.query;
+  const given = LOST_FOUND_QUERY_KEYS.filter(k => q[k] !== undefined);
+  if (!given.length) {
+    const rows = db.prepare(`SELECT ${LOST_FOUND_COLUMNS} FROM lost_found ORDER BY created_at DESC`).all();
+    return res.json(rows);
+  }
+  const bad = (detail) => res.status(400).json({ error: 'invalid_query', detail });
+  for (const key of given) {
+    if (typeof q[key] !== 'string') return bad(`"${key}" must be given once, as text`);
+  }
+  if (q.count !== undefined) {
+    if (q.count !== '1' || given.length > 1) return bad('count must be 1, with neither open nor limit');
+    const n = db.prepare('SELECT COALESCE(SUM(COALESCE(resolved, 0) = 0), 0) AS open, COALESCE(SUM(COALESCE(resolved, 0) != 0), 0) AS resolved FROM lost_found').get();
+    return res.json({ open: n.open, resolved: n.resolved });
+  }
+  if (q.open !== undefined && q.open !== '0' && q.open !== '1') return bad('open must be 1 (open only) or 0 (resolved only)');
+  let limit = LOST_FOUND_MAX_LIMIT;
+  if (q.limit !== undefined) {
+    if (!/^[1-9]\d{0,2}$/.test(q.limit) || Number(q.limit) > LOST_FOUND_MAX_LIMIT) {
+      return bad(`limit must be a whole number from 1 to ${LOST_FOUND_MAX_LIMIT}`);
+    }
+    limit = Number(q.limit);
+  }
+  const where = q.open === '1' ? 'WHERE COALESCE(resolved, 0) = 0' : q.open === '0' ? 'WHERE COALESCE(resolved, 0) != 0' : '';
+  const rows = db.prepare(`SELECT ${LOST_FOUND_COLUMNS} FROM lost_found ${where} ORDER BY created_at DESC, id DESC LIMIT ?`).all(limit);
   res.json(rows);
 });
 
@@ -2341,7 +2591,9 @@ app.get('/api/bookings', authRequired, (req, res) => {
   if (type)  { wheres.push('type = ?');  params.push(type);  }
   if (wheres.length) sql += ' WHERE ' + wheres.join(' AND ');
   sql += ' ORDER BY date_from, id';
-  res.json(db.prepare(sql).all(...params));
+  // A hotel booking also says where it is (`place`); location_url stays what
+  // is stored, so an edit form never saves a derived link back.
+  res.json(db.prepare(sql).all(...params).map((booking) => hotelPlaces.decorateBooking(booking)));
 });
 
 app.post('/api/bookings/extract-draft', organizerOrAgentRequired, extractUpload.single('file'), async (req, res) => {
@@ -2350,14 +2602,26 @@ app.post('/api/bookings/extract-draft', organizerOrAgentRequired, extractUpload.
     const phase = typeof extracted.phase === 'string' ? extracted.phase : '';
     const type = typeof extracted.type === 'string' ? extracted.type : 'other';
     const name = typeof extracted.name === 'string' ? extracted.name.trim() : '';
-    const validTypes = new Set(['flight', 'hotel', 'car', 'attraction', 'other']);
-    if (!VALID_PLAN_PHASES.has(phase) || !validTypes.has(type) || !name) {
+    const validTypes = new Set(textRules.BOOKING_TYPES);
+    if (!knownPhase(phase) || !validTypes.has(type) || !name) {
       return res.status(422).json({ error: 'Extraction needs a valid phase, type, and name before a draft can be created', extracted });
     }
-    const text = (key) => typeof extracted[key] === 'string' && extracted[key].trim() ? extracted[key].trim() : null;
+    // Nobody typed this text — an LLM read it off a PDF — so it is CLEANED,
+    // not refused: < > and control characters removed, lengths clamped, a
+    // date that is not YYYY-MM-DD dropped (server/text-rules.js). Refusing
+    // would leave the organizer with no draft; every draft is reviewed
+    // before it is approved. The name is cleaned before the emptiness check,
+    // so a name that was nothing but markup is the same 422 as no name.
+    const F = textRules.BOOKING_FIELDS;
+    const text = (key) => textRules.cleanText(extracted[key], F[key]);
+    const cleanName = textRules.cleanText(name, F.name);
+    if (!cleanName) {
+      return res.status(422).json({ error: 'Extraction needs a valid phase, type, and name before a draft can be created', extracted });
+    }
     const result = db.prepare(
       "INSERT INTO bookings (phase,type,name,date_from,date_to,passengers,confirmation,pin,notes,cost,created_by,review_status) VALUES (?,?,?,?,?,?,?,?,?,?,?, 'draft')"
-    ).run(phase, type, name, text('date_from'), text('date_to'), text('passengers'), text('confirmation'), text('pin'), text('notes'), 0, req.user.username);
+    ).run(phase, type, cleanName, textRules.cleanDate(extracted.date_from), textRules.cleanDate(extracted.date_to),
+      text('passengers'), text('confirmation'), text('pin'), text('notes'), 0, req.user.username);
     const booking = db.prepare('SELECT * FROM bookings WHERE id = ?').get(result.lastInsertRowid);
     res.status(201).json({ ok: true, booking, extracted });
   } catch (e) {
@@ -2374,25 +2638,65 @@ app.post('/api/bookings/:id/approve', organizerOrAgentRequired, (req, res) => {
 
 app.post('/api/bookings', organizerOrAgentRequired, (req, res) => {
   const { phase, type, name, date_from, date_to, passengers, confirmation, pin, notes, cost, apple_wallet_url, google_wallet_url, location_url } = req.body || {};
-  if (!phase || !type || !name) return res.status(400).json({ error: 'phase, type, name required' });
+  if (!phase || !type || !name) {
+    const body = { error: 'phase, type, name required' };
+    if (phase && type) Object.assign(body, textRules.requiredRefusal(body.error, 'name', textRules.BOOKING_FIELDS));
+    return res.status(400).json(body);
+  }
+  // A booking filed under a phase the trip does not have is shown under no
+  // stop and imported nowhere (see import-from-bookings below). The extract
+  // draft already refused one; this route and PATCH did not.
+  if (!knownBookingPhase(phase)) return res.status(400).json({ error: 'unknown phase' });
+  // A type outside the schema's list was a SQLite CHECK failure (500), and an
+  // array (["hotel"]) was flattened by better-sqlite3 and stored. Refused here,
+  // in both languages, from the same list the CHECK is built from.
+  const badType = textRules.bookingTypeRefusal(type);
+  if (badType) return res.status(400).json(badType);
+  // Every free-text field, link and date is checked at the write, and a
+  // refusal names the field and says what to fix in Hebrew and English
+  // (server/text-rules.js). The mcp booking tools call this route, so this is
+  // the one place the rule lives.
+  if (textRules.isBlank(name)) return res.status(400).json(textRules.requiredRefusal('text_required', 'name', textRules.BOOKING_FIELDS));
+  const checked = textRules.checkFields(req.body, textRules.BOOKING_FIELDS);
+  if (checked.error) return res.status(400).json(checked.error);
+  const v = checked.values;
   const result = db.prepare(
     'INSERT INTO bookings (phase,type,name,date_from,date_to,passengers,confirmation,pin,notes,cost,apple_wallet_url,google_wallet_url,location_url,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
-  ).run(phase, type, name, date_from || null, date_to || null, passengers || null,
-    confirmation || null, pin || null, notes || null, parseFloat(cost) || 0,
-    apple_wallet_url || null, google_wallet_url || null, location_url || null, req.user.username);
+  ).run(phase, type, v.name, v.date_from || null, v.date_to || null, v.passengers || null,
+    v.confirmation || null, v.pin || null, v.notes || null, parseFloat(cost) || 0,
+    v.apple_wallet_url || null, v.google_wallet_url || null, v.location_url || null, req.user.username);
   res.json({ ok: true, id: result.lastInsertRowid });
 });
 
 app.patch('/api/bookings/:id', organizerOrAgentRequired, (req, res) => {
   const fields = ['phase','type','name','date_from','date_to','passengers','confirmation','pin','notes','cost','apple_wallet_url','google_wallet_url','location_url'];
+  if (req.body.phase !== undefined && !knownBookingPhase(req.body.phase)) return res.status(400).json({ error: 'unknown phase' });
+  // A type this PATCH carries must be one of the list — null included, which
+  // was a NOT NULL failure (500).
+  if (req.body.type !== undefined) {
+    const badType = textRules.bookingTypeRefusal(req.body.type);
+    if (badType) return res.status(400).json(badType);
+  }
+  // The same checks as POST, on the fields this PATCH carries; one bad field
+  // refuses the whole PATCH. null and '' keep their old meaning (clear).
+  if (req.body.name !== undefined && textRules.isBlank(req.body.name)) {
+    return res.status(400).json(textRules.requiredRefusal('text_required', 'name', textRules.BOOKING_FIELDS));
+  }
+  const checked = textRules.checkFields(req.body, textRules.BOOKING_FIELDS);
+  if (checked.error) return res.status(400).json(checked.error);
   const updates = [];
   const params = [];
   for (const f of fields) {
-    if (req.body[f] !== undefined) { updates.push(`${f} = ?`); params.push(f === 'cost' ? parseFloat(req.body[f]) || 0 : req.body[f]); }
+    if (req.body[f] === undefined) continue;
+    updates.push(`${f} = ?`);
+    params.push(f === 'cost' ? parseFloat(req.body[f]) || 0 : Object.hasOwn(checked.values, f) ? checked.values[f] : req.body[f]);
   }
   if (!updates.length) return res.status(400).json({ error: 'no fields to update' });
   params.push(req.params.id);
   db.prepare(`UPDATE bookings SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+  // A hotel linked to a stop carries a check-in and a check-out item; they
+  // follow the booking's dates (server/trip-structure.js onBookingChanged).
+  if (req.body.date_from !== undefined || req.body.date_to !== undefined) tripStructure.onBookingChanged(req.params.id, req.user.username);
   res.json({ ok: true });
 });
 
@@ -2565,7 +2869,10 @@ app.get('/api/bookings/wallet-apple/:fn', authRequired, (req, res) => {
 });
 
 // ── PHASE PLAN ITEMS ──────────────────────────────────────────────────────────
-const VALID_PLAN_PHASES = new Set((TRIP_CONFIG.phases || []).map(p => p.id));
+// Which phase ids a plan row may be filed under is knownPhase() (above): the
+// trip's stops as they are now, plus every phase the config names. It was a
+// Set frozen at boot, so a stop split off after the interview could hold no
+// plan at all.
 
 // Surfaces a reviewer's rewrite as one object rather than four loose columns,
 // so a caller can test `item.correction` instead of knowing the schema. The
@@ -2608,14 +2915,25 @@ function joinBooking(item, { includeDrafts = false } = {}) {
   const withCorr = withCorrection(item);
   if (!item.booking_id) return withCorr;
   const bk = db.prepare(
-    'SELECT id, name, confirmation, conf_file FROM bookings WHERE id = ?' +
+    'SELECT id, name, confirmation, conf_file, type, phase, location_url FROM bookings WHERE id = ?' +
     (includeDrafts ? '' : " AND COALESCE(review_status, 'approved') = 'approved'")
   ).get(item.booking_id);
-  return { ...withCorr, booking: bk || null };
+  if (!bk) return { ...withCorr, booking: null };
+  // A hotel's check-in/check-out resolve its place the way every other screen
+  // does (server/hotel-place.js); the card keeps its four fields plus `place`.
+  const { type, phase, location_url, ...card } = bk;
+  const place = hotelPlaces.decorateBooking(bk).place;
+  return { ...hotelPlaces.decorateItem(withCorr, bk), booking: place ? { ...card, place } : card };
 }
 
 const PLAN_STATUSES = new Set(['confirmed', 'needs_review']);
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+// A plan date a Classic handler is SENT must be a day on the calendar, not only
+// the shape (second boundary re-check of PR #373). Refused with the route's own
+// error, plus `field` and `detail`. Reads keep ISO_DATE_RE: a row an older
+// server stored on 2027-02-30 is served as it is.
+const { isCalendarDay, CALENDAR_DAY_DETAIL } = require('./calendar-day');
+const planDateRefusal = (error, field) => ({ error, field, detail: CALENDAR_DAY_DETAIL });
 // 24-hour HH:MM. Matches what <input type="time"> submits and what the config
 // schedule already uses, so a DB plan item sorts against the same shape.
 const HHMM_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
@@ -2664,9 +2982,11 @@ function planFieldError(body, { requireText }) {
     const v = body[f];
     if (v !== undefined && v !== null && !isStr(v)) return `${f} must be a string`;
   }
+  // The one refusal here that is an object: it names its field (the routes
+  // send a string refusal as { error }).
   const d = body.date;
-  if (d !== undefined && d !== null && d !== '' && (!isStr(d) || !ISO_DATE_RE.test(d))) {
-    return 'date must be YYYY-MM-DD';
+  if (d !== undefined && d !== null && d !== '' && !isCalendarDay(d)) {
+    return planDateRefusal('date must be YYYY-MM-DD', 'date');
   }
   const t = body.time;
   if (t !== undefined && t !== null && t !== '' && (!isStr(t) || !isValidPlanTime(t))) {
@@ -2699,7 +3019,7 @@ function planFieldError(body, { requireText }) {
 }
 
 app.get('/api/phases/:phase_id/plan', authRequired, (req, res) => {
-  if (!VALID_PLAN_PHASES.has(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
+  if (!knownPhase(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
   const rows = db.prepare(
     // time_sort, not time: a rough token would otherwise sort lexically, putting
     // "afternoon" before "morning". COALESCE parks untimed items at the end.
@@ -2713,7 +3033,7 @@ app.get('/api/phases/:phase_id/plan', authRequired, (req, res) => {
 // Day headlines for a phase. Separate from the item list so /plan keeps its
 // array shape, which the agent tools and existing callers rely on.
 app.get('/api/phases/:phase_id/plan/days', authRequired, (req, res) => {
-  if (!VALID_PLAN_PHASES.has(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
+  if (!knownPhase(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
   res.json(db.prepare(
     'SELECT phase_id, date, label_he, label_en, enrichment_status, ' +
     'label_he_prev, label_en_prev, correction_note, corrected_at, review_status ' +
@@ -2774,10 +3094,10 @@ function ensurePlanDay(phaseId, date) {
 }
 
 app.post('/api/phases/:phase_id/plan', organizerOrAgentRequired, (req, res) => {
-  if (!VALID_PLAN_PHASES.has(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
+  if (!knownPhase(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
   const body = req.body || {};
   const bad = planFieldError(body, { requireText: true });
-  if (bad) return res.status(400).json({ error: bad });
+  if (bad) return res.status(400).json(typeof bad === 'string' ? { error: bad } : bad);
   const { date, time, text_he, text_en, location_url, booking_id, status, sort_order,
           waze_url, website_url, ticket_url } = body;
   const result = db.prepare(
@@ -2813,10 +3133,10 @@ app.post('/api/phases/:phase_id/plan', organizerOrAgentRequired, (req, res) => {
 });
 
 app.patch('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res) => {
-  if (!VALID_PLAN_PHASES.has(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
+  if (!knownPhase(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
   const body = req.body || {};
   const bad = planFieldError(body, { requireText: false });
-  if (bad) return res.status(400).json({ error: bad });
+  if (bad) return res.status(400).json(typeof bad === 'string' ? { error: bad } : bad);
   if (body.text_he !== undefined && !String(body.text_he).trim()) {
     return res.status(400).json({ error: 'text_he cannot be empty' });
   }
@@ -2829,8 +3149,15 @@ app.patch('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res)
   const existing = db.prepare('SELECT id, date FROM phase_plan_items WHERE id = ? AND phase_id = ?')
     .get(req.params.id, req.params.phase_id);
   if (!existing) return res.status(404).json({ error: 'not found' });
+  // Moving an item to another stop (run notes F6: this PATCH did not accept
+  // phase_id at all). The target is checked like the route's own phase.
+  if (body.phase_id !== undefined && (typeof body.phase_id !== 'string' || !knownPhase(body.phase_id))) {
+    return res.status(400).json({ error: 'unknown phase' });
+  }
+  const targetPhase = body.phase_id !== undefined ? body.phase_id : req.params.phase_id;
+  const phaseMoved = targetPhase !== req.params.phase_id;
 
-  const allowed = ['date','time','text_he','text_en','location_url','booking_id','status','sort_order',
+  const allowed = ['phase_id','date','time','text_he','text_en','location_url','booking_id','status','sort_order',
                    'waze_url','website_url','ticket_url','enrichment_status'];
   const updates = [];
   const params = [];
@@ -2857,20 +3184,30 @@ app.patch('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res)
   }
   if (!updates.length) return res.status(400).json({ error: 'no fields to update' });
   params.push(req.params.id, req.params.phase_id);
-  db.prepare(`UPDATE phase_plan_items SET ${updates.join(', ')} WHERE id = ? AND phase_id = ?`).run(...params);
-  // Moving a single item to another date is a schedule change too, and carries
-  // the same risk of leaving "tomorrow we…" behind on a neighbouring day.
-  // Only when the date actually moved — a text or link edit isn't a reshuffle.
   const dateMoved = body.date !== undefined && body.date !== existing.date;
-  if (dateMoved) { queuePhaseReview(req.params.phase_id); kickEnrichmentSoon(); }
+  db.transaction(() => {
+    db.prepare(`UPDATE phase_plan_items SET ${updates.join(', ')} WHERE id = ? AND phase_id = ?`).run(...params);
+    // A moved item needs a day to land on in its new stop.
+    if (phaseMoved) ensurePlanDay(targetPhase, body.date !== undefined ? body.date || null : existing.date);
+    // Moving a single item to another date is a schedule change too, and carries
+    // the same risk of leaving "tomorrow we…" behind on a neighbouring day.
+    // Only when the date actually moved — a text or link edit isn't a reshuffle.
+    // Moving it to another stop changes both stops' schedules.
+    if (dateMoved || phaseMoved) queuePhaseReview(req.params.phase_id);
+    if (phaseMoved) queuePhaseReview(targetPhase);
+  })();
+  if (dateMoved || phaseMoved) kickEnrichmentSoon();
   const updated = db.prepare('SELECT * FROM phase_plan_items WHERE id = ? AND phase_id = ?')
-    .get(req.params.id, req.params.phase_id);
+    .get(req.params.id, targetPhase);
   journey.syncFromLegacy('legacy-plan-update');
-  res.json({ ...joinBooking(updated, { includeDrafts: true }), ...(dateMoved ? { review: { status: HERMES_URL ? 'queued' : 'unavailable', scope: 'phase' } } : {}) });
+  const review = phaseMoved
+    ? { review: { status: HERMES_URL ? 'queued' : 'unavailable', scope: 'phases', phases: [req.params.phase_id, targetPhase] } }
+    : dateMoved ? { review: { status: HERMES_URL ? 'queued' : 'unavailable', scope: 'phase' } } : {};
+  res.json({ ...joinBooking(updated, { includeDrafts: true }), ...review });
 });
 
 app.delete('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res) => {
-  if (!VALID_PLAN_PHASES.has(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
+  if (!knownPhase(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
   const row = db.prepare('SELECT id FROM phase_plan_items WHERE id = ? AND phase_id = ?').get(req.params.id, req.params.phase_id);
   if (!row) return res.status(404).json({ error: 'not found' });
   db.prepare('DELETE FROM phase_plan_items WHERE id = ?').run(req.params.id);
@@ -2890,9 +3227,9 @@ app.delete('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res
 // overwrite path that was missing.
 app.patch('/api/phases/:phase_id/plan/days/:date', organizerOrAgentRequired, (req, res) => {
   const phaseId = req.params.phase_id;
-  if (!VALID_PLAN_PHASES.has(phaseId)) return res.status(400).json({ error: 'unknown phase' });
+  if (!knownPhase(phaseId)) return res.status(400).json({ error: 'unknown phase' });
   const { date } = req.params;
-  if (!ISO_DATE_RE.test(date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+  if (!isCalendarDay(date)) return res.status(400).json(planDateRefusal('date must be YYYY-MM-DD', 'date'));
   const body = req.body || {};
   for (const f of ['label_he', 'label_en']) {
     if (body[f] !== undefined && body[f] !== null && typeof body[f] !== 'string') {
@@ -2947,12 +3284,10 @@ app.patch('/api/phases/:phase_id/plan/days/:date', organizerOrAgentRequired, (re
 // together, in one transaction, or nothing does.
 app.post('/api/phases/:phase_id/plan/swap-days', organizerOrAgentRequired, (req, res) => {
   const phaseId = req.params.phase_id;
-  if (!VALID_PLAN_PHASES.has(phaseId)) return res.status(400).json({ error: 'unknown phase' });
+  if (!knownPhase(phaseId)) return res.status(400).json({ error: 'unknown phase' });
   const { date_a, date_b } = req.body || {};
   for (const [name, v] of [['date_a', date_a], ['date_b', date_b]]) {
-    if (typeof v !== 'string' || !ISO_DATE_RE.test(v)) {
-      return res.status(400).json({ error: `${name} must be YYYY-MM-DD` });
-    }
+    if (!isCalendarDay(v)) return res.status(400).json(planDateRefusal(`${name} must be YYYY-MM-DD`, name));
   }
   if (date_a === date_b) return res.status(400).json({ error: 'date_a and date_b must differ' });
 
@@ -3074,7 +3409,7 @@ async function enrichOne(item) {
       date: item.date || null,
       // Phase title gives the model the city/region, without which "the museum"
       // is unresolvable.
-      context: (TRIP_CONFIG.phases || []).find(p => p.id === item.phase_id)?.title || null,
+      context: tripStructure.phaseTitle(item.phase_id),
     }),
     // Must outlast trip-mcp's own 90s CLI budget, or this side gives up while
     // the model is still legitimately working and the item looks like a failure.
@@ -3167,7 +3502,7 @@ async function enrichDay(day) {
     body: JSON.stringify({
       kind: 'day',
       date: day.date,
-      context: (TRIP_CONFIG.phases || []).find(p => p.id === day.phase_id)?.title || null,
+      context: tripStructure.phaseTitle(day.phase_id),
       items: items.map(i => ({ time: i.time, text: i.text_en || i.text_he })),
     }),
     timeout: 100000,
@@ -3343,7 +3678,7 @@ async function reviewPhase(phaseId, days) {
     headers: { 'X-API-Key': HERMES_KEY, 'Content-Type': 'application/json' },
     body: JSON.stringify({
       kind: 'schedule_review',
-      context: (TRIP_CONFIG.phases || []).find(p => p.id === phaseId)?.title || null,
+      context: tripStructure.phaseTitle(phaseId),
       days,
     }),
     timeout: 120000,
@@ -3657,6 +3992,11 @@ function promoteConfigDays(createdBy, { queueEnrichment = true } = {}) {
   // 2026-09-25 it read the raw values: a one-element array passed httpOrNull's
   // regex and bound in SQLite as a plain value (stored, then served), and a
   // two-element one crashed boot with "Too many parameter values".
+  //
+  // The FILE, deliberately, not effectiveConfig(): this imports the original
+  // day plan (phases[].days[]), which the stop layer never carries — an
+  // override changes a stop's dates and hotel, never its days, and config_ref
+  // is keyed by the file's own positions.
   for (const rawPhase of (TRIP_CONFIG.phases || [])) {
     const phaseId = publicPart('phase', { id: rawPhase?.id })?.id;
     if (phaseId == null) continue;
@@ -3769,8 +4109,13 @@ function escapeConfigAttr(s) {
 app.post('/api/phase-plan/export-to-config', organizerOrAgentRequired, (req, res) => {
   if (!TRIP_CONFIG_RAW) return res.status(503).json({ error: 'trip config not loaded' });
   const phases = [];
+  // The EFFECTIVE phases are what gets written: the stops as the site shows
+  // them now (dates, hotels and stops set after the interview, open days
+  // recomputed), not the file as it was booted. A copy — the effective config
+  // is shared, and nothing is written unless something is exported.
+  const exportedPhases = JSON.parse(JSON.stringify(effectiveConfig().phases || []));
 
-  for (const phase of (TRIP_CONFIG.phases || [])) {
+  for (const phase of exportedPhases) {
     const items = db.prepare(
       'SELECT * FROM phase_plan_items WHERE phase_id = ? AND date IS NOT NULL ' +
       'ORDER BY date ASC, sort_order ASC, COALESCE(time_sort, 99999) ASC, id ASC'
@@ -3804,6 +4149,7 @@ app.post('/api/phase-plan/export-to-config', organizerOrAgentRequired, (req, res
   }
 
   if (!phases.length) return res.status(400).json({ error: 'no dated plan items to export' });
+  TRIP_CONFIG.phases = exportedPhases;
   persistConfigChange();
   const restorePoint = journey.setRestorePoint(req.user.username);
   const version = db.prepare('SELECT version FROM trip_config_versions ORDER BY version DESC LIMIT 1').get()?.version;
@@ -3824,7 +4170,7 @@ app.post('/api/phase-plan/import-from-bookings', organizerOrAgentRequired, (req,
     // for the Bookings tab dropping off-config phases). Importing one produced
     // a row that GET/PATCH/DELETE all reject as 'unknown phase' — unreachable
     // forever. Skip it and say so.
-    if (!VALID_PLAN_PHASES.has(bk.phase)) {
+    if (!knownPhase(bk.phase)) {
       skipped.push({ booking_id: bk.id, reason: 'phase not in trip config' });
       continue;
     }

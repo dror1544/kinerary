@@ -108,8 +108,14 @@ Hermes will deliver it as a file attachment.
 
 ## Coordinate coverage note
 The script extracts coordinates from:
-- Phase `accommodation` objects (hotels)
-- Bookings with `lat`/`lon`/`latitude`/`longitude` fields
+- Phase `hotels[]` entries, or else the phase's `accommodation` (hotels); a hotel with no coordinates of its
+  own takes its stop's coordinates, then the stop's `mapStop` pin
+- Bookings with `lat`/`lon`/`lng`/`latitude`/`longitude` fields
+
+## Language
+Names and descriptions in the file are in the trip's own language only (`meta.defaultLang`; without it, Hebrew
+when the trip has any Hebrew text, else English). A bilingual value uses the other language only when the trip's
+language is missing for it. Pass `get_config` as it comes — do not translate or merge the two languages yourself.
 
 **If a place has no coordinates** — it is silently skipped (not included in KML). After export, tell the user how many places were exported. If the count seems low, check whether the missing places have coordinates in the config/bookings and offer to look up their coordinates via the `maps` skill and update them.
 

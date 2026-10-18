@@ -769,6 +769,38 @@ describe("the poll loop", () => {
     });
   });
 
+  test("the group judge reaches the router through the poll loop: a judged-yes group message is pushed to the companion, marked", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await fix.pool.query(
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, $3)",
+        ["-1700100050", fix.tripId, "companion-japan"],
+      );
+      await fix.pool.query("UPDATE control_plane.trips SET assistant_names = $2 WHERE id = $1", [fix.tripId, ["Rio"]]);
+      const asked: string[] = [];
+      const groupJudge = {
+        model: () => "fake/judge",
+        judge: async (input: { text: string }) => {
+          asked.push(input.text);
+          return { kind: "yes" as const, confidence: 0.9, ms: 120, model: "fake/judge" };
+        },
+      };
+      fix.telegram.queued = [[{
+        update_id: 9,
+        message: { message_id: 3, from: { id: 777, first_name: "Dror" }, chat: { id: "-1700100050", type: "supergroup" }, text: "what time is check-in?" },
+      }]];
+      const stop = startTripBotPoller(
+        { db: fix.pool, telegram: fix.telegram, connector: fix.connector, groupJudge },
+        { longPollSeconds: 0, maxBackoffMs: 10 },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      stop();
+      assert.deepEqual(asked, ["what time is check-in?"]);
+      assert.equal(fix.connector.pushed.length, 1);
+      assert.match(fix.connector.pushed[0]!.text, /not addressed to you by name/);
+      assert.ok(fix.connector.pushed[0]!.text.endsWith("what time is check-in?"));
+    });
+  });
+
   test("a poisoned update cannot wedge the loop behind it", { skip: SKIP }, async () => {
     // The offset advances BEFORE handling. Telegram redelivers everything at or
     // after the offset until it moves, so an update that throws every time

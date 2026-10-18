@@ -25,6 +25,12 @@ this checks from outside, and each stage FAILS LOUDLY rather than warning.
 The scenarios are fixtures: `japan`, `multi` and `manual` each have documents
 and answers written down in control-plane/api/test/fixtures/make_documents.py,
 so the run can assert that a place named in a document reached the phase page.
+`star` (needs --auto) is a couples trip from ONE base with day trips: it checks
+the SHAPE of the built site, then tells the companion in chat about a hotel
+booking and a change of stops, asks it to plan one day, and checks the site
+followed (on macOS it first restarts the trip's bridge from this process, which
+holds the Local Network grant the worker's SSH-launched one lacks). What cannot pass
+yet is a named deferral that still runs and reports as a known gap.
 `own` is the other case — a person answering about a trip they actually mean to
 take. Nothing about it is scripted and nothing here knows the destination, so
 what the site is checked against is the intake THEY confirmed, read back from
@@ -44,6 +50,8 @@ import base64
 import datetime as dt
 import json
 import os
+import platform
+import re
 import secrets
 import shutil
 import subprocess
@@ -55,6 +63,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+from typing import NamedTuple
 
 REPO = Path(__file__).resolve().parents[1]
 API = os.environ.get("KINERARY_API", "http://127.0.0.1:4310")
@@ -88,6 +97,80 @@ OWN = "own"
 
 class Failed(Exception):
     """A stage that did not deliver what it claims to deliver."""
+
+
+# What `--scenario all` runs. `star` is deliberately not here: it cannot go
+# green until the interview-shape fix lands and the companion can edit stops,
+# and `all` is what hands-off runs use — a scenario that is red for known
+# reasons must be asked for by name.
+ALL_SCENARIOS = ["japan", "multi", "manual"]
+
+
+# ── Expectations that can be deferred ────────────────────────────────────────
+#
+# A `Verdict` is one expectation's outcome, computed by a pure function from
+# what the site served. Whether a failing verdict fails the RUN is decided
+# separately, by the scenario's `deferred` map (name -> reason): a deferred
+# expectation still runs, reports as a known gap with its reason, and says so
+# the day it starts passing. A deferral is never a deletion, which is why a
+# reason is required of every new one (test_e2e_star.py enforces it).
+
+class Verdict(NamedTuple):
+    name: str
+    passed: bool
+    good: str
+    bad: str
+    # A passing verdict that is information rather than a tick: printed as a
+    # note ("· ..."), not a pass mark. The check behind it was still made.
+    reported: bool = False
+
+
+def deferred_with_reasons(expect: dict) -> dict[str, str]:
+    """`expect["deferred"]` as {name: reason}. A bare list is the older form
+    (vietnam's) and means "deferred, no reason written down"."""
+    raw = expect.get("deferred") or {}
+    if isinstance(raw, dict):
+        return {str(k): str(v) for k, v in raw.items()}
+    return {str(name): "" for name in raw}
+
+
+def sort_verdicts(verdicts: "list[Verdict]", deferred: dict[str, str]):
+    """(hard failures, known gaps with reasons, deferred ones that now pass)."""
+    hard, gaps, now_passing = [], [], []
+    for v in verdicts:
+        if v.name in deferred:
+            (now_passing if v.passed else gaps).append((v, deferred[v.name]))
+        elif not v.passed:
+            hard.append(v)
+    return hard, gaps, now_passing
+
+
+def report_verdicts(verdicts: "list[Verdict]", deferred: dict[str, str], ctx: dict,
+                    raise_on_hard: bool = True) -> "list[Verdict]":
+    """Print every verdict, record the known gaps on the run, and fail on the
+    hard ones. All of them are printed before anything is raised, so a run with
+    three defects names three, not the first.
+
+    Returns the hard failures (empty when none), for a caller that has more to
+    check before it raises.
+    """
+    for v in verdicts:
+        if v.name in deferred:
+            reason = deferred[v.name]
+            if v.passed:
+                print(f"  {YELLOW}!{RESET} deferred check now PASSES ({v.name}): {v.good} "
+                      f"— take it off the deferred list")
+            else:
+                note(f"known gap, deferred ({v.name}): {v.bad}" + (f" — {reason}" if reason else ""))
+                ctx.setdefault("known_gaps", []).append((v.name, reason))
+        elif v.passed:
+            (note if v.reported else ok)(v.good)
+        else:
+            print(f"  {RED}✗{RESET} {v.name}: {v.bad}")
+    hard, _, _ = sort_verdicts(verdicts, deferred)
+    if hard and raise_on_hard:
+        raise Failed(f"{len(hard)} expectation(s) failed: " + "; ".join(f"{v.name}: {v.bad}" for v in hard))
+    return hard
 
 
 _stage = 0
@@ -281,6 +364,7 @@ class Auto:
             self.port = s.getsockname()[1]
         self.root = f"http://127.0.0.1:{self.port}"
         self.proc: subprocess.Popen | None = None
+        self.work = work
         self.log = work / "fake-telegram.log"
 
     def begin(self) -> None:
@@ -319,7 +403,17 @@ class Auto:
             report = REPORTS / f"chaos-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
             report.parent.mkdir(parents=True, exist_ok=True)
             cmd += ["--report", str(report)]
+        findings = None
+        if scenario == "star":
+            # What the organizer saw about ITSELF — whether its typed trip type
+            # had to fall back to the button. Read back after the build and turned
+            # into a verdict, so it fails alongside the site's own expectations
+            # rather than stopping the run at the first question.
+            findings = self.work / f"organizer-findings-{scenario}.json"
+            cmd += ["--findings", str(findings)]
         result = subprocess.run(cmd, cwd=REPO / "control-plane/api", env=env)
+        if findings is not None and findings.is_file():
+            ctx["organizer_findings"] = json.loads(findings.read_text())
         if report:
             note(f"chaos report (kept): {report}")
         check(result.returncode == 0, "the organizer answered every question and confirmed"
@@ -591,8 +685,15 @@ def stage_content(ctx: dict, scenario: str) -> None:
     # was serving it correctly. Both files count.
     whole = json.dumps(ctx["config"], ensure_ascii=False)
     bookings = DEPLOY_ROOT / "trips" / str(ctx.get("slug") or "") / "bookings.json"
+    ctx["bookings"] = []
     if bookings.is_file():
-        whole += bookings.read_text(encoding="utf-8")
+        bookings_text = bookings.read_text(encoding="utf-8")
+        whole += bookings_text
+        try:
+            rows = json.loads(bookings_text)
+        except json.JSONDecodeError as exc:
+            raise Failed(f"bookings.json is not JSON: {exc}") from exc
+        ctx["bookings"] = rows if isinstance(rows, list) else []
     for expected in spec.get("expect_anchor_text", []):
         check(expected in whole, f"booking reference on the site: {expected}",
               f"{expected!r} was given in the interview and is nowhere in the config")
@@ -612,8 +713,41 @@ def _check_site_expectations(ctx: dict, expect: dict) -> None:
     if not expect:
         return
     config = ctx["config"]
+    deferred = deferred_with_reasons(expect)
+
+    # The shape of the finished site (trip type, stops, anchors, rooms): every
+    # verdict is printed before anything is raised. The older expectations below
+    # raise on their own, so a hard failure here is held until they have run and
+    # then reported together with whatever they found.
+    shape = site_shape_verdicts(
+        config,
+        ctx.get("bookings") if ctx.get("bookings") is not None else [],
+        ((ctx["intake"] if "intake" in ctx else _load_intake(ctx)) if "trip_type" in expect else {}),
+        ctx.get("organizer_findings"),
+        expect,
+    )
+    for what in expect.get("report") or ():
+        if what == "car":
+            note(car_note(ctx.get("bookings") or []))
+    shape_failures = report_verdicts(shape, deferred, ctx, raise_on_hard=False)
+    held = ("; ".join(f"{v.name}: {v.bad}" for v in shape_failures)
+            if shape_failures else "")
+
+    try:
+        _check_account_expectations(ctx, expect, deferred)
+    except Failed as exc:
+        if held:
+            raise Failed(f"{len(shape_failures)} expectation(s) failed: {held}; and: {exc}") from exc
+        raise
+    if held:
+        raise Failed(f"{len(shape_failures)} expectation(s) failed: {held}")
+
+
+def _check_account_expectations(ctx: dict, expect: dict, deferred: dict) -> None:
+    """The expectations that predate the shape verdicts: timezone, language,
+    confirmed-booking count, days covered. Each raises on its own."""
+    config = ctx["config"]
     agent = config.get("agent") or {}
-    deferred = set(expect.get("deferred") or ())
 
     def check_or_note(name: str, condition: bool, good: str, bad: str) -> None:
         """`check`, unless this expectation is a KNOWN gap someone has already
@@ -624,6 +758,7 @@ def _check_site_expectations(ctx: dict, expect: dict) -> None:
             check(condition, good, bad)
         else:
             note(f"known gap, deferred: {bad}")
+            ctx.setdefault("known_gaps", []).append((name, deferred[name]))
 
     if expect.get("timezone_is_iana"):
         from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -670,25 +805,7 @@ def _check_site_expectations(ctx: dict, expect: dict) -> None:
               f"{want}; it renders {evidenced} confirmation(s) of its own")
 
     if expect.get("days_covered") == "all":
-        meta = config.get("meta") or {}
-        start = str(meta.get("departure") or "")[:10]
-        end = str(meta.get("returnDate") or "")[:10]
-        covered = set()
-        for phase in config.get("phases") or []:
-            dates = phase.get("dates") or {}
-            a, b = str(dates.get("start") or "")[:10], str(dates.get("end") or "")[:10]
-            if a and b:
-                day = dt.date.fromisoformat(a)
-                while day <= dt.date.fromisoformat(b):
-                    covered.add(day.isoformat())
-                    day += dt.timedelta(days=1)
-        missing = []
-        if start and end:
-            day = dt.date.fromisoformat(start)
-            while day <= dt.date.fromisoformat(end):
-                if day.isoformat() not in covered:
-                    missing.append(day.isoformat())
-                day += dt.timedelta(days=1)
+        covered, missing = uncovered_days(config)
         # The failure text is built only when there IS a failure. Python
         # evaluates both arguments, so `missing[0]` in the message raised
         # IndexError the first time this check passed — a latent crash that
@@ -709,6 +826,243 @@ def _check_site_expectations(ctx: dict, expect: dict) -> None:
                   f"phase {gap.get('id')!r} covers days nobody planned and says nothing about it")
         if gaps:
             ok(f"{len(gaps)} open stretch(es), shown rather than dropped")
+
+
+def uncovered_days(config: dict, start: str = "", end: str = "") -> "tuple[set, list]":
+    """(days some phase covers, days of the trip no phase covers).
+
+    The trip's bounds are meta.departure / meta.returnDate unless given — a
+    served config may not carry `meta`, and the caller then knows the dates.
+    """
+    meta = config.get("meta") or {}
+    start = start or str(meta.get("departure") or "")[:10]
+    end = end or str(meta.get("returnDate") or "")[:10]
+    covered: set = set()
+    for phase in config.get("phases") or []:
+        dates = phase.get("dates") or {}
+        a, b = str(dates.get("start") or "")[:10], str(dates.get("end") or "")[:10]
+        if a and b:
+            day = dt.date.fromisoformat(a)
+            while day <= dt.date.fromisoformat(b):
+                covered.add(day.isoformat())
+                day += dt.timedelta(days=1)
+    missing: list = []
+    if start and end:
+        day = dt.date.fromisoformat(start)
+        while day <= dt.date.fromisoformat(end):
+            if day.isoformat() not in covered:
+                missing.append(day.isoformat())
+            day += dt.timedelta(days=1)
+    return covered, missing
+
+
+# ── The shape of a built site: pure verdicts ─────────────────────────────────
+#
+# Written for the `star` scenario (a base town with day trips), but about the
+# site rather than the scenario: each takes what the site holds and what was
+# expected, and says whether they agree.
+
+def _spellings(name: "str | list") -> "list[str]":
+    return [name] if isinstance(name, str) else list(name)
+
+
+def _mentions(text: str, spelling: str) -> bool:
+    """Whether `text` names `spelling`. A Latin spelling must stand as a word —
+    the airport code FRA is inside "France" — while a Hebrew one is a plain
+    substring, because prefixes (בפרנקפורט, לפרנקפורט) attach to the word."""
+    if spelling.isascii():
+        return re.search(r"(?<![A-Za-z0-9])" + re.escape(spelling) + r"(?![A-Za-z0-9])",
+                         text, re.IGNORECASE) is not None
+    return spelling in text
+
+
+def _stop_name(phase: dict) -> str:
+    """A stop's NAME as the site shows it — title, id, tab — and nothing else.
+    Its notes may legitimately mention the airport the family lands at."""
+    title = phase.get("title") or {}
+    return " ".join(str(x) for x in (title.get("he"), title.get("en"), phase.get("id"), phase.get("tabLabel")) if x)
+
+
+def _stop_label(phase: dict) -> str:
+    title = phase.get("title") or {}
+    dates = phase.get("dates") or {}
+    name = title.get("en") or title.get("he") or phase.get("id") or "?"
+    return f"{name} {dates.get('start') or '(undated)'}..{dates.get('end') or '(undated)'}"
+
+
+def stops_verdict(phases: list, stops: list, name: str = "stops") -> Verdict:
+    """The site has exactly these stops, in order, each with these dates."""
+    problems = []
+    if len(phases) != len(stops):
+        problems.append(f"{len(phases)} stop(s) where {len(stops)} expected")
+    for i, want in enumerate(stops):
+        spellings = _spellings(want["name"])
+        if i >= len(phases):
+            problems.append(f"no stop #{i + 1} ({spellings[0]} {want['start']}..{want['end']})")
+            continue
+        have = phases[i]
+        dates = have.get("dates") or {}
+        if not any(_mentions(_stop_name(have), s) for s in spellings):
+            problems.append(f"stop #{i + 1} is not {spellings[0]}")
+        got = (str(dates.get("start") or "")[:10], str(dates.get("end") or "")[:10])
+        if got != (want["start"], want["end"]):
+            problems.append(f"{spellings[0]} is dated {got[0] or '(undated)'}..{got[1] or '(undated)'}, "
+                            f"expected {want['start']}..{want['end']}")
+    labels = "; ".join(_stop_label(p) for p in phases) or "none"
+    return Verdict(
+        name, not problems,
+        f"the site has the expected stop(s): {', '.join(_stop_label(p) for p in phases)}",
+        f"{'; '.join(problems)} (the site has: {labels})")
+
+
+def not_stops_verdict(phases: list, spellings: "str | list") -> Verdict:
+    """None of these places is a stop — the gateway city, where flights land."""
+    wanted = _spellings(spellings)
+    named = [_stop_label(p) for p in phases if any(_mentions(_stop_name(p), s) for s in wanted)]
+    return Verdict("not_stops", not named,
+                   f"{wanted[0]} is not a stop",
+                   f"{wanted[0]} is a stop on the site ({'; '.join(named)}) — it is where the "
+                   f"flights land, not where the family stays")
+
+
+def flight_verdicts(bookings: list, want: dict) -> "list[Verdict]":
+    """A dated flight in and one out, with the gateway on them.
+
+    Arrival and departure are travel_anchors; the site shows them as flight
+    rows in bookings.json. An undated flight is not an arrival.
+    """
+    flights = [b for b in bookings if str(b.get("type") or "") == "flight"]
+    dates = {str(b.get("date_from") or "")[:10] for b in flights}
+    missing = [f"{label} on {day}" for label, day in (("a flight in", want["in"]), ("a flight out", want["out"]))
+               if day not in dates]
+    text = " ".join(f"{b.get('name') or ''} {b.get('notes') or ''}" for b in flights)
+    gateway = _spellings(want.get("gateway") or [])
+    return [
+        Verdict("flight_anchors", not missing,
+                f"flights in ({want['in']}) and out ({want['out']}) are on the site",
+                f"missing {', '.join(missing)}; the site has {len(flights)} flight(s), "
+                f"dated {sorted(d for d in dates if d) or 'none'}"),
+        Verdict("gateway_in_anchors", any(_mentions(text, g) for g in gateway),
+                f"the gateway ({gateway[0]}) is named on the flights",
+                f"the gateway city ({gateway[0]}) is named on none of {len(flights)} flight(s) — the "
+                f"flights should carry it, since it is not a stop"),
+    ]
+
+
+_CAR_RE = re.compile(r"rental car|car rental|\brent(?:ed)? a car\b|רכב", re.IGNORECASE)
+
+
+def car_note(bookings: list) -> str:
+    """What the site says about a rental car. REPORT ONLY: the owner calls the
+    one car "usually not mandatory", so neither presence nor absence is a verdict."""
+    found = [b for b in bookings
+             if str(b.get("type") or "") == "car"
+             or _CAR_RE.search(f"{b.get('name') or ''} {b.get('notes') or ''}")]
+    if not found:
+        return "rental car: none recorded on the site (optional, not a failure)"
+    return "rental car: " + "; ".join(str(b.get("name") or b.get("type")) for b in found) + " (optional, reported only)"
+
+
+_ROOMS_RE = re.compile(r"\b(?:2|two)\s+rooms?\b|שני\s+חדרים|2\s+חדרים|שתי\s+יחידות", re.IGNORECASE)
+
+
+def rooms_verdict(config: dict, bookings: list) -> Verdict:
+    """"Two rooms" survives somewhere a traveller can read it. Where is not
+    decided — no field on a stop holds a room count — so anywhere on the config
+    or in a booking counts."""
+    text = json.dumps(config.get("phases") or [], ensure_ascii=False) + json.dumps(bookings, ensure_ascii=False)
+    return Verdict("rooms_visible", _ROOMS_RE.search(text) is not None,
+                   "the two rooms are visible on the site",
+                   "the organizer said one hotel, two rooms; 'two rooms' is on no stop and in no booking")
+
+
+def trip_type_flagged(config: "dict | None", words: str) -> bool:
+    """The companion was told the trip type is an open question: the config's
+    agent block carries a standing instruction marked `open_question:
+    "trip_type"` that quotes the organizer's words in both languages."""
+    agent = (config or {}).get("agent")
+    if not isinstance(agent, dict):
+        return False
+    for ins in agent.get("standing_instructions") or ():
+        if not isinstance(ins, dict) or ins.get("open_question") != "trip_type":
+            continue
+        text = ins.get("text") if isinstance(ins.get("text"), dict) else {}
+        if words and all(words in str(text.get(lang) or "") for lang in ("en", "he")):
+            return True
+    return False
+
+
+def trip_type_verdict(intake: dict, want: str, config: "dict | None" = None) -> Verdict:
+    """The trip type is the option, or, when the organizer's words matched no
+    option, those words kept and flagged for the companion.
+
+    Owner decision 2026-10-15: the trip type never blocks the build. Free text
+    is no longer a failure; it is REPORTED, and the run still fails when the
+    words did not reach the companion as an open question (a free-text trip
+    type that is unflagged would be silently treated as settled). Any other
+    recorded option than `want`, or nothing, still fails.
+    """
+    answer = (intake or {}).get("trip_type") or {}
+    kind = answer.get("kind")
+    if kind == "choice_other":
+        words = str(answer.get("other_text") or "").strip()
+        return Verdict(
+            "trip_type", trip_type_flagged(config, words),
+            f"trip_type left as the organizer's words {words!r}; flagged for the companion",
+            f"trip_type was left as the organizer's words {words!r} but the config carries no "
+            f"open-question instruction for the companion (agent.standing_instructions entry "
+            f"with open_question=trip_type quoting those words), so it would be treated as settled",
+            reported=True)
+    if kind == "choice":
+        recorded = f"option {answer.get('option_id')!r}"
+    else:
+        recorded = "nothing"
+    return Verdict("trip_type", kind == "choice" and answer.get("option_id") == want,
+                   f"trip_type is the {want!r} option",
+                   f"trip_type was recorded as {recorded}, expected the {want!r} option")
+
+
+def typed_choice_verdict(findings: "dict | None") -> Verdict:
+    """The organizer typed its trip type in words and the interview understood it.
+
+    `findings` is what the organizer wrote about itself (tools/auto-organizer.ts
+    --findings). Absent is a failure: silence must not read as understood.
+    """
+    if findings is None:
+        return Verdict("typed_choice_understood", False, "",
+                       "the organizer wrote no findings file, so nobody knows whether its typed answer was understood")
+    fallbacks = findings.get("typed_fallbacks") or []
+    return Verdict(
+        "typed_choice_understood", not fallbacks,
+        "the typed trip type was understood without tapping the button",
+        "; ".join(f"typed {f.get('question')!r} {f.get('tries')} time(s), the interview kept asking, "
+                  "and the button had to be tapped" for f in fallbacks))
+
+
+def site_shape_verdicts(config: dict, bookings: list, intake: dict, findings: "dict | None",
+                        expect: dict) -> "list[Verdict]":
+    out: "list[Verdict]" = []
+    phases = config.get("phases") or []
+    if "trip_type" in expect:
+        out.append(trip_type_verdict(intake, expect["trip_type"], config))
+    if "stops" in expect:
+        out.append(stops_verdict(phases, expect["stops"]))
+    if "not_stops" in expect:
+        out.append(not_stops_verdict(phases, expect["not_stops"]))
+    if "flight_anchors" in expect:
+        out.extend(flight_verdicts(bookings, expect["flight_anchors"]))
+    if expect.get("typed_choice_understood"):
+        out.append(typed_choice_verdict(findings))
+    if expect.get("rooms_visible"):
+        out.append(rooms_verdict(config, bookings))
+    return out
+
+
+def _load_intake(ctx: dict) -> dict:
+    """The confirmed intake, as the organizer's answers were recorded."""
+    return json.loads(psql(
+        f"SELECT data FROM control_plane.intake_versions "
+        f"WHERE trip_id='{ctx['trip_id']}' ORDER BY version DESC LIMIT 1") or "{}")
 
 
 def stage_own_content(ctx: dict) -> None:
@@ -831,8 +1185,17 @@ def stage_served(ctx: dict) -> None:
         capture_output=True, text=True,
     ).stdout
     password = next((l.split("=", 1)[1].strip() for l in env.splitlines() if l.startswith("SEED_PASSWORD=")), "")
-    check(bool(password), "the site has a shared password to log in with",
+    check(bool(password), "the site has a password to log in with",
           "no SEED_PASSWORD in the container's .env — nobody can log in to this trip at all")
+    # One password PER TRIP since 2026-10-15, generated at bootstrap. What the
+    # organizer is told (companion_intro, delivered in their private chat) has to
+    # be the one this site accepts - the worker reads it back from the container
+    # for exactly that reason - or the introduction hands out a login that fails.
+    told = psql(
+        f"SELECT companion_intro->>'login_password' FROM control_plane.trips WHERE id='{ctx['trip_id']}'") or ""
+    check(told == password, "the password the organizer is told is the one the site accepts",
+          "companion_intro.login_password differs from the container's SEED_PASSWORD "
+          "(or is missing) - the organizer's introduction carries a login that will not work")
 
     username = next((p.get("username") for p in (ctx["config"].get("participants") or []) if p.get("username")), "")
     check(bool(username), f"a traveller to log in as ({username})", "the config has no participant with a username")
@@ -909,6 +1272,85 @@ def stage_served(ctx: dict) -> None:
           f"/api/itinerary/active returned {str(itinerary)[:120]}")
 
 
+# ── The trip-mcp bridge on macOS (Local Network grant) ───────────────────────
+#
+# CLAUDE.md, "A Mac-provisioned companion that cannot read its own trip": the
+# worker wires the bridge over SSH, and macOS grants Local Network access per
+# responsible process, so that bridge serves MCP on loopback and fails every
+# call through to the trip's LAN address with EHOSTUNREACH. A process launched
+# from THIS run's own context has the grant, so on a Mac the run restarts the
+# bridge itself — with the deploy wrapper's documented command — and then asks
+# the bridge's /health whether it can reach its trip. Anywhere else the
+# provisioner's own check (companion-install-host.sh) already did that.
+
+def bridge_restart_command(system: str, deploy_root: Path, slug: str, repo: Path) -> "dict | None":
+    """The command that restarts this trip's bridge from the run's own process,
+    or None when this is not macOS. Pure: it decides, it does not run."""
+    if system != "Darwin":
+        return None
+    trip_dir = deploy_root / "trips" / slug
+    return {"argv": [str(deploy_root / "setup-mcp.sh"), "--restart-only", "--trip-dir", str(trip_dir)],
+            "env": {"REPO_ROOT": str(repo)}, "trip_dir": trip_dir}
+
+
+def _env_file_value(path: Path, key: str) -> str:
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return ""
+    for line in lines:
+        if line.startswith(f"{key}="):
+            return line.split("=", 1)[1].strip().strip('"').strip("\r")
+    return ""
+
+
+def bridge_health(port: str, key: str, run=subprocess.run) -> "tuple[bool, str]":
+    """Ask the bridge's /health whether it can reach its trip. The key goes to
+    curl on STDIN (`--config -`), never on the command line where `ps` shows it."""
+    config = (f'url = "http://127.0.0.1:{port}/health"\nheader = "X-API-Key: {key}"\n'
+              "silent\nshow-error\nmax-time = 15\n")
+    body = run(["curl", "--config", "-"], input=config, capture_output=True, text=True).stdout or ""
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return False, body.strip()[:200] or "no answer from the bridge"
+    return (isinstance(parsed, dict) and parsed.get("ok") is True), body.strip()[:200]
+
+
+def stage_bridge_reach(ctx: dict, system: "str | None" = None, run=subprocess.run, sleep=time.sleep,
+                       deploy_root: "Path | None" = None, repo: "Path | None" = None) -> bool:
+    """On macOS, restart the trip's bridge from this process and assert that it
+    can reach the trip. Returns whether it ran (False off macOS, doing nothing)."""
+    plan = bridge_restart_command(platform.system() if system is None else system, deploy_root or DEPLOY_ROOT,
+                                  str(ctx["slug"]), repo or REPO)
+    if plan is None:
+        return False
+    stage("The bridge — restarted from this process, so it holds the Local Network grant (macOS)")
+    trip_dir: Path = plan["trip_dir"]
+    key = _env_file_value(trip_dir / "mcp" / ".env", "MCP_API_KEY")
+    check(bool(key), "the bridge has an MCP key beside the trip",
+          f"no MCP_API_KEY in {trip_dir}/mcp/.env — the provisioner never wired this trip's bridge")
+    log = Path(tempfile.mkdtemp(prefix="kinerary-e2e-bridge-")) / "setup-mcp.log"
+    with open(log, "w") as out:
+        result = run(plan["argv"], env={**os.environ, **plan["env"]}, stdin=subprocess.DEVNULL,
+                     stdout=out, stderr=subprocess.STDOUT, timeout=180)
+    tail = log.read_text()[-400:].replace(key, "***")
+    shutil.rmtree(log.parent, ignore_errors=True)
+    check(result.returncode == 0, "setup-mcp.sh --restart-only restarted the bridge",
+          f"setup-mcp.sh --restart-only failed:\n{tail}")
+    port = _env_file_value(trip_dir / "mcp" / ".env", "MCP_PORT") or str(3000 + int(ctx["vmid"]))
+    healthy, body = False, ""
+    for _ in range(5):
+        healthy, body = bridge_health(port, key, run=run)
+        if healthy:
+            break
+        sleep(2)
+    check(healthy, f"the bridge on :{port} reaches the trip site (/health ok)",
+          f"the bridge on :{port} cannot reach the trip even when restarted from this process "
+          f"— /health said: {body.replace(key, '***')}")
+    return True
+
+
 def stage_companion(ctx: dict) -> None:
     stage("The companion — installed, rendered, running, routable")
     slug = ctx["slug"]
@@ -976,7 +1418,7 @@ def stage_mcp(ctx: dict) -> None:
 def site_login(ctx: dict) -> "tuple[str, str]":
     """A traveller's own session on the trip site: (base url, bearer token).
 
-    The same door stage_served uses — the shared password out of the
+    The same door stage_served uses — the trip's own password out of the
     container's own .env, and a participant from the trip's config.
     """
     base = f"http://{ctx['ip']}:8080"
@@ -1139,8 +1581,271 @@ def stage_documents(ctx: dict, auto: "Auto", work: Path) -> None:
     approve_until("family group", group, 12, landed("group"), since_group)
 
 
+# ── Changing the trip through the companion (the `star` scenario) ────────────
+
+#: Said to the companion whenever it asks for permission. Both languages: the
+#: organizer writes Hebrew, and the companion's own rule is to ask before it writes.
+APPROVAL = "כן, בבקשה תמשיך, אני מאשר. Yes, go ahead — I approve."
+
+_CHECK_IN_RE = re.compile(r"check[\s\-]*in\b|צ[׳'’`]?ק[\s\-]*אין|כניסה למלון|הגעה למלון", re.IGNORECASE)
+_CHECK_OUT_RE = re.compile(r"check[\s\-]*out\b|צ[׳'’`]?ק[\s\-]*(?:אאוט|אוט)|עזיבת המלון|יציאה מהמלון", re.IGNORECASE)
+
+
+def asks_permission(text: str) -> bool:
+    """Whether the companion's message is a question (and so waits for a yes)."""
+    return "?" in text
+
+
+def converse(auto, chat: str, text: str, *, quiet_seconds: int = 90, max_minutes: int = 10,
+             max_approvals: int = 3, poll: int = 10, sleep=time.sleep, clock=time.time) -> dict:
+    """Say `text` to the companion and stay until it has gone quiet.
+
+    A question is answered with an approval — the companion asks before it
+    writes — but at most `max_approvals` times, so two chatty parties cannot
+    keep each other going. The chat has gone quiet when it has said something
+    and then nothing for `quiet_seconds`. No reply at all within `max_minutes`
+    is returned as `timed_out` with no replies: the caller decides, and a
+    companion that never answered must not read as one that had nothing to add.
+
+    Everything is measured from the chat's position BEFORE the message, so
+    history (the welcome, earlier turns) is never mistaken for an answer.
+    """
+    seen = auto.seq_now(chat)
+    auto.say(chat, text)
+    started = clock()
+    deadline = started + max_minutes * 60
+    last_activity = started
+    replies: list[str] = []
+    approvals = 0
+    while clock() < deadline:
+        sleep(poll)
+        new = auto.said(chat, seen)
+        fresh = [m for m in new if m["kind"] == "send"]
+        if new:
+            seen = max(m["seq"] for m in new)
+        if fresh:
+            replies.extend(m["text"] for m in fresh)
+            last_activity = clock()
+            if approvals < max_approvals and asks_permission(fresh[-1]["text"]):
+                approvals += 1
+                auto.say(chat, APPROVAL)
+        elif replies and clock() - last_activity >= quiet_seconds:
+            return {"replies": replies, "approvals": approvals, "timed_out": False}
+    return {"replies": replies, "approvals": approvals, "timed_out": True}
+
+
+def hotel_booking_verdict(bookings: list, hotel: dict) -> Verdict:
+    """A hotel booking for this hotel with both its dates is on the site."""
+    needle = hotel["name"].casefold()
+    rows = [b for b in bookings if str(b.get("type") or "") == "hotel"]
+    named = [b for b in rows if needle in f"{b.get('name') or ''} {b.get('notes') or ''}".casefold()]
+    exact = [b for b in named if str(b.get("date_from") or "")[:10] == hotel["check_in"]
+             and str(b.get("date_to") or "")[:10] == hotel["check_out"]]
+    seen = "; ".join(f"{b.get('name')} {b.get('date_from')}..{b.get('date_to')}" for b in rows) or "no hotel bookings"
+    return Verdict("hotel_booking_recorded", bool(exact),
+                   f"the hotel booking is on the site ({hotel['name']}, {hotel['check_in']}..{hotel['check_out']})",
+                   f"no hotel booking for {hotel['name']} dated {hotel['check_in']}..{hotel['check_out']} "
+                   f"(the site has: {seen})")
+
+
+def stop_accommodation_verdict(phases: list, hotel: dict) -> Verdict:
+    """The stop itself names the hotel — what a traveller sees on the Journey tab."""
+    needle = hotel["name"].casefold()
+    held = [(p.get("accommodation") or {}) for p in phases]
+    return Verdict("base_stop_accommodation",
+                   any(needle in f"{a.get('name') or ''} {a.get('name_en') or ''}".casefold() for a in held),
+                   f"the base stop's accommodation is {hotel['name']}",
+                   f"the base stop's accommodation is "
+                   f"{[a['name'] for a in held if a.get('name')] or 'absent'}, not {hotel['name']}")
+
+
+def plan_item_verdict(items: list, day: str, kind: str) -> Verdict:
+    """The plan has a check-in (kind "in") or check-out (kind "out") item on `day`."""
+    pattern = _CHECK_IN_RE if kind == "in" else _CHECK_OUT_RE
+    name = "checkin_plan_item" if kind == "in" else "checkout_plan_item"
+    word = "check-in" if kind == "in" else "check-out"
+    on_day = [i for i in items if str(i.get("date") or "")[:10] == day]
+    hit = [i for i in on_day if pattern.search(f"{i.get('text_en') or ''} {i.get('text_he') or ''}")]
+    return Verdict(name, bool(hit), f"the plan has a {word} item on {day}",
+                   f"the plan has no {word} item on {day} ({len(on_day)} item(s) that day, "
+                   f"{len(items)} in the plan)")
+
+
+def _item_text(item: dict) -> str:
+    return f"{item.get('text_en') or ''} {item.get('text_he') or ''}"
+
+
+def day_plan_verdict(items: list, day: str, places: list, name: str = "day_plan_applied") -> Verdict:
+    """`day` of the ACTIVE itinerary has an item naming every place in `places`.
+
+    `items` are GET /api/itinerary/active's `items`; each entry of `places` is
+    one place's spellings (Latin and Hebrew), and either names it. A place found
+    only on another day is reported as such: the companion planned it, on the
+    wrong day, which is a different defect from not planning it.
+    """
+    on_day = [i for i in items if str(i.get("date") or "")[:10] == day]
+    missing, elsewhere = [], []
+    for place in places:
+        spellings = _spellings(place)
+        if any(_mentions(_item_text(i), s) for i in on_day for s in spellings):
+            continue
+        missing.append(spellings[0])
+        days = sorted({str(i.get("date") or "(undated)")[:10] for i in items
+                       if any(_mentions(_item_text(i), s) for s in spellings)})
+        if days:
+            elsewhere.append(f"{spellings[0]} is planned on {', '.join(days)}")
+    first = [_spellings(p)[0] for p in places]
+    if not missing:
+        return Verdict(name, True, f"{day} has plan items for {' and '.join(first)} ({len(on_day)} item(s) that day)",
+                       "")
+    detail = f"{day} has no plan item naming {' or '.join(missing)} ({len(on_day)} item(s) that day, " \
+             f"{len(items)} in the plan)"
+    if elsewhere:
+        detail += "; wrong day: " + "; ".join(elsewhere)
+    return Verdict(name, False, "", detail)
+
+
+def _checkin_out_keys(plan: list) -> "set[tuple]":
+    return {(str(i.get("date") or "")[:10], i.get("text_en") or "", i.get("text_he") or "")
+            for i in plan if _CHECK_IN_RE.search(_item_text(i)) or _CHECK_OUT_RE.search(_item_text(i))}
+
+
+def checkin_out_kept_verdict(before: list, after: list) -> Verdict:
+    """Planning a day must not take away the hotel's check-in / check-out items
+    that were on the plan before it. Compared to the plan just BEFORE the day
+    plan, not to the booking's dates: the change of stops legitimately moves the
+    check-out, and that is not this step's doing."""
+    was, now = _checkin_out_keys(before), _checkin_out_keys(after)
+    lost = sorted(was - now)
+    return Verdict("checkin_checkout_kept", bool(was) and not lost,
+                   f"the day plan left the {len(was)} check-in/check-out item(s) as they were",
+                   "there were no check-in/check-out items to keep" if not was else
+                   "the day plan removed or changed check-in/check-out item(s): "
+                   + "; ".join(f"{d} {en or he}" for d, en, he in lost))
+
+
+def days_verdict(config: dict, start: str, end: str, name: str = "days_covered") -> Verdict:
+    """Every day from `start` to `end` is on some stop."""
+    if not (start and end):
+        return Verdict(name, False, "", "no trip dates to check coverage against")
+    covered, missing = uncovered_days(config, start, end)
+    return Verdict(name, not missing, f"every day of the trip is on the site ({len(covered)} days)",
+                   f"{len(missing)} day(s) are on no stop at all"
+                   + (f" ({missing[0]}..{missing[-1]})" if missing else ""))
+
+
+def after_booking_verdicts(expect: dict, hotel: dict, config: dict, bookings: list, plan: list) -> "list[Verdict]":
+    out = []
+    if expect.get("hotel_booking_recorded"):
+        out.append(hotel_booking_verdict(bookings, hotel))
+    if expect.get("base_stop_accommodation"):
+        out.append(stop_accommodation_verdict((config.get("phases") or [])[:1], hotel))
+    if expect.get("checkin_plan_item"):
+        out.append(plan_item_verdict(plan, hotel["check_in"], "in"))
+    if expect.get("checkout_plan_item"):
+        out.append(plan_item_verdict(plan, hotel["check_out"], "out"))
+    return out
+
+
+def after_change_verdicts(expect: dict, config: dict, start: str, end: str) -> "list[Verdict]":
+    out = []
+    if "stops_after_change" in expect:
+        out.append(stops_verdict(config.get("phases") or [], expect["stops_after_change"], "stops_after_change"))
+    if expect.get("days_covered") == "all":
+        out.append(days_verdict(config, start, end))
+    return out
+
+
+def after_plan_verdicts(expect: dict, day_plan: dict, active_items: list,
+                        plan_before: list, plan_after: list) -> "list[Verdict]":
+    out = []
+    if expect.get("day_plan_applied"):
+        out.append(day_plan_verdict(active_items, day_plan["date"], day_plan["places"]))
+    if expect.get("checkin_plan_item") or expect.get("checkout_plan_item"):
+        out.append(checkin_out_kept_verdict(plan_before, plan_after))
+    return out
+
+
+def site_get(base: str, path: str, token: str):
+    out = subprocess.run(["curl", "-s", "-m", "30", f"{base}{path}", "-H", f"Authorization: Bearer {token}"],
+                         capture_output=True, text=True).stdout
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        raise Failed(f"{path} did not answer JSON: {out[:200]!r}")
+
+
+def served_state(base: str, token: str) -> "tuple[dict, list, list]":
+    """What a signed-in traveller is served now: the config (stops, with their
+    dates and accommodation), the bookings, and every phase's plan items."""
+    config = site_get(base, "/api/config", token)
+    if not isinstance(config, dict) or not config.get("phases"):
+        raise Failed(f"/api/config served no phases: {str(config)[:160]}")
+    bookings = site_get(base, "/api/bookings", token)
+    plan: list = []
+    for phase in config["phases"]:
+        rows = site_get(base, f"/api/phases/{phase['id']}/plan", token)
+        if isinstance(rows, list):
+            plan.extend(rows)
+    return config, bookings if isinstance(bookings, list) else [], plan
+
+
+def stage_companion_changes(ctx: dict, auto: "Auto", spec: dict) -> None:
+    """Tell the companion about a hotel booking, then a change of stops, then ask
+    it to plan one day, and check the SITE followed — never the chat's words.
+
+    Most of what the second half asks for cannot pass today: no companion tool
+    or site route edits a stop's dates, boundaries or accommodation. Those are
+    named deferrals in the scenario (make_documents.py), so this stage reports
+    them as known gaps rather than failing, and keeps asserting them for the day
+    they go green.
+    """
+    stage("The companion — a hotel booking, a change of stops, then a day plan, through chat")
+    after = spec["after_companion"]
+    hotel, expect = after["hotel"], after["expect"]
+    chat = ctx["chat"]
+    base, token = site_login(ctx)
+    trip_start, trip_end = spec["departure_date"], spec["return_date"]
+
+    def tell(what: str, message: str) -> None:
+        result = converse(auto, chat, message)
+        check(bool(result["replies"]), f"the companion answered the {what}",
+              f"the companion never answered the {what} (waited 10 min)")
+        note(f"{what}: {len(result['replies'])} reply(ies), {result['approvals']} approval(s) given; "
+             f"last: {result['replies'][-1][:110]!r}")
+
+    verdicts: "list[Verdict]" = []
+    tell("hotel booking", after["booking_message"])
+    config, bookings, plan = served_state(base, token)
+    verdicts += after_booking_verdicts(expect, hotel, config, bookings, plan)
+
+    tell("change of stops", after["change_message"])
+    config, bookings, plan = served_state(base, token)
+    verdicts += after_change_verdicts(expect, config, trip_start, trip_end)
+
+    if "plan_message" in after:
+        # The organizer asks for one day's plan. What is read back is the ACTIVE
+        # itinerary — what the site renders — not the chat, and not only the
+        # per-phase plan the hotel step read.
+        plan_before = plan
+        tell("day plan", after["plan_message"])
+        _, _, plan_after = served_state(base, token)
+        active = site_get(base, "/api/itinerary/active", token)
+        if not isinstance(active, dict) or not isinstance(active.get("items"), list):
+            raise Failed(f"/api/itinerary/active served no items: {str(active)[:160]}")
+        verdicts += after_plan_verdicts(expect, after["day_plan"], active["items"], plan_before, plan_after)
+
+    report_verdicts(verdicts, deferred_with_reasons(expect), ctx)
+
+
+def _scenario_spec(scenario: str) -> dict:
+    sys.path.insert(0, str(REPO / "control-plane/api/test/fixtures"))
+    from make_documents import SCENARIOS  # noqa: E402
+    return SCENARIOS[scenario]
+
+
 TRIP_NAMES = {"japan": "Japan 2026", "multi": "Italy 2026", "manual": "Portugal 2026", "chaos": "Greece 2027",
-              "vietnam": "Vietnam 2028",
+              "vietnam": "Vietnam 2028", "star": "Alsace 2027",
               # A placeholder the organizer would have typed on the signup form,
               # deliberately not a destination: naming it would be this script
               # deciding what an `own` run is about. --trip-name replaces it.
@@ -1149,9 +1854,11 @@ TRIP_NAMES = {"japan": "Japan 2026", "multi": "Italy 2026", "manual": "Portugal 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--scenario", default="multi", choices=["japan", "multi", "manual", "chaos", "vietnam", OWN, "all"],
+    ap.add_argument("--scenario", default="multi", choices=["japan", "multi", "manual", "chaos", "vietnam", "star", OWN, "all"],
                     help="a fixture (japan, multi, manual), 'chaos' — an automated organizer who does "
-                         "not follow the interview (tools/organizer-chaos.ts), or 'own' — a person's real "
+                         "not follow the interview (tools/organizer-chaos.ts), 'star' — a couples trip "
+                         "from one base with day trips, then a change of stops through the companion "
+                         "(needs --auto; known gaps are reported, not failed), or 'own' — a person's real "
                          "trip, checked against the intake they confirm")
     ap.add_argument("--trip-name", default=None)
     ap.add_argument("--wait-minutes", type=int, default=30,
@@ -1182,10 +1889,13 @@ def main() -> int:
                  "organizer can only play a fixture (japan, multi, manual, chaos)")
     if args.scenario == "chaos" and not args.auto:
         ap.error("--scenario chaos is the automated organizer misbehaving on purpose; it needs --auto")
+    if args.scenario == "star" and not args.auto:
+        ap.error("--scenario star needs --auto: it types its trip type in words and then talks to the "
+                 "companion as the organizer")
     if args.scenario == "all" and not args.auto:
         ap.error("--scenario all needs --auto: three interviews back to back are not a thing to ask a person for")
 
-    scenarios = ["japan", "multi", "manual"] if args.scenario == "all" else [args.scenario]
+    scenarios = list(ALL_SCENARIOS) if args.scenario == "all" else [args.scenario]
     results: list[tuple[str, int, dict]] = []
     try:
         stage_preflight()
@@ -1247,13 +1957,22 @@ def run_scenario(scenario: str, args: argparse.Namespace, auto: "Auto | None", c
         stage_site(ctx)
         stage_own_content(ctx) if scenario == OWN else stage_content(ctx, scenario)
         stage_served(ctx)
+        stage_bridge_reach(ctx)
         stage_companion(ctx)
         stage_mcp(ctx)
         if getattr(args, "documents", False):
             if auto is None:
                 raise Failed("--documents needs --auto: sending a file is a person's action")
             stage_documents(ctx, auto, work)
+        if scenario != OWN and "after_companion" in _scenario_spec(scenario):
+            if auto is None:
+                raise Failed(f"--scenario {scenario} changes the trip through the companion; it needs --auto")
+            stage_companion_changes(ctx, auto, _scenario_spec(scenario))
         print(f"\n{GREEN}✓ full cycle green ({scenario}){RESET}: site, content, companion and MCP all verified.")
+        if ctx.get("known_gaps"):
+            print(f"  {YELLOW}known gaps, deferred and tracked ({len(ctx['known_gaps'])}):{RESET}")
+            for name, reason in ctx["known_gaps"]:
+                print(f"    - {name}" + (f": {reason}" if reason else ""))
         print(f"  trip:  {ctx['trip_id']}  ({ctx['slug']})")
         print(f"  login: {ctx['email']} / {ctx['password']}")
         return 0

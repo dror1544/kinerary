@@ -176,7 +176,7 @@ const TRIP_CONFIG_PUBLIC = object({
   meta: object({
     title: scalar, title_en: scalar, brand: scalar, logo: scalar, logoAlt: scalar,
     admin: scalar, destination: scalar, defaultLang: scalar,
-    departure: scalar, returnDate: scalar, totalDays: scalar,
+    departure: scalar, returnDate: scalar, totalDays: scalar, deploymentNonce: scalar,
     homeCurrency: scalar, home_country: scalar, homePhoto: scalar, mapPhoto: scalar,
     photoCredits: list(object({ phase: scalar, title: scalar, source: scalar, license: scalar })),
   }),

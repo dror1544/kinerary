@@ -15,7 +15,17 @@
  * letting a duplicate surface later as a flaky EADDRINUSE.
  *
  * Only fixed ports belong here. A stand-in that binds port 0 and reads its
- * address back cannot collide, and needs no entry.
+ * address back cannot collide, and needs no entry. Neither does a test whose
+ * server needs no known port: `await freePort()` (helpers/port-guard.js) takes
+ * whatever the OS has free, so a LEAKED server from an earlier or another
+ * worktree's run cannot hold it — which is what fixed ports are exposed to,
+ * and why a test that can use one should (control-plane-session, hero-http,
+ * calendar-routes... did, 2026-10-13).
+ *
+ * A fixed port that something already holds is named, not discovered as an
+ * EADDRINUSE cascade: `npm test` runs check-free-ports.js first (pretest),
+ * and startTestServer()/startTestMcp() call assertPortFree() before spawning.
+ * Both name the holder's pid and command and say how to stop it.
  *
  * Adding a test that binds a port: add a named entry here, and import it.
  * Never write a port literal in a test file. That rule is not style: a literal
@@ -75,8 +85,6 @@ export const EPHEMERAL_RANGE_FIRST = 32768;
 export const TRIP_BRIDGE_PORT_RANGE = { first: 3100, last: 3999 };
 
 export const PORTS = {
-  companionControl:        28201,
-  companionConversation:   28202,
   // ── Full trip servers ──────────────────────────────────────────────────
   telegramSso:             28095,
   telegramSsoConfigResync: 28100,
@@ -91,7 +99,6 @@ export const PORTS = {
   errorHandling:           28105,
   currencyRates:           28107,
   scheduleReviewServer:    28109,
-  itineraryOverlaySync:    28113,
   planSingleSource:        28119,
   planSingleSourceBoot:    28120,
   itineraryPlanLayerServer: 28118,
@@ -100,15 +107,8 @@ export const PORTS = {
   configAllowListPromote:  28127,  // tests/config-allow-list.test.js — malformed plan config, issue #172
   galleryBoundary:         28128,  // tests/gallery-boundary.test.js — issues #191/#194
   galleryHardening:        28129,  // tests/gallery-hardening.test.js — boundary audit round 2 of #191/#194
-  // tests/trip-documents.test.js
-  tripDocuments:           28299,
-  tripTimezone:            28310,  // tests/trip-timezone.test.js
-
   modernParity:            28298,
-  modernEnrichment:        28194,
-  heroHttp:                28196,
   tripEventsHttp:          28198,
-  controlPlaneSession:     28296,
   tripMcpEnabled:          28304,
   tripMcpDisabled:         28305,
   tripMcpPublicOrigin:     28306,
@@ -122,22 +122,69 @@ export const PORTS = {
   configDayLinksSeeded:    28115,
 
   // ── MCP servers ────────────────────────────────────────────────────────
-  controlPlaneSessionMcp:  28295,
   groupDocumentMcp:        28293,
   mcpExtract:              28106,
   mcpExtractEmpty:         28300,
   mcpExtractEnv:           28301,  // tests/mcp-extract-env.test.js — issue #183
   itineraryPlanLayerMcp:   28108,
   mcpDefault:              28117,
-  mcpBookingConfirmation:  28116,
-  mcpBudget:               28121,
   mcpHealthUnreachable:    28122,
   mcpHealthReachable:      28123,
   mcpHealthAuth:           28125,
   mcpPhasePlan:            28308,  // tests/mcp-phase-plan.test.js — issue #310
   mcpPhasePlanLarge:       28309,  // tests/mcp-phase-plan.test.js — issue #310, safety-net fixture
-  mcpTripTimezone:         28311,  // tests/mcp-trip-timezone.test.js
   lostFound:               28312,  // tests/lost-found.test.js — issue #207
+  // Stop editing after the interview (server slices S1–S3).
+  tripStops:               28313,  // tests/trip-stops-http.test.js — main flow
+  tripStopsGolden:         28314,  // tests/trip-stops-http.test.js — byte-identical /api/config, one server at a time
+  itineraryMoveDay:        28315,  // tests/itinerary-move-day.test.js
+  configAllowListStops:    28316,  // tests/config-allow-list.test.js — stop overrides never serve pin/provenance
+  tripStopsHardening:      28317,  // tests/trip-stops-http.test.js — boundary review 2026-10-11 (stored XSS, prototype keys)
+  // Stop editing from the companion (slice S4) — tests/mcp-trip-stops.test.js.
+  mcpTripStops:            28318,  // mcp/mcp.js against a stand-in site
+  mcpTripStopsLive:        28319,  // mcp/mcp.js against the real trip server below
+  mcpTripStopsSite:        28320,  // the real trip server mcpTripStopsLive talks to
+  stopFollowups:           28321,  // tests/stop-followups.test.js — split-then-link, gershayim (second review 2026-10-11)
+  // "Tonight:" lodging computed at serve time — tests/tonight-lodging.test.js.
+  tonightLodging:          28322,
+  // Write-time validation of booking and participant text, bilingual refusals
+  // — tests/write-validation.test.js.
+  writeValidation:         28323,  // the trip server
+  writeValidationExtract:  28324,  // stand-in for the extraction service (extract-draft)
+  writeValidationMcp:      28325,  // mcp/mcp.js against that trip server
+  // The four P2 findings of the automated review of PR #362 (stop editing)
+  // — tests/stop-review-fixes.test.js.
+  stopReviewFixes:         28326,
+  // Subdivision flags (emoji tag sequences) in stop text, over HTTP (owner
+  // decision, 2026-10-12) — tests/emoji-flags-http.test.js.
+  emojiFlagsHttp:          28328,
+  // Tool output with the Unicode tag block made visible or dropped (boundary
+  // re-check of PR #375) — tests/mcp-tag-output.test.js.
+  mcpTagOutputSite:        28329,  // the real trip server
+  mcpTagOutputMcp:         28330,  // mcp/mcp.js against it
+  // The same for tool ERRORS (code review of PR #375): a stand-in site whose
+  // refusals carry tag text, so every error helper in mcp/mcp.js is reached.
+  mcpErrorTagsSite:      28334,  // the stand-in site
+  mcpErrorTagsMcp:       28335,  // mcp/mcp.js against it
+  // The public lost-and-found form: write-time text rules, abuse bounds, and
+  // the finder-submitted label on the model's copy — tests/lost-found-hardening.test.js.
+  lostFoundHardening:       28331,  // the trip server (text rules, MCP, Classic)
+  lostFoundHardeningMcp:    28332,  // mcp/mcp.js against it
+  lostFoundHardeningBounds: 28333,  // a second trip server: rate limit and open-entry cap
+  // Boundary review of PR #377: the limiter's client address behind a proxy
+  // (TRUST_PROXY_HOPS) and the bounded get_lost_found — tests/lost-found-proxy.test.js.
+  lostFoundProxyDefault:    28336,  // TRUST_PROXY_HOPS unset
+  lostFoundProxyOneHop:     28337,  // TRUST_PROXY_HOPS=1
+  lostFoundProxyTwoHops:    28338,  // TRUST_PROXY_HOPS=2
+  lostFoundProxyInvalid:    28339,  // invalid values, one server at a time
+  lostFoundBoundsSite:      28340,  // GET ?open= ?limit= ?count=1
+  lostFoundBoundsMcpSite:   28341,  // the trip server mcp/mcp.js reads
+  lostFoundBoundsMcp:       28342,  // mcp/mcp.js against it
+  // Review of the hardening itself: GET serves a column allow-list.
+  lostFoundColumnsSite:     28343,  // the trip server, with an extra column added
+  // One hotel, one place — a companion-added hotel resolves to the same name
+  // and links in every view — tests/hotel-one-place.test.js.
+  hotelOnePlace:            28351,
 
   // ── Stand-ins for services the server calls out to ─────────────────────
   bookingExtractMockHermes: 28103,

@@ -7,6 +7,7 @@ import { applyMigrations } from "../src/migrations.js";
 import {
   GROUP_BINDING_TOKEN_PATTERN,
   extractGroupBindingToken,
+  groupBindingTokenFromStartPayload,
   issueGroupBindingToken,
   redeemGroupBindingToken,
 } from "../src/group-binding.js";
@@ -45,6 +46,29 @@ async function withFixture(fn: (fix: Fixture) => Promise<void>): Promise<void> {
     await pool.end();
   }
 }
+
+describe("groupBindingTokenFromStartPayload", () => {
+  test("accepts exactly a token, canonicalised", () => {
+    assert.equal(groupBindingTokenFromStartPayload("KIN-ABCD2345"), "KIN-ABCD2345");
+    assert.equal(groupBindingTokenFromStartPayload("kin-abcd2345"), "KIN-ABCD2345");
+  });
+
+  test("a token is a legal Telegram start payload: A-Za-z0-9_- and at most 64 characters", () => {
+    // `?startgroup=<payload>` only carries that alphabet, so the token has to
+    // fit it without encoding — otherwise the link could not bind.
+    const issued = "KIN-ABCD2345";
+    assert.match(issued, /^[A-Za-z0-9_-]{1,64}$/);
+  });
+
+  test("anything that merely CONTAINS a token is not one: enrollment tokens, words, longer strings", () => {
+    for (const payload of [
+      "KIN-ABCD2345x", "KIN-ABCD23456", "xKIN-ABCD2345", "KIN-ABCD2345_rest", "see KIN-ABCD2345",
+      "japan-2026", "", null, undefined, "KIN-ABCD234", "KIN-ABCI2345",
+    ]) {
+      assert.equal(groupBindingTokenFromStartPayload(payload as never), null, String(payload));
+    }
+  });
+});
 
 describe("extractGroupBindingToken", () => {
   test("finds the token in a message the organizer pasted with other words", () => {

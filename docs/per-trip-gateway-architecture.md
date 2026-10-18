@@ -376,7 +376,8 @@ Link by link:
 
 - **User ↔ Companion** — shared bot → Kinerary relay → this trip's gateway
   (§4). The routing that gets it there is already built and already Kinerary's.
-- **Companion ↔ MCP** — 41 tools over SSE, authenticated with this trip's own
+- **Companion ↔ MCP** — 41 tools over SSE (the count on the day of that proof;
+  `mcp/mcp.js` registers 56 now, including the five stop tools), authenticated with this trip's own
   key, from a process that resolved `mcp_servers` under this trip's home. The
   live half is proven: reads (`get_config`, `get_phase_plan`, `get_bookings`,
   `get_photos`) and writes (`add_plan_item`, `update_plan_item`,

@@ -98,6 +98,54 @@
       "roster": [{"name": "Dana Levi"}, {"name": "Dana Cohen"}],
       "answer": "Dana",
       "expect": null
+    },
+    {
+      "why": "interview-language names with the Latin form beside them: the organizer answers in Hebrew",
+      "roster": [{"name": "דרור אלול", "name_en": "Dror Aloul"}, {"name": "חגית מלי אלול", "name_en": "Hagit Mali Aloul"}, {"name": "צחי סער", "name_en": "Tzachi Saar"}, {"name": "ליאב סער", "name_en": "Liav Saar"}],
+      "answer": "דרור אלול",
+      "expect": 0
+    },
+    {
+      "why": "the same roster, the organizer answers in English",
+      "roster": [{"name": "דרור אלול", "name_en": "Dror Aloul"}, {"name": "חגית מלי אלול", "name_en": "Hagit Mali Aloul"}, {"name": "צחי סער", "name_en": "Tzachi Saar"}, {"name": "ליאב סער", "name_en": "Liav Saar"}],
+      "answer": "Dror Aloul",
+      "expect": 0
+    },
+    {
+      "why": "the same roster, a first name in English",
+      "roster": [{"name": "דרור אלול", "name_en": "Dror Aloul"}, {"name": "חגית מלי אלול", "name_en": "Hagit Mali Aloul"}, {"name": "צחי סער", "name_en": "Tzachi Saar"}, {"name": "ליאב סער", "name_en": "Liav Saar"}],
+      "answer": "Hagit",
+      "expect": 1
+    },
+    {
+      "why": "the same roster, a first name in Hebrew",
+      "roster": [{"name": "דרור אלול", "name_en": "Dror Aloul"}, {"name": "חגית מלי אלול", "name_en": "Hagit Mali Aloul"}, {"name": "צחי סער", "name_en": "Tzachi Saar"}, {"name": "ליאב סער", "name_en": "Liav Saar"}],
+      "answer": "ליאב",
+      "expect": 3
+    },
+    {
+      "why": "the same roster, two travellers share a surname, so the surname alone names nobody",
+      "roster": [{"name": "דרור אלול", "name_en": "Dror Aloul"}, {"name": "חגית מלי אלול", "name_en": "Hagit Mali Aloul"}, {"name": "צחי סער", "name_en": "Tzachi Saar"}, {"name": "ליאב סער", "name_en": "Liav Saar"}],
+      "answer": "סער",
+      "expect": null
+    },
+    {
+      "why": "a roster confirmed before names were normalised (two in English letters, two Hebrew-only): a Hebrew answer for a Latin entry",
+      "roster": [{"name": "Dror Aloul", "name_en": "Dror Aloul"}, {"name": "Hagit Mali Aloul", "name_en": "Hagit Mali Aloul"}, {"name": "צחי סער"}, {"name": "ליאב סער"}],
+      "answer": "דרור אלול",
+      "expect": 0
+    },
+    {
+      "why": "the same older roster: a Hebrew first name for a Hebrew-only entry",
+      "roster": [{"name": "Dror Aloul", "name_en": "Dror Aloul"}, {"name": "Hagit Mali Aloul", "name_en": "Hagit Mali Aloul"}, {"name": "צחי סער"}, {"name": "ליאב סער"}],
+      "answer": "צחי",
+      "expect": 2
+    },
+    {
+      "why": "the same older roster: English letters for a Hebrew-only entry, by sound",
+      "roster": [{"name": "Dror Aloul", "name_en": "Dror Aloul"}, {"name": "Hagit Mali Aloul", "name_en": "Hagit Mali Aloul"}, {"name": "צחי סער"}, {"name": "ליאב סער"}],
+      "answer": "Tzachi",
+      "expect": 2
     }
   ]
 }

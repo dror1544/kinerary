@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import { before, after, test } from 'node:test';
 import { startTestServer, stopTestServer, api, loginAsAlice } from './helpers/server.js';
-import { PORTS } from './helpers/ports.js';
+import { freePort } from './helpers/port-guard.js';
 let owner, member;
 before(async () => {
-  await startTestServer({ PORT: PORTS.companionConversation, HERMES_API_KEY: 'conversation-test-agent' });
+  await startTestServer({ PORT: await freePort(), HERMES_API_KEY: 'conversation-test-agent' });
   owner = await loginAsAlice();
   member = (await (await api('/api/auth/login', { method: 'POST', body: { username: 'bob', password: '1234' } })).json()).token;
 });
