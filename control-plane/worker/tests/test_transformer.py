@@ -2087,6 +2087,26 @@ class DeriveDaysFromAnchorsTests(unittest.TestCase):
         self.assertEqual(out["kyoto"][0]["items"][0], {"time": "19:30", "text": {"he": "Fushimi Inari night walk",
                                                                                "en": "Fushimi Inari night walk"}})
 
+    # Reliability guarantee A (state consistency, MRD 5.3): the plan is
+    # regenerated from the held answers, so a corrected time must be the only
+    # time any day carries -- the old one cannot survive a regeneration.
+    def test_a_corrected_time_replaces_the_old_one_on_regeneration(self) -> None:
+        def regenerate(time):
+            return self._days([{"type": "activity", "name": "Fushimi Inari night walk",
+                                "date": "2026-09-25", "time": time, "confirmation": "FI-1"}])
+
+        before, after = regenerate("19:30"), regenerate("20:15")
+        self.assertEqual([i["time"] for d in before["kyoto"] for i in d["items"]], ["19:30"])
+        self.assertEqual([i["time"] for d in after["kyoto"] for i in d["items"]], ["20:15"])
+        self.assertEqual(after, regenerate("20:15"), "regenerating twice must give the same days")
+
+    def test_a_corrected_date_moves_the_item_and_leaves_nothing_on_the_old_day(self) -> None:
+        def regenerate(date):
+            return self._days([{"type": "activity", "name": "Tokyo Skytree", "date": date}])
+
+        moved = regenerate("2026-09-21")
+        self.assertEqual([d["date"] for d in moved["tokyo"]], ["2026-09-21"])
+
     def test_the_questions_own_example_shape_is_understood(self) -> None:
         # interview.ts travel_anchors dataExample, verbatim in shape.
         out = self._days([{"type": "flight", "name": "LY075 TLV-HND", "date": "2026-09-19", "confirmation": "ABC123"}])
