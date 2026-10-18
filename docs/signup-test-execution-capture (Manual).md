@@ -221,6 +221,7 @@ correctly with no correction needed.
 | 2 | The router/classifier took a travelers clarification as the answer to an unrelated, different question | **Bug** | → #413. 2026-10-18, gate 3. While sorting out finding #1 above, the organizer typed "נוסעים אחרים" ("other travelers") meaning it as clarification about the second ticket's names; the router applied it instead as the answer to a different open question — what to name the bot. Same *class* as #114 (free text not mapped to the slot the organizer meant), which sits in Track 2 of `docs/sprint6-tracks.md` as "the interview cannot hold what it's given" — but #114's own text is about unprompted/ambiguous volunteered facts, not about free text landing on the *wrong already-open* question, so Track 2 is a plausible home, not a confirmed one. **Unrouted** — see Decisions needed. |
 | 3a | The flight appears twice in the trip's Journey/itinerary view | **Open** | → #415. 2026-10-18, gate 3. Whether this is a defect depends on an unsettled product call: two couples really did travel on two separate ticket bookings, so two Journey entries may be the *correct* rendering of two real flights, or the two may be meant to collapse into one. The organizer did not bless this one the way he did 3b below. Not a code bug until that's decided. **Unrouted** — a product decision, not a sprint/track question; see Decisions needed. |
 | 3b | Under Reservations/bookings the flight also appears twice, but the second entry carries no ticket names/details — making it read as broken rather than as two legitimate separate bookings | **Bug** | → #414. 2026-10-18, gate 3. The organizer's own call: two reservation rows for two separate bookings would be *correct and expected*; the defect is specifically that the duplicate entry drops the names/details that would distinguish it from the first. Likely the same rendering/derivation path as 3a (`derive_bookings`/transformer, trip-content). Routed to **Track 1** (trip UI/UX) by the same convention that already sends trip-content rendering defects there (the original 2026-08-29 "Trip-content items → Sprint 4.5" routing, Track 1's successor). |
+| 4 | Opening the trip site's link from inside Telegram's own in-app browser (a WebView, not full Safari), logging in, and trying to view a document — the document does not display | **Bug** | → #417. 2026-10-18, gate 3, one observation reported in a follow-up note to this same run, Dror's own words verbatim: *"when I opened the web link from telegram and login and try to view a document, it doesn't show from safari it works. In PWA state it works fine. This is not a blocker."* The same action works in actual Safari and in the installed PWA (standalone mode) — only Telegram's in-app WebView fails. No root cause asserted here (candidates not ruled in or out: a JS API the WebView lacks, a `Content-Disposition`/MIME handling difference, an iframe/object-embed restriction, a CSP or viewport difference specific to that WebView). **Unrouted**: no track in `docs/sprint6-tracks.md` names "trip site behaviour inside Telegram's own in-app browser" as owned ground, and unlike 3b this is not a general trip-content rendering defect but a single client-environment's failure, so 3b's Track 1 routing convention does not automatically extend to it. See Decisions needed. **The owner's own call: not a blocker.** |
 
 **Decisions needed.**
 
@@ -238,9 +239,19 @@ correctly with no correction needed.
 - **Should two same-date bookings for different travelers render as one
   Journey entry or two?** Finding 3a is a product call, independent of
   finding 3b's rendering bug, and nothing in the plan currently answers it.
+- **Who owns trip-site behaviour that is specific to Telegram's own in-app
+  browser, as distinct from the site in general?** Finding #4 (the document
+  viewer fails only inside Telegram's WebView, not in Safari and not in the
+  installed PWA) is not a general trip-content rendering defect the way 3b
+  is, so 3b's Track 1 routing convention does not automatically reach it. No
+  track in `docs/sprint6-tracks.md` names ownership of one client
+  environment's behaviour. Candidates, not chosen here: Track 1 (it is still
+  site-cadence work) or a browser-compatibility backlog of its own. The
+  owner's own call is that this one is not a blocker, so nothing here forces
+  an urgent guess.
 - **No sprint is currently recorded as open to receive any of this.**
   `.project/sprint.json` is stale (shows Sprint 6, pre-merge); Sprint 7 is
   scoped to post-trip debrief and doesn't fit. Until a next sprint/cadence is
   recorded (see the 2026-09-28 "agile cadence after Release B" note), these
-  three findings have nowhere concrete to land beyond the track guesses
+  four findings have nowhere concrete to land beyond the track guesses
   offered above.
