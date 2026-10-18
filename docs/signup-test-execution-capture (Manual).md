@@ -184,3 +184,63 @@ Run by the owner on the Mac staging stack, scenario `manual`, Hebrew interview: 
 | R5 | On the Classic site the activity-voting section never rendered for a trip built from config, and one stop with no venues stopped the ratings | **Partial** | 2026-10-11, PR #363 (`tests/rsvp-config-stops.test.js`). **#170 is addressed, not closed:** its second bug (a card for an activity with no date or price) now shows blanks rather than "undefined" but no test pins it. #170 has no sprint label — unrouted, Q2. |
 
 **Unrouted from this run (no sprint owns them; see "Open ownership questions" in `docs/sprint6-tracks.md`):** the bridge `/health` check that did not fail provisioning and the Codex-fallback companion (Q4); CI not running `tests/scripts` and the grants re-apply at the VM upgrade (Q5); the test page and the Node-version fault (Q6); #170, #367 and #368 have no sprint label (Q2); and the ownership of the whole fix series (Q1).
+
+### Manual test run 2026-10-18 — gate 3 (pre-VM-upgrade), `main` post-sprint-6-merge
+
+Run by the owner on the Mac staging stack, trip slug `france-2026`
+(`trip_d28ce5320b0960fa8a6501e0cdff5c93`), against `main` at `81cafd3` — the
+commit sprint-6 just merged into — as gate 3 of the pre-VM-upgrade checklist
+(his own manual test/examination, including the newly added features). Raw
+notes belong outside the repository under the 2026-09-28 policy, in
+`$KINERARY_NOTES_DIR/run-notes/2026-10-18-gate3-manual-test.md`; **this session
+had no shell/Bash tool available, so it could not resolve
+`$KINERARY_NOTES_DIR`, check it for the macOS `uchg` lock, or write there.**
+The raw notes are reproduced verbatim in this run's handback and still need
+archiving there by a session with shell access — see the note at the top of
+this file: a missing/inaccessible vault is reported plainly, never worked
+around by writing into `docs/`.
+
+**Ownership note.** `.project/sprint.json` still records Sprint 6 as the open
+sprint (last touched 2026-09-20, before the merge visible in today's git log);
+Sprint 7 as planned (`docs/onboarding-mvp-sprint-plan.md`) is post-trip debrief
+and doesn't fit any of the three findings below. No sprint/track in
+`docs/sprint6-tracks.md` claims ongoing maintenance of the (already-shipped)
+document-intake feature or of general interview-routing correctness
+post-merge. Rather than guess, candidate owners are named per row and the real
+gap — nothing is currently the recorded owner of a *new* defect in already-shipped
+Sprint 6 work — is carried to Decisions needed below.
+
+**Worked well, worth recording so it isn't re-tested from scratch:** the
+interview reached confirmation on a two-couple, same-dates, two-flight-ticket
+scenario, and the first uploaded ticket's traveler names were extracted
+correctly with no correction needed.
+
+| # | Issue | Status | Detail |
+|---|---|---|---|
+| 1 | Document extraction got the first couple's names from their flight ticket but missed the second couple's names from a second ticket (same dates, different travelers); the organizer had to type them in by hand | **Bug** | → #412. 2026-10-18, gate 3, one observation (not yet replayed). Two tickets, same travel dates, two different couples, uploaded in the same document-intake pass: the first ticket's names extracted cleanly, the second ticket's did not and required an explicit manual answer. Lands in the document-intake feature (`#92` Slice A/B territory, merged via sprint-6) — **unrouted**: no track in `docs/sprint6-tracks.md` claims ongoing-maintenance ownership of that feature now that it has shipped. See Decisions needed. |
+| 2 | The router/classifier took a travelers clarification as the answer to an unrelated, different question | **Bug** | → #413. 2026-10-18, gate 3. While sorting out finding #1 above, the organizer typed "נוסעים אחרים" ("other travelers") meaning it as clarification about the second ticket's names; the router applied it instead as the answer to a different open question — what to name the bot. Same *class* as #114 (free text not mapped to the slot the organizer meant), which sits in Track 2 of `docs/sprint6-tracks.md` as "the interview cannot hold what it's given" — but #114's own text is about unprompted/ambiguous volunteered facts, not about free text landing on the *wrong already-open* question, so Track 2 is a plausible home, not a confirmed one. **Unrouted** — see Decisions needed. |
+| 3a | The flight appears twice in the trip's Journey/itinerary view | **Open** | → #415. 2026-10-18, gate 3. Whether this is a defect depends on an unsettled product call: two couples really did travel on two separate ticket bookings, so two Journey entries may be the *correct* rendering of two real flights, or the two may be meant to collapse into one. The organizer did not bless this one the way he did 3b below. Not a code bug until that's decided. **Unrouted** — a product decision, not a sprint/track question; see Decisions needed. |
+| 3b | Under Reservations/bookings the flight also appears twice, but the second entry carries no ticket names/details — making it read as broken rather than as two legitimate separate bookings | **Bug** | → #414. 2026-10-18, gate 3. The organizer's own call: two reservation rows for two separate bookings would be *correct and expected*; the defect is specifically that the duplicate entry drops the names/details that would distinguish it from the first. Likely the same rendering/derivation path as 3a (`derive_bookings`/transformer, trip-content). Routed to **Track 1** (trip UI/UX) by the same convention that already sends trip-content rendering defects there (the original 2026-08-29 "Trip-content items → Sprint 4.5" routing, Track 1's successor). |
+
+**Decisions needed.**
+
+- **Who maintains document-intake correctness now that `#92` has shipped?**
+  Finding #1 is a defect in already-merged code; no track in
+  `docs/sprint6-tracks.md` is recorded as owning *post-ship* document-intake
+  bugs (the doc only covers landing/assessing the PR). Candidates: Track 1
+  (it feeds trip content) or a dedicated document-intake-maintenance track —
+  not chosen here.
+- **Who owns the free-text-lands-on-the-wrong-open-question bug class?**
+  Finding #2 resembles #114's family (Track 2) but is not the same failure
+  mode #114 describes, and no issue currently names "clarifying one answer
+  gets misapplied to a different, already-pending question." Needs its own
+  determination, not an assumption that it's #114's bug.
+- **Should two same-date bookings for different travelers render as one
+  Journey entry or two?** Finding 3a is a product call, independent of
+  finding 3b's rendering bug, and nothing in the plan currently answers it.
+- **No sprint is currently recorded as open to receive any of this.**
+  `.project/sprint.json` is stale (shows Sprint 6, pre-merge); Sprint 7 is
+  scoped to post-trip debrief and doesn't fit. Until a next sprint/cadence is
+  recorded (see the 2026-09-28 "agile cadence after Release B" note), these
+  three findings have nowhere concrete to land beyond the track guesses
+  offered above.
