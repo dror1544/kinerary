@@ -24,6 +24,8 @@ const SAVED_PAGE = '<html><body><script>fetch("/api/config")</script>Booking con
 const contentName = (content, ext) => `${createHash('sha256').update(content).digest('hex')}.${ext}`;
 const VOUCHER = contentName(VOUCHER_TEXT, 'txt');
 const PAGE = contentName(SAVED_PAGE, 'html');
+const UNICODE_NAME = 'אישור הזמנה מקורי.pdf';
+const UNICODE_PDF = Buffer.from('%PDF-1.4\noriginal Unicode confirmation\n');
 
 // A document published into the trip's NFS directory only — the hard-linked,
 // single-copy path — must be listed and served exactly like one beside the config.
@@ -40,6 +42,7 @@ before(async () => {
   mkdirSync(documents, { recursive: true });
   writeFileSync(join(documents, VOUCHER), VOUCHER_TEXT);
   writeFileSync(join(documents, PAGE), SAVED_PAGE);
+  writeFileSync(join(documents, UNICODE_NAME), UNICODE_PDF);
   writeFileSync(join(testTripDir(), 'documents.json'), JSON.stringify([
     { file: NFS_ONLY, filename: 'Artemide.txt', mime: 'text/plain', links: [{ kind: 'phase', id: 'rome' }] },
     {
@@ -104,6 +107,20 @@ describe('a published source document through the confirmation route', () => {
     assert.match(res.headers.get('content-type'), /^text\/plain/);
     assert.equal(res.headers.get('cache-control'), 'private, no-store');
     assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+  });
+
+  test('a Unicode original filename returns exact bytes with safe UTF-8 disposition', async () => {
+    const url = `/api/bookings/confirmation/${encodeURIComponent(UNICODE_NAME)}`;
+    assert.equal((await api(url)).status, 401);
+    const res = await api(url, { token });
+    assert.equal(res.status, 200);
+    assert.deepEqual(Buffer.from(await res.arrayBuffer()), UNICODE_PDF);
+    assert.equal(res.headers.get('content-type'), 'application/pdf');
+    assert.equal(res.headers.get('cache-control'), 'private, no-store');
+    assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+    const disposition = res.headers.get('content-disposition');
+    assert.match(disposition, /^inline; filename="[ -~]+"; filename\*=UTF-8''/);
+    assert.equal(decodeURIComponent(disposition.split("filename*=UTF-8''")[1]), UNICODE_NAME);
   });
 
   test('a saved web page is a download, never a page on the trip origin', async () => {
