@@ -1,11 +1,11 @@
 {
   "format": 1,
-  "updated_at": "2026-09-20T17:38:45Z",
-  "updated_by": "Dror (recorded by Claude, readiness-baseline session)",
+  "updated_at": "2026-10-18T18:28:15Z",
+  "updated_by": "Dror (recorded by Claude, branch-cleanup session)",
   "sprint": {
     "id": "6",
     "title": "Verification, explicit activation, dashboard, and demo rehearsal",
-    "integration_branch": "integration/sprint-6",
+    "integration_branch": "main",
     "target_branch": "main",
     "milestone": "Sprint 6",
     "scope": {
@@ -78,6 +78,12 @@
       "by": "Dror (recorded by Claude, readiness-baseline session)",
       "change": "unlock sprint",
       "reason": "Dror, 2026-09-20: baseline established and the sprint work begins; he conditioned the unlock on the e2e passing with appropriate waivers, and scripts/e2e-full-cycle.py --scenario vietnam --auto --teardown is green at 97582b6 against a build verified from inside the running container, with no waivers taken"
+    },
+    {
+      "at": "2026-10-18T18:28:15Z",
+      "by": "Dror (recorded by Claude, branch-cleanup session)",
+      "change": "set-sprint 6 on integration/sprint-6 -> 6 on main",
+      "reason": "integration/sprint-6 and integration/sprint-6-into-main are both merged into main (0 commits ahead on either) and have been deleted; Sprint 6's work now lives on main directly, so the sprint record should point there too"
     }
   ]
 }
