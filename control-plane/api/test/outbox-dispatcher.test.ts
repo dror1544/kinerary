@@ -345,17 +345,226 @@ test("companion-ready introduces the assistant and hands over the token", { skip
       async sendMessage(p) { sent.push(p); },
     }, () => {}, { botUsername: "Kinerary_bot" });
 
-    // Two messages: the introduction, then the line to copy on its own.
-    assert.equal(sent.length, 2);
+    // Three messages: the introduction (password in a code span), the line to
+    // copy on its own, then the password on its own.
+    assert.equal(sent.length, 3);
     assert.match(sent[0]!.text, /Rio/);
-    assert.match(sent[0]!.text, /seed-pw/);
+    assert.match(sent[0]!.text, /<code>seed-pw<\/code>/);
     assert.match(sent[1]!.text, /^\/group KIN-/, "the copyable command, alone");
+    assert.equal(sent[2]!.text, "seed-pw", "the password, alone, last");
 
     const { rowCount } = await pool.query(
       "SELECT 1 FROM control_plane.telegram_group_binding_tokens WHERE trip_id = $1",
       [tripId],
     );
     assert.equal(rowCount, 1, "exactly one live token for the trip");
+  } finally {
+    await pool.end();
+  }
+});
+
+test("companion-ready is marked sent only after the password message too; a failure there retries every part", { skip }, async () => {
+  const pool = testPool();
+  const client = await pool.connect();
+  try {
+    await resetDb(client);
+    await applyMigrations(client, migrationsDir);
+    client.release();
+
+    const tripId = await insertTrip(pool);
+    const notifId = await insertOutboxRow(pool, tripId, "companion_ready", "555000111", {
+      private_url: "https://example.test/trip",
+      assistant_name: "Rio",
+      trip_title: "Japan 2026",
+      trip_slug: "japan-2026",
+      language: "en",
+      login_password: "seed-pw",
+    });
+
+    // The LAST part (the password) fails on the first pass.
+    const sent: string[] = [];
+    let failPassword = true;
+    const adapter = {
+      async sendApprovalRequest() {},
+      async sendMessage(p: { chatId: string; text: string }) {
+        if (p.text === "seed-pw" && failPassword) throw new Error("simulated send failure");
+        sent.push(p.text);
+      },
+    };
+    await dispatchPendingTripNotifications(pool, adapter, () => {}, { botUsername: "Kinerary_bot" });
+    let row = await pool.query("SELECT state, attempt FROM control_plane.notification_outbox WHERE id = $1", [notifId]);
+    assert.equal(row.rows[0].state, "pending", "not sent while the password message has not gone");
+    assert.equal(sent.length, 2, "introduction and binding line went out before it");
+
+    // The retry repeats all parts, and only then is the row sent.
+    failPassword = false;
+    await dispatchPendingTripNotifications(pool, adapter, () => {}, { botUsername: "Kinerary_bot" });
+    row = await pool.query("SELECT state FROM control_plane.notification_outbox WHERE id = $1", [notifId]);
+    assert.equal(row.rows[0].state, "sent");
+    assert.equal(sent.length, 5, "2 from the first pass + all 3 again");
+    assert.equal(sent[4], "seed-pw");
+  } finally {
+    await pool.end();
+  }
+});
+
+const GENERATED_PASSWORD = "ykxg-d263-qtw2-y3rq";
+const LOGINS = [{ name: "Ella", username: "ella" }, { name: "Tali", username: "tali" }];
+
+test("the greeting reaches Telegram's sendMessage as HTML with the password and usernames in <code> (he and en)", { skip }, async () => {
+  // The wire payload, not the adapter call: what is POSTed to api.telegram.org.
+  const { mock } = await import("node:test");
+  const { TelegramNotificationAdapter } = await import("../src/adapters/telegram.js");
+  for (const language of ["en", "he"] as const) {
+    const pool = testPool();
+    const client = await pool.connect();
+    const posted: Array<{ url: string; body: Record<string, unknown> }> = [];
+    mock.method(globalThis, "fetch", async (url: string, init?: RequestInit) => {
+      posted.push({ url, body: JSON.parse(String(init?.body)) });
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    });
+    try {
+      await resetDb(client);
+      await applyMigrations(client, migrationsDir);
+      client.release();
+      const tripId = await insertTrip(pool);
+      await insertOutboxRow(pool, tripId, "companion_ready", "555000111", {
+        private_url: "https://example.test/trip",
+        assistant_name: "Rio",
+        trip_title: "Japan 2026",
+        trip_slug: "japan-2026",
+        language,
+        login_password: GENERATED_PASSWORD,
+        login_usernames: LOGINS,
+      });
+      const adapter = new TelegramNotificationAdapter({ botToken: "bot-token", superAdminChatId: "1", db: pool });
+      await dispatchPendingTripNotifications(pool, adapter, () => {}, { botUsername: "Kinerary_bot" });
+
+      assert.equal(posted.length, 3, "introduction, the binding line, then the password alone");
+      assert.match(posted[0]!.url, /\/botbot-token\/sendMessage$/);
+      const intro = posted[0]!.body;
+      assert.equal(intro.chat_id, "555000111");
+      assert.equal(intro.parse_mode, "HTML");
+      const text = String(intro.text);
+      const loginLine = language === "he"
+        ? `הכניסה לאתר — שם המשתמש שלכם והסיסמה <code>${GENERATED_PASSWORD}</code> (היא גם מופיעה בהודעה נפרדת למטה, להעתקה):`
+        : `Log in with your username and the password <code>${GENERATED_PASSWORD}</code> (it's also in a separate message below, to copy):`;
+      assert.ok(text.includes(`${loginLine}\n• Ella — <code>ella</code>\n• Tali — <code>tali</code>`), text);
+      // The query-string ampersand is escaped, and no other tag exists.
+      // The link's payload is the binding token itself (the same one in the
+      // line posted next), not the trip slug.
+      const linkToken = /startgroup=(KIN-[A-HJ-NP-Z2-9]{8})&amp;admin=pin_messages\+invite_users/.exec(text)?.[1];
+      assert.ok(linkToken, text);
+      assert.equal(String(posted[1]!.body.text), `/group ${linkToken}`);
+      assert.deepEqual(
+        [...new Set([...text.matchAll(/<\/?([a-zA-Z]+)/g)].map((m) => m[1]))],
+        ["code"],
+      );
+      assert.equal(posted[1]!.body.parse_mode, undefined, "the binding line is plain");
+      assert.match(String(posted[1]!.body.text), /^\/group KIN-/);
+      // The password's own message: exactly the password, and no parse_mode on
+      // the wire, so Telegram treats it as plain text.
+      assert.equal(posted[2]!.body.chat_id, "555000111");
+      assert.equal(posted[2]!.body.text, GENERATED_PASSWORD);
+      assert.equal(posted[2]!.body.parse_mode, undefined, "the password message is plain");
+      assert.ok(!("parse_mode" in posted[2]!.body), "no parse_mode key at all");
+    } finally {
+      mock.restoreAll();
+      await pool.end();
+    }
+  }
+});
+
+// The add-to-group link needs the bot's @username. A deployment profile that
+// omits `web.telegram_bot_username` used to drop the link with nothing in any
+// log (owner's Mac staging greeting, 2026-10-16: step 1 just said "add me to
+// the group"). The handle is now derived from the bot token when the profile
+// does not carry it, and a greeting that still goes out without one says so.
+async function companionReadyFixture(pool: pg.Pool): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await resetDb(client);
+    await applyMigrations(client, migrationsDir);
+  } finally {
+    client.release();
+  }
+  const tripId = await insertTrip(pool);
+  await insertOutboxRow(pool, tripId, "companion_ready", "555000111", {
+    private_url: "https://example.test/trip",
+    assistant_name: "Rio",
+    trip_title: "Japan 2026",
+    trip_slug: "japan-2026",
+    language: "en",
+  });
+}
+
+test("no configured handle: the link is built from the handle the resolver derives", { skip }, async () => {
+  const pool = testPool();
+  try {
+    await companionReadyFixture(pool);
+    const sent: Array<{ text: string }> = [];
+    let asked = 0;
+    await dispatchPendingTripNotifications(pool, {
+      async sendApprovalRequest() {},
+      async sendMessage(p) { sent.push(p); },
+    }, () => {}, { resolveBotUsername: async () => { asked += 1; return "Derived_bot"; } });
+    assert.equal(asked, 1);
+    assert.match(sent[0]!.text, /https:\/\/t\.me\/Derived_bot\?startgroup=KIN-[A-HJ-NP-Z2-9]{8}&/);
+  } finally {
+    await pool.end();
+  }
+});
+
+test("a configured handle wins and the resolver is never asked", { skip }, async () => {
+  const pool = testPool();
+  try {
+    await companionReadyFixture(pool);
+    const sent: Array<{ text: string }> = [];
+    let asked = 0;
+    await dispatchPendingTripNotifications(pool, {
+      async sendApprovalRequest() {},
+      async sendMessage(p) { sent.push(p); },
+    }, () => {}, { botUsername: "Kinerary_bot", resolveBotUsername: async () => { asked += 1; return "Other_bot"; } });
+    assert.equal(asked, 0);
+    assert.match(sent[0]!.text, /t\.me\/Kinerary_bot\?startgroup=/);
+  } finally {
+    await pool.end();
+  }
+});
+
+test("no handle anywhere: the greeting still goes out, and the missing link is logged, not silent", { skip }, async () => {
+  const pool = testPool();
+  try {
+    await companionReadyFixture(pool);
+    const sent: Array<{ text: string }> = [];
+    const lines: string[] = [];
+    await dispatchPendingTripNotifications(pool, {
+      async sendApprovalRequest() {},
+      async sendMessage(p) { sent.push(p); },
+    }, (line) => lines.push(line), { resolveBotUsername: async () => null });
+    assert.match(sent[0]!.text, /Rio/);
+    assert.doesNotMatch(sent[0]!.text, /t\.me/);
+    assert.ok(
+      lines.some((l) => l.includes("outbox.bot_username_unavailable") && l.includes('"level":"warn"')),
+      lines.join("\n"),
+    );
+  } finally {
+    await pool.end();
+  }
+});
+
+test("a resolver that throws is the same as no handle: logged, and the greeting is not lost", { skip }, async () => {
+  const pool = testPool();
+  try {
+    await companionReadyFixture(pool);
+    const sent: Array<{ text: string }> = [];
+    const lines: string[] = [];
+    await dispatchPendingTripNotifications(pool, {
+      async sendApprovalRequest() {},
+      async sendMessage(p) { sent.push(p); },
+    }, (line) => lines.push(line), { resolveBotUsername: async () => { throw new Error("getMe 502"); } });
+    assert.equal(sent.length >= 1, true);
+    assert.ok(lines.some((l) => l.includes("outbox.bot_username_unavailable")), lines.join("\n"));
   } finally {
     await pool.end();
   }

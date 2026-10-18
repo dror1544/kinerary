@@ -429,6 +429,105 @@ class FleetMcp(unittest.TestCase):
                 continue
             self.assertIn("ORDER BY", statement, "an alerts query has no stable row order:\n" + statement)
 
+    # ---------------------------------------------- verification / approval --
+    def test_a_trip_s_latest_verification_failure_appears_in_alerts(self):
+        text, is_error = self.tool("alerts", {}, env=self.fixtures_env([
+            ("to_regclass", [["t"]]),
+            ("ve.check_name IN ('release_compatibility'", [["trip-v", "runtime_health", "2026-10-06 09:00 UTC"]]),
+        ]))
+        self.assertFalse(is_error, text)
+        self.assertIn("VERIFICATION FAILED", text)
+        self.assertIn("trip-v — runtime_health failed as of 2026-10-06 09:00 UTC", text)
+        # The hard-gated alert and the bridge alert are different incidents.
+        self.assertNotIn("COMPANION BRIDGE CHECK FAILED", text)
+
+    # The fake psql never evaluates SQL, so which rows count as "failed" and
+    # "latest" is pinned two ways: the rendering below from rows it is handed,
+    # and the query TEXT in the next test. The real selection is exercised
+    # against Postgres in control-plane/worker/tests/test_verification.py.
+    def test_a_live_trip_whose_companion_bridge_check_failed_appears_in_alerts(self):
+        text, is_error = self.tool("alerts", {}, env=self.fixtures_env([
+            ("to_regclass", [["t"]]),
+            ("ve.check_name = 'mcp_isolation'", [["trip-m", "2026-10-10 16:37 UTC"]]),
+        ]))
+        self.assertFalse(is_error, text)
+        self.assertEqual(text, "\n\n".join([
+            "⚠️ Kinerary fleet — a control plane",
+            "COMPANION BRIDGE CHECK FAILED\n  • trip-m — mcp_isolation failed as of 2026-10-10 16:37 UTC; "
+            "the site is up, but its companion's bridge could not be confirmed able to reach the trip",
+        ]))
+        self.assertNotIn("VERIFICATION FAILED", text)
+
+    def test_the_companion_bridge_alert_has_a_digest_line_too(self):
+        text = self.rendered("alerts", {"format": "digest"}, [
+            ["to_regclass", [["t"]]],
+            ["ve.check_name = 'mcp_isolation'", [["trip-m", "2026-10-10 16:37 UTC"]]],
+        ])
+        self.assertEqual(
+            text,
+            "**⚠️ Needs attention**\n"
+            "• companion bridge check failed: trip-m — mcp_isolation failed as of 2026-10-10 16:37 UTC; "
+            "the site is up, but its companion's bridge could not be confirmed able to reach the trip",
+        )
+        self.assert_telegram_safe(text)
+
+    def test_the_companion_bridge_query_counts_only_the_latest_failed_row_of_a_live_trip(self):
+        """What keeps 'skipped' (the gate-time row every trip has) and a bridge
+        that was repaired and re-checked from alerting."""
+        self.tool("alerts", {}, env=self.fixtures_env([("to_regclass", [["t"]])]))
+        queries = [s for s in self.statements() if "ve.check_name = 'mcp_isolation'" in s]
+        self.assertEqual(len(queries), 1, queries)
+        sql = queries[0]
+        self.assertIn("ve.outcome = 'failed'", sql)
+        self.assertNotIn("skipped", sql)
+        self.assertRegex(sql, r"ve\.observed_at = \(SELECT max\(ve2\.observed_at\)")
+        self.assertRegex(sql, r"ve2\.trip_id = ve\.trip_id AND ve2\.check_name = ve\.check_name")
+        self.assertIn("= 'live'", sql)
+        # Only columns the monitor's read-only role is granted on this table.
+        for column in re.findall(r"\bve2?\.(\w+)", sql):
+            self.assertIn(column, {"trip_id", "check_name", "outcome", "observed_at"}, column)
+
+    def test_the_companion_bridge_alert_is_not_checked_without_the_table(self):
+        self.tool("alerts", {}, env=self.fixtures_env([]))
+        self.assertFalse([s for s in self.statements() if "ve.check_name = 'mcp_isolation'" in s])
+
+    def test_verification_failure_is_not_checked_on_a_stack_without_the_table(self):
+        """to_regclass absent/false (no fixture match) must degrade, not error."""
+        text, is_error = self.tool("alerts", {}, env=self.fixtures_env([]))
+        self.assertFalse(is_error, text)
+        self.assertNotIn("VERIFICATION FAILED", text)
+
+    def test_a_job_waiting_too_long_for_organizer_approval_appears_in_alerts(self):
+        text, is_error = self.tool("alerts", {}, env=self.fixtures_env([
+            ("j.state = 'waiting_for_user_action'", [["trip-w", "provision", "2026-10-06 06:00 UTC"]]),
+        ]))
+        self.assertFalse(is_error, text)
+        self.assertIn("AWAITING ORGANIZER APPROVAL", text)
+        self.assertIn("trip-w — provision, waiting since 2026-10-06 06:00 UTC", text)
+
+    # ------------------------------------------------------- suspended trips --
+    # The fake psql returns exactly the rows a fixture names — it never
+    # evaluates the SQL sent to it — so what these two can actually prove is
+    # the query TEXT: whether it references t.suspended_at at all, which is
+    # the real safety property (a stack behind migration 20261003060350 has
+    # no such column, and referencing it would fail the whole query the way
+    # `tableExists`'s own docstring describes for a missing relation).
+    def test_a_suspended_trip_s_job_is_annotated_not_hidden_in_failures(self):
+        self.tool("failures", {}, env=self.fixtures_env([("information_schema.columns", [["t"]])]))
+        joined = "\n".join(self.statements())
+        self.assertIn("t.suspended_at IS NOT NULL", joined)
+        self.assertIn("SUSPENDED", joined)
+
+    def test_failures_degrades_when_the_suspended_at_column_does_not_exist(self):
+        """No fixture match for information_schema.columns == the column
+        isn't there. The query must then never reference t.suspended_at at
+        all, rather than fail outright the way a bare missing-column
+        reference would."""
+        self.tool("failures", {}, env=self.fixtures_env([]))
+        joined = "\n".join(self.statements())
+        self.assertNotIn("t.suspended_at", joined)
+        self.assertIn("WHEN false THEN", joined)
+
     # --------------------------------------------------------- failed reads --
     def test_a_failed_query_is_reported_as_a_failure_not_as_no_rows(self):
         text, is_error = self.tool("fleet_overview", env={"FLEET_TEST_FAIL": "1"})

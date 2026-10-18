@@ -491,7 +491,7 @@ describe("super-admin dashboard: slice 2 (suspend/retry)", { skip: SKIP ? "no CO
       assert.equal(row.rows[0]?.suspended_reason, "pausing");
 
       const evidence = await latestAuditEvidence(pool, "admin.resume_trip", fix.tripId);
-      assert.deepEqual(evidence, { ok: true });
+      assert.deepEqual(evidence, { ok: true, reapprovalNeeded: false });
     } finally {
       await teardownFixture(fix);
     }
@@ -608,6 +608,71 @@ describe("super-admin dashboard: slice 2 (suspend/retry)", { skip: SKIP ? "no CO
       assert.equal(claim.ok, true);
       if (!claim.ok) throw new Error("unreachable");
       assert.equal(claim.claim.jobId, plan.jobId);
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("resume reverts an approval that expired WHILE suspended, instead of reporting bare success (#review 2026-10-06 [P2])", async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const plan = await generatePlan(pool, fix.tripId, fix.correlationId);
+      assert.equal(plan.ok, true);
+      if (!plan.ok) throw new Error("unreachable");
+
+      // Already-expired approval — suspend does not pause its TTL.
+      await issueApproval(pool, plan.planId, "user:test", -1);
+
+      const suspend = await suspendTrip(pool, fix.tripId, "pausing past the approval's expiry");
+      assert.equal(suspend.ok, true);
+
+      const resume = await resumeTrip(pool, fix.tripId);
+      assert.equal(resume.ok, true);
+      if (!resume.ok) throw new Error("unreachable");
+      assert.equal(resume.reapprovalNeeded, true);
+
+      const planRow = await pool.query<{ status: string }>(
+        "SELECT status FROM control_plane.plans WHERE id = $1", [plan.planId],
+      );
+      assert.equal(planRow.rows[0]?.status, "pending_approval");
+
+      const jobRow = await pool.query<{ state: string }>(
+        "SELECT state FROM control_plane.jobs WHERE id = $1", [plan.jobId],
+      );
+      assert.equal(jobRow.rows[0]?.state, "waiting_for_user_action");
+
+      // A fresh approval, not ALREADY_APPROVED, now actually works.
+      const fresh = await issueApproval(pool, plan.planId, "user:test", 3600);
+      assert.equal(fresh.ok, true);
+      const claim = await claimJob(pool, "worker_reapproval_test", 60);
+      assert.equal(claim.ok, true);
+      if (!claim.ok) throw new Error("unreachable");
+      assert.equal(claim.claim.jobId, plan.jobId);
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("resume with a still-valid approval reports reapprovalNeeded: false", async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const plan = await generatePlan(pool, fix.tripId, fix.correlationId);
+      assert.equal(plan.ok, true);
+      if (!plan.ok) throw new Error("unreachable");
+      await issueApproval(pool, plan.planId, "user:test", 3600);
+
+      const suspend = await suspendTrip(pool, fix.tripId, "pausing, approval still valid");
+      assert.equal(suspend.ok, true);
+
+      const resume = await resumeTrip(pool, fix.tripId);
+      assert.equal(resume.ok, true);
+      if (!resume.ok) throw new Error("unreachable");
+      assert.equal(resume.reapprovalNeeded, false);
+
+      const planRow = await pool.query<{ status: string }>(
+        "SELECT status FROM control_plane.plans WHERE id = $1", [plan.planId],
+      );
+      assert.equal(planRow.rows[0]?.status, "approved");
     } finally {
       await teardownFixture(fix);
     }

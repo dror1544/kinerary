@@ -21,6 +21,7 @@ import {
   ATTACHMENT_TASKS,
   FORBIDDEN_MODELS,
   codexIsolationProblem,
+  isJudgeRunner,
   type RunnerResult,
   type StructuredModelRequest,
   type StructuredModelRunner,
@@ -28,7 +29,7 @@ import {
 import { structuredLog } from "./redaction.js";
 
 /** The tasks an override may name. */
-export const SWITCHABLE_TASKS = ["interpret", "extract_intake", "extract_itinerary", "read_image"] as const;
+export const SWITCHABLE_TASKS = ["interpret", "extract_intake", "extract_itinerary", "read_image", "group_judge"] as const;
 export type SwitchableTask = (typeof SWITCHABLE_TASKS)[number];
 
 export const RUNNER_KINDS = ["claude", "codex", "openrouter", "hermes"] as const;
@@ -277,6 +278,11 @@ export async function handleModelCommand(
   } else {
     if (FORBIDDEN_MODELS.has(binding.model)) {
       return `${binding.model} picks a model per request, which is a silent fallback. Name a model.`;
+    }
+    // The judge takes openrouter, claude or codex (a quick completion with no tools);
+    // hermes is an agent runtime. Said plainly, before the generic refusal.
+    if (task === "group_judge" && !isJudgeRunner(binding.runner)) {
+      return `group_judge takes only openrouter:<model>, claude:<model> or codex:<model>: ${binding.runner} is an agent runtime, not a quick completion. Nothing changed.`;
     }
     if (!runner.canServe(task, binding)) {
       const why = ATTACHMENT_TASKS.has(task) && !ATTACHMENT_RUNNERS.has(binding.runner)

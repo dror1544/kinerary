@@ -13,8 +13,12 @@ import {
   callbackDataFits,
   CONFIRM_CALLBACK_DATA,
   consumeExpectsReplyWindow,
+  CONVERSATION_MAX_MEMBERS,
+  CONVERSATION_WINDOW_SECONDS,
   findQuestion,
+  inCompanionConversation,
   KEEP_PLANNING_CALLBACK_DATA,
+  openCompanionConversation,
   otherCallbackData,
   parseCallbackData,
   parseInbound,
@@ -23,6 +27,7 @@ import {
   renderQuestion,
   renderSuggestion,
   renderTripList,
+  renewCompanionConversation,
   resolveChatRoute,
   suggestionNoCallbackData,
   suggestionYesCallbackData,
@@ -894,6 +899,245 @@ describe("companion reply-capture window (migration 0053)", () => {
     await withFixture(async (fix) => {
       await assert.doesNotReject(setCompanionExpectsReply(fix.pool, "800004999", true));
       assert.equal(await consumeExpectsReplyWindow(fix.pool, "800004999"), false);
+    });
+  });
+});
+
+describe("companion conversation window (per-person, 2026-10-16)", () => {
+  async function bindCompanion(fix: Fixture, chatId: string): Promise<void> {
+    await fix.pool.query(
+      "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ($1, $2, $3, $4)",
+      [`tcb_${randomBytes(16).toString("hex")}`, chatId, fix.tripId, "trip-companion"],
+    );
+  }
+  async function untilOf(fix: Fixture, chatId: string): Promise<number | null> {
+    const r = await fix.pool.query(
+      "SELECT extract(epoch FROM conversation_until - now())::float AS secs FROM control_plane.telegram_chat_bindings WHERE chat_id = $1",
+      [chatId],
+    );
+    return r.rows[0]?.secs ?? null;
+  }
+
+  test("the window is five minutes by default", () => {
+    assert.equal(CONVERSATION_WINDOW_SECONDS, 300);
+  });
+
+  test("forwarding a member's message opens the window for that member only", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "800005000");
+      assert.equal(await inCompanionConversation(fix.pool, "800005000", "111"), false, "nothing is open before a forward");
+
+      await openCompanionConversation(fix.pool, "800005000", "111");
+      assert.equal(await inCompanionConversation(fix.pool, "800005000", "111"), true);
+      assert.equal(await inCompanionConversation(fix.pool, "800005000", "222"), false, "another member is not the partner");
+      assert.equal(await inCompanionConversation(fix.pool, "800005001", "111"), false, "another chat is untouched");
+    });
+  });
+
+  test("a hit does not consume the window (unlike the one-shot reply window)", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "800005002");
+      await openCompanionConversation(fix.pool, "800005002", "111");
+      assert.equal(await inCompanionConversation(fix.pool, "800005002", "111"), true);
+      assert.equal(await inCompanionConversation(fix.pool, "800005002", "111"), true);
+    });
+  });
+
+  test("the companion's successful send renews the deadline from now", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "800005003");
+      await openCompanionConversation(fix.pool, "800005003", "111");
+      await fix.pool.query(
+        "UPDATE control_plane.telegram_chat_bindings SET conversation_until = now() + interval '10 seconds' WHERE chat_id = $1",
+        ["800005003"],
+      );
+      await renewCompanionConversation(fix.pool, "800005003");
+      const secs = await untilOf(fix, "800005003");
+      assert.ok(secs !== null && secs > 290 && secs <= 300, `renewed to ~300s from now, got ${secs}`);
+    });
+  });
+
+  test("a send never renews a conversation that already lapsed", { skip: SKIP }, async () => {
+    // A proactive message hours later (a daily post, a reminder) must not
+    // resurrect a stale partner: only a conversation still open at the send
+    // is renewed.
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "800005004");
+      await openCompanionConversation(fix.pool, "800005004", "111");
+      await fix.pool.query(
+        "UPDATE control_plane.telegram_chat_bindings SET conversation_until = now() - interval '1 second' WHERE chat_id = $1",
+        ["800005004"],
+      );
+      await renewCompanionConversation(fix.pool, "800005004");
+      assert.equal(await inCompanionConversation(fix.pool, "800005004", "111"), false);
+    });
+  });
+
+  test("a send in a chat with no conversation is a no-op", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "800005005");
+      await renewCompanionConversation(fix.pool, "800005005");
+      assert.equal(await untilOf(fix, "800005005"), null);
+      await assert.doesNotReject(renewCompanionConversation(fix.pool, "800005998"));
+    });
+  });
+
+  test("a lapsed window stops matching", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "800005006");
+      await openCompanionConversation(fix.pool, "800005006", "111");
+      await fix.pool.query(
+        "UPDATE control_plane.telegram_chat_bindings SET conversation_until = now() - interval '1 second' WHERE chat_id = $1",
+        ["800005006"],
+      );
+      assert.equal(await inCompanionConversation(fix.pool, "800005006", "111"), false);
+    });
+  });
+
+  test("another member joining does not displace the first: both are heard", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "800005007");
+      await openCompanionConversation(fix.pool, "800005007", "111");
+      await openCompanionConversation(fix.pool, "800005007", "222");
+      assert.equal(await inCompanionConversation(fix.pool, "800005007", "222"), true, "B joined");
+      assert.equal(await inCompanionConversation(fix.pool, "800005007", "111"), true, "A is still in");
+      assert.equal(await inCompanionConversation(fix.pool, "800005007", "333"), false, "a third who never spoke to it is not");
+    });
+  });
+
+  test("a member forwarded twice is in once, and moves to the back", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "800005012");
+      await openCompanionConversation(fix.pool, "800005012", "111");
+      await openCompanionConversation(fix.pool, "800005012", "222");
+      await openCompanionConversation(fix.pool, "800005012", "111");
+      const r = await fix.pool.query(
+        "SELECT conversation_user_ids FROM control_plane.telegram_chat_bindings WHERE chat_id = $1", ["800005012"],
+      );
+      assert.deepEqual(r.rows[0].conversation_user_ids, ["222", "111"]);
+    });
+  });
+
+  test("everyone shares one deadline: a member's forward extends it for all, a send renews it for all", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "800005013");
+      await openCompanionConversation(fix.pool, "800005013", "111");
+      await fix.pool.query(
+        "UPDATE control_plane.telegram_chat_bindings SET conversation_until = now() + interval '10 seconds' WHERE chat_id = $1",
+        ["800005013"],
+      );
+      await openCompanionConversation(fix.pool, "800005013", "222");
+      const secs = await untilOf(fix, "800005013");
+      assert.ok(secs !== null && secs > 290, `B's forward extended the shared deadline, got ${secs}`);
+      await fix.pool.query(
+        "UPDATE control_plane.telegram_chat_bindings SET conversation_until = now() + interval '10 seconds' WHERE chat_id = $1",
+        ["800005013"],
+      );
+      await renewCompanionConversation(fix.pool, "800005013");
+      assert.ok((await untilOf(fix, "800005013"))! > 290);
+      assert.equal(await inCompanionConversation(fix.pool, "800005013", "111"), true);
+      assert.equal(await inCompanionConversation(fix.pool, "800005013", "222"), true);
+    });
+  });
+
+  test("expiry clears everyone: stale ids read as empty and the next forward starts a fresh set", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "800005014");
+      await openCompanionConversation(fix.pool, "800005014", "111");
+      await openCompanionConversation(fix.pool, "800005014", "222");
+      await fix.pool.query(
+        "UPDATE control_plane.telegram_chat_bindings SET conversation_until = now() - interval '1 second' WHERE chat_id = $1",
+        ["800005014"],
+      );
+      assert.equal(await inCompanionConversation(fix.pool, "800005014", "111"), false);
+      assert.equal(await inCompanionConversation(fix.pool, "800005014", "222"), false);
+      await openCompanionConversation(fix.pool, "800005014", "333");
+      assert.equal(await inCompanionConversation(fix.pool, "800005014", "333"), true);
+      assert.equal(await inCompanionConversation(fix.pool, "800005014", "111"), false, "the old set did not come back");
+      assert.equal(await inCompanionConversation(fix.pool, "800005014", "222"), false);
+    });
+  });
+
+  test("the set is capped, oldest dropped", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "800005015");
+      assert.equal(CONVERSATION_MAX_MEMBERS, 20);
+      for (let i = 1; i <= CONVERSATION_MAX_MEMBERS + 2; i++) {
+        await openCompanionConversation(fix.pool, "800005015", `u${i}`);
+      }
+      const r = await fix.pool.query(
+        "SELECT cardinality(conversation_user_ids) AS n FROM control_plane.telegram_chat_bindings WHERE chat_id = $1", ["800005015"],
+      );
+      assert.equal(r.rows[0].n, CONVERSATION_MAX_MEMBERS);
+      assert.equal(await inCompanionConversation(fix.pool, "800005015", "u1"), false, "oldest dropped");
+      assert.equal(await inCompanionConversation(fix.pool, "800005015", "u2"), false);
+      assert.equal(await inCompanionConversation(fix.pool, "800005015", "u3"), true);
+      assert.equal(await inCompanionConversation(fix.pool, "800005015", `u${CONVERSATION_MAX_MEMBERS + 2}`), true);
+    });
+  });
+
+  test("the same partner's next forward never shortens a deadline the companion's work already pushed out", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "800005008");
+      await openCompanionConversation(fix.pool, "800005008", "111");
+      await fix.pool.query(
+        "UPDATE control_plane.telegram_chat_bindings SET conversation_until = now() + interval '1 hour' WHERE chat_id = $1",
+        ["800005008"],
+      );
+      await openCompanionConversation(fix.pool, "800005008", "111");
+      const secs = await untilOf(fix, "800005008");
+      assert.ok(secs !== null && secs > 3000, `kept the later deadline, got ${secs}`);
+    });
+  });
+
+  test("the per-trip opt-out defeats the window, on write and on read", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "800005009");
+      await fix.pool.query(
+        "UPDATE control_plane.trips SET companion_reply_capture_enabled = false WHERE id = $1",
+        [fix.tripId],
+      );
+      await openCompanionConversation(fix.pool, "800005009", "111");
+      assert.equal(await untilOf(fix, "800005009"), null, "an opted-out trip records nothing");
+      assert.equal(await inCompanionConversation(fix.pool, "800005009", "111"), false);
+
+      // Switched off AFTER a window was opened: the read still refuses.
+      await fix.pool.query(
+        "UPDATE control_plane.trips SET companion_reply_capture_enabled = true WHERE id = $1",
+        [fix.tripId],
+      );
+      await openCompanionConversation(fix.pool, "800005009", "111");
+      await fix.pool.query(
+        "UPDATE control_plane.trips SET companion_reply_capture_enabled = false WHERE id = $1",
+        [fix.tripId],
+      );
+      assert.equal(await inCompanionConversation(fix.pool, "800005009", "111"), false);
+    });
+  });
+
+  test("a closed binding never opens or matches", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "800005010");
+      await openCompanionConversation(fix.pool, "800005010", "111");
+      await fix.pool.query(
+        "UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'test' WHERE chat_id = $1",
+        ["800005010"],
+      );
+      assert.equal(await inCompanionConversation(fix.pool, "800005010", "111"), false);
+    });
+  });
+
+  test("the one-shot reply window is independent: expects=false does not touch the conversation", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "800005011");
+      await openCompanionConversation(fix.pool, "800005011", "111");
+      await setCompanionExpectsReply(fix.pool, "800005011", true);
+      await setCompanionExpectsReply(fix.pool, "800005011", false);
+      assert.equal(await inCompanionConversation(fix.pool, "800005011", "111"), true);
+      // ...and consuming the one-shot window leaves the conversation alone.
+      await setCompanionExpectsReply(fix.pool, "800005011", true);
+      assert.equal(await consumeExpectsReplyWindow(fix.pool, "800005011"), true);
+      assert.equal(await inCompanionConversation(fix.pool, "800005011", "111"), true);
     });
   });
 });

@@ -38,6 +38,14 @@ class LxcSpec:
     # Always the topology's own top-level `name`; never a second source of
     # truth to fall out of sync with it.
     trip_slug: str = ""
+    # The https origin the trip is served on (no path), e.g. https://<host>.
+    # Never a YAML key: it is computed from the topology's own public hostname
+    # so it cannot drift from the proxy host. The site writes it to .env as
+    # PUBLIC_ORIGIN, which is the OAuth issuer of its member MCP connector
+    # (server/trip-mcp), together with TRIP_MCP_ENABLED=1. Empty (a hand-built
+    # spec with no hostname) leaves the connector off: a guessed origin would
+    # be an issuer no assistant could reach.
+    public_origin: str = ""
 
 
 @dataclass(frozen=True)
@@ -135,6 +143,7 @@ def load_topology(raw: Mapping[str, Any]) -> Topology:
             nfs_host_dir=_nonempty_string(lxc, "nfs_host_dir", "proxmox.lxc"),
             nfs_mount_path=_nonempty_string(lxc, "nfs_mount_path", "proxmox.lxc"),
             trip_slug=name,
+            public_origin=f"https://{_nonempty_string(proxy, 'hostname', 'npm')}",
         ),
         proxy=ProxySpec(
             hostname=_nonempty_string(proxy, "hostname", "npm"),

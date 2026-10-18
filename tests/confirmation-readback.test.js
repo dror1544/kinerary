@@ -112,9 +112,10 @@ it('booking lookup failures expose no backend addresses, credentials or paths', 
   require('./trip-mcp/tools').registerTools({ registerTool(name, _schema, run) {
     if (name === 'get_booking_confirmation') callback = run;
   } }, { get: async () => { throw new Error('http://localhost:1234 Bearer private-credential /private/server/path'); } }, { write: true });
-  await assert.rejects(callback({ booking_id: 1 }), err => {
-    assert.match(err.message, /Booking confirmation lookup failed.*authenticated trip site/);
-    assert.doesNotMatch(err.message, /localhost|Bearer|credential|private/);
-    return true;
-  });
+  const result = await callback({ booking_id: 1 });
+  assert.equal(result.isError, true);
+  assert.equal(result.content.length, 1);
+  assert.equal(result.content[0].type, 'text');
+  assert.match(result.content[0].text, /Booking confirmation lookup failed.*authenticated trip site/);
+  assert.doesNotMatch(result.content[0].text, /localhost|Bearer|credential|private/);
 });

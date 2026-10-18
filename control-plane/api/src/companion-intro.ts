@@ -46,7 +46,11 @@ export interface CompanionIntroFacts {
   loginUsernames?: readonly { name: string; username: string }[] | null;
   /** The shared bot's @username, for the add-to-group link. */
   botUsername?: string | null;
-  /** Payload for the add-to-group deep link — the trip slug. */
+  /**
+   * Payload for the add-to-group deep link when NO binding token was issued —
+   * the trip slug. With a token the link carries the token instead, so that
+   * tapping it binds the group by itself.
+   */
   tripSlug?: string | null;
   organizerName?: string | null;
   proactive?: ProactiveSettings | null;
@@ -64,6 +68,39 @@ export interface CompanionIntroFacts {
 }
 
 /**
+ * COPYABLE SPANS. A value someone has to copy off a phone (the generated
+ * password, a username) is marked here, once, with a pair of control characters
+ * that no fact can contain, and rendered afterwards by whoever knows the
+ * destination: `renderPlain` drops the marks, `renderHtml` escapes the text and
+ * turns each pair into Telegram's `<code>`, where a tap copies the span.
+ *
+ * Marking rather than writing `<code>` inline keeps one text builder serving
+ * both the organizer's HTML message and the group's plain one, and means the
+ * HTML escape runs over the WHOLE message exactly once: a value cannot smuggle a
+ * tag in, because by the time tags exist it has already been escaped.
+ */
+const SPAN_OPEN = "\u0001";
+const SPAN_CLOSE = "\u0002";
+
+function copyable(value: string): string {
+  const clean = value.replace(/[\u0001\u0002]/g, "");
+  return clean ? `${SPAN_OPEN}${clean}${SPAN_CLOSE}` : "";
+}
+
+function renderPlain(marked: string): string {
+  return marked.replace(/[\u0001\u0002]/g, "");
+}
+
+/** Telegram HTML reserves exactly these three; `&` first so the others survive. */
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function renderHtml(marked: string): string {
+  return escapeHtml(marked).replace(/\u0001/g, "<code>").replace(/\u0002/g, "</code>");
+}
+
+/**
  * The login block: the password, and the name each person types to use it.
  *
  * Every traveller shares one password, so the username is the only thing that
@@ -71,20 +108,26 @@ export interface CompanionIntroFacts {
  * nobody can guess it. An empty list falls back to the old wording, which is
  * what a trip with no seeded accounts still gets.
  */
-function loginLines(facts: CompanionIntroFacts): string[] {
+function loginLines(facts: CompanionIntroFacts, options: { ownMessage?: boolean } = {}): string[] {
   const he = facts.language === "he";
   if (!facts.loginPassword) return [he ? "הכניסה מהאתר עצמו." : "Log in from the site itself."];
+  // Only the organizer's setup message is followed by the password on its own
+  // (`organizerIntroMessages`); the group's arrival message is not, so it must
+  // not point at a message that never comes.
+  const pointer = options.ownMessage
+    ? (he ? " (היא גם מופיעה בהודעה נפרדת למטה, להעתקה)" : " (it's also in a separate message below, to copy)")
+    : "";
   const people = (facts.loginUsernames ?? []).filter((p) => p.username);
   if (people.length === 0) {
     return [he
-      ? `הכניסה עם השם שלכם והסיסמה: ${facts.loginPassword}`
-      : `Log in with your name and the password: ${facts.loginPassword}`];
+      ? `הכניסה עם השם שלכם והסיסמה: ${copyable(facts.loginPassword)}${pointer}`
+      : `Log in with your name and the password: ${copyable(facts.loginPassword)}${pointer}`];
   }
   return [
     he
-      ? `הכניסה לאתר — שם המשתמש שלכם והסיסמה ${facts.loginPassword}:`
-      : `Log in with your username and the password ${facts.loginPassword}:`,
-    ...people.map((p) => `• ${p.name} — ${p.username}`),
+      ? `הכניסה לאתר — שם המשתמש שלכם והסיסמה ${copyable(facts.loginPassword)}${pointer}:`
+      : `Log in with your username and the password ${copyable(facts.loginPassword)}${pointer}:`,
+    ...people.map((p) => `• ${p.name} — ${copyable(p.username)}`),
   ];
 }
 
@@ -174,9 +217,20 @@ function listJoin(items: readonly string[], lang: "he" | "en"): string {
  * merely reassuring.
  */
 export function organizerIntroText(facts: CompanionIntroFacts): string {
+  return renderPlain(organizerIntroMarked(facts));
+}
+
+/** The organizer's setup message with its copyable spans still marked. */
+function organizerIntroMarked(facts: CompanionIntroFacts): string {
   const he = facts.language === "he";
   const title = facts.tripTitle?.trim() || null;
-  const addUrl = groupAddUrl(facts.botUsername, facts.tripSlug ?? "");
+  // The link's payload is the group-binding token whenever one was issued: then
+  // the link BINDS (Telegram posts `/start@bot <token>` in the chosen group,
+  // from the organizer, and the relay redeems it). The trip slug was the
+  // payload before and nothing consumed it; it stays only as the no-token
+  // fallback so that case is unchanged.
+  const addUrl = groupAddUrl(facts.botUsername, facts.groupBindingToken ?? facts.tripSlug ?? "");
+  const oneTap = Boolean(addUrl && facts.groupBindingToken);
   const schedule = scheduleLines(facts.proactive, facts.language);
   const parts: string[] = [];
 
@@ -192,11 +246,22 @@ export function organizerIntroText(facts: CompanionIntroFacts): string {
       "",
       `האתר: ${facts.siteUrl}`,
     );
-    parts.push(...loginLines(facts));
+    parts.push(...loginLines(facts, { ownMessage: true }));
     if (schedule.length) {
       parts.push("", `אשלח מיוזמתי: ${listJoin(schedule, "he")}.`);
     }
-    if (addUrl || facts.groupBindingToken) {
+    if (oneTap) {
+      parts.push(
+        "",
+        "כדי שאהיה גם בקבוצה המשפחתית או קבוצת הטיול — מספיק קישור אחד:",
+        `1. לוחצים על הקישור: ${addUrl}`,
+        "   טלגרם יאפשר לבחור קבוצה קיימת (או לפתוח קבוצה חדשה קודם) ולהוסיף אותי אליה.",
+        "2. כשטלגרם שואל אילו הרשאות לתת לי — הופכים אותי למנהל ומשאירים דלוקה הרשאת \"הצמדת הודעות\" (Pin messages) — זה מה שנותן לי להצמיד את הודעת הפתיחה, כדי שכולם ימצאו בקלות את האתר והפרטים החשובים. אין צורך להדליק שום הרשאה אחרת.",
+        "3. זהו. אני אתחבר לקבוצה בעצמי ואציג את עצמי שם — אין מה להדביק.",
+        "",
+        `הקישור לא עובד, או שאני כבר בקבוצה? מוסיפים אותי ידנית (@${facts.botUsername}), הופכים אותי למנהל, ואז בקבוצה עצמה — לא כאן — מעתיקים את השורה המלאה מההודעה הבאה שלי ומדביקים אותה שם. שלחתם אותה מוקדם מדי? משלימים את ההוספה וההרשאה ומדביקים שוב.`,
+      );
+    } else if (addUrl || facts.groupBindingToken) {
       parts.push("", "כדי שאהיה גם בקבוצה המשפחתית או קבוצת הטיול:");
       if (facts.botUsername) {
         parts.push(
@@ -233,11 +298,22 @@ export function organizerIntroText(facts: CompanionIntroFacts): string {
     "",
     `The site: ${facts.siteUrl}`,
   );
-  parts.push(...loginLines(facts));
+  parts.push(...loginLines(facts, { ownMessage: true }));
   if (schedule.length) {
     parts.push("", `I'll send you ${listJoin(schedule, "en")} without being asked.`);
   }
-  if (addUrl || facts.groupBindingToken) {
+  if (oneTap) {
+    parts.push(
+      "",
+      "To bring me into the family or trip group — one link is all it takes:",
+      `1. Tap this link: ${addUrl}`,
+      "   Telegram lets you pick the group (an existing one, or make a new one first) and add me to it.",
+      "2. When Telegram asks which rights to give me, make me an admin and keep the \"Pin messages\" permission on — that's what lets me pin the welcome message, so everyone can find the site and the essentials at a glance. Nothing else needs to be switched on.",
+      "3. That's it. I'll connect to the group on my own and say hello there — nothing to paste.",
+      "",
+      `Link doesn't work, or I'm already in the group? Add @${facts.botUsername} yourself, make me an admin, then, in that group — not here — copy the whole line from my next message and paste it in. Sent it too early? Finish adding me and the permission, then paste it again.`,
+    );
+  } else if (addUrl || facts.groupBindingToken) {
     parts.push("", "To bring me into the family or trip group:");
     if (facts.botUsername) {
       parts.push(
@@ -401,7 +477,7 @@ export function groupIntroText(
     if (schedule.length) {
       parts.push("", `אשלח לכאן מיוזמתי: ${listJoin(schedule, "he")}.`);
     }
-    return parts.join("\n");
+    return renderPlain(parts.join("\n"));
   }
 
   parts.push(
@@ -432,7 +508,7 @@ export function groupIntroText(
   if (schedule.length) {
     parts.push("", `I'll post ${listJoin(schedule, "en")} here without being asked.`);
   }
-  return parts.join("\n");
+  return renderPlain(parts.join("\n"));
 }
 
 /**
@@ -454,15 +530,41 @@ export function groupBindingCommand(token: string): string {
   return `/group ${token}`;
 }
 
+/** One message to send, and how to send it. */
+export interface IntroMessage {
+  text: string;
+  /** Present when `text` is Telegram HTML; absent means send as plain text. */
+  parseMode?: "HTML";
+  /** What to send instead if Telegram refuses the HTML: same words, no markup. */
+  plainText?: string;
+}
+
 /**
- * The organizer's introduction, as the messages to send in order.
+ * The organizer's introduction, as the messages to send in order: the
+ * introduction itself (Telegram HTML, with the generated password and each
+ * username as `<code>` spans), then the group-binding line when a token was
+ * issued, then — last, when a password is configured — the password on its own.
  *
- * One message when there is no token to hand over, two when there is — the
- * second being nothing but the line to copy.
+ * The password is in the introduction twice on purpose. A `<code>` span is
+ * accepted by Telegram (verified 2026-10-16) but tapping it does not copy on
+ * the owner's client; only whole-message copy works there. So the password is
+ * ALSO a message of its own — exactly the password, plain text, no label, no
+ * punctuation — and long-press, Copy, takes exactly it. (An earlier decision,
+ * 2026-10-15, dropped such a message in favour of tap-to-copy; superseded
+ * 2026-10-16.) The binding line is a command to post, so it stays separate too.
+ *
+ * Order is part of the contract: the dispatcher sends them one after another,
+ * and the introduction points at "my next message" for the binding line, so
+ * that line must stay immediately after the introduction; the password goes
+ * last. Organizer chat only — `groupIntroText` never sends the password alone.
  */
-export function organizerIntroMessages(facts: CompanionIntroFacts): string[] {
-  const messages = [organizerIntroText(facts)];
-  if (facts.groupBindingToken) messages.push(groupBindingCommand(facts.groupBindingToken));
+export function organizerIntroMessages(facts: CompanionIntroFacts): IntroMessage[] {
+  const marked = organizerIntroMarked(facts);
+  const messages: IntroMessage[] = [
+    { text: renderHtml(marked), parseMode: "HTML", plainText: renderPlain(marked) },
+  ];
+  if (facts.groupBindingToken) messages.push({ text: groupBindingCommand(facts.groupBindingToken) });
+  if (facts.loginPassword) messages.push({ text: facts.loginPassword });
   return messages;
 }
 
@@ -506,6 +608,7 @@ export function companionHelpText(facts: {
     );
     if (facts.siteUrl) parts.push("", `האתר של הטיול: ${facts.siteUrl}`);
     parts.push("", "‎/name — לשנות את השם שלי.");
+    if (!facts.isPrivateChat) parts.push("", "‎/proactive — רמת המעורבות שלי בשיחה בקבוצה (1–3)");
     if (facts.isPrivateChat) parts.push("", "‎/group — לחבר אותי לקבוצה המשפחתית שלכם.");
     return parts.join("\n");
   }
@@ -517,6 +620,7 @@ export function companionHelpText(facts: {
   );
   if (facts.siteUrl) parts.push("", `The trip site: ${facts.siteUrl}`);
   parts.push("", "/name — change what I'm called.");
+  if (!facts.isPrivateChat) parts.push("", "/proactive — how much I join the conversation in the group (1-3)");
   if (facts.isPrivateChat) parts.push("", "/group — connect me to your family group.");
   return parts.join("\n");
 }
@@ -541,6 +645,62 @@ export function renameUsage(language: "he" | "en", current: readonly string[]): 
   return he
     ? `כרגע קוראים לי: ${list}.\nכדי לשנות: ‎/name שם חדש — אפשר גם שני שמות, למשל ‎/name סולו / Solo`
     : `I currently answer to: ${list}.\nTo change it: /name New name — two languages work too, e.g. /name Solo / סולו`;
+}
+
+/**
+ * Replies to `/proactive`, the organizer's preference for how much the
+ * assistant takes part in one group (chat-router.ts, PROACTIVE_*). Router-composed
+ * like `/name`: a preference stated plainly, in the trip's language, neutral in
+ * gender, with no explanation of how it is done - the owner's decision is that a
+ * family should not have to understand the mechanism to choose a level.
+ */
+export function proactiveStatus(language: "he" | "en", level: 1 | 2 | 3): string {
+  return language === "he"
+    ? `רמת המעורבות שלי בקבוצה: ${level}\n` +
+      "1 — רק כשפונים אליי (שם, תיוג או תגובה להודעה שלי)\n" +
+      "2 — גם בהמשך שיחה שהתחלנו, ובתשובה לשאלה ששאלתי\n" +
+      "3 — גם כשנראה שמשהו מיועד לי (ברירת מחדל)\n" +
+      "לשינוי: ‎/proactive 1, 2 או 3"
+    : `My involvement in this group: level ${level}\n` +
+      "1 - only when you call me (my name, a tag, or a reply to one of my messages)\n" +
+      "2 - also in a conversation we've started, and when I've asked a question\n" +
+      "3 - also when something looks meant for me (default)\n" +
+      "To change: /proactive 1, 2 or 3";
+}
+
+/** What a level means, in a few words, for the confirmation. */
+function proactiveShort(language: "he" | "en", level: 1 | 2 | 3): string {
+  const he = ["רק כשפונים אליי", "גם בהמשך שיחה", "גם כשנראה שמשהו מיועד לי"] as const;
+  const en = ["only when called", "also in a conversation", "also when something looks meant for me"] as const;
+  return (language === "he" ? he : en)[level - 1]!;
+}
+
+/** `/proactive N` took effect. */
+export function proactiveChanged(language: "he" | "en", level: 1 | 2 | 3): string {
+  return language === "he"
+    ? `✅ מעכשיו רמה ${level}: ${proactiveShort(language, level)}`
+    : `✅ Level ${level} from now on: ${proactiveShort(language, level)}`;
+}
+
+/** A member who is not the trip's organizer tried to change it. */
+export function proactiveRefused(language: "he" | "en"): string {
+  return language === "he"
+    ? "רק מי שארגן את הטיול יכול לשנות את זה. אפשר לראות את ההגדרה עם ‎/proactive."
+    : "Only the trip organizer can change this. You can see the setting with /proactive.";
+}
+
+/** The change could not be saved (the store is unavailable, e.g. a relay running ahead of its migration). */
+export function proactiveUnavailable(language: "he" | "en"): string {
+  return language === "he"
+    ? "לא הצלחתי לשנות את זה כרגע. נסו שוב עוד מעט."
+    : "I couldn't change that right now. Please try again in a little while.";
+}
+
+/** `/proactive` in a private chat, where there is no group to set it for. */
+export function proactiveInPrivateChat(language: "he" | "en"): string {
+  return language === "he"
+    ? "‎/proactive שייך לקבוצה — שלחו אותו שם."
+    : "/proactive belongs to the group - send it there.";
 }
 
 /** One message for every refused name: the rule is short enough to state whole. */

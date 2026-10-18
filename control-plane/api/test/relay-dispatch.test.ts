@@ -15,6 +15,8 @@ import {
 import { dispatchUpdate, DEFAULT_STRINGS, OutageNoticeLimiter } from "../src/relay/dispatch.js";
 import { uiString } from "../src/intake-copy.js";
 import { GroupContext } from "../src/relay/group-context.js";
+import { PendingAttachments } from "../src/relay/pending-attachments.js";
+import { addressedMark, conversationMark, reactionAnswerMark, SILENCE_SENTINEL } from "../src/relay/stay-silent.js";
 import { confirmIntakeForChat, getSessionForChat, submitAnswerForChat } from "../src/interview.js";
 import { issueGroupBindingToken } from "../src/group-binding.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
@@ -405,7 +407,12 @@ describe("dispatchUpdate — the branch table", () => {
 
       const byNewName = await dispatchUpdate(fix.pool, msg(group, "סולו, מה התוכנית מחר?", "supergroup"));
       assert.equal(byNewName.kind, "to_gateway", "the new name now reaches the companion");
-      const byOldName = await dispatchUpdate(fix.pool, msg(group, "משפחת מרגולין יוצאת מחר", "supergroup"));
+      // From ANOTHER member: the sender of the line above is now in conversation
+      // with the assistant (2026-10-16) and would be heard whatever they said.
+      const byOldName = await dispatchUpdate(fix.pool, {
+        update_id: 2,
+        message: { message_id: 8, from: { id: 888, first_name: "Noa" }, chat: { id: group, type: "supergroup" }, text: "משפחת מרגולין יוצאת מחר" },
+      });
       assert.equal(byOldName.kind, "ignore", "a rename replaces — the old name no longer wakes it");
     });
   });
@@ -947,6 +954,202 @@ describe("the companion arriving in a group", { skip: SKIP }, () => {
     });
   });
 
+  describe("the one-tap add link: /start@bot <token> posted in the group by Telegram", () => {
+    // Telegram, on `?startgroup=<payload>`, adds the bot and then posts
+    // `/start@<bot> <payload>` in that group, from the person who added it.
+    const BOT = { id: "8463178587", username: "Kinerary_bot" };
+    const startInGroup = (chatId: string, payload: string, fromId = 777, chatType = "supergroup") => ({
+      update_id: 95,
+      message: {
+        message_id: 9,
+        chat: { id: chatId, type: chatType },
+        from: { id: fromId, is_bot: false, first_name: "Dror" },
+        text: payload === "" ? "/start@Kinerary_bot" : `/start@Kinerary_bot ${payload}`,
+      },
+    }) as never;
+
+    async function withIntro(fix: Fixture): Promise<void> {
+      await fix.pool.query(
+        `UPDATE control_plane.trips SET companion_intro = $2::jsonb WHERE id = $1`,
+        [fix.tripId, JSON.stringify({
+          assistant_name: "Rio", trip_title: "Japan 2026", private_url: "https://japan-2026.example",
+          language: "en", login_password: "seed-pw",
+        })],
+      );
+    }
+    const bindingsFor = async (fix: Fixture, chatId: string) => (await fix.pool.query(
+      "SELECT trip_id FROM control_plane.telegram_chat_bindings WHERE chat_id = $1 AND closed_at IS NULL",
+      [chatId],
+    )).rows;
+
+    test("binds the group and greets it, exactly like /group <token> from the same sender", async () => {
+      await withFixture(async (fix) => {
+        await withIntro(fix);
+        const issued = await issueGroupBindingToken(fix.pool, fix.tripId, "777", { ttlSeconds: 3600 });
+        assert.equal(issued.ok, true);
+        if (!issued.ok) return;
+
+        const viaStart = await dispatchUpdate(
+          fix.pool, startInGroup("-1002000501", issued.token), undefined, undefined, BOT,
+        );
+        assert.equal(viaStart.kind, "group_intro");
+        if (viaStart.kind !== "group_intro") return;
+        assert.equal(viaStart.chatId, "-1002000501");
+        assert.match(viaStart.text, /Rio/);
+        assert.deepEqual((await bindingsFor(fix, "-1002000501")).map((r) => r.trip_id), [fix.tripId]);
+
+        // The decision is the one the /group path makes for the same token.
+        const viaGroup = await dispatchUpdate(
+          fix.pool,
+          { update_id: 96, message: { message_id: 10, chat: { id: "-1002000502", type: "supergroup" },
+            from: { id: 777, is_bot: false, first_name: "Dror" }, text: `/group ${issued.token}` } } as never,
+          undefined, undefined, BOT,
+        );
+        assert.equal(viaGroup.kind, "group_intro");
+        if (viaGroup.kind !== "group_intro") return;
+        assert.equal(viaStart.text, viaGroup.text);
+        assert.equal(viaStart.pin, viaGroup.pin);
+      });
+    });
+
+    test("a lowercase payload (phone keyboards) binds too", async () => {
+      await withFixture(async (fix) => {
+        await withIntro(fix);
+        const issued = await issueGroupBindingToken(fix.pool, fix.tripId, "777", { ttlSeconds: 3600 });
+        if (!issued.ok) throw new Error("issue failed");
+        const d = await dispatchUpdate(
+          fix.pool, startInGroup("-1002000503", issued.token.toLowerCase()), undefined, undefined, BOT,
+        );
+        assert.equal(d.kind, "group_intro");
+        assert.equal((await bindingsFor(fix, "-1002000503")).length, 1);
+      });
+    });
+
+    test("a different person's tap (someone the token was not issued to) binds nothing and gets the flat refusal", async () => {
+      await withFixture(async (fix) => {
+        await withIntro(fix);
+        const issued = await issueGroupBindingToken(fix.pool, fix.tripId, "777", { ttlSeconds: 3600 });
+        if (!issued.ok) throw new Error("issue failed");
+        const d = await dispatchUpdate(
+          fix.pool, startInGroup("-1002000504", issued.token, 4242), undefined, undefined, BOT,
+        );
+        assert.equal(d.kind === "reply" && d.reply.text, DEFAULT_STRINGS.groupTokenRefused);
+        assert.equal((await bindingsFor(fix, "-1002000504")).length, 0);
+      });
+    });
+
+    test("an expired token, an unknown token and a retired trip's token are all refused with the same sentence", async () => {
+      await withFixture(async (fix) => {
+        await withIntro(fix);
+        const issued = await issueGroupBindingToken(fix.pool, fix.tripId, "777", { ttlSeconds: 3600 });
+        if (!issued.ok) throw new Error("issue failed");
+        await fix.pool.query(
+          `UPDATE control_plane.telegram_group_binding_tokens
+              SET created_at = now() - interval '2 hours', expires_at = now() - interval '1 hour'
+            WHERE trip_id = $1`,
+          [fix.tripId],
+        );
+        const expired = await dispatchUpdate(
+          fix.pool, startInGroup("-1002000505", issued.token), undefined, undefined, BOT,
+        );
+        const unknown = await dispatchUpdate(
+          fix.pool, startInGroup("-1002000506", "KIN-ZZZZZZZZ"), undefined, undefined, BOT,
+        );
+        // A live token whose trip has since been retired by teardown.
+        const fresh = await issueGroupBindingToken(fix.pool, fix.tripId, "777", { ttlSeconds: 3600 });
+        if (!fresh.ok) throw new Error("issue failed");
+        await fix.pool.query(
+          "UPDATE control_plane.trips SET slug = 'retired-' || slug || '-20261016' WHERE id = $1", [fix.tripId],
+        );
+        const retired = await dispatchUpdate(
+          fix.pool, startInGroup("-1002000510", fresh.token), undefined, undefined, BOT,
+        );
+        for (const d of [expired, unknown, retired]) {
+          assert.equal(d.kind === "reply" && d.reply.text, DEFAULT_STRINGS.groupTokenRefused);
+        }
+        for (const id of ["-1002000505", "-1002000506", "-1002000510"]) {
+          assert.equal((await bindingsFor(fix, id)).length, 0);
+        }
+      });
+    });
+
+    test("a group already bound to a DIFFERENT trip is refused: a link is not authority over someone else's binding", async () => {
+      await withFixture(async (fix) => {
+        await withIntro(fix);
+        const otherTrip = testId("trip");
+        await fix.pool.query(
+          "INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ($1, $2, 'draft')",
+          [otherTrip, otherTrip.replace(/_/g, "-")],
+        );
+        await fix.pool.query(
+          "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), '-1002000507', $1, 'other')",
+          [otherTrip],
+        );
+        const issued = await issueGroupBindingToken(fix.pool, fix.tripId, "777", { ttlSeconds: 3600 });
+        if (!issued.ok) throw new Error("issue failed");
+        const d = await dispatchUpdate(
+          fix.pool, startInGroup("-1002000507", issued.token), undefined, undefined, BOT,
+        );
+        assert.equal(d.kind === "reply" && d.reply.text, DEFAULT_STRINGS.groupTokenRefused);
+        assert.deepEqual((await bindingsFor(fix, "-1002000507")).map((r) => r.trip_id), [otherTrip]);
+      });
+    });
+
+    test("the same link tapped again is the supported re-bind: it greets again, nothing is duplicated", async () => {
+      await withFixture(async (fix) => {
+        await withIntro(fix);
+        const issued = await issueGroupBindingToken(fix.pool, fix.tripId, "777", { ttlSeconds: 3600 });
+        if (!issued.ok) throw new Error("issue failed");
+        for (let i = 0; i < 2; i += 1) {
+          const d = await dispatchUpdate(
+            fix.pool, startInGroup("-1002000508", issued.token), undefined, undefined, BOT,
+          );
+          assert.equal(d.kind, "group_intro");
+        }
+        assert.equal((await bindingsFor(fix, "-1002000508")).length, 1);
+      });
+    });
+
+    test("a /start payload in a group that is NOT a binding token is unchanged: the old answer, nothing bound", async () => {
+      // `?startgroup=<slug>` was the payload before; nothing consumed it. In a
+      // group it was answered with "do this in a private chat" — and still is.
+      await withFixture(async (fix) => {
+        for (const payload of ["japan-2026", "KIN-ZZZZZZZ", "KIN-ZZZZZZZZZ", "x".repeat(43), ""]) {
+          const d = await dispatchUpdate(
+            fix.pool, startInGroup("-1002000509", payload), undefined, undefined, BOT,
+          );
+          assert.equal(d.kind, "reply", payload);
+          assert.notEqual(d.kind === "reply" && d.reply.text, DEFAULT_STRINGS.groupTokenRefused);
+        }
+        assert.equal((await bindingsFor(fix, "-1002000509")).length, 0);
+      });
+    });
+
+    test("PRIVATE chat /start <token> is still onboarding, never a group binding", async () => {
+      await withFixture(async (fix) => {
+        await withIntro(fix);
+        const issued = await issueGroupBindingToken(fix.pool, fix.tripId, "777", { ttlSeconds: 3600 });
+        if (!issued.ok) throw new Error("issue failed");
+        const dm = "700000777";
+        const d = await dispatchUpdate(
+          fix.pool,
+          { update_id: 97, message: { message_id: 11, chat: { id: dm, type: "private" },
+            from: { id: 777, is_bot: false, first_name: "Dror" }, text: `/start ${issued.token}` } } as never,
+          undefined, undefined, BOT,
+        );
+        // The enrollment path owns it: an unrecognised payload there is a bad
+        // link. It is not redeemed, and the DM is not bound.
+        assert.equal(d.kind, "reply");
+        assert.equal(d.kind === "reply" && d.reply.text, DEFAULT_STRINGS.badLink);
+        assert.equal((await bindingsFor(fix, dm)).length, 0);
+        const live = await fix.pool.query(
+          "SELECT use_count FROM control_plane.telegram_group_binding_tokens WHERE trip_id = $1", [fix.tripId],
+        );
+        assert.equal(live.rows[0].use_count, 0, "not redeemed");
+      });
+    });
+  });
+
   test("the password can be withheld from the group by one option", async () => {
     await withFixture(async (fix) => {
       const chatId = "-1002000888";
@@ -981,6 +1184,54 @@ describe("the companion arriving in a group", { skip: SKIP }, () => {
         fix.pool, joinUpdate("-1002000999"), undefined, undefined, { id: "8463178587" },
       );
       assert.equal(decision.kind, "reply");
+    });
+  });
+
+  test("joining a group that is not bound yet asks for the trip joining key, in the adder's language (owner's wording, 2026-10-16)", async () => {
+    // The one-tap link adds the bot, THEN Telegram posts `/start@bot <token>`.
+    // The join arrives first, so what it says must not contradict the binding
+    // that follows ("open the link from your signup" would).
+    await withFixture(async (fix) => {
+      const en = await dispatchUpdate(
+        fix.pool, joinUpdate("-1002000998"), undefined, undefined, { id: "8463178587" },
+      );
+      assert.equal(
+        en.kind === "reply" && en.reply.text,
+        "Happy to join your group, but I need the trip joining key to be helpful.",
+      );
+      const he = await dispatchUpdate(
+        fix.pool,
+        { ...(joinUpdate("-1002000997") as object), my_chat_member: {
+          ...(joinUpdate("-1002000997") as { my_chat_member: object }).my_chat_member,
+          from: { id: 77, is_bot: false, first_name: "דרור", language_code: "he" },
+        } } as never,
+        undefined, undefined, { id: "8463178587" },
+      );
+      assert.equal(
+        he.kind === "reply" && he.reply.text,
+        "שמח להצטרף לקבוצה, אבל אני צריך את מפתח ההצטרפות לטיול כדי לעזור.",
+      );
+      // And the key that follows binds and greets, as before.
+      await fix.pool.query(
+        `UPDATE control_plane.trips SET companion_intro = $2::jsonb WHERE id = $1`,
+        [fix.tripId, JSON.stringify({ assistant_name: "Rio", language: "en", private_url: "https://x.example" })],
+      );
+      const issued = await issueGroupBindingToken(fix.pool, fix.tripId, "77", { ttlSeconds: 3600 });
+      if (!issued.ok) throw new Error("issue failed");
+      const bound = await dispatchUpdate(
+        fix.pool,
+        { update_id: 98, message: { message_id: 12, chat: { id: "-1002000998", type: "supergroup" },
+          from: { id: 77, is_bot: false, first_name: "Dror" }, text: `/start@Kinerary_bot ${issued.token}` } } as never,
+        undefined, undefined, { id: "8463178587", username: "Kinerary_bot" },
+      );
+      assert.equal(bound.kind, "group_intro");
+    });
+  });
+
+  test("ordinary messages in an unbound chat keep the old 'no trip for this chat' text; only the join changed", async () => {
+    await withFixture(async (fix) => {
+      const decision = await dispatchUpdate(fix.pool, msg("-1002000996", "/name Rio", "supergroup"));
+      assert.equal(decision.kind === "reply" && decision.reply.text, DEFAULT_STRINGS.unbound);
     });
   });
 
@@ -1035,7 +1286,14 @@ describe("companion reply-capture through dispatchUpdate (migration 0053)", { sk
       const first = await dispatchUpdate(fix.pool, msg(chatId, "Friday works for us", "group"));
       assert.equal(first.kind, "to_gateway", "the window captures the very next message, whoever sends it");
 
-      const second = await dispatchUpdate(fix.pool, msg(chatId, "anyway, who's driving?", "group"));
+      // A DIFFERENT member: the captured sender is now the assistant's
+      // conversation partner (2026-10-16) and their own next messages are
+      // heard without a name - covered by the conversation-window suite.
+      // The one-shot "?" window itself is spent, and nobody else gets a pass.
+      const second = await dispatchUpdate(fix.pool, {
+        update_id: 2,
+        message: { message_id: 8, from: { id: 888, first_name: "Noa" }, chat: { id: chatId, type: "group" }, text: "anyway, who's driving?" },
+      });
       assert.deepEqual(
         second,
         { kind: "ignore", reason: "NOT_ADDRESSED" },
@@ -1096,6 +1354,265 @@ describe("companion reply-capture through dispatchUpdate (migration 0053)", { sk
         { id: "8463178587", username: "kinerary_bot" },
       );
       assert.equal(decision.kind, "to_gateway");
+    });
+  });
+});
+
+// The per-person conversation window (owner's decision, 2026-10-16): once the
+// companion is talking with one member of a group, that member's own next
+// messages reach it without its name, for five minutes after its last send.
+describe("companion conversation window through dispatchUpdate", { skip: SKIP }, () => {
+  const NAMES = ["Liv"];
+  const DROR = 777;
+  const NOA = 555;
+
+  function from(chatId: string, text: string, fromId: number, extra: Record<string, unknown> = {}): TelegramUpdate {
+    return {
+      update_id: 3,
+      message: {
+        message_id: 9,
+        from: { id: fromId, first_name: fromId === DROR ? "Dror" : "Noa", ...extra },
+        chat: { id: chatId, type: "supergroup" },
+        text,
+      },
+    } as TelegramUpdate;
+  }
+
+  async function bindNamed(fix: Fixture, chatId: string): Promise<void> {
+    await bindCompanion(fix, chatId, "companion-colmar");
+    await fix.pool.query("UPDATE control_plane.trips SET assistant_names = $2 WHERE id = $1", [fix.tripId, NAMES]);
+  }
+
+  async function dispatch(fix: Fixture, update: TelegramUpdate, lines: string[] = [], options: Record<string, unknown> = {}) {
+    return dispatchUpdate(fix.pool, update, undefined, (l) => lines.push(l), {}, options);
+  }
+
+  test("after being addressed by name, the same member's untagged follow-ups are forwarded", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1003000001";
+      await bindNamed(fix, chat);
+      const lines: string[] = [];
+      assert.equal((await dispatch(fix, from(chat, "Liv, what is the plan for Friday?", DROR), lines)).kind, "to_gateway");
+      assert.equal(
+        (await dispatch(fix, from(chat, "and what about Saturday", DROR), lines)).kind,
+        "to_gateway",
+        "no name, no mention, no reply, no question mark before it: the window carries it",
+      );
+      assert.equal((await dispatch(fix, from(chat, "thanks", DROR), lines)).kind, "to_gateway", "each forward renews it");
+      assert.ok(lines.some((l) => l.includes("trip_bot.conversation_window_hit")), "the hit is logged");
+    });
+  });
+
+  test("another member's untagged message is still NOT_ADDRESSED, and does not disturb the partner", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1003000002";
+      await bindNamed(fix, chat);
+      await dispatch(fix, from(chat, "Liv, hello", DROR));
+      assert.deepEqual(await dispatch(fix, from(chat, "we should leave at nine", NOA)), { kind: "ignore", reason: "NOT_ADDRESSED" });
+      assert.equal((await dispatch(fix, from(chat, "and eat first", DROR))).kind, "to_gateway", "Dror still holds the conversation");
+    });
+  });
+
+  test("the member's message after the window lapsed is NOT_ADDRESSED", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1003000003";
+      await bindNamed(fix, chat);
+      await dispatch(fix, from(chat, "Liv, hello", DROR));
+      await fix.pool.query(
+        "UPDATE control_plane.telegram_chat_bindings SET conversation_until = now() - interval '1 second' WHERE chat_id = $1",
+        [chat],
+      );
+      assert.deepEqual(await dispatch(fix, from(chat, "and one more thing", DROR)), { kind: "ignore", reason: "NOT_ADDRESSED" });
+    });
+  });
+
+  test("a message sent while the companion is still working (no send yet) is forwarded", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1003000004";
+      await bindNamed(fix, chat);
+      // The organizer sends a file, then follows up before any reply exists:
+      // nothing here calls renewCompanionConversation, as no send has happened.
+      await dispatch(fix, from(chat, "Liv, I am sending the booking PDF", DROR));
+      assert.equal((await dispatch(fix, from(chat, "it is the second hotel", DROR))).kind, "to_gateway");
+      assert.equal((await dispatch(fix, from(chat, "check the dates", DROR))).kind, "to_gateway");
+    });
+  });
+
+  test("a member who was never addressed to it gets no window", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1003000005";
+      await bindNamed(fix, chat);
+      assert.deepEqual(await dispatch(fix, from(chat, "anyone hungry?", DROR)), { kind: "ignore", reason: "NOT_ADDRESSED" });
+    });
+  });
+
+  test("the one-shot question window still admits another member, and the conversation moves to them", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1003000006";
+      await bindNamed(fix, chat);
+      await dispatch(fix, from(chat, "Liv, plan something", DROR));
+      await setCompanionExpectsReply(fix.pool, chat, true);
+      const lines: string[] = [];
+      assert.equal((await dispatch(fix, from(chat, "Friday works for us", NOA), lines)).kind, "to_gateway", "anyone's next message after a '?'");
+      assert.ok(lines.some((l) => l.includes("trip_bot.reply_window_hit")), "the one-shot window now logs its hit");
+      assert.ok(!lines.some((l) => l.includes("trip_bot.conversation_window_hit")), "and that was not the conversation window");
+      assert.equal((await dispatch(fix, from(chat, "oh and also", DROR))).kind, "to_gateway", "Dror is still in the conversation: Noa joined, nobody was displaced");
+      assert.equal((await dispatch(fix, from(chat, "is it far?", NOA))).kind, "to_gateway", "and Noa is in");
+    });
+  });
+
+  test("another member addressing the companion by name joins the conversation; the first is still in", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1003000007";
+      await bindNamed(fix, chat);
+      await dispatch(fix, from(chat, "Liv, hello", DROR));
+      await dispatch(fix, from(chat, "Liv, what about me?", NOA));
+      assert.equal((await dispatch(fix, from(chat, "still there?", DROR))).kind, "to_gateway", "Dror was not displaced");
+      assert.equal((await dispatch(fix, from(chat, "thanks", NOA))).kind, "to_gateway");
+      assert.deepEqual(
+        await dispatch(fix, from(chat, "what are we doing", 999)),
+        { kind: "ignore", reason: "NOT_ADDRESSED" },
+        "a third member who never addressed it is not in",
+      );
+    });
+  });
+
+  test("the per-trip opt-out switches the conversation window off too", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1003000008";
+      await bindNamed(fix, chat);
+      await fix.pool.query("UPDATE control_plane.trips SET companion_reply_capture_enabled = false WHERE id = $1", [fix.tripId]);
+      assert.equal((await dispatch(fix, from(chat, "Liv, hello", DROR))).kind, "to_gateway", "naming it still works");
+      assert.deepEqual(await dispatch(fix, from(chat, "and another", DROR)), { kind: "ignore", reason: "NOT_ADDRESSED" });
+    });
+  });
+
+  test("a command inside the window is the router's, not the companion's", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1003000009";
+      await bindNamed(fix, chat);
+      await dispatch(fix, from(chat, "Liv, hello", DROR));
+      const decision = await dispatch(fix, from(chat, "/help", DROR));
+      assert.notEqual(decision.kind, "to_gateway");
+    });
+  });
+
+  test("a bot's message never opens or holds a window", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1003000010";
+      await bindNamed(fix, chat);
+      await dispatch(fix, from(chat, "Liv, hello", DROR));
+      const bot = await dispatch(fix, from(chat, "beep", DROR, { is_bot: true }));
+      assert.notEqual(bot.kind, "to_gateway");
+    });
+  });
+
+  test("a DM is unaffected and writes no window", async () => {
+    await withFixture(async (fix) => {
+      const chat = "700000222";
+      await bindCompanion(fix, chat, "companion-colmar");
+      assert.equal((await dispatchUpdate(fix.pool, msg(chat, "hello there", "private"))).kind, "to_gateway");
+      const r = await fix.pool.query(
+        "SELECT conversation_user_ids FROM control_plane.telegram_chat_bindings WHERE chat_id = $1", [chat],
+      );
+      assert.equal(r.rows[0].conversation_user_ids, null);
+    });
+  });
+
+  test("an untagged document from the partner INSIDE the window is forwarded, not held", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1003000012";
+      await bindNamed(fix, chat);
+      await dispatch(fix, from(chat, "Liv, I am about to send the booking", DROR));
+      const lines: string[] = [];
+      const file = {
+        update_id: 4,
+        message: {
+          message_id: 10,
+          from: { id: DROR, first_name: "Dror" },
+          chat: { id: chat, type: "supergroup" },
+          document: { file_id: "BQAC-x", file_name: "booking.pdf", mime_type: "application/pdf" },
+        },
+      } as TelegramUpdate;
+      const decision = await dispatch(fix, file, lines, { pendingAttachments: new PendingAttachments() });
+      assert.equal(decision.kind, "to_gateway", "in conversation, the file goes straight to the companion");
+      assert.ok(!lines.some((l) => l.includes("trip_bot.attachment_held")), "and is not held for a later message");
+    });
+  });
+
+  test("a failing window lookup degrades to NOT_ADDRESSED - held and overheard as before - not a failed update", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1003000013";
+      await bindNamed(fix, chat);
+      await dispatch(fix, from(chat, "Liv, hello", DROR));
+      // The relay running before the migration: the columns are not there. The
+      // lookup (and the write) throw; the router must carry on as it did before.
+      await fix.pool.query(
+        "ALTER TABLE control_plane.telegram_chat_bindings RENAME COLUMN conversation_until TO conversation_until_gone",
+      );
+      try {
+        const lines: string[] = [];
+        const ctx = new GroupContext();
+        const pending = new PendingAttachments();
+        const text = await dispatch(fix, from(chat, "what about the museum", DROR), lines, { groupContext: ctx });
+        assert.deepEqual(text, { kind: "ignore", reason: "NOT_ADDRESSED" });
+        assert.ok(lines.some((l) => l.includes("trip_bot.conversation_window_read_failed")), "the failure is loud");
+        assert.equal(ctx.take(chat).length, 1, "overheard context is kept, as before");
+
+        const file = {
+          update_id: 5,
+          message: {
+            message_id: 11,
+            from: { id: DROR, first_name: "Dror" },
+            chat: { id: chat, type: "supergroup" },
+            document: { file_id: "BQAC-y", file_name: "booking.pdf", mime_type: "application/pdf" },
+          },
+        } as TelegramUpdate;
+        const held = await dispatch(fix, file, lines, { pendingAttachments: pending });
+        assert.deepEqual(held, { kind: "ignore", reason: "NOT_ADDRESSED" });
+        assert.ok(lines.some((l) => l.includes("trip_bot.attachment_held")), "the document is held, as before");
+      } finally {
+        await fix.pool.query(
+          "ALTER TABLE control_plane.telegram_chat_bindings RENAME COLUMN conversation_until_gone TO conversation_until",
+        );
+      }
+    });
+  });
+
+  test("only a window-only forward carries the not-addressed mark; named ones carry the addressed mark, '?' ones neither", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1003000014";
+      await bindNamed(fix, chat);
+      const text = (d: { kind: string }) => (d as { event?: { text?: string } }).event?.text ?? "";
+      const named = await dispatch(fix, from(chat, "Liv, hello", DROR));
+      assert.equal(text(named), `${addressedMark()}\n\nLiv, hello`, "a named message carries the addressed mark, not the window mark");
+      assert.ok(!text(named).includes("[not addressed to you by name"));
+      const windowOnly = await dispatch(fix, from(chat, "and what about Saturday", DROR));
+      assert.equal(windowOnly.kind, "to_gateway");
+      assert.ok(text(windowOnly).startsWith(conversationMark()), "the window-only forward is marked");
+      assert.ok(text(windowOnly).endsWith("and what about Saturday"), "and the message itself is intact");
+      assert.ok(text(windowOnly).includes(SILENCE_SENTINEL), "and the mark names the way to stay silent");
+      // Answering a '?' is addressed by the router's own rule: unmarked.
+      await setCompanionExpectsReply(fix.pool, chat, true);
+      const answer = await dispatch(fix, from(chat, "Friday works", NOA));
+      assert.equal(text(answer), "Friday works", "a '?' window answer is not marked");
+      // The overheard block still leads; the mark sits beside the message.
+      const ctx = new GroupContext();
+      ctx.hold(chat, "Someone", "we should leave early");
+      const withCtx = text(await dispatch(fix, from(chat, "ok thanks", DROR), [], { groupContext: ctx }));
+      assert.ok(withCtx.startsWith("[overheard in the group"), "overheard first");
+      assert.ok(withCtx.indexOf(conversationMark()) > withCtx.indexOf("[end of overheard]"), "then the mark");
+    });
+  });
+
+  test("a message admitted only by the window is recorded as trigger conversation_window", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1003000011";
+      await bindNamed(fix, chat);
+      const named = await dispatch(fix, from(chat, "Liv, hello", DROR), [], { assistantEvents: true });
+      const followUp = await dispatch(fix, from(chat, "and also", DROR), [], { assistantEvents: true });
+      assert.equal((named as { analytics?: { triggerType: string } }).analytics?.triggerType, "name");
+      assert.equal((followUp as { analytics?: { triggerType: string } }).analytics?.triggerType, "conversation_window");
     });
   });
 });
@@ -1280,8 +1797,12 @@ describe("overheard group context (R11)", { skip: SKIP }, () => {
         undefined, undefined, {}, { groupContext: ctx });
       assert.equal(captured.kind, "to_gateway", "the open window still captures, as before");
 
-      const next = await dispatchUpdate(fix.pool, msg(chatId, "ומי נוהג?", "group"),
-        undefined, undefined, {}, { groupContext: ctx });
+      // Another member: the sender of the captured message is the assistant's
+      // conversation partner from here on (2026-10-16), which is its own window.
+      const next = await dispatchUpdate(fix.pool, {
+        update_id: 2,
+        message: { message_id: 8, from: { id: 888, first_name: "Noa" }, chat: { id: chatId, type: "group" }, text: "ומי נוהג?" },
+      }, undefined, undefined, {}, { groupContext: ctx });
       assert.deepEqual(next, { kind: "ignore", reason: "NOT_ADDRESSED" },
         "one-shot still means one-shot — context does not extend it");
       assert.equal(ctx.take(chatId).length, 1, "the ignored one was retained instead");
@@ -1442,6 +1963,198 @@ describe("dispatchUpdate — a companion that is down", () => {
       assert.equal(quiet.kind === "ignore" && quiet.analytics?.triggerType, "not_addressed");
       const lost = await dispatchUpdate(fix.pool, groupMsg("Rio, dinner?"), undefined, () => {}, BOT, opts);
       assert.equal(lost.kind === "reply" && lost.analytics !== undefined, true);
+    });
+  });
+});
+
+describe("explicit addressing and reactions through dispatchUpdate (staging run 2026-10-17)", { skip: SKIP }, () => {
+  const BOT = { username: "Tripinterviewer_bot", id: "7000000001" };
+  const DROR = 777;
+  const NOA = 555;
+  const text = (d: { kind: string }) => (d as { event?: { text?: string } }).event?.text ?? "";
+  const explicitOf = (d: { kind: string }) => (d as { explicit?: boolean }).explicit === true;
+
+  function from(chatId: string, body: string, fromId: number, extra: Record<string, unknown> = {}): TelegramUpdate {
+    return {
+      update_id: 3,
+      message: {
+        message_id: 9,
+        from: { id: fromId, first_name: fromId === DROR ? "Dror" : "Noa" },
+        chat: { id: chatId, type: "supergroup" },
+        text: body,
+        ...extra,
+      },
+    } as TelegramUpdate;
+  }
+  const replyTo = (body: string) => ({ reply_to_message: { message_id: 3, text: body, from: { id: 7000000001, is_bot: true } } });
+
+  async function bind(fix: Fixture, chatId: string): Promise<void> {
+    await bindCompanion(fix, chatId, "companion-colmar");
+    await fix.pool.query("UPDATE control_plane.trips SET assistant_names = $2 WHERE id = $1", [fix.tripId, ["Liv"]]);
+  }
+  const dispatch = (fix: Fixture, update: TelegramUpdate, lines: string[] = [], options: Record<string, unknown> = {}) =>
+    dispatchUpdate(fix.pool, update, undefined, (l) => lines.push(l), BOT, options);
+
+  test("an @mention of the bot, the assistant's name, and a reply to it are explicit: marked, with the handle, and flagged for the connector", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1004000001";
+      await bind(fix, chat);
+      const mention = await dispatch(fix, from(chat, "@Tripinterviewer_bot איפה המלון ביחס למרכז העיר?", DROR));
+      assert.equal(mention.kind, "to_gateway");
+      assert.ok(text(mention).startsWith(addressedMark(BOT.username)), "marked");
+      assert.ok(text(mention).includes("@Tripinterviewer_bot"), "the mark teaches the companion its handle");
+      assert.ok(text(mention).endsWith("איפה המלון ביחס למרכז העיר?"), "the words are untouched");
+      assert.ok(explicitOf(mention));
+
+      const named = await dispatch(fix, from(chat, "Liv what time is checkout", NOA));
+      assert.ok(text(named).startsWith(addressedMark(BOT.username)));
+      assert.ok(explicitOf(named));
+
+      const reply = await dispatch(fix, from(chat, "and the other one", DROR, replyTo("The pool closes at ten.")));
+      assert.ok(text(reply).startsWith(addressedMark(BOT.username)));
+      assert.ok(explicitOf(reply));
+    });
+  });
+
+  test("the addressed mark forbids the sentinel, carries the handle, and invents none when the bot's is unknown", () => {
+    assert.ok(addressedMark("Some_bot").startsWith("[addressed to you directly"));
+    assert.ok(addressedMark("Some_bot").includes(`Never reply with ${SILENCE_SENTINEL}`));
+    assert.ok(addressedMark("Some_bot").includes("@Some_bot"));
+    assert.ok(!addressedMark().includes("@"), "no handle, none invented");
+    assert.equal(addressedMark("a] b [c\nd"), addressedMark("abcd"), "only handle characters survive into the prompt");
+  });
+
+  test("the window, the judge and the '?' window never mark a message explicit", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1004000002";
+      await bind(fix, chat);
+      await dispatch(fix, from(chat, "Liv hello", DROR));
+      const windowOnly = await dispatch(fix, from(chat, "and what about Saturday", DROR));
+      assert.ok(text(windowOnly).startsWith(conversationMark()));
+      assert.ok(!text(windowOnly).includes("[addressed to you directly"));
+      assert.equal(explicitOf(windowOnly), false);
+
+      await setCompanionExpectsReply(fix.pool, chat, true);
+      const answer = await dispatch(fix, from(chat, "Friday works", NOA));
+      assert.equal(text(answer), "Friday works");
+      assert.equal(explicitOf(answer), false);
+    });
+  });
+
+  test("a DM is never marked", async () => {
+    await withFixture(async (fix) => {
+      const chat = "5550001";
+      await bindCompanion(fix, chat, "companion-colmar");
+      const dm = await dispatch(fix, { update_id: 4, message: { message_id: 1, from: { id: DROR, first_name: "Dror" }, chat: { id: chat, type: "private" }, text: "hi" } } as TelegramUpdate);
+      assert.equal(text(dm), "hi");
+      assert.equal(explicitOf(dm), false);
+    });
+  });
+
+  test("an overheard block leads, then the addressed mark, then the message", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1004000003";
+      await bind(fix, chat);
+      const ctx = new GroupContext();
+      ctx.hold(chat, "Someone", "we should leave early");
+      const out = text(await dispatch(fix, from(chat, "Liv, thoughts?", DROR), [], { groupContext: ctx }));
+      assert.ok(out.startsWith("[overheard in the group"));
+      assert.ok(out.indexOf(addressedMark(BOT.username)) > out.indexOf("[end of overheard]"));
+      assert.ok(out.endsWith("Liv, thoughts?"));
+    });
+  });
+
+  test("emoji-only with no question pending: the conversation window does not forward it", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1004000004";
+      await bind(fix, chat);
+      await dispatch(fix, from(chat, "Liv hello", DROR));
+      const lines: string[] = [];
+      const ctx = new GroupContext();
+      for (const reaction of ["😂", "👍", "!!!", "?", "🙏🙏"]) {
+        assert.deepEqual(await dispatch(fix, from(chat, reaction, DROR), lines, { groupContext: ctx }), { kind: "ignore", reason: "NOT_ADDRESSED" }, reaction);
+      }
+      assert.equal(ctx.take(chat).length, 0, "and reactions are not kept as overheard background either");
+      assert.ok(lines.some((l) => l.includes("trip_bot.reaction_not_forwarded")));
+      assert.ok(!lines.some((l) => l.includes("trip_bot.conversation_window_hit")));
+      assert.equal((await dispatch(fix, from(chat, "and Saturday", DROR))).kind, "to_gateway", "words still ride the window");
+      assert.equal((await dispatch(fix, from(chat, "👍 sounds good", DROR))).kind, "to_gateway", "an emoji WITH words is a message");
+    });
+  });
+
+  test("emoji-only after a question the assistant asked (the '?' window is open) is the answer: forwarded, window consumed, told what it answers", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1004000005";
+      await bind(fix, chat);
+      await setCompanionExpectsReply(fix.pool, chat, true); // "לעדכן את האתר?"
+      const lines: string[] = [];
+      const yes = await dispatch(fix, from(chat, "👍", DROR), lines);
+      assert.equal(yes.kind, "to_gateway");
+      assert.ok(lines.some((l) => l.includes("trip_bot.reply_window_hit")));
+      assert.ok(text(yes).startsWith(reactionAnswerMark()));
+      assert.ok(text(yes).endsWith("👍"));
+      assert.equal(explicitOf(yes), false, "not a by-name address: silence stays allowed");
+      // One shot: the next bare emoji finds no question pending.
+      assert.deepEqual(await dispatch(fix, from(chat, "👍", NOA)), { kind: "ignore", reason: "NOT_ADDRESSED" });
+    });
+  });
+
+  test("emoji-only inside the conversation window while a question is pending is forwarded (the question window answers it)", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1004000010";
+      await bind(fix, chat);
+      await dispatch(fix, from(chat, "Liv, can you update the site", DROR)); // Dror is in the conversation
+      await setCompanionExpectsReply(fix.pool, chat, true); // "Should I update the website?"
+      assert.equal((await dispatch(fix, from(chat, "👍", DROR))).kind, "to_gateway");
+    });
+  });
+
+  test("emoji-only after a STATEMENT is ignored", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1004000006";
+      await bind(fix, chat);
+      await setCompanionExpectsReply(fix.pool, chat, true);
+      await setCompanionExpectsReply(fix.pool, chat, false); // the assistant's next send was a statement
+      assert.deepEqual(await dispatch(fix, from(chat, "👍", DROR)), { kind: "ignore", reason: "NOT_ADDRESSED" });
+    });
+  });
+
+  test("an emoji-only Telegram reply to an assistant message that ended in a question is explicit; to a statement it is ignored", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1004000007";
+      await bind(fix, chat);
+      const yes = await dispatch(fix, from(chat, "👍", DROR, replyTo("לעדכן את האתר?")));
+      assert.equal(yes.kind, "to_gateway");
+      assert.ok(text(yes).startsWith(addressedMark(BOT.username)));
+      assert.ok(explicitOf(yes));
+      const ack = await dispatch(fix, from(chat, "👍", DROR, replyTo("עדכנתי את האתר.")));
+      assert.deepEqual(ack, { kind: "ignore", reason: "NOT_ADDRESSED" }, "a thumbs-up to a statement is a reaction");
+    });
+  });
+
+  test("a photo with no caption replying to the assistant is not a reaction", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1004000008";
+      await bind(fix, chat);
+      const photo = {
+        update_id: 5,
+        message: {
+          message_id: 12, from: { id: DROR, first_name: "Dror" }, chat: { id: chat, type: "supergroup" },
+          photo: [{ file_id: "p1", width: 10, height: 10 }], ...replyTo("Send me the voucher"),
+        },
+      } as TelegramUpdate;
+      assert.equal((await dispatch(fix, photo)).kind, "to_gateway");
+    });
+  });
+
+  test("a trip opted out of reply capture: an emoji after a '?' is not an answer, explicit address still works", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1004000009";
+      await bind(fix, chat);
+      await fix.pool.query("UPDATE control_plane.trips SET companion_reply_capture_enabled = false WHERE id = $1", [fix.tripId]);
+      await setCompanionExpectsReply(fix.pool, chat, true);
+      assert.deepEqual(await dispatch(fix, from(chat, "👍", DROR)), { kind: "ignore", reason: "NOT_ADDRESSED" });
+      assert.equal((await dispatch(fix, from(chat, "Liv hi", DROR))).kind, "to_gateway");
     });
   });
 });

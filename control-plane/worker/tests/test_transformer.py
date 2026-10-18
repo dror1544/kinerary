@@ -132,9 +132,11 @@ class TransformerTests(unittest.TestCase):
     def test_non_latin_destination_falls_back_to_a_phase_name(self) -> None:
         # "trip-2026" is a URL a family cannot tell from anyone else's; a
         # phase name is one they recognise (capture ledger, General #4).
+        # The destination is a Hebrew place no table resolves: "יפן" itself now
+        # resolves through the country aliases (TripIdentityFromEssenceTests).
         intake = {
             **JAPAN_INTAKE,
-            "destination": _text("יפן"),
+            "destination": _text("המזרח הרחוק"),
             "phases": _structured([
                 {"name": "טוקיו", "name_en": "Tokyo"},
                 {"name": "Kyoto"},
@@ -145,7 +147,7 @@ class TransformerTests(unittest.TestCase):
     def test_phase_fallback_skips_phases_that_slugify_to_nothing(self) -> None:
         intake = {
             **JAPAN_INTAKE,
-            "destination": _text("יפן"),
+            "destination": _text("המזרח הרחוק"),
             "phases": _structured([{"name": "טוקיו"}, {"name": "Kyoto"}]),
         }
         self.assertEqual(derive_trip_slug(intake, today=date(2026, 8, 20)), "kyoto-2026")
@@ -153,7 +155,7 @@ class TransformerTests(unittest.TestCase):
     def test_generic_fallback_remains_when_nothing_is_latin(self) -> None:
         intake = {
             **JAPAN_INTAKE,
-            "destination": _text("יפן"),
+            "destination": _text("המזרח הרחוק"),
             "phases": _structured([{"name": "טוקיו"}]),
         }
         self.assertEqual(derive_trip_slug(intake, today=date(2026, 8, 20)), "trip-2026")
@@ -213,14 +215,41 @@ class TransformerTests(unittest.TestCase):
         config = transform_intake(intake)
         self.assertIn("Extended family reunion", config["meta"]["title"])
 
-    def test_other_trip_type_reaches_the_companion_as_context(self) -> None:
-        intake = {**JAPAN_INTAKE, "trip_type": _choice_other("Extended family reunion")}
-        config = transform_intake(intake)
-        instructions = config["agent"]["standing_instructions"]
-        self.assertTrue(any(
-            item["text"]["en"] == "The organizer describes this trip as: Extended family reunion"
-            for item in instructions
-        ))
+    def _trip_type_instructions(self, trip_type: dict) -> list:
+        config = transform_intake({**JAPAN_INTAKE, "trip_type": trip_type})
+        instructions = (config.get("agent") or {}).get("standing_instructions", [])
+        return [i for i in instructions if i.get("open_question") == "trip_type"]
+
+    def test_unresolved_trip_type_reaches_the_companion_as_an_open_question(self) -> None:
+        # The organizer's typed trip type matched no option (choice_other). It
+        # must not block the build, and it must not look settled: the companion
+        # is told it is open, with the organizer's words verbatim, in both
+        # languages, and is told to settle it in conversation.
+        found = self._trip_type_instructions(_choice_other("שני זוגות, בלי ילדים"))
+        self.assertEqual(len(found), 1)
+        text = found[0]["text"]
+        for lang in ("en", "he"):
+            self.assertIn("שני זוגות, בלי ילדים", text[lang])
+        self.assertIn("not settled", text["en"])
+        self.assertIn("early in the conversation", text["en"])
+
+    def test_unresolved_trip_type_marker_is_organizer_only(self) -> None:
+        # The marker is for the companion. Organizer-only keeps it off the
+        # site through sanitizeConfig / agent-schema (group-visible only).
+        (found,) = self._trip_type_instructions(_choice_other("Extended family reunion"))
+        self.assertEqual(found["visibility"], "organizer")
+
+    def test_unresolved_trip_type_keeps_the_words_in_the_title(self) -> None:
+        config = transform_intake({**JAPAN_INTAKE, "trip_type": _choice_other("Extended family reunion")})
+        self.assertIn("Extended family reunion", config["meta"]["title"])
+
+    def test_a_chosen_trip_type_carries_no_open_question(self) -> None:
+        for option in ("family", "group_of_families", "couple"):
+            with self.subTest(option=option):
+                self.assertEqual(self._trip_type_instructions(_choice(option)), [])
+
+    def test_a_blank_typed_trip_type_adds_no_empty_question(self) -> None:
+        self.assertEqual(self._trip_type_instructions(_choice_other("   ")), [])
 
     def test_other_group_size_extracts_the_leading_number(self) -> None:
         # A stat "number" must actually be a number, not the organizer's
@@ -1159,6 +1188,83 @@ class NonLatinNameTests(unittest.TestCase):
         self.assertEqual("Margolin", family["name"]["en"])
 
 
+class TravelerLoginUsernameTests(unittest.TestCase):
+    """The site login of a traveller whose name is not in Latin letters.
+
+    Owner's manual test, 2026-10-15 (colmar-2026): the intro listed
+    Dror Aloul — droraloul, Hagit Mali Aloul — hagitmalialoul, צחי סער — traveler,
+    ליאב סער — traveler3. `_slugify` returns the literal "traveler" for anything
+    with no a-z0-9, and the collision suffix made the second "traveler3": two
+    logins the family could not tell from each other or from anyone's.
+
+    A login is ASCII, derived from a name, and stable: the same intake gives the
+    same usernames every time it is rendered, because the site's accounts are
+    keyed by them. A name that already had a Latin form keeps its login exactly.
+    """
+
+    def _usernames(self, travelers: list[dict]) -> list[str]:
+        config = transform_intake({**JAPAN_INTAKE, "travelers": _structured(travelers)}, today=date(2026, 8, 20))
+        return [p["username"] for p in config["participants"]]
+
+    AS_CONFIRMED = [
+        {"name": "Dror Aloul", "name_en": "Dror Aloul"},
+        {"name": "Hagit Mali Aloul", "name_en": "Hagit Mali Aloul"},
+        {"name": "צחי סער"},
+        {"name": "ליאב סער"},
+    ]
+    NORMALISED = [
+        {"name": "דרור אלול", "name_en": "Dror Aloul"},
+        {"name": "חגית מלי אלול", "name_en": "Hagit Mali Aloul"},
+        {"name": "צחי סער", "name_en": "Tzachi Saar"},
+        {"name": "ליאב סער", "name_en": "Liav Saar"},
+    ]
+
+    def test_names_with_a_latin_form_keep_the_login_they_always_had(self) -> None:
+        for roster in (self.AS_CONFIRMED, self.NORMALISED):
+            with self.subTest(first=roster[0]["name"]):
+                self.assertEqual(["droraloul", "hagitmalialoul"], self._usernames(roster)[:2])
+
+    def test_a_latin_form_beside_the_interview_language_name_makes_the_login(self) -> None:
+        self.assertEqual(
+            ["droraloul", "hagitmalialoul", "tzachisaar", "liavsaar"],
+            self._usernames(self.NORMALISED),
+        )
+
+    def test_hebrew_only_travellers_get_distinct_recognisable_ascii_logins_not_traveler(self) -> None:
+        usernames = self._usernames(self.AS_CONFIRMED)
+        self.assertEqual(4, len(set(usernames)))
+        for username in usernames:
+            self.assertRegex(username, r"^[a-z0-9]+$")
+            self.assertNotRegex(username, r"^traveler\d*$")
+        # Recognisable: the transliteration of the name, so "ליאב" reads as liav.
+        self.assertTrue(usernames[3].startswith("liav"), usernames[3])
+        self.assertTrue(usernames[2].startswith("tz"), usernames[2])
+
+    def test_the_same_intake_renders_the_same_logins_every_time(self) -> None:
+        for roster in (self.AS_CONFIRMED, self.NORMALISED):
+            self.assertEqual(self._usernames(roster), self._usernames(roster))
+
+    def test_two_hebrew_only_people_with_the_same_name_still_get_two_logins(self) -> None:
+        usernames = self._usernames([{"name": "צחי סער"}, {"name": "צחי סער"}])
+        self.assertEqual(2, len(set(usernames)))
+
+    def test_a_name_in_no_script_we_can_read_falls_back_to_a_numbered_guest(self) -> None:
+        # Last resort, and distinct: guest<position>, never "traveler".
+        self.assertEqual(["guest1", "guest2"], self._usernames([{"name": "李明"}, {"name": "محمد"}]))
+
+    def test_the_intro_login_list_reads_in_the_interview_language(self) -> None:
+        # provisioner.py builds login_usernames from participants[].name, which is
+        # the interview language's name — and the roster match still finds both.
+        config = transform_intake(
+            {**JAPAN_INTAKE, "travelers": _structured(self.NORMALISED)}, today=date(2026, 8, 20),
+        )
+        self.assertEqual(
+            [("דרור אלול", "droraloul"), ("חגית מלי אלול", "hagitmalialoul"),
+             ("צחי סער", "tzachisaar"), ("ליאב סער", "liavsaar")],
+            [(p["name"], p["username"]) for p in config["participants"]],
+        )
+
+
 class PhaseVenuesTests(unittest.TestCase):
     def _phase(self, venues):
         intake = {**JAPAN_INTAKE, "phases": _structured([
@@ -1522,6 +1628,53 @@ class DeriveBookingsTests(unittest.TestCase):
         # Two rows, two keys: hashing the bare type gave both "activity" the
         # same seed_key and the site's INSERT OR IGNORE kept only one.
         self.assertEqual(len({r["seed_key"] for r in rows.values()}), 2)
+
+    def test_a_flight_anchor_keeps_its_route_and_so_does_the_car(self) -> None:
+        # The star e2e, 2026-10-14 (and the owner's run of 2026-10-10): flights
+        # to and from a gateway city that is NOT a stop reached the site as a
+        # bare "LY8801", so the gateway appeared nowhere. The route is part of
+        # the anchor's name (interpret.ts says so); the site must show it whole.
+        # Hebrew, because the organizer's words are kept as typed.
+        intake = {
+            **self.PHASED_INTAKE,
+            "travel_anchors": _structured([
+                {"type": "flight", "name": "LY8801 תל אביב → פרנקפורט", "date": "2026-09-19", "time": "07:10"},
+                {"type": "flight", "name": "LY8802 פרנקפורט → תל אביב", "date": "2026-09-27", "time": "15:40"},
+                {"type": "car", "name": "רכב שכור, איסוף בפרנקפורט", "date": "2026-09-19"},
+            ]),
+        }
+        rows = self._bookings(intake)
+        flights = [b for b in rows if b["type"] == "flight"]
+        self.assertEqual(
+            ["LY8801 תל אביב → פרנקפורט", "LY8802 פרנקפורט → תל אביב"],
+            sorted(b["name"] for b in flights),
+        )
+        text = " ".join(f"{b['name']} {b['notes'] or ''}" for b in flights)
+        self.assertIn("פרנקפורט", text, "the gateway is on the flights (e2e gateway_in_anchors)")
+        self.assertIn("תל אביב", text)
+        car = next(b for b in rows if b["type"] == "car")
+        self.assertIn("פרנקפורט", f"{car['name']} {car['notes'] or ''}", "the pick-up place survives")
+
+    def test_a_structured_name_the_shortener_cuts_is_kept_whole_in_notes(self) -> None:
+        # _shorten_phase_name cuts at a comma, colon, dash or semicolon and caps
+        # the length, which is right for a nav tab and wrong for "LY8801 A, B":
+        # whatever it dropped was the destination. The full words go to notes
+        # rather than being lost; a name it leaves alone gets no duplicate.
+        long_route = "LY8801 נמל התעופה בן גוריון תל אביב — פרנקפורט אם מיין"
+        intake = {
+            **self.PHASED_INTAKE,
+            "travel_anchors": _structured([
+                {"type": "flight", "name": long_route, "date": "2026-09-19"},
+                {"type": "flight", "name": "LY8802 פרנקפורט, תל אביב", "date": "2026-09-27"},
+                {"type": "attraction", "name": "Tokyo Skytree", "date": "2026-09-20"},
+            ]),
+        }
+        rows = {b["date_from"]: b for b in self._bookings(intake) if b["type"] != "hotel"}
+        for day, full in (("2026-09-19", long_route), ("2026-09-27", "LY8802 פרנקפורט, תל אביב")):
+            row = rows[day]
+            self.assertIn("פרנקפורט", f"{row['name']} {row['notes'] or ''}")
+            self.assertEqual(full, row["notes"])
+        self.assertIsNone(rows["2026-09-20"]["notes"], "a name left whole is not repeated in notes")
 
     def test_every_kind_the_question_invites_is_typed_a_booking_not_other(self) -> None:
         # The question names these by name, so the model emits them verbatim.
@@ -2591,3 +2744,257 @@ class ConfirmedBookingsAreConfirmed(unittest.TestCase):
         for placeholder in ("–", "-", "  ", "n/a", "TBD", "none"):
             with self.subTest(placeholder):
                 self.assertFalse(transformer._has_confirmation({"confirmation": placeholder}))
+
+
+def _stop(name: str, name_en: str | None = None, start: str | None = None, end: str | None = None, **extra) -> dict:
+    stop: dict = {"name": name}
+    if name_en:
+        stop["name_en"] = name_en
+    if start:
+        stop["start"] = start
+    if end:
+        stop["end"] = end
+    stop.update(extra)
+    return stop
+
+
+class TripIdentityFromEssenceTests(unittest.TestCase):
+    """The trip's name — its slug, its title and brand, and the stop the main
+    hero photo is taken from — comes from where the trip IS, never from
+    whichever stop happens to be first.
+
+    Live run, 2026-10-10: a trip to Alsace sleeping in Colmar and flying in via
+    Frankfurt answered the destination in Hebrew only ("אלזס, קולמר"). Hebrew
+    slugifies to nothing, so `derive_trip_slug` took the FIRST stop's latin
+    name — Frankfurt, the arrival gateway — and the trip became
+    `frankfurt-2026`. The interview now keeps a gateway out of the stops, but
+    the trip's identity must not depend on that: the stop holding most of the
+    nights is the trip's base, and a one-night gateway can never outrank it.
+
+    Both producers write the fields read here (name, name_en, start, end): the
+    agentless path's `planned[]` stops and the agent path's `venues[]` stops are
+    each exercised below.
+    """
+
+    TODAY = date(2026, 8, 20)
+
+    def colmar_intake(self, destination: str = "אלזס, קולמר", *, gateway_first: bool = True) -> dict:
+        stops = []
+        if gateway_first:
+            # The worst case: the gateway did reach the stops, and first.
+            stops.append(_stop("פרנקפורט", "Frankfurt", "2026-10-01", "2026-10-02"))
+        stops.append(_stop(
+            "קולמר", "Colmar", "2026-10-02" if gateway_first else "2026-10-01", "2026-10-09",
+            planned=["Petite Venise"],
+        ))
+        return {
+            **JAPAN_INTAKE,
+            "trip_type": _choice("couple"),
+            "destination": _text(destination),
+            "departure_date": _text("2026-10-01"),
+            "return_date": _text("2026-10-09"),
+            "phases": _structured(stops),
+        }
+
+    # ── slug ────────────────────────────────────────────────────────────────
+
+    def test_hebrew_destination_with_a_gateway_first_is_named_by_its_base(self) -> None:
+        self.assertEqual(derive_trip_slug(self.colmar_intake(), today=self.TODAY), "colmar-2026")
+
+    def test_hebrew_destination_without_the_gateway_is_named_by_its_base(self) -> None:
+        intake = self.colmar_intake(gateway_first=False)
+        self.assertEqual(derive_trip_slug(intake, today=self.TODAY), "colmar-2026")
+
+    def test_a_latin_destination_still_wins_over_every_stop(self) -> None:
+        self.assertEqual(
+            derive_trip_slug(self.colmar_intake("Alsace"), today=self.TODAY), "alsace-2026",
+        )
+
+    def test_hebrew_only_destination_takes_the_longest_stop_not_the_first(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "destination": _text("אלזס"),
+            "departure_date": _text("2026-10-01"),
+            "return_date": _text("2026-10-10"),
+            "phases": _structured([
+                _stop("שטרסבורג", "Strasbourg", "2026-10-01", "2026-10-03"),
+                _stop("קולמר", "Colmar", "2026-10-03", "2026-10-10"),
+            ]),
+        }
+        self.assertEqual(derive_trip_slug(intake, today=self.TODAY), "colmar-2026")
+
+    def test_a_city_visited_twice_counts_all_its_nights(self) -> None:
+        # New York 2 + 2 nights outranks Boston's 3, though no single visit
+        # does and Boston comes first.
+        intake = {
+            **JAPAN_INTAKE,
+            "destination": _text("החוף המזרחי"),
+            "departure_date": _text("2026-10-01"),
+            "return_date": _text("2026-10-09"),
+            "phases": _structured([
+                _stop("בוסטון", "Boston", "2026-10-01", "2026-10-04"),
+                _stop("ניו יורק", "New York", "2026-10-04", "2026-10-06"),
+                _stop("פילדלפיה", "Philadelphia", "2026-10-06", "2026-10-07"),
+                _stop("ניו יורק", "New York", "2026-10-07", "2026-10-09"),
+            ]),
+        }
+        self.assertEqual(derive_trip_slug(intake, today=self.TODAY), "new-york-2026")
+
+    def japan_stops(self, *, agent_shape: bool = False) -> list[dict]:
+        def extra(place: str) -> dict:
+            # The agent path writes venues[{name,time}], the agentless planned[].
+            return {"venues": [{"name": place, "time": "10:00"}]} if agent_shape else {"planned": [place]}
+
+        return [
+            _stop("טוקיו", "Tokyo", "2026-11-01", "2026-11-05", **extra("Tokyo Skytree")),
+            _stop("קיוטו", "Kyoto", "2026-11-05", "2026-11-10", **extra("Kinkaku-ji")),
+            _stop("אוסקה", "Osaka", "2026-11-10", "2026-11-13", **extra("Osaka Castle")),
+        ]
+
+    def test_a_multi_stop_latin_destination_keeps_the_destination_slug(self) -> None:
+        for agent_shape in (False, True):
+            with self.subTest(agent_shape=agent_shape):
+                intake = {**JAPAN_INTAKE, "phases": _structured(self.japan_stops(agent_shape=agent_shape))}
+                self.assertEqual(derive_trip_slug(intake, today=self.TODAY), "japan-2026")
+
+    def test_a_hebrew_country_name_is_the_destination_not_a_stop(self) -> None:
+        # "יפן" is a country the alias table already knows; the destination is
+        # Japan, so the slug is too — not whichever city is longest or first.
+        intake = {**JAPAN_INTAKE, "destination": _text("יפן"), "phases": _structured(self.japan_stops())}
+        self.assertEqual(derive_trip_slug(intake, today=self.TODAY), "japan-2026")
+
+    def test_undated_stops_fall_back_to_trip_order(self) -> None:
+        # No dates means no nights to compare: trip order is the only tiebreak
+        # left, and it is deterministic.
+        intake = {
+            **JAPAN_INTAKE,
+            "destination": _text("המזרח הרחוק"),
+            "phases": _structured([_stop("Tokyo"), _stop("Kyoto")]),
+        }
+        self.assertEqual(derive_trip_slug(intake, today=self.TODAY), "tokyo-2026")
+
+    # ── title and brand ─────────────────────────────────────────────────────
+
+    def test_a_multi_place_hebrew_destination_is_titled_by_its_dominant_base(self) -> None:
+        meta = transform_intake(self.colmar_intake(), today=self.TODAY)["meta"]
+        self.assertEqual(meta["brand"], "קולמר 2026")
+        self.assertEqual(meta["title"], "קולמר 2026 — Couple")
+        self.assertNotIn("FRANKFURT", meta["brand"].upper())
+
+    def test_a_multi_place_latin_destination_is_titled_by_its_dominant_base(self) -> None:
+        intake = self.colmar_intake("Alsace, Colmar")
+        intake["phases"] = _structured([
+            _stop("Frankfurt", None, "2026-10-01", "2026-10-02"),
+            _stop("Colmar", None, "2026-10-02", "2026-10-09"),
+        ])
+        meta = transform_intake(intake, today=self.TODAY)["meta"]
+        self.assertEqual(meta["brand"], "COLMAR 2026")
+
+    def test_a_single_place_destination_still_names_the_trip(self) -> None:
+        meta = transform_intake(self.colmar_intake("Alsace"), today=self.TODAY)["meta"]
+        self.assertEqual(meta["brand"], "ALSACE 2026")
+
+    def test_a_balanced_city_list_keeps_the_generic_title(self) -> None:
+        # No stop holds most of the nights, so none of them is the trip's
+        # essence; naming it after one would be a guess.
+        intake = {
+            **JAPAN_INTAKE,
+            "destination": _text("Rome, Florence, Venice"),
+            "departure_date": _text("2026-10-01"),
+            "return_date": _text("2026-10-09"),
+            "phases": _structured([
+                _stop("Rome", None, "2026-10-01", "2026-10-04"),
+                _stop("Florence", None, "2026-10-04", "2026-10-07"),
+                _stop("Venice", None, "2026-10-07", "2026-10-09"),
+            ]),
+        }
+        self.assertEqual(transform_intake(intake, today=self.TODAY)["meta"]["brand"], "FAMILY TRIP 2026")
+
+    # ── the stop the main hero is taken from ────────────────────────────────
+
+    def test_essence_phase_is_the_base_not_the_gateway(self) -> None:
+        config = transform_intake(self.colmar_intake(), today=self.TODAY)
+        self.assertEqual(config["phases"][0]["id"], "frankfurt", "fixture: the gateway sorts first")
+        self.assertEqual(transformer.essence_phase_id(config["phases"]), "colmar")
+
+    def test_essence_phase_ignores_the_open_days_placeholder(self) -> None:
+        # Undecided days are the site's own inference, not a place.
+        phases = [
+            {"id": "colmar", "title": {"en": "Colmar"}, "dates": {"start": "2026-10-01", "end": "2026-10-03"}},
+            {"id": "open-days", "unplanned": True, "title": {"en": "Days not planned yet"},
+             "dates": {"start": "2026-10-03", "end": "2026-10-12"}},
+        ]
+        self.assertEqual(transformer.essence_phase_id(phases), "colmar")
+
+    def test_essence_phase_is_none_without_a_real_stop(self) -> None:
+        self.assertIsNone(transformer.essence_phase_id([]))
+        self.assertIsNone(transformer.essence_phase_id([
+            {"id": "open-days", "unplanned": True, "title": {"en": "Days not planned yet"}},
+        ]))
+
+
+class StopWithoutEnglishNameTests(unittest.TestCase):
+    """A stop the interview confirmed with NO `name_en` still names the trip.
+
+    Star e2e, 2026-10-15 (2 of 3 Hebrew runs): destination "אלזס, צרפת" and one
+    stop {"name": "קולמר", ...} with no English name. The interview now asks for
+    `name_en` on every stop; this is the net under it, for the run where the
+    model leaves it out anyway.
+
+    The fallback is NOT transliteration. A slug is [a-z0-9-] (the trips.slug
+    CHECK), so a Hebrew place cannot be spelled into one without inventing an
+    English spelling, which is the failure the interview rule exists to prevent.
+    What it does instead: a country the destination names (France) gives the
+    slug; otherwise the slug is generic and the year distinguishes it; the TITLE
+    and BRAND keep the stop's own words, so the place is never dropped; and the
+    phase carries the organizer's name on both language sides, not a blank.
+
+    These stops carry neither `planned` nor `venues`, which is the shape of the
+    live intake; the two producers write the same name fields read here.
+    """
+
+    TODAY = date(2026, 10, 15)
+
+    def live_intake(self, destination: str = "אלזס, צרפת", *, name_en: str | None = None) -> dict:
+        # The exact answers of the failing runs: a couple, one Hebrew stop.
+        return {
+            **JAPAN_INTAKE,
+            "trip_type": _choice("couple"),
+            "destination": _text(destination),
+            "departure_date": _text("2027-12-02"),
+            "return_date": _text("2027-12-09"),
+            "phases": _structured([_stop("קולמר", name_en, "2027-12-02", "2027-12-09")]),
+        }
+
+    def test_a_country_the_destination_names_gives_the_slug(self) -> None:
+        self.assertEqual(derive_trip_slug(self.live_intake(), today=self.TODAY), "france-2027")
+
+    def test_the_title_and_brand_keep_the_place_instead_of_a_generic_trip(self) -> None:
+        meta = transform_intake(self.live_intake(), today=self.TODAY)["meta"]
+        self.assertEqual(meta["brand"], "קולמר 2027")
+        self.assertEqual(meta["title"], "קולמר 2027 — Couple")
+        self.assertNotIn("Couple Trip", meta["title"])
+
+    def test_the_phase_keeps_the_organizers_name_on_both_sides(self) -> None:
+        phase = transform_intake(self.live_intake(), today=self.TODAY)["phases"][0]
+        self.assertEqual(phase["title"], {"he": "קולמר", "en": "קולמר"})
+        self.assertEqual(phase["dates"], {"start": "2027-12-02", "end": "2027-12-09"})
+
+    def test_a_destination_no_table_knows_gets_a_generic_valid_slug_and_still_a_titled_trip(self) -> None:
+        intake = self.live_intake("אלזס")
+        slug = derive_trip_slug(intake, today=self.TODAY)
+        self.assertEqual(slug, "trip-2027")
+        self.assertRegex(slug, r"^[a-z0-9]+(-[a-z0-9]+)*$")
+        self.assertEqual(transform_intake(intake, today=self.TODAY)["meta"]["brand"], "אלזס 2027")
+
+    def test_with_the_english_name_the_slug_and_phase_use_it(self) -> None:
+        # The case the interview fix produces: same answers, name_en present.
+        intake = self.live_intake("אלזס", name_en="Colmar")
+        self.assertEqual(derive_trip_slug(intake, today=self.TODAY), "colmar-2027")
+        phase = transform_intake(intake, today=self.TODAY)["phases"][0]
+        self.assertEqual(phase["title"]["en"], "Colmar")
+        self.assertEqual(phase["id"], "colmar")
+
+    def test_the_hero_stop_is_still_found_without_an_english_name(self) -> None:
+        config = transform_intake(self.live_intake(), today=self.TODAY)
+        self.assertEqual(transformer.essence_phase_id(config["phases"]), config["phases"][0]["id"])

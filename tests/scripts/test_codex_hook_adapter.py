@@ -35,7 +35,7 @@ class CodexAdapter(Harness):
         result = subprocess.run(
             [sys.executable, "scripts/claude-hooks/codex-adapter.py", mode],
             cwd=self.root, env=self.env, input=raw, capture_output=True,
-            text=True, timeout=10)
+            text=True, timeout=60)  # bounds a HANG, not a slow call: the adapter is ~1s alone, much slower in a loaded suite
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout).get("hookSpecificOutput", {}) if result.stdout.strip() else {}
 
@@ -525,7 +525,7 @@ class CodexAdapter(Harness):
             [sys.executable, str(self.root / "scripts/claude-hooks/codex-adapter.py"), "bash"],
             cwd=self.hermes.name, env=self.env,
             input=json.dumps({"tool_input": {"command": "git commit -m 'note'"}}),
-            capture_output=True, text=True, timeout=10)
+            capture_output=True, text=True, timeout=60)  # bounds a HANG, not a slow call: the adapter is ~1s alone, much slower in a loaded suite
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertDenied(json.loads(result.stdout).get("hookSpecificOutput", {}))
 

@@ -636,6 +636,17 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // understand" by itself tells someone they failed without telling them
     // what would succeed.
     didNotFollow: "Sorry — I didn't quite follow that. Here's what I'm waiting for:",
+    // SAID AT THE SUMMARY when a typed message put nothing on record - and not
+    // "I didn't follow". Live, 2026-10-15: an organizer asked to add the hotel
+    // they were sleeping at, was told they were not followed, and confirmed
+    // without it. They had been followed; what they had not been told is HOW to
+    // add it. So this names what to say (a place and what is there) and keeps
+    // the way out: the summary is re-sent underneath, Confirm included.
+    recapNothingCaptured: "I can add or change things here — just tell me what and where in one sentence, for example: \"we're staying at Hotel X in Kyoto\" or \"Ruth is 71\". If everything below is right, tap Confirm.",
+    // SAID AT THE "MORE, OR THE SUMMARY?" OFFER when they clearly told us
+    // something about the trip and none of it could be placed. Both exits stay
+    // underneath.
+    couldNotPlace: "I can tell you want to add something, but I couldn't tell where it goes. Say it in one sentence with the place, for example: \"we're staying at Hotel X in Kyoto\" — or choose below.",
     stillWaitingBeforeExpiry:
       "I'll close this conversation in about 10 minutes if I don't hear from you — nothing is lost, everything you've told me is saved. This is what I'm still waiting for:",
     // "Saved and waiting" was a promise the system does not keep: the answers
@@ -664,6 +675,11 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // In a group the answer would list trips the rest of the room has no claim
     // to — including, on a shared bot, another family's.
     tripsInGroup: "I can only show your trips in our private chat.",
+    // The bot was just added to a group no trip is bound to. Owner's wording
+    // (2026-10-16). It is what the one-tap add link meets first: Telegram
+    // posts the binding key a moment AFTER the join, so this must not say
+    // "open the link from your signup".
+    joinedUnbound: "Happy to join your group, but I need the trip joining key to be helpful.",
     switchDone: "This chat is now on",
     switchUnchanged: "This chat is already on",
     // Bound, but nothing is behind it yet. Said at the moment of switching so
@@ -881,6 +897,8 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     expiringSoon:
       "אם לא אשמע מכם, אסגור את השיחה בעוד כ-10 דקות — שום דבר לא הולך לאיבוד, כל מה שסיפרתם שמור. שלחו משהו ונמשיך.",
     didNotFollow: "סליחה — לא הבנתי בדיוק. הנה מה שאני מחכה לו:",
+    recapNothingCaptured: "אפשר להוסיף או לשנות כאן — כתבו לי במשפט אחד מה ואיפה, למשל: \"נישן במלון X בקיוטו\" או \"רות בת 71\". אם הכול נכון, לחצו אישור.",
+    couldNotPlace: "הבנתי שרציתם להוסיף משהו, אבל לא הצלחתי להבין לאן זה שייך. כתבו לי את זה במשפט אחד עם המקום, למשל: \"נישן במלון X בקיוטו\" — או בחרו למטה.",
     stillWaitingBeforeExpiry:
       "אם לא אשמע מכם, אסגור את השיחה בעוד כ-10 דקות — שום דבר לא הולך לאיבוד, כל מה שסיפרתם שמור. זה מה שאני עדיין מחכה לו:",
     expired: "סגרתי את השיחה בינתיים — כל מה שסיפרתם שמור, שום דבר לא הלך לאיבוד. כדי להמשיך צריך קישור ראיון חדש; בקשו ממי שהקים לכם את הטיול ונמשיך בדיוק מאיפה שעצרנו.",
@@ -891,6 +909,9 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     tripsFooter: "בחרו אחד כדי לחבר אליו את הצ׳אט הזה.",
     tripsEmpty: "אין לי עדיין טיולים המשויכים לצ׳אט הזה. פתחו את הקישור מההרשמה ל‑Kinerary ונקים אחד יחד.",
     tripsInGroup: "אני יכול להראות את הטיולים שלך רק בצ׳אט הפרטי בינינו.",
+    // Owner's wording, masculine like the strings around it: no trip is known
+    // for this chat, so there is no stated bot_gender to honour.
+    joinedUnbound: "שמח להצטרף לקבוצה, אבל אני צריך את מפתח ההצטרפות לטיול כדי לעזור.",
     switchDone: "הצ׳אט הזה מחובר עכשיו אל",
     switchUnchanged: "הצ׳אט הזה כבר מחובר אל",
     switchNoCompanion: "האתר מוכן — אני עדיין מסיים את העוזר של הטיול הזה, אז תנו לי רגע לפני שתשאלו אותי עליו.",

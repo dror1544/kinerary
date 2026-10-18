@@ -3,7 +3,8 @@ import { createNotificationAdapter } from "./adapters/notification.js";
 import { loadArchitectureProfile, validateBeforeProvider } from "./config.js";
 import { createDatabasePool, databaseReadiness } from "./database.js";
 import { dispatchPendingTripNotifications } from "./outbox-dispatcher.js";
-import { recoverStaleLeases } from "./job-queue.js";
+import { createBotUsernameResolver } from "./bot-username.js";
+import { recoverStaleLeases, recoverExpiredApprovals } from "./job-queue.js";
 import { destinationInfoSearchConfigured, refreshStaleDestinationInfo } from "./destination-info-store.js";
 import { venueLinkSearchConfigured } from "./itinerary-extract.js";
 import { resolvePendingVenueLinks } from "./venue-links.js";
@@ -236,6 +237,11 @@ const app = buildApp(profile, {
 // sufficient (single API process today).
 if (signup) {
   const notification = signup.notification;
+  const resolveBotUsername = createBotUsernameResolver({
+    configured: profile.web?.telegram_bot_username ?? process.env.TELEGRAM_BOT_USERNAME ?? null,
+    botToken: signup.botToken,
+    log: (line) => process.stderr.write(`${line}\n`),
+  });
   let dispatching = false;
   const OUTBOX_POLL_INTERVAL_MS = 10_000;
   const timer = setInterval(() => {
@@ -249,7 +255,11 @@ if (signup) {
       // profile rather than stored per outbox row: it belongs to the
       // deployment, and a row written before a bot rename would otherwise hand
       // an organizer a link to a handle that no longer resolves.
-      { botUsername: profile.web?.telegram_bot_username ?? null },
+      // The profile's `web` block is optional, so on its own the handle was
+      // missing from any deployment that omitted it, and the link vanished with
+      // nothing logged. The resolver prefers what the deployment states and
+      // otherwise asks the bot itself (getMe on the signup token), cached.
+      { resolveBotUsername },
     )
       .catch((error) => {
         process.stderr.write(`${structuredLog("error", "outbox.dispatch_loop_error", {
@@ -287,6 +297,35 @@ if (signup) {
       })
       .finally(() => { recovering = false; });
   }, STALE_LEASE_POLL_INTERVAL_MS);
+  timer.unref();
+}
+
+// Reverts a plan (and its job) whose approval expired before anyone acted on
+// it. Same "no production caller" gap as recoverStaleLeases above, found in
+// the same PR review (2026-10-06 [P2]): resumeTrip (admin-mutations.ts) now
+// does this inline for the one trip it is resuming, but a plan can also sit
+// expired without ever being suspended at all — an organizer who approved
+// and then did nothing. Runs unconditionally, same reasoning as the lease
+// recovery above.
+{
+  let reverting = false;
+  const EXPIRED_APPROVAL_POLL_INTERVAL_MS = 2 * 60_000;
+  const timer = setInterval(() => {
+    if (reverting) return;
+    reverting = true;
+    recoverExpiredApprovals(pool)
+      .then((count) => {
+        if (count > 0) {
+          process.stderr.write(`${structuredLog("warn", "job_queue.expired_approvals_reverted", { count })}\n`);
+        }
+      })
+      .catch((error) => {
+        process.stderr.write(`${structuredLog("error", "job_queue.expired_approval_revert_error", {
+          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        })}\n`);
+      })
+      .finally(() => { reverting = false; });
+  }, EXPIRED_APPROVAL_POLL_INTERVAL_MS);
   timer.unref();
 }
 

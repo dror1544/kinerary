@@ -15,7 +15,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startTestServer, stopTestServer, api, loginAsAlice, testTripDir } from './helpers/server.js';
-import { PORTS } from './helpers/ports.js';
+import { freePort } from './helpers/port-guard.js';
 
 let token;
 
@@ -35,7 +35,7 @@ const NFS_ONLY = contentName(NFS_ONLY_TEXT, 'txt');
 before(async () => {
   const nfsDocuments = mkdtempSync(join(tmpdir(), 'trip-nfs-documents-'));
   writeFileSync(join(nfsDocuments, NFS_ONLY), NFS_ONLY_TEXT);
-  await startTestServer({ PORT: String(PORTS.tripDocuments), TRIP_DOCUMENTS_DIR: nfsDocuments });
+  await startTestServer({ PORT: String(await freePort()), TRIP_DOCUMENTS_DIR: nfsDocuments });
   token = await loginAsAlice();
 
   const documents = join(testTripDir(), 'documents');

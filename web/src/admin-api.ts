@@ -167,7 +167,7 @@ export const getAdminAudit = (key: string) => adminApi<{ events: AdminAuditEvent
 
 export type AdminRetryResult = { planId: string; planDigest: string; releaseId: string; jobId: string; supersededPlanId: string | null };
 export type AdminSuspendResult = { tripId: string; suspendedAt: string };
-export type AdminResumeResult = { tripId: string };
+export type AdminResumeResult = { tripId: string; reapprovalNeeded: boolean };
 
 export const retryTrip = (key: string, tripId: string) =>
   adminApiPost<AdminRetryResult>(key, `/v1/admin/trips/${encodeURIComponent(tripId)}/retry`);

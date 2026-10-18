@@ -51,6 +51,12 @@ Hermes as a slash command. Published menus (`routerCommandMenus`): private chats
 and the default get `/help /name /group /trips /switch`; groups get `/help /name`.
 Whether every row's *where* was exercised live was not re-checked here.
 
+**Planned, not built (PR #407, draft): `/proactive 1|2|3`.** A per-group setting of
+how much the companion takes part in the group's conversation; the organizer
+changes it, anyone can read it, the default is 3. Design and reasoning:
+`docs/group-participation-design.md`. It is not in the table above because no
+code answers it yet.
+
 Two facts about the parse layer matter for everything below.
 
 **Arguments are discarded.** `parseInbound`

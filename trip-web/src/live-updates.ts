@@ -3,7 +3,15 @@ import { useQueryClient, type QueryClient } from '@tanstack/react-query';
 import { startEventStream } from './event-stream';
 
 const DEPENDENCIES: Record<string, string[]> = {
-  itinerary: ['itinerary', 'today', 'confirmations', 'revisions'],
+  // 'config' too: GET /api/config is the EFFECTIVE config, and its open-days
+  // stretch is recomputed from the days the active plan has on real stops
+  // (server/trip-structure.js withOpenDays) — a day moved between stops
+  // changes it.
+  itinerary: ['itinerary', 'today', 'confirmations', 'revisions', 'config'],
+  // The stop layer (trip_stop_overrides/history, server/trip-events.js): a stop
+  // edit changes the effective config, and the rows it moves change the plan
+  // and today. Journey reads all three, so it follows without a reload.
+  stops: ['config', 'itinerary', 'today', 'stops', 'stop-history'],
   bookings: ['bookings', 'itinerary', 'today', 'confirmations'],
   budget: ['budget'],
   photos: ['photos', 'photo-reactions', 'photo-comments', 'moments', 'today'],

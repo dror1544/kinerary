@@ -36,6 +36,24 @@ export interface IssueApprovalOptions {
  * telling the operator cannot fail the approval — the row is handed to the
  * outbox dispatcher (outbox-dispatcher.ts), which sends it on its own 10s loop
  * and retries to max_attempts. Observability, never a gate.
+ *
+ * DOES NOT RE-CHECK `trips.lifecycle_state` (issue #378, R4-1, boundary
+ * review round 4, 2026-10-14 — the reviewer suggested this as optional
+ * defense-in-depth against the same race `trip-clear.ts`'s `executeClear`
+ * and `planner.ts`'s `generatePlan` close by both locking `trips`).
+ * Decided NOT to add it here: it would be redundant once those two are
+ * fixed, not a second layer against a real gap. The invariant this function
+ * relies on is `generatePlan`'s own — a plan reaches `pending_approval` only
+ * in the SAME transaction that creates its job in `waiting_for_user_action`,
+ * and that job stays non-terminal until this function (or
+ * `completeJob`/`failJob`) resolves it. `executeClear`'s `JOB_IN_PROGRESS`
+ * refusal already catches ANY non-terminal job for a trip, locked, so a
+ * trip whose plan is still `pending_approval` when this function runs could
+ * never have been successfully cleared in the first place — `executeClear`
+ * would have found that same job and refused. There is therefore no
+ * reachable state where this function approves a plan on a trip clear
+ * already finished with; adding a `lifecycle_state` check here would be
+ * checking an invariant the job lock already guarantees, not closing a gap.
  */
 export async function issueApproval(
   db: pg.Pool,

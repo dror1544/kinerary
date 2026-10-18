@@ -53,6 +53,25 @@ no tools, no memory, no fallback chain. It did not reproduce the incident's
 echo on either template, so it does not show that the echo got rarer; what it
 does show is in the #240 PR. Its header lists what it measures and what not.
 
+## Stops: a booking is not a change to the Journey tab
+
+On 2026-10-10 a companion recorded an organizer's hotel, said it was added, and
+the Journey tab did not move. SOUL.md's **Stops** section now says that a hotel
+booking is linked to its stop (`set_stop_from_booking`), that a stop is changed
+with `get_stops` then `update_stop`, `split_stop` or `move_plan_day`, that only
+the organizer asks for those in their private chat, and that nothing is called
+done before it is read back. The procedure — each refusal and what to say, when
+to confirm first, the split-date rule — is in the operations skill's **Stops**
+section, so the always-loaded SOUL stays short. `tests/test_stop_editing.py`
+pins both on the rendered text in every language and persona variant.
+
+`eval/stop_editing_cases.json` holds the behavioural cases — hotel, last night
+near the airport, moving a Tuesday, and the organizer-only redirects — with the
+tool calls each one expects. It is written and checked for consistency by the
+same test file, but **not run**: it needs the stop tools on the trip connection
+and a live model, and no runner exists yet (`eval/needs_eval.py` is the one to
+follow). Its header says what a runner must do.
+
 ## Create a real profile
 
 ```bash

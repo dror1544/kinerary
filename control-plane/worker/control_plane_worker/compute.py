@@ -53,6 +53,11 @@ class ComputeAdapter(Protocol):
         self, slug: str, *, first_provision: bool = False, trip_id: str | None = None,
     ) -> str: ...
 
+    def site_login_password(self, slug: str) -> str | None:
+        """The login password the trip's site was built with, as that site's
+        own .env holds it; None when there is none to report."""
+        ...
+
 
 class NullComputeAdapter:
     """No compute adapter configured — ShellDeployAdapter falls back to this
@@ -67,6 +72,9 @@ class NullComputeAdapter:
             f"no vmid configured for slug {slug!r}, and automatic container "
             "creation (--enable-compute) is not turned on"
         )
+
+    def site_login_password(self, slug: str) -> str | None:
+        return None
 
 
 class LxcProvisionAdapter:
@@ -114,7 +122,6 @@ class LxcProvisionAdapter:
         memory_mb: int = 1024,
         disk_gb: int = 8,
         forward_port: int = 8080,
-        seed_password: str = "",
         control_plane_exchange_key: str = "",
         npm_identity: str = "",
         npm_secret: str = "",
@@ -151,7 +158,12 @@ class LxcProvisionAdapter:
         self._memory_mb = memory_mb
         self._disk_gb = disk_gb
         self._forward_port = forward_port
-        self._seed_password = seed_password
+        # slug -> the password the trip's container reports in its own .env,
+        # read back by create_container after apply(). Held in this process
+        # only (never written to topology.yaml or any file) and handed to the
+        # worker once, to tell the organizer. There is no deployment-wide
+        # password: each site generates its own at bootstrap.
+        self._site_passwords: dict[str, str | None] = {}
         self._control_plane_exchange_key = control_plane_exchange_key
         # Set per-call by create_container (the worker is single-threaded — one
         # job at a time via run_once), read by _build_provisioner when it
@@ -199,12 +211,21 @@ class LxcProvisionAdapter:
                 f"{self._node} after apply — cannot determine its vmid"
             )
         vmid = str(record["vmid"])
+        # What the site accepts, read from the container itself - on a first
+        # provision the one it just generated, on a re-provision the one it
+        # already had (bootstrap never rewrites an existing .env). An ssh
+        # failure here raises on purpose: the job retries, rather than the
+        # organizer being introduced to a site with no password to type.
+        self._site_passwords[slug] = provisioner.proxmox.site_password(topology.lxc)
         # Only known after apply(), so this rewrites the file _write_topology
         # already wrote pre-apply — same fields, plus vmid. mcp_bridge.py
         # reads it back for slugs that (unlike the two legacy trips) have no
         # entry in the operator-supplied --vmid-map.
         self._write_topology(topology_path, topology, slug, vmid=vmid)
         return vmid
+
+    def site_login_password(self, slug: str) -> str | None:
+        return self._site_passwords.get(slug)
 
     # ── topology construction ────────────────────────────────────────────
 
@@ -257,6 +278,9 @@ class LxcProvisionAdapter:
                 nfs_host_dir=f"{self._nfs_host_base}/{trip_id or slug}",
                 nfs_mount_path=f"{self._nfs_mount_base}/{trip_id or slug}",
                 trip_slug=slug,
+                # The same host NPM and the tunnel serve the trip on, so the
+                # member MCP connector's OAuth issuer is a name assistants reach.
+                public_origin=f"https://{hostname}",
             ),
             # forward_host is the container's IP, deliberately not its LXC name.
             # No trip-* hostname resolves on this LAN — the containers hold
@@ -380,7 +404,7 @@ class LxcProvisionAdapter:
         )
         return Provisioner(
             ProxmoxLxcAdapter(
-                proxmox_ssh, seed_password=self._seed_password, reset_data=self._reset_data,
+                proxmox_ssh, reset_data=self._reset_data,
                 control_plane_exchange_key=self._control_plane_exchange_key,
             ),
             NpmProxyHostAdapter(npm_transport),

@@ -1,4 +1,4 @@
-import { PORTS } from './helpers/ports.js';
+import { freePort } from './helpers/port-guard.js';
 import assert from 'node:assert/strict';
 import { before, after, test } from 'node:test';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
@@ -11,7 +11,7 @@ import { startTestMcp, stopTestMcp, mcpCallTool } from './helpers/mcp.js';
 
 const tripId = 'trip_sessiontest01', ownerId = 'user_sessionowner', memberId = 'user_sessionmember';
 const key = 'test-dedicated-exchange-key';
-let temp, ownerToken, gateway, controlPlane, gatewayOrigin;
+let temp, ownerToken, gateway, controlPlane, gatewayOrigin, tripPort, mcpPort;
 const listen = server => new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(`http://127.0.0.1:${server.address().port}`)));
 const close = server => new Promise(resolve => { server.closeAllConnections(); server.close(resolve); });
 const sessionBody = (extra = {}) => ({ tripId, userId: ownerId, role: 'owner', runtimeUsername: null, ...extra });
@@ -22,9 +22,11 @@ before(async () => {
   temp = mkdtempSync(join(tmpdir(), 'runtime-identity-test-'));
   const manifest = join(temp, 'identity.json');
   writeFileSync(manifest, JSON.stringify({ version: 1, tripId, owner: { userId: ownerId, username: 'alice' } }));
-  await startTestServer({ PORT: PORTS.controlPlaneSession, CONTROL_PLANE_EXCHANGE_KEY: key, CONTROL_PLANE_IDENTITY_FILE: manifest, SITE_DIR: fileURLToPath(new URL('../site', import.meta.url)) });
+  // Ports the OS hands out, not fixed ones: a leaked server from another run cannot hold them.
+  tripPort = await freePort(); do { mcpPort = await freePort(); } while (mcpPort === tripPort);
+  await startTestServer({ PORT: tripPort, CONTROL_PLANE_EXCHANGE_KEY: key, CONTROL_PLANE_IDENTITY_FILE: manifest, SITE_DIR: fileURLToPath(new URL('../site', import.meta.url)) });
   await loginAsAlice();
-  await startTestMcp({ MCP_PORT: String(PORTS.controlPlaneSessionMcp), API_BASE_URL: `http://127.0.0.1:${PORTS.controlPlaneSession}`, TRIP_API_KEY: 'test-hermes-key' });
+  await startTestMcp({ MCP_PORT: String(mcpPort), API_BASE_URL: `http://127.0.0.1:${tripPort}`, TRIP_API_KEY: 'test-hermes-key' });
   controlPlane = http.createServer(async (req, res) => {
     assert.equal(req.headers['x-api-key'], key);
     res.setHeader('content-type', 'application/json');
@@ -34,7 +36,7 @@ before(async () => {
       if (token !== 'owner-grant' && token !== 'member-grant') { res.writeHead(401); return res.end('{}'); }
       return res.end(JSON.stringify({ ...sessionBody(token === 'member-grant' ? { userId: memberId, role: 'member', runtimeUsername: 'bob' } : {}), audience: 'runtime_gateway' }));
     }
-    if (req.url === `/internal/runtime-routes/${tripId}`) return res.end(JSON.stringify({ routeRef: 'fixture', upstreamOrigin: `http://127.0.0.1:${PORTS.controlPlaneSession}`, upstreamBasePath: '' }));
+    if (req.url === `/internal/runtime-routes/${tripId}`) return res.end(JSON.stringify({ routeRef: 'fixture', upstreamOrigin: `http://127.0.0.1:${tripPort}`, upstreamBasePath: '' }));
     res.writeHead(404); res.end('{}');
   });
   Object.assign(process.env, { NODE_ENV: 'test', CONTROL_PLANE_INTERNAL_ORIGIN: await listen(controlPlane),

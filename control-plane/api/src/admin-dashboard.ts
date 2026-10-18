@@ -186,7 +186,31 @@ const EVIDENCE_ALLOWLIST: ReadonlyMap<string, readonly string[]> = new Map([
   // closed `reason` enum (TRIP_NOT_FOUND / ALREADY_SUSPENDED / NOT_SUSPENDED)
   // — same posture as admin.retry_trip's `reason` above, never free text.
   ["admin.suspend_trip", ["ok", "reason"]],
-  ["admin.resume_trip", ["ok", "reason"]],
+  // reapprovalNeeded (2026-10-06 [P2]) is a plain boolean this codebase
+  // computes itself — whether resuming found and reverted an approval that
+  // expired while the trip was suspended — never traveler or operator text.
+  ["admin.resume_trip", ["ok", "reason", "reapprovalNeeded"]],
+  // trip-clear.ts's executeClear (issue #378, operator-key route, not the
+  // admin key — listed here anyway because this is the ONE allow-list
+  // /v1/admin/audit reads from). `slugBefore`/`slugAfter` ARE written to
+  // this action's evidence (useful to a trusted operator reading the row
+  // directly) but are deliberately NOT allow-listed here — boundary review
+  // (F6, 2026-10-13) flagged a trip's slug as organizer-chosen text that can
+  // carry a family name, the exact "operator/organizer free text" risk this
+  // allow-list exists to keep off a served route. Everything that IS listed
+  // is an opaque id, a row count, or a boolean. The full archived payload
+  // (which DOES contain traveler data: roster names, intake answers) lives
+  // only in trip_clear_archives, never in evidence at all — see
+  // trip-clear.ts's own module doc and the migration's header.
+  // Round 8 scope cut (2026-10-15, issue #378): this route now refuses
+  // outright (EVER_PROVISIONED) rather than executing against a provisioned
+  // trip, so there is no longer a partial-success "infra still pending"
+  // shape to report at all.
+  ["operator.clear_trip", [
+    "ok", "archiveId", "enrollmentsRevoked", "agentTurnsDeleted",
+    "intakeSessionsDeleted", "groupBindingCodesRevoked", "chatBindingsClosed",
+    "lifecycleResetToDraft", "slugRetired",
+  ]],
 ]);
 
 function projectEvidence(action: string, evidence: unknown): unknown {

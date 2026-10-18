@@ -1,7 +1,7 @@
 /**
  * The daily control-plan report — issue #326, Track 2's second slice.
  *
- * Renders the five sections `control-plan-metrics.md` ("Suggested Daily
+ * Renders the five sections (plus the group judge's, once) `control-plan-metrics.md` ("Suggested Daily
  * Control Plan Report") names — Usage, Value Delivered, Information Quality,
  * Learning and Enrichment, Organizer Enablement — from `DayRates`
  * (analytics/rates.ts) alone, as JSON and as Markdown built from the SAME
@@ -108,8 +108,93 @@ function usageSection(rollup: DayRollup, rates: DayRates): ReportSection {
         fmtCount(rollup.replies.failed),
         rollup.replies.delivered + rollup.replies.failed + rollup.replies.suppressed === 0,
       ),
+      // A defect count (target 0): the companion answered a message that named
+      // it with the silence sentinel, so the family got nothing.
+      line(
+        "Silent on a message that named the assistant",
+        fmtCount(rollup.replies.silent_on_addressed),
+        rollup.replies.delivered + rollup.replies.failed + rollup.replies.suppressed === 0,
+      ),
     ],
   };
+}
+
+/**
+ * The group judge (relay/group-judge.ts): what it was asked, what it said, how
+ * fast, and the two live accuracy PROXIES. Targets (owner, 2026-10-16):
+ * precision >= 90% and recall >= 75% - which only the labelled benchmark
+ * (tools/judge-benchmark.ts) can measure; the proxies here move in the same
+ * direction as the misses and the false alarms but undercount both, and are
+ * labelled so. p95 <= 1.5 s, hard timeout 3 s. With no judge decisions that day
+ * every line says so - a trip whose judge is off or whose group was quiet has no
+ * rate, not a rate of zero.
+ */
+function judgeSection(rollup: DayRollup, rates: DayRates): ReportSection {
+  const j = rates.judge;
+  const none = j.decisions === 0;
+  const fallbackReasons = Object.entries(j.fallback_by_reason)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([reason, n]) => `${reason} ${n}`)
+    .join(", ");
+  const models = Object.entries(j.by_model)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([model, n]) => `${model} (${n})`)
+    .join(", ");
+  return {
+    title: "Group Judge",
+    lines: [
+      none ? noDataLine("Messages judged") : line("Messages judged", fmtCount(j.decisions)),
+      line("Judged for the assistant (yes rate)", fmtPercent(j.yes_rate), j.yes_rate.value === null),
+      line(
+        "Missed proxy - judge said no, same sender then addressed the assistant within 3 min",
+        fmtPercent(j.missed_proxy),
+        j.missed_proxy.value === null,
+      ),
+      line(
+        "Over-eager proxy - judge said yes, companion replied with silence",
+        fmtPercent(j.over_eager_proxy),
+        j.over_eager_proxy.value === null,
+      ),
+      line("Judge latency p50 (target p95 <= 1500 ms, hard timeout 3000 ms)", fmtLatency(j.latency_p50_ms), j.latency_p50_ms.value === null),
+      line("Judge latency p95", fmtLatency(j.latency_p95_ms), j.latency_p95_ms.value === null),
+      line(
+        "Fallbacks (timeout, error, unparseable, rate limited)",
+        j.fallback_rate.value === null
+          ? NO_DATA
+          : `${fmtPercent(j.fallback_rate)}${fallbackReasons ? ` - ${fallbackReasons}` : ""}`,
+        j.fallback_rate.value === null,
+      ),
+      none
+        ? noDataLine("Yes below the confidence threshold, handled as no")
+        : line("Yes below the confidence threshold, handled as no", fmtCount(rollup.judge?.below_threshold ?? 0)),
+      none ? noDataLine("Model") : line("Model", models || "unknown"),
+      ...proactiveLines(rollup),
+    ],
+  };
+}
+
+/**
+ * The proactive level (`/proactive`): where the groups stand now, and how many
+ * were moved up or down that day. A group turning the assistant down is the
+ * signal that it is not welcome; a quiet day with no events says "no data", not
+ * zero changes, as everywhere in this report. The distribution is a snapshot of
+ * the open group bindings when the report was read (DayRollup.proactive).
+ */
+function proactiveLines(rollup: DayRollup): ReportLine[] {
+  const p = rollup.proactive;
+  const groups = Object.entries(p?.groups_by_level ?? {}).sort(([a], [b]) => a.localeCompare(b));
+  const changes = (p?.raised ?? 0) + (p?.lowered ?? 0);
+  return [
+    groups.length === 0
+      ? noDataLine("Groups by proactive level, now (1 only when called, 2 follows the conversation, 3 joins in)")
+      : line(
+          "Groups by proactive level, now (1 only when called, 2 follows the conversation, 3 joins in)",
+          groups.map(([level, n]) => `${level}: ${n}`).join(", "),
+        ),
+    changes === 0
+      ? noDataLine("Proactive level changes")
+      : line("Proactive level changes", `raised ${p.raised}, lowered ${p.lowered}`),
+  ];
 }
 
 /** Every OTHER line here still needs an assistant-side judgement this slice has no source for. */
@@ -214,6 +299,7 @@ export function renderDailyReport(rollup: DayRollup): { json: DailyReport; markd
     ],
     sections: [
       usageSection(rollup, rates),
+      judgeSection(rollup, rates),
       valueDeliveredSection(rollup, rates),
       informationQualitySection(rollup, rates),
       learningSection(),

@@ -42,15 +42,31 @@ import {
   resolveChatLanguage,
   tripDisplayName,
   consumeExpectsReplyWindow,
+  inCompanionConversation,
+  openCompanionConversation,
+  groupProactiveLevel,
+  groupProactiveLevelSetting,
+  setGroupProactiveLevel,
+  PROACTIVE_JOINS_IN,
+  type ProactiveLevel,
+  isTripOrganizer,
+  tripLanguage,
 } from "../chat-router.js";
 import { listOrganizerTrips, switchChatToTrip, type OrganizerTrip } from "../organizer-trips.js";
 import { isAddressedToAssistant } from "./addressing.js";
-import { classifyTrigger, inboundFacts, type InboundFacts } from "../analytics/relay-facts.js";
+import { addressedMark, conversationMark, reactionAnswerMark } from "./stay-silent.js";
+import type { GroupJudge, JudgeOutcome } from "./group-judge.js";
+import { classifyTrigger, inboundFacts, type InboundFacts, type JudgeFacts, type LevelChangeFacts } from "../analytics/relay-facts.js";
 import { coerceLanguage, uiString, type Language } from "../intake-copy.js";
 import {
   companionHelpText,
   groupBindingCommand,
   groupIntroText,
+  proactiveChanged,
+  proactiveInPrivateChat,
+  proactiveRefused,
+  proactiveStatus,
+  proactiveUnavailable,
   renameConfirmation,
   renameRefused,
   renameUsage,
@@ -58,6 +74,7 @@ import {
 import { getAssistantNames, parseAssistantNames, setAssistantNames } from "../assistant-names.js";
 import {
   extractGroupBindingToken,
+  groupBindingTokenFromStartPayload,
   groupBindingTokenIsOwn,
   issueGroupBindingToken,
   redeemGroupBindingToken,
@@ -84,7 +101,7 @@ import { visionProcessingConfig } from "../document-vision.js";
 import { digestTelegramId } from "../identity.js";
 import type { StructuredModelRunner } from "../model-runner.js";
 import { handleModelCommand, isSwitchableRunner } from "../model-task-settings.js";
-import type { ChatType, WireMessageEvent } from "./protocol.js";
+import { looksLikeAQuestion, type ChatType, type WireMessageEvent } from "./protocol.js";
 
 /** A message the connector should send itself, rather than routing to an agent. */
 export interface DirectReply {
@@ -95,12 +112,29 @@ export interface DirectReply {
 
 export type DispatchDecision =
   /** Hand this turn to the Hermes gateway as an `inbound` frame. */
-  | { kind: "to_gateway"; event: WireMessageEvent; analytics?: InboundFacts }
+  | {
+      kind: "to_gateway";
+      event: WireMessageEvent;
+      analytics?: InboundFacts;
+      /**
+       * True when the group message was addressed to the assistant EXPLICITLY (its
+       * name, an @mention, a reply to its message) and so carries the
+       * `addressedMark`. The connector remembers it per chat: a silence reply to
+       * such a turn is a defect, not a judgement call (stay-silent.ts).
+       */
+      explicit?: boolean;
+    }
   /**
    * The connector answers this one itself. `analytics` is set only on the
    * companion-unreachable answer, which is a lost turn (#177).
    */
-  | { kind: "reply"; reply: DirectReply; analytics?: InboundFacts }
+  | { kind: "reply"; reply: DirectReply; analytics?: InboundFacts; levelChange?: LevelChangeFacts }
+  /**
+   * Only with `deferJudge`: the message needs the group judge and the caller must not
+   * block on it. `ask` makes the model call (queued and bounded by the judge itself)
+   * and never throws; see `DispatchOptions.deferJudge`.
+   */
+  | { kind: "judge_pending"; chatId: string; ask: () => Promise<JudgeOutcome> }
   | {
       /**
        * The bot has just been added to a group bound to a trip: send the
@@ -415,6 +449,33 @@ export interface DispatchOptions {
    * the companion route, exactly as before #178.
    */
   organizerDocumentRoute?: boolean;
+  /**
+   * The group judge (relay/group-judge.ts): asked, last of all, whether an
+   * unaddressed group message is meant for the assistant. Absent - JUDGE_RUNNER
+   * unset, the default - nothing is asked and an unaddressed message is
+   * NOT_ADDRESSED exactly as before. Injected, like the runner, so this module
+   * stays testable without a network.
+   */
+  groupJudge?: GroupJudge;
+  /**
+   * Do not wait for the judge. When a group message reaches the judge step, return
+   * `{ kind: "judge_pending", ask }` instead of awaiting the model; the caller runs
+   * `ask()` OFF its loop (the poller does, one chain per chat so a chat's messages
+   * keep their order), then calls `dispatchUpdate` again for the same update with
+   * `judgedOutcome` set to the result. Absent or false - the default, and every
+   * test and tool that calls this directly - the judge is awaited right here.
+   *
+   * The second call is safe because everything before the judge step is a read for a
+   * message that reaches it: it was not addressed, so the "?" window claim found
+   * nothing to consume and the conversation window did not list the sender.
+   */
+  deferJudge?: boolean;
+  /**
+   * The judge's verdict on THIS update, from a `judge_pending` round trip. `null` is
+   * "not asked or no usable answer": the message is NOT_ADDRESSED. Set, it replaces
+   * the call; the judge is never asked twice.
+   */
+  judgedOutcome?: JudgeOutcome | null;
 }
 
 /**
@@ -483,7 +544,14 @@ export async function dispatchUpdate(
   if (joined) {
     const route = await resolveChatRoute(db, joined.chatId);
     if (route.kind !== "companion") {
-      return { kind: "reply", reply: { chatId: joined.chatId, text: strings.unbound } };
+      // Not `strings.unbound` ("open the link from your signup"): with the
+      // one-tap add link the binding key arrives right after this join, and
+      // that sentence would contradict it. Ordinary messages in an unbound
+      // chat keep `strings.unbound`; only the join has the owner's wording.
+      // The language is the adder's Telegram locale — the only evidence a
+      // chat with no trip has.
+      const language = coerceLanguage(update.my_chat_member?.from?.language_code) ?? "en";
+      return { kind: "reply", reply: { chatId: joined.chatId, text: uiString("joinedUnbound", language) } };
     }
     const facts = await companionIntroFacts(db, route.tripId);
     const assistantName = typeof facts?.assistant_name === "string" ? facts.assistant_name : null;
@@ -536,7 +604,19 @@ export async function dispatchUpdate(
   const text = message.text ?? message.caption ?? "";
   const parsed = parseInbound(text);
 
-  if (parsed.kind === "start") {
+  // The one-tap add-to-group link. Telegram answers `?startgroup=<token>` by
+  // adding the bot to the group the organizer picked and then posting
+  // `/start@<bot> <token>` THERE, from the organizer. That is a group-binding
+  // redemption, not the onboarding `/start` below: it is claimed here, only in a
+  // non-private chat and only when the payload is exactly a binding token, and
+  // it falls through to the same redemption `/group <token>` goes through. A
+  // private `/start <anything>` never gets here (the enrollment path owns it),
+  // and a group `/start` with any other payload keeps its old answer.
+  const groupStartToken = parsed.kind === "start" && message.chat?.type !== "private"
+    ? groupBindingTokenFromStartPayload(parsed.payload)
+    : null;
+
+  if (parsed.kind === "start" && !groupStartToken) {
     const outcome = await startFromDeepLink(db, chatId, parsed.payload, log, message.from?.language_code);
     switch (outcome.kind) {
       case "started": {
@@ -629,7 +709,7 @@ export async function dispatchUpdate(
   // bot IS an admin (admins see every message). The instructions teach the
   // command, which is the form that always arrives.
   const postedToken = message.chat?.type !== "private"
-    ? extractGroupBindingToken(text)
+    ? groupStartToken ?? extractGroupBindingToken(text)
     : null;
   if (postedToken) {
     const senderId = message.from?.id === undefined ? null : String(message.from.id);
@@ -734,6 +814,66 @@ export async function dispatchUpdate(
       const now = await setAssistantNames(db, route.tripId, names.names);
       log(structuredLog("info", "trip_bot.renamed", { via: "command", names: now?.length ?? 0 }));
       return { kind: "reply", reply: { chatId, text: renameConfirmation(language, now ?? names.names) } };
+    }
+  }
+
+  // `/proactive`, `/proactive 1|2|3`: how much the assistant takes part in THIS
+  // group (chat-router.ts, PROACTIVE_*). A preference, not a privacy switch.
+  // Anyone may read it; only the trip's organizer - a fact from the control
+  // plane's own links, never from the message - may change it. Router-owned like
+  // /name: it changes what the router hears, and Hermes' own command surface is
+  // not ours to extend.
+  if (parsed.kind === "command" && parsed.name === "proactive") {
+    const route = await resolveChatRoute(db, chatId);
+    if (route.kind === "unbound") {
+      return { kind: "reply", reply: { chatId, text: strings.unbound } };
+    }
+    if (route.kind === "companion") {
+      const language = await tripLanguage(db, route.tripId);
+      if (message.chat?.type === "private") {
+        return { kind: "reply", reply: { chatId, text: proactiveInPrivateChat(language) } };
+      }
+      const argument = (parsed.argument ?? "").trim();
+      const requested = argument === "1" || argument === "2" || argument === "3" ? (Number(argument) as ProactiveLevel) : null;
+      // Nothing, or something that is not 1, 2 or 3: the options. A read never needs a role.
+      if (requested === null) {
+        const current = (await groupProactiveLevelSetting(db, chatId).catch(() => null)) ?? PROACTIVE_JOINS_IN;
+        return { kind: "reply", reply: { chatId, text: proactiveStatus(language, current) } };
+      }
+      const senderId = message.from?.id === undefined ? null : String(message.from.id);
+      if (!senderId || !(await isTripOrganizer(db, route.tripId, senderId))) {
+        log(structuredLog("info", "trip_bot.proactive_refused", { reason: "NOT_ORGANIZER" }));
+        return { kind: "reply", reply: { chatId, text: proactiveRefused(language) } };
+      }
+      // A relay running ahead of its migration has no such column: say so to the
+      // organizer instead of failing the update (and saying nothing).
+      let previous: ProactiveLevel | null;
+      try {
+        // Keyed by the trip the organizer check above authorised, not by the chat
+        // alone: the chat may have been re-bound to another trip since.
+        previous = await setGroupProactiveLevel(db, chatId, requested, route.tripId);
+      } catch (error) {
+        log(structuredLog("warn", "trip_bot.proactive_write_failed", {
+          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        }));
+        return { kind: "reply", reply: { chatId, text: proactiveUnavailable(language) } };
+      }
+      if (previous === null) {
+        // No open binding of THIS trip on this chat any more: nothing was written.
+        log(structuredLog("info", "trip_bot.proactive_not_changed", { reason: "NO_MATCHING_BINDING" }));
+        return { kind: "reply", reply: { chatId, text: proactiveUnavailable(language) } };
+      }
+      // (`level` is a field structuredLog strips: it indexes the line.)
+      log(structuredLog("info", "trip_bot.proactive_changed", { proactive_level: requested, previous_level: previous }));
+      return {
+        kind: "reply",
+        reply: { chatId, text: proactiveChanged(language, requested) },
+        // Counts only: how many groups turn it down is a KPI. A repeat of the
+        // current level is not a change.
+        ...(options.assistantEvents && previous !== null && previous !== requested
+          ? { levelChange: { tripId: route.tripId, level: requested, direction: requested > previous ? "raised" as const : "lowered" as const } }
+          : {}),
+      };
     }
   }
 
@@ -885,19 +1025,105 @@ export async function dispatchUpdate(
     // `route.kind === "companion"` is structural, not a real branch here —
     // normalizeUpdate never reaches this point for an interview or unbound
     // chat — mirrored only to match the ternary just below it.
-    const capturedAsReply =
-      outcome.route.kind === "companion" ? await consumeExpectsReplyWindow(db, chatId) : false;
-
-    const addressed =
-      capturedAsReply ||
-      isAddressedToAssistant({
-        chatType: outcome.event.source.chat_type,
-        text: outcome.event.text,
-        assistantNames: outcome.route.kind === "companion" ? outcome.route.assistantNames : [],
-        botUsername: botIdentity.username,
-        isReplyToAssistant,
-      });
+    //
+    // It now also reads the group's proactive level (level 1 admits nothing
+    // through it), a column a relay running ahead of its migration does not have:
+    // a failed claim degrades to "no window", as the conversation window's reads
+    // below do, rather than failing the update.
     const senderId = outcome.event.source.user_id;
+    const inGroup = outcome.route.kind === "companion" && outcome.event.source.chat_type !== "dm";
+    // EXPLICIT addressing: the assistant's name, an @mention of the bot, or a reply
+    // to one of its messages. Decided on the message alone - no window, no model.
+    const explicitlyAddressed = isAddressedToAssistant({
+      chatType: outcome.event.source.chat_type,
+      text: outcome.event.text,
+      assistantNames: outcome.route.kind === "companion" ? outcome.route.assistantNames : [],
+      botUsername: botIdentity.username,
+      isReplyToAssistant,
+    });
+    // A group message with no letter or digit and no attachment (a laugh, a
+    // thumbs-up, a lone "?") is a reaction, not a request - EXCEPT as the answer
+    // to a question the assistant asked ("Should I update the site?" - 👍 is
+    // consent, owner's decision 2026-10-17). Exactly two things make one an
+    // answer: the one-shot "?" window is open (the assistant's latest send ended
+    // in a question, unanswered, inside 150 s - consumed below, as for any
+    // message), or it is a Telegram reply to an assistant message that itself
+    // ended in a question. Anything else - a laugh, a thumbs-up to a statement,
+    // a reply to a statement - is chatter: the conversation window and the judge
+    // never admit it. "The assistant's latest message was a question" is NOT
+    // stored anywhere new: the "?" window IS that state, and a reply carries the
+    // text it replies to.
+    const reactionOnly = inGroup && !outcome.attachment && outcome.event.text.trim() !== "" &&
+      !judgeableText(outcome.event.text);
+    const repliedToText = message.reply_to_message?.text ?? message.reply_to_message?.caption ?? "";
+    const reactionAnswersQuestion = reactionOnly && isReplyToAssistant && looksLikeAQuestion(repliedToText);
+    // Explicit addressing as it counts for THIS message: a reaction that replies
+    // to a statement is not explicit, whoever's message it replies to.
+    const explicitHere = explicitlyAddressed && (!reactionOnly || reactionAnswersQuestion);
+
+    let capturedAsReply = false;
+    if (outcome.route.kind === "companion") {
+      try {
+        capturedAsReply = await consumeExpectsReplyWindow(db, chatId);
+      } catch (error) {
+        log(structuredLog("warn", "trip_bot.reply_window_read_failed", {
+          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        }));
+      }
+    }
+
+    // Booleans only in the log: no chat or user id beyond what other events carry.
+    if (capturedAsReply) log(structuredLog("info", "trip_bot.reply_window_hit", {}));
+
+    if (reactionOnly && !capturedAsReply && !explicitHere) log(structuredLog("info", "trip_bot.reaction_not_forwarded", {}));
+    const addressedOtherwise = capturedAsReply || explicitHere;
+
+    // The per-person conversation window (2026-10-16). Consulted LAST, only for
+    // a group message every other route has refused: is the sender the one
+    // member the assistant is in conversation with here, inside the window?
+    // The sender is the Telegram user id the update carried, never anything
+    // read from the text. A pure read - the forward below is what renews it.
+    //
+    // A failed lookup degrades to "not in the window" - today's behaviour -
+    // rather than failing the whole update: a relay that runs before the
+    // migration is applied (a restart applies none) would otherwise throw on
+    // every untagged group message and lose its held documents and overheard
+    // context with them. Same rule as the writes.
+    let capturedByConversation = false;
+    if (!addressedOtherwise && inGroup && senderId && !reactionOnly) {
+      try {
+        capturedByConversation = await inCompanionConversation(db, chatId, senderId);
+      } catch (error) {
+        log(structuredLog("warn", "trip_bot.conversation_window_read_failed", {
+          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        }));
+      }
+    }
+    if (capturedByConversation) log(structuredLog("info", "trip_bot.conversation_window_hit", {}));
+
+    // The group judge (2026-10-16): LAST of all, and only for a group message
+    // every rule above has refused. Existing rules first - anything one of them
+    // addressed never reaches a model. Text and captions only: an uncaptioned
+    // photo or file has nothing to judge and keeps today's hold-until-addressed
+    // behaviour. Every way it can fail ends in NOT_ADDRESSED.
+    let capturedByJudge = false;
+    let judged: JudgeOutcome | null = null;
+    if (
+      !addressedOtherwise && !capturedByConversation && inGroup && senderId &&
+      options.groupJudge?.model() && outcome.route.kind === "companion" && judgeableText(outcome.event.text)
+    ) {
+      if (options.judgedOutcome !== undefined) {
+        // Second pass of a deferred judgement: the verdict is already in.
+        judged = options.judgedOutcome;
+      } else {
+        const ask = await prepareGroupJudge(db, options.groupJudge, outcome.route, chatId, outcome.event.text, log);
+        if (ask === null) judged = null;
+        else if (options.deferJudge) return { kind: "judge_pending", chatId, ask };
+        else judged = await ask();
+      }
+      capturedByJudge = judged?.kind === "yes";
+    }
+    const addressed = addressedOtherwise || capturedByConversation || capturedByJudge;
     // #177: the gate's verdict, as metadata. Only ever called through
     // `withAnalytics`, which never calls it while assistant events are off.
     // The text is taken here, before anything is prefixed to it.
@@ -905,13 +1131,15 @@ export async function dispatchUpdate(
     const routedTripId = outcome.route.kind === "companion" ? outcome.route.tripId : null;
     const seen = (linkRole: string | null | undefined): InboundFacts => {
       if (!routedTripId) throw new Error("NOT_COMPANION_ROUTE");
-      return inboundFacts({
+      const facts = inboundFacts({
         tripId: routedTripId,
         // Telegram's own type for the channel; the gate's mapped one for the trigger.
         telegramChatType: message.chat?.type,
         trigger: classifyTrigger({
           addressed,
           capturedAsReply,
+          capturedByConversation,
+          capturedByJudge,
           chatType: outcome.event.source.chat_type,
           text: heardText,
           assistantNames: outcome.route.kind === "companion" ? outcome.route.assistantNames : [],
@@ -922,6 +1150,14 @@ export async function dispatchUpdate(
         attachmentKind: outcome.attachment?.kind ?? null,
         textLength: heardText.length,
       });
+      // Memory-only keys (relay-facts.ts): they let the emitter notice that the
+      // same sender, right after a judge_no, then addressed the assistant by name.
+      return {
+        ...facts,
+        chatKey: chatId,
+        ...(senderId ? { senderKey: senderId } : {}),
+        ...(judged ? { judge: judgeFactsOf(judged) } : {}),
+      };
     };
     if (!addressed) {
       // Not for the assistant, so nothing is downloaded. A DOCUMENT is still
@@ -933,7 +1169,9 @@ export async function dispatchUpdate(
       // this only means the NEXT addressed message knows what it is replying
       // into. Groups only — a DM is addressed by construction, so nothing is
       // ever dropped there.
-      if (options.groupContext && outcome.event.source.chat_type !== "dm" && outcome.event.text) {
+      // A bare reaction (an emoji, a "?") is not kept either: it adds nothing the
+      // companion could use and would only lengthen the block that leads its prompt.
+      if (options.groupContext && outcome.event.source.chat_type !== "dm" && outcome.event.text && !reactionOnly) {
         options.groupContext.hold(
           chatId,
           outcome.event.source.user_name || "someone",
@@ -955,6 +1193,22 @@ export async function dispatchUpdate(
           ...(held ? { documentHeld: true } : {}),
         }))),
       };
+    }
+
+    // This sender is now one of the members the assistant is talking with in this group:
+    // they join the conversation (nobody is displaced) and its shared deadline is extended. Written
+    // when the message is FORWARDED, not when the assistant answers, so a
+    // follow-up sent while it is still working counts. Whatever route
+    // addressed the message - name, mention, reply, the "?" window or this
+    // window itself. A failed write is logged and never costs the message.
+    if (inGroup && senderId) {
+      try {
+        await openCompanionConversation(db, chatId, senderId);
+      } catch (error) {
+        log(structuredLog("warn", "trip_bot.conversation_window_write_failed", {
+          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        }));
+      }
     }
 
     // WHOSE VOICE THIS IS, when the trip knows. `user_name` arrives from
@@ -1033,6 +1287,38 @@ export async function dispatchUpdate(
       }
     }
 
+    // A message that got here ONLY because its sender is in conversation with
+    // the assistant (no name, @mention, reply-to or "?" window) is marked, so the
+    // companion can tell a remark to the family from a message to it, and may
+    // answer with the silence sentinel (stay-silent.ts; the connector drops it).
+    // Named / mentioned / replying messages never get this mark (see addressedMark below). Text is the only
+    // field that reaches the model, so the mark is a fenced line on the text,
+    // put on BEFORE the overheard block so that block still leads. An empty
+    // text (a photo or file with no caption) gets the mark alone.
+    // The judge's yes is marked the same way, for the same reason: the companion
+    // is told it was not addressed by name and may stay silent (the second guard
+    // against a wrong yes).
+    if (capturedByConversation || capturedByJudge) {
+      outcome.event.text = `${conversationMark()}\n\n${outcome.event.text}`.trimEnd();
+    }
+    // The opposite fence (2026-10-17, A3 of the staging run): a group message
+    // that EXPLICITLY addressed the assistant - its name, an @mention, a reply to
+    // it - says so. The companion's prompt never named its own @handle, so it read
+    // "@<bot> where is the hotel?" as meant for someone else and answered with the
+    // silence sentinel, twice. Said as a fenced line on the text (the only field
+    // that reaches the model), carrying the bot's handle so the companion learns
+    // it, and ordered exactly like the conversation mark. The "?" window is NOT
+    // explicit - the next message after a question may be anyone's remark - so it
+    // keeps today's unmarked form. A DM is addressed by construction, never marked.
+    const explicit = inGroup && explicitHere;
+    if (explicit) {
+      outcome.event.text = `${addressedMark(botIdentity.username)}\n\n${outcome.event.text}`.trimEnd();
+    } else if (inGroup && reactionOnly && capturedAsReply) {
+      // A reaction that took the "?" window: not addressed by name, so a silence
+      // is allowed, but it is told what the bare emoji answers.
+      outcome.event.text = `${reactionAnswerMark()}\n\n${outcome.event.text}`.trimEnd();
+    }
+
     // The turns this message is a reply INTO. Prefixed onto the text rather
     // than carried in its own field because the gateway forwards `text` and
     // nothing else reaches the model — a new inbound field would be ignored
@@ -1062,6 +1348,7 @@ export async function dispatchUpdate(
     return {
       kind: "to_gateway",
       event: forwarded,
+      ...(explicit ? { explicit: true } : {}),
       ...(await withAnalytics(options.assistantEvents, log, () => ({
         ...seen(senderLinkRole),
         attachmentsJoined: attachments.joined,
@@ -1172,6 +1459,67 @@ export async function dispatchUpdate(
     default:
       return { kind: "ignore", reason: outcome.reason };
   }
+}
+
+/** A message worth a model call: it carries at least one letter or digit. A lone emoji or "?" is a reaction. */
+function judgeableText(text: string): boolean {
+  return /[\p{L}\p{N}]/u.test(text);
+}
+
+/**
+ * Prepares the judge's question about one unaddressed group message: null when it
+ * must not be asked - the group's level is below 3 (`/proactive`; a trip that opted
+ * out of reply capture reads as level 1), or the level could not be read (fail
+ * closed: a relay running ahead of its migration judges nothing) - otherwise the
+ * function that asks. The reads happen here, now; only the model call is left to
+ * `ask`, which never throws, logs the verdict and its speed (never the text), and
+ * may be run later and off the caller's loop.
+ */
+async function prepareGroupJudge(
+  db: pg.Pool,
+  judge: GroupJudge,
+  route: Extract<ChatRoute, { kind: "companion" }>,
+  chatId: string,
+  text: string,
+  log: (line: string) => void,
+): Promise<(() => Promise<JudgeOutcome>) | null> {
+  try {
+    if ((await groupProactiveLevel(db, chatId)) !== PROACTIVE_JOINS_IN) return null;
+  } catch (error) {
+    log(structuredLog("warn", "trip_bot.group_judge_level_read_failed", {
+      safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+    }));
+    return null;
+  }
+  const language = await tripLanguage(db, route.tripId).catch(() => "en" as const);
+  return async () => {
+    const judged = await judge.judge({ chatId, text, assistantNames: route.assistantNames, language });
+    log(structuredLog("info", "trip_bot.group_judged", {
+      verdict: judged.kind,
+      latency_ms: judged.ms,
+      model: judged.model,
+      ...(judged.kind === "fallback" ? { reason: judged.reason } : { confidence: judged.confidence }),
+      ...(judged.kind === "no" && judged.belowThreshold ? { below_threshold: true } : {}),
+    }));
+    return judged;
+  };
+}
+
+/** A judge outcome as the analytics descriptor names it. */
+function judgeFactsOf(judged: JudgeOutcome): JudgeFacts {
+  const base = { latencyMs: judged.ms, model: judged.model };
+  if (judged.kind === "yes") {
+    return { ...base, outcome: "judge_yes", confidencePct: Math.round(judged.confidence * 100) };
+  }
+  if (judged.kind === "no") {
+    return {
+      ...base,
+      outcome: "judge_no",
+      confidencePct: Math.round(judged.confidence * 100),
+      ...(judged.belowThreshold ? { belowThreshold: true } : {}),
+    };
+  }
+  return { ...base, outcome: "judge_fallback", fallbackReason: judged.reason };
 }
 
 /**
