@@ -1,27 +1,45 @@
-# Kinerary control plane — Sprint 0
+# Kinerary control plane
 
-This directory establishes the portable control-plane boundary described by
-PR 10. It does not provision, activate, expose provider actions, or deploy a
-live trip.
+The control plane is everything that stands between a person asking for a trip
+and a running trip site: signup and portal accounts, the Telegram interview and
+its relay, plan approval, provisioning and verifying a trip's deployment, and
+the companion bots a trip ends up with. The trip sites it provisions are the
+product described in [FRAMEWORK.md](../FRAMEWORK.md); this directory is the
+machinery that builds and watches them. Where it runs is deployment, not
+product: [docs/control-plane-vm-deployment.md](../docs/control-plane-vm-deployment.md)
+is the runbook, and architecture-specific values live outside this repository.
 
 ## Repository shape
 
+- `api/`: the TypeScript/Fastify service (`src/server.ts`) — public API,
+  signup/portal, the Telegram relay (`src/relay/`), the interview and its
+  interview MCP (`src/interview-mcp.ts`), the companion MCP
+  (`src/companion-mcp.ts`), the job queue, the release catalog and its
+  operator CLI (below), and the transactional migration runner
+  (`src/migrate.ts`). PostgreSQL constraints are the authoritative canonical
+  JSON write guard.
+- `worker/`: the private Python worker (`control_plane_worker`). It has no
+  public HTTP listener. `provision` drains approved jobs — the provisioner,
+  the intake-to-config transformer, enrichment, the companion-profile and MCP
+  bridge steps, and verification of what it built; `run` and `check-database`
+  only observe the queue and the database; `inventory` and `cleanup` are the
+  read-only/dry-run Proxmox commands.
+- `db/migrations/`: the PostgreSQL migrations, applied in order by
+  `api/src/migrate.ts`. Naming and the rollback header are in
+  [docs/migrations.md](../docs/migrations.md); `db/compose.test.yml` is an
+  isolated local test database.
+- `deployment/`: the Compose stacks (`compose.local.yml`, `compose.vm.yml`,
+  `compose.example.yml`), the VM scripts and `vm-release.py`, Hermes image
+  tooling and the relay conformance check.
 - `contracts/v1/`: closed JSON Schema contracts for canonical records and the
   provider-neutral adapter request/result envelope.
-- `api/`: TypeScript/Fastify public API skeleton, architecture validation,
-  lifecycle guards, safe operational logs, fake adapters and a transactional
-  migration runner. PostgreSQL constraints are the authoritative canonical
-  JSON write guard in this stage.
-- `worker/`: private Python queue worker skeleton. It has no public HTTP action
-  listener; its operator CLI provides read-only Proxmox inventory and dry-run
-  test cleanup only.
-- `db/`: PostgreSQL registry migrations and an isolated local test database.
-- `deployment/`: a boundary example where only the API joins ingress; the
-  worker and PostgreSQL remain on an internal network.
+- `runtime-gateway/`: a small Node gateway that routes portal sessions to
+  trip runtimes (`/t/<trip>/…`).
+- `config/`: example architecture profiles. `architecture.example.json` holds
+  only test adapter names and validation-safe references.
 
 Architecture-specific values and credentials come from an external profile
-and opaque secret references. `config/architecture.example.json` contains
-only test adapter names and validation-safe references.
+and opaque secret references.
 
 ## Secret references
 
@@ -102,7 +120,7 @@ remain in the environment:
 PYTHONPATH=control-plane/worker python3 -m control_plane_worker inventory --node TEST_NODE
 ```
 
-Cleanup is selection-only in Sprint 0 and requires an exact test-run label:
+Cleanup is selection-only (`--dry-run` is required) and requires an exact test-run label:
 
 ```bash
 PYTHONPATH=control-plane/worker python3 -m control_plane_worker cleanup \
@@ -111,19 +129,21 @@ PYTHONPATH=control-plane/worker python3 -m control_plane_worker cleanup \
   --test-run-id tr_example123 --dry-run
 ```
 
-No execute/delete option exists in this stage.
+The `cleanup` command has no execute/delete option; tearing a trip down is
+`scripts/teardown-trip.py`, described in the root `CLAUDE.md`.
 
 ## Reviewable local runtime
 
 The local stack runs PostgreSQL with persistent storage, a one-shot migration
-container, the database-aware API and a private queue-observer worker. Only the
-API is published, on loopback by default; PostgreSQL and the worker have no
-host port.
+container, the database-aware API and the worker. Only the API is published, on
+loopback by default; PostgreSQL and the worker have no host port.
 
-The `run` command deliberately does not instantiate the executable `Worker`
-class in Sprint 0. That class is contract-test scaffolding for the later
-durable claim/execute sprint; the deployed worker only observes queue and
-migration health and has no provider-mutation path.
+The worker service runs `provision`, which drains approved provisioning jobs.
+It is deliberately inert until configured: the deploy root, repo root and the
+compute-adapter credentials are empty by default, so an unconfigured worker
+fails loudly every poll cycle rather than reaching real infrastructure. The
+`run` command is the queue-observing mode with no provider-mutation path; see
+the comments in `deployment/compose.local.yml`.
 
 ```bash
 control-plane/deployment/prepare-local.sh
