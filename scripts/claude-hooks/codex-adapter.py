@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Translate Codex hook inputs/outputs; shared shell scripts own the policy.
 
-Codex 0.153.2 does not implement PreToolUse `ask`: returning it fails open.
-Represent that decision as a denial requiring the owner to take the action.
+Owner decision (2026-10-18): preserve shared-policy `ask` decisions instead
+of converting them to denials. Current Codex treats `ask` as unsupported and
+continues execution without a hook approval prompt; the owner accepts this
+temporary behavior. Native sandbox/approval checks still apply.
 This adapter cannot force the runtime to execute a missing/untrusted hook or
 make a runtime-level hook timeout fail closed. See the accompanying report.
 """
@@ -87,9 +89,9 @@ def translate(output: dict) -> dict:
     if not isinstance(reason, str):
         raise ValueError("Shared policy returned an invalid reason")
     if decision == "ask":
-        return denied("Owner approval required. Codex cannot turn this hook decision "
-                      "into an approval prompt; the action is blocked. "
-                      + reason)
+        # Preserve the owner's requested policy, even where Codex cannot yet
+        # display this hook's approval prompt. Explicit denials remain denials.
+        return output
     # A plain allow is not an input rewrite. Continue through the runtime's
     # normal sandbox/approval checks using its supported no-decision result.
     return {} if decision == "allow" else denied(reason)
