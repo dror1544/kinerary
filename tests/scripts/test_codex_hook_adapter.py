@@ -1,4 +1,4 @@
-"""Codex transport must preserve shared policy without unsupported ask decisions."""
+"""Codex transport preserves policy asks; explicit denials still fail closed."""
 from __future__ import annotations
 
 import hashlib
@@ -53,17 +53,36 @@ class CodexAdapter(Harness):
         subprocess.run(["git", "checkout", "-qb", "fix/example"], cwd=self.root, check=True)
         self.assertEqual(self.bash("git commit -m 'docs: note'"), {})
 
-    def test_policy_commit_ask_becomes_deny(self):
+    def test_policy_commit_ask_is_preserved(self):
         subprocess.run(["git", "checkout", "-qb", "fix/example"], cwd=self.root, check=True)
         (self.root / ".codex").mkdir()
         (self.root / ".codex/hooks.json").write_text("{}\n")
         subprocess.run(["git", "add", ".codex/hooks.json"], cwd=self.root, check=True)
-        self.assertDenied(self.bash("git commit -m 'fix: hooks'"))
+        result = self.bash("git commit -m 'fix: hooks'")
+        self.assertEqual(result.get("permissionDecision"), "ask", result)
+        self.assertIn("CLAUDE.md", result["permissionDecisionReason"])
 
-    def test_sensitive_commands_are_denied(self):
-        for command in ("git push origin main", "docker compose up -d --build"):
+    def test_sensitive_commands_preserve_shared_approval_requests(self):
+        for command in ("git merge --no-commit --no-ff origin/main",
+                        "git push origin main", "docker compose up -d --build"):
             with self.subTest(command=command):
-                self.assertDenied(self.bash(command))
+                result = self.bash(command)
+                self.assertEqual(result.get("permissionDecision"), "ask", result)
+                self.assertTrue(result.get("permissionDecisionReason"), result)
+
+    def test_ask_preserves_the_shared_response_without_mutation(self):
+        spec = importlib.util.spec_from_file_location(
+            "codex_adapter_ask_test", REPO / "scripts/claude-hooks/codex-adapter.py")
+        adapter = importlib.util.module_from_spec(spec)
+        with patch.object(sys, "dont_write_bytecode", True):
+            spec.loader.exec_module(adapter)
+        response = {"hookSpecificOutput": {
+            "hookEventName": "PreToolUse", "permissionDecision": "ask",
+            "permissionDecisionReason": "Review this exact merge before proceeding.",
+        }}
+        before = json.loads(json.dumps(response))
+        self.assertEqual(adapter.translate(response), before)
+        self.assertEqual(response, before)
 
     def test_subagent_identity_is_preserved(self):
         subprocess.run(["git", "checkout", "-qb", "fix/example"], cwd=self.root, check=True)
