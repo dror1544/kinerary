@@ -230,6 +230,115 @@ describe('trip MCP — an organizer connects an assistant', () => {
     assert.match(brief.result.content[0].text, /standing_instructions/);
   });
 
+  // Issue #173: budget_items has no owner column and PATCH/DELETE were gated
+  // by authRequired alone — any authenticated member, not just the organizer,
+  // could rewrite or erase ANY other member's (including the organizer's)
+  // budget line. Owner decision 2026-09-25: row ownership (option b) — a
+  // member may only touch their own line; the organizer and the agent key may
+  // touch any line; a line with no recorded creator (seeded, or agent-authored
+  // with nobody named) is organizer/agent-only.
+  it('a plain member cannot rewrite or erase another member\'s budget line, including the organizer\'s', async () => {
+    const created = await (await api('/api/budget', {
+      method: 'POST', token: aliceSession, body: { phase: 'general', category: 'lodging', description: 'alice line', amount: 10 },
+    })).json();
+    assert.ok(created.ok, JSON.stringify(created));
+
+    const patch = await api(`/api/budget/${created.id}`, { method: 'PATCH', token: bobSession, body: { description: 'bob was here' } });
+    assert.equal(patch.status, 403, JSON.stringify(await patch.json()));
+
+    const stillAlices = await (await api('/api/budget', { token: aliceSession })).json();
+    assert.equal(stillAlices.find(r => r.id === created.id).description, 'alice line', 'bob\'s PATCH must not have changed the row');
+
+    const del = await api(`/api/budget/${created.id}`, { method: 'DELETE', token: bobSession });
+    assert.equal(del.status, 403, JSON.stringify(await del.json()));
+
+    const stillThere = await (await api('/api/budget', { token: aliceSession })).json();
+    assert.ok(stillThere.some(r => r.id === created.id), 'bob\'s DELETE must not have removed the row');
+  });
+
+  it('a member may edit and delete their OWN budget line', async () => {
+    const created = await (await api('/api/budget', {
+      method: 'POST', token: bobSession, body: { phase: 'general', category: 'food', description: 'bob\'s own line', amount: 5 },
+    })).json();
+    assert.ok(created.ok, JSON.stringify(created));
+
+    const patch = await api(`/api/budget/${created.id}`, { method: 'PATCH', token: bobSession, body: { description: 'bob updated it' } });
+    assert.equal(patch.status, 200, JSON.stringify(await patch.json()));
+    const rows = await (await api('/api/budget', { token: aliceSession })).json();
+    assert.equal(rows.find(r => r.id === created.id).description, 'bob updated it');
+
+    const del = await api(`/api/budget/${created.id}`, { method: 'DELETE', token: bobSession });
+    assert.equal(del.status, 200, JSON.stringify(await del.json()));
+    const after = await (await api('/api/budget', { token: aliceSession })).json();
+    assert.ok(!after.some(r => r.id === created.id), 'bob\'s own DELETE must succeed');
+  });
+
+  it('the organizer may edit and delete ANY member\'s budget line', async () => {
+    const created = await (await api('/api/budget', {
+      method: 'POST', token: bobSession, body: { phase: 'general', category: 'food', description: 'bob line for organizer', amount: 7 },
+    })).json();
+    assert.ok(created.ok, JSON.stringify(created));
+
+    const patch = await api(`/api/budget/${created.id}`, { method: 'PATCH', token: aliceSession, body: { description: 'organizer corrected it' } });
+    assert.equal(patch.status, 200, JSON.stringify(await patch.json()));
+
+    const del = await api(`/api/budget/${created.id}`, { method: 'DELETE', token: aliceSession });
+    assert.equal(del.status, 200, JSON.stringify(await del.json()));
+  });
+
+  it('the agent key may edit and delete ANY member\'s budget line', async () => {
+    const created = await (await api('/api/budget', {
+      method: 'POST', token: bobSession, body: { phase: 'general', category: 'food', description: 'bob line for agent', amount: 3 },
+    })).json();
+    assert.ok(created.ok, JSON.stringify(created));
+
+    const patch = await api(`/api/budget/${created.id}`, { method: 'PATCH', apiKey: 'test-hermes-key', body: { description: 'agent corrected it' } });
+    assert.equal(patch.status, 200, JSON.stringify(await patch.json()));
+
+    const del = await api(`/api/budget/${created.id}`, { method: 'DELETE', apiKey: 'test-hermes-key' });
+    assert.equal(del.status, 200, JSON.stringify(await del.json()));
+  });
+
+  it('a line with no recorded creator (seeded, or agent-authored with nobody named) is organizer/agent-only', async () => {
+    // The agent key's own POST — mcp/mcp.js's add_budget_item never names a
+    // requesting member today, so it lands with no creator, same as a seeded
+    // row: a member cannot touch it, only the organizer or the agent key can.
+    const created = await (await api('/api/budget', {
+      method: 'POST', apiKey: 'test-hermes-key', body: { phase: 'general', category: 'food', description: 'agent-authored, nobody named', amount: 1 },
+    })).json();
+    assert.ok(created.ok, JSON.stringify(created));
+
+    const memberPatch = await api(`/api/budget/${created.id}`, { method: 'PATCH', token: bobSession, body: { description: 'bob tries anyway' } });
+    assert.equal(memberPatch.status, 403);
+
+    const memberDelete = await api(`/api/budget/${created.id}`, { method: 'DELETE', token: bobSession });
+    assert.equal(memberDelete.status, 403);
+
+    const organizerPatch = await api(`/api/budget/${created.id}`, { method: 'PATCH', token: aliceSession, body: { description: 'organizer may still touch it' } });
+    assert.equal(organizerPatch.status, 200);
+
+    await api(`/api/budget/${created.id}`, { method: 'DELETE', apiKey: 'test-hermes-key' });
+  });
+
+  it('GET /api/budget stays trip-wide readable, and marks per-row whether THIS caller may edit it', async () => {
+    const aliceOwned = await (await api('/api/budget', {
+      method: 'POST', token: aliceSession, body: { phase: 'general', category: 'food', description: 'can_edit fixture: alice', amount: 1 },
+    })).json();
+    const bobOwned = await (await api('/api/budget', {
+      method: 'POST', token: bobSession, body: { phase: 'general', category: 'food', description: 'can_edit fixture: bob', amount: 1 },
+    })).json();
+
+    // Every family member — organizer or not — can still read every line:
+    // the fix is about who may WRITE a line, not who may see the budget.
+    const asBob = await (await api('/api/budget', { token: bobSession })).json();
+    assert.ok(asBob.some(r => r.id === aliceOwned.id), 'bob must still be able to read alice\'s line');
+    assert.equal(asBob.find(r => r.id === aliceOwned.id).can_edit, false, 'bob may not edit alice\'s line');
+    assert.equal(asBob.find(r => r.id === bobOwned.id).can_edit, true, 'bob may edit his own line');
+
+    const asAlice = await (await api('/api/budget', { token: aliceSession })).json();
+    assert.equal(asAlice.find(r => r.id === bobOwned.id).can_edit, true, 'the organizer may edit anyone\'s line');
+  });
+
   it('a route\'s own refusal comes back as a tool error, not a crash', async () => {
     const r = await (await rpc(tokens.access_token, 'tools/call', { name: 'delete_booking', arguments: { id: 999999 } })).json();
     assert.equal(r.result.isError, true);

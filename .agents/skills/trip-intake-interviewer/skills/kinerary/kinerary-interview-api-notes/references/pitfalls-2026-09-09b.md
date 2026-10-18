@@ -1,4 +1,4 @@
-# Pitfalls observed — 2026-09-09 session (Solomon Japan trip)
+# Pitfalls observed — 2026-09-09 session (Japan trip)
 
 ## `record_answers_for_chat` + structured questions: unreliable, use submit directly
 

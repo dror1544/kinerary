@@ -25,8 +25,43 @@ export const MAX_DOCUMENT_BYTES = 20 * 1024 * 1024;
  */
 export const MAX_DOCUMENT_CHARS = 200_000;
 
+/**
+ * Names this reader. Bumped whenever a change here could make the same file
+ * read differently, because a stored extraction is keyed by the reader that
+ * produced its text — and a reading made by an older, lossier reader must not
+ * be served as if the improved one had made it.
+ */
+export const DOCUMENT_READER_VERSION = "reader-2026-09-13.2";
+
+/** Below this many non-space characters a PDF page is taken to be unread — a scan. */
+const PAGE_USABLE_CHARS = 20;
+
+/**
+ * What was read, one unit at a time: a PDF page, a spreadsheet sheet, or the
+ * whole of a document that has no reliable pages (a Word file has no fixed
+ * pagination, and inventing page numbers for one would be making them up).
+ *
+ * `usable: false` is a page that yielded next to no text — almost always a
+ * scanned page inside an otherwise readable PDF. A whole-document check passes
+ * such a PDF happily as long as ONE page has text, which is exactly how a
+ * nineteen-page scan with a typed cover sheet used to be reported as read.
+ *
+ * `cut: true` marks a unit that starts beyond the character budget, so the
+ * truncation can be said in terms of what was actually lost. Offsets are counted
+ * before whitespace collapsing, so a unit straddling the limit is approximate by
+ * a few characters.
+ */
+export interface DocumentCoverageUnit {
+  /** `image`: the whole file was read by a vision model — see document-vision.ts. */
+  unit: "page" | "sheet" | "document" | "image";
+  index: number;
+  chars: number;
+  usable: boolean;
+  cut?: boolean;
+}
+
 export type DocumentTextResult =
-  | { ok: true; text: string; pages: number; truncated: boolean }
+  | { ok: true; text: string; pages: number; truncated: boolean; coverage: DocumentCoverageUnit[] }
   | {
       ok: false;
       reason: "UNSUPPORTED_TYPE" | "TOO_LARGE" | "UNREADABLE" | "NO_TEXT" | "IDENTITY_DOCUMENT";
@@ -229,16 +264,131 @@ function xmlText(fragment: string): string {
  * which is the one piece of xlsx that cannot be skipped: without resolving it
  * every text cell reads as a small integer.
  *
- * KNOWN LOSS: dates are serial numbers in xlsx and come out as numbers, since
- * telling a date from a quantity needs the cell's format record. A budget's
- * amounts survive, which is what `budget_detail` is actually after; a
- * spreadsheet used as an itinerary would not fare as well.
+ * DATES are decoded, not guessed. In xlsx a date is a serial day count — 46284
+ * is 19 September 2026 — and the only thing that says a number is a date rather
+ * than a price is the cell's number format. Handing the model the raw serial
+ * and asking it to work out which numbers were dates is asking it to guess, and
+ * a spreadsheet itinerary is exactly where a wrong guess costs a day. So the
+ * cell's style is followed to its number format, date-shaped formats are turned
+ * into ISO text on the workbook's own date system (1900 or 1904), and everything
+ * else stays the number it was.
+ *
+ * Cells keep their COLUMNS: a row is laid out by each cell's reference, so an
+ * empty column stays an empty field rather than shifting every value after it
+ * one column left under the wrong header. A formula reads as its cached value;
+ * one with no cached value has nothing to read, and is counted as unread rather
+ * than passing silently as an empty cell.
  */
 export function xlsxToText(bytes: Uint8Array, maxSheets = 12): string | null {
+  const sheets = xlsxSheets(bytes, maxSheets);
+  return sheets ? sheets.filter((sheet) => sheet.trim()).join("\n") : null;
+}
+
+/** The same, one string per sheet, so a reader can say which sheets it read. */
+export function xlsxSheets(bytes: Uint8Array, maxSheets = 12): string[] | null {
+  return xlsxSheetDetails(bytes, maxSheets)?.map((sheet) => sheet.text) ?? null;
+}
+
+function xmlAttribute(tag: string, name: string): string | undefined {
+  return new RegExp(`\\s${name}="([^"]*)"`).exec(tag)?.[1];
+}
+
+function decodeXmlEntities(text: string): string {
+  return text
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'");
+}
+
+type CellDateKind = "date" | "time" | "datetime";
+
+/** Built-in number formats that are dates or times (ECMA-376 §18.8.30, plus the CJK date ids). */
+const BUILTIN_FORMAT_KIND = new Map<number, CellDateKind>([
+  ...[14, 15, 16, 17, 27, 28, 29, 30, 31, 34, 35, 36, 50, 51, 52, 53, 54, 57, 58].map((id) => [id, "date"] as const),
+  ...[18, 19, 20, 21, 32, 33, 45, 46, 47, 55, 56].map((id) => [id, "time"] as const),
+  [22, "datetime"] as const,
+]);
+
+/**
+ * Whether a custom format code shows a date, a time, both, or neither. Quoted
+ * literals, escaped characters and bracketed locale or colour sections are
+ * removed first — `[$-he-IL]` and `"days"` must not read as date tokens — and
+ * then d/y mark a date and h/s mark a time.
+ */
+function formatCodeKind(code: string): CellDateKind | null {
+  const bare = decodeXmlEntities(code)
+    .replace(/"[^"]*"/g, "")
+    .replace(/\\./g, "")
+    .replace(/\[(?![hms]+\])[^\]]*\]/gi, "");
+  const hasDate = /[dy]/i.test(bare);
+  const hasTime = /[hs]/i.test(bare);
+  if (hasDate && hasTime) return "datetime";
+  if (hasDate) return "date";
+  if (hasTime) return "time";
+  return null;
+}
+
+interface WorkbookFormats {
+  /** cellXfs index -> what kind of date the cell's format shows, if any. */
+  styleKind: (CellDateKind | null)[];
+  date1904: boolean;
+}
+
+function workbookFormats(bytes: Uint8Array): WorkbookFormats {
+  const styles = readZipEntry(bytes, "xl/styles.xml")?.toString("utf8") ?? "";
+  const custom = new Map<number, string>();
+  for (const tag of styles.match(/<numFmt\b[^>]*>/g) ?? []) {
+    const id = Number(xmlAttribute(tag, "numFmtId"));
+    const code = xmlAttribute(tag, "formatCode");
+    if (Number.isInteger(id) && code !== undefined) custom.set(id, code);
+  }
+  const xfs = /<cellXfs\b[^>]*>([\s\S]*?)<\/cellXfs>/.exec(styles)?.[1] ?? "";
+  const styleKind = (xfs.match(/<xf\b[^>]*>/g) ?? []).map((tag) => {
+    const id = Number(xmlAttribute(tag, "numFmtId") ?? "0");
+    const code = custom.get(id);
+    return code !== undefined ? formatCodeKind(code) : BUILTIN_FORMAT_KIND.get(id) ?? null;
+  });
+  const workbook = readZipEntry(bytes, "xl/workbook.xml")?.toString("utf8") ?? "";
+  const date1904 = /<workbookPr\b[^>]*\bdate1904="(1|true)"/i.test(workbook);
+  return { styleKind, date1904 };
+}
+
+/**
+ * A serial date as ISO text, on the workbook's date system. The 1900 system
+ * counts 1900-02-29, a day that never existed (a Lotus 1-2-3 bug Excel kept for
+ * compatibility), so serials from 61 on are one day ahead of a plain count.
+ */
+export function serialToIsoText(serial: number, kind: CellDateKind, date1904 = false): string | null {
+  if (!Number.isFinite(serial) || serial < 0) return null;
+  const whole = Math.floor(serial);
+  const seconds = Math.round((serial - whole) * 86_400);
+  const epoch = date1904
+    ? Date.UTC(1904, 0, 1)
+    : whole < 61 ? Date.UTC(1899, 11, 31) : Date.UTC(1899, 11, 30);
+  const iso = new Date(epoch + whole * 86_400_000 + seconds * 1000).toISOString();
+  const day = iso.slice(0, 10);
+  const clock = iso.slice(11, 16);
+  return kind === "date" ? day : kind === "time" ? clock : `${day} ${clock}`;
+}
+
+/** A cell reference's column as a zero-based index: A→0, Z→25, AA→26. */
+function columnIndex(reference: string | undefined): number | null {
+  const letters = /^([A-Z]+)\d+$/.exec(reference ?? "")?.[1];
+  if (!letters) return null;
+  let index = 0;
+  for (const ch of letters) index = index * 26 + (ch.charCodeAt(0) - 64);
+  return index - 1;
+}
+
+/** Each sheet's text, and how many formula cells had no cached value to read. */
+export function xlsxSheetDetails(bytes: Uint8Array, maxSheets = 12): { text: string; unread: number }[] | null {
   const sharedXml = readZipEntry(bytes, "xl/sharedStrings.xml")?.toString("utf8") ?? "";
   const shared = (sharedXml.match(/<si\b[^>]*>[\s\S]*?<\/si>/g) ?? []).map(xmlText);
+  const { styleKind, date1904 } = workbookFormats(bytes);
 
-  const lines: string[] = [];
+  const sheets: { text: string; unread: number }[] = [];
   let found = 0;
   for (let n = 1; n <= maxSheets; n += 1) {
     const sheet = readZipEntry(bytes, `xl/worksheets/sheet${n}.xml`)?.toString("utf8");
@@ -249,24 +399,45 @@ export function xlsxToText(bytes: Uint8Array, maxSheets = 12): string | null {
       continue;
     }
     found += 1;
+    const lines: string[] = [];
+    let unread = 0;
+    sheets.push({ text: "", unread: 0 });
     for (const row of sheet.match(/<row\b[^>]*>[\s\S]*?<\/row>/g) ?? []) {
       const cells: string[] = [];
       for (const cell of row.match(/<c\b[^>]*(?:\/>|>[\s\S]*?<\/c>)/g) ?? []) {
-        const type = cell.match(/\st="([^"]+)"/)?.[1];
+        const open = /^<c\b[^>]*/.exec(cell)?.[0] ?? "";
+        const type = xmlAttribute(open, "t");
+        const raw = /<v>([\s\S]*?)<\/v>/.exec(cell)?.[1];
+        let value: string;
         if (type === "s") {
-          const index = Number(cell.match(/<v>(\d+)<\/v>/)?.[1]);
-          cells.push(Number.isInteger(index) ? shared[index] ?? "" : "");
+          const index = Number(raw);
+          value = Number.isInteger(index) ? shared[index] ?? "" : "";
         } else if (type === "inlineStr") {
-          cells.push(xmlText(cell));
+          value = xmlText(cell);
+        } else if (type === "b") {
+          value = raw === "1" ? "TRUE" : raw === "0" ? "FALSE" : "";
+        } else if (raw === undefined) {
+          value = "";
+          if (/<f\b/.test(cell)) unread += 1;
+        } else if (type === undefined || type === "n") {
+          const kind = styleKind[Number(xmlAttribute(open, "s") ?? "0")] ?? null;
+          value = (kind ? serialToIsoText(Number(raw), kind, date1904) : null) ?? decodeXmlEntities(raw);
         } else {
-          cells.push(cell.match(/<v>([\s\S]*?)<\/v>/)?.[1] ?? "");
+          value = decodeXmlEntities(raw);
         }
+        // Placed at its own column, so a gap stays a gap. A reference absurdly
+        // far to the right is appended rather than padded out to it.
+        const column = columnIndex(xmlAttribute(open, "r"));
+        const at = column !== null && column - cells.length <= 256 ? Math.max(column, cells.length) : cells.length;
+        while (cells.length < at) cells.push("");
+        cells[at] = value;
       }
       const line = cells.join("\t").trimEnd();
       if (line.trim()) lines.push(line);
     }
+    sheets[sheets.length - 1] = { text: lines.join("\n"), unread };
   }
-  return found > 0 ? lines.join("\n") : null;
+  return found > 0 ? sheets : null;
 }
 
 /**
@@ -329,36 +500,45 @@ export async function documentText(
   bytes: Uint8Array,
   mime: string | undefined,
   filename: string | undefined,
+  options: { maxChars?: number } = {},
 ): Promise<DocumentTextResult> {
+  const maxChars = options.maxChars ?? MAX_DOCUMENT_CHARS;
   const kind = documentKindFor(mime, filename);
   if (!kind) return { ok: false, reason: "UNSUPPORTED_TYPE", detail: mime ?? filename ?? "unknown" };
   if (bytes.length > MAX_DOCUMENT_BYTES) return { ok: false, reason: "TOO_LARGE", detail: String(bytes.length) };
 
-  let raw: string;
+  let units: { unit: DocumentCoverageUnit["unit"]; index: number; text: string; unread?: number }[];
   let pages = 1;
   if (kind === "text") {
-    raw = new TextDecoder().decode(bytes);
+    units = [{ unit: "document", index: 1, text: new TextDecoder().decode(bytes) }];
   } else if (kind === "docx") {
     const extracted = docxToText(bytes);
     if (extracted === null) return { ok: false, reason: "UNREADABLE", detail: "not a readable .docx" };
-    raw = extracted;
+    units = [{ unit: "document", index: 1, text: extracted }];
   } else if (kind === "xlsx") {
-    const extracted = xlsxToText(bytes);
-    if (extracted === null) return { ok: false, reason: "UNREADABLE", detail: "not a readable .xlsx" };
-    raw = extracted;
+    const sheets = xlsxSheetDetails(bytes);
+    if (sheets === null) return { ok: false, reason: "UNREADABLE", detail: "not a readable .xlsx" };
+    units = sheets.map((sheet, i) => ({ unit: "sheet" as const, index: i + 1, text: sheet.text, unread: sheet.unread }));
   } else if (kind === "html") {
-    raw = htmlToText(new TextDecoder().decode(bytes));
+    units = [{ unit: "document", index: 1, text: htmlToText(new TextDecoder().decode(bytes)) }];
   } else {
     try {
-      const pdf = await getDocumentProxy(bytes);
-      const out = await extractText(pdf, { mergePages: true });
+      // A COPY. pdf.js takes ownership of the buffer it is given and detaches
+      // it, so the caller's bytes came back empty: hashed afterwards, every PDF
+      // on a trip had the digest of nothing; hashed before, the store refused
+      // the write as a digest mismatch and no PDF original was ever kept.
+      const pdf = await getDocumentProxy(bytes.slice());
+      // Page by page, so a scanned page inside a typed PDF can be SEEN as
+      // unread rather than disappearing into one merged string.
+      const out = await extractText(pdf, { mergePages: false });
       pages = out.totalPages;
-      raw = Array.isArray(out.text) ? out.text.join("\n") : out.text;
+      units = out.text.map((text, i) => ({ unit: "page" as const, index: i + 1, text }));
     } catch (e) {
       return { ok: false, reason: "UNREADABLE", detail: String((e as Error)?.message ?? e).slice(0, 200) };
     }
   }
 
+  const raw = units.map((u) => u.text).join("\n");
   const tidied = tidyDocumentText(raw);
 
   // Checked on the extracted text, before it is returned to anything that
@@ -372,10 +552,29 @@ export async function documentText(
   // reason rather than being folded into UNREADABLE.
   if (!hasUsableText(tidied)) return { ok: false, reason: "NO_TEXT" };
 
+  let offset = 0;
+  const coverage = units.map((u): DocumentCoverageUnit => {
+    const piece = tidyDocumentText(u.text);
+    const chars = piece.replace(/\s+/g, "").length;
+    const start = offset;
+    offset += piece.length + 1;
+    return {
+      unit: u.unit,
+      index: u.index,
+      chars,
+      // A page with next to no text is a scan. A sheet is unread only where a
+      // formula had no cached value — an empty sheet is an empty sheet. A Word
+      // or text file either reads or is refused whole above.
+      usable: u.unit === "page" ? chars >= PAGE_USABLE_CHARS : (u.unread ?? 0) === 0,
+      ...(start >= maxChars ? { cut: true } : {}),
+    };
+  });
+
   return {
     ok: true,
-    text: tidied.slice(0, MAX_DOCUMENT_CHARS),
+    text: tidied.slice(0, maxChars),
     pages,
-    truncated: tidied.length > MAX_DOCUMENT_CHARS,
+    truncated: tidied.length > maxChars,
+    coverage,
   };
 }

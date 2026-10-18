@@ -6,7 +6,7 @@ import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
 import { buildApp, type ChatRoutingDependencies } from "../src/app.js";
 import { validateArchitectureProfile } from "../src/config.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const skip = !databaseUrl;
@@ -33,7 +33,7 @@ const testProfile = validateArchitectureProfile({
 });
 
 test("GET /internal/telegram-chat-bindings/:chatId returns the bound trip and profile", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -70,7 +70,7 @@ test("GET /internal/telegram-chat-bindings/:chatId returns the bound trip and pr
 });
 
 test("GET /internal/telegram-chat-bindings/:chatId returns 404 for an unbound chat id", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -95,7 +95,7 @@ test("GET /internal/telegram-chat-bindings/:chatId returns 404 for an unbound ch
 });
 
 test("GET /internal/telegram-chat-bindings/:chatId refuses a missing or wrong API key", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);

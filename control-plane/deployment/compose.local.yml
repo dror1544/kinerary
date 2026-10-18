@@ -80,6 +80,18 @@ services:
       # leaves this unset, so only a manifest-backed, digest-verified release is
       # ever selectable.
       CONTROL_PLANE_ALLOW_UNSEALED_RELEASE: ${CONTROL_PLANE_ALLOW_UNSEALED_RELEASE:-1}
+      # Gates every /v1/admin/* route (app.ts's adminAuth, checked against
+      # X-API-Key) — unset leaves them unmounted entirely, which is why the
+      # super-admin dashboard (sprint6-tracks.md "Monitoring") has never been
+      # reachable on this local stack. (compose.vm.yml's api service never had
+      # this line either, until the same gap was found and fixed there too —
+      # see that file's own comment on this key.)
+      CONTROL_PLANE_ADMIN_KEY: ${CONTROL_PLANE_ADMIN_KEY:-}
+      # The operator's invitation routes (OperatorDependencies, server.ts) —
+      # /internal/operator/invitations and #410's trip-force-clear. Optional
+      # like the admin key above: unset leaves the routes unmounted (503)
+      # rather than failing startup.
+      CONTROL_PLANE_OPERATOR_KEY: ${CONTROL_PLANE_OPERATOR_KEY:-}
     # The secret is still mounted: the profile's file:// database reference
     # resolves to this path.
     # trip_bot_creds is mounted so the stand-down check can resolve the relay's
@@ -161,6 +173,7 @@ services:
       PROVISIONER_COMPANION_SSH_KNOWN_HOSTS: ${PROVISIONER_COMPANION_SSH_KNOWN_HOSTS:-}
       PROVISIONER_COMPANION_PROFILE_ENABLED: ${PROVISIONER_COMPANION_PROFILE_ENABLED:-}
       PROVISIONER_MCP_BRIDGE_ENABLED: ${PROVISIONER_MCP_BRIDGE_ENABLED:-}
+      PROVISIONER_BRIDGE_PROBE_MINUTES: ${PROVISIONER_BRIDGE_PROBE_MINUTES:-}
       # ShellDeployAdapter's REPO_ROOT (site/server/shared come from here) —
       # deploy.sh's own default is a host macOS path that doesn't exist
       # inside this container, so this must be set (to /repo) whenever
@@ -184,11 +197,11 @@ services:
       RPI_SSH_KEY: /root/.ssh/id_ed25519_rpi4_hermes
       PROVISIONER_LXC_IP_POOL: ${PROVISIONER_LXC_IP_POOL:-}
       PROVISIONER_LXC_HOSTNAME_DOMAIN: ${PROVISIONER_LXC_HOSTNAME_DOMAIN:-}
-      # Shared onboarding password baked into a new site's .env. Empty (the
-      # default) keeps server.js's independent random per-user passwords —
-      # which today means the site has no usable login at all, since Telegram
-      # SSO is ruled out and Google is unconfigured. Stopgap until a real
-      # member/organizer signup flow exists.
+      # RETIRED (2026-10-15). This used to become the login of EVERY new trip
+      # site. Each site now generates its own password at bootstrap and the
+      # organizer is told it; this value is ignored. It is still passed through
+      # only so the worker can say so at startup if a deployment sets it
+      # (otherwise the change would be silent). Remove it from provisioning.env.
       PROVISIONER_SEED_PASSWORD: ${PROVISIONER_SEED_PASSWORD:-}
       CONTROL_PLANE_EXCHANGE_KEY: ${CONTROL_PLANE_EXCHANGE_KEY:-}
       # Operator's Telegram chat id for the provisioning-outcome DM. The API

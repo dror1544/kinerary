@@ -25,7 +25,7 @@ const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
 const { createOAuthStore, redirectAllowed, isLoopbackHost, pkceMatches, authenticateClient, SCOPE, READ_SCOPE } = require('./oauth');
 const { renderAuthorizePage, renderErrorPage, renderConnectorInfoPage } = require('./authorize-page');
-const { registerTools, buildInstructions } = require('./tools');
+const { registerTools, buildInstructions, visibleTags } = require('./tools');
 const { normalizeOrganizers } = require('../../shared/agent-schema');
 
 
@@ -327,7 +327,10 @@ function registerTripMcp({
       const text = await r.text();
       let data = text;
       try { data = JSON.parse(text); } catch { /* not JSON */ }
-      if (!r.ok) throw new Error(`${method} ${path} → ${r.status} ${(typeof data === 'string' ? data : JSON.stringify(data)).slice(0, 300)}`);
+      // The body can quote stored text (a refusal naming a headline or an
+      // item), so the tag block goes here, where the message is made, before
+      // the cut — as well as on the tool's error path (tools.js toolError).
+      if (!r.ok) throw new Error(`${method} ${path} → ${r.status} ${visibleTags(typeof data === 'string' ? data : JSON.stringify(data)).slice(0, 300)}`);
       return data;
     };
     return {

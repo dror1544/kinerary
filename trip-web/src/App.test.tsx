@@ -293,7 +293,7 @@ describe("Modern trip SPA", () => {
     tokenStore.set("member-token");
     const fetchMock = vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
       if (url === "/api/photos") return { ok: true, status: 200, json: async () => [{
-        id: "photo-1", filename: "memory.jpg", originalName: "Memory.jpg", phase: "tokyo", caption: "First night",
+        id: "photo-1", filename: "memory.jpg", url: "/api/photos/file/memory.jpg?exp=4102444800&sig=abc", originalName: "Memory.jpg", phase: "tokyo", caption: "First night",
         username: "alice", uploadedAt: "2026-05-01T18:00:00.000Z", user: { username: "alice", name_en: "Alice", color: "#123456" },
       }] };
       if (url === "/api/reactions") return { ok: true, status: 200, json: async () => ({ "photo-1": { "❤️": ["bob"] } }) };
@@ -311,7 +311,7 @@ describe("Modern trip SPA", () => {
     expect(await screen.findByRole("heading", { name: /trip photos/i })).toBeInTheDocument();
     expect(await screen.findByText("First night")).toBeInTheDocument();
     expect(screen.getByText("Great photo")).toBeInTheDocument();
-    expect(screen.getByRole("img", { name: "First night" })).toHaveAttribute("src", "/api/photos/file/memory.jpg");
+    expect(screen.getByRole("img", { name: "First night" })).toHaveAttribute("src", "/api/photos/file/memory.jpg?exp=4102444800&sig=abc");
     fireEvent.click(screen.getByRole("button", { name: /react with ❤️/i }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/reactions/photo-1", expect.objectContaining({ method: "POST" })));
     vi.unstubAllGlobals();

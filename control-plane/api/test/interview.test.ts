@@ -36,7 +36,7 @@ import {
 } from "../src/interview.js";
 import { readableDate } from "../src/intake-copy.js";
 import { applyMigrations } from "../src/migrations.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const DB_URL = testDatabaseUrl();
 const SKIP = !DB_URL;
@@ -184,7 +184,7 @@ describe("validateAnswer (unit)", () => {
   });
 
   test("travelers: a name in any script counts, not just Latin", () => {
-    const result = validateAnswer("travelers", null, null, INTAKE_QUESTIONS, [{ name: "ניר", age: 56 }]);
+    const result = validateAnswer("travelers", null, null, INTAKE_QUESTIONS, [{ name: "רון", age: 47 }]);
     assert.equal(result.ok, true);
   });
 
@@ -559,6 +559,7 @@ async function teardownFixture(fix: TestFixture) {
   await pool.query("DELETE FROM control_plane.interview_enrollments WHERE trip_id = $1", [draftTripId]);
   await pool.query("DELETE FROM control_plane.trip_memberships WHERE trip_id = $1", [draftTripId]);
   await pool.query("DELETE FROM control_plane.trips WHERE id = $1", [draftTripId]);
+  await pool.query("DELETE FROM control_plane.telegram_organizer_links WHERE user_id = $1", [ownerId]);
   await pool.query("DELETE FROM control_plane.user_identities WHERE user_id = $1", [ownerId]);
   await pool.query("DELETE FROM control_plane.users WHERE id = $1", [ownerId]);
 }
@@ -599,7 +600,7 @@ describe("startSession (DB)", () => {
 
   before(async () => {
     if (SKIP) return;
-    pool = new pg.Pool({ connectionString: DB_URL, max: 3 });
+    pool = testPool({ max: 3 });
     await runMigrations(pool);
   });
 
@@ -729,7 +730,7 @@ describe("getSession / submitAnswer / confirmIntake (DB)", () => {
 
   before(async () => {
     if (SKIP) return;
-    pool = new pg.Pool({ connectionString: DB_URL, max: 3 });
+    pool = testPool({ max: 3 });
     await runMigrations(pool);
   });
 
@@ -1138,6 +1139,113 @@ describe("getSession / submitAnswer / confirmIntake (DB)", () => {
         [fix.draftTripId],
       );
       assert.equal(rows[0]?.language, "he");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("confirming a stop with no English name still confirms, and says so in the log", { skip: SKIP }, async () => {
+    // Star e2e, 2026-10-15: a Hebrew interview confirmed the stop "קולמר" with no
+    // name_en in 2 of 3 runs and nothing anywhere said so. The confirmation must
+    // not be blocked (the organizer cannot fix a field that is the reader's job);
+    // it must be loud, and carry a count rather than the organizer's words.
+    const fix = await setupFixture(pool);
+    try {
+      const token = await issuedEnrollmentToken(fix);
+      const started = await startSession(fix.pool, token, () => {}, undefined, CHAT_ID);
+      if (!started.ok) throw new Error("unreachable");
+      await answerAllRequiredQuestions(fix.pool, started.sessionToken);
+      const stops = await submitAnswer(fix.pool, started.sessionToken, "phases", null, undefined, undefined, [
+        { name: "קולמר", start: "2026-09-06", end: "2026-09-20" },
+      ]);
+      assert.equal(stops.ok, true);
+
+      const lines: string[] = [];
+      const confirmed = await confirmIntake(fix.pool, started.sessionToken, (line) => lines.push(line));
+      assert.equal(confirmed.ok, true);
+
+      const warn = lines.find((l) => l.includes("interview.stop_without_english_name"));
+      assert.ok(warn, `expected a stop_without_english_name warning, got: ${lines.join(" | ")}`);
+      assert.match(warn, /"stops_missing_name_en":1/);
+      assert.equal(warn.includes("קולמר"), false, "the log carries a count, not the organizer's words");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("confirming stops that all have an English name logs no warning", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const token = await issuedEnrollmentToken(fix);
+      const started = await startSession(fix.pool, token, () => {}, undefined, CHAT_ID);
+      if (!started.ok) throw new Error("unreachable");
+      await answerAllRequiredQuestions(fix.pool, started.sessionToken);
+      await submitAnswer(fix.pool, started.sessionToken, "phases", null, undefined, undefined, [
+        { name: "קולמר", name_en: "Colmar", start: "2026-09-06", end: "2026-09-20" },
+      ]);
+      const lines: string[] = [];
+      const confirmed = await confirmIntake(fix.pool, started.sessionToken, (line) => lines.push(line));
+      assert.equal(confirmed.ok, true);
+      assert.equal(lines.some((l) => l.includes("stop_without_english_name")), false);
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("confirming a Hebrew interview whose travellers lack a form of their name still confirms, and says so by count", { skip: SKIP }, async () => {
+    // Owner's manual test, 2026-10-15: a Hebrew interview confirmed
+    // [{Dror Aloul, name_en}, {Hagit Mali Aloul, name_en}, {צחי סער}, {ליאב סער}] —
+    // two in English letters, two in Hebrew with no name_en. Loud, not blocking,
+    // and the log carries counts, never the family's names.
+    const fix = await setupFixture(pool);
+    try {
+      const token = await issuedEnrollmentToken(fix);
+      const started = await startSession(fix.pool, token, () => {}, undefined, CHAT_ID);
+      if (!started.ok) throw new Error("unreachable");
+      await setLanguageForChat(fix.pool, CHAT_ID, "he");
+      await answerAllRequiredQuestions(fix.pool, started.sessionToken);
+      const roster = await submitAnswer(fix.pool, started.sessionToken, "travelers", null, undefined, undefined, [
+        { name: "Dror Aloul", name_en: "Dror Aloul" },
+        { name: "Hagit Mali Aloul", name_en: "Hagit Mali Aloul" },
+        { name: "צחי סער" },
+        { name: "ליאב סער" },
+      ]);
+      assert.equal(roster.ok, true);
+      assert.equal((await submitAnswer(fix.pool, started.sessionToken, "organizer_identity", "Dror Aloul")).ok, true);
+
+      const lines: string[] = [];
+      const confirmed = await confirmIntake(fix.pool, started.sessionToken, (line) => lines.push(line));
+      assert.equal(confirmed.ok, true);
+
+      const warn = lines.find((l) => l.includes("interview.traveler_without_name_form"));
+      assert.ok(warn, `expected a traveler_without_name_form warning, got: ${lines.join(" | ")}`);
+      assert.match(warn, /"travelers_missing_interview_language_name":2/);
+      assert.match(warn, /"travelers_missing_name_en":2/);
+      for (const word of ["Dror", "Aloul", "צחי", "סער"]) {
+        assert.equal(warn.includes(word), false, `the log carries counts, not ${word}`);
+      }
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("confirming travellers who each carry both names logs no warning", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const token = await issuedEnrollmentToken(fix);
+      const started = await startSession(fix.pool, token, () => {}, undefined, CHAT_ID);
+      if (!started.ok) throw new Error("unreachable");
+      await setLanguageForChat(fix.pool, CHAT_ID, "he");
+      await answerAllRequiredQuestions(fix.pool, started.sessionToken);
+      await submitAnswer(fix.pool, started.sessionToken, "travelers", null, undefined, undefined, [
+        { name: "דרור אלול", name_en: "Dror Aloul" },
+        { name: "צחי סער", name_en: "Tzachi Saar" },
+      ]);
+      await submitAnswer(fix.pool, started.sessionToken, "organizer_identity", "דרור אלול");
+      const lines: string[] = [];
+      const confirmed = await confirmIntake(fix.pool, started.sessionToken, (line) => lines.push(line));
+      assert.equal(confirmed.ok, true);
+      assert.equal(lines.some((l) => l.includes("traveler_without_name_form")), false);
     } finally {
       await teardownFixture(fix);
     }
@@ -1884,7 +1992,7 @@ describe("the organizer is someone on the roster (DB)", () => {
 
   before(async () => {
     if (SKIP) return;
-    pool = new pg.Pool({ connectionString: DB_URL, max: 3 });
+    pool = testPool({ max: 3 });
     await runMigrations(pool);
   });
 
@@ -1940,7 +2048,7 @@ describe("the organizer is someone on the roster (DB)", () => {
       assert.equal(answered.ok, true);
       if (!answered.ok) throw new Error("unreachable");
       assert.equal(await storedOrganizer(fix.pool, sessionId), "דנה", "kept as written, so asking again can quote it");
-      assert.equal(answered.view.unsettled?.organizer_identity, "דנה");
+      assert.equal(answered.view.unsettled?.organizer_identity?.text, "דנה");
       assert.equal(answered.view.nextQuestion?.id, "organizer_identity", "the question comes back");
       assert.deepEqual(answered.view.choices?.organizer_identity?.map((c) => c.value), ["Dana", "Dina"]);
 
@@ -1978,7 +2086,7 @@ describe("the organizer is someone on the roster (DB)", () => {
       const early = await submitAnswer(fix.pool, sessionToken, "organizer_identity", "ניר");
       assert.equal(early.ok, true);
       if (!early.ok) throw new Error("unreachable");
-      assert.equal(early.view.unsettled?.organizer_identity, "ניר", "no roster yet to name anyone from");
+      assert.equal(early.view.unsettled?.organizer_identity?.text, "ניר", "no roster yet to name anyone from");
 
       await submitAnswer(fix.pool, sessionToken, "travelers", null, undefined, undefined, [
         { name: "Nir", name_en: "Nir", age: 40 },
@@ -1996,7 +2104,7 @@ describe("the trip's dates are in order (DB)", () => {
 
   before(async () => {
     if (SKIP) return;
-    pool = new pg.Pool({ connectionString: DB_URL, max: 3 });
+    pool = testPool({ max: 3 });
     await runMigrations(pool);
   });
 
@@ -2016,7 +2124,7 @@ describe("the trip's dates are in order (DB)", () => {
       const reversed = await submitAnswer(fix.pool, sessionToken, "departure_date", "2027-07-12");
       assert.equal(reversed.ok, true);
       if (!reversed.ok) throw new Error("unreachable");
-      assert.equal(reversed.view.unsettled?.return_date, "2027-07-01", "the departure arriving second re-opens the return");
+      assert.equal(reversed.view.unsettled?.return_date?.text, "2027-07-01", "the departure arriving second re-opens the return");
       assert.equal(reversed.view.nextQuestion?.id, "return_date");
 
       const refused = await confirmIntake(fix.pool, sessionToken);

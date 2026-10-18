@@ -6,7 +6,7 @@ import { applyMigrations } from "../src/migrations.js";
 import { correctIntake } from "../src/intake-correction.js";
 import { generatePlan } from "../src/planner.js";
 import { issueApproval } from "../src/plan-approval.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const DB_URL = testDatabaseUrl();
 const SKIP = !DB_URL;
@@ -117,7 +117,7 @@ describe("correctIntake", () => {
 
   before(async () => {
     if (SKIP) return;
-    pool = new pg.Pool({ connectionString: DB_URL });
+    pool = testPool();
     await runMigrations(pool);
   });
 

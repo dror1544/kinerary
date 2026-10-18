@@ -53,7 +53,7 @@ test("a real extraction of the fixture conforms to the site's day/venue contract
   const result = await extractItinerary({
     destination: "Japan",
     phases: PHASES,
-    travelers: ["Nir", "Ella", "Noa", "Maya", "Shai"],
+    travelers: ["Ron", "Tali", "Yael", "Dana", "Gal"],
     documentText,
   });
 

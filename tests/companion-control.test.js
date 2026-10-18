@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { before, after, test } from 'node:test';
 import { createServer } from 'node:http';
 import { startTestServer, stopTestServer, api, loginAsAlice } from './helpers/server.js';
-import { PORTS } from './helpers/ports.js';
+import { freePort } from './helpers/port-guard.js';
 let owner, member, sidecar, requests = [], unavailable = false;
 const state = { scheduler_running: true, tasks: [{ id: 'trip-task', label: { he: 'עדכון בוקר', en: 'Morning update' }, audience: 'group', enabled: true, schedule: 'Daily at 08:00', timezone: 'Asia/Tokyo', next_run: '2026-09-14T08:00:00+09:00', prompt: 'must never reach browser' }] };
 before(async () => {
@@ -18,7 +18,7 @@ before(async () => {
     res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(state));
   });
   await new Promise(resolve => sidecar.listen(0, '127.0.0.1', resolve));
-  await startTestServer({ PORT: PORTS.companionControl, COMPANION_CONTROL_URL: `http://127.0.0.1:${sidecar.address().port}`, COMPANION_CONTROL_TOKEN: 'test-control-token' });
+  await startTestServer({ PORT: await freePort(), COMPANION_CONTROL_URL: `http://127.0.0.1:${sidecar.address().port}`, COMPANION_CONTROL_TOKEN: 'test-control-token' });
   owner = await loginAsAlice();
   member = (await (await api('/api/auth/login', { method: 'POST', body: { username: 'bob', password: '1234' } })).json()).token;
 });

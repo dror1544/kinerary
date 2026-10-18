@@ -4,7 +4,7 @@
  * 2026-09-12: an organizer finished an interview, got the site's password in
  * the assistant's introduction, opened the site — and found a form asking for a
  * username. The accounts are the travellers and their usernames are DERIVED
- * from their names (`ella`, `nirsolomon`), so there was nothing to type and no
+ * from their names (`tali`, `ronmargolin`), so there was nothing to type and no
  * way to find out. Classic has offered a picker from `/api/config/roster` all
  * along; this is the same roster, on the modern screen.
  */
@@ -34,8 +34,8 @@ describe("the login screen", () => {
       if (String(input).includes("/api/config/roster")) {
         return new Response(JSON.stringify({
           participants: [
-            { username: "nirsolomon", name: "ניר סולומון" },
-            { username: "ella", name: "אלה" },
+            { username: "ronmargolin", name: "רון מרגולין" },
+            { username: "tali", name: "טלי" },
           ],
         }), { headers: { "content-type": "application/json" } });
       }
@@ -43,11 +43,11 @@ describe("the login screen", () => {
     }));
 
     renderLoggedOut();
-    const chip = await screen.findByRole("button", { name: "אלה" });
+    const chip = await screen.findByRole("button", { name: "טלי" });
     fireEvent.click(chip);
     await waitFor(() => {
       const field = screen.getByLabelText(/Username/i) as HTMLInputElement;
-      expect(field.value).toBe("ella");
+      expect(field.value).toBe("tali");
     });
   });
 
@@ -55,6 +55,6 @@ describe("the login screen", () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ error: "nope" }), { status: 500 })));
     renderLoggedOut();
     expect(await screen.findByLabelText(/Username/i)).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "אלה" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "טלי" })).toBeNull();
   });
 });

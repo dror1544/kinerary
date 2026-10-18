@@ -7,7 +7,7 @@ import { buildApp, type ChatRoutingDependencies, type InterviewDependencies } fr
 import { validateArchitectureProfile } from "../src/config.js";
 import { issueEnrollment } from "../src/enrollment.js";
 import { applyMigrations } from "../src/migrations.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const skip = !databaseUrl;
@@ -24,7 +24,7 @@ test("POST /internal/telegram-interviews/bind returns 503 without both internal 
 });
 
 test("POST /internal/telegram-interviews/bind authenticates, validates, and creates one active binding", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   try {
     await pool.query("DROP SCHEMA IF EXISTS control_plane CASCADE");
     await pool.query("DROP TABLE IF EXISTS public.control_plane_schema_migrations");

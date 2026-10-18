@@ -24,6 +24,7 @@ import { createServer, type IncomingMessage, type Server } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import { structuredLog } from "../redaction.js";
 import { detectInternalLeak } from "./internal-leak.js";
+import { ExplicitTurns, silenceVerdict } from "./stay-silent.js";
 import {
   decodeFrame,
   encodeFrame,
@@ -34,7 +35,30 @@ import {
   type OutboundResult,
   type WireMessageEvent,
 } from "./protocol.js";
-import type { TelegramClient } from "./telegram-api.js";
+import { TIMEOUT_ERROR, type TelegramClient } from "./telegram-api.js";
+
+/**
+ * What the gateway is told when a send or edit to Telegram TIMED OUT (#225,
+ * round 2). Not the client's bare word "TIMEOUT": Hermes reads the error string
+ * with its own classifier (gateway/platforms/base.py, `_is_timeout_error` and
+ * `_is_retryable_error`), and "timeout" is neither - so it fell to the
+ * plain-text fallback and re-sent the reply, prefixed "(Response formatting
+ * failed, plain text:)". A timed-out send may well have been delivered, so the
+ * family could see the reply twice. "timed out" is what Hermes reads as a
+ * timeout - returned as-is, never retried, never re-sent, exactly as its own 30 s
+ * "relay outbound timed out" was before - and the phrase carries none of its
+ * retryable words ("network", "connecttimeout" and the rest). Fixed, like the
+ * word it replaces: no URL, no token. Only the gateway sees it; the interview
+ * reads the client's result directly and still gets a transient failure.
+ */
+export const GATEWAY_TIMEOUT_ERROR = "telegram call timed out";
+
+/** The client's error, in words the gateway classifies correctly. */
+function gatewayError(error: string | undefined, fallback: string): string {
+  if (error === TIMEOUT_ERROR) return GATEWAY_TIMEOUT_ERROR;
+  return error ?? fallback;
+}
+import type { ReplyObserver } from "../analytics/emitter.js";
 
 /**
  * A `Content-Disposition` value that Node will actually accept.
@@ -128,6 +152,35 @@ export interface ConnectorOptions {
    * the organizer is lost, and a turn that spoke is not mistaken for a stall.
    */
   interviewSay?: (chatId: string, text: string) => Promise<boolean>;
+  /**
+   * Records whether the assistant's last companion (group) send expects a
+   * reply, so the router's addressing gate can auto-capture the very next
+   * message in that chat for one turn (migration 0053). `expects` mirrors
+   * `SendAction.expectsReply`.
+   *
+   * Never called on an interview chat — that branch above returns before
+   * reaching Telegram at all, so this option only ever sees companion sends.
+   * A predicate/setter pair rather than a database handle, same reasoning as
+   * `interviewChat`/`interviewSay`: the connector's job is the wire.
+   */
+  setExpectsReply?: (chatId: string, expects: boolean) => Promise<void>;
+  /**
+   * Called after every companion send that reached Telegram, to renew the
+   * per-person conversation window on the chat's binding (the member the
+   * assistant is talking with keeps being heard without its name for five
+   * minutes after its last message). Unlike `setExpectsReply` it does not
+   * depend on whether the message was a question. Same failure rule: a write
+   * error is logged and never turns a delivered message into a failure. Never
+   * called on an interview chat.
+   */
+  renewConversation?: (chatId: string) => Promise<void>;
+  /**
+   * The relay's assistant-event emitter (#177), told what became of each
+   * companion `send` once Telegram has answered. Synchronous and unable to
+   * throw, so the reply's own result is never delayed by it. Absent — the
+   * default — records nothing. Never called for an interview chat.
+   */
+  assistantEvents?: ReplyObserver;
 }
 
 export class RelayConnector {
@@ -144,6 +197,8 @@ export class RelayConnector {
    */
   private readonly gateways = new Map<string, Set<WebSocket>>();
   private readonly log: (line: string) => void;
+  /** Which forwarded group turns named the assistant, so a silence reply to one is counted (stay-silent.ts). */
+  private readonly explicitTurns = new ExplicitTurns();
   private readonly path: string;
 
   constructor(private readonly options: ConnectorOptions) {
@@ -415,16 +470,41 @@ export class RelayConnector {
           return { success: true };
         }
 
-        const leak = detectInternalLeak(action.content);
+        // The companion chose not to answer a message in the conversation
+        // window that was not meant for it (stay-silent.ts). Nothing goes to
+        // Telegram, success goes back to the gateway (its per-request future has
+        // to resolve), and NOTHING else changes: the conversation window is not
+        // renewed and the "?" window is neither opened nor cleared, because the
+        // companion said nothing. Booleans only in the log.
+        const verdict = silenceVerdict(action.content);
+        if (verdict.kind === "silent") {
+          this.log(structuredLog("info", "trip_bot.companion_stayed_silent", { silent: true }));
+          // Silence on a message that NAMED the assistant is a defect, not a
+          // judgement call: nothing can be sent (no answer to invent), but it is
+          // logged and recorded so the daily report counts it. Booleans only.
+          const onAddressed = this.explicitTurns.wasExplicit(action.chat_id, action.reply_to);
+          if (onAddressed) this.log(structuredLog("warn", "trip_bot.silence_on_addressed_turn", { silent: true }));
+          this.options.assistantEvents?.replySent(
+            action.chat_id, "suppressed", action.content.length, action.reply_to,
+            onAddressed ? { silentOnAddressed: true } : undefined,
+          );
+          return { success: true };
+        }
+        const content = verdict.content;
+
+        const leak = detectInternalLeak(content);
         if (leak.leaks) {
           this.log(structuredLog("warn", "relay.internal_leak_suppressed", {
             matched: leak.term ?? "",
           }));
+          this.options.assistantEvents?.replySent(action.chat_id, "suppressed", content.length, action.reply_to);
           // Reported as delivered on purpose: the gateway's per-request future
           // has to resolve, and this is not a transport failure it could
           // usefully retry.
           return { success: true };
         }
+        // A send that THROWS is a failed delivery too: recorded, then rethrown
+        // untouched so onOutbound answers the gateway exactly as before.
         const sent = await telegram.sendMessage({
           chatId: action.chat_id,
           // Agent-authored, so it is written in the dialect TELEGRAM_DESCRIPTOR
@@ -448,25 +528,70 @@ export class RelayConnector {
           // message reached the organizer as "יש בעיה טכנית עם הדפדפן שלי\." and
           // a link written "japan\-2026\.ara\-united\.store". Raw here; the
           // dialect is honoured one layer down, once.
-          text: action.content,
+          text: content,
           replyTo: action.reply_to,
           parseMode: "MarkdownV2",
+        }).catch((error: unknown) => {
+          this.options.assistantEvents?.replySent(action.chat_id, "failed", content.length, action.reply_to);
+          throw error;
         });
+        this.options.assistantEvents?.replySent(
+          action.chat_id, sent.ok ? "delivered" : "failed", content.length, action.reply_to,
+        );
+        // Only a message that actually reached Telegram may open (or clear) a
+        // capture window — a failed send asked nothing, so nothing here
+        // should change. A write failure is logged and swallowed: the send
+        // itself already succeeded or failed on its own terms, and there is
+        // nothing about this side-effect worth reporting a delivered message
+        // as failed over.
+        if (sent.ok && this.options.setExpectsReply) {
+          try {
+            await this.options.setExpectsReply(action.chat_id, action.expectsReply);
+            // The "?" window is the only one of the two that was invisible: a
+            // missed capture could not be told from a window that never opened.
+            if (action.expectsReply) this.log(structuredLog("info", "relay.reply_window_opened", { expects: true }));
+          } catch (error) {
+            this.log(structuredLog("warn", "relay.expects_reply_write_failed", {
+              safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+            }));
+          }
+        }
+        // The per-person conversation window: every delivered companion send,
+        // question or not, pushes its deadline out (a no-op unless a
+        // conversation is open). Separate from the "?" window above on
+        // purpose - a statement clears that one and must not touch this one.
+        if (sent.ok && this.options.renewConversation) {
+          try {
+            await this.options.renewConversation(action.chat_id);
+          } catch (error) {
+            this.log(structuredLog("warn", "relay.conversation_renew_failed", {
+              safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+            }));
+          }
+        }
         return sent.ok
           ? { success: true, message_id: sent.messageId }
-          : { success: false, error: sent.error ?? "SEND_FAILED" };
+          : { success: false, error: gatewayError(sent.error, "SEND_FAILED") };
       }
       case "edit": {
+        // The sentinel must not reach the chat through an edit either (a
+        // streaming reply edits a message into its final text). Silence on an
+        // edit leaves the message as it stands.
+        const editVerdict = silenceVerdict(action.content);
+        if (editVerdict.kind === "silent") {
+          this.log(structuredLog("info", "trip_bot.companion_stayed_silent", { silent: true }));
+          return { success: true };
+        }
         const edited = await telegram.editMessageText({
           chatId: action.chat_id,
           messageId: action.message_id,
           // Same reason as `send`: an edit is agent prose too, and an edit that
           // fails to parse leaves the ORIGINAL message on screen, so the loss
           // is even quieter. Escaped once, by telegram-api.ts.
-          text: action.content,
+          text: editVerdict.content,
           parseMode: "MarkdownV2",
         });
-        return edited.ok ? { success: true } : { success: false, error: edited.error ?? "EDIT_FAILED" };
+        return edited.ok ? { success: true } : { success: false, error: gatewayError(edited.error, "EDIT_FAILED") };
       }
       case "typing":
         await telegram.sendChatAction({ chatId: action.chat_id });
@@ -496,7 +621,7 @@ export class RelayConnector {
    * should tell the organizer rather than leave them waiting on an answer that
    * will never come.
    */
-  pushInbound(event: WireMessageEvent): boolean {
+  pushInbound(event: WireMessageEvent, turn?: { explicit?: boolean }): boolean {
     const profile = event.source.profile;
     const targets = this.socketsFor(profile);
     let delivered = false;
@@ -504,6 +629,12 @@ export class RelayConnector {
       if (ws.readyState !== ws.OPEN) continue;
       this.send(ws, { type: "inbound", event });
       delivered = true;
+    }
+    // Remembered only for a turn that reached a companion, and only when the
+    // caller says what it was (a group turn): the companion's silence reply is
+    // judged against it in performAction.
+    if (delivered && turn && event.source.chat_id) {
+      this.explicitTurns.note(event.source.chat_id, event.message_id, turn.explicit === true);
     }
     if (!delivered) {
       this.log(

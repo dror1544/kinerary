@@ -8,7 +8,8 @@ import { issueApproval } from "../src/plan-approval.js";
 import { claimJob, heartbeat, recoverStaleLeases, recoverExpiredApprovals, completeJob, failJob } from "../src/job-queue.js";
 import { buildReleaseManifest, type PayloadSource } from "../src/release-artifact.js";
 import { promoteRelease, registerCandidateRelease } from "../src/release-registry.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { executeClear, previewClear } from "../src/trip-clear.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const DB_URL = testDatabaseUrl();
 const SKIP = !DB_URL;
@@ -124,6 +125,12 @@ async function restoreAvailableReleases(_fix: PlannerFixture, hidden: HiddenRele
 
 async function teardownFixture(fix: PlannerFixture) {
   const { pool, tripId, ownerId, releaseId } = fix;
+  // R4-1's own tests (below) can leave a trip_clear_archives row behind when
+  // executeClear wins its race against generatePlan — that table's FK to
+  // trips carries no ON DELETE, so the trips row below would otherwise fail
+  // to delete with a 23503. Harmless for every other fixture here, which
+  // never has one.
+  await pool.query("DELETE FROM control_plane.trip_clear_archives WHERE trip_id = $1", [tripId]);
   await pool.query("DELETE FROM control_plane.plan_approvals WHERE plan_id IN (SELECT id FROM control_plane.plans WHERE trip_id = $1)", [tripId]);
   await pool.query("DELETE FROM control_plane.job_steps WHERE job_id IN (SELECT id FROM control_plane.jobs WHERE trip_id = $1)", [tripId]);
   await pool.query("DELETE FROM control_plane.jobs WHERE trip_id = $1", [tripId]);
@@ -131,6 +138,7 @@ async function teardownFixture(fix: PlannerFixture) {
   await pool.query("DELETE FROM control_plane.intake_versions WHERE trip_id = $1", [tripId]);
   await pool.query("DELETE FROM control_plane.trip_memberships WHERE trip_id = $1", [tripId]);
   await pool.query("DELETE FROM control_plane.trips WHERE id = $1", [tripId]);
+  await pool.query("DELETE FROM control_plane.telegram_organizer_links WHERE user_id = $1", [ownerId]);
   await pool.query("DELETE FROM control_plane.user_identities WHERE user_id = $1", [ownerId]);
   await pool.query("DELETE FROM control_plane.users WHERE id = $1", [ownerId]);
   await pool.query("DELETE FROM control_plane.releases WHERE id = $1", [releaseId]);
@@ -143,7 +151,7 @@ describe("generatePlan", () => {
 
   before(async () => {
     if (SKIP) return;
-    pool = new pg.Pool({ connectionString: DB_URL, max: 5 });
+    pool = testPool({ max: 5 });
     await runMigrations(pool);
   });
 
@@ -426,7 +434,7 @@ describe("retryProvision", () => {
 
   before(async () => {
     if (SKIP) return;
-    pool = new pg.Pool({ connectionString: DB_URL, max: 5 });
+    pool = testPool({ max: 5 });
     await runMigrations(pool);
   });
 
@@ -711,7 +719,7 @@ describe("issueApproval", () => {
 
   before(async () => {
     if (SKIP) return;
-    pool = new pg.Pool({ connectionString: DB_URL, max: 5 });
+    pool = testPool({ max: 5 });
     await runMigrations(pool);
   });
 
@@ -811,7 +819,7 @@ describe("claimJob / heartbeat / completeJob / failJob", () => {
 
   before(async () => {
     if (SKIP) return;
-    pool = new pg.Pool({ connectionString: DB_URL, max: 5 });
+    pool = testPool({ max: 5 });
     await runMigrations(pool);
   });
 
@@ -1202,6 +1210,129 @@ describe("claimJob / heartbeat / completeJob / failJob", () => {
       );
       assert.equal(afterApproval.rows[0]?.count, "1");
     } finally {
+      await teardownFixture(fix);
+    }
+  });
+});
+
+// ── generatePlan vs executeClear (issue #378, R4-1) ──────────────────────────
+//
+// Boundary review round 4 reproduced live, twice: a concurrent generatePlan
+// (an organizer confirming their interview, or an admin retry) can INSERT a
+// brand-new job after executeClear's own job lock already passed and found
+// nothing — FOR UPDATE cannot lock a row that does not exist yet. The fix
+// locks `trips` on BOTH sides (executeClear before its jobs check;
+// generatePlan as its own authoritative re-check, inside its own
+// transaction) so the two genuinely serialize on that row. These tests
+// exercise the real functions against each other, not a simulation of the
+// lock alone.
+describe("generatePlan vs executeClear — the trips lock must make them serialize (R4-1)", () => {
+  let pool: pg.Pool;
+
+  before(async () => {
+    if (SKIP) return;
+    pool = testPool({ max: 5 });
+    await runMigrations(pool);
+  });
+
+  after(async () => { if (!SKIP) await pool?.end(); });
+
+  test("racing the real functions directly never leaves an inconsistent result, whichever side wins", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const preview = await previewClear(fix.pool, fix.tripId);
+      assert.equal(preview.ok, true);
+      if (!preview.ok) return;
+      const confirmValue = preview.plan.slug;
+
+      const [genResult, clearResult] = await Promise.all([
+        generatePlan(fix.pool, fix.tripId, fix.correlationId),
+        executeClear(fix.pool, fix.tripId, confirmValue, "test:operator"),
+      ]);
+
+      if (genResult.ok) {
+        // generatePlan won the trips lock: its job must have been visible to
+        // clear's own locked jobs check, which must have refused rather than
+        // clearing past it.
+        assert.equal(clearResult.ok, false,
+          "clear must not report success once generatePlan's job actually exists");
+        if (clearResult.ok) return;
+        assert.equal(clearResult.reason, "JOB_IN_PROGRESS");
+        const job = await fix.pool.query<{ state: string }>(
+          "SELECT state FROM control_plane.jobs WHERE id = $1", [genResult.jobId]);
+        assert.equal(job.rows[0]?.state, "waiting_for_user_action", "the job must survive, untouched");
+      } else {
+        // clear won the trips lock: it must have actually succeeded, and
+        // generatePlan's own locked re-check must have seen the post-clear
+        // state and refused — never creating a job on a trip clear just reset.
+        assert.equal(clearResult.ok, true, JSON.stringify(clearResult));
+        assert.equal(genResult.reason, "TRIP_NOT_CONFIRMED");
+        const jobs = await fix.pool.query<{ n: number }>(
+          "SELECT count(*)::int AS n FROM control_plane.jobs WHERE trip_id = $1", [fix.tripId]);
+        assert.equal(jobs.rows[0]?.n, 0, "no job must exist on a trip that was genuinely cleared");
+      }
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("a job created while clear is blocked on the trips lock is caught, not missed — deterministic reproduction", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    const holder = await pool.connect();
+    try {
+      const preview = await previewClear(fix.pool, fix.tripId);
+      assert.equal(preview.ok, true);
+      if (!preview.ok) return;
+      const confirmValue = preview.plan.slug;
+
+      // Mirrors generatePlan mid-transaction, holding the SAME lock
+      // executeClear's own `trips` lock now contends for — and actually
+      // creates the plan+job it would, so the job executeClear must catch
+      // genuinely did not exist when this hold began.
+      await holder.query("BEGIN");
+      await holder.query("SELECT 1 FROM control_plane.trips WHERE id = $1 FOR UPDATE", [fix.tripId]);
+
+      const beforeJobs = await fix.pool.query<{ n: number }>(
+        "SELECT count(*)::int AS n FROM control_plane.jobs WHERE trip_id = $1", [fix.tripId]);
+      assert.equal(beforeJobs.rows[0]?.n, 0, "no job exists yet when the hold begins");
+
+      let settled = false;
+      const clearPromise = executeClear(fix.pool, fix.tripId, confirmValue, "test:operator").then((r) => {
+        settled = true;
+        return r;
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      assert.equal(settled, false, "executeClear must block on the trips lock, not race past it");
+
+      // The held transaction now does what generatePlan would — creates the
+      // plan and job, THEN commits, exactly mirroring the reviewer's
+      // "both transactions paused mid-flight" reproduction.
+      const planId = `plan_${randomHex(16)}`;
+      const jobId = `job_${randomHex(16)}`;
+      await holder.query(
+        `INSERT INTO control_plane.plans(id, trip_id, release_id, kind, digest, status, desired)
+         VALUES ($1, $2, $3, 'provision', $4, 'pending_approval', '{}'::jsonb)`,
+        [planId, fix.tripId, fix.releaseId, `sha256:${randomHex(64)}`],
+      );
+      await holder.query(
+        `INSERT INTO control_plane.jobs(id, trip_id, plan_id, job_type, idempotency_key, correlation_id, state)
+         VALUES ($1, $2, $3, 'provision', $4, $5, 'waiting_for_user_action')`,
+        [jobId, fix.tripId, planId, `idem_${randomHex(16)}`, fix.correlationId],
+      );
+      await holder.query("UPDATE control_plane.trips SET lifecycle_state = 'planned' WHERE id = $1", [fix.tripId]);
+      await holder.query("COMMIT");
+
+      const result = await clearPromise;
+      assert.equal(result.ok, false,
+        "clear must see the job that landed during the hold, never a stale 'nothing pending' read");
+      if (result.ok) return;
+      assert.equal(result.reason, "JOB_IN_PROGRESS");
+
+      const job = await fix.pool.query<{ state: string }>("SELECT state FROM control_plane.jobs WHERE id = $1", [jobId]);
+      assert.equal(job.rows[0]?.state, "waiting_for_user_action", "untouched — clear refused before touching anything");
+    } finally {
+      holder.release();
       await teardownFixture(fix);
     }
   });

@@ -181,6 +181,11 @@ CREATE TABLE public.control_plane_schema_migrations (version text PRIMARY KEY, a
 INSERT INTO public.control_plane_schema_migrations(version) VALUES ('0001_foundation.sql'), ('0002_bindings.sql');
 CREATE TABLE control_plane.trips (id text PRIMARY KEY, slug text NOT NULL UNIQUE, lifecycle_state text NOT NULL,
   reachability text NOT NULL DEFAULT 'reachable',
+  unreachable_reason text, reachability_checked_at timestamptz,
+  CONSTRAINT trips_reachability_check CHECK (reachability IN ('unknown', 'reachable', 'unreachable')),
+  CONSTRAINT trips_unreachable_reason_check CHECK (
+    (reachability = 'unreachable' AND unreachable_reason IS NOT NULL)
+    OR (reachability <> 'unreachable' AND unreachable_reason IS NULL)),
   created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now());
 CREATE TABLE control_plane.telegram_chat_bindings (id text PRIMARY KEY, trip_id text NOT NULL, chat_id text NOT NULL,
   hermes_profile text, closed_at timestamptz, created_at timestamptz NOT NULL DEFAULT now());

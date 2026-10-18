@@ -27,9 +27,25 @@ class LxcSpec:
     # Trip media (avatars/photos) storage: nfs_host_dir already lives on the
     # NFS mount Proxmox itself has (confirmed live: /mnt/pve/truenas-nfs/...,
     # a subdirectory there is all a new trip needs — no separate TrueNAS-side
-    # provisioning). nfs_mount_path is where the container sees it (mp0).
+    # provisioning). nfs_mount_path is where the container sees it (mp0). Both
+    # are named by trip id, never by slug: a slug is the organizer's words,
+    # deliberately reusable once teardown frees it, and an id cannot collide.
     nfs_host_dir: str
     nfs_mount_path: str
+    # The human name, for the one place a slug still belongs: the container's
+    # OWN filesystem (TRIP_DIR, the TRIP.txt marker) — not NFS, so it is not
+    # this dataclass's other paths, and it is what a person actually reads.
+    # Always the topology's own top-level `name`; never a second source of
+    # truth to fall out of sync with it.
+    trip_slug: str = ""
+    # The https origin the trip is served on (no path), e.g. https://<host>.
+    # Never a YAML key: it is computed from the topology's own public hostname
+    # so it cannot drift from the proxy host. The site writes it to .env as
+    # PUBLIC_ORIGIN, which is the OAuth issuer of its member MCP connector
+    # (server/trip-mcp), together with TRIP_MCP_ENABLED=1. Empty (a hand-built
+    # spec with no hostname) leaves the connector off: a guessed origin would
+    # be an issuer no assistant could reach.
+    public_origin: str = ""
 
 
 @dataclass(frozen=True)
@@ -126,6 +142,8 @@ def load_topology(raw: Mapping[str, Any]) -> Topology:
             nameserver=_nonempty_string(lxc, "nameserver", "proxmox.lxc"),
             nfs_host_dir=_nonempty_string(lxc, "nfs_host_dir", "proxmox.lxc"),
             nfs_mount_path=_nonempty_string(lxc, "nfs_mount_path", "proxmox.lxc"),
+            trip_slug=name,
+            public_origin=f"https://{_nonempty_string(proxy, 'hostname', 'npm')}",
         ),
         proxy=ProxySpec(
             hostname=_nonempty_string(proxy, "hostname", "npm"),

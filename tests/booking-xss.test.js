@@ -148,3 +148,89 @@ describe('buildBookingRow() — escaping', () => {
     assert.ok(html.includes('&lt;img'), 'date_from should be HTML-escaped');
   });
 });
+
+// ── Third boundary review 2026-10-11, finding A ────────────────────────────
+// PIN and passengers went into the Bookings tab's innerHTML raw. Both are
+// writable by the organizer/agent key (POST/PATCH /api/bookings, the mcp
+// add_booking/update_booking tools) and by the extract-draft route, which fills
+// them from an uploaded PDF and shows them to members once approved. Live proof
+// on the review: the two payloads below rendered as live elements.
+const REVIEW_PAX = '<img src=x onerror=alert("pax")>';
+const REVIEW_PIN = '<svg onload=alert("pin")>';
+const HOSTILE = ['<img src=x onerror=alert(1)>', 'x" onmouseover="alert(1)', "' autofocus onfocus='alert(1)", 'javascript:alert(1)', "x');alert(1);//"];
+
+function rowDom(ctx, b, canEdit = true) {
+  const win = new Window({ url: 'http://localhost/' });
+  const table = win.document.createElement('table');
+  table.innerHTML = ctx.buildBookingRow(b, canEdit);
+  return table;
+}
+
+function assertRowInert(root) {
+  assert.equal(root.querySelectorAll('img[src="x"], svg, script, iframe').length, 0, root.innerHTML);
+  for (const el of root.querySelectorAll('*')) {
+    for (const attr of el.getAttributeNames()) {
+      assert.ok(!/^on/i.test(attr), `${el.tagName} carries ${attr}: ${el.outerHTML}`);
+      assert.ok(!/autofocus|alert|["'=();]/i.test(attr), `${el.tagName} grew an attribute named ${attr}: ${el.outerHTML}`);
+    }
+  }
+}
+
+describe('buildBookingRow() — PIN and passengers (finding A)', () => {
+  test('the exact payloads from the review render as text, not elements', () => {
+    const ctx = makeContext();
+    const root = rowDom(ctx, { id: 1, type: 'flight', name: 'LY 001', passengers: REVIEW_PAX, pin: REVIEW_PIN });
+    assertRowInert(root);
+    const cells = root.querySelectorAll('td');
+    assert.equal(cells[2].textContent, REVIEW_PAX, 'passengers shown exactly as typed');
+    assert.ok(cells[3].textContent.includes(`PIN: ${REVIEW_PIN}`), 'the PIN shown exactly as typed');
+  });
+
+  for (const v of HOSTILE) {
+    test(`${JSON.stringify(v)} as passengers, PIN and booking id`, () => {
+      const ctx = makeContext();
+      const root = rowDom(ctx, { id: v, type: 'hotel', name: 'Hotel', passengers: v, pin: v });
+      assertRowInert(root);
+      const cells = root.querySelectorAll('td');
+      assert.equal(cells[2].textContent, v);
+      assert.equal(cells[3].querySelector('span').textContent, `PIN: ${v}`);
+      const [edit, del] = root.querySelectorAll('button');
+      assert.deepEqual([edit.getAttribute('onclick'), edit.dataset.act, edit.dataset.arg], [null, 'booking-edit', v], 'the id reaches its handler as data');
+      assert.deepEqual([del.getAttribute('onclick'), del.dataset.act, del.dataset.arg], [null, 'booking-del', v]);
+    });
+  }
+
+  test('positive control: an ordinary booking row, an & shown once', () => {
+    const ctx = makeContext();
+    const root = rowDom(ctx, { id: 12, type: 'flight', name: 'TLV → JFK', passengers: '2 adults & 1 child', pin: '4321', cost: 1500, date_from: '2027-03-10' });
+    const cells = root.querySelectorAll('td');
+    assert.equal(cells[2].textContent, '2 adults & 1 child');
+    assert.equal(cells[3].textContent, 'PIN: 4321');
+    assert.equal(cells[4].textContent, `$${(1500).toLocaleString()}`);
+    assert.equal(root.querySelector('[data-act="booking-edit"]').dataset.arg, '12');
+  });
+
+  test('a booking with no passengers still shows the dash, and a read-only viewer gets no buttons', () => {
+    const ctx = makeContext();
+    const root = rowDom(ctx, { id: 3, type: 'car', name: 'Car' }, false);
+    assert.equal(root.querySelectorAll('td')[2].textContent, '–');
+    assert.equal(root.querySelectorAll('button').length, 0);
+  });
+});
+
+describe('loadBookings() — a booking\'s phase heading is text', () => {
+  for (const v of HOSTILE) {
+    test(`phase ${JSON.stringify(v)}`, async () => {
+      const ctx = makeContext({
+        fetch: async () => ({ ok: true, json: async () => [{ id: 1, phase: v, type: 'flight', name: 'X' }] }),
+        T: { he: {}, en: {} }, currentLang: 'en',
+      });
+      ctx.document.body.innerHTML = '<div id="bookings-content"></div>';
+      ctx.window.TRIP_CONFIG = { phases: [] };
+      await ctx.loadBookings();
+      const el = ctx.document.getElementById('bookings-content');
+      assertRowInert(el);
+      assert.equal(el.querySelector('h3').textContent, v);
+    });
+  }
+});

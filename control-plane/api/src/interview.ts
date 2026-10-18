@@ -1,8 +1,15 @@
 import { createHash, randomBytes } from "node:crypto";
-import { resolveOrganizer, rosterChoices, type OrganizerMatch, type RosterChoice } from "./organizer-identity.js";
+import { normalizeIdentity, resolveOrganizer, rosterChoices, rosterChoicesFor, type OrganizerMatch, type RosterChoice } from "./organizer-identity.js";
+import { LIVE_INTAKE_SESSION_PREDICATE } from "./organizer-trips.js";
 import type pg from "pg";
 import { assertCanonicalRecordSafe, UnsafeCanonicalRecordError } from "./canonical.js";
+// The country_reference key. Shared, not local, because destination-info-store's
+// fan-out UPDATE has to address the very rows saveConsularContacts writes here —
+// see country-key.ts for what divergence costs.
+import { normaliseCountryKey as normaliseCountry } from "./country-key.js";
 import { consumeEnrollmentInTx } from "./enrollment.js";
+import { isPrivateChatId } from "./identity.js";
+import { linkTelegramOrganizerInTx } from "./organizer-trips.js";
 import {
   coerceLanguage,
   DEFAULT_LANGUAGE,
@@ -13,6 +20,57 @@ import {
   type Language,
 } from "./intake-copy.js";
 import { structuredLog } from "./redaction.js";
+import { listTripDocuments } from "./document-registry.js";
+import { canonical, entryIdentity, stripVisitMarkers } from "./answer-merge.js";
+import { applyOps, draftDigest, warningLines, type Line, type Op } from "./typed-changes.js";
+import { listAnswerSources, type SourceDisposition } from "./answer-provenance.js";
+
+/**
+ * Which documents support which confirmed answers, pinned to the version being
+ * confirmed.
+ *
+ * Provenance rows name an entry by its identity (answer-merge.ts
+ * `entryIdentity`). That is right while an answer is still changing, and wrong
+ * for anything downstream: the provisioning worker is Python, and re-deriving
+ * "the same entry" there would be a second copy of the identity rules, free to
+ * drift from this one. So identity is resolved ONCE, here, against the answers
+ * this version freezes, into a plain index into that answer's list. The version
+ * is immutable, so the index is too.
+ *
+ * A source whose entry no longer resolves to exactly one entry — renamed,
+ * removed, or now indistinguishable from another — is left out rather than
+ * guessed. A missing link reads as "no source shown"; a guessed one would put
+ * one hotel's voucher on another hotel's card.
+ */
+async function confirmedSources(
+  db: Pick<pg.PoolClient, "query">,
+  tripId: string,
+  answers: AnswerStore,
+): Promise<{ questionId: string; index: number | null; documentId: string; disposition: SourceDisposition; paths: string[] }[]> {
+  const strength: Partial<Record<SourceDisposition, number>> = { accepted: 3, filled: 2, unchanged: 1 };
+  const chosen = new Map<string, { questionId: string; index: number | null; documentId: string; disposition: SourceDisposition; paths: string[] }>();
+  for (const row of await listAnswerSources(db, tripId)) {
+    if (!strength[row.disposition]) continue;
+    const answer = answers[row.questionId] as { data?: unknown } | undefined;
+    if (!answer) continue;
+    let index: number | null = null;
+    if (row.entryKey !== "") {
+      const data = Array.isArray(answer.data) ? answer.data : [];
+      const matches = data.flatMap((entry, i) => (entryIdentity(entry) === row.entryKey ? [i] : []));
+      if (matches.length !== 1) continue;
+      index = matches[0]!;
+    }
+    const key = `${row.questionId}|${index ?? ""}|${row.documentId}`;
+    const held = chosen.get(key);
+    // Which fields a document supplied is kept across its rows: a voucher that
+    // FILLED an accommodation is the right source for a hotel card, where the
+    // plan that merely named the stay is not.
+    const paths = [...new Set([...(held?.paths ?? []), ...row.paths])];
+    const disposition = !held || strength[row.disposition]! > strength[held.disposition]! ? row.disposition : held.disposition;
+    chosen.set(key, { questionId: row.questionId, index, documentId: row.documentId, disposition, paths });
+  }
+  return [...chosen.values()];
+}
 
 function generateId(prefix: string): string {
   return `${prefix}_${randomBytes(16).toString("hex")}`;
@@ -184,6 +242,16 @@ export interface IntakeQuestion {
    */
   checkComplete?: (data: unknown) => string | null;
   /**
+   * A deterministic correction applied to a STRUCTURED answer before it is
+   * stored, whatever produced it.
+   *
+   * For rules that are decidable in code. A model may propose the value — it
+   * is good at spotting that "VN572" is in the sentence — but where the rule
+   * for what that value MEANS is written down, code decides, rather than the
+   * test suite sampling model variance more often.
+   */
+  sanitize?: (data: unknown) => unknown;
+  /**
    * Marks this question safe for the router to ask entirely on its own —
    * no agent nomination, no agent judgment, asked the moment it is next and
    * nothing else is pending. The architectural rule: the agent owns
@@ -232,6 +300,14 @@ export interface IntakeQuestion {
   canonicalize?: (answers: AnswerStore) => IntakeAnswer | null;
   /** Buttons for a TEXT or STRUCTURED question, drawn from what is already recorded. */
   choicesFrom?: (answers: AnswerStore) => RosterChoice[];
+  /**
+   * Which WAY an unsettled answer on record fails to settle this question, for
+   * `unsettledText` to pick the right copy — `organizer_identity` reads
+   * differently when nobody on the roster matched ("doesn't match any of the
+   * names") than when two did ("which one are you?"). Absent for every
+   * question with only one way to be unsettled.
+   */
+  unsettledMatchKind?: (answers: AnswerStore) => string | undefined;
   /**
    * What this question is about RIGHT NOW, when one question is put once per
    * thing: "gluten-free — who does that apply to?". Names an option of another
@@ -337,6 +413,122 @@ function canonicalized(answers: AnswerStore, questions: readonly IntakeQuestion[
  * "real" name, which is not something to adjudicate from a control-plane
  * module.
  */
+/**
+ * A date the site can use, or a reason it cannot. `YYYY-MM-DD` and a real day.
+ *
+ * Checked because the transformer reads nothing else: a stop saved with
+ * `start: "2 May"` was accepted here, stored in the canonical intake, and
+ * provisioned with no dates at all — no error anywhere (a document's "Rome 2-6
+ * May" was extracted exactly like that on 2026-09-13).
+ */
+function isoDateProblem(value: unknown, where: string): string | null {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    const parsed = new Date(`${value}T00:00:00Z`);
+    if (!Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value) return null;
+  }
+  return `${where} must be a date written YYYY-MM-DD (got ${JSON.stringify(value).slice(0, 40)}). ` +
+    "Convert it using the trip's year, or leave the field out — never store the date as it was written.";
+}
+
+/** Every date field of a stop list: each stop's start and end, and each day's date. */
+function phaseDatesProblem(data: unknown): string | null {
+  if (!Array.isArray(data)) return null;
+  for (const [i, stop] of data.entries()) {
+    if (!stop || typeof stop !== "object") continue;
+    const s = stop as Record<string, unknown>;
+    const problem = isoDateProblem(s.start, `phases[${i}].start`) ?? isoDateProblem(s.end, `phases[${i}].end`);
+    if (problem) return problem;
+    for (const [j, day] of (Array.isArray(s.days) ? s.days : []).entries()) {
+      const dayProblem = day && typeof day === "object" ? isoDateProblem((day as Record<string, unknown>).date, `phases[${i}].days[${j}].date`) : null;
+      if (dayProblem) return dayProblem;
+    }
+  }
+  return null;
+}
+
+/**
+ * The stops whose place is written only in a non-Latin script and carry no
+ * `name_en` — by the name the organizer wrote them.
+ *
+ * Every stop of a non-English interview is supposed to carry the place's common
+ * English name: the site's English side, the trip's slug and title and the
+ * enrichment lookups all read it, and a Hebrew-only stop gives them nothing.
+ * The star e2e (2026-10-15) lost it in 2 of 3 Hebrew runs, the model leaving
+ * `name_en` out of a stop where the third run wrote the English name.
+ *
+ * Reported, never rejected: refusing the answer would drop every stop and re-ask
+ * the organizer for something they already said, to repair a field that is the
+ * reader's job and not theirs. See the log at confirmation, and the transformer,
+ * which names the trip from the stop's own words when this field is missing.
+ *
+ * A name in Latin script needs no second one; `name_en` only matters where the
+ * first name is not English-readable. Anything that is not a stop list reports
+ * nothing.
+ */
+export function stopsMissingEnglishName(data: unknown): string[] {
+  if (!Array.isArray(data)) return [];
+  const missing: string[] = [];
+  for (const stop of data) {
+    if (!stop || typeof stop !== "object") continue;
+    const s = stop as Record<string, unknown>;
+    if (typeof s.name !== "string") continue;
+    const name = s.name.trim();
+    if (!/\p{L}/u.test(name) || /\p{Script=Latin}/u.test(name)) continue;
+    if (typeof s.name_en === "string" && s.name_en.trim() !== "") continue;
+    missing.push(name);
+  }
+  return missing;
+}
+
+/**
+ * How many travellers lack a name in the interview's language, and how many lack
+ * the Latin form — counted, never named.
+ *
+ * Every traveller carries `name` in the interview's own language and script and
+ * `name_en` in Latin letters (the owner's manual test, 2026-10-15: four
+ * travellers confirmed in two scripts, two of them with no `name_en`). The site's
+ * roster, the intro's login list and the login names read these fields, and a
+ * Hebrew-only traveller gave the login nothing Latin to be made from.
+ *
+ * Reported, never rejected, for the reason `stopsMissingEnglishName` gives: a
+ * rejection would drop the whole roster and re-ask the organizer for names they
+ * already said, to repair a field that is the interviewer's job. An English
+ * interview has no second name to owe — a Latin `name` is its own Latin form.
+ * A language whose script is not known here is only checked for the Latin form.
+ * Anything that is not a roster counts nothing.
+ */
+export function travelersMissingNames(
+  data: unknown,
+  language: string,
+): { missingInterviewLanguageName: number; missingEnglishName: number } {
+  const gap = { missingInterviewLanguageName: 0, missingEnglishName: 0 };
+  if (!Array.isArray(data) || language === "en") return gap;
+  const script = INTERVIEW_NAME_SCRIPT[language];
+  for (const person of data) {
+    if (!person || typeof person !== "object") continue;
+    const p = person as Record<string, unknown>;
+    if (typeof p.name !== "string" || !/\p{L}/u.test(p.name)) continue;
+    if (script && !script.test(p.name)) gap.missingInterviewLanguageName += 1;
+    const latin = typeof p.name_en === "string" && /\p{Script=Latin}/u.test(p.name_en);
+    if (!latin) gap.missingEnglishName += 1;
+  }
+  return gap;
+}
+
+/** The letters a name must contain to be written in an interview's language. */
+const INTERVIEW_NAME_SCRIPT: Record<string, RegExp> = { he: /\p{Script=Hebrew}/u };
+
+function anchorDatesProblem(data: unknown): string | null {
+  if (!Array.isArray(data)) return null;
+  for (const [i, anchor] of data.entries()) {
+    if (!anchor || typeof anchor !== "object") continue;
+    const problem = isoDateProblem((anchor as Record<string, unknown>).date, `travel_anchors[${i}].date`);
+    if (problem) return problem;
+  }
+  return null;
+}
+
 function hasNamedTraveler(data: unknown): boolean {
   if (!Array.isArray(data)) return false;
   return data.some((entry) => {
@@ -496,7 +688,14 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     // spelling the organizer can glance at and correct costs them one word
     // ("Sagi, not Sagie") instead of a whole list. Answers overwrite, so a
     // correction arriving later is a plain re-submit of this question.
-    prompt: "Who's coming? List each person's name, age, and family/household group. If the names aren't in Latin script, transliterate them YOURSELF and submit that as each person's English spelling — then show the organizer the spellings you chose so they can correct any you got wrong. Never ask them to write the names out a second time.",
+    //
+    // BOTH NAMES, ALWAYS (owner's manual test, 2026-10-15). `name` is in the
+    // language and script of the interview, `name_en` is the Latin form: a
+    // ticket's exact spelling when a document printed one, a transliteration
+    // otherwise. A Hebrew interview confirmed two travellers in English letters
+    // (off the tickets) and two in Hebrew with no name_en — a roster in two
+    // scripts and two site logins with no Latin form to be derived from.
+    prompt: "Who's coming? List each person's name, age, and family/household group. Every person gets two names: \"name\" in the language of this interview, in its own script (a name given in Latin letters is rewritten in that script — a transliteration, never a translation), and \"name_en\" in Latin letters — copied exactly as printed when a document spelled it (a ticket's spelling is the passport's), otherwise transliterated YOURSELF. Show the organizer the spellings you chose so they can correct any you got wrong, and never ask them to write the names out a second time.",
     dataShape: "array",
     dataExample: "[{\"name\": \"נועה ברק\", \"name_en\": \"Noa Barak\", \"age\": 12, \"family\": \"Barak\"}]",
     required: true,
@@ -523,7 +722,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     // and its own schema. `_derive_phases` still reads `days` off this answer —
     // that is how the folded result gets in — it is simply not this call's job
     // to produce them.
-    prompt: "Where are you going, and when? List each stop: a short place name (city or region — e.g. \"Dallas\", not \"Dallas (boys; Mavericks game September 6)\"), date range, and accommodation (with confirmation number) if already booked. Keep any extra context — who's on this leg, an event, a plan detail — out of the name; it's fine to just not record it structurally.",
+    prompt: "Where are you going, and when? List each stop: a short place name (city or region — e.g. \"Dallas\", not \"Dallas (boys; Mavericks game September 6)\") as the organizer wrote it, its common English name as name_en (every stop has one, whatever language the interview is in — when the name is not in Latin script, write the English name yourself), date range, and accommodation (with confirmation number) if already booked. Keep any extra context — who's on this leg, an event, a plan detail — out of the name; it's fine to just not record it structurally.",
     dataShape: "array",
     // `planned` holds places the trip means to visit on this leg but has NOT
     // booked. The distinction from `travel_anchors` is EVIDENCE OF BOOKING —
@@ -542,18 +741,43 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     // confirmation, because a stay named without a code is the common case.
     dataExample: "[{\"name\": \"Reykjavik\", \"name_en\": \"Reykjavik\", \"start\": \"2027-03-04\", \"end\": \"2027-03-07\", \"accommodation\": {\"name\": \"Hotel Borg\", \"confirmation\": \"HB-2217\"}, \"planned\": [\"Hallgrimskirkja\"]}, {\"name\": \"Vik\", \"name_en\": \"Vik\", \"start\": \"2027-03-07\", \"end\": \"2027-03-09\", \"accommodation\": {\"name\": \"Hotel Kria\"}}]",
     required: true,
+    checkComplete: phaseDatesProblem,
   },
   {
     id: "travel_anchors",
     type: "structured",
+    // These kinds are named because the transformer provisions them
+    // (activity, tour, ticket, reservation, and since #109 event, shuttle and
+    // parking, all map to `attraction`). Asked only about "flights, hotels, or
+    // cars", a model left a booked e-ticket, a shuttle voucher and an event
+    // parking pass out of travel_anchors on 2026-09-13 — "no flight, hotel, or
+    // car booking confirmation number" — and their references with them (#62).
+    //
+    // TRAINS ARE NOT ASKED FOR, and that is a decision rather than an omission.
+    // Every word in this list has to survive `_ANCHOR_TYPE_MAP` (transformer.py),
+    // whose canonical set is exactly {flight, hotel, car, attraction, other};
+    // there is no rail member and `.get(type, "other")` catches what is missing.
+    // So asking for trains would collect them and then file every one as
+    // "other" — a taxonomy short a member, which is the shape of #115. Add the
+    // canonical type first, then this word; adding the word alone reads as a
+    // feature and behaves as a silent downgrade.
     prompt: "Which reservations are already booked? Include flights, hotels, cars, and ticketed attractions, tours, activities, events, shuttles, or parking. List each with its confirmation, order, or booking code.",
     dataShape: "array",
     // One real `type`, not "flight|hotel|car": a list of alternatives shown as
     // a value is a value a model can copy. The transformer reads any type
     // (`_read_anchor`); hotel, car and proposal stay out of the day plan, and
     // an optional HH:MM `time` puts a booked visit at its hour.
-    dataExample: "[{\"type\": \"attraction\", \"name\": \"Sky Lagoon\", \"date\": \"2027-03-05\", \"time\": \"15:00\", \"confirmation\": \"SL-58213\"}]",
+    //
+    // A flight carries its ROUTE in `name`, and a car its pick-up place (star
+    // e2e, 2026-10-14: "LY8801" alone left the gateway city off the site). The
+    // route is in the name, not in new fields, because the transformer already
+    // shows a name and no validator or site shape has to learn a key.
+    dataExample: "[{\"type\": \"attraction\", \"name\": \"Sky Lagoon\", \"date\": \"2027-03-05\", \"time\": \"15:00\", \"confirmation\": \"SL-58213\"}, {\"type\": \"flight\", \"name\": \"FI305 Oslo → Reykjavik\", \"date\": \"2027-03-04\", \"time\": \"09:30\"}, {\"type\": \"car\", \"name\": \"Rental car pick-up Keflavik airport\", \"date\": \"2027-03-04\"}]",
     required: false,
+    // A flight number is not a confirmation, and that is a rule, not a
+    // judgement — see withoutFlightNumbersAsConfirmations (#131).
+    sanitize: withoutFlightNumbersAsConfirmations,
+    checkComplete: anchorDatesProblem,
   },
   {
     id: "constraints",
@@ -680,7 +904,22 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
       if (match.kind !== "matched" || (current?.kind === "text" && current.text === match.name)) return null;
       return { kind: "text", schema_version: INTAKE_SCHEMA_VERSION, text: match.name };
     },
-    choicesFrom: (answers) => rosterChoices(answers.travelers?.kind === "structured" ? answers.travelers.data : undefined),
+    // The whole roster, normally — the organizer's real answer may be the
+    // first thing typed. Narrowed to just the two-or-more it could be once a
+    // typed answer is ambiguous: offering the whole roster there just repeats
+    // the mistake, since the roster's OWN "Dana" button records "Dana" and
+    // resolves ambiguous again (#321).
+    choicesFrom: (answers) => {
+      const roster = answers.travelers?.kind === "structured" ? answers.travelers.data : undefined;
+      const match = organizerMatch(answers);
+      return match.kind === "ambiguous" ? rosterChoicesFor(roster, match.candidates) : rosterChoices(roster);
+    },
+    // Nobody matched, or more than one did — `unsettledText` reads different
+    // copy for each, and `renderQuestion`'s buttons already differ above.
+    unsettledMatchKind: (answers) => {
+      const match = organizerMatch(answers);
+      return match.kind === "matched" ? undefined : match.kind;
+    },
   },
   {
     // The assistant's name, voice and tone are REQUIRED as of 2026-09-07, at the
@@ -835,6 +1074,166 @@ export type AnswerValidationResult =
       detail?: string;
     };
 
+/**
+ * Is this string a flight designator — `VN572`, `LY381`, `BA1A`, `U26301`?
+ *
+ * IATA form: a two-character airline code (at least one letter, so `U2` and
+ * `9W` count), one to four digits, and an optional operational suffix letter.
+ * ICAO form: three letters, one to four digits. Separators and case are noise.
+ *
+ * A designator names a SERVICE, not a reservation. Every passenger on that
+ * aircraft carries the same one, and it is printed on a timetable long before
+ * anyone buys a seat — so it is never, on its own, evidence of a booking.
+ */
+export function isFlightDesignator(value: string): boolean {
+  const cleaned = value.replace(/[\s\-_.]/g, "").toUpperCase();
+  if (!cleaned) return false;
+  // The lookahead is what stops a bare number matching: an airline code may
+  // carry a digit ("U2", "9W") but never two, so one of the first two
+  // characters is always a letter. Without it `12345` read as a designator.
+  return /^(?=.{0,1}[A-Z])[A-Z0-9]{2}\d{1,4}[A-Z]?$/.test(cleaned)
+    || /^[A-Z]{3}\d{1,4}[A-Z]?$/.test(cleaned);
+}
+
+// ── A flight the organizer typed is never lost because the model did not file it ──
+//
+// Live, star e2e, 2026-10-15 (2 runs of 6): the organizer typed both flights
+// inside the answer to the stops question. The reader sometimes proposed the
+// stops only; `travel_anchors` is optional, so nothing ever asked for it, the
+// organizer confirmed, and both flights were nowhere in the config. Whether a
+// typed flight reaches `travel_anchors` was a model judgement, and this is the
+// deterministic floor under it: a designator found in what the organizer TYPED
+// that no `travel_anchors` entry carries is asked about, once, before the
+// summary. The detector never files anything — the organizer's answer does.
+
+/**
+ * Flight designators in text the organizer typed, normalised ("LY8801"), in
+ * order of first appearance.
+ *
+ * DELIBERATELY NARROWER than `isFlightDesignator`, which judges a field that is
+ * already known to be a booking reference. Free text is full of things that
+ * wear the same shape — "USD 1500", "DEC 15", "B737", "MP3", "NY 2027" — and a
+ * wrong hit costs the organizer a question, so:
+ *  - capital letters only, with the code and the number glued or joined by a
+ *    hyphen ("LY8801", "LY-8801"); a space is not accepted, because it is what
+ *    makes a currency and a month read as a flight;
+ *  - at least two digits, and three when the airline code itself carries a
+ *    digit ("U2", "9W") — "A320" and "B737" are aircraft, not services;
+ *  - not part of a longer word or number.
+ * What this misses is left to the reader, as it always was. A single-digit
+ * flight number ("LY1") is one of those.
+ */
+export function flightDesignatorsIn(text: string): string[] {
+  const found: string[] = [];
+  const pattern = /(?<![A-Za-z0-9])([A-Z]{2,3}|[A-Z][0-9]|[0-9][A-Z])-?([0-9]{1,4})(?![A-Za-z0-9])/g;
+  for (const match of text.matchAll(pattern)) {
+    const code = match[1]!;
+    const digits = match[2]!;
+    const needed = /[0-9]/.test(code) ? 3 : 2;
+    if (digits.length < needed) continue;
+    const designator = `${code}${digits}`;
+    if (!isFlightDesignator(designator)) continue;
+    if (!found.includes(designator)) found.push(designator);
+  }
+  return found;
+}
+
+/** Is this designator named anywhere in the organizer's bookings? Any spelling, any case. */
+function designatorInAnchors(designator: string, answers: AnswerStore): boolean {
+  const answer = answers.travel_anchors;
+  if (!answer || answer.kind !== "structured") return false;
+  const haystack = JSON.stringify(answer.data ?? null).toUpperCase();
+  const spelled = designator.split("").join("[\\s\\-_.]?");
+  return new RegExp(`(?<![A-Z0-9])${spelled}(?![0-9])`).test(haystack);
+}
+
+/**
+ * The flights the organizer typed that the bookings do not carry and that have
+ * not been asked about yet. Empty is the normal state. "Asked" is once and for
+ * good: an organizer who answers that they are not booked is believed, and the
+ * interview never goes round again.
+ */
+export function flightsOwed(answers: AnswerStore, ui: InterviewUiState): string[] {
+  const asked = new Set(ui.flightsAsked ?? []);
+  return (ui.typedFlights ?? []).filter((d) => !asked.has(d) && !designatorInAnchors(d, answers));
+}
+
+/** Words for "you mentioned these flights — say them again as bookings", one or several. */
+const FLIGHTS_OWED_PHRASES: Readonly<Record<Language, { one: string; many: string }>> = {
+  en: {
+    one: "You mentioned flight {flights}. So that I don't lose it, tell me about it again with its date and route (and a confirmation number, if you have one) — or tell me it isn't booked yet.",
+    many: "You mentioned the flights {flights}. So that I don't lose them, tell me about each one again with its date and route (and a confirmation number, if you have one) — or tell me they aren't booked yet.",
+  },
+  he: {
+    one: "הזכרתם את הטיסה {flights}. כדי שלא אפספס אותה, כתבו לי עליה שוב עם התאריך והמסלול (ומספר אישור, אם יש) — או כתבו שעוד לא הזמנתם.",
+    many: "הזכרתם את הטיסות {flights}. כדי שלא אפספס אותן, כתבו לי על כל אחת מהן שוב עם התאריך והמסלול (ומספר אישור, אם יש) — או כתבו שעוד לא הזמנתם.",
+  },
+};
+
+/** The line that leads the bookings question when typed flights are owed. */
+export function flightsOwedLead(designators: readonly string[], language: Language): string {
+  const phrases = FLIGHTS_OWED_PHRASES[language] ?? FLIGHTS_OWED_PHRASES[DEFAULT_LANGUAGE];
+  return (designators.length === 1 ? phrases.one : phrases.many).replace("{flights}", designators.join(", "));
+}
+
+/**
+ * Keeps a flight number out of a booking's `confirmation`.
+ *
+ * `travel_anchors` means "already booked", and the field that makes it mean
+ * that is the confirmation — the fixtures say so: *"evidence of booking is a
+ * confirmation number"*. On 2026-09-20 the interpreter filled it with the
+ * flight number instead, from an organizer who had booked nothing and said so:
+ *
+ *     { "name": "VN572 תל אביב-האנוי", "confirmation": "VN572" }
+ *
+ * The site then told the family two bookings were confirmed. The count that
+ * reported it was already correct (#124) and was being fed this; sampling more
+ * e2e runs would only have measured how often a model gets it wrong. Dror,
+ * 2026-09-20: *"flight number should not remain a model judgement … code
+ * should be authoritative."*
+ *
+ * DELIBERATELY NARROW, because the cost of a false positive is deleting a real
+ * booking reference. Applied only when all three hold:
+ *
+ *   1. the anchor is a flight,
+ *   2. the confirmation reads as a flight designator, and
+ *   3. that same designator is already in the anchor's `name`.
+ *
+ * (3) is what makes it safe. A confirmation that merely restates the name is
+ * not independent evidence of anything, whereas a code the organizer supplied
+ * separately might legitimately look designator-shaped — a hotel reference
+ * like `HB-2217` matches the pattern exactly, which is why the pattern alone
+ * must never decide.
+ *
+ * The number is moved to `flight_number` rather than discarded: the model was
+ * right about what it read, only wrong about which field it answers.
+ *
+ * The residual case — a flight whose confirmation is designator-shaped and
+ * NOT in the name — is left alone on purpose. It cannot be told from a real
+ * reference without guessing, and guessing here loses data.
+ */
+export function withoutFlightNumbersAsConfirmations(data: unknown): unknown {
+  if (!Array.isArray(data)) return data;
+  return data.map((row) => {
+    if (!row || typeof row !== "object" || Array.isArray(row)) return row;
+    const anchor = row as Record<string, unknown>;
+    const confirmation = String(anchor.confirmation ?? "").trim();
+    if (!confirmation || String(anchor.type ?? "").toLowerCase() !== "flight") return row;
+    if (!isFlightDesignator(confirmation)) return row;
+
+    const name = String(anchor.name ?? "");
+    const normalised = confirmation.replace(/[\s\-_.]/g, "").toUpperCase();
+    const inName = name
+      .toUpperCase()
+      .split(/[^A-Z0-9]+/)
+      .some((token) => token === normalised);
+    if (!inName) return row;
+
+    const { confirmation: _dropped, ...rest } = anchor;
+    return { ...rest, ...(anchor.flight_number ? {} : { flight_number: confirmation }) };
+  });
+}
+
 export function validateAnswer(
   questionId: string,
   optionId: string | "other" | null,
@@ -873,7 +1272,13 @@ export function validateAnswer(
     // Shape is necessary, not sufficient — see `checkComplete`'s doc comment.
     const incomplete = question.checkComplete?.(structuredData);
     if (incomplete) return { ok: false, reason: "INCOMPLETE_ANSWER", detail: incomplete };
-    return { ok: true, answer: { kind: "structured", schema_version: INTAKE_SCHEMA_VERSION, data: structuredData } };
+    // The one gate every path goes through — the model, the agent, a document
+    // and a typed answer all arrive here — so a rule enforced at this point
+    // cannot be bypassed by the route that produced the data.
+    // The interpreter's additional-visit marker steers a merge and is never
+    // stored, whichever path proposed it.
+    const cleaned = stripVisitMarkers(question.sanitize ? question.sanitize(structuredData) : structuredData);
+    return { ok: true, answer: { kind: "structured", schema_version: INTAKE_SCHEMA_VERSION, data: cleaned } };
   }
 
   if (question.type === "choice") {
@@ -1229,7 +1634,16 @@ function describeStructured(data: unknown): string {
     }
     const record = item as Record<string, unknown>;
     const named = NAME_KEYS.map((k) => record[k]).find((v) => typeof v === "string" && v.trim() !== "");
-    if (typeof named === "string") return named.trim();
+    if (typeof named === "string") {
+      // A stop shows where they sleep. The summary is what an immutable version
+      // is approved from, and a hotel added there (2026-10-15) was invisible on
+      // it: the organizer could not tell whether it had landed.
+      const stay = record.accommodation;
+      const hotel = stay && typeof stay === "object" && !Array.isArray(stay)
+        ? (stay as Record<string, unknown>).name
+        : undefined;
+      return typeof hotel === "string" && hotel.trim() !== "" ? `${named.trim()} (${hotel.trim()})` : named.trim();
+    }
     // No conventional name: show the first short scalar rather than nothing.
     const scalar = Object.values(record).find(
       (v) => (typeof v === "string" && v.trim() !== "" && v.length <= 60) || typeof v === "number",
@@ -1344,6 +1758,12 @@ export interface SessionView {
   /** True once the "essentials done" choice has been put to the organizer. */
   offeredMore: boolean;
   /**
+   * Flights the organizer typed that the bookings do not carry and that have not
+   * been asked about — see `flightsOwed`. The router asks the bookings question
+   * about them before the interview can reach its summary. Absent or empty: none.
+   */
+  flightsOwed?: string[];
+  /**
    * Where the interview is, as a phase it entered rather than a value
    * recomputed from the answers. The source of truth; `state` is its
    * projection into the older three-value vocabulary.
@@ -1387,8 +1807,14 @@ export interface SessionView {
    * An answer on record that does not settle its question, by question id, as
    * written — so asking again can say what did not match rather than repeat
    * itself. See `IntakeQuestion.satisfiedBy`.
+   *
+   * `matchKind` is `IntakeQuestion.unsettledMatchKind`'s reading of WHY it is
+   * unsettled, when a question has more than one way to be — organizer_identity
+   * reads differently for "matched nobody" than for "matched two".
    */
-  unsettled?: Record<string, string>;
+  unsettled?: Record<string, { text: string; matchKind?: string }>;
+  /** The choice whose Other button is awaiting literal organizer text. */
+  otherPending: IntakeQuestion | null;
 }
 
 function recordChoices(answers: AnswerStore): Record<string, RosterChoice[]> {
@@ -1409,12 +1835,12 @@ function recordSubjects(answers: AnswerStore): Record<string, { fromQuestion: st
   return out;
 }
 
-function unsettledAnswers(answers: AnswerStore): Record<string, string> {
-  const out: Record<string, string> = {};
+function unsettledAnswers(answers: AnswerStore): Record<string, { text: string; matchKind?: string }> {
+  const out: Record<string, { text: string; matchKind?: string }> = {};
   for (const q of INTAKE_QUESTIONS) {
     const answer = answers[q.id];
     if (!q.satisfiedBy || answer === undefined || q.satisfiedBy(answers)) continue;
-    if (answer.kind === "text") out[q.id] = answer.text;
+    if (answer.kind === "text") out[q.id] = { text: answer.text, matchKind: q.unsettledMatchKind?.(answers) };
   }
   return out;
 }
@@ -1438,6 +1864,14 @@ function currentSelections(answers: AnswerStore): Record<string, string[]> {
  */
 export interface InterviewUiState {
   finishRequested?: boolean;
+  /**
+   * Flight designators found in what the organizer TYPED, normalised ("LY8801").
+   * Written by the interpret path as a message arrives, before the reader has a
+   * say, so a flight the reader did not file is still known — see `flightsOwed`.
+   */
+  typedFlights?: string[];
+  /** The typed flights the organizer has been asked about. Once is enough. */
+  flightsAsked?: string[];
   skipped?: string[];
   /**
    * Required questions that were asked and not answered, stepped aside so the
@@ -1464,6 +1898,8 @@ export interface InterviewUiState {
    * either of those IS the finalization.
    */
   multiPending?: string;
+  /** A choice's Other button was tapped; the next typed message is its value. */
+  otherPending?: string;
   /**
    * A document is being READ right now — not queued, being read.
    *
@@ -1603,8 +2039,14 @@ function parseUiState(raw: unknown): InterviewUiState {
   const deferred = Array.isArray(record.deferred)
     ? record.deferred.filter((id): id is string => typeof id === "string")
     : undefined;
+  const designators = (value: unknown): string[] =>
+    Array.isArray(value) ? value.filter((d): d is string => typeof d === "string" && /^[A-Z0-9]{4,8}$/.test(d)) : [];
+  const typedFlights = designators(record.typed_flights);
+  const flightsAsked = designators(record.flights_asked);
   return {
     ...(record.finish_requested === true ? { finishRequested: true } : {}),
+    ...(typedFlights.length > 0 ? { typedFlights } : {}),
+    ...(flightsAsked.length > 0 ? { flightsAsked } : {}),
     ...(skipped && skipped.length > 0 ? { skipped } : {}),
     ...(deferred && deferred.length > 0 ? { deferred } : {}),
     ...(typeof record.pending_ask === "string" ? { pendingAsk: record.pending_ask } : {}),
@@ -1615,6 +2057,7 @@ function parseUiState(raw: unknown): InterviewUiState {
     ...(record.opening_done === true ? { openingDone: true } : {}),
     ...(isInterviewPhase(record.pending_entry) ? { pendingEntry: record.pending_entry } : {}),
     ...(typeof record.multi_pending === "string" ? { multiPending: record.multi_pending } : {}),
+    ...(typeof record.other_pending === "string" ? { otherPending: record.other_pending } : {}),
     ...((suggestions) => (suggestions ? { suggestions } : {}))(parseSuggestions(record.suggestions)),
     ...(typeof record.reading_document_since === "string" ? { readingDocumentSince: record.reading_document_since } : {}),
   };
@@ -1623,6 +2066,8 @@ function parseUiState(raw: unknown): InterviewUiState {
 function serializeUiState(ui: InterviewUiState): string {
   return JSON.stringify({
     ...(ui.finishRequested ? { finish_requested: true } : {}),
+    ...(ui.typedFlights && ui.typedFlights.length > 0 ? { typed_flights: ui.typedFlights } : {}),
+    ...(ui.flightsAsked && ui.flightsAsked.length > 0 ? { flights_asked: ui.flightsAsked } : {}),
     ...(ui.skipped && ui.skipped.length > 0 ? { skipped: ui.skipped } : {}),
     ...(ui.deferred && ui.deferred.length > 0 ? { deferred: ui.deferred } : {}),
     ...(ui.pendingAsk ? { pending_ask: ui.pendingAsk } : {}),
@@ -1633,6 +2078,7 @@ function serializeUiState(ui: InterviewUiState): string {
     ...(ui.openingDone ? { opening_done: true } : {}),
     ...(ui.pendingEntry ? { pending_entry: ui.pendingEntry } : {}),
     ...(ui.multiPending ? { multi_pending: ui.multiPending } : {}),
+    ...(ui.otherPending ? { other_pending: ui.otherPending } : {}),
     ...(ui.suggestions && Object.keys(ui.suggestions).length > 0 ? { suggestions: ui.suggestions } : {}),
     ...(ui.readingDocumentSince ? { reading_document_since: ui.readingDocumentSince } : {}),
   });
@@ -1715,6 +2161,161 @@ export async function deferQuestionForChat(
  */
 export async function undeferAllForChat(db: pg.Pool, chatId: string): Promise<void> {
   await updateUiStateForChat(db, chatId, (ui) => ({ ...ui, deferred: [] }));
+}
+
+// ── Asking a required question again: what is still missing ─────────────────
+//
+// Live, in Hebrew, 2026-10-10: the organizer answered the stops question with
+// "we sleep in X and day-trip to the villages, no plan yet", the reader said
+// `unclear`, and the router sent the IDENTICAL question back, twice more. They
+// had followed the conversation and were told nothing about what was wrong.
+//
+// A re-ask leads with one of these lines, above the same question and its
+// buttons: it acknowledges the reply and names the piece still missing. The
+// table is CLOSED and the line is chosen by code — keyed by question id, with a
+// sub-gap where a question has more than one way to be incomplete (the router's
+// `reaskGap` picks it). The reader's own `why` is never shown: the model never
+// addresses the organizer (interpret.ts header), so it may only select a key.
+//
+// Two phrasings per gap, alternated by attempt, so a second miss reads
+// differently from the first and no two consecutive messages are the same.
+// Hebrew addresses the organizer in the plural, like the rest of the copy.
+// Accommodation is never named as missing: the stops question asks for it only
+// "if already booked", and demanding it would contradict the question.
+//
+// Every required question has its own entry (pinned by
+// interview-reask-gap.test.ts); `choice` covers a required choice question with
+// none, and `*` is the last resort that the test keeps from ever being reached
+// by a required question.
+
+/** The re-ask lines: gap key → language → [first phrasing, second phrasing]. */
+export const REASK_GAP_PHRASES: Readonly<Record<string, Readonly<Record<Language, readonly [string, string]>>>> = {
+  "phases.dates": {
+    en: [
+      "Thanks, that helps. What I'm still missing is the dates — roughly from when to when you'll be in each place. An estimate is fine.",
+      "Just the dates and this part is done — even rough ones, like \"the first week of August\", are enough.",
+    ],
+    he: [
+      "תודה, זה עוזר. מה שעוד חסר לי זה התאריכים — בערך מתי עד מתי תהיו בכל מקום. מספיק תאריך משוער.",
+      "רק התאריכים והחלק הזה מוכן — גם משהו משוער, כמו \"השבוע הראשון של אוגוסט\", מספיק.",
+    ],
+  },
+  "phases.places": {
+    en: [
+      "Thanks, that helps. What I'm still missing is where you'll be staying along the way — the town or area you'll be based in for each part of the trip, in order.",
+      "To lay the trip out I need the places you'll sleep — just the town or area for each part, in order. Day trips can wait.",
+    ],
+    he: [
+      "תודה, זה עוזר. מה שעוד חסר לי זה איפה תהיו לאורך הדרך — העיר או האזור שבו תהיו בכל חלק של הטיול, לפי הסדר.",
+      "כדי לסדר את מסלול הטיול אני צריך את המקומות שבהם תלונו — רק העיר או האזור לכל חלק, לפי הסדר. טיולי יום אפשר להשאיר לאחר כך.",
+    ],
+  },
+  phases: {
+    en: [
+      "Thanks, that helps. To set up the stops I still need two things: the places, in order, and roughly when you'll be in each one.",
+      "Nearly there with the stops — a place and rough dates for each part of the trip is all I need. You can add the hotel name later if you have not booked it yet.",
+    ],
+    he: [
+      "תודה, זה עוזר. כדי לסדר את התחנות חסרים לי עוד שני דברים: המקומות לפי הסדר, ובערך מתי תהיו בכל אחד מהם.",
+      "כמעט סיימנו עם התחנות — מקום ותאריכים משוערים לכל חלק של הטיול זה כל מה שצריך. את שם המלון אפשר להוסיף אחר כך, אם עוד לא הזמנתם.",
+    ],
+  },
+  destination: {
+    en: [
+      "Thanks. What I still need is where the trip is — a country, a region or a city is enough.",
+      "Just the destination for now — the country or the main city you're heading to.",
+    ],
+    he: [
+      "תודה. מה שעוד חסר לי זה לאן הטיול — מספיק מדינה, אזור או עיר.",
+      "רק היעד בינתיים — המדינה או העיר העיקרית שאליה אתם נוסעים.",
+    ],
+  },
+  departure_date: {
+    en: [
+      "Thanks. What I still need is the day the trip starts — a day and a month is enough.",
+      "Just the start date — for example \"12 August\".",
+    ],
+    he: [
+      "תודה. מה שעוד חסר לי זה היום שבו הטיול מתחיל — מספיק יום וחודש.",
+      "רק תאריך היציאה — למשל \"12 באוגוסט\".",
+    ],
+  },
+  return_date: {
+    en: [
+      "Thanks. What I still need is the day you head home — a day and a month is enough.",
+      "Just the return date — for example \"26 August\".",
+    ],
+    he: [
+      "תודה. מה שעוד חסר לי זה היום שבו אתם חוזרים הביתה — מספיק יום וחודש.",
+      "רק תאריך החזרה — למשל \"26 באוגוסט\".",
+    ],
+  },
+  travelers: {
+    en: [
+      "Thanks. What I still need is who's coming — a name for each person (ages help too).",
+      "Just the names of everyone travelling, and I'll take it from there.",
+    ],
+    he: [
+      "תודה. מה שעוד חסר לי זה מי נוסע — שם לכל אחד (גם גילים עוזרים).",
+      "רק השמות של כל מי שנוסע, ומשם אני ממשיך.",
+    ],
+  },
+  organizer_identity: {
+    en: [
+      "Thanks. What I still need is which of the travellers is talking to me.",
+      "Just tell me which name on the list is yours.",
+    ],
+    he: [
+      "תודה. מה שעוד חסר לי זה מי מבין הנוסעים מדבר איתי.",
+      "רק תגידו איזה שם ברשימה הוא שלכם.",
+    ],
+  },
+  bot_name: {
+    en: [
+      "Thanks. What I still need is a name for the trip assistant — the name the travellers would actually type.",
+      "Just a name for the assistant — anything short the travellers will use.",
+    ],
+    he: [
+      "תודה. מה שעוד חסר לי זה שם לעוזר של הטיול — השם שהנוסעים באמת יקלידו.",
+      "רק שם לעוזר — משהו קצר שהנוסעים ישתמשו בו.",
+    ],
+  },
+  choice: {
+    en: [
+      "Thanks. I still need you to pick one of the options below — tap it, or say it in your own words.",
+      "Just one of the options below and we'll move on — tapping it is quickest.",
+    ],
+    he: [
+      "תודה. עוד חסר לי שתבחרו אחת מהאפשרויות למטה — אפשר להקיש עליה או לכתוב במילים שלכם.",
+      "רק אחת מהאפשרויות למטה ונמשיך — הכי מהיר להקיש עליה.",
+    ],
+  },
+  "*": {
+    en: [
+      "Thanks. This one is still open, and I need it before we can finish:",
+      "One more go at this one — a short answer is fine:",
+    ],
+    he: [
+      "תודה. השאלה הזאת עוד פתוחה, ואני צריך אותה לפני שנסיים:",
+      "עוד ניסיון בשאלה הזאת — מספיקה תשובה קצרה:",
+    ],
+  },
+};
+
+/**
+ * The line that leads a re-ask: `gap` is a key of `REASK_GAP_PHRASES`
+ * ("phases.dates", "destination"), `attempt` counts from 1 and alternates the
+ * two phrasings. An unknown sub-gap falls back to its question's own entry, a
+ * choice question with no entry to `choice`, anything else to `*`.
+ */
+export function reaskLead(gap: string, attempt: number, language: Language): string {
+  const questionId = gap.split(".")[0]!;
+  const entry = REASK_GAP_PHRASES[gap]
+    ?? REASK_GAP_PHRASES[questionId]
+    ?? (INTAKE_QUESTIONS.find((q) => q.id === questionId)?.type === "choice" ? REASK_GAP_PHRASES.choice : undefined)
+    ?? REASK_GAP_PHRASES["*"]!;
+  const phrasings = entry[language] ?? entry[DEFAULT_LANGUAGE];
+  return phrasings[(Math.max(1, Math.floor(attempt)) - 1) % phrasings.length]!;
 }
 
 /** The optional question the interviewer nominated, if it is still askable. */
@@ -1857,7 +2458,14 @@ export function nextPhase(
 
   if (current === "essentials") return requiredDone ? "optional" : "essentials";
 
+  // TYPED FLIGHTS NOT YET ASKED ABOUT hold the interview open. Finishing, or
+  // running out of optional questions, would otherwise reach a summary that
+  // lacks a flight the organizer wrote — and a confirmed intake is immutable.
+  // Asking is what releases it (`flightsAsked`), so this cannot hold forever.
+  const flightsPending = flightsOwed(answers, ui).length > 0;
+
   if (current === "optional") {
+    if (flightsPending) return "optional";
     if (ui.finishRequested) return "recap";
     // Running out is the other way in. Confirmation is gated on the REQUIRED
     // set alone, so arriving here early skips nothing that matters.
@@ -1865,8 +2473,9 @@ export function nextPhase(
   }
 
   // recap: the organizer either confirms (handled by confirmIntake, which sets
-  // the phase directly) or reopens the questions with Keep planning.
-  return ui.finishRequested ? "recap" : "optional";
+  // the phase directly) or reopens the questions with Keep planning. A flight
+  // typed while the summary is up reopens them too, until it has been asked about.
+  return ui.finishRequested && !flightsPending ? "recap" : "optional";
 }
 
 /**
@@ -1899,6 +2508,8 @@ function deriveSessionState(
   const allRequired = questions.filter((q) => q.required);
   const allAnswered = allRequired.every((q) => isAnswered(q, answers));
   if (!allAnswered) return "interviewing";
+  // Same hold as `nextPhase`: the stored `state` must not run ahead of the phase.
+  if (flightsOwed(answers, ui).length > 0) return "interviewing";
   if (ui.finishRequested) return "awaiting_confirmation";
   return unansweredOptionalQuestions(answers, questions, ui).length === 0
     ? "awaiting_confirmation"
@@ -1919,13 +2530,33 @@ export type SubmitAnswerResult =
   | { ok: true; view: SessionView }
   | {
       ok: false;
-      reason: "NOT_FOUND" | "SESSION_CONFIRMED" | "UNKNOWN_QUESTION" | "UNKNOWN_OPTION" | "OTHER_TEXT_REQUIRED" | "OTHER_NOT_ALLOWED" | "TEXT_TOO_LONG" | "TEXT_REQUIRED" | "CHOICE_REQUIRED" | "DATA_REQUIRED" | "DATA_WRONG_SHAPE" | "OPTIONS_REQUIRED" | "INCOMPLETE_ANSWER";
+      reason: "NOT_FOUND" | "SESSION_CONFIRMED" | "UNKNOWN_QUESTION" | "UNKNOWN_OPTION" | "OTHER_TEXT_REQUIRED" | "OTHER_NOT_ALLOWED" | "TEXT_TOO_LONG" | "TEXT_REQUIRED" | "CHOICE_REQUIRED" | "DATA_REQUIRED" | "DATA_WRONG_SHAPE" | "OPTIONS_REQUIRED" | "INCOMPLETE_ANSWER"
+        /** The answer changed since the caller read it — see `AnswerPrecondition`. */
+        | "STALE_ANSWER";
       detail?: string;
     };
 
+/**
+ * The answer a write was computed FROM.
+ *
+ * A document read takes minutes, and what it writes is a merge of what it read
+ * into the answer held when it started. Without this, a write that lands after
+ * the organizer corrected that answer by hand — or after another document
+ * landed first — replaces their work with a minutes-old view of it, silently,
+ * under a lock that only guarantees the overwrite is tidy. With it, the write
+ * is refused as STALE_ANSWER and the caller merges again against what is there
+ * now.
+ *
+ * `held` is the stored answer exactly as read (the whole `{kind, …}` record), or
+ * undefined when the question was unanswered.
+ */
+export interface AnswerPrecondition {
+  held: unknown;
+}
+
 export type ConfirmIntakeResult =
   | { ok: true; sessionId: string; intakeVersionId: string; digest: string; versionNumber: number }
-  | { ok: false; reason: "NOT_FOUND" | "NOT_ALL_REQUIRED_ANSWERED" | "UNSAFE_ANSWER_CONTENT"; unsafePath?: string };
+  | { ok: false; reason: "NOT_FOUND" | "NOT_ALL_REQUIRED_ANSWERED" | "UNSAFE_ANSWER_CONTENT" | "PENDING_CHANGE"; unsafePath?: string };
 
 // A private Telegram chat id is always a positive integer in string form —
 // reject anything else rather than storing whatever an LLM tool-call
@@ -1941,7 +2572,9 @@ const TELEGRAM_CHAT_ID_HINT_PATTERN = /^\d{1,20}$/;
 // owner; conducting it in a group would put that behind whoever else is in
 // the room. Group chats bind to a trip's COMPANION instead (0019), after the
 // signed organizer action Sprint 5 requires.
-const TELEGRAM_PRIVATE_CHAT_ID_PATTERN = /^\d{1,20}$/;
+// The predicate itself lives in identity.ts, beside digestTelegramId — three
+// modules were carrying their own copy of it.
+
 
 /**
  * Exchanges a valid enrollment token for a session, atomically:
@@ -2022,7 +2655,7 @@ export async function startSession(
     // unbound (fail closed). Written NULL when the caller is not the
     // router — the HTTP/MCP path has no verified chat id to offer.
     const chatId =
-      verifiedTelegramChatId && TELEGRAM_PRIVATE_CHAT_ID_PATTERN.test(verifiedTelegramChatId)
+      verifiedTelegramChatId && isPrivateChatId(verifiedTelegramChatId)
         ? verifiedTelegramChatId
         : null;
 
@@ -2044,6 +2677,20 @@ export async function startSession(
        VALUES ($1, $2, $3, $4, $5, 'interviewing', '{}'::jsonb, $6, $7, $8)`,
       [sessionId, enrollment.tripId, enrollment.userId, enrollment.enrollmentId, digest, chatId, language, interpretPathDefault()],
     );
+
+    // The one moment both halves of "this Telegram person is this user" are
+    // proven together: the enrollment names the user it was ISSUED to, and
+    // `chatId` was read by the router off its own authenticated Telegram
+    // connection. Written in the SAME transaction for the same reason the
+    // binding above is — a link recorded for a session that then failed to
+    // commit would claim an ownership nothing else agrees with.
+    //
+    // This is what lets /trips and /switch exist at all; see
+    // organizer-trips.ts. It is NOT an authentication path and grants no web
+    // session — Telegram SSO stays retired (/v1/auth/telegram answers 410).
+    if (chatId) {
+      await linkTelegramOrganizerInTx(client, chatId, enrollment.userId);
+    }
 
     await client.query("COMMIT");
 
@@ -2067,6 +2714,7 @@ export async function startSession(
       pendingSay: null,
       pendingAskText: null,
       suggestions: {},
+      otherPending: null,
     };
     return { ok: true, sessionId, sessionToken: rawSessionToken, view };
   } catch (error) {
@@ -2122,6 +2770,57 @@ export async function getSession(
 }
 
 /**
+ * A typed answer resolved against a question's OWN choices, with no model.
+ *
+ * The buttons on a roster-backed question are drawn from data the control
+ * plane already holds, so "which of these is it" is a decidable lookup, not a
+ * judgement — exactly the kind `docs/interview-without-an-agent.md` says must
+ * not be handed to a model. It was anyway, and the model could not do it: on
+ * 2026-09-20 an organizer answered `organizer_identity` with their own name,
+ * exactly as the roster spells it and exactly as the question's prompt asks
+ * for, and `interpret` returned zero proposals twice. The interview asked the
+ * same question forever and no trip was ever built.
+ *
+ * The deterministic matcher was right there and never ran: `satisfiedBy` and
+ * `canonicalize` act on an answer that has been STORED, and the interpreter is
+ * what decides whether to store one.
+ *
+ * Returns the canonical value to record, or null when the text names nobody or
+ * more than one — both of which must stay with the model and the re-ask, since
+ * guessing between two travellers is the failure this cannot afford.
+ */
+export function typedChoiceAnswer(
+  questionId: string,
+  text: string,
+  answers: AnswerStore,
+): string | null {
+  const written = text.trim();
+  if (!written) return null;
+  const question = INTAKE_QUESTIONS.find((q) => q.id === questionId);
+  if (!question?.choicesFrom) return null;
+
+  // organizer_identity has its own matcher, and it is the tested one: it
+  // handles a first name alone, a household name, a self-reference and the
+  // same name in the other alphabet. Nothing here should re-implement it.
+  if (questionId === "organizer_identity") {
+    const match = organizerMatch({ ...answers, organizer_identity: {
+      kind: "text", schema_version: INTAKE_SCHEMA_VERSION, text: written,
+    } });
+    return match.kind === "matched" ? match.name : null;
+  }
+
+  // Any other roster-backed question: an exact match on what the button says
+  // or what it would record. Deliberately strict — a looser rule here would be
+  // guessing, and the model plus the re-ask are the right home for that.
+  const normalized = normalizeIdentity(written);
+  const hits = question.choicesFrom(answers).filter(
+    (choice) => normalizeIdentity(choice.value) === normalized
+      || normalizeIdentity(choice.label) === normalized,
+  );
+  return hits.length === 1 ? hits[0]!.value : null;
+}
+
+/**
  * The current view of whichever interview a Telegram chat is conducting.
  *
  * Read-only counterpart to submitAnswerForChat, and addressed the same way —
@@ -2148,7 +2847,7 @@ export async function getSessionForChat(db: pg.Pool, chatId: string): Promise<Ge
   }>(
     `SELECT id, trip_id, state, phase, awaiting, answers, ui_state, language
      FROM control_plane.intake_sessions
-     WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND expired_at IS NULL`,
+     WHERE ${LIVE_INTAKE_SESSION_PREDICATE}`,
     [chatId],
   );
   const [session] = row.rows;
@@ -2648,6 +3347,7 @@ function buildSessionView(
       pendingSay: null,
       pendingAskText: null,
       suggestions: {},
+      otherPending: null,
     };
   }
   // The phase is the authority; `state` is its projection. Deriving it here the
@@ -2670,6 +3370,7 @@ function buildSessionView(
     selections: currentSelections(answers),
     language,
     offeredMore: ui.offeredMore === true,
+    flightsOwed: flightsOwed(answers, ui),
     lastPrompt: ui.lastPrompt ?? null,
     phase,
     awaiting,
@@ -2680,6 +3381,7 @@ function buildSessionView(
     choices: recordChoices(answers),
     subjects: recordSubjects(answers),
     unsettled: unsettledAnswers(answers),
+    otherPending: ui.otherPending ? INTAKE_QUESTIONS.find((q) => q.id === ui.otherPending) ?? null : null,
   };
 }
 
@@ -3337,6 +4039,42 @@ export async function recordLastPromptForChat(
   await updateUiStateForChat(db, chatId, (ui) => ({ ...ui, lastPrompt: key }));
 }
 
+/**
+ * Notes the flight designators in a message the organizer typed, BEFORE the
+ * reader's proposals are applied, so a flight the reader leaves out is still
+ * known to the interview. Returns the designators this message carried.
+ *
+ * Records nothing about the trip — only that these were said. The phase is
+ * re-evaluated because a flight typed while the summary is up reopens the
+ * questions (`nextPhase`).
+ */
+export async function noteTypedFlightsForChat(
+  db: pg.Pool,
+  chatId: string,
+  text: string,
+): Promise<string[]> {
+  const found = flightDesignatorsIn(text);
+  if (found.length === 0) return [];
+  await updateUiStateForChat(db, chatId, (ui) => ({
+    ...ui,
+    typedFlights: [...new Set([...(ui.typedFlights ?? []), ...found])].slice(-40),
+  }));
+  await advancePhaseForChat(db, chatId);
+  return found;
+}
+
+/** Records that the organizer has been asked about these flights, so it is never asked twice. */
+export async function markFlightsAskedForChat(
+  db: pg.Pool,
+  chatId: string,
+  designators: readonly string[],
+): Promise<void> {
+  await updateUiStateForChat(db, chatId, (ui) => ({
+    ...ui,
+    flightsAsked: [...new Set([...(ui.flightsAsked ?? []), ...designators])].slice(-40),
+  }));
+}
+
 /** Records that the "essentials done" choice has been shown, so it is shown once. */
 export async function markOfferedMoreForChat(db: pg.Pool, chatId: string): Promise<void> {
   await updateUiStateForChat(db, chatId, (ui) => ({ ...ui, offeredMore: true }));
@@ -3537,6 +4275,35 @@ export async function toggleMultiChoiceForChat(
 }
 
 /**
+ * Starts the free-text half of a choice's Other path.
+ *
+ * This is persisted rather than held in the poller: a Telegram update can be
+ * delivered after a process restart, and the next message must still belong to
+ * the tapped question rather than being sent to the interviewer as prose.
+ */
+export async function beginOtherAnswerForChat(
+  db: pg.Pool,
+  chatId: string,
+  questionId: string,
+): Promise<GetSessionResult> {
+  const question = INTAKE_QUESTIONS.find((q) => q.id === questionId);
+  if (!question?.allowsOther || question.type !== "choice") return { ok: false, reason: "NOT_FOUND" };
+  return updateUiStateForChat(db, chatId, (ui) => ({ ...ui, otherPending: questionId }));
+}
+
+/** Records the literal text requested by an Other button, only for that button. */
+export async function submitPendingOtherForChat(
+  db: pg.Pool,
+  chatId: string,
+  text: string,
+): Promise<SubmitAnswerResult> {
+  const current = await getSessionForChat(db, chatId);
+  const questionId = current.ok ? current.view.otherPending?.id : null;
+  if (!questionId) return { ok: false, reason: "NOT_FOUND" };
+  return submitAnswerForChat(db, chatId, questionId, "other", text);
+}
+
+/**
  * `Done` on a multi-select: the set on screen is the answer.
  *
  * Nothing new is recorded — every tick already wrote itself — so this only ends
@@ -3575,11 +4342,13 @@ export async function submitAnswerForChat(
   otherText?: string,
   structuredData?: unknown,
   optionIds?: readonly string[],
+  precondition?: AnswerPrecondition,
 ): Promise<SubmitAnswerResult> {
   const result = await submitAnswerVia(
     db,
     { by: "chat", chatId },
     questionId, optionId, otherText, structuredData, optionIds,
+    false, precondition,
   );
   // A recorded answer is the main thing that can move the interview on — the
   // last required one ends `essentials`, the last optional one ends `optional`.
@@ -3603,6 +4372,7 @@ async function submitAnswerVia(
   optionIds?: readonly string[],
   /** A tick on a multi-select keyboard, not a finished answer. */
   ticking = false,
+  precondition?: AnswerPrecondition,
 ): Promise<SubmitAnswerResult> {
   const client = await db.connect();
   try {
@@ -3611,6 +4381,12 @@ async function submitAnswerVia(
     const session = await lockSession(client, locator);
     if (!session) { await client.query("ROLLBACK"); return { ok: false, reason: "NOT_FOUND" }; }
     if (session.state === "confirmed") { await client.query("ROLLBACK"); return { ok: false, reason: "SESSION_CONFIRMED" }; }
+    // Checked under the row lock, so nothing can change the answer between this
+    // comparison and the write below.
+    if (precondition && canonical(session.answers[questionId]) !== canonical(precondition.held)) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "STALE_ANSWER" };
+    }
 
     const validation = validateAnswer(questionId, optionId, otherText, INTAKE_QUESTIONS, structuredData, optionIds);
     if (!validation.ok) {
@@ -3624,11 +4400,14 @@ async function submitAnswerVia(
     // and a finished answer on the question being ticked ends the ticking.
     // Any answer to a question, a tick included, is the organizer answering it
     // themselves — a suggestion for it has nothing left to ask.
+    const withoutOther = stored.otherPending === questionId
+      ? (({ otherPending: _drop, ...rest }) => rest)(stored)
+      : stored;
     const ui: InterviewUiState = withoutSuggestion(ticking
-      ? { ...stored, multiPending: questionId }
-      : stored.multiPending === undefined
-        ? stored
-        : (({ multiPending: _drop, ...rest }) => rest)(stored), questionId);
+      ? { ...withoutOther, multiPending: questionId }
+      : withoutOther.multiPending === undefined
+        ? withoutOther
+        : (({ multiPending: _drop, ...rest }) => rest)(withoutOther), questionId);
     const newState = deriveSessionState(updatedAnswers, INTAKE_QUESTIONS, ui);
 
     await client.query(
@@ -3645,6 +4424,154 @@ async function submitAnswerVia(
         coerceLanguage(session.language) ?? DEFAULT_LANGUAGE,
       ),
     };
+  } catch (error) {
+    try { await client.query("ROLLBACK"); } catch { /* ignore */ }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export type ApplyPendingChangeResult =
+  | { ok: true; view: SessionView; questions: string[] }
+  | {
+      ok: false;
+      reason:
+        | "NOT_FOUND"
+        | "SESSION_CONFIRMED"
+        | "WRONG_SESSION"
+        | "NOT_PENDING"
+        | "ALREADY_APPLIED"
+        | "BLOCKED"
+        | "STALE"
+        /** The draft is not the version the person confirmed: a follow-up merged into it since. */
+        | "UPDATED"
+        | "INVALID";
+      detail?: string;
+    };
+
+/**
+ * Applies a waiting typed change (#206) — ONE transaction, all or nothing.
+ *
+ * The draft carries `base` (the held answer of each question it touches, as it
+ * was when the organizer was shown the change) and `result` (the validated
+ * answer that was shown). Applying is a compare-and-swap from one to the other,
+ * under the session's row lock and the draft's own:
+ *
+ *  - the draft must be `pending` and belong to THIS chat's live session — the
+ *    draft id arrives in a button's callback data, which proves nothing about
+ *    who tapped it;
+ *  - every touched question must still hold exactly what was shown as `base`;
+ *    otherwise nothing is written (`STALE`) and the caller rebuilds the change
+ *    against what is held now and shows it again;
+ *  - each `result` is validated once more, the writer's own gate;
+ *  - a draft with an open reference or a conflict cannot be applied (`BLOCKED`).
+ * A change touching two questions is applied together or not at all. A second
+ * tap finds the draft applied and says so (`ALREADY_APPLIED`), writing nothing.
+ *
+ * The model is never called here: what is committed is the stored result, not a
+ * fresh reading of the words that produced it.
+ */
+export async function applyPendingChangeForChat(
+  db: pg.Pool,
+  chatId: string,
+  draftId: string,
+  /**
+   * The digest of the version the person was looking at (`draftDigest`). Compared
+   * under the lock, so a follow-up merged in between can never be applied by an
+   * older Yes. Omitted only by a caller that has just read the draft itself.
+   */
+  expectedDigest?: string,
+): Promise<ApplyPendingChangeResult> {
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+    const session = await lockSession(client, { by: "chat", chatId });
+    if (!session) { await client.query("ROLLBACK"); return { ok: false, reason: "NOT_FOUND" }; }
+    if (session.state === "confirmed") { await client.query("ROLLBACK"); return { ok: false, reason: "SESSION_CONFIRMED" }; }
+
+    const found = await client.query<{
+      id: string;
+      session_id: string;
+      status: string;
+      base: Record<string, unknown>;
+      ops: Op[];
+      result: Record<string, IntakeAnswer>;
+      preview: Line[];
+      unresolved: unknown[];
+      blocked: unknown[];
+    }>(
+      `SELECT id, session_id, status, base, ops, result, preview, unresolved, blocked
+         FROM control_plane.intake_pending_changes WHERE id = $1 FOR UPDATE`,
+      [draftId],
+    );
+    const draft = found.rows[0];
+    if (!draft) { await client.query("ROLLBACK"); return { ok: false, reason: "NOT_FOUND" }; }
+    if (draft.session_id !== session.id) { await client.query("ROLLBACK"); return { ok: false, reason: "WRONG_SESSION" }; }
+    if (draft.status === "applied") { await client.query("ROLLBACK"); return { ok: false, reason: "ALREADY_APPLIED" }; }
+    if (draft.status !== "pending") { await client.query("ROLLBACK"); return { ok: false, reason: "NOT_PENDING" }; }
+
+    if (expectedDigest !== undefined && expectedDigest !== draftDigest(draft)) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "UPDATED" };
+    }
+
+    const questionIds = Object.keys(draft.result ?? {});
+    if (questionIds.length === 0 || draft.unresolved.length > 0 || draft.blocked.length > 0) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "BLOCKED" };
+    }
+    for (const questionId of questionIds) {
+      if (canonical(session.answers[questionId] ?? null) !== canonical(draft.base?.[questionId] ?? null)) {
+        await client.query("ROLLBACK");
+        return { ok: false, reason: "STALE", detail: questionId };
+      }
+    }
+
+    // The warnings on a preview (a confirmed booking a removal leaves behind, a
+    // dietary scope that would name nobody, an organizer who would un-match) are
+    // computed from answers this change does not touch, so `base` does not cover
+    // them. They are recomputed HERE, from the answers as they are now: if they
+    // differ from what the person was shown, nothing is applied and the caller
+    // shows the current preview.
+    const fresh = applyOps(session.answers, draft.ops);
+    if (fresh.ok && canonical(warningLines(fresh.preview)) !== canonical(warningLines(draft.preview))) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "UPDATED" };
+    }
+
+    const written: AnswerStore = {};
+    for (const questionId of questionIds) {
+      const shown = draft.result[questionId]!;
+      if (shown.kind !== "structured") { await client.query("ROLLBACK"); return { ok: false, reason: "INVALID", detail: questionId }; }
+      const checked = validateAnswer(questionId, null, null, INTAKE_QUESTIONS, shown.data);
+      if (!checked.ok) {
+        await client.query("ROLLBACK");
+        return { ok: false, reason: "INVALID", detail: `${questionId}: ${checked.reason}` };
+      }
+      written[questionId] = checked.answer;
+    }
+
+    const updatedAnswers = canonicalized({ ...session.answers, ...written });
+    const ui = questionIds.reduce((u, questionId) => withoutSuggestion(u, questionId), parseUiState(session.ui_state));
+    const newState = deriveSessionState(updatedAnswers, INTAKE_QUESTIONS, ui);
+    await client.query(
+      "UPDATE control_plane.intake_sessions SET answers = $1, state = $2, ui_state = $3::jsonb, updated_at = now() WHERE id = $4",
+      [JSON.stringify(updatedAnswers), newState, serializeUiState(ui), session.id],
+    );
+    await client.query(
+      `UPDATE control_plane.intake_pending_changes
+          SET status = 'applied', resolved_at = now(), resolved_by = 'organizer', updated_at = now()
+        WHERE id = $1`,
+      [draft.id],
+    );
+    await client.query("COMMIT");
+
+    // Advancing the phase is its own step, as it is for every other writer.
+    await advancePhaseForChat(db, chatId);
+    const view = await getSessionForChat(db, chatId);
+    if (!view.ok) return { ok: false, reason: "NOT_FOUND" };
+    return { ok: true, view: view.view, questions: questionIds };
   } catch (error) {
     try { await client.query("ROLLBACK"); } catch { /* ignore */ }
     throw error;
@@ -3714,6 +4641,20 @@ async function confirmIntakeVia(
       return { ok: true, sessionId: session.id, intakeVersionId: ver.id, digest: ver.digest, versionNumber: ver.version };
     }
 
+    // A CHANGE THE ORGANIZER HAS NOT SETTLED. Confirming now would lock in the
+    // answers the change is about to alter, or drop it unseen — never silently
+    // applied, never silently dropped. Checked here, under the session lock and
+    // before anything else, so BOTH callers are covered: the Confirm button
+    // (`confirmIntakeForChat`) and the web route (`confirmIntake`, app.ts).
+    const waiting = await client.query(
+      "SELECT 1 FROM control_plane.intake_pending_changes WHERE session_id = $1 AND status = 'pending' LIMIT 1",
+      [session.id],
+    );
+    if ((waiting.rowCount ?? 0) > 0) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "PENDING_CHANGE" };
+    }
+
     // All required questions must be answered.
     const allRequired = INTAKE_QUESTIONS.filter((q) => q.required);
     // `isAnswered`, not presence: an organizer answer that names nobody on the
@@ -3750,13 +4691,36 @@ async function confirmIntakeVia(
     const versionId = generateId("intk");
     const artifactRef = `intake:sessions:${session.id}:v${nextVersion}`;
 
+    // WHICH DOCUMENTS this version was built from, as a manifest of the trip's
+    // registry rather than a copy of their text. The session's own
+    // `source_document` held only the last document read — each upload
+    // overwrote the one before — so a version built from four confirmations
+    // recorded one. The text lives on the extraction rows; this names the
+    // documents so the version can be traced back to them. The agent path
+    // still stages `source_document` itself and has no registry rows, so it
+    // keeps what it staged.
+    const registered = await listTripDocuments(client, session.trip_id);
+    const sourceDocument = registered.length > 0
+      ? {
+          documents: registered.map((doc) => ({
+            documentId: doc.id,
+            digest: doc.contentDigest,
+            filename: doc.filename,
+            byteSize: doc.byteSize,
+            mime: doc.mime,
+            stored: doc.ingestState === "stored",
+          })),
+          sources: await confirmedSources(client, session.trip_id, session.answers),
+        }
+      : session.source_document ?? null;
+
     await client.query(
       `INSERT INTO control_plane.intake_versions(id, trip_id, version, artifact_ref, digest, confirmed_at, schema_version, data, source_document, language)
        VALUES ($1, $2, $3, $4, $5, now(), $6, $7::jsonb, $8::jsonb, $9)`,
       [
         versionId, session.trip_id, nextVersion, artifactRef, intakeDigest,
         INTAKE_SCHEMA_VERSION, JSON.stringify(session.answers),
-        session.source_document ? JSON.stringify(session.source_document) : null,
+        sourceDocument ? JSON.stringify(sourceDocument) : null,
         // The language the interview was actually held in, copied onto the
         // version because the SESSION does not survive: it is deleted on reset
         // and superseded on correction, while the transformer reads the
@@ -3791,6 +4755,38 @@ async function confirmIntakeVia(
       intake_version_id: versionId,
       version: nextVersion,
     }));
+
+    // LOUD, NOT BLOCKING. A stop in non-Latin script with no English name gives
+    // the site no English side and the trip no English slug or title, and
+    // nothing else would ever say so (star e2e, 2026-10-15). A count only: the
+    // names are the organizer's, and the count is what tells an operator to look.
+    const phasesAnswer = session.answers.phases;
+    const unnamed = phasesAnswer?.kind === "structured" ? stopsMissingEnglishName(phasesAnswer.data) : [];
+    if (unnamed.length > 0) {
+      log(structuredLog("warn", "interview.stop_without_english_name", {
+        session_id: session.id,
+        trip_id: session.trip_id,
+        intake_version_id: versionId,
+        stops_missing_name_en: unnamed.length,
+      }));
+    }
+
+    // The same, for travellers: `name` in the interview's language, `name_en` in
+    // Latin letters (owner's manual test, 2026-10-15). Counts only — these are
+    // people's names.
+    const travelersAnswer = session.answers.travelers;
+    const nameGap = travelersAnswer?.kind === "structured"
+      ? travelersMissingNames(travelersAnswer.data, coerceLanguage(session.language) ?? DEFAULT_LANGUAGE)
+      : { missingInterviewLanguageName: 0, missingEnglishName: 0 };
+    if (nameGap.missingInterviewLanguageName > 0 || nameGap.missingEnglishName > 0) {
+      log(structuredLog("warn", "interview.traveler_without_name_form", {
+        session_id: session.id,
+        trip_id: session.trip_id,
+        intake_version_id: versionId,
+        travelers_missing_interview_language_name: nameGap.missingInterviewLanguageName,
+        travelers_missing_name_en: nameGap.missingEnglishName,
+      }));
+    }
 
     return { ok: true, sessionId: session.id, intakeVersionId: versionId, digest: intakeDigest, versionNumber: nextVersion };
   } catch (error) {
@@ -3908,10 +4904,6 @@ export async function saveSourceDocumentForChat(
 export type ConsularContact = { name: { he: string; en: string }; phone: string };
 
 const CONSULAR_MAX_AGE_DAYS = 180;
-
-function normaliseCountry(value: unknown): string {
-  return String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ").slice(0, 80);
-}
 
 /** The site renders contact.name through `_biSpan` (raw HTML) and phone into a
  * `tel:` href — same XSS posture as the itinerary `days` text, so strip markup

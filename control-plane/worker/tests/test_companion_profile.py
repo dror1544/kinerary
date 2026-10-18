@@ -144,6 +144,61 @@ class BuildCompanionHandoffTests(unittest.TestCase):
             self.assertNotIn(forbidden, blob.lower())
 
 
+class UnresolvedTripTypeReachesTheCompanionTests(unittest.TestCase):
+    """The organizer typed a trip type that matched no option. The transformer
+    marks it as an open question; this is the render the companion reads."""
+
+    TEMPLATE = Path(__file__).resolve().parents[3] / "profile-templates" / "familytrip-companion"
+
+    def _rendered_private_context(self, trip_type: dict) -> dict:
+        import subprocess
+        import sys
+        import tempfile
+
+        from control_plane_worker.transformer import transform_intake
+
+        intake = {
+            "trip_type": trip_type,
+            "destination": {"kind": "text", "schema_version": 1, "text": "Japan"},
+            "trip_duration": {"kind": "choice", "option_id": "two_weeks", "schema_version": 1, "other_text": None},
+        }
+        produced = (transform_intake(intake).get("agent") or {}).get("standing_instructions", [])
+        config = {**FULL_CONFIG, "agent": {**FULL_CONFIG["agent"], "standing_instructions": produced}}
+        handoff = build_companion_handoff(
+            trip_id="trip_abc", slug="tokyo-2026", config=config,
+            intake_version_id="intk_abc", intake_schema_version=2,
+            intake_digest="sha256:" + "a" * 64, confirmed_at="2026-01-01T00:00:00+00:00",
+            canonical_site_url="https://tokyo-2026.example",
+        )
+        assert handoff is not None
+        with tempfile.TemporaryDirectory() as tmp:
+            src, out = Path(tmp) / "in.json", Path(tmp) / "bundle"
+            src.write_text(json.dumps(handoff))
+            done = subprocess.run(
+                [sys.executable, str(self.TEMPLATE / "render_profile.py"), "--input", str(src), "--output", str(out)],
+                text=True, capture_output=True,
+            )
+            self.assertEqual(done.returncode, 0, done.stderr)
+            return json.loads((out / "references" / "interview-context.private.json").read_text())
+
+    def test_a_typed_trip_type_is_an_open_question_in_the_rendered_private_context(self) -> None:
+        private = self._rendered_private_context(
+            {"kind": "choice_other", "option_id": None, "schema_version": 1, "other_text": "two couples, no kids"}
+        )
+        asked = [i for i in private["organizer_private"]["standing_instructions"]
+                 if i.get("open_question") == "trip_type"]
+        self.assertEqual(len(asked), 1)
+        self.assertIn("two couples, no kids", asked[0]["text"]["en"])
+        self.assertEqual(asked[0]["visibility"], "organizer")
+
+    def test_a_chosen_trip_type_renders_no_open_question(self) -> None:
+        private = self._rendered_private_context(
+            {"kind": "choice", "option_id": "couple", "schema_version": 1, "other_text": None}
+        )
+        instructions = private["organizer_private"].get("standing_instructions", [])
+        self.assertEqual([i for i in instructions if i.get("open_question")], [])
+
+
 class SlugifyProfileNameTests(unittest.TestCase):
     def test_strips_hyphens_and_stays_in_bounds(self) -> None:
         self.assertRegex(_slugify_profile_name("tokyo-kyoto-2026"), r"^[a-z][a-z0-9]{2,31}$")
@@ -315,4 +370,27 @@ class CompanionOverlayTemplateTests(unittest.TestCase):
         )
         # And the one-shot flag is spent before the profile ever speaks.
         self.assertIs(onboarding["seen"]["profile_build_offered"], True)
+
+    def test_skill_manage_writes_are_staged_and_toolsets_are_unchanged(self) -> None:
+        """companion-write-confinement (2026-09-29): production usage showed
+        write_file/patch (zero calls, ever) and skill_manage (one call, ever —
+        the companion writing itself an undesired workaround skill) have no
+        legitimate use on a trip companion. `skills.write_approval: true`
+        makes Hermes's own gate (tools/write_approval.py) STAGE every
+        skill_manage create/edit/patch/delete/write_file/remove_file instead
+        of applying it — nothing auto-approves a staged write.
+
+        This must NOT touch disabled_toolsets: `file`, `memory`, `cronjob`
+        and `skills` stay enabled so read_file/search_files/skill_view/memory
+        keep working — only the WRITE actions are gated, and write_file/patch
+        are a separate code path this config key does not reach (confined
+        instead by HERMES_WRITE_SAFE_ROOT, set at enrollment — see
+        scripts/companion-install-host.sh, not this template).
+        """
+        overlay = yaml.safe_load(self.OVERLAY.read_text(encoding="utf-8"))
+        self.assertEqual(overlay["skills"], {"write_approval": True})
+        self.assertEqual(
+            overlay["agent"]["disabled_toolsets"], ["terminal", "code_execution"],
+            "this change must not disable file/memory/cronjob/skills too",
+        )
 

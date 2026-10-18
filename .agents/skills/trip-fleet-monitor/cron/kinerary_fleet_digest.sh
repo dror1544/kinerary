@@ -63,17 +63,34 @@ run_section() {
   return 1
 }
 
-echo "📋 Kinerary daily digest — $(date '+%a %d %b, %H:%M')"
+# WHAT THE MESSAGE IS MADE OF. This is delivered with --no-agent: no model sits
+# between this script and Telegram, so whatever markdown appears here is exactly
+# what the gateway's markdown -> MarkdownV2 converter is handed. Measured
+# 2026-09-28 by running Hermes's own converter over the delivered digest:
+#   *Title*   comes out ITALIC. Bold is **Title**.
+#   ``` block comes out as a boxed, quote-looking block, which the owner dislikes.
+#   a line starting with > is a real block quote.
+# So the sections come from `--format digest` on the three tools (fleet-mcp.mjs):
+# bold titles, one bullet per fact, no fences, no pipe tables. The same tools
+# print their agent-facing text by default, and that text is not changed.
+#
+# The other half of a clean delivery is not in this file: Hermes wraps every cron
+# delivery in "Cronjob Response: <name> ... To stop or manage this job, send me
+# a new message", which is noise for a job with no agent to talk to. That is
+# `cron.wrap_response`, switched off by scripts/bootstrap-fleet-monitor.sh.
+echo "**📋 Kinerary daily digest — $(date '+%a %d %b, %H:%M')**"
 echo
 
-if run_section --tool fleet_overview; then
+# The stack line comes first in this section's own output, so it names the
+# control plane the whole digest was read from.
+if run_section --tool fleet_overview --format digest; then
   echo "$OUT"
 else
   echo "❌ The fleet overview could not be read: $ERR"
 fi
 echo
 
-if run_section --tool statistics --days 7; then
+if run_section --tool statistics --days 7 --format digest; then
   echo "$OUT"
 else
   echo "❌ Statistics could not be read: $ERR"
@@ -83,14 +100,14 @@ echo
 # The same alerts the watchdog uses, so the digest and the alerts can never
 # disagree about what is wrong. Empty output means healthy ONLY when the check
 # itself succeeded.
-if run_section --tool alerts; then
+if run_section --tool alerts --format digest; then
   if [ -n "$OUT" ]; then
     echo "$OUT"
   else
     echo "✅ Nothing needs attention."
   fi
 else
-  echo "❌ Fleet health could NOT be checked — the alerts query failed, so this digest cannot say whether anything needs attention."
+  echo "❌ **Fleet health could NOT be checked** — the alerts query failed, so this digest cannot say whether anything needs attention."
   echo "   $ERR"
 fi
 

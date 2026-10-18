@@ -3,6 +3,7 @@ import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 
 const LandingPage = lazy(() => import("./pages/LandingPage"));
 const ProductApp = lazy(() => import("./pages/ProductApp"));
+const AdminDashboardPage = lazy(() => import("./pages/AdminDashboardPage"));
 const NotFoundPage = lazy(() => import("./pages/NotFoundPage"));
 
 function RouteFallback() {
@@ -23,6 +24,7 @@ function PageTitle() {
     "/forgot-password": "Reset your password — Kinerary",
     "/trips": "My trips — Kinerary",
     "/trips/new": "Start a trip — Kinerary",
+    "/admin": "Super-admin dashboard — Kinerary",
   };
   useEffect(() => {
     document.title = titles[location.pathname] ?? "Kinerary";
@@ -46,6 +48,10 @@ export function App() {
           <Route path="/trips/:tripId" element={<ProductApp view="trip" />} />
           <Route path="/trips/:tripId/app" element={<ProductApp view="runtime" />} />
           <Route path="/join" element={<ProductApp view="join" />} />
+          {/* Operator-only, gated by its own X-API-Key inside the page —
+              not the organizer cookie session every other /trips/* route
+              uses. See admin-api.ts's module doc. */}
+          <Route path="/admin" element={<AdminDashboardPage />} />
           <Route path="/new-trip" element={<Navigate to="/trips/new" replace />} />
           <Route path="*" element={<NotFoundPage />} />
         </Routes>

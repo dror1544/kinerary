@@ -7,11 +7,14 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
-import { startTestServer, stopTestServer, api, loginAsAlice } from './helpers/server.js';
+import { createRequire } from 'module';
+import { startTestServer, stopTestServer, api, loginAsAlice, testTripDir } from './helpers/server.js';
 import { PORTS } from './helpers/ports.js';
 
 let token;
 const HERE = dirname(fileURLToPath(import.meta.url));
+// The trip server's own SQLite binding (tests/ has none of its own).
+const Database = createRequire(import.meta.url)('../server/node_modules/better-sqlite3');
 
 before(async () => {
   // A non-empty HERMES_URL puts the plan layer in its normal "an enrichment
@@ -806,6 +809,26 @@ describe('GET /api/config/roster', () => {
   });
 });
 
+// ── GET /api/config/deployment-identity ───────────────────────────────────────
+// Deliberately public, deliberately just this one field — #review 2026-10-03
+// [P2]: the verification worker's rendered_data check compared only the
+// roster, and two trips for the same family can share one, so a misrouted
+// private_url could pass against the wrong trip. #review 2026-10-06 [N1]:
+// this used to serve the real departure/returnDate, which meant anyone who
+// knew the hostname learned exactly when the family is away. Now serves an
+// opaque deploymentNonce instead — carries no information about the trip,
+// so a public, unauthenticated route stays safe to probe.
+describe('GET /api/config/deployment-identity', () => {
+  test('is reachable without a token, and carries only an opaque nonce — never the real dates', async () => {
+    const res = await api('/api/config/deployment-identity');
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.deepEqual(Object.keys(body).sort(), ['deploymentNonce']);
+    assert.equal(typeof body.deploymentNonce, 'string');
+    assert.ok(!('departure' in body) && !('returnDate' in body), 'must never serve real dates here');
+  });
+});
+
 // ── Config-driven generalization: phases derive from config ───────────────────
 describe('config-driven phase structure', () => {
   test('phase count matches fixture config', async () => {
@@ -1434,11 +1457,19 @@ describe('Phase plan migration', () => {
   });
 
   test('skips a booking whose phase is not in trip.config.json', async () => {
-    await api('/api/bookings', {
+    // POST /api/bookings now refuses an unknown phase, so a row like this can
+    // only come from before that check (or a config that dropped a stop) —
+    // plant it the way such a row exists: directly in the trip DB.
+    const refused = await api('/api/bookings', {
       method: 'POST', token,
-      body: { phase: 'not-a-configured-phase', type: 'other', name: 'מחוץ לקונפיג',
-              notes: 'ד'.repeat(120) },
+      body: { phase: 'not-a-configured-phase', type: 'other', name: 'מחוץ לקונפיג', notes: 'ד'.repeat(120) },
     });
+    assert.equal(refused.status, 400);
+    const db = new Database(join(dirname(testTripDir()), 'trip.db'));
+    try {
+      db.prepare("INSERT INTO bookings (phase, type, name, notes, created_by) VALUES ('not-a-configured-phase', 'other', 'מחוץ לקונפיג', ?, 'alice')")
+        .run('ד'.repeat(120));
+    } finally { db.close(); }
     const { created, skipped } = await (await api('/api/phase-plan/import-from-bookings',
       { method: 'POST', token })).json();
     assert.ok(!created.some(i => i.text_he.includes('מחוץ לקונפיג')),

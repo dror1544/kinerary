@@ -1,0 +1,83 @@
+{
+  "format": 1,
+  "updated_at": "2026-09-20T17:38:45Z",
+  "updated_by": "Dror (recorded by Claude, readiness-baseline session)",
+  "sprint": {
+    "id": "6",
+    "title": "Verification, explicit activation, dashboard, and demo rehearsal",
+    "integration_branch": "integration/sprint-6",
+    "target_branch": "main",
+    "milestone": "Sprint 6",
+    "scope": {
+      "plan": "docs/onboarding-mvp-sprint-plan.md#sprint-6--verification-explicit-activation-dashboard-and-demo-rehearsal",
+      "tracks": "docs/sprint6-tracks.md (arrives with PR #111)",
+      "team": "docs/agent-team-plan.md"
+    }
+  },
+  "baseline": {
+    "branch": "integration/sprint-6",
+    "commit": "97582b6bab1832a2f614c836717b229a828907c9",
+    "report": "docs/test-reports/sprint-6-baseline-2026-09-20.md",
+    "release": null
+  },
+  "locks": {
+    "sprint": {
+      "state": "open",
+      "since": "2026-09-20",
+      "by": "Dror (recorded by Claude, readiness-baseline session)",
+      "reason": "Dror, 2026-09-20: baseline established and the sprint work begins; he conditioned the unlock on the e2e passing with appropriate waivers, and scripts/e2e-full-cycle.py --scenario vietnam --auto --teardown is green at 97582b6 against a build verified from inside the running container, with no waivers taken",
+      "meaning": "the integration branch may be assessed, merged to main and deployed, through the normal gates",
+      "forbids": []
+    },
+    "baseline": {
+      "state": "locked",
+      "since": "2026-09-20",
+      "by": "Dror (recorded by Claude, readiness-baseline session)",
+      "reason": "Dror, 2026-09-20, approved explicitly: the baseline is final at 97582b6 and the agent team may start; evidence is the nine suites recorded in docs/test-reports/sprint-6-baseline-2026-09-20.md, run at that commit with a clean tree",
+      "meaning": "the baseline is settled: baseline.commit is what sprint work builds on, and the agent team may start",
+      "forbids": [
+        "moving baseline.commit without --override"
+      ]
+    }
+  },
+  "override": {
+    "rule": "A lock, the baseline commit or the sprint changes only through scripts/project-state.py, with --by and --reason. Moving baseline.commit while the baseline is locked, or changing the sprint while the sprint is locked, needs --override and is recorded as such. The resulting file change is a commit; hard rule 1 makes every commit a human approval, and the commit prompt names every lock, baseline and override change in it.",
+    "commands": [
+      "scripts/project-state.py lock|unlock sprint|baseline --by WHO --reason WHY",
+      "scripts/project-state.py set-baseline --commit REF --by WHO --reason WHY [--override]",
+      "scripts/project-state.py set-sprint --id N --integration-branch B --by WHO --reason WHY [--override]"
+    ]
+  },
+  "history": [
+    {
+      "at": "2026-09-20T13:05:57Z",
+      "by": "Dror (recorded by Claude, agent-team plan session)",
+      "change": "init sprint 6 at 6ebd532",
+      "reason": "both locks were only in memory files and operator knowledge; Dror asked on 2026-09-20 for one durable, agent-readable source of truth"
+    },
+    {
+      "at": "2026-09-20T14:10:02Z",
+      "by": "Dror (recorded by Claude, readiness-baseline session)",
+      "change": "set-baseline 6ebd532 -> 4cfcad5",
+      "reason": "Dror, 2026-09-20: #131 is approved and committed, so the baseline pointer moves to it; 6ebd532 predated the flight-designator fix and no longer reflected the tree the sprint would start from"
+    },
+    {
+      "at": "2026-09-20T16:46:34Z",
+      "by": "Dror (recorded by Claude, readiness-baseline session)",
+      "change": "set-baseline 4cfcad5 -> 97582b6",
+      "reason": "Dror, 2026-09-20: the baseline is the point where this session's tasks are finished and verified, and Sprint 6 starts with all agents from there; #131 (4cfcad5) and #134 (97582b6) are committed and nine suites were run green at 97582b6"
+    },
+    {
+      "at": "2026-09-20T16:46:34Z",
+      "by": "Dror (recorded by Claude, readiness-baseline session)",
+      "change": "lock baseline at 97582b6",
+      "reason": "Dror, 2026-09-20, approved explicitly: the baseline is final at 97582b6 and the agent team may start; evidence is the nine suites recorded in docs/test-reports/sprint-6-baseline-2026-09-20.md, run at that commit with a clean tree"
+    },
+    {
+      "at": "2026-09-20T17:38:45Z",
+      "by": "Dror (recorded by Claude, readiness-baseline session)",
+      "change": "unlock sprint",
+      "reason": "Dror, 2026-09-20: baseline established and the sprint work begins; he conditioned the unlock on the e2e passing with appropriate waivers, and scripts/e2e-full-cycle.py --scenario vietnam --auto --teardown is green at 97582b6 against a build verified from inside the running container, with no waivers taken"
+    }
+  ]
+}

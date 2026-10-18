@@ -34,7 +34,7 @@ test("a web profile boots without duplicate trip routes and retires Telegram web
   const profile = validateArchitectureProfile(JSON.parse(await readFile(path, "utf8")));
   const portal = {
     db: {} as PortalDependencies["db"],
-    google: { authorizationUrl: () => "https://accounts.example.test", exchange: async () => ({ subject: "sub", displayName: "Name" }) },
+    google: { authorizationUrl: () => "https://accounts.example.test", exchange: async () => ({ subject: "sub", displayName: "Name", emailVerified: false }) },
     runtimeAccounts: { participantExists: async () => true, provisionParticipant: async () => {} },
     publicOrigin: profile.web!.public_origin,
     runtimeOrigin: profile.web!.runtime_origin,

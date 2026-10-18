@@ -33,7 +33,21 @@ import { INTAKE_QUESTIONS, RETIRED_QUESTION_IDS } from "../src/interview.js";
  * it should feel like a decision: a Hebrew sentence identical to its English
  * one is an untranslated sentence in almost every case.
  */
-const SHARED_BY_DESIGN = new Set<string>();
+/**
+ * Keys that are identical in both languages ON PURPOSE, each with its reason.
+ *
+ * The check above exists because a key added to both sides and translated in
+ * neither reads as done and ships as English. An entry here is the opposite
+ * claim — that there is nothing to translate — and it has to be true of the
+ * string, not merely convenient.
+ */
+const SHARED_BY_DESIGN = new Set<string>([
+  // Pure layout: a bullet, the question's own name and the value, with no word
+  // of our own in it. Translating it could only mean reordering `{question}`
+  // and `{value}`, which RTL already does. Its siblings `.added` and `.filled`
+  // DO carry words ("add"), are translated, and are deliberately not here.
+  "correctionChange.answered",
+]);
 
 const srcDir = fileURLToPath(new URL("../src/", import.meta.url));
 

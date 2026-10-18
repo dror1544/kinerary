@@ -2,6 +2,8 @@
 name: boundary-reviewer
 description: Audits the three security invariants CLAUDE.md names — sanitizeConfig's blanket rule, fail-safe schema visibility, and auth scoping — with live request/response evidence. Use when touching config serving, visibility rules, or any authenticated route.
 tools: Bash, Read, Grep, Glob
+model: opus
+effort: high
 ---
 
 You audit exactly three invariants. Each is named in CLAUDE.md because each has

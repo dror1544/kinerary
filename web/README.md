@@ -13,9 +13,17 @@ Dynamic public and organizer-facing web application for Kinerary.
 - lazy-loaded route bundles and deep-link fallback;
 - route and interaction tests.
 
-Authentication controls are intentionally interface-only in this slice. They
-do not create sessions or call the existing per-trip authentication endpoints.
-Public organizer authentication will be wired to new control-plane endpoints.
+Authentication is wired, as of 2026-09-19. `signIn()` navigates to
+`/v1/auth/google/start` and `passwordSignIn()` posts to `/v1/auth/password`;
+both are served by `control-plane/api/src/portal.ts`, which also issues the
+rotating session cookie and enforces CSRF on mutations. A verified Google login
+creates the account.
+
+What is still missing is organizer **email/password signup**: `/sign-up` and
+`/forgot-password` redirect to `/sign-in`, and of the nine account endpoints in
+`docs/web-control-plane-integration-plan.md` §4.3 only the Google pair, `/v1/me`
+and `/v1/logout` exist. Provisioned trip sites are a separate story again — they
+have no registration route at all.
 
 ## Local development
 
