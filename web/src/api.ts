@@ -36,6 +36,15 @@ function csrfToken() {
     ?.split("=")[1];
 }
 
+export class ApiError extends Error {
+  constructor(public readonly code: string, message: string) { super(message); }
+}
+
+export type InterviewLinkState = {
+  activeEnrollment: { id: string; expiresAt: string } | null;
+  recoverable: boolean; hasInterview: boolean; telegramChatUrl: string;
+};
+
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
@@ -47,7 +56,18 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(path, { ...init, headers, credentials: "same-origin" });
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));
-    throw new Error(payload.message || payload.error || "The request could not be completed.");
+    const messages: Record<string, string> = {
+      INVALID_CREDENTIALS: "Email or password is incorrect.",
+      SIGN_IN_RATE_LIMITED: "Too many sign-in attempts. Please try again in a minute.",
+      GOOGLE_SIGN_IN_UNAVAILABLE: "Google sign-in is not available here.",
+      ACTIVE_ENROLLMENT_EXISTS: "An interview link already exists. You can replace a lost link before the interview starts.",
+      TRIP_NOT_DRAFT: "Your interview has already started. Continue in your existing Telegram chat.",
+      INTERVIEW_ALREADY_STARTED: "Your interview has already started. Continue in your existing Telegram chat.",
+      ENROLLMENT_NOT_REPLACEABLE: "This link changed or was already used. Check the trip status before continuing.",
+      ENROLLMENT_BUSY: "Trip setup is changing. Please try again.",
+      ORIGIN_INVALID: "Please sign in from the Kinerary website.",
+    };
+    throw new ApiError(typeof payload.error === "string" ? payload.error : "REQUEST_FAILED", messages[payload.error] || payload.message || payload.error || "The request could not be completed.");
   }
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
@@ -79,3 +99,10 @@ export function passwordSignIn(input: { tripId: string; runtimeUsername: string;
 export const getMe = () => api<unknown>("/v1/me").then((value) => meSchema.parse(value));
 export const getTrips = () => api<unknown>("/v1/trips").then((value) => z.object({ trips: z.array(tripSchema) }).parse(value));
 export const getTrip = (id: string) => api<unknown>(`/v1/trips/${encodeURIComponent(id)}`).then((value) => tripSchema.parse(value));
+
+export const getAuthCapabilities = () => api<unknown>("/v1/auth/capabilities").then(value => z.object({ google: z.boolean(), emailPassword: z.boolean() }).parse(value));
+export const emailPasswordSignIn = (input: { email: string; password: string; returnTo: string }) => api<{ appPath: string }>("/v1/auth/email-password", { method: "POST", body: JSON.stringify(input) });
+export function safeReturnTo(value: string | null): string {
+  if (!value?.startsWith("/") || value.startsWith("//") || value.includes("\\")) return "/trips";
+  try { const url = new URL(value, "https://portal.invalid"); return url.origin === "https://portal.invalid" ? `${url.pathname}${url.search}${url.hash}` : "/trips"; } catch { return "/trips"; }
+}

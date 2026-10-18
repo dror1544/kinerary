@@ -3,8 +3,8 @@ import { promisify } from "node:util";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type pg from "pg";
 import { CodeChallengeMethod, OAuth2Client } from "google-auth-library";
-import { issueEnrollment } from "./enrollment.js";
-import { ensureUnknownPasswordCredential, resolveOrCreateEmailAccount } from "./password-identity.js";
+import { issueEnrollment, replaceEnrollment } from "./enrollment.js";
+import { ensureUnknownPasswordCredential, resolveOrCreateEmailAccount, verifyPasswordLogin } from "./password-identity.js";
 import { generatePlan } from "./planner.js";
 import { issueApproval } from "./plan-approval.js";
 
@@ -166,7 +166,7 @@ export class HttpRuntimeAccountAdapter implements RuntimeAccountAdapter {
 
 export interface PortalDependencies {
   db: pg.Pool;
-  google: GoogleOidcAdapter;
+  google?: GoogleOidcAdapter;
   runtimeAccounts: RuntimeAccountAdapter;
   publicOrigin: string;
   runtimeOrigin: string;
@@ -368,7 +368,56 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
     return reply.code(202).send({ accepted: true });
   });
 
+  app.get("/v1/auth/capabilities", async () => ({ google: Boolean(deps.google), emailPassword: true }));
+
+  // Bound both expensive credential checks and limiter memory. Use the socket
+  // peer from Fastify (trustProxy is off), never caller-supplied forwarding.
+  type Attempts = Map<string, { count: number; expiresAt: number }>;
+  const loginAttempts: Attempts = new Map();
+  const accountAttempts: Attempts = new Map();
+  function admitLogin(attempts: Attempts, key: string, limit: number): boolean {
+    const now = Date.now();
+    for (const [storedKey, entry] of attempts) if (entry.expiresAt <= now) attempts.delete(storedKey);
+    const previous = attempts.get(key);
+    if ((previous && previous.count >= limit) || (!previous && attempts.size >= 1024)) return false;
+    attempts.set(key, { count: (previous?.count ?? 0) + 1, expiresAt: previous?.expiresAt ?? now + 60_000 });
+    return true;
+  }
+  app.post("/v1/auth/email-password", async (request, reply) => {
+    if (!admitLogin(loginAttempts, request.ip, 100)) {
+      return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
+    }
+    // A login creates only a session, never an account or a credential.
+    const body = request.body as Record<string, unknown> | null;
+    if (!body || typeof body.email !== "string" || body.email.length > 254 ||
+        typeof body.password !== "string" || body.password.length > 1024) {
+      return reply.code(401).send({ error: "INVALID_CREDENTIALS" });
+    }
+    // Same-origin forms do not require a pre-existing session's CSRF token,
+    // but must not let another origin force the browser into a chosen account.
+    if (request.headers.origin && request.headers.origin !== deps.publicOrigin) {
+      return reply.code(403).send({ error: "ORIGIN_INVALID" });
+    }
+    if (!admitLogin(accountAttempts, sha256(body.email.trim().toLowerCase()), 10)) {
+      return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
+    }
+    const result = await verifyPasswordLogin(deps.db, body);
+    if (!result.ok) return reply.code(401).send({ error: "INVALID_CREDENTIALS" });
+    const client = await deps.db.connect();
+    try {
+      await client.query("BEGIN");
+      const user = await client.query("SELECT id FROM control_plane.users WHERE id = $1 AND status = 'active' FOR SHARE", [result.identity.providerSubjectId]);
+      if (!user.rows[0]) { await client.query("ROLLBACK"); return reply.code(401).send({ error: "INVALID_CREDENTIALS" }); }
+      const session = await createWebSession(client, user.rows[0].id, deps.sessionTtlSeconds);
+      await client.query("COMMIT");
+      setWebSessionCookies(reply, deps, session);
+      return { appPath: validatedReturnTo(body.returnTo) };
+    } catch (error) { await client.query("ROLLBACK"); throw error; }
+    finally { client.release(); }
+  });
+
   app.get("/v1/auth/google/start", async (request, reply) => {
+    if (!deps.google) return reply.code(503).send({ error: "GOOGLE_SIGN_IN_UNAVAILABLE" });
     const query = request.query as Record<string, unknown>;
     const state = base64url(24);
     const nonce = base64url(24);
@@ -383,6 +432,7 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
   });
 
   app.get("/v1/auth/google/callback", async (request, reply) => {
+    if (!deps.google) return reply.code(503).send({ error: "GOOGLE_SIGN_IN_UNAVAILABLE" });
     const query = request.query as Record<string, unknown>;
     if (typeof query.state !== "string" || typeof query.code !== "string") return reply.code(400).send({ error: "AUTH_CALLBACK_INVALID" });
     const client = await deps.db.connect();
@@ -554,6 +604,43 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
     if (!result.ok) return reply.code(409).send({ error: result.reason });
     await recordFunnelEvent(deps.db, "interview_launched", { userId: user.id, tripId });
     return reply.code(201).send({
+      enrollmentId: result.enrollmentId,
+      deepLink: `https://t.me/${deps.telegramBotUsername}?start=${encodeURIComponent(result.token)}`,
+      expiresAt: result.expiresAt.toISOString(),
+    });
+  });
+
+  // Safe recovery metadata only: the original plaintext enrollment is never
+  // persisted, reconstructed, or returned here.
+  app.get("/v1/trips/:id/interview-link", async (request, reply) => {
+    const user = await requireUser(request, reply, deps); if (!user) return;
+    const tripId = (request.params as { id?: string }).id ?? "";
+    const result = await deps.db.query<{ lifecycle_state: string; id: string | null; expires_at: Date | null; has_interview: boolean }>(
+      `SELECT t.lifecycle_state,e.id,e.expires_at,
+         EXISTS(SELECT 1 FROM control_plane.intake_sessions s WHERE s.trip_id=t.id) AS has_interview
+       FROM control_plane.trips t
+       JOIN control_plane.trip_memberships m ON m.trip_id=t.id
+       LEFT JOIN control_plane.interview_enrollments e ON e.trip_id=t.id AND e.state='issued' AND e.expires_at>now()
+       WHERE t.id=$1 AND m.user_id=$2 AND m.status='active' AND m.role='owner' AND m.dashboard_access=true`, [tripId,user.id]);
+    const row = result.rows[0]; if (!row) return reply.code(404).send({ error: "NOT_FOUND" });
+    return reply.header("cache-control", "private, no-store").send({
+      activeEnrollment: row.id ? { id: row.id, expiresAt: row.expires_at!.toISOString() } : null,
+      recoverable: Boolean(row.id) && row.lifecycle_state === "draft" && !row.has_interview,
+      hasInterview: row.has_interview,
+      telegramChatUrl: `https://t.me/${deps.telegramBotUsername}`,
+    });
+  });
+
+  app.post("/v1/trips/:id/interview-link/replace", async (request, reply) => {
+    const user = await requireMutation(request, reply, deps); if (!user) return;
+    const tripId = (request.params as { id?: string }).id ?? "";
+    const expectedEnrollmentId = (request.body as { expectedEnrollmentId?: unknown } | null)?.expectedEnrollmentId;
+    if (typeof expectedEnrollmentId !== "string" || !/^enrl_[A-Za-z0-9]{8,64}$/.test(expectedEnrollmentId)) {
+      return reply.code(400).send({ error: "INVALID_REQUEST" });
+    }
+    const result = await replaceEnrollment(deps.db, user.id, tripId, expectedEnrollmentId, { enrollmentTtlSeconds: deps.enrollmentTtlSeconds });
+    if (!result.ok) return reply.code(result.reason === "NOT_OWNER" ? 404 : 409).send({ error: result.reason === "NOT_OWNER" ? "NOT_FOUND" : result.reason });
+    return reply.header("cache-control", "private, no-store").code(201).send({
       enrollmentId: result.enrollmentId,
       deepLink: `https://t.me/${deps.telegramBotUsername}?start=${encodeURIComponent(result.token)}`,
       expiresAt: result.expiresAt.toISOString(),

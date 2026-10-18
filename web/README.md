@@ -13,17 +13,34 @@ Dynamic public and organizer-facing web application for Kinerary.
 - lazy-loaded route bundles and deep-link fallback;
 - route and interaction tests.
 
-Authentication is wired, as of 2026-09-19. `signIn()` navigates to
-`/v1/auth/google/start` and `passwordSignIn()` posts to `/v1/auth/password`;
-both are served by `control-plane/api/src/portal.ts`, which also issues the
-rotating session cookie and enforces CSRF on mutations. A verified Google login
-creates the account.
+Authentication uses the control-plane portal. Existing organizers can sign in
+with their email and account password through `/v1/auth/email-password`.
+`/v1/auth/capabilities` reports which providers are configured; Google sign-in
+is offered only when its client ID and secret are both configured. Trip members
+can still use the separate `/v1/auth/password` trip-username login. These routes
+issue the real session cookie, and mutations require its CSRF token.
 
-What is still missing is organizer **email/password signup**: `/sign-up` and
-`/forgot-password` redirect to `/sign-in`, and of the nine account endpoints in
-`docs/web-control-plane-integration-plan.md` §4.3 only the Google pair, `/v1/me`
-and `/v1/logout` exist. Provisioned trip sites are a separate story again — they
-have no registration route at all.
+The account UI lists membership-scoped trips, creates draft trips, presents a
+clickable private Telegram interview link, and shows provisioning plans for
+review. Creating a draft does not provision a site. An interview link is held
+only while its page remains mounted. After a reload, requesting another link
+reports the existing enrollment; the owner can explicitly replace a lost unused
+link. Replacement invalidates the old link and leaves the draft unchanged.
+Links for an interview that has already started cannot be replaced: continue in
+the existing Telegram chat. Expired links use ordinary preparation.
+
+Owner-scoped `GET /v1/trips/:id/interview-link` returns metadata without a token;
+CSRF-protected `POST /v1/trips/:id/interview-link/replace` requires the expected
+enrollment ID and atomically replaces only an unexpired unused link on a draft
+with an active owner, dashboard access, and no existing interview. A competing
+update returns a conflict for a refreshed, explicit retry; neither route resets
+an interview or reconstructs or persists the original plaintext token, and
+ordinary issuance keeps its existing conflict behavior.
+
+Organizer email/password signup and password recovery remain unavailable in
+this SPA: `/sign-up` and `/forgot-password` redirect to `/sign-in`. Existing
+email sign-in does not create accounts or replace credentials. Provisioned trip
+sites retain their separate member login and invitation flows.
 
 ## Local development
 
@@ -32,7 +49,14 @@ npm install
 npm run dev
 ```
 
-The development server uses `http://127.0.0.1:4175`.
+The development server uses `http://127.0.0.1:4175`; preview uses port 4176.
+Both proxy `/v1` to `KINERARY_API_ORIGIN` (default `http://127.0.0.1:4310`).
+Run the real control-plane API separately. Its architecture profile must enable
+`web` and set `web.public_origin` to the browser origin, because sign-in and
+mutations validate Origin. Set the two Google secret references together when
+using Google; omit both for existing organizer email/password review. A static
+production host must route `/v1` to the API itself; Vite's proxy is for local
+review. Do not change a stack serving another active test just to review this UI.
 
 ## Verification
 

@@ -1,0 +1,30 @@
+.mini-app-shell {
+  --mini-bg: #f5f7fa;
+  --mini-text: #10263a;
+  height: 100dvh;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--mini-bg);
+  color: var(--mini-text);
+  padding: max(env(safe-area-inset-top), var(--mini-top, 0px)) max(env(safe-area-inset-right), var(--mini-right, 0px)) max(env(safe-area-inset-bottom), var(--mini-bottom, 0px)) max(env(safe-area-inset-left), var(--mini-left, 0px));
+}
+.mini-app-bar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .85rem 1rem; border-bottom: 1px solid #cad5de; font-size: .85rem; font-weight: 600; }
+.mini-app-bar a { color: inherit; text-underline-offset: 3px; }
+.mini-app-unavailable { max-width: 34rem; margin: auto; padding: 3rem 1.25rem; }
+/* Constrain the existing fixed runtime to this shell's remaining safe area. */
+.mini-app-shell > .product-shell { flex: 1; min-height: 0; overflow: auto; }
+.mini-app-trip > .product-shell { display: flex; flex-direction: column; overflow: hidden; }
+.mini-app-trip .product-header { flex-shrink: 0; }
+.mini-app-shell .runtime-shell { position: relative; inset: auto; z-index: auto; flex: 1; min-height: 0; grid-template-rows: 48px minmax(0, 1fr); }
+.mini-app-shell .runtime-shell iframe { min-height: 0; }
+.mini-app-shell .dashboard-main { width: 100%; max-width: 70rem; }
+@media (max-width: 600px) {
+  .mini-app-shell .product-header { flex-wrap: wrap; gap: .75rem; padding: 1rem; }
+  .mini-app-shell .dashboard-nav { flex-wrap: wrap; gap: .6rem; }
+  .mini-app-shell .dashboard-main { padding: 1.25rem 1rem; }
+  .mini-app-shell .page-title { flex-wrap: wrap; gap: 1rem; }
+  .mini-app-shell .page-title .button { width: 100%; text-align: center; }
+  .mini-app-shell .runtime-bar { padding-inline: 1rem; }
+}
