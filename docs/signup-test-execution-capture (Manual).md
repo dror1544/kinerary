@@ -184,3 +184,94 @@ Run by the owner on the Mac staging stack, scenario `manual`, Hebrew interview: 
 | R5 | On the Classic site the activity-voting section never rendered for a trip built from config, and one stop with no venues stopped the ratings | **Partial** | 2026-10-11, PR #363 (`tests/rsvp-config-stops.test.js`). **#170 is addressed, not closed:** its second bug (a card for an activity with no date or price) now shows blanks rather than "undefined" but no test pins it. #170 has no sprint label — unrouted, Q2. |
 
 **Unrouted from this run (no sprint owns them; see "Open ownership questions" in `docs/sprint6-tracks.md`):** the bridge `/health` check that did not fail provisioning and the Codex-fallback companion (Q4); CI not running `tests/scripts` and the grants re-apply at the VM upgrade (Q5); the test page and the Node-version fault (Q6); #170, #367 and #368 have no sprint label (Q2); and the ownership of the whole fix series (Q1).
+
+### Manual test run 2026-10-18 — gate 3 (pre-VM-upgrade), `main` post-sprint-6-merge
+
+Run by the owner on the Mac staging stack, trip slug `france-2026`
+(`trip_d28ce5320b0960fa8a6501e0cdff5c93`), against `main` at `81cafd3` — the
+commit sprint-6 just merged into — as gate 3 of the pre-VM-upgrade checklist
+(his own manual test/examination, including the newly added features). Raw
+notes belong outside the repository under the 2026-09-28 policy, in
+`$KINERARY_NOTES_DIR/run-notes/2026-10-18-gate3-manual-test.md`; **neither this
+session nor the one that triaged findings 5 and 6 (added later the same day)
+had a shell/Bash tool available, so neither could resolve
+`$KINERARY_NOTES_DIR`, check it for the macOS `uchg` lock, or write there.**
+The raw notes for all six findings (1–4 and the later 5–6) are reproduced
+verbatim in their respective run handbacks and still need archiving there by
+a session with shell access — see the note at the top of this file: a
+missing/inaccessible vault is reported plainly, never worked around by
+writing into `docs/`.
+
+**Ownership note.** `.project/sprint.json` still records Sprint 6 as the open
+sprint (last touched 2026-09-20, before the merge visible in today's git log);
+Sprint 7 as planned (`docs/onboarding-mvp-sprint-plan.md`) is post-trip debrief
+and doesn't fit any of the six findings below. No sprint/track in
+`docs/sprint6-tracks.md` claims ongoing maintenance of the (already-shipped)
+document-intake feature or of general interview-routing correctness
+post-merge. Rather than guess, candidate owners are named per row and the real
+gap — nothing is currently the recorded owner of a *new* defect in already-shipped
+Sprint 6 work — is carried to Decisions needed below.
+
+**Worked well, worth recording so it isn't re-tested from scratch:** the
+interview reached confirmation on a two-couple, same-dates, two-flight-ticket
+scenario, and the first uploaded ticket's traveler names were extracted
+correctly with no correction needed.
+
+| # | Issue | Status | Detail |
+|---|---|---|---|
+| 1 | Document extraction got the first couple's names from their flight ticket but missed the second couple's names from a second ticket (same dates, different travelers); the organizer had to type them in by hand | **Bug** | → #412. 2026-10-18, gate 3, one observation (not yet replayed). Two tickets, same travel dates, two different couples, uploaded in the same document-intake pass: the first ticket's names extracted cleanly, the second ticket's did not and required an explicit manual answer. Lands in the document-intake feature (`#92` Slice A/B territory, merged via sprint-6) — **unrouted**: no track in `docs/sprint6-tracks.md` claims ongoing-maintenance ownership of that feature now that it has shipped. See Decisions needed. |
+| 2 | The router/classifier took a travelers clarification as the answer to an unrelated, different question | **Bug** | → #413. 2026-10-18, gate 3. While sorting out finding #1 above, the organizer typed "נוסעים אחרים" ("other travelers") meaning it as clarification about the second ticket's names; the router applied it instead as the answer to a different open question — what to name the bot. Same *class* as #114 (free text not mapped to the slot the organizer meant), which sits in Track 2 of `docs/sprint6-tracks.md` as "the interview cannot hold what it's given" — but #114's own text is about unprompted/ambiguous volunteered facts, not about free text landing on the *wrong already-open* question, so Track 2 is a plausible home, not a confirmed one. **Unrouted** — see Decisions needed. |
+| 3a | The flight appears twice in the trip's Journey/itinerary view | **Open** | → #415. 2026-10-18, gate 3. Whether this is a defect depends on an unsettled product call: two couples really did travel on two separate ticket bookings, so two Journey entries may be the *correct* rendering of two real flights, or the two may be meant to collapse into one. The organizer did not bless this one the way he did 3b below. Not a code bug until that's decided. **Unrouted** — a product decision, not a sprint/track question; see Decisions needed. |
+| 3b | Under Reservations/bookings the flight also appears twice, but the second entry carries no ticket names/details — making it read as broken rather than as two legitimate separate bookings | **Bug** | → #414. 2026-10-18, gate 3. The organizer's own call: two reservation rows for two separate bookings would be *correct and expected*; the defect is specifically that the duplicate entry drops the names/details that would distinguish it from the first. Likely the same rendering/derivation path as 3a (`derive_bookings`/transformer, trip-content). Routed to **Track 1** (trip UI/UX) by the same convention that already sends trip-content rendering defects there (the original 2026-08-29 "Trip-content items → Sprint 4.5" routing, Track 1's successor). |
+| 4 | Opening the trip site's link from inside Telegram's own in-app browser (a WebView, not full Safari), logging in, and trying to view a document — the document does not display | **Bug** | → #417. 2026-10-18, gate 3, one observation reported in a follow-up note to this same run, Dror's own words verbatim: *"when I opened the web link from telegram and login and try to view a document, it doesn't show from safari it works. In PWA state it works fine. This is not a blocker."* The same action works in actual Safari and in the installed PWA (standalone mode) — only Telegram's in-app WebView fails. No root cause asserted here (candidates not ruled in or out: a JS API the WebView lacks, a `Content-Disposition`/MIME handling difference, an iframe/object-embed restriction, a CSP or viewport difference specific to that WebView). **Unrouted**: no track in `docs/sprint6-tracks.md` names "trip site behaviour inside Telegram's own in-app browser" as owned ground, and unlike 3b this is not a general trip-content rendering defect but a single client-environment's failure, so 3b's Track 1 routing convention does not automatically extend to it. See Decisions needed. **The owner's own call: not a blocker.** |
+| 5 | In the trip's group chat, for some issues the companion answers "אטפל מולך בפרטי" ("I'll handle it with you privately") and then never initiates anything in the private (DM) chat — the promise goes unfulfilled. Separately, Dror's own judgment: it should not say this in the group at all | **Bug** | 2026-10-18, gate 3, Dror's own words verbatim: *"In the group it answers for some issues 'אטפל מולך בפרטי' it doesn't initiate anything in the private chat and it shouldn't say it in the group."* Two distinct problems, kept as one row because that is how it was reported: (a) a promised DM follow-up that never happens, and (b) a product/UX judgment that the line should not be said in the group at all, independent of whether (a) is fixed. `profile-templates/familytrip-companion/templates/SOUL.md.tpl:24-29` already instructs close to this exact pattern, but narrower: it is written only for infrastructure/plumbing questions reaching the group ("say briefly that you will pick it up privately with the organizer, and continue in the organizer-private channel") — whether Dror saw that documented case specifically, or the companion applying the same line more broadly to "some issues," is not established from the note alone. More to the point: nothing found in the companion's profile or tool inventory lets it actually *initiate* a DM on its own — `SOUL.md.tpl:8` says explicitly "Do not privately message ordinary participants," and the only proactive-send paths found in the template (morning/evening briefings) are scheduled and group-opt-in gated, not an on-demand follow-up to a flagged issue. So the template's own "continue in the organizer-private channel" line has no backing capability behind it that was found — a plausible root cause for (a), not confirmed against an actual transcript. Checked `docs/group-participation-design.md` (PR #406, merged on the sprint branch — the conversation window and stay-silent sentinel; PR #407, draft, unmerged — the judge and `/proactive 1\|2\|3`): neither covers escalating an issue to a private follow-up, so the group-participation work (#406–#409) is a plausible but **not confirmed** home — it governs whether the companion speaks in the group at all, not what it does once it decides to defer. **Unrouted** — no track or issue found that owns "the companion defers to a private follow-up it never performs." → #418. **Dror's explicit call: this should be handled** (not waved off as non-blocking, unlike findings 1-4). See Decisions needed. |
+| 6 | A hotel booking added via chat reached the Reservations tab but did not appear on the Plan (day-by-day itinerary) tab or the Map tab | **Bug** | 2026-10-18, gate 3, Dror's own words verbatim: *"Also added a hotel in the chat this was added to the reservation tab but not to the plan and not reflected in the map tab."* Strong candidate link, not confirmed: PR #362 (`pr/g3-stop-editing`, part of the g1–g5 stack that targeted `integration/sprint-6-into-main`/PR #356 — which today's git log shows merged into `main` at `81cafd3`, the commit this run tested) built exactly this path: `set_stop_from_booking` links a hotel booking to its stop, setting the stop's dates and hotel and writing one check-in/check-out item onto the Plan (`docs/sprint6-tracks.md:868`). That same PR's own tracked caveat says the companion side of it was **"BEHAVIOUR NOT DEMONSTRATED"** — the instruction to link a booking to its stop had never been run against a live model (`docs/sprint6-tracks.md:869`; CHANGELOG, Sprint 6, PR #362 entries) — so this may be the first live test of exactly that unverified path, and on this run it did not happen: Reservations got the write, the stop link that would also move it onto the Plan did not. Two distinct possible mechanisms are not distinguished here: the code/tool not yet reaching this trip (its own notes say it "reaches a trip's companion only after that trip's bridge is refreshed, and the instructions only after its companion profile is refreshed") versus the code being live but the model not calling `set_stop_from_booking` (an instruction-following miss). The Map tab not reflecting it is likely the same root cause rather than a second one: the Map tab draws its pins from phase/stop data (`trip-web/src/App.tsx`), so a booking that never updated a stop would not appear on the Map either way — not independently confirmed. Checked PR #362's own tracked follow-ups, #365 (the open-days marker gap) and #369 (Modern-site wording) — neither covers this. **Unrouted**: not established as a new regression in deployed code versus a known, already-flagged-as-unverified gap finally observed live. → #419. **Dror's explicit call: this should be handled** (not waved off as non-blocking, unlike findings 1-4). See Decisions needed. |
+
+**Decisions needed.**
+
+- **Who maintains document-intake correctness now that `#92` has shipped?**
+  Finding #1 is a defect in already-merged code; no track in
+  `docs/sprint6-tracks.md` is recorded as owning *post-ship* document-intake
+  bugs (the doc only covers landing/assessing the PR). Candidates: Track 1
+  (it feeds trip content) or a dedicated document-intake-maintenance track —
+  not chosen here.
+- **Who owns the free-text-lands-on-the-wrong-open-question bug class?**
+  Finding #2 resembles #114's family (Track 2) but is not the same failure
+  mode #114 describes, and no issue currently names "clarifying one answer
+  gets misapplied to a different, already-pending question." Needs its own
+  determination, not an assumption that it's #114's bug.
+- **Should two same-date bookings for different travelers render as one
+  Journey entry or two?** Finding 3a is a product call, independent of
+  finding 3b's rendering bug, and nothing in the plan currently answers it.
+- **Who owns trip-site behaviour that is specific to Telegram's own in-app
+  browser, as distinct from the site in general?** Finding #4 (the document
+  viewer fails only inside Telegram's WebView, not in Safari and not in the
+  installed PWA) is not a general trip-content rendering defect the way 3b
+  is, so 3b's Track 1 routing convention does not automatically reach it. No
+  track in `docs/sprint6-tracks.md` names ownership of one client
+  environment's behaviour. Candidates, not chosen here: Track 1 (it is still
+  site-cadence work) or a browser-compatibility backlog of its own. The
+  owner's own call is that this one is not a blocker, so nothing here forces
+  an urgent guess.
+- **Who owns a companion promise to follow up privately, that the companion
+  itself has no way to keep?** Finding #5 bundles a likely-unbuilt capability
+  (nothing found lets the companion initiate a DM on its own) with a separate
+  judgment call (should it say this in the group at all).
+  `docs/group-participation-design.md`'s PR #406/#407 line of work governs
+  related group-vs-private addressing but was not found to cover this case —
+  not confirmed as its home.
+- **Is finding #6 a regression, or the first live failure of an
+  already-flagged-as-unverified behaviour?** PR #362 built
+  `set_stop_from_booking` specifically to make a hotel booking move the Plan
+  (and, as a side effect, the Map); its own notes already said the companion
+  side was never run against a live model. Whether this run's miss is that
+  code not yet reaching this trip, or the model not calling the tool it was
+  told to, is not distinguished here. No track owns ongoing correctness of
+  the g1–g5 stack (open question Q1 in `docs/sprint6-tracks.md`), so there is
+  no confirmed home even once the mechanism is known.
+- **No sprint is currently recorded as open to receive any of this.**
+  `.project/sprint.json` is stale (shows Sprint 6, pre-merge); Sprint 7 is
+  scoped to post-trip debrief and doesn't fit. Until a next sprint/cadence is
+  recorded (see the 2026-09-28 "agile cadence after Release B" note), these
+  six findings have nowhere concrete to land beyond the track guesses
+  offered above.
