@@ -15,8 +15,11 @@ python3 validate_bundle.py /tmp/intake-interviewer
 
 ```bash
 python3 render_interviewer.py --input setup.json --output /tmp/intake-interviewer \
-  --install-profile intakebot --workspace "$HOME/.hermes-workspaces/intakebot"
+  --install-profile intakebot --workspace "$HOME/.hermes-workspaces/intakebot" \
+  --relay-url "$GATEWAY_RELAY_URL"
 ```
+
+`--relay-url` is **required** whenever the overlay sets `gateway.multiplex_profiles: true` (it does today): the installer refuses without it, before creating anything, and appends `GATEWAY_RELAY_URL=<url>` to the new profile's `.env`. The URL is runtime input — supply your own relay's address; the template names none. `INSTALL.md` carries the same step for a manual install.
 
 The installer creates a fresh profile and workspace and bundles non-secret settings, including the project model-routing overlay. It never writes credentials, user IDs, or starts a gateway. The overlay must be deliberately merged into the generated profile config as described below.
 
