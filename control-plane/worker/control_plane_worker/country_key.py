@@ -4,11 +4,12 @@ This is the Python half of a contract whose authoritative statement is
 ``control-plane/api/src/country-key.ts``. Read that file for why the rule exists;
 this docstring is about why the rule needs a second implementation at all.
 
-THREE PLACES DERIVE THIS KEY, IN TWO LANGUAGES:
+FOUR PLACES DERIVE THIS KEY, IN TWO LANGUAGES:
 
   saveConsularContacts     interview.ts                INSERT … ON CONFLICT   (write)
   writeDestinationInfo     destination-info-store.ts   UPDATE … WHERE …       (write)
   _destination_info_lookup __main__.py                 SELECT … WHERE …       (read)
+  _consular_lookup         __main__.py                 SELECT … WHERE …       (read)
 
 The two writers share one TypeScript function. The reader cannot import it — it
 is a different runtime in a different container — so it is reimplemented here,
@@ -25,11 +26,11 @@ disagree on either the rule or the bound. That test is the only thing connecting
 them; without it this file is a copy that drifts, which is the exact failure the
 TypeScript side was extracted to prevent.
 
-NOT APPLIED TO ``_consular_lookup``. The consular reader a few lines above in
-__main__.py open-codes the same normalisation and has the same missing
-truncation. That is pre-existing and reaches a live path, so it is deliberately
-left alone here and reported instead; changing what an existing lookup matches
-is not a side effect this change should carry.
+ALSO APPLIED TO ``_consular_lookup`` (#161). The consular reader open-coded the
+same normalisation first and had the same missing truncation; it now calls
+``normalise_country_key`` for both the destination and the home country, so a
+fourth derivation is not hiding in __main__.py. The consular store is written
+by ``saveConsularContacts``, which already goes through the TypeScript helper.
 """
 from __future__ import annotations
 

@@ -392,8 +392,11 @@ def main(argv: list[str] | None = None) -> int:
                 """Read-only view of control_plane.country_reference, populated
                 by interview-mcp's lookup_consular_contacts. A miss (or any DB
                 error) returns None and enrich_config just skips the contacts."""
-                dest = _re.sub(r"\s+", " ", destination).strip().lower()
-                home = _re.sub(r"\s+", " ", home_country).strip().lower()
+                from .country_key import normalise_country_key
+                dest = normalise_country_key(destination)
+                home = normalise_country_key(home_country)
+                if not dest or not home:
+                    return None
                 try:
                     import psycopg
                     with psycopg.connect(db_url) as conn:
