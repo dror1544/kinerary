@@ -568,17 +568,29 @@ function chooseFormat(format) {
  * traveller or an error message wrote (a companion's bug summary, an
  * unreachable reason). Stripped: newlines and the fold character (a value must
  * stay on its own line), `*` and backticks (they would turn into bold, italics
- * or a code fence), and square brackets (`[x](y)` is a link a stranger could
- * plant in the owner's morning message).
+ * or a code fence), square brackets (`[x](y)` is a link a stranger could
+ * plant in the owner's morning message), `~` and `|` (strikethrough and
+ * spoiler), an italic-shaped `_`, and a leading `>` (block quote).
+ *
+ * `_` is REMOVED where it borders a non-word character, never backslash-escaped:
+ * Hermes's Telegram converter escapes a backslash itself, so `\_` would print
+ * both characters. (That converter also escapes a bare `_x_`, so this guards
+ * against a different converter rather than fixing a seen leak; #304 said "not
+ * proven either way".) Underscores inside a word stay: every reason code,
+ * NO_ORGANIZER_CHAT included, is spelled with them.
  */
 const md = (value) =>
   String(value ?? "")
     .replace(/[\x1e\r\n\t]+/g, " ")
-    .replace(/[*`]/g, "")
+    .replace(/[*`~|]/g, "")
     .replace(/\[/g, "(")
     .replace(/\]/g, ")")
+    .replace(/(?<![\p{L}\p{N}_])_+|_+(?![\p{L}\p{N}_])/gu, "")
     .replace(/\s+/g, " ")
-    .trim();
+    .trim()
+    // Newlines are folded above, so the start of the value is the only place a
+    // block-quote `>` can sit.
+    .replace(/^(?:>\s*)+/, "");
 
 /**
  * Stage names for a person. A stage this table does not know is printed as it
@@ -1641,7 +1653,7 @@ async function loadAlerts(stack, h) {
 
   const [
     unreachable, jobs, notifications, stuck, awaiting, companionless, modelFailing, reported,
-    verificationFailed, bridgeCheckFailed, awaitingApproval,
+    verificationFailed, bridgeCheckFailed, awaitingApproval, reachabilityStale,
   ] = await Promise.all([
     runSql(stack, `SELECT t.slug, coalesce(t.unreachable_reason,'-')
                      FROM control_plane.trips t
@@ -1766,10 +1778,25 @@ async function loadAlerts(stack, h) {
                       AND j.updated_at < now() - interval '${h} hours'
                       AND ${real}
                     ORDER BY t.slug, j.id;`),
+    // A live trip whose bridge probe has stopped asking (#295): the probe's
+    // failure to run is otherwise only a worker log line. Slugs only, never the
+    // age, so the bytes do not move while it stays stale. Self-gated: it fires
+    // only on a stack where SOME trip was checked in the last hour, i.e. where
+    // the probe runs at all — otherwise a stack that never enabled the probe
+    // (or predates the release that carries it) would alert for every trip.
+    runSql(stack, `SELECT t.slug
+                     FROM control_plane.trips t
+                    WHERE t.lifecycle_state = 'ready_private' AND ${tripClassSql(stack)} = 'live'
+                      AND t.slug NOT LIKE 'retired-%'
+                      AND (t.reachability_checked_at IS NULL
+                           OR t.reachability_checked_at < now() - interval '60 minutes')
+                      AND EXISTS (SELECT 1 FROM control_plane.trips p
+                                   WHERE p.reachability_checked_at > now() - interval '60 minutes')
+                    ORDER BY t.slug;`),
   ]);
   return {
     unreachable, jobs, notifications, stuck, awaiting, companionless, modelFailing, reported,
-    verificationFailed, awaitingApproval, bridgeCheckFailed,
+    verificationFailed, awaitingApproval, bridgeCheckFailed, reachabilityStale,
   };
 }
 
@@ -1785,12 +1812,17 @@ async function loadAlerts(stack, h) {
  */
 function alertSections({
   unreachable, jobs, notifications, stuck, awaiting, companionless, modelFailing, reported,
-  verificationFailed, awaitingApproval, bridgeCheckFailed,
+  verificationFailed, awaitingApproval, bridgeCheckFailed, reachabilityStale,
 }) {
   return [
     { title: "UNREACHABLE", label: "unreachable", rows: unreachable,
       text: (r) => `${r[0]} — ${r[1]}`,
       digest: (r) => `${md(r[0])} — ${md(r[1])}` },
+    // Not UNREACHABLE: that one says the probe ran and the trip failed it. This
+    // says the probe has not run for the trip (#295). Gated in the query.
+    { title: "REACHABILITY CHECK STALE", label: "reachability check stale", rows: reachabilityStale,
+      text: (r) => `${r[0]} — no reachability check for over 60 minutes; the probe that confirms the companion's bridge may have stopped`,
+      digest: (r) => `${md(r[0])} — no reachability check for over 60 minutes; the probe that confirms the companion's bridge may have stopped` },
     { title: "BUILT WITHOUT AN ORGANIZER CHAT", label: "no organizer chat", rows: companionless,
       text: (r) => `${r[0]} — site is up, no private chat bound`,
       digest: (r) => `${md(r[0])} — site is up, no private chat bound` },
