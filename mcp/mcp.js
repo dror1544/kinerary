@@ -172,6 +172,16 @@ const STOP_REFUSAL_HINTS = {
   booking_belongs_to_another_stop: 'That booking is filed under another stop (named in "stop"); linking it here would move that stop\'s check-in and check-out, so it is refused. Ask the organizer which stop the hotel is for. If it is this one, the organizer first changes the booking\'s stop to this one on the site (the booking\'s edit form), then call set_stop_from_booking again. A booking filed under the stop this one was split from links without that.',
   booking_linked_to_another_stop: 'That booking already sets another stop (named in "stop") — its dates and hotel — and one booking shapes one stop, so it is refused. Tell the organizer. It is freed only when that stop is set from a different hotel booking (set_stop_from_booking on that stop) or its change is undone from the stop\'s history on the site; update_stop does not free it. Then link it here.',
   invalid_text: 'Stop text may not contain < or > or control characters (a line break only in description and note), nor invisible characters that change its direction or display ("detail" says which); the field is named in "field". Quotes are fine and are stored as typed (ארה"ב, 55" TV). Remove the < or > (say "less than" / "more than" in words if it matters), then resend. If "source" is "booking", the text is the booking\'s own: fix the booking (update_booking) first.',
+  dates_required: 'plan_open_days needs the stretch to plan: start and end (YYYY-MM-DD).',
+  title_required: 'The new stop needs a title (title_he and/or title_en).',
+  trip_has_no_dates: 'This trip has no start and end dates of its own, so there is no gap to measure. Tell the organizer; do not retry.',
+  dates_overlap_stop: 'Some of those days already belong to a stop (named in "stop", with the days in "days"). "open_days" lists the stretches that are still open — plan one of those, or change the stop that holds the days with update_stop first. Nothing was written.',
+  item_outside_stop: 'One plan item (its position is "index") is dated outside the stretch being planned. Fix its date or the stretch and send the whole plan again; nothing was written.',
+  invalid_item: 'One plan item (its position is "index", the field is named) is not valid; "detail" says how. Fix it and send the whole plan again — nothing was written, so do not call add_plan_item for the others.',
+  invalid_items: 'items is a list of plan items. Nothing was written.',
+  invalid_day: 'One day headline (its position is "index") is not valid; "detail" says how. Nothing was written.',
+  invalid_days: 'day_titles is a list of { date, label_he and/or label_en }. Nothing was written.',
+  invalid_stop_id: 'A stop id is lowercase letters, digits and hyphens, and may not start with open-days. Leave it out and the site makes one from the title.',
   invalid_link: 'A link (named in "field") must be a full address starting http:// or https://, with a real host and no quotes, spaces, backslashes or < >. Resend it without that link or with a clean one; if "source" is "booking", fix the booking\'s location_url (update_booking) first.',
 };
 
@@ -956,7 +966,8 @@ mcp.tool('delete_plan_item',
 // (server/trip-structure.js), which merge an override over trip.config.json so
 // a rebuild does not lose it. Each tool is one route; the route is the
 // authority on every rule, and its refusals reach the model whole (stopsApi).
-// The site's own MCP (server/trip-mcp/tools.js) offers the same five tools.
+// The site's own MCP (server/trip-mcp/tools.js) offers the same five tools;
+// plan_open_days (issue #133) is on this server only.
 //
 // Ids: the server's stop ids are lowercase letters, digits and hyphens, up to
 // 48 characters (STOP_ID_RE; a split's generated id is a 40-character slug
@@ -1012,6 +1023,7 @@ mcp.tool('update_stop',
   '"rename the stop", "we are staying at X there". Send only what changes: give just start or just end and the other is kept; give one ' +
   'language of the title and the other is kept. accommodation REPLACES the stop\'s whole accommodation (null removes it) — include every ' +
   'field that should remain. A hotel BOOKING is linked with set_stop_from_booking instead, which also adds check-in/check-out. ' +
+  'To plan days that belong to NO stop yet (the "days not planned yet" block) use plan_open_days, not this plus split_stop. ' +
   'It refuses: dates outside the trip\'s own dates (the trip is never extended); a range that would leave plan items outside it — the ' +
   'refusal lists them; tell the organizer, then resend with on_outside; a PIN or door code; the computed "days not planned yet" block; and, ' +
   'with revision, a stop list that changed since you read it. ' +
@@ -1064,6 +1076,7 @@ mcp.tool('split_stop',
   'Split one stop in two at a date — "the last night near the airport", "two nights in Strasbourg in the middle of Colmar". The stop ends on ' +
   'at_date and a NEW stop, right after it, runs from at_date to the old end; plan items and headlines dated after at_date move to the new ' +
   'stop (at_date itself, the transfer day, stays with the first), and both stops are queued for a wording review. ' +
+  'To plan days that belong to NO stop yet (the "days not planned yet" block), use plan_open_days: it creates the stop AND its plan in one step. ' +
   'Give the new stop a title (title_he and/or title_en), and optionally its accommodation; with booking_id, that hotel booking is then ' +
   'linked to the new stop exactly as set_stop_from_booking would (its dates, its accommodation, check-in/check-out). ' +
   'It refuses: a stop with no dates yet; an at_date not strictly inside the stop (both must keep a night); no title; the computed ' +
@@ -1101,6 +1114,52 @@ mcp.tool('split_stop',
       },
     });
   }
+});
+
+const planItem = z.object({
+  date: isoDate.describe('The day, YYYY-MM-DD — one of the days being planned'),
+  text_he: z.string().trim().min(1).max(500).describe('What happens, in Hebrew (required)'),
+  text_en: z.string().max(500).optional().describe('The same in English'),
+  time: z.string().regex(/^(([01]\d|2[0-3]):[0-5]\d|morning|noon|afternoon|evening)$/, 'time is HH:MM (24-hour), or morning, noon, afternoon, evening').optional(),
+  item_type: z.enum(['travel', 'activity', 'meal', 'lodging', 'free_time', 'booking', 'task', 'note']).optional().describe('Default: activity'),
+  location_url: accUrl.optional().describe('Waze or Google Maps link to the place'),
+  status: z.enum(['confirmed', 'needs_review']).optional().describe('Default: confirmed — the organizer just approved the plan'),
+}).strict();
+const dayTitle = z.object({
+  date: isoDate, label_he: z.string().max(120).optional(), label_en: z.string().max(120).optional(),
+}).strict();
+
+mcp.tool('plan_open_days',
+  'Plan days that belong to NO stop yet (the "days not planned yet" block) as ONE action: a new stop for that stretch — its title, hotel — ' +
+  'AND its plan items and day headlines, all-or-nothing. Use it for "make the 4th to the 6th Strasbourg and plan it": propose the stop and its ' +
+  'plan to the organizer, and once they approve call this ONCE. Do not rebuild it from update_stop + split_stop + add_plan_item: a failure between ' +
+  'those calls leaves a stop without its plan, and the organizer would have to approve twice. ' +
+  'start/end are the first and last day of the stretch (get_stops lists the open days under the computed block, "kind":"computed"). Every item\'s ' +
+  'date must fall inside start..end. Plan items already filed under the open days on those dates move onto the new stop. ' +
+  'It refuses — and then NOTHING is written, no stop and no item: dates outside the trip; any day already held by a stop (the refusal names it and ' +
+  'lists the stretches still open); an item or headline that is not valid or is dated outside the stretch (named by position); text with < or >; a ' +
+  'PIN or door code; and, with revision, a stop list that changed since you read it. ' +
+  'Organizer or agent only. Returns the new stop, every item created and the open days that remain — read them back to the organizer ' +
+  'rather than trusting the success, and say it is done only because this returned.', {
+  start: isoDate.describe('First day of the stretch to plan, YYYY-MM-DD'),
+  end: isoDate.describe('Last day of the stretch (inclusive), YYYY-MM-DD'),
+  title_he: stopTitle.optional().describe('New stop title in Hebrew'),
+  title_en: stopTitle.optional().describe('New stop title in English'),
+  tab_label: z.string().trim().min(1).max(40).optional().describe('Short tab label, e.g. "STRASBOURG"'),
+  emoji: z.string().trim().min(1).max(16).optional(),
+  accommodation: accommodationSchema.optional().describe('Where the family sleeps at the new stop'),
+  items: z.array(planItem).max(200).optional().describe('The plan: what happens on which day. Omit to open the stop with an empty plan.'),
+  day_titles: z.array(dayTitle).max(200).optional().describe('Optional headline per day, e.g. "The old town"'),
+  revision: stopRevision,
+}, async ({ start, end, title_he, title_en, tab_label, emoji, accommodation, items, day_titles, revision }) => {
+  if (!title_he && !title_en) throw new Error('The new stop needs a title: give title_he and/or title_en. Nothing was changed.');
+  const body = { dates: { start, end }, title: { ...(title_he ? { he: title_he } : {}), ...(title_en ? { en: title_en } : {}) } };
+  if (tab_label !== undefined) body.tabLabel = tab_label;
+  if (emoji !== undefined) body.emoji = emoji;
+  if (accommodation !== undefined) body.accommodation = accommodation;
+  if (items !== undefined) body.items = items;
+  if (day_titles !== undefined) body.days = day_titles;
+  return ok(await stopsApi('POST', '/api/stops', body, { ifMatch: revision }));
 });
 
 mcp.tool('set_stop_from_booking',

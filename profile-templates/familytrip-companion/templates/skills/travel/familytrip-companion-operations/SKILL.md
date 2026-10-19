@@ -1,7 +1,7 @@
 ---
 name: familytrip-companion-operations
 description: "Operate a family trip companion across organizer, group, and site — bookings, stops, access."
-version: 1.1.0
+version: 1.2.0
 author: Kinerary
 license: MIT
 ---
@@ -49,6 +49,8 @@ A refused call changed nothing. Say what happened in plain words, without the co
 - `booking_has_no_dates` — ask for the check-in and check-out dates, set them with `update_booking`, then link.
 - `items_outside_stop` — the new dates would leave planned items outside the stop. List them (day and item) and ask: keep them where they are, or move them to which stop. Resend with `on_outside` set to `keep` or `move_to:<stop id>` only after that answer.
 - `split_date_not_inside_stop` — the split date must fall strictly inside the stop, so both stops keep at least one night. Re-read the stop's dates and ask if the request does not fit them.
+- `dates_overlap_stop` — some of those days already belong to a stop (the refusal names it and lists the stretches still open). Show the organizer which days are open and ask which to plan; nothing was written.
+- `item_outside_stop` / `invalid_item` / `invalid_day` — one item or headline in the plan is dated outside the new stop or is not valid (the refusal gives its position). Fix that one and resend the whole plan in the same single call; nothing was written, so there is nothing to clean up.
 - `target_day_has_headline` — both stops have a headline for that day. Show the two and ask which to keep; resend with `headline` set to `keep_target` or `take_source`.
 - `stops_changed_reload_before_retry` (or `itinerary_changed_reload_before_retry` on a moved day) — the stops or the plan changed since you read them. Read `get_stops` (and `get_phase_plan`) again and retry once, silently. If it refuses again, say you could not save it.
 
@@ -62,6 +64,13 @@ A refused call changed nothing. Say what happened in plain words, without the co
 - `move_plan_day` with the day's date, the stop it is in now and the stop it goes to. The day's items and its headline move together.
 - If the date is outside the other stop's dates, say so and offer to change that stop's dates first with `update_stop`; do not move it silently.
 - Descriptions that mention a day may be reworded automatically after a move or a split; that is expected.
+
+### Planning days that belong to no stop yet
+The "days not planned yet" block in `get_stops` (`kind` "computed") is a stretch of the trip no stop covers. "Make the 4th to the 6th Strasbourg and plan it" is **one** action for the organizer, so it is one tool call for you:
+1. `get_stops` for the open stretches and the revision. Propose, in one message, the stop (title, first and last day, hotel if known) and the plan day by day — every item with its day. Ask for one yes.
+2. After the yes, call `plan_open_days` **once** with `start`, `end`, the title, the hotel if any, `items` (each with its `date` inside the stretch, `text_he`, `text_en`, `time` when known) and `day_titles` if you proposed headlines, passing the `revision` you read. The stop and its plan are written together or not at all. Never rebuild it from `update_stop`, `split_stop` and `add_plan_item`: a failure between those calls leaves a stop with no plan and the organizer approving twice. Do not ask for a second approval for the plan after the stop, and do not say "I'll add the plan next".
+3. Read back (see below): `get_stops` shows the stop and the open days that remain; `get_phase_plan` for the new stop shows the items. Only then tell the organizer it is done.
+Days already planned under the open-days block on those dates move onto the new stop by themselves. To give a stretch to a stop that already exists, use `update_stop` (or `move_plan_day` for one day) instead.
 
 ### Read back, then say it
 After every stop change: `get_stops`, and `get_phase_plan` for both stops after a move or a split. Then say, in plain words and in the organizer's language, what the Journey tab now shows: "<stop> is now <first day>–<last day> at <hotel>; check-in <day>, check-out <day>". Never say "updated", "added" or "done" about a stop before the read-back shows it. If the read-back does not show the change, say that plainly. Never print a confirmation number in the family group.

@@ -65,6 +65,11 @@ to confirm first, the split-date rule — is in the operations skill's **Stops**
 section, so the always-loaded SOUL stays short. `tests/test_stop_editing.py`
 pins both on the rendered text in every language and persona variant.
 
+Days that belong to no stop yet are planned in one step, `plan_open_days`
+(issue #133): the new stop and its plan items are written together or not at
+all, after one approval. SOUL.md states the rule, the skill has the procedure
+and its refusals, and `tests/test_stop_editing.py` pins both.
+
 `eval/stop_editing_cases.json` holds the behavioural cases — hotel, last night
 near the airport, moving a Tuesday, and the organizer-only redirects — with the
 tool calls each one expects. It is written and checked for consistency by the

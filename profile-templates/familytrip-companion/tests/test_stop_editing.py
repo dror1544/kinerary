@@ -18,7 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ROOT / 'eval' / 'stop_editing_cases.json'
 SKILL_REL = 'skills/travel/familytrip-companion-operations/SKILL.md'
-STOP_TOOLS = ('get_stops', 'update_stop', 'split_stop', 'set_stop_from_booking', 'move_plan_day')
+STOP_TOOLS = ('get_stops', 'update_stop', 'split_stop', 'set_stop_from_booking', 'move_plan_day', 'plan_open_days')
 STOP_WRITE_TOOLS = STOP_TOOLS[1:]
 
 
@@ -179,6 +179,33 @@ class RenderedInstructions(unittest.TestCase):
         bookings = section(skill, '## Bookings and documents')
         self.assertIn('A hotel booking is then linked to its stop (see **Stops**)', bookings)
 
+    def test_soul_and_skill_tell_the_companion_to_plan_open_days_in_one_call(self):
+        # Issue #133: the owner's requirement is ONE approval, ONE completed
+        # action. The companion is told to use the single tool for days that
+        # belong to no stop yet, and not to rebuild it from three.
+        for lang in ('he', 'en'):
+            with self.subTest(lang=lang):
+                td, out, cp = render(lang)
+                self.addCleanup(td.cleanup)
+                self.assertEqual(cp.returncode, 0, cp.stderr)
+                soul = flat(section((out / 'SOUL.md').read_text(), SOUL_STOPS))
+                self.assertIn('planned with ONE call, `plan_open_days`', soul)
+                self.assertIn('the new stop and its plan together', soul)
+                self.assertIn('Never build it from `update_stop`, `split_stop` and `add_plan_item`', soul)
+                skill = (out / SKILL_REL).read_text()
+                plan = flat(section(section(skill, SKILL_STOPS), '### Planning days that belong to no stop yet', '### '))
+                self.assertIn('`plan_open_days` **once**', plan)
+                self.assertIn('written together or not at all', plan)
+                self.assertIn('Do not ask for a second approval for the plan after the stop', plan)
+                self.assertIn('Only then tell the organizer it is done', plan)
+                self.assertIn('passing the `revision` you read', plan)
+        # And its refusals are named with what to do.
+        refusals = flat(section((ROOT / 'templates' / SKILL_REL).read_text(), '### Refusals', '### '))
+        for code, words in [('dates_overlap_stop', 'which days are open'),
+                            ('item_outside_stop', 'resend the whole plan in the same single call')]:
+            self.assertIn(f'`{code}`', refusals, code)
+            self.assertIn(words, refusals, code)
+
     def test_skill_description_names_stops(self):
         skill = (ROOT / 'templates' / SKILL_REL).read_text()
         front = skill.split('---', 2)[1]
@@ -302,6 +329,26 @@ class StopEditingCases(unittest.TestCase):
         for sid in (args['from_phase_id'], args['to_phase_id']):
             self.assertTrue(stops[sid]['dates']['start'] <= args['date'] <= stops[sid]['dates']['end'], sid)
         self.assertLess(t.index('move_plan_day'), len(t) - 1, 'a read-back follows the move')
+
+    def test_plan_open_days_case_is_one_call_after_one_approval(self):
+        c = self.cases['plan_open_days_one_call']
+        t = self.tools('plan_open_days_one_call')
+        self.assertEqual(c['chat'], 'organizer_private')
+        self.assertEqual(t.count('plan_open_days'), 1, 'one call, not one per item')
+        self.assertEqual(t[0], 'get_stops')
+        self.assertGreater(len(t), t.index('plan_open_days') + 1, 'a read-back follows the call')
+        for banned in ('update_stop', 'split_stop', 'add_plan_item'):
+            self.assertNotIn(banned, t)
+            self.assertIn(banned, c['expected']['forbidden_tools'])
+        args = self.call('plan_open_days_one_call', 'plan_open_days')['args']
+        gap = next(s for s in c['state']['stops'] if s.get('unplanned'))
+        self.assertEqual((args['start'], args['end']), (gap['dates']['start'], gap['dates']['end']), 'the stretch is the open one')
+        self.assertTrue(args['items'])
+        for item in args['items']:
+            self.assertTrue(args['start'] <= item['date'] <= args['end'], 'every item is inside the stretch')
+        proposal = json.dumps(c['prior_turns'])
+        for item in args['items']:
+            self.assertIn(item['time'], proposal, 'the call carries what the organizer approved')
 
     def test_member_case_calls_no_stop_write(self):
         c = self.cases['member_asks_to_split']

@@ -189,6 +189,13 @@ export const BASE_PORTS = {
   // One hotel, one place — a companion-added hotel resolves to the same name
   // and links in every view — tests/hotel-one-place.test.js.
   hotelOnePlace:            28351,
+  // Planning the open days in one action (issue #133) — tests/plan-open-days.test.js
+  // and tests/mcp-plan-open-days.test.js.
+  planOpenDays:             28352,  // the trip server, main flow (colmar shape)
+  planOpenDaysFresh:        28353,  // a second trip server: a trip whose every day was covered at provisioning
+  mcpPlanOpenDaysStand:     28354,  // mcp/mcp.js against a stand-in site
+  mcpPlanOpenDaysMcp:       28355,  // mcp/mcp.js against the real trip server below
+  mcpPlanOpenDaysSite:      28356,  // the real trip server mcpPlanOpenDaysMcp talks to
 
   // ── Stand-ins for services the server calls out to ─────────────────────
   bookingExtractMockHermes: 28103,
