@@ -1792,10 +1792,14 @@ function renderRsvpCard(activity) {
   // An activity's id, title, date and price are config text (rsvp_activities):
   // escaped, and the id reaches setRsvp() as data (runDataAction).
   const aid = escapeHtml(activity.id);
+  // Date and price are both optional in config: show the parts that exist, and
+  // no meta line at all when neither does (issue #170 — it used to render a
+  // bare "📅  · " for an activity with neither).
+  const meta = [activity.date && `📅 ${escapeHtml(activity.date)}`, price && escapeHtml(price)].filter(Boolean).join(' · ');
 
   return `<div class="rsvp-card" id="rsvp-card-${aid}">
     <div class="rsvp-title">${escapeHtml(title)}</div>
-    <div class="rsvp-meta">📅 ${escapeHtml(activity.date)} · ${escapeHtml(price)}</div>
+    ${meta ? `<div class="rsvp-meta">${meta}</div>` : ''}
     ${currentUser ? `<div class="rsvp-btns">
       <button class="${btnClass('yes')}"   data-act="rsvp" data-arg="${aid}" data-arg2="yes">${tr.rsvp_yes}</button>
       <button class="${btnClass('no')}"    data-act="rsvp" data-arg="${aid}" data-arg2="no">${tr.rsvp_no}</button>
