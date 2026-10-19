@@ -131,7 +131,7 @@ async function say(pool: pg.Pool, chat: Chat, text: string, telegram: Telegram, 
   seq += 1;
   await queueInboundMessage(pool, chat.chatId, { text, message_id: `m${seq}` } as never);
   await flushSettledInboundBursts(
-    { db: pool, telegram, connector: { pushInbound: () => true }, modelRunner: model.runner } as never,
+    { db: pool, telegram, connector: { pushInbound: () => true }, modelRunner: model.runner, log: () => {} } as never,
     () => {},
     0,
   );
@@ -625,7 +625,7 @@ describe("typed changes: saying it in words, and everything the router must not 
       const tg = new Telegram();
       const model = fakeModel(() => [update("Tokyo", { end: "2026-05-25" })]);
       await queueInboundMessage(pool, a.chatId, { text, message_id: "mresume1" } as never);
-      await flushSettledInboundBursts({ db: pool, telegram: tg, connector: { pushInbound: () => true }, modelRunner: model.runner } as never, () => {}, 0);
+      await flushSettledInboundBursts({ db: pool, telegram: tg, connector: { pushInbound: () => true }, modelRunner: model.runner, log: () => {} } as never, () => {}, 0);
       assert.equal(model.calls.n, 1, "asked again, not resumed as 'the model said nothing'");
       assert.ok(tg.button("a"), "and the change is shown");
       assert.deepEqual(await draftStatuses(pool, a), ["pending"]);
