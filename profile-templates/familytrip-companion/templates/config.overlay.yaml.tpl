@@ -159,3 +159,20 @@ onboarding:
   profile_build: "off"
   seen:
     profile_build_offered: true
+
+# Hermes replays a housekeeping notice on the first turn after it raises a
+# Codex gpt-5.4/5.5/5.6 compaction threshold: "ℹ Codex gpt-5.6-terra caps
+# context at 272K, so auto-compaction was raised to 85% (from 50%) ... Opt back
+# out: hermes config set compression.codex_gpt55_autoraise false". It shows once
+# per profile, and every trip gets a fresh companion profile, so every new
+# trip's first group reply carried it (#65) — naming the model and the vendor
+# behind the assistant and handing a family a runtime command. The interviewer
+# profile already turns it off (.agents/skills/trip-intake-interviewer/
+# config.yaml.template); this block never reached companions.
+#
+# Only the NOTICE goes. The autoraise itself is a different key
+# (`codex_gpt55_autoraise`) and stays at Hermes's default. Fail-safe for
+# companions rendered before this block: GATEWAY_STATUS_PHRASES in
+# control-plane/api/src/relay/internal-leak.ts.
+compression:
+  codex_gpt55_autoraise_notice: false
