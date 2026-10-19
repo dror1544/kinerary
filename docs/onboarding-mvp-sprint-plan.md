@@ -1848,6 +1848,77 @@ Exit gate: the Japan trip produces reviewed, provenance-labelled feedback that
 improves only the intended trip by default; no raw chat transcript or
 unreviewed suggestion becomes shared knowledge.
 
+#### Sprint 7 carry-in — open issues to fix (triage 2026-10-18)
+
+Every open issue was checked against `main` @ `03c0e1c` on 2026-10-18. 15 were
+already fixed or obsolete and are now closed. 23 small fixes are on five
+`fix/` PRs, #425–#429: #31, #37, #65, #135, #161, #170, #201 (code half), #202, #227 (code
+half), #283, #287, #288, #295, #303, #304, #334, #344, #366, #367, #374, #379,
+#381, #420. The rest is listed below. The plan never assigns a single issue to
+two lanes. Sizes are the triage estimates. **(sec)** marks an issue that touches
+a CLAUDE.md security path, so it needs a boundary review with live
+request/response evidence.
+
+**Fix in Sprint 7, by area:**
+
+- **Interview and document intake:** issues #51 (S, tell the organizer a typed
+  message was cut), #339 (S, a suggestion tap drops held phases/travellers),
+  #214 (M), #216 (M), #209 (M), #412–#414 (M, same root cause: traveller names
+  on a second same-date ticket), #413 (M), #115 (M), #82 (M), #48 (M), #8 (M),
+  #154 (M), #100 (S, test time). #51 and #339 change behaviour on the
+  interview path, so each needs a recorded regression assessment.
+- **Companion behaviour:** issues #418 (S, template wording plus re-render),
+  #419 (M, read the transcript first), #67 (S–M), #68 (S), #69 (M), #163 (S–M,
+  PDF repair), #187 (M, outage recovery), #246 (M), #405 (M, duplicated group
+  delivery), #417 (M, document view in Telegram's WebView; adjacent to #359),
+  #78 (M, Hermes delegation patch).
+- **Trip site and data reliability:** issues #382 (M), #384 (L), #385 (L, design
+  first), #365 (M), #369 (S), #376 (S, the code-point caps half), #200 (M),
+  #212 (M, sec), #355 (S, sec), #368 (M, feature).
+- **Relay and control plane:** issues #33 (M; split out the HMAC `expRaw` and
+  `getUpdates` timeout items as S), #30 (S–M), #217 (M, gates
+  `ORGANIZER_DOCUMENT_ROUTE_ENABLED`), #221 (S), #225 (M, the items still open),
+  #387 (S, lock order), #390 (L), #327 (M, sec: per-profile ingest key), #281
+  (M, sec).
+- **Release, operations and fleet monitor:** issues #289 together with #294
+  (S–M, verify against a pre-upgrade baseline and `/health`), #380, then #189
+  (Hermes upgrade; also blocked on #349), #127 (S), #292 (S–M, needs a privacy
+  audit), #300 (S–M), #263 (S), #265 (S), #291 together with #302 (L, move the
+  monitor to the VM), #238 (L, separate nightly stack), #190 (L), #106 (L).
+- **Accounts:** issues #126 (L, password recovery), #107 (M, sec).
+- **Shared knowledge:** issue #188 (L, the shared place resolver). #159 closes
+  when slice 3 lands.
+
+**Needs an owner decision before any work:**
+
+| Issue | Question |
+|---|---|
+| #39 | Close it, or keep "pin the language once"? Today the interview follows the language the organizer writes in. |
+| #77 | Should `trip_interests` reach the companion, gated on `bot_name` or as its own handoff field? |
+| #103 | When a reply is suppressed, should the router send a fallback sentence instead? |
+| #117, #198 | Design the interview judge pair. Can a finding ever change a confirmed intake? |
+| #119 | Is an unattended gateway restart acceptable as auto-repair? |
+| #130, #69 | Does a place's `en` have to be its real English name, and whose job is that? |
+| #186 | Consent and retention for assistant recording, before full production. |
+| #210 | Should minting a public album link be organizer-only? Should there be one rule for a caller's own row? |
+| #277 | Admin key: move under `/internal/` or harden in place? Switch to `timingSafeEqual` either way. |
+| #278 | May one organizer reset another organizer's password? |
+| #307 | Ratify the per-role Hermes tool allow-lists. The draft is in the vault. |
+| #346 | Who approves a companion's dangerous command, the organizer or the operator? |
+| #349 | Where does the gateway reconciler live, and what grace period follows a trip's end? |
+| #370 | Make `messaging_binding` and `mcp_isolation` hard gates, accepting the reorder? |
+| #376 | Do emoji tag characters get through typed changes too? |
+| #383 | Ordering guard: version or `updated_at`? Required for agent writes? |
+| #415 | Same-date bookings for different travellers: one Journey entry or two? |
+
+**Owner action, then close:** #323 needs the `CLAUDE_CODE_OAUTH_TOKEN` secret.
+#125 is fixed in the template, but a745213 records it as deferred, so confirm
+before closing. #133 and #206 have code on `main` and close after a live walk.
+
+**Connected Assistants (#247–#256):** this is its own initiative, not this fix
+list. CA-01 and CA-07 are drafts #357 and #359, which must land in that order;
+CA-00 lands with #357.
+
 ## 4. Demo-trip acceptance script
 
 Run this only after Sprint 6 automated gates are green. Record the IDs,
