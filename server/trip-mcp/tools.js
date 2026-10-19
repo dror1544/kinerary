@@ -19,10 +19,14 @@ const WRITE = { readOnlyHint: false, destructiveHint: false, openWorldHint: fals
 const DESTROY = { readOnlyHint: false, destructiveHint: true, openWorldHint: false };
 const bookingType = z.enum(['flight', 'hotel', 'car', 'attraction', 'other']);
 
-// Other people's records reach the assistant as name and colour only. Some
-// read routes embed a whole user row (Telegram id, age, Google email) — issue
-// #191 — and this connector should not carry that to a model provider, for
-// organizers or members, whatever the route does.
+// Other people's records reach the assistant as name and colour only. Issue
+// #191 (read routes embedding a whole user row: Telegram id, age, Google
+// email) is fixed at the source — the routes attach publicUser()'s allow-list
+// (server/public-user.js). PERSON_FIELDS / withPeople() below are defence in
+// depth, not the fix: should a route ever embed more again, this connector
+// still would not carry it to a model provider, for organizers or members.
+// /api/ratings embeds no user at all ({venue: {username: stars}}); the
+// get_ratings test in tests/trip-mcp.test.js pins that shape.
 const PERSON_FIELDS = ['username', 'name', 'name_en', 'color'];
 const person = u => (u && typeof u === 'object' ? Object.fromEntries(PERSON_FIELDS.filter(k => k in u).map(k => [k, u[k]])) : u);
 const withPeople = rows => {

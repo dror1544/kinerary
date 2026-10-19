@@ -205,3 +205,37 @@ describe('ratings on a stop with no venues', () => {
     } finally { await t.done(); }
   });
 });
+
+// Issue #170: the meta line was `📅 ${date} · ${price}` unconditionally, so a
+// config activity without a date or price (both optional in the interview's
+// output) rendered "📅 undefined · undefined" — or escapeHtml's blank — and a
+// dangling "·".
+describe('the RSVP card meta line shows only the parts the activity has', () => {
+  // `check` runs while the window is still open (happy-dom misbehaves after close()).
+  const render = async (activity, check) => {
+    const t = await boot(clone(FIXTURE));
+    try {
+      const host = t.doc.createElement('div');
+      host.innerHTML = t.win.renderRsvpCard({ id: 'a1', title: { he: 'שייט', en: 'Boat' }, ...activity });
+      check(host);
+    } finally { await t.done(); }
+  };
+
+  test('no date and no price: no meta line at all, and no "undefined"', () => render({}, (host) => {
+    assert.ok(!host.querySelector('.rsvp-meta'), 'no .rsvp-meta element');   // not assert.equal(el, null): a failing diff of a DOM node hangs node:test
+    assert.doesNotMatch(host.textContent, /undefined|null|·|📅/);
+    assert.ok(host.querySelector('.rsvp-title'), 'the card itself still renders');
+  }));
+
+  test('date only: the date, no separator', () => render({ date: '2027-03-11' }, (host) => {
+    assert.equal(host.querySelector('.rsvp-meta').textContent.trim(), '📅 2027-03-11');
+  }));
+
+  test('price only: the price, no calendar icon and no separator', () => render({ price: { he: '20 דולר', en: '$20' } }, (host) => {
+    assert.match(host.querySelector('.rsvp-meta').textContent.trim(), /^(20 דולר|\$20)$/);
+  }));
+
+  test('both: date and price joined by one separator', () => render({ date: '2027-03-11', price: '$20' }, (host) => {
+    assert.equal(host.querySelector('.rsvp-meta').textContent.trim(), '📅 2027-03-11 · $20');
+  }));
+});

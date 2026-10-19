@@ -1,6 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { findMissingDeps, describeMissingDeps, REQUIRED_DEPS } from './helpers/required-deps.js';
 import { assertPortFree, findBusyPorts, freePort, describeBusyPorts } from './helpers/port-guard.js';
 
 const occupy = (host) => new Promise((resolve, reject) => {
@@ -64,4 +70,53 @@ test('freePort hands back a port that can be bound, and a different one while th
     assert.notEqual(p1, p2);
     assert.ok(p1 > 1023 && p1 < 65536);
   } finally { await release(s1); }
+});
+
+// Issue #366: a worktree with no `npm ci` does not fail, its tests are
+// cancelled — the pretest names the missing package and the command instead.
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const CHECK = path.join(REPO_ROOT, 'tests', 'helpers', 'check-free-ports.js');
+
+test('the dependencies the suite needs resolve in this tree', () => {
+  assert.deepEqual(findMissingDeps(REPO_ROOT).map(m => m.request), []);
+  assert.deepEqual(REQUIRED_DEPS.map(d => d.dir).sort(), ['mcp', 'server', 'tests']);
+});
+
+test('a tree with no node_modules is named package by package, with the npm ci command', () => {
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'no-deps-'));
+  try {
+    const missing = findMissingDeps(empty);
+    assert.deepEqual(missing.map(m => m.dir).sort(), ['mcp', 'server', 'tests']);
+    const text = describeMissingDeps(missing);
+    assert.match(text, /express/);
+    assert.match(text, /@modelcontextprotocol\/sdk/);
+    assert.match(text, /happy-dom/);
+    for (const dir of ['server', 'mcp', 'tests']) assert.match(text, new RegExp(`npm ci --prefix ${dir}\\b`));
+  } finally { fs.rmSync(empty, { recursive: true, force: true }); }
+});
+
+test('only the directory that lacks a package is named', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'some-deps-'));
+  try {
+    for (const dep of REQUIRED_DEPS.filter(d => d.dir !== 'mcp')) {
+      const pkg = dep.request.startsWith('@') ? dep.request.split('/').slice(0, 2).join('/') : dep.request;
+      const dir = path.join(root, dep.dir, 'node_modules', pkg);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: pkg, main: 'index.js' }));
+      fs.writeFileSync(path.join(dir, 'index.js'), '');
+    }
+    assert.deepEqual(findMissingDeps(root).map(m => m.dir), ['mcp']);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the pretest exits 1 naming the install command in a tree without dependencies', () => {
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'no-deps-'));
+  try {
+    const bad = spawnSync(process.execPath, [CHECK, empty], { encoding: 'utf8' });
+    assert.equal(bad.status, 1, bad.stderr);
+    assert.match(bad.stderr, /npm ci --prefix server/);
+    // This tree's own ports may legitimately be held by a neighbour's run; only the deps half is asserted.
+    const ok = spawnSync(process.execPath, [CHECK], { encoding: 'utf8' });
+    assert.doesNotMatch(ok.stderr, /npm ci/, ok.stderr);
+  } finally { fs.rmSync(empty, { recursive: true, force: true }); }
 });

@@ -408,6 +408,46 @@ describe('trip MCP — an organizer connects an assistant', () => {
     }
   });
 
+  // Issue #227: get_ratings passes /api/ratings through untouched, so the only
+  // thing keeping other users' rows out of it is that the route returns
+  // {venue: {username: stars}} and nothing else. Pin that shape for both
+  // connection scopes, and that a member-chosen venue id of `__proto__` stays
+  // a key (the route builds null-prototype maps; JSON.parse and the tool's
+  // output sanitiser must not turn it into pollution either).
+  it('get_ratings gives {venue: {username: stars}} and nothing else, to an organizer and to a member', async () => {
+    const rate = (token, venue, rating) => api('/api/ratings', { method: 'POST', token, body: { venue, rating } });
+    for (const [token, venue, stars] of [
+      [aliceSession, 'mcp-rated', 5], [bobSession, 'mcp-rated', 2],
+      [aliceSession, '__proto__', 4], [bobSession, '__proto__', 1],
+    ]) assert.equal((await rate(token, venue, stars)).status, 200, `${venue} ${stars}`);
+
+    for (const session of [aliceSession, bobSession]) {
+      const t = await connect(session);
+      const r = await (await rpc(t.access_token, 'tools/call', { name: 'get_ratings', arguments: {} })).json();
+      assert.ok(!r.result.isError, JSON.stringify(r));
+      const ratings = JSON.parse(r.result.content[0].text);
+
+      assert.deepEqual(ratings['mcp-rated'], { alice: 5, bob: 2 });
+      for (const [venue, byUser] of Object.entries(ratings)) {
+        for (const [username, stars] of Object.entries(byUser)) {
+          assert.match(username, /^[a-z0-9_.-]+$/i, `${venue}: a username, not a user object`);
+          assert.equal(typeof stars, 'number', `${venue}/${username}: just the stars, no user fields`);
+        }
+      }
+
+      assert.ok(Object.hasOwn(ratings, '__proto__'), 'a venue named __proto__ is an ordinary key');
+      assert.deepEqual(Object.getOwnPropertyDescriptor(ratings, '__proto__').value, { alice: 4, bob: 1 });
+      assert.equal(Object.getPrototypeOf(ratings), Object.prototype, 'and did not replace the result\'s prototype');
+      assert.equal(({}).alice, undefined, 'nor did it reach Object.prototype in this process');
+
+      // The server is another process: if the key had polluted its Object.prototype,
+      // every plain object it builds afterwards would carry the raters.
+      const rsvps = await (await rpc(t.access_token, 'tools/call', { name: 'get_rsvps', arguments: { activityId: 'mcp-rsvp' } })).json();
+      for (const row of JSON.parse(rsvps.result.content[0].text)) assert.equal(row.alice, undefined);
+      assert.equal((await (await api('/api/ratings', { token: session })).json()).alice, undefined);
+    }
+  });
+
   it('the assistant can revoke its own connection', async () => {
     tokens = await connect();
     const r = await fetch(base + '/oauth/revoke', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ token: tokens.refresh_token, client_id: client.client_id }).toString() });
