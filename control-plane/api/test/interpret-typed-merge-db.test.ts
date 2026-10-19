@@ -79,7 +79,7 @@ describe("a typed correction to the bookings keeps what was held", { skip: SKIP 
         }] } };
       } };
       await queueInboundMessage(pool, CHAT, { text, message_id: id("m") } as never);
-      await flushSettledInboundBursts({ db: pool, telegram: new Telegram(), connector: { pushInbound: () => true }, modelRunner: runner } as never, () => {}, 0);
+      await flushSettledInboundBursts({ db: pool, telegram: new Telegram(), connector: { pushInbound: () => true }, modelRunner: runner, log: () => {} } as never, () => {}, 0);
       const stored = (await pool.query("SELECT answers->'travel_anchors'->'data' AS d FROM control_plane.intake_sessions WHERE id = $1", [sessionId])).rows[0].d as { name: string }[];
       assert.deepEqual(stored.map((b) => b.name).sort(), ["Gion Inn", "LY381"]);
     });

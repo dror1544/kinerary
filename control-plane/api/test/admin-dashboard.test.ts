@@ -74,7 +74,10 @@ describe("super-admin dashboard: slice 1 (read-only)", { skip: SKIP ? "no CONTRO
     await pool.query("DELETE FROM control_plane.jobs");
     await pool.query("DELETE FROM control_plane.plans");
     await pool.query("DELETE FROM control_plane.trips");
-    await pool.query("DELETE FROM control_plane.releases");
+    // Not the dev-seed release: later test files (planner.test.ts, ...) read
+    // release_localdev0001 and this file runs before them on a shared DB (#344).
+    // Same convention as release-registry.test.ts.
+    await pool.query("DELETE FROM control_plane.releases WHERE id <> 'release_localdev0001'");
   });
 
   function appWithAdmin() {
@@ -367,6 +370,43 @@ describe("super-admin dashboard: slice 1 (read-only)", { skip: SKIP ? "no CONTRO
     }
   });
 
+  test("GET /v1/admin/audit drops allow-listed evidence values that are not the format the writer produces (#283)", async () => {
+    // from/to are ReleaseStatus values and artifactDigest a sha256 ref. A row
+    // that carries anything else under those KEYS (a hand-written row, a
+    // future writer) must not be served verbatim just because the key is known.
+    await pool.query(
+      `INSERT INTO control_plane.audit_events(id, actor_ref, action, target_ref, correlation_id, evidence, occurred_at)
+       VALUES ($1, 'user:test', 'release.promote', 'release_1', 'corr_manualaudittest283a', $2::jsonb, now())`,
+      [`audit_${suffix()}`, JSON.stringify({ from: "<script>alert(1)</script>", to: "bogus-status", artifactDigest: "sha256:not-a-digest-283" })],
+    );
+    await pool.query(
+      `INSERT INTO control_plane.audit_events(id, actor_ref, action, target_ref, correlation_id, evidence, occurred_at)
+       VALUES ($1, 'user:test', 'release.promote', 'release_2', 'corr_manualaudittest283b', $2::jsonb, now())`,
+      [`audit_${suffix()}`, JSON.stringify({ from: "candidate", to: ["verified"], artifactDigest: 42 })],
+    );
+    await pool.query(
+      `INSERT INTO control_plane.audit_events(id, actor_ref, action, target_ref, correlation_id, evidence, occurred_at)
+       VALUES ($1, 'user:test', 'release.promote', 'release_3', 'corr_manualaudittest283c', $2::jsonb, now())`,
+      [`audit_${suffix()}`, JSON.stringify({ from: "verified", to: "available", artifactDigest: `sha256:${"b".repeat(64)}` })],
+    );
+
+    const app = appWithAdmin();
+    try {
+      const response = await app.inject({ method: "GET", url: "/v1/admin/audit?action=release.promote", headers: { "x-api-key": KEY } });
+      assert.equal(response.statusCode, 200);
+      assert.ok(!response.body.includes("<script>"));
+      assert.ok(!response.body.includes("not-a-digest-283"));
+      // audit_events is append-only, so rows from earlier tests are present too.
+      const { events } = JSON.parse(response.body) as { events: { correlationId: string; evidence: Record<string, unknown> }[] };
+      const byCorr = new Map(events.map((e) => [e.correlationId, e.evidence]));
+      assert.deepEqual(byCorr.get("corr_manualaudittest283a"), {});
+      assert.deepEqual(byCorr.get("corr_manualaudittest283b"), { from: "candidate" });
+      assert.deepEqual(byCorr.get("corr_manualaudittest283c"), { from: "verified", to: "available", artifactDigest: `sha256:${"b".repeat(64)}` });
+    } finally {
+      await app.close();
+    }
+  });
+
   test("GET /v1/admin/audit withholds actorRef and targetRef that do not look like opaque identifiers", async () => {
     // audit_events.actor_ref / target_ref carry no DB-level format CHECK
     // (unlike releases.promoted_by) — this is the read-time safety net for
@@ -485,16 +525,20 @@ describe("super-admin dashboard: slice 1 (read-only)", { skip: SKIP ? "no CONTRO
   // ── Versions ──────────────────────────────────────────────────────────────
 
   test("GET /v1/admin/versions lists the seeded releases", async () => {
-    await seedRelease("r1", "candidate");
-    await seedRelease("r2", "available");
+    const r1 = await seedRelease("r1", "candidate");
+    const r2 = await seedRelease("r2", "available");
 
     const app = appWithAdmin();
     try {
       const response = await app.inject({ method: "GET", url: "/v1/admin/versions", headers: { "x-api-key": KEY } });
       assert.equal(response.statusCode, 200);
-      const { releases } = JSON.parse(response.body);
+      // The dev-seed release (release_localdev0001) survives the per-test
+      // wipe on purpose; this test is about the two it seeded.
+      const releases = (JSON.parse(response.body).releases as { id: string; status: string }[])
+        .filter((r) => r.id !== "release_localdev0001");
       assert.equal(releases.length, 2);
-      assert.deepEqual(new Set(releases.map((r: { status: string }) => r.status)), new Set(["candidate", "available"]));
+      assert.deepEqual(new Set(releases.map((r) => r.id)), new Set([r1, r2]));
+      assert.deepEqual(new Set(releases.map((r) => r.status)), new Set(["candidate", "available"]));
     } finally {
       await app.close();
     }

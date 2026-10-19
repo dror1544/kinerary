@@ -645,9 +645,15 @@ export async function applyDecision(
               : result.outcome === "already_decided" ? "Already decided"
                 : "Could not process this action",
       });
-      if (result.outcome === "error") {
-        log(structuredLog("warn", "trip_bot.approval_rejected", { safe_error_code: result.reason }));
-      }
+      // One line per tap, whatever the outcome (#37): logging only the error
+      // made "the admin tapped Approve and nothing happened" look the same as
+      // "nobody tapped". Deliberately no request id, sender or applicant — the
+      // outcome and, on error, the safe code are all the log needs. This
+      // replaces `trip_bot.approval_rejected`, which nothing read.
+      log(structuredLog(result.outcome === "error" ? "warn" : "info", "trip_bot.approval_processed", {
+        outcome: result.outcome,
+        ...(result.outcome === "error" ? { safe_error_code: result.reason } : {}),
+      }));
       return;
     }
 

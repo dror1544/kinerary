@@ -66,6 +66,15 @@ class Tests(unittest.TestCase):
   overlay=yaml.safe_load((o/'config.overlay.yaml').read_text())
   self.assertEqual(overlay['skills'],{'write_approval':True})
   self.assertEqual(overlay['agent']['disabled_toolsets'],['terminal','code_execution'])
+ def test_rendered_overlay_silences_the_codex_autoraise_notice(self):
+  # #65: Hermes replays "auto-compaction was raised ..." (naming the model and
+  # a `hermes config set` command) into the FIRST group reply of every fresh
+  # profile. The interviewer template already sets this key; the companion had
+  # no `compression` block at all. Only the notice goes: the autoraise itself,
+  # a different key (`codex_gpt55_autoraise`), is left at Hermes's default.
+  td,o,c=self.go(); self.addCleanup(td.cleanup); self.assertEqual(c.returncode,0,c.stderr)
+  overlay=yaml.safe_load((o/'config.overlay.yaml').read_text())
+  self.assertEqual(overlay['compression'],{'codex_gpt55_autoraise_notice':False})
  def test_shipped_skills_find_their_own_files(self):
   # trip-kml-export ran its script from $PROFILE_SKILLS_DIR, which nothing
   # defines, so on every companion the path pointed at /travel/... (#71). A

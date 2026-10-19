@@ -4,6 +4,9 @@ import { describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
+import { signApprovalAction } from "../src/approval-action.js";
+import { digestTelegramId, type VerifiedTelegramIdentity } from "../src/identity.js";
+import { startSignup } from "../src/signup.js";
 import { askText } from "../src/intake-copy.js";
 import { INTAKE_QUESTIONS } from "../src/interview.js";
 import { issueEnrollment } from "../src/enrollment.js";
@@ -866,6 +869,79 @@ describe("when the trip bot IS the signup bot", () => {
       // the button forever and the admin cannot tell refusal from a hang.
       assert.equal(fix.telegram.answered.length, 1);
       assert.equal(fix.telegram.answered[0]?.text, "Could not process this action");
+    });
+  });
+
+  describe("every approval outcome leaves one info line (#37)", () => {
+    // Before, only the error outcome was logged, so "the admin tapped Approve
+    // and nothing happened" and "nobody tapped" looked the same in the log.
+    const ADMIN_TELEGRAM_ID = 391627336;
+    const config = { ...APPROVAL_CONFIG, superAdminSubjectDigest: digestTelegramId(String(ADMIN_TELEGRAM_ID)) };
+    const noNotification = { async sendApprovalRequest() {}, async sendMessage() {} };
+
+    async function pendingRequest(fix: Fixture): Promise<string> {
+      const organizer: VerifiedTelegramIdentity = {
+        provider: "telegram", providerSubjectDigest: digestTelegramId("200000777"),
+        providerSubjectId: "200000777", displayName: "Applicant",
+      };
+      const started = await startSignup(fix.pool, organizer, "Japan 2026", config, noNotification);
+      assert.equal(started.status, "awaiting_approval");
+      return (started as { requestId: string }).requestId;
+    }
+
+    async function tapAndCollect(fix: Fixture, data: string): Promise<string[]> {
+      const lines: string[] = [];
+      const decision = await dispatchUpdate(fix.pool, approvalTap(data));
+      assert.equal(decision.kind, "approval_callback");
+      await applyDecision(decision, {
+        db: fix.pool, telegram: fix.telegram, connector: fix.connector, approvals: { config }, log: (l) => lines.push(l),
+      });
+      return lines;
+    }
+
+    const processed = (lines: string[]) =>
+      lines.map((l) => JSON.parse(l) as Record<string, unknown>).filter((e) => e.event === "trip_bot.approval_processed");
+
+    test("approved, rejected and already_decided each log one info line carrying the outcome", { skip: SKIP }, async () => {
+      await withFixture(async (fix) => {
+        const approveId = await pendingRequest(fix);
+        const approve = signApprovalAction(approveId, "approve", config.actionSecret).token;
+        const first = processed(await tapAndCollect(fix, approve));
+        assert.equal(first.length, 1);
+        assert.equal(first[0]!.level, "info");
+        assert.equal(first[0]!.outcome, "approved");
+
+        // The same tap again: the request is decided, and the log says so.
+        const replay = processed(await tapAndCollect(fix, approve));
+        assert.equal(replay.length, 1);
+        assert.equal(replay[0]!.outcome, "already_decided");
+        assert.equal(replay[0]!.level, "info");
+      });
+      await withFixture(async (fix) => {
+        const rejectId = await pendingRequest(fix);
+        const reject = signApprovalAction(rejectId, "reject", config.actionSecret).token;
+        const lines = await tapAndCollect(fix, reject);
+        const rejected = processed(lines);
+        assert.equal(rejected.length, 1);
+        assert.equal(rejected[0]!.outcome, "rejected");
+        assert.equal(rejected[0]!.level, "info");
+        // No identifier of the request, the sender or the applicant in the line.
+        assert.ok(!lines.join("").includes(rejectId));
+        assert.ok(!lines.join("").includes(String(ADMIN_TELEGRAM_ID)));
+        assert.ok(!lines.join("").includes("200000777"));
+        assert.ok(!lines.join("").includes(reject));
+      });
+    });
+
+    test("the error outcome keeps its safe_error_code and is still one line", { skip: SKIP }, async () => {
+      await withFixture(async (fix) => {
+        const lines = await tapAndCollect(fix, "not-a-real-signed-token");
+        const errors = processed(lines);
+        assert.equal(errors.length, 1);
+        assert.equal(errors[0]!.outcome, "error");
+        assert.equal(errors[0]!.safe_error_code, "INVALID_SIGNATURE");
+        assert.equal(lines.length, 1, "no second line for the same tap");
+      });
     });
   });
 
