@@ -491,6 +491,45 @@ class FleetMcp(unittest.TestCase):
         self.tool("alerts", {}, env=self.fixtures_env([]))
         self.assertFalse([s for s in self.statements() if "ve.check_name = 'mcp_isolation'" in s])
 
+    # ------------------------------------------------- stale reachability (#295) --
+    STALE = "reachability_checked_at"
+
+    def test_a_live_trip_whose_reachability_check_went_stale_appears_in_alerts(self):
+        text, is_error = self.tool("alerts", {}, env=self.fixtures_env([(self.STALE, [["trip-s"]])]))
+        self.assertFalse(is_error, text)
+        self.assertEqual(text, "\n\n".join([
+            "⚠️ Kinerary fleet — a control plane",
+            "REACHABILITY CHECK STALE\n  • trip-s — no reachability check for over 60 minutes; "
+            "the probe that confirms the companion's bridge may have stopped",
+        ]))
+
+    def test_the_stale_reachability_alert_has_a_digest_line_too(self):
+        text = self.rendered("alerts", {"format": "digest"}, [(self.STALE, [["trip-s"]])])
+        self.assertEqual(
+            text,
+            "**⚠️ Needs attention**\n"
+            "• reachability check stale: trip-s — no reachability check for over 60 minutes; "
+            "the probe that confirms the companion's bridge may have stopped",
+        )
+        self.assert_telegram_safe(text)
+
+    def test_the_stale_reachability_query_is_gated_on_the_probe_running_at_all(self):
+        """The fake psql never evaluates SQL, so the selection is pinned by its text.
+        Without the EXISTS gate this fires for every trip on a stack whose probe was
+        never enabled (the exact noise #295 warns about)."""
+        self.tool("alerts", {}, env=self.fixtures_env([]))
+        queries = [s for s in self.statements() if self.STALE in s]
+        self.assertEqual(len(queries), 1, queries)
+        sql = queries[0]
+        self.assertRegex(sql, r"reachability_checked_at IS NULL\s+OR\s+\w+\.reachability_checked_at < now\(\) - interval '60 minutes'")
+        self.assertRegex(sql, r"EXISTS \(SELECT 1 FROM control_plane\.trips \w+\s+WHERE \w+\.reachability_checked_at > now\(\) - interval '60 minutes'\)")
+        self.assertIn("= 'live'", sql)
+        self.assertIn("lifecycle_state = 'ready_private'", sql)
+        self.assertIn("NOT LIKE 'retired-%'", sql)
+        # Slugs only: a moving value in the output re-wakes the model hourly.
+        self.assertEqual(sql.split("FROM")[0].split("SELECT")[1].strip(), "t.slug")
+        self.assertNotRegex(sql, r"(?i)\b(insert|update|delete|alter|drop|truncate)\b")
+
     def test_verification_failure_is_not_checked_on_a_stack_without_the_table(self):
         """to_regclass absent/false (no fixture match) must degrade, not error."""
         text, is_error = self.tool("alerts", {}, env=self.fixtures_env([]))
@@ -656,6 +695,28 @@ class FleetMcp(unittest.TestCase):
         self.assertNotIn("**all fine**", text)
         self.assertIn("trip-d", text)
         self.assert_telegram_safe(text)
+
+    def test_a_traveller_s_words_cannot_italicise_strike_spoil_or_quote_in_the_digest(self):
+        """Hermes turns ~~x~~ into strikethrough, ||x|| into a spoiler, a line-leading
+        '>' into a quote, and *x* into italic. Not `_x_` — its converter escapes a bare
+        underscore — but md() drops the italic-shaped ones anyway, so a different
+        converter cannot change what a stranger's words do."""
+        hostile = "> x _x_ ~x~ ~~y~~ ||z|| NO_ORGANIZER_CHAT mcp__trip_mcp__get __init__ a|b"
+        fixtures = [["companion_bug_reports r\n", [["trip-d", "bug", hostile, "rep_1", "2026-09-27 08:00 UTC"]]]]
+        text = self.rendered("alerts", {"format": "digest"}, [["to_regclass", [["t"]]], *fixtures])
+        self.assertEqual(len(text.splitlines()), 2, text)
+        line = text.splitlines()[1]
+        for char in "~|":
+            self.assertNotIn(char, line)
+        self.assertNotRegex(line, r"(?<![A-Za-z0-9_])_|_(?![A-Za-z0-9_])", "an italic-shaped underscore survived")
+        self.assertIn("NO_ORGANIZER_CHAT", line, "a reason code must stay readable")
+        self.assertIn("bug, x x x y z NO_ORGANIZER_CHAT mcp__trip_mcp__get init ab (", line)
+        self.assert_telegram_safe(text)
+
+    def test_a_leading_quote_marker_in_a_value_is_dropped(self):
+        fixtures = [["j.state = 'failed' AND", [["trip-j", "> quoted", ">> deeper", "3/3"]]]]
+        text = self.rendered("alerts", {"format": "digest"}, fixtures)
+        self.assertEqual(text.splitlines()[1], "• failed job: trip-j — quoted deeper (attempt 3/3)")
 
     def test_a_long_run_of_incidents_is_capped_and_says_so(self):
         rows = [[f"trip-{i:02d}", "provision", "TIMED_OUT", "3/3"] for i in range(13)]
