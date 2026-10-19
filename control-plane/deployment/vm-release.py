@@ -178,6 +178,22 @@ class Report:
 # Running things. read() always runs; act() is what --dry-run replaces with a
 # description, so a dry run can never change anything by accident.
 # --------------------------------------------------------------------------- #
+INTERVIEW_REGISTERED_RE = re.compile(r"MCP server 'interview'.*registered.*tool\(s\):")
+TRIP_INTAKE_GATEWAY_SERVICE = "/run/service/gateway-trip-intake"
+
+
+def interview_registrations(agent_log: Path) -> List[str]:
+    """Every line in the trip-intake agent log where the gateway registered the
+    interview MCP server's tools, oldest first. verify() reads the last one."""
+    if not agent_log.exists():
+        return []
+    return [raw for raw in agent_log.read_text(errors="replace").splitlines() if INTERVIEW_REGISTERED_RE.search(raw)]
+
+
+def count_interview_registrations(agent_log: Path) -> int:
+    return len(interview_registrations(agent_log))
+
+
 class Shell:
     def __init__(self, report: Report, dry_run: bool = False):
         self.report = report
@@ -1236,6 +1252,28 @@ class ControlPlane:
             raise MigrateFailed(f"migrate with {short} failed; running {previous['KINERARY_REV']} again"
                                 + (f", with these new migrations committed: {', '.join(committed)}" if committed else ""))
 
+    def trip_intake_log(self) -> Path:
+        return HERMES_DATA / "profiles" / "trip-intake" / "logs" / "agent.log"
+
+    def restart_trip_intake_gateway(self) -> None:
+        """The gateway reads interview-mcp's tool list once, when it boots, so a
+        recreated interview-mcp is invisible to it until it restarts (#420).
+        Restarted whether or not the Hermes container was: a code-only switch
+        leaves Hermes running with the tool list it registered last time."""
+        log = self.trip_intake_log()
+        before = count_interview_registrations(log)
+        self.sh.act(["docker", "exec", HERMES_CONTAINER, "/command/s6-svc", "-r", TRIP_INTAKE_GATEWAY_SERVICE],
+                    describe="restart the trip-intake gateway so it re-registers the interview tools  (downtime: interviews pause for seconds)",
+                    timeout=60)
+        if self.dry_run:
+            return
+        for _ in range(30):
+            if count_interview_registrations(log) > before:
+                self.r.ok("trip-intake gateway re-registered the interview tools")
+                return
+            time.sleep(2)
+        self.r.note("trip-intake gateway did not log a new interview tool registration within 60s — verify will say if tools are missing")
+
     def start_switched(self, hermes_rev: Optional[str], *, restart_hermes: bool) -> None:
         """The point of no return: the target's containers start. From here a failure
         rolls forward (verify, then rollback), because putting an older database back
@@ -1251,6 +1289,7 @@ class ControlPlane:
                         describe="compose up -d hermes  (downtime: companions and site AI features restart)", timeout=900)
         else:
             self.r.ok("Hermes untouched — companions and site AI features keep running")
+        self.restart_trip_intake_gateway()
 
     # ---------------------------------------------------------- verify --
     def relay_log(self) -> List[Dict]:
@@ -1278,11 +1317,13 @@ class ControlPlane:
         # The same special case, for the same reason, lives in
         # control-plane/api/src/relay/gateway-wait.ts's expectedGatewayProfiles
         # — if another UNREACHABLE_REASONS value ever needs the same
-        # treatment, update both queries together.
+        # treatment, update both queries together. The retired-slug filter is
+        # the same NOT_RETIRED_SQL (trip-retirement.ts) that file uses (#288).
         rows = self.psql(
             "SELECT DISTINCT t.slug || '|' || b.hermes_profile FROM control_plane.telegram_chat_bindings b "
             "JOIN control_plane.trips t ON t.id = b.trip_id WHERE b.closed_at IS NULL AND b.hermes_profile IS NOT NULL "
-            "AND (t.reachability <> 'unreachable' OR t.unreachable_reason = 'TRIP_MCP_BRIDGE_FAILED') ORDER BY 1")
+            "AND (t.reachability <> 'unreachable' OR t.unreachable_reason = 'TRIP_MCP_BRIDGE_FAILED') "
+            "AND t.slug NOT LIKE 'retired-%' ORDER BY 1")
         return [tuple(row.split("|", 1)) for row in rows.splitlines() if "|" in row]  # type: ignore[misc]
 
     def verify(self) -> bool:
@@ -1329,12 +1370,8 @@ class ControlPlane:
 
         source = REPO / "control-plane" / "api" / "src" / "interview-mcp.ts"
         expected_tools = extract_agent_tools(source.read_text()) if source.exists() else []
-        agent_log = HERMES_DATA / "profiles" / "trip-intake" / "logs" / "agent.log"
-        registered = ""
-        if agent_log.exists():
-            for raw in agent_log.read_text(errors="replace").splitlines():
-                if re.search(r"MCP server 'interview'.*registered.*tool\(s\):", raw):
-                    registered = raw
+        registrations = interview_registrations(self.trip_intake_log())
+        registered = registrations[-1] if registrations else ""
         if not expected_tools:
             self.r.note("could not extract the *_for_chat tool list from interview-mcp.ts — gateway tools not checked")
         else:

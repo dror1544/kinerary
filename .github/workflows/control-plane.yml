@@ -8,9 +8,14 @@ on:
       # run no CI at all and regressions only surface at the PR.
       - "integration/**"
       - "docs/trip-fleet-control-plane-plan"
+      # main is the leading branch now, and a release is cut on release/**;
+      # without these, a push to either runs no CI at all (#303).
+      - "release/**"
+      - main
   pull_request:
     branches:
       - "integration/**"
+      - "release/**"
       - main
       - "docs/trip-fleet-control-plane-plan"
 
