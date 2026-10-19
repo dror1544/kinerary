@@ -40,6 +40,13 @@ def validate(d):
  if q.get('pii_redaction') is not True or q.get('secret_redaction') is not True or q.get('sensitive_default')!='private': bad('privacy defaults are not fail-closed')
  if not re.match(r'^https?://',d['backend'].get('url','')): bad('backend URL must use HTTP(S)')
 def tpl(path,v): return Template(path.read_text()).substitute(v)
+# #31: gateway.multiplex_profiles: true is only safe together with a GATEWAY_RELAY_URL env stamp in the
+# profile's .env (a config key does not do it). Detect the flag in the overlay itself, never assume it.
+MULTIPLEX=re.compile(r'^\s*multiplex_profiles:\s*true\b',re.M)
+RELAY_URL=re.compile(r'https?://[^\s]+')
+def needs_relay_url(): return bool(MULTIPLEX.search((ROOT/'templates/config.overlay.yaml.tpl').read_text()))
+def check_relay_url(u):
+ if not u or not RELAY_URL.fullmatch(u): bad('--relay-url must be a single http(s) URL with no whitespace (the profile .env takes one GATEWAY_RELAY_URL line)')
 def render(d,out):
  validate(d)
  if out.exists() and any(out.iterdir()): bad(f'output is not empty: {out}')
@@ -49,9 +56,9 @@ def render(d,out):
  for src,dst in [('SOUL.md.tpl','profile/SOUL.md'),('profile.yaml.tpl','profile/profile.yaml'),('config.overlay.yaml.tpl','profile/config.overlay.yaml'),('workspace/.hermes.md.tpl','workspace/.hermes.md'),('workspace/references/sources.md.tpl','workspace/references/sources.md')]:
   p=out/dst; p.parent.mkdir(parents=True,exist_ok=True); p.write_text(tpl(ROOT/'templates'/src,v))
  shutil.copytree(ROOT/'templates/skills',out/'profile/skills'); (out/'workspace/notes-rw/notifications').mkdir(parents=True,exist_ok=True)
- lines=['# Installation','','This bundle contains no secrets. Create a fresh profile, copy `profile/`, and set its workspace. Configure model, interview service, and gateway through Hermes CLI.','','```bash',f"hermes profile create {d['profile']['name']} --no-skills --description {json.dumps(d['profile']['description'])}",f"hermes -p {d['profile']['name']} config set terminal.cwd /absolute/path/to/workspace",f"hermes -p {d['profile']['name']} config set security.redact_secrets true",f"hermes -p {d['profile']['name']} config set privacy.redact_pii true",f"hermes -p {d['profile']['name']} config set approvals.mode smart",f"hermes -p {d['profile']['name']} mcp add {b['connection_name']} --url {b['url']} --auth {b['auth_mode']}",f"hermes -p {d['profile']['name']} mcp test {b['connection_name']}",f"hermes -p {d['profile']['name']} gateway setup",f"hermes -p {d['profile']['name']} gateway start",f"hermes -p {d['profile']['name']} gateway status",'```','','Before invitations, verify only four interview tools, a unique bot token, restricted allowlist, disabled group chats, and no provisioning/existing-subject access.']
+ lines=['# Installation','','This bundle contains no secrets. Create a fresh profile, copy `profile/`, and set its workspace. Configure model, interview service, and gateway through Hermes CLI.','','```bash',f"hermes profile create {d['profile']['name']} --no-skills --description {json.dumps(d['profile']['description'])}",f"hermes -p {d['profile']['name']} config set terminal.cwd /absolute/path/to/workspace",f"hermes -p {d['profile']['name']} config set security.redact_secrets true",f"hermes -p {d['profile']['name']} config set privacy.redact_pii true",f"hermes -p {d['profile']['name']} config set approvals.mode smart",f"hermes -p {d['profile']['name']} mcp add {b['connection_name']} --url {b['url']} --auth {b['auth_mode']}",f"hermes -p {d['profile']['name']} mcp test {b['connection_name']}",*([f"# gateway.multiplex_profiles is true in the overlay: stamp the relay URL (an ENV var, not config) before the gateway starts",f"echo 'GATEWAY_RELAY_URL=<relay-url>' >> \"$HOME/.hermes/profiles/{d['profile']['name']}/.env\"   # or pass --relay-url to render_interviewer.py --install-profile"] if needs_relay_url() else []),f"hermes -p {d['profile']['name']} gateway setup",f"hermes -p {d['profile']['name']} gateway start",f"hermes -p {d['profile']['name']} gateway status",'```','','Before invitations, verify only four interview tools, a unique bot token, restricted allowlist, disabled group chats, and no provisioning/existing-subject access.']
  (out/'INSTALL.md').write_text('\n'.join(lines)+'\n')
-def install(bundle,name,workspace):
+def install(bundle,name,workspace,relay_url=None):
  home=Path.home()/'.hermes/profiles'/name
  if home.exists(): bad(f'refusing to overwrite existing profile: {home}')
  if workspace.exists() and any(workspace.iterdir()): bad(f'refusing non-empty workspace: {workspace}')
@@ -60,13 +67,21 @@ def install(bundle,name,workspace):
   q=home/p.name
   shutil.copytree(p,q,dirs_exist_ok=True) if p.is_dir() else shutil.copy2(p,q)
  shutil.copytree(bundle/'workspace',workspace,dirs_exist_ok=True)
+ if relay_url:
+  env=home/'.env'; cur=env.read_text() if env.exists() else ''; line=f'GATEWAY_RELAY_URL={relay_url}'
+  if line not in cur.splitlines(): env.write_text(cur+('' if not cur or cur.endswith('\n') else '\n')+line+'\n')
  for key,val in [('terminal.cwd',str(workspace)),('security.redact_secrets','true'),('privacy.redact_pii','true'),('approvals.mode','smart')]: subprocess.run(['hermes','-p',name,'config','set',key,val],check=True)
 def main():
- p=argparse.ArgumentParser(); p.add_argument('--input',required=True,type=Path); p.add_argument('--output',required=True,type=Path); p.add_argument('--install-profile'); p.add_argument('--workspace',type=Path); a=p.parse_args(); d=json.loads(a.input.read_text()); render(d,a.output)
+ p=argparse.ArgumentParser(); p.add_argument('--input',required=True,type=Path); p.add_argument('--output',required=True,type=Path); p.add_argument('--install-profile'); p.add_argument('--workspace',type=Path); p.add_argument('--relay-url'); a=p.parse_args(); d=json.loads(a.input.read_text())
+ if a.install_profile and needs_relay_url() and not a.relay_url: bad('--relay-url is required: the overlay sets gateway.multiplex_profiles: true, which is only safe with a GATEWAY_RELAY_URL stamp in the profile .env')
+ if a.relay_url:
+  if not a.install_profile: bad('--relay-url only applies together with --install-profile')
+  check_relay_url(a.relay_url)
+ render(d,a.output)
  if a.install_profile:
   if a.install_profile!=d['profile']['name']: bad('--install-profile must match profile.name')
   if not a.workspace or not a.workspace.is_absolute(): bad('--workspace must be an absolute path for installation')
-  install(a.output,a.install_profile,a.workspace)
+  install(a.output,a.install_profile,a.workspace,a.relay_url if needs_relay_url() else None)
  print(a.output)
 if __name__=='__main__':
  try: main()
