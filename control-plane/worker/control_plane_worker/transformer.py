@@ -1998,8 +1998,11 @@ def _derive_phases(phases: list[Any], destination: str = "") -> list[dict[str, A
         else:
             # The only trace of an abstention: the site simply shows no
             # per-phase list, which is also what a bug would look like.
+            # phase/reason are in the MESSAGE as well as extra=: the worker's
+            # LOG_FORMAT does not render extra, so extra alone is invisible (#201).
             logger.info(
-                "transformer.packing_abstained",
+                "transformer.packing_abstained phase=%s reason=%s",
+                phase_id, abstained,
                 extra={"phase": phase_id, "reason": abstained},
             )
 

@@ -2022,8 +2022,12 @@ class ProvisionerWorker:
                     # trip-mcp tools yet.
                     try:
                         wired = self._mcp_bridge.setup(slug, hermes_profile)
+                        built_from = getattr(self._mcp_bridge, "built_from", "unreported")
                         logger.info(
+                            # built_from is in the MESSAGE too: LOG_FORMAT drops extra= (#127, #201).
+                            "%s built_from=%s",
                             "provisioner.mcp_bridge_wired" if wired else "provisioner.mcp_bridge_skipped",
+                            built_from,
                             extra={
                                 "trip_id": trip_id,
                                 "hermes_profile": hermes_profile,
@@ -2031,7 +2035,7 @@ class ProvisionerWorker:
                                 # install host chooses it through its own
                                 # forced command, so this is the only place the
                                 # worker can learn it.
-                                "built_from": getattr(self._mcp_bridge, "built_from", "unreported"),
+                                "built_from": built_from,
                             },
                         )
                     except Exception:

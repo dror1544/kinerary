@@ -93,11 +93,16 @@ def _run(destination: str, phase_name: str, month: int | None, phase_name_en: st
     finally:
         log.removeHandler(capture)
         log.setLevel(previous)
-    reasons = [
-        getattr(r, "reason", None)
-        for r in capture.records
-        if r.getMessage() == "transformer.packing_abstained"
+    abstentions = [
+        r for r in capture.records
+        if r.getMessage().startswith("transformer.packing_abstained")
     ]
+    # #201: the worker's LOG_FORMAT drops `extra=`, so the reason has to be in
+    # the rendered message itself or the abstention is invisible in the logs.
+    for r in abstentions:
+        assert f"reason={r.reason}" in r.getMessage(), r.getMessage()
+        assert f"phase={r.phase}" in r.getMessage(), r.getMessage()
+    reasons = [getattr(r, "reason", None) for r in abstentions]
     return config["phases"][0], reasons
 
 
