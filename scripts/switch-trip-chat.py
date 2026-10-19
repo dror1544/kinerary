@@ -193,11 +193,17 @@ def switch(chat_id: str, target_ref: str, apply: bool) -> None:
         f"{q(profile) if installed else 'NULL'})"
     )
     # Only a trip with a companion may claim reachable — same rule the
-    # provisioner follows, for the same reason.
+    # provisioner follows, for the same reason. An existing
+    # TRIP_MCP_BRIDGE_FAILED mark is kept (#287): switching a chat proves
+    # nothing about the trip's bridge, and clearing the mark is
+    # --reconcile-companion's job, which checks the bridge first.
+    new_reachability = q('reachable') if installed else q('unreachable')
+    new_reason = 'NULL' if installed else q('COMPANION_INSTALL_FAILED')
+    keep = "unreachable_reason = 'TRIP_MCP_BRIDGE_FAILED'"
     stmts.append(
         "UPDATE control_plane.trips SET "
-        f"  reachability = {q('reachable') if installed else q('unreachable')}, "
-        f"  unreachable_reason = {'NULL' if installed else q('COMPANION_INSTALL_FAILED')}, "
+        f"  reachability = CASE WHEN {keep} THEN reachability ELSE {new_reachability} END, "
+        f"  unreachable_reason = CASE WHEN {keep} THEN unreachable_reason ELSE {new_reason} END, "
         "  reachability_checked_at = now() "
         f"WHERE id = {q(trip_id)}"
     )
