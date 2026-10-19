@@ -1512,7 +1512,7 @@ Build:
   codebase — no `backup_checkpoints` table, no per-trip snapshot or backup
   event exists — so it is recorded as a permanent, honest `skipped` rather
   than a fabricated pass, per the module's own docstring. No sprint or issue
-  currently owns building that mechanism; see Decisions needed.
+  currently owns building that mechanism: unowned, backlog (2026-10-19).
 - Generate a separate, expiring activation plan with the exact logical
   hostname/TLS/upstream intent. Apply it only from a distinct approval.
 - **Add super-admin lifecycle dashboard: funnel/state, jobs/blocked actions,
@@ -1669,6 +1669,25 @@ Manual tests:
 Exit gate: the complete demo script passes, its evidence is retained, cleanup
 is verified, and the team can repeat the run without manual database changes.
 
+### Sprint 6 — CLOSED 2026-10-19
+
+Closed by Dror on 2026-10-19. `integration/sprint-6` reached `main` through
+PR #356 on 2026-10-18; the last merge on `main` at close is `03c0e1c`. What was
+not built, or not exercised, and where it went. The leftovers were triaged into
+Sprint 7 or the backlog on 2026-10-19.
+
+- **Expiring activation plan: not built, superseded.** The separate expiring
+  activation plan and its distinct approval are superseded by
+  `docs/activation-scope.md` (see the note at the top of this sprint).
+- **Outcome events: partial.** Built in part; the remainder was triaged on
+  2026-10-19 (per-item destination: the sprint 7 tracks or the backlog).
+- **Daily report: partial.** Built in part; triaged the same way.
+- **Missing-info loop, organizer request: deferred** per decision 22.
+- **`backup_checkpoint`: unowned.** No sprint owns building a backup checkpoint
+  mechanism (backlog, 2026-10-19).
+- **Manual tests not exercised:** the deliberately failed health check and the
+  worker restart before a clean retry (decision 27).
+
 ### Decision gate after Sprint 6 — k3s substrate migration
 
 **Not scheduled work.** A proposal (Dror, 2026-09-02) to be decided once
@@ -1766,7 +1785,65 @@ cutover:
 
 Archived design: `docs/archived/interviewer-lifecycle-design.md`. It was proposed to give a Hermes interviewer a lifecycle. `docs/interview-without-an-agent.md` removed the interviewer instead, so most of this sprint has nothing left to act on: per-interview rendered profile, chat id written into it, render/destroy lifecycle — rejected (no agent on the default path; `SESSION_NOT_AGENT_WRITABLE` in app.ts); lifecycle and TTL — idle expiry with a warning (migration 0049), orthogonal to `state` by decision; concurrency — kept apart by chat on the default path, still refused (409 AMBIGUOUS) on the agent path until Hermes leaves the intake path (§8 benchmark); localised question catalogue (#41) — built as `intake-copy.ts` (en/he) with completeness tests; template promotion — interview behaviour is code, so promotion is a reviewed commit plus `kinerary-cp-release`. **Still open, not scheduled here:** (1) unfinished-interview measurement (the question people stop at, and outcome by duration) — a requirement (Dror, 2026-09-09) whose shape is undecided, homed in `docs/interview-without-an-agent.md` §8b, partial coverage today in `fleet-mcp.mjs` `statistics`/`stalled_interviews` — **owned by Sprint 6 Track 2 (Dror, 2026-09-25; see `docs/sprint6-tracks.md`)**; (2) an offline judge of interview transcripts that proposes interview changes — not built, not restated since the agent-less switch (restated 2026-09-25 as issue #198, to be designed together with #117's pre-summary judge; see `docs/sprint6-tracks.md`, track owner undecided); it is not `plan-review.ts` (which judges a deployed plan) and not #117's pre-summary pass (which judges one interview's content in the organizer's path) — the owner decides whether it is still wanted; (3) un-namespaced Hermes session ids for companion profiles — a companion concern, homed with the companion work.
 
-### Sprint 7 — Post-trip debrief and reviewed learning
+### Sprint 7 — Hardening, safe upgrades, one origin
+
+> **Decided by Dror, 2026-10-19.** Sprint 6 is closed (section above). Sprint 7
+> is this one, run spec-first. The post-trip debrief sprint that used to carry
+> the number is now Sprint 8 and keeps its gate.
+
+**Goal:** a correction reaches every surface; an upgrade cannot silently leave a
+gateway stale; the newer Hermes becomes possible; trips live under one URL;
+organizers create trips from the web.
+
+**Way of working: spec-driven.** Each item gets an implementation spec in
+`docs/specs/sprint-7/<issue>-<slug>.md`, approved by Dror before it is briefed.
+Briefs carry a `Spec:` field, and "Done when" is the spec's acceptance criteria.
+The product-level sprint spec is in the notes folder (`KINERARY_NOTES_DIR`)
+`specs/`.
+
+Tracks (the specs hold the detail; this lists scope):
+
+- **T1 Trip correctness.** #419 a hotel added in chat reaches Plan and Map
+  (must-fix); #418 no private follow-up promise in groups (must-fix); #412 and
+  #414 second-ticket traveler names; #415 product decision first; #413
+  clarification lands on the wrong question; reliability A: #382 (a correction
+  reaches the site; the booking seed is `INSERT OR IGNORE`) and #383 (an older
+  edit must not overwrite a newer one).
+- **T2 Safe upgrades** (a partial of `docs/future/control-plane-ota-upgrades.md`).
+  #420 a switch restarts every Hermes gateway; verify checks tool registration
+  for every profile (#294, #289); a failed verify retries once, then rolls back
+  automatically; #127 slice 1, each trip records the release/checkout that built
+  it. GHCR images and the offer/gate flow stay future.
+- **T3 Hermes readiness.** #380, #379, #349 (a control-plane-owned gateway
+  reconciler), then the #189 rehearsal on the Mac. The VM bump stays behind the
+  MVP VM-upgrade gate.
+- **T4 One origin for trips.** Every trip site served under one hostname (path
+  routing, e.g. `/t/<slug>/`) instead of a subdomain per trip: a path-aware
+  proxy, a trip-web relative base, per-trip namespaced session storage, old
+  subdomains redirect, and provisioning stops creating per-trip DNS and proxy
+  records. Security path: boundary review. Reopens the host-per-trip decision in
+  `docs/future/k3s-home-deployment-sprint-plan.md`.
+- **T5 Trip creation from the web.** Land #357, then #359 (organizer sign-in,
+  original PDFs, Mini App entry, #358 link recovery); #417; real Telegram and
+  ChatGPT/Claude PDF tests.
+- **Housekeeping.** #323 and the SDLC process proposal §10 close-out
+  (`docs/kinerary-sdlc-process-proposal-2026-09-28.md`); #387; #381.
+
+**Out of scope** (Sprint 8 or backlog): post-trip debrief, CA-02..CA-08, the k3s
+migration, release channels slices 2 to 5, the #346 approval lane (designed
+alongside #380, not built), #186.
+
+**Capacity.** T4 and #349 are both L. If the sprint must shrink, T4 is cut to
+spec, proxy and one trip migrated.
+
+**Exit gate:** every Sprint 7 spec is marked verified, a green full-cycle e2e on
+`main`, and a regression plan for the release.
+
+### Sprint 8 — Post-trip debrief and reviewed learning
+
+> **Renumbered 2026-10-19 (Dror).** This was Sprint 7. Sprint 7 is now
+> "Hardening, safe upgrades, one origin" (above); the content and the exit gate
+> below are unchanged.
 
 **Goal:** turn a completed trip into organizer-controlled knowledge for that
 trip and, only with explicit consent, future-trip suggestions.
@@ -1958,7 +2035,7 @@ be unable to produce an active trip.
 
 The MVP onboarding milestone is complete when the Sprint 6 demo is repeatable
 from a clean test allocation, and the automated test suite covers every
-component seam plus the major refusal paths. Sprint 7 is the first
+component seam plus the major refusal paths. Sprint 8 (renumbered from 7 on 2026-10-19) is the first
 post-trip-learning milestone and can begin once a completed Japan demo exists.
 A human may still approve provisioning and activation; automation means those
 approvals trigger a durable, repeatable workflow rather than an operator's

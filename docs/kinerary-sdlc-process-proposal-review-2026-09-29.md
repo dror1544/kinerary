@@ -1,5 +1,7 @@
 # Review — Kinerary SDLC process proposal, and `agency-agents` measured against it
 
+Status (2026-10-19): partly applied — regression-assessment pre-filter (#320) and the Small tier (#322); §10 close-out and the #323 secret owed in Sprint 7 housekeeping; the rest deferred.
+
 **Written 2026-09-29**, the day after the proposal
 (`kinerary-sdlc-process-proposal-2026-09-28.md`, prepared by Codex). This is
 the review its §8 asked for, plus a second question Dror asked alongside it:

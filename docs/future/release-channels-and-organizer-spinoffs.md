@@ -10,6 +10,11 @@ Tracked in #190 (the requirement, the owner's words, the slices) and #127 (the
 first slice). Read the "From the owner" and "Proposed" labels below: only the
 first kind is decided.
 
+Status: **pulled into Sprint 7 in part (2026-10-19, Dror)** — slice 1 only:
+each trip records the release/checkout that built it (#127), under Sprint 7
+Track 2 in `docs/onboarding-mvp-sprint-plan.md`. Slices 2 to 5 are out of scope
+for Sprint 7 and stay as described here.
+
 ## The idea
 
 Today every trip runs whatever the last person to install a companion happened
