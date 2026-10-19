@@ -599,7 +599,7 @@ describe("a reply that answers nothing", { skip: SKIP ? "no CONTROL_PLANE_TEST_D
       const { advanceRouterOwnedQuestions } = await import("../src/relay/poller.js");
       const { DEFAULT_STRINGS } = await import("../src/relay/dispatch.js");
       const telegram = new Recorder();
-      const deps = { db: pool, telegram, connector: { pushInbound: () => true }, modelRunner: emptyRunner } as never;
+      const deps = { db: pool, telegram, connector: { pushInbound: () => true }, modelRunner: emptyRunner, log: () => {} } as never;
 
       await advanceRouterOwnedQuestions(deps, DEFAULT_STRINGS, () => {});
 
@@ -703,7 +703,7 @@ describe("a reply that answers nothing", { skip: SKIP ? "no CONTROL_PLANE_TEST_D
           return telegram.sendMessage(p);
         },
       });
-      const deps = { db: pool, telegram: watching, connector: { pushInbound: () => true }, modelRunner: emptyRunner } as never;
+      const deps = { db: pool, telegram: watching, connector: { pushInbound: () => true }, modelRunner: emptyRunner, log: () => {} } as never;
 
       const before = await getSessionForChat(pool, a.chatId);
       assert.ok(before.ok);
@@ -1010,7 +1010,7 @@ describe("a repeated unsettled organizer answer is restated, never 'didn't follo
       assert.ok(choice, "Dana Levi is one of the two offered buttons");
 
       const decision = await dispatchUpdate(pool, tap(a.chatId, answerCallbackData("organizer_identity", choice!.id)));
-      await applyDecision(decision, { db: pool, telegram, connector: { pushInbound: () => true } } as never);
+      await applyDecision(decision, { db: pool, telegram, connector: { pushInbound: () => true }, log: () => {} } as never);
 
       const store = await answersForChat(pool, a.chatId);
       const settled = store?.answers.organizer_identity;
@@ -1222,7 +1222,7 @@ describe("the boundary, answered in words", { skip: SKIP ? "no CONTROL_PLANE_TES
         [a.chatId],
       );
       await advanceRouterOwnedQuestions(
-        { db: pool, telegram, connector: { pushInbound: () => true }, modelRunner: emptyRunner } as never,
+        { db: pool, telegram, connector: { pushInbound: () => true }, modelRunner: emptyRunner, log: () => {} } as never,
         DEFAULT_STRINGS,
         () => {},
       );

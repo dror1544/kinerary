@@ -110,7 +110,7 @@
 
 import { randomBytes } from "node:crypto";
 import type pg from "pg";
-import { listReleases, type ReleaseSummary } from "./release-registry.js";
+import { listReleases, type ReleaseStatus, type ReleaseSummary } from "./release-registry.js";
 
 function generateId(prefix: string): string {
   return `${prefix}_${randomBytes(16).toString("hex")}`;
@@ -154,11 +154,13 @@ function safePlain(value: string): string {
  * permanently, not for one request. A `Map.get` never touches the prototype
  * chain regardless of what string it is asked for.
  *
- * Values are not further redacted: every key named below is populated only
- * by code in this repository from data that is itself format-constrained
- * (a release id, a status enum, a sha256 digest) — never from traveler or
- * organizer text. If that stops being true for an action, its entry here
- * has to be reconsidered, not just widened.
+ * Values are checked, not trusted (#283): every key named below is populated
+ * only by code in this repository from data that is itself format-constrained
+ * (a release id, a status enum, a sha256 digest) — but `audit_events.evidence`
+ * is free jsonb, so a key's value is served only if it still has that format
+ * (`EVIDENCE_VALIDATORS`); one that does not is dropped, like an unknown key.
+ * A key with no validator is served as before, so an action whose values are
+ * not format-constrained has to be reconsidered here, not just widened.
  */
 const EVIDENCE_ALLOWLIST: ReadonlyMap<string, readonly string[]> = new Map([
   // release-registry.ts's promoteRelease() — from/to are ReleaseStatus enum
@@ -213,13 +215,36 @@ const EVIDENCE_ALLOWLIST: ReadonlyMap<string, readonly string[]> = new Map([
   ]],
 ]);
 
+// ReleaseStatus values, as a Record so adding a status to the type breaks the
+// build here instead of silently dropping the new status from the audit view.
+const RELEASE_STATUS_VALUES: Readonly<Record<ReleaseStatus, true>> = {
+  candidate: true, verified: true, available: true, deprecated: true, retired: true,
+};
+function isReleaseStatus(value: unknown): boolean {
+  return typeof value === "string" && Object.hasOwn(RELEASE_STATUS_VALUES, value);
+}
+// Same pattern registerCandidateRelease() enforces on the manifest digest.
+const SHA256_DIGEST_RE = /^sha256:[a-f0-9]{64}$/;
+function isSha256Digest(value: unknown): boolean {
+  return typeof value === "string" && SHA256_DIGEST_RE.test(value);
+}
+
+/** Per-action, per-key value check. A failing value is dropped from the projection. */
+const EVIDENCE_VALIDATORS: ReadonlyMap<string, Readonly<Record<string, (value: unknown) => boolean>>> = new Map([
+  ["release.promote", { from: isReleaseStatus, to: isReleaseStatus, artifactDigest: isSha256Digest }],
+]);
+
 function projectEvidence(action: string, evidence: unknown): unknown {
   const allowedKeys = EVIDENCE_ALLOWLIST.get(action);
   if (!allowedKeys || evidence === null || typeof evidence !== "object" || Array.isArray(evidence)) return {};
   const source = evidence as Record<string, unknown>;
+  const validators = EVIDENCE_VALIDATORS.get(action);
   const projected: Record<string, unknown> = {};
   for (const key of allowedKeys) {
-    if (Object.hasOwn(source, key)) projected[key] = source[key];
+    if (!Object.hasOwn(source, key)) continue;
+    const valid = validators && Object.hasOwn(validators, key) ? validators[key] : undefined;
+    if (valid && !valid(source[key])) continue;
+    projected[key] = source[key];
   }
   return projected;
 }

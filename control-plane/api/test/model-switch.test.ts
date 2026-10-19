@@ -6,11 +6,15 @@
  * calls get, and never a call already in flight.
  */
 import assert from "node:assert/strict";
-import { describe, test } from "node:test";
+import { beforeEach, describe, test } from "node:test";
 import { parseInbound } from "../src/chat-router.js";
 import type { RunnerResult, StructuredModelRequest, StructuredModelRunner } from "../src/model-runner.js";
 import { MODEL_TASKS, runnerForBinding, taskTimeoutMs } from "../src/model-runner.js";
-import { handleModelCommand, isSwitchableRunner, parseBinding, switchableRunner, verifyCodexOverrides } from "../src/model-task-settings.js";
+import {
+  CODEX_PROBE_TIMEOUT_MS, handleModelCommand, isSwitchableRunner, parseBinding, resetCodexProbeMemo, switchableRunner,
+  verifyCodexOverrides,
+} from "../src/model-task-settings.js";
+import { withFakeBinDir, writeFakeBin } from "./support/child-env-harness.js";
 
 /** A runner that names itself and answers with its own name. */
 function named(provider: string, model: string, gate?: Promise<void>): StructuredModelRunner & { calls: number } {
@@ -152,6 +156,79 @@ describe("/model codex is verified before it is saved (#58)", () => {
     const clean: NodeJS.ProcessEnv = {};
     await verifyCodexOverrides(new Map([["interpret", { runner: "claude", model: "m" }]]), () => {}, async () => { throw new Error("probed"); }, clean);
     assert.equal(clean.KINERARY_CODEX_ISOLATION_UNVERIFIED, undefined);
+  });
+});
+
+describe("the codex probe is bounded and a pass is remembered (#202)", () => {
+  const codexOverride = new Map([["extract_intake", { runner: "codex" as const, model: "gpt-5.6-luna" }]]);
+  const touchedDb = () => new Proxy({}, { get: () => { throw new Error("DB-TOUCHED"); } }) as never;
+  const codexRunnerFor = () =>
+    switchableRunner(named("claude", "claude-sonnet-5"), (task, b) => runnerForBinding(b.runner, b.model, taskTimeoutMs(task), task, {}));
+  beforeEach(() => resetCodexProbeMemo());
+
+  test("a passing probe runs once across refreshes, and is handed a short bound", async () => {
+    const calls: Array<[string, number | undefined]> = [];
+    const probe = async (bin: string, timeoutMs?: number) => { calls.push([bin, timeoutMs]); return null; };
+    const env: NodeJS.ProcessEnv = {};
+    await verifyCodexOverrides(codexOverride, () => {}, probe, env);
+    await verifyCodexOverrides(codexOverride, () => {}, probe, env);
+    await verifyCodexOverrides(codexOverride, () => {}, probe, {});
+    assert.equal(calls.length, 1, "30s refreshes must not re-probe a codex that already passed");
+    assert.deepEqual(calls[0], ["codex", CODEX_PROBE_TIMEOUT_MS]);
+    assert.equal(CODEX_PROBE_TIMEOUT_MS, 5_000);
+    assert.equal(env.KINERARY_CODEX_ISOLATION_UNVERIFIED, undefined);
+  });
+
+  test("a pass is remembered per binary, not for every codex", async () => {
+    const bins: string[] = [];
+    const probe = async (bin: string) => { bins.push(bin); return null; };
+    await verifyCodexOverrides(codexOverride, () => {}, probe, { CODEX_BIN: "/opt/a/codex" });
+    await verifyCodexOverrides(codexOverride, () => {}, probe, { CODEX_BIN: "/opt/b/codex" });
+    await verifyCodexOverrides(codexOverride, () => {}, probe, { CODEX_BIN: "/opt/a/codex" });
+    assert.deepEqual(bins, ["/opt/a/codex", "/opt/b/codex"]);
+  });
+
+  test("a failing probe is never remembered: it latches, and a fresh process state probes again", async () => {
+    let calls = 0;
+    const probe = async () => { calls += 1; return "no codex"; };
+    const first: NodeJS.ProcessEnv = {};
+    await verifyCodexOverrides(codexOverride, () => {}, probe, first);
+    assert.equal(first.KINERARY_CODEX_ISOLATION_UNVERIFIED, "1");
+    await verifyCodexOverrides(codexOverride, () => {}, probe, first); // latched: no need to ask again
+    assert.equal(calls, 1);
+    await verifyCodexOverrides(codexOverride, () => {}, probe, {}); // nothing was remembered as good
+    assert.equal(calls, 2);
+  });
+
+  test("/model hands the probe the same short bound and always probes fresh", async () => {
+    const seen: Array<number | undefined> = [];
+    const probe = async (_bin: string, timeoutMs?: number) => { seen.push(timeoutMs); return null; };
+    // Remembered pass for the refresh loop must not short-circuit the command.
+    await verifyCodexOverrides(codexOverride, () => {}, probe, {});
+    for (let i = 0; i < 2; i += 1) {
+      await assert.rejects(
+        handleModelCommand(
+          touchedDb(), codexRunnerFor(), { name: "model", args: "extract_intake codex:gpt-5.6-luna" }, "sha256:" + "0".repeat(64),
+          () => {}, probe,
+        ),
+        /DB-TOUCHED/,
+      );
+    }
+    assert.deepEqual(seen, [5_000, 5_000, 5_000]);
+  });
+
+  test("a codex that never answers is a problem within the short bound, not a hang", async () => {
+    await withFakeBinDir("slow-codex-", async (dir) => {
+      const bin = await writeFakeBin(dir, "codex", ["setTimeout(() => {}, 60_000);"]);
+      const env: NodeJS.ProcessEnv = { CODEX_BIN: bin };
+      const lines: string[] = [];
+      const started = Date.now();
+      await verifyCodexOverrides(codexOverride, (l) => lines.push(l), undefined, env);
+      const elapsed = Date.now() - started;
+      assert.equal(env.KINERARY_CODEX_ISOLATION_UNVERIFIED, "1");
+      assert.match(lines.join(""), /codex_isolation_unverified/);
+      assert.ok(elapsed < 15_000, `resolved in ${elapsed}ms; the bound is ${CODEX_PROBE_TIMEOUT_MS}ms, not the 20s default`);
+    });
   });
 });
 

@@ -126,6 +126,23 @@ const GATEWAY_STATUS_PHRASES: readonly string[] = [
   "/approve session",
   "/approve always",
   "security scan —",
+  // Hermes's own housekeeping notice after it raises a Codex compaction
+  // threshold (#65), seen in the FIRST group reply of every new companion:
+  //
+  //     ℹ Codex gpt-5.6-terra caps context at 272K, so auto-compaction was
+  //       raised to 85% (from 50%) to use more of the window before
+  //       summarizing.
+  //       Opt back out: hermes config set compression.codex_gpt55_autoraise false
+  //
+  // It names the model and vendor behind the assistant and hands a family a
+  // runtime command. Source fix: `compression.codex_gpt55_autoraise_notice:
+  // false` in the companion overlay; this covers companions rendered before
+  // it, and a reworded notice that keeps one of these stems. All three are
+  // fixed English the harness emits — "hermes config set" and the config key
+  // are not words a family writes about a holiday.
+  "auto-compaction was raised",
+  "codex_gpt55_autoraise",
+  "hermes config set",
 ];
 
 /**
