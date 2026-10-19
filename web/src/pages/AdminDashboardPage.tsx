@@ -34,6 +34,8 @@ import {
 export default function AdminDashboardPage() {
   const [key, setKeyState] = useState(() => getStoredAdminKey());
   const [inputKey, setInputKey] = useState("");
+  // Set when the API refuses the key (401 on a data call), cleared on the next attempt (#436).
+  const [rejected, setRejected] = useState(false);
   const enabled = key.length > 0;
 
   const report = useQuery({ queryKey: ["admin-report", key], queryFn: () => getAdminReport(key), enabled, retry: false });
@@ -53,13 +55,19 @@ export default function AdminDashboardPage() {
     if (unauthorized) {
       clearAdminKey();
       setKeyState("");
+      setRejected(true);
     }
   }, [unauthorized]);
 
   function unlock(event: React.FormEvent) {
     event.preventDefault();
-    storeAdminKey(inputKey);
-    setKeyState(inputKey);
+    // A paste or autofill often carries a space or newline the operator cannot see (#436).
+    const trimmed = inputKey.trim();
+    setInputKey(trimmed);
+    if (!trimmed) return;
+    setRejected(false);
+    storeAdminKey(trimmed);
+    setKeyState(trimmed);
   }
 
   function lock() {
@@ -90,8 +98,26 @@ export default function AdminDashboardPage() {
                 onChange={(event) => setInputKey(event.target.value)}
               />
             </label>
+            {rejected && <Notice>That key was not accepted. Check it and try again.</Notice>}
             <button className="button wide">Unlock</button>
           </form>
+        </main>
+      </div>
+    );
+  }
+
+  // The key is only known to be good once a data call has answered. Until then
+  // (and while a 401 is on its way to be handled above) show no dashboard chrome (#436).
+  const checks = [report, funnel, jobs, failures, versions, audit];
+  const verifying = !checks.some((query) => query.isSuccess || query.isError);
+  if (verifying || unauthorized) {
+    return (
+      <div className="product-shell">
+        <header className="product-header"><Brand /></header>
+        <main className="placeholder-card">
+          <p className="eyebrow">Operator only</p>
+          <h1>Super-admin dashboard</h1>
+          <p role="status">Checking the key…</p>
         </main>
       </div>
     );

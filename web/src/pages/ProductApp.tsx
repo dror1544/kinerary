@@ -6,6 +6,7 @@ import { Link, Navigate, useLocation, useNavigate, useParams } from "react-route
 import { z } from "zod";
 import { api, getMe, getTrip, getTrips, passwordSignIn, signIn, getAuthCapabilities, emailPasswordSignIn, safeReturnTo, type TripSummary, type InterviewLinkState, ApiError } from "../api";
 import { Brand } from "../components/Brand";
+import { DateInput, nextDay } from "../components/DateInput";
 
 export type ProductView = "sign-in" | "trips" | "new-trip" | "trip" | "runtime" | "join";
 
@@ -58,7 +59,6 @@ function SignIn() {
           <button className="button wide" disabled={passwordLogin.isPending}>{passwordLogin.isPending ? "Signing in…" : "Continue with trip password"}</button>
           {passwordLogin.isError && <Notice>{passwordLogin.error.message}</Notice>}
         </form>}
-        {me.isError && <p className="subtle">Your session is not active yet.</p>}
       </main>
     </div>
   );
@@ -98,16 +98,23 @@ function TripCard({ trip }: { trip: TripSummary }) {
   return <article className="trip-card"><div className="status-chip">{humanize(trip.nextAction)}</div><h3>{trip.title}</h3><p>{trip.destination || "Destination to be confirmed"}</p><small>{[trip.startDate, trip.endDate].filter(Boolean).join(" → ") || "Dates are flexible"}</small><Link className="button button-small" to={open}>{trip.runtimeReady ? "Open trip" : humanize(trip.nextAction)}</Link></article>;
 }
 
-const tripSchema = z.object({ destination: z.string().trim().min(2, "Add a destination").max(160), startDate: z.string().optional(), endDate: z.string().optional(), tripType: z.enum(["family", "group", "couple", "other"]) }).refine((value) => !value.startDate || !value.endDate || value.endDate >= value.startDate, { message: "End date must follow the start date", path: ["endDate"] });
+const tripSchema = z.object({ destination: z.string().trim().min(2, "Add a destination").max(160), startDate: z.string().optional(), endDate: z.string().optional(), tripType: z.enum(["family", "group", "couple", "other"]) }).refine((value) => !value.startDate || !value.endDate || value.endDate > value.startDate, { message: "End date must follow the start date", path: ["endDate"] });
 type TripForm = z.infer<typeof tripSchema>;
 
 function NewTrip() {
   const navigate = useNavigate();
   const stored = JSON.parse(sessionStorage.getItem("kinerary-trip-starter") || "{}") as Partial<TripForm>;
   const form = useForm<TripForm>({ resolver: zodResolver(tripSchema), defaultValues: { destination: stored.destination || "", startDate: stored.startDate || "", endDate: stored.endDate || "", tripType: stored.tripType || "family" } });
+  const startDate = form.watch("startDate");
+  // The end date defaults to the day after the start, and is pushed forward when a later start would leave it at or before the start (#433).
+  const moveEndAfterStart = (start: string) => {
+    const minimum = nextDay(start);
+    const end = form.getValues("endDate");
+    if (minimum && (!end || end < minimum)) form.setValue("endDate", minimum);
+  };
   useEffect(() => { const subscription = form.watch((value) => sessionStorage.setItem("kinerary-trip-starter", JSON.stringify(value))); return () => subscription.unsubscribe(); }, [form]);
   const create = useMutation({ mutationFn: (values: TripForm) => api<TripSummary>("/v1/trips", { method: "POST", body: JSON.stringify(values) }), onSuccess: (trip) => { sessionStorage.removeItem("kinerary-trip-starter"); navigate(`/trips/${trip.id}/setup`); } });
-  return <main className="dashboard-main narrow"><Link className="back-link" to="/trips">← My trips</Link><p className="eyebrow">New trip</p><h1>Start with the outline</h1><p className="lede">Nothing needs to be final. Your interview will confirm or correct these details.</p><form className="form-card" onSubmit={form.handleSubmit((values) => create.mutate(values))}><label>Destination<input {...form.register("destination")} placeholder="e.g. Northern Italy" />{form.formState.errors.destination && <small className="field-error">{form.formState.errors.destination.message}</small>}</label><div className="field-row"><label>Approximate start<input type="date" {...form.register("startDate")} /></label><label>Approximate end<input type="date" {...form.register("endDate")} />{form.formState.errors.endDate && <small className="field-error">{form.formState.errors.endDate.message}</small>}</label></div><label>Who is traveling?<select {...form.register("tripType")}><option value="family">Family</option><option value="couple">Couple</option><option value="group">Group</option><option value="other">Other</option></select></label>{create.isError && <Notice>{create.error.message}</Notice>}<button className="button" disabled={create.isPending}>{create.isPending ? "Creating…" : "Create trip"}</button></form></main>;
+  return <main className="dashboard-main narrow"><Link className="back-link" to="/trips">← My trips</Link><p className="eyebrow">New trip</p><h1>Start with the outline</h1><p className="lede">Nothing needs to be final. Your interview will confirm or correct these details.</p><form className="form-card" onSubmit={form.handleSubmit((values) => create.mutate(values))}><label>Destination<input {...form.register("destination")} placeholder="e.g. Northern Italy" />{form.formState.errors.destination && <small className="field-error">{form.formState.errors.destination.message}</small>}</label><div className="field-row"><label>Approximate start<DateInput {...form.register("startDate", { onChange: event => moveEndAfterStart(event.target.value) })} /></label><label>Approximate end<DateInput min={nextDay(startDate)} {...form.register("endDate")} />{form.formState.errors.endDate && <small className="field-error">{form.formState.errors.endDate.message}</small>}</label></div><label>Who is traveling?<select {...form.register("tripType")}><option value="family">Family</option><option value="couple">Couple</option><option value="group">Group</option><option value="other">Other</option></select></label>{create.isError && <Notice>{create.error.message}</Notice>}<button className="button" disabled={create.isPending}>{create.isPending ? "Creating…" : "Create trip"}</button></form></main>;
 }
 
 function TripSetup() {
