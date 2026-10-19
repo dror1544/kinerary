@@ -275,6 +275,23 @@ class RestoreAgainstPostgres(unittest.TestCase):
         self.assertNotIn(("gone-for-good", "gone2026"), result,
                          "genuinely unreachable for another reason is still excluded")
 
+    def test_live_companions_excludes_a_retired_trip(self):
+        # Issue #288: teardown renames a slug to retired-<slug>-<yyyymmdd> and
+        # closes its bindings, but a binding that is still open (a race, or a
+        # half-finished teardown) must not make verify wait on a gateway that
+        # will never come back. Mirrors NOT_RETIRED_SQL in gateway-wait.ts.
+        self.sql("kinerary_control_plane", """
+            INSERT INTO control_plane.trips(id, slug, lifecycle_state, reachability) VALUES
+              ('trip_eeeeeee1', 'retired-x-20260101', 'ready_private', 'reachable'),
+              ('trip_eeeeeee2', 'live-one', 'ready_private', 'reachable');
+            INSERT INTO control_plane.telegram_chat_bindings(id, trip_id, chat_id, hermes_profile) VALUES
+              ('tcb_retired', 'trip_eeeeeee1', '3001', 'retired2026'),
+              ('tcb_live', 'trip_eeeeeee2', '3002', 'live2026');
+        """)
+        result = self.cp.live_companions()
+        self.assertIn(("live-one", "live2026"), result)
+        self.assertNotIn(("retired-x-20260101", "retired2026"), result)
+
 
 if __name__ == "__main__":
     unittest.main()

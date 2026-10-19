@@ -31,6 +31,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 TOOL = ROOT / "control-plane" / "deployment" / "vm-release.py"
@@ -919,6 +920,91 @@ class RollbackPreparation(unittest.TestCase):
         hermes = vr.hermes_undo(cp, self.tmp / "hermes-data.before-rollback-20260918T090000Z")
         self.assertIn("mv", hermes.by_hand)
         self.assertIn("hermes", hermes.by_hand)
+
+
+class TripIntakeGatewayRestart(unittest.TestCase):
+    """Issue #420: start_switched recreates interview-mcp but the trip-intake
+    Hermes gateway keeps the tool list it registered at its own boot, so verify()
+    then reads an old `MCP server 'interview' ... registered` line (or none) and
+    the interview silently runs without the new tools. The gateway has to be
+    restarted after the compose up, whether or not the Hermes container was."""
+
+    REGISTERED = "INFO tools.mcp: MCP server 'interview' registered 3 tool(s): mcp__interview__a_for_chat"
+
+    class Stub(vr.ControlPlane):
+        def __init__(self, log, *, dry_run=False, write_new_line=True):
+            self.out = io.StringIO()
+            super().__init__(vr.Report(self.out, color=False))
+            self.calls = []
+            self.sh = self
+            self.dry_run = dry_run
+            self.log = log
+            self.write_new_line = write_new_line
+
+        def r_text(self):
+            return self.out.getvalue()
+
+        def act(self, argv, *, describe="", **kwargs):  # stands in for cp.sh
+            argv = [str(a) for a in argv]
+            self.calls.append((" ".join(argv), describe, kwargs.get("timeout")))
+            if self.dry_run:
+                self.r.step(f"would run: {describe}")
+            elif "s6-svc" in " ".join(argv) and self.write_new_line:
+                with self.log.open("a") as handle:
+                    handle.write(TripIntakeGatewayRestart.REGISTERED + "\n")
+            return subprocess.CompletedProcess(list(argv), 0, b"", b"")
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="vm-release-gateway-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        logs = self.tmp / "profiles" / "trip-intake" / "logs"
+        logs.mkdir(parents=True)
+        self.log = logs / "agent.log"
+        self.log.write_text(self.REGISTERED + "\n")  # the OLD registration, from before the switch
+        patcher = mock.patch.object(vr, "HERMES_DATA", self.tmp)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        sleeper = mock.patch.object(vr.time, "sleep", lambda _s: None)
+        sleeper.start()
+        self.addCleanup(sleeper.stop)
+
+    def restart_calls(self, cp):
+        return [i for i, (argv, _d, _t) in enumerate(cp.calls) if "s6-svc" in argv]
+
+    def test_restarts_the_gateway_after_the_compose_up_even_when_hermes_is_untouched(self):
+        cp = self.Stub(self.log)
+        cp.start_switched(None, restart_hermes=False)
+        compose_up = next(i for i, (argv, _d, _t) in enumerate(cp.calls) if "interview-mcp" in argv)
+        restarts = self.restart_calls(cp)
+        self.assertEqual(len(restarts), 1)
+        self.assertGreater(restarts[0], compose_up, "the gateway restarts after interview-mcp is up")
+        argv, _describe, timeout = cp.calls[restarts[0]]
+        self.assertEqual(argv.split()[:4], ["docker", "exec", vr.HERMES_CONTAINER, "/command/s6-svc"])
+        self.assertIn("-r /run/service/gateway-trip-intake", argv)
+        self.assertEqual(timeout, 60)
+
+    def test_restarts_the_gateway_when_hermes_is_restarted_too(self):
+        cp = self.Stub(self.log)
+        cp.start_switched("abc1234", restart_hermes=True)
+        hermes_up = next(i for i, (argv, _d, _t) in enumerate(cp.calls) if argv.endswith(" hermes"))
+        self.assertGreater(self.restart_calls(cp)[0], hermes_up)
+
+    def test_waits_for_a_new_registration_line_not_the_old_one(self):
+        cp = self.Stub(self.log, write_new_line=False)
+        cp.start_switched(None, restart_hermes=False)
+        self.assertEqual(self.log.read_text().count("registered"), 1, "nothing new was logged")
+        self.assertEqual(vr.count_interview_registrations(self.log), 1)
+        # The wait gave up (bounded) and said so, instead of passing on the stale line.
+        self.assertIn("did not log", cp.r_text())
+
+    def test_a_dry_run_only_describes_the_restart(self):
+        cp = self.Stub(self.log, dry_run=True)
+        cp.start_switched(None, restart_hermes=False)
+        restarts = self.restart_calls(cp)
+        self.assertEqual(len(restarts), 1)
+        self.assertEqual(self.log.read_text().count("registered"), 1, "a dry run changes nothing")
+        self.assertIn("would run:", cp.r_text())
+        self.assertNotIn("did not log", cp.r_text())
 
 
 class GateWrapper(unittest.TestCase):
