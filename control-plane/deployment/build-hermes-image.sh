@@ -130,10 +130,25 @@ docker run --rm --entrypoint sh "$TAG" -lc "cat /opt/hermes/$MANIFEST_NAME" | di
 
 TESTS="$(grep -ho '^+++ b/tests/[^[:space:]]*' "$PATCHES"/*.patch | sed 's|^+++ b/||' | sort -u | tr '\n' ' ')"
 if [ -n "${TESTS// /}" ]; then
-  docker run --rm --entrypoint sh -v "$BUILD_DIR:/src" -w /src -e PYTHONDONTWRITEBYTECODE=1 "$TAG" -lc \
-    "VIRTUAL_ENV=/opt/hermes/.venv uv pip install -q pytest pytest-asyncio >/dev/null 2>&1; \
-     /opt/hermes/.venv/bin/python -m pytest $TESTS -q -p no:cacheprovider" \
-    || { echo "build-hermes-image: the patched tests fail in the built image" >&2; exit 1; }
+  # Install pytest with uv if the image has it (older images do), else with the
+  # venv's own pip, bootstrapped by ensurepip if it is missing. Output stays
+  # visible and a failed install stops here with its own message (#379): it used
+  # to be `>/dev/null 2>&1` with the result ignored, so a missing uv surfaced as
+  # "No module named pytest" one line later.
+  # shellcheck disable=SC2016  # expanded inside the container, not here
+  install_and_test='
+    VENV=/opt/hermes/.venv
+    if command -v uv >/dev/null 2>&1; then
+      VIRTUAL_ENV=$VENV uv pip install -q pytest pytest-asyncio
+    else
+      $VENV/bin/python -m pip --version >/dev/null 2>&1 || $VENV/bin/python -m ensurepip
+      $VENV/bin/python -m pip install -q pytest pytest-asyncio
+    fi || { echo "build-hermes-image: could not install pytest into the built image (see the installer output above)" >&2; exit 97; }
+    $VENV/bin/python -m pytest '"$TESTS"' -q -p no:cacheprovider'
+  docker run --rm --entrypoint sh -v "$BUILD_DIR:/src" -w /src -e PYTHONDONTWRITEBYTECODE=1 "$TAG" -lc "$install_and_test" \
+    || { rc=$?
+         [ "$rc" -eq 97 ] || echo "build-hermes-image: the patched tests fail in the built image" >&2
+         exit 1; }
 fi
 
 echo
