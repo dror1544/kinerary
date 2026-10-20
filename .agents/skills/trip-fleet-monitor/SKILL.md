@@ -104,15 +104,18 @@ of this section is that you can tell which:
 | `DUPLICATE` | two independent gateway processes for one profile | **yes** |
 | `UNOBSERVED` | no good sweep in 30 minutes, so none of the above is current | one alert for the reconciler, not one per trip |
 
-Reasons you will see on a dormant companion: `NOT_CURRENT_TRIP` (its organizer
-moved their chat to another trip — an organizer has at most one running
-companion, the trip their Telegram DM is bound to), `TRIP_ENDED` (more than 14
-days after the trip), `RETIRED`, `TEARDOWN`, `PIN_OFF` (an operator did it).
-A stopped companion starts again by itself when the family writes to it
-(`WAKE`, for 2 days), when its organizer switches back, or when an operator pins
-it on. **Do not tell anyone a dormant companion is broken, and do not try to
-start one** — the reconciler is the only thing that starts and stops gateways,
-and `reconcile-gateways --pin <profile> on|off` is the operator's override.
+Reasons you will see on a dormant companion: `NOT_CURRENT` (a planned trip, or
+one that ended within its 14 days' grace, that is not its organizer's current
+trip, was not switched away from in the last 2 days, is not under way and was
+not asked for), `ARCHIVED` (more than 14 days past its end), `RETIRED`,
+`TEARDOWN`, `PIN_OFF` (an operator did it). The ones that keep a companion up:
+`CURRENT_TRIP` (the trip an organizer's chat is bound to), `WARM` (they
+switched away less than 2 days ago), `UNDERWAY` (between its start and end
+dates), `REVIVED` (a message reached it while it was off, less than 2 days
+ago) and `QUIET_WINDOW` (nothing is stopped within 6 hours of a conversation).
+**Do not tell anyone a dormant companion is broken, and do not try to start
+one** — the reconciler is the only thing that starts and stops gateways, and
+`reconcile-gateways --pin <profile> on|off|clear` is the operator's override.
 
 `fleet_overview` opens its section with the reconciler's own line: its mode
 (`observe` records and reports and acts on nothing; `enforce` also starts and

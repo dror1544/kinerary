@@ -4,8 +4,10 @@ record and decide, observe only by default.
 Three layers, cheapest first:
 
   * `decide()` is a pure function, so its rules are a TABLE — this file's
-    specification of who runs and why, including the owner's 2026-10-20 rule
-    (one running companion per organizer, 14 days' grace, a 2-day wake);
+    specification of who runs and why, including the owner's final 2026-10-20
+    model (the organizer's current trip, a 2-day warm window after a switch,
+    trips underway, a 2-day revival when a message reaches a stopped companion,
+    14 days' grace, then archive);
   * the ssh adapter's parsing of the host's lines, with `subprocess.run`
     replaced — a forged or truncated answer is an error, never a verdict;
   * the sweep against a real PostgreSQL (CONTROL_PLANE_TEST_DATABASE_URL, whose
@@ -64,96 +66,80 @@ def d(offset_days: int) -> date:
 
 R, S = "running", "stopped"
 
+H = timedelta(hours=1)
+TWO_DAYS = timedelta(days=2)
+
 #: (label, facts, expected desired, expected reason, expected needs_confirmation)
 DECIDE_TABLE: list[tuple[str, dict[str, Any], str, str, bool]] = [
     # --- the interviewer, retirement, pins ---
     ("the interviewer always runs", dict(kind="interviewer"), R, "INTERVIEWER", False),
     ("the interviewer runs even when it is somehow flagged retired",
      dict(kind="interviewer", retired=True, pin="off"), R, "INTERVIEWER", False),
-    ("a retired trip is down at once", dict(retired=True, is_current=True), S, "RETIRED", False),
-    ("a teardown pin is down at once, beating the organizer's current trip",
-     dict(pin="teardown", is_current=True, organizer_dm_known=True), S, "TEARDOWN", False),
+    ("a retired trip is down at once, current or not", dict(retired=True, is_current=True), S, "RETIRED", False),
+    ("a teardown pin is down at once, even the organizer's current trip",
+     dict(pin="teardown", is_current=True), S, "TEARDOWN", False),
     ("retired beats an operator pin on", dict(retired=True, pin="on"), S, "RETIRED", False),
-    ("an operator pin on beats a trip that ended long ago",
-     dict(pin="on", end_date=d(-400)), R, "PIN_ON", False),
-    ("an operator pin on beats not being the organizer's current trip",
-     dict(pin="on", organizer_dm_known=True, is_current=False), R, "PIN_ON", False),
-    ("an operator pin off beats the organizer's current trip",
-     dict(pin="off", is_current=True, organizer_dm_known=True), S, "PIN_OFF", False),
-    ("an operator pin off beats a wake", dict(pin="off", last_wake_at=NOW - timedelta(hours=1)), S, "PIN_OFF", False),
+    ("an operator pin on beats an archived trip", dict(pin="on", end_date=d(-400)), R, "PIN_ON", False),
+    ("an operator pin off beats the current trip", dict(pin="off", is_current=True), S, "PIN_OFF", False),
+    ("an operator pin off beats a trip underway", dict(pin="off", start_date=d(-1), end_date=d(3)), S, "PIN_OFF", False),
+    ("an operator pin off beats a revival", dict(pin="off", asked_at=NOW - H), S, "PIN_OFF", False),
     ("an operator pin off is not held back by a conversation just now",
      dict(pin="off", last_activity_at=NOW - timedelta(minutes=1)), S, "PIN_OFF", False),
 
-    # --- one running companion per organizer ---
-    ("the organizer's current trip runs", dict(organizer_dm_known=True, is_current=True), R, "CURRENT_TRIP", False),
-    ("an organizer's other trip stops, flap-prone so it needs two sweeps",
-     dict(organizer_dm_known=True, is_current=False), S, "NOT_CURRENT_TRIP", True),
-    ("...even inside its grace period, ended yesterday",
-     dict(organizer_dm_known=True, is_current=False, end_date=d(-1)), S, "NOT_CURRENT_TRIP", True),
-    ("...even with no dates at all", dict(organizer_dm_known=True, is_current=False), S, "NOT_CURRENT_TRIP", True),
-    ("the organizer's own /switch away is the confirmation: no second sweep",
-     dict(organizer_dm_known=True, is_current=False, switched_away=True), S, "NOT_CURRENT_TRIP", False),
-    ("a trip no organizer's DM constrains runs (no open DM binding anywhere)",
-     dict(organizer_dm_known=False, is_current=False), R, "IN_WINDOW", False),
-    ("a trip with several organizers runs if it is ANY of their current trip",
-     dict(organizer_dm_known=True, is_current=True), R, "CURRENT_TRIP", False),
-
-    # --- dates and the 14-day grace ---
-    ("no dates runs", dict(is_current=True, organizer_dm_known=True), R, "CURRENT_TRIP", False),
-    ("a trip in the future runs: no pre-trip dormancy",
-     dict(is_current=True, organizer_dm_known=True, start_date=d(30), end_date=d(40)), R, "CURRENT_TRIP", False),
-    ("the last day of the trip runs",
-     dict(is_current=True, organizer_dm_known=True, start_date=d(-5), end_date=d(0)), R, "CURRENT_TRIP", False),
-    ("the 14th day after the end still runs",
-     dict(is_current=True, organizer_dm_known=True, end_date=d(-14)), R, "CURRENT_TRIP", False),
-    ("the 15th day after the end stops", dict(is_current=True, organizer_dm_known=True, end_date=d(-15)),
-     S, "TRIP_ENDED", True),
-    ("an unconstrained trip past its grace stops", dict(end_date=d(-15)), S, "TRIP_ENDED", True),
-    ("an unconstrained trip inside its grace runs", dict(end_date=d(-14)), R, "IN_WINDOW", False),
-    ("a start date with no end date runs", dict(is_current=True, organizer_dm_known=True, start_date=d(-300)),
+    # --- 1. CURRENT_TRIP: any organizer's current trip, until end + 14 days ---
+    ("the organizer's current trip runs, with no dates", dict(is_current=True), R, "CURRENT_TRIP", False),
+    ("...planned for next year", dict(is_current=True, start_date=d(300), end_date=d(310)), R, "CURRENT_TRIP", False),
+    ("...under way: current is named first", dict(is_current=True, start_date=d(-2), end_date=d(5)),
      R, "CURRENT_TRIP", False),
+    ("...the 14th day after its end still runs", dict(is_current=True, end_date=d(-14)), R, "CURRENT_TRIP", False),
+    ("...the 15th day after its end it is archived, current or not",
+     dict(is_current=True, end_date=d(-15)), S, "ARCHIVED", True),
+    ("an ask on the current trip changes nothing", dict(is_current=True, asked_at=NOW - H), R, "CURRENT_TRIP", False),
 
-    # --- wake: a family message to a stopped companion ---
-    ("a lost turn an hour ago wakes a non-current trip",
-     dict(organizer_dm_known=True, last_wake_at=NOW - timedelta(hours=1)), R, "WAKE", False),
-    ("...for two days", dict(organizer_dm_known=True, last_wake_at=NOW - timedelta(days=2) + timedelta(minutes=1)),
-     R, "WAKE", False),
-    ("...and not a minute longer", dict(organizer_dm_known=True, last_wake_at=NOW - timedelta(days=2)),
-     S, "NOT_CURRENT_TRIP", True),
-    ("a wake keeps an ended trip up, however long after the trip",
-     dict(end_date=d(-300), last_wake_at=NOW - timedelta(hours=3)), R, "WAKE", False),
-    ("a wake does not need the organizer to be anywhere",
-     dict(end_date=d(-30), organizer_dm_known=True, last_wake_at=NOW - timedelta(minutes=5)), R, "WAKE", False),
-    ("a wake does not resurrect a retired trip",
-     dict(retired=True, last_wake_at=NOW - timedelta(minutes=5)), S, "RETIRED", False),
-    ("a wake on a trip that would run anyway changes nothing",
-     dict(is_current=True, organizer_dm_known=True, last_wake_at=NOW - timedelta(minutes=5)), R, "CURRENT_TRIP", False),
+    # --- 2. WARM: switched away less than two days ago ---
+    ("a trip switched away from an hour ago stays up", dict(warm_at=NOW - H), R, "WARM", False),
+    ("...for two days", dict(warm_at=NOW - TWO_DAYS + timedelta(minutes=1)), R, "WARM", False),
+    ("...and not a minute longer", dict(warm_at=NOW - TWO_DAYS), S, "NOT_CURRENT", True),
+    ("warm outranks archived inside its two days", dict(warm_at=NOW - H, end_date=d(-90)), R, "WARM", False),
+    ("warm does not resurrect a retired trip", dict(warm_at=NOW - H, retired=True), S, "RETIRED", False),
+
+    # --- 3. UNDERWAY: start <= today <= end, whatever the organizer is looking at ---
+    ("a trip under way runs though nobody's chat is on it", dict(start_date=d(-3), end_date=d(4)),
+     R, "UNDERWAY", False),
+    ("the first day of the trip", dict(start_date=d(0), end_date=d(6)), R, "UNDERWAY", False),
+    ("the last day of the trip", dict(start_date=d(-5), end_date=d(0)), R, "UNDERWAY", False),
+    ("the day before it starts is not underway", dict(start_date=d(1), end_date=d(7)), S, "NOT_CURRENT", True),
+    ("the day after it ends is not underway", dict(start_date=d(-7), end_date=d(-1)), S, "NOT_CURRENT", True),
+    ("a start date with no end date is not underway", dict(start_date=d(-30)), S, "NOT_CURRENT", True),
+
+    # --- 4. REVIVED: a message reached it while off ---
+    ("a message that reached no gateway an hour ago revives a stopped trip",
+     dict(asked_at=NOW - H), R, "REVIVED", False),
+    ("...for two days", dict(asked_at=NOW - TWO_DAYS + timedelta(minutes=1)), R, "REVIVED", False),
+    ("...and not a minute longer", dict(asked_at=NOW - TWO_DAYS), S, "NOT_CURRENT", True),
+    ("an archived trip revives the same way", dict(end_date=d(-90), asked_at=NOW - H), R, "REVIVED", False),
+    ("...and archives again after two days", dict(end_date=d(-90), asked_at=NOW - TWO_DAYS), S, "ARCHIVED", True),
+    ("an ask does not resurrect a retired trip", dict(retired=True, asked_at=NOW - H), S, "RETIRED", False),
+
+    # --- 5/6. the two stops ---
+    ("past end + 14 days it is ARCHIVED; a stop needs two sweeps", dict(end_date=d(-15)), S, "ARCHIVED", True),
+    ("a long-archived trip stays archived", dict(end_date=d(-400)), S, "ARCHIVED", True),
+    ("ended inside its grace and not current is NOT_CURRENT", dict(end_date=d(-14)), S, "NOT_CURRENT", True),
+    ("planned and not current is NOT_CURRENT", dict(start_date=d(30), end_date=d(40)), S, "NOT_CURRENT", True),
+    ("no dates and not current is NOT_CURRENT", dict(), S, "NOT_CURRENT", True),
 
     # --- the quiet window: nothing is stopped within 6 hours of a conversation ---
-    ("a conversation 5h59m ago holds a stop back",
-     dict(organizer_dm_known=True, last_activity_at=NOW - timedelta(hours=6) + timedelta(minutes=1)),
-     R, "QUIET_WINDOW", False),
-    ("...6 hours ago it no longer does",
-     dict(organizer_dm_known=True, last_activity_at=NOW - timedelta(hours=6)), S, "NOT_CURRENT_TRIP", True),
-    ("the quiet window also holds back the end of the grace period",
-     dict(end_date=d(-40), last_activity_at=NOW - timedelta(hours=1)), R, "QUIET_WINDOW", False),
+    ("a conversation 5h59m ago holds a NOT_CURRENT stop back",
+     dict(last_activity_at=NOW - timedelta(hours=6) + timedelta(minutes=1)), R, "QUIET_WINDOW", False),
+    ("...6 hours ago it no longer does", dict(last_activity_at=NOW - timedelta(hours=6)), S, "NOT_CURRENT", True),
+    ("the quiet window also holds back an ARCHIVED stop",
+     dict(end_date=d(-90), last_activity_at=NOW - H), R, "QUIET_WINDOW", False),
     ("the quiet window does not hold back a RETIRED stop",
      dict(retired=True, last_activity_at=NOW - timedelta(minutes=1)), S, "RETIRED", False),
-    ("a wake outranks the quiet window in the reason it reports",
-     dict(organizer_dm_known=True, last_wake_at=NOW - timedelta(hours=1),
-          last_activity_at=NOW - timedelta(hours=1)), R, "WAKE", False),
-
-    # --- the open case: a family IN a trip that is not its organizer's current one ---
-    ("family mid-trip in a group: kept by the default rule",
-     dict(organizer_dm_known=True, has_group=True, start_date=d(-3), end_date=d(4)), R, "MIDTRIP_PROTECTED", False),
-    ("...but only with a group chat bound",
-     dict(organizer_dm_known=True, has_group=False, start_date=d(-3), end_date=d(4)), S, "NOT_CURRENT_TRIP", True),
-    ("...and only while the trip is under way",
-     dict(organizer_dm_known=True, has_group=True, start_date=d(2), end_date=d(9)), S, "NOT_CURRENT_TRIP", True),
-    ("...and not after it ended",
-     dict(organizer_dm_known=True, has_group=True, start_date=d(-9), end_date=d(-2)), S, "NOT_CURRENT_TRIP", True),
-    ("...and not with unknown dates",
-     dict(organizer_dm_known=True, has_group=True), S, "NOT_CURRENT_TRIP", True),
+    ("a revival outranks the quiet window in the reason it reports",
+     dict(asked_at=NOW - H, last_activity_at=NOW - H), R, "REVIVED", False),
+    ("a trip that runs anyway reports why, not the quiet window",
+     dict(start_date=d(-1), end_date=d(1), last_activity_at=NOW - H), R, "UNDERWAY", False),
 ]
 
 
@@ -164,17 +150,15 @@ class DecideTable(unittest.TestCase):
                 got = decide(GatewayFacts(profile="p-x", **kwargs), NOW)
                 self.assertEqual(got, Decision(desired, reason, confirm))
 
-    def test_the_midtrip_family_rule_is_a_policy_not_a_guess(self) -> None:
-        facts = GatewayFacts(profile="p-x", organizer_dm_known=True, has_group=True,
-                             start_date=d(-3), end_date=d(4))
-        self.assertEqual(decide(facts, NOW, Policy(midtrip_family_rule="keep")).reason, "MIDTRIP_PROTECTED")
-        self.assertEqual(decide(facts, NOW, Policy(midtrip_family_rule="stop")).reason, "NOT_CURRENT_TRIP")
-        self.assertEqual(DEFAULT_POLICY.midtrip_family_rule, "keep",
-                         "fail safe for travellers until the owner decides")
-
     def test_the_policy_numbers_are_the_owners(self) -> None:
-        self.assertEqual((DEFAULT_POLICY.grace_days, DEFAULT_POLICY.wake_days, DEFAULT_POLICY.quiet_hours),
+        self.assertEqual((DEFAULT_POLICY.grace_days, DEFAULT_POLICY.revive_days, DEFAULT_POLICY.quiet_hours),
                          (14, 2, 6))
+
+    def test_the_reasons_are_exactly_the_closed_set_the_schema_allows(self) -> None:
+        from control_plane_worker.gateway_reconcile import REASONS
+        self.assertEqual(set(REASONS), {
+            "INTERVIEWER", "PIN_ON", "PIN_OFF", "TEARDOWN", "RETIRED", "CURRENT_TRIP", "WARM", "UNDERWAY",
+            "REVIVED", "QUIET_WINDOW", "ARCHIVED", "NOT_CURRENT"})
 
     def test_every_reason_decide_can_return_is_a_closed_code_the_schema_allows(self) -> None:
         from control_plane_worker.gateway_reconcile import REASONS
@@ -182,9 +166,9 @@ class DecideTable(unittest.TestCase):
             self.assertIn(reason, REASONS)
 
     def test_decide_is_pure(self) -> None:
-        facts = GatewayFacts(profile="p-x", organizer_dm_known=True)
+        facts = GatewayFacts(profile="p-x", is_current=True, warm_at=NOW - H)
         self.assertEqual(decide(facts, NOW), decide(facts, NOW))
-        self.assertEqual(facts, GatewayFacts(profile="p-x", organizer_dm_known=True))
+        self.assertEqual(facts, GatewayFacts(profile="p-x", is_current=True, warm_at=NOW - H))
 
     def test_dates_read_the_way_the_site_and_the_portal_write_them(self) -> None:
         self.assertEqual(parse_date("2026-09-05T20:00:00+03:00"), date(2026, 9, 5))
@@ -420,7 +404,11 @@ class SweepTests(unittest.TestCase):
 
     def trip(self, *, profile: str | None = None, lifecycle: str = "ready_private", slug: str | None = None,
              departure: str | None = None, return_date: str | None = None,
-             start: date | None = None, end: date | None = None) -> dict[str, str]:
+             start: date | None = None, end: date | None = None, undated: bool = False) -> dict[str, str]:
+        """A provisioned trip. With no dates given it is UNDERWAY (the plain
+        "this one should run" fixture); `undated=True` gives it none."""
+        if not undated and not (departure or return_date or start or end):
+            start, end = self.past(1), self.past(-5)
         trip_id = f"trip_{rnd(8)}"
         slug = slug or f"gw-{rnd(4)}"
         profile = profile or f"gw{rnd(5)}"
@@ -449,23 +437,28 @@ class SweepTests(unittest.TestCase):
             "VALUES (%s, %s, %s, %s, 'active')", (f"tm_{rnd(8)}", trip["trip_id"], user_id, role))
         return user_id
 
-    def bind(self, trip: dict[str, str], chat_id: str, *, closed_ago: timedelta | None = None,
-             reason: str = "organizer_switch") -> None:
+    def bind(self, trip: dict[str, str], chat_id: str, *, created_ago: timedelta = timedelta(0),
+             closed_ago: timedelta | None = None, reason: str = "organizer_switch") -> None:
+        """A binding of a chat to the trip, created `created_ago` ago and, if
+        `closed_ago` is given, closed that long ago. A private chat's id is
+        digits; a group's starts with a minus."""
         self.conn.execute(
-            "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile, closed_at, closed_reason) "
-            "VALUES (%s, %s, %s, %s, %s, %s)",
-            (f"tcb_{rnd(8)}", chat_id, trip["trip_id"], trip["profile"],
+            "INSERT INTO control_plane.telegram_chat_bindings"
+            "(id, chat_id, trip_id, hermes_profile, created_at, closed_at, closed_reason) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (f"tcb_{rnd(8)}", chat_id, trip["trip_id"], trip["profile"], self.now - created_ago,
              None if closed_ago is None else self.now - closed_ago, None if closed_ago is None else reason))
 
-    def unbind(self, chat_id: str) -> None:
-        self.conn.execute("DELETE FROM control_plane.telegram_chat_bindings WHERE chat_id = %s", (chat_id,))
-
-    def switch(self, chat_id: str, to: dict[str, str], *, minutes_ago: float = 0.5) -> None:
+    def switch(self, chat_id: str, to: dict[str, str]) -> None:
         """What switchChatToTrip does: close the open binding, open a new one."""
         self.conn.execute(
             "UPDATE control_plane.telegram_chat_bindings SET closed_at = %s, closed_reason = 'organizer_switch' "
-            "WHERE chat_id = %s AND closed_at IS NULL", (self.now - timedelta(minutes=minutes_ago), chat_id))
+            "WHERE chat_id = %s AND closed_at IS NULL", (self.now, chat_id))
         self.bind(to, chat_id)
+
+    def past(self, days: int) -> date:
+        """A date `days` before the sweep's today."""
+        return self.now.date() - timedelta(days=days)
 
     def event(self, trip: dict[str, str], kind: str, ago: timedelta) -> None:
         common = dict(trip_id=trip["trip_id"], at=self.now - ago, id=str(uuid.uuid4()))
@@ -503,195 +496,198 @@ class SweepTests(unittest.TestCase):
         self.now += timedelta(minutes=minutes)
         self.clock.now += minutes * 60
 
-    # ── the owner's rule, from real rows ────────────────────────────────────
+    # ── who runs, from real rows ─────────────────────────────────────────────
 
-    def test_an_organizers_other_trip_is_stopped_and_the_one_their_dm_is_bound_to_runs(self) -> None:
-        a, b = self.trip(), self.trip()
-        for t in (a, b):
+    def test_the_organizers_current_trip_runs_and_a_planned_one_they_are_not_on_does_not(self) -> None:
+        current, other = self.trip(undated=True), self.trip(undated=True)
+        for t in (current, other):
             self.organizer(t, "7001")
-        self.bind(b, "7001")
-        self.host.set(a["profile"], "running")
-        self.host.set(b["profile"], "running")
+        self.bind(current, "7001")
+        self.host.set(current["profile"], "running")
+        self.host.set(other["profile"], "running")
         self.sweep().run()
-        self.assertEqual((self.row(a)["desired"], self.row(a)["reason"]), ("stopped", "NOT_CURRENT_TRIP"))
-        self.assertEqual((self.row(b)["desired"], self.row(b)["reason"]), ("running", "CURRENT_TRIP"))
+        self.assertEqual((self.row(current)["desired"], self.row(current)["reason"]), ("running", "CURRENT_TRIP"))
+        self.assertEqual((self.row(other)["desired"], self.row(other)["reason"]), ("stopped", "NOT_CURRENT"))
 
-    def test_the_same_organizer_under_two_user_ids_is_still_one_organizer(self) -> None:
-        # One physical organizer owns several control-plane user ids (migration
-        # 0052). Both are linked to the same Telegram digest, so the rule holds.
-        a, b = self.trip(), self.trip()
+    def test_the_same_person_under_two_user_ids_is_one_organizer(self) -> None:
+        a, b = self.trip(undated=True), self.trip(undated=True)
         self.organizer(a, "7002", user_id=f"user_{rnd(8)}")
         self.organizer(b, "7002", user_id=f"user_{rnd(8)}")
         self.bind(b, "7002")
-        self.host.set(a["profile"], "running")
         self.sweep().run()
-        self.assertEqual(self.row(a)["reason"], "NOT_CURRENT_TRIP")
+        self.assertEqual(self.row(a)["reason"], "NOT_CURRENT")
         self.assertEqual(self.row(b)["reason"], "CURRENT_TRIP")
 
-    def test_a_trip_with_two_organizers_runs_if_it_is_either_ones_current_trip(self) -> None:
-        shared, other = self.trip(), self.trip()
+    def test_a_trip_is_current_if_it_is_any_of_its_organizers_current_trip(self) -> None:
+        shared, away = self.trip(undated=True), self.trip(undated=True)
         self.organizer(shared, "7003", role="owner")
         self.organizer(shared, "7004", role="organizer")
-        self.organizer(other, "7003")
-        self.bind(other, "7003")      # the first organizer is on `other`
-        self.bind(shared, "7004")     # the second is on `shared`
+        self.organizer(away, "7003")
+        self.bind(away, "7003")        # the first organizer is elsewhere
+        self.bind(shared, "7004")      # the second is on it
         self.sweep().run()
         self.assertEqual(self.row(shared)["reason"], "CURRENT_TRIP")
-        self.assertEqual(self.row(other)["reason"], "CURRENT_TRIP")
 
-    def test_a_trip_both_of_whose_organizers_are_elsewhere_is_stopped(self) -> None:
-        shared, away = self.trip(), self.trip()
-        self.organizer(shared, "7005")
-        self.organizer(shared, "7006", role="organizer")
-        for tg in ("7005", "7006"):
-            self.organizer(away, tg)
-            self.bind(away, tg)
+    def test_a_member_is_not_an_organizer_and_a_group_is_not_a_dm(self) -> None:
+        member_trip, group_trip = self.trip(undated=True), self.trip(undated=True)
+        self.organizer(member_trip, "7005", role="member")
+        self.bind(member_trip, "7005")
+        self.bind(group_trip, "-100777")
         self.sweep().run()
-        self.assertEqual(self.row(shared)["reason"], "NOT_CURRENT_TRIP")
+        self.assertEqual(self.row(member_trip)["reason"], "NOT_CURRENT")
+        self.assertEqual(self.row(group_trip)["reason"], "NOT_CURRENT")
 
-    def test_a_member_is_not_an_organizer(self) -> None:
-        t, other = self.trip(), self.trip()
-        self.organizer(t, "7007", role="member")      # a family member's own link
-        self.organizer(other, "7007", role="owner")
-        self.bind(other, "7007")
+    def test_a_dm_bound_to_a_retired_trip_is_nobodys_current_trip(self) -> None:
+        dead = self.trip(slug=f"retired-gw-{rnd(3)}-20260101")
+        self.organizer(dead, "7006")
+        self.bind(dead, "7006")
         self.sweep().run()
-        self.assertEqual(self.row(t)["reason"], "IN_WINDOW", "a member's DM binding constrains nobody's trip")
-
-    def test_an_organizer_with_no_dm_binding_constrains_nothing(self) -> None:
-        t = self.trip()
-        self.organizer(t, "7008")
-        self.sweep().run()
-        self.assertEqual((self.row(t)["desired"], self.row(t)["reason"]), ("running", "IN_WINDOW"))
-
-    def test_a_dm_bound_to_a_retired_trip_is_not_a_current_trip(self) -> None:
-        live, dead = self.trip(), self.trip(slug=f"retired-gw-{rnd(3)}-20260101")
-        self.organizer(live, "7009")
-        self.organizer(dead, "7009")
-        self.bind(dead, "7009")
-        self.sweep().run()
-        self.assertEqual(self.row(live)["reason"], "IN_WINDOW")
         self.assertEqual(self.row(dead)["reason"], "RETIRED")
-
-    def test_a_group_binding_is_not_a_dm(self) -> None:
-        t, other = self.trip(), self.trip()
-        self.organizer(t, "7010")
-        self.organizer(other, "7010")
-        self.bind(other, "-100123456")   # a group, whatever it is named
-        self.sweep().run()
-        self.assertEqual(self.row(t)["reason"], "IN_WINDOW")
 
     def test_a_pre_provisioning_trip_has_no_gateway_to_decide_about(self) -> None:
         t = self.trip(lifecycle="draft")
         self.sweep().run()
         self.assertIsNone(self.row(t))
 
-    # ── switching moves the one running companion ───────────────────────────
-
-    def test_a_switch_stops_the_previous_trip_at_once_and_starts_the_new_one(self) -> None:
-        a, b = self.trip(), self.trip()
+    def test_a_switch_starts_the_new_trip_at_once_and_does_not_stop_the_old_one(self) -> None:
+        a, b = self.trip(undated=True), self.trip(undated=True)
         for t in (a, b):
-            self.organizer(t, "7020")
-        self.bind(a, "7020")
+            self.organizer(t, "7010")
+        self.bind(a, "7010")
         self.host.set(a["profile"], "running")
         self.host.set(b["profile"], "stopped")
         sweep = self.sweep("enforce")
         sweep.run()
-        self.assertEqual(self.row(b)["reason"], "NOT_CURRENT_TRIP")
-        self.assertEqual(self.host.act_calls, [], "nothing to do yet: a is current and running, b is stopped")
-        self.switch("7020", b)
+        self.assertEqual(self.host.act_calls, [], "a is current and up; b is not current and already down")
+        self.switch("7010", b)
         self.advance(1)
         sweep.run()
-        self.assertIn((b["profile"], "start"), self.host.act_calls, "the new trip starts on the very next sweep")
-        self.assertIn((a["profile"], "stop"), self.host.act_calls,
-                      "the organizer's own /switch is the confirmation: the old trip stops with no second sweep")
+        self.assertEqual(self.host.act_calls, [(b["profile"], "start")], "no immediate stop on switch")
+        self.assertEqual(self.row(a)["reason"], "WARM")
+        self.assertEqual(self.row(b)["reason"], "CURRENT_TRIP")
 
-    def test_without_a_switch_a_flap_prone_stop_waits_for_a_second_sweep(self) -> None:
-        a, b = self.trip(), self.trip()
+    def test_the_old_trip_stays_up_two_days_and_then_stops_after_two_sweeps(self) -> None:
+        a, b = self.trip(undated=True), self.trip(undated=True)
         for t in (a, b):
-            self.organizer(t, "7021")
-        self.bind(b, "7021")
+            self.organizer(t, "7011")
+        self.bind(a, "7011")
         self.host.set(a["profile"], "running")
         self.host.set(b["profile"], "running")
         sweep = self.sweep("enforce")
         sweep.run()
-        self.assertEqual(self.host.act_calls, [], "first sighting: decided once, nothing stopped")
-        self.assertEqual(self.row(a)["confirmations"], 1)
+        self.switch("7011", b)
+        for minutes in (5, 60 * 24, 60 * 23):          # one minute short of two days since the switch
+            self.advance(minutes)
+            sweep.run()
+        self.assertEqual(self.row(a)["reason"], "WARM")
+        self.assertEqual(self.host.act_calls, [])
+        self.advance(65)
+        sweep.run()
+        self.assertEqual((self.row(a)["desired"], self.row(a)["reason"]), ("stopped", "NOT_CURRENT"))
+        self.assertEqual(self.host.act_calls, [], "decided once: not stopped yet")
         self.advance(5)
         sweep.run()
         self.assertEqual(self.host.act_calls, [(a["profile"], "stop")])
 
-    def test_a_flap_never_darkens_a_companion(self) -> None:
-        a, b = self.trip(), self.trip()
+    def test_a_chat_rebound_to_another_trip_also_starts_the_warm_window(self) -> None:
+        a, b = self.trip(undated=True), self.trip(undated=True)
         for t in (a, b):
-            self.organizer(t, "7022")
-        self.bind(a, "7022")
-        self.host.set(a["profile"], "running")
+            self.organizer(t, "7012")
+        # The provisioner retargeted the chat: a's binding closed for another reason, b's opened.
+        self.bind(a, "7012", created_ago=timedelta(days=30), closed_ago=timedelta(minutes=30), reason="retargeted")
+        self.bind(b, "7012", created_ago=timedelta(minutes=30))
+        self.sweep().run()
+        self.assertEqual(self.row(a)["reason"], "WARM")
+
+    def test_a_binding_closed_for_another_reason_with_no_replacement_is_not_warm(self) -> None:
+        a = self.trip(undated=True)
+        self.organizer(a, "7013")
+        self.bind(a, "7013", created_ago=timedelta(days=30), closed_ago=timedelta(minutes=30), reason="chat_left")
+        self.sweep().run()
+        self.assertEqual(self.row(a)["reason"], "NOT_CURRENT")
+
+    def test_a_trip_underway_runs_whoever_the_organizer_is_talking_to(self) -> None:
+        under_way, current = self.trip(start=self.past(3), end=self.past(-4)), self.trip(undated=True)
+        for t in (under_way, current):
+            self.organizer(t, "7014")
+        self.bind(current, "7014")
+        self.host.set(under_way["profile"], "stopped")
+        self.sweep("enforce").run()
+        self.assertEqual(self.row(under_way)["reason"], "UNDERWAY")
+        self.assertEqual(self.host.act_calls, [(under_way["profile"], "start")])
+
+    def test_a_current_trip_past_its_grace_is_archived_and_stops_after_two_sweeps(self) -> None:
+        t = self.trip(end=self.past(15))
+        self.organizer(t, "7015")
+        self.bind(t, "7015")
+        self.host.set(t["profile"], "running")
         sweep = self.sweep("enforce")
         sweep.run()
-        # b is switched to and, between sweeps, straight back to a.
-        self.conn.execute("UPDATE control_plane.telegram_chat_bindings SET closed_at = now() - interval '2 hours', "
-                          "closed_reason = 'organizer_switch' WHERE chat_id = '7022'")
-        self.bind(b, "7022")
-        self.advance(5)
-        sweep.run()          # a decided NOT_CURRENT_TRIP once
-        self.conn.execute("DELETE FROM control_plane.telegram_chat_bindings WHERE chat_id = '7022' AND trip_id = %s",
-                          (b["trip_id"],))
-        self.bind(a, "7022")
+        self.assertEqual((self.row(t)["desired"], self.row(t)["reason"]), ("stopped", "ARCHIVED"))
+        self.assertEqual(self.host.act_calls, [])
         self.advance(5)
         sweep.run()
-        self.assertNotIn((a["profile"], "stop"), self.host.act_calls)
-        self.assertEqual(self.row(a)["desired"], "running")
+        self.assertEqual(self.host.act_calls, [(t["profile"], "stop")])
 
-    # ── dates, grace, wake, quiet ───────────────────────────────────────────
+    def test_the_current_trip_runs_through_day_14_of_its_grace(self) -> None:
+        t = self.trip(end=self.past(14))
+        self.organizer(t, "7016")
+        self.bind(t, "7016")
+        self.sweep().run()
+        self.assertEqual(self.row(t)["reason"], "CURRENT_TRIP")
+
+    def test_a_lost_turn_revives_a_stopped_trip_for_two_days_and_stops_nobody_else(self) -> None:
+        current, revived, lapsed = self.trip(undated=True), self.trip(undated=True), self.trip(undated=True)
+        for t in (current, revived, lapsed):
+            self.organizer(t, "7017")
+        self.bind(current, "7017")
+        self.event(revived, "lost", timedelta(hours=1))
+        self.event(lapsed, "lost", timedelta(days=2, minutes=1))
+        self.host.set(current["profile"], "running")
+        self.host.set(revived["profile"], "stopped")
+        self.host.set(lapsed["profile"], "stopped")
+        self.sweep("enforce").run()
+        self.assertEqual((self.row(revived)["desired"], self.row(revived)["reason"]), ("running", "REVIVED"))
+        self.assertEqual(self.row(lapsed)["reason"], "NOT_CURRENT")
+        self.assertEqual(self.host.act_calls, [(revived["profile"], "start")])
+
+    def test_a_revived_archived_trip_stops_again_after_two_days(self) -> None:
+        t = self.trip(end=self.past(90))
+        self.event(t, "lost", timedelta(hours=1))
+        self.host.set(t["profile"], "stopped")
+        sweep = self.sweep("enforce")
+        sweep.run()
+        self.assertEqual(self.host.act_calls, [(t["profile"], "start")])
+        self.advance(60 * 24 + 30)
+        sweep.run()
+        self.assertEqual(self.row(t)["reason"], "REVIVED")
+        self.advance(60 * 24)
+        sweep.run()
+        self.assertEqual(self.row(t)["reason"], "ARCHIVED")
+        self.advance(5)
+        sweep.run()
+        self.assertEqual(self.host.act_calls, [(t["profile"], "start"), (t["profile"], "stop")])
 
     def test_the_grace_period_reads_the_deployed_config_first_then_the_portal_columns(self) -> None:
-        snap = self.trip(departure="2026-01-01T20:00:00+02:00", return_date=(NOW.date() - timedelta(days=20)).isoformat())
-        portal = self.trip(start=d(-30), end=d(-20))
+        snap = self.trip(departure="2026-01-01T20:00:00+02:00", return_date=self.past(20).isoformat())
+        portal = self.trip(start=self.past(30), end=self.past(20))
         for t in (snap, portal):
             self.host.set(t["profile"], "stopped")
         self.sweep().run()
         for t in (snap, portal):
-            self.assertEqual(self.row(t)["reason"], "TRIP_ENDED", t["slug"])
+            self.assertEqual(self.row(t)["reason"], "ARCHIVED", t["slug"])
 
-    def test_a_lost_turn_wakes_a_stopped_companion_for_two_days_alongside_the_current_trip(self) -> None:
-        current, quiet = self.trip(), self.trip()
-        for t in (current, quiet):
-            self.organizer(t, "7030")
-        self.bind(current, "7030")
-        self.event(quiet, "lost", timedelta(hours=1))
-        self.host.set(current["profile"], "running")
-        self.host.set(quiet["profile"], "stopped")
-        sweep = self.sweep("enforce")
-        sweep.run()
-        self.assertEqual((self.row(quiet)["desired"], self.row(quiet)["reason"]), ("running", "WAKE"))
-        self.assertEqual(self.row(current)["reason"], "CURRENT_TRIP", "the wake does not take over the current trip")
-        self.assertEqual(self.host.act_calls, [(quiet["profile"], "start")])
-        self.assertNotIn((current["profile"], "stop"), self.host.act_calls)
-
-    def test_the_wake_lapses_after_two_days(self) -> None:
-        a, b = self.trip(), self.trip()
-        for t in (a, b):
-            self.organizer(t, "7031")
-        self.bind(a, "7031")
-        self.event(b, "lost", timedelta(days=2, minutes=1))
-        self.sweep().run()
-        self.assertEqual(self.row(b)["reason"], "NOT_CURRENT_TRIP")
-
-    def test_a_conversation_within_six_hours_holds_a_stop_but_never_causes_a_start(self) -> None:
-        a, b = self.trip(), self.trip()
-        for t in (a, b):
-            self.organizer(t, "7032")
-        self.bind(a, "7032")
-        self.event(b, "reply", timedelta(hours=2))
-        self.host.set(a["profile"], "running")
-        self.host.set(b["profile"], "running")
+    def test_a_conversation_within_six_hours_holds_an_archive_stop_but_never_causes_a_start(self) -> None:
+        t = self.trip(end=self.past(90))
+        self.event(t, "reply", timedelta(hours=2))
+        self.host.set(t["profile"], "running")
         sweep = self.sweep("enforce")
         for _ in range(3):
             sweep.run()
             self.advance(5)
-        self.assertEqual(self.row(b)["reason"], "QUIET_WINDOW")
-        self.assertEqual(self.host.act_calls, [], "b is held: not stopped")
-        self.host.set(b["profile"], "stopped")
+        self.assertEqual(self.row(t)["reason"], "QUIET_WINDOW")
+        self.assertEqual(self.host.act_calls, [], "held: not stopped")
+        self.host.set(t["profile"], "stopped")
         sweep.run()
         self.assertEqual(self.host.act_calls, [], "and a hold never starts a gateway that is already down")
 
@@ -709,17 +705,6 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(log.text.count("gateway_reconcile.wake_signal_blind"), 1, "once per process, not per sweep")
         self.assertIn("ASSISTANT_EVENTS_ENABLED", log.text)
         self.assertIsNotNone(t)
-
-    def test_the_families_midtrip_case_is_kept_and_flagged_by_its_reason(self) -> None:
-        a, b = self.trip(start=d(-3), end=d(4)), self.trip()
-        for t in (a, b):
-            self.organizer(t, "7033")
-        self.bind(b, "7033")
-        self.bind(a, "-100777")
-        self.host.set(a["profile"], "running")
-        self.sweep("enforce").run()
-        self.assertEqual((self.row(a)["desired"], self.row(a)["reason"]), ("running", "MIDTRIP_PROTECTED"))
-        self.assertEqual(self.host.act_calls, [])
 
     # ── retired, pins, the interviewer ──────────────────────────────────────
 
@@ -754,7 +739,7 @@ class SweepTests(unittest.TestCase):
         self.host.set(t["profile"], "running")
         sweep = self.sweep("enforce")
         sweep.run()
-        self.assertEqual(self.row(t)["reason"], "IN_WINDOW")
+        self.assertEqual(self.row(t)["reason"], "UNDERWAY")
         out = set_pin(DB_URL, self.host, t["profile"], "off", now=self.now)
         self.assertEqual((out["desired"], out["reason"]), ("stopped", "PIN_OFF"))
         self.assertEqual(self.row(t)["pin"], "off")
@@ -762,7 +747,7 @@ class SweepTests(unittest.TestCase):
         sweep.run()
         self.assertEqual(self.host.act_calls, [(t["profile"], "stop")], "an operator stop needs no second sweep")
         out = set_pin(DB_URL, self.host, t["profile"], "clear", now=self.now)
-        self.assertEqual(out["reason"], "IN_WINDOW")
+        self.assertEqual(out["reason"], "UNDERWAY")
         self.assertIsNone(self.row(t)["pin"])
         self.assertEqual([e["pin"] for e in self.events(t, "PIN")], ["off", "clear"])
 
@@ -784,9 +769,8 @@ class SweepTests(unittest.TestCase):
         self.assertIn("teardown in progress", str(ctx.exception))
 
     def test_a_teardown_pin_stops_the_gateway_and_nothing_restarts_it(self) -> None:
-        t = self.trip()
-        self.organizer(t, "7040")
-        self.bind(t, "7040")        # even the organizer's current trip
+        t = self.trip()             # an active trip: only the pin says otherwise
+        self.bind(t, "7040")
         self.conn.execute(
             "INSERT INTO control_plane.companion_gateways(hermes_profile, trip_id, kind, desired, reason, pin, pin_set_at) "
             "VALUES (%s, %s, 'companion', 'stopped', 'TEARDOWN', 'teardown', now())", (t["profile"], t["trip_id"]))
@@ -802,10 +786,7 @@ class SweepTests(unittest.TestCase):
     # ── OBSERVE NEVER ACTS ──────────────────────────────────────────────────
 
     def test_observe_records_decisions_and_observations_and_calls_act_never(self) -> None:
-        up, down, gone, stale = self.trip(), self.trip(), self.trip(), self.trip()
-        self.organizer(up, "7050")
-        self.organizer(stale, "7050")
-        self.bind(up, "7050")
+        up, down, gone, stale = self.trip(), self.trip(), self.trip(), self.trip(end=self.past(90))
         self.host.set(up["profile"], "stopped")                       # should run, is down: would start
         self.host.set(stale["profile"], "running")                    # should not run, is up: would stop
         self.host.set(down["profile"], "stopped")
@@ -839,10 +820,7 @@ class SweepTests(unittest.TestCase):
             self.sweep("enforce-ish")
 
     def test_dry_run_decides_and_asks_but_writes_and_acts_on_nothing(self) -> None:
-        a, b = self.trip(), self.trip()
-        for t in (a, b):
-            self.organizer(t, "7051")
-        self.bind(a, "7051")
+        a, b = self.trip(), self.trip(end=self.past(90))
         self.host.set(a["profile"], "stopped")
         self.host.set(b["profile"], "running")
         before = self.conn.execute("SELECT count(*) AS n FROM control_plane.companion_gateway_events").fetchone()["n"]
@@ -883,7 +861,7 @@ class SweepTests(unittest.TestCase):
         sweep.run()
         decided = self.events(t, "DECIDED")
         observed = self.events(t, "OBSERVED")
-        self.assertEqual([(e["desired"], e["reason"]) for e in decided], [("running", "IN_WINDOW")])
+        self.assertEqual([(e["desired"], e["reason"]) for e in decided], [("running", "UNDERWAY")])
         self.assertEqual([e["observed"] for e in observed], ["running", "stopped"])
         for e in decided + observed:
             self.assertEqual(e["mode"], "observe")
@@ -1060,15 +1038,12 @@ class SweepTests(unittest.TestCase):
     # ── the wake path: a hint runs a sweep ahead of its interval ────────────
 
     def test_a_switch_or_a_lost_turn_runs_a_sweep_before_the_interval_a_quiet_database_does_not(self) -> None:
-        a, b = self.trip(), self.trip()
-        self.organizer(a, "7060")
-        self.organizer(b, "7060")
-        self.bind(a, "7060")
+        a, b = self.trip(), self.trip(end=self.past(90))
         sweep = self.sweep()
         self.assertIsNotNone(sweep.maybe_run(), "the first poll sweeps")
         self.clock.now += 40
         self.assertIsNone(sweep.maybe_run(), "nothing happened: no sweep, only a cheap read")
-        self.switch("7060", b)
+        self.bind(b, "7060")
         self.clock.now += 40
         got = sweep.maybe_run()
         self.assertIsNotNone(got, "an organizer's switch opens a binding: a sweep runs 40s later, not 5 minutes")
@@ -1105,15 +1080,15 @@ class SweepTests(unittest.TestCase):
             "INSERT INTO control_plane.companion_gateways(hermes_profile, kind, desired, reason) "
             "VALUES (%s, 'companion', 'running', 'because the owner said so')",
             "INSERT INTO control_plane.companion_gateways(hermes_profile, kind, desired, reason, observed) "
-            "VALUES (%s, 'companion', 'running', 'CURRENT_TRIP', 'sort of running')",
+            "VALUES (%s, 'companion', 'running', 'UNDERWAY', 'sort of running')",
             "INSERT INTO control_plane.companion_gateways(hermes_profile, kind, desired, reason, pin) "
-            "VALUES (%s, 'companion', 'running', 'CURRENT_TRIP', 'maybe')",
+            "VALUES (%s, 'companion', 'running', 'UNDERWAY', 'maybe')",
             "INSERT INTO control_plane.companion_gateways(hermes_profile, kind, desired, reason, pin) "
-            "VALUES (%s, 'companion', 'running', 'CURRENT_TRIP', 'on')",       # a pin needs its time
+            "VALUES (%s, 'companion', 'running', 'UNDERWAY', 'on')",       # a pin needs its time
             "INSERT INTO control_plane.companion_gateways(hermes_profile, kind, desired, reason, last_action) "
-            "VALUES (%s, 'companion', 'running', 'CURRENT_TRIP', 'start')",     # an action needs its time and result
+            "VALUES (%s, 'companion', 'running', 'UNDERWAY', 'start')",     # an action needs its time and result
             "INSERT INTO control_plane.companion_gateways(hermes_profile, kind, desired, reason) "
-            "VALUES ('UPPER CASE', 'companion', 'running', 'CURRENT_TRIP')",
+            "VALUES ('UPPER CASE', 'companion', 'running', 'UNDERWAY')",
         ):
             with self.subTest(sql=sql[:90]), self.assertRaises(psycopg.errors.CheckViolation):
                 self.conn.execute(sql, (t["profile"],) if "%s" in sql else ())

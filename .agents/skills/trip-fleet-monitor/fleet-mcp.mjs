@@ -333,8 +333,8 @@ const SITE_URL_SQL = `
  * is not is BROKEN and somebody should.
  *
  *   RUNNING       should run, does
- *   DORMANT       should not run, does not (the reason says why: NOT_CURRENT_TRIP,
- *                 TRIP_ENDED, RETIRED, PIN_OFF ...) — also a conversation-hold
+ *   DORMANT       should not run, does not (the reason says why: NOT_CURRENT,
+ *                 ARCHIVED, RETIRED, PIN_OFF ...) — also a conversation-hold
  *                 that found the gateway already down
  *   PENDING_STOP  should not run, still does — the reconciler has not (or, in
  *                 observe mode, will not) stopped it yet

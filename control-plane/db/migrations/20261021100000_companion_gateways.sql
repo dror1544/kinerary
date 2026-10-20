@@ -18,11 +18,13 @@
 --
 -- THE RULE IT DECIDES BY, in one paragraph (the order is in decide()):
 -- the interviewer is always up; a retired or torn-down trip is down; an
--- operator pin wins over everything automatic; an organizer has at most ONE
--- running companion, the trip their Telegram DM is bound to (/switch moves
--- it); that trip runs until 14 days after it ends; a family message to a
--- stopped companion starts it for 2 days alongside; and nothing is stopped
--- within 6 hours of a conversation.
+-- operator pin wins over everything automatic; a trip runs while it is any of
+-- its organizers' CURRENT trip (the one their Telegram DM is bound to), for two
+-- days after they switch away (WARM), while it is UNDERWAY (between its start
+-- and end dates), and for two days after a message reached it while it was off
+-- (REVIVED); a trip more than 14 days past its end is ARCHIVED and any other
+-- trip that is none of those is NOT_CURRENT — both stopped; and nothing is
+-- stopped within 6 hours of a conversation.
 --
 -- WHAT IS NOT HERE IS THE POINT, as in assistant_events (20260925143012):
 -- every column is a number, a timestamp, an id or a value from a closed set
@@ -56,8 +58,7 @@ CREATE TABLE control_plane.companion_gateways (
   desired         text NOT NULL CHECK (desired IN ('running', 'stopped')),
   reason          text NOT NULL CHECK (reason IN (
     'INTERVIEWER', 'PIN_ON', 'PIN_OFF', 'TEARDOWN', 'RETIRED',
-    'CURRENT_TRIP', 'IN_WINDOW', 'WAKE', 'MIDTRIP_PROTECTED', 'QUIET_WINDOW',
-    'NOT_CURRENT_TRIP', 'TRIP_ENDED'
+    'CURRENT_TRIP', 'WARM', 'UNDERWAY', 'REVIVED', 'QUIET_WINDOW', 'ARCHIVED', 'NOT_CURRENT'
   )),
   decided_at      timestamptz NOT NULL DEFAULT now(),
   confirmations   smallint NOT NULL DEFAULT 1 CHECK (confirmations BETWEEN 1 AND 2),
@@ -104,8 +105,7 @@ CREATE TABLE control_plane.companion_gateway_events (
   desired        text CHECK (desired IN ('running', 'stopped')),
   reason         text CHECK (reason IN (
     'INTERVIEWER', 'PIN_ON', 'PIN_OFF', 'TEARDOWN', 'RETIRED',
-    'CURRENT_TRIP', 'IN_WINDOW', 'WAKE', 'MIDTRIP_PROTECTED', 'QUIET_WINDOW',
-    'NOT_CURRENT_TRIP', 'TRIP_ENDED'
+    'CURRENT_TRIP', 'WARM', 'UNDERWAY', 'REVIVED', 'QUIET_WINDOW', 'ARCHIVED', 'NOT_CURRENT'
   )),
   observed       text CHECK (observed IN ('running', 'duplicate', 'stopped', 'absent')),
   action         text CHECK (action IN ('start', 'stop')),

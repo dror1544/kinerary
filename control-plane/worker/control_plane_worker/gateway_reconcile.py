@@ -22,36 +22,40 @@ call to the action adapter on that path, and a test pins it. `enforce` acts.
 __main__.py), because a typo quietly becoming `observe` or `off` is the
 silent-downgrade shape this repository keeps paying for.
 
-THE RULE (owner decisions, 2026-10-20), in the order decide() applies it:
+THE RULE (owner decisions, 2026-10-20, final), in the order decide() applies it
+to a trip companion (the interviewer always runs; a retired trip, a `teardown`
+pin and the operator's `on`/`off` pin come first):
 
-  1. The interviewer always runs.
-  2. A retired (torn-down) trip is down; so is one pinned `teardown`.
-  3. An operator pin (`on`/`off`) beats everything automatic below.
-  4. An organizer has at most ONE running companion: the trip their Telegram
-     DM is currently bound to (the /switch target). Their other trips are
-     stopped, even inside their grace period. "Organizer" is a trip membership
-     with role owner or organizer; a trip with several organizers runs if it is
-     ANY of its organizers' current trip. An organizer with no open DM binding
-     constrains nothing.
-  5. The current trip (and a trip nobody's DM constrains) runs until
-     GRACE_DAYS after its end date; no dates, or unreadable dates, means it
-     runs. There is no pre-trip dormancy.
-  6. A stop that rule 4 or 5 would make is overridden by a WAKE (a family
-     message to a stopped companion, recorded by the relay as a lost turn,
-     keeps it up WAKE_DAYS, alongside the organizer's current trip) and then by
-     the QUIET window (nothing is stopped within QUIET_HOURS of a
-     conversation).
-  7. The one open question: a trip whose family is IN it (today within its
-     dates, with a group chat bound) but which is not its organizer's current
-     trip. Rule 4 read literally stops it. `MIDTRIP_FAMILY_RULE` decides, and
-     it defaults to "keep" — fail safe for travellers — until the owner says.
+  1. CURRENT_TRIP. The trip is the current trip of ANY of its organizers: an
+     open private-chat binding of theirs points at it (the /switch target;
+     "organizer" is an active owner/organizer membership, matched to the chat
+     by the same sha256 digest the API uses). It runs, unless it is past its
+     end date + GRACE_DAYS (14), which is rule 5.
+  2. WARM. It was an organizer's current trip and they switched away (the
+     binding closed by /switch, or the chat was bound to another trip) less
+     than WARM_DAYS (2) ago. It keeps running for those two days.
+  3. UNDERWAY. start_date <= today <= end_date. It runs whatever its
+     organizer is looking at.
+  4. REVIVED. A message reached it while it was off (the relay recorded a
+     lost turn) less than REVIVE_DAYS (2) ago. It runs, alongside whatever
+     else runs: a revival never stops another trip.
+  5. ARCHIVED. Today is past end_date + 14 days. Stopped.
+  6. NOT_CURRENT. Anything else: planned, or ended within its grace, and not
+     current, not warm, not underway, not revived; or no dates and not
+     current. Stopped.
+  A stop (5 or 6) is HELD for QUIET_HOURS (6) after any conversation with the
+  trip (reason QUIET_WINDOW). The hold only holds: it never starts a gateway.
+
+There is no limit on how many companions an organizer has running while their
+trips are underway or warm; what bounds the fleet is the current trip, the
+warm window, the dates and the revival.
 
 WHY STARTS ARE NOT DEBOUNCED BUT STOPS ARE. A wrongly started gateway costs a
 process for a few minutes; a wrongly stopped one is a dark companion for a
-family. So a start acts at once, and a stop for a reason a flap could produce
-(rules 4 and 5) must have been decided on two consecutive sweeps — unless the
-organizer's own /switch just closed that trip's DM binding, which is the
-confirmation. Retired, teardown and operator stops are certain and act at once.
+family. So a start acts at once, and a stop that a date or a clock decides
+(ARCHIVED, NOT_CURRENT) must have been decided on two consecutive sweeps.
+Retired, teardown and operator stops are certain and act at once. A /switch
+does not stop the trip it leaves: it becomes WARM for two days first.
 
 Every log line carries its facts in the message text (`log_fields`): the
 worker's format prints the message and drops `extra` (#292).
@@ -75,11 +79,9 @@ logger = logging.getLogger(__name__)
 # ── policy ────────────────────────────────────────────────────────────────────
 
 GRACE_DAYS = 14
-WAKE_DAYS = 2
+WARM_DAYS = 2
+REVIVE_DAYS = 2
 QUIET_HOURS = 6
-#: A DM binding opened or closed by /switch within this long is "just now": the
-#: sweep treats the organizer's own action as the confirmation of a stop.
-SWITCH_WINDOW_MINUTES = 30
 #: Consecutive sweeps a flap-prone stop must be decided before it is acted on.
 STOP_CONFIRMATIONS = 2
 MAX_ACTIONS_PER_SWEEP = 3
@@ -90,10 +92,6 @@ BREAKER_AFTER = 3
 EVENT_RETENTION_DAYS = 90
 STATEMENT_TIMEOUT_MS = 5000
 INTERVIEWER_PROFILE = "trip-intake"
-
-#: What to do with a trip whose family is in it but which is not its
-#: organizer's current trip. "keep" or "stop". See the module doc, rule 7.
-MIDTRIP_FAMILY_RULE = "keep"
 
 #: The advisory lock the sweep, the `--pin` CLI, teardown-trip.py and
 #: vm-release.py all take, by this exact text through hashtext(), so none of
@@ -110,13 +108,12 @@ PRE_PROVISIONING_STATES = (
     "planned", "provisioning_approved", "provisioning",
 )
 
-#: The relay's wake signal: a turn it could not hand to a gateway.
+#: The relay's revive signal: a turn it could not hand to a gateway.
 WAKE_OUTCOMES = ("lost_gateway_unavailable", "lost_companion_unreachable")
 
 REASONS = (
     "INTERVIEWER", "PIN_ON", "PIN_OFF", "TEARDOWN", "RETIRED",
-    "CURRENT_TRIP", "IN_WINDOW", "WAKE", "MIDTRIP_PROTECTED", "QUIET_WINDOW",
-    "NOT_CURRENT_TRIP", "TRIP_ENDED",
+    "CURRENT_TRIP", "WARM", "UNDERWAY", "REVIVED", "QUIET_WINDOW", "ARCHIVED", "NOT_CURRENT",
 )
 
 #: A reason that only HOLDS a running gateway: it never justifies starting one.
@@ -136,16 +133,15 @@ class GatewayFacts:
     pin: str | None = None               # 'on' | 'off' | 'teardown' | None
     start_date: date | None = None
     end_date: date | None = None
-    #: At least one organizer of this trip has an open private DM binding (to
-    #: ANY trip). When none does, nothing constrains this trip to one-per-organizer.
-    organizer_dm_known: bool = False
-    #: Some organizer's DM binding points at THIS trip.
+    #: Some organizer's open private-chat binding points at THIS trip.
     is_current: bool = False
-    #: An organizer's /switch closed the DM binding to this trip within
-    #: SWITCH_WINDOW_MINUTES: their own action, so no second sweep is needed.
-    switched_away: bool = False
-    has_group: bool = False
-    last_wake_at: datetime | None = None
+    #: When an organizer last stopped having this as their current trip (their
+    #: binding closed by /switch, or the chat bound elsewhere), within
+    #: WARM_DAYS; None if they did not.
+    warm_at: datetime | None = None
+    #: When the relay last lost a turn for this trip because no gateway took it
+    #: (a message to a stopped companion), within REVIVE_DAYS; None if none.
+    asked_at: datetime | None = None
     last_activity_at: datetime | None = None
 
 
@@ -161,9 +157,9 @@ class Decision:
 @dataclass(frozen=True)
 class Policy:
     grace_days: int = GRACE_DAYS
-    wake_days: int = WAKE_DAYS
+    warm_days: int = WARM_DAYS
+    revive_days: int = REVIVE_DAYS
     quiet_hours: int = QUIET_HOURS
-    midtrip_family_rule: str = MIDTRIP_FAMILY_RULE
 
 
 DEFAULT_POLICY = Policy()
@@ -183,26 +179,21 @@ def decide(facts: GatewayFacts, now: datetime, policy: Policy = DEFAULT_POLICY) 
         return Decision("stopped", "PIN_OFF")
 
     today = now.astimezone(timezone.utc).date()
-    midtrip = (
-        facts.start_date is not None and facts.end_date is not None
-        and facts.start_date <= today <= facts.end_date
-    )
-    window_open = facts.end_date is None or today <= facts.end_date + timedelta(days=policy.grace_days)
+    past_grace = facts.end_date is not None and today > facts.end_date + timedelta(days=policy.grace_days)
 
-    if facts.organizer_dm_known and not facts.is_current:
-        if facts.has_group and midtrip and policy.midtrip_family_rule == "keep":
-            return Decision("running", "MIDTRIP_PROTECTED")
-        base = Decision("stopped", "NOT_CURRENT_TRIP", needs_confirmation=not facts.switched_away)
-    elif not window_open:
-        base = Decision("stopped", "TRIP_ENDED", needs_confirmation=True)
-    else:
-        return Decision("running", "CURRENT_TRIP" if facts.is_current else "IN_WINDOW")
+    if facts.is_current and not past_grace:
+        return Decision("running", "CURRENT_TRIP")
+    if facts.warm_at is not None and now - facts.warm_at < timedelta(days=policy.warm_days):
+        return Decision("running", "WARM")
+    if facts.start_date is not None and facts.end_date is not None and facts.start_date <= today <= facts.end_date:
+        return Decision("running", "UNDERWAY")
+    if facts.asked_at is not None and now - facts.asked_at < timedelta(days=policy.revive_days):
+        return Decision("running", "REVIVED")
 
-    if facts.last_wake_at is not None and now - facts.last_wake_at < timedelta(days=policy.wake_days):
-        return Decision("running", "WAKE")
+    # A stop, held back for a conversation that is still warm.
     if facts.last_activity_at is not None and now - facts.last_activity_at < timedelta(hours=policy.quiet_hours):
         return Decision("running", "QUIET_WINDOW")
-    return base
+    return Decision("stopped", "ARCHIVED" if past_grace else "NOT_CURRENT", needs_confirmation=True)
 
 
 # ── what the host reports, and how it is asked ────────────────────────────────
@@ -366,7 +357,7 @@ WITH named AS (
     JOIN control_plane.telegram_organizer_links l ON l.user_id = m.user_id
    WHERE m.role IN ('owner', 'organizer') AND m.status = 'active'
 ), dm AS (
-  SELECT b.trip_id, b.created_at, b.closed_at, b.closed_reason,
+  SELECT b.chat_id, b.trip_id, b.created_at, b.closed_at, b.closed_reason,
          'sha256:' || encode(sha256(convert_to(b.chat_id, 'UTF8')), 'hex') AS digest
     FROM control_plane.telegram_chat_bindings b
     JOIN control_plane.trips bt ON bt.id = b.trip_id
@@ -379,18 +370,16 @@ SELECT p.profile, t.id AS trip_id, t.slug,
        t.start_date::text AS start_date, t.end_date::text AS end_date,
        t.plan_snapshot #>> '{meta,departure}' AS departure,
        t.plan_snapshot #>> '{meta,returnDate}' AS return_date,
-       EXISTS (SELECT 1 FROM org o JOIN dm ON dm.digest = o.digest AND dm.closed_at IS NULL
-                WHERE o.trip_id = t.id) AS organizer_dm_known,
        EXISTS (SELECT 1 FROM org o JOIN dm ON dm.digest = o.digest AND dm.closed_at IS NULL AND dm.trip_id = t.id
                 WHERE o.trip_id = t.id) AS is_current,
-       EXISTS (SELECT 1 FROM org o JOIN dm ON dm.digest = o.digest AND dm.trip_id = t.id
-                WHERE o.trip_id = t.id AND dm.closed_reason = 'organizer_switch'
-                  AND dm.closed_at > %(switch_since)s) AS switched_away,
-       EXISTS (SELECT 1 FROM control_plane.telegram_chat_bindings g
-                WHERE g.trip_id = t.id AND g.closed_at IS NULL AND g.chat_id !~ '^[0-9]{1,20}$') AS has_group,
+       (SELECT max(dm.closed_at) FROM org o JOIN dm ON dm.digest = o.digest AND dm.trip_id = t.id
+         WHERE o.trip_id = t.id AND dm.closed_at > %(warm_since)s
+           AND (dm.closed_reason = 'organizer_switch'
+                OR EXISTS (SELECT 1 FROM dm d2 WHERE d2.chat_id = dm.chat_id AND d2.trip_id <> dm.trip_id
+                            AND d2.created_at >= dm.closed_at - interval '1 minute'))) AS warm_at,
        (SELECT max(e.occurred_at) FROM control_plane.assistant_events e
          WHERE e.trip_id = t.id AND e.event_type = 'turn_lost' AND e.outcome = ANY(%(wake)s)
-           AND e.occurred_at > %(wake_since)s) AS last_wake_at,
+           AND e.occurred_at > %(revive_since)s) AS asked_at,
        (SELECT max(e.occurred_at) FROM control_plane.assistant_events e
          WHERE e.trip_id = t.id AND e.occurred_at > %(quiet_since)s) AS last_activity_at,
        g.pin
@@ -408,8 +397,8 @@ def load_facts(conn: Any, now: datetime, interviewer_profile: str = INTERVIEWER_
     rows = conn.execute(FACTS_SQL, {
         "pre": list(PRE_PROVISIONING_STATES),
         "wake": list(WAKE_OUTCOMES),
-        "switch_since": now - timedelta(minutes=SWITCH_WINDOW_MINUTES),
-        "wake_since": now - timedelta(days=policy.wake_days),
+        "revive_since": now - timedelta(days=policy.revive_days),
+        "warm_since": now - timedelta(days=policy.warm_days),
         "quiet_since": now - timedelta(hours=policy.quiet_hours),
     }).fetchall()
     out = [GatewayFacts(profile=interviewer_profile, kind="interviewer")]
@@ -421,9 +410,8 @@ def load_facts(conn: Any, now: datetime, interviewer_profile: str = INTERVIEWER_
             retired=bool(row["retired"]), pin=row["pin"],
             start_date=parse_date(row["departure"]) or parse_date(row["start_date"]),
             end_date=parse_date(row["return_date"]) or parse_date(row["end_date"]),
-            organizer_dm_known=bool(row["organizer_dm_known"]), is_current=bool(row["is_current"]),
-            switched_away=bool(row["switched_away"]), has_group=bool(row["has_group"]),
-            last_wake_at=row["last_wake_at"], last_activity_at=row["last_activity_at"],
+            is_current=bool(row["is_current"]), warm_at=row["warm_at"], asked_at=row["asked_at"],
+            last_activity_at=row["last_activity_at"],
         ))
     return out
 
@@ -494,7 +482,7 @@ class GatewayReconcileSweep:
         self._clock, self._now = clock, now_fn
         self._last: float | None = None
         self._last_hint_check: float | None = None
-        self._watermark: tuple[Any, Any, Any] | None = None
+        self._watermark: tuple[Any, Any] | None = None
         self._warned_blind = False
         self.enabled = mode != "off" and self._interval > 0 and can_reconcile(adapter)
 
@@ -503,7 +491,7 @@ class GatewayReconcileSweep:
     def describe(self) -> str:
         if self.enabled:
             return (f"gateway reconcile: {self.mode.upper()} every {self._interval / 60:g} min "
-                    f"(+ a switch/wake hint every {self._hint_seconds:g}s) over the companion forced command"
+                    f"(+ a switch/ask hint every {self._hint_seconds:g}s) over the companion forced command"
                     + (" — records and reports, acts on nothing" if self.mode == "observe" else ""))
         if self.mode == "off":
             return "gateway reconcile: OFF (--gateway-reconcile-mode off)"
@@ -564,14 +552,12 @@ class GatewayReconcileSweep:
         with self._connect() as conn:
             row = conn.execute(
                 """SELECT (SELECT max(created_at) FROM control_plane.telegram_chat_bindings) AS binding,
-                          (SELECT max(closed_at) FROM control_plane.telegram_chat_bindings
-                            WHERE closed_reason = 'organizer_switch') AS switched,
                           (SELECT max(occurred_at) FROM control_plane.assistant_events
                             WHERE event_type = 'turn_lost' AND outcome = ANY(%s)
                               AND occurred_at > now() - interval '3 days') AS lost""",
                 (list(WAKE_OUTCOMES),),
             ).fetchone()
-        mark = (row["binding"], row["switched"], row["lost"])
+        mark = (row["binding"], row["lost"])
         previous, self._watermark = self._watermark, mark
         return previous is not None and mark != previous
 

@@ -113,8 +113,8 @@ class GatewayRendering(unittest.TestCase):
     def overview_fixtures(self) -> list:
         return with_gateways(
             [SWEEP, [["observe", "ok", "3"]]],
-            [HEALTH, [["live", "RUNNING", "CURRENT_TRIP", "2"], ["live", "DORMANT", "NOT_CURRENT_TRIP", "3"],
-                      ["live", "DORMANT", "TRIP_ENDED", "4"], ["live", "PENDING_STOP", "NOT_CURRENT_TRIP", "1"],
+            [HEALTH, [["live", "RUNNING", "CURRENT_TRIP", "2"], ["live", "DORMANT", "NOT_CURRENT", "3"],
+                      ["live", "DORMANT", "ARCHIVED", "4"], ["live", "PENDING_STOP", "ARCHIVED", "1"],
                       ["live", "BROKEN", "CURRENT_TRIP", "1"], ["retired", "DORMANT", "RETIRED", "30"],
                       ["retired", "STRAY", "RETIRED", "1"]]],
             [ATTENTION_OVERVIEW, [["trip-a", "live", "BROKEN", "CURRENT_TRIP", "stopped", "3"],
@@ -128,7 +128,7 @@ class GatewayRendering(unittest.TestCase):
         self.assertIn("reconciler: observe, last sweep 3 min ago (ok)", section)
         self.assertIn("health: RUNNING=2, DORMANT=7, PENDING_STOP=1, BROKEN=1, STRAY=1", section,
                       "test debris (retired) is not counted as a healthy fleet, but a stray gateway is")
-        self.assertIn("dormant because: NOT_CURRENT_TRIP=3, TRIP_ENDED=4", section)
+        self.assertIn("dormant because: NOT_CURRENT=3, ARCHIVED=4", section)
         self.assertIn("NEEDS ATTENTION", section)
         self.assertIn("trip-a | BROKEN | CURRENT_TRIP | stopped | 3", section)
         self.assertIn("old-trip | STRAY | RETIRED | running | 0", section)
@@ -154,14 +154,14 @@ class GatewayRendering(unittest.TestCase):
     def test_a_gateway_that_should_be_up_and_is_not_is_an_alert_and_a_dormant_one_never_is(self) -> None:
         fx = with_gateways([ATTENTION_ALERTS, [
             ["trip-a", "BROKEN", "CURRENT_TRIP", "stopped", "0"],
-            ["trip-b", "BROKEN", "IN_WINDOW", "absent", "3"],
+            ["trip-b", "BROKEN", "CURRENT_TRIP", "absent", "3"],
             ["old-1", "STRAY", "RETIRED", "running", "0"],
             ["trip-c", "DUPLICATE", "CURRENT_TRIP", "duplicate", "0"]]])
         text, is_error = self.tool("alerts", fixtures=fx)
         self.assertFalse(is_error, text)
         self.assertIn("COMPANION GATEWAY\n"
                       "  • trip-a — companion gateway is down but should be running (CURRENT_TRIP): the host reports it stopped\n"
-                      "  • trip-b — companion gateway is down but should be running (IN_WINDOW): the host reports it absent; "
+                      "  • trip-b — companion gateway is down but should be running (CURRENT_TRIP): the host reports it absent; "
                       "3 start attempt(s) failed\n"
                       "  • old-1 — a gateway is still running although this trip was torn down (RETIRED)\n"
                       "  • trip-c — two independent gateway processes are running for one companion", text)
@@ -212,16 +212,16 @@ class GatewayRendering(unittest.TestCase):
     def test_trip_detail_says_what_was_decided_what_the_host_said_and_what_changed(self) -> None:
         fx = with_gateways(
             ["coalesce(t.destination_label,'-')", [self.HEAD]],
-            [DETAIL, [["DORMANT", "stopped", "NOT_CURRENT_TRIP", "stopped", "0", "2026-10-21 08:00 UTC", "-",
+            [DETAIL, [["DORMANT", "stopped", "ARCHIVED", "stopped", "0", "2026-10-21 08:00 UTC", "-",
                        "stop ok", "10-21 08:05 UTC", "0", "-", "10-21 08:10 UTC"]]],
             [DETAIL_EVENTS, [["10-21 08:05 UTC", "ACTION", "-", "-", "-", "stop", "ok", "-"],
-                             ["10-21 08:00 UTC", "DECIDED", "stopped", "NOT_CURRENT_TRIP", "-", "-", "-", "-"]]],
+                             ["10-21 08:00 UTC", "DECIDED", "stopped", "ARCHIVED", "-", "-", "-", "-"]]],
         )
         text, is_error = self.tool("trip_detail", {"trip": "japan-2026"}, fixtures=fx)
         self.assertFalse(is_error, text)
         section = text.split("COMPANION GATEWAY")[1]
         self.assertIn("dormant = stopped on purpose, broken = should be up and is not", section)
-        self.assertIn("DORMANT | stopped | NOT_CURRENT_TRIP | stopped (0)", section)
+        self.assertIn("DORMANT | stopped | ARCHIVED | stopped (0)", section)
         self.assertIn("10-21 08:05 UTC | ACTION | - | - | - | stop | ok | -", section)
 
     def test_a_trip_with_no_decision_yet_says_so(self) -> None:
@@ -351,15 +351,15 @@ class GatewayHealthAgainstPostgres(unittest.TestCase):
         self.sweep()
         cases = {
             "RUNNING": dict(desired="running", reason="CURRENT_TRIP", observed="running"),
-            "DORMANT": dict(desired="stopped", reason="NOT_CURRENT_TRIP", observed="stopped"),
+            "DORMANT": dict(desired="stopped", reason="ARCHIVED", observed="stopped"),
             "DORMANT-absent": dict(desired="stopped", reason="RETIRED", observed="absent"),
             "DORMANT-hold": dict(desired="running", reason="QUIET_WINDOW", observed="stopped", decided_ago=120),
-            "PENDING_STOP": dict(desired="stopped", reason="NOT_CURRENT_TRIP", observed="running"),
+            "PENDING_STOP": dict(desired="stopped", reason="ARCHIVED", observed="running"),
             "STRAY": dict(desired="stopped", reason="RETIRED", observed="running"),
             "STRAY-teardown": dict(desired="stopped", reason="TEARDOWN", observed="running"),
             "DUPLICATE": dict(desired="running", reason="CURRENT_TRIP", observed="duplicate"),
             "BROKEN": dict(desired="running", reason="CURRENT_TRIP", observed="stopped", decided_ago=20),
-            "BROKEN-absent": dict(desired="running", reason="IN_WINDOW", observed="absent", decided_ago=20),
+            "BROKEN-absent": dict(desired="running", reason="CURRENT_TRIP", observed="absent", decided_ago=20),
             "BROKEN-failures": dict(desired="running", reason="CURRENT_TRIP", observed="stopped", decided_ago=2, failures=3),
             "STARTING": dict(desired="running", reason="CURRENT_TRIP", observed="stopped", decided_ago=2, failures=2),
             "UNOBSERVED": dict(desired="running", reason="CURRENT_TRIP", observed=None),
@@ -373,7 +373,7 @@ class GatewayHealthAgainstPostgres(unittest.TestCase):
         self.sweep(ago_minutes=45)
         self.sweep(ago_minutes=1, result="host_unreachable")
         slugs = [self.gateway("a", desired="running", reason="CURRENT_TRIP", observed="running"),
-                 self.gateway("b", desired="stopped", reason="NOT_CURRENT_TRIP", observed="stopped"),
+                 self.gateway("b", desired="stopped", reason="ARCHIVED", observed="stopped"),
                  self.gateway("c", desired="stopped", reason="RETIRED", observed="running")]
         for slug in slugs:
             self.assertEqual(self.health_of(slug), "UNOBSERVED", slug)
@@ -384,8 +384,8 @@ class GatewayHealthAgainstPostgres(unittest.TestCase):
     def test_alerts_name_what_needs_a_person_and_nothing_that_was_on_purpose(self) -> None:
         self.sweep()
         up = self.gateway("up", desired="running", reason="CURRENT_TRIP", observed="running")
-        dormant = self.gateway("dormant", desired="stopped", reason="TRIP_ENDED", observed="stopped")
-        pending = self.gateway("pending", desired="stopped", reason="NOT_CURRENT_TRIP", observed="running")
+        dormant = self.gateway("dormant", desired="stopped", reason="ARCHIVED", observed="stopped")
+        pending = self.gateway("pending", desired="stopped", reason="ARCHIVED", observed="running")
         broken = self.gateway("broken", desired="running", reason="CURRENT_TRIP", observed="stopped", decided_ago=30,
                               failures=1)
         stray = self.gateway("stray", desired="stopped", reason="RETIRED", observed="running",
@@ -402,7 +402,7 @@ class GatewayHealthAgainstPostgres(unittest.TestCase):
     def test_the_overview_counts_them(self) -> None:
         self.sweep()
         self.gateway("one", desired="running", reason="CURRENT_TRIP", observed="running")
-        self.gateway("two", desired="stopped", reason="NOT_CURRENT_TRIP", observed="stopped")
+        self.gateway("two", desired="stopped", reason="ARCHIVED", observed="stopped")
         text = self.tool("fleet_overview")
         self.assertIn("COMPANION GATEWAYS", text)
         self.assertRegex(text, r"reconciler: observe, last sweep \d+ min ago \(ok\)")
