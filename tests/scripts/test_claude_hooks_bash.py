@@ -17,9 +17,13 @@ import os
 import shutil
 import subprocess
 import tempfile
+import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
+# tests/scripts has no __init__.py; make sibling imports work under any runner.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 REPO = Path(__file__).resolve().parents[2]
 GIT_ID = ["-c", "user.name=t", "-c", "user.email=t@example.invalid"]
 
@@ -34,7 +38,8 @@ class Harness(unittest.TestCase):
             shutil.copy2(REPO / "scripts" / name, self.root / "scripts" / name)
         for name in ("pretooluse-bash.sh", "match-command.py"):
             shutil.copy2(REPO / "scripts/claude-hooks" / name, self.root / "scripts/claude-hooks" / name)
-        self.env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        # Never the developer's own notes folder (a synced, slow share on some machines): see NotesDirIsNeverTheDevelopersOwn.
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_") and k != "KINERARY_NOTES_DIR"}
         self.env["HERMES_HOME"] = self.hermes.name
         self.log = self.root.parent / (self.root.name + "-decisions.tsv")
         self.env["KINERARY_HOOK_LOG"] = str(self.log)  # never the real log
@@ -51,6 +56,48 @@ class Harness(unittest.TestCase):
         out = subprocess.run(["bash", "scripts/claude-hooks/pretooluse-bash.sh"], cwd=self.root, env=self.env,
                              input=json.dumps(payload), capture_output=True, text=True, timeout=120).stdout.strip()
         return json.loads(out)["hookSpecificOutput"] if out else {}
+
+
+class NotesDirIsNeverTheDevelopersOwn(unittest.TestCase):
+    """2026-10-20: the nightly preflight failed on test_codex_hook_adapter because the
+    harness handed the hook the developer's real KINERARY_NOTES_DIR (a synced network-backed folder
+    on some machines), and a deploy-class command makes pretooluse-bash.sh read
+    $KINERARY_NOTES_DIR/regression-plans inside the adapter's 20s budget. A suite's result
+    must not depend on whose machine it runs on, so the harness env never carries it
+    (test_notes_dir.py sets its own, pointed at a temp fixture, where that is the point)."""
+
+    def setUp(self):
+        self.parent = tempfile.TemporaryDirectory()
+        self.addCleanup(self.parent.cleanup)
+        plans = Path(self.parent.name) / "regression-plans"
+        plans.mkdir()
+        # A FIFO named like a plan: grep opening it blocks forever, as a stalled network read would.
+        os.mkfifo(plans / "regression-plan-sentinel.md")
+        patcher = unittest.mock.patch.dict(os.environ, {"KINERARY_NOTES_DIR": self.parent.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def harness(self, cls):
+        h = cls("setUp")
+        h.setUp()
+        self.addCleanup(h.tmp.cleanup)
+        self.addCleanup(h.hermes.cleanup)
+        return h
+
+    def test_every_hook_harness_scrubs_the_parents_notes_dir(self):
+        import test_preflight_project_state as pps
+        for cls in (Harness, pps.Harness):
+            with self.subTest(harness=cls.__module__):
+                self.assertNotIn("KINERARY_NOTES_DIR", self.harness(cls).env)
+
+    def test_a_deploy_prompt_does_not_read_the_parents_notes_dir(self):
+        h = self.harness(Harness)
+        self.addCleanup(h.log.unlink, missing_ok=True)
+        out = subprocess.run(
+            ["bash", "scripts/claude-hooks/pretooluse-bash.sh"], cwd=h.root, env=h.env,
+            input=json.dumps({"tool_name": "Bash", "tool_input": {"command": "docker compose up -d --build"}}),
+            capture_output=True, text=True, timeout=30).stdout.strip()  # a read of the FIFO would hang
+        self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "ask")
 
 
 class EveryDecisionIsCounted(Harness):
