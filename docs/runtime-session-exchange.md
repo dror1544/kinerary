@@ -181,8 +181,24 @@ removal from the trip or disabling the account ends them all. A grant minted
 before the column existed carries no session (`NULL`) and keeps the earlier rule
 (any live portal session of the person) until it expires, 90 s, so a rollback of
 the portal is compatible. The column is deliberately not a foreign key: a
-deleted session must answer "no", not be rewritten to `NULL`. A stream already
-open ends at its next reconnect.
+deleted session must answer "no", not be rewritten to `NULL`. A live-update
+(`text/event-stream`) response is asked about again while it is open, every half
+cache window (15 s with the defaults), and is ended on the first "no": a stream
+held open would otherwise carry the trip's data to a signed-out device for as long
+as the 12-hour cookie (`endStreamWhenSessionEnds`; before 2026-10-20 it ended only
+at its next reconnect). The browser then reconnects with its backoff and the new
+connection is refused like any other request. A page that is already drawn stays
+drawn until its next request (its minute-by-minute refresh, or any click), which
+answers 401 and shows the sign-in; that is the window to expect when checking a
+sign-out by eye, together with the up-to-30-second cached answer.
+
+**Silent drops are logged.** An owner or organizer whose dashboard link does not
+make it into the session shows no "Organizer dashboard" entry and no error. The
+gateway logs `runtime_gateway.dashboard_url_dropped: trip=… role=… reason=absent|
+not_this_portals_setup_page|unparseable expected_origin=… [received_origin=…]` when
+it drops one, and the trip logs `control_plane.session_without_dashboard_url:
+role=… reason=not_sent|rejected` when it mints an owner/organizer session without
+one. Neither prints the URL, a grant or a token. Both lines appear once per launch.
 
 Every call the gateway makes to the control plane or a trip carries a timeout
 (5 s; `RUNTIME_UPSTREAM_TIMEOUT_MS`), so a hung service fails closed quickly: the
@@ -225,7 +241,7 @@ covers a non-owner organizer and a demoted one.
 
 `tests/runtime-logout.test.js` covers shared browser logout, failure behavior and
 the per-trip storage scoping; `control-plane/runtime-gateway/test/gateway.test.js`
-covers the Origin/content-type rules, replay, the portal redirect and the
-liveness check; `web/src/pages/runtime-launcher.test.tsx` covers the form POST,
+covers the Origin/content-type rules, replay, the portal redirect, the
+liveness check, the re-check of an open stream and the dropped-dashboard log line; `web/src/pages/runtime-launcher.test.tsx` covers the form POST,
 the back/forward guard and a source guard that no iframe or message hand-off
 remains. No deployment or live-account migration is implied by these local checks.

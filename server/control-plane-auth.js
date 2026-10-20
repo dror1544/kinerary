@@ -109,6 +109,12 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
     // Signed into the session, so it can only come from the exchange-key holder
     // and only an owner/organizer carries it. A member's token never does.
     const dashboard = ['owner', 'organizer'].includes(role) ? safeDashboardUrl(dashboardUrl, identity.tripId) : null;
+    // An owner or organizer minted without the link opens a trip with no way
+    // back to the dashboard and nothing to say why (staging, 2026-10-20). Say
+    // which of the two it was; never the value, which is not ours to echo.
+    if (['owner', 'organizer'].includes(role) && !dashboard) {
+      console.warn(`control_plane.session_without_dashboard_url: role=${role} reason=${dashboardUrl === undefined || dashboardUrl === null ? 'not_sent' : 'rejected'}`);
+    }
     const controlPlane = { userId, tripId: identity.tripId, role, ...(dashboard ? { dashboardUrl: dashboard } : {}) };
     const token = jwt.sign({ username: row.username, controlPlane }, jwtSecret, { expiresIn: '12h' });
     return res.json({ token });

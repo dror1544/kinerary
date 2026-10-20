@@ -106,3 +106,20 @@ test('a hostile href is rejected at mint and again at read', async () => {
     assert.equal(auth.dashboardUrlFor({ userId: ids.owner, tripId, role: 'owner', dashboardUrl: other }, 'alice'), null, other);
   }
 });
+
+test('an owner or organizer minted without the link is logged, with the reason and never the value; a member is not', async () => {
+  const lines = [];
+  const original = console.warn;
+  console.warn = (...args) => lines.push(args.join(' '));
+  try {
+    await mint(ids.owner, 'owner');                                                    // gateway sent nothing
+    await mint(ids.organizer, 'organizer', { dashboardUrl: 'https://evil.example/x' }); // sent, refused
+    await mint(ids.owner, 'owner', { dashboardUrl: DASHBOARD });                       // fine: silent
+    await mint(ids.member, 'member', { runtimeUsername: 'bob' });                      // members never have one: silent
+  } finally { console.warn = original; }
+  assert.deepEqual(lines, [
+    'control_plane.session_without_dashboard_url: role=owner reason=not_sent',
+    'control_plane.session_without_dashboard_url: role=organizer reason=rejected',
+  ]);
+  assert.ok(!lines.join('').includes('evil.example'));
+});

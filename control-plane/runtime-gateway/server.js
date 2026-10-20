@@ -173,6 +173,20 @@ async function sessionLive(session) {
   return true;
 }
 
+// An owner or organizer whose way back to the dashboard did not survive the pin
+// opens a trip with no "Organizer dashboard" menu entry and nothing anywhere
+// saying why (2026-10-20, staging acceptance). Say so, once per launch: the
+// reason and the origins, never the grant, a token or a cookie.
+function logDashboardDropped(tripId, grant) {
+  let reason = "absent";
+  let received = "";
+  if (typeof grant.dashboardUrl === "string") {
+    reason = "not_this_portals_setup_page";
+    try { received = ` received_origin=${new URL(grant.dashboardUrl).origin}`; } catch { reason = "unparseable"; }
+  }
+  console.error(`runtime_gateway.dashboard_url_dropped: trip=${tripId} role=${grant.role} reason=${reason} expected_origin=${PORTAL_ORIGIN}${received}`);
+}
+
 async function launch(req, res, tripId) {
   // A cross-site form POST carries no cookie of ours and no custom header, so
   // Origin is the only thing that says the portal sent it. Missing, "null"
@@ -200,6 +214,7 @@ async function launch(req, res, tripId) {
   // Only this deployment's own portal can be the way back: the URL must be exactly
   // PORTAL_ORIGIN + the trip's setup path, whatever the control plane sent.
   if (grant.dashboardUrl === `${PORTAL_ORIGIN}/trips/${tripId}/setup`) identity.dashboardUrl = grant.dashboardUrl;
+  else if (grant.role === "owner" || grant.role === "organizer") logDashboardDropped(tripId, grant);
   const sessionResponse = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/session`, {
     method: "POST", headers: { "content-type": "application/json", "x-api-key": EXCHANGE_KEY },
     body: JSON.stringify(identity),
@@ -244,6 +259,28 @@ async function participantExists(req, res, tripId, runtimeUsername) {
   res.end(payload);
 }
 
+// Ask again while a stream is open, at half the cache window so a revocation
+// is seen within one window after the cached "live" runs out (30 s + 15 s with
+// the defaults). A negative answer, an outage and a hung control plane all end
+// the stream, as they end a request: the browser reconnects with its backoff and
+// the connection itself is then refused with the rest.
+function endStreamWhenSessionEnds(res, upstream, session) {
+  const every = Math.max(250, Math.min(15_000, Math.floor(LIVE_FOR_MS / 2) || 1_000));
+  let asking = false;
+  const timer = setInterval(async () => {
+    if (asking) return;
+    asking = true;
+    try {
+      if (await sessionLive(session)) return;
+    } finally { asking = false; }
+    clearInterval(timer);
+    upstream.destroy();
+    res.destroy();
+  }, every);
+  timer.unref?.();
+  res.on("close", () => clearInterval(timer));
+}
+
 async function proxy(req, res, tripId, suffix, session) {
   const route = await routeFor(tripId);
   const origin = new URL(route.upstreamOrigin);
@@ -266,6 +303,10 @@ async function proxy(req, res, tripId, suffix, session) {
     if (typeof responseHeaders.location === "string" && responseHeaders.location.startsWith("/")) responseHeaders.location = `/t/${tripId}${responseHeaders.location}`;
     res.writeHead(upstreamResponse.statusCode || 502, responseHeaders);
     upstreamResponse.pipe(res);
+    // The check above ran once, when this request began. A live-update stream
+    // can then stay open for the whole 12-hour cookie, so signing out of the
+    // portal would end every request except the one carrying the trip's data.
+    if (String(responseHeaders["content-type"] || "").toLowerCase().startsWith("text/event-stream")) endStreamWhenSessionEnds(res, upstream, session);
   });
   upstream.on("error", () => { if (!res.headersSent) json(res, 502, { error: "RUNTIME_UNAVAILABLE" }); else res.destroy(); });
   // A closed browser must also release its long-lived upstream SSE stream.
