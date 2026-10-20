@@ -27,6 +27,13 @@
 // computation. A config without it (hand-authored, or provisioned with every
 // day covered) is served as authored: the layer never invents the convention.
 //
+// PLANNING OPEN DAYS IS ONE ACTION. ops.create (POST /api/stops, issue #133)
+// puts a new stop into a gap together with its hotel, day headlines and plan
+// items, validated as a whole and written in one transaction: the owner's
+// requirement (2026-09-20) is one approval, one completed action, never a stop
+// without its plan. Coverage (which days a stop holds) is computed from the stops
+// themselves, so it works on a trip with no open-days marker too.
+//
 // EMPTY LAYER = THE CONFIG. With no override row and no unplanned phase the
 // base object itself is returned; with unplanned phases and nothing changed,
 // the recomputation reproduces the provisioner's output byte for byte
@@ -149,6 +156,22 @@ const STRIP_LINE_RE = new RegExp(UNSAFE_LINE_RE.source, 'gu');
 const STRIP_MULTILINE_RE = new RegExp(UNSAFE_MULTILINE_RE.source, 'gu');
 const FLAG_SPLIT_RE = new RegExp(`(${FLAG_TAG_SRC})`, 'u');
 const STOP_FIELDS = ['dates', 'accommodation', 'title', 'tabLabel', 'emoji'];
+// ── planning the open days in one action (issue #133) ────────────────────────
+// What a plan item sent with POST /api/stops may carry — the add-item routes'
+// own fields (server/living-journey.js), minus the ones an item written WITH a
+// stop has no use for (a booking link, a sort order). Unlike those routes, an
+// unknown value is refused, not quietly turned into a default: the whole action
+// is one approval, and a half-understood item is a reason to ask again.
+const NEW_STOP_KEYS = ['dates', 'title', 'tabLabel', 'emoji', 'accommodation', 'id', 'items', 'days'];
+const NEW_ITEM_KEYS = ['date', 'time', 'text_he', 'text_en', 'item_type', 'location_url', 'status'];
+const NEW_DAY_KEYS = ['date', 'label_he', 'label_en'];
+const ITEM_TYPES = new Set(['travel', 'activity', 'meal', 'lodging', 'free_time', 'booking', 'task', 'note']);
+const HHMM_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+const ROUGH_TIMES = { morning: 9 * 60, noon: 12 * 60, afternoon: 15 * 60, evening: 19 * 60 };
+const MAX_NEW_ITEMS = 200;
+const MAX_ITEM_TEXT = 500;
+const MAX_DAY_LABEL = 120;
+
 const OPEN_TITLE = { he: 'ימים שעוד לא תוכננו', en: 'Days not planned yet' };
 // The same sentence the provisioner writes, so an unchanged trip serves
 // byte-identical text — but the number now comes from the computation.
@@ -475,6 +498,95 @@ function recheckSnapshot(fields, historyId) {
   return { fields: out };
 }
 
+// The plan items of a new stop, checked as a whole before anything is written:
+// { items } (normalised, in the order given) or { error } naming the item by its
+// position. `range` is the new stop's { start, end }; an item on another day
+// would be filed on a stop that does not hold it.
+function validateNewItems(value, range) {
+  if (value === undefined) return { items: [] };
+  if (!Array.isArray(value) || value.length > MAX_NEW_ITEMS) {
+    return { error: fail(400, 'invalid_items', { detail: `items is a list of at most ${MAX_NEW_ITEMS} plan items` }) };
+  }
+  const items = [];
+  for (const [index, given] of value.entries()) {
+    const at = (field) => `items[${index}].${field}`;
+    const bad = (field, detail) => ({ error: fail(400, 'invalid_item', { index, field: at(field), detail }) });
+    if (!isObj(given)) return { error: fail(400, 'invalid_item', { index, detail: 'an item is an object' }) };
+    for (const key of Object.keys(given)) {
+      if (!NEW_ITEM_KEYS.includes(key)) return { error: fail(400, 'unknown_field', { index, field: at(key) }) };
+    }
+    const date = inputDay(given.date);
+    if (!date) return bad('date', 'date is required: YYYY-MM-DD, a real calendar day');
+    if (date < range.start || date > range.end) return { error: fail(400, 'item_outside_stop', { index, date, stop: range }) };
+    const text = {};
+    for (const key of ['text_he', 'text_en']) {
+      const v = given[key];
+      if (v === undefined || v === null) { text[key] = null; continue; }
+      if (typeof v !== 'string' || v.length > MAX_ITEM_TEXT) return bad(key, `text up to ${MAX_ITEM_TEXT} characters`);
+      const unsafe = unsafeTextAt(v, at(key));
+      if (unsafe) return { error: invalidText(unsafe) };
+      text[key] = isBlankText(v) ? null : v.trim();
+    }
+    if (text.text_he === null) return bad('text_he', 'text_he is required');
+    let time = null;
+    if (given.time !== undefined && given.time !== null && given.time !== '') {
+      if (typeof given.time !== 'string' || !(HHMM_RE.test(given.time.trim()) || Object.hasOwn(ROUGH_TIMES, given.time.trim()))) {
+        return bad('time', 'time is HH:MM (24-hour), or morning, noon, afternoon or evening');
+      }
+      time = given.time.trim();
+    }
+    const timeSort = time === null ? null : HHMM_RE.test(time) ? Number(time.slice(0, 2)) * 60 + Number(time.slice(3)) : ROUGH_TIMES[time];
+    const itemType = given.item_type === undefined || given.item_type === null ? 'activity' : given.item_type;
+    if (typeof itemType !== 'string' || !ITEM_TYPES.has(itemType)) return bad('item_type', `item_type is one of ${[...ITEM_TYPES].join(', ')}`);
+    let locationUrl = null;
+    if (given.location_url !== undefined && given.location_url !== null && given.location_url !== '') {
+      locationUrl = safeLink(given.location_url);
+      if (locationUrl === undefined) return { error: fail(400, 'invalid_link', { index, field: at('location_url'), detail: LINK_DETAIL }) };
+    }
+    const status = given.status === undefined || given.status === null ? 'confirmed' : given.status;
+    if (status !== 'confirmed' && status !== 'needs_review') return bad('status', 'status is confirmed or needs_review');
+    items.push({
+      date, time, time_sort: timeSort, item_type: itemType, text_he: text.text_he, text_en: text.text_en,
+      location_url: locationUrl, confirmation_state: status === 'confirmed' ? 'verified' : 'needs_review',
+    });
+  }
+  return { items };
+}
+
+// The headlines of the new stop's days: [{ date, label_he, label_en }].
+function validateNewDays(value, range) {
+  if (value === undefined) return { days: [] };
+  if (!Array.isArray(value) || value.length > MAX_NEW_ITEMS) {
+    return { error: fail(400, 'invalid_days', { detail: `days is a list of at most ${MAX_NEW_ITEMS} day headlines` }) };
+  }
+  const days = [];
+  const seen = new Set();
+  for (const [index, given] of value.entries()) {
+    const at = (field) => `days[${index}].${field}`;
+    const bad = (field, detail) => ({ error: fail(400, 'invalid_day', { index, field: at(field), detail }) });
+    if (!isObj(given)) return { error: fail(400, 'invalid_day', { index, detail: 'a day is an object' }) };
+    for (const key of Object.keys(given)) {
+      if (!NEW_DAY_KEYS.includes(key)) return { error: fail(400, 'unknown_field', { index, field: at(key) }) };
+    }
+    const date = inputDay(given.date);
+    if (!date || date < range.start || date > range.end) return bad('date', `a day of the new stop (${range.start} to ${range.end})`);
+    if (seen.has(date)) return bad('date', 'each day is given once');
+    seen.add(date);
+    const label = {};
+    for (const key of ['label_he', 'label_en']) {
+      const v = given[key];
+      if (v === undefined || v === null || v === '') { label[key] = null; continue; }
+      if (typeof v !== 'string' || v.length > MAX_DAY_LABEL) return bad(key, `text up to ${MAX_DAY_LABEL} characters`);
+      const unsafe = unsafeTextAt(v, at(key));
+      if (unsafe) return { error: invalidText(unsafe) };
+      label[key] = isBlankText(v) ? null : v.trim();
+    }
+    if (label.label_he === null && label.label_en === null) return bad('label_he', 'a headline needs label_he and/or label_en');
+    days.push({ date, ...label });
+  }
+  return { days };
+}
+
 function slugify(text) {
   return String(text || '').toLowerCase().normalize('NFKD').replace(/[̀-ͯ]/g, '')
     .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
@@ -603,24 +715,34 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
       if (o.kind !== 'added' || baseIds.has(o.phase_id)) continue;
       const at = list.findIndex(p => p?.id === o.after_phase_id);
       const phase = addedPhase(o.phase_id, o.fields);
-      if (at >= 0) list.splice(at + 1, 0, phase); else list.push(phase);
+      if (at >= 0) list.splice(at + 1, 0, phase);
+      else if (!o.after_phase_id) {
+        // A stop created in a gap (ops.create) hangs on no other stop: it takes
+        // its place by date, before the first stop that starts later.
+        const start = phaseDates(phase)?.start;
+        const later = start ? list.findIndex(p => !isUnplanned(p) && phaseDates(p)?.start > start) : -1;
+        if (later >= 0) list.splice(later, 0, phase); else list.push(phase);
+      } else list.push(phase);
     }
     const realIds = new Set(list.filter(p => !isUnplanned(p)).map(p => p?.id));
     if (measurable) list = withOpenDays(list, basePhases, realIds, range);
     return { config: { ...cfg, phases: list }, realIds };
   }
 
-  function withOpenDays(list, basePhases, realIds, range) {
-    const covered = new Set();
+  // Every day some real stop holds, as Map<day, stop id>: the days a stop's
+  // dates span, and the days the active plan has on a REAL stop even when that
+  // stop has no dates yet. A day planned under an open-days phase is still a day
+  // no stop has claimed. "Planned" means an item or a headline: an empty day
+  // row (what a moved item leaves behind) is not a plan. Computed open-days
+  // phases in `list` are not stops and cover nothing.
+  function coveredDays(list, realIds) {
+    const covered = new Map();
     for (const phase of list) {
+      if (isUnplanned(phase)) continue;
       const d = phaseDates(phase);
       if (!d) continue;
-      for (let day = d.start; day <= d.end; day = addDays(day, 1)) covered.add(day);
+      for (let day = d.start; day <= d.end; day = addDays(day, 1)) if (!covered.has(day)) covered.set(day, phase.id);
     }
-    // A day the active plan has on a REAL stop belongs to the trip's structure
-    // even when that stop has no dates yet. A day planned under an open-days
-    // phase is still a day no stop has claimed. "Planned" means an item or a
-    // headline: an empty day row (what a moved item leaves behind) is not a plan.
     const rows = rowsOf();
     const planned = [
       ...(rows.items || []),
@@ -628,8 +750,12 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
     ];
     for (const entry of planned) {
       const day = isoDay(entry?.date);
-      if (day && realIds.has(entry.phase_id)) covered.add(day);
+      if (day && realIds.has(entry.phase_id) && !covered.has(day)) covered.set(day, entry.phase_id);
     }
+    return covered;
+  }
+  // The uncovered stretches of the trip, in order.
+  function gapsOf(covered, range) {
     const gaps = [];
     for (let day = range.start; day <= range.end; day = addDays(day, 1)) {
       if (covered.has(day)) continue;
@@ -637,6 +763,11 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
       if (last && last.end === addDays(day, -1)) last.end = day, last.days++;
       else gaps.push({ start: day, end: day, days: 1 });
     }
+    return gaps;
+  }
+
+  function withOpenDays(list, basePhases, realIds, range) {
+    const gaps = gapsOf(coveredDays(list, realIds), range);
     const baseOpen = new Map(basePhases.filter(isUnplanned).map(p => [p.id, p]));
     const out = [...list];
     gaps.forEach((gap, i) => {
@@ -981,6 +1112,119 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
         return { status: 201, body: {
           revision: revision(), itinerary_revision: itineraryRevision,
           stops: [stopSummary(id), stopSummary(newId)], moved, review: reviewInfo([id, newId]),
+        } };
+      });
+    },
+
+    // PLAN THE OPEN DAYS (issue #133): a new stop in a gap, with its hotel, its
+    // day headlines and its plan items, as ONE action. The owner's requirement
+    // (2026-09-20) is that an approved change "execute immediately as one
+    // completed action": the stop and its itinerary together, never one without
+    // the other. Everything is checked first, against the trip as it stands —
+    // the days are inside the trip, none of them is held by a stop, every item
+    // falls on one of them — and then the override, its history and the
+    // itinerary revision are written in one transaction (atomically()). A
+    // refusal, and a failure half-way, both leave the trip exactly as it was.
+    create(body, actor, ifMatch) {
+      if (!isObj(body)) return fail(400, 'invalid_body');
+      for (const key of Object.keys(body)) if (!NEW_STOP_KEYS.includes(key)) return fail(400, 'unknown_field', { field: key });
+      if (body.dates === undefined || body.dates === null) return fail(400, 'dates_required');
+      if (body.title === undefined) return fail(400, 'title_required');
+      const { items: _items, days: _days, id: wantedId, ...stopBody } = body;
+      const v = validateStopFields(stopBody, { allowed: ['dates', 'title', 'tabLabel', 'emoji', 'accommodation'] });
+      if (v.error) return v.error;
+      const trip = tripRange(base());
+      // Without the trip's own dates there is nothing to measure a gap against.
+      if (!trip.start || !trip.end || trip.start > trip.end) return fail(400, 'trip_has_no_dates');
+      const dates = v.fields.dates;
+      const outsideTrip = rangeError(dates);
+      if (outsideTrip) return outsideTrip;
+      const covered = coveredDays(effectiveConfig().phases || [], current().realIds);
+      const held = [];
+      for (let day = dates.start; day <= dates.end; day = addDays(day, 1)) if (covered.has(day)) held.push(day);
+      if (held.length) {
+        return fail(409, 'dates_overlap_stop', {
+          stop: covered.get(held[0]), days: held.slice(0, 10),
+          open_days: gapsOf(covered, trip).map(({ start, end }) => ({ start, end })),
+        });
+      }
+      const given = validateNewItems(body.items, dates);
+      if (given.error) return given.error;
+      const headlines = validateNewDays(body.days, dates);
+      if (headlines.error) return headlines.error;
+      let newId;
+      if (wantedId !== undefined) {
+        if (typeof wantedId !== 'string' || !STOP_ID_RE.test(wantedId) || /^open-days/.test(wantedId)) return fail(400, 'invalid_stop_id');
+        if (isReservedStopId(wantedId)) return fail(400, 'invalid_stop_id', { detail: 'a reserved name' });
+        if (isPhase(wantedId) || q.override.get(wantedId)) return fail(409, 'stop_id_taken');
+        newId = wantedId;
+      } else {
+        const title = v.fields.title;
+        const seed = slugify(typeof title === 'string' ? title : title.en || '') || `stop-${dates.start}`;
+        const root = /^open-days/.test(seed) || isReservedStopId(seed) ? `stop-${dates.start}` : seed;
+        newId = root;
+        for (let n = 2; isPhase(newId) || q.override.get(newId); n++) newId = `${root}-${n}`;
+      }
+      if (!revisionMatches(ifMatch)) return stale();
+      // Plan rows already filed under the open days on these dates (somebody
+      // had started planning them) belong to the stop that now holds the day;
+      // left behind they would be reachable but shown nowhere.
+      const stray = new Map();
+      const rows = rowsOf();
+      for (const entry of [...(rows.items || []), ...((rows.days || []).filter(d => d?.label_he || d?.label_en))]) {
+        const day = isoDay(entry?.date);
+        if (!day || day < dates.start || day > dates.end) continue;
+        if (typeof entry.phase_id === 'string' && isComputed(entry.phase_id) && !isStop(entry.phase_id)) stray.set(`${entry.phase_id}\u001f${day}`, { from: entry.phase_id, date: day });
+      }
+      return atomically(() => {
+        write(newId, {
+          kind: 'added', fields: v.fields, after_phase_id: null, base_digest: {}, booking_id: null,
+        }, 'create', actor, `planned open days ${dates.start} to ${dates.end}`);
+        cache = null;
+        const created = [];
+        const moved = { items: [], days: [] };
+        let itineraryRevision = null;
+        if (stray.size || given.items.length || headlines.days.length) {
+          itineraryRevision = applyItinerary(actor, `Planned open days ${dates.start} to ${dates.end} as ${newId}`, plan => {
+            const target = effectivePhase(newId);
+            const ensureDay = (date) => {
+              let day = plan.days.find(d => d.phase_id === newId && d.date === date);
+              if (!day) {
+                day = { phase_id: newId, date, label_he: null, label_en: null, ...journey().dayContext(target, date), sort_order: plan.days.length };
+                plan.days.push(day);
+              }
+              return day;
+            };
+            for (const { from, date } of stray.values()) {
+              const r = moveDayRows(plan, { from, to: newId, date, lodging: journey().dayContext(target, date), headline: 'keep_target' });
+              moved.items.push(...r.items);
+              if (!moved.days.includes(date)) moved.days.push(date);
+            }
+            for (const headline of headlines.days) {
+              const day = ensureDay(headline.date);
+              if (headline.label_he !== null) day.label_he = headline.label_he;
+              if (headline.label_en !== null) day.label_en = headline.label_en;
+            }
+            for (const item of given.items) {
+              ensureDay(item.date);
+              const uid = `item_${Date.now().toString(36)}_${crypto.randomBytes(6).toString('hex')}`;
+              plan.items.push({
+                item_uid: uid, phase_id: newId, date: item.date, time: item.time, time_sort: item.time_sort,
+                item_type: item.item_type, text_he: item.text_he, text_en: item.text_en, location_url: item.location_url,
+                waze_url: null, website_url: null, ticket_url: null, booking_id: null,
+                confirmation_state: item.confirmation_state, duration_minutes: null,
+                sort_order: plan.items.length + 1, source_ref: uid, created_by: actor, extra_links: null,
+              });
+              created.push({ item_uid: uid, date: item.date, time: item.time, text_he: item.text_he, text_en: item.text_en });
+            }
+          });
+        }
+        if (moved.items.length) queuePhaseReview(newId);
+        const after = coveredDays(effectiveConfig().phases || [], current().realIds);
+        return { status: 201, body: {
+          revision: revision(), itinerary_revision: itineraryRevision, stop: stopSummary(newId),
+          items: created, moved_from_open_days: moved,
+          open_days: gapsOf(after, trip).map(({ start, end }) => ({ start, end })),
         } };
       });
     },
@@ -1335,6 +1579,8 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
       res.setHeader('Cache-Control', 'no-store');
       res.json({ phase_id: req.params.phase_id, revision: revision(), history: historyOf(req.params.phase_id) });
     });
+    app.post('/api/stops', organizerOrAgentRequired, (req, res) =>
+      send(res, ops.create(req.body || {}, req.user.username, req.headers['if-match'])));
     app.patch('/api/stops/:phase_id', organizerOrAgentRequired, (req, res) =>
       send(res, ops.update(req.params.phase_id, req.body || {}, req.user.username, req.headers['if-match'])));
     app.post('/api/stops/:phase_id/split', organizerOrAgentRequired, (req, res) =>

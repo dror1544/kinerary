@@ -283,7 +283,7 @@
       },
       "expected": {
         "calls_in_order": [],
-        "forbidden_tools": ["update_stop", "split_stop", "set_stop_from_booking", "move_plan_day"]
+        "forbidden_tools": ["update_stop", "split_stop", "set_stop_from_booking", "move_plan_day", "plan_open_days"]
       },
       "reply_must": [
         "is friendly and one or two lines",
@@ -314,7 +314,7 @@
       },
       "expected": {
         "calls_in_order": [],
-        "forbidden_tools": ["update_stop", "split_stop", "set_stop_from_booking", "move_plan_day"]
+        "forbidden_tools": ["update_stop", "split_stop", "set_stop_from_booking", "move_plan_day", "plan_open_days"]
       },
       "reply_must": [
         "says briefly it will pick this up privately with the organizer"
@@ -322,6 +322,60 @@
       "reply_must_not": [
         "move the day from the group",
         "accuse anyone of impersonation"
+      ]
+    },
+    {
+      "id": "plan_open_days_one_call",
+      "scenario": "Issue #133. The trip has days no stop covers. The organizer has been shown a proposal (a new stop Strasbourg for those days, with its plan) and approves it with one word: the stop and its plan land in ONE tool call, with no second approval and no 'I'll add the plan next'.",
+      "chat": "organizer_private",
+      "from": "organizer",
+      "prior_turns": [
+        {"from": "organizer", "en": "Make the 5th to the 7th Strasbourg and plan it.", "he": "תעשי את 5 עד 7 שטרסבורג ותתכנני."},
+        {"from": "companion", "en": "Proposal: a stop 'Strasbourg', 5-7 Dec. 5 Dec 10:00 the cathedral; 6 Dec 11:00 Petite France walk; 7 Dec 09:30 Christmas market. Shall I do it?", "he": "הצעה: תחנה 'שטרסבורג', 5-7 בדצמבר. 5.12 10:00 הקתדרלה; 6.12 11:00 טיול בפטיט פראנס; 7.12 09:30 שוק חג המולד. לבצע?"}
+      ],
+      "message": {
+        "en": "Yes, do it.",
+        "he": "כן, תבצעי."
+      },
+      "state": {
+        "trip": {"start": "2027-12-02", "end": "2027-12-07", "timezone": "Europe/Paris"},
+        "stops": [
+          {"id": "colmar", "title": "Colmar", "dates": {"start": "2027-12-02", "end": "2027-12-05"}, "plan": []},
+          {"id": "open-days", "title": "Days not planned yet", "unplanned": true, "dates": {"start": "2027-12-05", "end": "2027-12-07"}, "plan": []}
+        ],
+        "bookings": []
+      },
+      "expected": {
+        "calls_in_order": [
+          {"tool": "get_stops"},
+          {"tool": "plan_open_days", "args": {
+            "start": "2027-12-05", "end": "2027-12-07", "title_en": "Strasbourg",
+            "items": [
+              {"date": "2027-12-05", "time": "10:00", "text_en": "the cathedral"},
+              {"date": "2027-12-06", "time": "11:00", "text_en": "Petite France walk"},
+              {"date": "2027-12-07", "time": "09:30", "text_en": "Christmas market"}
+            ]
+          }, "match": {"title_en": "names Strasbourg", "items": "every item the proposal listed, each dated inside 5-7 Dec"}},
+          {"tool": "get_stops"},
+          {"tool": "get_phase_plan", "args": {"phase_id": "strasbourg"}}
+        ],
+        "forbidden_tools": ["update_stop", "split_stop", "add_plan_item"],
+        "why_one_call": "the owner's requirement (2026-09-20): one approval, one completed action. A stop first and its items after is the half-applied state this tool exists to remove.",
+        "after": {
+          "stops": [
+            {"id": "colmar", "dates": {"start": "2027-12-02", "end": "2027-12-05"}},
+            {"id": "<new>", "title": "Strasbourg", "dates": {"start": "2027-12-05", "end": "2027-12-07"}}
+          ]
+        }
+      },
+      "reply_must": [
+        "comes only after the read-back shows the stop and its three items",
+        "says what the Journey tab now shows: Strasbourg, 5-7 Dec, with the three planned items"
+      ],
+      "reply_must_not": [
+        "ask for a second approval for the plan",
+        "say the plan will be added later or shortly",
+        "say it is done before the read-back"
       ]
     }
   ]
