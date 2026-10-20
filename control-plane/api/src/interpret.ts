@@ -940,6 +940,7 @@ export function applyProposals(
     if (usable.length === 0) return;
     const ordered = [...usable].sort((a, b) => b.confidence - a.confidence);
     const candidates = ordered.length > 1 ? [mergedProposal(ordered), ordered[0]!] : [ordered[0]!];
+    let restatedOnly = false;
     for (const original of candidates) {
       // A structured question that already holds an answer: the offer is the
       // reading MERGED INTO what is held, exactly as the accepted path builds
@@ -952,7 +953,10 @@ export function applyProposals(
       const heldAnswer = ctx.held?.[original.questionId];
       if (original.value.kind === "structured" && isRecord(heldAnswer) && heldAnswer.kind === "structured") {
         const step = reconcileStructured(heldAnswer.data, original.value.data, mergeOptionsFor(original.questionId));
-        if (!step.changed) continue;
+        if (!step.changed) {
+          restatedOnly = true;
+          continue;
+        }
         candidate = { ...original, value: { kind: "structured", data: step.merged } };
       }
       const validated = validateProposed(candidate, questions);
@@ -961,6 +965,11 @@ export function applyProposals(
         return;
       }
     }
+    // Dropped because it only restates what is held. Say so the way the
+    // accepted path does: `LOW_CONFIDENCE` alone reads as "nothing found" to the
+    // document reply, which then tells the organizer a file that CONFIRMS the
+    // trip had nothing about it.
+    if (restatedOnly) for (const p of usable) reject(p, "NO_NEW_INFORMATION");
   };
 
   const isStructured = (p: ProposedAnswer) => p.value.kind === "structured";

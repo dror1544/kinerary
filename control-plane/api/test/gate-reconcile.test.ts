@@ -167,6 +167,9 @@ describe("an unsure document reading of a held structured answer", () => {
     const decisions = applyProposals([unsure("phases", [{ name: "Tokyo" }], "Tokyo 2026-10-01")], UNSURE_CTX);
     assert.deepEqual(decisions.suggested, []);
     assert.equal(decisions.accepted.length, 0);
+    // And it is recorded as AGREEING with what is held, which is what the
+    // document reply reads ("I already have that"), not only as unsure.
+    assert.ok(decisions.rejected.some((r) => r.questionId === "phases" && r.reason === "NO_NEW_INFORMATION"));
   });
 
   test("a reading that fills one stop's dates is offered on top of all four stops", () => {

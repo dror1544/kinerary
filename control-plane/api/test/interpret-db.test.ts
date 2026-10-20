@@ -1363,6 +1363,27 @@ describe("a typed message longer than one read takes", { skip: SKIP ? "no CONTRO
     });
   });
 
+  test("a notice that cannot be sent is logged, without its text, and the message is still read", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await setInterpretPath(pool, a.chatId, true);
+      const telegram = new Recorder();
+      const original = telegram.sendMessage.bind(telegram);
+      telegram.sendMessage = async (p) => {
+        if (p.text === uiString("messagePartial", "en")) throw new Error("telegram down");
+        return original(p);
+      };
+      const runner = recording();
+      const lines: string[] = [];
+
+      await say(pool, a.chatId, longEnglish, telegram, runner, (line) => lines.push(line));
+
+      const warned = lines.filter((l) => l.includes("interview.message_partial_notice_failed"));
+      assert.equal(warned.length, 1, `logged once — log: ${JSON.stringify(lines.filter((l) => l.includes("warn")))}`);
+      assert.ok(!warned[0]!.includes(uiString("messagePartial", "en")), "and without the message text");
+      assert.ok(runner.prompts.length > 0, "the reading was not lost");
+    });
+  });
+
   test("a message within the budget is not apologised for", async () => {
     await withTwoInterviews(async ({ pool, a }) => {
       await setInterpretPath(pool, a.chatId, true);
