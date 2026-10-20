@@ -42,6 +42,7 @@ import { uiString } from "../src/intake-copy.js";
 import {
   claimInterpretation,
   findInterpretation,
+  INTERPRET_SOURCE_BUDGET_CHARS,
   isInterpretPath,
   markInterpretationCommitted,
   recordInterpretationResult,
@@ -1302,6 +1303,80 @@ describe("the boundary, answered in words", { skip: SKIP ? "no CONTROL_PLANE_TES
       await say(pool, a.chatId, "it's a family trip", telegram, runner);
 
       assert.deepEqual(runner.calls.map((c) => c.schema), ["interpret"], "one call, mid-interview");
+    });
+  });
+});
+
+// #51 — a typed message past INTERPRET_SOURCE_BUDGET_CHARS is cut from the
+// prompt; before this the organizer was never told, so what followed read as a
+// complete reading of everything they wrote.
+describe("a typed message longer than one read takes", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABASE_URL" : false }, () => {
+  const TAIL = "ZZTAILMARKERZZ";
+
+  /** Records the interpret prompts it is handed and proposes nothing. */
+  function recording() {
+    const prompts: string[] = [];
+    return {
+      prompts,
+      async run(req: { prompt: string; parse: (raw: unknown) => unknown }) {
+        prompts.push(req.prompt);
+        const parsed = req.parse({ proposals: [], unclear: [] });
+        return { ok: true as const, value: parsed, attempts: 1, ms: 1 };
+      },
+    };
+  }
+
+  const longEnglish = `${"We are a family of four going to Japan in the spring. ".repeat(200)}${TAIL}`;
+  const longHebrew = `${"אנחנו משפחה של ארבעה ונוסעים ליפן באביב. ".repeat(250)}${TAIL}`;
+
+  test("English: the organizer is told once, the tail never reached the prompt, the other chat heard nothing", async () => {
+    assert.ok(longEnglish.length > INTERPRET_SOURCE_BUDGET_CHARS);
+    await withTwoInterviews(async ({ pool, a, b }) => {
+      await setInterpretPath(pool, a.chatId, true);
+      await setInterpretPath(pool, b.chatId, true);
+      const telegramA = new Recorder();
+      const telegramB = new Recorder();
+      const runner = recording();
+
+      await say(pool, a.chatId, longEnglish, telegramA, runner);
+
+      const told = telegramA.sent.filter((m) => m.text === uiString("messagePartial", "en"));
+      assert.equal(told.length, 1, `said exactly once — sent: ${JSON.stringify(telegramA.sent.map((m) => m.text.slice(0, 60)))}`);
+      assert.ok(runner.prompts.length > 0, "the message was still read");
+      assert.ok(runner.prompts.every((p) => !p.includes(TAIL)), "and the tail is what was cut");
+      assert.deepEqual(telegramB.sent, [], "nobody else's interview is spoken to");
+    });
+  });
+
+  test("Hebrew: said in the language they wrote, not the one the session started in", async () => {
+    assert.ok(longHebrew.length > INTERPRET_SOURCE_BUDGET_CHARS);
+    await withTwoInterviews(async ({ pool, a }) => {
+      await setInterpretPath(pool, a.chatId, true);
+      const telegram = new Recorder();
+      const runner = recording();
+
+      await say(pool, a.chatId, longHebrew, telegram, runner);
+
+      assert.equal(telegram.sent.filter((m) => m.text === uiString("messagePartial", "he")).length, 1);
+      assert.equal(telegram.sent.filter((m) => m.text === uiString("messagePartial", "en")).length, 0, "and not in English");
+      assert.ok(runner.prompts.every((p) => !p.includes(TAIL)));
+    });
+  });
+
+  test("a message within the budget is not apologised for", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await setInterpretPath(pool, a.chatId, true);
+      const telegram = new Recorder();
+      const runner = recording();
+      const short = `${"We are going to Japan. ".repeat(20)}${TAIL}`;
+      assert.ok(short.length < INTERPRET_SOURCE_BUDGET_CHARS);
+
+      await say(pool, a.chatId, short, telegram, runner);
+
+      assert.ok(runner.prompts.some((p) => p.includes(TAIL)), "the whole message reached the prompt");
+      for (const language of ["en", "he"] as const) {
+        assert.ok(!telegram.sent.some((m) => m.text === uiString("messagePartial", language)), `no ${language} partial notice`);
+      }
     });
   });
 });

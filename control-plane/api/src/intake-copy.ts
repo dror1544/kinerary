@@ -518,6 +518,12 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // was not must not be passed off as read, because the organizer would
     // reasonably assume anything missing from the recap was not in the file.
     documentPartial: "I could only read part of that — some of it is a scan, or it runs longer than I can take in one go. I've used what I could read; if something from it is missing below, tell me or send that part separately.",
+    // Said when a TYPED message ran past what one read takes (#51). The first
+    // part was used; the rest was not, and the organizer would reasonably assume
+    // anything missing from what follows was simply not understood. Not
+    // `documentPartial`: there is no file and no scan, and "some of it is a
+    // scan" would be untrue.
+    messagePartial: "That message was longer than I can read in one go, so I used the first part of it. If something from the end is missing, send it again on its own.",
     // Said after the day-by-day, when the documents together ran past what one
     // itinerary read takes. Not `documentPartial`: every file WAS read, so "some
     // of it is a scan" is untrue, and said a second time after the recap it
@@ -802,6 +808,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     documentUnreadable: "לא הצלחתי לקרוא את הקובץ — יכול להיות שזו סריקה או תמונה ולא מסמך טקסט. אפשר לשלוח קובץ אחר אם יש, או שנמשיך ואשאל במקום.",
     documentIdentity: "זה נראה כמו דרכון או תעודת זהות — לא קראתי אותו. אני לא צריך מסמכי זיהוי כדי להקים את הטיול, אז אין סיבה שאחזיק אחד כזה. אישורי הזמנה, כרטיסים ותוכניות — אלה המועילים.",
     documentPartial: "הצלחתי לקרוא רק חלק מזה — חלק מהקובץ סרוק, או שהוא ארוך מכדי לקרוא בבת אחת. השתמשתי במה שהצלחתי לקרוא; אם משהו ממנו חסר למטה, ספרו לי או שלחו את החלק הזה בנפרד.",
+    messagePartial: "ההודעה הזאת ארוכה מכדי שאוכל לקרוא אותה בבת אחת, אז התבססתי על החלק הראשון שלה. אם משהו מהסוף חסר, שלחו אותו שוב בהודעה נפרדת.",
     itineraryPartial: "התוכנית היומית שהוספתי מכסה רק חלק מהמסמכים — יחד הם ארוכים מכדי שאתכנן מהם בבת אחת. בדקו את הימים באתר הטיול; אם משהו חסר, שלחו את המסמך הזה לבד.",
     documentAlreadyRead: "את זה כבר יש לי — קראתי אותו קודם, כך שאין ממנו משהו חדש להוסיף. ממשיכים:",
     documentConflict: "שני מסמכים שלכם לא מסכימים לגבי {what} של {entry}. אצלי רשום {held}, אבל ב-\"{document}\" כתוב {incoming}. מה נכון?",
