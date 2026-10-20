@@ -605,6 +605,202 @@ provisioning run (below): LXC, NPM host, DNS record and ingress rule all gone,
 the trip-mcp bridge stopped on its port, and the RPi4's cloudflared config
 byte-identical to before the run.
 
+## Organizer portal and runtime gateway (optional)
+
+Two more services, off unless asked for: **`portal`** (the `web/` single-page app
+behind nginx, with a same-origin `/v1` proxy to the api) and **`runtime-gateway`**
+(`control-plane/runtime-gateway`, the front door that signs a portal member into a
+trip site). Both belong to the compose profile `web`. Without
+`COMPOSE_PROFILES=web` in `vm.env` neither exists, no env variable below is read
+by anything that matters, and `up`, `kinerary-cp-release` and every image are
+exactly what they were — `tests/scripts/test_vm_web_profile.py` renders
+`compose.vm.yml` both ways and fails if switching the profile on changes anything
+but the two services it adds (and the three pass-through variables of the api and
+the one of the worker, which are empty until `vm.env` sets them). Nothing about this deployment lives in the repository: origins, secrets
+and the interface the ingress reaches are all `vm.env`, and the profile file is
+kept in kinerary-deploy.
+
+**Two clocks.** The services, the api's `web` block and the worker's exchange key
+are control-plane changes: they reach every trip at the next restart. A trip *site*
+is different — the exchange key is written into a site's `.env` when the worker
+**builds** it, so a trip built before the key was set cannot be launched from the
+portal until its identity sidecar and key are installed (see
+`docs/runtime-session-exchange.md`, "Existing runtimes need…"). Set the key before
+the trips that should be reachable are built, or install it on the existing ones.
+
+### What to set (`vm.env`; names only — `vm.env.example` has the commented list)
+
+| Name | What |
+|---|---|
+| `COMPOSE_PROFILES` | `web` switches the two services on. The release tool reads it from `provisioning.env`/`vm.env` (later wins), so upgrade, verify and rollback follow it |
+| `KINERARY_ARCHITECTURE_PROFILE` | absolute path of the architecture profile **with** a `web` block. Unset, the stack mounts the repository's `architecture.local.example.json` as before |
+| `PORTAL_ORIGIN`, `RUNTIME_ORIGIN` | the two public `https://` origins, exactly as the profile's `web.public_origin` / `web.runtime_origin` |
+| `RUNTIME_EXCHANGE_KEY` | one secret shared by the api (`env://RUNTIME_EXCHANGE_KEY` in the profile), the gateway and every trip site; the worker is handed it as `CONTROL_PLANE_EXCHANGE_KEY` |
+| `RUNTIME_COOKIE_SECRET` | the gateway's cookie-sealing secret: at least 32 random bytes, independent of every other secret |
+| `WEB_BIND_IP`, `PORTAL_PORT`, `RUNTIME_GATEWAY_PORT` | where the ingress reaches the two services. Loopback (`127.0.0.1`), `4173` and `4320` unless set — the same posture as `CONTROL_PLANE_BIND_IP` for the api |
+| `RUNTIME_PUBLIC_SUFFIXES`, `RUNTIME_SAME_SITE_OK`, `RUNTIME_UPSTREAM_TIMEOUT_MS` | gateway tuning, usually unset (see "Same site" below) |
+| `GOOGLE_WEB_CLIENT_ID`, `GOOGLE_WEB_CLIENT_SECRET` | optional pair, only if the profile's `web` block names them |
+
+These are plain `vm.env` variables like `CONTROL_PLANE_OPERATOR_KEY`, not files
+under `.local-secrets/`: the api and the gateway each read their secret from the
+environment (`env://` in the profile; the gateway has no file option), and a
+compose secret that only exists when the profile is on cannot be attached to the
+api conditionally. `vm.env` is root 0600, like the other keys in it.
+
+### The api's profile
+
+`compose.vm.yml` mounts one architecture profile into the api, `migrate`, the relay
+and `companion-mcp`. To switch the portal on, copy
+`control-plane/deployment/architecture.vm-web.example.json` into kinerary-deploy,
+replace its placeholder origins, `runtime_upstream_host_suffixes` and
+`telegram_bot_username`, and point `KINERARY_ARCHITECTURE_PROFILE` at the copy.
+It is the VM's existing example plus a `web` block, and a test keeps the two from
+drifting. Notes on what you are filling in:
+
+- `web.runtime_upstream_host_suffixes`: the DNS domain the trips' own hostnames live
+  under. A trip's `private_url` is `https://<its hostname>`, and the api refuses a
+  route whose host is not that domain or under it (`RUNTIME_ROUTE_INVALID`). The
+  gateway fetches those hostnames from inside its container, so they must resolve
+  and answer from the VM.
+- Secret references in the `web` block: `env://RUNTIME_EXCHANGE_KEY` and
+  (optionally) `env://GOOGLE_WEB_CLIENT_ID` / `env://GOOGLE_WEB_CLIENT_SECRET` are the
+  only `env://` names the api container is given. A bot token for the Mini App is
+  `file:///run/secrets/telegram_creds` (already mounted; it is the one bot's token).
+  `kinerary-cp-release plan` and `upgrade` refuse a profile that names any other
+  `env://` variable, or one that is unset, before anything is switched.
+- Google: add `google_client_id_secret_ref` and `google_client_secret_ref` **together**
+  (the schema requires both) and set the two variables; the redirect URI to register
+  is `<PORTAL_ORIGIN>/v1/auth/google/callback`. Left out, sign-in is email and password.
+- **Telegram Mini App fields** (`web.telegram_bot_token_secret_ref`,
+  `web.telegram_init_data_max_age_seconds`) and **`public_api.trust_proxy`** arrive
+  with the Mini App sign-in change (#442, PR #456). The profile schema is strict, so
+  a revision from before it **rejects** those keys and the api does not start: add
+  them only once the revision you are upgrading to contains that change, and add
+  them in the same step as the upgrade (the example file leaves them out for that
+  reason).
+- **`public_api.trust_proxy`.** Behind the ingress every client reaches the api from
+  the portal container's address, so the per-IP sign-in limits
+  (`/v1/auth/email-password`, `/v1/auth/password`, `/v1/auth/telegram-mini-app`)
+  become one budget for everyone. Set it to the number of proxies between the browser
+  and the api that append to `X-Forwarded-For`: the portal's nginx is one, the ingress
+  another, and anything in front of the ingress that appends (a CDN, a tunnel daemon)
+  one more. A wrong number is worse than none — too high lets a caller choose their
+  own address with a header; `docs/telegram-mini-app.md` explains. Count your chain
+  once, from the ingress's configuration, rather than from this page.
+- `signup.auto_approve` in the example is `true`, as in the profile this VM already
+  mounts. That is a decision for the owner to confirm *before* the portal is public
+  (it is the front-door admission gate; see the schema comment in
+  `control-plane/api/src/config.ts`).
+
+### Same site
+
+The gateway's per-trip cookie is `SameSite=Strict`, so `PORTAL_ORIGIN` and
+`RUNTIME_ORIGIN` must share a registrable domain (`portal.example.com` and
+`runtime.example.com`, not two different domains). The gateway refuses to start
+otherwise, and the release tool refuses the plan first. Where the shared domain sits
+under a public suffix such as `co.uk`, name it in `RUNTIME_PUBLIC_SUFFIXES`;
+`RUNTIME_SAME_SITE_OK=1` overrides a wrong guess and is logged loudly — avoid it.
+
+### Ingress
+
+Two hostnames, both HTTPS, terminated at the ingress. The api only *enforces* https
+origins when the profile says `"environment": "production"` (`config.ts`), which the
+VM's current profile does not — whether to change that is a separate decision, but
+session cookies are marked `Secure` only when `web.public_origin` is https
+(`portal.ts`), so a public portal needs https regardless:
+
+| Hostname | Forward to |
+|---|---|
+| the `PORTAL_ORIGIN` host | `WEB_BIND_IP:PORTAL_PORT` (plain HTTP) |
+| the `RUNTIME_ORIGIN` host | `WEB_BIND_IP:RUNTIME_GATEWAY_PORT` (plain HTTP) |
+
+`WEB_BIND_IP` has to be an address the ingress can reach; loopback is only right
+when the ingress runs on the VM. The runtime hostname carries trip traffic that the
+portal's does not — server-sent events, large uploads and streamed downloads — so
+its route must not buffer responses, must not cap request bodies below the trip's
+own limit and must allow long-lived connections. Do not publish either port beyond
+the ingress.
+
+### Order of operations
+
+1. **Prerequisites, outside the VM:** the two DNS names and certificates; the ingress
+   routes above (they can exist before anything answers); the Google client if used;
+   the Telegram step below if the Mini App is wanted.
+2. **kinerary-deploy:** the profile copy, then the `vm.env` values. `COMPOSE_PROFILES`
+   goes in **last**. Generate the exchange key and cookie secret there; never paste
+   them anywhere else.
+3. `sudo kinerary-cp-release plan main` and `upgrade main --dry-run`. With the profile
+   on, the plan checks — names only, never values — that every variable above is set,
+   that the profile has a `web` block whose origins equal `PORTAL_ORIGIN` /
+   `RUNTIME_ORIGIN`, that the two share a site, and that every `env://` reference is
+   one the api is given; it lists the two extra images; and the dry run names the extra
+   services it would start and check.
+4. **Upgrade through the release tool**, in the usual window (the pre-upgrade dump and
+   snapshot are unchanged by this). It builds `kinerary-cp/portal:<rev>` and
+   `kinerary-cp/runtime-gateway:<rev>` beside the other three, starts them in the same
+   `up` as the api, and `--wait` covers their health checks. The api restarts first; the
+   portal's nginx re-resolves it (see below), so no portal restart is needed.
+5. **Verify.** `sudo kinerary-cp-release verify` adds four lines when the profile is
+   on: each container runs on the current revision; `GET /v1/auth/capabilities`
+   answers **through the portal's own nginx** (so the proxy and the api behind it in one
+   request); the gateway's `/health` answers. Then from outside: the portal origin
+   loads, `<PORTAL_ORIGIN>/v1/auth/capabilities` returns JSON, and
+   `<RUNTIME_ORIGIN>/health` returns `{"ok":true}`.
+6. **Browser acceptance** is `docs/landing-spa-test-runbook.md`'s list, on this
+   deployment.
+
+**Telegram, one time** (only for the Mini App, and only once the revision carries
+#456). The bot's Mini App has to point at `<PORTAL_ORIGIN>/mini-app`, set by hand in
+@BotFather on the bot named in `web.telegram_bot_username` (as of 2026-10: Bot
+Settings, then Configure Mini App / Main App; the menus move, so follow BotFather's
+own wording). At boot the api calls `getMe` and logs `mini_app.bot_checked` with
+`has_main_web_app`; `mini_app.bot_token_mismatch` means the token is not the named
+bot's, and the feature stays off.
+
+**The `/v1` proxy** (`web/nginx.conf`, an envsubst template): the portal image takes
+`CONTROL_PLANE_API_ORIGIN` (compose sets it to the api's service name on the shared
+network) and the container's own DNS server, and resolves the api *as the answer
+expires*. A literal `proxy_pass` resolves once at start and keeps the old address
+after the api container is recreated — every upgrade does that — answering 502 until
+the portal restarts too; measured on 2026-10-20 with a stand-in api (200, then 502
+for the literal form and 200 for this one, after the api came back on a new address).
+To check a change to the template without a container of your own:
+
+```bash
+docker run --rm -e CONTROL_PLANE_API_ORIGIN=http://api:4310 -e NGINX_ENTRYPOINT_LOCAL_RESOLVERS=1 \
+  -e 'NGINX_ENVSUBST_FILTER=^(CONTROL_PLANE_API_ORIGIN|NGINX_LOCAL_RESOLVERS)$' \
+  -v "$PWD/web/nginx.conf:/etc/nginx/templates/default.conf.template:ro" \
+  --entrypoint /docker-entrypoint.sh nginx:stable-alpine nginx -t
+```
+
+`tests/scripts/test_vm_web_profile.py` runs exactly this (skipped, saying so, when
+docker or the image is absent) and also asserts the asset-cache regex is quoted:
+unquoted, nginx reads the `{` of `{8,}` as a block and refuses to start (#441). The
+portal image is built from the **repository root** (`docker build -f web/Dockerfile .`),
+because the stylesheet imports `shared/brand-tokens.css`.
+
+**Rollback.** `kinerary-cp-release rollback` to a revision that has the portal keeps
+the pair on that revision's images (it fails if those images were pruned, like the
+others). To a revision from **before** the portal existed it starts none, says so, and
+`--remove-orphans` removes the running pair; `COMPOSE_PROFILES=web` can stay in
+`vm.env` meanwhile and is ignored by that revision. The api's profile file is a
+separate matter: a profile with a `web` block is read by the older api too, which
+serves the portal routes it knows.
+
+**Turning it off.** Remove `web` from `COMPOSE_PROFILES` in `vm.env`, then remove the
+containers — switching the profile off does not stop a running pair, and `verify`
+keeps saying so until they are gone:
+
+```bash
+$C --profile web rm -sf portal runtime-gateway
+```
+
+Then, if the api should stop serving portal routes, remove
+`KINERARY_ARCHITECTURE_PROFILE` (back to the repository example) and recreate the api
+(`$C up -d api`, which restarts it — a window, not a reflex), and take the two ingress
+routes down. The exchange key already written into trip sites stays; it is inert
+without a gateway holding the same key.
+
 ## Upgrades and rollback
 
 One VM, a snapshot before every upgrade, three ways back. A second standby VM
@@ -624,7 +820,9 @@ sudo kinerary-cp-release prune --dry-run
 ```
 
 **An upgrade**, in order:
-1. **Prepare.** Build the images in a throwaway worktree, before the snapshot,
+1. **Prepare.** Build the images (api, worker, agent-runtime; plus portal and
+   runtime-gateway when the [`web` profile](#organizer-portal-and-runtime-gateway-optional)
+   is on) in a throwaway worktree, before the snapshot,
    so builds don't grow it. Validate the target's `compose.vm.yml` against this
    VM's env and secrets. Check storage.
 2. **Guards.** No provisioning job in flight, no interview mid-turn, and the
@@ -643,7 +841,9 @@ sudo kinerary-cp-release prune --dry-run
    finds its dump and snapshot.
 5. **Verify.** readyz, migrations, image tags, relay bot/polling/no 409,
    trip-intake's `*_for_chat` tools, Hermes credentials, and every live trip's
-   companion connection and trip-mcp bridge. Dror gets the result on Telegram.
+   companion connection and trip-mcp bridge — and, with the `web` profile on, the
+   portal and gateway containers, the portal's `/v1` proxy and the gateway's `/health`.
+   Dror gets the result on Telegram.
 
 **A trip marked `TRIP_MCP_BRIDGE_FAILED` is not skipped by any of this**
 (issue #193): `restart-bridges`, `verify`'s bridge check and the relay's
