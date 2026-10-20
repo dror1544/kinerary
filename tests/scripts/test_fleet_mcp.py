@@ -267,6 +267,30 @@ DIGEST_ALERTS = """\
 • reported by a companion: trip-d — bug, The itinerary page shows the wrong day (rep_1, 2026-09-27 08:00 UTC)"""
 
 
+#: A stand-in `ssh` for the concurrency tests. It plays the VM's sshd: every
+#: invocation registers itself in a directory, holds its place for a moment, and
+#: answers "Connection reset" (exit 255, the way ssh reports a dropped
+#: handshake) when more than FLEET_TEST_SSH_CAP are in the directory at once. The
+#: highest number ever seen at once is appended to peak.log. After that it
+#: behaves exactly like FAKE_PSQL, so fixtures and the SQL log work unchanged.
+FAKE_SSH = """#!/usr/bin/env python3
+import os, sys, time
+active = os.environ["FLEET_TEST_SSH_ACTIVE"]
+mine = os.path.join(active, str(os.getpid()))
+open(mine, "w").close()
+seen = len(os.listdir(active))
+with open(os.path.join(active, "..", "peak.log"), "a") as peak:
+    peak.write(str(seen) + "\\n")
+if seen > int(os.environ["FLEET_TEST_SSH_CAP"]):
+    time.sleep(0.05)
+    os.remove(mine)
+    sys.stderr.write("kex_exchange_identification: read: Connection reset by peer\\n")
+    sys.exit(255)
+time.sleep(0.15)
+os.remove(mine)
+""" + FAKE_PSQL.split("\n", 1)[1]
+
+
 @unittest.skipUnless(NODE, "node is not installed")
 class FleetMcp(unittest.TestCase):
     def setUp(self) -> None:
@@ -1107,6 +1131,135 @@ class FleetMcp(unittest.TestCase):
         self.configure_hermes_logs_dir(self.tmp / "hermes-logs")
         text = self.tool_usage_text()
         self.assertIn("tool usage: no tool calls in the last 7 days", text)
+
+
+@unittest.skipUnless(NODE, "node is not installed")
+class FleetMcpSshConcurrency(unittest.TestCase):
+    """No tool call may hold more than a few SSH sessions to one stack at once.
+
+    On 2026-10-20 `alerts` ran twelve queries in one Promise.all, each its own
+    `ssh ... psql`, and the VM's sshd (MaxStartups 10:30:100) dropped the eleventh
+    -- "kex_exchange_identification: read: Connection reset by peer" -- failing the
+    alert cron about every other run. The stand-in ssh (FAKE_SSH) drops the same
+    way past FLEET_TEST_SSH_CAP, so a call that exceeds the cap fails here the way
+    it failed in production. Both paths are the real ones: buildArgv's ssh branch,
+    reached through FLEET_SSH_BIN, not the `argv` escape hatch.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.log = self.tmp / "sql.log"
+        self.active = self.tmp / "active"
+        self.active.mkdir()
+        self.peak_log = self.tmp / "peak.log"
+        fake = self.tmp / "fake-ssh.py"
+        fake.write_text(FAKE_SSH)
+        fake.chmod(0o755)
+        self.fake = fake
+        self.config = self.tmp / "fleet-stacks.json"
+        self.write_config({})
+
+    def write_config(self, ssh_extra: dict, hermes_logs_dir: str | None = None) -> None:
+        stack = {
+            "label": "a control plane", "production": True,
+            "container": "pg",
+            "database": {"user": "u", "name": "d"},
+            "ssh": {"target": "cp@host", "sudo": True, **ssh_extra},
+        }
+        if hermes_logs_dir:
+            stack["hermes_logs_dir"] = hermes_logs_dir
+        self.config.write_text(json.dumps({"default_stack": "prod", "stacks": {"prod": stack}}))
+
+    def tool(self, name: str, arguments: dict | None = None, cap: int = 99,
+             fixtures: list | None = None) -> tuple[str, bool]:
+        env = {**os.environ, "KINERARY_FLEET_CONFIG": str(self.config),
+               "FLEET_SSH_BIN": str(self.fake), "FLEET_TEST_SQL_LOG": str(self.log),
+               "FLEET_TEST_SSH_ACTIVE": str(self.active), "FLEET_TEST_SSH_CAP": str(cap)}
+        if fixtures is not None:
+            path = self.tmp / "fixtures.json"
+            path.write_text(json.dumps(fixtures))
+            env["FLEET_TEST_FIXTURES"] = str(path)
+        message = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": name, "arguments": arguments or {}}}
+        proc = subprocess.run([NODE, str(SERVER)], input=json.dumps(message) + "\n",
+                              capture_output=True, text=True, timeout=120, env=env)
+        result = json.loads(proc.stdout.splitlines()[0])["result"]
+        return result["content"][0]["text"], bool(result.get("isError"))
+
+    def peak(self) -> int:
+        return max(int(n) for n in self.peak_log.read_text().split())
+
+    def invocations(self) -> int:
+        return len(self.peak_log.read_text().split())
+
+    def test_alerts_never_exceed_the_default_limit_and_still_return_everything_in_order(self):
+        text, is_error = self.tool("alerts", cap=4, fixtures=FIXTURES)
+        self.assertFalse(is_error, text)
+        self.assertEqual(text, TEXT_ALERTS)
+        self.assertGreater(self.invocations(), 10, "alerts no longer sends the many queries this test is about")
+        self.assertLessEqual(self.peak(), 4)
+        # The limiter queues; it does not serialise. If this fell to 1 the fix
+        # would have turned a 12-query call into 12 round trips for nothing.
+        self.assertGreater(self.peak(), 1)
+
+    def test_a_limit_above_the_stand_in_sshd_s_cap_really_does_drop_a_call(self):
+        """The control: without it a green run above proves nothing about the stand-in."""
+        self.write_config({"max_concurrent": 8})
+        text, is_error = self.tool("alerts", cap=3, fixtures=FIXTURES)
+        self.assertTrue(is_error, "8 at once against a cap of 3 should have been dropped")
+        self.assertIn("Connection reset", text)
+
+    def test_the_configured_limit_is_honoured(self):
+        self.write_config({"max_concurrent": 2})
+        text, is_error = self.tool("alerts", cap=2, fixtures=FIXTURES)
+        self.assertFalse(is_error, text)
+        self.assertEqual(text, TEXT_ALERTS)
+        self.assertEqual(self.peak(), 2)
+
+    def test_a_limit_of_one_is_a_serial_call_with_the_same_answer(self):
+        self.write_config({"max_concurrent": 1})
+        text, is_error = self.tool("alerts", cap=1, fixtures=FIXTURES)
+        self.assertFalse(is_error, text)
+        self.assertEqual(text, TEXT_ALERTS)
+        self.assertEqual(self.peak(), 1)
+
+    def test_the_limit_is_clamped_to_one_through_eight(self):
+        for configured, expected_peak in ((0, 1), (-5, 1), (100, 8), ("many", 4), (None, 4)):
+            with self.subTest(configured=configured):
+                self.peak_log.unlink(missing_ok=True)
+                self.write_config({"max_concurrent": configured})
+                # The cap is the expected peak, so a limiter that let more through fails.
+                text, is_error = self.tool("alerts", cap=expected_peak, fixtures=FIXTURES)
+                self.assertFalse(is_error, text)
+                self.assertEqual(self.peak(), expected_peak)
+
+    def test_every_tool_stays_within_the_limit(self):
+        for name, arguments in TOOLS:
+            with self.subTest(tool=name):
+                self.peak_log.unlink(missing_ok=True)
+                text, is_error = self.tool(name, arguments, cap=4)
+                self.assertFalse(is_error, text)
+                if self.peak_log.exists():
+                    self.assertLessEqual(self.peak(), 4)
+
+    def test_the_digest_path_stays_within_the_limit(self):
+        for name in ("fleet_overview", "statistics", "alerts"):
+            with self.subTest(tool=name):
+                self.peak_log.unlink(missing_ok=True)
+                text, is_error = self.tool(name, {"format": "digest"}, cap=4, fixtures=FIXTURES)
+                self.assertFalse(is_error, text)
+                self.assertLessEqual(self.peak(), 4)
+
+    def test_the_tool_usage_read_goes_through_the_same_limit(self):
+        """It is a second spawn site (runToolUsageCommand), over the same ssh."""
+        self.write_config({"max_concurrent": 2}, hermes_logs_dir="/var/hermes")
+        text, is_error = self.tool("statistics", cap=2, fixtures=FIXTURES)
+        self.assertFalse(is_error, text)
+        self.assertLessEqual(self.peak(), 2)
+        # The stand-in ssh does not run the remote script, so it prints nothing:
+        # the read must have completed cleanly, not been refused by the stand-in sshd.
+        self.assertNotIn("could not be read", text)
+        self.assertNotIn("not collected on this stack", text)
 
 
 if __name__ == "__main__":

@@ -320,10 +320,70 @@ const SITE_URL_SQL = `
     WHERE j.trip_id = t.id AND j.state = 'succeeded' AND j.result ? 'private_url'
     ORDER BY j.created_at DESC LIMIT 1)`;
 
+/**
+ * How many processes may be talking to one stack at once.
+ *
+ * Every remote read is its own `ssh … psql`, and a tool answers with a
+ * `Promise.all` over up to a dozen of them. The VM's sshd refuses a new
+ * connection once ten are still handshaking (MaxStartups 10:30:100): on
+ * 2026-10-20 `alerts` opened twelve in one second, the eleventh was reset
+ * ("kex_exchange_identification: read: Connection reset by peer"), and one
+ * dropped query rejects the whole tool call — the alert cron failed about every
+ * other run. Bounding it here, where every spawn goes, means no call site can
+ * get it wrong however many queries it grows to. The Promise.all callers and
+ * their result order are unchanged: the limiter only decides when each starts.
+ *
+ * Default 4; `ssh.max_concurrent` on the stack overrides it, clamped to 1..8 so
+ * a typo can neither reopen the 10-handshake limit this exists for nor stop a
+ * stack from running anything (0 becomes 1). The place is held for the
+ * process's whole life, not only the handshake: simpler, and a running session
+ * is one sshd still counts.
+ *
+ * No retry on a reset: a dropped handshake that survives a limit of four is a
+ * real fault, and retrying would hide the very failure this was found through.
+ * No ControlMaster either: its socket must live in a writable path, and a
+ * shared one is a channel another local user could be handed.
+ */
+const DEFAULT_MAX_CONCURRENT = 4;
+const limiters = new Map();
+
+function maxConcurrent(stackName) {
+  const configured = CONFIG.stacks[stackName]?.ssh?.max_concurrent;
+  if (configured === undefined || configured === null) return DEFAULT_MAX_CONCURRENT;
+  return clamp(configured, 1, 8, DEFAULT_MAX_CONCURRENT);
+}
+
+/** Run `task` (returns a promise) once fewer than the stack's limit are running; FIFO. */
+function limited(stackName, task) {
+  let state = limiters.get(stackName);
+  if (!state) {
+    state = { running: 0, waiting: [] };
+    limiters.set(stackName, state);
+  }
+  const pump = () => {
+    while (state.running < maxConcurrent(stackName) && state.waiting.length > 0) {
+      const next = state.waiting.shift();
+      state.running += 1;
+      Promise.resolve()
+        .then(next.task)
+        .then(next.resolve, next.reject)
+        .finally(() => { state.running -= 1; pump(); });
+    }
+  };
+  return new Promise((resolve_, reject) => {
+    state.waiting.push({ task, resolve: resolve_, reject });
+    pump();
+  });
+}
+
 /** Run one read-only script against a stack and return rows as string arrays. */
 function runSql(stackName, sql) {
   if (CONFIG.error) return Promise.reject(new Error(CONFIG.error));
   const argv = buildArgv(stackName);
+  return limited(stackName, () => spawnSql(stackName, argv, sql));
+}
+
+function spawnSql(stackName, argv, sql) {
   return new Promise((resolve_, reject) => {
     const child = spawn(argv[0], argv.slice(1), {
       stdio: ["pipe", "pipe", "pipe"],
@@ -478,8 +538,16 @@ function buildToolUsageArgv(name, sinceIso) {
   ];
 }
 
-/** Run the tool-usage argv and return its TAB-separated rows as string arrays. */
-function runToolUsageCommand(argv) {
+/**
+ * Run the tool-usage argv and return its TAB-separated rows as string arrays.
+ * The second spawn site: over SSH it is one more session to the same sshd, so it
+ * takes a place in the stack's limiter like every query does.
+ */
+function runToolUsageCommand(argv, stackName) {
+  return limited(stackName, () => spawnToolUsage(argv));
+}
+
+function spawnToolUsage(argv) {
   return new Promise((resolve_, reject) => {
     const child = spawn(argv[0], argv.slice(1), {
       stdio: ["ignore", "pipe", "pipe"],
@@ -1318,7 +1386,7 @@ async function loadToolUsage(stack, d) {
   if (!dir) return { state: "not_configured" };
   try {
     const argv = buildToolUsageArgv(stack, toolUsageCutoff(d));
-    const rows = await runToolUsageCommand(argv);
+    const rows = await runToolUsageCommand(argv, stack);
     const counts = new Map();
     const profiles = new Set();
     for (const row of rows) {
