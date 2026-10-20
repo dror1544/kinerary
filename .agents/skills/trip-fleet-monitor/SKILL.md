@@ -41,7 +41,7 @@ adding a staging environment is an edit to that file.
 | `production: true` | this one describes real travellers; never merge its numbers |
 | `url` | psql connects directly (managed Postgres, published port) |
 | `container` | the database is in a container on this machine |
-| `ssh` | …and that machine is reached over SSH first (`target`, `key`, `sudo`, `port`, `options`) |
+| `ssh` | …and that machine is reached over SSH first (`target`, `key`, `sudo`, `port`, `options`, `max_concurrent`) |
 | `argv` | escape hatch: a literal command line, with `{sep}` and `{pgoptions}` |
 
 Config is searched in this order, first hit wins:
@@ -51,6 +51,12 @@ Config is searched in this order, first hit wins:
    monitor read a different deployment and announce it as production.
 2. `<hermes profile>/fleet-stacks.json` — beside the skill, **not inside it**
 3. `~/.config/kinerary/fleet-stacks.json`
+
+`ssh.max_concurrent` (default 4, clamped to 1–8) is how many processes the server
+runs against one stack at once. A tool asks a dozen questions in parallel and each
+is its own SSH session; sshd's `MaxStartups` (10 by default) resets the 11th, which
+failed the alert cron about every other run on 2026-10-20. Leave it alone unless the
+host's `MaxStartups` is known to be lower.
 
 The "beside, not inside" rule matters: `install-hermes-skill.sh` diffs the skill
 directory, so a real deployment's config living inside it would read as drift
