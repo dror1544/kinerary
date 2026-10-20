@@ -71,7 +71,7 @@ test("Google is optional as a complete pair and unavailable routes fail explicit
   } });
   try {
     const providers = await app.inject({ url: "/v1/auth/capabilities" });
-    assert.deepEqual(providers.json(), { google: false, emailPassword: true });
+    assert.deepEqual(providers.json(), { google: false, emailPassword: true, telegramMiniApp: false });
     for (const url of ["/v1/auth/google/start", "/v1/auth/google/callback?state=x&code=x"]) {
       const response = await app.inject({ url });
       assert.equal(response.statusCode, 503);

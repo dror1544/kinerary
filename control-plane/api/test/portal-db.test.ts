@@ -110,7 +110,9 @@ test("portal HTTP authorization separates dashboard, tenant and runtime access",
     assert.equal(unknownRuntimeUser.statusCode, 409);
 
     const memberTrips = await app.inject({ method: "GET", url: "/v1/trips", headers: { cookie: member.cookie } });
-    assert.deepEqual(memberTrips.json().trips, []);
+    // A member's "My trips" is the trips they can open (#442); the dashboard
+    // detail of those trips stays an organizer-only 404 just below.
+    assert.deepEqual(memberTrips.json().trips.map((trip: { id: string }) => trip.id), [ids.ownedTrip]);
     const memberDetail = await app.inject({ method: "GET", url: `/v1/trips/${ids.ownedTrip}`, headers: { cookie: member.cookie } });
     assert.equal(memberDetail.statusCode, 404);
     const memberLaunch = await app.inject({ method: "POST", url: `/v1/trips/${ids.ownedTrip}/launch`, headers: { cookie: member.cookie, "x-csrf-token": member.csrf } });
@@ -185,7 +187,8 @@ test("portal HTTP authorization separates dashboard, tenant and runtime access",
     const limitedMe = await app.inject({ method: "GET", url: "/v1/me", headers: { cookie: limitedCookie } });
     assert.equal(limitedMe.statusCode, 200);
     const limitedTrips = await app.inject({ method: "GET", url: "/v1/trips", headers: { cookie: limitedCookie } });
-    assert.deepEqual(limitedTrips.json().trips, []);
+    assert.deepEqual(limitedTrips.json().trips.map((trip: { id: string }) => trip.id), [ids.ownedTrip]);
+    assert.equal(limitedTrips.json().trips[0].permissions.dashboard, false);
     const limitedLaunch = await app.inject({
       method: "POST", url: `/v1/trips/${ids.ownedTrip}/launch`,
       headers: { cookie: limitedCookie, "x-csrf-token": csrf },
@@ -193,13 +196,13 @@ test("portal HTTP authorization separates dashboard, tenant and runtime access",
     assert.equal(limitedLaunch.statusCode, 200);
 
     const passwordLogin = await app.inject({
-      method: "POST", url: "/v1/auth/password",
+      method: "POST", url: "/v1/auth/password", headers: { origin: "http://portal.example.test" },
       payload: { tripId: ids.ownedTrip, runtimeUsername: "password-guest", password: "password-guest-secret", returnTo: `/trips/${ids.ownedTrip}/app` },
     });
     assert.equal(passwordLogin.statusCode, 200);
     assert.equal(passwordLogin.json().appPath, `/trips/${ids.ownedTrip}/app`);
     const badPassword = await app.inject({
-      method: "POST", url: "/v1/auth/password",
+      method: "POST", url: "/v1/auth/password", headers: { origin: "http://portal.example.test" },
       payload: { tripId: ids.ownedTrip, runtimeUsername: "password-guest", password: "wrong-secret" },
     });
     assert.equal(badPassword.statusCode, 401);

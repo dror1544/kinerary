@@ -7,6 +7,14 @@ import { issueEnrollment, replaceEnrollment } from "./enrollment.js";
 import { ensureUnknownPasswordCredential, resolveOrCreateEmailAccount, verifyPasswordLogin } from "./password-identity.js";
 import { generatePlan } from "./planner.js";
 import { issueApproval } from "./plan-approval.js";
+import { removeMember } from "./member-removal.js";
+import { structuredLog } from "./redaction.js";
+import {
+  TRIP_ID_PATTERN, claimSessionSlot, enqueueSignInNotice, linkMemberOrSkip,
+  listTelegramLinks, recordLinkSignIn, resolveMiniAppLaunch, unlinkTelegramLink,
+  type TelegramMiniAppConfig,
+} from "./telegram-mini-app.js";
+import { verifyMiniAppInitData, type VerifiedInitData } from "./telegram-webapp-auth.js";
 
 function opaque(prefix: string, bytes = 16): string {
   return `${prefix}_${randomBytes(bytes).toString("hex")}`;
@@ -178,6 +186,12 @@ export interface PortalDependencies {
   approvalTtlSeconds: number;
   /** Operator's Telegram chat id for provisioning notifications. See issueApproval. */
   operatorChatId?: string;
+  /**
+   * Telegram Mini App sign-in (#442). Absent, or `enabled()` false, leaves
+   * `POST /v1/auth/telegram-mini-app` answering 503 and `capabilities` saying
+   * so: the feature is off, and says it is off.
+   */
+  telegramMiniApp?: TelegramMiniAppConfig & { log?: (line: string) => void };
 }
 
 interface PortalUser {
@@ -213,13 +227,15 @@ async function portalUser(request: FastifyRequest, deps: PortalDependencies): Pr
   };
 }
 
-async function createWebSession(client: pg.PoolClient, userId: string, ttlSeconds: number) {
+async function createWebSession(client: pg.PoolClient, userId: string, ttlSeconds: number, telegramLinkId: string | null = null) {
   const sessionToken = base64url(32);
   const csrf = base64url(24);
+  // `telegramLinkId` is set only for a session a Telegram link minted, so that
+  // unlinking (or the link ending any other way) can end that session too.
   await client.query(
-    `INSERT INTO control_plane.web_sessions(id, user_id, token_digest, csrf_digest, expires_at)
-     VALUES ($1, $2, $3, $4, now() + ($5 * interval '1 second'))`,
-    [opaque("wsess"), userId, sha256(sessionToken), sha256(csrf), ttlSeconds],
+    `INSERT INTO control_plane.web_sessions(id, user_id, token_digest, csrf_digest, expires_at, telegram_link_id)
+     VALUES ($1, $2, $3, $4, now() + ($5 * interval '1 second'), $6)`,
+    [opaque("wsess"), userId, sha256(sessionToken), sha256(csrf), ttlSeconds, telegramLinkId],
   );
   return { sessionToken, csrf };
 }
@@ -230,6 +246,29 @@ function setWebSessionCookies(reply: FastifyReply, deps: PortalDependencies, ses
     cookie("kit_session", session.sessionToken, { maxAge: deps.sessionTtlSeconds, secure }),
     cookie("kit_csrf", session.csrf, { maxAge: deps.sessionTtlSeconds, httpOnly: false, secure }),
   ]);
+}
+
+function clearWebSessionCookies(reply: FastifyReply, deps: PortalDependencies): void {
+  const secure = deps.publicOrigin.startsWith("https://");
+  reply.header("set-cookie", [cookie("kit_session", "", { maxAge: 0, secure }), cookie("kit_csrf", "", { maxAge: 0, httpOnly: false, secure })]);
+}
+
+/** An Origin that is present, is not the literal "null" of a sandboxed/opaque origin, and is ours. */
+function originIsOurs(request: FastifyRequest, deps: PortalDependencies): boolean {
+  const origin = request.headers.origin;
+  return typeof origin === "string" && origin !== "null" && origin === deps.publicOrigin;
+}
+
+/**
+ * The "Next time, open with Telegram" request: verified-initData material AND an
+ * explicit consent flag, both in the SAME request as a credential. Anything
+ * short of `consent === true` is not a request to link.
+ */
+function telegramLinkRequest(body: Record<string, unknown>): { initData: string } | null {
+  const link = body.telegramLink;
+  if (!link || typeof link !== "object") return null;
+  const { initData, consent } = link as { initData?: unknown; consent?: unknown };
+  return consent === true && typeof initData === "string" ? { initData } : null;
 }
 
 async function recordFunnelEvent(
@@ -330,6 +369,27 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
   ]);
   const plan = planResult.rows[0];
   const runtimeReady = routeResult.rows[0]?.state === "ready";
+  // Who is on the trip, for the organizer's "remove member". The handle is the
+  // membership id, never a user id. `removable` is the server's own answer so
+  // the page does not re-derive the rules (not yourself; owners only by an
+  // owner; never the last owner/organizer).
+  const memberRows = trip.dashboard_access ? await deps.db.query<{
+    id: string; user_id: string; display_name: string; role: string; runtime_username: string | null;
+  }>(
+    `SELECT m.id, m.user_id, u.display_name, m.role,
+            (SELECT i.runtime_username FROM control_plane.site_invites i
+              WHERE i.trip_id = m.trip_id AND i.redeemed_by = m.user_id AND i.state = 'redeemed'
+              ORDER BY i.redeemed_at DESC LIMIT 1) AS runtime_username
+       FROM control_plane.trip_memberships m JOIN control_plane.users u ON u.id = m.user_id
+      WHERE m.trip_id = $1 AND m.status = 'active' ORDER BY m.created_at, m.id`, [tripId]) : { rows: [] };
+  const isOrganizerSide = (role: string) => role === "owner" || role === "organizer";
+  const members = memberRows.rows.map((row) => {
+    const others = memberRows.rows.filter((other) => other.user_id !== row.user_id);
+    const removable = trip.dashboard_access && isOrganizerSide(trip.role) && row.user_id !== userId
+      && !(row.role === "owner" && (trip.role !== "owner" || !others.some((other) => other.role === "owner")))
+      && !(isOrganizerSide(row.role) && !others.some((other) => isOrganizerSide(other.role)));
+    return { id: row.id, displayName: row.display_name, role: row.role, runtimeUsername: row.runtime_username, you: row.user_id === userId, removable };
+  });
   return {
     id: trip.id,
     title: trip.title ?? trip.destination_label ?? "Untitled trip",
@@ -352,11 +412,43 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
       releaseId: plan.release_id, digest: plan.digest, safeErrorCode: plan.safe_error_code,
     } : null,
     runtimeReady,
+    members,
     invites: invitesResult.rows.map((invite) => ({
       id: invite.id, displayName: invite.intended_display_name, runtimeUsername: invite.runtime_username,
       status: invite.state === "unused" && invite.expires_at.getTime() < Date.now() ? "expired" : invite.state,
       expiresAt: invite.expires_at.toISOString(), createdAt: invite.created_at.toISOString(),
     })),
+  };
+}
+
+/**
+ * What a member WITHOUT dashboard access may see of a trip in their list: the
+ * trip's name, place, dates, their own permissions and whether it can be
+ * opened. Nothing of the organizer's workbench — invitees' names and usernames,
+ * invite ids, plan id/digest/status, the interview session, the lifecycle —
+ * which `tripDetail` carries for the people who run the trip.
+ */
+async function memberTripSummary(deps: PortalDependencies, tripId: string, userId: string) {
+  const result = await deps.db.query<{
+    id: string; title: string | null; destination_label: string | null; start_date: string | null; end_date: string | null;
+    role: string; dashboard_access: boolean; runtime_access: boolean; runtime_ready: boolean;
+  }>(
+    `SELECT t.id, t.title, t.destination_label, t.start_date::text, t.end_date::text, m.role, m.dashboard_access, m.runtime_access,
+            EXISTS (SELECT 1 FROM control_plane.runtime_routes r WHERE r.trip_id = t.id AND r.state = 'ready') AS runtime_ready
+       FROM control_plane.trips t JOIN control_plane.trip_memberships m ON m.trip_id = t.id
+      WHERE t.id = $1 AND m.user_id = $2 AND m.status = 'active'`,
+    [tripId, userId],
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  return {
+    id: row.id,
+    title: row.title ?? row.destination_label ?? "Untitled trip",
+    destination: row.destination_label,
+    startDate: row.start_date,
+    endDate: row.end_date,
+    permissions: { role: row.role, dashboard: false, runtime: row.runtime_access, invite: false, requestProvisioning: false },
+    runtimeReady: row.runtime_ready,
   };
 }
 
@@ -368,13 +460,26 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
     return reply.code(202).send({ accepted: true });
   });
 
-  app.get("/v1/auth/capabilities", async () => ({ google: Boolean(deps.google), emailPassword: true }));
+  app.get("/v1/auth/capabilities", async () => ({
+    google: Boolean(deps.google),
+    emailPassword: true,
+    telegramMiniApp: Boolean(deps.telegramMiniApp?.enabled()),
+  }));
 
   // Bound both expensive credential checks and limiter memory. Use the socket
   // peer from Fastify (trustProxy is off), never caller-supplied forwarding.
   type Attempts = Map<string, { count: number; expiresAt: number }>;
   const loginAttempts: Attempts = new Map();
   const accountAttempts: Attempts = new Map();
+  // Mini App launches and the trip-password route get limiters of their own, so
+  // a flood against one cannot spend another's allowance. The per-person and
+  // per-account maps are only ever keyed AFTER the thing being keyed has been
+  // verified to exist (a signed initData, a credential row): keyed earlier, any
+  // caller could fill the 1024 slots with junk and lock everyone else out.
+  const miniAppIpAttempts: Attempts = new Map();
+  const miniAppUserAttempts: Attempts = new Map();
+  const passwordIpAttempts: Attempts = new Map();
+  const passwordAccountAttempts: Attempts = new Map();
   function admitLogin(attempts: Attempts, key: string, limit: number): boolean {
     const now = Date.now();
     for (const [storedKey, entry] of attempts) if (entry.expiresAt <= now) attempts.delete(storedKey);
@@ -414,6 +519,128 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
       return { appPath: validatedReturnTo(body.returnTo) };
     } catch (error) { await client.query("ROLLBACK"); throw error; }
     finally { client.release(); }
+  });
+
+  // ── Telegram Mini App sign-in (#442) ──────────────────────────────────────
+  //
+  // POST /v1/auth/telegram-mini-app  { initData, tripId? }
+  //
+  //   200 { kind: "session", appPath, notice? }  + the ordinary session cookies
+  //   200 { kind: "choose", trips, notice? }     no cookie, no user ids
+  //   401 { error: "TELEGRAM_NOT_LINKED", fallback: "trip_password" | "none", tripId? }
+  //   401 { error: "TELEGRAM_INIT_DATA_INVALID" }   ONE code for every verification failure
+  //   400 INVALID_REQUEST (a tripId that is not shaped like one) · 403 ORIGIN_INVALID
+  //   415 · 429 · 503 (feature off)
+  //
+  // Everything is `private, no-store`. The order below is the security design:
+  // cheap structural gates first (feature, per-IP budget, Origin, content type —
+  // all in onRequest, before the body is even parsed), then ONE HMAC, and only
+  // then anything keyed on the person.
+  const miniAppLog = (line: string) => (deps.telegramMiniApp?.log ?? ((l: string) => process.stderr.write(`${l}\n`)))(line);
+  app.post("/v1/auth/telegram-mini-app", {
+    // initData is capped at 4096 bytes; a body that cannot hold one is not one.
+    bodyLimit: 65536,
+    onRequest: async (request, reply) => {
+      reply.header("cache-control", "private, no-store");
+      if (!deps.telegramMiniApp?.enabled()) return reply.code(503).send({ error: "TELEGRAM_MINI_APP_UNAVAILABLE" });
+      if (!admitLogin(miniAppIpAttempts, request.ip, 100)) {
+        return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
+      }
+      // A login-CSRF vector: another site could otherwise post a victim's own
+      // initData (or an attacker's) from the victim's browser. Missing and the
+      // literal "null" (sandboxed iframes, file:, redirects) are refused too.
+      if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
+      if (!/^application\/json(?:\s*;.*)?$/i.test(String(request.headers["content-type"] ?? ""))) {
+        return reply.code(415).send({ error: "UNSUPPORTED_MEDIA_TYPE" });
+      }
+    },
+  }, async (request, reply) => {
+    const cfg = deps.telegramMiniApp!;
+    const body = request.body && typeof request.body === "object" && !Array.isArray(request.body) ? request.body as Record<string, unknown> : {};
+    // Only `initData`, the signed string, is ever read. Not initDataUnsafe, not a
+    // user object, not a query parameter.
+    const verified = verifyMiniAppInitData(body.initData, cfg.botToken, { maxAgeSeconds: cfg.maxAgeSeconds });
+    if (!verified.ok) {
+      miniAppLog(structuredLog("warn", "mini_app.init_data_rejected", { reason: verified.reason }));
+      return reply.code(401).send({ error: "TELEGRAM_INIT_DATA_INVALID" });
+    }
+    const launch: VerifiedInitData = verified.data;
+    // Keyed by a hash of the id and held in memory only; reachable solely with a
+    // signature Telegram made, so junk cannot fill the map.
+    if (!admitLogin(miniAppUserAttempts, sha256(`miniapp:${launch.telegramUserId}`), 20)) {
+      return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
+    }
+    let requestedTripId: string | null = null;
+    if (body.tripId !== undefined && body.tripId !== null) {
+      if (typeof body.tripId !== "string" || !TRIP_ID_PATTERN.test(body.tripId)) return reply.code(400).send({ error: "INVALID_REQUEST" });
+      requestedTripId = body.tripId;
+    }
+    const incoming = parseCookies(request.headers.cookie).kit_session;
+    const revokeIncoming = async (client: pg.PoolClient) => {
+      // A verified launch replaces whatever session this WebView already held:
+      // on a shared device the previous person must not stay signed in behind it.
+      if (incoming) await client.query("UPDATE control_plane.web_sessions SET revoked_at = now() WHERE token_digest = $1 AND revoked_at IS NULL", [sha256(incoming)]);
+    };
+    const client = await deps.db.connect();
+    try {
+      await client.query("BEGIN");
+      const outcome = await resolveMiniAppLaunch(client, launch, requestedTripId);
+      if (outcome.kind === "session") {
+        if (!(await claimSessionSlot(client, launch, cfg.maxAgeSeconds))) {
+          // The launch has minted its allowance. Same answer as any other bad initData.
+          await client.query("ROLLBACK");
+          miniAppLog(structuredLog("warn", "mini_app.init_data_rejected", { reason: "REPLAY_CAP" }));
+          return reply.code(401).send({ error: "TELEGRAM_INIT_DATA_INVALID" });
+        }
+        const used = await recordLinkSignIn(client, outcome.target.linkKind, outcome.target.linkId);
+        if (!used) {
+          await client.query("ROLLBACK");
+          return reply.code(401).send({ error: "TELEGRAM_NOT_LINKED", fallback: "none" });
+        }
+        const session = await createWebSession(client, outcome.target.userId, deps.sessionTtlSeconds, outcome.target.linkId);
+        // First use of this link: tell the account owner's OWN chats (not the signer).
+        const noticesQueued = used.first
+          ? await enqueueSignInNotice(client, {
+            signerTelegramId: launch.telegramUserId, userId: outcome.target.userId, accountName: outcome.target.userDisplayName,
+            linkKind: outcome.target.linkKind, tripTitle: outcome.target.tripTitle,
+          })
+          : 0;
+        await revokeIncoming(client);
+        await client.query("COMMIT");
+        setWebSessionCookies(reply, deps, session);
+        miniAppLog(structuredLog("info", "mini_app.sign_in", { outcome: "session", link_kind: outcome.target.linkKind, first_use: used.first, notices_queued: noticesQueued }));
+        return { kind: "session", appPath: outcome.target.appPath, ...(outcome.notice ? { notice: outcome.notice } : {}) };
+      }
+      await revokeIncoming(client);
+      await client.query("COMMIT");
+      if (incoming) clearWebSessionCookies(reply, deps);
+      miniAppLog(structuredLog("info", "mini_app.sign_in", { outcome: outcome.kind }));
+      if (outcome.kind === "choose") return { kind: "choose", trips: outcome.trips, ...(outcome.notice ? { notice: outcome.notice } : {}) };
+      return reply.code(401).send({ error: "TELEGRAM_NOT_LINKED", fallback: outcome.fallback, ...(outcome.tripId ? { tripId: outcome.tripId } : {}) });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  });
+
+  // The signed-in user's own view of every Telegram account that can sign in as
+  // them, and the way to end one. Any signed-in user, member or organizer: the
+  // list is about THEIR account.
+  app.get("/v1/account/telegram-links", async (request, reply) => {
+    const user = await requireUser(request, reply, deps);
+    if (!user) return;
+    reply.header("cache-control", "private, no-store");
+    return { miniAppEnabled: Boolean(deps.telegramMiniApp?.enabled()), links: await listTelegramLinks(deps.db, user.id) };
+  });
+  app.delete("/v1/account/telegram-links/:linkId", async (request, reply) => {
+    const user = await requireMutation(request, reply, deps);
+    if (!user) return;
+    reply.header("cache-control", "private, no-store");
+    const linkId = (request.params as { linkId?: string }).linkId ?? "";
+    if (!(await unlinkTelegramLink(deps.db, user.id, linkId))) return reply.code(404).send({ error: "NOT_FOUND" });
+    return { status: "unlinked" };
   });
 
   app.get("/v1/auth/google/start", async (request, reply) => {
@@ -492,7 +719,15 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
   });
 
   app.post("/v1/auth/password", async (request, reply) => {
-    const body = request.body as Record<string, unknown>;
+    // Per-IP before anything is read or hashed: scrypt is the expensive step.
+    if (!admitLogin(passwordIpAttempts, request.ip, 100)) {
+      return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
+    }
+    // Same-origin form posts only. This route used to accept a request from any
+    // origin (and none): a page on another site could drive the victim's browser
+    // into a chosen account, which is login CSRF. Missing and "null" are refused.
+    if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
+    const body = (request.body && typeof request.body === "object" ? request.body : {}) as Record<string, unknown>;
     const tripId = typeof body.tripId === "string" ? body.tripId : "";
     const runtimeUsername = typeof body.runtimeUsername === "string" ? body.runtimeUsername.toLowerCase().trim() : "";
     const password = typeof body.password === "string" ? body.password : "";
@@ -507,17 +742,40 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
       [tripId, runtimeUsername],
     );
     const credential = result.rows[0];
+    // Per account, and only for an account that EXISTS: keyed on the request's
+    // own (trip, username) before this lookup, any caller could fill the map
+    // with invented pairs and 429 every real member.
+    if (credential && !admitLogin(passwordAccountAttempts, sha256(`${tripId}:${runtimeUsername}`), 10)) {
+      return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
+    }
     if (!credential || !(await verifyPortalPassword(password, credential.password_hash))) {
       return reply.code(401).send({ error: "INVALID_CREDENTIALS" });
     }
+    const linkRequest = telegramLinkRequest(body);
     const client = await deps.db.connect();
     try {
       await client.query("BEGIN");
       const session = await createWebSession(client, credential.user_id, deps.sessionTtlSeconds);
+      // "Next time, open with Telegram": the credential just verified, fresh
+      // verified initData and an explicit consent flag all arrive in THIS
+      // request, or nothing is linked. A skip never fails the sign-in.
+      let telegramLink: "linked" | "skipped" | undefined;
+      if (linkRequest) {
+        telegramLink = "skipped";
+        const cfg = deps.telegramMiniApp;
+        const verified = cfg?.enabled() ? verifyMiniAppInitData(linkRequest.initData, cfg.botToken, { maxAgeSeconds: cfg.maxAgeSeconds }) : null;
+        if (cfg && verified?.ok && admitLogin(miniAppUserAttempts, sha256(`miniapp:${verified.data.telegramUserId}`), 20)) {
+          const name = await client.query<{ display_name: string }>("SELECT display_name FROM control_plane.users WHERE id = $1", [credential.user_id]);
+          telegramLink = await linkMemberOrSkip(client, {
+            launch: verified.data, maxAgeSeconds: cfg.maxAgeSeconds, userId: credential.user_id, tripId,
+            accountName: name.rows[0]?.display_name ?? "your account", via: "mini_app_trip_password",
+          }, miniAppLog);
+        }
+      }
       await client.query("COMMIT");
       setWebSessionCookies(reply, deps, session);
       const appPath = typeof body.returnTo === "string" ? validatedReturnTo(body.returnTo) : `/trips/${tripId}/app`;
-      return { appPath };
+      return { appPath, ...(telegramLink ? { telegramLink } : {}) };
     } catch (error) {
       await client.query("ROLLBACK");
       throw error;
@@ -543,9 +801,12 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
   app.get("/v1/trips", async (request, reply) => {
     const user = await requireUser(request, reply, deps);
     if (!user) return;
-    const rows = await deps.db.query<{ id: string }>(
-      "SELECT trip_id AS id FROM control_plane.trip_memberships WHERE user_id = $1 AND status = 'active' AND dashboard_access = true ORDER BY created_at DESC", [user.id]);
-    return { trips: (await Promise.all(rows.rows.map((row) => tripDetail(deps, row.id, user.id)))).filter(Boolean) };
+    const rows = await deps.db.query<{ id: string; dashboard_access: boolean }>(
+      // A member's trips are the ones they can open (runtime access), the same
+      // list the Mini App shows; an organizer's also include the trips they run.
+      "SELECT trip_id AS id, dashboard_access FROM control_plane.trip_memberships WHERE user_id = $1 AND status = 'active' AND (dashboard_access = true OR runtime_access = true) ORDER BY created_at DESC", [user.id]);
+    // Full detail only where the caller runs the trip; a runtime-only member gets the summary.
+    return { trips: (await Promise.all(rows.rows.map((row) => row.dashboard_access ? tripDetail(deps, row.id, user.id) : memberTripSummary(deps, row.id, user.id)))).filter(Boolean) };
   });
 
   app.post("/v1/trips", async (request, reply) => {
@@ -772,8 +1033,36 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
     const result = await deps.db.query(
       "UPDATE control_plane.site_invites SET state = 'revoked', updated_at = now() WHERE id = $1 AND trip_id = $2 AND state = 'unused'",
       [params.inviteId, params.id]);
-    if (!result.rowCount) return reply.code(404).send({ error: "NOT_FOUND" });
+    if (result.rowCount) return { status: "revoked" };
+    // A REDEEMED invite is a person on the trip: revoking it removes them, with
+    // everything removing a member does (member-removal.ts).
+    const redeemed = await deps.db.query<{ redeemed_by: string | null }>(
+      "SELECT redeemed_by FROM control_plane.site_invites WHERE id = $1 AND trip_id = $2 AND state = 'redeemed'",
+      [params.inviteId, params.id]);
+    const target = redeemed.rows[0]?.redeemed_by;
+    if (!target) return reply.code(404).send({ error: "NOT_FOUND" });
+    const removal = await removeMember(deps.db, { tripId: params.id ?? "", actorUserId: user.id, targetUserId: target });
+    if (!removal.ok) return reply.code(removal.status).send({ error: removal.error });
     return { status: "revoked" };
+  });
+
+  // Remove a member from the trip. Organizer-side only; anyone else, and any
+  // membership that is not on this trip, is the same 404.
+  app.delete("/v1/trips/:id/members/:membershipId", async (request, reply) => {
+    const user = await requireMutation(request, reply, deps);
+    if (!user) return;
+    const params = request.params as { id?: string; membershipId?: string };
+    const tripId = params.id ?? "";
+    const target = await deps.db.query<{ user_id: string }>(
+      "SELECT user_id FROM control_plane.trip_memberships WHERE id = $1 AND trip_id = $2 AND status = 'active'",
+      [params.membershipId ?? "", tripId]);
+    const actor = await membership(deps, tripId, user.id);
+    if (!actor || !["owner", "organizer"].includes(actor.role) || !actor.dashboard_access || !target.rows[0]) {
+      return reply.code(404).send({ error: "NOT_FOUND" });
+    }
+    const removal = await removeMember(deps.db, { tripId, actorUserId: user.id, targetUserId: target.rows[0].user_id });
+    if (!removal.ok) return reply.code(removal.status).send({ error: removal.error });
+    return { status: "removed" };
   });
 
   app.post("/v1/site-invites/inspect", async (request, reply) => {
@@ -848,9 +1137,28 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
       await client.query("UPDATE control_plane.site_invites SET state = 'redeemed', redeemed_by = $1, redeemed_at = now(), updated_at = now() WHERE id = $2", [userId, invite.id]);
       if (!signedIn) passwordSession = await createWebSession(client, userId, deps.sessionTtlSeconds);
       await recordFunnelEvent(client, "invitation_redeemed", { userId, tripId: invite.trip_id });
+      // Phase 2 linking, invite flavour. Only for a brand-new account that has
+      // just proved itself by holding the invite and choosing a password — never
+      // for a redemption riding an existing cookie session (that is a session,
+      // not a credential), and only from our own origin.
+      let telegramLink: "linked" | "skipped" | undefined;
+      const linkRequest = !signedIn && method === "password" ? telegramLinkRequest(body) : null;
+      if (linkRequest) {
+        telegramLink = "skipped";
+        const cfg = deps.telegramMiniApp;
+        const verified = cfg?.enabled() && originIsOurs(request, deps)
+          ? verifyMiniAppInitData(linkRequest.initData, cfg.botToken, { maxAgeSeconds: cfg.maxAgeSeconds })
+          : null;
+        if (cfg && verified?.ok && admitLogin(miniAppUserAttempts, sha256(`miniapp:${verified.data.telegramUserId}`), 20)) {
+          telegramLink = await linkMemberOrSkip(client, {
+            launch: verified.data, maxAgeSeconds: cfg.maxAgeSeconds, userId, tripId: invite.trip_id,
+            accountName: invite.intended_display_name, via: "mini_app_invite_redemption",
+          }, miniAppLog);
+        }
+      }
       await client.query("COMMIT");
       if (passwordSession) setWebSessionCookies(reply, deps, passwordSession);
-      return { status: "redeemed", tripId: invite.trip_id, appPath: `/trips/${invite.trip_id}/app` };
+      return { status: "redeemed", tripId: invite.trip_id, appPath: `/trips/${invite.trip_id}/app`, ...(telegramLink ? { telegramLink } : {}) };
     } catch (error) {
       await client.query("ROLLBACK");
       throw error;

@@ -19,7 +19,9 @@
  *     the bot's own authenticated connection — never a body field.
  *   - The set of trips a command may touch is derived server-side from that
  *     identity, through telegram_organizer_links (migration 0052) joined to
- *     active memberships. An argument or a tapped button SELECTS WITHIN that
+ *     active memberships. A link is also a Mini App sign-in path, and Unlink
+ *     MOVES the row out of this table (telegram-mini-app.ts), so no reader here
+ *     — this release's or an older one's — has to know a revocation exists. An argument or a tapped button SELECTS WITHIN that
  *     set; it can never widen it.
  *   - Refusals are uniform. "That trip isn't yours" and "no such trip" are the
  *     same sentence, for the reason group-binding already gives: a
@@ -121,10 +123,16 @@ export async function linkTelegramOrganizerInTx(
   verifiedVia: "enrollment_redemption" | "backfill_intake_session" = "enrollment_redemption",
 ): Promise<void> {
   if (!isPrivateChatId(telegramUserId)) return;
+  // A pair the owner has Unlinked stays unlinked: redeeming another interview
+  // link (the forwarded one, say) must not quietly re-open it. The history row
+  // an Unlink leaves is what says so.
   await client.query(
     `INSERT INTO control_plane.telegram_organizer_links
        (id, user_id, telegram_subject_digest, verified_via)
-     VALUES ($1, $2, $3, $4)
+     SELECT $1, $2, $3, $4
+      WHERE NOT EXISTS (
+        SELECT 1 FROM control_plane.telegram_organizer_link_revocations r
+         WHERE r.telegram_subject_digest = $3 AND r.user_id = $2)
      ON CONFLICT DO NOTHING`,
     [`tol_${randomBytes(16).toString("hex")}`, userId, digestTelegramId(telegramUserId), verifiedVia],
   );

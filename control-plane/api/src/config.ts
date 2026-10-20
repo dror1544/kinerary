@@ -22,6 +22,21 @@ export const architectureProfileSchema = z.object({
   public_api: z.object({
     bind_host: z.string().min(1),
     port: z.number().int().min(1024).max(65535),
+    /**
+     * Which proxies in front of this API may speak for the client's address.
+     * OFF (absent) is the default and means `request.ip` is the socket peer —
+     * correct for a direct deployment, and for one behind a proxy it means every
+     * client shares the proxy's address, so the per-IP sign-in limits
+     * (/v1/auth/email-password, /v1/auth/password, /v1/auth/telegram-mini-app)
+     * become one global budget. Set it to the proxy's address(es) or CIDR(s) —
+     * or a hop count when the chain is fixed — and Fastify takes the client's
+     * address from `X-Forwarded-For` ONLY for requests arriving from them. A
+     * wrong list is worse than none: it lets a caller pick their own address.
+     */
+    trust_proxy: z.union([
+      z.number().int().min(1).max(8),
+      z.array(z.string().min(1).max(64)).min(1).max(16),
+    ]).optional(),
   }).strict(),
   worker: z.object({
     queue: z.literal("postgres"),
@@ -87,6 +102,16 @@ export const architectureProfileSchema = z.object({
     runtime_exchange_key_secret_ref: secretReference,
     runtime_upstream_host_suffixes: z.array(z.string().min(1).max(253).regex(/^[A-Za-z0-9.-]+$/)).min(1),
     telegram_bot_username: z.string().regex(/^[A-Za-z0-9_]{5,32}$/),
+    /**
+     * The token of the bot whose Mini App signs people in. OPTIONAL, and absent
+     * means the feature is OFF (logged at boot, and `capabilities` says so) — it
+     * never falls back to some other configured bot token. At boot `getMe` on
+     * this token must name `telegram_bot_username`, or the feature stays off:
+     * a token for a different bot would otherwise verify that bot's launches.
+     */
+    telegram_bot_token_secret_ref: secretReference.optional(),
+    /** How old a Mini App launch's `auth_date` may be. Telegram's own guidance is minutes, not hours. */
+    telegram_init_data_max_age_seconds: z.number().int().min(60).max(3600).default(300),
     // There is deliberately no provisioning-admin allowlist here. Provisioning
     // is approved by the trip's own organizer; the operator is notified, not
     // asked. See docs/landing-page-plan.md.

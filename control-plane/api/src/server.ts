@@ -14,6 +14,7 @@ import { structuredLog } from "./redaction.js";
 import { resolveSecretRef } from "./secrets.js";
 import { deleteWebhookIfPresent, startTelegramApprovalPoller } from "./telegram-poller.js";
 import { GoogleOidcClient, HttpRuntimeAccountAdapter, type PortalDependencies } from "./portal.js";
+import { checkBotIdentity } from "./telegram-mini-app.js";
 
 const profilePath = process.env.CONTROL_PLANE_ARCHITECTURE_PROFILE;
 if (!profilePath) throw new Error("CONTROL_PLANE_ARCHITECTURE_PROFILE is required");
@@ -124,7 +125,40 @@ if (profile.web) {
   const google = profile.web.google_client_id_secret_ref && profile.web.google_client_secret_ref
     ? new GoogleOidcClient(await resolveSecretRef(profile.web.google_client_id_secret_ref), await resolveSecretRef(profile.web.google_client_secret_ref), `${profile.web.public_origin}/v1/auth/google/callback`)
     : undefined;
-  portal = { db: pool, google, runtimeAccounts: new HttpRuntimeAccountAdapter(profile.web.runtime_origin, runtimeExchangeKey), publicOrigin: profile.web.public_origin, runtimeOrigin: profile.web.runtime_origin, runtimeExchangeKey, runtimeUpstreamHostSuffixes: profile.web.runtime_upstream_host_suffixes, telegramBotUsername: profile.web.telegram_bot_username, sessionTtlSeconds: profile.web.session_ttl_seconds, enrollmentTtlSeconds: profile.signup?.enrollment_ttl_seconds ?? 86400, approvalTtlSeconds: 86400, operatorChatId };
+  const miniAppLog = (line: string) => process.stderr.write(`${line}\n`);
+  let telegramMiniApp: PortalDependencies["telegramMiniApp"];
+  if (!profile.web.telegram_bot_token_secret_ref) {
+    // UNSET IS A DOWNGRADE, NOT AN ERROR — so say it once, here, where a person
+    // reading the boot log will see why the Mini App never signs anyone in.
+    miniAppLog(structuredLog("warn", "mini_app.disabled", { reason: "web.telegram_bot_token_secret_ref is not set" }));
+  } else {
+    let miniAppToken: string | undefined;
+    try {
+      miniAppToken = await resolveSecretRef(profile.web.telegram_bot_token_secret_ref);
+    } catch (error) {
+      // A token that cannot be read turns the feature off; it does not stop the API.
+      miniAppLog(structuredLog("error", "mini_app.token_unresolved", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN", effect: "Telegram Mini App sign-in stays off" }));
+    }
+    if (miniAppToken) {
+      const token = miniAppToken;
+      let enabled = false;
+      telegramMiniApp = { botToken: token, maxAgeSeconds: profile.web.telegram_init_data_max_age_seconds, enabled: () => enabled, log: miniAppLog };
+      // The feature is on only once getMe on THIS token names the bot the
+      // profile says it is. A network failure is retried (it is not a verdict);
+      // a different bot is a mis-wired secret and stays off until a restart.
+      const expectedUsername = profile.web.telegram_bot_username;
+      const check = async (): Promise<boolean> => {
+        const result = await checkBotIdentity({ token, expectedUsername, log: miniAppLog });
+        enabled = result.ok;
+        return result.ok || result.reason === "MISMATCH";
+      };
+      if (!(await check())) {
+        const retry = setInterval(() => { check().then((settled) => { if (settled) clearInterval(retry); }).catch(() => {}); }, 60_000);
+        retry.unref();
+      }
+    }
+  }
+  portal = { db: pool, google, telegramMiniApp, runtimeAccounts: new HttpRuntimeAccountAdapter(profile.web.runtime_origin, runtimeExchangeKey), publicOrigin: profile.web.public_origin, runtimeOrigin: profile.web.runtime_origin, runtimeExchangeKey, runtimeUpstreamHostSuffixes: profile.web.runtime_upstream_host_suffixes, telegramBotUsername: profile.web.telegram_bot_username, sessionTtlSeconds: profile.web.session_ttl_seconds, enrollmentTtlSeconds: profile.signup?.enrollment_ttl_seconds ?? 86400, approvalTtlSeconds: 86400, operatorChatId };
 }
 
 // The interviewer agent's chat-addressed interview routes, which the MCP
@@ -235,11 +269,22 @@ const app = buildApp(profile, {
 // leaves 'pending' in notification_outbox after provisioning completes.
 // Guarded against overlap in-process; see outbox-dispatcher.ts for why that's
 // sufficient (single API process today).
-if (signup) {
-  const notification = signup.notification;
+//
+// It also runs where only the web block (the Mini App) is configured: the Mini
+// App sign-in notice is an outbox row too, and a deployment with web but no
+// signup block would otherwise queue notices that nothing ever sends.
+const outboxBotToken = signup?.botToken ?? portal?.telegramMiniApp?.botToken;
+const outboxNotification = signup?.notification ?? (outboxBotToken
+  ? createNotificationAdapter(profile.adapters.messaging, {
+    // `superAdminChatId` is for approval DMs, which a web-only deployment never sends.
+    telegram: { botToken: outboxBotToken, superAdminChatId: operatorChatId ?? "", db: pool, log: (line) => process.stderr.write(`${line}\n`) },
+  })
+  : undefined);
+if (outboxNotification && outboxBotToken) {
+  const notification = outboxNotification;
   const resolveBotUsername = createBotUsernameResolver({
     configured: profile.web?.telegram_bot_username ?? process.env.TELEGRAM_BOT_USERNAME ?? null,
-    botToken: signup.botToken,
+    botToken: outboxBotToken,
     log: (line) => process.stderr.write(`${line}\n`),
   });
   let dispatching = false;
@@ -259,7 +304,8 @@ if (signup) {
       // missing from any deployment that omitted it, and the link vanished with
       // nothing logged. The resolver prefers what the deployment states and
       // otherwise asks the bot itself (getMe on the signup token), cached.
-      { resolveBotUsername },
+      // `publicOrigin` is for the unlink link in the Mini App sign-in notice.
+      { resolveBotUsername, publicOrigin: portal?.publicOrigin ?? null },
     )
       .catch((error) => {
         process.stderr.write(`${structuredLog("error", "outbox.dispatch_loop_error", {
