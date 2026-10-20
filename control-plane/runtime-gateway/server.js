@@ -116,7 +116,7 @@ function sameKey(supplied) {
 }
 
 // The sealed cookie proves the portal once vouched for this person; the portal
-// is asked again (at most every 30 s per person and trip) so that signing out of
+// is asked again (at most every 30 s per launching portal session and trip) so that signing out of
 // the portal, removing someone from the trip or disabling them ends the trip
 // session too. A positive answer is cached, a negative one never is. When the
 // control plane cannot be asked the answer is no: failing open here would turn
@@ -125,10 +125,11 @@ const LIVE_FOR_MS = Math.max(0, Math.min(30_000, Number(process.env.RUNTIME_SESS
 const liveCache = new Map();
 async function sessionLive(session) {
   if (typeof session.userId !== "string") return false;
-  const key = `${session.tripId}:${session.userId}`;
+  const sessionId = typeof session.sessionId === "string" ? session.sessionId : null;
+  const key = `${session.tripId}:${session.userId}:${sessionId}`;
   if ((liveCache.get(key) ?? 0) > Date.now()) return true;
   try {
-    await controlPlane("/internal/runtime-sessions/check", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tripId: session.tripId, userId: session.userId }) });
+    await controlPlane("/internal/runtime-sessions/check", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tripId: session.tripId, userId: session.userId, sessionId }) });
   } catch (error) {
     liveCache.delete(key);
     if (error?.message === "CONTROL_PLANE_REJECTED") return false;
@@ -172,7 +173,7 @@ async function launch(req, res, tripId) {
   if (!sessionResponse.ok) return launchRefused(res, [400, 401, 403].includes(sessionResponse.status) ? 401 : 503);
   const runtime = await sessionResponse.json();
   if (typeof runtime.token !== "string") return launchRefused(res, 503);
-  const value = encodeSession({ tripId, userId: grant.userId, token: runtime.token, exp: Date.now() + 12 * 60 * 60 * 1000 });
+  const value = encodeSession({ tripId, userId: grant.userId, sessionId: typeof grant.sessionId === "string" ? grant.sessionId : null, token: runtime.token, exp: Date.now() + 12 * 60 * 60 * 1000 });
   // Strict: the launch POST and the 303 that follows it come from the portal,
   // which must be same-site with this origin (docs/runtime-session-exchange.md).
   const attributes = [`${cookieName(tripId)}=${encodeURIComponent(value)}`, "Path=/", "HttpOnly", "SameSite=Strict", "Max-Age=43200"];

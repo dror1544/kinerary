@@ -9,6 +9,8 @@ let eventStreamClosed = false;
 const sessionBodies = [];
 const consumed = new Set();
 const revokedUsers = new Set();
+const revokedSessions = new Set();
+let lastCheck;
 let checkCalls = 0, checkDown = false;
 const PORTAL = "https://app.example.test";
 // What a browser sends for a page navigation (undici would otherwise say sec-fetch-mode: cors).
@@ -75,13 +77,13 @@ before(async () => {
       if (!reusable && !once) { res.statusCode = 401; return res.end(JSON.stringify({ error: "invalid" })); }
       if (once) consumed.add(payload.token);
       const tripId = payload.token === "once-other-trip" ? "trip_otherxyz1" : "trip_abcdefgh";
-      return res.end(JSON.stringify({ tripId, userId: "user_abcdefgh", role: "owner", runtimeUsername: null, audience: "runtime_gateway", dashboardUrl: `${PORTAL}/trips/${tripId}/setup` }));
+      return res.end(JSON.stringify({ tripId, userId: "user_abcdefgh", role: "owner", runtimeUsername: null, audience: "runtime_gateway", sessionId: payload.token === "once-device-b" ? "wsess_deviceb0001" : "wsess_devicea0001", dashboardUrl: `${PORTAL}/trips/${tripId}/setup` }));
     }
     if (req.url === "/internal/runtime-sessions/check") {
       const payload = await body(req);
-      checkCalls += 1;
+      checkCalls += 1; lastCheck = payload;
       if (checkDown) { res.statusCode = 500; return res.end("{}"); }
-      if (revokedUsers.has(payload.userId)) { res.statusCode = 401; return res.end(JSON.stringify({ error: "SESSION_REVOKED" })); }
+      if (revokedUsers.has(payload.userId) || revokedSessions.has(payload.sessionId)) { res.statusCode = 401; return res.end(JSON.stringify({ error: "SESSION_REVOKED" })); }
       return res.end(JSON.stringify({ live: true }));
     }
     if (req.url === "/internal/runtime-routes/trip_abcdefgh") return res.end(JSON.stringify({ routeRef: "route_abcdefgh", upstreamOrigin, upstreamBasePath: "" }));
@@ -189,6 +191,22 @@ test("revoking the person at the portal ends the trip session within the cache w
     await new Promise(resolve => setTimeout(resolve, 300));
     assert.equal((await get()).status, 401, "when the portal cannot be asked, the answer is no");
   } finally { checkDown = false; }
+});
+
+test("signing out on one device ends only the trip session opened from that device", async () => {
+  const a = (await formLaunch("once-device-a")).headers.get("set-cookie").split(";")[0];
+  const b = (await formLaunch("once-device-b")).headers.get("set-cookie").split(";")[0];
+  const get = (cookie) => fetch(`${gatewayOrigin}/t/trip_abcdefgh/api/config`, { headers: { cookie } });
+  assert.equal((await get(a)).status, 200);
+  assert.equal(lastCheck.sessionId, "wsess_devicea0001", "the check names the launching portal session");
+  assert.equal((await get(b)).status, 200);
+  assert.equal(lastCheck.sessionId, "wsess_deviceb0001");
+  revokedSessions.add("wsess_devicea0001"); // device A signs out of the portal; B's portal session is still live
+  try {
+    await new Promise(resolve => setTimeout(resolve, 300)); // past the 200 ms test window
+    assert.equal((await get(a)).status, 401, "the trip session opened from A ends");
+    assert.equal((await get(b)).status, 200, "the trip session opened from B keeps working");
+  } finally { revokedSessions.delete("wsess_devicea0001"); }
 });
 
 test("the JSON launch body still works for compatibility, with the same Origin rule", async () => {

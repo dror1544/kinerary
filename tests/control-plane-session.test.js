@@ -13,6 +13,7 @@ const tripId = 'trip_sessiontest01', ownerId = 'user_sessionowner', memberId = '
 const key = 'test-dedicated-exchange-key';
 const dashboardUrl = `https://portal.example.test/trips/${tripId}/setup`;
 let portalSignedOut = false;
+const signedOutSessions = new Set();
 let temp, ownerToken, gateway, controlPlane, gatewayOrigin, tripPort, mcpPort;
 const listen = server => new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(`http://127.0.0.1:${server.address().port}`)));
 const close = server => new Promise(resolve => { server.closeAllConnections(); server.close(resolve); });
@@ -35,15 +36,16 @@ before(async () => {
     if (req.url === '/internal/runtime-launch/consume') {
       let body = ''; for await (const chunk of req) body += chunk;
       const token = JSON.parse(body).token;
-      if (token !== 'owner-grant' && token !== 'member-grant') { res.writeHead(401); return res.end('{}'); }
+      if (token !== 'owner-grant' && token !== 'owner-grant-b' && token !== 'member-grant') { res.writeHead(401); return res.end('{}'); }
       const member = token === 'member-grant';
       // Same shape the control plane returns: a dashboard link for owners/organizers, null for members.
-      return res.end(JSON.stringify({ ...sessionBody(member ? { userId: memberId, role: 'member', runtimeUsername: 'bob' } : {}), dashboardUrl: member ? null : dashboardUrl, audience: 'runtime_gateway' }));
+      return res.end(JSON.stringify({ ...sessionBody(member ? { userId: memberId, role: 'member', runtimeUsername: 'bob' } : {}), dashboardUrl: member ? null : dashboardUrl, sessionId: token === 'owner-grant-b' ? 'wsess_deviceb0001' : 'wsess_devicea0001', audience: 'runtime_gateway' }));
     }
     if (req.url === '/internal/runtime-sessions/check') {
       let body = ''; for await (const chunk of req) body += chunk;
-      if (portalSignedOut) { res.writeHead(401); return res.end('{}'); }
-      return res.end(JSON.stringify({ live: JSON.parse(body).tripId === tripId }));
+      const asked = JSON.parse(body);
+      if (portalSignedOut || signedOutSessions.has(asked.sessionId)) { res.writeHead(401); return res.end('{}'); }
+      return res.end(JSON.stringify({ live: asked.tripId === tripId }));
     }
     if (req.url === `/internal/runtime-routes/${tripId}`) return res.end(JSON.stringify({ routeRef: 'fixture', upstreamOrigin: `http://127.0.0.1:${tripPort}`, upstreamBasePath: '' }));
     res.writeHead(404); res.end('{}');
@@ -207,6 +209,18 @@ test('after the portal signs the person out, the trip session is refused', async
   try { assert.equal((await config()).status, 401); assert.equal((await fetch(`${gatewayOrigin}/t/${tripId}/api/auth/me`, { headers: { cookie } })).status, 401); }
   finally { portalSignedOut = false; }
   assert.equal((await config()).status, 200);
+});
+
+test('signing out on one device ends only the trip session opened from it', async () => {
+  const a = await launch('owner-grant'), b = await launch('owner-grant-b');
+  const config = cookie => fetch(`${gatewayOrigin}/t/${tripId}/api/config`, { headers: { cookie } });
+  assert.equal((await config(a)).status, 200); assert.equal((await config(b)).status, 200);
+  signedOutSessions.add('wsess_devicea0001');
+  try {
+    assert.equal((await config(a)).status, 401, 'device A signed out of the portal');
+    assert.equal((await config(b)).status, 200, 'device B is still signed in');
+    assert.equal((await fetch(`${gatewayOrigin}/t/${tripId}/api/auth/me`, { headers: { cookie: b } })).status, 200);
+  } finally { signedOutSessions.delete('wsess_devicea0001'); }
 });
 
 test('removing a participant also refuses future gateway sessions and existing managed tokens', async () => {

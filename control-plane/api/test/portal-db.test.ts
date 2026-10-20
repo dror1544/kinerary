@@ -526,3 +526,43 @@ test("the gateway can ask whether a trip session is still entitled, and portal l
     await pool.query("UPDATE control_plane.trip_memberships SET runtime_access = true WHERE trip_id = $1 AND user_id = $2", [ids.otherTrip, ids.outsider]);
   } finally { await app.close(); }
 });
+
+test("a trip session is tied to the portal session that launched it: logout on device A ends A's only", { skip }, async () => {
+  const app = buildApp(profile, { portal: portalDeps(pool) });
+  const post = (url: string, payload: unknown, headers: Record<string, string> = {}) => app.inject({ method: "POST", url, headers, payload: payload as object });
+  const internal = { "x-api-key": "exchange-key" };
+  const launchFrom = async (device: { cookie: string; csrf: string }) => {
+    const launched = await post(`/v1/trips/${ids.otherTrip}/launch`, undefined, { cookie: device.cookie, "x-csrf-token": device.csrf });
+    assert.equal(launched.statusCode, 200);
+    const consumed = await post("/internal/runtime-launch/consume", { token: launched.json().launchToken }, internal);
+    assert.equal(consumed.statusCode, 200);
+    return consumed.json() as { sessionId: string | null; userId: string };
+  };
+  const live = async (grant: { sessionId: string | null }) => (await post("/internal/runtime-sessions/check", { tripId: ids.otherTrip, userId: ids.outsider, sessionId: grant.sessionId }, internal)).statusCode;
+  try {
+    await pool.query("UPDATE control_plane.web_sessions SET revoked_at = now() WHERE user_id = $1", [ids.outsider]);
+    const deviceA = await session(ids.outsider, "devicea"), deviceB = await session(ids.outsider, "deviceb");
+    const a = await launchFrom(deviceA), b = await launchFrom(deviceB);
+    assert.equal(a.sessionId, `wsess_${suffix}devicea`, "the grant remembers the launching session");
+    assert.equal(b.sessionId, `wsess_${suffix}deviceb`);
+    assert.equal(await live(a), 200); assert.equal(await live(b), 200);
+    const loggedOut = await post("/v1/logout", undefined, { cookie: deviceA.cookie, "x-csrf-token": deviceA.csrf });
+    assert.equal(loggedOut.statusCode, 200);
+    assert.equal(await live(a), 401, "A's trip session ends");
+    assert.equal(await live(b), 200, "B's portal session is live, so B's trip session keeps working");
+    // A session id that belongs to someone else, or to nobody, is not a live session of this person.
+    assert.equal(await live({ sessionId: `wsess_${suffix}member` }), 401);
+    assert.equal(await live({ sessionId: "wsess_doesnotexist01" }), 401);
+    // An expired session ends it too.
+    await pool.query("UPDATE control_plane.web_sessions SET expires_at = now() - interval '1 second' WHERE id = $1", [b.sessionId]);
+    assert.equal(await live(b), 401);
+    // A grant minted before the column existed has no session: the earlier rule (any live session of the person) still applies.
+    await session(ids.outsider, "devicec");
+    assert.equal(await live({ sessionId: null }), 200);
+    const legacy = `legacy-grant-${suffix}`;
+    await pool.query(`INSERT INTO control_plane.runtime_launch_grants(id, trip_id, user_id, token_digest, audience, expires_at) VALUES ($1, $2, $3, $4, 'runtime_gateway', now() + interval '60 seconds')`, [`launch_${suffix}legacy`, ids.otherTrip, ids.outsider, sha256(legacy)]);
+    const consumedLegacy = await post("/internal/runtime-launch/consume", { token: legacy }, internal);
+    assert.equal(consumedLegacy.statusCode, 200);
+    assert.equal(consumedLegacy.json().sessionId, null);
+  } finally { await app.close(); }
+});

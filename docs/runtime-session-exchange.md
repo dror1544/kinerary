@@ -147,17 +147,24 @@ query or return path reflected, identical for existing and nonexistent trips. A
 script's fetch keeps the 401 JSON. The old "wait for a postMessage" bootstrap page
 and both message listeners are gone.
 
-**Revocable sessions.** The sealed cookie also records the portal user. On every
-request the gateway asks `POST /internal/runtime-sessions/check` (exchange key,
-compared in constant time) whether that person is still active, still has
-`runtime_access` on the trip and still has a live portal session; a positive
-answer is cached for at most 30 s (`RUNTIME_SESSION_CHECK_TTL_MS` lowers it, for
-tests), a negative one never, and an unreachable control plane means refusal.
-Signing out of the portal, removal from the trip or disabling the account
-therefore ends trip access within 30 s (a stream already open ends at its next
-reconnect). *Interim:* "live portal session" is any live session of that person;
-binding the grant and cookie to the exact launching session needs a column on
-`runtime_launch_grants` (a migration) and is proposed separately.
+**Revocable sessions.** `POST /v1/trips/:id/launch` records the launching portal
+session's ID (`web_sessions.id`, not its token digest) on the grant
+(`runtime_launch_grants.session_id`); the consume response returns it and the
+gateway seals it, with the portal user, in the per-trip cookie. On every request
+the gateway asks `POST /internal/runtime-sessions/check` (exchange key, compared
+in constant time) whether **that exact session** is still live (not revoked, not
+expired, same person), and whether the person is still active and still has
+`runtime_access` on the trip. A positive answer is cached for at most 30 s per
+launching session (`RUNTIME_SESSION_CHECK_TTL_MS` lowers it, for tests), a
+negative one never, and an unreachable control plane means refusal. Signing out
+of the portal on one device therefore ends the trip session opened from that
+device within 30 s and leaves the one opened from another device working;
+removal from the trip or disabling the account ends them all. A grant minted
+before the column existed carries no session (`NULL`) and keeps the earlier rule
+(any live portal session of the person) until it expires, 90 s, so a rollback of
+the portal is compatible. The column is deliberately not a foreign key: a
+deleted session must answer "no", not be rewritten to `NULL`. A stream already
+open ends at its next reconnect.
 
 **Shared runtime origin.** Every trip opened from the portal lives on one origin.
 The trip UIs therefore scope `trip-token`, `tripToken`, `token` and `trip-user`

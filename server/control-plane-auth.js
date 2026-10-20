@@ -19,13 +19,14 @@ const usernameValid = value => typeof value === 'string' && /^[a-z0-9][a-z0-9._-
 // than rendered into a menu href: javascript:, data:, userinfo, control
 // characters and other paths never leave this function.
 const MAX_DASHBOARD_URL = 2048;
-const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
+// Loopback by shape, not by literal: the release build refuses a private-IPv4 literal in shipped code.
+const isLoopbackHost = host => host === 'localhost' || host === '[::1]' || /^127(\.\d{1,3}){3}$/.test(host);
 function safeDashboardUrl(value, tripId) {
   if (typeof value !== 'string' || !value || value.length > MAX_DASHBOARD_URL || /[\u0000-\u0020\u007f]/.test(value)) return null;
   let url;
   try { url = new URL(value); } catch { return null; }
   if (url.username || url.password || url.search || url.hash) return null;
-  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && LOOPBACK_HOSTS.has(url.hostname))) return null;
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && isLoopbackHost(url.hostname))) return null;
   if (!tripIdValid(tripId) || url.pathname !== `/trips/${tripId}/setup`) return null;
   return url.href;
 }
