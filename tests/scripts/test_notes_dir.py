@@ -322,6 +322,14 @@ class TheAgentsWriteWhereTheRuleSays(unittest.TestCase):
         self.assertIn("regression-plans/", t)
         self.assertIn("docs/test-reports/", t)
 
+    def test_implementation_specs_live_in_the_repo(self):
+        claude = self.read("CLAUDE.md")
+        self.assertIn("docs/specs/sprint-N/", claude)
+        self.assertIn("docs/specs/sprint-<N>/", self.read(".claude/agents/doc-keeper.md"))
+        readme = self.read("docs/specs/README.md")
+        for needle in ("Acceptance criteria", "approved", "hard rule 6", "$KINERARY_NOTES_DIR/specs/"):
+            self.assertIn(needle, readme, needle)
+
     def test_doc_keeper_zones(self):
         t = self.read(".claude/agents/doc-keeper.md")
         for needle in ("KINERARY_NOTES_DIR", "specs/", "handovers/", "regression-plans/", "test-reports/",
