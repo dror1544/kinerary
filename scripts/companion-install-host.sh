@@ -67,6 +67,10 @@ cat > "$HANDOFF"
 # slug and a profile name. Everything the bridge needs beyond those two (the
 # site's address, the container, the port) is read from this host's own
 # kinerary-deploy files below, never from the request.
+#
+# A fourth, since 2026-10-21 (issue #349): `companion_gateway_status`, a list of
+# profile NAMES the control plane wants the running state of. READ-ONLY; see its
+# handler below. It carries no `profile` object, so it is validated separately.
 VALIDATED="$(
   /usr/bin/python3 - "$HANDOFF" <<'PY'
 import json, re, sys
@@ -77,8 +81,18 @@ except Exception as e:
 if not isinstance(d, dict):
     print("refusing a request that is not a JSON object", file=sys.stderr); raise SystemExit(2)
 kind = d.get("record_type") or "trip_assistant_profile_input"
-if kind not in ("trip_assistant_profile_input", "trip_mcp_bridge_request", "trip_mcp_bridge_probe"):
+if kind not in ("trip_assistant_profile_input", "trip_mcp_bridge_request", "trip_mcp_bridge_probe",
+                "companion_gateway_status"):
     print(f"refusing unknown request type: {kind!r}", file=sys.stderr); raise SystemExit(2)
+if kind == "companion_gateway_status":
+    # A list of profile NAMES and nothing else (issue 349). Each one is checked
+    # with the same pattern as every other name that reaches this host, because
+    # the status handler below reads a directory and matches a process by it.
+    names = d.get("profiles")
+    if (not isinstance(names, list) or not 1 <= len(names) <= 200 or len(set(map(str, names))) != len(names)
+            or not all(isinstance(n, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{1,62}", n) for n in names)):
+        print("refusing an unsafe gateway status request", file=sys.stderr); raise SystemExit(2)
+    print(f"{kind}\t\t"); raise SystemExit(0)
 profile = d.get("profile") or {}
 name = profile.get("name") if isinstance(profile, dict) else None
 # Conservative on purpose: this becomes ~/.hermes/profiles/<name>. No dots (no
@@ -99,6 +113,76 @@ PY
 REQUEST_KIND="$(printf '%s' "$VALIDATED" | cut -f1)"
 PROFILE_NAME="$(printf '%s' "$VALIDATED" | cut -f2)"
 TRIP_SLUG="$(printf '%s' "$VALIDATED" | cut -f3)"
+
+# ── Gateway status: which companion gateways are running on THIS host? ───────
+#
+# Issue #349. The control plane decides which companions run, and to decide it
+# has to be able to see. Read-only and early: it renders nothing, starts and
+# stops nothing, reads no key and no trip file, and answers about exactly the
+# profiles named. A request carries NAMES (already validated above); how a
+# gateway is recognised is this host's own business.
+#
+# Recognised the way scripts/e2e-full-cycle.py already does, by its command
+# line: `-p|--profile <name> gateway run`, which launchd runs on a Mac and an s6
+# slot in the Hermes container runs on the VM (visible to this host's ps). A
+# supervisor wrapper whose own arguments repeat that command line is ONE
+# gateway, not two: a match whose parent is also a match for the same profile is
+# not counted, so `duplicate` means two independent starters, the thing the
+# upgrade precondition worries about.
+#
+# Output is EXACTLY these lines, and the worker parses each by full match:
+#   GATEWAY <name> <running|duplicate|stopped|absent> <n>      one per name asked
+#   STATUS_END <number of GATEWAY lines>                       a truncated answer is not a short list
+# `stopped` is a profile directory with no gateway; `absent` is no such profile.
+if [ "$REQUEST_KIND" = "companion_gateway_status" ]; then
+  /usr/bin/python3 - "$HANDOFF" "$HOME/.hermes/profiles" <<'PYSTATUS' || die "gateway status failed"
+import json, os, re, subprocess, sys
+
+NAME = re.compile(r"[a-z0-9][a-z0-9-]{1,62}")
+GATEWAY = re.compile(r"(?:^|\s)(?:-p|--profile)\s+([a-z0-9][a-z0-9-]{1,62})\s+gateway\s+run(?:\s|$)")
+ROW = re.compile(r"\s*([0-9]+)\s+([0-9]+)\s+(.*)")
+
+names = json.load(open(sys.argv[1])).get("profiles")
+if not isinstance(names, list) or not names or not all(isinstance(n, str) and NAME.fullmatch(n) for n in names):
+    print("companion-install-host: refusing an unsafe gateway status request", file=sys.stderr)
+    raise SystemExit(2)
+
+try:
+    listing = subprocess.run(["ps", "axww", "-o", "pid=,ppid=,args="], capture_output=True, text=True, timeout=30)
+except (OSError, subprocess.SubprocessError):
+    listing = None
+if listing is None or listing.returncode != 0:
+    print("companion-install-host: could not list processes", file=sys.stderr)
+    raise SystemExit(2)
+
+matches = {}
+for line in listing.stdout.splitlines():
+    row = ROW.fullmatch(line)
+    found = GATEWAY.search(row.group(3)) if row else None
+    if found:
+        matches[int(row.group(1))] = (int(row.group(2)), found.group(1))
+
+top_level = {}
+for pid, (ppid, profile) in matches.items():
+    parent = matches.get(ppid)
+    if parent is None or parent[1] != profile:
+        top_level[profile] = top_level.get(profile, 0) + 1
+
+for name in names:
+    n = top_level.get(name, 0)
+    if n >= 2:
+        state = "duplicate"
+    elif n == 1:
+        state = "running"
+    elif os.path.isdir(os.path.join(sys.argv[2], name)):
+        state = "stopped"
+    else:
+        state = "absent"
+    print(f"GATEWAY {name} {state} {min(n, 99)}")
+print(f"STATUS_END {len(names)}")
+PYSTATUS
+  exit 0
+fi
 
 # render_profile.py refuses to overwrite an existing profile, so a retried job
 # after a partial success is a safe error rather than a silent clobber. Report

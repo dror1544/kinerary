@@ -42,9 +42,10 @@ def poll_loop(
     *,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    gateway_sweep: Any = None,
 ) -> None:
     """The provisioner's loop: one job at a time; when there is none, the
-    bridge probe (if due), then a sleep.
+    bridge probe (if due), the gateway reconcile (if due), then a sleep.
 
     The probe runs ONLY on an idle poll, in this same thread, so it can never
     race a provision re-wiring the same trip's bridge (issue #119). A failed
@@ -60,6 +61,14 @@ def poll_loop(
                 except Exception as exc:
                     print(json.dumps({"event": "provisioner.bridge_probe_sweep_failed",
                                       "error": safe_failure_message(exc)}), flush=True)
+                if gateway_sweep is not None:
+                    # Its own handler: a reconcile failure must neither skip the
+                    # sleep nor be mistaken for a bridge-probe failure.
+                    try:
+                        gateway_sweep.maybe_run(should_stop=is_stopping)
+                    except Exception as exc:
+                        print(json.dumps({"event": "provisioner.gateway_reconcile_failed",
+                                          "error": safe_failure_message(exc)}), flush=True)
                 end = monotonic() + poll_seconds
                 while not is_stopping() and monotonic() < end:
                     sleep(min(0.25, max(0, end - monotonic())))
@@ -78,6 +87,41 @@ def _non_negative_minutes(raw: str) -> float:
     if value < 0 or value != value or value == float("inf"):
         raise argparse.ArgumentTypeError(f"must be 0 (off) or a positive number of minutes: {raw!r}")
     return value
+
+
+def _reconcile_mode(raw: str) -> str:
+    """observe | enforce | off. Anything else REFUSES at startup: a typo that
+    quietly became `observe` or `off` would leave the operator believing the
+    control plane was deciding which gateways run when it was not."""
+    from .gateway_reconcile import MODES
+
+    value = (raw or "").strip().lower()
+    if value not in MODES:
+        raise argparse.ArgumentTypeError(f"must be one of {', '.join(MODES)}: {raw!r}")
+    return value
+
+
+def _add_companion_ssh_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--companion-ssh-host", default=os.environ.get("PROVISIONER_COMPANION_SSH_HOST"))
+    parser.add_argument("--companion-ssh-user", default=os.environ.get("PROVISIONER_COMPANION_SSH_USER"))
+    parser.add_argument("--companion-ssh-key", default=os.environ.get("PROVISIONER_COMPANION_SSH_KEY"))
+    parser.add_argument("--companion-ssh-known-hosts", default=os.environ.get("PROVISIONER_COMPANION_SSH_KNOWN_HOSTS"))
+
+
+def _gateway_adapter(args: argparse.Namespace) -> Any:
+    """The adapter that asks the companion host about gateways, or None.
+
+    Independent of whether PROVISIONING is switched on: the VM keeps companion
+    provisioning off outside a test run, and the control plane still has to
+    know which gateways are running there."""
+    if not (args.companion_ssh_host and args.companion_ssh_user and args.companion_ssh_key):
+        return None
+    from .gateway_reconcile import SshGatewayAdapter
+
+    return SshGatewayAdapter(
+        host=args.companion_ssh_host, user=args.companion_ssh_user, key_path=args.companion_ssh_key,
+        known_hosts=args.companion_ssh_known_hosts,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -182,6 +226,37 @@ def build_parser() -> argparse.ArgumentParser:
                                 "trip at most this often, and record the answer as the trip's reachability — "
                                 "alert only, nothing is restarted. 0 turns it off "
                                 "(PROVISIONER_BRIDGE_PROBE_MINUTES, default 30)")
+    # #349. The control plane decides which companion gateways run. OBSERVE by
+    # default: it records every decision and every observation and acts on
+    # nothing, so shipping the code changes no running gateway. `enforce` is a
+    # deliberate switch; an unreadable value refuses rather than falling back.
+    # `or "observe"`: compose passes `${GATEWAY_RECONCILE_MODE:-}`, so an unset
+    # variable arrives as "" and means the default.
+    provision.add_argument("--gateway-reconcile-mode", type=_reconcile_mode,
+                           default=os.environ.get("GATEWAY_RECONCILE_MODE") or "observe",
+                           help="observe (default): record which companion gateways should run and what the host "
+                                "reports, act on nothing. enforce: also start and stop them. off: do not run "
+                                "(GATEWAY_RECONCILE_MODE)")
+    provision.add_argument("--gateway-reconcile-minutes", type=_non_negative_minutes,
+                           default=os.environ.get("GATEWAY_RECONCILE_MINUTES") or "5",
+                           help="how often the gateway reconcile sweeps when idle; a switch of an organizer's "
+                                "trip or a lost family message runs one sooner. 0 turns it off "
+                                "(GATEWAY_RECONCILE_MINUTES, default 5)")
+    reconcile = subparsers.add_parser(
+        "reconcile-gateways",
+        help="operator: run one gateway reconcile sweep, show what it would do, or pin a gateway on/off")
+    reconcile.add_argument("--database-url-file", default=os.environ.get("CONTROL_PLANE_DATABASE_URL_FILE"))
+    _add_companion_ssh_arguments(reconcile)
+    which = reconcile.add_mutually_exclusive_group(required=True)
+    which.add_argument("--once", action="store_true",
+                       help="one sweep now, in --mode (observe unless you say otherwise), then exit")
+    which.add_argument("--dry-run", action="store_true",
+                       help="decide, ask the host, print what would be started and stopped; write and act on nothing")
+    which.add_argument("--pin", nargs=2, metavar=("PROFILE", "on|off|clear"),
+                       help="override the decision for one gateway, under the same lock the sweep takes; "
+                            "the next enforce sweep applies it")
+    reconcile.add_argument("--mode", type=_reconcile_mode, default="observe",
+                           help="with --once: observe (default) or enforce")
     check = subparsers.add_parser("check-database", help="verify the private worker database connection")
     check.add_argument("--database-url-file", default=os.environ.get("CONTROL_PLANE_DATABASE_URL_FILE"))
     return parser
@@ -238,7 +313,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     _configure_logging()
     try:
-        if args.command in {"run", "check-database", "provision"} and not args.database_url_file:
+        if args.command in {"run", "check-database", "provision", "reconcile-gateways"} and not args.database_url_file:
             raise ValueError("--database-url-file or CONTROL_PLANE_DATABASE_URL_FILE is required")
         if args.command == "provision":
             if not args.deploy_root:
@@ -544,6 +619,12 @@ def main(argv: list[str] | None = None) -> int:
             from .mcp_bridge import BridgeProbeSweep
             bridge_sweep = BridgeProbeSweep(db_url, mcp_bridge_adapter, interval_minutes=args.bridge_probe_minutes)
             print(bridge_sweep.describe(), flush=True)
+            from .gateway_reconcile import GatewayReconcileSweep
+            gateway_sweep = GatewayReconcileSweep(
+                db_url, _gateway_adapter(args),
+                mode=args.gateway_reconcile_mode, interval_minutes=args.gateway_reconcile_minutes,
+            )
+            print(gateway_sweep.describe(), flush=True)
             import signal
             stopping = False
             def _stop(_sig: int, _frame: object) -> None:
@@ -551,8 +632,24 @@ def main(argv: list[str] | None = None) -> int:
                 stopping = True
             signal.signal(signal.SIGTERM, _stop)
             signal.signal(signal.SIGINT, _stop)
-            poll_loop(worker_obj, bridge_sweep, args.poll_seconds, lambda: stopping)
+            poll_loop(worker_obj, bridge_sweep, args.poll_seconds, lambda: stopping, gateway_sweep=gateway_sweep)
             return 0
+        if args.command == "reconcile-gateways":
+            from .gateway_reconcile import GatewayReconcileSweep, format_plan, set_pin
+            from .runtime import read_secret_file
+            db_url = read_secret_file(args.database_url_file)
+            adapter = _gateway_adapter(args)
+            if adapter is None:
+                raise ValueError("a companion SSH host, user and key are required "
+                                 "(--companion-ssh-host/-user/-key or PROVISIONER_COMPANION_SSH_*)")
+            if args.pin:
+                profile, state = args.pin
+                print(json.dumps(set_pin(db_url, adapter, profile, state), sort_keys=True), flush=True)
+                return 0
+            sweep = GatewayReconcileSweep(db_url, adapter, mode=args.mode, interval_minutes=5)
+            summary = sweep.run(dry_run=args.dry_run)
+            print(format_plan(summary), flush=True)
+            return 0 if summary["result"] == "ok" else 1
         if args.command == "run":
             from .runtime import run
             return run(args.database_url_file, args.poll_seconds)

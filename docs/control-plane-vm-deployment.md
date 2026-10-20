@@ -482,7 +482,7 @@ plan 2026-09-28 finding 3).
 **What it is.** `control-plane/deployment/monitor-db-role.sql` creates
 `kinerary_fleet_ro`: `LOGIN NOINHERIT`, no other attribute, no memberships,
 connection limit 20, `default_transaction_read_only = on`,
-`statement_timeout = 20s`, and `SELECT` on exactly the 92 columns of the 14
+`statement_timeout = 20s`, and `SELECT` on exactly the 117 columns of the 16
 relations the fleet MCP reads — column-level, so `trips.companion_intro` (each
 site's password), `intake_sessions.answers` and people's names stay unreadable
 (the file's header). It also takes `TEMPORARY` on the database from `PUBLIC`,
