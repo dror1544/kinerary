@@ -50,6 +50,7 @@ import os
 import pwd
 import re
 import secrets
+import select
 import shlex
 import shutil
 import subprocess
@@ -1275,14 +1276,31 @@ class ControlPlane:
         # excluded — waiting on those would cost every trip the full timeout
         # for a companion that was never coming back.
         #
-        # The same special case, for the same reason, lives in
+        #
+        # A DORMANT companion is not live either (issue #349): one the control
+        # plane's reconciler has actually STOPPED on purpose and the host
+        # confirmed stopped, so "NOT connected to the relay" is the right state
+        # and must neither fail a verify nor have its bridge restarted. Dormant is
+        # what HAPPENED, not what was decided: desired 'stopped' AND the last
+        # action a successful stop AND the host last saying stopped/absent. A
+        # decision alone is not enough - in observe mode the reconciler decides
+        # and never acts, and a running (or later crashed) gateway must stay
+        # expected. No row (not decided about) or no table (a database from before
+        # the migration) means NOT dormant: when in doubt a companion is expected up.
+        #
+        # The same two special cases, for the same reasons, live in
         # control-plane/api/src/relay/gateway-wait.ts's expectedGatewayProfiles
-        # — if another UNREACHABLE_REASONS value ever needs the same
-        # treatment, update both queries together.
+        # — if either changes, or another UNREACHABLE_REASONS value ever needs
+        # the same treatment, update both queries together.
+        dormant = ""
+        if self.psql("SELECT to_regclass('control_plane.companion_gateways') IS NOT NULL") == "t":
+            dormant = (" AND NOT EXISTS (SELECT 1 FROM control_plane.companion_gateways g "
+                       "WHERE g.hermes_profile = b.hermes_profile AND g.desired = 'stopped' AND g.last_action = 'stop' AND g.last_result = 'ok' AND g.observed IN ('stopped', 'absent'))")
         rows = self.psql(
             "SELECT DISTINCT t.slug || '|' || b.hermes_profile FROM control_plane.telegram_chat_bindings b "
             "JOIN control_plane.trips t ON t.id = b.trip_id WHERE b.closed_at IS NULL AND b.hermes_profile IS NOT NULL "
-            "AND (t.reachability <> 'unreachable' OR t.unreachable_reason = 'TRIP_MCP_BRIDGE_FAILED') ORDER BY 1")
+            "AND (t.reachability <> 'unreachable' OR t.unreachable_reason = 'TRIP_MCP_BRIDGE_FAILED')"
+            + dormant + " ORDER BY 1")
         return [tuple(row.split("|", 1)) for row in rows.splitlines() if "|" in row]  # type: ignore[misc]
 
     def verify(self) -> bool:
@@ -1394,6 +1412,117 @@ def current_versions(cp: ControlPlane) -> Dict[str, str]:
             "full": cp.git("rev-parse", "HEAD", check=False)}
 
 
+#: The text the worker's reconciler, scripts/teardown-trip.py and this tool all
+#: pass to hashtext() to name ONE advisory lock. tests/scripts pins that the
+#: three spell it identically.
+GATEWAY_LOCK_TEXT = "control_plane.companion_gateways"
+
+
+class GatewayLock:
+    """Holds the companion-gateway advisory lock for the length of a release
+    action that stops or starts gateways (upgrade, rollback, restart-bridges).
+
+    The worker's reconciler takes the same lock for every sweep and skips the
+    sweep when it is held, so it cannot start a gateway this tool just stopped,
+    or stop one it is waiting for, halfway through an upgrade. The lock lives as
+    long as one database SESSION, so a `psql` is kept open in the Postgres
+    container with its stdin as the lease: closing the pipe ends the session
+    and releases the lock, whatever happens to this process.
+
+    If the lock cannot be had within WAIT_SECONDS something else (a sweep, a
+    teardown, an operator pin) is mid-flight: the action is REFUSED, not run
+    unguarded. If the DATABASE cannot be reached at all it is noted and the
+    action goes on — a rollback must stay possible when the database is the
+    thing that is broken, and with it down no reconciler can act either.
+    `--restore-db` kills this session by design; the lock is gone by then and
+    that is fine, the swap replaces the database it was held in."""
+
+    WAIT_SECONDS = 120
+
+    def __init__(self, cp: "ControlPlane") -> None:
+        self.cp = cp
+        self.proc: Optional["subprocess.Popen[bytes]"] = None
+
+    def __enter__(self) -> "GatewayLock":
+        cp = self.cp
+        if cp.dry_run:
+            cp.r.step("would hold the companion-gateway lock while this runs (the reconciler pauses)")
+            return self
+        argv = ["docker", "exec", "-i", PG_CONTAINER, "psql", "-U", DB_USER, "-d", DB_NAME, "-q", "-At",
+                "-v", "ON_ERROR_STOP=1"]
+        try:
+            self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            assert self.proc.stdin is not None and self.proc.stdout is not None
+            self.proc.stdin.write((f"SET lock_timeout = '{int(self.WAIT_SECONDS)}s';\n"
+                                   f"SELECT pg_advisory_lock(hashtext('{GATEWAY_LOCK_TEXT}'));\n"
+                                   "SELECT 'LOCKED';\n").encode())
+            self.proc.stdin.flush()
+            deadline = time.monotonic() + self.WAIT_SECONDS + 15
+            # Unbuffered reads on the pipe's descriptor: select() on a descriptor
+            # whose data a BufferedReader has already pulled in never fires, and
+            # psql's blank line and 'LOCKED' can arrive in one chunk.
+            fd, seen = self.proc.stdout.fileno(), b""
+            while True:
+                remaining = deadline - time.monotonic()
+                ready = select.select([fd], [], [], remaining)[0] if remaining > 0 else []
+                if not ready:
+                    self._release()
+                    raise Refused("the companion-gateway lock is held by something else (a reconcile sweep, a "
+                                  "teardown or a pin): retry in a few minutes")
+                chunk = os.read(fd, 4096)
+                seen += chunk
+                if b"LOCKED" in seen.split():
+                    cp.r.ok("holding the companion-gateway lock: the reconciler pauses until this finishes")
+                    return self
+                if chunk == b"":
+                    self.proc.wait(timeout=10)
+                    err = (self.proc.stderr.read() if self.proc.stderr else b"").decode(errors="replace")
+                    self._release()
+                    if "lock timeout" in err:
+                        raise Refused("the companion-gateway lock is held by something else (a reconcile sweep, a "
+                                      "teardown or a pin): retry in a few minutes")
+                    reason = err.strip().splitlines()[-1][:160] if err.strip() else "no reason given"
+                    cp.r.note(f"could not take the companion-gateway lock ({reason}): continuing without it — "
+                              "with the database unreachable no reconciler can act either")
+                    return self
+        except OSError as error:
+            cp.r.note(f"could not take the companion-gateway lock ({type(error).__name__}): continuing without it")
+            self.proc = None
+            return self
+
+    def _release(self) -> None:
+        proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+            proc.wait(timeout=10)
+        except (subprocess.TimeoutExpired, OSError):
+            proc.kill()
+        for stream in (proc.stdout, proc.stderr):
+            if stream:
+                stream.close()
+
+    def __exit__(self, *exc: object) -> bool:
+        self._release()
+        return False
+
+
+def holds_gateway_lock(fn):  # type: ignore[no-untyped-def]
+    """Run a release action that moves gateways under the companion-gateway lock."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(cp, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if not isinstance(cp, ControlPlane):
+            return fn(cp, *args, **kwargs)
+        with GatewayLock(cp):
+            return fn(cp, *args, **kwargs)
+
+    return wrapper
+
+
 def cmd_status(cp: ControlPlane) -> int:
     r = cp.r
     versions = current_versions(cp)
@@ -1464,6 +1593,7 @@ def cmd_plan(cp: ControlPlane, rev: str) -> int:
     return 1 if r.failures else 0
 
 
+@holds_gateway_lock
 def cmd_upgrade(cp: ControlPlane, rev: str, hermes_rev: Optional[str], force_live: bool) -> int:
     r = cp.r
     r.head("1/5 Prepare" + ("  [DRY RUN — nothing will change]" if cp.dry_run else ""))
@@ -1568,6 +1698,7 @@ def cmd_upgrade(cp: ControlPlane, rev: str, hermes_rev: Optional[str], force_liv
     return 2
 
 
+@holds_gateway_lock
 def cmd_rollback(cp: ControlPlane, to: Optional[str], restore_db: bool, keep_db: bool, restore_hermes: bool, force_live: bool) -> int:
     r = cp.r
     r.head("1/5 Target" + ("  [DRY RUN — nothing will change]" if cp.dry_run else ""))
@@ -1856,6 +1987,7 @@ def undo_hermes_data(cp: ControlPlane, aside: Path) -> None:
               describe="compose up -d hermes  (companions and site AI features come back)", timeout=900)
 
 
+@holds_gateway_lock
 def cmd_restart_bridges(cp: ControlPlane) -> int:
     r = cp.r
     r.head("Restart trip-mcp bridges and their companions" + ("  [DRY RUN]" if cp.dry_run else ""))

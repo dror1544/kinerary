@@ -276,5 +276,89 @@ class RestoreAgainstPostgres(unittest.TestCase):
                          "genuinely unreachable for another reason is still excluded")
 
 
+    # ---------------------------------------------------- issue #349 ---------
+    GATEWAYS = ("CREATE TABLE control_plane.companion_gateways "
+                "(hermes_profile text PRIMARY KEY, desired text NOT NULL CHECK (desired IN ('running','stopped')), "
+                "observed text, last_action text, last_result text);")
+
+    def test_live_companions_skips_a_dormant_companion_and_only_that(self):
+        # DORMANT is what the reconciler DID: it stopped the gateway, the host
+        # confirmed, and the decision is still "stopped". A decision alone (observe
+        # mode decides and never acts) must leave a companion expected: it is
+        # running, or it crashed, and restart-bridges/verify must still see it.
+        # No row (undecided) and no table (a database from before the migration)
+        # both mean "expected up".
+        self.sql("kinerary_control_plane", """
+            UPDATE control_plane.telegram_chat_bindings SET hermes_profile = 'japan2026' WHERE id = 'tcb_1';
+            INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES
+              ('trip_ddddddd1', 'dormant-trip', 'ready_private'), ('trip_ddddddd2', 'undecided-trip', 'ready_private'),
+              ('trip_ddddddd3', 'warm-trip', 'ready_private'), ('trip_ddddddd4', 'observe-trip', 'ready_private'),
+              ('trip_ddddddd5', 'cameback-trip', 'ready_private'), ('trip_ddddddd6', 'failed-trip', 'ready_private'),
+              ('trip_ddddddd7', 'neverstopped-trip', 'ready_private'), ('trip_ddddddd8', 'absent-trip', 'ready_private');
+            INSERT INTO control_plane.telegram_chat_bindings(id, trip_id, chat_id, hermes_profile) VALUES
+              ('tcb_d1', 'trip_ddddddd1', '3001', 'dormant2026'), ('tcb_d2', 'trip_ddddddd2', '3002', 'undecided2026'),
+              ('tcb_d3', 'trip_ddddddd3', '3003', 'warm2026'), ('tcb_d4', 'trip_ddddddd4', '3004', 'observe2026'),
+              ('tcb_d5', 'trip_ddddddd5', '3005', 'cameback2026'), ('tcb_d6', 'trip_ddddddd6', '3006', 'failed2026'),
+              ('tcb_d7', 'trip_ddddddd7', '3007', 'neverstopped2026'), ('tcb_d8', 'trip_ddddddd8', '3008', 'absent2026');
+        """)
+        without_table = self.cp.live_companions()
+        self.assertIn(("dormant-trip", "dormant2026"), without_table, "no table: nothing is dormant")
+        self.sql("kinerary_control_plane", self.GATEWAYS + """
+            INSERT INTO control_plane.companion_gateways VALUES
+              ('dormant2026', 'stopped', 'stopped', 'stop', 'ok'),
+              ('absent2026', 'stopped', 'absent', 'stop', 'ok'),
+              ('warm2026', 'running', 'running', NULL, NULL),
+              ('observe2026', 'stopped', 'running', NULL, NULL),
+              ('cameback2026', 'stopped', 'running', 'stop', 'ok'),
+              ('failed2026', 'stopped', 'running', 'stop', 'failed'),
+              ('neverstopped2026', 'stopped', 'stopped', NULL, NULL);""")
+        result = self.cp.live_companions()
+        self.assertNotIn(("dormant-trip", "dormant2026"), result)
+        self.assertNotIn(("absent-trip", "absent2026"), result)
+        for expected in (("undecided-trip", "undecided2026"), ("warm-trip", "warm2026"), ("japan", "japan2026"),
+                         ("observe-trip", "observe2026"), ("cameback-trip", "cameback2026"),
+                         ("failed-trip", "failed2026"), ("neverstopped-trip", "neverstopped2026")):
+            self.assertIn(expected, result, f"{expected} must stay expected")
+
+    def test_the_release_lock_pauses_the_reconciler_and_lets_go(self):
+        def try_lock() -> str:
+            return self.sql("kinerary_control_plane",
+                            f"SELECT pg_try_advisory_lock(hashtext('{self.vr.GATEWAY_LOCK_TEXT}'))"
+                            f"::int || ':' || pg_advisory_unlock_all()::text")
+
+        self.assertTrue(try_lock().startswith("1"), "free to begin with")
+        with self.vr.GatewayLock(self.cp):
+            # pg_advisory_unlock_all releases only this probe's own locks.
+            self.assertTrue(try_lock().startswith("0"), "held while the release action runs")
+        self.assertTrue(try_lock().startswith("1"), "released when it is over")
+
+    def test_a_release_refuses_rather_than_runs_unguarded_when_something_else_holds_the_lock(self):
+        holder = subprocess.Popen([DOCKER, "exec", "-i", self.container, "psql", "-U", "kinerary_control_plane", "-d",
+                                   "kinerary_control_plane", "-q", "-At"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE)
+        holder.stdin.write(f"SELECT pg_advisory_lock(hashtext('{self.vr.GATEWAY_LOCK_TEXT}'));\n"
+                           "SELECT 'HELD';\n".encode())
+        holder.stdin.flush()
+        self.assertIn(b"HELD", holder.stdout.readline() + holder.stdout.readline())
+        self.addCleanup(lambda: (holder.stdin.close(), holder.wait(timeout=10), holder.stdout.close()))
+        lock = self.vr.GatewayLock(self.cp)
+        lock.WAIT_SECONDS = 2
+        started = time.monotonic()
+        with self.assertRaises(self.vr.Refused) as refused:
+            lock.__enter__()
+        self.assertIn("held by something else", str(refused.exception))
+        self.assertLess(time.monotonic() - started, 30)
+        # The three actions that move gateways are the ones that take it.
+        for name in ("cmd_upgrade", "cmd_rollback", "cmd_restart_bridges"):
+            self.assertTrue(hasattr(getattr(self.vr, name), "__wrapped__"), f"{name} runs without the gateway lock")
+
+    def test_a_dry_run_takes_nothing(self):
+        cp = self.vr.ControlPlane(self.vr.Report(io.StringIO(), color=False), dry_run=True)
+        with mock.patch.object(subprocess, "Popen") as popen:
+            with self.vr.GatewayLock(cp):
+                pass
+        popen.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
