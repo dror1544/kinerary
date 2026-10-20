@@ -175,6 +175,31 @@ class GatewayStatus(GatewayVerbSandbox):
         self.assertEqual(self.lines(self.send(self.status("running-one"))),
                          ["GATEWAY running-one stopped 0", "STATUS_END 1"])
 
+    def test_the_shape_the_vm_runs_today_is_recognised_verbatim(self) -> None:
+        """Read-only probe of the VM (Hermes ab0d98414): uid 10000, the hermes
+        user, the same uid as the forced command's account."""
+        me = os.getuid()
+        self.procs_full(
+            f"  901     1 {me} /opt/hermes/.venv/bin/python3 /opt/hermes/.venv/bin/hermes -p running-one gateway run --replace",
+        )
+        self.assertEqual(self.lines(self.send(self.status("running-one", "stopped-one"))),
+                         ["GATEWAY running-one running 1", "GATEWAY stopped-one stopped 0", "STATUS_END 2"])
+
+    def test_every_spelling_of_the_profile_flag_and_every_module_shape_counts(self) -> None:
+        me = os.getuid()
+        shapes = [
+            f"  911     1 {me} /opt/hermes/.venv/bin/python3 /opt/hermes/.venv/bin/hermes --profile running-one gateway run",
+            f"  912     1 {me} /opt/hermes/.venv/bin/python3 /opt/hermes/.venv/bin/hermes --profile=running-one gateway run",
+            f"  913     1 {me} /opt/hermes/.venv/bin/python3 /opt/hermes/.venv/bin/hermes -p=running-one gateway run",
+            f"  914     1 {me} python3 -u -X utf8 -W ignore -m hermes_cli.main -p running-one gateway run",
+            f"  915     1 {me} /Users/x/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main --profile running-one gateway run",
+            f"  916     1 {me} python -m hermes_cli.stderr_timestamp --error-log /x -- python -m hermes_cli.main --profile running-one gateway run",
+        ]
+        for shape in shapes:
+            with self.subTest(shape=shape.split(None, 3)[3][:90]):
+                self.procs_full(shape)
+                self.assertEqual(self.lines(self.send(self.status("running-one")))[0], "GATEWAY running-one running 1")
+
     def test_a_decoy_cannot_fake_a_gateway(self) -> None:
         """Argument text alone is what a decoy supplies for free. A process counts
         only if it is this account's and it is a Hermes process."""
@@ -187,6 +212,9 @@ class GatewayStatus(GatewayVerbSandbox):
             f"  804     1 {me} python3 -c print(1) -p running-one gateway run",         # python, no hermes module
             f"  805     1 {me} vi -p running-one gateway run",
             f"  806     1 {me} tail -f /var/log/hermes.log -p running-one gateway run",  # names hermes only as an argument
+            f"  807     1 {other} /opt/hermes/.venv/bin/python3 /opt/hermes/.venv/bin/hermes -p running-one gateway run --replace",
+            f"  808     1 {me} python3 /opt/hermes/.venv/bin/other -m os -p running-one gateway run",
+            f"  809     1 {me} hermes-notes -p running-one gateway run",
         )
         self.assertEqual(self.lines(self.send(self.status("running-one"))),
                          ["GATEWAY running-one stopped 0", "STATUS_END 1"])
@@ -373,12 +401,24 @@ class GatewayAction(GatewayActionSandbox):
         self.assertVerdict(result, "italy2026", "stop", "ok")
         self.assertEqual(self.calls(), ["-p italy2026 gateway stop"])
 
-    def test_a_start_of_a_running_gateway_and_a_stop_of_a_stopped_one_touch_nothing(self) -> None:
+    def test_a_start_of_a_running_gateway_touches_nothing_and_a_stop_is_always_a_real_stop(self) -> None:
         self.procs("  700     1 hermes -p italy2026 gateway run")
         self.assertVerdict(self.run_action(self.action("italy2026", "start")), "italy2026", "start", "ok")
+        self.assertEqual(self.calls(), [], "a start of a running gateway is ok without acting: never a restart")
         self.procs("")
         self.assertVerdict(self.run_action(self.action("italy2026", "stop")), "italy2026", "stop", "ok")
-        self.assertEqual(self.calls(), [], "ok without acting: idempotent, and never a restart")
+        self.assertEqual(self.calls(), ["-p italy2026 gateway stop"],
+                         "the confirming stop is a REAL, idempotent `hermes gateway stop`: it also writes Hermes's own "
+                         "desired state, and if this host mis-reads a gateway it still stops it")
+
+    def test_a_stop_stops_a_gateway_the_process_table_could_not_see(self) -> None:
+        # A gateway whose command line the matcher does not recognise reads as
+        # stopped. A "confirming" stop that only believed the table would report
+        # it already stopped; the real stop reaches it.
+        (self.home / "hermes.mode").write_text("noop")
+        result = self.run_action(self.action("italy2026", "stop"))
+        self.assertVerdict(result, "italy2026", "stop", "ok")
+        self.assertEqual(self.calls(), ["-p italy2026 gateway stop"])
 
     def test_a_start_that_does_nothing_is_failed_not_ok(self) -> None:
         (self.home / "hermes.mode").write_text("noop")
@@ -612,6 +652,63 @@ class GatewayActionBridge(GatewayActionSandbox):
         self.assertNotIn("s3cret-mcp-key", result.stdout + result.stderr)
 
 
+class BridgeRequestCannotMintEvidence(GatewayActionSandbox):
+    """E2: companion-provenance.json is what the backfill trusts. A bridge request
+    must not be able to create it for somebody else's profile."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.deploy = self.home / "kinerary-deploy"
+        trip = self.deploy / "trips/italy-2026"
+        (trip / "mcp").mkdir(parents=True)
+        (trip / "topology.yaml").write_text(TOPOLOGY)
+        (trip / "mcp/.env").write_text("MCP_API_KEY=s3cret-mcp-key\n")
+        self.trip = trip
+        self._exe(self.bin / "curl", '#!/bin/sh\ncat >/dev/null\necho \'{"ok":true}\'\n')
+        # the gateway registers its trip-mcp tools in its own log, as the real one does
+        self._exe(self.deploy / "setup-mcp.sh",
+                  f'#!/bin/sh\nmkdir -p "{self.home}/.hermes/profiles/$1/logs"\n'
+                  f'echo "INFO tools.mcp_tool: MCP server \'trip-mcp\' (HTTP): registered 44 tool(s)" '
+                  f'>> "{self.home}/.hermes/profiles/$1/logs/agent.log"\nexit 0\n')
+        for name in ("myownbot", "italy2026"):
+            (self.home / ".hermes/profiles" / name).mkdir(parents=True, exist_ok=True)
+        (self.home / ".hermes/profiles/myownbot/kinerary-managed").unlink(missing_ok=True)
+
+    def bridge(self, profile: str) -> subprocess.CompletedProcess:
+        env = {"HOME": str(self.home), "PATH": f"{self.bin}:/usr/bin:/bin", "FAKE_UNAME": "Linux",
+               "KINERARY_GATEWAY_WAIT_SECONDS": "2"}
+        request = {"record_type": "trip_mcp_bridge_request", "schema_version": 1, "slug": "italy-2026",
+                   "profile": {"name": profile}}
+        return subprocess.run(["bash", str(SCRIPT)], input=json.dumps(request), capture_output=True, text=True,
+                              env=env, timeout=120)
+
+    def backfill(self, *names) -> subprocess.CompletedProcess:
+        return self.run_action({"record_type": "companion_gateway_backfill", "schema_version": 1,
+                                "profiles": list(names)})
+
+    def test_a_bridge_request_for_an_unmarked_profile_writes_no_evidence_so_backfill_refuses_it(self) -> None:
+        result = self.bridge("myownbot")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("WIRED myownbot", result.stdout)
+        self.assertFalse((self.trip / "companion-provenance.json").exists(),
+                         "evidence minted for a profile this system never installed")
+        self.assertIn("provenance not recorded", result.stderr)
+        chain = self.backfill("myownbot")
+        self.assertEqual(chain.stdout.splitlines(), ["BACKFILL myownbot refused", "BACKFILL_END 1"])
+        self.assertFalse((self.home / ".hermes/profiles/myownbot/kinerary-managed").exists())
+
+    def test_a_marked_profile_gets_its_evidence_and_the_chain_still_works_for_a_real_install(self) -> None:
+        result = self.bridge("italy2026")          # carries the marker (GatewayActionSandbox gives it one)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads((self.trip / "companion-provenance.json").read_text())
+        self.assertEqual(record["profile"], "italy2026")
+
+    def test_a_symlinked_or_protected_profile_never_gets_evidence_even_with_a_marker(self) -> None:
+        (self.home / ".hermes/profiles/default/kinerary-managed").write_text("kinerary-managed\n")
+        self.bridge("default")
+        self.assertFalse((self.trip / "companion-provenance.json").exists())
+
+
 class GatewayBackfill(GatewayActionSandbox):
     """The marker says "this system installed this profile". The backfill may only
     say so with host-side evidence: a trip's provenance record that names it."""
@@ -750,8 +847,9 @@ class InstallWritesTheMarkerAndDarwinHasOneStarter(GatewayActionSandbox):
         self.assertIn("NOT RUNNING", result.stderr, "and a launchd that did not take it says so")
         self.assertIn("launchctl bootstrap gui/", result.stderr)
         text = SCRIPT.read_text()
+        launchd_starter = text[text.index("start_gateway() {"):text.index("gateway_pids() {")]
         self.assertNotIn("detach.py", text)
-        self.assertNotIn("run --replace", text)
+        self.assertNotIn("--replace", launchd_starter, "no starter in the Mac path replaces another")
 
 
 if __name__ == "__main__":

@@ -67,7 +67,9 @@ stopped/absent, desired stopped. A desired-stopped gateway that is running, or
 that nobody has stopped (observe mode never does), is still expected. To make
 convergence real in enforce mode the sweep sends an idempotent `stop` for a
 desired-stopped gateway it finds already stopped but has not yet recorded a
-confirmed stop for (the host answers ok without touching anything).
+confirmed stop for (on the host this is a REAL `hermes gateway stop`: idempotent,
+it also writes Hermes's own desired state, and a gateway whose command line the
+host could not read is still stopped rather than reported "already stopped").
 
 THE LOCK IS NOT HELD ACROSS THE NETWORK. The sweep takes the advisory lock to
 decide and record, releases it around every call to the host (a status read can
@@ -850,8 +852,32 @@ class GatewayReconcileSweep:
                 summary["failed"] += 1
             with self._locked(conn):
                 self._record_action(conn, profile, planned.trip_id, verb, result, self._now(), row)
+                after = self._decide_all(conn, self._now()).get(profile) if verb == "start" else None
+                row = conn.execute("SELECT * FROM control_plane.companion_gateways WHERE hermes_profile = %s",
+                                   (profile,)).fetchone()
             logger.info(log_fields("gateway_reconcile.action", profile=profile, action=verb, result=result,
                                    reason=planned.reason))
+            # A start can take minutes on the host, and the lock is not held while it
+            # does. If a certain stop (a teardown pin, an operator's off, a
+            # retirement) landed meanwhile, the gateway that just came up must go
+            # down now, not at the next sweep: a teardown that has already stopped
+            # it would otherwise be undone by a start that was already in flight.
+            if after is not None and after.desired == "stopped" and not after.needs_confirmation:
+                logger.warning(log_fields(
+                    "gateway_reconcile.stopping_after_start", profile=profile, reason=after.reason,
+                    effect="the decision became a certain stop while the start was in flight"))
+                try:
+                    stop_result = self._adapter.act(profile, "stop", None)
+                except GatewayHostError as exc:
+                    stop_result = "failed"
+                    summary["failed"] += 1
+                    logger.warning(log_fields("gateway_reconcile.action_error", profile=profile, action="stop",
+                                              error=exc.safe_reason))
+                summary["stops"] += 1
+                if stop_result != "ok":
+                    summary["failed"] += 1
+                with self._locked(conn):
+                    self._record_action(conn, profile, planned.trip_id, "stop", stop_result, self._now(), row)
 
     # -- the plan: pure given the records -------------------------------------
 
@@ -863,7 +889,7 @@ class GatewayReconcileSweep:
         hold-only reason, a duplicate and an absent profile produce nothing.
 
         A desired-stopped gateway found already `stopped` with no confirmed stop
-        on record gets a `noop` stop: the host answers ok without touching it,
+        on record gets a `noop` stop: a real, idempotent host stop that finds nothing to do,
         and that record is what makes it DORMANT to everything that skips
         dormant companions (see the module doc)."""
         starts, stops, confirms = [], [], []

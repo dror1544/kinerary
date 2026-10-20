@@ -703,11 +703,45 @@ ON CONFLICT (hermes_profile) DO UPDATE
       pin_trip_id = excluded.pin_trip_id, pin_set_at = now(),
       decided_at = CASE WHEN companion_gateways.desired = 'stopped' AND companion_gateways.reason = 'TEARDOWN'
                         THEN companion_gateways.decided_at ELSE now() END,
-      confirmations = 1, updated_at = now();
+      justified_by = '{{}}', confirmations = 1, updated_at = now();
 INSERT INTO control_plane.companion_gateway_events (event, hermes_profile, trip_id, pin)
 VALUES ('PIN', '{profile}', '{trip['id']}', 'teardown');
 COMMIT;""")
     return "pinned"
+
+
+def confirm_gateway_down(profile: str, *, seconds: float = 30.0, loaded=None, stop=None,
+                         sleep=time.sleep, monotonic=time.monotonic) -> bool:
+    """The LAST gateway step of a teardown: is the gateway really down now?
+
+    The reconciler's start can be in flight on the host for minutes (the sweep
+    does not hold its lock while it waits), and a start that was already running
+    when the pin landed can finish AFTER this script stopped the gateway. The
+    pin makes the reconciler stop such a gateway at once when it notices; this
+    is the other half - the teardown does not report success while a gateway is
+    still up. Polls for `seconds`, issuing a stop whenever it is still loaded,
+    and returns whether it ended down. Best effort at the very end: the profile
+    may already be deleted, in which case there is nothing for a stop to reach
+    and the answer is whatever the process table says."""
+    loaded = loaded or gateway_loaded
+    stop = stop or _stop_gateway
+    deadline = monotonic() + seconds
+    while True:
+        if not loaded(profile):
+            return True
+        stop(profile)
+        if monotonic() >= deadline:
+            return not loaded(profile)
+        sleep(2)
+
+
+def _stop_gateway(profile: str) -> None:
+    if MACOS:
+        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/ai.hermes.gateway-{profile}"],
+                       capture_output=True)
+    else:
+        subprocess.run([hermes(), "-p", profile, "gateway", "stop"], capture_output=True, text=True,
+                       stdin=subprocess.DEVNULL)
 
 
 def main() -> int:
@@ -929,6 +963,13 @@ def main() -> int:
                 say(f"{RED}✗{RESET}", f"s6         a {profile} supervisor is still running after a rescan")
             else:
                 say(f"{GREEN}✓{RESET}", "s6         no supervisor left for it")
+
+    # Last: nothing above may have let a gateway come back (an in-flight start of
+    # the reconciler's, a cron tick). See confirm_gateway_down.
+    down = confirm_gateway_down(profile)
+    say(f"{GREEN}✓{RESET}" if down else f"{RED}✗{RESET}",
+        "gateway    confirmed down" if down else f"gateway    {profile} is STILL RUNNING after the teardown")
+    failed |= not down
 
     if failed:
         print(f"\n{RED}✗ something remains{RESET}")

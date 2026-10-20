@@ -391,10 +391,15 @@ the worker at startup rather than falling back):
   organizer never linked a Telegram identity, which `enforce` would also stop).
   Nothing is `DORMANT` in observe mode - see below - and `DORMANT` is never an alert.
 - `enforce` also starts and stops, at most 3 gateways per sweep (a gateway found
-  already stopped gets one idempotent `stop` so its stop is on record), with a backoff
+  already stopped gets one `stop` so its stop is on record - a real, idempotent
+  `hermes gateway stop`, which also writes Hermes's own desired state and still
+  stops a gateway whose command line the host could not read), with a backoff
   after a failed attempt (5, 10, 20, 40, 60 minutes) and the sweep abandoned
   after 3 host errors in a row. It never restarts a gateway: a start of a running
-  one and a stop of a stopped one are `ok` without touching anything.
+  one is `ok` without touching anything. A start can take minutes on the host; if
+  a certain stop (a teardown pin, an operator's off) lands while it is in flight,
+  the sweep stops the gateway at once afterwards instead of waiting for the next
+  sweep.
 - `off` is the sweep not existing.
 
 **Operator** (from the worker container, `--database-url-file` and the
@@ -412,8 +417,14 @@ python -m control_plane_worker reconcile-gateways --backfill-markers        # on
 only), `companion_gateway_backfill` and `companion_gateway_action` (`start|stop`).
 Every request is read up to 64 KiB (more is refused), a profile name is
 `[a-z0-9][a-z0-9-]{1,62}`, and a `slug` is absent or a string. Status counts only
-this account's processes that are Hermes (the program is `hermes`, or python
-running a hermes module): argument text alone does not make a gateway. It refuses:
+this account's processes that are Hermes: the program is `hermes`, or python running
+a script named `hermes` (the shape the VM runs today: `<venv>/bin/python3
+<venv>/bin/hermes -p <profile> gateway run --replace`, uid 10000) or a
+`-m hermes_cli...` module anywhere in its arguments; `-p NAME`, `--profile NAME`
+and `--profile=NAME` all count. Argument text alone does not make a gateway.
+The newer Hermes may run its gateways differently - its command line is unknown
+until the container rehearsal (S4) records it, and a gateway of an unrecognised
+shape reads as stopped (which is why the confirming stop is a real stop). It refuses:
 
 - any profile on `scripts/protected-profiles.txt` - ONE list, read by this script
   and by `teardown-trip.py` (which adds only the interviewer, which the
@@ -425,6 +436,11 @@ running a hermes module): argument text alone does not make a gateway. It refuse
   own bot token and is never started or stopped;
 - to stop `trip-intake`; and anything at all on a Mac (launchd is that platform's
   supervisor; the Mac stays observe-only - the backfill too).
+
+**The evidence cannot be minted by a request.** The bridge request writes
+`companion-provenance.json` only for a profile that already carries the marker
+(a fresh install writes the marker first), so a bridge request naming somebody's
+own profile leaves no record for the backfill to trust.
 
 **The marker means "this system installed it", and only two things write it:** a
 *fresh* install here (never a retried `ALREADY_PRESENT` one - a profile that was
@@ -453,7 +469,9 @@ lock just before acting on it, dropping the action if a pin landed meanwhile; a
 sweep that cannot re-take it within 30 seconds is abandoned.
 `scripts/teardown-trip.py` takes it to pin a trip's gateway OFF (`TEARDOWN`) as
 its first step after the backup — so the reconciler cannot restart a gateway
-between teardown stopping it and the trip being retired. **A pin belongs to its
+between teardown stopping it and the trip being retired - and ends by confirming
+the gateway is down (polling, bounded, stopping it again if it is not) and failing
+loudly if it is still up. **A pin belongs to its
 trip**: it is ignored for any other trip that reuses the profile name, and the
 transaction that retires the trip clears it; `--pin <profile> clear` removes a
 teardown pin whose trip is gone but refuses one in progress. And

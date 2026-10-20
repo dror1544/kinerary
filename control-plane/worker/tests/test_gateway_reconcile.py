@@ -365,6 +365,7 @@ class FakeHost:
         self.lock_free_during_status: list[bool] = []
         self.lock_free_during_act: list[bool] = []
         self.on_status: Any = None           # a callable() run while the sweep is "on the network"
+        self.on_act: Any = None              # the same, once, while an action is in flight
 
     def set(self, profile: str, state: str, count: int | None = None) -> None:
         self.states[profile] = Observed(state, count if count is not None else (0 if state in ("stopped", "absent") else 1))
@@ -384,6 +385,9 @@ class FakeHost:
         self.act_slugs.append(slug)
         if self.probe:
             self.lock_free_during_act.append(self.probe())
+        if self.on_act:
+            hook, self.on_act = self.on_act, None
+            hook()
         result = self.act_result(profile, verb) if callable(self.act_result) else self.act_result
         if result == "ok" and self.converge:
             self.set(profile, "running" if verb == "start" else "stopped")
@@ -1390,6 +1394,39 @@ class SweepTests(unittest.TestCase):
             self.sweep("enforce").run()
         self.assertEqual(self.host.act_calls, [], "the start was planned before the pin; the pin wins")
         self.assertIn("gateway_reconcile.action_dropped", log.text)
+
+    def test_a_certain_stop_that_lands_during_an_in_flight_start_stops_the_gateway_at_once(self) -> None:
+        t = self.trip()
+        self.host.set(t["profile"], "stopped")
+
+        def teardown_pins_it() -> None:
+            self.conn.execute(
+                "INSERT INTO control_plane.companion_gateways(hermes_profile, trip_id, kind, desired, reason, pin, "
+                "pin_trip_id, pin_set_at) VALUES (%s, %s, 'companion', 'stopped', 'TEARDOWN', 'teardown', %s, now()) "
+                "ON CONFLICT (hermes_profile) DO UPDATE SET pin = 'teardown', pin_trip_id = excluded.pin_trip_id, "
+                "pin_set_at = now()", (t["profile"], t["trip_id"], t["trip_id"]))
+
+        self.host.on_act = teardown_pins_it
+        with Rendered() as log:
+            self.sweep("enforce").run()
+        self.assertEqual(self.host.act_calls, [(t["profile"], "start"), (t["profile"], "stop")],
+                         "the start was in flight when the pin landed; the gateway it brought up goes down now")
+        self.assertEqual((self.row(t)["last_action"], self.row(t)["last_result"]), ("stop", "ok"))
+        self.assertIn("gateway_reconcile.stopping_after_start", log.text)
+        self.assertEqual(self.host.states[t["profile"]].state, "stopped")
+
+    def test_a_flap_prone_change_during_a_start_does_not_trigger_an_immediate_stop(self) -> None:
+        t = self.trip()
+        self.host.set(t["profile"], "stopped")
+
+        def trip_ends_long_ago() -> None:
+            self.conn.execute("UPDATE control_plane.trips SET end_date = %s, start_date = %s WHERE id = %s",
+                              (self.past(90), self.past(100), t["trip_id"]))
+
+        self.host.on_act = trip_ends_long_ago
+        self.sweep("enforce").run()
+        self.assertEqual(self.host.act_calls, [(t["profile"], "start")],
+                         "ARCHIVED needs its two sweeps like any date-driven stop")
 
     def test_a_sweep_that_cannot_retake_the_lock_is_abandoned_not_hung(self) -> None:
         t = self.trip()

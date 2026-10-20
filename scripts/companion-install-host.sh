@@ -162,23 +162,45 @@ write_gateway_probe() {
 import json, os, re, subprocess, sys
 
 NAME = re.compile(r"[a-z0-9][a-z0-9-]{1,62}")
-GATEWAY = re.compile(r"(?:^|\s)(?:-p|--profile)\s+([a-z0-9][a-z0-9-]{1,62})\s+gateway\s+run(?:\s|$)")
+GATEWAY = re.compile(r"(?:^|\s)(?:-p|--profile)(?:\s+|=)([a-z0-9][a-z0-9-]{1,62})\s+gateway\s+run(?:\s|$)")
 ROW = re.compile(r"\s*([0-9]+)\s+([0-9]+)\s+([0-9]+)\s+(.*)")
 
 
 def hermes_process(args):
     """Is this command line a Hermes process, not any process whose arguments
-    happen to read like one? The program must be `hermes` (or a name containing
-    it), or a python running a hermes module. Argument text alone is what a
-    decoy supplies for free; together with the uid filter below it takes the
-    account itself to fake a gateway."""
+    happen to read like one? Argument text alone is what a decoy supplies for
+    free; together with the uid filter in top_level_counts() it takes the account
+    itself to fake a gateway. Shapes that count:
+
+      hermes -p NAME gateway run ...                      the CLI itself
+      <venv>/python3 <venv>/bin/hermes -p NAME gateway run --replace
+                                                          the shape the VM runs today
+                                                          (Hermes ab0d98414, observed
+                                                          on the VM: uid 10000,
+                                                          /opt/hermes/.venv/bin/python3
+                                                          /opt/hermes/.venv/bin/hermes
+                                                          -p <profile> gateway run, plus flags)
+      <python> ... -m hermes_cli.main|stderr_timestamp ... a module invocation, -m anywhere in argv
+
+    TODO(rehearsal S4, #349 PR C): the newer Hermes (4097709b0c) may run a
+    gateway differently (a supervised wrapper, a different entry point). Its
+    command line is unknown until the container rehearsal; until S4 records it
+    and the matcher is extended, a gateway of that shape would read as stopped.
+    The confirming stop is therefore a REAL `hermes gateway stop`, so a
+    mis-read never leaves a running gateway merely "confirmed"."""
     tokens = args.split()
     if not tokens:
         return False
     exe = os.path.basename(tokens[0])
-    if "hermes" in exe:
+    if exe == "hermes":
         return True
-    return exe.startswith("python") and any("hermes" in t for t in tokens[1:4])
+    if not exe.startswith("python"):
+        return False
+    rest = tokens[1:]
+    if any(os.path.basename(t) == "hermes" for t in rest):
+        return True
+    return any(t == "-m" and i + 1 < len(rest) and rest[i + 1].startswith("hermes_cli")
+               for i, t in enumerate(rest))
 
 
 def fail(message):
@@ -1132,7 +1154,11 @@ if [ "$REQUEST_KIND" = "companion_gateway_action" ]; then
     if gateway_wait_for "$name" up; then gateway_result "$name" start ok "gateway is running"
     else gateway_result "$name" start failed "no gateway appeared within ${limit}s"; fi
   else
-    if [ "$now_running" -eq 0 ]; then gateway_result "$name" stop ok "already stopped"; exit 0; fi
+    # ALWAYS a real `hermes gateway stop`, even when the process table shows
+    # nothing: it is idempotent, it also writes Hermes's own desired state (so a
+    # boot does not bring the gateway back), and if this host mis-reads a
+    # gateway's command line a running one is still stopped instead of being
+    # reported "already stopped". It never restarts anything.
     run_bounded "$limit" hermes -p "$name" gateway stop || true
     if gateway_wait_for "$name" down; then gateway_result "$name" stop ok "gateway is stopped"
     else gateway_result "$name" stop failed "the gateway was still running after ${limit}s"; fi
@@ -1201,7 +1227,18 @@ if [ "$REQUEST_KIND" = "trip_mcp_bridge_request" ]; then
       #
       # Printed on the WIRED line because that is what the worker already
       # reads, and written beside the trip because a log line ages out.
-      companion_provenance "$TRIP_DIR" "$PROFILE_NAME"
+      # The provenance record is the evidence the backfill trusts to mark a
+      # profile as this system's, so it is written only for a profile that
+      # already carries the marker (a fresh install writes the marker first). A
+      # bridge request naming somebody's own, unmarked profile must not be able
+      # to mint that evidence.
+      if [ -f "$HOME/.hermes/profiles/$PROFILE_NAME/$GATEWAY_MARKER" ] \
+           && [ ! -L "$HOME/.hermes/profiles/$PROFILE_NAME/$GATEWAY_MARKER" ] \
+           && [ ! -L "$HOME/.hermes/profiles/$PROFILE_NAME" ] && ! gateway_denied "$PROFILE_NAME"; then
+        companion_provenance "$TRIP_DIR" "$PROFILE_NAME"
+      else
+        printf 'companion-install-host: provenance not recorded: %s carries no provenance marker\n' "$PROFILE_NAME" >&2
+      fi
       printf 'WIRED %s %s\n' "$PROFILE_NAME" "$(repo_commit)"
       exit 0
     fi

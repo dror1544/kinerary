@@ -620,13 +620,49 @@ class PinGatewayOff(unittest.TestCase):
             self.assertLess(order.index("pin"), order.index(later), f"the pin must come before {later}")
         self.assertLess(order.index("gateway-uninstall"), order.index("database"))
 
+    def test_the_last_gateway_step_confirms_the_gateway_is_down(self):
+        events = self.run_main(pin="pinned")
+        order = events["log"]
+        self.assertEqual(order[-1], "confirm-down", order)
+        self.assertLess(order.index("database"), order.index("confirm-down"))
+        self.assertEqual(events["code"], 0)
+
+    def test_a_gateway_that_is_still_up_at_the_end_fails_the_teardown_loudly(self):
+        events = self.run_main(pin="pinned", confirm=False)
+        self.assertEqual(events["code"], 1)
+        self.assertIn("STILL RUNNING", events["stdout"])
+
+    def test_confirm_gateway_down_stops_it_again_until_it_is_down(self):
+        loaded = iter([True, True, False])
+        stops: list[str] = []
+        clock = [0.0]
+        ok = teardown.confirm_gateway_down(
+            "japan2026", seconds=30, loaded=lambda p: next(loaded), stop=stops.append,
+            sleep=lambda s: clock.__setitem__(0, clock[0] + s), monotonic=lambda: clock[0])
+        self.assertTrue(ok)
+        self.assertEqual(stops, ["japan2026", "japan2026"], "a stop for each look that still found it up")
+
+    def test_confirm_gateway_down_is_bounded_and_says_no_when_it_never_goes_down(self):
+        stops: list[str] = []
+        clock = [0.0]
+        ok = teardown.confirm_gateway_down(
+            "japan2026", seconds=10, loaded=lambda p: True, stop=stops.append,
+            sleep=lambda s: clock.__setitem__(0, clock[0] + s), monotonic=lambda: clock[0])
+        self.assertFalse(ok)
+        self.assertLessEqual(clock[0], 12)
+        self.assertGreaterEqual(len(stops), 2)
+
+    def test_the_pin_resets_what_justified_the_gateway_to_running(self):
+        _result, seen = self.run_pin()
+        self.assertIn("justified_by = '{}'", seen[0])
+
     def test_the_plan_shows_the_pin_first(self):
         out = self.run_main(pin="pinned", execute=False)["stdout"]
         self.assertIn("pin ", out)
         self.assertLess(out.index("pin "), out.index("allowlist"))
         self.assertIn("TEARDOWN", out)
 
-    def run_main(self, *, pin, execute=True):
+    def run_main(self, *, pin, execute=True, confirm=True):
         import contextlib
         import io
         import sys as _sys
@@ -664,6 +700,7 @@ class PinGatewayOff(unittest.TestCase):
                 mock.patch.object(teardown, "hermes", lambda: "hermes"),
                 mock.patch.object(teardown, "backup", record("backup")),
                 mock.patch.object(teardown, "pin_gateway_off", record("pin", pin)),
+                mock.patch.object(teardown, "confirm_gateway_down", record("confirm-down", confirm)),
                 mock.patch.object(teardown, "narrow_allowlist", record("allowlist")),
                 mock.patch.object(teardown, "retire_in_db", record("database", "retired-japan-2026-20260101")),
                 mock.patch.object(teardown.subprocess, "run", run),
