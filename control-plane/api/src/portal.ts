@@ -8,6 +8,14 @@ import { ensureUnknownPasswordCredential, resolveOrCreateEmailAccount, verifyPas
 import { generatePlan } from "./planner.js";
 import { issueApproval } from "./plan-approval.js";
 
+// The gateway's key, compared in constant time (a plain !== leaks how many
+// leading bytes were right).
+function exchangeKeyMatches(supplied: unknown, expected: string): boolean {
+  if (typeof supplied !== "string" || !expected) return false;
+  const a = Buffer.from(supplied), b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 function opaque(prefix: string, bytes = 16): string {
   return `${prefix}_${randomBytes(bytes).toString("hex")}`;
 }
@@ -185,6 +193,7 @@ interface PortalUser {
   displayName: string;
   googleSubjectDigest: string | null;
   sessionDigest: string;
+  sessionId: string;
   sessionCreatedAt: Date;
 }
 
@@ -192,9 +201,9 @@ async function portalUser(request: FastifyRequest, deps: PortalDependencies): Pr
   const raw = parseCookies(request.headers.cookie).kit_session;
   if (!raw) return null;
   const result = await deps.db.query<{
-    id: string; display_name: string; provider_subject_digest: string | null; session_digest: string; session_created_at: Date;
+    id: string; display_name: string; provider_subject_digest: string | null; session_digest: string; session_id: string; session_created_at: Date;
   }>(
-    `SELECT u.id, u.display_name, ui.provider_subject_digest, s.token_digest AS session_digest, s.created_at AS session_created_at
+    `SELECT u.id, u.display_name, ui.provider_subject_digest, s.token_digest AS session_digest, s.id AS session_id, s.created_at AS session_created_at
      FROM control_plane.web_sessions s
      JOIN control_plane.users u ON u.id = s.user_id AND u.status = 'active'
      LEFT JOIN control_plane.user_identities ui ON ui.user_id = u.id AND ui.provider = 'google'
@@ -209,6 +218,7 @@ async function portalUser(request: FastifyRequest, deps: PortalDependencies): Pr
     displayName: row.display_name,
     googleSubjectDigest: row.provider_subject_digest,
     sessionDigest: row.session_digest,
+    sessionId: row.session_id,
     sessionCreatedAt: row.session_created_at,
   };
 }
@@ -865,34 +875,68 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
     if (!member?.runtime_access) return reply.code(404).send({ error: "NOT_FOUND" });
     const token = base64url(32);
     await deps.db.query(
-      `INSERT INTO control_plane.runtime_launch_grants(id, trip_id, user_id, token_digest, audience, expires_at)
-       VALUES ($1, $2, $3, $4, 'runtime_gateway', now() + interval '90 seconds')`,
-      [opaque("launch"), tripId, user.id, sha256(token)],
+      `INSERT INTO control_plane.runtime_launch_grants(id, trip_id, user_id, token_digest, audience, expires_at, session_id)
+       VALUES ($1, $2, $3, $4, 'runtime_gateway', now() + interval '90 seconds', $5)`,
+      [opaque("launch"), tripId, user.id, sha256(token), user.sessionId],
     );
     await recordFunnelEvent(deps.db, "runtime_launched", { userId: user.id, tripId });
     return { runtimeOrigin: deps.runtimeOrigin, framePath: `/t/${tripId}/`, launchToken: token, expiresInSeconds: 90 };
   });
 
   app.post("/internal/runtime-launch/consume", async (request, reply) => {
-    if (request.headers["x-api-key"] !== deps.runtimeExchangeKey) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+    if (!exchangeKeyMatches(request.headers["x-api-key"], deps.runtimeExchangeKey)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
     const token = (request.body as Record<string, unknown>)?.token;
     if (typeof token !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
-    const result = await deps.db.query<{ id: string; trip_id: string; user_id: string; role: string; runtime_username: string | null }>(
+    const result = await deps.db.query<{ id: string; trip_id: string; user_id: string; role: string; runtime_username: string | null; session_id: string | null }>(
       `UPDATE control_plane.runtime_launch_grants g SET consumed_at = now()
        FROM control_plane.trip_memberships m
        WHERE g.token_digest = $1 AND g.consumed_at IS NULL AND g.expires_at > now()
          AND m.trip_id = g.trip_id AND m.user_id = g.user_id AND m.status = 'active' AND m.runtime_access = true
-       RETURNING g.id, g.trip_id, g.user_id, m.role,
+       RETURNING g.id, g.trip_id, g.user_id, g.session_id, m.role,
          (SELECT i.runtime_username FROM control_plane.site_invites i
           WHERE i.trip_id = g.trip_id AND i.redeemed_by = g.user_id AND i.state = 'redeemed'
           ORDER BY i.redeemed_at DESC LIMIT 1) AS runtime_username`, [sha256(token)]);
     const row = result.rows[0];
     if (!row) return reply.code(401).send({ error: "LAUNCH_INVALID" });
-    return { tripId: row.trip_id, userId: row.user_id, role: row.role, runtimeUsername: row.runtime_username, audience: "runtime_gateway" };
+    // The way back to the dashboard, from this deployment's own configured
+    // portal origin (no hostname in code). Only an owner/organizer has a
+    // dashboard; the trip still re-checks the role before it serves the URL.
+    const dashboardUrl = row.role === "member" ? null : `${deps.publicOrigin}/trips/${row.trip_id}/setup`;
+    return { tripId: row.trip_id, userId: row.user_id, role: row.role, runtimeUsername: row.runtime_username, dashboardUrl, sessionId: row.session_id, audience: "runtime_gateway" };
+  });
+
+  // Asked by the gateway (at most every 30 s per session) before it serves a
+  // request on a sealed cookie: is the portal session that opened this trip
+  // still live, and is its person still active and still entitled to the trip?
+  // Signing out of the portal on one device therefore ends the trip session
+  // opened from that device and no other; removal from the trip or disabling
+  // ends them all. The role the session was opened with must still be the
+  // membership's role: a demotion (or promotion) answers no, so the person has to
+  // relaunch and is issued a session for the role they now hold. A grant minted before session binding existed carries no
+  // session (null) and keeps the earlier rule: any live portal session of the
+  // person. Those grants live 90 seconds, so that rule is a rollback aid only.
+  app.post("/internal/runtime-sessions/check", async (request, reply) => {
+    if (!exchangeKeyMatches(request.headers["x-api-key"], deps.runtimeExchangeKey)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+    const { tripId, userId, sessionId, role } = (request.body ?? {}) as Record<string, unknown>;
+    const optionalText = (value: unknown) => value === undefined || value === null || typeof value === "string";
+    if (typeof tripId !== "string" || typeof userId !== "string" || !optionalText(sessionId) || !optionalText(role)) {
+      return reply.code(400).send({ error: "INVALID_REQUEST" });
+    }
+    const result = await deps.db.query(
+      `SELECT 1 FROM control_plane.trip_memberships m
+       JOIN control_plane.users u ON u.id = m.user_id AND u.status = 'active'
+       WHERE m.trip_id = $1 AND m.user_id = $2 AND m.status = 'active' AND m.runtime_access = true
+         AND ($4::text IS NULL OR m.role = $4::text)
+         AND EXISTS (SELECT 1 FROM control_plane.web_sessions s
+                     WHERE s.user_id = m.user_id AND s.revoked_at IS NULL AND s.expires_at > now()
+                       AND ($3::text IS NULL OR s.id = $3::text))`,
+      [tripId, userId, sessionId ?? null, role ?? null]);
+    if (!result.rows[0]) return reply.code(401).send({ error: "SESSION_REVOKED" });
+    return { live: true };
   });
 
   app.get("/internal/runtime-routes/:tripId", async (request, reply) => {
-    if (request.headers["x-api-key"] !== deps.runtimeExchangeKey) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+    if (!exchangeKeyMatches(request.headers["x-api-key"], deps.runtimeExchangeKey)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
     const tripId = (request.params as { tripId?: string }).tripId ?? "";
     const result = await deps.db.query<{ route_ref: string; private_url: string | null }>(
       `SELECT r.route_ref, j.result->>'private_url' AS private_url

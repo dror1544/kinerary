@@ -43,6 +43,7 @@ const T = {
     sm_photos:      '📷 תמונות',
     sm_info:        'ℹ️ מידע',
     sm_lostfound:   '🔍 Lost & Found',
+    sm_dashboard:   '🧭 לוח המארגן',
 
     /* budget */
     budget_add_title:   'הוסף הוצאה',
@@ -367,6 +368,7 @@ const T = {
     sm_photos:      '📷 Photos',
     sm_info:        'ℹ️ Info',
     sm_lostfound:   '🔍 Lost & Found',
+    sm_dashboard:   '🧭 Organizer dashboard',
 
     /* budget */
     budget_add_title:   'Add Expense',

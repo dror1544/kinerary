@@ -10,6 +10,29 @@ const userIdValid = value => typeof value === 'string' && /^user_[A-Za-z0-9]{8,6
 const tripIdValid = value => typeof value === 'string' && /^trip_[A-Za-z0-9]{8,64}$/.test(value);
 const usernameValid = value => typeof value === 'string' && /^[a-z0-9][a-z0-9._-]{0,63}$/.test(value);
 
+// The link back to the organizer dashboard, which the control plane builds from
+// its own configuration and the gateway passes through the session exchange into
+// the signed claim. This function checks SHAPE only: https (http only on a
+// loopback host, for local development), no credentials, query or fragment, at
+// most 2048 characters, and the path pinned to THIS trip's setup page. It does not
+// know which origin is the portal, so a caller holding the exchange key could name
+// any https host; the gateway, which knows PORTAL_ORIGIN, drops every URL that is
+// not exactly PORTAL_ORIGIN + that path before it asks for the session. Anything
+// else is dropped rather than rendered into a menu href: javascript:, data:,
+// userinfo, control characters and other paths never leave this function.
+const MAX_DASHBOARD_URL = 2048;
+// Loopback by shape, not by literal: the release build refuses a private-IPv4 literal in shipped code.
+const isLoopbackHost = host => host === 'localhost' || host === '[::1]' || /^127(\.\d{1,3}){3}$/.test(host);
+function safeDashboardUrl(value, tripId) {
+  if (typeof value !== 'string' || !value || value.length > MAX_DASHBOARD_URL || /[\u0000-\u0020\u007f]/.test(value)) return null;
+  let url;
+  try { url = new URL(value); } catch { return null; }
+  if (url.username || url.password || url.search || url.hash) return null;
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && isLoopbackHost(url.hostname))) return null;
+  if (!tripIdValid(tripId) || url.pathname !== `/trips/${tripId}/setup`) return null;
+  return url.href;
+}
+
 function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) {
   const key = process.env.CONTROL_PLANE_EXCHANGE_KEY || '';
   let identity;
@@ -73,7 +96,7 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
   }
 
   app.post('/api/internal/control-plane/session', internal, (req, res) => {
-    const { userId, runtimeUsername, role } = req.body || {};
+    const { userId, runtimeUsername, role, dashboardUrl } = req.body || {};
     if (!userIdValid(userId) || !['owner', 'organizer', 'member'].includes(role) ||
         (runtimeUsername !== null && !usernameValid(runtimeUsername))) {
       return res.status(400).json({ error: 'INVALID_REQUEST' });
@@ -83,7 +106,11 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
         !activeUser(row.username) || !roleMatchesLocal(role, row.username)) {
       return res.status(403).json({ error: 'IDENTITY_MISMATCH' });
     }
-    const token = jwt.sign({ username: row.username, controlPlane: { userId, tripId: identity.tripId, role } }, jwtSecret, { expiresIn: '12h' });
+    // Signed into the session, so it can only come from the exchange-key holder
+    // and only an owner/organizer carries it. A member's token never does.
+    const dashboard = ['owner', 'organizer'].includes(role) ? safeDashboardUrl(dashboardUrl, identity.tripId) : null;
+    const controlPlane = { userId, tripId: identity.tripId, role, ...(dashboard ? { dashboardUrl: dashboard } : {}) };
+    const token = jwt.sign({ username: row.username, controlPlane }, jwtSecret, { expiresIn: '12h' });
     return res.json({ token });
   });
 
@@ -111,6 +138,15 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
     catch { return res.status(409).json({ error: 'IDENTITY_CONFLICT' }); }
     return res.json({ ok: true });
   });
-  return { validManagedPayload };
+  // Only for a managed session whose claim passed validManagedPayload on this
+  // request (so the binding, the participant and the local organizer role were
+  // all re-checked just now). A direct login, a member and the agent key have
+  // no claim and get nothing.
+  function dashboardUrlFor(claim, username) {
+    if (!claim || typeof claim !== 'object' || !['owner', 'organizer'].includes(claim.role)) return null;
+    if (!roleMatchesLocal(claim.role, username)) return null;
+    return safeDashboardUrl(claim.dashboardUrl, identity?.tripId);
+  }
+  return { validManagedPayload, dashboardUrlFor };
 }
-module.exports = { createControlPlaneAuth };
+module.exports = { createControlPlaneAuth, safeDashboardUrl };

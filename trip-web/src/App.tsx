@@ -2,6 +2,7 @@ import { CompanionPanel } from "./CompanionPanel";
 import { TodayWeather } from "./TodayWeather";
 import { VenueLinks } from "./venue-links";
 import { safeExternalUrl } from "./external-url";
+import { dashboardHref } from "./dashboard-link";
 export { safeExternalUrl } from "./external-url";
 import { MobileSelect } from "./MobileSelect";
 import { rsvpForItem, venueForItem } from "./activity-rsvp";
@@ -2489,7 +2490,7 @@ function MemberLogins({ config, lang }: { config?: TripConfig; lang: Lang }) {
   );
 }
 
-function AppMenu({
+export function AppMenu({
   open,
   lang,
   currentUser,
@@ -2515,6 +2516,7 @@ function AppMenu({
     return () => { document.body.style.overflow = previous; };
   }, [open]);
   if (!open) return null;
+  const dashboardLink = dashboardHref(currentUser?.dashboard_url);
   return (
     <div className="menu-overlay" role="presentation" onClick={() => setOpen(false)}>
       <aside className="app-menu" role="dialog" aria-modal="true" aria-label="Trip menu" onClick={(event) => event.stopPropagation()}>
@@ -2562,6 +2564,7 @@ function AppMenu({
             {lang === "he" ? "Switch to English" : "עברית"}
           </button>
           {isOrganizer ? <a href={classicHref()}>{copy(lang,"Open Classic organizer fallback","פתיחת הגרסה הקלאסית למארגן")}</a> : null}
+          {dashboardLink ?<a href={dashboardLink} data-testid="organizer-dashboard-link">{copy(lang,"Organizer dashboard","לוח המארגן")}</a> : null}
           <button
             type="button"
             className="danger-menu"
@@ -2616,7 +2619,7 @@ export default function App() {
   }, [lang]);
 
   useEffect(() => {
-    if (me.data) localStorage.setItem("trip-user", JSON.stringify(me.data));
+    if (me.data) { const { dashboard_url: _dashboard, ...stored } = me.data; localStorage.setItem("trip-user", JSON.stringify(stored)); } // dashboard_url is per trip and per session: memory only
   }, [me.data]);
 
   useEffect(() => {

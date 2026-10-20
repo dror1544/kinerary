@@ -1544,11 +1544,33 @@ app.post('/api/auth/telegram-login', async (req, res) => {
   res.json({ token, user: safeUser });
 });
 
+// The controlPlane claim of the Bearer token on this request, or null. Never
+// throws, never trusts an unverified token, and returns nothing for the agent
+// key (which has no Bearer token).
+function verifiedManagedClaim(req) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : (req.query._t || null);
+  if (!token) return null;
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    if (!payload.controlPlane || !controlPlaneAuth.validManagedPayload(payload) || payload.username !== req.user.username) return null;
+    return payload.controlPlane;
+  } catch { return null; }
+}
+
 app.get('/api/auth/me', authRequired, (req, res) => {
   const user = getUser(req.user.username);
   if (!user) return res.status(404).json({ error: 'not_found' });
   const organizers = normalizeOrganizers(TRIP_CONFIG.agent);
-  res.json({ ...user, is_organizer: organizers.includes(user.username) });
+  const body = { ...user, is_organizer: organizers.includes(user.username) };
+  // Present only for an owner/organizer who arrived through the dashboard.
+  // authRequired is not an organizer check and carries no claim, so the managed
+  // session is verified again here (signature, binding, active participant,
+  // current local organizer role) and the URL is read from that verified claim.
+  // Members, direct logins and the agent key have no managed claim: no field.
+  const dashboardUrl = controlPlaneAuth.dashboardUrlFor(verifiedManagedClaim(req), user.username);
+  if (dashboardUrl) body.dashboard_url = dashboardUrl;
+  res.json(body);
 });
 
 app.put('/api/auth/avatar', authRequired, (req, res) => {

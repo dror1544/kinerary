@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { App } from "../App";
 
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status });
@@ -19,7 +19,12 @@ function mount(route: string, authenticated = true, runtimeAllowed = false) {
   const view = render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })}><MemoryRouter initialEntries={[route]}><App /><LocationProbe /></MemoryRouter></QueryClientProvider>);
   return { ...view, calls };
 }
-afterEach(() => { vi.unstubAllGlobals(); delete (window as unknown as { Telegram?: unknown }).Telegram; });
+let submissions: { action: string; token: string | null }[] = [];
+beforeEach(() => {
+  submissions = []; sessionStorage.clear();
+  vi.spyOn(HTMLFormElement.prototype, "submit").mockImplementation(function (this: HTMLFormElement) { submissions.push({ action: this.action, token: new FormData(this).get("token") as string | null }); });
+});
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); sessionStorage.clear(); window.history.replaceState(null, "", "/"); delete (window as unknown as { Telegram?: unknown }).Telegram; });
 it("opens private account space in an ordinary browser without Telegram identity", async () => {
   mount("/mini-app?startapp=account");
   expect(await screen.findByRole("heading", { name: "My trips" })).toBeInTheDocument();
@@ -35,7 +40,8 @@ it("untrusted Telegram user and chat hints cannot grant trip access", async () =
   const { calls } = mount("/mini-app?startapp=trip_abcdefgh");
   expect(await screen.findByText("This trip is not ready to open.")).toBeInTheDocument();
   expect(calls).toContain("POST /v1/trips/trip_abcdefgh/launch");
-  expect(screen.queryByTitle("Kinerary trip")).toBeNull();
+  expect(document.querySelector("iframe")).toBeNull();
+  expect(submissions).toEqual([]);
 });
 it("hands off to existing sign-in with the Mini App return path", async () => {
   window.history.replaceState(null, "", "/mini-app/trips/trip_abcdefgh");
@@ -62,13 +68,24 @@ it("calls SDK presentation methods, validates styling and cleans up back events"
   unmount(); expect(off).toHaveBeenCalled(); expect(hide).toHaveBeenCalled();
 });
 
-it("an authorized trip launch uses the existing runtime grant and iframe", async () => {
+it("an authorized trip launch posts the existing runtime grant as a top-level form, with no iframe", async () => {
+  (window as unknown as { Telegram: unknown }).Telegram = { WebApp: { platform: "android", ready: vi.fn(), expand: vi.fn() } };
   const { calls } = mount("/mini-app?startapp=trip_abcdefgh", true, true);
-  const frame = await screen.findByTitle("Kinerary trip");
-  expect(frame).toHaveAttribute("src", "https://runtime.example.test/t/trip_abcdefgh/");
-  expect(frame.closest(".mini-app-shell")).toHaveClass("mini-app-trip");
+  await vi.waitFor(() => expect(submissions).toHaveLength(1));
+  expect(submissions[0]).toEqual({ action: "https://runtime.example.test/t/trip_abcdefgh/__launch", token: "fixture-grant" });
+  expect(screen.getByTestId("mini-app-shell")).toHaveClass("mini-app-trip");
+  expect(document.querySelector("iframe")).toBeNull();
   expect(calls).toContain("POST /v1/trips/trip_abcdefgh/launch");
   expect(screen.getByTestId("route")).toHaveTextContent("/mini-app/trips/trip_abcdefgh");
+});
+it("Telegram's browser clients get the trip in a real tab, never a form post inside their frame", async () => {
+  const openLink = vi.fn();
+  (window as unknown as { Telegram: unknown }).Telegram = { WebApp: { platform: "weba", ready: vi.fn(), expand: vi.fn(), openLink } };
+  const { calls } = mount("/mini-app/trips/trip_abcdefgh", true, true);
+  fireEvent.click(await screen.findByRole("button", { name: "Open trip in a new tab" }));
+  expect(openLink).toHaveBeenCalledWith(`${window.location.origin}/trips/trip_abcdefgh/app`);
+  expect(submissions).toEqual([]);
+  expect(calls.filter((call) => call.endsWith("/launch"))).toEqual([]);
 });
 it("loads the SDK only while the Mini App entry is mounted", async () => {
   const ordinary = mount("/trips");
@@ -89,6 +106,7 @@ function TripSwitch() {
   return <button onClick={() => navigate("/mini-app/trips/trip_ijklmnop")}>Select another trip</button>;
 }
 function changingTrip(first: Promise<Response>) {
+  (window as unknown as { Telegram: unknown }).Telegram = { WebApp: { platform: "ios", ready: vi.fn(), expand: vi.fn() } };
   const calls: string[] = [];
   vi.stubGlobal("fetch", vi.fn(async (input: unknown) => {
     const path = String(input); calls.push(path);
@@ -99,15 +117,17 @@ function changingTrip(first: Promise<Response>) {
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })}><MemoryRouter initialEntries={["/mini-app/trips/trip_abcdefgh"]}><App /><TripSwitch /><LocationProbe /></MemoryRouter></QueryClientProvider>);
   return calls;
 }
-it("clears a previous successful runtime frame when the next selected trip is denied", async () => {
+it("a previous trip's launch does not carry over when the next selected trip is denied", async () => {
   const calls = changingTrip(Promise.resolve(json({ runtimeOrigin: "https://runtime.example.test", framePath: "/t/trip_abcdefgh/", launchToken: "fixture-first-grant" })));
-  expect(await screen.findByTitle("Kinerary trip")).toHaveAttribute("src", "https://runtime.example.test/t/trip_abcdefgh/");
+  await vi.waitFor(() => expect(submissions).toHaveLength(1));
+  expect(submissions[0].action).toBe("https://runtime.example.test/t/trip_abcdefgh/__launch");
   fireEvent.click(screen.getByRole("button", { name: "Select another trip" }));
   await screen.findByText("This trip is not ready to open.");
   expect(calls).toContain("/v1/trips/trip_ijklmnop/launch");
-  expect(screen.queryByTitle("Kinerary trip")).toBeNull();
+  expect(document.querySelector("form")).toBeNull();
+  expect(submissions).toHaveLength(1);
 });
-it("a delayed previous-trip response cannot populate the currently denied trip", async () => {
+it("a delayed previous-trip response cannot launch while the currently selected trip is denied", async () => {
   let resolve!: (value: Response) => void;
   const first = new Promise<Response>(complete => { resolve = complete; });
   const calls = changingTrip(first);
@@ -116,5 +136,6 @@ it("a delayed previous-trip response cannot populate the currently denied trip",
   await screen.findByText("This trip is not ready to open.");
   await act(async () => { resolve(json({ runtimeOrigin: "https://runtime.example.test", framePath: "/t/trip_abcdefgh/", launchToken: "fixture-delayed-grant" })); await first; });
   expect(screen.getByTestId("route")).toHaveTextContent("/mini-app/trips/trip_ijklmnop");
-  expect(screen.queryByTitle("Kinerary trip")).toBeNull();
+  expect(document.querySelector("form")).toBeNull();
+  expect(submissions).toEqual([]);
 });
