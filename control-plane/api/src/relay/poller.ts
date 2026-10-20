@@ -3168,6 +3168,23 @@ async function runInterpretPath(
     );
     return;
   }
+  // A TYPED MESSAGE LONGER THAN ONE READ TAKES (#51). The prompt keeps its first
+  // INTERPRET_SOURCE_BUDGET_CHARS and drops the rest; the log line above is all
+  // the operator gets, and the organizer would take what follows for a complete
+  // reading. Said once per message, in the language resolved above, before the
+  // reply it qualifies. A replayed burst returned earlier and does not say it
+  // again; a crash-retry of an uncommitted one may — a repeated line costs less
+  // than a silent cut. Best effort — a failed send must not lose the reading —
+  // but logged, so it is not silent.
+  if (sourceText.length > INTERPRET_SOURCE_BUDGET_CHARS) {
+    // Never the text, only that it failed.
+    const sent = await deps.telegram
+      .sendMessage({ chatId: burst.chatId, text: uiString("messagePartial", language) })
+      .catch(() => null);
+    if (!sent || !sent.ok) {
+      log(structuredLog("warn", "interview.message_partial_notice_failed", { session_id: burst.sessionId }));
+    }
+  }
   // Which question is currently on the organizer's screen. Needed after the
   // commit, to decide whether the interview may move past it — see `pace`.
   const onScreen = session.ok && session.view.lastPrompt?.startsWith("q:")

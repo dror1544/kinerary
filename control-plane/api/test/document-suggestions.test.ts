@@ -167,6 +167,41 @@ describe("an unsure reading from a document is kept, said, and asked about", () 
   });
 });
 
+describe("an unsure reading that only restates what is held (#339 follow-up)", () => {
+  // `suggestFrom` drops such a reading — a Yes would add nothing — and the one
+  // rejection left was LOW_CONFIDENCE, which is not "agreed", so the organizer
+  // was told "I couldn't find anything about the trip in it" about a file that
+  // confirms the trip. Through the real read, not a re-implementation of it.
+  test("the organizer is told it agrees with what is held, never that nothing was found; nothing is stored to ask about", { skip: SKIP }, async () => {
+    await withTwoChats(async (pool, a, b) => {
+      const telegram = new Recorder();
+      const seeded = await submitAnswerForChat(pool, a, "phases", null, undefined, [{ name: "Lisbon" }, { name: "Porto" }]);
+      assert.ok(seeded.ok);
+      await upload(pool, a, {
+        proposals: [{
+          questionId: "phases",
+          value: { kind: "structured", data: [{ name: "Lisbon" }] },
+          confidence: 0.3,
+          evidence: "Hotel Aurora Lisbon",
+        }],
+        unclear: [],
+      }, telegram);
+
+      const texts = telegram.sent.map((m) => m.text);
+      assert.ok(texts.includes(uiString("documentNothingNew", "en")), `told it agrees — sent: ${JSON.stringify(texts)}`);
+      assert.ok(!texts.includes(uiString("documentNothing", "en")), "and never that it found nothing");
+      assert.ok(!texts.includes(uiString("documentUnsure", "en")), "nor that it has something to check");
+
+      const view = await getSessionForChat(pool, a);
+      assert.deepEqual(view.ok && view.view.suggestions, {}, "no suggestion is stored");
+      const store = await answersForChat(pool, a);
+      assert.deepEqual(((store?.answers.phases as { data: { name: string }[] }).data).map((p) => p.name), ["Lisbon", "Porto"], "the held stops are untouched");
+      const other = await getSessionForChat(pool, b);
+      assert.deepEqual(other.ok && other.view.suggestions, {}, "the other chat is untouched");
+    });
+  });
+});
+
 describe("the day-by-day plan is built behind the interview, not in front of it", () => {
   // 2026-09-16, live, on the Mac: a 4-page PDF was read in 115s, and then the
   // organizer waited another 51s for the next question while the day-by-day plan
