@@ -62,6 +62,8 @@ const signupBlock = {
 interface BootedServer {
   port: number;
   stop: () => Promise<void>;
+  /** Everything the server has written to stderr so far. */
+  stderr: () => string;
 }
 
 /**
@@ -85,7 +87,7 @@ async function exitCodeWithin(child: ChildProcess, timeoutMs: number): Promise<n
   });
 }
 
-async function bootServer(profile: Record<string, unknown>, port: number): Promise<BootedServer> {
+async function bootServer(profile: Record<string, unknown>, port: number, extraEnv: Record<string, string> = {}): Promise<BootedServer> {
   const directory = await mkdtemp(join(tmpdir(), "kinerary-control-plane-boot-"));
   const profilePath = join(directory, "architecture.json");
   await writeFile(profilePath, JSON.stringify(profile), "utf8");
@@ -103,6 +105,7 @@ async function bootServer(profile: Record<string, unknown>, port: number): Promi
       CONTROL_PLANE_ACTION_SECRET: "boot-test-action-secret",
       KINERARY_TEST_RUNTIME_EXCHANGE_KEY: "boot-runtime-exchange-secret",
       CONTROL_PLANE_TELEGRAM_WEBHOOK_SECRET: "boot-test-webhook-secret",
+      ...extraEnv,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -125,7 +128,7 @@ async function bootServer(profile: Record<string, unknown>, port: number): Promi
     }
     try {
       const response = await fetch(`http://127.0.0.1:${port}/healthz`, { signal: AbortSignal.timeout(500) });
-      if (response.ok) return { port, stop };
+      if (response.ok) return { port, stop, stderr: () => stderr };
     } catch {
       // not listening yet
     }
@@ -424,8 +427,52 @@ test("the real portal server boots without Google credentials and advertises ema
   try {
     const response = await fetch(`http://127.0.0.1:${port}/v1/auth/capabilities`);
     assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), { google: false, emailPassword: true });
+    assert.deepEqual(await response.json(), { google: false, emailPassword: true, telegramMiniApp: false });
     const google = await fetch(`http://127.0.0.1:${port}/v1/auth/google/start`);
     assert.equal(google.status, 503);
+    // No web.telegram_bot_token_secret_ref: the Mini App feature is off and the
+    // boot log says why (a downgrade nobody can see in the conversation).
+    assert.match(server.stderr(), /"event":"mini_app.disabled"/);
+    const miniApp = await fetch(`http://127.0.0.1:${port}/v1/auth/telegram-mini-app`, {
+      method: "POST", headers: { "content-type": "application/json", origin: `http://127.0.0.1:${port}` }, body: "{}",
+    });
+    assert.equal(miniApp.status, 503);
+  } finally { await server.stop(); }
+});
+
+test("the real portal server keeps Mini App sign-in off when its token cannot be read, and says so", async () => {
+  const port = await freePort(), workerPort = await freePort();
+  const server = await bootServer({ ...baseProfile(port, workerPort), web: {
+    public_origin: `http://127.0.0.1:${port}`, runtime_origin: "http://127.0.0.1:4320",
+    runtime_exchange_key_secret_ref: "env://KINERARY_TEST_RUNTIME_EXCHANGE_KEY",
+    runtime_upstream_host_suffixes: ["internal"], telegram_bot_username: "kinerary_bot",
+    telegram_bot_token_secret_ref: "env://KINERARY_TEST_MINI_APP_TOKEN_UNSET",
+  } }, port);
+  try {
+    // An unreadable Mini App token must not take the whole API down with it.
+    const response = await fetch(`http://127.0.0.1:${port}/v1/auth/capabilities`);
+    assert.equal((await response.json() as { telegramMiniApp: boolean }).telegramMiniApp, false);
+    assert.match(server.stderr(), /"event":"mini_app.token_unresolved"/);
+    assert.doesNotMatch(server.stderr(), /KINERARY_TEST_MINI_APP_TOKEN_UNSET.*[0-9]{6,}:AA/);
+  } finally { await server.stop(); }
+});
+
+test("the real portal server stays off until getMe names the configured bot, and never logs the token", async () => {
+  const port = await freePort(), workerPort = await freePort();
+  const token = "987654:AAFakeMiniAppBootTokenNeverLogged";
+  const server = await bootServer({ ...baseProfile(port, workerPort), web: {
+    public_origin: `http://127.0.0.1:${port}`, runtime_origin: "http://127.0.0.1:4320",
+    runtime_exchange_key_secret_ref: "env://KINERARY_TEST_RUNTIME_EXCHANGE_KEY",
+    runtime_upstream_host_suffixes: ["internal"], telegram_bot_username: "kinerary_bot",
+    telegram_bot_token_secret_ref: "env://KINERARY_TEST_MINI_APP_TOKEN",
+  } }, port, { KINERARY_TEST_MINI_APP_TOKEN: token });
+  try {
+    // Telegram answers this fake token with an error (or is unreachable from
+    // CI): either way getMe did not confirm the bot, so the feature is off.
+    const response = await fetch(`http://127.0.0.1:${port}/v1/auth/capabilities`);
+    assert.equal((await response.json() as { telegramMiniApp: boolean }).telegramMiniApp, false);
+    assert.match(server.stderr(), /"event":"mini_app\.bot_check_(failed|unusable)"/);
+    assert.equal(server.stderr().includes(token), false);
+    assert.equal(server.stderr().includes("AAFakeMiniAppBootTokenNeverLogged"), false);
   } finally { await server.stop(); }
 });

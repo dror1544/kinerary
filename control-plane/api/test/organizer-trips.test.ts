@@ -16,6 +16,8 @@ import { issueEnrollment } from "../src/enrollment.js";
 import { startFromDeepLink, switchCallbackData, parseCallbackData, parseInbound } from "../src/chat-router.js";
 import { dispatchUpdate, DEFAULT_STRINGS } from "../src/relay/dispatch.js";
 import { listOrganizerTrips, switchChatToTrip } from "../src/organizer-trips.js";
+import { isTripOrganizer } from "../src/chat-router.js";
+import { unlinkTelegramLink } from "../src/telegram-mini-app.js";
 import { digestTelegramId } from "../src/identity.js";
 import { uiString } from "../src/intake-copy.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
@@ -699,4 +701,52 @@ describe("a returning organizer's second trip (DB)", { skip: SKIP }, () => {
         "a torn-down trip was greeted as one they still have");
     });
   });
+});
+
+describe("an unlinked Telegram account loses the bot too (DB)", { skip: SKIP }, () => {
+  // A telegram_organizer_links row is also a Mini App sign-in path (#442), so
+  // "revocable" has to mean revoked everywhere it is read, not only where it signs in.
+  async function linkOf(pool: pg.Pool, tripId: string) {
+    const { rows } = await pool.query<{ id: string; user_id: string }>(
+      `SELECT l.id, l.user_id FROM control_plane.telegram_organizer_links l
+         JOIN control_plane.trip_memberships m ON m.user_id = l.user_id
+        WHERE m.trip_id = $1 AND l.telegram_subject_digest = $2`,
+      [tripId, digestTelegramId(ORGANIZER_CHAT)],
+    );
+    return rows[0]!;
+  }
+
+  test("after Unlink, /trips stops listing that account's trips, /switch refuses it uniformly, and the rest behave as before", async () => {
+    await withFixture(async ({ pool, italyId, japanId }) => {
+      const before = await listOrganizerTrips(pool, ORGANIZER_CHAT, ORGANIZER_CHAT);
+      assert.deepEqual(before.map((t) => t.slug).sort(), ["italy-2026", "japan-2026"]);
+      assert.equal(await isTripOrganizer(pool, italyId, ORGANIZER_CHAT), true);
+      assert.equal(await hasEarlier(pool, japanId), true);
+
+      const italy = await linkOf(pool, italyId);
+      assert.equal(await unlinkTelegramLink(pool, italy.user_id, italy.id), true);
+
+      const after = await listOrganizerTrips(pool, ORGANIZER_CHAT, ORGANIZER_CHAT);
+      assert.deepEqual(after.map((t) => t.slug), ["japan-2026"], "the unlinked account's trip is gone, the other is untouched");
+      const refused = await switchChatToTrip(pool, ORGANIZER_CHAT, ORGANIZER_CHAT, italyId);
+      const nonexistent = await switchChatToTrip(pool, ORGANIZER_CHAT, ORGANIZER_CHAT, testId("trip"));
+      assert.deepEqual(refused, { kind: "refused", reason: "NOT_YOURS" });
+      assert.deepEqual(refused, nonexistent, "the existing uniform refusal");
+      assert.equal(await openBinding(pool, ORGANIZER_CHAT), null, "nothing was bound");
+      assert.equal(await isTripOrganizer(pool, italyId, ORGANIZER_CHAT), false);
+      assert.equal(await hasEarlier(pool, japanId), false, "the unlinked account's built trip no longer makes them 'returning'");
+
+      const still = await switchChatToTrip(pool, ORGANIZER_CHAT, ORGANIZER_CHAT, japanId);
+      assert.equal(still.kind, "switched");
+
+      const japan = await linkOf(pool, japanId);
+      assert.equal(await unlinkTelegramLink(pool, japan.user_id, japan.id), true);
+      assert.deepEqual(await listOrganizerTrips(pool, ORGANIZER_CHAT, ORGANIZER_CHAT), []);
+    });
+  });
+
+  async function hasEarlier(pool: pg.Pool, tripId: string) {
+    const { hasEarlierBuiltTrip } = await import("../src/organizer-trips.js");
+    return hasEarlierBuiltTrip(pool, tripId, ORGANIZER_CHAT);
+  }
 });

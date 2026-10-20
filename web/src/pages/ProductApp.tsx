@@ -6,6 +6,8 @@ import { Link, Navigate, useLocation, useNavigate, useParams } from "react-route
 import { z } from "zod";
 import { api, getMe, getTrip, getTrips, passwordSignIn, signIn, getAuthCapabilities, emailPasswordSignIn, safeReturnTo, type TripSummary, type InterviewLinkState, ApiError } from "../api";
 import { Brand } from "../components/Brand";
+import { tripUsernameInputProps, tripUsernameRegisterOptions } from "../mini-app/username";
+import { TelegramAccounts } from "./TelegramAccounts";
 
 export type ProductView = "sign-in" | "trips" | "new-trip" | "trip" | "runtime" | "join";
 
@@ -53,7 +55,7 @@ function SignIn() {
         </form>}
         {capabilities.data?.google && <button className="button wide" onClick={() => signIn(returnTo)}>Continue with Google</button>}
         {tripId && <form className="compact-form" onSubmit={passwordForm.handleSubmit((value) => passwordLogin.mutate(value))}>
-          <label>Trip username<input required pattern="[a-z0-9][a-z0-9._-]{1,63}" autoComplete="username" {...passwordForm.register("runtimeUsername")} /></label>
+          <label>Trip username<input {...tripUsernameInputProps} {...passwordForm.register("runtimeUsername", tripUsernameRegisterOptions)} /></label>
           <label>Password<input required minLength={8} type="password" autoComplete="current-password" {...passwordForm.register("password")} /></label>
           <button className="button wide" disabled={passwordLogin.isPending}>{passwordLogin.isPending ? "Signing in…" : "Continue with trip password"}</button>
           {passwordLogin.isError && <Notice>{passwordLogin.error.message}</Notice>}
@@ -90,12 +92,17 @@ function Trips() {
     }
     return grouped;
   }, [trips.data]);
-  return <main className="dashboard-main"><div className="page-title"><div><p className="eyebrow">Personal space</p><h1>My trips</h1></div><Link className="button" to="/trips/new">Plan a new trip</Link></div>{trips.isError && <Notice>We could not load your trips. Please retry.</Notice>}{trips.isPending && <p>Loading trips…</p>}{Object.entries(sections).map(([name, items]) => items.length > 0 && <section className="trip-section" key={name}><h2>{name}</h2><div className="trip-grid">{items.map((trip) => <TripCard key={trip.id} trip={trip} />)}</div></section>)}{trips.data?.trips.length === 0 && <div className="empty-state"><h2>Your first trip starts here.</h2><p>Add the broad outline. The private Telegram interview will help fill in the rest.</p><Link className="button" to="/trips/new">Create a trip</Link></div>}</main>;
+  return <main className="dashboard-main"><div className="page-title"><div><p className="eyebrow">Personal space</p><h1>My trips</h1></div><Link className="button" to="/trips/new">Plan a new trip</Link></div>{trips.isError && <Notice>We could not load your trips. Please retry.</Notice>}{trips.isPending && <p>Loading trips…</p>}{Object.entries(sections).map(([name, items]) => items.length > 0 && <section className="trip-section" key={name}><h2>{name}</h2><div className="trip-grid">{items.map((trip) => <TripCard key={trip.id} trip={trip} />)}</div></section>)}{trips.data?.trips.length === 0 && <div className="empty-state"><h2>Your first trip starts here.</h2><p>Add the broad outline. The private Telegram interview will help fill in the rest.</p><Link className="button" to="/trips/new">Create a trip</Link></div>}<TelegramAccounts /></main>;
 }
 
 function TripCard({ trip }: { trip: TripSummary }) {
-  const open = trip.runtimeReady ? `/trips/${trip.id}/app` : `/trips/${trip.id}/setup`;
-  return <article className="trip-card"><div className="status-chip">{humanize(trip.nextAction)}</div><h3>{trip.title}</h3><p>{trip.destination || "Destination to be confirmed"}</p><small>{[trip.startDate, trip.endDate].filter(Boolean).join(" → ") || "Dates are flexible"}</small><Link className="button button-small" to={open}>{trip.runtimeReady ? "Open trip" : humanize(trip.nextAction)}</Link></article>;
+  const inMiniApp = useLocation().pathname.startsWith("/mini-app");
+  const open = trip.runtimeReady ? (inMiniApp ? `/mini-app/trips/${trip.id}` : `/trips/${trip.id}/app`) : `/trips/${trip.id}/setup`;
+  // A member (runtime access, no dashboard) has no setup page to go to; an unready trip is just not ready.
+  const action = trip.runtimeReady || trip.permissions.dashboard
+    ? <Link className="button button-small" to={open}>{trip.runtimeReady ? "Open trip" : humanize(trip.nextAction)}</Link>
+    : <small>Not ready to open yet</small>;
+  return <article className="trip-card"><div className="status-chip">{humanize(trip.nextAction)}</div><h3>{trip.title}</h3><p>{trip.destination || "Destination to be confirmed"}</p><small>{[trip.startDate, trip.endDate].filter(Boolean).join(" → ") || "Dates are flexible"}</small>{action}</article>;
 }
 
 const tripSchema = z.object({ destination: z.string().trim().min(2, "Add a destination").max(160), startDate: z.string().optional(), endDate: z.string().optional(), tripType: z.enum(["family", "group", "couple", "other"]) }).refine((value) => !value.startDate || !value.endDate || value.endDate >= value.startDate, { message: "End date must follow the start date", path: ["endDate"] });
@@ -178,11 +185,12 @@ function InvitePanel({ trip }: { trip: TripSummary }) {
   const create = useMutation({ mutationFn: (values: { displayName: string; runtimeUsername: string }) => api<{ joinUrl: string }>(`/v1/trips/${trip.id}/site-invites`, { method: "POST", body: JSON.stringify(values) }), onSuccess: ({ joinUrl: value }) => { setJoinUrl(value); form.reset(); queryClient.invalidateQueries({ queryKey: ["trip", trip.id] }); } });
   const revoke = useMutation({ mutationFn: (id: string) => api(`/v1/trips/${trip.id}/site-invites/${id}`, { method: "DELETE" }), onSuccess: () => queryClient.invalidateQueries({ queryKey: ["trip", trip.id] }) });
   if (!trip.permissions.invite) return null;
-  return <aside className="workflow-card"><h2>Site invitations</h2><p>Each private link is for one person and can be used once.</p><form className="compact-form" onSubmit={form.handleSubmit((value) => create.mutate(value))}><label>Name<input required {...form.register("displayName")} /></label><label>Trip username<input required pattern="[a-z0-9][a-z0-9._-]{1,63}" {...form.register("runtimeUsername")} /></label><button className="button button-small">Create invite</button></form>{joinUrl && <div className="share-box"><strong>Copy this link now</strong><input readOnly value={joinUrl} /><div className="share-actions"><button onClick={() => navigator.clipboard.writeText(joinUrl)}>Copy</button>{navigator.share && <button onClick={() => navigator.share({ title: trip.title, url: joinUrl })}>Share</button>}<a href={`mailto:?subject=${encodeURIComponent(`Join ${trip.title}`)}&body=${encodeURIComponent(joinUrl)}`}>Email</a><a href={`https://t.me/share/url?url=${encodeURIComponent(joinUrl)}`} target="_blank" rel="noreferrer">Telegram</a></div></div>}<ul className="invite-list">{trip.invites?.map((invite) => <li key={invite.id}><div><strong>{invite.displayName}</strong><small>{invite.runtimeUsername} · {humanize(invite.status)}</small></div>{invite.status === "unused" && <button className="text-button" onClick={() => revoke.mutate(invite.id)}>Revoke</button>}</li>)}</ul></aside>;
+  return <aside className="workflow-card"><h2>Site invitations</h2><p>Each private link is for one person and can be used once.</p><form className="compact-form" onSubmit={form.handleSubmit((value) => create.mutate(value))}><label>Name<input required {...form.register("displayName")} /></label><label>Trip username<input {...tripUsernameInputProps} autoComplete="off" {...form.register("runtimeUsername", tripUsernameRegisterOptions)} /></label><button className="button button-small">Create invite</button></form>{joinUrl && <div className="share-box"><strong>Copy this link now</strong><input readOnly value={joinUrl} /><div className="share-actions"><button onClick={() => navigator.clipboard.writeText(joinUrl)}>Copy</button>{navigator.share && <button onClick={() => navigator.share({ title: trip.title, url: joinUrl })}>Share</button>}<a href={`mailto:?subject=${encodeURIComponent(`Join ${trip.title}`)}&body=${encodeURIComponent(joinUrl)}`}>Email</a><a href={`https://t.me/share/url?url=${encodeURIComponent(joinUrl)}`} target="_blank" rel="noreferrer">Telegram</a></div></div>}<ul className="invite-list">{trip.invites?.map((invite) => <li key={invite.id}><div><strong>{invite.displayName}</strong><small>{invite.runtimeUsername} · {humanize(invite.status)}</small></div>{invite.status === "unused" && <button className="text-button" onClick={() => revoke.mutate(invite.id)}>Revoke</button>}</li>)}</ul></aside>;
 }
 
 function Runtime() {
   const navigate = useNavigate();
+  const inMiniApp = useLocation().pathname.startsWith("/mini-app");
   const { tripId = "" } = useParams();
   const iframe = useRef<HTMLIFrameElement>(null);
   const [launch, setLaunch] = useState<{ runtimeOrigin: string; framePath: string; launchToken: string }>();
@@ -202,7 +210,7 @@ function Runtime() {
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
   }, [launch, navigate]);
-  return <main className="runtime-shell"><div className="runtime-bar"><Link to={`/trips/${tripId}/setup`}>← Trip setup</Link><strong>Kinerary trip</strong><span /></div>{grant.isPending && <div className="route-loading">Opening your trip…</div>}{grant.isError && <div className="route-loading">This trip is not ready to open.</div>}{launch && <iframe ref={iframe} title="Kinerary trip" src={`${launch.runtimeOrigin}${launch.framePath}`} sandbox="allow-forms allow-modals allow-popups allow-same-origin allow-scripts allow-downloads" allow="clipboard-write" />}</main>;
+  return <main className="runtime-shell"><div className="runtime-bar">{inMiniApp ? <Link to="/mini-app">← My trips</Link> : <Link to={`/trips/${tripId}/setup`}>← Trip setup</Link>}<strong>Kinerary trip</strong><span /></div>{grant.isPending && <div className="route-loading">Opening your trip…</div>}{grant.isError && <div className="route-loading">This trip is not ready to open.</div>}{launch && <iframe ref={iframe} title="Kinerary trip" src={`${launch.runtimeOrigin}${launch.framePath}`} sandbox="allow-forms allow-modals allow-popups allow-same-origin allow-scripts allow-downloads" allow="clipboard-write" />}</main>;
 }
 
 function Join() {

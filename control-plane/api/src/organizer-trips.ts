@@ -18,8 +18,9 @@
  *   - Identity is the Telegram sender id from the update Telegram delivered on
  *     the bot's own authenticated connection — never a body field.
  *   - The set of trips a command may touch is derived server-side from that
- *     identity, through telegram_organizer_links (migration 0052) joined to
- *     active memberships. An argument or a tapped button SELECTS WITHIN that
+ *     identity, through telegram_organizer_links (migration 0052, minus the
+ *     links revoked since: a link is also a Mini App sign-in path, and
+ *     unlinking it must end bot access too) joined to active memberships. An argument or a tapped button SELECTS WITHIN that
  *     set; it can never widen it.
  *   - Refusals are uniform. "That trip isn't yours" and "no such trip" are the
  *     same sentence, for the reason group-binding already gives: a
@@ -91,7 +92,7 @@ export async function hasEarlierBuiltTrip(
                WHERE own.trip_id = $1 AND own.role = 'owner' AND own.status = 'active')
             OR ($2::text IS NOT NULL AND m.user_id IN (
               SELECT l.user_id FROM control_plane.telegram_organizer_links l
-               WHERE l.telegram_subject_digest = $2))
+               WHERE l.telegram_subject_digest = $2 AND l.revoked_at IS NULL))
           )
      ) AS earlier`,
     [tripId, digest],
@@ -206,7 +207,7 @@ export async function listOrganizerTrips(
          ON m.trip_id = t.id AND m.status = 'active'
       WHERE m.user_id IN (
               SELECT user_id FROM control_plane.telegram_organizer_links
-               WHERE telegram_subject_digest = $1)
+               WHERE telegram_subject_digest = $1 AND revoked_at IS NULL)
         AND ${NOT_RETIRED_SQL}
         AND NOT EXISTS (
               SELECT 1 FROM control_plane.telegram_chat_bindings d
@@ -325,7 +326,7 @@ export async function switchChatToTrip(
           AND ${NOT_RETIRED_SQL}
           AND m.user_id IN (
                 SELECT user_id FROM control_plane.telegram_organizer_links
-                 WHERE telegram_subject_digest = $2)
+                 WHERE telegram_subject_digest = $2 AND revoked_at IS NULL)
         LIMIT 1`,
       [tripId, digestTelegramId(telegramUserId)],
     );

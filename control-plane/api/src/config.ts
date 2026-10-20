@@ -87,6 +87,16 @@ export const architectureProfileSchema = z.object({
     runtime_exchange_key_secret_ref: secretReference,
     runtime_upstream_host_suffixes: z.array(z.string().min(1).max(253).regex(/^[A-Za-z0-9.-]+$/)).min(1),
     telegram_bot_username: z.string().regex(/^[A-Za-z0-9_]{5,32}$/),
+    /**
+     * The token of the bot whose Mini App signs people in. OPTIONAL, and absent
+     * means the feature is OFF (logged at boot, and `capabilities` says so) — it
+     * never falls back to some other configured bot token. At boot `getMe` on
+     * this token must name `telegram_bot_username`, or the feature stays off:
+     * a token for a different bot would otherwise verify that bot's launches.
+     */
+    telegram_bot_token_secret_ref: secretReference.optional(),
+    /** How old a Mini App launch's `auth_date` may be. Telegram's own guidance is minutes, not hours. */
+    telegram_init_data_max_age_seconds: z.number().int().min(60).max(3600).default(300),
     // There is deliberately no provisioning-admin allowlist here. Provisioning
     // is approved by the trip's own organizer; the operator is notified, not
     // asked. See docs/landing-page-plan.md.
