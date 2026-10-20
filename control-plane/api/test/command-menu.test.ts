@@ -5,7 +5,7 @@ import type { TelegramClient } from "../src/relay/telegram-api.js";
 
 // What the router answers itself (relay/dispatch.ts). Anything else a menu
 // offers is a command the command gate refuses.
-const ROUTER_COMMANDS = new Set(["help", "name", "proactive", "group", "trips", "switch"]);
+const ROUTER_COMMANDS = new Set(["help", "name", "app", "proactive", "group", "trips", "switch"]);
 
 describe("routerCommandMenus — the menu is the router's, not Hermes's", () => {
   test("every advertised command is one the router handles", () => {
@@ -25,6 +25,12 @@ describe("routerCommandMenus — the menu is the router's, not Hermes's", () => 
       for (const outsideGroups of ["group", "trips", "switch"]) {
         assert.equal(names.includes(outsideGroups), menu.scope !== "all_group_chats", `${menu.scope} /${outsideGroups} placement`);
       }
+    }
+  });
+
+  test("/app is offered in every scope - the same Open trip button for the chat's own trip, wherever it is asked", () => {
+    for (const menu of routerCommandMenus()) {
+      assert.ok(menu.commands.some((c) => c.command === "app"), `${menu.scope}/${menu.languageCode ?? "-"} lacks /app`);
     }
   });
 

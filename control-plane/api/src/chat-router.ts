@@ -868,10 +868,20 @@ export async function startFromDeepLink(
 
 // ── Inline keyboards ─────────────────────────────────────────────────────────
 
-export interface InlineButton {
+export interface InlineCallbackButton {
   text: string;
   callback_data: string;
 }
+/**
+ * A button that opens a link. The only kind that works in a group for the Mini
+ * App: an inline `web_app` button is private-chat only, a `t.me/<bot>?startapp=`
+ * URL is not.
+ */
+export interface InlineUrlButton {
+  text: string;
+  url: string;
+}
+export type InlineButton = InlineCallbackButton | InlineUrlButton;
 export interface InlineKeyboard {
   inline_keyboard: InlineButton[][];
 }

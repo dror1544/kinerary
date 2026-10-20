@@ -96,6 +96,11 @@ interface Runtime {
   /** Set only in serve mode; its absence is what disables the poll loop. */
   db?: ReturnType<typeof createDatabasePool>;
   botIdentity?: BotIdentity;
+  /**
+   * `web.telegram_bot_username` (or TELEGRAM_BOT_USERNAME): the bot whose Main
+   * Mini App the "Open trip" button opens. Absent, the relay's own handle is used.
+   */
+  tripAppBotUsername?: string;
   /** From `relay.interviewer_profile`; absent disables interview forwarding. */
   interviewerProfile?: string;
   /**
@@ -171,6 +176,19 @@ async function serveRuntime(path: string): Promise<Runtime> {
     }));
   }
 
+  // Which bot the "Open trip" button points at (#443). Said once, here, because
+  // a missing handle removes the button with nothing in the chat to show for it.
+  const tripAppBotUsername = profile.web?.telegram_bot_username ?? process.env.TELEGRAM_BOT_USERNAME ?? undefined;
+  if (tripAppBotUsername) {
+    log(structuredLog("info", "relay.trip_app_link", { source: "configured", bot_username: tripAppBotUsername }));
+  } else if (identity) {
+    log(structuredLog("info", "relay.trip_app_link", { source: "getMe", bot_username: identity.username }));
+  } else {
+    log(structuredLog("warn", "relay.trip_app_link_unavailable", {
+      hint: "no web.telegram_bot_username and getMe failed: the Open trip button and /app cannot be offered",
+    }));
+  }
+
   // Publish the ⌘ menu here — once, at boot, beside the other call that asks
   // Telegram about ourselves — rather than per message. Awaited so the log
   // lines stay in order, and deliberately not guarded: publishCommandMenu owns
@@ -208,6 +226,7 @@ async function serveRuntime(path: string): Promise<Runtime> {
     telegram,
     db,
     botIdentity: identity ? { username: identity.username, id: identity.id } : undefined,
+    ...(tripAppBotUsername ? { tripAppBotUsername } : {}),
     interviewerProfile: relay.interviewer_profile,
     multiplexGatewayId: relay.multiplex_gateway_id,
     approvals,
@@ -427,6 +446,7 @@ async function main(): Promise<void> {
       telegram: runtime.telegram,
       connector,
       botIdentity: runtime.botIdentity,
+      ...(runtime.tripAppBotUsername ? { tripAppBotUsername: runtime.tripAppBotUsername } : {}),
       interviewerProfile: runtime.interviewerProfile,
       approvals: runtime.approvals,
       media: { telegram: runtime.telegram, store: mediaStore, baseUrl: mediaBaseUrl, log },

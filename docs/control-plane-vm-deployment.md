@@ -152,6 +152,15 @@ is its only credential, and losing it made every interpret call `FAILED`.
 ### Checks that actually answer the question
 
 - **API:** `readyz` → `"status":"ready"` with the expected `schema_migrations`.
+- **Telegram Mini App** (only if `web.telegram_bot_token_secret_ref` is set):
+  `readyz` carries `telegram_mini_app: {configured, enabled, has_main_web_app}`.
+  `enabled: true` means `getMe` on that token names the bot the profile says it is.
+  `has_main_web_app: false` is the one-time BotFather step not done yet — the
+  "Open trip" button and `/app` link would open nothing (set it:
+  [Telegram Mini App](telegram-mini-app.md#one-time-setup-the-bots-main-mini-app));
+  `null` means Telegram has not said yet, which is not "no". None of these makes
+  the API not-ready. The boot log carries the same finding as
+  `mini_app.main_web_app_missing`.
 - **Relay:** `$C logs relay` shows `relay.bot_identity` naming the bot you
   expect, `relay.ready … polling:true`, and **no** `409`/`Conflict` — a 409
   means a second `getUpdates` loop exists somewhere on the same token.

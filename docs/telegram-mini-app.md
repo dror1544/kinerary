@@ -146,6 +146,46 @@ must name `web.telegram_bot_username`, or the feature stays off (`mini_app.bot_t
 — handles only, never the token); a network failure is retried every minute. Boot also logs
 `has_main_web_app` from `getMe`. Nothing logs `initData`, a hash, a Telegram id or its digest.
 
+### One-time setup: the bot's Main Mini App
+
+The `t.me/<bot>?startapp=...` link behind the "Open trip" button opens the bot's
+**Main Mini App**, which only exists once somebody sets it in BotFather. No code can
+do that step, so a deployment that never did it has working sign-in and a button that
+opens nothing.
+
+1. In BotFather: `/mybots`, choose the bot, **Bot Settings**, **Configure Mini App**
+   (or **Main Mini App** in newer clients), **Enable Mini App**.
+2. URL: `<web.public_origin>/mini-app` — the portal origin from the architecture profile,
+   plus `/mini-app`. Nothing else is needed; the trip rides in `startapp`.
+3. It must be the **same bot** as `web.telegram_bot_username` (the boot check
+   already refuses a token for another bot).
+
+Then check it, without reading logs: `GET /readyz` reports
+`telegram_mini_app.has_main_web_app` — `true` when Telegram says the bot has a Main
+Mini App, `false` while the step above is not done, `null` while Telegram has not
+answered yet. The check runs at boot and is repeated every minute while Telegram has not
+answered, or answers `false`, so doing the step above shows on `/readyz` within a minute,
+without a restart. Boot logs `mini_app.main_web_app_missing` once for `false`.
+`has_main_web_app` is the bot's own `getMe` field, so the answer is Telegram's, not ours.
+
+### The "Open trip" button and `/app`
+
+The relay posts and pins one message in a trip's group — when the group is bound
+(`/group KIN-…`, or the one-tap add link) and again when the bot is re-added — carrying a
+URL button to `https://t.me/<bot>?startapp=<trip id>`; `/app` (and "open the app",
+"פתח את האפליקציה", addressed to the assistant) answers with the same button for the
+chat's own trip. The bot comes from `web.telegram_bot_username`, else the relay's own
+`getMe`; with neither, no button is made and `trip_bot.open_trip_unavailable` is logged.
+
+The link **selects, it never grants**: the only thing in it is the trip id, which is
+already in every trip URL; the Mini App signs the person in with the identity Telegram
+verified for that launch and opens the trip only for an active member of it (above). A
+URL button is used because an inline `web_app` button does not work in groups. If the
+bot cannot pin (no admin right to pin messages), the group is told so once, with what to
+do; the message works unpinned. A previous Open trip message of the bot's own at the top
+of the pins is unpinned first, so a group moved to another trip does not keep pointing at
+the old one. Command surface: [trip-bot-command-surface.md](trip-bot-command-surface.md).
+
 Unsupported in v1: Telegram Web (`web.telegram.org`, platforms `weba`/`webk`) runs Mini Apps
 in a cross-site iframe where the session cookies are not sent; the page says "Open in the
 Telegram app". A person who is not linked and whose launch names no trip sees a message
@@ -193,6 +233,9 @@ the existing web views and the ordinary sign-in page remain usable.
 - Resolution, replay (including two pools), shared device, unlink, notice, phase 2, revocation,
   `/v1/auth/password` hardening, log redaction (needs a scratch database):
   `telegram-mini-app-db.test.ts`.
+- The button, `/app`, the words, the pin and the readiness field: `open-trip.test.ts`,
+  `relay-open-trip.test.ts` (needs a scratch database), `mini-app-status.test.ts`,
+  `server-boot.test.ts`, `command-menu.test.ts`.
 - Client: `web/src/mini-app/MiniAppSignIn.test.tsx`, `web/src/pages/TelegramAccounts.test.tsx`,
   `web/src/pages/TripUsername.test.tsx`.
 
