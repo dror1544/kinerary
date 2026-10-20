@@ -92,7 +92,12 @@ function messageTextFor(row: OutboxRow, options?: DispatchOptions): string | Int
   if (row.notification_type === SIGN_IN_NOTICE_TYPE) {
     // About an account, not a trip (trip_id is NULL). Wording lives with the
     // sign-in code that queues it.
-    return signInNoticeText(payloadString(row, "account_name") ?? "your account", options?.publicOrigin ?? null);
+    return signInNoticeText({
+      accountName: payloadString(row, "account_name") ?? "your account",
+      linkKind: payloadString(row, "link_kind") === "member" ? "member" : "organizer",
+      tripTitle: payloadString(row, "trip_title"),
+      at: payloadString(row, "at"),
+    }, options?.publicOrigin ?? null);
   }
   if (row.notification_type === "provisioning_complete" || row.notification_type === "companion_ready") {
     const url = row.payload && typeof row.payload.private_url === "string" ? row.payload.private_url : null;

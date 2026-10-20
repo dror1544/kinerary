@@ -7,6 +7,7 @@ import { issueEnrollment, replaceEnrollment } from "./enrollment.js";
 import { ensureUnknownPasswordCredential, resolveOrCreateEmailAccount, verifyPasswordLogin } from "./password-identity.js";
 import { generatePlan } from "./planner.js";
 import { issueApproval } from "./plan-approval.js";
+import { removeMember } from "./member-removal.js";
 import { structuredLog } from "./redaction.js";
 import {
   TRIP_ID_PATTERN, claimSessionSlot, enqueueSignInNotice, linkMemberOrSkip,
@@ -368,6 +369,27 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
   ]);
   const plan = planResult.rows[0];
   const runtimeReady = routeResult.rows[0]?.state === "ready";
+  // Who is on the trip, for the organizer's "remove member". The handle is the
+  // membership id, never a user id. `removable` is the server's own answer so
+  // the page does not re-derive the rules (not yourself; owners only by an
+  // owner; never the last owner/organizer).
+  const memberRows = trip.dashboard_access ? await deps.db.query<{
+    id: string; user_id: string; display_name: string; role: string; runtime_username: string | null;
+  }>(
+    `SELECT m.id, m.user_id, u.display_name, m.role,
+            (SELECT i.runtime_username FROM control_plane.site_invites i
+              WHERE i.trip_id = m.trip_id AND i.redeemed_by = m.user_id AND i.state = 'redeemed'
+              ORDER BY i.redeemed_at DESC LIMIT 1) AS runtime_username
+       FROM control_plane.trip_memberships m JOIN control_plane.users u ON u.id = m.user_id
+      WHERE m.trip_id = $1 AND m.status = 'active' ORDER BY m.created_at, m.id`, [tripId]) : { rows: [] };
+  const isOrganizerSide = (role: string) => role === "owner" || role === "organizer";
+  const members = memberRows.rows.map((row) => {
+    const others = memberRows.rows.filter((other) => other.user_id !== row.user_id);
+    const removable = trip.dashboard_access && isOrganizerSide(trip.role) && row.user_id !== userId
+      && !(row.role === "owner" && (trip.role !== "owner" || !others.some((other) => other.role === "owner")))
+      && !(isOrganizerSide(row.role) && !others.some((other) => isOrganizerSide(other.role)));
+    return { id: row.id, displayName: row.display_name, role: row.role, runtimeUsername: row.runtime_username, you: row.user_id === userId, removable };
+  });
   return {
     id: trip.id,
     title: trip.title ?? trip.destination_label ?? "Untitled trip",
@@ -390,11 +412,43 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
       releaseId: plan.release_id, digest: plan.digest, safeErrorCode: plan.safe_error_code,
     } : null,
     runtimeReady,
+    members,
     invites: invitesResult.rows.map((invite) => ({
       id: invite.id, displayName: invite.intended_display_name, runtimeUsername: invite.runtime_username,
       status: invite.state === "unused" && invite.expires_at.getTime() < Date.now() ? "expired" : invite.state,
       expiresAt: invite.expires_at.toISOString(), createdAt: invite.created_at.toISOString(),
     })),
+  };
+}
+
+/**
+ * What a member WITHOUT dashboard access may see of a trip in their list: the
+ * trip's name, place, dates, their own permissions and whether it can be
+ * opened. Nothing of the organizer's workbench — invitees' names and usernames,
+ * invite ids, plan id/digest/status, the interview session, the lifecycle —
+ * which `tripDetail` carries for the people who run the trip.
+ */
+async function memberTripSummary(deps: PortalDependencies, tripId: string, userId: string) {
+  const result = await deps.db.query<{
+    id: string; title: string | null; destination_label: string | null; start_date: string | null; end_date: string | null;
+    role: string; dashboard_access: boolean; runtime_access: boolean; runtime_ready: boolean;
+  }>(
+    `SELECT t.id, t.title, t.destination_label, t.start_date::text, t.end_date::text, m.role, m.dashboard_access, m.runtime_access,
+            EXISTS (SELECT 1 FROM control_plane.runtime_routes r WHERE r.trip_id = t.id AND r.state = 'ready') AS runtime_ready
+       FROM control_plane.trips t JOIN control_plane.trip_memberships m ON m.trip_id = t.id
+      WHERE t.id = $1 AND m.user_id = $2 AND m.status = 'active'`,
+    [tripId, userId],
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  return {
+    id: row.id,
+    title: row.title ?? row.destination_label ?? "Untitled trip",
+    destination: row.destination_label,
+    startDate: row.start_date,
+    endDate: row.end_date,
+    permissions: { role: row.role, dashboard: false, runtime: row.runtime_access, invite: false, requestProvisioning: false },
+    runtimeReady: row.runtime_ready,
   };
 }
 
@@ -544,13 +598,17 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
           return reply.code(401).send({ error: "TELEGRAM_NOT_LINKED", fallback: "none" });
         }
         const session = await createWebSession(client, outcome.target.userId, deps.sessionTtlSeconds, outcome.target.linkId);
-        if (used.first) {
-          await enqueueSignInNotice(client, { telegramUserId: launch.telegramUserId, accountName: outcome.target.userDisplayName, linkKind: outcome.target.linkKind });
-        }
+        // First use of this link: tell the account owner's OWN chats (not the signer).
+        const noticesQueued = used.first
+          ? await enqueueSignInNotice(client, {
+            signerTelegramId: launch.telegramUserId, userId: outcome.target.userId, accountName: outcome.target.userDisplayName,
+            linkKind: outcome.target.linkKind, tripTitle: outcome.target.tripTitle,
+          })
+          : 0;
         await revokeIncoming(client);
         await client.query("COMMIT");
         setWebSessionCookies(reply, deps, session);
-        miniAppLog(structuredLog("info", "mini_app.sign_in", { outcome: "session", link_kind: outcome.target.linkKind, first_use: used.first }));
+        miniAppLog(structuredLog("info", "mini_app.sign_in", { outcome: "session", link_kind: outcome.target.linkKind, first_use: used.first, notices_queued: noticesQueued }));
         return { kind: "session", appPath: outcome.target.appPath, ...(outcome.notice ? { notice: outcome.notice } : {}) };
       }
       await revokeIncoming(client);
@@ -743,11 +801,12 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
   app.get("/v1/trips", async (request, reply) => {
     const user = await requireUser(request, reply, deps);
     if (!user) return;
-    const rows = await deps.db.query<{ id: string }>(
+    const rows = await deps.db.query<{ id: string; dashboard_access: boolean }>(
       // A member's trips are the ones they can open (runtime access), the same
       // list the Mini App shows; an organizer's also include the trips they run.
-      "SELECT trip_id AS id FROM control_plane.trip_memberships WHERE user_id = $1 AND status = 'active' AND (dashboard_access = true OR runtime_access = true) ORDER BY created_at DESC", [user.id]);
-    return { trips: (await Promise.all(rows.rows.map((row) => tripDetail(deps, row.id, user.id)))).filter(Boolean) };
+      "SELECT trip_id AS id, dashboard_access FROM control_plane.trip_memberships WHERE user_id = $1 AND status = 'active' AND (dashboard_access = true OR runtime_access = true) ORDER BY created_at DESC", [user.id]);
+    // Full detail only where the caller runs the trip; a runtime-only member gets the summary.
+    return { trips: (await Promise.all(rows.rows.map((row) => row.dashboard_access ? tripDetail(deps, row.id, user.id) : memberTripSummary(deps, row.id, user.id)))).filter(Boolean) };
   });
 
   app.post("/v1/trips", async (request, reply) => {
@@ -974,8 +1033,36 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
     const result = await deps.db.query(
       "UPDATE control_plane.site_invites SET state = 'revoked', updated_at = now() WHERE id = $1 AND trip_id = $2 AND state = 'unused'",
       [params.inviteId, params.id]);
-    if (!result.rowCount) return reply.code(404).send({ error: "NOT_FOUND" });
+    if (result.rowCount) return { status: "revoked" };
+    // A REDEEMED invite is a person on the trip: revoking it removes them, with
+    // everything removing a member does (member-removal.ts).
+    const redeemed = await deps.db.query<{ redeemed_by: string | null }>(
+      "SELECT redeemed_by FROM control_plane.site_invites WHERE id = $1 AND trip_id = $2 AND state = 'redeemed'",
+      [params.inviteId, params.id]);
+    const target = redeemed.rows[0]?.redeemed_by;
+    if (!target) return reply.code(404).send({ error: "NOT_FOUND" });
+    const removal = await removeMember(deps.db, { tripId: params.id ?? "", actorUserId: user.id, targetUserId: target });
+    if (!removal.ok) return reply.code(removal.status).send({ error: removal.error });
     return { status: "revoked" };
+  });
+
+  // Remove a member from the trip. Organizer-side only; anyone else, and any
+  // membership that is not on this trip, is the same 404.
+  app.delete("/v1/trips/:id/members/:membershipId", async (request, reply) => {
+    const user = await requireMutation(request, reply, deps);
+    if (!user) return;
+    const params = request.params as { id?: string; membershipId?: string };
+    const tripId = params.id ?? "";
+    const target = await deps.db.query<{ user_id: string }>(
+      "SELECT user_id FROM control_plane.trip_memberships WHERE id = $1 AND trip_id = $2 AND status = 'active'",
+      [params.membershipId ?? "", tripId]);
+    const actor = await membership(deps, tripId, user.id);
+    if (!actor || !["owner", "organizer"].includes(actor.role) || !actor.dashboard_access || !target.rows[0]) {
+      return reply.code(404).send({ error: "NOT_FOUND" });
+    }
+    const removal = await removeMember(deps.db, { tripId, actorUserId: user.id, targetUserId: target.rows[0].user_id });
+    if (!removal.ok) return reply.code(removal.status).send({ error: removal.error });
+    return { status: "removed" };
   });
 
   app.post("/v1/site-invites/inspect", async (request, reply) => {

@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { getTelegramLinks, unlinkTelegramLink, type TelegramLink } from "../api";
 
 const HOW: Record<TelegramLink["via"], string> = {
-  interview_link: "by redeeming your interview link in Telegram",
+  interview_link: "by redeeming an interview link in Telegram",
   earlier_interview: "from an interview you did earlier in Telegram",
   trip_password: "with the trip password inside the Mini App",
   invite: "with a site invitation inside the Mini App",
@@ -47,8 +47,9 @@ export function TelegramAccounts() {
               <div>
                 <strong>{link.scope === "trip" ? `Opens ${link.tripTitle ?? "one trip"} only` : "Opens all of your trips"}</strong>
                 <small>
-                  Linked on {day(link.linkedAt)} {HOW[link.via]}.{" "}
-                  {link.lastSignedInAt ? `Last signed in ${day(link.lastSignedInAt)}.` : "Has not signed in with it yet."}
+                  Linked on {day(link.linkedAt)} {link.viaTripTitle ? `via the interview for "${link.viaTripTitle}"` : HOW[link.via]}.{" "}
+                  {link.firstSignedInAt ? `First signed in ${day(link.firstSignedInAt)}.` : "Has not signed in with it yet."}{" "}
+                  {link.lastSignedInAt && link.lastSignedInAt !== link.firstSignedInAt ? `Last signed in ${day(link.lastSignedInAt)}.` : ""}
                 </small>
               </div>
               {confirming === link.id

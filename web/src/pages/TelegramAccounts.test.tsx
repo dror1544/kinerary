@@ -5,8 +5,8 @@ import { afterEach, expect, it, vi } from "vitest";
 import { App } from "../App";
 
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status });
-const link = { id: "tol_0123456789abcdef", scope: "account", via: "interview_link", tripTitle: null, linkedAt: "2026-10-03T10:00:00.000Z", lastSignedInAt: "2026-10-04T10:00:00.000Z" };
-const tripLink = { id: "tml_0123456789abcdef", scope: "trip", via: "trip_password", tripTitle: "Rome", linkedAt: "2026-10-05T10:00:00.000Z", lastSignedInAt: null };
+const link = { id: "tol_0123456789abcdef", scope: "account", via: "interview_link", tripTitle: null, viaTripTitle: "Rome 2027", linkedAt: "2026-10-03T10:00:00.000Z", firstSignedInAt: "2026-10-04T10:00:00.000Z", lastSignedInAt: "2026-10-06T10:00:00.000Z" };
+const tripLink = { id: "tml_0123456789abcdef", scope: "trip", via: "trip_password", tripTitle: "Rome", viaTripTitle: null, linkedAt: "2026-10-05T10:00:00.000Z", firstSignedInAt: null, lastSignedInAt: null };
 
 function mount(links: unknown[], enabled = true) {
   const calls: string[] = [];
@@ -29,7 +29,9 @@ it("lists every Telegram account that can sign in as you — when, how, which tr
   expect(await screen.findByRole("heading", { name: "Telegram accounts that can sign in as you" })).toBeInTheDocument();
   expect(screen.getByText("Opens all of your trips")).toBeInTheDocument();
   expect(screen.getByText("Opens Rome only")).toBeInTheDocument();
-  expect(screen.getByText(/by redeeming your interview link in Telegram/)).toBeInTheDocument();
+  // The row says which trip's interview made the link, and when it first and last signed in.
+  expect(screen.getByText(/via the interview for "Rome 2027"/)).toBeInTheDocument();
+  expect(screen.getByText(/First signed in .*Last signed in/)).toBeInTheDocument();
   expect(screen.getByText(/with the trip password inside the Mini App/)).toBeInTheDocument();
   expect(screen.getByText(/Has not signed in with it yet/)).toBeInTheDocument();
   expect(document.body.textContent).not.toMatch(/sha256|tol_|tml_/);

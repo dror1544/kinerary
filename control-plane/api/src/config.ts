@@ -22,6 +22,21 @@ export const architectureProfileSchema = z.object({
   public_api: z.object({
     bind_host: z.string().min(1),
     port: z.number().int().min(1024).max(65535),
+    /**
+     * Which proxies in front of this API may speak for the client's address.
+     * OFF (absent) is the default and means `request.ip` is the socket peer —
+     * correct for a direct deployment, and for one behind a proxy it means every
+     * client shares the proxy's address, so the per-IP sign-in limits
+     * (/v1/auth/email-password, /v1/auth/password, /v1/auth/telegram-mini-app)
+     * become one global budget. Set it to the proxy's address(es) or CIDR(s) —
+     * or a hop count when the chain is fixed — and Fastify takes the client's
+     * address from `X-Forwarded-For` ONLY for requests arriving from them. A
+     * wrong list is worse than none: it lets a caller pick their own address.
+     */
+    trust_proxy: z.union([
+      z.number().int().min(1).max(8),
+      z.array(z.string().min(1).max(64)).min(1).max(16),
+    ]).optional(),
   }).strict(),
   worker: z.object({
     queue: z.literal("postgres"),

@@ -145,14 +145,15 @@ credential and never an authentication path.
 
 **That last clause changed on 2026-10-20 (#442).** A row is now also a **sign-in path**:
 the holder of the linked Telegram account can open the Mini App as that user with no
-password (§10). The table keeps its name and shape, but it is now **revocable**
-(`revoked_at`, migration `20261020120000`), **owner-visible** ("Telegram accounts that
-can sign in as you" on My trips, with Unlink) and **announced** (a Telegram notice on
-the first Mini App sign-in through a link). Every reader skips a revoked row — the Mini
-App resolver and the bot's own (`/trips`, `/switch`, `hasEarlierBuiltTrip`,
-`isTripOrganizer`) — so Unlink ends bot access too. A revoked organizer link stays
-revoked; a new interview link does not re-open it. Telegram Login Widget SSO on the
-per-trip sites stays retired (`/v1/auth/telegram` still answers 410).
+password (§10). The table keeps its name and shape, but it is now **revocable** (an Unlink
+*moves* the row to `telegram_organizer_link_revocations`, migration `20261020120000`),
+**owner-visible** ("Telegram accounts that can sign in as you" on My trips, with Unlink) and
+**announced** (a Telegram notice to the owner's own chats on the first Mini App sign-in through a
+link). Because the row is moved rather than flagged, every reader — the Mini App resolver, the
+bot's own (`/trips`, `/switch`, `hasEarlierBuiltTrip`, `isTripOrganizer`), and the previous
+release's after a rollback — simply no longer sees it, with no reader having to know about
+revocation. A revoked organizer link stays revoked; a new interview link does not re-open it.
+Telegram Login Widget SSO on the per-trip sites stays retired (`/v1/auth/telegram` still answers 410).
 
 **The migration backfills from `intake_sessions`.** Without that the feature
 would ship inert: a link is written when an enrollment is redeemed, and an
@@ -416,8 +417,8 @@ Collected so they are not lost in the prose. None of these should be guessed:
 3. **Draft creation without a destination** (§6, kept for later) — placeholder,
    or ask one question first?
 4. **Mini app auth** (§10) — *resolved (2026-10-20)*: outside the retired decision, under
-   the conditions in §10 and `telegram-mini-app.md`. The bot's own readers of
-   `telegram_organizer_links` skip revoked links (closed 2026-10-20).
+   the conditions in §10 and `telegram-mini-app.md`. An Unlink removes the
+   row from `telegram_organizer_links`, so no bot reader sees it (closed 2026-10-20).
 
 ## 12. What the tests would have to show
 

@@ -1,4 +1,4 @@
--- rollback: compatible — adds nullable columns, two new tables that no existing code reads, and triggers that write only those; the previous code runs unchanged (it never signs anyone in with Telegram, and still honours a revoked link for bot routing)
+-- rollback: compatible — adds nullable columns, new tables that no existing code reads, and triggers that write only those; Unlink moves an organizer link out of telegram_organizer_links into a history table, so the previous release's bot readers cannot see an unlinked account and the previous code runs unchanged
 --
 -- TELEGRAM LINKS BECOME A SIGN-IN PATH (#442) — AND SO THEY MUST BE REVOCABLE.
 --
@@ -10,14 +10,14 @@
 -- password". The table keeps its name and its columns; what changes is what a
 -- row is worth, and therefore three things around it:
 --
---   * it is REVOCABLE        (`revoked_at`, `revoked_reason`) — a row that
---                            signs people in cannot be append-only forever;
+--   * it is REVOCABLE        — Unlink MOVES the row out of this table into
+--                            `telegram_organizer_link_revocations` (below);
 --   * it is OWNER-VISIBLE    — the signed-in user sees every Telegram account
 --                            that can sign in as them and can unlink it
 --                            (GET/DELETE /v1/account/telegram-links);
 --   * it is ANNOUNCED        (`first_signed_in_at`) — the first Mini App
---                            sign-in through a link sends the Telegram account
---                            a notice, once.
+--                            sign-in through a link sends a notice to the
+--                            account owner's own Telegram chats, once.
 --
 -- Why this matters in practice: an organizer's link is written when an
 -- interview link is redeemed from a Telegram chat. An interview link that was
@@ -28,30 +28,45 @@
 -- is how an Unlink also ends the sessions that link already minted instead of
 -- leaving them alive for their seven days.
 --
--- A revoked organizer link STAYS revoked: `linkTelegramOrganizerInTx` keeps its
--- ON CONFLICT DO NOTHING, so redeeming another interview link does not quietly
--- re-open a door the organizer shut. Every reader of the table skips a revoked
--- row — the Mini App resolver and the bot's own (/trips, /switch, "returning
--- organizer", isTripOrganizer) — so Unlink ends bot access too.
+-- WHY UNLINK MOVES THE ROW instead of flagging it. A `revoked_at` column would
+-- need every reader to remember to look at it, and the previous release's bot
+-- readers (/trips, /switch, "returning organizer", the organizer check) do not
+-- know the column exists: after a rollback they would go on honouring an
+-- unlinked account, which is exactly the access the organizer took away. A row
+-- that is no longer in the table cannot be read by code that has never heard of
+-- the revocation, so the rollback header stays truthfully `compatible`.
 --
--- ── 1. Revocation and first-use bookkeeping on the existing table ──────────
+-- A revoked organizer link STAYS revoked: `linkTelegramOrganizerInTx` now
+-- refuses to write a pair that has a row in the history table, so redeeming
+-- another interview link does not quietly re-open a door the organizer shut.
+--
+-- ── 1. First-use bookkeeping, and the history an Unlink leaves behind ──────
 
 ALTER TABLE control_plane.telegram_organizer_links
-  ADD COLUMN IF NOT EXISTS revoked_at         timestamptz,
-  ADD COLUMN IF NOT EXISTS revoked_reason     text,
   ADD COLUMN IF NOT EXISTS first_signed_in_at timestamptz,
   ADD COLUMN IF NOT EXISTS last_signed_in_at  timestamptz;
 
-ALTER TABLE control_plane.telegram_organizer_links
-  DROP CONSTRAINT IF EXISTS telegram_organizer_links_revoked_reason_check;
-ALTER TABLE control_plane.telegram_organizer_links
-  ADD CONSTRAINT telegram_organizer_links_revoked_reason_check
-    CHECK (revoked_reason IS NULL OR revoked_reason IN ('owner_unlinked'));
-ALTER TABLE control_plane.telegram_organizer_links
-  DROP CONSTRAINT IF EXISTS telegram_organizer_links_revoked_shape_check;
-ALTER TABLE control_plane.telegram_organizer_links
-  ADD CONSTRAINT telegram_organizer_links_revoked_shape_check
-    CHECK ((revoked_at IS NULL) = (revoked_reason IS NULL));
+-- One row per Unlink. The id is the link's own id (so web_sessions.telegram_link_id
+-- keeps pointing at something). Nothing reads this table to grant anything; it
+-- exists to remember that a pair was shut, and so the history is not lost.
+CREATE TABLE IF NOT EXISTS control_plane.telegram_organizer_link_revocations (
+  id                       text        NOT NULL,
+  user_id                  text        NOT NULL REFERENCES control_plane.users(id),
+  telegram_subject_digest  text        NOT NULL,
+  verified_via             text        NOT NULL,
+  linked_at                timestamptz NOT NULL,
+  first_signed_in_at       timestamptz,
+  last_signed_in_at        timestamptz,
+  revoked_at               timestamptz NOT NULL DEFAULT now(),
+  revoked_reason           text        NOT NULL,
+  CONSTRAINT telegram_organizer_link_revocations_pkey PRIMARY KEY (id),
+  CONSTRAINT telegram_organizer_link_revocations_digest_shape
+    CHECK (telegram_subject_digest ~ '^sha256:[0-9a-f]{64}$'),
+  CONSTRAINT telegram_organizer_link_revocations_reason_check
+    CHECK (revoked_reason IN ('owner_unlinked'))
+);
+CREATE INDEX IF NOT EXISTS telegram_organizer_link_revocations_pair_idx
+  ON control_plane.telegram_organizer_link_revocations (telegram_subject_digest, user_id);
 
 -- ── 2. Phase 2: members who were never in telegram_organizer_links ─────────
 --

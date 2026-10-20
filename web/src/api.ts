@@ -27,7 +27,11 @@ export type TripSummary = {
   runtimeReady: boolean;
   permissions: { role: string; dashboard: boolean; runtime: boolean; invite: boolean; requestProvisioning: boolean };
   invites?: InviteSummary[];
+  /** Organizer view only: who is on the trip, for "remove member". */
+  members?: MemberSummary[];
 };
+
+export type MemberSummary = { id: string; displayName: string; role: string; runtimeUsername: string | null; you: boolean; removable: boolean };
 
 function csrfToken() {
   return document.cookie
@@ -78,6 +82,9 @@ const inviteSchema = z.object({
   id: z.string(), displayName: z.string(), runtimeUsername: z.string(),
   status: z.enum(["unused", "redeemed", "expired", "revoked"]), expiresAt: z.string(),
 });
+const memberSchema: z.ZodType<MemberSummary> = z.object({
+  id: z.string(), displayName: z.string(), role: z.string(), runtimeUsername: z.string().nullable(), you: z.boolean(), removable: z.boolean(),
+});
 const tripSchema: z.ZodType<TripSummary> = z.object({
   id: z.string(), title: z.string(), destination: z.string().nullable(), startDate: z.string().nullable(), endDate: z.string().nullable(),
   tripType: z.string(), lifecycleState: z.string(), nextAction: z.string(),
@@ -86,7 +93,18 @@ const tripSchema: z.ZodType<TripSummary> = z.object({
   runtimeReady: z.boolean(),
   permissions: z.object({ role: z.string(), dashboard: z.boolean(), runtime: z.boolean(), invite: z.boolean(), requestProvisioning: z.boolean() }),
   invites: z.array(inviteSchema).optional(),
+  members: z.array(memberSchema).optional(),
 });
+// What a member WITHOUT dashboard access gets in their list: name, place, dates, their own
+// permissions and whether it opens. Filled out to a TripSummary with neutral defaults.
+const memberTripSchema = z.object({
+  id: z.string(), title: z.string(), destination: z.string().nullable(), startDate: z.string().nullable(), endDate: z.string().nullable(),
+  permissions: z.object({ role: z.string(), dashboard: z.boolean(), runtime: z.boolean(), invite: z.boolean(), requestProvisioning: z.boolean() }),
+  runtimeReady: z.boolean(),
+}).transform((trip): TripSummary => ({
+  ...trip, tripType: "other", lifecycleState: "ready_private", nextAction: trip.runtimeReady ? "open_trip" : "view_status",
+  interview: null, provisioning: null,
+}));
 const meSchema: z.ZodType<Me> = z.object({ id: z.string(), displayName: z.string() });
 
 export function signIn(returnTo: string) {
@@ -146,19 +164,23 @@ export async function telegramMiniAppSignIn(input: { initData: string; tripId?: 
   return { kind: "unavailable" };
 }
 
-export type TelegramLink = { id: string; scope: "account" | "trip"; via: "interview_link" | "earlier_interview" | "trip_password" | "invite"; tripTitle: string | null; linkedAt: string; lastSignedInAt: string | null };
+export type TelegramLink = {
+  id: string; scope: "account" | "trip"; via: "interview_link" | "earlier_interview" | "trip_password" | "invite";
+  tripTitle: string | null; viaTripTitle: string | null; linkedAt: string; firstSignedInAt: string | null; lastSignedInAt: string | null;
+};
 const telegramLinksSchema = z.object({
   miniAppEnabled: z.boolean(),
   links: z.array(z.object({
     id: z.string(), scope: z.enum(["account", "trip"]), via: z.enum(["interview_link", "earlier_interview", "trip_password", "invite"]),
-    tripTitle: z.string().nullable(), linkedAt: z.string(), lastSignedInAt: z.string().nullable(),
+    tripTitle: z.string().nullable(), viaTripTitle: z.string().nullable(), linkedAt: z.string(),
+    firstSignedInAt: z.string().nullable(), lastSignedInAt: z.string().nullable(),
   })),
 });
 export const getTelegramLinks = () => api<unknown>("/v1/account/telegram-links").then((value) => telegramLinksSchema.parse(value));
 export const unlinkTelegramLink = (id: string) => api<{ status: string }>(`/v1/account/telegram-links/${encodeURIComponent(id)}`, { method: "DELETE" });
 
 export const getMe = () => api<unknown>("/v1/me").then((value) => meSchema.parse(value));
-export const getTrips = () => api<unknown>("/v1/trips").then((value) => z.object({ trips: z.array(tripSchema) }).parse(value));
+export const getTrips = () => api<unknown>("/v1/trips").then((value) => z.object({ trips: z.array(z.union([tripSchema, memberTripSchema])) }).parse(value));
 export const getTrip = (id: string) => api<unknown>(`/v1/trips/${encodeURIComponent(id)}`).then((value) => tripSchema.parse(value));
 
 export const getAuthCapabilities = () => api<unknown>("/v1/auth/capabilities").then(value => z.object({ google: z.boolean(), emailPassword: z.boolean(), telegramMiniApp: z.boolean().optional() }).parse(value));
@@ -167,3 +189,6 @@ export function safeReturnTo(value: string | null): string {
   if (!value?.startsWith("/") || value.startsWith("//") || value.includes("\\")) return "/trips";
   try { const url = new URL(value, "https://portal.invalid"); return url.origin === "https://portal.invalid" ? `${url.pathname}${url.search}${url.hash}` : "/trips"; } catch { return "/trips"; }
 }
+
+export const removeTripMember = (tripId: string, membershipId: string) =>
+  api<{ status: string }>(`/v1/trips/${encodeURIComponent(tripId)}/members/${encodeURIComponent(membershipId)}`, { method: "DELETE" });

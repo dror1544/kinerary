@@ -216,3 +216,14 @@ test("web.telegram_bot_token_secret_ref is optional, validated as an opaque refe
     assert.doesNotThrow(() => validateArchitectureProfile({ ...raw, web: { ...raw.web, telegram_init_data_max_age_seconds: age } }));
   }
 });
+
+test("public_api.trust_proxy is optional (default off) and takes hops or a list of proxies", async () => {
+  const raw = JSON.parse(await readFile(webExamplePath, "utf8"));
+  assert.equal(validateArchitectureProfile(raw).public_api.trust_proxy, undefined);
+  for (const good of [1, 2, ["10.0.0.0/8"], ["127.0.0.1", "::1"]]) {
+    assert.doesNotThrow(() => validateArchitectureProfile({ ...raw, public_api: { ...raw.public_api, trust_proxy: good } }), JSON.stringify(good));
+  }
+  for (const bad of [true, false, 0, 9, [], "10.0.0.1", [""], [1]]) {
+    assert.throws(() => validateArchitectureProfile({ ...raw, public_api: { ...raw.public_api, trust_proxy: bad } }), JSON.stringify(bad));
+  }
+});

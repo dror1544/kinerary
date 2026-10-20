@@ -19,7 +19,7 @@ const profile = validateArchitectureProfile({
   test_resources: { enabled: false },
 });
 
-function appWith(options: { enabled?: boolean; queryLog?: string[]; unlinkedClient?: boolean } = {}) {
+function appWith(options: { enabled?: boolean; queryLog?: string[]; unlinkedClient?: boolean; trustProxy?: number | string[] } = {}) {
   const touched: string[] = options.queryLog ?? [];
   const client = {
     query: async (sql: string) => {
@@ -41,7 +41,14 @@ function appWith(options: { enabled?: boolean; queryLog?: string[]; unlinkedClie
     telegramBotUsername: "kinerary_bot", sessionTtlSeconds: 3600, enrollmentTtlSeconds: 3600, approvalTtlSeconds: 3600,
     telegramMiniApp: { botToken: TEST_BOT_TOKEN, maxAgeSeconds: 300, enabled: () => options.enabled ?? true, log: () => {} },
   };
-  return { app: buildApp(profile, { portal }), touched };
+  const effective = options.trustProxy === undefined ? profile : validateArchitectureProfile({
+    version: 1, environment: "test", public_api: { bind_host: "127.0.0.1", port: 4310, trust_proxy: options.trustProxy },
+    worker: { queue: "postgres", health_bind_host: "127.0.0.1", health_port: 4311 },
+    database: { connection_secret_ref: "env://CONTROL_PLANE_DATABASE_URL" },
+    adapters: { compute: "fake", ingress: "fake", agent_runtime: "fake", messaging: "fake", secrets: "fake" },
+    test_resources: { enabled: false },
+  });
+  return { app: buildApp(effective, { portal }), touched };
 }
 const post = (app: ReturnType<typeof appWith>["app"], payload: unknown, headers: Record<string, string> = {}) =>
   app.inject({
@@ -145,6 +152,47 @@ test("the per-IP budget is spent before verification: the 101st request is 429 w
   } finally { await app.close(); }
 });
 
+// ── Behind an ingress: the per-IP budget follows the CLIENT only when the proxy is declared ─────────
+
+async function hundredAndOne(app: ReturnType<typeof appWith>["app"], remoteAddress: string, forwardedFor: (i: number) => string) {
+  let last = 0;
+  for (let i = 0; i < 101; i++) {
+    const response = await app.inject({
+      method: "POST", url: "/v1/auth/telegram-mini-app", remoteAddress,
+      headers: { origin: ORIGIN, "content-type": "application/json", "x-forwarded-for": forwardedFor(i) }, payload: "{}",
+    });
+    last = response.statusCode;
+  }
+  return last;
+}
+
+test("trust_proxy OFF (default): X-Forwarded-For is ignored, so every client behind the proxy shares one budget", async () => {
+  const { app } = appWith();
+  try {
+    assert.equal(await hundredAndOne(app, "10.0.0.5", (i) => `198.51.100.${i % 200}`), 429, "101 different claimed clients, one socket peer: limited");
+  } finally { await app.close(); }
+});
+
+test("trust_proxy listing the proxy: each forwarded client gets its own budget, and one client is still limited", async () => {
+  for (const trustProxy of [["10.0.0.0/8"], 1] as Array<number | string[]>) {
+    const { app } = appWith({ trustProxy });
+    try {
+      assert.notEqual(await hundredAndOne(app, "10.0.0.5", (i) => `198.51.100.${i % 200}`), 429, `${JSON.stringify(trustProxy)}: distinct clients are not throttled together`);
+    } finally { await app.close(); }
+    const again = appWith({ trustProxy });
+    try {
+      assert.equal(await hundredAndOne(again.app, "10.0.0.5", () => "198.51.100.77"), 429, `${JSON.stringify(trustProxy)}: the same client is still limited`);
+    } finally { await again.app.close(); }
+  }
+});
+
+test("trust_proxy does not let an UNLISTED peer choose its own address", async () => {
+  const { app } = appWith({ trustProxy: ["10.0.0.0/8"] });
+  try {
+    assert.equal(await hundredAndOne(app, "203.0.113.9", (i) => `198.51.100.${i % 200}`), 429, "a caller outside the list cannot rotate its address with a header");
+  } finally { await app.close(); }
+});
+
 test("the per-person budget is keyed only after verification: forged requests cannot spend or fill it", async () => {
   const { app } = appWith({ unlinkedClient: true });
   try {
@@ -190,6 +238,9 @@ test("boot check: another bot's token keeps the feature off and the log never co
   assert.deepEqual(result, { ok: false, reason: "MISMATCH" });
   const mismatch = lines.find((l) => l.includes("mini_app.bot_token_mismatch"));
   assert.ok(mismatch);
+  // The bot's public handle must survive structuredLog's redaction (a key named *token* would not).
+  assert.match(mismatch, /"getme_username":"some_other_bot"/);
+  assert.match(mismatch, /"configured_username":"kinerary_bot"/);
   assert.equal(lines.some((l) => l.includes(OTHER_BOT_TOKEN) || l.includes(OTHER_BOT_TOKEN.split(":")[1]!)), false);
 });
 

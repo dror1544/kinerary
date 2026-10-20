@@ -269,11 +269,22 @@ const app = buildApp(profile, {
 // leaves 'pending' in notification_outbox after provisioning completes.
 // Guarded against overlap in-process; see outbox-dispatcher.ts for why that's
 // sufficient (single API process today).
-if (signup) {
-  const notification = signup.notification;
+//
+// It also runs where only the web block (the Mini App) is configured: the Mini
+// App sign-in notice is an outbox row too, and a deployment with web but no
+// signup block would otherwise queue notices that nothing ever sends.
+const outboxBotToken = signup?.botToken ?? portal?.telegramMiniApp?.botToken;
+const outboxNotification = signup?.notification ?? (outboxBotToken
+  ? createNotificationAdapter(profile.adapters.messaging, {
+    // `superAdminChatId` is for approval DMs, which a web-only deployment never sends.
+    telegram: { botToken: outboxBotToken, superAdminChatId: operatorChatId ?? "", db: pool, log: (line) => process.stderr.write(`${line}\n`) },
+  })
+  : undefined);
+if (outboxNotification && outboxBotToken) {
+  const notification = outboxNotification;
   const resolveBotUsername = createBotUsernameResolver({
     configured: profile.web?.telegram_bot_username ?? process.env.TELEGRAM_BOT_USERNAME ?? null,
-    botToken: signup.botToken,
+    botToken: outboxBotToken,
     log: (line) => process.stderr.write(`${line}\n`),
   });
   let dispatching = false;

@@ -681,7 +681,6 @@ export async function isTripOrganizer(db: pg.Pool, tripId: string, telegramUserI
        FROM control_plane.telegram_organizer_links l
        JOIN control_plane.trip_memberships m ON m.user_id = l.user_id
       WHERE l.telegram_subject_digest = $2
-        AND l.revoked_at IS NULL
         AND m.trip_id = $1 AND m.role = 'owner' AND m.status = 'active'
       LIMIT 1`,
     [tripId, digestTelegramId(telegramUserId)],

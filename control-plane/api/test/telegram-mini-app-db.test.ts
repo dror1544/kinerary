@@ -486,7 +486,7 @@ test("a forwarded interview link is visible to the organizer, who can unlink it 
     assert.equal(listed.headers["cache-control"], "private, no-store");
     const body = listed.json();
     assert.equal(body.links.length, 1);
-    assert.deepEqual(Object.keys(body.links[0]).sort(), ["id", "lastSignedInAt", "linkedAt", "scope", "tripTitle", "via"]);
+    assert.deepEqual(Object.keys(body.links[0]).sort(), ["firstSignedInAt", "id", "lastSignedInAt", "linkedAt", "scope", "tripTitle", "via", "viaTripTitle"]);
     assert.equal(body.links[0].id, linkId);
     assert.equal(body.links[0].via, "interview_link");
     assert.equal(body.links[0].scope, "account");
@@ -513,64 +513,189 @@ test("a forwarded interview link is visible to the organizer, who can unlink it 
     assert.deepEqual((await app.inject({ method: "GET", url: "/v1/account/telegram-links", headers: { cookie: owner.cookie } })).json().links, []);
     const again = await app.inject({ method: "DELETE", url: `/v1/account/telegram-links/${linkId}`, headers: { cookie: owner.cookie, "x-csrf-token": owner.csrf } });
     assert.equal(again.statusCode, 404);
-    const stored = await pool.query("SELECT revoked_reason FROM control_plane.telegram_organizer_links WHERE id = $1", [linkId]);
-    assert.equal(stored.rows[0].revoked_reason, "owner_unlinked");
+    // Unlink MOVES the row: it is gone from the table the previous release's bot readers read,
+    // and it is in the history table.
+    assert.equal((await pool.query("SELECT 1 FROM control_plane.telegram_organizer_links WHERE id = $1", [linkId])).rowCount, 0);
+    const history = await pool.query("SELECT revoked_reason, telegram_subject_digest FROM control_plane.telegram_organizer_link_revocations WHERE id = $1", [linkId]);
+    assert.equal(history.rows[0].revoked_reason, "owner_unlinked");
+    assert.equal(history.rows[0].telegram_subject_digest, digestTelegramId(String(attacker)));
   } finally { await app.close(); }
 });
 
-test("the first sign-in through a link queues one notice via the outbox; a second queues none; the ordinary dispatcher sends it once and nulls the id", { skip }, async () => {
+async function bindDm(tripId: string, chatId: string | number, closed = false) {
+  await pool.query(
+    "INSERT INTO control_plane.telegram_chat_bindings(id,chat_id,trip_id,closed_at,closed_reason) VALUES ($1,$2,$3,$4,$5)",
+    [id("tcb"), String(chatId), tripId, closed ? new Date() : null, closed ? "organizer_switch" : null]);
+}
+const clearNotices = () => pool.query("DELETE FROM control_plane.notification_outbox WHERE notification_type = 'mini_app_sign_in_notice'");
+const fakeAdapter = () => {
+  const sent: Array<{ chatId: string; text: string }> = [];
+  return { sent, adapter: { sendApprovalRequest: async () => {}, sendMessage: async (m: { chatId: string; text: string }) => { sent.push(m); } } };
+};
+
+test("the first sign-in through a link notifies the ACCOUNT OWNER's own chats, not the signer; a second sign-in queues none; the id is nulled after sending", { skip }, async () => {
   const app = newApp();
   try {
-    await pool.query("DELETE FROM control_plane.notification_outbox WHERE notification_type = 'mini_app_sign_in_notice'");
-    const user = await mkUser("Noticed Person");
-    await mkMember(await mkTrip("Noticed"), user);
-    const telegramId = tg();
-    await linkOrganizer(user, telegramId);
-    assert.equal((await exchange(app, initDataFor(telegramId))).statusCode, 200);
-    assert.equal((await exchange(app, initDataFor(telegramId))).statusCode, 200);
-    const queued = await pool.query("SELECT recipient, trip_id, state, payload FROM control_plane.notification_outbox WHERE notification_type = 'mini_app_sign_in_notice'");
-    assert.equal(queued.rowCount, 1);
-    assert.equal(queued.rows[0].recipient, String(telegramId));
-    assert.equal(queued.rows[0].trip_id, null);
-    assert.equal(queued.rows[0].state, "pending");
+    await clearNotices();
+    const owner = await mkUser("Noticed Person");
+    const trip = await mkTrip("Rome in May");
+    await mkMember(trip, owner);
+    const ownerChat = tg(), otherOwnerChat = tg(), forwardee = tg();
+    await bindDm(trip, ownerChat);
+    await bindDm(trip, otherOwnerChat);
+    await bindDm(trip, tg(), true);                       // closed: not a recipient
+    await bindDm(trip, -(1_000_000_000_000 + Math.floor(Math.random() * 1e9)));   // a group: not a recipient
+    await bindDm(trip, forwardee);                        // the signer's own chat: not a recipient
+    await linkOrganizer(owner, forwardee);
 
-    const sent: Array<{ chatId: string; text: string }> = [];
-    const adapter = { sendApprovalRequest: async () => {}, sendMessage: async (m: { chatId: string; text: string }) => { sent.push(m); } };
-    // The one dispatcher that sends every other outbox row sends this one too.
+    assert.equal((await exchange(app, initDataFor(forwardee, { start_param: trip }))).statusCode, 200);
+    assert.equal((await exchange(app, initDataFor(forwardee, { start_param: trip }))).statusCode, 200);
+    const queued = await pool.query("SELECT recipient, trip_id, state FROM control_plane.notification_outbox WHERE notification_type = 'mini_app_sign_in_notice' ORDER BY recipient");
+    assert.deepEqual(queued.rows.map((r) => r.recipient).sort(), [String(ownerChat), String(otherOwnerChat)].sort());
+    assert.ok(queued.rows.every((r) => r.trip_id === null && r.state === "pending"));
+
+    const { sent, adapter } = fakeAdapter();
+    // The one dispatcher that sends every other outbox row sends these too.
     await dispatchPendingTripNotifications(pool, adapter, () => {}, { publicOrigin: ORIGIN });
-    const mine = sent.filter((m) => m.chatId === String(telegramId));
-    assert.equal(mine.length, 1);
-    assert.match(mine[0]!.text, /Noticed Person/);
-    assert.match(mine[0]!.text, /Unlink/);
-    assert.match(mine[0]!.text, new RegExp(`${ORIGIN}/trips`));
+    const mine = sent.filter((m) => [String(ownerChat), String(otherOwnerChat)].includes(m.chatId));
+    assert.equal(mine.length, 2);
+    for (const message of mine) {
+      assert.match(message.text, /Noticed Person/);
+      assert.match(message.text, /Rome in May/, "names the trip");
+      assert.match(message.text, /UTC/, "says when");
+      assert.match(message.text, /Unlink/);
+      assert.match(message.text, new RegExp(`${ORIGIN}/trips`));
+    }
+    assert.equal(sent.some((m) => m.chatId === String(forwardee)), false, "the signer is told nothing");
     const done = await pool.query("SELECT state, recipient FROM control_plane.notification_outbox WHERE notification_type = 'mini_app_sign_in_notice'");
-    assert.equal(done.rows[0].state, "sent");
-    assert.equal(done.rows[0].recipient, null, "the raw Telegram id does not stay at rest");
+    assert.ok(done.rows.every((r) => r.state === "sent" && r.recipient === null), "the raw Telegram ids do not stay at rest");
     await dispatchPendingTripNotifications(pool, adapter, () => {}, { publicOrigin: ORIGIN });
-    assert.equal(sent.filter((m) => m.chatId === String(telegramId)).length, 1, "sent exactly once");
+    assert.equal(sent.filter((m) => m.chatId === String(ownerChat)).length, 1, "sent exactly once");
   } finally { await app.close(); }
 });
 
-test("a failing Telegram send leaves the notice pending and never fails or delays the sign-in", { skip }, async () => {
+test("with no DM binding of the owner's there is no notice at all, and the sign-in is unaffected", { skip }, async () => {
   const app = newApp();
   try {
-    await pool.query("DELETE FROM control_plane.notification_outbox WHERE notification_type = 'mini_app_sign_in_notice'");
-    const user = await mkUser("Outage");
-    await mkMember(await mkTrip("Outage trip"), user);
-    const telegramId = tg();
-    await linkOrganizer(user, telegramId);
-    assert.equal((await exchange(app, initDataFor(telegramId))).statusCode, 200);
+    await clearNotices();
+    logs.length = 0;
+    const owner = await mkUser("Unbound Owner");
+    const trip = await mkTrip("No DM trip");
+    await mkMember(trip, owner);
+    const forwardee = tg();
+    await bindDm(trip, forwardee);                        // only the signer's own chat is bound
+    await linkOrganizer(owner, forwardee);
+    assert.equal((await exchange(app, initDataFor(forwardee, { start_param: trip }))).statusCode, 200);
+    assert.equal((await pool.query("SELECT 1 FROM control_plane.notification_outbox WHERE notification_type = 'mini_app_sign_in_notice'")).rowCount, 0);
+    assert.ok(logs.some((l) => l.includes('"notices_queued":0')), "the quiet case is logged as a count");
+  } finally { await app.close(); }
+});
+
+test("a failing Telegram send leaves the notice pending and never fails the sign-in; when the retry budget is spent the id is dropped", { skip }, async () => {
+  const app = newApp();
+  try {
+    await clearNotices();
+    const owner = await mkUser("Outage");
+    const trip = await mkTrip("Outage trip");
+    await mkMember(trip, owner);
+    const ownerChat = tg(), signer = tg();
+    await bindDm(trip, ownerChat);
+    await linkOrganizer(owner, signer);
+    assert.equal((await exchange(app, initDataFor(signer, { start_param: trip }))).statusCode, 200);
     const broken = { sendApprovalRequest: async () => {}, sendMessage: async () => { throw new Error("telegram down"); } };
-    assert.equal(await dispatchPendingTripNotifications(pool, broken, (line) => logs.push(line), { publicOrigin: ORIGIN }), 0);
+    await dispatchPendingTripNotifications(pool, broken, (line) => logs.push(line), { publicOrigin: ORIGIN });
     const row = await pool.query("SELECT state, attempt FROM control_plane.notification_outbox WHERE notification_type = 'mini_app_sign_in_notice'");
     assert.equal(row.rows[0].state, "pending");
     assert.equal(row.rows[0].attempt, 1);
-    // The ordinary retry budget applies; when it is spent the row fails for good
-    // and the raw Telegram id is dropped with it.
     for (let i = 0; i < 5; i++) await dispatchPendingTripNotifications(pool, broken, () => {}, { publicOrigin: ORIGIN });
     const spent = await pool.query("SELECT state, recipient FROM control_plane.notification_outbox WHERE notification_type = 'mini_app_sign_in_notice'");
     assert.equal(spent.rows[0].state, "failed");
     assert.equal(spent.rows[0].recipient, null);
+  } finally { await app.close(); }
+});
+
+test("the dashboard row tells an organizer's own link from a forwardee's: when, via the interview for which trip, first and last sign-in", { skip }, async () => {
+  const app = newApp();
+  try {
+    const owner = await mkUser("Row Owner");
+    const rome = await mkTrip("Rome 2027");
+    await mkMember(rome, owner);
+    // What redeeming an interview link writes: an enrollment consumed now, and a link created in the same moment.
+    await pool.query(
+      `INSERT INTO control_plane.interview_enrollments(id, trip_id, user_id, token_digest, state, expires_at, consumed_at)
+       VALUES ($1,$2,$3,$4,'consumed', now() + interval '1 hour', now())`,
+      [id("enr"), rome, owner, `sha256:${randomBytes(32).toString("hex")}`]);
+    const redeemer = tg();
+    const linkId = await linkOrganizer(owner, redeemer);
+    const backfilled = await linkOrganizer(owner, tg(), "backfill_intake_session");
+    await pool.query("UPDATE control_plane.telegram_organizer_links SET created_at = now() - interval '40 days' WHERE id = $1", [backfilled]);
+    const before = await app.inject({ method: "GET", url: "/v1/account/telegram-links", headers: { cookie: (await webSession(owner, "row")).cookie } });
+    const rows = before.json().links as Array<Record<string, unknown>>;
+    const mine = rows.find((r) => r.id === linkId)!;
+    assert.equal(mine.via, "interview_link");
+    assert.equal(mine.viaTripTitle, "Rome 2027");
+    assert.equal(mine.firstSignedInAt, null, "never signed in yet");
+    const old = rows.find((r) => r.id === backfilled)!;
+    assert.equal(old.via, "earlier_interview");
+    assert.equal(old.viaTripTitle, null);
+    await exchange(app, initDataFor(redeemer, { start_param: rome }));
+    const after = (await app.inject({ method: "GET", url: "/v1/account/telegram-links", headers: { cookie: (await webSession(owner, "row2")).cookie } })).json().links as Array<Record<string, unknown>>;
+    const signedIn = after.find((r) => r.id === linkId)!;
+    assert.ok(signedIn.firstSignedInAt && signedIn.lastSignedInAt);
+  } finally { await app.close(); }
+});
+
+test("Unlink moves the organizer link out of the table older code reads, keeps it unlinked after another interview redemption, and closes the forwardee's hold", { skip }, async () => {
+  const app = newApp();
+  try {
+    const { linkTelegramOrganizerInTx } = await import("../src/organizer-trips.js");
+    const owner = await mkUser("Hold Owner");
+    const trip = await mkTrip("Hold trip");
+    await mkMember(trip, owner);
+    const forwardee = tg();
+    const linkId = await linkOrganizer(owner, forwardee);
+    // The forwardee is part-way through the owner's interview, and a companion DM is bound to the trip.
+    const enrollment = id("enr");
+    await pool.query(
+      `INSERT INTO control_plane.interview_enrollments(id, trip_id, user_id, token_digest, state, expires_at, consumed_at)
+       VALUES ($1,$2,$3,$4,'consumed', now() + interval '1 hour', now())`,
+      [enrollment, trip, owner, `sha256:${randomBytes(32).toString("hex")}`]);
+    const sessionId = id("sess");
+    await pool.query(
+      `INSERT INTO control_plane.intake_sessions(id, trip_id, user_id, enrollment_id, state, telegram_chat_id)
+       VALUES ($1,$2,$3,$4,'interviewing',$5)`, [sessionId, trip, owner, enrollment, String(forwardee)]);
+    await pool.query(
+      "INSERT INTO control_plane.telegram_interview_bindings(chat_id, trip_id, session_id, state) VALUES ($1,$2,$3,'active')",
+      [String(forwardee), trip, sessionId]);
+    await bindDm(trip, forwardee);
+    // An unrelated chat's interview and binding must be left alone.
+    const bystanderChat = tg();
+    await bindDm(trip, bystanderChat);
+
+    const ownerSession = await webSession(owner, "hold");
+    const response = await app.inject({ method: "DELETE", url: `/v1/account/telegram-links/${linkId}`, headers: { cookie: ownerSession.cookie, "x-csrf-token": ownerSession.csrf } });
+    assert.equal(response.statusCode, 200);
+
+    // Gone from the table older code reads — the query the previous release's /trips uses sees nothing.
+    const olderReaders = await pool.query(
+      `SELECT m.trip_id FROM control_plane.trip_memberships m
+        WHERE m.status = 'active' AND m.user_id IN (SELECT user_id FROM control_plane.telegram_organizer_links WHERE telegram_subject_digest = $1)`,
+      [digestTelegramId(String(forwardee))]);
+    assert.equal(olderReaders.rowCount, 0);
+
+    // The hold is closed, nothing deleted.
+    const session = await pool.query("SELECT expired_at FROM control_plane.intake_sessions WHERE id = $1", [sessionId]);
+    assert.ok(session.rows[0].expired_at, "the interview session is expired");
+    assert.equal((await pool.query("SELECT state FROM control_plane.telegram_interview_bindings WHERE session_id = $1", [sessionId])).rows[0].state, "revoked");
+    const binding = await pool.query("SELECT closed_at, closed_reason FROM control_plane.telegram_chat_bindings WHERE chat_id = $1 AND trip_id = $2", [String(forwardee), trip]);
+    assert.ok(binding.rows[0].closed_at); assert.equal(binding.rows[0].closed_reason, "telegram_unlinked");
+    assert.equal((await pool.query("SELECT closed_at FROM control_plane.telegram_chat_bindings WHERE chat_id = $1", [String(bystanderChat)])).rows[0].closed_at, null);
+
+    // Redeeming another interview link from the same Telegram account does not re-open it.
+    const client = await pool.connect();
+    try { await linkTelegramOrganizerInTx(client, String(forwardee), owner); } finally { client.release(); }
+    assert.equal((await pool.query("SELECT 1 FROM control_plane.telegram_organizer_links WHERE telegram_subject_digest = $1 AND user_id = $2", [digestTelegramId(String(forwardee)), owner])).rowCount, 0);
+    assert.equal((await exchange(app, initDataFor(forwardee, { start_param: trip }))).statusCode, 401);
   } finally { await app.close(); }
 });
 
@@ -833,5 +958,189 @@ test("capabilities reports the Mini App flag, and a disabled feature answers 503
     const off = await exchange(app, initDataFor(tg()));
     assert.equal(off.statusCode, 503);
     assert.deepEqual(off.json(), { error: "TELEGRAM_MINI_APP_UNAVAILABLE" });
+  } finally { await app.close(); }
+});
+
+// ── A member's trip list is a summary; organizers can remove members ─────────
+
+async function joinMember(app: App, ownerSession: { cookie: string; csrf: string }, tripId: string, label: string, extraBody: Record<string, unknown> = {}) {
+  const username = `${label}-${suffix}${hex().slice(0, 3)}`;
+  const token = await memberWithInvite(app, ownerSession, tripId, username);
+  const redeemed = await app.inject({
+    method: "POST", url: "/v1/site-invites/redeem", headers: { origin: ORIGIN },
+    payload: { token, method: "password", password: "member-secret-1", ...extraBody },
+  });
+  assert.equal(redeemed.statusCode, 200, redeemed.body);
+  const invite = (await pool.query("SELECT id, redeemed_by FROM control_plane.site_invites WHERE trip_id = $1 AND runtime_username = $2", [tripId, username])).rows[0];
+  const membershipId = (await pool.query("SELECT id FROM control_plane.trip_memberships WHERE trip_id = $1 AND user_id = $2", [tripId, invite.redeemed_by])).rows[0].id as string;
+  return { username, userId: invite.redeemed_by as string, inviteId: invite.id as string, membershipId, cookie: asCookie(redeemed) };
+}
+
+test("a runtime-only member's trip list is a summary: none of the organizer's workbench", { skip }, async () => {
+  const app = newApp();
+  try {
+    const organizer = await mkUser("Secret Organizer Name");
+    const trip = await mkTrip("Summary trip");
+    await mkMember(trip, organizer);
+    await pool.query("UPDATE control_plane.trips SET destination_label = 'Lisbon', start_date = '2027-05-01', end_date = '2027-05-09' WHERE id = $1", [trip]);
+    const owner = await webSession(organizer, "sumry");
+    const other = await joinMember(app, owner, trip, "other-guest");
+    const mine = await joinMember(app, owner, trip, "the-member");
+    const listed = await app.inject({ method: "GET", url: "/v1/trips", headers: { cookie: mine.cookie } });
+    assert.equal(listed.statusCode, 200);
+    const trips = listed.json().trips as Array<Record<string, unknown>>;
+    assert.equal(trips.length, 1);
+    assert.deepEqual(Object.keys(trips[0]!).sort(), ["destination", "endDate", "id", "permissions", "runtimeReady", "startDate", "title"]);
+    assert.equal(trips[0]!.title, "Summary trip"); assert.equal(trips[0]!.destination, "Lisbon");
+    assert.equal(trips[0]!.startDate, "2027-05-01"); assert.equal(trips[0]!.runtimeReady, false);
+    assert.deepEqual(trips[0]!.permissions, { role: "member", dashboard: false, runtime: true, invite: false, requestProvisioning: false });
+    // None of the organizer's fields, and no other invitee, anywhere in the body.
+    assert.doesNotMatch(listed.body, new RegExp(`${other.username}|Guest ${other.username}|${other.inviteId}|invites|planId|digest|sessionId|lifecycleState|Secret Organizer Name|members`));
+    const detail = await app.inject({ method: "GET", url: `/v1/trips/${trip}`, headers: { cookie: mine.cookie } });
+    assert.equal(detail.statusCode, 404);
+    // The organizer still gets the full detail, with the people on the trip.
+    const full = (await app.inject({ method: "GET", url: "/v1/trips", headers: { cookie: owner.cookie } })).json().trips[0];
+    assert.ok(Array.isArray(full.invites) && Array.isArray(full.members) && full.lifecycleState);
+    assert.equal(full.members.find((m: { you: boolean }) => m.you).removable, false, "not yourself");
+    assert.equal(full.members.filter((m: { removable: boolean }) => m.removable).length, 2);
+  } finally { await app.close(); }
+});
+
+test("remove member: ends membership, password, sessions, invite and Telegram link; refuses self and non-organizers uniformly", { skip }, async () => {
+  const app = newApp();
+  try {
+    const organizer = await mkUser("Remover");
+    const trip = await mkTrip("Removal trip");
+    await mkMember(trip, organizer);
+    const owner = await webSession(organizer, "rm");
+    const telegramId = tg();
+    const member = await joinMember(app, owner, trip, "leaver", linkBody(initDataFor(telegramId)));
+    const bystander = await joinMember(app, owner, trip, "stays");
+    // The member is signed in on the portal AND through Telegram, and holds an unused launch grant.
+    const viaTelegram = await exchange(app, initDataFor(telegramId, { start_param: trip }));
+    assert.equal(viaTelegram.statusCode, 200);
+    assert.equal((await me(app, member.cookie)).statusCode, 200);
+    await pool.query("INSERT INTO control_plane.runtime_launch_grants(id,trip_id,user_id,token_digest,audience,expires_at) VALUES ($1,$2,$3,$4,'runtime_gateway', now() + interval '1 minute')", [id("launch"), trip, member.userId, sha256(`grant-${suffix}${hex()}`)]);
+
+    const ownerHeaders = { cookie: owner.cookie, "x-csrf-token": owner.csrf };
+    // Uniform 404s: a member cannot remove anyone, an unknown membership, another trip's membership.
+    const bystanderSession = await webSession(bystander.userId, "bys");
+    const asMember = await app.inject({ method: "DELETE", url: `/v1/trips/${trip}/members/${member.membershipId}`, headers: { cookie: bystanderSession.cookie, "x-csrf-token": bystanderSession.csrf } });
+    const unknown = await app.inject({ method: "DELETE", url: `/v1/trips/${trip}/members/memb_doesnotexist`, headers: ownerHeaders });
+    const foreignOrg = await webSession(await mkUser("Foreign Org"), "frg");
+    const foreignTrip = await mkTrip("Foreign");
+    await mkMember(foreignTrip, (await pool.query("SELECT user_id FROM control_plane.web_sessions WHERE token_digest = $1", [sha256(foreignOrg.raw)])).rows[0].user_id);
+    const crossTrip = await app.inject({ method: "DELETE", url: `/v1/trips/${trip}/members/${member.membershipId}`, headers: { cookie: foreignOrg.cookie, "x-csrf-token": foreignOrg.csrf } });
+    for (const refused of [asMember, unknown, crossTrip]) assert.equal(refused.statusCode, 404);
+    assert.equal(unknown.body, crossTrip.body, "uniform 404");
+    assert.equal(unknown.body, asMember.body, "uniform 404");
+
+    // Not yourself.
+    const ownMembership = (await pool.query("SELECT id FROM control_plane.trip_memberships WHERE trip_id = $1 AND user_id = $2", [trip, organizer])).rows[0].id;
+    const self = await app.inject({ method: "DELETE", url: `/v1/trips/${trip}/members/${ownMembership}`, headers: ownerHeaders });
+    assert.equal(self.statusCode, 409); assert.equal(self.json().error, "CANNOT_REMOVE_SELF");
+
+    const removed = await app.inject({ method: "DELETE", url: `/v1/trips/${trip}/members/${member.membershipId}`, headers: ownerHeaders });
+    assert.equal(removed.statusCode, 200, removed.body);
+    assert.equal((await pool.query("SELECT status FROM control_plane.trip_memberships WHERE id = $1", [member.membershipId])).rows[0].status, "revoked");
+    assert.equal((await pool.query("SELECT 1 FROM control_plane.web_password_credentials WHERE trip_id = $1 AND user_id = $2", [trip, member.userId])).rowCount, 0);
+    const pwd = await passwordPost(app, { tripId: trip, runtimeUsername: member.username, password: "member-secret-1" });
+    assert.equal(pwd.statusCode, 401, "the trip password no longer works");
+    assert.equal((await pool.query("SELECT state FROM control_plane.site_invites WHERE id = $1", [member.inviteId])).rows[0].state, "revoked");
+    assert.equal((await pool.query("SELECT revoked_reason FROM control_plane.telegram_member_links WHERE user_id = $1", [member.userId])).rows[0].revoked_reason, "membership_ended");
+    assert.equal((await me(app, member.cookie)).statusCode, 401, "their portal session ends");
+    assert.equal((await me(app, asCookie(viaTelegram))).statusCode, 401, "and so does the one Telegram minted");
+    assert.equal((await pool.query("SELECT 1 FROM control_plane.runtime_launch_grants WHERE user_id = $1 AND consumed_at IS NULL", [member.userId])).rowCount, 0);
+    assert.equal((await exchange(app, initDataFor(telegramId, { start_param: trip }))).statusCode, 401);
+    // Somebody else on the trip is untouched.
+    assert.equal((await me(app, bystander.cookie)).statusCode, 200);
+    // A second removal is a plain 404.
+    assert.equal((await app.inject({ method: "DELETE", url: `/v1/trips/${trip}/members/${member.membershipId}`, headers: ownerHeaders })).statusCode, 404);
+  } finally { await app.close(); }
+});
+
+test("remove member: someone who is still on another trip keeps their portal session; only an owner removes an owner", { skip }, async () => {
+  const app = newApp();
+  try {
+    const ownerUser = await mkUser("Owner A");
+    const organizerUser = await mkUser("Organizer B");
+    const trip = await mkTrip("Two hats");
+    const elsewhere = await mkTrip("Elsewhere");
+    await mkMember(trip, ownerUser, "owner");
+    await mkMember(trip, organizerUser, "organizer");
+    const owner = await webSession(ownerUser, "oa");
+    const organizer = await webSession(organizerUser, "ob");
+    const ownerMembership = (await pool.query("SELECT id FROM control_plane.trip_memberships WHERE trip_id = $1 AND user_id = $2", [trip, ownerUser])).rows[0].id;
+    const organizerMembership = (await pool.query("SELECT id FROM control_plane.trip_memberships WHERE trip_id = $1 AND user_id = $2", [trip, organizerUser])).rows[0].id;
+    const refused = await app.inject({ method: "DELETE", url: `/v1/trips/${trip}/members/${ownerMembership}`, headers: { cookie: organizer.cookie, "x-csrf-token": organizer.csrf } });
+    assert.equal(refused.statusCode, 409); assert.equal(refused.json().error, "OWNER_ONLY");
+    await mkMember(elsewhere, organizerUser, "owner");
+    const ok = await app.inject({ method: "DELETE", url: `/v1/trips/${trip}/members/${organizerMembership}`, headers: { cookie: owner.cookie, "x-csrf-token": owner.csrf } });
+    assert.equal(ok.statusCode, 200);
+    assert.equal((await me(app, organizer.cookie)).statusCode, 200, "their other trip keeps them signed in");
+    assert.equal((await app.inject({ method: "GET", url: `/v1/trips/${trip}`, headers: { cookie: organizer.cookie } })).statusCode, 404);
+  } finally { await app.close(); }
+});
+
+test("revoking a REDEEMED invite removes the person, with the same effects", { skip }, async () => {
+  const app = newApp();
+  try {
+    const organizer = await mkUser("Invite Revoker");
+    const trip = await mkTrip("Redeemed invite trip");
+    await mkMember(trip, organizer);
+    const owner = await webSession(organizer, "ri");
+    const telegramId = tg();
+    const member = await joinMember(app, owner, trip, "redeemed", linkBody(initDataFor(telegramId)));
+    const revoked = await app.inject({ method: "DELETE", url: `/v1/trips/${trip}/site-invites/${member.inviteId}`, headers: { cookie: owner.cookie, "x-csrf-token": owner.csrf } });
+    assert.equal(revoked.statusCode, 200, revoked.body);
+    assert.equal((await pool.query("SELECT status FROM control_plane.trip_memberships WHERE id = $1", [member.membershipId])).rows[0].status, "revoked");
+    assert.equal((await me(app, member.cookie)).statusCode, 401);
+    assert.equal((await exchange(app, initDataFor(telegramId, { start_param: trip }))).statusCode, 401);
+    assert.equal((await passwordPost(app, { tripId: trip, runtimeUsername: member.username, password: "member-secret-1" })).statusCode, 401);
+    assert.equal((await app.inject({ method: "DELETE", url: `/v1/trips/${trip}/site-invites/${member.inviteId}`, headers: { cookie: owner.cookie, "x-csrf-token": owner.csrf } })).statusCode, 404, "already revoked");
+  } finally { await app.close(); }
+});
+
+test("re-linking the same Telegram account to the same person and trip is not news: one notice, worded for one trip", { skip }, async () => {
+  const app = newApp();
+  try {
+    await clearNotices();
+    const organizer = await mkUser("Org Relink");
+    const trip = await mkTrip("Relink trip");
+    await mkMember(trip, organizer, "owner");
+    const ownerChat = tg();
+    await bindDm(trip, ownerChat);
+    const owner = await webSession(organizer, "rl");
+    const telegramId = tg();
+    const member = await joinMember(app, owner, trip, "relinker", linkBody(initDataFor(telegramId)));
+    // Unlink (owner of the member link is the member), then link again by password.
+    const memberSession = await webSession(member.userId, "rlm");
+    const linkRow = (await pool.query("SELECT id FROM control_plane.telegram_member_links WHERE user_id = $1 AND revoked_at IS NULL", [member.userId])).rows[0].id;
+    assert.equal((await app.inject({ method: "DELETE", url: `/v1/account/telegram-links/${linkRow}`, headers: { cookie: memberSession.cookie, "x-csrf-token": memberSession.csrf } })).statusCode, 200);
+    const again = await passwordPost(app, { tripId: trip, runtimeUsername: member.username, password: "member-secret-1", ...linkBody(initDataFor(telegramId)) });
+    assert.equal(again.json().telegramLink, "linked");
+    assert.equal((await pool.query("SELECT count(*)::int AS n FROM control_plane.telegram_member_links WHERE user_id = $1", [member.userId])).rows[0].n, 2);
+    // A member account is not an owner/organizer of anything, so the only recipients are none: the
+    // member's own list is their channel. (If the account WERE an organizer, the text would name one trip.)
+    assert.equal((await pool.query("SELECT 1 FROM control_plane.notification_outbox WHERE notification_type = 'mini_app_sign_in_notice'")).rowCount, 0);
+    const { signInNoticeText } = await import("../src/telegram-mini-app.js");
+    const text = signInNoticeText({ accountName: "Mia", linkKind: "member", tripTitle: "Relink trip", at: new Date().toISOString() }, ORIGIN);
+    assert.match(text, /can now open "Relink trip"/);
+    assert.doesNotMatch(text, /all .*trips|account's trips/);
+  } finally { await app.close(); }
+});
+
+test("the DM-binding hint is used for chat_type absent or sender only", { skip }, async () => {
+  const app = newApp();
+  try {
+    const user = await mkUser("Chat Type");
+    const a = await mkTrip("CT A"), b = await mkTrip("CT B");
+    await mkMember(a, user); await mkMember(b, user);
+    const telegramId = tg();
+    await linkOrganizer(user, telegramId);
+    await bindDm(b, telegramId);
+    assert.equal((await exchange(app, initDataFor(telegramId))).json().appPath, `/mini-app/trips/${b}`);
+    assert.equal((await exchange(app, initDataFor(telegramId, { chat_type: "sender" }))).json().appPath, `/mini-app/trips/${b}`);
+    assert.equal((await exchange(app, initDataFor(telegramId, { chat_type: "private" }))).json().appPath, "/mini-app");
   } finally { await app.close(); }
 });

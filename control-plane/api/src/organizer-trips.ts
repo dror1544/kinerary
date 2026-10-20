@@ -18,9 +18,10 @@
  *   - Identity is the Telegram sender id from the update Telegram delivered on
  *     the bot's own authenticated connection — never a body field.
  *   - The set of trips a command may touch is derived server-side from that
- *     identity, through telegram_organizer_links (migration 0052, minus the
- *     links revoked since: a link is also a Mini App sign-in path, and
- *     unlinking it must end bot access too) joined to active memberships. An argument or a tapped button SELECTS WITHIN that
+ *     identity, through telegram_organizer_links (migration 0052) joined to
+ *     active memberships. A link is also a Mini App sign-in path, and Unlink
+ *     MOVES the row out of this table (telegram-mini-app.ts), so no reader here
+ *     — this release's or an older one's — has to know a revocation exists. An argument or a tapped button SELECTS WITHIN that
  *     set; it can never widen it.
  *   - Refusals are uniform. "That trip isn't yours" and "no such trip" are the
  *     same sentence, for the reason group-binding already gives: a
@@ -92,7 +93,7 @@ export async function hasEarlierBuiltTrip(
                WHERE own.trip_id = $1 AND own.role = 'owner' AND own.status = 'active')
             OR ($2::text IS NOT NULL AND m.user_id IN (
               SELECT l.user_id FROM control_plane.telegram_organizer_links l
-               WHERE l.telegram_subject_digest = $2 AND l.revoked_at IS NULL))
+               WHERE l.telegram_subject_digest = $2))
           )
      ) AS earlier`,
     [tripId, digest],
@@ -122,10 +123,16 @@ export async function linkTelegramOrganizerInTx(
   verifiedVia: "enrollment_redemption" | "backfill_intake_session" = "enrollment_redemption",
 ): Promise<void> {
   if (!isPrivateChatId(telegramUserId)) return;
+  // A pair the owner has Unlinked stays unlinked: redeeming another interview
+  // link (the forwarded one, say) must not quietly re-open it. The history row
+  // an Unlink leaves is what says so.
   await client.query(
     `INSERT INTO control_plane.telegram_organizer_links
        (id, user_id, telegram_subject_digest, verified_via)
-     VALUES ($1, $2, $3, $4)
+     SELECT $1, $2, $3, $4
+      WHERE NOT EXISTS (
+        SELECT 1 FROM control_plane.telegram_organizer_link_revocations r
+         WHERE r.telegram_subject_digest = $3 AND r.user_id = $2)
      ON CONFLICT DO NOTHING`,
     [`tol_${randomBytes(16).toString("hex")}`, userId, digestTelegramId(telegramUserId), verifiedVia],
   );
@@ -207,7 +214,7 @@ export async function listOrganizerTrips(
          ON m.trip_id = t.id AND m.status = 'active'
       WHERE m.user_id IN (
               SELECT user_id FROM control_plane.telegram_organizer_links
-               WHERE telegram_subject_digest = $1 AND revoked_at IS NULL)
+               WHERE telegram_subject_digest = $1)
         AND ${NOT_RETIRED_SQL}
         AND NOT EXISTS (
               SELECT 1 FROM control_plane.telegram_chat_bindings d
@@ -326,7 +333,7 @@ export async function switchChatToTrip(
           AND ${NOT_RETIRED_SQL}
           AND m.user_id IN (
                 SELECT user_id FROM control_plane.telegram_organizer_links
-                 WHERE telegram_subject_digest = $2 AND revoked_at IS NULL)
+                 WHERE telegram_subject_digest = $2)
         LIMIT 1`,
       [tripId, digestTelegramId(telegramUserId)],
     );

@@ -19,7 +19,7 @@ only from a **link**, written earlier by someone proving something Telegram cann
 
 **Contract change of `telegram_organizer_links`.** Migration 0052 called it "never a
 credential and never an authentication path". With this feature a row is a sign-in
-path, so it is now **revocable** (`revoked_at`), **owner-visible** (the "Telegram
+path, so it is now **revocable** (Unlink moves the row to a history table), **owner-visible** (the "Telegram
 accounts that can sign in as you" list) and **announced** (a notice on first use).
 The reason is concrete: an interview link that is forwarded to someone else yields
 a link to a Telegram account that is not the organizer's, and before this change that
@@ -108,22 +108,43 @@ this (the runtime-gateway lane owns that).
 
 - **See and remove:** "Telegram accounts that can sign in as you" on My trips
   (`GET /v1/account/telegram-links`, `DELETE /v1/account/telegram-links/:id`; `requireUser` /
-  `requireMutation`). It shows when it was linked, how, which trip for a trip-scoped
-  link, and when it last signed in — **never** the Telegram id, its digest or any piece of
-  either (a digest of a short numeric id is brute-forceable), and no Telegram-supplied name.
-- **Notice:** the first Mini App sign-in through a link queues a Telegram DM to the
-  signing-in account (outbox type `mini_app_sign_in_notice`, trip_id NULL, sent by the
-  ordinary outbox dispatcher with its usual retries; the raw Telegram id in the row is nulled
-  once it is sent or has failed for good; never inline) saying which account it signed in as and how to unlink. It goes to the account
-  that signed in — the only chat the server can address from a digest; the list above is
-  the owner's channel.
-- **Revocable:** an unlinked or revoked link signs nobody in, and the bot stops honouring it
-  too (`/trips`, `/switch`, the returning-organizer greeting and the organizer check all skip
-  revoked links). A revoked organizer link stays revoked: redeeming another interview link does
-  not re-open it. Member links also end —
-  with their sessions — when the trip password changes, when the membership ends, or when
-  the invite is revoked. These are database triggers (migration `20261020120000`), not
-  route code, because none of the three events has a single writer.
+  `requireMutation`), for any signed-in person. A row says: *linked on D via the interview for
+  "Trip"* (or via an earlier interview / the trip password / an invitation), *first signed in D*,
+  *last signed in D*, and which trip a trip-scoped link opens — enough for an organizer to tell their
+  own link from a forwardee's. **Never** the Telegram id, its digest or any piece of either (a digest of
+  a short numeric id is brute-forceable), and no Telegram-supplied name.
+- **Notice:** the first Mini App sign-in through a link queues a Telegram message to **the account
+  owner's own chats** — the open, private DM bindings with the bot (`telegram_chat_bindings`) of the
+  trips the account is owner or organizer of, minus the signer's own chat. It says which account signed
+  in, which trip it opened and when, and how to unlink. It does **not** go to the account that signed in
+  (a forwardee would only be told about their own sign-in). If the owner has no such chat nothing is
+  queued and the list above is the only channel (the sign-in log line carries `notices_queued`).
+  Outbox type `mini_app_sign_in_notice`, trip_id NULL, one row per chat, sent by the ordinary outbox
+  dispatcher with its usual retries (which runs whenever the web block is configured, with or without
+  `signup`); the raw Telegram id in the row is nulled once it is sent or has failed for good; never
+  inline. A member-scoped link has no such chats (members are not DM-bound), so it queues none;
+  re-linking the same Telegram account to the same person and trip is never news.
+- **Revocable:** **Unlink MOVES an organizer link** out of `telegram_organizer_links` into
+  `telegram_organizer_link_revocations`, so every reader — this release's and the previous release's bot
+  readers after a rollback — simply no longer sees it (`/trips`, `/switch`, the returning-organizer
+  greeting and the organizer check need no knowledge of revocation). It also ends the sessions the link
+  minted, and closes the unlinked Telegram chat's hold on the account's trips outside the web: its live
+  interview session is expired, its interview binding revoked and its open chat binding closed
+  (`telegram_unlinked`) — nothing deleted. A revoked organizer link stays revoked: redeeming another
+  interview link from the same Telegram account does not re-open it (the history row says so). Member
+  links are flagged `revoked_at` (only this release reads that table) and also end — with their
+  sessions — when the trip password changes, when the membership ends, or when the invite is revoked.
+  These are database triggers (migration `20261020120000`), not route code, because none of the three
+  events has a single writer.
+- **Remove member:** an owner or organizer removes a person from the trip's "People on this trip" panel
+  (`DELETE /v1/trips/:id/members/:membershipId`, `requireMutation`; revoking a **redeemed** invite does
+  the same). One transaction: membership to `revoked` (which fires the Telegram-link trigger), trip
+  password deleted, the invite revoked, unused launch grants spent, and every portal session of theirs
+  ended if they have no other active membership (otherwise their sessions stay, since every trip route
+  checks membership on every request). Refused: yourself, an owner by a non-owner, the last owner or
+  organizer (409); anyone who is not an owner/organizer of that trip, and any membership not on that trip,
+  get the same 404. *Not covered:* the trip site's own gateway session (control plane has no call to end
+  it; it runs out on its own clock).
 
 ### Phase 2: how a member gets linked
 
@@ -136,6 +157,23 @@ password burns nothing and links nothing. A refusal never fails the sign-in it r
 response says `telegramLink: "skipped"` and the page says so. `/v1/auth/password` now also
 requires an `Origin` equal to `web.public_origin` and is rate limited (100/min/IP;
 10/min/account, counted only for accounts that exist).
+
+## A member's trip list
+
+`GET /v1/trips` returns the full trip detail (invitees, invite ids, plan, interview session, lifecycle)
+only for memberships with dashboard access. A runtime-only member gets a **summary**: id, title,
+destination, dates, their own permissions and `runtimeReady` — nothing of the organizer's workbench.
+`GET /v1/trips/:id` stays a 404 for them.
+
+## Behind an ingress: `public_api.trust_proxy`
+
+By default `request.ip` is the socket peer, so behind a reverse proxy every client shares the proxy's
+address and the per-IP sign-in budgets (`/v1/auth/email-password`, `/v1/auth/password`,
+`/v1/auth/telegram-mini-app`) become one global budget. `public_api.trust_proxy` in the architecture
+profile (absent = off) lists the proxies that may speak for the client: a hop count (1-8) or a list of
+addresses/CIDRs. Fastify then takes the client address from `X-Forwarded-For` **only** for requests
+arriving from them; a caller outside the list cannot choose its own address with a header. Set it to
+exactly the ingress in front of the API; a wrong list is worse than none.
 
 ## Configuration
 
