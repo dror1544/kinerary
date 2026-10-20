@@ -566,3 +566,22 @@ test("a trip session is tied to the portal session that launched it: logout on d
     assert.equal(consumedLegacy.json().sessionId, null);
   } finally { await app.close(); }
 });
+
+test("the live check requires the membership role to still be the role the session was opened with", { skip }, async () => {
+  const app = buildApp(profile, { portal: portalDeps(pool) });
+  const check = (role: string | null) =>
+    app.inject({ method: "POST", url: "/internal/runtime-sessions/check", headers: { "x-api-key": "exchange-key" }, payload: { tripId: ids.otherTrip, userId: ids.outsider, role } });
+  try {
+    await session(ids.outsider, "rolecheck");
+    assert.equal((await check("owner")).statusCode, 200);
+    assert.equal((await check(null)).statusCode, 200, "a session sealed without a role is checked as before");
+    assert.equal((await check("member")).statusCode, 401, "sealed as a member, but the membership is owner");
+    await pool.query("UPDATE control_plane.trip_memberships SET role = 'member' WHERE trip_id = $1 AND user_id = $2", [ids.otherTrip, ids.outsider]);
+    try {
+      assert.equal((await check("owner")).statusCode, 401, "demoted in the control plane: the owner-era session is refused");
+      assert.equal((await check("member")).statusCode, 200, "a session opened after the demotion is fine");
+    } finally {
+      await pool.query("UPDATE control_plane.trip_memberships SET role = 'owner' WHERE trip_id = $1 AND user_id = $2", [ids.otherTrip, ids.outsider]);
+    }
+  } finally { await app.close(); }
+});

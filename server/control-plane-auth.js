@@ -11,13 +11,15 @@ const tripIdValid = value => typeof value === 'string' && /^trip_[A-Za-z0-9]{8,6
 const usernameValid = value => typeof value === 'string' && /^[a-z0-9][a-z0-9._-]{0,63}$/.test(value);
 
 // The link back to the organizer dashboard, which the control plane builds from
-// its own configuration and signs into the managed session. It is only ever
-// `https://<origin>/trips/<this trip's id>/setup` (http only on a loopback host,
-// for local development): no credentials, query or fragment, nothing longer than
-// 2048 characters, and the path is pinned to THIS trip so a mistaken or hostile
-// exchange cannot point the menu anywhere else. Anything else is dropped rather
-// than rendered into a menu href: javascript:, data:, userinfo, control
-// characters and other paths never leave this function.
+// its own configuration and the gateway passes through the session exchange into
+// the signed claim. This function checks SHAPE only: https (http only on a
+// loopback host, for local development), no credentials, query or fragment, at
+// most 2048 characters, and the path pinned to THIS trip's setup page. It does not
+// know which origin is the portal, so a caller holding the exchange key could name
+// any https host; the gateway, which knows PORTAL_ORIGIN, drops every URL that is
+// not exactly PORTAL_ORIGIN + that path before it asks for the session. Anything
+// else is dropped rather than rendered into a menu href: javascript:, data:,
+// userinfo, control characters and other paths never leave this function.
 const MAX_DASHBOARD_URL = 2048;
 // Loopback by shape, not by literal: the release build refuses a private-IPv4 literal in shipped code.
 const isLoopbackHost = host => host === 'localhost' || host === '[::1]' || /^127(\.\d{1,3}){3}$/.test(host);

@@ -11,7 +11,8 @@
 
   // Every trip behind the gateway shares one origin, hence one localStorage.
   // The session keys are scoped to this trip so that one trip's marker (or
-  // cached user) is never read by another; everything else is left as it is.
+  // cached user) is not read by accident (this is not an isolation boundary: the
+  // trips share one origin, so a page's script can still reach the others' keys); everything else is left as it is.
   // Done on Storage.prototype because Classic, Modern and their helpers all read
   // these keys directly, and this file loads before any of them.
   const scopedKeys = ['trip-token', 'tripToken', 'token', 'trip-user'];

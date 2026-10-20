@@ -11,6 +11,37 @@ const PORTAL_ORIGIN = required("PORTAL_ORIGIN").replace(/\/$/, "");
 const RUNTIME_ORIGIN = required("RUNTIME_ORIGIN").replace(/\/$/, "");
 const secureCookie = RUNTIME_ORIGIN.startsWith("https://");
 const routeCache = new Map();
+// A hung control plane or trip must fail closed quickly, not hold every request open.
+const UPSTREAM_TIMEOUT_MS = Math.max(50, Number(process.env.RUNTIME_UPSTREAM_TIMEOUT_MS ?? 5000) || 5000);
+const timedFetch = (url, init = {}) => fetch(url, { ...init, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
+
+// The per-trip cookie is SameSite=Strict, so the portal and this origin must be
+// the same SITE: from another site the browser stores the cookie after the launch
+// POST but does not send it on the 303, and every launch would loop back to the
+// portal. "Same site" here is the registrable domain, approximated by the last two
+// hostname labels (three when the last two are a listed public suffix such as
+// co.uk, named in RUNTIME_PUBLIC_SUFFIXES, comma separated); two non-DNS hosts
+// (localhost, an IP address) are the same site only if the hostnames are equal.
+// RUNTIME_SAME_SITE_OK=1 overrides a wrong guess, loudly.
+export function registrableDomain(hostname, publicSuffixes = []) {
+  const labels = hostname.toLowerCase().split(".");
+  if (labels.length < 2 || /^[\d.]+$/.test(hostname) || hostname.includes(":") || hostname.startsWith("[")) return hostname.toLowerCase();
+  const tail2 = labels.slice(-2).join(".");
+  return publicSuffixes.includes(tail2) && labels.length >= 3 ? labels.slice(-3).join(".") : tail2;
+}
+export function sameSite(a, b, publicSuffixes = []) {
+  return registrableDomain(new URL(a).hostname, publicSuffixes) === registrableDomain(new URL(b).hostname, publicSuffixes);
+}
+const publicSuffixes = String(process.env.RUNTIME_PUBLIC_SUFFIXES || "").split(",").map((v) => v.trim().toLowerCase()).filter(Boolean);
+if (!sameSite(PORTAL_ORIGIN, RUNTIME_ORIGIN, publicSuffixes)) {
+  if (process.env.RUNTIME_SAME_SITE_OK === "1") {
+    console.error("runtime_gateway.cross_site_origins_allowed: PORTAL_ORIGIN and RUNTIME_ORIGIN are not the same site; RUNTIME_SAME_SITE_OK=1 is set, so launches will only work if the browser really treats them as same-site");
+  } else {
+    const message = "PORTAL_ORIGIN and RUNTIME_ORIGIN must be the same site (share a registrable domain): the trip cookie is SameSite=Strict and would not be sent after the launch, so every launch would loop. Set RUNTIME_PUBLIC_SUFFIXES if the shared domain sits under a public suffix such as co.uk, or RUNTIME_SAME_SITE_OK=1 to override.";
+    console.error(`runtime_gateway.cross_site_origins: ${message}`);
+    throw new Error(message);
+  }
+}
 
 function required(name) {
   const value = process.env[name];
@@ -68,7 +99,7 @@ function cookieValue(req, name) {
 }
 
 async function controlPlane(path, init = {}) {
-  const response = await fetch(`${CONTROL_PLANE_ORIGIN}${path}`, { ...init, headers: { ...init.headers, "x-api-key": EXCHANGE_KEY } });
+  const response = await timedFetch(`${CONTROL_PLANE_ORIGIN}${path}`, { ...init, headers: { ...init.headers, "x-api-key": EXCHANGE_KEY } });
   if (!response.ok) {
     const error = Object.assign(new Error("CONTROL_PLANE_REJECTED"), { statusCode: response.status });
     throw error;
@@ -126,10 +157,11 @@ const liveCache = new Map();
 async function sessionLive(session) {
   if (typeof session.userId !== "string") return false;
   const sessionId = typeof session.sessionId === "string" ? session.sessionId : null;
-  const key = `${session.tripId}:${session.userId}:${sessionId}`;
+  const role = typeof session.role === "string" ? session.role : null;
+  const key = `${session.tripId}:${session.userId}:${sessionId}:${role}`;
   if ((liveCache.get(key) ?? 0) > Date.now()) return true;
   try {
-    await controlPlane("/internal/runtime-sessions/check", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tripId: session.tripId, userId: session.userId, sessionId }) });
+    await controlPlane("/internal/runtime-sessions/check", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tripId: session.tripId, userId: session.userId, sessionId, role }) });
   } catch (error) {
     liveCache.delete(key);
     if (error?.message === "CONTROL_PLANE_REJECTED") return false;
@@ -164,16 +196,18 @@ async function launch(req, res, tripId) {
   const route = await routeFor(tripId);
   const identity = { tripId, userId: grant.userId, role: grant.role, runtimeUsername: grant.runtimeUsername };
   // The control plane builds the dashboard URL from its own configuration; the
-  // trip validates it again before it will serve it to an owner or organizer.
-  if (typeof grant.dashboardUrl === "string" && grant.dashboardUrl.length <= 2048) identity.dashboardUrl = grant.dashboardUrl;
-  const sessionResponse = await fetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/session`, {
+  // trip validates its shape again before it will serve it to an owner or organizer.
+  // Only this deployment's own portal can be the way back: the URL must be exactly
+  // PORTAL_ORIGIN + the trip's setup path, whatever the control plane sent.
+  if (grant.dashboardUrl === `${PORTAL_ORIGIN}/trips/${tripId}/setup`) identity.dashboardUrl = grant.dashboardUrl;
+  const sessionResponse = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/session`, {
     method: "POST", headers: { "content-type": "application/json", "x-api-key": EXCHANGE_KEY },
     body: JSON.stringify(identity),
   });
   if (!sessionResponse.ok) return launchRefused(res, [400, 401, 403].includes(sessionResponse.status) ? 401 : 503);
   const runtime = await sessionResponse.json();
   if (typeof runtime.token !== "string") return launchRefused(res, 503);
-  const value = encodeSession({ tripId, userId: grant.userId, sessionId: typeof grant.sessionId === "string" ? grant.sessionId : null, token: runtime.token, exp: Date.now() + 12 * 60 * 60 * 1000 });
+  const value = encodeSession({ tripId, userId: grant.userId, sessionId: typeof grant.sessionId === "string" ? grant.sessionId : null, role: typeof grant.role === "string" ? grant.role : null, token: runtime.token, exp: Date.now() + 12 * 60 * 60 * 1000 });
   // Strict: the launch POST and the 303 that follows it come from the portal,
   // which must be same-site with this origin (docs/runtime-session-exchange.md).
   const attributes = [`${cookieName(tripId)}=${encodeURIComponent(value)}`, "Path=/", "HttpOnly", "SameSite=Strict", "Max-Age=43200"];
@@ -189,7 +223,7 @@ async function provisionParticipant(req, res, tripId) {
   const route = await routeFor(tripId);
   const body = await readJson(req);
   if (body.tripId !== tripId) return json(res, 400, { error: "INVALID_REQUEST" });
-  const response = await fetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants`, {
+  const response = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants`, {
     method: "POST", headers: { "content-type": "application/json", "x-api-key": EXCHANGE_KEY }, body: JSON.stringify(body),
   });
   const payload = await response.text();
@@ -202,7 +236,7 @@ async function participantExists(req, res, tripId, runtimeUsername) {
   if (!/^trip_[A-Za-z0-9]{8,64}$/.test(tripId)) return json(res, 404, { error: "NOT_FOUND" });
   if (!/^[a-z0-9][a-z0-9._-]{1,63}$/.test(runtimeUsername)) return json(res, 400, { error: "INVALID_REQUEST" });
   const route = await routeFor(tripId);
-  const response = await fetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants/${encodeURIComponent(runtimeUsername)}`, {
+  const response = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants/${encodeURIComponent(runtimeUsername)}`, {
     method: "GET", headers: { "x-api-key": EXCHANGE_KEY, "x-control-plane-trip-id": tripId },
   });
   const payload = await response.text();

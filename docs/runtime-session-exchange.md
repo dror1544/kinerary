@@ -68,11 +68,17 @@ identity.
 
 `dashboardUrl` is optional. The control plane builds it from the portal's
 configured public origin (`web.public_origin` + `/trips/<tripId>/setup`; no
-hostname lives in code). The runtime keeps it in the signed claim only for an
-`owner` or `organizer` and only if it is exactly `https://<origin>/trips/<this
-trip's id>/setup` (http only for a loopback host in development), with no
-credentials, query or fragment and at most 2048 characters. Anything else is
-dropped, not an error.
+hostname lives in code). Two parties check it, each what it knows:
+
+- the **gateway** knows the portal's origin: it passes the URL on only if it is
+  exactly `PORTAL_ORIGIN + "/trips/<tripId>/setup"`, and otherwise leaves it out;
+- the **runtime** checks shape only: it keeps the URL in the signed claim only for
+  an `owner` or `organizer`, and only if it is `https://<origin>/trips/<this
+  trip's id>/setup` (http only for a loopback host in development), with no
+  credentials, query or fragment and at most 2048 characters. It cannot tell the
+  portal's origin from another https host, which is why the gateway pins it.
+
+Anything else is dropped, not an error.
 
 `GET /api/auth/me` adds `dashboard_url` **only** to a managed owner/organizer
 session. `authRequired` is unchanged and carries no claim; `/api/auth/me`
@@ -136,9 +142,17 @@ origin), `Path=/`, no `Domain`, `HttpOnly`, `Secure`, **`SameSite=Strict`**, 12 
 One cookie per trip, name-scoped, because the runtime origin is shared by every
 trip: a `__Host-` cookie cannot be planted from a sibling subdomain. Strict means
 the portal and the runtime origin **must be the same site** (a shared registrable
-domain). If they are not, the 303 arrives without the cookie, the gateway sends
-the browser back to the portal, and the launcher stops after three attempts in
-20 seconds with a message instead of looping.
+domain). From another site the browser stores the cookie after the launch POST but
+does not send it on the 303, and every launch would loop back to the portal. So the
+gateway **refuses to start** (a loud `runtime_gateway.cross_site_origins` error)
+when `PORTAL_ORIGIN` and `RUNTIME_ORIGIN` are not the same site. "Same site" is the
+registrable domain approximated by the last two hostname labels; when the shared
+domain sits under a public suffix such as `co.uk`, name it in
+`RUNTIME_PUBLIC_SUFFIXES` (comma separated) so three labels are compared; two
+non-DNS hosts (`localhost`, an IP) are the same site only if the hostnames are
+equal. `RUNTIME_SAME_SITE_OK=1` overrides a wrong guess and logs
+`runtime_gateway.cross_site_origins_allowed` on every start. The portal's launcher
+still stops after three launches of one trip in 20 seconds, as a last resort.
 
 An unauthenticated top-level navigation under `/t/<trip>/` (Sec-Fetch-Mode
 `navigate`, or `Accept: text/html` when Fetch Metadata is absent) is answered
@@ -154,7 +168,11 @@ gateway seals it, with the portal user, in the per-trip cookie. On every request
 the gateway asks `POST /internal/runtime-sessions/check` (exchange key, compared
 in constant time) whether **that exact session** is still live (not revoked, not
 expired, same person), and whether the person is still active and still has
-`runtime_access` on the trip. A positive answer is cached for at most 30 s per
+`runtime_access` on the trip, **with the same role the session was opened with**
+(the role is sealed in the cookie; a demotion or promotion at the control plane
+answers 401, so the person opens the trip again and is issued a session for the
+role they now hold, and `/api/auth/me` stops showing `is_organizer` and
+`dashboard_url`). A positive answer is cached for at most 30 s per
 launching session (`RUNTIME_SESSION_CHECK_TTL_MS` lowers it, for tests), a
 negative one never, and an unreachable control plane means refusal. Signing out
 of the portal on one device therefore ends the trip session opened from that
@@ -165,6 +183,10 @@ before the column existed carries no session (`NULL`) and keeps the earlier rule
 the portal is compatible. The column is deliberately not a foreign key: a
 deleted session must answer "no", not be rewritten to `NULL`. A stream already
 open ends at its next reconnect.
+
+Every call the gateway makes to the control plane or a trip carries a timeout
+(5 s; `RUNTIME_UPSTREAM_TIMEOUT_MS`), so a hung service fails closed quickly: the
+live check answers "no" and a launch shows the generic failure page.
 
 **Shared runtime origin.** Every trip opened from the portal lives on one origin.
 The trip UIs therefore scope `trip-token`, `tripToken`, `token` and `trip-user`

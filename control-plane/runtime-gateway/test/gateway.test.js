@@ -1,6 +1,8 @@
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 let upstream, controlPlane, gateway;
 let upstreamOrigin, gatewayOrigin;
@@ -11,6 +13,7 @@ const consumed = new Set();
 const revokedUsers = new Set();
 const revokedSessions = new Set();
 let lastCheck;
+let currentRole = "owner", hangControlPlane = false;
 let checkCalls = 0, checkDown = false;
 const PORTAL = "https://app.example.test";
 // What a browser sends for a page navigation (undici would otherwise say sec-fetch-mode: cors).
@@ -72,16 +75,19 @@ before(async () => {
     if (req.url === "/internal/runtime-launch/consume") {
       const payload = await body(req);
       // "valid-grant" is reusable fixture data; "once-*" grants are single-use like the real table.
+      if (hangControlPlane && payload.token === "once-hangs") return; // never answers
       const reusable = payload.token === "valid-grant";
       const once = typeof payload.token === "string" && payload.token.startsWith("once-") && !consumed.has(payload.token);
       if (!reusable && !once) { res.statusCode = 401; return res.end(JSON.stringify({ error: "invalid" })); }
       if (once) consumed.add(payload.token);
       const tripId = payload.token === "once-other-trip" ? "trip_otherxyz1" : "trip_abcdefgh";
-      return res.end(JSON.stringify({ tripId, userId: "user_abcdefgh", role: "owner", runtimeUsername: null, audience: "runtime_gateway", sessionId: payload.token === "once-device-b" ? "wsess_deviceb0001" : "wsess_devicea0001", dashboardUrl: `${PORTAL}/trips/${tripId}/setup` }));
+      return res.end(JSON.stringify({ tripId, userId: "user_abcdefgh", role: payload.token === "once-member-grant" ? "member" : "owner", runtimeUsername: null, audience: "runtime_gateway", sessionId: payload.token === "once-device-b" ? "wsess_deviceb0001" : "wsess_devicea0001", dashboardUrl: payload.token === "once-evil-origin" ? `https://evil.example/trips/${tripId}/setup` : payload.token === "once-other-trip-path" ? `${PORTAL}/trips/trip_somebodyelse/setup` : `${PORTAL}/trips/${tripId}/setup` }));
     }
     if (req.url === "/internal/runtime-sessions/check") {
       const payload = await body(req);
       checkCalls += 1; lastCheck = payload;
+      if (hangControlPlane) return; // never answers
+      if (payload.role && payload.role !== currentRole) { res.statusCode = 401; return res.end(JSON.stringify({ error: "ROLE_CHANGED" })); }
       if (checkDown) { res.statusCode = 500; return res.end("{}"); }
       if (revokedUsers.has(payload.userId) || revokedSessions.has(payload.sessionId)) { res.statusCode = 401; return res.end(JSON.stringify({ error: "SESSION_REVOKED" })); }
       return res.end(JSON.stringify({ live: true }));
@@ -93,7 +99,7 @@ before(async () => {
   Object.assign(process.env, {
     NODE_ENV: "test", CONTROL_PLANE_INTERNAL_ORIGIN: controlPlaneOrigin,
     RUNTIME_EXCHANGE_KEY: "exchange-key", RUNTIME_COOKIE_SECRET: "cookie-secret-at-least-random",
-    PORTAL_ORIGIN: PORTAL, RUNTIME_ORIGIN: "https://runtime.example.test", RUNTIME_SESSION_CHECK_TTL_MS: "200",
+    PORTAL_ORIGIN: PORTAL, RUNTIME_ORIGIN: "https://runtime.example.test", RUNTIME_SESSION_CHECK_TTL_MS: "200", RUNTIME_UPSTREAM_TIMEOUT_MS: "300",
   });
   const { createRuntimeGateway } = await import(`../server.js?test=${Date.now()}`);
   gateway = createRuntimeGateway();
@@ -207,6 +213,82 @@ test("signing out on one device ends only the trip session opened from that devi
     assert.equal((await get(a)).status, 401, "the trip session opened from A ends");
     assert.equal((await get(b)).status, 200, "the trip session opened from B keeps working");
   } finally { revokedSessions.delete("wsess_devicea0001"); }
+});
+
+test("the dashboard URL is passed on only when it is exactly this portal's setup page for this trip", async () => {
+  for (const token of ["once-evil-origin", "once-other-trip-path"]) {
+    const response = await formLaunch(token);
+    assert.equal(response.status, 303, token);
+    assert.equal(sessionBodies.at(-1).dashboardUrl, undefined, `${token} must not reach the trip`);
+  }
+  assert.equal((await formLaunch("once-good-origin")).status, 303);
+  assert.equal(sessionBodies.at(-1).dashboardUrl, `${PORTAL}/trips/trip_abcdefgh/setup`);
+});
+
+test("a role change at the control plane ends the session opened with the old role", async () => {
+  const cookie = (await formLaunch("once-role-owner")).headers.get("set-cookie").split(";")[0];
+  const get = (c) => fetch(`${gatewayOrigin}/t/trip_abcdefgh/api/config`, { headers: { cookie: c } });
+  assert.equal((await get(cookie)).status, 200);
+  assert.equal(lastCheck.role, "owner", "the sealed role is what the check is asked about");
+  currentRole = "member"; // demoted in the control plane
+  try {
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assert.equal((await get(cookie)).status, 401, "the owner-era session is refused");
+    const relaunched = (await formLaunch("once-member-grant")).headers.get("set-cookie").split(";")[0];
+    assert.equal((await get(relaunched)).status, 200, "relaunching issues a session for the role now held");
+    assert.equal(lastCheck.role, "member");
+    assert.equal(sessionBodies.at(-1).role, "member");
+  } finally { currentRole = "owner"; }
+});
+
+test("a hung control plane fails closed within the timeout instead of holding the request", async () => {
+  const cookie = (await formLaunch("once-hang-session")).headers.get("set-cookie").split(";")[0];
+  hangControlPlane = true;
+  try {
+    await new Promise(resolve => setTimeout(resolve, 300)); // let any cached answer expire
+    const startedAt = Date.now();
+    const checked = await fetch(`${gatewayOrigin}/t/trip_abcdefgh/api/config`, { headers: { cookie } });
+    assert.equal(checked.status, 401, "no answer from the portal means no session");
+    assert.ok(Date.now() - startedAt < 3000, `took ${Date.now() - startedAt} ms`);
+    const launchStart = Date.now();
+    const launched = await formLaunch("once-hangs");
+    assert.equal(launched.status, 503, "a launch whose grant cannot be consumed is a generic failure");
+    assert.ok(Date.now() - launchStart < 3000);
+  } finally { hangControlPlane = false; }
+});
+
+test("the gateway refuses to start when the portal and runtime origins are not the same site", async () => {
+  const server = fileURLToPath(new URL("../server.js", import.meta.url));
+  const run = (extra) => new Promise((resolve) => {
+    const child = spawn(process.execPath, [server], {
+      env: { PATH: process.env.PATH, PORT: "0", BIND_HOST: "127.0.0.1", CONTROL_PLANE_INTERNAL_ORIGIN: "http://127.0.0.1:9", RUNTIME_EXCHANGE_KEY: "k", RUNTIME_COOKIE_SECRET: "s", PORTAL_ORIGIN: "https://app.example.test", RUNTIME_ORIGIN: "https://runtime.other.test", ...extra },
+    });
+    let out = "", err = "";
+    child.stdout.on("data", (c) => { out += c; if (/listening/.test(out)) child.kill(); });
+    child.stderr.on("data", (c) => { err += c; });
+    child.on("close", (code) => resolve({ code, out, err }));
+    setTimeout(() => child.kill(), 4000);
+  });
+  const refused = await run({});
+  assert.notEqual(refused.code, 0);
+  assert.match(refused.err, /cross_site_origins/);
+  assert.match(refused.err, /same site/);
+  assert.equal(refused.out, "");
+  const overridden = await run({ RUNTIME_SAME_SITE_OK: "1" });
+  assert.match(overridden.out, /listening/);
+  assert.match(overridden.err, /cross_site_origins_allowed/, "an override is still loud");
+  const sameSiteHosts = await run({ RUNTIME_ORIGIN: "https://runtime.example.test" });
+  assert.match(sameSiteHosts.out, /listening/);
+  // A shared domain under a public suffix (co.uk) is two sites unless the suffix is declared.
+  const ukRefused = await run({ PORTAL_ORIGIN: "https://app.alice.co.uk", RUNTIME_ORIGIN: "https://run.bob.co.uk" });
+  assert.notEqual(ukRefused.code, 0);
+  const ukDeclared = await run({ PORTAL_ORIGIN: "https://app.alice.co.uk", RUNTIME_ORIGIN: "https://run.alice.co.uk", RUNTIME_PUBLIC_SUFFIXES: "co.uk" });
+  assert.match(ukDeclared.out, /listening/);
+  const ukSibling = await run({ PORTAL_ORIGIN: "https://app.alice.co.uk", RUNTIME_ORIGIN: "https://run.bob.co.uk", RUNTIME_PUBLIC_SUFFIXES: "co.uk" });
+  assert.notEqual(ukSibling.code, 0);
+  // Loopback development: same hostname on different ports is one site; two different IPs are not.
+  assert.match((await run({ PORTAL_ORIGIN: "http://localhost:5173", RUNTIME_ORIGIN: "http://localhost:4320" })).out, /listening/);
+  assert.notEqual((await run({ PORTAL_ORIGIN: "http://localhost:5173", RUNTIME_ORIGIN: "http://127.0.0.1:4320" })).code, 0);
 });
 
 test("the JSON launch body still works for compatibility, with the same Origin rule", async () => {

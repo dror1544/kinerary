@@ -910,23 +910,27 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
   // still live, and is its person still active and still entitled to the trip?
   // Signing out of the portal on one device therefore ends the trip session
   // opened from that device and no other; removal from the trip or disabling
-  // ends them all. A grant minted before session binding existed carries no
+  // ends them all. The role the session was opened with must still be the
+  // membership's role: a demotion (or promotion) answers no, so the person has to
+  // relaunch and is issued a session for the role they now hold. A grant minted before session binding existed carries no
   // session (null) and keeps the earlier rule: any live portal session of the
   // person. Those grants live 90 seconds, so that rule is a rollback aid only.
   app.post("/internal/runtime-sessions/check", async (request, reply) => {
     if (!exchangeKeyMatches(request.headers["x-api-key"], deps.runtimeExchangeKey)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
-    const { tripId, userId, sessionId } = (request.body ?? {}) as Record<string, unknown>;
-    if (typeof tripId !== "string" || typeof userId !== "string" || (sessionId !== undefined && sessionId !== null && typeof sessionId !== "string")) {
+    const { tripId, userId, sessionId, role } = (request.body ?? {}) as Record<string, unknown>;
+    const optionalText = (value: unknown) => value === undefined || value === null || typeof value === "string";
+    if (typeof tripId !== "string" || typeof userId !== "string" || !optionalText(sessionId) || !optionalText(role)) {
       return reply.code(400).send({ error: "INVALID_REQUEST" });
     }
     const result = await deps.db.query(
       `SELECT 1 FROM control_plane.trip_memberships m
        JOIN control_plane.users u ON u.id = m.user_id AND u.status = 'active'
        WHERE m.trip_id = $1 AND m.user_id = $2 AND m.status = 'active' AND m.runtime_access = true
+         AND ($4::text IS NULL OR m.role = $4::text)
          AND EXISTS (SELECT 1 FROM control_plane.web_sessions s
                      WHERE s.user_id = m.user_id AND s.revoked_at IS NULL AND s.expires_at > now()
                        AND ($3::text IS NULL OR s.id = $3::text))`,
-      [tripId, userId, sessionId ?? null]);
+      [tripId, userId, sessionId ?? null, role ?? null]);
     if (!result.rows[0]) return reply.code(401).send({ error: "SESSION_REVOKED" });
     return { live: true };
   });
