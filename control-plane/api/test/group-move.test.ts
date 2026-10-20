@@ -1,0 +1,480 @@
+/**
+ * Moving a Telegram group from one trip to the organizer's next one.
+ *
+ * Until this, `/group KIN-…` in a group already bound to trip A was refused
+ * (CHAT_BOUND_ELSEWHERE) for EVERYONE, including the person who organizes both
+ * trips - so the only way to carry a family group from last year's trip to this
+ * year's was an operator. The rule now: the sender of the code must be a linked
+ * organizer of the trip the group is bound to NOW as well as of the trip the code
+ * is for. Anyone else gets one uniform refusal and nothing changes.
+ *
+ * Every refusal test asserts the DATABASE is unchanged, not just the reply: the
+ * property is "nobody else's group moves", and a message proves nothing about that.
+ */
+import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
+import { describe, test } from "node:test";
+import { fileURLToPath } from "node:url";
+import pg from "pg";
+import { applyMigrations } from "../src/migrations.js";
+import {
+  GROUP_MOVED_CLOSED_REASON,
+  issueGroupBindingToken,
+  redeemGroupBindingToken,
+} from "../src/group-binding.js";
+import { resolveChatRoute } from "../src/chat-router.js";
+import { digestTelegramId } from "../src/identity.js";
+import { uiString } from "../src/intake-copy.js";
+import { applyDecision } from "../src/relay/poller.js";
+import { dispatchUpdate, DEFAULT_STRINGS, type DispatchDecision } from "../src/relay/dispatch.js";
+import type { TelegramUpdate } from "../src/relay/normalize.js";
+import type { PinnedMessage, SendResult, TelegramClient } from "../src/relay/telegram-api.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
+
+const SKIP = !testDatabaseUrl();
+const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
+const BOT = { id: "8463178587", username: "Kinerary_bot" };
+
+/** Organizes trips A and B, through two different user ids (the live shape). */
+const DROR = "777";
+/** Organizes trip C only - somebody else's trip. */
+const STRANGER_ORGANIZER = "999";
+/** A family member: holds no organizer link at all. */
+const MEMBER = "555";
+const CHAT = "-1002000500";
+
+const id = (prefix: string) => `${prefix}_${randomBytes(16).toString("hex")}`;
+
+interface Fixture {
+  pool: pg.Pool;
+  tripA: string;
+  tripB: string;
+  tripC: string;
+}
+
+async function addTrip(pool: pg.Pool, slug: string, language: "en" | "he", owner: string, profile: string): Promise<string> {
+  const tripId = id("trip");
+  await pool.query(
+    `INSERT INTO control_plane.trips(id, slug, lifecycle_state, hermes_profile, companion_intro, assistant_names)
+     VALUES ($1, $2, 'ready_private', $3, $4::jsonb, $5)`,
+    [tripId, slug, profile, JSON.stringify({
+      assistant_name: `Rio-${slug}`, trip_title: `Trip ${slug}`, private_url: `https://${slug}.example`, language, login_password: "seed-pw",
+    }), [`Rio-${slug}`]],
+  );
+  await pool.query(
+    "INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status) VALUES ($1, $2, $3, 'owner', 'active')",
+    [id("memb"), tripId, owner],
+  );
+  return tripId;
+}
+
+async function withFixture(
+  fn: (fix: Fixture) => Promise<void>,
+  opts: { languageA?: "en" | "he" } = {},
+): Promise<void> {
+  const pool = testPool();
+  const client = await pool.connect();
+  try {
+    await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");
+    await client.query("DROP TABLE IF EXISTS public.control_plane_schema_migrations");
+    await applyMigrations(client, migrationsDir);
+  } finally {
+    client.release();
+  }
+  try {
+    const [uA, uB, uC] = [id("user"), id("user"), id("user")];
+    for (const u of [uA, uB, uC]) {
+      await pool.query("INSERT INTO control_plane.users(id, status, display_name) VALUES ($1, 'active', 'U')", [u]);
+    }
+    const link = (userId: string, telegramId: string) => pool.query(
+      `INSERT INTO control_plane.telegram_organizer_links(id, user_id, telegram_subject_digest, verified_via)
+       VALUES ($1, $2, $3, 'enrollment_redemption')`,
+      [id("tol"), userId, digestTelegramId(telegramId)],
+    );
+    await link(uA, DROR);
+    await link(uB, DROR);
+    await link(uC, STRANGER_ORGANIZER);
+    const tripA = await addTrip(pool, "japan-2025", opts.languageA ?? "en", uA, "companion-a");
+    const tripB = await addTrip(pool, "italy-2026", "en", uB, "companion-b");
+    const tripC = await addTrip(pool, "peru-2026", "en", uC, "companion-c");
+    // The group is Trip A's, with its companion.
+    await pool.query(
+      "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ($1, $2, $3, 'companion-a')",
+      [id("tcb"), CHAT, tripA],
+    );
+    await fn({ pool, tripA, tripB, tripC });
+  } finally {
+    await pool.end();
+  }
+}
+
+interface BindingRow { trip_id: string; hermes_profile: string | null; closed_at: Date | null; closed_reason: string | null }
+
+async function bindings(pool: pg.Pool, chatId = CHAT): Promise<BindingRow[]> {
+  const { rows } = await pool.query<BindingRow>(
+    `SELECT trip_id, hermes_profile, closed_at, closed_reason
+       FROM control_plane.telegram_chat_bindings WHERE chat_id = $1 ORDER BY created_at, id`,
+    [chatId],
+  );
+  return rows;
+}
+
+async function tokenUse(pool: pg.Pool, tripId: string): Promise<number> {
+  const { rows } = await pool.query<{ use_count: number }>(
+    "SELECT use_count FROM control_plane.telegram_group_binding_tokens WHERE trip_id = $1", [tripId]);
+  return rows[0]!.use_count;
+}
+
+async function issue(pool: pg.Pool, tripId: string, forTelegramId: string): Promise<string> {
+  const issued = await issueGroupBindingToken(pool, tripId, forTelegramId, { ttlSeconds: 3600 });
+  if (!issued.ok) throw new Error("issue failed");
+  return issued.token;
+}
+
+describe("moving a group to the organizer's next trip (db)", { skip: SKIP }, () => {
+  test("the organizer of both trips moves the group: old binding closed 'group_moved', new one open, routing follows", async () => {
+    await withFixture(async ({ pool, tripA, tripB }) => {
+      const token = await issue(pool, tripB, DROR);
+      const result = await redeemGroupBindingToken(pool, token, CHAT, DROR);
+      assert.deepEqual(result, { ok: true, tripId: tripB, rebound: false, movedFromTripId: tripA });
+
+      const rows = await bindings(pool);
+      assert.equal(rows.length, 2, "history is kept, nothing is overwritten");
+      assert.equal(rows[0]!.trip_id, tripA);
+      assert.ok(rows[0]!.closed_at, "the old binding is closed");
+      assert.equal(rows[0]!.closed_reason, GROUP_MOVED_CLOSED_REASON);
+      assert.equal(GROUP_MOVED_CLOSED_REASON, "group_moved");
+      assert.equal(rows[1]!.trip_id, tripB);
+      assert.equal(rows[1]!.closed_at, null);
+      assert.equal(rows[1]!.closed_reason, null);
+      assert.equal(rows[1]!.hermes_profile, "companion-b", "the NEW trip's companion, not the old one's");
+
+      // Companion routing for the chat goes to B, and only B.
+      const route = await resolveChatRoute(pool, CHAT);
+      assert.equal(route.kind, "companion");
+      if (route.kind !== "companion") return;
+      assert.equal(route.tripId, tripB);
+      assert.equal(route.hermesProfile, "companion-b");
+      assert.ok(route.assistantNames.includes("Rio-italy-2026"));
+      assert.equal(route.assistantNames.includes("Rio-japan-2025"), false);
+
+      // The code is recorded as used (it stays redeemable until expiry by owner decision 2026-10-16:
+      // one trip may bind several groups). Trip A itself is untouched.
+      assert.equal(await tokenUse(pool, tripB), 1);
+      const a = await pool.query("SELECT lifecycle_state, slug FROM control_plane.trips WHERE id = $1", [tripA]);
+      assert.deepEqual(a.rows[0], { lifecycle_state: "ready_private", slug: "japan-2025" });
+    });
+  });
+
+  test("re-posting the same code after the move is the ordinary re-bind, not a second move", async () => {
+    await withFixture(async ({ pool, tripB }) => {
+      const token = await issue(pool, tripB, DROR);
+      await redeemGroupBindingToken(pool, token, CHAT, DROR);
+      const again = await redeemGroupBindingToken(pool, token, CHAT, DROR);
+      assert.deepEqual(again, { ok: true, tripId: tripB, rebound: true });
+      assert.equal((await bindings(pool)).length, 2);
+    });
+  });
+
+  test("a member who is not an organizer of the group's trip cannot move it, even with a code issued to them", async () => {
+    await withFixture(async ({ pool, tripA, tripB }) => {
+      const before = await bindings(pool);
+      const token = await issue(pool, tripB, MEMBER);
+      const result = await redeemGroupBindingToken(pool, token, CHAT, MEMBER);
+      assert.deepEqual(result, { ok: false, reason: "GROUP_MOVE_NOT_ORGANIZER" });
+      assert.deepEqual(await bindings(pool), before, "nothing moved");
+      assert.equal(await tokenUse(pool, tripB), 0, "and the code was not spent");
+      const route = await resolveChatRoute(pool, CHAT);
+      assert.equal(route.kind === "companion" && route.tripId, tripA);
+    });
+  });
+
+  test("the organizer of the NEW trip but not of the group's trip cannot take the group", async () => {
+    await withFixture(async ({ pool, tripA, tripC }) => {
+      const before = await bindings(pool);
+      const token = await issue(pool, tripC, STRANGER_ORGANIZER);
+      const result = await redeemGroupBindingToken(pool, token, CHAT, STRANGER_ORGANIZER);
+      assert.deepEqual(result, { ok: false, reason: "GROUP_MOVE_NOT_ORGANIZER" });
+      assert.deepEqual(await bindings(pool), before);
+      const route = await resolveChatRoute(pool, CHAT);
+      assert.equal(route.kind === "companion" && route.tripId, tripA);
+    });
+  });
+
+  test("the organizer of the group's trip cannot move it to a trip they do not organize", async () => {
+    await withFixture(async ({ pool, tripA, tripC }) => {
+      const before = await bindings(pool);
+      // A code for somebody else's trip, issued to Dror (a member's DM can be bound to any trip).
+      const token = await issue(pool, tripC, DROR);
+      const result = await redeemGroupBindingToken(pool, token, CHAT, DROR);
+      assert.deepEqual(result, { ok: false, reason: "GROUP_MOVE_NOT_ORGANIZER" });
+      assert.deepEqual(await bindings(pool), before);
+      assert.equal(await tokenUse(pool, tripC), 0);
+      const route = await resolveChatRoute(pool, CHAT);
+      assert.equal(route.kind === "companion" && route.tripId, tripA);
+    });
+  });
+
+  test("a Telegram person whose organizer link is gone is not an organizer", async () => {
+    await withFixture(async ({ pool, tripB }) => {
+      // However "unlinked" is stored (a revoked row on one branch, a moved row on another), a person
+      // with no row at all is "not linked" to every version of the reader.
+      await pool.query("DELETE FROM control_plane.telegram_organizer_links WHERE telegram_subject_digest = $1", [digestTelegramId(DROR)]);
+      const token = await issue(pool, tripB, DROR);
+      const result = await redeemGroupBindingToken(pool, token, CHAT, DROR);
+      assert.deepEqual(result, { ok: false, reason: "GROUP_MOVE_NOT_ORGANIZER" });
+      assert.equal((await bindings(pool)).length, 1);
+    });
+  });
+
+  test("the other refusals come first and are unchanged: wrong sender, expired, unknown, retired trip", async () => {
+    await withFixture(async ({ pool, tripA, tripB }) => {
+      const token = await issue(pool, tripB, DROR);
+      assert.deepEqual(await redeemGroupBindingToken(pool, token, CHAT, MEMBER), { ok: false, reason: "WRONG_SENDER" });
+      assert.deepEqual(await redeemGroupBindingToken(pool, "KIN-AAAAAAAA", CHAT, DROR), { ok: false, reason: "NOT_FOUND" });
+      await pool.query("UPDATE control_plane.telegram_group_binding_tokens SET created_at = now() - interval '2 hours', expires_at = now() - interval '1 hour' WHERE trip_id = $1", [tripB]);
+      assert.deepEqual(await redeemGroupBindingToken(pool, token, CHAT, DROR), { ok: false, reason: "EXPIRED" });
+      const fresh = await issue(pool, tripB, DROR);
+      await pool.query("UPDATE control_plane.trips SET slug = 'retired-italy-20261001' WHERE id = $1", [tripB]);
+      assert.deepEqual(await redeemGroupBindingToken(pool, fresh, CHAT, DROR), { ok: false, reason: "TRIP_RETIRED" });
+      const route = await resolveChatRoute(pool, CHAT);
+      assert.equal(route.kind === "companion" && route.tripId, tripA);
+      assert.equal((await bindings(pool)).length, 1);
+    });
+  });
+
+  test("a group with no open binding still binds the ordinary way (no move involved)", async () => {
+    await withFixture(async ({ pool, tripB }) => {
+      const token = await issue(pool, tripB, DROR);
+      const result = await redeemGroupBindingToken(pool, token, "-1002000501", DROR);
+      assert.deepEqual(result, { ok: true, tripId: tripB, rebound: false });
+    });
+  });
+
+  // ── Lock order (#175) ─────────────────────────────────────────────────────
+  // A move takes: the token row (FOR UPDATE), the old binding row (FOR UPDATE), then
+  // `trips` through the new binding's foreign key. teardown-trip.py takes the token
+  // row first, then bindings, then trips - the same order, so no cycle. These run the
+  // two sides concurrently against a real database; a deadlock surfaces as a thrown 40P01.
+  // Each is made deterministic (teardown takes its lock BEFORE the move starts, the move
+  // queues, then teardown carries on) so the assertion is about the outcome, not about luck.
+
+  test("a move queued behind teardown of the NEW trip (token revoke, then binding close) does not deadlock", async () => {
+    await withFixture(async ({ pool, tripA, tripB }) => {
+      const token = await issue(pool, tripB, DROR);
+      const teardown = await pool.connect();
+      try {
+        await teardown.query("BEGIN");
+        // teardown-trip.py's REVOKE_GROUP_TOKENS, first: it now holds the new trip's token row.
+        await teardown.query(
+          "UPDATE control_plane.telegram_group_binding_tokens SET expires_at = now() WHERE trip_id = $1 AND expires_at > now()", [tripB]);
+        const move = redeemGroupBindingToken(pool, token, CHAT, DROR);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        await teardown.query(
+          "UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed' WHERE trip_id = $1 AND closed_at IS NULL", [tripB]);
+        await teardown.query("UPDATE control_plane.trips SET slug = 'retired-italy-20261020' WHERE id = $1", [tripB]);
+        await teardown.query("COMMIT");
+        const result = await move; // a real deadlock is a thrown 40P01 here
+        assert.deepEqual(result, { ok: false, reason: "EXPIRED" }, "the revoked code moves nothing");
+      } finally {
+        teardown.release();
+      }
+      const open = (await bindings(pool)).filter((b) => b.closed_at === null);
+      assert.deepEqual(open.map((b) => b.trip_id), [tripA], "the group stays where it was");
+    });
+  });
+
+  test("a move queued behind teardown of the OLD trip (binding closed, slug renamed) does not deadlock", async () => {
+    await withFixture(async ({ pool, tripA, tripB }) => {
+      const token = await issue(pool, tripB, DROR);
+      const teardown = await pool.connect();
+      try {
+        await teardown.query("BEGIN");
+        await teardown.query(
+          "UPDATE control_plane.telegram_group_binding_tokens SET expires_at = now() WHERE trip_id = $1 AND expires_at > now()", [tripA]);
+        // teardown holds the OLD binding row (and, next, the old trips row) ...
+        await teardown.query(
+          "UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed' WHERE trip_id = $1 AND closed_at IS NULL", [tripA]);
+        // ... while the move, holding the NEW trip's token row, queues on that binding row.
+        const move = redeemGroupBindingToken(pool, token, CHAT, DROR);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        await teardown.query("UPDATE control_plane.trips SET slug = 'retired-japan-20261020' WHERE id = $1", [tripA]);
+        await teardown.query("COMMIT");
+        const result = await move;
+        // Teardown won the row: nothing is left to move, so this is a plain bind of a free group.
+        assert.deepEqual(result, { ok: true, tripId: tripB, rebound: false });
+      } finally {
+        teardown.release();
+      }
+      const rows = await bindings(pool);
+      assert.deepEqual(rows.filter((b) => b.closed_at === null).map((b) => b.trip_id), [tripB]);
+      assert.equal(rows.find((b) => b.trip_id === tripA)!.closed_reason, "trip_destroyed", "teardown's reason is not overwritten");
+    });
+  });
+
+  test("a move that wins the row first leaves teardown of the old trip nothing to close", async () => {
+    await withFixture(async ({ pool, tripA, tripB }) => {
+      const token = await issue(pool, tripB, DROR);
+      assert.ok((await redeemGroupBindingToken(pool, token, CHAT, DROR)).ok);
+      const closed = await pool.query(
+        "UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed' WHERE trip_id = $1 AND closed_at IS NULL", [tripA]);
+      assert.equal(closed.rowCount, 0);
+      const rows = await bindings(pool);
+      assert.equal(rows.find((b) => b.trip_id === tripA)!.closed_reason, GROUP_MOVED_CLOSED_REASON);
+    });
+  });
+
+  test("two posts of the same code at once: one move, one re-bind, one open binding", async () => {
+    await withFixture(async ({ pool, tripA, tripB }) => {
+      const token = await issue(pool, tripB, DROR);
+      const [x, y] = await Promise.all([
+        redeemGroupBindingToken(pool, token, CHAT, DROR),
+        redeemGroupBindingToken(pool, token, CHAT, DROR),
+      ]);
+      assert.ok(x.ok && y.ok);
+      if (!x.ok || !y.ok) return;
+      assert.deepEqual([x.rebound, y.rebound].sort(), [false, true]);
+      const rows = await bindings(pool);
+      assert.equal(rows.filter((b) => b.closed_at === null).length, 1);
+      assert.equal(rows.filter((b) => b.closed_reason === GROUP_MOVED_CLOSED_REASON && b.trip_id === tripA).length, 1);
+    });
+  });
+});
+
+// ── Through the relay ───────────────────────────────────────────────────────
+
+function say(chatId: string, text: string, fromId: number): TelegramUpdate {
+  return {
+    update_id: 5,
+    message: {
+      message_id: 12,
+      from: { id: fromId, first_name: "Dana" },
+      chat: { id: chatId, type: "supergroup" },
+      text,
+    },
+  } as TelegramUpdate;
+}
+
+const READY = { tripAppReady: () => true, tripAppBotUsername: "Kinerary_bot" };
+
+const dispatch = (pool: pg.Pool, update: TelegramUpdate, options: object = READY, lines: string[] = []) =>
+  dispatchUpdate(pool, update, DEFAULT_STRINGS, (line) => lines.push(line), BOT, options);
+
+class RecordingTelegram {
+  calls: string[] = [];
+  sent: { chatId: string; text: string; replyMarkup?: unknown }[] = [];
+  pinned: string[] = [];
+  unpinned: string[] = [];
+  top: PinnedMessage | null = null;
+  async sendMessage(params: { chatId: string; text: string; replyMarkup?: unknown }): Promise<SendResult> {
+    this.sent.push(params);
+    this.calls.push(`send:${this.sent.length}`);
+    return { ok: true, messageId: String(this.sent.length) };
+  }
+  async pinChatMessage(params: { messageId: string }): Promise<boolean> {
+    this.calls.push(`pin:${params.messageId}`);
+    this.pinned.push(params.messageId);
+    return true;
+  }
+  async getPinnedMessage(): Promise<PinnedMessage | null> {
+    this.calls.push("getPinned");
+    return this.top;
+  }
+  async unpinChatMessage(params: { messageId: string }): Promise<boolean> {
+    this.calls.push(`unpin:${params.messageId}`);
+    this.unpinned.push(params.messageId);
+    return true;
+  }
+}
+
+const deps = (telegram: RecordingTelegram) => ({
+  db: {} as pg.Pool,
+  telegram: telegram as unknown as TelegramClient,
+  connector: { pushInbound: () => true },
+  botIdentity: BOT,
+  log: () => {},
+});
+
+describe("moving a group through the relay", { skip: SKIP }, () => {
+  test("the organizer's /group in the old trip's group: the new trip's intro, its button, and our old pin replaced", async () => {
+    await withFixture(async ({ pool, tripA, tripB }) => {
+      const token = await issue(pool, tripB, DROR);
+      const lines: string[] = [];
+      const decision: DispatchDecision = await dispatch(pool, say(CHAT, `/group ${token}`, Number(DROR)), READY, lines);
+      assert.equal(decision.kind, "group_intro");
+      if (decision.kind !== "group_intro") return;
+      assert.match(decision.text, /Rio-italy-2026/, "it introduces the NEW trip's assistant");
+      assert.match(decision.text, /Trip italy-2026/);
+      assert.ok(decision.text.includes(uiString("groupMovedNotice", "en").replace("{trip}", "Trip italy-2026")), "and says the group has moved");
+      assert.equal(decision.text.includes("Trip japan-2025"), false);
+      const url = decision.openTrip?.replyMarkup.inline_keyboard.flat()[0];
+      assert.equal(url && "url" in url ? url.url : null, `https://t.me/Kinerary_bot?startapp=${tripB}`);
+      assert.ok(lines.some((l) => l.includes("trip_bot.group_moved")), lines.join("\n"));
+
+      // What the poller does with it: take OUR old Open-trip pin down first, then intro, then the new button.
+      const telegram = new RecordingTelegram();
+      telegram.top = { messageId: "41", fromId: BOT.id, text: uiString("openTripText", "en"), buttonUrls: [`https://t.me/Kinerary_bot?startapp=${tripA}`] };
+      await applyDecision(decision, deps(telegram));
+      assert.deepEqual(telegram.unpinned, ["41"]);
+      assert.equal(telegram.sent.length, 2, "the intro and the new Open trip message");
+      assert.equal(telegram.sent[1]!.text, uiString("openTripText", "en"));
+      assert.deepEqual(telegram.pinned, ["1", "2"]);
+      assert.ok(telegram.calls.indexOf("unpin:41") < telegram.calls.indexOf("send:1"));
+    });
+  });
+
+  test("Mini App not ready: the move still happens, and nothing is unpinned or pinned beyond the intro", async () => {
+    await withFixture(async ({ pool, tripB }) => {
+      const token = await issue(pool, tripB, DROR);
+      const decision = await dispatch(pool, say(CHAT, `/group ${token}`, Number(DROR)), { tripAppReady: () => false, tripAppBotUsername: "Kinerary_bot" });
+      assert.equal(decision.kind, "group_intro");
+      if (decision.kind !== "group_intro") return;
+      assert.equal(decision.openTrip, undefined);
+      const telegram = new RecordingTelegram();
+      telegram.top = { messageId: "41", fromId: BOT.id, text: "x", buttonUrls: ["https://t.me/Kinerary_bot?startapp=trip_x"] };
+      await applyDecision(decision, deps(telegram));
+      assert.deepEqual(telegram.unpinned, []);
+      assert.equal(telegram.calls.includes("getPinned"), false);
+      const route = await resolveChatRoute(pool, CHAT);
+      assert.equal(route.kind === "companion" && route.tripId, tripB);
+    });
+  });
+
+  test("a non-organizer gets one uniform refusal in the group's language, the reason is logged, nothing changes", async () => {
+    for (const language of ["en", "he"] as const) {
+      await withFixture(async ({ pool, tripA, tripB }) => {
+        const token = await issue(pool, tripB, MEMBER);
+        const lines: string[] = [];
+        const before = await bindings(pool);
+        const decision = await dispatch(pool, say(CHAT, `/group ${token}`, Number(MEMBER)), READY, lines);
+        assert.equal(decision.kind, "reply", language);
+        if (decision.kind !== "reply") return;
+        assert.equal(decision.reply.text, uiString("groupMoveNotOrganizer", language));
+        assert.equal(decision.reply.replyMarkup, undefined);
+        assert.ok(lines.some((l) => l.includes("trip_bot.group_binding_refused") && l.includes("GROUP_MOVE_NOT_ORGANIZER")), lines.join("\n"));
+        assert.deepEqual(await bindings(pool), before);
+        const route = await resolveChatRoute(pool, CHAT);
+        assert.equal(route.kind === "companion" && route.tripId, tripA);
+      }, { languageA: language });
+    }
+    assert.equal(uiString("groupMoveNotOrganizer", "en"), "This group belongs to another trip. Only its organizer can move it.");
+    assert.match(uiString("groupMoveNotOrganizer", "he"), /[֐-׿]/);
+  });
+
+  test("the three kinds of non-move refusal read identically to the group", async () => {
+    await withFixture(async ({ pool, tripB, tripC }) => {
+      const replies: string[] = [];
+      for (const [tripId, issuedTo, sender] of [
+        [tripB, MEMBER, MEMBER],                                       // not an organizer of anything
+        [tripC, STRANGER_ORGANIZER, STRANGER_ORGANIZER],                // organizer of the new trip only
+        [tripC, DROR, DROR],                                            // organizer of the old trip only
+      ] as const) {
+        const token = await issue(pool, tripId, issuedTo);
+        const decision = await dispatch(pool, say(CHAT, `/group ${token}`, Number(sender)));
+        assert.equal(decision.kind, "reply");
+        if (decision.kind === "reply") replies.push(decision.reply.text);
+      }
+      assert.deepEqual(new Set(replies).size, 1, replies.join(" | "));
+    });
+  });
+});

@@ -308,6 +308,20 @@ only commands, replies and mentions. A bare token pasted as text would not
 arrive at all, and the case that breaks is the recovery case ("post it again
 now that I'm an admin"). Do not "simplify" this to a bare token.
 
+**Moving a group to the organizer's next trip (2026-10-20).** A code for trip B
+posted in a group already bound to trip A *moves* the group when the sender (the
+verified `from.id`, never anything typed) is a linked organizer of **both** A and
+B (`isTripOrganizer`); the old binding is closed with `closed_reason =
+'group_moved'` (history kept, no migration — the column is free text), a new one
+opens for B with B's companion, the code is recorded as used but stays redeemable
+until it expires, and the group gets B's introduction (and, when the Mini App is
+ready, B's Open trip message in place of A's). Anyone else gets one sentence —
+"This group belongs to another trip. Only its organizer can move it." — whichever
+half of the check failed, and nothing changes (log reason
+`GROUP_MOVE_NOT_ORGANIZER`). A's website and companion are untouched; the
+companion simply stops being routed for that chat. Asserted by
+`control-plane/api/test/group-move.test.ts`.
+
 ## 8. `/url` — DROPPED (2026-09-13)
 
 Not needed, by Dror's decision: `/help` already answers it. In any chat bound
