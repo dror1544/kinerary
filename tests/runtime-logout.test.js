@@ -45,3 +45,47 @@ test('direct Classic and Modern logins do not acquire a gateway logout handler',
   assert.equal(fixture({ path: '/classic.html' }).window.runtimeLogout, undefined);
   assert.equal(fixture({ path: '/modern/' }).window.runtimeLogout, undefined);
 });
+
+// The runtime origin is shared by every trip, so one localStorage serves them all.
+function storageFixture(path, data = new Map()) {
+  class Storage {
+    getItem(key) { return data.has(key) ? data.get(key) : null; }
+    setItem(key, value) { data.set(key, String(value)); }
+    removeItem(key) { data.delete(key); }
+  }
+  const localStorage = new Storage();
+  const window = { fetch: async () => ({ ok: true, json: async () => ({ portalUrl: 'https://portal.example' }) }), EventSource: function () {}, localStorage };
+  window.parent = window;
+  const context = {
+    window, Storage, localStorage, location: { pathname: path, origin: 'https://runtime.example', assign() {}, replace() {} },
+    XMLHttpRequest: function () {}, MutationObserver: class { observe() {} }, document: { documentElement: {}, querySelectorAll: () => [] }, URL,
+  };
+  context.XMLHttpRequest.prototype.open = () => {};
+  vm.runInNewContext(script, context);
+  return { localStorage, data };
+}
+
+test('session keys are scoped to the trip, so trips sharing the runtime origin never read each other\'s', () => {
+  const shared = new Map(); // one origin, one localStorage
+  const a = storageFixture('/t/trip_aaaaaaaa/classic.html', shared);
+  assert.equal(a.localStorage.getItem('trip-token'), 'runtime-gateway-session');
+  assert.ok(shared.has('/t/trip_aaaaaaaa:trip-token'), [...shared.keys()].join());
+  assert.ok(!shared.has('trip-token'));
+  a.localStorage.setItem('trip-user', '{"username":"alice"}');
+  assert.ok(shared.has('/t/trip_aaaaaaaa:trip-user'));
+  assert.equal(a.localStorage.getItem('trip-user'), '{"username":"alice"}');
+  // Another trip's page on the same origin cannot see it: its keys carry its own base.
+  const b = storageFixture('/t/trip_bbbbbbbb/classic.html', shared);
+  assert.equal(b.localStorage.getItem('trip-user'), null);
+  // Unrelated keys (language, caches) are not renamed.
+  a.localStorage.setItem('tripLang', 'he');
+  assert.ok(shared.has('tripLang'));
+  a.localStorage.removeItem('trip-user');
+  assert.equal(a.localStorage.getItem('trip-user'), null);
+});
+
+test('direct Classic and Modern logins keep their plain keys', () => {
+  const direct = storageFixture('/classic.html');
+  direct.localStorage.setItem('trip-token', 'jwt');
+  assert.ok(direct.data.has('trip-token'));
+});

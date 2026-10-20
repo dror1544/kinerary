@@ -2,18 +2,18 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { Link, Navigate, useLocation, useNavigate, useParams } from "react-router-dom";
+import { Link, Navigate, useLocation, useNavigate, useNavigationType, useParams } from "react-router-dom";
 import { z } from "zod";
 import { api, getMe, getTrip, getTrips, passwordSignIn, signIn, getAuthCapabilities, emailPasswordSignIn, safeReturnTo, type TripSummary, type InterviewLinkState, ApiError } from "../api";
 import { Brand } from "../components/Brand";
 
 export type ProductView = "sign-in" | "trips" | "new-trip" | "trip" | "runtime" | "join";
 
-export default function ProductApp({ view }: { view: ProductView }) {
+export default function ProductApp({ view, host }: { view: ProductView; host?: LauncherHost }) {
   const { tripId } = useParams();
   if (view === "sign-in") return <SignIn />;
   if (view === "join") return <Join />;
-  return <Protected>{view === "trips" ? <Trips /> : view === "new-trip" ? <NewTrip /> : view === "trip" ? <TripSetup key={tripId} /> : <Runtime />}</Protected>;
+  return <Protected>{view === "trips" ? <Trips /> : view === "new-trip" ? <NewTrip /> : view === "trip" ? <TripSetup key={tripId} /> : <Runtime key={tripId} host={host} />}</Protected>;
 }
 
 function SignIn() {
@@ -181,28 +181,122 @@ function InvitePanel({ trip }: { trip: TripSummary }) {
   return <aside className="workflow-card"><h2>Site invitations</h2><p>Each private link is for one person and can be used once.</p><form className="compact-form" onSubmit={form.handleSubmit((value) => create.mutate(value))}><label>Name<input required {...form.register("displayName")} /></label><label>Trip username<input required pattern="[a-z0-9][a-z0-9._-]{1,63}" {...form.register("runtimeUsername")} /></label><button className="button button-small">Create invite</button></form>{joinUrl && <div className="share-box"><strong>Copy this link now</strong><input readOnly value={joinUrl} /><div className="share-actions"><button onClick={() => navigator.clipboard.writeText(joinUrl)}>Copy</button>{navigator.share && <button onClick={() => navigator.share({ title: trip.title, url: joinUrl })}>Share</button>}<a href={`mailto:?subject=${encodeURIComponent(`Join ${trip.title}`)}&body=${encodeURIComponent(joinUrl)}`}>Email</a><a href={`https://t.me/share/url?url=${encodeURIComponent(joinUrl)}`} target="_blank" rel="noreferrer">Telegram</a></div></div>}<ul className="invite-list">{trip.invites?.map((invite) => <li key={invite.id}><div><strong>{invite.displayName}</strong><small>{invite.runtimeUsername} · {humanize(invite.status)}</small></div>{invite.status === "unused" && <button className="text-button" onClick={() => revoke.mutate(invite.id)}>Revoke</button>}</li>)}</ul></aside>;
 }
 
-function Runtime() {
-  const navigate = useNavigate();
+/** What the Mini App tells the launcher about the Telegram client it runs in. */
+export interface LauncherHost { settled: boolean; webClient: boolean; openLink: (url: string) => void }
+
+type LaunchGrant = { runtimeOrigin: string; framePath: string; launchToken: string };
+const LAUNCH_MARK = "kineraryLaunched";
+const LAUNCH_LOG = "kineraryLaunchLog";
+
+/** The one place a launch URL is made: this trip's own launch path on an http(s) origin, never anything the response happens to say. */
+function launchAction(grant: LaunchGrant, tripId: string): string | null {
+  try {
+    const origin = new URL(grant.runtimeOrigin);
+    if (!["https:", "http:"].includes(origin.protocol) || origin.username || origin.password) return null;
+    if (grant.runtimeOrigin.replace(/\/$/, "") !== origin.origin || grant.framePath !== `/t/${tripId}/`) return null;
+    return `${origin.origin}/t/${tripId}/__launch`;
+  } catch { return null; }
+}
+
+/** Back/forward onto a launcher whose grant is long spent: show a button, never submit again by itself. */
+function cameBackToLauncher(tripId: string, navigationType: string): boolean {
+  if ((window.history.state as Record<string, unknown> | null)?.[LAUNCH_MARK] === tripId) return true;
+  if (navigationType !== "POP") return false;
+  try {
+    const entry = performance.getEntriesByType?.("navigation")?.[0] as PerformanceNavigationTiming | undefined;
+    return entry?.type === "back_forward" && new URL(entry.name, window.location.href).pathname === window.location.pathname;
+  } catch { return false; }
+}
+
+/**
+ * Three launches of one trip inside 20 seconds means the gateway keeps sending
+ * the browser back here (a cookie it refuses to keep): stop and say so rather
+ * than loop forever, creating a grant each time.
+ */
+function launchLooping(tripId: string): boolean {
+  try {
+    const now = Date.now();
+    const log = (JSON.parse(sessionStorage.getItem(LAUNCH_LOG) || "[]") as { t: string; at: number }[]).filter((entry) => now - entry.at < 20_000);
+    log.push({ t: tripId, at: now });
+    sessionStorage.setItem(LAUNCH_LOG, JSON.stringify(log));
+    return log.filter((entry) => entry.t === tripId).length > 3;
+  } catch { return false; }
+}
+
+function Runtime({ host }: { host?: LauncherHost }) {
   const { tripId = "" } = useParams();
-  const iframe = useRef<HTMLIFrameElement>(null);
-  const [launch, setLaunch] = useState<{ runtimeOrigin: string; framePath: string; launchToken: string }>();
-  const grant = useMutation({ mutationFn: () => api<{ runtimeOrigin: string; framePath: string; launchToken: string }>(`/v1/trips/${tripId}/launch`, { method: "POST" }), onSuccess: setLaunch });
-  useEffect(() => { grant.mutate(); }, [tripId]); // eslint-disable-line react-hooks/exhaustive-deps
+  const inMiniApp = useLocation().pathname.startsWith("/mini-app");
+  const navigationType = useNavigationType();
+  const form = useRef<HTMLFormElement>(null);
+  const requested = useRef(false);
+  const submitted = useRef(false);
+  const [again, setAgain] = useState(() => cameBackToLauncher(tripId, navigationType));
+  const [grant, setGrant] = useState<LaunchGrant>();
+  const [looping, setLooping] = useState(false);
+  const mutation = useMutation({ mutationFn: () => api<LaunchGrant>(`/v1/trips/${tripId}/launch`, { method: "POST" }), onSuccess: setGrant });
+  const webClient = host?.webClient ?? false;
+  const ready = host?.settled ?? true;
+  const myTrips = inMiniApp ? "/mini-app" : "/trips";
+
+  const request = () => {
+    if (launchLooping(tripId)) { setLooping(true); return; }
+    requested.current = true;
+    mutation.mutate();
+  };
+  // The first thing a page does is ask for a grant; coming back to a spent one asks only on a click.
   useEffect(() => {
-    if (!launch) return;
-    const onMessage = (event: MessageEvent) => {
-      if (event.origin !== launch.runtimeOrigin || event.source !== iframe.current?.contentWindow) return;
-      if (event.data?.type === "kinerary:runtime-logout") {
-        navigate("/trips", { replace: true });
-        return;
-      }
-      if (event.data?.type !== "kinerary:runtime-ready") return;
-      iframe.current.contentWindow?.postMessage({ type: "kinerary:launch", token: launch.launchToken }, launch.runtimeOrigin);
+    if (again || webClient || !ready || requested.current) return;
+    request();
+  }, [again, webClient, ready]); // eslint-disable-line react-hooks/exhaustive-deps
+  // bfcache restores the page as it was left, grant and all: that grant is spent.
+  useEffect(() => {
+    const onPageShow = (event: Event) => {
+      if (!(event as PageTransitionEvent).persisted) return;
+      setGrant(undefined);
+      submitted.current = false;
+      requested.current = true;
+      setAgain(true);
     };
-    window.addEventListener("message", onMessage);
-    return () => window.removeEventListener("message", onMessage);
-  }, [launch, navigate]);
-  return <main className="runtime-shell"><div className="runtime-bar"><Link to={`/trips/${tripId}/setup`}>← Trip setup</Link><strong>Kinerary trip</strong><span /></div>{grant.isPending && <div className="route-loading">Opening your trip…</div>}{grant.isError && <div className="route-loading">This trip is not ready to open.</div>}{launch && <iframe ref={iframe} title="Kinerary trip" src={`${launch.runtimeOrigin}${launch.framePath}`} sandbox="allow-forms allow-modals allow-popups allow-same-origin allow-scripts allow-downloads" allow="clipboard-write" />}</main>;
+    window.addEventListener("pageshow", onPageShow);
+    return () => window.removeEventListener("pageshow", onPageShow);
+  }, []);
+  // The grant leaves in a top-level form POST: its token is in the body, in no URL, and the browser sends Origin (the gateway refuses without it).
+  const action = grant ? launchAction(grant, tripId) : null;
+  useEffect(() => {
+    if (!grant || !action || again || submitted.current) return;
+    submitted.current = true;
+    try { window.history.replaceState({ ...(window.history.state ?? {}), [LAUNCH_MARK]: tripId }, ""); } catch { /* the navigation-type check still applies */ }
+    form.current?.submit();
+  }, [grant, action, again, tripId]);
+
+  const openAgain = () => {
+    submitted.current = false;
+    requested.current = false;
+    setGrant(undefined);
+    try { window.history.replaceState({ ...(window.history.state ?? {}), [LAUNCH_MARK]: undefined }, ""); } catch { /* ignore */ }
+    setAgain(false);
+    request();
+  };
+
+  if (webClient) {
+    return <main className="runtime-launch">
+      <p>Telegram's browser app cannot show a trip inside itself.</p>
+      <button className="button" onClick={() => host?.openLink(`${window.location.origin}/trips/${tripId}/app`)}>Open trip in a new tab</button>
+      <Link to={myTrips}>My trips</Link>
+    </main>;
+  }
+  if (looping) {
+    return <main className="runtime-launch"><p>This trip keeps sending you back here, so it was not opened again.</p><p className="subtle">Please try again in a moment, or contact the person who runs Kinerary for you.</p><Link to={myTrips}>My trips</Link></main>;
+  }
+  if (again) {
+    return <main className="runtime-launch"><p>You came back from your trip.</p><button className="button" onClick={openAgain}>Open trip again</button><Link to={myTrips}>My trips</Link></main>;
+  }
+  const failed = mutation.isError || (grant && !action);
+  return <main className="runtime-launch">
+    {!failed && <div className="route-loading">Opening your trip…</div>}
+    {failed && <><div className="route-loading">This trip is not ready to open.</div><Link to={myTrips}>My trips</Link></>}
+    {grant && action && <form ref={form} method="post" action={action} hidden autoComplete="off"><input type="hidden" name="token" value={grant.launchToken} /></form>}
+  </main>;
 }
 
 function Join() {

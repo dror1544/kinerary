@@ -121,6 +121,11 @@ test("portal HTTP authorization separates dashboard, tenant and runtime access",
     const consumed = await app.inject({ method: "POST", url: "/internal/runtime-launch/consume", headers: { "x-api-key": "exchange-key" }, payload: { token: memberLaunch.json().launchToken } });
     assert.equal(consumed.statusCode, 200);
     assert.equal(consumed.json().tripId, ids.ownedTrip);
+    assert.equal(consumed.json().dashboardUrl, null, "a member has no dashboard to return to");
+    const ownerLaunch = await app.inject({ method: "POST", url: `/v1/trips/${ids.ownedTrip}/launch`, headers: { cookie: owner.cookie, "x-csrf-token": owner.csrf } });
+    assert.equal(ownerLaunch.statusCode, 200);
+    const ownerConsumed = await app.inject({ method: "POST", url: "/internal/runtime-launch/consume", headers: { "x-api-key": "exchange-key" }, payload: { token: ownerLaunch.json().launchToken } });
+    assert.equal(ownerConsumed.json().dashboardUrl, `http://portal.example.test/trips/${ids.ownedTrip}/setup`, "built from the configured portal origin");
     const replay = await app.inject({ method: "POST", url: "/internal/runtime-launch/consume", headers: { "x-api-key": "exchange-key" }, payload: { token: memberLaunch.json().launchToken } });
     assert.equal(replay.statusCode, 401);
 
@@ -498,4 +503,26 @@ test("lost interview recovery is owner-only, CSRF-protected and explicit; expire
     }
     await app.close();
   }
+});
+
+test("the gateway can ask whether a trip session is still entitled, and portal logout ends it", { skip }, async () => {
+  const app = buildApp(profile, { portal: portalDeps(pool) });
+  const check = (apiKey: string | undefined, userId = ids.outsider, tripId = ids.otherTrip) =>
+    app.inject({ method: "POST", url: "/internal/runtime-sessions/check", headers: apiKey ? { "x-api-key": apiKey } : {}, payload: { tripId, userId } });
+  try {
+    await pool.query("UPDATE control_plane.web_sessions SET revoked_at = now() WHERE user_id = $1", [ids.outsider]);
+    assert.equal((await check("exchange-key")).statusCode, 401, "no live portal session yet");
+    const outsider = await session(ids.outsider, "rtcheck");
+    assert.equal((await check("exchange-key")).statusCode, 200);
+    assert.equal((await check("exchange-key", ids.outsider, ids.ownedTrip)).statusCode, 401, "not their trip");
+    for (const key of [undefined, "wrong", "exchange-ke", "exchange-key-and-more"]) assert.equal((await check(key)).statusCode, 401, String(key));
+    const loggedOut = await app.inject({ method: "POST", url: "/v1/logout", headers: { cookie: outsider.cookie, "x-csrf-token": outsider.csrf } });
+    assert.equal(loggedOut.statusCode, 200);
+    assert.equal((await check("exchange-key")).statusCode, 401, "portal logout ends the trip session");
+    await session(ids.outsider, "rtcheck2");
+    assert.equal((await check("exchange-key")).statusCode, 200);
+    await pool.query("UPDATE control_plane.trip_memberships SET runtime_access = false WHERE trip_id = $1 AND user_id = $2", [ids.otherTrip, ids.outsider]);
+    assert.equal((await check("exchange-key")).statusCode, 401, "removed from the trip");
+    await pool.query("UPDATE control_plane.trip_memberships SET runtime_access = true WHERE trip_id = $1 AND user_id = $2", [ids.otherTrip, ids.outsider]);
+  } finally { await app.close(); }
 });

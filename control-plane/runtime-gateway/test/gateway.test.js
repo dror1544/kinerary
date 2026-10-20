@@ -6,17 +6,40 @@ let upstream, controlPlane, gateway;
 let upstreamOrigin, gatewayOrigin;
 let proxiedAuthorization;
 let eventStreamClosed = false;
+const sessionBodies = [];
+const consumed = new Set();
+const revokedUsers = new Set();
+let checkCalls = 0, checkDown = false;
+const PORTAL = "https://app.example.test";
+// What a browser sends for a page navigation (undici would otherwise say sec-fetch-mode: cors).
+const NAV = { "sec-fetch-mode": "navigate", "sec-fetch-dest": "document", accept: "text/html" };
 
 function listen(server) {
   return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(`http://127.0.0.1:${server.address().port}`)));
 }
 function close(server) { return new Promise((resolve) => server.close(resolve)); }
+function formLaunch(token, origin = PORTAL, path = "/t/trip_abcdefgh/__launch") {
+  const headers = { "content-type": "application/x-www-form-urlencoded" };
+  if (origin !== null) headers.origin = origin;
+  return fetch(`${gatewayOrigin}${path}`, { method: "POST", redirect: "manual", headers, body: new URLSearchParams({ token }).toString() });
+}
+// fetch() overwrites Sec-Fetch-* itself (it says "cors"), so page navigations are made with http.request.
+function rawGet(path, headers = {}, method = "GET") {
+  return new Promise((resolve, reject) => {
+    const request = http.request(`${gatewayOrigin}${path}`, { method, headers }, (response) => {
+      const chunks = []; response.on("data", (c) => chunks.push(c));
+      response.on("end", () => resolve({ status: response.statusCode, headers: { get: (n) => response.headers[n.toLowerCase()] ?? null }, text: Buffer.concat(chunks).toString() }));
+    });
+    request.on("error", reject); request.end();
+  });
+}
 function body(req) { return new Promise((resolve) => { const chunks = []; req.on("data", (chunk) => chunks.push(chunk)); req.on("end", () => resolve(JSON.parse(Buffer.concat(chunks).toString() || "{}"))); }); }
 
 before(async () => {
   upstream = http.createServer(async (req, res) => {
     if (req.url === "/api/internal/control-plane/session") {
       assert.equal(req.headers["x-api-key"], "exchange-key");
+      sessionBodies.push(await body(req));
       res.setHeader("content-type", "application/json");
       return res.end(JSON.stringify({ token: "runtime-jwt" }));
     }
@@ -46,8 +69,20 @@ before(async () => {
     res.setHeader("content-type", "application/json");
     if (req.url === "/internal/runtime-launch/consume") {
       const payload = await body(req);
-      if (payload.token !== "valid-grant") { res.statusCode = 401; return res.end(JSON.stringify({ error: "invalid" })); }
-      return res.end(JSON.stringify({ tripId: "trip_abcdefgh", userId: "user_abcdefgh", role: "owner", runtimeUsername: null, audience: "runtime_gateway" }));
+      // "valid-grant" is reusable fixture data; "once-*" grants are single-use like the real table.
+      const reusable = payload.token === "valid-grant";
+      const once = typeof payload.token === "string" && payload.token.startsWith("once-") && !consumed.has(payload.token);
+      if (!reusable && !once) { res.statusCode = 401; return res.end(JSON.stringify({ error: "invalid" })); }
+      if (once) consumed.add(payload.token);
+      const tripId = payload.token === "once-other-trip" ? "trip_otherxyz1" : "trip_abcdefgh";
+      return res.end(JSON.stringify({ tripId, userId: "user_abcdefgh", role: "owner", runtimeUsername: null, audience: "runtime_gateway", dashboardUrl: `${PORTAL}/trips/${tripId}/setup` }));
+    }
+    if (req.url === "/internal/runtime-sessions/check") {
+      const payload = await body(req);
+      checkCalls += 1;
+      if (checkDown) { res.statusCode = 500; return res.end("{}"); }
+      if (revokedUsers.has(payload.userId)) { res.statusCode = 401; return res.end(JSON.stringify({ error: "SESSION_REVOKED" })); }
+      return res.end(JSON.stringify({ live: true }));
     }
     if (req.url === "/internal/runtime-routes/trip_abcdefgh") return res.end(JSON.stringify({ routeRef: "route_abcdefgh", upstreamOrigin, upstreamBasePath: "" }));
     res.statusCode = 404; res.end(JSON.stringify({ error: "missing" }));
@@ -56,7 +91,7 @@ before(async () => {
   Object.assign(process.env, {
     NODE_ENV: "test", CONTROL_PLANE_INTERNAL_ORIGIN: controlPlaneOrigin,
     RUNTIME_EXCHANGE_KEY: "exchange-key", RUNTIME_COOKIE_SECRET: "cookie-secret-at-least-random",
-    PORTAL_ORIGIN: "https://app.example.test", RUNTIME_ORIGIN: "https://runtime.example.test",
+    PORTAL_ORIGIN: PORTAL, RUNTIME_ORIGIN: "https://runtime.example.test", RUNTIME_SESSION_CHECK_TTL_MS: "200",
   });
   const { createRuntimeGateway } = await import(`../server.js?test=${Date.now()}`);
   gateway = createRuntimeGateway();
@@ -65,21 +100,133 @@ before(async () => {
 
 after(async () => { await Promise.all([close(gateway), close(controlPlane), close(upstream)]); });
 
-test("serves an isolated launch bootstrap without putting a grant in the URL", async () => {
-  const response = await fetch(`${gatewayOrigin}/t/trip_abcdefgh/`);
-  assert.equal(response.status, 200);
-  const html = await response.text();
-  assert.match(html, /kinerary:runtime-ready/);
-  assert.match(response.headers.get("content-security-policy"), /frame-ancestors https:\/\/app\.example\.test/);
+test("a form POST from the portal consumes the grant and redirects to the trip with the cookie, token nowhere in a URL", async () => {
+  const logged = [];
+  const originals = ["log", "error", "warn", "info"].map((name) => [name, console[name]]);
+  for (const [name] of originals) console[name] = (...args) => logged.push(args.join(" "));
+  let launched;
+  try { launched = await formLaunch("once-form-grant"); } finally { for (const [name, fn] of originals) console[name] = fn; }
+  assert.equal(launched.status, 303);
+  assert.equal(launched.headers.get("location"), "/t/trip_abcdefgh/");
+  assert.ok(!launched.headers.get("location").includes("once-form-grant"));
+  assert.ok(!logged.join("\n").includes("once-form-grant"), "the grant must not be logged");
+  assert.equal(launched.headers.get("cache-control"), "no-store");
+  const cookie = launched.headers.get("set-cookie");
+  // Per-trip, __Host- prefixed (Secure, Path=/, no Domain), Strict.
+  assert.ok(cookie.startsWith("kit_runtime=") === false && cookie.startsWith("__Host-kit_rt_trip_abcdefgh="));
+  assert.match(cookie, /; Path=\/(;|$)/);
+  assert.ok(!/Domain=/i.test(cookie));
+  assert.match(cookie, /HttpOnly/);
+  assert.match(cookie, /SameSite=Strict/);
+  assert.match(cookie, /Secure/);
+  assert.ok(!cookie.includes("once-form-grant"));
+  // The dashboard URL the control plane built travels through the session exchange.
+  assert.equal(sessionBodies.at(-1).dashboardUrl, `${PORTAL}/trips/trip_abcdefgh/setup`);
+  assert.equal(sessionBodies.at(-1).role, "owner");
 });
 
-test("consumes a trip-bound grant once and proxies with the runtime session", async () => {
-  const launched = await fetch(`${gatewayOrigin}/t/trip_abcdefgh/__launch`, {
-    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: "valid-grant" }),
-  });
-  assert.equal(launched.status, 204);
+test("the launch refuses a missing, null or foreign Origin before touching the grant", async () => {
+  for (const origin of [null, "null", "https://evil.example", "https://runtime.example.test", `${PORTAL}.evil.example`]) {
+    const response = await formLaunch("once-origin-grant", origin);
+    assert.equal(response.status, 403, `Origin ${origin}`);
+    assert.equal(response.headers.get("set-cookie"), null);
+  }
+  // The grant was never consumed by the refusals, so the portal's own post still works.
+  assert.equal((await formLaunch("once-origin-grant")).status, 303);
+});
+
+test("a replayed, wrong-trip or malformed grant is refused and sets no cookie", async () => {
+  assert.equal((await formLaunch("once-replay-grant")).status, 303);
+  const replay = await formLaunch("once-replay-grant");
+  assert.equal(replay.status, 401);
+  assert.equal(replay.headers.get("set-cookie"), null);
+  const wrongTrip = await formLaunch("once-other-trip");
+  assert.equal(wrongTrip.status, 401);
+  assert.equal(wrongTrip.headers.get("set-cookie"), null);
+  assert.equal((await formLaunch("not-a-grant")).status, 401);
+  assert.equal((await formLaunch("")).status, 400);
+  const html = await replay.text();
+  assert.match(html, /could not be opened/);
+  assert.ok(!html.includes("once-replay-grant"));
+  // Same body for every refusal: no hint which trips exist.
+  assert.equal(await (await formLaunch("not-a-grant")).text(), html);
+});
+
+test("a cross-site text/plain or multipart form is refused even from the portal's Origin", async () => {
+  for (const type of ["text/plain", "multipart/form-data; boundary=x", ""]) {
+    const response = await fetch(`${gatewayOrigin}/t/trip_abcdefgh/__launch`, { method: "POST", redirect: "manual", headers: { "content-type": type, origin: PORTAL }, body: JSON.stringify({ token: "valid-grant" }) });
+    assert.equal(response.status, 400, type);
+    assert.equal(response.headers.get("set-cookie"), null);
+  }
+  // The classic login-CSRF shape: enctype=text/plain from a foreign page (Origin foreign or "null").
+  for (const origin of ["https://evil.example", "null"]) {
+    const response = await fetch(`${gatewayOrigin}/t/trip_abcdefgh/__launch`, { method: "POST", redirect: "manual", headers: { "content-type": "text/plain", origin }, body: 'token=valid-grant' });
+    assert.equal(response.status, 403);
+    assert.equal(response.headers.get("set-cookie"), null);
+  }
+});
+
+test("revoking the person at the portal ends the trip session within the cache window, and an outage fails closed", async () => {
+  const launched = await formLaunch("valid-grant");
   const cookie = launched.headers.get("set-cookie").split(";")[0];
-  assert.ok(cookie.startsWith("kit_runtime="));
+  const get = (headers = {}) => fetch(`${gatewayOrigin}/t/trip_abcdefgh/api/config`, { redirect: "manual", headers: { cookie, ...headers } });
+  assert.equal((await get()).status, 200);
+  const before = checkCalls;
+  assert.equal((await get()).status, 200);
+  assert.equal(checkCalls, before, "a positive answer is cached, not re-asked on every request");
+  revokedUsers.add("user_abcdefgh");
+  try {
+    await new Promise(resolve => setTimeout(resolve, 300)); // past the 200 ms test window
+    assert.equal((await get()).status, 401, "portal logout / removal ends the trip session");
+    const page = await rawGet("/t/trip_abcdefgh/api/config", { ...NAV, cookie });
+    assert.equal(page.status, 303);
+    assert.equal(page.headers.get("location"), `${PORTAL}/trips/trip_abcdefgh/app`);
+  } finally { revokedUsers.delete("user_abcdefgh"); }
+  // Back in good standing the same cookie works again; an outage then fails closed.
+  assert.equal((await get()).status, 200);
+  checkDown = true;
+  try {
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assert.equal((await get()).status, 401, "when the portal cannot be asked, the answer is no");
+  } finally { checkDown = false; }
+});
+
+test("the JSON launch body still works for compatibility, with the same Origin rule", async () => {
+  const send = (origin) => fetch(`${gatewayOrigin}/t/trip_abcdefgh/__launch`, { method: "POST", redirect: "manual", headers: { "content-type": "application/json", ...(origin ? { origin } : {}) }, body: JSON.stringify({ token: "valid-grant" }) });
+  assert.equal((await send(undefined)).status, 403);
+  assert.equal((await send(PORTAL)).status, 303);
+});
+
+test("an unauthenticated page request redirects to the portal's open-trip route; nothing else is served", async () => {
+  const response = await rawGet("/t/trip_abcdefgh/", NAV);
+  assert.equal(response.status, 303);
+  assert.equal(response.headers.get("location"), `${PORTAL}/trips/trip_abcdefgh/app`);
+  assert.equal(response.headers.get("set-cookie"), null);
+  // A trip the gateway has never heard of answers identically.
+  const unknown = await rawGet("/t/trip_unknown99/", NAV);
+  assert.equal(unknown.status, 303);
+  assert.equal(unknown.headers.get("location"), `${PORTAL}/trips/trip_unknown99/app`);
+  // A deep-link navigation also goes to the portal; an API call or a frame does not.
+  const deep = await rawGet("/t/trip_abcdefgh/classic.html", NAV);
+  assert.equal(deep.status, 303);
+  assert.equal(deep.headers.get("location"), `${PORTAL}/trips/trip_abcdefgh/app`, "no deep path or query is reflected");
+  const withNext = await rawGet("/t/trip_abcdefgh/?next=https://evil.example&return_to=//evil.example", NAV);
+  assert.equal(withNext.headers.get("location"), `${PORTAL}/trips/trip_abcdefgh/app`);
+  const api = await rawGet("/t/trip_abcdefgh/api/config", { "sec-fetch-mode": "cors", "sec-fetch-dest": "empty", accept: "*/*" });
+  assert.equal(api.status, 401);
+  const framed = await rawGet("/t/trip_abcdefgh/", { "sec-fetch-mode": "navigate", "sec-fetch-dest": "iframe" });
+  assert.equal(framed.status, 401);
+  const post = await rawGet("/t/trip_abcdefgh/", NAV, "POST");
+  assert.equal(post.status, 401);
+  // Without Fetch Metadata (older clients) Accept: text/html decides.
+  assert.equal((await rawGet("/t/trip_abcdefgh/", { accept: "text/html" })).status, 303);
+  assert.equal((await rawGet("/t/trip_abcdefgh/", { accept: "application/json" })).status, 401);
+});
+
+test("consumes a trip-bound grant and proxies with the runtime session, now as a top-level page", async () => {
+  const launched = await formLaunch("valid-grant");
+  assert.equal(launched.status, 303);
+  const cookie = launched.headers.get("set-cookie").split(";")[0];
   const cookieValue = decodeURIComponent(cookie.slice("kit_runtime=".length));
   assert.ok(!cookieValue.includes("runtime-jwt"), "the runtime JWT must not be exposed as plaintext cookie content");
   for (const part of cookieValue.split(".")) {
@@ -90,8 +237,16 @@ test("consumes a trip-bound grant once and proxies with the runtime session", as
   assert.equal(response.status, 200);
   assert.equal(proxiedAuthorization, "Bearer runtime-jwt");
   assert.deepEqual(await response.json(), { path: "/api/config?upstream=http://attacker.invalid" });
-  assert.equal(response.headers.get("x-frame-options"), null);
-  assert.equal(response.headers.get("content-security-policy"), "default-src 'self'; frame-ancestors https://app.example.test");
+  // Nothing frames the trip site any more: it is DENY / 'none', not "the portal".
+  assert.equal(response.headers.get("x-frame-options"), "DENY");
+  assert.equal(response.headers.get("content-security-policy"), "default-src 'self'; frame-ancestors 'none'");
+});
+
+test("never serves a postMessage bootstrap or lets anything frame the trip", async () => {
+  const signedOut = await fetch(`${gatewayOrigin}/t/trip_abcdefgh/__signed_out`);
+  assert.match(signedOut.headers.get("content-security-policy"), /frame-ancestors 'none'/);
+  const redirect = await rawGet("/t/trip_abcdefgh/", NAV);
+  assert.ok(!redirect.text.includes("kinerary:runtime-ready"));
 });
 
 test("rejects trip paths without a valid gateway session", async () => {
@@ -107,9 +262,7 @@ test("forwards internal participant existence checks", async () => {
 
 
 test("streams authenticated events without buffering, scopes the cookie, and closes the upstream", async () => {
-  const launched = await fetch(`${gatewayOrigin}/t/trip_abcdefgh/__launch`, {
-    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: "valid-grant" }),
-  });
+  const launched = await formLaunch("valid-grant");
   const cookie = launched.headers.get("set-cookie").split(";")[0];
   const foreign = await fetch(`${gatewayOrigin}/t/trip_other123/api/events`, { headers: { cookie } });
   assert.equal(foreign.status, 401);

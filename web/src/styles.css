@@ -564,10 +564,9 @@ h1 { margin: 0; max-width: 700px; font: 800 clamp(48px, 5.1vw, 78px)/1.01 "Manro
 .invite-list li { display: flex; justify-content: space-between; align-items: center; border-top: 1px solid #e8e3dc; padding: 14px 0; }
 .invite-list small { display: block; color: #73838c; margin-top: 4px; }
 .notice { padding: 14px 16px; background: #fff0e9; border-left: 4px solid var(--coral); border-radius: 8px; color: #7d351d; margin: 15px 0; }
-.runtime-shell { position: fixed; inset: 0; background: white; display: grid; grid-template-rows: 48px 1fr; z-index: 30; }
-.runtime-bar { display: flex; align-items: center; justify-content: space-between; padding: 0 18px; background: var(--ink); color: white; }
-.runtime-bar a { color: white; text-decoration: none; }
-.runtime-shell iframe { width: 100%; height: 100%; border: 0; }
+.runtime-launch { min-height: 100dvh; display: grid; place-content: center; justify-items: center; gap: 14px; padding: 24px; text-align: center; }
+.runtime-launch .route-loading { min-height: 0; }
+.runtime-launch a { color: var(--teal); font-weight: 700; }
 .method-tabs { display: flex; gap: 8px; margin: 22px 0; }
 .method-tabs button { padding: 10px 14px; border: 1px solid #d2dcda; border-radius: 99px; color: #53666f; }
 .method-tabs button.active { color: white; background: var(--teal); border-color: var(--teal); }

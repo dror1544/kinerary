@@ -4,6 +4,7 @@ export interface MiniSdk {
   ready?: () => void;
   expand?: () => void;
   platform?: unknown;
+  openLink?: (url: string, options?: Record<string, unknown>) => void;
   themeParams?: Record<string, unknown>;
   safeAreaInset?: Record<string, unknown>;
   contentSafeAreaInset?: Record<string, unknown>;
@@ -19,20 +20,38 @@ export function safely(operation: (() => void) | undefined) {
   try { if (typeof operation === "function") operation(); } catch { /* Older hosts keep ordinary browser controls. */ }
 }
 
-/** SDK is presentation-only. Never reads initData, users, chats or tokens. */
-export function useMiniSdk(): MiniSdk | null {
-  const [sdk, setSdk] = useState<MiniSdk | null>(availableSdk);
+/** Telegram's browser clients run the Mini App inside a page frame, which a top-level trip site cannot be shown in. */
+const WEB_PLATFORMS = new Set(["web", "weba", "webk"]);
+export function isWebClient(sdk: MiniSdk | null): boolean {
+  return typeof sdk?.platform === "string" && WEB_PLATFORMS.has(sdk.platform);
+}
+
+export interface MiniSdkState { sdk: MiniSdk | null; settled: boolean }
+
+/**
+ * SDK is presentation-only. Never reads initData, users, chats or tokens.
+ * `settled` says whether the script has finished loading (or failed, or been
+ * given up on after a few seconds), so the trip launcher knows the platform
+ * before it chooses between submitting in place and handing a browser tab the link.
+ */
+export function useMiniSdkState(): MiniSdkState {
+  const [state, setState] = useState<MiniSdkState>(() => { const sdk = availableSdk(); return { sdk, settled: Boolean(sdk) }; });
   useEffect(() => {
-    if (availableSdk()) { setSdk(availableSdk()); return; }
+    if (availableSdk()) { setState({ sdk: availableSdk(), settled: true }); return; }
     const script = document.createElement("script");
     script.src = "https://telegram.org/js/telegram-web-app.js";
     script.async = true;
-    script.onload = () => setSdk(availableSdk());
-    script.onerror = () => setSdk(null);
+    const giveUp = window.setTimeout(() => setState((current) => current.settled ? current : { sdk: availableSdk(), settled: true }), 4000);
+    script.onload = () => setState({ sdk: availableSdk(), settled: true });
+    script.onerror = () => setState({ sdk: null, settled: true });
     document.head.append(script);
-    return () => { script.onload = null; script.onerror = null; script.remove(); };
+    return () => { window.clearTimeout(giveUp); script.onload = null; script.onerror = null; script.remove(); };
   }, []);
-  return sdk;
+  return state;
+}
+
+export function useMiniSdk(): MiniSdk | null {
+  return useMiniSdkState().sdk;
 }
 
 export function miniStyles(sdk: MiniSdk | null): CSSProperties {

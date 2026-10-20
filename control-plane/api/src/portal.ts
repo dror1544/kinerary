@@ -8,6 +8,14 @@ import { ensureUnknownPasswordCredential, resolveOrCreateEmailAccount, verifyPas
 import { generatePlan } from "./planner.js";
 import { issueApproval } from "./plan-approval.js";
 
+// The gateway's key, compared in constant time (a plain !== leaks how many
+// leading bytes were right).
+function exchangeKeyMatches(supplied: unknown, expected: string): boolean {
+  if (typeof supplied !== "string" || !expected) return false;
+  const a = Buffer.from(supplied), b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 function opaque(prefix: string, bytes = 16): string {
   return `${prefix}_${randomBytes(bytes).toString("hex")}`;
 }
@@ -874,7 +882,7 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
   });
 
   app.post("/internal/runtime-launch/consume", async (request, reply) => {
-    if (request.headers["x-api-key"] !== deps.runtimeExchangeKey) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+    if (!exchangeKeyMatches(request.headers["x-api-key"], deps.runtimeExchangeKey)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
     const token = (request.body as Record<string, unknown>)?.token;
     if (typeof token !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
     const result = await deps.db.query<{ id: string; trip_id: string; user_id: string; role: string; runtime_username: string | null }>(
@@ -888,11 +896,35 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
           ORDER BY i.redeemed_at DESC LIMIT 1) AS runtime_username`, [sha256(token)]);
     const row = result.rows[0];
     if (!row) return reply.code(401).send({ error: "LAUNCH_INVALID" });
-    return { tripId: row.trip_id, userId: row.user_id, role: row.role, runtimeUsername: row.runtime_username, audience: "runtime_gateway" };
+    // The way back to the dashboard, from this deployment's own configured
+    // portal origin (no hostname in code). Only an owner/organizer has a
+    // dashboard; the trip still re-checks the role before it serves the URL.
+    const dashboardUrl = row.role === "member" ? null : `${deps.publicOrigin}/trips/${row.trip_id}/setup`;
+    return { tripId: row.trip_id, userId: row.user_id, role: row.role, runtimeUsername: row.runtime_username, dashboardUrl, audience: "runtime_gateway" };
+  });
+
+  // Asked by the gateway (at most every 30 s per person and trip) before it serves
+  // a request on a sealed cookie: is this person still signed in to the portal,
+  // still active, and still entitled to this trip? Signing out of the portal,
+  // being removed or being disabled therefore ends the trip session too.
+  // Interim: "signed in" means at least one live portal session for the person;
+  // binding to the exact session that launched needs a column on the grant.
+  app.post("/internal/runtime-sessions/check", async (request, reply) => {
+    if (!exchangeKeyMatches(request.headers["x-api-key"], deps.runtimeExchangeKey)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+    const { tripId, userId } = (request.body ?? {}) as Record<string, unknown>;
+    if (typeof tripId !== "string" || typeof userId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+    const result = await deps.db.query(
+      `SELECT 1 FROM control_plane.trip_memberships m
+       JOIN control_plane.users u ON u.id = m.user_id AND u.status = 'active'
+       WHERE m.trip_id = $1 AND m.user_id = $2 AND m.status = 'active' AND m.runtime_access = true
+         AND EXISTS (SELECT 1 FROM control_plane.web_sessions s WHERE s.user_id = m.user_id AND s.revoked_at IS NULL AND s.expires_at > now())`,
+      [tripId, userId]);
+    if (!result.rows[0]) return reply.code(401).send({ error: "SESSION_REVOKED" });
+    return { live: true };
   });
 
   app.get("/internal/runtime-routes/:tripId", async (request, reply) => {
-    if (request.headers["x-api-key"] !== deps.runtimeExchangeKey) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+    if (!exchangeKeyMatches(request.headers["x-api-key"], deps.runtimeExchangeKey)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
     const tripId = (request.params as { tripId?: string }).tripId ?? "";
     const result = await deps.db.query<{ route_ref: string; private_url: string | null }>(
       `SELECT r.route_ref, j.result->>'private_url' AS private_url
