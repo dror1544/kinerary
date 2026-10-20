@@ -663,8 +663,9 @@ export async function setGroupProactiveLevel(
  *
  * Two proofs, either enough, both server-side facts and neither read from the
  * message: the trip's own person link says so (0051, written at provisioning),
- * or the sender's verified Telegram identity (0052) belongs to a user holding
- * an active OWNER membership on this trip. Unknown, an anonymous group admin
+ * or the sender's verified Telegram identity is linked, FOR THIS TRIP
+ * (telegram_organizer_trip_links; a trip the organizer unlinked does not count),
+ * to a user holding an active OWNER membership on it. Unknown, an anonymous group admin
  * and a failed lookup are all "no" - a command that changes how the whole room
  * is involved is not offered to a stranger.
  *
@@ -678,9 +679,9 @@ export async function isTripOrganizer(db: pg.Pool, tripId: string, telegramUserI
   if (!isPrivateChatId(telegramUserId)) return false;
   const result = await db.query(
     `SELECT 1
-       FROM control_plane.telegram_organizer_links l
-       JOIN control_plane.trip_memberships m ON m.user_id = l.user_id
-      WHERE l.telegram_subject_digest = $2
+       FROM control_plane.telegram_organizer_trip_links l
+       JOIN control_plane.trip_memberships m ON m.user_id = l.user_id AND m.trip_id = l.trip_id
+      WHERE l.telegram_subject_digest = $2 AND l.revoked_at IS NULL
         AND m.trip_id = $1 AND m.role = 'owner' AND m.status = 'active'
       LIMIT 1`,
     [tripId, digestTelegramId(telegramUserId)],

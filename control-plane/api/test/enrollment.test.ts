@@ -64,6 +64,7 @@ async function teardownFixture(fixture: TestFixture) {
   // Delete in FK-safe order
   await pool.query("DELETE FROM control_plane.intake_sessions WHERE trip_id = ANY($1)", [[draftTripId, otherTripId]]);
   await pool.query("DELETE FROM control_plane.interview_enrollments WHERE trip_id = ANY($1)", [[draftTripId, otherTripId]]);
+  await pool.query("DELETE FROM control_plane.telegram_organizer_trip_links WHERE trip_id = ANY($1)", [[draftTripId, otherTripId]]);
   await pool.query("DELETE FROM control_plane.trip_memberships WHERE trip_id = ANY($1)", [[draftTripId, otherTripId]]);
   await pool.query("DELETE FROM control_plane.trips WHERE id = ANY($1)", [[draftTripId, otherTripId]]);
   await pool.query("DELETE FROM control_plane.telegram_organizer_links WHERE user_id = ANY($1)", [[ownerId, nonOwnerId]]);

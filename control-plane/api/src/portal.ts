@@ -11,9 +11,10 @@ import { removeMember } from "./member-removal.js";
 import { structuredLog } from "./redaction.js";
 import {
   TRIP_ID_PATTERN, claimSessionSlot, enqueueSignInNotice, linkMemberOrSkip,
-  listTelegramLinks, recordLinkSignIn, resolveMiniAppLaunch, unlinkTelegramLink,
+  recordLinkSignIn, resolveMiniAppLaunch, telegramLinksByTrip, unlinkTelegramLink,
   type TelegramMiniAppConfig,
 } from "./telegram-mini-app.js";
+import { issueTelegramLinkToken } from "./telegram-link-token.js";
 import { verifyMiniAppInitData, type VerifiedInitData } from "./telegram-webapp-auth.js";
 
 function opaque(prefix: string, bytes = 16): string {
@@ -64,9 +65,28 @@ function parseCookies(header: unknown): Record<string, string> {
   }));
 }
 
-function cookie(name: string, value: string, options: { maxAge?: number; httpOnly?: boolean; secure?: boolean } = {}): string {
-  const pieces = [`${name}=${encodeURIComponent(value)}`, "Path=/", "SameSite=Lax"];
+/**
+ * `crossSite` is the COOKIE VARIANT FOR A MINI APP RUNNING INSIDE A FRAME ON
+ * ANOTHER SITE — Telegram Web (web.telegram.org) embeds the portal in a
+ * cross-site iframe, where a `SameSite=Lax` cookie is never sent and a
+ * Mini App that cannot hold a session cannot sign anyone in.
+ *
+ *   SameSite=None   so the browser sends it from inside that frame;
+ *   Secure          which `None` requires, so an http origin (local dev) keeps
+ *                   the Lax cookie rather than emit one browsers would drop;
+ *   Partitioned     CHIPS: the browser keys the cookie to the TOP-LEVEL site
+ *                   that was framing us when it was set (web.telegram.org), so
+ *                   it is sent only back inside that same embedding — not to
+ *                   a page on any other site that frames or requests us.
+ *
+ * Only the Mini App's own sign-in asks for it (`embedded` in the request, set
+ * by the page when it finds itself in a frame). The ordinary portal keeps Lax.
+ */
+function cookie(name: string, value: string, options: { maxAge?: number; httpOnly?: boolean; secure?: boolean; crossSite?: boolean } = {}): string {
+  const crossSite = options.crossSite === true && options.secure !== false;
+  const pieces = [`${name}=${encodeURIComponent(value)}`, "Path=/", crossSite ? "SameSite=None" : "SameSite=Lax"];
   if (options.secure !== false) pieces.push("Secure");
+  if (crossSite) pieces.push("Partitioned");
   if (options.httpOnly !== false) pieces.push("HttpOnly");
   if (options.maxAge !== undefined) pieces.push(`Max-Age=${options.maxAge}`);
   return pieces.join("; ");
@@ -192,6 +212,8 @@ export interface PortalDependencies {
    * so: the feature is off, and says it is off.
    */
   telegramMiniApp?: TelegramMiniAppConfig & { log?: (line: string) => void };
+  /** How long a dashboard-issued Telegram link works. Defaults to 15 minutes. */
+  telegramLinkTtlSeconds?: number;
 }
 
 interface PortalUser {
@@ -240,17 +262,37 @@ async function createWebSession(client: pg.PoolClient, userId: string, ttlSecond
   return { sessionToken, csrf };
 }
 
-function setWebSessionCookies(reply: FastifyReply, deps: PortalDependencies, session: { sessionToken: string; csrf: string }): void {
+function setWebSessionCookies(
+  reply: FastifyReply, deps: PortalDependencies, session: { sessionToken: string; csrf: string },
+  options: { embedded?: boolean } = {},
+): void {
   const secure = deps.publicOrigin.startsWith("https://");
+  const crossSite = options.embedded === true;
   reply.header("set-cookie", [
-    cookie("kit_session", session.sessionToken, { maxAge: deps.sessionTtlSeconds, secure }),
-    cookie("kit_csrf", session.csrf, { maxAge: deps.sessionTtlSeconds, httpOnly: false, secure }),
+    cookie("kit_session", session.sessionToken, { maxAge: deps.sessionTtlSeconds, secure, crossSite }),
+    cookie("kit_csrf", session.csrf, { maxAge: deps.sessionTtlSeconds, httpOnly: false, secure, crossSite }),
   ]);
 }
 
-function clearWebSessionCookies(reply: FastifyReply, deps: PortalDependencies): void {
+/**
+ * Expires BOTH variants. A cookie is identified by name, domain, path AND (for
+ * the partitioned one) its partition, so a Lax expiry does not touch the
+ * partitioned cookie a Mini App session set, and the other way round.
+ */
+function expiredSessionCookies(deps: PortalDependencies): string[] {
   const secure = deps.publicOrigin.startsWith("https://");
-  reply.header("set-cookie", [cookie("kit_session", "", { maxAge: 0, secure }), cookie("kit_csrf", "", { maxAge: 0, httpOnly: false, secure })]);
+  const out = [cookie("kit_session", "", { maxAge: 0, secure }), cookie("kit_csrf", "", { maxAge: 0, httpOnly: false, secure })];
+  if (secure) out.push(cookie("kit_session", "", { maxAge: 0, secure, crossSite: true }), cookie("kit_csrf", "", { maxAge: 0, httpOnly: false, secure, crossSite: true }));
+  return out;
+}
+
+function clearWebSessionCookies(reply: FastifyReply, deps: PortalDependencies): void {
+  reply.header("set-cookie", expiredSessionCookies(deps));
+}
+
+/** The page found itself in a frame on another site and says so; it can only ever weaken its own cookie. */
+function embeddedRequest(body: Record<string, unknown>): boolean {
+  return body.embedded === true;
 }
 
 /** An Origin that is present, is not the literal "null" of a sandboxed/opaque origin, and is ours. */
@@ -413,6 +455,9 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
     } : null,
     runtimeReady,
     members,
+    // Which Telegram accounts can open THIS trip as the viewer: the card's
+    // linked / not-linked icon and its ⋮ menu's Unlink entries.
+    telegram: { links: (await telegramLinksByTrip(deps.db, userId, [tripId])).get(tripId) ?? [] },
     invites: invitesResult.rows.map((invite) => ({
       id: invite.id, displayName: invite.intended_display_name, runtimeUsername: invite.runtime_username,
       status: invite.state === "unused" && invite.expires_at.getTime() < Date.now() ? "expired" : invite.state,
@@ -449,6 +494,7 @@ async function memberTripSummary(deps: PortalDependencies, tripId: string, userI
     endDate: row.end_date,
     permissions: { role: row.role, dashboard: false, runtime: row.runtime_access, invite: false, requestProvisioning: false },
     runtimeReady: row.runtime_ready,
+    telegram: { links: (await telegramLinksByTrip(deps.db, userId, [tripId])).get(tripId) ?? [] },
   };
 }
 
@@ -607,7 +653,7 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
           : 0;
         await revokeIncoming(client);
         await client.query("COMMIT");
-        setWebSessionCookies(reply, deps, session);
+        setWebSessionCookies(reply, deps, session, { embedded: embeddedRequest(body) });
         miniAppLog(structuredLog("info", "mini_app.sign_in", { outcome: "session", link_kind: outcome.target.linkKind, first_use: used.first, notices_queued: noticesQueued }));
         return { kind: "session", appPath: outcome.target.appPath, ...(outcome.notice ? { notice: outcome.notice } : {}) };
       }
@@ -625,15 +671,9 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
     }
   });
 
-  // The signed-in user's own view of every Telegram account that can sign in as
-  // them, and the way to end one. Any signed-in user, member or organizer: the
-  // list is about THEIR account.
-  app.get("/v1/account/telegram-links", async (request, reply) => {
-    const user = await requireUser(request, reply, deps);
-    if (!user) return;
-    reply.header("cache-control", "private, no-store");
-    return { miniAppEnabled: Boolean(deps.telegramMiniApp?.enabled()), links: await listTelegramLinks(deps.db, user.id) };
-  });
+  // Ends one Telegram link — one TRIP's link — of the signed-in user's own, with
+  // the sessions it opened. The trip card (GET /v1/trips) says which links exist;
+  // this is the ⋮ menu's Unlink. Any signed-in user, member or organizer.
   app.delete("/v1/account/telegram-links/:linkId", async (request, reply) => {
     const user = await requireMutation(request, reply, deps);
     if (!user) return;
@@ -773,7 +813,7 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
         }
       }
       await client.query("COMMIT");
-      setWebSessionCookies(reply, deps, session);
+      setWebSessionCookies(reply, deps, session, { embedded: embeddedRequest(body) });
       const appPath = typeof body.returnTo === "string" ? validatedReturnTo(body.returnTo) : `/trips/${tripId}/app`;
       return { appPath, ...(telegramLink ? { telegramLink } : {}) };
     } catch (error) {
@@ -793,8 +833,7 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
     if (!user) return;
     const raw = parseCookies(request.headers.cookie).kit_session;
     await deps.db.query("UPDATE control_plane.web_sessions SET revoked_at = now() WHERE token_digest = $1", [sha256(raw ?? "")]);
-    const secure = deps.publicOrigin.startsWith("https://");
-    reply.header("set-cookie", [cookie("kit_session", "", { maxAge: 0, secure }), cookie("kit_csrf", "", { maxAge: 0, httpOnly: false, secure })]);
+    clearWebSessionCookies(reply, deps);
     return { ok: true };
   });
 
@@ -868,6 +907,32 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
       enrollmentId: result.enrollmentId,
       deepLink: `https://t.me/${deps.telegramBotUsername}?start=${encodeURIComponent(result.token)}`,
       expiresAt: result.expiresAt.toISOString(),
+    });
+  });
+
+  // The trip card's "Link Telegram": a one-time, short-lived deep link that links
+  // WHICHEVER Telegram account opens it to the signed-in organizer, for this trip
+  // only. The session and CSRF token prove the account; the bot's verified update
+  // proves the Telegram identity (telegram-link-token.ts). This is the only way
+  // back after an Unlink — an interview link, which may have been forwarded,
+  // does not undo one.
+  const linkTokenAttempts: Attempts = new Map();
+  app.post("/v1/trips/:id/telegram-link", async (request, reply) => {
+    const user = await requireMutation(request, reply, deps);
+    if (!user) return;
+    reply.header("cache-control", "private, no-store");
+    // A person asks a handful of times, not hundreds; the cap bounds the churn
+    // of revoked rows and the memory the limiter holds.
+    if (!admitLogin(linkTokenAttempts, user.id, 10)) {
+      return reply.header("retry-after", "60").code(429).send({ error: "RATE_LIMITED" });
+    }
+    const tripId = (request.params as { id?: string }).id ?? "";
+    const issued = await issueTelegramLinkToken(deps.db, { userId: user.id, tripId, ttlSeconds: deps.telegramLinkTtlSeconds });
+    // Not a trip they run, not a trip at all, retired: one answer.
+    if (!issued.ok) return reply.code(404).send({ error: "NOT_FOUND" });
+    return reply.code(201).send({
+      deepLink: `https://t.me/${deps.telegramBotUsername}?start=${encodeURIComponent(issued.token)}`,
+      expiresAt: issued.expiresAt.toISOString(),
     });
   });
 

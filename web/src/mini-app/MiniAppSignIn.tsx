@@ -4,11 +4,8 @@ import { useForm } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router-dom";
 import { getMe, passwordSignIn, safeReturnTo, telegramMiniAppSignIn, type MiniAppSignInResult, type MiniAppTrip } from "../api";
 import { digestInitData, launchMarker } from "./launch";
-import { openedByTelegram, readLaunch, stripLaunchFragment, type MiniLaunch, type MiniSdk } from "./sdk";
+import { isEmbedded, openedByTelegram, readLaunch, stripLaunchFragment, type MiniLaunch, type MiniSdk } from "./sdk";
 import { tripUsernameInputProps, tripUsernameRegisterOptions } from "./username";
-
-/** Telegram Web (web.telegram.org) runs Mini Apps in a cross-site iframe where our cookies are not sent. */
-const UNSUPPORTED_PLATFORMS = new Set(["web", "weba", "webk"]);
 
 type View =
   | { name: "checking" }
@@ -60,9 +57,16 @@ export default function MiniAppSignIn({ sdk, settled, children }: { sdk: MiniSdk
 
   // Whatever the exchange concluded, the page's cached data belonged to whoever
   // held the WebView before: drop it.
-  const settle = (result: MiniAppSignInResult, digest: string | null) => {
+  const settle = async (result: MiniAppSignInResult, digest: string | null) => {
     queryClient.clear();
     if (result.kind === "session") {
+      // Inside Telegram Web the session is a partitioned cross-site cookie. Some
+      // browsers (Safari, a Chrome with third-party cookies blocked) refuse it
+      // without saying so, and a sign-in that cannot be read back would leave
+      // the person on a blank page. Ask once, and say so if it did not stick.
+      if (isEmbedded(launch.current?.platform ?? null)) {
+        try { await getMe(); } catch { launchMarker.clear(); setView({ name: "unsupported" }); return; }
+      }
       if (digest) launchMarker.write(digest);
       if (result.notice) setBanner("That trip isn't available to your account. Here is what is.");
       // The launch fragment goes with it until the SDK has read it (stripLaunchFragment, below).
@@ -96,14 +100,13 @@ export default function MiniAppSignIn({ sdk, settled, children }: { sdk: MiniSdk
     launch.current = found;
     (async () => {
       if (!found.initData) { setView({ name: "message", kind: "invalid" }); return; }
-      if (found.platform && UNSUPPORTED_PLATFORMS.has(found.platform)) { setView({ name: "unsupported" }); return; }
       const digest = await digestInitData(found.initData);
       // A reload of a launch that already signed in: the cookie session is still
       // good, so the launch string is not sent again (it has a cap).
       if (launchMarker.read() === digest) {
         try { await getMe(); setView({ name: "open" }); return; } catch { launchMarker.clear(); }
       }
-      settle(await telegramMiniAppSignIn({ initData: found.initData }), digest);
+      await settle(await telegramMiniAppSignIn({ initData: found.initData, embedded: isEmbedded(found.platform) }), digest);
     })();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [telegram, sdk, settled]);
@@ -119,7 +122,7 @@ export default function MiniAppSignIn({ sdk, settled, children }: { sdk: MiniSdk
     const found = launch.current;
     if (!found?.initData) return;
     setView({ name: "checking" });
-    settle(await telegramMiniAppSignIn({ initData: found.initData, tripId }), await digestInitData(found.initData));
+    await settle(await telegramMiniAppSignIn({ initData: found.initData, tripId, embedded: isEmbedded(found.platform) }), await digestInitData(found.initData));
   };
 
   const shell = (title: string, body: ReactNode) => (
@@ -132,7 +135,7 @@ export default function MiniAppSignIn({ sdk, settled, children }: { sdk: MiniSdk
 
   if (view.name === "checking" || view.name === "opening") return shell("Signing you in…", <p role="status">Checking your Telegram account.</p>);
   if (view.name === "unsupported") {
-    return shell("Open Kinerary in the Telegram app", <p>Telegram Web can't keep you signed in to Kinerary. Open this chat in the Telegram app on your phone or desktop.</p>);
+    return shell("Open Kinerary in the Telegram app", <p>Your browser didn't keep the sign-in inside Telegram Web — it blocks cookies from sites opened in another site's frame. Open this chat in the Telegram app on your phone or desktop, or allow third-party cookies for web.telegram.org and try again.</p>);
   }
   if (view.name === "message") return shell(messages[view.kind].title, <p>{messages[view.kind].body}</p>);
   if (view.name === "choose") {
@@ -151,6 +154,7 @@ export default function MiniAppSignIn({ sdk, settled, children }: { sdk: MiniSdk
     return shell("Sign in to this trip", <TripPasswordForm
       tripId={view.tripId}
       initData={launch.current?.initData ?? null}
+      platform={launch.current?.platform ?? null}
       onSignedIn={(appPath, note) => {
         queryClient.clear();
         if (launch.current?.initData) void digestInitData(launch.current.initData).then(launchMarker.write);
@@ -166,12 +170,13 @@ export default function MiniAppSignIn({ sdk, settled, children }: { sdk: MiniSdk
   return <>{banner && <p className="notice" role="status">{banner}</p>}{children}</>;
 }
 
-function TripPasswordForm({ tripId, initData, onSignedIn }: { tripId: string; initData: string | null; onSignedIn: (appPath: string, note: string | null) => void }) {
+function TripPasswordForm({ tripId, initData, platform, onSignedIn }: { tripId: string; initData: string | null; platform: string | null; onSignedIn: (appPath: string, note: string | null) => void }) {
   const form = useForm<{ runtimeUsername: string; password: string; remember: boolean }>({ defaultValues: { runtimeUsername: "", password: "", remember: false } });
   const returnTo = `/mini-app/trips/${tripId}`;
   const signIn = useMutation({
     mutationFn: (values: { runtimeUsername: string; password: string; remember: boolean }) => passwordSignIn({
       tripId, returnTo, runtimeUsername: values.runtimeUsername, password: values.password,
+      ...(isEmbedded(platform) ? { embedded: true as const } : {}),
       // The consent flag travels WITH the credential, in this one request, or not at all.
       ...(values.remember && initData ? { telegramLink: { initData, consent: true as const } } : {}),
     }),
@@ -188,7 +193,7 @@ function TripPasswordForm({ tripId, initData, onSignedIn }: { tripId: string; in
       <label>Trip username<input {...tripUsernameInputProps} {...form.register("runtimeUsername", tripUsernameRegisterOptions)} /></label>
       <label>Password<input required minLength={8} type="password" autoComplete="current-password" {...form.register("password")} /></label>
       <label className="checkbox-row"><input type="checkbox" {...form.register("remember")} /> Next time, open with Telegram</label>
-      <p className="subtle">Links this Telegram account to your trip sign-in. You can remove it later under "Telegram accounts that can sign in as you".</p>
+      <p className="subtle">Links this Telegram account to your trip sign-in. You can remove it later from that trip's Telegram menu (the three dots) on My trips.</p>
       <button className="button wide" disabled={signIn.isPending}>{signIn.isPending ? "Signing in…" : "Continue with trip password"}</button>
       {signIn.isError && <div className="notice" role="alert">{signIn.error.message}</div>}
     </form>

@@ -57,6 +57,21 @@ export function readLaunch(sdk: MiniSdk | null): MiniLaunch {
   return { initData: fromSdk ?? (fromHash && fromHash.length > 0 ? fromHash : null), platform: platform || null };
 }
 
+/** Telegram's own names for the web clients, which run Mini Apps in an iframe on web.telegram.org. */
+const WEB_CLIENT_PLATFORMS = new Set(["web", "weba", "webk"]);
+
+/**
+ * Is this page inside a frame on another site? True in Telegram Web, where a
+ * `SameSite=Lax` cookie is never sent and the session has to be the partitioned
+ * cross-site variant. Both signals count: the frame itself (`window.top`, which
+ * throws across origins — also "embedded"), and the platform Telegram reports,
+ * which is definitive for its own web clients.
+ */
+export function isEmbedded(platform: string | null): boolean {
+  if (platform && WEB_CLIENT_PLATFORMS.has(platform)) return true;
+  try { return window.self !== window.top; } catch { return true; }
+}
+
 /** Removes the launch fragment from the address bar (and so from history, screenshots, logs and shares). */
 export function stripLaunchFragment(): void {
   if (!new URLSearchParams(window.location.hash.slice(1)).has("tgWebAppData")) return;

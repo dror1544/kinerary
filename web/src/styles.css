@@ -540,6 +540,16 @@ h1 { margin: 0; max-width: 700px; font: 800 clamp(48px, 5.1vw, 78px)/1.01 "Manro
 .product-shell .trip-card p { margin: 0; color: #60727f; }
 .product-shell .trip-card small { margin: 8px 0 26px; color: #7a8991; }
 .product-shell .trip-card .button { margin-top: auto; }
+.product-shell .trip-card-head { display: flex; justify-content: space-between; align-items: center; width: 100%; }
+.telegram-status { position: relative; display: flex; align-items: center; gap: 2px; }
+.telegram-icon { display: inline-grid; place-items: center; width: 28px; height: 28px; border-radius: 50%; color: #8a979d; background: #f1f3f2; }
+.telegram-icon.linked { color: #167b74; background: #e9f7f5; }
+.telegram-kebab { font-size: 20px; line-height: 1; min-width: 28px; min-height: 28px; }
+.telegram-menu { position: absolute; z-index: 5; top: calc(100% + 6px); right: 0; width: 290px; display: grid; gap: 6px; text-align: left; background: white; border: 1px solid #e5e0d8; border-radius: 14px; padding: 12px; box-shadow: 0 18px 40px rgba(16,38,58,.16); }
+.telegram-menu .subtle, .telegram-menu small { margin: 0; color: #60727f; }
+.telegram-menu .text-button { text-align: left; display: grid; gap: 2px; }
+.product-shell .telegram-menu small { margin: 0; }
+.telegram-issued, .telegram-confirm { display: grid; gap: 8px; padding: 8px; border-radius: 10px; background: #eaf7f5; }
 .status-chip { display: inline-flex; border-radius: 99px; background: #e9f7f5; color: #167b74; padding: 7px 10px; font-size: 11px; font-weight: 800; }
 .product-shell .empty-state { text-align: center; padding: 70px 30px; }
 .product-shell .empty-state h2 { font-size: 32px; }

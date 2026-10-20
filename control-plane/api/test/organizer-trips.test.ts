@@ -15,7 +15,7 @@ import { applyMigrations } from "../src/migrations.js";
 import { issueEnrollment } from "../src/enrollment.js";
 import { startFromDeepLink, switchCallbackData, parseCallbackData, parseInbound } from "../src/chat-router.js";
 import { dispatchUpdate, DEFAULT_STRINGS } from "../src/relay/dispatch.js";
-import { listOrganizerTrips, switchChatToTrip } from "../src/organizer-trips.js";
+import { linkTelegramOrganizerInTx, listOrganizerTrips, switchChatToTrip } from "../src/organizer-trips.js";
 import { isTripOrganizer } from "../src/chat-router.js";
 import { unlinkTelegramLink } from "../src/telegram-mini-app.js";
 import { digestTelegramId } from "../src/identity.js";
@@ -100,9 +100,9 @@ async function withFixture(fn: (fix: Fixture) => Promise<void>): Promise<void> {
       );
       if (chat) {
         await pool.query(
-          `INSERT INTO control_plane.telegram_organizer_links(id, user_id, telegram_subject_digest, verified_via)
-           VALUES ($1,$2,$3,'enrollment_redemption')`,
-          [testId("tol"), userId, digestTelegramId(chat)],
+          `INSERT INTO control_plane.telegram_organizer_trip_links(id, user_id, trip_id, telegram_subject_digest, verified_via)
+           VALUES ($1,$2,$3,$4,'enrollment_redemption')`,
+          [testId("otl"), userId, tripId, digestTelegramId(chat)],
         );
       }
       return tripId;
@@ -554,7 +554,7 @@ describe("the identity link the commands depend on (DB)", { skip: SKIP }, () => 
         "SELECT user_id FROM control_plane.trip_memberships WHERE trip_id = $1", [italyId]);
       const ownerId = rows[0]?.user_id ?? "";
       await pool.query("UPDATE control_plane.trips SET lifecycle_state = 'draft' WHERE id = $1", [italyId]);
-      await pool.query("DELETE FROM control_plane.telegram_organizer_links WHERE user_id = $1", [ownerId]);
+      await pool.query("DELETE FROM control_plane.telegram_organizer_trip_links WHERE user_id = $1", [ownerId]);
 
       const issued = await issueEnrollment(pool, ownerId, italyId, { enrollmentTtlSeconds: 900 });
       assert.equal(issued.ok, true);
@@ -563,15 +563,20 @@ describe("the identity link the commands depend on (DB)", { skip: SKIP }, () => 
       const started = await startFromDeepLink(pool, "606060606", issued.token);
       assert.equal(started.kind, "started");
 
-      const link = await pool.query<{ user_id: string; verified_via: string }>(
-        "SELECT user_id, verified_via FROM control_plane.telegram_organizer_links WHERE telegram_subject_digest = $1",
+      // One row, FOR THIS TRIP — not an account-wide row. The table the previous
+      // release read is not written any more.
+      const link = await pool.query<{ user_id: string; trip_id: string; verified_via: string }>(
+        "SELECT user_id, trip_id, verified_via FROM control_plane.telegram_organizer_trip_links WHERE telegram_subject_digest = $1",
         [digestTelegramId("606060606")],
       );
-      assert.deepEqual(link.rows, [{ user_id: ownerId, verified_via: "enrollment_redemption" }]);
+      assert.deepEqual(link.rows, [{ user_id: ownerId, trip_id: italyId, verified_via: "enrollment_redemption" }]);
+      const legacy = await pool.query(
+        "SELECT 1 FROM control_plane.telegram_organizer_links WHERE telegram_subject_digest = $1", [digestTelegramId("606060606")]);
+      assert.equal(legacy.rowCount, 0, "no account-wide row is written any more");
     });
   });
 
-  test("the backfill recovers links from interviews that already happened", async () => {
+  test("the backfill (0052) and the per-trip snapshot (20261021120000) recover links from interviews that already happened", async () => {
     await withFixture(async ({ pool, italyId, japanId }) => {
       const owners = await pool.query<{ user_id: string; trip_id: string }>(
         "SELECT user_id, trip_id FROM control_plane.trip_memberships WHERE trip_id = ANY($1)", [[italyId, japanId]]);
@@ -583,20 +588,30 @@ describe("the identity link the commands depend on (DB)", { skip: SKIP }, () => 
           [testId("sess"), row.trip_id, row.user_id, enrollmentId, `sha256:${randomBytes(32).toString("hex")}`, ORGANIZER_CHAT],
         );
       }
-      // Erase the links and re-run the migration's OWN backfill statement, so
-      // this tests the shipped SQL rather than a paraphrase of it.
+      // Erase the links and re-run the migrations' OWN statements — 0052's
+      // backfill into the account-wide table, then the snapshot that turns each
+      // account-wide row into per-trip rows — so this tests the shipped SQL
+      // rather than a paraphrase of it.
+      await pool.query("DELETE FROM control_plane.telegram_organizer_trip_links");
       await pool.query("DELETE FROM control_plane.telegram_organizer_links");
       const sql = await readFile(`${migrationsDir}/0052_telegram_organizer_links.sql`, "utf8");
       const backfill = sql.slice(sql.lastIndexOf("INSERT INTO control_plane.telegram_organizer_links"));
+      const perTrip = await readFile(`${migrationsDir}/20261021120000_telegram_organizer_trip_links.sql`, "utf8");
+      const snapshot = perTrip.slice(
+        perTrip.indexOf("INSERT INTO control_plane.telegram_organizer_trip_links"),
+        perTrip.indexOf(";", perTrip.indexOf("INSERT INTO control_plane.telegram_organizer_trip_links")) + 1,
+      );
       await pool.query(backfill);
+      await pool.query(snapshot);
 
       const trips = await listOrganizerTrips(pool, ORGANIZER_CHAT, ORGANIZER_CHAT);
       assert.deepEqual(trips.map((t) => t.slug).sort(), ["italy-2026", "japan-2026"]);
 
-      // Idempotent: the migration is re-runnable and so is its backfill.
+      // Idempotent: the migrations are re-runnable and so are their backfills.
       await pool.query(backfill);
+      await pool.query(snapshot);
       const count = await pool.query<{ c: string }>(
-        "SELECT count(*) AS c FROM control_plane.telegram_organizer_links WHERE telegram_subject_digest = $1",
+        "SELECT count(*) AS c FROM control_plane.telegram_organizer_trip_links WHERE telegram_subject_digest = $1",
         [digestTelegramId(ORGANIZER_CHAT)],
       );
       assert.equal(count.rows[0]?.c, "2");
@@ -612,6 +627,18 @@ describe("the identity link the commands depend on (DB)", { skip: SKIP }, () => 
       const sql = await readFile(`${migrationsDir}/0052_telegram_organizer_links.sql`, "utf8");
       const count = async () =>
         (await pool.query<{ n: number }>("SELECT count(*)::int AS n FROM control_plane.telegram_organizer_links")).rows[0]?.n;
+      const before = await count();
+      await pool.query(sql);
+      await pool.query(sql);
+      assert.equal(await count(), before);
+    });
+  });
+
+  test("the per-trip migration re-runs harmlessly too", async () => {
+    await withFixture(async ({ pool }) => {
+      const sql = await readFile(`${migrationsDir}/20261021120000_telegram_organizer_trip_links.sql`, "utf8");
+      const count = async () =>
+        (await pool.query<{ n: number }>("SELECT count(*)::int AS n FROM control_plane.telegram_organizer_trip_links")).rows[0]?.n;
       const before = await count();
       await pool.query(sql);
       await pool.query(sql);
@@ -704,13 +731,12 @@ describe("a returning organizer's second trip (DB)", { skip: SKIP }, () => {
 });
 
 describe("an unlinked Telegram account loses the bot too (DB)", { skip: SKIP }, () => {
-  // A telegram_organizer_links row is also a Mini App sign-in path (#442), so
-  // "revocable" has to mean revoked everywhere it is read, not only where it signs in.
+  // An organizer link is also a Mini App sign-in path (#442), so "revocable"
+  // has to mean revoked everywhere it is read, not only where it signs in.
   async function linkOf(pool: pg.Pool, tripId: string) {
     const { rows } = await pool.query<{ id: string; user_id: string }>(
-      `SELECT l.id, l.user_id FROM control_plane.telegram_organizer_links l
-         JOIN control_plane.trip_memberships m ON m.user_id = l.user_id
-        WHERE m.trip_id = $1 AND l.telegram_subject_digest = $2`,
+      `SELECT l.id, l.user_id FROM control_plane.telegram_organizer_trip_links l
+        WHERE l.trip_id = $1 AND l.telegram_subject_digest = $2 AND l.revoked_at IS NULL`,
       [tripId, digestTelegramId(ORGANIZER_CHAT)],
     );
     return rows[0]!;
@@ -749,4 +775,159 @@ describe("an unlinked Telegram account loses the bot too (DB)", { skip: SKIP }, 
     const { hasEarlierBuiltTrip } = await import("../src/organizer-trips.js");
     return hasEarlierBuiltTrip(pool, tripId, ORGANIZER_CHAT);
   }
+});
+
+/**
+ * #442 round 4: a Telegram link is per TRIP. The fixture above gives every trip
+ * its own user, which cannot tell a per-trip link from an account-wide one; this
+ * one user owns two trips, which can.
+ */
+describe("a Telegram link is per trip (DB)", { skip: SKIP }, () => {
+  async function oneOrganizerTwoTrips(pool: pg.Pool) {
+    await pool.query("TRUNCATE control_plane.users, control_plane.trips CASCADE");
+    const userId = testId("user");
+    await pool.query("INSERT INTO control_plane.users(id, status, display_name) VALUES ($1,'active','Olive')", [userId]);
+    const trips: Record<string, string> = {};
+    for (const slug of ["rome-2027", "oslo-2027"]) {
+      const tripId = testId("trip");
+      trips[slug] = tripId;
+      await pool.query("INSERT INTO control_plane.trips(id, slug, lifecycle_state, title) VALUES ($1,$2,'ready_private',$3)", [tripId, slug, slug]);
+      await pool.query(
+        "INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status) VALUES ($1,$2,$3,'owner','active')",
+        [testId("memb"), tripId, userId]);
+    }
+    return { userId, rome: trips["rome-2027"]!, oslo: trips["oslo-2027"]! };
+  }
+  async function link(pool: pg.Pool, userId: string, tripId: string, chat = ORGANIZER_CHAT) {
+    const client = await pool.connect();
+    try { await linkTelegramOrganizerInTx(client, chat, userId, tripId); } finally { client.release(); }
+    const { rows } = await pool.query<{ id: string }>(
+      "SELECT id FROM control_plane.telegram_organizer_trip_links WHERE user_id = $1 AND trip_id = $2 AND telegram_subject_digest = $3 AND revoked_at IS NULL",
+      [userId, tripId, digestTelegramId(chat)]);
+    return rows[0]?.id ?? null;
+  }
+
+  test("unlinking Rome leaves Oslo in /trips, /switch, the organizer check and the returning-organizer opening", async () => {
+    const pool = await migratedPool();
+    const { userId, rome, oslo } = await oneOrganizerTwoTrips(pool);
+    const romeLink = await link(pool, userId, rome);
+    await link(pool, userId, oslo);
+    assert.deepEqual((await listOrganizerTrips(pool, ORGANIZER_CHAT, ORGANIZER_CHAT)).map((t) => t.slug).sort(), ["oslo-2027", "rome-2027"]);
+
+    assert.equal(await unlinkTelegramLink(pool, userId, romeLink!), true);
+
+    assert.deepEqual((await listOrganizerTrips(pool, ORGANIZER_CHAT, ORGANIZER_CHAT)).map((t) => t.slug), ["oslo-2027"],
+      "the owner's other trip is still listed — before this change the Unlink took both");
+    assert.deepEqual(await switchChatToTrip(pool, ORGANIZER_CHAT, ORGANIZER_CHAT, rome), { kind: "refused", reason: "NOT_YOURS" });
+    assert.equal((await switchChatToTrip(pool, ORGANIZER_CHAT, ORGANIZER_CHAT, oslo)).kind, "switched");
+    assert.equal(await isTripOrganizer(pool, rome, ORGANIZER_CHAT), false);
+    assert.equal(await isTripOrganizer(pool, oslo, ORGANIZER_CHAT), true);
+    const { hasEarlierBuiltTrip } = await import("../src/organizer-trips.js");
+    // A new trip under ANOTHER user_id (the shape this deployment is really in),
+    // so the only thing tying it to Olive's earlier trips is the Telegram link.
+    const other = testId("user");
+    const third = testId("trip");
+    await pool.query("INSERT INTO control_plane.users(id, status, display_name) VALUES ($1,'active','Olive again')", [other]);
+    await pool.query("INSERT INTO control_plane.trips(id, slug, lifecycle_state, title) VALUES ($1,'new-2028','draft','new')", [third]);
+    await pool.query("INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status) VALUES ($1,$2,$3,'owner','active')", [testId("memb"), third, other]);
+    assert.equal(await hasEarlierBuiltTrip(pool, third, ORGANIZER_CHAT), true, "Oslo, still linked, counts as an earlier trip of this Telegram account");
+    const osloLink = await pool.query<{ id: string }>(
+      "SELECT id FROM control_plane.telegram_organizer_trip_links WHERE trip_id = $1 AND revoked_at IS NULL", [oslo]);
+    await unlinkTelegramLink(pool, userId, osloLink.rows[0]!.id);
+    assert.equal(await hasEarlierBuiltTrip(pool, third, ORGANIZER_CHAT), false, "Rome and Oslo are both unlinked: no earlier trip is theirs");
+  });
+
+  test("an Unlink closes the chat's hold on THAT trip only", async () => {
+    const pool = await migratedPool();
+    const { userId, rome, oslo } = await oneOrganizerTwoTrips(pool);
+    const romeLink = await link(pool, userId, rome);
+    await link(pool, userId, oslo);
+    await bind(pool, ORGANIZER_CHAT, oslo, "familytrip-oslo");
+    await unlinkTelegramLink(pool, userId, romeLink!);
+    assert.equal(await openBinding(pool, ORGANIZER_CHAT), oslo, "the DM binding to Oslo is untouched by unlinking Rome");
+
+    const { rows } = await pool.query<{ id: string }>(
+      "SELECT id FROM control_plane.telegram_organizer_trip_links WHERE trip_id = $1 AND revoked_at IS NULL", [oslo]);
+    await unlinkTelegramLink(pool, userId, rows[0]!.id);
+    assert.equal(await openBinding(pool, ORGANIZER_CHAT), null, "unlinking Oslo closes the DM's routing to Oslo");
+    const closed = await pool.query<{ closed_reason: string }>(
+      "SELECT closed_reason FROM control_plane.telegram_chat_bindings WHERE trip_id = $1", [oslo]);
+    assert.deepEqual(closed.rows, [{ closed_reason: "telegram_unlinked" }]);
+  });
+
+  test("a forwarded interview link cannot undo an Unlink of the same trip, and a link for another trip is not affected", async () => {
+    const pool = await migratedPool();
+    const { userId, rome, oslo } = await oneOrganizerTwoTrips(pool);
+    const romeLink = await link(pool, userId, rome);
+    await unlinkTelegramLink(pool, userId, romeLink!);
+    assert.equal(await link(pool, userId, rome), null, "redeeming again writes nothing for the unlinked trip");
+    assert.notEqual(await link(pool, userId, oslo), null, "another trip still links by the ordinary route");
+    assert.deepEqual((await listOrganizerTrips(pool, ORGANIZER_CHAT, ORGANIZER_CHAT)).map((t) => t.slug), ["oslo-2027"]);
+  });
+
+  test("an account-wide row from the previous release becomes one live link per active membership, sign-in history kept; an ended membership gets none", async () => {
+    const pool = await migratedPool();
+    const { userId, rome, oslo } = await oneOrganizerTwoTrips(pool);
+    const ended = testId("trip");
+    await pool.query("INSERT INTO control_plane.trips(id, slug, lifecycle_state, title) VALUES ($1,'ended-2020','ready_private','ended')", [ended]);
+    await pool.query("INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status) VALUES ($1,$2,$3,'owner','revoked')", [testId("memb"), ended, userId]);
+    await pool.query(
+      `INSERT INTO control_plane.telegram_organizer_links(id, user_id, telegram_subject_digest, verified_via, first_signed_in_at, last_signed_in_at)
+       VALUES ($1,$2,$3,'enrollment_redemption', '2026-10-01T10:00:00Z', '2026-10-02T10:00:00Z')`,
+      [testId("tol"), userId, digestTelegramId(ORGANIZER_CHAT)]);
+    const perTrip = await readFile(`${migrationsDir}/20261021120000_telegram_organizer_trip_links.sql`, "utf8");
+    const start = perTrip.indexOf("INSERT INTO control_plane.telegram_organizer_trip_links");
+    await pool.query(perTrip.slice(start, perTrip.indexOf(";", start) + 1));
+
+    const { rows } = await pool.query<{ trip_id: string; first_signed_in_at: Date | null }>(
+      "SELECT trip_id, first_signed_in_at FROM control_plane.telegram_organizer_trip_links WHERE user_id = $1 ORDER BY trip_id", [userId]);
+    assert.deepEqual(rows.map((r) => r.trip_id).sort(), [rome, oslo].sort());
+    assert.ok(rows.every((r) => r.first_signed_in_at?.toISOString() === "2026-10-01T10:00:00.000Z"), "an already-announced link is not announced again");
+    assert.deepEqual((await listOrganizerTrips(pool, ORGANIZER_CHAT, ORGANIZER_CHAT)).map((t) => t.slug).sort(), ["oslo-2027", "rome-2027"],
+      "the organizer keeps every trip they had until they change one");
+  });
+
+  test("ROLLBACK SAFETY: a per-trip Unlink leaves the previous release's reader (account-wide table) blind to the pair", async () => {
+    const pool = await migratedPool();
+    const { userId, rome, oslo } = await oneOrganizerTwoTrips(pool);
+    const legacyId = testId("tol");
+    await pool.query(
+      "INSERT INTO control_plane.telegram_organizer_links(id, user_id, telegram_subject_digest, verified_via) VALUES ($1,$2,$3,'enrollment_redemption')",
+      [legacyId, userId, digestTelegramId(ORGANIZER_CHAT)]);
+    const romeLink = await link(pool, userId, rome);
+    await link(pool, userId, oslo);
+    // A session the account-wide link minted before the upgrade.
+    const sessionId = testId("wsess");
+    await pool.query(
+      "INSERT INTO control_plane.web_sessions(id,user_id,token_digest,csrf_digest,expires_at,telegram_link_id) VALUES ($1,$2,$3,$4,now() + interval '1 hour',$5)",
+      [sessionId, userId, `sha256:${randomBytes(32).toString("hex")}`, `sha256:${randomBytes(32).toString("hex")}`, legacyId]);
+
+    // The previous release's trip list, in shape: every membership of every user the digest links.
+    const oldReader = () => pool.query(
+      `SELECT m.trip_id FROM control_plane.trip_memberships m
+        WHERE m.status = 'active' AND m.user_id IN (SELECT user_id FROM control_plane.telegram_organizer_links WHERE telegram_subject_digest = $1)`,
+      [digestTelegramId(ORGANIZER_CHAT)]);
+    assert.equal((await oldReader()).rowCount, 2, "before the Unlink the old reader sees both trips");
+
+    assert.equal(await unlinkTelegramLink(pool, userId, romeLink!), true);
+
+    assert.equal((await oldReader()).rowCount, 0, "after ANY per-trip Unlink the old reader sees none of the pair's trips — it cannot be left holding Rome");
+    const history = await pool.query("SELECT 1 FROM control_plane.telegram_organizer_link_revocations WHERE id = $1", [legacyId]);
+    assert.equal(history.rowCount, 1, "the account-wide row was moved, not lost");
+    const session = await pool.query<{ revoked_at: Date | null }>("SELECT revoked_at FROM control_plane.web_sessions WHERE id = $1", [sessionId]);
+    assert.notEqual(session.rows[0]?.revoked_at, null, "a session the account-wide link opened ends with it");
+    // This release is unaffected: Oslo is still linked for it.
+    assert.deepEqual((await listOrganizerTrips(pool, ORGANIZER_CHAT, ORGANIZER_CHAT)).map((t) => t.slug), ["oslo-2027"]);
+  });
+
+  test("a membership that ends takes the trip's Telegram link with it for good, and the link does not come back with the membership", async () => {
+    const pool = await migratedPool();
+    const { userId, rome } = await oneOrganizerTwoTrips(pool);
+    const linkId = await link(pool, userId, rome);
+    await pool.query("UPDATE control_plane.trip_memberships SET status = 'revoked' WHERE trip_id = $1 AND user_id = $2", [rome, userId]);
+    const ended = await pool.query<{ revoked_reason: string | null }>("SELECT revoked_reason FROM control_plane.telegram_organizer_trip_links WHERE id = $1", [linkId]);
+    assert.equal(ended.rows[0]?.revoked_reason, "membership_ended");
+    await pool.query("UPDATE control_plane.trip_memberships SET status = 'active' WHERE trip_id = $1 AND user_id = $2", [rome, userId]);
+    assert.deepEqual(await listOrganizerTrips(pool, ORGANIZER_CHAT, ORGANIZER_CHAT), [], "re-adding the person does not revive a link made when they ran the trip");
+  });
 });

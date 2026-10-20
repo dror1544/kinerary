@@ -14,16 +14,25 @@ only from a **link**, written earlier by someone proving something Telegram cann
 
 | Link | Written when | Scope |
 |---|---|---|
-| `telegram_organizer_links` | an interview link issued to the account is redeemed from a Telegram chat (migration 0052) | every trip of that account |
+| `telegram_organizer_trip_links` | an interview link for that trip is redeemed from a Telegram chat, **or** the signed-in organizer's dashboard issues a one-time link for that trip and a Telegram account redeems it (migration `20261021120000`) | that one trip |
 | `telegram_member_links` | a member signs in with their **trip password** (or redeems a **site invite**) inside the Mini App, ticks "Next time, open with Telegram", and verified `initData` arrives in the same request | that one trip |
 
-**Contract change of `telegram_organizer_links`.** Migration 0052 called it "never a
-credential and never an authentication path". With this feature a row is a sign-in
-path, so it is now **revocable** (Unlink moves the row to a history table), **owner-visible** (the "Telegram
-accounts that can sign in as you" list) and **announced** (a notice on first use).
+**Contract change of the organizer link.** Migration 0052 called `telegram_organizer_links` "never a
+credential and never an authentication path". With this feature a link is a sign-in
+path, so it is **revocable**, **owner-visible** (on the trip card) and **announced** (a notice on first use).
 The reason is concrete: an interview link that is forwarded to someone else yields
 a link to a Telegram account that is not the organizer's, and before this change that
 cost only bot routing.
+
+**The link is per trip (owner decision, 2026-10-20).** The first version kept 0052's account-wide row, so
+Unlinking one trip took *every* trip of the organizer out of the bot's `/trips` and `/switch`, and a revoked
+pair stayed revoked with no way back from the dashboard. Now one row = one (Telegram account, user, **trip**)
+in `telegram_organizer_trip_links`, revoked in place (`revoked_at`). Every reader — the bot's `/trips`,
+`/switch`, `hasEarlierBuiltTrip`, `isTripOrganizer` and the Mini App resolver — asks for the link **of the
+trip in question**. 0052's account-wide table is no longer read or written by this release. Existing
+account-wide rows were **expanded by the migration** into one live link per active membership (sign-in
+history copied, so an announced link is not announced again), so an organizer keeps every trip until they
+change one; the old rows themselves stay put so the previous release still runs after a rollback.
 
 ## Entry paths
 
@@ -35,7 +44,8 @@ cost only bot routing.
 
 ## The sign-in exchange
 
-`POST /v1/auth/telegram-mini-app`, body `{ initData, tripId? }` (`tripId` only on the chooser's follow-up).
+`POST /v1/auth/telegram-mini-app`, body `{ initData, tripId?, embedded? }` (`tripId` only on the chooser's follow-up;
+`embedded: true` only when the page finds itself in a frame on another site — Telegram Web — see "Telegram Web" below).
 
 | Response | Meaning |
 |---|---|
@@ -106,36 +116,55 @@ this (the runtime-gateway lane owns that).
 
 ## Safeguards the owner asked for (2026-10-20)
 
-- **See and remove:** "Telegram accounts that can sign in as you" on My trips
-  (`GET /v1/account/telegram-links`, `DELETE /v1/account/telegram-links/:id`; `requireUser` /
-  `requireMutation`), for any signed-in person. A row says: *linked on D via the interview for
-  "Trip"* (or via an earlier interview / the trip password / an invitation), *first signed in D*,
-  *last signed in D*, and which trip a trip-scoped link opens — enough for an organizer to tell their
-  own link from a forwardee's. **Never** the Telegram id, its digest or any piece of either (a digest of
-  a short numeric id is brute-forceable), and no Telegram-supplied name.
-- **Notice:** the first Mini App sign-in through a link queues a Telegram message to **the account
-  owner's own chats** — the open, private DM bindings with the bot (`telegram_chat_bindings`) of the
-  trips the account is owner or organizer of, minus the signer's own chat. It says which account signed
-  in, which trip it opened and when, and how to unlink. It does **not** go to the account that signed in
-  (a forwardee would only be told about their own sign-in). If the owner has no such chat nothing is
-  queued and the list above is the only channel (the sign-in log line carries `notices_queued`).
-  Outbox type `mini_app_sign_in_notice`, trip_id NULL, one row per chat, sent by the ordinary outbox
-  dispatcher with its usual retries (which runs whenever the web block is configured, with or without
-  `signup`); the raw Telegram id in the row is nulled once it is sent or has failed for good; never
-  inline. A member-scoped link has no such chats (members are not DM-bound), so it queues none;
-  re-linking the same Telegram account to the same person and trip is never news.
-- **Revocable:** **Unlink MOVES an organizer link** out of `telegram_organizer_links` into
-  `telegram_organizer_link_revocations`, so every reader — this release's and the previous release's bot
-  readers after a rollback — simply no longer sees it (`/trips`, `/switch`, the returning-organizer
-  greeting and the organizer check need no knowledge of revocation). It also ends the sessions the link
-  minted, and closes the unlinked Telegram chat's hold on the account's trips outside the web: its live
-  interview session is expired, its interview binding revoked and its open chat binding closed
-  (`telegram_unlinked`) — nothing deleted. A revoked organizer link stays revoked: redeeming another
-  interview link from the same Telegram account does not re-open it (the history row says so). Member
-  links are flagged `revoked_at` (only this release reads that table) and also end — with their
-  sessions — when the trip password changes, when the membership ends, or when the invite is revoked.
-  These are database triggers (migration `20261020120000`), not route code, because none of the three
-  events has a single writer.
+- **See and remove, per trip:** each organizer trip card on My trips shows a Telegram status icon (linked / not
+  linked) and a ⋮ menu. The menu lists the Telegram accounts linked to **that trip** — `linked on D`, how
+  (the interview, an earlier interview, a link from the page, the trip password, an invitation), *last
+  opened D* — each with **Unlink** (after a confirmation), plus **Link Telegram**. The data is the `telegram`
+  field of `GET /v1/trips` / `GET /v1/trips/:id` (`links[]`: `id`, `via`, `linkedAt`, `firstSignedInAt`,
+  `lastSignedInAt`); unlinking is `DELETE /v1/account/telegram-links/:id` (`requireMutation`). A runtime-only
+  member sees the same status on their card and can end their own link, but is not offered Link. **Never**
+  the Telegram id, its digest or any piece of either (a digest of a short numeric id is brute-forceable), and
+  no Telegram-supplied name. This replaces the account-level "Telegram accounts that can sign in as you"
+  section and `GET /v1/account/telegram-links` (removed: answers 404). Dates on the page are formatted in the
+  **page's** language (`<html lang>`), never the browser's.
+- **Link — the only way back after an Unlink** (`POST /v1/trips/:id/telegram-link`, `requireMutation`, owner or
+  organizer with dashboard access; anyone else, a retired trip and a nonexistent one get the same 404;
+  10/min per person). It returns `{ deepLink: "https://t.me/<bot>?start=lk_…", expiresAt }`. The token is
+  the enrollment pattern (`enrollment.ts`) — 24 random bytes, only the sha256 stored in
+  `telegram_link_tokens`, row-locked single use, at most one live token per (user, trip) — with a **15-minute**
+  fuse. **Redeeming** is the bot's `/start lk_…` in a *private* chat (`telegram-link-token.ts`, claimed in
+  `relay/dispatch.ts` before the enrollment path; a group redemption is refused without consuming): the
+  sender id comes from the update Telegram delivered on the bot's own connection and the issuer from the
+  token, so both halves are proven by different things — the signed-in session proves the account, the bot's
+  update proves the Telegram identity. The link is written for **that user and that trip** and nothing else.
+  Every refusal (expired, used, replaced, unknown, malformed, issuer no longer runs the trip) is **one
+  sentence**, so a guess learns nothing. An interview link — which may have been forwarded — still cannot
+  undo an Unlink (`linkTelegramOrganizerInTx` refuses a (Telegram account, user, trip) that has a revoked
+  row); this is.
+- **Notice:** the first Mini App sign-in through a link queues a Telegram message to **all of the account
+  owner's private bot chats, including the one that signed in** (owner decision, 2026-10-20: the first
+  version skipped the signer's chat and, for an organizer whose only chat is their own phone, the notice
+  never arrived). Recipients: the open, private DM bindings of the trips the account is owner or organizer
+  of, plus the signing Telegram account's own private chat. It says which account signed in, which trip it
+  opened and when, and how to unlink (the trip card's three-dot menu). Per link: relinking a trip later
+  announces that link's first sign-in again, which is the point when the relink was made with a link the
+  organizer may have forwarded. Outbox type `mini_app_sign_in_notice`, trip_id NULL, one row per chat, sent
+  by the ordinary outbox dispatcher with its usual retries (which runs whenever the web block is configured,
+  with or without `signup`); the raw Telegram id in the row is nulled once it is sent or has failed for good;
+  never inline. Re-linking the same Telegram account to the same member and trip is never news.
+- **Revocable:** an organizer link is flagged `revoked_at` / `owner_unlinked` in place (only this release
+  reads that table), ends the sessions it minted, and closes that Telegram chat's hold **on that trip** outside
+  the web: its live interview session is expired, its interview binding revoked and its open chat binding
+  closed (`telegram_unlinked`) — nothing deleted; the organizer's other trips are untouched.
+  **Rollback safety:** the previous release read only the account-wide `telegram_organizer_links` and cannot
+  hide one trip out of it, so a per-trip Unlink also **moves that pair's account-wide row** into
+  `telegram_organizer_link_revocations` (and ends the sessions it minted): after a rollback the older readers
+  see none of the pair's trips — an Unlink can cost bot access until a relink, and can never leave behind
+  access the owner took away. A membership that ends also revokes the trip's organizer links (trigger, so the
+  link does not revive if the person is added back). Member links are flagged `revoked_at` and also end —
+  with their sessions — when the trip password changes, when the membership ends, or when the invite is
+  revoked. These are database triggers (migrations `20261020120000`, `20261021120000`), not route code,
+  because none of the events has a single writer.
 - **Remove member:** an owner or organizer removes a person from the trip's "People on this trip" panel
   (`DELETE /v1/trips/:id/members/:membershipId`, `requireMutation`; revoking a **redeemed** invite does
   the same). One transaction: membership to `revoked` (which fires the Telegram-link trigger), trip
@@ -184,10 +213,38 @@ must name `web.telegram_bot_username`, or the feature stays off (`mini_app.bot_t
 — handles only, never the token); a network failure is retried every minute. Boot also logs
 `has_main_web_app` from `getMe`. Nothing logs `initData`, a hash, a Telegram id or its digest.
 
-Unsupported in v1: Telegram Web (`web.telegram.org`, platforms `weba`/`webk`) runs Mini Apps
-in a cross-site iframe where the session cookies are not sent; the page says "Open in the
-Telegram app". A person who is not linked and whose launch names no trip sees a message
-(no email form).
+A person who is not linked and whose launch names no trip sees a message (no email form).
+
+## Telegram Web (`web.telegram.org`)
+
+Telegram Web runs a Mini App in an **iframe on another site**, where the portal's `SameSite=Lax` cookies are
+never sent. Supported since 2026-10-20, in two parts that must travel together:
+
+- **A cookie variant for the Mini App session only.** When the page finds itself framed (`window.top`
+  differs, or Telegram reports platform `web`/`weba`/`webk`) it sends `embedded: true` with the exchange (and
+  with the trip-password sign-in). The response then sets `kit_session` and `kit_csrf` as
+  `SameSite=None; Secure; Partitioned` ([CHIPS](https://developer.mozilla.org/en-US/docs/Web/Privacy/Guides/Privacy_sandbox/Partitioned_cookies)):
+  the browser keys the cookie to the top-level site that framed us, so it is sent back only inside
+  `web.telegram.org`'s frame — not to any other site that frames or requests the portal. The ordinary
+  portal, and a native WebView (iOS, Android, desktop), keep the Lax cookies; an `http://` origin keeps Lax too
+  (`None` needs `Secure`). `embedded` can only weaken the caller's own cookie. Logout and the shared-device
+  clear expire **both** variants (a cookie's identity includes its partition). **CSRF and Origin rules are
+  unchanged:** the exchange still requires `Origin` to equal `web.public_origin` (a fetch from inside the frame
+  to the portal's own origin sends exactly that), and mutations still need the double-submit CSRF token.
+- **Framing allowed for `/mini-app` only** (`web/nginx.conf`). Every response carries
+  `Content-Security-Policy: frame-ancestors 'none'` and `X-Frame-Options: DENY` (the portal had no
+  framing header at all before this), except the shell served for `/mini-app` and `/mini-app/…`, which
+  carries `frame-ancestors https://web.telegram.org https://webk.telegram.org https://webz.telegram.org`
+  and no `X-Frame-Options` (it cannot name an origin). nginx does not inherit `add_header` into a location
+  that has its own, and a `try_files … /index.html` fallback is an internal redirect to `location =
+  /index.html`, whose `'none'` would win — so the Mini App locations serve the shell from a named location
+  with `rewrite … break`. `web/src/framing.test.ts` holds the shape; the real headers were captured from a
+  throwaway nginx (recorded in the PR).
+
+**Browsers that refuse the partitioned cookie** (Safari, a Chrome with third-party cookies blocked) accept
+the exchange and then cannot read the session back. After a session answer inside a frame the page asks
+`/v1/me` once; if it is unauthorised it says "Open Kinerary in the Telegram app" (and mentions third-party
+cookies) instead of showing a blank page. Real acceptance on Telegram Web in Chrome and in Safari is still owed.
 
 ## Checking a captured `initData`
 
@@ -231,8 +288,10 @@ the existing web views and the ordinary sign-in page remain usable.
 - Resolution, replay (including two pools), shared device, unlink, notice, phase 2, revocation,
   `/v1/auth/password` hardening, log redaction (needs a scratch database):
   `telegram-mini-app-db.test.ts`.
-- Client: `web/src/mini-app/MiniAppSignIn.test.tsx`, `web/src/pages/TelegramAccounts.test.tsx`,
-  `web/src/pages/TripUsername.test.tsx`.
+- The per-trip link, the dashboard link and the way back: `telegram-link-token-db.test.ts`,
+  `organizer-trips.test.ts` ("a Telegram link is per trip").
+- Client: `web/src/mini-app/MiniAppSignIn.test.tsx`, `web/src/pages/TripTelegram.test.tsx`,
+  `web/src/pages/TripUsername.test.tsx`; framing headers: `web/src/framing.test.ts`.
 
 Real Telegram acceptance remains required on mobile and desktop hosts: launch private and group
 entries as linked and unlinked accounts, confirm refusal for non-members, check safe areas and back

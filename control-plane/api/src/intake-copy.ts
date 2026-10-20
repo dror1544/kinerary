@@ -689,6 +689,11 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // distinguishable refusal confirms a guess to whoever is guessing.
     switchRefused: "I can't switch to that one. Send /trips to see the ones I have for you.",
     switchInGroup: "I can only switch trips in our private chat — this group stays on its own trip.",
+    // The dashboard's "Link Telegram" deep link, redeemed. {trip} is replaced by
+    // the trip's title. ONE refusal sentence for every reason (expired, used,
+    // unknown, not yours any more): a distinguishable one confirms a guess.
+    telegramLinked: "Done — this Telegram account is now linked to \"{trip}\". Send /trips to see it, and /switch to talk to it from this chat.",
+    telegramLinkRefused: "That link didn't work — it may have expired or been used already. Open Kinerary, find the trip and choose Link Telegram for a fresh one.",
     switchInInterview: "We're in the middle of setting up a trip. Let's finish this one first, then I can switch.",
     // Migration 0042's reachability. Worth surfacing: this is the exact state
     // that produced "I don't have a trip for this chat" about a site that was
@@ -917,6 +922,8 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     switchNoCompanion: "האתר מוכן — אני עדיין מסיים את העוזר של הטיול הזה, אז תנו לי רגע לפני שתשאלו אותי עליו.",
     switchRefused: "אני לא יכול לעבור לשם. שלחו ‎/trips‎ כדי לראות את הטיולים שיש לי עבורכם.",
     switchInGroup: "אני יכול להחליף טיול רק בצ׳אט הפרטי בינינו — הקבוצה הזו נשארת על הטיול שלה.",
+    telegramLinked: "בוצע — חשבון הטלגרם הזה מקושר עכשיו אל \"{trip}\". שלחו ‎/trips‎ כדי לראות אותו, ו‎/switch‎ כדי לדבר איתו מהצ׳אט הזה.",
+    telegramLinkRefused: "הקישור הזה לא עבד — ייתכן שפג תוקפו או שכבר נעשה בו שימוש. היכנסו ל-Kinerary, מצאו את הטיול ובחרו Link Telegram כדי לקבל קישור חדש.",
     switchInInterview: "אנחנו באמצע הקמת טיול. בואו נסיים את זה קודם, ואז אוכל להחליף.",
     tripUnreachable: "(האתר לא מגיב)",
     tripBridgeUnreachable: "(לצערי אני לא יכול לקרוא את נתוני הטיול כרגע)",

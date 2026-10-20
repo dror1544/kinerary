@@ -174,14 +174,57 @@ it("a refused or rate-limited launch says to reopen from Telegram", async () => 
   expect(await screen.findByRole("heading", { name: "We couldn't verify this Telegram launch" })).toBeInTheDocument();
 });
 
-it("Telegram Web (web/telegram) is told to open the Telegram app, and nothing is sent", async () => {
-  for (const platform of ["weba", "webk"]) {
+it("Telegram Web (a frame on another site) asks for the cross-site cookie variant and signs in; other platforms never do", async () => {
+  for (const platform of ["weba", "webk", "web"]) {
     telegram({ platform });
-    const { exchanges, unmount } = mount("/mini-app", () => undefined, { authenticated: false });
-    expect(await screen.findByRole("heading", { name: "Open Kinerary in the Telegram app" })).toBeInTheDocument();
-    expect(exchanges()).toHaveLength(0);
+    const { exchanges, unmount } = mount("/mini-app", (path) => path === "/v1/auth/telegram-mini-app" ? json({ kind: "session", appPath: "/mini-app/trips/trip_abcdefgh" }) : undefined);
+    await screen.findByTitle("Kinerary trip");
+    expect(exchanges()).toHaveLength(1);
+    expect(exchanges()[0].body).toEqual({ initData: INIT, embedded: true });
     unmount();
+    window.sessionStorage.clear();
   }
+  telegram({ platform: "ios" });
+  const native = mount("/mini-app", (path) => path === "/v1/auth/telegram-mini-app" ? json({ kind: "session", appPath: "/mini-app" }) : undefined);
+  await screen.findByRole("heading", { name: "My trips" });
+  expect(native.exchanges()[0].body, "a native WebView keeps the ordinary Lax cookies").toEqual({ initData: INIT });
+});
+
+it("Telegram Web: the chooser's follow-up and the trip-password sign-in carry the same request", async () => {
+  telegram({ platform: "weba" });
+  const trips = [
+    { tripId: "trip_abcdefgh", title: "Rome", destination: null, startDate: null, endDate: null },
+    { tripId: "trip_ijklmnop", title: "Oslo", destination: null, startDate: null, endDate: null },
+  ];
+  const chosen = mount("/mini-app", (path, init) => {
+    if (path !== "/v1/auth/telegram-mini-app") return undefined;
+    return JSON.parse(String(init?.body)).tripId ? json({ kind: "session", appPath: "/mini-app/trips/trip_ijklmnop" }) : json({ kind: "choose", trips });
+  });
+  fireEvent.click(await screen.findByRole("button", { name: "Oslo" }));
+  await screen.findByTitle("Kinerary trip");
+  expect(chosen.exchanges().map((e) => e.body)).toEqual([{ initData: INIT, embedded: true }, { initData: INIT, tripId: "trip_ijklmnop", embedded: true }]);
+  chosen.unmount();
+  window.sessionStorage.clear();
+
+  const { calls } = mount("/mini-app", (path, init) => {
+    if (path === "/v1/auth/telegram-mini-app") return json({ error: "TELEGRAM_NOT_LINKED", fallback: "trip_password", tripId: "trip_abcdefgh" }, 401);
+    if (path === "/v1/auth/password") return json({ appPath: JSON.parse(String(init?.body)).returnTo });
+    return undefined;
+  }, { authenticated: false });
+  fireEvent.change(await screen.findByLabelText("Trip username"), { target: { value: "dana" } });
+  fireEvent.change(screen.getByLabelText("Password"), { target: { value: "member-password" } });
+  fireEvent.click(screen.getByRole("button", { name: "Continue with trip password" }));
+  await vi.waitFor(() => expect(calls.some((c) => c.path === "/v1/auth/password")).toBe(true));
+  expect(calls.find((c) => c.path === "/v1/auth/password")!.body).toMatchObject({ embedded: true });
+});
+
+it("Telegram Web where the browser refuses the cross-site cookie: says to use the Telegram app instead of showing a blank page", async () => {
+  telegram({ platform: "weba" });
+  // The exchange succeeds, but the session cookie never sticks: /v1/me is unauthorised right after.
+  mount("/mini-app", (path) => path === "/v1/auth/telegram-mini-app" ? json({ kind: "session", appPath: "/mini-app" }) : undefined, { authenticated: false });
+  expect(await screen.findByRole("heading", { name: "Open Kinerary in the Telegram app" })).toBeInTheDocument();
+  expect(screen.getByText(/third-party cookies/)).toBeInTheDocument();
+  expect(launchMarker.read(), "a launch that did not stick is not remembered as signed in").toBeNull();
 });
 
 it("with the feature off (503) the page behaves as before: the ordinary sign-in", async () => {

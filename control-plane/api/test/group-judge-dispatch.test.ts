@@ -415,8 +415,8 @@ describe("/proactive - how much the assistant takes part in one group", { skip: 
       const chat = "-1005000004";
       await bindNamed(fix, chat);
       await fix.pool.query(
-        "INSERT INTO control_plane.telegram_organizer_links(id, user_id, telegram_subject_digest, verified_via) VALUES ($1, $2, $3, 'enrollment_redemption')",
-        [testId("tol"), fix.userId, digestTelegramId(String(DROR))],
+        "INSERT INTO control_plane.telegram_organizer_trip_links(id, user_id, trip_id, telegram_subject_digest, verified_via) VALUES ($1, $2, $3, $4, 'enrollment_redemption')",
+        [testId("otl"), fix.userId, fix.tripId, digestTelegramId(String(DROR))],
       );
       assert.match(reply(await dispatch(fix, from(chat, "/proactive 1", DROR))), /Level 1/);
       assert.equal(await column(fix, chat), 1);

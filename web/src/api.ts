@@ -29,6 +29,13 @@ export type TripSummary = {
   invites?: InviteSummary[];
   /** Organizer view only: who is on the trip, for "remove member". */
   members?: MemberSummary[];
+  /** The Telegram accounts that can open THIS trip as the viewer: the card's icon and its Unlink entries. */
+  telegram?: { links: TelegramLink[] };
+};
+
+export type TelegramLink = {
+  id: string; via: "interview_link" | "earlier_interview" | "dashboard_link" | "trip_password" | "invite";
+  linkedAt: string; firstSignedInAt: string | null; lastSignedInAt: string | null;
 };
 
 export type MemberSummary = { id: string; displayName: string; role: string; runtimeUsername: string | null; you: boolean; removable: boolean };
@@ -69,6 +76,7 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
       INTERVIEW_ALREADY_STARTED: "Your interview has already started. Continue in your existing Telegram chat.",
       ENROLLMENT_NOT_REPLACEABLE: "This link changed or was already used. Check the trip status before continuing.",
       ENROLLMENT_BUSY: "Trip setup is changing. Please try again.",
+      RATE_LIMITED: "Too many requests. Please wait a minute and try again.",
       ORIGIN_INVALID: "Please sign in from the Kinerary website.",
       TELEGRAM_NOT_LINKED: "This Telegram account is not linked yet.",
     };
@@ -85,6 +93,11 @@ const inviteSchema = z.object({
 const memberSchema: z.ZodType<MemberSummary> = z.object({
   id: z.string(), displayName: z.string(), role: z.string(), runtimeUsername: z.string().nullable(), you: z.boolean(), removable: z.boolean(),
 });
+const telegramLinkSchema: z.ZodType<TelegramLink> = z.object({
+  id: z.string(), via: z.enum(["interview_link", "earlier_interview", "dashboard_link", "trip_password", "invite"]),
+  linkedAt: z.string(), firstSignedInAt: z.string().nullable(), lastSignedInAt: z.string().nullable(),
+});
+const telegramSchema = z.object({ links: z.array(telegramLinkSchema) });
 const tripSchema: z.ZodType<TripSummary> = z.object({
   id: z.string(), title: z.string(), destination: z.string().nullable(), startDate: z.string().nullable(), endDate: z.string().nullable(),
   tripType: z.string(), lifecycleState: z.string(), nextAction: z.string(),
@@ -94,6 +107,7 @@ const tripSchema: z.ZodType<TripSummary> = z.object({
   permissions: z.object({ role: z.string(), dashboard: z.boolean(), runtime: z.boolean(), invite: z.boolean(), requestProvisioning: z.boolean() }),
   invites: z.array(inviteSchema).optional(),
   members: z.array(memberSchema).optional(),
+  telegram: telegramSchema.optional(),
 });
 // What a member WITHOUT dashboard access gets in their list: name, place, dates, their own
 // permissions and whether it opens. Filled out to a TripSummary with neutral defaults.
@@ -101,6 +115,7 @@ const memberTripSchema = z.object({
   id: z.string(), title: z.string(), destination: z.string().nullable(), startDate: z.string().nullable(), endDate: z.string().nullable(),
   permissions: z.object({ role: z.string(), dashboard: z.boolean(), runtime: z.boolean(), invite: z.boolean(), requestProvisioning: z.boolean() }),
   runtimeReady: z.boolean(),
+  telegram: telegramSchema.optional(),
 }).transform((trip): TripSummary => ({
   ...trip, tripType: "other", lifecycleState: "ready_private", nextAction: trip.runtimeReady ? "open_trip" : "view_status",
   interview: null, provisioning: null,
@@ -115,6 +130,8 @@ export function passwordSignIn(input: {
   tripId: string; runtimeUsername: string; password: string; returnTo: string;
   /** "Next time, open with Telegram": only ever sent with the person's explicit consent. */
   telegramLink?: { initData: string; consent: true };
+  /** The page is inside a frame on another site (Telegram Web): ask for the cross-site cookie variant. */
+  embedded?: true;
 }) {
   return api<{ appPath: string; telegramLink?: "linked" | "skipped" }>("/v1/auth/password", { method: "POST", body: JSON.stringify(input) });
 }
@@ -138,13 +155,13 @@ const miniAppAppPath = /^\/mini-app(?:\/trips\/trip_[A-Za-z0-9]{8,64})?$/;
  * in the POST body only (never a URL, never a header), and the server — not
  * this client — decides who the person is.
  */
-export async function telegramMiniAppSignIn(input: { initData: string; tripId?: string }): Promise<MiniAppSignInResult> {
+export async function telegramMiniAppSignIn(input: { initData: string; tripId?: string; embedded?: boolean }): Promise<MiniAppSignInResult> {
   let response: Response;
   try {
     response = await fetch("/v1/auth/telegram-mini-app", {
       method: "POST", credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(input.tripId ? { initData: input.initData, tripId: input.tripId } : { initData: input.initData }),
+      body: JSON.stringify({ initData: input.initData, ...(input.tripId ? { tripId: input.tripId } : {}), ...(input.embedded ? { embedded: true } : {}) }),
     });
   } catch { return { kind: "unavailable" }; }
   const body = await response.json().catch(() => ({})) as Record<string, unknown>;
@@ -164,20 +181,11 @@ export async function telegramMiniAppSignIn(input: { initData: string; tripId?: 
   return { kind: "unavailable" };
 }
 
-export type TelegramLink = {
-  id: string; scope: "account" | "trip"; via: "interview_link" | "earlier_interview" | "trip_password" | "invite";
-  tripTitle: string | null; viaTripTitle: string | null; linkedAt: string; firstSignedInAt: string | null; lastSignedInAt: string | null;
-};
-const telegramLinksSchema = z.object({
-  miniAppEnabled: z.boolean(),
-  links: z.array(z.object({
-    id: z.string(), scope: z.enum(["account", "trip"]), via: z.enum(["interview_link", "earlier_interview", "trip_password", "invite"]),
-    tripTitle: z.string().nullable(), viaTripTitle: z.string().nullable(), linkedAt: z.string(),
-    firstSignedInAt: z.string().nullable(), lastSignedInAt: z.string().nullable(),
-  })),
-});
-export const getTelegramLinks = () => api<unknown>("/v1/account/telegram-links").then((value) => telegramLinksSchema.parse(value));
 export const unlinkTelegramLink = (id: string) => api<{ status: string }>(`/v1/account/telegram-links/${encodeURIComponent(id)}`, { method: "DELETE" });
+const issuedLinkSchema = z.object({ deepLink: z.string().regex(/^https:\/\/t\.me\/[A-Za-z0-9_]+\?start=[A-Za-z0-9_-]+$/), expiresAt: z.string() });
+/** A one-time, short-lived t.me link that links whichever Telegram account opens it to THIS trip. */
+export const issueTelegramLink = (tripId: string) =>
+  api<unknown>(`/v1/trips/${encodeURIComponent(tripId)}/telegram-link`, { method: "POST" }).then((value) => issuedLinkSchema.parse(value));
 
 export const getMe = () => api<unknown>("/v1/me").then((value) => meSchema.parse(value));
 export const getTrips = () => api<unknown>("/v1/trips").then((value) => z.object({ trips: z.array(z.union([tripSchema, memberTripSchema])) }).parse(value));
