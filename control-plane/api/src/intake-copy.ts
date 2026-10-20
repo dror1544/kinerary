@@ -689,6 +689,17 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // distinguishable refusal confirms a guess to whoever is guessing.
     switchRefused: "I can't switch to that one. Send /trips to see the ones I have for you.",
     switchInGroup: "I can only switch trips in our private chat — this group stays on its own trip.",
+    // ── The Mini App's way in (#443) ────────────────────────────────────
+    // The message carrying the "Open trip" URL button, in a trip's group (pinned
+    // there) or answering /app. It says nothing about passwords or access: the
+    // button only SELECTS the trip, and the Mini App decides who may open it.
+    openTripText: "The trip is one tap away — tap Open trip to see the plan right here in Telegram.",
+    openTripButton: "Open trip",
+    // Pinning needs the admin right to pin. Said once, with what to do about it;
+    // the button above works either way.
+    openTripPinFailed: "I couldn't pin the Open trip message. To keep it at the top of the group, make me an admin with the \"Pin messages\" right, then send the group code again. The button works from where it is.",
+    // The Mini App is not ready for this bot (or no handle is known): said plainly, not blank.
+    openTripUnavailable: "The trip app isn't available yet. The trip site link from /help works as usual.",
     switchInInterview: "We're in the middle of setting up a trip. Let's finish this one first, then I can switch.",
     // Migration 0042's reachability. Worth surfacing: this is the exact state
     // that produced "I don't have a trip for this chat" about a site that was
@@ -917,6 +928,10 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     switchNoCompanion: "האתר מוכן — אני עדיין מסיים את העוזר של הטיול הזה, אז תנו לי רגע לפני שתשאלו אותי עליו.",
     switchRefused: "אני לא יכול לעבור לשם. שלחו ‎/trips‎ כדי לראות את הטיולים שיש לי עבורכם.",
     switchInGroup: "אני יכול להחליף טיול רק בצ׳אט הפרטי בינינו — הקבוצה הזו נשארת על הטיול שלה.",
+    openTripText: "הטיול במרחק לחיצה — לחצו על פתיחת הטיול כדי לראות את התוכנית כאן בטלגרם.",
+    openTripButton: "פתיחת הטיול",
+    openTripPinFailed: "לא הצלחתי להצמיד את הודעת פתיחת הטיול. כדי שתישאר בראש הקבוצה, הפכו אותי למנהל עם ההרשאה \"הצמדת הודעות\" ושלחו שוב את קוד הקבוצה. הכפתור עובד גם מהמקום שבו הוא נמצא.",
+    openTripUnavailable: "אפליקציית הטיול עדיין לא זמינה. הקישור לאתר הטיול מ-‎/help ממשיך לעבוד כרגיל.",
     switchInInterview: "אנחנו באמצע הקמת טיול. בואו נסיים את זה קודם, ואז אוכל להחליף.",
     tripUnreachable: "(האתר לא מגיב)",
     tripBridgeUnreachable: "(לצערי אני לא יכול לקרוא את נתוני הטיול כרגע)",
