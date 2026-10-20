@@ -230,10 +230,12 @@ export interface TripBotPollerDeps {
    */
   botIdentity?: BotIdentity;
   /**
-   * The bot handle the "Open trip" link points at (`web.telegram_bot_username`).
-   * Absent, `botIdentity.username` is used; see DispatchOptions.tripAppBotUsername.
+   * The bot handle the "Open trip" link points at (`web.telegram_bot_username`);
+   * see DispatchOptions.tripAppBotUsername.
    */
   tripAppBotUsername?: string | null;
+  /** Whether the Mini App is ready for that bot, asked per update; see DispatchOptions.tripAppReady. */
+  tripAppReady?: () => boolean;
   /**
    * The Hermes profile that serves written interview answers, from
    * `relay.interviewer_profile`.
@@ -5450,6 +5452,7 @@ export function startTripBotPoller(
         ...(deps.groupJudge ? { groupJudge: deps.groupJudge } : {}),
         ...(deps.organizerDocumentRoute === true ? { organizerDocumentRoute: true } : {}),
         ...(deps.tripAppBotUsername ? { tripAppBotUsername: deps.tripAppBotUsername } : {}),
+        ...(deps.tripAppReady ? { tripAppReady: deps.tripAppReady } : {}),
         // Asked per update rather than cached: a gateway can stop between
         // one message and the next, and a stale "reachable" spends the
         // organizer's turn on a socket that is gone.

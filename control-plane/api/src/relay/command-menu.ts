@@ -17,9 +17,10 @@
  * /proactive is the opposite case: it appears in groups only, being one group's
  * preference, set there by the trip's organizer.
  *
- * /app is in EVERY menu: the "Open trip" button is the same fixed message for the
- * chat's own trip wherever it is asked (a group's, or a private chat's), and it
- * grants nothing - the Mini App decides who may open the trip (#443).
+ * /app is in EVERY menu once the Mini App is ready, and in none before: the "Open
+ * trip" button is the same fixed message for the chat's own trip wherever it is
+ * asked (a group's, or a private chat's), and it grants nothing - the Mini App
+ * decides who may open the trip (#443). Republished when readiness flips.
  *
  * `/start` is deliberately absent. Telegram surfaces its own Start button, and
  * a menu entry for a command that does nothing without a token is a dead end.
@@ -63,15 +64,22 @@ const DESCRIPTIONS = {
   },
 } as const;
 
-/** Every menu the router publishes: three scopes, for the default, en and he. */
-export function routerCommandMenus(): CommandMenu[] {
+/**
+ * Every menu the router publishes: three scopes, for the default, en and he.
+ *
+ * `/app` is in them only when the Mini App is READY for the bot
+ * (`tripApp: true`, relay/trip-app-readiness.ts): a menu entry for a command
+ * that answers "not available yet" is a dead end. Default: not ready, i.e. the
+ * menus as they were before #443.
+ */
+export function routerCommandMenus(options: { tripApp?: boolean } = {}): CommandMenu[] {
   const menus: CommandMenu[] = [];
   for (const languageCode of [undefined, "en", "he"] as const) {
     const text = DESCRIPTIONS[languageCode ?? "en"];
     const everywhere = [
       { command: "help", description: text.help },
       { command: "name", description: text.name },
-      { command: "app", description: text.app },
+      ...(options.tripApp === true ? [{ command: "app", description: text.app }] : []),
     ];
     const privateChat = [
       ...everywhere,
@@ -105,6 +113,7 @@ export function routerCommandMenus(): CommandMenu[] {
 export async function publishCommandMenu(
   telegram: TelegramClient,
   log: (line: string) => void = () => {},
+  options: { tripApp?: boolean } = {},
 ): Promise<boolean> {
   if (!telegram.setMyCommands) {
     log(structuredLog("info", "relay.command_menu_unsupported", {}));
@@ -112,7 +121,7 @@ export async function publishCommandMenu(
   }
   let published = 0;
   let failed = 0;
-  for (const menu of routerCommandMenus()) {
+  for (const menu of routerCommandMenus(options)) {
     let ok = false;
     try {
       ok = await telegram.setMyCommands({
@@ -126,6 +135,6 @@ export async function publishCommandMenu(
     if (ok) published += 1;
     else failed += 1;
   }
-  log(structuredLog(failed ? "warn" : "info", "relay.command_menu_published", { published, failed }));
+  log(structuredLog(failed ? "warn" : "info", "relay.command_menu_published", { published, failed, trip_app: options.tripApp === true }));
   return failed === 0;
 }

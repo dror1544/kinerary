@@ -170,12 +170,26 @@ without a restart. Boot logs `mini_app.main_web_app_missing` once for `false`.
 
 ### The "Open trip" button and `/app`
 
-The relay posts and pins one message in a trip's group — when the group is bound
+**Only when the Mini App is ready for the bot** (owner decision, 2026-10-20). All of it —
+the button, the pin, `/app` in the command menus, the plain-word replies — appears only when
+(1) the profile has a `web` block with `telegram_bot_token_secret_ref`, and `getMe` on that
+token names `web.telegram_bot_username` (the same check as sign-in), **and** (2) that `getMe`
+says `has_main_web_app: true`. The relay is a separate process from the API, so it asks
+Telegram itself (`relay/trip-app-readiness.ts`, the same `createBotCheckRound` the API uses):
+at boot (it must be able to resolve the same `web.telegram_bot_token_secret_ref` as the API, or it logs `relay.trip_app_token_unresolved` and stays off), then every minute while the answer is not yes, so doing the BotFather step turns it on
+**without a restart**, and the menus are republished when it flips. **Unknown is not ready**
+(never checked, unreachable, a different bot's token, a field Telegram did not send). There is
+no fallback to the relay's own bot handle: no `web` block means no Mini App. Not ready, the
+group's introduction is exactly what it was before #443, `/app` typed anyway answers "not
+available yet", and the words go on to the companion like any sentence. The relay logs
+`relay.trip_app_ready` / `relay.trip_app_not_ready` at boot and `relay.trip_app_readiness_changed`
+when it flips; the API's `/readyz` carries the same facts for its own token.
+
+When ready, the relay posts and pins one message in a trip's group — when the group is bound
 (`/group KIN-…`, or the one-tap add link) and again when the bot is re-added — carrying a
-URL button to `https://t.me/<bot>?startapp=<trip id>`; `/app` (and "open the app",
-"פתח את האפליקציה", addressed to the assistant) answers with the same button for the
-chat's own trip. The bot comes from `web.telegram_bot_username`, else the relay's own
-`getMe`; with neither, no button is made and `trip_bot.open_trip_unavailable` is logged.
+URL button to `https://t.me/<web.telegram_bot_username>?startapp=<trip id>`; `/app` (and
+"open the app", "פתח את האפליקציה", addressed to the assistant) answers with the same button
+for the chat's own trip.
 
 The link **selects, it never grants**: the only thing in it is the trip id, which is
 already in every trip URL; the Mini App signs the person in with the identity Telegram
@@ -235,7 +249,7 @@ the existing web views and the ordinary sign-in page remain usable.
   `telegram-mini-app-db.test.ts`.
 - The button, `/app`, the words, the pin and the readiness field: `open-trip.test.ts`,
   `relay-open-trip.test.ts` (needs a scratch database), `mini-app-status.test.ts`,
-  `server-boot.test.ts`, `command-menu.test.ts`.
+  `server-boot.test.ts`, `command-menu.test.ts`, `trip-app-readiness.test.ts`.
 - Client: `web/src/mini-app/MiniAppSignIn.test.tsx`, `web/src/pages/TelegramAccounts.test.tsx`,
   `web/src/pages/TripUsername.test.tsx`.
 

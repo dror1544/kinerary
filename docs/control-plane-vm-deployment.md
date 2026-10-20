@@ -161,6 +161,9 @@ is its only credential, and losing it made every interpret call `FAILED`.
   `null` means Telegram has not said yet, which is not "no". None of these makes
   the API not-ready. The boot log carries the same finding as
   `mini_app.main_web_app_missing`.
+  The **relay** checks the same thing for itself (`relay.trip_app_ready` or
+  `relay.trip_app_not_ready` in its log): the Open trip button, `/app` and its menu entry
+  stay off until it is ready.
 - **Relay:** `$C logs relay` shows `relay.bot_identity` naming the bot you
   expect, `relay.ready … polling:true`, and **no** `409`/`Conflict` — a 409
   means a second `getUpdates` loop exists somewhere on the same token.

@@ -101,8 +101,11 @@ const startappOf = (decision: DispatchDecision): string | null => {
   return button && "url" in button ? button.url : null;
 };
 
+// The Mini App is READY for the bot (owner decision 2026-10-20) unless a test says otherwise.
+const READY = { tripAppReady: () => true, tripAppBotUsername: "Kinerary_bot" };
+
 const dispatch = (pool: pg.Pool, update: TelegramUpdate, options = {}, log: (line: string) => void = () => {}) =>
-  dispatchUpdate(pool, update, DEFAULT_STRINGS, log, BOT, options);
+  dispatchUpdate(pool, update, DEFAULT_STRINGS, log, BOT, { ...READY, ...options });
 
 describe("binding a group posts the Open trip message (#443)", { skip: SKIP }, () => {
   const redeem = async (fix: Fixture, chatId: string, tripId = fix.tripId, options = {}, log?: (line: string) => void) => {
@@ -127,7 +130,7 @@ describe("binding a group posts the Open trip message (#443)", { skip: SKIP }, (
     });
   });
 
-  test("the configured bot username wins over the relay's own getMe handle", async () => {
+  test("the link points at the configured Mini App bot - never at the relay's own getMe handle", async () => {
     await withFixture(async (fix) => {
       await setIntro(fix.pool, fix.tripId, "en");
       const decision = await redeem(fix, "-1002000802", fix.tripId, { tripAppBotUsername: "Portal_Bot" });
@@ -154,7 +157,7 @@ describe("binding a group posts the Open trip message (#443)", { skip: SKIP }, (
       if (!issued.ok) throw new Error("issue failed");
       const decision = await dispatchUpdate(
         fix.pool, say("-1002000804", `/group ${issued.token}`, { fromId: Number(ORGANIZER) }),
-        DEFAULT_STRINGS, (line) => lines.push(line), {}, {},
+        DEFAULT_STRINGS, (line) => lines.push(line), BOT, { tripAppReady: () => true },
       );
       assert.equal(decision.kind, "group_intro");
       if (decision.kind !== "group_intro") return;
@@ -292,12 +295,12 @@ describe("/app (#443)", { skip: SKIP }, () => {
     });
   });
 
-  test("with no bot handle known it says so, in words, instead of staying silent", async () => {
+  test("ready but with no bot handle it says so, in words, instead of staying silent", async () => {
     await withFixture(async (fix) => {
       await setIntro(fix.pool, fix.tripId, "en");
       await bind(fix.pool, "-1002000814", fix.tripId);
       const lines: string[] = [];
-      const decision = await dispatchUpdate(fix.pool, say("-1002000814", "/app"), DEFAULT_STRINGS, (l) => lines.push(l), {}, {});
+      const decision = await dispatchUpdate(fix.pool, say("-1002000814", "/app"), DEFAULT_STRINGS, (l) => lines.push(l), BOT, { tripAppReady: () => true });
       assert.equal(decision.kind === "reply" && decision.reply.text, uiString("openTripUnavailable", "en"));
       assert.ok(lines.some((l) => l.includes("trip_bot.open_trip_unavailable")));
     });
@@ -353,6 +356,146 @@ describe("asking for the app in plain words (#443)", { skip: SKIP }, () => {
       assert.equal((await startFromDeepLink(fix.pool, "700000823", issued.token)).kind, "started");
       const interviewing = await dispatch(fix.pool, say("700000823", "open the app", { type: "private" }));
       assert.equal(startappOf(interviewing), null, "an interview's words belong to the interview");
+    });
+  });
+});
+
+// ── The Mini App is not ready: owner decision 2026-10-20 ─────────────────────
+// No Open trip message or pin on a binding (the introduction is exactly as before
+// #443), /app says "not available yet", the plain words are left to the companion.
+// Unknown is not ready: no readiness function at all, one that says false, and one
+// that throws are all the same.
+
+describe("when the Mini App is NOT ready (#443)", { skip: SKIP }, () => {
+  const notReadyVariants: [string, Record<string, unknown>][] = [
+    ["no readiness known at all", {}],
+    ["readiness says false", { tripAppReady: () => false }],
+    ["readiness check throws", { tripAppReady: () => { throw new Error("boom"); } }],
+    ["readiness says something other than true", { tripAppReady: () => "yes" as never }],
+  ];
+  const asNotReady = (pool: pg.Pool, update: TelegramUpdate, variant: Record<string, unknown>) =>
+    dispatchUpdate(pool, update, DEFAULT_STRINGS, () => {}, BOT, { tripAppBotUsername: "Kinerary_bot", ...variant });
+
+  test("binding a group: the introduction is exactly what it was, with no Open trip message to post or pin", async () => {
+    await withFixture(async (fix) => {
+      await setIntro(fix.pool, fix.tripId, "en");
+      const issued = await issueGroupBindingToken(fix.pool, fix.tripId, ORGANIZER, { ttlSeconds: 3600 });
+      if (!issued.ok) throw new Error("issue failed");
+      const bindIn = (chatId: string, variant: Record<string, unknown> | null) => {
+        const update = say(chatId, `/group ${issued.token}`, { fromId: Number(ORGANIZER) });
+        return variant === null ? dispatch(fix.pool, update) : asNotReady(fix.pool, update, variant);
+      };
+      const ready = await bindIn("-1002000900", null);
+      assert.equal(ready.kind === "group_intro" && ready.openTrip !== undefined, true, "sanity: ready posts it");
+      let n = 1;
+      for (const [name, variant] of notReadyVariants) {
+        const decision = await bindIn(`-100200090${n++}`, variant);
+        assert.equal(decision.kind, "group_intro", name);
+        if (decision.kind !== "group_intro" || ready.kind !== "group_intro") return;
+        assert.equal(decision.openTrip, undefined, name);
+        assert.equal(decision.text, ready.text, `${name}: the introduction itself is unchanged`);
+        assert.equal(decision.pin, ready.pin, name);
+      }
+    });
+  });
+
+  test("the bot joining an already-bound group posts no Open trip message either", async () => {
+    await withFixture(async (fix) => {
+      await setIntro(fix.pool, fix.tripId, "en");
+      await bind(fix.pool, "-1002000910", fix.tripId);
+      for (const [name, variant] of notReadyVariants) {
+        const decision = await asNotReady(fix.pool, {
+          update_id: 90,
+          my_chat_member: {
+            chat: { id: "-1002000910", type: "supergroup" },
+            from: { id: 77, is_bot: false, first_name: "Dror" },
+            old_chat_member: { user: { id: Number(BOT.id), is_bot: true }, status: "left" },
+            new_chat_member: { user: { id: Number(BOT.id), is_bot: true }, status: "member" },
+          },
+        } as never, variant);
+        assert.equal(decision.kind, "group_intro", name);
+        assert.equal(decision.kind === "group_intro" && decision.openTrip, undefined, name);
+      }
+    });
+  });
+
+  test("/app typed anyway gets a plain 'not available yet', in every kind of chat", async () => {
+    await withFixture(async (fix) => {
+      await setIntro(fix.pool, fix.tripId, "en");
+      await bind(fix.pool, "-1002000920", fix.tripId);
+      await bind(fix.pool, "700000920", fix.tripId);
+      const chats: [string, string, string][] = [
+        ["bound group", "-1002000920", "supergroup"],
+        ["unbound group", "-1002000921", "supergroup"],
+        ["bound DM", "700000920", "private"],
+        ["unbound DM", "700000921", "private"],
+      ];
+      for (const [name, variant] of notReadyVariants) {
+        for (const [chatName, chatId, type] of chats) {
+          const decision = await asNotReady(fix.pool, say(chatId, "/app", { type }), variant);
+          assert.equal(decision.kind, "reply", `${name} / ${chatName}`);
+          if (decision.kind !== "reply") return;
+          assert.equal(decision.reply.text, uiString("openTripUnavailable", "en"), `${name} / ${chatName}`);
+          assert.equal(decision.reply.replyMarkup, undefined, `${name} / ${chatName}: no button`);
+        }
+      }
+    });
+  });
+
+  test("the plain words are not answered: they go on to the companion like any other sentence", async () => {
+    await withFixture(async (fix) => {
+      await setIntro(fix.pool, fix.tripId, "en", ["Rio"]);
+      await bind(fix.pool, "-1002000930", fix.tripId);
+      await bind(fix.pool, "700000930", fix.tripId);
+      for (const [name, variant] of notReadyVariants) {
+        const dm = await asNotReady(fix.pool, say("700000930", "open the app", { type: "private" }), variant);
+        assert.equal(dm.kind, "to_gateway", `${name}: a DM's words reach the companion`);
+        const group = await asNotReady(fix.pool, say("-1002000930", "Rio open the app"), variant);
+        assert.equal(group.kind, "to_gateway", `${name}: so does an addressed group message`);
+        assert.equal(startappOf(dm), null);
+        assert.equal(startappOf(group), null);
+      }
+    });
+  });
+
+  test("no web block, no button: a ready flag without the Mini App's own bot handle falls back to nothing (never the relay's getMe handle)", async () => {
+    await withFixture(async (fix) => {
+      await setIntro(fix.pool, fix.tripId, "en");
+      await bind(fix.pool, "-1002000940", fix.tripId);
+      // BOT.username is "Kinerary_bot"; the Mini App's handle is absent. /app must not reuse the relay's own.
+      const decision = await dispatchUpdate(fix.pool, say("-1002000940", "/app"), DEFAULT_STRINGS, () => {}, BOT, { tripAppReady: () => true });
+      assert.equal(startappOf(decision), null);
+      assert.equal(decision.kind === "reply" && decision.reply.text, uiString("openTripUnavailable", "en"));
+    });
+  });
+
+  test("readiness is asked per update, so it turns on - and off - without a restart", async () => {
+    await withFixture(async (fix) => {
+      await setIntro(fix.pool, fix.tripId, "en");
+      await bind(fix.pool, "-1002000950", fix.tripId);
+      let ready = false;
+      // ONE options object for the whole test: only the flag the function reads changes.
+      const options = { tripAppBotUsername: "Kinerary_bot", tripAppReady: () => ready };
+      const ask = () => dispatchUpdate(fix.pool, say("-1002000950", "/app"), DEFAULT_STRINGS, () => {}, BOT, options);
+      const bindAgain = async (chatId: string) => {
+        const issued = await issueGroupBindingToken(fix.pool, fix.tripId, ORGANIZER, { ttlSeconds: 3600 });
+        if (!issued.ok) throw new Error("issue failed");
+        return dispatchUpdate(
+          fix.pool, say(chatId, `/group ${issued.token}`, { fromId: Number(ORGANIZER) }), DEFAULT_STRINGS, () => {}, BOT, options,
+        );
+      };
+
+      assert.equal(startappOf(await ask()), null, "not ready: no button");
+      const before = await bindAgain("-1002000951");
+      assert.equal(before.kind === "group_intro" && before.openTrip, undefined);
+
+      ready = true; // the BotFather step was done; the readiness check noticed
+      assert.equal(startappOf(await ask()), `https://t.me/Kinerary_bot?startapp=${fix.tripId}`);
+      const after = await bindAgain("-1002000952");
+      assert.equal(after.kind === "group_intro" && after.openTrip !== undefined, true);
+
+      ready = false;
+      assert.equal(startappOf(await ask()), null, "and back off again");
     });
   });
 });

@@ -427,11 +427,18 @@ export interface DispatchOptions {
   groupBindingTtlSeconds?: number;
   /**
    * The bot handle the "Open trip" link points at: `web.telegram_bot_username`,
-   * the bot whose Main Mini App signs people in. Absent, the relay's own
-   * `getMe` handle is used (`botIdentity.username`); absent too, there is no
-   * link to give and every place that would send one says so.
+   * the bot whose Main Mini App signs people in. NOT the relay's own `getMe`
+   * handle: no `web` block means no Mini App, whatever bot the relay is.
    */
   tripAppBotUsername?: string | null;
+  /**
+   * Is the Mini App ready for that bot (relay/trip-app-readiness.ts): enabled,
+   * and the bot's Main Mini App is set. Asked on every update, so a flip needs no
+   * restart. Absent - and anything but exactly `true` - is NOT ready: no Open
+   * trip message on a binding, `/app` answers "not available yet", and the plain
+   * words are left to the companion (owner decision 2026-10-20).
+   */
+  tripAppReady?: () => boolean;
   /**
    * The signup super admin, as the subject digest approvals are checked
    * against. Absent means nobody may switch models from a chat.
@@ -554,12 +561,24 @@ function openTripFor(
   botIdentity: BotIdentity,
   log: (line: string) => void,
 ): OpenTripMessage | null {
-  const handle = normaliseBotUsername(options.tripAppBotUsername) ?? normaliseBotUsername(botIdentity.username);
+  // Unknown is not ready. Quiet on purpose: not being ready is a state, and the
+  // readiness module logs its own flips; this runs on every binding.
+  if (!tripAppIsReady(options)) return null;
+  const handle = normaliseBotUsername(options.tripAppBotUsername);
   const message = openTripMessage(handle, tripId, language);
   if (!message) {
     log(structuredLog("warn", "trip_bot.open_trip_unavailable", { reason: handle ? "BAD_TRIP_ID" : "NO_BOT_USERNAME" }));
   }
   return message;
+}
+
+/** Exactly `true` from the readiness check, and nothing else, is ready. */
+function tripAppIsReady(options: DispatchOptions): boolean {
+  try {
+    return options.tripAppReady?.() === true;
+  } catch {
+    return false;
+  }
 }
 
 export async function dispatchUpdate(
@@ -1018,8 +1037,16 @@ export async function dispatchUpdate(
   // command is a shortcut, not syntax) and are matched against a closed list,
   // only when the message is addressed to the assistant, only on a chat bound
   // to a trip. See open-trip.ts.
+  const appReady = tripAppIsReady(options);
   const appCommand = parsed.kind === "command" && parsed.name === "app";
-  const appWordsMaybe = parsed.kind === "text" && couldAskForTripApp(text);
+  // Not ready: the words are not answered at all (they go on to the companion as
+  // any sentence does), and the command says plainly that it is not there yet.
+  const appWordsMaybe = appReady && parsed.kind === "text" && couldAskForTripApp(text);
+  if (appCommand && !appReady) {
+    const language = await resolveChatLanguage(db, chatId, message.from?.language_code);
+    log(structuredLog("info", "trip_bot.open_trip_requested", { via: "command", available: false, ready: false }));
+    return { kind: "reply", reply: { chatId, text: uiString("openTripUnavailable", language) } };
+  }
   if (appCommand || appWordsMaybe) {
     const route = await resolveChatRoute(db, chatId);
     const isPrivate = message.chat?.type === "private";
