@@ -1277,13 +1277,16 @@ class ControlPlane:
         # for a companion that was never coming back.
         #
         #
-        # A DORMANT companion is not live either (issue #349): the control plane
-        # stopped it on purpose (its trip is not current, or archived, or was
-        # pinned off), so "NOT connected to the relay" is the right state and
-        # must neither fail a verify nor have its bridge restarted. Dormant =
-        # companion_gateways.desired = 'stopped'. No row (the reconciler has not
-        # decided about it) or no table (a database from before the migration)
-        # means NOT dormant: when in doubt a companion is expected up.
+        # A DORMANT companion is not live either (issue #349): one the control
+        # plane's reconciler has actually STOPPED on purpose and the host
+        # confirmed stopped, so "NOT connected to the relay" is the right state
+        # and must neither fail a verify nor have its bridge restarted. Dormant is
+        # what HAPPENED, not what was decided: desired 'stopped' AND the last
+        # action a successful stop AND the host last saying stopped/absent. A
+        # decision alone is not enough - in observe mode the reconciler decides
+        # and never acts, and a running (or later crashed) gateway must stay
+        # expected. No row (not decided about) or no table (a database from before
+        # the migration) means NOT dormant: when in doubt a companion is expected up.
         #
         # The same two special cases, for the same reasons, live in
         # control-plane/api/src/relay/gateway-wait.ts's expectedGatewayProfiles
@@ -1292,7 +1295,7 @@ class ControlPlane:
         dormant = ""
         if self.psql("SELECT to_regclass('control_plane.companion_gateways') IS NOT NULL") == "t":
             dormant = (" AND NOT EXISTS (SELECT 1 FROM control_plane.companion_gateways g "
-                       "WHERE g.hermes_profile = b.hermes_profile AND g.desired = 'stopped')")
+                       "WHERE g.hermes_profile = b.hermes_profile AND g.desired = 'stopped' AND g.last_action = 'stop' AND g.last_result = 'ok' AND g.observed IN ('stopped', 'absent'))")
         rows = self.psql(
             "SELECT DISTINCT t.slug || '|' || b.hermes_profile FROM control_plane.telegram_chat_bindings b "
             "JOIN control_plane.trips t ON t.id = b.trip_id WHERE b.closed_at IS NULL AND b.hermes_profile IS NOT NULL "

@@ -552,6 +552,36 @@ class PinGatewayOff(unittest.TestCase):
         self.assertIn("'japan2026'", tx)
         self.assertIn("trip_abcdefgh12", tx)
 
+    def test_the_pin_is_for_this_trip_only(self):
+        _result, seen = self.run_pin()
+        tx = seen[0]
+        self.assertIn("pin_trip_id", tx)
+        self.assertRegex(tx, r"'teardown', 'trip_abcdefgh12', now\(\)")
+        self.assertIn("pin_trip_id = excluded.pin_trip_id", tx)
+
+    def test_the_trips_retirement_clears_its_pin_in_the_same_transaction(self):
+        # A pin that outlived its trip would darken the next trip given the same
+        # profile name once the slug is free. Both branches of retire_in_db.
+        for trip in ({"id": "trip_abcdefgh12", "slug": "retired-japan-2026-20260101", "orig": "japan-2026"},
+                     {"id": "trip_abcdefgh12", "slug": "japan-2026", "orig": "japan-2026"}):
+            with self.subTest(slug=trip["slug"]):
+                seen: list[str] = []
+                with mock.patch.object(teardown, "psql", side_effect=lambda sql: seen.append(sql) or "0"):
+                    teardown.retire_in_db(trip)
+                tx = seen[-1]
+                self.assertLess(tx.index("BEGIN"), tx.index("pin = 'teardown' AND pin_trip_id = 'trip_abcdefgh12'"))
+                self.assertLess(tx.index("pin = 'teardown' AND pin_trip_id = 'trip_abcdefgh12'"), tx.index("COMMIT"))
+                self.assertIn("to_regclass('control_plane.companion_gateways') IS NOT NULL", tx,
+                              "a database from before the migration has nothing to clear and must not fail the retirement")
+                self.assertIn("'PIN', hermes_profile, 'trip_abcdefgh12', 'clear'", tx)
+
+    def test_the_protected_profiles_are_the_one_shared_list_plus_the_interviewer(self):
+        root = Path(__file__).resolve().parents[2]
+        listed = {line for line in (root / "scripts/protected-profiles.txt").read_text().splitlines()
+                  if line and not line.startswith("#")}
+        self.assertEqual(teardown.PROTECTED_PROFILES, listed | {"trip-intake"})
+        self.assertIn("default", teardown.PROTECTED_PROFILES)
+
     def test_the_lock_is_the_one_the_reconciler_and_the_release_tool_take(self):
         root = Path(__file__).resolve().parents[2]
         worker = (root / "control-plane/worker/control_plane_worker/gateway_reconcile.py").read_text()

@@ -54,8 +54,13 @@ chmod 700 "$WORK"
 # The handoff, and nothing else, comes from the caller.
 HANDOFF="$WORK/handoff.json"
 umask 077
-cat > "$HANDOFF"
+# At most 64 KiB, whatever the request kind: the largest real handoff is a few
+# KiB, and an unbounded read is a way to fill the disk through the forced
+# command. One byte more than the cap is read so an oversize request is REFUSED,
+# not silently truncated into something that might still parse.
+head -c 65537 > "$HANDOFF"
 [ -s "$HANDOFF" ] || die "empty handoff on stdin"
+[ "$(wc -c < "$HANDOFF" | tr -d ' ')" -le 65536 ] || die "request larger than 64 KiB refused"
 
 # Validate before use. `render_profile.py` does its own strict schema check and
 # forbidden-key scan; this is the narrower question of whether the values that
@@ -109,9 +114,11 @@ if kind == "companion_gateway_action":
     if action not in ("start", "stop"):
         print(f"refusing unknown gateway action: {action!r}", file=sys.stderr); raise SystemExit(2)
 if kind in ("trip_mcp_bridge_request", "trip_mcp_bridge_probe", "companion_gateway_action"):
-    slug = d.get("slug") or ""
-    if not isinstance(slug, str):
-        print(f"refusing unsafe trip slug: {slug!r}", file=sys.stderr); raise SystemExit(2)
+    # Absent or a string, nothing else: 0, false, [] and {} are not "no slug".
+    raw = d.get("slug")
+    if raw is not None and not isinstance(raw, str):
+        print(f"refusing unsafe trip slug: {raw!r}", file=sys.stderr); raise SystemExit(2)
+    slug = raw or ""
     # Becomes ~/kinerary-deploy/trips/<slug>: the trip-slug grammar, no more.
     if slug != "" and (not re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", slug) or len(slug) > 80):
         print(f"refusing unsafe trip slug: {slug!r}", file=sys.stderr); raise SystemExit(2)
@@ -156,7 +163,22 @@ import json, os, re, subprocess, sys
 
 NAME = re.compile(r"[a-z0-9][a-z0-9-]{1,62}")
 GATEWAY = re.compile(r"(?:^|\s)(?:-p|--profile)\s+([a-z0-9][a-z0-9-]{1,62})\s+gateway\s+run(?:\s|$)")
-ROW = re.compile(r"\s*([0-9]+)\s+([0-9]+)\s+(.*)")
+ROW = re.compile(r"\s*([0-9]+)\s+([0-9]+)\s+([0-9]+)\s+(.*)")
+
+
+def hermes_process(args):
+    """Is this command line a Hermes process, not any process whose arguments
+    happen to read like one? The program must be `hermes` (or a name containing
+    it), or a python running a hermes module. Argument text alone is what a
+    decoy supplies for free; together with the uid filter below it takes the
+    account itself to fake a gateway."""
+    tokens = args.split()
+    if not tokens:
+        return False
+    exe = os.path.basename(tokens[0])
+    if "hermes" in exe:
+        return True
+    return exe.startswith("python") and any("hermes" in t for t in tokens[1:4])
 
 
 def fail(message):
@@ -166,7 +188,7 @@ def fail(message):
 
 def top_level_counts():
     try:
-        listing = subprocess.run(["ps", "axww", "-o", "pid=,ppid=,args="], capture_output=True, text=True, timeout=30)
+        listing = subprocess.run(["ps", "axww", "-o", "pid=,ppid=,uid=,args="], capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
         listing = None
     if listing is None or listing.returncode != 0:
@@ -174,7 +196,10 @@ def top_level_counts():
     matches = {}
     for line in listing.stdout.splitlines():
         row = ROW.fullmatch(line)
-        found = GATEWAY.search(row.group(3)) if row else None
+        # Only this account's processes (the hermes user, on the VM the same uid
+        # as the container's), and only ones that are Hermes.
+        mine = row is not None and int(row.group(3)) == os.getuid()
+        found = GATEWAY.search(row.group(4)) if mine and hermes_process(row.group(4)) else None
         if found:
             matches[int(row.group(1))] = (int(row.group(2)), found.group(1))
     counts = {}
@@ -214,20 +239,151 @@ PYPROBE
 # The provenance marker. A Hermes host also runs profiles that are not this
 # product's companions (an operator's own, with their own bot tokens), and the
 # control plane must never start or stop one of those. A profile this system
-# installed carries the marker; a profile without it is refused by every action.
-# The deny list is the belt to that braces: names that are never touched even
-# if somebody puts a marker in them.
+# INSTALLED carries the marker, and a profile without it is refused by every
+# action. The marker is written only (1) by a fresh install here, never on an
+# ALREADY_PRESENT retry - a profile that was there before this system touched it
+# is exactly what the marker exists to exclude - and (2) by the backfill, which
+# needs host-side evidence that this system installed it (the trip's
+# companion-provenance.json, written when the bridge was wired, names the
+# profile). It is created exclusively and never through a symlink, and a profile
+# directory that is a symlink is not a profile.
+#
+# The deny list is the belt to that braces: names never touched even if somebody
+# puts a marker in them. ONE list, scripts/protected-profiles.txt, which
+# teardown-trip.py reads too (it adds only the interviewer). A missing or
+# malformed list refuses everything: no list is not "nothing is protected".
 GATEWAY_MARKER="kinerary-managed"
-GATEWAY_DENY=" default trip-monitor kinerary-extract "
+PROTECTED_FILE="$REPO_ROOT/scripts/protected-profiles.txt"
+GATEWAY_DENY=""
+load_gateway_deny() {
+  local line out=" "
+  [ -f "$PROTECTED_FILE" ] || die "no protected-profiles list at $PROTECTED_FILE: refusing to touch any gateway"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    case "$line" in *[!a-z0-9-]*) die "malformed entry in $PROTECTED_FILE: refusing to touch any gateway" ;; esac
+    out="$out$line "
+  done < "$PROTECTED_FILE"
+  GATEWAY_DENY="$out"
+}
 gateway_denied() {
+  [ -n "$GATEWAY_DENY" ] || load_gateway_deny
   case "$GATEWAY_DENY" in *" $1 "*) return 0 ;; esac
   return 1
 }
+# Written to a file for the same bash 3.2 reason as the probe. Modes:
+#   mark <profiles dir> <name>     marked | already | refused
+#   backfill <handoff> <profiles dir> <deploy root> <deny list> <refuse-all 0|1>
+#                                  one BACKFILL line per name, then BACKFILL_END
+write_gateway_mark() {
+  cat > "$WORK/gateway_mark.py" <<'PYMARK'
+import json, os, re, stat, sys
+
+MARKER = "kinerary-managed"
+NAME = re.compile(r"[a-z0-9][a-z0-9-]{1,62}")
+
+
+def mark(base, name):
+    """Exclusive, no-follow create of the marker in a real profile directory."""
+    path = os.path.join(base, name)
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return "absent"
+    if not stat.S_ISDIR(st.st_mode):          # a symlink to a directory is not a directory here
+        return "refused"
+    try:
+        dir_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return "refused"
+    try:
+        try:
+            existing = os.lstat(MARKER, dir_fd=dir_fd)
+            return "already" if stat.S_ISREG(existing.st_mode) else "refused"
+        except FileNotFoundError:
+            pass
+        try:
+            fd = os.open(MARKER, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dir_fd)
+        except OSError:
+            return "refused"
+        with os.fdopen(fd, "w") as handle:
+            handle.write(MARKER + "\n")
+        return "marked"
+    finally:
+        os.close(dir_fd)
+
+
+def peek(base, name):
+    """What is there, without writing: absent | refused (a symlink or not a
+    directory, or a marker that is not a regular file) | already | none."""
+    path = os.path.join(base, name)
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return "absent"
+    if not stat.S_ISDIR(st.st_mode):
+        return "refused"
+    try:
+        marker = os.lstat(os.path.join(path, MARKER))
+    except FileNotFoundError:
+        return "none"
+    return "already" if stat.S_ISREG(marker.st_mode) else "refused"
+
+
+def evidenced(deploy_root):
+    """Profiles some trip's companion-provenance.json names: written by the bridge
+    wiring this system performs, in a directory only this system's key writes."""
+    found = set()
+    trips = os.path.join(deploy_root, "trips")
+    try:
+        entries = sorted(os.scandir(trips), key=lambda e: e.name)
+    except OSError:
+        return found
+    for entry in entries:
+        if not entry.is_dir(follow_symlinks=False):
+            continue
+        path = os.path.join(entry.path, "companion-provenance.json")
+        try:
+            st = os.lstat(path)
+            if not stat.S_ISREG(st.st_mode) or st.st_size > 65536:
+                continue
+            data = json.load(open(path))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and isinstance(data.get("profile"), str) and NAME.fullmatch(data["profile"]):
+            found.add(data["profile"])
+    return found
+
+
+mode = sys.argv[1]
+if mode == "mark":
+    print(mark(sys.argv[2], sys.argv[3]))
+    raise SystemExit(0)
+
+handoff, base, deploy_root, deny, refuse_all = sys.argv[2:7]
+names = json.load(open(handoff)).get("profiles")
+if not isinstance(names, list) or not all(isinstance(n, str) and NAME.fullmatch(n) for n in names):
+    print("companion-install-host: refusing an unsafe backfill request", file=sys.stderr)
+    raise SystemExit(2)
+proof = evidenced(deploy_root)
+denied = set(deny.split())
+for name in names:
+    if refuse_all == "1" or name in denied:
+        outcome = "refused"
+    elif name not in proof:
+        state = peek(base, name)
+        outcome = state if state in ("already", "absent") else "refused"
+        if outcome == "refused":
+            print(f"companion-install-host: {name} not marked: no trip's provenance record names it", file=sys.stderr)
+    else:
+        outcome = mark(base, name)
+    print(f"BACKFILL {name} {outcome}")
+print(f"BACKFILL_END {len(names)}")
+PYMARK
+}
 mark_managed() {
-  local name="$1" dir="$HOME/.hermes/profiles/$1"
-  gateway_denied "$name" && return 0
-  [ -d "$dir" ] || return 0
-  printf 'kinerary-managed\n' > "$dir/$GATEWAY_MARKER" 2>/dev/null || true
+  gateway_denied "$1" && return 0
+  write_gateway_mark
+  /usr/bin/python3 "$WORK/gateway_mark.py" mark "$HOME/.hermes/profiles" "$1" >/dev/null || true
 }
 
 if [ "$REQUEST_KIND" = "companion_gateway_status" ]; then
@@ -236,31 +392,20 @@ if [ "$REQUEST_KIND" = "companion_gateway_status" ]; then
   exit 0
 fi
 
-# Backfill: mark profiles that already exist (installed before the marker did).
-# Exactly one `BACKFILL <name> <marked|already|refused|absent>` line per name,
-# then `BACKFILL_END <n>`. `refused` is the deny list; nothing else is touched.
+# Backfill: mark profiles that exist, were installed by this system (a trip's
+# provenance record names them) and are not protected. Exactly one
+# `BACKFILL <name> <marked|already|refused|absent>` line per name, then
+# `BACKFILL_END <n>`. A Mac refuses every name: launchd is its supervisor.
 if [ "$REQUEST_KIND" = "companion_gateway_backfill" ]; then
-  /usr/bin/python3 - "$HANDOFF" > "$WORK/backfill.names" <<'PYNAMES' || die "gateway backfill failed"
-import json, sys
-for n in json.load(open(sys.argv[1])).get("profiles"):
-    print(n)
-PYNAMES
-  total=0
-  while IFS= read -r backfill_name; do
-    total=$((total + 1))
-    if gateway_denied "$backfill_name"; then
-      outcome=refused
-    elif [ ! -d "$HOME/.hermes/profiles/$backfill_name" ]; then
-      outcome=absent
-    elif [ -f "$HOME/.hermes/profiles/$backfill_name/$GATEWAY_MARKER" ]; then
-      outcome=already
-    else
-      mark_managed "$backfill_name"
-      if [ -f "$HOME/.hermes/profiles/$backfill_name/$GATEWAY_MARKER" ]; then outcome=marked; else outcome=refused; fi
-    fi
-    printf 'BACKFILL %s %s\n' "$backfill_name" "$outcome"
-  done < "$WORK/backfill.names"
-  printf 'BACKFILL_END %s\n' "$total"
+  gateway_denied none || true     # load (and validate) the protected list before anything else
+  write_gateway_mark
+  refuse_all=0
+  if [ "$(uname -s)" = Darwin ]; then
+    refuse_all=1
+    printf 'companion-install-host: backfill refused: this platform runs launchd agents and is observe-only\n' >&2
+  fi
+  /usr/bin/python3 "$WORK/gateway_mark.py" backfill "$HANDOFF" "$HOME/.hermes/profiles" \
+    "${KINERARY_DEPLOY_ROOT:-$HOME/kinerary-deploy}" "$GATEWAY_DENY" "$refuse_all" || die "gateway backfill failed"
   exit 0
 fi
 
@@ -923,6 +1068,14 @@ revive_bridge_before_start() {  # slug
   local slug="$1" root="${KINERARY_DEPLOY_ROOT:-$HOME/kinerary-deploy}"
   [ -n "$slug" ] || return 0
   [ -f "$root/trips/$slug/topology.yaml" ] && [ -f "$root/trips/$slug/mcp/.env" ] || return 0
+  # The slug came from the caller: it must be THIS profile's trip before anything
+  # of that trip is touched. The provenance record the bridge wiring writes names
+  # the profile; a trip that does not, or is reached through a symlink, is refused.
+  if [ -L "$root/trips/$slug" ] || [ -L "$root/trips/$slug/companion-provenance.json" ] \
+       || ! grep -Fq "\"profile\":\"$PROFILE_NAME\"" "$root/trips/$slug/companion-provenance.json" 2>/dev/null; then
+    gateway_note "trip $slug has no provenance record naming $PROFILE_NAME"
+    return 2
+  fi
   TRIP_SLUG="$slug"
   read_trip_wiring
   bridge_reaches_trip "$MCP_PORT" "$TRIP_DIR" && return 0
@@ -959,14 +1112,20 @@ if [ "$REQUEST_KIND" = "companion_gateway_action" ]; then
   if [ "$verb" = stop ] && [ "$name" = trip-intake ]; then
     gateway_result "$name" "$verb" refused "the interviewer is never stopped"; exit 0
   fi
+  [ -L "$home" ] && { gateway_result "$name" "$verb" refused "its profile directory is a symlink"; exit 0; }
   [ -d "$home" ] || { gateway_result "$name" "$verb" refused "no such profile on this host"; exit 0; }
-  [ -f "$home/$GATEWAY_MARKER" ] || { gateway_result "$name" "$verb" refused "no provenance marker; run the backfill for it"; exit 0; }
+  if [ -L "$home/$GATEWAY_MARKER" ] || [ ! -f "$home/$GATEWAY_MARKER" ]; then
+    gateway_result "$name" "$verb" refused "no provenance marker; run the backfill for it"; exit 0
+  fi
   limit="${KINERARY_GATEWAY_WAIT_SECONDS:-45}"
   case "$limit" in ''|*[!0-9]*) limit=45 ;; esac
   now_running="$(gateway_count "$name")"
   if [ "$verb" = start ]; then
     if [ "$now_running" -ge 1 ]; then gateway_result "$name" start ok "already running"; exit 0; fi
-    if ! revive_bridge_before_start "$TRIP_SLUG"; then
+    revive_bridge_before_start "$TRIP_SLUG" && bridge_status=0 || bridge_status=$?
+    if [ "$bridge_status" -eq 2 ]; then
+      gateway_result "$name" start refused "that trip's provenance record does not name this profile"; exit 0
+    elif [ "$bridge_status" -ne 0 ]; then
       gateway_result "$name" start failed "its trip-mcp bridge is down and could not be restarted"; exit 0
     fi
     run_bounded "$limit" hermes -p "$name" gateway start || true
@@ -1064,7 +1223,9 @@ if [ -d "$HOME/.hermes/profiles/$PROFILE_NAME" ]; then
   # report success and change nothing.
   merge_overlay "$PROFILE_NAME"
   enroll_relay "$PROFILE_NAME"
-  mark_managed "$PROFILE_NAME"
+  # NOT marked here: a profile that was already present was not installed by
+  # this run, and "this system installed it" is what the marker asserts. Only the
+  # backfill, with provenance evidence, marks a profile from before the marker.
   start_gateway "$PROFILE_NAME"
   printf 'ALREADY_PRESENT %s\n' "$PROFILE_NAME"
   exit 0

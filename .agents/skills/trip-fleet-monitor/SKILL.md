@@ -96,8 +96,8 @@ of this section is that you can tell which:
 | health | meaning | alert? |
 |---|---|---|
 | `RUNNING` | should run, does | no |
-| `DORMANT` | should **not** run, does not — stopped on purpose. The *reason* says why (below) | **never** |
-| `PENDING_STOP` | should not run, still does — the reconciler has not stopped it yet (it is in `observe` mode, or inside its two-sweep confirmation) | no |
+| `DORMANT` | the reconciler **stopped** it on purpose and the host confirmed it (last action a successful stop; host says stopped/absent). The *reason* says why (below). In `observe` mode nothing is ever dormant | **never** |
+| `PENDING_STOP` | decided stopped but not (yet) stopped by the reconciler: it still runs, or nothing has stopped it (`observe` mode, or inside the two-sweep confirmation). The relay and the release tool still expect it up | no |
 | `STARTING` | should run, does not, decided under 15 minutes ago | no |
 | `BROKEN` | should run, does not — for over 15 minutes, or after 3 failed starts | **yes** |
 | `STRAY` | the trip was torn down or retired and a gateway is still running | **yes** |

@@ -333,16 +333,25 @@ const SITE_URL_SQL = `
  * is not is BROKEN and somebody should.
  *
  *   RUNNING       should run, does
- *   DORMANT       should not run, does not (the reason says why: NOT_CURRENT,
- *                 ARCHIVED, RETIRED, PIN_OFF ...) — also a conversation-hold
- *                 that found the gateway already down
- *   PENDING_STOP  should not run, still does — the reconciler has not (or, in
- *                 observe mode, will not) stopped it yet
+ *   DORMANT       the reconciler STOPPED it on purpose and the host confirmed it
+ *                 (desired stopped AND last action a successful stop AND the
+ *                 host last said stopped/absent). The reason says why: NOT_CURRENT,
+ *                 ARCHIVED, RETIRED, PIN_OFF ... It is what happened, not what
+ *                 was decided: in observe mode nothing is ever dormant.
+ *   PENDING_STOP  decided stopped but not (yet) stopped by the reconciler:
+ *                 still running, or never stopped by it (observe mode, or inside
+ *                 the two-sweep confirmation) - and a conversation-hold that
+ *                 found the gateway down. Nobody is told; the relay and the
+ *                 release tool still EXPECT it up.
  *   STARTING      should run, does not, and was decided under 15 minutes ago
  *   BROKEN        should run, does not, for over 15 minutes or after 3 failed starts
  *   STRAY         torn down or retired, and a gateway is still running
  *   DUPLICATE     two independent gateway processes for one profile
  *   UNOBSERVED    no good sweep in 30 minutes, so none of the above is current
+ *
+ * The DORMANT predicate is the same one relay/gateway-wait.ts and the release
+ * tool's live_companions() use to skip a companion; a test pins the three
+ * agree. If it changes, change all three.
  */
 const GATEWAY_SWEEP_FRESH_SQL = `coalesce((SELECT max(ev.occurred_at) FROM control_plane.companion_gateway_events ev
                                            WHERE ev.event = 'SWEEP' AND ev.result = 'ok') > now() - interval '30 minutes', false)`;
@@ -350,9 +359,9 @@ const GATEWAY_HEALTH_SQL = `CASE
     WHEN NOT ${GATEWAY_SWEEP_FRESH_SQL} OR g.observed IS NULL THEN 'UNOBSERVED'
     WHEN g.observed = 'duplicate' THEN 'DUPLICATE'
     WHEN g.desired = 'stopped' AND g.observed = 'running' AND g.reason IN ('RETIRED','TEARDOWN') THEN 'STRAY'
-    WHEN g.desired = 'stopped' AND g.observed = 'running' THEN 'PENDING_STOP'
-    WHEN g.desired = 'stopped' THEN 'DORMANT'
-    WHEN g.reason = 'QUIET_WINDOW' AND g.observed IN ('stopped','absent') THEN 'DORMANT'
+    WHEN g.desired = 'stopped' AND g.last_action = 'stop' AND g.last_result = 'ok' AND g.observed IN ('stopped', 'absent') THEN 'DORMANT'
+    WHEN g.desired = 'stopped' THEN 'PENDING_STOP'
+    WHEN g.reason = 'QUIET_WINDOW' AND g.observed IN ('stopped','absent') THEN 'PENDING_STOP'
     WHEN g.observed = 'running' THEN 'RUNNING'
     WHEN g.failures >= 3 OR g.decided_at < now() - interval '15 minutes' THEN 'BROKEN'
     ELSE 'STARTING'

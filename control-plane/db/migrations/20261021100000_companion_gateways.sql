@@ -63,10 +63,24 @@ CREATE TABLE control_plane.companion_gateways (
   decided_at      timestamptz NOT NULL DEFAULT now(),
   confirmations   smallint NOT NULL DEFAULT 1 CHECK (confirmations BETWEEN 1 AND 2),
 
-  -- An operator's or teardown's override, set under the advisory lock.
+  -- An operator's or teardown's override, set under the advisory lock. A pin
+  -- belongs to ONE TRIP (`pin_trip_id`, a plain id, no foreign key: it must
+  -- outlive the trip it was set for): a profile name can be reused by a later
+  -- trip once teardown has freed the slug, and a pin set for the old trip must
+  -- not darken the new one. The decider ignores a pin whose trip is not the
+  -- trip being decided, and retire_in_db clears a teardown pin in the same
+  -- transaction that retires its trip.
   pin             text CHECK (pin IN ('on', 'off', 'teardown')),
+  pin_trip_id     text,
   pin_set_at      timestamptz,
   CONSTRAINT companion_gateways_pin_pair CHECK ((pin IS NULL) = (pin_set_at IS NULL)),
+  CONSTRAINT companion_gateways_pin_trip CHECK (pin IS NULL OR pin_trip_id IS NOT NULL),
+
+  -- Every trip that says this profile should run (trip ids, nothing else). A
+  -- profile can be named by several trips; it runs if ANY says run, and this is
+  -- the record of which. Empty when the profile is stopped.
+  justified_by    text[] NOT NULL DEFAULT '{}',
+  CONSTRAINT companion_gateways_justified_by_size CHECK (cardinality(justified_by) <= 50),
 
   -- What the host said last time it was asked: `duplicate` is two independent
   -- gateway processes for one profile; `absent` is no such profile on the host.

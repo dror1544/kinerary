@@ -278,31 +278,47 @@ class RestoreAgainstPostgres(unittest.TestCase):
 
     # ---------------------------------------------------- issue #349 ---------
     GATEWAYS = ("CREATE TABLE control_plane.companion_gateways "
-                "(hermes_profile text PRIMARY KEY, desired text NOT NULL CHECK (desired IN ('running','stopped')));")
+                "(hermes_profile text PRIMARY KEY, desired text NOT NULL CHECK (desired IN ('running','stopped')), "
+                "observed text, last_action text, last_result text);")
 
     def test_live_companions_skips_a_dormant_companion_and_only_that(self):
-        # A companion the control plane stopped on purpose is not "live": verify
-        # must not call its absence a failure and restart-bridges must not
-        # restart its bridge. No row (undecided) and no table (a database from
-        # before the migration) both mean "expected up".
+        # DORMANT is what the reconciler DID: it stopped the gateway, the host
+        # confirmed, and the decision is still "stopped". A decision alone (observe
+        # mode decides and never acts) must leave a companion expected: it is
+        # running, or it crashed, and restart-bridges/verify must still see it.
+        # No row (undecided) and no table (a database from before the migration)
+        # both mean "expected up".
         self.sql("kinerary_control_plane", """
             UPDATE control_plane.telegram_chat_bindings SET hermes_profile = 'japan2026' WHERE id = 'tcb_1';
             INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES
               ('trip_ddddddd1', 'dormant-trip', 'ready_private'), ('trip_ddddddd2', 'undecided-trip', 'ready_private'),
-              ('trip_ddddddd3', 'warm-trip', 'ready_private');
+              ('trip_ddddddd3', 'warm-trip', 'ready_private'), ('trip_ddddddd4', 'observe-trip', 'ready_private'),
+              ('trip_ddddddd5', 'cameback-trip', 'ready_private'), ('trip_ddddddd6', 'failed-trip', 'ready_private'),
+              ('trip_ddddddd7', 'neverstopped-trip', 'ready_private'), ('trip_ddddddd8', 'absent-trip', 'ready_private');
             INSERT INTO control_plane.telegram_chat_bindings(id, trip_id, chat_id, hermes_profile) VALUES
               ('tcb_d1', 'trip_ddddddd1', '3001', 'dormant2026'), ('tcb_d2', 'trip_ddddddd2', '3002', 'undecided2026'),
-              ('tcb_d3', 'trip_ddddddd3', '3003', 'warm2026');
+              ('tcb_d3', 'trip_ddddddd3', '3003', 'warm2026'), ('tcb_d4', 'trip_ddddddd4', '3004', 'observe2026'),
+              ('tcb_d5', 'trip_ddddddd5', '3005', 'cameback2026'), ('tcb_d6', 'trip_ddddddd6', '3006', 'failed2026'),
+              ('tcb_d7', 'trip_ddddddd7', '3007', 'neverstopped2026'), ('tcb_d8', 'trip_ddddddd8', '3008', 'absent2026');
         """)
         without_table = self.cp.live_companions()
         self.assertIn(("dormant-trip", "dormant2026"), without_table, "no table: nothing is dormant")
         self.sql("kinerary_control_plane", self.GATEWAYS + """
-            INSERT INTO control_plane.companion_gateways VALUES ('dormant2026', 'stopped'), ('warm2026', 'running');""")
+            INSERT INTO control_plane.companion_gateways VALUES
+              ('dormant2026', 'stopped', 'stopped', 'stop', 'ok'),
+              ('absent2026', 'stopped', 'absent', 'stop', 'ok'),
+              ('warm2026', 'running', 'running', NULL, NULL),
+              ('observe2026', 'stopped', 'running', NULL, NULL),
+              ('cameback2026', 'stopped', 'running', 'stop', 'ok'),
+              ('failed2026', 'stopped', 'running', 'stop', 'failed'),
+              ('neverstopped2026', 'stopped', 'stopped', NULL, NULL);""")
         result = self.cp.live_companions()
         self.assertNotIn(("dormant-trip", "dormant2026"), result)
-        self.assertIn(("undecided-trip", "undecided2026"), result, "no decision recorded: expected up")
-        self.assertIn(("warm-trip", "warm2026"), result)
-        self.assertIn(("japan", "japan2026"), result)
+        self.assertNotIn(("absent-trip", "absent2026"), result)
+        for expected in (("undecided-trip", "undecided2026"), ("warm-trip", "warm2026"), ("japan", "japan2026"),
+                         ("observe-trip", "observe2026"), ("cameback-trip", "cameback2026"),
+                         ("failed-trip", "failed2026"), ("neverstopped-trip", "neverstopped2026")):
+            self.assertIn(expected, result, f"{expected} must stay expected")
 
     def test_the_release_lock_pauses_the_reconciler_and_lets_go(self):
         def try_lock() -> str:

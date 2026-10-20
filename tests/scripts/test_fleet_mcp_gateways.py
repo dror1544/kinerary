@@ -327,7 +327,12 @@ class GatewayHealthAgainstPostgres(unittest.TestCase):
             "VALUES ('SWEEP', now() - make_interval(mins => %s), 'observe', %s, 1, 0)", (ago_minutes, result))
 
     def gateway(self, label: str, *, desired: str, reason: str, observed: str | None, failures: int = 0,
-                decided_ago: int = 60, slug: str | None = None) -> str:
+                decided_ago: int = 60, slug: str | None = None, stopped_ok: bool = False,
+                last_action: str | None = None, last_result: str | None = None) -> str:
+        """`stopped_ok` is the shorthand for "the reconciler stopped it and the
+        host confirmed": a successful stop on record."""
+        if stopped_ok:
+            last_action, last_result = "stop", "ok"
         trip_id = f"trip_{uuid.uuid4().hex[:12]}"
         slug = slug or f"gwh-{label}-{uuid.uuid4().hex[:4]}"
         self.conn.execute("INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES (%s, %s, 'planned')",
@@ -335,11 +340,13 @@ class GatewayHealthAgainstPostgres(unittest.TestCase):
         self.trips.append(trip_id)
         self.conn.execute(
             "INSERT INTO control_plane.companion_gateways(hermes_profile, trip_id, kind, desired, reason, observed, "
-            "observed_count, failures, decided_at, observed_at) VALUES (%s, %s, 'companion', %s, %s, %s, %s, %s, "
-            "now() - make_interval(mins => %s), CASE WHEN %s::text IS NULL THEN NULL ELSE now() END)",
+            "observed_count, failures, decided_at, observed_at, last_action, last_action_at, last_result) "
+            "VALUES (%s, %s, 'companion', %s, %s, %s, %s, %s, now() - make_interval(mins => %s), "
+            "CASE WHEN %s::text IS NULL THEN NULL ELSE now() END, %s, "
+            "CASE WHEN %s::text IS NULL THEN NULL ELSE now() END, %s)",
             (f"gwh{uuid.uuid4().hex[:10]}", trip_id, desired, reason, observed,
              None if observed is None else (0 if observed in ("stopped", "absent") else 1), failures, decided_ago,
-             observed))
+             observed, last_action, last_action, last_result))
         return slug
 
     def health_of(self, slug: str) -> str:
@@ -351,9 +358,17 @@ class GatewayHealthAgainstPostgres(unittest.TestCase):
         self.sweep()
         cases = {
             "RUNNING": dict(desired="running", reason="CURRENT_TRIP", observed="running"),
-            "DORMANT": dict(desired="stopped", reason="ARCHIVED", observed="stopped"),
-            "DORMANT-absent": dict(desired="stopped", reason="RETIRED", observed="absent"),
-            "DORMANT-hold": dict(desired="running", reason="QUIET_WINDOW", observed="stopped", decided_ago=120),
+            "DORMANT": dict(desired="stopped", reason="ARCHIVED", observed="stopped", stopped_ok=True),
+            "DORMANT-absent": dict(desired="stopped", reason="RETIRED", observed="absent", stopped_ok=True),
+            # decided, never stopped by the reconciler (observe mode): NOT dormant
+            "PENDING_STOP-never-stopped": dict(desired="stopped", reason="NOT_CURRENT", observed="stopped"),
+            "PENDING_STOP-failed-stop": dict(desired="stopped", reason="NOT_CURRENT", observed="stopped",
+                                             last_action="stop", last_result="failed"),
+            "PENDING_STOP-came-back": dict(desired="stopped", reason="NOT_CURRENT", observed="running",
+                                           stopped_ok=True),
+            "PENDING_STOP-stopped-then-started": dict(desired="stopped", reason="NOT_CURRENT", observed="stopped",
+                                                      last_action="start", last_result="ok"),
+            "PENDING_STOP-hold": dict(desired="running", reason="QUIET_WINDOW", observed="stopped", decided_ago=120),
             "PENDING_STOP": dict(desired="stopped", reason="ARCHIVED", observed="running"),
             "STRAY": dict(desired="stopped", reason="RETIRED", observed="running"),
             "STRAY-teardown": dict(desired="stopped", reason="TEARDOWN", observed="running"),
@@ -373,7 +388,7 @@ class GatewayHealthAgainstPostgres(unittest.TestCase):
         self.sweep(ago_minutes=45)
         self.sweep(ago_minutes=1, result="host_unreachable")
         slugs = [self.gateway("a", desired="running", reason="CURRENT_TRIP", observed="running"),
-                 self.gateway("b", desired="stopped", reason="ARCHIVED", observed="stopped"),
+                 self.gateway("b", desired="stopped", reason="ARCHIVED", observed="stopped", stopped_ok=True),
                  self.gateway("c", desired="stopped", reason="RETIRED", observed="running")]
         for slug in slugs:
             self.assertEqual(self.health_of(slug), "UNOBSERVED", slug)
@@ -384,7 +399,7 @@ class GatewayHealthAgainstPostgres(unittest.TestCase):
     def test_alerts_name_what_needs_a_person_and_nothing_that_was_on_purpose(self) -> None:
         self.sweep()
         up = self.gateway("up", desired="running", reason="CURRENT_TRIP", observed="running")
-        dormant = self.gateway("dormant", desired="stopped", reason="ARCHIVED", observed="stopped")
+        dormant = self.gateway("dormant", desired="stopped", reason="ARCHIVED", observed="stopped", stopped_ok=True)
         pending = self.gateway("pending", desired="stopped", reason="ARCHIVED", observed="running")
         broken = self.gateway("broken", desired="running", reason="CURRENT_TRIP", observed="stopped", decided_ago=30,
                               failures=1)
@@ -402,7 +417,7 @@ class GatewayHealthAgainstPostgres(unittest.TestCase):
     def test_the_overview_counts_them(self) -> None:
         self.sweep()
         self.gateway("one", desired="running", reason="CURRENT_TRIP", observed="running")
-        self.gateway("two", desired="stopped", reason="ARCHIVED", observed="stopped")
+        self.gateway("two", desired="stopped", reason="ARCHIVED", observed="stopped", stopped_ok=True)
         text = self.tool("fleet_overview")
         self.assertIn("COMPANION GATEWAYS", text)
         self.assertRegex(text, r"reconciler: observe, last sweep \d+ min ago \(ok\)")

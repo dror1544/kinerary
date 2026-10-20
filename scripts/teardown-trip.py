@@ -95,8 +95,25 @@ SLUG = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 # Past ready_private, a trip has been handed to real people. Tearing one of
 # those down is a decision about a family's trip, not test housekeeping.
 REFUSED_STATES = {"activation_approved", "active", "completed", "sealed"}
-# Profiles that are not a trip's companion at all.
-PROTECTED_PROFILES = {"trip-intake", "elulhome", "familytrip", "kinerary-extract", "kinerarytest", "default"}
+# Profiles that are not a trip's companion at all: the shared list the forced
+# command (companion-install-host.sh) reads too, plus the interviewer, which that
+# script manages (always running) and so keeps off the shared list. A list that
+# cannot be read refuses the teardown rather than protecting nothing.
+PROTECTED_FILE = Path(__file__).resolve().parent / "protected-profiles.txt"
+
+
+def _protected_profiles() -> set[str]:
+    names = {"trip-intake"}
+    for raw in PROTECTED_FILE.read_text(encoding="utf-8").splitlines():
+        if not raw or raw.startswith("#"):
+            continue
+        if not re.fullmatch(r"[a-z0-9-]+", raw):
+            raise SystemExit(f"malformed entry in {PROTECTED_FILE}: refusing to run")
+        names.add(raw)
+    return names
+
+
+PROTECTED_PROFILES = _protected_profiles()
 
 GREEN, RED, YELLOW, DIM, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
 
@@ -554,6 +571,27 @@ def backup(trip: dict, trip_dir: Path, dest: Path) -> None:
 CLOSE_SESSIONS = ("UPDATE control_plane.intake_sessions SET expired_at = now() "
                   "WHERE trip_id = '{id}' AND expired_at IS NULL AND state <> 'confirmed'")
 
+# The teardown pin (pin_gateway_off, below) is a statement about THIS trip. It
+# is cleared in the very transaction that retires the trip, so it cannot outlive
+# it: once teardown frees a slug, a new trip can be given the same profile name,
+# and a pin left behind would darken it. (The decider also ignores a pin whose
+# trip is not the one it is deciding, which covers a pin this step never got to
+# clear.) Guarded: a database from before the companion_gateways migration has
+# nothing to clear, and a bare UPDATE would fail the whole transaction.
+CLEAR_TEARDOWN_PIN = """DO $clear$
+BEGIN
+  IF to_regclass('control_plane.companion_gateways') IS NOT NULL THEN
+    WITH cleared AS (
+      UPDATE control_plane.companion_gateways
+         SET pin = NULL, pin_trip_id = NULL, pin_set_at = NULL, updated_at = now()
+       WHERE pin = 'teardown' AND pin_trip_id = '{id}'
+      RETURNING hermes_profile)
+    INSERT INTO control_plane.companion_gateway_events (event, hermes_profile, trip_id, pin)
+      SELECT 'PIN', hermes_profile, '{id}', 'clear' FROM cleared;
+  END IF;
+END
+$clear$"""
+
 
 # A group-binding token (issue #175, migration 0045) is issued into the
 # organizer's DM and stays redeemable for up to its own TTL — 7 to 30 days —
@@ -603,6 +641,7 @@ def retire_in_db(trip: dict) -> str:
 UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed'
  WHERE trip_id = '{trip['id']}' AND closed_at IS NULL;
 {CLOSE_SESSIONS.format(id=trip['id'])};
+{CLEAR_TEARDOWN_PIN.format(id=trip['id'])};
 COMMIT;""")
         return trip["slug"]
     base = f"retired-{trip['orig']}-{datetime.now():%Y%m%d}"
@@ -618,6 +657,7 @@ UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason
 UPDATE control_plane.trips SET slug = '{new}', updated_at = now()
  WHERE id = '{trip['id']}' AND slug = '{trip['slug']}';
 {CLOSE_SESSIONS.format(id=trip['id'])};
+{CLEAR_TEARDOWN_PIN.format(id=trip['id'])};
 COMMIT;""")
     return new
 
@@ -656,10 +696,11 @@ def pin_gateway_off(trip: dict) -> str:
 SET LOCAL lock_timeout = '120s';
 SELECT pg_advisory_xact_lock(hashtext('{GATEWAY_LOCK_TEXT}'));
 INSERT INTO control_plane.companion_gateways
-  (hermes_profile, trip_id, kind, desired, reason, pin, pin_set_at)
-VALUES ('{profile}', '{trip['id']}', 'companion', 'stopped', 'TEARDOWN', 'teardown', now())
+  (hermes_profile, trip_id, kind, desired, reason, pin, pin_trip_id, pin_set_at)
+VALUES ('{profile}', '{trip['id']}', 'companion', 'stopped', 'TEARDOWN', 'teardown', '{trip['id']}', now())
 ON CONFLICT (hermes_profile) DO UPDATE
-  SET trip_id = excluded.trip_id, desired = 'stopped', reason = 'TEARDOWN', pin = 'teardown', pin_set_at = now(),
+  SET trip_id = excluded.trip_id, desired = 'stopped', reason = 'TEARDOWN', pin = 'teardown',
+      pin_trip_id = excluded.pin_trip_id, pin_set_at = now(),
       decided_at = CASE WHEN companion_gateways.desired = 'stopped' AND companion_gateways.reason = 'TEARDOWN'
                         THEN companion_gateways.decided_at ELSE now() END,
       confirmations = 1, updated_at = now();

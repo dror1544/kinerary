@@ -656,7 +656,7 @@ def main(argv: list[str] | None = None) -> int:
                 from .gateway_reconcile import load_facts
                 from datetime import datetime, timezone
                 with psycopg.connect(db_url, row_factory=dict_row, autocommit=True, connect_timeout=10) as conn:
-                    names = [f.profile for f in load_facts(conn, datetime.now(timezone.utc)) if not f.retired]
+                    names = list(dict.fromkeys(f.profile for f in load_facts(conn, datetime.now(timezone.utc)) if not f.retired))
                 result = adapter.backfill(names)
                 for name in names:
                     print(f"{name}: {result[name]}", flush=True)

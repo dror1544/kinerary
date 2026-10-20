@@ -33,7 +33,9 @@ pin and the operator's `on`/`off` pin come first):
      end date + GRACE_DAYS (14), which is rule 5.
   2. WARM. It was an organizer's current trip and they switched away (the
      binding closed by /switch, or the chat was bound to another trip) less
-     than WARM_DAYS (2) ago. It keeps running for those two days.
+     than WARM_DAYS (2) ago. It keeps running for those two days, unless it is
+     already past its grace: an archived trip is archived even if it was just
+     current.
   3. UNDERWAY. start_date <= today <= end_date. It runs whatever its
      organizer is looking at.
   4. REVIVED. A user asked for it less than REVIVE_DAYS (2) ago: a message
@@ -52,6 +54,28 @@ There is no limit on how many companions an organizer has running while their
 trips are underway or warm; what bounds the fleet is the current trip, the
 warm window, the dates and the revival.
 
+A PROFILE CAN BE NAMED BY SEVERAL TRIPS (a slug freed by teardown can be reused
+by a new trip with the same profile name). decide() is per trip; the profile
+runs if ANY trip naming it says run, and the record says which trips justify it
+(`justified_by`). Only if every trip says stop does it stop.
+
+WHAT COUNTS AS DORMANT. Other systems skip a "dormant" companion (the relay's
+startup wait, the release tool's verify and restart-bridges, the fleet monitor):
+that is a gateway the reconciler has actually stopped and the host has
+confirmed stopped - last_action = 'stop', last_result = 'ok', observed
+stopped/absent, desired stopped. A desired-stopped gateway that is running, or
+that nobody has stopped (observe mode never does), is still expected. To make
+convergence real in enforce mode the sweep sends an idempotent `stop` for a
+desired-stopped gateway it finds already stopped but has not yet recorded a
+confirmed stop for (the host answers ok without touching anything).
+
+THE LOCK IS NOT HELD ACROSS THE NETWORK. The sweep takes the advisory lock to
+decide and record, releases it around every call to the host (a status read can
+take a minute, an action three), and re-takes it to record the result - so
+`kinerary-cp-release` and `teardown-trip.py`, which wait two minutes for it,
+are never starved. Before each action it re-takes the lock and re-decides that
+one profile; if the answer changed (a pin landed) the action is dropped.
+
 WHY STARTS ARE NOT DEBOUNCED BUT STOPS ARE. A wrongly started gateway costs a
 process for a few minutes; a wrongly stopped one is a dark companion for a
 family. So a start acts at once, and a stop that a date or a clock decides
@@ -69,9 +93,10 @@ import logging
 import re
 import subprocess
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .companion_profile import forced_command_argv
 from .mcp_bridge import log_fields
@@ -92,6 +117,9 @@ BACKOFF_CAP_MINUTES = 60
 #: A host that does not answer this many times in a row ends the sweep.
 BREAKER_AFTER = 3
 EVENT_RETENTION_DAYS = 90
+#: How long the sweep waits to RE-take the lock between host calls before it
+#: abandons the sweep (a release or teardown holds it that long at most).
+LOCK_REWAIT_SECONDS = 30
 STATEMENT_TIMEOUT_MS = 5000
 INTERVIEWER_PROFILE = "trip-intake"
 
@@ -133,7 +161,7 @@ class GatewayFacts:
     trip_id: str | None = None
     slug: str | None = None              # the trip's slug, for the bridge check before a start
     retired: bool = False
-    pin: str | None = None               # 'on' | 'off' | 'teardown' | None
+    pin: str | None = None               # 'on' | 'off' | 'teardown' | None - only a pin set FOR THIS TRIP
     start_date: date | None = None
     end_date: date | None = None
     #: Some organizer's open private-chat binding points at THIS trip.
@@ -191,7 +219,8 @@ def decide(facts: GatewayFacts, now: datetime, policy: Policy = DEFAULT_POLICY) 
 
     if facts.is_current and not past_grace:
         return Decision("running", "CURRENT_TRIP")
-    if facts.warm_at is not None and now - facts.warm_at < timedelta(days=policy.warm_days):
+    if (facts.warm_at is not None and now - facts.warm_at < timedelta(days=policy.warm_days)
+            and not past_grace):
         return Decision("running", "WARM")
     if facts.start_date is not None and facts.end_date is not None and facts.start_date <= today <= facts.end_date:
         return Decision("running", "UNDERWAY")
@@ -203,6 +232,59 @@ def decide(facts: GatewayFacts, now: datetime, policy: Policy = DEFAULT_POLICY) 
     if facts.last_activity_at is not None and now - facts.last_activity_at < timedelta(hours=policy.quiet_hours):
         return Decision("running", "QUIET_WINDOW")
     return Decision("stopped", "ARCHIVED" if past_grace else "NOT_CURRENT", needs_confirmation=True)
+
+
+#: Which running reason to report when several trips want a profile up.
+_RUN_RANK = {r: i for i, r in enumerate(
+    ("INTERVIEWER", "PIN_ON", "CURRENT_TRIP", "UNDERWAY", "WARM", "REVIVED", "QUIET_WINDOW"))}
+#: Which stop reason to report when every trip says stop (live trips first).
+_STOP_RANK = {r: i for i, r in enumerate(("TEARDOWN", "PIN_OFF", "ARCHIVED", "NOT_CURRENT", "RETIRED"))}
+
+
+@dataclass(frozen=True)
+class ProfileDecision:
+    """The decision for one PROFILE, which may be named by several trips."""
+
+    profile: str
+    kind: str
+    desired: str
+    reason: str
+    needs_confirmation: bool
+    #: The trip that justifies the decision (the best running one, else the
+    #: newest live one); the slug is the one the host checks a bridge for.
+    trip_id: str | None = None
+    slug: str | None = None
+    #: Every trip that says run (empty when the profile is stopped).
+    justified_by: tuple[str, ...] = ()
+
+
+def decide_profile(group: Sequence[GatewayFacts], now: datetime, policy: Policy = DEFAULT_POLICY) -> ProfileDecision:
+    """One decision per profile from one decision per trip naming it.
+
+    A profile runs if ANY trip naming it says run: a stale or archived trip that
+    happens to share the profile name must never stop a live one. It stops only
+    when every trip says stop, and then the reason comes from the live trips
+    (a retired trip's RETIRED only speaks when nothing live names the profile).
+    Pure, like decide()."""
+    decided = [(f, decide(f, now, policy)) for f in group]
+    first = group[0]
+    running = sorted(((f, d) for f, d in decided if d.desired == "running"), key=lambda fd: _RUN_RANK[fd[1].reason])
+    if running:
+        best_f, best_d = running[0]
+        return ProfileDecision(first.profile, first.kind, "running", best_d.reason, False, best_f.trip_id, best_f.slug,
+                               tuple(f.trip_id for f, _ in running if f.trip_id))
+    live = [(f, d) for f, d in decided if not f.retired] or decided
+    live.sort(key=lambda fd: _STOP_RANK.get(fd[1].reason, 99))
+    f0, d0 = live[0]
+    return ProfileDecision(first.profile, first.kind, "stopped", d0.reason,
+                           all(d.needs_confirmation for _, d in live), f0.trip_id, f0.slug, ())
+
+
+def group_by_profile(facts: Iterable[GatewayFacts]) -> dict[str, list[GatewayFacts]]:
+    groups: dict[str, list[GatewayFacts]] = {}
+    for f in facts:
+        groups.setdefault(f.profile, []).append(f)
+    return groups
 
 
 # ── what the host reports, and how it is asked ────────────────────────────────
@@ -394,11 +476,10 @@ WITH named AS (
   SELECT b.hermes_profile, b.trip_id, 1 FROM control_plane.telegram_chat_bindings b
    WHERE b.hermes_profile IS NOT NULL
 ), pick AS (
-  SELECT DISTINCT ON (n.profile) n.profile, n.trip_id
+  SELECT DISTINCT n.profile, n.trip_id
     FROM named n JOIN control_plane.trips t ON t.id = n.trip_id
    WHERE n.profile ~ '^[a-z0-9][a-z0-9-]{1,62}$'
      AND t.lifecycle_state <> ALL(%(pre)s)
-   ORDER BY n.profile, (t.slug LIKE 'retired-%%'), n.rank, t.created_at DESC
 ), org AS (
   SELECT DISTINCT m.trip_id, l.telegram_subject_digest AS digest
     FROM control_plane.trip_memberships m
@@ -408,8 +489,7 @@ WITH named AS (
   SELECT b.chat_id, b.trip_id, b.created_at, b.closed_at, b.closed_reason,
          'sha256:' || encode(sha256(convert_to(b.chat_id, 'UTF8')), 'hex') AS digest
     FROM control_plane.telegram_chat_bindings b
-    JOIN control_plane.trips bt ON bt.id = b.trip_id
-   WHERE b.chat_id ~ '^[0-9]{1,20}$' AND bt.slug NOT LIKE 'retired-%%'
+   WHERE b.chat_id ~ '^[0-9]{1,20}$'
 )
 SELECT p.profile, t.id AS trip_id, t.slug,
        (t.slug LIKE 'retired-%%' OR EXISTS (
@@ -432,18 +512,20 @@ SELECT p.profile, t.id AS trip_id, t.slug,
            AND e.occurred_at > %(revive_since)s) AS asked_at,
        (SELECT max(e.occurred_at) FROM control_plane.assistant_events e
          WHERE e.trip_id = t.id AND e.occurred_at > %(quiet_since)s) AS last_activity_at,
-       g.pin
+       CASE WHEN g.pin_trip_id = t.id THEN g.pin END AS pin
   FROM pick p
   JOIN control_plane.trips t ON t.id = p.trip_id
   LEFT JOIN control_plane.companion_gateways g ON g.hermes_profile = p.profile
- ORDER BY p.profile
+ ORDER BY p.profile, (t.slug LIKE 'retired-%%'), t.created_at DESC, t.id
 """
 
 
 def load_facts(conn: Any, now: datetime, interviewer_profile: str = INTERVIEWER_PROFILE,
                policy: Policy = DEFAULT_POLICY) -> list[GatewayFacts]:
-    """One GatewayFacts per managed profile: the interviewer, then every
-    companion profile the control plane has named for a provisioned trip."""
+    """The interviewer, then one GatewayFacts per (profile, trip) the control
+    plane has named for a provisioned trip: a profile named by several trips
+    appears once per trip, live and newest first. A pin counts only for the trip
+    it was set for."""
     rows = conn.execute(FACTS_SQL, {
         "pre": list(PRE_PROVISIONING_STATES),
         "wake": list(WAKE_OUTCOMES),
@@ -614,28 +696,51 @@ class GatewayReconcileSweep:
 
     # -- one sweep ------------------------------------------------------------
 
+    class _LockBusy(Exception):
+        """The advisory lock could not be had (first take: skip the sweep)."""
+
+    class _LockLost(Exception):
+        """The lock could not be RE-taken between host calls: abandon the sweep."""
+
+    @contextmanager
+    def _locked(self, conn: Any, *, first: bool = False):
+        """Hold the advisory lock for one stretch of database work. The first
+        take does not wait (another holder means skip this sweep); every later
+        take waits LOCK_REWAIT_SECONDS, because a release or teardown may be
+        holding it for the moment it takes them to record."""
+        if not advisory_lock(conn, wait_seconds=0.0 if first else float(LOCK_REWAIT_SECONDS)):
+            raise self._LockBusy() if first else self._LockLost()
+        try:
+            yield
+        finally:
+            advisory_unlock(conn)
+
     def run(self, should_stop: Callable[[], bool] = lambda: False, *,
             dry_run: bool = False) -> dict[str, Any]:
         """One sweep. `dry_run` reads and decides and asks the host, and writes
         and acts on NOTHING: it is the operator's "what would you do" and it is
         always observe, whatever the configured mode."""
         mode = "observe" if dry_run else self.mode
-        now = self._now()
         summary: dict[str, Any] = {
             "mode": "dry_run" if dry_run else mode, "profiles": 0, "running": 0, "stopped": 0,
             "changed": 0, "starts": 0, "stops": 0, "failed": 0, "deferred": 0,
-            "would_start": [], "would_stop": [], "duplicates": [], "result": "ok",
+            "would_start": [], "would_stop": [], "would_confirm": [], "duplicates": [], "result": "ok",
         }
         conn = self._connect()
-        locked = False
         try:
-            locked = advisory_lock(conn)
-            if not locked:
-                summary["result"] = "lock_busy"
-                logger.info(log_fields("gateway_reconcile.skipped", reason="another holder has the advisory lock "
-                                       "(a teardown, a release, a pin, or a sweep)"))
-                return summary
-            self._sweep(conn, now, mode, summary, should_stop, write=not dry_run)
+            self._sweep(conn, mode, summary, should_stop, write=not dry_run)
+        except self._LockBusy:
+            summary["result"] = "lock_busy"
+            logger.info(log_fields("gateway_reconcile.skipped", reason="another holder has the advisory lock "
+                                   "(a teardown, a release, a pin, or a sweep)"))
+            conn.close()
+            return summary
+        except self._LockLost:
+            summary["result"] = "lock_busy"
+            logger.warning(log_fields(
+                "gateway_reconcile.lock_lost", waited=LOCK_REWAIT_SECONDS,
+                effect="a release or teardown held the lock for the whole wait; the rest of this sweep is abandoned "
+                       "and the next one starts from the database"))
         except GatewayHostError as exc:
             summary["result"] = "host_unreachable"
             logger.warning(log_fields(
@@ -645,56 +750,68 @@ class GatewayReconcileSweep:
             summary["result"] = "error"
             logger.error(log_fields("gateway_reconcile.error", error=type(exc).__name__,
                                     effect="this sweep is abandoned; the next one starts from the database"))
+        try:
+            if not dry_run:
+                self._event(conn, "SWEEP", mode=mode, result=summary["result"],
+                            profiles=summary["profiles"], actions=summary["starts"] + summary["stops"])
+                self._prune(conn)
+        except Exception as exc:  # the heartbeat must not mask the sweep's own outcome
+            logger.warning(log_fields("gateway_reconcile.heartbeat_failed", error=type(exc).__name__))
         finally:
-            try:
-                if not dry_run and summary["result"] != "lock_busy":
-                    self._event(conn, "SWEEP", mode=mode, result=summary["result"],
-                                profiles=summary["profiles"], actions=summary["starts"] + summary["stops"])
-                    self._prune(conn)
-            except Exception as exc:  # the heartbeat must not mask the sweep's own outcome
-                logger.warning(log_fields("gateway_reconcile.heartbeat_failed", error=type(exc).__name__))
-            try:
-                if locked:
-                    advisory_unlock(conn)
-            finally:
-                conn.close()
+            conn.close()
         logger.info(log_fields(
             "gateway_reconcile.sweep",
             **{k: v for k, v in summary.items() if not isinstance(v, list)},
             would_start=",".join(summary["would_start"]), would_stop=",".join(summary["would_stop"]),
-            duplicates=",".join(summary["duplicates"]),
+            would_confirm=len(summary["would_confirm"]), duplicates=",".join(summary["duplicates"]),
         ))
         return summary
 
-    def _sweep(self, conn: Any, now: datetime, mode: str, summary: dict[str, Any],
+    def _decide_all(self, conn: Any, now: datetime) -> dict[str, ProfileDecision]:
+        groups = group_by_profile(load_facts(conn, now, self._interviewer, self._policy))
+        return {profile: decide_profile(group, now, self._policy) for profile, group in groups.items()}
+
+    def _sweep(self, conn: Any, mode: str, summary: dict[str, Any],
                should_stop: Callable[[], bool], *, write: bool) -> None:
-        facts = load_facts(conn, now, self._interviewer, self._policy)
-        decisions = {f.profile: (f, decide(f, now, self._policy)) for f in facts}
-        summary["profiles"] = len(decisions)
-        summary["running"] = sum(1 for _, d in decisions.values() if d.desired == "running")
-        summary["stopped"] = summary["profiles"] - summary["running"]
-        self._warn_if_wake_blind(conn, now)
+        now = self._now()
+        # 1. decide and record, under the lock; released before any host call.
+        with self._locked(conn, first=True):
+            decisions = self._decide_all(conn, now)
+            summary["profiles"] = len(decisions)
+            summary["running"] = sum(1 for d in decisions.values() if d.desired == "running")
+            summary["stopped"] = summary["profiles"] - summary["running"]
+            self._warn_if_wake_blind(conn, now)
+            if write:
+                rows = {r["hermes_profile"]: r for r in
+                        conn.execute("SELECT * FROM control_plane.companion_gateways").fetchall()}
+                for profile, d in decisions.items():
+                    rows[profile] = self._record_decision(conn, rows.get(profile), d, now, summary)
 
-        rows = {r["hermes_profile"]: r for r in conn.execute("SELECT * FROM control_plane.companion_gateways").fetchall()}
-        if write:
-            for profile, (f, d) in decisions.items():
-                rows[profile] = self._record_decision(conn, rows.get(profile), f, d, now, summary)
-
+        # 2. ask the host: NO lock (a status read can take a minute).
         observed = self._adapter.status(list(decisions))  # may raise GatewayHostError: nothing below runs
-        if write:
-            for profile, obs in observed.items():
-                rows[profile] = self._record_observation(conn, rows.get(profile), decisions[profile][1], obs, now)
 
-        # What would be done, from the DECISION and the observation alone — so
-        # observe and dry-run report the same list enforce would act on, and a
-        # steady fleet reports an empty one.
-        todo = self._plan(decisions, observed, rows, now)
+        # 3. record what it said and plan, under the lock again.
+        with self._locked(conn):
+            rows = {r["hermes_profile"]: r for r in
+                    conn.execute("SELECT * FROM control_plane.companion_gateways").fetchall()}
+            if write:
+                for profile, obs in observed.items():
+                    rows[profile] = self._record_observation(conn, rows.get(profile), decisions[profile], obs, now)
+            # What would be done, from the DECISION and the observation alone, so
+            # observe and dry-run report the same list enforce would act on, and
+            # a steady fleet reports an empty one.
+            todo = self._plan(decisions, observed, rows, now)
         for item in todo:
-            summary["would_start" if item["action"] == "start" else "would_stop"].append(item["profile"])
+            if item["noop"]:
+                summary["would_confirm"].append(item["profile"])
+            else:
+                summary["would_start" if item["action"] == "start" else "would_stop"].append(item["profile"])
         summary["duplicates"] = sorted(p for p, o in observed.items() if o.state == "duplicate")
         if mode != "enforce" or not write:
             return
 
+        # 4. act, one profile at a time: re-decide it under the lock, release,
+        # call the host, re-take the lock to record.
         errors_in_a_row = 0
         for item in todo:
             if should_stop():
@@ -703,15 +820,24 @@ class GatewayReconcileSweep:
                 summary["deferred"] += 1
                 continue
             profile, verb = item["profile"], item["action"]
+            planned = decisions[profile]
+            with self._locked(conn):
+                fresh = self._decide_all(conn, self._now()).get(profile)
+                if fresh is None or fresh.desired != planned.desired or fresh.reason in HOLD_ONLY_REASONS:
+                    logger.info(log_fields("gateway_reconcile.action_dropped", profile=profile, action=verb,
+                                           effect="the decision changed before the host was called"))
+                    continue
+                row = conn.execute("SELECT * FROM control_plane.companion_gateways WHERE hermes_profile = %s",
+                                   (profile,)).fetchone()
             try:
-                facts = decisions[profile][0]
-                result = self._adapter.act(profile, verb, facts.slug if verb == "start" and facts.kind == "companion" else None)
+                result = self._adapter.act(profile, verb, planned.slug if verb == "start" and planned.kind == "companion" else None)
             except GatewayHostError as exc:
                 errors_in_a_row += 1
                 summary["failed"] += 1
                 logger.warning(log_fields("gateway_reconcile.action_error", profile=profile, action=verb,
                                           error=exc.safe_reason))
-                self._record_action(conn, profile, decisions[profile][0].trip_id, verb, "failed", now, rows[profile])
+                with self._locked(conn):
+                    self._record_action(conn, profile, planned.trip_id, verb, "failed", self._now(), row)
                 if errors_in_a_row >= BREAKER_AFTER:
                     summary["result"] = "host_unreachable"
                     logger.warning(log_fields("gateway_reconcile.sweep_aborted", after=errors_in_a_row,
@@ -722,21 +848,27 @@ class GatewayReconcileSweep:
             summary["starts" if verb == "start" else "stops"] += 1
             if result != "ok":
                 summary["failed"] += 1
-            self._record_action(conn, profile, decisions[profile][0].trip_id, verb, result, now, rows[profile])
+            with self._locked(conn):
+                self._record_action(conn, profile, planned.trip_id, verb, result, self._now(), row)
             logger.info(log_fields("gateway_reconcile.action", profile=profile, action=verb, result=result,
-                                   reason=decisions[profile][1].reason))
+                                   reason=planned.reason))
 
     # -- the plan: pure given the records -------------------------------------
 
     @staticmethod
-    def _plan(decisions: Mapping[str, tuple[GatewayFacts, Decision]], observed: Mapping[str, Observed],
-              rows: Mapping[str, Mapping[str, Any]], now: datetime) -> list[dict[str, str]]:
+    def _plan(decisions: Mapping[str, ProfileDecision], observed: Mapping[str, Observed],
+              rows: Mapping[str, Mapping[str, Any]], now: datetime) -> list[dict[str, Any]]:
         """Starts first (the interviewer first of them), then stops; each in
         profile order. A profile on backoff, an unconfirmed flap-prone stop, a
-        hold-only reason, a duplicate and an absent profile produce nothing."""
-        starts, stops = [], []
-        for profile in sorted(decisions, key=lambda p: (decisions[p][0].kind != "interviewer", p)):
-            facts, decision = decisions[profile]
+        hold-only reason, a duplicate and an absent profile produce nothing.
+
+        A desired-stopped gateway found already `stopped` with no confirmed stop
+        on record gets a `noop` stop: the host answers ok without touching it,
+        and that record is what makes it DORMANT to everything that skips
+        dormant companions (see the module doc)."""
+        starts, stops, confirms = [], [], []
+        for profile in sorted(decisions, key=lambda p: (decisions[p].kind != "interviewer", p)):
+            decision = decisions[profile]
             obs = observed.get(profile)
             row = rows.get(profile) or {}
             if obs is None or obs.state in ("duplicate", "absent"):
@@ -745,12 +877,18 @@ class GatewayReconcileSweep:
             if wait is not None and wait > now:
                 continue
             if decision.desired == "running" and obs.state == "stopped" and decision.reason not in HOLD_ONLY_REASONS:
-                starts.append({"profile": profile, "action": "start"})
-            elif decision.desired == "stopped" and obs.state == "running":
-                confirmed = int(row.get("confirmations") or 1) >= STOP_CONFIRMATIONS
-                if confirmed or not decision.needs_confirmation:
-                    stops.append({"profile": profile, "action": "stop"})
-        return starts + stops
+                starts.append({"profile": profile, "action": "start", "noop": False})
+                continue
+            if decision.desired != "stopped":
+                continue
+            confirmed = int(row.get("confirmations") or 1) >= STOP_CONFIRMATIONS
+            if not (confirmed or not decision.needs_confirmation):
+                continue
+            if obs.state == "running":
+                stops.append({"profile": profile, "action": "stop", "noop": False})
+            elif obs.state == "stopped" and not (row.get("last_action") == "stop" and row.get("last_result") == "ok"):
+                confirms.append({"profile": profile, "action": "stop", "noop": True})
+        return starts + stops + confirms
 
     # -- records --------------------------------------------------------------
 
@@ -762,17 +900,18 @@ class GatewayReconcileSweep:
             [event, *cols.values()],
         )
 
-    def _record_decision(self, conn: Any, row: Mapping[str, Any] | None, facts: GatewayFacts, d: Decision,
+    def _record_decision(self, conn: Any, row: Mapping[str, Any] | None, d: ProfileDecision,
                          now: datetime, summary: dict[str, Any]) -> Mapping[str, Any]:
         mode = self.mode if self.mode != "off" else "observe"
+        by = list(d.justified_by)
         if row is None:
             row = conn.execute(
                 """INSERT INTO control_plane.companion_gateways
-                     (hermes_profile, trip_id, kind, desired, reason, decided_at, confirmations)
-                   VALUES (%s, %s, %s, %s, %s, %s, 1) RETURNING *""",
-                (facts.profile, facts.trip_id, facts.kind, d.desired, d.reason, now),
+                     (hermes_profile, trip_id, kind, desired, reason, decided_at, confirmations, justified_by)
+                   VALUES (%s, %s, %s, %s, %s, %s, 1, %s) RETURNING *""",
+                (d.profile, d.trip_id, d.kind, d.desired, d.reason, now, by),
             ).fetchone()
-            self._event(conn, "DECIDED", mode=mode, hermes_profile=facts.profile, trip_id=facts.trip_id,
+            self._event(conn, "DECIDED", mode=mode, hermes_profile=d.profile, trip_id=d.trip_id,
                         desired=d.desired, reason=d.reason)
             summary["changed"] += 1
             return row
@@ -780,39 +919,40 @@ class GatewayReconcileSweep:
             row = conn.execute(
                 """UPDATE control_plane.companion_gateways
                       SET desired = %s, reason = %s, decided_at = %s, confirmations = 1, trip_id = %s,
-                          kind = %s, updated_at = now()
+                          kind = %s, justified_by = %s, updated_at = now()
                     WHERE hermes_profile = %s RETURNING *""",
-                (d.desired, d.reason, now, facts.trip_id, facts.kind, facts.profile),
+                (d.desired, d.reason, now, d.trip_id, d.kind, by, d.profile),
             ).fetchone()
         elif row["reason"] != d.reason:
             row = conn.execute(
                 """UPDATE control_plane.companion_gateways
-                      SET reason = %s, trip_id = %s, kind = %s, updated_at = now()
+                      SET reason = %s, trip_id = %s, kind = %s, justified_by = %s, updated_at = now()
                     WHERE hermes_profile = %s RETURNING *""",
-                (d.reason, facts.trip_id, facts.kind, facts.profile),
+                (d.reason, d.trip_id, d.kind, by, d.profile),
             ).fetchone()
         elif int(row["confirmations"]) < STOP_CONFIRMATIONS:
             row = conn.execute(
                 """UPDATE control_plane.companion_gateways
-                      SET confirmations = confirmations + 1, trip_id = %s, kind = %s, updated_at = now()
+                      SET confirmations = confirmations + 1, trip_id = %s, kind = %s, justified_by = %s,
+                          updated_at = now()
                     WHERE hermes_profile = %s RETURNING *""",
-                (facts.trip_id, facts.kind, facts.profile),
+                (d.trip_id, d.kind, by, d.profile),
             ).fetchone()
             return row
         else:
-            if row["trip_id"] != facts.trip_id:
+            if row["trip_id"] != d.trip_id or list(row["justified_by"] or []) != by:
                 row = conn.execute(
-                    "UPDATE control_plane.companion_gateways SET trip_id = %s, updated_at = now() "
-                    "WHERE hermes_profile = %s RETURNING *", (facts.trip_id, facts.profile),
+                    "UPDATE control_plane.companion_gateways SET trip_id = %s, justified_by = %s, updated_at = now() "
+                    "WHERE hermes_profile = %s RETURNING *", (d.trip_id, by, d.profile),
                 ).fetchone()
             return row
-        self._event(conn, "DECIDED", mode=mode, hermes_profile=facts.profile, trip_id=facts.trip_id,
+        self._event(conn, "DECIDED", mode=mode, hermes_profile=d.profile, trip_id=d.trip_id,
                     desired=d.desired, reason=d.reason)
         summary["changed"] += 1
-        logger.info(log_fields("gateway_reconcile.decided", profile=facts.profile, desired=d.desired, reason=d.reason))
+        logger.info(log_fields("gateway_reconcile.decided", profile=d.profile, desired=d.desired, reason=d.reason))
         return row
 
-    def _record_observation(self, conn: Any, row: Mapping[str, Any], d: Decision, obs: Observed,
+    def _record_observation(self, conn: Any, row: Mapping[str, Any], d: ProfileDecision, obs: Observed,
                             now: datetime) -> Mapping[str, Any]:
         mode = self.mode if self.mode != "off" else "observe"
         profile = row["hermes_profile"]
@@ -912,27 +1052,41 @@ def set_pin(db_url: str, adapter: Any, profile: str, pin: str, *, now: datetime 
             raise RuntimeError("could not take the companion gateway lock (a sweep, teardown or release holds it)")
         try:
             sweep = GatewayReconcileSweep("-", adapter, mode="observe", interval_minutes=0, now_fn=lambda: when)
-            facts = {f.profile: f for f in load_facts(conn, when)}
-            current = facts.get(profile)
-            if current is None:
-                raise ValueError(f"{profile!r} is not a gateway the control plane manages")
-            if current.kind == "interviewer":
-                raise ValueError("the interviewer always runs and cannot be pinned")
-            if current.pin == "teardown":
-                raise ValueError(f"{profile!r} is pinned by a teardown in progress; that is not an operator's to clear")
-            summary = {"changed": 0}
-            row = conn.execute("SELECT * FROM control_plane.companion_gateways WHERE hermes_profile = %s",
+            group = [f for f in load_facts(conn, when) if f.profile == profile]
+            raw = conn.execute("SELECT * FROM control_plane.companion_gateways WHERE hermes_profile = %s",
                                (profile,)).fetchone()
+            if not group and raw is None:
+                raise ValueError(f"{profile!r} is not a gateway the control plane manages")
+            if group and group[0].kind == "interviewer":
+                raise ValueError("the interviewer always runs and cannot be pinned")
+            live = [f for f in group if not f.retired]
+            # A teardown pin belongs to the trip being torn down. While that trip
+            # is still alive it is not an operator's to clear; once it is retired
+            # (or the pin is for a trip that no longer names this profile) it is
+            # just a stale record, and clearing it is exactly the repair.
+            if raw and raw["pin"] == "teardown" and any(f.trip_id == raw["pin_trip_id"] for f in live):
+                raise ValueError(f"{profile!r} is pinned by a teardown in progress; that is not an operator's to clear")
             new_pin = None if pin == "clear" else pin
-            decided = decide(replace(current, pin=new_pin), when)
-            row = sweep._record_decision(conn, row, replace(current, pin=new_pin), decided, when, summary)
+            if new_pin is None:
+                target = raw["pin_trip_id"] if raw else None
+            else:
+                if not live:
+                    raise ValueError(f"every trip naming {profile!r} is retired; there is nothing to pin")
+                target = live[0].trip_id          # the newest live trip naming it
+            regrouped = [replace(f, pin=new_pin) if f.trip_id == target else f for f in group]
+            decided = decide_profile(regrouped, when) if regrouped else None
+            if decided is not None:
+                sweep._record_decision(conn, raw, decided, when, {"changed": 0})
             conn.execute(
-                "UPDATE control_plane.companion_gateways SET pin = %s, pin_set_at = %s, updated_at = now() "
-                "WHERE hermes_profile = %s",
-                (new_pin, when if new_pin else None, profile),
+                "UPDATE control_plane.companion_gateways SET pin = %s, pin_trip_id = %s, pin_set_at = %s, "
+                "updated_at = now() WHERE hermes_profile = %s",
+                (new_pin, target if new_pin else None, when if new_pin else None, profile),
             )
-            sweep._event(conn, "PIN", hermes_profile=profile, trip_id=current.trip_id, pin=pin)
-            return {"profile": profile, "pin": pin, "desired": decided.desired, "reason": decided.reason}
+            sweep._event(conn, "PIN", hermes_profile=profile, trip_id=target if target and group else None, pin=pin)
+            return {"profile": profile, "pin": pin,
+                    "desired": decided.desired if decided else (raw or {}).get("desired"),
+                    "reason": decided.reason if decided else (raw or {}).get("reason"),
+                    "trip_id": target}
         finally:
             advisory_unlock(conn)
 

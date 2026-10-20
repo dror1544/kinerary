@@ -100,7 +100,11 @@ DECIDE_TABLE: list[tuple[str, dict[str, Any], str, str, bool]] = [
     ("a trip switched away from an hour ago stays up", dict(warm_at=NOW - H), R, "WARM", False),
     ("...for two days", dict(warm_at=NOW - TWO_DAYS + timedelta(minutes=1)), R, "WARM", False),
     ("...and not a minute longer", dict(warm_at=NOW - TWO_DAYS), S, "NOT_CURRENT", True),
-    ("warm outranks archived inside its two days", dict(warm_at=NOW - H, end_date=d(-90)), R, "WARM", False),
+    ("an archived trip is archived even if it was just current: warm does not outrank the archive",
+     dict(warm_at=NOW - H, end_date=d(-90)), S, "ARCHIVED", True),
+    ("...at the edge: warm still holds on the 14th day after the end", dict(warm_at=NOW - H, end_date=d(-14)),
+     R, "WARM", False),
+    ("...and not on the 15th", dict(warm_at=NOW - H, end_date=d(-15)), S, "ARCHIVED", True),
     ("warm does not resurrect a retired trip", dict(warm_at=NOW - H, retired=True), S, "RETIRED", False),
 
     # --- 3. UNDERWAY: start <= today <= end, whatever the organizer is looking at ---
@@ -174,6 +178,22 @@ class DecideTable(unittest.TestCase):
         from control_plane_worker.gateway_reconcile import REASONS
         for _label, kwargs, _d, reason, _c in DECIDE_TABLE:
             self.assertIn(reason, REASONS)
+
+    def test_a_hold_never_plans_a_start_and_a_steady_state_plans_nothing(self) -> None:
+        from control_plane_worker.gateway_reconcile import ProfileDecision
+        plan = GatewayReconcileSweep._plan
+        held = ProfileDecision("p-x", "companion", "running", "QUIET_WINDOW", False)
+        up = ProfileDecision("p-y", "companion", "running", "UNDERWAY", False)
+        down = ProfileDecision("p-z", "companion", "stopped", "NOT_CURRENT", True)
+        decisions = {"p-x": held, "p-y": up, "p-z": down}
+        stopped = {p: Observed("stopped", 0) for p in decisions}
+        got = plan(decisions, stopped, {"p-z": {"confirmations": 2}}, NOW)
+        self.assertEqual([(i["profile"], i["action"], i["noop"]) for i in got],
+                         [("p-y", "start", False), ("p-z", "stop", True)],
+                         "p-x is only held (never started); p-z gets one idempotent confirming stop")
+        settled = plan(decisions, stopped,
+                       {"p-z": {"confirmations": 2, "last_action": "stop", "last_result": "ok"}}, NOW)
+        self.assertEqual([i["profile"] for i in settled], ["p-y"])
 
     def test_decide_is_pure(self) -> None:
         facts = GatewayFacts(profile="p-x", is_current=True, warm_at=NOW - H)
@@ -341,12 +361,20 @@ class FakeHost:
         self.act_result: Any = "ok"          # a string, or a callable(profile, verb) -> str | raises
         self.status_error: Exception | None = None
         self.converge = True                 # an ok action makes the state match
+        self.probe: Any = None               # a callable() -> bool: is the advisory lock free right now?
+        self.lock_free_during_status: list[bool] = []
+        self.lock_free_during_act: list[bool] = []
+        self.on_status: Any = None           # a callable() run while the sweep is "on the network"
 
     def set(self, profile: str, state: str, count: int | None = None) -> None:
         self.states[profile] = Observed(state, count if count is not None else (0 if state in ("stopped", "absent") else 1))
 
     def status(self, profiles: Any) -> dict[str, Observed]:
         self.status_calls.append(list(profiles))
+        if self.probe:
+            self.lock_free_during_status.append(self.probe())
+        if self.on_status:
+            self.on_status()
         if self.status_error:
             raise self.status_error
         return {p: self.states.get(p, Observed("absent", 0)) for p in profiles}
@@ -354,6 +382,8 @@ class FakeHost:
     def act(self, profile: str, verb: str, slug: str | None = None) -> str:
         self.act_calls.append((profile, verb))
         self.act_slugs.append(slug)
+        if self.probe:
+            self.lock_free_during_act.append(self.probe())
         result = self.act_result(profile, verb) if callable(self.act_result) else self.act_result
         if result == "ok" and self.converge:
             self.set(profile, "running" if verb == "start" else "stopped")
@@ -573,6 +603,13 @@ class SweepTests(unittest.TestCase):
         self.sweep().run()
         self.assertEqual(self.row(member_trip)["reason"], "NOT_CURRENT")
         self.assertEqual(self.row(group_trip)["reason"], "NOT_CURRENT")
+
+    def test_a_group_chat_never_counts_even_if_its_id_were_somebodys_linked_identity(self) -> None:
+        t = self.trip(undated=True)
+        self.organizer(t, "-100555")            # a linked "Telegram id" that is shaped like a group id
+        self.bind(t, "-100555")
+        self.sweep().run()
+        self.assertEqual(self.row(t)["reason"], "NOT_CURRENT")
 
     def test_a_dm_bound_to_a_retired_trip_is_nobodys_current_trip(self) -> None:
         dead = self.trip(slug=f"retired-gw-{rnd(3)}-20260101")
@@ -828,8 +865,9 @@ class SweepTests(unittest.TestCase):
                     set_pin(DB_URL, self.host, profile, pin, now=self.now)
                 self.assertIn(why, str(ctx.exception))
         self.conn.execute(
-            "INSERT INTO control_plane.companion_gateways(hermes_profile, trip_id, kind, desired, reason, pin, pin_set_at) "
-            "VALUES (%s, %s, 'companion', 'stopped', 'TEARDOWN', 'teardown', now())", (t["profile"], t["trip_id"]))
+            "INSERT INTO control_plane.companion_gateways(hermes_profile, trip_id, kind, desired, reason, pin, pin_trip_id, pin_set_at) "
+            "VALUES (%s, %s, 'companion', 'stopped', 'TEARDOWN', 'teardown', %s, now())",
+            (t["profile"], t["trip_id"], t["trip_id"]))
         with self.assertRaises(ValueError) as ctx:
             set_pin(DB_URL, self.host, t["profile"], "clear", now=self.now)
         self.assertIn("teardown in progress", str(ctx.exception))
@@ -838,8 +876,9 @@ class SweepTests(unittest.TestCase):
         t = self.trip()             # an active trip: only the pin says otherwise
         self.bind(t, "7040")
         self.conn.execute(
-            "INSERT INTO control_plane.companion_gateways(hermes_profile, trip_id, kind, desired, reason, pin, pin_set_at) "
-            "VALUES (%s, %s, 'companion', 'stopped', 'TEARDOWN', 'teardown', now())", (t["profile"], t["trip_id"]))
+            "INSERT INTO control_plane.companion_gateways(hermes_profile, trip_id, kind, desired, reason, pin, pin_trip_id, pin_set_at) "
+            "VALUES (%s, %s, 'companion', 'stopped', 'TEARDOWN', 'teardown', %s, now())",
+            (t["profile"], t["trip_id"], t["trip_id"]))
         self.host.set(t["profile"], "running")
         sweep = self.sweep("enforce")
         sweep.run()
@@ -1115,6 +1154,260 @@ class SweepTests(unittest.TestCase):
         self.assertTrue(all(a > datetime.now(timezone.utc) - timedelta(days=90) for a in ages))
         self.assertEqual(len([a for a in ages if a < datetime.now(timezone.utc) - timedelta(days=88)]), 1)
         self.assertIsNotNone(t)
+
+    # ── R1: dormant means "the reconciler stopped it", not "somebody decided to" ──────
+
+    def dormant_in_sql(self, profile: str) -> bool:
+        """The predicate gateway-wait.ts, live_companions() and the fleet monitor share."""
+        return self.conn.execute(
+            "SELECT EXISTS (SELECT 1 FROM control_plane.companion_gateways g WHERE g.hermes_profile = %s "
+            "AND g.desired = 'stopped' AND g.last_action = 'stop' AND g.last_result = 'ok' "
+            "AND g.observed IN ('stopped', 'absent')) AS dormant", (profile,)).fetchone()["dormant"]
+
+    def test_observe_mode_decides_stopped_but_nothing_is_dormant(self) -> None:
+        running = self.trip(undated=True)       # not current, not underway: NOT_CURRENT
+        gone = self.trip(undated=True)
+        self.host.set(running["profile"], "running")
+        self.host.set(gone["profile"], "stopped")
+        sweep = self.sweep("observe")
+        for _ in range(3):
+            sweep.run()
+            self.advance(5)
+        for t in (running, gone):
+            self.assertEqual((self.row(t)["desired"], self.row(t)["reason"]), ("stopped", "NOT_CURRENT"))
+            self.assertFalse(self.dormant_in_sql(t["profile"]), "observe never stops anything, so nothing is dormant")
+
+    def test_a_gateway_the_reconciler_stopped_and_the_host_confirmed_is_dormant_until_it_comes_back(self) -> None:
+        t = self.trip(undated=True)
+        self.host.set(t["profile"], "running")
+        sweep = self.sweep("enforce")
+        sweep.run()
+        self.assertFalse(self.dormant_in_sql(t["profile"]), "decided, not yet stopped")
+        self.advance(5)
+        sweep.run()                                  # the second sweep stops it
+        self.advance(5)
+        sweep.run()                                  # and observes it stopped
+        self.assertEqual(self.host.act_calls, [(t["profile"], "stop")])
+        self.assertTrue(self.dormant_in_sql(t["profile"]))
+        self.host.set(t["profile"], "running")       # somebody started it by hand
+        self.advance(5)
+        sweep.run()
+        self.assertFalse(self.dormant_in_sql(t["profile"]), "running again: expected again")
+
+    def test_an_already_stopped_gateway_is_confirmed_once_with_an_idempotent_stop_then_left_alone(self) -> None:
+        t = self.trip(undated=True)
+        self.host.set(t["profile"], "stopped")
+        self.host.converge = False                   # the host's answer "already stopped" changes nothing
+        observe = self.sweep("observe").run()
+        self.assertEqual(observe["would_confirm"], [], "first sighting: not confirmed yet")
+        self.advance(5)
+        observe = self.sweep("observe").run()
+        self.assertIn(t["profile"], observe["would_confirm"])
+        self.assertNotIn(t["profile"], observe["would_stop"], "nothing is running, so nothing would be stopped")
+        self.assertEqual(self.host.act_calls, [])
+        enforce = self.sweep("enforce")
+        enforce.run()
+        self.assertEqual(self.host.act_calls, [(t["profile"], "stop")])
+        self.assertTrue(self.dormant_in_sql(t["profile"]))
+        self.advance(5)
+        enforce.run()
+        self.assertEqual(len(self.host.act_calls), 1, "confirmed once, not every sweep")
+
+    def test_a_stopped_gateway_the_reconciler_started_is_not_dormant_after_a_revival(self) -> None:
+        t = self.trip(end=self.past(90))
+        self.host.set(t["profile"], "stopped")
+        sweep = self.sweep("enforce")
+        sweep.run()
+        self.advance(5)
+        sweep.run()
+        self.assertTrue(self.dormant_in_sql(t["profile"]))
+        self.event(t, "lost", timedelta(minutes=1))
+        self.advance(5)
+        sweep.run()
+        self.assertIn((t["profile"], "start"), self.host.act_calls)
+        self.assertFalse(self.dormant_in_sql(t["profile"]))
+
+    # ── R2: a pin belongs to its trip ──────────────────────────────────────────────
+
+    def test_a_teardown_pin_does_not_darken_a_later_trip_that_reuses_the_profile_name(self) -> None:
+        old = self.trip(slug=f"retired-gw-{rnd(3)}-20260101", profile="reusedname")
+        self.conn.execute(
+            "INSERT INTO control_plane.companion_gateways(hermes_profile, trip_id, kind, desired, reason, pin, pin_trip_id, pin_set_at) "
+            "VALUES (%s, %s, 'companion', 'stopped', 'TEARDOWN', 'teardown', %s, now())",
+            ("reusedname", old["trip_id"], old["trip_id"]))
+        new = self.trip(profile="reusedname")                   # underway, same profile name
+        self.profiles.append("reusedname")
+        self.host.set("reusedname", "stopped")
+        self.sweep("enforce").run()
+        self.assertEqual((self.row(new)["desired"], self.row(new)["reason"]), ("running", "UNDERWAY"))
+        self.assertEqual(self.host.act_calls, [("reusedname", "start")])
+
+    def test_an_operator_can_clear_a_teardown_pin_whose_trip_is_gone_but_not_one_in_progress(self) -> None:
+        gone = self.trip(slug=f"retired-gw-{rnd(3)}-20260101", profile="stalepin")
+        self.conn.execute(
+            "INSERT INTO control_plane.companion_gateways(hermes_profile, trip_id, kind, desired, reason, pin, pin_trip_id, pin_set_at) "
+            "VALUES (%s, %s, 'companion', 'stopped', 'TEARDOWN', 'teardown', %s, now())",
+            ("stalepin", gone["trip_id"], gone["trip_id"]))
+        out = set_pin(DB_URL, self.host, "stalepin", "clear", now=self.now)
+        self.assertEqual(out["pin"], "clear")
+        row = self.conn.execute("SELECT * FROM control_plane.companion_gateways WHERE hermes_profile = 'stalepin'").fetchone()
+        self.assertIsNone(row["pin"])
+        self.assertIsNone(row["pin_trip_id"])
+        live = self.trip(profile="inprogress")
+        self.conn.execute(
+            "INSERT INTO control_plane.companion_gateways(hermes_profile, trip_id, kind, desired, reason, pin, pin_trip_id, pin_set_at) "
+            "VALUES (%s, %s, 'companion', 'stopped', 'TEARDOWN', 'teardown', %s, now())",
+            ("inprogress", live["trip_id"], live["trip_id"]))
+        with self.assertRaises(ValueError) as ctx:
+            set_pin(DB_URL, self.host, "inprogress", "clear", now=self.now)
+        self.assertIn("teardown in progress", str(ctx.exception))
+
+    def test_an_operator_pin_is_for_the_newest_live_trip_and_stays_with_it(self) -> None:
+        older = self.trip(profile="sharedpin", end=self.past(60))
+        newer = self.trip(profile="sharedpin")
+        out = set_pin(DB_URL, self.host, "sharedpin", "off", now=self.now)
+        self.assertEqual(out["trip_id"], newer["trip_id"])
+        row = self.conn.execute("SELECT * FROM control_plane.companion_gateways WHERE hermes_profile = 'sharedpin'").fetchone()
+        self.assertEqual((row["pin"], row["pin_trip_id"]), ("off", newer["trip_id"]))
+        self.assertNotEqual(older["trip_id"], newer["trip_id"])
+
+    def test_the_retirement_transaction_clears_the_trips_teardown_pin(self) -> None:
+        import importlib.util
+        from pathlib import Path
+        spec = importlib.util.spec_from_file_location(
+            "teardown_for_test", Path(__file__).resolve().parents[3] / "scripts" / "teardown-trip.py")
+        teardown = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(teardown)
+        t = self.trip(slug="rome-2026", profile="romeprofile")
+        self.conn.execute(
+            "INSERT INTO control_plane.companion_gateways(hermes_profile, trip_id, kind, desired, reason, pin, pin_trip_id, pin_set_at) "
+            "VALUES (%s, %s, 'companion', 'stopped', 'TEARDOWN', 'teardown', %s, now())",
+            ("romeprofile", t["trip_id"], t["trip_id"]))
+        other = self.trip(profile="otherpin")
+        self.conn.execute(
+            "INSERT INTO control_plane.companion_gateways(hermes_profile, trip_id, kind, desired, reason, pin, pin_trip_id, pin_set_at) "
+            "VALUES (%s, %s, 'companion', 'stopped', 'PIN_OFF', 'off', %s, now())",
+            ("otherpin", other["trip_id"], other["trip_id"]))
+
+        def run_sql(sql: str) -> str:
+            cur = self.conn.execute(sql)
+            row = cur.fetchone() if cur.description else None
+            return str(next(iter(row.values()))) if row else ""
+
+        with mock.patch.object(teardown, "psql", side_effect=run_sql):
+            teardown.retire_in_db({"id": t["trip_id"], "slug": "rome-2026", "orig": "rome-2026"})
+        row = self.conn.execute("SELECT pin, pin_trip_id FROM control_plane.companion_gateways "
+                                "WHERE hermes_profile = 'romeprofile'").fetchone()
+        self.assertEqual((row["pin"], row["pin_trip_id"]), (None, None))
+        self.assertEqual(self.conn.execute("SELECT pin FROM control_plane.companion_gateways "
+                                           "WHERE hermes_profile = 'otherpin'").fetchone()["pin"], "off",
+                         "another trip's pin is not touched")
+        self.assertEqual([e["pin"] for e in self.events(t, "PIN")], ["clear"])
+
+    # ── R4: a profile named by several trips ────────────────────────────────────────
+
+    def test_a_profile_runs_if_any_trip_naming_it_says_run(self) -> None:
+        archived = self.trip(profile="sharedname", end=self.past(90))
+        underway = self.trip(profile="sharedname")
+        stopped_old = self.trip(profile="sharedname", end=self.past(120))
+        self.host.set("sharedname", "stopped")
+        self.sweep("enforce").run()
+        row = self.row(underway)
+        self.assertEqual((row["desired"], row["reason"]), ("running", "UNDERWAY"))
+        self.assertEqual(row["trip_id"], underway["trip_id"])
+        self.assertEqual(list(row["justified_by"]), [underway["trip_id"]])
+        self.assertEqual(self.host.act_calls, [("sharedname", "start")])
+        self.assertNotIn(archived["trip_id"], row["justified_by"])
+        self.assertNotIn(stopped_old["trip_id"], row["justified_by"])
+
+    def test_every_trip_that_says_run_is_recorded_as_justifying_it(self) -> None:
+        a, b = self.trip(profile="twotrips"), self.trip(profile="twotrips")
+        self.sweep().run()
+        self.assertEqual(set(self.row(a)["justified_by"]), {a["trip_id"], b["trip_id"]})
+
+    def test_a_profile_stops_only_when_every_trip_naming_it_says_stop_and_a_retired_one_does_not_decide(self) -> None:
+        old = self.trip(profile="allstop", slug=f"retired-gw-{rnd(3)}-20260101")
+        a = self.trip(profile="allstop", end=self.past(90))
+        b = self.trip(profile="allstop", undated=True)
+        self.host.set("allstop", "running")
+        enforce = self.sweep("enforce")
+        enforce.run()
+        row = self.row(a)
+        self.assertEqual((row["desired"], row["reason"]), ("stopped", "ARCHIVED"),
+                         "the reason comes from the live trips, not from the retired one")
+        self.assertEqual(self.host.act_calls, [], "a retired trip's certainty does not make a live trip's flap-prone "
+                                                   "stop immediate: it still needs its second sweep")
+        self.advance(5)
+        enforce.run()
+        self.assertEqual(self.host.act_calls, [("allstop", "stop")])
+        self.assertEqual(row["justified_by"], [])
+        self.assertIsNotNone(old)
+        self.assertIsNotNone(b)
+
+    def test_the_retired_trip_of_a_shared_profile_never_stops_a_live_one(self) -> None:
+        self.trip(profile="sharedlive", slug=f"retired-gw-{rnd(3)}-20260101")
+        live = self.trip(profile="sharedlive")
+        self.host.set("sharedlive", "running")
+        self.sweep("enforce").run()
+        self.assertEqual(self.row(live)["desired"], "running")
+        self.assertEqual(self.host.act_calls, [])
+
+    # ── the lock is not held across the network ──────────────────────────────────────
+
+    def lock_free(self) -> bool:
+        probe = psycopg.connect(DB_URL, row_factory=dict_row, autocommit=True)
+        try:
+            got = probe.execute("SELECT pg_try_advisory_lock(hashtext(%s)) AS g", (ADVISORY_LOCK_TEXT,)).fetchone()["g"]
+            if got:
+                probe.execute("SELECT pg_advisory_unlock(hashtext(%s))", (ADVISORY_LOCK_TEXT,))
+            return bool(got)
+        finally:
+            probe.close()
+
+    def test_the_advisory_lock_is_free_while_the_sweep_waits_on_the_host(self) -> None:
+        t = self.trip()
+        self.host.set(t["profile"], "stopped")
+        self.host.probe = self.lock_free
+        self.sweep("enforce").run()
+        self.assertEqual(self.host.act_calls, [(t["profile"], "start")])
+        self.assertEqual(self.host.lock_free_during_status, [True], "a release or teardown can take it during status")
+        self.assertEqual(self.host.lock_free_during_act, [True], "...and during an action")
+        self.assertTrue(self.lock_free(), "and it is released when the sweep ends")
+
+    def test_a_pin_that_lands_while_the_sweep_is_on_the_network_cancels_the_action(self) -> None:
+        t = self.trip()
+        self.host.set(t["profile"], "stopped")
+
+        def pin_lands() -> None:
+            self.conn.execute(
+                "INSERT INTO control_plane.companion_gateways(hermes_profile, trip_id, kind, desired, reason, pin, "
+                "pin_trip_id, pin_set_at) VALUES (%s, %s, 'companion', 'stopped', 'TEARDOWN', 'teardown', %s, now()) "
+                "ON CONFLICT (hermes_profile) DO UPDATE SET pin = 'teardown', pin_trip_id = excluded.pin_trip_id, "
+                "pin_set_at = now()", (t["profile"], t["trip_id"], t["trip_id"]))
+
+        self.host.on_status = pin_lands
+        with Rendered() as log:
+            self.sweep("enforce").run()
+        self.assertEqual(self.host.act_calls, [], "the start was planned before the pin; the pin wins")
+        self.assertIn("gateway_reconcile.action_dropped", log.text)
+
+    def test_a_sweep_that_cannot_retake_the_lock_is_abandoned_not_hung(self) -> None:
+        t = self.trip()
+        self.host.set(t["profile"], "stopped")
+        other = psycopg.connect(DB_URL, row_factory=dict_row, autocommit=True)
+        self.addCleanup(other.close)
+
+        def somebody_takes_it() -> None:
+            other.execute("SET lock_timeout = '5s'")      # a sweep that kept the lock fails this test, not hangs it
+            other.execute("SELECT pg_advisory_lock(hashtext(%s))", (ADVISORY_LOCK_TEXT,))
+
+        self.host.on_status = somebody_takes_it
+        with mock.patch("control_plane_worker.gateway_reconcile.LOCK_REWAIT_SECONDS", 1), Rendered() as log:
+            summary = self.sweep("enforce").run()
+        other.execute("SELECT pg_advisory_unlock_all()")
+        self.assertEqual(summary["result"], "lock_busy")
+        self.assertEqual(self.host.act_calls, [])
+        self.assertIn("gateway_reconcile.lock_lost", log.text)
 
     # ── the wake path: a hint runs a sweep ahead of its interval ────────────
 
