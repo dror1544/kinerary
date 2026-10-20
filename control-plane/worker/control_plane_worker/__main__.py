@@ -255,6 +255,10 @@ def build_parser() -> argparse.ArgumentParser:
     which.add_argument("--pin", nargs=2, metavar=("PROFILE", "on|off|clear"),
                        help="override the decision for one gateway, under the same lock the sweep takes; "
                             "the next enforce sweep applies it")
+    which.add_argument("--backfill-markers", action="store_true",
+                       help="ask the companion host to write its provenance marker into every managed gateway "
+                            "profile that exists (the host refuses any profile it does not manage). Needed once "
+                            "for profiles installed before the marker existed, before `enforce` can act on them")
     reconcile.add_argument("--mode", type=_reconcile_mode, default="observe",
                            help="with --once: observe (default) or enforce")
     check = subparsers.add_parser("check-database", help="verify the private worker database connection")
@@ -645,6 +649,17 @@ def main(argv: list[str] | None = None) -> int:
             if args.pin:
                 profile, state = args.pin
                 print(json.dumps(set_pin(db_url, adapter, profile, state), sort_keys=True), flush=True)
+                return 0
+            if args.backfill_markers:
+                import psycopg
+                from psycopg.rows import dict_row
+                from .gateway_reconcile import load_facts
+                from datetime import datetime, timezone
+                with psycopg.connect(db_url, row_factory=dict_row, autocommit=True, connect_timeout=10) as conn:
+                    names = [f.profile for f in load_facts(conn, datetime.now(timezone.utc)) if not f.retired]
+                result = adapter.backfill(names)
+                for name in names:
+                    print(f"{name}: {result[name]}", flush=True)
                 return 0
             sweep = GatewayReconcileSweep(db_url, adapter, mode=args.mode, interval_minutes=5)
             summary = sweep.run(dry_run=args.dry_run)

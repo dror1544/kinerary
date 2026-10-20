@@ -6,6 +6,12 @@ yet automated", so the first one was done by hand (italy-2026, japan-2026) and
 found a step that quietly undoes itself. This is that run's order, as a command:
 
   1. backup     profile tarball, launchd plist, interviewer config, DB rows
+  1b. pin       pin the trip's gateway OFF (reason TEARDOWN) in the control
+                plane's companion_gateways record, under the advisory lock the
+                gateway reconciler holds for a sweep (issue #349). Without it a
+                sweep could start the gateway again between step 3 and step 6,
+                undoing the stop with nothing watching. If the pin cannot be
+                written the teardown stops here, before anything is torn down.
   2. allowlist  drop the profile from the interviewer's multiplex allowlist and
                 restart the interviewer — BEFORE the profile is deleted. The
                 interviewer runs a cron ticker for every allowlisted profile,
@@ -616,6 +622,53 @@ COMMIT;""")
     return new
 
 
+#: The advisory lock the worker's gateway reconciler, vm-release.py and this
+#: script all take, named to hashtext() by this exact text.
+GATEWAY_LOCK_TEXT = "control_plane.companion_gateways"
+
+
+def pin_gateway_off(trip: dict) -> str:
+    """Pin the trip's companion gateway OFF (reason TEARDOWN) in the control
+    plane's own record, under the same advisory lock the reconciler holds for a
+    sweep. Returns "pinned", or "no-table" on a database from before the
+    companion_gateways migration (nothing there decides which gateways run).
+
+    WHY FIRST, AND WHY UNDER THE LOCK. The reconciler (control_plane_worker/
+    gateway_reconcile.py) starts a gateway that should run. This script stops
+    the gateway, and then the database step retires the trip - and between the
+    two a sweep that has not yet seen the retirement would start it again, and
+    the allowlist/uninstall work above it would be undone by a process nobody is
+    watching. The pin is the decision "this one is down" written where the
+    reconciler reads it; taking the lock means any sweep that read the facts
+    before the pin landed has FINISHED before the pin does, and every sweep after
+    it sees the pin. A pin that cannot be written within 120s raises: teardown
+    stops here, before it has torn anything down.
+
+    One transaction: the lock is a transaction lock, released by COMMIT or by
+    the connection ending, so a crash cannot leave it held.
+    """
+    profile = trip["profile"]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,62}", profile) or not TRIP_ID.match(trip["id"]):
+        raise Refused(f"unsafe profile or trip id for the gateway pin: {profile!r} {trip['id']!r}")
+    if not table_exists("companion_gateways"):
+        return "no-table"
+    psql(f"""BEGIN;
+SET LOCAL lock_timeout = '120s';
+SELECT pg_advisory_xact_lock(hashtext('{GATEWAY_LOCK_TEXT}'));
+INSERT INTO control_plane.companion_gateways
+  (hermes_profile, trip_id, kind, desired, reason, pin, pin_set_at)
+VALUES ('{profile}', '{trip['id']}', 'companion', 'stopped', 'TEARDOWN', 'teardown', now())
+ON CONFLICT (hermes_profile) DO UPDATE
+  SET trip_id = excluded.trip_id, desired = 'stopped', reason = 'TEARDOWN', pin = 'teardown', pin_set_at = now(),
+      decided_at = CASE WHEN companion_gateways.desired = 'stopped' AND companion_gateways.reason = 'TEARDOWN'
+                        THEN companion_gateways.decided_at ELSE now() END,
+      confirmations = 1, updated_at = now();
+INSERT INTO control_plane.companion_gateway_events (event, hermes_profile, trip_id, pin)
+VALUES ('PIN', '{profile}', '{trip['id']}', 'teardown');
+COMMIT;""")
+    return "pinned"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--trip", required=True, help="trip id (trip_...) or slug")
@@ -656,6 +709,9 @@ def main() -> int:
     store = document_store(trip)
     originals = kept_originals(store)
     plan = [
+        ("pin", table_exists("companion_gateways"),
+         f"pin {profile}'s gateway OFF (TEARDOWN) in the control plane under its lock, so the reconciler "
+         "cannot restart it between the stop and the retirement"),
         ("allowlist", interviewer_allows(profile), f"drop {profile} from the interviewer's allowlist, restart it"),
         ("gateway", gateway_installed(profile), f"uninstall the {profile} gateway"),
         ("bridge", b is not None, f"stop trip-mcp pid {b[0]} on :{b[1]}" if b else "no bridge"),
@@ -704,6 +760,17 @@ def main() -> int:
     print()
     backup(trip, trip_dir, dest)
     say(f"{GREEN}✓{RESET}", f"backup     {dest}")
+
+    # FIRST, before anything is stopped: see pin_gateway_off. A pin that cannot
+    # be written stops the teardown here, with nothing torn down.
+    try:
+        pinned = pin_gateway_off(trip)
+    except (RuntimeError, Refused) as exc:
+        print(f"{RED}refused{RESET}: could not pin {profile}'s gateway off ({exc}) - nothing was torn down")
+        return 2
+    say(f"{GREEN}✓{RESET}" if pinned == "pinned" else f"{DIM}·{RESET}",
+        "pin        gateway pinned OFF (TEARDOWN) under the companion-gateway lock" if pinned == "pinned"
+        else "pin        (this database has no companion_gateways table: nothing decides which gateways run)")
 
     if interviewer_allows(profile):
         narrow_allowlist(profile)

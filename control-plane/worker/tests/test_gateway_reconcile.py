@@ -120,6 +120,16 @@ DECIDE_TABLE: list[tuple[str, dict[str, Any], str, str, bool]] = [
     ("an archived trip revives the same way", dict(end_date=d(-90), asked_at=NOW - H), R, "REVIVED", False),
     ("...and archives again after two days", dict(end_date=d(-90), asked_at=NOW - TWO_DAYS), S, "ARCHIVED", True),
     ("an ask does not resurrect a retired trip", dict(retired=True, asked_at=NOW - H), S, "RETIRED", False),
+    ("an organizer's /switch to an archived trip revives it", dict(end_date=d(-90), is_current=True,
+     switched_at=NOW - H), R, "REVIVED", False),
+    ("...for two days from the binding", dict(end_date=d(-90), is_current=True,
+     switched_at=NOW - TWO_DAYS + timedelta(minutes=1)), R, "REVIVED", False),
+    ("...and then it archives again, current or not", dict(end_date=d(-90), is_current=True,
+     switched_at=NOW - TWO_DAYS), S, "ARCHIVED", True),
+    ("the newest ask wins: an old switch and a new message", dict(end_date=d(-90), is_current=True,
+     switched_at=NOW - timedelta(days=3), asked_at=NOW - H), R, "REVIVED", False),
+    ("a switch to a trip still inside its grace is just CURRENT_TRIP", dict(end_date=d(-3), is_current=True,
+     switched_at=NOW - H), R, "CURRENT_TRIP", False),
 
     # --- 5/6. the two stops ---
     ("past end + 14 days it is ARCHIVED; a stop needs two sweeps", dict(end_date=d(-15)), S, "ARCHIVED", True),
@@ -291,6 +301,31 @@ class AdapterParsing(unittest.TestCase):
                 adapter.act(profile, verb)
 
 
+    def test_a_start_carries_the_trip_slug_for_the_bridge_check_and_nothing_else_does(self) -> None:
+        adapter, run = self.run_with("ACTION aa-one start ok\n")
+        adapter.act("aa-one", "start", "italy-2026")
+        payload = __import__("json").loads(run.call_args.kwargs["input"])
+        self.assertEqual(payload["slug"], "italy-2026")
+        for verb, slug in (("stop", "italy-2026"), ("start", "../etc"), ("start", "A B"), ("start", "a" * 81)):
+            with self.subTest(verb=verb, slug=slug), self.assertRaises(GatewayHostError):
+                adapter.act("aa-one", verb, slug)
+
+    def test_backfill_wants_one_verdict_per_name_and_a_closing_count(self) -> None:
+        adapter, run = self.run_with("BACKFILL aa-one marked\nBACKFILL bb-two refused\nBACKFILL_END 2\n")
+        self.assertEqual(adapter.backfill(["aa-one", "bb-two"]), {"aa-one": "marked", "bb-two": "refused"})
+        self.assertEqual(__import__("json").loads(run.call_args.kwargs["input"]),
+                         {"record_type": "companion_gateway_backfill", "schema_version": 1,
+                          "profiles": ["aa-one", "bb-two"]})
+        for out in ("BACKFILL aa-one marked\n", "BACKFILL aa-one maybe\nBACKFILL_END 1\n",
+                    "BACKFILL zz-other marked\nBACKFILL_END 1\n",
+                    "BACKFILL aa-one marked\nBACKFILL aa-one marked\nBACKFILL_END 2\n",
+                    "BACKFILL aa-one marked\nBACKFILL_END 3\n"):
+            with self.subTest(out=out):
+                adapter, _ = self.run_with(out)
+                with self.assertRaises(GatewayHostError):
+                    adapter.backfill(["aa-one"])
+
+
 # ── the sweep, against a real database ────────────────────────────────────────
 
 class FakeHost:
@@ -302,6 +337,7 @@ class FakeHost:
         self.states: dict[str, Observed] = {}
         self.status_calls: list[list[str]] = []
         self.act_calls: list[tuple[str, str]] = []
+        self.act_slugs: list[str | None] = []
         self.act_result: Any = "ok"          # a string, or a callable(profile, verb) -> str | raises
         self.status_error: Exception | None = None
         self.converge = True                 # an ok action makes the state match
@@ -315,8 +351,9 @@ class FakeHost:
             raise self.status_error
         return {p: self.states.get(p, Observed("absent", 0)) for p in profiles}
 
-    def act(self, profile: str, verb: str) -> str:
+    def act(self, profile: str, verb: str, slug: str | None = None) -> str:
         self.act_calls.append((profile, verb))
+        self.act_slugs.append(slug)
         result = self.act_result(profile, verb) if callable(self.act_result) else self.act_result
         if result == "ok" and self.converge:
             self.set(profile, "running" if verb == "start" else "stopped")
@@ -619,7 +656,7 @@ class SweepTests(unittest.TestCase):
     def test_a_current_trip_past_its_grace_is_archived_and_stops_after_two_sweeps(self) -> None:
         t = self.trip(end=self.past(15))
         self.organizer(t, "7015")
-        self.bind(t, "7015")
+        self.bind(t, "7015", created_ago=timedelta(days=3))
         self.host.set(t["profile"], "running")
         sweep = self.sweep("enforce")
         sweep.run()
@@ -628,6 +665,35 @@ class SweepTests(unittest.TestCase):
         self.advance(5)
         sweep.run()
         self.assertEqual(self.host.act_calls, [(t["profile"], "stop")])
+
+    def test_a_switch_to_an_archived_trip_revives_and_starts_it_then_it_archives_again(self) -> None:
+        t = self.trip(end=self.past(90))
+        self.organizer(t, "7018")
+        self.host.set(t["profile"], "stopped")
+        sweep = self.sweep("enforce")
+        sweep.run()
+        self.assertEqual(self.row(t)["reason"], "ARCHIVED")
+        self.assertEqual(self.host.act_calls, [], "archived and down: converged")
+        self.bind(t, "7018")                    # the organizer's /switch to it
+        self.advance(1)
+        sweep.run()
+        self.assertEqual((self.row(t)["desired"], self.row(t)["reason"]), ("running", "REVIVED"))
+        self.assertEqual(self.host.act_calls, [(t["profile"], "start")])
+        self.advance(60 * 24 * 2 + 10)          # two days and ten minutes after the binding
+        sweep.run()
+        self.assertEqual(self.row(t)["reason"], "ARCHIVED")
+        self.advance(5)
+        sweep.run()
+        self.assertEqual(self.host.act_calls, [(t["profile"], "start"), (t["profile"], "stop")])
+
+    def test_a_group_or_a_non_organizer_chat_does_not_revive_an_archived_trip(self) -> None:
+        group, stranger = self.trip(end=self.past(90)), self.trip(end=self.past(90))
+        self.organizer(stranger, "7019", role="member")
+        self.bind(group, "-100888")
+        self.bind(stranger, "7019")
+        self.sweep().run()
+        self.assertEqual(self.row(group)["reason"], "ARCHIVED")
+        self.assertEqual(self.row(stranger)["reason"], "ARCHIVED")
 
     def test_the_current_trip_runs_through_day_14_of_its_grace(self) -> None:
         t = self.trip(end=self.past(14))
@@ -886,6 +952,21 @@ class SweepTests(unittest.TestCase):
         self.assertEqual((row["last_action"], row["last_result"], row["failures"]), ("start", "ok", 0))
         self.assertEqual([(e["action"], e["result"], e["mode"]) for e in self.events(t, "ACTION")],
                          [("start", "ok", "enforce")])
+
+    def test_a_start_names_the_trip_for_the_bridge_check_a_stop_and_the_interviewer_do_not(self) -> None:
+        up, down = self.trip(), self.trip(slug=f"retired-gw-{rnd(3)}-20260101")
+        self.host.set(up["profile"], "stopped")
+        self.host.set(down["profile"], "running")
+        self.host.set("trip-intake", "stopped")
+        self.addCleanup(lambda: self.conn.execute(
+            "DELETE FROM control_plane.companion_gateway_events WHERE hermes_profile = 'trip-intake'"))
+        self.addCleanup(lambda: self.conn.execute(
+            "DELETE FROM control_plane.companion_gateways WHERE hermes_profile = 'trip-intake'"))
+        self.sweep("enforce").run()
+        by_call = dict(zip(self.host.act_calls, self.host.act_slugs))
+        self.assertEqual(by_call[(up["profile"], "start")], up["slug"])
+        self.assertIsNone(by_call[(down["profile"], "stop")])
+        self.assertIsNone(by_call[("trip-intake", "start")])
 
     def test_at_most_three_actions_per_sweep_and_the_rest_wait_for_the_next(self) -> None:
         ts = [self.trip() for _ in range(5)]

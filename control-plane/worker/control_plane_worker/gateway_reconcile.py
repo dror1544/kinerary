@@ -36,9 +36,11 @@ pin and the operator's `on`/`off` pin come first):
      than WARM_DAYS (2) ago. It keeps running for those two days.
   3. UNDERWAY. start_date <= today <= end_date. It runs whatever its
      organizer is looking at.
-  4. REVIVED. A message reached it while it was off (the relay recorded a
-     lost turn) less than REVIVE_DAYS (2) ago. It runs, alongside whatever
-     else runs: a revival never stops another trip.
+  4. REVIVED. A user asked for it less than REVIVE_DAYS (2) ago: a message
+     reached it while it was off (the relay recorded a lost turn), or an
+     organizer of it opened a private-chat binding to it (a /switch to an
+     archived trip). It runs, alongside whatever else runs: a revival never
+     stops another trip.
   5. ARCHIVED. Today is past end_date + 14 days. Stopped.
   6. NOT_CURRENT. Anything else: planned, or ended within its grace, and not
      current, not warm, not underway, not revived; or no dates and not
@@ -129,6 +131,7 @@ class GatewayFacts:
     profile: str
     kind: str = "companion"              # 'interviewer' | 'companion'
     trip_id: str | None = None
+    slug: str | None = None              # the trip's slug, for the bridge check before a start
     retired: bool = False
     pin: str | None = None               # 'on' | 'off' | 'teardown' | None
     start_date: date | None = None
@@ -139,6 +142,11 @@ class GatewayFacts:
     #: binding closed by /switch, or the chat bound elsewhere), within
     #: WARM_DAYS; None if they did not.
     warm_at: datetime | None = None
+    #: When an organizer of this trip last opened a private-chat binding to it
+    #: (a /switch to it), within REVIVE_DAYS; None if none did. For a trip
+    #: still inside its grace this is also CURRENT_TRIP; for an archived one it
+    #: is the ask that revives it.
+    switched_at: datetime | None = None
     #: When the relay last lost a turn for this trip because no gateway took it
     #: (a message to a stopped companion), within REVIVE_DAYS; None if none.
     asked_at: datetime | None = None
@@ -187,7 +195,8 @@ def decide(facts: GatewayFacts, now: datetime, policy: Policy = DEFAULT_POLICY) 
         return Decision("running", "WARM")
     if facts.start_date is not None and facts.end_date is not None and facts.start_date <= today <= facts.end_date:
         return Decision("running", "UNDERWAY")
-    if facts.asked_at is not None and now - facts.asked_at < timedelta(days=policy.revive_days):
+    asks = [t for t in (facts.asked_at, facts.switched_at) if t is not None]
+    if asks and now - max(asks) < timedelta(days=policy.revive_days):
         return Decision("running", "REVIVED")
 
     # A stop, held back for a conversation that is still warm.
@@ -294,14 +303,53 @@ class SshGatewayAdapter:
                 f"gateway status answered for {len(answers)} of {len(names)} profile(s), end marker {ended}")
         return answers
 
-    def act(self, profile: str, verb: str) -> str:
+    _SLUG_RE = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
+    _BACKFILL_LINE = re.compile(r"BACKFILL ([a-z0-9][a-z0-9-]{1,62}) (marked|already|refused|absent)")
+    _BACKFILL_END = re.compile(r"BACKFILL_END ([0-9]{1,4})")
+
+    def backfill(self, profiles: Sequence[str]) -> dict[str, str]:
+        """Ask the host to write the provenance marker into profiles that exist
+        and are not on its deny list: {profile: marked|already|refused|absent}.
+        Same discipline as `status`: exactly the names asked, a closing count."""
+        names = list(dict.fromkeys(profiles))
+        if not names or len(names) > self.MAX_PROFILES or not all(PROFILE_RE.fullmatch(n) for n in names):
+            raise GatewayHostError(f"refusing to backfill {len(names)} profile(s)")
+        lines = self._ssh(
+            {"record_type": "companion_gateway_backfill", "schema_version": 1, "profiles": names},
+            self.STATUS_TIMEOUT_SECONDS, "gateway backfill",
+        )
+        out: dict[str, str] = {}
+        ended = None
+        for index, line in enumerate(lines):
+            end = self._BACKFILL_END.fullmatch(line)
+            if end:
+                if index != len(lines) - 1:
+                    raise GatewayHostError("gateway backfill had lines after its end marker")
+                ended = int(end.group(1))
+                continue
+            match = self._BACKFILL_LINE.fullmatch(line)
+            if not match or match.group(1) not in names or match.group(1) in out:
+                raise GatewayHostError(f"gateway backfill returned a line that is not a verdict (line {index + 1})")
+            out[match.group(1)] = match.group(2)
+        if ended is None or ended != len(out) or set(out) != set(names):
+            raise GatewayHostError(f"gateway backfill answered for {len(out)} of {len(names)} profile(s)")
+        return out
+
+    def act(self, profile: str, verb: str, slug: str | None = None) -> str:
         """Start or stop one profile's gateway. Returns 'ok', 'refused' or
-        'failed' as the host said; raises GatewayHostError when it was not asked."""
+        'failed' as the host said; raises GatewayHostError when it was not asked.
+        `slug`, for a start, names the trip whose trip-mcp bridge the host checks
+        (and restarts if it is not answering) before the gateway starts."""
         if verb not in self.VERBS or not PROFILE_RE.fullmatch(profile or ""):
             raise GatewayHostError(f"refusing to {verb!r} {profile!r}")
+        if slug is not None and (verb != "start" or not self._SLUG_RE.fullmatch(slug) or len(slug) > 80):
+            raise GatewayHostError(f"refusing to {verb} {profile!r} with slug {slug!r}")
+        payload = {"record_type": "companion_gateway_action", "schema_version": 1, "action": verb,
+                   "profile": {"name": profile}}
+        if slug:
+            payload["slug"] = slug
         lines = self._ssh(
-            {"record_type": "companion_gateway_action", "schema_version": 1, "action": verb,
-             "profile": {"name": profile}},
+            payload,
             self.ACTION_TIMEOUT_SECONDS, f"gateway {verb}",
         )
         if len(lines) != 1:
@@ -372,6 +420,8 @@ SELECT p.profile, t.id AS trip_id, t.slug,
        t.plan_snapshot #>> '{meta,returnDate}' AS return_date,
        EXISTS (SELECT 1 FROM org o JOIN dm ON dm.digest = o.digest AND dm.closed_at IS NULL AND dm.trip_id = t.id
                 WHERE o.trip_id = t.id) AS is_current,
+       (SELECT max(dm.created_at) FROM org o JOIN dm ON dm.digest = o.digest AND dm.trip_id = t.id
+         WHERE o.trip_id = t.id AND dm.created_at > %(revive_since)s) AS switched_at,
        (SELECT max(dm.closed_at) FROM org o JOIN dm ON dm.digest = o.digest AND dm.trip_id = t.id
          WHERE o.trip_id = t.id AND dm.closed_at > %(warm_since)s
            AND (dm.closed_reason = 'organizer_switch'
@@ -406,11 +456,12 @@ def load_facts(conn: Any, now: datetime, interviewer_profile: str = INTERVIEWER_
         if row["profile"] == interviewer_profile:
             continue  # a trip row naming the interviewer's profile must not demote it
         out.append(GatewayFacts(
-            profile=row["profile"], kind="companion", trip_id=row["trip_id"],
+            profile=row["profile"], kind="companion", trip_id=row["trip_id"], slug=row["slug"],
             retired=bool(row["retired"]), pin=row["pin"],
             start_date=parse_date(row["departure"]) or parse_date(row["start_date"]),
             end_date=parse_date(row["return_date"]) or parse_date(row["end_date"]),
-            is_current=bool(row["is_current"]), warm_at=row["warm_at"], asked_at=row["asked_at"],
+            is_current=bool(row["is_current"]), warm_at=row["warm_at"],
+            switched_at=row["switched_at"], asked_at=row["asked_at"],
             last_activity_at=row["last_activity_at"],
         ))
     return out
@@ -653,7 +704,8 @@ class GatewayReconcileSweep:
                 continue
             profile, verb = item["profile"], item["action"]
             try:
-                result = self._adapter.act(profile, verb)
+                facts = decisions[profile][0]
+                result = self._adapter.act(profile, verb, facts.slug if verb == "start" and facts.kind == "companion" else None)
             except GatewayHostError as exc:
                 errors_in_a_row += 1
                 summary["failed"] += 1

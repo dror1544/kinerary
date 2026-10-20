@@ -139,3 +139,43 @@ test("expected companions are the open bindings of trips not known to be unreach
     await pool.end();
   }
 });
+
+test("a companion the control plane stopped on purpose is not waited for; an undecided one still is", { skip: !databaseUrl }, async () => {
+  const pool = testPool();
+  const client = await pool.connect();
+  try {
+    await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");
+    await client.query("DROP TABLE IF EXISTS public.control_plane_schema_migrations");
+    await applyMigrations(client, migrationsDir);
+    await client.query(`INSERT INTO control_plane.trips(id, slug, lifecycle_state, reachability, unreachable_reason) VALUES
+      ('trip_curr0001', 'current-trip', 'ready_private', 'reachable', NULL),
+      ('trip_dorm0001', 'dormant-trip', 'ready_private', 'reachable', NULL),
+      ('trip_none0001', 'undecided-trip', 'ready_private', 'reachable', NULL),
+      ('trip_revv0001', 'revived-trip', 'ready_private', 'reachable', NULL),
+      ('trip_brkn0001', 'bridge-broken-dormant', 'ready_private', 'unreachable', 'TRIP_MCP_BRIDGE_FAILED')`);
+    const bind = (id: string, chat: string, trip: string, profile: string) =>
+      client.query(
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ($1, $2, $3, $4)",
+        [id, chat, trip, profile],
+      );
+    await bind("tcb_curr0001", "-2001", "trip_curr0001", "current2026");
+    await bind("tcb_dorm0001", "-2002", "trip_dorm0001", "dormant2026");
+    await bind("tcb_none0001", "-2003", "trip_none0001", "undecided2026");
+    await bind("tcb_revv0001", "-2004", "trip_revv0001", "revived2026");
+    await bind("tcb_brkn0001", "-2005", "trip_brkn0001", "brokendormant2026");
+    await client.query(`INSERT INTO control_plane.companion_gateways(hermes_profile, kind, desired, reason) VALUES
+      ('current2026', 'companion', 'running', 'CURRENT_TRIP'),
+      ('dormant2026', 'companion', 'stopped', 'NOT_CURRENT'),
+      ('revived2026', 'companion', 'running', 'REVIVED'),
+      ('brokendormant2026', 'companion', 'stopped', 'ARCHIVED')`);
+    assert.deepEqual(await expectedGatewayProfiles(client), ["current2026", "revived2026", "undecided2026"]);
+    // The decision flips back: it is expected again.
+    await client.query("UPDATE control_plane.companion_gateways SET desired = 'running', reason = 'REVIVED' WHERE hermes_profile = 'dormant2026'");
+    assert.deepEqual(await expectedGatewayProfiles(client), ["current2026", "dormant2026", "revived2026", "undecided2026"]);
+  } finally {
+    await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");
+    await client.query("DROP TABLE IF EXISTS public.control_plane_schema_migrations");
+    client.release();
+    await pool.end();
+  }
+});

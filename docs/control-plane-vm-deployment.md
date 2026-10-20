@@ -331,6 +331,121 @@ makes the runtime read, with nothing in the repo applying that patch: the
 deployment would have looked correct and quietly dropped every file a family
 sent.
 
+### Which gateways run is the control plane's decision
+
+Issue #349. Nothing used to say which companions are *meant* to be up: each
+gateway started from whatever `hermes -p <profile> gateway start` last recorded,
+so "stopped on purpose" and "broken" looked the same, and a newer Hermes that
+starts named profiles stopped at boot would have made every live trip's
+companion a guess. The worker's **gateway reconciler**
+(`control-plane/worker/control_plane_worker/gateway_reconcile.py`) decides, from
+facts the database already holds, writes the decision to
+`control_plane.companion_gateways` (closed-code columns only, history in
+`companion_gateway_events`), and — only in `enforce` mode — starts and stops
+gateways through the companion forced command. It runs on the provisioner
+worker's idle loop (every 5 minutes, and sooner when an organizer's `/switch`
+opens a private-chat binding or the relay records a lost turn), needs only the
+companion SSH settings (not companion *provisioning*, which stays off on this VM
+outside a test run), and has **no HTTP route**.
+
+**The rule**, in the order `decide()` applies it (the interviewer always runs;
+a retired trip, a `teardown` pin and an operator pin come first):
+
+1. **CURRENT_TRIP** — the trip is the current trip of any of its organizers (an
+   active owner/organizer membership, matched to an open private-chat binding by
+   the same sha256 digest the API uses). Runs, until 14 days after it ends.
+2. **WARM** — it was an organizer's current trip and they switched away less than
+   2 days ago. A `/switch` therefore does not stop the trip it leaves.
+3. **UNDERWAY** — today is between its start and end dates, whatever the
+   organizer is looking at.
+4. **REVIVED** — an organizer opened a private-chat binding to it, or a message
+   reached it while it was off (the relay's `lost_gateway_unavailable` /
+   `lost_companion_unreachable` turn), less than 2 days ago. It runs alongside
+   everything else; a revival never stops another trip.
+5. **ARCHIVED** — more than 14 days past its end. Stopped.
+6. **NOT_CURRENT** — anything else (planned or in its grace but none of the
+   above, or undated and not current). Stopped.
+
+Nothing automatic is stopped within 6 hours of a conversation (`QUIET_WINDOW`; it
+only holds, it never starts). A start is never debounced; a stop that a date or a
+clock decides (`ARCHIVED`, `NOT_CURRENT`) must be decided on two consecutive
+sweeps. Dates come from the deployed config (`trips.plan_snapshot`) first, then
+`trips.start_date`/`end_date`. Revival depends on the relay recording assistant
+events (`ASSISTANT_EVENTS_ENABLED=1`); the reconciler logs
+`gateway_reconcile.wake_signal_blind` once per process when it has seen none in
+7 days.
+
+**Modes** (`GATEWAY_RECONCILE_MODE`, default `observe`; an unreadable value stops
+the worker at startup rather than falling back):
+
+- `observe` records every decision and every observation and acts on nothing.
+  Ship in this mode first and read the fleet monitor's "COMPANION GATEWAYS"
+  section for a week: `PENDING_STOP` lists what `enforce` would stop,
+  `NOT_CURRENT` lists every trip nobody's chat is on (including a trip whose
+  organizer never linked a Telegram identity, which `enforce` would also stop),
+  `DORMANT` is never an alert.
+- `enforce` also starts and stops, at most 3 gateways per sweep, with a backoff
+  after a failed attempt (5, 10, 20, 40, 60 minutes) and the sweep abandoned
+  after 3 host errors in a row. It never restarts a gateway: a start of a running
+  one and a stop of a stopped one are `ok` without touching anything.
+- `off` is the sweep not existing.
+
+**Operator** (from the worker container, `--database-url-file` and the
+`PROVISIONER_COMPANION_SSH_*` settings as for the worker):
+
+```bash
+python -m control_plane_worker reconcile-gateways --dry-run                 # what would it start and stop? writes nothing
+python -m control_plane_worker reconcile-gateways --once [--mode enforce]   # one sweep now (observe unless told)
+python -m control_plane_worker reconcile-gateways --pin <profile> off       # on | off | clear — an override, under the lock
+python -m control_plane_worker reconcile-gateways --backfill-markers        # once, before the first enforce
+```
+
+**What the host will and will not do.** The forced command
+(`scripts/companion-install-host.sh`) answers `companion_gateway_status` (read
+only), `companion_gateway_backfill` and `companion_gateway_action` (`start|stop`).
+It refuses: any profile on its deny list (`default`, `trip-monitor`,
+`kinerary-extract`); any profile without the **provenance marker** (a file named
+`kinerary-managed` in the profile directory, written at install and by the
+backfill — a profile this system did not install may carry somebody's own bot
+token and is never started); to stop `trip-intake`; and anything at all on a Mac
+(launchd is that platform's supervisor; the Mac stays observe-only). Before it
+starts a trip's gateway it brings the trip's `trip-mcp` bridge back if it is
+not answering — a gateway that connects first parks the bridge after three
+failed connects and stays toolless for the life of the process — and refuses
+the start if it cannot. **Run `--backfill-markers` once after the first deploy**:
+until then `enforce` gets `refused` for every profile installed before the
+marker existed, which the fleet monitor shows as `BROKEN`.
+
+**One lock.** `pg_advisory_lock(hashtext('control_plane.companion_gateways'))`:
+every sweep holds it (and skips itself when it cannot have it),
+`scripts/teardown-trip.py` takes it to pin a trip's gateway OFF (`TEARDOWN`) as
+its first step after the backup — so the reconciler cannot restart a gateway
+between teardown stopping it and the trip being retired — and
+`kinerary-cp-release upgrade`, `rollback` and `restart-bridges` hold it for the
+length of the action. A release that cannot get the lock within two minutes
+refuses; a database that cannot be reached is noted and the release goes on.
+
+**Dormant companions are not waited for.** `relay/gateway-wait.ts`
+(`expectedGatewayProfiles`) and the release tool's `live_companions()` skip a
+companion whose recorded decision is `stopped`, together: a gateway down on
+purpose must not cost every other trip the relay's startup wait, fail
+`verify`, or have its bridge restarted. No row, or no table, means expected up.
+If either query changes, change both (a test pins that they agree).
+
+**Mac.** The launchd agent `companion-install-host.sh` writes for a new trip is
+now the supervised kind: restart only on failure (`KeepAlive`/`SuccessfulExit`
+false), `--external-supervisor`, no `--replace`, and **no fallback starter** —
+the detached `gateway run` it used to start when launchd would not take the agent
+from an SSH session was the second starter that made Hermes warn "another
+profile's standalone gateway owns this host". When launchd did not take it the
+install says so and prints the `launchctl bootstrap` line to run from a
+Terminal.
+
+**Not here yet.** Stamping `gateway.standalone: true` on every managed profile,
+the Hermes-upgrade readiness checks in `kinerary-cp-release`, and the container
+rehearsal are the next change. Until that ships, do not move the VM to a Hermes
+that folds named profiles into one process.
+
 ### Files sent on Telegram: the hand-off folder
 
 A companion gets a file someone sent as a **local path**. Hermes saves it with

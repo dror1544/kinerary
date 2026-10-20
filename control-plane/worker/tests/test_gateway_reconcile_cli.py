@@ -50,10 +50,12 @@ class GatewayReconcileFlagsTests(unittest.TestCase):
             self.assertTrue(build_parser().parse_args(["reconcile-gateways", "--dry-run"]).dry_run)
             self.assertEqual(
                 build_parser().parse_args(["reconcile-gateways", "--pin", "p-x", "off"]).pin, ["p-x", "off"])
+            self.assertTrue(build_parser().parse_args(["reconcile-gateways", "--backfill-markers"]).backfill_markers)
             args = build_parser().parse_args(["reconcile-gateways", "--once"])
             self.assertEqual(args.mode, "observe", "a bare --once must not enforce")
             for argv in (["reconcile-gateways"], ["reconcile-gateways", "--once", "--dry-run"],
-                         ["reconcile-gateways", "--once", "--pin", "p-x", "on"]):
+                         ["reconcile-gateways", "--once", "--pin", "p-x", "on"],
+                         ["reconcile-gateways", "--backfill-markers", "--dry-run"]):
                 with self.subTest(argv=argv), self.assertRaises(SystemExit), mock.patch("sys.stderr"):
                     build_parser().parse_args(argv)
 

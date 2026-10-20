@@ -68,9 +68,12 @@ cat > "$HANDOFF"
 # site's address, the container, the port) is read from this host's own
 # kinerary-deploy files below, never from the request.
 #
-# A fourth, since 2026-10-21 (issue #349): `companion_gateway_status`, a list of
-# profile NAMES the control plane wants the running state of. READ-ONLY; see its
-# handler below. It carries no `profile` object, so it is validated separately.
+# Since 2026-10-21 (issue #349) three more, all about which gateways run:
+# `companion_gateway_status` (READ-ONLY: a list of profile NAMES) and
+# `companion_gateway_backfill` (a list of NAMES to mark as managed), neither of
+# which carries a `profile` object and so both are validated separately; and
+# `companion_gateway_action`, one profile name, a verb from the closed set
+# start|stop, and optionally the trip slug whose bridge to check first.
 VALIDATED="$(
   /usr/bin/python3 - "$HANDOFF" <<'PY'
 import json, re, sys
@@ -82,9 +85,9 @@ if not isinstance(d, dict):
     print("refusing a request that is not a JSON object", file=sys.stderr); raise SystemExit(2)
 kind = d.get("record_type") or "trip_assistant_profile_input"
 if kind not in ("trip_assistant_profile_input", "trip_mcp_bridge_request", "trip_mcp_bridge_probe",
-                "companion_gateway_status"):
+                "companion_gateway_status", "companion_gateway_backfill", "companion_gateway_action"):
     print(f"refusing unknown request type: {kind!r}", file=sys.stderr); raise SystemExit(2)
-if kind == "companion_gateway_status":
+if kind in ("companion_gateway_status", "companion_gateway_backfill"):
     # A list of profile NAMES and nothing else (issue 349). Each one is checked
     # with the same pattern as every other name that reaches this host, because
     # the status handler below reads a directory and matches a process by it.
@@ -92,7 +95,7 @@ if kind == "companion_gateway_status":
     if (not isinstance(names, list) or not 1 <= len(names) <= 200 or len(set(map(str, names))) != len(names)
             or not all(isinstance(n, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{1,62}", n) for n in names)):
         print("refusing an unsafe gateway status request", file=sys.stderr); raise SystemExit(2)
-    print(f"{kind}\t\t"); raise SystemExit(0)
+    print(f"{kind}\t\t\t"); raise SystemExit(0)
 profile = d.get("profile") or {}
 name = profile.get("name") if isinstance(profile, dict) else None
 # Conservative on purpose: this becomes ~/.hermes/profiles/<name>. No dots (no
@@ -100,89 +103,167 @@ name = profile.get("name") if isinstance(profile, dict) else None
 if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,62}", name):
     print(f"refusing unsafe profile name: {name!r}", file=sys.stderr); raise SystemExit(2)
 slug = ""
-if kind in ("trip_mcp_bridge_request", "trip_mcp_bridge_probe"):
+action = ""
+if kind == "companion_gateway_action":
+    action = d.get("action")
+    if action not in ("start", "stop"):
+        print(f"refusing unknown gateway action: {action!r}", file=sys.stderr); raise SystemExit(2)
+if kind in ("trip_mcp_bridge_request", "trip_mcp_bridge_probe", "companion_gateway_action"):
     slug = d.get("slug") or ""
     if not isinstance(slug, str):
         print(f"refusing unsafe trip slug: {slug!r}", file=sys.stderr); raise SystemExit(2)
     # Becomes ~/kinerary-deploy/trips/<slug>: the trip-slug grammar, no more.
-    if not re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", slug) or len(slug) > 80:
+    if slug != "" and (not re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", slug) or len(slug) > 80):
         print(f"refusing unsafe trip slug: {slug!r}", file=sys.stderr); raise SystemExit(2)
-print(f"{kind}\t{name}\t{slug}")
+    if slug == "" and kind != "companion_gateway_action":
+        print(f"refusing unsafe trip slug: {slug!r}", file=sys.stderr); raise SystemExit(2)
+print(f"{kind}\t{name}\t{slug}\t{action}")
 PY
 )" || die "handoff validation failed"
 REQUEST_KIND="$(printf '%s' "$VALIDATED" | cut -f1)"
 PROFILE_NAME="$(printf '%s' "$VALIDATED" | cut -f2)"
 TRIP_SLUG="$(printf '%s' "$VALIDATED" | cut -f3)"
+GATEWAY_ACTION="$(printf '%s' "$VALIDATED" | cut -f4)"
 
-# ── Gateway status: which companion gateways are running on THIS host? ───────
+# ── Which companion gateways run on THIS host (issue #349) ────────────────────
 #
-# Issue #349. The control plane decides which companions run, and to decide it
-# has to be able to see. Read-only and early: it renders nothing, starts and
-# stops nothing, reads no key and no trip file, and answers about exactly the
-# profiles named. A request carries NAMES (already validated above); how a
-# gateway is recognised is this host's own business.
+# The control plane decides which companions run; to decide it has to see, and
+# to enforce it has to start and stop. Three request kinds, all naming PROFILES
+# and nothing else the caller controls:
 #
-# Recognised the way scripts/e2e-full-cycle.py already does, by its command
-# line: `-p|--profile <name> gateway run`, which launchd runs on a Mac and an s6
-# slot in the Hermes container runs on the VM (visible to this host's ps). A
-# supervisor wrapper whose own arguments repeat that command line is ONE
+#   companion_gateway_status    READ-ONLY. For each name asked: running, duplicate,
+#                               stopped or absent.
+#   companion_gateway_backfill  writes the provenance marker into profiles that
+#                               exist and are not on the deny list.
+#   companion_gateway_action    start|stop one profile's gateway (handler below,
+#                               after the bridge helpers it uses).
+#
+# A gateway is recognised the way scripts/e2e-full-cycle.py already does, by its
+# command line: `-p|--profile <name> gateway run`, which launchd runs on a Mac and
+# an s6 slot in the Hermes container runs on the VM (visible to this host's ps).
+# A supervisor wrapper whose own arguments repeat that command line is ONE
 # gateway, not two: a match whose parent is also a match for the same profile is
 # not counted, so `duplicate` means two independent starters, the thing the
 # upgrade precondition worries about.
 #
-# Output is EXACTLY these lines, and the worker parses each by full match:
-#   GATEWAY <name> <running|duplicate|stopped|absent> <n>      one per name asked
-#   STATUS_END <number of GATEWAY lines>                       a truncated answer is not a short list
-# `stopped` is a profile directory with no gateway; `absent` is no such profile.
-if [ "$REQUEST_KIND" = "companion_gateway_status" ]; then
-  /usr/bin/python3 - "$HANDOFF" "$HOME/.hermes/profiles" <<'PYSTATUS' || die "gateway status failed"
+# Written to a file, not inlined: macOS /bin/bash 3.2 mis-parses quotes inside a
+# here-document inside a command substitution. Modes:
+#   status <handoff> <profiles dir>   the GATEWAY lines and STATUS_END
+#   count <name>                      the number of independent gateways, alone
+write_gateway_probe() {
+  cat > "$WORK/gateway_probe.py" <<'PYPROBE'
 import json, os, re, subprocess, sys
 
 NAME = re.compile(r"[a-z0-9][a-z0-9-]{1,62}")
 GATEWAY = re.compile(r"(?:^|\s)(?:-p|--profile)\s+([a-z0-9][a-z0-9-]{1,62})\s+gateway\s+run(?:\s|$)")
 ROW = re.compile(r"\s*([0-9]+)\s+([0-9]+)\s+(.*)")
 
-names = json.load(open(sys.argv[1])).get("profiles")
+
+def fail(message):
+    print("companion-install-host: " + message, file=sys.stderr)
+    raise SystemExit(2)
+
+
+def top_level_counts():
+    try:
+        listing = subprocess.run(["ps", "axww", "-o", "pid=,ppid=,args="], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        listing = None
+    if listing is None or listing.returncode != 0:
+        fail("could not list processes")
+    matches = {}
+    for line in listing.stdout.splitlines():
+        row = ROW.fullmatch(line)
+        found = GATEWAY.search(row.group(3)) if row else None
+        if found:
+            matches[int(row.group(1))] = (int(row.group(2)), found.group(1))
+    counts = {}
+    for pid, (ppid, profile) in matches.items():
+        parent = matches.get(ppid)
+        if parent is None or parent[1] != profile:
+            counts[profile] = counts.get(profile, 0) + 1
+    return counts
+
+
+mode = sys.argv[1]
+if mode == "count":
+    if not NAME.fullmatch(sys.argv[2]):
+        fail("refusing an unsafe profile name")
+    print(top_level_counts().get(sys.argv[2], 0))
+    raise SystemExit(0)
+
+names = json.load(open(sys.argv[2])).get("profiles")
 if not isinstance(names, list) or not names or not all(isinstance(n, str) and NAME.fullmatch(n) for n in names):
-    print("companion-install-host: refusing an unsafe gateway status request", file=sys.stderr)
-    raise SystemExit(2)
-
-try:
-    listing = subprocess.run(["ps", "axww", "-o", "pid=,ppid=,args="], capture_output=True, text=True, timeout=30)
-except (OSError, subprocess.SubprocessError):
-    listing = None
-if listing is None or listing.returncode != 0:
-    print("companion-install-host: could not list processes", file=sys.stderr)
-    raise SystemExit(2)
-
-matches = {}
-for line in listing.stdout.splitlines():
-    row = ROW.fullmatch(line)
-    found = GATEWAY.search(row.group(3)) if row else None
-    if found:
-        matches[int(row.group(1))] = (int(row.group(2)), found.group(1))
-
-top_level = {}
-for pid, (ppid, profile) in matches.items():
-    parent = matches.get(ppid)
-    if parent is None or parent[1] != profile:
-        top_level[profile] = top_level.get(profile, 0) + 1
-
+    fail("refusing an unsafe gateway status request")
+counts = top_level_counts()
 for name in names:
-    n = top_level.get(name, 0)
+    n = counts.get(name, 0)
     if n >= 2:
         state = "duplicate"
     elif n == 1:
         state = "running"
-    elif os.path.isdir(os.path.join(sys.argv[2], name)):
+    elif os.path.isdir(os.path.join(sys.argv[3], name)):
         state = "stopped"
     else:
         state = "absent"
     print(f"GATEWAY {name} {state} {min(n, 99)}")
 print(f"STATUS_END {len(names)}")
-PYSTATUS
+PYPROBE
+}
+
+# The provenance marker. A Hermes host also runs profiles that are not this
+# product's companions (an operator's own, with their own bot tokens), and the
+# control plane must never start or stop one of those. A profile this system
+# installed carries the marker; a profile without it is refused by every action.
+# The deny list is the belt to that braces: names that are never touched even
+# if somebody puts a marker in them.
+GATEWAY_MARKER="kinerary-managed"
+GATEWAY_DENY=" default trip-monitor kinerary-extract "
+gateway_denied() {
+  case "$GATEWAY_DENY" in *" $1 "*) return 0 ;; esac
+  return 1
+}
+mark_managed() {
+  local name="$1" dir="$HOME/.hermes/profiles/$1"
+  gateway_denied "$name" && return 0
+  [ -d "$dir" ] || return 0
+  printf 'kinerary-managed\n' > "$dir/$GATEWAY_MARKER" 2>/dev/null || true
+}
+
+if [ "$REQUEST_KIND" = "companion_gateway_status" ]; then
+  write_gateway_probe
+  /usr/bin/python3 "$WORK/gateway_probe.py" status "$HANDOFF" "$HOME/.hermes/profiles" || die "gateway status failed"
   exit 0
 fi
+
+# Backfill: mark profiles that already exist (installed before the marker did).
+# Exactly one `BACKFILL <name> <marked|already|refused|absent>` line per name,
+# then `BACKFILL_END <n>`. `refused` is the deny list; nothing else is touched.
+if [ "$REQUEST_KIND" = "companion_gateway_backfill" ]; then
+  /usr/bin/python3 - "$HANDOFF" > "$WORK/backfill.names" <<'PYNAMES' || die "gateway backfill failed"
+import json, sys
+for n in json.load(open(sys.argv[1])).get("profiles"):
+    print(n)
+PYNAMES
+  total=0
+  while IFS= read -r backfill_name; do
+    total=$((total + 1))
+    if gateway_denied "$backfill_name"; then
+      outcome=refused
+    elif [ ! -d "$HOME/.hermes/profiles/$backfill_name" ]; then
+      outcome=absent
+    elif [ -f "$HOME/.hermes/profiles/$backfill_name/$GATEWAY_MARKER" ]; then
+      outcome=already
+    else
+      mark_managed "$backfill_name"
+      if [ -f "$HOME/.hermes/profiles/$backfill_name/$GATEWAY_MARKER" ]; then outcome=marked; else outcome=refused; fi
+    fi
+    printf 'BACKFILL %s %s\n' "$backfill_name" "$outcome"
+  done < "$WORK/backfill.names"
+  printf 'BACKFILL_END %s\n' "$total"
+  exit 0
+fi
+
 
 # render_profile.py refuses to overwrite an existing profile, so a retried job
 # after a partial success is a safe error rather than a silent clobber. Report
@@ -451,7 +532,6 @@ start_gateway() {
         <string>${name}</string>
         <string>gateway</string>
         <string>run</string>
-        <string>--replace</string>
         <string>--external-supervisor</string>
     </array>
     <key>WorkingDirectory</key>
@@ -473,7 +553,10 @@ start_gateway() {
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
     <key>ThrottleInterval</key>
     <integer>30</integer>
     <key>ExitTimeOut</key>
@@ -522,36 +605,14 @@ PLIST
     return 0
   fi
 
-  # DETACHED FALLBACK. Its own session, so the SSH session ending cannot take
-  # it — that is the whole difference from `nohup`, which only covers SIGHUP.
-  # Written to a file rather than inlined: macOS /bin/bash 3.2 is what sshd
-  # runs a forced command with, and it mis-parses quoting inside a command
-  # substitution (the same reason the topology reader below is a file).
-  printf 'companion-install-host: launchctl did not start %s (%s); starting it detached\n' \
-    "$name" "${boot_err:-no error reported}" >&2
-  cat > "$WORK/detach.py" <<'PYDETACH'
-import os, sys
-log, argv = sys.argv[1], sys.argv[2:]
-if os.fork():
-    os._exit(0)
-os.setsid()
-fd = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
-os.dup2(os.open(os.devnull, os.O_RDONLY), 0)
-os.dup2(fd, 1)
-os.dup2(fd, 2)
-os.execv(argv[0], argv)
-PYDETACH
-  # `--replace` because a half-started instance may still hold the socket, and
-  # the point here is to end up with exactly one gateway.
-  HERMES_HOME="$home" "$py" "$WORK/detach.py" "$home/logs/gateway.log" \
-    "$py" -m hermes_cli.main --profile "$name" gateway run --replace || true
-
-  if gateway_alive "$name"; then
-    printf 'companion-install-host: gateway %s started (detached)\n' "$name" >&2
-  else
-    printf 'companion-install-host: %s NOT RUNNING — launchctl: %s\n' \
-      "$name" "${boot_err:-no error reported}" >&2
-  fi
+  # NO FALLBACK STARTER. There used to be a detached gateway started with the replace flag here
+  # for when launchd would not take the agent from an SSH session, and it is the
+  # double starter that put two processes on one profile and made Hermes warn
+  # "another profile's standalone gateway owns this host" (2026-10-13). One
+  # supervisor per profile: if launchd did not start it, say so, and say what to
+  # run. The agent is installed (RunAtLoad), so the next login starts it too.
+  printf 'companion-install-host: launchctl did not start %s (%s); it is NOT RUNNING. From your own Terminal: launchctl bootstrap gui/%s %s\n' \
+    "$name" "${boot_err:-no error reported}" "$(id -u)" "$plist" >&2
 }
 
 # The gateway processes for this profile, if any. `pgrep -f` because the
@@ -792,6 +853,134 @@ PYTOPO
 # sees it. Stdout is EXACTLY one line, `HEALTH ok` or `HEALTH fail <code>`
 # (codes: bridge_health_code). A refusal is exit 2 with no HEALTH line, so the
 # worker can tell "the bridge failed" from "the question could not be asked".
+# ── Gateway action: start or stop ONE companion's gateway ────────────────────
+#
+# Issue #349. The control plane's reconciler asks; this host decides whether it
+# may. It answers EXACTLY one line, `ACTION <name> <start|stop> <ok|refused|failed>`,
+# with the reason on stderr (prefixed, bounded): `refused` is a rule, `failed` is
+# the host trying and not getting there, and neither is ever dressed as `ok`.
+#
+# What this host refuses, whatever it is asked:
+#   - any profile on the deny list, and any profile without the provenance marker
+#     (a profile this system did not install may belong to somebody's own bot);
+#   - to stop the interviewer (`trip-intake`): it is always up;
+#   - anything on a Mac. A Mac runs one launchd agent per profile, and launchd
+#     (KeepAlive) is that platform's supervisor: this verb must not become a
+#     second starter. The Mac stays observe-only.
+#
+# It never restarts. A start of a gateway that is already up is `ok`, a stop of
+# one that is down is `ok`, and either way nothing is touched: the old install
+# path's stop-then-start is exactly the double-starter this work removes.
+#
+# Waits are bounded and the bound is this host's own (KINERARY_GATEWAY_WAIT_SECONDS,
+# default 45), never the request's.
+gateway_note() { printf 'companion-install-host: %s\n' "$1" >&2; }
+gateway_result() {  # name verb outcome reason
+  gateway_note "$1 $2: $3 ($4)"
+  printf 'ACTION %s %s %s\n' "$1" "$2" "$3"
+}
+run_bounded() {  # seconds command... — returns 124 when it had to be killed
+  local limit="$1" pid waited=0
+  shift
+  "$@" >/dev/null 2>&1 </dev/null &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$waited" -ge "$limit" ]; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  wait "$pid"
+}
+gateway_count() {
+  /usr/bin/python3 "$WORK/gateway_probe.py" count "$1" || die "could not read the gateway state of $1"
+}
+# Wait (bounded) for the gateway count to satisfy `want`: up or down.
+gateway_wait_for() {  # name up|down
+  local name="$1" want="$2" waited=0 limit="${KINERARY_GATEWAY_WAIT_SECONDS:-45}" n
+  case "$limit" in ''|*[!0-9]*) limit=45 ;; esac
+  while :; do
+    n="$(gateway_count "$name")"
+    if [ "$want" = up ] && [ "$n" -ge 1 ]; then return 0; fi
+    if [ "$want" = down ] && [ "$n" -eq 0 ]; then return 0; fi
+    [ "$waited" -ge "$limit" ] && return 1
+    sleep 1
+    waited=$((waited + 1))
+  done
+}
+
+# Q8: a gateway started before its trip-mcp bridge is up parks the bridge after
+# three failed connects and stays toolless for the life of the process, so a DEAD
+# bridge is brought back first. Only the trip's own bridge, only for a trip that
+# has one configured, and only when it is not answering at all (or predates
+# /health); a bridge that answers but cannot reach the trip is the probe's to
+# report, not a reason to withhold the companion. Returns 1 if it could not be
+# brought back: starting the gateway would only repeat the silent failure.
+revive_bridge_before_start() {  # slug
+  local slug="$1" root="${KINERARY_DEPLOY_ROOT:-$HOME/kinerary-deploy}"
+  [ -n "$slug" ] || return 0
+  [ -f "$root/trips/$slug/topology.yaml" ] && [ -f "$root/trips/$slug/mcp/.env" ] || return 0
+  TRIP_SLUG="$slug"
+  read_trip_wiring
+  bridge_reaches_trip "$MCP_PORT" "$TRIP_DIR" && return 0
+  case "$BRIDGE_HEALTH_CODE" in
+    none|NO_HEALTH_ROUTE) ;;
+    *) gateway_note "trip-mcp for $slug answers but cannot reach its trip ($BRIDGE_HEALTH_CODE); starting the gateway anyway"
+       return 0 ;;
+  esac
+  [ -x "$DEPLOY_ROOT/setup-mcp.sh" ] || { gateway_note "no setup-mcp.sh to restart the bridge for $slug"; return 1; }
+  gateway_note "trip-mcp for $slug is not answering; restarting it before the gateway"
+  if ! REPO_ROOT="$REPO_ROOT" KINERARY_DEPLOY_ROOT="$DEPLOY_ROOT" "$DEPLOY_ROOT/setup-mcp.sh" \
+         --restart-only --trip-dir "$TRIP_DIR" < /dev/null > "$WORK/restart-mcp.log" 2>&1; then
+    tail -5 "$WORK/restart-mcp.log" >&2
+    return 1
+  fi
+  bridge_reaches_trip "$MCP_PORT" "$TRIP_DIR" && return 0
+  case "$BRIDGE_HEALTH_CODE" in
+    none|NO_HEALTH_ROUTE) return 1 ;;
+  esac
+  return 0
+}
+
+if [ "$REQUEST_KIND" = "companion_gateway_action" ]; then
+  write_gateway_probe
+  verb="$GATEWAY_ACTION"
+  name="$PROFILE_NAME"
+  home="$HOME/.hermes/profiles/$name"
+  if [ "$(uname -s)" = Darwin ]; then
+    gateway_result "$name" "$verb" refused "this platform runs launchd agents and is observe-only"; exit 0
+  fi
+  if gateway_denied "$name"; then
+    gateway_result "$name" "$verb" refused "not a profile this system manages"; exit 0
+  fi
+  if [ "$verb" = stop ] && [ "$name" = trip-intake ]; then
+    gateway_result "$name" "$verb" refused "the interviewer is never stopped"; exit 0
+  fi
+  [ -d "$home" ] || { gateway_result "$name" "$verb" refused "no such profile on this host"; exit 0; }
+  [ -f "$home/$GATEWAY_MARKER" ] || { gateway_result "$name" "$verb" refused "no provenance marker; run the backfill for it"; exit 0; }
+  limit="${KINERARY_GATEWAY_WAIT_SECONDS:-45}"
+  case "$limit" in ''|*[!0-9]*) limit=45 ;; esac
+  now_running="$(gateway_count "$name")"
+  if [ "$verb" = start ]; then
+    if [ "$now_running" -ge 1 ]; then gateway_result "$name" start ok "already running"; exit 0; fi
+    if ! revive_bridge_before_start "$TRIP_SLUG"; then
+      gateway_result "$name" start failed "its trip-mcp bridge is down and could not be restarted"; exit 0
+    fi
+    run_bounded "$limit" hermes -p "$name" gateway start || true
+    if gateway_wait_for "$name" up; then gateway_result "$name" start ok "gateway is running"
+    else gateway_result "$name" start failed "no gateway appeared within ${limit}s"; fi
+  else
+    if [ "$now_running" -eq 0 ]; then gateway_result "$name" stop ok "already stopped"; exit 0; fi
+    run_bounded "$limit" hermes -p "$name" gateway stop || true
+    if gateway_wait_for "$name" down; then gateway_result "$name" stop ok "gateway is stopped"
+    else gateway_result "$name" stop failed "the gateway was still running after ${limit}s"; fi
+  fi
+  exit 0
+fi
+
 if [ "$REQUEST_KIND" = "trip_mcp_bridge_probe" ]; then
   read_trip_wiring
   if bridge_reaches_trip "$MCP_PORT" "$TRIP_DIR"; then
@@ -875,6 +1064,7 @@ if [ -d "$HOME/.hermes/profiles/$PROFILE_NAME" ]; then
   # report success and change nothing.
   merge_overlay "$PROFILE_NAME"
   enroll_relay "$PROFILE_NAME"
+  mark_managed "$PROFILE_NAME"
   start_gateway "$PROFILE_NAME"
   printf 'ALREADY_PRESENT %s\n' "$PROFILE_NAME"
   exit 0
@@ -887,6 +1077,7 @@ fi
 
 merge_overlay "$PROFILE_NAME"
 enroll_relay "$PROFILE_NAME"
+mark_managed "$PROFILE_NAME"
 start_gateway "$PROFILE_NAME"
 
 printf 'INSTALLED %s\n' "$PROFILE_NAME"
