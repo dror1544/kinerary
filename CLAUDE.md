@@ -796,8 +796,14 @@ public** and anyone can open an issue:
 - **Claude never gets a GitHub token.** `gh` collects the PR/issue context into
   `.assessment-context/` in a step *before* the model runs, and a later step —
   with no model in it — posts the comment. An injection in an issue body has
-  nothing to post with. The tool allowlist is what makes "no network" true, so
-  widening it to a bare `Bash` undoes the containment.
+  nothing to post with. Since #323 (2026-10-21) the model runs as
+  `claude -p --restricted --strict-mcp-config --tools "Read,Grep,Glob,Write"`:
+  no shell, no repo settings or hooks, no MCP. Checkout keeps no token
+  (`persist-credentials: false`), and the post step withholds a comment that
+  carries a credential or touched any other file. An allow-list of `Bash(...)`
+  prefixes was measured NOT to be a boundary in `-p` mode, so adding any shell
+  back undoes the containment. `Workflow guards` in `control-plane.yml` runs the
+  tests that pin this.
 - **`pull_request`, never `pull_request_target`.** A fork PR gets no secrets
   and the job skips. Switching that one word runs untrusted code with a key.
 - **An issue is assessed automatically only for OWNER/MEMBER/COLLABORATOR.**

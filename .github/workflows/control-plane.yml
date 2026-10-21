@@ -248,3 +248,23 @@ jobs:
           node-version: "22"
       - run: npm test
         working-directory: control-plane/runtime-gateway
+
+  # ── Guards on CI's own containment ───────────────────────────────────────────
+  #
+  # The tests that pin the regression-assessment workflow's containment (no
+  # GitHub token for the model, no shell, checkout keeps no credential) were
+  # run only by local preflight, so a PR undoing them went green (#323's own
+  # assessment, 2026-10-21). These are pure text checks and a bash script, so
+  # they need no service. The rest of tests/scripts is #300.
+  workflow-guards:
+    name: Workflow guards
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m unittest -v tests.scripts.test_regression_assessment_workflow tests.scripts.test_regression_assessment_scope
