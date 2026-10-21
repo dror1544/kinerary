@@ -204,6 +204,20 @@ class TheModelNeverHoldsAGitHubToken(unittest.TestCase):
         self.assertIn("--restricted", block)
         self.assertIn("--strict-mcp-config", block)
 
+    def test_the_session_inventory_is_only_the_four_file_tools(self):
+        # --allowedTools is permission; --tools is what exists. Without it the
+        # session held PushNotification/SendMessage (fourth assessment).
+        block = _step_block(_workflow_text(), "Assess")
+        tools = set(re.search(r'--tools "([^"]+)"', block).group(1).split(","))
+        self.assertLessEqual(tools, {"Read", "Grep", "Glob", "Write"})
+        disallowed = set(re.search(r'--disallowedTools "([^"]+)"', block).group(1).split(","))
+        self.assertLessEqual({"PushNotification", "SendMessage", "ToolSearch", "Skill"}, disallowed)
+
+    def test_a_comment_from_a_run_that_touched_other_files_is_withheld(self):
+        post = _step_block(_workflow_text(), "Post the assessment")
+        self.assertIn("git status --porcelain --untracked-files=all", post)
+        self.assertLess(post.index("git status --porcelain"), post.index("> comment.md"))
+
     def test_the_comment_is_scanned_for_credentials_before_it_is_posted(self):
         post = _step_block(_workflow_text(), "Post the assessment")
         scan = post.index('grep -qF -- "$secret" regression-assessment.md')
