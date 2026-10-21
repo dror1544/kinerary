@@ -308,7 +308,14 @@ jobs:
           # a hard boundary: commands outside it (echo, git config) ran. So Bash
           # is disallowed outright, and the git facts the model needs are files
           # written by "Collect context". Never add Bash back.
+          # --restricted: no code-running tools, and the repo's own
+          # .claude/settings.json is NOT loaded, so its command hooks
+          # (SessionStart, PreToolUse) cannot run a PR's edited shell next to
+          # the credential (the third assessment, 2026-10-21).
+          # --strict-mcp-config: no MCP servers either.
           claude -p "$PROMPT" \
+            --restricted \
+            --strict-mcp-config \
             --model claude-opus-5 \
             --max-turns 40 \
             --allowedTools "Read,Grep,Glob,Write" \
@@ -322,11 +329,29 @@ jobs:
           EVENT: ${{ github.event_name }}
           NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # Only to check the comment does not carry them; never printed.
+          SCAN_OAUTH: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          SCAN_APIKEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           set -euo pipefail
           if [ ! -s regression-assessment.md ]; then
             echo "::error title=No assessment produced::\
           The agent wrote no regression-assessment.md. See $RUN_URL"
+            exit 1
+          fi
+
+          # The model wrote this file and read strangers' text while holding the
+          # model credential, and the file is posted verbatim to a public
+          # comment, so it is an egress channel. Refuse to post a credential:
+          # the exact values, and anything shaped like one.
+          leak=""
+          for secret in "$SCAN_OAUTH" "$SCAN_APIKEY" "$GH_TOKEN"; do
+            if [ -n "$secret" ] && grep -qF -- "$secret" regression-assessment.md; then leak=yes; fi
+          done
+          if grep -qE 'sk-ant-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}' regression-assessment.md; then leak=yes; fi
+          if [ -n "$leak" ]; then
+            echo "::error title=Assessment withheld::\
+          The assessment contained a credential or a credential-shaped string and was NOT posted. See $RUN_URL"
             exit 1
           fi
 

@@ -199,6 +199,18 @@ class TheModelNeverHoldsAGitHubToken(unittest.TestCase):
         self.assertIn("Bash", disallowed)
         self.assertIn("WebFetch", disallowed)
 
+    def test_the_model_loads_none_of_the_repos_settings_or_hooks(self):
+        block = _step_block(_workflow_text(), "Assess")
+        self.assertIn("--restricted", block)
+        self.assertIn("--strict-mcp-config", block)
+
+    def test_the_comment_is_scanned_for_credentials_before_it_is_posted(self):
+        post = _step_block(_workflow_text(), "Post the assessment")
+        scan = post.index('grep -qF -- "$secret" regression-assessment.md')
+        self.assertLess(scan, post.index("gh pr comment"), "scan before posting")
+        self.assertIn("sk-ant-", post)
+        self.assertNotRegex(post, r'echo[^\n]*\$(SCAN_OAUTH|SCAN_APIKEY|secret)\b', "never print a secret")
+
     def test_the_git_facts_are_written_before_the_model_runs(self):
         ctx = _step_block(_workflow_text(), "Collect context")
         self.assertIn(".assessment-context/commits.txt", ctx)
