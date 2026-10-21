@@ -100,6 +100,143 @@ class NotesDirIsNeverTheDevelopersOwn(unittest.TestCase):
         self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "ask")
 
 
+class NotesReadIsBounded(Harness):
+    """2026-10-21 (owner decision): the deploy prompt's read of the notes vault is bounded.
+
+    On a machine where the notes folder is a synced, network-backed share a read has taken
+    more than 20s (measured 2026-10-20). That stalls the prompt and, under
+    codex-adapter.py's 20s POLICY_TIMEOUT, turns an `ask` into `deny ... TimeoutExpired`.
+    The vault check now gets KINERARY_NOTES_READ_TIMEOUT_SECONDS (default 3, clamped 1..10);
+    past it the hook still ASKS, searches the repo only, and says plainly that the vault was
+    not checked in time -- which is not the same as nothing having been assessed.
+
+    Unlike NotesDirIsNeverTheDevelopersOwn, the hanging notes dir is handed to the hook on
+    purpose. A FIFO named like a plan stands in for the stalled read: grep opening it blocks."""
+
+    DEPLOY = "docker compose up -d --build"
+    SENTENCE = "could not be checked for a regression plan in time"
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.hermes.cleanup)
+        self.addCleanup(self.log.unlink, missing_ok=True)
+        self.notes = tempfile.TemporaryDirectory()
+        self.addCleanup(self.notes.cleanup)
+        self.plans = Path(self.notes.name) / "regression-plans"
+        self.plans.mkdir()
+        self.addCleanup(self.reap_strays)
+        self.env["KINERARY_NOTES_DIR"] = self.notes.name
+
+    def hang(self):
+        os.mkfifo(self.plans / "regression-plan-sentinel.md")
+
+    def short(self):
+        out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.root, check=True, capture_output=True, text=True)
+        return out.stdout.strip()[:7]
+
+    def strays(self):
+        """Pids of processes still reading from this test's notes dir (its path is in their argv)."""
+        ps = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout
+        return [int(l.split(None, 1)[0]) for l in ps.splitlines() if self.notes.name in l]
+
+    def reap_strays(self):
+        import signal
+        for pid in self.strays():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+    def timed_hook(self, limit=None, wait=25):
+        import time
+        if limit is None:
+            self.env.pop("KINERARY_NOTES_READ_TIMEOUT_SECONDS", None)
+        else:
+            self.env["KINERARY_NOTES_READ_TIMEOUT_SECONDS"] = str(limit)
+        payload = {"tool_name": "Bash", "tool_input": {"command": self.DEPLOY}}
+        t0 = time.monotonic()
+        out = subprocess.run(["bash", "scripts/claude-hooks/pretooluse-bash.sh"], cwd=self.root, env=self.env,
+                             input=json.dumps(payload), capture_output=True, text=True, timeout=wait).stdout.strip()
+        return json.loads(out)["hookSpecificOutput"], time.monotonic() - t0
+
+    def test_a_hanging_vault_still_asks_within_the_limit_and_says_so(self):
+        self.hang()
+        d, took = self.timed_hook(limit=1)
+        self.assertEqual(d["permissionDecision"], "ask")
+        self.assertIn(self.SENTENCE, d["permissionDecisionReason"])
+        self.assertIn("not the same as nothing having been assessed", d["permissionDecisionReason"])
+        self.assertLess(took, 1 + 2)
+
+    def test_the_default_limit_is_three_seconds(self):
+        self.hang()
+        d, took = self.timed_hook()
+        self.assertEqual(d["permissionDecision"], "ask")
+        self.assertIn("limit 3s", d["permissionDecisionReason"])
+        self.assertGreaterEqual(took, 2.5)
+        self.assertLess(took, 3 + 2)
+
+    def test_no_reader_is_left_behind_when_the_limit_passes(self):
+        import time
+        self.hang()
+        self.timed_hook(limit=1)
+        for _ in range(20):  # a signalled process needs a moment to go
+            if not self.strays():
+                break
+            time.sleep(0.1)
+        self.assertEqual(self.strays(), [])
+
+    def test_the_repo_is_still_searched_when_the_vault_is_not(self):
+        self.hang()
+        legacy = self.root / "docs/test-reports"
+        legacy.mkdir(parents=True)
+        (legacy / "regression-plan-2026-10-21-x.md").write_text("assessed %s\n" % self.short())
+        d, _ = self.timed_hook(limit=1)
+        self.assertEqual(d["permissionDecision"], "ask")
+        self.assertIn("Assessed at this commit (%s)" % self.short(), d["permissionDecisionReason"])
+        self.assertIn("regression-plan-2026-10-21-x.md", d["permissionDecisionReason"])
+        self.assertIn(self.SENTENCE, d["permissionDecisionReason"])
+
+    def test_a_vault_that_answers_in_time_reads_exactly_as_before(self):
+        (self.plans / "regression-plan-2026-10-21-vault.md").write_text("assessed %s\n" % self.short())
+        d, took = self.timed_hook(limit=3)
+        reason = d["permissionDecisionReason"]
+        self.assertEqual(d["permissionDecision"], "ask")
+        self.assertIn("Assessed at this commit (%s):\n%s" % (self.short(), self.plans / "regression-plan-2026-10-21-vault.md"), reason)
+        self.assertIn("Searched: $KINERARY_NOTES_DIR/regression-plans", reason)
+        self.assertNotIn("in time", reason)
+        self.assertLess(took, 3)
+
+    def test_the_limit_is_clamped_to_one_through_ten(self):
+        self.hang()
+        for raw, shown in (("0", "limit 1s"), ("-5", "limit 1s"), ("abc", "limit 3s"), ("", "limit 3s"), ("2", "limit 2s")):
+            with self.subTest(value=raw):
+                d, _ = self.timed_hook(limit=raw)
+                self.assertEqual(d["permissionDecision"], "ask")
+                self.assertIn(shown, d["permissionDecisionReason"])
+
+    def test_a_limit_above_ten_waits_ten_seconds_not_longer(self):
+        self.hang()
+        d, took = self.timed_hook(limit=99)
+        self.assertIn("limit 10s", d["permissionDecisionReason"])
+        self.assertGreaterEqual(took, 9.5)
+        self.assertLess(took, 10 + 2)
+
+    def test_only_file_names_reach_the_prompt_and_control_characters_are_stripped(self):
+        (self.plans / "regression-plan-a\x1bb.md").write_text("assessed %s SECRET-BODY\n" % self.short())
+        d, _ = self.timed_hook(limit=3)
+        self.assertNotIn("SECRET-BODY", d["permissionDecisionReason"])
+        self.assertNotIn("\x1b", d["permissionDecisionReason"])
+        self.assertIn("regression-plan-a?b.md", d["permissionDecisionReason"])
+
+    def test_a_subagent_is_still_refused_not_asked_and_never_waits_on_the_vault(self):
+        self.hang()
+        payload = {"tool_name": "Bash", "tool_input": {"command": self.DEPLOY}, "agent_type": "developer"}
+        out = subprocess.run(["bash", "scripts/claude-hooks/pretooluse-bash.sh"], cwd=self.root, env=self.env,
+                             input=json.dumps(payload), capture_output=True, text=True, timeout=2).stdout.strip()
+        self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny")
+
+
 class EveryDecisionIsCounted(Harness):
     """2026-09-26: the hook appends one line per decision to a local log outside the
     repository, so "how many prompts does a change cost" is measured, not inferred

@@ -135,12 +135,63 @@ plan_note_with_notes() {
     "$short" "$branch" "$searched"
 }
 
-plan_note() {
-  if [ -n "${KINERARY_NOTES_DIR:-}" ]; then
-    plan_note_with_notes "$KINERARY_NOTES_DIR"
+# The vault read is bounded (owner decision 2026-10-21). On a machine where the
+# notes folder is a synced, network-backed share a read has taken >20s (measured
+# 2026-10-20), which stalls this prompt and, under codex-adapter.py's 20s
+# POLICY_TIMEOUT, turned an `ask` into `deny ... TimeoutExpired`. So the notes search
+# runs in a background process group with a short limit; past it the hook still ASKS,
+# searches the repo only, and says plainly that the vault was not checked.
+# Limit: KINERARY_NOTES_READ_TIMEOUT_SECONDS, whole seconds, default 3, clamped 1..10.
+# Portable on purpose: macOS has no `timeout` and its /bin/bash is 3.2, so this is
+# `set -m` + a done-marker file + a polling loop, no GNU-only tools and no `wait`
+# (a process stuck in uninterruptible network I/O must never be waited for).
+notes_read_limit() {
+  local v="${KINERARY_NOTES_READ_TIMEOUT_SECONDS:-}"
+  if [[ "$v" =~ ^-[0-9]+$ ]]; then
+    printf '1'
+  elif [[ "$v" =~ ^[0-9]+$ ]]; then
+    if [ "${#v}" -gt 3 ] || [ "$((10#$v))" -gt 10 ]; then printf '10'
+    elif [ "$((10#$v))" -lt 1 ]; then printf '1'
+    else printf '%s' "$((10#$v))"
+    fi
   else
-    plan_note_repo
+    printf '3'
   fi
+}
+
+plan_note() {
+  if [ -z "${KINERARY_NOTES_DIR:-}" ]; then
+    plan_note_repo
+    return
+  fi
+  local limit work pid ticks=0 max
+  limit="$(notes_read_limit)"
+  max=$((limit * 10))
+  work="$(mktemp -d 2>/dev/null)" || work=""
+  if [ -n "$work" ]; then
+    # Its own process group (set -m), so one kill reaches the grep under it too. Its
+    # stdout/stderr never touch our pipe: a straggler stuck in the kernel must not be
+    # able to hold the hook's output open.
+    set -m 2>/dev/null
+    ( plan_note_with_notes "$KINERARY_NOTES_DIR" >"$work/out" 2>/dev/null; : >"$work/done" ) \
+      </dev/null >/dev/null 2>&1 &
+    pid=$!
+    disown "$pid" 2>/dev/null
+    set +m 2>/dev/null
+    while [ ! -e "$work/done" ] && [ "$ticks" -lt "$max" ]; do
+      sleep 0.1
+      ticks=$((ticks + 1))
+    done
+    if [ -e "$work/done" ]; then
+      cat "$work/out" 2>/dev/null
+      rm -rf "$work"
+      return
+    fi
+    kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
+    rm -rf "$work"
+  fi
+  printf 'The notes folder ($KINERARY_NOTES_DIR/regression-plans) could not be checked for a regression plan in time (limit %ss) — this is not the same as nothing having been assessed. Only docs/test-reports could be searched:\n' "$limit"
+  plan_note_repo
 }
 
 # One line per decision, so "how many prompts does a change cost" is measured

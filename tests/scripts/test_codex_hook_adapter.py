@@ -70,6 +70,26 @@ class CodexAdapter(Harness):
                 self.assertEqual(result.get("permissionDecision"), "ask", result)
                 self.assertTrue(result.get("permissionDecisionReason"), result)
 
+    def test_a_hanging_notes_vault_yields_ask_not_a_timeout_denial(self):
+        """2026-10-20: a stalled notes-folder read ran past the adapter's 20s budget and the
+        deploy prompt became `deny ... TimeoutExpired`. The hook now bounds that read itself."""
+        import time
+        notes = tempfile.TemporaryDirectory()
+        self.addCleanup(notes.cleanup)
+        plans = Path(notes.name) / "regression-plans"
+        plans.mkdir()
+        os.mkfifo(plans / "regression-plan-sentinel.md")  # grep opening it blocks, like a stalled share
+        self.env["KINERARY_NOTES_DIR"] = notes.name  # deliberately handed to the hook
+        self.env.pop("KINERARY_NOTES_READ_TIMEOUT_SECONDS", None)
+        self.addCleanup(lambda: subprocess.run(["pkill", "-9", "-f", notes.name], capture_output=True))
+        t0 = time.monotonic()
+        result = self.bash("docker compose up -d --build")
+        took = time.monotonic() - t0
+        self.assertEqual(result.get("permissionDecision"), "ask", result)
+        self.assertNotIn("TimeoutExpired", result.get("permissionDecisionReason", ""))
+        self.assertIn("could not be checked for a regression plan in time", result["permissionDecisionReason"])
+        self.assertLess(took, 15)  # inside the adapter's 20s POLICY_TIMEOUT with room to spare
+
     def test_ask_preserves_the_shared_response_without_mutation(self):
         spec = importlib.util.spec_from_file_location(
             "codex_adapter_ask_test", REPO / "scripts/claude-hooks/codex-adapter.py")
