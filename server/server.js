@@ -1559,16 +1559,20 @@ function verifiedManagedClaim(req) {
 }
 
 app.get('/api/auth/me', authRequired, (req, res) => {
+  // Per person and per session (it now carries their dashboard address): no cache, shared or private, may keep it.
+  res.setHeader('Cache-Control', 'no-store');
   const user = getUser(req.user.username);
   if (!user) return res.status(404).json({ error: 'not_found' });
   const organizers = normalizeOrganizers(TRIP_CONFIG.agent);
   const body = { ...user, is_organizer: organizers.includes(user.username) };
-  // Present only for an owner/organizer who arrived through the dashboard.
-  // authRequired is not an organizer check and carries no claim, so the managed
-  // session is verified again here (signature, binding, active participant,
+  // Present only for an organizer. authRequired is not an organizer check and
+  // carries no claim, so the person is checked again here. Through the dashboard
+  // the managed session is verified (signature, binding, active participant,
   // current local organizer role) and the URL is read from that verified claim.
-  // Members, direct logins and the agent key have no managed claim: no field.
-  const dashboardUrl = controlPlaneAuth.dashboardUrlFor(verifiedManagedClaim(req), user.username);
+  // Any other way in (a direct login on the trip's own hostname, the installed
+  // app) gets the configured URL, never one from the request. Members, demoted
+  // organizers and the agent key (not a person) get no field.
+  const dashboardUrl = req.user.isAgent ? null : controlPlaneAuth.dashboardUrlForOrganizer(verifiedManagedClaim(req), user.username);
   if (dashboardUrl) body.dashboard_url = dashboardUrl;
   res.json(body);
 });

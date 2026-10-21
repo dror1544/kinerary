@@ -81,7 +81,7 @@ before(async () => {
       if (!reusable && !once) { res.statusCode = 401; return res.end(JSON.stringify({ error: "invalid" })); }
       if (once) consumed.add(payload.token);
       const tripId = payload.token === "once-other-trip" ? "trip_otherxyz1" : "trip_abcdefgh";
-      return res.end(JSON.stringify({ tripId, userId: "user_abcdefgh", role: payload.token === "once-member-grant" ? "member" : "owner", runtimeUsername: null, audience: "runtime_gateway", sessionId: payload.token === "once-device-b" ? "wsess_deviceb0001" : "wsess_devicea0001", dashboardUrl: payload.token === "once-evil-origin" ? `https://evil.example/trips/${tripId}/setup` : payload.token === "once-other-trip-path" ? `${PORTAL}/trips/trip_somebodyelse/setup` : `${PORTAL}/trips/${tripId}/setup` }));
+      return res.end(JSON.stringify({ tripId, userId: "user_abcdefgh", role: payload.token.startsWith("once-member") ? "member" : "owner", runtimeUsername: null, audience: "runtime_gateway", sessionId: payload.token === "once-device-b" ? "wsess_deviceb0001" : "wsess_devicea0001", dashboardUrl: payload.token === "once-no-dashboard" ? undefined : payload.token.startsWith("once-evil-origin") ? `https://evil.example/trips/${tripId}/setup` : payload.token === "once-other-trip-path" ? `${PORTAL}/trips/trip_somebodyelse/setup` : `${PORTAL}/trips/${tripId}/setup` }));
     }
     if (req.url === "/internal/runtime-sessions/check") {
       const payload = await body(req);
@@ -223,6 +223,43 @@ test("the dashboard URL is passed on only when it is exactly this portal's setup
   }
   assert.equal((await formLaunch("once-good-origin")).status, 303);
   assert.equal(sessionBodies.at(-1).dashboardUrl, `${PORTAL}/trips/trip_abcdefgh/setup`);
+});
+
+test("an owner whose dashboard link is dropped is told so in the log, and a member (who never has one) is not", async () => {
+  const logged = [];
+  const original = console.error;
+  console.error = (...args) => logged.push(args.join(" "));
+  try {
+    assert.equal((await formLaunch("once-evil-origin-log")).status, 303);
+    assert.equal((await formLaunch("once-no-dashboard")).status, 303);
+    assert.equal((await formLaunch("once-member-log")).status, 303);
+    assert.equal((await formLaunch("once-good-origin-2")).status, 303);
+  } finally { console.error = original; }
+  const dropped = logged.filter((line) => line.includes("runtime_gateway.dashboard_url_dropped"));
+  assert.equal(dropped.length, 2, `exactly the foreign-origin and the absent owner launches are reported:\n${logged.join("\n")}`);
+  assert.match(dropped[0], /trip=trip_abcdefgh role=owner reason=not_this_portals_setup_page expected_origin=https:\/\/app\.example\.test received_origin=https:\/\/evil\.example$/);
+  assert.match(dropped[1], /trip=trip_abcdefgh role=owner reason=absent expected_origin=https:\/\/app\.example\.test$/);
+  assert.ok(!logged.join("\n").includes("once-"), "no grant is ever logged");
+});
+
+test("signing out at the portal also ends a live-update stream that is already open", async () => {
+  const cookie = (await formLaunch("once-device-a-stream")).headers.get("set-cookie").split(";")[0];
+  const response = await fetch(`${gatewayOrigin}/t/trip_abcdefgh/api/events`, { headers: { cookie } });
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("content-type"), /text\/event-stream/);
+  const reader = response.body.getReader();
+  assert.match(new TextDecoder().decode((await reader.read()).value), /event: ready/);
+  // Still signed in: the stream outlives several check windows (200 ms here).
+  await new Promise((resolve) => setTimeout(resolve, 900));
+  assert.equal(eventStreamClosed, false, "a live session keeps its stream");
+  const ended = (async () => { for (;;) { try { const { done } = await reader.read(); if (done) return "done"; } catch { return "error"; } } })();
+  revokedSessions.add("wsess_devicea0001");
+  try {
+    const outcome = await Promise.race([ended, new Promise((resolve) => setTimeout(() => resolve("still open"), 3000))]);
+    assert.notEqual(outcome, "still open", "the stream must end once the launching portal session is revoked");
+  } finally { revokedSessions.delete("wsess_devicea0001"); await reader.cancel().catch(() => undefined); }
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(eventStreamClosed, true, "the upstream stream is released too");
 });
 
 test("a role change at the control plane ends the session opened with the old role", async () => {

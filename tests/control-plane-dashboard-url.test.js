@@ -7,7 +7,7 @@
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 import { createRequire } from 'node:module';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import http from 'node:http';
@@ -105,4 +105,107 @@ test('a hostile href is rejected at mint and again at read', async () => {
     assert.equal((await mint(ids.owner, 'owner', { dashboardUrl: other })).controlPlane.dashboardUrl, undefined, other);
     assert.equal(auth.dashboardUrlFor({ userId: ids.owner, tripId, role: 'owner', dashboardUrl: other }, 'alice'), null, other);
   }
+});
+
+test('an owner or organizer minted without the link is logged, with the reason and never the value; a member is not', async () => {
+  const lines = [];
+  const original = console.warn;
+  console.warn = (...args) => lines.push(args.join(' '));
+  try {
+    await mint(ids.owner, 'owner');                                                    // gateway sent nothing
+    await mint(ids.organizer, 'organizer', { dashboardUrl: 'https://evil.example/x' }); // sent, refused
+    await mint(ids.owner, 'owner', { dashboardUrl: DASHBOARD });                       // fine: silent
+    await mint(ids.member, 'member', { runtimeUsername: 'bob' });                      // members never have one: silent
+  } finally { console.warn = original; }
+  assert.deepEqual(lines, [
+    'control_plane.session_without_dashboard_url: role=owner reason=not_sent',
+    'control_plane.session_without_dashboard_url: role=organizer reason=rejected',
+  ]);
+  assert.ok(!lines.join('').includes('evil.example'));
+});
+
+// ── An organizer who did not come through the gateway ───────────────────────
+// A direct login on the trip's own hostname (or the installed app) has no managed
+// claim. The address then comes from configuration alone: the identity sidecar's
+// portalOrigin (written by the worker from the control plane's web.public_origin)
+// plus THIS trip's id. Built per case: createControlPlaneAuth reads the sidecar once.
+function authWith(portalOrigin, warnings = []) {
+  const file = join(temp, `identity-${Math.random().toString(36).slice(2)}.json`);
+  writeFileSync(file, JSON.stringify({ version: 1, tripId, owner: { userId: ids.owner, username: 'alice' }, ...(portalOrigin === undefined ? {} : { portalOrigin }) }));
+  const previous = process.env.CONTROL_PLANE_IDENTITY_FILE;
+  process.env.CONTROL_PLANE_IDENTITY_FILE = file;
+  const db = new Database(':memory:');
+  db.exec('CREATE TABLE users (username TEXT PRIMARY KEY)');
+  for (const name of ['alice', 'carol', 'bob']) db.prepare('INSERT INTO users(username) VALUES (?)').run(name);
+  const original = console.warn;
+  console.warn = (...args) => warnings.push(args.join(' '));
+  try {
+    const { createControlPlaneAuth } = requireFromServer('./control-plane-auth.js');
+    return createControlPlaneAuth({ app: express(), db, tripDir: temp, config: () => config, ready: Promise.resolve(), jwtSecret: SECRET });
+  } finally { console.warn = original; process.env.CONTROL_PLANE_IDENTITY_FILE = previous; }
+}
+
+test('a direct-login organizer gets the configured dashboard address of THIS trip; members, demoted organizers and strangers do not', () => {
+  const direct = authWith('https://portal.example.test');
+  assert.equal(direct.dashboardUrlForOrganizer(null, 'alice'), DASHBOARD);
+  assert.equal(direct.dashboardUrlForOrganizer(undefined, 'carol'), DASHBOARD, 'any organizer, not only the owner');
+  assert.equal(direct.dashboardUrlForOrganizer(null, 'bob'), null, 'a member');
+  assert.equal(direct.dashboardUrlForOrganizer(null, 'hermes'), null, 'not a participant (the agent key)');
+  assert.equal(direct.dashboardUrlForOrganizer(null, 'mallory'), null, 'not a user at all');
+  config.agent.organizers = ['alice'];
+  try { assert.equal(direct.dashboardUrlForOrganizer(null, 'carol'), null, 'a demoted organizer'); }
+  finally { config.agent.organizers = ['alice', 'carol']; }
+  // A trailing slash and a loopback http origin (development) are plain origins too.
+  assert.equal(authWith('https://portal.example.test/').dashboardUrlForOrganizer(null, 'alice'), DASHBOARD);
+  assert.equal(authWith('http://localhost:5173').dashboardUrlForOrganizer(null, 'alice'), `http://localhost:5173/trips/${tripId}/setup`);
+});
+
+test('no portalOrigin configured means no direct-login link, and says nothing is wrong', () => {
+  const warnings = [];
+  assert.equal(authWith(undefined, warnings).dashboardUrlForOrganizer(null, 'alice'), null);
+  assert.equal(authWith(null, warnings).dashboardUrlForOrganizer(null, 'alice'), null);
+  assert.deepEqual(warnings, [], 'an unconfigured portal origin is the older-trip state, not an error');
+});
+
+// One list for both validators (the worker's normalize_portal_origin reads the same file).
+const PORTAL_ORIGIN_CASES = JSON.parse(readFileSync(new URL('./fixtures/portal-origin-cases.json', import.meta.url), 'utf8')).cases;
+
+test('safePortalOrigin accepts and refuses exactly what tests/fixtures/portal-origin-cases.json says, with the canonical form', () => {
+  const { safePortalOrigin } = requireFromServer('./control-plane-auth.js');
+  assert.ok(PORTAL_ORIGIN_CASES.length > 60 && PORTAL_ORIGIN_CASES.some(c => c.accepted) && PORTAL_ORIGIN_CASES.some(c => !c.accepted));
+  for (const { input, accepted, canonical } of PORTAL_ORIGIN_CASES) {
+    assert.equal(safePortalOrigin(input), accepted ? canonical : null, JSON.stringify(input).slice(0, 60));
+  }
+});
+
+test('every refused portalOrigin yields no link and is logged once at start, and every accepted one yields this trip\'s address', () => {
+  for (const { input, accepted, canonical } of PORTAL_ORIGIN_CASES) {
+    const warnings = [];
+    const auth = authWith(input, warnings);
+    const label = JSON.stringify(input).slice(0, 60);
+    if (accepted) {
+      assert.equal(auth.dashboardUrlForOrganizer(null, 'alice'), `${canonical}/trips/${tripId}/setup`, label);
+      assert.deepEqual(warnings, [], label);
+    } else {
+      assert.equal(auth.dashboardUrlForOrganizer(null, 'alice'), null, label);
+      // null / absent / empty are "not configured", a state older trips are legitimately in; the rest is a mistake worth a line.
+      const mistake = input !== null && input !== '';
+      assert.equal(warnings.length, mistake ? 1 : 0, label);
+      if (mistake) { assert.match(warnings[0], /^control_plane\.portal_origin_invalid:/); assert.ok(!warnings[0].includes('evil'), 'never echoes the value'); }
+    }
+  }
+});
+
+test('a managed claim and the configured address agree; where they differ the configured one wins, and a member gets none', () => {
+  const auth = authWith('https://portal.example.test');
+  assert.equal(auth.dashboardUrlForOrganizer({ userId: ids.owner, tripId, role: 'owner', dashboardUrl: DASHBOARD }, 'alice'), DASHBOARD);
+  // A claim naming another origin (a gateway pinned to a different portal, or a hostile one) never overrides configuration.
+  assert.equal(auth.dashboardUrlForOrganizer({ userId: ids.owner, tripId, role: 'owner', dashboardUrl: `https://evil.example/trips/${tripId}/setup` }, 'alice'), DASHBOARD);
+  assert.equal(auth.dashboardUrlForOrganizer({ userId: ids.owner, tripId, role: 'owner', dashboardUrl: `http://127.0.0.1:5173/trips/${tripId}/setup` }, 'alice'), DASHBOARD);
+  assert.equal(auth.dashboardUrlForOrganizer({ userId: ids.member, tripId, role: 'member', dashboardUrl: DASHBOARD }, 'bob'), null);
+  // With nothing configured the managed path is exactly what it was.
+  const unconfigured = authWith(undefined);
+  const pinned = `http://127.0.0.1:5173/trips/${tripId}/setup`;
+  assert.equal(unconfigured.dashboardUrlForOrganizer({ userId: ids.owner, tripId, role: 'owner', dashboardUrl: pinned }, 'alice'), pinned);
+  assert.equal(unconfigured.dashboardUrlForOrganizer({ userId: ids.owner, tripId, role: 'owner', dashboardUrl: 'javascript:1' }, 'alice'), null);
 });

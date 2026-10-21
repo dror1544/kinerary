@@ -204,6 +204,11 @@ services:
       # (otherwise the change would be silent). Remove it from provisioning.env.
       PROVISIONER_SEED_PASSWORD: ${PROVISIONER_SEED_PASSWORD:-}
       CONTROL_PLANE_EXCHANGE_KEY: ${CONTROL_PLANE_EXCHANGE_KEY:-}
+      # The portal's own origin (the API's web.public_origin), written into each
+      # trip's identity sidecar so an organizer who opens the trip on its own
+      # hostname still gets an "Organizer dashboard" link. Unset: no link for a
+      # direct login (said at worker start). Reaches a trip at its next provision.
+      CONTROL_PLANE_PORTAL_ORIGIN: ${CONTROL_PLANE_PORTAL_ORIGIN:-}
       # Operator's Telegram chat id for the provisioning-outcome DM. The API
       # sends the matching approval DM to the same chat, resolved from the
       # profile's signup.super_admin_chat_id_secret_ref. Empty simply enqueues
