@@ -159,5 +159,50 @@ class NoDeadConfiguredGuards(unittest.TestCase):
         self.assertIn("steps.ctx.outputs.relevant == 'true'", text)
 
 
+def _step_block(text: str, step_name: str) -> str:
+    """The text of one `- name: <step_name>` step, up to the next step."""
+    start = text.index(f"      - name: {step_name}\n")
+    nxt = re.compile(r"^      - ", re.M).search(text, start + 1)
+    return text[start:nxt.start() if nxt else len(text)]
+
+
+class TheModelNeverHoldsAGitHubToken(unittest.TestCase):
+    """Rule 1 of the workflow header, now enforced, not just stated (#323).
+
+    claude-code-action always obtains a GitHub token for itself (OIDC to its
+    App, or `github_token`), so the first credentialed run failed on it.
+    Meanwhile actions/checkout's default left this job's token in .git/config,
+    where a model allowed to Read and run git could find it."""
+
+    def test_assess_runs_the_cli_not_the_action(self):
+        block = _step_block(_workflow_text(), "Assess")
+        self.assertNotRegex(block, r"^\s+uses:", "the Assess step must not use an action")
+        self.assertIn('claude -p "$PROMPT"', block)
+        self.assertRegex(block, r'CLAUDE_CODE_VERSION: "\d+\.\d+\.\d+"', "the CLI is pinned")
+
+    def test_assess_is_given_no_github_credential(self):
+        block = _step_block(_workflow_text(), "Assess")
+        for needle in ("github.token", "GITHUB_TOKEN", "GH_TOKEN", "id-token"):
+            with self.subTest(needle=needle):
+                self.assertNotIn(needle, block)
+
+    def test_no_job_level_oidc_permission(self):
+        self.assertNotRegex(_workflow_text(), r"id-token:\s*write")
+
+    def test_checkout_does_not_persist_the_job_token(self):
+        text = _workflow_text()
+        start = text.index("uses: actions/checkout@")
+        nxt = re.compile(r"^      - ", re.M).search(text, start)
+        self.assertRegex(text[start:nxt.start()], r"persist-credentials:\s*false")
+
+    def test_the_tool_allowlist_never_widens_to_bare_bash(self):
+        block = _step_block(_workflow_text(), "Assess")
+        allowed = re.search(r'--allowedTools "([^"]+)"', block).group(1).split(",")
+        self.assertNotIn("Bash", allowed)
+        for tool in allowed:
+            with self.subTest(tool=tool):
+                self.assertFalse(re.match(r"Bash\((curl|wget|gh|nc|ssh)", tool), tool)
+
+
 if __name__ == "__main__":
     unittest.main()
