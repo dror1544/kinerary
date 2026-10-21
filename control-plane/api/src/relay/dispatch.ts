@@ -788,6 +788,10 @@ export async function dispatchUpdate(
     }
     log(structuredLog("info", "trip_bot.group_bound", { rebound: redeemed.rebound }));
     if (redeemed.movedFromTripId) {
+      // In-memory, chat-keyed state belongs to the trip the group WAS: forget it, so the old
+      // trip's overheard messages and held documents never reach the new trip's companion.
+      options.groupContext?.clear(chatId);
+      options.pendingAttachments?.clearChat(chatId);
       log(structuredLog("info", "trip_bot.group_moved", { from_trip_id: redeemed.movedFromTripId, to_trip_id: redeemed.tripId }));
     }
     const facts = await companionIntroFacts(db, redeemed.tripId);

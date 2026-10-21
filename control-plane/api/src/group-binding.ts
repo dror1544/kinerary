@@ -339,15 +339,20 @@ export async function redeemGroupBindingToken(
     }
 
     // FOR UPDATE: the binding row is the second lock in the order described above, and what
-    // makes two redemptions (or a redemption and a teardown) of one chat take turns. A row
-    // closed while we waited no longer matches, and the group is then simply free.
-    const existing = await client.query<{ id: string; trip_id: string }>(
+    // makes two redemptions (or a redemption and a teardown) of one chat take turns.
+    const readOpenBinding = async () => (await client.query<{ id: string; trip_id: string }>(
       `SELECT id, trip_id FROM control_plane.telegram_chat_bindings
         WHERE chat_id = $1 AND closed_at IS NULL
         FOR UPDATE`,
       [chatId],
-    );
-    const bound = existing.rows[0];
+    )).rows[0];
+    let bound = await readOpenBinding();
+    // A redemption that waited on that row lock while a MOVE (or a re-bind) committed does not
+    // see the binding the winner just opened: the locked row no longer matches and a statement
+    // never sees rows inserted after it began. Read again - a fresh statement, a fresh view -
+    // so a group that is no longer free goes down the bound-elsewhere path below, authorization
+    // included, instead of being "bound" over the top of somebody else's move.
+    bound ??= await readOpenBinding();
     let movedFromTripId: string | undefined;
     if (bound && bound.trip_id !== row.trip_id) {
       if (!(await senderMayMoveGroup(client, bound.trip_id, row.trip_id, senderTelegramUserId))) {
@@ -360,50 +365,14 @@ export async function redeemGroupBindingToken(
           WHERE id = $1`,
         [bound.id, GROUP_MOVED_CLOSED_REASON],
       );
-      // The NEW trip's own companion first (trips.hermes_profile), a binding's only as the
-      // fallback for a trip built before that column - the order `/switch` uses. A group
-      // moved onto a trip must not keep answering as the trip it left.
-      await client.query(
-        `INSERT INTO control_plane.telegram_chat_bindings (id, chat_id, trip_id, hermes_profile)
-         SELECT $1, $2, t.id,
-                coalesce(
-                  t.hermes_profile,
-                  (SELECT b.hermes_profile
-                     FROM control_plane.telegram_chat_bindings b
-                    WHERE b.trip_id = t.id AND b.hermes_profile IS NOT NULL
-                    ORDER BY b.created_at DESC
-                    LIMIT 1))
-           FROM control_plane.trips t
-          WHERE t.id = $3`,
-        [`tcb_${randomBytes(16).toString("hex")}`, chatId, row.trip_id],
-      );
+      await openBinding(client, chatId, row.trip_id);
       movedFromTripId = bound.trip_id;
     } else if (!bound) {
-      await client.query(
-        `INSERT INTO control_plane.telegram_chat_bindings
-           (id, chat_id, trip_id, hermes_profile)
-         SELECT $1, $2, $3, b.hermes_profile
-           FROM control_plane.telegram_chat_bindings b
-          WHERE b.trip_id = $3 AND b.hermes_profile IS NOT NULL
-          ORDER BY b.created_at DESC
-          LIMIT 1`,
-        [`tcb_${randomBytes(16).toString("hex")}`, chatId, row.trip_id],
-      );
-      // The trip may have no companion installed yet (migration 0043). Bind it
-      // anyway: routing and the assistant behind it are separate components,
-      // separately retryable, and a bound chat with no profile answers
+      // The trip may have no companion installed yet (migration 0043): `openBinding` binds it
+      // anyway with a NULL profile. Routing and the assistant behind it are separate
+      // components, separately retryable, and a bound chat with no profile answers
       // COMPANION_PENDING rather than "I don't have a trip for this chat".
-      const created = await client.query(
-        "SELECT 1 FROM control_plane.telegram_chat_bindings WHERE chat_id = $1 AND closed_at IS NULL",
-        [chatId],
-      );
-      if (!created.rowCount) {
-        await client.query(
-          `INSERT INTO control_plane.telegram_chat_bindings (id, chat_id, trip_id, hermes_profile)
-           VALUES ($1, $2, $3, NULL)`,
-          [`tcb_${randomBytes(16).toString("hex")}`, chatId, row.trip_id],
-        );
-      }
+      await openBinding(client, chatId, row.trip_id);
     }
 
     // The token is NOT consumed here, on purpose. Owner decision 2026-10-16:
@@ -425,10 +394,48 @@ export async function redeemGroupBindingToken(
     };
   } catch (error) {
     await client.query("ROLLBACK").catch(() => undefined);
+    // Somebody else's binding of this chat committed between our reads and our INSERT (the
+    // partial unique index on open bindings, 0029). The group is not free and this sender was
+    // never checked against whoever holds it: the same uniform refusal as any other
+    // non-organizer, never an unhandled error (which the poller would swallow as a dropped update).
+    if (isActiveChatBindingConflict(error)) return { ok: false, reason: "GROUP_MOVE_NOT_ORGANIZER" };
     throw error;
   } finally {
     client.release();
   }
+}
+
+function isActiveChatBindingConflict(error: unknown): boolean {
+  const e = error as { code?: string; constraint?: string } | null;
+  return e?.code === "23505" && e.constraint === "telegram_chat_bindings_active_chat_idx";
+}
+
+/**
+ * Opens the chat's binding to a trip, with ONE rule for the companion profile whether the
+ * group was free or moved: the trip's own (`trips.hermes_profile`, migration 20260922060000)
+ * first, then the latest binding of that trip that carries one (a trip built before that
+ * column), else NULL. The trip may have no companion yet (migration 0043) and is bound anyway.
+ *
+ * The caller has made sure no open binding of this chat exists in its own view; if one
+ * committed since, the partial unique index throws 23505 and the caller refuses.
+ */
+async function openBinding(client: pg.PoolClient, chatId: string, tripId: string): Promise<void> {
+  const inserted = await client.query(
+    `INSERT INTO control_plane.telegram_chat_bindings (id, chat_id, trip_id, hermes_profile)
+     SELECT $1, $2, t.id,
+            coalesce(
+              t.hermes_profile,
+              (SELECT b.hermes_profile
+                 FROM control_plane.telegram_chat_bindings b
+                WHERE b.trip_id = t.id AND b.hermes_profile IS NOT NULL
+                ORDER BY b.created_at DESC
+                LIMIT 1))
+       FROM control_plane.trips t
+      WHERE t.id = $3`,
+    [`tcb_${randomBytes(16).toString("hex")}`, chatId, tripId],
+  );
+  // The token's foreign key guarantees the trip exists; no row here would be a bug, not a state.
+  if (!inserted.rowCount) throw new Error("openBinding: trip row missing");
 }
 
 /**

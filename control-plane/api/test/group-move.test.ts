@@ -28,6 +28,8 @@ import { uiString } from "../src/intake-copy.js";
 import { applyDecision } from "../src/relay/poller.js";
 import { dispatchUpdate, DEFAULT_STRINGS, type DispatchDecision } from "../src/relay/dispatch.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
+import { GroupContext } from "../src/relay/group-context.js";
+import { PendingAttachments } from "../src/relay/pending-attachments.js";
 import type { PinnedMessage, SendResult, TelegramClient } from "../src/relay/telegram-api.js";
 import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
@@ -324,6 +326,103 @@ describe("moving a group to the organizer's next trip (db)", { skip: SKIP }, () 
     });
   });
 
+  // ── A redemption queued behind a move must not take the "free group" branch (boundary review S1) ──
+  // The waiting statement locks the binding row the move is about to close; once the move commits
+  // that row no longer matches and the group LOOKS free - but it was just bound to trip B.
+
+  for (const otherHasBinding of [true, false]) {
+    test(`a non-organizer's code queued behind a move is refused, not bound over it (their trip ${otherHasBinding ? "has" : "has no"} other binding)`, async () => {
+      await withFixture(async ({ pool, tripA, tripB, tripC }) => {
+        if (otherHasBinding) {
+          await pool.query(
+            "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ($1, '-1009990000', $2, 'companion-c')",
+            [id("tcb"), tripC]);
+        }
+        const strangersCode = await issue(pool, tripC, STRANGER_ORGANIZER);
+        // The organizer's move, already holding the group's binding row, as a hand-run transaction.
+        const mover = await pool.connect();
+        let result: Awaited<ReturnType<typeof redeemGroupBindingToken>> | { threw: unknown };
+        try {
+          await mover.query("BEGIN");
+          await mover.query("SELECT 1 FROM control_plane.telegram_group_binding_tokens WHERE trip_id = $1 FOR UPDATE", [tripB]);
+          await mover.query("SELECT id FROM control_plane.telegram_chat_bindings WHERE chat_id = $1 AND closed_at IS NULL FOR UPDATE", [CHAT]);
+          const racing = redeemGroupBindingToken(pool, strangersCode, CHAT, STRANGER_ORGANIZER)
+            .catch((error: unknown) => ({ threw: error }));
+          await new Promise((resolve) => setTimeout(resolve, 150));
+          await mover.query("UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'group_moved' WHERE chat_id = $1 AND closed_at IS NULL", [CHAT]);
+          await mover.query(
+            "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ($1, $2, $3, 'companion-b')",
+            [id("tcb"), CHAT, tripB]);
+          await mover.query("COMMIT");
+          result = await racing;
+        } finally {
+          mover.release();
+        }
+        assert.deepEqual(result, { ok: false, reason: "GROUP_MOVE_NOT_ORGANIZER" }, "never an ok, never a throw");
+        const route = await resolveChatRoute(pool, CHAT);
+        assert.equal(route.kind === "companion" && route.tripId, tripB, "routing stays with the move's trip");
+        assert.equal((await bindings(pool)).filter((b) => b.closed_at === null).length, 1);
+        assert.equal(await tokenUse(pool, tripC), 0, "and the stranger's code was not spent");
+        void tripA;
+      });
+    });
+  }
+
+  test("a binding that commits between a redemption's reads and its INSERT is a uniform refusal, not an unhandled error", async () => {
+    await withFixture(async ({ pool, tripB, tripC }) => {
+      const free = "-1002000777";
+      const strangersCode = await issue(pool, tripC, STRANGER_ORGANIZER);
+      const other = await pool.connect();
+      try {
+        await other.query("BEGIN");
+        // An uncommitted binding of the free group: invisible to the redemption's reads, and its
+        // INSERT then waits on the unique index.
+        await other.query(
+          "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ($1, $2, $3, 'companion-b')",
+          [id("tcb"), free, tripB]);
+        const racing = redeemGroupBindingToken(pool, strangersCode, free, STRANGER_ORGANIZER)
+          .catch((error: unknown) => ({ threw: error }));
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        await other.query("COMMIT");
+        assert.deepEqual(await racing, { ok: false, reason: "GROUP_MOVE_NOT_ORGANIZER" });
+      } finally {
+        other.release();
+      }
+      const rows = await bindings(pool, free);
+      assert.deepEqual(rows.map((b) => b.trip_id), [tripB]);
+    });
+  });
+
+  // ── One rule for the companion profile (boundary review S3) ──
+
+  test("a FREE group gets the trip's own profile (trips.hermes_profile) even when the trip has no binding yet", async () => {
+    await withFixture(async ({ pool, tripB }) => {
+      const result = await redeemGroupBindingToken(pool, await issue(pool, tripB, DROR), "-1002000601", DROR);
+      assert.ok(result.ok);
+      assert.equal((await bindings(pool, "-1002000601"))[0]!.hermes_profile, "companion-b");
+    });
+  });
+
+  test("with no trips.hermes_profile, free-bind and move both fall back to the trip's latest binding that has one", async () => {
+    await withFixture(async ({ pool, tripA, tripB }) => {
+      await pool.query("UPDATE control_plane.trips SET hermes_profile = NULL WHERE id = $1", [tripB]);
+      await pool.query(
+        `INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile, created_at)
+         VALUES ($1, '-1009990001', $2, 'old-b', now() - interval '2 days'),
+                ($3, '-1009990002', $2, 'newer-b', now() - interval '1 day')`,
+        [id("tcb"), tripB, id("tcb")]);
+      const code = await issue(pool, tripB, DROR);
+      const free = await redeemGroupBindingToken(pool, code, "-1002000602", DROR);
+      assert.ok(free.ok);
+      const moved = await redeemGroupBindingToken(pool, code, CHAT, DROR);
+      assert.ok(moved.ok && moved.movedFromTripId === tripA);
+      const a = (await bindings(pool, "-1002000602"))[0]!.hermes_profile;
+      const b = (await bindings(pool)).find((x) => x.closed_at === null)!.hermes_profile;
+      assert.equal(a, "newer-b");
+      assert.equal(b, "newer-b", "the same rule on both paths");
+    });
+  });
+
   test("two posts of the same code at once: one move, one re-bind, one open binding", async () => {
     await withFixture(async ({ pool, tripA, tripB }) => {
       const token = await issue(pool, tripB, DROR);
@@ -420,6 +519,57 @@ describe("moving a group through the relay", { skip: SKIP }, () => {
       assert.equal(telegram.sent[1]!.text, uiString("openTripText", "en"));
       assert.deepEqual(telegram.pinned, ["1", "2"]);
       assert.ok(telegram.calls.indexOf("unpin:41") < telegram.calls.indexOf("send:1"));
+    });
+  });
+
+  // ── In-memory, chat-keyed state does not cross the move (boundary review S2) ──
+  describe("what the family said before the move", () => {
+    const aunt = (text: string): TelegramUpdate => ({
+      update_id: 6,
+      message: { message_id: 13, from: { id: 31337, first_name: "Aunt" }, chat: { id: CHAT, type: "supergroup" }, text },
+    }) as unknown as TelegramUpdate;
+    const sayAs = (fromId: number, text: string) => say(CHAT, text, fromId);
+    const textOf = (decision: DispatchDecision): string => decision.kind === "to_gateway" ? decision.event.text : `<${decision.kind}>`;
+
+    test("control: bound to trip A, an unaddressed message IS carried onto the next addressed one", async () => {
+      await withFixture(async ({ pool }) => {
+        const opts = { ...READY, groupContext: new GroupContext() };
+        await dispatch(pool, aunt("mum's passport is 12345678"), opts);
+        const next = await dispatch(pool, sayAs(Number(DROR), "Rio-japan-2025, anything new?"), opts);
+        assert.match(textOf(next), /passport is 12345678/, "sanity: the carrying works, so its absence below means something");
+      });
+    });
+
+    test("after the move, trip A's overheard messages are NOT handed to trip B's companion", async () => {
+      await withFixture(async ({ pool, tripB }) => {
+        const groupContext = new GroupContext();
+        const pendingAttachments = new PendingAttachments();
+        const opts = { ...READY, groupContext, pendingAttachments };
+        await dispatch(pool, aunt("mum's passport is 12345678"), opts);
+        pendingAttachments.hold(CHAT, "31337", { fileId: "file-from-trip-a", kind: "document", mime: "application/pdf" });
+        const moved = await dispatch(pool, sayAs(Number(DROR), `/group ${await issue(pool, tripB, DROR)}`), opts);
+        assert.equal(moved.kind, "group_intro");
+        const next = await dispatch(pool, sayAs(Number(DROR), "Rio-italy-2026, anything new?"), opts);
+        assert.equal(next.kind, "to_gateway");
+        assert.equal(textOf(next).includes("passport"), false, textOf(next));
+        assert.equal(textOf(next).includes("overheard"), false);
+        assert.deepEqual(pendingAttachments.take(CHAT, "31337"), [], "nor are documents held for trip A's family");
+        // ...while a message said AFTER the move is carried as ever.
+        await dispatch(pool, aunt("we land at 07:40"), opts);
+        const later = await dispatch(pool, sayAs(Number(DROR), "Rio-italy-2026, and now?"), opts);
+        assert.match(textOf(later), /we land at 07:40/);
+      });
+    });
+
+    test("a re-bind of the SAME trip keeps what was overheard (nothing moved)", async () => {
+      await withFixture(async ({ pool, tripA }) => {
+        const opts = { ...READY, groupContext: new GroupContext() };
+        await dispatch(pool, aunt("mum's passport is 12345678"), opts);
+        const again = await dispatch(pool, sayAs(Number(DROR), `/group ${await issue(pool, tripA, DROR)}`), opts);
+        assert.equal(again.kind, "group_intro");
+        const next = await dispatch(pool, sayAs(Number(DROR), "Rio-japan-2025, anything new?"), opts);
+        assert.match(textOf(next), /passport is 12345678/);
+      });
     });
   });
 
