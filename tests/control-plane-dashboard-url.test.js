@@ -7,7 +7,7 @@
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 import { createRequire } from 'node:module';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import http from 'node:http';
@@ -167,16 +167,32 @@ test('no portalOrigin configured means no direct-login link, and says nothing is
   assert.deepEqual(warnings, [], 'an unconfigured portal origin is the older-trip state, not an error');
 });
 
-test('a bad configured portalOrigin yields no link, and is logged once at start', () => {
-  for (const bad of ['javascript:alert(1)', 'http://portal.example.test', 'https://u:p@portal.example.test', 'https://portal.example.test/path',
-    'https://portal.example.test/?x=1', 'https://portal.example.test/#x', 'https://portal.example.test/trips/trip_other/setup', 'portal.example.test',
-    '', 42, { origin: 'https://portal.example.test' }, ['https://portal.example.test'], 'https://portal.example.test\n@evil.example', `https://${'a'.repeat(2100)}.test`]) {
+// One list for both validators (the worker's normalize_portal_origin reads the same file).
+const PORTAL_ORIGIN_CASES = JSON.parse(readFileSync(new URL('./fixtures/portal-origin-cases.json', import.meta.url), 'utf8')).cases;
+
+test('safePortalOrigin accepts and refuses exactly what tests/fixtures/portal-origin-cases.json says, with the canonical form', () => {
+  const { safePortalOrigin } = requireFromServer('./control-plane-auth.js');
+  assert.ok(PORTAL_ORIGIN_CASES.length > 60 && PORTAL_ORIGIN_CASES.some(c => c.accepted) && PORTAL_ORIGIN_CASES.some(c => !c.accepted));
+  for (const { input, accepted, canonical } of PORTAL_ORIGIN_CASES) {
+    assert.equal(safePortalOrigin(input), accepted ? canonical : null, JSON.stringify(input).slice(0, 60));
+  }
+});
+
+test('every refused portalOrigin yields no link and is logged once at start, and every accepted one yields this trip\'s address', () => {
+  for (const { input, accepted, canonical } of PORTAL_ORIGIN_CASES) {
     const warnings = [];
-    const auth = authWith(bad, warnings);
-    assert.equal(auth.dashboardUrlForOrganizer(null, 'alice'), null, JSON.stringify(bad).slice(0, 50));
-    assert.equal(warnings.length, 1, `logged: ${JSON.stringify(bad).slice(0, 50)}`);
-    assert.match(warnings[0], /^control_plane\.portal_origin_invalid:/);
-    assert.ok(!warnings[0].includes('evil.example'), 'never echoes the value');
+    const auth = authWith(input, warnings);
+    const label = JSON.stringify(input).slice(0, 60);
+    if (accepted) {
+      assert.equal(auth.dashboardUrlForOrganizer(null, 'alice'), `${canonical}/trips/${tripId}/setup`, label);
+      assert.deepEqual(warnings, [], label);
+    } else {
+      assert.equal(auth.dashboardUrlForOrganizer(null, 'alice'), null, label);
+      // null / absent / empty are "not configured", a state older trips are legitimately in; the rest is a mistake worth a line.
+      const mistake = input !== null && input !== '';
+      assert.equal(warnings.length, mistake ? 1 : 0, label);
+      if (mistake) { assert.match(warnings[0], /^control_plane\.portal_origin_invalid:/); assert.ok(!warnings[0].includes('evil'), 'never echoes the value'); }
+    }
   }
 });
 

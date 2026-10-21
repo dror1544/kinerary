@@ -12,6 +12,7 @@ import os
 import re
 import secrets
 import unittest
+from pathlib import Path
 from typing import Any
 
 import psycopg
@@ -451,7 +452,8 @@ class ProvisionerHappyPathTests(unittest.TestCase):
         self.assertTrue(any("provisioner.portal_origin_unset" in line for line in logs.output))
 
     def test_a_malformed_portal_origin_is_dropped_loudly_not_written(self) -> None:
-        for bad in ("javascript:alert(1)", "http://portal.example.test", "https://u:p@portal.example.test", "https://portal.example.test/x"):
+        for bad in ("javascript:alert(1)", "http://portal.example.test", "https://u:p@portal.example.test", "https://portal.example.test/x",
+                    "https://evil.example\\portal.example.test", "https://portal.example.test."):
             with self.subTest(bad=bad):
                 with self.assertLogs("control_plane_worker.provisioner", level="WARNING") as logs:
                     identity = self._identity_sidecar_with(portal_origin=bad)
@@ -2906,23 +2908,20 @@ class ReconcileCompanionTests(unittest.TestCase):
 
 
 class NormalizePortalOriginTests(unittest.TestCase):
-    def test_accepts_only_a_plain_origin(self) -> None:
-        for good, expected in (
-            ("https://portal.example.test", "https://portal.example.test"),
-            ("https://portal.example.test/", "https://portal.example.test"),
-            ("  https://portal.example.test  ", "https://portal.example.test"),
-            ("https://portal.example.test:8443", "https://portal.example.test:8443"),
-            ("http://localhost:5173", "http://localhost:5173"),
-            ("http://127.0.0.1:5173", "http://127.0.0.1:5173"),
-        ):
-            self.assertEqual(expected, normalize_portal_origin(good), good)
+    """One list for both validators: the trip site's safePortalOrigin reads the
+    same tests/fixtures/portal-origin-cases.json, so a case cannot be accepted by
+    one side and refused by the other without a test going red."""
 
-    def test_refuses_everything_else(self) -> None:
-        for bad in (
-            None, "", "   ", "portal.example.test", "javascript:alert(1)", "data:text/html,x", "ftp://portal.example.test",
-            "http://portal.example.test", "https://u:p@portal.example.test", "https://portal.example.test/path",
-            "https://portal.example.test/?x=1", "https://portal.example.test/#x", "https://portal.example.test:notaport",
-            "https://portal.example.test\n@evil.example", "https://portal example.test", "https://" + "a" * 2100 + ".test",
-            "https://", 42,
-        ):
-            self.assertIsNone(normalize_portal_origin(bad), repr(bad)[:50])  # type: ignore[arg-type]
+    CASES = json.loads(
+        (Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "portal-origin-cases.json").read_text(encoding="utf-8")
+    )["cases"]
+
+    def test_the_shared_list_is_not_empty_either_way(self) -> None:
+        self.assertGreater(len(self.CASES), 60)
+        self.assertTrue(any(c["accepted"] for c in self.CASES))
+        self.assertTrue(any(not c["accepted"] for c in self.CASES))
+
+    def test_accepts_and_refuses_exactly_what_the_shared_list_says(self) -> None:
+        for case in self.CASES:
+            expected = case["canonical"] if case["accepted"] else None
+            self.assertEqual(expected, normalize_portal_origin(case["input"]), repr(case["input"])[:60])  # type: ignore[arg-type]

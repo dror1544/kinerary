@@ -181,6 +181,16 @@ test('dashboard_url reaches organizers (through the gateway or by direct login) 
   assert.equal((await agent.text()).includes('dashboard_url'), false);
 });
 
+test('/api/auth/me is never cached, whoever asks and however it answers', async () => {
+  // It carries a per-person, per-session address now; GET /api/config sets the same header.
+  for (const options of [{ token: await loginAsAlice() }, { apiKey: 'test-hermes-key' }]) {
+    const r = await api('/api/auth/me', options);
+    assert.equal(r.headers.get('cache-control'), 'no-store', `status ${r.status}`);
+  }
+  const unauthenticated = await api('/api/auth/me');
+  assert.equal(unauthenticated.status, 401);
+});
+
 test('the session exchange drops a dashboard URL that is not plain https or loopback http', async () => {
   const bad = ['javascript:alert(1)', 'data:text/html,x', 'http://portal.example.test/x', 'https://user:pw@portal.example.test/x', `https://portal.example.test/${'a'.repeat(2100)}`, 'https://portal.example.test/a b', '//portal.example.test/x', `https://portal.example.test/trips/trip_anothertrip/setup`, `${dashboardUrl}?next=https://evil.example`, `${dashboardUrl}#x`, 'https://portal.example.test/', 42, { toString: () => 'https://x.test' }];
   for (const candidate of bad) {

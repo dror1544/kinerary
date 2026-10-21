@@ -30,10 +30,16 @@ that path. Example (illustrative identifiers only):
 `web.public_origin`. The runtime builds an organizer's dashboard address from it
 (`<portalOrigin>/trips/<tripId>/setup`) when they did **not** arrive through the
 gateway, for instance a direct login on the trip's own hostname or the installed
-app. It must be a plain origin: https (http only for a loopback host), no
-credentials, path, query or fragment. Anything else is treated as not set, and the
-runtime logs `control_plane.portal_origin_invalid` once at start. It is read from
-configuration only, never from a request.
+app. It must be a plain origin, checked on the raw text: `https://<ASCII DNS name>[:port]`
+or `http://<loopback>[:port]`, with at most one trailing slash. No credentials, path,
+query or fragment; no backslash, `%`-escape, whitespace, Unicode, trailing dot or
+leading-zero port; the name's last label is not all digits. Anything else is treated
+as not set, and the runtime logs `control_plane.portal_origin_invalid` once at start.
+The worker (`normalize_portal_origin`) and the runtime (`safePortalOrigin`) apply the
+same rule and are both tested against `tests/fixtures/portal-origin-cases.json`.
+The origin is read from configuration only, never from a request.
+`GET /api/auth/me`, which now carries that per-person address, answers
+`Cache-Control: no-store`.
 
 The owner must already be an active local participant and configured
 organizer. No ambiguous name matching or “first participant is the owner”

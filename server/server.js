@@ -1559,6 +1559,8 @@ function verifiedManagedClaim(req) {
 }
 
 app.get('/api/auth/me', authRequired, (req, res) => {
+  // Per person and per session (it now carries their dashboard address): no cache, shared or private, may keep it.
+  res.setHeader('Cache-Control', 'no-store');
   const user = getUser(req.user.username);
   if (!user) return res.status(404).json({ error: 'not_found' });
   const organizers = normalizeOrganizers(TRIP_CONFIG.agent);

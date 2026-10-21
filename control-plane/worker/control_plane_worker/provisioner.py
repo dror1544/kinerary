@@ -14,13 +14,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import subprocess
 import threading
 import time
 from pathlib import Path
-from urllib.parse import urlsplit
 from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 import psycopg
@@ -1039,31 +1039,48 @@ def _organizer_recipient_chat_id(cur: Any, trip_id: str) -> str | None:
     return _organizer_chat_ids(cur, trip_id)[1]
 
 
-def normalize_portal_origin(value: str | None) -> str | None:
-    """The portal's origin as a trip site may be told it, or None.
+_PORTAL_DNS_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+_PORTAL_PORT = r"(?::(?P<port>[1-9][0-9]{0,4}))?"
+_PORTAL_OCTET = r"(?:0|[1-9][0-9]{0,2})"
+_PORTAL_HTTPS = re.compile(rf"https://(?P<host>{_PORTAL_DNS_LABEL}(?:\.{_PORTAL_DNS_LABEL})*){_PORTAL_PORT}/?")
+_PORTAL_LOOPBACK = re.compile(rf"http://(?P<host>localhost|127(?:\.{_PORTAL_OCTET}){{3}}|\[::1\]){_PORTAL_PORT}/?")
 
-    It is what the control plane calls `web.public_origin`: a plain origin,
-    https (http only for a loopback host, development), no credentials, path,
-    query or fragment. The trip site re-checks it, and a malformed value there
-    only removes the dashboard link, so this is the first of two checks, not the
-    only one. A trailing slash is dropped."""
-    if not isinstance(value, str) or not value.strip():
+
+def normalize_portal_origin(value: str | None) -> str | None:
+    """The portal's origin as a trip site may be told it (canonical form), or None.
+
+    It is what the control plane calls `web.public_origin`, and it must be
+    refused here for exactly the inputs the trip site refuses
+    (`safePortalOrigin` in server/control-plane-auth.js), so that a bad value is
+    reported by the worker's WARNING instead of being written and silently
+    ignored at the site. The rule is decided on the raw text: https://<ASCII DNS
+    name>[:port] or http://<loopback>[:port], at most one trailing slash. No
+    userinfo, path, query, fragment, backslash, %-escape, whitespace, Unicode (a
+    host or a digit), trailing dot or leading-zero port; the last label of a name
+    is not all digits. Both validators are driven by
+    tests/fixtures/portal-origin-cases.json. The canonical form is lower-case,
+    with the default port and the slash dropped, and is not stripped of
+    surrounding whitespace: whitespace is a refusal."""
+    if not isinstance(value, str) or not value or len(value) > 2048:
         return None
-    candidate = value.strip()
-    if len(candidate) > 2048 or any(ord(c) <= 0x20 or ord(c) == 0x7F for c in candidate) or "?" in candidate or "#" in candidate:
+    match = _PORTAL_HTTPS.fullmatch(value)
+    secure = match is not None
+    if not match:
+        match = _PORTAL_LOOPBACK.fullmatch(value)
+    if not match:
         return None
-    try:
-        parts = urlsplit(candidate)
-        host = parts.hostname
-        parts.port  # raises ValueError on a malformed port
-    except ValueError:
+    host = match.group("host").lower()
+    port = match.group("port")
+    if secure and host.rsplit(".", 1)[-1].isdigit():
         return None
-    if not host or parts.username is not None or parts.password is not None or parts.path not in ("", "/"):
+    if not secure and host.startswith("127."):
+        if any(int(octet) > 255 for octet in host.split(".")):
+            return None
+    if port is not None and int(port) > 65535:
         return None
-    loopback = host in ("localhost", "::1") or (host.startswith("127.") and host.replace(".", "").isdigit())
-    if parts.scheme != "https" and not (parts.scheme == "http" and loopback):
-        return None
-    return f"{parts.scheme}://{parts.netloc}"
+    default = "443" if secure else "80"
+    suffix = f":{port}" if port is not None and port != default else ""
+    return f"{'https' if secure else 'http'}://{host}{suffix}"
 
 
 class ProvisionerWorker:

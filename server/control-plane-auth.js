@@ -35,16 +35,28 @@ function safeDashboardUrl(value, tripId) {
 
 // The portal's origin as the control plane's own configuration states it
 // (web.public_origin), written by the worker into the identity sidecar on every
-// provision. An origin and nothing else: https (http only on a loopback host),
-// no credentials, path, query or fragment. Anything else is no origin at all, so
-// a bad value shows no dashboard link rather than a wrong one.
+// provision. An origin and nothing else, decided on the RAW text before any URL
+// parser sees it (a parser forgives what an href must not carry: backslashes,
+// %-escapes, Unicode digits and hosts, a trailing dot):
+//   https://<ASCII DNS name>[:port]   or   http://<loopback>[:port]
+// with at most one trailing slash. The name's last label must not be all digits
+// (so no IPv4 literal other than loopback), no trailing dot, no leading-zero port
+// or loopback octet. The worker's normalize_portal_origin() applies the same rule
+// and both are driven by the one list in tests/fixtures/portal-origin-cases.json.
+// Anything else is no origin at all: a bad value shows no dashboard link rather
+// than a wrong one. Returns the canonical origin (lower-case, default port and
+// slash dropped), or null.
+const DNS_LABEL = '[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?';
+const PORT = '(?::[1-9][0-9]{0,4})?';
+const OCTET = '(?:0|[1-9][0-9]{0,2})';
+const HTTPS_ORIGIN = new RegExp(`^https://${DNS_LABEL}(?:\\.${DNS_LABEL})*${PORT}/?$`);
+const LOOPBACK_ORIGIN = new RegExp(`^http://(?:localhost|127(?:\\.${OCTET}){3}|\\[::1\\])${PORT}/?$`);
 function safePortalOrigin(value) {
-  if (typeof value !== 'string' || !value || value.length > MAX_DASHBOARD_URL || /[\u0000-\u0020\u007f]/.test(value)) return null;
+  if (typeof value !== 'string' || !value || value.length > MAX_DASHBOARD_URL) return null;
+  if (!HTTPS_ORIGIN.test(value) && !LOOPBACK_ORIGIN.test(value)) return null;
   let url;
-  try { url = new URL(value); } catch { return null; }
-  if (url.username || url.password || url.search || url.hash || (url.pathname !== '/' && url.pathname !== '')) return null;
-  if (value.includes('?') || value.includes('#')) return null;
-  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && isLoopbackHost(url.hostname))) return null;
+  try { url = new URL(value); } catch { return null; } // 65536+, an octet above 255
+  if (url.protocol === 'https:' && /^[0-9]+$/.test(url.hostname.split('.').pop())) return null;
   return url.origin;
 }
 
@@ -71,7 +83,7 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
     safePortalOrigin(identity.portalOrigin) ? `${safePortalOrigin(identity.portalOrigin)}/trips/${identity.tripId}/setup` : null,
     identity.tripId,
   ) : null;
-  if (identity && identity.portalOrigin !== undefined && identity.portalOrigin !== null && !configuredDashboardUrl) {
+  if (identity && ![undefined, null, ''].includes(identity.portalOrigin) && !configuredDashboardUrl) {
     console.warn('control_plane.portal_origin_invalid: the identity sidecar\'s portalOrigin is not a plain https origin; organizers reaching this trip directly will see no dashboard link');
   }
   const find = db.prepare('SELECT * FROM control_plane_identities WHERE user_id = ? AND trip_id = ?');
@@ -195,4 +207,4 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
   }
   return { validManagedPayload, dashboardUrlFor, dashboardUrlForOrganizer };
 }
-module.exports = { createControlPlaneAuth, safeDashboardUrl };
+module.exports = { createControlPlaneAuth, safeDashboardUrl, safePortalOrigin };
