@@ -190,7 +190,7 @@ plan_note() {
     kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
     rm -rf "$work"
   fi
-  printf 'The notes folder ($KINERARY_NOTES_DIR/regression-plans) could not be checked for a regression plan in time (limit %ss) — this is not the same as nothing having been assessed. Only docs/test-reports could be searched:\n' "$limit"
+  printf 'The notes folder ($KINERARY_NOTES_DIR/regression-plans) could not be checked for a regression plan in time (limit %ss) — this is not the same as nothing having been assessed. To wait longer, set KINERARY_NOTES_READ_TIMEOUT_SECONDS (up to 10). Only docs/test-reports could be searched:\n' "$limit"
   plan_note_repo
 }
 

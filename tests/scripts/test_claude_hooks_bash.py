@@ -173,6 +173,8 @@ class NotesReadIsBounded(Harness):
         d, took = self.timed_hook()
         self.assertEqual(d["permissionDecision"], "ask")
         self.assertIn("limit 3s", d["permissionDecisionReason"])
+        # The person can only retry with a longer wait if the prompt names the knob.
+        self.assertIn("KINERARY_NOTES_READ_TIMEOUT_SECONDS", d["permissionDecisionReason"])
         self.assertGreaterEqual(took, 2.5)
         self.assertLess(took, 3 + 2)
 
