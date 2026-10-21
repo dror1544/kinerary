@@ -219,15 +219,36 @@ jobs:
           fi
           ls -la .assessment-context
 
+      # Node is pinned, as in every control-plane.yml job, so a runner-image
+      # bump cannot break the one step that produces the deliverable.
+      - if: steps.ctx.outputs.relevant == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # The install runs in its OWN step with no secret in its environment, so
+      # no install script can see the model credential.
+      - name: Install the claude CLI
+        if: steps.ctx.outputs.relevant == 'true'
+        env:
+          CLAUDE_CODE_VERSION: "2.1.302"   # pinned; bump on purpose
+        run: |
+          set -euo pipefail
+          npm install -g --no-fund --no-audit "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION" >/dev/null
+          installed="$(claude --version)"
+          case "$installed" in
+            *"$CLAUDE_CODE_VERSION"*) echo "claude $installed" ;;
+            *) echo "::error title=Wrong claude CLI::expected $CLAUDE_CODE_VERSION, got $installed"; exit 1 ;;
+          esac
+
       - name: Assess
         if: steps.ctx.outputs.relevant == 'true'
         # The `claude` CLI directly, not anthropics/claude-code-action. The
         # action always obtains a GitHub token for itself (OIDC to its GitHub
         # App, or `github_token`), and this job gives the model none (rule 1).
         # The first credentialed run (#323, 2026-10-19) failed exactly there.
-        # The CLI needs only the model credential. Pinned; bump on purpose.
+        # The CLI needs only the model credential.
         env:
-          CLAUDE_CODE_VERSION: "2.1.302"
           # Whichever is set; the OAuth token wins when both are.
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN == '' && secrets.ANTHROPIC_API_KEY || '' }}
@@ -274,14 +295,15 @@ jobs:
           set -euo pipefail
           [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || unset CLAUDE_CODE_OAUTH_TOKEN
           [ -n "$ANTHROPIC_API_KEY" ] || unset ANTHROPIC_API_KEY
-          npm install -g --no-fund --no-audit "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION" >/dev/null
-          claude --version
           # The allow-list is what makes "no network" true. In -p mode any tool
-          # outside it is refused, not asked about. Never widen it to bare Bash.
+          # outside it is refused, not asked about. Never widen it to bare Bash,
+          # and git only by its read-only subcommands: `git fetch/push/ls-remote
+          # <url>` would reach the network (the context was fetched before this
+          # step, so the model needs none of them).
           claude -p "$PROMPT" \
             --model claude-opus-5 \
             --max-turns 40 \
-            --allowedTools "Read,Grep,Glob,Write,Bash(git:*),Bash(ls:*),Bash(cat:*),Bash(sed:*),Bash(grep:*),Bash(rg:*),Bash(find:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(jq:*)"
+            --allowedTools "Read,Grep,Glob,Write,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(git ls-files:*),Bash(git rev-parse:*),Bash(git merge-base:*),Bash(git blame:*),Bash(git grep:*),Bash(git branch:*),Bash(git cat-file:*),Bash(ls:*),Bash(cat:*),Bash(sed:*),Bash(grep:*),Bash(rg:*),Bash(find:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(jq:*)"
 
       # ── Post it. No model runs in this step. ──────────────────────────────
       - name: Post the assessment

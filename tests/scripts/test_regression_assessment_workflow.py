@@ -176,9 +176,26 @@ class TheModelNeverHoldsAGitHubToken(unittest.TestCase):
 
     def test_assess_runs_the_cli_not_the_action(self):
         block = _step_block(_workflow_text(), "Assess")
-        self.assertNotRegex(block, r"^\s+uses:", "the Assess step must not use an action")
+        # re.M: without it `^` only anchors at position 0 and this could not fail.
+        self.assertIsNone(re.search(r"^\s+uses:", block, re.M), "the Assess step must not use an action")
         self.assertIn('claude -p "$PROMPT"', block)
-        self.assertRegex(block, r'CLAUDE_CODE_VERSION: "\d+\.\d+\.\d+"', "the CLI is pinned")
+
+    def test_the_cli_is_pinned_and_installed_without_a_secret_in_reach(self):
+        text = _workflow_text()
+        install = _step_block(text, "Install the claude CLI")
+        self.assertRegex(install, r'CLAUDE_CODE_VERSION: "\d+\.\d+\.\d+"', "the CLI is pinned")
+        self.assertIn("npm install -g", install)
+        self.assertNotIn("secrets.", install, "no install script may see a credential")
+        self.assertNotIn("npm install", _step_block(text, "Assess"))
+        self.assertIn("uses: actions/setup-node@", text, "Node is pinned")
+
+    def test_git_is_allowed_only_by_read_only_subcommands(self):
+        allowed = re.search(r'--allowedTools "([^"]+)"', _step_block(_workflow_text(), "Assess")).group(1).split(",")
+        self.assertNotIn("Bash(git:*)", allowed)
+        for tool in allowed:
+            with self.subTest(tool=tool):
+                self.assertFalse(
+                    re.match(r"Bash\(git (fetch|push|pull|clone|ls-remote|remote|submodule|config)", tool), tool)
 
     def test_assess_is_given_no_github_credential(self):
         block = _step_block(_workflow_text(), "Assess")
