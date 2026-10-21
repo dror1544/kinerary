@@ -22,6 +22,14 @@
  * either way, which is why they are built first.
  */
 import type pg from "pg";
+
+/**
+ * Anything that can run a query: the pool, or a client inside a transaction.
+ * The organizer readers below take this so a caller already in a transaction
+ * (`redeemGroupBindingToken`) asks on ITS connection - one connection held
+ * while a second is awaited is how a small pool deadlocks itself.
+ */
+export type Queryable = Pick<pg.Pool, "query">;
 import {
   askText,
   coerceLanguage,
@@ -256,7 +264,7 @@ export function companionIntroLoginUsernames(
  * dashboard) lifts the override. The person's name is untouched.
  */
 export async function resolveTripPerson(
-  db: pg.Pool,
+  db: Queryable,
   tripId: string,
   telegramUserId: string,
 ): Promise<{ username: string; displayName: string | null; role: string } | null> {
@@ -691,7 +699,7 @@ export async function setGroupProactiveLevel(
  * (an 'organizer'-role membership, a revoked or invited owner, a plain member are
  * all "no"), and a person link must say 'organizer'. A failed lookup is "no".
  */
-export async function isTripOrganizer(db: pg.Pool, tripId: string, telegramUserId: string): Promise<boolean> {
+export async function isTripOrganizer(db: Queryable, tripId: string, telegramUserId: string): Promise<boolean> {
   if (!tripId || !telegramUserId) return false;
   if ((await resolveTripPerson(db, tripId, telegramUserId))?.role === "organizer") return true;
   if (!isPrivateChatId(telegramUserId)) return false;
@@ -886,10 +894,20 @@ export async function startFromDeepLink(
 
 // ── Inline keyboards ─────────────────────────────────────────────────────────
 
-export interface InlineButton {
+export interface InlineCallbackButton {
   text: string;
   callback_data: string;
 }
+/**
+ * A button that opens a link. The only kind that works in a group for the Mini
+ * App: an inline `web_app` button is private-chat only, a `t.me/<bot>?startapp=`
+ * URL is not.
+ */
+export interface InlineUrlButton {
+  text: string;
+  url: string;
+}
+export type InlineButton = InlineCallbackButton | InlineUrlButton;
 export interface InlineKeyboard {
   inline_keyboard: InlineButton[][];
 }

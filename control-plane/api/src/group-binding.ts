@@ -27,7 +27,17 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import type pg from "pg";
+import { isTripOrganizer } from "./chat-router.js";
 import { NOT_RETIRED_SQL } from "./trip-retirement.js";
+
+/**
+ * Why a binding was closed because its group was carried to another trip by
+ * that group's own organizer. Free text in `telegram_chat_bindings.closed_reason`
+ * (0029 constrains only its length and that it is set exactly when the binding
+ * is closed) - no migration, and every reader that branches on a reason looks for
+ * 'trip_destroyed' alone, so an unfamiliar one is safe to meet.
+ */
+export const GROUP_MOVED_CLOSED_REASON = "group_moved";
 
 /**
  * `KIN-` plus eight unambiguous characters.
@@ -170,14 +180,24 @@ export async function groupBindingTokenIsOwn(
 }
 
 export type GroupBindingRedeemResult =
-  | { ok: true; tripId: string; rebound: boolean }
+  | {
+      ok: true;
+      tripId: string;
+      rebound: boolean;
+      /** Set when the group was carried here from another trip (the old binding is closed 'group_moved'). */
+      movedFromTripId?: string;
+    }
   | {
       ok: false;
       reason:
         | "NOT_FOUND"
         | "EXPIRED"
         | "WRONG_SENDER"
-        | "CHAT_BOUND_ELSEWHERE"
+        /**
+         * The group is bound to another trip and the sender is not an organizer of BOTH
+         * that trip and this one. One reason for every way of failing that, on purpose.
+         */
+        | "GROUP_MOVE_NOT_ORGANIZER"
         | "NOT_A_GROUP"
         | "TRIP_RETIRED";
     };
@@ -185,10 +205,25 @@ export type GroupBindingRedeemResult =
 /**
  * Redeems a token posted in a group, binding that group to the token's trip.
  *
- * Refuses a chat already bound to a DIFFERENT trip. On a shared bot the group
- * being taken belongs to a real family, and a token is not authority over a
- * binding somebody else made — the organizer of the other trip never agreed to
- * lose it. Rebinding the SAME trip is the supported path and reports
+ * A chat already bound to a DIFFERENT trip is MOVED only by someone who is an
+ * organizer of that trip AND of the one the token is for (`isTripOrganizer`,
+ * from the sender's verified Telegram id - the same proof `/proactive` asks
+ * for). On a shared bot the group belongs to a real family, and a token is not
+ * authority over a binding somebody else made - the organizer of the other trip
+ * never agreed to lose it - so anyone else is refused with
+ * `GROUP_MOVE_NOT_ORGANIZER` and nothing changes. The token alone is NOT
+ * enough here, even though it was issued to the sender: a code can be issued
+ * into any chat bound to its trip, and a family member's DM is one.
+ *
+ * A move happens in ONE transaction: the old open binding is closed with
+ * `group_moved` (history is kept; nothing is overwritten) and a new one is
+ * opened for the new trip with THAT trip's companion profile. The old trip's
+ * website and companion are untouched; routing simply follows the open binding.
+ * The authorization is one function call (`senderMayMoveGroup`) made before the
+ * first write, so a "tap to confirm" step can later be added by returning early
+ * from exactly there, with no change to what a confirmed move does.
+ *
+ * Rebinding the SAME trip is the supported path and reports
  * `rebound: true` so the caller can greet again without claiming it is new.
  *
  * Refuses a token whose trip has been retired (`t.slug` renamed
@@ -213,6 +248,14 @@ export type GroupBindingRedeemResult =
  * `REVOKE_GROUP_TOKENS` now runs FIRST in both of that function's
  * transaction branches, so it locks the token row before `trips`, matching
  * this function's own order instead of opposing it.
+ *
+ * THE MOVE ADDS ONE LOCK TO THAT ORDER, IN THE SAME PLACE TEARDOWN TAKES IT:
+ * the group's open binding row (`FOR UPDATE`) sits between the token row and
+ * `trips` - teardown revokes tokens, then closes bindings, then renames the
+ * slug. It is taken on every redemption, not just a move, so two redemptions of
+ * one chat take turns instead of racing the partial unique index. The
+ * organizer reads for the authorization are plain reads on this transaction's
+ * own connection and lock nothing.
  *
  * THE RACE THIS STILL DOES NOT CLOSE — separate from the deadlock above
  * (that one is fixed; this one is not), and related to, but sharper than,
@@ -295,43 +338,41 @@ export async function redeemGroupBindingToken(
       return { ok: false, reason: "TRIP_RETIRED" };
     }
 
-    const existing = await client.query<{ trip_id: string }>(
-      `SELECT trip_id FROM control_plane.telegram_chat_bindings
-        WHERE chat_id = $1 AND closed_at IS NULL`,
+    // FOR UPDATE: the binding row is the second lock in the order described above, and what
+    // makes two redemptions (or a redemption and a teardown) of one chat take turns.
+    const readOpenBinding = async () => (await client.query<{ id: string; trip_id: string }>(
+      `SELECT id, trip_id FROM control_plane.telegram_chat_bindings
+        WHERE chat_id = $1 AND closed_at IS NULL
+        FOR UPDATE`,
       [chatId],
-    );
-    const bound = existing.rows[0];
+    )).rows[0];
+    let bound = await readOpenBinding();
+    // A redemption that waited on that row lock while a MOVE (or a re-bind) committed does not
+    // see the binding the winner just opened: the locked row no longer matches and a statement
+    // never sees rows inserted after it began. Read again - a fresh statement, a fresh view -
+    // so a group that is no longer free goes down the bound-elsewhere path below, authorization
+    // included, instead of being "bound" over the top of somebody else's move.
+    bound ??= await readOpenBinding();
+    let movedFromTripId: string | undefined;
     if (bound && bound.trip_id !== row.trip_id) {
-      await client.query("ROLLBACK");
-      return { ok: false, reason: "CHAT_BOUND_ELSEWHERE" };
-    }
-
-    if (!bound) {
-      await client.query(
-        `INSERT INTO control_plane.telegram_chat_bindings
-           (id, chat_id, trip_id, hermes_profile)
-         SELECT $1, $2, $3, b.hermes_profile
-           FROM control_plane.telegram_chat_bindings b
-          WHERE b.trip_id = $3 AND b.hermes_profile IS NOT NULL
-          ORDER BY b.created_at DESC
-          LIMIT 1`,
-        [`tcb_${randomBytes(16).toString("hex")}`, chatId, row.trip_id],
-      );
-      // The trip may have no companion installed yet (migration 0043). Bind it
-      // anyway: routing and the assistant behind it are separate components,
-      // separately retryable, and a bound chat with no profile answers
-      // COMPANION_PENDING rather than "I don't have a trip for this chat".
-      const created = await client.query(
-        "SELECT 1 FROM control_plane.telegram_chat_bindings WHERE chat_id = $1 AND closed_at IS NULL",
-        [chatId],
-      );
-      if (!created.rowCount) {
-        await client.query(
-          `INSERT INTO control_plane.telegram_chat_bindings (id, chat_id, trip_id, hermes_profile)
-           VALUES ($1, $2, $3, NULL)`,
-          [`tcb_${randomBytes(16).toString("hex")}`, chatId, row.trip_id],
-        );
+      if (!(await senderMayMoveGroup(client, bound.trip_id, row.trip_id, senderTelegramUserId))) {
+        await client.query("ROLLBACK");
+        return { ok: false, reason: "GROUP_MOVE_NOT_ORGANIZER" };
       }
+      await client.query(
+        `UPDATE control_plane.telegram_chat_bindings
+            SET closed_at = now(), closed_reason = $2
+          WHERE id = $1`,
+        [bound.id, GROUP_MOVED_CLOSED_REASON],
+      );
+      await openBinding(client, chatId, row.trip_id);
+      movedFromTripId = bound.trip_id;
+    } else if (!bound) {
+      // The trip may have no companion installed yet (migration 0043): `openBinding` binds it
+      // anyway with a NULL profile. Routing and the assistant behind it are separate
+      // components, separately retryable, and a bound chat with no profile answers
+      // COMPANION_PENDING rather than "I don't have a trip for this chat".
+      await openBinding(client, chatId, row.trip_id);
     }
 
     // The token is NOT consumed here, on purpose. Owner decision 2026-10-16:
@@ -345,11 +386,76 @@ export async function redeemGroupBindingToken(
       [tokenDigest(token)],
     );
     await client.query("COMMIT");
-    return { ok: true, tripId: row.trip_id, rebound: Boolean(bound) };
+    return {
+      ok: true,
+      tripId: row.trip_id,
+      rebound: Boolean(bound) && movedFromTripId === undefined,
+      ...(movedFromTripId !== undefined ? { movedFromTripId } : {}),
+    };
   } catch (error) {
     await client.query("ROLLBACK").catch(() => undefined);
+    // Somebody else's binding of this chat committed between our reads and our INSERT (the
+    // partial unique index on open bindings, 0029). The group is not free and this sender was
+    // never checked against whoever holds it: the same uniform refusal as any other
+    // non-organizer, never an unhandled error (which the poller would swallow as a dropped update).
+    if (isActiveChatBindingConflict(error)) return { ok: false, reason: "GROUP_MOVE_NOT_ORGANIZER" };
     throw error;
   } finally {
     client.release();
   }
+}
+
+function isActiveChatBindingConflict(error: unknown): boolean {
+  const e = error as { code?: string; constraint?: string } | null;
+  return e?.code === "23505" && e.constraint === "telegram_chat_bindings_active_chat_idx";
+}
+
+/**
+ * Opens the chat's binding to a trip, with ONE rule for the companion profile whether the
+ * group was free or moved: the trip's own (`trips.hermes_profile`, migration 20260922060000)
+ * first, then the latest binding of that trip that carries one (a trip built before that
+ * column), else NULL. The trip may have no companion yet (migration 0043) and is bound anyway.
+ *
+ * The caller has made sure no open binding of this chat exists in its own view; if one
+ * committed since, the partial unique index throws 23505 and the caller refuses.
+ */
+async function openBinding(client: pg.PoolClient, chatId: string, tripId: string): Promise<void> {
+  const inserted = await client.query(
+    `INSERT INTO control_plane.telegram_chat_bindings (id, chat_id, trip_id, hermes_profile)
+     SELECT $1, $2, t.id,
+            coalesce(
+              t.hermes_profile,
+              (SELECT b.hermes_profile
+                 FROM control_plane.telegram_chat_bindings b
+                WHERE b.trip_id = t.id AND b.hermes_profile IS NOT NULL
+                ORDER BY b.created_at DESC
+                LIMIT 1))
+       FROM control_plane.trips t
+      WHERE t.id = $3`,
+    [`tcb_${randomBytes(16).toString("hex")}`, chatId, tripId],
+  );
+  // The token's foreign key guarantees the trip exists; no row here would be a bug, not a state.
+  if (!inserted.rowCount) throw new Error("openBinding: trip row missing");
+}
+
+/**
+ * May this sender carry a group from `fromTripId` to `toTripId`?
+ *
+ * Both halves are facts the control plane holds about the sender's VERIFIED
+ * Telegram id (the update's `from.id`), never anything typed: they must be an
+ * organizer of the trip the group belongs to now (it is theirs to give up) and
+ * of the trip it is going to (it is theirs to receive). Reads go through
+ * `isTripOrganizer` rather than restating the link tables here, so a change to
+ * what "linked organizer" means (revoked links, per-trip links) lands in one place.
+ *
+ * Runs on the redeeming transaction's own client: plain reads, no locks.
+ */
+async function senderMayMoveGroup(
+  client: pg.PoolClient,
+  fromTripId: string,
+  toTripId: string,
+  senderTelegramUserId: string,
+): Promise<boolean> {
+  return (await isTripOrganizer(client, fromTripId, senderTelegramUserId))
+    && (await isTripOrganizer(client, toTripId, senderTelegramUserId));
 }
