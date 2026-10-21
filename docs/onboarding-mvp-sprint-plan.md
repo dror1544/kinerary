@@ -1919,6 +1919,31 @@ before closing. #133 and #206 have code on `main` and close after a live walk.
 list. CA-01 and CA-07 are drafts #357 and #359, which must land in that order;
 CA-00 lands with #357.
 
+### Sprint 8 (candidate) — Fleet health: production watches itself
+
+**Decided by Dror, 2026-10-21:** redesign monitoring in a future sprint, spec
+first. Spec (draft, awaiting approval):
+`docs/specs/sprint-8/468-fleet-health-self-monitoring.md`. Issue #468.
+
+**Why:** on 2026-10-19/20 the Mac-hosted monitor's SQL-over-SSH fan-out hit the
+VM's sshd `MaxStartups` about once an hour, and an LLM-wrapped cron sent a wrong
+failure notice. Nothing reported the monitor itself being down. #453 is the
+stopgap: it caps the monitor at 4 concurrent SSH sessions.
+
+**Shape:**
+- A deterministic checker in the control plane, with fingerprinted open/resolve
+  alerts.
+- Delivery through the existing outbox, with no model in the path.
+- A read-only operator endpoint replacing the SSH queries.
+- An external heartbeat.
+- The Hermes monitor keeps only judgment work: companion-report triage and the
+  digest.
+
+**Five slices, in order:** rules and checker (M), delivery (M), endpoint (S),
+heartbeat (S), retire the SSH path (S–M). It absorbs or reshapes #291, #295,
+#370 and #187, and feeds #125. The spec's open questions (alert channel,
+heartbeat watcher, severities, quiet hours) are decided at approval.
+
 ## 4. Demo-trip acceptance script
 
 Run this only after Sprint 6 automated gates are green. Record the IDs,
