@@ -162,6 +162,11 @@ services:
       # password. Passed through only so the worker warns if it is still set.
       PROVISIONER_SEED_PASSWORD: ${PROVISIONER_SEED_PASSWORD:-}
       CONTROL_PLANE_OPERATOR_CHAT_ID: ${CONTROL_PLANE_OPERATOR_CHAT_ID:-}
+      # The portal's own origin (the API's web.public_origin), written into each
+      # trip's identity sidecar so an organizer who opens the trip on its own
+      # hostname still gets an "Organizer dashboard" link. Unset: no link for a
+      # direct login (said at worker start). Reaches a trip at its next provision.
+      CONTROL_PLANE_PORTAL_ORIGIN: ${CONTROL_PLANE_PORTAL_ORIGIN:-}
       NPM_URL: ${NPM_URL:-}
       NPM_API_TOKEN: ${NPM_API_TOKEN:-}
       NPM_IDENTITY: ${NPM_IDENTITY:-}

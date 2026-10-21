@@ -23,6 +23,7 @@ from control_plane_worker.provisioner import (
     ProvisionerWorker,
     TripRetired,
     bind_chat_to_trip,
+    normalize_portal_origin,
     _record_trip_companion,
     attach_profile_to_orphan_bindings,
 )
@@ -429,6 +430,46 @@ class ProvisionerHappyPathTests(unittest.TestCase):
         identity = sidecars["control-plane.identity.json"]
         self.assertEqual(self.fix["trip_id"], identity["tripId"])
         self.assertIsNone(identity["owner"], "an unresolved organizer must not be guessed")
+
+    def _identity_sidecar_with(self, **worker_kwargs: Any) -> dict[str, Any]:
+        worker = ProvisionerWorker(db_url=DB_URL, deploy=self.fake_deploy, worker_id="test-provisioner", **worker_kwargs)
+        worker.run_once()
+        return self.fake_deploy.deployed[-1]["sidecars"]["control-plane.identity.json"]
+
+    def test_identity_sidecar_tells_the_trip_where_its_dashboard_lives(self) -> None:
+        # So an organizer who opens the trip on its own hostname still has a way back.
+        identity = self._identity_sidecar_with(portal_origin="https://portal.example.test/")
+        self.assertEqual("https://portal.example.test", identity["portalOrigin"], "a plain origin, slash dropped")
+        self.assertEqual(self.fix["trip_id"], identity["tripId"])
+        # Never in the public trip config, which the site serves.
+        self.assertNotIn("portal.example.test", json.dumps(self.fake_deploy.deployed[-1]["config"]))
+
+    def test_identity_sidecar_has_no_portal_origin_when_unset_and_the_worker_says_so(self) -> None:
+        with self.assertLogs("control_plane_worker.provisioner", level="INFO") as logs:
+            identity = self._identity_sidecar_with(portal_origin="")
+        self.assertNotIn("portalOrigin", identity)
+        self.assertTrue(any("provisioner.portal_origin_unset" in line for line in logs.output))
+
+    def test_a_malformed_portal_origin_is_dropped_loudly_not_written(self) -> None:
+        for bad in ("javascript:alert(1)", "http://portal.example.test", "https://u:p@portal.example.test", "https://portal.example.test/x"):
+            with self.subTest(bad=bad):
+                with self.assertLogs("control_plane_worker.provisioner", level="WARNING") as logs:
+                    identity = self._identity_sidecar_with(portal_origin=bad)
+                self.assertNotIn("portalOrigin", identity)
+                self.assertTrue(any("provisioner.portal_origin_invalid" in line for line in logs.output))
+                self.assertFalse(any(bad in line for line in logs.output), "the value itself is not echoed")
+
+    def test_portal_origin_defaults_from_the_environment_variable_the_compose_files_pass(self) -> None:
+        previous = os.environ.get("CONTROL_PLANE_PORTAL_ORIGIN")
+        os.environ["CONTROL_PLANE_PORTAL_ORIGIN"] = "https://portal.example.test"
+        try:
+            identity = self._identity_sidecar_with()
+        finally:
+            if previous is None:
+                del os.environ["CONTROL_PLANE_PORTAL_ORIGIN"]
+            else:
+                os.environ["CONTROL_PLANE_PORTAL_ORIGIN"] = previous
+        self.assertEqual("https://portal.example.test", identity["portalOrigin"])
 
     def test_owner_identity_is_bound_to_the_resolved_local_organizer(self) -> None:
         teardown_fixture(self.conn, self.fix)
@@ -2862,3 +2903,26 @@ class ReconcileCompanionTests(unittest.TestCase):
             self.worker.reconcile_companion(self.fix["trip_id"])
         self.assertEqual(self._state(), before)
         self.assertEqual(self.companion.installed, [])
+
+
+class NormalizePortalOriginTests(unittest.TestCase):
+    def test_accepts_only_a_plain_origin(self) -> None:
+        for good, expected in (
+            ("https://portal.example.test", "https://portal.example.test"),
+            ("https://portal.example.test/", "https://portal.example.test"),
+            ("  https://portal.example.test  ", "https://portal.example.test"),
+            ("https://portal.example.test:8443", "https://portal.example.test:8443"),
+            ("http://localhost:5173", "http://localhost:5173"),
+            ("http://127.0.0.1:5173", "http://127.0.0.1:5173"),
+        ):
+            self.assertEqual(expected, normalize_portal_origin(good), good)
+
+    def test_refuses_everything_else(self) -> None:
+        for bad in (
+            None, "", "   ", "portal.example.test", "javascript:alert(1)", "data:text/html,x", "ftp://portal.example.test",
+            "http://portal.example.test", "https://u:p@portal.example.test", "https://portal.example.test/path",
+            "https://portal.example.test/?x=1", "https://portal.example.test/#x", "https://portal.example.test:notaport",
+            "https://portal.example.test\n@evil.example", "https://portal example.test", "https://" + "a" * 2100 + ".test",
+            "https://", 42,
+        ):
+            self.assertIsNone(normalize_portal_origin(bad), repr(bad)[:50])  # type: ignore[arg-type]

@@ -368,10 +368,11 @@ function saveTripUser(user) {
 }
 
 // The organizer's way back to the dashboard. /api/auth/me sends dashboard_url
-// only to an owner/organizer whose session was opened from the dashboard (a
-// signed claim, https or loopback http, no credentials); members, direct
-// logins and the agent key never get it. Checked again here before it becomes
-// an href, so a bad value shows no entry rather than a `javascript:` link.
+// only to an organizer, however they reached the trip: from the signed claim
+// of a dashboard launch, or else from the address the trip's own configuration
+// names (a direct login, the installed app). Members and the agent key never
+// get it. Checked again here before it becomes an href, so a bad value shows
+// no entry rather than a `javascript:` link.
 function applyDashboardLink() {
   const section = document.getElementById('sm-dashboard-section');
   const link = document.getElementById('sm-dashboard-link');

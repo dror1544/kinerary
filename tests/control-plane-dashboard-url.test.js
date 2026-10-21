@@ -123,3 +123,73 @@ test('an owner or organizer minted without the link is logged, with the reason a
   ]);
   assert.ok(!lines.join('').includes('evil.example'));
 });
+
+// ── An organizer who did not come through the gateway ───────────────────────
+// A direct login on the trip's own hostname (or the installed app) has no managed
+// claim. The address then comes from configuration alone: the identity sidecar's
+// portalOrigin (written by the worker from the control plane's web.public_origin)
+// plus THIS trip's id. Built per case: createControlPlaneAuth reads the sidecar once.
+function authWith(portalOrigin, warnings = []) {
+  const file = join(temp, `identity-${Math.random().toString(36).slice(2)}.json`);
+  writeFileSync(file, JSON.stringify({ version: 1, tripId, owner: { userId: ids.owner, username: 'alice' }, ...(portalOrigin === undefined ? {} : { portalOrigin }) }));
+  const previous = process.env.CONTROL_PLANE_IDENTITY_FILE;
+  process.env.CONTROL_PLANE_IDENTITY_FILE = file;
+  const db = new Database(':memory:');
+  db.exec('CREATE TABLE users (username TEXT PRIMARY KEY)');
+  for (const name of ['alice', 'carol', 'bob']) db.prepare('INSERT INTO users(username) VALUES (?)').run(name);
+  const original = console.warn;
+  console.warn = (...args) => warnings.push(args.join(' '));
+  try {
+    const { createControlPlaneAuth } = requireFromServer('./control-plane-auth.js');
+    return createControlPlaneAuth({ app: express(), db, tripDir: temp, config: () => config, ready: Promise.resolve(), jwtSecret: SECRET });
+  } finally { console.warn = original; process.env.CONTROL_PLANE_IDENTITY_FILE = previous; }
+}
+
+test('a direct-login organizer gets the configured dashboard address of THIS trip; members, demoted organizers and strangers do not', () => {
+  const direct = authWith('https://portal.example.test');
+  assert.equal(direct.dashboardUrlForOrganizer(null, 'alice'), DASHBOARD);
+  assert.equal(direct.dashboardUrlForOrganizer(undefined, 'carol'), DASHBOARD, 'any organizer, not only the owner');
+  assert.equal(direct.dashboardUrlForOrganizer(null, 'bob'), null, 'a member');
+  assert.equal(direct.dashboardUrlForOrganizer(null, 'hermes'), null, 'not a participant (the agent key)');
+  assert.equal(direct.dashboardUrlForOrganizer(null, 'mallory'), null, 'not a user at all');
+  config.agent.organizers = ['alice'];
+  try { assert.equal(direct.dashboardUrlForOrganizer(null, 'carol'), null, 'a demoted organizer'); }
+  finally { config.agent.organizers = ['alice', 'carol']; }
+  // A trailing slash and a loopback http origin (development) are plain origins too.
+  assert.equal(authWith('https://portal.example.test/').dashboardUrlForOrganizer(null, 'alice'), DASHBOARD);
+  assert.equal(authWith('http://localhost:5173').dashboardUrlForOrganizer(null, 'alice'), `http://localhost:5173/trips/${tripId}/setup`);
+});
+
+test('no portalOrigin configured means no direct-login link, and says nothing is wrong', () => {
+  const warnings = [];
+  assert.equal(authWith(undefined, warnings).dashboardUrlForOrganizer(null, 'alice'), null);
+  assert.equal(authWith(null, warnings).dashboardUrlForOrganizer(null, 'alice'), null);
+  assert.deepEqual(warnings, [], 'an unconfigured portal origin is the older-trip state, not an error');
+});
+
+test('a bad configured portalOrigin yields no link, and is logged once at start', () => {
+  for (const bad of ['javascript:alert(1)', 'http://portal.example.test', 'https://u:p@portal.example.test', 'https://portal.example.test/path',
+    'https://portal.example.test/?x=1', 'https://portal.example.test/#x', 'https://portal.example.test/trips/trip_other/setup', 'portal.example.test',
+    '', 42, { origin: 'https://portal.example.test' }, ['https://portal.example.test'], 'https://portal.example.test\n@evil.example', `https://${'a'.repeat(2100)}.test`]) {
+    const warnings = [];
+    const auth = authWith(bad, warnings);
+    assert.equal(auth.dashboardUrlForOrganizer(null, 'alice'), null, JSON.stringify(bad).slice(0, 50));
+    assert.equal(warnings.length, 1, `logged: ${JSON.stringify(bad).slice(0, 50)}`);
+    assert.match(warnings[0], /^control_plane\.portal_origin_invalid:/);
+    assert.ok(!warnings[0].includes('evil.example'), 'never echoes the value');
+  }
+});
+
+test('a managed claim and the configured address agree; where they differ the configured one wins, and a member gets none', () => {
+  const auth = authWith('https://portal.example.test');
+  assert.equal(auth.dashboardUrlForOrganizer({ userId: ids.owner, tripId, role: 'owner', dashboardUrl: DASHBOARD }, 'alice'), DASHBOARD);
+  // A claim naming another origin (a gateway pinned to a different portal, or a hostile one) never overrides configuration.
+  assert.equal(auth.dashboardUrlForOrganizer({ userId: ids.owner, tripId, role: 'owner', dashboardUrl: `https://evil.example/trips/${tripId}/setup` }, 'alice'), DASHBOARD);
+  assert.equal(auth.dashboardUrlForOrganizer({ userId: ids.owner, tripId, role: 'owner', dashboardUrl: `http://127.0.0.1:5173/trips/${tripId}/setup` }, 'alice'), DASHBOARD);
+  assert.equal(auth.dashboardUrlForOrganizer({ userId: ids.member, tripId, role: 'member', dashboardUrl: DASHBOARD }, 'bob'), null);
+  // With nothing configured the managed path is exactly what it was.
+  const unconfigured = authWith(undefined);
+  const pinned = `http://127.0.0.1:5173/trips/${tripId}/setup`;
+  assert.equal(unconfigured.dashboardUrlForOrganizer({ userId: ids.owner, tripId, role: 'owner', dashboardUrl: pinned }, 'alice'), pinned);
+  assert.equal(unconfigured.dashboardUrlForOrganizer({ userId: ids.owner, tripId, role: 'owner', dashboardUrl: 'javascript:1' }, 'alice'), null);
+});

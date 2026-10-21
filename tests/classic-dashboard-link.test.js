@@ -42,7 +42,7 @@ test('the entry shows, with the URL as its href, when the session carries dashbo
   assert.deepEqual(menu({ username: 'alice', is_organizer: true, dashboard_url: url }), { visible: true, href: url });
 });
 
-test('the entry is hidden for a member, a direct login and a signed-out menu', () => {
+test('the entry is hidden for a member, an organizer whose server sent none (older trip, no portal configured) and a signed-out menu', () => {
   for (const user of [{ username: 'bob' }, { username: 'alice', is_organizer: true }, null]) {
     assert.deepEqual(menu(user), { visible: false, href: null });
   }
@@ -69,4 +69,25 @@ test('both languages carry the label', () => {
   assert.equal((TRANSLATIONS.match(/sm_dashboard:/g) || []).length, 2);
   assert.match(TRANSLATIONS, /sm_dashboard:\s+'🧭 לוח המארגן'/);
   assert.match(TRANSLATIONS, /sm_dashboard:\s+'🧭 Organizer dashboard'/);
+});
+
+test('a plain password login (no gateway) gets the entry from /api/auth/me on the reload, and it is not cached', async () => {
+  // checkAuth() is what runs after login.reload() on every page load, managed or direct.
+  const url = 'https://portal.example.test/trips/trip_abcdefgh/setup';
+  const win = new Window({ url: 'http://localhost/' });
+  const from = HTML.indexOf('<aside class="side-menu"');
+  win.document.body.innerHTML = HTML.slice(from, HTML.indexOf('</aside>', from) + 8) + '<div id="login-overlay"></div>';
+  const store = { 'trip-token': 'direct-password-jwt', 'trip-user': JSON.stringify({ username: 'alice' }) };
+  const fetched = [];
+  const ctx = vm.createContext({
+    window: win, document: win.document, URL, currentUser: null, isOrganizer: false,
+    localStorage: { getItem: k => store[k] ?? null, setItem: (k, v) => { store[k] = String(v); }, removeItem: k => { delete store[k]; } },
+    fetch: async (path, init) => { fetched.push([path, init.headers.Authorization]); return { ok: true, json: async () => ({ username: 'alice', is_organizer: true, dashboard_url: url }) }; },
+  });
+  vm.runInContext(`${extract('safeUrl')}\n${extract('saveTripUser')}\n${extract('applyDashboardLink')}\nfunction showLoggedIn() { applyDashboardLink(); }\n${APP.slice(APP.search(/async function checkAuth\(/), APP.indexOf('\n}\n', APP.search(/async function checkAuth\(/)) + 3)}\nglobalThis.done = checkAuth();`, ctx);
+  assert.equal(await ctx.done, true);
+  assert.deepEqual(fetched, [['/api/auth/me', 'Bearer direct-password-jwt']]);
+  assert.equal(win.document.getElementById('sm-dashboard-link').getAttribute('href'), url);
+  assert.notEqual(win.document.getElementById('sm-dashboard-section').style.display, 'none');
+  assert.deepEqual(JSON.parse(store['trip-user']), { username: 'alice', is_organizer: true }, 'dashboard_url stays out of localStorage');
 });

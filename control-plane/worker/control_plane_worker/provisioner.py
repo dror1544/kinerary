@@ -20,6 +20,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 import psycopg
@@ -1038,6 +1039,33 @@ def _organizer_recipient_chat_id(cur: Any, trip_id: str) -> str | None:
     return _organizer_chat_ids(cur, trip_id)[1]
 
 
+def normalize_portal_origin(value: str | None) -> str | None:
+    """The portal's origin as a trip site may be told it, or None.
+
+    It is what the control plane calls `web.public_origin`: a plain origin,
+    https (http only for a loopback host, development), no credentials, path,
+    query or fragment. The trip site re-checks it, and a malformed value there
+    only removes the dashboard link, so this is the first of two checks, not the
+    only one. A trailing slash is dropped."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    candidate = value.strip()
+    if len(candidate) > 2048 or any(ord(c) <= 0x20 or ord(c) == 0x7F for c in candidate) or "?" in candidate or "#" in candidate:
+        return None
+    try:
+        parts = urlsplit(candidate)
+        host = parts.hostname
+        parts.port  # raises ValueError on a malformed port
+    except ValueError:
+        return None
+    if not host or parts.username is not None or parts.password is not None or parts.path not in ("", "/"):
+        return None
+    loopback = host in ("localhost", "::1") or (host.startswith("127.") and host.replace(".", "").isdigit())
+    if parts.scheme != "https" and not (parts.scheme == "http" and loopback):
+        return None
+    return f"{parts.scheme}://{parts.netloc}"
+
+
 class ProvisionerWorker:
     """Claims one approved provision job at a time, transforms intake to
     trip.config.json, deploys via the deploy adapter, and records the result.
@@ -1073,8 +1101,27 @@ class ProvisionerWorker:
         verification_retry_attempts: int | None = None,
         verification_retry_delay_s: float | None = None,
         verification_sleep: "verification.SleepFn | None" = None,
+        portal_origin: str | None = None,
     ) -> None:
         self._db_url = db_url
+        # The control plane's web.public_origin (CONTROL_PLANE_PORTAL_ORIGIN),
+        # told to each trip site in its identity sidecar so an organizer who
+        # opens the trip on its own hostname still has a way back to the
+        # dashboard. Unset leaves it out (the site then shows no link for a
+        # direct login); a value that is not a plain origin is dropped LOUDLY
+        # rather than written, because the symptom of a missing link is silence.
+        configured = portal_origin if portal_origin is not None else os.environ.get("CONTROL_PLANE_PORTAL_ORIGIN", "")
+        self._portal_origin = normalize_portal_origin(configured)
+        if configured.strip() and not self._portal_origin:
+            logger.warning(
+                "provisioner.portal_origin_invalid: CONTROL_PLANE_PORTAL_ORIGIN is not a plain https origin; "
+                "trip sites will not show an organizer dashboard link to a direct login"
+            )
+        elif not configured.strip():
+            logger.info(
+                "provisioner.portal_origin_unset: CONTROL_PLANE_PORTAL_ORIGIN is not set; "
+                "trip sites built or redeployed now will not show an organizer dashboard link to a direct login"
+            )
         # Where the control plane keeps uploaded originals (DOCUMENT_STORE_DIR,
         # the same root the relay writes to). Unset: a trip is provisioned with
         # no source documents, exactly as before documents were kept at all.
@@ -1215,6 +1262,9 @@ class ProvisionerWorker:
                      if len(owners) == 1 and len(organizers) == 1 else None)
             sidecars["control-plane.identity.json"] = {
                 "version": 1, "tripId": trip_id, "owner": owner,
+                # Rewritten on every provision, so a trip built before this
+                # existed learns it at its next redeploy. Absent when unset.
+                **({"portalOrigin": self._portal_origin} if self._portal_origin else {}),
             }
 
             # The confirmed version's source documents: published beside the

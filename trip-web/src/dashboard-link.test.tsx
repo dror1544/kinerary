@@ -23,7 +23,7 @@ describe("the organizer's way back to the dashboard", () => {
     expect(screen.getByRole("link", { name: "לוח המארגן" })).toBeInTheDocument();
   });
 
-  it("is absent for a member, a direct organizer login and a signed-out menu", () => {
+  it("is absent for a member, an organizer whose server sent none (older trip, no portal configured) and a signed-out menu", () => {
     for (const user of [{ username: "bob" }, { username: "alice", is_organizer: true }, undefined] as (CurrentUser | undefined)[]) {
       renderMenu(user);
       expect(screen.queryByTestId("organizer-dashboard-link")).toBeNull();

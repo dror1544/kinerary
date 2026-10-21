@@ -25,7 +25,7 @@ const enroll = body => api('/api/internal/control-plane/participants', { method:
 before(async () => {
   temp = mkdtempSync(join(tmpdir(), 'runtime-identity-test-'));
   const manifest = join(temp, 'identity.json');
-  writeFileSync(manifest, JSON.stringify({ version: 1, tripId, owner: { userId: ownerId, username: 'alice' } }));
+  writeFileSync(manifest, JSON.stringify({ version: 1, tripId, owner: { userId: ownerId, username: 'alice' }, portalOrigin: 'https://portal.example.test' }));
   // Ports the OS hands out, not fixed ones: a leaked server from another run cannot hold them.
   tripPort = await freePort(); do { mcpPort = await freePort(); } while (mcpPort === tripPort);
   await startTestServer({ PORT: tripPort, CONTROL_PLANE_EXCHANGE_KEY: key, CONTROL_PLANE_IDENTITY_FILE: manifest, SITE_DIR: fileURLToPath(new URL('../site', import.meta.url)) });
@@ -157,7 +157,7 @@ test('gateway logout expires only this trip cookie and rejects cross-origin requ
 });
 
 
-test('dashboard_url reaches owners through the gateway and nobody else', async () => {
+test('dashboard_url reaches organizers (through the gateway or by direct login) and never members or the agent key', async () => {
   const meOf = async options => await (await api('/api/auth/me', options)).json();
   // Owner, launched from the dashboard: the control plane's URL rides the signed session.
   const ownerCookie = await launch('owner-grant');
@@ -169,9 +169,14 @@ test('dashboard_url reaches owners through the gateway and nobody else', async (
   // A member launched the same way gets none, even if the exchange carries a URL for them.
   const memberToken = (await (await exchange(sessionBody({ userId: memberId, role: 'member', runtimeUsername: 'bob', dashboardUrl }))).json()).token;
   assert.equal((await meOf({ token: memberToken })).dashboard_url, undefined);
-  // Direct logins (password) and the agent key never have one.
+  // A direct login (password, on the trip's own hostname) by an organizer gets the CONFIGURED
+  // address of this trip's dashboard page; a direct login by a member, and the agent key, never do.
   const direct = await meOf({ token: await loginAsAlice() });
-  assert.equal(direct.username, 'alice'); assert.equal(direct.dashboard_url, undefined);
+  assert.equal(direct.username, 'alice'); assert.equal(direct.dashboard_url, dashboardUrl);
+  const bobLogin = await api('/api/auth/login', { method: 'POST', body: { username: 'bob', password: '1234' } });
+  assert.equal(bobLogin.status, 200);
+  const directMember = await meOf({ token: (await bobLogin.json()).token });
+  assert.equal(directMember.username, 'bob'); assert.equal(directMember.dashboard_url, undefined);
   const agent = await api('/api/auth/me', { apiKey: 'test-hermes-key' });
   assert.equal((await agent.text()).includes('dashboard_url'), false);
 });
@@ -180,10 +185,15 @@ test('the session exchange drops a dashboard URL that is not plain https or loop
   const bad = ['javascript:alert(1)', 'data:text/html,x', 'http://portal.example.test/x', 'https://user:pw@portal.example.test/x', `https://portal.example.test/${'a'.repeat(2100)}`, 'https://portal.example.test/a b', '//portal.example.test/x', `https://portal.example.test/trips/trip_anothertrip/setup`, `${dashboardUrl}?next=https://evil.example`, `${dashboardUrl}#x`, 'https://portal.example.test/', 42, { toString: () => 'https://x.test' }];
   for (const candidate of bad) {
     const token = (await (await exchange(sessionBody({ dashboardUrl: candidate }))).json()).token;
-    assert.equal((await (await api('/api/auth/me', { token })).json()).dashboard_url, undefined, String(candidate).slice(0, 40));
+    // The signed claim carries none of it; what /api/auth/me serves is the trip's own configured address.
+    assert.equal(JSON.parse(Buffer.from(token.split('.')[1], 'base64url')).controlPlane.dashboardUrl, undefined, String(candidate).slice(0, 40));
+    assert.equal((await (await api('/api/auth/me', { token })).json()).dashboard_url, dashboardUrl, String(candidate).slice(0, 40));
   }
   const loopback = (await (await exchange(sessionBody({ dashboardUrl: `http://localhost:5173/trips/${tripId}/setup` }))).json()).token;
-  assert.equal((await (await api('/api/auth/me', { token: loopback })).json()).dashboard_url, `http://localhost:5173/trips/${tripId}/setup`);
+  // The runtime accepts loopback http into the signed claim (development); /api/auth/me still serves the
+  // address the trip's own configuration names, which wins wherever the two differ.
+  assert.equal(JSON.parse(Buffer.from(loopback.split('.')[1], 'base64url')).controlPlane.dashboardUrl, `http://localhost:5173/trips/${tripId}/setup`);
+  assert.equal((await (await api('/api/auth/me', { token: loopback })).json()).dashboard_url, dashboardUrl);
 });
 
 test('a stored .html or .svg opened under /t/<trip>/ is never served as something that runs', async () => {
@@ -228,7 +238,9 @@ test('a dashboard link to any other origin never reaches the trip, even from the
   const cookie = await launch('evil-grant');
   const me = await (await fetch(`${gatewayOrigin}/t/${tripId}/api/auth/me`, { headers: { cookie } })).json();
   assert.equal(me.username, 'alice');
-  assert.equal(me.dashboard_url, undefined, 'https://evil.example/... was dropped by the gateway');
+  // The foreign URL was dropped by the gateway; the organizer still gets the dashboard that
+  // the trip's own configuration names, never the one the control plane sent.
+  assert.equal(me.dashboard_url, dashboardUrl, 'https://evil.example/... was dropped by the gateway');
   assert.equal((await (await fetch(`${gatewayOrigin}/t/${tripId}/api/auth/me`, { headers: { cookie: await launch('owner-grant') } })).json()).dashboard_url, dashboardUrl);
 });
 

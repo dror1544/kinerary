@@ -21,9 +21,19 @@ that path. Example (illustrative identifiers only):
 {
   "version": 1,
   "tripId": "trip_example1234",
-  "owner": { "userId": "user_example1234", "username": "alice" }
+  "owner": { "userId": "user_example1234", "username": "alice" },
+  "portalOrigin": "https://portal.example"
 }
 ```
+
+`portalOrigin` is optional: the portal's own origin, the control plane's
+`web.public_origin`. The runtime builds an organizer's dashboard address from it
+(`<portalOrigin>/trips/<tripId>/setup`) when they did **not** arrive through the
+gateway, for instance a direct login on the trip's own hostname or the installed
+app. It must be a plain origin: https (http only for a loopback host), no
+credentials, path, query or fragment. Anything else is treated as not set, and the
+runtime logs `control_plane.portal_origin_invalid` once at start. It is read from
+configuration only, never from a request.
 
 The owner must already be an active local participant and configured
 organizer. No ambiguous name matching or “first participant is the owner”
@@ -35,6 +45,16 @@ transformer's uniquely resolved organizer. An unresolved organizer produces
 `owner: null`, which fails closed at the runtime. First-time LXC bootstrap
 writes the exchange key to its mode-600 `.env` when configured on the worker.
 It never stores the key in topology YAML or public trip config.
+
+`portalOrigin` comes from the worker's `CONTROL_PLANE_PORTAL_ORIGIN`, which a
+deployment sets to the same value as the API's `web.public_origin` (both compose
+files pass it through; no hostname lives in code). Unlike the exchange key, it is
+in the sidecar, and the worker rewrites the sidecar on **every** provision, so a
+trip built before this existed gets it at its next redeploy, not only when its
+container is rebuilt. The worker says so at start when the variable is unset
+(`provisioner.portal_origin_unset`, INFO) or is not a plain origin
+(`provisioner.portal_origin_invalid`, WARNING; the value is not echoed). A trip not yet
+redeployed keeps the old behaviour: the link appears only for a gateway launch.
 
 Existing runtimes need their private identity sidecar and exchange key installed
 explicitly before deployment/restart. Their existing `.env` is not overwritten.
@@ -80,12 +100,18 @@ hostname lives in code). Two parties check it, each what it knows:
 
 Anything else is dropped, not an error.
 
-`GET /api/auth/me` adds `dashboard_url` **only** to a managed owner/organizer
-session. `authRequired` is unchanged and carries no claim; `/api/auth/me`
-verifies the Bearer token again (signature, binding, active participant, current
-local organizer role) and reads the URL from that verified claim. Members,
-direct logins, the agent key and a demoted organizer get no such field, and
-`sanitizeConfig` / `/api/config` are untouched. Trip UIs show an "Organizer
+`GET /api/auth/me` adds `dashboard_url` **only** for an organizer (an active
+participant who is a configured organizer *now*), by whichever way they reached
+the trip. Through the gateway the Bearer token is verified again (signature,
+binding, active participant, current local organizer role) and the URL is read
+from that verified claim. Any other way in (a direct login on the trip's own
+hostname, the installed app) gets the address configured by the sidecar's
+`portalOrigin` and this trip's id. Where both exist and differ, the configured
+one is served: configuration knows the portal's origin and a claim is not trusted
+for it. `authRequired` is unchanged and carries no claim. Members, a demoted
+organizer, the agent key and a trip with no configured `portalOrigin` get no such
+field (a direct login on such a trip gets none), and `sanitizeConfig` /
+`/api/config` are untouched. Trip UIs show an "Organizer
 dashboard / לוח המארגן" menu entry only when it is present and an http(s)
 URL without credentials, and never write it to `localStorage`.
 
@@ -233,11 +259,14 @@ control-plane responses. It covers owner/member permissions, key rejection,
 trip and identity mismatch, invitation conflicts, unchanged Classic passwords,
 both HTML shells, MCP updates through two gateway streams, reconnection,
 logout, portal sign-out ending the trip session, uploaded HTML/SVG staying
-non-executable behind the gateway, `dashboard_url` for owners and never for
-members, direct logins or the agent key, and the form-POST launch. Portal
+non-executable behind the gateway, `dashboard_url` for organizers (through the gateway or by direct
+login) and never for members or the agent key, and the form-POST launch. Portal
 database tests separately cover single-use grant consumption, the session
 check, and invitation retry identity consistency. `tests/control-plane-dashboard-url.test.js`
-covers a non-owner organizer and a demoted one.
+covers a non-owner organizer, a demoted one, the configured address for a direct
+login (present, absent when unset, absent and logged when malformed) and the
+precedence between the claim and the configuration; the worker's sidecar and
+`normalize_portal_origin` are in `control-plane/worker/tests/test_provisioner.py`.
 
 `tests/runtime-logout.test.js` covers shared browser logout, failure behavior and
 the per-trip storage scoping; `control-plane/runtime-gateway/test/gateway.test.js`

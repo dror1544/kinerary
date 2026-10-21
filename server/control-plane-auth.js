@@ -33,6 +33,21 @@ function safeDashboardUrl(value, tripId) {
   return url.href;
 }
 
+// The portal's origin as the control plane's own configuration states it
+// (web.public_origin), written by the worker into the identity sidecar on every
+// provision. An origin and nothing else: https (http only on a loopback host),
+// no credentials, path, query or fragment. Anything else is no origin at all, so
+// a bad value shows no dashboard link rather than a wrong one.
+function safePortalOrigin(value) {
+  if (typeof value !== 'string' || !value || value.length > MAX_DASHBOARD_URL || /[\u0000-\u0020\u007f]/.test(value)) return null;
+  let url;
+  try { url = new URL(value); } catch { return null; }
+  if (url.username || url.password || url.search || url.hash || (url.pathname !== '/' && url.pathname !== '')) return null;
+  if (value.includes('?') || value.includes('#')) return null;
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && isLoopbackHost(url.hostname))) return null;
+  return url.origin;
+}
+
 function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) {
   const key = process.env.CONTROL_PLANE_EXCHANGE_KEY || '';
   let identity;
@@ -48,6 +63,17 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
     role TEXT NOT NULL CHECK(role IN ('owner', 'organizer', 'member')),
     invite_id TEXT UNIQUE
   )`);
+  // Where the organizer dashboard of THIS trip lives, for an organizer who did not come
+  // through the gateway (a direct login on the trip's own hostname, the installed
+  // app). From configuration, never from a request: the sidecar's portalOrigin
+  // plus this trip's own id. Null when either is missing or malformed.
+  const configuredDashboardUrl = identity ? safeDashboardUrl(
+    safePortalOrigin(identity.portalOrigin) ? `${safePortalOrigin(identity.portalOrigin)}/trips/${identity.tripId}/setup` : null,
+    identity.tripId,
+  ) : null;
+  if (identity && identity.portalOrigin !== undefined && identity.portalOrigin !== null && !configuredDashboardUrl) {
+    console.warn('control_plane.portal_origin_invalid: the identity sidecar\'s portalOrigin is not a plain https origin; organizers reaching this trip directly will see no dashboard link');
+  }
   const find = db.prepare('SELECT * FROM control_plane_identities WHERE user_id = ? AND trip_id = ?');
   const localUser = db.prepare('SELECT username FROM users WHERE username = ?');
   const insert = db.prepare('INSERT INTO control_plane_identities(user_id, trip_id, username, role, invite_id) VALUES (?, ?, ?, ?, ?)');
@@ -147,12 +173,26 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
   // Only for a managed session whose claim passed validManagedPayload on this
   // request (so the binding, the participant and the local organizer role were
   // all re-checked just now). A direct login, a member and the agent key have
-  // no claim and get nothing.
+  // no claim and get nothing from THIS function; dashboardUrlForOrganizer adds the
+  // configured address for an organizer who has none.
   function dashboardUrlFor(claim, username) {
     if (!claim || typeof claim !== 'object' || !['owner', 'organizer'].includes(claim.role)) return null;
     if (!roleMatchesLocal(claim.role, username)) return null;
     return safeDashboardUrl(claim.dashboardUrl, identity?.tripId);
   }
-  return { validManagedPayload, dashboardUrlFor };
+  // An organizer on this trip however they got in: through the gateway (the
+  // claim's pinned URL, as above) or directly. The direct case reads no request
+  // input at all: the person must be an active participant and a CURRENT local
+  // organizer, and the URL is the configured one. Members and the agent key
+  // (no username that is an organizer here) get nothing.
+  function dashboardUrlForOrganizer(claim, username) {
+    const managed = dashboardUrlFor(claim, username);
+    // Configuration knows the portal's origin and the gateway's claim need not
+    // be trusted for it: where both exist and differ, configuration wins.
+    if (managed && (!configuredDashboardUrl || managed === configuredDashboardUrl)) return managed;
+    if (!configuredDashboardUrl || !activeUser(username) || !organizers().includes(username)) return null;
+    return configuredDashboardUrl;
+  }
+  return { validManagedPayload, dashboardUrlFor, dashboardUrlForOrganizer };
 }
 module.exports = { createControlPlaneAuth, safeDashboardUrl };
