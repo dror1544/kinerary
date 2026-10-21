@@ -22,6 +22,14 @@
  * either way, which is why they are built first.
  */
 import type pg from "pg";
+
+/**
+ * Anything that can run a query: the pool, or a client inside a transaction.
+ * The organizer readers below take this so a caller already in a transaction
+ * (`redeemGroupBindingToken`) asks on ITS connection - one connection held
+ * while a second is awaited is how a small pool deadlocks itself.
+ */
+export type Queryable = Pick<pg.Pool, "query">;
 import {
   askText,
   coerceLanguage,
@@ -245,7 +253,7 @@ export function companionIntroLoginUsernames(
  * and is not identity.
  */
 export async function resolveTripPerson(
-  db: pg.Pool,
+  db: Queryable,
   tripId: string,
   telegramUserId: string,
 ): Promise<{ username: string; displayName: string | null; role: string } | null> {
@@ -672,7 +680,7 @@ export async function setGroupProactiveLevel(
  * (an 'organizer'-role membership, a revoked or invited owner, a plain member are
  * all "no"), and a person link must say 'organizer'. A failed lookup is "no".
  */
-export async function isTripOrganizer(db: pg.Pool, tripId: string, telegramUserId: string): Promise<boolean> {
+export async function isTripOrganizer(db: Queryable, tripId: string, telegramUserId: string): Promise<boolean> {
   if (!tripId || !telegramUserId) return false;
   if ((await resolveTripPerson(db, tripId, telegramUserId))?.role === "organizer") return true;
   if (!isPrivateChatId(telegramUserId)) return false;

@@ -105,6 +105,17 @@ export class PendingAttachments {
       .map(({ heldAt: _heldAt, ...attachment }) => attachment);
   }
 
+  /**
+   * Forgets every document held in `chatId`, for every sender. Called when the
+   * group is moved to another trip: a file sent while it was the old trip's
+   * must not ride a later message to the new trip's assistant.
+   */
+  clearChat(chatId: string): void {
+    for (const key of [...this.held.keys()]) {
+      if ((JSON.parse(key) as string[])[0] === chatId) this.held.delete(key);
+    }
+  }
+
   /** (chat, sender) pairs currently holding at least one live document. */
   get size(): number {
     this.prune(this.now());

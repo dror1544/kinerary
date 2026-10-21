@@ -689,6 +689,13 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // distinguishable refusal confirms a guess to whoever is guessing.
     switchRefused: "I can't switch to that one. Send /trips to see the ones I have for you.",
     switchInGroup: "I can only switch trips in our private chat — this group stays on its own trip.",
+    // A valid group code posted in a group that belongs to ANOTHER trip, by someone who is not an
+    // organizer of both. One sentence for every way of being refused, so it confirms nothing about
+    // who organizes what.
+    groupMoveNotOrganizer: "This group belongs to another trip. Only its organizer can move it.",
+    // Posted at the top of the new introduction when the group's own organizer moved it to their next trip.
+    groupMovedNotice: "This group now follows {trip}.",
+    groupMovedNoticeUntitled: "the new trip",
     // ── The Mini App's way in (#443) ────────────────────────────────────
     // The message carrying the "Open trip" URL button, in a trip's group (pinned
     // there) or answering /app. It says nothing about passwords or access: the
@@ -928,6 +935,9 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     switchNoCompanion: "האתר מוכן — אני עדיין מסיים את העוזר של הטיול הזה, אז תנו לי רגע לפני שתשאלו אותי עליו.",
     switchRefused: "אני לא יכול לעבור לשם. שלחו ‎/trips‎ כדי לראות את הטיולים שיש לי עבורכם.",
     switchInGroup: "אני יכול להחליף טיול רק בצ׳אט הפרטי בינינו — הקבוצה הזו נשארת על הטיול שלה.",
+    groupMoveNotOrganizer: "הקבוצה הזו שייכת לטיול אחר. רק מי שמארגן אותו יכול להעביר אותה.",
+    groupMovedNotice: "מעכשיו הקבוצה הזו מלווה את {trip}.",
+    groupMovedNoticeUntitled: "הטיול החדש",
     openTripText: "הטיול במרחק לחיצה — לחצו על פתיחת הטיול כדי לראות את התוכנית כאן בטלגרם.",
     openTripButton: "פתיחת הטיול",
     openTripPinFailed: "לא הצלחתי להצמיד את הודעת פתיחת הטיול. כדי שתישאר בראש הקבוצה, הפכו אותי למנהל עם ההרשאה \"הצמדת הודעות\" ושלחו שוב את קוד הקבוצה. הכפתור עובד גם מהמקום שבו הוא נמצא.",

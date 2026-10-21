@@ -1090,7 +1090,8 @@ describe("the companion arriving in a group", { skip: SKIP }, () => {
         const d = await dispatchUpdate(
           fix.pool, startInGroup("-1002000507", issued.token), undefined, undefined, BOT,
         );
-        assert.equal(d.kind === "reply" && d.reply.text, DEFAULT_STRINGS.groupTokenRefused);
+        // Since the group-move rule: a valid code from a non-organizer gets the uniform "belongs to another trip" answer.
+        assert.equal(d.kind === "reply" && d.reply.text, uiString("groupMoveNotOrganizer", "en"));
         assert.deepEqual((await bindingsFor(fix, "-1002000507")).map((r) => r.trip_id), [otherTrip]);
       });
     });

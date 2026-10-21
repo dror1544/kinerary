@@ -774,12 +774,26 @@ export async function dispatchUpdate(
       : ({ ok: false, reason: "WRONG_SENDER" } as const);
     if (!redeemed.ok) {
       log(structuredLog("info", "trip_bot.group_binding_refused", { reason: redeemed.reason }));
-      // Deliberately one message for every refusal. Distinguishing "that token
+      // A valid code, from its own holder, in a group that belongs to another trip: the sender
+      // does not organize both. Said in the GROUP's language (the chat is still bound to the
+      // trip it belongs to), one sentence for every way of failing the check.
+      if (redeemed.reason === "GROUP_MOVE_NOT_ORGANIZER") {
+        const language = await resolveChatLanguage(db, chatId, message.from?.language_code);
+        return { kind: "reply", reply: { chatId, text: uiString("groupMoveNotOrganizer", language) } };
+      }
+      // Deliberately one message for every other refusal. Distinguishing "that token
       // does not exist" from "that token is not yours" would confirm a guess to
       // whoever is guessing, in a room the organizer does not control.
       return { kind: "reply", reply: { chatId, text: strings.groupTokenRefused } };
     }
     log(structuredLog("info", "trip_bot.group_bound", { rebound: redeemed.rebound }));
+    if (redeemed.movedFromTripId) {
+      // In-memory, chat-keyed state belongs to the trip the group WAS: forget it, so the old
+      // trip's overheard messages and held documents never reach the new trip's companion.
+      options.groupContext?.clear(chatId);
+      options.pendingAttachments?.clearChat(chatId);
+      log(structuredLog("info", "trip_bot.group_moved", { from_trip_id: redeemed.movedFromTripId, to_trip_id: redeemed.tripId }));
+    }
     const facts = await companionIntroFacts(db, redeemed.tripId);
     const assistantName = typeof facts?.assistant_name === "string" ? facts.assistant_name : null;
     if (!facts || !assistantName) {
@@ -790,11 +804,21 @@ export async function dispatchUpdate(
     // message; a re-bind to another trip therefore posts that trip's button, and
     // the poller replaces one of ours pinned earlier.
     const boundOpenTrip = openTripFor(redeemed.tripId, facts.language === "he" ? "he" : "en", options, botIdentity, log);
+    // A group carried over from another trip says so first, in the NEW trip's language: the
+    // people in it were talking to a different trip's assistant a moment ago.
+    const movedNotice = redeemed.movedFromTripId
+      ? `${uiString("groupMovedNotice", facts.language === "he" ? "he" : "en").replace(
+          "{trip}",
+          typeof facts.trip_title === "string" && facts.trip_title.trim()
+            ? facts.trip_title.trim()
+            : uiString("groupMovedNoticeUntitled", facts.language === "he" ? "he" : "en"),
+        )}\n\n`
+      : "";
     return {
       kind: "group_intro",
       chatId,
       ...(boundOpenTrip ? { openTrip: boundOpenTrip } : {}),
-      text: groupIntroText(
+      text: movedNotice + groupIntroText(
         {
           assistantName,
           tripTitle: typeof facts.trip_title === "string" ? facts.trip_title : null,
