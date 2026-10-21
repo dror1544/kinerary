@@ -189,13 +189,20 @@ class TheModelNeverHoldsAGitHubToken(unittest.TestCase):
         self.assertNotIn("npm install", _step_block(text, "Assess"))
         self.assertIn("uses: actions/setup-node@", text, "Node is pinned")
 
-    def test_git_is_allowed_only_by_read_only_subcommands(self):
-        allowed = re.search(r'--allowedTools "([^"]+)"', _step_block(_workflow_text(), "Assess")).group(1).split(",")
-        self.assertNotIn("Bash(git:*)", allowed)
-        for tool in allowed:
-            with self.subTest(tool=tool):
-                self.assertFalse(
-                    re.match(r"Bash\(git (fetch|push|pull|clone|ls-remote|remote|submodule|config)", tool), tool)
+    def test_the_model_has_no_shell_at_all(self):
+        # A positive allow-list, not a deny-list: in -p mode Bash(...) prefixes
+        # were measured not to bound what runs (assessment of 2026-10-21).
+        block = _step_block(_workflow_text(), "Assess")
+        allowed = set(re.search(r'--allowedTools "([^"]+)"', block).group(1).split(","))
+        self.assertLessEqual(allowed, {"Read", "Grep", "Glob", "Write"})
+        disallowed = set(re.search(r'--disallowedTools "([^"]+)"', block).group(1).split(","))
+        self.assertIn("Bash", disallowed)
+        self.assertIn("WebFetch", disallowed)
+
+    def test_the_git_facts_are_written_before_the_model_runs(self):
+        ctx = _step_block(_workflow_text(), "Collect context")
+        self.assertIn(".assessment-context/commits.txt", ctx)
+        self.assertIn(".assessment-context/diff-stat.txt", ctx)
 
     def test_assess_is_given_no_github_credential(self):
         block = _step_block(_workflow_text(), "Assess")
@@ -211,14 +218,6 @@ class TheModelNeverHoldsAGitHubToken(unittest.TestCase):
         start = text.index("uses: actions/checkout@")
         nxt = re.compile(r"^      - ", re.M).search(text, start)
         self.assertRegex(text[start:nxt.start()], r"persist-credentials:\s*false")
-
-    def test_the_tool_allowlist_never_widens_to_bare_bash(self):
-        block = _step_block(_workflow_text(), "Assess")
-        allowed = re.search(r'--allowedTools "([^"]+)"', block).group(1).split(",")
-        self.assertNotIn("Bash", allowed)
-        for tool in allowed:
-            with self.subTest(tool=tool):
-                self.assertFalse(re.match(r"Bash\((curl|wget|gh|nc|ssh)", tool), tool)
 
 
 if __name__ == "__main__":

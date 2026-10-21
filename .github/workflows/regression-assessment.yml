@@ -212,6 +212,10 @@ jobs:
             # and the file list plus the tree is enough to reason from.
             gh pr diff "$NUMBER" | head -c 400000 > .assessment-context/diff.patch
             git fetch --no-tags origin "$BASE_REF":refs/remotes/origin/"$BASE_REF" || true
+            # The model has no shell, so the git facts it would run git for are
+            # written here, before it starts.
+            git log --oneline "origin/$BASE_REF..HEAD" > .assessment-context/commits.txt 2>/dev/null || true
+            git diff --stat "origin/$BASE_REF...HEAD" > .assessment-context/diff-stat.txt 2>/dev/null || true
           else
             gh issue view "$NUMBER" \
               --json number,title,body,author,labels,comments \
@@ -272,10 +276,13 @@ jobs:
               - `number`          — the PR or issue number
               - `pull-request.json` / `issue.json` — its metadata and body
               - `changed-files.txt`, `diff.patch` — the change, on a PR only
+              - `commits.txt`, `diff-stat.txt` — `git log --oneline` and
+                `git diff --stat` against the base, on a PR only
 
-            You have **no GitHub credentials**, and the tool allowlist below
-            gives you no way to reach the network — no `curl`, no `wget`, no
-            `gh`. That is deliberate, not an oversight to work around. Do not
+            You have **no GitHub credentials and no shell**: your tools are
+            Read, Grep, Glob and Write. Where your instructions say to run
+            `git log` or `git diff`, read the files above instead. That is
+            deliberate, not an oversight to work around. Do not
             try to reach the production VM, its database, or any deploy host
             either; none of them are reachable from here. Read the checked-out
             repository and those files, and nothing else.
@@ -295,15 +302,17 @@ jobs:
           set -euo pipefail
           [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || unset CLAUDE_CODE_OAUTH_TOKEN
           [ -n "$ANTHROPIC_API_KEY" ] || unset ANTHROPIC_API_KEY
-          # The allow-list is what makes "no network" true. In -p mode any tool
-          # outside it is refused, not asked about. Never widen it to bare Bash,
-          # and git only by its read-only subcommands: `git fetch/push/ls-remote
-          # <url>` would reach the network (the context was fetched before this
-          # step, so the model needs none of them).
+          # NO SHELL. This step's environment holds the model credential and the
+          # model reads text written by strangers. The assessment of 2026-10-21
+          # measured that in -p mode an allow-list of Bash(...) prefixes is NOT
+          # a hard boundary: commands outside it (echo, git config) ran. So Bash
+          # is disallowed outright, and the git facts the model needs are files
+          # written by "Collect context". Never add Bash back.
           claude -p "$PROMPT" \
             --model claude-opus-5 \
             --max-turns 40 \
-            --allowedTools "Read,Grep,Glob,Write,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(git ls-files:*),Bash(git rev-parse:*),Bash(git merge-base:*),Bash(git blame:*),Bash(git grep:*),Bash(git branch:*),Bash(git cat-file:*),Bash(ls:*),Bash(cat:*),Bash(sed:*),Bash(grep:*),Bash(rg:*),Bash(find:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(jq:*)"
+            --allowedTools "Read,Grep,Glob,Write" \
+            --disallowedTools "Bash,WebFetch,WebSearch,Task,NotebookEdit"
 
       # ── Post it. No model runs in this step. ──────────────────────────────
       - name: Post the assessment
