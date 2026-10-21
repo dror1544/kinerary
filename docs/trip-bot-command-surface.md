@@ -385,8 +385,10 @@ verified Telegram id worth no more than the links someone proved earlier:
   chat's trip *selects*, membership *grants*; a trip the person cannot open is refused
   exactly like one that does not exist;
 - links are **visible to their owner, revocable, and announced** (§3);
-- the session is the ordinary web session (7 days), and a verified launch replaces any
-  session already in the WebView.
+- the session lasts 7 days like any web session but is **scoped** to the trips that Telegram account
+  is linked to (everything else of the account needs a password or Google sign-in, enforced in
+  `requireUser`; `telegram-mini-app.md`), and a verified launch replaces any session already in the
+  WebView.
 
 §3's enrollment-time identity row is what makes this possible for organizers; members, who
 have no such row, are linked the first time they sign in with their trip password inside the

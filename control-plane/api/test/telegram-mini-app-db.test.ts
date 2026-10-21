@@ -9,6 +9,7 @@ import { digestTelegramId } from "../src/identity.js";
 import { applyMigrations } from "../src/migrations.js";
 import { dispatchPendingTripNotifications } from "../src/outbox-dispatcher.js";
 import { sha256, type PortalDependencies } from "../src/portal.js";
+import { scopedSessionDigest } from "../src/portal-scope.js";
 import { MINI_APP_SESSIONS_PER_LAUNCH } from "../src/telegram-mini-app.js";
 import { TEST_BOT_TOKEN, launchFields, signedInitData } from "./support/mini-app-init-data.js";
 import { testDatabaseUrl, testPool } from "./support/test-database.js";
@@ -166,7 +167,10 @@ test("a linked organizer lands on the chat's trip with a session identical to a 
     assert.match(setCookie.find((c) => c.startsWith("kit_csrf="))!, /Max-Age=3600/);
     assert.doesNotMatch(setCookie.find((c) => c.startsWith("kit_csrf="))!, /HttpOnly/);
 
-    const row = await pool.query("SELECT user_id, telegram_link_id, expires_at - created_at AS ttl FROM control_plane.web_sessions WHERE token_digest = $1", [sha256(cookieOf(response, "kit_session")!)]);
+    // Stored under the SCOPED digest: no older release can match it (rollback fails closed).
+    const cookieValue = cookieOf(response, "kit_session")!;
+    assert.equal((await pool.query("SELECT 1 FROM control_plane.web_sessions WHERE token_digest = $1", [sha256(cookieValue)])).rowCount, 0);
+    const row = await pool.query("SELECT user_id, telegram_link_id, expires_at - created_at AS ttl FROM control_plane.web_sessions WHERE token_digest = $1", [scopedSessionDigest(cookieValue)]);
     assert.equal(row.rows[0].user_id, user);
     assert.equal(row.rows[0].telegram_link_id, linkId);
 

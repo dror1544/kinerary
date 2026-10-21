@@ -3,6 +3,11 @@ import { z } from "zod";
 export type Me = {
   id: string;
   displayName: string;
+  /**
+   * "telegram": signed in through a Telegram link, so this session sees only the trips that Telegram
+   * account is linked to; the full dashboard needs a password or Google sign-in. Absent = full.
+   */
+  scope?: "telegram" | "full";
 };
 
 export type InviteSummary = {
@@ -77,6 +82,7 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
       ENROLLMENT_NOT_REPLACEABLE: "This link changed or was already used. Check the trip status before continuing.",
       ENROLLMENT_BUSY: "Trip setup is changing. Please try again.",
       RATE_LIMITED: "Too many requests. Please wait a minute and try again.",
+      ACCOUNT_SIGN_IN_REQUIRED: "Sign in with your password to do this.",
       ORIGIN_INVALID: "Please sign in from the Kinerary website.",
       TELEGRAM_NOT_LINKED: "This Telegram account is not linked yet.",
     };
@@ -120,7 +126,7 @@ const memberTripSchema = z.object({
   ...trip, tripType: "other", lifecycleState: "ready_private", nextAction: trip.runtimeReady ? "open_trip" : "view_status",
   interview: null, provisioning: null,
 }));
-const meSchema: z.ZodType<Me> = z.object({ id: z.string(), displayName: z.string() });
+const meSchema: z.ZodType<Me> = z.object({ id: z.string(), displayName: z.string(), scope: z.enum(["telegram", "full"]).optional() });
 
 export function signIn(returnTo: string) {
   window.location.assign(`/v1/auth/google/start?return_to=${encodeURIComponent(returnTo)}`);
@@ -192,7 +198,7 @@ export const getTrips = () => api<unknown>("/v1/trips").then((value) => z.object
 export const getTrip = (id: string) => api<unknown>(`/v1/trips/${encodeURIComponent(id)}`).then((value) => tripSchema.parse(value));
 
 export const getAuthCapabilities = () => api<unknown>("/v1/auth/capabilities").then(value => z.object({ google: z.boolean(), emailPassword: z.boolean(), telegramMiniApp: z.boolean().optional() }).parse(value));
-export const emailPasswordSignIn = (input: { email: string; password: string; returnTo: string }) => api<{ appPath: string }>("/v1/auth/email-password", { method: "POST", body: JSON.stringify(input) });
+export const emailPasswordSignIn = (input: { email: string; password: string; returnTo: string; embedded?: true }) => api<{ appPath: string }>("/v1/auth/email-password", { method: "POST", body: JSON.stringify(input) });
 export function safeReturnTo(value: string | null): string {
   if (!value?.startsWith("/") || value.startsWith("//") || value.includes("\\")) return "/trips";
   try { const url = new URL(value, "https://portal.invalid"); return url.origin === "https://portal.invalid" ? `${url.pathname}${url.search}${url.hash}` : "/trips"; } catch { return "/trips"; }

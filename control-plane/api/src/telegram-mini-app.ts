@@ -677,6 +677,15 @@ export async function unlinkTelegramLink(db: pg.Pool, userId: string, linkId: st
       if (!row) { await client.query("ROLLBACK"); return false; }
       await retireAccountWideLink(client, userId, row.telegram_subject_digest);
       await closeChatHold(client, userId, row.telegram_subject_digest, row.trip_id);
+      // The bot's own organizer fact for this sender on this trip (migration 0051's person link,
+      // written at provisioning from whoever ran the interview) is demoted too: an Unlink must take
+      // the organizer powers the link gave, not only the Mini App (boundary review R1).
+      await client.query(
+        `UPDATE control_plane.trip_person_links SET role = 'participant'
+          WHERE trip_id = $2 AND role = 'organizer' AND telegram_user_id ~ '^[0-9]{1,20}$'
+            AND ${CHAT_DIGEST_SQL("telegram_user_id")} = $1`,
+        [row.telegram_subject_digest, row.trip_id],
+      );
     }
     await client.query(
       "UPDATE control_plane.web_sessions SET revoked_at = now() WHERE telegram_link_id = $1 AND revoked_at IS NULL",

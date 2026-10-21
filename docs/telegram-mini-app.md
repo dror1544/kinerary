@@ -106,13 +106,52 @@ its session on reload through a `sessionStorage` marker tied to a digest of the
 
 ### Session
 
-`createWebSession` + `setWebSessionCookies`, unchanged: same scope, same TTL
-(`web.session_ttl_seconds`, 7 days by default) as an email or Google sign-in. Any
-`kit_session` already in the WebView is **revoked** when a verified launch mints a session
-or ends in choose / NOT_LINKED (a shared device must not stay signed in as the previous
-person). A session minted through a link records `web_sessions.telegram_link_id`, so
-unlinking ends it. *Not covered here:* the trip site's own gateway cookie is not revoked by
-this (the runtime-gateway lane owns that).
+`createWebSession` + `setWebSessionCookies`: the same TTL (`web.session_ttl_seconds`, 7 days by default)
+as an email or Google sign-in, **but not the same scope** (below). Any `kit_session` already in the WebView
+is **revoked** when a verified launch mints a session or ends in choose / NOT_LINKED (a shared device must
+not stay signed in as the previous person). A session minted through a link records
+`web_sessions.telegram_link_id`, so unlinking ends it. *Not covered here:* the trip site's own gateway
+cookie is not revoked by this (the runtime-gateway lane owns that).
+
+### A Telegram session is scoped to the trips its Telegram account is linked to (owner decision, 2026-10-21)
+
+A link proves a Telegram account, not a person at a keyboard, and a forwarded interview link makes a link for
+someone who is not the organizer. So the session a Mini App sign-in mints sees and acts on **only the trips
+that Telegram account is linked to for that user** (every live organizer-trip link and member link with the
+same Telegram account and the same user as the link that minted it — derived from the link rows on every
+request, so a new link widens it and an Unlink narrows it on the next call). The full dashboard — the account's
+other trips, planning a new trip, anything account-level — needs a **password or Google sign-in**
+(`/sign-in`, which a scoped session is not redirected away from). A trip-password sign-in inside the Mini App
+is a password credential and mints a normal session.
+
+Enforced in **one place**, `requireUser` (portal.ts), which every authenticated portal route goes through
+(`requireMutation` calls it), by `scopeDecision` (`portal-scope.ts`) against `PORTAL_SCOPE_POLICY`:
+
+| Policy | Routes | A scoped session gets |
+|---|---|---|
+| `trip` | everything under `/v1/trips/:id/…` and `GET /v1/trips/:id` (interview-link, telegram-link, provisioning, plans, site-invites, members, launch) | its linked trip: as an organizer's/member's session does. Any other trip id, a nonexistent one included: the **same 404** `{"error":"NOT_FOUND"}` |
+| `filtered` | `GET /v1/trips` | only the linked trips (filter in the SQL) |
+| `link` | `DELETE /v1/account/telegram-links/:linkId` | may end a link of a trip in scope (which ends the session); another trip's link is the same 404 |
+| `account` | `POST /v1/trips`, `POST /v1/site-invites/redeem` | `403 {"error":"ACCOUNT_SIGN_IN_REQUIRED","message":"Sign in with your password to do this."}` |
+| `session` | `GET /v1/me` (reports `scope: "telegram"`), `POST /v1/logout` | allowed |
+| `open` | sign-in routes, invite inspection, internal runtime routes | not session routes; a route marked `open` that asks for a user is refused |
+
+**Fail closed.** A route with no row in the table makes the app **refuse to boot**
+(`assertEveryRouteIsClassified`), and a scoped session on anything but an explicit allowance is refused. A
+scope that cannot be read — a link id that is unknown, revoked, malformed, of the older account-wide shape,
+or missing — is the empty scope: no trip, no account action, still reported as scoped. `/launch` is a trip route,
+so the gateway handoff downstream of it only ever receives a trip in scope.
+
+**Rollback fails closed.** A scoped session's row is stored under `sha256("telegram-scope:" + cookie)`,
+not `sha256(cookie)`. This release looks up either; every older release looks up only the second, finds
+nothing and answers 401, so a downgrade cannot turn a Telegram session into a full one (the person launches
+again). A cookie that begins with the prefix is looked up under neither. Sessions the earlier build of this
+feature minted (plain digest, `telegram_link_id` set, Mac staging only) are recognised as scoped by the link id.
+No migration: the scope is derived from rows that already exist.
+
+Held by `control-plane/api/test/portal-scope-db.test.ts` (the route sweep over `PORTAL_SCOPE_POLICY`, the
+source-vs-table check, live widening/narrowing, fail-closed scopes, rollback lookup) and
+`web/src/pages/ScopedSession.test.tsx`.
 
 ## Safeguards the owner asked for (2026-10-20)
 
@@ -161,7 +200,15 @@ this (the runtime-gateway lane owns that).
   `telegram_organizer_link_revocations` (and ends the sessions it minted): after a rollback the older readers
   see none of the pair's trips — an Unlink can cost bot access until a relink, and can never leave behind
   access the owner took away. A membership that ends also revokes the trip's organizer links (trigger, so the
-  link does not revive if the person is added back). Member links are flagged `revoked_at` and also end —
+  link does not revive if the person is added back). **An Unlink also takes the bot's organizer powers**
+  (boundary review R1, 2026-10-21): `trip_person_links` (migration 0051) says "this Telegram sender is the
+  organizer" and is written at provisioning from whichever account ran the interview — a forwardee's, if the
+  link was forwarded — and `isTripOrganizer` trusts it, so it used to survive an Unlink (`/proactive`, and
+  any organizer-only command). The Unlink demotes that row to `participant` (the name stays), the
+  membership-end trigger does the same (migration `20261022120000`), and `resolveTripPerson` reads an
+  `organizer` row as `participant` whenever that Telegram account has a revoked link to the trip and no live
+  one — so a re-provision, which upserts the role back, cannot undo it; a relink from the dashboard lifts it.
+  Member links are flagged `revoked_at` and also end —
   with their sessions — when the trip password changes, when the membership ends, or when the invite is
   revoked. These are database triggers (migrations `20261020120000`, `20261021120000`), not route code,
   because none of the events has a single writer.

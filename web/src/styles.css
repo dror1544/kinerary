@@ -614,3 +614,6 @@ h1 { margin: 0; max-width: 700px; font: 800 clamp(48px, 5.1vw, 78px)/1.01 "Manro
 .plan-facts dd { margin: 0; font-size: 13px; }
 .plan-digest { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
 .button-row { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+
+.scope-banner { margin: 15px auto; max-width: 1180px; }
+.scope-banner a { text-decoration: underline; font-weight: 700; }

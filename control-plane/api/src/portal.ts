@@ -15,6 +15,10 @@ import {
   type TelegramMiniAppConfig,
 } from "./telegram-mini-app.js";
 import { issueTelegramLinkToken } from "./telegram-link-token.js";
+import {
+  ACCOUNT_SIGN_IN_REQUIRED, assertEveryRouteIsClassified, loadSessionScope, scopeDecision, scopedSessionDigest, sessionDigests,
+  type SessionScope,
+} from "./portal-scope.js";
 import { verifyMiniAppInitData, type VerifiedInitData } from "./telegram-webapp-auth.js";
 
 function opaque(prefix: string, bytes = 16): string {
@@ -222,6 +226,13 @@ interface PortalUser {
   googleSubjectDigest: string | null;
   sessionDigest: string;
   sessionCreatedAt: Date;
+  /**
+   * NULL for a full (password / Google) session. For a session a Telegram link
+   * minted, the trips that Telegram account is linked to - possibly none. See
+   * portal-scope.ts: `requireUser` enforces it, so a handler sees only a user
+   * the route is allowed for.
+   */
+  scope: SessionScope | null;
 }
 
 async function portalUser(request: FastifyRequest, deps: PortalDependencies): Promise<PortalUser | null> {
@@ -229,23 +240,33 @@ async function portalUser(request: FastifyRequest, deps: PortalDependencies): Pr
   if (!raw) return null;
   const result = await deps.db.query<{
     id: string; display_name: string; provider_subject_digest: string | null; session_digest: string; session_created_at: Date;
+    telegram_link_id: string | null;
   }>(
-    `SELECT u.id, u.display_name, ui.provider_subject_digest, s.token_digest AS session_digest, s.created_at AS session_created_at
+    `SELECT u.id, u.display_name, ui.provider_subject_digest, s.token_digest AS session_digest, s.created_at AS session_created_at,
+            s.telegram_link_id
      FROM control_plane.web_sessions s
      JOIN control_plane.users u ON u.id = s.user_id AND u.status = 'active'
      LEFT JOIN control_plane.user_identities ui ON ui.user_id = u.id AND ui.provider = 'google'
-     WHERE s.token_digest = $1 AND s.revoked_at IS NULL AND s.expires_at > now()`,
-    [sha256(raw)],
+     WHERE s.token_digest = ANY($1::text[]) AND s.revoked_at IS NULL AND s.expires_at > now()`,
+    [sessionDigests(raw)],
   );
   const row = result.rows[0];
   if (!row) return null;
-  void deps.db.query("UPDATE control_plane.web_sessions SET last_seen_at = now() WHERE token_digest = $1", [sha256(raw)]).catch(() => {});
+  void deps.db.query("UPDATE control_plane.web_sessions SET last_seen_at = now() WHERE token_digest = $1", [row.session_digest]).catch(() => {});
+  // Scoped when EITHER signal says so: a Telegram link minted it, or it is stored under the scoped digest.
+  // A scoped session whose scope cannot be read has the empty scope, not a full one.
+  const scoped = row.telegram_link_id !== null || row.session_digest === scopedSessionDigest(raw);
+  let scope: SessionScope | null = null;
+  if (scoped) {
+    scope = await loadSessionScope(deps.db, { userId: row.id, telegramLinkId: row.telegram_link_id }).catch(() => ({ tripIds: new Set<string>() }));
+  }
   return {
     id: row.id,
     displayName: row.display_name,
     googleSubjectDigest: row.provider_subject_digest,
     sessionDigest: row.session_digest,
     sessionCreatedAt: row.session_created_at,
+    scope,
   };
 }
 
@@ -253,11 +274,13 @@ async function createWebSession(client: pg.PoolClient, userId: string, ttlSecond
   const sessionToken = base64url(32);
   const csrf = base64url(24);
   // `telegramLinkId` is set only for a session a Telegram link minted, so that
-  // unlinking (or the link ending any other way) can end that session too.
+  // unlinking (or the link ending any other way) can end that session too. Such
+  // a session is SCOPED (portal-scope.ts) and is stored under the scoped digest,
+  // which no older release can match: a rollback cannot widen it.
   await client.query(
     `INSERT INTO control_plane.web_sessions(id, user_id, token_digest, csrf_digest, expires_at, telegram_link_id)
      VALUES ($1, $2, $3, $4, now() + ($5 * interval '1 second'), $6)`,
-    [opaque("wsess"), userId, sha256(sessionToken), sha256(csrf), ttlSeconds, telegramLinkId],
+    [opaque("wsess"), userId, telegramLinkId ? scopedSessionDigest(sessionToken) : sha256(sessionToken), sha256(csrf), ttlSeconds, telegramLinkId],
   );
   return { sessionToken, csrf };
 }
@@ -327,7 +350,16 @@ async function recordFunnelEvent(
 
 async function requireUser(request: FastifyRequest, reply: FastifyReply, deps: PortalDependencies): Promise<PortalUser | null> {
   const user = await portalUser(request, deps);
-  if (!user) reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+  if (!user) { reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" }); return null; }
+  // THE one place a Telegram-minted session is held to its scope (portal-scope.ts).
+  if (user.scope) {
+    const decision = await scopeDecision(deps.db, {
+      routeKey: `${request.method} ${request.routeOptions.url ?? ""}`,
+      params: (request.params && typeof request.params === "object" ? request.params : {}) as Record<string, unknown>,
+      scope: user.scope,
+    });
+    if (!decision.allow) { reply.code(decision.status).send(decision.body); return null; }
+  }
   return user;
 }
 
@@ -341,8 +373,8 @@ async function requireMutation(request: FastifyRequest, reply: FastifyReply, dep
     return null;
   }
   const session = await deps.db.query<{ csrf_digest: string }>(
-    "SELECT csrf_digest FROM control_plane.web_sessions WHERE token_digest = $1 AND revoked_at IS NULL AND expires_at > now()",
-    [sha256(cookies.kit_session ?? "")],
+    "SELECT csrf_digest FROM control_plane.web_sessions WHERE token_digest = ANY($1::text[]) AND revoked_at IS NULL AND expires_at > now()",
+    [sessionDigests(cookies.kit_session ?? "")],
   );
   if (!session.rows[0] || !safeEqual(session.rows[0].csrf_digest, sha256(csrfHeader))) {
     reply.code(403).send({ error: "CSRF_INVALID" });
@@ -499,6 +531,23 @@ async function memberTripSummary(deps: PortalDependencies, tripId: string, userI
 }
 
 export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependencies): void {
+  // Every route registered below must have a scope policy (portal-scope.ts), or
+  // the app does not boot: a route that forgot would fail only for a Telegram
+  // session, which is exactly the session nobody tests by hand.
+  const registered: string[] = [];
+  let collecting = true;
+  app.addHook("onRoute", (route) => {
+    if (!collecting) return;
+    for (const method of ([] as string[]).concat(route.method)) {
+      if (method !== "HEAD" && method !== "OPTIONS") registered.push(`${method} ${route.url}`);
+    }
+  });
+  registerPortalRouteHandlers(app, deps);
+  collecting = false;
+  assertEveryRouteIsClassified(registered);
+}
+
+function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependencies): void {
   app.post("/v1/events", async (request, reply) => {
     const event = (request.body as Record<string, unknown>)?.event;
     if (event !== "landing_cta") return reply.code(400).send({ error: "INVALID_REQUEST" });
@@ -561,7 +610,7 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
       if (!user.rows[0]) { await client.query("ROLLBACK"); return reply.code(401).send({ error: "INVALID_CREDENTIALS" }); }
       const session = await createWebSession(client, user.rows[0].id, deps.sessionTtlSeconds);
       await client.query("COMMIT");
-      setWebSessionCookies(reply, deps, session);
+      setWebSessionCookies(reply, deps, session, { embedded: embeddedRequest(body) });
       return { appPath: validatedReturnTo(body.returnTo) };
     } catch (error) { await client.query("ROLLBACK"); throw error; }
     finally { client.release(); }
@@ -625,7 +674,7 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
     const revokeIncoming = async (client: pg.PoolClient) => {
       // A verified launch replaces whatever session this WebView already held:
       // on a shared device the previous person must not stay signed in behind it.
-      if (incoming) await client.query("UPDATE control_plane.web_sessions SET revoked_at = now() WHERE token_digest = $1 AND revoked_at IS NULL", [sha256(incoming)]);
+      if (incoming) await client.query("UPDATE control_plane.web_sessions SET revoked_at = now() WHERE token_digest = ANY($1::text[]) AND revoked_at IS NULL", [sessionDigests(incoming)]);
     };
     const client = await deps.db.connect();
     try {
@@ -825,14 +874,15 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
   app.get("/v1/me", async (request, reply) => {
     const user = await requireUser(request, reply, deps);
     if (!user) return;
-    return { id: user.id, displayName: user.displayName };
+    // `scope: "telegram"` tells the page this session sees only the trips its Telegram account is linked to.
+    return { id: user.id, displayName: user.displayName, scope: user.scope ? "telegram" : "full" };
   });
 
   app.post("/v1/logout", async (request, reply) => {
     const user = await requireMutation(request, reply, deps);
     if (!user) return;
     const raw = parseCookies(request.headers.cookie).kit_session;
-    await deps.db.query("UPDATE control_plane.web_sessions SET revoked_at = now() WHERE token_digest = $1", [sha256(raw ?? "")]);
+    await deps.db.query("UPDATE control_plane.web_sessions SET revoked_at = now() WHERE token_digest = ANY($1::text[])", [sessionDigests(raw ?? "")]);
     clearWebSessionCookies(reply, deps);
     return { ok: true };
   });
@@ -843,7 +893,13 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
     const rows = await deps.db.query<{ id: string; dashboard_access: boolean }>(
       // A member's trips are the ones they can open (runtime access), the same
       // list the Mini App shows; an organizer's also include the trips they run.
-      "SELECT trip_id AS id, dashboard_access FROM control_plane.trip_memberships WHERE user_id = $1 AND status = 'active' AND (dashboard_access = true OR runtime_access = true) ORDER BY created_at DESC", [user.id]);
+      // A Telegram-minted session sees only the trips its Telegram account is
+      // linked to (portal-scope.ts): the filter is in the query, not after it.
+      `SELECT trip_id AS id, dashboard_access FROM control_plane.trip_memberships
+        WHERE user_id = $1 AND status = 'active' AND (dashboard_access = true OR runtime_access = true)
+          AND ($2::text[] IS NULL OR trip_id = ANY($2::text[]))
+        ORDER BY created_at DESC`,
+      [user.id, user.scope ? [...user.scope.tripIds] : null]);
     // Full detail only where the caller runs the trip; a runtime-only member gets the summary.
     return { trips: (await Promise.all(rows.rows.map((row) => row.dashboard_access ? tripDetail(deps, row.id, user.id) : memberTripSummary(deps, row.id, user.id)))).filter(Boolean) };
   });
@@ -1149,6 +1205,9 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
     const method = body.method;
     if (typeof token !== "string" || (method !== "google" && method !== "password")) return reply.code(400).send({ error: "INVALID_REQUEST" });
     let signedIn = await portalUser(request, deps);
+    // Joining a trip adds a membership to the signed-in ACCOUNT: account level,
+    // so not from a session a Telegram link minted (portal-scope.ts).
+    if (signedIn?.scope) return reply.code(ACCOUNT_SIGN_IN_REQUIRED.status).send(ACCOUNT_SIGN_IN_REQUIRED.body);
     const password = method === "password" && typeof body.password === "string" ? body.password : undefined;
     if (method === "password" && (!password || password.length < 8 || password.length > 128)) return reply.code(400).send({ error: "PASSWORD_INVALID" });
     if (method === "google") {

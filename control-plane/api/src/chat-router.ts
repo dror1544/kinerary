@@ -243,6 +243,17 @@ export function companionIntroLoginUsernames(
  * senders nobody has ever bound. The caller must degrade to the Telegram
  * display name rather than guessing, because that name is set by the sender
  * and is not identity.
+ *
+ * AN UNLINK OVERRIDES THE ORGANIZER ROLE (boundary review R1, 2026-10-21). The
+ * person link is written at provisioning from whichever Telegram account ran
+ * the interview - a forwardee, if the interview link was forwarded - and nothing
+ * but the Telegram link knows that account was later shut out. So an
+ * 'organizer' row is read as 'participant' when this sender's Telegram account
+ * has a REVOKED link to this trip and no live one. The row is demoted when the
+ * link is revoked (telegram-mini-app.ts, and the membership-end trigger), but a
+ * re-provision upserts the role back to 'organizer'; deciding it here as well
+ * means the order of events cannot matter. A live link (a relink from the
+ * dashboard) lifts the override. The person's name is untouched.
  */
 export async function resolveTripPerson(
   db: pg.Pool,
@@ -250,16 +261,23 @@ export async function resolveTripPerson(
   telegramUserId: string,
 ): Promise<{ username: string; displayName: string | null; role: string } | null> {
   if (!tripId || !telegramUserId) return null;
+  const digest = isPrivateChatId(telegramUserId) ? digestTelegramId(telegramUserId) : null;
   const { rows } = await db.query<{
     participant_username: string;
     display_name: string | null;
     role: string;
   }>(
-    `SELECT participant_username, display_name, role
-       FROM control_plane.trip_person_links
-      WHERE trip_id = $1 AND telegram_user_id = $2
+    `SELECT p.participant_username, p.display_name,
+            CASE WHEN p.role = 'organizer' AND $3::text IS NOT NULL
+                      AND EXISTS (SELECT 1 FROM control_plane.telegram_organizer_trip_links r
+                                   WHERE r.trip_id = p.trip_id AND r.telegram_subject_digest = $3 AND r.revoked_at IS NOT NULL)
+                      AND NOT EXISTS (SELECT 1 FROM control_plane.telegram_organizer_trip_links l
+                                       WHERE l.trip_id = p.trip_id AND l.telegram_subject_digest = $3 AND l.revoked_at IS NULL)
+                 THEN 'participant' ELSE p.role END AS role
+       FROM control_plane.trip_person_links p
+      WHERE p.trip_id = $1 AND p.telegram_user_id = $2
       LIMIT 1`,
-    [tripId, telegramUserId],
+    [tripId, telegramUserId, digest],
   );
   const row = rows[0];
   return row
