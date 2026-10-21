@@ -259,7 +259,8 @@ jobs:
   workflow-guards:
     name: Workflow guards
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # The hook suites take ~3 minutes locally (2026-10-21); a hang bound, not a target.
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
         with:
@@ -268,3 +269,10 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m unittest -v tests.scripts.test_regression_assessment_workflow tests.scripts.test_regression_assessment_scope
+      # The commit/deploy hooks (rules 1 and 2) and their codex adapter: bash,
+      # git, jq and ps only, no services. Their tests make throwaway repos and
+      # commit in them, so git needs an identity on the runner.
+      - run: |
+          git config --global user.email ci@invalid.example
+          git config --global user.name "kinerary ci"
+          python -m unittest -v tests.scripts.test_claude_hooks_bash tests.scripts.test_codex_hook_adapter
