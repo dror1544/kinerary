@@ -138,6 +138,7 @@ function TripSetup() {
   const queryClient = useQueryClient();
   const detail = useQuery({ queryKey: ["trip", tripId], queryFn: () => getTrip(tripId), refetchInterval: 5000 });
   const [linkConflict, setLinkConflict] = useState(false);
+  const scoped = useQuery({ queryKey: ["me"], queryFn: getMe, retry: false }).data?.scope === "telegram";
   const linkState = useQuery({ queryKey: ["interview-link", tripId], queryFn: () => api<InterviewLinkState>(`/v1/trips/${tripId}/interview-link`), enabled: detail.data?.permissions.role === "owner" && (linkConflict || Boolean(detail.data?.interview)), retry: false });
   const refreshLinkState = () => { setLinkConflict(true); void queryClient.invalidateQueries({ queryKey: ["interview-link", tripId] }); void queryClient.invalidateQueries({ queryKey: ["trip", tripId] }); };
   const interview = useMutation({ mutationFn: () => api<{ deepLink: string }>(`/v1/trips/${tripId}/interview-link`, { method: "POST" }), onError: error => {
@@ -150,7 +151,7 @@ function TripSetup() {
   const trip = detail.data;
   const alreadyStarted = Boolean(trip.interview) || Boolean(linkState.data?.hasInterview) || trip.lifecycleState !== "draft";
   const currentLink = replaceLink.data || interview.data;
-  const interviewAction = trip.permissions.role !== "owner" ? null : alreadyStarted ? <>
+  const interviewAction = trip.permissions.role !== "owner" ? null : scoped ? <p>Signed in with Telegram: to prepare or replace an interview link, sign in with your password.</p> : alreadyStarted ? <>
     <p>Continue your interview in your existing Telegram chat. Your answers stay in that conversation.</p>
     {linkState.data && <a className="button button-small" href={linkState.data.telegramChatUrl} target="_blank" rel="noopener noreferrer">Continue in Telegram</a>}
   </> : currentLink ? <a className="button button-small" href={currentLink.deepLink} target="_blank" rel="noopener noreferrer">Open Telegram interview</a> : linkConflict && linkState.isPending ? <p>Checking the existing interview link…</p> : linkState.data?.recoverable ? <>

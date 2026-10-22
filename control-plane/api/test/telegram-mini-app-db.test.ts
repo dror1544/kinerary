@@ -381,7 +381,8 @@ test("a member linked in phase 2 is scoped to the one trip, and members' My trip
     const session = asCookie(response);
     // A member session is a member session: no owner routes.
     assert.equal((await app.inject({ method: "GET", url: `/v1/trips/${t}`, headers: { cookie: session } })).statusCode, 404);
-    assert.equal((await app.inject({ method: "POST", url: `/v1/trips/${t}/interview-link`, headers: { cookie: session, "x-csrf-token": cookieOf(response, "kit_csrf")! } })).statusCode, 404);
+    assert.equal((await app.inject({ method: "POST", url: `/v1/trips/${t}/interview-link`, headers: { cookie: session, "x-csrf-token": cookieOf(response, "kit_csrf")! } })).statusCode, 403,
+      "a Telegram-minted session may not mint an interview link at all (account level, M1); the owner-only 404 is the password session's");
     const listed = await app.inject({ method: "GET", url: "/v1/trips", headers: { cookie: session } });
     assert.ok(listed.json().trips.some((x: { id: string }) => x.id === t));
   } finally { await app.close(); }

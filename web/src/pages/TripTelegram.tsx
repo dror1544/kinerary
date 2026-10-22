@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { issueTelegramLink, unlinkTelegramLink, type TripSummary } from "../api";
+import { useQuery } from "@tanstack/react-query";
+import { getMe, issueTelegramLink, unlinkTelegramLink, type TripSummary } from "../api";
 import { formatDay, formatTime } from "./dates";
 
 const HOW = {
@@ -30,7 +31,10 @@ const HOW = {
 export function TripTelegram({ trip }: { trip: TripSummary }) {
   const queryClient = useQueryClient();
   const links = trip.telegram?.links ?? [];
-  const canLink = trip.permissions.dashboard && ["owner", "organizer"].includes(trip.permissions.role);
+  const organizerSide = trip.permissions.dashboard && ["owner", "organizer"].includes(trip.permissions.role);
+  // A session a Telegram link minted cannot mint another way in: the server answers 403, so it is not offered.
+  const scoped = useQuery({ queryKey: ["me"], queryFn: getMe, retry: false }).data?.scope === "telegram";
+  const canLink = organizerSide && !scoped;
   const [open, setOpen] = useState(false);
   const [confirming, setConfirming] = useState<string | null>(null);
   const refresh = () => Promise.all([
@@ -42,7 +46,7 @@ export function TripTelegram({ trip }: { trip: TripSummary }) {
     mutationFn: unlinkTelegramLink,
     onSuccess: async () => { setConfirming(null); setOpen(false); link.reset(); await refresh(); },
   });
-  if (!canLink && links.length === 0) return null;
+  if (!organizerSide && links.length === 0) return null;
   const linked = links.length > 0;
   const state = linked ? "linked" : "not linked";
   return (
@@ -61,6 +65,7 @@ export function TripTelegram({ trip }: { trip: TripSummary }) {
       {open && (
         <div className="telegram-menu" role="menu" aria-label={`Telegram for ${trip.title}`}>
           <p className="subtle telegram-state">{linked ? `${links.length === 1 ? "A Telegram account is" : `${links.length} Telegram accounts are`} linked to this trip.` : "No Telegram account is linked to this trip."}</p>
+          {organizerSide && scoped && <small>Signed in with Telegram: to link another Telegram account, sign in with your password.</small>}
           {canLink && !link.data && (
             <button type="button" role="menuitem" className="text-button" onClick={() => link.mutate()} disabled={link.isPending}>
               {link.isPending ? "Preparing link…" : linked ? "Link another Telegram" : "Link Telegram"}

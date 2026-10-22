@@ -1014,3 +1014,87 @@ describe("an unlink takes the bot's organizer powers too (DB)", { skip: SKIP }, 
     assert.equal(await isTripOrganizer(pool, tripId, OTHER_CHAT), false);
   });
 });
+
+/**
+ * Review S2: a relink must give back what an Unlink took. The co-organizer is the
+ * case that matters - the owner path of `isTripOrganizer` does not cover them, so
+ * the demoted person link is their ONLY organizer fact in the bot.
+ */
+describe("a relink restores the bot's organizer fact an unlink demoted (DB)", { skip: SKIP }, () => {
+  async function coOrganizerTrip(pool: pg.Pool) {
+    await pool.query("TRUNCATE control_plane.users, control_plane.trips CASCADE");
+    const owner = testId("user"), co = testId("user"), tripId = testId("trip");
+    for (const [u, n] of [[owner, "Owner"], [co, "Co-organizer"]] as const) await pool.query("INSERT INTO control_plane.users(id, status, display_name) VALUES ($1,'active',$2)", [u, n]);
+    await pool.query("INSERT INTO control_plane.trips(id, slug, lifecycle_state, title) VALUES ($1,'rome-s2','ready_private','Rome')", [tripId]);
+    await pool.query("INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status, dashboard_access) VALUES ($1,$2,$3,'owner','active',true)", [testId("memb"), tripId, owner]);
+    await pool.query("INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status, dashboard_access) VALUES ($1,$2,$3,'organizer','active',true)", [testId("memb"), tripId, co]);
+    return { owner, co, tripId };
+  }
+  const person = (pool: pg.Pool, tripId: string, chat: string, role = "organizer") => pool.query(
+    `INSERT INTO control_plane.trip_person_links(id, trip_id, telegram_user_id, participant_username, display_name, role, verified_via)
+     VALUES ($1,$2,$3,'dana','Dana',$4,'interview_chat')`, [testId("tpl"), tripId, chat, role]);
+  const link = async (pool: pg.Pool, userId: string, tripId: string, chat: string) => {
+    const client = await pool.connect();
+    try { await linkTelegramOrganizerInTx(client, chat, userId, tripId); } finally { client.release(); }
+    return (await pool.query<{ id: string }>(
+      "SELECT id FROM control_plane.telegram_organizer_trip_links WHERE user_id = $1 AND trip_id = $2 AND telegram_subject_digest = $3 AND revoked_at IS NULL",
+      [userId, tripId, digestTelegramId(chat)])).rows[0]!.id;
+  };
+  const roleOf = async (pool: pg.Pool, tripId: string, chat: string) =>
+    (await pool.query<{ role: string }>("SELECT role FROM control_plane.trip_person_links WHERE trip_id = $1 AND telegram_user_id = $2", [tripId, chat])).rows[0]?.role;
+
+  test("a co-organizer who is unlinked and relinked regains isTripOrganizer and linkRole=organizer", async () => {
+    const pool = await migratedPool();
+    const { co, tripId } = await coOrganizerTrip(pool);
+    const { resolveTripPerson } = await import("../src/chat-router.js");
+    const { issueTelegramLinkToken, redeemTelegramLinkToken } = await import("../src/telegram-link-token.js");
+    await person(pool, tripId, OTHER_CHAT);
+    const linkId = await link(pool, co, tripId, OTHER_CHAT);
+    assert.equal(await isTripOrganizer(pool, tripId, OTHER_CHAT), true);
+
+    await unlinkTelegramLink(pool, co, linkId);
+    assert.equal(await isTripOrganizer(pool, tripId, OTHER_CHAT), false);
+    assert.equal((await resolveTripPerson(pool, tripId, OTHER_CHAT))?.role, "participant");
+
+    const issued = await issueTelegramLinkToken(pool, { userId: co, tripId });
+    assert.ok(issued.ok);
+    const redeemed = await redeemTelegramLinkToken(pool, issued.ok ? issued.token : "", OTHER_CHAT);
+    assert.equal(redeemed.ok, true);
+    assert.equal(await roleOf(pool, tripId, OTHER_CHAT), "organizer", "the stored fact is restored");
+    assert.equal(await isTripOrganizer(pool, tripId, OTHER_CHAT), true);
+    assert.equal((await resolveTripPerson(pool, tripId, OTHER_CHAT))?.role, "organizer", "linkRole is organizer again");
+  });
+
+  test("a relink promotes only a row an unlink demoted: a person who was a participant all along stays one", async () => {
+    const pool = await migratedPool();
+    const { co, tripId } = await coOrganizerTrip(pool);
+    const { issueTelegramLinkToken, redeemTelegramLinkToken } = await import("../src/telegram-link-token.js");
+    await person(pool, tripId, OTHER_CHAT, "participant");        // never an organizer, never unlinked
+    const issued = await issueTelegramLinkToken(pool, { userId: co, tripId });
+    assert.equal((await redeemTelegramLinkToken(pool, issued.ok ? issued.token : "", OTHER_CHAT)).ok, true);
+    assert.equal(await roleOf(pool, tripId, OTHER_CHAT), "participant");
+  });
+
+  test("a relink whose issuer no longer runs the trip restores nothing", async () => {
+    const pool = await migratedPool();
+    const { co, tripId } = await coOrganizerTrip(pool);
+    const { issueTelegramLinkToken, redeemTelegramLinkToken } = await import("../src/telegram-link-token.js");
+    await person(pool, tripId, OTHER_CHAT);
+    await unlinkTelegramLink(pool, co, await link(pool, co, tripId, OTHER_CHAT));
+    const issued = await issueTelegramLinkToken(pool, { userId: co, tripId });
+    await pool.query("UPDATE control_plane.trip_memberships SET status = 'revoked' WHERE trip_id = $1 AND user_id = $2", [tripId, co]);
+    assert.equal((await redeemTelegramLinkToken(pool, issued.ok ? issued.token : "", OTHER_CHAT)).ok, false);
+    assert.equal(await roleOf(pool, tripId, OTHER_CHAT), "participant");
+  });
+
+  test("an Unlink does not demote while another user's live link of the same Telegram account still stands on the trip (the trigger's guard)", async () => {
+    const pool = await migratedPool();
+    const { owner, co, tripId } = await coOrganizerTrip(pool);
+    await person(pool, tripId, OTHER_CHAT);
+    const coLink = await link(pool, co, tripId, OTHER_CHAT);
+    await link(pool, owner, tripId, OTHER_CHAT);                   // the same Telegram account is also linked as the owner
+    await unlinkTelegramLink(pool, co, coLink);
+    assert.equal(await roleOf(pool, tripId, OTHER_CHAT), "organizer");
+    assert.equal(await isTripOrganizer(pool, tripId, OTHER_CHAT), true);
+  });
+});

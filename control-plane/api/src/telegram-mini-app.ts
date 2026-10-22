@@ -683,7 +683,12 @@ export async function unlinkTelegramLink(db: pg.Pool, userId: string, linkId: st
       await client.query(
         `UPDATE control_plane.trip_person_links SET role = 'participant'
           WHERE trip_id = $2 AND role = 'organizer' AND telegram_user_id ~ '^[0-9]{1,20}$'
-            AND ${CHAT_DIGEST_SQL("telegram_user_id")} = $1`,
+            AND ${CHAT_DIGEST_SQL("telegram_user_id")} = $1
+            -- the same guard as the membership-end trigger: another user's live link of this
+            -- Telegram account to this trip still stands, so the account is still an organizer there
+            AND NOT EXISTS (
+              SELECT 1 FROM control_plane.telegram_organizer_trip_links l
+               WHERE l.trip_id = $2 AND l.telegram_subject_digest = $1 AND l.revoked_at IS NULL)`,
         [row.telegram_subject_digest, row.trip_id],
       );
     }

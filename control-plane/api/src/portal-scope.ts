@@ -94,10 +94,13 @@ export const PORTAL_SCOPE_POLICY: Readonly<Record<string, RouteScope>> = Object.
   "DELETE /v1/account/telegram-links/:linkId": "link",
 
   "GET /v1/trips/:id": "trip",
-  "POST /v1/trips/:id/interview-link": "trip",
   "GET /v1/trips/:id/interview-link": "trip",
-  "POST /v1/trips/:id/interview-link/replace": "trip",
-  "POST /v1/trips/:id/telegram-link": "trip",
+  // These three MINT a way into the account: an interview link or a Telegram link redeemed by
+  // another Telegram account becomes a link of its own, one that outlives the Unlink of the
+  // session's own account (boundary review round 2, M1). They need a password or Google sign-in.
+  "POST /v1/trips/:id/interview-link": "account",
+  "POST /v1/trips/:id/interview-link/replace": "account",
+  "POST /v1/trips/:id/telegram-link": "account",
   "POST /v1/trips/:id/provisioning-request": "trip",
   "POST /v1/trips/:id/plans/:planId/approve": "trip",
   "POST /v1/trips/:id/plans/:planId/reject": "trip",
@@ -118,6 +121,11 @@ export function assertEveryRouteIsClassified(routes: readonly string[]): void {
 export interface SessionScope {
   /** Trips a Telegram-minted session may open. Empty is a valid, fail-closed answer. */
   tripIds: ReadonlySet<string>;
+  /**
+   * The Telegram account (digest) that minted the session. A scoped session may end only that
+   * account's own links, never another account's - the owner's included (review S1). Null when unknown.
+   */
+  telegramDigest: string | null;
 }
 
 /**
@@ -129,10 +137,10 @@ export async function loadSessionScope(
   db: pg.Pool,
   input: { userId: string; telegramLinkId: string | null },
 ): Promise<SessionScope> {
-  const empty: SessionScope = { tripIds: new Set() };
+  const empty: SessionScope = { tripIds: new Set(), telegramDigest: null };
   const linkId = input.telegramLinkId;
   if (!linkId || !/^(otl|tml)_[A-Za-z0-9]{8,64}$/.test(linkId)) return empty;
-  const result = await db.query<{ trip_id: string }>(
+  const result = await db.query<{ trip_id: string; minting_digest: string }>(
     `WITH minting AS (
        SELECT user_id, telegram_subject_digest FROM control_plane.telegram_organizer_trip_links
         WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
@@ -140,16 +148,16 @@ export async function loadSessionScope(
        SELECT user_id, telegram_subject_digest FROM control_plane.telegram_member_links
         WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
      )
-     SELECT l.trip_id FROM control_plane.telegram_organizer_trip_links l
+     SELECT l.trip_id, m.telegram_subject_digest AS minting_digest FROM control_plane.telegram_organizer_trip_links l
        JOIN minting m ON m.user_id = l.user_id AND m.telegram_subject_digest = l.telegram_subject_digest
       WHERE l.revoked_at IS NULL
      UNION
-     SELECT l.trip_id FROM control_plane.telegram_member_links l
+     SELECT l.trip_id, m.telegram_subject_digest FROM control_plane.telegram_member_links l
        JOIN minting m ON m.user_id = l.user_id AND m.telegram_subject_digest = l.telegram_subject_digest
       WHERE l.revoked_at IS NULL`,
     [linkId, input.userId],
   );
-  return { tripIds: new Set(result.rows.map((row) => row.trip_id)) };
+  return { tripIds: new Set(result.rows.map((row) => row.trip_id)), telegramDigest: result.rows[0]?.minting_digest ?? null };
 }
 
 export type ScopeDecision =
@@ -184,14 +192,17 @@ export async function scopeDecision(
     case "link": {
       const linkId = input.params.linkId;
       if (typeof linkId !== "string" || !/^(otl|tml)_[A-Za-z0-9]{8,64}$/.test(linkId)) return NOT_FOUND;
-      const row = await db.query<{ trip_id: string }>(
-        `SELECT trip_id FROM control_plane.telegram_organizer_trip_links WHERE id = $1 AND revoked_at IS NULL
+      const row = await db.query<{ trip_id: string; telegram_subject_digest: string }>(
+        `SELECT trip_id, telegram_subject_digest FROM control_plane.telegram_organizer_trip_links WHERE id = $1 AND revoked_at IS NULL
          UNION ALL
-         SELECT trip_id FROM control_plane.telegram_member_links WHERE id = $1 AND revoked_at IS NULL`,
+         SELECT trip_id, telegram_subject_digest FROM control_plane.telegram_member_links WHERE id = $1 AND revoked_at IS NULL`,
         [linkId],
       );
-      const tripId = row.rows[0]?.trip_id;
-      return tripId && input.scope.tripIds.has(tripId) ? { allow: true } : NOT_FOUND;
+      const found = row.rows[0];
+      // Only the session's OWN Telegram account's links: another account's link on an in-scope trip - the
+      // owner's phone, say - is not this session's to end, and looks like no link at all.
+      const mine = Boolean(found) && input.scope.telegramDigest !== null && found!.telegram_subject_digest === input.scope.telegramDigest;
+      return found && mine && input.scope.tripIds.has(found.trip_id) ? { allow: true } : NOT_FOUND;
     }
     // "account", "open" (a route that asks for a user but declared it does not),
     // and anything unclassified: refuse.

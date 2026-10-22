@@ -129,12 +129,14 @@ Enforced in **one place**, `requireUser` (portal.ts), which every authenticated 
 
 | Policy | Routes | A scoped session gets |
 |---|---|---|
-| `trip` | everything under `/v1/trips/:id/…` and `GET /v1/trips/:id` (interview-link, telegram-link, provisioning, plans, site-invites, members, launch) | its linked trip: as an organizer's/member's session does. Any other trip id, a nonexistent one included: the **same 404** `{"error":"NOT_FOUND"}` |
+| `trip` | `GET /v1/trips/:id` and the rest of `/v1/trips/:id/…` except the three link-minting routes below (interview-link status, provisioning, plans, site-invites, members, launch) | its linked trip: as an organizer's/member's session does. Any other trip id, a nonexistent one included: the **same 404** `{"error":"NOT_FOUND"}` |
 | `filtered` | `GET /v1/trips` | only the linked trips (filter in the SQL) |
-| `link` | `DELETE /v1/account/telegram-links/:linkId` | may end a link of a trip in scope (which ends the session); another trip's link is the same 404 |
-| `account` | `POST /v1/trips`, `POST /v1/site-invites/redeem` | `403 {"error":"ACCOUNT_SIGN_IN_REQUIRED","message":"Sign in with your password to do this."}` |
+| `link` | `DELETE /v1/account/telegram-links/:linkId` | may end only a link of **its own Telegram account** on a trip in scope (which ends the session). Another trip's link, and another account's link on an in-scope trip (the owner's phone), are the same 404 as an unknown id |
+| `account` | `POST /v1/trips`, `POST /v1/site-invites/redeem`, and the three routes that **mint a way into the account**: `POST /v1/trips/:id/telegram-link`, `POST /v1/trips/:id/interview-link`, `POST /v1/trips/:id/interview-link/replace` (boundary review M1: a link a scoped session minted and a second Telegram account redeemed would outlive the Unlink of the session's own account) | `403 {"error":"ACCOUNT_SIGN_IN_REQUIRED","message":"Sign in with your password to do this."}` |
 | `session` | `GET /v1/me` (reports `scope: "telegram"`), `POST /v1/logout` | allowed |
 | `open` | sign-in routes, invite inspection, internal runtime routes | not session routes; a route marked `open` that asks for a user is refused |
+
+**Order of checks on a mutation:** authenticated → Origin → CSRF → scope, so a foreign id and an unknown one get the same status. A present `Origin` that is not `web.public_origin` (including `null`) is refused with `403 ORIGIN_INVALID` on every `requireMutation` route and on a `POST /v1/site-invites/redeem` that rides a cookie session — a second wall behind the CSRF token now that the Mini App cookie can be `SameSite=None`; a missing `Origin` keeps CSRF-token-only behaviour.
 
 **Fail closed.** A route with no row in the table makes the app **refuse to boot**
 (`assertEveryRouteIsClassified`), and a scoped session on anything but an explicit allowance is refused. A
@@ -207,7 +209,7 @@ source-vs-table check, live widening/narrowing, fail-closed scopes, rollback loo
   any organizer-only command). The Unlink demotes that row to `participant` (the name stays), the
   membership-end trigger does the same (migration `20261022120000`), and `resolveTripPerson` reads an
   `organizer` row as `participant` whenever that Telegram account has a revoked link to the trip and no live
-  one — so a re-provision, which upserts the role back, cannot undo it; a relink from the dashboard lifts it.
+  one — so a re-provision, which upserts the role back, cannot undo it. A relink from the dashboard restores the stored role (only a row that an unlink or a membership end demoted, only when the issuer is still an owner/organizer of the trip), and the Unlink demotion has the same "no other live link of this Telegram account to the trip" guard as the trigger.
   Member links are flagged `revoked_at` and also end —
   with their sessions — when the trip password changes, when the membership ends, or when the invite is
   revoked. These are database triggers (migrations `20261020120000`, `20261021120000`), not route code,

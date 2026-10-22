@@ -258,7 +258,7 @@ async function portalUser(request: FastifyRequest, deps: PortalDependencies): Pr
   const scoped = row.telegram_link_id !== null || row.session_digest === scopedSessionDigest(raw);
   let scope: SessionScope | null = null;
   if (scoped) {
-    scope = await loadSessionScope(deps.db, { userId: row.id, telegramLinkId: row.telegram_link_id }).catch(() => ({ tripIds: new Set<string>() }));
+    scope = await loadSessionScope(deps.db, { userId: row.id, telegramLinkId: row.telegram_link_id }).catch(() => ({ tripIds: new Set<string>(), telegramDigest: null }));
   }
   return {
     id: row.id,
@@ -348,24 +348,55 @@ async function recordFunnelEvent(
   );
 }
 
-async function requireUser(request: FastifyRequest, reply: FastifyReply, deps: PortalDependencies): Promise<PortalUser | null> {
+async function authenticate(request: FastifyRequest, reply: FastifyReply, deps: PortalDependencies): Promise<PortalUser | null> {
   const user = await portalUser(request, deps);
   if (!user) { reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" }); return null; }
-  // THE one place a Telegram-minted session is held to its scope (portal-scope.ts).
-  if (user.scope) {
-    const decision = await scopeDecision(deps.db, {
-      routeKey: `${request.method} ${request.routeOptions.url ?? ""}`,
-      params: (request.params && typeof request.params === "object" ? request.params : {}) as Record<string, unknown>,
-      scope: user.scope,
-    });
-    if (!decision.allow) { reply.code(decision.status).send(decision.body); return null; }
-  }
   return user;
 }
 
-async function requireMutation(request: FastifyRequest, reply: FastifyReply, deps: PortalDependencies): Promise<PortalUser | null> {
-  const user = await requireUser(request, reply, deps);
+/**
+ * THE one place a Telegram-minted session is held to its scope (portal-scope.ts).
+ * For a mutation it runs AFTER the Origin and CSRF checks, so a request that
+ * would be refused for those reasons gets the same status whatever id it names:
+ * a foreign link id and an unknown one cannot be told apart by the status.
+ */
+async function enforceScope(request: FastifyRequest, reply: FastifyReply, deps: PortalDependencies, user: PortalUser): Promise<boolean> {
+  if (!user.scope) return true;
+  const decision = await scopeDecision(deps.db, {
+    routeKey: `${request.method} ${request.routeOptions.url ?? ""}`,
+    params: (request.params && typeof request.params === "object" ? request.params : {}) as Record<string, unknown>,
+    scope: user.scope,
+  });
+  if (!decision.allow) { reply.code(decision.status).send(decision.body); return false; }
+  return true;
+}
+
+async function requireUser(request: FastifyRequest, reply: FastifyReply, deps: PortalDependencies): Promise<PortalUser | null> {
+  const user = await authenticate(request, reply, deps);
   if (!user) return null;
+  return (await enforceScope(request, reply, deps, user)) ? user : null;
+}
+
+/**
+ * A state-changing request carries the session cookie, a CSRF header that matches it
+ * AND - when the browser says where it came from - our own origin. A present Origin
+ * that is not `web.public_origin` (including the literal "null") is refused: with the
+ * Telegram Web cookie variant (SameSite=None) the cookie is no longer held back by
+ * SameSite, so this is a second wall behind the CSRF token. A MISSING Origin keeps
+ * today's behaviour (CSRF token only): non-browser clients and older browsers do not send it.
+ */
+function originRefused(request: FastifyRequest, deps: PortalDependencies): boolean {
+  const origin = request.headers.origin;
+  return origin !== undefined && origin !== deps.publicOrigin;
+}
+
+async function requireMutation(request: FastifyRequest, reply: FastifyReply, deps: PortalDependencies): Promise<PortalUser | null> {
+  const user = await authenticate(request, reply, deps);
+  if (!user) return null;
+  if (originRefused(request, deps)) {
+    reply.code(403).send({ error: "ORIGIN_INVALID" });
+    return null;
+  }
   const cookies = parseCookies(request.headers.cookie);
   const csrfHeader = request.headers["x-csrf-token"];
   if (typeof csrfHeader !== "string" || !cookies.kit_csrf || !safeEqual(csrfHeader, cookies.kit_csrf)) {
@@ -380,7 +411,7 @@ async function requireMutation(request: FastifyRequest, reply: FastifyReply, dep
     reply.code(403).send({ error: "CSRF_INVALID" });
     return null;
   }
-  return user;
+  return (await enforceScope(request, reply, deps, user)) ? user : null;
 }
 
 /**
@@ -1205,6 +1236,8 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     const method = body.method;
     if (typeof token !== "string" || (method !== "google" && method !== "password")) return reply.code(400).send({ error: "INVALID_REQUEST" });
     let signedIn = await portalUser(request, deps);
+    // Riding a cookie session is a state change on that account: it needs our origin when the browser sends one.
+    if (signedIn && originRefused(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
     // Joining a trip adds a membership to the signed-in ACCOUNT: account level,
     // so not from a session a Telegram link minted (portal-scope.ts).
     if (signedIn?.scope) return reply.code(ACCOUNT_SIGN_IN_REQUIRED.status).send(ACCOUNT_SIGN_IN_REQUIRED.body);

@@ -195,6 +195,17 @@ export async function redeemTelegramLinkToken(
         [linkId, token.user_id, token.trip_id, digest],
       );
     }
+    // A relink restores the bot's organizer fact an Unlink demoted (trip_person_links, migration 0051):
+    // only a row that is 'participant' BECAUSE of a revoked link of this Telegram account to this trip
+    // (an Unlink or a membership end - never a row that was a participant to begin with), and only
+    // because the issuer, checked above, is still an owner or organizer of the trip.
+    await client.query(
+      `UPDATE control_plane.trip_person_links p SET role = 'organizer'
+        WHERE p.trip_id = $1 AND p.telegram_user_id = $2 AND p.role = 'participant'
+          AND EXISTS (SELECT 1 FROM control_plane.telegram_organizer_trip_links r
+                       WHERE r.trip_id = $1 AND r.telegram_subject_digest = $3 AND r.revoked_at IS NOT NULL)`,
+      [token.trip_id, telegramUserId, digest],
+    );
     await client.query(
       "UPDATE control_plane.telegram_link_tokens SET state = 'consumed', consumed_at = now(), consumed_link_id = $2 WHERE id = $1",
       [token.id, linkId],

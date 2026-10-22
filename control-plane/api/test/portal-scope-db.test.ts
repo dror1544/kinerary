@@ -169,7 +169,10 @@ test("SWEEP: every route, aimed at a trip the Telegram session is not linked to,
         swept.push(key);
       }
     }
-    assert.ok(swept.length >= 14, `swept ${swept.length} routes: ${swept.join(", ")}`);
+    const expectedSweep = Object.values(PORTAL_SCOPE_POLICY).filter((kind) => ["trip", "link", "account"].includes(kind)).length;
+    assert.equal(swept.length, expectedSweep, `swept ${swept.length} of ${expectedSweep} routes: ${swept.join(", ")}`);
+    assert.ok(swept.length >= 15);
+    assert.ok(["POST /v1/trips/:id/telegram-link", "POST /v1/trips/:id/interview-link", "POST /v1/trips/:id/interview-link/replace"].every((k) => swept.includes(k)), "the link-minting routes are account-level");
     // Nothing the sweep did touched Oslo.
     assert.equal((await pool.query("SELECT 1 FROM control_plane.site_invites WHERE trip_id = $1", [oslo])).rowCount, 0);
     assert.equal((await pool.query("SELECT 1 FROM control_plane.telegram_link_tokens WHERE trip_id = $1", [oslo])).rowCount, 0);
@@ -195,8 +198,10 @@ test("a scoped session lists and opens only its linked trips; the full session o
     assert.deepEqual(me.json(), { id: user, displayName: "Olive", scope: "telegram" });
     assert.equal((await call(app, full, "GET", "/v1/me")).json().scope, "full");
 
-    // Acting on the linked trip works as an organizer's session does.
-    assert.equal((await call(app, scoped, "POST", `/v1/trips/${rome}/telegram-link`)).statusCode, 201);
+    // Acting on the linked trip works as an organizer's session does - except minting a way INTO the
+    // account (a Telegram link, an interview link), which needs a password (boundary review M1).
+    assert.equal((await call(app, scoped, "POST", `/v1/trips/${rome}/telegram-link`)).statusCode, 403);
+    assert.equal((await call(app, full, "POST", `/v1/trips/${rome}/telegram-link`)).statusCode, 201);
     assert.equal((await call(app, scoped, "POST", `/v1/trips/${rome}/site-invites`, { displayName: "Guest", runtimeUsername: "guest-one" })).statusCode, 201);
     assert.equal((await call(app, scoped, "GET", `/v1/trips/${rome}/interview-link`)).statusCode, 200);
     assert.equal((await call(app, scoped, "POST", `/v1/trips/${rome}/launch`)).statusCode, 200, "/launch respects the scope for its own trip");
@@ -208,13 +213,94 @@ test("a scoped session lists and opens only its linked trips; the full session o
   } finally { await app.close(); }
 });
 
-test("a scoped session may end its OWN trip's link, which ends the session; it cannot touch another trip's", { skip }, async () => {
+test("a scoped session may end only ITS OWN Telegram account's link; another account's link on the same trip - the owner's phone - is the same 404 as an unknown id", { skip }, async () => {
   const app = newApp();
   try {
-    const { scoped, romeLink, osloLink } = await fixture(app);
+    const { scoped, romeLink, osloLink, user, rome } = await fixture(app);
+    const ownersPhone = await organizerLink(user, rome, tg());     // a DIFFERENT Telegram account, same in-scope trip
+    const unknown = await call(app, scoped, "DELETE", "/v1/account/telegram-links/otl_doesnotexist0000");
+    const foreign = await call(app, scoped, "DELETE", `/v1/account/telegram-links/${ownersPhone}`);
+    assert.equal(foreign.statusCode, 404);
+    assert.equal(foreign.body, unknown.body, "a foreign id and an unknown one look the same");
+    assert.equal((await pool.query("SELECT 1 FROM control_plane.telegram_organizer_trip_links WHERE id = $1 AND revoked_at IS NULL", [ownersPhone])).rowCount, 1, "the owner's link is still live");
     assert.equal((await call(app, scoped, "DELETE", `/v1/account/telegram-links/${osloLink}`)).statusCode, 404);
+    // The scope decision runs AFTER the CSRF check: without the header both are the same 403, whatever id they name.
+    const noCsrf = (id: string) => app.inject({ method: "DELETE", url: `/v1/account/telegram-links/${id}`, headers: { cookie: scoped.cookie, origin: ORIGIN } });
+    const a = await noCsrf(ownersPhone), b = await noCsrf("otl_doesnotexist0000");
+    assert.equal(a.statusCode, 403); assert.equal(a.body, b.body);
+    // Its own: allowed, and it ends the session.
     assert.equal((await call(app, scoped, "DELETE", `/v1/account/telegram-links/${romeLink}`)).statusCode, 200);
     assert.equal((await call(app, scoped, "GET", "/v1/me")).statusCode, 401, "the link's own session ended with it");
+  } finally { await app.close(); }
+});
+
+test("M1 CHAIN: a scoped session cannot mint a Telegram link or an interview link, so it cannot plant a second account that outlives the first one's Unlink", { skip }, async () => {
+  const app = newApp();
+  try {
+    const { scoped, rome, user } = await fixture(app);
+    const tokens = async () => (await pool.query("SELECT 1 FROM control_plane.telegram_link_tokens WHERE trip_id = $1", [rome])).rowCount;
+    const enrollments = async () => (await pool.query("SELECT 1 FROM control_plane.interview_enrollments WHERE trip_id = $1", [rome])).rowCount;
+    for (const [method, url] of [["POST", `/v1/trips/${rome}/telegram-link`], ["POST", `/v1/trips/${rome}/interview-link`], ["POST", `/v1/trips/${rome}/interview-link/replace`]] as const) {
+      const response = await call(app, scoped, method, url, url.endsWith("replace") ? { expectedEnrollmentId: "enrl_abcdefgh" } : undefined);
+      assert.equal(response.statusCode, 403, url);
+      assert.deepEqual(response.json(), { error: "ACCOUNT_SIGN_IN_REQUIRED", message: "Sign in with your password to do this." }, url);
+    }
+    assert.equal(await tokens(), 0, "no link token was created");
+    assert.equal(await enrollments(), 0, "no interview enrollment was created");
+    // The same user with a password session may, as before.
+    const full = await fullSession(user, "m1");
+    assert.equal((await call(app, full, "POST", `/v1/trips/${rome}/telegram-link`)).statusCode, 201);
+    assert.equal(await tokens(), 1);
+  } finally { await app.close(); }
+});
+
+// ── Origin: a second wall behind the CSRF token (review S3) ──────────────────
+
+test("a state-changing request with a present Origin that is not ours is refused; a missing Origin keeps CSRF-token-only behaviour", { skip }, async () => {
+  const app = newApp();
+  try {
+    const { user, rome, full } = await fixture(app);
+    const post = (origin: string | null, session: { cookie: string; csrf: string }) => app.inject({
+      method: "POST", url: `/v1/trips/${rome}/telegram-link`,
+      headers: { cookie: session.cookie, "x-csrf-token": session.csrf, ...(origin !== null ? { origin } : {}) },
+    });
+    assert.equal((await post(ORIGIN, full)).statusCode, 201, "our own origin");
+    assert.equal((await post(null, full)).statusCode, 201, "no Origin header: unchanged");
+    for (const origin of ["https://evil.example", "null", "http://portal.example.test.evil.example", "https://web.telegram.org"]) {
+      const response = await post(origin, full);
+      assert.equal(response.statusCode, 403, origin);
+      assert.deepEqual(response.json(), { error: "ORIGIN_INVALID" }, origin);
+    }
+    // Logout and unlink go through the same wall.
+    const out = await app.inject({ method: "POST", url: "/v1/logout", headers: { cookie: full.cookie, "x-csrf-token": full.csrf, origin: "https://evil.example" } });
+    assert.equal(out.statusCode, 403);
+    assert.equal((await call(app, full, "GET", "/v1/me")).statusCode, 200, "the refused logout did not end the session");
+    // GETs carry no state change and are not Origin-checked.
+    assert.equal((await app.inject({ method: "GET", url: "/v1/me", headers: { cookie: full.cookie, origin: "https://evil.example" } })).statusCode, 200);
+
+    // Redeeming an invite while riding a cookie session is a state change on that account too.
+    const invite = await call(app, full, "POST", `/v1/trips/${rome}/site-invites`, { displayName: "Guest", runtimeUsername: "guest-origin" });
+    assert.equal(invite.statusCode, 201);
+    const token = new URL(invite.json().joinUrl).hash.slice("#token=".length);
+    const redeem = (origin: string | null) => app.inject({
+      method: "POST", url: "/v1/site-invites/redeem",
+      headers: { cookie: full.cookie, "x-csrf-token": full.csrf, "content-type": "application/json", ...(origin !== null ? { origin } : {}) },
+      payload: JSON.stringify({ token, method: "google" }),
+    });
+    // Our own origin and no Origin at all are not refused by the wall (this session has no Google identity, so 401 is what follows).
+    assert.equal((await redeem(ORIGIN)).statusCode, 401);
+    assert.equal((await redeem(null)).statusCode, 401);
+    assert.equal((await redeem("https://evil.example")).statusCode, 403);
+    assert.deepEqual((await redeem("https://evil.example")).json(), { error: "ORIGIN_INVALID" });
+    const byPassword = await app.inject({
+      method: "POST", url: "/v1/site-invites/redeem",
+      headers: { cookie: full.cookie, "content-type": "application/json", origin: "https://evil.example" },
+      payload: JSON.stringify({ token, method: "password", password: "a-long-enough-password" }),
+    });
+    assert.equal(byPassword.statusCode, 403, "the password path riding a cookie session is Origin-checked too");
+    assert.deepEqual(byPassword.json(), { error: "ORIGIN_INVALID" });
+    assert.equal((await pool.query("SELECT state FROM control_plane.site_invites WHERE runtime_username = 'guest-origin' AND trip_id = $1", [rome])).rows[0].state, "unused", "the invite was not consumed");
+    void user;
   } finally { await app.close(); }
 });
 

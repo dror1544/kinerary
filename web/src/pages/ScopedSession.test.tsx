@@ -72,3 +72,20 @@ it("a server refusal of an account-level action is shown in the server's words",
   fireEvent.click(screen.getByRole("button", { name: /Create|Continue|Save/i }));
   expect(await screen.findByText("Sign in with your password to do this.")).toBeInTheDocument();
 });
+
+it("a scoped session is not offered Link on a trip card (the server would refuse it), and is told how to", async () => {
+  const link = { id: "otl_0123456789abcdef", via: "interview_link", linkedAt: "2026-10-03T10:00:00.000Z", firstSignedInAt: null, lastSignedInAt: null };
+  const calls = mount("/trips", { id: "user_1", displayName: "Olive", scope: "telegram" }, (path) =>
+    path === "/v1/trips" ? json({ trips: [{ ...trip, telegram: { links: [link] } }] }) : undefined);
+  fireEvent.click(await screen.findByRole("button", { name: "Telegram options for Rome 2027" }));
+  expect(await screen.findByText(/to link another Telegram account, sign in with your password/)).toBeInTheDocument();
+  expect(screen.queryByRole("menuitem", { name: /Link Telegram|Link another Telegram/ })).toBeNull();
+  expect(screen.getByRole("menuitem", { name: /Unlink Telegram/ })).toBeInTheDocument();
+  expect(calls.some((c) => c.path.endsWith("/telegram-link"))).toBe(false);
+});
+
+it("a full session still gets Link", async () => {
+  mount("/trips", { id: "user_1", displayName: "Olive", scope: "full" });
+  fireEvent.click(await screen.findByRole("button", { name: "Telegram options for Rome 2027" }));
+  expect(await screen.findByRole("menuitem", { name: "Link Telegram" })).toBeInTheDocument();
+});
