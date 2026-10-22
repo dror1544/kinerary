@@ -152,6 +152,18 @@ is its only credential, and losing it made every interpret call `FAILED`.
 ### Checks that actually answer the question
 
 - **API:** `readyz` → `"status":"ready"` with the expected `schema_migrations`.
+- **Telegram Mini App** (only if `web.telegram_bot_token_secret_ref` is set):
+  `readyz` carries `telegram_mini_app: {configured, enabled, has_main_web_app}`.
+  `enabled: true` means `getMe` on that token names the bot the profile says it is.
+  `has_main_web_app: false` is the one-time BotFather step not done yet — the
+  "Open trip" button and `/app` link would open nothing (set it:
+  [Telegram Mini App](telegram-mini-app.md#one-time-setup-the-bots-main-mini-app));
+  `null` means Telegram has not said yet, which is not "no". None of these makes
+  the API not-ready. The boot log carries the same finding as
+  `mini_app.main_web_app_missing`.
+  The **relay** checks the same thing for itself (`relay.trip_app_ready` or
+  `relay.trip_app_not_ready` in its log): the Open trip button, `/app` and its menu entry
+  stay off until it is ready.
 - **Relay:** `$C logs relay` shows `relay.bot_identity` naming the bot you
   expect, `relay.ready … polling:true`, and **no** `409`/`Conflict` — a 409
   means a second `getUpdates` loop exists somewhere on the same token.
@@ -331,6 +343,180 @@ makes the runtime read, with nothing in the repo applying that patch: the
 deployment would have looked correct and quietly dropped every file a family
 sent.
 
+### Which gateways run is the control plane's decision
+
+Issue #349. Nothing used to say which companions are *meant* to be up: each
+gateway started from whatever `hermes -p <profile> gateway start` last recorded,
+so "stopped on purpose" and "broken" looked the same, and a newer Hermes that
+starts named profiles stopped at boot would have made every live trip's
+companion a guess. The worker's **gateway reconciler**
+(`control-plane/worker/control_plane_worker/gateway_reconcile.py`) decides, from
+facts the database already holds, writes the decision to
+`control_plane.companion_gateways` (closed-code columns only, history in
+`companion_gateway_events`), and — only in `enforce` mode — starts and stops
+gateways through the companion forced command. It runs on the provisioner
+worker's idle loop (every 5 minutes, and sooner when an organizer's `/switch`
+opens a private-chat binding or the relay records a lost turn), needs only the
+companion SSH settings (not companion *provisioning*, which stays off on this VM
+outside a test run), and has **no HTTP route**.
+
+**The rule**, in the order `decide()` applies it (the interviewer always runs;
+a retired trip, a `teardown` pin and an operator pin come first):
+
+1. **CURRENT_TRIP** — the trip is the current trip of any of its organizers (an
+   active owner/organizer membership, matched to an open private-chat binding by
+   the same sha256 digest the API uses). Runs, until 14 days after it ends.
+2. **WARM** — it was an organizer's current trip and they switched away less than
+   2 days ago. A `/switch` therefore does not stop the trip it leaves. (Not past
+   14 days after its end: an archived trip is archived even if it was just current.)
+3. **UNDERWAY** — today is between its start and end dates, whatever the
+   organizer is looking at.
+4. **REVIVED** — an organizer opened a private-chat binding to it, or a message
+   reached it while it was off (the relay's `lost_gateway_unavailable` /
+   `lost_companion_unreachable` turn), less than 2 days ago. It runs alongside
+   everything else; a revival never stops another trip.
+5. **ARCHIVED** — more than 14 days past its end. Stopped.
+6. **NOT_CURRENT** — anything else (planned or in its grace but none of the
+   above, or undated and not current). Stopped.
+
+A profile can be named by several trips (a slug freed by teardown can be reused
+with the same profile name): each trip is decided on its own, the profile **runs
+if any of them says run**, and the record keeps which ones justify it
+(`justified_by`). Only if every live trip says stop does it stop.
+
+Nothing automatic is stopped within 6 hours of a conversation (`QUIET_WINDOW`; it
+only holds, it never starts). A start is never debounced; a stop that a date or a
+clock decides (`ARCHIVED`, `NOT_CURRENT`) must be decided on two consecutive
+sweeps. Dates come from the deployed config (`trips.plan_snapshot`) first, then
+`trips.start_date`/`end_date`. Revival depends on the relay recording assistant
+events (`ASSISTANT_EVENTS_ENABLED=1`); the reconciler logs
+`gateway_reconcile.wake_signal_blind` once per process when it has seen none in
+7 days.
+
+**Modes** (`GATEWAY_RECONCILE_MODE`, default `observe`; an unreadable value stops
+the worker at startup rather than falling back):
+
+- `observe` records every decision and every observation and acts on nothing.
+  Ship in this mode first and read the fleet monitor's "COMPANION GATEWAYS"
+  section for a week: `PENDING_STOP` lists what `enforce` would stop,
+  `NOT_CURRENT` lists every trip nobody's chat is on (including a trip whose
+  organizer never linked a Telegram identity, which `enforce` would also stop).
+  Nothing is `DORMANT` in observe mode - see below - and `DORMANT` is never an alert.
+- `enforce` also starts and stops, at most 3 gateways per sweep (a gateway found
+  already stopped gets one `stop` so its stop is on record - a real, idempotent
+  `hermes gateway stop`, which also writes Hermes's own desired state and still
+  stops a gateway whose command line the host could not read), with a backoff
+  after a failed attempt (5, 10, 20, 40, 60 minutes) and the sweep abandoned
+  after 3 host errors in a row. It never restarts a gateway: a start of a running
+  one is `ok` without touching anything. A start can take minutes on the host; if
+  a certain stop (a teardown pin, an operator's off) lands while it is in flight,
+  the sweep stops the gateway at once afterwards instead of waiting for the next
+  sweep.
+- `off` is the sweep not existing.
+
+**Operator** (from the worker container, `--database-url-file` and the
+`PROVISIONER_COMPANION_SSH_*` settings as for the worker):
+
+```bash
+python -m control_plane_worker reconcile-gateways --dry-run                 # what would it start and stop? writes nothing
+python -m control_plane_worker reconcile-gateways --once [--mode enforce]   # one sweep now (observe unless told)
+python -m control_plane_worker reconcile-gateways --pin <profile> off       # on | off | clear — an override, under the lock
+python -m control_plane_worker reconcile-gateways --backfill-markers        # once, before the first enforce
+```
+
+**What the host will and will not do.** The forced command
+(`scripts/companion-install-host.sh`) answers `companion_gateway_status` (read
+only), `companion_gateway_backfill` and `companion_gateway_action` (`start|stop`).
+Every request is read up to 64 KiB (more is refused), a profile name is
+`[a-z0-9][a-z0-9-]{1,62}`, and a `slug` is absent or a string. Status counts only
+this account's processes that are Hermes: the program is `hermes`, or python running
+a script named `hermes` (the shape the VM runs today: `<venv>/bin/python3
+<venv>/bin/hermes -p <profile> gateway run --replace`, uid 10000) or a
+`-m hermes_cli...` module anywhere in its arguments; `-p NAME`, `--profile NAME`
+and `--profile=NAME` all count. Argument text alone does not make a gateway.
+The newer Hermes may run its gateways differently - its command line is unknown
+until the container rehearsal (S4) records it, and a gateway of an unrecognised
+shape reads as stopped (which is why the confirming stop is a real stop). It refuses:
+
+- any profile on `scripts/protected-profiles.txt` - ONE list, read by this script
+  and by `teardown-trip.py` (which adds only the interviewer, which the
+  reconciler manages and never stops). A missing or malformed list refuses
+  everything;
+- any profile without the **provenance marker** (a file named `kinerary-managed`
+  in the profile directory), a profile directory that is a symlink, and a marker
+  that is a symlink. A profile this system did not install may carry somebody's
+  own bot token and is never started or stopped;
+- to stop `trip-intake`; and anything at all on a Mac (launchd is that platform's
+  supervisor; the Mac stays observe-only - the backfill too).
+
+**The evidence cannot be minted by a request.** The bridge request writes
+`companion-provenance.json` only for a profile that already carries the marker
+(a fresh install writes the marker first), so a bridge request naming somebody's
+own profile leaves no record for the backfill to trust.
+
+**The marker means "this system installed it", and only two things write it:** a
+*fresh* install here (never a retried `ALREADY_PRESENT` one - a profile that was
+there before is exactly what it must exclude), and `--backfill-markers`, which
+needs host-side evidence: a trip's `companion-provenance.json` (written when the
+trip's bridge was wired) naming the profile. It is created exclusively and never
+through a symlink. A profile with no such record is `refused`, so a trip whose
+bridge was never wired through this system (no provenance record) is refused until
+it has been, and `trip-intake`, which has no trip, is marked once by hand
+(`echo kinerary-managed > ~/.hermes/profiles/trip-intake/kinerary-managed`).
+
+Before it starts a trip's gateway it checks the `slug` it was given: that trip's
+`companion-provenance.json` must name this profile (else `refused`), and then it
+brings the trip's `trip-mcp` bridge back if it is not answering - a gateway that
+connects first parks the bridge after three failed connects and stays toolless
+for the life of the process - and refuses the start if it cannot. **Run
+`--backfill-markers` once after the first deploy**: until then `enforce` gets
+`refused` for every profile installed before the marker existed, which the fleet
+monitor shows as `BROKEN`.
+
+**One lock.** `pg_advisory_lock(hashtext('control_plane.companion_gateways'))`:
+a sweep holds it to decide and record and to record each result - **not** while
+it waits on the host (a status read can take a minute, an action three), so the
+two-minute waits below are never starved - and re-decides a profile under the
+lock just before acting on it, dropping the action if a pin landed meanwhile; a
+sweep that cannot re-take it within 30 seconds is abandoned.
+`scripts/teardown-trip.py` takes it to pin a trip's gateway OFF (`TEARDOWN`) as
+its first step after the backup — so the reconciler cannot restart a gateway
+between teardown stopping it and the trip being retired - and ends by confirming
+the gateway is down (polling, bounded, stopping it again if it is not) and failing
+loudly if it is still up. **A pin belongs to its
+trip**: it is ignored for any other trip that reuses the profile name, and the
+transaction that retires the trip clears it; `--pin <profile> clear` removes a
+teardown pin whose trip is gone but refuses one in progress. And
+`kinerary-cp-release upgrade`, `rollback` and `restart-bridges` hold it for the
+length of the action. A release that cannot get the lock within two minutes
+refuses; a database that cannot be reached is noted and the release goes on.
+
+**Dormant companions are not waited for - but dormant is what happened, not what
+was decided.** `relay/gateway-wait.ts` (`expectedGatewayProfiles`), the release
+tool's `live_companions()` and the fleet monitor's `DORMANT` skip a companion only
+when its record says `desired = stopped` **and** `last_action = stop` **and**
+`last_result = ok` **and** the host last reported it `stopped` or `absent`: the
+reconciler stopped it and the host confirmed. A decision alone is not enough - in
+`observe` mode the reconciler decides and never acts, and a gateway that is
+running (or crashed later) must stay expected, in `restart-bridges`, in `verify`
+and in the relay's startup wait; the monitor shows it as `PENDING_STOP`, or
+`STRAY` for a torn-down trip. No row, or no table, means expected up. If any of
+the three changes, change all three (a test pins that they agree).
+
+**Mac.** The launchd agent `companion-install-host.sh` writes for a new trip is
+now the supervised kind: restart only on failure (`KeepAlive`/`SuccessfulExit`
+false), `--external-supervisor`, no `--replace`, and **no fallback starter** —
+the detached `gateway run` it used to start when launchd would not take the agent
+from an SSH session was the second starter that made Hermes warn "another
+profile's standalone gateway owns this host". When launchd did not take it the
+install says so and prints the `launchctl bootstrap` line to run from a
+Terminal.
+
+**Not here yet.** Stamping `gateway.standalone: true` on every managed profile,
+the Hermes-upgrade readiness checks in `kinerary-cp-release`, and the container
+rehearsal are the next change. Until that ships, do not move the VM to a Hermes
+that folds named profiles into one process.
+
 ### Files sent on Telegram: the hand-off folder
 
 A companion gets a file someone sent as a **local path**. Hermes saves it with
@@ -482,7 +668,7 @@ plan 2026-09-28 finding 3).
 **What it is.** `control-plane/deployment/monitor-db-role.sql` creates
 `kinerary_fleet_ro`: `LOGIN NOINHERIT`, no other attribute, no memberships,
 connection limit 20, `default_transaction_read_only = on`,
-`statement_timeout = 20s`, and `SELECT` on exactly the 92 columns of the 14
+`statement_timeout = 20s`, and `SELECT` on exactly the 117 columns of the 16
 relations the fleet MCP reads — column-level, so `trips.companion_intro` (each
 site's password), `intake_sessions.answers` and people's names stay unreadable
 (the file's header). It also takes `TEMPORARY` on the database from `PUBLIC`,
@@ -605,6 +791,202 @@ provisioning run (below): LXC, NPM host, DNS record and ingress rule all gone,
 the trip-mcp bridge stopped on its port, and the RPi4's cloudflared config
 byte-identical to before the run.
 
+## Organizer portal and runtime gateway (optional)
+
+Two more services, off unless asked for: **`portal`** (the `web/` single-page app
+behind nginx, with a same-origin `/v1` proxy to the api) and **`runtime-gateway`**
+(`control-plane/runtime-gateway`, the front door that signs a portal member into a
+trip site). Both belong to the compose profile `web`. Without
+`COMPOSE_PROFILES=web` in `vm.env` neither exists, no env variable below is read
+by anything that matters, and `up`, `kinerary-cp-release` and every image are
+exactly what they were — `tests/scripts/test_vm_web_profile.py` renders
+`compose.vm.yml` both ways and fails if switching the profile on changes anything
+but the two services it adds (and the three pass-through variables of the api and
+the one of the worker, which are empty until `vm.env` sets them). Nothing about this deployment lives in the repository: origins, secrets
+and the interface the ingress reaches are all `vm.env`, and the profile file is
+kept in kinerary-deploy.
+
+**Two clocks.** The services, the api's `web` block and the worker's exchange key
+are control-plane changes: they reach every trip at the next restart. A trip *site*
+is different — the exchange key is written into a site's `.env` when the worker
+**builds** it, so a trip built before the key was set cannot be launched from the
+portal until its identity sidecar and key are installed (see
+`docs/runtime-session-exchange.md`, "Existing runtimes need…"). Set the key before
+the trips that should be reachable are built, or install it on the existing ones.
+
+### What to set (`vm.env`; names only — `vm.env.example` has the commented list)
+
+| Name | What |
+|---|---|
+| `COMPOSE_PROFILES` | `web` switches the two services on. The release tool reads it from `provisioning.env`/`vm.env` (later wins), so upgrade, verify and rollback follow it |
+| `KINERARY_ARCHITECTURE_PROFILE` | absolute path of the architecture profile **with** a `web` block. Unset, the stack mounts the repository's `architecture.local.example.json` as before |
+| `PORTAL_ORIGIN`, `RUNTIME_ORIGIN` | the two public `https://` origins, exactly as the profile's `web.public_origin` / `web.runtime_origin` |
+| `RUNTIME_EXCHANGE_KEY` | one secret shared by the api (`env://RUNTIME_EXCHANGE_KEY` in the profile), the gateway and every trip site; the worker is handed it as `CONTROL_PLANE_EXCHANGE_KEY` |
+| `RUNTIME_COOKIE_SECRET` | the gateway's cookie-sealing secret: at least 32 random bytes, independent of every other secret |
+| `WEB_BIND_IP`, `PORTAL_PORT`, `RUNTIME_GATEWAY_PORT` | where the ingress reaches the two services. Loopback (`127.0.0.1`), `4173` and `4320` unless set — the same posture as `CONTROL_PLANE_BIND_IP` for the api |
+| `RUNTIME_PUBLIC_SUFFIXES`, `RUNTIME_SAME_SITE_OK`, `RUNTIME_UPSTREAM_TIMEOUT_MS` | gateway tuning, usually unset (see "Same site" below) |
+| `GOOGLE_WEB_CLIENT_ID`, `GOOGLE_WEB_CLIENT_SECRET` | optional pair, only if the profile's `web` block names them |
+
+These are plain `vm.env` variables like `CONTROL_PLANE_OPERATOR_KEY`, not files
+under `.local-secrets/`: the api and the gateway each read their secret from the
+environment (`env://` in the profile; the gateway has no file option), and a
+compose secret that only exists when the profile is on cannot be attached to the
+api conditionally. `vm.env` is root 0600, like the other keys in it.
+
+### The api's profile
+
+`compose.vm.yml` mounts one architecture profile into the api, `migrate`, the relay
+and `companion-mcp`. To switch the portal on, copy
+`control-plane/deployment/architecture.vm-web.example.json` into kinerary-deploy,
+replace its placeholder origins, `runtime_upstream_host_suffixes` and
+`telegram_bot_username`, and point `KINERARY_ARCHITECTURE_PROFILE` at the copy.
+It is the VM's existing example plus a `web` block, and a test keeps the two from
+drifting. Notes on what you are filling in:
+
+- `web.runtime_upstream_host_suffixes`: the DNS domain the trips' own hostnames live
+  under. A trip's `private_url` is `https://<its hostname>`, and the api refuses a
+  route whose host is not that domain or under it (`RUNTIME_ROUTE_INVALID`). The
+  gateway fetches those hostnames from inside its container, so they must resolve
+  and answer from the VM.
+- Secret references in the `web` block: `env://RUNTIME_EXCHANGE_KEY` and
+  (optionally) `env://GOOGLE_WEB_CLIENT_ID` / `env://GOOGLE_WEB_CLIENT_SECRET` are the
+  only `env://` names the api container is given. A bot token for the Mini App is
+  `file:///run/secrets/telegram_creds` (already mounted; it is the one bot's token).
+  `kinerary-cp-release plan` and `upgrade` refuse a profile that names any other
+  `env://` variable, or one that is unset, before anything is switched.
+- Google: add `google_client_id_secret_ref` and `google_client_secret_ref` **together**
+  (the schema requires both) and set the two variables; the redirect URI to register
+  is `<PORTAL_ORIGIN>/v1/auth/google/callback`. Left out, sign-in is email and password.
+- **Telegram Mini App fields** (`web.telegram_bot_token_secret_ref`,
+  `web.telegram_init_data_max_age_seconds`) and **`public_api.trust_proxy`** arrive
+  with the Mini App sign-in change (#442, PR #456). The profile schema is strict, so
+  a revision from before it **rejects** those keys and the api does not start: add
+  them only once the revision you are upgrading to contains that change, and add
+  them in the same step as the upgrade (the example file leaves them out for that
+  reason).
+- **`public_api.trust_proxy`.** Behind the ingress every client reaches the api from
+  the portal container's address, so the per-IP sign-in limits
+  (`/v1/auth/email-password`, `/v1/auth/password`, `/v1/auth/telegram-mini-app`)
+  become one budget for everyone. Set it to the number of proxies between the browser
+  and the api that append to `X-Forwarded-For`: the portal's nginx is one, the ingress
+  another, and anything in front of the ingress that appends (a CDN, a tunnel daemon)
+  one more. A wrong number is worse than none — too high lets a caller choose their
+  own address with a header; `docs/telegram-mini-app.md` explains. Count your chain
+  once, from the ingress's configuration, rather than from this page.
+- `signup.auto_approve` in the example is `true`, as in the profile this VM already
+  mounts. That is a decision for the owner to confirm *before* the portal is public
+  (it is the front-door admission gate; see the schema comment in
+  `control-plane/api/src/config.ts`).
+
+### Same site
+
+The gateway's per-trip cookie is `SameSite=Strict`, so `PORTAL_ORIGIN` and
+`RUNTIME_ORIGIN` must share a registrable domain (`portal.example.com` and
+`runtime.example.com`, not two different domains). The gateway refuses to start
+otherwise, and the release tool refuses the plan first. Where the shared domain sits
+under a public suffix such as `co.uk`, name it in `RUNTIME_PUBLIC_SUFFIXES`;
+`RUNTIME_SAME_SITE_OK=1` overrides a wrong guess and is logged loudly — avoid it.
+
+### Ingress
+
+Two hostnames, both HTTPS, terminated at the ingress. The api only *enforces* https
+origins when the profile says `"environment": "production"` (`config.ts`), which the
+VM's current profile does not — whether to change that is a separate decision, but
+session cookies are marked `Secure` only when `web.public_origin` is https
+(`portal.ts`), so a public portal needs https regardless:
+
+| Hostname | Forward to |
+|---|---|
+| the `PORTAL_ORIGIN` host | `WEB_BIND_IP:PORTAL_PORT` (plain HTTP) |
+| the `RUNTIME_ORIGIN` host | `WEB_BIND_IP:RUNTIME_GATEWAY_PORT` (plain HTTP) |
+
+`WEB_BIND_IP` has to be an address the ingress can reach; loopback is only right
+when the ingress runs on the VM. The runtime hostname carries trip traffic that the
+portal's does not — server-sent events, large uploads and streamed downloads — so
+its route must not buffer responses, must not cap request bodies below the trip's
+own limit and must allow long-lived connections. Do not publish either port beyond
+the ingress.
+
+### Order of operations
+
+1. **Prerequisites, outside the VM:** the two DNS names and certificates; the ingress
+   routes above (they can exist before anything answers); the Google client if used;
+   the Telegram step below if the Mini App is wanted.
+2. **kinerary-deploy:** the profile copy, then the `vm.env` values. `COMPOSE_PROFILES`
+   goes in **last**. Generate the exchange key and cookie secret there; never paste
+   them anywhere else.
+3. `sudo kinerary-cp-release plan main` and `upgrade main --dry-run`. With the profile
+   on, the plan checks — names only, never values — that every variable above is set,
+   that the profile has a `web` block whose origins equal `PORTAL_ORIGIN` /
+   `RUNTIME_ORIGIN`, that the two share a site, and that every `env://` reference is
+   one the api is given; it lists the two extra images; and the dry run names the extra
+   services it would start and check.
+4. **Upgrade through the release tool**, in the usual window (the pre-upgrade dump and
+   snapshot are unchanged by this). It builds `kinerary-cp/portal:<rev>` and
+   `kinerary-cp/runtime-gateway:<rev>` beside the other three, starts them in the same
+   `up` as the api, and `--wait` covers their health checks. The api restarts first; the
+   portal's nginx re-resolves it (see below), so no portal restart is needed.
+5. **Verify.** `sudo kinerary-cp-release verify` adds four lines when the profile is
+   on: each container runs on the current revision; `GET /v1/auth/capabilities`
+   answers **through the portal's own nginx** (so the proxy and the api behind it in one
+   request); the gateway's `/health` answers. Then from outside: the portal origin
+   loads, `<PORTAL_ORIGIN>/v1/auth/capabilities` returns JSON, and
+   `<RUNTIME_ORIGIN>/health` returns `{"ok":true}`.
+6. **Browser acceptance** is `docs/landing-spa-test-runbook.md`'s list, on this
+   deployment.
+
+**Telegram, one time** (only for the Mini App, and only once the revision carries
+#456). The bot's Mini App has to point at `<PORTAL_ORIGIN>/mini-app`, set by hand in
+@BotFather on the bot named in `web.telegram_bot_username` (as of 2026-10: Bot
+Settings, then Configure Mini App / Main App; the menus move, so follow BotFather's
+own wording). At boot the api calls `getMe` and logs `mini_app.bot_checked` with
+`has_main_web_app`; `mini_app.bot_token_mismatch` means the token is not the named
+bot's, and the feature stays off.
+
+**The `/v1` proxy** (`web/nginx.conf`, an envsubst template): the portal image takes
+`CONTROL_PLANE_API_ORIGIN` (compose sets it to the api's service name on the shared
+network) and the container's own DNS server, and resolves the api *as the answer
+expires*. A literal `proxy_pass` resolves once at start and keeps the old address
+after the api container is recreated — every upgrade does that — answering 502 until
+the portal restarts too; measured on 2026-10-20 with a stand-in api (200, then 502
+for the literal form and 200 for this one, after the api came back on a new address).
+To check a change to the template without a container of your own:
+
+```bash
+docker run --rm -e CONTROL_PLANE_API_ORIGIN=http://api:4310 -e NGINX_ENTRYPOINT_LOCAL_RESOLVERS=1 \
+  -e 'NGINX_ENVSUBST_FILTER=^(CONTROL_PLANE_API_ORIGIN|NGINX_LOCAL_RESOLVERS)$' \
+  -v "$PWD/web/nginx.conf:/etc/nginx/templates/default.conf.template:ro" \
+  --entrypoint /docker-entrypoint.sh nginx:stable-alpine nginx -t
+```
+
+`tests/scripts/test_vm_web_profile.py` runs exactly this (skipped, saying so, when
+docker or the image is absent) and also asserts the asset-cache regex is quoted:
+unquoted, nginx reads the `{` of `{8,}` as a block and refuses to start (#441). The
+portal image is built from the **repository root** (`docker build -f web/Dockerfile .`),
+because the stylesheet imports `shared/brand-tokens.css`.
+
+**Rollback.** `kinerary-cp-release rollback` to a revision that has the portal keeps
+the pair on that revision's images (it fails if those images were pruned, like the
+others). To a revision from **before** the portal existed it starts none, says so, and
+`--remove-orphans` removes the running pair; `COMPOSE_PROFILES=web` can stay in
+`vm.env` meanwhile and is ignored by that revision. The api's profile file is a
+separate matter: a profile with a `web` block is read by the older api too, which
+serves the portal routes it knows.
+
+**Turning it off.** Remove `web` from `COMPOSE_PROFILES` in `vm.env`, then remove the
+containers — switching the profile off does not stop a running pair, and `verify`
+keeps saying so until they are gone:
+
+```bash
+$C --profile web rm -sf portal runtime-gateway
+```
+
+Then, if the api should stop serving portal routes, remove
+`KINERARY_ARCHITECTURE_PROFILE` (back to the repository example) and recreate the api
+(`$C up -d api`, which restarts it — a window, not a reflex), and take the two ingress
+routes down. The exchange key already written into trip sites stays; it is inert
+without a gateway holding the same key.
+
 ## Upgrades and rollback
 
 One VM, a snapshot before every upgrade, three ways back. A second standby VM
@@ -624,7 +1006,9 @@ sudo kinerary-cp-release prune --dry-run
 ```
 
 **An upgrade**, in order:
-1. **Prepare.** Build the images in a throwaway worktree, before the snapshot,
+1. **Prepare.** Build the images (api, worker, agent-runtime; plus portal and
+   runtime-gateway when the [`web` profile](#organizer-portal-and-runtime-gateway-optional)
+   is on) in a throwaway worktree, before the snapshot,
    so builds don't grow it. Validate the target's `compose.vm.yml` against this
    VM's env and secrets. Check storage.
 2. **Guards.** No provisioning job in flight, no interview mid-turn, and the
@@ -643,7 +1027,9 @@ sudo kinerary-cp-release prune --dry-run
    finds its dump and snapshot.
 5. **Verify.** readyz, migrations, image tags, relay bot/polling/no 409,
    trip-intake's `*_for_chat` tools, Hermes credentials, and every live trip's
-   companion connection and trip-mcp bridge. Dror gets the result on Telegram.
+   companion connection and trip-mcp bridge — and, with the `web` profile on, the
+   portal and gateway containers, the portal's `/v1` proxy and the gateway's `/health`.
+   Dror gets the result on Telegram.
 
 **A trip marked `TRIP_MCP_BRIDGE_FAILED` is not skipped by any of this**
 (issue #193): `restart-bridges`, `verify`'s bridge check and the relay's

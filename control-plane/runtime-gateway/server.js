@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import http from "node:http";
 import https from "node:https";
 
@@ -11,6 +11,37 @@ const PORTAL_ORIGIN = required("PORTAL_ORIGIN").replace(/\/$/, "");
 const RUNTIME_ORIGIN = required("RUNTIME_ORIGIN").replace(/\/$/, "");
 const secureCookie = RUNTIME_ORIGIN.startsWith("https://");
 const routeCache = new Map();
+// A hung control plane or trip must fail closed quickly, not hold every request open.
+const UPSTREAM_TIMEOUT_MS = Math.max(50, Number(process.env.RUNTIME_UPSTREAM_TIMEOUT_MS ?? 5000) || 5000);
+const timedFetch = (url, init = {}) => fetch(url, { ...init, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
+
+// The per-trip cookie is SameSite=Strict, so the portal and this origin must be
+// the same SITE: from another site the browser stores the cookie after the launch
+// POST but does not send it on the 303, and every launch would loop back to the
+// portal. "Same site" here is the registrable domain, approximated by the last two
+// hostname labels (three when the last two are a listed public suffix such as
+// co.uk, named in RUNTIME_PUBLIC_SUFFIXES, comma separated); two non-DNS hosts
+// (localhost, an IP address) are the same site only if the hostnames are equal.
+// RUNTIME_SAME_SITE_OK=1 overrides a wrong guess, loudly.
+export function registrableDomain(hostname, publicSuffixes = []) {
+  const labels = hostname.toLowerCase().split(".");
+  if (labels.length < 2 || /^[\d.]+$/.test(hostname) || hostname.includes(":") || hostname.startsWith("[")) return hostname.toLowerCase();
+  const tail2 = labels.slice(-2).join(".");
+  return publicSuffixes.includes(tail2) && labels.length >= 3 ? labels.slice(-3).join(".") : tail2;
+}
+export function sameSite(a, b, publicSuffixes = []) {
+  return registrableDomain(new URL(a).hostname, publicSuffixes) === registrableDomain(new URL(b).hostname, publicSuffixes);
+}
+const publicSuffixes = String(process.env.RUNTIME_PUBLIC_SUFFIXES || "").split(",").map((v) => v.trim().toLowerCase()).filter(Boolean);
+if (!sameSite(PORTAL_ORIGIN, RUNTIME_ORIGIN, publicSuffixes)) {
+  if (process.env.RUNTIME_SAME_SITE_OK === "1") {
+    console.error("runtime_gateway.cross_site_origins_allowed: PORTAL_ORIGIN and RUNTIME_ORIGIN are not the same site; RUNTIME_SAME_SITE_OK=1 is set, so launches will only work if the browser really treats them as same-site");
+  } else {
+    const message = "PORTAL_ORIGIN and RUNTIME_ORIGIN must be the same site (share a registrable domain): the trip cookie is SameSite=Strict and would not be sent after the launch, so every launch would loop. Set RUNTIME_PUBLIC_SUFFIXES if the shared domain sits under a public suffix such as co.uk, or RUNTIME_SAME_SITE_OK=1 to override.";
+    console.error(`runtime_gateway.cross_site_origins: ${message}`);
+    throw new Error(message);
+  }
+}
 
 function required(name) {
   const value = process.env[name];
@@ -24,7 +55,7 @@ function json(res, status, body) {
   res.end(data);
 }
 
-async function readJson(req, limit = 32_768) {
+async function readRaw(req, limit = 32_768) {
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
@@ -32,7 +63,11 @@ async function readJson(req, limit = 32_768) {
     if (size > limit) throw new Error("BODY_TOO_LARGE");
     chunks.push(chunk);
   }
-  return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function readJson(req, limit = 32_768) {
+  return JSON.parse(await readRaw(req, limit) || "{}");
 }
 
 const cookieKey = createHash("sha256").update(COOKIE_SECRET).digest();
@@ -64,7 +99,7 @@ function cookieValue(req, name) {
 }
 
 async function controlPlane(path, init = {}) {
-  const response = await fetch(`${CONTROL_PLANE_ORIGIN}${path}`, { ...init, headers: { ...init.headers, "x-api-key": EXCHANGE_KEY } });
+  const response = await timedFetch(`${CONTROL_PLANE_ORIGIN}${path}`, { ...init, headers: { ...init.headers, "x-api-key": EXCHANGE_KEY } });
   if (!response.ok) {
     const error = Object.assign(new Error("CONTROL_PLANE_REJECTED"), { statusCode: response.status });
     throw error;
@@ -80,46 +115,130 @@ async function routeFor(tripId) {
   return route;
 }
 
-function bootstrap(tripId) {
-  const origin = JSON.stringify(PORTAL_ORIGIN);
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Opening Kinerary</title></head><body><p>Opening your trip…</p><script>
-  const portalOrigin=${origin};
-  addEventListener('message',async(event)=>{
-    if(event.origin!==portalOrigin||event.source!==parent||event.data?.type!=='kinerary:launch'||typeof event.data.token!=='string')return;
-    const response=await fetch(location.pathname.replace(/\\/$/,'')+'/__launch',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({token:event.data.token})});
-    if(response.ok)location.reload();else document.body.textContent='This trip could not be opened.';
-  });
-  parent.postMessage({type:'kinerary:runtime-ready'},portalOrigin);
-  </script></body></html>`;
+// The browser lands here by a top-level form POST from the portal (no iframe,
+// no postMessage), so every refusal is a small page that links back to the
+// portal rather than raw JSON. Status codes stay uniform: a caller cannot tell
+// "no such trip" from "bad grant" from "grant for another trip".
+function launchRefused(res, status) {
+  const body = Buffer.from(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Kinerary</title></head><body><p>This trip could not be opened.</p><p><a href="${PORTAL_ORIGIN}/trips">Return to Kinerary</a></p></body></html>`);
+  res.writeHead(status, { "content-type": "text/html; charset=utf-8", "content-length": body.length, "cache-control": "no-store", "referrer-policy": "no-referrer", "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'" });
+  res.end(body);
+}
+
+// Only a browser navigation is sent to the portal. A script's fetch (or a
+// frame, which nothing may create any more) keeps the 401 JSON.
+function wantsPage(req) {
+  const mode = req.headers["sec-fetch-mode"];
+  if (mode) return mode === "navigate" && (req.headers["sec-fetch-dest"] || "document") === "document";
+  return String(req.headers.accept || "").includes("text/html");
+}
+
+// One cookie per trip, name-scoped rather than path-scoped: a __Host- cookie
+// must be Path=/ with no Domain, which also stops a sibling subdomain from
+// planting (tossing) a session of its own. Plain http (local development) cannot
+// carry the prefix.
+function cookieName(tripId) {
+  return `${secureCookie ? "__Host-" : ""}kit_rt_${tripId}`;
+}
+
+function sameKey(supplied) {
+  const a = Buffer.from(String(supplied ?? "")), b = Buffer.from(EXCHANGE_KEY);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+// The sealed cookie proves the portal once vouched for this person; the portal
+// is asked again (at most every 30 s per launching portal session and trip) so that signing out of
+// the portal, removing someone from the trip or disabling them ends the trip
+// session too. A positive answer is cached, a negative one never is. When the
+// control plane cannot be asked the answer is no: failing open here would turn
+// an outage into a way to keep a revoked session.
+const LIVE_FOR_MS = Math.max(0, Math.min(30_000, Number(process.env.RUNTIME_SESSION_CHECK_TTL_MS ?? 30_000) || 0));
+const liveCache = new Map();
+async function sessionLive(session) {
+  if (typeof session.userId !== "string") return false;
+  const sessionId = typeof session.sessionId === "string" ? session.sessionId : null;
+  const role = typeof session.role === "string" ? session.role : null;
+  const key = `${session.tripId}:${session.userId}:${sessionId}:${role}`;
+  if ((liveCache.get(key) ?? 0) > Date.now()) return true;
+  try {
+    await controlPlane("/internal/runtime-sessions/check", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tripId: session.tripId, userId: session.userId, sessionId, role }) });
+  } catch (error) {
+    liveCache.delete(key);
+    if (error?.message === "CONTROL_PLANE_REJECTED") return false;
+    console.error("runtime_gateway.session_check_unavailable");
+    return false;
+  }
+  liveCache.set(key, Date.now() + LIVE_FOR_MS);
+  if (liveCache.size > 5000) for (const [k, expires] of liveCache) if (expires < Date.now()) liveCache.delete(k);
+  return true;
+}
+
+// An owner or organizer whose way back to the dashboard did not survive the pin
+// opens a trip with no "Organizer dashboard" menu entry and nothing anywhere
+// saying why (2026-10-20, staging acceptance). Say so, once per launch: the
+// reason and the origins, never the grant, a token or a cookie.
+function logDashboardDropped(tripId, grant) {
+  let reason = "absent";
+  let received = "";
+  if (typeof grant.dashboardUrl === "string") {
+    reason = "not_this_portals_setup_page";
+    try { received = ` received_origin=${new URL(grant.dashboardUrl).origin}`; } catch { reason = "unparseable"; }
+  }
+  console.error(`runtime_gateway.dashboard_url_dropped: trip=${tripId} role=${grant.role} reason=${reason} expected_origin=${PORTAL_ORIGIN}${received}`);
 }
 
 async function launch(req, res, tripId) {
-  const { token } = await readJson(req);
-  if (typeof token !== "string" || token.length > 256) return json(res, 400, { error: "INVALID_REQUEST" });
+  // A cross-site form POST carries no cookie of ours and no custom header, so
+  // Origin is the only thing that says the portal sent it. Missing, "null"
+  // (a no-referrer form, a sandboxed frame) or foreign: refuse before reading
+  // the body or touching the grant.
+  if (req.headers.origin !== PORTAL_ORIGIN) return launchRefused(res, 403);
+  let token;
+  try {
+    const raw = await readRaw(req, 4096);
+    const type = String(req.headers["content-type"] || "").split(";")[0].trim().toLowerCase();
+    // The portal's form is urlencoded. JSON stays only so a rollback to the
+    // previous portal build still launches; every other type (text/plain is
+    // what a cross-site form can send without a preflight) is refused.
+    if (type === "application/x-www-form-urlencoded") token = new URLSearchParams(raw).get("token");
+    else if (type === "application/json") token = JSON.parse(raw || "{}").token;
+    else return launchRefused(res, 400);
+  } catch { return launchRefused(res, 400); }
+  if (typeof token !== "string" || !token || token.length > 256) return launchRefused(res, 400);
   const grant = await controlPlane("/internal/runtime-launch/consume", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token }) });
-  if (grant.tripId !== tripId || grant.audience !== "runtime_gateway") return json(res, 401, { error: "LAUNCH_INVALID" });
+  if (grant.tripId !== tripId || grant.audience !== "runtime_gateway") return launchRefused(res, 401);
   const route = await routeFor(tripId);
-  const sessionResponse = await fetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/session`, {
+  const identity = { tripId, userId: grant.userId, role: grant.role, runtimeUsername: grant.runtimeUsername };
+  // The control plane builds the dashboard URL from its own configuration; the
+  // trip validates its shape again before it will serve it to an owner or organizer.
+  // Only this deployment's own portal can be the way back: the URL must be exactly
+  // PORTAL_ORIGIN + the trip's setup path, whatever the control plane sent.
+  if (grant.dashboardUrl === `${PORTAL_ORIGIN}/trips/${tripId}/setup`) identity.dashboardUrl = grant.dashboardUrl;
+  else if (grant.role === "owner" || grant.role === "organizer") logDashboardDropped(tripId, grant);
+  const sessionResponse = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/session`, {
     method: "POST", headers: { "content-type": "application/json", "x-api-key": EXCHANGE_KEY },
-    body: JSON.stringify({ tripId, userId: grant.userId, role: grant.role, runtimeUsername: grant.runtimeUsername }),
+    body: JSON.stringify(identity),
   });
-  if (!sessionResponse.ok) return json(res, [400, 401, 403].includes(sessionResponse.status) ? 401 : 503, { error: "RUNTIME_SESSION_FAILED" });
+  if (!sessionResponse.ok) return launchRefused(res, [400, 401, 403].includes(sessionResponse.status) ? 401 : 503);
   const runtime = await sessionResponse.json();
-  if (typeof runtime.token !== "string") return json(res, 503, { error: "RUNTIME_SESSION_FAILED" });
-  const value = encodeSession({ tripId, token: runtime.token, exp: Date.now() + 12 * 60 * 60 * 1000 });
-  const attributes = [`kit_runtime=${encodeURIComponent(value)}`, `Path=/t/${tripId}/`, "HttpOnly", "SameSite=Lax", "Max-Age=43200"];
+  if (typeof runtime.token !== "string") return launchRefused(res, 503);
+  const value = encodeSession({ tripId, userId: grant.userId, sessionId: typeof grant.sessionId === "string" ? grant.sessionId : null, role: typeof grant.role === "string" ? grant.role : null, token: runtime.token, exp: Date.now() + 12 * 60 * 60 * 1000 });
+  // Strict: the launch POST and the 303 that follows it come from the portal,
+  // which must be same-site with this origin (docs/runtime-session-exchange.md).
+  const attributes = [`${cookieName(tripId)}=${encodeURIComponent(value)}`, "Path=/", "HttpOnly", "SameSite=Strict", "Max-Age=43200"];
   if (secureCookie) attributes.push("Secure");
-  res.writeHead(204, { "set-cookie": attributes.join("; "), "cache-control": "no-store" });
+  // 303 turns the POST into a GET of the trip. The grant is in no URL.
+  res.writeHead(303, { location: `/t/${tripId}/`, "set-cookie": attributes.join("; "), "cache-control": "no-store", "referrer-policy": "no-referrer" });
   res.end();
 }
 
 async function provisionParticipant(req, res, tripId) {
-  if (req.headers["x-api-key"] !== EXCHANGE_KEY) return json(res, 401, { error: "AUTHENTICATION_REQUIRED" });
+  if (!sameKey(req.headers["x-api-key"])) return json(res, 401, { error: "AUTHENTICATION_REQUIRED" });
   if (!/^trip_[A-Za-z0-9]{8,64}$/.test(tripId)) return json(res, 404, { error: "NOT_FOUND" });
   const route = await routeFor(tripId);
   const body = await readJson(req);
   if (body.tripId !== tripId) return json(res, 400, { error: "INVALID_REQUEST" });
-  const response = await fetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants`, {
+  const response = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants`, {
     method: "POST", headers: { "content-type": "application/json", "x-api-key": EXCHANGE_KEY }, body: JSON.stringify(body),
   });
   const payload = await response.text();
@@ -128,16 +247,38 @@ async function provisionParticipant(req, res, tripId) {
 }
 
 async function participantExists(req, res, tripId, runtimeUsername) {
-  if (req.headers["x-api-key"] !== EXCHANGE_KEY) return json(res, 401, { error: "AUTHENTICATION_REQUIRED" });
+  if (!sameKey(req.headers["x-api-key"])) return json(res, 401, { error: "AUTHENTICATION_REQUIRED" });
   if (!/^trip_[A-Za-z0-9]{8,64}$/.test(tripId)) return json(res, 404, { error: "NOT_FOUND" });
   if (!/^[a-z0-9][a-z0-9._-]{1,63}$/.test(runtimeUsername)) return json(res, 400, { error: "INVALID_REQUEST" });
   const route = await routeFor(tripId);
-  const response = await fetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants/${encodeURIComponent(runtimeUsername)}`, {
+  const response = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants/${encodeURIComponent(runtimeUsername)}`, {
     method: "GET", headers: { "x-api-key": EXCHANGE_KEY, "x-control-plane-trip-id": tripId },
   });
   const payload = await response.text();
   res.writeHead(response.status, { "content-type": "application/json", "cache-control": "no-store" });
   res.end(payload);
+}
+
+// Ask again while a stream is open, at half the cache window so a revocation
+// is seen within one window after the cached "live" runs out (30 s + 15 s with
+// the defaults). A negative answer, an outage and a hung control plane all end
+// the stream, as they end a request: the browser reconnects with its backoff and
+// the connection itself is then refused with the rest.
+function endStreamWhenSessionEnds(res, upstream, session) {
+  const every = Math.max(250, Math.min(15_000, Math.floor(LIVE_FOR_MS / 2) || 1_000));
+  let asking = false;
+  const timer = setInterval(async () => {
+    if (asking) return;
+    asking = true;
+    try {
+      if (await sessionLive(session)) return;
+    } finally { asking = false; }
+    clearInterval(timer);
+    upstream.destroy();
+    res.destroy();
+  }, every);
+  timer.unref?.();
+  res.on("close", () => clearInterval(timer));
 }
 
 async function proxy(req, res, tripId, suffix, session) {
@@ -151,17 +292,21 @@ async function proxy(req, res, tripId, suffix, session) {
   const upstream = transport.request({ protocol: origin.protocol, hostname: origin.hostname, port: origin.port || undefined, method: req.method, path: targetPath, headers }, (upstreamResponse) => {
     const responseHeaders = { ...upstreamResponse.headers };
     delete responseHeaders["set-cookie"];
-    // Trip nginx serves direct sites with X-Frame-Options: DENY. The managed
-    // portal deliberately frames them, so replace that policy with a CSP
-    // restricted to the configured portal, preserving other CSP directives.
-    delete responseHeaders["x-frame-options"];
+    // The trip site is a top-level page now; nothing frames it. Keep the
+    // upstream X-Frame-Options and make the CSP say the same, preserving the
+    // other upstream CSP directives.
+    responseHeaders["x-frame-options"] = "DENY";
     const upstreamCsp = String(responseHeaders["content-security-policy"] || "");
     const csp = upstreamCsp.split(";").map(part => part.trim()).filter(part => part && !/^frame-ancestors(?:\s|$)/i.test(part));
-    responseHeaders["content-security-policy"] = [...csp, `frame-ancestors ${PORTAL_ORIGIN}`].join("; ");
+    responseHeaders["content-security-policy"] = [...csp, "frame-ancestors 'none'"].join("; ");
 
     if (typeof responseHeaders.location === "string" && responseHeaders.location.startsWith("/")) responseHeaders.location = `/t/${tripId}${responseHeaders.location}`;
     res.writeHead(upstreamResponse.statusCode || 502, responseHeaders);
     upstreamResponse.pipe(res);
+    // The check above ran once, when this request began. A live-update stream
+    // can then stay open for the whole 12-hour cookie, so signing out of the
+    // portal would end every request except the one carrying the trip's data.
+    if (String(responseHeaders["content-type"] || "").toLowerCase().startsWith("text/event-stream")) endStreamWhenSessionEnds(res, upstream, session);
   });
   upstream.on("error", () => { if (!res.headersSent) json(res, 502, { error: "RUNTIME_UNAVAILABLE" }); else res.destroy(); });
   // A closed browser must also release its long-lived upstream SSE stream.
@@ -183,27 +328,45 @@ export function createRuntimeGateway() {
       const tripId = decodeURIComponent(match[1]);
       if (!/^trip_[A-Za-z0-9]{8,64}$/.test(tripId)) return json(res, 404, { error: "NOT_FOUND" });
       const suffix = match[2] || "/";
-      if (suffix === "/__launch" && req.method === "POST") return await launch(req, res, tripId);
+      if (suffix === "/__launch" && req.method === "POST") {
+        try { return await launch(req, res, tripId); }
+        catch (error) {
+          // A rejected/expired/replayed grant is an authentication failure,
+          // anything else is the runtime being away. Never raw JSON: a person
+          // is looking at this page.
+          const rejected = error?.message === "CONTROL_PLANE_REJECTED" && error.statusCode === 401;
+          return launchRefused(res, rejected ? 401 : 503);
+        }
+      }
       if (suffix === "/__signed_out" && req.method === "GET") {
-        res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "content-security-policy": `default-src 'none'; frame-ancestors ${PORTAL_ORIGIN}` });
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "content-security-policy": `default-src 'none'; frame-ancestors 'none'` });
         return res.end("<!doctype html><title>Signed out</title><p>You have signed out of this trip. Return to your personal space to open it again.</p>");
       }
       if (suffix === "/__logout" && req.method === "POST") {
         if (req.headers["x-kinerary-logout"] !== "1" || (req.headers.origin && req.headers.origin !== RUNTIME_ORIGIN)) {
           return json(res, 403, { error: "ORIGIN_REJECTED" });
         }
-        res.setHeader("set-cookie", `kit_runtime=; Path=/t/${tripId}/; HttpOnly; SameSite=Lax; Max-Age=0${secureCookie ? "; Secure" : ""}`);
+        res.setHeader("set-cookie", `${cookieName(tripId)}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secureCookie ? "; Secure" : ""}`);
         return json(res, 200, { portalUrl: PORTAL_ORIGIN });
       }
       // Internal identity endpoints are exclusively server-to-server.
       if (suffix.startsWith("/api/internal/")) return json(res, 404, { error: "NOT_FOUND" });
 
-      const session = decodeSession(cookieValue(req, "kit_runtime"));
-      if (!session || session.tripId !== tripId) {
-        if (req.method !== "GET" || suffix !== "/") return json(res, 401, { error: "AUTHENTICATION_REQUIRED" });
-        const html = Buffer.from(bootstrap(tripId));
-        res.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-length": html.length, "cache-control": "no-store", "content-security-policy": `default-src 'none'; script-src 'unsafe-inline'; connect-src 'self'; style-src 'unsafe-inline'; frame-ancestors ${PORTAL_ORIGIN}` });
-        return res.end(html);
+      let session = decodeSession(cookieValue(req, cookieName(tripId)));
+      if (session && session.tripId !== tripId) session = null;
+      // A sealed cookie is not enough: the portal must still consider this
+      // person signed in and entitled to the trip (logout, removal, disabling).
+      if (session && !(await sessionLive(session))) session = null;
+      if (!session) {
+        // A page navigation without a session goes to the portal, which signs
+        // the person in if needed and posts a fresh grant back. The target is
+        // fixed: no route lookup first, no query or return path reflected, so
+        // existing and nonexistent trips answer identically.
+        if (req.method === "GET" && wantsPage(req)) {
+          res.writeHead(303, { location: `${PORTAL_ORIGIN}/trips/${tripId}/app`, "cache-control": "no-store", "referrer-policy": "no-referrer" });
+          return res.end();
+        }
+        return json(res, 401, { error: "AUTHENTICATION_REQUIRED" });
       }
       return await proxy(req, res, tripId, suffix, session);
     } catch (error) {

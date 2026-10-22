@@ -50,6 +50,7 @@ import os
 import pwd
 import re
 import secrets
+import select
 import shlex
 import shutil
 import subprocess
@@ -99,6 +100,11 @@ COMPOSE_PROJECT = "kinerary-cp"
 PG_CONTAINER = ENV.get("KINERARY_CP_PG_CONTAINER", "kinerary-cp-postgres-1")
 RELAY_CONTAINER = "kinerary-cp-relay-1"
 HERMES_CONTAINER = "hermes"
+# The optional organizer portal and runtime gateway: compose profile `web`, off
+# unless COMPOSE_PROFILES in vm.env/provisioning.env names it. They are images of
+# their own (kinerary-cp/<service>:<rev>), built beside the three above.
+WEB_PROFILE = "web"
+WEB_SERVICES = ("portal", "runtime-gateway")
 DB_USER = DB_NAME = "kinerary_control_plane"
 READYZ = ENV.get("KINERARY_CP_READYZ", "http://127.0.0.1:4310/readyz")
 
@@ -295,6 +301,85 @@ def site_from_texts(control_plane_env: Optional[str], provisioning_env: str, vm_
     return {key: site[key] for key in (*SITE_REQUIRED, "CP_REFUSE_STORAGE") if key in site}
 
 
+def compose_profiles(*env_texts: str) -> List[str]:
+    """COMPOSE_PROFILES as compose itself reads it from the env files: the last file to set it wins."""
+    value = ""
+    for text in env_texts:
+        value = read_env_text(text).get("COMPOSE_PROFILES", value)
+    return [p.strip().strip("\"'") for p in value.split(",") if p.strip()]
+
+
+def compose_defines_web(compose_text: str) -> bool:
+    """Whether a compose.vm.yml carries both web services. Looked up in the TARGET
+    revision's file: a rollback to a version from before the portal existed has none,
+    and must neither expect its images nor start it."""
+    return all(re.search(rf"^  {re.escape(name)}:\s*$", compose_text, re.M) for name in WEB_SERVICES)
+
+
+# The env:// targets compose.vm.yml gives the api for the `web` block's secret references.
+WEB_API_ENV = ("RUNTIME_EXCHANGE_KEY", "GOOGLE_WEB_CLIENT_ID", "GOOGLE_WEB_CLIENT_SECRET")
+WEB_REQUIRED_ENV = ("RUNTIME_EXCHANGE_KEY", "RUNTIME_COOKIE_SECRET", "PORTAL_ORIGIN", "RUNTIME_ORIGIN",
+                    "KINERARY_ARCHITECTURE_PROFILE")
+
+
+def registrable_domain(hostname: str, public_suffixes: Sequence[str] = ()) -> str:
+    """The same approximation runtime-gateway/server.js makes (its comment explains it):
+    the last two labels, three when the last two are a listed public suffix; an IP or a
+    single-label host is its own site."""
+    hostname = hostname.lower()
+    labels = hostname.split(".")
+    if len(labels) < 2 or re.fullmatch(r"[\d.]+", hostname) or ":" in hostname or hostname.startswith("["):
+        return hostname
+    tail2 = ".".join(labels[-2:])
+    return ".".join(labels[-3:]) if tail2 in public_suffixes and len(labels) >= 3 else tail2
+
+
+def web_config_problems(env: Dict[str, str], profile: Optional[Dict]) -> List[str]:
+    """What would stop the portal and gateway from working, found BEFORE anything is
+    switched. Names only, never values: the env holds the exchange key and cookie secret.
+
+    The gateway and the api's `web` block each state the two public origins; they must
+    agree or every sign-in and every launch is refused at runtime, in a way that points
+    nowhere near the cause."""
+    problems = [f"{name} is not set in vm.env" for name in WEB_REQUIRED_ENV if not env.get(name)]
+    if env.get("PORTAL_ORIGIN") and env.get("RUNTIME_ORIGIN") and env.get("RUNTIME_SAME_SITE_OK") != "1":
+        # The gateway refuses to start across sites (its trip cookie is SameSite=Strict).
+        # Found here, that is a refused plan; found there, it is a failed upgrade.
+        suffixes = [s.strip().lower() for s in env.get("RUNTIME_PUBLIC_SUFFIXES", "").split(",") if s.strip()]
+        try:
+            hosts = [urllib.parse.urlparse(env[name]).hostname or "" for name in ("PORTAL_ORIGIN", "RUNTIME_ORIGIN")]
+        except ValueError:
+            hosts = []
+        if len(hosts) != 2 or not all(hosts):
+            problems.append("PORTAL_ORIGIN and RUNTIME_ORIGIN must be origins with a host name")
+        elif registrable_domain(hosts[0], suffixes) != registrable_domain(hosts[1], suffixes):
+            problems.append("PORTAL_ORIGIN and RUNTIME_ORIGIN are not the same site (the trip cookie is SameSite=Strict, so every "
+                            "launch would loop and the gateway refuses to start); put both under one registrable domain, "
+                            "or list a public suffix in RUNTIME_PUBLIC_SUFFIXES")
+    if env.get("KINERARY_ARCHITECTURE_PROFILE") and profile is None:
+        problems.append("KINERARY_ARCHITECTURE_PROFILE does not name a readable JSON file")
+    elif profile is not None:
+        web = profile.get("web")
+        if not isinstance(web, dict):
+            problems.append("the architecture profile has no `web` block, so the api would serve no portal routes")
+        else:
+            for env_name, key in (("PORTAL_ORIGIN", "public_origin"), ("RUNTIME_ORIGIN", "runtime_origin")):
+                have, want = env.get(env_name, "").rstrip("/"), str(web.get(key, "")).rstrip("/")
+                if have and want and have != want:
+                    problems.append(f"{env_name} differs from the profile's web.{key}")
+            # An env:// reference can only be satisfied by a variable compose.vm.yml hands the
+            # api; anything else is empty there and stops the api at boot.
+            for key, ref in sorted(web.items()):
+                if key.endswith("_secret_ref") and isinstance(ref, str) and ref.startswith("env://"):
+                    name = ref[len("env://"):]
+                    if name not in WEB_API_ENV:
+                        problems.append(f"web.{key} names env://{name}, which compose.vm.yml does not pass to the api "
+                                        f"(it passes {', '.join(WEB_API_ENV)})")
+                    elif not env.get(name):
+                        problems.append(f"web.{key} names env://{name}, which is not set in vm.env")
+    return problems
+
+
 def rollback_declaration(sql: str) -> Optional[Tuple[str, str]]:
     """(`compatible`|`breaking`, reason) from a migration's first 20 lines, or None."""
     match = ROLLBACK_HEADER.search("\n".join(sql.splitlines()[:20]))
@@ -383,14 +468,14 @@ def backups_to_prune(backups: Sequence[Tuple[str, int]], *, keep: int, max_total
 
 
 def images_to_prune(tags: Iterable[str], keep_revs: Iterable[str]) -> List[str]:
-    """kinerary-cp/{api,worker,agent-runtime}:<rev> images not in keep_revs.
+    """kinerary-cp/{api,worker,agent-runtime,portal,runtime-gateway}:<rev> images not in keep_revs.
 
     Hermes images are never pruned here: building one is a manual step.
     """
     keep = {r for r in keep_revs if r}
     doomed = []
     for tag in tags:
-        match = re.match(r"^kinerary-cp/(api|worker|agent-runtime):([0-9a-f]{7,40})$", tag)
+        match = re.match(r"^kinerary-cp/(api|worker|agent-runtime|portal|runtime-gateway):([0-9a-f]{7,40})$", tag)
         if match and match.group(2) not in keep:
             doomed.append(tag)
     return sorted(doomed)
@@ -746,6 +831,7 @@ class ControlPlane:
         self.dry_run = dry_run
         self.actor = actor
         self._site: Optional[Dict[str, str]] = None
+        self.target_full: Optional[str] = None
 
     @property
     def site(self) -> Dict[str, str]:
@@ -760,9 +846,42 @@ class ControlPlane:
         return self.site["CP_VMID"]
 
     # ------------------------------------------------------------ basics --
+    def web_enabled(self) -> bool:
+        """Is the optional `web` profile switched on in this VM's env files? Read from
+        the files alone — the same two compose reads — never from the caller's
+        environment, which sudo resets and a rehearsal sets differently."""
+        read = lambda path: path.read_text() if path.exists() else ""  # noqa: E731
+        return WEB_PROFILE in compose_profiles(read(PROVISIONING_ENV), read(VM_ENV))
+
     def compose(self, *args: str) -> List[str]:
+        # `--profile web` is passed explicitly rather than left to COMPOSE_PROFILES:
+        # every command this tool builds then agrees with web_enabled(), whatever
+        # an older compose does with the variable in an --env-file.
+        profile = ["--profile", WEB_PROFILE] if self.web_enabled() else []
         return ["docker", "compose", "-f", str(DEPLOYMENT_DIR / "compose.vm.yml"),
-                "--env-file", str(PROVISIONING_ENV), "--env-file", str(VM_ENV), *args]
+                "--env-file", str(PROVISIONING_ENV), "--env-file", str(VM_ENV), *profile, *args]
+
+    def web_in_compose(self, full: str) -> bool:
+        proc = self.sh.read(self.git_argv("show", f"{full}:control-plane/deployment/compose.vm.yml"), timeout=60)
+        return proc.returncode == 0 and compose_defines_web(proc.stdout.decode(errors="replace"))
+
+    def web_services(self) -> List[str]:
+        """The web services to start now: those the checked-out compose.vm.yml defines,
+        when the profile is on. Empty when it is off — and also, with a note, when the
+        profile is on but this version predates the portal (a rollback), because naming
+        a service compose does not know fails the whole `up`."""
+        if not self.web_enabled():
+            return []
+        if self.dry_run and self.target_full:
+            has_web = self.web_in_compose(self.target_full)
+        else:
+            compose_file = DEPLOYMENT_DIR / "compose.vm.yml"
+            has_web = compose_file.exists() and compose_defines_web(compose_file.read_text())
+        if has_web:
+            return list(WEB_SERVICES)
+        self.r.note(f"{WEB_PROFILE} is on in vm.env but this version's compose.vm.yml has no portal or runtime gateway — "
+                    "they are not started (a running pair from a newer version is removed with the other orphans)")
+        return []
 
     def vm_env(self) -> Dict[str, str]:
         return read_env_text(VM_ENV.read_text())
@@ -1172,11 +1291,20 @@ class ControlPlane:
     def image_exists(self, tag: str) -> bool:
         return self.sh.read(["docker", "image", "inspect", tag], timeout=30).returncode == 0
 
-    def kinerary_images(self, rev: str) -> List[str]:
-        return [f"kinerary-cp/api:{rev}", f"kinerary-cp/worker:{rev}", f"kinerary-cp/agent-runtime:{rev}"]
+    def web_images_wanted(self, full: Optional[str]) -> bool:
+        """The portal and gateway images belong to a release only when the profile is on
+        AND that revision's compose.vm.yml defines them — so a stack that never enabled
+        the web builds, checks and prunes exactly what it did before."""
+        return bool(full) and self.web_enabled() and self.web_in_compose(full)
+
+    def kinerary_images(self, rev: str, full: Optional[str] = None) -> List[str]:
+        images = [f"kinerary-cp/api:{rev}", f"kinerary-cp/worker:{rev}", f"kinerary-cp/agent-runtime:{rev}"]
+        if self.web_images_wanted(full):
+            images += [f"kinerary-cp/{name}:{rev}" for name in WEB_SERVICES]
+        return images
 
     def build_images(self, full: str, short: str) -> None:
-        missing = [t for t in self.kinerary_images(short) if not self.image_exists(t)]
+        missing = [t for t in self.kinerary_images(short, full) if not self.image_exists(t)]
         if not missing:
             self.r.ok(f"images for {short} already built")
             return
@@ -1187,6 +1315,13 @@ class ControlPlane:
             ["docker", "build", "-f", "control-plane/deployment/agent-runtime.Dockerfile",
              "--build-arg", f"BASE=kinerary-cp/api:{short}", "-t", f"kinerary-cp/agent-runtime:{short}", "."],
         ]
+        if self.web_images_wanted(full):
+            # Each image's own build context, as compose.vm.yml's `build:` blocks name them.
+            builds += [
+                ["docker", "build", "-f", "web/Dockerfile", "-t", f"kinerary-cp/portal:{short}", "."],
+                ["docker", "build", "-f", "control-plane/runtime-gateway/Dockerfile",
+                 "-t", f"kinerary-cp/runtime-gateway:{short}", "control-plane/runtime-gateway"],
+            ]
         if self.dry_run:
             self.r.step(f"would build {len(builds)} images for {short} in a worktree at {worktree} (~1.6 GB, before the snapshot so builds do not grow it)")
             return
@@ -1202,7 +1337,7 @@ class ControlPlane:
                     raise Refused("image build failed:\n      " + "\n      ".join(tail))
         finally:
             self.sh.read(self.git_argv("worktree", "remove", "--force", str(worktree)))
-        self.r.ok(f"built {', '.join(self.kinerary_images(short))}")
+        self.r.ok(f"built {', '.join(self.kinerary_images(short, full))}")
 
     def validate_compose(self, full: str) -> None:
         text = self.sh.read(self.git_argv("show", f"{full}:control-plane/deployment/compose.vm.yml"), check=True).stdout
@@ -1210,8 +1345,9 @@ class ControlPlane:
             handle.write(text)
             temp = handle.name
         try:
+            profile = ["--profile", WEB_PROFILE] if self.web_enabled() else []
             proc = self.sh.read(["docker", "compose", "--project-directory", str(DEPLOYMENT_DIR), "-f", temp,
-                                 "--env-file", str(PROVISIONING_ENV), "--env-file", str(VM_ENV), "config", "-q"], timeout=60)
+                                 "--env-file", str(PROVISIONING_ENV), "--env-file", str(VM_ENV), *profile, "config", "-q"], timeout=60)
         finally:
             os.unlink(temp)
         if proc.returncode != 0:
@@ -1219,6 +1355,28 @@ class ControlPlane:
                         f"{proc.stderr.decode(errors='replace').strip()[-300:]}")
         else:
             self.r.ok("the target's compose.vm.yml validates against this VM's env files and secrets")
+
+    def guard_web(self, full: str) -> None:
+        """With the `web` profile on and the target carrying the portal, its configuration
+        must be whole BEFORE the switch: a gateway missing a value exits at start and an
+        api whose profile names a variable it was never given stops at boot — the second
+        takes the interview with it. Nothing is checked, and nothing printed, when the
+        profile is off."""
+        if not self.web_images_wanted(full):
+            return
+        read = lambda path: path.read_text() if path.exists() else ""  # noqa: E731
+        env = {**read_env_text(read(PROVISIONING_ENV)), **read_env_text(read(VM_ENV))}
+        profile: Optional[Dict] = None
+        if env.get("KINERARY_ARCHITECTURE_PROFILE"):
+            try:
+                profile = json.loads((DEPLOYMENT_DIR / env["KINERARY_ARCHITECTURE_PROFILE"]).read_text())
+            except (OSError, ValueError):
+                profile = None
+        problems = web_config_problems(env, profile)
+        for problem in problems:
+            self.r.fail(f"{WEB_PROFILE} profile: {problem}")
+        if not problems:
+            self.r.ok(f"{WEB_PROFILE} profile: the portal and gateway are configured (names checked, no values shown)")
 
     # ---------------------------------------------------------- switch --
     def switch_to(self, full: str, short: str, hermes_rev: Optional[str], previous: Dict[str, str],
@@ -1231,6 +1389,7 @@ class ControlPlane:
         """Checkout, vm.env, migrate — nothing that is running is touched yet, and a
         failed migrate puts the checkout and vm.env back. Everything here is still
         undoable, which is what lets a failed rollback put its database back too."""
+        self.target_full = full  # a dry run never checks it out; web_services() asks git instead
         self.sh.act(self.git_argv("checkout", "--quiet", "--detach", full), describe=f"git checkout --detach {short}")
         self.sh.act(self.git_argv("tag", "-f", f"deployed/{short}", full), describe=f"git tag deployed/{short}")
         updates = {"KINERARY_REV": short}
@@ -1278,8 +1437,12 @@ class ControlPlane:
         """The point of no return: the target's containers start. From here a failure
         rolls forward (verify, then rollback), because putting an older database back
         under running newer code would strand it."""
-        self.sh.act(self.compose("up", "-d", "--wait", "--remove-orphans", "api", "worker", "interview-mcp", "companion-mcp"),
-                    describe="compose up -d --wait api worker interview-mcp companion-mcp  (downtime: none for trips)", timeout=900,
+        # The portal and gateway follow the api in the same command, so --wait covers
+        # them and they come up on the new revision's images; the api is recreated
+        # first, and the portal's resolver (web/nginx.conf) finds its new address.
+        services = ["api", "worker", "interview-mcp", "companion-mcp", *self.web_services()]
+        self.sh.act(self.compose("up", "-d", "--wait", "--remove-orphans", *services),
+                    describe=f"compose up -d --wait {' '.join(services)}  (downtime: none for trips)", timeout=900,
                     stream_output=True)
         self.sh.act([str(DEPLOYMENT_DIR / "vm-relay-restart.sh"), "--force-live"],
                     describe="vm-relay-restart.sh --force-live  (downtime: the Telegram bot pauses; messages wait at Telegram)",
@@ -1314,17 +1477,68 @@ class ControlPlane:
         # excluded — waiting on those would cost every trip the full timeout
         # for a companion that was never coming back.
         #
-        # The same special case, for the same reason, lives in
+        #
+        # A DORMANT companion is not live either (issue #349): one the control
+        # plane's reconciler has actually STOPPED on purpose and the host
+        # confirmed stopped, so "NOT connected to the relay" is the right state
+        # and must neither fail a verify nor have its bridge restarted. Dormant is
+        # what HAPPENED, not what was decided: desired 'stopped' AND the last
+        # action a successful stop AND the host last saying stopped/absent. A
+        # decision alone is not enough - in observe mode the reconciler decides
+        # and never acts, and a running (or later crashed) gateway must stay
+        # expected. No row (not decided about) or no table (a database from before
+        # the migration) means NOT dormant: when in doubt a companion is expected up.
+        #
+        # The same two special cases, for the same reasons, live in
         # control-plane/api/src/relay/gateway-wait.ts's expectedGatewayProfiles
         # — if another UNREACHABLE_REASONS value ever needs the same
         # treatment, update both queries together. The retired-slug filter is
         # the same NOT_RETIRED_SQL (trip-retirement.ts) that file uses (#288).
+        dormant = ""
+        if self.psql("SELECT to_regclass('control_plane.companion_gateways') IS NOT NULL") == "t":
+            dormant = (" AND NOT EXISTS (SELECT 1 FROM control_plane.companion_gateways g "
+                       "WHERE g.hermes_profile = b.hermes_profile AND g.desired = 'stopped' AND g.last_action = 'stop' AND g.last_result = 'ok' AND g.observed IN ('stopped', 'absent'))")
         rows = self.psql(
             "SELECT DISTINCT t.slug || '|' || b.hermes_profile FROM control_plane.telegram_chat_bindings b "
             "JOIN control_plane.trips t ON t.id = b.trip_id WHERE b.closed_at IS NULL AND b.hermes_profile IS NOT NULL "
             "AND (t.reachability <> 'unreachable' OR t.unreachable_reason = 'TRIP_MCP_BRIDGE_FAILED') "
-            "AND t.slug NOT LIKE 'retired-%' ORDER BY 1")
+            "AND t.slug NOT LIKE 'retired-%'"
+            + dormant + " ORDER BY 1")
         return [tuple(row.split("|", 1)) for row in rows.splitlines() if "|" in row]  # type: ignore[misc]
+
+    def probe_in(self, container: str, url: str) -> Tuple[bool, str]:
+        """GET a URL from INSIDE a container — the question is whether that service answers,
+        not whether the interface it is published on is reachable from here."""
+        proc = self.sh.read(["docker", "exec", container, "wget", "-q", "-O", "-", url], timeout=30)
+        return proc.returncode == 0, (proc.stdout or proc.stderr).decode(errors="replace").strip()[:200]
+
+    def verify_web(self, running: Dict[str, str], rev: str) -> None:
+        """The optional portal and gateway. Off means not looked at — except to say so when
+        they are running anyway, because turning the profile off does not stop them."""
+        names = {service: f"{COMPOSE_PROJECT}-{service}-1" for service in WEB_SERVICES}
+        if not self.web_enabled():
+            leftover = [name for name in names.values() if name in running]
+            if leftover:
+                self.r.note(f"profile {WEB_PROFILE} is off in vm.env but {', '.join(leftover)} is still running — "
+                            "see 'Organizer portal and runtime gateway' in docs/control-plane-vm-deployment.md to remove it")
+            return
+        compose_file = DEPLOYMENT_DIR / "compose.vm.yml"
+        if not (compose_file.exists() and compose_defines_web(compose_file.read_text())):
+            self.r.note(f"profile {WEB_PROFILE} is on in vm.env but this version has no portal or runtime gateway — not checked")
+            return
+        for service, container in names.items():
+            image = running.get(container, "")
+            (self.r.ok if image.endswith(f":{rev}") else self.r.fail)(f"{container}: {image or 'NOT RUNNING'}")
+        # Through the portal's own nginx to the api: proves the same-origin /v1 proxy and
+        # the api behind it in one request.
+        ok, body = self.probe_in(names["portal"], "http://127.0.0.1/v1/auth/capabilities")
+        ok = ok and '"emailPassword"' in body
+        (self.r.ok if ok else self.r.fail)(
+            "portal: /v1/auth/capabilities answers through its proxy" if ok else f"portal: /v1/auth/capabilities did not answer through its proxy: {body or 'no output'}")
+        ok, body = self.probe_in(names["runtime-gateway"], "http://127.0.0.1:4320/health")
+        ok = ok and '"ok":true' in body.replace(" ", "")
+        (self.r.ok if ok else self.r.fail)(
+            "runtime gateway: /health answers" if ok else f"runtime gateway: /health did not answer: {body or 'no output'}")
 
     def verify(self) -> bool:
         before = self.r.failures
@@ -1356,6 +1570,7 @@ class ControlPlane:
             (self.r.ok if image.endswith(f":{rev}") else self.r.fail)(f"{container}: {image or 'NOT RUNNING'}")
         image = running.get(HERMES_CONTAINER, "")
         (self.r.ok if image.endswith(f":{hermes_rev}") else self.r.fail)(f"{HERMES_CONTAINER}: {image or 'NOT RUNNING'}")
+        self.verify_web(running, rev)
 
         events = self.relay_log()
         identity = [e for e in events if e.get("event") == "relay.bot_identity"]
@@ -1431,6 +1646,117 @@ def current_versions(cp: ControlPlane) -> Dict[str, str]:
             "full": cp.git("rev-parse", "HEAD", check=False)}
 
 
+#: The text the worker's reconciler, scripts/teardown-trip.py and this tool all
+#: pass to hashtext() to name ONE advisory lock. tests/scripts pins that the
+#: three spell it identically.
+GATEWAY_LOCK_TEXT = "control_plane.companion_gateways"
+
+
+class GatewayLock:
+    """Holds the companion-gateway advisory lock for the length of a release
+    action that stops or starts gateways (upgrade, rollback, restart-bridges).
+
+    The worker's reconciler takes the same lock for every sweep and skips the
+    sweep when it is held, so it cannot start a gateway this tool just stopped,
+    or stop one it is waiting for, halfway through an upgrade. The lock lives as
+    long as one database SESSION, so a `psql` is kept open in the Postgres
+    container with its stdin as the lease: closing the pipe ends the session
+    and releases the lock, whatever happens to this process.
+
+    If the lock cannot be had within WAIT_SECONDS something else (a sweep, a
+    teardown, an operator pin) is mid-flight: the action is REFUSED, not run
+    unguarded. If the DATABASE cannot be reached at all it is noted and the
+    action goes on — a rollback must stay possible when the database is the
+    thing that is broken, and with it down no reconciler can act either.
+    `--restore-db` kills this session by design; the lock is gone by then and
+    that is fine, the swap replaces the database it was held in."""
+
+    WAIT_SECONDS = 120
+
+    def __init__(self, cp: "ControlPlane") -> None:
+        self.cp = cp
+        self.proc: Optional["subprocess.Popen[bytes]"] = None
+
+    def __enter__(self) -> "GatewayLock":
+        cp = self.cp
+        if cp.dry_run:
+            cp.r.step("would hold the companion-gateway lock while this runs (the reconciler pauses)")
+            return self
+        argv = ["docker", "exec", "-i", PG_CONTAINER, "psql", "-U", DB_USER, "-d", DB_NAME, "-q", "-At",
+                "-v", "ON_ERROR_STOP=1"]
+        try:
+            self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            assert self.proc.stdin is not None and self.proc.stdout is not None
+            self.proc.stdin.write((f"SET lock_timeout = '{int(self.WAIT_SECONDS)}s';\n"
+                                   f"SELECT pg_advisory_lock(hashtext('{GATEWAY_LOCK_TEXT}'));\n"
+                                   "SELECT 'LOCKED';\n").encode())
+            self.proc.stdin.flush()
+            deadline = time.monotonic() + self.WAIT_SECONDS + 15
+            # Unbuffered reads on the pipe's descriptor: select() on a descriptor
+            # whose data a BufferedReader has already pulled in never fires, and
+            # psql's blank line and 'LOCKED' can arrive in one chunk.
+            fd, seen = self.proc.stdout.fileno(), b""
+            while True:
+                remaining = deadline - time.monotonic()
+                ready = select.select([fd], [], [], remaining)[0] if remaining > 0 else []
+                if not ready:
+                    self._release()
+                    raise Refused("the companion-gateway lock is held by something else (a reconcile sweep, a "
+                                  "teardown or a pin): retry in a few minutes")
+                chunk = os.read(fd, 4096)
+                seen += chunk
+                if b"LOCKED" in seen.split():
+                    cp.r.ok("holding the companion-gateway lock: the reconciler pauses until this finishes")
+                    return self
+                if chunk == b"":
+                    self.proc.wait(timeout=10)
+                    err = (self.proc.stderr.read() if self.proc.stderr else b"").decode(errors="replace")
+                    self._release()
+                    if "lock timeout" in err:
+                        raise Refused("the companion-gateway lock is held by something else (a reconcile sweep, a "
+                                      "teardown or a pin): retry in a few minutes")
+                    reason = err.strip().splitlines()[-1][:160] if err.strip() else "no reason given"
+                    cp.r.note(f"could not take the companion-gateway lock ({reason}): continuing without it — "
+                              "with the database unreachable no reconciler can act either")
+                    return self
+        except OSError as error:
+            cp.r.note(f"could not take the companion-gateway lock ({type(error).__name__}): continuing without it")
+            self.proc = None
+            return self
+
+    def _release(self) -> None:
+        proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+            proc.wait(timeout=10)
+        except (subprocess.TimeoutExpired, OSError):
+            proc.kill()
+        for stream in (proc.stdout, proc.stderr):
+            if stream:
+                stream.close()
+
+    def __exit__(self, *exc: object) -> bool:
+        self._release()
+        return False
+
+
+def holds_gateway_lock(fn):  # type: ignore[no-untyped-def]
+    """Run a release action that moves gateways under the companion-gateway lock."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(cp, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if not isinstance(cp, ControlPlane):
+            return fn(cp, *args, **kwargs)
+        with GatewayLock(cp):
+            return fn(cp, *args, **kwargs)
+
+    return wrapper
+
+
 def cmd_status(cp: ControlPlane) -> int:
     r = cp.r
     versions = current_versions(cp)
@@ -1496,11 +1822,13 @@ def cmd_plan(cp: ControlPlane, rev: str) -> int:
         (r.ok if verdict == "compatible" else r.note)(
             "a later rollback can keep the database" if verdict == "compatible"
             else "a later rollback will need --restore-db (or --keep-db after reading the reasons)")
-    for tag in cp.kinerary_images(short):
+    for tag in cp.kinerary_images(short, full):
         (r.ok if cp.image_exists(tag) else r.note)(f"{tag} {'present' if cp.image_exists(tag) else 'will be built'}")
+    cp.guard_web(full)
     return 1 if r.failures else 0
 
 
+@holds_gateway_lock
 def cmd_upgrade(cp: ControlPlane, rev: str, hermes_rev: Optional[str], force_live: bool) -> int:
     r = cp.r
     r.head("1/5 Prepare" + ("  [DRY RUN — nothing will change]" if cp.dry_run else ""))
@@ -1527,6 +1855,7 @@ def cmd_upgrade(cp: ControlPlane, rev: str, hermes_rev: Optional[str], force_liv
         tag = f"kinerary-cp/hermes:{hermes_rev}"
         (r.ok if cp.image_exists(tag) else r.fail)(f"{tag} {'present' if cp.image_exists(tag) else 'missing — build it first (runbook: Hermes)'}")
     cp.validate_compose(full)
+    cp.guard_web(full)
     cp.guard_storage(extra_bytes=cp.db_size_bytes() + (2 * 1024 ** 3))
     cp.refuse_if_failed("nothing was changed")
     cp.build_images(full, short)
@@ -1587,7 +1916,8 @@ def cmd_upgrade(cp: ControlPlane, rev: str, hermes_rev: Optional[str], force_liv
     r.head("5/5 Verify")
     if cp.dry_run:
         r.step("would verify: readyz, migrations, image tags, relay bot + polling + no 409, trip-intake tools, "
-               "Hermes credentials, every live trip's companion and trip-mcp bridge")
+               "Hermes credentials, every live trip's companion and trip-mcp bridge"
+               + (", the portal's /v1 proxy and the runtime gateway" if cp.web_enabled() else ""))
         r.line()
         r.line(f"Dry run complete: {r.failures} problem(s). Nothing was changed.")
         return 1 if r.failures else 0
@@ -1605,6 +1935,7 @@ def cmd_upgrade(cp: ControlPlane, rev: str, hermes_rev: Optional[str], force_liv
     return 2
 
 
+@holds_gateway_lock
 def cmd_rollback(cp: ControlPlane, to: Optional[str], restore_db: bool, keep_db: bool, restore_hermes: bool, force_live: bool) -> int:
     r = cp.r
     r.head("1/5 Target" + ("  [DRY RUN — nothing will change]" if cp.dry_run else ""))
@@ -1628,7 +1959,7 @@ def cmd_rollback(cp: ControlPlane, to: Optional[str], restore_db: bool, keep_db:
     hermes_changes = hermes_target != versions["HERMES_REV"]
     r.ok(f"{versions['KINERARY_REV']} → {short} \"{cp.subject(full)}\"" + (f", Hermes {versions['HERMES_REV']} → {hermes_target}" if hermes_changes else ""))
     r.fact("target", f"{versions['KINERARY_REV']} -> {short} \"{cp.subject(full)}\"")
-    for tag in cp.kinerary_images(short):
+    for tag in cp.kinerary_images(short, full):
         (r.ok if cp.image_exists(tag) else r.fail)(f"{tag} {'present' if cp.image_exists(tag) else 'MISSING — pruned? rebuild it or pick another target'}")
     if hermes_changes:
         (r.ok if cp.image_exists(f"kinerary-cp/hermes:{hermes_target}") else r.fail)(f"kinerary-cp/hermes:{hermes_target}")
@@ -1711,7 +2042,8 @@ def cmd_rollback(cp: ControlPlane, to: Optional[str], restore_db: bool, keep_db:
 
     r.head("5/5 Verify")
     if cp.dry_run:
-        r.step("would verify: readyz, migrations, image tags, relay, trip-intake tools, Hermes credentials, live trips")
+        r.step("would verify: readyz, migrations, image tags, relay, trip-intake tools, Hermes credentials, live trips"
+               + (", the portal's /v1 proxy and the runtime gateway" if cp.web_enabled() else ""))
         r.line(); r.line(f"Dry run complete: {r.failures} problem(s). Nothing was changed.")
         return 1 if r.failures else 0
     ok = cp.verify()
@@ -1893,6 +2225,7 @@ def undo_hermes_data(cp: ControlPlane, aside: Path) -> None:
               describe="compose up -d hermes  (companions and site AI features come back)", timeout=900)
 
 
+@holds_gateway_lock
 def cmd_restart_bridges(cp: ControlPlane) -> int:
     r = cp.r
     r.head("Restart trip-mcp bridges and their companions" + ("  [DRY RUN]" if cp.dry_run else ""))

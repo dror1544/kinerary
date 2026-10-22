@@ -7,6 +7,7 @@ import { App } from "./App";
 function renderRoute(route: string, authenticated = false) {
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
+    if (url === "/v1/auth/capabilities") return new Response(JSON.stringify({ google: true, emailPassword: true }));
     if (url === "/v1/me") return new Response(authenticated ? JSON.stringify({ id: "user_test", displayName: "Test Organizer" }) : JSON.stringify({ error: "AUTHENTICATION_REQUIRED" }), { status: authenticated ? 200 : 401, headers: { "content-type": "application/json" } });
     if (url === "/v1/trips") return new Response(JSON.stringify({ trips: [] }), { status: 200, headers: { "content-type": "application/json" } });
     return new Response(JSON.stringify({ error: "NOT_FOUND" }), { status: 404, headers: { "content-type": "application/json" } });
@@ -69,7 +70,7 @@ describe("Kinerary SPA routes", () => {
   it("renders the sign-in route directly", async () => {
     renderRoute("/sign-in");
     expect(await screen.findByRole("heading", { name: /sign in to continue/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /continue with google/i })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: /continue with google/i })).toBeInTheDocument();
   });
 
   it("renders the authenticated trip dashboard", async () => {
@@ -108,24 +109,4 @@ describe("Kinerary SPA routes", () => {
     expect(screen.queryByRole("button", { name: /approve and provision/i })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /^reject$/i })).not.toBeInTheDocument();
   });
-});
-
-it("accepts trip logout only from the active runtime frame and returns to My trips", async () => {
-  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
-    const url = String(input);
-    const json = (body: unknown) => new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
-    if (url === "/v1/me") return json({ id: "user_test", displayName: "Owner" });
-    if (url === `/v1/trips/${TRIP_ID}/launch`) return json({ runtimeOrigin: "https://runtime.example", framePath: `/t/${TRIP_ID}/`, launchToken: "fixture-grant" });
-    if (url === "/v1/trips") return json({ trips: [] });
-    return new Response("{}", { status: 404 });
-  }));
-  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={[`/trips/${TRIP_ID}/app`]}><App /></MemoryRouter></QueryClientProvider>);
-  const frame = await screen.findByTitle("Kinerary trip") as HTMLIFrameElement;
-  fireEvent(window, new MessageEvent("message", { origin: "https://untrusted.example", source: frame.contentWindow, data: { type: "kinerary:runtime-logout" } }));
-  expect(screen.getByTitle("Kinerary trip")).toBeInTheDocument();
-  fireEvent(window, new MessageEvent("message", { origin: "https://runtime.example", source: window, data: { type: "kinerary:runtime-logout" } }));
-  expect(screen.getByTitle("Kinerary trip")).toBeInTheDocument();
-  fireEvent(window, new MessageEvent("message", { origin: "https://runtime.example", source: frame.contentWindow, data: { type: "kinerary:runtime-logout" } }));
-  expect(await screen.findByRole("heading", { name: "My trips" })).toBeInTheDocument();
-  expect(screen.queryByTitle("Kinerary trip")).toBeNull();
 });

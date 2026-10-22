@@ -3,6 +3,16 @@
 This runbook describes validation on an HTTPS test domain. It does not
 authorize deployment or production cutover.
 
+On the control-plane VM the two services below are run by `compose.vm.yml` under
+the optional profile `web`, configured entirely from `vm.env`:
+"Organizer portal and runtime gateway" in
+[control-plane-vm-deployment.md](control-plane-vm-deployment.md) is the deployment
+procedure, and the acceptance below is what to run after it. The web image is built
+from the repository root (`docker build -f web/Dockerfile .`: the stylesheet imports
+`shared/brand-tokens.css`), and `web/nginx.conf` is an envsubst template whose
+asset-cache regex must stay quoted (#441) — check a change to it with the `nginx -t`
+command in that section.
+
 ## Required topology
 
 - Organizer origin: SPA/Nginx and same-origin `/v1` proxy.

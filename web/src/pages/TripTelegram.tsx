@@ -1,0 +1,100 @@
+import { useState } from "react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
+import { getMe, issueTelegramLink, unlinkTelegramLink, type TripSummary } from "../api";
+import { formatDay, formatTime } from "./dates";
+
+const HOW = {
+  interview_link: "via the trip's interview link",
+  earlier_interview: "from an earlier interview",
+  dashboard_link: "with a link from this page",
+  trip_password: "with the trip password",
+  invite: "with a site invitation",
+} as const;
+
+/**
+ * The trip card's Telegram status and its ⋮ menu.
+ *
+ * A Telegram link is PER TRIP: the account that is linked can open THIS trip in
+ * the bot (/trips, /switch) and in the Mini App without a password, and nothing
+ * else of the organizer's. So the status and the menu live on the card they
+ * describe, and Unlinking one trip leaves the others as they were.
+ *
+ * Link produces a one-time link for the account that opens it in Telegram (the
+ * only way back after an Unlink; an interview link someone forwarded does not
+ * undo one). Unlink lists each linked Telegram account by WHEN and HOW it was
+ * linked — never who: the server does not know a name and will not hand out an
+ * id, so the list is for recognising your own phone and spotting the one you
+ * did not make. A member sees the same card state and can end their own link,
+ * but only an organizer is offered Link.
+ */
+export function TripTelegram({ trip }: { trip: TripSummary }) {
+  const queryClient = useQueryClient();
+  const links = trip.telegram?.links ?? [];
+  const organizerSide = trip.permissions.dashboard && ["owner", "organizer"].includes(trip.permissions.role);
+  // A session a Telegram link minted cannot mint another way in: the server answers 403, so it is not offered.
+  const scoped = useQuery({ queryKey: ["me"], queryFn: getMe, retry: false }).data?.scope === "telegram";
+  const canLink = organizerSide && !scoped;
+  const [open, setOpen] = useState(false);
+  const [confirming, setConfirming] = useState<string | null>(null);
+  const refresh = () => Promise.all([
+    queryClient.invalidateQueries({ queryKey: ["trips"] }),
+    queryClient.invalidateQueries({ queryKey: ["trip", trip.id] }),
+  ]);
+  const link = useMutation({ mutationFn: () => issueTelegramLink(trip.id) });
+  const unlink = useMutation({
+    mutationFn: unlinkTelegramLink,
+    onSuccess: async () => { setConfirming(null); setOpen(false); link.reset(); await refresh(); },
+  });
+  if (!organizerSide && links.length === 0) return null;
+  const linked = links.length > 0;
+  const state = linked ? "linked" : "not linked";
+  return (
+    <div className="telegram-status" onKeyDown={(event) => { if (event.key === "Escape") { setOpen(false); setConfirming(null); } }}>
+      <span className={linked ? "telegram-icon linked" : "telegram-icon"} role="img" aria-label={`Telegram ${state}`} title={`Telegram ${state}`}>
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false">
+          <path fill="currentColor" d="M21.5 3.5 2.7 10.8c-.8.3-.8 1.4 0 1.7l4.6 1.7 1.8 5.5c.2.7 1.1.9 1.6.4l2.6-2.6 4.6 3.4c.6.4 1.4.1 1.6-.6l3.2-15.6c.2-.8-.6-1.4-1.3-1.1Z" />
+          {!linked && <path d="M3 3l18 18" stroke="#fff" strokeWidth="5" strokeLinecap="round" />}
+          {!linked && <path d="M3 3l18 18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />}
+        </svg>
+      </span>
+      <button
+        type="button" className="text-button telegram-kebab" aria-haspopup="menu" aria-expanded={open}
+        aria-label={`Telegram options for ${trip.title}`} onClick={() => { if (open) { link.reset(); setConfirming(null); } setOpen(!open); }}
+      >⋮</button>
+      {open && (
+        <div className="telegram-menu" role="menu" aria-label={`Telegram for ${trip.title}`}>
+          <p className="subtle telegram-state">{linked ? `${links.length === 1 ? "A Telegram account is" : `${links.length} Telegram accounts are`} linked to this trip.` : "No Telegram account is linked to this trip."}</p>
+          {organizerSide && scoped && <small>Signed in with Telegram: to link another Telegram account, sign in with your password.</small>}
+          {canLink && !link.data && (
+            <button type="button" role="menuitem" className="text-button" onClick={() => link.mutate()} disabled={link.isPending}>
+              {link.isPending ? "Preparing link…" : linked ? "Link another Telegram" : "Link Telegram"}
+            </button>
+          )}
+          {link.data && (
+            <div className="telegram-issued">
+              <a className="button button-small" href={link.data.deepLink} target="_blank" rel="noopener noreferrer">Open in Telegram</a>
+              <small>Works once, until {formatTime(link.data.expiresAt)}. Open it in the Telegram account you want to link to this trip.</small>
+            </div>
+          )}
+          {links.map((entry) => (
+            confirming === entry.id
+              ? <div key={entry.id} className="telegram-confirm" role="group" aria-label="Confirm unlink">
+                <small>Unlink this Telegram account (linked {formatDay(entry.linkedAt)})? It will stop opening this trip, and it will disappear from the bot's trip list.</small>
+                <span>
+                  <button type="button" className="text-button" onClick={() => unlink.mutate(entry.id)} disabled={unlink.isPending}>Confirm unlink</button>
+                  <button type="button" className="text-button" onClick={() => setConfirming(null)}>Keep</button>
+                </span>
+              </div>
+              : <button key={entry.id} type="button" role="menuitem" className="text-button telegram-unlink" onClick={() => setConfirming(entry.id)}>
+                Unlink Telegram · linked {formatDay(entry.linkedAt)}
+                <small>{HOW[entry.via]}{entry.lastSignedInAt ? ` · last opened ${formatDay(entry.lastSignedInAt)}` : " · not opened yet"}</small>
+              </button>
+          ))}
+          {link.isError && <div className="notice" role="alert">{link.error.message}</div>}
+          {unlink.isError && <div className="notice" role="alert">{unlink.error.message}</div>}
+        </div>
+      )}
+    </div>
+  );
+}

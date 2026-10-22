@@ -359,8 +359,37 @@ function avatarSrc(username) {
   return `/avatars/${_activeAvatarFile(username)}`;
 }
 
+// `trip-user` outlives the session and, on the shared runtime origin, would be
+// read by other trips: the dashboard link is a claim of THIS session and stays
+// in memory only.
+function saveTripUser(user) {
+  const { dashboard_url: _omitted, ...stored } = user || {};
+  localStorage.setItem('trip-user', JSON.stringify(stored));
+}
+
+// The organizer's way back to the dashboard. /api/auth/me sends dashboard_url
+// only to an organizer, however they reached the trip: from the signed claim
+// of a dashboard launch, or else from the address the trip's own configuration
+// names (a direct login, the installed app). Members and the agent key never
+// get it. Checked again here before it becomes an href, so a bad value shows
+// no entry rather than a `javascript:` link.
+function applyDashboardLink() {
+  const section = document.getElementById('sm-dashboard-section');
+  const link = document.getElementById('sm-dashboard-link');
+  if (!section || !link) return;
+  let href = '';
+  try {
+    const raw = safeUrl(currentUser && currentUser.dashboard_url);
+    const url = raw && raw.length <= 2048 ? new URL(raw) : null;
+    if (url && !url.username && !url.password) href = url.href;
+  } catch { href = ''; }
+  if (href) { link.setAttribute('href', href); section.style.display = ''; }
+  else { link.removeAttribute('href'); section.style.display = 'none'; }
+}
+
 function showLoggedIn() {
   if (!currentUser) return;
+  applyDashboardLink();
   // Side menu user block
   const smUser = document.getElementById('sm-user');
   const smAvatar = document.getElementById('sm-user-avatar');
@@ -591,7 +620,7 @@ function initAvatarLightbox() {
     if (!(currentUser && currentUser.username === username)) return;
     localStorage.removeItem(`avatar_${username}`);
     currentUser.avatar_file = null;
-    localStorage.setItem('trip-user', JSON.stringify(currentUser));
+    saveTripUser(currentUser);
     const token = localStorage.getItem('trip-token');
     if (token) {
       fetch('/api/auth/avatar', { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } }).catch(() => {});
@@ -741,7 +770,7 @@ function initAvatarLightbox() {
       if (currentUser) {
         currentUser.google_email = null;
         currentUser.google_picture = null;
-        localStorage.setItem('trip-user', JSON.stringify(currentUser));
+        saveTripUser(currentUser);
       }
       _updateGoogleConnectUI();
       showLoggedIn(); // fall back to the file-based avatar now that Google is disconnected
@@ -847,7 +876,7 @@ async function handleGoogleCredential(response) {
       }
       currentUser.google_email = data.google_email;
       currentUser.google_picture = data.google_picture;
-      localStorage.setItem('trip-user', JSON.stringify(currentUser));
+      saveTripUser(currentUser);
       _updateGoogleConnectUI();
       showLoggedIn(); // refresh the small side-menu avatar if no avatar was explicitly picked
     } catch {
@@ -974,7 +1003,7 @@ async function checkAuth() {
       if (res.ok) {
         currentUser = await res.json();
         isOrganizer = !!currentUser.is_organizer;
-        localStorage.setItem('trip-user', JSON.stringify(currentUser));
+        saveTripUser(currentUser);
         showLoggedIn();
         document.getElementById('login-overlay').style.display = 'none';
         return true;
@@ -994,6 +1023,7 @@ async function doLogout() {
   }
   ['trip-token', 'tripToken', 'token', 'trip-user'].forEach(key => localStorage.removeItem(key));
   currentUser = null;
+  applyDashboardLink();
   const smUser = document.getElementById('sm-user');
   if (smUser) smUser.style.display = 'none';
   // Close side menu if open

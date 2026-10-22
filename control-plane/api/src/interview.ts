@@ -2685,11 +2685,13 @@ export async function startSession(
     // binding above is — a link recorded for a session that then failed to
     // commit would claim an ownership nothing else agrees with.
     //
-    // This is what lets /trips and /switch exist at all; see
-    // organizer-trips.ts. It is NOT an authentication path and grants no web
-    // session — Telegram SSO stays retired (/v1/auth/telegram answers 410).
+    // This is what lets /trips and /switch exist at all, and the Mini App sign
+    // in for THIS trip; see organizer-trips.ts. The link is per trip, so
+    // unlinking it later leaves the organizer's other trips alone. It grants no
+    // web session by itself — the Mini App exchange does, from verified
+    // initData (telegram-mini-app.ts); /v1/auth/telegram stays retired (410).
     if (chatId) {
-      await linkTelegramOrganizerInTx(client, chatId, enrollment.userId);
+      await linkTelegramOrganizerInTx(client, chatId, enrollment.userId, enrollment.tripId);
     }
 
     await client.query("COMMIT");

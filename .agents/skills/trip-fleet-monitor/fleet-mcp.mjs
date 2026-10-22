@@ -39,7 +39,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SERVER_NAME = "kinerary-fleet";
-const SERVER_VERSION = "2.1.0";
+const SERVER_VERSION = "2.2.0";
 
 /** psql field separator: unit separator, which cannot occur in these columns. */
 const SEP = "\x1f";
@@ -376,6 +376,66 @@ function limited(stackName, task) {
   });
 }
 
+/**
+ * Companion gateways — what the control plane decided and what the host said
+ * (#349; migration 20261021100000). The reconciler in the worker WRITES these
+ * two tables; this file only reads them, through the same column-level grant as
+ * everything else, and every column here is a number, a timestamp or a value
+ * from a closed set — nothing a traveller typed.
+ *
+ * THE POINT OF THIS VOCABULARY: "stopped on purpose" and "broken" must never
+ * read the same. A trip whose companion is down because its organizer moved to
+ * another trip is DORMANT and nobody should be told; one that should be up and
+ * is not is BROKEN and somebody should.
+ *
+ *   RUNNING       should run, does
+ *   DORMANT       the reconciler STOPPED it on purpose and the host confirmed it
+ *                 (desired stopped AND last action a successful stop AND the
+ *                 host last said stopped/absent). The reason says why: NOT_CURRENT,
+ *                 ARCHIVED, RETIRED, PIN_OFF ... It is what happened, not what
+ *                 was decided: in observe mode nothing is ever dormant.
+ *   PENDING_STOP  decided stopped but not (yet) stopped by the reconciler:
+ *                 still running, or never stopped by it (observe mode, or inside
+ *                 the two-sweep confirmation) - and a conversation-hold that
+ *                 found the gateway down. Nobody is told; the relay and the
+ *                 release tool still EXPECT it up.
+ *   STARTING      should run, does not, and was decided under 15 minutes ago
+ *   BROKEN        should run, does not, for over 15 minutes or after 3 failed starts
+ *   STRAY         torn down or retired, and a gateway is still running
+ *   DUPLICATE     two independent gateway processes for one profile
+ *   UNOBSERVED    no good sweep in 30 minutes, so none of the above is current
+ *
+ * The DORMANT predicate is the same one relay/gateway-wait.ts and the release
+ * tool's live_companions() use to skip a companion; a test pins the three
+ * agree. If it changes, change all three.
+ */
+const GATEWAY_SWEEP_FRESH_SQL = `coalesce((SELECT max(ev.occurred_at) FROM control_plane.companion_gateway_events ev
+                                           WHERE ev.event = 'SWEEP' AND ev.result = 'ok') > now() - interval '30 minutes', false)`;
+const GATEWAY_HEALTH_SQL = `CASE
+    WHEN NOT ${GATEWAY_SWEEP_FRESH_SQL} OR g.observed IS NULL THEN 'UNOBSERVED'
+    WHEN g.observed = 'duplicate' THEN 'DUPLICATE'
+    WHEN g.desired = 'stopped' AND g.observed = 'running' AND g.reason IN ('RETIRED','TEARDOWN') THEN 'STRAY'
+    WHEN g.desired = 'stopped' AND g.last_action = 'stop' AND g.last_result = 'ok' AND g.observed IN ('stopped', 'absent') THEN 'DORMANT'
+    WHEN g.desired = 'stopped' THEN 'PENDING_STOP'
+    WHEN g.reason = 'QUIET_WINDOW' AND g.observed IN ('stopped','absent') THEN 'PENDING_STOP'
+    WHEN g.observed = 'running' THEN 'RUNNING'
+    WHEN g.failures >= 3 OR g.decided_at < now() - interval '15 minutes' THEN 'BROKEN'
+    ELSE 'STARTING'
+  END`;
+
+/** One row per managed gateway, with its health, as a derived table named `x`. */
+const gatewayRowsSql = (stack) => `
+  SELECT coalesce(t.slug, g.hermes_profile) AS name, ${tripClassSql(stack)} AS cls, g.kind AS kind,
+         g.desired AS desired, g.reason AS reason, coalesce(g.observed, '-') AS observed,
+         coalesce(g.observed_count::text, '-') AS observed_count, g.failures AS failures,
+         to_char(g.decided_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI') || ' UTC' AS decided,
+         ${GATEWAY_HEALTH_SQL} AS health
+    FROM control_plane.companion_gateways g
+    LEFT JOIN control_plane.trips t ON t.id = g.trip_id`;
+
+/** The needs-attention health classes — the ones somebody should look at. */
+const GATEWAY_ATTENTION = "('BROKEN','STRAY','DUPLICATE')";
+
 /** Run one read-only script against a stack and return rows as string arrays. */
 function runSql(stackName, sql) {
   if (CONFIG.error) return Promise.reject(new Error(CONFIG.error));
@@ -709,7 +769,7 @@ function stateCounts(rows) {
 const digestFirstLine = (stack) =>
   `${md(stackLabel(stack))}${isProduction(stack) ? "" : `${DOT}NOT PRODUCTION`}`;
 
-function renderOverviewDigest(stack, { stages, jobs, notifications, stalled, unreachable, stuck, links }) {
+function renderOverviewDigest(stack, { stages, jobs, notifications, stalled, unreachable, stuck, links, gateways }) {
   const lines = [digestFirstLine(stack), ""];
 
   // Trips by class and stage. live, prospect and retired always get a line so
@@ -793,6 +853,7 @@ function renderOverviewDigest(stack, { stages, jobs, notifications, stalled, unr
     lines.push("**Confirmed, never built**");
     for (const r of stuck) lines.push(`• ${md(r[0])} — ${md(r[1])}, ${stageLabel(r[2])}, waiting ${md(r[3])}`);
   }
+  lines.push(...renderGatewaysDigest(gateways));
   return lines.join("\n");
 }
 
@@ -907,10 +968,84 @@ async function loadOverview(stack) {
                      JOIN control_plane.trips t ON t.id = e.trip_id
                     GROUP BY 1,2 ORDER BY 1,2;`),
   ]);
-  return { stages, jobs, notifications, stalled, unreachable, stuck, links };
+  const gateways = await loadGateways(stack);
+  return { stages, jobs, notifications, stalled, unreachable, stuck, links, gateways };
 }
 
-function renderOverviewText(stack, { stages, jobs, notifications, stalled, unreachable, stuck, links }) {
+/**
+ * The reconciler's own heartbeat and the fleet's gateway health, or null on a
+ * stack that has not applied the migration (a stack a schema behind must
+ * degrade, not break).
+ */
+async function loadGateways(stack) {
+  if (!(await tableExists(stack, "control_plane.companion_gateways"))) return null;
+  const [sweep, health, attention] = await Promise.all([
+    runSql(stack, `SELECT e.mode, e.result, round(extract(epoch from (now() - e.occurred_at)) / 60)::text
+                     FROM control_plane.companion_gateway_events e
+                    WHERE e.event = 'SWEEP' ORDER BY e.occurred_at DESC LIMIT 1;`),
+    runSql(stack, `SELECT x.cls, x.health, x.reason, count(*)::text FROM (${gatewayRowsSql(stack)}) x
+                    GROUP BY 1,2,3 ORDER BY 1,2,3;`),
+    runSql(stack, `SELECT x.name, x.cls, x.health, x.reason, x.observed, x.failures::text FROM (${gatewayRowsSql(stack)}) x
+                    WHERE x.health IN ${GATEWAY_ATTENTION} AND x.cls <> 'scaffolding'
+                    ORDER BY x.name;`),
+  ]);
+  return { sweep, health, attention };
+}
+
+/** "observe, last sweep 3 min ago (ok)" — or the plain statement that none has been recorded. */
+function reconcilerLine(sweep) {
+  if (sweep.length === 0) {
+    return "no sweep has ever been recorded — the reconciler is off, or has not run yet (worker log: `gateway reconcile:`)";
+  }
+  const [mode, result, minutes] = sweep[0];
+  const stale = Number(minutes) > 30 ? " — STALE: nothing below is current" : "";
+  return `${mode}, last sweep ${minutes} min ago (${result})${stale}`;
+}
+
+function renderGatewaysText(gateways) {
+  if (!gateways) return [];
+  const { sweep, health, attention } = gateways;
+  const counts = new Map();
+  const reasons = new Map();
+  for (const [cls, state, reason, n] of health) {
+    if (NOISE_CLASSES.has(cls) && !["STRAY", "DUPLICATE"].includes(state)) continue;
+    counts.set(state, (counts.get(state) ?? 0) + Number(n));
+    if (state === "DORMANT") reasons.set(reason, (reasons.get(reason) ?? 0) + Number(n));
+  }
+  return [
+    "",
+    "COMPANION GATEWAYS  (the control plane decides which run — 'dormant' is stopped on purpose, 'broken' is not)",
+    `  reconciler: ${reconcilerLine(sweep)}`,
+    `  health: ${[...counts].map(([k, v]) => `${k}=${v}`).join(", ") || "none recorded"}`,
+    ...(reasons.size ? [`  dormant because: ${[...reasons].map(([k, v]) => `${k}=${v}`).join(", ")}`] : []),
+    ...(attention.length ? ["  NEEDS ATTENTION", asTable(attention.map((r) => [r[0], r[2], r[3], r[4], r[5]]),
+      ["trip", "health", "because", "host says", "failed starts"]).replace(/^/gm, "  ")] : []),
+  ];
+}
+
+function renderGatewaysDigest(gateways) {
+  if (!gateways) return [];
+  const { sweep, health, attention } = gateways;
+  const lines = ["", "**Companion gateways**"];
+  if (sweep.length === 0) {
+    lines.push("• ⚠️ the reconciler has never recorded a sweep (off, or not run yet)");
+  } else {
+    const [mode, result, minutes] = sweep[0];
+    lines.push(`• reconciler: ${md(mode)}, last sweep ${md(minutes)} min ago (${md(result)})${Number(minutes) > 30 ? " — ⚠️ stale" : ""}`);
+  }
+  const counts = new Map();
+  for (const [cls, state, , n] of health) {
+    if (NOISE_CLASSES.has(cls) && !["STRAY", "DUPLICATE"].includes(state)) continue;
+    counts.set(state, (counts.get(state) ?? 0) + Number(n));
+  }
+  if (counts.size) lines.push(`• ${[...counts].map(([k, v]) => `${v} ${md(k.toLowerCase())}`).join(DOT)}`);
+  for (const r of attention.slice(0, DIGEST_ALERT_CAP)) {
+    lines.push(`• ⚠️ ${md(r[0])}: ${md(r[2].toLowerCase())} (${md(r[3])}; host says ${md(r[4])})`);
+  }
+  return lines;
+}
+
+function renderOverviewText(stack, { stages, jobs, notifications, stalled, unreachable, stuck, links, gateways }) {
   const liveStages = stages.filter((r) => r[0] === "live");
   const byStage = (cls) => stages.filter((r) => r[0] === cls).map((r) => `${r[1]}=${r[2]}`).join(", ") || "none";
 
@@ -943,6 +1078,7 @@ function renderOverviewText(stack, { stages, jobs, notifications, stalled, unrea
     "",
     "CONFIRMED BUT NEVER BUILT — someone finished answering and no job exists",
     asTable(stuck, ["slug", "class", "stage", "waiting"]),
+    ...renderGatewaysText(gateways),
   ].join("\n");
 }
 
@@ -974,7 +1110,8 @@ async function tripDetail({ stack = CONFIG.defaultStack, trip }) {
   const ref = safeRef(trip);
   const match = `(t.id = '${ref}' OR t.slug = '${ref}')`;
 
-  const [head, session, jobs, steps, notifications, bindings, people, enrollments, models] = await Promise.all([
+  const hasGateways = await tableExists(stack, "control_plane.companion_gateways");
+  const [head, session, jobs, steps, notifications, bindings, people, enrollments, models, gateway, gatewayEvents] = await Promise.all([
     runSql(stack, `SELECT t.id, t.slug, ${tripClassSql(stack)}, t.lifecycle_state, coalesce(t.reachability,'-'),
                           coalesce(t.unreachable_reason,'-'), coalesce(t.title,'-'), coalesce(t.destination_label,'-'),
                           coalesce(to_char(t.start_date,'YYYY-MM-DD'),'-'), coalesce(to_char(t.end_date,'YYYY-MM-DD'),'-'),
@@ -1067,6 +1204,30 @@ async function tripDetail({ stack = CONFIG.defaultStack, trip }) {
                      JOIN control_plane.intake_sessions s ON s.id = i.session_id
                      JOIN control_plane.trips t ON t.id = s.trip_id
                     WHERE ${match} GROUP BY 1 ORDER BY 1;`),
+    // The control plane's decision for this trip's companion gateway and what
+    // the host last said, in closed codes (migration 20261021100000).
+    hasGateways
+      ? runSql(stack, `SELECT x.health, x.desired, x.reason, x.observed, x.observed_count, x.decided,
+                              coalesce(g.pin, '-'), coalesce(g.last_action || ' ' || g.last_result, '-'),
+                              coalesce(to_char(g.last_action_at AT TIME ZONE 'UTC', 'MM-DD HH24:MI') || ' UTC', '-'),
+                              g.failures::text,
+                              coalesce(to_char(g.next_attempt_at AT TIME ZONE 'UTC', 'MM-DD HH24:MI') || ' UTC', '-'),
+                              coalesce(to_char(g.observed_at AT TIME ZONE 'UTC', 'MM-DD HH24:MI') || ' UTC', '-')
+                         FROM control_plane.companion_gateways g
+                         JOIN control_plane.trips t ON t.id = g.trip_id
+                         JOIN (${gatewayRowsSql(stack)}) x ON x.name = t.slug
+                        WHERE ${match};`)
+      : Promise.resolve([]),
+    hasGateways
+      ? runSql(stack, `SELECT to_char(ge.occurred_at AT TIME ZONE 'UTC', 'MM-DD HH24:MI') || ' UTC', ge.event,
+                              coalesce(ge.desired, '-'), coalesce(ge.reason, '-'), coalesce(ge.observed, '-'),
+                              coalesce(ge.action, '-'), coalesce(ge.result, '-'), coalesce(ge.pin, '-')
+                         FROM control_plane.companion_gateway_events ge
+                         JOIN control_plane.companion_gateways g ON g.hermes_profile = ge.hermes_profile
+                         JOIN control_plane.trips t ON t.id = g.trip_id
+                        WHERE ${match} AND ge.event <> 'SWEEP'
+                        ORDER BY ge.occurred_at DESC LIMIT 12;`)
+      : Promise.resolve([]),
   ]);
 
   if (head.length === 0) return `No trip matching '${ref}' on ${stack}.`;
@@ -1105,6 +1266,17 @@ async function tripDetail({ stack = CONFIG.defaultStack, trip }) {
     "",
     "PEOPLE LINKED  (roles only — names are deliberately not available to this tool)",
     asTable(people, ["role", "verified_via", "count"]),
+    ...(hasGateways ? [
+      "",
+      "COMPANION GATEWAY  (decided by the control plane: dormant = stopped on purpose, broken = should be up and is not)",
+      gateway.length === 0
+        ? "  (no decision recorded for this trip yet)"
+        : asTable([[gateway[0][0], gateway[0][1], gateway[0][2], `${gateway[0][3]} (${gateway[0][4]})`, gateway[0][5], gateway[0][6],
+                    gateway[0][7], gateway[0][8], gateway[0][9], gateway[0][10]]],
+            ["health", "should be", "because", "host says", "decided", "pin", "last action", "at", "failed starts", "next attempt"]),
+      "  recent changes:",
+      asTable(gatewayEvents, ["when", "what", "should be", "because", "host says", "action", "result", "pin"]),
+    ] : []),
   ].join("\n");
 }
 
@@ -1719,9 +1891,13 @@ async function loadAlerts(stack, h) {
   // table at all.
   const hasVerification = await tableExists(stack, "control_plane.verification_evidence");
 
+  // The control plane's own account of which companion gateways should run
+  // (migration 20261021100000). A stack a schema behind has no such table.
+  const hasGateways = await tableExists(stack, "control_plane.companion_gateways");
+
   const [
     unreachable, jobs, notifications, stuck, awaiting, companionless, modelFailing, reported,
-    verificationFailed, bridgeCheckFailed, awaitingApproval, reachabilityStale,
+    verificationFailed, bridgeCheckFailed, awaitingApproval, reachabilityStale, gatewaysDown, reconcilerSilent,
   ] = await Promise.all([
     runSql(stack, `SELECT t.slug, coalesce(t.unreachable_reason,'-')
                      FROM control_plane.trips t
@@ -1861,12 +2037,46 @@ async function loadAlerts(stack, h) {
                       AND EXISTS (SELECT 1 FROM control_plane.trips p
                                    WHERE p.reachability_checked_at > now() - interval '60 minutes')
                     ORDER BY t.slug;`),
+    // A companion that is DORMANT is not here, on purpose: stopped because its
+    // organizer moved on, or the trip ended, is the system working. Only a
+    // gateway that should be up and is not, one still running after its trip
+    // was torn down, and one that is running twice. Sorted, and with no
+    // derived time in the text: it must not change while the fleet does not.
+    hasGateways
+      ? runSql(stack, `SELECT x.name, x.health, x.reason, x.observed, x.failures::text
+                         FROM (${gatewayRowsSql(stack)}) x
+                        WHERE x.health IN ${GATEWAY_ATTENTION} AND x.cls <> 'scaffolding'
+                        ORDER BY x.name;`)
+      : Promise.resolve([]),
+    // The reconciler's heartbeat: a sweep row every sweep. If it ran once and
+    // has not had a good sweep for 30 minutes, every health above is stale, and
+    // saying so is the alert. A stack where it never ran has nothing to compare.
+    hasGateways
+      ? runSql(stack, `SELECT coalesce(to_char(max(ev.occurred_at) FILTER (WHERE ev.result = 'ok') AT TIME ZONE 'UTC',
+                                                'YYYY-MM-DD HH24:MI') || ' UTC', 'never')
+                         FROM control_plane.companion_gateway_events ev
+                        WHERE ev.event = 'SWEEP'
+                       HAVING count(*) > 0
+                          AND coalesce(max(ev.occurred_at) FILTER (WHERE ev.result = 'ok'), 'epoch') < now() - interval '30 minutes'
+                        ORDER BY 1;`)
+      : Promise.resolve([]),
   ]);
   return {
     unreachable, jobs, notifications, stuck, awaiting, companionless, modelFailing, reported,
-    verificationFailed, awaitingApproval, bridgeCheckFailed, reachabilityStale,
+    verificationFailed, awaitingApproval, bridgeCheckFailed, reachabilityStale, gatewaysDown, reconcilerSilent,
   };
 }
+
+/** What each needs-attention gateway health says, for the agent and (with `esc`) the digest. */
+const GATEWAY_ALERT_TEXT = {
+  BROKEN: (r, esc = (v) => v) =>
+    `${esc(r[0])} — companion gateway is down but should be running (${esc(r[2])}): the host reports it ${esc(r[3])}` +
+    (Number(r[4]) > 0 ? `; ${esc(r[4])} start attempt(s) failed` : ""),
+  STRAY: (r, esc = (v) => v) =>
+    `${esc(r[0])} — a gateway is still running although this trip was torn down (${esc(r[2])})`,
+  DUPLICATE: (r, esc = (v) => v) =>
+    `${esc(r[0])} — two independent gateway processes are running for one companion`,
+};
 
 /**
  * The alert categories, ONCE. The text the agent reads and the compact digest
@@ -1880,7 +2090,7 @@ async function loadAlerts(stack, h) {
  */
 function alertSections({
   unreachable, jobs, notifications, stuck, awaiting, companionless, modelFailing, reported,
-  verificationFailed, awaitingApproval, bridgeCheckFailed, reachabilityStale,
+  verificationFailed, awaitingApproval, bridgeCheckFailed, reachabilityStale, gatewaysDown = [], reconcilerSilent = [],
 }) {
   return [
     { title: "UNREACHABLE", label: "unreachable", rows: unreachable,
@@ -1929,6 +2139,15 @@ function alertSections({
     { title: "UNDELIVERED NOTIFICATIONS", label: "undelivered notification", rows: notifications,
       text: (r) => `${r[0]} — ${r[1]} (attempt ${r[2]})`,
       digest: (r) => `${md(r[0])} — ${md(r[1])} (attempt ${md(r[2])})` },
+    // Not UNREACHABLE: that one is a bridge that cannot reach its trip. This is
+    // the gateway process itself, which the control plane decides about
+    // (#349). BROKEN is never a gateway that was stopped on purpose.
+    { title: "COMPANION GATEWAY", label: "companion gateway", rows: gatewaysDown,
+      text: (r) => GATEWAY_ALERT_TEXT[r[1]](r),
+      digest: (r) => GATEWAY_ALERT_TEXT[r[1]](r, md) },
+    { title: "GATEWAY RECONCILER SILENT", label: "gateway reconciler silent", rows: reconcilerSilent,
+      text: (r) => `${r[0] === "never" ? "no good sweep has ever completed (the host may not understand the status request yet)" : `no good sweep since ${r[0]}`}; the gateway health reported by this tool is stale`,
+      digest: (r) => `${r[0] === "never" ? "no good sweep has ever completed" : `no good sweep since ${md(r[0])}`}; gateway health is stale` },
     { title: "REPORTED BY A COMPANION", label: "reported by a companion", rows: reported,
       text: (r) => `${r[0]} [${r[1]}] ${r[2]} (${r[3]}, ${r[4]})`,
       // A traveller's own summary: cut short, and stripped of anything that

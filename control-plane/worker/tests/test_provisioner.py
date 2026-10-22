@@ -12,6 +12,7 @@ import os
 import re
 import secrets
 import unittest
+from pathlib import Path
 from typing import Any
 
 import psycopg
@@ -23,6 +24,7 @@ from control_plane_worker.provisioner import (
     ProvisionerWorker,
     TripRetired,
     bind_chat_to_trip,
+    normalize_portal_origin,
     _record_trip_companion,
     attach_profile_to_orphan_bindings,
 )
@@ -429,6 +431,47 @@ class ProvisionerHappyPathTests(unittest.TestCase):
         identity = sidecars["control-plane.identity.json"]
         self.assertEqual(self.fix["trip_id"], identity["tripId"])
         self.assertIsNone(identity["owner"], "an unresolved organizer must not be guessed")
+
+    def _identity_sidecar_with(self, **worker_kwargs: Any) -> dict[str, Any]:
+        worker = ProvisionerWorker(db_url=DB_URL, deploy=self.fake_deploy, worker_id="test-provisioner", **worker_kwargs)
+        worker.run_once()
+        return self.fake_deploy.deployed[-1]["sidecars"]["control-plane.identity.json"]
+
+    def test_identity_sidecar_tells_the_trip_where_its_dashboard_lives(self) -> None:
+        # So an organizer who opens the trip on its own hostname still has a way back.
+        identity = self._identity_sidecar_with(portal_origin="https://portal.example.test/")
+        self.assertEqual("https://portal.example.test", identity["portalOrigin"], "a plain origin, slash dropped")
+        self.assertEqual(self.fix["trip_id"], identity["tripId"])
+        # Never in the public trip config, which the site serves.
+        self.assertNotIn("portal.example.test", json.dumps(self.fake_deploy.deployed[-1]["config"]))
+
+    def test_identity_sidecar_has_no_portal_origin_when_unset_and_the_worker_says_so(self) -> None:
+        with self.assertLogs("control_plane_worker.provisioner", level="INFO") as logs:
+            identity = self._identity_sidecar_with(portal_origin="")
+        self.assertNotIn("portalOrigin", identity)
+        self.assertTrue(any("provisioner.portal_origin_unset" in line for line in logs.output))
+
+    def test_a_malformed_portal_origin_is_dropped_loudly_not_written(self) -> None:
+        for bad in ("javascript:alert(1)", "http://portal.example.test", "https://u:p@portal.example.test", "https://portal.example.test/x",
+                    "https://evil.example\\portal.example.test", "https://portal.example.test."):
+            with self.subTest(bad=bad):
+                with self.assertLogs("control_plane_worker.provisioner", level="WARNING") as logs:
+                    identity = self._identity_sidecar_with(portal_origin=bad)
+                self.assertNotIn("portalOrigin", identity)
+                self.assertTrue(any("provisioner.portal_origin_invalid" in line for line in logs.output))
+                self.assertFalse(any(bad in line for line in logs.output), "the value itself is not echoed")
+
+    def test_portal_origin_defaults_from_the_environment_variable_the_compose_files_pass(self) -> None:
+        previous = os.environ.get("CONTROL_PLANE_PORTAL_ORIGIN")
+        os.environ["CONTROL_PLANE_PORTAL_ORIGIN"] = "https://portal.example.test"
+        try:
+            identity = self._identity_sidecar_with()
+        finally:
+            if previous is None:
+                del os.environ["CONTROL_PLANE_PORTAL_ORIGIN"]
+            else:
+                os.environ["CONTROL_PLANE_PORTAL_ORIGIN"] = previous
+        self.assertEqual("https://portal.example.test", identity["portalOrigin"])
 
     def test_owner_identity_is_bound_to_the_resolved_local_organizer(self) -> None:
         teardown_fixture(self.conn, self.fix)
@@ -2878,3 +2921,23 @@ class ReconcileCompanionTests(unittest.TestCase):
             self.worker.reconcile_companion(self.fix["trip_id"])
         self.assertEqual(self._state(), before)
         self.assertEqual(self.companion.installed, [])
+
+
+class NormalizePortalOriginTests(unittest.TestCase):
+    """One list for both validators: the trip site's safePortalOrigin reads the
+    same tests/fixtures/portal-origin-cases.json, so a case cannot be accepted by
+    one side and refused by the other without a test going red."""
+
+    CASES = json.loads(
+        (Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "portal-origin-cases.json").read_text(encoding="utf-8")
+    )["cases"]
+
+    def test_the_shared_list_is_not_empty_either_way(self) -> None:
+        self.assertGreater(len(self.CASES), 60)
+        self.assertTrue(any(c["accepted"] for c in self.CASES))
+        self.assertTrue(any(not c["accepted"] for c in self.CASES))
+
+    def test_accepts_and_refuses_exactly_what_the_shared_list_says(self) -> None:
+        for case in self.CASES:
+            expected = case["canonical"] if case["accepted"] else None
+            self.assertEqual(expected, normalize_portal_origin(case["input"]), repr(case["input"])[:60])  # type: ignore[arg-type]

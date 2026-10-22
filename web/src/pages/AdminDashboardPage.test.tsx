@@ -179,4 +179,76 @@ describe("the super-admin dashboard page", () => {
     expect(await screen.findByLabelText(/admin key/i)).toBeInTheDocument();
     expect(sessionStorage.getItem("kinerary-admin-key")).toBeNull();
   });
+
+  it("says plainly that a wrong key was not accepted, keeps the form open, and never shows the dashboard as unlocked (#436)", async () => {
+    stubFetch(() => json({ error: "AUTHENTICATION_REQUIRED" }, 401));
+    renderPage();
+    expect(screen.queryByRole("alert")).toBeNull();
+    fireEvent.change(screen.getByLabelText(/admin key/i), { target: { value: "a-wrong-key" } });
+    fireEvent.click(screen.getByRole("button", { name: /unlock/i }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("That key was not accepted. Check it and try again.");
+    expect(screen.getByLabelText(/admin key/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /unlock/i })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: /control-plane dashboard/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^lock$/i })).toBeNull();
+    expect(sessionStorage.getItem("kinerary-admin-key")).toBeNull();
+  });
+
+  it("does not render dashboard chrome while the key is still being checked (#436)", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => {})));
+    renderPage();
+    fireEvent.change(screen.getByLabelText(/admin key/i), { target: { value: "a-key" } });
+    fireEvent.click(screen.getByRole("button", { name: /unlock/i }));
+    expect(await screen.findByText(/checking the key/i)).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: /control-plane dashboard/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^lock$/i })).toBeNull();
+  });
+
+  it("lets the operator retry with a right key after a rejection, and the message goes away (#436)", async () => {
+    stubFetch((url, init) => {
+      if (new Headers(init?.headers).get("x-api-key") !== "right-key") return json({ error: "AUTHENTICATION_REQUIRED" }, 401);
+      if (url === "/v1/admin/report") return json(EMPTY_REPORT);
+      if (url === "/v1/admin/funnel") return json(EMPTY_FUNNEL);
+      if (url === "/v1/admin/jobs") return json({ jobs: [] });
+      if (url === "/v1/admin/failures") return json({ failures: [] });
+      if (url === "/v1/admin/versions") return json({ releases: [] });
+      if (url === "/v1/admin/audit") return json({ events: [] });
+      return json({ error: "NOT_FOUND" }, 404);
+    });
+    renderPage();
+    fireEvent.change(screen.getByLabelText(/admin key/i), { target: { value: "wrong-key" } });
+    fireEvent.click(screen.getByRole("button", { name: /unlock/i }));
+    await screen.findByText(/that key was not accepted/i);
+    fireEvent.change(screen.getByLabelText(/admin key/i), { target: { value: "right-key" } });
+    fireEvent.click(screen.getByRole("button", { name: /unlock/i }));
+    expect(await screen.findByRole("heading", { name: /control-plane dashboard/i })).toBeInTheDocument();
+    expect(screen.queryByText(/that key was not accepted/i)).not.toBeInTheDocument();
+    expect(sessionStorage.getItem("kinerary-admin-key")).toBe("right-key");
+  });
+
+  it("trims whitespace a paste or autofill put around the key (#436)", async () => {
+    const seen: (string | null)[] = [];
+    stubFetch((url, init) => {
+      seen.push(new Headers(init?.headers).get("x-api-key"));
+      return json({ error: "AUTHENTICATION_REQUIRED" }, 401);
+    });
+    renderPage();
+    fireEvent.change(screen.getByLabelText(/admin key/i), { target: { value: "  padded-key\n" } });
+    fireEvent.click(screen.getByRole("button", { name: /unlock/i }));
+    await screen.findByText(/that key was not accepted/i);
+    expect(seen.length).toBeGreaterThan(0);
+    expect(new Set(seen)).toEqual(new Set(["padded-key"]));
+  });
+
+  it("treats a whitespace-only key as empty: no admin call, no unlock (#436)", async () => {
+    const calls: string[] = [];
+    stubFetch((url) => { calls.push(url); return json({}, 404); });
+    renderPage();
+    fireEvent.change(screen.getByLabelText(/admin key/i), { target: { value: "   " } });
+    fireEvent.click(screen.getByRole("button", { name: /unlock/i }));
+    expect(screen.getByLabelText(/admin key/i)).toBeInTheDocument();
+    expect(calls).toEqual([]);
+    expect(sessionStorage.getItem("kinerary-admin-key")).toBeNull();
+  });
 });

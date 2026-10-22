@@ -5,6 +5,7 @@ import pg from "pg";
 import { buildApp } from "../src/app.js";
 import { validateArchitectureProfile } from "../src/config.js";
 import { applyMigrations } from "../src/migrations.js";
+import { createOrVerifyPasswordIdentity } from "../src/password-identity.js";
 import { sha256, type PortalDependencies } from "../src/portal.js";
 import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
@@ -79,6 +80,8 @@ after(async () => {
   await pool.query("DELETE FROM control_plane.web_password_credentials WHERE trip_id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
   await pool.query("DELETE FROM control_plane.site_invites WHERE trip_id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
   await pool.query("DELETE FROM control_plane.web_sessions WHERE user_id = ANY($1)", [[ids.owner, ids.member, ids.outsider, passwordInviteeId].filter(Boolean)]);
+  await pool.query("DELETE FROM control_plane.telegram_link_tokens WHERE trip_id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
+  await pool.query("DELETE FROM control_plane.telegram_organizer_trip_links WHERE trip_id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
   await pool.query("DELETE FROM control_plane.trip_memberships WHERE trip_id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
   await pool.query("DELETE FROM control_plane.trips WHERE id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
   await pool.query("DELETE FROM control_plane.telegram_organizer_links WHERE user_id = ANY($1)", [[ids.owner, ids.member, ids.outsider]]);
@@ -109,7 +112,9 @@ test("portal HTTP authorization separates dashboard, tenant and runtime access",
     assert.equal(unknownRuntimeUser.statusCode, 409);
 
     const memberTrips = await app.inject({ method: "GET", url: "/v1/trips", headers: { cookie: member.cookie } });
-    assert.deepEqual(memberTrips.json().trips, []);
+    // A member's "My trips" is the trips they can open (#442); the dashboard
+    // detail of those trips stays an organizer-only 404 just below.
+    assert.deepEqual(memberTrips.json().trips.map((trip: { id: string }) => trip.id), [ids.ownedTrip]);
     const memberDetail = await app.inject({ method: "GET", url: `/v1/trips/${ids.ownedTrip}`, headers: { cookie: member.cookie } });
     assert.equal(memberDetail.statusCode, 404);
     const memberLaunch = await app.inject({ method: "POST", url: `/v1/trips/${ids.ownedTrip}/launch`, headers: { cookie: member.cookie, "x-csrf-token": member.csrf } });
@@ -120,6 +125,11 @@ test("portal HTTP authorization separates dashboard, tenant and runtime access",
     const consumed = await app.inject({ method: "POST", url: "/internal/runtime-launch/consume", headers: { "x-api-key": "exchange-key" }, payload: { token: memberLaunch.json().launchToken } });
     assert.equal(consumed.statusCode, 200);
     assert.equal(consumed.json().tripId, ids.ownedTrip);
+    assert.equal(consumed.json().dashboardUrl, null, "a member has no dashboard to return to");
+    const ownerLaunch = await app.inject({ method: "POST", url: `/v1/trips/${ids.ownedTrip}/launch`, headers: { cookie: owner.cookie, "x-csrf-token": owner.csrf } });
+    assert.equal(ownerLaunch.statusCode, 200);
+    const ownerConsumed = await app.inject({ method: "POST", url: "/internal/runtime-launch/consume", headers: { "x-api-key": "exchange-key" }, payload: { token: ownerLaunch.json().launchToken } });
+    assert.equal(ownerConsumed.json().dashboardUrl, `http://portal.example.test/trips/${ids.ownedTrip}/setup`, "built from the configured portal origin");
     const replay = await app.inject({ method: "POST", url: "/internal/runtime-launch/consume", headers: { "x-api-key": "exchange-key" }, payload: { token: memberLaunch.json().launchToken } });
     assert.equal(replay.statusCode, 401);
 
@@ -184,7 +194,8 @@ test("portal HTTP authorization separates dashboard, tenant and runtime access",
     const limitedMe = await app.inject({ method: "GET", url: "/v1/me", headers: { cookie: limitedCookie } });
     assert.equal(limitedMe.statusCode, 200);
     const limitedTrips = await app.inject({ method: "GET", url: "/v1/trips", headers: { cookie: limitedCookie } });
-    assert.deepEqual(limitedTrips.json().trips, []);
+    assert.deepEqual(limitedTrips.json().trips.map((trip: { id: string }) => trip.id), [ids.ownedTrip]);
+    assert.equal(limitedTrips.json().trips[0].permissions.dashboard, false);
     const limitedLaunch = await app.inject({
       method: "POST", url: `/v1/trips/${ids.ownedTrip}/launch`,
       headers: { cookie: limitedCookie, "x-csrf-token": csrf },
@@ -192,13 +203,13 @@ test("portal HTTP authorization separates dashboard, tenant and runtime access",
     assert.equal(limitedLaunch.statusCode, 200);
 
     const passwordLogin = await app.inject({
-      method: "POST", url: "/v1/auth/password",
+      method: "POST", url: "/v1/auth/password", headers: { origin: "http://portal.example.test" },
       payload: { tripId: ids.ownedTrip, runtimeUsername: "password-guest", password: "password-guest-secret", returnTo: `/trips/${ids.ownedTrip}/app` },
     });
     assert.equal(passwordLogin.statusCode, 200);
     assert.equal(passwordLogin.json().appPath, `/trips/${ids.ownedTrip}/app`);
     const badPassword = await app.inject({
-      method: "POST", url: "/v1/auth/password",
+      method: "POST", url: "/v1/auth/password", headers: { origin: "http://portal.example.test" },
       payload: { tripId: ids.ownedTrip, runtimeUsername: "password-guest", password: "wrong-secret" },
     });
     assert.equal(badPassword.statusCode, 401);
@@ -382,5 +393,200 @@ test("with no operator chat id configured, approval still succeeds and simply en
       `SELECT count(*)::int AS count FROM control_plane.notification_outbox
        WHERE notification_type = 'operator_provisioning_approved'`);
     assert.equal(after.rows[0].count, before.rows[0].count, "no operator row was added");
+  } finally { await app.close(); }
+});
+
+
+test("existing organizer email login keeps canonical identity and authorizes a CSRF-protected new trip and interview", { skip }, async () => {
+  const email = `portal-${suffix}@example.test`;
+  const password = "existing-organizer-secret";
+  const seeded = await createOrVerifyPasswordIdentity(pool, { email, password });
+  assert.ok(seeded.ok);
+  const userId = seeded.identity.providerSubjectId;
+  const app = buildApp(profile, { portal: { ...portalDeps(pool), google: undefined } });
+  let tripId: string | undefined;
+  try {
+    const before = await pool.query("SELECT count(*)::int AS count FROM control_plane.users");
+    const login = await app.inject({ method: "POST", url: "/v1/auth/email-password", payload: { email: email.toUpperCase(), password, returnTo: "//attacker.test" } });
+    assert.equal(login.statusCode, 200);
+    assert.equal(login.json().appPath, "/trips");
+    const lines = login.headers["set-cookie"];
+    assert.ok(Array.isArray(lines));
+    assert.match(lines[0], /HttpOnly/);
+    assert.match(lines[0], /SameSite=Lax/);
+    const cookie = lines.map(line => line.split(";", 1)[0]).join("; ");
+    const csrf = decodeURIComponent(lines.find(line => line.startsWith("kit_csrf="))!.split(";", 1)[0].slice("kit_csrf=".length));
+    const me = await app.inject({ url: "/v1/me", headers: { cookie } });
+    assert.equal(me.statusCode, 200);
+    assert.equal(me.json().id, userId);
+    assert.equal((await pool.query("SELECT count(*)::int AS count FROM control_plane.users")).rows[0].count, before.rows[0].count);
+    const payload = { destination: "Rome", startDate: "2027-03-01", endDate: "2027-03-09", tripType: "family" };
+    assert.equal((await app.inject({ method: "POST", url: "/v1/trips", headers: { cookie }, payload })).statusCode, 403);
+    const created = await app.inject({ method: "POST", url: "/v1/trips", headers: { cookie, "x-csrf-token": csrf }, payload });
+    assert.equal(created.statusCode, 201);
+    tripId = created.json().id;
+    const detail = await app.inject({ url: `/v1/trips/${tripId}`, headers: { cookie } });
+    assert.equal(detail.statusCode, 200);
+    assert.equal(detail.json().destination, "Rome");
+    assert.equal(detail.json().startDate, "2027-03-01");
+    const interview = await app.inject({ method: "POST", url: `/v1/trips/${tripId}/interview-link`, headers: { cookie, "x-csrf-token": csrf } });
+    assert.equal(interview.statusCode, 201);
+    assert.match(interview.json().deepLink, /^https:\/\/t\.me\/kinerary_bot\?start=/);
+    for (const input of [{ email, password: "wrong" }, { email: "unknown@example.test", password }, { email, password: "x".repeat(1025) }]) {
+      const response = await app.inject({ method: "POST", url: "/v1/auth/email-password", payload: input });
+      assert.equal(response.statusCode, 401);
+      assert.deepEqual(response.json(), { error: "INVALID_CREDENTIALS" });
+      assert.equal(response.headers["set-cookie"], undefined);
+    }
+    const crossOrigin = await app.inject({ method: "POST", url: "/v1/auth/email-password", headers: { origin: "https://attacker.test" }, payload: { email, password } });
+    assert.equal(crossOrigin.statusCode, 403);
+    await pool.query("UPDATE control_plane.users SET status = 'suspended' WHERE id = $1", [userId]);
+    const inactive = await app.inject({ method: "POST", url: "/v1/auth/email-password", payload: { email, password } });
+    assert.equal(inactive.statusCode, 401);
+    assert.deepEqual(inactive.json(), { error: "INVALID_CREDENTIALS" });
+    assert.equal((await app.inject({ url: "/v1/me", headers: { cookie } })).statusCode, 401);
+  } finally {
+    if (tripId) {
+      await pool.query("DELETE FROM control_plane.funnel_events WHERE trip_id = $1", [tripId]);
+      await pool.query("DELETE FROM control_plane.interview_enrollments WHERE trip_id = $1", [tripId]);
+      await pool.query("DELETE FROM control_plane.trip_memberships WHERE trip_id = $1", [tripId]);
+      await pool.query("DELETE FROM control_plane.trips WHERE id = $1", [tripId]);
+    }
+    await pool.query("DELETE FROM control_plane.funnel_events WHERE user_id = $1", [userId]);
+    await pool.query("DELETE FROM control_plane.web_sessions WHERE user_id = $1", [userId]);
+    await pool.query("DELETE FROM control_plane.password_credentials WHERE user_id = $1", [userId]);
+    await pool.query("DELETE FROM control_plane.user_identities WHERE user_id = $1", [userId]);
+    await pool.query("DELETE FROM control_plane.users WHERE id = $1", [userId]);
+    await app.close();
+  }
+});
+
+test("lost interview recovery is owner-only, CSRF-protected and explicit; expired links use ordinary issuance", { skip }, async () => {
+  const app = buildApp(profile, { portal: portalDeps(pool) });
+  const owner = await session(ids.owner, "recovery"); const outsider = await session(ids.outsider, "recoveryother");
+  let tripId: string | undefined;
+  try {
+    const headers = { cookie: owner.cookie, "x-csrf-token": owner.csrf };
+    const created = await app.inject({ method: "POST", url: "/v1/trips", headers, payload: { destination: "Recovery test", tripType: "family" } });
+    assert.equal(created.statusCode, 201); tripId = created.json().id;
+    const url = `/v1/trips/${tripId}/interview-link`;
+    const issued = await app.inject({ method: "POST", url, headers }); assert.equal(issued.statusCode, 201);
+    const oldId = issued.json().enrollmentId;
+    assert.equal((await app.inject({ method: "POST", url, headers })).json().error, "ACTIVE_ENROLLMENT_EXISTS");
+    assert.equal((await app.inject({ url })).statusCode, 401);
+    assert.equal((await app.inject({ url, headers: { cookie: outsider.cookie } })).statusCode, 404);
+    const metadata = await app.inject({ url, headers }); assert.equal(metadata.statusCode, 200);
+    assert.equal(metadata.headers['cache-control'], 'private, no-store');
+    assert.deepEqual(metadata.json().activeEnrollment, { id: oldId, expiresAt: issued.json().expiresAt });
+    assert.equal(metadata.json().recoverable, true);
+    assert.doesNotMatch(metadata.body, /start=|token|token_digest/);
+    const replace = { method: "POST" as const, url: url + "/replace", payload: { expectedEnrollmentId: oldId } };
+    assert.equal((await app.inject({ ...replace, headers: { cookie: owner.cookie } })).statusCode, 403);
+    assert.equal((await app.inject({ ...replace, headers: { cookie: outsider.cookie, "x-csrf-token": outsider.csrf } })).statusCode, 404);
+    assert.equal((await app.inject({ ...replace, headers, payload: {} })).statusCode, 400);
+    const next = await app.inject({ ...replace, headers }); assert.equal(next.statusCode, 201);
+    assert.notEqual(next.json().deepLink, issued.json().deepLink);
+    const { verifyEnrollmentToken } = await import('../src/enrollment.js');
+    assert.deepEqual(await verifyEnrollmentToken(pool, new URL(issued.json().deepLink).searchParams.get('start')!), { ok: false, reason: 'REVOKED' });
+    assert.equal((await app.inject({ ...replace, headers })).statusCode, 409);
+    await pool.query("UPDATE control_plane.interview_enrollments SET expires_at=now()-interval '1 second' WHERE trip_id=$1 AND state='issued'", [tripId]);
+    const expired = await app.inject({ url, headers }); assert.equal(expired.json().recoverable, false); assert.equal(expired.json().activeEnrollment, null);
+    const fresh = await app.inject({ method: 'POST', url, headers }); assert.equal(fresh.statusCode, 201);
+    const { startSession } = await import('../src/interview.js');
+    assert.ok((await startSession(pool, new URL(fresh.json().deepLink).searchParams.get('start')!)).ok);
+    const active = await app.inject({ url, headers }); assert.equal(active.json().hasInterview, true); assert.equal(active.json().recoverable, false);
+    const snapshot = (await pool.query('SELECT state,answers FROM control_plane.intake_sessions WHERE trip_id=$1', [tripId])).rows;
+    assert.equal((await app.inject({ ...replace, headers, payload: { expectedEnrollmentId: fresh.json().enrollmentId } })).statusCode, 409);
+    assert.deepEqual((await pool.query('SELECT state,answers FROM control_plane.intake_sessions WHERE trip_id=$1', [tripId])).rows, snapshot);
+  } finally {
+    if (tripId) {
+      await pool.query('DELETE FROM control_plane.intake_sessions WHERE trip_id=$1', [tripId]);
+      await pool.query('DELETE FROM control_plane.interview_enrollments WHERE trip_id=$1', [tripId]);
+      await pool.query('DELETE FROM control_plane.funnel_events WHERE trip_id=$1', [tripId]);
+      await pool.query('DELETE FROM control_plane.trip_memberships WHERE trip_id=$1', [tripId]);
+      await pool.query('DELETE FROM control_plane.trips WHERE id=$1', [tripId]);
+    }
+    await app.close();
+  }
+});
+
+test("the gateway can ask whether a trip session is still entitled, and portal logout ends it", { skip }, async () => {
+  const app = buildApp(profile, { portal: portalDeps(pool) });
+  const check = (apiKey: string | undefined, userId = ids.outsider, tripId = ids.otherTrip) =>
+    app.inject({ method: "POST", url: "/internal/runtime-sessions/check", headers: apiKey ? { "x-api-key": apiKey } : {}, payload: { tripId, userId } });
+  try {
+    await pool.query("UPDATE control_plane.web_sessions SET revoked_at = now() WHERE user_id = $1", [ids.outsider]);
+    assert.equal((await check("exchange-key")).statusCode, 401, "no live portal session yet");
+    const outsider = await session(ids.outsider, "rtcheck");
+    assert.equal((await check("exchange-key")).statusCode, 200);
+    assert.equal((await check("exchange-key", ids.outsider, ids.ownedTrip)).statusCode, 401, "not their trip");
+    for (const key of [undefined, "wrong", "exchange-ke", "exchange-key-and-more"]) assert.equal((await check(key)).statusCode, 401, String(key));
+    const loggedOut = await app.inject({ method: "POST", url: "/v1/logout", headers: { cookie: outsider.cookie, "x-csrf-token": outsider.csrf } });
+    assert.equal(loggedOut.statusCode, 200);
+    assert.equal((await check("exchange-key")).statusCode, 401, "portal logout ends the trip session");
+    await session(ids.outsider, "rtcheck2");
+    assert.equal((await check("exchange-key")).statusCode, 200);
+    await pool.query("UPDATE control_plane.trip_memberships SET runtime_access = false WHERE trip_id = $1 AND user_id = $2", [ids.otherTrip, ids.outsider]);
+    assert.equal((await check("exchange-key")).statusCode, 401, "removed from the trip");
+    await pool.query("UPDATE control_plane.trip_memberships SET runtime_access = true WHERE trip_id = $1 AND user_id = $2", [ids.otherTrip, ids.outsider]);
+  } finally { await app.close(); }
+});
+
+test("a trip session is tied to the portal session that launched it: logout on device A ends A's only", { skip }, async () => {
+  const app = buildApp(profile, { portal: portalDeps(pool) });
+  const post = (url: string, payload: unknown, headers: Record<string, string> = {}) => app.inject({ method: "POST", url, headers, payload: payload as object });
+  const internal = { "x-api-key": "exchange-key" };
+  const launchFrom = async (device: { cookie: string; csrf: string }) => {
+    const launched = await post(`/v1/trips/${ids.otherTrip}/launch`, undefined, { cookie: device.cookie, "x-csrf-token": device.csrf });
+    assert.equal(launched.statusCode, 200);
+    const consumed = await post("/internal/runtime-launch/consume", { token: launched.json().launchToken }, internal);
+    assert.equal(consumed.statusCode, 200);
+    return consumed.json() as { sessionId: string | null; userId: string };
+  };
+  const live = async (grant: { sessionId: string | null }) => (await post("/internal/runtime-sessions/check", { tripId: ids.otherTrip, userId: ids.outsider, sessionId: grant.sessionId }, internal)).statusCode;
+  try {
+    await pool.query("UPDATE control_plane.web_sessions SET revoked_at = now() WHERE user_id = $1", [ids.outsider]);
+    const deviceA = await session(ids.outsider, "devicea"), deviceB = await session(ids.outsider, "deviceb");
+    const a = await launchFrom(deviceA), b = await launchFrom(deviceB);
+    assert.equal(a.sessionId, `wsess_${suffix}devicea`, "the grant remembers the launching session");
+    assert.equal(b.sessionId, `wsess_${suffix}deviceb`);
+    assert.equal(await live(a), 200); assert.equal(await live(b), 200);
+    const loggedOut = await post("/v1/logout", undefined, { cookie: deviceA.cookie, "x-csrf-token": deviceA.csrf });
+    assert.equal(loggedOut.statusCode, 200);
+    assert.equal(await live(a), 401, "A's trip session ends");
+    assert.equal(await live(b), 200, "B's portal session is live, so B's trip session keeps working");
+    // A session id that belongs to someone else, or to nobody, is not a live session of this person.
+    assert.equal(await live({ sessionId: `wsess_${suffix}member` }), 401);
+    assert.equal(await live({ sessionId: "wsess_doesnotexist01" }), 401);
+    // An expired session ends it too.
+    await pool.query("UPDATE control_plane.web_sessions SET expires_at = now() - interval '1 second' WHERE id = $1", [b.sessionId]);
+    assert.equal(await live(b), 401);
+    // A grant minted before the column existed has no session: the earlier rule (any live session of the person) still applies.
+    await session(ids.outsider, "devicec");
+    assert.equal(await live({ sessionId: null }), 200);
+    const legacy = `legacy-grant-${suffix}`;
+    await pool.query(`INSERT INTO control_plane.runtime_launch_grants(id, trip_id, user_id, token_digest, audience, expires_at) VALUES ($1, $2, $3, $4, 'runtime_gateway', now() + interval '60 seconds')`, [`launch_${suffix}legacy`, ids.otherTrip, ids.outsider, sha256(legacy)]);
+    const consumedLegacy = await post("/internal/runtime-launch/consume", { token: legacy }, internal);
+    assert.equal(consumedLegacy.statusCode, 200);
+    assert.equal(consumedLegacy.json().sessionId, null);
+  } finally { await app.close(); }
+});
+
+test("the live check requires the membership role to still be the role the session was opened with", { skip }, async () => {
+  const app = buildApp(profile, { portal: portalDeps(pool) });
+  const check = (role: string | null) =>
+    app.inject({ method: "POST", url: "/internal/runtime-sessions/check", headers: { "x-api-key": "exchange-key" }, payload: { tripId: ids.otherTrip, userId: ids.outsider, role } });
+  try {
+    await session(ids.outsider, "rolecheck");
+    assert.equal((await check("owner")).statusCode, 200);
+    assert.equal((await check(null)).statusCode, 200, "a session sealed without a role is checked as before");
+    assert.equal((await check("member")).statusCode, 401, "sealed as a member, but the membership is owner");
+    await pool.query("UPDATE control_plane.trip_memberships SET role = 'member' WHERE trip_id = $1 AND user_id = $2", [ids.otherTrip, ids.outsider]);
+    try {
+      assert.equal((await check("owner")).statusCode, 401, "demoted in the control plane: the owner-era session is refused");
+      assert.equal((await check("member")).statusCode, 200, "a session opened after the demotion is fine");
+    } finally {
+      await pool.query("UPDATE control_plane.trip_memberships SET role = 'owner' WHERE trip_id = $1 AND user_id = $2", [ids.otherTrip, ids.outsider]);
+    }
   } finally { await app.close(); }
 });

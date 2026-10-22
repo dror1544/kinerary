@@ -2,45 +2,68 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { Link, Navigate, useLocation, useNavigate, useParams } from "react-router-dom";
+import { Link, Navigate, useLocation, useNavigate, useNavigationType, useParams } from "react-router-dom";
 import { z } from "zod";
-import { api, getMe, getTrip, getTrips, passwordSignIn, signIn, type TripSummary } from "../api";
+import { api, getMe, getTrip, getTrips, passwordSignIn, signIn, getAuthCapabilities, emailPasswordSignIn, safeReturnTo, type TripSummary, type InterviewLinkState, ApiError } from "../api";
 import { Brand } from "../components/Brand";
+import { tripUsernameInputProps, tripUsernameRegisterOptions } from "../mini-app/username";
+import { isEmbedded } from "../mini-app/sdk";
+import { TripTelegram } from "./TripTelegram";
+import { MembersPanel } from "./MembersPanel";
+import { DateInput, nextDay } from "../components/DateInput";
 
 export type ProductView = "sign-in" | "trips" | "new-trip" | "trip" | "runtime" | "join";
 
-export default function ProductApp({ view }: { view: ProductView }) {
+export default function ProductApp({ view, host }: { view: ProductView; host?: LauncherHost }) {
+  const { tripId } = useParams();
   if (view === "sign-in") return <SignIn />;
   if (view === "join") return <Join />;
-  return <Protected>{view === "trips" ? <Trips /> : view === "new-trip" ? <NewTrip /> : view === "trip" ? <TripSetup /> : <Runtime />}</Protected>;
+  return <Protected>{view === "trips" ? <Trips /> : view === "new-trip" ? <NewTrip /> : view === "trip" ? <TripSetup key={tripId} /> : <Runtime key={tripId} host={host} />}</Protected>;
 }
 
 function SignIn() {
   const navigate = useNavigate();
   const me = useQuery({ queryKey: ["me"], queryFn: getMe, retry: false });
-  const returnTo = new URLSearchParams(useLocation().search).get("return_to") || "/trips";
-  const tripId = returnTo.match(/^\/trips\/(trip_[A-Za-z0-9]{8,64})(?:\/app)?/)?.[1] ?? "";
+  const queryClient = useQueryClient();
+  const capabilities = useQuery({ queryKey: ["auth-capabilities"], queryFn: getAuthCapabilities, retry: false });
+  const returnTo = safeReturnTo(new URLSearchParams(useLocation().search).get("return_to"));
+  const emailForm = useForm<{ email: string; password: string }>({ defaultValues: { email: "", password: "" } });
+  const finishLogin = async ({ appPath }: { appPath: string }) => {
+    queryClient.clear();
+    await queryClient.fetchQuery({ queryKey: ["me"], queryFn: getMe });
+    navigate(safeReturnTo(appPath));
+  };
+  const emailLogin = useMutation({ mutationFn: (values: { email: string; password: string }) => emailPasswordSignIn({ ...values, returnTo, ...(isEmbedded(null) ? { embedded: true as const } : {}) }), onSuccess: finishLogin });
+  const tripId = returnTo.match(/^\/(?:mini-app\/)?trips\/(trip_[A-Za-z0-9]{8,64})(?:\/app)?/)?.[1] ?? "";
   const passwordForm = useForm<{ runtimeUsername: string; password: string }>({ defaultValues: { runtimeUsername: "", password: "" } });
   const passwordLogin = useMutation({
-    mutationFn: (values: { runtimeUsername: string; password: string }) => passwordSignIn({ tripId, returnTo, ...values }),
-    onSuccess: ({ appPath }) => navigate(appPath),
+    mutationFn: (values: { runtimeUsername: string; password: string }) => passwordSignIn({ tripId, returnTo, ...values, ...(isEmbedded(null) ? { embedded: true as const } : {}) }),
+    onSuccess: finishLogin,
   });
-  if (me.data) return <Navigate replace to={returnTo.startsWith("/") ? returnTo : "/trips"} />;
+  // A Telegram-scoped session is not "signed in" for the full dashboard: this page is how it upgrades.
+  if (me.data && me.data.scope !== "telegram") return <Navigate replace to={returnTo} />;
   return (
     <div className="product-shell">
       <header className="product-header"><Brand /></header>
       <main className="placeholder-card">
         <p className="eyebrow">Kinerary personal space</p>
         <h1>Sign in to continue</h1>
-        <p>Use Google to create trips, follow setup, and invite the people traveling with you. Telegram is only used for the planning interview.</p>
-        <button className="button wide" onClick={() => signIn(returnTo)}>Continue with Google</button>
+        <p>Sign in with your existing organizer account to create trips and follow setup. The planning interview continues privately in Telegram.</p>
+        {capabilities.isPending && <p>Loading sign-in options…</p>}
+        {capabilities.isError && <Notice>Sign-in is unavailable. Please retry once the service is connected.</Notice>}
+        {capabilities.data?.emailPassword && <form className="compact-form" onSubmit={emailForm.handleSubmit(value => emailLogin.mutate(value))}>
+          <label>Email<input required type="email" maxLength={254} autoComplete="username" {...emailForm.register("email")} /></label>
+          <label>Account password<input required type="password" maxLength={1024} autoComplete="current-password" {...emailForm.register("password")} /></label>
+          <button className="button wide" disabled={emailLogin.isPending}>{emailLogin.isPending ? "Signing in…" : "Sign in"}</button>
+          {emailLogin.isError && <Notice>{emailLogin.error.message}</Notice>}
+        </form>}
+        {capabilities.data?.google && <button className="button wide" onClick={() => signIn(returnTo)}>Continue with Google</button>}
         {tripId && <form className="compact-form" onSubmit={passwordForm.handleSubmit((value) => passwordLogin.mutate(value))}>
-          <label>Trip username<input required pattern="[a-z0-9][a-z0-9._-]{1,63}" autoComplete="username" {...passwordForm.register("runtimeUsername")} /></label>
+          <label>Trip username<input {...tripUsernameInputProps} {...passwordForm.register("runtimeUsername", tripUsernameRegisterOptions)} /></label>
           <label>Password<input required minLength={8} type="password" autoComplete="current-password" {...passwordForm.register("password")} /></label>
           <button className="button wide" disabled={passwordLogin.isPending}>{passwordLogin.isPending ? "Signing in…" : "Continue with trip password"}</button>
           {passwordLogin.isError && <Notice>{passwordLogin.error.message}</Notice>}
         </form>}
-        {me.isError && <p className="subtle">Your session is not active yet.</p>}
       </main>
     </div>
   );
@@ -50,7 +73,19 @@ function Protected({ children }: { children: React.ReactNode }) {
   const me = useQuery({ queryKey: ["me"], queryFn: getMe, retry: false });
   if (me.isPending) return <div className="route-loading">Opening your personal space…</div>;
   if (me.isError) return <Navigate replace to={`/sign-in?return_to=${encodeURIComponent(location.pathname)}`} />;
-  return <div className="product-shell"><DashboardHeader name={me.data.displayName} />{children}</div>;
+  return <div className="product-shell"><DashboardHeader name={me.data.displayName} />{me.data.scope === "telegram" && <ScopeBanner />}{children}</div>;
+}
+
+/**
+ * A session a Telegram link minted sees only the trips that Telegram account is
+ * linked to (the server enforces it; this only says so). The full dashboard -
+ * every trip, planning a new one - needs a password or Google sign-in.
+ */
+function ScopeBanner() {
+  return <aside className="notice scope-banner" role="status">
+    You're signed in with Telegram, so you see only the trips linked to this Telegram account.{" "}
+    <Link to={`/sign-in?return_to=${encodeURIComponent("/trips")}`}>Sign in with password for the full dashboard</Link>
+  </aside>;
 }
 
 function DashboardHeader({ name }: { name: string }) {
@@ -62,6 +97,7 @@ function DashboardHeader({ name }: { name: string }) {
 
 function Trips() {
   const trips = useQuery({ queryKey: ["trips"], queryFn: getTrips });
+  const scoped = useQuery({ queryKey: ["me"], queryFn: getMe, retry: false }).data?.scope === "telegram";
   const sections = useMemo(() => {
     const grouped: Record<string, TripSummary[]> = { Setup: [], Provisioning: [], Ready: [], Completed: [] };
     for (const trip of trips.data?.trips || []) {
@@ -72,36 +108,67 @@ function Trips() {
     }
     return grouped;
   }, [trips.data]);
-  return <main className="dashboard-main"><div className="page-title"><div><p className="eyebrow">Personal space</p><h1>My trips</h1></div><Link className="button" to="/trips/new">Plan a new trip</Link></div>{trips.isError && <Notice>We could not load your trips. Please retry.</Notice>}{trips.isPending && <p>Loading trips…</p>}{Object.entries(sections).map(([name, items]) => items.length > 0 && <section className="trip-section" key={name}><h2>{name}</h2><div className="trip-grid">{items.map((trip) => <TripCard key={trip.id} trip={trip} />)}</div></section>)}{trips.data?.trips.length === 0 && <div className="empty-state"><h2>Your first trip starts here.</h2><p>Add the broad outline. The private Telegram interview will help fill in the rest.</p><Link className="button" to="/trips/new">Create a trip</Link></div>}</main>;
+  return <main className="dashboard-main"><div className="page-title"><div><p className="eyebrow">Personal space</p><h1>My trips</h1></div>{!scoped && <Link className="button" to="/trips/new">Plan a new trip</Link>}</div>{trips.isError && <Notice>We could not load your trips. Please retry.</Notice>}{trips.isPending && <p>Loading trips…</p>}{Object.entries(sections).map(([name, items]) => items.length > 0 && <section className="trip-section" key={name}><h2>{name}</h2><div className="trip-grid">{items.map((trip) => <TripCard key={trip.id} trip={trip} />)}</div></section>)}{trips.data?.trips.length === 0 && <div className="empty-state"><h2>{scoped ? "No trips yet." : "Your first trip starts here."}</h2>{scoped ? <p>No trip is linked to this Telegram account yet. Ask the organizer, or sign in with your password.</p> : <><p>Add the broad outline. The private Telegram interview will help fill in the rest.</p><Link className="button" to="/trips/new">Create a trip</Link></>}</div>}</main>;
 }
 
 function TripCard({ trip }: { trip: TripSummary }) {
-  const open = trip.runtimeReady ? `/trips/${trip.id}/app` : `/trips/${trip.id}/setup`;
-  return <article className="trip-card"><div className="status-chip">{humanize(trip.nextAction)}</div><h3>{trip.title}</h3><p>{trip.destination || "Destination to be confirmed"}</p><small>{[trip.startDate, trip.endDate].filter(Boolean).join(" → ") || "Dates are flexible"}</small><Link className="button button-small" to={open}>{trip.runtimeReady ? "Open trip" : humanize(trip.nextAction)}</Link></article>;
+  const inMiniApp = useLocation().pathname.startsWith("/mini-app");
+  const open = trip.runtimeReady ? (inMiniApp ? `/mini-app/trips/${trip.id}` : `/trips/${trip.id}/app`) : `/trips/${trip.id}/setup`;
+  // A member (runtime access, no dashboard) has no setup page to go to; an unready trip is just not ready.
+  const action = trip.runtimeReady || trip.permissions.dashboard
+    ? <Link className="button button-small" to={open}>{trip.runtimeReady ? "Open trip" : humanize(trip.nextAction)}</Link>
+    : <small>Not ready to open yet</small>;
+  return <article className="trip-card"><div className="trip-card-head"><div className="status-chip">{humanize(trip.nextAction)}</div><TripTelegram trip={trip} /></div><h3>{trip.title}</h3><p>{trip.destination || "Destination to be confirmed"}</p><small>{[trip.startDate, trip.endDate].filter(Boolean).join(" → ") || "Dates are flexible"}</small>{action}</article>;
 }
 
-const tripSchema = z.object({ destination: z.string().trim().min(2, "Add a destination").max(160), startDate: z.string().optional(), endDate: z.string().optional(), tripType: z.enum(["family", "group", "couple", "other"]) }).refine((value) => !value.startDate || !value.endDate || value.endDate >= value.startDate, { message: "End date must follow the start date", path: ["endDate"] });
+const tripSchema = z.object({ destination: z.string().trim().min(2, "Add a destination").max(160), startDate: z.string().optional(), endDate: z.string().optional(), tripType: z.enum(["family", "group", "couple", "other"]) }).refine((value) => !value.startDate || !value.endDate || value.endDate > value.startDate, { message: "End date must follow the start date", path: ["endDate"] });
 type TripForm = z.infer<typeof tripSchema>;
 
 function NewTrip() {
   const navigate = useNavigate();
   const stored = JSON.parse(sessionStorage.getItem("kinerary-trip-starter") || "{}") as Partial<TripForm>;
   const form = useForm<TripForm>({ resolver: zodResolver(tripSchema), defaultValues: { destination: stored.destination || "", startDate: stored.startDate || "", endDate: stored.endDate || "", tripType: stored.tripType || "family" } });
+  const startDate = form.watch("startDate");
+  // The end date defaults to the day after the start, and is pushed forward when a later start would leave it at or before the start (#433).
+  const moveEndAfterStart = (start: string) => {
+    const minimum = nextDay(start);
+    const end = form.getValues("endDate");
+    if (minimum && (!end || end < minimum)) form.setValue("endDate", minimum);
+  };
   useEffect(() => { const subscription = form.watch((value) => sessionStorage.setItem("kinerary-trip-starter", JSON.stringify(value))); return () => subscription.unsubscribe(); }, [form]);
   const create = useMutation({ mutationFn: (values: TripForm) => api<TripSummary>("/v1/trips", { method: "POST", body: JSON.stringify(values) }), onSuccess: (trip) => { sessionStorage.removeItem("kinerary-trip-starter"); navigate(`/trips/${trip.id}/setup`); } });
-  return <main className="dashboard-main narrow"><Link className="back-link" to="/trips">← My trips</Link><p className="eyebrow">New trip</p><h1>Start with the outline</h1><p className="lede">Nothing needs to be final. Your interview will confirm or correct these details.</p><form className="form-card" onSubmit={form.handleSubmit((values) => create.mutate(values))}><label>Destination<input {...form.register("destination")} placeholder="e.g. Northern Italy" />{form.formState.errors.destination && <small className="field-error">{form.formState.errors.destination.message}</small>}</label><div className="field-row"><label>Approximate start<input type="date" {...form.register("startDate")} /></label><label>Approximate end<input type="date" {...form.register("endDate")} />{form.formState.errors.endDate && <small className="field-error">{form.formState.errors.endDate.message}</small>}</label></div><label>Who is traveling?<select {...form.register("tripType")}><option value="family">Family</option><option value="couple">Couple</option><option value="group">Group</option><option value="other">Other</option></select></label>{create.isError && <Notice>{create.error.message}</Notice>}<button className="button" disabled={create.isPending}>{create.isPending ? "Creating…" : "Create trip"}</button></form></main>;
+  return <main className="dashboard-main narrow"><Link className="back-link" to="/trips">← My trips</Link><p className="eyebrow">New trip</p><h1>Start with the outline</h1><p className="lede">Nothing needs to be final. Your interview will confirm or correct these details.</p><form className="form-card" onSubmit={form.handleSubmit((values) => create.mutate(values))}><label>Destination<input {...form.register("destination")} placeholder="e.g. Northern Italy" />{form.formState.errors.destination && <small className="field-error">{form.formState.errors.destination.message}</small>}</label><div className="field-row"><label>Approximate start<DateInput {...form.register("startDate", { onChange: event => moveEndAfterStart(event.target.value) })} /></label><label>Approximate end<DateInput min={nextDay(startDate)} {...form.register("endDate")} />{form.formState.errors.endDate && <small className="field-error">{form.formState.errors.endDate.message}</small>}</label></div><label>Who is traveling?<select {...form.register("tripType")}><option value="family">Family</option><option value="couple">Couple</option><option value="group">Group</option><option value="other">Other</option></select></label>{create.isError && <Notice>{create.error.message}</Notice>}<button className="button" disabled={create.isPending}>{create.isPending ? "Creating…" : "Create trip"}</button></form></main>;
 }
 
 function TripSetup() {
   const { tripId = "" } = useParams();
   const queryClient = useQueryClient();
   const detail = useQuery({ queryKey: ["trip", tripId], queryFn: () => getTrip(tripId), refetchInterval: 5000 });
-  const interview = useMutation({ mutationFn: () => api<{ deepLink: string }>(`/v1/trips/${tripId}/interview-link`, { method: "POST" }), onSuccess: ({ deepLink }) => window.open(deepLink, "_blank", "noopener,noreferrer") });
+  const [linkConflict, setLinkConflict] = useState(false);
+  const scoped = useQuery({ queryKey: ["me"], queryFn: getMe, retry: false }).data?.scope === "telegram";
+  const linkState = useQuery({ queryKey: ["interview-link", tripId], queryFn: () => api<InterviewLinkState>(`/v1/trips/${tripId}/interview-link`), enabled: detail.data?.permissions.role === "owner" && (linkConflict || Boolean(detail.data?.interview)), retry: false });
+  const refreshLinkState = () => { setLinkConflict(true); void queryClient.invalidateQueries({ queryKey: ["interview-link", tripId] }); void queryClient.invalidateQueries({ queryKey: ["trip", tripId] }); };
+  const interview = useMutation({ mutationFn: () => api<{ deepLink: string }>(`/v1/trips/${tripId}/interview-link`, { method: "POST" }), onError: error => {
+    if (error instanceof ApiError && ["ACTIVE_ENROLLMENT_EXISTS", "TRIP_NOT_DRAFT"].includes(error.code)) refreshLinkState();
+  } });
+  const replaceLink = useMutation({ mutationFn: () => api<{ deepLink: string }>(`/v1/trips/${tripId}/interview-link/replace`, { method: "POST", body: JSON.stringify({ expectedEnrollmentId: linkState.data?.activeEnrollment?.id }) }), onError: refreshLinkState, onSuccess: () => { interview.reset(); setLinkConflict(false); } });
   const provision = useMutation({ mutationFn: () => api(`/v1/trips/${tripId}/provisioning-request`, { method: "POST" }), onSuccess: () => queryClient.invalidateQueries({ queryKey: ["trip", tripId] }) });
   if (detail.isPending) return <main className="dashboard-main">Loading trip…</main>;
   if (detail.isError) return <main className="dashboard-main"><Notice>Trip not found or unavailable.</Notice></main>;
   const trip = detail.data;
-  return <main className="dashboard-main"><Link className="back-link" to="/trips">← My trips</Link><div className="page-title"><div><p className="eyebrow">Trip setup</p><h1>{trip.title}</h1><p>{trip.destination}</p></div>{trip.runtimeReady && <Link className="button" to={`/trips/${trip.id}/app`}>Open trip</Link>}</div><div className="setup-layout"><section className="workflow-card"><h2>Setup progress</h2><WorkflowStep done={Boolean(trip.interview)} title="Start your private planning interview" detail={trip.interview ? `Interview ${humanize(trip.interview.state)}` : "Continue in the shared Kinerary Telegram bot."}><button className="button button-small" onClick={() => interview.mutate()} disabled={interview.isPending}>Open Telegram interview</button></WorkflowStep><WorkflowStep done={trip.lifecycleState !== "draft" && trip.lifecycleState !== "intake_in_progress"} title="Confirm the trip outline" detail="The normalized summary becomes available here after confirmation." /><WorkflowStep done={Boolean(trip.provisioning)} title="Create the provisioning plan" detail="Kinerary pins an exact release and the resources your trip needs, for you to review before anything is built.">{trip.nextAction === "request_provisioning" && <button className="button button-small" onClick={() => provision.mutate()} disabled={provision.isPending}>Create plan</button>}</WorkflowStep><WorkflowStep done={Boolean(trip.provisioning) && trip.provisioning!.planStatus !== "pending_approval"} title="Review and approve the plan" detail={trip.provisioning ? humanize(trip.provisioning.jobState || trip.provisioning.planStatus) : "Available once the plan exists. You approve it yourself — nobody else has to sign off."}><PlanReview trip={trip} tripId={tripId} /></WorkflowStep>{trip.provisioning?.safeErrorCode && <Notice>Setup needs attention: {humanize(trip.provisioning.safeErrorCode)}</Notice>}{(interview.isError || provision.isError) && <Notice>{(interview.error || provision.error)?.message}</Notice>}</section><InvitePanel trip={trip} /></div></main>;
+  const alreadyStarted = Boolean(trip.interview) || Boolean(linkState.data?.hasInterview) || trip.lifecycleState !== "draft";
+  const currentLink = replaceLink.data || interview.data;
+  const interviewAction = trip.permissions.role !== "owner" ? null : scoped ? <p>Signed in with Telegram: to prepare or replace an interview link, sign in with your password.</p> : alreadyStarted ? <>
+    <p>Continue your interview in your existing Telegram chat. Your answers stay in that conversation.</p>
+    {linkState.data && <a className="button button-small" href={linkState.data.telegramChatUrl} target="_blank" rel="noopener noreferrer">Continue in Telegram</a>}
+  </> : currentLink ? <a className="button button-small" href={currentLink.deepLink} target="_blank" rel="noopener noreferrer">Open Telegram interview</a> : linkConflict && linkState.isPending ? <p>Checking the existing interview link…</p> : linkState.data?.recoverable ? <>
+    <p>Replacing invalidates the previous unused link. Your trip outline stays unchanged.</p>
+    <button className="button button-small" onClick={() => replaceLink.mutate()} disabled={replaceLink.isPending}>{replaceLink.isPending ? "Replacing link…" : "Replace lost interview link"}</button>
+  </> : <>
+    {linkConflict && linkState.data && !linkState.data.activeEnrollment && <p>The previous link is no longer active. Prepare a new interview link.</p>}
+    <button className="button button-small" onClick={() => interview.mutate()} disabled={interview.isPending}>{interview.isPending ? "Preparing interview…" : "Prepare Telegram interview"}</button>
+  </>;
+  return <main className="dashboard-main"><Link className="back-link" to="/trips">← My trips</Link><div className="page-title"><div><p className="eyebrow">Trip setup</p><h1>{trip.title}</h1><p>{trip.destination}</p><p>{trip.startDate || "Start date to confirm"} → {trip.endDate || "End date to confirm"} · {humanize(trip.tripType)} trip</p></div>{trip.runtimeReady && <Link className="button" to={`/trips/${trip.id}/app`}>Open trip</Link>}</div><div className="setup-layout"><section className="workflow-card"><h2>Setup progress</h2><WorkflowStep done={Boolean(trip.interview)} title="Start your private planning interview" detail={trip.interview ? `Interview ${humanize(trip.interview.state)}` : "Continue in the shared Kinerary Telegram bot."}>{interviewAction}</WorkflowStep><WorkflowStep done={trip.lifecycleState !== "draft" && trip.lifecycleState !== "intake_in_progress"} title="Confirm the trip outline" detail="The normalized summary becomes available here after confirmation." /><WorkflowStep done={Boolean(trip.provisioning)} title="Create the provisioning plan" detail="Kinerary pins an exact release and the resources your trip needs, for you to review before anything is built.">{trip.nextAction === "request_provisioning" && <button className="button button-small" onClick={() => provision.mutate()} disabled={provision.isPending}>Create plan</button>}</WorkflowStep><WorkflowStep done={Boolean(trip.provisioning) && trip.provisioning!.planStatus !== "pending_approval"} title="Review and approve the plan" detail={trip.provisioning ? humanize(trip.provisioning.jobState || trip.provisioning.planStatus) : "Available once the plan exists. You approve it yourself — nobody else has to sign off."}><PlanReview trip={trip} tripId={tripId} /></WorkflowStep>{trip.provisioning?.safeErrorCode && <Notice>Setup needs attention: {humanize(trip.provisioning.safeErrorCode)}</Notice>}{(interview.isError || replaceLink.isError || linkState.isError || provision.isError) && <Notice>{(replaceLink.error || linkState.error || interview.error || provision.error)?.message}</Notice>}</section><InvitePanel trip={trip} /><MembersPanel trip={trip} /></div></main>;
 }
 
 function PlanReview({ trip, tripId }: { trip: TripSummary; tripId: string }) {
@@ -141,42 +208,141 @@ function InvitePanel({ trip }: { trip: TripSummary }) {
   const form = useForm<{ displayName: string; runtimeUsername: string }>({ defaultValues: { displayName: "", runtimeUsername: "" } });
   const create = useMutation({ mutationFn: (values: { displayName: string; runtimeUsername: string }) => api<{ joinUrl: string }>(`/v1/trips/${trip.id}/site-invites`, { method: "POST", body: JSON.stringify(values) }), onSuccess: ({ joinUrl: value }) => { setJoinUrl(value); form.reset(); queryClient.invalidateQueries({ queryKey: ["trip", trip.id] }); } });
   const revoke = useMutation({ mutationFn: (id: string) => api(`/v1/trips/${trip.id}/site-invites/${id}`, { method: "DELETE" }), onSuccess: () => queryClient.invalidateQueries({ queryKey: ["trip", trip.id] }) });
+  const scoped = useQuery({ queryKey: ["me"], queryFn: getMe, retry: false }).data?.scope === "telegram";
   if (!trip.permissions.invite) return null;
-  return <aside className="workflow-card"><h2>Site invitations</h2><p>Each private link is for one person and can be used once.</p><form className="compact-form" onSubmit={form.handleSubmit((value) => create.mutate(value))}><label>Name<input required {...form.register("displayName")} /></label><label>Trip username<input required pattern="[a-z0-9][a-z0-9._-]{1,63}" {...form.register("runtimeUsername")} /></label><button className="button button-small">Create invite</button></form>{joinUrl && <div className="share-box"><strong>Copy this link now</strong><input readOnly value={joinUrl} /><div className="share-actions"><button onClick={() => navigator.clipboard.writeText(joinUrl)}>Copy</button>{navigator.share && <button onClick={() => navigator.share({ title: trip.title, url: joinUrl })}>Share</button>}<a href={`mailto:?subject=${encodeURIComponent(`Join ${trip.title}`)}&body=${encodeURIComponent(joinUrl)}`}>Email</a><a href={`https://t.me/share/url?url=${encodeURIComponent(joinUrl)}`} target="_blank" rel="noreferrer">Telegram</a></div></div>}<ul className="invite-list">{trip.invites?.map((invite) => <li key={invite.id}><div><strong>{invite.displayName}</strong><small>{invite.runtimeUsername} · {humanize(invite.status)}</small></div>{invite.status === "unused" && <button className="text-button" onClick={() => revoke.mutate(invite.id)}>Revoke</button>}</li>)}</ul></aside>;
+  // An invitation is a join link anyone can redeem: a session a Telegram link minted cannot make or revoke one.
+  if (scoped) return <aside className="workflow-card"><h2>Site invitations</h2><p>Signed in with Telegram: to invite or remove people, sign in with your password.</p></aside>;
+  return <aside className="workflow-card"><h2>Site invitations</h2><p>Each private link is for one person and can be used once.</p><form className="compact-form" onSubmit={form.handleSubmit((value) => create.mutate(value))}><label>Name<input required {...form.register("displayName")} /></label><label>Trip username<input {...tripUsernameInputProps} autoComplete="off" {...form.register("runtimeUsername", tripUsernameRegisterOptions)} /></label><button className="button button-small">Create invite</button></form>{joinUrl && <div className="share-box"><strong>Copy this link now</strong><input readOnly value={joinUrl} /><div className="share-actions"><button onClick={() => navigator.clipboard.writeText(joinUrl)}>Copy</button>{navigator.share && <button onClick={() => navigator.share({ title: trip.title, url: joinUrl })}>Share</button>}<a href={`mailto:?subject=${encodeURIComponent(`Join ${trip.title}`)}&body=${encodeURIComponent(joinUrl)}`}>Email</a><a href={`https://t.me/share/url?url=${encodeURIComponent(joinUrl)}`} target="_blank" rel="noreferrer">Telegram</a></div></div>}<ul className="invite-list">{trip.invites?.map((invite) => <li key={invite.id}><div><strong>{invite.displayName}</strong><small>{invite.runtimeUsername} · {humanize(invite.status)}</small></div>{invite.status === "unused" && <button className="text-button" onClick={() => revoke.mutate(invite.id)}>Revoke</button>}</li>)}</ul></aside>;
 }
 
-function Runtime() {
-  const navigate = useNavigate();
+/** What the Mini App tells the launcher about the Telegram client it runs in. */
+export interface LauncherHost { settled: boolean; webClient: boolean; openLink: (url: string) => void }
+
+type LaunchGrant = { runtimeOrigin: string; framePath: string; launchToken: string };
+const LAUNCH_MARK = "kineraryLaunched";
+const LAUNCH_LOG = "kineraryLaunchLog";
+
+/** The one place a launch URL is made: this trip's own launch path on an http(s) origin, never anything the response happens to say. */
+function launchAction(grant: LaunchGrant, tripId: string): string | null {
+  try {
+    const origin = new URL(grant.runtimeOrigin);
+    if (!["https:", "http:"].includes(origin.protocol) || origin.username || origin.password) return null;
+    if (grant.runtimeOrigin.replace(/\/$/, "") !== origin.origin || grant.framePath !== `/t/${tripId}/`) return null;
+    return `${origin.origin}/t/${tripId}/__launch`;
+  } catch { return null; }
+}
+
+/** Back/forward onto a launcher whose grant is long spent: show a button, never submit again by itself. */
+function cameBackToLauncher(tripId: string, navigationType: string): boolean {
+  if ((window.history.state as Record<string, unknown> | null)?.[LAUNCH_MARK] === tripId) return true;
+  if (navigationType !== "POP") return false;
+  try {
+    const entry = performance.getEntriesByType?.("navigation")?.[0] as PerformanceNavigationTiming | undefined;
+    return entry?.type === "back_forward" && new URL(entry.name, window.location.href).pathname === window.location.pathname;
+  } catch { return false; }
+}
+
+/**
+ * Three launches of one trip inside 20 seconds means the gateway keeps sending
+ * the browser back here (a cookie it refuses to keep): stop and say so rather
+ * than loop forever, creating a grant each time.
+ */
+function launchLooping(tripId: string): boolean {
+  try {
+    const now = Date.now();
+    const log = (JSON.parse(sessionStorage.getItem(LAUNCH_LOG) || "[]") as { t: string; at: number }[]).filter((entry) => now - entry.at < 20_000);
+    log.push({ t: tripId, at: now });
+    sessionStorage.setItem(LAUNCH_LOG, JSON.stringify(log));
+    return log.filter((entry) => entry.t === tripId).length > 3;
+  } catch { return false; }
+}
+
+function Runtime({ host }: { host?: LauncherHost }) {
   const { tripId = "" } = useParams();
-  const iframe = useRef<HTMLIFrameElement>(null);
-  const [launch, setLaunch] = useState<{ runtimeOrigin: string; framePath: string; launchToken: string }>();
-  const grant = useMutation({ mutationFn: () => api<{ runtimeOrigin: string; framePath: string; launchToken: string }>(`/v1/trips/${tripId}/launch`, { method: "POST" }), onSuccess: setLaunch });
-  useEffect(() => { grant.mutate(); }, [tripId]); // eslint-disable-line react-hooks/exhaustive-deps
+  const inMiniApp = useLocation().pathname.startsWith("/mini-app");
+  const navigationType = useNavigationType();
+  const form = useRef<HTMLFormElement>(null);
+  const requested = useRef(false);
+  const submitted = useRef(false);
+  const [again, setAgain] = useState(() => cameBackToLauncher(tripId, navigationType));
+  const [grant, setGrant] = useState<LaunchGrant>();
+  const [looping, setLooping] = useState(false);
+  const mutation = useMutation({ mutationFn: () => api<LaunchGrant>(`/v1/trips/${tripId}/launch`, { method: "POST" }), onSuccess: setGrant });
+  const webClient = host?.webClient ?? false;
+  const ready = host?.settled ?? true;
+  const myTrips = inMiniApp ? "/mini-app" : "/trips";
+
+  const request = () => {
+    if (launchLooping(tripId)) { setLooping(true); return; }
+    requested.current = true;
+    mutation.mutate();
+  };
+  // The first thing a page does is ask for a grant; coming back to a spent one asks only on a click.
   useEffect(() => {
-    if (!launch) return;
-    const onMessage = (event: MessageEvent) => {
-      if (event.origin !== launch.runtimeOrigin || event.source !== iframe.current?.contentWindow) return;
-      if (event.data?.type === "kinerary:runtime-logout") {
-        navigate("/trips", { replace: true });
-        return;
-      }
-      if (event.data?.type !== "kinerary:runtime-ready") return;
-      iframe.current.contentWindow?.postMessage({ type: "kinerary:launch", token: launch.launchToken }, launch.runtimeOrigin);
+    if (again || webClient || !ready || requested.current) return;
+    request();
+  }, [again, webClient, ready]); // eslint-disable-line react-hooks/exhaustive-deps
+  // bfcache restores the page as it was left, grant and all: that grant is spent.
+  useEffect(() => {
+    const onPageShow = (event: Event) => {
+      if (!(event as PageTransitionEvent).persisted) return;
+      setGrant(undefined);
+      submitted.current = false;
+      requested.current = true;
+      setAgain(true);
     };
-    window.addEventListener("message", onMessage);
-    return () => window.removeEventListener("message", onMessage);
-  }, [launch, navigate]);
-  return <main className="runtime-shell"><div className="runtime-bar"><Link to={`/trips/${tripId}/setup`}>← Trip setup</Link><strong>Kinerary trip</strong><span /></div>{grant.isPending && <div className="route-loading">Opening your trip…</div>}{grant.isError && <div className="route-loading">This trip is not ready to open.</div>}{launch && <iframe ref={iframe} title="Kinerary trip" src={`${launch.runtimeOrigin}${launch.framePath}`} sandbox="allow-forms allow-modals allow-popups allow-same-origin allow-scripts allow-downloads" allow="clipboard-write" />}</main>;
+    window.addEventListener("pageshow", onPageShow);
+    return () => window.removeEventListener("pageshow", onPageShow);
+  }, []);
+  // The grant leaves in a top-level form POST: its token is in the body, in no URL, and the browser sends Origin (the gateway refuses without it).
+  const action = grant ? launchAction(grant, tripId) : null;
+  useEffect(() => {
+    if (!grant || !action || again || submitted.current) return;
+    submitted.current = true;
+    try { window.history.replaceState({ ...(window.history.state ?? {}), [LAUNCH_MARK]: tripId }, ""); } catch { /* the navigation-type check still applies */ }
+    form.current?.submit();
+  }, [grant, action, again, tripId]);
+
+  const openAgain = () => {
+    submitted.current = false;
+    requested.current = false;
+    setGrant(undefined);
+    try { window.history.replaceState({ ...(window.history.state ?? {}), [LAUNCH_MARK]: undefined }, ""); } catch { /* ignore */ }
+    setAgain(false);
+    request();
+  };
+
+  if (webClient) {
+    return <main className="runtime-launch">
+      <p>Telegram's browser app cannot show a trip inside itself.</p>
+      <button className="button" onClick={() => host?.openLink(`${window.location.origin}/trips/${tripId}/app`)}>Open trip in a new tab</button>
+      <Link to={myTrips}>My trips</Link>
+    </main>;
+  }
+  if (looping) {
+    return <main className="runtime-launch"><p>This trip keeps sending you back here, so it was not opened again.</p><p className="subtle">Please try again in a moment, or contact the person who runs Kinerary for you.</p><Link to={myTrips}>My trips</Link></main>;
+  }
+  if (again) {
+    return <main className="runtime-launch"><p>You came back from your trip.</p><button className="button" onClick={openAgain}>Open trip again</button><Link to={myTrips}>My trips</Link></main>;
+  }
+  const failed = mutation.isError || (grant && !action);
+  return <main className="runtime-launch">
+    {!failed && <div className="route-loading">Opening your trip…</div>}
+    {failed && <><div className="route-loading">This trip is not ready to open.</div><Link to={myTrips}>My trips</Link></>}
+    {grant && action && <form ref={form} method="post" action={action} hidden autoComplete="off"><input type="hidden" name="token" value={grant.launchToken} /></form>}
+  </main>;
 }
 
 function Join() {
   const navigate = useNavigate();
-  const token = new URLSearchParams(location.hash.slice(1)).get("token") || "";
+  const token = new URLSearchParams(useLocation().hash.slice(1)).get("token") || "";
+  const capabilities = useQuery({ queryKey: ["auth-capabilities"], queryFn: getAuthCapabilities, retry: false });
   const inspect = useQuery({ queryKey: ["invite", token], queryFn: () => api<{ tripTitle: string; displayName: string; status: string }>("/v1/site-invites/inspect", { method: "POST", body: JSON.stringify({ token }) }), enabled: Boolean(token), retry: false });
   const [method, setMethod] = useState<"google" | "password">("google");
   const [password, setPassword] = useState("");
-  const redeem = useMutation({ mutationFn: () => api<{ appPath: string }>("/v1/site-invites/redeem", { method: "POST", body: JSON.stringify({ token, method, ...(method === "password" ? { password } : {}) }) }), onSuccess: ({ appPath }) => navigate(appPath), onError: (error) => { if (method === "google" && error.message.includes("GOOGLE_SIGN_IN_REQUIRED")) signIn(`/join#token=${token}`); } });
-  return <div className="product-shell"><header className="product-header"><Brand /></header><main className="placeholder-card"><p className="eyebrow">Private invitation</p>{!token || inspect.isError ? <><h1>This invitation is unavailable</h1><p>Ask the organizer for a fresh link.</p></> : inspect.isPending ? <p>Checking invitation…</p> : <><h1>Join {inspect.data.tripTitle}</h1><p>This invitation is intended for {inspect.data.displayName}.</p><div className="method-tabs"><button className={method === "google" ? "active" : ""} onClick={() => setMethod("google")}>Use Google</button><button className={method === "password" ? "active" : ""} onClick={() => setMethod("password")}>Use a password</button></div>{method === "password" && <label className="standalone-field">Choose a password<input type="password" minLength={8} value={password} onChange={(event) => setPassword(event.target.value)} /></label>}<button className="button wide" onClick={() => redeem.mutate()} disabled={redeem.isPending || inspect.data.status !== "unused"}>Join this trip</button>{redeem.isError && <Notice>{redeem.error.message}</Notice>}</>}</main></div>;
+  useEffect(() => { if (capabilities.data && !capabilities.data.google) setMethod("password"); }, [capabilities.data]);
+  const redeem = useMutation({ mutationFn: () => api<{ appPath: string }>("/v1/site-invites/redeem", { method: "POST", body: JSON.stringify({ token, method, ...(method === "password" ? { password } : {}) }) }), onSuccess: ({ appPath }) => navigate(safeReturnTo(appPath)), onError: (error) => { if (method === "google" && error.message.includes("GOOGLE_SIGN_IN_REQUIRED")) signIn(`/join#token=${token}`); } });
+  return <div className="product-shell"><header className="product-header"><Brand /></header><main className="placeholder-card"><p className="eyebrow">Private invitation</p>{!token || inspect.isError ? <><h1>This invitation is unavailable</h1><p>Ask the organizer for a fresh link.</p></> : inspect.isPending ? <p>Checking invitation…</p> : <><h1>Join {inspect.data.tripTitle}</h1><p>This invitation is intended for {inspect.data.displayName}.</p>{capabilities.isPending && <p>Loading sign-in options…</p>}{capabilities.isError && <Notice>Sign-in is unavailable. Please retry once the service is connected.</Notice>}<div className="method-tabs">{capabilities.data?.google && <button className={method === "google" ? "active" : ""} onClick={() => setMethod("google")}>Use Google</button>}<button className={method === "password" ? "active" : ""} onClick={() => setMethod("password")}>Use a password</button></div>{method === "password" && <label className="standalone-field">Choose a password<input type="password" minLength={8} value={password} onChange={(event) => setPassword(event.target.value)} /></label>}<button className="button wide" onClick={() => redeem.mutate()} disabled={redeem.isPending || !capabilities.data || inspect.data.status !== "unused"}>Join this trip</button>{redeem.isError && <Notice>{redeem.error.message}</Notice>}</>}</main></div>;
 }
 
 function Notice({ children }: { children: React.ReactNode }) { return <div className="notice" role="alert">{children}</div>; }

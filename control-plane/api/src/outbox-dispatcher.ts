@@ -3,6 +3,7 @@ import type { NotificationAdapter } from "./signup.js";
 import { structuredLog } from "./redaction.js";
 import { organizerIntroMessages, type IntroMessage, type ProactiveSettings } from "./companion-intro.js";
 import { issueGroupBindingToken } from "./group-binding.js";
+import { SIGN_IN_NOTICE_TYPE, signInNoticeText } from "./telegram-mini-app.js";
 
 interface OutboxRow {
   id: string;
@@ -88,6 +89,16 @@ function operatorMessageTextFor(row: OutboxRow): string | null {
  */
 function messageTextFor(row: OutboxRow, options?: DispatchOptions): string | IntroMessage[] | null {
   if (row.notification_type.startsWith("operator_")) return operatorMessageTextFor(row);
+  if (row.notification_type === SIGN_IN_NOTICE_TYPE) {
+    // About an account, not a trip (trip_id is NULL). Wording lives with the
+    // sign-in code that queues it.
+    return signInNoticeText({
+      accountName: payloadString(row, "account_name") ?? "your account",
+      linkKind: payloadString(row, "link_kind") === "member" ? "member" : "organizer",
+      tripTitle: payloadString(row, "trip_title"),
+      at: payloadString(row, "at"),
+    }, options?.publicOrigin ?? null);
+  }
   if (row.notification_type === "provisioning_complete" || row.notification_type === "companion_ready") {
     const url = row.payload && typeof row.payload.private_url === "string" ? row.payload.private_url : null;
     if (!url) return null;
@@ -156,6 +167,8 @@ export interface DispatchOptions {
    * add-to-group link. A null or a throw is logged, never swallowed quietly.
    */
   resolveBotUsername?: () => Promise<string | null>;
+  /** The portal's public origin, for the unlink link in the Mini App sign-in notice. Absent drops the link, not the notice. */
+  publicOrigin?: string | null;
   /** How long an issued group-binding token stays valid. Defaults to 30 days. */
   groupBindingTtlSeconds?: number;
   /**
@@ -178,7 +191,8 @@ export async function dispatchPendingTripNotifications(
   const { rows } = await db.query<OutboxRow>(
     `SELECT id, trip_id, notification_type, recipient, payload, attempt, max_attempts
      FROM control_plane.notification_outbox
-     WHERE state = 'pending' AND trip_id IS NOT NULL
+     WHERE state = 'pending'
+       AND (trip_id IS NOT NULL OR notification_type = '${SIGN_IN_NOTICE_TYPE}')
      ORDER BY created_at
      LIMIT 20`,
   );
@@ -261,7 +275,11 @@ export async function dispatchPendingTripNotifications(
         });
       }
       await db.query(
-        "UPDATE control_plane.notification_outbox SET state = 'sent', sent_at = now(), updated_at = now() WHERE id = $1",
+        // The Mini App sign-in notice carries a raw Telegram id in `recipient`
+        // (digests cannot be messaged); once sent, it does not stay at rest.
+        `UPDATE control_plane.notification_outbox SET state = 'sent', sent_at = now(), updated_at = now(),
+           recipient = CASE WHEN notification_type = '${SIGN_IN_NOTICE_TYPE}' THEN NULL ELSE recipient END
+         WHERE id = $1`,
         [row.id],
       );
       dispatched++;
@@ -273,6 +291,7 @@ export async function dispatchPendingTripNotifications(
       await db.query(
         `UPDATE control_plane.notification_outbox
          SET state = CASE WHEN attempt + 1 >= max_attempts THEN 'failed' ELSE 'pending' END,
+             recipient = CASE WHEN attempt + 1 >= max_attempts AND notification_type = '${SIGN_IN_NOTICE_TYPE}' THEN NULL ELSE recipient END,
              attempt = attempt + 1, updated_at = now()
          WHERE id = $1`,
         [row.id],

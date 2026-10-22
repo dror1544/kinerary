@@ -207,3 +207,56 @@ export async function consumeEnrollmentInTx(
 
   return { enrollmentId: enrollment.id, tripId: enrollment.trip_id, userId: enrollment.user_id };
 }
+
+export type EnrollmentReplacementResult =
+  | { ok: true; enrollmentId: string; token: string; expiresAt: Date }
+  | { ok: false; reason: "NOT_OWNER" | "TRIP_NOT_DRAFT" | "ENROLLMENT_NOT_REPLACEABLE" | "INTERVIEW_ALREADY_STARTED" | "ENROLLMENT_BUSY" };
+
+/** Explicit recovery of a lost, unused link. The expected id prevents a stale
+ * request (including a second tab) from rotating a newly returned link. Never
+ * resumes or resets a session, and never persists a plaintext token. */
+export async function replaceEnrollment(
+  db: pg.Pool, userId: string, tripId: string, expectedEnrollmentId: string,
+  config: EnrollmentConfig,
+): Promise<EnrollmentReplacementResult> {
+  const client = await db.connect();
+  const refuse = async (reason: Exclude<EnrollmentReplacementResult, { ok: true }>['reason']): Promise<EnrollmentReplacementResult> => {
+    await client.query("ROLLBACK"); return { ok: false, reason };
+  };
+  try {
+    await client.query("BEGIN");
+    // startSession consumes/locks enrollment before locking its trip. Follow
+    // that order so a consume racing recovery cannot create an inverse wait.
+    const row = await client.query<{ state: string; expires_at: Date }>(
+      `SELECT state, expires_at FROM control_plane.interview_enrollments
+       WHERE id=$1 AND trip_id=$2 FOR UPDATE`, [expectedEnrollmentId, tripId]);
+    const trip = await client.query<{ lifecycle_state: string }>(
+      `SELECT t.lifecycle_state FROM control_plane.trips t
+       JOIN control_plane.trip_memberships m ON m.trip_id=t.id
+       JOIN control_plane.users u ON u.id=m.user_id
+       WHERE t.id=$1 AND m.user_id=$2 AND m.role='owner' AND m.status='active'
+         AND m.dashboard_access=true AND u.status='active'
+       FOR UPDATE OF t NOWAIT FOR SHARE OF m, u NOWAIT`, [tripId, userId]);
+    // Account/membership changes may have their own lock order. Do not wait
+    // behind them while holding enrollment: refuse safely and allow a retry.
+    if (!trip.rows[0]) return await refuse("NOT_OWNER");
+    if (!row.rows[0] || row.rows[0].state !== "issued" || row.rows[0].expires_at.getTime() <= Date.now()) {
+      return await refuse("ENROLLMENT_NOT_REPLACEABLE");
+    }
+    if (trip.rows[0].lifecycle_state !== "draft") return await refuse("TRIP_NOT_DRAFT");
+    const sessions = await client.query("SELECT 1 FROM control_plane.intake_sessions WHERE trip_id=$1 LIMIT 1", [tripId]);
+    if (sessions.rowCount) return await refuse("INTERVIEW_ALREADY_STARTED");
+    const token = randomBytes(32).toString("base64url"), enrollmentId = generateId("enrl");
+    const expiresAt = new Date(Date.now() + config.enrollmentTtlSeconds * 1000);
+    await client.query("UPDATE control_plane.interview_enrollments SET state='revoked' WHERE id=$1", [expectedEnrollmentId]);
+    await client.query(
+      `INSERT INTO control_plane.interview_enrollments(id,trip_id,user_id,token_digest,state,expires_at)
+       VALUES ($1,$2,$3,$4,'issued',$5)`, [enrollmentId, tripId, userId, tokenDigest(token), expiresAt]);
+    await client.query("COMMIT");
+    return { ok: true, enrollmentId, token, expiresAt };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    if ((error as { code?: string }).code === "55P03") return { ok: false, reason: "ENROLLMENT_BUSY" };
+    throw error;
+  } finally { client.release(); }
+}

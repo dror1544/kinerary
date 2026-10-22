@@ -75,13 +75,13 @@ scaffolding would have hidden production's alerts.
 
 | tool | answers |
 |---|---|
-| `fleet_overview` | everything at a glance — trips by class and stage, jobs, failed notifications, open interviews, what became of the interview links, unreachable trips, confirmed-but-never-built |
+| `fleet_overview` | everything at a glance — trips by class and stage, jobs, failed notifications, open interviews, what became of the interview links, unreachable trips, confirmed-but-never-built, and the **companion gateways** (below) |
 | `list_trips` | trips with stage, reachability, idle time (`filter`: live, active, all, unreachable, ready) |
-| `trip_detail` | one trip end to end: its site URL, sessions with document provenance, every interview link and whether it was opened, how the interview's model calls went, jobs with error codes, notifications, Telegram bindings, linked people |
+| `trip_detail` | one trip end to end: its site URL, sessions with document provenance, every interview link and whether it was opened, how the interview's model calls went, jobs with error codes, notifications, Telegram bindings, linked people, and its companion gateway's decision and recent changes |
 | `failures` | failed jobs, jobs in flight over an hour, failed notifications, unreachable trips in a window — each tagged with trip class |
 | `stalled_interviews` | interviews **still open** and idle beyond a threshold, and what they wait on |
 | `statistics` | funnel including how many links were opened, completion rate, model success rate inside the interview, build success rate, median interview and build durations — and **companion usage** per trip (see below), which is one of four stated no-data states rather than a row of zeros wherever the relay does not record it |
-| `alerts` | **only** what is actionable — and empty output when healthy, which is what makes a silent watchdog possible. Byte-stable while nothing changes: each incident says when it started (UTC), never how long ago, and rows are sorted |
+| `alerts` | **only** what is actionable — and empty output when healthy, which is what makes a silent watchdog possible. Byte-stable while nothing changes: each incident says when it started (UTC), never how long ago, and rows are sorted. Includes a companion gateway that should be up and is not, and a silent reconciler |
 | `bug_reports` | what trip companions have reported as broken, with the reporting person's exact words — your triage queue |
 | `stacks` | which stacks exist, which is production, where config came from, the schema version each has applied, live connectivity |
 
@@ -90,6 +90,45 @@ psql and asserts the properties that are easy to lose in an edit: no tool takes
 SQL, no query reads a document's text or the column holding the site password,
 alerts select nothing derived from `now()`, and every live-interview query
 excludes the sessions that have already closed.
+
+### Companion gateways — dormant is not broken
+
+The control plane decides which companion gateways run (issue #349): the
+worker's reconciler records, per gateway, what *should* happen and why, and
+what the host last reported. You read that record; you never write it. A
+companion that is down is one of two very different things, and the whole point
+of this section is that you can tell which:
+
+| health | meaning | alert? |
+|---|---|---|
+| `RUNNING` | should run, does | no |
+| `DORMANT` | the reconciler **stopped** it on purpose and the host confirmed it (last action a successful stop; host says stopped/absent). The *reason* says why (below). In `observe` mode nothing is ever dormant | **never** |
+| `PENDING_STOP` | decided stopped but not (yet) stopped by the reconciler: it still runs, or nothing has stopped it (`observe` mode, or inside the two-sweep confirmation). The relay and the release tool still expect it up | no |
+| `STARTING` | should run, does not, decided under 15 minutes ago | no |
+| `BROKEN` | should run, does not — for over 15 minutes, or after 3 failed starts | **yes** |
+| `STRAY` | the trip was torn down or retired and a gateway is still running | **yes** |
+| `DUPLICATE` | two independent gateway processes for one profile | **yes** |
+| `UNOBSERVED` | no good sweep in 30 minutes, so none of the above is current | one alert for the reconciler, not one per trip |
+
+Reasons you will see on a dormant companion: `NOT_CURRENT` (a planned trip, or
+one that ended within its 14 days' grace, that is not its organizer's current
+trip, was not switched away from in the last 2 days, is not under way and was
+not asked for), `ARCHIVED` (more than 14 days past its end), `RETIRED`,
+`TEARDOWN`, `PIN_OFF` (an operator did it). The ones that keep a companion up:
+`CURRENT_TRIP` (the trip an organizer's chat is bound to), `WARM` (they
+switched away less than 2 days ago), `UNDERWAY` (between its start and end
+dates), `REVIVED` (a message reached it while it was off, less than 2 days
+ago) and `QUIET_WINDOW` (nothing is stopped within 6 hours of a conversation).
+**Do not tell anyone a dormant companion is broken, and do not try to start
+one** — the reconciler is the only thing that starts and stops gateways, and
+`reconcile-gateways --pin <profile> on|off|clear` is the operator's override.
+
+`fleet_overview` opens its section with the reconciler's own line: its mode
+(`observe` records and reports and acts on nothing; `enforce` also starts and
+stops), when it last swept and how that went. **A stack where no sweep was ever
+recorded is not a healthy stack** — the reconciler is off or has not run — and
+the overview says exactly that rather than staying silent. `trip_detail` shows
+the decision, the host's report and the last changes for one trip.
 
 ### Companion usage in `statistics`
 

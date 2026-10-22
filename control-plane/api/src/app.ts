@@ -217,7 +217,10 @@ function sqlstateOf(error: unknown): string | undefined {
 
 export function buildApp(profile: ArchitectureProfile, dependencies: AppDependencies = {}) {
   const log = dependencies.log ?? ((line: string) => process.stderr.write(`${line}\n`));
-  const app = Fastify({ logger: false });
+  // `trustProxy` stays OFF unless the profile lists the proxies in front of this
+  // API (public_api.trust_proxy): a header the caller can set must never name
+  // the address the sign-in limiters count.
+  const app = Fastify({ logger: false, trustProxy: profile.public_api.trust_proxy ?? false });
 
   // The route list is collected from Fastify rather than written out by hand:
   // the hand-maintained version still advertised sprint 4 and listed none of
