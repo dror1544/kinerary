@@ -42,13 +42,15 @@ table (`/start`, `/group`, `/done`) predates §3 and §4 being built.*
 | `/trips` | DM only | Lists the sender's trips and which one this chat is on. Refused in a group. In the DM menu. |
 | `/switch` / `/select` `<trip>` | DM only | Points this chat at a different trip of the sender's. Refused in a group. In the DM menu. |
 | `/name` / `/rename` `<names>` | Any chat bound to a trip; not mid-interview | Shows or changes the assistant's name(s). In every menu. |
+| `/app` | Any chat bound to a trip, group or DM; not mid-interview | Replies with an "Open trip" URL button (`https://t.me/<bot>?startapp=<trip id>`) for the chat's own trip, in the trip's language. An argument is ignored: the chat's binding picks the trip. Unbound group: the usual "no trip for this chat" answer. Unbound DM: the sender's own trips to choose from, as `/trips`. Also answered to plain words addressed to the assistant ("open the app", "פתח את האפליקציה") from a closed list (`relay/open-trip.ts`). **Only when the Mini App is ready for the bot** (see [`telegram-mini-app.md`](telegram-mini-app.md#the-open-trip-button-and-app)); before that, `/app` answers "not available yet" in any chat, the words are not answered, and it is in no menu. When ready, it is in every menu. |
 | `/help` | A chat bound to a trip | The router answers with the companion's own help text (`companionHelpText`). In every menu. |
 | `/model` / `/models` | Super admin's own DM only | Shows or switches which model serves each task. For anyone else it is answered as an unknown command; not in any menu. |
 
 Any other command in a bound chat gets the same help text with the unknown
 command named; mid-interview it gets `notMyCommand`; nothing is forwarded to
 Hermes as a slash command. Published menus (`routerCommandMenus`): private chats
-and the default get `/help /name /group /trips /switch`; groups get `/help /name`.
+and the default get `/help /name /group /trips /switch`; groups get `/help /name /proactive`; `/app` joins every menu
+once the Mini App is ready, and the menus are republished when that flips.
 Whether every row's *where* was exercised live was not re-checked here.
 
 **Planned, not built (PR #407, draft): `/proactive 1|2|3`.** A per-group setting of
@@ -311,6 +313,25 @@ only commands, replies and mentions. A bare token pasted as text would not
 arrive at all, and the case that breaks is the recovery case ("post it again
 now that I'm an admin"). Do not "simplify" this to a bare token.
 
+**Moving a group to the organizer's next trip (2026-10-20).** A code for trip B
+posted in a group already bound to trip A *moves* the group when the sender (the
+verified `from.id`, never anything typed) is an organizer of **both** A and
+B (`isTripOrganizer`: a LIVE per-trip Telegram link to that trip — an account-wide
+link counts for nothing — or a `trip_person_links` organizer row that no revoked
+link overrides, boundary review R1: a forwardee the owner Unlinked from A or B
+cannot move the group, and the dashboard's relink restores it); the old binding is closed with `closed_reason =
+'group_moved'` (history kept, no migration — the column is free text), a new one
+opens for B with B's companion, the code is recorded as used but stays redeemable
+until it expires, and the group gets B's introduction (and, when the Mini App is
+ready, B's Open trip message in place of A's). Anyone else gets one sentence —
+"This group belongs to another trip. Only its organizer can move it." — whichever
+half of the check failed, and nothing changes (log reason
+`GROUP_MOVE_NOT_ORGANIZER`). A's website and companion are untouched; the
+companion simply stops being routed for that chat. Nothing in this path writes
+`trip_person_links`, so a move can never re-promote a demoted organizer row.
+Asserted by `control-plane/api/test/group-move.test.ts` (the per-trip links, the
+account-wide-only refusal and the R1 Unlink/relink/member-removal cases).
+
 ## 8. `/url` — DROPPED (2026-09-13)
 
 Not needed, by Dror's decision: `/help` already answers it. In any chat bound
@@ -338,8 +359,8 @@ router's own `/help` and `/name` menu from integration (db3f0fe):
 
 | Scope | Commands |
 |---|---|
-| `default`, `all_private_chats` | `/help`, `/name`, `/group`, `/trips`, `/switch` |
-| `all_group_chats` | `/help`, `/name` |
+| `default`, `all_private_chats` | `/help`, `/name`, `/group`, `/trips`, `/switch` (+ `/app` once the Mini App is ready) |
+| `all_group_chats` | `/help`, `/name`, `/proactive` (+ `/app` once the Mini App is ready) |
 
 Groups get a menu of their own rather than none: leaving a group's menu alone
 is what kept sixty stale Hermes commands in a live family group on 2026-09-13.
@@ -405,6 +426,15 @@ Mini App.
 - *What is publicly reachable?* `web.public_origin`, as for the SPA; the exchange requires
   `Origin` to equal it.
 - *Where does it live?* Extending `web/` (`web/src/mini-app/`), one SPA and one API client.
+
+**The way in from a group (#443, 2026-10-20).** A Mini App cannot be launched from a group by
+an inline `web_app` button, so the bot posts a URL button to the bot's Main Mini App with the
+trip id as `startapp`: pinned when a group is bound (a message of ours pinned earlier is
+replaced), and on request with `/app`. It only selects the trip; membership still grants.
+It appears only when the Mini App is ready for the bot (enabled, and `has_main_web_app` true),
+re-evaluated at runtime; unknown is not ready.
+Whether the bot's Main Mini App is set is on `/readyz` (`telegram_mini_app.has_main_web_app`);
+the one-time BotFather step is in [`telegram-mini-app.md`](telegram-mini-app.md#one-time-setup-the-bots-main-mini-app).
 
 `setChatMenuButton` is the bridge — the same call that configures the menu can point at a
 Mini App instead of the command list — which is why §9 and this section are in the same

@@ -15,6 +15,7 @@ import { resolveSecretRef } from "./secrets.js";
 import { deleteWebhookIfPresent, startTelegramApprovalPoller } from "./telegram-poller.js";
 import { GoogleOidcClient, HttpRuntimeAccountAdapter, type PortalDependencies } from "./portal.js";
 import { checkBotIdentity } from "./telegram-mini-app.js";
+import { createBotCheckRound, createMiniAppStatus, withMiniAppReadiness } from "./mini-app-status.js";
 
 const profilePath = process.env.CONTROL_PLANE_ARCHITECTURE_PROFILE;
 if (!profilePath) throw new Error("CONTROL_PLANE_ARCHITECTURE_PROFILE is required");
@@ -119,6 +120,10 @@ if (chatRoutingKey) {
   chatRouting = { db: pool, apiKey: chatRoutingKey };
 }
 
+// What /readyz says about the Mini App (mini-app-status.ts). Declared outside the
+// block below so the readiness check can read it whether or not the block runs.
+const miniAppStatus = createMiniAppStatus();
+
 let portal: PortalDependencies | undefined;
 if (profile.web) {
   const runtimeExchangeKey = await resolveSecretRef(profile.web.runtime_exchange_key_secret_ref);
@@ -141,17 +146,24 @@ if (profile.web) {
     }
     if (miniAppToken) {
       const token = miniAppToken;
+      miniAppStatus.markConfigured();
       let enabled = false;
       telegramMiniApp = { botToken: token, maxAgeSeconds: profile.web.telegram_init_data_max_age_seconds, enabled: () => enabled, log: miniAppLog };
       // The feature is on only once getMe on THIS token names the bot the
       // profile says it is. A network failure is retried (it is not a verdict);
       // a different bot is a mis-wired secret and stays off until a restart.
       const expectedUsername = profile.web.telegram_bot_username;
-      const check = async (): Promise<boolean> => {
-        const result = await checkBotIdentity({ token, expectedUsername, log: miniAppLog });
-        enabled = result.ok;
-        return result.ok || result.reason === "MISMATCH";
-      };
+      const check = createBotCheckRound({
+        check: () => checkBotIdentity({ token, expectedUsername, log: miniAppLog }),
+        status: miniAppStatus,
+        setEnabled: (value) => { enabled = value; },
+        // The one step no code can do. Said loudly once, where the other Mini App
+        // lines are, and kept on /readyz (telegram_mini_app).
+        onMainWebAppMissing: () => miniAppLog(structuredLog("warn", "mini_app.main_web_app_missing", {
+          effect: "the Open trip button and /app links open nothing until the bot's Main Mini App is set",
+          hint: "BotFather: Bot Settings, Configure Mini App, URL <portal origin>/mini-app (docs/telegram-mini-app.md)",
+        })),
+      });
       if (!(await check())) {
         const retry = setInterval(() => { check().then((settled) => { if (settled) clearInterval(retry); }).catch(() => {}); }, 60_000);
         retry.unref();
@@ -251,7 +263,7 @@ if (assistantEventsIngestKey) {
 }
 
 const app = buildApp(profile, {
-  readiness: () => databaseReadiness(pool),
+  readiness: withMiniAppReadiness(() => databaseReadiness(pool), miniAppStatus),
   close: () => pool.end(),
   signup,
   interview,

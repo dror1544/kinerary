@@ -103,6 +103,8 @@ import { digestTelegramId } from "../identity.js";
 import type { StructuredModelRunner } from "../model-runner.js";
 import { handleModelCommand, isSwitchableRunner } from "../model-task-settings.js";
 import { looksLikeAQuestion, type ChatType, type WireMessageEvent } from "./protocol.js";
+import { asksForTripApp, couldAskForTripApp, openTripMessage, type OpenTripMessage } from "./open-trip.js";
+import { normaliseBotUsername } from "../bot-username.js";
 
 /** A message the connector should send itself, rather than routing to an agent. */
 export interface DirectReply {
@@ -157,6 +159,12 @@ export type DispatchDecision =
       followUp?: string;
       /** Whether to attempt pinning. False for a DM, where there is nothing to pin for. */
       pin?: boolean;
+      /**
+       * The "Open trip" message (#443): sent after the introduction and pinned
+       * under it, replacing one of ours pinned earlier. Absent when no bot handle
+       * is known (logged) and on a code hand-over, which binds nothing.
+       */
+      openTrip?: OpenTripMessage;
     }
   /** The organizer typed /done or /summary — show the recap, whatever else is going on. */
   | { kind: "show_summary"; chatId: string; view: SessionView }
@@ -419,6 +427,20 @@ export interface DispatchOptions {
   /** How long a group-binding token stays valid. Defaults to a week. */
   groupBindingTtlSeconds?: number;
   /**
+   * The bot handle the "Open trip" link points at: `web.telegram_bot_username`,
+   * the bot whose Main Mini App signs people in. NOT the relay's own `getMe`
+   * handle: no `web` block means no Mini App, whatever bot the relay is.
+   */
+  tripAppBotUsername?: string | null;
+  /**
+   * Is the Mini App ready for that bot (relay/trip-app-readiness.ts): enabled,
+   * and the bot's Main Mini App is set. Asked on every update, so a flip needs no
+   * restart. Absent - and anything but exactly `true` - is NOT ready: no Open
+   * trip message on a binding, `/app` answers "not available yet", and the plain
+   * words are left to the companion (owner decision 2026-10-20).
+   */
+  tripAppReady?: () => boolean;
+  /**
    * The signup super admin, as the subject digest approvals are checked
    * against. Absent means nobody may switch models from a chat.
    */
@@ -528,6 +550,38 @@ function repliesToAssistant(message: TelegramMessage, botIdentity: BotIdentity):
   return botIdentity.id ? String(repliedTo.id) === botIdentity.id : Boolean(repliedTo.is_bot);
 }
 
+/**
+ * The "Open trip" message for a trip, or null with a logged reason. Never
+ * silent: a deployment with no bot handle would otherwise lose the button with
+ * nothing anywhere to say why (the failure mode bot-username.ts exists for).
+ */
+function openTripFor(
+  tripId: string,
+  language: Language,
+  options: DispatchOptions,
+  botIdentity: BotIdentity,
+  log: (line: string) => void,
+): OpenTripMessage | null {
+  // Unknown is not ready. Quiet on purpose: not being ready is a state, and the
+  // readiness module logs its own flips; this runs on every binding.
+  if (!tripAppIsReady(options)) return null;
+  const handle = normaliseBotUsername(options.tripAppBotUsername);
+  const message = openTripMessage(handle, tripId, language);
+  if (!message) {
+    log(structuredLog("warn", "trip_bot.open_trip_unavailable", { reason: handle ? "BAD_TRIP_ID" : "NO_BOT_USERNAME" }));
+  }
+  return message;
+}
+
+/** Exactly `true` from the readiness check, and nothing else, is ready. */
+function tripAppIsReady(options: DispatchOptions): boolean {
+  try {
+    return options.tripAppReady?.() === true;
+  } catch {
+    return false;
+  }
+}
+
 export async function dispatchUpdate(
   db: pg.Pool,
   update: TelegramUpdate,
@@ -560,9 +614,11 @@ export async function dispatchUpdate(
     // that never finished. Nothing to introduce, and inventing a name here is
     // exactly what this module refuses to do.
     if (!facts || !assistantName) return { kind: "ignore", reason: "NO_INTRO_FACTS" };
+    const joinedOpenTrip = openTripFor(route.tripId, facts.language === "he" ? "he" : "en", options, botIdentity, log);
     return {
       kind: "group_intro",
       chatId: joined.chatId,
+      ...(joinedOpenTrip ? { openTrip: joinedOpenTrip } : {}),
       text: groupIntroText(
         {
           assistantName,
@@ -743,21 +799,51 @@ export async function dispatchUpdate(
       : ({ ok: false, reason: "WRONG_SENDER" } as const);
     if (!redeemed.ok) {
       log(structuredLog("info", "trip_bot.group_binding_refused", { reason: redeemed.reason }));
-      // Deliberately one message for every refusal. Distinguishing "that token
+      // A valid code, from its own holder, in a group that belongs to another trip: the sender
+      // does not organize both. Said in the GROUP's language (the chat is still bound to the
+      // trip it belongs to), one sentence for every way of failing the check.
+      if (redeemed.reason === "GROUP_MOVE_NOT_ORGANIZER") {
+        const language = await resolveChatLanguage(db, chatId, message.from?.language_code);
+        return { kind: "reply", reply: { chatId, text: uiString("groupMoveNotOrganizer", language) } };
+      }
+      // Deliberately one message for every other refusal. Distinguishing "that token
       // does not exist" from "that token is not yours" would confirm a guess to
       // whoever is guessing, in a room the organizer does not control.
       return { kind: "reply", reply: { chatId, text: strings.groupTokenRefused } };
     }
     log(structuredLog("info", "trip_bot.group_bound", { rebound: redeemed.rebound }));
+    if (redeemed.movedFromTripId) {
+      // In-memory, chat-keyed state belongs to the trip the group WAS: forget it, so the old
+      // trip's overheard messages and held documents never reach the new trip's companion.
+      options.groupContext?.clear(chatId);
+      options.pendingAttachments?.clearChat(chatId);
+      log(structuredLog("info", "trip_bot.group_moved", { from_trip_id: redeemed.movedFromTripId, to_trip_id: redeemed.tripId }));
+    }
     const facts = await companionIntroFacts(db, redeemed.tripId);
     const assistantName = typeof facts?.assistant_name === "string" ? facts.assistant_name : null;
     if (!facts || !assistantName) {
       return { kind: "reply", reply: { chatId, text: strings.groupBoundNoIntro } };
     }
+    // The way into the Mini App for this trip, posted and pinned right after the
+    // introduction (#443). Built from the trip the TOKEN named, never from the
+    // message; a re-bind to another trip therefore posts that trip's button, and
+    // the poller replaces one of ours pinned earlier.
+    const boundOpenTrip = openTripFor(redeemed.tripId, facts.language === "he" ? "he" : "en", options, botIdentity, log);
+    // A group carried over from another trip says so first, in the NEW trip's language: the
+    // people in it were talking to a different trip's assistant a moment ago.
+    const movedNotice = redeemed.movedFromTripId
+      ? `${uiString("groupMovedNotice", facts.language === "he" ? "he" : "en").replace(
+          "{trip}",
+          typeof facts.trip_title === "string" && facts.trip_title.trim()
+            ? facts.trip_title.trim()
+            : uiString("groupMovedNoticeUntitled", facts.language === "he" ? "he" : "en"),
+        )}\n\n`
+      : "";
     return {
       kind: "group_intro",
       chatId,
-      text: groupIntroText(
+      ...(boundOpenTrip ? { openTrip: boundOpenTrip } : {}),
+      text: movedNotice + groupIntroText(
         {
           assistantName,
           tripTitle: typeof facts.trip_title === "string" ? facts.trip_title : null,
@@ -989,6 +1075,64 @@ export async function dispatchUpdate(
       const result = await setFinishRequestedForChat(db, chatId, true);
       if (result.ok) return { kind: "show_summary", chatId, view: result.view };
     }
+  }
+
+  // `/app`, and the plain words for it: the "Open trip" button for the chat's
+  // trip (#443). Router-owned like /name - it is a fixed message, composed from
+  // the chat's own binding, and the companion has no business improvising a link.
+  //
+  // Anyone in the chat may ask: the button only SELECTS the trip, and the Mini
+  // App decides who may open it. Plain words are accepted for the same thing (a
+  // command is a shortcut, not syntax) and are matched against a closed list,
+  // only when the message is addressed to the assistant, only on a chat bound
+  // to a trip. See open-trip.ts.
+  const appReady = tripAppIsReady(options);
+  const appCommand = parsed.kind === "command" && parsed.name === "app";
+  // Not ready: the words are not answered at all (they go on to the companion as
+  // any sentence does), and the command says plainly that it is not there yet.
+  const appWordsMaybe = appReady && parsed.kind === "text" && couldAskForTripApp(text);
+  if (appCommand && !appReady) {
+    const language = await resolveChatLanguage(db, chatId, message.from?.language_code);
+    log(structuredLog("info", "trip_bot.open_trip_requested", { via: "command", available: false, ready: false }));
+    return { kind: "reply", reply: { chatId, text: uiString("openTripUnavailable", language) } };
+  }
+  if (appCommand || appWordsMaybe) {
+    const route = await resolveChatRoute(db, chatId);
+    const isPrivate = message.chat?.type === "private";
+    if (route.kind === "companion") {
+      const chatType = mapChatType(message.chat?.type, message.is_topic_message === true && message.message_thread_id !== undefined);
+      const addressedWords = chatType === "dm" || isAddressedToAssistant({
+        chatType,
+        text,
+        assistantNames: route.assistantNames,
+        botUsername: botIdentity.username,
+        isReplyToAssistant: repliesToAssistant(message, botIdentity),
+      });
+      const wanted = appCommand || (addressedWords && asksForTripApp(text, {
+        assistantNames: route.assistantNames,
+        botUsername: botIdentity.username,
+      }));
+      if (wanted) {
+        const language = isPrivate
+          ? await resolveChatLanguage(db, chatId, message.from?.language_code)
+          : await tripLanguage(db, route.tripId);
+        const open = openTripFor(route.tripId, language, options, botIdentity, log);
+        log(structuredLog("info", "trip_bot.open_trip_requested", { via: appCommand ? "command" : "words", available: Boolean(open) }));
+        if (!open) return { kind: "reply", reply: { chatId, text: uiString("openTripUnavailable", language) } };
+        return { kind: "reply", reply: { chatId, text: open.text, replyMarkup: open.replyMarkup } };
+      }
+    } else if (route.kind === "unbound" && appCommand) {
+      const senderId = message.from?.id === undefined ? null : String(message.from.id);
+      // Nothing is bound: a group gets the same sentence as any command there.
+      if (!isPrivate || !senderId) return { kind: "reply", reply: { chatId, text: strings.unbound } };
+      // A private chat with no trip yet: the sender's own trips, to pick one -
+      // the same list /trips answers, and the same re-authorising buttons.
+      const language = await resolveChatLanguage(db, chatId, message.from?.language_code);
+      const rendered = renderTripList(await listOrganizerTrips(db, senderId, chatId), language);
+      return { kind: "reply", reply: { chatId, text: rendered.text, replyMarkup: rendered.replyMarkup ?? undefined } };
+    }
+    // A live interview, or words that did not amount to a request: not ours.
+    // /app mid-interview falls to the command gate below (`notMyCommand`).
   }
 
   // ── A command is answered HERE, or it is not answered at all ───────────────

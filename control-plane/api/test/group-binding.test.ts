@@ -181,7 +181,7 @@ describe("group binding tokens", { skip: SKIP }, () => {
       const result = await redeemGroupBindingToken(pool, issued.token, chatId, "777");
       assert.equal(result.ok, false);
       if (result.ok) return;
-      assert.equal(result.reason, "CHAT_BOUND_ELSEWHERE");
+      assert.equal(result.reason, "GROUP_MOVE_NOT_ORGANIZER");
 
       const route = await resolveChatRoute(pool, chatId);
       assert.equal(route.kind === "companion" && route.tripId, otherTripId, "the other trip keeps it");
