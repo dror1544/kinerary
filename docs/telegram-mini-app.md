@@ -129,10 +129,10 @@ Enforced in **one place**, `requireUser` (portal.ts), which every authenticated 
 
 | Policy | Routes | A scoped session gets |
 |---|---|---|
-| `trip` | `GET /v1/trips/:id` and the rest of `/v1/trips/:id/…` except the three link-minting routes below (interview-link status, provisioning, plans, site-invites, members, launch) | its linked trip: as an organizer's/member's session does. Any other trip id, a nonexistent one included: the **same 404** `{"error":"NOT_FOUND"}` |
+| `trip` | `GET /v1/trips/:id`, `GET …/interview-link` (status only), `POST …/provisioning-request`, `POST …/plans/:planId/approve\|reject`, `POST …/launch` | its linked trip: as an organizer's/member's session does. Any other trip id, a nonexistent one included: the **same 404** `{"error":"NOT_FOUND"}` |
 | `filtered` | `GET /v1/trips` | only the linked trips (filter in the SQL) |
 | `link` | `DELETE /v1/account/telegram-links/:linkId` | may end only a link of **its own Telegram account** on a trip in scope (which ends the session). Another trip's link, and another account's link on an in-scope trip (the owner's phone), are the same 404 as an unknown id |
-| `account` | `POST /v1/trips`, `POST /v1/site-invites/redeem`, and the three routes that **mint a way into the account**: `POST /v1/trips/:id/telegram-link`, `POST /v1/trips/:id/interview-link`, `POST /v1/trips/:id/interview-link/replace` (boundary review M1: a link a scoped session minted and a second Telegram account redeemed would outlive the Unlink of the session's own account) | `403 {"error":"ACCOUNT_SIGN_IN_REQUIRED","message":"Sign in with your password to do this."}` |
+| `account` | `POST /v1/trips`, `POST /v1/site-invites/redeem`, and the three routes that **mint a way into the account**: `POST /v1/trips/:id/telegram-link`, `POST /v1/trips/:id/interview-link`, `POST /v1/trips/:id/interview-link/replace`, and — everything that **creates a credential or removes access** — `POST /v1/trips/:id/site-invites`, `DELETE /v1/trips/:id/site-invites/:inviteId`, `DELETE /v1/trips/:id/members/:membershipId` (boundary review M1, round 3 MF1: a link or a join URL a scoped session minted, redeemed by someone else, would outlive the Unlink of the session's own account; a forwardee must not remove people either) | `403 {"error":"ACCOUNT_SIGN_IN_REQUIRED","message":"Sign in with your password to do this."}` |
 | `session` | `GET /v1/me` (reports `scope: "telegram"`), `POST /v1/logout` | allowed |
 | `open` | sign-in routes, invite inspection, internal runtime routes | not session routes; a route marked `open` that asks for a user is refused |
 
@@ -209,7 +209,7 @@ source-vs-table check, live widening/narrowing, fail-closed scopes, rollback loo
   any organizer-only command). The Unlink demotes that row to `participant` (the name stays), the
   membership-end trigger does the same (migration `20261022120000`), and `resolveTripPerson` reads an
   `organizer` row as `participant` whenever that Telegram account has a revoked link to the trip and no live
-  one — so a re-provision, which upserts the role back, cannot undo it. A relink from the dashboard restores the stored role (only a row that an unlink or a membership end demoted, only when the issuer is still an owner/organizer of the trip), and the Unlink demotion has the same "no other live link of this Telegram account to the trip" guard as the trigger.
+  one — so a re-provision, which upserts the role back, cannot undo it. A relink from the dashboard restores the stored role (only a row that an unlink or a membership end demoted, only when the issuer is still an owner/organizer of the trip), and the Unlink demotion has the same "no other live link of this Telegram account to the trip" guard as the trigger. The demotion is **recorded** (`trip_person_links.demoted_from_role`, migration `20261023120000`, written by the Unlink and by the membership-end trigger) and the relink restores only a row carrying that marker, then clears it — a person who was a participant all along is never promoted by an old Unlinked link of their Telegram account (round 3, MF2). Rows demoted before the column existed carry no marker and are not restored.
   Member links are flagged `revoked_at` and also end —
   with their sessions — when the trip password changes, when the membership ends, or when the invite is
   revoked. These are database triggers (migrations `20261020120000`, `20261021120000`), not route code,
@@ -257,7 +257,7 @@ exactly the ingress in front of the API; a wrong list is worse than none.
 
 `web.telegram_bot_token_secret_ref` (optional; absent means **off**, logged at boot as
 `mini_app.disabled`, and `GET /v1/auth/capabilities` reports `telegramMiniApp: false`) and
-`web.telegram_init_data_max_age_seconds` (60–3600, default 300). At boot `getMe` on that token
+`web.telegram_init_data_max_age_seconds` (60–3600, default 300). `web.public_origin` and `web.runtime_origin` are **normalised to the browser's Origin form** at config load (`new URL(x).origin`: lower case, default port and trailing slash dropped, any path removed), because the Origin check on every mutation compares the header with `public_origin` byte for byte; the isolation check compares the normalised values. At boot `getMe` on that token
 must name `web.telegram_bot_username`, or the feature stays off (`mini_app.bot_token_mismatch`
 — handles only, never the token); a network failure is retried every minute. Boot also logs
 `has_main_web_app` from `getMe`. Nothing logs `initData`, a hash, a Telegram id or its digest.

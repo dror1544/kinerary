@@ -104,9 +104,12 @@ export const PORTAL_SCOPE_POLICY: Readonly<Record<string, RouteScope>> = Object.
   "POST /v1/trips/:id/provisioning-request": "trip",
   "POST /v1/trips/:id/plans/:planId/approve": "trip",
   "POST /v1/trips/:id/plans/:planId/reject": "trip",
-  "POST /v1/trips/:id/site-invites": "trip",
-  "DELETE /v1/trips/:id/site-invites/:inviteId": "trip",
-  "DELETE /v1/trips/:id/members/:membershipId": "trip",
+  // A site invite is a join URL that anyone can redeem anonymously with a password: it makes an account
+  // that outlives the Unlink of the session that minted it (round 3, MF1). Revoking an invite and removing
+  // a member take access away from other people; a forwardee must not do either. All three need a password.
+  "POST /v1/trips/:id/site-invites": "account",
+  "DELETE /v1/trips/:id/site-invites/:inviteId": "account",
+  "DELETE /v1/trips/:id/members/:membershipId": "account",
   "POST /v1/trips/:id/launch": "trip",
 });
 

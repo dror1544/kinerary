@@ -89,3 +89,27 @@ it("a full session still gets Link", async () => {
   fireEvent.click(await screen.findByRole("button", { name: "Telegram options for Rome 2027" }));
   expect(await screen.findByRole("menuitem", { name: "Link Telegram" })).toBeInTheDocument();
 });
+
+it("a scoped session on the setup page is not offered invitations, member removal or interview links - it is told to sign in with a password", async () => {
+  const detail = { ...trip, lifecycleState: "ready_private", members: [
+    { id: "memb_me", displayName: "Olive", role: "owner", runtimeUsername: null, you: true, removable: false },
+    { id: "memb_guest", displayName: "Guest Gal", role: "member", runtimeUsername: "gal", you: false, removable: true },
+  ] };
+  const calls = mount("/trips/trip_romerome/setup", { id: "user_1", displayName: "Olive", scope: "telegram" }, (path) =>
+    path === "/v1/trips/trip_romerome" ? json(detail) : undefined);
+  expect(await screen.findByText(/to invite or remove people, sign in with your password/)).toBeInTheDocument();
+  expect(screen.getByText(/to remove people, sign in with your password/)).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Remove" })).toBeNull();
+  expect(screen.queryByRole("button", { name: /Create invitation|Create link|Invite/i })).toBeNull();
+  expect(calls.some((c) => c.method !== "GET")).toBe(false);
+});
+
+it("a full session on the setup page still gets the invitations and the people panel", async () => {
+  const detail = { ...trip, members: [
+    { id: "memb_me", displayName: "Olive", role: "owner", runtimeUsername: null, you: true, removable: false },
+    { id: "memb_guest", displayName: "Guest Gal", role: "member", runtimeUsername: "gal", you: false, removable: true },
+  ] };
+  mount("/trips/trip_romerome/setup", { id: "user_1", displayName: "Olive", scope: "full" }, (path) =>
+    path === "/v1/trips/trip_romerome" ? json(detail) : undefined);
+  expect(await screen.findByRole("button", { name: "Remove" })).toBeInTheDocument();
+});

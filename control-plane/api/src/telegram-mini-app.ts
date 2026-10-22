@@ -681,7 +681,7 @@ export async function unlinkTelegramLink(db: pg.Pool, userId: string, linkId: st
       // written at provisioning from whoever ran the interview) is demoted too: an Unlink must take
       // the organizer powers the link gave, not only the Mini App (boundary review R1).
       await client.query(
-        `UPDATE control_plane.trip_person_links SET role = 'participant'
+        `UPDATE control_plane.trip_person_links SET role = 'participant', demoted_from_role = 'organizer'
           WHERE trip_id = $2 AND role = 'organizer' AND telegram_user_id ~ '^[0-9]{1,20}$'
             AND ${CHAT_DIGEST_SQL("telegram_user_id")} = $1
             -- the same guard as the membership-end trigger: another user's live link of this

@@ -645,8 +645,11 @@ describe("the identity link the commands depend on (DB)", { skip: SKIP }, () => 
       const before = await count();
       await pool.query(sql);
       await pool.query(sql);
+      const latest = await readFile(`${migrationsDir}/20261023120000_person_link_demotion_marker.sql`, "utf8");
       await pool.query(later);
       await pool.query(later);
+      await pool.query(latest);
+      await pool.query(latest);
       assert.equal(await count(), before);
     });
   });
@@ -1063,6 +1066,53 @@ describe("a relink restores the bot's organizer fact an unlink demoted (DB)", { 
     assert.equal(await roleOf(pool, tripId, OTHER_CHAT), "organizer", "the stored fact is restored");
     assert.equal(await isTripOrganizer(pool, tripId, OTHER_CHAT), true);
     assert.equal((await resolveTripPerson(pool, tripId, OTHER_CHAT))?.role, "organizer", "linkRole is organizer again");
+  });
+
+  test("MF2 (reviewer's P/Q): a person who was a participant all along stays one after redeeming a co-organizer's link, even with an old Unlinked link of their own", async () => {
+    const pool = await migratedPool();
+    const { owner, co, tripId } = await coOrganizerTrip(pool);
+    const { issueTelegramLinkToken, redeemTelegramLinkToken } = await import("../src/telegram-link-token.js");
+    const P = OTHER_CHAT, Q = "551100331";
+    await person(pool, tripId, P);                                   // P: the organizer-side person (co-organizer's Telegram)
+    await person(pool, tripId, Q, "participant");                    // Q: a participant throughout
+    // Q's Telegram account once had a link to the trip (as the OWNER's), and it was Unlinked.
+    const old = await link(pool, owner, tripId, Q);
+    await unlinkTelegramLink(pool, owner, old);
+    assert.equal((await pool.query("SELECT demoted_from_role FROM control_plane.trip_person_links WHERE trip_id = $1 AND telegram_user_id = $2", [tripId, Q])).rows[0].demoted_from_role, null,
+      "Q was never an organizer, so nothing was demoted and nothing is recorded");
+    const issued = await issueTelegramLinkToken(pool, { userId: co, tripId });
+    assert.equal((await redeemTelegramLinkToken(pool, issued.ok ? issued.token : "", Q)).ok, true);
+    assert.equal(await roleOf(pool, tripId, Q), "participant", "Q is NOT promoted");
+    assert.equal(await isTripOrganizer(pool, tripId, Q), false);
+    void P;
+  });
+
+  test("MF2: the demotion is recorded by the Unlink and by the membership trigger, restored by the relink, and the marker is cleared", async () => {
+    const pool = await migratedPool();
+    const { owner, co, tripId } = await coOrganizerTrip(pool);
+    const { issueTelegramLinkToken, redeemTelegramLinkToken } = await import("../src/telegram-link-token.js");
+    const marker = async (chat: string) => (await pool.query("SELECT demoted_from_role AS m FROM control_plane.trip_person_links WHERE trip_id = $1 AND telegram_user_id = $2", [tripId, chat])).rows[0]?.m ?? null;
+    // Owner, by an Unlink.
+    await person(pool, tripId, ORGANIZER_CHAT);
+    await unlinkTelegramLink(pool, owner, await link(pool, owner, tripId, ORGANIZER_CHAT));
+    assert.equal(await marker(ORGANIZER_CHAT), "organizer");
+    let issued = await issueTelegramLinkToken(pool, { userId: owner, tripId });
+    assert.equal((await redeemTelegramLinkToken(pool, issued.ok ? issued.token : "", ORGANIZER_CHAT)).ok, true);
+    assert.equal(await roleOf(pool, tripId, ORGANIZER_CHAT), "organizer", "the owner's own relink restores");
+    assert.equal(await marker(ORGANIZER_CHAT), null, "and the marker is cleared");
+    // Co-organizer, by the membership-end trigger (S2b): removed, re-added, relinked.
+    await person(pool, tripId, OTHER_CHAT);
+    await link(pool, co, tripId, OTHER_CHAT);
+    await pool.query("UPDATE control_plane.trip_memberships SET status = 'revoked' WHERE trip_id = $1 AND user_id = $2", [tripId, co]);
+    assert.equal(await roleOf(pool, tripId, OTHER_CHAT), "participant");
+    assert.equal(await marker(OTHER_CHAT), "organizer", "the trigger records it too");
+    await pool.query("UPDATE control_plane.trip_memberships SET status = 'active' WHERE trip_id = $1 AND user_id = $2", [tripId, co]);
+    assert.equal(await roleOf(pool, tripId, OTHER_CHAT), "participant", "being added back does not revive the role");
+    issued = await issueTelegramLinkToken(pool, { userId: co, tripId });
+    assert.equal((await redeemTelegramLinkToken(pool, issued.ok ? issued.token : "", OTHER_CHAT)).ok, true);
+    assert.equal(await roleOf(pool, tripId, OTHER_CHAT), "organizer");
+    assert.equal(await marker(OTHER_CHAT), null, "the marker is cleared on this path too");
+    assert.equal(await isTripOrganizer(pool, tripId, OTHER_CHAT), true);
   });
 
   test("a relink promotes only a row an unlink demoted: a person who was a participant all along stays one", async () => {

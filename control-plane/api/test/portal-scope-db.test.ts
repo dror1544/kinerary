@@ -202,7 +202,8 @@ test("a scoped session lists and opens only its linked trips; the full session o
     // account (a Telegram link, an interview link), which needs a password (boundary review M1).
     assert.equal((await call(app, scoped, "POST", `/v1/trips/${rome}/telegram-link`)).statusCode, 403);
     assert.equal((await call(app, full, "POST", `/v1/trips/${rome}/telegram-link`)).statusCode, 201);
-    assert.equal((await call(app, scoped, "POST", `/v1/trips/${rome}/site-invites`, { displayName: "Guest", runtimeUsername: "guest-one" })).statusCode, 201);
+    assert.equal((await call(app, scoped, "POST", `/v1/trips/${rome}/site-invites`, { displayName: "Guest", runtimeUsername: "guest-one" })).statusCode, 403);
+    assert.equal((await call(app, full, "POST", `/v1/trips/${rome}/site-invites`, { displayName: "Guest", runtimeUsername: "guest-one" })).statusCode, 201);
     assert.equal((await call(app, scoped, "GET", `/v1/trips/${rome}/interview-link`)).statusCode, 200);
     assert.equal((await call(app, scoped, "POST", `/v1/trips/${rome}/launch`)).statusCode, 200, "/launch respects the scope for its own trip");
     const outLaunch = await call(app, scoped, "POST", `/v1/trips/${oslo}/launch`);
@@ -251,6 +252,33 @@ test("M1 CHAIN: a scoped session cannot mint a Telegram link or an interview lin
     const full = await fullSession(user, "m1");
     assert.equal((await call(app, full, "POST", `/v1/trips/${rome}/telegram-link`)).statusCode, 201);
     assert.equal(await tokens(), 1);
+  } finally { await app.close(); }
+});
+
+test("MF1: a scoped session cannot mint a join URL, revoke an invite or remove a member; a full session can", { skip }, async () => {
+  const app = newApp();
+  try {
+    const { scoped, full, rome, user } = await fixture(app);
+    const invites = async () => (await pool.query("SELECT 1 FROM control_plane.site_invites WHERE trip_id = $1", [rome])).rowCount;
+    const refusal = { error: "ACCOUNT_SIGN_IN_REQUIRED", message: "Sign in with your password to do this." };
+    const mint = await call(app, scoped, "POST", `/v1/trips/${rome}/site-invites`, { displayName: "Planted", runtimeUsername: "planted-one" });
+    assert.equal(mint.statusCode, 403); assert.deepEqual(mint.json(), refusal);
+    assert.equal(await invites(), 0, "no invite row was created");
+    const made = await call(app, full, "POST", `/v1/trips/${rome}/site-invites`, { displayName: "Guest", runtimeUsername: "guest-mf1" });
+    assert.equal(made.statusCode, 201);
+    assert.equal(await invites(), 1);
+    const inviteId = made.json().id as string;
+    const revoke = await call(app, scoped, "DELETE", `/v1/trips/${rome}/site-invites/${inviteId}`);
+    assert.equal(revoke.statusCode, 403); assert.deepEqual(revoke.json(), refusal);
+    assert.equal((await pool.query("SELECT state FROM control_plane.site_invites WHERE id = $1", [inviteId])).rows[0].state, "unused", "the invite was not revoked");
+    // A real second member to remove (a runtime-only guest on the trip).
+    const guest = await mkUser("Guest member");
+    await mkMember(rome, guest, "member");
+    const membership = (await pool.query("SELECT id FROM control_plane.trip_memberships WHERE trip_id = $1 AND user_id = $2", [rome, guest])).rows[0].id as string;
+    const removal = await call(app, scoped, "DELETE", `/v1/trips/${rome}/members/${membership}`);
+    assert.equal(removal.statusCode, 403); assert.deepEqual(removal.json(), refusal);
+    assert.equal((await pool.query("SELECT status FROM control_plane.trip_memberships WHERE id = $1", [membership])).rows[0].status, "active", "the member was not removed");
+    assert.equal((await call(app, full, "DELETE", `/v1/trips/${rome}/site-invites/${inviteId}`)).statusCode, 200, "the password session still can");
   } finally { await app.close(); }
 });
 
