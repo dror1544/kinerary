@@ -1,6 +1,6 @@
 # A companion's report reaches GitHub through the monitor, and the reporter hears back
 
-Status: draft (2026-10-22, owner answers of 2026-10-22 folded in) · Issue: #125 · Track: T4 · Size: L (three slices) · Tier: High
+Status: draft (2026-10-22; all open questions answered by Dror 2026-10-22, awaiting approval) · Issue: #125 · Track: T4 · Size: L (three slices) · Tier: High
 Security path: yes (the issue-filing token; traveller text in a public tracker; a new monitor write path) · Migration: yes (verdicts, beta flag) · Live-trip behaviour: yes (companion replies; companions need a re-render)
 
 ## Problem
@@ -54,8 +54,8 @@ Each new report gets one verdict:
 | `bug` | a real defect | one GitHub issue, labelled `companion-bug` |
 | `how_to` | the product does it, but differently | an explanation goes back to the reporter |
 | `not_supported` | the product does not do this, and nothing is planned | an explanation goes back to the reporter |
-| `planned` | a known future feature | an explanation goes back, naming it as planned, with no date promised |
-| `duplicate` | already reported or already filed | the original's reference is told back |
+| `planned` | a known future feature | the person is told the request has also been raised by other users and is in the product's plan for the future; no date, no issue number |
+| `duplicate` | already reported or already filed | the person is told it has already been reported and is being looked at; no reference |
 
 ### The answer back
 
@@ -65,14 +65,17 @@ Each new report gets one verdict:
   made. It tells the person in their own language, for example: "I checked:
   you can do that from the trip site's Plan tab, by …", or "That isn't supported
   yet; it's on the list of planned features."
-- The explanation is written for the person. It never contains another trip's
-  data, internal identifiers, or anything from the issue tracker beyond "a
-  ticket was opened".
+- **No issue numbers or technical data in the chat**, for any verdict (owner,
+  2026-10-22): no issue number, link, report id, label, error code or internal
+  name, and never another trip's data. The person hears plain language only.
+  For `planned`, that means something like: "Other travellers have asked for
+  this too, and it's part of what we plan to build." The issue number stays with
+  the operator.
 
 ### Suggestions (beta testers only)
 
-- A trip, or an organizer account, can be marked **beta** by an operator
-  (open question 1 decides which).
+- A **trip** can be marked **beta** by an operator (owner, 2026-10-22: per trip).
+  Every member of a beta trip may suggest. Per-person beta is a later change.
 - On a beta trip, the companion offers `suggest_improvement` as well as
   `report_bug`. On any other trip, that tool is absent, and a request to "suggest
   a feature" gets a polite "I've noted it" with no filing.
@@ -170,14 +173,16 @@ and the operator is told.
   English and Hebrew:
   - `how_to` gives the steps;
   - `not_supported` says it plainly;
-  - `planned` makes no promise;
-  - `duplicate` gives the original reference.
-  None leaks another trip's data or an internal identifier.
+  - `planned` says other users raised it too and it is in the future plan, with
+    no promise;
+  - `duplicate` says it was already reported.
+  A test asserts that no reply contains an issue number, `#`-number, URL,
+  `R-`/`cbr_` id, label or error code, and none leaks another trip's data.
 
 ### Slice 3: beta suggestions
 
-- **AC-13 Beta flag.** A migration adds the flag at the level open question 1
-  decides. An operator sets it through a verb on the existing operator route set
+- **AC-13 Beta flag.** A migration adds `trips.beta boolean NOT NULL DEFAULT false`
+  (per trip, the owner's decision of 2026-10-22). An operator sets it through a verb on the existing operator route set
   or the `cpinvite`-style forced command. Default off.
 - **AC-14 Tool presence follows the flag.** `suggest_improvement` is offered by
   `companion-mcp.ts` only when the caller's trip is beta. Otherwise the call is
@@ -247,14 +252,12 @@ companion comes back with the steps). Then, on a beta trip, suggest something
 - `issue-mcp`, `report-verdict-mcp` and the monitor skill reach the monitor
   through `install-hermes-skill.sh` (an approved step).
 
-## Open questions
+## Decisions (owner, 2026-10-22)
 
-1. **Beta at which level:** per trip (every member of a beta trip may suggest), or
-   per person (needs the relay's verified sender id passed to the companion's
-   tools, which is a larger change)? Proposed: per trip now, per person later.
-2. **Should a `planned` answer link the public issue number** to the person, or
-   only say "planned"? Proposed: only "planned"; the issue number goes to the
-   operator.
-3. **Who may see the slug and profile:** proposed the operator channel only. Is
-   that right, or should the issue carry a non-identifying trip alias (for
-   example `trip-7f3a`)?
+1. **Beta is per trip.** Every member of a beta trip may suggest. Per-person
+   beta (which needs the relay's verified sender id) is a later change.
+2. **No issue or technical data reaches the chat.** For `planned`, the person
+   hears that other users raised it too and that it is in the product's future
+   plan. Issue numbers go to the operator only.
+3. **The public issue carries the opaque trip id only.** The slug and profile
+   go to the operator channel only, as proposed.
