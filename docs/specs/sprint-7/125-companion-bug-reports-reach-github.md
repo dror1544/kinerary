@@ -83,6 +83,38 @@ Each new report gets one verdict:
   the labels `suggestion` and `from-beta`, carrying the same redacted quote and
   identifiers as a bug.
 
+### The operator hears about every filed issue, with what the issue left out
+
+Owner, 2026-10-22: whenever the monitor opens an issue, it logs that it did, and
+says so on its Telegram, with all the data that was not placed in the issue.
+
+- **Operator Telegram message.** One message per filed issue (bug or
+  suggestion), sent to the monitor's own operator chat, the one its digest goes
+  to. It contains:
+  - the issue number and link;
+  - the verdict;
+  - the trip slug and the opaque trip id;
+  - the companion profile;
+  - the report reference and time.
+
+  It then carries **everything the redactor withheld**:
+  - the unredacted quote, summary and detail;
+  - which roster names, contact details, booking codes and links were removed.
+- **Never anywhere else.** The message goes only to the operator chat: never a
+  family group, an organizer or the issue.
+- **Log line.** A structured line, `monitor.issue_filed`, carrying the issue
+  number, report id, trip id, verdict and fingerprint. It holds **no** private
+  text, because log files persist and travel. The private details live in the
+  operator chat only.
+- **Verdicts that file nothing** (`how_to`, `not_supported`, `planned`,
+  `duplicate`) also get one short operator message: the verdict, the
+  explanation sent back, and the trip slug. The day's digest then lists the
+  count of each.
+- **Delivery failure.** If the Telegram message fails, the issue is still filed
+  (it is already public and correct). The log line records
+  `operator_notice: failed`, and the next digest lists the issue as "filed, the
+  operator was not told".
+
 ### Privacy in the public issue
 
 The public issue never carries:
@@ -144,6 +176,18 @@ and the operator is told.
 - **AC-8 No token in the companion.** The rendered companion config and `.env`
   contain no `GITHUB`/`GH_` key.
 
+- **AC-16 Operator notice.** Every successful filing:
+  - Emits exactly one `monitor.issue_filed` log line, with ids only.
+  - Sends one Telegram message to the operator chat, carrying the issue link
+    and every withheld field: the slug, the profile, and the unredacted quote,
+    summary and detail, plus a list of the redaction classes applied.
+  - A test with a stub Telegram and a stub GitHub asserts:
+    - the message carries all of those fields;
+    - the log line carries none of the private ones;
+    - the message's chat is the configured operator chat and nothing else.
+  - A failed send still files the issue, logs `operator_notice: failed`, and
+    shows up in the next digest.
+
 ### Slice 2: the answer back
 
 - **AC-9 Verdict write path.** A separate, single-purpose MCP server,
@@ -201,6 +245,7 @@ and the operator is told.
 | Templates | `SOUL.md.tpl` and the operations skill: reporting, answer-back and suggestion wording |
 | Fleet monitor | `fleet-mcp.mjs`: redacted fields, and the redactor module `redact.mjs` with tests |
 | Issue filing | `issue-mcp.mjs`: kinds `companion-report` and `companion-suggestion`, with the redaction check on input |
+| Operator notice | the monitor skill and SOUL send the post-filing operator message through the monitor's existing Telegram delivery. A `monitor.issue_filed` log line is emitted by `issue-mcp.mjs` after creation |
 | Verdicts | new `report-verdict-mcp.mjs`, and the operator route in `app.ts` |
 | Migrations | `companion_report_verdicts`, and the beta flag |
 
