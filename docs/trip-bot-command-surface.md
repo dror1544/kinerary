@@ -143,16 +143,20 @@ So `telegram_organizer_links` (migration 0052) is its own many-`user_id`s-per-di
 table, and `user_identities` is untouched. It was a read model for routing, never a
 credential and never an authentication path.
 
-**That last clause changed on 2026-10-20 (#442).** A row is now also a **sign-in path**:
-the holder of the linked Telegram account can open the Mini App as that user with no
-password (§10). The table keeps its name and shape, but it is now **revocable** (an Unlink
-*moves* the row to `telegram_organizer_link_revocations`, migration `20261020120000`),
-**owner-visible** ("Telegram accounts that can sign in as you" on My trips, with Unlink) and
-**announced** (a Telegram notice to the owner's own chats on the first Mini App sign-in through a
-link). Because the row is moved rather than flagged, every reader — the Mini App resolver, the
-bot's own (`/trips`, `/switch`, `hasEarlierBuiltTrip`, `isTripOrganizer`), and the previous
-release's after a rollback — simply no longer sees it, with no reader having to know about
-revocation. A revoked organizer link stays revoked; a new interview link does not re-open it.
+**That last clause changed on 2026-10-20 (#442), and so did the table.** A link is now also a
+**sign-in path**: the holder of the linked Telegram account can open the Mini App as that user with
+no password (§10). It is **per trip** (`telegram_organizer_trip_links`, migration `20261021120000`:
+one row per Telegram account, user and trip), because the account-wide row made one Unlink take every
+trip out of `/trips` and left no way back. It is **revocable** (flagged in place), **owner-visible** (the
+trip card's Telegram icon and ⋮ menu on My trips, with Unlink), **announced** (a Telegram notice to all
+the owner's private chats, the signer's included, on a link's first Mini App sign-in) and **re-linkable
+only from the signed-in dashboard** (`POST /v1/trips/:id/telegram-link` → a one-time `t.me/<bot>?start=lk_…`
+that the bot redeems for the sender's verified Telegram id). The bot's readers — `/trips`, `/switch`,
+`hasEarlierBuiltTrip`, `isTripOrganizer` — and the Mini App resolver all ask for the link *of the trip
+in question*. 0052's account-wide table is no longer read or written; the migration expanded each row into
+per-trip rows, and a per-trip Unlink moves the pair's account-wide row to
+`telegram_organizer_link_revocations`, so the previous release after a rollback cannot see an unlinked
+account. A revoked (Telegram account, user, trip) stays revoked: an interview link does not re-open it.
 Telegram Login Widget SSO on the per-trip sites stays retired (`/v1/auth/telegram` still answers 410).
 
 **The migration backfills from `intake_sessions`.** Without that the feature
@@ -375,14 +379,16 @@ verified Telegram id worth no more than the links someone proved earlier:
 
 - the identity is **verified exactly** (the Mini App HMAC, not the Login Widget one;
   fresh; bounded; replay-capped in Postgres) and answered with one generic refusal;
-- it signs in only through a **link** (`telegram_organizer_links`, or
+- it signs in only through a **link** (`telegram_organizer_trip_links`, or
   `telegram_member_links` written when a member proves their trip password in the Mini App
   and consents) and only to a trip the linked account is an **active member** of; the
   chat's trip *selects*, membership *grants*; a trip the person cannot open is refused
   exactly like one that does not exist;
 - links are **visible to their owner, revocable, and announced** (§3);
-- the session is the ordinary web session (7 days), and a verified launch replaces any
-  session already in the WebView.
+- the session lasts 7 days like any web session but is **scoped** to the trips that Telegram account
+  is linked to (everything else of the account needs a password or Google sign-in, enforced in
+  `requireUser`; `telegram-mini-app.md`), and a verified launch replaces any session already in the
+  WebView.
 
 §3's enrollment-time identity row is what makes this possible for organizers; members, who
 have no such row, are linked the first time they sign in with their trip password inside the
@@ -394,7 +400,8 @@ Mini App.
   whatever that session's role can (a member: open the trip; an organizer: the dashboard
   actions). The Mini App adds no authorization of its own.
 - *Replace the commands or sit beside them?* Beside: the commands work in a group, the Mini
-  App does not (and Telegram Web is unsupported in v1).
+  App does not (Telegram Web is supported with a partitioned cookie and `frame-ancestors` for `/mini-app`
+  only — `telegram-mini-app.md`).
 - *What is publicly reachable?* `web.public_origin`, as for the SPA; the exchange requires
   `Origin` to equal it.
 - *Where does it live?* Extending `web/` (`web/src/mini-app/`), one SPA and one API client.
@@ -417,8 +424,9 @@ Collected so they are not lost in the prose. None of these should be guessed:
 3. **Draft creation without a destination** (§6, kept for later) — placeholder,
    or ask one question first?
 4. **Mini app auth** (§10) — *resolved (2026-10-20)*: outside the retired decision, under
-   the conditions in §10 and `telegram-mini-app.md`. An Unlink removes the
-   row from `telegram_organizer_links`, so no bot reader sees it (closed 2026-10-20).
+   the conditions in §10 and `telegram-mini-app.md`. Links are per trip; an Unlink revokes that trip's
+   link and moves the pair's old account-wide row to history, so no bot reader — current or previous
+   release — sees it (closed 2026-10-20, reshaped per trip 2026-10-20).
 
 ## 12. What the tests would have to show
 

@@ -74,8 +74,8 @@ async function withFix(fn: (f: Fix) => Promise<void>): Promise<void> {
     await link(A.tripId, DROR, "dror", "organizer");
     await link(B.tripId, OTHER_ORG, "other", "organizer");
     await pool.query(
-      "INSERT INTO control_plane.telegram_organizer_links(id, user_id, telegram_subject_digest, verified_via) VALUES ($1, $2, $3, 'enrollment_redemption')",
-      [id("tol"), B.userId, digestTelegramId(String(OTHER_ORG))],
+      "INSERT INTO control_plane.telegram_organizer_trip_links(id, user_id, trip_id, telegram_subject_digest, verified_via) VALUES ($1, $2, $3, $4, 'enrollment_redemption')",
+      [id("otl"), B.userId, B.tripId, digestTelegramId(String(OTHER_ORG))],
     );
     const bind = (chat: string, tripId: string) => pool.query(
       "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, 'p')",
@@ -142,8 +142,8 @@ describe("/proactive is the organizer's, of THIS trip, and nobody else's", { ski
         await f.pool.query("INSERT INTO control_plane.users(id, status, display_name) VALUES ($1, 'active', 'M')", [userId]);
         await f.pool.query("INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status) VALUES ($1, $2, $3, $4, $5)", [id("memb"), f.A.tripId, userId, role, status]);
         await f.pool.query(
-          "INSERT INTO control_plane.telegram_organizer_links(id, user_id, telegram_subject_digest, verified_via) VALUES ($1, $2, $3, 'enrollment_redemption')",
-          [id("tol"), userId, digestTelegramId(String(tg))],
+          "INSERT INTO control_plane.telegram_organizer_trip_links(id, user_id, trip_id, telegram_subject_digest, verified_via) VALUES ($1, $2, $3, $4, 'enrollment_redemption')",
+          [id("otl"), userId, f.A.tripId, digestTelegramId(String(tg))],
         );
       };
       await linked("member", "active", 1001);

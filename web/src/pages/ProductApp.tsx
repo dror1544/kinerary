@@ -7,7 +7,8 @@ import { z } from "zod";
 import { api, getMe, getTrip, getTrips, passwordSignIn, signIn, getAuthCapabilities, emailPasswordSignIn, safeReturnTo, type TripSummary, type InterviewLinkState, ApiError } from "../api";
 import { Brand } from "../components/Brand";
 import { tripUsernameInputProps, tripUsernameRegisterOptions } from "../mini-app/username";
-import { TelegramAccounts } from "./TelegramAccounts";
+import { isEmbedded } from "../mini-app/sdk";
+import { TripTelegram } from "./TripTelegram";
 import { MembersPanel } from "./MembersPanel";
 
 export type ProductView = "sign-in" | "trips" | "new-trip" | "trip" | "runtime" | "join";
@@ -31,14 +32,15 @@ function SignIn() {
     await queryClient.fetchQuery({ queryKey: ["me"], queryFn: getMe });
     navigate(safeReturnTo(appPath));
   };
-  const emailLogin = useMutation({ mutationFn: (values: { email: string; password: string }) => emailPasswordSignIn({ ...values, returnTo }), onSuccess: finishLogin });
+  const emailLogin = useMutation({ mutationFn: (values: { email: string; password: string }) => emailPasswordSignIn({ ...values, returnTo, ...(isEmbedded(null) ? { embedded: true as const } : {}) }), onSuccess: finishLogin });
   const tripId = returnTo.match(/^\/(?:mini-app\/)?trips\/(trip_[A-Za-z0-9]{8,64})(?:\/app)?/)?.[1] ?? "";
   const passwordForm = useForm<{ runtimeUsername: string; password: string }>({ defaultValues: { runtimeUsername: "", password: "" } });
   const passwordLogin = useMutation({
-    mutationFn: (values: { runtimeUsername: string; password: string }) => passwordSignIn({ tripId, returnTo, ...values }),
+    mutationFn: (values: { runtimeUsername: string; password: string }) => passwordSignIn({ tripId, returnTo, ...values, ...(isEmbedded(null) ? { embedded: true as const } : {}) }),
     onSuccess: finishLogin,
   });
-  if (me.data) return <Navigate replace to={returnTo} />;
+  // A Telegram-scoped session is not "signed in" for the full dashboard: this page is how it upgrades.
+  if (me.data && me.data.scope !== "telegram") return <Navigate replace to={returnTo} />;
   return (
     <div className="product-shell">
       <header className="product-header"><Brand /></header>
@@ -71,7 +73,19 @@ function Protected({ children }: { children: React.ReactNode }) {
   const me = useQuery({ queryKey: ["me"], queryFn: getMe, retry: false });
   if (me.isPending) return <div className="route-loading">Opening your personal space…</div>;
   if (me.isError) return <Navigate replace to={`/sign-in?return_to=${encodeURIComponent(location.pathname)}`} />;
-  return <div className="product-shell"><DashboardHeader name={me.data.displayName} />{children}</div>;
+  return <div className="product-shell"><DashboardHeader name={me.data.displayName} />{me.data.scope === "telegram" && <ScopeBanner />}{children}</div>;
+}
+
+/**
+ * A session a Telegram link minted sees only the trips that Telegram account is
+ * linked to (the server enforces it; this only says so). The full dashboard -
+ * every trip, planning a new one - needs a password or Google sign-in.
+ */
+function ScopeBanner() {
+  return <aside className="notice scope-banner" role="status">
+    You're signed in with Telegram, so you see only the trips linked to this Telegram account.{" "}
+    <Link to={`/sign-in?return_to=${encodeURIComponent("/trips")}`}>Sign in with password for the full dashboard</Link>
+  </aside>;
 }
 
 function DashboardHeader({ name }: { name: string }) {
@@ -83,6 +97,7 @@ function DashboardHeader({ name }: { name: string }) {
 
 function Trips() {
   const trips = useQuery({ queryKey: ["trips"], queryFn: getTrips });
+  const scoped = useQuery({ queryKey: ["me"], queryFn: getMe, retry: false }).data?.scope === "telegram";
   const sections = useMemo(() => {
     const grouped: Record<string, TripSummary[]> = { Setup: [], Provisioning: [], Ready: [], Completed: [] };
     for (const trip of trips.data?.trips || []) {
@@ -93,7 +108,7 @@ function Trips() {
     }
     return grouped;
   }, [trips.data]);
-  return <main className="dashboard-main"><div className="page-title"><div><p className="eyebrow">Personal space</p><h1>My trips</h1></div><Link className="button" to="/trips/new">Plan a new trip</Link></div>{trips.isError && <Notice>We could not load your trips. Please retry.</Notice>}{trips.isPending && <p>Loading trips…</p>}{Object.entries(sections).map(([name, items]) => items.length > 0 && <section className="trip-section" key={name}><h2>{name}</h2><div className="trip-grid">{items.map((trip) => <TripCard key={trip.id} trip={trip} />)}</div></section>)}{trips.data?.trips.length === 0 && <div className="empty-state"><h2>Your first trip starts here.</h2><p>Add the broad outline. The private Telegram interview will help fill in the rest.</p><Link className="button" to="/trips/new">Create a trip</Link></div>}<TelegramAccounts /></main>;
+  return <main className="dashboard-main"><div className="page-title"><div><p className="eyebrow">Personal space</p><h1>My trips</h1></div>{!scoped && <Link className="button" to="/trips/new">Plan a new trip</Link>}</div>{trips.isError && <Notice>We could not load your trips. Please retry.</Notice>}{trips.isPending && <p>Loading trips…</p>}{Object.entries(sections).map(([name, items]) => items.length > 0 && <section className="trip-section" key={name}><h2>{name}</h2><div className="trip-grid">{items.map((trip) => <TripCard key={trip.id} trip={trip} />)}</div></section>)}{trips.data?.trips.length === 0 && <div className="empty-state"><h2>{scoped ? "No trips yet." : "Your first trip starts here."}</h2>{scoped ? <p>No trip is linked to this Telegram account yet. Ask the organizer, or sign in with your password.</p> : <><p>Add the broad outline. The private Telegram interview will help fill in the rest.</p><Link className="button" to="/trips/new">Create a trip</Link></>}</div>}</main>;
 }
 
 function TripCard({ trip }: { trip: TripSummary }) {
@@ -103,7 +118,7 @@ function TripCard({ trip }: { trip: TripSummary }) {
   const action = trip.runtimeReady || trip.permissions.dashboard
     ? <Link className="button button-small" to={open}>{trip.runtimeReady ? "Open trip" : humanize(trip.nextAction)}</Link>
     : <small>Not ready to open yet</small>;
-  return <article className="trip-card"><div className="status-chip">{humanize(trip.nextAction)}</div><h3>{trip.title}</h3><p>{trip.destination || "Destination to be confirmed"}</p><small>{[trip.startDate, trip.endDate].filter(Boolean).join(" → ") || "Dates are flexible"}</small>{action}</article>;
+  return <article className="trip-card"><div className="trip-card-head"><div className="status-chip">{humanize(trip.nextAction)}</div><TripTelegram trip={trip} /></div><h3>{trip.title}</h3><p>{trip.destination || "Destination to be confirmed"}</p><small>{[trip.startDate, trip.endDate].filter(Boolean).join(" → ") || "Dates are flexible"}</small>{action}</article>;
 }
 
 const tripSchema = z.object({ destination: z.string().trim().min(2, "Add a destination").max(160), startDate: z.string().optional(), endDate: z.string().optional(), tripType: z.enum(["family", "group", "couple", "other"]) }).refine((value) => !value.startDate || !value.endDate || value.endDate >= value.startDate, { message: "End date must follow the start date", path: ["endDate"] });
@@ -123,6 +138,7 @@ function TripSetup() {
   const queryClient = useQueryClient();
   const detail = useQuery({ queryKey: ["trip", tripId], queryFn: () => getTrip(tripId), refetchInterval: 5000 });
   const [linkConflict, setLinkConflict] = useState(false);
+  const scoped = useQuery({ queryKey: ["me"], queryFn: getMe, retry: false }).data?.scope === "telegram";
   const linkState = useQuery({ queryKey: ["interview-link", tripId], queryFn: () => api<InterviewLinkState>(`/v1/trips/${tripId}/interview-link`), enabled: detail.data?.permissions.role === "owner" && (linkConflict || Boolean(detail.data?.interview)), retry: false });
   const refreshLinkState = () => { setLinkConflict(true); void queryClient.invalidateQueries({ queryKey: ["interview-link", tripId] }); void queryClient.invalidateQueries({ queryKey: ["trip", tripId] }); };
   const interview = useMutation({ mutationFn: () => api<{ deepLink: string }>(`/v1/trips/${tripId}/interview-link`, { method: "POST" }), onError: error => {
@@ -135,7 +151,7 @@ function TripSetup() {
   const trip = detail.data;
   const alreadyStarted = Boolean(trip.interview) || Boolean(linkState.data?.hasInterview) || trip.lifecycleState !== "draft";
   const currentLink = replaceLink.data || interview.data;
-  const interviewAction = trip.permissions.role !== "owner" ? null : alreadyStarted ? <>
+  const interviewAction = trip.permissions.role !== "owner" ? null : scoped ? <p>Signed in with Telegram: to prepare or replace an interview link, sign in with your password.</p> : alreadyStarted ? <>
     <p>Continue your interview in your existing Telegram chat. Your answers stay in that conversation.</p>
     {linkState.data && <a className="button button-small" href={linkState.data.telegramChatUrl} target="_blank" rel="noopener noreferrer">Continue in Telegram</a>}
   </> : currentLink ? <a className="button button-small" href={currentLink.deepLink} target="_blank" rel="noopener noreferrer">Open Telegram interview</a> : linkConflict && linkState.isPending ? <p>Checking the existing interview link…</p> : linkState.data?.recoverable ? <>
@@ -185,7 +201,10 @@ function InvitePanel({ trip }: { trip: TripSummary }) {
   const form = useForm<{ displayName: string; runtimeUsername: string }>({ defaultValues: { displayName: "", runtimeUsername: "" } });
   const create = useMutation({ mutationFn: (values: { displayName: string; runtimeUsername: string }) => api<{ joinUrl: string }>(`/v1/trips/${trip.id}/site-invites`, { method: "POST", body: JSON.stringify(values) }), onSuccess: ({ joinUrl: value }) => { setJoinUrl(value); form.reset(); queryClient.invalidateQueries({ queryKey: ["trip", trip.id] }); } });
   const revoke = useMutation({ mutationFn: (id: string) => api(`/v1/trips/${trip.id}/site-invites/${id}`, { method: "DELETE" }), onSuccess: () => queryClient.invalidateQueries({ queryKey: ["trip", trip.id] }) });
+  const scoped = useQuery({ queryKey: ["me"], queryFn: getMe, retry: false }).data?.scope === "telegram";
   if (!trip.permissions.invite) return null;
+  // An invitation is a join link anyone can redeem: a session a Telegram link minted cannot make or revoke one.
+  if (scoped) return <aside className="workflow-card"><h2>Site invitations</h2><p>Signed in with Telegram: to invite or remove people, sign in with your password.</p></aside>;
   return <aside className="workflow-card"><h2>Site invitations</h2><p>Each private link is for one person and can be used once.</p><form className="compact-form" onSubmit={form.handleSubmit((value) => create.mutate(value))}><label>Name<input required {...form.register("displayName")} /></label><label>Trip username<input {...tripUsernameInputProps} autoComplete="off" {...form.register("runtimeUsername", tripUsernameRegisterOptions)} /></label><button className="button button-small">Create invite</button></form>{joinUrl && <div className="share-box"><strong>Copy this link now</strong><input readOnly value={joinUrl} /><div className="share-actions"><button onClick={() => navigator.clipboard.writeText(joinUrl)}>Copy</button>{navigator.share && <button onClick={() => navigator.share({ title: trip.title, url: joinUrl })}>Share</button>}<a href={`mailto:?subject=${encodeURIComponent(`Join ${trip.title}`)}&body=${encodeURIComponent(joinUrl)}`}>Email</a><a href={`https://t.me/share/url?url=${encodeURIComponent(joinUrl)}`} target="_blank" rel="noreferrer">Telegram</a></div></div>}<ul className="invite-list">{trip.invites?.map((invite) => <li key={invite.id}><div><strong>{invite.displayName}</strong><small>{invite.runtimeUsername} · {humanize(invite.status)}</small></div>{invite.status === "unused" && <button className="text-button" onClick={() => revoke.mutate(invite.id)}>Revoke</button>}</li>)}</ul></aside>;
 }
 

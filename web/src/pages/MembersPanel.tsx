@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { removeTripMember, type TripSummary } from "../api";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { getMe, removeTripMember, type TripSummary } from "../api";
 
 const ROLE: Record<string, string> = { owner: "Owner", organizer: "Organizer", member: "Member" };
 
@@ -21,7 +21,16 @@ export function MembersPanel({ trip }: { trip: TripSummary }) {
     mutationFn: (membershipId: string) => removeTripMember(trip.id, membershipId),
     onSuccess: () => { setConfirming(null); return queryClient.invalidateQueries({ queryKey: ["trip", trip.id] }); },
   });
+  const scoped = useQuery({ queryKey: ["me"], queryFn: getMe, retry: false }).data?.scope === "telegram";
   if (!trip.permissions.invite || !trip.members?.length) return null;
+  if (scoped) {
+    return (
+      <aside className="workflow-card">
+        <h2>People on this trip</h2>
+        <p>Signed in with Telegram: to remove people, sign in with your password.</p>
+      </aside>
+    );
+  }
   return (
     <aside className="workflow-card">
       <h2>People on this trip</h2>

@@ -18,11 +18,13 @@
  *   - Identity is the Telegram sender id from the update Telegram delivered on
  *     the bot's own authenticated connection — never a body field.
  *   - The set of trips a command may touch is derived server-side from that
- *     identity, through telegram_organizer_links (migration 0052) joined to
- *     active memberships. A link is also a Mini App sign-in path, and Unlink
- *     MOVES the row out of this table (telegram-mini-app.ts), so no reader here
- *     — this release's or an older one's — has to know a revocation exists. An argument or a tapped button SELECTS WITHIN that
- *     set; it can never widen it.
+ *     identity, through telegram_organizer_trip_links — ONE ROW PER TRIP, so an
+ *     organizer who unlinks one trip keeps the others — joined to active
+ *     memberships. A link is also a Mini App sign-in path. The previous
+ *     account-wide table (0052) is no longer read: an Unlink moves that pair's
+ *     row out of it (telegram-mini-app.ts), so an older release after a
+ *     rollback cannot see an unlinked account either. An argument or a tapped
+ *     button SELECTS WITHIN the set; it can never widen it.
  *   - Refusals are uniform. "That trip isn't yours" and "no such trip" are the
  *     same sentence, for the reason group-binding already gives: a
  *     distinguishable refusal confirms a guess to whoever is guessing.
@@ -66,7 +68,8 @@ export const LIVE_INTAKE_SESSION_PREDICATE =
  *
  * Identity is read from both directions, because one person here legitimately
  * owns several user_ids: the trip's own owner, and every user the sender's
- * Telegram identity has been PROVEN to own (migration 0052). The Telegram id
+ * Telegram identity has been PROVEN to own for THAT earlier trip (a link the
+ * organizer unlinked does not count). The Telegram id
  * comes from the update's own chat, never from anything anyone typed.
  *
  * Wrong in the safe direction by construction: an unknown person, a first
@@ -91,9 +94,10 @@ export async function hasEarlierBuiltTrip(
             m.user_id IN (
               SELECT own.user_id FROM control_plane.trip_memberships own
                WHERE own.trip_id = $1 AND own.role = 'owner' AND own.status = 'active')
-            OR ($2::text IS NOT NULL AND m.user_id IN (
-              SELECT l.user_id FROM control_plane.telegram_organizer_links l
-               WHERE l.telegram_subject_digest = $2))
+            OR ($2::text IS NOT NULL AND EXISTS (
+              SELECT 1 FROM control_plane.telegram_organizer_trip_links l
+               WHERE l.telegram_subject_digest = $2 AND l.user_id = m.user_id
+                 AND l.trip_id = t.id AND l.revoked_at IS NULL))
           )
      ) AS earlier`,
     [tripId, digest],
@@ -106,35 +110,41 @@ function bindingId(): string {
 }
 
 /**
- * Records that a Telegram person owns a control-plane user.
+ * Records that a Telegram person is this control-plane user, FOR ONE TRIP.
  *
  * Called inside the transaction that consumes an enrollment, because that is
  * the one moment both halves are proven at once: `consumeEnrollmentInTx`
- * returns the user the enrollment was ISSUED to, and the chat id was read by
- * the router off its own Telegram connection. Neither came from a message.
+ * returns the user (and trip) the enrollment was ISSUED for, and the chat id was
+ * read by the router off its own Telegram connection. Neither came from a
+ * message.
  *
  * Idempotent, and deliberately not read-before-write: redeeming another link
  * from the same chat is the ordinary case, not a conflict.
+ *
+ * A pair the owner has Unlinked for THIS trip stays unlinked: redeeming an
+ * interview link (a forwarded one, say) must not quietly re-open it. The way
+ * back is the dashboard's one-time link (telegram-link-token.ts), which needs
+ * the signed-in account as well as the Telegram identity. Other trips are
+ * unaffected either way.
  */
 export async function linkTelegramOrganizerInTx(
   client: pg.PoolClient,
   telegramUserId: string,
   userId: string,
+  tripId: string,
   verifiedVia: "enrollment_redemption" | "backfill_intake_session" = "enrollment_redemption",
 ): Promise<void> {
   if (!isPrivateChatId(telegramUserId)) return;
-  // A pair the owner has Unlinked stays unlinked: redeeming another interview
-  // link (the forwarded one, say) must not quietly re-open it. The history row
-  // an Unlink leaves is what says so.
   await client.query(
-    `INSERT INTO control_plane.telegram_organizer_links
-       (id, user_id, telegram_subject_digest, verified_via)
-     SELECT $1, $2, $3, $4
+    `INSERT INTO control_plane.telegram_organizer_trip_links
+       (id, user_id, trip_id, telegram_subject_digest, verified_via)
+     SELECT $1, $2, $3, $4, $5
       WHERE NOT EXISTS (
-        SELECT 1 FROM control_plane.telegram_organizer_link_revocations r
-         WHERE r.telegram_subject_digest = $3 AND r.user_id = $2)
+        SELECT 1 FROM control_plane.telegram_organizer_trip_links r
+         WHERE r.telegram_subject_digest = $4 AND r.user_id = $2 AND r.trip_id = $3
+           AND r.revoked_at IS NOT NULL)
      ON CONFLICT DO NOTHING`,
-    [`tol_${randomBytes(16).toString("hex")}`, userId, digestTelegramId(telegramUserId), verifiedVia],
+    [`otl_${randomBytes(16).toString("hex")}`, userId, tripId, digestTelegramId(telegramUserId), verifiedVia],
   );
 }
 
@@ -212,9 +222,10 @@ export async function listOrganizerTrips(
        FROM control_plane.trips t
        JOIN control_plane.trip_memberships m
          ON m.trip_id = t.id AND m.status = 'active'
-      WHERE m.user_id IN (
-              SELECT user_id FROM control_plane.telegram_organizer_links
-               WHERE telegram_subject_digest = $1)
+      WHERE EXISTS (
+              SELECT 1 FROM control_plane.telegram_organizer_trip_links l
+               WHERE l.telegram_subject_digest = $1 AND l.user_id = m.user_id
+                 AND l.trip_id = t.id AND l.revoked_at IS NULL)
         AND ${NOT_RETIRED_SQL}
         AND NOT EXISTS (
               SELECT 1 FROM control_plane.telegram_chat_bindings d
@@ -331,9 +342,10 @@ export async function switchChatToTrip(
           -- retired trip. Same predicate as group-binding and the trip list;
           -- deliberately no lock — see #175 (40P01 against retire_in_db).
           AND ${NOT_RETIRED_SQL}
-          AND m.user_id IN (
-                SELECT user_id FROM control_plane.telegram_organizer_links
-                 WHERE telegram_subject_digest = $2)
+          AND EXISTS (
+                SELECT 1 FROM control_plane.telegram_organizer_trip_links l
+                 WHERE l.telegram_subject_digest = $2 AND l.user_id = m.user_id
+                   AND l.trip_id = m.trip_id AND l.revoked_at IS NULL)
         LIMIT 1`,
       [tripId, digestTelegramId(telegramUserId)],
     );

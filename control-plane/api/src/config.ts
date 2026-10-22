@@ -16,6 +16,16 @@ const secretReference = z.string().regex(
 
 const privateHost = z.enum(["127.0.0.1", "::1"]);
 
+/** `new URL(x).origin`; an origin the URL parser calls opaque ("null") is not a usable origin. */
+function originOf(value: string, ctx: z.RefinementCtx): string {
+  const origin = new URL(value).origin;
+  if (origin === "null") {
+    ctx.addIssue({ code: "custom", message: "must be an http(s) origin" });
+    return z.NEVER;
+  }
+  return origin;
+}
+
 export const architectureProfileSchema = z.object({
   version: z.literal(1),
   environment: z.enum(["test", "development", "production"]),
@@ -95,8 +105,11 @@ export const architectureProfileSchema = z.object({
     webhook_secret_ref: secretReference,
   }).strict().optional(),
   web: z.object({
-    public_origin: z.string().url(),
-    runtime_origin: z.string().url(),
+    // Normalised to the WHATWG origin (scheme://host[:port], lower case, default port dropped, no
+    // trailing slash or path): the browser's Origin header is always in that form, so a profile written
+    // "https://Portal.example/" must still equal it, or every mutation would be refused as a foreign origin.
+    public_origin: z.string().url().transform(originOf),
+    runtime_origin: z.string().url().transform(originOf),
     google_client_id_secret_ref: secretReference.optional(),
     google_client_secret_ref: secretReference.optional(),
     runtime_exchange_key_secret_ref: secretReference,

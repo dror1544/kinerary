@@ -11,9 +11,14 @@ import { removeMember } from "./member-removal.js";
 import { structuredLog } from "./redaction.js";
 import {
   TRIP_ID_PATTERN, claimSessionSlot, enqueueSignInNotice, linkMemberOrSkip,
-  listTelegramLinks, recordLinkSignIn, resolveMiniAppLaunch, unlinkTelegramLink,
+  recordLinkSignIn, resolveMiniAppLaunch, telegramLinksByTrip, unlinkTelegramLink,
   type TelegramMiniAppConfig,
 } from "./telegram-mini-app.js";
+import { issueTelegramLinkToken } from "./telegram-link-token.js";
+import {
+  ACCOUNT_SIGN_IN_REQUIRED, assertEveryRouteIsClassified, loadSessionScope, scopeDecision, scopedSessionDigest, sessionDigests,
+  type SessionScope,
+} from "./portal-scope.js";
 import { verifyMiniAppInitData, type VerifiedInitData } from "./telegram-webapp-auth.js";
 
 function opaque(prefix: string, bytes = 16): string {
@@ -64,9 +69,28 @@ function parseCookies(header: unknown): Record<string, string> {
   }));
 }
 
-function cookie(name: string, value: string, options: { maxAge?: number; httpOnly?: boolean; secure?: boolean } = {}): string {
-  const pieces = [`${name}=${encodeURIComponent(value)}`, "Path=/", "SameSite=Lax"];
+/**
+ * `crossSite` is the COOKIE VARIANT FOR A MINI APP RUNNING INSIDE A FRAME ON
+ * ANOTHER SITE — Telegram Web (web.telegram.org) embeds the portal in a
+ * cross-site iframe, where a `SameSite=Lax` cookie is never sent and a
+ * Mini App that cannot hold a session cannot sign anyone in.
+ *
+ *   SameSite=None   so the browser sends it from inside that frame;
+ *   Secure          which `None` requires, so an http origin (local dev) keeps
+ *                   the Lax cookie rather than emit one browsers would drop;
+ *   Partitioned     CHIPS: the browser keys the cookie to the TOP-LEVEL site
+ *                   that was framing us when it was set (web.telegram.org), so
+ *                   it is sent only back inside that same embedding — not to
+ *                   a page on any other site that frames or requests us.
+ *
+ * Only the Mini App's own sign-in asks for it (`embedded` in the request, set
+ * by the page when it finds itself in a frame). The ordinary portal keeps Lax.
+ */
+function cookie(name: string, value: string, options: { maxAge?: number; httpOnly?: boolean; secure?: boolean; crossSite?: boolean } = {}): string {
+  const crossSite = options.crossSite === true && options.secure !== false;
+  const pieces = [`${name}=${encodeURIComponent(value)}`, "Path=/", crossSite ? "SameSite=None" : "SameSite=Lax"];
   if (options.secure !== false) pieces.push("Secure");
+  if (crossSite) pieces.push("Partitioned");
   if (options.httpOnly !== false) pieces.push("HttpOnly");
   if (options.maxAge !== undefined) pieces.push(`Max-Age=${options.maxAge}`);
   return pieces.join("; ");
@@ -192,6 +216,8 @@ export interface PortalDependencies {
    * so: the feature is off, and says it is off.
    */
   telegramMiniApp?: TelegramMiniAppConfig & { log?: (line: string) => void };
+  /** How long a dashboard-issued Telegram link works. Defaults to 15 minutes. */
+  telegramLinkTtlSeconds?: number;
 }
 
 interface PortalUser {
@@ -200,6 +226,13 @@ interface PortalUser {
   googleSubjectDigest: string | null;
   sessionDigest: string;
   sessionCreatedAt: Date;
+  /**
+   * NULL for a full (password / Google) session. For a session a Telegram link
+   * minted, the trips that Telegram account is linked to - possibly none. See
+   * portal-scope.ts: `requireUser` enforces it, so a handler sees only a user
+   * the route is allowed for.
+   */
+  scope: SessionScope | null;
 }
 
 async function portalUser(request: FastifyRequest, deps: PortalDependencies): Promise<PortalUser | null> {
@@ -207,23 +240,33 @@ async function portalUser(request: FastifyRequest, deps: PortalDependencies): Pr
   if (!raw) return null;
   const result = await deps.db.query<{
     id: string; display_name: string; provider_subject_digest: string | null; session_digest: string; session_created_at: Date;
+    telegram_link_id: string | null;
   }>(
-    `SELECT u.id, u.display_name, ui.provider_subject_digest, s.token_digest AS session_digest, s.created_at AS session_created_at
+    `SELECT u.id, u.display_name, ui.provider_subject_digest, s.token_digest AS session_digest, s.created_at AS session_created_at,
+            s.telegram_link_id
      FROM control_plane.web_sessions s
      JOIN control_plane.users u ON u.id = s.user_id AND u.status = 'active'
      LEFT JOIN control_plane.user_identities ui ON ui.user_id = u.id AND ui.provider = 'google'
-     WHERE s.token_digest = $1 AND s.revoked_at IS NULL AND s.expires_at > now()`,
-    [sha256(raw)],
+     WHERE s.token_digest = ANY($1::text[]) AND s.revoked_at IS NULL AND s.expires_at > now()`,
+    [sessionDigests(raw)],
   );
   const row = result.rows[0];
   if (!row) return null;
-  void deps.db.query("UPDATE control_plane.web_sessions SET last_seen_at = now() WHERE token_digest = $1", [sha256(raw)]).catch(() => {});
+  void deps.db.query("UPDATE control_plane.web_sessions SET last_seen_at = now() WHERE token_digest = $1", [row.session_digest]).catch(() => {});
+  // Scoped when EITHER signal says so: a Telegram link minted it, or it is stored under the scoped digest.
+  // A scoped session whose scope cannot be read has the empty scope, not a full one.
+  const scoped = row.telegram_link_id !== null || row.session_digest === scopedSessionDigest(raw);
+  let scope: SessionScope | null = null;
+  if (scoped) {
+    scope = await loadSessionScope(deps.db, { userId: row.id, telegramLinkId: row.telegram_link_id }).catch(() => ({ tripIds: new Set<string>(), telegramDigest: null }));
+  }
   return {
     id: row.id,
     displayName: row.display_name,
     googleSubjectDigest: row.provider_subject_digest,
     sessionDigest: row.session_digest,
     sessionCreatedAt: row.session_created_at,
+    scope,
   };
 }
 
@@ -231,26 +274,48 @@ async function createWebSession(client: pg.PoolClient, userId: string, ttlSecond
   const sessionToken = base64url(32);
   const csrf = base64url(24);
   // `telegramLinkId` is set only for a session a Telegram link minted, so that
-  // unlinking (or the link ending any other way) can end that session too.
+  // unlinking (or the link ending any other way) can end that session too. Such
+  // a session is SCOPED (portal-scope.ts) and is stored under the scoped digest,
+  // which no older release can match: a rollback cannot widen it.
   await client.query(
     `INSERT INTO control_plane.web_sessions(id, user_id, token_digest, csrf_digest, expires_at, telegram_link_id)
      VALUES ($1, $2, $3, $4, now() + ($5 * interval '1 second'), $6)`,
-    [opaque("wsess"), userId, sha256(sessionToken), sha256(csrf), ttlSeconds, telegramLinkId],
+    [opaque("wsess"), userId, telegramLinkId ? scopedSessionDigest(sessionToken) : sha256(sessionToken), sha256(csrf), ttlSeconds, telegramLinkId],
   );
   return { sessionToken, csrf };
 }
 
-function setWebSessionCookies(reply: FastifyReply, deps: PortalDependencies, session: { sessionToken: string; csrf: string }): void {
+function setWebSessionCookies(
+  reply: FastifyReply, deps: PortalDependencies, session: { sessionToken: string; csrf: string },
+  options: { embedded?: boolean } = {},
+): void {
   const secure = deps.publicOrigin.startsWith("https://");
+  const crossSite = options.embedded === true;
   reply.header("set-cookie", [
-    cookie("kit_session", session.sessionToken, { maxAge: deps.sessionTtlSeconds, secure }),
-    cookie("kit_csrf", session.csrf, { maxAge: deps.sessionTtlSeconds, httpOnly: false, secure }),
+    cookie("kit_session", session.sessionToken, { maxAge: deps.sessionTtlSeconds, secure, crossSite }),
+    cookie("kit_csrf", session.csrf, { maxAge: deps.sessionTtlSeconds, httpOnly: false, secure, crossSite }),
   ]);
 }
 
-function clearWebSessionCookies(reply: FastifyReply, deps: PortalDependencies): void {
+/**
+ * Expires BOTH variants. A cookie is identified by name, domain, path AND (for
+ * the partitioned one) its partition, so a Lax expiry does not touch the
+ * partitioned cookie a Mini App session set, and the other way round.
+ */
+function expiredSessionCookies(deps: PortalDependencies): string[] {
   const secure = deps.publicOrigin.startsWith("https://");
-  reply.header("set-cookie", [cookie("kit_session", "", { maxAge: 0, secure }), cookie("kit_csrf", "", { maxAge: 0, httpOnly: false, secure })]);
+  const out = [cookie("kit_session", "", { maxAge: 0, secure }), cookie("kit_csrf", "", { maxAge: 0, httpOnly: false, secure })];
+  if (secure) out.push(cookie("kit_session", "", { maxAge: 0, secure, crossSite: true }), cookie("kit_csrf", "", { maxAge: 0, httpOnly: false, secure, crossSite: true }));
+  return out;
+}
+
+function clearWebSessionCookies(reply: FastifyReply, deps: PortalDependencies): void {
+  reply.header("set-cookie", expiredSessionCookies(deps));
+}
+
+/** The page found itself in a frame on another site and says so; it can only ever weaken its own cookie. */
+function embeddedRequest(body: Record<string, unknown>): boolean {
+  return body.embedded === true;
 }
 
 /** An Origin that is present, is not the literal "null" of a sandboxed/opaque origin, and is ours. */
@@ -283,15 +348,55 @@ async function recordFunnelEvent(
   );
 }
 
-async function requireUser(request: FastifyRequest, reply: FastifyReply, deps: PortalDependencies): Promise<PortalUser | null> {
+async function authenticate(request: FastifyRequest, reply: FastifyReply, deps: PortalDependencies): Promise<PortalUser | null> {
   const user = await portalUser(request, deps);
-  if (!user) reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+  if (!user) { reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" }); return null; }
   return user;
 }
 
-async function requireMutation(request: FastifyRequest, reply: FastifyReply, deps: PortalDependencies): Promise<PortalUser | null> {
-  const user = await requireUser(request, reply, deps);
+/**
+ * THE one place a Telegram-minted session is held to its scope (portal-scope.ts).
+ * For a mutation it runs AFTER the Origin and CSRF checks, so a request that
+ * would be refused for those reasons gets the same status whatever id it names:
+ * a foreign link id and an unknown one cannot be told apart by the status.
+ */
+async function enforceScope(request: FastifyRequest, reply: FastifyReply, deps: PortalDependencies, user: PortalUser): Promise<boolean> {
+  if (!user.scope) return true;
+  const decision = await scopeDecision(deps.db, {
+    routeKey: `${request.method} ${request.routeOptions.url ?? ""}`,
+    params: (request.params && typeof request.params === "object" ? request.params : {}) as Record<string, unknown>,
+    scope: user.scope,
+  });
+  if (!decision.allow) { reply.code(decision.status).send(decision.body); return false; }
+  return true;
+}
+
+async function requireUser(request: FastifyRequest, reply: FastifyReply, deps: PortalDependencies): Promise<PortalUser | null> {
+  const user = await authenticate(request, reply, deps);
   if (!user) return null;
+  return (await enforceScope(request, reply, deps, user)) ? user : null;
+}
+
+/**
+ * A state-changing request carries the session cookie, a CSRF header that matches it
+ * AND - when the browser says where it came from - our own origin. A present Origin
+ * that is not `web.public_origin` (including the literal "null") is refused: with the
+ * Telegram Web cookie variant (SameSite=None) the cookie is no longer held back by
+ * SameSite, so this is a second wall behind the CSRF token. A MISSING Origin keeps
+ * today's behaviour (CSRF token only): non-browser clients and older browsers do not send it.
+ */
+function originRefused(request: FastifyRequest, deps: PortalDependencies): boolean {
+  const origin = request.headers.origin;
+  return origin !== undefined && origin !== deps.publicOrigin;
+}
+
+async function requireMutation(request: FastifyRequest, reply: FastifyReply, deps: PortalDependencies): Promise<PortalUser | null> {
+  const user = await authenticate(request, reply, deps);
+  if (!user) return null;
+  if (originRefused(request, deps)) {
+    reply.code(403).send({ error: "ORIGIN_INVALID" });
+    return null;
+  }
   const cookies = parseCookies(request.headers.cookie);
   const csrfHeader = request.headers["x-csrf-token"];
   if (typeof csrfHeader !== "string" || !cookies.kit_csrf || !safeEqual(csrfHeader, cookies.kit_csrf)) {
@@ -299,14 +404,14 @@ async function requireMutation(request: FastifyRequest, reply: FastifyReply, dep
     return null;
   }
   const session = await deps.db.query<{ csrf_digest: string }>(
-    "SELECT csrf_digest FROM control_plane.web_sessions WHERE token_digest = $1 AND revoked_at IS NULL AND expires_at > now()",
-    [sha256(cookies.kit_session ?? "")],
+    "SELECT csrf_digest FROM control_plane.web_sessions WHERE token_digest = ANY($1::text[]) AND revoked_at IS NULL AND expires_at > now()",
+    [sessionDigests(cookies.kit_session ?? "")],
   );
   if (!session.rows[0] || !safeEqual(session.rows[0].csrf_digest, sha256(csrfHeader))) {
     reply.code(403).send({ error: "CSRF_INVALID" });
     return null;
   }
-  return user;
+  return (await enforceScope(request, reply, deps, user)) ? user : null;
 }
 
 /**
@@ -413,6 +518,9 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
     } : null,
     runtimeReady,
     members,
+    // Which Telegram accounts can open THIS trip as the viewer: the card's
+    // linked / not-linked icon and its ⋮ menu's Unlink entries.
+    telegram: { links: (await telegramLinksByTrip(deps.db, userId, [tripId])).get(tripId) ?? [] },
     invites: invitesResult.rows.map((invite) => ({
       id: invite.id, displayName: invite.intended_display_name, runtimeUsername: invite.runtime_username,
       status: invite.state === "unused" && invite.expires_at.getTime() < Date.now() ? "expired" : invite.state,
@@ -449,10 +557,28 @@ async function memberTripSummary(deps: PortalDependencies, tripId: string, userI
     endDate: row.end_date,
     permissions: { role: row.role, dashboard: false, runtime: row.runtime_access, invite: false, requestProvisioning: false },
     runtimeReady: row.runtime_ready,
+    telegram: { links: (await telegramLinksByTrip(deps.db, userId, [tripId])).get(tripId) ?? [] },
   };
 }
 
 export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependencies): void {
+  // Every route registered below must have a scope policy (portal-scope.ts), or
+  // the app does not boot: a route that forgot would fail only for a Telegram
+  // session, which is exactly the session nobody tests by hand.
+  const registered: string[] = [];
+  let collecting = true;
+  app.addHook("onRoute", (route) => {
+    if (!collecting) return;
+    for (const method of ([] as string[]).concat(route.method)) {
+      if (method !== "HEAD" && method !== "OPTIONS") registered.push(`${method} ${route.url}`);
+    }
+  });
+  registerPortalRouteHandlers(app, deps);
+  collecting = false;
+  assertEveryRouteIsClassified(registered);
+}
+
+function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependencies): void {
   app.post("/v1/events", async (request, reply) => {
     const event = (request.body as Record<string, unknown>)?.event;
     if (event !== "landing_cta") return reply.code(400).send({ error: "INVALID_REQUEST" });
@@ -515,7 +641,7 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
       if (!user.rows[0]) { await client.query("ROLLBACK"); return reply.code(401).send({ error: "INVALID_CREDENTIALS" }); }
       const session = await createWebSession(client, user.rows[0].id, deps.sessionTtlSeconds);
       await client.query("COMMIT");
-      setWebSessionCookies(reply, deps, session);
+      setWebSessionCookies(reply, deps, session, { embedded: embeddedRequest(body) });
       return { appPath: validatedReturnTo(body.returnTo) };
     } catch (error) { await client.query("ROLLBACK"); throw error; }
     finally { client.release(); }
@@ -579,7 +705,7 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
     const revokeIncoming = async (client: pg.PoolClient) => {
       // A verified launch replaces whatever session this WebView already held:
       // on a shared device the previous person must not stay signed in behind it.
-      if (incoming) await client.query("UPDATE control_plane.web_sessions SET revoked_at = now() WHERE token_digest = $1 AND revoked_at IS NULL", [sha256(incoming)]);
+      if (incoming) await client.query("UPDATE control_plane.web_sessions SET revoked_at = now() WHERE token_digest = ANY($1::text[]) AND revoked_at IS NULL", [sessionDigests(incoming)]);
     };
     const client = await deps.db.connect();
     try {
@@ -607,7 +733,7 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
           : 0;
         await revokeIncoming(client);
         await client.query("COMMIT");
-        setWebSessionCookies(reply, deps, session);
+        setWebSessionCookies(reply, deps, session, { embedded: embeddedRequest(body) });
         miniAppLog(structuredLog("info", "mini_app.sign_in", { outcome: "session", link_kind: outcome.target.linkKind, first_use: used.first, notices_queued: noticesQueued }));
         return { kind: "session", appPath: outcome.target.appPath, ...(outcome.notice ? { notice: outcome.notice } : {}) };
       }
@@ -625,15 +751,9 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
     }
   });
 
-  // The signed-in user's own view of every Telegram account that can sign in as
-  // them, and the way to end one. Any signed-in user, member or organizer: the
-  // list is about THEIR account.
-  app.get("/v1/account/telegram-links", async (request, reply) => {
-    const user = await requireUser(request, reply, deps);
-    if (!user) return;
-    reply.header("cache-control", "private, no-store");
-    return { miniAppEnabled: Boolean(deps.telegramMiniApp?.enabled()), links: await listTelegramLinks(deps.db, user.id) };
-  });
+  // Ends one Telegram link — one TRIP's link — of the signed-in user's own, with
+  // the sessions it opened. The trip card (GET /v1/trips) says which links exist;
+  // this is the ⋮ menu's Unlink. Any signed-in user, member or organizer.
   app.delete("/v1/account/telegram-links/:linkId", async (request, reply) => {
     const user = await requireMutation(request, reply, deps);
     if (!user) return;
@@ -773,7 +893,7 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
         }
       }
       await client.query("COMMIT");
-      setWebSessionCookies(reply, deps, session);
+      setWebSessionCookies(reply, deps, session, { embedded: embeddedRequest(body) });
       const appPath = typeof body.returnTo === "string" ? validatedReturnTo(body.returnTo) : `/trips/${tripId}/app`;
       return { appPath, ...(telegramLink ? { telegramLink } : {}) };
     } catch (error) {
@@ -785,16 +905,16 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
   app.get("/v1/me", async (request, reply) => {
     const user = await requireUser(request, reply, deps);
     if (!user) return;
-    return { id: user.id, displayName: user.displayName };
+    // `scope: "telegram"` tells the page this session sees only the trips its Telegram account is linked to.
+    return { id: user.id, displayName: user.displayName, scope: user.scope ? "telegram" : "full" };
   });
 
   app.post("/v1/logout", async (request, reply) => {
     const user = await requireMutation(request, reply, deps);
     if (!user) return;
     const raw = parseCookies(request.headers.cookie).kit_session;
-    await deps.db.query("UPDATE control_plane.web_sessions SET revoked_at = now() WHERE token_digest = $1", [sha256(raw ?? "")]);
-    const secure = deps.publicOrigin.startsWith("https://");
-    reply.header("set-cookie", [cookie("kit_session", "", { maxAge: 0, secure }), cookie("kit_csrf", "", { maxAge: 0, httpOnly: false, secure })]);
+    await deps.db.query("UPDATE control_plane.web_sessions SET revoked_at = now() WHERE token_digest = ANY($1::text[])", [sessionDigests(raw ?? "")]);
+    clearWebSessionCookies(reply, deps);
     return { ok: true };
   });
 
@@ -804,7 +924,13 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
     const rows = await deps.db.query<{ id: string; dashboard_access: boolean }>(
       // A member's trips are the ones they can open (runtime access), the same
       // list the Mini App shows; an organizer's also include the trips they run.
-      "SELECT trip_id AS id, dashboard_access FROM control_plane.trip_memberships WHERE user_id = $1 AND status = 'active' AND (dashboard_access = true OR runtime_access = true) ORDER BY created_at DESC", [user.id]);
+      // A Telegram-minted session sees only the trips its Telegram account is
+      // linked to (portal-scope.ts): the filter is in the query, not after it.
+      `SELECT trip_id AS id, dashboard_access FROM control_plane.trip_memberships
+        WHERE user_id = $1 AND status = 'active' AND (dashboard_access = true OR runtime_access = true)
+          AND ($2::text[] IS NULL OR trip_id = ANY($2::text[]))
+        ORDER BY created_at DESC`,
+      [user.id, user.scope ? [...user.scope.tripIds] : null]);
     // Full detail only where the caller runs the trip; a runtime-only member gets the summary.
     return { trips: (await Promise.all(rows.rows.map((row) => row.dashboard_access ? tripDetail(deps, row.id, user.id) : memberTripSummary(deps, row.id, user.id)))).filter(Boolean) };
   });
@@ -868,6 +994,32 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
       enrollmentId: result.enrollmentId,
       deepLink: `https://t.me/${deps.telegramBotUsername}?start=${encodeURIComponent(result.token)}`,
       expiresAt: result.expiresAt.toISOString(),
+    });
+  });
+
+  // The trip card's "Link Telegram": a one-time, short-lived deep link that links
+  // WHICHEVER Telegram account opens it to the signed-in organizer, for this trip
+  // only. The session and CSRF token prove the account; the bot's verified update
+  // proves the Telegram identity (telegram-link-token.ts). This is the only way
+  // back after an Unlink — an interview link, which may have been forwarded,
+  // does not undo one.
+  const linkTokenAttempts: Attempts = new Map();
+  app.post("/v1/trips/:id/telegram-link", async (request, reply) => {
+    const user = await requireMutation(request, reply, deps);
+    if (!user) return;
+    reply.header("cache-control", "private, no-store");
+    // A person asks a handful of times, not hundreds; the cap bounds the churn
+    // of revoked rows and the memory the limiter holds.
+    if (!admitLogin(linkTokenAttempts, user.id, 10)) {
+      return reply.header("retry-after", "60").code(429).send({ error: "RATE_LIMITED" });
+    }
+    const tripId = (request.params as { id?: string }).id ?? "";
+    const issued = await issueTelegramLinkToken(deps.db, { userId: user.id, tripId, ttlSeconds: deps.telegramLinkTtlSeconds });
+    // Not a trip they run, not a trip at all, retired: one answer.
+    if (!issued.ok) return reply.code(404).send({ error: "NOT_FOUND" });
+    return reply.code(201).send({
+      deepLink: `https://t.me/${deps.telegramBotUsername}?start=${encodeURIComponent(issued.token)}`,
+      expiresAt: issued.expiresAt.toISOString(),
     });
   });
 
@@ -1084,6 +1236,11 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
     const method = body.method;
     if (typeof token !== "string" || (method !== "google" && method !== "password")) return reply.code(400).send({ error: "INVALID_REQUEST" });
     let signedIn = await portalUser(request, deps);
+    // Riding a cookie session is a state change on that account: it needs our origin when the browser sends one.
+    if (signedIn && originRefused(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
+    // Joining a trip adds a membership to the signed-in ACCOUNT: account level,
+    // so not from a session a Telegram link minted (portal-scope.ts).
+    if (signedIn?.scope) return reply.code(ACCOUNT_SIGN_IN_REQUIRED.status).send(ACCOUNT_SIGN_IN_REQUIRED.body);
     const password = method === "password" && typeof body.password === "string" ? body.password : undefined;
     if (method === "password" && (!password || password.length < 8 || password.length > 128)) return reply.code(400).send({ error: "PASSWORD_INVALID" });
     if (method === "google") {

@@ -7,11 +7,13 @@
  *
  *   - A VERIFIED Telegram identity is a digest. It becomes a control-plane
  *     session only through a LINK that someone created earlier by proving
- *     something Telegram alone cannot: redeeming an interview link issued to the
- *     account (`telegram_organizer_links`), or typing the trip's own password /
- *     redeeming a site invite while presenting fresh initData
- *     (`telegram_member_links`). Possessing a Telegram id proves you are that
- *     Telegram id; the link is the claim that you are also that user.
+ *     something Telegram alone cannot: redeeming an interview link or the
+ *     dashboard's one-time link for ONE trip (`telegram_organizer_trip_links`),
+ *     or typing the trip's own password / redeeming a site invite while
+ *     presenting fresh initData (`telegram_member_links`). Every link is scoped
+ *     to a trip, so Unlinking one trip leaves the person's others as they were.
+ *     Possessing a Telegram id proves you are that Telegram id; the link is the
+ *     claim that you are also that user.
  *
  *   - The CHAT'S TRIP only SELECTS. `start_param`, the chooser's `tripId` and
  *     the person's DM binding name a trip; membership of a linked account grants
@@ -28,7 +30,7 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import type pg from "pg";
-import { digestTelegramId } from "./identity.js";
+import { digestTelegramId, isPrivateChatId } from "./identity.js";
 import { structuredLog } from "./redaction.js";
 import { TELEGRAM_API_ROOT } from "./relay/telegram-api.js";
 import { NOT_RETIRED_SQL } from "./trip-retirement.js";
@@ -215,9 +217,9 @@ function better(a: AccessRow, b: AccessRow): number {
 async function loadAccess(client: pg.PoolClient, digest: string): Promise<{ linked: boolean; rows: AccessRow[] }> {
   const linked = await client.query<{ linked: boolean }>(
     `SELECT EXISTS (
-       SELECT 1 FROM control_plane.telegram_organizer_links l
+       SELECT 1 FROM control_plane.telegram_organizer_trip_links l
          JOIN control_plane.users u ON u.id = l.user_id AND u.status = 'active'
-        WHERE l.telegram_subject_digest = $1
+        WHERE l.telegram_subject_digest = $1 AND l.revoked_at IS NULL
        UNION ALL
        SELECT 1 FROM control_plane.telegram_member_links m
          JOIN control_plane.users u ON u.id = m.user_id AND u.status = 'active'
@@ -232,9 +234,9 @@ async function loadAccess(client: pg.PoolClient, digest: string): Promise<{ link
     link_id: string; link_kind: LinkKind;
   }>(
     `WITH linked AS (
-       SELECT l.id AS link_id, 'organizer'::text AS link_kind, l.user_id, NULL::text AS only_trip
-         FROM control_plane.telegram_organizer_links l
-        WHERE l.telegram_subject_digest = $1
+       SELECT l.id AS link_id, 'organizer'::text AS link_kind, l.user_id, l.trip_id AS only_trip
+         FROM control_plane.telegram_organizer_trip_links l
+        WHERE l.telegram_subject_digest = $1 AND l.revoked_at IS NULL
        UNION ALL
        SELECT m.id, 'member'::text, m.user_id, m.trip_id
          FROM control_plane.telegram_member_links m
@@ -353,7 +355,7 @@ function opaqueId(prefix: string): string {
 }
 
 const LINK_TABLE: Record<LinkKind, string> = {
-  organizer: "control_plane.telegram_organizer_links",
+  organizer: "control_plane.telegram_organizer_trip_links",
   member: "control_plane.telegram_member_links",
 };
 
@@ -366,9 +368,8 @@ const LINK_TABLE: Record<LinkKind, string> = {
 export async function recordLinkSignIn(client: pg.PoolClient, kind: LinkKind, linkId: string): Promise<{ first: boolean } | null> {
   const table = LINK_TABLE[kind];
   const row = await client.query<{ first_signed_in_at: Date | null }>(
-    // An organizer link that was Unlinked is no longer in its table at all;
-    // a member link is flagged.
-    `SELECT first_signed_in_at FROM ${table} WHERE id = $1 ${kind === "member" ? "AND revoked_at IS NULL" : ""} FOR UPDATE`,
+    // Both kinds are revoked in place (`revoked_at`); a revoked link signs nobody in.
+    `SELECT first_signed_in_at FROM ${table} WHERE id = $1 AND revoked_at IS NULL FOR UPDATE`,
     [linkId],
   );
   if (!row.rows[0]) return null;
@@ -385,15 +386,19 @@ export async function recordLinkSignIn(client: pg.PoolClient, kind: LinkKind, li
  * dispatcher (outbox-dispatcher.ts), never inline: a Telegram outage must not
  * delay or fail a sign-in, and a rolled-back sign-in must not announce itself.
  *
- * WHO GETS IT. Not the account that signed in: a forwarded interview link is
- * the case this exists for, and telling the forwardee about their own
- * sign-in warns nobody. It goes to the account owner's OWN chats — the open,
- * private (positive-id) bindings of the trips the account is owner or
- * organizer of — minus the signer's own chat. If there are none, nothing is
- * queued and the "Telegram accounts that can sign in as you" list is the only
- * channel; the count is returned so the caller can log that, quietly.
- * (A member-scoped link has no such chats: members are not bound to the bot in
- * DM, and the member just consented in the same request.)
+ * WHO GETS IT: every private bot chat the account owner has, INCLUDING the one
+ * that signed in (owner decision 2026-10-20). The first version skipped the
+ * signer's chat on the reasoning that a forwardee's own notice warns nobody —
+ * true, and it cost the common case: an organizer's own phone is usually their
+ * only chat, so the notice they were promised never arrived. Sending to every
+ * chat is also the simpler rule, and a forwardee reading "someone signed in as
+ * you" learns nothing they were not just shown.
+ *
+ * The chats are the open, private (positive-id) bindings of the trips the
+ * account is owner or organizer of, plus the signing Telegram account's own
+ * private chat (a Mini App launch is by definition from a person who can be
+ * messaged by the bot; the id is Telegram-verified, never a body field). The
+ * count is returned so the caller can log it, quietly.
  *
  * One row per chat, trip_id NULL, its own notification type. The raw Telegram
  * chat id in `recipient` is nulled by the dispatcher once the row is sent or
@@ -410,7 +415,7 @@ export async function enqueueSignInNotice(
     now?: Date;
   },
 ): Promise<number> {
-  const chats = await client.query<{ chat_id: string }>(
+  const bound = await client.query<{ chat_id: string }>(
     `SELECT DISTINCT b.chat_id
        FROM control_plane.telegram_chat_bindings b
        JOIN control_plane.trip_memberships m
@@ -418,23 +423,24 @@ export async function enqueueSignInNotice(
        JOIN control_plane.trips t ON t.id = b.trip_id
       WHERE b.closed_at IS NULL
         AND b.chat_id ~ '^[0-9]{1,20}$'
-        AND b.chat_id <> $2
         AND ${NOT_RETIRED_SQL}`,
-    [input.userId, input.signerTelegramId],
+    [input.userId],
   );
+  const chats = new Set(bound.rows.map((row) => row.chat_id));
+  if (isPrivateChatId(input.signerTelegramId)) chats.add(input.signerTelegramId);
   const payload = JSON.stringify({
     account_name: input.accountName, link_kind: input.linkKind, trip_title: input.tripTitle,
     at: (input.now ?? new Date()).toISOString(),
   });
-  for (const chat of chats.rows) {
+  for (const chatId of chats) {
     await client.query(
       `INSERT INTO control_plane.notification_outbox
          (id, trip_id, kind, recipient, payload, signup_request_id, notification_type, adapter, state)
        VALUES ($1, NULL, 'mini_app_sign_in_notice', $2, $3::jsonb, NULL, 'mini_app_sign_in_notice', 'control-plane', 'pending')`,
-      [opaqueId("notif"), chat.chat_id, payload],
+      [opaqueId("notif"), chatId, payload],
     );
   }
-  return chats.rows.length;
+  return chats.size;
 }
 
 export const SIGN_IN_NOTICE_TYPE = "mini_app_sign_in_notice";
@@ -449,16 +455,16 @@ export function signInNoticeText(
   const trip = input.tripTitle ? `"${input.tripTitle}"` : null;
   const en = input.linkKind === "member" && trip
     ? `A Telegram account was just linked to "${input.accountName}" and can now open ${trip} in Kinerary's Mini App without a password (${when}).`
-    : `A Telegram account just signed in to Kinerary's Mini App as "${input.accountName}"${trip ? ` and opened ${trip}` : ""} (${when}). It can open that account's trips without a password.`;
+    : `A Telegram account just signed in to Kinerary's Mini App as "${input.accountName}"${trip ? ` and opened ${trip}` : ""} (${when}). ${trip ? "It is linked to that trip" : "It is linked to your trips"} and needs no password.`;
   const he = input.linkKind === "member" && trip
     ? `חשבון טלגרם חובר ל-"${input.accountName}" ויכול מעכשיו לפתוח את ${trip} באפליקציית ה-Mini App של Kinerary בלי סיסמה (${when}).`
-    : `חשבון טלגרם נכנס עכשיו לאפליקציית ה-Mini App של Kinerary בתור "${input.accountName}"${trip ? ` ופתח את ${trip}` : ""} (${when}). הוא יכול לפתוח את הטיולים של אותו חשבון בלי סיסמה.`;
+    : `חשבון טלגרם נכנס עכשיו לאפליקציית ה-Mini App של Kinerary בתור "${input.accountName}"${trip ? ` ופתח את ${trip}` : ""} (${when}). ${trip ? "הוא מקושר לטיול הזה" : "הוא מקושר לטיולים שלכם"} ואינו צריך סיסמה.`;
   return [
     en,
-    `If that was not you or someone you trust: open ${where}, find "Telegram accounts that can sign in as you", and press Unlink.`,
+    `If that was not you or someone you trust: open ${where}, find the trip, open its Telegram menu (the three dots) and choose Unlink.`,
     "",
     he,
-    `אם זה לא אתם או מישהו שאתם סומכים עליו: היכנסו אל ${where}, מצאו את "Telegram accounts that can sign in as you" ולחצו Unlink.`,
+    `אם זה לא אתם או מישהו שאתם סומכים עליו: היכנסו אל ${where}, מצאו את הטיול, פתחו את תפריט הטלגרם שלו (שלוש הנקודות) ובחרו Unlink.`,
   ].join("\n");
 }
 
@@ -548,25 +554,15 @@ export async function linkMemberOrSkip(
   }
 }
 
-// ── The owner's view: list and unlink ───────────────────────────────────────
+// ── The owner's view: the trip card's Telegram status, and Unlink ───────────
 
-export type LinkVia = "interview_link" | "earlier_interview" | "trip_password" | "invite";
+export type LinkVia = "interview_link" | "earlier_interview" | "dashboard_link" | "trip_password" | "invite";
 
+/** One Telegram account that can currently open ONE trip as `userId`. */
 export interface TelegramLinkView {
   /** Opaque row id; the only thing the Unlink button needs. */
   id: string;
-  /** "account" opens every trip of the account; "trip" opens one. */
-  scope: "account" | "trip";
   via: LinkVia;
-  /** The trip a trip-scoped link opens. */
-  tripTitle: string | null;
-  /**
-   * For a link made by redeeming an interview link: the trip THAT interview was
-   * for, so an organizer can match "linked on the 3rd via the interview for
-   * Rome" against their own memory of redeeming it — and spot the one they
-   * did not.
-   */
-  viaTripTitle: string | null;
   linkedAt: string;
   firstSignedInAt: string | null;
   lastSignedInAt: string | null;
@@ -575,86 +571,89 @@ export interface TelegramLinkView {
 const VIA: Record<string, LinkVia> = {
   enrollment_redemption: "interview_link",
   backfill_intake_session: "earlier_interview",
+  dashboard_link_token: "dashboard_link",
   mini_app_trip_password: "trip_password",
   mini_app_invite_redemption: "invite",
 };
 
 /**
- * Every Telegram account that can currently sign in as `userId`.
+ * The Telegram accounts that can open each of these trips as `userId`, keyed by
+ * trip. This is what the dashboard's trip card shows (linked / not linked) and
+ * what its ⋮ menu offers to Unlink.
  *
- * WHAT IS SHOWN, and why that much: the date it was linked, how (and for which
- * trip's interview), the trip for a trip-scoped link, and when it first and
- * last signed in. Those are the facts a person can check against their own
- * memory ("I never redeemed an interview link for Rome on the 3rd") without this
- * endpoint becoming a way to learn who the other party is. Not shown, on
- * purpose: the Telegram id, its digest or any prefix of it (a digest of a short
- * numeric id is brute-forceable, so a fragment narrows it), and any
- * Telegram-supplied name (free text the other person chose).
- *
- * The interview trip is matched by time: the link row is written in the same
- * transaction that consumes the enrollment, so its created_at is the
- * enrollment's consumed_at. A link with no enrollment within five minutes of it
- * (a backfilled one) simply has no `viaTripTitle`.
+ * WHAT IS SHOWN, and why that much: when it was linked, how, and when it first
+ * and last signed in. Those are the facts a person can check against their own
+ * memory ("I never linked Telegram to Rome on the 3rd") without this becoming a
+ * way to learn who the other party is. Not shown, on purpose: the Telegram id,
+ * its digest or any prefix of it (a digest of a short numeric id is
+ * brute-forceable, so a fragment narrows it), and any Telegram-supplied name
+ * (free text the other person chose). The trip comes from the card the row is
+ * rendered on, so the rows carry no trip title either.
  */
-export async function listTelegramLinks(db: pg.Pool, userId: string): Promise<TelegramLinkView[]> {
+export async function telegramLinksByTrip(
+  db: pg.Pool | pg.PoolClient,
+  userId: string,
+  tripIds: readonly string[],
+): Promise<Map<string, TelegramLinkView[]>> {
+  const byTrip = new Map<string, TelegramLinkView[]>();
+  if (tripIds.length === 0) return byTrip;
   const result = await db.query<{
-    id: string; scope: "account" | "trip"; verified_via: string; trip_title: string | null; via_trip_title: string | null;
-    created_at: Date; first_signed_in_at: Date | null; last_signed_in_at: Date | null;
+    id: string; trip_id: string; verified_via: string; created_at: Date;
+    first_signed_in_at: Date | null; last_signed_in_at: Date | null;
   }>(
-    `SELECT l.id, 'account'::text AS scope, l.verified_via, NULL::text AS trip_title, v.title AS via_trip_title,
-            l.created_at, l.first_signed_in_at, l.last_signed_in_at
-       FROM control_plane.telegram_organizer_links l
-       LEFT JOIN LATERAL (
-         SELECT COALESCE(t.title, t.destination_label, 'Untitled trip') AS title
-           FROM control_plane.interview_enrollments e
-           JOIN control_plane.trips t ON t.id = e.trip_id
-          WHERE e.user_id = l.user_id AND e.consumed_at IS NOT NULL
-            AND l.verified_via = 'enrollment_redemption'
-            AND abs(extract(epoch FROM (e.consumed_at - l.created_at))) <= 300
-          ORDER BY abs(extract(epoch FROM (e.consumed_at - l.created_at))) LIMIT 1
-       ) v ON true
-      WHERE l.user_id = $1
+    `SELECT l.id, l.trip_id, l.verified_via, l.created_at, l.first_signed_in_at, l.last_signed_in_at
+       FROM control_plane.telegram_organizer_trip_links l
+      WHERE l.user_id = $1 AND l.trip_id = ANY($2::text[]) AND l.revoked_at IS NULL
      UNION ALL
-     SELECT m.id, 'trip'::text, m.verified_via, COALESCE(t.title, t.destination_label, 'Untitled trip'), NULL::text,
-            m.created_at, m.first_signed_in_at, m.last_signed_in_at
+     SELECT m.id, m.trip_id, m.verified_via, m.created_at, m.first_signed_in_at, m.last_signed_in_at
        FROM control_plane.telegram_member_links m
-       JOIN control_plane.trips t ON t.id = m.trip_id
-      WHERE m.user_id = $1 AND m.revoked_at IS NULL
-     ORDER BY created_at DESC`,
-    [userId],
+      WHERE m.user_id = $1 AND m.trip_id = ANY($2::text[]) AND m.revoked_at IS NULL
+     ORDER BY created_at, id`,
+    [userId, [...tripIds]],
   );
-  return result.rows.map((row) => ({
-    id: row.id,
-    scope: row.scope,
-    via: VIA[row.verified_via] ?? "interview_link",
-    tripTitle: row.trip_title,
-    viaTripTitle: row.via_trip_title,
-    linkedAt: row.created_at.toISOString(),
-    firstSignedInAt: row.first_signed_in_at ? row.first_signed_in_at.toISOString() : null,
-    lastSignedInAt: row.last_signed_in_at ? row.last_signed_in_at.toISOString() : null,
-  }));
+  for (const row of result.rows) {
+    const list = byTrip.get(row.trip_id) ?? [];
+    list.push({
+      id: row.id,
+      via: VIA[row.verified_via] ?? "interview_link",
+      linkedAt: row.created_at.toISOString(),
+      firstSignedInAt: row.first_signed_in_at ? row.first_signed_in_at.toISOString() : null,
+      lastSignedInAt: row.last_signed_in_at ? row.last_signed_in_at.toISOString() : null,
+    });
+    byTrip.set(row.trip_id, list);
+  }
+  return byTrip;
 }
 
 /**
- * Ends one of `userId`'s own links, and with it everything that link held:
+ * Ends one of `userId`'s own links — ONE TRIP's link — and with it everything
+ * that link held:
  *
  *   - the sessions it minted (`web_sessions.telegram_link_id`);
- *   - for an organizer link, the Telegram account's hold on the account's trips
- *     outside the web: an interview it is part-way through, and any open chat
- *     binding of that same Telegram chat to those trips. Closed, in the
- *     existing patterns (`expired_at` on the session, `closed_at`/`closed_reason`
- *     on the binding, `revoked` on the interview binding) — nothing deleted.
- *     Without this a forwardee who redeemed the owner's interview link would
- *     lose the Mini App and keep answering the owner's interview.
+ *   - for an organizer link, that Telegram account's hold on THAT trip outside
+ *     the web: an interview it is part-way through, and any open chat binding of
+ *     the same Telegram chat to the trip. Closed, in the existing patterns
+ *     (`expired_at` on the session, `closed_at`/`closed_reason` on the binding,
+ *     `revoked` on the interview binding) — nothing deleted. Without this a
+ *     forwardee who redeemed the owner's interview link would lose the Mini App
+ *     and keep answering the owner's interview.
  *
- * An organizer link is MOVED to the history table rather than flagged, so a
- * reader that has never heard of revocation (this code's older release, after a
- * rollback) cannot see it. A member link is in a table only this release reads
- * and is flagged. `false` for a link that is not theirs, does not exist or is
- * already gone — the same answer for all three.
+ * The organizer's OTHER trips are untouched: the bot's /trips and /switch, and
+ * the Mini App sign-in, keep working for every trip whose link is still live.
+ *
+ * ROLLBACK SAFETY. Both link tables are revoked in place and are read only by
+ * this release. The previous release read the account-wide
+ * `telegram_organizer_links` instead, and could not hide one trip out of it —
+ * so if this pair still has an account-wide row it is MOVED to the history
+ * table here, in the same transaction (see migration 20261021120000): older
+ * code then sees none of the pair's trips, which can cost access after a
+ * rollback and can never keep access the owner took away.
+ *
+ * `false` for a link that is not theirs, does not exist or is already gone —
+ * the same answer for all three.
  */
 export async function unlinkTelegramLink(db: pg.Pool, userId: string, linkId: string): Promise<boolean> {
-  const kind: LinkKind | null = linkId.startsWith("tol_") ? "organizer" : linkId.startsWith("tml_") ? "member" : null;
+  const kind: LinkKind | null = linkId.startsWith("otl_") ? "organizer" : linkId.startsWith("tml_") ? "member" : null;
   if (!kind) return false;
   const client = await db.connect();
   try {
@@ -667,22 +666,31 @@ export async function unlinkTelegramLink(db: pg.Pool, userId: string, linkId: st
       );
       if (!revoked.rowCount) { await client.query("ROLLBACK"); return false; }
     } else {
-      const removed = await client.query<{ telegram_subject_digest: string }>(
-        `WITH gone AS (
-           DELETE FROM control_plane.telegram_organizer_links
-            WHERE id = $1 AND user_id = $2
-            RETURNING id, user_id, telegram_subject_digest, verified_via, created_at, first_signed_in_at, last_signed_in_at
-         ), kept AS (
-           INSERT INTO control_plane.telegram_organizer_link_revocations
-             (id, user_id, telegram_subject_digest, verified_via, linked_at, first_signed_in_at, last_signed_in_at, revoked_reason)
-           SELECT id, user_id, telegram_subject_digest, verified_via, created_at, first_signed_in_at, last_signed_in_at, 'owner_unlinked' FROM gone
-         )
-         SELECT telegram_subject_digest FROM gone`,
+      const revoked = await client.query<{ telegram_subject_digest: string; trip_id: string }>(
+        `UPDATE control_plane.telegram_organizer_trip_links
+            SET revoked_at = now(), revoked_reason = 'owner_unlinked'
+          WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
+          RETURNING telegram_subject_digest, trip_id`,
         [linkId, userId],
       );
-      const digest = removed.rows[0]?.telegram_subject_digest;
-      if (!digest) { await client.query("ROLLBACK"); return false; }
-      await closeChatHold(client, userId, digest);
+      const row = revoked.rows[0];
+      if (!row) { await client.query("ROLLBACK"); return false; }
+      await retireAccountWideLink(client, userId, row.telegram_subject_digest);
+      await closeChatHold(client, userId, row.telegram_subject_digest, row.trip_id);
+      // The bot's own organizer fact for this sender on this trip (migration 0051's person link,
+      // written at provisioning from whoever ran the interview) is demoted too: an Unlink must take
+      // the organizer powers the link gave, not only the Mini App (boundary review R1).
+      await client.query(
+        `UPDATE control_plane.trip_person_links SET role = 'participant', demoted_from_role = 'organizer'
+          WHERE trip_id = $2 AND role = 'organizer' AND telegram_user_id ~ '^[0-9]{1,20}$'
+            AND ${CHAT_DIGEST_SQL("telegram_user_id")} = $1
+            -- the same guard as the membership-end trigger: another user's live link of this
+            -- Telegram account to this trip still stands, so the account is still an organizer there
+            AND NOT EXISTS (
+              SELECT 1 FROM control_plane.telegram_organizer_trip_links l
+               WHERE l.trip_id = $2 AND l.telegram_subject_digest = $1 AND l.revoked_at IS NULL)`,
+        [row.telegram_subject_digest, row.trip_id],
+      );
     }
     await client.query(
       "UPDATE control_plane.web_sessions SET revoked_at = now() WHERE telegram_link_id = $1 AND revoked_at IS NULL",
@@ -698,28 +706,57 @@ export async function unlinkTelegramLink(db: pg.Pool, userId: string, linkId: st
   }
 }
 
+/**
+ * Moves the pair's account-wide row (the previous release's model, 0052) into
+ * the history table and ends the sessions it minted. A no-op for a pair that
+ * never had one. See `unlinkTelegramLink` for why this exists at all.
+ */
+async function retireAccountWideLink(client: pg.PoolClient, userId: string, digest: string): Promise<void> {
+  const gone = await client.query<{ id: string }>(
+    `WITH gone AS (
+       DELETE FROM control_plane.telegram_organizer_links
+        WHERE user_id = $1 AND telegram_subject_digest = $2
+        RETURNING id, user_id, telegram_subject_digest, verified_via, created_at, first_signed_in_at, last_signed_in_at
+     ), kept AS (
+       INSERT INTO control_plane.telegram_organizer_link_revocations
+         (id, user_id, telegram_subject_digest, verified_via, linked_at, first_signed_in_at, last_signed_in_at, revoked_reason)
+       SELECT id, user_id, telegram_subject_digest, verified_via, created_at, first_signed_in_at, last_signed_in_at, 'owner_unlinked' FROM gone
+       ON CONFLICT DO NOTHING
+     )
+     SELECT id FROM gone`,
+    [userId, digest],
+  );
+  const ids = gone.rows.map((row) => row.id);
+  if (ids.length > 0) {
+    await client.query(
+      "UPDATE control_plane.web_sessions SET revoked_at = now() WHERE telegram_link_id = ANY($1::text[]) AND revoked_at IS NULL",
+      [ids],
+    );
+  }
+}
+
 /** sha256 of a raw Telegram chat id column, built exactly like identity.ts's digestTelegramId. */
 const CHAT_DIGEST_SQL = (column: string) => `'sha256:' || encode(sha256(convert_to(${column}, 'UTF8')), 'hex')`;
 
-async function closeChatHold(client: pg.PoolClient, userId: string, digest: string): Promise<void> {
-  // A live interview of the account's, driven from the unlinked chat.
+async function closeChatHold(client: pg.PoolClient, userId: string, digest: string, tripId: string): Promise<void> {
+  // A live interview of the account's FOR THIS TRIP, driven from the unlinked chat.
   await client.query(
     `UPDATE control_plane.intake_sessions SET expired_at = now()
-      WHERE user_id = $1 AND expired_at IS NULL AND state <> 'confirmed'
+      WHERE user_id = $1 AND trip_id = $3 AND expired_at IS NULL AND state <> 'confirmed'
         AND telegram_chat_id ~ '^[0-9]{1,20}$' AND ${CHAT_DIGEST_SQL("telegram_chat_id")} = $2`,
-    [userId, digest],
+    [userId, digest, tripId],
   );
   await client.query(
     `UPDATE control_plane.telegram_interview_bindings SET state = 'revoked', updated_at = now()
-      WHERE state = 'active' AND chat_id ~ '^[0-9]{1,20}$' AND ${CHAT_DIGEST_SQL("chat_id")} = $2
-        AND trip_id IN (SELECT trip_id FROM control_plane.trip_memberships WHERE user_id = $1)`,
-    [userId, digest],
+      WHERE state = 'active' AND chat_id ~ '^[0-9]{1,20}$' AND ${CHAT_DIGEST_SQL("chat_id")} = $1
+        AND trip_id = $2`,
+    [digest, tripId],
   );
-  // The same chat's open routing to the account's trips (a companion DM).
+  // The same chat's open routing to THIS trip (a companion DM).
   await client.query(
     `UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'telegram_unlinked'
-      WHERE closed_at IS NULL AND chat_id ~ '^[0-9]{1,20}$' AND ${CHAT_DIGEST_SQL("chat_id")} = $2
-        AND trip_id IN (SELECT trip_id FROM control_plane.trip_memberships WHERE user_id = $1)`,
-    [userId, digest],
+      WHERE closed_at IS NULL AND chat_id ~ '^[0-9]{1,20}$' AND ${CHAT_DIGEST_SQL("chat_id")} = $1
+        AND trip_id = $2`,
+    [digest, tripId],
   );
 }

@@ -53,6 +53,7 @@ import {
   tripLanguage,
 } from "../chat-router.js";
 import { listOrganizerTrips, switchChatToTrip, type OrganizerTrip } from "../organizer-trips.js";
+import { redeemTelegramLinkToken, telegramLinkTokenFromStartPayload } from "../telegram-link-token.js";
 import { isAddressedToAssistant } from "./addressing.js";
 import { addressedMark, conversationMark, reactionAnswerMark } from "./stay-silent.js";
 import type { GroupJudge, JudgeOutcome } from "./group-judge.js";
@@ -615,6 +616,30 @@ export async function dispatchUpdate(
   const groupStartToken = parsed.kind === "start" && message.chat?.type !== "private"
     ? groupBindingTokenFromStartPayload(parsed.payload)
     : null;
+
+  // The dashboard's "Link Telegram" deep link. Claimed before the enrollment
+  // path because the payload shape (lk_ + 32 characters) is not an enrollment
+  // token's (43), and the sender id is the update's own, never the message's.
+  // Private chats only, and a link opened in a group is NOT consumed. Every
+  // refusal is the same sentence (telegram-link-token.ts).
+  const linkToken = parsed.kind === "start" ? telegramLinkTokenFromStartPayload(parsed.payload) : null;
+  if (linkToken) {
+    const language = await resolveChatLanguage(db, chatId, message.from?.language_code);
+    if (message.chat?.type !== "private" || message.from?.id === undefined) {
+      return { kind: "reply", reply: { chatId, text: strings.notPrivate } };
+    }
+    const linked = await redeemTelegramLinkToken(db, linkToken, String(message.from.id));
+    log(structuredLog("info", "trip_bot.telegram_link", { outcome: linked.ok ? (linked.alreadyLinked ? "already_linked" : "linked") : "refused" }));
+    return {
+      kind: "reply",
+      reply: {
+        chatId,
+        text: linked.ok
+          ? uiString("telegramLinked", language).replace("{trip}", () => linked.tripTitle)
+          : uiString("telegramLinkRefused", language),
+      },
+    };
+  }
 
   if (parsed.kind === "start" && !groupStartToken) {
     const outcome = await startFromDeepLink(db, chatId, parsed.payload, log, message.from?.language_code);
