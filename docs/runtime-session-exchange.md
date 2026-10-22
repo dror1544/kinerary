@@ -204,7 +204,18 @@ expired, same person), and whether the person is still active and still has
 (the role is sealed in the cookie; a demotion or promotion at the control plane
 answers 401, so the person opens the trip again and is issued a session for the
 role they now hold, and `/api/auth/me` stops showing `is_organizer` and
-`dashboard_url`). A positive answer is cached for at most 30 s per
+`dashboard_url`). When that portal session is a **Telegram-scoped** one (minted by
+a Mini App sign-in, `web_sessions.telegram_link_id` set; `portal-scope.ts`), the
+check also asks whether the trip is **still in that session's scope**, re-derived
+from the live link rows by the same `scopeDecision` the portal applies to the
+launch itself. A trip that has left the scope (the link that put it there was
+unlinked, or it never was in scope) answers `401 SESSION_REVOKED`, exactly as a
+revoked session does, so the open trip page ends within the cache window below. A
+full (password / Google) session is not scoped and is unaffected; a scope that
+cannot be read counts as empty. Asserted by `RUNTIME CHECK` in
+`control-plane/api/test/portal-scope-db.test.ts` and, for the gateway ending the
+session on that answer, by `a trip that leaves a scoped session's scope` in
+`control-plane/runtime-gateway/test/gateway.test.js`. A positive answer is cached for at most 30 s per
 launching session (`RUNTIME_SESSION_CHECK_TTL_MS` lowers it, for tests), a
 negative one never, and an unreachable control plane means refusal. Signing out
 of the portal on one device therefore ends the trip session opened from that

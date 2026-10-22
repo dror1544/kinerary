@@ -244,6 +244,41 @@ interface PortalUser {
   scope: SessionScope | null;
 }
 
+/**
+ * A scoped session's scope, derived from its link rows now. The ONE place that
+ * turns "this session was minted by that link" into a trip set, used by
+ * `portalUser` (every portal request) and by the gateway's liveness check, so
+ * the two cannot disagree. A scope that cannot be read is the EMPTY scope.
+ */
+async function readSessionScope(deps: PortalDependencies, userId: string, telegramLinkId: string | null): Promise<SessionScope> {
+  return loadSessionScope(deps.db, { userId, telegramLinkId }).catch(() => ({ tripIds: new Set<string>(), telegramDigest: null }));
+}
+
+/** The route whose policy decides whether a session may OPEN a trip: the launch that produced the trip session. */
+const OPEN_TRIP_ROUTE = "POST /v1/trips/:id/launch";
+
+/**
+ * Is a live portal session of this user one that may still open this trip? A full session (no
+ * Telegram link) may; a scoped one only if the trip is in its scope TODAY, by the same
+ * `scopeDecision` `requireUser` applies to the launch. Without `sessionId` (a grant minted before
+ * session binding) any live session that qualifies is enough.
+ */
+async function sessionMayOpenTrip(deps: PortalDependencies, input: { userId: string; tripId: string; sessionId: string | null }): Promise<boolean> {
+  const sessions = await deps.db.query<{ telegram_link_id: string | null }>(
+    `SELECT telegram_link_id FROM control_plane.web_sessions
+      WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > now() AND ($2::text IS NULL OR id = $2::text)
+      ORDER BY (telegram_link_id IS NULL) DESC`,
+    [input.userId, input.sessionId]);
+  for (const row of sessions.rows) {
+    if (row.telegram_link_id === null) return true;
+    const decision = await scopeDecision(deps.db, {
+      routeKey: OPEN_TRIP_ROUTE, params: { id: input.tripId }, scope: await readSessionScope(deps, input.userId, row.telegram_link_id),
+    });
+    if (decision.allow) return true;
+  }
+  return false;
+}
+
 async function portalUser(request: FastifyRequest, deps: PortalDependencies): Promise<PortalUser | null> {
   const raw = parseCookies(request.headers.cookie).kit_session;
   if (!raw) return null;
@@ -265,10 +300,7 @@ async function portalUser(request: FastifyRequest, deps: PortalDependencies): Pr
   // Scoped when EITHER signal says so: a Telegram link minted it, or it is stored under the scoped digest.
   // A scoped session whose scope cannot be read has the empty scope, not a full one.
   const scoped = row.telegram_link_id !== null || row.session_digest === scopedSessionDigest(raw);
-  let scope: SessionScope | null = null;
-  if (scoped) {
-    scope = await loadSessionScope(deps.db, { userId: row.id, telegramLinkId: row.telegram_link_id }).catch(() => ({ tripIds: new Set<string>(), telegramDigest: null }));
-  }
+  const scope = scoped ? await readSessionScope(deps, row.id, row.telegram_link_id) : null;
   return {
     id: row.id,
     displayName: row.display_name,
@@ -1380,6 +1412,8 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
   // relaunch and is issued a session for the role they now hold. A grant minted before session binding existed carries no
   // session (null) and keeps the earlier rule: any live portal session of the
   // person. Those grants live 90 seconds, so that rule is a rollback aid only.
+  // A session a Telegram link minted is SCOPED (portal-scope.ts): it also has to still have this trip in
+  // its scope, re-derived from the live link rows here, so an Unlink ends an open trip page.
   app.post("/internal/runtime-sessions/check", async (request, reply) => {
     if (!exchangeKeyMatches(request.headers["x-api-key"], deps.runtimeExchangeKey)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
     const { tripId, userId, sessionId, role } = (request.body ?? {}) as Record<string, unknown>;
@@ -1397,6 +1431,11 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
                        AND ($3::text IS NULL OR s.id = $3::text))`,
       [tripId, userId, sessionId ?? null, role ?? null]);
     if (!result.rows[0]) return reply.code(401).send({ error: "SESSION_REVOKED" });
+    // A Telegram-minted (scoped) session stays valid only while the trip is in its scope: an Unlink
+    // ends an open trip page as it ends the next portal request. Answered exactly as a revoked session.
+    if (!(await sessionMayOpenTrip(deps, { userId, tripId, sessionId: typeof sessionId === "string" ? sessionId : null }))) {
+      return reply.code(401).send({ error: "SESSION_REVOKED" });
+    }
     return { live: true };
   });
 

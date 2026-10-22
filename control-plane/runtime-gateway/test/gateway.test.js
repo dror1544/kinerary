@@ -12,6 +12,7 @@ const sessionBodies = [];
 const consumed = new Set();
 const revokedUsers = new Set();
 const revokedSessions = new Set();
+const outOfScopeTrips = new Set(); // trips a Telegram-scoped session no longer has in scope (the portal answers like a revoked session)
 let lastCheck;
 let currentRole = "owner", hangControlPlane = false;
 let checkCalls = 0, checkDown = false;
@@ -89,7 +90,7 @@ before(async () => {
       if (hangControlPlane) return; // never answers
       if (payload.role && payload.role !== currentRole) { res.statusCode = 401; return res.end(JSON.stringify({ error: "ROLE_CHANGED" })); }
       if (checkDown) { res.statusCode = 500; return res.end("{}"); }
-      if (revokedUsers.has(payload.userId) || revokedSessions.has(payload.sessionId)) { res.statusCode = 401; return res.end(JSON.stringify({ error: "SESSION_REVOKED" })); }
+      if (revokedUsers.has(payload.userId) || revokedSessions.has(payload.sessionId) || outOfScopeTrips.has(payload.tripId)) { res.statusCode = 401; return res.end(JSON.stringify({ error: "SESSION_REVOKED" })); }
       return res.end(JSON.stringify({ live: true }));
     }
     if (req.url === "/internal/runtime-routes/trip_abcdefgh") return res.end(JSON.stringify({ routeRef: "route_abcdefgh", upstreamOrigin, upstreamBasePath: "" }));
@@ -213,6 +214,21 @@ test("signing out on one device ends only the trip session opened from that devi
     assert.equal((await get(a)).status, 401, "the trip session opened from A ends");
     assert.equal((await get(b)).status, 200, "the trip session opened from B keeps working");
   } finally { revokedSessions.delete("wsess_devicea0001"); }
+});
+
+test("a trip that leaves a scoped session's scope (an Unlink) ends the open trip session", async () => {
+  const cookie = (await formLaunch("valid-grant")).headers.get("set-cookie").split(";")[0];
+  const get = (headers = {}) => fetch(`${gatewayOrigin}/t/trip_abcdefgh/api/config`, { redirect: "manual", headers: { cookie, ...headers } });
+  assert.equal((await get()).status, 200);
+  assert.equal(lastCheck.tripId, "trip_abcdefgh", "the check names the trip, which is what the portal re-evaluates the scope against");
+  outOfScopeTrips.add("trip_abcdefgh");
+  try {
+    await new Promise(resolve => setTimeout(resolve, 300)); // past the 200 ms test window
+    assert.equal((await get()).status, 401, "answered like a revoked session, so the gateway ends it");
+    const page = await rawGet("/t/trip_abcdefgh/api/config", { ...NAV, cookie });
+    assert.equal(page.status, 303);
+    assert.equal(page.headers.get("location"), `${PORTAL}/trips/trip_abcdefgh/app`);
+  } finally { outOfScopeTrips.delete("trip_abcdefgh"); }
 });
 
 test("the dashboard URL is passed on only when it is exactly this portal's setup page for this trip", async () => {
