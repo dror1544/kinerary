@@ -420,3 +420,64 @@ test("logout works for a scoped session and ends it", { skip }, async () => {
     assert.equal((await call(app, scoped, "GET", "/v1/me")).statusCode, 401);
   } finally { await app.close(); }
 });
+
+// ── The gateway's liveness question honours the scope too ───────────────────
+
+/**
+ * `POST /internal/runtime-sessions/check` is what the runtime gateway asks before it serves an open trip
+ * page. It must answer for a SCOPED session exactly as `requireUser` would for the launch of that trip:
+ * "an Unlink takes effect on the next request" has to hold for a trip page that is already open.
+ */
+test("RUNTIME CHECK: a scoped session's open trip ends when its link goes; a full session is unaffected; a trip never in scope was never open", { skip }, async () => {
+  const app = newApp();
+  const check = (tripId: string, userId: string, sessionId: string | null, key: string | undefined = "exchange-key") => app.inject({
+    method: "POST", url: "/internal/runtime-sessions/check", headers: key ? { "x-api-key": key } : {}, payload: { tripId, userId, sessionId, role: "owner" },
+  });
+  const sessionIdOf = async (raw: string) =>
+    (await pool.query<{ id: string }>("SELECT id FROM control_plane.web_sessions WHERE token_digest = ANY($1::text[])", [sessionDigests(raw)])).rows[0]!.id;
+  try {
+    const { user, rome, oslo, telegramId, scoped, full } = await fixture(app);
+    const scopedId = await sessionIdOf(scoped.raw), fullId = await sessionIdOf(full.raw);
+
+    // The answer for a revoked session, the one every refusal below must equal.
+    await pool.query("UPDATE control_plane.web_sessions SET revoked_at = now() WHERE id = $1", [fullId]);
+    const revoked = await check(rome, user, fullId);
+    await pool.query("UPDATE control_plane.web_sessions SET revoked_at = NULL WHERE id = $1", [fullId]);
+    assert.equal(revoked.statusCode, 401); assert.deepEqual(revoked.json(), { error: "SESSION_REVOKED" });
+
+    // 1. In scope: passes. (Rome is the trip the Telegram account is linked to.)
+    const inScope = await check(rome, user, scopedId);
+    assert.equal(inScope.statusCode, 200, inScope.body); assert.deepEqual(inScope.json(), { live: true });
+
+    // 4. Never in scope: Oslo is linked only to a DIFFERENT Telegram account.
+    const never = await check(oslo, user, scopedId);
+    assert.equal(never.statusCode, revoked.statusCode); assert.deepEqual(never.json(), revoked.json(), "out of scope answers exactly as a revoked session");
+
+    // 2. Put Oslo in scope with a second link of the SAME Telegram account, then really Unlink it.
+    const second = await organizerLink(user, oslo, telegramId);
+    assert.equal((await check(oslo, user, scopedId)).statusCode, 200, "linked: the open trip page stays valid");
+    const { unlinkTelegramLink } = await import("../src/telegram-mini-app.js");
+    assert.equal(await unlinkTelegramLink(pool, user, second), true);
+    const afterUnlink = await check(oslo, user, scopedId);
+    assert.equal(afterUnlink.statusCode, 401, afterUnlink.body); assert.deepEqual(afterUnlink.json(), revoked.json());
+    assert.equal((await check(rome, user, scopedId)).statusCode, 200, "the trip whose link still stands is untouched");
+
+    // 3. A full session of the same user is unaffected, on any trip the membership allows.
+    assert.equal((await check(oslo, user, fullId)).statusCode, 200);
+    assert.equal((await check(rome, user, fullId)).statusCode, 200);
+
+    // A grant with no session id keeps the earlier rule (any live session of the person), now scope-aware:
+    // with a full session alive it passes; with only the scoped session it follows that session's scope.
+    assert.equal((await check(oslo, user, null)).statusCode, 200, "a live full session satisfies the legacy rule");
+    await pool.query("UPDATE control_plane.web_sessions SET revoked_at = now() WHERE id = $1", [fullId]);
+    assert.equal((await check(oslo, user, null)).statusCode, 401, "only a scoped session is left, and Oslo is not in its scope");
+    assert.equal((await check(rome, user, null)).statusCode, 200);
+
+    // Fails closed: a scoped session whose link cannot be read has the empty scope.
+    await pool.query("UPDATE control_plane.web_sessions SET telegram_link_id = 'bogus' WHERE id = $1", [scopedId]);
+    assert.equal((await check(rome, user, scopedId)).statusCode, 401, "an unreadable scope is no scope");
+
+    // Still keyed: no exchange key, no answer.
+    assert.equal((await check(rome, user, scopedId, undefined)).statusCode, 401);
+  } finally { await app.close(); }
+});
