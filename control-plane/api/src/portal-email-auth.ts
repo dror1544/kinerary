@@ -9,9 +9,16 @@
  *
  * THE SHAPE, and why each part is where it is:
  *
+ *   - THE PASSWORD IS CHOSEN AT VERIFICATION, NOT AT SIGN-UP. Sign-up takes an
+ *     address and a name only; the emailed link opens a page that asks for the
+ *     password, and the request that sends it is the one that spends the token.
+ *     Anyone can start a sign-up for anyone's address, so a password chosen then
+ *     would be known to a stranger the moment the real owner clicked the link.
+ *     Opening the link spends nothing (a mail scanner that fetches it burns no
+ *     token), and a too-short password is refused before the token is touched.
  *   - AN UNVERIFIED SIGN-UP IS NOT AN ACCOUNT. It is one row in
- *     `email_action_tokens` (purpose `sign_up`): the name, the scrypt hash of the
- *     chosen password, and the digest of the emailed token. No `users`,
+ *     `email_action_tokens` (purpose `sign_up`): the name and the digest of the
+ *     emailed token, no password at all. No `users`,
  *     `user_identities` or `password_credentials` row exists until the token is
  *     consumed. So an unverified address cannot sign in (nothing to match), cannot
  *     be claimed, and cannot block an operator's invitation or a Google sign-in
@@ -45,7 +52,7 @@ import { createHash, randomBytes } from "node:crypto";
 import type pg from "pg";
 import type { Mailer } from "./mailer.js";
 import { MailSendError } from "./mailer.js";
-import { digestEmail, hashPassword, resolveOrCreateEmailAccountByDigest } from "./password-identity.js";
+import { digestEmail, resolveOrCreateEmailAccountByDigest } from "./password-identity.js";
 import { renderPortalMail, type MailLanguage, type PortalMail } from "./portal-email-templates.js";
 import { structuredLog } from "./redaction.js";
 
@@ -126,7 +133,7 @@ async function purgeStale(db: pg.Pool): Promise<void> {
   await db.query("DELETE FROM control_plane.email_action_tokens WHERE created_at < now() - interval '2 days'");
 }
 
-export interface SignUpRequest { email: string; password: string; displayName?: string; returnTo: string; language: MailLanguage }
+export interface SignUpRequest { email: string; displayName?: string; returnTo: string; language: MailLanguage }
 
 /**
  * Everything a sign-up request does after it has been answered. A new address
@@ -135,8 +142,6 @@ export interface SignUpRequest { email: string; password: string; displayName?: 
  */
 export async function startSignUp(ctx: EmailAuthContext, input: SignUpRequest): Promise<void> {
   const emailDigest = digestEmail(input.email);
-  // The same scrypt work whether or not the address is taken.
-  const passwordHash = await hashPassword(input.password);
   await purgeStale(ctx.db);
   if (await overSendBudget(ctx.db, emailDigest)) {
     ctx.log(structuredLog("warn", "email_auth.address_send_budget_exhausted", { purpose: "sign_up", effect: "request answered, nothing sent" }));
@@ -162,14 +167,14 @@ export async function startSignUp(ctx: EmailAuthContext, input: SignUpRequest): 
     await client.query("BEGIN");
     // Only the newest link works: a person who asked twice is not left with two live tokens.
     await client.query(
-      `UPDATE control_plane.email_action_tokens SET consumed_at = now(), password_hash = NULL
+      `UPDATE control_plane.email_action_tokens SET consumed_at = now()
         WHERE email_digest = $1 AND purpose = 'sign_up' AND consumed_at IS NULL`,
       [emailDigest],
     );
     await client.query(
-      `INSERT INTO control_plane.email_action_tokens(id, purpose, token_digest, email_digest, display_name, password_hash, return_to, expires_at)
-       VALUES ($1, 'sign_up', $2, $3, $4, $5, $6, now() + ($7 * interval '1 second'))`,
-      [rowId(), sha(token), emailDigest, displayName, passwordHash, input.returnTo, SIGN_UP_TOKEN_TTL_SECONDS],
+      `INSERT INTO control_plane.email_action_tokens(id, purpose, token_digest, email_digest, display_name, return_to, expires_at)
+       VALUES ($1, 'sign_up', $2, $3, $4, $5, now() + ($6 * interval '1 second'))`,
+      [rowId(), sha(token), emailDigest, displayName, input.returnTo, SIGN_UP_TOKEN_TTL_SECONDS],
     );
     await client.query("COMMIT");
   } catch (error) {
@@ -237,21 +242,23 @@ export type VerifyResult =
   | { ok: false; error: "TOKEN_INVALID" | "ACCOUNT_EXISTS" };
 
 /**
- * Spends a sign-up token and, if the address still has no account, creates it.
- * The caller owns BEGIN/COMMIT so the account, its credential and the session it
- * is signed in with commit together. The token is spent even when the address
- * turned out to have an account already: it will not be tried again.
+ * Spends a sign-up token and, if the address still has no account, creates it
+ * with the password the person just chose (`passwordHash`, computed by the
+ * caller BEFORE the transaction, as for a reset). The caller owns BEGIN/COMMIT so
+ * the account, its credential and the session it is signed in with commit
+ * together. The token is spent even when the address turned out to have an
+ * account already: it will not be tried again.
  */
-export async function consumeSignUpToken(client: pg.PoolClient, token: unknown): Promise<VerifyResult> {
+export async function consumeSignUpToken(client: pg.PoolClient, token: unknown, passwordHash: string): Promise<VerifyResult> {
   if (typeof token !== "string" || !SIGN_UP_TOKEN.test(token)) return { ok: false, error: "TOKEN_INVALID" };
-  const found = await client.query<{ id: string; email_digest: string; display_name: string; password_hash: string; return_to: string | null }>(
-    `SELECT id, email_digest, display_name, password_hash, return_to FROM control_plane.email_action_tokens
+  const found = await client.query<{ id: string; email_digest: string; display_name: string; return_to: string | null }>(
+    `SELECT id, email_digest, display_name, return_to FROM control_plane.email_action_tokens
       WHERE token_digest = $1 AND purpose = 'sign_up' AND consumed_at IS NULL AND expires_at > now() FOR UPDATE`,
     [sha(token)],
   );
   const row = found.rows[0];
-  if (!row || !row.password_hash) return { ok: false, error: "TOKEN_INVALID" };
-  await client.query("UPDATE control_plane.email_action_tokens SET consumed_at = now(), password_hash = NULL WHERE id = $1", [row.id]);
+  if (!row) return { ok: false, error: "TOKEN_INVALID" };
+  await client.query("UPDATE control_plane.email_action_tokens SET consumed_at = now() WHERE id = $1", [row.id]);
 
   const taken = await client.query(
     `SELECT 1 FROM control_plane.password_credentials WHERE email_digest = $1
@@ -266,7 +273,7 @@ export async function consumeSignUpToken(client: pg.PoolClient, token: unknown):
   const credential = await client.query(
     `INSERT INTO control_plane.password_credentials(user_id, email_digest, password_hash)
      VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING user_id`,
-    [userId, row.email_digest, row.password_hash],
+    [userId, row.email_digest, passwordHash],
   );
   // A concurrent invitation or Google sign-in won the address between the check and here: leave theirs alone.
   if (credential.rowCount !== 1) return { ok: false, error: "ACCOUNT_EXISTS" };

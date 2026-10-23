@@ -544,6 +544,19 @@ class ConfigurationIsCheckedBeforeTheSwitch(unittest.TestCase):
         self.assertEqual(len(vr.web_config_problems(self.GOOD_ENV, both)), 2)
         self.assertEqual(vr.web_config_problems({**self.GOOD_ENV, "GOOGLE_WEB_CLIENT_ID": "i", "GOOGLE_WEB_CLIENT_SECRET": "s"}, both), [])
 
+    def test_the_email_api_key_is_a_variable_the_api_is_given(self):
+        email = self.profile(email_provider="resend", email_api_key_secret_ref="env://PORTAL_EMAIL_API_KEY", email_from="noreply@mail.example.test")
+        # Named by the profile but unset in vm.env: a refused plan, not an api that dies at boot.
+        problems = vr.web_config_problems(self.GOOD_ENV, email)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("env://PORTAL_EMAIL_API_KEY", problems[0])
+        self.assertIn("not set in vm.env", problems[0])
+        self.assertEqual(vr.web_config_problems({**self.GOOD_ENV, "PORTAL_EMAIL_API_KEY": "key-value"}, email), [])
+        # Left out of the profile, the variable is not required.
+        self.assertEqual(vr.web_config_problems(self.GOOD_ENV, self.profile()), [])
+        # And vm.env.example documents it.
+        self.assertIn("PORTAL_EMAIL_API_KEY=", (ROOT / "control-plane" / "deployment" / "vm.env.example").read_text())
+
 
 if __name__ == "__main__":
     unittest.main()

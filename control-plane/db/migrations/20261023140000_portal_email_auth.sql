@@ -10,15 +10,16 @@
 -- without holding anything that can be mailed.
 --
 -- AN UNVERIFIED SIGN-UP IS A ROW HERE, NOT AN ACCOUNT. `purpose = 'sign_up'`
--- carries the name and the scrypt hash of the password the person chose, and
--- nothing else. No `users`, `user_identities` or `password_credentials` row
--- exists until the emailed token is consumed, so an unverified sign-up cannot
--- sign in (there is no credential to match), cannot be claimed by anyone, and
--- cannot stand in the way of an operator's invitation or a Google sign-in for
--- the same address: those resolve the address through
--- `resolveOrCreateEmailAccount` and find nothing here to collide with. When the
--- token is consumed (or superseded by a newer one) `password_hash` is set back
--- to NULL.
+-- carries the name and the digest of the token, and NO PASSWORD: the person
+-- chooses it on the page the emailed link opens, in the same request that
+-- spends the token. So whoever starts a sign-up for somebody else's address
+-- never knows a password for the account that address will get. No `users`,
+-- `user_identities` or `password_credentials` row exists until the token is
+-- consumed, so an unverified sign-up cannot sign in (there is no credential to
+-- match), cannot be claimed by anyone, and cannot stand in the way of an
+-- operator's invitation or a Google sign-in for the same address: those resolve
+-- the address through `resolveOrCreateEmailAccount` and find nothing here to
+-- collide with.
 --
 -- 'password_reset' is bound to the user it was issued for. 'existing_notice'
 -- records that a "you already have an account" message was sent (the token
@@ -32,7 +33,6 @@ CREATE TABLE control_plane.email_action_tokens (
   email_digest text NOT NULL CHECK (email_digest ~ '^sha256:[a-f0-9]{64}$'),
   user_id text REFERENCES control_plane.users(id) ON DELETE CASCADE,
   display_name text CHECK (display_name IS NULL OR char_length(display_name) BETWEEN 1 AND 120),
-  password_hash text CHECK (password_hash IS NULL OR char_length(password_hash) BETWEEN 32 AND 256),
   return_to text CHECK (return_to IS NULL OR return_to ~ '^/[A-Za-z0-9/_?=&.#%-]*$'),
   expires_at timestamptz NOT NULL,
   consumed_at timestamptz,

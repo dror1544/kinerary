@@ -216,11 +216,11 @@ export const getTrip = (id: string) => api<unknown>(`/v1/trips/${encodeURICompon
 export const getAuthCapabilities = () => api<unknown>("/v1/auth/capabilities").then(value => z.object({ google: z.boolean(), emailPassword: z.boolean(), emailSignUp: z.boolean().optional(), telegramMiniApp: z.boolean().optional() }).parse(value));
 export const emailPasswordSignIn = (input: { email: string; password: string; returnTo: string; embedded?: true }) => api<{ appPath: string }>("/v1/auth/email-password", { method: "POST", body: JSON.stringify(input) });
 
-/** Creates nothing yet: the server emails a link, and the account exists once that link is used. */
-export const emailSignUp = (input: { email: string; password: string; displayName: string; returnTo: string; language: "en" | "he" }) =>
+/** Creates nothing yet, and takes no password: the server emails a link, and the person chooses the password on the page it opens. */
+export const emailSignUp = (input: { email: string; displayName: string; returnTo: string; language: "en" | "he" }) =>
   api<{ status: "check_your_email" }>("/v1/auth/sign-up", { method: "POST", body: JSON.stringify(input) });
-/** Spends the emailed token: creates the account and signs the person in. */
-export const verifyEmail = (token: string) => api<{ appPath: string }>("/v1/auth/verify-email", { method: "POST", body: JSON.stringify({ token }) });
+/** Spends the emailed token together with the password chosen on the verify page: creates the account and signs the person in. */
+export const verifyEmail = (input: { token: string; password: string }) => api<{ appPath: string }>("/v1/auth/verify-email", { method: "POST", body: JSON.stringify(input) });
 /** Always the same answer, whether or not the address has an account. */
 export const forgotPassword = (input: { email: string; language: "en" | "he" }) =>
   api<{ status: "check_your_email" }>("/v1/auth/password/forgot", { method: "POST", body: JSON.stringify(input) });

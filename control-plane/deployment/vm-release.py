@@ -317,7 +317,7 @@ def compose_defines_web(compose_text: str) -> bool:
 
 
 # The env:// targets compose.vm.yml gives the api for the `web` block's secret references.
-WEB_API_ENV = ("RUNTIME_EXCHANGE_KEY", "GOOGLE_WEB_CLIENT_ID", "GOOGLE_WEB_CLIENT_SECRET")
+WEB_API_ENV = ("RUNTIME_EXCHANGE_KEY", "GOOGLE_WEB_CLIENT_ID", "GOOGLE_WEB_CLIENT_SECRET", "PORTAL_EMAIL_API_KEY")
 WEB_REQUIRED_ENV = ("RUNTIME_EXCHANGE_KEY", "RUNTIME_COOKIE_SECRET", "PORTAL_ORIGIN", "RUNTIME_ORIGIN",
                     "KINERARY_ARCHITECTURE_PROFILE")
 

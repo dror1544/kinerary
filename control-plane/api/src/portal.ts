@@ -723,8 +723,8 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
 
   // ── Email sign-up, verification and password reset (portal-email-auth.ts) ──
   //
-  //   POST /v1/auth/sign-up          { email, password, displayName?, returnTo?, language? }  202 { status: "check_your_email" }
-  //   POST /v1/auth/verify-email     { token }                 200 { appPath } + session cookies | 400 TOKEN_INVALID | 409 ACCOUNT_EXISTS
+  //   POST /v1/auth/sign-up          { email, displayName?, returnTo?, language? }  202 { status: "check_your_email" }  (no password: it is chosen at verification)
+  //   POST /v1/auth/verify-email     { token, password }       200 { appPath } + session cookies | 400 TOKEN_INVALID | 400 PASSWORD_TOO_SHORT | 409 ACCOUNT_EXISTS
   //   POST /v1/auth/password/forgot  { email, language? }      202 { status: "check_your_email" }
   //   POST /v1/auth/password/reset   { token, password }       200 { appPath } + session cookies | 400 TOKEN_INVALID
   //
@@ -758,15 +758,15 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     if (!admitLogin(signUpIpAttempts, request.ip, 20)) return reply.header("retry-after", "60").code(429).send({ error: "SIGN_UP_RATE_LIMITED" });
     if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
     const body = jsonBody(request);
-    if (!isPlausibleEmail(body.email) || typeof body.password !== "string" ||
+    // There is deliberately no password here, and one in the body is ignored, never stored: the person
+    // chooses it on the page the emailed link opens (see portal-email-auth.ts).
+    if (!isPlausibleEmail(body.email) ||
         (body.displayName !== undefined && (typeof body.displayName !== "string" || body.displayName.length > 120))) {
       return reply.code(400).send({ error: "INVALID_REQUEST" });
     }
-    if (body.password.length < PASSWORD_MIN_LENGTH) return reply.code(400).send({ error: "PASSWORD_TOO_SHORT" });
-    if (body.password.length > PASSWORD_MAX_LENGTH) return reply.code(400).send({ error: "INVALID_REQUEST" });
     if (!admitLogin(signUpAddressAttempts, addressKey(body.email), 3)) return reply.header("retry-after", "60").code(429).send({ error: "SIGN_UP_RATE_LIMITED" });
     const input = {
-      email: body.email, password: body.password, displayName: typeof body.displayName === "string" ? body.displayName : undefined,
+      email: body.email, displayName: typeof body.displayName === "string" ? body.displayName : undefined,
       returnTo: storableReturnTo(body.returnTo ?? body.return_to), language: pickLanguage(body.language, request.headers["accept-language"]),
     };
     const ctx = emailAuthContext(deps.mailer);
@@ -780,10 +780,16 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     if (!admitLogin(emailTokenIpAttempts, request.ip, 30)) return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
     if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
     const body = jsonBody(request);
+    if (typeof body.password !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+    // Before the token is touched: a typo in the password must not burn the link.
+    if (body.password.length < PASSWORD_MIN_LENGTH) return reply.code(400).send({ error: "PASSWORD_TOO_SHORT" });
+    if (body.password.length > PASSWORD_MAX_LENGTH) return reply.code(400).send({ error: "INVALID_REQUEST" });
+    // Hashed before the transaction, so a bad token costs the same scrypt and no row lock is held meanwhile.
+    const passwordHash = await hashPassword(body.password);
     const client = await deps.db.connect();
     try {
       await client.query("BEGIN");
-      const result = await consumeSignUpToken(client, body.token);
+      const result = await consumeSignUpToken(client, body.token, passwordHash);
       if (!result.ok) {
         // Commit: a spent token stays spent, even when the address turned out to have an account already.
         await client.query("COMMIT");

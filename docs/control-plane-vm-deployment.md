@@ -867,11 +867,14 @@ drifting. Notes on what you are filling in:
   page says "Sign-up isn't open yet", and the api logs `email_auth.disabled` at
   boot. The links in the messages are built from `web.public_origin`. The address,
   domain and key live in the deployment's profile and secrets, never in this
-  repository. **The key reference must be one the release tool allows**:
+  repository. **The key goes in `vm.env` as `PORTAL_EMAIL_API_KEY`** and the profile
+  names it as `"email_api_key_secret_ref": "env://PORTAL_EMAIL_API_KEY"`:
   `kinerary-cp-release` refuses an `env://` name outside its allow-list
-  (`WEB_API_ENV` in `vm-release.py`, mirrored in `compose.vm.yml`), so a new
-  variable needs those two files to name it, or a `file://` secret mounted into the
-  container. Like the Mini App fields, the profile schema is strict: add these keys
+  (`WEB_API_ENV` in `vm-release.py`, mirrored in `compose.vm.yml`), and
+  `PORTAL_EMAIL_API_KEY` is on it, so `plan` refuses a profile that names it
+  while `vm.env` leaves it empty. The sign-up flow itself: a new organizer gives an
+  address and a name, is emailed a link, and chooses the password on the page the
+  link opens (opening it spends nothing; the submit does). Like the Mini App fields, the profile schema is strict: add these keys
   only in the same step as an upgrade to a revision that contains this change.
 - **Telegram Mini App fields** (`web.telegram_bot_token_secret_ref`,
   `web.telegram_init_data_max_age_seconds`) and **`public_api.trust_proxy`** arrive

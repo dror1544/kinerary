@@ -64,7 +64,10 @@ const post = (app: App, url: string, payload: unknown, headers: Record<string, s
   method: "POST", url, payload: JSON.stringify(payload), headers: { "content-type": "application/json", origin: ORIGIN, ...headers },
 });
 const signUp = (app: App, email: string, extra: Record<string, unknown> = {}) =>
-  post(app, "/v1/auth/sign-up", { email, password: PASSWORD, displayName: "Dana Organizer", ...extra });
+  post(app, "/v1/auth/sign-up", { email, displayName: "Dana Organizer", ...extra });
+/** The page the emailed link opens sends the token together with the password the person chose there. */
+const verify = (app: App, token: unknown, password: unknown = PASSWORD, headers: Record<string, string> = {}) =>
+  post(app, "/v1/auth/verify-email", { token, password }, headers);
 const tokenIn = (message: MailMessage | undefined, prefix: "ev" | "pr") => {
   assert.ok(message, "a message was sent");
   const found = message.text.match(new RegExp(`#token=(${prefix}_[A-Za-z0-9_-]{43})`));
@@ -86,13 +89,13 @@ const me = (app: App, cookie: string) => app.inject({ method: "GET", url: "/v1/m
 const userCount = async (email: string) =>
   (await pool.query("SELECT count(*)::int AS n FROM control_plane.user_identities WHERE provider = 'password' AND provider_subject_digest = $1", [digestEmail(email)])).rows[0].n as number;
 const tokenRows = async (email: string) =>
-  (await pool.query("SELECT purpose, consumed_at, password_hash FROM control_plane.email_action_tokens WHERE email_digest = $1 ORDER BY created_at", [digestEmail(email)])).rows;
+  (await pool.query("SELECT purpose, consumed_at FROM control_plane.email_action_tokens WHERE email_digest = $1 ORDER BY created_at", [digestEmail(email)])).rows;
 
-/** Sign up and verify; returns the signed-in session. */
-async function newAccount(h: Harness, email: string, extra: Record<string, unknown> = {}) {
+/** Sign up and verify (choosing `password` on the verify page); returns the signed-in session. */
+async function newAccount(h: Harness, email: string, extra: Record<string, unknown> = {}, password = PASSWORD) {
   assert.equal((await signUp(h.app, email, extra)).statusCode, 202);
   await portalMailIdle();
-  const verified = await post(h.app, "/v1/auth/verify-email", { token: tokenIn(lastTo(h.mailer, email), "ev") });
+  const verified = await verify(h.app, tokenIn(lastTo(h.mailer, email), "ev"), password);
   assert.equal(verified.statusCode, 200, verified.body);
   return { session: cookiesOf(verified)!, response: verified };
 }
@@ -127,15 +130,19 @@ test("sign-up creates NO account until the emailed link is used; then it signs t
     assert.match(mail.html, /<a href="http:\/\/portal\.example\.test\/verify-email#token=ev_/);
     const token = tokenIn(mail, "ev");
 
-    // Only the digest of the token is stored, and the password only as a hash.
-    const stored = await pool.query("SELECT token_digest, password_hash, display_name, return_to FROM control_plane.email_action_tokens WHERE email_digest = $1", [digestEmail(email)]);
+    // Only the digest of the token is stored; there is no password in the row at all.
+    const stored = await pool.query("SELECT * FROM control_plane.email_action_tokens WHERE email_digest = $1", [digestEmail(email)]);
     assert.equal(stored.rowCount, 1);
     assert.equal(stored.rows[0].token_digest, sha256(token));
-    assert.match(stored.rows[0].password_hash, /^scrypt:/);
-    assert.doesNotMatch(JSON.stringify(stored.rows), new RegExp(`${token}|${PASSWORD}`));
+    assert.equal("password_hash" in stored.rows[0], false, "the table has no password column");
+    assert.doesNotMatch(JSON.stringify(stored.rows), new RegExp(`${token}|${PASSWORD}|scrypt`));
     assert.equal(stored.rows[0].return_to, "/trips/new");
+    assert.match(mail.subject, /^Finish creating your Kinerary account/);
+    assert.match(mail.text, /Choose your password to finish/);
 
-    const verified = await post(h.app, "/v1/auth/verify-email", { token });
+    // Opening the page spends nothing; only a request that carries the password does (page tests cover the UI).
+    assert.equal((await tokenRows(email))[0].consumed_at, null);
+    const verified = await verify(h.app, token);
     assert.equal(verified.statusCode, 200, verified.body);
     assert.deepEqual(verified.json(), { appPath: "/trips/new" });
     assert.equal(verified.headers["cache-control"], "private, no-store");
@@ -147,8 +154,8 @@ test("sign-up creates NO account until the emailed link is used; then it signs t
 
     assert.equal(await userCount(email), 1);
     const afterRows = await tokenRows(email);
-    assert.ok(afterRows[0].consumed_at && afterRows[0].password_hash === null, "the token is spent and the hash is gone from the row");
-    // And the password chosen at sign-up is the one that signs in from now on.
+    assert.ok(afterRows[0].consumed_at, "the token is spent");
+    // And the password chosen at verification is the one that signs in from now on.
     assert.equal((await signIn(h.app, email, PASSWORD)).statusCode, 200);
     assert.equal((await signIn(h.app, email, "not the password")).statusCode, 401);
   } finally { await h.app.close(); }
@@ -160,7 +167,7 @@ test("the same answer for a new address and one that already has an account; the
     const email = addr("dupe");
     await newAccount(h, email);
     h.mailer.outbox.length = 0;
-    const again = await signUp(h.app, email, { password: "a different password" });
+    const again = await signUp(h.app, email);
     const fresh = await signUp(h.app, addr("brandnew"));
     assert.equal(again.statusCode, 202);
     assert.equal(again.statusCode, fresh.statusCode);
@@ -175,7 +182,6 @@ test("the same answer for a new address and one that already has an account; the
     assert.doesNotMatch(notice.text, /#token=/, "the notice carries no token");
     assert.equal(await userCount(email), 1, "no second account");
     assert.equal((await signIn(h.app, email, PASSWORD)).statusCode, 200, "their password is untouched");
-    assert.equal((await signIn(h.app, email, "a different password")).statusCode, 401);
     assert.equal((await tokenRows(email)).filter((r) => r.purpose === "sign_up").length, 1, "the duplicate left no verifiable token");
   } finally { await h.app.close(); }
 });
@@ -190,19 +196,19 @@ test("a reused, expired, superseded, malformed or unknown token is refused with 
     await signUp(h.app, email); await portalMailIdle();
     const second = tokenIn(lastTo(h.mailer, email), "ev");
     assert.notEqual(first, second);
-    const superseded = await post(h.app, "/v1/auth/verify-email", { token: first });
+    const superseded = await verify(h.app, first);
     assert.equal(superseded.statusCode, 400);
     assert.deepEqual(superseded.json(), { error: "TOKEN_INVALID" });
 
     // Expired.
     await pool.query("UPDATE control_plane.email_action_tokens SET expires_at = now() - interval '1 second' WHERE token_digest = $1", [sha256(second)]);
-    const expired = await post(h.app, "/v1/auth/verify-email", { token: second });
+    const expired = await verify(h.app, second);
     assert.deepEqual([expired.statusCode, expired.body], [superseded.statusCode, superseded.body], "expired looks like superseded");
     assert.equal(await userCount(email), 0);
 
     // Unknown, malformed and wrong-purpose tokens are the same answer.
     for (const token of [`ev_${randomBytes(32).toString("base64url")}`, "garbage", "", 42, null, `pr_${randomBytes(32).toString("base64url")}`]) {
-      const refused = await post(h.app, "/v1/auth/verify-email", { token });
+      const refused = await verify(h.app, token);
       assert.deepEqual([refused.statusCode, refused.body], [400, superseded.body], String(token));
     }
 
@@ -210,25 +216,72 @@ test("a reused, expired, superseded, malformed or unknown token is refused with 
     const e2 = addr("reuse");
     await signUp(h.app, e2); await portalMailIdle();
     const token = tokenIn(lastTo(h.mailer, e2), "ev");
-    assert.equal((await post(h.app, "/v1/auth/verify-email", { token })).statusCode, 200);
-    const reused = await post(h.app, "/v1/auth/verify-email", { token });
+    assert.equal((await verify(h.app, token)).statusCode, 200);
+    const reused = await verify(h.app, token);
     assert.deepEqual([reused.statusCode, reused.body], [400, superseded.body]);
     // A sign-up token cannot be used as a reset token.
     assert.equal((await post(h.app, "/v1/auth/password/reset", { token, password: PASSWORD })).statusCode, 400);
   } finally { await h.app.close(); }
 });
 
-test("sign-up validates input the same way whatever the address: short password, bad email, oversized fields", { skip }, async () => {
+test("sign-up validates the address and name the same way whatever the address, and takes no password", { skip }, async () => {
   const h = harness();
   try {
-    assert.deepEqual((await signUp(h.app, addr("short"), { password: "1234567" })).json(), { error: "PASSWORD_TOO_SHORT" });
-    assert.equal((await signUp(h.app, addr("eight"), { password: "12345678" })).statusCode, 202, "8 characters is the minimum, as at login");
-    assert.equal((await post(h.app, "/v1/auth/sign-up", { email: "not-an-email", password: PASSWORD })).statusCode, 400);
-    assert.equal((await post(h.app, "/v1/auth/sign-up", { email: addr("x"), password: "p".repeat(1025) })).statusCode, 400);
-    assert.equal((await post(h.app, "/v1/auth/sign-up", { email: addr("x"), password: PASSWORD, displayName: "n".repeat(121) })).statusCode, 400);
+    assert.equal((await post(h.app, "/v1/auth/sign-up", { email: "not-an-email" })).statusCode, 400);
+    assert.equal((await post(h.app, "/v1/auth/sign-up", { email: addr("x"), displayName: "n".repeat(121) })).statusCode, 400);
     assert.equal((await post(h.app, "/v1/auth/sign-up", [])).statusCode, 400);
+    // No password is asked for, and a client that still sends one gets nothing stored and no say in the account.
+    const sneaky = addr("sneaky");
+    assert.equal((await post(h.app, "/v1/auth/sign-up", { email: sneaky, password: "attacker chosen pw" })).statusCode, 202);
     await portalMailIdle();
     assert.equal(h.mailer.outbox.length, 1, "only the valid request sent anything");
+    const row = (await pool.query("SELECT * FROM control_plane.email_action_tokens WHERE email_digest = $1", [digestEmail(sneaky)])).rows[0];
+    assert.doesNotMatch(JSON.stringify(row), /attacker chosen pw|scrypt/);
+    const verified = await verify(h.app, tokenIn(lastTo(h.mailer, sneaky), "ev"), "the owner chose this");
+    assert.equal((await me(h.app, cookiesOf(verified)!.cookie)).statusCode, 200);
+    assert.equal((await signIn(h.app, sneaky, "the owner chose this")).statusCode, 200);
+    assert.equal((await signIn(h.app, sneaky, "attacker chosen pw")).statusCode, 401);
+  } finally { await h.app.close(); }
+});
+
+test("PRE-HIJACK: whoever starts a sign-up for an address never knows a password for it; the owner who clicks the link chooses their own", { skip }, async () => {
+  const h = harness();
+  try {
+    const victim = addr("hijack");
+    // The attacker asks for an account on the victim's address. Nothing they can send carries a password.
+    assert.equal((await post(h.app, "/v1/auth/sign-up", { email: victim, displayName: "Not the owner", password: "attacker password!" })).statusCode, 202);
+    await portalMailIdle();
+    const token = tokenIn(lastTo(h.mailer, victim), "ev");   // goes to the VICTIM's mailbox, not the attacker
+    assert.equal((await signIn(h.app, victim, "attacker password!")).statusCode, 401, "nothing to sign in to yet");
+    // The owner opens the link and chooses a password of their own.
+    const verified = await verify(h.app, token, "the owner's own passphrase");
+    assert.equal(verified.statusCode, 200, verified.body);
+    // The attacker cannot sign in with anything they chose or guessed from the sign-up.
+    for (const guess of ["attacker password!", PASSWORD, "password", "12345678"]) {
+      assert.equal((await signIn(h.app, victim, guess)).statusCode, 401, guess);
+    }
+    assert.equal((await signIn(h.app, victim, "the owner's own passphrase")).statusCode, 200);
+  } finally { await h.app.close(); }
+});
+
+test("the password is validated BEFORE the token is touched: a too-short or missing one does not burn the link", { skip }, async () => {
+  const h = harness();
+  try {
+    const email = addr("pwfirst");
+    await signUp(h.app, email); await portalMailIdle();
+    const token = tokenIn(lastTo(h.mailer, email), "ev");
+    for (const bad of ["1234567", "", "p".repeat(1025)]) {
+      const refused = await verify(h.app, token, bad);
+      assert.equal(refused.statusCode, 400, bad.slice(0, 8));
+      assert.equal(cookiesOf(refused), undefined);
+    }
+    assert.deepEqual((await verify(h.app, token, "1234567")).json(), { error: "PASSWORD_TOO_SHORT" });
+    assert.equal((await post(h.app, "/v1/auth/verify-email", { token })).statusCode, 400, "no password at all");
+    assert.equal((await post(h.app, "/v1/auth/verify-email", { token, password: 12345678 })).statusCode, 400, "not a string");
+    assert.equal((await tokenRows(email))[0].consumed_at, null, "still unspent after every refusal");
+    assert.equal(await userCount(email), 0);
+    assert.equal((await verify(h.app, token, "12345678")).statusCode, 200, "8 characters is the minimum, as at login, and the same link then works");
+    assert.equal((await signIn(h.app, email, "12345678")).statusCode, 200);
   } finally { await h.app.close(); }
 });
 
@@ -237,7 +290,7 @@ test("emails go out in Hebrew when asked (body or Accept-Language), as plain tex
   try {
     const he = addr("he"), accept = addr("accept"), en = addr("en");
     await signUp(h.app, he, { language: "he" });
-    await post(h.app, "/v1/auth/sign-up", { email: accept, password: PASSWORD }, { "accept-language": "he-IL,he;q=0.9,en;q=0.8" });
+    await post(h.app, "/v1/auth/sign-up", { email: accept }, { "accept-language": "he-IL,he;q=0.9,en;q=0.8" });
     await signUp(h.app, en);
     await portalMailIdle();
     const hebrew = lastTo(h.mailer, he)!;
@@ -246,7 +299,7 @@ test("emails go out in Hebrew when asked (body or Accept-Language), as plain tex
     assert.match(hebrew.text, /#token=ev_/);
     assert.match(lastTo(h.mailer, accept)!.subject, /[֐-׿]/);
     const english = lastTo(h.mailer, en)!;
-    assert.match(english.subject, /^Confirm your email/);
+    assert.match(english.subject, /^Finish creating your Kinerary/);
     assert.match(english.html, /<html lang="en" dir="ltr">/);
     assert.match(english.html, /<a href=/);
   } finally { await h.app.close(); }
@@ -361,7 +414,7 @@ test("a stale unverified sign-up does not block an invitation, and verifying it 
   const h = harness();
   try {
     const email = addr("race");
-    await signUp(h.app, email, { password: "the signup password" }); await portalMailIdle();
+    await signUp(h.app, email); await portalMailIdle();
     const token = tokenIn(lastTo(h.mailer, email), "ev");
 
     // The operator invites the same address: the account is minted exactly as always.
@@ -375,13 +428,13 @@ test("a stale unverified sign-up does not block an invitation, and verifying it 
     } finally { client.release(); }
     const before = (await pool.query("SELECT password_hash FROM control_plane.password_credentials WHERE user_id = $1", [userId])).rows[0].password_hash;
 
-    const verify = await post(h.app, "/v1/auth/verify-email", { token });
-    assert.deepEqual([verify.statusCode, verify.json()], [409, { error: "ACCOUNT_EXISTS" }]);
-    assert.equal(cookiesOf(verify), undefined, "no session");
+    const attempt = await verify(h.app, token, "the typed password");
+    assert.deepEqual([attempt.statusCode, attempt.json()], [409, { error: "ACCOUNT_EXISTS" }]);
+    assert.equal(cookiesOf(attempt), undefined, "no session");
     assert.equal((await pool.query("SELECT password_hash FROM control_plane.password_credentials WHERE user_id = $1", [userId])).rows[0].password_hash, before, "the invited credential is untouched");
-    assert.equal((await signIn(h.app, email, "the signup password")).statusCode, 401, "the pending password never became a login");
+    assert.equal((await signIn(h.app, email, "the typed password")).statusCode, 401, "the password typed on the stale link never became a login");
     assert.equal(await userCount(email), 1);
-    assert.equal((await post(h.app, "/v1/auth/verify-email", { token })).statusCode, 400, "and the spent token is spent");
+    assert.equal((await verify(h.app, token)).statusCode, 400, "and the spent token is spent");
   } finally { await h.app.close(); }
 });
 
@@ -401,8 +454,8 @@ test("Google sign-in for the same verified address works with a pending sign-up,
     const session = cookiesOf(callback)!;
     assert.equal((await me(h.app, session.cookie)).statusCode, 200);
     // The pending sign-up now finds an account: the link is refused and does not replace Google's credential.
-    const verify = await post(h.app, "/v1/auth/verify-email", { token: tokenIn(lastTo(h.mailer, pending), "ev") });
-    assert.equal(verify.statusCode, 409);
+    const attempt = await verify(h.app, tokenIn(lastTo(h.mailer, pending), "ev"));
+    assert.equal(attempt.statusCode, 409);
 
     // The other order: sign up and verify, then Google for that address attaches to the same user.
     const verified = addr("gverified");
@@ -438,11 +491,11 @@ test("sign-up and forgot are limited per address and per IP, and the answer for 
   try {
     let refused = 0;
     for (let i = 0; i < 25; i++) {
-      const response = await post(ip.app, "/v1/auth/sign-up", { email: addr("ip"), password: PASSWORD });
+      const response = await post(ip.app, "/v1/auth/sign-up", { email: addr("ip") });
       if (response.statusCode === 429) refused++; else assert.equal(response.statusCode, 202);
     }
     assert.equal(refused, 5, "20 per minute per IP, and a forwarded header does not buy another allowance");
-    assert.equal((await post(ip.app, "/v1/auth/sign-up", { email: addr("ip"), password: PASSWORD }, { "x-forwarded-for": "198.51.100.77" })).statusCode, 429);
+    assert.equal((await post(ip.app, "/v1/auth/sign-up", { email: addr("ip") }, { "x-forwarded-for": "198.51.100.77" })).statusCode, 429);
     // The IP budget is spent before any password is hashed or any mail sent.
     await portalMailIdle();
     assert.equal(ip.mailer.outbox.length, 20);
@@ -450,8 +503,8 @@ test("sign-up and forgot are limited per address and per IP, and the answer for 
 
   const tokens = harness();
   try {
-    for (let i = 0; i < 30; i++) assert.equal((await post(tokens.app, "/v1/auth/verify-email", { token: "nope" })).statusCode, 400);
-    assert.equal((await post(tokens.app, "/v1/auth/verify-email", { token: "nope" })).statusCode, 429);
+    for (let i = 0; i < 30; i++) assert.equal((await verify(tokens.app, "nope")).statusCode, 400);
+    assert.equal((await verify(tokens.app, "nope")).statusCode, 429);
     assert.equal((await post(tokens.app, "/v1/auth/password/reset", { token: "nope", password: PASSWORD })).statusCode, 429, "verify and reset share one IP budget");
   } finally { await tokens.app.close(); }
 });
@@ -486,8 +539,8 @@ test("every email route needs our own Origin: missing, foreign and \"null\" are 
   try {
     const email = addr("origin");
     const bodies: Record<string, unknown> = {
-      "/v1/auth/sign-up": { email, password: PASSWORD },
-      "/v1/auth/verify-email": { token: "x" },
+      "/v1/auth/sign-up": { email },
+      "/v1/auth/verify-email": { token: "x", password: PASSWORD },
       "/v1/auth/password/forgot": { email },
       "/v1/auth/password/reset": { token: "x", password: PASSWORD },
     };
@@ -521,7 +574,7 @@ test("with email unconfigured, sign-up and forgot answer 503 SIGN_UP_UNAVAILABLE
     await portalMailIdle();
     assert.deepEqual(await tokenRows(email), [], "no token was created for a message that cannot be sent");
     // Tokens already in people's inboxes keep working: only sending is off.
-    assert.equal((await post(h.app, "/v1/auth/verify-email", { token: "nope" })).statusCode, 400);
+    assert.equal((await verify(h.app, "nope")).statusCode, 400);
   } finally { await h.app.close(); }
   const on = harness();
   try { assert.equal((await on.app.inject({ url: "/v1/auth/capabilities" })).json().emailSignUp, true); } finally { await on.app.close(); }
@@ -554,7 +607,7 @@ test("no token, password, password hash, API key or address reaches a log line, 
     secrets.push(victim);
     assert.equal((await signUp(bad.app, victim)).statusCode, 202);
     await portalMailIdle();
-    secrets.push((await pool.query("SELECT password_hash FROM control_plane.email_action_tokens WHERE email_digest = $1", [digestEmail(victim)])).rows[0].password_hash);
+    secrets.push((await pool.query("SELECT password_hash FROM control_plane.password_credentials WHERE email_digest = $1", [digestEmail(email)])).rows[0].password_hash);
   } finally {
     (process.stderr as { write: unknown }).write = realErr; (process.stdout as { write: unknown }).write = realOut;
     await ok.app.close(); await bad.app.close();

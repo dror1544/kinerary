@@ -104,6 +104,10 @@ services:
       RUNTIME_EXCHANGE_KEY: ${RUNTIME_EXCHANGE_KEY:-}
       GOOGLE_WEB_CLIENT_ID: ${GOOGLE_WEB_CLIENT_ID:-}
       GOOGLE_WEB_CLIENT_SECRET: ${GOOGLE_WEB_CLIENT_SECRET:-}
+      # The email provider's API key for the portal's own sign-up and password reset
+      # (profile `web.email_api_key_secret_ref: env://PORTAL_EMAIL_API_KEY`). Optional:
+      # with no email block in the profile it is inert, and the sign-up routes answer 503.
+      PORTAL_EMAIL_API_KEY: ${PORTAL_EMAIL_API_KEY:-}
     # telegram_creds and trip_bot_creds are one file on purpose (see the secrets
     # block): identical refs are how the api stands its approval poller down in
     # favour of the relay's single getUpdates loop.

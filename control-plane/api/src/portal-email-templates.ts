@@ -22,9 +22,9 @@ function copy(mail: PortalMail, language: MailLanguage): Copy {
   if (language === "he") {
     switch (mail.kind) {
       case "verify": return {
-        subject: "אימות הכתובת שלך ב-Kinerary",
-        lines: [`שלום ${mail.displayName},`, `כדי לסיים את יצירת החשבון, אשרו את כתובת האימייל. הקישור תקף ל-${mail.ttlHours} שעות ופועל פעם אחת בלבד.`],
-        action: { label: "אישור הכתובת", url: mail.link },
+        subject: "סיום יצירת החשבון ב-Kinerary",
+        lines: [`שלום ${mail.displayName},`, `כדי לסיים את יצירת החשבון, בחרו סיסמה. הקישור יאשר גם את כתובת האימייל, תקף ל-${mail.ttlHours} שעות ופועל פעם אחת בלבד.`],
+        action: { label: "בחירת סיסמה לסיום", url: mail.link },
         footer: "אם לא ביקשתם ליצור חשבון ב-Kinerary, אפשר להתעלם מהמכתב הזה. לא ייווצר חשבון.",
       };
       case "reset": return {
@@ -46,9 +46,9 @@ function copy(mail: PortalMail, language: MailLanguage): Copy {
   }
   switch (mail.kind) {
     case "verify": return {
-      subject: "Confirm your email address for Kinerary",
-      lines: [`Hi ${mail.displayName},`, `To finish creating your account, confirm your email address. The link works once and is valid for ${mail.ttlHours} hours.`],
-      action: { label: "Confirm my email", url: mail.link },
+      subject: "Finish creating your Kinerary account",
+      lines: [`Hi ${mail.displayName},`, `Choose your password to finish creating your account. The link also confirms your email address; it works once and is valid for ${mail.ttlHours} hours.`],
+      action: { label: "Choose your password to finish", url: mail.link },
       footer: "If you didn't ask for a Kinerary account, you can ignore this message. No account will be created.",
     };
     case "reset": return {
