@@ -430,8 +430,12 @@ test("the real portal server boots without Google credentials and advertises ema
     const response = await fetch(`http://127.0.0.1:${port}/v1/auth/capabilities`);
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), { google: false, emailPassword: true, emailSignUp: false, telegramMiniApp: false });
-    const google = await fetch(`http://127.0.0.1:${port}/v1/auth/google/start`);
+    const google = await fetch(`http://127.0.0.1:${port}/v1/auth/google`, {
+      method: "POST", headers: { "content-type": "application/json", origin: `http://127.0.0.1:${port}` }, body: JSON.stringify({ credential: "x" }),
+    });
     assert.equal(google.status, 503);
+    // Unset is a downgrade, not an error, so the boot log says so.
+    assert.match(server.stderr(), /"event":"google_sign_in.disabled"/);
     // No web.telegram_bot_token_secret_ref: the Mini App feature is off and the
     // boot log says why (a downgrade nobody can see in the conversation).
     assert.match(server.stderr(), /"event":"mini_app.disabled"/);

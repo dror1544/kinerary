@@ -16,7 +16,9 @@ Dynamic public and organizer-facing web application for Kinerary.
 Authentication uses the control-plane portal. Existing organizers can sign in
 with their email and account password through `/v1/auth/email-password`.
 `/v1/auth/capabilities` reports which providers are configured; Google sign-in
-is offered only when its client ID and secret are both configured. Trip members
+(Google Identity Services, sign-up and sign-in in one, `POST /v1/auth/google`) is
+offered only when the profile's `web.google_client_id` is set, and the page draws
+Google's button from the client ID that route hands it. Trip members
 can still use the separate `/v1/auth/password` trip-username login. These routes
 issue the real session cookie, and mutations require its CSRF token.
 
@@ -53,8 +55,9 @@ The development server uses `http://127.0.0.1:4175`; preview uses port 4176.
 Both proxy `/v1` to `KINERARY_API_ORIGIN` (default `http://127.0.0.1:4310`).
 Run the real control-plane API separately. Its architecture profile must enable
 `web` and set `web.public_origin` to the browser origin, because sign-in and
-mutations validate Origin. Set the two Google secret references together when
-using Google; omit both for existing organizer email/password review. A static
+mutations validate Origin. Set `web.google_client_id` (a public OAuth client ID of
+type Web application, with this dev origin under its Authorized JavaScript origins)
+when using Google; omit it for existing organizer email/password review. A static
 production host must route `/v1` to the API itself; Vite's proxy is for local
 review. Do not change a stack serving another active test just to review this UI.
 

@@ -13,7 +13,7 @@ import { runPendingPlanReviews } from "./plan-review-store.js";
 import { structuredLog } from "./redaction.js";
 import { resolveSecretRef } from "./secrets.js";
 import { deleteWebhookIfPresent, startTelegramApprovalPoller } from "./telegram-poller.js";
-import { GoogleOidcClient, HttpRuntimeAccountAdapter, type PortalDependencies } from "./portal.js";
+import { GoogleIdTokenClient, HttpRuntimeAccountAdapter, type PortalDependencies } from "./portal.js";
 import { LogMailer, ResendMailer, type Mailer } from "./mailer.js";
 import { checkBotIdentity } from "./telegram-mini-app.js";
 import { createBotCheckRound, createMiniAppStatus, withMiniAppReadiness } from "./mini-app-status.js";
@@ -128,10 +128,11 @@ const miniAppStatus = createMiniAppStatus();
 let portal: PortalDependencies | undefined;
 if (profile.web) {
   const runtimeExchangeKey = await resolveSecretRef(profile.web.runtime_exchange_key_secret_ref);
-  const google = profile.web.google_client_id_secret_ref && profile.web.google_client_secret_ref
-    ? new GoogleOidcClient(await resolveSecretRef(profile.web.google_client_id_secret_ref), await resolveSecretRef(profile.web.google_client_secret_ref), `${profile.web.public_origin}/v1/auth/google/callback`)
-    : undefined;
+  // The client ID is public (the page needs it to draw Google's button), so it is a plain profile string. Unset
+  // turns Google sign-in off, and capabilities says so; say it once here for whoever reads the boot log.
+  const google = profile.web.google_client_id ? new GoogleIdTokenClient(profile.web.google_client_id) : undefined;
   const miniAppLog = (line: string) => process.stderr.write(`${line}\n`);
+  if (!google) miniAppLog(structuredLog("warn", "google_sign_in.disabled", { reason: "web.google_client_id is not set" }));
   let telegramMiniApp: PortalDependencies["telegramMiniApp"];
   if (!profile.web.telegram_bot_token_secret_ref) {
     // UNSET IS A DOWNGRADE, NOT AN ERROR — so say it once, here, where a person

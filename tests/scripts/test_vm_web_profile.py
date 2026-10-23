@@ -539,10 +539,25 @@ class ConfigurationIsCheckedBeforeTheSwitch(unittest.TestCase):
         # A file reference to a secret the api already mounts is fine.
         self.assertEqual(vr.web_config_problems(self.GOOD_ENV, self.profile(telegram_bot_token_secret_ref="file:///run/secrets/telegram_creds")), [])
 
-    def test_google_is_a_pair_the_api_is_given_only_if_set(self):
-        both = self.profile(google_client_id_secret_ref="env://GOOGLE_WEB_CLIENT_ID", google_client_secret_ref="env://GOOGLE_WEB_CLIENT_SECRET")
-        self.assertEqual(len(vr.web_config_problems(self.GOOD_ENV, both)), 2)
-        self.assertEqual(vr.web_config_problems({**self.GOOD_ENV, "GOOGLE_WEB_CLIENT_ID": "i", "GOOGLE_WEB_CLIENT_SECRET": "s"}, both), [])
+    def test_google_is_one_public_client_id_in_the_profile_and_the_old_pair_is_a_refused_plan(self):
+        # The ID-token flow: a plain string, no env variable, no secret. Set or left out, there is nothing to report.
+        self.assertEqual(vr.web_config_problems(self.GOOD_ENV, self.profile(google_client_id="123456789012-abc.apps.googleusercontent.com")), [])
+        self.assertEqual(vr.web_config_problems(self.GOOD_ENV, self.profile()), [])
+        # Not a client ID: refused here, before the api's own config loader would refuse it at boot.
+        for bad in ("env://GOOGLE_WEB_CLIENT_ID", "123-abc", "123.apps.googleusercontent.com.evil.test", ""):
+            problems = vr.web_config_problems(self.GOOD_ENV, self.profile(google_client_id=bad))
+            self.assertEqual(len(problems), 1, bad)
+            self.assertIn("web.google_client_id is not an OAuth client ID", problems[0])
+        # The retired secret-ref pair is named, once each, with the field that replaces it - whether or not vm.env still has the variables.
+        old = self.profile(google_client_id_secret_ref="env://GOOGLE_WEB_CLIENT_ID", google_client_secret_ref="env://GOOGLE_WEB_CLIENT_SECRET")
+        for env in (self.GOOD_ENV, {**self.GOOD_ENV, "GOOGLE_WEB_CLIENT_ID": "i", "GOOGLE_WEB_CLIENT_SECRET": "s"}):
+            problems = vr.web_config_problems(env, old)
+            self.assertEqual(len(problems), 2)
+            self.assertTrue(all("no longer supported" in p and "web.google_client_id" in p for p in problems), problems)
+        # compose.vm.yml and vm.env.example no longer hand the api (or list) the variables that pair used.
+        self.assertNotIn("GOOGLE_WEB_CLIENT", COMPOSE.read_text())
+        self.assertNotIn("GOOGLE_WEB_CLIENT", (ROOT / "control-plane" / "deployment" / "vm.env.example").read_text())
+        self.assertNotIn("GOOGLE_WEB_CLIENT", " ".join(vr.WEB_API_ENV))
 
     def test_the_email_api_key_is_a_variable_the_api_is_given(self):
         email = self.profile(email_provider="resend", email_api_key_secret_ref="env://PORTAL_EMAIL_API_KEY", email_from="noreply@mail.example.test")

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -7,7 +7,7 @@ import { App } from "./App";
 function renderRoute(route: string, authenticated = false) {
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
-    if (url === "/v1/auth/capabilities") return new Response(JSON.stringify({ google: true, emailPassword: true }));
+    if (url === "/v1/auth/capabilities") return new Response(JSON.stringify({ google: true, googleClientId: "123456789012-fixture.apps.googleusercontent.com", emailPassword: true }));
     if (url === "/v1/me") return new Response(authenticated ? JSON.stringify({ id: "user_test", displayName: "Test Organizer" }) : JSON.stringify({ error: "AUTHENTICATION_REQUIRED" }), { status: authenticated ? 200 : 401, headers: { "content-type": "application/json" } });
     if (url === "/v1/trips") return new Response(JSON.stringify({ trips: [] }), { status: 200, headers: { "content-type": "application/json" } });
     return new Response(JSON.stringify({ error: "NOT_FOUND" }), { status: 404, headers: { "content-type": "application/json" } });
@@ -68,9 +68,13 @@ describe("Kinerary SPA routes", () => {
   });
 
   it("renders the sign-in route directly", async () => {
+    // Google draws its own button (components/GoogleSignInButton.test.tsx covers it); here the page only has to ask.
+    const renderButton = vi.fn();
+    window.google = { accounts: { id: { initialize: vi.fn(), renderButton } } };
     renderRoute("/sign-in");
     expect(await screen.findByRole("heading", { name: /sign in to continue/i })).toBeInTheDocument();
-    expect(await screen.findByRole("button", { name: /continue with google/i })).toBeInTheDocument();
+    await waitFor(() => expect(renderButton).toHaveBeenCalledTimes(1));
+    delete window.google;
   });
 
   it("renders the authenticated trip dashboard", async () => {

@@ -825,7 +825,6 @@ the trips that should be reachable are built, or install it on the existing ones
 | `RUNTIME_COOKIE_SECRET` | the gateway's cookie-sealing secret: at least 32 random bytes, independent of every other secret |
 | `WEB_BIND_IP`, `PORTAL_PORT`, `RUNTIME_GATEWAY_PORT` | where the ingress reaches the two services. Loopback (`127.0.0.1`), `4173` and `4320` unless set — the same posture as `CONTROL_PLANE_BIND_IP` for the api |
 | `RUNTIME_PUBLIC_SUFFIXES`, `RUNTIME_SAME_SITE_OK`, `RUNTIME_UPSTREAM_TIMEOUT_MS` | gateway tuning, usually unset (see "Same site" below) |
-| `GOOGLE_WEB_CLIENT_ID`, `GOOGLE_WEB_CLIENT_SECRET` | optional pair, only if the profile's `web` block names them |
 
 These are plain `vm.env` variables like `CONTROL_PLANE_OPERATOR_KEY`, not files
 under `.local-secrets/`: the api and the gateway each read their secret from the
@@ -849,14 +848,51 @@ drifting. Notes on what you are filling in:
   gateway fetches those hostnames from inside its container, so they must resolve
   and answer from the VM.
 - Secret references in the `web` block: `env://RUNTIME_EXCHANGE_KEY` and
-  (optionally) `env://GOOGLE_WEB_CLIENT_ID` / `env://GOOGLE_WEB_CLIENT_SECRET` are the
+  (optionally) `env://PORTAL_EMAIL_API_KEY` are the
   only `env://` names the api container is given. A bot token for the Mini App is
   `file:///run/secrets/telegram_creds` (already mounted; it is the one bot's token).
   `kinerary-cp-release plan` and `upgrade` refuse a profile that names any other
   `env://` variable, or one that is unset, before anything is switched.
-- Google: add `google_client_id_secret_ref` and `google_client_secret_ref` **together**
-  (the schema requires both) and set the two variables; the redirect URI to register
-  is `<PORTAL_ORIGIN>/v1/auth/google/callback`. Left out, sign-in is email and password.
+- **Sign in with Google** (`web.google_client_id`; owner decision 2026-10-23). The portal
+  uses Google Identity Services: the page draws Google's button from a **public** OAuth
+  client ID, Google hands back a signed ID token, and `POST /v1/auth/google` verifies it
+  (signature, expiry, issuer, and the audience, which must be this client ID). There is
+  **no client secret, no env variable and no redirect URI**. It covers the portal only
+  (creating trips); trip sites have their own sign-in and are untouched. Steps, once:
+  1. In the Google Cloud console, *APIs & Services*, *Credentials*, *Create credentials*,
+     *OAuth client ID*, application type **Web application**. (If the project has no
+     consent screen yet, create it; the default `openid`, `email` and `profile` scopes
+     are all this needs, and publishing status must be *In production* or only listed
+     test users can sign in.)
+  2. Under **Authorized JavaScript origins** add the portal origin exactly as it is in
+     the profile's `web.public_origin`: scheme and host (and port, if any), no path, no
+     trailing slash, e.g. `https://<PORTAL_ORIGIN host>`. Add every other origin the
+     portal is served from (a staging host, `http://localhost:<port>` for local review).
+     Leave **Authorized redirect URIs** empty: nothing redirects.
+  3. Copy the **Client ID** (it ends in `.apps.googleusercontent.com`) into the profile:
+     `"google_client_id": "<id>.apps.googleusercontent.com"`. It is not a secret and is
+     served to every visitor by `GET /v1/auth/capabilities`, so it is a plain string in
+     the profile, not an `env://` reference and not in `vm.env`.
+  4. Roll the api (`kinerary-cp-release upgrade`). Check it: `GET /v1/auth/capabilities`
+     answers `"google": true` and `"googleClientId": "…"`. Left out, Google sign-in is
+     **off**, the api logs `google_sign_in.disabled` at boot, and sign-in is email and
+     password.
+
+  What it does: sign-up and sign-in in one. A Google account whose address Google has
+  verified (`email_verified` is exactly `true`) either creates a new organizer account for
+  that address or, for an address that already has one (password, invitation or email
+  sign-up), attaches the Google identity to it: one address is one user. Every failure
+  (garbage, bad signature, wrong audience or issuer, expired, unverified address) is the
+  same `401 GOOGLE_SIGN_IN_FAILED`; the api logs `google_sign_in.refused` with a reason
+  code only, never the token or the address. The button is not drawn inside the Telegram
+  Mini App, because Google's popup cannot open there.
+  The previous profile fields `google_client_id_secret_ref` and `google_client_secret_ref`
+  are **refused** (the api will not boot with them, and `kinerary-cp-release plan` says
+  so first), with a message naming `web.google_client_id`; remove both when you add it.
+  The portal's nginx lets `accounts.google.com` scripts, frames and connections through
+  on the `/sign-in` and `/sign-up` documents only (`web/nginx.conf`,
+  `@google_sign_in_shell`); every other page's policy does not mention Google, and the
+  `/mini-app` framing policy is unchanged.
 - **Email for the portal's own sign-up and password reset** (`web.email_provider`,
   `web.email_api_key_secret_ref`, `web.email_from`). `email_provider` is `"resend"`
   (POST `https://api.resend.com/emails` with the key as a bearer token; the key

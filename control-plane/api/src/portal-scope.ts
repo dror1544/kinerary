@@ -84,8 +84,8 @@ export const PORTAL_SCOPE_POLICY: Readonly<Record<string, RouteScope>> = Object.
   "POST /v1/auth/password/forgot": "open",
   "POST /v1/auth/password/reset": "open",
   "POST /v1/auth/telegram-mini-app": "open",
-  "GET /v1/auth/google/start": "open",
-  "GET /v1/auth/google/callback": "open",
+  // Sign in with Google (ID token). Never reads the session cookie: the signed token is the whole authority.
+  "POST /v1/auth/google": "open",
   "POST /v1/auth/password": "open",
   "POST /v1/site-invites/inspect": "open",
   "POST /internal/runtime-launch/consume": "open",

@@ -2,7 +2,7 @@ import { createHash, randomBytes, scrypt as scryptCallback, timingSafeEqual } fr
 import { promisify } from "node:util";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type pg from "pg";
-import { CodeChallengeMethod, OAuth2Client } from "google-auth-library";
+import { OAuth2Client } from "google-auth-library";
 import { issueEnrollment, replaceEnrollment } from "./enrollment.js";
 import { ensureUnknownPasswordCredential, hashPassword, resolveOrCreateEmailAccount, verifyPasswordLogin } from "./password-identity.js";
 import type { Mailer } from "./mailer.js";
@@ -126,51 +126,73 @@ export interface GoogleIdentity {
   email?: string;
   /**
    * Google's own `email_verified` claim, and only ever true when it said so.
-   * `exchange` rejects an explicit false, but the claim can also be absent —
-   * and "absent" must not read as "verified" at the one call site that uses
-   * this to decide whether two accounts are the same person.
+   * `verify` refuses anything else (the claim can also be absent, and "absent"
+   * must not read as "verified" where this decides that two accounts are the
+   * same person); the route checks it again.
    */
   emailVerified: boolean;
 }
 
-export interface GoogleOidcAdapter {
-  authorizationUrl(input: { state: string; nonce: string; codeChallenge: string }): string;
-  exchange(input: { code: string; codeVerifier: string; nonce: string }): Promise<GoogleIdentity>;
+/**
+ * Why a Google credential was refused. A CODE, never the library's message: that message can quote the token
+ * (`Invalid token signature: <jwt>`, `Wrong number of segments in token: <jwt>`), and the log must hold neither
+ * the token nor the address in it.
+ */
+export type GoogleRefusal =
+  | "CREDENTIAL_MISSING" | "SIGNATURE_INVALID" | "AUDIENCE_MISMATCH" | "ISSUER_MISMATCH" | "TOKEN_EXPIRED"
+  | "TOKEN_MALFORMED" | "SUBJECT_MISSING" | "EMAIL_MISSING" | "EMAIL_UNVERIFIED" | "VERIFY_FAILED";
+
+export class GoogleSignInRefused extends Error {
+  constructor(readonly reason: GoogleRefusal) { super(reason); this.name = "GoogleSignInRefused"; }
 }
 
-export class GoogleOidcClient implements GoogleOidcAdapter {
-  private readonly client: OAuth2Client;
+/**
+ * Verifies the signed ID token Google Identity Services hands the page ("Sign in with Google", ID-token flow:
+ * the page draws Google's button from the PUBLIC client ID, Google signs a token for it, and the page posts
+ * the token to POST /v1/auth/google). There is no client secret and no redirect. Throws GoogleSignInRefused.
+ */
+export interface GoogleIdTokenVerifier {
+  /** The OAuth client ID: the token's required audience, and what capabilities hands the page. */
+  readonly clientId: string;
+  verify(credential: string): Promise<GoogleIdentity>;
+}
 
-  constructor(private readonly clientId: string, clientSecret: string, private readonly redirectUri: string) {
-    this.client = new OAuth2Client(clientId, clientSecret, redirectUri);
-  }
+export class GoogleIdTokenClient implements GoogleIdTokenVerifier {
+  /** `client` is injectable so a test can serve its own signing certificates instead of fetching Google's. */
+  constructor(readonly clientId: string, private readonly client: OAuth2Client = new OAuth2Client(clientId)) {}
 
-  authorizationUrl(input: { state: string; nonce: string; codeChallenge: string }): string {
-    return this.client.generateAuthUrl({
-      access_type: "offline",
-      scope: ["openid", "email", "profile"],
-      state: input.state,
-      nonce: input.nonce,
-      code_challenge: input.codeChallenge,
-      code_challenge_method: CodeChallengeMethod.S256,
-      prompt: "select_account",
-    });
-  }
-
-  async exchange(input: { code: string; codeVerifier: string; nonce: string }): Promise<GoogleIdentity> {
-    const response = await this.client.getToken({ code: input.code, codeVerifier: input.codeVerifier, redirect_uri: this.redirectUri });
-    const idToken = response.tokens.id_token;
-    if (!idToken) throw new Error("GOOGLE_ID_TOKEN_MISSING");
-    const ticket = await this.client.verifyIdToken({ idToken, audience: this.clientId });
-    const payload = ticket.getPayload();
-    if (!payload?.sub || payload.nonce !== input.nonce || payload.email_verified === false) throw new Error("GOOGLE_IDENTITY_INVALID");
+  async verify(credential: string): Promise<GoogleIdentity> {
+    if (!credential) throw new GoogleSignInRefused("CREDENTIAL_MISSING");
+    let payload;
+    try {
+      // The library checks the signature against Google's published certificates, the expiry (exp, and iat
+      // not in the future), the audience, and the issuer: accounts.google.com or https://accounts.google.com.
+      const ticket = await this.client.verifyIdToken({ idToken: credential, audience: this.clientId });
+      payload = ticket.getPayload();
+    } catch (error) {
+      throw new GoogleSignInRefused(refusalFor(error instanceof Error ? error.message : ""));
+    }
+    if (!payload?.sub) throw new GoogleSignInRefused("SUBJECT_MISSING");
+    if (!payload.email) throw new GoogleSignInRefused("EMAIL_MISSING");
+    // `=== true`, not `!== false`: an absent claim must not read as verified, because this is what decides
+    // that Google's address and an existing account's address are the same person.
+    if (payload.email_verified !== true) throw new GoogleSignInRefused("EMAIL_UNVERIFIED");
     return {
       subject: payload.sub,
-      displayName: payload.name?.slice(0, 120) || payload.email?.split("@")[0]?.slice(0, 120) || "Kinerary organizer",
+      displayName: payload.name?.trim().slice(0, 120) || payload.email.split("@")[0]?.slice(0, 120) || "Kinerary organizer",
       email: payload.email,
-      emailVerified: payload.email_verified === true,
+      emailVerified: true,
     };
   }
+}
+
+function refusalFor(message: string): GoogleRefusal {
+  if (/Invalid token signature|No pem found/i.test(message)) return "SIGNATURE_INVALID";
+  if (/Wrong recipient|audience/i.test(message)) return "AUDIENCE_MISMATCH";
+  if (/Invalid issuer/i.test(message)) return "ISSUER_MISMATCH";
+  if (/Token used too late|expired/i.test(message)) return "TOKEN_EXPIRED";
+  if (/segments|Can't parse/i.test(message)) return "TOKEN_MALFORMED";
+  return "VERIFY_FAILED";
 }
 
 export interface RuntimeAccountAdapter {
@@ -212,7 +234,8 @@ export class HttpRuntimeAccountAdapter implements RuntimeAccountAdapter {
 
 export interface PortalDependencies {
   db: pg.Pool;
-  google?: GoogleOidcAdapter;
+  /** Present only when `web.google_client_id` is set; absent turns Google sign-in off (capabilities says so). */
+  google?: GoogleIdTokenVerifier;
   runtimeAccounts: RuntimeAccountAdapter;
   publicOrigin: string;
   runtimeOrigin: string;
@@ -471,20 +494,6 @@ async function requireMutation(request: FastifyRequest, reply: FastifyReply, dep
   return (await enforceScope(request, reply, deps, user)) ? user : null;
 }
 
-/**
- * An account with no email behind it — a Google sign-in whose address Google
- * would not vouch for. It gets its own user, as it always has, because there
- * is nothing here to tie it to anyone.
- */
-async function createBareUser(client: pg.PoolClient, displayName: string): Promise<string> {
-  const userId = opaque("user");
-  await client.query(
-    "INSERT INTO control_plane.users(id, status, display_name) VALUES ($1, 'active', $2)",
-    [userId, displayName],
-  );
-  return userId;
-}
-
 async function membership(deps: PortalDependencies, tripId: string, userId: string) {
   const result = await deps.db.query<{ role: string; dashboard_access: boolean; runtime_access: boolean }>(
     `SELECT role, dashboard_access, runtime_access FROM control_plane.trip_memberships
@@ -660,6 +669,8 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
 
   app.get("/v1/auth/capabilities", async () => ({
     google: Boolean(deps.google),
+    // The PUBLIC OAuth client ID the page needs to draw Google's button; present exactly when `google` is true.
+    ...(deps.google ? { googleClientId: deps.google.clientId } : {}),
     emailPassword: true,
     // Whether the portal can send the verification / reset message at all. False renders "Sign-up isn't open yet".
     emailSignUp: Boolean(deps.mailer),
@@ -979,76 +990,81 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     return { status: "restored" };
   });
 
-  app.get("/v1/auth/google/start", async (request, reply) => {
+  // ── Sign in with Google (Google Identity Services, ID-token flow) ──
+  //
+  //   POST /v1/auth/google  { credential, returnTo?, embedded? }  200 { appPath } + session cookies
+  //                         | 401 GOOGLE_SIGN_IN_FAILED | 403 ORIGIN_INVALID | 429 SIGN_IN_RATE_LIMITED | 503 GOOGLE_SIGN_IN_UNAVAILABLE
+  //
+  // Sign-up and sign-in in one. Policy `open` (portal-scope.ts): it never reads the session cookie. `credential`
+  // is the signed ID token the page's Google button yields. Origin must be ours (a page on another site must not be
+  // able to post a token it holds and sign the visitor in: login CSRF), the IP is rate-limited BEFORE the token is
+  // looked at, and the answer is `no-store`. EVERY failure to establish who Google says this is, whatever the cause
+  // (garbage, bad signature, wrong audience or issuer, expired, no verified address, a suspended account), is the
+  // same 401 GOOGLE_SIGN_IN_FAILED, so the route tells a caller nothing about which part was wrong. The cause goes to
+  // the log as a reason CODE only: never the token, never the address.
+  const googleIpAttempts: Attempts = new Map();
+  app.post("/v1/auth/google", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
     if (!deps.google) return reply.code(503).send({ error: "GOOGLE_SIGN_IN_UNAVAILABLE" });
-    const query = request.query as Record<string, unknown>;
-    const state = base64url(24);
-    const nonce = base64url(24);
-    const verifier = base64url(48);
-    const challenge = createHash("sha256").update(verifier).digest("base64url");
-    await deps.db.query(
-      `INSERT INTO control_plane.web_auth_attempts(id, state_digest, code_verifier, nonce, return_to, expires_at)
-       VALUES ($1, $2, $3, $4, $5, now() + interval '10 minutes')`,
-      [opaque("wauth"), sha256(state), verifier, nonce, validatedReturnTo(query.return_to ?? query.returnTo)],
-    );
-    return reply.redirect(deps.google.authorizationUrl({ state, nonce, codeChallenge: challenge }));
-  });
-
-  app.get("/v1/auth/google/callback", async (request, reply) => {
-    if (!deps.google) return reply.code(503).send({ error: "GOOGLE_SIGN_IN_UNAVAILABLE" });
-    const query = request.query as Record<string, unknown>;
-    if (typeof query.state !== "string" || typeof query.code !== "string") return reply.code(400).send({ error: "AUTH_CALLBACK_INVALID" });
+    if (!admitLogin(googleIpAttempts, request.ip, 30)) {
+      return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
+    }
+    if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
+    const body = jsonBody(request);
+    const refuse = async (reason: GoogleRefusal | "ACCOUNT_INACTIVE") => {
+      emailAuthLog(structuredLog("warn", "google_sign_in.refused", { reason }));
+      await recordFunnelEvent(deps.db, "google_auth", { outcome: "failure" }).catch(() => {});
+      return reply.code(401).send({ error: "GOOGLE_SIGN_IN_FAILED" });
+    };
+    if (typeof body.credential !== "string" || body.credential.length === 0 || body.credential.length > 8192) return refuse("CREDENTIAL_MISSING");
+    let identity: GoogleIdentity;
+    try {
+      identity = await deps.google.verify(body.credential);
+    } catch (error) {
+      return refuse(error instanceof GoogleSignInRefused ? error.reason : "VERIFY_FAILED");
+    }
+    if (!identity.email || !identity.emailVerified) return refuse("EMAIL_UNVERIFIED");
+    const subjectDigest = sha256(`google:${identity.subject}`);
     const client = await deps.db.connect();
     try {
       await client.query("BEGIN");
-      const attempts = await client.query<{ id: string; code_verifier: string; nonce: string; return_to: string }>(
-        `SELECT id, code_verifier, nonce, return_to FROM control_plane.web_auth_attempts
-         WHERE state_digest = $1 AND consumed_at IS NULL AND expires_at > now() FOR UPDATE`, [sha256(query.state)]);
-      const attempt = attempts.rows[0];
-      if (!attempt) { await client.query("ROLLBACK"); return reply.code(400).send({ error: "AUTH_CALLBACK_INVALID" }); }
-      const identity = await deps.google.exchange({ code: query.code, codeVerifier: attempt.code_verifier, nonce: attempt.nonce });
-      const subjectDigest = sha256(`google:${identity.subject}`);
-      const identities = await client.query<{ user_id: string }>(
+      const known = await client.query<{ user_id: string }>(
         "SELECT user_id FROM control_plane.user_identities WHERE provider = 'google' AND provider_subject_digest = $1", [subjectDigest]);
-      let userId = identities.rows[0]?.user_id;
+      let userId = known.rows[0]?.user_id;
       if (!userId) {
-        // First Google sign-in for this Google account. If Google has VERIFIED
-        // an address for it, that address already names an organizer account
-        // here — one they signed up for, or one an operator invited — and this
-        // is the same person arriving by a different door. Attach the Google
-        // identity to that account instead of starting a third one beside it.
-        //
-        // Safe in the direction that matters: Google proving the address is a
-        // stronger claim than this system has ever had for it, since signup
-        // itself never verifies an email. An unverified or absent claim falls
-        // through to a fresh account, which is the old behavior.
-        if (identity.email && identity.emailVerified) {
-          userId = await resolveOrCreateEmailAccount(client, identity.email, identity.displayName);
-          // The account must not be claimable by asserting its address. Without
-          // this, an account reachable only by Google would sit there with no
-          // password credential, and `POST /v1/signup` with that email would
-          // set one — handing a stranger who knows the address everything this
-          // person owns. A credential nobody knows closes that; they sign in
-          // with Google, and password recovery (portal-email-auth.ts) gives them one they chose.
-          await ensureUnknownPasswordCredential(client, userId, identity.email);
-        } else {
-          userId = await createBareUser(client, identity.displayName);
+        // First sign-in with this Google account. Its address is verified, so it names the canonical account for
+        // that address (one address, one user_id: password-identity.ts), creating it if there is none: a new
+        // address is a new organizer account (sign-up auto-approves), an existing one (password, invitation,
+        // email sign-up) is the same person arriving by another door and gets the Google identity attached.
+        userId = await resolveOrCreateEmailAccount(client, identity.email, identity.displayName);
+        // A credential nobody knows, so the account cannot be claimed by typing its address into POST /v1/signup;
+        // it never overwrites an existing one. Google or password recovery (portal-email-auth.ts) is the way in.
+        await ensureUnknownPasswordCredential(client, userId, identity.email);
+        const attached = await client.query<{ user_id: string }>(
+          `INSERT INTO control_plane.user_identities(id, user_id, provider, provider_subject_digest, verified_at)
+           VALUES ($1, $2, 'google', $3, now())
+           ON CONFLICT (provider, provider_subject_digest) DO NOTHING
+           RETURNING user_id`,
+          [opaque("idnt"), userId, subjectDigest]);
+        if (!attached.rows[0]) {
+          // A concurrent first sign-in with the same Google account won: its row stands, and so is ours.
+          const winner = await client.query<{ user_id: string }>(
+            "SELECT user_id FROM control_plane.user_identities WHERE provider = 'google' AND provider_subject_digest = $1", [subjectDigest]);
+          userId = winner.rows[0]?.user_id ?? userId;
         }
-        await client.query(
-          "INSERT INTO control_plane.user_identities(id, user_id, provider, provider_subject_digest, verified_at) VALUES ($1, $2, 'google', $3, now())",
-          [opaque("idnt"), userId, subjectDigest],
-        );
       }
+      const active = await client.query("SELECT 1 FROM control_plane.users WHERE id = $1 AND status = 'active' FOR SHARE", [userId]);
+      if (!active.rows[0]) { await client.query("ROLLBACK"); return await refuse("ACCOUNT_INACTIVE"); }
       const session = await createWebSession(client, userId, deps.sessionTtlSeconds);
       await recordFunnelEvent(client, "google_auth", { outcome: "success", userId });
-      await client.query("UPDATE control_plane.web_auth_attempts SET consumed_at = now() WHERE id = $1", [attempt.id]);
       await client.query("COMMIT");
-      setWebSessionCookies(reply, deps, session);
-      return reply.redirect(`${deps.publicOrigin}${attempt.return_to}`);
-    } catch {
-      await client.query("ROLLBACK");
-      await recordFunnelEvent(deps.db, "google_auth", { outcome: "failure" }).catch(() => {});
-      return reply.code(401).send({ error: "GOOGLE_AUTH_FAILED" });
+      setWebSessionCookies(reply, deps, session, { embedded: embeddedRequest(body) });
+      return { appPath: validatedReturnTo(body.returnTo) };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      // A database fault is not "Google said no": it stays a 500 (and the log line has the code, not the cause's text).
+      emailAuthLog(structuredLog("error", "google_sign_in.failed", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN" }));
+      throw error;
     } finally {
       client.release();
     }

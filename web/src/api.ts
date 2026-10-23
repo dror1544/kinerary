@@ -83,6 +83,7 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
       INVALID_CREDENTIALS: "Email or password is incorrect.",
       SIGN_IN_RATE_LIMITED: "Too many sign-in attempts. Please try again in a minute.",
       GOOGLE_SIGN_IN_UNAVAILABLE: "Google sign-in is not available here.",
+      GOOGLE_SIGN_IN_FAILED: "Google sign-in didn't work. Please try again, or use your email.",
       ACTIVE_ENROLLMENT_EXISTS: "An interview link already exists. You can replace a lost link before the interview starts.",
       TRIP_NOT_DRAFT: "Your interview has already started. Continue in your existing Telegram chat.",
       INTERVIEW_ALREADY_STARTED: "Your interview has already started. Continue in your existing Telegram chat.",
@@ -143,9 +144,12 @@ const memberTripSchema = z.object({
 }));
 const meSchema: z.ZodType<Me> = z.object({ id: z.string(), displayName: z.string(), scope: z.enum(["telegram", "full"]).optional() });
 
-export function signIn(returnTo: string) {
-  window.location.assign(`/v1/auth/google/start?return_to=${encodeURIComponent(returnTo)}`);
-}
+/**
+ * Sign-up and sign-in with Google in one: posts the signed ID token Google Identity Services gave the page
+ * (components/GoogleSignInButton.tsx). The server verifies it; nothing here decides who the person is.
+ */
+export const googleSignIn = (input: { credential: string; returnTo: string; embedded?: true }) =>
+  api<{ appPath: string }>("/v1/auth/google", { method: "POST", body: JSON.stringify(input) });
 
 export function passwordSignIn(input: {
   tripId: string; runtimeUsername: string; password: string; returnTo: string;
@@ -214,7 +218,7 @@ export const getMe = () => api<unknown>("/v1/me").then((value) => meSchema.parse
 export const getTrips = () => api<unknown>("/v1/trips").then((value) => z.object({ trips: z.array(z.union([tripSchema, memberTripSchema])) }).parse(value));
 export const getTrip = (id: string) => api<unknown>(`/v1/trips/${encodeURIComponent(id)}`).then((value) => tripSchema.parse(value));
 
-export const getAuthCapabilities = () => api<unknown>("/v1/auth/capabilities").then(value => z.object({ google: z.boolean(), emailPassword: z.boolean(), emailSignUp: z.boolean().optional(), telegramMiniApp: z.boolean().optional() }).parse(value));
+export const getAuthCapabilities = () => api<unknown>("/v1/auth/capabilities").then(value => z.object({ google: z.boolean(), googleClientId: z.string().optional(), emailPassword: z.boolean(), emailSignUp: z.boolean().optional(), telegramMiniApp: z.boolean().optional() }).parse(value));
 export const emailPasswordSignIn = (input: { email: string; password: string; returnTo: string; embedded?: true }) => api<{ appPath: string }>("/v1/auth/email-password", { method: "POST", body: JSON.stringify(input) });
 
 /** Creates nothing yet, and takes no password and no name: the server emails a link, and the person chooses the name and password on the page it opens. */

@@ -97,13 +97,12 @@ services:
       # The web portal's secrets (profile `web`). They are the targets of the
       # `env://` references in the architecture profile's `web` block
       # (architecture.vm-web.example.json), so they are read only when that
-      # block is there: with the default profile these three are inert, and an
+      # block is there: with the default profile these are inert, and an
       # empty one that the profile DOES name stops the api at boot
       # ("secret reference env://… is unset or empty") rather than serving a
-      # portal that cannot sign anyone in. Google is optional, as a pair.
+      # portal that cannot sign anyone in. Google needs no variable: its OAuth client ID is a
+      # public string in the profile (`web.google_client_id`) and there is no client secret.
       RUNTIME_EXCHANGE_KEY: ${RUNTIME_EXCHANGE_KEY:-}
-      GOOGLE_WEB_CLIENT_ID: ${GOOGLE_WEB_CLIENT_ID:-}
-      GOOGLE_WEB_CLIENT_SECRET: ${GOOGLE_WEB_CLIENT_SECRET:-}
       # The email provider's API key for the portal's own sign-up and password reset
       # (profile `web.email_api_key_secret_ref: env://PORTAL_EMAIL_API_KEY`). Optional:
       # with no email block in the profile it is inert, and the sign-up routes answer 503.

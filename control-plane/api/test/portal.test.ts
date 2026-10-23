@@ -34,7 +34,7 @@ test("a web profile boots without duplicate trip routes and retires Telegram web
   const profile = validateArchitectureProfile(JSON.parse(await readFile(path, "utf8")));
   const portal = {
     db: {} as PortalDependencies["db"],
-    google: { authorizationUrl: () => "https://accounts.example.test", exchange: async () => ({ subject: "sub", displayName: "Name", emailVerified: false }) },
+    google: { clientId: "test-client.apps.googleusercontent.com", verify: async () => ({ subject: "sub", displayName: "Name", emailVerified: false }) },
     runtimeAccounts: { participantExists: async () => true, provisionParticipant: async () => {} },
     publicOrigin: profile.web!.public_origin,
     runtimeOrigin: profile.web!.runtime_origin,
@@ -56,13 +56,25 @@ test("a web profile boots without duplicate trip routes and retires Telegram web
 });
 
 
-test("Google is optional as a complete pair and unavailable routes fail explicitly", async () => {
+test("Google sign-in is off without web.google_client_id, validates it when set, and refuses the retired secret-ref pair by name", async () => {
   const raw = JSON.parse(await readFile(fileURLToPath(new URL("../../config/architecture.web.example.json", import.meta.url)), "utf8"));
-  delete raw.web.google_client_id_secret_ref;
-  delete raw.web.google_client_secret_ref;
+  assert.equal(typeof raw.web.google_client_id, "string", "the example profile names the (public) client ID");
+  delete raw.web.google_client_id;
   const profile = validateArchitectureProfile(raw);
-  assert.throws(() => validateArchitectureProfile({ ...raw, web: { ...raw.web, google_client_id_secret_ref: "env://GOOGLE_ID" } }));
-  assert.throws(() => validateArchitectureProfile({ ...raw, web: { ...raw.web, google_client_secret_ref: "env://GOOGLE_SECRET" } }));
+  assert.equal(profile.web?.google_client_id, undefined);
+  // A plain client ID is accepted; anything that is not one is refused.
+  assert.equal(validateArchitectureProfile({ ...raw, web: { ...raw.web, google_client_id: "123-abc.apps.googleusercontent.com" } }).web?.google_client_id, "123-abc.apps.googleusercontent.com");
+  for (const bad of ["env://GOOGLE_ID", "123-abc", "123-abc.apps.googleusercontent.com.evil.test", "https://123.apps.googleusercontent.com", "", " 123.apps.googleusercontent.com"]) {
+    assert.throws(() => validateArchitectureProfile({ ...raw, web: { ...raw.web, google_client_id: bad } }), /google_client_id/, `refuses ${JSON.stringify(bad)}`);
+  }
+  // The retired OIDC pair: refused with a message that names the replacement, not a bare "unrecognized key".
+  for (const old of ["google_client_id_secret_ref", "google_client_secret_ref"]) {
+    assert.throws(
+      () => validateArchitectureProfile({ ...raw, web: { ...raw.web, [old]: "env://GOOGLE_X" } }),
+      (error: Error) => error.message.includes(`web.${old} is no longer supported`) && error.message.includes("web.google_client_id") && error.message.includes(".apps.googleusercontent.com"),
+    );
+  }
+  assert.throws(() => validateArchitectureProfile({ ...raw, web: { ...raw.web, google_client_id_secret_ref: "env://A", google_client_secret_ref: "env://B" } }), /no longer supported/);
   const app = buildApp(profile, { portal: {
     db: {} as PortalDependencies["db"], runtimeAccounts: {} as PortalDependencies["runtimeAccounts"],
     publicOrigin: raw.web.public_origin, runtimeOrigin: raw.web.runtime_origin, runtimeExchangeKey: "test-key",
@@ -72,10 +84,12 @@ test("Google is optional as a complete pair and unavailable routes fail explicit
   try {
     const providers = await app.inject({ url: "/v1/auth/capabilities" });
     assert.deepEqual(providers.json(), { google: false, emailPassword: true, emailSignUp: false, telegramMiniApp: false });
+    const response = await app.inject({ method: "POST", url: "/v1/auth/google", headers: { origin: raw.web.public_origin }, payload: { credential: "x" } });
+    assert.equal(response.statusCode, 503);
+    assert.deepEqual(response.json(), { error: "GOOGLE_SIGN_IN_UNAVAILABLE" });
+    // The redirect flow is gone: its routes are not there to answer at all.
     for (const url of ["/v1/auth/google/start", "/v1/auth/google/callback?state=x&code=x"]) {
-      const response = await app.inject({ url });
-      assert.equal(response.statusCode, 503);
-      assert.deepEqual(response.json(), { error: "GOOGLE_SIGN_IN_UNAVAILABLE" });
+      assert.equal((await app.inject({ url })).statusCode, 404, url);
     }
   } finally { await app.close(); }
 });

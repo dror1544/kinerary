@@ -48,7 +48,7 @@ function harness(options: { mailer?: Mailer | null; loud?: boolean } = {}): Harn
   const google = { next: { subject: "g-unset", displayName: "G", emailVerified: false } as GoogleIdentity };
   const portal: PortalDependencies = {
     db: pool,
-    google: { authorizationUrl: ({ state }) => `https://accounts.example.test/auth?state=${state}`, exchange: async () => google.next },
+    google: { clientId: "test-client.apps.googleusercontent.com", verify: async () => google.next },
     runtimeAccounts: { participantExists: async () => true, provisionParticipant: async () => {} },
     publicOrigin: ORIGIN, runtimeOrigin: "http://runtime.example.test", runtimeExchangeKey: "exchange-key",
     runtimeUpstreamHostSuffixes: ["internal"], telegramBotUsername: "kinerary_bot", sessionTtlSeconds: 3600,
@@ -470,17 +470,14 @@ test("a stale unverified sign-up does not block an invitation, and verifying it 
 
 test("Google sign-in for the same verified address works with a pending sign-up, and after a verified one lands on the same account", { skip }, async () => {
   const h = harness();
-  const googleSignIn = async () => {
-    const start = await h.app.inject({ url: "/v1/auth/google/start" });
-    const state = new URL(String(start.headers.location)).searchParams.get("state")!;
-    return h.app.inject({ url: `/v1/auth/google/callback?state=${state}&code=c` });
-  };
+  // The verifier is stubbed here (google-id-token-db.test.ts runs the real one); the route and the account logic are real.
+  const googleSignIn = () => post(h.app, "/v1/auth/google", { credential: "stub-credential" });
   try {
     const pending = addr("gpending");
     await signUp(h.app, pending); await portalMailIdle();
     h.google.next = { subject: `g-${suffix}-1`, displayName: "Gina", email: pending, emailVerified: true };
     const callback = await googleSignIn();
-    assert.equal(callback.statusCode, 302, callback.body);
+    assert.equal(callback.statusCode, 200, callback.body);
     const session = cookiesOf(callback)!;
     assert.equal((await me(h.app, session.cookie)).statusCode, 200);
     // The pending sign-up now finds an account: the link is refused and does not replace Google's credential.
@@ -493,7 +490,7 @@ test("Google sign-in for the same verified address works with a pending sign-up,
     const ownId = (await me(h.app, own.cookie)).json().id;
     h.google.next = { subject: `g-${suffix}-2`, displayName: "Gina", email: verified, emailVerified: true };
     const viaGoogle = await googleSignIn();
-    assert.equal(viaGoogle.statusCode, 302);
+    assert.equal(viaGoogle.statusCode, 200);
     assert.equal((await me(h.app, cookiesOf(viaGoogle)!.cookie)).json().id, ownId, "one address, one user_id");
     assert.equal((await signIn(h.app, verified, PASSWORD)).statusCode, 200, "the password still works");
   } finally { await h.app.close(); }

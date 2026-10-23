@@ -26,6 +26,21 @@ function originOf(value: string, ctx: z.RefinementCtx): string {
   return origin;
 }
 
+export const GOOGLE_CLIENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*\.apps\.googleusercontent\.com$/;
+
+/** A key the profile used to carry, now refused with the instruction instead of a bare "unrecognized key". */
+function removedGoogleField(name: string) {
+  return z.unknown().superRefine((value, ctx) => {
+    if (value === undefined) return;
+    ctx.addIssue({
+      code: "custom",
+      message: `web.${name} is no longer supported: Google sign-in now uses Google Identity Services and needs only the public OAuth client ID. `
+        + `Remove web.google_client_id_secret_ref and web.google_client_secret_ref, and set web.google_client_id to the client ID `
+        + `(a string ending in .apps.googleusercontent.com, not a secret reference).`,
+    });
+  }).optional();
+}
+
 export const architectureProfileSchema = z.object({
   version: z.literal(1),
   environment: z.enum(["test", "development", "production"]),
@@ -110,8 +125,20 @@ export const architectureProfileSchema = z.object({
     // "https://Portal.example/" must still equal it, or every mutation would be refused as a foreign origin.
     public_origin: z.string().url().transform(originOf),
     runtime_origin: z.string().url().transform(originOf),
-    google_client_id_secret_ref: secretReference.optional(),
-    google_client_secret_ref: secretReference.optional(),
+    /**
+     * The OAuth client ID for "Sign in with Google" (Google Identity Services), a plain string. It is PUBLIC:
+     * the page needs it to draw Google's button, so it is served by GET /v1/auth/capabilities and is not a
+     * secret reference. The sign-in is the ID-token flow (POST /v1/auth/google verifies Google's signed token
+     * against this audience), so there is no client secret anywhere. ABSENT means Google sign-in is off.
+     * Create the client as type "Web application" with the portal origin under "Authorized JavaScript origins"
+     * (docs/control-plane-vm-deployment.md).
+     */
+    google_client_id: z.string().max(256).regex(GOOGLE_CLIENT_ID_PATTERN, "must be an OAuth client ID ending in .apps.googleusercontent.com").optional(),
+    // The two fields the server-side OIDC redirect flow used. They are REFUSED rather than ignored: a profile
+    // that still names them would otherwise boot with Google sign-in silently off (unset is a downgrade, not
+    // an error), or fail with a bare "unrecognized key" that does not say what to do.
+    google_client_id_secret_ref: removedGoogleField("google_client_id_secret_ref"),
+    google_client_secret_ref: removedGoogleField("google_client_secret_ref"),
     runtime_exchange_key_secret_ref: secretReference,
     runtime_upstream_host_suffixes: z.array(z.string().min(1).max(253).regex(/^[A-Za-z0-9.-]+$/)).min(1),
     telegram_bot_username: z.string().regex(/^[A-Za-z0-9_]{5,32}$/),
@@ -143,9 +170,7 @@ export const architectureProfileSchema = z.object({
     email_provider: z.enum(["resend", "log"]).optional(),
     email_api_key_secret_ref: secretReference.optional(),
     email_from: z.string().email().max(254).optional(),
-  }).strict().refine((web) => Boolean(web.google_client_id_secret_ref) === Boolean(web.google_client_secret_ref), {
-    message: "Google client ID and secret references must be configured together",
-  }).refine((web) => web.email_provider !== undefined || (web.email_api_key_secret_ref === undefined && web.email_from === undefined), {
+  }).strict().refine((web) => web.email_provider !== undefined || (web.email_api_key_secret_ref === undefined && web.email_from === undefined), {
     message: "email_api_key_secret_ref and email_from need email_provider",
     path: ["email_provider"],
   }).refine((web) => web.email_provider !== "resend" || (web.email_api_key_secret_ref !== undefined && web.email_from !== undefined), {

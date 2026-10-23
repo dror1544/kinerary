@@ -20,7 +20,9 @@ command in that section.
 - Private network: control-plane API, PostgreSQL, worker, and isolated trip
   runtimes. The gateway and API share `RUNTIME_EXCHANGE_KEY`; runtimes receive
   the same key only for their private exchange endpoints.
-- Google OIDC redirect: `<organizer-origin>/v1/auth/google/callback`.
+- Google sign-in: an OAuth client of type Web application whose Authorized JavaScript
+  origins include `<organizer-origin>`; its client ID goes in the profile's
+  `web.google_client_id` (no secret, no redirect URI).
 
 Start from `control-plane/config/architecture.web.example.json`. Replace all
 example origins, secret references, upstream suffixes, bot username, and admin

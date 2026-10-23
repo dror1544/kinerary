@@ -4,8 +4,9 @@ import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Link, Navigate, useLocation, useNavigate, useNavigationType, useParams } from "react-router-dom";
 import { z } from "zod";
-import { api, getMe, getTrip, getTrips, passwordSignIn, signIn, getAuthCapabilities, emailPasswordSignIn, safeReturnTo, type TripSummary, type InterviewLinkState, ApiError } from "../api";
+import { api, getMe, getTrip, getTrips, passwordSignIn, getAuthCapabilities, emailPasswordSignIn, safeReturnTo, type TripSummary, type InterviewLinkState, ApiError } from "../api";
 import { Brand } from "../components/Brand";
+import { GoogleSignInButton } from "../components/GoogleSignInButton";
 import { tripUsernameInputProps, tripUsernameRegisterOptions } from "../mini-app/username";
 import { isEmbedded } from "../mini-app/sdk";
 import { TripTelegram } from "./TripTelegram";
@@ -60,7 +61,7 @@ function SignIn() {
           {emailLogin.isError && <Notice>{emailLogin.error.message}</Notice>}
           <p className="form-links"><Link to="/forgot-password">Forgot your password?</Link> · <Link to={`/sign-up?returnTo=${encodeURIComponent(returnTo)}`}>Create an account</Link></p>
         </form>}
-        {capabilities.data?.google && <button className="button wide" onClick={() => signIn(returnTo)}>Continue with Google</button>}
+        {capabilities.data?.google && capabilities.data.googleClientId && <GoogleSignInButton clientId={capabilities.data.googleClientId} returnTo={returnTo} />}
         {tripId && <form className="compact-form" onSubmit={passwordForm.handleSubmit((value) => passwordLogin.mutate(value))}>
           <label>Trip username<input {...tripUsernameInputProps} {...passwordForm.register("runtimeUsername", tripUsernameRegisterOptions)} /></label>
           <label>Password<input required minLength={8} type="password" autoComplete="current-password" {...passwordForm.register("password")} /></label>
@@ -355,7 +356,7 @@ function Join() {
   const [method, setMethod] = useState<"google" | "password">("google");
   const [password, setPassword] = useState("");
   useEffect(() => { if (capabilities.data && !capabilities.data.google) setMethod("password"); }, [capabilities.data]);
-  const redeem = useMutation({ mutationFn: () => api<{ appPath: string }>("/v1/site-invites/redeem", { method: "POST", body: JSON.stringify({ token, method, ...(method === "password" ? { password } : {}) }) }), onSuccess: ({ appPath }) => navigate(safeReturnTo(appPath)), onError: (error) => { if (method === "google" && error.message.includes("GOOGLE_SIGN_IN_REQUIRED")) signIn(`/join#token=${token}`); } });
+  const redeem = useMutation({ mutationFn: () => api<{ appPath: string }>("/v1/site-invites/redeem", { method: "POST", body: JSON.stringify({ token, method, ...(method === "password" ? { password } : {}) }) }), onSuccess: ({ appPath }) => navigate(safeReturnTo(appPath)), onError: (error) => { if (method === "google" && error.message.includes("GOOGLE_SIGN_IN_REQUIRED")) navigate(`/sign-in?return_to=${encodeURIComponent(`/join#token=${token}`)}`); } });
   return <div className="product-shell"><header className="product-header"><Brand /></header><main className="placeholder-card"><p className="eyebrow">Private invitation</p>{!token || inspect.isError ? <><h1>This invitation is unavailable</h1><p>Ask the organizer for a fresh link.</p></> : inspect.isPending ? <p>Checking invitation…</p> : <><h1>Join {inspect.data.tripTitle}</h1><p>This invitation is intended for {inspect.data.displayName}.</p>{capabilities.isPending && <p>Loading sign-in options…</p>}{capabilities.isError && <Notice>Sign-in is unavailable. Please retry once the service is connected.</Notice>}<div className="method-tabs">{capabilities.data?.google && <button className={method === "google" ? "active" : ""} onClick={() => setMethod("google")}>Use Google</button>}<button className={method === "password" ? "active" : ""} onClick={() => setMethod("password")}>Use a password</button></div>{method === "password" && <label className="standalone-field">Choose a password<input type="password" minLength={8} value={password} onChange={(event) => setPassword(event.target.value)} /></label>}<button className="button wide" onClick={() => redeem.mutate()} disabled={redeem.isPending || !capabilities.data || inspect.data.status !== "unused"}>Join this trip</button>{redeem.isError && <Notice>{redeem.error.message}</Notice>}</>}</main></div>;
 }
 

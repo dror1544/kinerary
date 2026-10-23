@@ -1,8 +1,9 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useState, type FormEvent } from "react";
 import { Link, Navigate, useLocation } from "react-router-dom";
-import { ApiError, emailSignUp, getAuthCapabilities, getMe, safeReturnTo, signIn } from "../api";
+import { ApiError, emailSignUp, getAuthCapabilities, getMe, safeReturnTo } from "../api";
 import { AccountShell, Notice, mailLanguage } from "../components/AccountShell";
+import { GoogleSignInButton } from "../components/GoogleSignInButton";
 
 /** The unavailable state is its own page, not an error under a form: there is nothing here to fill in. */
 export function SignUpClosed({ returnTo }: { returnTo: string }) {
@@ -55,7 +56,7 @@ export default function SignUpPage() {
           {request.isError && <Notice>{request.error.message}</Notice>}
         </form>
       )}
-      {capabilities.data?.google && <button className="button wide" type="button" onClick={() => signIn(returnTo)}>Continue with Google</button>}
+      {capabilities.data?.google && capabilities.data.googleClientId && <GoogleSignInButton clientId={capabilities.data.googleClientId} returnTo={returnTo} />}
       <p>Already have an account? <Link to={`/sign-in?return_to=${encodeURIComponent(returnTo)}`}>Sign in</Link></p>
     </AccountShell>
   );
