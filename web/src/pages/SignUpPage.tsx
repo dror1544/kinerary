@@ -21,10 +21,10 @@ export default function SignUpPage() {
   const returnTo = safeReturnTo(params.get("returnTo") ?? params.get("return_to"));
   const me = useQuery({ queryKey: ["me"], queryFn: getMe, retry: false });
   const capabilities = useQuery({ queryKey: ["auth-capabilities"], queryFn: getAuthCapabilities, retry: false });
-  const [form, setForm] = useState({ displayName: "", email: "" });
+  const [form, setForm] = useState({ email: "" });
   const [sentTo, setSentTo] = useState<string | null>(null);
   const request = useMutation({
-    mutationFn: () => emailSignUp({ ...form, email: form.email.trim(), displayName: form.displayName.trim(), returnTo, language: mailLanguage() }),
+    mutationFn: () => emailSignUp({ ...form, email: form.email.trim(), returnTo, language: mailLanguage() }),
     onSuccess: () => setSentTo(form.email.trim()),
   });
 
@@ -36,7 +36,7 @@ export default function SignUpPage() {
   if (sentTo) {
     return (
       <AccountShell eyebrow="Kinerary personal space" title="Check your email">
-        <p>If <strong>{sentTo}</strong> can be used to create an account, we've sent a link. Open it to choose your password and finish; it works once and expires in 24 hours.</p>
+        <p>If <strong>{sentTo}</strong> can be used to create an account, we've sent a link. Open it to choose your name and password and finish; it works once and expires in 24 hours.</p>
         <p>Nothing arrived? Check your spam folder, or <button type="button" className="link-button" onClick={() => { request.reset(); setSentTo(null); }}>use a different address</button>.</p>
       </AccountShell>
     );
@@ -45,12 +45,11 @@ export default function SignUpPage() {
   const submit = (event: FormEvent) => { event.preventDefault(); request.mutate(); };
   return (
     <AccountShell eyebrow="Kinerary personal space" title="Create your account">
-      <p>Create an organizer account to plan trips. We'll email you a link; you choose your password there, and the account is created once you do.</p>
+      <p>Create an organizer account to plan trips. We'll email you a link; you choose your name and password there, and the account is created once you do.</p>
       {capabilities.isPending && <p>Loading sign-up options…</p>}
       {capabilities.isError && <Notice>Sign-up is unavailable. Please retry in a moment.</Notice>}
       {capabilities.data?.emailSignUp === true && (
         <form className="compact-form" onSubmit={submit}>
-          <label>Your name<input required type="text" maxLength={120} autoComplete="name" value={form.displayName} onChange={(e) => setForm({ ...form, displayName: e.target.value })} /></label>
           <label>Email<input required type="email" maxLength={254} autoComplete="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} /></label>
           <button className="button wide" disabled={request.isPending}>{request.isPending ? "Sending…" : "Email me a link"}</button>
           {request.isError && <Notice>{request.error.message}</Notice>}

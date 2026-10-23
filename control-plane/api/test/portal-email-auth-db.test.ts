@@ -64,10 +64,10 @@ const post = (app: App, url: string, payload: unknown, headers: Record<string, s
   method: "POST", url, payload: JSON.stringify(payload), headers: { "content-type": "application/json", origin: ORIGIN, ...headers },
 });
 const signUp = (app: App, email: string, extra: Record<string, unknown> = {}) =>
-  post(app, "/v1/auth/sign-up", { email, displayName: "Dana Organizer", ...extra });
-/** The page the emailed link opens sends the token together with the password the person chose there. */
-const verify = (app: App, token: unknown, password: unknown = PASSWORD, headers: Record<string, string> = {}) =>
-  post(app, "/v1/auth/verify-email", { token, password }, headers);
+  post(app, "/v1/auth/sign-up", { email, ...extra });
+/** The page the emailed link opens sends the token with the password and the name the person chose there. */
+const verify = (app: App, token: unknown, password: unknown = PASSWORD, headers: Record<string, string> = {}, displayName: unknown = "Dana Organizer") =>
+  post(app, "/v1/auth/verify-email", { token, password, displayName }, headers);
 const tokenIn = (message: MailMessage | undefined, prefix: "ev" | "pr") => {
   assert.ok(message, "a message was sent");
   const found = message.text.match(new RegExp(`#token=(${prefix}_[A-Za-z0-9_-]{43})`));
@@ -224,11 +224,10 @@ test("a reused, expired, superseded, malformed or unknown token is refused with 
   } finally { await h.app.close(); }
 });
 
-test("sign-up validates the address and name the same way whatever the address, and takes no password", { skip }, async () => {
+test("sign-up validates the address, and takes no password and no name", { skip }, async () => {
   const h = harness();
   try {
     assert.equal((await post(h.app, "/v1/auth/sign-up", { email: "not-an-email" })).statusCode, 400);
-    assert.equal((await post(h.app, "/v1/auth/sign-up", { email: addr("x"), displayName: "n".repeat(121) })).statusCode, 400);
     assert.equal((await post(h.app, "/v1/auth/sign-up", [])).statusCode, 400);
     // No password is asked for, and a client that still sends one gets nothing stored and no say in the account.
     const sneaky = addr("sneaky");
@@ -237,6 +236,7 @@ test("sign-up validates the address and name the same way whatever the address, 
     assert.equal(h.mailer.outbox.length, 1, "only the valid request sent anything");
     const row = (await pool.query("SELECT * FROM control_plane.email_action_tokens WHERE email_digest = $1", [digestEmail(sneaky)])).rows[0];
     assert.doesNotMatch(JSON.stringify(row), /attacker chosen pw|scrypt/);
+    assert.equal("display_name" in row, false, "the pending row has no name column either");
     const verified = await verify(h.app, tokenIn(lastTo(h.mailer, sneaky), "ev"), "the owner chose this");
     assert.equal((await me(h.app, cookiesOf(verified)!.cookie)).statusCode, 200);
     assert.equal((await signIn(h.app, sneaky, "the owner chose this")).statusCode, 200);
@@ -248,19 +248,49 @@ test("PRE-HIJACK: whoever starts a sign-up for an address never knows a password
   const h = harness();
   try {
     const victim = addr("hijack");
-    // The attacker asks for an account on the victim's address. Nothing they can send carries a password.
-    assert.equal((await post(h.app, "/v1/auth/sign-up", { email: victim, displayName: "Not the owner", password: "attacker password!" })).statusCode, 202);
+    // The attacker asks for an account on the victim's address. Nothing they can send carries a password or a name.
+    const phish = "Not the owner <b>click here</b>";
+    assert.equal((await post(h.app, "/v1/auth/sign-up", { email: victim, displayName: phish, password: "attacker password!" })).statusCode, 202);
     await portalMailIdle();
-    const token = tokenIn(lastTo(h.mailer, victim), "ev");   // goes to the VICTIM's mailbox, not the attacker
+    const mail = lastTo(h.mailer, victim)!;   // goes to the VICTIM's mailbox, not the attacker
+    assert.doesNotMatch(mail.text + mail.html + mail.subject, /Not the owner|click here|attacker password/, "the attacker's words are not in the mail");
+    assert.match(mail.text, /^Hi,\n/, "the greeting is generic");
+    assert.equal(JSON.stringify((await pool.query("SELECT * FROM control_plane.email_action_tokens WHERE email_digest = $1", [digestEmail(victim)])).rows).includes("Not the owner"), false, "and not stored");
+    const token = tokenIn(mail, "ev");
     assert.equal((await signIn(h.app, victim, "attacker password!")).statusCode, 401, "nothing to sign in to yet");
     // The owner opens the link and chooses a password of their own.
-    const verified = await verify(h.app, token, "the owner's own passphrase");
+    const verified = await verify(h.app, token, "the owner's own passphrase", {}, "Dror Elul");
     assert.equal(verified.statusCode, 200, verified.body);
+    assert.equal((await me(h.app, cookiesOf(verified)!.cookie)).json().displayName, "Dror Elul", "the account carries the name the owner typed, not the attacker's");
     // The attacker cannot sign in with anything they chose or guessed from the sign-up.
     for (const guess of ["attacker password!", PASSWORD, "password", "12345678"]) {
       assert.equal((await signIn(h.app, victim, guess)).statusCode, 401, guess);
     }
     assert.equal((await signIn(h.app, victim, "the owner's own passphrase")).statusCode, 200);
+  } finally { await h.app.close(); }
+});
+
+test("the name is chosen at verification: cleaned (control and bidi characters out), 1 to 80 characters, and refused BEFORE the token is touched", { skip }, async () => {
+  const h = harness();
+  try {
+    const email = addr("name");
+    await signUp(h.app, email); await portalMailIdle();
+    const token = tokenIn(lastTo(h.mailer, email), "ev");
+    for (const bad of ["", "   ", "\u202e\u200b\u0007", "n".repeat(81), 42, null, { a: 1 }]) {
+      const refused = await verify(h.app, token, PASSWORD, {}, bad);
+      assert.deepEqual([refused.statusCode, refused.json()], [400, { error: "INVALID_NAME" }], String(JSON.stringify(bad)).slice(0, 20));
+    }
+    assert.deepEqual((await post(h.app, "/v1/auth/verify-email", { token, password: PASSWORD })).json(), { error: "INVALID_NAME" }, "no name at all");
+    assert.equal((await tokenRows(email))[0].consumed_at, null, "every refusal left the link unspent");
+    assert.equal(await userCount(email), 0);
+    // 80 characters is allowed; a right-to-left override, a zero-width space and a newline are stripped; whitespace is collapsed.
+    const good = await verify(h.app, token, PASSWORD, {}, "  \u202eדנה\u200b  \n  כהן  ");
+    assert.equal(good.statusCode, 200, good.body);
+    assert.equal((await me(h.app, cookiesOf(good)!.cookie)).json().displayName, "דנה כהן");
+    const e80 = addr("name80");
+    await signUp(h.app, e80); await portalMailIdle();
+    const ok80 = await verify(h.app, tokenIn(lastTo(h.mailer, e80), "ev"), PASSWORD, {}, "n".repeat(80));
+    assert.equal(ok80.statusCode, 200, "exactly 80 characters");
   } finally { await h.app.close(); }
 });
 

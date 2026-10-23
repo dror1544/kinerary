@@ -94,6 +94,7 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
       TELEGRAM_NOT_LINKED: "This Telegram account is not linked yet.",
       SIGN_UP_UNAVAILABLE: "Sign-up isn't open yet.",
       SIGN_UP_RATE_LIMITED: "Too many requests. Please wait a minute and try again.",
+      INVALID_NAME: "Enter your name (up to 80 characters).",
       PASSWORD_TOO_SHORT: "Use at least 8 characters for the password.",
       TOKEN_INVALID: "This link has expired or was already used.",
       ACCOUNT_EXISTS: "You already have an account. Sign in, or reset your password.",
@@ -216,11 +217,11 @@ export const getTrip = (id: string) => api<unknown>(`/v1/trips/${encodeURICompon
 export const getAuthCapabilities = () => api<unknown>("/v1/auth/capabilities").then(value => z.object({ google: z.boolean(), emailPassword: z.boolean(), emailSignUp: z.boolean().optional(), telegramMiniApp: z.boolean().optional() }).parse(value));
 export const emailPasswordSignIn = (input: { email: string; password: string; returnTo: string; embedded?: true }) => api<{ appPath: string }>("/v1/auth/email-password", { method: "POST", body: JSON.stringify(input) });
 
-/** Creates nothing yet, and takes no password: the server emails a link, and the person chooses the password on the page it opens. */
-export const emailSignUp = (input: { email: string; displayName: string; returnTo: string; language: "en" | "he" }) =>
+/** Creates nothing yet, and takes no password and no name: the server emails a link, and the person chooses the name and password on the page it opens. */
+export const emailSignUp = (input: { email: string; returnTo: string; language: "en" | "he" }) =>
   api<{ status: "check_your_email" }>("/v1/auth/sign-up", { method: "POST", body: JSON.stringify(input) });
-/** Spends the emailed token together with the password chosen on the verify page: creates the account and signs the person in. */
-export const verifyEmail = (input: { token: string; password: string }) => api<{ appPath: string }>("/v1/auth/verify-email", { method: "POST", body: JSON.stringify(input) });
+/** Spends the emailed token together with the name and password chosen on the verify page: creates the account and signs the person in. */
+export const verifyEmail = (input: { token: string; password: string; displayName: string }) => api<{ appPath: string }>("/v1/auth/verify-email", { method: "POST", body: JSON.stringify(input) });
 /** Always the same answer, whether or not the address has an account. */
 export const forgotPassword = (input: { email: string; language: "en" | "he" }) =>
   api<{ status: "check_your_email" }>("/v1/auth/password/forgot", { method: "POST", body: JSON.stringify(input) });

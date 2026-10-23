@@ -40,15 +40,16 @@ it("sign-up posts the details with the returnTo it arrived with, then shows 'che
     handler: (path) => path === "/v1/auth/sign-up" ? json({ status: "check_your_email" }, 202) : undefined,
   });
   await screen.findByLabelText("Email");
-  fireEvent.change(field("Your name"), { target: { value: "Dana Organizer" } });
   fireEvent.change(field("Email"), { target: { value: "dana@mail.example.test" } });
-  expect(screen.queryByLabelText("Password")).toBeNull();   // the password is chosen on the page the emailed link opens
+  // Neither the password nor the name is asked for here: both are chosen on the page the emailed link opens.
+  expect(screen.queryByLabelText("Password")).toBeNull();
+  expect(screen.queryByLabelText("Your name")).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: "Email me a link" }));
   expect(await screen.findByRole("heading", { name: "Check your email" })).toBeInTheDocument();
   expect(screen.getByText("dana@mail.example.test")).toBeInTheDocument();
   const sent = calls.find((c) => c.path === "/v1/auth/sign-up")!;
   expect(sent.method).toBe("POST");
-  expect(sent.body).toEqual({ displayName: "Dana Organizer", email: "dana@mail.example.test", returnTo: "/trips/new", language: "en" });
+  expect(sent.body).toEqual({ email: "dana@mail.example.test", returnTo: "/trips/new", language: "en" });
   expect(screen.getByTestId("route")).toHaveTextContent("/sign-up");
 });
 
@@ -62,7 +63,6 @@ it("sign-up says 'Sign-up isn't open yet' when the server has no email configure
 it("a 503 SIGN_UP_UNAVAILABLE from the server turns the page into the same closed state", async () => {
   mount("/sign-up", { handler: (path) => path === "/v1/auth/sign-up" ? json({ error: "SIGN_UP_UNAVAILABLE" }, 503) : undefined });
   await screen.findByLabelText("Email");
-  fireEvent.change(field("Your name"), { target: { value: "D" } });
   fireEvent.change(field("Email"), { target: { value: "d@mail.example.test" } });
   fireEvent.click(screen.getByRole("button", { name: "Email me a link" }));
   expect(await screen.findByRole("heading", { name: "Sign-up isn't open yet" })).toBeInTheDocument();
@@ -71,14 +71,14 @@ it("a 503 SIGN_UP_UNAVAILABLE from the server turns the page into the same close
 it("a rate-limit or short-password refusal is shown on the form, not swallowed", async () => {
   mount("/sign-up", { handler: (path) => path === "/v1/auth/sign-up" ? json({ error: "SIGN_UP_RATE_LIMITED" }, 429) : undefined });
   await screen.findByLabelText("Email");
-  fireEvent.change(field("Your name"), { target: { value: "D" } });
   fireEvent.change(field("Email"), { target: { value: "d@mail.example.test" } });
   fireEvent.click(screen.getByRole("button", { name: "Email me a link" }));
   expect(await screen.findByRole("alert")).toHaveTextContent(/Too many requests/);
   expect(screen.getByRole("heading", { name: "Create your account" })).toBeInTheDocument();
 });
 
-const choose = (password: string, repeat = password) => {
+const choose = (password: string, repeat = password, name = "Dana Organizer") => {
+  fireEvent.change(field("Your name"), { target: { value: name } });
   fireEvent.change(field("Password"), { target: { value: password } });
   fireEvent.change(field("Repeat it"), { target: { value: repeat } });
   fireEvent.click(screen.getByRole("button", { name: "Create account and sign in" }));
@@ -88,7 +88,7 @@ it("opening the verify link spends NOTHING; only the submit sends the token with
   const calls = mount("/verify-email#token=ev_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG", {
     handler: (path) => path === "/v1/auth/verify-email" ? json({ appPath: "/trips/new" }) : undefined,
   });
-  expect(await screen.findByRole("heading", { name: "Choose your password" })).toBeInTheDocument();
+  expect(await screen.findByRole("heading", { name: "Finish your account" })).toBeInTheDocument();
   expect(window.location.hash).toBe("");
   // Settled, rendered, StrictMode double-run done: still no call that could spend the token.
   expect(calls.some((c) => c.path === "/v1/auth/verify-email")).toBe(false);
@@ -97,32 +97,44 @@ it("opening the verify link spends NOTHING; only the submit sends the token with
   const verifies = calls.filter((c) => c.path === "/v1/auth/verify-email");
   expect(verifies).toHaveLength(1);
   expect(verifies[0]!.method).toBe("POST");
-  expect(verifies[0]!.body).toEqual({ token: "ev_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG", password: "a brand new passphrase" });
+  expect(verifies[0]!.body).toEqual({ token: "ev_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG", password: "a brand new passphrase", displayName: "Dana Organizer" });
 });
 
 it("two different passwords are refused on the page, before anything is sent; a too-short one from the server keeps the form (the link is not burned)", async () => {
   const calls = mount("/verify-email#token=ev_keep", {
     handler: (path) => path === "/v1/auth/verify-email" ? json({ error: "PASSWORD_TOO_SHORT" }, 400) : undefined,
   });
-  await screen.findByRole("heading", { name: "Choose your password" });
+  await screen.findByRole("heading", { name: "Finish your account" });
   choose("a brand new passphrase", "something else entirely");
   expect(await screen.findByRole("alert")).toHaveTextContent("don't match");
   expect(calls.some((c) => c.path === "/v1/auth/verify-email")).toBe(false);
   choose("longenough");
   await waitFor(() => expect(calls.filter((c) => c.path === "/v1/auth/verify-email")).toHaveLength(1));
   expect(await screen.findByRole("alert")).toHaveTextContent("at least 8 characters");
-  expect(screen.getByRole("heading", { name: "Choose your password" })).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "Finish your account" })).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Create account and sign in" })).toBeEnabled();
+});
+
+it("the name is sent trimmed, and a server INVALID_NAME keeps the form instead of burning the link", async () => {
+  const calls = mount("/verify-email#token=ev_name", {
+    handler: (path) => path === "/v1/auth/verify-email" ? json({ error: "INVALID_NAME" }, 400) : undefined,
+  });
+  await screen.findByRole("heading", { name: "Finish your account" });
+  choose("a brand new passphrase", "a brand new passphrase", "   Dana Organizer   ");
+  expect(await screen.findByRole("alert")).toHaveTextContent("Enter your name");
+  expect(calls.find((c) => c.path === "/v1/auth/verify-email")!.body).toMatchObject({ displayName: "Dana Organizer" });
+  expect(screen.getByRole("heading", { name: "Finish your account" })).toBeInTheDocument();
+  expect(screen.getByLabelText("Your name")).toHaveValue("   Dana Organizer   ");
 });
 
 it("the verify page also reads a ?token= query, and a refused token says so with a way forward", async () => {
   const calls = mount("/verify-email?token=ev_fromquery", {
     handler: (path) => path === "/v1/auth/verify-email" ? json({ error: "TOKEN_INVALID" }, 400) : undefined,
   });
-  await screen.findByRole("heading", { name: "Choose your password" });
+  await screen.findByRole("heading", { name: "Finish your account" });
   choose("a brand new passphrase");
   expect(await screen.findByRole("heading", { name: "This link didn't work" })).toBeInTheDocument();
-  expect(calls.find((c) => c.path === "/v1/auth/verify-email")!.body).toEqual({ token: "ev_fromquery", password: "a brand new passphrase" });
+  expect(calls.find((c) => c.path === "/v1/auth/verify-email")!.body).toEqual({ token: "ev_fromquery", password: "a brand new passphrase", displayName: "Dana Organizer" });
   expect(screen.getByRole("link", { name: "Start sign-up again" })).toHaveAttribute("href", "/sign-up");
 });
 
@@ -135,7 +147,7 @@ it("the verify page with no token never calls the server and never shows the for
 
 it("a token spent after the address got an account some other way says so and offers sign-in and reset", async () => {
   mount("/verify-email#token=ev_x", { handler: (path) => path === "/v1/auth/verify-email" ? json({ error: "ACCOUNT_EXISTS" }, 409) : undefined });
-  await screen.findByRole("heading", { name: "Choose your password" });
+  await screen.findByRole("heading", { name: "Finish your account" });
   choose("a brand new passphrase");
   expect(await screen.findByRole("heading", { name: "You already have an account" })).toBeInTheDocument();
   expect(screen.getByRole("link", { name: "reset your password" })).toHaveAttribute("href", "/forgot-password");

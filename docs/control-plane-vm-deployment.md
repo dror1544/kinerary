@@ -873,9 +873,11 @@ drifting. Notes on what you are filling in:
   (`WEB_API_ENV` in `vm-release.py`, mirrored in `compose.vm.yml`), and
   `PORTAL_EMAIL_API_KEY` is on it, so `plan` refuses a profile that names it
   while `vm.env` leaves it empty. The sign-up flow itself: a new organizer gives an
-  address and a name, is emailed a link, and chooses the password on the page the
-  link opens (opening it spends nothing; the submit does). Like the Mini App fields, the profile schema is strict: add these keys
-  only in the same step as an upgrade to a revision that contains this change.
+  address only, is emailed a link, and chooses their name and password on the page
+  the link opens (opening it spends nothing; the submit does). Neither is asked
+  for at sign-up, because anyone can start a sign-up for anyone's address and
+  would otherwise know the password or write the name. Like the Mini App fields,
+  the profile schema is strict: add these keys only in the same step as an upgrade to a revision that contains this change.
 - **Telegram Mini App fields** (`web.telegram_bot_token_secret_ref`,
   `web.telegram_init_data_max_age_seconds`) and **`public_api.trust_proxy`** arrive
   with the Mini App sign-in change (#442, PR #456). The profile schema is strict, so

@@ -10,7 +10,7 @@ export function pickLanguage(requested: unknown, acceptLanguage: unknown): MailL
 }
 
 export type PortalMail =
-  | { kind: "verify"; link: string; displayName: string; ttlHours: number }
+  | { kind: "verify"; link: string; ttlHours: number }
   | { kind: "reset"; link: string; ttlMinutes: number }
   | { kind: "existing"; signInUrl: string; resetUrl: string };
 
@@ -23,7 +23,7 @@ function copy(mail: PortalMail, language: MailLanguage): Copy {
     switch (mail.kind) {
       case "verify": return {
         subject: "סיום יצירת החשבון ב-Kinerary",
-        lines: [`שלום ${mail.displayName},`, `כדי לסיים את יצירת החשבון, בחרו סיסמה. הקישור יאשר גם את כתובת האימייל, תקף ל-${mail.ttlHours} שעות ופועל פעם אחת בלבד.`],
+        lines: ["שלום,", `כדי לסיים את יצירת החשבון, בחרו סיסמה. הקישור יאשר גם את כתובת האימייל, תקף ל-${mail.ttlHours} שעות ופועל פעם אחת בלבד.`],
         action: { label: "בחירת סיסמה לסיום", url: mail.link },
         footer: "אם לא ביקשתם ליצור חשבון ב-Kinerary, אפשר להתעלם מהמכתב הזה. לא ייווצר חשבון.",
       };
@@ -47,7 +47,7 @@ function copy(mail: PortalMail, language: MailLanguage): Copy {
   switch (mail.kind) {
     case "verify": return {
       subject: "Finish creating your Kinerary account",
-      lines: [`Hi ${mail.displayName},`, `Choose your password to finish creating your account. The link also confirms your email address; it works once and is valid for ${mail.ttlHours} hours.`],
+      lines: ["Hi,", `Choose your password to finish creating your account. The link also confirms your email address; it works once and is valid for ${mail.ttlHours} hours.`],
       action: { label: "Choose your password to finish", url: mail.link },
       footer: "If you didn't ask for a Kinerary account, you can ignore this message. No account will be created.",
     };

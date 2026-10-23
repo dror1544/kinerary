@@ -28,6 +28,7 @@ export default function VerifyEmailPage() {
     if (token) window.history.replaceState(window.history.state, "", location.pathname);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const [error, setError] = useState<{ code: string; message: string } | null>(null);
@@ -50,7 +51,7 @@ export default function VerifyEmailPage() {
     setError(null);
     setPending(true);
     try {
-      const { appPath } = await verifyEmail({ token, password });
+      const { appPath } = await verifyEmail({ token, password, displayName: displayName.trim() });
       queryClient.clear();
       await queryClient.fetchQuery({ queryKey: ["me"], queryFn: getMe });
       navigate(safeReturnTo(appPath), { replace: true });
@@ -60,9 +61,10 @@ export default function VerifyEmailPage() {
     }
   };
   return (
-    <AccountShell eyebrow="Kinerary personal space" title="Choose your password">
-      <p>Your email address is confirmed by this link. Choose a password to finish creating your account; you'll be signed in afterwards.</p>
+    <AccountShell eyebrow="Kinerary personal space" title="Finish your account">
+      <p>Your email address is confirmed by this link. Tell us your name and choose a password to finish creating your account; you'll be signed in afterwards.</p>
       <form className="compact-form" onSubmit={submit}>
+        <label>Your name<input required type="text" maxLength={80} autoComplete="name" value={displayName} onChange={(e) => setDisplayName(e.target.value)} /></label>
         <label>Password<input required type="password" minLength={8} maxLength={1024} autoComplete="new-password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>
         <label>Repeat it<input required type="password" minLength={8} maxLength={1024} autoComplete="new-password" value={confirm} onChange={(e) => setConfirm(e.target.value)} /></label>
         <p className="field-hint">At least 8 characters.</p>

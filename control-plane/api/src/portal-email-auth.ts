@@ -10,15 +10,20 @@
  * THE SHAPE, and why each part is where it is:
  *
  *   - THE PASSWORD IS CHOSEN AT VERIFICATION, NOT AT SIGN-UP. Sign-up takes an
- *     address and a name only; the emailed link opens a page that asks for the
- *     password, and the request that sends it is the one that spends the token.
+ *     address only; the emailed link opens a page that asks for the name and the
+ *     password, and the request that sends them is the one that spends the token.
  *     Anyone can start a sign-up for anyone's address, so a password chosen then
  *     would be known to a stranger the moment the real owner clicked the link.
  *     Opening the link spends nothing (a mail scanner that fetches it burns no
- *     token), and a too-short password is refused before the token is touched.
+ *     token), and a too-short password or an unusable name is refused before the
+ *     token is touched.
+ *   - THE NAME IS CHOSEN THERE TOO, for the same reason: a name typed at sign-up
+ *     would become the owner's account name AND the greeting in the mail sent to
+ *     the owner's inbox, both written by a stranger. The verification mail greets
+ *     generically, and the pending row holds no name.
  *   - AN UNVERIFIED SIGN-UP IS NOT AN ACCOUNT. It is one row in
- *     `email_action_tokens` (purpose `sign_up`): the name and the digest of the
- *     emailed token, no password at all. No `users`,
+ *     `email_action_tokens` (purpose `sign_up`): the digest of the
+ *     emailed token and the return path, no password and no name. No `users`,
  *     `user_identities` or `password_credentials` row exists until the token is
  *     consumed. So an unverified address cannot sign in (nothing to match), cannot
  *     be claimed, and cannot block an operator's invitation or a Google sign-in
@@ -70,6 +75,29 @@ const RESET_TOKEN = /^pr_[A-Za-z0-9_-]{43}$/;
 const sha = (value: string) => `sha256:${createHash("sha256").update(value).digest("hex")}`;
 const newToken = (prefix: "ev" | "pr") => `${prefix}_${randomBytes(32).toString("base64url")}`;
 const rowId = () => `eat_${randomBytes(16).toString("hex")}`;
+
+export const DISPLAY_NAME_MAX_LENGTH = 80;
+
+/**
+ * The name a person types for their own account, made safe to store, show and
+ * put in a mail: control, format (which includes the bidi overrides and
+ * zero-width characters), surrogate, private-use and line/paragraph-separator
+ * characters become spaces, the invisible filler letters the same, whitespace is
+ * collapsed and trimmed. Null when nothing is left or more than
+ * DISPLAY_NAME_MAX_LENGTH characters remain: the caller refuses, it never clips
+ * a name the person has not seen clipped. The same character classes as
+ * identity.ts's telegramDisplayName, which cleans a name Telegram supplied.
+ */
+export function cleanDisplayName(value: unknown): string | null {
+  if (typeof value !== "string" || value.length > 1024) return null;
+  const cleaned = value
+    .replace(/[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Zl}\p{Zp}]/gu, " ")
+    .replace(/[ㅤ⠀ᅟᅠﾠ]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const length = Array.from(cleaned).length;
+  return length >= 1 && length <= DISPLAY_NAME_MAX_LENGTH ? cleaned : null;
+}
 
 export function isPlausibleEmail(value: unknown): value is string {
   return typeof value === "string" && value.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
@@ -133,7 +161,7 @@ async function purgeStale(db: pg.Pool): Promise<void> {
   await db.query("DELETE FROM control_plane.email_action_tokens WHERE created_at < now() - interval '2 days'");
 }
 
-export interface SignUpRequest { email: string; displayName?: string; returnTo: string; language: MailLanguage }
+export interface SignUpRequest { email: string; returnTo: string; language: MailLanguage }
 
 /**
  * Everything a sign-up request does after it has been answered. A new address
@@ -161,7 +189,6 @@ export async function startSignUp(ctx: EmailAuthContext, input: SignUpRequest): 
     return;
   }
   const token = newToken("ev");
-  const displayName = (input.displayName?.trim() || to.split("@")[0] || "Kinerary organizer").slice(0, 120);
   const client = await ctx.db.connect();
   try {
     await client.query("BEGIN");
@@ -172,9 +199,9 @@ export async function startSignUp(ctx: EmailAuthContext, input: SignUpRequest): 
       [emailDigest],
     );
     await client.query(
-      `INSERT INTO control_plane.email_action_tokens(id, purpose, token_digest, email_digest, display_name, return_to, expires_at)
-       VALUES ($1, 'sign_up', $2, $3, $4, $5, now() + ($6 * interval '1 second'))`,
-      [rowId(), sha(token), emailDigest, displayName, input.returnTo, SIGN_UP_TOKEN_TTL_SECONDS],
+      `INSERT INTO control_plane.email_action_tokens(id, purpose, token_digest, email_digest, return_to, expires_at)
+       VALUES ($1, 'sign_up', $2, $3, $4, now() + ($5 * interval '1 second'))`,
+      [rowId(), sha(token), emailDigest, input.returnTo, SIGN_UP_TOKEN_TTL_SECONDS],
     );
     await client.query("COMMIT");
   } catch (error) {
@@ -184,7 +211,7 @@ export async function startSignUp(ctx: EmailAuthContext, input: SignUpRequest): 
     client.release();
   }
   await deliver(ctx, "sign_up", {
-    kind: "verify", link: `${ctx.publicOrigin}/verify-email#token=${token}`, displayName, ttlHours: SIGN_UP_TOKEN_TTL_SECONDS / 3600,
+    kind: "verify", link: `${ctx.publicOrigin}/verify-email#token=${token}`, ttlHours: SIGN_UP_TOKEN_TTL_SECONDS / 3600,
   }, input.language, to);
 }
 
@@ -243,16 +270,17 @@ export type VerifyResult =
 
 /**
  * Spends a sign-up token and, if the address still has no account, creates it
- * with the password the person just chose (`passwordHash`, computed by the
- * caller BEFORE the transaction, as for a reset). The caller owns BEGIN/COMMIT so
+ * with the password and name the person just chose (`passwordHash`, computed by
+ * the caller BEFORE the transaction, as for a reset; `displayName`, already
+ * cleaned by `cleanDisplayName`). The caller owns BEGIN/COMMIT so
  * the account, its credential and the session it is signed in with commit
  * together. The token is spent even when the address turned out to have an
  * account already: it will not be tried again.
  */
-export async function consumeSignUpToken(client: pg.PoolClient, token: unknown, passwordHash: string): Promise<VerifyResult> {
+export async function consumeSignUpToken(client: pg.PoolClient, token: unknown, passwordHash: string, displayName: string): Promise<VerifyResult> {
   if (typeof token !== "string" || !SIGN_UP_TOKEN.test(token)) return { ok: false, error: "TOKEN_INVALID" };
-  const found = await client.query<{ id: string; email_digest: string; display_name: string; return_to: string | null }>(
-    `SELECT id, email_digest, display_name, return_to FROM control_plane.email_action_tokens
+  const found = await client.query<{ id: string; email_digest: string; return_to: string | null }>(
+    `SELECT id, email_digest, return_to FROM control_plane.email_action_tokens
       WHERE token_digest = $1 AND purpose = 'sign_up' AND consumed_at IS NULL AND expires_at > now() FOR UPDATE`,
     [sha(token)],
   );
@@ -269,7 +297,7 @@ export async function consumeSignUpToken(client: pg.PoolClient, token: unknown, 
   );
   if ((taken.rowCount ?? 0) > 0) return { ok: false, error: "ACCOUNT_EXISTS" };
 
-  const userId = await resolveOrCreateEmailAccountByDigest(client, row.email_digest, row.display_name);
+  const userId = await resolveOrCreateEmailAccountByDigest(client, row.email_digest, displayName);
   const credential = await client.query(
     `INSERT INTO control_plane.password_credentials(user_id, email_digest, password_hash)
      VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING user_id`,
