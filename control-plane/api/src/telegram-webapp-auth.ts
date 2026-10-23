@@ -48,7 +48,7 @@
  * initData".
  */
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { isPrivateChatId, telegramDisplayLabel } from "./identity.js";
+import { isPrivateChatId, telegramDisplayName, type TelegramName } from "./identity.js";
 
 export const INIT_DATA_MAX_BYTES = 4096;
 /** How far in the future an auth_date may be (clock skew between Telegram and us). */
@@ -80,10 +80,10 @@ export interface VerifiedInitData {
   /** `chat_type` as Telegram signed it ("sender", "private", "group", ...), if present. */
   chatType: string | null;
   /**
-   * A short display label of the signed-in Telegram account (first name and @username), taken from the
-   * user object INSIDE the signed string. Display data only; never used to decide anything.
+   * First name and @username of the signed-in Telegram account, as separate fields, taken from the user
+   * object INSIDE the signed string. Display data only; never used to decide anything.
    */
-  label: string | null;
+  name: TelegramName | null;
 }
 
 export type InitDataResult =
@@ -177,7 +177,7 @@ export function verifyMiniAppInitData(
       replayKey: expected.toString("hex"),
       startParam: startParam === undefined || startParam === "" ? null : startParam,
       chatType: chatType === undefined || chatType === "" ? null : chatType,
-      label: telegramDisplayLabel(user as { first_name?: unknown; username?: unknown }),
+      name: telegramDisplayName(user as { first_name?: unknown; username?: unknown }),
     },
   };
 }

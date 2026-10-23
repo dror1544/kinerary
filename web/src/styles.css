@@ -549,6 +549,8 @@ h1 { margin: 0; max-width: 700px; font: 800 clamp(48px, 5.1vw, 78px)/1.01 "Manro
 .telegram-menu .subtle, .telegram-menu small { margin: 0; color: #60727f; }
 .telegram-menu .text-button { text-align: left; display: grid; gap: 2px; }
 .product-shell .telegram-menu small { margin: 0; }
+.telegram-handle { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.92em; opacity: 0.85; }
+.telegram-handle, .telegram-name { unicode-bidi: isolate; }
 .telegram-issued, .telegram-confirm { display: grid; gap: 8px; padding: 8px; border-radius: 10px; background: #eaf7f5; }
 .status-chip { display: inline-flex; border-radius: 99px; background: #e9f7f5; color: #167b74; padding: 7px 10px; font-size: 11px; font-weight: 800; }
 .product-shell .empty-state { text-align: center; padding: 70px 30px; }

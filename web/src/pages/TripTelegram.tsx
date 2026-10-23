@@ -14,6 +14,23 @@ const HOW: Record<TelegramLinkVia, string> = {
 };
 
 /**
+ * Who a Telegram link is, as far as the server may say: the first name, then the @username in a style of its
+ * own. They are separate fields on purpose - a first name can say anything, including someone else's @handle
+ * (the server strips '@' from it) - and only the second is a handle. Each sits in <bdi> so a right-to-left
+ * name cannot reorder the text around it. Display only; nothing acts on it. With neither: "Telegram account".
+ */
+function Who({ name, username, none = "Telegram account" }: { name?: string; username?: string; none?: string }) {
+  if (!name && !username) return <>{none}</>;
+  return (
+    <>
+      {name && <bdi className="telegram-name">{name}</bdi>}
+      {name && username && " "}
+      {username && <bdi className="telegram-handle">@{username}</bdi>}
+    </>
+  );
+}
+
+/**
  * The trip card's Telegram status and its ⋮ menu.
  *
  * A Telegram link is PER TRIP: the account that is linked can open THIS trip in
@@ -97,7 +114,7 @@ export function TripTelegram({ trip }: { trip: TripSummary }) {
           {canLink && unlinked.map((entry) => (
             confirming === entry.id
               ? <div key={entry.id} className="telegram-confirm" role="group" aria-label="Confirm restore">
-                <small>Restore Telegram access for {entry.label ?? "this Telegram account"}? It will open this trip again, and sign in fresh.</small>
+                <small>Restore Telegram access for <Who name={entry.name} username={entry.username} none="this Telegram account" />? It will open this trip again, and sign in fresh.</small>
                 <span>
                   <button type="button" className="text-button" onClick={() => restore.mutate(entry.id)} disabled={restore.isPending}>Confirm restore</button>
                   <button type="button" className="text-button" onClick={() => setConfirming(null)}>Keep unlinked</button>
@@ -105,7 +122,7 @@ export function TripTelegram({ trip }: { trip: TripSummary }) {
               </div>
               : <button key={entry.id} type="button" role="menuitem" className="text-button telegram-restore" onClick={() => { restore.reset(); setConfirming(entry.id); }}>
                 Restore Telegram · unlinked {formatDay(entry.unlinkedAt)}
-                <small>{entry.label ?? "Telegram account"} · was linked {formatDay(entry.linkedAt)}, {HOW[entry.via]}</small>
+                <small><Who name={entry.name} username={entry.username} /> · was linked {formatDay(entry.linkedAt)}, {HOW[entry.via]}</small>
               </button>
           ))}
           {links.map((entry) => (
@@ -119,7 +136,7 @@ export function TripTelegram({ trip }: { trip: TripSummary }) {
               </div>
               : <button key={entry.id} type="button" role="menuitem" className="text-button telegram-unlink" onClick={() => setConfirming(entry.id)}>
                 Unlink Telegram · linked {formatDay(entry.linkedAt)}
-                <small>{entry.label ? `${entry.label} · ` : ""}{HOW[entry.via]}{entry.lastSignedInAt ? ` · last opened ${formatDay(entry.lastSignedInAt)}` : " · not opened yet"}</small>
+                <small>{entry.name || entry.username ? <><Who name={entry.name} username={entry.username} />{" · "}</> : null}{HOW[entry.via]}{entry.lastSignedInAt ? ` · last opened ${formatDay(entry.lastSignedInAt)}` : " · not opened yet"}</small>
               </button>
           ))}
           {link.isError && <div className="notice" role="alert">{link.error.message}</div>}

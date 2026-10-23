@@ -99,7 +99,7 @@ import type { GroupContext } from "./group-context.js";
 import { getSessionForChat, setFinishRequestedForChat, type SessionView } from "../interview.js";
 import { organizerDocumentRoute } from "../document-correction.js";
 import { visionProcessingConfig } from "../document-vision.js";
-import { digestTelegramId, telegramDisplayLabel } from "../identity.js";
+import { digestTelegramId, telegramDisplayName } from "../identity.js";
 import type { StructuredModelRunner } from "../model-runner.js";
 import { handleModelCommand, isSwitchableRunner } from "../model-task-settings.js";
 import { looksLikeAQuestion, type ChatType, type WireMessageEvent } from "./protocol.js";
@@ -601,7 +601,9 @@ async function unboundDmTripList(
   message: { chat?: { type?: string }; from?: { id?: number | string; language_code?: string } },
   chatId: string,
 ): Promise<DirectReply | null> {
-  if (message.chat?.type !== "private" || message.from?.id === undefined) return null;
+  // The sender must BE the chat: in a private chat the two ids are the same, so any other pairing is not a
+  // person writing in their own DM, and gets the old reply rather than a list.
+  if (message.chat?.type !== "private" || message.from?.id === undefined || String(message.from.id) !== chatId) return null;
   const trips = await listOrganizerTrips(db, String(message.from.id), chatId);
   if (trips.length === 0) return null;
   const language = await resolveChatLanguage(db, chatId, message.from?.language_code);
@@ -711,7 +713,7 @@ export async function dispatchUpdate(
     if (message.chat?.type !== "private" || message.from?.id === undefined) {
       return { kind: "reply", reply: { chatId, text: strings.notPrivate } };
     }
-    const linked = await redeemTelegramLinkToken(db, linkToken, String(message.from.id), telegramDisplayLabel(message.from));
+    const linked = await redeemTelegramLinkToken(db, linkToken, String(message.from.id), telegramDisplayName(message.from));
     log(structuredLog("info", "trip_bot.telegram_link", { outcome: linked.ok ? (linked.alreadyLinked ? "already_linked" : "linked") : "refused" }));
     return {
       kind: "reply",
@@ -725,7 +727,7 @@ export async function dispatchUpdate(
   }
 
   if (parsed.kind === "start" && !groupStartToken) {
-    const outcome = await startFromDeepLink(db, chatId, parsed.payload, log, message.from?.language_code, telegramDisplayLabel(message.from));
+    const outcome = await startFromDeepLink(db, chatId, parsed.payload, log, message.from?.language_code, telegramDisplayName(message.from));
     switch (outcome.kind) {
       case "started": {
         // The opening is the document offer, not the first question. Asking

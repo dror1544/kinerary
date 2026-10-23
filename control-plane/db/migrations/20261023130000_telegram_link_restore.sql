@@ -44,8 +44,9 @@
 --
 -- THE LINK'S DISPLAY LABEL (owner decision 2026-10-23, "name + confirm"). A restore is
 -- one click on an account the owner may not recognise, so each link row carries a
--- short label of the Telegram account - first name and @username - for the dashboard
--- to show next to it. `telegram_label` is DISPLAY DATA ONLY. It is written only from
+-- short name of the Telegram account - first name and @username, in TWO columns so a
+-- first name that says "@someone" can never pass for the handle - for the dashboard to
+-- show next to it. Both are DISPLAY DATA ONLY. They are written only from
 -- what Telegram delivered on a verified path (the update's `from`, or the user inside
 -- signature-checked initData), never from a request body; it is bounded and stripped
 -- of control characters before it gets here; and nothing ever decides anything from
@@ -82,17 +83,21 @@ CREATE INDEX IF NOT EXISTS telegram_organizer_trip_links_restorable_idx
   WHERE revoked_reason = 'owner_unlinked' AND restored_at IS NULL;
 
 ALTER TABLE control_plane.telegram_organizer_trip_links
-  ADD COLUMN IF NOT EXISTS telegram_label text;
+  ADD COLUMN IF NOT EXISTS telegram_first_name text,
+  ADD COLUMN IF NOT EXISTS telegram_username text;
 ALTER TABLE control_plane.telegram_organizer_trip_links
-  DROP CONSTRAINT IF EXISTS telegram_organizer_trip_links_label_length_check;
+  DROP CONSTRAINT IF EXISTS telegram_organizer_trip_links_name_shape_check;
 ALTER TABLE control_plane.telegram_organizer_trip_links
-  ADD CONSTRAINT telegram_organizer_trip_links_label_length_check
-  CHECK (telegram_label IS NULL OR char_length(telegram_label) BETWEEN 1 AND 80);
+  ADD CONSTRAINT telegram_organizer_trip_links_name_shape_check
+  CHECK ((telegram_first_name IS NULL OR (char_length(telegram_first_name) BETWEEN 1 AND 40 AND position('@' in telegram_first_name) = 0))
+         AND (telegram_username IS NULL OR telegram_username ~ '^[A-Za-z0-9_]{1,32}$'));
 
 ALTER TABLE control_plane.telegram_member_links
-  ADD COLUMN IF NOT EXISTS telegram_label text;
+  ADD COLUMN IF NOT EXISTS telegram_first_name text,
+  ADD COLUMN IF NOT EXISTS telegram_username text;
 ALTER TABLE control_plane.telegram_member_links
-  DROP CONSTRAINT IF EXISTS telegram_member_links_label_length_check;
+  DROP CONSTRAINT IF EXISTS telegram_member_links_name_shape_check;
 ALTER TABLE control_plane.telegram_member_links
-  ADD CONSTRAINT telegram_member_links_label_length_check
-  CHECK (telegram_label IS NULL OR char_length(telegram_label) BETWEEN 1 AND 80);
+  ADD CONSTRAINT telegram_member_links_name_shape_check
+  CHECK ((telegram_first_name IS NULL OR (char_length(telegram_first_name) BETWEEN 1 AND 40 AND position('@' in telegram_first_name) = 0))
+         AND (telegram_username IS NULL OR telegram_username ~ '^[A-Za-z0-9_]{1,32}$'));

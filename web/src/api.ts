@@ -40,12 +40,13 @@ export type TripSummary = {
 
 export type TelegramLinkVia = "interview_link" | "earlier_interview" | "dashboard_link" | "dashboard_restore" | "trip_password" | "invite";
 
-export type UnlinkedTelegramLink = { id: string; via: TelegramLinkVia; linkedAt: string; unlinkedAt: string; label?: string };
+export type UnlinkedTelegramLink = { id: string; via: TelegramLinkVia; linkedAt: string; unlinkedAt: string; name?: string; username?: string };
 
 export type TelegramLink = {
   id: string; via: TelegramLinkVia;
-  /** First name and @username of the Telegram account, when the server may show it (display only). */
-  label?: string;
+  /** First name and @username of the Telegram account, as SEPARATE fields, when the server may show them (display only). */
+  name?: string;
+  username?: string;
   linkedAt: string; firstSignedInAt: string | null; lastSignedInAt: string | null;
 };
 
@@ -106,9 +107,9 @@ const memberSchema: z.ZodType<MemberSummary> = z.object({
   id: z.string(), displayName: z.string(), role: z.string(), runtimeUsername: z.string().nullable(), you: z.boolean(), removable: z.boolean(),
 });
 const telegramViaSchema = z.enum(["interview_link", "earlier_interview", "dashboard_link", "dashboard_restore", "trip_password", "invite"]);
-const unlinkedTelegramLinkSchema: z.ZodType<UnlinkedTelegramLink> = z.object({ id: z.string(), via: telegramViaSchema, linkedAt: z.string(), unlinkedAt: z.string(), label: z.string().optional() });
+const unlinkedTelegramLinkSchema: z.ZodType<UnlinkedTelegramLink> = z.object({ id: z.string(), via: telegramViaSchema, linkedAt: z.string(), unlinkedAt: z.string(), name: z.string().optional(), username: z.string().optional() });
 const telegramLinkSchema: z.ZodType<TelegramLink> = z.object({
-  id: z.string(), via: telegramViaSchema, label: z.string().optional(),
+  id: z.string(), via: telegramViaSchema, name: z.string().optional(), username: z.string().optional(),
   linkedAt: z.string(), firstSignedInAt: z.string().nullable(), lastSignedInAt: z.string().nullable(),
 });
 const telegramSchema = z.object({ links: z.array(telegramLinkSchema), unlinked: z.array(unlinkedTelegramLinkSchema).optional() });

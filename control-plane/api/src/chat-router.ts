@@ -50,7 +50,7 @@ import {
   type SessionView,
 } from "./interview.js";
 import { peekEnrollmentTripId } from "./enrollment.js";
-import { digestTelegramId, isPrivateChatId } from "./identity.js";
+import { digestTelegramId, isPrivateChatId, type TelegramName } from "./identity.js";
 import { structuredLog } from "./redaction.js";
 
 // ── Inbound text ─────────────────────────────────────────────────────────────
@@ -796,8 +796,8 @@ export async function startFromDeepLink(
   log: (line: string) => void = () => {},
   /** The organizer's Telegram client locale, if the update carried one. */
   languageHint?: string,
-  /** The Telegram account's display label, from the update's verified `from` (display data only). */
-  telegramLabel?: string | null,
+  /** The Telegram account's first name and @username, from the update's verified `from` (display data only). */
+  telegramName?: TelegramName | null,
 ): Promise<StartLinkOutcome> {
   // A chat already conducting an interview must not consume a second
   // enrollment. The partial unique index on (telegram_chat_id) would reject
@@ -868,7 +868,7 @@ export async function startFromDeepLink(
     return { kind: "rejected", reason: "NOT_PRIVATE_CHAT" };
   }
 
-  const result = await startSession(db, payload, log, undefined, chatId, languageHint, telegramLabel);
+  const result = await startSession(db, payload, log, undefined, chatId, languageHint, telegramName);
   if (!result.ok) {
     log(structuredLog("info", "chat_router.start_link_rejected", { safe_error_code: result.reason }));
     return { kind: "rejected", reason: result.reason };

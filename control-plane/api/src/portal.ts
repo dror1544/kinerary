@@ -773,7 +773,7 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
           miniAppLog(structuredLog("warn", "mini_app.init_data_rejected", { reason: "REPLAY_CAP" }));
           return reply.code(401).send({ error: "TELEGRAM_INIT_DATA_INVALID" });
         }
-        const used = await recordLinkSignIn(client, outcome.target.linkKind, outcome.target.linkId, launch.label);
+        const used = await recordLinkSignIn(client, outcome.target.linkKind, outcome.target.linkId, launch.name);
         if (!used) {
           await client.query("ROLLBACK");
           return reply.code(401).send({ error: "TELEGRAM_NOT_LINKED", fallback: "none" });

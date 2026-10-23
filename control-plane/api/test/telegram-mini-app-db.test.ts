@@ -502,8 +502,8 @@ test("a forwarded interview link is visible on the trip card, and the organizer 
     assert.equal(card.statusCode, 200);
     const links = card.json().telegram.links as Array<Record<string, unknown>>;
     assert.equal(links.length, 1);
-    assert.deepEqual(Object.keys(links[0]!).sort(), ["firstSignedInAt", "id", "label", "lastSignedInAt", "linkedAt", "via"]);
-    assert.equal(links[0]!.label, "Test", "the label of the signed-in account, from its signed initData (display only)");
+    assert.deepEqual(Object.keys(links[0]!).sort(), ["firstSignedInAt", "id", "lastSignedInAt", "linkedAt", "name", "via"]);
+    assert.equal(links[0]!.name, "Test", "the first name of the signed-in account, from its signed initData (display only)");
     assert.ok(!JSON.stringify(links).includes("sha256:") && !JSON.stringify(links).includes(String(attacker)), "no id or digest beside it");
     assert.equal(links[0]!.id, linkId);
     assert.equal(links[0]!.via, "interview_link");

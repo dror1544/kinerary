@@ -32,7 +32,7 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import type pg from "pg";
-import { digestTelegramId, isPrivateChatId } from "./identity.js";
+import { digestTelegramId, isPrivateChatId, type TelegramName } from "./identity.js";
 import { LIVE_INTAKE_SESSION_PREDICATE } from "./organizer-trips.js";
 import { CHAT_DIGEST_SQL } from "./telegram-mini-app.js";
 import { NOT_RETIRED_SQL } from "./trip-retirement.js";
@@ -180,8 +180,8 @@ export async function redeemTelegramLinkToken(
   db: pg.Pool,
   rawToken: string,
   telegramUserId: string,
-  /** The Telegram account's display label, from the update's verified `from` (display data only, never from the message). */
-  telegramLabel: string | null = null,
+  /** The Telegram account's first name and @username, from the update's verified `from` (display data only, never from the message). */
+  telegramName: TelegramName | null = null,
 ): Promise<RedeemLinkTokenResult> {
   if (!LINK_TOKEN_PATTERN.test(rawToken) || !isPrivateChatId(telegramUserId)) return { ok: false, reason: "INVALID" };
   const client = await db.connect();
@@ -215,12 +215,15 @@ export async function redeemTelegramLinkToken(
       linkId = opaqueId("otl");
       await client.query(
         `INSERT INTO control_plane.telegram_organizer_trip_links
-           (id, user_id, trip_id, telegram_subject_digest, verified_via, telegram_label)
-         VALUES ($1, $2, $3, $4, 'dashboard_link_token', $5)`,
-        [linkId, token.user_id, token.trip_id, digest, telegramLabel],
+           (id, user_id, trip_id, telegram_subject_digest, verified_via, telegram_first_name, telegram_username)
+         VALUES ($1, $2, $3, $4, 'dashboard_link_token', $5, $6)`,
+        [linkId, token.user_id, token.trip_id, digest, telegramName?.firstName ?? null, telegramName?.username ?? null],
       );
-    } else if (telegramLabel) {
-      await client.query("UPDATE control_plane.telegram_organizer_trip_links SET telegram_label = $2 WHERE id = $1 AND telegram_label IS NULL", [linkId, telegramLabel]);
+    } else if (telegramName) {
+      await client.query(
+        `UPDATE control_plane.telegram_organizer_trip_links
+            SET telegram_first_name = COALESCE(telegram_first_name, $2), telegram_username = COALESCE(telegram_username, $3) WHERE id = $1`,
+        [linkId, telegramName.firstName, telegramName.username]);
     }
     // A relink restores the bot's organizer fact an Unlink demoted, and only that (see the helper).
     await restoreDemotedOrganizerPersonLink(client, token.trip_id, digest);
@@ -249,21 +252,27 @@ export async function redeemTelegramLinkToken(
  * binding of the chat (to this or any trip - the organizer may have switched it elsewhere since) and no live
  * interview on it, which would outrank a companion anyway and must not be disturbed.
  *
- * LOCK ORDER, as teardown's (scripts/teardown-trip.py retire_in_db, group-binding.ts): group-binding tokens
- * (not touched here), then chat bindings, then the trip row (read through the INSERT's SELECT). A concurrent
- * switch of the same chat holds the open binding FOR UPDATE; the partial unique index on open bindings is the
- * backstop, and ON CONFLICT DO NOTHING turns a lost race into "not reopened" rather than an error.
+ * TWO STEPS, because of LOCK ORDER. Teardown (scripts/teardown-trip.py `retire_in_db`) and group-binding.ts
+ * take group-binding tokens, then CHAT BINDINGS, then the TRIP row. Inserting a link row takes a KEY SHARE
+ * lock on `trips` through its foreign key, so every chat-binding lock this restore needs is taken FIRST, by
+ * `lockFreePrivateChats`, before the link row is written; `openBindings` runs last and only inserts. The
+ * order inside restoreTelegramLink is therefore memberships, link rows, chat bindings, then trips. (Taking
+ * the binding lock after the link INSERT was the reverse of teardown's and could deadlock with 40P01 against
+ * a concurrent retire - boundary review round 2, MF1.) A concurrent switch of the same chat holds the open
+ * binding FOR UPDATE; the partial unique index on open bindings is the backstop, and ON CONFLICT DO NOTHING
+ * turns a lost race into "not reopened" rather than an error.
  */
-async function reopenPrivateRoute(client: pg.PoolClient, revokedLinkId: string, tripId: string, digest: string): Promise<boolean> {
+async function lockFreePrivateChats(client: pg.PoolClient, revokedLinkId: string, tripId: string, digest: string): Promise<string[]> {
   const chats = await client.query<{ chat_id: string }>(
     `SELECT DISTINCT b.chat_id
        FROM control_plane.telegram_chat_bindings b
        JOIN control_plane.telegram_organizer_trip_links o ON o.id = $1
       WHERE b.trip_id = $2 AND b.closed_reason = 'telegram_unlinked' AND b.closed_at >= o.revoked_at
-        AND b.chat_id ~ '^[0-9]{1,20}$' AND ${CHAT_DIGEST_SQL("b.chat_id")} = $3`,
+        AND b.chat_id ~ '^[0-9]{1,20}$' AND ${CHAT_DIGEST_SQL("b.chat_id")} = $3
+      ORDER BY b.chat_id`,
     [revokedLinkId, tripId, digest],
   );
-  let reopened = false;
+  const free: string[] = [];
   for (const { chat_id: chatId } of chats.rows) {
     const open = await client.query(
       "SELECT 1 FROM control_plane.telegram_chat_bindings WHERE chat_id = $1 AND closed_at IS NULL FOR UPDATE",
@@ -272,6 +281,15 @@ async function reopenPrivateRoute(client: pg.PoolClient, revokedLinkId: string, 
     if (open.rowCount) continue;
     const interview = await client.query(`SELECT 1 FROM control_plane.intake_sessions WHERE ${LIVE_INTAKE_SESSION_PREDICATE}`, [chatId]);
     if (interview.rowCount) continue;
+    free.push(chatId);
+  }
+  return free;
+}
+
+/** Second step of the reopen: only inserts, so it adds no lock that runs ahead of teardown's order. */
+async function openBindings(client: pg.PoolClient, chatIds: readonly string[], tripId: string): Promise<boolean> {
+  let reopened = false;
+  for (const chatId of chatIds) {
     const inserted = await client.query(
       `INSERT INTO control_plane.telegram_chat_bindings (id, chat_id, trip_id, hermes_profile)
        SELECT $1, $2, t.id,
@@ -323,11 +341,11 @@ export type RestoreLinkResult =
  * gets restored_at / restored_by / restored_link_id. The bot's demoted
  * organizer fact comes back under the same marker rule as the lk_ relink.
  *
- * IT ALSO REOPENS THE BOT ROUTE (`reopenPrivateRoute`): the private chat whose
+ * IT ALSO REOPENS THE BOT ROUTE (`lockFreePrivateChats` then `openBindings`): the private chat whose
  * binding THIS Unlink closed gets a NEW open binding to the trip, so the restored
  * organizer's DM reaches the companion again instead of "I don't have a trip for
  * this chat". Only when that chat is free (no open binding, no live interview).
- * The label (`telegram_label`) is copied from the revoked row - display data
+ * The name (`telegram_first_name`, `telegram_username`) is copied from the revoked row - display data
  * only, never taken from the request.
  *
  * WHAT IT DELIBERATELY DOES NOT DO. It revives no session: every session the
@@ -360,8 +378,8 @@ export async function restoreTelegramLink(
     // Membership first, then the link row - the order the membership-end trigger takes them in.
     const tripTitle = await tripTheUserRuns(client, input.userId, peek.rows[0].trip_id, true);
     if (tripTitle === null) { await client.query("ROLLBACK"); return notFound; }
-    const old = await client.query<{ trip_id: string; telegram_subject_digest: string; telegram_label: string | null }>(
-      `SELECT trip_id, telegram_subject_digest, telegram_label FROM control_plane.telegram_organizer_trip_links
+    const old = await client.query<{ trip_id: string; telegram_subject_digest: string; telegram_first_name: string | null; telegram_username: string | null }>(
+      `SELECT trip_id, telegram_subject_digest, telegram_first_name, telegram_username FROM control_plane.telegram_organizer_trip_links
         WHERE id = $1 AND user_id = $2 AND revoked_reason = 'owner_unlinked' AND restored_at IS NULL FOR UPDATE`,
       [input.linkId, input.userId],
     );
@@ -376,12 +394,15 @@ export async function restoreTelegramLink(
       [input.linkId],
     );
     if (superseded.rowCount) { await client.query("ROLLBACK"); return notFound; }
+    // The chat-binding locks come BEFORE the link INSERT below (its FK takes a lock on `trips`): teardown's
+    // order is bindings, then trips, and this must not be the reverse (lockFreePrivateChats).
+    const freeChats = await lockFreePrivateChats(client, input.linkId, row.trip_id, row.telegram_subject_digest);
     const linkId = opaqueId("otl");
     await client.query(
       `INSERT INTO control_plane.telegram_organizer_trip_links
-         (id, user_id, trip_id, telegram_subject_digest, verified_via, telegram_label)
-       VALUES ($1, $2, $3, $4, 'dashboard_restore', $5)`,
-      [linkId, input.userId, row.trip_id, row.telegram_subject_digest, row.telegram_label],
+         (id, user_id, trip_id, telegram_subject_digest, verified_via, telegram_first_name, telegram_username)
+       VALUES ($1, $2, $3, $4, 'dashboard_restore', $5, $6)`,
+      [linkId, input.userId, row.trip_id, row.telegram_subject_digest, row.telegram_first_name, row.telegram_username],
     );
     await client.query(
       `UPDATE control_plane.telegram_organizer_trip_links
@@ -389,7 +410,7 @@ export async function restoreTelegramLink(
       [input.linkId, input.userId, linkId],
     );
     await restoreDemotedOrganizerPersonLink(client, row.trip_id, row.telegram_subject_digest);
-    const routeReopened = await reopenPrivateRoute(client, input.linkId, row.trip_id, row.telegram_subject_digest);
+    const routeReopened = await openBindings(client, freeChats, row.trip_id);
     await client.query("COMMIT");
     return { ok: true, linkId, tripTitle, routeReopened };
   } catch (error) {

@@ -17,8 +17,8 @@ import { buildApp } from "../src/app.js";
 import { validateArchitectureProfile } from "../src/config.js";
 import { resolveChatRoute } from "../src/chat-router.js";
 import { issueEnrollment } from "../src/enrollment.js";
-import { digestTelegramId, telegramDisplayLabel } from "../src/identity.js";
-import { issueTelegramLinkToken } from "../src/telegram-link-token.js";
+import { digestTelegramId, telegramDisplayName } from "../src/identity.js";
+import { issueTelegramLinkToken, restoreTelegramLink } from "../src/telegram-link-token.js";
 import { DEFAULT_STRINGS, dispatchUpdate } from "../src/relay/dispatch.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
 import { applyMigrations } from "../src/migrations.js";
@@ -480,27 +480,46 @@ test("an unbound PRIVATE DM, plain text or /start, from an account with live org
   } finally { await app.close(); }
 });
 
-// ── The display label: name + confirm (owner decision 2026-10-23) ───────────
+// ── The display name: first name and @username, kept apart (owner decision 2026-10-23) ──
 
-const labelOf = async (linkId: string) => (await row(linkId)).telegram_label as string | null;
+const nameOf = async (linkId: string) => {
+  const r = await row(linkId);
+  return { firstName: r.telegram_first_name as string | null, username: r.telegram_username as string | null };
+};
+const seen = (l: { name?: string; username?: string }) => ({ name: l.name, username: l.username });
 
-test("telegramDisplayLabel: first name and @username only, bounded, control and bidi characters stripped, junk dropped", () => {
-  assert.equal(telegramDisplayLabel({ first_name: "Dana", username: "dana_k" }), "Dana @dana_k");
-  assert.equal(telegramDisplayLabel({ first_name: "Dana" }), "Dana");
-  assert.equal(telegramDisplayLabel({ username: "dana_k" }), "@dana_k");
-  assert.equal(telegramDisplayLabel({ first_name: "‮Da\nna\u0000\t  K⁦", username: "not a handle!" }), "Da na K", "controls, bidi and line breaks gone; a non-handle dropped");
-  assert.equal(telegramDisplayLabel({ first_name: "x".repeat(500), username: "u".repeat(32) }), `${"x".repeat(40)} @${"u".repeat(32)}`, "bounded");
-  assert.ok(Array.from(telegramDisplayLabel({ first_name: "😀".repeat(100), username: "u".repeat(32) })!).length <= 80);
-  assert.equal(telegramDisplayLabel({ first_name: "\ud800" }), null, "a lone surrogate would not survive Postgres: stripped");
-  for (const junk of [null, undefined, {}, { first_name: 5, username: {} }, { first_name: " \n " }]) assert.equal(telegramDisplayLabel(junk as never), null);
+test("telegramDisplayName: first name and @username as separate fields; bounded; controls, bidi, '@' and invisible fillers stripped; junk dropped", () => {
+  assert.deepEqual(telegramDisplayName({ first_name: "Dana", username: "dana_k" }), { firstName: "Dana", username: "dana_k" });
+  assert.deepEqual(telegramDisplayName({ first_name: "Dana" }), { firstName: "Dana", username: null });
+  assert.deepEqual(telegramDisplayName({ username: "dana_k" }), { firstName: null, username: "dana_k" });
+  assert.deepEqual(telegramDisplayName({ first_name: "‮Da\nna\u0000\t  K⁦", username: "not a handle!" }), { firstName: "Da na K", username: null }, "controls, bidi and line breaks gone; a non-handle dropped");
+  assert.equal(telegramDisplayName({ first_name: "x".repeat(500) })!.firstName, "x".repeat(40), "bounded");
+  assert.ok(Array.from(telegramDisplayName({ first_name: "😀".repeat(100) })!.firstName!).length <= 40);
+  assert.equal(telegramDisplayName({ first_name: "\ud800" }), null, "a lone surrogate would not survive Postgres: stripped");
+  for (const junk of [null, undefined, {}, { first_name: 5, username: {} }, { first_name: " \n " }]) assert.equal(telegramDisplayName(junk as never), null);
+
+  // F2: '@' (and its look-alikes) never survives in a first name, so a name cannot pose as a handle.
+  assert.deepEqual(telegramDisplayName({ first_name: "Dror @own_p", username: "real_one" }), { firstName: "Dror own_p", username: "real_one" });
+  assert.deepEqual(telegramDisplayName({ first_name: "＠owner ﹫x" }), { firstName: "owner x", username: null });
+
+  // F3: a name that is blank apart from invisible fillers is no name; a username alone still counts.
+  for (const filler of ["ㅤ", "⠀", "ᅟ", "ᅠ", "ﾠ", "ㅤ⠀ ᅟᅠﾠ"]) {
+    assert.equal(telegramDisplayName({ first_name: filler }), null, `U+${filler.codePointAt(0)!.toString(16)} alone`);
+    assert.deepEqual(telegramDisplayName({ first_name: filler, username: "dana_k" }), { firstName: null, username: "dana_k" });
+  }
+  assert.equal(telegramDisplayName({ first_name: `Daㅤna` })!.firstName, "Da na");
+  // F3: at most two combining marks per base character.
+  const tower = `Z${"̀".repeat(50)}a${"́".repeat(5)}`;
+  assert.equal(telegramDisplayName({ first_name: tower })!.firstName, `Z̀̀á́`);
 });
 
-test("the label is written only from verified Telegram data, shown to a full session, copied by Restore, and a body field is never trusted", { skip }, async () => {
+test("the name is written only from verified Telegram data, shown to a full session, copied by Restore, and a body field is never trusted", { skip }, async () => {
   const app = newApp();
   try {
     const { user, rome, telegramId, link, full } = await fixture(app);
-    assert.equal(await labelOf(link), null, "an existing row has none");
-    assert.equal("label" in (await tripCard(app, full, rome)).telegram.links[0], false, "so the card carries none, and says 'Telegram account'");
+    assert.deepEqual(await nameOf(link), { firstName: null, username: null }, "an existing row has none");
+    const bare = (await tripCard(app, full, rome)).telegram.links[0];
+    assert.equal("name" in bare || "username" in bare, false, "so the card carries none, and says 'Telegram account'");
 
     // A Mini App sign-in fills it from the SIGNED user object; extra body fields are ignored.
     const initData = signedInitData(launchFields(telegramId, Date.now(), {
@@ -508,40 +527,61 @@ test("the label is written only from verified Telegram data, shown to a full ses
     }));
     const signIn = await app.inject({
       method: "POST", url: "/v1/auth/telegram-mini-app", headers: { "content-type": "application/json", origin: ORIGIN },
-      payload: JSON.stringify({ initData, label: "EVIL", telegramLabel: "EVIL", first_name: "EVIL", username: "evil", user: { first_name: "EVIL" } }),
+      payload: JSON.stringify({ initData, label: "EVIL", name: "EVIL", username: "evil", telegramLabel: "EVIL", first_name: "EVIL", user: { first_name: "EVIL", username: "evil" } }),
     });
     assert.equal(signIn.statusCode, 200);
-    assert.equal(await labelOf(link), "Dana @dana_k", "from initData, not from the body");
-    // Later sign-ins do not rewrite a label that is there.
+    assert.deepEqual(await nameOf(link), { firstName: "Dana", username: "dana_k" }, "from initData, not from the body");
+    // Later sign-ins do not rewrite a name that is there.
     await app.inject({
       method: "POST", url: "/v1/auth/telegram-mini-app", headers: { "content-type": "application/json", origin: ORIGIN },
-      payload: JSON.stringify({ initData: signedInitData(launchFields(telegramId, Date.now(), { query_id: `AA${hex()}`, start_param: rome, user: JSON.stringify({ id: telegramId, first_name: "Changed" }) })) }),
+      payload: JSON.stringify({ initData: signedInitData(launchFields(telegramId, Date.now(), { query_id: `AA${hex()}`, start_param: rome, user: JSON.stringify({ id: telegramId, first_name: "Changed", username: "changed" }) })) }),
     });
-    assert.equal(await labelOf(link), "Dana @dana_k");
-    assert.equal((await tripCard(app, full, rome)).telegram.links[0].label, "Dana @dana_k");
+    assert.deepEqual(await nameOf(link), { firstName: "Dana", username: "dana_k" });
+    assert.deepEqual(seen((await tripCard(app, full, rome)).telegram.links[0]), { name: "Dana", username: "dana_k" });
 
-    // Unlink, then Restore with a hostile body: the new row carries the OLD row's label, nothing else.
+    // Unlink, then Restore with a hostile body: the new row carries the OLD row's name, nothing else.
     assert.equal((await unlink(app, full, link)).statusCode, 200);
-    assert.equal((await tripCard(app, full, rome)).telegram.unlinked[0].label, "Dana @dana_k");
+    assert.deepEqual(seen((await tripCard(app, full, rome)).telegram.unlinked[0]), { name: "Dana", username: "dana_k" });
     const restored = await app.inject({
       method: "POST", url: `/v1/account/telegram-links/${link}/restore`,
       headers: { cookie: full.cookie, "x-csrf-token": full.csrf, origin: ORIGIN, "content-type": "application/json" },
-      payload: JSON.stringify({ label: "EVIL", telegramLabel: "EVIL" }),
+      payload: JSON.stringify({ label: "EVIL", name: "EVIL", username: "evil", telegramLabel: "EVIL" }),
     });
     assert.equal(restored.statusCode, 200);
     const [now] = (await live(user, rome)).rows;
-    assert.equal(await labelOf(now.id), "Dana @dana_k");
-    assert.equal((await pool.query("SELECT 1 FROM control_plane.telegram_organizer_trip_links WHERE telegram_label ILIKE '%evil%'")).rowCount, 0, "the client's text is nowhere in the table");
+    assert.deepEqual(await nameOf(now.id), { firstName: "Dana", username: "dana_k" });
+    assert.equal((await pool.query("SELECT 1 FROM control_plane.telegram_organizer_trip_links WHERE telegram_first_name ILIKE '%evil%' OR telegram_username ILIKE '%evil%'")).rowCount, 0, "the client's text is nowhere in the table");
   } finally { await app.close(); }
 });
 
-test("a label decides nothing: two accounts with the SAME label are two links; Restore follows the row, not the name", { skip }, async () => {
+test("F2: a forwardee who types the owner's @handle as their first name cannot pose as it: '@' is stripped, and the real handle is its own field", { skip }, async () => {
   const app = newApp();
   try {
     const { user, rome, link, full } = await fixture(app);
-    const twin = tg();
-    const twinLink = await organizerLink(user, rome, twin);
-    await pool.query("UPDATE control_plane.telegram_organizer_trip_links SET telegram_label = 'Dana' WHERE id = ANY($1)", [[link, twinLink]]);
+    const forwardee = tg();
+    const forwardeeLink = await organizerLink(user, rome, forwardee);
+    const initData = signedInitData(launchFields(forwardee, Date.now(), {
+      query_id: `AA${hex()}`, start_param: rome, user: JSON.stringify({ id: forwardee, first_name: "Dror @own_p", username: "sneaky_f" }),
+    }));
+    const signIn = await app.inject({ method: "POST", url: "/v1/auth/telegram-mini-app", headers: { "content-type": "application/json", origin: ORIGIN }, payload: JSON.stringify({ initData }) });
+    assert.equal(signIn.statusCode, 200);
+    assert.deepEqual(await nameOf(forwardeeLink), { firstName: "Dror own_p", username: "sneaky_f" });
+    const card = (await tripCard(app, full, rome)).telegram.links.find((l: { id: string }) => l.id === forwardeeLink);
+    assert.deepEqual(seen(card), { name: "Dror own_p", username: "sneaky_f" });
+    assert.ok(!String(card.name).includes("@"), "no '@' in the name field: only the username field is a handle");
+    assert.equal((await pool.query("SELECT 1 FROM control_plane.telegram_organizer_trip_links WHERE telegram_first_name LIKE '%@%'")).rowCount, 0);
+    // The database refuses a name that carries one, whatever code wrote it.
+    await assert.rejects(pool.query("UPDATE control_plane.telegram_organizer_trip_links SET telegram_first_name = 'x @y' WHERE id = $1", [link]), /name_shape_check/);
+    await assert.rejects(pool.query("UPDATE control_plane.telegram_organizer_trip_links SET telegram_username = '@y' WHERE id = $1", [link]), /name_shape_check/);
+  } finally { await app.close(); }
+});
+
+test("a name decides nothing: two accounts with the SAME name are two links; Restore follows the row, not the name", { skip }, async () => {
+  const app = newApp();
+  try {
+    const { user, rome, link, full } = await fixture(app);
+    const twinLink = await organizerLink(user, rome, tg());
+    await pool.query("UPDATE control_plane.telegram_organizer_trip_links SET telegram_first_name = 'Dana', telegram_username = 'dana_k' WHERE id = ANY($1)", [[link, twinLink]]);
     assert.equal((await unlink(app, full, link)).statusCode, 200);
     assert.equal((await restore(app, full, link)).statusCode, 200);
     const digests = (await live(user, rome)).rows.map((r) => r.telegram_subject_digest);
@@ -549,25 +589,24 @@ test("a label decides nothing: two accounts with the SAME label are two links; R
   } finally { await app.close(); }
 });
 
-test("a scoped session sees its OWN account's label and no other's, and never the Unlinked list", { skip }, async () => {
+test("a scoped session sees its OWN account's name and no other's, and never the Unlinked list", { skip }, async () => {
   const app = newApp();
   try {
     const { user, rome, telegramId, link, full } = await fixture(app);
-    const other = tg();
-    const otherLink = await organizerLink(user, rome, other);
-    await pool.query("UPDATE control_plane.telegram_organizer_trip_links SET telegram_label = CASE WHEN id = $1 THEN 'Mine @me' ELSE 'Other @other' END WHERE id = ANY($2)", [link, [link, otherLink]]);
+    const otherLink = await organizerLink(user, rome, tg());
+    await pool.query("UPDATE control_plane.telegram_organizer_trip_links SET telegram_first_name = CASE WHEN id = $1 THEN 'Mine' ELSE 'Other' END, telegram_username = CASE WHEN id = $1 THEN 'me' ELSE 'other' END WHERE id = ANY($2)", [link, [link, otherLink]]);
     const scoped = await telegramSession(app, telegramId, rome);
     const scopedCard = (await tripCard(app, scoped, rome)).telegram;
-    const byId = Object.fromEntries(scopedCard.links.map((l: { id: string; label?: string }) => [l.id, l.label]));
-    assert.equal(byId[link], "Mine @me");
-    assert.equal(byId[otherLink], undefined, "the owner's other phone's name is not for this session");
+    const byId = Object.fromEntries(scopedCard.links.map((l: { id: string }) => [l.id, seen(l as never)]));
+    assert.deepEqual(byId[link], { name: "Mine", username: "me" });
+    assert.deepEqual(byId[otherLink], { name: undefined, username: undefined }, "the owner's other phone's name is not for this session");
     assert.equal("unlinked" in scopedCard, false);
     const fullCard = (await tripCard(app, full, rome)).telegram;
-    assert.deepEqual(Object.fromEntries(fullCard.links.map((l: { id: string; label?: string }) => [l.id, l.label])), { [link]: "Mine @me", [otherLink]: "Other @other" });
+    assert.deepEqual(Object.fromEntries(fullCard.links.map((l: { id: string }) => [l.id, seen(l as never)])), { [link]: { name: "Mine", username: "me" }, [otherLink]: { name: "Other", username: "other" } });
   } finally { await app.close(); }
 });
 
-test("the label is stored at an interview redemption and at a lk_ redemption, from the update's own sender", { skip }, async () => {
+test("the name is stored at an interview redemption and at a lk_ redemption, from the update's own sender", { skip }, async () => {
   const app = newApp();
   try {
     // lk_: the bot's /start from a verified sender.
@@ -577,8 +616,8 @@ test("the label is stored at an interview redemption and at a lk_ redemption, fr
     const newcomer = tg();
     const reply = await dm(newcomer, `/start ${issued.ok ? issued.token : ""}`, { first_name: "Maya", username: "maya_m", last_name: "Surname" });
     assert.equal(reply.kind, "reply");
-    const created = (await pool.query("SELECT telegram_label, verified_via FROM control_plane.telegram_organizer_trip_links WHERE telegram_subject_digest = $1", [digestTelegramId(String(newcomer))])).rows;
-    assert.deepEqual(created, [{ telegram_label: "Maya @maya_m", verified_via: "dashboard_link_token" }], "first name and @username; the surname is not kept");
+    const created = (await pool.query("SELECT telegram_first_name, telegram_username, verified_via FROM control_plane.telegram_organizer_trip_links WHERE telegram_subject_digest = $1", [digestTelegramId(String(newcomer))])).rows;
+    assert.deepEqual(created, [{ telegram_first_name: "Maya", telegram_username: "maya_m", verified_via: "dashboard_link_token" }], "first name and @username; the surname is not kept");
 
     // Interview: an enrollment redeemed from the organizer's chat.
     const owner = await mkUser("Ivy");
@@ -590,7 +629,71 @@ test("the label is stored at an interview redemption and at a lk_ redemption, fr
     const ivy = tg();
     const started = await dm(ivy, `/start ${enrollment.ok ? enrollment.token : ""}`, { first_name: "Ivy", username: "ivy_i" });
     assert.notEqual(textOf(started), DEFAULT_STRINGS.badLink);
-    const interviewLink = (await pool.query("SELECT telegram_label, verified_via FROM control_plane.telegram_organizer_trip_links WHERE telegram_subject_digest = $1", [digestTelegramId(String(ivy))])).rows;
-    assert.deepEqual(interviewLink, [{ telegram_label: "Ivy @ivy_i", verified_via: "enrollment_redemption" }]);
+    const interviewLink = (await pool.query("SELECT telegram_first_name, telegram_username, verified_via FROM control_plane.telegram_organizer_trip_links WHERE telegram_subject_digest = $1", [digestTelegramId(String(ivy))])).rows;
+    assert.deepEqual(interviewLink, [{ telegram_first_name: "Ivy", telegram_username: "ivy_i", verified_via: "enrollment_redemption" }]);
+  } finally { await app.close(); }
+});
+
+// ── Lock order against teardown (boundary review round 2, MF1) ──────────────
+
+test("MF1: a Restore racing a teardown cannot deadlock - the chat-binding lock is taken BEFORE the link INSERT locks the trip, as teardown's order is bindings then trips", { skip }, async () => {
+  const app = newApp();
+  try {
+    const owner = await mkUser("Olga"), co = await mkUser("Cora");
+    const trip = await mkTrip("Kobe");
+    await pool.query("UPDATE control_plane.trips SET hermes_profile = 'kin-kobe' WHERE id = $1", [trip]);
+    await mkMember(trip, owner); await mkMember(trip, co, "organizer");
+    const phone = tg();
+    const link = await organizerLink(owner, trip, phone);
+    await organizerLink(co, trip, phone);               // the same phone, linked by the co-organizer too
+    await bindDm(trip, phone, "kin-kobe");
+    const session = await fullSession(owner, "mf1");
+    assert.equal((await unlink(app, session, link)).statusCode, 200);
+    await bindDm(trip, phone, "kin-kobe");              // the DM was moved back onto the trip through the co-organizer's link
+
+    // Pause the Restore AFTER its link INSERT (which locks the trip row through the foreign key): its next
+    // statement, the person-link UPDATE, waits on this table lock.
+    const gate = await pool.connect();
+    await gate.query("BEGIN");
+    await gate.query("LOCK TABLE control_plane.trip_person_links IN EXCLUSIVE MODE");
+    const restoreDone = restoreTelegramLink(pool, { userId: owner, linkId: link }).then((v) => ({ ok: true as const, v }), (e: { code?: string }) => ({ ok: false as const, code: e.code }));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    // Teardown's own statements, in its own order (scripts/teardown-trip.py retire_in_db).
+    const td = await pool.connect();
+    const teardownDone = (async () => {
+      try {
+        await td.query("BEGIN");
+        await td.query("UPDATE control_plane.telegram_group_binding_tokens SET expires_at = now() WHERE trip_id = $1 AND expires_at > now()", [trip]);
+        await td.query("UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed' WHERE trip_id = $1 AND closed_at IS NULL", [trip]);
+        await td.query("UPDATE control_plane.trips SET slug = $2, updated_at = now() WHERE id = $1", [trip, `retired-kobe-${suffix}-20261023`]);
+        await td.query("COMMIT");
+        return "committed";
+      } catch (error) {
+        await td.query("ROLLBACK").catch(() => undefined);
+        return (error as { code?: string }).code ?? "error";
+      } finally { td.release(); }
+    })();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await gate.query("COMMIT");
+    gate.release();
+    const [restoreResult, teardownResult] = await Promise.all([restoreDone, teardownDone]);
+    assert.notEqual(teardownResult, "40P01", "teardown was not chosen as the deadlock victim");
+    assert.equal(teardownResult, "committed");
+    assert.ok(restoreResult.ok, `the restore did not fail (${restoreResult.ok ? "" : restoreResult.code})`);
+  } finally { await app.close(); }
+});
+
+// ── F4: the trips list goes to the chat's own person only ───────────────────
+
+test("F4: an unbound private-chat update whose sender is NOT the chat owner gets the old reply, not a trips list", { skip }, async () => {
+  const app = newApp();
+  try {
+    const { telegramId } = await fixture(app);           // linked organizer
+    const otherChat = tg();
+    const odd = { update_id: 3, message: { message_id: 5, from: { id: telegramId, first_name: "Olive" }, chat: { id: otherChat, type: "private" }, text: "hello?" } } as unknown as TelegramUpdate;
+    assert.equal(textOf(await dispatchUpdate(pool, odd, DEFAULT_STRINGS)), DEFAULT_STRINGS.unbound);
+    const own = await dm(telegramId, "hello?");
+    assert.match(textOf(own), /Here are your trips/, "the person's own DM still gets the list");
   } finally { await app.close(); }
 });

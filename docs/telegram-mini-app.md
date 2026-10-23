@@ -165,7 +165,7 @@ source-vs-table check, live widening/narrowing, fail-closed scopes, rollback loo
   `lastSignedInAt`); unlinking is `DELETE /v1/account/telegram-links/:id` (`requireMutation`). A runtime-only
   member sees the same status on their card and can end their own link, but is not offered Link. **Never**
   the Telegram id, its digest or any piece of either (a digest of a short numeric id is brute-forceable); the
-  one piece of the other party shown since 2026-10-23 is the display label (first name, @username) below, to a
+  one piece of the other party shown since 2026-10-23 is the display name (first name and, separately, @username) below, to a
   full session only. This replaces the account-level "Telegram accounts that can sign in as you"
   section and `GET /v1/account/telegram-links` (removed: answers 404). Dates on the page are formatted in the
   **page's** language (`<html lang>`), never the browser's.
@@ -194,28 +194,33 @@ source-vs-table check, live widening/narrowing, fail-closed scopes, rollback loo
   (`telegram_unlinked`) gets a NEW open chat binding to the trip, with the trip's companion profile, in the
   same transaction (history is never un-closed) — only when that chat has no open binding and no live
   interview — so `resolveChatRoute` is `companion` and a plain DM reaches the companion instead of "I
-  don't have a trip for this chat". Lock order as teardown's: chat bindings, then the trip row. Separately,
+  don't have a trip for this chat". Lock order as teardown's (`retire_in_db`: tokens, chat bindings, trip row): the restore takes memberships, link rows, **chat bindings**, and only then the link INSERT that locks the trip through its foreign key (`lockFreePrivateChats` before the INSERT, `openBindings` after) — the reverse deadlocked with `40P01` against a concurrent teardown (boundary review round 2, MF1; held by the MF1 test, which fails with the old order). Separately,
   an **unbound private chat** (plain text or a bare `/start`) from a Telegram account that has live
-  organizer links is answered with the same trips list and buttons `/trips` gives (as `/app` already did);
-  an unknown sender still gets the old reply. Not restored: the interview session and interview binding
+  organizer links is answered with the same trips list and buttons `/trips` gives (as `/app` already did), only when the
+  sender's id IS the private chat's id; an unknown sender, or any other pairing, still gets the old reply. Not restored: the interview session and interview binding
   the Unlink closed (a click must never resume a live interview; a new interview link starts a new one) and
   the pre-Sprint-7 account-wide row (it stays in the history table). **Rollback:** to a release that reads
   `telegram_organizer_trip_links` (the Sprint 7 candidate d0e3b73 does) a restored account keeps its access;
   only a pre-Sprint-7 target cannot see per-trip rows and loses it (fail closed).
-  **Names (owner decision 2026-10-23, "name + confirm"):** each link row carries `telegram_label` — the
-  account's first name and @username (`telegramDisplayLabel`, identity.ts: bounded to 80, control, format
-  and bidi characters stripped, a non-handle username dropped) — written only from what Telegram delivered on
-  a verified path (the update's `from` at an interview redemption or a `lk_` redemption; the user object inside
-  signature-checked initData at a Mini App sign-in, where a link without a label is filled; copied from the
-  revoked row at a restore). It is **display data only**: never read from a request body, never compared,
-  parsed or used for any decision (the digest is the identity). Rows from before this release have none and
-  show as "Telegram account". `links[]` and `unlinked[]` carry `label` (omitted when there is none) for a
-  **full session**; a Telegram-minted session gets the same shape as before plus at most the label of its
-  **own** account, and never the Unlinked list. The card asks "Restore Telegram access for <label>?" before
-  the POST. The card shows `telegram.unlinked[]` (`id`, `via`, `linkedAt`, `unlinkedAt`, `label?`; no id,
-  digest) and a **Restore Telegram** entry in the ⋮ menu for a full session of an owner or
-  organizer. Held by `control-plane/api/test/telegram-link-restore-db.test.ts` and
-  `web/src/pages/TripTelegram.test.tsx`.
+  **Names (owner decision 2026-10-23, "name + confirm"):** each link row carries the account's
+  `telegram_first_name` and `telegram_username` as **two separate fields** (`telegramDisplayName`, identity.ts),
+  so a first name that says "@someone" can never pass for the handle: every '@' (and its look-alikes) is
+  stripped from the first name, the username must be a real handle (`[A-Za-z0-9_]{1,32}`), and the database
+  refuses an '@' in the name. The first name is bounded to 40 characters; control, format and bidi characters
+  and the invisible fillers U+3164, U+2800, U+115F, U+1160, U+FFA0 are stripped (a name that is blank
+  without them is no name); at most two combining marks are kept per base character. Written only from what
+  Telegram delivered on a verified path (the update's `from` at an interview redemption or a `lk_`
+  redemption; the user object inside signature-checked initData at a Mini App sign-in, where a link
+  without a name is filled; copied from the revoked row at a restore). It is **display data only**: never
+  read from a request body, never compared, parsed or used for any decision (the digest is the identity).
+  Rows from before this release have none and show as "Telegram account". `links[]` and `unlinked[]` carry
+  `name` and `username` (each omitted when there is none) for a **full session**; a Telegram-minted session
+  gets the same shape as before plus at most the name of its **own** account, and never the Unlinked list.
+  The card shows the first name, then the @username in a style of its own (each in `<bdi>`), then "linked
+  <date>", and asks "Restore Telegram access for <name> @<username>?" before the POST. The card shows
+  `telegram.unlinked[]` (`id`, `via`, `linkedAt`, `unlinkedAt`, `name?`, `username?`; no id, digest) and a
+  **Restore Telegram** entry in the ⋮ menu for a full session of an owner or organizer. Held by
+  `control-plane/api/test/telegram-link-restore-db.test.ts` and `web/src/pages/TripTelegram.test.tsx`.
 - **Link — the way to add a Telegram account that was never linked** (`POST /v1/trips/:id/telegram-link`, `requireMutation`, owner or
   organizer with dashboard access; anyone else, a retired trip and a nonexistent one get the same 404;
   10/min per person). It returns `{ deepLink: "https://t.me/<bot>?start=lk_…", expiresAt }`. The token is
