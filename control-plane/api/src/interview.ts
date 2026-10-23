@@ -2608,6 +2608,8 @@ export async function startSession(
   telegramChatIdHint?: string,
   verifiedTelegramChatId?: string,
   languageHint?: string,
+  /** Label of the Telegram account, from the update's verified `from` (display data only). */
+  telegramLabel?: string | null,
 ): Promise<StartSessionResult> {
   const client = await db.connect();
   try {
@@ -2691,7 +2693,7 @@ export async function startSession(
     // web session by itself — the Mini App exchange does, from verified
     // initData (telegram-mini-app.ts); /v1/auth/telegram stays retired (410).
     if (chatId) {
-      await linkTelegramOrganizerInTx(client, chatId, enrollment.userId, enrollment.tripId);
+      await linkTelegramOrganizerInTx(client, chatId, enrollment.userId, enrollment.tripId, "enrollment_redemption", telegramLabel ?? null);
     }
 
     await client.query("COMMIT");

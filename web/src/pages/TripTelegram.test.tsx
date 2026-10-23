@@ -91,7 +91,7 @@ it("Unlink asks first, unlinks only that trip, and the card goes to 'not linked'
 
 const unlinkedEntry = { id: "otl_aaaaaaaaaaaaaaaa", via: "interview_link", linkedAt: "2026-10-03T10:00:00.000Z", unlinkedAt: "2026-10-05T10:00:00.000Z" };
 
-it("an Unlinked account is offered Restore; one click restores it with one POST and no Telegram link, and the card goes back to 'linked'", async () => {
+it("an Unlinked account is offered Restore; it asks first, then one POST (no Telegram link), and the card goes back to 'linked'", async () => {
   const romeCard = (linked: boolean) => ({ ...base, id: "trip_romerome", title: "Rome 2027", telegram: { links: linked ? [{ ...link, id: "otl_bbbbbbbbbbbbbbbb", via: "dashboard_restore" }] : [], unlinked: linked ? [] : [unlinkedEntry] } });
   let restored = false;
   const calls = mount({ rome: [], oslo: [] }, (path, init) => {
@@ -103,10 +103,39 @@ it("an Unlinked account is offered Restore; one click restores it with one POST 
   expect(rome.getByRole("img", { name: "Telegram not linked" })).toBeInTheDocument();
   fireEvent.click(rome.getByRole("button", { name: "Telegram options for Rome 2027" }));
   fireEvent.click(rome.getByRole("menuitem", { name: /Restore Telegram · unlinked Oct 5, 2026/ }));
+  // Asked first: nothing has been sent yet, and an account with no label is still named for what it is.
+  expect(calls.some((c) => c.startsWith("POST"))).toBe(false);
+  expect(rome.getByText(/Restore Telegram access for this Telegram account\?/)).toBeInTheDocument();
+  fireEvent.click(rome.getByRole("button", { name: "Confirm restore" }));
   await vi.waitFor(() => expect(within(screen.getByRole("heading", { name: "Rome 2027" }).closest("article")!).getByRole("img", { name: "Telegram linked" })).toBeInTheDocument());
   expect(calls.filter((c) => c.startsWith("POST"))).toEqual([`POST /v1/account/telegram-links/${unlinkedEntry.id}/restore`]);
   expect(calls.some((c) => c.includes("telegram-link") && !c.includes("telegram-links"))).toBe(false);
   expect(document.body.textContent).not.toMatch(/sha256|otl_|tml_/);
+});
+
+it("the Restore question and the entries carry the account's label; Keep unlinked sends nothing; an unlabeled live link still reads 'Telegram account'", async () => {
+  const labelled = { ...unlinkedEntry, label: "Dana @dana_k" };
+  const calls = mount({ rome: [], oslo: [] }, (path) =>
+    path === "/v1/trips" ? json({ trips: [{ ...base, id: "trip_romerome", title: "Rome 2027", telegram: { links: [{ ...link, label: "Noa @noa_n" }], unlinked: [labelled, { ...unlinkedEntry, id: "otl_cccccccccccccccc" }] } }] }) : undefined);
+  const rome = within(await card("Rome 2027"));
+  fireEvent.click(rome.getByRole("button", { name: "Telegram options for Rome 2027" }));
+  expect(rome.getByText(/Noa @noa_n · via the trip's interview link/)).toBeInTheDocument();
+  expect(rome.getByText(/Telegram account · was linked Oct 3, 2026/)).toBeInTheDocument();
+  expect(rome.getByText(/Dana @dana_k · was linked Oct 3, 2026/)).toBeInTheDocument();
+  fireEvent.click(rome.getAllByRole("menuitem", { name: /Restore Telegram/ })[0]!);
+  expect(rome.getByText("Restore Telegram access for Dana @dana_k? It will open this trip again, and sign in fresh.")).toBeInTheDocument();
+  fireEvent.click(rome.getByRole("button", { name: "Keep unlinked" }));
+  expect(calls.some((c) => c.startsWith("POST"))).toBe(false);
+  expect(rome.queryByRole("group", { name: "Confirm restore" })).toBeNull();
+});
+
+it("a label is shown as text, never as markup", async () => {
+  mount({ rome: [], oslo: [] }, (path) =>
+    path === "/v1/trips" ? json({ trips: [{ ...base, id: "trip_romerome", title: "Rome 2027", telegram: { links: [{ ...link, label: "<img src=x onerror=alert(1)>" }] } }] }) : undefined);
+  const rome = within(await card("Rome 2027"));
+  fireEvent.click(rome.getByRole("button", { name: "Telegram options for Rome 2027" }));
+  expect(rome.getByText(/<img src=x onerror=alert\(1\)>/)).toBeInTheDocument();
+  expect(document.querySelector("img[src='x']")).toBeNull();
 });
 
 it("a refused Restore says so", async () => {
@@ -117,6 +146,7 @@ it("a refused Restore says so", async () => {
   const rome = within(await card("Rome 2027"));
   fireEvent.click(rome.getByRole("button", { name: "Telegram options for Rome 2027" }));
   fireEvent.click(rome.getByRole("menuitem", { name: /Restore Telegram/ }));
+  fireEvent.click(rome.getByRole("button", { name: "Confirm restore" }));
   expect(await rome.findByRole("alert")).toBeInTheDocument();
 });
 

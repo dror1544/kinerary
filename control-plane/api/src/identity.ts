@@ -96,6 +96,32 @@ export function verifyTelegramLogin(
   };
 }
 
+export const TELEGRAM_LABEL_MAX_LENGTH = 80;
+
+/**
+ * A short, human label for a Telegram account, for the dashboard to show next to a link ("Dana @dana_k"),
+ * so an owner can tell their own phone from a stranger's. DISPLAY DATA ONLY: it is free text the other
+ * person chose, so it is never used to decide anything (who a link belongs to, what it may open, whether
+ * it can be restored) - the digest decides, and the label is never compared, parsed or trusted.
+ *
+ * Callers pass only what Telegram delivered on a VERIFIED path: the `from` of an update the bot received
+ * on its own connection, or the user object inside signature-checked initData. NEVER a request body.
+ *
+ * First name and @username only (no surname, no id). Bounded, and every control, format and bidi
+ * character is stripped, so a label cannot reorder the text around it or smuggle a line break. A username
+ * that is not a real Telegram handle is dropped. Null when nothing usable is left.
+ */
+export function telegramDisplayLabel(from: { first_name?: unknown; username?: unknown } | null | undefined): string | null {
+  const clean = (value: unknown) => typeof value === "string"
+    ? value.replace(/[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Zl}\p{Zp}]/gu, " ").replace(/\s+/g, " ").trim()
+    : "";
+  const clip = (value: string, max: number) => Array.from(value).slice(0, max).join("").trim();
+  const first = clip(clean(from?.first_name), 40);
+  const handle = typeof from?.username === "string" && /^[A-Za-z0-9_]{1,32}$/.test(from.username) ? `@${from.username}` : "";
+  const label = [first, handle].filter(Boolean).join(" ");
+  return Array.from(label).length > 0 && Array.from(label).length <= TELEGRAM_LABEL_MAX_LENGTH ? label : null;
+}
+
 /** Produces the SHA256 digest stored in user_identities for a Telegram numeric ID. */
 export function digestTelegramId(telegramId: string): string {
   return "sha256:" + createHash("sha256").update(telegramId).digest("hex");

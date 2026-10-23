@@ -133,18 +133,20 @@ export async function linkTelegramOrganizerInTx(
   userId: string,
   tripId: string,
   verifiedVia: "enrollment_redemption" | "backfill_intake_session" = "enrollment_redemption",
+  /** Display label from the update's verified `from` (identity.ts, telegramDisplayLabel). Display data only. */
+  telegramLabel: string | null = null,
 ): Promise<void> {
   if (!isPrivateChatId(telegramUserId)) return;
   await client.query(
     `INSERT INTO control_plane.telegram_organizer_trip_links
-       (id, user_id, trip_id, telegram_subject_digest, verified_via)
-     SELECT $1, $2, $3, $4, $5
+       (id, user_id, trip_id, telegram_subject_digest, verified_via, telegram_label)
+     SELECT $1, $2, $3, $4, $5, $6
       WHERE NOT EXISTS (
         SELECT 1 FROM control_plane.telegram_organizer_trip_links r
          WHERE r.telegram_subject_digest = $4 AND r.user_id = $2 AND r.trip_id = $3
            AND r.revoked_at IS NOT NULL)
      ON CONFLICT DO NOTHING`,
-    [`otl_${randomBytes(16).toString("hex")}`, userId, tripId, digestTelegramId(telegramUserId), verifiedVia],
+    [`otl_${randomBytes(16).toString("hex")}`, userId, tripId, digestTelegramId(telegramUserId), verifiedVia, telegramLabel],
   );
 }
 

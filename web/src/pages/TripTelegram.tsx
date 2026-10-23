@@ -54,7 +54,7 @@ export function TripTelegram({ trip }: { trip: TripSummary }) {
   const link = useMutation({ mutationFn: () => issueTelegramLink(trip.id) });
   const restore = useMutation({
     mutationFn: restoreTelegramLink,
-    onSuccess: async () => { setOpen(false); link.reset(); await refresh(); },
+    onSuccess: async () => { setConfirming(null); setOpen(false); link.reset(); await refresh(); },
   });
   const unlink = useMutation({
     mutationFn: unlinkTelegramLink,
@@ -91,13 +91,22 @@ export function TripTelegram({ trip }: { trip: TripSummary }) {
               <small>Works once, until {formatTime(link.data.expiresAt)}. Open it in the Telegram account you want to link to this trip.</small>
             </div>
           )}
-          {/* Restore: one click, no Telegram round trip. The server hands the list only to a full session; canLink
-              repeats that here so the button is never a dead end. */}
+          {/* Restore: no Telegram round trip, but it asks first - the label (first name, @username) is how the owner
+              recognises the account. The server hands the list only to a full session; canLink repeats that here so
+              the button is never a dead end. The label is text Telegram's user chose: shown, never acted on. */}
           {canLink && unlinked.map((entry) => (
-            <button key={entry.id} type="button" role="menuitem" className="text-button telegram-restore" disabled={restore.isPending} onClick={() => restore.mutate(entry.id)}>
-              Restore Telegram · unlinked {formatDay(entry.unlinkedAt)}
-              <small>was linked {formatDay(entry.linkedAt)}, {HOW[entry.via]}</small>
-            </button>
+            confirming === entry.id
+              ? <div key={entry.id} className="telegram-confirm" role="group" aria-label="Confirm restore">
+                <small>Restore Telegram access for {entry.label ?? "this Telegram account"}? It will open this trip again, and sign in fresh.</small>
+                <span>
+                  <button type="button" className="text-button" onClick={() => restore.mutate(entry.id)} disabled={restore.isPending}>Confirm restore</button>
+                  <button type="button" className="text-button" onClick={() => setConfirming(null)}>Keep unlinked</button>
+                </span>
+              </div>
+              : <button key={entry.id} type="button" role="menuitem" className="text-button telegram-restore" onClick={() => { restore.reset(); setConfirming(entry.id); }}>
+                Restore Telegram · unlinked {formatDay(entry.unlinkedAt)}
+                <small>{entry.label ?? "Telegram account"} · was linked {formatDay(entry.linkedAt)}, {HOW[entry.via]}</small>
+              </button>
           ))}
           {links.map((entry) => (
             confirming === entry.id
@@ -110,7 +119,7 @@ export function TripTelegram({ trip }: { trip: TripSummary }) {
               </div>
               : <button key={entry.id} type="button" role="menuitem" className="text-button telegram-unlink" onClick={() => setConfirming(entry.id)}>
                 Unlink Telegram · linked {formatDay(entry.linkedAt)}
-                <small>{HOW[entry.via]}{entry.lastSignedInAt ? ` · last opened ${formatDay(entry.lastSignedInAt)}` : " · not opened yet"}</small>
+                <small>{entry.label ? `${entry.label} · ` : ""}{HOW[entry.via]}{entry.lastSignedInAt ? ` · last opened ${formatDay(entry.lastSignedInAt)}` : " · not opened yet"}</small>
               </button>
           ))}
           {link.isError && <div className="notice" role="alert">{link.error.message}</div>}

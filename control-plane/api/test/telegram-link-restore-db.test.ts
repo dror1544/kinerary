@@ -15,7 +15,12 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { buildApp } from "../src/app.js";
 import { validateArchitectureProfile } from "../src/config.js";
-import { digestTelegramId } from "../src/identity.js";
+import { resolveChatRoute } from "../src/chat-router.js";
+import { issueEnrollment } from "../src/enrollment.js";
+import { digestTelegramId, telegramDisplayLabel } from "../src/identity.js";
+import { issueTelegramLinkToken } from "../src/telegram-link-token.js";
+import { DEFAULT_STRINGS, dispatchUpdate } from "../src/relay/dispatch.js";
+import type { TelegramUpdate } from "../src/relay/normalize.js";
 import { applyMigrations } from "../src/migrations.js";
 import { sha256, type PortalDependencies } from "../src/portal.js";
 import { PORTAL_SCOPE_POLICY } from "../src/portal-scope.js";
@@ -379,5 +384,213 @@ test("only the newest Unlink of an account is offered, and not once a lk_ relink
     assert.deepEqual((await tripCard(app, full, rome)).telegram.unlinked, []);
     assert.equal((await restore(app, full, second.id)).statusCode, 404);
     assert.equal((await live(user, rome)).rowCount, 1, "still exactly one live link");
+  } finally { await app.close(); }
+});
+
+// ── The bot comes back with the restore (owner round-2 complaint) ───────────
+
+const dmUpdate = (telegramId: number, text: string, from: Record<string, unknown> = {}) => ({
+  update_id: 1,
+  message: { message_id: 5, from: { id: telegramId, first_name: "Olive", ...from }, chat: { id: telegramId, type: "private" }, text },
+}) as unknown as TelegramUpdate;
+const dm = (telegramId: number, text: string, from: Record<string, unknown> = {}) => dispatchUpdate(pool, dmUpdate(telegramId, text, from), DEFAULT_STRINGS);
+const textOf = (decision: Awaited<ReturnType<typeof dispatchUpdate>>) => decision.kind === "reply" ? decision.reply.text : `<${decision.kind}>`;
+async function bindDm(tripId: string, telegramId: number, profile = "kin-rome") {
+  await pool.query("INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ($1,$2,$3,$4)", [id("tcb"), String(telegramId), tripId, profile]);
+}
+const bindings = async (chatId: number) => (await pool.query<{ trip_id: string; closed_reason: string | null; open: boolean; hermes_profile: string | null }>(
+  "SELECT trip_id, closed_reason, closed_at IS NULL AS open, hermes_profile FROM control_plane.telegram_chat_bindings WHERE chat_id = $1 ORDER BY created_at, id", [String(chatId)])).rows;
+
+test("RESTORE REOPENS THE DM: the route is 'companion' again as a NEW binding (the closed one stays history), /trips marks the chat current, and a plain DM reaches the gateway", { skip }, async () => {
+  const app = newApp();
+  try {
+    const { user, rome, telegramId, link, full } = await fixture(app);
+    await bindDm(rome, telegramId);
+    assert.equal((await resolveChatRoute(pool, String(telegramId))).kind, "companion");
+    assert.equal((await unlink(app, full, link)).statusCode, 200);
+    assert.equal((await resolveChatRoute(pool, String(telegramId))).kind, "unbound");
+    assert.deepEqual((await bindings(telegramId)).map((b) => [b.closed_reason, b.open]), [["telegram_unlinked", false]]);
+
+    const restored = await restore(app, full, link);
+    assert.equal(restored.statusCode, 200);
+    const route = await resolveChatRoute(pool, String(telegramId));
+    assert.equal(route.kind, "companion");
+    assert.equal(route.kind === "companion" && route.tripId, rome);
+    assert.equal(route.kind === "companion" && route.hermesProfile, "kin-rome");
+    assert.deepEqual((await bindings(telegramId)).map((b) => [b.closed_reason, b.open]), [["telegram_unlinked", false], [null, true]], "history kept closed, one new open row");
+    assert.match(textOf(await dm(telegramId, "/trips")), /← this chat/);
+    assert.equal((await dm(telegramId, "what is the plan tomorrow?")).kind, "to_gateway");
+    assert.equal((await live(user, rome)).rowCount, 1);
+  } finally { await app.close(); }
+});
+
+test("a restore does not reopen a chat that has a live interview, or one already routed to another trip", { skip }, async () => {
+  const app = newApp();
+  try {
+    // A live interview on the chat.
+    const a = await fixture(app);
+    await bindDm(a.rome, a.telegramId);
+    assert.equal((await unlink(app, a.full, a.link)).statusCode, 200);
+    const enrollmentId = id("enr");
+    await pool.query(
+      `INSERT INTO control_plane.interview_enrollments(id, trip_id, user_id, token_digest, state, expires_at, consumed_at)
+       VALUES ($1,$2,$3,$4,'consumed', now() + interval '1 hour', now())`,
+      [enrollmentId, a.rome, a.user, `sha256:${randomBytes(32).toString("hex")}`]);
+    await pool.query(
+      `INSERT INTO control_plane.intake_sessions(id, trip_id, user_id, enrollment_id, session_token_digest, state, answers, telegram_chat_id, language)
+       VALUES ($1,$2,$3,$4,$5,'interviewing','{}'::jsonb,$6,'en')`,
+      [id("sess"), a.rome, a.user, enrollmentId, `sha256:${randomBytes(32).toString("hex")}`, String(a.telegramId)]);
+    assert.equal((await restore(app, a.full, a.link)).statusCode, 200, "the link itself still comes back");
+    assert.deepEqual((await bindings(a.telegramId)).map((b) => b.open), [false], "no binding was opened under a live interview");
+    assert.equal((await resolveChatRoute(pool, String(a.telegramId))).kind, "interview");
+
+    // The chat was moved to another trip after the Unlink.
+    const b = await fixture(app);
+    const oslo = await mkTrip("Oslo"); await mkMember(oslo, b.user);
+    await bindDm(b.rome, b.telegramId);
+    assert.equal((await unlink(app, b.full, b.link)).statusCode, 200);
+    await bindDm(oslo, b.telegramId, "kin-oslo");
+    assert.equal((await restore(app, b.full, b.link)).statusCode, 200);
+    const route = await resolveChatRoute(pool, String(b.telegramId));
+    assert.equal(route.kind === "companion" && route.tripId, oslo, "the chat keeps the trip it was moved to");
+    assert.equal((await bindings(b.telegramId)).filter((x) => x.open).length, 1);
+  } finally { await app.close(); }
+});
+
+test("an unbound PRIVATE DM, plain text or /start, from an account with live organizer links gets the trips list; an unknown sender still gets the old reply", { skip }, async () => {
+  const app = newApp();
+  try {
+    const { rome, telegramId } = await fixture(app);       // linked, no binding at all
+    for (const text of ["hello?", "/start"]) {
+      const answer = await dm(telegramId, text);
+      assert.equal(answer.kind, "reply", text);
+      assert.match(textOf(answer), /Here are your trips/, text);
+      assert.match(textOf(answer), /Rome/, text);
+      assert.ok(answer.kind === "reply" && JSON.stringify(answer.reply.replyMarkup).includes(`s:${rome}`), `${text}: a button per trip`);
+    }
+    const stranger = tg();
+    assert.equal(textOf(await dm(stranger, "hello?")), DEFAULT_STRINGS.unbound, "an unknown sender learns what they always did");
+    assert.equal(textOf(await dm(stranger, "/start")), DEFAULT_STRINGS.noPayload);
+    // A bad payload keeps its own answer, even for a linked account.
+    assert.equal(textOf(await dm(telegramId, "/start !!!")), DEFAULT_STRINGS.badLink);
+    // Tapping the button binds the chat (re-authorised from the tapper's id), as /trips has always done.
+    const tap = await dispatchUpdate(pool, { update_id: 2, callback_query: { id: "cq", from: { id: telegramId }, message: { message_id: 5, chat: { id: telegramId, type: "private" } }, data: `s:${rome}` } } as unknown as TelegramUpdate, DEFAULT_STRINGS);
+    assert.equal(tap.kind, "callback_reply");
+    assert.equal((await resolveChatRoute(pool, String(telegramId))).kind, "companion");
+  } finally { await app.close(); }
+});
+
+// ── The display label: name + confirm (owner decision 2026-10-23) ───────────
+
+const labelOf = async (linkId: string) => (await row(linkId)).telegram_label as string | null;
+
+test("telegramDisplayLabel: first name and @username only, bounded, control and bidi characters stripped, junk dropped", () => {
+  assert.equal(telegramDisplayLabel({ first_name: "Dana", username: "dana_k" }), "Dana @dana_k");
+  assert.equal(telegramDisplayLabel({ first_name: "Dana" }), "Dana");
+  assert.equal(telegramDisplayLabel({ username: "dana_k" }), "@dana_k");
+  assert.equal(telegramDisplayLabel({ first_name: "‮Da\nna\u0000\t  K⁦", username: "not a handle!" }), "Da na K", "controls, bidi and line breaks gone; a non-handle dropped");
+  assert.equal(telegramDisplayLabel({ first_name: "x".repeat(500), username: "u".repeat(32) }), `${"x".repeat(40)} @${"u".repeat(32)}`, "bounded");
+  assert.ok(Array.from(telegramDisplayLabel({ first_name: "😀".repeat(100), username: "u".repeat(32) })!).length <= 80);
+  assert.equal(telegramDisplayLabel({ first_name: "\ud800" }), null, "a lone surrogate would not survive Postgres: stripped");
+  for (const junk of [null, undefined, {}, { first_name: 5, username: {} }, { first_name: " \n " }]) assert.equal(telegramDisplayLabel(junk as never), null);
+});
+
+test("the label is written only from verified Telegram data, shown to a full session, copied by Restore, and a body field is never trusted", { skip }, async () => {
+  const app = newApp();
+  try {
+    const { user, rome, telegramId, link, full } = await fixture(app);
+    assert.equal(await labelOf(link), null, "an existing row has none");
+    assert.equal("label" in (await tripCard(app, full, rome)).telegram.links[0], false, "so the card carries none, and says 'Telegram account'");
+
+    // A Mini App sign-in fills it from the SIGNED user object; extra body fields are ignored.
+    const initData = signedInitData(launchFields(telegramId, Date.now(), {
+      query_id: `AA${hex()}`, start_param: rome, user: JSON.stringify({ id: telegramId, first_name: "Dana", username: "dana_k" }),
+    }));
+    const signIn = await app.inject({
+      method: "POST", url: "/v1/auth/telegram-mini-app", headers: { "content-type": "application/json", origin: ORIGIN },
+      payload: JSON.stringify({ initData, label: "EVIL", telegramLabel: "EVIL", first_name: "EVIL", username: "evil", user: { first_name: "EVIL" } }),
+    });
+    assert.equal(signIn.statusCode, 200);
+    assert.equal(await labelOf(link), "Dana @dana_k", "from initData, not from the body");
+    // Later sign-ins do not rewrite a label that is there.
+    await app.inject({
+      method: "POST", url: "/v1/auth/telegram-mini-app", headers: { "content-type": "application/json", origin: ORIGIN },
+      payload: JSON.stringify({ initData: signedInitData(launchFields(telegramId, Date.now(), { query_id: `AA${hex()}`, start_param: rome, user: JSON.stringify({ id: telegramId, first_name: "Changed" }) })) }),
+    });
+    assert.equal(await labelOf(link), "Dana @dana_k");
+    assert.equal((await tripCard(app, full, rome)).telegram.links[0].label, "Dana @dana_k");
+
+    // Unlink, then Restore with a hostile body: the new row carries the OLD row's label, nothing else.
+    assert.equal((await unlink(app, full, link)).statusCode, 200);
+    assert.equal((await tripCard(app, full, rome)).telegram.unlinked[0].label, "Dana @dana_k");
+    const restored = await app.inject({
+      method: "POST", url: `/v1/account/telegram-links/${link}/restore`,
+      headers: { cookie: full.cookie, "x-csrf-token": full.csrf, origin: ORIGIN, "content-type": "application/json" },
+      payload: JSON.stringify({ label: "EVIL", telegramLabel: "EVIL" }),
+    });
+    assert.equal(restored.statusCode, 200);
+    const [now] = (await live(user, rome)).rows;
+    assert.equal(await labelOf(now.id), "Dana @dana_k");
+    assert.equal((await pool.query("SELECT 1 FROM control_plane.telegram_organizer_trip_links WHERE telegram_label ILIKE '%evil%'")).rowCount, 0, "the client's text is nowhere in the table");
+  } finally { await app.close(); }
+});
+
+test("a label decides nothing: two accounts with the SAME label are two links; Restore follows the row, not the name", { skip }, async () => {
+  const app = newApp();
+  try {
+    const { user, rome, link, full } = await fixture(app);
+    const twin = tg();
+    const twinLink = await organizerLink(user, rome, twin);
+    await pool.query("UPDATE control_plane.telegram_organizer_trip_links SET telegram_label = 'Dana' WHERE id = ANY($1)", [[link, twinLink]]);
+    assert.equal((await unlink(app, full, link)).statusCode, 200);
+    assert.equal((await restore(app, full, link)).statusCode, 200);
+    const digests = (await live(user, rome)).rows.map((r) => r.telegram_subject_digest);
+    assert.equal(new Set(digests).size, 2, "both accounts live; the restore did not merge or pick by name");
+  } finally { await app.close(); }
+});
+
+test("a scoped session sees its OWN account's label and no other's, and never the Unlinked list", { skip }, async () => {
+  const app = newApp();
+  try {
+    const { user, rome, telegramId, link, full } = await fixture(app);
+    const other = tg();
+    const otherLink = await organizerLink(user, rome, other);
+    await pool.query("UPDATE control_plane.telegram_organizer_trip_links SET telegram_label = CASE WHEN id = $1 THEN 'Mine @me' ELSE 'Other @other' END WHERE id = ANY($2)", [link, [link, otherLink]]);
+    const scoped = await telegramSession(app, telegramId, rome);
+    const scopedCard = (await tripCard(app, scoped, rome)).telegram;
+    const byId = Object.fromEntries(scopedCard.links.map((l: { id: string; label?: string }) => [l.id, l.label]));
+    assert.equal(byId[link], "Mine @me");
+    assert.equal(byId[otherLink], undefined, "the owner's other phone's name is not for this session");
+    assert.equal("unlinked" in scopedCard, false);
+    const fullCard = (await tripCard(app, full, rome)).telegram;
+    assert.deepEqual(Object.fromEntries(fullCard.links.map((l: { id: string; label?: string }) => [l.id, l.label])), { [link]: "Mine @me", [otherLink]: "Other @other" });
+  } finally { await app.close(); }
+});
+
+test("the label is stored at an interview redemption and at a lk_ redemption, from the update's own sender", { skip }, async () => {
+  const app = newApp();
+  try {
+    // lk_: the bot's /start from a verified sender.
+    const { user, rome } = await fixture(app);
+    const issued = await issueTelegramLinkToken(pool, { userId: user, tripId: rome });
+    assert.ok(issued.ok);
+    const newcomer = tg();
+    const reply = await dm(newcomer, `/start ${issued.ok ? issued.token : ""}`, { first_name: "Maya", username: "maya_m", last_name: "Surname" });
+    assert.equal(reply.kind, "reply");
+    const created = (await pool.query("SELECT telegram_label, verified_via FROM control_plane.telegram_organizer_trip_links WHERE telegram_subject_digest = $1", [digestTelegramId(String(newcomer))])).rows;
+    assert.deepEqual(created, [{ telegram_label: "Maya @maya_m", verified_via: "dashboard_link_token" }], "first name and @username; the surname is not kept");
+
+    // Interview: an enrollment redeemed from the organizer's chat.
+    const owner = await mkUser("Ivy");
+    const draft = id("trip");
+    await pool.query("INSERT INTO control_plane.trips(id,slug,lifecycle_state,title) VALUES ($1,$2,'draft','Draft')", [draft, `rs-${draft.replace(/_/g, "-").toLowerCase()}`]);
+    await mkMember(draft, owner);
+    const enrollment = await issueEnrollment(pool, owner, draft, { enrollmentTtlSeconds: 900 });
+    assert.ok(enrollment.ok);
+    const ivy = tg();
+    const started = await dm(ivy, `/start ${enrollment.ok ? enrollment.token : ""}`, { first_name: "Ivy", username: "ivy_i" });
+    assert.notEqual(textOf(started), DEFAULT_STRINGS.badLink);
+    const interviewLink = (await pool.query("SELECT telegram_label, verified_via FROM control_plane.telegram_organizer_trip_links WHERE telegram_subject_digest = $1", [digestTelegramId(String(ivy))])).rows;
+    assert.deepEqual(interviewLink, [{ telegram_label: "Ivy @ivy_i", verified_via: "enrollment_redemption" }]);
   } finally { await app.close(); }
 });

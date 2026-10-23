@@ -99,7 +99,7 @@ import type { GroupContext } from "./group-context.js";
 import { getSessionForChat, setFinishRequestedForChat, type SessionView } from "../interview.js";
 import { organizerDocumentRoute } from "../document-correction.js";
 import { visionProcessingConfig } from "../document-vision.js";
-import { digestTelegramId } from "../identity.js";
+import { digestTelegramId, telegramDisplayLabel } from "../identity.js";
 import type { StructuredModelRunner } from "../model-runner.js";
 import { handleModelCommand, isSwitchableRunner } from "../model-task-settings.js";
 import { looksLikeAQuestion, type ChatType, type WireMessageEvent } from "./protocol.js";
@@ -582,6 +582,33 @@ function tripAppIsReady(options: DispatchOptions): boolean {
   }
 }
 
+/**
+ * A PRIVATE chat with no trip, written to by a Telegram account that has live
+ * organizer trip links: answer with the trips list and buttons `/trips` gives
+ * (the same one `/app` already answers in an unbound DM) instead of "I don't have
+ * a trip for this chat" / "open the link from your signup email" - sentences that
+ * are wrong for someone who has trips and just needs to pick one. Reached after an
+ * Unlink + Restore on a chat whose route could not be reopened, and in any DM the
+ * account has never routed.
+ *
+ * Null (the caller keeps its old reply) for a group, a sender we cannot see, and a
+ * sender with no live link - an unknown sender learns exactly what they did before.
+ * The list is re-derived from the update's own verified sender id, and the buttons
+ * re-authorise each tap, exactly like `/trips`.
+ */
+async function unboundDmTripList(
+  db: pg.Pool,
+  message: { chat?: { type?: string }; from?: { id?: number | string; language_code?: string } },
+  chatId: string,
+): Promise<DirectReply | null> {
+  if (message.chat?.type !== "private" || message.from?.id === undefined) return null;
+  const trips = await listOrganizerTrips(db, String(message.from.id), chatId);
+  if (trips.length === 0) return null;
+  const language = await resolveChatLanguage(db, chatId, message.from?.language_code);
+  const rendered = renderTripList(trips, language);
+  return { chatId, text: rendered.text, replyMarkup: rendered.replyMarkup ?? undefined };
+}
+
 export async function dispatchUpdate(
   db: pg.Pool,
   update: TelegramUpdate,
@@ -684,7 +711,7 @@ export async function dispatchUpdate(
     if (message.chat?.type !== "private" || message.from?.id === undefined) {
       return { kind: "reply", reply: { chatId, text: strings.notPrivate } };
     }
-    const linked = await redeemTelegramLinkToken(db, linkToken, String(message.from.id));
+    const linked = await redeemTelegramLinkToken(db, linkToken, String(message.from.id), telegramDisplayLabel(message.from));
     log(structuredLog("info", "trip_bot.telegram_link", { outcome: linked.ok ? (linked.alreadyLinked ? "already_linked" : "linked") : "refused" }));
     return {
       kind: "reply",
@@ -698,7 +725,7 @@ export async function dispatchUpdate(
   }
 
   if (parsed.kind === "start" && !groupStartToken) {
-    const outcome = await startFromDeepLink(db, chatId, parsed.payload, log, message.from?.language_code);
+    const outcome = await startFromDeepLink(db, chatId, parsed.payload, log, message.from?.language_code, telegramDisplayLabel(message.from));
     switch (outcome.kind) {
       case "started": {
         // The opening is the document offer, not the first question. Asking
@@ -719,7 +746,13 @@ export async function dispatchUpdate(
       }
       case "already_in_interview":
         return { kind: "reply", reply: { chatId, text: strings.alreadyInterviewing } };
-      case "rejected":
+      case "rejected": {
+        // A bare `/start` in a private chat that has no trip, from an account with live organizer links:
+        // its trips to pick from, not "welcome" (a payload we rejected as bad keeps its bad-link answer).
+        if (outcome.reason === "NO_PAYLOAD" && !parsed.malformed && (await resolveChatRoute(db, chatId)).kind === "unbound") {
+          const list = await unboundDmTripList(db, message, chatId);
+          if (list) return { kind: "reply", reply: list };
+        }
         return {
           kind: "reply",
           reply: {
@@ -738,6 +771,7 @@ export async function dispatchUpdate(
                   : strings.badLink,
           },
         };
+      }
     }
   }
 
@@ -1559,8 +1593,12 @@ export async function dispatchUpdate(
         ),
       };
     }
-    case "UNROUTED":
-      return { kind: "reply", reply: { chatId, text: strings.unbound } };
+    case "UNROUTED": {
+      // A plain message in a PRIVATE chat with no trip, from an account that has organizer trips: the list to
+      // pick from (what `/trips` and `/app` give), not "open the link from your signup". Others: as before.
+      const list = await unboundDmTripList(db, message, chatId);
+      return { kind: "reply", reply: list ?? { chatId, text: strings.unbound } };
+    }
     case "COMPANION_PENDING": {
       // Two different situations arrive here, and the family is owed different
       // words for each:

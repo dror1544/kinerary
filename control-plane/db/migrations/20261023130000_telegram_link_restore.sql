@@ -1,4 +1,4 @@
--- rollback: compatible — adds nullable columns that only this release writes or reads and widens one CHECK list by one value ('dashboard_restore') that only this release inserts; the previous release never reads telegram_organizer_trip_links, and a restored link is a per-trip row it cannot see, so a rollback can cost a restored account its access and can never keep one the owner took away
+-- rollback: compatible — adds nullable columns that only this release writes or reads, and widens one CHECK list by one value ('dashboard_restore') that only this release inserts; a rollback to a release that reads telegram_organizer_trip_links (the Sprint 7 candidate d0e3b73 does) keeps a restored account's access exactly as the owner left it, and one to a release from before that table (pre-Sprint 7) cannot see per-trip rows at all and so loses it, which fails closed
 --
 -- RESTORE WITHOUT TELEGRAM (owner request, round-3 staging test, 2026-10-23).
 --
@@ -33,10 +33,24 @@
 --
 -- The new row's verified_via is 'dashboard_restore'.
 --
--- Nothing in this file touches telegram_organizer_links (the previous release's
+-- Nothing in this file touches telegram_organizer_links (the pre-Sprint-7
 -- account-wide table). An Unlink already moved the pair's row out of it into the
--- history table; a restore does NOT move it back, so after a rollback the older
--- readers still see none of the pair's trips (fail closed).
+-- history table; a restore does NOT move it back. So: a rollback to a release that
+-- reads telegram_organizer_trip_links (the Sprint 7 candidate d0e3b73 does) sees the
+-- restored row and keeps the account's access, as the owner left it; a rollback to a
+-- release from before this table existed reads only the account-wide one, sees none
+-- of the pair's trips, and the restored account loses access until it is linked again
+-- (fail closed: it can cost access, never keep what the owner took away).
+--
+-- THE LINK'S DISPLAY LABEL (owner decision 2026-10-23, "name + confirm"). A restore is
+-- one click on an account the owner may not recognise, so each link row carries a
+-- short label of the Telegram account - first name and @username - for the dashboard
+-- to show next to it. `telegram_label` is DISPLAY DATA ONLY. It is written only from
+-- what Telegram delivered on a verified path (the update's `from`, or the user inside
+-- signature-checked initData), never from a request body; it is bounded and stripped
+-- of control characters before it gets here; and nothing ever decides anything from
+-- it: the digest is the identity. Rows that exist already have none and show as
+-- "Telegram account". The column is NULL-able and unchecked beyond its length.
 
 ALTER TABLE control_plane.telegram_organizer_trip_links
   ADD COLUMN IF NOT EXISTS revoked_by text,
@@ -66,3 +80,19 @@ ALTER TABLE control_plane.telegram_organizer_trip_links
 CREATE INDEX IF NOT EXISTS telegram_organizer_trip_links_restorable_idx
   ON control_plane.telegram_organizer_trip_links (user_id, trip_id)
   WHERE revoked_reason = 'owner_unlinked' AND restored_at IS NULL;
+
+ALTER TABLE control_plane.telegram_organizer_trip_links
+  ADD COLUMN IF NOT EXISTS telegram_label text;
+ALTER TABLE control_plane.telegram_organizer_trip_links
+  DROP CONSTRAINT IF EXISTS telegram_organizer_trip_links_label_length_check;
+ALTER TABLE control_plane.telegram_organizer_trip_links
+  ADD CONSTRAINT telegram_organizer_trip_links_label_length_check
+  CHECK (telegram_label IS NULL OR char_length(telegram_label) BETWEEN 1 AND 80);
+
+ALTER TABLE control_plane.telegram_member_links
+  ADD COLUMN IF NOT EXISTS telegram_label text;
+ALTER TABLE control_plane.telegram_member_links
+  DROP CONSTRAINT IF EXISTS telegram_member_links_label_length_check;
+ALTER TABLE control_plane.telegram_member_links
+  ADD CONSTRAINT telegram_member_links_label_length_check
+  CHECK (telegram_label IS NULL OR char_length(telegram_label) BETWEEN 1 AND 80);

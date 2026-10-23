@@ -164,8 +164,9 @@ source-vs-table check, live widening/narrowing, fail-closed scopes, rollback loo
   field of `GET /v1/trips` / `GET /v1/trips/:id` (`links[]`: `id`, `via`, `linkedAt`, `firstSignedInAt`,
   `lastSignedInAt`); unlinking is `DELETE /v1/account/telegram-links/:id` (`requireMutation`). A runtime-only
   member sees the same status on their card and can end their own link, but is not offered Link. **Never**
-  the Telegram id, its digest or any piece of either (a digest of a short numeric id is brute-forceable), and
-  no Telegram-supplied name. This replaces the account-level "Telegram accounts that can sign in as you"
+  the Telegram id, its digest or any piece of either (a digest of a short numeric id is brute-forceable); the
+  one piece of the other party shown since 2026-10-23 is the display label (first name, @username) below, to a
+  full session only. This replaces the account-level "Telegram accounts that can sign in as you"
   section and `GET /v1/account/telegram-links` (removed: answers 404). Dates on the page are formatted in the
   **page's** language (`<html lang>`), never the browser's.
 - **Restore — the way back for an account the owner Unlinked, with no Telegram round trip** (owner request,
@@ -189,11 +190,30 @@ source-vs-table check, live widening/narrowing, fail-closed scopes, rollback loo
   and for membership-end), and on the revoked row `restored_at` / `restored_by` / `restored_link_id`.
   The bot's organizer fact comes back through the **same helper the `lk_` relink uses**
   (`restoreDemotedOrganizerPersonLink`): only a `trip_person_links` row carrying the `demoted_from_role`
-  marker, which is then cleared. Not restored: the interview session, interview binding and chat binding
-  the Unlink closed (the Telegram account's hold on the trip — the next `/start` or interview link makes
-  them again) and the previous release's account-wide row (it stays in the history table, so a rollback
-  still fails closed). The card shows `telegram.unlinked[]` (`id`, `via`, `linkedAt`, `unlinkedAt`; no id,
-  digest or name) and a **Restore Telegram** entry in the ⋮ menu for a full session of an owner or
+  marker, which is then cleared. **The bot comes back too:** the private chat whose binding this Unlink closed
+  (`telegram_unlinked`) gets a NEW open chat binding to the trip, with the trip's companion profile, in the
+  same transaction (history is never un-closed) — only when that chat has no open binding and no live
+  interview — so `resolveChatRoute` is `companion` and a plain DM reaches the companion instead of "I
+  don't have a trip for this chat". Lock order as teardown's: chat bindings, then the trip row. Separately,
+  an **unbound private chat** (plain text or a bare `/start`) from a Telegram account that has live
+  organizer links is answered with the same trips list and buttons `/trips` gives (as `/app` already did);
+  an unknown sender still gets the old reply. Not restored: the interview session and interview binding
+  the Unlink closed (a click must never resume a live interview; a new interview link starts a new one) and
+  the pre-Sprint-7 account-wide row (it stays in the history table). **Rollback:** to a release that reads
+  `telegram_organizer_trip_links` (the Sprint 7 candidate d0e3b73 does) a restored account keeps its access;
+  only a pre-Sprint-7 target cannot see per-trip rows and loses it (fail closed).
+  **Names (owner decision 2026-10-23, "name + confirm"):** each link row carries `telegram_label` — the
+  account's first name and @username (`telegramDisplayLabel`, identity.ts: bounded to 80, control, format
+  and bidi characters stripped, a non-handle username dropped) — written only from what Telegram delivered on
+  a verified path (the update's `from` at an interview redemption or a `lk_` redemption; the user object inside
+  signature-checked initData at a Mini App sign-in, where a link without a label is filled; copied from the
+  revoked row at a restore). It is **display data only**: never read from a request body, never compared,
+  parsed or used for any decision (the digest is the identity). Rows from before this release have none and
+  show as "Telegram account". `links[]` and `unlinked[]` carry `label` (omitted when there is none) for a
+  **full session**; a Telegram-minted session gets the same shape as before plus at most the label of its
+  **own** account, and never the Unlinked list. The card asks "Restore Telegram access for <label>?" before
+  the POST. The card shows `telegram.unlinked[]` (`id`, `via`, `linkedAt`, `unlinkedAt`, `label?`; no id,
+  digest) and a **Restore Telegram** entry in the ⋮ menu for a full session of an owner or
   organizer. Held by `control-plane/api/test/telegram-link-restore-db.test.ts` and
   `web/src/pages/TripTelegram.test.tsx`.
 - **Link — the way to add a Telegram account that was never linked** (`POST /v1/trips/:id/telegram-link`, `requireMutation`, owner or
