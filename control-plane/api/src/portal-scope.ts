@@ -75,6 +75,14 @@ export const PORTAL_SCOPE_POLICY: Readonly<Record<string, RouteScope>> = Object.
   "POST /v1/events": "open",
   "GET /v1/auth/capabilities": "open",
   "POST /v1/auth/email-password": "open",
+  // Email sign-up and password reset (portal-email-auth.ts). None reads the session cookie: the emailed token
+  // (or, for sign-up and forgot, nothing but an address that gets a message) is the whole authority, so a
+  // Telegram-scoped session can neither use these to reach another address's account nor be stopped from
+  // using them as a stranger would.
+  "POST /v1/auth/sign-up": "open",
+  "POST /v1/auth/verify-email": "open",
+  "POST /v1/auth/password/forgot": "open",
+  "POST /v1/auth/password/reset": "open",
   "POST /v1/auth/telegram-mini-app": "open",
   "GET /v1/auth/google/start": "open",
   "GET /v1/auth/google/callback": "open",

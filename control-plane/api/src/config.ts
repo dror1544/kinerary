@@ -129,8 +129,28 @@ export const architectureProfileSchema = z.object({
     // is approved by the trip's own organizer; the operator is notified, not
     // asked. See docs/landing-page-plan.md.
     session_ttl_seconds: z.number().int().min(3600).max(2592000).default(604800),
+    /**
+     * Email for the portal's own sign-up and password reset (verification and
+     * reset links). All three ABSENT means "email is not configured": the
+     * sign-up and forgot-password routes answer 503 SIGN_UP_UNAVAILABLE, the
+     * page says sign-up is not open yet, and nothing is ever "sent" into the
+     * void. `resend` posts to Resend's HTTP API with the key behind
+     * `email_api_key_secret_ref`; `log` sends nothing and is for tests and a
+     * development stack (refused in production, where it would swallow every
+     * link). The address, domain and key belong in the deployment's profile,
+     * never in this repository.
+     */
+    email_provider: z.enum(["resend", "log"]).optional(),
+    email_api_key_secret_ref: secretReference.optional(),
+    email_from: z.string().email().max(254).optional(),
   }).strict().refine((web) => Boolean(web.google_client_id_secret_ref) === Boolean(web.google_client_secret_ref), {
     message: "Google client ID and secret references must be configured together",
+  }).refine((web) => web.email_provider !== undefined || (web.email_api_key_secret_ref === undefined && web.email_from === undefined), {
+    message: "email_api_key_secret_ref and email_from need email_provider",
+    path: ["email_provider"],
+  }).refine((web) => web.email_provider !== "resend" || (web.email_api_key_secret_ref !== undefined && web.email_from !== undefined), {
+    message: "email_provider \"resend\" needs both email_api_key_secret_ref and email_from",
+    path: ["email_provider"],
   }).optional(),
   /**
    * The Trip Bot relay connector — the WebSocket server Hermes's gateway dials
@@ -237,6 +257,13 @@ export const architectureProfileSchema = z.object({
   }
   if (profile.web && profile.web.public_origin === profile.web.runtime_origin) {
     ctx.addIssue({ code: "custom", path: ["web", "runtime_origin"], message: "runtime origin must be isolated from the organizer origin" });
+  }
+  if (profile.environment === "production" && profile.web?.email_provider === "log") {
+    ctx.addIssue({
+      code: "custom",
+      path: ["web", "email_provider"],
+      message: "email_provider \"log\" sends nothing; a production profile must use a real provider or leave email unconfigured (sign-up then answers 503)",
+    });
   }
   if (profile.environment === "production" && profile.web) {
     for (const [key, value] of [["public_origin", profile.web.public_origin], ["runtime_origin", profile.web.runtime_origin]] as const) {

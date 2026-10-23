@@ -92,6 +92,11 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
       ACCOUNT_SIGN_IN_REQUIRED: "Sign in with your password to do this.",
       ORIGIN_INVALID: "Please sign in from the Kinerary website.",
       TELEGRAM_NOT_LINKED: "This Telegram account is not linked yet.",
+      SIGN_UP_UNAVAILABLE: "Sign-up isn't open yet.",
+      SIGN_UP_RATE_LIMITED: "Too many requests. Please wait a minute and try again.",
+      PASSWORD_TOO_SHORT: "Use at least 8 characters for the password.",
+      TOKEN_INVALID: "This link has expired or was already used.",
+      ACCOUNT_EXISTS: "You already have an account. Sign in, or reset your password.",
     };
     throw new ApiError(typeof payload.error === "string" ? payload.error : "REQUEST_FAILED", messages[payload.error] || payload.message || payload.error || "The request could not be completed.");
   }
@@ -208,8 +213,21 @@ export const getMe = () => api<unknown>("/v1/me").then((value) => meSchema.parse
 export const getTrips = () => api<unknown>("/v1/trips").then((value) => z.object({ trips: z.array(z.union([tripSchema, memberTripSchema])) }).parse(value));
 export const getTrip = (id: string) => api<unknown>(`/v1/trips/${encodeURIComponent(id)}`).then((value) => tripSchema.parse(value));
 
-export const getAuthCapabilities = () => api<unknown>("/v1/auth/capabilities").then(value => z.object({ google: z.boolean(), emailPassword: z.boolean(), telegramMiniApp: z.boolean().optional() }).parse(value));
+export const getAuthCapabilities = () => api<unknown>("/v1/auth/capabilities").then(value => z.object({ google: z.boolean(), emailPassword: z.boolean(), emailSignUp: z.boolean().optional(), telegramMiniApp: z.boolean().optional() }).parse(value));
 export const emailPasswordSignIn = (input: { email: string; password: string; returnTo: string; embedded?: true }) => api<{ appPath: string }>("/v1/auth/email-password", { method: "POST", body: JSON.stringify(input) });
+
+/** Creates nothing yet: the server emails a link, and the account exists once that link is used. */
+export const emailSignUp = (input: { email: string; password: string; displayName: string; returnTo: string; language: "en" | "he" }) =>
+  api<{ status: "check_your_email" }>("/v1/auth/sign-up", { method: "POST", body: JSON.stringify(input) });
+/** Spends the emailed token: creates the account and signs the person in. */
+export const verifyEmail = (token: string) => api<{ appPath: string }>("/v1/auth/verify-email", { method: "POST", body: JSON.stringify({ token }) });
+/** Always the same answer, whether or not the address has an account. */
+export const forgotPassword = (input: { email: string; language: "en" | "he" }) =>
+  api<{ status: "check_your_email" }>("/v1/auth/password/forgot", { method: "POST", body: JSON.stringify(input) });
+/** Spends the emailed token, sets the password, ends the other sessions and signs the person in. */
+export const resetPassword = (input: { token: string; password: string }) =>
+  api<{ appPath: string }>("/v1/auth/password/reset", { method: "POST", body: JSON.stringify(input) });
+
 export function safeReturnTo(value: string | null): string {
   if (!value?.startsWith("/") || value.startsWith("//") || value.includes("\\")) return "/trips";
   try { const url = new URL(value, "https://portal.invalid"); return url.origin === "https://portal.invalid" ? `${url.pathname}${url.search}${url.hash}` : "/trips"; } catch { return "/trips"; }

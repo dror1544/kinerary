@@ -1,28 +1,47 @@
-import { ArrowLeft, Mail } from "lucide-react";
-import { FormEvent, useState } from "react";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
-import { Brand } from "../components/Brand";
+import { ApiError, forgotPassword, getAuthCapabilities } from "../api";
+import { AccountShell, Notice, mailLanguage } from "../components/AccountShell";
 
 export default function ForgotPasswordPage() {
-  const [submitted, setSubmitted] = useState(false);
-  const submit = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    setSubmitted(true);
-  };
+  const capabilities = useQuery({ queryKey: ["auth-capabilities"], queryFn: getAuthCapabilities, retry: false });
+  const [email, setEmail] = useState("");
+  const [sentTo, setSentTo] = useState<string | null>(null);
+  const request = useMutation({
+    mutationFn: () => forgotPassword({ email: email.trim(), language: mailLanguage() }),
+    onSuccess: () => setSentTo(email.trim()),
+  });
 
+  if ((capabilities.data && capabilities.data.emailSignUp !== true) || (request.error instanceof ApiError && request.error.code === "SIGN_UP_UNAVAILABLE")) {
+    return (
+      <AccountShell eyebrow="Password help" title="Password reset isn't open yet">
+        <p>We can't send reset links right now. Please check back soon, or sign in with Google or Telegram if that's how you joined.</p>
+        <Link className="button wide" to="/sign-in">Back to sign in</Link>
+      </AccountShell>
+    );
+  }
+  if (sentTo) {
+    return (
+      <AccountShell eyebrow="Password help" title="Check your email">
+        <p>If there's an account for <strong>{sentTo}</strong>, we've sent a link to choose a new password. It works once and expires in an hour.</p>
+        <p><Link to="/sign-in">Back to sign in</Link></p>
+      </AccountShell>
+    );
+  }
+  const submit = (event: FormEvent) => { event.preventDefault(); request.mutate(); };
   return (
-    <main className="simple-auth-page">
-      <header><Brand /><Link to="/sign-in"><ArrowLeft size={16} /> Back to sign in</Link></header>
-      <section>
-        <span className="section-label">Password help</span>
-        <h1>Find your way back in.</h1>
-        <p>Enter your email. When the control-plane account service is connected, Kinerary will send a secure, expiring reset link.</p>
-        <form onSubmit={submit}>
-          <label>Email<div className="input-wrap"><Mail size={18} /><input type="email" required autoComplete="email" placeholder="you@example.com" /></div></label>
-          <button className="button button-coral" type="submit">Request reset link</button>
+    <AccountShell eyebrow="Password help" title="Find your way back in">
+      <p>Enter your email and we'll send a link to choose a new password. This also works if you joined through an invitation or Google and never set one.</p>
+      {capabilities.isPending && <p>Loading…</p>}
+      {capabilities.data?.emailSignUp === true && (
+        <form className="compact-form" onSubmit={submit}>
+          <label>Email<input required type="email" maxLength={254} autoComplete="email" value={email} onChange={(e) => setEmail(e.target.value)} /></label>
+          <button className="button wide" disabled={request.isPending}>{request.isPending ? "Sending…" : "Send reset link"}</button>
+          {request.isError && <Notice>{request.error.message}</Notice>}
         </form>
-        {submitted && <p className="form-notice" role="status">The reset screen is ready. No email was sent from this interface preview.</p>}
-      </section>
-    </main>
+      )}
+      <p><Link to="/sign-in">Back to sign in</Link></p>
+    </AccountShell>
   );
 }

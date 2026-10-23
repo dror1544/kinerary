@@ -26,7 +26,9 @@ function SignIn() {
   const me = useQuery({ queryKey: ["me"], queryFn: getMe, retry: false });
   const queryClient = useQueryClient();
   const capabilities = useQuery({ queryKey: ["auth-capabilities"], queryFn: getAuthCapabilities, retry: false });
-  const returnTo = safeReturnTo(new URLSearchParams(useLocation().search).get("return_to"));
+  const searchParams = new URLSearchParams(useLocation().search);
+  // /trips/new links here with `returnTo`; the Google redirect and the dashboard say `return_to`.
+  const returnTo = safeReturnTo(searchParams.get("return_to") ?? searchParams.get("returnTo"));
   const emailForm = useForm<{ email: string; password: string }>({ defaultValues: { email: "", password: "" } });
   const finishLogin = async ({ appPath }: { appPath: string }) => {
     queryClient.clear();
@@ -56,6 +58,7 @@ function SignIn() {
           <label>Account password<input required type="password" maxLength={1024} autoComplete="current-password" {...emailForm.register("password")} /></label>
           <button className="button wide" disabled={emailLogin.isPending}>{emailLogin.isPending ? "Signing in…" : "Sign in"}</button>
           {emailLogin.isError && <Notice>{emailLogin.error.message}</Notice>}
+          <p className="form-links"><Link to="/forgot-password">Forgot your password?</Link> · <Link to={`/sign-up?returnTo=${encodeURIComponent(returnTo)}`}>Create an account</Link></p>
         </form>}
         {capabilities.data?.google && <button className="button wide" onClick={() => signIn(returnTo)}>Continue with Google</button>}
         {tripId && <form className="compact-form" onSubmit={passwordForm.handleSubmit((value) => passwordLogin.mutate(value))}>

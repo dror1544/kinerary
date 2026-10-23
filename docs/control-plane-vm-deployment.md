@@ -857,6 +857,22 @@ drifting. Notes on what you are filling in:
 - Google: add `google_client_id_secret_ref` and `google_client_secret_ref` **together**
   (the schema requires both) and set the two variables; the redirect URI to register
   is `<PORTAL_ORIGIN>/v1/auth/google/callback`. Left out, sign-in is email and password.
+- **Email for the portal's own sign-up and password reset** (`web.email_provider`,
+  `web.email_api_key_secret_ref`, `web.email_from`). `email_provider` is `"resend"`
+  (POST `https://api.resend.com/emails` with the key as a bearer token; the key
+  reference and the sender address are both required) or `"log"` (sends nothing;
+  refused in a production profile). Leave all three out and email is **off**: the
+  routes `POST /v1/auth/sign-up` and `/v1/auth/password/forgot` answer 503
+  `SIGN_UP_UNAVAILABLE`, `GET /v1/auth/capabilities` says `emailSignUp: false`, the
+  page says "Sign-up isn't open yet", and the api logs `email_auth.disabled` at
+  boot. The links in the messages are built from `web.public_origin`. The address,
+  domain and key live in the deployment's profile and secrets, never in this
+  repository. **The key reference must be one the release tool allows**:
+  `kinerary-cp-release` refuses an `env://` name outside its allow-list
+  (`WEB_API_ENV` in `vm-release.py`, mirrored in `compose.vm.yml`), so a new
+  variable needs those two files to name it, or a `file://` secret mounted into the
+  container. Like the Mini App fields, the profile schema is strict: add these keys
+  only in the same step as an upgrade to a revision that contains this change.
 - **Telegram Mini App fields** (`web.telegram_bot_token_secret_ref`,
   `web.telegram_init_data_max_age_seconds`) and **`public_api.trust_proxy`** arrive
   with the Mini App sign-in change (#442, PR #456). The profile schema is strict, so
@@ -1419,9 +1435,12 @@ it the routes are not mounted at all, and a key on one side only reads as a
 401. The fleet monitor reaches the same tool through the `cpinvite` forced
 command — install and rules in `.agents/skills/organizer-invites/SKILL.md`.
 
-There is no password reset behind any of this. The control plane has no such
-route for organizers, and an invited account is deliberately given no password
-credential at all.
+An invited account holds a credential nobody knows (it is not password-less),
+and since 2026-10-23 its owner can set a real password with the portal's
+"Forgot password" link (`POST /v1/auth/password/forgot`, then `/reset-password`),
+provided the `web` block configures email (below). Without email those routes
+answer 503 `SIGN_UP_UNAVAILABLE`, and an invited organizer still reaches the
+trip through Telegram or Google on the same verified address.
 
 ## Manual test
 

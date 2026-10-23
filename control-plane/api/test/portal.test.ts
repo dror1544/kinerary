@@ -71,7 +71,7 @@ test("Google is optional as a complete pair and unavailable routes fail explicit
   } });
   try {
     const providers = await app.inject({ url: "/v1/auth/capabilities" });
-    assert.deepEqual(providers.json(), { google: false, emailPassword: true, telegramMiniApp: false });
+    assert.deepEqual(providers.json(), { google: false, emailPassword: true, emailSignUp: false, telegramMiniApp: false });
     for (const url of ["/v1/auth/google/start", "/v1/auth/google/callback?state=x&code=x"]) {
       const response = await app.inject({ url });
       assert.equal(response.statusCode, 503);
@@ -110,4 +110,27 @@ test("email login throttles before credential hashing and ignores spoofed forwar
     assert.equal(spoofed.statusCode, 429);
     assert.equal(queries, 99);
   } finally { await app.close(); }
+});
+
+test("the profile's email block: resend needs its key and sender, the log provider is refused in production, and a stray field is not accepted", async () => {
+  const raw = JSON.parse(await readFile(fileURLToPath(new URL("../../config/architecture.web.example.json", import.meta.url)), "utf8"));
+  const withWeb = (extra: Record<string, unknown>, env = "development") => {
+    const web = { ...raw.web, ...extra };
+    if (extra.email_provider === undefined) delete web.email_provider;
+    return { ...raw, environment: env, web: env === "production" ? { ...web, public_origin: "https://portal.example.test", runtime_origin: "https://runtime.example.test" } : web };
+  };
+  // Unconfigured is a valid profile (sign-up answers 503); so is a complete resend block.
+  assert.equal(validateArchitectureProfile(withWeb({})).web?.email_provider, undefined);
+  const resend = { email_provider: "resend", email_api_key_secret_ref: "env://EMAIL_API_KEY", email_from: "noreply@mail.example.test" };
+  assert.equal(validateArchitectureProfile(withWeb(resend, "production")).web?.email_provider, "resend");
+  // Half a resend block, a key with no provider, a sender that is not an address, an unknown provider.
+  assert.throws(() => validateArchitectureProfile(withWeb({ ...resend, email_api_key_secret_ref: undefined })), /needs both/);
+  assert.throws(() => validateArchitectureProfile(withWeb({ ...resend, email_from: undefined })), /needs both/);
+  assert.throws(() => validateArchitectureProfile(withWeb({ email_api_key_secret_ref: "env://EMAIL_API_KEY" })), /need email_provider/);
+  assert.throws(() => validateArchitectureProfile(withWeb({ ...resend, email_from: "not an address" })));
+  assert.throws(() => validateArchitectureProfile(withWeb({ ...resend, email_provider: "smtp" })));
+  assert.throws(() => validateArchitectureProfile(withWeb({ ...resend, email_api_key_secret_ref: "literal-key-in-the-profile" })), undefined, "a key must be a secret reference, never a value");
+  // The log provider delivers nothing: fine for dev and tests, refused where it would swallow every link.
+  assert.equal(validateArchitectureProfile(withWeb({ email_provider: "log" })).web?.email_provider, "log");
+  assert.throws(() => validateArchitectureProfile(withWeb({ email_provider: "log" }, "production")), /sends nothing/);
 });

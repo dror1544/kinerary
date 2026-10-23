@@ -4,7 +4,13 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type pg from "pg";
 import { CodeChallengeMethod, OAuth2Client } from "google-auth-library";
 import { issueEnrollment, replaceEnrollment } from "./enrollment.js";
-import { ensureUnknownPasswordCredential, resolveOrCreateEmailAccount, verifyPasswordLogin } from "./password-identity.js";
+import { ensureUnknownPasswordCredential, hashPassword, resolveOrCreateEmailAccount, verifyPasswordLogin } from "./password-identity.js";
+import type { Mailer } from "./mailer.js";
+import {
+  PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH, consumePasswordReset, consumeSignUpToken, isPlausibleEmail, portalMailIdle,
+  runInBackground, startPasswordReset, startSignUp, type EmailAuthContext,
+} from "./portal-email-auth.js";
+import { pickLanguage } from "./portal-email-templates.js";
 import { generatePlan } from "./planner.js";
 import { issueApproval } from "./plan-approval.js";
 import { removeMember } from "./member-removal.js";
@@ -226,6 +232,15 @@ export interface PortalDependencies {
   telegramMiniApp?: TelegramMiniAppConfig & { log?: (line: string) => void };
   /** How long a dashboard-issued Telegram link works. Defaults to 15 minutes. */
   telegramLinkTtlSeconds?: number;
+  /**
+   * Carries the verification and password-reset messages. ABSENT means email is
+   * not configured: `POST /v1/auth/sign-up` and `/v1/auth/password/forgot` answer
+   * 503 SIGN_UP_UNAVAILABLE and `capabilities.emailSignUp` is false. There is no
+   * path on which a message is silently not sent.
+   */
+  mailer?: Mailer;
+  /** Where the email routes write their (token-free) log lines. Defaults to stderr. */
+  emailAuthLog?: (line: string) => void;
 }
 
 interface PortalUser {
@@ -630,6 +645,8 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
   });
   registerPortalRouteHandlers(app, deps);
   collecting = false;
+  // Sign-up and reset work happens after the response; closing the app waits for it.
+  app.addHook("onClose", async () => { await portalMailIdle(); });
   assertEveryRouteIsClassified(registered);
 }
 
@@ -644,6 +661,8 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
   app.get("/v1/auth/capabilities", async () => ({
     google: Boolean(deps.google),
     emailPassword: true,
+    // Whether the portal can send the verification / reset message at all. False renders "Sign-up isn't open yet".
+    emailSignUp: Boolean(deps.mailer),
     telegramMiniApp: Boolean(deps.telegramMiniApp?.enabled()),
   }));
 
@@ -700,6 +719,124 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
       return { appPath: validatedReturnTo(body.returnTo) };
     } catch (error) { await client.query("ROLLBACK"); throw error; }
     finally { client.release(); }
+  });
+
+  // ── Email sign-up, verification and password reset (portal-email-auth.ts) ──
+  //
+  //   POST /v1/auth/sign-up          { email, password, displayName?, returnTo?, language? }  202 { status: "check_your_email" }
+  //   POST /v1/auth/verify-email     { token }                 200 { appPath } + session cookies | 400 TOKEN_INVALID | 409 ACCOUNT_EXISTS
+  //   POST /v1/auth/password/forgot  { email, language? }      202 { status: "check_your_email" }
+  //   POST /v1/auth/password/reset   { token, password }       200 { appPath } + session cookies | 400 TOKEN_INVALID
+  //
+  // All four are `open` (portal-scope.ts): none reads the session cookie, so a
+  // Telegram-scoped session gets no more and no less from them than a stranger;
+  // the emailed token is the whole authority. Sign-up and forgot answer 503
+  // SIGN_UP_UNAVAILABLE without a mailer, and answer 202 identically for an
+  // address that has an account and one that has not (the work follows the
+  // response; see portal-email-auth.ts). Every one is `no-store` and needs our
+  // own Origin, like /v1/auth/password: verify and reset SIGN SOMEBODY IN, so a
+  // page on another site must not be able to post a token it holds.
+  const signUpIpAttempts: Attempts = new Map();
+  const signUpAddressAttempts: Attempts = new Map();
+  const forgotIpAttempts: Attempts = new Map();
+  const forgotAddressAttempts: Attempts = new Map();
+  const emailTokenIpAttempts: Attempts = new Map();
+  const emailAuthLog = (line: string) => (deps.emailAuthLog ?? ((l: string) => process.stderr.write(`${l}\n`)))(line);
+  const emailAuthContext = (mailer: Mailer): EmailAuthContext => ({ db: deps.db, mailer, publicOrigin: deps.publicOrigin, log: emailAuthLog });
+  const jsonBody = (request: FastifyRequest): Record<string, unknown> =>
+    request.body && typeof request.body === "object" && !Array.isArray(request.body) ? request.body as Record<string, unknown> : {};
+  const addressKey = (email: string) => sha256(email.trim().toLowerCase());
+  /** The page's own `returnTo`, kept only if it is a path the migration's CHECK also accepts. */
+  const storableReturnTo = (value: unknown): string => {
+    const path = validatedReturnTo(value);
+    return /^\/[A-Za-z0-9/_?=&.#%-]*$/.test(path) ? path : "/trips";
+  };
+
+  app.post("/v1/auth/sign-up", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    if (!deps.mailer) return reply.code(503).send({ error: "SIGN_UP_UNAVAILABLE" });
+    if (!admitLogin(signUpIpAttempts, request.ip, 20)) return reply.header("retry-after", "60").code(429).send({ error: "SIGN_UP_RATE_LIMITED" });
+    if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
+    const body = jsonBody(request);
+    if (!isPlausibleEmail(body.email) || typeof body.password !== "string" ||
+        (body.displayName !== undefined && (typeof body.displayName !== "string" || body.displayName.length > 120))) {
+      return reply.code(400).send({ error: "INVALID_REQUEST" });
+    }
+    if (body.password.length < PASSWORD_MIN_LENGTH) return reply.code(400).send({ error: "PASSWORD_TOO_SHORT" });
+    if (body.password.length > PASSWORD_MAX_LENGTH) return reply.code(400).send({ error: "INVALID_REQUEST" });
+    if (!admitLogin(signUpAddressAttempts, addressKey(body.email), 3)) return reply.header("retry-after", "60").code(429).send({ error: "SIGN_UP_RATE_LIMITED" });
+    const input = {
+      email: body.email, password: body.password, displayName: typeof body.displayName === "string" ? body.displayName : undefined,
+      returnTo: storableReturnTo(body.returnTo ?? body.return_to), language: pickLanguage(body.language, request.headers["accept-language"]),
+    };
+    const ctx = emailAuthContext(deps.mailer);
+    runInBackground(() => startSignUp(ctx, input), (error) =>
+      emailAuthLog(structuredLog("error", "email_auth.sign_up_failed", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN" })));
+    return reply.code(202).send({ status: "check_your_email" });
+  });
+
+  app.post("/v1/auth/verify-email", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    if (!admitLogin(emailTokenIpAttempts, request.ip, 30)) return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
+    if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
+    const body = jsonBody(request);
+    const client = await deps.db.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await consumeSignUpToken(client, body.token);
+      if (!result.ok) {
+        // Commit: a spent token stays spent, even when the address turned out to have an account already.
+        await client.query("COMMIT");
+        return reply.code(result.error === "ACCOUNT_EXISTS" ? 409 : 400).send({ error: result.error });
+      }
+      const session = await createWebSession(client, result.userId, deps.sessionTtlSeconds);
+      await client.query("COMMIT");
+      setWebSessionCookies(reply, deps, session);
+      return { appPath: validatedReturnTo(result.returnTo) };
+    } catch (error) {
+      try { await client.query("ROLLBACK"); } catch { /* ignore */ }
+      throw error;
+    } finally { client.release(); }
+  });
+
+  app.post("/v1/auth/password/forgot", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    if (!deps.mailer) return reply.code(503).send({ error: "SIGN_UP_UNAVAILABLE" });
+    if (!admitLogin(forgotIpAttempts, request.ip, 20)) return reply.header("retry-after", "60").code(429).send({ error: "SIGN_UP_RATE_LIMITED" });
+    if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
+    const body = jsonBody(request);
+    if (!isPlausibleEmail(body.email)) return reply.code(400).send({ error: "INVALID_REQUEST" });
+    if (!admitLogin(forgotAddressAttempts, addressKey(body.email), 3)) return reply.header("retry-after", "60").code(429).send({ error: "SIGN_UP_RATE_LIMITED" });
+    const input = { email: body.email, language: pickLanguage(body.language, request.headers["accept-language"]) };
+    const ctx = emailAuthContext(deps.mailer);
+    runInBackground(() => startPasswordReset(ctx, input), (error) =>
+      emailAuthLog(structuredLog("error", "email_auth.password_reset_failed", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN" })));
+    return reply.code(202).send({ status: "check_your_email" });
+  });
+
+  app.post("/v1/auth/password/reset", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    if (!admitLogin(emailTokenIpAttempts, request.ip, 30)) return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
+    if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
+    const body = jsonBody(request);
+    if (typeof body.token !== "string" || typeof body.password !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+    // Before the token is touched: a typo in the new password must not burn the link.
+    if (body.password.length < PASSWORD_MIN_LENGTH) return reply.code(400).send({ error: "PASSWORD_TOO_SHORT" });
+    if (body.password.length > PASSWORD_MAX_LENGTH) return reply.code(400).send({ error: "INVALID_REQUEST" });
+    const passwordHash = await hashPassword(body.password);
+    const client = await deps.db.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await consumePasswordReset(client, body.token, passwordHash);
+      if (!result.ok) { await client.query("ROLLBACK"); return reply.code(400).send({ error: result.error }); }
+      const session = await createWebSession(client, result.userId, deps.sessionTtlSeconds);
+      await client.query("COMMIT");
+      setWebSessionCookies(reply, deps, session);
+      return { appPath: "/trips" };
+    } catch (error) {
+      try { await client.query("ROLLBACK"); } catch { /* ignore */ }
+      throw error;
+    } finally { client.release(); }
   });
 
   // ── Telegram Mini App sign-in (#442) ──────────────────────────────────────
@@ -887,7 +1024,7 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
           // password credential, and `POST /v1/signup` with that email would
           // set one — handing a stranger who knows the address everything this
           // person owns. A credential nobody knows closes that; they sign in
-          // with Google, and password recovery later gives them one they chose.
+          // with Google, and password recovery (portal-email-auth.ts) gives them one they chose.
           await ensureUnknownPasswordCredential(client, userId, identity.email);
         } else {
           userId = await createBareUser(client, identity.displayName);

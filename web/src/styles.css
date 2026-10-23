@@ -622,3 +622,9 @@ h1 { margin: 0; max-width: 700px; font: 800 clamp(48px, 5.1vw, 78px)/1.01 "Manro
 
 .scope-banner { margin: 15px auto; max-width: 1180px; }
 .scope-banner a { text-decoration: underline; font-weight: 700; }
+
+/* Account pages (sign-up, verify, forgot, reset) */
+.link-button { border: 0; padding: 0; background: none; color: var(--teal); font: inherit; font-weight: 800; cursor: pointer; text-decoration: underline; }
+.field-hint { margin: -4px 0 0; font-size: 13px; }
+.form-links { margin: 6px 0 0; font-size: 14px; }
+.form-links a, .placeholder-card p a { color: var(--teal); font-weight: 800; }

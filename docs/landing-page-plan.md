@@ -20,8 +20,10 @@ the runtime UI and data owner; it is not merged into React.
 - Every email account holds a credential from birth: the password the person
   chose, or, for an invitation or a Google sign-in, one built from random bytes
   nobody keeps. That is what stops an account being claimed by whoever signs up
-  with its address first. Until password recovery ships, an organizer who never
-  chose a password uses Google on the web; the Telegram bot needs no password.
+  with its address first. Since 2026-10-23 an organizer who never chose a password
+  can set one with the emailed "Forgot password" link (where the deployment
+  configures email); otherwise they use Google on the web; the Telegram bot needs
+  no password.
 - What the SPA itself wires today (checked 2026-09-25): the personal space
   (`/app`, `ProductApp.tsx`) starts Google sign-in through
   `/v1/auth/google/start`. The public `/sign-in` and `/sign-up` screens
@@ -105,6 +107,5 @@ until SSE, large uploads/downloads, Google participant linking, password joins,
 and mobile iframe behavior pass test-domain acceptance. New onboarding must
 present only the personal-space route after cutover.
 
-Deferred: password recovery (the landing SPA's screen for it sends nothing
-yet), billing, rename/archive/delete, full operational history,
+Deferred: billing, rename/archive/delete, full operational history,
 memories/community/commerce, and rewriting the legacy runtime in React.

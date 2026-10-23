@@ -16,6 +16,7 @@
     "telegram_bot_username": "kinerary_bot",
     "telegram_bot_token_secret_ref": "env://TELEGRAM_BOT_TOKEN",
     "telegram_init_data_max_age_seconds": 300,
-    "session_ttl_seconds": 604800
+    "session_ttl_seconds": 604800,
+    "email_provider": "log"
   }
 }
