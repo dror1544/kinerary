@@ -6,7 +6,7 @@
  */
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { after, before, test } from "node:test";
+import { after, before, beforeEach, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { buildApp } from "../src/app.js";
@@ -15,8 +15,9 @@ import { LogMailer, MailSendError, ResendMailer, type MailMessage, type Mailer }
 import { applyMigrations } from "../src/migrations.js";
 import { ensureUnknownPasswordCredential, resolveOrCreateEmailAccount, digestEmail } from "../src/password-identity.js";
 import { sha256, type GoogleIdentity, type PortalDependencies } from "../src/portal.js";
-import { portalMailIdle, ADDRESS_HOURLY_SEND_CAP } from "../src/portal-email-auth.js";
+import { portalMailIdle, ADDRESS_HOURLY_SEND_CAP, GLOBAL_SENDS_PER_MINUTE, normalizeEmail } from "../src/portal-email-auth.js";
 import { PORTAL_SCOPE_POLICY, scopedSessionDigest } from "../src/portal-scope.js";
+import { issueTelegramLinkToken, redeemTelegramLinkToken } from "../src/telegram-link-token.js";
 import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const skip = !testDatabaseUrl();
@@ -63,6 +64,10 @@ type App = Harness["app"];
 const post = (app: App, url: string, payload: unknown, headers: Record<string, string> = {}) => app.inject({
   method: "POST", url, payload: JSON.stringify(payload), headers: { "content-type": "application/json", origin: ORIGIN, ...headers },
 });
+/** From a chosen client address: how a flood from many IPs is simulated (trustProxy is off, so this is the socket peer). */
+const postFrom = (app: App, remoteAddress: string, url: string, payload: unknown) => app.inject({
+  method: "POST", url, remoteAddress, payload: JSON.stringify(payload), headers: { "content-type": "application/json", origin: ORIGIN },
+});
 const signUp = (app: App, email: string, extra: Record<string, unknown> = {}) =>
   post(app, "/v1/auth/sign-up", { email, ...extra });
 /** The page the emailed link opens sends the token with the password and the name the person chose there. */
@@ -106,6 +111,8 @@ before(async () => {
   const client = await pool.connect();
   try { await applyMigrations(client, migrationsDir); } finally { client.release(); }
 });
+// Every message leaves a row and the global ceiling counts them all, so each test starts from an empty table.
+beforeEach(async () => { if (!skip) await pool.query("DELETE FROM control_plane.email_action_tokens"); });
 after(async () => { if (!skip) { await portalMailIdle(); await pool.end(); } });
 
 // ── Sign-up and verification ────────────────────────────────────────────────
@@ -408,7 +415,7 @@ test("an expired or superseded reset link is refused, and an unknown one gets th
     await post(h.app, "/v1/auth/password/forgot", { email }); await portalMailIdle();
     const older = tokenIn(lastTo(h.mailer, email), "pr");
     await post(h.app, "/v1/auth/password/forgot", { email: email.toUpperCase() }); await portalMailIdle();
-    const newer = tokenIn(lastTo(h.mailer, email.toUpperCase()), "pr");
+    const newer = tokenIn(lastTo(h.mailer, email), "pr");
     assert.notEqual(older, newer);
     assert.equal((await post(h.app, "/v1/auth/password/reset", { token: older, password: PASSWORD })).statusCode, 400);
     assert.equal((await post(h.app, "/v1/auth/password/reset", { token: newer, password: PASSWORD })).statusCode, 200);
@@ -501,22 +508,7 @@ test("Google sign-in for the same verified address works with a pending sign-up,
 
 // ── Rate limits, send budget, Origin, availability ─────────────────────────
 
-test("sign-up and forgot are limited per address and per IP, and the answer for a limited address does not depend on whether it exists", { skip }, async () => {
-  const h = harness();
-  try {
-    const email = addr("limited");
-    for (let i = 0; i < 3; i++) assert.equal((await signUp(h.app, email)).statusCode, 202);
-    const limited = await signUp(h.app, email);
-    assert.equal(limited.statusCode, 429);
-    assert.deepEqual(limited.json(), { error: "SIGN_UP_RATE_LIMITED" });
-    assert.equal(limited.headers["retry-after"], "60");
-    // The forgot route has its own allowance.
-    const forgot = addr("limited-forgot");
-    for (let i = 0; i < 3; i++) assert.equal((await post(h.app, "/v1/auth/password/forgot", { email: forgot })).statusCode, 202);
-    assert.equal((await post(h.app, "/v1/auth/password/forgot", { email: forgot })).statusCode, 429);
-    assert.equal((await signUp(h.app, addr("elsewhere"))).statusCode, 202, "another address is unaffected");
-  } finally { await h.app.close(); }
-
+test("sign-up and forgot are limited per IP (a forwarded header buys nothing), and verify and reset share one IP budget", { skip }, async () => {
   const ip = harness();
   try {
     let refused = 0;
@@ -712,5 +704,184 @@ test("the four routes are open: a Telegram-scoped session neither helps nor hind
     assert.equal(issued.json().scope, "full");
     assert.equal(issued.json().displayName, "Dana Organizer");
     assert.notEqual(issued.json().id, scopedUser, "the session issued belongs to the token's account, never to the scoped session's user");
+  } finally { await h.app.close(); }
+});
+
+// ── One spelling of an address (boundary review M1) ─────────────────────────
+
+test("normalizeEmail accepts only a strict ASCII addr-spec and returns the one spelling used everywhere", () => {
+  assert.equal(normalizeEmail("  Dana.O+Trip@Mail.Example.TEST "), "dana.o+trip@mail.example.test");
+  assert.equal(normalizeEmail("o'brien_x@sub.example.co.uk"), "o'brien_x@sub.example.co.uk");
+  assert.equal(normalizeEmail(`${"a".repeat(64)}@example.test`), `${"a".repeat(64)}@example.test`);
+  assert.equal(normalizeEmail(`${"a".repeat(65)}@example.test`), null, "local part over 64");
+  const long = `a@${"b".repeat(63)}.${"c".repeat(63)}.${"d".repeat(63)}.${"e".repeat(63)}.test`;   // 270 characters
+  assert.equal(normalizeEmail(long), null, "over 254 characters in all");
+  for (const bad of [
+    "a<owner@victim.test>", "\"x\"<owner@victim.test>", "owner@victim.test,", "owner@victim.test>", "<owner@victim.test>", "owner@victim.test;",
+    "Kate@victim.test", "kate@victim.teK", "owner@vıctim.test", "é@victim.test", "owner@victïm.test",
+    "a b@victim.test", "a@vic tim.test", "a@@victim.test", "a@b@victim.test", "@victim.test", "a@", "a", "",
+    ".a@victim.test", "a.@victim.test", "a..b@victim.test", "\"a b\"@victim.test", "a(c)@victim.test", "a\\b@victim.test",
+    "a@victim", "a@1.2.3.4", "a@-victim.test", "a@victim-.test", "a@victim..test", "a@victim.t", "a@victim.123", "a@victim_x.test",
+    "a@victim.test\u0000", "a@vic\ntim.test", 42, null, undefined, {},
+  ]) assert.equal(normalizeEmail(bad), null, JSON.stringify(bad));
+});
+
+test("a display-name form, a comma, a Kelvin sign: refused with INVALID_EMAIL on both routes before anything is counted, written or mailed", { skip }, async () => {
+  const h = harness();
+  try {
+    const strings = ["a<owner@victim.test>", "\"x\"<owner@victim.test>", "owner@victim.test,", "Kate@victim.test", "a b@victim.test", "owner@victïm.test", "a..b@victim.test", "a@victim"];
+    let n = 0;
+    for (const email of strings) {
+      for (const url of ["/v1/auth/sign-up", "/v1/auth/password/forgot"]) {
+        const response = await postFrom(h.app, `10.9.${Math.floor(n / 200)}.${(n++ % 200) + 1}`, url, { email });
+        assert.deepEqual([response.statusCode, response.json()], [400, { error: "INVALID_EMAIL" }], `${url} ${JSON.stringify(email)}`);
+      }
+    }
+    await portalMailIdle();
+    assert.equal(h.mailer.outbox.length, 0);
+    assert.equal((await pool.query("SELECT count(*)::int AS n FROM control_plane.email_action_tokens")).rows[0].n, 0, "no row was written for any of them");
+    assert.equal((await pool.query("SELECT count(*)::int AS n FROM control_plane.users WHERE display_name LIKE '%victim%'")).rows[0].n, 0);
+  } finally { await h.app.close(); }
+});
+
+test("a capitalised address is the same mailbox: one lower-case spelling in the mail, one account, one set of budgets", { skip }, async () => {
+  const h = harness();
+  try {
+    const base = addr("mixed"), upper = base.toUpperCase();
+    assert.equal((await signUp(h.app, upper)).statusCode, 202);
+    await portalMailIdle();
+    const mail = lastTo(h.mailer, base);
+    assert.ok(mail, "the message went to the lower-case spelling");
+    assert.equal(h.mailer.outbox.every((m) => m.to === base), true);
+    const verified = await verify(h.app, tokenIn(mail, "ev"));
+    assert.equal(verified.statusCode, 200, verified.body);
+    assert.equal(await userCount(base), 1);
+    assert.equal(digestEmail(upper), digestEmail(base));
+    // Signing in with either spelling reaches the same account.
+    const lower = await me(h.app, cookiesOf(await signIn(h.app, base, PASSWORD))!.cookie);
+    const capitals = await me(h.app, cookiesOf(await signIn(h.app, upper, PASSWORD))!.cookie);
+    assert.equal(lower.json().id, capitals.json().id);
+    // A second sign-up in capitals is "you already have an account" to the lower-case address; no second user.
+    h.mailer.outbox.length = 0;
+    await signUp(h.app, upper); await portalMailIdle();
+    assert.match(lastTo(h.mailer, base)!.subject, /already have a Kinerary account/i);
+    assert.equal(await userCount(base), 1);
+    // And every spelling draws on the one per-address budget.
+    assert.equal((await tokenRows(base)).length, 2);
+    assert.equal((await tokenRows(upper)).length, 2);
+  } finally { await h.app.close(); }
+});
+
+// ── Budgets that cannot be filled with junk or raced (boundary review M2) ───
+
+test("12 simultaneous requests for one address send exactly the hourly cap: the count and the write are one step", { skip }, async () => {
+  const h = harness();
+  try {
+    const email = addr("burst");
+    const responses = await Promise.all(Array.from({ length: 12 }, (_, i) => postFrom(h.app, `10.1.0.${i + 1}`, "/v1/auth/sign-up", { email })));
+    assert.deepEqual(responses.map((r) => r.statusCode), Array(12).fill(202), "every caller got the same answer");
+    await portalMailIdle();
+    assert.equal((await tokenRows(email)).length, ADDRESS_HOURLY_SEND_CAP, "rows written");
+    assert.equal(h.mailer.outbox.filter((m) => m.to === email).length, ADDRESS_HOURLY_SEND_CAP, "messages sent");
+    assert.equal((await tokenRows(email)).filter((r) => r.consumed_at === null).length, 1, "and only the newest link is live");
+    assert.equal(h.logs.filter((l) => l.includes("email_auth.address_send_budget_exhausted")).length, 12 - ADDRESS_HOURLY_SEND_CAP);
+  } finally { await h.app.close(); }
+});
+
+test("1100 junk addresses from 1100 different IPs do not lock out the next person: no 429, no map to fill, and the global ceiling holds exactly", { skip }, async () => {
+  const h = harness();
+  try {
+    for (let i = 0; i < 1100; i++) {
+      const response = await postFrom(h.app, `10.${2 + Math.floor(i / 60000)}.${Math.floor(i / 250) % 240}.${(i % 250) + 1}`, "/v1/auth/sign-up", { email: addr("junk") });
+      assert.equal(response.statusCode, 202, `junk ${i}`);
+    }
+    await portalMailIdle();
+    const rows = (await pool.query("SELECT count(*)::int AS n FROM control_plane.email_action_tokens")).rows[0].n as number;
+    assert.equal(rows, GLOBAL_SENDS_PER_MINUTE, "the ceiling is exact, not approximate");
+    assert.equal(h.mailer.outbox.length, GLOBAL_SENDS_PER_MINUTE);
+    assert.ok(h.logs.some((l) => l.includes("email_auth.global_send_budget_exhausted")), "and the log says so");
+
+    // A real person arriving mid-flood is answered like everyone else (not 429)...
+    const person = addr("realperson");
+    const during = await postFrom(h.app, "192.0.2.50", "/v1/auth/sign-up", { email: person });
+    assert.equal(during.statusCode, 202);
+    await portalMailIdle();
+    assert.equal(lastTo(h.mailer, person), undefined, "...the minute's allowance is spent, so nothing is sent yet");
+    // ...and once the minute has passed, the same request goes through. Nothing was left stuck.
+    await pool.query("UPDATE control_plane.email_action_tokens SET created_at = now() - interval '2 minutes'");
+    const later = await postFrom(h.app, "192.0.2.50", "/v1/auth/sign-up", { email: person });
+    assert.equal(later.statusCode, 202);
+    await portalMailIdle();
+    assert.ok(lastTo(h.mailer, person), "delivered after the window");
+  } finally { await h.app.close(); }
+});
+
+test("the global ceiling counts every kind of message, holds for known addresses too, and releases when the minute is over", { skip }, async () => {
+  const h = harness();
+  try {
+    const known = addr("ceiling-known");
+    await newAccount(h, known);                       // 1 row
+    for (let i = 1; i < GLOBAL_SENDS_PER_MINUTE; i++) {
+      await pool.query(
+        `INSERT INTO control_plane.email_action_tokens(id, purpose, token_digest, email_digest, expires_at, consumed_at)
+         VALUES ($1, 'existing_notice', $2, $3, now(), now())`,
+        [`eat_${randomBytes(12).toString("hex")}`, sha256(randomBytes(8).toString("hex")), digestEmail(addr("filler"))]);
+    }
+    h.mailer.outbox.length = 0;
+    const fresh = addr("ceiling-fresh");
+    assert.equal((await signUp(h.app, fresh)).statusCode, 202);
+    assert.equal((await post(h.app, "/v1/auth/password/forgot", { email: known })).statusCode, 202);
+    assert.equal((await signUp(h.app, known)).statusCode, 202);
+    await portalMailIdle();
+    assert.equal(h.mailer.outbox.length, 0, "nothing was sent: new, forgot and duplicate all answered as usual");
+    assert.equal((await tokenRows(fresh)).length, 0);
+    assert.equal(h.logs.filter((l) => l.includes("email_auth.global_send_budget_exhausted")).length, 3);
+    await pool.query("UPDATE control_plane.email_action_tokens SET created_at = now() - interval '2 minutes'");
+    await post(h.app, "/v1/auth/password/forgot", { email: known }); await portalMailIdle();
+    assert.equal(h.mailer.outbox.length, 1, "released");
+  } finally { await h.app.close(); }
+});
+
+// ── A reset also kills what a stolen session left unredeemed (review F1) ────
+
+test("a reset revokes the user's unredeemed Telegram link tokens and interview links; redeemed links stay; links issued after work", { skip }, async () => {
+  const h = harness();
+  try {
+    const email = addr("leftovers");
+    const { session } = await newAccount(h, email);
+    const userId = (await me(h.app, session.cookie)).json().id as string;
+    const tripId = `trip_${suffix}${randomBytes(4).toString("hex")}`;
+    await pool.query("INSERT INTO control_plane.trips(id,slug,lifecycle_state,title) VALUES ($1,$2,'draft','Rome')", [tripId, `lo-${tripId.replace(/_/g, "-")}`]);
+    await pool.query(
+      "INSERT INTO control_plane.trip_memberships(id,trip_id,user_id,role,status,dashboard_access,runtime_access) VALUES ($1,$2,$3,'owner','active',true,true)",
+      [`memb_${randomBytes(8).toString("hex")}`, tripId, userId]);
+
+    // What the (stolen) session left behind: an unredeemed Telegram link and an unopened interview link.
+    const lk = await issueTelegramLinkToken(pool, { userId, tripId });
+    assert.ok(lk.ok);
+    const interviewDigest = sha256(`interview-${randomBytes(8).toString("hex")}`);
+    await pool.query(
+      "INSERT INTO control_plane.interview_enrollments(id,trip_id,user_id,token_digest,state,expires_at) VALUES ($1,$2,$3,$4,'issued',now() + interval '1 day')",
+      [`enrl_${randomBytes(8).toString("hex")}`, tripId, userId, interviewDigest]);
+    // And a link that was already redeemed before the reset: the owner manages that one on the trip card.
+    const kept = `otl_${randomBytes(16).toString("hex")}`;
+    await pool.query(
+      "INSERT INTO control_plane.telegram_organizer_trip_links(id,user_id,trip_id,telegram_subject_digest,verified_via) VALUES ($1,$2,$3,$4,'enrollment_redemption')",
+      [kept, userId, tripId, sha256(`tg-${randomBytes(6).toString("hex")}`)]);
+
+    await post(h.app, "/v1/auth/password/forgot", { email }); await portalMailIdle();
+    const reset = await post(h.app, "/v1/auth/password/reset", { token: tokenIn(lastTo(h.mailer, email), "pr"), password: "a brand new passphrase" });
+    assert.equal(reset.statusCode, 200, reset.body);
+
+    // The reviewer's case: issued before the reset, redeemed after it.
+    assert.deepEqual(await redeemTelegramLinkToken(pool, lk.token, String(7_100_000_000 + Math.floor(Math.random() * 1_000_000))), { ok: false, reason: "INVALID" });
+    assert.equal((await pool.query("SELECT state FROM control_plane.telegram_link_tokens WHERE user_id = $1", [userId])).rows[0].state, "revoked");
+    assert.equal((await pool.query("SELECT state FROM control_plane.interview_enrollments WHERE token_digest = $1", [interviewDigest])).rows[0].state, "revoked");
+    assert.equal((await pool.query("SELECT 1 FROM control_plane.telegram_organizer_trip_links WHERE id = $1 AND revoked_at IS NULL", [kept])).rowCount, 1, "an existing link is left alone");
+
+    // A link issued from the new session works.
+    const fresh = await issueTelegramLinkToken(pool, { userId, tripId });
+    assert.ok(fresh.ok);
+    assert.deepEqual(await redeemTelegramLinkToken(pool, fresh.token, String(7_200_000_000 + Math.floor(Math.random() * 1_000_000))), { ok: true, tripTitle: "Rome", alreadyLinked: false });
   } finally { await h.app.close(); }
 });

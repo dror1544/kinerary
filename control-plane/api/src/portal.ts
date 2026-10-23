@@ -7,7 +7,7 @@ import { issueEnrollment, replaceEnrollment } from "./enrollment.js";
 import { ensureUnknownPasswordCredential, hashPassword, resolveOrCreateEmailAccount, verifyPasswordLogin } from "./password-identity.js";
 import type { Mailer } from "./mailer.js";
 import {
-  PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH, cleanDisplayName, consumePasswordReset, consumeSignUpToken, isPlausibleEmail, portalMailIdle,
+  PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH, cleanDisplayName, consumePasswordReset, consumeSignUpToken, normalizeEmail, portalMailIdle,
   runInBackground, startPasswordReset, startSignUp, type EmailAuthContext,
 } from "./portal-email-auth.js";
 import { pickLanguage } from "./portal-email-templates.js";
@@ -737,15 +737,28 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
   // own Origin, like /v1/auth/password: verify and reset SIGN SOMEBODY IN, so a
   // page on another site must not be able to post a token it holds.
   const signUpIpAttempts: Attempts = new Map();
-  const signUpAddressAttempts: Attempts = new Map();
   const forgotIpAttempts: Attempts = new Map();
-  const forgotAddressAttempts: Attempts = new Map();
   const emailTokenIpAttempts: Attempts = new Map();
+  /**
+   * The per-IP counter for these routes. Unlike `admitLogin` it never refuses a caller because the map is
+   * full: a fixed-size map that fails closed is filled with junk keys by whoever has enough addresses and
+   * then locks out everyone (boundary review M2). At capacity it forgets the oldest entry instead, so memory
+   * stays bounded and a flood can only rotate through its own addresses. What a flood can send is bounded by
+   * the persistent budgets in portal-email-auth.ts, not by this map.
+   */
+  const admitEmailIp = (attempts: Attempts, key: string, limit: number): boolean => {
+    const now = Date.now();
+    for (const [storedKey, entry] of attempts) if (entry.expiresAt <= now) attempts.delete(storedKey);
+    const previous = attempts.get(key);
+    if (previous && previous.count >= limit) return false;
+    if (!previous && attempts.size >= 1024) attempts.delete(attempts.keys().next().value as string);
+    attempts.set(key, { count: (previous?.count ?? 0) + 1, expiresAt: previous?.expiresAt ?? now + 60_000 });
+    return true;
+  };
   const emailAuthLog = (line: string) => (deps.emailAuthLog ?? ((l: string) => process.stderr.write(`${l}\n`)))(line);
   const emailAuthContext = (mailer: Mailer): EmailAuthContext => ({ db: deps.db, mailer, publicOrigin: deps.publicOrigin, log: emailAuthLog });
   const jsonBody = (request: FastifyRequest): Record<string, unknown> =>
     request.body && typeof request.body === "object" && !Array.isArray(request.body) ? request.body as Record<string, unknown> : {};
-  const addressKey = (email: string) => sha256(email.trim().toLowerCase());
   /** The page's own `returnTo`, kept only if it is a path the migration's CHECK also accepts. */
   const storableReturnTo = (value: unknown): string => {
     const path = validatedReturnTo(value);
@@ -755,15 +768,17 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
   app.post("/v1/auth/sign-up", async (request, reply) => {
     reply.header("cache-control", "private, no-store");
     if (!deps.mailer) return reply.code(503).send({ error: "SIGN_UP_UNAVAILABLE" });
-    if (!admitLogin(signUpIpAttempts, request.ip, 20)) return reply.header("retry-after", "60").code(429).send({ error: "SIGN_UP_RATE_LIMITED" });
+    if (!admitEmailIp(signUpIpAttempts, request.ip, 20)) return reply.header("retry-after", "60").code(429).send({ error: "SIGN_UP_RATE_LIMITED" });
     if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
     const body = jsonBody(request);
     // There is deliberately no password and no name here: a `password` or `displayName` in the body is ignored,
     // never stored, never mailed. The person chooses both on the page the emailed link opens (portal-email-auth.ts).
-    if (!isPlausibleEmail(body.email)) return reply.code(400).send({ error: "INVALID_REQUEST" });
-    if (!admitLogin(signUpAddressAttempts, addressKey(body.email), 3)) return reply.header("retry-after", "60").code(429).send({ error: "SIGN_UP_RATE_LIMITED" });
+    // One spelling of the address (strict ASCII, lower-cased) for the digest, the budget and the mail's `to`.
+    // The per-address budget is persistent and lives in the database (portal-email-auth.ts), not in a map here.
+    const email = normalizeEmail(body.email);
+    if (email === null) return reply.code(400).send({ error: "INVALID_EMAIL" });
     const input = {
-      email: body.email,
+      email,
       returnTo: storableReturnTo(body.returnTo ?? body.return_to), language: pickLanguage(body.language, request.headers["accept-language"]),
     };
     const ctx = emailAuthContext(deps.mailer);
@@ -774,7 +789,7 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
 
   app.post("/v1/auth/verify-email", async (request, reply) => {
     reply.header("cache-control", "private, no-store");
-    if (!admitLogin(emailTokenIpAttempts, request.ip, 30)) return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
+    if (!admitEmailIp(emailTokenIpAttempts, request.ip, 30)) return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
     if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
     const body = jsonBody(request);
     if (typeof body.password !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
@@ -807,12 +822,12 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
   app.post("/v1/auth/password/forgot", async (request, reply) => {
     reply.header("cache-control", "private, no-store");
     if (!deps.mailer) return reply.code(503).send({ error: "SIGN_UP_UNAVAILABLE" });
-    if (!admitLogin(forgotIpAttempts, request.ip, 20)) return reply.header("retry-after", "60").code(429).send({ error: "SIGN_UP_RATE_LIMITED" });
+    if (!admitEmailIp(forgotIpAttempts, request.ip, 20)) return reply.header("retry-after", "60").code(429).send({ error: "SIGN_UP_RATE_LIMITED" });
     if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
     const body = jsonBody(request);
-    if (!isPlausibleEmail(body.email)) return reply.code(400).send({ error: "INVALID_REQUEST" });
-    if (!admitLogin(forgotAddressAttempts, addressKey(body.email), 3)) return reply.header("retry-after", "60").code(429).send({ error: "SIGN_UP_RATE_LIMITED" });
-    const input = { email: body.email, language: pickLanguage(body.language, request.headers["accept-language"]) };
+    const email = normalizeEmail(body.email);
+    if (email === null) return reply.code(400).send({ error: "INVALID_EMAIL" });
+    const input = { email, language: pickLanguage(body.language, request.headers["accept-language"]) };
     const ctx = emailAuthContext(deps.mailer);
     runInBackground(() => startPasswordReset(ctx, input), (error) =>
       emailAuthLog(structuredLog("error", "email_auth.password_reset_failed", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN" })));
@@ -821,7 +836,7 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
 
   app.post("/v1/auth/password/reset", async (request, reply) => {
     reply.header("cache-control", "private, no-store");
-    if (!admitLogin(emailTokenIpAttempts, request.ip, 30)) return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
+    if (!admitEmailIp(emailTokenIpAttempts, request.ip, 30)) return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
     if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
     const body = jsonBody(request);
     if (typeof body.token !== "string" || typeof body.password !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });

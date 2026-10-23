@@ -876,7 +876,13 @@ drifting. Notes on what you are filling in:
   address only, is emailed a link, and chooses their name and password on the page
   the link opens (opening it spends nothing; the submit does). Neither is asked
   for at sign-up, because anyone can start a sign-up for anyone's address and
-  would otherwise know the password or write the name. Like the Mini App fields,
+  would otherwise know the password or write the name. Only a strict ASCII
+  address is accepted (400 `INVALID_EMAIL` otherwise), and sending is bounded by
+  persistent budgets, not memory: 5 messages per address per hour and 60 in all per
+  minute; past either the request is answered as usual, nothing is sent, and the
+  api logs `email_auth.address_send_budget_exhausted` or
+  `email_auth.global_send_budget_exhausted`. A reset also revokes the user's
+  unredeemed Telegram link tokens and interview links. Like the Mini App fields,
   the profile schema is strict: add these keys only in the same step as an upgrade to a revision that contains this change.
 - **Telegram Mini App fields** (`web.telegram_bot_token_secret_ref`,
   `web.telegram_init_data_max_age_seconds`) and **`public_api.trust_proxy`** arrive

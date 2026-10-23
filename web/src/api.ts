@@ -94,6 +94,7 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
       TELEGRAM_NOT_LINKED: "This Telegram account is not linked yet.",
       SIGN_UP_UNAVAILABLE: "Sign-up isn't open yet.",
       SIGN_UP_RATE_LIMITED: "Too many requests. Please wait a minute and try again.",
+      INVALID_EMAIL: "Enter a plain email address like name@example.com.",
       INVALID_NAME: "Enter your name (up to 80 characters).",
       PASSWORD_TOO_SHORT: "Use at least 8 characters for the password.",
       TOKEN_INVALID: "This link has expired or was already used.",

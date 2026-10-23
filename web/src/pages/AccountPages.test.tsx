@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { StrictMode } from "react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -127,15 +127,26 @@ it("the name is sent trimmed, and a server INVALID_NAME keeps the form instead o
   expect(screen.getByLabelText("Your name")).toHaveValue("   Dana Organizer   ");
 });
 
-it("the verify page also reads a ?token= query, and a refused token says so with a way forward", async () => {
-  const calls = mount("/verify-email?token=ev_fromquery", {
+it("a refused token says so with a way forward", async () => {
+  const calls = mount("/verify-email#token=ev_refused", {
     handler: (path) => path === "/v1/auth/verify-email" ? json({ error: "TOKEN_INVALID" }, 400) : undefined,
   });
   await screen.findByRole("heading", { name: "Finish your account" });
   choose("a brand new passphrase");
   expect(await screen.findByRole("heading", { name: "This link didn't work" })).toBeInTheDocument();
-  expect(calls.find((c) => c.path === "/v1/auth/verify-email")!.body).toEqual({ token: "ev_fromquery", password: "a brand new passphrase", displayName: "Dana Organizer" });
+  expect(calls.find((c) => c.path === "/v1/auth/verify-email")!.body).toEqual({ token: "ev_refused", password: "a brand new passphrase", displayName: "Dana Organizer" });
   expect(screen.getByRole("link", { name: "Start sign-up again" })).toHaveAttribute("href", "/sign-up");
+});
+
+it("a ?token= query is NOT read (only the fragment is): the page shows the broken-link state and sends nothing", async () => {
+  const calls = mount("/verify-email?token=ev_fromquery");
+  expect(await screen.findByRole("heading", { name: "This link didn't work" })).toBeInTheDocument();
+  expect(screen.queryByLabelText("Password")).toBeNull();
+  expect(calls.some((c) => c.path === "/v1/auth/verify-email")).toBe(false);
+  cleanup();
+  const resetCalls = mount("/reset-password?token=pr_fromquery");
+  expect(await screen.findByRole("heading", { name: "This link didn't work" })).toBeInTheDocument();
+  expect(resetCalls.some((c) => c.path === "/v1/auth/password/reset")).toBe(false);
 });
 
 it("the verify page with no token never calls the server and never shows the form", async () => {

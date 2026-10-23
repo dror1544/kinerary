@@ -45,10 +45,14 @@
  *   - A TOKEN IS A SECRET, SO ONLY ITS DIGEST IS STORED, it is single use and
  *     short lived, and it travels in the URL FRAGMENT (`/verify-email#token=…`)
  *     which browsers never send to a server, a proxy log or a Referer.
- *   - A SEND BUDGET PER ADDRESS lives in the table (rows are the count), because
- *     the in-memory limiter forgets on restart and cannot stop a slow drip to a
- *     stranger's mailbox. Over budget, the request is answered as usual and
- *     nothing is sent — and the log says so.
+ *   - THE SEND BUDGETS LIVE IN THE TABLE (rows are the count), per address and
+ *     global, counted and written under one lock (see `reserveSend`). There is
+ *     no in-memory per-address limiter: a fixed-size map fills with junk
+ *     addresses and then refuses everyone. Over budget, the request is answered
+ *     as usual and nothing is sent — and the log says so.
+ *   - ONE SPELLING OF AN ADDRESS (`normalizeEmail`) is used for the digest, the
+ *     budget and the `to` of the message, and anything but a strict ASCII
+ *     addr-spec is refused before any of them.
  *
  * NOTHING HERE LOGS A TOKEN, A PASSWORD, A HASH OR AN ADDRESS. A send failure
  * logs the purpose and the provider's HTTP status.
@@ -65,6 +69,8 @@ export const SIGN_UP_TOKEN_TTL_SECONDS = 24 * 60 * 60;
 export const PASSWORD_RESET_TOKEN_TTL_SECONDS = 60 * 60;
 /** Messages (of any kind) a single address may be sent per hour; past it a request is answered and nothing is sent. */
 export const ADDRESS_HOURLY_SEND_CAP = 5;
+/** Messages of any kind, to anyone, per minute; past it a request is answered and nothing is sent. */
+export const GLOBAL_SENDS_PER_MINUTE = 60;
 export const PASSWORD_MIN_LENGTH = 8;
 export const PASSWORD_MAX_LENGTH = 1024;
 
@@ -99,8 +105,43 @@ export function cleanDisplayName(value: unknown): string | null {
   return length >= 1 && length <= DISPLAY_NAME_MAX_LENGTH ? cleaned : null;
 }
 
-export function isPlausibleEmail(value: unknown): value is string {
-  return typeof value === "string" && value.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
+const EMAIL_LOCAL = /^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*$/;
+const EMAIL_LABEL = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/;
+
+/**
+ * THE ONE SPELLING OF AN ADDRESS this module accepts, trimmed and lower-cased,
+ * or null. Only a strict ASCII addr-spec gets through: no display-name form
+ * (`a<b@c.test>`, `"x"<b@c.test>`), no angle brackets, quotes, commas or
+ * spaces, no non-ASCII at all. The check runs on the RAW text, before
+ * lower-casing, because lower-casing is where look-alikes turn into ASCII (the
+ * Kelvin sign U+212A becomes `k`). What this returns is the string the caller
+ * must use for everything — the digest, the rate-limit key, and the `to` of the
+ * message — so what is counted, what is looked up and what is mailed are the
+ * same mailbox. `digestEmail` (password-identity.ts) trims and lower-cases and
+ * so agrees with it on every address this accepts.
+ *
+ * Local part: at most 64 characters from the RFC 5322 "atext" set, dots only
+ * between characters. Domain: dot-separated LDH labels (1-63 characters, no
+ * leading or trailing hyphen), at least two of them, ending in an alphabetic
+ * label of two or more letters (so a bare IP is not an address); at most 254
+ * characters in all.
+ *
+ * ONLY NEW INPUT IS HELD TO THIS. An account created before this by a path that
+ * took wider input still signs in as it always did; it just cannot ask for a
+ * reset link here until its address is one a mailer could deliver to anyway.
+ */
+export function normalizeEmail(value: unknown): string | null {
+  if (typeof value !== "string" || value.length > 512) return null;
+  const trimmed = value.trim();
+  if (trimmed.length > 254) return null;
+  const at = trimmed.lastIndexOf("@");
+  if (at < 1 || trimmed.indexOf("@") !== at) return null;
+  const local = trimmed.slice(0, at), domain = trimmed.slice(at + 1);
+  if (local.length > 64 || !EMAIL_LOCAL.test(local)) return null;
+  const labels = domain.split(".");
+  if (labels.length < 2 || !labels.every((label) => EMAIL_LABEL.test(label))) return null;
+  if (!/^[A-Za-z]{2,63}$/.test(labels[labels.length - 1]!)) return null;
+  return trimmed.toLowerCase();
 }
 
 // ── In-flight background work ───────────────────────────────────────────────
@@ -149,12 +190,63 @@ async function accountExists(db: pg.Pool, emailDigest: string): Promise<boolean>
   return (found.rowCount ?? 0) > 0;
 }
 
-async function overSendBudget(db: pg.Pool, emailDigest: string): Promise<boolean> {
-  const sent = await db.query<{ n: number }>(
-    "SELECT count(*)::int AS n FROM control_plane.email_action_tokens WHERE email_digest = $1 AND created_at > now() - interval '1 hour'",
-    [emailDigest],
-  );
-  return (sent.rows[0]?.n ?? 0) >= ADDRESS_HOURLY_SEND_CAP;
+/**
+ * COUNT AND WRITE IN ONE STEP. Every message the portal sends leaves a row in
+ * `email_action_tokens`, so the rows are the send count. Counting and then
+ * inserting in two statements lets a burst of concurrent requests all read
+ * "under budget" and all send; here one transaction-scoped advisory lock covers
+ * both the count and the insert, so the budget holds under concurrency. One
+ * lock for all addresses (not one per digest) is deliberate: the critical
+ * section is two small statements, and the same lock is what makes the GLOBAL
+ * ceiling exact too.
+ *
+ * Two persistent ceilings, both answered silently to the caller (the 202 is the
+ * same) and loudly in the log:
+ *   - ADDRESS_HOURLY_SEND_CAP messages to one address per hour, so a stranger's
+ *     mailbox cannot be flooded through us;
+ *   - GLOBAL_SENDS_PER_MINUTE messages in all, so a flood of distinct junk
+ *     addresses cannot make us a mail cannon or run up the provider's bill.
+ *     (A sender with many addresses and many IPs can therefore use up the
+ *     minute's allowance for everyone; the cost of that is a delayed mail, not
+ *     a wrong answer, and the per-IP limit bounds how fast it can be done.)
+ * Neither lives in memory: a restart does not forget them, and there is no
+ * fixed-size map for junk keys to fill and lock everyone else out of.
+ *
+ * Returns whether `write` ran (and so a message should be sent).
+ */
+async function reserveSend(
+  ctx: EmailAuthContext, emailDigest: string, purpose: string, write: (client: pg.PoolClient) => Promise<void>,
+): Promise<boolean> {
+  const client = await ctx.db.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended('portal_email_auth.send_budget', 0))");
+    const counts = await client.query<{ address: number; global: number }>(
+      `SELECT count(*) FILTER (WHERE email_digest = $1 AND created_at > now() - interval '1 hour')::int AS address,
+              count(*) FILTER (WHERE created_at > now() - interval '1 minute')::int AS global
+         FROM control_plane.email_action_tokens WHERE created_at > now() - interval '1 hour'`,
+      [emailDigest],
+    );
+    const { address, global } = counts.rows[0] ?? { address: 0, global: 0 };
+    if (global >= GLOBAL_SENDS_PER_MINUTE) {
+      await client.query("ROLLBACK");
+      ctx.log(structuredLog("warn", "email_auth.global_send_budget_exhausted", { purpose, effect: "request answered, nothing sent" }));
+      return false;
+    }
+    if (address >= ADDRESS_HOURLY_SEND_CAP) {
+      await client.query("ROLLBACK");
+      ctx.log(structuredLog("warn", "email_auth.address_send_budget_exhausted", { purpose, effect: "request answered, nothing sent" }));
+      return false;
+    }
+    await write(client);
+    await client.query("COMMIT");
+    return true;
+  } catch (error) {
+    try { await client.query("ROLLBACK"); } catch { /* ignore */ }
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function purgeStale(db: pg.Pool): Promise<void> {
@@ -171,27 +263,24 @@ export interface SignUpRequest { email: string; returnTo: string; language: Mail
 export async function startSignUp(ctx: EmailAuthContext, input: SignUpRequest): Promise<void> {
   const emailDigest = digestEmail(input.email);
   await purgeStale(ctx.db);
-  if (await overSendBudget(ctx.db, emailDigest)) {
-    ctx.log(structuredLog("warn", "email_auth.address_send_budget_exhausted", { purpose: "sign_up", effect: "request answered, nothing sent" }));
-    return;
-  }
-  const to = input.email.trim();
+  const to = input.email;
   if (await accountExists(ctx.db, emailDigest)) {
-    // Recorded so the notice counts against the address's budget; the digest is random and can never be presented.
-    await ctx.db.query(
-      `INSERT INTO control_plane.email_action_tokens(id, purpose, token_digest, email_digest, expires_at, consumed_at)
-       VALUES ($1, 'existing_notice', $2, $3, now(), now())`,
-      [rowId(), sha(randomBytes(32).toString("base64url")), emailDigest],
-    );
+    // Recorded so the notice counts against the budgets; the digest is random and can never be presented.
+    const reserved = await reserveSend(ctx, emailDigest, "existing_notice", async (client) => {
+      await client.query(
+        `INSERT INTO control_plane.email_action_tokens(id, purpose, token_digest, email_digest, expires_at, consumed_at)
+         VALUES ($1, 'existing_notice', $2, $3, now(), now())`,
+        [rowId(), sha(randomBytes(32).toString("base64url")), emailDigest],
+      );
+    });
+    if (!reserved) return;
     await deliver(ctx, "existing_notice", {
       kind: "existing", signInUrl: `${ctx.publicOrigin}/sign-in`, resetUrl: `${ctx.publicOrigin}/forgot-password`,
     }, input.language, to);
     return;
   }
   const token = newToken("ev");
-  const client = await ctx.db.connect();
-  try {
-    await client.query("BEGIN");
+  const reserved = await reserveSend(ctx, emailDigest, "sign_up", async (client) => {
     // Only the newest link works: a person who asked twice is not left with two live tokens.
     await client.query(
       `UPDATE control_plane.email_action_tokens SET consumed_at = now()
@@ -203,13 +292,8 @@ export async function startSignUp(ctx: EmailAuthContext, input: SignUpRequest): 
        VALUES ($1, 'sign_up', $2, $3, $4, now() + ($5 * interval '1 second'))`,
       [rowId(), sha(token), emailDigest, input.returnTo, SIGN_UP_TOKEN_TTL_SECONDS],
     );
-    await client.query("COMMIT");
-  } catch (error) {
-    try { await client.query("ROLLBACK"); } catch { /* ignore */ }
-    throw error;
-  } finally {
-    client.release();
-  }
+  });
+  if (!reserved) return;
   await deliver(ctx, "sign_up", {
     kind: "verify", link: `${ctx.publicOrigin}/verify-email#token=${token}`, ttlHours: SIGN_UP_TOKEN_TTL_SECONDS / 3600,
   }, input.language, to);
@@ -232,14 +316,8 @@ export async function startPasswordReset(ctx: EmailAuthContext, input: { email: 
   );
   const userId = account.rows[0]?.user_id;
   if (!userId) return;
-  if (await overSendBudget(ctx.db, emailDigest)) {
-    ctx.log(structuredLog("warn", "email_auth.address_send_budget_exhausted", { purpose: "password_reset", effect: "request answered, nothing sent" }));
-    return;
-  }
   const token = newToken("pr");
-  const client = await ctx.db.connect();
-  try {
-    await client.query("BEGIN");
+  const reserved = await reserveSend(ctx, emailDigest, "password_reset", async (client) => {
     await client.query(
       "UPDATE control_plane.email_action_tokens SET consumed_at = now() WHERE user_id = $1 AND purpose = 'password_reset' AND consumed_at IS NULL",
       [userId],
@@ -249,16 +327,11 @@ export async function startPasswordReset(ctx: EmailAuthContext, input: { email: 
        VALUES ($1, 'password_reset', $2, $3, $4, now() + ($5 * interval '1 second'))`,
       [rowId(), sha(token), emailDigest, userId, PASSWORD_RESET_TOKEN_TTL_SECONDS],
     );
-    await client.query("COMMIT");
-  } catch (error) {
-    try { await client.query("ROLLBACK"); } catch { /* ignore */ }
-    throw error;
-  } finally {
-    client.release();
-  }
+  });
+  if (!reserved) return;
   await deliver(ctx, "password_reset", {
     kind: "reset", link: `${ctx.publicOrigin}/reset-password#token=${token}`, ttlMinutes: PASSWORD_RESET_TOKEN_TTL_SECONDS / 60,
-  }, input.language, input.email.trim());
+  }, input.language, input.email);
 }
 
 // ── Consuming a token (inside the caller's transaction) ─────────────────────
@@ -312,7 +385,8 @@ export type ResetResult = { ok: true; userId: string } | { ok: false; error: "TO
 
 /**
  * Spends a reset token, sets the password, and ends every web session the user
- * had (a forgotten password is often a lost or shared device). The caller
+ * had (a forgotten password is often a lost or shared device) along with their
+ * unredeemed Telegram link tokens and interview links. The caller
  * creates the new session in the same transaction. `passwordHash` is computed by
  * the caller BEFORE the transaction, so scrypt runs for a bad token exactly as
  * it does for a good one and never while a row lock is held.
@@ -337,5 +411,10 @@ export async function consumePasswordReset(client: pg.PoolClient, token: unknown
     [row.user_id, row.email_digest, passwordHash],
   );
   await client.query("UPDATE control_plane.web_sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL", [row.user_id]);
+  // What a session that is now dead may have left lying around: a Telegram link nobody has redeemed yet, and
+  // an interview link nobody has opened. Redeemed ones stay (their owner manages them on the trip card); an
+  // unredeemed one issued before this reset must not be usable after it. Issuing a fresh one is one click.
+  await client.query("UPDATE control_plane.telegram_link_tokens SET state = 'revoked' WHERE user_id = $1 AND state = 'issued'", [row.user_id]);
+  await client.query("UPDATE control_plane.interview_enrollments SET state = 'revoked' WHERE user_id = $1 AND state = 'issued'", [row.user_id]);
   return { ok: true, userId: row.user_id };
 }

@@ -26,12 +26,11 @@ export function mailLanguage(): "he" | "en" {
 
 /**
  * The one-time token from an emailed link. The link carries it in the URL
- * FRAGMENT (`#token=…`), which the browser never sends to a server; a query
- * string (`?token=…`) is accepted too. It is removed from the address bar once
- * read so it does not sit in history or a screenshot.
+ * FRAGMENT (`#token=…`) and only there: the browser never sends a fragment to a
+ * server, a proxy log or a Referer, and a `?token=` query (which it would) is
+ * deliberately NOT read. The page removes it from the address bar once read so
+ * it does not sit in history or a screenshot.
  */
-export function readEmailToken(location: { hash: string; search: string }): string {
-  const fromHash = new URLSearchParams(location.hash.replace(/^#/, "")).get("token");
-  const fromQuery = new URLSearchParams(location.search).get("token");
-  return fromHash ?? fromQuery ?? "";
+export function readEmailToken(location: { hash: string }): string {
+  return new URLSearchParams(location.hash.replace(/^#/, "")).get("token") ?? "";
 }
