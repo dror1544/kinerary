@@ -128,6 +128,16 @@ async function bindCompanion(fix: Fixture, chatId: string, profile: string | nul
   );
 }
 
+/** Telegram user `telegramUserId` is this trip's organizer (what isTripOrganizer reads); msg() sends from 777. */
+async function makeOrganizer(fix: Fixture, telegramUserId = "777"): Promise<void> {
+  await fix.pool.query(
+    `INSERT INTO control_plane.trip_person_links
+       (id, trip_id, telegram_user_id, participant_username, display_name, role, verified_via)
+     VALUES ('tpl_' || md5(random()::text), $1, $2, 'organizer1', 'Dror', 'organizer', 'interview_chat')`,
+    [fix.tripId, telegramUserId],
+  );
+}
+
 describe("dispatchUpdate — the branch table", () => {
   test("a valid deep link starts the interview and replies with the first question", { skip: SKIP }, async () => {
     await withFixture(async (fix) => {
@@ -950,6 +960,7 @@ describe("the companion arriving in a group", { skip: SKIP }, () => {
       }
 
       // And a bare /group still issues one — that is what it is for.
+      await makeOrganizer(fix);
       const bare = await dispatchUpdate(fix.pool, msg(dm, "/group"));
       assert.equal(bare.kind, "group_intro", "a bare /group still hands over a code");
     });
@@ -2173,6 +2184,7 @@ describe("/group hands over the full add-to-group link, the same one the greetin
     await withFixture(async (fix) => {
       const dm = "700000901";
       await bindCompanion(fix, dm, "companion-japan");
+      await makeOrganizer(fix);
       const decision = await dispatchUpdate(fix.pool, msg(dm, "/group"), undefined, () => {}, BOT);
       assert.equal(decision.kind, "group_intro");
       if (decision.kind !== "group_intro") return;
@@ -2196,6 +2208,7 @@ describe("/group hands over the full add-to-group link, the same one the greetin
     await withFixture(async (fix) => {
       const dm = "700000902";
       await bindCompanion(fix, dm, "companion-japan");
+      await makeOrganizer(fix);
       await fix.pool.query(
         "UPDATE control_plane.trips SET companion_intro = $2::jsonb WHERE id = $1",
         [fix.tripId, JSON.stringify({ assistant_name: "יפו", language: "he" })],
@@ -2214,6 +2227,7 @@ describe("/group hands over the full add-to-group link, the same one the greetin
     await withFixture(async (fix) => {
       const dm = "700000903";
       await bindCompanion(fix, dm, "companion-japan");
+      await makeOrganizer(fix);
       const lines: string[] = [];
       const decision = await dispatchUpdate(fix.pool, msg(dm, "/group"), undefined, (l) => lines.push(l), {});
       assert.equal(decision.kind, "group_intro");
@@ -2234,6 +2248,66 @@ describe("/group hands over the full add-to-group link, the same one the greetin
       // Nobody got a token out of either.
       const rows = await fix.pool.query("SELECT 1 FROM control_plane.telegram_group_binding_tokens WHERE trip_id = $1", [fix.tripId]);
       assert.equal(rows.rowCount, 0);
+    });
+  });
+
+  test("only the trip's organizer gets a code: a member's DM on a companion route is refused, with no token and no link", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const dm = "700000904";
+      await bindCompanion(fix, dm, "companion-japan");
+      // 777 is on the trip as a participant, not an organizer.
+      await fix.pool.query(
+        `INSERT INTO control_plane.trip_person_links
+           (id, trip_id, telegram_user_id, participant_username, display_name, role, verified_via)
+         VALUES ('tpl_' || md5(random()::text), $1, '777', 'member1', 'Dror', 'participant', 'interview_chat')`,
+        [fix.tripId],
+      );
+      for (const text of ["/group", "/bind"]) {
+        const decision = await dispatchUpdate(fix.pool, msg(dm, text), undefined, () => {}, BOT);
+        assert.deepEqual(decision, { kind: "reply", reply: { chatId: dm, text: DEFAULT_STRINGS.groupTokenUnavailable } });
+      }
+      const rows = await fix.pool.query("SELECT 1 FROM control_plane.telegram_group_binding_tokens WHERE trip_id = $1", [fix.tripId]);
+      assert.equal(rows.rowCount, 0);
+    });
+  });
+
+  test("a sender the trip does not know at all is refused the same way", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const dm = "700000905";
+      await bindCompanion(fix, dm, "companion-japan");
+      const decision = await dispatchUpdate(fix.pool, msg(dm, "/group"), undefined, () => {}, BOT);
+      assert.deepEqual(decision, { kind: "reply", reply: { chatId: dm, text: DEFAULT_STRINGS.groupTokenUnavailable } });
+      const rows = await fix.pool.query("SELECT 1 FROM control_plane.telegram_group_binding_tokens WHERE trip_id = $1", [fix.tripId]);
+      assert.equal(rows.rowCount, 0);
+    });
+  });
+
+  test("an organizer whose Telegram link was unlinked (demoted) is refused, and a relink restores /group", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const dm = "700000906";
+      await bindCompanion(fix, dm, "companion-japan");
+      await makeOrganizer(fix);
+      const digest = digestTelegramId("777");
+      await fix.pool.query(
+        `INSERT INTO control_plane.telegram_organizer_trip_links
+           (id, user_id, trip_id, telegram_subject_digest, verified_via, revoked_at, revoked_reason)
+         VALUES ('otl_revoked12345678', $1, $2, $3, 'enrollment_redemption', now(), 'owner_unlinked')`,
+        [fix.userId, fix.tripId, digest],
+      );
+      const demoted = await dispatchUpdate(fix.pool, msg(dm, "/group"), undefined, () => {}, BOT);
+      assert.deepEqual(demoted, { kind: "reply", reply: { chatId: dm, text: DEFAULT_STRINGS.groupTokenUnavailable } });
+      const none = await fix.pool.query("SELECT 1 FROM control_plane.telegram_group_binding_tokens WHERE trip_id = $1", [fix.tripId]);
+      assert.equal(none.rowCount, 0);
+
+      // A live link (a relink from the dashboard) lifts the override.
+      await fix.pool.query(
+        `INSERT INTO control_plane.telegram_organizer_trip_links
+           (id, user_id, trip_id, telegram_subject_digest, verified_via)
+         VALUES ('otl_relinked12345678', $1, $2, $3, 'dashboard_link_token')`,
+        [fix.userId, fix.tripId, digest],
+      );
+      const back = await dispatchUpdate(fix.pool, msg(dm, "/group"), undefined, () => {}, BOT);
+      assert.equal(back.kind, "group_intro");
     });
   });
 });

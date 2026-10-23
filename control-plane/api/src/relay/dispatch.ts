@@ -1001,6 +1001,16 @@ export async function dispatchUpdate(
       // Asked somewhere it cannot be answered. Silence would read as broken.
       return { kind: "reply", reply: { chatId, text: strings.groupTokenUnavailable } };
     }
+    // Organizer only, by the same check /proactive makes (a fact from the control
+    // plane's own links, never from the message). A private chat bound to the trip
+    // is not proof of that: a member's linked DM resolves to the same companion
+    // route, and the token (and the link carrying it) binds a group to the trip.
+    // A demoted organizer (link revoked) fails it too. Same sentence as every
+    // other refusal here; no token is issued.
+    if (!(await isTripOrganizer(db, route.tripId, senderId))) {
+      log(structuredLog("info", "trip_bot.group_token_refused", { reason: "NOT_ORGANIZER" }));
+      return { kind: "reply", reply: { chatId, text: strings.groupTokenUnavailable } };
+    }
     const issued = await issueGroupBindingToken(db, route.tripId, senderId, {
       ttlSeconds: options.groupBindingTtlSeconds ?? 7 * 24 * 3600,
     });
