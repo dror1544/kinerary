@@ -35,11 +35,15 @@ export type TripSummary = {
   /** Organizer view only: who is on the trip, for "remove member". */
   members?: MemberSummary[];
   /** The Telegram accounts that can open THIS trip as the viewer: the card's icon and its Unlink entries. */
-  telegram?: { links: TelegramLink[] };
+  telegram?: { links: TelegramLink[]; /** Unlinked accounts that can be restored without Telegram: absent for a Telegram-minted session. */ unlinked?: UnlinkedTelegramLink[] };
 };
 
+export type TelegramLinkVia = "interview_link" | "earlier_interview" | "dashboard_link" | "dashboard_restore" | "trip_password" | "invite";
+
+export type UnlinkedTelegramLink = { id: string; via: TelegramLinkVia; linkedAt: string; unlinkedAt: string };
+
 export type TelegramLink = {
-  id: string; via: "interview_link" | "earlier_interview" | "dashboard_link" | "trip_password" | "invite";
+  id: string; via: TelegramLinkVia;
   linkedAt: string; firstSignedInAt: string | null; lastSignedInAt: string | null;
 };
 
@@ -99,11 +103,13 @@ const inviteSchema = z.object({
 const memberSchema: z.ZodType<MemberSummary> = z.object({
   id: z.string(), displayName: z.string(), role: z.string(), runtimeUsername: z.string().nullable(), you: z.boolean(), removable: z.boolean(),
 });
+const telegramViaSchema = z.enum(["interview_link", "earlier_interview", "dashboard_link", "dashboard_restore", "trip_password", "invite"]);
+const unlinkedTelegramLinkSchema: z.ZodType<UnlinkedTelegramLink> = z.object({ id: z.string(), via: telegramViaSchema, linkedAt: z.string(), unlinkedAt: z.string() });
 const telegramLinkSchema: z.ZodType<TelegramLink> = z.object({
-  id: z.string(), via: z.enum(["interview_link", "earlier_interview", "dashboard_link", "trip_password", "invite"]),
+  id: z.string(), via: telegramViaSchema,
   linkedAt: z.string(), firstSignedInAt: z.string().nullable(), lastSignedInAt: z.string().nullable(),
 });
-const telegramSchema = z.object({ links: z.array(telegramLinkSchema) });
+const telegramSchema = z.object({ links: z.array(telegramLinkSchema), unlinked: z.array(unlinkedTelegramLinkSchema).optional() });
 const tripSchema: z.ZodType<TripSummary> = z.object({
   id: z.string(), title: z.string(), destination: z.string().nullable(), startDate: z.string().nullable(), endDate: z.string().nullable(),
   tripType: z.string(), lifecycleState: z.string(), nextAction: z.string(),
@@ -188,6 +194,8 @@ export async function telegramMiniAppSignIn(input: { initData: string; tripId?: 
 }
 
 export const unlinkTelegramLink = (id: string) => api<{ status: string }>(`/v1/account/telegram-links/${encodeURIComponent(id)}`, { method: "DELETE" });
+/** Brings back an Unlinked Telegram account with no Telegram round trip (full sessions only; a Telegram-minted session gets 403). */
+export const restoreTelegramLink = (id: string) => api<{ status: string }>(`/v1/account/telegram-links/${encodeURIComponent(id)}/restore`, { method: "POST" });
 const issuedLinkSchema = z.object({ deepLink: z.string().regex(/^https:\/\/t\.me\/[A-Za-z0-9_]+\?start=[A-Za-z0-9_-]+$/), expiresAt: z.string() });
 /** A one-time, short-lived t.me link that links whichever Telegram account opens it to THIS trip. */
 export const issueTelegramLink = (tripId: string) =>

@@ -631,6 +631,29 @@ test("with no DM binding at all the signer's own chat still gets the notice - th
   } finally { await app.close(); }
 });
 
+test("the notice is sent on a link's FIRST sign-in only (every later sign-in is silent, however many); a NEW link for the same account and trip announces itself again", { skip }, async () => {
+  const app = newApp();
+  try {
+    await clearNotices();
+    const owner = await mkUser("Once Only");
+    const trip = await mkTrip("Once trip");
+    await mkMember(trip, owner);
+    const signer = tg();
+    const mine = () => pool.query("SELECT recipient FROM control_plane.notification_outbox WHERE notification_type = 'mini_app_sign_in_notice' AND recipient = $1", [String(signer)]);
+    const first = await linkOrganizer(owner, signer, [trip]);
+    for (let i = 0; i < 4; i++) assert.equal((await exchange(app, initDataFor(signer, { start_param: trip }))).statusCode, 200);
+    assert.equal((await mine()).rowCount, 1, "four sign-ins on one link, one notice");
+    assert.ok((await pool.query("SELECT first_signed_in_at FROM control_plane.telegram_organizer_trip_links WHERE id = $1", [first])).rows[0].first_signed_in_at, "the fact is stored on the link row, durably");
+
+    // Unlinked and linked again: a new row, which has not signed in yet.
+    const { unlinkTelegramLink } = await import("../src/telegram-mini-app.js");
+    assert.equal(await unlinkTelegramLink(pool, owner, first), true);
+    await linkOrganizer(owner, signer, [trip], "dashboard_link_token");
+    for (let i = 0; i < 3; i++) assert.equal((await exchange(app, initDataFor(signer, { start_param: trip }))).statusCode, 200);
+    assert.equal((await mine()).rowCount, 2, "the new link announced itself once, then went quiet");
+  } finally { await app.close(); }
+});
+
 test("a failing Telegram send leaves the notice pending and never fails the sign-in; when the retry budget is spent the id is dropped", { skip }, async () => {
   const app = newApp();
   try {

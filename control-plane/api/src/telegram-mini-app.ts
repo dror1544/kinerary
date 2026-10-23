@@ -556,7 +556,7 @@ export async function linkMemberOrSkip(
 
 // ── The owner's view: the trip card's Telegram status, and Unlink ───────────
 
-export type LinkVia = "interview_link" | "earlier_interview" | "dashboard_link" | "trip_password" | "invite";
+export type LinkVia = "interview_link" | "earlier_interview" | "dashboard_link" | "dashboard_restore" | "trip_password" | "invite";
 
 /** One Telegram account that can currently open ONE trip as `userId`. */
 export interface TelegramLinkView {
@@ -572,6 +572,7 @@ const VIA: Record<string, LinkVia> = {
   enrollment_redemption: "interview_link",
   backfill_intake_session: "earlier_interview",
   dashboard_link_token: "dashboard_link",
+  dashboard_restore: "dashboard_restore",
   mini_app_trip_password: "trip_password",
   mini_app_invite_redemption: "invite",
 };
@@ -625,6 +626,57 @@ export async function telegramLinksByTrip(
   return byTrip;
 }
 
+/** One Unlinked Telegram account the owner may bring back with a click (the trip card's "Restore"). */
+export interface UnlinkedTelegramLinkView {
+  /** Opaque id of the REVOKED row; the only thing the Restore button needs. */
+  id: string;
+  via: LinkVia;
+  linkedAt: string;
+  unlinkedAt: string;
+}
+
+/**
+ * The Telegram accounts `userId` Unlinked from each trip that can still be
+ * restored without Telegram, keyed by trip. Given ONLY to a full session of an
+ * owner or organizer (the route that fills the card decides; a scoped session is
+ * never handed this), and only what the live list shows: when it was linked and
+ * how, plus when it was unlinked. Never the Telegram id, its digest or a name.
+ *
+ * Restorable means all of: an owner Unlink (not a membership that ended), not
+ * restored already, the NEWEST revoked row of its (Telegram account, user, trip)
+ * pair, and the pair has no live row now (a lk_ relink already brought it back).
+ * `restoreTelegramLink` (telegram-link-token.ts) re-checks every one at the click.
+ */
+export async function unlinkedTelegramLinksByTrip(
+  db: pg.Pool | pg.PoolClient,
+  userId: string,
+  tripIds: readonly string[],
+): Promise<Map<string, UnlinkedTelegramLinkView[]>> {
+  const byTrip = new Map<string, UnlinkedTelegramLinkView[]>();
+  if (tripIds.length === 0) return byTrip;
+  const result = await db.query<{ id: string; trip_id: string; verified_via: string; created_at: Date; revoked_at: Date }>(
+    `SELECT l.id, l.trip_id, l.verified_via, l.created_at, l.revoked_at
+       FROM control_plane.telegram_organizer_trip_links l
+      WHERE l.user_id = $1 AND l.trip_id = ANY($2::text[])
+        AND l.revoked_reason = 'owner_unlinked' AND l.restored_at IS NULL
+        AND NOT EXISTS (
+              SELECT 1 FROM control_plane.telegram_organizer_trip_links x
+               WHERE x.telegram_subject_digest = l.telegram_subject_digest AND x.user_id = l.user_id AND x.trip_id = l.trip_id
+                 AND x.id <> l.id AND (x.revoked_at IS NULL OR (x.revoked_at, x.id) > (l.revoked_at, l.id)))
+      ORDER BY l.revoked_at DESC, l.id`,
+    [userId, [...tripIds]],
+  );
+  for (const row of result.rows) {
+    const list = byTrip.get(row.trip_id) ?? [];
+    list.push({
+      id: row.id, via: VIA[row.verified_via] ?? "interview_link",
+      linkedAt: row.created_at.toISOString(), unlinkedAt: row.revoked_at.toISOString(),
+    });
+    byTrip.set(row.trip_id, list);
+  }
+  return byTrip;
+}
+
 /**
  * Ends one of `userId`'s own links — ONE TRIP's link — and with it everything
  * that link held:
@@ -668,7 +720,7 @@ export async function unlinkTelegramLink(db: pg.Pool, userId: string, linkId: st
     } else {
       const revoked = await client.query<{ telegram_subject_digest: string; trip_id: string }>(
         `UPDATE control_plane.telegram_organizer_trip_links
-            SET revoked_at = now(), revoked_reason = 'owner_unlinked'
+            SET revoked_at = now(), revoked_reason = 'owner_unlinked', revoked_by = $2
           WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
           RETURNING telegram_subject_digest, trip_id`,
         [linkId, userId],
@@ -736,7 +788,7 @@ async function retireAccountWideLink(client: pg.PoolClient, userId: string, dige
 }
 
 /** sha256 of a raw Telegram chat id column, built exactly like identity.ts's digestTelegramId. */
-const CHAT_DIGEST_SQL = (column: string) => `'sha256:' || encode(sha256(convert_to(${column}, 'UTF8')), 'hex')`;
+export const CHAT_DIGEST_SQL = (column: string) => `'sha256:' || encode(sha256(convert_to(${column}, 'UTF8')), 'hex')`;
 
 async function closeChatHold(client: pg.PoolClient, userId: string, digest: string, tripId: string): Promise<void> {
   // A live interview of the account's FOR THIS TRIP, driven from the unlinked chat.

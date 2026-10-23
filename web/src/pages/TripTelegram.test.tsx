@@ -89,6 +89,50 @@ it("Unlink asks first, unlinks only that trip, and the card goes to 'not linked'
   expect(within(await card("Oslo 2027")).getByRole("img", { name: "Telegram linked" })).toBeInTheDocument();
 });
 
+const unlinkedEntry = { id: "otl_aaaaaaaaaaaaaaaa", via: "interview_link", linkedAt: "2026-10-03T10:00:00.000Z", unlinkedAt: "2026-10-05T10:00:00.000Z" };
+
+it("an Unlinked account is offered Restore; one click restores it with one POST and no Telegram link, and the card goes back to 'linked'", async () => {
+  const romeCard = (linked: boolean) => ({ ...base, id: "trip_romerome", title: "Rome 2027", telegram: { links: linked ? [{ ...link, id: "otl_bbbbbbbbbbbbbbbb", via: "dashboard_restore" }] : [], unlinked: linked ? [] : [unlinkedEntry] } });
+  let restored = false;
+  const calls = mount({ rome: [], oslo: [] }, (path, init) => {
+    if (path === "/v1/trips") return json({ trips: [romeCard(restored)] });
+    if (init?.method === "POST" && path === `/v1/account/telegram-links/${unlinkedEntry.id}/restore`) { restored = true; return json({ status: "restored" }); }
+    return undefined;
+  });
+  const rome = within(await card("Rome 2027"));
+  expect(rome.getByRole("img", { name: "Telegram not linked" })).toBeInTheDocument();
+  fireEvent.click(rome.getByRole("button", { name: "Telegram options for Rome 2027" }));
+  fireEvent.click(rome.getByRole("menuitem", { name: /Restore Telegram · unlinked Oct 5, 2026/ }));
+  await vi.waitFor(() => expect(within(screen.getByRole("heading", { name: "Rome 2027" }).closest("article")!).getByRole("img", { name: "Telegram linked" })).toBeInTheDocument());
+  expect(calls.filter((c) => c.startsWith("POST"))).toEqual([`POST /v1/account/telegram-links/${unlinkedEntry.id}/restore`]);
+  expect(calls.some((c) => c.includes("telegram-link") && !c.includes("telegram-links"))).toBe(false);
+  expect(document.body.textContent).not.toMatch(/sha256|otl_|tml_/);
+});
+
+it("a refused Restore says so", async () => {
+  mount({ rome: [], oslo: [] }, (path, init) => {
+    if (path === "/v1/trips") return json({ trips: [{ ...base, id: "trip_romerome", title: "Rome 2027", telegram: { links: [], unlinked: [unlinkedEntry] } }] });
+    return init?.method === "POST" && path.endsWith("/restore") ? json({ error: "NOT_FOUND" }, 404) : undefined;
+  });
+  const rome = within(await card("Rome 2027"));
+  fireEvent.click(rome.getByRole("button", { name: "Telegram options for Rome 2027" }));
+  fireEvent.click(rome.getByRole("menuitem", { name: /Restore Telegram/ }));
+  expect(await rome.findByRole("alert")).toBeInTheDocument();
+});
+
+it("a Telegram-minted session is never offered Restore, even if the list were present", async () => {
+  const calls = mount({ rome: [], oslo: [] }, (path) => {
+    if (path === "/v1/me") return json({ id: "user_existing", displayName: "Organizer", scope: "telegram" });
+    if (path === "/v1/trips") return json({ trips: [{ ...base, id: "trip_romerome", title: "Rome 2027", telegram: { links: [link], unlinked: [unlinkedEntry] } }] });
+    return undefined;
+  });
+  const rome = within(await card("Rome 2027"));
+  fireEvent.click(rome.getByRole("button", { name: "Telegram options for Rome 2027" }));
+  expect(await rome.findByText(/to link another Telegram account, sign in with your password/)).toBeInTheDocument();
+  expect(rome.queryByRole("menuitem", { name: /Restore Telegram/ })).toBeNull();
+  expect(calls.some((c) => c.endsWith("/restore"))).toBe(false);
+});
+
 it("Keep leaves the link alone", async () => {
   const calls = mount({ rome: [link], oslo: [] });
   const rome = within(await card("Rome 2027"));

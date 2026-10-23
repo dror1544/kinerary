@@ -1,16 +1,17 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useQuery } from "@tanstack/react-query";
-import { getMe, issueTelegramLink, unlinkTelegramLink, type TripSummary } from "../api";
+import { getMe, issueTelegramLink, restoreTelegramLink, unlinkTelegramLink, type TelegramLinkVia, type TripSummary } from "../api";
 import { formatDay, formatTime } from "./dates";
 
-const HOW = {
+const HOW: Record<TelegramLinkVia, string> = {
   interview_link: "via the trip's interview link",
   earlier_interview: "from an earlier interview",
   dashboard_link: "with a link from this page",
+  dashboard_restore: "restored from this page",
   trip_password: "with the trip password",
   invite: "with a site invitation",
-} as const;
+};
 
 /**
  * The trip card's Telegram status and its ⋮ menu.
@@ -21,16 +22,25 @@ const HOW = {
  * describe, and Unlinking one trip leaves the others as they were.
  *
  * Link produces a one-time link for the account that opens it in Telegram (the
- * only way back after an Unlink; an interview link someone forwarded does not
- * undo one). Unlink lists each linked Telegram account by WHEN and HOW it was
+ * way to add an account that was never linked; an interview link someone
+ * forwarded does not undo an Unlink, and Restore, below, is for the account you
+ * Unlinked). Unlink lists each linked Telegram account by WHEN and HOW it was
  * linked — never who: the server does not know a name and will not hand out an
  * id, so the list is for recognising your own phone and spotting the one you
  * did not make. A member sees the same card state and can end their own link,
  * but only an organizer is offered Link.
+ *
+ * Restore brings back an account the owner Unlinked, in one click and with no
+ * Telegram round trip: it is the same Telegram account, so nothing needs
+ * proving in Telegram again. It is a way in, so like Link it is for a password
+ * or Google session only - the server answers 403 to a Telegram-minted one and
+ * never sends it the list. A restored account signs in fresh; nothing it had
+ * open before comes back.
  */
 export function TripTelegram({ trip }: { trip: TripSummary }) {
   const queryClient = useQueryClient();
   const links = trip.telegram?.links ?? [];
+  const unlinked = trip.telegram?.unlinked ?? [];
   const organizerSide = trip.permissions.dashboard && ["owner", "organizer"].includes(trip.permissions.role);
   // A session a Telegram link minted cannot mint another way in: the server answers 403, so it is not offered.
   const scoped = useQuery({ queryKey: ["me"], queryFn: getMe, retry: false }).data?.scope === "telegram";
@@ -42,6 +52,10 @@ export function TripTelegram({ trip }: { trip: TripSummary }) {
     queryClient.invalidateQueries({ queryKey: ["trip", trip.id] }),
   ]);
   const link = useMutation({ mutationFn: () => issueTelegramLink(trip.id) });
+  const restore = useMutation({
+    mutationFn: restoreTelegramLink,
+    onSuccess: async () => { setOpen(false); link.reset(); await refresh(); },
+  });
   const unlink = useMutation({
     mutationFn: unlinkTelegramLink,
     onSuccess: async () => { setConfirming(null); setOpen(false); link.reset(); await refresh(); },
@@ -77,6 +91,14 @@ export function TripTelegram({ trip }: { trip: TripSummary }) {
               <small>Works once, until {formatTime(link.data.expiresAt)}. Open it in the Telegram account you want to link to this trip.</small>
             </div>
           )}
+          {/* Restore: one click, no Telegram round trip. The server hands the list only to a full session; canLink
+              repeats that here so the button is never a dead end. */}
+          {canLink && unlinked.map((entry) => (
+            <button key={entry.id} type="button" role="menuitem" className="text-button telegram-restore" disabled={restore.isPending} onClick={() => restore.mutate(entry.id)}>
+              Restore Telegram · unlinked {formatDay(entry.unlinkedAt)}
+              <small>was linked {formatDay(entry.linkedAt)}, {HOW[entry.via]}</small>
+            </button>
+          ))}
           {links.map((entry) => (
             confirming === entry.id
               ? <div key={entry.id} className="telegram-confirm" role="group" aria-label="Confirm unlink">
@@ -93,6 +115,7 @@ export function TripTelegram({ trip }: { trip: TripSummary }) {
           ))}
           {link.isError && <div className="notice" role="alert">{link.error.message}</div>}
           {unlink.isError && <div className="notice" role="alert">{unlink.error.message}</div>}
+          {restore.isError && <div className="notice" role="alert">{restore.error.message}</div>}
         </div>
       )}
     </div>

@@ -11,10 +11,10 @@ import { removeMember } from "./member-removal.js";
 import { structuredLog } from "./redaction.js";
 import {
   TRIP_ID_PATTERN, claimSessionSlot, enqueueSignInNotice, linkMemberOrSkip,
-  recordLinkSignIn, resolveMiniAppLaunch, telegramLinksByTrip, unlinkTelegramLink,
+  recordLinkSignIn, resolveMiniAppLaunch, telegramLinksByTrip, unlinkTelegramLink, unlinkedTelegramLinksByTrip,
   type TelegramMiniAppConfig,
 } from "./telegram-mini-app.js";
-import { issueTelegramLinkToken } from "./telegram-link-token.js";
+import { issueTelegramLinkToken, restoreTelegramLink } from "./telegram-link-token.js";
 import {
   ACCOUNT_SIGN_IN_REQUIRED, assertEveryRouteIsClassified, loadSessionScope, scopeDecision, scopedSessionDigest, sessionDigests,
   type SessionScope,
@@ -490,7 +490,7 @@ function nextAction(state: string, planStatus?: string | null, jobState?: string
   return "view_status";
 }
 
-async function tripDetail(deps: PortalDependencies, tripId: string, userId: string) {
+async function tripDetail(deps: PortalDependencies, tripId: string, userId: string, opts: { restorable?: boolean } = {}) {
   const tripResult = await deps.db.query<{
     id: string; title: string | null; destination_label: string | null; start_date: string | null; end_date: string | null;
     trip_type: string | null; lifecycle_state: string; slug: string; role: string; dashboard_access: boolean; runtime_access: boolean;
@@ -562,7 +562,12 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
     members,
     // Which Telegram accounts can open THIS trip as the viewer: the card's
     // linked / not-linked icon and its ⋮ menu's Unlink entries.
-    telegram: { links: (await telegramLinksByTrip(deps.db, userId, [tripId])).get(tripId) ?? [] },
+    telegram: {
+      links: (await telegramLinksByTrip(deps.db, userId, [tripId])).get(tripId) ?? [],
+      // Unlinked accounts the owner may Restore. A FULL session only (the caller decides): a Telegram-minted
+      // session is never told which accounts were Unlinked, because it cannot restore one (portal-scope.ts).
+      ...(opts.restorable ? { unlinked: (await unlinkedTelegramLinksByTrip(deps.db, userId, [tripId])).get(tripId) ?? [] } : {}),
+    },
     invites: invitesResult.rows.map((invite) => ({
       id: invite.id, displayName: invite.intended_display_name, runtimeUsername: invite.runtime_username,
       status: invite.state === "unused" && invite.expires_at.getTime() < Date.now() ? "expired" : invite.state,
@@ -805,6 +810,25 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     return { status: "unlinked" };
   });
 
+  // The trip card's "Restore": brings back a Telegram account the signed-in owner or organizer Unlinked,
+  // with no Telegram round trip (telegram-link-token.ts, restoreTelegramLink). Policy "account": a session a
+  // Telegram link minted gets 403 before this handler runs, because restoring is minting a way in. Origin and
+  // CSRF as for every mutation. Refused alike (404) for a link that is not theirs, does not exist, is not an
+  // owner Unlink, is already back, or is on a trip they do not run.
+  const restoreAttempts: Attempts = new Map();
+  app.post("/v1/account/telegram-links/:linkId/restore", async (request, reply) => {
+    const user = await requireMutation(request, reply, deps);
+    if (!user) return;
+    reply.header("cache-control", "private, no-store");
+    if (!admitLogin(restoreAttempts, user.id, 20)) {
+      return reply.header("retry-after", "60").code(429).send({ error: "RATE_LIMITED" });
+    }
+    const linkId = (request.params as { linkId?: string }).linkId ?? "";
+    const restored = await restoreTelegramLink(deps.db, { userId: user.id, linkId });
+    if (!restored.ok) return reply.code(404).send({ error: "NOT_FOUND" });
+    return { status: "restored" };
+  });
+
   app.get("/v1/auth/google/start", async (request, reply) => {
     if (!deps.google) return reply.code(503).send({ error: "GOOGLE_SIGN_IN_UNAVAILABLE" });
     const query = request.query as Record<string, unknown>;
@@ -974,7 +998,7 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
         ORDER BY created_at DESC`,
       [user.id, user.scope ? [...user.scope.tripIds] : null]);
     // Full detail only where the caller runs the trip; a runtime-only member gets the summary.
-    return { trips: (await Promise.all(rows.rows.map((row) => row.dashboard_access ? tripDetail(deps, row.id, user.id) : memberTripSummary(deps, row.id, user.id)))).filter(Boolean) };
+    return { trips: (await Promise.all(rows.rows.map((row) => row.dashboard_access ? tripDetail(deps, row.id, user.id, { restorable: !user.scope }) : memberTripSummary(deps, row.id, user.id)))).filter(Boolean) };
   });
 
   app.post("/v1/trips", async (request, reply) => {
@@ -1010,7 +1034,7 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     } finally {
       client.release();
     }
-    return reply.code(201).send(await tripDetail(deps, tripId, user.id));
+    return reply.code(201).send(await tripDetail(deps, tripId, user.id, { restorable: !user.scope }));
   });
 
   app.get("/v1/trips/:id", async (request, reply) => {
@@ -1018,7 +1042,7 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     if (!user) return;
     const tripId = (request.params as { id?: string }).id;
     if (!tripId) return reply.code(400).send({ error: "INVALID_REQUEST" });
-    const detail = await tripDetail(deps, tripId, user.id);
+    const detail = await tripDetail(deps, tripId, user.id, { restorable: !user.scope });
     if (!detail || !detail.permissions.dashboard) return reply.code(404).send({ error: "NOT_FOUND" });
     return detail;
   });
@@ -1042,9 +1066,9 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
   // The trip card's "Link Telegram": a one-time, short-lived deep link that links
   // WHICHEVER Telegram account opens it to the signed-in organizer, for this trip
   // only. The session and CSRF token prove the account; the bot's verified update
-  // proves the Telegram identity (telegram-link-token.ts). This is the only way
-  // back after an Unlink — an interview link, which may have been forwarded,
-  // does not undo one.
+  // proves the Telegram identity (telegram-link-token.ts). This is the way back for an account the
+  // organizer never linked; the one they Unlinked comes back with Restore (below), and an interview
+  // link, which may have been forwarded, does not undo an Unlink.
   const linkTokenAttempts: Attempts = new Map();
   app.post("/v1/trips/:id/telegram-link", async (request, reply) => {
     const user = await requireMutation(request, reply, deps);

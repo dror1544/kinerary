@@ -132,7 +132,7 @@ Enforced in **one place**, `requireUser` (portal.ts), which every authenticated 
 | `trip` | `GET /v1/trips/:id`, `GET …/interview-link` (status only), `POST …/provisioning-request`, `POST …/plans/:planId/approve\|reject`, `POST …/launch` | its linked trip: as an organizer's/member's session does. Any other trip id, a nonexistent one included: the **same 404** `{"error":"NOT_FOUND"}` |
 | `filtered` | `GET /v1/trips` | only the linked trips (filter in the SQL) |
 | `link` | `DELETE /v1/account/telegram-links/:linkId` | may end only a link of **its own Telegram account** on a trip in scope (which ends the session). Another trip's link, and another account's link on an in-scope trip (the owner's phone), are the same 404 as an unknown id |
-| `account` | `POST /v1/trips`, `POST /v1/site-invites/redeem`, and the three routes that **mint a way into the account**: `POST /v1/trips/:id/telegram-link`, `POST /v1/trips/:id/interview-link`, `POST /v1/trips/:id/interview-link/replace`, and — everything that **creates a credential or removes access** — `POST /v1/trips/:id/site-invites`, `DELETE /v1/trips/:id/site-invites/:inviteId`, `DELETE /v1/trips/:id/members/:membershipId` (boundary review M1, round 3 MF1: a link or a join URL a scoped session minted, redeemed by someone else, would outlive the Unlink of the session's own account; a forwardee must not remove people either) | `403 {"error":"ACCOUNT_SIGN_IN_REQUIRED","message":"Sign in with your password to do this."}` |
+| `account` | `POST /v1/trips`, `POST /v1/site-invites/redeem`, and the four routes that **mint a way into the account**: `POST /v1/trips/:id/telegram-link`, `POST /v1/account/telegram-links/:linkId/restore`, `POST /v1/trips/:id/interview-link`, `POST /v1/trips/:id/interview-link/replace`, and — everything that **creates a credential or removes access** — `POST /v1/trips/:id/site-invites`, `DELETE /v1/trips/:id/site-invites/:inviteId`, `DELETE /v1/trips/:id/members/:membershipId` (boundary review M1, round 3 MF1: a link or a join URL a scoped session minted, redeemed by someone else, would outlive the Unlink of the session's own account; a forwardee must not remove people either) | `403 {"error":"ACCOUNT_SIGN_IN_REQUIRED","message":"Sign in with your password to do this."}` |
 | `session` | `GET /v1/me` (reports `scope: "telegram"`), `POST /v1/logout` | allowed |
 | `open` | sign-in routes, invite inspection, internal runtime routes | not session routes; a route marked `open` that asks for a user is refused |
 
@@ -168,7 +168,35 @@ source-vs-table check, live widening/narrowing, fail-closed scopes, rollback loo
   no Telegram-supplied name. This replaces the account-level "Telegram accounts that can sign in as you"
   section and `GET /v1/account/telegram-links` (removed: answers 404). Dates on the page are formatted in the
   **page's** language (`<html lang>`), never the browser's.
-- **Link — the only way back after an Unlink** (`POST /v1/trips/:id/telegram-link`, `requireMutation`, owner or
+- **Restore — the way back for an account the owner Unlinked, with no Telegram round trip** (owner request,
+  2026-10-23; `POST /v1/account/telegram-links/:linkId/restore`, `requireMutation`, policy `account`: a
+  password or Google session only — a Telegram-minted session gets the 403 `ACCOUNT_SIGN_IN_REQUIRED`, and
+  its trip card is never sent the list of Unlinked accounts). `:linkId` is the **revoked** row's opaque id;
+  the Telegram account is the one on that row, never anything in the request. It works only when all of
+  these hold, re-read under row locks, and every failure is the **same 404** (a foreign link, an unknown or
+  malformed id, a member-link id, a non-organizer, a retired trip, an already-restored row all look alike):
+  the row is the signed-in user's own; it was revoked by an **owner Unlink** (`membership_ended` is
+  permanent, and a user who is gone has no card to click on); it is not restored yet and is the *newest*
+  revoked row of its (Telegram account, user, trip) pair with no live row (a `lk_` relink already brought it
+  back); and the user still **runs the trip** today — the same check as issuing and redeeming a `lk_` link
+  (`tripTheUserRuns`: owner or organizer with dashboard access, active, trip not retired or destroyed).
+  20/min per person. **A restore writes a NEW live row** (`verified_via = 'dashboard_restore'`), not a
+  cleared `revoked_at`: the Unlink stays in the table that records it (the file's own rule since
+  `20261021120000`: "relinking writes a NEW row"), nothing refers to the new id yet so **no session is
+  revived** (the sessions the Unlink ended point at the old id and stay revoked; the person signs in fresh),
+  and the new row has no first sign-in, so the notice below announces it again. History, kept on both
+  rows (migration `20261023130000`): `revoked_by` (who unlinked; NULL for rows from before this release
+  and for membership-end), and on the revoked row `restored_at` / `restored_by` / `restored_link_id`.
+  The bot's organizer fact comes back through the **same helper the `lk_` relink uses**
+  (`restoreDemotedOrganizerPersonLink`): only a `trip_person_links` row carrying the `demoted_from_role`
+  marker, which is then cleared. Not restored: the interview session, interview binding and chat binding
+  the Unlink closed (the Telegram account's hold on the trip — the next `/start` or interview link makes
+  them again) and the previous release's account-wide row (it stays in the history table, so a rollback
+  still fails closed). The card shows `telegram.unlinked[]` (`id`, `via`, `linkedAt`, `unlinkedAt`; no id,
+  digest or name) and a **Restore Telegram** entry in the ⋮ menu for a full session of an owner or
+  organizer. Held by `control-plane/api/test/telegram-link-restore-db.test.ts` and
+  `web/src/pages/TripTelegram.test.tsx`.
+- **Link — the way to add a Telegram account that was never linked** (`POST /v1/trips/:id/telegram-link`, `requireMutation`, owner or
   organizer with dashboard access; anyone else, a retired trip and a nonexistent one get the same 404;
   10/min per person). It returns `{ deepLink: "https://t.me/<bot>?start=lk_…", expiresAt }`. The token is
   the enrollment pattern (`enrollment.ts`) — 24 random bytes, only the sha256 stored in
@@ -187,9 +215,14 @@ source-vs-table check, live widening/narrowing, fail-closed scopes, rollback loo
   version skipped the signer's chat and, for an organizer whose only chat is their own phone, the notice
   never arrived). Recipients: the open, private DM bindings of the trips the account is owner or organizer
   of, plus the signing Telegram account's own private chat. It says which account signed in, which trip it
-  opened and when, and how to unlink (the trip card's three-dot menu). Per link: relinking a trip later
-  announces that link's first sign-in again, which is the point when the relink was made with a link the
-  organizer may have forwarded. Outbox type `mini_app_sign_in_notice`, trip_id NULL, one row per chat, sent
+  opened and when, and how to unlink (the trip card's three-dot menu). **Once per link, not per sign-in**
+  (owner request, 2026-10-23; the stored fact is the link row's `first_signed_in_at`, set in the same
+  transaction that queues the notice, so a second sign-in on the same link — however many — queues
+  nothing): relinking a trip later, or restoring an Unlinked account, makes a NEW link row and announces
+  that link's first sign-in again, which is the point when the relink was made with a link the organizer
+  may have forwarded. One Telegram account opening N trips has N links, so N first sign-ins: N notices,
+  once each. Held by `telegram-mini-app-db.test.ts` ("the notice is sent on a link's FIRST sign-in only…")
+  and `telegram-link-restore-db.test.ts` ("a restored link announces its first sign-in again, once"). Outbox type `mini_app_sign_in_notice`, trip_id NULL, one row per chat, sent
   by the ordinary outbox dispatcher with its usual retries (which runs whenever the web block is configured,
   with or without `signup`); the raw Telegram id in the row is nulled once it is sent or has failed for good;
   never inline. Re-linking the same Telegram account to the same member and trip is never news.
