@@ -209,6 +209,12 @@ describe("binding a group posts the Open trip message (#443)", { skip: SKIP }, (
     await withFixture(async (fix) => {
       await setIntro(fix.pool, fix.tripId, "en");
       await bind(fix.pool, "700000801", fix.tripId);
+      await fix.pool.query(
+        `INSERT INTO control_plane.trip_person_links
+           (id, trip_id, telegram_user_id, participant_username, display_name, role, verified_via)
+         VALUES ('tpl_' || md5(random()::text), $1, $2, 'organizer1', 'Dror', 'organizer', 'interview_chat')`,
+        [fix.tripId, ORGANIZER],
+      );
       const decision = await dispatch(fix.pool, say("700000801", "/group", { type: "private", fromId: Number(ORGANIZER) }));
       assert.equal(decision.kind, "group_intro");
       if (decision.kind !== "group_intro") return;

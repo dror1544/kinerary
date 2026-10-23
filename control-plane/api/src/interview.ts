@@ -8,7 +8,7 @@ import { assertCanonicalRecordSafe, UnsafeCanonicalRecordError } from "./canonic
 // see country-key.ts for what divergence costs.
 import { normaliseCountryKey as normaliseCountry } from "./country-key.js";
 import { consumeEnrollmentInTx } from "./enrollment.js";
-import { isPrivateChatId } from "./identity.js";
+import { isPrivateChatId, type TelegramName } from "./identity.js";
 import { linkTelegramOrganizerInTx } from "./organizer-trips.js";
 import {
   coerceLanguage,
@@ -2608,6 +2608,8 @@ export async function startSession(
   telegramChatIdHint?: string,
   verifiedTelegramChatId?: string,
   languageHint?: string,
+  /** First name and @username of the Telegram account, from the update's verified `from` (display data only). */
+  telegramName?: TelegramName | null,
 ): Promise<StartSessionResult> {
   const client = await db.connect();
   try {
@@ -2691,7 +2693,7 @@ export async function startSession(
     // web session by itself — the Mini App exchange does, from verified
     // initData (telegram-mini-app.ts); /v1/auth/telegram stays retired (410).
     if (chatId) {
-      await linkTelegramOrganizerInTx(client, chatId, enrollment.userId, enrollment.tripId);
+      await linkTelegramOrganizerInTx(client, chatId, enrollment.userId, enrollment.tripId, "enrollment_redemption", telegramName ?? null);
     }
 
     await client.query("COMMIT");

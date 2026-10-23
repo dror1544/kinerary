@@ -95,6 +95,10 @@ export const PORTAL_SCOPE_POLICY: Readonly<Record<string, RouteScope>> = Object.
   "POST /v1/site-invites/redeem": "account",
 
   "DELETE /v1/account/telegram-links/:linkId": "link",
+  // Restoring an Unlinked Telegram account without Telegram MINTS a way into the account, exactly like the
+  // telegram-link route below: a scoped session (a forwardee's phone) must not undo an Unlink, its own
+  // account's or anyone's. A password or Google sign-in only.
+  "POST /v1/account/telegram-links/:linkId/restore": "account",
 
   "GET /v1/trips/:id": "trip",
   "GET /v1/trips/:id/interview-link": "trip",

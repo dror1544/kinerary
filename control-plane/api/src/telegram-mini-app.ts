@@ -30,7 +30,7 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import type pg from "pg";
-import { digestTelegramId, isPrivateChatId } from "./identity.js";
+import { digestTelegramId, isPrivateChatId, type TelegramName } from "./identity.js";
 import { structuredLog } from "./redaction.js";
 import { TELEGRAM_API_ROOT } from "./relay/telegram-api.js";
 import { NOT_RETIRED_SQL } from "./trip-retirement.js";
@@ -365,7 +365,11 @@ const LINK_TABLE: Record<LinkKind, string> = {
  * sign-in is refused: `null`) or waits until the sign-in has committed (and
  * then revokes the session it minted via `web_sessions.telegram_link_id`).
  */
-export async function recordLinkSignIn(client: pg.PoolClient, kind: LinkKind, linkId: string): Promise<{ first: boolean } | null> {
+export async function recordLinkSignIn(
+  client: pg.PoolClient, kind: LinkKind, linkId: string,
+  /** From the signature-checked initData (VerifiedInitData.name); display data only. Fills a link that has none. */
+  telegramName: TelegramName | null = null,
+): Promise<{ first: boolean } | null> {
   const table = LINK_TABLE[kind];
   const row = await client.query<{ first_signed_in_at: Date | null }>(
     // Both kinds are revoked in place (`revoked_at`); a revoked link signs nobody in.
@@ -374,8 +378,9 @@ export async function recordLinkSignIn(client: pg.PoolClient, kind: LinkKind, li
   );
   if (!row.rows[0]) return null;
   await client.query(
-    `UPDATE ${table} SET last_signed_in_at = now(), first_signed_in_at = COALESCE(first_signed_in_at, now()) WHERE id = $1`,
-    [linkId],
+    `UPDATE ${table} SET last_signed_in_at = now(), first_signed_in_at = COALESCE(first_signed_in_at, now()),
+            telegram_first_name = COALESCE(telegram_first_name, $2), telegram_username = COALESCE(telegram_username, $3) WHERE id = $1`,
+    [linkId, telegramName?.firstName ?? null, telegramName?.username ?? null],
   );
   return { first: row.rows[0].first_signed_in_at === null };
 }
@@ -514,11 +519,11 @@ export async function linkMemberInTx(
   );
   const inserted = await client.query<{ id: string }>(
     `INSERT INTO control_plane.telegram_member_links
-       (id, user_id, trip_id, telegram_subject_digest, verified_via, first_signed_in_at, last_signed_in_at)
-     VALUES ($1, $2, $3, $4, $5, now(), now())
+       (id, user_id, trip_id, telegram_subject_digest, verified_via, first_signed_in_at, last_signed_in_at, telegram_first_name, telegram_username)
+     VALUES ($1, $2, $3, $4, $5, now(), now(), $6, $7)
      ON CONFLICT (telegram_subject_digest, user_id, trip_id) WHERE revoked_at IS NULL DO NOTHING
      RETURNING id`,
-    [opaqueId("tml"), input.userId, input.tripId, digestTelegramId(input.launch.telegramUserId), input.via],
+    [opaqueId("tml"), input.userId, input.tripId, digestTelegramId(input.launch.telegramUserId), input.via, input.launch.name?.firstName ?? null, input.launch.name?.username ?? null],
   );
   if (inserted.rowCount && !before.rowCount) {
     const trip = await client.query<{ title: string }>(
@@ -556,12 +561,31 @@ export async function linkMemberOrSkip(
 
 // ── The owner's view: the trip card's Telegram status, and Unlink ───────────
 
-export type LinkVia = "interview_link" | "earlier_interview" | "dashboard_link" | "trip_password" | "invite";
+export type LinkVia = "interview_link" | "earlier_interview" | "dashboard_link" | "dashboard_restore" | "trip_password" | "invite";
+
+/**
+ * Whose names a caller may be shown. A FULL session sees every label on the user's own links; a
+ * Telegram-minted (scoped) session only its OWN Telegram account's (`ownDigest`, from the session's scope) -
+ * it must not learn how the owner's other phones are named.
+ */
+export type LabelVisibility = "all" | { ownDigest: string | null };
+
+/**
+ * The first name and @username when the viewer may see them, as two separate keys (`name`, `username`; a
+ * missing one is omitted). Display data only: never compared, never decides anything.
+ */
+function visibleName(firstName: string | null, username: string | null, digest: string, visibility: LabelVisibility): { name?: string; username?: string } {
+  if (visibility !== "all" && !(visibility.ownDigest !== null && visibility.ownDigest === digest)) return {};
+  return { ...(firstName ? { name: firstName } : {}), ...(username ? { username } : {}) };
+}
 
 /** One Telegram account that can currently open ONE trip as `userId`. */
 export interface TelegramLinkView {
   /** Opaque row id; the only thing the Unlink button needs. */
   id: string;
+  /** First name and @username (separate fields) when the viewer may see them; absent otherwise. Never decide anything. */
+  name?: string;
+  username?: string;
   via: LinkVia;
   linkedAt: string;
   firstSignedInAt: string | null;
@@ -572,6 +596,7 @@ const VIA: Record<string, LinkVia> = {
   enrollment_redemption: "interview_link",
   backfill_intake_session: "earlier_interview",
   dashboard_link_token: "dashboard_link",
+  dashboard_restore: "dashboard_restore",
   mini_app_trip_password: "trip_password",
   mini_app_invite_redemption: "invite",
 };
@@ -586,26 +611,33 @@ const VIA: Record<string, LinkVia> = {
  * memory ("I never linked Telegram to Rome on the 3rd") without this becoming a
  * way to learn who the other party is. Not shown, on purpose: the Telegram id,
  * its digest or any prefix of it (a digest of a short numeric id is
- * brute-forceable, so a fragment narrows it), and any Telegram-supplied name
- * (free text the other person chose). The trip comes from the card the row is
- * rendered on, so the rows carry no trip title either.
+ * brute-forceable, so a fragment narrows it). The one thing about the other
+ * party that IS shown (owner decision 2026-10-23, "name + confirm") is the
+ * display name - first name and @username as two separate fields, free text the
+ * other person chose, stored from a verified Telegram path and bounded - so the owner can tell their
+ * own phone from a stranger's before pressing Unlink or Restore. A FULL session
+ * sees every label on its own links; a scoped session only its own account's
+ * (`LabelVisibility`). It is display data: nothing reads it to decide anything.
+ * The trip comes from the card the row is rendered on, so the rows carry no trip
+ * title either.
  */
 export async function telegramLinksByTrip(
   db: pg.Pool | pg.PoolClient,
   userId: string,
   tripIds: readonly string[],
+  visibility: LabelVisibility = { ownDigest: null },
 ): Promise<Map<string, TelegramLinkView[]>> {
   const byTrip = new Map<string, TelegramLinkView[]>();
   if (tripIds.length === 0) return byTrip;
   const result = await db.query<{
     id: string; trip_id: string; verified_via: string; created_at: Date;
-    first_signed_in_at: Date | null; last_signed_in_at: Date | null;
+    first_signed_in_at: Date | null; last_signed_in_at: Date | null; telegram_first_name: string | null; telegram_username: string | null; telegram_subject_digest: string;
   }>(
-    `SELECT l.id, l.trip_id, l.verified_via, l.created_at, l.first_signed_in_at, l.last_signed_in_at
+    `SELECT l.id, l.trip_id, l.verified_via, l.created_at, l.first_signed_in_at, l.last_signed_in_at, l.telegram_first_name, l.telegram_username, l.telegram_subject_digest
        FROM control_plane.telegram_organizer_trip_links l
       WHERE l.user_id = $1 AND l.trip_id = ANY($2::text[]) AND l.revoked_at IS NULL
      UNION ALL
-     SELECT m.id, m.trip_id, m.verified_via, m.created_at, m.first_signed_in_at, m.last_signed_in_at
+     SELECT m.id, m.trip_id, m.verified_via, m.created_at, m.first_signed_in_at, m.last_signed_in_at, m.telegram_first_name, m.telegram_username, m.telegram_subject_digest
        FROM control_plane.telegram_member_links m
       WHERE m.user_id = $1 AND m.trip_id = ANY($2::text[]) AND m.revoked_at IS NULL
      ORDER BY created_at, id`,
@@ -619,6 +651,63 @@ export async function telegramLinksByTrip(
       linkedAt: row.created_at.toISOString(),
       firstSignedInAt: row.first_signed_in_at ? row.first_signed_in_at.toISOString() : null,
       lastSignedInAt: row.last_signed_in_at ? row.last_signed_in_at.toISOString() : null,
+      ...visibleName(row.telegram_first_name, row.telegram_username, row.telegram_subject_digest, visibility),
+    });
+    byTrip.set(row.trip_id, list);
+  }
+  return byTrip;
+}
+
+/** One Unlinked Telegram account the owner may bring back with a click (the trip card's "Restore"). */
+export interface UnlinkedTelegramLinkView {
+  /** Opaque id of the REVOKED row; the only thing the Restore button needs. */
+  id: string;
+  via: LinkVia;
+  linkedAt: string;
+  unlinkedAt: string;
+  /** First name and @username, full sessions only (this list is never given to any other). Never decide anything. */
+  name?: string;
+  username?: string;
+}
+
+/**
+ * The Telegram accounts `userId` Unlinked from each trip that can still be
+ * restored without Telegram, keyed by trip. Given ONLY to a full session of an
+ * owner or organizer (the route that fills the card decides; a scoped session is
+ * never handed this), and only what the live list shows: when it was linked and
+ * how, plus when it was unlinked. Never the Telegram id, its digest or a name.
+ *
+ * Restorable means all of: an owner Unlink (not a membership that ended), not
+ * restored already, the NEWEST revoked row of its (Telegram account, user, trip)
+ * pair, and the pair has no live row now (a lk_ relink already brought it back).
+ * `restoreTelegramLink` (telegram-link-token.ts) re-checks every one at the click.
+ */
+export async function unlinkedTelegramLinksByTrip(
+  db: pg.Pool | pg.PoolClient,
+  userId: string,
+  tripIds: readonly string[],
+): Promise<Map<string, UnlinkedTelegramLinkView[]>> {
+  const byTrip = new Map<string, UnlinkedTelegramLinkView[]>();
+  if (tripIds.length === 0) return byTrip;
+  const result = await db.query<{ id: string; trip_id: string; verified_via: string; created_at: Date; revoked_at: Date; telegram_first_name: string | null; telegram_username: string | null }>(
+    `SELECT l.id, l.trip_id, l.verified_via, l.created_at, l.revoked_at, l.telegram_first_name, l.telegram_username
+       FROM control_plane.telegram_organizer_trip_links l
+      WHERE l.user_id = $1 AND l.trip_id = ANY($2::text[])
+        AND l.revoked_reason = 'owner_unlinked' AND l.restored_at IS NULL
+        AND NOT EXISTS (
+              SELECT 1 FROM control_plane.telegram_organizer_trip_links x
+               WHERE x.telegram_subject_digest = l.telegram_subject_digest AND x.user_id = l.user_id AND x.trip_id = l.trip_id
+                 AND x.id <> l.id AND (x.revoked_at IS NULL OR (x.revoked_at, x.id) > (l.revoked_at, l.id)))
+      ORDER BY l.revoked_at DESC, l.id`,
+    [userId, [...tripIds]],
+  );
+  for (const row of result.rows) {
+    const list = byTrip.get(row.trip_id) ?? [];
+    list.push({
+      id: row.id, via: VIA[row.verified_via] ?? "interview_link",
+      linkedAt: row.created_at.toISOString(), unlinkedAt: row.revoked_at.toISOString(),
+      ...(row.telegram_first_name ? { name: row.telegram_first_name } : {}),
+      ...(row.telegram_username ? { username: row.telegram_username } : {}),
     });
     byTrip.set(row.trip_id, list);
   }
@@ -668,7 +757,7 @@ export async function unlinkTelegramLink(db: pg.Pool, userId: string, linkId: st
     } else {
       const revoked = await client.query<{ telegram_subject_digest: string; trip_id: string }>(
         `UPDATE control_plane.telegram_organizer_trip_links
-            SET revoked_at = now(), revoked_reason = 'owner_unlinked'
+            SET revoked_at = now(), revoked_reason = 'owner_unlinked', revoked_by = $2
           WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
           RETURNING telegram_subject_digest, trip_id`,
         [linkId, userId],
@@ -736,7 +825,7 @@ async function retireAccountWideLink(client: pg.PoolClient, userId: string, dige
 }
 
 /** sha256 of a raw Telegram chat id column, built exactly like identity.ts's digestTelegramId. */
-const CHAT_DIGEST_SQL = (column: string) => `'sha256:' || encode(sha256(convert_to(${column}, 'UTF8')), 'hex')`;
+export const CHAT_DIGEST_SQL = (column: string) => `'sha256:' || encode(sha256(convert_to(${column}, 'UTF8')), 'hex')`;
 
 async function closeChatHold(client: pg.PoolClient, userId: string, digest: string, tripId: string): Promise<void> {
   // A live interview of the account's FOR THIS TRIP, driven from the unlinked chat.

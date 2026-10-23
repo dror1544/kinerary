@@ -303,7 +303,7 @@ test("a title with replacement patterns in it is shown as written", { skip }, as
 
 // ── The path back, end to end ───────────────────────────────────────────────
 
-test("after an Unlink the dashboard link is the ONLY way back: a forwarded interview link cannot undo it", { skip }, async () => {
+test("after an Unlink the dashboard link (or Restore, from a full session) is the way back: a forwarded interview link cannot undo it", { skip }, async () => {
   const app = newApp();
   try {
     const user = await mkUser("Olive"); const rome = await mkTrip("Rome"); const oslo = await mkTrip("Oslo");

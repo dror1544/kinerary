@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -113,12 +113,23 @@ function Trips() {
 
 function TripCard({ trip }: { trip: TripSummary }) {
   const inMiniApp = useLocation().pathname.startsWith("/mini-app");
+  const navigate = useNavigate();
   const open = trip.runtimeReady ? (inMiniApp ? `/mini-app/trips/${trip.id}` : `/trips/${trip.id}/app`) : `/trips/${trip.id}/setup`;
-  // A member (runtime access, no dashboard) has no setup page to go to; an unready trip is just not ready.
+  // The trip's own page (progress, Telegram status, members). A member (runtime access, no dashboard) has no
+  // setup page to go to, so their card is not a link: an unready trip is just not ready.
+  const tripPage = trip.permissions.dashboard ? `/trips/${trip.id}/setup` : null;
   const action = trip.runtimeReady || trip.permissions.dashboard
-    ? <Link className="button button-small" to={open}>{trip.runtimeReady ? "Open trip" : humanize(trip.nextAction)}</Link>
+    // stopPropagation: Open trip is its own action and must not also navigate to the card's page.
+    ? <Link className="button button-small" to={open} onClick={(event) => event.stopPropagation()}>{trip.runtimeReady ? "Open trip" : humanize(trip.nextAction)}</Link>
     : <small>Not ready to open yet</small>;
-  return <article className="trip-card"><div className="trip-card-head"><div className="status-chip">{humanize(trip.nextAction)}</div><TripTelegram trip={trip} /></div><h3>{trip.title}</h3><p>{trip.destination || "Destination to be confirmed"}</p><small>{[trip.startDate, trip.endDate].filter(Boolean).join(" → ") || "Dates are flexible"}</small>{action}</article>;
+  // The title is the real link (focusable, announced, middle-clickable); the click handler lets the rest of the
+  // card behave the same for a pointer. Controls inside the card keep their own meaning.
+  const onCardClick = (event: MouseEvent<HTMLElement>) => {
+    if (!tripPage || event.defaultPrevented) return;
+    if ((event.target as HTMLElement).closest("a, button, input, select, textarea, label, .telegram-status")) return;
+    navigate(tripPage);
+  };
+  return <article className={`trip-card${tripPage ? " trip-card-openable" : ""}`} onClick={onCardClick}><div className="trip-card-head"><div className="status-chip">{humanize(trip.nextAction)}</div><TripTelegram trip={trip} /></div><h3>{tripPage ? <Link className="trip-card-link" to={tripPage}>{trip.title}</Link> : trip.title}</h3><p>{trip.destination || "Destination to be confirmed"}</p><small>{[trip.startDate, trip.endDate].filter(Boolean).join(" → ") || "Dates are flexible"}</small>{action}</article>;
 }
 
 const tripSchema = z.object({ destination: z.string().trim().min(2, "Add a destination").max(160), startDate: z.string().optional(), endDate: z.string().optional(), tripType: z.enum(["family", "group", "couple", "other"]) }).refine((value) => !value.startDate || !value.endDate || value.endDate > value.startDate, { message: "End date must follow the start date", path: ["endDate"] });
