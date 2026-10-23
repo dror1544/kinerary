@@ -19,6 +19,7 @@ import { PendingAttachments } from "../src/relay/pending-attachments.js";
 import { addressedMark, conversationMark, reactionAnswerMark, SILENCE_SENTINEL } from "../src/relay/stay-silent.js";
 import { confirmIntakeForChat, getSessionForChat, submitAnswerForChat } from "../src/interview.js";
 import { issueGroupBindingToken } from "../src/group-binding.js";
+import { groupAddLinkLine, groupAddUrl, organizerIntroText } from "../src/companion-intro.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
 import { testDatabaseUrl, testPool } from "./support/test-database.js";
 import { agentTextIsInLanguage } from "../src/relay/internal-leak.js";
@@ -2156,6 +2157,83 @@ describe("explicit addressing and reactions through dispatchUpdate (staging run 
       await setCompanionExpectsReply(fix.pool, chat, true);
       assert.deepEqual(await dispatch(fix, from(chat, "👍", DROR)), { kind: "ignore", reason: "NOT_ADDRESSED" });
       assert.equal((await dispatch(fix, from(chat, "Liv hi", DROR))).kind, "to_gateway");
+    });
+  });
+});
+
+describe("/group hands over the full add-to-group link, the same one the greeting sends", () => {
+  const BOT = { id: "8463178587", username: "Kinerary_bot" };
+  const tokenIn = (followUp: string | undefined): string => {
+    const m = /^\/group (\S+)$/.exec(followUp ?? "");
+    assert.ok(m, "the follow-up is still the copyable /group line");
+    return m![1];
+  };
+
+  test("an organizer's /group reply carries the link built by groupAddUrl with the issued token, and keeps its text", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const dm = "700000901";
+      await bindCompanion(fix, dm, "companion-japan");
+      const decision = await dispatchUpdate(fix.pool, msg(dm, "/group"), undefined, () => {}, BOT);
+      assert.equal(decision.kind, "group_intro");
+      if (decision.kind !== "group_intro") return;
+      const token = tokenIn(decision.followUp);
+      const url = groupAddUrl(BOT.username, token);
+      assert.equal(url, `https://t.me/Kinerary_bot?startgroup=${token}&admin=pin_messages+invite_users`);
+      assert.ok(url && decision.text.includes(url), "the reply contains the full link");
+      // The existing instructions are untouched, and the link is added after them.
+      assert.ok(decision.text.startsWith(DEFAULT_STRINGS.groupTokenIssued(token)));
+      assert.equal(decision.pin, false);
+      // The greeting builds the SAME link for the same token and handle: one builder, not a copy.
+      const greeting = organizerIntroText({
+        assistantName: "Rio", tripTitle: null, siteUrl: "https://x.example", language: "en",
+        botUsername: BOT.username, groupBindingToken: token,
+      });
+      assert.ok(url && greeting.includes(url));
+    });
+  });
+
+  test("a Hebrew trip gets the link line in Hebrew, with the same URL", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const dm = "700000902";
+      await bindCompanion(fix, dm, "companion-japan");
+      await fix.pool.query(
+        "UPDATE control_plane.trips SET companion_intro = $2::jsonb WHERE id = $1",
+        [fix.tripId, JSON.stringify({ assistant_name: "יפו", language: "he" })],
+      );
+      const decision = await dispatchUpdate(fix.pool, msg(dm, "/group"), undefined, () => {}, BOT);
+      assert.equal(decision.kind, "group_intro");
+      if (decision.kind !== "group_intro") return;
+      const token = tokenIn(decision.followUp);
+      const url = groupAddUrl(BOT.username, token)!;
+      assert.ok(decision.text.includes(groupAddLinkLine("he", url)));
+      assert.ok(decision.text.startsWith(DEFAULT_STRINGS.groupTokenIssued(token)));
+    });
+  });
+
+  test("with no bot handle the reply is the old one and the gap is logged, not silent", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const dm = "700000903";
+      await bindCompanion(fix, dm, "companion-japan");
+      const lines: string[] = [];
+      const decision = await dispatchUpdate(fix.pool, msg(dm, "/group"), undefined, (l) => lines.push(l), {});
+      assert.equal(decision.kind, "group_intro");
+      if (decision.kind !== "group_intro") return;
+      const token = tokenIn(decision.followUp);
+      assert.equal(decision.text, DEFAULT_STRINGS.groupTokenIssued(token));
+      assert.ok(lines.some((l) => l.includes("trip_bot.group_link_unavailable")));
+    });
+  });
+
+  test("the refusals are unchanged: a group chat and an unbound chat get the same sentence and no link", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "-1002000901", "companion-japan");
+      const inGroup = await dispatchUpdate(fix.pool, msg("-1002000901", "/group", "supergroup"), undefined, () => {}, BOT);
+      assert.deepEqual(inGroup, { kind: "reply", reply: { chatId: "-1002000901", text: DEFAULT_STRINGS.groupTokenUnavailable } });
+      const unbound = await dispatchUpdate(fix.pool, msg("700000999", "/group"), undefined, () => {}, BOT);
+      assert.deepEqual(unbound, { kind: "reply", reply: { chatId: "700000999", text: DEFAULT_STRINGS.groupTokenUnavailable } });
+      // Nobody got a token out of either.
+      const rows = await fix.pool.query("SELECT 1 FROM control_plane.telegram_group_binding_tokens WHERE trip_id = $1", [fix.tripId]);
+      assert.equal(rows.rowCount, 0);
     });
   });
 });

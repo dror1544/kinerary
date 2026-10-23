@@ -61,6 +61,8 @@ import { classifyTrigger, inboundFacts, type InboundFacts, type JudgeFacts, type
 import { coerceLanguage, uiString, type Language } from "../intake-copy.js";
 import {
   companionHelpText,
+  groupAddLinkLine,
+  groupAddUrl,
   groupBindingCommand,
   groupIntroText,
   proactiveChanged,
@@ -1005,11 +1007,20 @@ export async function dispatchUpdate(
     if (!issued.ok) {
       return { kind: "reply", reply: { chatId, text: strings.groupTokenUnavailable } };
     }
-    // Two messages: the instructions, then the line to copy on its own.
+    // The one-tap add-to-group link: the greeting's own builder (`groupAddUrl`),
+    // with this token as the payload, so what /group hands over and what the
+    // post-interview greeting sends are the same link. Without a bot handle
+    // there is no link; the reply then goes out as it always did, and the gap
+    // is logged rather than silent (the greeting does the same).
+    const addUrl = groupAddUrl(botIdentity.username, issued.token);
+    if (!addUrl) log(structuredLog("warn", "trip_bot.group_link_unavailable", { reason: "NO_BOT_USERNAME" }));
+    const addLine = addUrl ? groupAddLinkLine(await tripLanguage(db, route.tripId), addUrl) : null;
+    const instructions = strings.groupTokenIssued(issued.token);
+    // Two messages: the instructions (and the link), then the line to copy on its own.
     return {
       kind: "group_intro",
       chatId,
-      text: strings.groupTokenIssued(issued.token),
+      text: addLine ? `${instructions}\n\n${addLine}` : instructions,
       followUp: groupBindingCommand(issued.token),
       pin: false,
     };
