@@ -60,6 +60,14 @@ it("sign-up says 'Sign-up isn't open yet' when the server has no email configure
   expect(screen.getByRole("link", { name: "Sign in" })).toHaveAttribute("href", "/sign-in?return_to=%2Ftrips");
 });
 
+it("with email sign-up off but Google on, sign-up stays open for Google: no email form, and no 'isn't open' page", async () => {
+  mount("/sign-up", { capabilities: { google: true, googleClientId: "123-x.apps.googleusercontent.com", emailPassword: true, emailSignUp: false } });
+  expect(await screen.findByRole("heading", { name: "Create your account" })).toBeInTheDocument();
+  expect(await screen.findByText(/Sign-up by email isn.t open yet/)).toBeInTheDocument();
+  expect(screen.queryByLabelText("Email")).toBeNull();
+  expect(screen.queryByRole("heading", { name: "Sign-up isn't open yet" })).toBeNull();
+});
+
 it("a 503 SIGN_UP_UNAVAILABLE from the server turns the page into the same closed state", async () => {
   mount("/sign-up", { handler: (path) => path === "/v1/auth/sign-up" ? json({ error: "SIGN_UP_UNAVAILABLE" }, 503) : undefined });
   await screen.findByLabelText("Email");
