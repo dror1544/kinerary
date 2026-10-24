@@ -887,8 +887,17 @@ drifting. Notes on what you are filling in:
   code only, never the token or the address. A token is also single use and bound to the
   browser that asked: the page first calls `GET /v1/auth/google/nonce` (the api sets a
   five-minute HttpOnly cookie, `kit_gnonce`, and returns only its hash for Google to sign
-  into the token), and `POST /v1/auth/google` accepts the token only with that cookie, which
-  it clears whatever the outcome. A token's `azp`, when present, must be the client ID.
+  into the token), and `POST /v1/auth/google` accepts the token only with that cookie, at
+  most five minutes after the api issued it (the issue time is inside the secret the
+  token's nonce hashes), and only once: the nonce is spent in the sign-in transaction
+  (table `control_plane.google_signin_nonces`; a replay of the identical token and cookie is
+  `401 GOOGLE_SIGN_IN_FAILED`, logged with reason `NONCE_REPLAYED`; expired rows are
+  deleted by the next sign-in). The cookie is cleared once its nonce has matched, not on a
+  refusal that proves nothing about it, so another tab's attempt is not broken. An email
+  claim that is not a plain address (a second `@`, whitespace, `<>",`, non-ASCII) is
+  refused as `GOOGLE_SIGN_IN_FAILED` (reason `EMAIL_MALFORMED`), and a `@googlemail.com`
+  address is the same account as its `@gmail.com` spelling. A token's `azp`, when
+  present, must be the client ID.
   Google signs people in only for addresses **Google itself runs** (owner decision
   2026-10-23: "if it is a google account it will do the signing, otherwise regular
   signup"): `@gmail.com` and `@googlemail.com`, or a Workspace address whose token carries an

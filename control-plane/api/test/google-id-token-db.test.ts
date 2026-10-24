@@ -15,7 +15,7 @@ import { buildApp } from "../src/app.js";
 import { validateArchitectureProfile } from "../src/config.js";
 import { applyMigrations } from "../src/migrations.js";
 import { createOrVerifyPasswordIdentity, digestEmail } from "../src/password-identity.js";
-import { GoogleIdTokenClient, googleIsAuthoritativeFor, sha256, type PortalDependencies } from "../src/portal.js";
+import { GoogleIdTokenClient, canonicalGoogleEmail, googleIsAuthoritativeFor, isPlainAddrSpec, sha256, type PortalDependencies } from "../src/portal.js";
 import { PORTAL_SCOPE_POLICY } from "../src/portal-scope.js";
 import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
@@ -289,17 +289,33 @@ test("SINGLE USE: the nonce cookie is HttpOnly, scoped and short-lived; a token 
     assert.match(cleared, /Max-Age=0/);
     assert.match(cleared, /Path=\/v1\/auth\/google;/);
     assert.ok(cookieOf(ok), "and the session cookies are set alongside it");
-    // Replaying the identical token with the identical cookie (the browser having kept a copy): the secret is spent
-    // only on the browser side, so this is what the token's own `exp` and the rate limit are for - but a replay from
-    // anywhere without the cookie, which is every replay by someone who merely saw the token, is refused (above).
+    // A replay from anywhere without the cookie (every replay by someone who merely saw the token) is refused.
     const replayWithoutCookie = await google(app, { credential });
     assert.equal(replayWithoutCookie.statusCode, 401);
+    // And the identical token with the identical cookie, the browser having kept a copy, is refused too: the nonce
+    // is spent on the SERVER, in google_signin_nonces, not only cleared in the browser.
+    logs.length = 0;
+    const replay = await google(app, { credential }, { origin: ORIGIN, cookie });
+    assert.equal(replay.statusCode, 401);
+    assert.deepEqual(replay.json(), { error: "GOOGLE_SIGN_IN_FAILED" });
+    assert.equal(cookieOf(replay), undefined, "no session");
+    assert.deepEqual(logs.map((l) => JSON.parse(l).reason), ["NONCE_REPLAYED"]);
+    assert.equal((await pool.query("SELECT 1 FROM control_plane.google_signin_nonces WHERE nonce_digest = $1", [nonce])).rowCount, 1, "exactly one spent row");
 
-    // Every outcome clears it, a refusal included.
+    // A refusal that proves nothing about the cookie leaves it alone (it may be another tab's attempt): a token
+    // that fails verification, and a token whose nonce is not this cookie's.
     const failed = await bound(app, { aud: "999999999999-x.apps.googleusercontent.com" });
     const failedResponse = await google(app, { credential: failed.credential }, { origin: ORIGIN, cookie: failed.cookie });
     assert.equal(failedResponse.statusCode, 401);
-    assert.match(setCookies(failedResponse).find((c) => c.startsWith("kit_gnonce="))!, /Max-Age=0/);
+    assert.equal(setCookies(failedResponse).some((c) => c.startsWith("kit_gnonce=")), false, "verification failure: cookie left alone");
+    const mismatch = await google(app, { credential: idToken({ nonce: "f".repeat(64), email: addr("mm") }) }, { origin: ORIGIN, cookie: failed.cookie });
+    assert.equal(mismatch.statusCode, 401);
+    assert.equal(setCookies(mismatch).some((c) => c.startsWith("kit_gnonce=")), false, "nonce mismatch: cookie left alone");
+    // A refusal AFTER the nonce matched (here: an address Google does not run) does clear it.
+    const outsider = await bound(app, { email: addrAt("outsider", "outlook.com") });
+    const outsiderResponse = await google(app, { credential: outsider.credential }, { origin: ORIGIN, cookie: outsider.cookie });
+    assert.equal(outsiderResponse.statusCode, 401);
+    assert.match(setCookies(outsiderResponse).find((c) => c.startsWith("kit_gnonce="))!, /Max-Age=0/);
     // And a refused Origin does not spend a legitimate page's nonce.
     const keep = await bound(app, { email: addr("keep"), sub: `g-keep-${suffix}` });
     const foreign = await google(app, { credential: keep.credential }, { origin: "http://attacker.example.test", cookie: keep.cookie });
@@ -472,6 +488,149 @@ test("the 'use email sign-up' answer is given only for a genuine, correctly boun
   } finally { await app.close(); }
 });
 
+
+/** A nonce the server "issued" at `issuedAt` (epoch seconds), made the way the GET route makes one, so a test can age it. */
+function nonceIssuedAt(issuedAt: number, claims: Record<string, unknown> = {}) {
+  const secret = `${issuedAt}.${randomBytes(32).toString("base64url")}`;
+  const nonce = createHash("sha256").update(secret).digest("hex");
+  return { credential: idToken({ nonce, ...claims }), cookie: `kit_gnonce=${secret}`, nonce };
+}
+const nowSeconds = () => Math.floor(Date.now() / 1000);
+
+test("SINGLE USE ON THE SERVER: the identical token and cookie give 200 once, then 401 NONCE_REPLAYED, and a replay creates and changes nothing", { skip }, async () => {
+  const { app, logs } = harness();
+  try {
+    const email = addr("replay"), sub = `g-replay-${suffix}`;
+    const token = await bound(app, { email, sub });
+    const first = await google(app, { credential: token.credential }, { origin: ORIGIN, cookie: token.cookie });
+    assert.equal(first.statusCode, 200, first.body);
+    const sessionsAfterFirst = (await accountTables()).sessions;
+    logs.length = 0;
+    for (let i = 0; i < 3; i++) {
+      const replay = await google(app, { credential: token.credential }, { origin: ORIGIN, cookie: token.cookie });
+      assert.equal(replay.statusCode, 401, `replay ${i}`);
+      assert.deepEqual(replay.json(), { error: "GOOGLE_SIGN_IN_FAILED" });
+      assert.equal(cookieOf(replay), undefined);
+    }
+    assert.deepEqual(logs.map((l) => JSON.parse(l).reason), ["NONCE_REPLAYED", "NONCE_REPLAYED", "NONCE_REPLAYED"]);
+    assert.equal((await accountTables()).sessions, sessionsAfterFirst, "no session from a replay");
+    // Four concurrent posts of the same pair: exactly one wins.
+    const racing = await bound(app, { email: addr("race"), sub: `g-race-${suffix}` });
+    const results = await Promise.all([1, 2, 3, 4].map(() => google(app, { credential: racing.credential }, { origin: ORIGIN, cookie: racing.cookie })));
+    assert.deepEqual(results.map((r) => r.statusCode).sort(), [200, 401, 401, 401]);
+    // A refusal that did not spend (the token was not for an address Google runs) can be retried, with the same answer.
+    const outsider = await bound(app, { email: addrAt("late", "outlook.com") });
+    for (let i = 0; i < 2; i++) assert.equal((await google(app, { credential: outsider.credential }, { origin: ORIGIN, cookie: outsider.cookie })).json().error, "GOOGLE_USE_EMAIL_SIGN_UP");
+  } finally { await app.close(); }
+});
+
+test("a nonce secret issued more than five minutes ago is refused (NONCE_EXPIRED), one from the future too, a fresh one works", { skip }, async () => {
+  const { app, logs } = harness();
+  try {
+    const email = addr("expiry"), sub = `g-expiry-${suffix}`;
+    for (const [name, issued] of [["6 minutes old", nowSeconds() - 360], ["a day old", nowSeconds() - 86400], ["issued in the future", nowSeconds() + 3600]] as const) {
+      const token = nonceIssuedAt(issued, { email, sub });
+      logs.length = 0;
+      const response = await google(app, { credential: token.credential }, { origin: ORIGIN, cookie: token.cookie });
+      assert.equal(response.statusCode, 401, name);
+      assert.deepEqual(response.json(), { error: "GOOGLE_SIGN_IN_FAILED" });
+      assert.deepEqual(logs.map((l) => JSON.parse(l).reason), ["NONCE_EXPIRED"], name);
+      assert.equal((await pool.query("SELECT 1 FROM control_plane.google_signin_nonces WHERE nonce_digest = $1", [token.nonce])).rowCount, 0, `${name}: nothing spent`);
+    }
+    assert.equal((await accountsFor(email)).length, 0);
+    // The edge: 4 minutes old is accepted. The age cannot be edited into a token's cookie: it is inside what the nonce hashes.
+    const fresh = nonceIssuedAt(nowSeconds() - 240, { email, sub });
+    assert.equal((await google(app, { credential: fresh.credential }, { origin: ORIGIN, cookie: fresh.cookie })).statusCode, 200);
+    const edited = nonceIssuedAt(nowSeconds() - 3600, { email, sub });
+    const forged = edited.cookie.replace(/=\d+\./, `=${nowSeconds()}.`);
+    assert.equal((await google(app, { credential: edited.credential }, { origin: ORIGIN, cookie: forged })).statusCode, 401, "a re-dated cookie no longer matches the token's nonce");
+    // A cookie that is not in the issued shape (what an older release set) is a mismatch.
+    const legacy = "legacy-secret-without-issue-time";
+    const legacyToken = idToken({ nonce: createHash("sha256").update(legacy).digest("hex"), email: addr("legacy") });
+    assert.equal((await google(app, { credential: legacyToken }, { origin: ORIGIN, cookie: `kit_gnonce=${legacy}` })).statusCode, 401);
+  } finally { await app.close(); }
+});
+
+test("spent nonces are purged once past their expiry, by the next sign-in, and only those", { skip }, async () => {
+  const { app } = harness();
+  try {
+    const old = createHash("sha256").update(`old-${suffix}`).digest("hex");
+    const live = createHash("sha256").update(`live-${suffix}`).digest("hex");
+    await pool.query("INSERT INTO control_plane.google_signin_nonces(nonce_digest, used_at, expires_at) VALUES ($1, now() - interval '2 hours', now() - interval '1 hour'), ($2, now(), now() + interval '5 minutes')", [old, live]);
+    const response = await signInAs(app, { email: addr("purge"), sub: `g-purge-${suffix}` });
+    assert.equal(response.statusCode, 200, response.body);
+    const rows = (await pool.query("SELECT nonce_digest FROM control_plane.google_signin_nonces WHERE nonce_digest = ANY($1)", [[old, live]])).rows.map((r) => r.nonce_digest);
+    assert.deepEqual(rows, [live], "the expired row is gone, the live one is not");
+    assert.equal((await pool.query("SELECT count(*)::int AS n FROM control_plane.google_signin_nonces WHERE expires_at < now()")).rows[0].n, 0, "no expired row remains");
+    await pool.query("DELETE FROM control_plane.google_signin_nonces WHERE nonce_digest = $1", [live]);
+  } finally { await app.close(); }
+});
+
+test("googlemail.com and gmail.com are one mailbox: a googlemail.com token links to the existing gmail.com account", { skip }, async () => {
+  const { app } = harness();
+  try {
+    const local = `same-${suffix}`;
+    const seeded = await createOrVerifyPasswordIdentity(pool, { email: `${local}@gmail.com`, password: "existing-organizer-secret" });
+    assert.ok(seeded.ok);
+    const owner = seeded.identity.providerSubjectId;
+    const users = (await pool.query("SELECT count(*)::int AS n FROM control_plane.users")).rows[0].n as number;
+    const viaGooglemail = await signInAs(app, { email: `${local}@googlemail.com`, sub: `g-gm-${suffix}` });
+    assert.equal(viaGooglemail.statusCode, 200, viaGooglemail.body);
+    assert.equal((await me(app, cookieOf(viaGooglemail)!.cookie)).json().id, owner, "the existing gmail.com account");
+    assert.deepEqual((await googleRows(`g-gm-${suffix}`)).map((r) => r.user_id), [owner]);
+    assert.equal((await pool.query("SELECT count(*)::int AS n FROM control_plane.users")).rows[0].n, users, "no second user");
+    // The other way round: a googlemail.com first sign-in creates the account under gmail.com.
+    const fresh = `fresh-${suffix}`;
+    const created = await signInAs(app, { email: `${fresh}@GoogleMail.com`, sub: `g-gm2-${suffix}` });
+    assert.equal(created.statusCode, 200, created.body);
+    const accounts = await accountsFor(`${fresh}@gmail.com`);
+    assert.equal(accounts.length, 1);
+    assert.equal(accounts[0]!.user_id, (await me(app, cookieOf(created)!.cookie)).json().id);
+    assert.equal((await accountsFor(`${fresh}@googlemail.com`)).length, 0, "no googlemail.com-keyed identity");
+    assert.equal(canonicalGoogleEmail(" A@GoogleMail.com "), "a@gmail.com");
+    assert.equal(canonicalGoogleEmail("a@notgooglemail.com"), "a@notgooglemail.com");
+    assert.equal(canonicalGoogleEmail("a@x.googlemail.com"), "a@x.googlemail.com", "only the bare domain");
+  } finally { await app.close(); }
+});
+
+test("an email claim that is not a plain addr-spec is refused as GOOGLE_SIGN_IN_FAILED, before anything is looked up", { skip }, async () => {
+  const { app, logs } = harness();
+  try {
+    const before = await accountTables();
+    const malformed = [
+      "a@evil.example.test@gmail.com", "x@gmail.com@evil.example.test", " x@gmail.com", "x@gmail.com ", "x@gmail.com\n", "x y@gmail.com", "\tx@gmail.com",
+      "<x@gmail.com>", "\"x\"@gmail.com", "x,y@gmail.com", "\"x@evil.example.test\"@gmail.com", "x@@gmail.com", "@gmail.com", "x@", "x",
+      "x@gma\u00efl.com", "\u00ef@gmail.com", "x\u0000@gmail.com", "x@gmail.com\u2028", `${"a".repeat(250)}@gmail.com`,
+    ];
+    for (const email of malformed) {
+      logs.length = 0;
+      const response = await signInAs(app, { email, sub: `g-malformed-${suffix}` });
+      assert.equal(response.statusCode, 401, JSON.stringify(email));
+      assert.deepEqual(response.json(), { error: "GOOGLE_SIGN_IN_FAILED" }, JSON.stringify(email));
+      assert.equal(cookieOf(response), undefined);
+      assert.equal(JSON.parse(logs[0]!).reason, "EMAIL_MALFORMED", JSON.stringify(email));
+    }
+    assert.equal((await googleRows(`g-malformed-${suffix}`)).length, 0);
+    // (A refusal records one failure in the funnel, as every GOOGLE_SIGN_IN_FAILED does; the account tables do not move.)
+    const { funnel: _funnel, ...afterTables } = await accountTables();
+    const { funnel: _funnelBefore, ...beforeTables } = before;
+    assert.deepEqual(afterTables, beforeTables, "no user, identity, credential or session row");
+    for (const [email, ok] of [["x@gmail.com", true], ["a.b+c@gmail.com", true], ["x@evil.test@gmail.com", false], [" x@gmail.com", false]] as const) assert.equal(isPlainAddrSpec(email), ok, email);
+  } finally { await app.close(); }
+});
+
+test("two tabs: a request whose nonce does not match this cookie leaves the cookie, so the other tab's attempt still completes", { skip }, async () => {
+  const { app } = harness();
+  try {
+    const tabA = await bound(app, { email: addr("taba"), sub: `g-taba-${suffix}` });
+    // Tab B asked later, so the browser holds B's cookie and A's token is posted with it: a mismatch, which must not clear B's cookie.
+    const tabB = await bound(app, { email: addr("tabb"), sub: `g-tabb-${suffix}` });
+    const aWithB = await google(app, { credential: tabA.credential }, { origin: ORIGIN, cookie: tabB.cookie });
+    assert.equal(aWithB.statusCode, 401);
+    assert.equal(setCookies(aWithB).some((c) => c.startsWith("kit_gnonce=")), false, "the cookie is not cleared");
+    assert.equal((await google(app, { credential: tabB.credential }, { origin: ORIGIN, cookie: tabB.cookie })).statusCode, 200, "tab B still completes with the cookie it still holds");
+  } finally { await app.close(); }
+});
 
 test("returnTo is honoured only as a same-origin path, including after normalisation (/.//host is //host)", { skip }, async () => {
   const { app } = harness();

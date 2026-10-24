@@ -53,6 +53,12 @@ const GOOGLE_NONCE_COOKIE = "kit_gnonce";
 const GOOGLE_NONCE_PATH = "/v1/auth/google";
 /** What the page hands Google Identity Services as `nonce`: the hash of the secret only the cookie holds. */
 const googleNonceFor = (secret: string): string => createHash("sha256").update(secret).digest("hex");
+/** How long a nonce secret may be used after the server issued it (the cookie's Max-Age is the same, but only the server's word counts). */
+const GOOGLE_NONCE_MAX_AGE_SECONDS = 300;
+/** The issue time is the server's own (written at GET); this only absorbs a second instance's clock being a little ahead. */
+const GOOGLE_NONCE_CLOCK_SKEW_SECONDS = 30;
+/** The cookie's secret is `<issued-at, epoch seconds>.<random>`; the issue time is inside what the token's nonce hashes. */
+const GOOGLE_NONCE_SECRET = /^([0-9]{9,12})\.[A-Za-z0-9_-]{20,64}$/;
 
 function safeEqual(left: string, right: string): boolean {
   const a = Buffer.from(left);
@@ -155,7 +161,8 @@ export interface GoogleIdentity {
 export type GoogleRefusal =
   | "CREDENTIAL_MISSING" | "SIGNATURE_INVALID" | "AUDIENCE_MISMATCH" | "ISSUER_MISMATCH" | "TOKEN_EXPIRED"
   | "TOKEN_MALFORMED" | "SUBJECT_MISSING" | "EMAIL_MISSING" | "EMAIL_UNVERIFIED" | "AZP_MISMATCH"
-  | "NONCE_MISSING" | "NONCE_MISMATCH" | "EMAIL_NOT_GOOGLE_AUTHORITATIVE" | "VERIFY_FAILED";
+  | "NONCE_MISSING" | "NONCE_MISMATCH" | "NONCE_EXPIRED" | "NONCE_REPLAYED" | "EMAIL_MALFORMED"
+  | "EMAIL_NOT_GOOGLE_AUTHORITATIVE" | "VERIFY_FAILED";
 
 export class GoogleSignInRefused extends Error {
   constructor(readonly reason: GoogleRefusal) { super(reason); this.name = "GoogleSignInRefused"; }
@@ -222,6 +229,29 @@ export function googleIsAuthoritativeFor(email: string, hostedDomain?: string): 
   if (!domain) return false;
   if (domain === "gmail.com" || domain === "googlemail.com") return true;
   return typeof hostedDomain === "string" && hostedDomain.trim() !== "" && domain === hostedDomain.trim().toLowerCase();
+}
+
+/**
+ * Whether a claim is a plain addr-spec, the only shape an email claim may have: ASCII printable only (no
+ * whitespace, no control characters, nothing beyond U+007E), exactly one "@" with something either side, and none of
+ * `<>",`. A claim like `a@evil.test@gmail.com`, ` x@gmail.com`, or `"x@evil.test"@gmail.com` is refused outright
+ * rather than interpreted, because the authority check and the account lookup would otherwise each have to guess
+ * which "@" counts. Google does not send such a claim; this is defence in depth against the day one reaches here.
+ */
+export function isPlainAddrSpec(email: string): boolean {
+  if (email.length > 254 || !/^[\x21-\x7e]+$/.test(email) || /[<>",]/.test(email)) return false;
+  const parts = email.split("@");
+  return parts.length === 2 && parts[0]!.length > 0 && parts[1]!.length > 0;
+}
+
+/**
+ * The one account an address names. Google runs @googlemail.com and @gmail.com as the same mailbox, so both
+ * resolve to gmail.com before the account lookup: otherwise the same person holds two accounts by which spelling
+ * Google happened to put in the token.
+ */
+export function canonicalGoogleEmail(email: string): string {
+  const lowered = email.trim().toLowerCase();
+  return lowered.endsWith("@googlemail.com") ? `${lowered.slice(0, -"googlemail.com".length)}gmail.com` : lowered;
 }
 
 function refusalFor(message: string): GoogleRefusal {
@@ -1044,13 +1074,21 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
   //
   // SINGLE USE, AND BOUND TO THE BROWSER THAT ASKED. A signed ID token is a bearer credential that stays valid for
   // about an hour, and it is readable (it is a JWT), so one that leaks (a log, a proxy, a screenshot) could be posted
-  // by anyone. So the page first calls GET /v1/auth/google/nonce: the server makes a random secret, sets it in a
-  // short-lived HttpOnly cookie scoped to /v1/auth/google, and returns only its SHA-256 as the `nonce` the page hands
-  // Google. Google puts that nonce in the token; the POST accepts the token only if SHA-256(cookie) equals the token's
-  // nonce, and clears the cookie whatever the outcome. A leaked token shows the hash, not the secret, so it cannot be
-  // replayed (an attacker cannot forge the cookie from the token), and even the browser that obtained it has spent
-  // the secret. Chosen over recording used token hashes until `exp`: that needs a table (a migration) or memory (lost
-  // on restart, wrong with two instances), and only stops a second use, where this also stops a use from anywhere else.
+  // by anyone. So the page first calls GET /v1/auth/google/nonce: the server makes a secret `<issued-at>.<random>`,
+  // sets it in a short-lived HttpOnly cookie scoped to /v1/auth/google, and returns only its SHA-256 as the `nonce`
+  // the page hands Google. Google puts that nonce in the token. The POST accepts the token only if
+  //   1. SHA-256(cookie) equals the token's nonce (a leaked token shows the hash, not the secret, and an attacker
+  //      cannot forge the cookie from the token), and
+  //   2. the issue time inside the cookie is at most 5 minutes old (it is covered by that hash, so it cannot be
+  //      edited without invalidating the token: no HMAC key or server-side record of issued nonces is needed), and
+  //   3. the nonce is not yet in control_plane.google_signin_nonces. It is SPENT there, inside the sign-in
+  //      transaction, by INSERT ... ON CONFLICT DO NOTHING; no row inserted means a replay (NONCE_REPLAYED), so a
+  //      captured token+cookie pair works once, even from the browser that holds the cookie. Clearing the cookie is
+  //      only a courtesy; it is not what makes the nonce single-use.
+  // A refusal that proves nothing about the cookie (bad token, mismatched nonce, a foreign Origin) leaves the cookie
+  // alone, so another tab's attempt in the same browser is not broken by it; only a request whose nonce matched the
+  // cookie clears it. Rows are kept until 10 minutes after issue, longer than the 5 minutes they could be accepted
+  // for, and the next sign-in deletes the expired ones. A failed sign-in transaction rolls the spend back.
   const googleIpAttempts: Attempts = new Map();
   const googleNonceIpAttempts: Attempts = new Map();
   const nonceCookie = (value: string, maxAge: number) =>
@@ -1061,8 +1099,8 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     if (!admitLogin(googleNonceIpAttempts, request.ip, 60)) {
       return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
     }
-    const secret = base64url(32);
-    reply.header("set-cookie", nonceCookie(secret, 300));
+    const secret = `${Math.floor(Date.now() / 1000)}.${base64url(32)}`;
+    reply.header("set-cookie", nonceCookie(secret, GOOGLE_NONCE_MAX_AGE_SECONDS));
     return { nonce: googleNonceFor(secret) };
   });
   app.post("/v1/auth/google", async (request, reply) => {
@@ -1072,9 +1110,10 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
       return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
     }
     if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
-    // From here the secret is spent, whatever the outcome.
     const nonceSecret = parseCookies(request.headers.cookie)[GOOGLE_NONCE_COOKIE];
-    reply.header("set-cookie", nonceCookie("", 0));
+    // Cleared only once the token's nonce is proven to be this cookie's (see SINGLE USE): a refusal before that says
+    // nothing about this cookie, and it may belong to another tab's attempt.
+    const clearNonceCookie = () => { reply.header("set-cookie", nonceCookie("", 0)); };
     const body = jsonBody(request);
     const refuse = async (reason: GoogleRefusal | "ACCOUNT_INACTIVE") => {
       if (reason === "EMAIL_NOT_GOOGLE_AUTHORITATIVE") {
@@ -1095,15 +1134,30 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
       return refuse(error instanceof GoogleSignInRefused ? error.reason : "VERIFY_FAILED");
     }
     if (!identity.email || !identity.emailVerified) return refuse("EMAIL_UNVERIFIED");
+    if (!isPlainAddrSpec(identity.email)) return refuse("EMAIL_MALFORMED");
     if (!nonceSecret) return refuse("NONCE_MISSING");
-    if (!identity.nonce || !safeEqual(googleNonceFor(nonceSecret), identity.nonce)) return refuse("NONCE_MISMATCH");
+    const issued = GOOGLE_NONCE_SECRET.exec(nonceSecret);
+    if (!issued || !identity.nonce || !safeEqual(googleNonceFor(nonceSecret), identity.nonce)) return refuse("NONCE_MISMATCH");
+    // From here the token is bound to this cookie, and the cookie is of no further use whatever the outcome.
+    clearNonceCookie();
+    const issuedAt = Number(issued[1]);
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    if (nowSeconds - issuedAt > GOOGLE_NONCE_MAX_AGE_SECONDS || issuedAt - nowSeconds > GOOGLE_NONCE_CLOCK_SKEW_SECONDS) return refuse("NONCE_EXPIRED");
     // Last of the token checks, so that only a token that is genuine AND bound to this browser can learn this answer;
     // and before any lookup, so it cannot depend on whether the address already has an account.
     if (!googleIsAuthoritativeFor(identity.email, identity.hd)) return refuse("EMAIL_NOT_GOOGLE_AUTHORITATIVE");
+    const email = canonicalGoogleEmail(identity.email);
     const subjectDigest = sha256(`google:${identity.subject}`);
     const client = await deps.db.connect();
     try {
       await client.query("BEGIN");
+      // Spend the nonce. Expired rows go first (opportunistic purge: no job), then the insert; no row back is a replay.
+      await client.query("DELETE FROM control_plane.google_signin_nonces WHERE expires_at < now()");
+      const spent = await client.query(
+        `INSERT INTO control_plane.google_signin_nonces(nonce_digest, expires_at)
+         VALUES ($1, to_timestamp($2)) ON CONFLICT (nonce_digest) DO NOTHING RETURNING 1`,
+        [identity.nonce, issuedAt + 2 * GOOGLE_NONCE_MAX_AGE_SECONDS]);
+      if (!spent.rows[0]) { await client.query("ROLLBACK"); return await refuse("NONCE_REPLAYED"); }
       const known = await client.query<{ user_id: string }>(
         "SELECT user_id FROM control_plane.user_identities WHERE provider = 'google' AND provider_subject_digest = $1", [subjectDigest]);
       let userId = known.rows[0]?.user_id;
@@ -1112,10 +1166,10 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
         // that address (one address, one user_id: password-identity.ts), creating it if there is none: a new
         // address is a new organizer account (sign-up auto-approves), an existing one (password, invitation,
         // email sign-up) is the same person arriving by another door and gets the Google identity attached.
-        userId = await resolveOrCreateEmailAccount(client, identity.email, identity.displayName);
+        userId = await resolveOrCreateEmailAccount(client, email, identity.displayName);
         // A credential nobody knows, so the account cannot be claimed by typing its address into POST /v1/signup;
         // it never overwrites an existing one. Google or password recovery (portal-email-auth.ts) is the way in.
-        await ensureUnknownPasswordCredential(client, userId, identity.email);
+        await ensureUnknownPasswordCredential(client, userId, email);
         const attached = await client.query<{ user_id: string }>(
           `INSERT INTO control_plane.user_identities(id, user_id, provider, provider_subject_digest, verified_at)
            VALUES ($1, $2, 'google', $3, now())
