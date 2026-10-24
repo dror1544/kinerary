@@ -825,7 +825,6 @@ the trips that should be reachable are built, or install it on the existing ones
 | `RUNTIME_COOKIE_SECRET` | the gateway's cookie-sealing secret: at least 32 random bytes, independent of every other secret |
 | `WEB_BIND_IP`, `PORTAL_PORT`, `RUNTIME_GATEWAY_PORT` | where the ingress reaches the two services. Loopback (`127.0.0.1`), `4173` and `4320` unless set — the same posture as `CONTROL_PLANE_BIND_IP` for the api |
 | `RUNTIME_PUBLIC_SUFFIXES`, `RUNTIME_SAME_SITE_OK`, `RUNTIME_UPSTREAM_TIMEOUT_MS` | gateway tuning, usually unset (see "Same site" below) |
-| `GOOGLE_WEB_CLIENT_ID`, `GOOGLE_WEB_CLIENT_SECRET` | optional pair, only if the profile's `web` block names them |
 
 These are plain `vm.env` variables like `CONTROL_PLANE_OPERATOR_KEY`, not files
 under `.local-secrets/`: the api and the gateway each read their secret from the
@@ -849,14 +848,102 @@ drifting. Notes on what you are filling in:
   gateway fetches those hostnames from inside its container, so they must resolve
   and answer from the VM.
 - Secret references in the `web` block: `env://RUNTIME_EXCHANGE_KEY` and
-  (optionally) `env://GOOGLE_WEB_CLIENT_ID` / `env://GOOGLE_WEB_CLIENT_SECRET` are the
+  (optionally) `env://PORTAL_EMAIL_API_KEY` are the
   only `env://` names the api container is given. A bot token for the Mini App is
   `file:///run/secrets/telegram_creds` (already mounted; it is the one bot's token).
   `kinerary-cp-release plan` and `upgrade` refuse a profile that names any other
   `env://` variable, or one that is unset, before anything is switched.
-- Google: add `google_client_id_secret_ref` and `google_client_secret_ref` **together**
-  (the schema requires both) and set the two variables; the redirect URI to register
-  is `<PORTAL_ORIGIN>/v1/auth/google/callback`. Left out, sign-in is email and password.
+- **Sign in with Google** (`web.google_client_id`; owner decision 2026-10-23). The portal
+  uses Google Identity Services: the page draws Google's button from a **public** OAuth
+  client ID, Google hands back a signed ID token, and `POST /v1/auth/google` verifies it
+  (signature, expiry, issuer, and the audience, which must be this client ID). There is
+  **no client secret, no env variable and no redirect URI**. It covers the portal only
+  (creating trips); trip sites have their own sign-in and are untouched. Steps, once:
+  1. In the Google Cloud console, *APIs & Services*, *Credentials*, *Create credentials*,
+     *OAuth client ID*, application type **Web application**. (If the project has no
+     consent screen yet, create it; the default `openid`, `email` and `profile` scopes
+     are all this needs, and publishing status must be *In production* or only listed
+     test users can sign in.)
+  2. Under **Authorized JavaScript origins** add the portal origin exactly as it is in
+     the profile's `web.public_origin`: scheme and host (and port, if any), no path, no
+     trailing slash, e.g. `https://<PORTAL_ORIGIN host>`. Add every other origin the
+     portal is served from (a staging host, `http://localhost:<port>` for local review).
+     Leave **Authorized redirect URIs** empty: nothing redirects.
+  3. Copy the **Client ID** (it ends in `.apps.googleusercontent.com`) into the profile:
+     `"google_client_id": "<id>.apps.googleusercontent.com"`. It is not a secret and is
+     served to every visitor by `GET /v1/auth/capabilities`, so it is a plain string in
+     the profile, not an `env://` reference and not in `vm.env`.
+  4. Roll the api (`kinerary-cp-release upgrade`). Check it: `GET /v1/auth/capabilities`
+     answers `"google": true` and `"googleClientId": "…"`. Left out, Google sign-in is
+     **off**, the api logs `google_sign_in.disabled` at boot, and sign-in is email and
+     password.
+
+  What it does: sign-up and sign-in in one. A Google account whose address Google has
+  verified (`email_verified` is exactly `true`) either creates a new organizer account for
+  that address or, for an address that already has one (password, invitation or email
+  sign-up), attaches the Google identity to it: one address is one user. Every failure
+  (garbage, bad signature, wrong audience or issuer, expired, unverified address) is the
+  same `401 GOOGLE_SIGN_IN_FAILED`; the api logs `google_sign_in.refused` with a reason
+  code only, never the token or the address. A token is also single use and bound to the
+  browser that asked: the page first calls `GET /v1/auth/google/nonce` (the api sets a
+  five-minute HttpOnly cookie, `kit_gnonce`, and returns only its hash for Google to sign
+  into the token), and `POST /v1/auth/google` accepts the token only with that cookie, at
+  most five minutes after the api issued it (the issue time is inside the secret the
+  token's nonce hashes), and only once: the nonce is spent in the sign-in transaction
+  (table `control_plane.google_signin_nonces`; a replay of the identical token and cookie is
+  `401 GOOGLE_SIGN_IN_FAILED`, logged with reason `NONCE_REPLAYED`; expired rows are
+  deleted by the next sign-in). The cookie is cleared once its nonce has matched, not on a
+  refusal that proves nothing about it, so another tab's attempt is not broken. An email
+  claim that is not a plain address (a second `@`, whitespace, `<>",`, non-ASCII) is
+  refused as `GOOGLE_SIGN_IN_FAILED` (reason `EMAIL_MALFORMED`), and a `@googlemail.com`
+  address is the same account as its `@gmail.com` spelling. A token's `azp`, when
+  present, must be the client ID.
+  Google signs people in only for addresses **Google itself runs** (owner decision
+  2026-10-23: "if it is a google account it will do the signing, otherwise regular
+  signup"): `@gmail.com` and `@googlemail.com`, or a Workspace address whose token carries an
+  `hd` claim equal to the address's domain (exact match, not a suffix). Any other address,
+  an `outlook.com` or company address that is merely attached to a Google account, is
+  refused with `401 {"error":"GOOGLE_USE_EMAIL_SIGN_UP"}` and the page says "This address
+  isn't a Google account", with links to the email sign-up and sign-in. The answer is the
+  same whether or not that address already has an account, nothing is written, and the
+  api logs `google_sign_in.refused` with reason `EMAIL_NOT_GOOGLE_AUTHORITATIVE` only. It
+  is given only for a genuine token bound to the asking browser; anything else is the
+  ordinary `GOOGLE_SIGN_IN_FAILED`. The button is not drawn inside the Telegram
+  Mini App, because Google's popup cannot open there.
+  The previous profile fields `google_client_id_secret_ref` and `google_client_secret_ref`
+  are **refused** (the api will not boot with them, and `kinerary-cp-release plan` says
+  so first), with a message naming `web.google_client_id`; remove both when you add it.
+  The portal's nginx lets `accounts.google.com` scripts, frames and connections through
+  on the `/sign-in` and `/sign-up` documents only (`web/nginx.conf`,
+  `@google_sign_in_shell`); every other page's policy does not mention Google, and the
+  `/mini-app` framing policy is unchanged.
+- **Email for the portal's own sign-up and password reset** (`web.email_provider`,
+  `web.email_api_key_secret_ref`, `web.email_from`). `email_provider` is `"resend"`
+  (POST `https://api.resend.com/emails` with the key as a bearer token; the key
+  reference and the sender address are both required) or `"log"` (sends nothing;
+  refused in a production profile). Leave all three out and email is **off**: the
+  routes `POST /v1/auth/sign-up` and `/v1/auth/password/forgot` answer 503
+  `SIGN_UP_UNAVAILABLE`, `GET /v1/auth/capabilities` says `emailSignUp: false`, the
+  page says "Sign-up isn't open yet", and the api logs `email_auth.disabled` at
+  boot. The links in the messages are built from `web.public_origin`. The address,
+  domain and key live in the deployment's profile and secrets, never in this
+  repository. **The key goes in `vm.env` as `PORTAL_EMAIL_API_KEY`** and the profile
+  names it as `"email_api_key_secret_ref": "env://PORTAL_EMAIL_API_KEY"`:
+  `kinerary-cp-release` refuses an `env://` name outside its allow-list
+  (`WEB_API_ENV` in `vm-release.py`, mirrored in `compose.vm.yml`), and
+  `PORTAL_EMAIL_API_KEY` is on it, so `plan` refuses a profile that names it
+  while `vm.env` leaves it empty. The sign-up flow itself: a new organizer gives an
+  address only, is emailed a link, and chooses their name and password on the page
+  the link opens (opening it spends nothing; the submit does). Neither is asked
+  for at sign-up, because anyone can start a sign-up for anyone's address and
+  would otherwise know the password or write the name. Only a strict ASCII
+  address is accepted (400 `INVALID_EMAIL` otherwise), and sending is bounded by
+  persistent budgets, not memory: 5 messages per address per hour and 60 in all per
+  minute; past either the request is answered as usual, nothing is sent, and the
+  api logs `email_auth.address_send_budget_exhausted` or
+  `email_auth.global_send_budget_exhausted`. A reset also revokes the user's
+  unredeemed Telegram link tokens and interview links. Like the Mini App fields,
+  the profile schema is strict: add these keys only in the same step as an upgrade to a revision that contains this change.
 - **Telegram Mini App fields** (`web.telegram_bot_token_secret_ref`,
   `web.telegram_init_data_max_age_seconds`) and **`public_api.trust_proxy`** arrive
   with the Mini App sign-in change (#442, PR #456). The profile schema is strict, so
@@ -1419,9 +1506,12 @@ it the routes are not mounted at all, and a key on one side only reads as a
 401. The fleet monitor reaches the same tool through the `cpinvite` forced
 command — install and rules in `.agents/skills/organizer-invites/SKILL.md`.
 
-There is no password reset behind any of this. The control plane has no such
-route for organizers, and an invited account is deliberately given no password
-credential at all.
+An invited account holds a credential nobody knows (it is not password-less),
+and since 2026-10-23 its owner can set a real password with the portal's
+"Forgot password" link (`POST /v1/auth/password/forgot`, then `/reset-password`),
+provided the `web` block configures email (below). Without email those routes
+answer 503 `SIGN_UP_UNAVAILABLE`, and an invited organizer still reaches the
+trip through Telegram or Google on the same verified address.
 
 ## Manual test
 

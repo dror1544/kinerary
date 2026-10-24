@@ -429,9 +429,13 @@ test("the real portal server boots without Google credentials and advertises ema
   try {
     const response = await fetch(`http://127.0.0.1:${port}/v1/auth/capabilities`);
     assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), { google: false, emailPassword: true, telegramMiniApp: false });
-    const google = await fetch(`http://127.0.0.1:${port}/v1/auth/google/start`);
+    assert.deepEqual(await response.json(), { google: false, emailPassword: true, emailSignUp: false, telegramMiniApp: false });
+    const google = await fetch(`http://127.0.0.1:${port}/v1/auth/google`, {
+      method: "POST", headers: { "content-type": "application/json", origin: `http://127.0.0.1:${port}` }, body: JSON.stringify({ credential: "x" }),
+    });
     assert.equal(google.status, 503);
+    // Unset is a downgrade, not an error, so the boot log says so.
+    assert.match(server.stderr(), /"event":"google_sign_in.disabled"/);
     // No web.telegram_bot_token_secret_ref: the Mini App feature is off and the
     // boot log says why (a downgrade nobody can see in the conversation).
     assert.match(server.stderr(), /"event":"mini_app.disabled"/);
@@ -440,6 +444,42 @@ test("the real portal server boots without Google credentials and advertises ema
     });
     assert.equal(miniApp.status, 503);
   } finally { await server.stop(); }
+});
+
+test("the real portal server says why email sign-up is off, and answers 503 SIGN_UP_UNAVAILABLE rather than pretending", async () => {
+  const port = await freePort(), workerPort = await freePort();
+  const web = (extra: Record<string, unknown>) => ({
+    public_origin: `http://127.0.0.1:${port}`, runtime_origin: "http://127.0.0.1:4320",
+    runtime_exchange_key_secret_ref: "env://KINERARY_TEST_RUNTIME_EXCHANGE_KEY",
+    runtime_upstream_host_suffixes: ["internal"], telegram_bot_username: "kinerary_bot", ...extra,
+  });
+  const asks = (origin: string) => fetch(`${origin}/v1/auth/sign-up`, {
+    method: "POST", headers: { "content-type": "application/json", origin }, body: JSON.stringify({ email: "a@b.example.test", password: "long enough pw" }),
+  });
+  // No email_provider at all.
+  const off = await bootServer({ ...baseProfile(port, workerPort), web: web({}) }, port);
+  try {
+    assert.match(off.stderr(), /"event":"email_auth.disabled"/);
+    const response = await asks(`http://127.0.0.1:${port}`);
+    assert.deepEqual([response.status, await response.json()], [503, { error: "SIGN_UP_UNAVAILABLE" }]);
+  } finally { await off.stop(); }
+
+  // Resend, with a key reference that resolves to nothing: still 503, and the log names the cause.
+  const port2 = await freePort(), workerPort2 = await freePort();
+  const unresolved = await bootServer({ ...baseProfile(port2, workerPort2), web: { ...web({}), public_origin: `http://127.0.0.1:${port2}`, email_provider: "resend", email_api_key_secret_ref: "env://KINERARY_TEST_EMAIL_KEY_UNSET", email_from: "noreply@mail.example.test" } }, port2);
+  try {
+    assert.match(unresolved.stderr(), /"event":"email_auth.key_unresolved"/);
+    assert.equal((await asks(`http://127.0.0.1:${port2}`)).status, 503);
+    assert.equal(((await (await fetch(`http://127.0.0.1:${port2}/v1/auth/capabilities`)).json()) as { emailSignUp: boolean }).emailSignUp, false);
+  } finally { await unresolved.stop(); }
+
+  // The log provider (development only): on, and loud that nothing is delivered.
+  const port3 = await freePort(), workerPort3 = await freePort();
+  const logOnly = await bootServer({ ...baseProfile(port3, workerPort3), web: { ...web({}), public_origin: `http://127.0.0.1:${port3}`, email_provider: "log" } }, port3);
+  try {
+    assert.match(logOnly.stderr(), /"event":"email_auth.log_only"/);
+    assert.equal(((await (await fetch(`http://127.0.0.1:${port3}/v1/auth/capabilities`)).json()) as { emailSignUp: boolean }).emailSignUp, true);
+  } finally { await logOnly.stop(); }
 });
 
 test("the real portal server keeps Mini App sign-in off when its token cannot be read, and says so", async () => {

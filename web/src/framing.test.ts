@@ -28,13 +28,47 @@ it("the portal is not framable by default: frame-ancestors 'none' and X-Frame-Op
   expect(serverLevel).toContain(DENY);
 });
 
+/** A location's Content-Security-Policy value, if it adds one. */
+const policyOf = (lines: string[]) => /^add_header Content-Security-Policy "(.*)" always;$/.exec(lines.find((line) => line.startsWith("add_header Content-Security-Policy")) ?? "")?.[1];
+const GOOGLE_SHELL = "@google_sign_in_shell";
+
 it("every location that adds a header of its own restates the no-framing pair (nginx does not inherit them)", () => {
   for (const [name, lines] of blocks()) {
     const adds = lines.filter((line) => line.startsWith("add_header "));
     if (adds.length === 0 || name === "@mini_app_shell") continue;
-    expect(adds, name).toContain(NONE);
+    // The Google sign-in shell carries MORE than the pair in its policy, never less: it must still start with it.
+    if (name === GOOGLE_SHELL) expect(policyOf(lines), name).toMatch(/^frame-ancestors 'none'(;|$)/);
+    else expect(adds, name).toContain(NONE);
     expect(adds, name).toContain(DENY);
   }
+});
+
+it("Google may be reached from the sign-in and sign-up documents and from nowhere else", () => {
+  const all = blocks();
+  expect(all.get("= /sign-in")).toEqual(["try_files $uri @google_sign_in_shell;"]);
+  expect(all.get("= /sign-up")).toEqual(["try_files $uri @google_sign_in_shell;"]);
+  const shell = all.get(GOOGLE_SHELL)!;
+  expect(shell).toContain("rewrite ^ /index.html break;");
+  const policy = policyOf(shell)!;
+  const directive = (name: string) => policy.split(";").map((part) => part.trim()).find((part) => part.startsWith(`${name} `)) ?? "";
+  // Exactly the paths Google documents for the Identity Services button: its script, its frame, its callbacks, its stylesheet.
+  expect(directive("script-src")).toBe("script-src 'self' https://accounts.google.com/gsi/client");
+  expect(directive("frame-src")).toBe("frame-src https://accounts.google.com/gsi/");
+  expect(directive("connect-src")).toBe("connect-src 'self' https://accounts.google.com/gsi/");
+  expect(directive("style-src")).toContain("https://accounts.google.com/gsi/style");
+  // Not the whole of Google, not a wildcard, not an inline script.
+  expect(policy).not.toMatch(/\*|google\.com(?!\/gsi)|unsafe-eval/);
+  expect(directive("script-src")).not.toContain("unsafe-inline");
+  // And nowhere else: the server-level headers and every other location never mention Google.
+  expect(serverLevel.some((line) => /google/i.test(line))).toBe(false);
+  for (const [name, lines] of all) {
+    if (name === GOOGLE_SHELL || name === "= /sign-in" || name === "= /sign-up") continue; // the two that point at the shell
+    expect(lines.some((line) => /google/i.test(line)), name).toBe(false);
+  }
+  expect(conf.match(/accounts\.google\.com/g)?.length).toBe(4);
+  // The Mini App shell and its framing policy are untouched by any of this.
+  expect(all.get("@mini_app_shell")).toContain(TELEGRAM[0]);
+  expect(all.get("@mini_app_shell")!.some((line) => /google/i.test(line))).toBe(false);
 });
 
 it("only the Mini App shell may be framed, and only by Telegram's web clients", () => {

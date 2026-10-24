@@ -13,6 +13,23 @@ test("return paths are same-origin and retain a join fragment", () => {
   }
 });
 
+test("return paths stay same-origin AFTER normalisation, and validatedReturnTo is idempotent", () => {
+  // Each of these resolves to "//evil.example" (another site, to a browser) once the URL parser has folded the dots.
+  for (const attack of ["/.//evil.example", "/trips/../..//evil.example", "/a/..//evil.example/x?y=1#z", "/./..//evil.example", "/x/%2e%2e//evil.example"]) {
+    assert.equal(validatedReturnTo(attack), "/trips", attack);
+  }
+  assert.equal(validatedReturnTo("/./evil.example"), "/evil.example", "a dot segment that leaves one leading slash is an ordinary path");
+  const samples = [
+    "/trips", "/trips/trip_abcdefgh/app?from=ready#panel", "/join#token=abc", "/.//evil.example", "/trips/../..//evil.example", "//x", "/\\x", "/a/./b/../c",
+    "/%2f%2fevil.example", "/trips?next=//evil.example", "https://evil.example", "", "x", 5, null, undefined,
+  ];
+  for (const sample of samples) {
+    const once = validatedReturnTo(sample);
+    assert.equal(validatedReturnTo(once), once, `idempotent for ${JSON.stringify(sample)}`);
+    assert.ok(once.startsWith("/") && !once.startsWith("//") && !once.startsWith("/\\"), `${JSON.stringify(sample)} -> ${once}`);
+  }
+});
+
 test("token digests are deterministic and never contain the source token", () => {
   const digest = sha256("raw-secret-token");
   assert.match(digest, /^sha256:[a-f0-9]{64}$/);
@@ -34,7 +51,7 @@ test("a web profile boots without duplicate trip routes and retires Telegram web
   const profile = validateArchitectureProfile(JSON.parse(await readFile(path, "utf8")));
   const portal = {
     db: {} as PortalDependencies["db"],
-    google: { authorizationUrl: () => "https://accounts.example.test", exchange: async () => ({ subject: "sub", displayName: "Name", emailVerified: false }) },
+    google: { clientId: "test-client.apps.googleusercontent.com", verify: async () => ({ subject: "sub", displayName: "Name", emailVerified: false }) },
     runtimeAccounts: { participantExists: async () => true, provisionParticipant: async () => {} },
     publicOrigin: profile.web!.public_origin,
     runtimeOrigin: profile.web!.runtime_origin,
@@ -56,13 +73,25 @@ test("a web profile boots without duplicate trip routes and retires Telegram web
 });
 
 
-test("Google is optional as a complete pair and unavailable routes fail explicitly", async () => {
+test("Google sign-in is off without web.google_client_id, validates it when set, and refuses the retired secret-ref pair by name", async () => {
   const raw = JSON.parse(await readFile(fileURLToPath(new URL("../../config/architecture.web.example.json", import.meta.url)), "utf8"));
-  delete raw.web.google_client_id_secret_ref;
-  delete raw.web.google_client_secret_ref;
+  assert.equal(typeof raw.web.google_client_id, "string", "the example profile names the (public) client ID");
+  delete raw.web.google_client_id;
   const profile = validateArchitectureProfile(raw);
-  assert.throws(() => validateArchitectureProfile({ ...raw, web: { ...raw.web, google_client_id_secret_ref: "env://GOOGLE_ID" } }));
-  assert.throws(() => validateArchitectureProfile({ ...raw, web: { ...raw.web, google_client_secret_ref: "env://GOOGLE_SECRET" } }));
+  assert.equal(profile.web?.google_client_id, undefined);
+  // A plain client ID is accepted; anything that is not one is refused.
+  assert.equal(validateArchitectureProfile({ ...raw, web: { ...raw.web, google_client_id: "123-abc.apps.googleusercontent.com" } }).web?.google_client_id, "123-abc.apps.googleusercontent.com");
+  for (const bad of ["env://GOOGLE_ID", "123-abc", "123-abc.apps.googleusercontent.com.evil.test", "https://123.apps.googleusercontent.com", "", " 123.apps.googleusercontent.com"]) {
+    assert.throws(() => validateArchitectureProfile({ ...raw, web: { ...raw.web, google_client_id: bad } }), /google_client_id/, `refuses ${JSON.stringify(bad)}`);
+  }
+  // The retired OIDC pair: refused with a message that names the replacement, not a bare "unrecognized key".
+  for (const old of ["google_client_id_secret_ref", "google_client_secret_ref"]) {
+    assert.throws(
+      () => validateArchitectureProfile({ ...raw, web: { ...raw.web, [old]: "env://GOOGLE_X" } }),
+      (error: Error) => error.message.includes(`web.${old} is no longer supported`) && error.message.includes("web.google_client_id") && error.message.includes(".apps.googleusercontent.com"),
+    );
+  }
+  assert.throws(() => validateArchitectureProfile({ ...raw, web: { ...raw.web, google_client_id_secret_ref: "env://A", google_client_secret_ref: "env://B" } }), /no longer supported/);
   const app = buildApp(profile, { portal: {
     db: {} as PortalDependencies["db"], runtimeAccounts: {} as PortalDependencies["runtimeAccounts"],
     publicOrigin: raw.web.public_origin, runtimeOrigin: raw.web.runtime_origin, runtimeExchangeKey: "test-key",
@@ -71,11 +100,13 @@ test("Google is optional as a complete pair and unavailable routes fail explicit
   } });
   try {
     const providers = await app.inject({ url: "/v1/auth/capabilities" });
-    assert.deepEqual(providers.json(), { google: false, emailPassword: true, telegramMiniApp: false });
+    assert.deepEqual(providers.json(), { google: false, emailPassword: true, emailSignUp: false, telegramMiniApp: false });
+    const response = await app.inject({ method: "POST", url: "/v1/auth/google", headers: { origin: raw.web.public_origin }, payload: { credential: "x" } });
+    assert.equal(response.statusCode, 503);
+    assert.deepEqual(response.json(), { error: "GOOGLE_SIGN_IN_UNAVAILABLE" });
+    // The redirect flow is gone: its routes are not there to answer at all.
     for (const url of ["/v1/auth/google/start", "/v1/auth/google/callback?state=x&code=x"]) {
-      const response = await app.inject({ url });
-      assert.equal(response.statusCode, 503);
-      assert.deepEqual(response.json(), { error: "GOOGLE_SIGN_IN_UNAVAILABLE" });
+      assert.equal((await app.inject({ url })).statusCode, 404, url);
     }
   } finally { await app.close(); }
 });
@@ -110,4 +141,27 @@ test("email login throttles before credential hashing and ignores spoofed forwar
     assert.equal(spoofed.statusCode, 429);
     assert.equal(queries, 99);
   } finally { await app.close(); }
+});
+
+test("the profile's email block: resend needs its key and sender, the log provider is refused in production, and a stray field is not accepted", async () => {
+  const raw = JSON.parse(await readFile(fileURLToPath(new URL("../../config/architecture.web.example.json", import.meta.url)), "utf8"));
+  const withWeb = (extra: Record<string, unknown>, env = "development") => {
+    const web = { ...raw.web, ...extra };
+    if (extra.email_provider === undefined) delete web.email_provider;
+    return { ...raw, environment: env, web: env === "production" ? { ...web, public_origin: "https://portal.example.test", runtime_origin: "https://runtime.example.test" } : web };
+  };
+  // Unconfigured is a valid profile (sign-up answers 503); so is a complete resend block.
+  assert.equal(validateArchitectureProfile(withWeb({})).web?.email_provider, undefined);
+  const resend = { email_provider: "resend", email_api_key_secret_ref: "env://EMAIL_API_KEY", email_from: "noreply@mail.example.test" };
+  assert.equal(validateArchitectureProfile(withWeb(resend, "production")).web?.email_provider, "resend");
+  // Half a resend block, a key with no provider, a sender that is not an address, an unknown provider.
+  assert.throws(() => validateArchitectureProfile(withWeb({ ...resend, email_api_key_secret_ref: undefined })), /needs both/);
+  assert.throws(() => validateArchitectureProfile(withWeb({ ...resend, email_from: undefined })), /needs both/);
+  assert.throws(() => validateArchitectureProfile(withWeb({ email_api_key_secret_ref: "env://EMAIL_API_KEY" })), /need email_provider/);
+  assert.throws(() => validateArchitectureProfile(withWeb({ ...resend, email_from: "not an address" })));
+  assert.throws(() => validateArchitectureProfile(withWeb({ ...resend, email_provider: "smtp" })));
+  assert.throws(() => validateArchitectureProfile(withWeb({ ...resend, email_api_key_secret_ref: "literal-key-in-the-profile" })), undefined, "a key must be a secret reference, never a value");
+  // The log provider delivers nothing: fine for dev and tests, refused where it would swallow every link.
+  assert.equal(validateArchitectureProfile(withWeb({ email_provider: "log" })).web?.email_provider, "log");
+  assert.throws(() => validateArchitectureProfile(withWeb({ email_provider: "log" }, "production")), /sends nothing/);
 });

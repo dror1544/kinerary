@@ -2,9 +2,15 @@ import { createHash, randomBytes, scrypt as scryptCallback, timingSafeEqual } fr
 import { promisify } from "node:util";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type pg from "pg";
-import { CodeChallengeMethod, OAuth2Client } from "google-auth-library";
+import { OAuth2Client } from "google-auth-library";
 import { issueEnrollment, replaceEnrollment } from "./enrollment.js";
-import { ensureUnknownPasswordCredential, resolveOrCreateEmailAccount, verifyPasswordLogin } from "./password-identity.js";
+import { ensureUnknownPasswordCredential, hashPassword, resolveOrCreateEmailAccount, verifyPasswordLogin } from "./password-identity.js";
+import type { Mailer } from "./mailer.js";
+import {
+  PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH, cleanDisplayName, consumePasswordReset, consumeSignUpToken, normalizeEmail, portalMailIdle,
+  runInBackground, startPasswordReset, startSignUp, type EmailAuthContext,
+} from "./portal-email-auth.js";
+import { pickLanguage } from "./portal-email-templates.js";
 import { generatePlan } from "./planner.js";
 import { issueApproval } from "./plan-approval.js";
 import { removeMember } from "./member-removal.js";
@@ -42,6 +48,17 @@ function base64url(bytes = 32): string {
 }
 
 const scrypt = promisify(scryptCallback);
+
+const GOOGLE_NONCE_COOKIE = "kit_gnonce";
+const GOOGLE_NONCE_PATH = "/v1/auth/google";
+/** What the page hands Google Identity Services as `nonce`: the hash of the secret only the cookie holds. */
+const googleNonceFor = (secret: string): string => createHash("sha256").update(secret).digest("hex");
+/** How long a nonce secret may be used after the server issued it (the cookie's Max-Age is the same, but only the server's word counts). */
+const GOOGLE_NONCE_MAX_AGE_SECONDS = 300;
+/** The issue time is the server's own (written at GET); this only absorbs a second instance's clock being a little ahead. */
+const GOOGLE_NONCE_CLOCK_SKEW_SECONDS = 30;
+/** The cookie's secret is `<issued-at, epoch seconds>.<random>`; the issue time is inside what the token's nonce hashes. */
+const GOOGLE_NONCE_SECRET = /^([0-9]{9,12})\.[A-Za-z0-9_-]{20,64}$/;
 
 function safeEqual(left: string, right: string): boolean {
   const a = Buffer.from(left);
@@ -94,9 +111,9 @@ function parseCookies(header: unknown): Record<string, string> {
  * Only the Mini App's own sign-in asks for it (`embedded` in the request, set
  * by the page when it finds itself in a frame). The ordinary portal keeps Lax.
  */
-function cookie(name: string, value: string, options: { maxAge?: number; httpOnly?: boolean; secure?: boolean; crossSite?: boolean } = {}): string {
+function cookie(name: string, value: string, options: { maxAge?: number; httpOnly?: boolean; secure?: boolean; crossSite?: boolean; path?: string } = {}): string {
   const crossSite = options.crossSite === true && options.secure !== false;
-  const pieces = [`${name}=${encodeURIComponent(value)}`, "Path=/", crossSite ? "SameSite=None" : "SameSite=Lax"];
+  const pieces = [`${name}=${encodeURIComponent(value)}`, `Path=${options.path ?? "/"}`, crossSite ? "SameSite=None" : "SameSite=Lax"];
   if (options.secure !== false) pieces.push("Secure");
   if (crossSite) pieces.push("Partitioned");
   if (options.httpOnly !== false) pieces.push("HttpOnly");
@@ -108,7 +125,12 @@ export function validatedReturnTo(value: unknown): string {
   if (typeof value !== "string" || !value.startsWith("/") || value.startsWith("//") || value.includes("\\")) return "/trips";
   try {
     const parsed = new URL(value, "https://portal.invalid");
-    return parsed.origin === "https://portal.invalid" ? `${parsed.pathname}${parsed.search}${parsed.hash}` : "/trips";
+    if (parsed.origin !== "https://portal.invalid") return "/trips";
+    const normalized = `${parsed.pathname}${parsed.search}${parsed.hash}`;
+    // Normalisation can CREATE what the checks above refused: "/.//evil.example" and "/trips/../..//evil.example" both
+    // resolve to "//evil.example", which a browser reads as another site. So the OUTPUT is held to the same rule as the
+    // input; that makes this function idempotent (validatedReturnTo(validatedReturnTo(x)) === validatedReturnTo(x)).
+    return normalized.startsWith("/") && !normalized.startsWith("//") && !normalized.includes("\\") ? normalized : "/trips";
   } catch {
     return "/trips";
   }
@@ -120,51 +142,125 @@ export interface GoogleIdentity {
   email?: string;
   /**
    * Google's own `email_verified` claim, and only ever true when it said so.
-   * `exchange` rejects an explicit false, but the claim can also be absent —
-   * and "absent" must not read as "verified" at the one call site that uses
-   * this to decide whether two accounts are the same person.
+   * `verify` refuses anything else (the claim can also be absent, and "absent"
+   * must not read as "verified" where this decides that two accounts are the
+   * same person); the route checks it again.
    */
   emailVerified: boolean;
+  /** The token's `hd` claim: the Google Workspace domain the account belongs to. Absent for a consumer Google account. */
+  hd?: string;
+  /** The token's `nonce` claim: what the page gave Google Identity Services. The route holds it to the sign-in cookie. */
+  nonce?: string;
 }
 
-export interface GoogleOidcAdapter {
-  authorizationUrl(input: { state: string; nonce: string; codeChallenge: string }): string;
-  exchange(input: { code: string; codeVerifier: string; nonce: string }): Promise<GoogleIdentity>;
+/**
+ * Why a Google credential was refused. A CODE, never the library's message: that message can quote the token
+ * (`Invalid token signature: <jwt>`, `Wrong number of segments in token: <jwt>`), and the log must hold neither
+ * the token nor the address in it.
+ */
+export type GoogleRefusal =
+  | "CREDENTIAL_MISSING" | "SIGNATURE_INVALID" | "AUDIENCE_MISMATCH" | "ISSUER_MISMATCH" | "TOKEN_EXPIRED"
+  | "TOKEN_MALFORMED" | "SUBJECT_MISSING" | "EMAIL_MISSING" | "EMAIL_UNVERIFIED" | "AZP_MISMATCH"
+  | "NONCE_MISSING" | "NONCE_MISMATCH" | "NONCE_EXPIRED" | "NONCE_REPLAYED" | "EMAIL_MALFORMED"
+  | "EMAIL_NOT_GOOGLE_AUTHORITATIVE" | "VERIFY_FAILED";
+
+export class GoogleSignInRefused extends Error {
+  constructor(readonly reason: GoogleRefusal) { super(reason); this.name = "GoogleSignInRefused"; }
 }
 
-export class GoogleOidcClient implements GoogleOidcAdapter {
-  private readonly client: OAuth2Client;
+/**
+ * Verifies the signed ID token Google Identity Services hands the page ("Sign in with Google", ID-token flow:
+ * the page draws Google's button from the PUBLIC client ID, Google signs a token for it, and the page posts
+ * the token to POST /v1/auth/google). There is no client secret and no redirect. Throws GoogleSignInRefused.
+ */
+export interface GoogleIdTokenVerifier {
+  /** The OAuth client ID: the token's required audience, and what capabilities hands the page. */
+  readonly clientId: string;
+  verify(credential: string): Promise<GoogleIdentity>;
+}
 
-  constructor(private readonly clientId: string, clientSecret: string, private readonly redirectUri: string) {
-    this.client = new OAuth2Client(clientId, clientSecret, redirectUri);
-  }
+export class GoogleIdTokenClient implements GoogleIdTokenVerifier {
+  /** `client` is injectable so a test can serve its own signing certificates instead of fetching Google's. */
+  constructor(readonly clientId: string, private readonly client: OAuth2Client = new OAuth2Client(clientId)) {}
 
-  authorizationUrl(input: { state: string; nonce: string; codeChallenge: string }): string {
-    return this.client.generateAuthUrl({
-      access_type: "offline",
-      scope: ["openid", "email", "profile"],
-      state: input.state,
-      nonce: input.nonce,
-      code_challenge: input.codeChallenge,
-      code_challenge_method: CodeChallengeMethod.S256,
-      prompt: "select_account",
-    });
-  }
-
-  async exchange(input: { code: string; codeVerifier: string; nonce: string }): Promise<GoogleIdentity> {
-    const response = await this.client.getToken({ code: input.code, codeVerifier: input.codeVerifier, redirect_uri: this.redirectUri });
-    const idToken = response.tokens.id_token;
-    if (!idToken) throw new Error("GOOGLE_ID_TOKEN_MISSING");
-    const ticket = await this.client.verifyIdToken({ idToken, audience: this.clientId });
-    const payload = ticket.getPayload();
-    if (!payload?.sub || payload.nonce !== input.nonce || payload.email_verified === false) throw new Error("GOOGLE_IDENTITY_INVALID");
+  async verify(credential: string): Promise<GoogleIdentity> {
+    if (!credential) throw new GoogleSignInRefused("CREDENTIAL_MISSING");
+    let payload;
+    try {
+      // The library checks the signature against Google's published certificates, the expiry (exp, and iat
+      // not in the future), the audience, and the issuer: accounts.google.com or https://accounts.google.com.
+      const ticket = await this.client.verifyIdToken({ idToken: credential, audience: this.clientId });
+      payload = ticket.getPayload();
+    } catch (error) {
+      throw new GoogleSignInRefused(refusalFor(error instanceof Error ? error.message : ""));
+    }
+    if (!payload?.sub) throw new GoogleSignInRefused("SUBJECT_MISSING");
+    // `azp` is the client the token was issued to. When Google says one, it must be ours (aud alone is checked by the library).
+    if (payload.azp !== undefined && payload.azp !== this.clientId) throw new GoogleSignInRefused("AZP_MISMATCH");
+    if (!payload.email) throw new GoogleSignInRefused("EMAIL_MISSING");
+    // `=== true`, not `!== false`: an absent claim must not read as verified, because this is what decides
+    // that Google's address and an existing account's address are the same person.
+    if (payload.email_verified !== true) throw new GoogleSignInRefused("EMAIL_UNVERIFIED");
     return {
       subject: payload.sub,
-      displayName: payload.name?.slice(0, 120) || payload.email?.split("@")[0]?.slice(0, 120) || "Kinerary organizer",
+      displayName: payload.name?.trim().slice(0, 120) || payload.email.split("@")[0]?.slice(0, 120) || "Kinerary organizer",
       email: payload.email,
-      emailVerified: payload.email_verified === true,
+      emailVerified: true,
+      ...(typeof payload.nonce === "string" ? { nonce: payload.nonce } : {}),
+      ...(typeof payload.hd === "string" ? { hd: payload.hd } : {}),
     };
   }
+}
+
+/**
+ * Whether Google is AUTHORITATIVE for this address, i.e. whether Google's say-so that "this person controls
+ * <address>" is as good as this system proving it itself by an emailed link. It is for @gmail.com and
+ * @googlemail.com (Google runs that mailbox), and for a Workspace account whose `hd` claim equals the address's
+ * domain (Google runs that domain's mail). For anyone else `email_verified` only says Google once sent a code to
+ * an address it does not run (an outlook.com or company address attached to a Google account), which is not proof
+ * that its owner is the person holding the token. Those addresses use the emailed-link sign-up instead, whether or
+ * not an account exists: the answer must not tell the two apart. Exact domain equality, never a suffix match
+ * ("gmail.com.evil.test", "notgmail.com" and a subdomain of `hd` are all refused).
+ */
+export function googleIsAuthoritativeFor(email: string, hostedDomain?: string): boolean {
+  const at = email.lastIndexOf("@");
+  if (at < 1) return false;
+  const domain = email.slice(at + 1).trim().toLowerCase();
+  if (!domain) return false;
+  if (domain === "gmail.com" || domain === "googlemail.com") return true;
+  return typeof hostedDomain === "string" && hostedDomain.trim() !== "" && domain === hostedDomain.trim().toLowerCase();
+}
+
+/**
+ * Whether a claim is a plain addr-spec, the only shape an email claim may have: ASCII printable only (no
+ * whitespace, no control characters, nothing beyond U+007E), exactly one "@" with something either side, and none of
+ * `<>",`. A claim like `a@evil.test@gmail.com`, ` x@gmail.com`, or `"x@evil.test"@gmail.com` is refused outright
+ * rather than interpreted, because the authority check and the account lookup would otherwise each have to guess
+ * which "@" counts. Google does not send such a claim; this is defence in depth against the day one reaches here.
+ */
+export function isPlainAddrSpec(email: string): boolean {
+  if (email.length > 254 || !/^[\x21-\x7e]+$/.test(email) || /[<>",]/.test(email)) return false;
+  const parts = email.split("@");
+  return parts.length === 2 && parts[0]!.length > 0 && parts[1]!.length > 0;
+}
+
+/**
+ * The one account an address names. Google runs @googlemail.com and @gmail.com as the same mailbox, so both
+ * resolve to gmail.com before the account lookup: otherwise the same person holds two accounts by which spelling
+ * Google happened to put in the token.
+ */
+export function canonicalGoogleEmail(email: string): string {
+  const lowered = email.trim().toLowerCase();
+  return lowered.endsWith("@googlemail.com") ? `${lowered.slice(0, -"googlemail.com".length)}gmail.com` : lowered;
+}
+
+function refusalFor(message: string): GoogleRefusal {
+  if (/Invalid token signature|No pem found/i.test(message)) return "SIGNATURE_INVALID";
+  if (/Wrong recipient|audience/i.test(message)) return "AUDIENCE_MISMATCH";
+  if (/Invalid issuer/i.test(message)) return "ISSUER_MISMATCH";
+  if (/Token used too late|expired/i.test(message)) return "TOKEN_EXPIRED";
+  if (/segments|Can't parse/i.test(message)) return "TOKEN_MALFORMED";
+  return "VERIFY_FAILED";
 }
 
 export interface RuntimeAccountAdapter {
@@ -206,7 +302,8 @@ export class HttpRuntimeAccountAdapter implements RuntimeAccountAdapter {
 
 export interface PortalDependencies {
   db: pg.Pool;
-  google?: GoogleOidcAdapter;
+  /** Present only when `web.google_client_id` is set; absent turns Google sign-in off (capabilities says so). */
+  google?: GoogleIdTokenVerifier;
   runtimeAccounts: RuntimeAccountAdapter;
   publicOrigin: string;
   runtimeOrigin: string;
@@ -226,6 +323,15 @@ export interface PortalDependencies {
   telegramMiniApp?: TelegramMiniAppConfig & { log?: (line: string) => void };
   /** How long a dashboard-issued Telegram link works. Defaults to 15 minutes. */
   telegramLinkTtlSeconds?: number;
+  /**
+   * Carries the verification and password-reset messages. ABSENT means email is
+   * not configured: `POST /v1/auth/sign-up` and `/v1/auth/password/forgot` answer
+   * 503 SIGN_UP_UNAVAILABLE and `capabilities.emailSignUp` is false. There is no
+   * path on which a message is silently not sent.
+   */
+  mailer?: Mailer;
+  /** Where the email routes write their (token-free) log lines. Defaults to stderr. */
+  emailAuthLog?: (line: string) => void;
 }
 
 interface PortalUser {
@@ -456,20 +562,6 @@ async function requireMutation(request: FastifyRequest, reply: FastifyReply, dep
   return (await enforceScope(request, reply, deps, user)) ? user : null;
 }
 
-/**
- * An account with no email behind it — a Google sign-in whose address Google
- * would not vouch for. It gets its own user, as it always has, because there
- * is nothing here to tie it to anyone.
- */
-async function createBareUser(client: pg.PoolClient, displayName: string): Promise<string> {
-  const userId = opaque("user");
-  await client.query(
-    "INSERT INTO control_plane.users(id, status, display_name) VALUES ($1, 'active', $2)",
-    [userId, displayName],
-  );
-  return userId;
-}
-
 async function membership(deps: PortalDependencies, tripId: string, userId: string) {
   const result = await deps.db.query<{ role: string; dashboard_access: boolean; runtime_access: boolean }>(
     `SELECT role, dashboard_access, runtime_access FROM control_plane.trip_memberships
@@ -630,6 +722,8 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
   });
   registerPortalRouteHandlers(app, deps);
   collecting = false;
+  // Sign-up and reset work happens after the response; closing the app waits for it.
+  app.addHook("onClose", async () => { await portalMailIdle(); });
   assertEveryRouteIsClassified(registered);
 }
 
@@ -643,7 +737,11 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
 
   app.get("/v1/auth/capabilities", async () => ({
     google: Boolean(deps.google),
+    // The PUBLIC OAuth client ID the page needs to draw Google's button; present exactly when `google` is true.
+    ...(deps.google ? { googleClientId: deps.google.clientId } : {}),
     emailPassword: true,
+    // Whether the portal can send the verification / reset message at all. False renders "Sign-up isn't open yet".
+    emailSignUp: Boolean(deps.mailer),
     telegramMiniApp: Boolean(deps.telegramMiniApp?.enabled()),
   }));
 
@@ -700,6 +798,144 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
       return { appPath: validatedReturnTo(body.returnTo) };
     } catch (error) { await client.query("ROLLBACK"); throw error; }
     finally { client.release(); }
+  });
+
+  // ── Email sign-up, verification and password reset (portal-email-auth.ts) ──
+  //
+  //   POST /v1/auth/sign-up          { email, returnTo?, language? }  202 { status: "check_your_email" }  (no password, no name: both are chosen at verification)
+  //   POST /v1/auth/verify-email     { token, password, displayName }  200 { appPath } + session cookies | 400 TOKEN_INVALID | 400 PASSWORD_TOO_SHORT | 400 INVALID_NAME | 409 ACCOUNT_EXISTS
+  //   POST /v1/auth/password/forgot  { email, language? }      202 { status: "check_your_email" }
+  //   POST /v1/auth/password/reset   { token, password }       200 { appPath } + session cookies | 400 TOKEN_INVALID
+  //
+  // All four are `open` (portal-scope.ts): none reads the session cookie, so a
+  // Telegram-scoped session gets no more and no less from them than a stranger;
+  // the emailed token is the whole authority. Sign-up and forgot answer 503
+  // SIGN_UP_UNAVAILABLE without a mailer, and answer 202 identically for an
+  // address that has an account and one that has not (the work follows the
+  // response; see portal-email-auth.ts). Every one is `no-store` and needs our
+  // own Origin, like /v1/auth/password: verify and reset SIGN SOMEBODY IN, so a
+  // page on another site must not be able to post a token it holds.
+  const signUpIpAttempts: Attempts = new Map();
+  const forgotIpAttempts: Attempts = new Map();
+  const emailTokenIpAttempts: Attempts = new Map();
+  /**
+   * The per-IP counter for these routes. Unlike `admitLogin` it never refuses a caller because the map is
+   * full: a fixed-size map that fails closed is filled with junk keys by whoever has enough addresses and
+   * then locks out everyone (boundary review M2). At capacity it forgets the oldest entry instead, so memory
+   * stays bounded and a flood can only rotate through its own addresses. What a flood can send is bounded by
+   * the persistent budgets in portal-email-auth.ts, not by this map.
+   */
+  const admitEmailIp = (attempts: Attempts, key: string, limit: number): boolean => {
+    const now = Date.now();
+    for (const [storedKey, entry] of attempts) if (entry.expiresAt <= now) attempts.delete(storedKey);
+    const previous = attempts.get(key);
+    if (previous && previous.count >= limit) return false;
+    if (!previous && attempts.size >= 1024) attempts.delete(attempts.keys().next().value as string);
+    attempts.set(key, { count: (previous?.count ?? 0) + 1, expiresAt: previous?.expiresAt ?? now + 60_000 });
+    return true;
+  };
+  const emailAuthLog = (line: string) => (deps.emailAuthLog ?? ((l: string) => process.stderr.write(`${l}\n`)))(line);
+  const emailAuthContext = (mailer: Mailer): EmailAuthContext => ({ db: deps.db, mailer, publicOrigin: deps.publicOrigin, log: emailAuthLog });
+  const jsonBody = (request: FastifyRequest): Record<string, unknown> =>
+    request.body && typeof request.body === "object" && !Array.isArray(request.body) ? request.body as Record<string, unknown> : {};
+  /** The page's own `returnTo`, kept only if it is a path the migration's CHECK also accepts. */
+  const storableReturnTo = (value: unknown): string => {
+    const path = validatedReturnTo(value);
+    return /^\/[A-Za-z0-9/_?=&.#%-]*$/.test(path) ? path : "/trips";
+  };
+
+  app.post("/v1/auth/sign-up", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    if (!deps.mailer) return reply.code(503).send({ error: "SIGN_UP_UNAVAILABLE" });
+    if (!admitEmailIp(signUpIpAttempts, request.ip, 20)) return reply.header("retry-after", "60").code(429).send({ error: "SIGN_UP_RATE_LIMITED" });
+    if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
+    const body = jsonBody(request);
+    // There is deliberately no password and no name here: a `password` or `displayName` in the body is ignored,
+    // never stored, never mailed. The person chooses both on the page the emailed link opens (portal-email-auth.ts).
+    // One spelling of the address (strict ASCII, lower-cased) for the digest, the budget and the mail's `to`.
+    // The per-address budget is persistent and lives in the database (portal-email-auth.ts), not in a map here.
+    const email = normalizeEmail(body.email);
+    if (email === null) return reply.code(400).send({ error: "INVALID_EMAIL" });
+    const input = {
+      email,
+      returnTo: storableReturnTo(body.returnTo ?? body.return_to), language: pickLanguage(body.language, request.headers["accept-language"]),
+    };
+    const ctx = emailAuthContext(deps.mailer);
+    runInBackground(() => startSignUp(ctx, input), (error) =>
+      emailAuthLog(structuredLog("error", "email_auth.sign_up_failed", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN" })));
+    return reply.code(202).send({ status: "check_your_email" });
+  });
+
+  app.post("/v1/auth/verify-email", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    if (!admitEmailIp(emailTokenIpAttempts, request.ip, 30)) return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
+    if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
+    const body = jsonBody(request);
+    if (typeof body.password !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+    // Before the token is touched: a typo in the password or the name must not burn the link.
+    if (body.password.length < PASSWORD_MIN_LENGTH) return reply.code(400).send({ error: "PASSWORD_TOO_SHORT" });
+    if (body.password.length > PASSWORD_MAX_LENGTH) return reply.code(400).send({ error: "INVALID_REQUEST" });
+    const displayName = cleanDisplayName(body.displayName);
+    if (displayName === null) return reply.code(400).send({ error: "INVALID_NAME" });
+    // Hashed before the transaction, so a bad token costs the same scrypt and no row lock is held meanwhile.
+    const passwordHash = await hashPassword(body.password);
+    const client = await deps.db.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await consumeSignUpToken(client, body.token, passwordHash, displayName);
+      if (!result.ok) {
+        // Commit: a spent token stays spent, even when the address turned out to have an account already.
+        await client.query("COMMIT");
+        return reply.code(result.error === "ACCOUNT_EXISTS" ? 409 : 400).send({ error: result.error });
+      }
+      const session = await createWebSession(client, result.userId, deps.sessionTtlSeconds);
+      await client.query("COMMIT");
+      setWebSessionCookies(reply, deps, session);
+      return { appPath: validatedReturnTo(result.returnTo) };
+    } catch (error) {
+      try { await client.query("ROLLBACK"); } catch { /* ignore */ }
+      throw error;
+    } finally { client.release(); }
+  });
+
+  app.post("/v1/auth/password/forgot", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    if (!deps.mailer) return reply.code(503).send({ error: "SIGN_UP_UNAVAILABLE" });
+    if (!admitEmailIp(forgotIpAttempts, request.ip, 20)) return reply.header("retry-after", "60").code(429).send({ error: "SIGN_UP_RATE_LIMITED" });
+    if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
+    const body = jsonBody(request);
+    const email = normalizeEmail(body.email);
+    if (email === null) return reply.code(400).send({ error: "INVALID_EMAIL" });
+    const input = { email, language: pickLanguage(body.language, request.headers["accept-language"]) };
+    const ctx = emailAuthContext(deps.mailer);
+    runInBackground(() => startPasswordReset(ctx, input), (error) =>
+      emailAuthLog(structuredLog("error", "email_auth.password_reset_failed", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN" })));
+    return reply.code(202).send({ status: "check_your_email" });
+  });
+
+  app.post("/v1/auth/password/reset", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    if (!admitEmailIp(emailTokenIpAttempts, request.ip, 30)) return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
+    if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
+    const body = jsonBody(request);
+    if (typeof body.token !== "string" || typeof body.password !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+    // Before the token is touched: a typo in the new password must not burn the link.
+    if (body.password.length < PASSWORD_MIN_LENGTH) return reply.code(400).send({ error: "PASSWORD_TOO_SHORT" });
+    if (body.password.length > PASSWORD_MAX_LENGTH) return reply.code(400).send({ error: "INVALID_REQUEST" });
+    const passwordHash = await hashPassword(body.password);
+    const client = await deps.db.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await consumePasswordReset(client, body.token, passwordHash);
+      if (!result.ok) { await client.query("ROLLBACK"); return reply.code(400).send({ error: result.error }); }
+      const session = await createWebSession(client, result.userId, deps.sessionTtlSeconds);
+      await client.query("COMMIT");
+      setWebSessionCookies(reply, deps, session);
+      return { appPath: "/trips" };
+    } catch (error) {
+      try { await client.query("ROLLBACK"); } catch { /* ignore */ }
+      throw error;
+    } finally { client.release(); }
   });
 
   // ── Telegram Mini App sign-in (#442) ──────────────────────────────────────
@@ -837,76 +1073,143 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     return { status: "restored" };
   });
 
-  app.get("/v1/auth/google/start", async (request, reply) => {
+  // ── Sign in with Google (Google Identity Services, ID-token flow) ──
+  //
+  //   GET  /v1/auth/google/nonce                                   200 { nonce } + the kit_gnonce cookie (see SINGLE USE below)
+  //   POST /v1/auth/google  { credential, returnTo?, embedded? }  200 { appPath } + session cookies
+  //                         | 401 GOOGLE_SIGN_IN_FAILED | 401 GOOGLE_USE_EMAIL_SIGN_UP | 403 ORIGIN_INVALID | 429 SIGN_IN_RATE_LIMITED | 503 GOOGLE_SIGN_IN_UNAVAILABLE
+  //
+  // Sign-up and sign-in in one. Policy `open` (portal-scope.ts): it never reads the session cookie. `credential`
+  // is the signed ID token the page's Google button yields. Origin must be ours (a page on another site must not be
+  // able to post a token it holds and sign the visitor in: login CSRF), the IP is rate-limited BEFORE the token is
+  // looked at, and the answer is `no-store`. EVERY failure to establish who Google says this is, whatever the cause
+  // (garbage, bad signature, wrong audience or issuer, expired, no verified address, a suspended account), is the
+  // same 401 GOOGLE_SIGN_IN_FAILED, so the route tells a caller nothing about which part was wrong. The cause goes to
+  // the log as a reason CODE only: never the token, never the address.
+  //
+  // SINGLE USE, AND BOUND TO THE BROWSER THAT ASKED. A signed ID token is a bearer credential that stays valid for
+  // about an hour, and it is readable (it is a JWT), so one that leaks (a log, a proxy, a screenshot) could be posted
+  // by anyone. So the page first calls GET /v1/auth/google/nonce: the server makes a secret `<issued-at>.<random>`,
+  // sets it in a short-lived HttpOnly cookie scoped to /v1/auth/google, and returns only its SHA-256 as the `nonce`
+  // the page hands Google. Google puts that nonce in the token. The POST accepts the token only if
+  //   1. SHA-256(cookie) equals the token's nonce (a leaked token shows the hash, not the secret, and an attacker
+  //      cannot forge the cookie from the token), and
+  //   2. the issue time inside the cookie is at most 5 minutes old (it is covered by that hash, so it cannot be
+  //      edited without invalidating the token: no HMAC key or server-side record of issued nonces is needed), and
+  //   3. the nonce is not yet in control_plane.google_signin_nonces. It is SPENT there, inside the sign-in
+  //      transaction, by INSERT ... ON CONFLICT DO NOTHING; no row inserted means a replay (NONCE_REPLAYED), so a
+  //      captured token+cookie pair works once, even from the browser that holds the cookie. Clearing the cookie is
+  //      only a courtesy; it is not what makes the nonce single-use.
+  // A refusal that proves nothing about the cookie (bad token, mismatched nonce, a foreign Origin) leaves the cookie
+  // alone, so another tab's attempt in the same browser is not broken by it; only a request whose nonce matched the
+  // cookie clears it. Rows are kept until 10 minutes after issue, longer than the 5 minutes they could be accepted
+  // for, and the next sign-in deletes the expired ones. A failed sign-in transaction rolls the spend back.
+  const googleIpAttempts: Attempts = new Map();
+  const googleNonceIpAttempts: Attempts = new Map();
+  const nonceCookie = (value: string, maxAge: number) =>
+    cookie(GOOGLE_NONCE_COOKIE, value, { maxAge, secure: deps.publicOrigin.startsWith("https://"), path: GOOGLE_NONCE_PATH });
+  app.get("/v1/auth/google/nonce", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
     if (!deps.google) return reply.code(503).send({ error: "GOOGLE_SIGN_IN_UNAVAILABLE" });
-    const query = request.query as Record<string, unknown>;
-    const state = base64url(24);
-    const nonce = base64url(24);
-    const verifier = base64url(48);
-    const challenge = createHash("sha256").update(verifier).digest("base64url");
-    await deps.db.query(
-      `INSERT INTO control_plane.web_auth_attempts(id, state_digest, code_verifier, nonce, return_to, expires_at)
-       VALUES ($1, $2, $3, $4, $5, now() + interval '10 minutes')`,
-      [opaque("wauth"), sha256(state), verifier, nonce, validatedReturnTo(query.return_to ?? query.returnTo)],
-    );
-    return reply.redirect(deps.google.authorizationUrl({ state, nonce, codeChallenge: challenge }));
+    if (!admitLogin(googleNonceIpAttempts, request.ip, 60)) {
+      return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
+    }
+    const secret = `${Math.floor(Date.now() / 1000)}.${base64url(32)}`;
+    reply.header("set-cookie", nonceCookie(secret, GOOGLE_NONCE_MAX_AGE_SECONDS));
+    return { nonce: googleNonceFor(secret) };
   });
-
-  app.get("/v1/auth/google/callback", async (request, reply) => {
+  app.post("/v1/auth/google", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
     if (!deps.google) return reply.code(503).send({ error: "GOOGLE_SIGN_IN_UNAVAILABLE" });
-    const query = request.query as Record<string, unknown>;
-    if (typeof query.state !== "string" || typeof query.code !== "string") return reply.code(400).send({ error: "AUTH_CALLBACK_INVALID" });
+    if (!admitLogin(googleIpAttempts, request.ip, 30)) {
+      return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
+    }
+    if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
+    const nonceSecret = parseCookies(request.headers.cookie)[GOOGLE_NONCE_COOKIE];
+    // Cleared only once the token's nonce is proven to be this cookie's (see SINGLE USE): a refusal before that says
+    // nothing about this cookie, and it may belong to another tab's attempt.
+    const clearNonceCookie = () => { reply.header("set-cookie", nonceCookie("", 0)); };
+    const body = jsonBody(request);
+    const refuse = async (reason: GoogleRefusal | "ACCOUNT_INACTIVE") => {
+      if (reason === "EMAIL_NOT_GOOGLE_AUTHORITATIVE") {
+        // A valid, correctly bound token for an address Google does not run: point at the email sign-up. Nothing is
+        // written (no funnel row either), and it is the same answer whether or not the address has an account.
+        emailAuthLog(structuredLog("warn", "google_sign_in.refused", { reason }));
+        return reply.code(401).send({ error: "GOOGLE_USE_EMAIL_SIGN_UP" });
+      }
+      emailAuthLog(structuredLog("warn", "google_sign_in.refused", { reason }));
+      await recordFunnelEvent(deps.db, "google_auth", { outcome: "failure" }).catch(() => {});
+      return reply.code(401).send({ error: "GOOGLE_SIGN_IN_FAILED" });
+    };
+    if (typeof body.credential !== "string" || body.credential.length === 0 || body.credential.length > 8192) return refuse("CREDENTIAL_MISSING");
+    let identity: GoogleIdentity;
+    try {
+      identity = await deps.google.verify(body.credential);
+    } catch (error) {
+      return refuse(error instanceof GoogleSignInRefused ? error.reason : "VERIFY_FAILED");
+    }
+    if (!identity.email || !identity.emailVerified) return refuse("EMAIL_UNVERIFIED");
+    if (!isPlainAddrSpec(identity.email)) return refuse("EMAIL_MALFORMED");
+    if (!nonceSecret) return refuse("NONCE_MISSING");
+    const issued = GOOGLE_NONCE_SECRET.exec(nonceSecret);
+    if (!issued || !identity.nonce || !safeEqual(googleNonceFor(nonceSecret), identity.nonce)) return refuse("NONCE_MISMATCH");
+    // From here the token is bound to this cookie, and the cookie is of no further use whatever the outcome.
+    clearNonceCookie();
+    const issuedAt = Number(issued[1]);
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    if (nowSeconds - issuedAt > GOOGLE_NONCE_MAX_AGE_SECONDS || issuedAt - nowSeconds > GOOGLE_NONCE_CLOCK_SKEW_SECONDS) return refuse("NONCE_EXPIRED");
+    // Last of the token checks, so that only a token that is genuine AND bound to this browser can learn this answer;
+    // and before any lookup, so it cannot depend on whether the address already has an account.
+    if (!googleIsAuthoritativeFor(identity.email, identity.hd)) return refuse("EMAIL_NOT_GOOGLE_AUTHORITATIVE");
+    const email = canonicalGoogleEmail(identity.email);
+    const subjectDigest = sha256(`google:${identity.subject}`);
     const client = await deps.db.connect();
     try {
       await client.query("BEGIN");
-      const attempts = await client.query<{ id: string; code_verifier: string; nonce: string; return_to: string }>(
-        `SELECT id, code_verifier, nonce, return_to FROM control_plane.web_auth_attempts
-         WHERE state_digest = $1 AND consumed_at IS NULL AND expires_at > now() FOR UPDATE`, [sha256(query.state)]);
-      const attempt = attempts.rows[0];
-      if (!attempt) { await client.query("ROLLBACK"); return reply.code(400).send({ error: "AUTH_CALLBACK_INVALID" }); }
-      const identity = await deps.google.exchange({ code: query.code, codeVerifier: attempt.code_verifier, nonce: attempt.nonce });
-      const subjectDigest = sha256(`google:${identity.subject}`);
-      const identities = await client.query<{ user_id: string }>(
+      // Spend the nonce. Expired rows go first (opportunistic purge: no job), then the insert; no row back is a replay.
+      await client.query("DELETE FROM control_plane.google_signin_nonces WHERE expires_at < now()");
+      const spent = await client.query(
+        `INSERT INTO control_plane.google_signin_nonces(nonce_digest, expires_at)
+         VALUES ($1, to_timestamp($2)) ON CONFLICT (nonce_digest) DO NOTHING RETURNING 1`,
+        [identity.nonce, issuedAt + 2 * GOOGLE_NONCE_MAX_AGE_SECONDS]);
+      if (!spent.rows[0]) { await client.query("ROLLBACK"); return await refuse("NONCE_REPLAYED"); }
+      const known = await client.query<{ user_id: string }>(
         "SELECT user_id FROM control_plane.user_identities WHERE provider = 'google' AND provider_subject_digest = $1", [subjectDigest]);
-      let userId = identities.rows[0]?.user_id;
+      let userId = known.rows[0]?.user_id;
       if (!userId) {
-        // First Google sign-in for this Google account. If Google has VERIFIED
-        // an address for it, that address already names an organizer account
-        // here — one they signed up for, or one an operator invited — and this
-        // is the same person arriving by a different door. Attach the Google
-        // identity to that account instead of starting a third one beside it.
-        //
-        // Safe in the direction that matters: Google proving the address is a
-        // stronger claim than this system has ever had for it, since signup
-        // itself never verifies an email. An unverified or absent claim falls
-        // through to a fresh account, which is the old behavior.
-        if (identity.email && identity.emailVerified) {
-          userId = await resolveOrCreateEmailAccount(client, identity.email, identity.displayName);
-          // The account must not be claimable by asserting its address. Without
-          // this, an account reachable only by Google would sit there with no
-          // password credential, and `POST /v1/signup` with that email would
-          // set one — handing a stranger who knows the address everything this
-          // person owns. A credential nobody knows closes that; they sign in
-          // with Google, and password recovery later gives them one they chose.
-          await ensureUnknownPasswordCredential(client, userId, identity.email);
-        } else {
-          userId = await createBareUser(client, identity.displayName);
+        // First sign-in with this Google account. Its address is verified, so it names the canonical account for
+        // that address (one address, one user_id: password-identity.ts), creating it if there is none: a new
+        // address is a new organizer account (sign-up auto-approves), an existing one (password, invitation,
+        // email sign-up) is the same person arriving by another door and gets the Google identity attached.
+        userId = await resolveOrCreateEmailAccount(client, email, identity.displayName);
+        // A credential nobody knows, so the account cannot be claimed by typing its address into POST /v1/signup;
+        // it never overwrites an existing one. Google or password recovery (portal-email-auth.ts) is the way in.
+        await ensureUnknownPasswordCredential(client, userId, email);
+        const attached = await client.query<{ user_id: string }>(
+          `INSERT INTO control_plane.user_identities(id, user_id, provider, provider_subject_digest, verified_at)
+           VALUES ($1, $2, 'google', $3, now())
+           ON CONFLICT (provider, provider_subject_digest) DO NOTHING
+           RETURNING user_id`,
+          [opaque("idnt"), userId, subjectDigest]);
+        if (!attached.rows[0]) {
+          // A concurrent first sign-in with the same Google account won: its row stands, and so is ours.
+          const winner = await client.query<{ user_id: string }>(
+            "SELECT user_id FROM control_plane.user_identities WHERE provider = 'google' AND provider_subject_digest = $1", [subjectDigest]);
+          userId = winner.rows[0]?.user_id ?? userId;
         }
-        await client.query(
-          "INSERT INTO control_plane.user_identities(id, user_id, provider, provider_subject_digest, verified_at) VALUES ($1, $2, 'google', $3, now())",
-          [opaque("idnt"), userId, subjectDigest],
-        );
       }
+      const active = await client.query("SELECT 1 FROM control_plane.users WHERE id = $1 AND status = 'active' FOR SHARE", [userId]);
+      if (!active.rows[0]) { await client.query("ROLLBACK"); return await refuse("ACCOUNT_INACTIVE"); }
       const session = await createWebSession(client, userId, deps.sessionTtlSeconds);
       await recordFunnelEvent(client, "google_auth", { outcome: "success", userId });
-      await client.query("UPDATE control_plane.web_auth_attempts SET consumed_at = now() WHERE id = $1", [attempt.id]);
       await client.query("COMMIT");
-      setWebSessionCookies(reply, deps, session);
-      return reply.redirect(`${deps.publicOrigin}${attempt.return_to}`);
-    } catch {
-      await client.query("ROLLBACK");
-      await recordFunnelEvent(deps.db, "google_auth", { outcome: "failure" }).catch(() => {});
-      return reply.code(401).send({ error: "GOOGLE_AUTH_FAILED" });
+      setWebSessionCookies(reply, deps, session, { embedded: embeddedRequest(body) });
+      return { appPath: validatedReturnTo(body.returnTo) };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      // A database fault is not "Google said no": it stays a 500 (and the log line has the code, not the cause's text).
+      emailAuthLog(structuredLog("error", "google_sign_in.failed", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN" }));
+      throw error;
     } finally {
       client.release();
     }

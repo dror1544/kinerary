@@ -317,7 +317,7 @@ def compose_defines_web(compose_text: str) -> bool:
 
 
 # The env:// targets compose.vm.yml gives the api for the `web` block's secret references.
-WEB_API_ENV = ("RUNTIME_EXCHANGE_KEY", "GOOGLE_WEB_CLIENT_ID", "GOOGLE_WEB_CLIENT_SECRET")
+WEB_API_ENV = ("RUNTIME_EXCHANGE_KEY", "PORTAL_EMAIL_API_KEY")
 WEB_REQUIRED_ENV = ("RUNTIME_EXCHANGE_KEY", "RUNTIME_COOKIE_SECRET", "PORTAL_ORIGIN", "RUNTIME_ORIGIN",
                     "KINERARY_ARCHITECTURE_PROFILE")
 
@@ -367,9 +367,20 @@ def web_config_problems(env: Dict[str, str], profile: Optional[Dict]) -> List[st
                 have, want = env.get(env_name, "").rstrip("/"), str(web.get(key, "")).rstrip("/")
                 if have and want and have != want:
                     problems.append(f"{env_name} differs from the profile's web.{key}")
+            # Google sign-in is the Identity Services ID-token flow: ONE public string, no secret, no env variable. The
+            # old secret-ref pair is refused by the api's config loader at boot; found here it is a refused plan instead.
+            for retired in ("google_client_id_secret_ref", "google_client_secret_ref"):
+                if retired in web:
+                    problems.append(f"web.{retired} is no longer supported: replace the pair with web.google_client_id "
+                                    f"(the OAuth client ID, a string ending in .apps.googleusercontent.com)")
+            google_id = web.get("google_client_id")
+            if google_id is not None and not (isinstance(google_id, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.apps\.googleusercontent\.com", google_id)):
+                problems.append("web.google_client_id is not an OAuth client ID (it must end in .apps.googleusercontent.com)")
             # An env:// reference can only be satisfied by a variable compose.vm.yml hands the
             # api; anything else is empty there and stops the api at boot.
             for key, ref in sorted(web.items()):
+                if key in ("google_client_id_secret_ref", "google_client_secret_ref"):
+                    continue  # already reported above, with the instruction
                 if key.endswith("_secret_ref") and isinstance(ref, str) and ref.startswith("env://"):
                     name = ref[len("env://"):]
                     if name not in WEB_API_ENV:
