@@ -86,6 +86,8 @@ export const PORTAL_SCOPE_POLICY: Readonly<Record<string, RouteScope>> = Object.
   "POST /v1/auth/telegram-mini-app": "open",
   // Sign in with Google (ID token). Never reads the session cookie: the signed token is the whole authority.
   "POST /v1/auth/google": "open",
+  // The single-use nonce for it: sets a random cookie and returns its hash. Reads no session.
+  "GET /v1/auth/google/nonce": "open",
   "POST /v1/auth/password": "open",
   "POST /v1/site-invites/inspect": "open",
   "POST /internal/runtime-launch/consume": "open",

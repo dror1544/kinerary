@@ -5,6 +5,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { App } from "../App";
 import { GSI_SCRIPT } from "./GoogleSignInButton";
 
+let nonces = 0;
 const CLIENT_ID = "123456789012-fixture.apps.googleusercontent.com";
 type Callback = (response: { credential?: string }) => void;
 
@@ -12,8 +13,8 @@ const json = (body: unknown, status = 200) => new Response(JSON.stringify(body),
 
 /** Stands in for https://accounts.google.com/gsi/client: records what the page asks of it and draws a marker. */
 function stubGoogle() {
-  const captured: { config?: { client_id: string; callback: Callback }; rendered: HTMLElement[]; options?: Record<string, unknown> } = { rendered: [] };
-  const initialize = vi.fn((config: { client_id: string; callback: Callback }) => { captured.config = config; });
+  const captured: { config?: { client_id: string; nonce?: string; callback: Callback }; rendered: HTMLElement[]; options?: Record<string, unknown> } = { rendered: [] };
+  const initialize = vi.fn((config: { client_id: string; nonce?: string; callback: Callback }) => { captured.config = config; });
   const renderButton = vi.fn((parent: HTMLElement, options: Record<string, unknown>) => {
     captured.rendered.push(parent); captured.options = options;
     const marker = document.createElement("div"); marker.textContent = "Google's own button"; parent.appendChild(marker);
@@ -29,13 +30,14 @@ function mount(route: string, capabilities: Record<string, unknown>, handler: (u
     calls.push(`${init?.method ?? "GET"} ${url}`);
     if (url === "/v1/auth/capabilities") return json({ emailPassword: true, emailSignUp: true, ...capabilities });
     if (url === "/v1/me") return json({ error: "AUTHENTICATION_REQUIRED" }, 401);
+    if (url === "/v1/auth/google/nonce") return json({ nonce: `nonce-${++nonces}` });
     return handler(url, init);
   }));
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><MemoryRouter initialEntries={[route]}><App /></MemoryRouter></QueryClientProvider>);
   return calls;
 }
 
-beforeEach(() => { vi.unstubAllGlobals(); delete window.google; window.sessionStorage.clear(); document.head.querySelectorAll(`script[src="${GSI_SCRIPT}"]`).forEach((node) => node.remove()); });
+beforeEach(() => { nonces = 0; vi.unstubAllGlobals(); delete window.google; window.sessionStorage.clear(); document.head.querySelectorAll(`script[src="${GSI_SCRIPT}"]`).forEach((node) => node.remove()); });
 afterEach(() => { delete window.google; window.sessionStorage.clear(); });
 
 it("draws Google's button on /sign-in from the client ID the server named, and not before the server says google:true", async () => {
@@ -44,6 +46,7 @@ it("draws Google's button on /sign-in from the client ID the server named, and n
   expect(await screen.findByText("Google's own button")).toBeInTheDocument();
   expect(initialize).toHaveBeenCalledTimes(1);
   expect(initialize.mock.calls[0]![0].client_id).toBe(CLIENT_ID);
+  expect(initialize.mock.calls[0]![0].nonce, "the server's single-use nonce is what Google signs into the token").toBe("nonce-1");
   expect(renderButton).toHaveBeenCalledTimes(1);
 });
 
@@ -107,14 +110,32 @@ it("the callback posts the credential (and where to go next) to /v1/auth/google,
 });
 
 it("a refused credential keeps the person on the page with a plain message, and posts nothing else", async () => {
-  const { captured } = stubGoogle();
+  const { captured, initialize } = stubGoogle();
   const calls = mount("/sign-up", { google: true, googleClientId: CLIENT_ID }, (url) => url === "/v1/auth/google" ? json({ error: "GOOGLE_SIGN_IN_FAILED" }, 401) : json({}, 404));
   await screen.findByText("Google's own button");
   captured.config!.callback({ credential: "bad" });
   expect(await screen.findByText("Google sign-in didn't work. Please try again, or use your email.")).toBeInTheDocument();
   expect(calls.filter((call) => call.startsWith("POST")).length).toBe(1);
+  // The attempt spent the nonce, so the button is armed again with a fresh one.
+  await waitFor(() => expect(calls.filter((call) => call === "GET /v1/auth/google/nonce").length).toBe(2));
+  await waitFor(() => expect(initialize).toHaveBeenCalledTimes(2));
+  expect(initialize.mock.calls[1]![0].nonce).toBe("nonce-2");
   // An empty callback (the popup closed without a credential) posts nothing at all.
   captured.config!.callback({});
   expect(await screen.findByText("Google sign-in didn't complete. Please try again.")).toBeInTheDocument();
   expect(calls.filter((call) => call === "POST /v1/auth/google").length).toBe(1);
+});
+
+it("an address Google is not the authority for (GOOGLE_USE_EMAIL_SIGN_UP) points at the email sign-up and sign-in instead of a bare error", async () => {
+  const { captured } = stubGoogle();
+  mount("/sign-in?return_to=%2Ftrips%2Fnew", { google: true, googleClientId: CLIENT_ID }, (url) => url === "/v1/auth/google" ? json({ error: "GOOGLE_USE_EMAIL_SIGN_UP" }, 401) : json({}, 404));
+  await screen.findByText("Google's own button");
+  captured.config!.callback({ credential: "outlook-token" });
+  expect(await screen.findByText(/This address isn't a Google account/)).toBeInTheDocument();
+  expect(screen.getByText(/sign up or sign in with your email instead/)).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "Sign up" })).toHaveAttribute("href", "/sign-up?returnTo=%2Ftrips%2Fnew");
+  expect(screen.getByRole("link", { name: "Sign in" })).toHaveAttribute("href", "/sign-in?return_to=%2Ftrips%2Fnew");
+  expect(screen.queryByText(/Google sign-in didn't work/)).toBeNull();
+  // The nonce was spent, so the button is armed again for another try.
+  await waitFor(() => expect(captured.config!.nonce).toBe("nonce-2"));
 });

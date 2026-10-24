@@ -1,13 +1,14 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { getMe, googleSignIn, safeReturnTo } from "../api";
+import { Link } from "react-router-dom";
+import { ApiError, getMe, googleNonce, googleSignIn, safeReturnTo } from "../api";
 import { isEmbedded, openedByTelegram } from "../mini-app/sdk";
 import { Notice } from "./AccountShell";
 
 /** The part of Google Identity Services this page uses (https://accounts.google.com/gsi/client). */
 interface GoogleIdentityApi {
-  initialize(config: { client_id: string; callback: (response: { credential?: string }) => void; ux_mode?: "popup"; auto_select?: boolean }): void;
+  initialize(config: { client_id: string; nonce?: string; callback: (response: { credential?: string }) => void; ux_mode?: "popup"; auto_select?: boolean }): void;
   renderButton(parent: HTMLElement, options: Record<string, unknown>): void;
 }
 declare global {
@@ -53,6 +54,9 @@ export function GoogleSignInButton({ clientId, returnTo }: { clientId: string; r
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [error, setError] = useState("");
+  // Google vouched for the token but is not the authority for this address (an outlook.com or company address): the
+  // person is sent to the email sign-up instead, whether or not they already have an account.
+  const [useEmail, setUseEmail] = useState(false);
   const [blocked, setBlocked] = useState(false);
   const hidden = googleSignInUnavailableHere();
   // The latest values, read by the callback Google holds on to (initialize runs once per mount).
@@ -62,27 +66,37 @@ export function GoogleSignInButton({ clientId, returnTo }: { clientId: string; r
   useEffect(() => {
     if (hidden) return;
     let live = true;
-    loadGoogleIdentity().then((id) => {
+    // Each sign-in is single use: the server hands out a nonce (the secret stays in an HttpOnly cookie), Google puts it
+    // in the token, and the server spends it on the first attempt. So the button is (re)armed with a fresh nonce on mount
+    // and again after every attempt that did not leave the page.
+    const arm = async (id: GoogleIdentityApi): Promise<void> => {
+      const { nonce } = await googleNonce();
       if (!live || !container.current) return;
       id.initialize({
         client_id: clientId,
+        nonce,
         ux_mode: "popup",
         auto_select: false,
         callback: async ({ credential }) => {
-          if (!credential) { setError("Google sign-in didn't complete. Please try again."); return; }
+          if (!credential) { setError("Google sign-in didn't complete. Please try again."); await arm(id).catch(() => setBlocked(true)); return; }
           setError("");
+          setUseEmail(false);
           try {
             const { appPath } = await googleSignIn({ credential, returnTo: latest.current.returnTo });
             latest.current.queryClient.clear();
             await latest.current.queryClient.fetchQuery({ queryKey: ["me"], queryFn: getMe });
             latest.current.navigate(safeReturnTo(appPath));
           } catch (failure) {
-            setError(failure instanceof Error ? failure.message : "Google sign-in didn't work. Please try again.");
+            if (failure instanceof ApiError && failure.code === "GOOGLE_USE_EMAIL_SIGN_UP") setUseEmail(true);
+            else setError(failure instanceof Error ? failure.message : "Google sign-in didn't work. Please try again.");
+            await arm(id).catch(() => setBlocked(true));
           }
         },
       });
+      container.current.replaceChildren();
       id.renderButton(container.current, { type: "standard", theme: "outline", size: "large", text: "continue_with", shape: "rectangular", logo_alignment: "left" });
-    }).catch(() => { if (live) setBlocked(true); });
+    };
+    loadGoogleIdentity().then(arm).catch(() => { if (live) setBlocked(true); });
     return () => { live = false; };
   }, [clientId, hidden]);
 
@@ -92,6 +106,12 @@ export function GoogleSignInButton({ clientId, returnTo }: { clientId: string; r
       <div ref={container} data-testid="google-signin-button" />
       {blocked && <Notice>Google sign-in couldn't load here. Use your email instead.</Notice>}
       {error && <Notice>{error}</Notice>}
+      {useEmail && (
+        <Notice>
+          This address isn't a Google account &mdash; sign up or sign in with your email instead.{" "}
+          <Link to={`/sign-up?returnTo=${encodeURIComponent(returnTo)}`}>Sign up</Link> &middot; <Link to={`/sign-in?return_to=${encodeURIComponent(returnTo)}`}>Sign in</Link>
+        </Notice>
+      )}
     </div>
   );
 }

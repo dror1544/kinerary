@@ -14,11 +14,14 @@ the runtime UI and data owner; it is not merged into React.
   email sign-up, and an operator's invitation. All three resolve the
   address through one function, `resolveOrCreateEmailAccount`, so a second way
   in never starts a second user.
-- A first Google sign-in whose address Google has verified attaches to the
-  account that address already names — one the person signed up for, or one an
+- A first Google sign-in whose address Google has verified AND runs (`@gmail.com`,
+  `@googlemail.com`, or a Workspace address whose `hd` claim equals its domain) attaches
+  to the account that address already names — one the person signed up for, or one an
   operator invited — or creates it when there is none. An address Google has not
-  verified signs nobody in (`401 GOOGLE_SIGN_IN_FAILED`); there is no account without
-  an address.
+  verified signs nobody in (`401 GOOGLE_SIGN_IN_FAILED`); a verified address Google
+  does not run (outlook.com, a company domain without `hd`) gets
+  `401 GOOGLE_USE_EMAIL_SIGN_UP` and uses the emailed-link sign-up instead, with or
+  without an existing account; there is no account without an address.
 - Every email account holds a credential from birth: the password the person
   chose, or, for an invitation or a Google sign-in, one built from random bytes
   nobody keeps. That is what stops an account being claimed by whoever signs up

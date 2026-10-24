@@ -471,11 +471,17 @@ test("a stale unverified sign-up does not block an invitation, and verifying it 
 test("Google sign-in for the same verified address works with a pending sign-up, and after a verified one lands on the same account", { skip }, async () => {
   const h = harness();
   // The verifier is stubbed here (google-id-token-db.test.ts runs the real one); the route and the account logic are real.
-  const googleSignIn = () => post(h.app, "/v1/auth/google", { credential: "stub-credential" });
+  // The route holds the token's nonce to the cookie it handed out, so the stubbed identity carries the nonce the page was given.
+  const googleSignIn = async () => {
+    const issued = await h.app.inject({ method: "GET", url: "/v1/auth/google/nonce" });
+    h.google.next = { ...h.google.next, nonce: issued.json().nonce };
+    const cookie = ([] as string[]).concat(issued.headers["set-cookie"] as string[]).find((c) => c.startsWith("kit_gnonce="))!.split(";")[0]!;
+    return post(h.app, "/v1/auth/google", { credential: "stub-credential" }, { cookie });
+  };
   try {
     const pending = addr("gpending");
     await signUp(h.app, pending); await portalMailIdle();
-    h.google.next = { subject: `g-${suffix}-1`, displayName: "Gina", email: pending, emailVerified: true };
+    h.google.next = { subject: `g-${suffix}-1`, displayName: "Gina", email: pending, emailVerified: true, hd: "mail.example.test" };
     const callback = await googleSignIn();
     assert.equal(callback.statusCode, 200, callback.body);
     const session = cookiesOf(callback)!;
@@ -488,7 +494,7 @@ test("Google sign-in for the same verified address works with a pending sign-up,
     const verified = addr("gverified");
     const { session: own } = await newAccount(h, verified);
     const ownId = (await me(h.app, own.cookie)).json().id;
-    h.google.next = { subject: `g-${suffix}-2`, displayName: "Gina", email: verified, emailVerified: true };
+    h.google.next = { subject: `g-${suffix}-2`, displayName: "Gina", email: verified, emailVerified: true, hd: "mail.example.test" };
     const viaGoogle = await googleSignIn();
     assert.equal(viaGoogle.statusCode, 200);
     assert.equal((await me(h.app, cookiesOf(viaGoogle)!.cookie)).json().id, ownId, "one address, one user_id");

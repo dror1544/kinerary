@@ -49,6 +49,11 @@ function base64url(bytes = 32): string {
 
 const scrypt = promisify(scryptCallback);
 
+const GOOGLE_NONCE_COOKIE = "kit_gnonce";
+const GOOGLE_NONCE_PATH = "/v1/auth/google";
+/** What the page hands Google Identity Services as `nonce`: the hash of the secret only the cookie holds. */
+const googleNonceFor = (secret: string): string => createHash("sha256").update(secret).digest("hex");
+
 function safeEqual(left: string, right: string): boolean {
   const a = Buffer.from(left);
   const b = Buffer.from(right);
@@ -100,9 +105,9 @@ function parseCookies(header: unknown): Record<string, string> {
  * Only the Mini App's own sign-in asks for it (`embedded` in the request, set
  * by the page when it finds itself in a frame). The ordinary portal keeps Lax.
  */
-function cookie(name: string, value: string, options: { maxAge?: number; httpOnly?: boolean; secure?: boolean; crossSite?: boolean } = {}): string {
+function cookie(name: string, value: string, options: { maxAge?: number; httpOnly?: boolean; secure?: boolean; crossSite?: boolean; path?: string } = {}): string {
   const crossSite = options.crossSite === true && options.secure !== false;
-  const pieces = [`${name}=${encodeURIComponent(value)}`, "Path=/", crossSite ? "SameSite=None" : "SameSite=Lax"];
+  const pieces = [`${name}=${encodeURIComponent(value)}`, `Path=${options.path ?? "/"}`, crossSite ? "SameSite=None" : "SameSite=Lax"];
   if (options.secure !== false) pieces.push("Secure");
   if (crossSite) pieces.push("Partitioned");
   if (options.httpOnly !== false) pieces.push("HttpOnly");
@@ -114,7 +119,12 @@ export function validatedReturnTo(value: unknown): string {
   if (typeof value !== "string" || !value.startsWith("/") || value.startsWith("//") || value.includes("\\")) return "/trips";
   try {
     const parsed = new URL(value, "https://portal.invalid");
-    return parsed.origin === "https://portal.invalid" ? `${parsed.pathname}${parsed.search}${parsed.hash}` : "/trips";
+    if (parsed.origin !== "https://portal.invalid") return "/trips";
+    const normalized = `${parsed.pathname}${parsed.search}${parsed.hash}`;
+    // Normalisation can CREATE what the checks above refused: "/.//evil.example" and "/trips/../..//evil.example" both
+    // resolve to "//evil.example", which a browser reads as another site. So the OUTPUT is held to the same rule as the
+    // input; that makes this function idempotent (validatedReturnTo(validatedReturnTo(x)) === validatedReturnTo(x)).
+    return normalized.startsWith("/") && !normalized.startsWith("//") && !normalized.includes("\\") ? normalized : "/trips";
   } catch {
     return "/trips";
   }
@@ -131,6 +141,10 @@ export interface GoogleIdentity {
    * same person); the route checks it again.
    */
   emailVerified: boolean;
+  /** The token's `hd` claim: the Google Workspace domain the account belongs to. Absent for a consumer Google account. */
+  hd?: string;
+  /** The token's `nonce` claim: what the page gave Google Identity Services. The route holds it to the sign-in cookie. */
+  nonce?: string;
 }
 
 /**
@@ -140,7 +154,8 @@ export interface GoogleIdentity {
  */
 export type GoogleRefusal =
   | "CREDENTIAL_MISSING" | "SIGNATURE_INVALID" | "AUDIENCE_MISMATCH" | "ISSUER_MISMATCH" | "TOKEN_EXPIRED"
-  | "TOKEN_MALFORMED" | "SUBJECT_MISSING" | "EMAIL_MISSING" | "EMAIL_UNVERIFIED" | "VERIFY_FAILED";
+  | "TOKEN_MALFORMED" | "SUBJECT_MISSING" | "EMAIL_MISSING" | "EMAIL_UNVERIFIED" | "AZP_MISMATCH"
+  | "NONCE_MISSING" | "NONCE_MISMATCH" | "EMAIL_NOT_GOOGLE_AUTHORITATIVE" | "VERIFY_FAILED";
 
 export class GoogleSignInRefused extends Error {
   constructor(readonly reason: GoogleRefusal) { super(reason); this.name = "GoogleSignInRefused"; }
@@ -173,6 +188,8 @@ export class GoogleIdTokenClient implements GoogleIdTokenVerifier {
       throw new GoogleSignInRefused(refusalFor(error instanceof Error ? error.message : ""));
     }
     if (!payload?.sub) throw new GoogleSignInRefused("SUBJECT_MISSING");
+    // `azp` is the client the token was issued to. When Google says one, it must be ours (aud alone is checked by the library).
+    if (payload.azp !== undefined && payload.azp !== this.clientId) throw new GoogleSignInRefused("AZP_MISMATCH");
     if (!payload.email) throw new GoogleSignInRefused("EMAIL_MISSING");
     // `=== true`, not `!== false`: an absent claim must not read as verified, because this is what decides
     // that Google's address and an existing account's address are the same person.
@@ -182,8 +199,29 @@ export class GoogleIdTokenClient implements GoogleIdTokenVerifier {
       displayName: payload.name?.trim().slice(0, 120) || payload.email.split("@")[0]?.slice(0, 120) || "Kinerary organizer",
       email: payload.email,
       emailVerified: true,
+      ...(typeof payload.nonce === "string" ? { nonce: payload.nonce } : {}),
+      ...(typeof payload.hd === "string" ? { hd: payload.hd } : {}),
     };
   }
+}
+
+/**
+ * Whether Google is AUTHORITATIVE for this address, i.e. whether Google's say-so that "this person controls
+ * <address>" is as good as this system proving it itself by an emailed link. It is for @gmail.com and
+ * @googlemail.com (Google runs that mailbox), and for a Workspace account whose `hd` claim equals the address's
+ * domain (Google runs that domain's mail). For anyone else `email_verified` only says Google once sent a code to
+ * an address it does not run (an outlook.com or company address attached to a Google account), which is not proof
+ * that its owner is the person holding the token. Those addresses use the emailed-link sign-up instead, whether or
+ * not an account exists: the answer must not tell the two apart. Exact domain equality, never a suffix match
+ * ("gmail.com.evil.test", "notgmail.com" and a subdomain of `hd` are all refused).
+ */
+export function googleIsAuthoritativeFor(email: string, hostedDomain?: string): boolean {
+  const at = email.lastIndexOf("@");
+  if (at < 1) return false;
+  const domain = email.slice(at + 1).trim().toLowerCase();
+  if (!domain) return false;
+  if (domain === "gmail.com" || domain === "googlemail.com") return true;
+  return typeof hostedDomain === "string" && hostedDomain.trim() !== "" && domain === hostedDomain.trim().toLowerCase();
 }
 
 function refusalFor(message: string): GoogleRefusal {
@@ -992,8 +1030,9 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
 
   // ── Sign in with Google (Google Identity Services, ID-token flow) ──
   //
+  //   GET  /v1/auth/google/nonce                                   200 { nonce } + the kit_gnonce cookie (see SINGLE USE below)
   //   POST /v1/auth/google  { credential, returnTo?, embedded? }  200 { appPath } + session cookies
-  //                         | 401 GOOGLE_SIGN_IN_FAILED | 403 ORIGIN_INVALID | 429 SIGN_IN_RATE_LIMITED | 503 GOOGLE_SIGN_IN_UNAVAILABLE
+  //                         | 401 GOOGLE_SIGN_IN_FAILED | 401 GOOGLE_USE_EMAIL_SIGN_UP | 403 ORIGIN_INVALID | 429 SIGN_IN_RATE_LIMITED | 503 GOOGLE_SIGN_IN_UNAVAILABLE
   //
   // Sign-up and sign-in in one. Policy `open` (portal-scope.ts): it never reads the session cookie. `credential`
   // is the signed ID token the page's Google button yields. Origin must be ours (a page on another site must not be
@@ -1002,7 +1041,30 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
   // (garbage, bad signature, wrong audience or issuer, expired, no verified address, a suspended account), is the
   // same 401 GOOGLE_SIGN_IN_FAILED, so the route tells a caller nothing about which part was wrong. The cause goes to
   // the log as a reason CODE only: never the token, never the address.
+  //
+  // SINGLE USE, AND BOUND TO THE BROWSER THAT ASKED. A signed ID token is a bearer credential that stays valid for
+  // about an hour, and it is readable (it is a JWT), so one that leaks (a log, a proxy, a screenshot) could be posted
+  // by anyone. So the page first calls GET /v1/auth/google/nonce: the server makes a random secret, sets it in a
+  // short-lived HttpOnly cookie scoped to /v1/auth/google, and returns only its SHA-256 as the `nonce` the page hands
+  // Google. Google puts that nonce in the token; the POST accepts the token only if SHA-256(cookie) equals the token's
+  // nonce, and clears the cookie whatever the outcome. A leaked token shows the hash, not the secret, so it cannot be
+  // replayed (an attacker cannot forge the cookie from the token), and even the browser that obtained it has spent
+  // the secret. Chosen over recording used token hashes until `exp`: that needs a table (a migration) or memory (lost
+  // on restart, wrong with two instances), and only stops a second use, where this also stops a use from anywhere else.
   const googleIpAttempts: Attempts = new Map();
+  const googleNonceIpAttempts: Attempts = new Map();
+  const nonceCookie = (value: string, maxAge: number) =>
+    cookie(GOOGLE_NONCE_COOKIE, value, { maxAge, secure: deps.publicOrigin.startsWith("https://"), path: GOOGLE_NONCE_PATH });
+  app.get("/v1/auth/google/nonce", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    if (!deps.google) return reply.code(503).send({ error: "GOOGLE_SIGN_IN_UNAVAILABLE" });
+    if (!admitLogin(googleNonceIpAttempts, request.ip, 60)) {
+      return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
+    }
+    const secret = base64url(32);
+    reply.header("set-cookie", nonceCookie(secret, 300));
+    return { nonce: googleNonceFor(secret) };
+  });
   app.post("/v1/auth/google", async (request, reply) => {
     reply.header("cache-control", "private, no-store");
     if (!deps.google) return reply.code(503).send({ error: "GOOGLE_SIGN_IN_UNAVAILABLE" });
@@ -1010,8 +1072,17 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
       return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
     }
     if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
+    // From here the secret is spent, whatever the outcome.
+    const nonceSecret = parseCookies(request.headers.cookie)[GOOGLE_NONCE_COOKIE];
+    reply.header("set-cookie", nonceCookie("", 0));
     const body = jsonBody(request);
     const refuse = async (reason: GoogleRefusal | "ACCOUNT_INACTIVE") => {
+      if (reason === "EMAIL_NOT_GOOGLE_AUTHORITATIVE") {
+        // A valid, correctly bound token for an address Google does not run: point at the email sign-up. Nothing is
+        // written (no funnel row either), and it is the same answer whether or not the address has an account.
+        emailAuthLog(structuredLog("warn", "google_sign_in.refused", { reason }));
+        return reply.code(401).send({ error: "GOOGLE_USE_EMAIL_SIGN_UP" });
+      }
       emailAuthLog(structuredLog("warn", "google_sign_in.refused", { reason }));
       await recordFunnelEvent(deps.db, "google_auth", { outcome: "failure" }).catch(() => {});
       return reply.code(401).send({ error: "GOOGLE_SIGN_IN_FAILED" });
@@ -1024,6 +1095,11 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
       return refuse(error instanceof GoogleSignInRefused ? error.reason : "VERIFY_FAILED");
     }
     if (!identity.email || !identity.emailVerified) return refuse("EMAIL_UNVERIFIED");
+    if (!nonceSecret) return refuse("NONCE_MISSING");
+    if (!identity.nonce || !safeEqual(googleNonceFor(nonceSecret), identity.nonce)) return refuse("NONCE_MISMATCH");
+    // Last of the token checks, so that only a token that is genuine AND bound to this browser can learn this answer;
+    // and before any lookup, so it cannot depend on whether the address already has an account.
+    if (!googleIsAuthoritativeFor(identity.email, identity.hd)) return refuse("EMAIL_NOT_GOOGLE_AUTHORITATIVE");
     const subjectDigest = sha256(`google:${identity.subject}`);
     const client = await deps.db.connect();
     try {

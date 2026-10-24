@@ -13,6 +13,23 @@ test("return paths are same-origin and retain a join fragment", () => {
   }
 });
 
+test("return paths stay same-origin AFTER normalisation, and validatedReturnTo is idempotent", () => {
+  // Each of these resolves to "//evil.example" (another site, to a browser) once the URL parser has folded the dots.
+  for (const attack of ["/.//evil.example", "/trips/../..//evil.example", "/a/..//evil.example/x?y=1#z", "/./..//evil.example", "/x/%2e%2e//evil.example"]) {
+    assert.equal(validatedReturnTo(attack), "/trips", attack);
+  }
+  assert.equal(validatedReturnTo("/./evil.example"), "/evil.example", "a dot segment that leaves one leading slash is an ordinary path");
+  const samples = [
+    "/trips", "/trips/trip_abcdefgh/app?from=ready#panel", "/join#token=abc", "/.//evil.example", "/trips/../..//evil.example", "//x", "/\\x", "/a/./b/../c",
+    "/%2f%2fevil.example", "/trips?next=//evil.example", "https://evil.example", "", "x", 5, null, undefined,
+  ];
+  for (const sample of samples) {
+    const once = validatedReturnTo(sample);
+    assert.equal(validatedReturnTo(once), once, `idempotent for ${JSON.stringify(sample)}`);
+    assert.ok(once.startsWith("/") && !once.startsWith("//") && !once.startsWith("/\\"), `${JSON.stringify(sample)} -> ${once}`);
+  }
+});
+
 test("token digests are deterministic and never contain the source token", () => {
   const digest = sha256("raw-secret-token");
   assert.match(digest, /^sha256:[a-f0-9]{64}$/);

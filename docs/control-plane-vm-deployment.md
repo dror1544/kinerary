@@ -884,7 +884,22 @@ drifting. Notes on what you are filling in:
   sign-up), attaches the Google identity to it: one address is one user. Every failure
   (garbage, bad signature, wrong audience or issuer, expired, unverified address) is the
   same `401 GOOGLE_SIGN_IN_FAILED`; the api logs `google_sign_in.refused` with a reason
-  code only, never the token or the address. The button is not drawn inside the Telegram
+  code only, never the token or the address. A token is also single use and bound to the
+  browser that asked: the page first calls `GET /v1/auth/google/nonce` (the api sets a
+  five-minute HttpOnly cookie, `kit_gnonce`, and returns only its hash for Google to sign
+  into the token), and `POST /v1/auth/google` accepts the token only with that cookie, which
+  it clears whatever the outcome. A token's `azp`, when present, must be the client ID.
+  Google signs people in only for addresses **Google itself runs** (owner decision
+  2026-10-23: "if it is a google account it will do the signing, otherwise regular
+  signup"): `@gmail.com` and `@googlemail.com`, or a Workspace address whose token carries an
+  `hd` claim equal to the address's domain (exact match, not a suffix). Any other address,
+  an `outlook.com` or company address that is merely attached to a Google account, is
+  refused with `401 {"error":"GOOGLE_USE_EMAIL_SIGN_UP"}` and the page says "This address
+  isn't a Google account", with links to the email sign-up and sign-in. The answer is the
+  same whether or not that address already has an account, nothing is written, and the
+  api logs `google_sign_in.refused` with reason `EMAIL_NOT_GOOGLE_AUTHORITATIVE` only. It
+  is given only for a genuine token bound to the asking browser; anything else is the
+  ordinary `GOOGLE_SIGN_IN_FAILED`. The button is not drawn inside the Telegram
   Mini App, because Google's popup cannot open there.
   The previous profile fields `google_client_id_secret_ref` and `google_client_secret_ref`
   are **refused** (the api will not boot with them, and `kinerary-cp-release plan` says

@@ -7,6 +7,7 @@ import { App } from "./App";
 function renderRoute(route: string, authenticated = false) {
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
+    if (url === "/v1/auth/google/nonce") return new Response(JSON.stringify({ nonce: "n".repeat(64) }));
     if (url === "/v1/auth/capabilities") return new Response(JSON.stringify({ google: true, googleClientId: "123456789012-fixture.apps.googleusercontent.com", emailPassword: true }));
     if (url === "/v1/me") return new Response(authenticated ? JSON.stringify({ id: "user_test", displayName: "Test Organizer" }) : JSON.stringify({ error: "AUTHENTICATION_REQUIRED" }), { status: authenticated ? 200 : 401, headers: { "content-type": "application/json" } });
     if (url === "/v1/trips") return new Response(JSON.stringify({ trips: [] }), { status: 200, headers: { "content-type": "application/json" } });

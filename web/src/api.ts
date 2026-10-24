@@ -83,6 +83,7 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
       INVALID_CREDENTIALS: "Email or password is incorrect.",
       SIGN_IN_RATE_LIMITED: "Too many sign-in attempts. Please try again in a minute.",
       GOOGLE_SIGN_IN_UNAVAILABLE: "Google sign-in is not available here.",
+      GOOGLE_USE_EMAIL_SIGN_UP: "This address isn't a Google account — sign up or sign in with your email instead.",
       GOOGLE_SIGN_IN_FAILED: "Google sign-in didn't work. Please try again, or use your email.",
       ACTIVE_ENROLLMENT_EXISTS: "An interview link already exists. You can replace a lost link before the interview starts.",
       TRIP_NOT_DRAFT: "Your interview has already started. Continue in your existing Telegram chat.",
@@ -148,6 +149,8 @@ const meSchema: z.ZodType<Me> = z.object({ id: z.string(), displayName: z.string
  * Sign-up and sign-in with Google in one: posts the signed ID token Google Identity Services gave the page
  * (components/GoogleSignInButton.tsx). The server verifies it; nothing here decides who the person is.
  */
+/** A single-use nonce for one Google sign-in: its secret is in an HttpOnly cookie, only its hash is returned (hand it to Google as `nonce`). */
+export const googleNonce = () => api<{ nonce: string }>("/v1/auth/google/nonce");
 export const googleSignIn = (input: { credential: string; returnTo: string; embedded?: true }) =>
   api<{ appPath: string }>("/v1/auth/google", { method: "POST", body: JSON.stringify(input) });
 
@@ -235,7 +238,13 @@ export const resetPassword = (input: { token: string; password: string }) =>
 
 export function safeReturnTo(value: string | null): string {
   if (!value?.startsWith("/") || value.startsWith("//") || value.includes("\\")) return "/trips";
-  try { const url = new URL(value, "https://portal.invalid"); return url.origin === "https://portal.invalid" ? `${url.pathname}${url.search}${url.hash}` : "/trips"; } catch { return "/trips"; }
+  try {
+    const url = new URL(value, "https://portal.invalid");
+    if (url.origin !== "https://portal.invalid") return "/trips";
+    const out = `${url.pathname}${url.search}${url.hash}`;
+    // "/.//evil.example" folds to "//evil.example": hold the OUTPUT to the rule too (the server does the same).
+    return out.startsWith("//") || out.includes("\\") ? "/trips" : out;
+  } catch { return "/trips"; }
 }
 
 export const removeTripMember = (tripId: string, membershipId: string) =>
