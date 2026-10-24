@@ -48,6 +48,7 @@ it("draws Google's button on /sign-in from the client ID the server named, and n
   expect(initialize.mock.calls[0]![0].client_id).toBe(CLIENT_ID);
   expect(initialize.mock.calls[0]![0].nonce, "the server's single-use nonce is what Google signs into the token").toBe("nonce-1");
   expect(renderButton).toHaveBeenCalledTimes(1);
+  expect(renderButton.mock.calls[0]![1]).toMatchObject({ locale: document.documentElement.lang || "en" });
 });
 
 it("draws it on /sign-up too", async () => {
