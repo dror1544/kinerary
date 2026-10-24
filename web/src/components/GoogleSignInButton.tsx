@@ -94,7 +94,8 @@ export function GoogleSignInButton({ clientId, returnTo }: { clientId: string; r
         },
       });
       container.current.replaceChildren();
-      id.renderButton(container.current, { type: "standard", theme: "outline", size: "large", text: "continue_with", shape: "rectangular", logo_alignment: "left" });
+      // Without `locale` Google draws the button in the browser's or Google account's language, not the page's.
+      id.renderButton(container.current, { type: "standard", theme: "outline", size: "large", text: "continue_with", shape: "rectangular", logo_alignment: "left", locale: document.documentElement.lang || "en" });
     };
     loadGoogleIdentity().then(arm).catch(() => { if (live) setBlocked(true); });
     return () => { live = false; };
