@@ -30,7 +30,12 @@ export default function SignUpPage() {
   });
 
   if (me.data && me.data.scope !== "telegram") return <Navigate replace to={returnTo} />;
-  if ((capabilities.data && capabilities.data.emailSignUp !== true) || (request.error instanceof ApiError && request.error.code === "SIGN_UP_UNAVAILABLE")) {
+  // Closed only when NO way to create an account is offered: Google signs a new person up too, so an
+  // email sign-up that is off (or answers SIGN_UP_UNAVAILABLE) still leaves this page open for Google.
+  const googleOffered = Boolean(capabilities.data?.google && capabilities.data.googleClientId);
+  const emailClosed = (capabilities.data !== undefined && capabilities.data.emailSignUp !== true)
+    || (request.error instanceof ApiError && request.error.code === "SIGN_UP_UNAVAILABLE");
+  if (emailClosed && !googleOffered) {
     return <SignUpClosed returnTo={returnTo} />;
   }
 
@@ -46,10 +51,12 @@ export default function SignUpPage() {
   const submit = (event: FormEvent) => { event.preventDefault(); request.mutate(); };
   return (
     <AccountShell eyebrow="Kinerary personal space" title="Create your account">
-      <p>Create an organizer account to plan trips. We'll email you a link; you choose your name and password there, and the account is created once you do.</p>
+      {emailClosed
+        ? <p>Create an organizer account to plan trips with your Google account. Sign-up by email isn't open yet.</p>
+        : <p>Create an organizer account to plan trips. We'll email you a link; you choose your name and password there, and the account is created once you do.</p>}
       {capabilities.isPending && <p>Loading sign-up options…</p>}
       {capabilities.isError && <Notice>Sign-up is unavailable. Please retry in a moment.</Notice>}
-      {capabilities.data?.emailSignUp === true && (
+      {capabilities.data?.emailSignUp === true && !emailClosed && (
         <form className="compact-form" onSubmit={submit}>
           <label>Email<input required type="email" maxLength={254} autoComplete="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} /></label>
           <button className="button wide" disabled={request.isPending}>{request.isPending ? "Sending…" : "Email me a link"}</button>
