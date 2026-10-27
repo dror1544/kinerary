@@ -18,7 +18,9 @@ catch, and stays quiet on the grandfathered tree it must not touch.
 """
 from __future__ import annotations
 
+import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -28,22 +30,49 @@ MIGRATIONS = REPO / "control-plane/db/migrations"
 
 GOOD_HEADER = "-- rollback: compatible — one new table; nothing existing changes shape\n"
 
+# The probes below stage files, so they must not do it in the real repository: a
+# crash between `git add -f` and the cleanup leaves a probe file in the real
+# index (or, for a migration, in the real migrations directory) for the next
+# commit to pick up (#135). They run in a throwaway shared clone instead. The
+# clone holds HEAD's tree, so the working-tree copy of the script under test
+# (and the allow-list) is copied over it: uncommitted edits are what get tested.
+CLONE_ROOT: Path | None = None
+CLONE: Path | None = None
+CLONE_SCRIPT: Path | None = None
+
+
+def setUpModule() -> None:
+    global CLONE_ROOT, CLONE, CLONE_SCRIPT
+    CLONE_ROOT = Path(tempfile.mkdtemp(prefix="preflight-probe-"))
+    CLONE = CLONE_ROOT / "r"
+    subprocess.run(["git", "clone", "-q", "--shared", str(REPO), str(CLONE)], check=True, capture_output=True)
+    CLONE_SCRIPT = CLONE / "scripts/preflight-checks.sh"
+    shutil.copy2(SCRIPT, CLONE_SCRIPT)
+    if (REPO / ".preflight-allow").exists():
+        shutil.copy2(REPO / ".preflight-allow", CLONE / ".preflight-allow")
+
+
+def tearDownModule() -> None:
+    if CLONE_ROOT is not None:
+        shutil.rmtree(CLONE_ROOT, ignore_errors=True)
+
 
 def staged(name: str, body: str) -> tuple[int, str]:
-    """Write a migration, run --staged over it, and always clean up.
+    """Write a migration into the throwaway clone, run --staged over it there,
+    and always clean up.
 
     --staged, not --paths: --paths is the Claude-hook fast path and returns
     after B4, so B7 never runs there. Getting that wrong makes every case below
     look like it passes.
     """
-    path = MIGRATIONS / name
+    path = CLONE / "control-plane/db/migrations" / name
     path.write_text(body, encoding="utf-8")
     try:
-        subprocess.run(["git", "add", "-f", str(path)], cwd=REPO, capture_output=True, check=True)
-        r = subprocess.run([str(SCRIPT), "--staged"], cwd=REPO, capture_output=True, text=True)
+        subprocess.run(["git", "add", "-f", str(path)], cwd=CLONE, capture_output=True, check=True)
+        r = subprocess.run([str(CLONE_SCRIPT), "--staged"], cwd=CLONE, capture_output=True, text=True)
         return r.returncode, r.stdout
     finally:
-        subprocess.run(["git", "restore", "--staged", str(path)], cwd=REPO, capture_output=True)
+        subprocess.run(["git", "restore", "--staged", str(path)], cwd=CLONE, capture_output=True)
         path.unlink(missing_ok=True)
 
 
@@ -86,6 +115,27 @@ class MigrationNaming(unittest.TestCase):
         code, out = staged("20260919143003_zz_probe.sql", body)
         self.assertNotIn("rollback contract", out)
         self.assertEqual(code, 0, out)
+
+
+class TheRealRepositoryIsNotTouched(unittest.TestCase):
+    """#135: the probes used to `git add -f` into the real index and write into
+    the real migrations directory. A crash in between left a probe staged for
+    the next commit."""
+
+    def real_index(self) -> str:
+        return subprocess.run(["git", "diff", "--cached", "--name-only"], cwd=REPO,
+                              capture_output=True, text=True, check=True).stdout
+
+    def test_staging_a_probe_leaves_the_real_index_and_migrations_untouched(self):
+        before = self.real_index()
+        staged("20260919143099_zz_probe.sql", GOOD_HEADER + "SELECT 1;\n")
+        self.assertEqual(self.real_index(), before)
+        self.assertEqual(list(MIGRATIONS.glob("*_zz_probe.sql")), [])
+        self.assertEqual(list((CLONE / "control-plane/db/migrations").glob("*_zz_probe.sql")), [],
+                         "the clone is cleaned between probes too")
+
+    def test_the_clone_runs_the_working_tree_copy_of_the_script(self):
+        self.assertEqual(CLONE_SCRIPT.read_bytes(), SCRIPT.read_bytes())
 
 
 class GrandfatheredTree(unittest.TestCase):

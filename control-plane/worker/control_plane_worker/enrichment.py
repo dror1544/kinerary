@@ -559,7 +559,16 @@ def _enrich_consular(
     home-country embassy/consulate a traveler in trouble actually calls."""
     if consular_lookup is None or not destination or not destination.strip():
         return
-    contacts = consular_lookup(destination.strip(), _home_country(out))
+    # country_reference is keyed on the country, and organizers answer with an
+    # itinerary ("Tokyo, Hakone, Kyoto, Osaka, Japan") — ask for the country
+    # tail first, as _enrich_destination_info does (#161). Fall back to the whole
+    # string only when it differs, for a row an older write stored under it.
+    home = _home_country(out)
+    whole = destination.strip()
+    anchor = _destination_anchor(destination)
+    contacts = consular_lookup(anchor, home) if anchor else None
+    if (not isinstance(contacts, list) or not contacts) and whole != anchor:
+        contacts = consular_lookup(whole, home)
     if not isinstance(contacts, list) or not contacts:
         return
     cleaned: list[dict[str, Any]] = []

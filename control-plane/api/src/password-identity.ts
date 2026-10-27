@@ -14,7 +14,7 @@ function base64url(bytes = 16): string {
   return randomBytes(bytes).toString("base64url");
 }
 
-async function hashPassword(password: string): Promise<string> {
+export async function hashPassword(password: string): Promise<string> {
   const salt = base64url(16);
   const derived = (await scrypt(password, salt, 32)) as Buffer;
   return `scrypt:${salt}:${derived.toString("base64url")}`;
@@ -83,9 +83,10 @@ function nameFromEmail(email: string): string {
  *
  * `verified_at` is written as now(), which is what signup has always written
  * for a password identity without verifying anything either: in this model the
- * column records when the address was asserted, not when it was proven. Real
- * verification is a separate piece of work, and when it arrives it belongs
- * here, once, rather than at each caller.
+ * column records when the address was asserted, not when it was proven. The
+ * portal's email sign-up (portal-email-auth.ts) proves the address with an
+ * emailed token BEFORE it calls this, so an account it creates has been
+ * verified in fact; the other callers still assert only.
  *
  * Runs inside the caller's transaction so the account and whatever it is being
  * created for — a credential, a trip — commit together or not at all.
@@ -95,7 +96,23 @@ export async function resolveOrCreateEmailAccount(
   email: string,
   displayName?: string,
 ): Promise<string> {
-  const emailDigest = digestEmail(email);
+  return resolveOrCreateEmailAccountByDigest(client, digestEmail(email), displayName || nameFromEmail(email));
+}
+
+/**
+ * The body of `resolveOrCreateEmailAccount`, for a caller that holds the
+ * address only as its digest. The portal's email sign-up keeps a pending
+ * sign-up by digest (a stored address is something that can be mailed, and the
+ * table that holds the pending row has no business with one), so by the time
+ * the emailed token is consumed the plaintext address is gone. This is still
+ * THE one place an address becomes a `user_id`: the function above is a wrapper
+ * that computes the digest and the fallback name, so the two cannot diverge.
+ */
+export async function resolveOrCreateEmailAccountByDigest(
+  client: pg.PoolClient,
+  emailDigest: string,
+  displayName: string,
+): Promise<string> {
   const existing = await client.query<{ user_id: string }>(
     "SELECT user_id FROM control_plane.user_identities WHERE provider = 'password' AND provider_subject_digest = $1",
     [emailDigest],
@@ -109,7 +126,7 @@ export async function resolveOrCreateEmailAccount(
   const userId = `user_${randomBytes(16).toString("hex")}`;
   await client.query(
     "INSERT INTO control_plane.users(id, status, display_name) VALUES ($1, 'active', $2)",
-    [userId, (displayName || nameFromEmail(email)).slice(0, 120)],
+    [userId, displayName.slice(0, 120)],
   );
   const inserted = await client.query<{ user_id: string }>(
     `INSERT INTO control_plane.user_identities(id, user_id, provider, provider_subject_digest, verified_at)
@@ -152,11 +169,11 @@ export async function resolveOrCreateEmailAccount(
  * account is structurally identical to one somebody signed up for themselves,
  * and the organizer simply has no password yet.
  *
- * WHAT REPLACES IT. Password recovery, when the landing page and its
- * authentication UX exist. That flow will overwrite this hash with one the
- * organizer chose, which needs nothing added here: it is an ordinary credential
- * in an ordinary account, which is the point of writing it. Until then an
- * invited organizer reaches their trip through Telegram, or through a Google
+ * WHAT REPLACES IT. Password recovery (`POST /v1/auth/password/forgot` and
+ * `/reset`, portal-email-auth.ts) overwrites this hash with one the organizer
+ * chose, which needs nothing added here: it is an ordinary credential in an
+ * ordinary account, which is the point of writing it. Where email is not
+ * configured an invited organizer reaches their trip through Telegram, or through a Google
  * sign-in on the same verified address, which resolves to this same user.
  *
  * NEVER OVERWRITES. `ON CONFLICT DO NOTHING` covers both unique constraints on
@@ -202,8 +219,8 @@ export async function ensureUnknownPasswordCredential(
  * intended shape: their account already holds a credential nobody knows, so
  * this returns INVALID_CREDENTIALS rather than letting whoever gets there first
  * set the password on a trip that is not theirs. The way in for that person is
- * password recovery, which arrives with the landing page; until then it is
- * Telegram, or Google on the same verified address.
+ * password recovery by email (portal-email-auth.ts), or Telegram, or Google on
+ * the same verified address.
  */
 export async function createOrVerifyPasswordIdentity(
   db: pg.Pool,
@@ -285,7 +302,10 @@ export async function verifyPasswordLogin(
     [emailDigest],
   );
   const [row] = result.rows;
-  if (!row || !(await verifyPassword(payload.password, row.password_hash))) {
+  // Missing addresses do the same scrypt work as an incorrect password on an
+  // existing credential. The dummy result can never authenticate an account.
+  const matches = await verifyPassword(payload.password, row?.password_hash ?? `scrypt:unregistered-email-dummy:${Buffer.alloc(32).toString("base64url")}`);
+  if (!row || !matches) {
     return { ok: false, error: "PASSWORD_LOGIN_INVALID_CREDENTIALS" };
   }
   return { ok: true, identity: passwordIdentity(row.user_id, payload.email, emailDigest) };

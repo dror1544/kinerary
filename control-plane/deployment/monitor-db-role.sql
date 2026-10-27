@@ -73,6 +73,9 @@ SELECT set_config('kinerary_fleet_ro.role', :'role', false) AS fleet_ro_role,
 control_plane.assistant_events: trip_id occurred_at event_type channel_type requester_role outcome
 control_plane.assistant_events: response_latency_ms media_kind
 control_plane.companion_bug_reports: id trip_id reported_at kind summary detail quote surface
+control_plane.companion_gateway_events: occurred_at event mode hermes_profile desired reason observed action pin result
+control_plane.companion_gateways: hermes_profile trip_id kind desired reason decided_at pin observed observed_count
+control_plane.companion_gateways: observed_at last_action last_action_at last_result failures next_attempt_at
 control_plane.intake_sessions: id trip_id state created_at updated_at source_document language phase
 control_plane.intake_sessions: awaiting awaiting_since interpret_path expires_at expired_at
 control_plane.intake_versions: trip_id confirmed_at

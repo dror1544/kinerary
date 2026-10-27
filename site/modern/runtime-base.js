@@ -9,6 +9,24 @@
   };
   if (!base) return;
 
+  // Every trip behind the gateway shares one origin, hence one localStorage.
+  // The session keys are scoped to this trip so that one trip's marker (or
+  // cached user) is not read by accident (this is not an isolation boundary: the
+  // trips share one origin, so a page's script can still reach the others' keys); everything else is left as it is.
+  // Done on Storage.prototype because Classic, Modern and their helpers all read
+  // these keys directly, and this file loads before any of them.
+  const scopedKeys = ['trip-token', 'tripToken', 'token', 'trip-user'];
+  if (typeof Storage !== 'undefined' && Storage.prototype && !Storage.prototype.__kineraryTripScoped) {
+    const scope = key => (scopedKeys.includes(key) ? base + ':' + key : key);
+    for (const method of ['getItem', 'setItem', 'removeItem']) {
+      const native = Storage.prototype[method];
+      Storage.prototype[method] = function (key, ...rest) {
+        return native.call(this, this === window.localStorage ? scope(key) : key, ...rest);
+      };
+    }
+    Object.defineProperty(Storage.prototype, '__kineraryTripScoped', { value: true });
+  }
+
   // This is only a UI session marker. The actual runtime JWT remains inside
   // the gateway's authenticated encrypted HttpOnly cookie and is injected upstream there.
   localStorage.setItem('trip-token', 'runtime-gateway-session');

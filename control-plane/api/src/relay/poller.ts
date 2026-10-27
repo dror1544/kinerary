@@ -199,6 +199,7 @@ import {
   type DispatchStrings,
 } from "./dispatch.js";
 import { toWireEvent, type TelegramUpdate } from "./normalize.js";
+import { isOurOpenTripMessage, type OpenTripMessage } from "./open-trip.js";
 import { agentTextIsInLanguage } from "./internal-leak.js";
 import type { WireMessageEvent } from "./protocol.js";
 import { isPermanentRefusal, type SendResult, type TelegramClient } from "./telegram-api.js";
@@ -228,6 +229,13 @@ export interface TripBotPollerDeps {
    * rather than "replying to us".
    */
   botIdentity?: BotIdentity;
+  /**
+   * The bot handle the "Open trip" link points at (`web.telegram_bot_username`);
+   * see DispatchOptions.tripAppBotUsername.
+   */
+  tripAppBotUsername?: string | null;
+  /** Whether the Mini App is ready for that bot, asked per update; see DispatchOptions.tripAppReady. */
+  tripAppReady?: () => boolean;
   /**
    * The Hermes profile that serves written interview answers, from
    * `relay.interviewer_profile`.
@@ -352,6 +360,48 @@ function interviewChatOf(decision: DispatchDecision): string | null {
     default:
       return null;
   }
+}
+
+/**
+ * Takes down the "Open trip" message WE pinned earlier in this chat, if the top
+ * pin is one. Best effort and quiet: no pin rights, no such pin, or a client
+ * that cannot ask, and the new button is posted anyway. "Ours" is decided on
+ * the bot's own id plus the message's shape (open-trip.ts), never on text alone.
+ */
+async function unpinOurOpenTrip(chatId: string, deps: TripBotPollerDeps, log: (line: string) => void): Promise<void> {
+  const botId = deps.botIdentity?.id;
+  if (!botId || !deps.telegram.getPinnedMessage || !deps.telegram.unpinChatMessage) return;
+  try {
+    const pinned = await deps.telegram.getPinnedMessage(chatId);
+    if (!pinned || !isOurOpenTripMessage(pinned, botId)) return;
+    const unpinned = await deps.telegram.unpinChatMessage({ chatId, messageId: pinned.messageId });
+    log(structuredLog("info", "trip_bot.open_trip_unpinned", { unpinned }));
+  } catch (error) {
+    log(structuredLog("warn", "trip_bot.open_trip_unpin_failed", {
+      safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+    }));
+  }
+}
+
+/**
+ * Sends the "Open trip" message and pins it. If it cannot be pinned, the chat is
+ * told so ONCE, in the same breath, with what to do about it: the button already
+ * works where it stands, so this is advice, not an error, and nothing retries.
+ */
+async function postOpenTrip(
+  chatId: string,
+  open: OpenTripMessage,
+  deps: TripBotPollerDeps,
+  log: (line: string) => void,
+): Promise<void> {
+  const sent = await deps.telegram.sendMessage({ chatId, text: open.text, replyMarkup: open.replyMarkup });
+  log(structuredLog("info", "trip_bot.open_trip_sent", { ok: sent.ok }));
+  if (!sent.ok || !sent.messageId) return;
+  const pinned = deps.telegram.pinChatMessage
+    ? await deps.telegram.pinChatMessage({ chatId, messageId: sent.messageId })
+    : false;
+  log(structuredLog("info", "trip_bot.open_trip_pin", { pinned }));
+  if (!pinned) await deps.telegram.sendMessage({ chatId, text: open.pinFailedText });
 }
 
 export async function applyDecision(
@@ -645,13 +695,24 @@ export async function applyDecision(
               : result.outcome === "already_decided" ? "Already decided"
                 : "Could not process this action",
       });
-      if (result.outcome === "error") {
-        log(structuredLog("warn", "trip_bot.approval_rejected", { safe_error_code: result.reason }));
-      }
+      // One line per tap, whatever the outcome (#37): logging only the error
+      // made "the admin tapped Approve and nothing happened" look the same as
+      // "nobody tapped". Deliberately no request id, sender or applicant — the
+      // outcome and, on error, the safe code are all the log needs. This
+      // replaces `trip_bot.approval_rejected`, which nothing read.
+      log(structuredLog(result.outcome === "error" ? "warn" : "info", "trip_bot.approval_processed", {
+        outcome: result.outcome,
+        ...(result.outcome === "error" ? { safe_error_code: result.reason } : {}),
+      }));
       return;
     }
 
     case "group_intro": {
+      // A pinned "Open trip" of ours from an earlier arrival or binding is taken
+      // down FIRST, so the new one is the only one - and the group is never left
+      // pointing at a trip it no longer is (#443). Before the introduction, so
+      // that what Telegram reports as the top pin is the button and not the intro.
+      if (decision.openTrip) await unpinOurOpenTrip(decision.chatId, deps, log);
       const sent = await deps.telegram.sendMessage({ chatId: decision.chatId, text: decision.text });
       log(structuredLog("info", "trip_bot.group_intro_sent", { ok: sent.ok }));
       // The copyable line, on its own, after the instructions that point at it.
@@ -668,6 +729,7 @@ export async function applyDecision(
         });
         log(structuredLog("info", "trip_bot.group_intro_pin", { pinned }));
       }
+      if (decision.openTrip) await postOpenTrip(decision.chatId, decision.openTrip, deps, log);
       return;
     }
 
@@ -3162,6 +3224,23 @@ async function runInterpretPath(
     );
     return;
   }
+  // A TYPED MESSAGE LONGER THAN ONE READ TAKES (#51). The prompt keeps its first
+  // INTERPRET_SOURCE_BUDGET_CHARS and drops the rest; the log line above is all
+  // the operator gets, and the organizer would take what follows for a complete
+  // reading. Said once per message, in the language resolved above, before the
+  // reply it qualifies. A replayed burst returned earlier and does not say it
+  // again; a crash-retry of an uncommitted one may — a repeated line costs less
+  // than a silent cut. Best effort — a failed send must not lose the reading —
+  // but logged, so it is not silent.
+  if (sourceText.length > INTERPRET_SOURCE_BUDGET_CHARS) {
+    // Never the text, only that it failed.
+    const sent = await deps.telegram
+      .sendMessage({ chatId: burst.chatId, text: uiString("messagePartial", language) })
+      .catch(() => null);
+    if (!sent || !sent.ok) {
+      log(structuredLog("warn", "interview.message_partial_notice_failed", { session_id: burst.sessionId }));
+    }
+  }
   // Which question is currently on the organizer's screen. Needed after the
   // commit, to decide whether the interview may move past it — see `pace`.
   const onScreen = session.ok && session.view.lastPrompt?.startsWith("q:")
@@ -5395,6 +5474,8 @@ export function startTripBotPoller(
         ...(deps.assistantEvents ? { assistantEvents: true } : {}),
         ...(deps.groupJudge ? { groupJudge: deps.groupJudge } : {}),
         ...(deps.organizerDocumentRoute === true ? { organizerDocumentRoute: true } : {}),
+        ...(deps.tripAppBotUsername ? { tripAppBotUsername: deps.tripAppBotUsername } : {}),
+        ...(deps.tripAppReady ? { tripAppReady: deps.tripAppReady } : {}),
         // Asked per update rather than cached: a gateway can stop between
         // one message and the next, and a stale "reachable" spends the
         // organizer's turn on a socket that is gone.

@@ -186,6 +186,8 @@ export type CurrentUser = {
   avatar_file?: string | null;
   google_picture?: string | null;
   is_organizer?: boolean;
+  /** Only for an owner/organizer session opened from the dashboard. */
+  dashboard_url?: string;
 };
 export type ItineraryDay = {
   phase_id: string;

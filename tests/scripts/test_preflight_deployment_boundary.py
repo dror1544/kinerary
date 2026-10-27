@@ -12,6 +12,7 @@ what it must catch, and stays quiet on what it must not.
 """
 from __future__ import annotations
 
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -20,6 +21,32 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 SCRIPT = REPO / "scripts/preflight-checks.sh"
 
+# The probes stage files, so they must not do it in the real repository: a crash
+# between `git add -f` and the cleanup leaves a probe in the real index for the
+# next commit to pick up (#135). They run in a throwaway shared clone instead.
+# The clone holds HEAD's tree, so the working-tree copy of the script under test
+# (and the allow-list) is copied over it: uncommitted edits are what get tested.
+# The read-only --all tests stay on REPO.
+CLONE_ROOT: Path | None = None
+CLONE: Path | None = None
+CLONE_SCRIPT: Path | None = None
+
+
+def setUpModule() -> None:
+    global CLONE_ROOT, CLONE, CLONE_SCRIPT
+    CLONE_ROOT = Path(tempfile.mkdtemp(prefix="preflight-probe-"))
+    CLONE = CLONE_ROOT / "r"
+    subprocess.run(["git", "clone", "-q", "--shared", str(REPO), str(CLONE)], check=True, capture_output=True)
+    CLONE_SCRIPT = CLONE / "scripts/preflight-checks.sh"
+    shutil.copy2(SCRIPT, CLONE_SCRIPT)
+    if (REPO / ".preflight-allow").exists():
+        shutil.copy2(REPO / ".preflight-allow", CLONE / ".preflight-allow")
+
+
+def tearDownModule() -> None:
+    if CLONE_ROOT is not None:
+        shutil.rmtree(CLONE_ROOT, ignore_errors=True)
+
 
 def check_paths(*rel_paths: str) -> str:
     """Run the whole-tree check and return its output."""
@@ -27,15 +54,16 @@ def check_paths(*rel_paths: str) -> str:
 
 
 def check_one(body: str, name: str) -> tuple[int, str]:
-    """Write `body` to scripts/<name>, run --staged over just it, clean up."""
-    path = REPO / "scripts" / name
+    """Write `body` to scripts/<name> in the throwaway clone, run --staged over
+    just it there, clean up."""
+    path = CLONE / "scripts" / name
     path.write_text(body, encoding="utf-8")
     try:
-        subprocess.run(["git", "add", "-f", str(path)], cwd=REPO, capture_output=True, check=True)
-        r = subprocess.run([str(SCRIPT), "--staged"], cwd=REPO, capture_output=True, text=True)
+        subprocess.run(["git", "add", "-f", str(path)], cwd=CLONE, capture_output=True, check=True)
+        r = subprocess.run([str(CLONE_SCRIPT), "--staged"], cwd=CLONE, capture_output=True, text=True)
         return r.returncode, r.stdout
     finally:
-        subprocess.run(["git", "restore", "--staged", str(path)], cwd=REPO, capture_output=True)
+        subprocess.run(["git", "restore", "--staged", str(path)], cwd=CLONE, capture_output=True)
         path.unlink(missing_ok=True)
 
 
@@ -120,6 +148,20 @@ class NamingThisDeployment(unittest.TestCase):
                 reason.strip().startswith("BACKLOG:") or len(reason.strip()) > 20,
                 f"reason is too thin to be a decision: {line}",
             )
+
+
+class TheRealRepositoryIsNotTouched(unittest.TestCase):
+    """#135: check_one used to `git add -f` a probe into the real index."""
+
+    def real_index(self) -> str:
+        return subprocess.run(["git", "diff", "--cached", "--name-only"], cwd=REPO,
+                              capture_output=True, text=True, check=True).stdout
+
+    def test_a_probe_never_reaches_the_real_index_or_scripts_directory(self):
+        before = self.real_index()
+        check_one("#!/usr/bin/env bash\necho hi\n", "zz-boundary-probe.sh")
+        self.assertEqual(self.real_index(), before)
+        self.assertFalse((REPO / "scripts/zz-boundary-probe.sh").exists())
 
 
 if __name__ == "__main__":

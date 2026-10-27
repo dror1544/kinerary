@@ -663,6 +663,37 @@ class ConsularContactsTests(unittest.TestCase):
         out = enrich_config(_config(), "Japan", http=FakeHttp({}), pause=0, consular_lookup=boom)
         self.assertNotIn("emergency_contacts", out.get("travel_info", {}))
 
+    MULTI_CITY = "Tokyo, Hakone, Kyoto, Osaka, Japan"
+
+    def test_a_multi_city_destination_is_asked_by_its_country_tail(self) -> None:
+        """#161: country_reference is keyed on the country, so the lookup must be
+        asked for "Japan", not the organizer's whole itinerary string."""
+        asked = []
+        def lookup(dest, home):
+            asked.append(dest)
+            return self.JP_IL if dest == "Japan" else None
+        out = enrich_config(_config(), self.MULTI_CITY, http=FakeHttp({}), pause=0, consular_lookup=lookup)
+        self.assertEqual("Japan", asked[0])
+        self.assertEqual(2, len(out["travel_info"]["emergency_contacts"]))
+
+    def test_a_single_country_destination_is_asked_unchanged(self) -> None:
+        asked = []
+        def lookup(dest, home):
+            asked.append(dest)
+            return self.JP_IL
+        enrich_config(_config(), "  Japan ", http=FakeHttp({}), pause=0, consular_lookup=lookup)
+        self.assertEqual(["Japan"], asked)
+
+    def test_a_tail_miss_falls_back_to_the_whole_destination(self) -> None:
+        """A row stored under the full string (an older write) is still found."""
+        asked = []
+        def lookup(dest, home):
+            asked.append(dest)
+            return self.JP_IL if dest == self.MULTI_CITY else None
+        out = enrich_config(_config(), self.MULTI_CITY, http=FakeHttp({}), pause=0, consular_lookup=lookup)
+        self.assertEqual(["Japan", self.MULTI_CITY], asked)
+        self.assertEqual(2, len(out["travel_info"]["emergency_contacts"]))
+
 
 class DestinationInfoTests(unittest.TestCase):
     """Health / Money / Communication on the site's Info tab (issue #156).

@@ -106,6 +106,13 @@ if args[:1] == ["logs"]:
     sys.exit(0)
 if args[:2] == ["image", "inspect"]:
     sys.exit(0)                      # every version's images are present
+if args[:1] == ["exec"] and any(a.endswith("s6-svc") for a in args):
+    # The trip-intake gateway restart (#420): a restarted gateway registers the
+    # interview tools again, which is the new log line the release waits for.
+    log = Path(os.environ["FAKE_AGENT_LOG"])
+    lines = [l for l in log.read_text().splitlines() if "registered" in l]
+    log.open("a").write((lines[-1] if lines else "MCP server 'interview' registered 0 tool(s):") + "\n")
+    sys.exit(0)
 if args[:1] == ["exec"]:
     real(args)                        # psql, pg_dump and pg_restore are real
 if args[:1] in (["stop"], ["start"]):
@@ -324,6 +331,7 @@ class Rehearsal(unittest.TestCase):
             "PATH": f"{bins}:{os.environ['PATH']}",
             "REAL_DOCKER": DOCKER,
             "FAKE_STATE": str(self.state), "FAKE_CALLS": str(self.calls),
+            "FAKE_AGENT_LOG": str(hermes / "profiles/trip-intake/logs/agent.log"),
             "FAKE_VM_ENV": str(deploy / "vm.env"), "FAKE_REPO": str(self.repo), "FAKE_PG": self.container,
             "KINERARY_CP_REPO": str(self.repo), "KINERARY_CP_DEPLOY_ROOT": str(deploy),
             "KINERARY_CP_HERMES_DATA": str(hermes), "KINERARY_CP_PG_CONTAINER": self.container,
@@ -375,12 +383,15 @@ class Rehearsal(unittest.TestCase):
         self.assertEqual(self.snapshots(), {}, "a dry run never takes a snapshot")
         self.assertEqual(self.history(), [])
         self.assertFalse((self.tmp / "backups").exists(), "and never writes a backup")
+        self.assertNotIn("s6-svc", self.calls.read_text(), "and never restarts the trip-intake gateway (#420)")
 
     def test_an_upgrade_then_a_restore_db_rollback(self):
         done = self.release("upgrade", self.new_rev)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertEqual(self.vm_env()["KINERARY_REV"], self.new_rev)
         self.assertEqual(len(self.snapshots()), 1, "the upgrade took its snapshot")
+        self.assertIn("exec hermes /command/s6-svc -r /run/service/gateway-trip-intake", self.calls.read_text(),
+                      "the trip-intake gateway was restarted to pick up the new interview tools (#420)")
         self.assertIn("0003_rehearsal.sql", self.sql("SELECT version FROM public.control_plane_schema_migrations"))
         self.assertEqual(self.sql("SELECT count(*) FROM information_schema.columns WHERE table_name='trips' "
                                   "AND column_name='rehearsal_note'"), "1")

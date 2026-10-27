@@ -13,7 +13,10 @@ import { runPendingPlanReviews } from "./plan-review-store.js";
 import { structuredLog } from "./redaction.js";
 import { resolveSecretRef } from "./secrets.js";
 import { deleteWebhookIfPresent, startTelegramApprovalPoller } from "./telegram-poller.js";
-import { GoogleOidcClient, HttpRuntimeAccountAdapter, type PortalDependencies } from "./portal.js";
+import { GoogleIdTokenClient, HttpRuntimeAccountAdapter, type PortalDependencies } from "./portal.js";
+import { LogMailer, ResendMailer, type Mailer } from "./mailer.js";
+import { checkBotIdentity } from "./telegram-mini-app.js";
+import { createBotCheckRound, createMiniAppStatus, withMiniAppReadiness } from "./mini-app-status.js";
 
 const profilePath = process.env.CONTROL_PLANE_ARCHITECTURE_PROFILE;
 if (!profilePath) throw new Error("CONTROL_PLANE_ARCHITECTURE_PROFILE is required");
@@ -118,10 +121,74 @@ if (chatRoutingKey) {
   chatRouting = { db: pool, apiKey: chatRoutingKey };
 }
 
+// What /readyz says about the Mini App (mini-app-status.ts). Declared outside the
+// block below so the readiness check can read it whether or not the block runs.
+const miniAppStatus = createMiniAppStatus();
+
 let portal: PortalDependencies | undefined;
 if (profile.web) {
-  const [googleClientId, googleClientSecret, runtimeExchangeKey] = await Promise.all([resolveSecretRef(profile.web.google_client_id_secret_ref), resolveSecretRef(profile.web.google_client_secret_ref), resolveSecretRef(profile.web.runtime_exchange_key_secret_ref)]);
-  portal = { db: pool, google: new GoogleOidcClient(googleClientId, googleClientSecret, `${profile.web.public_origin}/v1/auth/google/callback`), runtimeAccounts: new HttpRuntimeAccountAdapter(profile.web.runtime_origin, runtimeExchangeKey), publicOrigin: profile.web.public_origin, runtimeOrigin: profile.web.runtime_origin, runtimeExchangeKey, runtimeUpstreamHostSuffixes: profile.web.runtime_upstream_host_suffixes, telegramBotUsername: profile.web.telegram_bot_username, sessionTtlSeconds: profile.web.session_ttl_seconds, enrollmentTtlSeconds: profile.signup?.enrollment_ttl_seconds ?? 86400, approvalTtlSeconds: 86400, operatorChatId };
+  const runtimeExchangeKey = await resolveSecretRef(profile.web.runtime_exchange_key_secret_ref);
+  // The client ID is public (the page needs it to draw Google's button), so it is a plain profile string. Unset
+  // turns Google sign-in off, and capabilities says so; say it once here for whoever reads the boot log.
+  const google = profile.web.google_client_id ? new GoogleIdTokenClient(profile.web.google_client_id) : undefined;
+  const miniAppLog = (line: string) => process.stderr.write(`${line}\n`);
+  if (!google) miniAppLog(structuredLog("warn", "google_sign_in.disabled", { reason: "web.google_client_id is not set" }));
+  let telegramMiniApp: PortalDependencies["telegramMiniApp"];
+  if (!profile.web.telegram_bot_token_secret_ref) {
+    // UNSET IS A DOWNGRADE, NOT AN ERROR — so say it once, here, where a person
+    // reading the boot log will see why the Mini App never signs anyone in.
+    miniAppLog(structuredLog("warn", "mini_app.disabled", { reason: "web.telegram_bot_token_secret_ref is not set" }));
+  } else {
+    let miniAppToken: string | undefined;
+    try {
+      miniAppToken = await resolveSecretRef(profile.web.telegram_bot_token_secret_ref);
+    } catch (error) {
+      // A token that cannot be read turns the feature off; it does not stop the API.
+      miniAppLog(structuredLog("error", "mini_app.token_unresolved", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN", effect: "Telegram Mini App sign-in stays off" }));
+    }
+    if (miniAppToken) {
+      const token = miniAppToken;
+      miniAppStatus.markConfigured();
+      let enabled = false;
+      telegramMiniApp = { botToken: token, maxAgeSeconds: profile.web.telegram_init_data_max_age_seconds, enabled: () => enabled, log: miniAppLog };
+      // The feature is on only once getMe on THIS token names the bot the
+      // profile says it is. A network failure is retried (it is not a verdict);
+      // a different bot is a mis-wired secret and stays off until a restart.
+      const expectedUsername = profile.web.telegram_bot_username;
+      const check = createBotCheckRound({
+        check: () => checkBotIdentity({ token, expectedUsername, log: miniAppLog }),
+        status: miniAppStatus,
+        setEnabled: (value) => { enabled = value; },
+        // The one step no code can do. Said loudly once, where the other Mini App
+        // lines are, and kept on /readyz (telegram_mini_app).
+        onMainWebAppMissing: () => miniAppLog(structuredLog("warn", "mini_app.main_web_app_missing", {
+          effect: "the Open trip button and /app links open nothing until the bot's Main Mini App is set",
+          hint: "BotFather: Bot Settings, Configure Mini App, URL <portal origin>/mini-app (docs/telegram-mini-app.md)",
+        })),
+      });
+      if (!(await check())) {
+        const retry = setInterval(() => { check().then((settled) => { if (settled) clearInterval(retry); }).catch(() => {}); }, 60_000);
+        retry.unref();
+      }
+    }
+  }
+  // Email for the portal's own sign-up and password reset. UNSET IS NOT SILENT: with no mailer the
+  // routes answer 503 SIGN_UP_UNAVAILABLE and the page says sign-up is not open yet, and this is the
+  // one line that tells whoever reads the boot log why.
+  let mailer: Mailer | undefined;
+  if (!profile.web.email_provider) {
+    miniAppLog(structuredLog("warn", "email_auth.disabled", { reason: "web.email_provider is not set", effect: "sign-up and password reset answer 503 SIGN_UP_UNAVAILABLE" }));
+  } else if (profile.web.email_provider === "log") {
+    mailer = new LogMailer({ log: miniAppLog, echo: profile.environment === "development" });
+    miniAppLog(structuredLog("warn", "email_auth.log_only", { effect: "sign-up and reset links are NOT delivered" }));
+  } else {
+    try {
+      mailer = new ResendMailer(await resolveSecretRef(profile.web.email_api_key_secret_ref!), profile.web.email_from!);
+    } catch (error) {
+      miniAppLog(structuredLog("error", "email_auth.key_unresolved", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN", effect: "sign-up and password reset answer 503 SIGN_UP_UNAVAILABLE" }));
+    }
+  }
+  portal = { db: pool, google, telegramMiniApp, mailer, emailAuthLog: miniAppLog, runtimeAccounts: new HttpRuntimeAccountAdapter(profile.web.runtime_origin, runtimeExchangeKey), publicOrigin: profile.web.public_origin, runtimeOrigin: profile.web.runtime_origin, runtimeExchangeKey, runtimeUpstreamHostSuffixes: profile.web.runtime_upstream_host_suffixes, telegramBotUsername: profile.web.telegram_bot_username, sessionTtlSeconds: profile.web.session_ttl_seconds, enrollmentTtlSeconds: profile.signup?.enrollment_ttl_seconds ?? 86400, approvalTtlSeconds: 86400, operatorChatId };
 }
 
 // The interviewer agent's chat-addressed interview routes, which the MCP
@@ -214,7 +281,7 @@ if (assistantEventsIngestKey) {
 }
 
 const app = buildApp(profile, {
-  readiness: () => databaseReadiness(pool),
+  readiness: withMiniAppReadiness(() => databaseReadiness(pool), miniAppStatus),
   close: () => pool.end(),
   signup,
   interview,
@@ -232,11 +299,22 @@ const app = buildApp(profile, {
 // leaves 'pending' in notification_outbox after provisioning completes.
 // Guarded against overlap in-process; see outbox-dispatcher.ts for why that's
 // sufficient (single API process today).
-if (signup) {
-  const notification = signup.notification;
+//
+// It also runs where only the web block (the Mini App) is configured: the Mini
+// App sign-in notice is an outbox row too, and a deployment with web but no
+// signup block would otherwise queue notices that nothing ever sends.
+const outboxBotToken = signup?.botToken ?? portal?.telegramMiniApp?.botToken;
+const outboxNotification = signup?.notification ?? (outboxBotToken
+  ? createNotificationAdapter(profile.adapters.messaging, {
+    // `superAdminChatId` is for approval DMs, which a web-only deployment never sends.
+    telegram: { botToken: outboxBotToken, superAdminChatId: operatorChatId ?? "", db: pool, log: (line) => process.stderr.write(`${line}\n`) },
+  })
+  : undefined);
+if (outboxNotification && outboxBotToken) {
+  const notification = outboxNotification;
   const resolveBotUsername = createBotUsernameResolver({
     configured: profile.web?.telegram_bot_username ?? process.env.TELEGRAM_BOT_USERNAME ?? null,
-    botToken: signup.botToken,
+    botToken: outboxBotToken,
     log: (line) => process.stderr.write(`${line}\n`),
   });
   let dispatching = false;
@@ -256,7 +334,8 @@ if (signup) {
       // missing from any deployment that omitted it, and the link vanished with
       // nothing logged. The resolver prefers what the deployment states and
       // otherwise asks the bot itself (getMe on the signup token), cached.
-      { resolveBotUsername },
+      // `publicOrigin` is for the unlink link in the Mini App sign-in notice.
+      { resolveBotUsername, publicOrigin: portal?.publicOrigin ?? null },
     )
       .catch((error) => {
         process.stderr.write(`${structuredLog("error", "outbox.dispatch_loop_error", {

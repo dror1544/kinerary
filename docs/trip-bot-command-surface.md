@@ -1,12 +1,12 @@
 # The Trip Bot's command surface, its menu, and a mini app
 
-**Status: §3, §4, §5 and §9 are BUILT (2026-09-10). §6 is kept for later; §8 was dropped (2026-09-13).**
+**Status: §3, §4, §5 and §9 are BUILT (2026-09-10). §6 is kept for later; §8 was dropped (2026-09-13). §10 (the Mini App) was decided and built as sign-in with the verified Telegram identity (2026-10-20, #442).**
 Written 2026-09-10 from Dror's request: the bot should answer a small set of
 typed commands — list my trips, switch to one, start a new interview, get the
 group-linking line, get the site URL — and those commands should appear in
 Telegram's own command menu rather than being folk knowledge. A Telegram Mini
-App for managing trips is raised in the same breath and is kept here as a
-**discussion**, not a plan.
+App for managing trips was raised in the same breath; it was kept as a
+discussion until 2026-10-20, when §10's ruling was made (below).
 
 What shipped, and where it lives:
 
@@ -42,13 +42,15 @@ table (`/start`, `/group`, `/done`) predates §3 and §4 being built.*
 | `/trips` | DM only | Lists the sender's trips and which one this chat is on. Refused in a group. In the DM menu. |
 | `/switch` / `/select` `<trip>` | DM only | Points this chat at a different trip of the sender's. Refused in a group. In the DM menu. |
 | `/name` / `/rename` `<names>` | Any chat bound to a trip; not mid-interview | Shows or changes the assistant's name(s). In every menu. |
+| `/app` | Any chat bound to a trip, group or DM; not mid-interview | Replies with an "Open trip" URL button (`https://t.me/<bot>?startapp=<trip id>`) for the chat's own trip, in the trip's language. An argument is ignored: the chat's binding picks the trip. Unbound group: the usual "no trip for this chat" answer. Unbound DM: the sender's own trips to choose from, as `/trips`. Also answered to plain words addressed to the assistant ("open the app", "פתח את האפליקציה") from a closed list (`relay/open-trip.ts`). **Only when the Mini App is ready for the bot** (see [`telegram-mini-app.md`](telegram-mini-app.md#the-open-trip-button-and-app)); before that, `/app` answers "not available yet" in any chat, the words are not answered, and it is in no menu. When ready, it is in every menu. |
 | `/help` | A chat bound to a trip | The router answers with the companion's own help text (`companionHelpText`). In every menu. |
 | `/model` / `/models` | Super admin's own DM only | Shows or switches which model serves each task. For anyone else it is answered as an unknown command; not in any menu. |
 
 Any other command in a bound chat gets the same help text with the unknown
 command named; mid-interview it gets `notMyCommand`; nothing is forwarded to
 Hermes as a slash command. Published menus (`routerCommandMenus`): private chats
-and the default get `/help /name /group /trips /switch`; groups get `/help /name`.
+and the default get `/help /name /group /trips /switch`; groups get `/help /name /proactive`; `/app` joins every menu
+once the Mini App is ready, and the menus are republished when that flips.
 Whether every row's *where* was exercised live was not re-checked here.
 
 **Planned, not built (PR #407, draft): `/proactive 1|2|3`.** A per-group setting of
@@ -139,10 +141,25 @@ AND digest = $2` and then take `rows[0]`, and each would silently start
 picking an arbitrary account. That is a worse failure than the one being
 fixed, and an authentication-shaped one.
 
-So `telegram_organizer_links` (migration 0052) is its own append-only,
-many-`user_id`s-per-digest table, and `user_identities` is untouched. It is a
-read model for routing, never a credential and never an authentication path —
-Telegram SSO stays retired.
+So `telegram_organizer_links` (migration 0052) is its own many-`user_id`s-per-digest
+table, and `user_identities` is untouched. It was a read model for routing, never a
+credential and never an authentication path.
+
+**That last clause changed on 2026-10-20 (#442), and so did the table.** A link is now also a
+**sign-in path**: the holder of the linked Telegram account can open the Mini App as that user with
+no password (§10). It is **per trip** (`telegram_organizer_trip_links`, migration `20261021120000`:
+one row per Telegram account, user and trip), because the account-wide row made one Unlink take every
+trip out of `/trips` and left no way back. It is **revocable** (flagged in place), **owner-visible** (the
+trip card's Telegram icon and ⋮ menu on My trips, with Unlink), **announced** (a Telegram notice to all
+the owner's private chats, the signer's included, on a link's first Mini App sign-in) and **re-linkable
+only from the signed-in dashboard** (`POST /v1/trips/:id/telegram-link` → a one-time `t.me/<bot>?start=lk_…`
+that the bot redeems for the sender's verified Telegram id). The bot's readers — `/trips`, `/switch`,
+`hasEarlierBuiltTrip`, `isTripOrganizer` — and the Mini App resolver all ask for the link *of the trip
+in question*. 0052's account-wide table is no longer read or written; the migration expanded each row into
+per-trip rows, and a per-trip Unlink moves the pair's account-wide row to
+`telegram_organizer_link_revocations`, so the previous release after a rollback cannot see an unlinked
+account. A revoked (Telegram account, user, trip) stays revoked: an interview link does not re-open it.
+Telegram Login Widget SSO on the per-trip sites stays retired (`/v1/auth/telegram` still answers 410).
 
 **The migration backfills from `intake_sessions`.** Without that the feature
 would ship inert: a link is written when an enrollment is redeemed, and an
@@ -296,6 +313,25 @@ only commands, replies and mentions. A bare token pasted as text would not
 arrive at all, and the case that breaks is the recovery case ("post it again
 now that I'm an admin"). Do not "simplify" this to a bare token.
 
+**Moving a group to the organizer's next trip (2026-10-20).** A code for trip B
+posted in a group already bound to trip A *moves* the group when the sender (the
+verified `from.id`, never anything typed) is an organizer of **both** A and
+B (`isTripOrganizer`: a LIVE per-trip Telegram link to that trip — an account-wide
+link counts for nothing — or a `trip_person_links` organizer row that no revoked
+link overrides, boundary review R1: a forwardee the owner Unlinked from A or B
+cannot move the group, and the dashboard's relink restores it); the old binding is closed with `closed_reason =
+'group_moved'` (history kept, no migration — the column is free text), a new one
+opens for B with B's companion, the code is recorded as used but stays redeemable
+until it expires, and the group gets B's introduction (and, when the Mini App is
+ready, B's Open trip message in place of A's). Anyone else gets one sentence —
+"This group belongs to another trip. Only its organizer can move it." — whichever
+half of the check failed, and nothing changes (log reason
+`GROUP_MOVE_NOT_ORGANIZER`). A's website and companion are untouched; the
+companion simply stops being routed for that chat. Nothing in this path writes
+`trip_person_links`, so a move can never re-promote a demoted organizer row.
+Asserted by `control-plane/api/test/group-move.test.ts` (the per-trip links, the
+account-wide-only refusal and the R1 Unlink/relink/member-removal cases).
+
 ## 8. `/url` — DROPPED (2026-09-13)
 
 Not needed, by Dror's decision: `/help` already answers it. In any chat bound
@@ -323,8 +359,8 @@ router's own `/help` and `/name` menu from integration (db3f0fe):
 
 | Scope | Commands |
 |---|---|
-| `default`, `all_private_chats` | `/help`, `/name`, `/group`, `/trips`, `/switch` |
-| `all_group_chats` | `/help`, `/name` |
+| `default`, `all_private_chats` | `/help`, `/name`, `/group`, `/trips`, `/switch` (+ `/app` once the Mini App is ready) |
+| `all_group_chats` | `/help`, `/name`, `/proactive` (+ `/app` once the Mini App is ready) |
 
 Groups get a menu of their own rather than none: leaving a group's menu alone
 is what kept sixty stale Hermes commands in a live family group on 2026-09-13.
@@ -344,54 +380,66 @@ an English menu.
 **Failure is not fatal.** A failed `setMyCommands` means an undiscoverable but
 fully working command surface. Log it; do not fail relay startup over it.
 
-## 10. A mini app to manage trips — discussion, not a plan
+## 10. A mini app to manage trips — DECIDED and built (2026-10-20, #442)
 
-Recorded because it was raised, and because there is one thing about it that
-needs a ruling before anyone estimates it.
+Raised on 2026-09-10 as a discussion with one question that needed a ruling first. The ruling
+and what was built are recorded here; the contract itself lives in
+[`telegram-mini-app.md`](telegram-mini-app.md).
 
-**Why it is tempting.** Most of it appears to exist. `web/` is a Vite/React
-SPA with `TripsPage`, `NewTripPage`, `AuthPage`; `portal.ts` is mounted and
-serves the organizer-scoped read model those pages consume; `profile.web
-.public_origin` is a real configured origin. A Telegram Mini App is a webview
-over an HTTPS URL — on the face of it, the same SPA in a different frame.
+**The question.** A Mini App authenticates by verifying `initData`, an HMAC over the bot
+token, which yields a verified Telegram user id. That is *Telegram-derived web
+authentication*, and this deployment had retired exactly that: `/v1/auth/telegram` answers
+`410 TELEGRAM_WEB_AUTH_RETIRED`, and the shared-bot decision rules out Telegram SSO
+permanently for the per-trip sites.
 
-**The thing that needs a ruling first.** A mini app authenticates by verifying
-`initData`, an HMAC over the bot token, which yields a verified Telegram user
-id. That is *Telegram-derived web authentication*, and this deployment
-retired exactly that: `/v1/auth/telegram` answers `410
-TELEGRAM_WEB_AUTH_RETIRED`, and the shared-bot decision rules out Telegram SSO
-permanently.
+**The ruling (owner, 2026-10-20): outside it.** The retired path was a per-trip *site*
+login widget, ruled out because one shared bot routed to many profiles cannot back a
+per-trip widget. A Mini App is one bot, one origin, one control plane. So `initData` is
+accepted — on one route, `POST /v1/auth/telegram-mini-app` — under conditions that make a
+verified Telegram id worth no more than the links someone proved earlier:
 
-The two are arguably not the same thing. The retired path was a **per-trip
-site** login widget, and it was ruled out because one shared bot routed to
-many profiles cannot back a per-trip widget. A mini app is one bot, one
-origin, one control plane — the structural objection does not obviously
-apply. But "does not obviously apply" is not a decision, and this one belongs
-to Dror rather than to whoever picks the work up. **If the answer is no, the
-mini app needs a different auth story or does not happen** — and §3's
-enrollment-time identity row is not a substitute, because it authenticates a
-chat, not a browser session.
+- the identity is **verified exactly** (the Mini App HMAC, not the Login Widget one;
+  fresh; bounded; replay-capped in Postgres) and answered with one generic refusal;
+- it signs in only through a **link** (`telegram_organizer_trip_links`, or
+  `telegram_member_links` written when a member proves their trip password in the Mini App
+  and consents) and only to a trip the linked account is an **active member** of; the
+  chat's trip *selects*, membership *grants*; a trip the person cannot open is refused
+  exactly like one that does not exist;
+- links are **visible to their owner, revocable, and announced** (§3);
+- the session lasts 7 days like any web session but is **scoped** to the trips that Telegram account
+  is linked to (everything else of the account needs a password or Google sign-in, enforced in
+  `requireUser`; `telegram-mini-app.md`), and a verified launch replaces any session already in the
+  WebView.
 
-**If the answer is yes, the open questions are:**
+§3's enrollment-time identity row is what makes this possible for organizers; members, who
+have no such row, are linked the first time they sign in with their trip password inside the
+Mini App.
 
-- **Read-only or actions?** A read-only trip list is a nicer `/trips` and
-  little else. Actions — request provisioning, approve a plan, invite members
-  — are where it earns its keep, and every one of those already has an
-  endpoint with its own authorization that would have to accept this new
-  caller.
-- **Does it replace the commands or sit beside them?** Both, probably: the
-  commands work in a group and offline-ish, the mini app does not. But a
-  duplicated surface is two places to keep honest, which is the cost.
-- **What is publicly reachable?** The mini app's origin must be, which drags
-  in the `mcp/provision.js` exposure rule's neighbourhood. Worth checking
-  against `docs/per-trip-gateway-architecture.md` before assuming.
-- **Where does it live?** Extending `web/` keeps one SPA and one API client;
-  a separate bundle keeps the console's growth away from a webview's
-  constraints.
+**What the original open questions became.**
 
-`setChatMenuButton` is the bridge — the same call that configures the menu can
-point at a mini app instead of the command list — which is why §9 and this
-section are in the same document.
+- *Read-only or actions?* The shell reuses the existing portal session, so it can do
+  whatever that session's role can (a member: open the trip; an organizer: the dashboard
+  actions). The Mini App adds no authorization of its own.
+- *Replace the commands or sit beside them?* Beside: the commands work in a group, the Mini
+  App does not (Telegram Web is supported with a partitioned cookie and `frame-ancestors` for `/mini-app`
+  only — `telegram-mini-app.md`).
+- *What is publicly reachable?* `web.public_origin`, as for the SPA; the exchange requires
+  `Origin` to equal it.
+- *Where does it live?* Extending `web/` (`web/src/mini-app/`), one SPA and one API client.
+
+**The way in from a group (#443, 2026-10-20).** A Mini App cannot be launched from a group by
+an inline `web_app` button, so the bot posts a URL button to the bot's Main Mini App with the
+trip id as `startapp`: pinned when a group is bound (a message of ours pinned earlier is
+replaced), and on request with `/app`. It only selects the trip; membership still grants.
+It appears only when the Mini App is ready for the bot (enabled, and `has_main_web_app` true),
+re-evaluated at runtime; unknown is not ready.
+Whether the bot's Main Mini App is set is on `/readyz` (`telegram_mini_app.has_main_web_app`);
+the one-time BotFather step is in [`telegram-mini-app.md`](telegram-mini-app.md#one-time-setup-the-bots-main-mini-app).
+
+`setChatMenuButton` is the bridge — the same call that configures the menu can point at a
+Mini App instead of the command list — which is why §9 and this section are in the same
+document. Installing the menu button and the BotFather Mini App are deployment steps, not
+part of the change.
 
 ## 11. Open decisions
 
@@ -405,8 +453,10 @@ Collected so they are not lost in the prose. None of these should be guessed:
    the plan today.
 3. **Draft creation without a destination** (§6, kept for later) — placeholder,
    or ask one question first?
-4. **Mini app auth** (§10) — does `initData` fall under the retired Telegram
-   web auth decision, or outside it?
+4. **Mini app auth** (§10) — *resolved (2026-10-20)*: outside the retired decision, under
+   the conditions in §10 and `telegram-mini-app.md`. Links are per trip; an Unlink revokes that trip's
+   link and moves the pair's old account-wide row to history, so no bot reader — current or previous
+   release — sees it (closed 2026-10-20, reshaped per trip 2026-10-20).
 
 ## 12. What the tests would have to show
 

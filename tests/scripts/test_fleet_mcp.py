@@ -77,6 +77,11 @@ TOOLS = [
 #: What production looked like on 2026-09-28, as rows, for the three tools the
 #: daily digest calls. Ordered: the first marker found in a statement answers it.
 FIXTURES = [
+    # Production on 2026-09-28 had not applied the companion-gateways migration
+    # (20261021100000): the tools must degrade on a stack a schema behind, and
+    # the pinned texts below are what they say there. The gateway sections have
+    # their own fixtures further down.
+    ("to_regclass('control_plane.companion_gateways')", [['f']]),
     ('to_regclass', [['t']]),
     ('FROM control_plane.trips t GROUP BY 1,2', [['live', 'ready_private', '2'], ['prospect', 'draft', '6'], ['prospect', 'intake_confirmed', '2'], ['prospect', 'intake_in_progress', '3'], ['retired', 'draft', '1'], ['retired', 'intake_in_progress', '7'], ['retired', 'provisioning_approved', '1'], ['retired', 'ready_private', '30']]),
     ('SELECT j.job_type, j.state', [['provision', 'cancelled', '1'], ['provision', 'failed', '1'], ['provision', 'succeeded', '34']]),
@@ -265,6 +270,30 @@ DIGEST_ALERTS = """\
 • interview waiting on us: trip-b — phase collect, waiting on us since 2026-09-15 10:00 UTC
 • model failing mid-interview: trip-b — TIMED_OUT
 • reported by a companion: trip-d — bug, The itinerary page shows the wrong day (rep_1, 2026-09-27 08:00 UTC)"""
+
+
+#: A stand-in `ssh` for the concurrency tests. It plays the VM's sshd: every
+#: invocation registers itself in a directory, holds its place for a moment, and
+#: answers "Connection reset" (exit 255, the way ssh reports a dropped
+#: handshake) when more than FLEET_TEST_SSH_CAP are in the directory at once. The
+#: highest number ever seen at once is appended to peak.log. After that it
+#: behaves exactly like FAKE_PSQL, so fixtures and the SQL log work unchanged.
+FAKE_SSH = """#!/usr/bin/env python3
+import os, sys, time
+active = os.environ["FLEET_TEST_SSH_ACTIVE"]
+mine = os.path.join(active, str(os.getpid()))
+open(mine, "w").close()
+seen = len(os.listdir(active))
+with open(os.path.join(active, "..", "peak.log"), "a") as peak:
+    peak.write(str(seen) + "\\n")
+if seen > int(os.environ["FLEET_TEST_SSH_CAP"]):
+    time.sleep(0.05)
+    os.remove(mine)
+    sys.stderr.write("kex_exchange_identification: read: Connection reset by peer\\n")
+    sys.exit(255)
+time.sleep(0.15)
+os.remove(mine)
+""" + FAKE_PSQL.split("\n", 1)[1]
 
 
 @unittest.skipUnless(NODE, "node is not installed")
@@ -491,6 +520,45 @@ class FleetMcp(unittest.TestCase):
         self.tool("alerts", {}, env=self.fixtures_env([]))
         self.assertFalse([s for s in self.statements() if "ve.check_name = 'mcp_isolation'" in s])
 
+    # ------------------------------------------------- stale reachability (#295) --
+    STALE = "reachability_checked_at"
+
+    def test_a_live_trip_whose_reachability_check_went_stale_appears_in_alerts(self):
+        text, is_error = self.tool("alerts", {}, env=self.fixtures_env([(self.STALE, [["trip-s"]])]))
+        self.assertFalse(is_error, text)
+        self.assertEqual(text, "\n\n".join([
+            "⚠️ Kinerary fleet — a control plane",
+            "REACHABILITY CHECK STALE\n  • trip-s — no reachability check for over 60 minutes; "
+            "the probe that confirms the companion's bridge may have stopped",
+        ]))
+
+    def test_the_stale_reachability_alert_has_a_digest_line_too(self):
+        text = self.rendered("alerts", {"format": "digest"}, [(self.STALE, [["trip-s"]])])
+        self.assertEqual(
+            text,
+            "**⚠️ Needs attention**\n"
+            "• reachability check stale: trip-s — no reachability check for over 60 minutes; "
+            "the probe that confirms the companion's bridge may have stopped",
+        )
+        self.assert_telegram_safe(text)
+
+    def test_the_stale_reachability_query_is_gated_on_the_probe_running_at_all(self):
+        """The fake psql never evaluates SQL, so the selection is pinned by its text.
+        Without the EXISTS gate this fires for every trip on a stack whose probe was
+        never enabled (the exact noise #295 warns about)."""
+        self.tool("alerts", {}, env=self.fixtures_env([]))
+        queries = [s for s in self.statements() if self.STALE in s]
+        self.assertEqual(len(queries), 1, queries)
+        sql = queries[0]
+        self.assertRegex(sql, r"reachability_checked_at IS NULL\s+OR\s+\w+\.reachability_checked_at < now\(\) - interval '60 minutes'")
+        self.assertRegex(sql, r"EXISTS \(SELECT 1 FROM control_plane\.trips \w+\s+WHERE \w+\.reachability_checked_at > now\(\) - interval '60 minutes'\)")
+        self.assertIn("= 'live'", sql)
+        self.assertIn("lifecycle_state = 'ready_private'", sql)
+        self.assertIn("NOT LIKE 'retired-%'", sql)
+        # Slugs only: a moving value in the output re-wakes the model hourly.
+        self.assertEqual(sql.split("FROM")[0].split("SELECT")[1].strip(), "t.slug")
+        self.assertNotRegex(sql, r"(?i)\b(insert|update|delete|alter|drop|truncate)\b")
+
     def test_verification_failure_is_not_checked_on_a_stack_without_the_table(self):
         """to_regclass absent/false (no fixture match) must degrade, not error."""
         text, is_error = self.tool("alerts", {}, env=self.fixtures_env([]))
@@ -656,6 +724,28 @@ class FleetMcp(unittest.TestCase):
         self.assertNotIn("**all fine**", text)
         self.assertIn("trip-d", text)
         self.assert_telegram_safe(text)
+
+    def test_a_traveller_s_words_cannot_italicise_strike_spoil_or_quote_in_the_digest(self):
+        """Hermes turns ~~x~~ into strikethrough, ||x|| into a spoiler, a line-leading
+        '>' into a quote, and *x* into italic. Not `_x_` — its converter escapes a bare
+        underscore — but md() drops the italic-shaped ones anyway, so a different
+        converter cannot change what a stranger's words do."""
+        hostile = "> x _x_ ~x~ ~~y~~ ||z|| NO_ORGANIZER_CHAT mcp__trip_mcp__get __init__ a|b"
+        fixtures = [["companion_bug_reports r\n", [["trip-d", "bug", hostile, "rep_1", "2026-09-27 08:00 UTC"]]]]
+        text = self.rendered("alerts", {"format": "digest"}, [["to_regclass", [["t"]]], *fixtures])
+        self.assertEqual(len(text.splitlines()), 2, text)
+        line = text.splitlines()[1]
+        for char in "~|":
+            self.assertNotIn(char, line)
+        self.assertNotRegex(line, r"(?<![A-Za-z0-9_])_|_(?![A-Za-z0-9_])", "an italic-shaped underscore survived")
+        self.assertIn("NO_ORGANIZER_CHAT", line, "a reason code must stay readable")
+        self.assertIn("bug, x x x y z NO_ORGANIZER_CHAT mcp__trip_mcp__get init ab (", line)
+        self.assert_telegram_safe(text)
+
+    def test_a_leading_quote_marker_in_a_value_is_dropped(self):
+        fixtures = [["j.state = 'failed' AND", [["trip-j", "> quoted", ">> deeper", "3/3"]]]]
+        text = self.rendered("alerts", {"format": "digest"}, fixtures)
+        self.assertEqual(text.splitlines()[1], "• failed job: trip-j — quoted deeper (attempt 3/3)")
 
     def test_a_long_run_of_incidents_is_capped_and_says_so(self):
         rows = [[f"trip-{i:02d}", "provision", "TIMED_OUT", "3/3"] for i in range(13)]
@@ -1046,6 +1136,135 @@ class FleetMcp(unittest.TestCase):
         self.configure_hermes_logs_dir(self.tmp / "hermes-logs")
         text = self.tool_usage_text()
         self.assertIn("tool usage: no tool calls in the last 7 days", text)
+
+
+@unittest.skipUnless(NODE, "node is not installed")
+class FleetMcpSshConcurrency(unittest.TestCase):
+    """No tool call may hold more than a few SSH sessions to one stack at once.
+
+    On 2026-10-20 `alerts` ran twelve queries in one Promise.all, each its own
+    `ssh ... psql`, and the VM's sshd (MaxStartups 10:30:100) dropped the eleventh
+    -- "kex_exchange_identification: read: Connection reset by peer" -- failing the
+    alert cron about every other run. The stand-in ssh (FAKE_SSH) drops the same
+    way past FLEET_TEST_SSH_CAP, so a call that exceeds the cap fails here the way
+    it failed in production. Both paths are the real ones: buildArgv's ssh branch,
+    reached through FLEET_SSH_BIN, not the `argv` escape hatch.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.log = self.tmp / "sql.log"
+        self.active = self.tmp / "active"
+        self.active.mkdir()
+        self.peak_log = self.tmp / "peak.log"
+        fake = self.tmp / "fake-ssh.py"
+        fake.write_text(FAKE_SSH)
+        fake.chmod(0o755)
+        self.fake = fake
+        self.config = self.tmp / "fleet-stacks.json"
+        self.write_config({})
+
+    def write_config(self, ssh_extra: dict, hermes_logs_dir: str | None = None) -> None:
+        stack = {
+            "label": "a control plane", "production": True,
+            "container": "pg",
+            "database": {"user": "u", "name": "d"},
+            "ssh": {"target": "cp@host", "sudo": True, **ssh_extra},
+        }
+        if hermes_logs_dir:
+            stack["hermes_logs_dir"] = hermes_logs_dir
+        self.config.write_text(json.dumps({"default_stack": "prod", "stacks": {"prod": stack}}))
+
+    def tool(self, name: str, arguments: dict | None = None, cap: int = 99,
+             fixtures: list | None = None) -> tuple[str, bool]:
+        env = {**os.environ, "KINERARY_FLEET_CONFIG": str(self.config),
+               "FLEET_SSH_BIN": str(self.fake), "FLEET_TEST_SQL_LOG": str(self.log),
+               "FLEET_TEST_SSH_ACTIVE": str(self.active), "FLEET_TEST_SSH_CAP": str(cap)}
+        if fixtures is not None:
+            path = self.tmp / "fixtures.json"
+            path.write_text(json.dumps(fixtures))
+            env["FLEET_TEST_FIXTURES"] = str(path)
+        message = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": name, "arguments": arguments or {}}}
+        proc = subprocess.run([NODE, str(SERVER)], input=json.dumps(message) + "\n",
+                              capture_output=True, text=True, timeout=120, env=env)
+        result = json.loads(proc.stdout.splitlines()[0])["result"]
+        return result["content"][0]["text"], bool(result.get("isError"))
+
+    def peak(self) -> int:
+        return max(int(n) for n in self.peak_log.read_text().split())
+
+    def invocations(self) -> int:
+        return len(self.peak_log.read_text().split())
+
+    def test_alerts_never_exceed_the_default_limit_and_still_return_everything_in_order(self):
+        text, is_error = self.tool("alerts", cap=4, fixtures=FIXTURES)
+        self.assertFalse(is_error, text)
+        self.assertEqual(text, TEXT_ALERTS)
+        self.assertGreater(self.invocations(), 10, "alerts no longer sends the many queries this test is about")
+        self.assertLessEqual(self.peak(), 4)
+        # The limiter queues; it does not serialise. If this fell to 1 the fix
+        # would have turned a 12-query call into 12 round trips for nothing.
+        self.assertGreater(self.peak(), 1)
+
+    def test_a_limit_above_the_stand_in_sshd_s_cap_really_does_drop_a_call(self):
+        """The control: without it a green run above proves nothing about the stand-in."""
+        self.write_config({"max_concurrent": 8})
+        text, is_error = self.tool("alerts", cap=3, fixtures=FIXTURES)
+        self.assertTrue(is_error, "8 at once against a cap of 3 should have been dropped")
+        self.assertIn("Connection reset", text)
+
+    def test_the_configured_limit_is_honoured(self):
+        self.write_config({"max_concurrent": 2})
+        text, is_error = self.tool("alerts", cap=2, fixtures=FIXTURES)
+        self.assertFalse(is_error, text)
+        self.assertEqual(text, TEXT_ALERTS)
+        self.assertEqual(self.peak(), 2)
+
+    def test_a_limit_of_one_is_a_serial_call_with_the_same_answer(self):
+        self.write_config({"max_concurrent": 1})
+        text, is_error = self.tool("alerts", cap=1, fixtures=FIXTURES)
+        self.assertFalse(is_error, text)
+        self.assertEqual(text, TEXT_ALERTS)
+        self.assertEqual(self.peak(), 1)
+
+    def test_the_limit_is_clamped_to_one_through_eight(self):
+        for configured, expected_peak in ((0, 1), (-5, 1), (100, 8), ("many", 4), (None, 4)):
+            with self.subTest(configured=configured):
+                self.peak_log.unlink(missing_ok=True)
+                self.write_config({"max_concurrent": configured})
+                # The cap is the expected peak, so a limiter that let more through fails.
+                text, is_error = self.tool("alerts", cap=expected_peak, fixtures=FIXTURES)
+                self.assertFalse(is_error, text)
+                self.assertEqual(self.peak(), expected_peak)
+
+    def test_every_tool_stays_within_the_limit(self):
+        for name, arguments in TOOLS:
+            with self.subTest(tool=name):
+                self.peak_log.unlink(missing_ok=True)
+                text, is_error = self.tool(name, arguments, cap=4)
+                self.assertFalse(is_error, text)
+                if self.peak_log.exists():
+                    self.assertLessEqual(self.peak(), 4)
+
+    def test_the_digest_path_stays_within_the_limit(self):
+        for name in ("fleet_overview", "statistics", "alerts"):
+            with self.subTest(tool=name):
+                self.peak_log.unlink(missing_ok=True)
+                text, is_error = self.tool(name, {"format": "digest"}, cap=4, fixtures=FIXTURES)
+                self.assertFalse(is_error, text)
+                self.assertLessEqual(self.peak(), 4)
+
+    def test_the_tool_usage_read_goes_through_the_same_limit(self):
+        """It is a second spawn site (runToolUsageCommand), over the same ssh."""
+        self.write_config({"max_concurrent": 2}, hermes_logs_dir="/var/hermes")
+        text, is_error = self.tool("statistics", cap=2, fixtures=FIXTURES)
+        self.assertFalse(is_error, text)
+        self.assertLessEqual(self.peak(), 2)
+        # The stand-in ssh does not run the remote script, so it prints nothing:
+        # the read must have completed cleanly, not been refused by the stand-in sshd.
+        self.assertNotIn("could not be read", text)
+        self.assertNotIn("not collected on this stack", text)
 
 
 if __name__ == "__main__":

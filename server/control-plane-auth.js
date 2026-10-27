@@ -10,6 +10,56 @@ const userIdValid = value => typeof value === 'string' && /^user_[A-Za-z0-9]{8,6
 const tripIdValid = value => typeof value === 'string' && /^trip_[A-Za-z0-9]{8,64}$/.test(value);
 const usernameValid = value => typeof value === 'string' && /^[a-z0-9][a-z0-9._-]{0,63}$/.test(value);
 
+// The link back to the organizer dashboard, which the control plane builds from
+// its own configuration and the gateway passes through the session exchange into
+// the signed claim. This function checks SHAPE only: https (http only on a
+// loopback host, for local development), no credentials, query or fragment, at
+// most 2048 characters, and the path pinned to THIS trip's setup page. It does not
+// know which origin is the portal, so a caller holding the exchange key could name
+// any https host; the gateway, which knows PORTAL_ORIGIN, drops every URL that is
+// not exactly PORTAL_ORIGIN + that path before it asks for the session. Anything
+// else is dropped rather than rendered into a menu href: javascript:, data:,
+// userinfo, control characters and other paths never leave this function.
+const MAX_DASHBOARD_URL = 2048;
+// Loopback by shape, not by literal: the release build refuses a private-IPv4 literal in shipped code.
+const isLoopbackHost = host => host === 'localhost' || host === '[::1]' || /^127(\.\d{1,3}){3}$/.test(host);
+function safeDashboardUrl(value, tripId) {
+  if (typeof value !== 'string' || !value || value.length > MAX_DASHBOARD_URL || /[\u0000-\u0020\u007f]/.test(value)) return null;
+  let url;
+  try { url = new URL(value); } catch { return null; }
+  if (url.username || url.password || url.search || url.hash) return null;
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && isLoopbackHost(url.hostname))) return null;
+  if (!tripIdValid(tripId) || url.pathname !== `/trips/${tripId}/setup`) return null;
+  return url.href;
+}
+
+// The portal's origin as the control plane's own configuration states it
+// (web.public_origin), written by the worker into the identity sidecar on every
+// provision. An origin and nothing else, decided on the RAW text before any URL
+// parser sees it (a parser forgives what an href must not carry: backslashes,
+// %-escapes, Unicode digits and hosts, a trailing dot):
+//   https://<ASCII DNS name>[:port]   or   http://<loopback>[:port]
+// with at most one trailing slash. The name's last label must not be all digits
+// (so no IPv4 literal other than loopback), no trailing dot, no leading-zero port
+// or loopback octet. The worker's normalize_portal_origin() applies the same rule
+// and both are driven by the one list in tests/fixtures/portal-origin-cases.json.
+// Anything else is no origin at all: a bad value shows no dashboard link rather
+// than a wrong one. Returns the canonical origin (lower-case, default port and
+// slash dropped), or null.
+const DNS_LABEL = '[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?';
+const PORT = '(?::[1-9][0-9]{0,4})?';
+const OCTET = '(?:0|[1-9][0-9]{0,2})';
+const HTTPS_ORIGIN = new RegExp(`^https://${DNS_LABEL}(?:\\.${DNS_LABEL})*${PORT}/?$`);
+const LOOPBACK_ORIGIN = new RegExp(`^http://(?:localhost|127(?:\\.${OCTET}){3}|\\[::1\\])${PORT}/?$`);
+function safePortalOrigin(value) {
+  if (typeof value !== 'string' || !value || value.length > MAX_DASHBOARD_URL) return null;
+  if (!HTTPS_ORIGIN.test(value) && !LOOPBACK_ORIGIN.test(value)) return null;
+  let url;
+  try { url = new URL(value); } catch { return null; } // 65536+, an octet above 255
+  if (url.protocol === 'https:' && /^[0-9]+$/.test(url.hostname.split('.').pop())) return null;
+  return url.origin;
+}
+
 function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) {
   const key = process.env.CONTROL_PLANE_EXCHANGE_KEY || '';
   let identity;
@@ -25,6 +75,17 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
     role TEXT NOT NULL CHECK(role IN ('owner', 'organizer', 'member')),
     invite_id TEXT UNIQUE
   )`);
+  // Where the organizer dashboard of THIS trip lives, for an organizer who did not come
+  // through the gateway (a direct login on the trip's own hostname, the installed
+  // app). From configuration, never from a request: the sidecar's portalOrigin
+  // plus this trip's own id. Null when either is missing or malformed.
+  const configuredDashboardUrl = identity ? safeDashboardUrl(
+    safePortalOrigin(identity.portalOrigin) ? `${safePortalOrigin(identity.portalOrigin)}/trips/${identity.tripId}/setup` : null,
+    identity.tripId,
+  ) : null;
+  if (identity && ![undefined, null, ''].includes(identity.portalOrigin) && !configuredDashboardUrl) {
+    console.warn('control_plane.portal_origin_invalid: the identity sidecar\'s portalOrigin is not a plain https origin; organizers reaching this trip directly will see no dashboard link');
+  }
   const find = db.prepare('SELECT * FROM control_plane_identities WHERE user_id = ? AND trip_id = ?');
   const localUser = db.prepare('SELECT username FROM users WHERE username = ?');
   const insert = db.prepare('INSERT INTO control_plane_identities(user_id, trip_id, username, role, invite_id) VALUES (?, ?, ?, ?, ?)');
@@ -73,7 +134,7 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
   }
 
   app.post('/api/internal/control-plane/session', internal, (req, res) => {
-    const { userId, runtimeUsername, role } = req.body || {};
+    const { userId, runtimeUsername, role, dashboardUrl } = req.body || {};
     if (!userIdValid(userId) || !['owner', 'organizer', 'member'].includes(role) ||
         (runtimeUsername !== null && !usernameValid(runtimeUsername))) {
       return res.status(400).json({ error: 'INVALID_REQUEST' });
@@ -83,7 +144,17 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
         !activeUser(row.username) || !roleMatchesLocal(role, row.username)) {
       return res.status(403).json({ error: 'IDENTITY_MISMATCH' });
     }
-    const token = jwt.sign({ username: row.username, controlPlane: { userId, tripId: identity.tripId, role } }, jwtSecret, { expiresIn: '12h' });
+    // Signed into the session, so it can only come from the exchange-key holder
+    // and only an owner/organizer carries it. A member's token never does.
+    const dashboard = ['owner', 'organizer'].includes(role) ? safeDashboardUrl(dashboardUrl, identity.tripId) : null;
+    // An owner or organizer minted without the link opens a trip with no way
+    // back to the dashboard and nothing to say why (staging, 2026-10-20). Say
+    // which of the two it was; never the value, which is not ours to echo.
+    if (['owner', 'organizer'].includes(role) && !dashboard) {
+      console.warn(`control_plane.session_without_dashboard_url: role=${role} reason=${dashboardUrl === undefined || dashboardUrl === null ? 'not_sent' : 'rejected'}`);
+    }
+    const controlPlane = { userId, tripId: identity.tripId, role, ...(dashboard ? { dashboardUrl: dashboard } : {}) };
+    const token = jwt.sign({ username: row.username, controlPlane }, jwtSecret, { expiresIn: '12h' });
     return res.json({ token });
   });
 
@@ -111,6 +182,29 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
     catch { return res.status(409).json({ error: 'IDENTITY_CONFLICT' }); }
     return res.json({ ok: true });
   });
-  return { validManagedPayload };
+  // Only for a managed session whose claim passed validManagedPayload on this
+  // request (so the binding, the participant and the local organizer role were
+  // all re-checked just now). A direct login, a member and the agent key have
+  // no claim and get nothing from THIS function; dashboardUrlForOrganizer adds the
+  // configured address for an organizer who has none.
+  function dashboardUrlFor(claim, username) {
+    if (!claim || typeof claim !== 'object' || !['owner', 'organizer'].includes(claim.role)) return null;
+    if (!roleMatchesLocal(claim.role, username)) return null;
+    return safeDashboardUrl(claim.dashboardUrl, identity?.tripId);
+  }
+  // An organizer on this trip however they got in: through the gateway (the
+  // claim's pinned URL, as above) or directly. The direct case reads no request
+  // input at all: the person must be an active participant and a CURRENT local
+  // organizer, and the URL is the configured one. Members and the agent key
+  // (no username that is an organizer here) get nothing.
+  function dashboardUrlForOrganizer(claim, username) {
+    const managed = dashboardUrlFor(claim, username);
+    // Configuration knows the portal's origin and the gateway's claim need not
+    // be trusted for it: where both exist and differ, configuration wins.
+    if (managed && (!configuredDashboardUrl || managed === configuredDashboardUrl)) return managed;
+    if (!configuredDashboardUrl || !activeUser(username) || !organizers().includes(username)) return null;
+    return configuredDashboardUrl;
+  }
+  return { validManagedPayload, dashboardUrlFor, dashboardUrlForOrganizer };
 }
-module.exports = { createControlPlaneAuth };
+module.exports = { createControlPlaneAuth, safeDashboardUrl, safePortalOrigin };

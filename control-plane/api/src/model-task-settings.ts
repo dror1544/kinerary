@@ -166,8 +166,40 @@ export function switchableRunner(
   };
 }
 
-/** How a codex install is checked: null when it knows every isolation feature, else what is wrong. */
-export type CodexProbe = (bin: string) => Promise<string | null>;
+/**
+ * How a codex install is checked: null when it knows every isolation feature,
+ * else what is wrong. `timeoutMs` bounds the whole check; a probe that outruns
+ * it resolves as a problem (fail-safe), never a pass.
+ */
+export type CodexProbe = (bin: string, timeoutMs?: number) => Promise<string | null>;
+
+/**
+ * How long the relay waits on `codex features list` from its refresh loop and
+ * the `/model` command. `codexIsolationProblem`'s own default is 20s, sized for
+ * startup; here the probe sits on the command's reply and the 30s refresh, and a
+ * healthy codex answers in well under a second (#202).
+ */
+export const CODEX_PROBE_TIMEOUT_MS = 5_000;
+
+/**
+ * Binaries whose isolation probe has PASSED in this process. The refresh loop
+ * (every 30s) re-verifies while any override names codex; without this a slow
+ * codex costs a child process per tick for as long as the override stands.
+ * Only a pass is remembered — a failure latches
+ * `KINERARY_CODEX_ISOLATION_UNVERIFIED` and ends the checking anyway.
+ *
+ * Trade-off (#202): a remembered pass does not notice a codex binary swapped
+ * under a running relay for one with a different feature list. A relay restart
+ * (or the `/model` command, which always probes fresh) re-checks. The call-time
+ * failure for such a swap is codex exiting on an unknown flag, not a silent
+ * downgrade, so the exposure is a loud error, not a quiet one.
+ */
+const passedCodexProbes = new Set<string>();
+
+/** Test hook: forget remembered passes. */
+export function resetCodexProbeMemo(): void {
+  passedCodexProbes.clear();
+}
 
 /**
  * The relay's startup check (relay/server.ts) only runs when a `*_RUNNER` ENV
@@ -187,8 +219,13 @@ export async function verifyCodexOverrides(
 ): Promise<void> {
   if (env.KINERARY_CODEX_ISOLATION_UNVERIFIED === "1") return;
   if (![...overrides.values()].some((binding) => binding.runner === "codex")) return;
-  const problem = await probe(env.CODEX_BIN || "codex");
-  if (!problem) return;
+  const bin = env.CODEX_BIN || "codex";
+  if (passedCodexProbes.has(bin)) return;
+  const problem = await probe(bin, CODEX_PROBE_TIMEOUT_MS);
+  if (!problem) {
+    passedCodexProbes.add(bin);
+    return;
+  }
   env.KINERARY_CODEX_ISOLATION_UNVERIFIED = "1";
   log(structuredLog("error", "relay.codex_isolation_unverified", {
     detail: problem,
@@ -293,7 +330,7 @@ export async function handleModelCommand(
     // canServe is synchronous and only reads the flag the startup check sets,
     // which that check sets only for an env-bound codex. Ask codex itself.
     if (binding.runner === "codex") {
-      const problem = await codexProbe(process.env.CODEX_BIN || "codex");
+      const problem = await codexProbe(process.env.CODEX_BIN || "codex", CODEX_PROBE_TIMEOUT_MS);
       if (problem) {
         return `${binding.runner}:${binding.model} cannot serve calls on this relay (${problem}). Nothing changed.`;
       }

@@ -158,6 +158,20 @@ export function groupAddUrl(botUsername: string | null | undefined, payload: str
   return `https://t.me/${handle}?startgroup=${safe}&admin=pin_messages+invite_users`;
 }
 
+/**
+ * What `/group` says about the one-tap add link, appended to its instructions.
+ *
+ * The URL itself is `groupAddUrl`'s, the same builder the post-interview
+ * greeting uses (`organizerIntroMarked`), with the issued binding token as the
+ * payload - so tapping it adds the bot as an admin AND binds the group, with
+ * nothing to paste. The pasted line stays below it as the fallback.
+ */
+export function groupAddLinkLine(language: "he" | "en", url: string): string {
+  return language === "he"
+    ? `או בדרך המהירה: לוחצים על הקישור הזה, בוחרים קבוצה ומאשרים לי הרשאות מנהל, ואני מתחבר לבד:\n${url}`
+    : `Or the quick way: tap this link, pick the group and approve my admin rights, and I'll connect on my own:\n${url}`;
+}
+
 /** Whether any proactive message is actually switched on. */
 function scheduleLines(proactive: ProactiveSettings | null | undefined, lang: "he" | "en"): string[] {
   const p = proactive ?? {};

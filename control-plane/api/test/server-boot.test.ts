@@ -6,6 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { applyMigrations } from "../src/migrations.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 /**
  * Boots the real server entrypoint — `src/server.ts`, the file the container
@@ -62,6 +64,8 @@ const signupBlock = {
 interface BootedServer {
   port: number;
   stop: () => Promise<void>;
+  /** Everything the server has written to stderr so far. */
+  stderr: () => string;
 }
 
 /**
@@ -85,7 +89,7 @@ async function exitCodeWithin(child: ChildProcess, timeoutMs: number): Promise<n
   });
 }
 
-async function bootServer(profile: Record<string, unknown>, port: number): Promise<BootedServer> {
+async function bootServer(profile: Record<string, unknown>, port: number, extraEnv: Record<string, string> = {}): Promise<BootedServer> {
   const directory = await mkdtemp(join(tmpdir(), "kinerary-control-plane-boot-"));
   const profilePath = join(directory, "architecture.json");
   await writeFile(profilePath, JSON.stringify(profile), "utf8");
@@ -101,7 +105,9 @@ async function bootServer(profile: Record<string, unknown>, port: number): Promi
       CONTROL_PLANE_DATABASE_URL: "postgresql://unused.invalid:5432/unused",
       CONTROL_PLANE_TELEGRAM_BOT_TOKEN: "12345678:AAFakeBootTestBotToken",
       CONTROL_PLANE_ACTION_SECRET: "boot-test-action-secret",
+      KINERARY_TEST_RUNTIME_EXCHANGE_KEY: "boot-runtime-exchange-secret",
       CONTROL_PLANE_TELEGRAM_WEBHOOK_SECRET: "boot-test-webhook-secret",
+      ...extraEnv,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -124,7 +130,7 @@ async function bootServer(profile: Record<string, unknown>, port: number): Promi
     }
     try {
       const response = await fetch(`http://127.0.0.1:${port}/healthz`, { signal: AbortSignal.timeout(500) });
-      if (response.ok) return { port, stop };
+      if (response.ok) return { port, stop, stderr: () => stderr };
     } catch {
       // not listening yet
     }
@@ -250,6 +256,7 @@ test("the real server entrypoint refuses to start when a signup secret cannot be
         // secret must stop the boot rather than yield a half-configured
         // server that 503s at request time.
         CONTROL_PLANE_ACTION_SECRET: "boot-test-action-secret",
+      KINERARY_TEST_RUNTIME_EXCHANGE_KEY: "boot-runtime-exchange-secret",
         CONTROL_PLANE_TELEGRAM_WEBHOOK_SECRET: "boot-test-webhook-secret",
         CONTROL_PLANE_TELEGRAM_BOT_TOKEN: "",
       },
@@ -411,3 +418,148 @@ for (const composeFile of ["compose.vm.yml", "compose.local.yml"]) {
     );
   });
 }
+
+test("the real portal server boots without Google credentials and advertises email login", async () => {
+  const port = await freePort(), workerPort = await freePort();
+  const server = await bootServer({ ...baseProfile(port, workerPort), web: {
+    public_origin: `http://127.0.0.1:${port}`, runtime_origin: "http://127.0.0.1:4320",
+    runtime_exchange_key_secret_ref: "env://KINERARY_TEST_RUNTIME_EXCHANGE_KEY",
+    runtime_upstream_host_suffixes: ["internal"], telegram_bot_username: "kinerary_bot",
+  } }, port);
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/v1/auth/capabilities`);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { google: false, emailPassword: true, emailSignUp: false, telegramMiniApp: false });
+    const google = await fetch(`http://127.0.0.1:${port}/v1/auth/google`, {
+      method: "POST", headers: { "content-type": "application/json", origin: `http://127.0.0.1:${port}` }, body: JSON.stringify({ credential: "x" }),
+    });
+    assert.equal(google.status, 503);
+    // Unset is a downgrade, not an error, so the boot log says so.
+    assert.match(server.stderr(), /"event":"google_sign_in.disabled"/);
+    // No web.telegram_bot_token_secret_ref: the Mini App feature is off and the
+    // boot log says why (a downgrade nobody can see in the conversation).
+    assert.match(server.stderr(), /"event":"mini_app.disabled"/);
+    const miniApp = await fetch(`http://127.0.0.1:${port}/v1/auth/telegram-mini-app`, {
+      method: "POST", headers: { "content-type": "application/json", origin: `http://127.0.0.1:${port}` }, body: "{}",
+    });
+    assert.equal(miniApp.status, 503);
+  } finally { await server.stop(); }
+});
+
+test("the real portal server says why email sign-up is off, and answers 503 SIGN_UP_UNAVAILABLE rather than pretending", async () => {
+  const port = await freePort(), workerPort = await freePort();
+  const web = (extra: Record<string, unknown>) => ({
+    public_origin: `http://127.0.0.1:${port}`, runtime_origin: "http://127.0.0.1:4320",
+    runtime_exchange_key_secret_ref: "env://KINERARY_TEST_RUNTIME_EXCHANGE_KEY",
+    runtime_upstream_host_suffixes: ["internal"], telegram_bot_username: "kinerary_bot", ...extra,
+  });
+  const asks = (origin: string) => fetch(`${origin}/v1/auth/sign-up`, {
+    method: "POST", headers: { "content-type": "application/json", origin }, body: JSON.stringify({ email: "a@b.example.test", password: "long enough pw" }),
+  });
+  // No email_provider at all.
+  const off = await bootServer({ ...baseProfile(port, workerPort), web: web({}) }, port);
+  try {
+    assert.match(off.stderr(), /"event":"email_auth.disabled"/);
+    const response = await asks(`http://127.0.0.1:${port}`);
+    assert.deepEqual([response.status, await response.json()], [503, { error: "SIGN_UP_UNAVAILABLE" }]);
+  } finally { await off.stop(); }
+
+  // Resend, with a key reference that resolves to nothing: still 503, and the log names the cause.
+  const port2 = await freePort(), workerPort2 = await freePort();
+  const unresolved = await bootServer({ ...baseProfile(port2, workerPort2), web: { ...web({}), public_origin: `http://127.0.0.1:${port2}`, email_provider: "resend", email_api_key_secret_ref: "env://KINERARY_TEST_EMAIL_KEY_UNSET", email_from: "noreply@mail.example.test" } }, port2);
+  try {
+    assert.match(unresolved.stderr(), /"event":"email_auth.key_unresolved"/);
+    assert.equal((await asks(`http://127.0.0.1:${port2}`)).status, 503);
+    assert.equal(((await (await fetch(`http://127.0.0.1:${port2}/v1/auth/capabilities`)).json()) as { emailSignUp: boolean }).emailSignUp, false);
+  } finally { await unresolved.stop(); }
+
+  // The log provider (development only): on, and loud that nothing is delivered.
+  const port3 = await freePort(), workerPort3 = await freePort();
+  const logOnly = await bootServer({ ...baseProfile(port3, workerPort3), web: { ...web({}), public_origin: `http://127.0.0.1:${port3}`, email_provider: "log" } }, port3);
+  try {
+    assert.match(logOnly.stderr(), /"event":"email_auth.log_only"/);
+    assert.equal(((await (await fetch(`http://127.0.0.1:${port3}/v1/auth/capabilities`)).json()) as { emailSignUp: boolean }).emailSignUp, true);
+  } finally { await logOnly.stop(); }
+});
+
+test("the real portal server keeps Mini App sign-in off when its token cannot be read, and says so", async () => {
+  const port = await freePort(), workerPort = await freePort();
+  const server = await bootServer({ ...baseProfile(port, workerPort), web: {
+    public_origin: `http://127.0.0.1:${port}`, runtime_origin: "http://127.0.0.1:4320",
+    runtime_exchange_key_secret_ref: "env://KINERARY_TEST_RUNTIME_EXCHANGE_KEY",
+    runtime_upstream_host_suffixes: ["internal"], telegram_bot_username: "kinerary_bot",
+    telegram_bot_token_secret_ref: "env://KINERARY_TEST_MINI_APP_TOKEN_UNSET",
+  } }, port);
+  try {
+    // An unreadable Mini App token must not take the whole API down with it.
+    const response = await fetch(`http://127.0.0.1:${port}/v1/auth/capabilities`);
+    assert.equal((await response.json() as { telegramMiniApp: boolean }).telegramMiniApp, false);
+    assert.match(server.stderr(), /"event":"mini_app.token_unresolved"/);
+    assert.doesNotMatch(server.stderr(), /KINERARY_TEST_MINI_APP_TOKEN_UNSET.*[0-9]{6,}:AA/);
+  } finally { await server.stop(); }
+});
+
+test("the real portal server stays off until getMe names the configured bot, and never logs the token", async () => {
+  const port = await freePort(), workerPort = await freePort();
+  const token = "987654:AAFakeMiniAppBootTokenNeverLogged";
+  const server = await bootServer({ ...baseProfile(port, workerPort), web: {
+    public_origin: `http://127.0.0.1:${port}`, runtime_origin: "http://127.0.0.1:4320",
+    runtime_exchange_key_secret_ref: "env://KINERARY_TEST_RUNTIME_EXCHANGE_KEY",
+    runtime_upstream_host_suffixes: ["internal"], telegram_bot_username: "kinerary_bot",
+    telegram_bot_token_secret_ref: "env://KINERARY_TEST_MINI_APP_TOKEN",
+  } }, port, { KINERARY_TEST_MINI_APP_TOKEN: token });
+  try {
+    // Telegram answers this fake token with an error (or is unreachable from
+    // CI): either way getMe did not confirm the bot, so the feature is off.
+    const response = await fetch(`http://127.0.0.1:${port}/v1/auth/capabilities`);
+    assert.equal((await response.json() as { telegramMiniApp: boolean }).telegramMiniApp, false);
+    assert.match(server.stderr(), /"event":"mini_app\.bot_check_(failed|unusable)"/);
+    assert.equal(server.stderr().includes(token), false);
+    assert.equal(server.stderr().includes("AAFakeMiniAppBootTokenNeverLogged"), false);
+  } finally { await server.stop(); }
+});
+
+test("the real server entrypoint puts the Mini App's state on /readyz (and keeps the token off it)", { skip: !testDatabaseUrl() }, async () => {
+  // /readyz needs a migrated database; everything else here boots without one.
+  const pool = testPool();
+  const client = await pool.connect();
+  try {
+    await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");
+    await client.query("DROP TABLE IF EXISTS public.control_plane_schema_migrations");
+    await applyMigrations(client, fileURLToPath(new URL("../../db/migrations/", import.meta.url)));
+  } finally {
+    client.release();
+    await pool.end();
+  }
+  const port = await freePort(), workerPort = await freePort();
+  const token = "987654:AAFakeMiniAppReadyzTokenNeverShown";
+  const server = await bootServer({ ...baseProfile(port, workerPort), web: {
+    public_origin: `http://127.0.0.1:${port}`, runtime_origin: "http://127.0.0.1:4320",
+    runtime_exchange_key_secret_ref: "env://KINERARY_TEST_RUNTIME_EXCHANGE_KEY",
+    runtime_upstream_host_suffixes: ["internal"], telegram_bot_username: "kinerary_bot",
+    telegram_bot_token_secret_ref: "env://KINERARY_TEST_MINI_APP_TOKEN",
+  } }, port, { KINERARY_TEST_MINI_APP_TOKEN: token, CONTROL_PLANE_DATABASE_URL: testDatabaseUrl() ?? "" });
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/readyz`);
+    assert.equal(response.status, 200);
+    const body = await response.text();
+    // Token configured, but getMe could not confirm the bot (a fake token): enabled is false and
+    // has_main_web_app is unknown - null, not false. Only a real answer from Telegram says "no".
+    assert.deepEqual(JSON.parse(body).telegram_mini_app, { configured: true, enabled: false, has_main_web_app: null });
+    assert.equal(body.includes(token), false);
+  } finally { await server.stop(); }
+});
+
+test("the real server entrypoint reports the Mini App as not configured on /readyz when the profile has no token", { skip: !testDatabaseUrl() }, async () => {
+  const port = await freePort(), workerPort = await freePort();
+  const server = await bootServer({ ...baseProfile(port, workerPort), web: {
+    public_origin: `http://127.0.0.1:${port}`, runtime_origin: "http://127.0.0.1:4320",
+    runtime_exchange_key_secret_ref: "env://KINERARY_TEST_RUNTIME_EXCHANGE_KEY",
+    runtime_upstream_host_suffixes: ["internal"], telegram_bot_username: "kinerary_bot",
+  } }, port, { CONTROL_PLANE_DATABASE_URL: testDatabaseUrl() ?? "" });
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/readyz`);
+    assert.equal(response.status, 200);
+    assert.deepEqual((await response.json() as { telegram_mini_app: unknown }).telegram_mini_app, { configured: false, enabled: false, has_main_web_app: null });
+  } finally { await server.stop(); }
+});

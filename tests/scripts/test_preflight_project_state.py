@@ -35,7 +35,8 @@ class Harness(unittest.TestCase):
         (self.root / ".claude/agents/sample.md").write_text(AGENT)
         (self.root / "docs/test-reports").mkdir(parents=True)
         (self.root / "docs/test-reports/baseline.md").write_text("# baseline\n")
-        self.env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        # Never the developer's own notes folder (a synced, slow share on some machines): the hook reads it on a deploy prompt.
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_") and k != "KINERARY_NOTES_DIR"}
         self.env["HERMES_HOME"] = self.hermes.name
         self.py("scripts/sync-codex-agents.py")
         self.git("init", "-q", "-b", "integration/sprint-9")

@@ -1,10 +1,15 @@
 import { lazy, Suspense, useEffect } from "react";
 import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 
+const MiniApp = lazy(() => import("./mini-app/MiniApp"));
 const LandingPage = lazy(() => import("./pages/LandingPage"));
 const ProductApp = lazy(() => import("./pages/ProductApp"));
 const AdminDashboardPage = lazy(() => import("./pages/AdminDashboardPage"));
 const NotFoundPage = lazy(() => import("./pages/NotFoundPage"));
+const SignUpPage = lazy(() => import("./pages/SignUpPage"));
+const VerifyEmailPage = lazy(() => import("./pages/VerifyEmailPage"));
+const ForgotPasswordPage = lazy(() => import("./pages/ForgotPasswordPage"));
+const ResetPasswordPage = lazy(() => import("./pages/ResetPasswordPage"));
 
 function RouteFallback() {
   return (
@@ -21,7 +26,9 @@ function PageTitle() {
     "/": "Kinerary — Keep the family trip moving",
     "/sign-in": "Sign in — Kinerary",
     "/sign-up": "Create your account — Kinerary",
+    "/verify-email": "Confirm your email — Kinerary",
     "/forgot-password": "Reset your password — Kinerary",
+    "/reset-password": "Choose a new password — Kinerary",
     "/trips": "My trips — Kinerary",
     "/trips/new": "Start a trip — Kinerary",
     "/admin": "Super-admin dashboard — Kinerary",
@@ -40,13 +47,17 @@ export function App() {
         <Routes>
           <Route path="/" element={<LandingPage />} />
           <Route path="/sign-in" element={<ProductApp view="sign-in" />} />
-          <Route path="/sign-up" element={<Navigate to="/sign-in" replace />} />
-          <Route path="/forgot-password" element={<Navigate to="/sign-in" replace />} />
+          <Route path="/sign-up" element={<SignUpPage />} />
+          <Route path="/verify-email" element={<VerifyEmailPage />} />
+          <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+          <Route path="/reset-password" element={<ResetPasswordPage />} />
           <Route path="/trips" element={<ProductApp view="trips" />} />
           <Route path="/trips/new" element={<ProductApp view="new-trip" />} />
           <Route path="/trips/:tripId/setup" element={<ProductApp view="trip" />} />
           <Route path="/trips/:tripId" element={<ProductApp view="trip" />} />
           <Route path="/trips/:tripId/app" element={<ProductApp view="runtime" />} />
+          <Route path="/mini-app" element={<MiniApp />} />
+          <Route path="/mini-app/trips/:tripId" element={<MiniApp />} />
           <Route path="/join" element={<ProductApp view="join" />} />
           {/* Operator-only, gated by its own X-API-Key inside the page —
               not the organizer cookie session every other /trips/* route

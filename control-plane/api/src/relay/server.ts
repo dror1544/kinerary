@@ -40,6 +40,8 @@ import { awaitExpectedGateways, expectedGatewayProfiles, gatewayWaitMsFromEnv } 
 import { MediaStore } from "./media-store.js";
 import type { BotIdentity } from "./dispatch.js";
 import { publishCommandMenu } from "./command-menu.js";
+import { createTripAppReadiness, type TripAppReadiness } from "./trip-app-readiness.js";
+import { checkBotIdentity } from "../telegram-mini-app.js";
 import { startTripBotPoller } from "./poller.js";
 import { checkDocumentStore, documentStoreFromEnv } from "../document-store.js";
 import { startDocumentSweeper } from "../document-sweeper.js";
@@ -96,6 +98,14 @@ interface Runtime {
   /** Set only in serve mode; its absence is what disables the poll loop. */
   db?: ReturnType<typeof createDatabasePool>;
   botIdentity?: BotIdentity;
+  /**
+   * `web.telegram_bot_username`: the bot whose Main Mini App the "Open trip"
+   * button opens. Absent when the profile has no `web` block - then there is no
+   * Mini App and the relay does not offer one.
+   */
+  tripAppBotUsername?: string;
+  /** Whether the Mini App is ready for that bot, re-evaluated over time. */
+  tripApp?: TripAppReadiness;
   /** From `relay.interviewer_profile`; absent disables interview forwarding. */
   interviewerProfile?: string;
   /**
@@ -171,12 +181,50 @@ async function serveRuntime(path: string): Promise<Runtime> {
     }));
   }
 
+  // The Mini App's "Open trip" button, the pin, /app in the menus and the plain
+  // words appear ONLY when the Mini App is ready for its bot (owner decision
+  // 2026-10-20; relay/trip-app-readiness.ts): a `web` block with a bot token that
+  // getMe confirms is the bot the profile names, AND getMe says that bot has its
+  // Main Mini App. Unknown is not ready. No fallback to this relay's own handle.
+  const tripAppBotUsername = profile.web?.telegram_bot_username;
+  let tripAppToken: string | null = null;
+  if (profile.web?.telegram_bot_token_secret_ref) {
+    try {
+      tripAppToken = await resolveSecretRef(profile.web.telegram_bot_token_secret_ref);
+    } catch (error) {
+      log(structuredLog("warn", "relay.trip_app_token_unresolved", {
+        safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        effect: "no Open trip button and no /app",
+      }));
+    }
+  }
+  const expectedUsername = tripAppBotUsername;
+  const tripApp = createTripAppReadiness({
+    check: tripAppToken && expectedUsername
+      ? () => checkBotIdentity({ token: tripAppToken!, expectedUsername, log })
+      : null,
+    onChange: (ready) => {
+      log(structuredLog("info", "relay.trip_app_readiness_changed", { ready }));
+      // The menus follow readiness: republished when it flips, never per message.
+      void publishCommandMenu(telegram, log, { tripApp: ready }).catch(() => {});
+    },
+  });
+  await tripApp.start();
+  if (tripApp.ready()) {
+    log(structuredLog("info", "relay.trip_app_ready", { bot_username: tripAppBotUsername }));
+  } else {
+    log(structuredLog("info", "relay.trip_app_not_ready", {
+      configured: Boolean(tripAppToken && expectedUsername),
+      hint: "Open trip button, /app and the plain-word replies stay off until the Mini App is configured and the bot's Main Mini App is set (docs/telegram-mini-app.md)",
+    }));
+  }
+
   // Publish the ⌘ menu here — once, at boot, beside the other call that asks
   // Telegram about ourselves — rather than per message. Awaited so the log
   // lines stay in order, and deliberately not guarded: publishCommandMenu owns
   // its own failure and never throws, because an undiscoverable menu must not
   // cost the deployment a relay.
-  await publishCommandMenu(telegram, log);
+  await publishCommandMenu(telegram, log, { tripApp: tripApp.ready() });
 
   // Same bot as signup? Then this loop owns the approval callbacks too.
   let approvals: { config: SignupConfig } | undefined;
@@ -208,6 +256,8 @@ async function serveRuntime(path: string): Promise<Runtime> {
     telegram,
     db,
     botIdentity: identity ? { username: identity.username, id: identity.id } : undefined,
+    ...(tripAppBotUsername ? { tripAppBotUsername } : {}),
+    tripApp,
     interviewerProfile: relay.interviewer_profile,
     multiplexGatewayId: relay.multiplex_gateway_id,
     approvals,
@@ -427,6 +477,8 @@ async function main(): Promise<void> {
       telegram: runtime.telegram,
       connector,
       botIdentity: runtime.botIdentity,
+      ...(runtime.tripAppBotUsername ? { tripAppBotUsername: runtime.tripAppBotUsername } : {}),
+      ...(runtime.tripApp ? { tripAppReady: () => runtime.tripApp!.ready() } : {}),
       interviewerProfile: runtime.interviewerProfile,
       approvals: runtime.approvals,
       media: { telegram: runtime.telegram, store: mediaStore, baseUrl: mediaBaseUrl, log },
@@ -469,6 +521,7 @@ async function main(): Promise<void> {
     process.on(signal, () => {
       log(structuredLog("info", "relay.shutting_down", { signal }));
       stopPolling?.();
+      runtime.tripApp?.stop();
       stopSweeping?.();
       stopOverrides?.();
       stopEventsPurge?.();

@@ -696,7 +696,7 @@ function upsertIssue(db, issue) {
 
 function recomputeQualityIssues(db) {
   const rows = activeRows(db);
-  if (!rows) return [];
+  if (!rows) return;
   const issues = [];
   const byDate = new Map();
   for (const item of rows.items) {
@@ -732,8 +732,14 @@ function recomputeQualityIssues(db) {
       }
     }
   }
-  const ids = issues.map((issue) => upsertIssue(db, { source: 'engine', ...issue }));
-  return db.prepare(`SELECT * FROM trip_quality_issues WHERE id IN (${ids.map(() => '?').join(',') || "''"}) ORDER BY created_at DESC`).all(...ids);
+  // One transaction: a plan with thousands of issues is thousands of upserts,
+  // and each is its own fsync outside one. No caller reads a return value, and
+  // the old `SELECT ... WHERE id IN (?,?,...)` over every id threw past
+  // SQLite's variable limit (~32766) — at boot, so the server would not start
+  // (issue #374). Readers query trip_quality_issues themselves (/api/issues).
+  db.transaction(() => {
+    for (const issue of issues) upsertIssue(db, { source: 'engine', ...issue });
+  })();
 }
 
 function etagForPayload(payload) {

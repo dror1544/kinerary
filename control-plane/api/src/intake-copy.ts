@@ -518,6 +518,12 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // was not must not be passed off as read, because the organizer would
     // reasonably assume anything missing from the recap was not in the file.
     documentPartial: "I could only read part of that — some of it is a scan, or it runs longer than I can take in one go. I've used what I could read; if something from it is missing below, tell me or send that part separately.",
+    // Said when a TYPED message ran past what one read takes (#51). The first
+    // part was used; the rest was not, and the organizer would reasonably assume
+    // anything missing from what follows was simply not understood. Not
+    // `documentPartial`: there is no file and no scan, and "some of it is a
+    // scan" would be untrue.
+    messagePartial: "That message was longer than I can read in one go, so I used the first part of it. If something from the end is missing, send it again on its own.",
     // Said after the day-by-day, when the documents together ran past what one
     // itinerary read takes. Not `documentPartial`: every file WAS read, so "some
     // of it is a scan" is untrue, and said a second time after the recap it
@@ -689,6 +695,29 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // distinguishable refusal confirms a guess to whoever is guessing.
     switchRefused: "I can't switch to that one. Send /trips to see the ones I have for you.",
     switchInGroup: "I can only switch trips in our private chat — this group stays on its own trip.",
+    // The dashboard's "Link Telegram" deep link, redeemed. {trip} is replaced by
+    // the trip's title. ONE refusal sentence for every reason (expired, used,
+    // unknown, not yours any more): a distinguishable one confirms a guess.
+    telegramLinked: "Done — this Telegram account is now linked to \"{trip}\". Send /trips to see it, and /switch to talk to it from this chat.",
+    telegramLinkRefused: "That link didn't work — it may have expired or been used already. Open Kinerary, find the trip and choose Link Telegram for a fresh one.",
+    // A valid group code posted in a group that belongs to ANOTHER trip, by someone who is not an
+    // organizer of both. One sentence for every way of being refused, so it confirms nothing about
+    // who organizes what.
+    groupMoveNotOrganizer: "This group belongs to another trip. Only its organizer can move it.",
+    // Posted at the top of the new introduction when the group's own organizer moved it to their next trip.
+    groupMovedNotice: "This group now follows {trip}.",
+    groupMovedNoticeUntitled: "the new trip",
+    // ── The Mini App's way in (#443) ────────────────────────────────────
+    // The message carrying the "Open trip" URL button, in a trip's group (pinned
+    // there) or answering /app. It says nothing about passwords or access: the
+    // button only SELECTS the trip, and the Mini App decides who may open it.
+    openTripText: "The trip is one tap away — tap Open trip to see the plan right here in Telegram.",
+    openTripButton: "Open trip",
+    // Pinning needs the admin right to pin. Said once, with what to do about it;
+    // the button above works either way.
+    openTripPinFailed: "I couldn't pin the Open trip message. To keep it at the top of the group, make me an admin with the \"Pin messages\" right, then send the group code again. The button works from where it is.",
+    // The Mini App is not ready for this bot (or no handle is known): said plainly, not blank.
+    openTripUnavailable: "The trip app isn't available yet. The trip site link from /help works as usual.",
     switchInInterview: "We're in the middle of setting up a trip. Let's finish this one first, then I can switch.",
     // Migration 0042's reachability. Worth surfacing: this is the exact state
     // that produced "I don't have a trip for this chat" about a site that was
@@ -802,6 +831,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     documentUnreadable: "לא הצלחתי לקרוא את הקובץ — יכול להיות שזו סריקה או תמונה ולא מסמך טקסט. אפשר לשלוח קובץ אחר אם יש, או שנמשיך ואשאל במקום.",
     documentIdentity: "זה נראה כמו דרכון או תעודת זהות — לא קראתי אותו. אני לא צריך מסמכי זיהוי כדי להקים את הטיול, אז אין סיבה שאחזיק אחד כזה. אישורי הזמנה, כרטיסים ותוכניות — אלה המועילים.",
     documentPartial: "הצלחתי לקרוא רק חלק מזה — חלק מהקובץ סרוק, או שהוא ארוך מכדי לקרוא בבת אחת. השתמשתי במה שהצלחתי לקרוא; אם משהו ממנו חסר למטה, ספרו לי או שלחו את החלק הזה בנפרד.",
+    messagePartial: "ההודעה הזאת ארוכה מכדי שאוכל לקרוא אותה בבת אחת, אז התבססתי על החלק הראשון שלה. אם משהו מהסוף חסר, שלחו אותו שוב בהודעה נפרדת.",
     itineraryPartial: "התוכנית היומית שהוספתי מכסה רק חלק מהמסמכים — יחד הם ארוכים מכדי שאתכנן מהם בבת אחת. בדקו את הימים באתר הטיול; אם משהו חסר, שלחו את המסמך הזה לבד.",
     documentAlreadyRead: "את זה כבר יש לי — קראתי אותו קודם, כך שאין ממנו משהו חדש להוסיף. ממשיכים:",
     documentConflict: "שני מסמכים שלכם לא מסכימים לגבי {what} של {entry}. אצלי רשום {held}, אבל ב-\"{document}\" כתוב {incoming}. מה נכון?",
@@ -917,6 +947,15 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     switchNoCompanion: "האתר מוכן — אני עדיין מסיים את העוזר של הטיול הזה, אז תנו לי רגע לפני שתשאלו אותי עליו.",
     switchRefused: "אני לא יכול לעבור לשם. שלחו ‎/trips‎ כדי לראות את הטיולים שיש לי עבורכם.",
     switchInGroup: "אני יכול להחליף טיול רק בצ׳אט הפרטי בינינו — הקבוצה הזו נשארת על הטיול שלה.",
+    telegramLinked: "בוצע — חשבון הטלגרם הזה מקושר עכשיו אל \"{trip}\". שלחו ‎/trips‎ כדי לראות אותו, ו‎/switch‎ כדי לדבר איתו מהצ׳אט הזה.",
+    telegramLinkRefused: "הקישור הזה לא עבד — ייתכן שפג תוקפו או שכבר נעשה בו שימוש. היכנסו ל-Kinerary, מצאו את הטיול ובחרו Link Telegram כדי לקבל קישור חדש.",
+    groupMoveNotOrganizer: "הקבוצה הזו שייכת לטיול אחר. רק מי שמארגן אותו יכול להעביר אותה.",
+    groupMovedNotice: "מעכשיו הקבוצה הזו מלווה את {trip}.",
+    groupMovedNoticeUntitled: "הטיול החדש",
+    openTripText: "הטיול במרחק לחיצה — לחצו על פתיחת הטיול כדי לראות את התוכנית כאן בטלגרם.",
+    openTripButton: "פתיחת הטיול",
+    openTripPinFailed: "לא הצלחתי להצמיד את הודעת פתיחת הטיול. כדי שתישאר בראש הקבוצה, הפכו אותי למנהל עם ההרשאה \"הצמדת הודעות\" ושלחו שוב את קוד הקבוצה. הכפתור עובד גם מהמקום שבו הוא נמצא.",
+    openTripUnavailable: "אפליקציית הטיול עדיין לא זמינה. הקישור לאתר הטיול מ-‎/help ממשיך לעבוד כרגיל.",
     switchInInterview: "אנחנו באמצע הקמת טיול. בואו נסיים את זה קודם, ואז אוכל להחליף.",
     tripUnreachable: "(האתר לא מגיב)",
     tripBridgeUnreachable: "(לצערי אני לא יכול לקרוא את נתוני הטיול כרגע)",

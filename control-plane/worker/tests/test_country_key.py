@@ -68,3 +68,17 @@ class NormaliseCountryKeyTests(unittest.TestCase):
         # which is the same mismatch by a subtler route.
         value = ("x " * 60).strip()          # 119 chars, single-spaced
         self.assertEqual(value.lower()[:COUNTRY_KEY_MAX_CHARS], normalise_country_key(value))
+
+
+class EveryReaderUsesTheSharedHelperTests(unittest.TestCase):
+    def test_consular_lookup_does_not_open_code_the_key(self) -> None:
+        """#161: _consular_lookup is a closure inside main(), so it cannot be
+        called here; pin the source instead. Both of its keys must come from
+        normalise_country_key, which carries the 80-character bound."""
+        source = (pathlib.Path(__file__).resolve().parents[1]
+                  / "control_plane_worker" / "__main__.py").read_text(encoding="utf-8")
+        start = source.index("def _consular_lookup(")
+        body = source[start:source.index("def _venue_lookup(", start)]
+        self.assertIn("normalise_country_key(destination)", body)
+        self.assertIn("normalise_country_key(home_country)", body)
+        self.assertNotIn("_re.sub", body)

@@ -146,3 +146,44 @@ test('config day items bring their enriched map, Waze and ticket links into the 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('a plan producing more quality issues than SQLite has variables still boots and recomputes (issue #374)', () => {
+  // recomputeQualityIssues used to end with `SELECT ... WHERE id IN (?,?,...)`
+  // with one variable per issue. Past SQLite's variable limit (32766 in the
+  // bundled build) that throws, and create() runs it at boot: the server died
+  // on a big plan. Undated, untimed activities yield three issues apiece
+  // (Missing day / time / location), so 12000 of them is 36000 issues.
+  const dir = mkdtempSync(join(tmpdir(), 'living-journey-bigplan-'));
+  try {
+    const db = new Database(':memory:');
+    db.exec(`
+      CREATE TABLE trip_config_versions (id INTEGER PRIMARY KEY AUTOINCREMENT, version INTEGER, content TEXT, hash TEXT);
+      CREATE TABLE phase_plan_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, phase_id TEXT, date TEXT, time TEXT, text_he TEXT, text_en TEXT,
+        location_url TEXT, booking_id INTEGER, status TEXT, sort_order REAL, created_by TEXT, created_at TEXT,
+        waze_url TEXT, website_url TEXT, ticket_url TEXT, enrichment_status TEXT, time_sort INTEGER, config_ref TEXT,
+        extra_links TEXT
+      );
+      CREATE TABLE phase_plan_days (phase_id TEXT, date TEXT, label_he TEXT, label_en TEXT, PRIMARY KEY (phase_id, date));
+      CREATE TABLE bookings (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, name TEXT, date_from TEXT, date_to TEXT, confirmation TEXT, conf_file TEXT, location_url TEXT, google_wallet_url TEXT, apple_wallet_url TEXT, pkpass_file TEXT);
+    `);
+    const insert = db.prepare("INSERT INTO phase_plan_items (phase_id, text_he, text_en, status, sort_order, created_by) VALUES ('p1', ?, ?, 'planned', ?, 'test')");
+    db.transaction(() => { for (let i = 0; i < 12000; i++) insert.run(`פריט ${i}`, `Item ${i}`, i); })();
+    const config = fixtureConfig();
+    const raw = JSON.stringify(config);
+
+    const journey = create({ db, config, raw, mediaDir: dir, fetchImpl: fetch });   // boot-time recompute
+    const count = () => db.prepare('SELECT COUNT(*) AS n FROM trip_quality_issues').get().n;
+    assert.ok(count() > 32766, `fixture must exceed the variable limit, got ${count()} issues`);
+
+    const routes = new Map();
+    const app = Object.fromEntries(['get', 'post', 'put', 'patch', 'delete'].map((method) =>
+      [method, (path, ...handlers) => routes.set(`${method} ${path}`, handlers.at(-1))]));
+    journey.registerRoutes(app, { authRequired() {}, organizerOrAgentRequired() {} });
+    let served;
+    routes.get('get /api/issues')({}, { json(value) { served = value; } });   // recompute again
+    assert.equal(served.length, count(), 'a second recompute upserts, it does not duplicate');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

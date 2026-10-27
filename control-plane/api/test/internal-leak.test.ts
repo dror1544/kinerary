@@ -117,4 +117,31 @@ describe("internal leak detection", () => {
       assert.equal(detectInternalLeak(text).leaks, false, text);
     }
   });
+
+  test("Hermes's Codex auto-compaction notice never reaches a family group (#65)", () => {
+    // Verbatim from the issue: a new companion's first group reply carried it.
+    const banner = [
+      "ℹ Codex gpt-5.6-terra caps context at 272K, so auto-compaction was raised to 85% (from 50%) to use more of the window before summarizing.",
+      "  Opt back out: hermes config set compression.codex_gpt55_autoraise false",
+    ].join("\n");
+    assert.equal(detectInternalLeak(banner).leaks, true);
+    // Each stem alone, so a Hermes rewording that keeps one is still caught.
+    assert.equal(detectInternalLeak("Heads up: auto-compaction was raised to 85%.").leaks, true);
+    assert.equal(detectInternalLeak("run compression.codex_gpt55_autoraise false").leaks, true);
+    assert.equal(detectInternalLeak("Try: hermes config set display.x y").leaks, true);
+    // The banner ahead of a real answer is still a leak: the reply is withheld whole.
+    assert.equal(detectInternalLeak(`${banner}\nThe flight leaves at 9:40.`).leaks, true);
+  });
+
+  test("the compaction-notice stems do not swallow real trip sentences", () => {
+    for (const text of [
+      "The flight leaves at 9:40 and the hotel is 85% booked, so the budget was raised a little.",
+      "Our guide caps the group at 12 people.",
+      "Opt for the early train; we set the alarm for 6.",
+      "The itinerary was raised with the hotel and they confirmed the room.",
+      "התקציב הוגדל ב-85% אז אפשר להזמין.",
+    ]) {
+      assert.equal(detectInternalLeak(text).leaks, false, text);
+    }
+  });
 });

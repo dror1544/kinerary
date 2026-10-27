@@ -77,7 +77,8 @@ you are finished.
 | What changed between sprints, for families, organizers and the operator | `CHANGELOG.md` at the repo root — `sprint-scribe` proposes the entries, you verify them |
 | Evidence from a run or an assessment | `$KINERARY_NOTES_DIR/test-reports/` or `regression-plans/`, outside the repo (files already in `docs/test-reports/` stay until migrated) |
 | Insights, security findings, handovers, raw run notes | `$KINERARY_NOTES_DIR/insights/`, `security/`, `handovers/`, `run-notes/` — never the repo |
-| A spec, or a product document (product spec, MRD, business plan, stage plans, landing-page drafts) | `$KINERARY_NOTES_DIR/specs/`, or the folder root for the product documents |
+| A product-level spec (a sprint's goal, tracks and decisions), or a product document (product spec, MRD, business plan, stage plans, landing-page drafts) | `$KINERARY_NOTES_DIR/specs/`, or the folder root for the product documents |
+| An implementation spec (behaviour, contracts, acceptance criteria for one sprint item) | `docs/specs/sprint-<N>/<issue>-<slug>.md` in the repo — `docs/specs/README.md` has the lifecycle; nothing deployment-specific (rule 6) |
 | Sprint and baseline state | `.project/sprint.json`, through `scripts/project-state.py` — never a document |
 | A decision with no document yet | a new `docs/<topic>-design.md`, never a paragraph in CLAUDE.md |
 

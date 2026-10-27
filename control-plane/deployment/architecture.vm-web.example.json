@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "environment": "development",
+  "public_api": {
+    "bind_host": "0.0.0.0",
+    "port": 4310
+  },
+  "worker": {
+    "queue": "postgres",
+    "health_bind_host": "127.0.0.1",
+    "health_port": 4311
+  },
+  "database": {
+    "connection_secret_ref": "file:///run/secrets/control_plane_database_url"
+  },
+  "adapters": {
+    "compute": "fake",
+    "ingress": "fake",
+    "agent_runtime": "fake",
+    "messaging": "telegram",
+    "secrets": "file"
+  },
+  "test_resources": {
+    "enabled": false
+  },
+  "signup": {
+    "telegram_bot_token_secret_ref": "file:///run/secrets/telegram_creds",
+    "super_admin_subject_digest": "sha256:c9a2902fe9b1d10e1c0fbf586f6b6bc72c1b8d50b9ab974245d35ec499c1f318",
+    "super_admin_chat_id_secret_ref": "file:///run/secrets/telegram_super_admin_chat_id",
+    "action_secret_ref": "file:///run/secrets/approval_signing_key",
+    "action_ttl_seconds": 3600,
+    "signup_rate_limit_cooldown_seconds": 3600,
+    "auto_approve": true,
+    "webhook_secret_ref": "file:///run/secrets/telegram_webhook_secret"
+  },
+  "web": {
+    "public_origin": "https://portal.example.com",
+    "runtime_origin": "https://runtime.example.com",
+    "runtime_exchange_key_secret_ref": "env://RUNTIME_EXCHANGE_KEY",
+    "runtime_upstream_host_suffixes": [
+      "trips.example.com"
+    ],
+    "telegram_bot_username": "example_bot",
+    "session_ttl_seconds": 604800
+  },
+  "relay": {
+    "bind_host": "127.0.0.1",
+    "port": 4312,
+    "gateway_secret_refs": [
+      "file:///run/secrets/relay_gateway_secret"
+    ],
+    "telegram_bot_token_secret_ref": "file:///run/secrets/trip_bot_creds",
+    "interviewer_profile": "trip-intake"
+  }
+}

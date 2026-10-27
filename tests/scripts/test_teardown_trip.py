@@ -517,3 +517,199 @@ class DeleteProfileAndWatch(unittest.TestCase):
         self.assertEqual(redeletes, 0)
         self.assertEqual(sleep_calls, [])
         self.assertEqual(fake.delete_calls, 1)
+
+
+TRIP = {"id": "trip_abcdefgh12", "slug": "japan-2026", "orig": "japan-2026", "profile": "japan2026",
+        "lifecycle_state": "ready_private", "open_bindings": 1, "live_group_tokens": 0}
+
+
+class PinGatewayOff(unittest.TestCase):
+    """Issue #349: the reconciler starts a gateway that should run. Between
+    teardown stopping a gateway and the trip being retired a sweep that had not
+    yet seen the retirement would start it again, so the first step is to write
+    "this one is down" where the reconciler reads it - under the lock the
+    reconciler holds for a sweep, so no sweep is mid-flight when it lands."""
+
+    def run_pin(self, trip=TRIP, table=True):
+        seen: list[str] = []
+        with mock.patch.object(teardown, "table_exists", return_value=table), \
+                mock.patch.object(teardown, "psql", side_effect=lambda sql: seen.append(sql) or ""):
+            result = teardown.pin_gateway_off(trip)
+        return result, seen
+
+    def test_it_is_one_transaction_that_takes_the_lock_before_it_writes(self):
+        result, seen = self.run_pin()
+        self.assertEqual(result, "pinned")
+        self.assertEqual(len(seen), 1, "one psql call: a crash anywhere leaves the database as it was")
+        tx = seen[0]
+        for earlier, later in (("BEGIN", "SET LOCAL lock_timeout"), ("SET LOCAL lock_timeout", "pg_advisory_xact_lock"),
+                               ("pg_advisory_xact_lock", "INSERT INTO control_plane.companion_gateways"),
+                               ("INSERT INTO control_plane.companion_gateways", "companion_gateway_events"),
+                               ("companion_gateway_events", "COMMIT")):
+            self.assertLess(tx.index(earlier), tx.index(later), f"{earlier} must come before {later}")
+        self.assertIn("'teardown'", tx)
+        self.assertIn("'TEARDOWN'", tx)
+        self.assertIn("'japan2026'", tx)
+        self.assertIn("trip_abcdefgh12", tx)
+
+    def test_the_pin_is_for_this_trip_only(self):
+        _result, seen = self.run_pin()
+        tx = seen[0]
+        self.assertIn("pin_trip_id", tx)
+        self.assertRegex(tx, r"'teardown', 'trip_abcdefgh12', now\(\)")
+        self.assertIn("pin_trip_id = excluded.pin_trip_id", tx)
+
+    def test_the_trips_retirement_clears_its_pin_in_the_same_transaction(self):
+        # A pin that outlived its trip would darken the next trip given the same
+        # profile name once the slug is free. Both branches of retire_in_db.
+        for trip in ({"id": "trip_abcdefgh12", "slug": "retired-japan-2026-20260101", "orig": "japan-2026"},
+                     {"id": "trip_abcdefgh12", "slug": "japan-2026", "orig": "japan-2026"}):
+            with self.subTest(slug=trip["slug"]):
+                seen: list[str] = []
+                with mock.patch.object(teardown, "psql", side_effect=lambda sql: seen.append(sql) or "0"):
+                    teardown.retire_in_db(trip)
+                tx = seen[-1]
+                self.assertLess(tx.index("BEGIN"), tx.index("pin = 'teardown' AND pin_trip_id = 'trip_abcdefgh12'"))
+                self.assertLess(tx.index("pin = 'teardown' AND pin_trip_id = 'trip_abcdefgh12'"), tx.index("COMMIT"))
+                self.assertIn("to_regclass('control_plane.companion_gateways') IS NOT NULL", tx,
+                              "a database from before the migration has nothing to clear and must not fail the retirement")
+                self.assertIn("'PIN', hermes_profile, 'trip_abcdefgh12', 'clear'", tx)
+
+    def test_the_protected_profiles_are_the_one_shared_list_plus_the_interviewer(self):
+        root = Path(__file__).resolve().parents[2]
+        listed = {line for line in (root / "scripts/protected-profiles.txt").read_text().splitlines()
+                  if line and not line.startswith("#")}
+        self.assertEqual(teardown.PROTECTED_PROFILES, listed | {"trip-intake"})
+        self.assertIn("default", teardown.PROTECTED_PROFILES)
+
+    def test_the_lock_is_the_one_the_reconciler_and_the_release_tool_take(self):
+        root = Path(__file__).resolve().parents[2]
+        worker = (root / "control-plane/worker/control_plane_worker/gateway_reconcile.py").read_text()
+        release = (root / "control-plane/deployment/vm-release.py").read_text()
+        for name, text in (("gateway_reconcile.py", worker), ("vm-release.py", release)):
+            self.assertIn(f'"{teardown.GATEWAY_LOCK_TEXT}"', text, f"{name} names a different lock")
+        _result, seen = self.run_pin()
+        self.assertIn(f"hashtext('{teardown.GATEWAY_LOCK_TEXT}')", seen[0])
+
+    def test_the_lock_wait_is_bounded_so_a_stuck_sweep_cannot_hang_a_teardown(self):
+        _result, seen = self.run_pin()
+        self.assertIn("lock_timeout = '120s'", seen[0])
+
+    def test_a_database_from_before_the_migration_is_skipped_loudly_not_failed(self):
+        result, seen = self.run_pin(table=False)
+        self.assertEqual(result, "no-table")
+        self.assertEqual(seen, [])
+
+    def test_a_name_that_could_break_out_of_the_statement_is_refused_before_any_sql(self):
+        for bad in ({**TRIP, "profile": "x'; DROP TABLE trips; --"}, {**TRIP, "profile": "Japan"},
+                    {**TRIP, "id": "trip_x'--"}):
+            with self.subTest(trip=bad), self.assertRaises(teardown.Refused):
+                self.run_pin(bad)
+
+    def test_a_pin_that_cannot_be_written_stops_the_teardown_before_anything_is_torn_down(self):
+        events = self.run_main(pin=RuntimeError("psql failed: canceling statement due to lock timeout"))
+        self.assertEqual(events["code"], 2)
+        self.assertEqual(events["log"], ["backup", "pin"], "nothing after the failed pin ran")
+
+    def test_the_pin_comes_after_the_backup_and_before_the_allowlist_the_gateway_and_the_database(self):
+        events = self.run_main(pin="pinned")
+        order = events["log"]
+        self.assertEqual(order[:2], ["backup", "pin"])
+        for later in ("allowlist", "gateway-uninstall", "database"):
+            self.assertIn(later, order)
+            self.assertLess(order.index("pin"), order.index(later), f"the pin must come before {later}")
+        self.assertLess(order.index("gateway-uninstall"), order.index("database"))
+
+    def test_the_last_gateway_step_confirms_the_gateway_is_down(self):
+        events = self.run_main(pin="pinned")
+        order = events["log"]
+        self.assertEqual(order[-1], "confirm-down", order)
+        self.assertLess(order.index("database"), order.index("confirm-down"))
+        self.assertEqual(events["code"], 0)
+
+    def test_a_gateway_that_is_still_up_at_the_end_fails_the_teardown_loudly(self):
+        events = self.run_main(pin="pinned", confirm=False)
+        self.assertEqual(events["code"], 1)
+        self.assertIn("STILL RUNNING", events["stdout"])
+
+    def test_confirm_gateway_down_stops_it_again_until_it_is_down(self):
+        loaded = iter([True, True, False])
+        stops: list[str] = []
+        clock = [0.0]
+        ok = teardown.confirm_gateway_down(
+            "japan2026", seconds=30, loaded=lambda p: next(loaded), stop=stops.append,
+            sleep=lambda s: clock.__setitem__(0, clock[0] + s), monotonic=lambda: clock[0])
+        self.assertTrue(ok)
+        self.assertEqual(stops, ["japan2026", "japan2026"], "a stop for each look that still found it up")
+
+    def test_confirm_gateway_down_is_bounded_and_says_no_when_it_never_goes_down(self):
+        stops: list[str] = []
+        clock = [0.0]
+        ok = teardown.confirm_gateway_down(
+            "japan2026", seconds=10, loaded=lambda p: True, stop=stops.append,
+            sleep=lambda s: clock.__setitem__(0, clock[0] + s), monotonic=lambda: clock[0])
+        self.assertFalse(ok)
+        self.assertLessEqual(clock[0], 12)
+        self.assertGreaterEqual(len(stops), 2)
+
+    def test_the_pin_resets_what_justified_the_gateway_to_running(self):
+        _result, seen = self.run_pin()
+        self.assertIn("justified_by = '{}'", seen[0])
+
+    def test_the_plan_shows_the_pin_first(self):
+        out = self.run_main(pin="pinned", execute=False)["stdout"]
+        self.assertIn("pin ", out)
+        self.assertLess(out.index("pin "), out.index("allowlist"))
+        self.assertIn("TEARDOWN", out)
+
+    def run_main(self, *, pin, execute=True, confirm=True):
+        import contextlib
+        import io
+        import sys as _sys
+        log: list[str] = []
+
+        def record(name, result=None):
+            def inner(*_a, **_k):
+                log.append(name)
+                if isinstance(result, Exception):
+                    raise result
+                return result
+            return inner
+
+        def run(argv, *a, **k):
+            if "uninstall" in argv:
+                log.append("gateway-uninstall")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "profiles").mkdir()
+            out = io.StringIO()
+            patches = [
+                mock.patch.object(teardown, "reexec_with_yaml", lambda: None),
+                mock.patch.object(teardown, "resolve", lambda target: dict(TRIP)),
+                mock.patch.object(teardown, "DEPLOY_ROOT", tmp),
+                mock.patch.object(teardown, "PROFILES", tmp / "profiles"),
+                mock.patch.object(teardown, "bridge", lambda d: None),
+                mock.patch.object(teardown, "document_store", lambda t: None),
+                mock.patch.object(teardown, "kept_originals", lambda s: 0),
+                mock.patch.object(teardown, "interviewer_allows", lambda p: True),
+                mock.patch.object(teardown, "gateway_installed", lambda p: True),
+                mock.patch.object(teardown, "gateway_loaded", lambda p: False),
+                mock.patch.object(teardown, "table_exists", lambda t: True),
+                mock.patch.object(teardown, "hermes", lambda: "hermes"),
+                mock.patch.object(teardown, "backup", record("backup")),
+                mock.patch.object(teardown, "pin_gateway_off", record("pin", pin)),
+                mock.patch.object(teardown, "confirm_gateway_down", record("confirm-down", confirm)),
+                mock.patch.object(teardown, "narrow_allowlist", record("allowlist")),
+                mock.patch.object(teardown, "retire_in_db", record("database", "retired-japan-2026-20260101")),
+                mock.patch.object(teardown.subprocess, "run", run),
+                mock.patch.object(teardown.time, "sleep", lambda s: None),
+                mock.patch.object(_sys, "argv", ["teardown", "--trip", "japan-2026"] + (["--execute"] if execute else [])),
+            ]
+            with contextlib.ExitStack() as stack:
+                for p in patches:
+                    stack.enter_context(p)
+                with contextlib.redirect_stdout(out):
+                    code = teardown.main()
+        return {"code": code, "log": log, "stdout": out.getvalue()}

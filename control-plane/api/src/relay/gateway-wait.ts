@@ -46,10 +46,21 @@ const MAX_GATEWAY_WAIT_SECONDS = 300;
  * repair path is `restart-bridges`, the same gap issue #193 fixes on the
  * `vm-release.py` side.
  *
- * The same special case, for the same reason, lives in
- * `control-plane/deployment/vm-release.py`'s `live_companions()` — if
- * another `UNREACHABLE_REASONS` value ever needs the same treatment, update
- * both queries together.
+ * A DORMANT companion is not expected either (issue #349): one the control
+ * plane's reconciler has actually STOPPED, on purpose, and the host confirmed
+ * stopped. Waiting for it would cost every other trip the full timeout on every
+ * restart for a gateway that is down by design. Dormant is therefore a fact
+ * about what happened, not about what was decided: the recorded decision says
+ * `stopped`, AND the reconciler's last action was a stop that succeeded, AND
+ * the host last reported it stopped or absent. A decision alone is not enough:
+ * in `observe` mode the reconciler decides and never acts, and a gateway that is
+ * running (or that crashed later) must stay expected. No row (nothing decided)
+ * also means expected: when in doubt a companion is expected up.
+ *
+ * The same two special cases, for the same reasons, live in
+ * `control-plane/deployment/vm-release.py`'s `live_companions()` — if either
+ * changes, or another `UNREACHABLE_REASONS` value ever needs the same
+ * treatment, update both queries together.
  */
 export async function expectedGatewayProfiles(db: Pick<Pool | PoolClient, "query">): Promise<string[]> {
   const result = await db.query<{ hermes_profile: string }>(
@@ -60,6 +71,9 @@ export async function expectedGatewayProfiles(db: Pick<Pool | PoolClient, "query
         AND b.hermes_profile IS NOT NULL
         AND (t.reachability <> 'unreachable' OR t.unreachable_reason = 'TRIP_MCP_BRIDGE_FAILED')
         AND ${NOT_RETIRED_SQL}
+        AND NOT EXISTS (
+          SELECT 1 FROM control_plane.companion_gateways g
+           WHERE g.hermes_profile = b.hermes_profile AND g.desired = 'stopped' AND g.last_action = 'stop' AND g.last_result = 'ok' AND g.observed IN ('stopped', 'absent'))
       ORDER BY b.hermes_profile`,
   );
   return result.rows.map((row) => row.hermes_profile);

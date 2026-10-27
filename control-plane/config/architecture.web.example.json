@@ -9,11 +9,13 @@
   "web": {
     "public_origin": "http://127.0.0.1:4173",
     "runtime_origin": "http://127.0.0.1:4320",
-    "google_client_id_secret_ref": "env://GOOGLE_WEB_CLIENT_ID",
-    "google_client_secret_ref": "env://GOOGLE_WEB_CLIENT_SECRET",
+    "google_client_id": "000000000000-example.apps.googleusercontent.com",
     "runtime_exchange_key_secret_ref": "env://RUNTIME_EXCHANGE_KEY",
     "runtime_upstream_host_suffixes": ["localhost", "internal"],
     "telegram_bot_username": "kinerary_bot",
-    "session_ttl_seconds": 604800
+    "telegram_bot_token_secret_ref": "env://TELEGRAM_BOT_TOKEN",
+    "telegram_init_data_max_age_seconds": 300,
+    "session_ttl_seconds": 604800,
+    "email_provider": "log"
   }
 }

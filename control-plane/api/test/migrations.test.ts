@@ -97,6 +97,15 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "20261016120000_group_conversation_window.sql",
       "20261016130000_group_proactive_level.sql",
       "20261017120000_assistant_events_silent_on_addressed.sql",
+      "20261020120000_telegram_mini_app_sign_in.sql",
+      "20261020130000_runtime_launch_session_binding.sql",
+      "20261021100000_companion_gateways.sql",
+      "20261021120000_telegram_organizer_trip_links.sql",
+      "20261022120000_membership_end_demotes_person_link.sql",
+      "20261023120000_person_link_demotion_marker.sql",
+      "20261023130000_telegram_link_restore.sql",
+      "20261023140000_portal_email_auth.sql",
+      "20261024100000_google_signin_nonces.sql",
     ]);
     assert.deepEqual(await applyMigrations(client, migrationsDir), []);
     const tables = await client.query("SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema = 'control_plane'");
@@ -174,6 +183,15 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "20261016120000_group_conversation_window.sql",
       "20261016130000_group_proactive_level.sql",
       "20261017120000_assistant_events_silent_on_addressed.sql",
+      "20261020120000_telegram_mini_app_sign_in.sql",
+      "20261020130000_runtime_launch_session_binding.sql",
+      "20261021100000_companion_gateways.sql",
+      "20261021120000_telegram_organizer_trip_links.sql",
+      "20261022120000_membership_end_demotes_person_link.sql",
+      "20261023120000_person_link_demotion_marker.sql",
+      "20261023130000_telegram_link_restore.sql",
+      "20261023140000_portal_email_auth.sql",
+      "20261024100000_google_signin_nonces.sql",
     ]);
   } finally {
     await reset(client);

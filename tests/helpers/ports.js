@@ -1,3 +1,7 @@
+import { createHash } from 'node:crypto';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 /**
  * ports.js — every port the test suite binds, in one place.
  *
@@ -84,7 +88,7 @@ export const EPHEMERAL_RANGE_FIRST = 32768;
 
 export const TRIP_BRIDGE_PORT_RANGE = { first: 3100, last: 3999 };
 
-export const PORTS = {
+export const BASE_PORTS = {
   // ── Full trip servers ──────────────────────────────────────────────────
   telegramSso:             28095,
   telegramSsoConfigResync: 28100,
@@ -185,12 +189,75 @@ export const PORTS = {
   // One hotel, one place — a companion-added hotel resolves to the same name
   // and links in every view — tests/hotel-one-place.test.js.
   hotelOnePlace:            28351,
+  // Planning the open days in one action (issue #133) — tests/plan-open-days.test.js
+  // and tests/mcp-plan-open-days.test.js.
+  planOpenDays:             28352,  // the trip server, main flow (colmar shape)
+  planOpenDaysFresh:        28353,  // a second trip server: a trip whose every day was covered at provisioning
+  mcpPlanOpenDaysStand:     28354,  // mcp/mcp.js against a stand-in site
+  mcpPlanOpenDaysMcp:       28355,  // mcp/mcp.js against the real trip server below
+  mcpPlanOpenDaysSite:      28356,  // the real trip server mcpPlanOpenDaysMcp talks to
 
   // ── Stand-ins for services the server calls out to ─────────────────────
   bookingExtractMockHermes: 28103,
   mcpHealthTripSite:        28124,
   scheduleReviewMockHermes: 28110,
 };
+
+// ── PER-WORKTREE OFFSET (issue #366) ──────────────────────────────────────
+//
+// Every worktree used to bind the very same ~60 numbers, so two worktrees
+// running `npm test` at once (the agent team's normal state) collided, and the
+// pretest named a "leaked server" that was a neighbour's live run. The table
+// above is the BASE; PORTS below is the base shifted by an offset that is the
+// same for every run in one checkout and different between checkouts:
+//
+//   TEST_PORT_OFFSET=<n>   explicit, for CI or a collision with a neighbour;
+//   otherwise              derived from a hash of this checkout's path.
+//
+// The offset is a multiple of PORT_STRIDE, and the stride is at least the
+// width of the table, so two offsets can never make the tables overlap (a
+// stride of 100 would: the base table spans 257 ports, and 28098 + 100 is
+// another entry's 28198). The largest offset keeps the highest port under
+// EPHEMERAL_RANGE_FIRST, so the "below the ephemeral range" reasoning at the
+// top of this file still holds for every worktree, and the table only moves
+// upward from 28000, away from the trip bridges (3100-3999) — both asserted
+// below on the shifted table, not on the base.
+//
+// Only a handful of slots fit under 32768, so two checkouts can still hash to
+// the same one: that is what the pretest (check-free-ports.js) is for, and
+// TEST_PORT_OFFSET is how you step aside.
+const baseValues = Object.values(BASE_PORTS);
+const BASE_FIRST = Math.min(...baseValues);
+const BASE_LAST = Math.max(...baseValues);
+export const PORT_STRIDE = Math.ceil((BASE_LAST - BASE_FIRST + 1) / 100) * 100;
+export const MAX_PORT_OFFSET = Math.floor((EPHEMERAL_RANGE_FIRST - 1 - BASE_LAST) / PORT_STRIDE) * PORT_STRIDE;
+const OFFSET_SLOTS = MAX_PORT_OFFSET / PORT_STRIDE + 1;
+
+/** The offset for a checkout at `root`, or the explicit `env.TEST_PORT_OFFSET`. Throws on a bad explicit value. */
+export function portOffsetFor(root, env = process.env) {
+  const explicit = env.TEST_PORT_OFFSET;
+  if (explicit !== undefined && explicit !== '') {
+    const n = Number(explicit);
+    if (!Number.isInteger(n) || n < 0 || n > MAX_PORT_OFFSET || n % PORT_STRIDE !== 0) {
+      throw new Error(
+        `helpers/ports.js: TEST_PORT_OFFSET=${JSON.stringify(explicit)} is not usable. It must be a multiple of ` +
+        `${PORT_STRIDE} from 0 to ${MAX_PORT_OFFSET} (so the highest test port stays below ${EPHEMERAL_RANGE_FIRST} ` +
+        'and two offsets never overlap).'
+      );
+    }
+    return n;
+  }
+  const slot = createHash('sha256').update(String(root)).digest().readUInt32BE(0) % OFFSET_SLOTS;
+  return slot * PORT_STRIDE;
+}
+
+export function applyOffset(table, offset) {
+  return Object.fromEntries(Object.entries(table).map(([name, port]) => [name, port + offset]));
+}
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+export const PORT_OFFSET = portOffsetFor(REPO_ROOT);
+export const PORTS = applyOffset(BASE_PORTS, PORT_OFFSET);
 
 export function assertUnique(table) {
   const owner = new Map();
