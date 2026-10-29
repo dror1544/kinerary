@@ -133,6 +133,16 @@ describe("internal leak detection", () => {
     assert.equal(detectInternalLeak(`${banner}\nThe flight leaves at 9:40.`).leaks, true);
   });
 
+  test("Hermes's SOUL.md truncation warning never reaches a chat", () => {
+    // Verbatim from the staging companion's message, 2026-10-29.
+    const warning = "⚠️  Context file SOUL.md TRUNCATED: 51390 chars exceeds limit of 48000 — trim the file, pin a larger context_file_max_chars, or use a larger-context model!";
+    assert.equal(detectInternalLeak(warning).leaks, true);
+    assert.equal(detectInternalLeak("Context file SOUL.md was cut short.").leaks, true);
+    assert.equal(detectInternalLeak("set context_file_max_chars higher").leaks, true);
+    // An ordinary sentence about a file or a soul is not the warning.
+    assert.equal(detectInternalLeak("I put the soul food place in the context of day 3.").leaks, false);
+  });
+
   test("the compaction-notice stems do not swallow real trip sentences", () => {
     for (const text of [
       "The flight leaves at 9:40 and the hotel is 85% booked, so the budget was raised a little.",
