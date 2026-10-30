@@ -1,7 +1,7 @@
 # A trip created on the dashboard seeds the interview
 
-Status: draft (2026-10-30) · Issue: #438 · Track: T1 · Size: M · Tier: Normal
-Security path: no (none of the three named invariants; reads the trip's own card inside the session-start transaction) · Migration: no · Live-trip behaviour: yes (interviews started after the relay restart)
+Status: approved 2026-10-30 by Dror (decisions below) · Issue: #438 · Track: T1 · Size: L (M + sign-up name + card write-back) · Tier: Normal
+Security path: yes since AC-11 (sign-up and Google sign-in write the account name: auth routes, boundary review) · Migration: possibly (an account display-name column if none fits; timestamped, rollback header) · Live-trip behaviour: yes (interviews started after the relay restart)
 
 > **Sprint 8 (2026-10-30): in scope, prioritised — first in the build order** (Dror via the lead session, 2026-10-30).
 
@@ -193,30 +193,39 @@ interview is already running is not touched (its session already exists).
 **Per-PR regression plan: needed** (router behaviour in a live interview, and
 the session-start transaction).
 
+## Decisions (Dror, 2026-10-30)
+
+1. **Name source (AC-2):** the name the organizer gave the product, not the
+   email. A Google sign-in uses the Google account's name (the verified
+   `name`/`given_name` claim); a password sign-up asks for a name once, on the
+   dashboard's sign-up form, and stores it on the account. The interview greets
+   with that name. An account that has none (created before this change) is
+   asked for it once on the dashboard. The Telegram first name is used only
+   when neither exists.
+2. **Trip type:** seed `family` and `couple` only; for `group` and `other` the
+   interview asks the type as today.
+3. **Organizer identity:** when the greeting name matches exactly one roster
+   entry, the question becomes a one-tap confirm ("You're Dana on the list,
+   right?"); otherwise it is asked as today. Adds **AC-9**.
+4. **Card follows the interview:** in this item. On intake confirm, the
+   confirmed destination and dates are written back to the trip card, so the
+   dashboard and the interview hold one answer. Adds **AC-10**.
+5. **"Could not be resolved":** this item seeds whatever a typed answer would
+   accept; place recognition is #485.
+
+Added acceptance criteria:
+- **AC-9** Given a seeded trip whose organizer name matches exactly one roster
+  entry, when the interview reaches `organizer_identity`, then it offers that
+  entry as a one-tap confirm, and a "no" falls back to today's open question;
+  with zero or several matches it asks as today.
+- **AC-10** Given an intake confirmed with a destination or dates different
+  from the card's, when the intake is confirmed, then the trip card shows the
+  confirmed values, and the change is recorded with who and when.
+- **AC-11** Given a password sign-up, when the account is created, then the
+  dashboard has asked for and stored a display name; given a Google sign-in, the
+  stored name is the Google account's name; an existing account with no name is
+  asked once on its next dashboard visit.
+
 ## Open questions
 
-1. **"Without asking who they are" — `organizer_identity`.** The trip-level
-   organizer is already the account that created it. What the interview still
-   asks is which traveller on the roster is speaking, and its prompt forbids
-   inferring that from who signed up. Proposal: when the greeting name matches
-   exactly one roster entry (`organizerMatch`, `interview.ts:381`), offer it as
-   a one-tap confirm ("You're Dana on the list — right?") instead of the open
-   question; otherwise ask as today. This relaxes a deliberate rule, so it is
-   Dror's call. **No AC above depends on it**; adopting it adds an AC-9.
-2. **Name source.** Telegram first name (proposed), the account's display name
-   (the email's local part for a password signup), or a name asked on the
-   dashboard form? **AC-2 depends on it.**
-3. **Trip type `group` and `other`.** The interview has no plain "group"
-   (`group_of_families` or a free-text "other"). Proposal: seed `family` and
-   `couple` only, and ask the type for `group`/`other`. Alternatively, align
-   the dashboard's options with the interview's. **AC-1's type half and AC-3
-   depend on it** for those two values.
-4. **Card follows the interview?** The card is never updated after the
-   interview corrects a value (no writer, see Problem), which leaves two
-   answers for one trip — against the dashboard-first guardrail "never two
-   sources of truth". Write the confirmed destination and dates back to the
-   card on intake confirm, in this item or a follow-up? No AC depends on it
-   unless it is pulled in.
-5. **"Could not be resolved" (round-2 wording).** This spec seeds whatever a
-   typed answer would accept and leaves place recognition to #485. Is that the
-   intended reading for Sprint 8? No AC depends on it.
+None blocking approval.
