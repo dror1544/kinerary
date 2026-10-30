@@ -298,7 +298,12 @@
  *      JOB_IN_PROGRESS check, EARLY pass. Catches a job that already
  *      existed before this call started; locks nothing at all when the
  *      trip has none (the `WHERE` matches zero rows). Matches `_complete`'s
- *      and the portal reject's own jobs-before-trips order.
+ *      and the portal reject's own jobs-before-trips order — and, since
+ *      issue #387, `retryProvision`'s and `correctIntake`'s (both used to
+ *      lock `trips` first and deadlocked against `_complete`), and
+ *      `scripts/teardown-trip.py`'s `retire_in_db` (tokens, sessions,
+ *      bindings, trips, teardown-pin clear: it used to close the sessions
+ *      AFTER the `trips` slug update, the opposite of step 2 below).
  *   2. Group-binding tokens, interview enrollments, intake sessions (and
  *      everything `SESSION_CASCADE_TABLES` cascades), and chat bindings are
  *      all touched here — before `trips`, matching `redeemGroupBindingToken`
