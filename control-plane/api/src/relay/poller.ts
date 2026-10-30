@@ -2135,7 +2135,7 @@ function renderStep(question: IntakeQuestion, view: SessionView, phrasing?: stri
   const suggestion = view.suggestions[question.id];
   const label = suggestion ? suggestionLabel(question.id, suggestion, view.language) : null;
   return label
-    ? renderSuggestion(question, label, view.language, phrasing)
+    ? renderSuggestion(question, label, view.language, phrasing, suggestion?.source)
     : renderQuestion(question, selectedOptionIds(view, question.id), view.language, phrasing, fromRecord(view, question.id));
 }
 

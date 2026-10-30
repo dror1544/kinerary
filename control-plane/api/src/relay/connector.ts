@@ -50,6 +50,13 @@ import { TIMEOUT_ERROR, type TelegramClient } from "./telegram-api.js";
  * retryable words ("network", "connecttimeout" and the rest). Fixed, like the
  * word it replaces: no URL, no token. Only the gateway sees it; the interview
  * reads the client's result directly and still gets a transient failure.
+ *
+ * Hermes' side of this is not copied here or in the tests: the two predicates'
+ * substrings are captured from Hermes' source into
+ * `test/fixtures/hermes-mirror.json` (scripts/capture-hermes-mirror.py, at the
+ * revision `hermes-patches/BASE_REV` pins) and `test/hermes-mirror.test.ts`
+ * (AC-1) fails if this phrase stops being a timeout, or becomes retryable, to
+ * the captured classifier.
  */
 export const GATEWAY_TIMEOUT_ERROR = "telegram call timed out";
 

@@ -8,6 +8,11 @@ export type Me = {
    * account is linked to; the full dashboard needs a password or Google sign-in. Absent = full.
    */
   scope?: "telegram" | "full";
+  /**
+   * The dashboard should ask, once, what to call this person: the Telegram interview greets the organizer by it.
+   * False (or absent) once they answered or said "not now", and for a Telegram-minted session, which cannot answer.
+   */
+  needsName?: boolean;
 };
 
 export type InviteSummary = {
@@ -144,7 +149,11 @@ const memberTripSchema = z.object({
   ...trip, tripType: "other", lifecycleState: "ready_private", nextAction: trip.runtimeReady ? "open_trip" : "view_status",
   interview: null, provisioning: null,
 }));
-const meSchema: z.ZodType<Me> = z.object({ id: z.string(), displayName: z.string(), scope: z.enum(["telegram", "full"]).optional() });
+const meSchema: z.ZodType<Me> = z.object({ id: z.string(), displayName: z.string(), scope: z.enum(["telegram", "full"]).optional(), needsName: z.boolean().optional() });
+/** The name this person gives the product, stored on their own account. The server cleans it and refuses an unusable one (INVALID_NAME). */
+export const saveAccountName = (displayName: string) => api<{ ok: true }>("/v1/account/name", { method: "POST", body: JSON.stringify({ displayName }) });
+/** "Not now": the dashboard does not ask again, and no name is stored. */
+export const dismissAccountName = () => api<{ ok: true }>("/v1/account/name", { method: "POST", body: JSON.stringify({ dismiss: true }) });
 
 /**
  * Sign-up and sign-in with Google in one: posts the signed ID token Google Identity Services gave the page

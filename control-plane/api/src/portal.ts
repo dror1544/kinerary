@@ -8,7 +8,7 @@ import { ensureUnknownPasswordCredential, hashPassword, resolveOrCreateEmailAcco
 import type { Mailer } from "./mailer.js";
 import {
   PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH, cleanDisplayName, consumePasswordReset, consumeSignUpToken, normalizeEmail, portalMailIdle,
-  runInBackground, startPasswordReset, startSignUp, type EmailAuthContext,
+  recordGivenName, runInBackground, startPasswordReset, startSignUp, type EmailAuthContext,
 } from "./portal-email-auth.js";
 import { pickLanguage } from "./portal-email-templates.js";
 import { generatePlan } from "./planner.js";
@@ -139,6 +139,12 @@ export function validatedReturnTo(value: unknown): string {
 export interface GoogleIdentity {
   subject: string;
   displayName: string;
+  /**
+   * The name Google itself put in the signed token -- its `given_name` claim, else its `name` -- and ONLY that.
+   * `displayName` above falls back to the local part of the email address when Google sent no name, which is a
+   * label and not a name; this is absent in that case. It is what the interview greets the organizer by (#438).
+   */
+  givenName?: string;
   email?: string;
   /**
    * Google's own `email_verified` claim, and only ever true when it said so.
@@ -201,9 +207,11 @@ export class GoogleIdTokenClient implements GoogleIdTokenVerifier {
     // `=== true`, not `!== false`: an absent claim must not read as verified, because this is what decides
     // that Google's address and an existing account's address are the same person.
     if (payload.email_verified !== true) throw new GoogleSignInRefused("EMAIL_UNVERIFIED");
+    const claimedName = [payload.given_name, payload.name].find((value): value is string => typeof value === "string" && value.trim() !== "");
     return {
       subject: payload.sub,
       displayName: payload.name?.trim().slice(0, 120) || payload.email.split("@")[0]?.slice(0, 120) || "Kinerary organizer",
+      ...(claimedName ? { givenName: claimedName.trim().slice(0, 120) } : {}),
       email: payload.email,
       emailVerified: true,
       ...(typeof payload.nonce === "string" ? { nonce: payload.nonce } : {}),
@@ -337,6 +345,10 @@ export interface PortalDependencies {
 interface PortalUser {
   id: string;
   displayName: string;
+  /** The name the account holder gave the product (`users.given_name`); null until somebody told us. */
+  givenName: string | null;
+  /** The dashboard has already put the question "what should we call you?" to them (answered or "not now"). */
+  givenNameAsked: boolean;
   googleSubjectDigest: string | null;
   sessionDigest: string;
   sessionId: string;
@@ -389,10 +401,11 @@ async function portalUser(request: FastifyRequest, deps: PortalDependencies): Pr
   const raw = parseCookies(request.headers.cookie).kit_session;
   if (!raw) return null;
   const result = await deps.db.query<{
-    id: string; display_name: string; provider_subject_digest: string | null; session_digest: string; session_id: string; session_created_at: Date;
+    id: string; display_name: string; given_name: string | null; given_name_asked_at: Date | null;
+    provider_subject_digest: string | null; session_digest: string; session_id: string; session_created_at: Date;
     telegram_link_id: string | null;
   }>(
-    `SELECT u.id, u.display_name, ui.provider_subject_digest, s.token_digest AS session_digest, s.id AS session_id, s.created_at AS session_created_at,
+    `SELECT u.id, u.display_name, u.given_name, u.given_name_asked_at, ui.provider_subject_digest, s.token_digest AS session_digest, s.id AS session_id, s.created_at AS session_created_at,
             s.telegram_link_id
      FROM control_plane.web_sessions s
      JOIN control_plane.users u ON u.id = s.user_id AND u.status = 'active'
@@ -410,6 +423,8 @@ async function portalUser(request: FastifyRequest, deps: PortalDependencies): Pr
   return {
     id: row.id,
     displayName: row.display_name,
+    givenName: row.given_name,
+    givenNameAsked: row.given_name_asked_at !== null,
     googleSubjectDigest: row.provider_subject_digest,
     sessionDigest: row.session_digest,
     sessionId: row.session_id,
@@ -1200,6 +1215,10 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
       }
       const active = await client.query("SELECT 1 FROM control_plane.users WHERE id = $1 AND status = 'active' FOR SHARE", [userId]);
       if (!active.rows[0]) { await client.query("ROLLBACK"); return await refuse("ACCOUNT_INACTIVE"); }
+      // The name Google vouches for, signed in the token we just verified, is the name this person gave the product
+      // (#438) -- stored for the account the token resolved to, and only while that account has none of its own.
+      // Whatever else the request carries is not read: the body is never the source of a name.
+      if (identity.givenName) await recordGivenName(client, userId, identity.givenName);
       const session = await createWebSession(client, userId, deps.sessionTtlSeconds);
       await recordFunnelEvent(client, "google_auth", { outcome: "success", userId });
       await client.query("COMMIT");
@@ -1283,7 +1302,40 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     const user = await requireUser(request, reply, deps);
     if (!user) return;
     // `scope: "telegram"` tells the page this session sees only the trips its Telegram account is linked to.
-    return { id: user.id, displayName: user.displayName, scope: user.scope ? "telegram" : "full" };
+    // `needsName`: the dashboard should ask, once, what to call this person -- the interview greets the organizer by
+    // it (#438). Present only when true, so the answer for everyone else keeps the shape it always had. Never for a
+    // Telegram-scoped session: it cannot change the account (`POST /v1/account/name` is account-level), so asking
+    // would offer something that is then refused.
+    const needsName = !user.scope && user.givenName === null && !user.givenNameAsked;
+    return {
+      id: user.id, displayName: user.displayName, scope: user.scope ? "telegram" : "full",
+      ...(needsName ? { needsName: true } : {}),
+    };
+  });
+
+  // The name an organizer gives the product, for the interview to greet them by (#438, AC-11).
+  //   POST /v1/account/name  { displayName }   200 { ok: true }   stores it on the CALLER's own account
+  //   POST /v1/account/name  { dismiss: true } 200 { ok: true }   "not now": the dashboard does not ask again
+  // Exactly those two shapes: any other field is refused rather than ignored, so nothing is accepted by accident.
+  // The account is the session's, never a body field; the name is cleaned like every name (cleanDisplayName). Full
+  // sessions only (portal-scope.ts "account"): a Telegram-minted session cannot rename the account it borrowed.
+  app.post("/v1/account/name", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    const user = await requireMutation(request, reply, deps);
+    if (!user) return;
+    const body = jsonBody(request);
+    const keys = Object.keys(body);
+    const naming = keys.length === 1 && keys[0] === "displayName";
+    const dismissing = keys.length === 1 && keys[0] === "dismiss" && body.dismiss === true;
+    if (!naming && !dismissing) return reply.code(400).send({ error: "INVALID_REQUEST" });
+    if (dismissing) {
+      await deps.db.query("UPDATE control_plane.users SET given_name_asked_at = COALESCE(given_name_asked_at, now()) WHERE id = $1", [user.id]);
+      return { ok: true };
+    }
+    const name = cleanDisplayName(body.displayName);
+    if (name === null) return reply.code(400).send({ error: "INVALID_NAME" });
+    await deps.db.query("UPDATE control_plane.users SET given_name = $2, given_name_asked_at = now() WHERE id = $1", [user.id, name]);
+    return { ok: true };
   });
 
   app.post("/v1/logout", async (request, reply) => {
