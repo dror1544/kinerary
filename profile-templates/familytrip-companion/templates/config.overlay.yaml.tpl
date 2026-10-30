@@ -38,8 +38,26 @@ fallback_providers:
     model: nvidia/nemotron-3-ultra-550b-a55b:free
   - provider: openrouter
     model: dots-studio/dots-3-note-preview:free
+# Final answers only. Hermes's Telegram default sends every interim assistant
+# line as its own message, so on 2026-10-29 a staging organizer asking a new
+# companion to plan the trip got "I'll start by reading the trip…", "I need to
+# load the trip tools…", "The trip server isn't reachable…" — English narration
+# of the agent's own tool calls, one message each, ahead of the Hebrew answer.
+# The relay carries a companion as platform `telegram`, so these keys are set at
+# the `display` level, which every platform reads before its own default.
+# `suppress_warning_notifications` keeps the harness's own warnings (the
+# SOUL.md truncation notice below, among others) out of the chat too.
 display:
   show_cost: true
+  interim_assistant_messages: false
+  suppress_warning_notifications: true
+# SOUL.md is ~52K characters. Unpinned, Hermes caps a context file at 6% of the
+# model's window, which is 48K on a 200K-window model (Claude Haiku, which an
+# organizer can pick with /model). Over the cap it keeps the head and tail and
+# DROPS THE MIDDLE (language, gender, tone, the no-plan rule, daily-plan
+# writing) without telling anyone but the log. Pinned well above the file so
+# the whole of it reaches every model; test_template.py fails if it outgrows this.
+context_file_max_chars: 120000
 # Same account, same reason as the chain above: a delegation configured onto a
 # provider with no working credential fails at the moment it is needed.
 delegation:

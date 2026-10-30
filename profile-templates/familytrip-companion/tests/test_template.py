@@ -75,6 +75,16 @@ class Tests(unittest.TestCase):
   td,o,c=self.go(); self.addCleanup(td.cleanup); self.assertEqual(c.returncode,0,c.stderr)
   overlay=yaml.safe_load((o/'config.overlay.yaml').read_text())
   self.assertEqual(overlay['compression'],{'codex_gpt55_autoraise_notice':False})
+ def test_rendered_overlay_sends_final_answers_and_the_whole_soul(self):
+  # 2026-10-29, staging: a new companion on Claude Haiku (200K window, so a
+  # 48K default cap) had SOUL.md's middle dropped, told the chat so in a
+  # warning, and narrated each tool call as its own Telegram message.
+  td,o,c=self.go(); self.addCleanup(td.cleanup); self.assertEqual(c.returncode,0,c.stderr)
+  overlay=yaml.safe_load((o/'config.overlay.yaml').read_text())
+  self.assertIs(overlay['display']['interim_assistant_messages'],False)
+  self.assertIs(overlay['display']['suppress_warning_notifications'],True)
+  soul=(o/'SOUL.md').read_text()
+  self.assertLess(len(soul),overlay['context_file_max_chars'],'SOUL.md outgrew the pinned context_file_max_chars: raise it in config.overlay.yaml.tpl or trim the file')
  def test_shipped_skills_find_their_own_files(self):
   # trip-kml-export ran its script from $PROFILE_SKILLS_DIR, which nothing
   # defines, so on every companion the path pointed at /travel/... (#71). A

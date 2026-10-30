@@ -143,6 +143,17 @@ const GATEWAY_STATUS_PHRASES: readonly string[] = [
   "auto-compaction was raised",
   "codex_gpt55_autoraise",
   "hermes config set",
+  // Hermes warning that a context file was cut, seen by a staging organizer on
+  // 2026-10-29 as a message of its own from a new companion:
+  //
+  //     ⚠️  Context file SOUL.md TRUNCATED: 51390 chars exceeds limit of
+  //         48000 — trim the file, pin a larger context_file_max_chars, …
+  //
+  // Source fix: `context_file_max_chars` and
+  // `display.suppress_warning_notifications` in the companion overlay; this
+  // covers companions rendered before them.
+  "context_file_max_chars",
+  "context file soul.md",
 ];
 
 /**
