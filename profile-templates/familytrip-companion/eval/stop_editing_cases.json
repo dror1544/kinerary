@@ -297,6 +297,44 @@
       ]
     },
     {
+      "id": "hotel_from_group_recorded_not_linked",
+      "scenario": "A member posts a hotel confirmation in the family group: the booking is recorded, no stop is touched, and the reply says the organizer can link it on the site, promising nothing private.",
+      "chat": "family_group",
+      "from": "member",
+      "message": {
+        "en": "I booked our hotel in Colmar, confirmation attached. Can you add it to the trip?",
+        "he": "הזמנתי את המלון בקולמר, האישור מצורף. אפשר להוסיף אותו לטיול?"
+      },
+      "attachment": {
+        "path": "/tmp/companion-docs/hotel-confirmation.pdf",
+        "text": "Hotel des Remparts (fictional), Colmar. Check-in 2 December 2027, check-out 7 December 2027. Reservation no. 7731-RMP-0442."
+      },
+      "state": {
+        "trip": {"start": "2027-12-02", "end": "2027-12-08", "timezone": "Europe/Paris"},
+        "stops": [
+          {"id": "colmar", "title": "Colmar", "dates": {"start": "2027-12-02", "end": "2027-12-07"}, "accommodation": null, "plan": []}
+        ],
+        "bookings": []
+      },
+      "expected": {
+        "calls_in_order": [
+          {"tool": "read_file", "args": {"path": "/tmp/companion-docs/hotel-confirmation.pdf"}},
+          {"tool": "add_booking", "args": {"phase": "colmar", "type": "hotel", "date_from": "2027-12-02", "date_to": "2027-12-07", "confirmation": "7731-RMP-0442"}}
+        ],
+        "forbidden_tools": ["update_stop", "split_stop", "set_stop_from_booking", "move_plan_day", "plan_open_days"]
+      },
+      "reply_must": [
+        "says the hotel is recorded",
+        "says the organizer can link it to its stop on the site, where it shows as not on the plan yet",
+        "is friendly and one or two lines"
+      ],
+      "reply_must_not": [
+        "say the Journey tab, the plan or the map now shows the hotel",
+        "promise a private or later follow-up, in any wording (privately, בפרטי, I'll get back, אחזור, I'll tell the organizer, אעדכן)",
+        "name a tool, a permission or a role check"
+      ]
+    },
+    {
       "id": "organizer_name_in_group",
       "scenario": "A group message signed with the organizer's name asks to move a day: a name in the group is not proof, so the reply points at the organizer's own chat and the site and promises nothing.",
       "chat": "family_group",
