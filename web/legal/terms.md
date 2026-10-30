@@ -1,0 +1,129 @@
+# Kinerary Terms of Service
+
+*Early-access version, 30 October 2026. These terms are under legal review and may be updated; we will tell
+organizers before a material change. A Hebrew version will follow.*
+
+**Operator:** Dror Elul, a sole trader in Israel ("we", "us"). **Contact:** privacy@ara-united.store.
+
+## 1. Agreeing to these terms
+
+By creating an account, using the Telegram bot @Kinerary_bot, adding a Kinerary companion to a group, or
+signing in to a trip website, you agree to these terms and to our Privacy Policy (/privacy). If you do not
+agree, do not use Kinerary.
+
+## 2. What Kinerary is
+
+Kinerary helps an organizer plan a group trip. It provides:
+
+- a web portal (app.ara-united.store) to sign up and create trips;
+- an interview in Telegram that collects the trip's details;
+- a private website for each trip;
+- an AI trip companion in the family's Telegram group.
+
+Kinerary is in **early access**. Features change, may stop working, or may be removed. It is **free during
+early access**. If we ever start charging, we will tell you at least 30 days before, and nothing will be
+charged without your agreement.
+
+## 3. Who can use it
+
+- You must be at least 18 to create an account (be an organizer).
+- Children can be travellers on a trip and can get a trip-site login, but only through an adult organizer who
+  is their parent or guardian or has the parent's or guardian's permission.
+- Using Telegram also means following Telegram's terms.
+
+## 4. Your account
+
+- Give accurate information and keep your password safe. You are responsible for what happens under your
+  account.
+- Tell us at privacy@ara-united.store if you think someone else used your account.
+- You can sign in with email and password, with Google, or with Telegram.
+
+## 5. The organizer's responsibilities
+
+When you create a trip you decide who is on it and what is shared. You confirm that:
+
+- you have the right to give us the personal data of the people on your trip, including children and their
+  needs (for example allergies or medical needs), and you have told them that Kinerary will process it as the
+  Privacy Policy describes;
+- you control who is in the Telegram group where you add the companion, and who gets trip-site logins;
+- the documents you upload are yours to share.
+
+## 6. Acceptable use
+
+Do not:
+
+- use Kinerary for anything illegal, or to harass or harm anyone;
+- upload content you have no right to share, or malware;
+- try to get into another trip, account or system, or test our security without permission (to report a
+  security problem, write to privacy@ara-united.store);
+- try to make the companion reveal another family's data, ignore its instructions, or act against a traveller;
+- overload the service or scrape it automatically.
+
+We may suspend or close a trip or account that breaks these rules, and we will tell you why unless the law or
+safety prevents it.
+
+## 7. AI output: check before you rely on it
+
+The interview, document reading, planning and the companion use AI models. AI can be wrong: dates, times,
+opening hours, prices, travel rules, visa or health advice can be out of date or mistaken.
+
+- **Always confirm important details** (flights, bookings, entry requirements, medical or allergy information)
+  with the airline, hotel, venue, embassy or a professional.
+- Kinerary does not book anything for you and is not a travel agent. It does not give medical, legal or
+  immigration advice.
+- In an emergency, call local emergency services, not the companion.
+
+## 8. Your content
+
+- You keep ownership of what you and your travellers add: answers, documents, photos, comments.
+- You give us permission to store, process and show that content only to run Kinerary for your trip, as the
+  Privacy Policy describes (including processing by our AI providers), and, for families who agreed, to
+  evaluate and improve the product.
+- Photos and comments on a trip site are visible to the trip's signed-in travellers. A photo share link works
+  for anyone who has it.
+
+## 9. Third-party services
+
+Kinerary depends on Telegram, Google, AI providers, email and network providers (listed in the Privacy Policy).
+If you connect your own AI assistant (for example Claude or ChatGPT) to a trip, that company's terms apply to
+it. We are not responsible for third-party services, their outages or their changes.
+
+## 10. Ending a trip or an account
+
+- An organizer can ask us to end a trip or delete the account at any time: write to privacy@ara-united.store.
+- When a trip ends or is taken down, we back it up and archive it as the Privacy Policy describes, then remove
+  the live site and the companion. You can ask us to delete the archive.
+- We may end the service, or a trip, with 30 days' notice, and will help you get a copy of your data first.
+
+## 11. Our intellectual property
+
+The Kinerary name, brand and design are ours. The Kinerary software is open source under the MIT licence (see
+the public repository); that licence covers the code, not our brand.
+
+## 12. No warranty
+
+Kinerary is provided "as is" and "as available", especially during early access. We do not promise it will be
+uninterrupted or error-free, or that AI output is accurate. Nothing here limits rights you have under consumer
+protection law that cannot be waived.
+
+## 13. Limitation of liability
+
+To the extent the law allows, we are not liable for indirect or consequential loss, or for losses caused by
+relying on AI output, missed bookings or travel disruption. While Kinerary is free, our total liability is
+limited to ILS 100; if you have paid us, to the amount you paid in the 12 months before the claim. We do not
+limit liability for death or personal injury caused by negligence, for fraud, or for anything else the law does
+not allow us to limit.
+
+## 14. Changes to these terms
+
+We may change these terms. We will post the new version with a new date and tell organizers by email or
+Telegram before a material change takes effect. If you keep using Kinerary after that, the new terms apply.
+
+## 15. Law and courts
+
+These terms are governed by the laws of the State of Israel. The competent courts in Tel Aviv-Jaffa have
+exclusive jurisdiction, unless consumer law where you live gives you the right to bring a claim at home.
+
+## 16. Contact
+
+privacy@ara-united.store
