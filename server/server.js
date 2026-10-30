@@ -12,6 +12,7 @@ const { OAuth2Client } = require('google-auth-library');
 const livingJourney = require('./living-journey');
 const { createTripEvents } = require('./trip-events');
 const { createTripStructure } = require('./trip-structure');
+const seedReconcile = require('./seed-reconcile');
 const { createHotelPlaces } = require('./hotel-place');
 const { createControlPlaneAuth } = require('./control-plane-auth');
 const { NEED_TYPES, NEED_SEVERITIES, VISIBILITIES, normalizeSeverity, normalizeVisibility } = require('../shared/needs-schema');
@@ -396,6 +397,21 @@ db.exec(`
 // their bookings table.
 for (const [col, decl] of [
   ['review_status', "TEXT NOT NULL DEFAULT 'approved'"],
+  // #382 — a re-provision's corrections reach a seeded booking (server/seed-reconcile.js).
+  // seed_hash: the values the row was last taken from bookings.json with; a row whose
+  // current values differ from it has been edited on the site. NULL on every row
+  // written before this existed ("cannot be proven unedited").
+  ['seed_hash', 'TEXT'],
+  // Set when the file stopped listing an unedited row: hidden from every tab, kept in the table
+  // (review_status is set to 'retired' beside it, so every reader that already
+  // asks for 'approved' skips the row without being told about this column).
+  ['retired_at', 'TEXT'],
+  // The file's newer values for an edited row, as JSON {hash, changed:{field:value}} — what the
+  // organizer is asked to keep or replace. seed_removed: the file dropped an edited row.
+  // seed_ack: the file version the organizer chose to ignore ("keep mine").
+  ['seed_pending', 'TEXT'],
+  ['seed_removed', 'INTEGER NOT NULL DEFAULT 0'],
+  ['seed_ack', 'TEXT'],
 ]) {
   try { db.exec(`ALTER TABLE bookings ADD COLUMN ${col} ${decl}`); } catch {}
 }
@@ -523,9 +539,19 @@ for (const [col, decl] of [
   // about wording that a date change made wrong.
   ['review_status',     "TEXT DEFAULT 'none'"],
   ['review_attempts',   'INTEGER DEFAULT 0'],
+  // #382 — see the bookings columns of the same names. config_hash is the hash of the values
+  // the config last gave this row; a row that differs from it was edited.
+  ['config_hash',       'TEXT'],
+  ['seed_pending',      'TEXT'],
+  ['seed_removed',      'INTEGER NOT NULL DEFAULT 0'],
+  ['seed_ack',          'TEXT'],
 ]) {
   try { db.exec(`ALTER TABLE phase_plan_items ADD COLUMN ${col} ${decl}`); } catch {}
 }
+// #382: what the reconcile last saw of the config's day items (digest), so a write the site made
+// itself is not mistaken for a re-provision. Additive; a trip that never sets SEED_RECONCILE never fills it
+// except through a site-side config write.
+try { db.exec('CREATE TABLE IF NOT EXISTS seed_reconcile_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)'); } catch {}
 try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_config_ref ON phase_plan_items(config_ref) WHERE config_ref IS NOT NULL'); } catch {}
 try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_itinerary_item_uid ON phase_plan_items(itinerary_item_uid) WHERE itinerary_item_uid IS NOT NULL'); } catch {}
 // A day's headline ("Thu 13/8 — Diamond Head + Waikiki") says what the day IS;
@@ -605,12 +631,52 @@ function insertParticipantUser(p, passwordHash) {
 function persistConfigChange() {
   TRIP_CONFIG_RAW = JSON.stringify(TRIP_CONFIG, null, 2);
   fs.writeFileSync(path.join(TRIP_DIR, 'trip.config.json'), TRIP_CONFIG_RAW);
+  // A change to the config's DAY ITEMS made by the site itself (an export) is not a re-provision:
+  // record what it wrote (see reconcilePlanFromConfig, #382). A write that leaves the day items
+  // as they were at boot (a participant added) records nothing — a re-provision's correction
+  // that has not been reconciled yet must not be swallowed by it.
+  try {
+    const written = seedReconcile.planDigest(configItemProjections());
+    if (BOOT_PLAN_DIGEST !== null && written !== BOOT_PLAN_DIGEST) {
+      db.prepare("INSERT INTO seed_reconcile_state (key, value) VALUES ('plan_config_digest', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(written);
+    }
+  } catch (e) { console.error('seed reconcile digest not recorded:', e.message); }
   try {
     const hash = crypto.createHash('sha256').update(TRIP_CONFIG_RAW).digest('hex');
     const latest = db.prepare('SELECT version FROM trip_config_versions ORDER BY version DESC LIMIT 1').get();
     const nextVersion = (latest?.version || 0) + 1;
     db.prepare('INSERT INTO trip_config_versions (version, content, hash) VALUES (?, ?, ?)').run(nextVersion, TRIP_CONFIG_RAW, hash);
   } catch (e) { console.error('trip config version snapshot failed:', e.message); }
+}
+
+// ── SEED RECONCILE (#382) ────────────────────────────────────────────────────
+// A re-provision rewrites bookings.json and trip.config.json and restarts this server on the
+// same data dir; reconciling the DB with them on boot is what makes a correction reach the
+// tabs. It changes live rows, so it is switched on a trip at a time, after a rehearsal on a
+// copy of that trip's data dir:
+//   SEED_RECONCILE=dry-run  print one SEED_RECONCILE_REPORT line (keys and field names, never
+//                           values) and exit; writes no booking, plan item or revision. Run it
+//                           on a COPY of DATA_DIR: the rest of boot still migrates the schema.
+//   SEED_RECONCILE=1        apply it.
+//   unset                   leave rows alone (new bookings are still inserted, as ever) and say
+//                           in the log what turning it on would do.
+const SEED_RECONCILE_RAW = String(process.env.SEED_RECONCILE || '').trim().toLowerCase();
+const SEED_RECONCILE_MODE = ['1', 'true', 'on', 'yes'].includes(SEED_RECONCILE_RAW) ? 'on'
+  : ['dry-run', 'dryrun'].includes(SEED_RECONCILE_RAW) ? 'dry-run' : 'off';
+if (SEED_RECONCILE_RAW && SEED_RECONCILE_MODE === 'off' && !['0', 'false', 'off', 'no'].includes(SEED_RECONCILE_RAW)) {
+  console.warn(`SEED_RECONCILE=${JSON.stringify(process.env.SEED_RECONCILE)} is not recognised (use 1 or dry-run); treated as off`);
+}
+const SEED_REPORT = {};
+// The config's day items as they were when this process booted (set by reconcilePlanFromConfig).
+let BOOT_PLAN_DIGEST = null;
+function logSeedReport(label, r) {
+  const n = (a) => (Array.isArray(a) ? a.length : a);
+  if (SEED_RECONCILE_MODE === 'on') {
+    console.log(`${label} reconciled: inserted=${n(r.insert)} updated=${n(r.update)} flagged=${n(r.flag)} removed_flagged=${n(r.flag_removed)} retired=${n(r.retire || [])} converged=${r.converge} unchanged=${r.unchanged}${r.not_in_plan ? ` not_in_plan=${r.not_in_plan}` : ''}${r.errors?.length ? ` errors=${r.errors.length}` : ''}${r.refused?.length ? ` REFUSED=${r.refused.map(x => x.reason).join('; ')}` : ''}`);
+  } else {
+    const would = n(r.update) + n(r.flag) + n(r.flag_removed) + n(r.retire || []);
+    console.log(`seed reconcile: ${SEED_RECONCILE_MODE === 'off' ? 'OFF' : 'dry-run'} — ${label}: would update ${n(r.update)}, flag ${n(r.flag)}, flag removed ${n(r.flag_removed)}, retire ${n(r.retire || [])}${would ? ' (set SEED_RECONCILE=1 to apply; SEED_RECONCILE=dry-run on a copy of the data dir prints the detail)' : ''}`);
+  }
 }
 
 // ── STARTUP MIGRATION ─────────────────────────────────────────────────────────
@@ -704,28 +770,34 @@ async function initData() {
     } catch { /* no photos file yet */ }
   }
 
-  // Seed bookings (idempotent via seed_key UNIQUE)
+  // Seed bookings from bookings.json, and reconcile them with it on every boot (#382,
+  // server/seed-reconcile.js): a row nobody edited takes the file's values, one a person
+  // edited keeps them and is flagged, one the file dropped is retired (hidden, kept).
+  // Rolled out a trip at a time — see SEED_RECONCILE_MODE.
   try {
     const bookingSeeds = JSON.parse(fs.readFileSync(path.join(TRIP_DIR, 'bookings.json'), 'utf8'));
-    const bookingInsert = db.prepare(
+    const keylessInsert = db.prepare(
       'INSERT OR IGNORE INTO bookings (phase,type,name,date_from,date_to,passengers,confirmation,pin,notes,cost,conf_file,location_url,seed_key,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
     );
-    // A trip DB seeded before bookings.json carried location_url keeps NULL
-    // forever — INSERT OR IGNORE is a no-op once the seed_key row exists. Fill
-    // it in on a later boot, but only where it is still unset so a hand edit on
-    // the Bookings tab is never stomped.
-    const bookingBackfillLoc = db.prepare(
-      'UPDATE bookings SET location_url = ? WHERE seed_key = ? AND location_url IS NULL'
-    );
-    db.transaction(() => {
-      for (const b of bookingSeeds) {
-        bookingInsert.run(b.phase, b.type, b.name, b.date_from || null, b.date_to || null,
+    // A trip DB seeded before bookings.json carried location_url keeps NULL forever. Fill it in
+    // on a later boot, but only where it is still unset so a hand edit on the Bookings tab is
+    // never stomped. With the reconcile on, a row that has a seed_hash is brought up to date by
+    // the reconcile below instead.
+    if (SEED_RECONCILE_MODE !== 'dry-run') seedReconcile.backfillLocation(db, bookingSeeds, { hashlessOnly: SEED_RECONCILE_MODE === 'on' });
+    const { report, keyless } = seedReconcile.reconcileBookings(db, bookingSeeds, {
+      mode: SEED_RECONCILE_MODE === 'on' ? 'apply' : SEED_RECONCILE_MODE === 'dry-run' ? 'report' : 'insert-only',
+      log: (m) => console.warn(m),
+    });
+    SEED_REPORT.bookings = report;
+    // A seed with no seed_key cannot be reconciled; it is inserted as it always was.
+    if (SEED_RECONCILE_MODE !== 'dry-run') {
+      for (const b of keyless) {
+        keylessInsert.run(b.phase, b.type, b.name, b.date_from || null, b.date_to || null,
           b.passengers || null, b.confirmation || null, b.pin || null,
-          b.notes || null, b.cost || 0, b.conf_file || null, b.location_url || null, b.seed_key, 'seed');
-        if (b.location_url) bookingBackfillLoc.run(b.location_url, b.seed_key);
+          b.notes || null, b.cost || 0, b.conf_file || null, b.location_url || null, null, 'seed');
       }
-    })();
-    console.log('Bookings seeded.');
+    }
+    logSeedReport('Bookings', report);
   } catch (e) { console.error('Bookings seed failed:', e.message); }
 }
 
@@ -1007,6 +1079,8 @@ const journey = livingJourney.create({
   stopKnown: (id) => tripStructure.isStop(id),
   onPhasesReshuffled: (phaseIds) => { for (const id of new Set(phaseIds)) queuePhaseReview(id); kickEnrichmentSoon(); },
   reviewConfigured: () => Boolean(HERMES_URL),
+  // Who sees "the trip file changed this" (#382): the same people who see booking drafts.
+  isOrganizer: (req) => canReviewDrafts(req),
   raw: TRIP_CONFIG_RAW,
   fetchImpl: fetch,
   mediaDir: MEDIA_DIR,
@@ -2613,13 +2687,17 @@ app.get('/api/bookings', authRequired, (req, res) => {
   // Drafts are a private organizer workflow. Members only ever receive
   // approved bookings, even if they guess the status query parameter.
   if (!canReviewDrafts(req)) wheres.push("COALESCE(review_status, 'approved') = 'approved'");
+  // A row the file stopped listing is retired: kept in the table, shown nowhere (#382).
+  wheres.push('retired_at IS NULL');
   if (phase) { wheres.push('phase = ?'); params.push(phase); }
   if (type)  { wheres.push('type = ?');  params.push(type);  }
   if (wheres.length) sql += ' WHERE ' + wheres.join(' AND ');
   sql += ' ORDER BY date_from, id';
   // A hotel booking also says where it is (`place`); location_url stays what
   // is stored, so an edit form never saves a derived link back.
-  res.json(db.prepare(sql).all(...params).map((booking) => hotelPlaces.decorateBooking(booking)));
+  // seed_changed / seed_removed are the organizer's: "the trip file changed this booking" (#382).
+  const organizer = canReviewDrafts(req);
+  res.json(db.prepare(sql).all(...params).map((booking) => seedReconcile.shapeBooking(hotelPlaces.decorateBooking(booking), organizer)));
 });
 
 app.post('/api/bookings/extract-draft', organizerOrAgentRequired, extractUpload.single('file'), async (req, res) => {
@@ -2648,7 +2726,7 @@ app.post('/api/bookings/extract-draft', organizerOrAgentRequired, extractUpload.
       "INSERT INTO bookings (phase,type,name,date_from,date_to,passengers,confirmation,pin,notes,cost,created_by,review_status) VALUES (?,?,?,?,?,?,?,?,?,?,?, 'draft')"
     ).run(phase, type, cleanName, textRules.cleanDate(extracted.date_from), textRules.cleanDate(extracted.date_to),
       text('passengers'), text('confirmation'), text('pin'), text('notes'), 0, req.user.username);
-    const booking = db.prepare('SELECT * FROM bookings WHERE id = ?').get(result.lastInsertRowid);
+    const booking = seedReconcile.shapeBooking(db.prepare('SELECT * FROM bookings WHERE id = ?').get(result.lastInsertRowid), true);
     res.status(201).json({ ok: true, booking, extracted });
   } catch (e) {
     console.error('[extract draft]', e.message);
@@ -2731,6 +2809,44 @@ app.delete('/api/bookings/:id', organizerOrAgentRequired, (req, res) => {
   if (!row) return res.status(404).json({ error: 'not found' });
   if (row.seed_key) return res.status(403).json({ error: 'seed bookings cannot be deleted' });
   db.prepare('DELETE FROM bookings WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+// ── "the trip file changed this" — keep mine / use the new one (#382) ────────
+// A seeded booking or config plan item that a person edited AND the file then changed is kept
+// as edited and flagged (server/seed-reconcile.js). These are the two answers. Organizer or agent
+// only, like every other write to the row; members never see the flag (shapeBooking).
+function parsePending(json) {
+  try { const p = JSON.parse(json); return p && typeof p === 'object' && p.changed && typeof p.changed === 'object' ? p : null; }
+  catch { return null; }
+}
+app.post('/api/bookings/:id/accept-seed', organizerOrAgentRequired, (req, res) => {
+  const row = db.prepare('SELECT * FROM bookings WHERE id = ? AND seed_key IS NOT NULL AND retired_at IS NULL').get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'seeded booking not found' });
+  if (row.seed_removed) {
+    // The file dropped a row somebody had edited; "use the new one" is to let it go.
+    db.prepare("UPDATE bookings SET retired_at = datetime('now'), review_status = 'retired', seed_pending = NULL, seed_removed = 0 WHERE id = ?").run(row.id);
+    return res.json({ ok: true, retired: true });
+  }
+  const pending = parsePending(row.seed_pending);
+  if (!pending) return res.status(409).json({ error: 'nothing_pending' });
+  const fields = Object.keys(pending.changed).filter(f => seedReconcile.BOOKING_FIELDS.includes(f));
+  try {
+    db.prepare(`UPDATE bookings SET ${fields.map(f => `${f} = ?`).join(', ')}${fields.length ? ', ' : ''}seed_hash = ?, seed_pending = NULL, seed_ack = NULL WHERE id = ?`)
+      .run(...fields.map(f => pending.changed[f]), pending.hash, row.id);
+  } catch (e) {
+    console.error('[accept-seed]', e.message);
+    return res.status(422).json({ error: 'the trip file value cannot be applied' });
+  }
+  if (fields.includes('date_from') || fields.includes('date_to')) tripStructure.onBookingChanged(row.id, req.user.username);
+  res.json({ ok: true, applied: fields });
+});
+app.post('/api/bookings/:id/keep-seed', organizerOrAgentRequired, (req, res) => {
+  const row = db.prepare('SELECT id, seed_pending, seed_removed FROM bookings WHERE id = ? AND seed_key IS NOT NULL AND retired_at IS NULL').get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'seeded booking not found' });
+  const pending = parsePending(row.seed_pending);
+  if (!pending && !row.seed_removed) return res.status(409).json({ error: 'nothing_pending' });
+  db.prepare('UPDATE bookings SET seed_ack = ?, seed_pending = NULL, seed_removed = 0 WHERE id = ?').run(row.seed_removed ? 'removed' : pending.hash, row.id);
   res.json({ ok: true });
 });
 
@@ -2938,10 +3054,12 @@ function canReviewDrafts(req) {
 // Fails safe — a caller that forgets to pass the viewer's capability gets the
 // member-visible projection, never the draft.
 function joinBooking(item, { includeDrafts = false } = {}) {
-  const withCorr = withCorrection(item);
+  // The seed flags ride the same capability as drafts: the organizer's (#382). The hash and ack
+  // columns are never served.
+  const withCorr = withCorrection(seedReconcile.shapePlanItem(item, includeDrafts));
   if (!item.booking_id) return withCorr;
   const bk = db.prepare(
-    'SELECT id, name, confirmation, conf_file, type, phase, location_url FROM bookings WHERE id = ?' +
+    'SELECT id, name, confirmation, conf_file, type, phase, location_url FROM bookings WHERE id = ? AND retired_at IS NULL' +
     (includeDrafts ? '' : " AND COALESCE(review_status, 'approved') = 'approved'")
   ).get(item.booking_id);
   if (!bk) return { ...withCorr, booking: null };
@@ -3244,6 +3362,50 @@ app.delete('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res
   res.json({ ok: true });
 });
 
+// The plan-item twin of /api/bookings/:id/accept-seed and keep-seed (#382). The plan is
+// phase_plan_items; an accepted value is a Classic write, so it syncs into a revision like one.
+function acceptPlanSeed(row, res) {
+  if (row.seed_removed) return res.status(409).json({ error: 'removed_from_file', detail: 'The trip file no longer has this item; delete it from the plan if you want it gone.' });
+  const pending = parsePending(row.seed_pending);
+  if (!pending) return res.status(409).json({ error: 'nothing_pending' });
+  const fields = Object.keys(pending.changed).filter(f => seedReconcile.PLAN_FIELDS.includes(f));
+  db.prepare(`UPDATE phase_plan_items SET ${fields.map(f => `${f} = ?`).join(', ')}${fields.length ? ', ' : ''}config_hash = ?, seed_pending = NULL, seed_ack = NULL WHERE id = ?`)
+    .run(...fields.map(f => pending.changed[f]), pending.hash, row.id);
+  journey.syncFromLegacy('config-accept-seed');
+  return res.json({ ok: true, applied: fields.filter(f => f !== 'time_sort') });
+}
+function keepPlanSeed(row, res) {
+  const pending = parsePending(row.seed_pending);
+  if (!pending && !row.seed_removed) return res.status(409).json({ error: 'nothing_pending' });
+  db.prepare('UPDATE phase_plan_items SET seed_ack = ?, seed_pending = NULL, seed_removed = 0 WHERE id = ?').run(row.seed_removed ? 'removed' : pending.hash, row.id);
+  return res.json({ ok: true });
+}
+// By the plan's own row id, as the Classic plan routes address it...
+app.post('/api/phases/:phase_id/plan/:id/accept-seed', organizerOrAgentRequired, (req, res) => {
+  if (!knownPhase(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
+  const row = db.prepare('SELECT * FROM phase_plan_items WHERE id = ? AND phase_id = ? AND config_ref IS NOT NULL').get(req.params.id, req.params.phase_id);
+  return row ? acceptPlanSeed(row, res) : res.status(404).json({ error: 'not found' });
+});
+app.post('/api/phases/:phase_id/plan/:id/keep-seed', organizerOrAgentRequired, (req, res) => {
+  if (!knownPhase(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
+  const row = db.prepare('SELECT * FROM phase_plan_items WHERE id = ? AND phase_id = ? AND config_ref IS NOT NULL').get(req.params.id, req.params.phase_id);
+  return row ? keepPlanSeed(row, res) : res.status(404).json({ error: 'not found' });
+});
+// ...and by item_uid, as the itinerary (what the Modern UI shows) addresses it.
+function planRowByItemUid(uid) {
+  if (typeof uid !== 'string') return null;
+  return db.prepare('SELECT * FROM phase_plan_items WHERE config_ref IS NOT NULL').all().find(r =>
+    (r.itinerary_item_uid || `cfg_${crypto.createHash('sha256').update(r.config_ref).digest('hex').slice(0, 16)}`) === uid) || null;
+}
+app.post('/api/itinerary/items/:item_uid/accept-seed', organizerOrAgentRequired, (req, res) => {
+  const row = planRowByItemUid(req.params.item_uid);
+  return row ? acceptPlanSeed(row, res) : res.status(404).json({ error: 'not found' });
+});
+app.post('/api/itinerary/items/:item_uid/keep-seed', organizerOrAgentRequired, (req, res) => {
+  const row = planRowByItemUid(req.params.item_uid);
+  return row ? keepPlanSeed(row, res) : res.status(404).json({ error: 'not found' });
+});
+
 // ── Active-plan day headlines: the part that says what a day IS ──────────────
 // Every existing writer of a headline is write-once: ensurePlanDay() inserts no
 // label at all, and both the enrichment worker and promote-config-days write
@@ -3495,7 +3657,7 @@ function findMatchingBooking(item) {
   const hay = new Set([...tokenize(item.text_en), ...tokenize(item.text_he)]);
   if (!hay.size) return null;
   const candidates = db.prepare(
-    'SELECT id, name, phase, confirmation FROM bookings WHERE phase = ?'
+    'SELECT id, name, phase, confirmation FROM bookings WHERE retired_at IS NULL AND phase = ?'
   ).all(item.phase_id);
   let best = null;
   for (const b of candidates) {
@@ -3969,6 +4131,57 @@ function hebrewOf(value) {
   return value ?? '';
 }
 
+// What the file says for one day item, in the shape the plan row stores it. One function for
+// the import (promoteConfigDays) and the reconcile (configItemProjections), so a value the
+// reconcile compares is exactly a value the import would have written.
+function projectDayItem(rawItem) {
+  const item = publicPart('dayItem', rawItem) || {};
+  const links = [...allConfigLinks(item.text?.he), ...allConfigLinks(item.text?.en)]
+    .filter((l, i, arr) => arr.findIndex(x => x.url === l.url) === i);
+  const httpUrl = (u) => (/^https?:\/\//i.test(u || '') ? u : null);
+  const rawTime = typeof item.time === 'string' ? item.time.trim() : '';
+  const time = isValidPlanTime(rawTime) ? rawTime : null;
+  // A config schedule may carry a range ("06:30–07:00"), which the plan
+  // item's time column can't represent. Keep it in the text rather than
+  // dropping a detail the organizer wrote.
+  const prefix = rawTime && !time ? `${rawTime} — ` : '';
+  return {
+    linksJson: links.length ? JSON.stringify(links) : null,
+    // Provision-time enrichment attaches maps/waze/url straight onto a config day
+    // item (matched from phases[].venues[]) — siblings of text/time, never inline <a>.
+    mapsHref: firstMapHref(item.text?.he) || firstMapHref(item.text?.en) || httpUrl(item.maps),
+    wazeHref: httpUrl(item.waze),
+    ticketHref: httpUrl(item.url),
+    time,
+    he: prefix + stripTags(hebrewOf(item.text)),
+    en: prefix + stripTags(item.text?.en ?? ''),
+  };
+}
+function projectionValues(date, p) {
+  return {
+    date, time: p.time, time_sort: planTimeSort(p.time), text_he: p.he || p.en, text_en: p.en || null,
+    location_url: p.mapsHref, waze_url: p.wazeHref, ticket_url: p.ticketHref, extra_links: p.linksJson,
+  };
+}
+// Every config day item as the plan would hold it: [{ref, values}]. The FILE, deliberately (as
+// promoteConfigDays): config_ref is keyed by the file's own positions.
+function configItemProjections() {
+  const out = [];
+  for (const rawPhase of (TRIP_CONFIG.phases || [])) {
+    const phaseId = publicPart('phase', { id: rawPhase?.id })?.id;
+    if (phaseId == null) continue;
+    (Array.isArray(rawPhase.days) ? rawPhase.days : []).forEach((rawDay, di) => {
+      const day = publicPart('day', rawDay) || {};
+      (Array.isArray(rawDay?.items) ? rawDay.items : []).forEach((rawItem, ii) => {
+        const p = projectDayItem(rawItem);
+        if (!p.he && !p.en) return;
+        out.push({ ref: `${phaseId}|${day.date || `d${di}`}|${ii}`, values: projectionValues(day.date || null, p) });
+      });
+    });
+  }
+  return out;
+}
+
 function promoteConfigDays(createdBy, { queueEnrichment = true } = {}) {
   const created = [];
   const skipped = [];
@@ -3977,8 +4190,8 @@ function promoteConfigDays(createdBy, { queueEnrichment = true } = {}) {
   const enrichSeed = HERMES_URL && queueEnrichment ? 'pending' : 'none';
   const insert = db.prepare(
     'INSERT OR IGNORE INTO phase_plan_items ' +
-    '(phase_id,date,time,time_sort,text_he,text_en,location_url,waze_url,ticket_url,extra_links,booking_id,status,sort_order,created_by,enrichment_status,config_ref) ' +
-    "VALUES (?,?,?,?,?,?,?,?,?,?,?,'confirmed',?,?,?,?)"
+    '(phase_id,date,time,time_sort,text_he,text_en,location_url,waze_url,ticket_url,extra_links,booking_id,status,sort_order,created_by,enrichment_status,config_ref,config_hash) ' +
+    "VALUES (?,?,?,?,?,?,?,?,?,?,?,'confirmed',?,?,?,?,?)"
   );
   // Re-running promote repairs a row whose links weren't available (or the
   // column didn't exist) the first time — filling only what is still NULL, so
@@ -3991,11 +4204,6 @@ function promoteConfigDays(createdBy, { queueEnrichment = true } = {}) {
     'waze_url = COALESCE(waze_url, ?), ticket_url = COALESCE(ticket_url, ?) ' +
     'WHERE config_ref = ?'
   );
-  // Provision-time enrichment attaches maps/waze/url straight onto a config day
-  // item (matched from phases[].venues[]) — siblings of text/time, never inline
-  // <a>, so allConfigLinks()/firstMapHref() below never see them.
-  const httpOrNull = (u) => (/^https?:\/\//i.test(u || '') ? u : null);
-
   const upsertDay = db.prepare(
     'INSERT INTO phase_plan_days (phase_id,date,label_he,label_en,enrichment_status) VALUES (?,?,?,?,?) ' +
     'ON CONFLICT(phase_id,date) DO UPDATE SET ' +
@@ -4037,15 +4245,9 @@ function promoteConfigDays(createdBy, { queueEnrichment = true } = {}) {
                       (he || en) ? 'done' : enrichSeed);
       }
       (Array.isArray(rawDay?.items) ? rawDay.items : []).forEach((rawItem, ii) => {
-        const item = publicPart('dayItem', rawItem) || {};
         const ref = `${phaseId}|${day.date || `d${di}`}|${ii}`;
-        const links = [...allConfigLinks(item.text?.he), ...allConfigLinks(item.text?.en)]
-          .filter((l, i, arr) => arr.findIndex(x => x.url === l.url) === i);
-        const linksJson = links.length ? JSON.stringify(links) : null;
-
-        const mapsHref  = firstMapHref(item.text?.he) || firstMapHref(item.text?.en) || httpOrNull(item.maps);
-        const wazeHref  = httpOrNull(item.waze);
-        const ticketHref = httpOrNull(item.url);
+        const projected = projectDayItem(rawItem);
+        const { linksJson, mapsHref, wazeHref, ticketHref } = projected;
 
         const existing = db.prepare(
           'SELECT location_url, waze_url, ticket_url, extra_links FROM phase_plan_items WHERE config_ref = ?'
@@ -4061,14 +4263,7 @@ function promoteConfigDays(createdBy, { queueEnrichment = true } = {}) {
           skipped.push({ config_ref: ref, reason: filled ? 'already promoted (links backfilled)' : 'already promoted' });
           return;
         }
-        const rawTime = typeof item.time === 'string' ? item.time.trim() : '';
-        const time = isValidPlanTime(rawTime) ? rawTime : null;
-        // A config schedule may carry a range ("06:30–07:00"), which the plan
-        // item's time column can't represent. Keep it in the text rather than
-        // dropping a detail the organizer wrote.
-        const prefix = rawTime && !time ? `${rawTime} — ` : '';
-        const he = prefix + stripTags(hebrewOf(item.text));
-        const en = prefix + stripTags(item.text?.en ?? '');
+        const { time, he, en } = projected;
         if (!he && !en) { skipped.push({ config_ref: ref, reason: 'no text' }); return; }
 
         const info = insert.run(
@@ -4077,7 +4272,9 @@ function promoteConfigDays(createdBy, { queueEnrichment = true } = {}) {
           mapsHref, wazeHref, ticketHref,
           linksJson,
           findMatchingBooking({ phase_id: phaseId, text_he: he, text_en: en }),
-          di * 1000 + ii, createdBy, enrichSeed, ref
+          di * 1000 + ii, createdBy, enrichSeed, ref,
+          // What the config gave this row, so a later boot can tell an edit from a correction (#382).
+          seedReconcile.hashOf(seedReconcile.normalizePlan(projectionValues(day.date || null, projected)), seedReconcile.PLAN_FIELDS)
         );
         if (info.changes) created.push({ id: info.lastInsertRowid, phase_id: phaseId, config_ref: ref });
         else skipped.push({ config_ref: ref, reason: 'already promoted' });
@@ -4187,7 +4384,7 @@ app.post('/api/phase-plan/export-to-config', organizerOrAgentRequired, (req, res
 // "already done" apart from "this booking can't be imported".
 app.post('/api/phase-plan/import-from-bookings', organizerOrAgentRequired, (req, res) => {
   const bookings = db.prepare(
-    "SELECT * FROM bookings WHERE notes IS NOT NULL AND length(notes) > 80"
+    "SELECT * FROM bookings WHERE retired_at IS NULL AND notes IS NOT NULL AND length(notes) > 80"
   ).all();
   const created = [];
   const skipped = [];
@@ -4735,4 +4932,37 @@ const HOST = process.env.HOST || undefined;
 // No enrichment queued: a deploy must not fire model calls at every existing item (see enrich-pending).
 journey.importPlanOnce(() => promoteConfigDays('config', { queueEnrichment: false }));
 
-app.listen(PORT, HOST, () => console.log(`Trip server running on ${HOST || '*'}:${PORT}`));
+// #382: bring the plan items imported from the config up to date with the config. Only when the
+// config's day items are not what this site last saw — a re-provision rewrote them. The site's
+// own writes (persistConfigChange, e.g. an export that folds link icons into the text) record
+// what they wrote, so they are never mistaken for one.
+function reconcilePlanFromConfig() {
+  try {
+    const items = configItemProjections();
+    const digest = seedReconcile.planDigest(items);
+    BOOT_PLAN_DIGEST = digest;
+    if (db.prepare("SELECT value FROM seed_reconcile_state WHERE key = 'plan_config_digest'").get()?.value === digest) {
+      SEED_REPORT.plan_items = { skipped: 'the config day items are what the site last saw' };
+      console.log('Plan items: config day items unchanged since the site last saw them.');
+      return;
+    }
+    const apply = SEED_RECONCILE_MODE === 'on';
+    const report = journey.reconcileConfigItems(items, { mode: apply ? 'apply' : 'report' });
+    SEED_REPORT.plan_items = report;
+    if (apply) {
+      db.prepare("INSERT INTO seed_reconcile_state (key, value) VALUES ('plan_config_digest', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(digest);
+    }
+    logSeedReport('Plan items', report);
+  } catch (e) { console.error('Plan items reconcile failed:', e.message); }
+}
+reconcilePlanFromConfig();
+
+if (SEED_RECONCILE_MODE === 'dry-run') {
+  // A rehearsal on a copy of the data dir: say what the reconcile would do, listen on nothing, exit.
+  dataReady.catch(() => {}).finally(() => {
+    console.log(`SEED_RECONCILE_REPORT ${JSON.stringify(SEED_REPORT)}`);
+    process.exit(0);
+  });
+} else {
+  app.listen(PORT, HOST, () => console.log(`Trip server running on ${HOST || '*'}:${PORT}`));
+}
