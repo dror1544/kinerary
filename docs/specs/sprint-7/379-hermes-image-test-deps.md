@@ -3,6 +3,8 @@
 Status: draft (2026-10-19) · Issue: #379 · Track: T3 · Size: S · Tier: Normal
 Security path: no · Migration: no · Live-trip behaviour: no
 
+> **Partly built on integration/sprint-7 (2026-10-19):** `cd3a750` installs pytest with uv when present, else the venv's pip, and a failed install fails loudly. Still owed by this spec: the sealed-venv case (no pip in the target image), separate messages for install / test failure / no tests collected where `cd3a750` does not already give them, and the `--source` without `--base-rev` mislabel. The developer reconciles against `cd3a750` first.
+
 ## Problem
 
 The verify step of `control-plane/deployment/build-hermes-image.sh` runs the

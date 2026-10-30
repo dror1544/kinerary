@@ -3,6 +3,8 @@
 Status: draft (2026-10-19) · Issue: #420 (absorbs #288) · Track: T2 · Size: M · Tier: Normal
 Security path: no (none of the three named invariants; spawns `docker exec` with no secret on argv) · Migration: no · Live-trip behaviour: yes
 
+> **Partly built on integration/sprint-7 (2026-10-19):** `199038a` restarts the **trip-intake** gateway after every switch and waits for its new tool registration, and `live_companions()` skips `retired-` slugs (#288). Still owed by this spec: every other gateway (companions, monitor), discovered rather than hard-coded, and the ordering with #349. The developer builds on `199038a`, not beside it.
+
 ## Problem
 
 `ControlPlane.start_switched` (`control-plane/deployment/vm-release.py:1239-1254`)

@@ -3,6 +3,8 @@
 Status: draft (2026-10-19) · Issue: #381 · Track: Housekeeping · Size: S · Tier: Small (docs-only)
 Security path: no · Migration: no · Live-trip behaviour: no
 
+> **Built on integration/sprint-7 (2026-10-19):** `4fccad1` (PR #426 carry-in). This spec is kept as the record; the verifier checks AC-1..n against that commit.
+
 `control-plane/README.md` opened as the "Sprint 0" boundary note while the
 directory now holds the API, relay, worker, runtime gateway, deployment scripts
 and migrations; the root `README.md` sends readers there for the repository
