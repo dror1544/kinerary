@@ -311,13 +311,13 @@ Recommend recovery first. Avoid long drives or rigid morning plans.
 
 **Anyone in the group can participate in planning** — suggest activities, propose routes, vote on options. This is welcome and should be encouraged.
 
-**Only the organizer ($ORGANIZER_REF) can approve writing to the trip site.** If a group member proposes a plan that others seem to agree with, still present a summary to the organizer privately and wait for their explicit approval before updating the site.
+**Anyone in the group can approve a plan or a site change**, in the group, and the organizer can also approve in their private chat. Approval is taken in the chat where it is given: never send someone to the other chat to repeat it, and never say you will take the plan to the organizer. The first clear yes from anyone there is the approval. (The trip's stops are the exception: they are the organizer's — see the Stops section of `familytrip-companion-operations`.)
 
 **Flow when planning involves the group:**
 1. Engage the group in the planning — present options, invite reactions, note what people prefer.
-2. Once a direction is clear, summarize the proposed plan and address the organizer:
-   > "[Organizer name], הקבוצה נוטה ל-[option]. רוצה שאעדכן את המסלול באתר?"
-3. Write to the site only after the organizer approves.
+2. Once a direction is clear, summarize the proposed plan in the group and ask once:
+   > "הקבוצה נוטה ל-[option]. רוצה שאעדכן את המסלול באתר?"
+3. Write to the site after the first clear yes from anyone there.
 
 ---
 
@@ -326,10 +326,10 @@ Recommend recovery first. Avoid long drives or rigid morning plans.
 After generating a day plan (pattern C or D), always offer to update the trip site's daily schedule with the plan:
 
 1. **Summarize what would be written** — one line per day item in plain language, as it would appear on the site.
-2. **Ask for confirmation before writing — address the organizer:**
+2. **Ask for confirmation before writing — ask whoever is in the conversation:**
    > "רוצה שאעדכן את המסלול הזה באתר? הנה מה שיירשם: [summary]"
    > / "Want me to update today's plan on the site? Here's what will be written: [summary]"
-3. **Write only after explicit organizer approval** — "כן" / "yes" / "תעדכן" counts as approval. Do not write speculatively or based on group consensus alone.
+3. **Write only after an explicit yes from someone in the conversation** — "כן" / "yes" / "תעדכן" counts as approval. Do not write speculatively, and do not read silence or a general mood as a yes.
 4. After writing, **read back the updated day entry** from the site and confirm it matches the approved plan.
 5. If the site still shows the old plan after writing, say so explicitly and do not claim success.
 
@@ -453,7 +453,7 @@ If user asks for shorter: duration + destination sequence + hotel names + key tr
 - Do not invent stop names; use maps skill or web_search results only.
 - Do not plan from the start of the day if it is already afternoon or evening — start from the current local time.
 - Do not suggest activities that are already closed or unreachable given the current local time.
-- Do not write to the trip site without explicit organizer approval — always summarize first and wait for "yes".
+- Do not write to the trip site without an explicit yes from someone in the conversation — always summarize first and wait for "yes".
 - Do not invent parking prices — only mention price if found in a web source.
 - Always offer both Google Maps and Waze nav links (unless user specified one).
 

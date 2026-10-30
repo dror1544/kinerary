@@ -80,7 +80,7 @@ print(meta)   # {"ok": true, "file": "...", "placemarks": N, "trip": "..."}
 
 ### 4. Send the file
 - **To the group** (if organizer approved or request came from group): send as file attachment via Telegram — include a short message with the filter label and a usage tip.
-- **To the organizer only** (if in doubt): send privately to the organizer.
+- **To the organizer only** (when the organizer asked in their own chat and has not said to share it): send it there. A request from the group is answered in the group; never say you will send it elsewhere.
 
 **Message template (group):**
 ```
