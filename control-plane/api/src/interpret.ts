@@ -871,6 +871,30 @@ function settleTypedChoice(proposal: ProposedAnswer, questions: readonly IntakeQ
  * question the interview is not asking is rejected before we spend anything on
  * validating it.
  */
+/**
+ * The closed list of words that describe people rather than name an assistant
+ * (#413), in the two languages an interview is held in. Singular and plural, and
+ * the filler that goes with them ("the kids", "other travellers", "my family").
+ * Deliberately not a classifier: the list is closed so a real name is never in
+ * doubt, and "Family Guy" or "Kids Club Tokyo" are not people words — every word
+ * has to be on it.
+ */
+const PEOPLE_WORDS: ReadonlySet<string> = new Set([
+  "traveller", "travellers", "traveler", "travelers", "passenger", "passengers",
+  "kid", "kids", "children", "family", "families", "other", "others",
+  "נוסעים", "נוסע", "מטיילים", "מטייל", "ילדים", "ילד", "משפחה", "משפחות", "אחרים", "אחר",
+]);
+const PEOPLE_FILLER: ReadonlySet<string> = new Set(["the", "my", "our", "all", "of", "and", "some", "other"]);
+
+export function looksLikePeopleWords(text: string): boolean {
+  const words = text.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  if (words.length === 0 || words.length > 4) return false;
+  // Hebrew attaches "the" (ה) and "and" (ו) to the word: הילדים, ואחרים.
+  const base = (w: string) => (PEOPLE_WORDS.has(w) ? w : /^[הו]/u.test(w) && PEOPLE_WORDS.has(w.slice(1)) ? w.slice(1) : w);
+  const bare = words.map(base);
+  return bare.some((w) => PEOPLE_WORDS.has(w)) && bare.every((w) => PEOPLE_WORDS.has(w) || PEOPLE_FILLER.has(w));
+}
+
 export function applyProposals(
   modelProposals: readonly ProposedAnswer[],
   ctx: ApplyProposalsContext,
@@ -880,6 +904,19 @@ export function applyProposals(
   const minConfidence = ctx.minConfidence ?? DEFAULT_MIN_CONFIDENCE;
   const outstanding = new Set(ctx.outstanding);
   const answered = new Set(ctx.answered);
+
+  /**
+   * The reply to the question on screen is not held to the confidence floor
+   * (`pendingQuestionId`) — except an assistant's name that is only a word for
+   * people. "other travellers" typed to explain a document is about the trip,
+   * not a name for the bot (#413): below the floor it becomes a suggestion the
+   * organizer confirms, the same as any other unsure read. It is not refused —
+   * a deliberate "Family" is one tap — and it is the second line of defence
+   * behind the recap marker, which reads the message as being about the recap.
+   */
+  const floorWaived = (p: ProposedAnswer): boolean =>
+    p.questionId === ctx.pendingQuestionId
+    && !(p.questionId === "bot_name" && p.value.kind === "text" && looksLikePeopleWords(p.value.text));
 
   /**
    * A correction to a structured answer ADDS to it. "My mother is joining too"
@@ -986,7 +1023,7 @@ export function applyProposals(
   // and its start by document order between two itineraries that both scored 1.
   const TRIP_EDGE: Readonly<Record<string, "earliest" | "latest">> = { departure_date: "earliest", return_date: "latest" };
   const credible = (p: ProposedAnswer) =>
-    (p.confidence >= minConfidence || p.questionId === ctx.pendingQuestionId) && evidenceAppears(p.evidence, ctx.sourceText);
+    (p.confidence >= minConfidence || floorWaived(p)) && evidenceAppears(p.evidence, ctx.sourceText);
   const isoDayOf = (p: ProposedAnswer): string | null =>
     p.value.kind === "text" && /^\d{4}-\d{2}-\d{2}$/.test(p.value.text) ? p.value.text : null;
   const winner = new Map<string, number>();
@@ -1046,7 +1083,7 @@ export function applyProposals(
     } else if (!outstanding.has(p.questionId) && !reconcilable) {
       return { reason: "NOT_OUTSTANDING" };
     }
-    if (p.confidence < minConfidence && p.questionId !== ctx.pendingQuestionId) {
+    if (p.confidence < minConfidence && !floorWaived(p)) {
       return { reason: "LOW_CONFIDENCE" };
     }
     if (!evidenceAppears(p.evidence, ctx.sourceText)) return { reason: "EVIDENCE_NOT_IN_SOURCE" };
@@ -1188,7 +1225,7 @@ export function applyProposals(
     } else if (!outstanding.has(proposal.questionId)) return reject(proposal, "NOT_OUTSTANDING");
     if (contested.has(proposal.questionId)) return reject(proposal, "CONFLICTING_PROPOSALS");
     if (winner.get(proposal.questionId) !== i) return reject(proposal, "DUPLICATE_PROPOSAL");
-    if (proposal.confidence < minConfidence && proposal.questionId !== ctx.pendingQuestionId) {
+    if (proposal.confidence < minConfidence && !floorWaived(proposal)) {
       suggestFrom([proposal]);
       return reject(proposal, "LOW_CONFIDENCE");
     }
@@ -1625,7 +1662,21 @@ export interface BuildInterpretPromptArgs {
    * not, and a hotel is told where it lives (a stop's accommodation).
    */
   summaryOnScreen?: boolean;
-  /** Ids of the questions that already have an answer. Read only with `summaryOnScreen`. */
+  /**
+   * The document recap was the last thing they read ("here is what I took from
+   * your file — tell me if anything is wrong"), and the question on screen is
+   * only the next one the router put underneath it (#413).
+   *
+   * Then a typed message is first of all about WHAT THE DOCUMENT GAVE — the
+   * travellers, the stops, the bookings — and only if it plainly is not, a reply
+   * to the question on screen. It is the `summaryOnScreen` widening, scoped to
+   * those three questions (`RECAP_QUESTION_IDS`), not every answered one: the
+   * summary invites a hotel or an interest, a recap only invites a correction of
+   * what it showed. Live, 2026-10-18: "נוסעים אחרים", said to explain a ticket
+   * whose second couple was missed, was filed as the assistant's name.
+   */
+  afterDocumentRecap?: boolean;
+  /** Ids of the questions that already have an answer. Read only with `summaryOnScreen` / `afterDocumentRecap`. */
   answered?: readonly string[];
   questions?: readonly IntakeQuestion[];
 }
@@ -1638,6 +1689,32 @@ export interface BuildInterpretPromptArgs {
  */
 function summaryAnswerableIds(): ReadonlySet<string> {
   return new Set([...DOCUMENT_ANSWERABLE_QUESTION_IDS, "trip_interests", "trip_pace"]);
+}
+
+/** What a document recap shows, so what a message after it may be about (#413). */
+export const RECAP_QUESTION_IDS: readonly string[] = ["travelers", "phases", "travel_anchors"];
+
+/**
+ * What to tell the reader on the turn after a document recap (#413). Without
+ * real names or places, like every example in this prompt (`exampleEchoes`).
+ */
+function recapSection(held: BuildInterpretPromptArgs["heldLists"], onScreen: IntakeQuestion | undefined): string[] {
+  return [
+    `THEY HAVE JUST BEEN SHOWN WHAT THEIR DOCUMENT GAVE: the travellers, the stops and the bookings it`,
+    `found, with "if any of that is wrong, tell me". ${onScreen ? `The question "${onScreen.id}" is only the next one we put under it.` : ``}`,
+    `So read this message FIRST as being about that: a correction or an addition to the travellers, the`,
+    `stops or the bookings ("my parents are coming too", "the hotel is X", "the flight is on the 3rd").`,
+    `Addressable now, besides the question on screen: ${RECAP_QUESTION_IDS.join(", ")}.`,
+    `- A message about one of those is NOT a reply to the question on screen. Do not file it there.`,
+    ...(held && held.travellers.length > 0
+      ? [`  Travellers and stops we already hold change through the operations below (add_traveller, add_stop…).`]
+      : []),
+    `- If it is plainly about the travellers but names nobody ("the other travellers", "my family", "the kids"),`,
+    `  do not guess a name and do not answer the question on screen with it: put "travelers" in "unclear"`,
+    `  with a "why", and propose nothing for it.`,
+    `- Only when it plainly answers the question on screen (a short name, a choice) is it a reply to it.`,
+    ``,
+  ];
 }
 
 /**
@@ -1679,8 +1756,12 @@ export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
   // At the summary, the answered questions a message can add to are described in
   // full too — except the stops and the travellers once held, which change only
   // through operations (`changeSection`), never as a proposal.
-  const answeredToo = args.summaryOnScreen
-    ? new Set((args.answered ?? []).filter((id) => summaryAnswerableIds().has(id)
+  //
+  // After a document recap the same widening applies, scoped to the recap's own
+  // three questions (#413).
+  const widened = Boolean(args.summaryOnScreen || args.afterDocumentRecap);
+  const answeredToo = widened
+    ? new Set((args.answered ?? []).filter((id) => (args.summaryOnScreen ? summaryAnswerableIds().has(id) : RECAP_QUESTION_IDS.includes(id))
         && !(id === "phases" && (args.heldLists?.stops.length ?? 0) > 0)
         && !(id === "travelers" && (args.heldLists?.travellers.length ?? 0) > 0)))
     : new Set<string>();
@@ -1692,13 +1773,17 @@ export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
     `You are reading one message from someone planning a trip, written in ${languageName(args.language)}.`,
     `Decide which of the questions below it answers. Answer ONLY with JSON.`,
     ``,
-    ...(args.summaryOnScreen ? summarySection(args.heldLists) : []),
+    ...(args.summaryOnScreen ? summarySection(args.heldLists) : args.afterDocumentRecap ? recapSection(args.heldLists, onScreen) : []),
     ...(onScreen
       ? [
           `They were just asked "${onScreen.prompt.replace(/\s+/g, " ").trim()}" (id: ${onScreen.id}),`,
-          `and this message is their reply to it. So read a short or bare answer as answering`,
-          `THAT question — "13/9" to a date question is that date, "4" to a how-many question is`,
-          `four. Only look elsewhere if the message plainly is not about it.`,
+          args.afterDocumentRecap
+            ? `and a short or bare answer to it IS its reply — "13/9" to a date question is that date.`
+            : `and this message is their reply to it. So read a short or bare answer as answering`,
+          ...(args.afterDocumentRecap
+            ? [`Anything about the travellers, stops or bookings is not (see above).`]
+            : [`THAT question — "13/9" to a date question is that date, "4" to a how-many question is`,
+               `four. Only look elsewhere if the message plainly is not about it.`]),
           ``,
         ]
       : []),
@@ -1736,16 +1821,16 @@ export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
     ...(asked.some((q) => q.id === "phases") ? stopsSection() : []),
     ...(asked.some((q) => q.id === "travelers") ? travelersSection(args.language) : []),
     ...(asked.some((q) => q.id === "travel_anchors") && !asked.some((q) => q.id === "phases") ? bookingsSection() : []),
-    args.summaryOnScreen ? `Questions (answered already or not):` : `Questions still outstanding:`,
+    widened ? `Questions (answered already or not):` : `Questions still outstanding:`,
     ...asked.map(describeQuestion),
     ``,
     ...changeSection(args.heldLists),
     ...(args.correctable?.length
       ? [
-          args.summaryOnScreen
+          widened
             ? `Already answered — propose one of these if this message ADDS to it or CHANGES it ("also…", "add…", "actually…", "make it…"). A message that merely repeats what they already said adds nothing. For a list,`
             : `Already answered — propose one of these ONLY if this message plainly corrects it`,
-          ...(args.summaryOnScreen ? [] : [
+          ...(widened ? [] : [
             `("actually…", "no, it's…", "add…", "make it…"). A passing mention is not a correction,`,
             `and a message that merely repeats what they already said is not one either. For a list,`,
           ]),

@@ -1789,6 +1789,8 @@ export interface SessionView {
   pendingAskText: string | null;
   /** What the router last sent, so it does not send it twice running. */
   lastPrompt: string | null;
+  /** The document recap the organizer has just read, if their next message is still about it (#413). */
+  recapMarker?: string | null;
   /**
    * Option ids currently selected per multi-select question.
    *
@@ -1921,6 +1923,19 @@ export interface InterviewUiState {
    * silence the router forever.
    */
   readingDocumentSince?: string;
+  /**
+   * "The document recap is what they have just read" (#413).
+   *
+   * `say()` sets no `lastPrompt`, so after a document burst the only thing on
+   * record as on screen is the NEXT question the router put under the recap —
+   * `bot_name`, say — and the organizer's reply to the recap was read as the
+   * answer to that. This marks the recap: `recap:doc:<interpretation id>`, and
+   * `recap:doc:<id>:asked` once the router has asked a clarifying question about
+   * it. Alive for the next ONE inbound message (the router clears it the moment
+   * it reads that message), or the next tap on an answer; never a state the
+   * interview resumes from. Lives here, beside `lastPrompt`, not in a column.
+   */
+  recapMarker?: string;
   /**
    * The optional question the interviewer has asked the router to put next.
    *
@@ -2060,6 +2075,7 @@ function parseUiState(raw: unknown): InterviewUiState {
     ...(typeof record.other_pending === "string" ? { otherPending: record.other_pending } : {}),
     ...((suggestions) => (suggestions ? { suggestions } : {}))(parseSuggestions(record.suggestions)),
     ...(typeof record.reading_document_since === "string" ? { readingDocumentSince: record.reading_document_since } : {}),
+    ...(typeof record.recap_marker === "string" && DOCUMENT_RECAP_MARKER.test(record.recap_marker) ? { recapMarker: record.recap_marker } : {}),
   };
 }
 
@@ -2081,6 +2097,7 @@ function serializeUiState(ui: InterviewUiState): string {
     ...(ui.otherPending ? { other_pending: ui.otherPending } : {}),
     ...(ui.suggestions && Object.keys(ui.suggestions).length > 0 ? { suggestions: ui.suggestions } : {}),
     ...(ui.readingDocumentSince ? { reading_document_since: ui.readingDocumentSince } : {}),
+    ...(ui.recapMarker ? { recap_marker: ui.recapMarker } : {}),
   });
 }
 
@@ -3375,6 +3392,7 @@ function buildSessionView(
     language,
     offeredMore: ui.offeredMore === true,
     flightsOwed: flightsOwed(answers, ui),
+    recapMarker: ui.recapMarker ?? null,
     lastPrompt: ui.lastPrompt ?? null,
     phase,
     awaiting,
@@ -4032,6 +4050,31 @@ export async function nominateQuestionForChat(
   }
   await advancePhaseForChat(db, chatId);
   return result;
+}
+
+/** `recap:doc:<interpretation id>` or `recap:doc:<id>:asked` — see `InterviewUiState.recapMarker`. */
+const DOCUMENT_RECAP_MARKER = /^recap:doc:[A-Za-z0-9_-]{1,80}(:asked)?$/;
+
+/** Marks the document recap just sent as what the organizer's next message may be about (#413). */
+export async function markDocumentRecap(db: pg.Pool, chatId: string, marker: string): Promise<void> {
+  if (!DOCUMENT_RECAP_MARKER.test(marker)) return;
+  await updateUiStateForChat(db, chatId, (ui) => ({ ...ui, recapMarker: marker })).catch(() => undefined);
+}
+
+/** The next message was read, or the organizer tapped an answer: the recap is no longer what they are replying to. */
+export async function clearDocumentRecap(db: pg.Pool, chatId: string): Promise<void> {
+  // Most taps and messages carry no marker: look before writing.
+  const marked = await db.query(
+    `SELECT 1 FROM control_plane.intake_sessions
+      WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND expired_at IS NULL AND ui_state ? 'recap_marker'`,
+    [chatId],
+  ).catch(() => null);
+  if (!marked || marked.rowCount === 0) return;
+  await updateUiStateForChat(db, chatId, (ui) => {
+    if (!ui.recapMarker) return ui;
+    const { recapMarker: _done, ...rest } = ui;
+    return rest;
+  }).catch(() => undefined);
 }
 
 /** Records what the router just sent, so it will not send the same thing again. */

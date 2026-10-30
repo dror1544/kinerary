@@ -487,6 +487,9 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     documentCorrect: "If any of that is wrong just tell me and I'll fix it — no rush, later is fine too. Meanwhile, carrying on:",
     /** Places the document means to visit but has not booked. */
     documentPlanned: "Places from the document",
+    // The reply to a message right after the recap that is about the travellers
+    // but names nobody (#413). About travellers - never about the assistant.
+    askOtherTravellers: "Who are the other travellers? Write their names as on the ticket.",
     documentNothing: "I read it, but I couldn't find anything about the trip in it. No harm — I'll just ask.",
     documentNothingNew: "I read it — everything in it matches what I already have, so there's nothing new to add. Carrying on:",
     // A reading the model was unsure of, put to the organizer instead of lost.
@@ -819,6 +822,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     documentRead: "הנה מה שלקחתי מהמסמך:",
     documentCorrect: "אם משהו מזה לא נכון פשוט תגידו לי ואתקן — אין לחץ, גם אחר כך אפשר. בינתיים נמשיך:",
     documentPlanned: "מקומות מהמסמך",
+    askOtherTravellers: "מי הנוסעים האחרים? כתבו את השמות שלהם כפי שהם מופיעים בכרטיס.",
     documentNothing: "קראתי, אבל לא מצאתי שם מידע על הטיול. לא נורא — פשוט אשאל.",
     documentNothingNew: "קראתי — כל מה שבמסמך כבר נמצא אצלי, כך שאין מה להוסיף. ממשיכים:",
     suggestionIntro: "מהמסמך שלכם — זה נכון?",
