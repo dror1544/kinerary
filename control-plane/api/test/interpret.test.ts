@@ -1326,13 +1326,40 @@ describe("an answer below the confidence floor becomes a suggestion", () => {
     assert.deepEqual(data.map((d) => d.name), ["Rome", "Florence"]);
   });
 
-  test("when any part of a structured answer was accepted, the unsure part is not offered beside it", () => {
+  // #412. This used to assert `suggested` was EMPTY: an unsure slice was
+  // dropped whenever a sibling passed, so a second ticket's travellers vanished
+  // beside the first ticket's. The accepted slice still wins what it says; the
+  // unsure slice's NEW entries are offered on top of it, never alone.
+  test("an unsure slice beside a passing one keeps its new entries as suggestions", () => {
     const { accepted, suggested } = applyProposals([
       stop("Rome", "2027-05-01", "2027-05-04", 0.9, "Rome 1 May - 4 May 2027"),
       stop("Florence", "2027-05-04", "2027-05-07", low, "Florence 4 May - 7 May 2027"),
     ], STOPS);
     assert.equal(accepted.length, 1);
+    assert.deepEqual((accepted[0]!.answer as { data: { name: string }[] }).data.map((d) => d.name), ["Rome"], "only the sure slice is written");
+    assert.equal(suggested.length, 1);
+    const offered = suggested[0]?.answer.kind === "structured" ? (suggested[0].answer.data as { name: string }[]) : [];
+    assert.deepEqual(offered.map((d) => d.name), ["Rome", "Florence"], "the offer is the union, so a Yes cannot drop the accepted stop");
+  });
+
+  test("an unsure slice that only repeats the passing one is not offered", () => {
+    const { accepted, suggested } = applyProposals([
+      stop("Rome", "2027-05-01", "2027-05-04", 0.9, "Rome 1 May - 4 May 2027"),
+      stop("Rome", "2027-05-01", "2027-05-04", low, "Rome 1 May - 4 May 2027"),
+    ], STOPS);
+    assert.equal(accepted.length, 1);
     assert.deepEqual(suggested, []);
+  });
+
+  test("an unsure slice beside a passing one that adds nothing to what is held is still offered", () => {
+    const held = { phases: { kind: "structured", schema_version: 3, data: [{ name: "Rome", start: "2027-05-01", end: "2027-05-04" }] } };
+    const { accepted, suggested } = applyProposals([
+      stop("Rome", "2027-05-01", "2027-05-04", 0.9, "Rome 1 May - 4 May 2027"),
+      stop("Florence", "2027-05-04", "2027-05-07", low, "Florence 4 May - 7 May 2027"),
+    ], { ...STOPS, outstanding: [], answered: ["phases"], held });
+    assert.deepEqual(accepted, [], "the sure slice restates what is held");
+    const offered = suggested[0]?.answer.kind === "structured" ? (suggested[0].answer.data as { name: string }[]) : [];
+    assert.deepEqual(offered.map((d) => d.name), ["Rome", "Florence"]);
   });
 });
 

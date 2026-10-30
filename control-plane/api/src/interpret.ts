@@ -970,7 +970,7 @@ export function applyProposals(
    * are merged exactly as accepted parts are; if the merge does not validate,
    * the most confident part alone is tried.
    */
-  const suggestFrom = (parts: readonly ProposedAnswer[]) => {
+  const suggestFrom = (parts: readonly ProposedAnswer[], base?: unknown) => {
     const usable = parts.filter((p) =>
       evidenceAppears(p.evidence, ctx.sourceText)
       && exampleEchoes(questions.find((q) => q.id === p.questionId)?.dataExample, p.value, ctx.sourceText).length === 0);
@@ -987,7 +987,10 @@ export function applyProposals(
       // same shape as #205 reached through a tap). A reading that adds and
       // fills nothing is not worth a question, and is not offered.
       let candidate = original;
-      const heldAnswer = ctx.held?.[original.questionId];
+      // `base` stands in for `held` when a sibling slice of this very question
+      // passed (#412): what is offered is the reading merged into the answer
+      // that sibling just made, so a Yes can never drop the accepted people.
+      const heldAnswer = base ?? ctx.held?.[original.questionId];
       if (original.value.kind === "structured" && isRecord(heldAnswer) && heldAnswer.kind === "structured") {
         const step = reconcileStructured(heldAnswer.data, original.value.data, mergeOptionsFor(original.questionId));
         if (!step.changed) {
@@ -1102,9 +1105,16 @@ export function applyProposals(
         if (refused.reason === "LOW_CONFIDENCE") unsure.push(p);
       } else passing.push(p);
     }
-    // Only when nothing for this question passed: a suggestion never competes
-    // with an answer the gate accepted.
+    // Nothing for this question passed: the unsure readings are the whole offer.
     if (passing.length === 0) return suggestFrom(unsure);
+    // Something passed. An unsure slice used to be dropped here ("a suggestion
+    // never competes with an answer the gate accepted"), and a second ticket's
+    // travellers vanished beside the first ticket's (#412). It still does not
+    // compete: the accepted answer is written as it is, and only the unsure
+    // slices' NEW entries are offered, merged on top of it (`offerBeside`).
+    const offerBeside = (accepted: unknown) => {
+      if (unsure.length > 0) suggestFrom(unsure, { kind: "structured", data: accepted });
+    };
     // Stable, so a tie keeps document order — the same rule as `winner`.
     const ordered = [...passing].sort((a, b) => b.confidence - a.confidence);
     const primary = ordered[0]!;
@@ -1137,6 +1147,8 @@ export function applyProposals(
       for (const a of step.ambiguous) ambiguous.push({ ...a, questionId, proposal: primary });
       if (!step.changed) {
         for (const p of ordered) reject(p, "NO_NEW_INFORMATION");
+        // What passed adds nothing to what is held; the unsure slices may.
+        if (unsure.length > 0) suggestFrom(unsure);
         return;
       }
       combined = step.merged;
@@ -1169,6 +1181,7 @@ export function applyProposals(
         ...(reconciled ? { reconciled } : {}),
         correction: correcting(primary),
       });
+      offerBeside(validated.answer.kind === "structured" ? validated.answer.data : combined);
       return;
     }
     if (reconciled || ordered.length === 1) {
@@ -1185,6 +1198,7 @@ export function applyProposals(
     const alone = validateProposed(primary, questions);
     if (!alone.ok) return reject(primary, alone.reason, alone.detail);
     accepted.push({ questionId, answer: corrected(alone.answer, primary), proposal: primary, correction: correcting(primary) });
+    offerBeside(alone.answer.kind === "structured" ? alone.answer.data : dataOf(primary));
   };
 
   proposals.forEach((proposal, i) => {

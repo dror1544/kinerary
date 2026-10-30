@@ -512,6 +512,15 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     documentUnsure: "I read it and found a few things I'm not sure I read right — I'll check each one with you as we go.",
     /** Beside what was taken, naming what will be checked. */
     documentWillCheck: "Not sure I read these right — I'll check them with you",
+    /**
+     * Another document names people the trip does not hold yet and the reader
+     * was unsure of (#412), asked in the reply itself with Yes / No because
+     * `travelers` is already answered and the router will not ask it again.
+     * `{names}` is the new people only.
+     */
+    documentMoreTravelers: "Another document also names {names} — add them to the travellers?",
+    /** The same message after a No: nothing was added, and said so. */
+    documentMoreTravelersDeclined: "Okay — I left the travellers as they were.",
     // Said only when a day-by-day actually landed. An extraction nobody can
     // see reads as a document that was not understood — the same reason the
     // planned places are listed rather than hidden inside a phase name.
@@ -848,6 +857,8 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     seedUntil: "עד {end}",
     documentUnsure: "קראתי, ומצאתי כמה דברים שאני לא בטוח שקראתי נכון — אבדוק איתכם כל אחד מהם בהמשך.",
     documentWillCheck: "לא בטוח שקראתי נכון — אבדוק איתכם",
+    documentMoreTravelers: "מסמך נוסף מזכיר גם את {names} — להוסיף אותם לנוסעים?",
+    documentMoreTravelersDeclined: "בסדר — השארתי את רשימת הנוסעים כמו שהייתה.",
     documentDays: "הוספתי גם את התוכנית היומית מהמסמך לכל עצירה — תראו אותה באתר של הטיול, ותמיד אפשר לשנות.",
     documentExtractFailed: "קראתי, אבל לא הצלחתי להבין את זה כרגע — זה עליי, לא על הקובץ. אשאל במקום, ואפשר לשלוח שוב מאוחר יותר.",
     documentUnreadable: "לא הצלחתי לקרוא את הקובץ — יכול להיות שזו סריקה או תמונה ולא מסמך טקסט. אפשר לשלוח קובץ אחר אם יש, או שנמשיך ואשאל במקום.",

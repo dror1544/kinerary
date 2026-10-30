@@ -25,6 +25,27 @@ import {
 } from "./interpret.js";
 import type { IntakeQuestion } from "./interview.js";
 
+/**
+ * A `travelers` proposal whose every `name_en` is printed in THIS document: the
+ * names, one per line, as the evidence. Null for anything else — another
+ * question, a text or choice value, an empty list, a traveller with no
+ * `name_en`, or one name the document does not contain (an invented person is
+ * still refused). Each name is checked against its own document only.
+ */
+function printedTravelerNames(proposal: ProposedAnswer, documentText: string): string | null {
+  if (proposal.questionId !== "travelers" || proposal.value.kind !== "structured") return null;
+  const data = proposal.value.data;
+  if (!Array.isArray(data) || data.length === 0) return null;
+  const printed: string[] = [];
+  for (const entry of data) {
+    const nameEn = typeof entry === "object" && entry !== null ? (entry as Record<string, unknown>).name_en : undefined;
+    if (typeof nameEn !== "string" || nameEn.trim().length < 3) return null;
+    printed.push(nameEn.trim());
+  }
+  const evidence = printed.join("\n");
+  return evidenceAppears(evidence, documentText) ? evidence : null;
+}
+
 export interface DocumentReading {
   documentId: string;
   text: string;
@@ -77,7 +98,17 @@ export function gateDocumentProposals(
 
   for (const reading of readings) {
     for (const proposal of reading.payload.proposals) {
-      if (evidenceAppears(proposal.evidence, reading.text)) {
+      const printed = evidenceAppears(proposal.evidence, reading.text) ? null : printedTravelerNames(proposal, reading.text);
+      if (printed) {
+        // The model quoted the interview's script (Hebrew) for names the ticket
+        // printed in Latin letters, so its quote is not in the file — but every
+        // name_en IS, as printed (#412). The proof is rebuilt from the file
+        // itself: those printed names become the evidence, which is also what
+        // the later whole-burst check will look for. The same proposal object
+        // is kept (provenance is traced by its identity).
+        proposal.evidence = printed;
+      }
+      if (printed || evidenceAppears(proposal.evidence, reading.text)) {
         surviving.push(proposal);
         owner.set(proposal, reading.documentId);
       } else {
