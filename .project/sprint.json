@@ -1,16 +1,16 @@
 {
   "format": 1,
-  "updated_at": "2026-10-18T18:28:15Z",
-  "updated_by": "Dror (recorded by Claude, branch-cleanup session)",
+  "updated_at": "2026-10-30T10:24:53Z",
+  "updated_by": "Dror (recorded by Claude, sprint-planning session)",
   "sprint": {
-    "id": "6",
-    "title": "Verification, explicit activation, dashboard, and demo rehearsal",
-    "integration_branch": "main",
+    "id": "8",
+    "title": "Hardening (short sprint)",
+    "integration_branch": "integration/sprint-8",
     "target_branch": "main",
-    "milestone": "Sprint 6",
+    "milestone": "Sprint 8",
     "scope": {
-      "plan": "docs/onboarding-mvp-sprint-plan.md#sprint-6--verification-explicit-activation-dashboard-and-demo-rehearsal",
-      "tracks": "docs/sprint6-tracks.md (arrives with PR #111)",
+      "plan": "docs/onboarding-mvp-sprint-plan.md#sprint-8--hardening-short-sprint-2026-10-30--about-2026-11-06",
+      "specs": "docs/specs/sprint-8/",
       "team": "docs/agent-team-plan.md"
     }
   },
@@ -84,6 +84,12 @@
       "by": "Dror (recorded by Claude, branch-cleanup session)",
       "change": "set-sprint 6 on integration/sprint-6 -> 6 on main",
       "reason": "integration/sprint-6 and integration/sprint-6-into-main are both merged into main (0 commits ahead on either) and have been deleted; Sprint 6's work now lives on main directly, so the sprint record should point there too"
+    },
+    {
+      "at": "2026-10-30T10:24:53Z",
+      "by": "Dror (recorded by Claude, sprint-planning session)",
+      "change": "set-sprint 6 on main -> 8 on integration/sprint-8",
+      "reason": "Dror, 2026-10-30: Sprint 7 closed as shipped (released 41965f7 on 2026-10-27); Sprint 8 is a one-week hardening sprint on integration/sprint-8, cut from main at 4510301 and merged to main every 2-3 days"
     }
   ]
 }
