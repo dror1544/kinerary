@@ -62,10 +62,11 @@ We do not sell personal data. We do not use it for advertising.
 ## 5. Legal bases
 
 - **Contract**: to provide the service you asked for (account, trip site, companion).
-- **Legitimate interests**: security, preventing abuse, fixing faults and improving the product. We weigh
-  these against your rights.
+- **Legitimate interests**: security, preventing abuse, fixing faults and improving the product, including,
+  during early access, reading trip data as section 7 describes (you can turn that off). We weigh these
+  against your rights.
 - **Consent**: where we ask for it, for example health-related needs, which the organizer provides on a
-  traveller's behalf, and the evaluation reading in section 7. You can withdraw consent at any time.
+  traveller's behalf. You can withdraw consent at any time.
 - **Legal obligation**: where the law requires us to keep or disclose data.
 
 Under the Israeli Privacy Protection Law, 5741-1981, and its regulations, you have the right to see the
@@ -84,15 +85,15 @@ gives you the rights in section 10.
 
 ## 7. Reading trip data to improve Kinerary
 
-Families in our early-access programme agreed that we may read their trip data and conversations to evaluate
-and improve Kinerary. We read it; we do not change it except at the organizer's request. They can withdraw
-this at any time by writing to us.
+While Kinerary is in early access, we read trip data and conversations to evaluate and improve the product.
+We read it; we do not change it except at the organizer's request.
 
-New organizers will be asked at sign-up, as a separate choice that is off by default. Until that choice is
-live, we do not read a new organizer's trip for evaluation unless they agree by message.
+This is on by default during early access. An organizer can turn it off at any time by writing to
+privacy@ara-united.store; a notice and a switch at sign-up, and in the account settings, are coming. Once it is
+off, we look at that organizer's trips only to provide the service, keep it secure, fix a fault, or when the
+law requires it.
 
-Otherwise we look at trip data only to provide the service, keep it secure, fix a fault, or when the law
-requires it.
+When early access ends, we will ask organizers again before continuing.
 
 ## 8. Retention, trip end and archives
 
