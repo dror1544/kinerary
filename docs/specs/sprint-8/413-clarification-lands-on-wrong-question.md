@@ -1,6 +1,6 @@
 # A clarification about a document does not land on the question on screen
 
-Status: draft, refreshed against 4510301 (2026-10-30) · Issue: #413 · Track: T1 · Size: M · Tier: Normal
+Status: approved 2026-10-30 by Dror (decisions above) · refreshed against 4510301 · Issue: #413 · Track: T1 · Size: M · Tier: Normal
 Security path: no · Migration: no · Live-trip behaviour: yes (the interview, for new trips)
 
 > **Sprint 8 (2026-10-30): in scope.**
@@ -153,21 +153,22 @@ part of a release). No live trip site is affected; only interviews started
 after the restart. **Per-PR regression plan: needed** (router behaviour in a
 live interview).
 
+## Decisions (Dror, 2026-10-30)
+
+1. **Its own bug, not #114's family**: a missing on-screen state after a
+   document recap, not an unprompted fact. It stays in T1 and links #114.
+2. **Keep the closed people-word list (AC-5)** as the second line of defence
+   behind the recap marker (AC-1), as the spec has it. It does not block a
+   name: a deliberate "Family" below the floor becomes a confirm, not a
+   refusal.
+3. **Reuse `summaryOnScreen` for the turn after a document recap, scoped to
+   `travelers`, `phases` and `travel_anchors`** (the spec's preference), not a
+   parallel `afterDocumentRecap` prompt section and not every answered
+   question.
+
 ## Open questions
+
+None open.
 
 Size: unchanged (M). Reusing the `summaryOnScreen` path may make the interpret
 half smaller, but the relay marker and DB tests are as drafted.
-
-
-1. Is this the same bug family as #114 (Track 2) or its own? The trace says it
-   is its own: a missing on-screen state after a document recap, not an
-   unprompted fact. This spec keeps it in T1 and links #114.
-2. Should the closed people-word list (AC-5) exist at all, or is the recap
-   marker (AC-1) enough? The list is a second line of defence. It could
-   wrongly block an assistant someone deliberately names "Family".
-3. (new) Reuse `summaryOnScreen` for the turn after a document recap (the
-   reader sees the recap's questions as "answered already or not"), or keep a
-   separate `afterDocumentRecap` flag limited to travelers/phases/
-   travel_anchors? The spec now prefers reuse, scoped to those three ids; the
-   wider option (every answered question) is simpler but invites more
-   misreadings of a plain answer to the on-screen question (AC-3).

@@ -1,12 +1,13 @@
 # Each flight reservation carries its own travellers and ticket
 
-Status: draft, refreshed against 4510301 (2026-10-30) · Issue: #414 · Track: T1 · Size: M · Tier: Normal
+Status: approved 2026-10-30 by Dror (decisions above) · refreshed against 4510301 · Issue: #414 · Track: T1 · Size: M · Tier: Normal
 Security path: no · Migration: no (site column exists) · Live-trip behaviour: yes (newly built and rebuilt trips)
 
 > **Sprint 8 (2026-10-30): in scope.**
 
-Related: #412 (extraction; separate cause). #415 decides the Journey side, and
-uses the same per-booking travellers this spec adds.
+Related: #412 (extraction; separate cause). #415 (decided 2026-10-30: one
+Journey line per physical flight) lists the same per-booking travellers this
+spec adds, so this item is built first or together with it.
 
 ## Problem
 
@@ -76,7 +77,10 @@ travellers (as printed), its own confirmation and its own ticket PDF.
 - AC-5 Given two flight anchors each sourced from its own document, then each
   row's `conf_file` is its own document. A confirmation stripped by
   `withoutFlightNumbersAsConfirmations` still links (the key is recorded after
-  sanitizing, or the match ignores a stripped field).
+  sanitizing, or the match ignores a stripped field). This holds also for two
+  **confirmation-less** same-flight anchors whose `passengers` differ:
+  `entryIdentity` includes `passengers` when present (Decisions, 2), so each
+  links its own PDF.
 - AC-6 Given the built site seeded from AC-4's `bookings.json`, then
   `GET /api/bookings` returns both rows with their passengers and `conf_file`,
   and the Modern Reservations list renders each row's names (`App.tsx:1554`).
@@ -89,7 +93,9 @@ travellers (as printed), its own confirmation and its own ticket PDF.
 - `control-plane/api/src/interview.ts` (`travel_anchors.dataExample` `:775`,
   sanitize `:1215-1235`, link key `:57-60`); `interpret.ts` (`:1895-1926`);
   `answer-merge.ts` `matchEntry` (`:266-306`), `entryIdentity` (`:245-254`): `passengers` disagreeing with
-  no references on either side is "different bookings" for segment types.
+  no references on either side is "different bookings" for segment types, and
+  `entryIdentity` joins non-empty `passengers` to a confirmation-less
+  segment's key (the upload link key, `interview.ts:57-60`).
 - `control-plane/worker/control_plane_worker/transformer.py` `derive_bookings`
   (`:2799-2921`): `passengers`; identity `(type, name, date, confirmation)` plus
   `passengers` **only when non-empty** (AC-7).
@@ -128,6 +134,8 @@ Write first:
   - `test_an_anchor_without_passengers_keeps_its_seed_key` (AC-7)
 - `control-plane/worker/tests/test_document_handoff.py`:
   `test_each_of_two_same_flight_anchors_links_its_own_ticket` (AC-5).
+- `control-plane/api/test/answer-merge.test.ts`:
+  `a confirmation-less segment's identity includes its passengers` (AC-5).
 - `tests/server.test.js`: `seeded passengers are served on the booking` (AC-6).
 
 Suites: `control-plane/api` (unit plus DB where noted), worker
@@ -140,15 +148,17 @@ The relay restart carries the extraction change; the worker restart carries
 (AC-7). **Per-PR regression plan: needed** (`seed_key` derivation is
 re-provision-sensitive; AC-7 is the guard).
 
+## Decisions (Dror, 2026-10-30)
+
+1. **A ticket that prints passengers but no PNR: two same-flight entries are
+   two bookings** (this spec's position, AC-3), not one booking needing a
+   question.
+2. **`passengers` joins `entryIdentity` for a confirmation-less segment** (the
+   spec's assumption), so two confirmation-less same-flight entries each link
+   their own PDF; AC-5 is not limited to tickets with a PNR.
+
 ## Open questions
 
+None open.
+
 Size: unchanged (M). Nothing in scope was built on main.
-
-
-1. When a ticket prints passengers but no PNR (rare), are two same-flight
-   entries two bookings (this spec) or one booking needing a question?
-2. (new) `entryIdentity` keys a confirmation-less segment by type, name and
-   date only (`answer-merge.ts:252`), and that key is what links a ticket to
-   its anchor (AC-5). Should `passengers` join that key too (so two
-   confirmation-less same-flight entries each link their own PDF), or is AC-5
-   satisfied only for tickets with a PNR? The spec assumes the former.

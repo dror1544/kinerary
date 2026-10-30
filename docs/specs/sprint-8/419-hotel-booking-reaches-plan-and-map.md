@@ -1,6 +1,6 @@
 # A hotel booking added in chat reaches Plan and Map
 
-Status: draft, refreshed against 4510301 (2026-10-30) · Issue: #419 · Track: T1 · Size: M · Tier: Normal
+Status: approved 2026-10-30 by Dror (decisions above) · refreshed against 4510301 · Issue: #419 · Track: T1 · Size: M · Tier: Normal
 Security path: no (organizer-only stop routes are reused, not changed) · Migration: no · Live-trip behaviour: yes
 
 > **Sprint 8 (2026-10-30): in scope.**
@@ -59,7 +59,7 @@ What the code does today:
   `templates/config.overlay.yaml.tpl` and `test_template.py` fails if SOUL
   outgrows it — so on any companion rendered from 4510301 on, the whole
   section is in the prompt. Whether `france-2026`'s companion ran on a
-  window small enough to drop it on 2026-10-18 is not known (open question 4).
+  window small enough to drop it on 2026-10-18 is not known (open question 3).
 - `france-2026` was built from `81cafd3`, so the tool and the instructions were
   present at render time. "Not refreshed" is unlikely. What remains is either a
   group-chat message (link refused by design) or a model miss.
@@ -94,8 +94,9 @@ stop. The hotel is never silently left off.
 - AC-2 Given an approved hotel booking whose phase is a real stop and which no
   stop is set from, when an organizer loads the site, then `GET /api/stops`
   reports it under that stop as `unlinked_hotel_booking` (id, name, dates), and
-  the Modern Stops editor offers "use this hotel for <stop>", which calls
-  `from-booking`. A member (non-organizer) token gets 403 on `GET /api/stops`
+  the Modern Stops editor shows it to the organizer as "not on the plan yet"
+  with a one-tap **link to stop** ("use this hotel for <stop>"), which calls
+  `from-booking`. Nothing links it without that tap. A member (non-organizer) token gets 403 on `GET /api/stops`
   as today (the existing auth-matrix test), so the field never reaches one.
 - AC-3 Given the rendered companion profile, when SOUL and the operations skill
   are read, then the hotel procedure lists `set_stop_from_booking` as a required
@@ -133,7 +134,9 @@ stop. The hotel is never silently left off.
 
 ## Non-goals
 
-- The server auto-linking a booking to a stop on create. This is open question 1.
+- The server auto-linking a booking to a stop on create. Decided against
+  (Dror, 2026-10-30): today's rule stands, a booking alone never moves a stop
+  (`FRAMEWORK.md:200`, the #362 decision).
 - Geocoding a hotel to get a pin (`hotel-place.js` is unchanged).
 - Writing stop edits back to the control-plane intake (PR #362 gap (a)).
 
@@ -168,11 +171,28 @@ A fourth layer: the assistant-events plugin reaches a companion only when it is 
 
 Live trips on the VM carry PR #362 only once the sprint-6 release is on the VM. Until then the instructions refer to tools those trips lack, so no live trip should get the profile refresh before its bridge has the tools. A **per-PR regression plan is needed** (live-trip behaviour; companion instructions).
 
+## Decisions (Dror, 2026-10-30)
+
+1. **No server auto-link; today's rule stands** — a booking alone never moves
+   a stop. The fix is two-sided instead: the companion **always** calls
+   `set_stop_from_booking` after `add_booking` for a hotel in the organizer's
+   own chat (AC-3, AC-5), and the site shows the organizer any unlinked hotel
+   booking with a one-tap "link to stop" (AC-2). A hotel from the group or a
+   member is recorded and left for that tap.
+
 ## Open questions
 
-1. Should the server link a hotel booking to its stop by itself, instead of relying on the model? For example: when the booking's phase is a stop with no hotel and the dates fit, or always, with an undo. This would make AC-3 and AC-5 belt-and-braces rather than the fix. Today's rule (`FRAMEWORK.md:200`) is "a booking alone never changes a stop", and that rule was a #362 decision.
-2. Which live trips get the redeploy plus the bridge and profile refresh for the PR #362 layer? This is Q3 in `docs/sprint6-tracks.md`, still unanswered.
-3. Was the 2026-10-18 hotel sent in the group or in the organizer's DM? If you know, it decides whether the group case (AC-2) or the model miss (AC-3, AC-5) is the main fix.
-4. (New, from #481.) Which model answered on `france-2026` on 2026-10-18 — the Codex primary or a fallback / `/model` choice with a smaller window? If SOUL's middle was dropped, the miss may already be fixed by #481 plus a profile refresh, and AC-5's model runs should be on a refreshed profile before deciding AC-3's wording change is needed.
+1. (Open — no recommendation in the spec; not decided.) Which live trips get
+   the redeploy plus the bridge and profile refresh for the PR #362 layer?
+   This is Q3 in `docs/sprint6-tracks.md`, still unanswered. A rollout
+   decision for the regression plan; no AC depends on it.
+2. (Open — factual, to be checked during build.) Was the 2026-10-18 hotel sent
+   in the group or in the organizer's DM? No AC depends on it: decision 1
+   keeps both the group case (AC-2) and the DM case (AC-3, AC-5).
+3. (Open — factual, to be checked during build.) Which model answered on
+   `france-2026` on 2026-10-18 — the Codex primary or a fallback / `/model`
+   choice with a smaller window (#481's cut middle)? No AC's wording depends
+   on it (decision 1 fixes AC-3's wording); AC-5's model runs are made on a
+   profile rendered with #481's overlay either way.
 
 Size: unchanged (M). AC-4 grows by one tool and one mirrored file; AC-6 is already met.

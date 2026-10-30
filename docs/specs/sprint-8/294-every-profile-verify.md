@@ -1,9 +1,9 @@
 # Verify every gateway's tools and every bridge's health, against a baseline
 
-Status: draft, refreshed against 4510301 (2026-10-30) · Issue: #294, #289 · Track: T2 · Size: M (L if Open question 3 pulls #420's remainder in) · Tier: Normal
+Status: approved 2026-10-30 by Dror (decisions above) · refreshed against 4510301 · Issue: #294, #289, #420 · Track: T2 · Size: L · Tier: Normal
 Security path: no (none of the three named invariants; reads each bridge's MCP key, see notes) · Migration: no · Live-trip behaviour: no
 
-> **Sprint 8 (2026-10-30): in scope.**
+> **Sprint 8 (2026-10-30): in scope, built together with the remainder of #420** (Dror, 2026-10-30): the upgrade restarts every gateway, discovered rather than hard-coded (spec `420-switch-restarts-every-gateway.md`), and verify checks each one (this spec). One item, size L.
 
 ## Problem
 
@@ -34,9 +34,9 @@ Security path: no (none of the three named invariants; reads each bridge's MCP k
 - `199038a` (#420, trip-intake half): the switch restarts the trip-intake
   gateway and waits up to 60 s for a new registration line (see above). The
   rest of spec `420-switch-restarts-every-gateway.md` — restarting every other
-  gateway, `running_gateways()` — is **unscheduled**, not in Sprint 8 (its own
-  tag line). `running_gateways()` does not exist on main. This spec previously
-  assumed it shipped together with 420; see Open question 3.
+  gateway, `running_gateways()` — was unscheduled until 2026-10-30, when Dror
+  pulled it into Sprint 8 with this item (Decisions, 3). `running_gateways()`
+  does not exist on main yet; it is built in the same item, from spec 420.
 - `199038a` (#288): `live_companions()` (`:1483-1518`) skips `retired-` slugs.
 - #349/#461 (gateway reconciler, in #478): `live_companions()` also skips a
   **dormant** companion — one the reconciler stopped on purpose and the host
@@ -73,23 +73,26 @@ Standalone `kinerary-cp-release verify` with no baseline reports all failures as
 
 **Per-gateway tool checks.** For each expected profile — `trip-intake` plus
 `live_companions()` (which already excludes retired and dormant companions) —
-and, if #420's remainder has landed, each profile from its `running_gateways()`:
+and each profile from #420's `running_gateways()`, built in this item:
 
 - MCP server names come from the profile's `config.yaml` `mcp_servers` keys.
-- For a gateway **the switch restarted** (trip-intake always, since
-  `199038a`; every gateway when Hermes itself was restarted), the registration
-  line must be **newer than the restart**: the tool keeps the line count it
-  read before `s6-svc -r` (`restart_trip_intake_gateway` already reads it,
-  `count_interview_registrations`, but discards it after waiting) and verify
-  reads only lines after it (the pattern `companion-install-host.sh` uses,
+- Every gateway **the switch restarted** — with #420's remainder that is
+  every running gateway: one `s6-svc -r` each, or all of them at once when
+  Hermes itself was recreated — must show a registration line **newer than
+  the restart**: `restart_gateways()` keeps, per profile, the line count it
+  read before the restart (generalising `restart_trip_intake_gateway`, which
+  reads it with `count_interview_registrations` but discards it after
+  waiting), and verify reads only lines after it (the pattern `companion-install-host.sh` uses,
   `LOG_FROM`, `:1188`). No fresh line within the wait (default 60 s) is
   `tools:<p>:<server>` fail `NOT_REGISTERED`.
-- For a gateway the switch did **not** restart while it recreated a server that
-  gateway uses (`companion-mcp` → `trip-control`), its newest registration
-  predates the switch, and per #420's Problem it does not re-establish the
-  connection. Until #420's remainder lands this is reported as
-  `tools:<p>:<server>` fail `STALE_REGISTRATION` — a real problem the switch
-  caused. How it counts is Open question 3.
+- A gateway the switch **should have restarted and did not** — its
+  `s6-svc -r` failed (#420 AC-5) — while the switch recreated a server that
+  gateway uses (`companion-mcp` → `trip-control`) still holds a registration
+  older than the switch, and per #420's Problem it does not re-establish the
+  connection. It is `tools:<p>:<server>` fail `STALE_REGISTRATION`, a
+  switch-owned class: always caused. When discovery could not read the
+  supervisor at all (#420 AC-8), that is its own failing check,
+  `gateways:discovery` `SUPERVISOR_UNREADABLE`, also switch-owned.
 - Expected tool sets, where the server's source is a container the switch just
   replaced: `interview` → `extract_agent_tools(interview-mcp.ts)` (existing,
   `:418`);
@@ -119,7 +122,9 @@ key read `:902`): `ok`, `HTTP_<n>`,
   with `HTTP_401` and the report names `restart-bridges` as the repair.
 - AC-4 Given a bridge whose `/health` answers 404 `Cannot GET /health`, when
   verify runs, then the code is `NO_HEALTH_ROUTE` and the report says "cannot be
-  verified", distinct from a failure.
+  verified", distinct from a failure. In an upgrade it fails as caused only if
+  the same bridge passed in the baseline; otherwise it is listed and does not
+  fail the upgrade.
 - AC-5 Given a baseline in which `bridge:japan` failed `HTTP_401`, and the same
   after the switch, when the upgrade's verify classifies, then it is
   pre-existing, the history row result is `ok`, `install_tool_files` and
@@ -148,6 +153,17 @@ key read `:902`): `ok`, `HTTP_<n>`,
 - AC-12 Given the web profile on and the portal's proxy check failing in both
   the baseline and after the switch, then it is caused (switch-owned class),
   as for AC-7.
+- AC-13 Given #420's `restart_gateways()` restarted `trip-intake`, `trip-a` and
+  `trip-monitor`, each with its own pre-restart line count, when verify runs,
+  then each of the three gets its own `tools:` checks read only from lines
+  after its own count — no profile name is hard-coded in the check list.
+- AC-14 Given `trip-a`'s `s6-svc -r` failed (#420 AC-5) and its newest
+  `trip-control` registration predates the switch, when verify runs, then
+  `tools:trip-a:trip-control` fails `STALE_REGISTRATION` and is classified
+  caused, even if the same check failed in the baseline.
+- AC-15 Given #420's discovery could not read the Hermes supervisor (#420
+  AC-8), when verify runs, then `gateways:discovery` fails
+  `SUPERVISOR_UNREADABLE` as caused, never "no gateways, nothing to check".
 
 ## Contracts
 
@@ -164,8 +180,11 @@ key read `:902`): `ok`, `HTTP_<n>`,
 - `HISTORY_FIELDS` (`:498`) gains `baseline`; `read_history` (`:506`)
   tolerates its absence.
 - Gate (`parse_gate`, `:623`): `verify` stays argument-free for the agent.
-- `restart_trip_intake_gateway` (`:1428`) keeps its pre-restart line count on
-  the instance for verify, instead of a separate offset mechanism.
+- `restart_trip_intake_gateway` (`:1428`) is generalised by #420 into
+  `restart_gateways()`, which keeps each profile's pre-restart line count on
+  the instance for verify, instead of a separate offset mechanism. The
+  restart itself, its order and its discovery are spec 420's contracts; this
+  spec owns only what verify reads from them.
 - `docs/control-plane-vm-deployment.md` step 5 — doc-keeper.
 
 ## Non-goals
@@ -187,7 +206,7 @@ forge a second line.
 
 Written first, in `tests/scripts/test_vm_release.py`: `ProfileToolChecks`
 (temp `HERMES_DATA` with `config.yaml` + `agent.log` fixtures, offsets): AC-1,
-AC-2; `BridgeHealth` (a loopback `HTTPServer` answering each body shape, as the
+AC-2, AC-13, AC-14, AC-15; `BridgeHealth` (a loopback `HTTPServer` answering each body shape, as the
 rehearsal's readyz server does): AC-3, AC-4, AC-9 (assert recorded argv);
 `BaselineClassification` (pure function on two check lists): AC-5 to AC-8;
 `HistoryCompat`: AC-10. Rehearsal: `test_a_preexisting_bridge_failure_does_not_fail_the_upgrade`.
@@ -195,28 +214,38 @@ Local preflight runs them; CI does not.
 
 ## Rollout and regression
 
-No trip feels this; it changes what the operator is told. It ships with
-`420-…` (verify needs the restart offsets) and is run, like it, from the target's
-own tool file on the first upgrade. Since #420's remainder is unscheduled, it
-no longer "ships with 420": see Open question 3. Assessment: not needed beyond the T2
-regression plan (no live-trip behaviour; the tool's verdict changes).
+This half changes what the operator is told; no trip feels it. It ships in
+one item with `420-…` (Dror, 2026-10-30: verify needs the restart offsets,
+and the restart without the check would hide its own failures), and is run,
+like it, from the target's own tool file on the first upgrade. The 420 half
+does change live-trip behaviour during upgrades (every companion restarts),
+so the item as a whole needs the regression plan spec 420 names (one
+rehearsal run plus one Mac-staging pass).
+
+## Decisions (Dror, 2026-10-30)
+
+1. **A pre-existing failure whose code changed is caused** — the safe reading,
+   as specified (AC-6).
+2. **`NO_HEALTH_ROUTE` fails as caused only if it passed in the baseline**
+   (the spec's recommendation; AC-4).
+3. **Option (a): #420's remainder is pulled into Sprint 8 with this item**
+   (size L). The upgrade restarts every gateway, discovered and not
+   hard-coded, and verify checks each one (AC-13 to AC-15). With every gateway
+   restarted, `STALE_REGISTRATION` remains only for a gateway whose restart
+   failed (AC-14), not for every code-only upgrade. Cross-link: spec
+   `420-switch-restarts-every-gateway.md`.
 
 ## Open questions
 
-1. A pre-existing failure whose **code changed** — caused (as specified, the
-   safe reading) or pre-existing?
-2. `NO_HEALTH_ROUTE` — pass with a note (bridge predates #127), or fail? Today
-   no VM bridge should lack it; recommendation: fail as caused only if it passed
-   in the baseline.
-3. (New, 2026-10-30) #420's every-gateway restart is unscheduled. Without it,
-   every switch that recreates `companion-mcp` but not Hermes leaves each
-   companion's `trip-control` registration stale, and this spec's verify would
-   correctly fail every such upgrade. Choose: (a) pull #420's remainder into
-   Sprint 8 with this item (size → L); (b) report `STALE_REGISTRATION` as a
-   caused failure anyway (honest, but every code-only upgrade goes red); or
-   (c) report it as a named, non-failing "not re-registered — #420" note until
-   #420 lands. Recommendation: (a), or (b) if the restart is to stay manual.
-4. (New) The #349 reconciler can start or stop a gateway between the baseline
-   and the post-switch verify. A gateway it starts appears only "after", so a
-   failing check on it reads as caused. Accept that (it is new and failing), or
-   take the expected set once, at baseline time, and check only that set?
+1. (Open — factual, to be checked during build.) Can the #349 reconciler start
+   or stop a gateway between the baseline and the post-switch verify? Read on
+   4510301: `cmd_upgrade`, `cmd_rollback` and `cmd_restart_bridges` all run
+   under `@holds_gateway_lock` (`GatewayLock`, `vm-release.py:1666`), the same
+   advisory lock every reconciler sweep takes and skips on when held, so a new
+   sweep cannot act during the release. The one window left is a host action
+   the reconciler had already dispatched when the release took the lock (the
+   sweep releases the lock around host calls, `gateway_reconcile.py:74-79`).
+   If that window is real, choose whether a gateway it starts mid-release is
+   checked ("new and failing reads as caused") or the expected set is taken
+   once at baseline time. No AC depends on the answer: AC-11 covers dormant
+   companions only.

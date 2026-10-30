@@ -1895,32 +1895,52 @@ merges, through the normal gates and with Dror's approval each time (hard rule
 `Spec:` and "Done when" is the spec's acceptance criteria; the verifier reports
 criterion by criterion (`docs/specs/README.md`).
 
-**Scope** (each with its spec):
+**Specs approved by Dror, 2026-10-30.** The twelve Sprint 8 specs (#419, #418,
+#382, #412, #414, #413, #387, #294, #380, #415, and the stretch #383, #417) and
+`420-switch-restarts-every-gateway.md` are approved, each with a "Decisions
+(Dror, 2026-10-30)" section; where a spec had a recommendation it was adopted,
+and factual questions are left open "to be checked during build", each naming
+the acceptance criteria that depend on it. #438 and #484 are new drafts, not
+yet approved; #484 is blocked on three product questions.
+
+**Scope** (each with its spec; build order top to bottom, item 0 first):
 
 | # | Item | Spec | Size |
 |---|---|---|---|
+| 0 | #438 a trip created on the dashboard seeds the interview: greets the organizer by name, opens with the destination and dates already chosen, never re-asks them (**prioritised — first in the build order**; added 2026-10-30) | `438-dashboard-trip-seeds-interview.md` (draft) | M |
 | 1 | #419 a hotel added in chat reaches Plan and Map (must-fix) | `419-hotel-booking-reaches-plan-and-map.md` | M |
 | 2 | #418 no private follow-up promise in groups (must-fix) | `418-no-private-follow-up-promise-in-groups.md` | S |
-| 3 | #382 a corrected booking or plan item reaches the live site | `382-corrected-booking-reaches-site.md` | M |
+| 3 | #382 a corrected booking or plan item reaches the live site | `382-corrected-booking-reaches-site.md` | L |
 | 4 | #412 + #414 a second ticket's traveller names, extracted and shown | `412-…`, `414-…` | M |
 | 5 | #413 a clarification lands on the question it answers | `413-clarification-lands-on-wrong-question.md` | M |
-| 6 | #387 provisioning lock order (a built site recorded as failed) | `387-provision-lock-order.md` | S |
-| 7 | #294 + #289 upgrade verify: bridges answer `/health`, pre-existing failures told apart | `294-every-profile-verify.md` | M |
+| 6 | #387 provisioning lock order (a built site recorded as failed), with `correctIntake`'s deadlock folded in as AC-8 | `387-provision-lock-order.md` | M |
+| 7 | #294 + #289 + the rest of #420: the upgrade restarts every gateway (discovered, not hard-coded) and verify checks each one; bridges answer `/health`; pre-existing failures told apart | `294-every-profile-verify.md`, `420-switch-restarts-every-gateway.md` | L |
 | 8 | #380 the relay's Hermes mirror is pinned by a fixture (Hermes-bump prerequisite) | `380-hermes-mirror-fixture.md` | M |
+| 9 | #484 flexible planning dates: month and year until execution needs exact days (added 2026-10-30) — after the hardening items, sequenced after #382/#383; **blocked on three product questions** | `484-flexible-planning-dates.md` (draft) | L |
 
-Decision first: **#415** (one Journey line or two for a flight booked twice)
-shapes how #414 renders; it is decided before item 4 is built.
+**#415 decided** (Dror, 2026-10-30): one Journey line per physical flight,
+listing both bookings and their travellers, shown to members too; Reservations
+still shows two entries. It builds on #414's per-booking travellers, so it is
+built with or after item 4.
+
+**Capacity.** With #438, #420 and #484 added, the sprint is larger than the
+original one-week target; #484 is the first to slip.
+
 Stretch, only if the above is done: #383 (ordering guard), #417 (documents in
 Telegram's in-app browser).
 
 **Not this sprint** (specs kept in `docs/specs/sprint-8/`, unscheduled): one
 origin for trips (to be re-specced: the organizer web release already put a
-portal and a runtime gateway on their own hosts), the rest of #420 (every
-gateway restarted), retry-then-rollback, #127, the Hermes bump (#189 and #349's
-remaining part), #323 and the process close-out. Also out: the post-trip debrief
-(backlog, below), CA-02..CA-08, the k3s migration.
+portal and a runtime gateway on their own hosts), retry-then-rollback, #127,
+the Hermes bump (#189 and #349's remaining part), #323 and the process
+close-out. Also out: the post-trip debrief (backlog, below), CA-02..CA-08, the
+k3s migration; the rest of the **dashboard-first trip creation** direction
+(Dror, 2026-10-30: destination check and seasonal attractions #485, livelier
+suggestions #486, join and switch links from the dashboard #487; notes folder
+`specs/2026-10-30-dashboard-first-trip-creation.md` — only its step 1, #438, is
+in this sprint); and **WhatsApp**, which is a separate session's work.
 
-**Exit gate:** the eight items' specs are marked verified (or deferred by Dror
+**Exit gate:** items 0–9's specs are marked verified (or deferred by Dror
 in writing), `integration/sprint-8` is merged to `main` with green CI and a green
 nightly, and a regression plan exists for whatever reaches the VM.
 

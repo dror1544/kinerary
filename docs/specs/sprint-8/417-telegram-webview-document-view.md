@@ -1,6 +1,6 @@
 # Viewing a document inside Telegram's in-app browser
 
-Status: draft, refreshed against 4510301 (2026-10-30) · Issue: #417 · Track: T5 · Size: M · Tier: High
+Status: approved 2026-10-30 by Dror (decisions above) · refreshed against 4510301 · Issue: #417 · Track: T5 · Size: M · Tier: High
 Security path: yes (`server/server.js` document routes — a new credential in a URL; auth scoping) · Migration: no · Live-trip behaviour: yes (trips built or rebuilt after the release)
 
 > **Sprint 8 (2026-10-30): stretch** — only if the in-scope items are done.
@@ -179,7 +179,7 @@ cookie and lands on the portal's sign-in instead.
 ## Non-goals
 
 - Rendering PDFs in-page (pdf.js) — a larger change, only if AC-6 shows Android
-  Telegram cannot open the signed link at all (open question 2).
+  Telegram cannot open the signed link at all (Decisions, 2).
 - Detecting Telegram from the user agent — unreliable on iOS, and not needed
   once nothing depends on popups.
 - Apple Wallet passes inside embedded browsers (host must support PassKit).
@@ -237,20 +237,20 @@ containing it — existing live trips keep the current behaviour until redeploye
 needed (security path in `server/server.js`); small blast radius — document
 view/download only.
 
+## Decisions (Dror, 2026-10-30)
+
+1. **View is same-tab everywhere**, desktop included (the spec's proposal; no
+   "is desktop" test, which is what failed here). AC-4.
+2. **The Android fallback is "attachment" (the system download)**; in-page
+   rendering (pdf.js) only if AC-6 shows Android Telegram cannot open the
+   signed link at all (the spec's non-goal stance).
+3. **TTL 120 s** — it has to cover only the start of the request, not the
+   transfer (the spec's value). AC-1.
+4. **Always mint, under the runtime gateway too** — one code path to test
+   (the spec's proposal). AC-4, AC-5.
+5. **Both access paths are required for acceptance**: a trip's own hostname
+   and the runtime gateway (portal / Mini App), as AC-6 lists them.
+
 ## Open questions
 
-1. Desktop behaviour: same-tab for view everywhere (simplest, proposed), or keep
-   a new tab on desktop browsers only? A new tab needs a reliable "is desktop"
-   test, which is what failed here.
-2. If Android Telegram does nothing with an inline PDF link, is the fallback
-   "attachment" (system download) acceptable, or is in-page rendering wanted?
-3. TTL 120 s — enough for a slow mobile network with a 50 MB PDF? (The TTL only
-   has to cover the start of the request, not the transfer.)
-4. (New, 2026-10-30) Under the runtime gateway the cookie already
-   authenticates a plain link. Should the client skip the mint there (two code
-   paths, no signature on the shared origin), or always mint (one code path,
-   the signature redundant on the gateway)? Proposed: always mint, for one
-   path to test.
-5. (New) Which access path matters for acceptance? Families on a live trip
-   reach it by its own hostname. Organizers now arrive through the portal or
-   Mini App, via the gateway. AC-6 lists both; confirm both are required.
+None open.

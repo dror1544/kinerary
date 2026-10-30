@@ -1,6 +1,6 @@
 # A second ticket's travellers are read, not dropped
 
-Status: draft, refreshed against 4510301 (2026-10-30) · Issue: #412 · Track: T1 · Size: M · Tier: Normal
+Status: approved 2026-10-30 by Dror (decisions above) · refreshed against 4510301 · Issue: #412 · Track: T1 · Size: M · Tier: Normal
 Security path: no · Migration: no · Live-trip behaviour: yes (the interview, for new trips)
 
 > **Sprint 8 (2026-10-30): in scope.**
@@ -69,7 +69,7 @@ code allows (`control-plane/api/src/`):
   same-burst fix needs the relay too.
 - **Where a stored suggestion is shown.** A suggestion is drawn only when the
   router next asks that question (`renderStep`, `relay/poller.ts:2130-2136`).
-  For an already-answered `travelers` that may be never; see open question 2.
+  For an already-answered `travelers` that may be never; decided: shown in the document reply (Decisions, 1).
 
 ## Behaviour
 
@@ -87,7 +87,9 @@ without a word.
   all four, and `sources.get("travelers")` names both documents.
 - AC-2 Given the same burst where document 2's `travelers` slice has confidence
   0.5, then document 2's people are returned in `suggested` (not only in
-  `rejected`), and the relay asks about them in the recap.
+  `rejected`), and the relay asks about them in the document reply itself: one
+  line naming them, with Yes/No ("The second ticket also names A B and C D —
+  add them?").
 - AC-3 Given document 2's slice whose evidence is the Hebrew rendering but whose
   `name_en` values appear verbatim in document 2's text, then the slice passes
   the evidence check (evidence may be satisfied by `name_en` as printed).
@@ -95,8 +97,8 @@ without a word.
   proposes couple 2 below the floor, then couple 2 is offered as a suggestion,
   and couple 1 is unchanged. **Gate and tap: already true on main (#339,
   `da74f26`).** What remains is that the organizer actually **sees** the offer
-  for an answered `travelers` (same delivery as AC-2); the test here is only
-  that delivery.
+  for an answered `travelers`, in the document reply as in AC-2 (Decisions,
+  1); the test here is only that delivery.
 - AC-5 (fixture) Given `control-plane/api/test/fixtures/two-parties-same-flight/`
   (two invented ticket texts: the same flight and date, different PNRs and
   passengers), when run through `gateDocumentProposals` with recorded model
@@ -115,8 +117,9 @@ without a word.
   appears in the document. This keeps "each proposal quotes its own document".
 - `control-plane/api/src/relay/poller.ts`: keep a `travelers` suggestion even
   when this read recorded `travelers` (`:2265-2266` skips it today), and show
-  it to the organizer in the document reply rather than waiting for a question
-  the router will not ask again (`renderStep`, `:2130-2136`).
+  it to the organizer in the document reply, as a line plus Yes/No, rather
+  than waiting for a question the router will not ask again (`renderStep`,
+  `:2130-2136`).
 - `control-plane/api/src/intake-copy.ts`: he/en "the second ticket also names …
   add them?".
 - New fixture, with invented names only.
@@ -160,17 +163,21 @@ Relay restart; affects interviews started afterwards. No trip site changes.
 **Per-PR regression plan: needed** (gate behaviour in live interviews, but
 narrow: it only adds suggestions).
 
+## Decisions (Dror, 2026-10-30)
+
+1. **An offer for an already answered `travelers` is shown in the document
+   reply itself: a line plus Yes/No** — option (a), the one the Behaviour text
+   promises. Not deferred to the final summary (AC-2, AC-4).
+
 ## Open questions
+
+1. (Open — factual, to be checked during build.) What did the france-2026
+   session's `interview.document_committed` line record (`rejected_questions`
+   / `suggested`) on Mac staging? It is a read-only probe and decides between
+   candidate 1 (low confidence) and candidate 2 (evidence). **AC-2 (candidate
+   1) and AC-3 (candidate 2) depend on it**: the spec keeps each fix only if
+   its candidate turns out to be live. AC-1, AC-4 and AC-5 do not depend on it.
 
 Size: unchanged (M). #339 removed AC-4's gate work, but the relay half found on
 refresh (the `recorded` skip and the delivery of a suggestion for an answered
 question) adds about as much.
-
-1. Can the lead read the france-2026 session's commit log line on staging
-   before build? It decides between candidate 1 and candidate 2, and the spec
-   keeps both fixes only if both turn out to be live.
-2. (new) How is an offer for an **already answered** `travelers` shown? Today
-   a stored suggestion appears only when the router asks that question again.
-   Options: (a) a line plus Yes/No in the document reply itself; (b) at the
-   final summary/confirm step; (c) both. (a) is what the Behaviour text
-   promises ("The second ticket also names … — add them?").

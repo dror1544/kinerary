@@ -1,9 +1,9 @@
-# Same flight, two bookings: one Journey entry or two (decision)
+# Same flight, two bookings: one Journey entry listing both
 
-Status: draft, refreshed against 4510301 (2026-10-30) · **needs Dror's decision before approval** · Issue: #415 · Track: T1 · Size: S · Tier: Normal
+Status: approved 2026-10-30 by Dror (decisions above) · refreshed against 4510301 · Issue: #415 · Track: T1 · Size: M · Tier: Normal
 Security path: no · Migration: no · Live-trip behaviour: yes (newly built trips)
 
-> **Sprint 8 (2026-10-30): decision first** — Dror decides before #414 is built.
+> **Sprint 8 (2026-10-30): decided — option B** (Dror, 2026-10-30; see Decisions). Built with or after #414: the line lists each booking's travellers from #414's `passengers`.
 
 ## Problem
 
@@ -54,7 +54,7 @@ which ticket, twice. To make B cheap:
 - a flight anchor with no recognisable flight number is not grouped. It stays
   its own line, as in A.
 
-## Acceptance criteria (for B; rewritten if A is chosen)
+## Acceptance criteria (option B, decided)
 
 - AC-1 Given two flight anchors with the same flight number and date and
   different confirmations, then the transformer emits **one** day item with
@@ -64,9 +64,17 @@ which ticket, twice. To make B cheap:
 - AC-3 Given a flight anchor whose name holds no flight number, then it is never
   grouped.
 - AC-4 Given the built site, then `GET /api/itinerary/active` serves that item
-  once, with both bookings joined. The Modern Journey shows one line with "2
-  bookings" and both confirmations on expand, organizer view only, as
-  confirmations already are.
+  once, with both bookings joined. The Modern Journey shows **one** line for the
+  flight that lists each booking with its own travellers (the booking's
+  `passengers`, #414), e.g. "AF 1621 Tel Aviv → Paris · A B, C D · E F, G H".
+  The line and the traveller names are shown to members and the organizer
+  alike. Confirmation numbers are shown exactly as today: organizer view
+  only. Reservations still shows two entries, one per booking (#414).
+- AC-6 Given a member token, when the Journey is loaded, then the member sees
+  the one line with each booking's travellers, and no confirmation number
+  appears in the line or in the member's `GET /api/itinerary/active` response.
+  (Booking `passengers` already reach members through `GET /api/bookings`,
+  `tests/write-validation.test.js`.)
 - AC-5 Given an existing trip (built before this), then a re-provision adds or
   removes no plan items (the plan import runs once, `importPlanOnce`,
   `server/living-journey.js:855-868`).
@@ -77,7 +85,9 @@ which ticket, twice. To make B cheap:
 - `server/server.js`: day-item import (`:4041`) and `joinBooking` (`:2940-2953`);
   `server/living-journey.js:641-675` (`serializeItinerary`), the booking join
   over a list.
-- `trip-web/src/App.tsx`: the Journey line.
+- `trip-web/src/App.tsx`: the Journey line — one line per grouped item, each
+  joined booking's `passengers` beside it; confirmations behind the existing
+  organizer check.
 - Additive config key `booking_refs` on a day item. **This is a
   `shared/config-visibility.js` allow-list decision**: it carries `seed_key`s
   only, never a confirmation, and must be entered on the list or it is
@@ -91,7 +101,8 @@ which ticket, twice. To make B cheap:
   - `test_an_unnumbered_flight_is_never_grouped`
 - `tests/config-allow-list.test.js`: `booking_refs is served and carries no confirmation`.
 - `tests/living-journey.test.js`: `a grouped flight joins both bookings`.
-- `trip-web/src/Journey.test.tsx`: `one line, two bookings`.
+- `trip-web/src/Journey.test.tsx`: `one line, two bookings, each with its travellers`;
+  `a member sees the line and the travellers but no confirmation` (AC-6).
 
 ## Rollout and regression
 
@@ -99,21 +110,29 @@ Trips built after the worker and site release. Existing trips are unaffected
 (AC-5). **Per-PR regression plan: needed** (a config shape plus an allow-list
 entry).
 
+## Decisions (Dror, 2026-10-30)
+
+1. **Option B.** One Journey line per physical flight, listing both bookings
+   and their travellers. Reservations still shows two entries (#414).
+2. **Members see it too** (the spec's recommendation for the members
+   question): the grouped line and each booking's travellers are shown to
+   members as well as the organizer. Confirmation numbers keep today's
+   organizer-only display (AC-4, AC-6).
+
 ## Open questions
 
-1. **Decision for Dror:** one Journey entry (B, recommended), two (A), or one
-   with the first booking only (C)?
-2. If B: should members see "2 bookings" at all, or only the organizer?
-3. (New.) #382 proposes a boot-time reconcile of config-imported plan items
-   (`reconcileConfigItems`). If #382 lands, AC-5 ("a re-provision adds or
-   removes no plan items") no longer holds by itself for an *unedited* trip:
-   a rebuilt config that groups two flights into one item would retire one
-   positional `config_ref`. Should grouped items be excluded from #382's
-   reconcile, or is the change acceptable for unedited rows?
+1. (Open — no recommendation in the spec; not decided.) #382 proposes a
+   boot-time reconcile of config-imported plan items (`reconcileConfigItems`).
+   If #382 lands, AC-5 ("a re-provision adds or removes no plan items") no
+   longer holds by itself for an *unedited* trip: a rebuilt config that groups
+   two flights into one item would retire one positional `config_ref`. Should
+   grouped items be excluded from #382's reconcile, or is the change
+   acceptable for unedited rows? **AC-5 here, and #382's AC-4, depend on the
+   answer**; it must be settled before whichever of #382 and #415 is built
+   second.
 
 Checked 2026-10-30: nothing on main since 03c0e1c changes the transformer's
 day derivation, the positional import or `findMatchingBooking` (line shifts
 only; the only transformer change is #201/#127's log message). No
-`booking_refs` exists. Size: S for the decision; option B as written is
-nearer M (worker, site join, allow-list entry, Journey UI) — size the brief
-M if B is chosen.
+`booking_refs` exists. Size: M (option B: worker, site join, allow-list entry,
+Journey UI).

@@ -1,9 +1,9 @@
 # One lock order for re-provisioning: `retryProvision` vs the worker's `_complete`
 
-Status: draft, refreshed against 4510301 (2026-10-30) · Issue: #387 · Track: Housekeeping · Size: S (M if AC-8 is kept in) · Tier: Normal
+Status: approved 2026-10-30 by Dror (decisions above) · refreshed against 4510301 · Issue: #387 · Track: Housekeeping · Size: M · Tier: Normal
 Security path: no · Migration: no · Live-trip behaviour: yes (operator retry path on any trip; control-plane API restart)
 
-> **Sprint 8 (2026-10-30): in scope.**
+> **Sprint 8 (2026-10-30): in scope, with `correctIntake` folded in as AC-8 (size M).**
 
 ## Problem
 
@@ -68,7 +68,7 @@ document correction via `document-correction.ts:497`) landing while the worker
 commits a finished build is the same `trips`-first vs `jobs`-first shape: the
 worker holds the job and plan rows and waits for `trips`; the correction holds
 `trips` and waits for the plan row. Not reproduced; same reasoning as above.
-See Open question 2.
+Folded into this item as AC-8 (Dror, 2026-10-30).
 
 **What moved on main since 03c0e1c (checked 2026-10-30).** `retryProvision`
 (`planner.ts`) and `trip-clear.ts` are unchanged. `_complete`'s lock sequence
@@ -133,7 +133,7 @@ A teardown and a clear racing on the same trip likewise wait, not deadlock.
 - AC-7 Each changed function's comment states its lock order and names the
   transactions it must agree with (as `trip-clear.ts` does), and the
   `trip-clear.ts` header's list of "every path that locks `trips`" stays true.
-- AC-8 (only if Open question 2 keeps it in this item) `correctIntake` takes
+- AC-8 `correctIntake` takes
   its locks in the order **jobs → plans → trips**, with the state check made
   after the `trips` lock, by the same pattern as AC-1/AC-2. Given a holder
   mirroring `_complete` on a trip in `provisioning_approved`, a concurrent
@@ -148,7 +148,7 @@ A teardown and a clear racing on the same trip likewise wait, not deadlock.
 - `scripts/teardown-trip.py` — `retire_in_db` statement order only (`CLOSE_SESSIONS`
   moved earlier in both branches; `CLEAR_TEARDOWN_PIN` stays last).
 - `control-plane/api/src/intake-correction.ts` — `correctIntake` statement order
-  only, if AC-8 is kept.
+  only (AC-8).
 - Worker unchanged: `_complete` already follows the convention.
 - No migration, no route or config change.
 
@@ -185,7 +185,7 @@ mid-run.
   bindings → `intake_sessions` check at `:141-142` and the rename-branch
   checks at `:166-170` change; the token-first check and the #349 pin tests
   stay).
-- AC-8 (if kept): `control-plane/api/test/intake-correction.test.ts`
+- AC-8: `control-plane/api/test/intake-correction.test.ts`
   (`describe("correctIntake")`, `:115`), same holder shape as AC-3.
 - Suites: `npm test --prefix control-plane/api` (DB suites with the test URL),
   `tests/scripts`.
@@ -195,14 +195,16 @@ mid-run.
 API restart (approved, as any) puts the retry change live; `teardown-trip.py`
 is an operator script, live when the checkout running it updates.
 Assessment: not needed — no migration, no auth or boundary path, no relay
-change; the change is statement order inside two operator-only transactions
-(three with AC-8, the third organizer-reachable), covered by concurrency tests.
+change; the change is statement order inside three transactions (two
+operator-only, `correctIntake` organizer-reachable), covered by concurrency
+tests.
+
+## Decisions (Dror, 2026-10-30)
+
+1. **The teardown half (AC-6) stays in this item** — one convention, one PR
+   (the spec's proposal).
+2. **`correctIntake`'s deadlock is folded in as AC-8**; size S → M.
 
 ## Open questions
 
-1. Keep the teardown half (AC-6) in this item, as the issue comment suggests,
-   or split it into its own issue? (Proposed: keep — one convention, one PR.)
-2. (New, 2026-10-30) `correctIntake` is a third instance of the same
-   trips-first shape (see Problem). Fold it in as AC-8 (one convention, one PR;
-   size S→M) or file it as its own issue? It is organizer-reachable, not only
-   operator-reachable, so it is arguably the likelier of the races.
+None open.

@@ -1,6 +1,6 @@
 # The relay's Hermes mirror, pinned to a captured fixture
 
-Status: draft, refreshed against 4510301 (2026-10-30) · Issue: #380 · Track: T3 · Size: M · Tier: Normal
+Status: approved 2026-10-30 by Dror (decisions above) · refreshed against 4510301 · Issue: #380 · Track: T3 · Size: M · Tier: Normal
 Security path: no (touches the leak filter's tests, not its rules; see notes) · Migration: no · Live-trip behaviour: no (unless the comparison finds drift, see Rollout)
 
 > **Sprint 8 (2026-10-30): in scope.**
@@ -73,7 +73,7 @@ internals). This is a tripwire, not an import.
   string and every gateway status string in it — including the compaction
   notice (#65) and the context-file truncation warning (#481) — is caught by
   `detectInternalLeak()` (each one listed by name on failure).
-- AC-2b (if Open question 3 keeps it) Given the fixture's list of Hermes config
+- AC-2b Given the fixture's list of Hermes config
   keys (read from Hermes' config defaults by symbol), when the suites run, then
   every key the companion overlay sets in the table's config-keys row exists in
   it; a key missing from the fixture fails naming the key and the overlay line.
@@ -187,18 +187,26 @@ or the timeout phrase, that is relay behaviour on every live companion and
 needs a per-PR regression plan; otherwise "assessment: not needed (test and
 fixture only)". Reaches nobody until the next control-plane release.
 
+## Decisions (Dror, 2026-10-30)
+
+1. **A reworded approval prompt: keep the old stems for one release**, for
+   rollback safety (the spec's recommendation). They are removed only after
+   the next release, and only when the fixture proves the old wording is gone.
+2. **The overlay's Hermes config keys are in this item (AC-2b)**: a renamed key
+   fails silently in the same way as a reworded status line, so the fixture is
+   their home (the spec's own reasoning; size stays M).
+3. **The fixture pins the target revision's wording** (`BASE_REV`, AC-5); the
+   #65/#481 stems seen on staging stay in `internal-leak.ts` regardless (a
+   widening only, per the Security notes). Any difference between the two is
+   recorded in the PR under AC-8.
+
 ## Open questions
 
-1. When the target revision moves again, is recapture a step in the Hermes bump
-   checklist (the #189 rehearsal) only, or also a preflight check that runs when
-   a Hermes source tree is present on the machine?
-2. If the target Hermes reworded the approval prompt, keep the old stems for one
-   release (recommended, rollback safety) or indefinitely?
-3. (New, 2026-10-30) Include the overlay's Hermes config keys (AC-2b) in this
-   item, or leave them to the #189 rehearsal? A renamed key fails silently in
-   the same way as a reworded status line, so the fixture is the natural home;
-   it adds a small AST read of Hermes' config defaults (size stays M).
-4. (New) The #65/#481 stems were read from messages seen on staging, from
-   whatever Hermes the Mac runs, not from `4097709b0c` source. The capture must
-   find them in the target tree. If the target words them differently, which
-   revision's wording does the fixture pin?
+1. (Open — no recommendation in the spec; not decided.) When the target
+   revision moves again, is recapture a step in the Hermes bump checklist (the
+   #189 rehearsal) only, or also a preflight check that runs when a Hermes
+   source tree is present on the machine? No AC depends on it: AC-5 and AC-7
+   provide the check either way; this decides only who runs it.
+2. (Open — factual, to be checked during build.) Does `4097709b0c` word the
+   #65/#481 notices the way staging showed them? Recorded under AC-8; no AC's
+   pass condition depends on the answer (decision 3).

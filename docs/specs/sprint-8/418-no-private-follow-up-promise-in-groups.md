@@ -1,6 +1,6 @@
 # The companion does not promise a private follow-up in a group
 
-Status: draft, refreshed against 4510301 (2026-10-30) · Issue: #418 · Track: T1 · Size: S · Tier: Normal
+Status: approved 2026-10-30 by Dror (decisions above) · refreshed against 4510301 · Issue: #418 · Track: T1 · Size: S · Tier: Normal
 Security path: no · Migration: no · Live-trip behaviour: yes (companion instructions)
 
 > **Sprint 8 (2026-10-30): in scope.**
@@ -141,7 +141,7 @@ No code, no relay change, no new tool.
 - Giving the companion a "message the organizer now" capability. That would be
   a new outbound path from a context full of traveller text, the same reason
   the companion cannot file issues itself (CLAUDE.md "A companion reports; the
-  monitor decides"). Open question 2.
+  monitor decides"). Decisions, 2.
 - The relay's group judge (#406/#407).
 
 ## Security and boundary notes
@@ -183,20 +183,24 @@ group keeps the old wording until then. **Per-PR regression plan: needed**
 (companion behaviour on live trips), but small: instruction text only, no
 tool or site change. It can ride with #419's profile refresh.
 
+## Decisions (Dror, 2026-10-30)
+
+1. **In a group, point the organizer to their own chat with the companion (or
+   the site); never promise to act** — the spec's recommendation: honest, and
+   it promises nothing the companion has to do later (AC-2, AC-4).
+2. **No "message the organizer on its own" capability in this item** (the
+   spec's non-goal). A real follow-up would be a separate, boundary-reviewed
+   feature, not this fix.
+
 ## Open questions
+
+1. (Open — no recommendation in the spec; not decided.) Live companions
+   rendered before #481 still cut SOUL.md's middle on a smaller-window model.
+   Should this fix's rollout re-render every live companion's overlay as well
+   as its SOUL (one refresh for both), or only the SOUL and skills, leaving
+   the overlay to #481's own rollout? A rollout choice for the regression
+   plan; no AC depends on it (AC-6's runs use a profile rendered with #481's
+   overlay either way).
 
 Size: unchanged (S). Nothing in scope was built on main; #481 and #133 only
 moved line numbers and removed one rollout risk (SOUL's middle being cut).
-
-
-1. In a group, drop the "pick it up privately" line entirely, or tell the
-   companion to point the organizer to their own chat with it? This spec
-   recommends the second: honest, and it promises nothing the companion has to
-   do later.
-2. Do you ever want the companion to be able to message the organizer on its
-   own (a real follow-up)? If yes, that is a separate, boundary-reviewed
-   feature. It is not this fix.
-3. (new) Live companions rendered before #481 still cut SOUL.md's middle on a
-   smaller-window model. Should this fix's rollout re-render every live
-   companion's overlay as well as its SOUL (one refresh for both), or only the
-   SOUL and skills, leaving the overlay to #481's own rollout?

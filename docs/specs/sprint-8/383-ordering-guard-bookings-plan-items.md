@@ -1,6 +1,6 @@
 # An older booking or plan-item edit cannot overwrite a newer one
 
-Status: draft, refreshed against 4510301 (2026-10-30) · Issue: #383 · Track: T1 · Size: M · Tier: Normal
+Status: approved 2026-10-30 by Dror (decisions above) · refreshed against 4510301 · Issue: #383 · Track: T1 · Size: M · Tier: Normal
 Security path: yes (`server/server.js` write routes; `server/trip-mcp/`) · Migration: no (site SQLite, additive column) · Live-trip behaviour: yes
 
 > **Sprint 8 (2026-10-30): stretch** — only if the in-scope items are done.
@@ -144,20 +144,25 @@ gets 428 on agent writes. So deploy the site and the bridge together per trip,
 and never the site alone. **Per-PR regression plan: needed** (write semantics
 on live trips; boundary path).
 
+## Decisions (Dror, 2026-10-30)
+
+1. **The guard is a row version** (not `updated_at`, which has second
+   resolution), **required for agent writes and optional for a person in the
+   site UI for one release** — the spec's proposal (AC-4, AC-7).
+2. **No organizer surface outside `trip-web` and Classic writes bookings or
+   plan items**: the portal reaches a trip through the trip site itself, as
+   the 2026-10-30 search found. The developer re-runs that search at build
+   time and stops for a spec PR if it finds one.
+
 ## Open questions
 
-1. What form should the guard take? This spec proposes a row version (not
-   `updated_at`, which has second resolution in SQLite's `datetime('now')`),
-   required for agent writes and optional for a person in the site UI, for one
-   release. Then make it required for everyone?
-2. Should a stale agent write (409) be reported to the fleet monitor as a
-   metric for "stale-state incidents per trip" (Guarantee A's KPI), or only
-   logged?
-3. (New.) The organizer web release (#478) put organizer editing in the
-   portal / Mini App. Does any organizer-facing surface outside `trip-web`
-   and Classic PATCH bookings or plan items (and so also need to send the
-   revision)? A search of `control-plane/` and `web/` on 2026-10-30 found
-   none (the portal reaches a trip through the trip site itself); confirm
-   that is the intended shape before approval.
+1. (Open — no recommendation in the spec; not decided.) After the one release,
+   is the revision made required for everyone? A later release's decision; no
+   AC in this item depends on it (AC-7 accepts and logs a revision-less member
+   write).
+2. (Open — no recommendation in the spec; not decided.) Should a stale agent
+   write (409) be reported to the fleet monitor as a "stale-state incidents per
+   trip" metric (Guarantee A's KPI), or only logged? No AC depends on it: the
+   ACs require the 409 and the log line only.
 
 Size: unchanged (M); one more Classic call site.

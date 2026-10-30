@@ -1,6 +1,6 @@
 # A corrected booking or plan item reaches the live trip site
 
-Status: draft, refreshed against 4510301 (2026-10-30) · Issue: #382 · Track: T1 · Size: L · Tier: High
+Status: approved 2026-10-30 by Dror (decisions above) · refreshed against 4510301 · Issue: #382 · Track: T1 · Size: L · Tier: High
 Security path: yes (`server/server.js` boot seed; plan import) · Migration: no (site SQLite, additive columns) · Live-trip behaviour: yes
 
 > **Sprint 8 (2026-10-30): in scope.**
@@ -100,7 +100,8 @@ On every boot the site reconciles the seed with the files:
     values at last apply) and `retired_at`;
   - additive columns on `phase_plan_items`: `config_hash`;
   - "edited" means the row's current values differ from the values its hash
-    was taken from. #383's `row_version` can serve if it lands first;
+    was taken from. `seed_hash` is independent of #383's `row_version`
+    (Decisions, 3): #382 is built first;
   - the boot seed (`:707-726`) becomes reconcile: insert, update-if-unedited,
     flag, retire;
   - a new organizer-only `POST /api/bookings/:id/accept-seed` and its plan-item
@@ -154,20 +155,27 @@ that first boot. **The regression plan must dry-run the reconcile on a copy of
 each live trip's DB first** (read-only, metadata only, under the alpha-tester
 policy). **Regression plan: needed, and High tier.**
 
+## Decisions (Dror, 2026-10-30)
+
+1. **Retire an unedited seed row that is gone from the file** (AC-6, the
+   spec's default); an edited one is kept and flagged `seed_removed`.
+2. **A stop set from a seeded hotel is flagged `booking_out_of_sync`, never
+   moved at boot** (AC-2 as written: "It is not silently moved"). This also
+   follows Dror's #419 decision of the same day: a booking alone never moves a
+   stop.
+3. **`seed_hash` stays independent of #383's `row_version`.** The spec lets
+   `row_version` serve only if #383 lands first; #383 is a stretch item after
+   this one, so it does not.
+
 ## Open questions
 
-1. Is retiring an unedited seed row that is gone from the file (AC-6) the right
-   default, or should it always be flagged for the organizer instead?
-2. Should a live trip's first reconciling boot be gated by a flag
-   (`SEED_RECONCILE=1`), so each trip is turned on one at a time after its
-   dry run?
-3. (New.) A stop override (PR #362) and a corrected `bookings.json` can now
-   disagree about a hotel's dates. AC-2 flags the stop `booking_out_of_sync`
-   and leaves it; should a *never-edited* stop that was set from an unedited
-   seeded hotel follow the corrected booking automatically instead (re-run
-   `from-booking` at boot)?
-4. (New.) #383 is drafted to add `row_version` to `bookings` and
-   `phase_plan_items`; build order matters for the "edited" test here. Land
-   #383 first and use `row_version`, or keep `seed_hash` independent?
+1. (Open — no recommendation in the spec; not decided.) Should a live trip's
+   first reconciling boot be gated by a flag (`SEED_RECONCILE=1`), so each
+   trip is turned on one at a time after its dry run? A rollout choice for the
+   High-tier regression plan; no AC depends on it.
+2. (Open, shared with #415's open question 1.) Whether a grouped flight item
+   (#415) is excluded from `reconcileConfigItems`. **AC-4 depends on it** for
+   a trip whose rebuilt config groups two flights; settle it before whichever
+   of #382 and #415 is built second.
 
 Size: unchanged (L).
