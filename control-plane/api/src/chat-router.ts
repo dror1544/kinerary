@@ -36,6 +36,7 @@ import {
   DEFAULT_LANGUAGE,
   lifecycleLabel,
   optionLabel,
+  seededOpening,
   uiString,
   type Language,
   unsettledText,
@@ -47,6 +48,7 @@ import {
   INTAKE_QUESTIONS,
   startSession,
   type IntakeQuestion,
+  type SeededOpening,
   type SessionView,
 } from "./interview.js";
 import { peekEnrollmentTripId } from "./enrollment.js";
@@ -738,6 +740,8 @@ export type StartLinkOutcome =
       view: SessionView;
       /** They have had a trip built before, so the opening greets them as such. */
       returning: boolean;
+      /** The trip was created on the dashboard and its card seeded the session: what the opening should say (#438). */
+      seeded?: SeededOpening;
     }
   | { kind: "already_in_interview"; sessionId: string; tripId: string }
   | {
@@ -891,7 +895,14 @@ export async function startFromDeepLink(
       returning,
     }),
   );
-  return { kind: "started", sessionId: result.sessionId, tripId: result.view.tripId, view: result.view, returning };
+  return {
+    kind: "started",
+    sessionId: result.sessionId,
+    tripId: result.view.tripId,
+    view: result.view,
+    returning,
+    ...(result.seeded ? { seeded: result.seeded } : {}),
+  };
 }
 
 // ── Inline keyboards ─────────────────────────────────────────────────────────
@@ -1248,6 +1259,8 @@ export function renderSuggestion(
   label: string,
   language: Language = DEFAULT_LANGUAGE,
   agentText?: string | null,
+  /** `account_name`: the organizer's own name matched the roster (#438), asked as "you're Dana, right?" rather than read from a document. */
+  source?: "account_name",
 ): RenderedQuestion {
   const shown = label.length > SUGGESTION_LABEL_MAX ? `${cutWhole(label, SUGGESTION_LABEL_MAX)}…` : label;
   const rows: InlineButton[][] = [[
@@ -1259,6 +1272,9 @@ export function renderSuggestion(
       { text: uiString("skip", language), callback_data: skipCallbackData(question.id) },
       { text: uiString("finish", language), callback_data: FINISH_CALLBACK_DATA },
     ]);
+  }
+  if (source === "account_name") {
+    return { text: uiString("organizerNameConfirm", language).replace("{name}", () => shown), replyMarkup: { inline_keyboard: rows } };
   }
   const ask = agentText?.trim() || askText(question, language);
   return { text: `${ask}\n\n${uiString("suggestionIntro", language)}\n${shown}`, replyMarkup: { inline_keyboard: rows } };
@@ -1308,6 +1324,12 @@ export function renderConfirmPrompt(
 export function renderDocumentOffer(
   language: Language = DEFAULT_LANGUAGE,
   returning = false,
+  /**
+   * Set when the trip was created on the dashboard (#438): who the organizer is to it, and the destination and dates
+   * already chosen. Said BEFORE the introduction, which follows unchanged; absent, the opening is exactly what it
+   * always was, byte for byte.
+   */
+  seeded?: SeededOpening,
 ): RenderedQuestion {
   return {
     // One message, not two: an opening that arrives as a pair of notifications
@@ -1323,7 +1345,9 @@ export function renderDocumentOffer(
     // is a bot talking past them. What that version says instead is the one
     // thing only a second trip raises — that the first one is not being
     // replaced.
-    text: uiString(returning ? "introductionReturning" : "introduction", language),
+    text: seeded
+      ? `${seededOpening(seeded, language)}\n\n${uiString(returning ? "introductionReturning" : "introduction", language)}`
+      : uiString(returning ? "introductionReturning" : "introduction", language),
     replyMarkup: {
       inline_keyboard: [[
         { text: uiString("noDocument", language), callback_data: NO_DOCUMENT_CALLBACK_DATA },

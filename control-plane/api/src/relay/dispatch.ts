@@ -742,7 +742,7 @@ export async function dispatchUpdate(
         if (!outcome.view.nextQuestion) {
           return { kind: "reply", reply: { chatId, text: strings.badLink } };
         }
-        const rendered = renderDocumentOffer(outcome.view.language, outcome.returning);
+        const rendered = renderDocumentOffer(outcome.view.language, outcome.returning, outcome.seeded);
         return {
           kind: "reply",
           reply: { chatId, text: rendered.text, replyMarkup: rendered.replyMarkup ?? undefined },

@@ -102,6 +102,9 @@ export const PORTAL_SCOPE_POLICY: Readonly<Record<string, RouteScope>> = Object.
   "GET /v1/trips": "filtered",
 
   "POST /v1/trips": "account",
+  // The name the interview greets the organizer by. It changes the ACCOUNT, which a Telegram-minted session only
+  // borrows: a password or Google sign-in only (#438).
+  "POST /v1/account/name": "account",
   "POST /v1/site-invites/redeem": "account",
 
   "DELETE /v1/account/telegram-links/:linkId": "link",
