@@ -139,8 +139,9 @@ class RetireInDb(unittest.TestCase):
         tx = seen[0]
         self.assertLess(tx.index("BEGIN"), tx.index("telegram_group_binding_tokens"))
         self.assertLess(tx.index("telegram_group_binding_tokens"), tx.index("telegram_chat_bindings"))
-        self.assertLess(tx.index("telegram_chat_bindings"), tx.index("intake_sessions"))
-        self.assertLess(tx.index("intake_sessions"), tx.index("COMMIT"))
+        self.assertLess(tx.index("telegram_group_binding_tokens"), tx.index("intake_sessions"))
+        self.assertLess(tx.index("intake_sessions"), tx.index("telegram_chat_bindings"))
+        self.assertLess(tx.index("telegram_chat_bindings"), tx.index("COMMIT"))
 
     def test_the_revoke_runs_first_in_both_branches_to_avoid_a_real_deadlock(self):
         # regression-planner reproduced an actual `40P01: deadlock detected`
@@ -170,6 +171,31 @@ class RetireInDb(unittest.TestCase):
                     tx.index("telegram_group_binding_tokens"), tx.index("telegram_chat_bindings"),
                     "the revoke must run before the bindings-close, not after",
                 )
+
+    def test_the_lock_order_agrees_with_execute_clear_in_both_branches(self):
+        # issue #387: executeClear (control-plane/api/src/trip-clear.ts) locks
+        # tokens, enrollments, SESSIONS, bindings, and `trips` LAST. This used to
+        # run tokens, bindings, TRIPS, sessions - a real 40P01 on a trip with a
+        # live unconfirmed session. Now: tokens -> sessions -> bindings -> trips
+        # -> teardown-pin clear, and the pin clear stays the last statement
+        # (#349/#461). control-plane/api/test/trip-clear.test.ts ("#387 AC-6")
+        # mirrors this order against the real executeClear.
+        for trip in (
+            {"id": "trip_abcdefgh12", "slug": "retired-japan-2026-20260101", "orig": "japan-2026"},
+            {"id": "trip_abcdefgh12", "slug": "japan-2026", "orig": "japan-2026"},
+        ):
+            with self.subTest(slug=trip["slug"]):
+                seen: list[str] = []
+                with mock.patch.object(teardown, "psql", side_effect=lambda sql: seen.append(sql) or "0"):
+                    teardown.retire_in_db(trip)
+                tx = seen[-1]
+                order = ["BEGIN", "telegram_group_binding_tokens", "intake_sessions", "telegram_chat_bindings"]
+                if trip["slug"] == "japan-2026":
+                    order.append("UPDATE control_plane.trips SET slug")
+                order += ["pin = 'teardown' AND pin_trip_id", "COMMIT"]
+                positions = [tx.index(marker) for marker in order]
+                self.assertEqual(positions, sorted(positions), f"statement order is not {order}")
+                self.assertEqual(len(set(positions)), len(positions))
 
     def test_the_revocation_never_touches_an_already_expired_token(self):
         # The table's own CHECK forbids expires_at <= created_at; only
