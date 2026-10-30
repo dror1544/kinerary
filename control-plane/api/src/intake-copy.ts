@@ -487,6 +487,9 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     documentCorrect: "If any of that is wrong just tell me and I'll fix it — no rush, later is fine too. Meanwhile, carrying on:",
     /** Places the document means to visit but has not booked. */
     documentPlanned: "Places from the document",
+    // The reply to a message right after the recap that is about the travellers
+    // but names nobody (#413). About travellers - never about the assistant.
+    askOtherTravellers: "Who are the other travellers? Write their names as on the ticket.",
     documentNothing: "I read it, but I couldn't find anything about the trip in it. No harm — I'll just ask.",
     documentNothingNew: "I read it — everything in it matches what I already have, so there's nothing new to add. Carrying on:",
     // A reading the model was unsure of, put to the organizer instead of lost.
@@ -494,6 +497,17 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     suggestionIntro: "From your document — is this right?",
     suggestionYes: "✅ Yes, that's right",
     suggestionNo: "✏️ No",
+    // The organizer's own name, matched against the roster they just listed (#438, AC-9): a one-tap confirm in
+    // place of "which of them are you?". Said as a question to them, not as something read from a document.
+    organizerNameConfirm: "You're {name} on the list, right?",
+    // The opening of a trip that was created on the dashboard (#438): who they are to this trip, and what is
+    // already chosen. Placed before the usual introduction, which follows unchanged.
+    seedGreeting: "Hi {name} — you're the organizer of this trip.",
+    seedGreetingAnon: "You're the organizer of this trip.",
+    seedStart: "I'm starting from what you chose on the dashboard: {what}. If any of it is off, just tell me and I'll change it.",
+    seedRange: "{start} to {end}",
+    seedFrom: "from {start}",
+    seedUntil: "until {end}",
     /** Instead of documentNothing, when nothing was certain but something was found. */
     documentUnsure: "I read it and found a few things I'm not sure I read right — I'll check each one with you as we go.",
     /** Beside what was taken, naming what will be checked. */
@@ -828,11 +842,19 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     documentRead: "הנה מה שלקחתי מהמסמך:",
     documentCorrect: "אם משהו מזה לא נכון פשוט תגידו לי ואתקן — אין לחץ, גם אחר כך אפשר. בינתיים נמשיך:",
     documentPlanned: "מקומות מהמסמך",
+    askOtherTravellers: "מי הנוסעים האחרים? כתבו את השמות שלהם כפי שהם מופיעים בכרטיס.",
     documentNothing: "קראתי, אבל לא מצאתי שם מידע על הטיול. לא נורא — פשוט אשאל.",
     documentNothingNew: "קראתי — כל מה שבמסמך כבר נמצא אצלי, כך שאין מה להוסיף. ממשיכים:",
     suggestionIntro: "מהמסמך שלכם — זה נכון?",
     suggestionYes: "✅ כן, נכון",
     suggestionNo: "✏️ לא",
+    organizerNameConfirm: "אתה {name} ברשימה, נכון?",
+    seedGreeting: "היי {name} — אתה המארגן של הטיול הזה.",
+    seedGreetingAnon: "אתה המארגן של הטיול הזה.",
+    seedStart: "אני מתחיל ממה שבחרת בלוח הבקרה: {what}. אם משהו מזה לא נכון, פשוט תגיד לי ואשנה.",
+    seedRange: "{start} עד {end}",
+    seedFrom: "החל מ-{start}",
+    seedUntil: "עד {end}",
     documentUnsure: "קראתי, ומצאתי כמה דברים שאני לא בטוח שקראתי נכון — אבדוק איתכם כל אחד מהם בהמשך.",
     documentWillCheck: "לא בטוח שקראתי נכון — אבדוק איתכם",
     documentMoreTravelers: "מסמך נוסף מזכיר גם את {names} — להוסיף אותם לנוסעים?",
@@ -1050,6 +1072,38 @@ export function readableDate(iso: string, language: Language = DEFAULT_LANGUAGE)
   if (probe.getUTCFullYear() !== year || probe.getUTCMonth() !== month - 1 || probe.getUTCDate() !== day) return null;
   const name = (MONTHS[language] ?? MONTHS[DEFAULT_LANGUAGE])[month - 1];
   return language === "he" ? `${day} ב${name} ${year}` : `${name} ${day}, ${year}`;
+}
+
+/** What a seeded session starts from, as the opening says it (the shape `interview.ts` calls `SeededOpening`). */
+export interface SeededOpeningFacts {
+  destination: string | null;
+  departureDate: string | null;
+  returnDate: string | null;
+  organizerName: string | null;
+}
+
+/**
+ * The lines that open an interview for a trip created on the dashboard (#438): who the organizer is to this trip,
+ * by name when there is one, and what is already chosen -- the destination and the dates, in words, never as
+ * `YYYY-MM-DD`. They go BEFORE the usual introduction; nothing after them changes.
+ *
+ * Only what was seeded is said: a trip with no dates names only the destination, one with a start date says
+ * "from <day>". A date `readableDate` will not render is left out rather than shown raw.
+ */
+export function seededOpening(seeded: SeededOpeningFacts, language: Language = DEFAULT_LANGUAGE): string {
+  const fill = (key: string, values: Record<string, string>) =>
+    Object.entries(values).reduce((text, [name, value]) => text.replace(`{${name}}`, () => value), uiString(key, language));
+  const name = seeded.organizerName?.trim();
+  const greeting = name ? fill("seedGreeting", { name }) : uiString("seedGreetingAnon", language);
+
+  const start = seeded.departureDate ? readableDate(seeded.departureDate, language) : null;
+  const end = seeded.returnDate ? readableDate(seeded.returnDate, language) : null;
+  const dates = start && end ? fill("seedRange", { start, end })
+    : start ? fill("seedFrom", { start })
+    : end ? fill("seedUntil", { end })
+    : null;
+  const what = [seeded.destination?.trim(), dates].filter((part): part is string => Boolean(part)).join(", ");
+  return what ? `${greeting} ${fill("seedStart", { what })}` : greeting;
 }
 
 function pick(localised: Localised | undefined, language: Language): string | null {

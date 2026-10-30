@@ -90,6 +90,8 @@ import {
   skipQuestionForChat,
   toggleMultiChoiceForChat,
   saveSuggestionsForChat,
+  markDocumentRecap,
+  clearDocumentRecap,
   dismissSuggestionForChat,
   suggestionLabel,
   type SuggestedAnswer,
@@ -1115,6 +1117,8 @@ async function applyInterviewCallback(
       await ack("That question is no longer part of the interview.");
       return;
     }
+    // A tap answers what is on screen: the recap is no longer what they are replying to (#413).
+    await clearDocumentRecap(deps.db, decision.chatId);
     // A multi_choice answer is a set, so it arrives as `toggle` taps and a
     // Done, never as a single `answer`. Reaching here with one means a stale
     // keyboard from before multi-select existed.
@@ -1785,7 +1789,7 @@ async function runDocumentPath(
 
   await markReadingDocument(deps.db, burst.chatId, true);
   try {
-    await readDocumentsInto(deps, deps.modelRunner, burst, tripId, registered, language, say, commit, log);
+    await readDocumentsInto(deps, deps.modelRunner, burst, tripId, registered, language, say, commit, log, interpretationId);
   } finally {
     // THE NEXT QUESTION, NOW — after the flag is down, not before. `ask` used to
     // be a closure `readDocumentsInto` called at each of its own exits, all of
@@ -2150,7 +2154,7 @@ function renderStep(question: IntakeQuestion, view: SessionView, phrasing?: stri
   const suggestion = view.suggestions[question.id];
   const label = suggestion ? suggestionLabel(question.id, suggestion, view.language) : null;
   return label
-    ? renderSuggestion(question, label, view.language, phrasing)
+    ? renderSuggestion(question, label, view.language, phrasing, suggestion?.source)
     : renderQuestion(question, selectedOptionIds(view, question.id), view.language, phrasing, fromRecord(view, question.id));
 }
 
@@ -2238,6 +2242,7 @@ async function readDocumentsInto(
   say: (text: string) => Promise<void>,
   commit: CommitDocumentBurst,
   log: (line: string) => void,
+  recapId?: string,
 ): Promise<void> {
   const started = Date.now();
   const extracted = await extractRegisteredDocuments(
@@ -2475,6 +2480,10 @@ async function readDocumentsInto(
 
     if (lines.length > 0) {
       await say(`${uiString("documentRead", language)}\n\n${lines.join("\n")}\n\n${uiString("documentCorrect", language)}`);
+      // THE RECAP IS NOW WHAT THEY ARE LOOKING AT, though `say` records no prompt
+      // and the question the router puts under it will be the one on record. The
+      // next message is read as possibly about the recap first (#413).
+      if (recapId) await markDocumentRecap(deps.db, burst.chatId, `recap:doc:${recapId}`);
     }
   }
   await sendMoreTravelers();
@@ -2972,7 +2981,7 @@ async function retakeFloor(
   chatId: string,
   sessionId: string,
   log: (line: string) => void,
-  reply: "change_preview" | "change_refused" | "change_not_understood" | "required_reask",
+  reply: "change_preview" | "change_refused" | "change_not_understood" | "required_reask" | "recap_clarify",
   extra: Record<string, string> = {},
 ): Promise<SessionView | null> {
   log(structuredLog("info", "interview.change_floor_taken_back", { session_id: sessionId, reply, ...extra }));
@@ -2992,7 +3001,7 @@ async function answerThisMessage(
   view: SessionView,
   text: string,
   log: (line: string) => void,
-  reply: "change_refused" | "change_not_understood",
+  reply: "change_refused" | "change_not_understood" | "recap_clarify",
 ): Promise<boolean> {
   if (!(await takeFloor(chatId, view, deps))) {
     const again = await retakeFloor(deps, chatId, view.sessionId, log, reply);
@@ -3300,6 +3309,14 @@ async function runInterpretPath(
     }
   }
 
+  // THE MESSAGE RIGHT AFTER A DOCUMENT RECAP (#413). The marker is alive for one
+  // inbound message: read here, cleared here, so a later message is never taken
+  // for a reply to a recap it did not follow. A document replaces it (its own
+  // recap sets a new one); a tap on an answer clears it in `applyDecision`.
+  const recapMarker = session.ok ? session.view.recapMarker ?? null : null;
+  if (recapMarker) await clearDocumentRecap(deps.db, burst.chatId);
+  const recapTurn = documents.length === 0 && recapMarker !== null;
+
   // A DOCUMENT. Read it, and let what it says answer questions.
   //
   // Handled before the text branch and instead of it: someone who uploads a
@@ -3512,6 +3529,9 @@ async function runInterpretPath(
       // is looking at: what they type is then something to ADD or CHANGE, and the
       // reader is given every answerable question for it (2026-10-15).
       summaryOnScreen: session.ok && (session.view.state === "awaiting_confirmation" || boundaryOnScreen(session.view) !== null),
+      // The recap is what they have just read: the message may be a correction
+      // of what the document gave rather than the answer on screen (#413).
+      afterDocumentRecap: recapTurn,
       answered: state.answered,
       // What they have already told us, so "actually, it's only my wife" is
       // something the model can propose at all (2026-09-16).
@@ -3582,6 +3602,38 @@ async function runInterpretPath(
     // The stops and the travellers change only through the confirmed flow.
     changeQuestions: CHANGE_QUESTIONS,
   });
+
+  // A MESSAGE ABOUT THE TRAVELLERS THAT NAMES NOBODY, right after the recap
+  // ("נוסעים אחרים" — the second couple's names were not read): the reader says
+  // `unclear` for `travelers`. It is answered with a question about the
+  // travellers, never filed against the question on screen (#413).
+  const clarifyTravellers = recapTurn
+    && state.answered.includes("travelers")
+    && unclear.some((u) => u.questionId === "travelers")
+    && !decisions.accepted.some((a) => a.questionId === "travelers")
+    && !((ops ?? []).some((op) => questionOfOp(op) === "travelers"));
+
+  // THE ON-SCREEN ANSWER THE FLOOR DID NOT WAIVE: a bot_name that is only a word
+  // for people, below the floor (#413). It is kept as an offer — "is this right?"
+  // — so a deliberate "Family" costs one tap, not a refusal. Only the question on
+  // screen: a volunteered low-confidence read for another question stays dropped,
+  // as it always was on the typed path.
+  if (!clarifyTravellers && onScreen) {
+    const offered = decisions.suggested.filter((x) => x.questionId === onScreen && !state.answered.includes(onScreen));
+    if (offered.length > 0) {
+      const offers: Record<string, SuggestedAnswer> = {};
+      for (const o of offered) {
+        const args = submitArgsFor(o.proposal.value);
+        offers[o.questionId] = {
+          optionId: args.optionId,
+          ...(args.otherText !== undefined ? { otherText: args.otherText } : {}),
+          ...(args.structuredData !== undefined ? { structuredData: args.structuredData } : {}),
+          ...(args.optionIds ? { optionIds: [...args.optionIds] } : {}),
+        };
+      }
+      await saveSuggestionsForChat(deps.db, burst.chatId, offers);
+    }
+  }
 
   for (const accepted of decisions.accepted) {
     // The MERGED answer, not the raw reading — see `submitArgsForAccepted`. (The
@@ -3667,6 +3719,17 @@ async function runInterpretPath(
   const made = change as ProposeResult | null;
   if (made) draftShown = await announceChange(deps, burst, made, language, log);
   if (draftShown) return;
+
+  if (clarifyTravellers) {
+    log(structuredLog("info", "interview.recap_clarify_travellers", { session_id: burst.sessionId }));
+    const now = await getSessionForChat(deps.db, burst.chatId);
+    if (now.ok && (await answerThisMessage(deps, burst.chatId, now.view, uiString("askOtherTravellers", now.view.language), log, "recap_clarify"))) {
+      // The names are the next message, and it is still about the recap: one more
+      // message, once — a second nameless reply does not renew it.
+      if (recapMarker && !recapMarker.endsWith(":asked")) await markDocumentRecap(deps.db, burst.chatId, `${recapMarker}:asked`);
+      return;
+    }
+  }
 
   // NEVER SILENT. A typed change to something already answered that the gate
   // would not take — an unsure read, a quote that is not in the message, a value

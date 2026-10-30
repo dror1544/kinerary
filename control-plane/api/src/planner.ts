@@ -290,6 +290,19 @@ const RETRYABLE_STATES = new Set([
  *
  * Refuses while a provision job holds a live lease — a stale/expired lease is
  * cancelled, an in-flight one is not yanked.
+ *
+ * LOCK ORDER (issue #387): `jobs` (non-terminal provision rows, FOR UPDATE),
+ * then `trips` (FOR UPDATE), then the `plans` / `jobs` / `trips` writes under
+ * those locks, with a PLAIN re-read of `jobs` once `trips` is held. It must
+ * agree with the worker's `_complete` and `_claim` (provisioner.py: jobs ->
+ * plan_approvals -> plans -> trips, `trips` last), `executeClear`
+ * (trip-clear.ts: jobs first, `trips` last, plain late re-read) and
+ * `correctIntake` (intake-correction.ts: same order). The job lock is the
+ * gate: any worker that has a non-terminal job on this trip holds that row
+ * before it touches plans or trips, so it is either finished (the row drops
+ * out of our locking read) or we queue behind it. It deliberately does NOT
+ * lock `plans` before `trips`: `resumeTrip` (admin-mutations.ts) takes
+ * trips -> plans, and a plans-first order here would conflict with it.
  */
 export async function retryProvision(
   db: pg.Pool,
@@ -301,6 +314,33 @@ export async function retryProvision(
   try {
     await client.query("BEGIN");
 
+    // 1. `jobs` FIRST. Lock every non-terminal provision job for this trip,
+    // THEN take `trips`, THEN decide. The worker claims with
+    // `... FOR UPDATE OF j SKIP LOCKED`, so once we hold these row locks a
+    // claim racing us skips the row instead of leasing it in the window
+    // between our check and our cancel — without the lock, a job claimed in
+    // that window would be cancelled here while its worker kept provisioning,
+    // and generatePlan would then queue a second one. `live` is computed
+    // against the DB clock in the same statement so a job that is genuinely
+    // in flight is never cancelled from under its worker. A worker finishing
+    // (`_complete`) holds its job row first, so this statement queues behind
+    // it (and re-evaluates the WHERE once it commits: a now-`succeeded` job
+    // drops out) instead of holding `trips` while the worker waits for it.
+    const provisionJobs = await client.query<{ id: string; live: boolean }>(
+      `SELECT id,
+              (state IN ('leased', 'running')
+               AND lease_expires_at IS NOT NULL
+               AND lease_expires_at > now()) AS live
+       FROM control_plane.jobs
+       WHERE trip_id = $1 AND job_type = 'provision'
+         AND state NOT IN ('succeeded', 'failed', 'cancelled')
+       FOR UPDATE`,
+      [tripId],
+    );
+    const lockedJobIds = new Set(provisionJobs.rows.map((j) => j.id));
+
+    // 2. `trips` LAST of the contended rows. The existence and state checks
+    // are made HERE, under this lock, so the decision is taken under it.
     const tripRow = await client.query<{ lifecycle_state: string }>(
       "SELECT lifecycle_state FROM control_plane.trips WHERE id = $1 FOR UPDATE",
       [tripId],
@@ -328,26 +368,27 @@ export async function retryProvision(
       return { ok: false, reason: "ORGANIZER_NOT_ON_ROSTER" };
     }
 
-    // Lock every non-terminal provision job for this trip, THEN decide. The
-    // worker claims with `... FOR UPDATE OF j SKIP LOCKED`, so once we hold
-    // these row locks a claim racing us skips the row instead of leasing it
-    // in the window between our check and our cancel — without the lock, a
-    // job claimed in that window would be cancelled here while its worker
-    // kept provisioning, and generatePlan would then queue a second one.
-    // `live` is computed against the DB clock in the same statement so a job
-    // that is genuinely in flight is never cancelled from under its worker.
-    const provisionJobs = await client.query<{ id: string; live: boolean }>(
-      `SELECT id,
-              (state IN ('leased', 'running')
-               AND lease_expires_at IS NOT NULL
-               AND lease_expires_at > now()) AS live
-       FROM control_plane.jobs
+    if (provisionJobs.rows.some((j) => j.live)) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "PROVISION_IN_PROGRESS" };
+    }
+
+    // 3. A PLAIN re-read of the non-terminal provision jobs, now that `trips`
+    // is held (never a second FOR UPDATE: that would lock `jobs` after
+    // `trips` and reopen the deadlock — trip-clear.ts, LOCK ORDER step 4).
+    // A job that was created between the locking read above and the `trips`
+    // lock committed under a concurrent generatePlan, which itself locks
+    // `trips`; it is a job we did not lock, so we must not cancel it (its
+    // worker could be claiming it right now, holding the job and waiting on
+    // our `trips` lock) and must not supersede its plan out from under it.
+    // Refuse, as for any in-flight provision.
+    const reread = await client.query<{ id: string }>(
+      `SELECT id FROM control_plane.jobs
        WHERE trip_id = $1 AND job_type = 'provision'
-         AND state NOT IN ('succeeded', 'failed', 'cancelled')
-       FOR UPDATE`,
+         AND state NOT IN ('succeeded', 'failed', 'cancelled')`,
       [tripId],
     );
-    if (provisionJobs.rows.some((j) => j.live)) {
+    if (reread.rows.some((j) => !lockedJobIds.has(j.id))) {
       await client.query("ROLLBACK");
       return { ok: false, reason: "PROVISION_IN_PROGRESS" };
     }

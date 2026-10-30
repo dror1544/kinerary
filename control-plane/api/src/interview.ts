@@ -377,6 +377,55 @@ export function datesInOrder(answers: AnswerStore): boolean {
   return end >= start;
 }
 
+/**
+ * What the dashboard's new-trip form wrote on the trip row (`POST /v1/trips`): the values an organizer already
+ * chose before the interview. Any of them may be absent, and the trip types are the DASHBOARD's vocabulary
+ * (`family | couple | group | other`), not the interview's.
+ */
+export interface TripCard {
+  destination: string | null;
+  /** `YYYY-MM-DD` as the `date` column prints it. */
+  startDate: string | null;
+  endDate: string | null;
+  tripType: string | null;
+}
+
+/** The dashboard's trip types the interview has an equivalent for. `group` and `other` are asked (owner decision, 2026-10-30). */
+const CARD_TRIP_TYPES: Readonly<Record<string, string>> = { family: "family", couple: "couple" };
+
+/**
+ * The answers a trip's card already holds, as the interview would have recorded them (#438).
+ *
+ * Each value goes through the SAME `validateAnswer` a typed answer does, so the interview never holds something it
+ * would have refused to be told; one that fails is left out and its question is asked as today. Dates must also be
+ * real days and in order (`datesInOrder`): when they are not, neither is seeded, because there is no telling which
+ * of the two is the mistake. Pure: it reads nothing and writes nothing, so the session start can call it inside
+ * the transaction that already holds the trip row.
+ */
+export function seedAnswersFromCard(card: TripCard): AnswerStore {
+  const seed: AnswerStore = {};
+  const accept = (questionId: string, optionId: string | null, text: string | null) => {
+    const checked = validateAnswer(questionId, optionId, text);
+    if (checked.ok) seed[questionId] = checked.answer;
+  };
+  if (card.destination !== null) accept("destination", null, card.destination);
+  const day = (value: string | null) => (value !== null && /^\d{4}-\d{2}-\d{2}$/.test(value.trim()) && readableDate(value, "en") !== null ? value.trim() : null);
+  const start = day(card.startDate);
+  const end = day(card.endDate);
+  const ordered = start === null || end === null || end >= start;
+  if (ordered && start !== null) accept("departure_date", null, start);
+  if (ordered && end !== null) accept("return_date", null, end);
+  // Own keys only: a card holding "constructor" must not resolve against Object.prototype.
+  const interviewType = card.tripType !== null && Object.hasOwn(CARD_TRIP_TYPES, card.tripType) ? CARD_TRIP_TYPES[card.tripType] : undefined;
+  if (interviewType !== undefined) accept("trip_type", interviewType, null);
+  return seed;
+}
+
+function textAnswer(answers: AnswerStore, questionId: string): string | null {
+  const answer = answers[questionId];
+  return answer?.kind === "text" ? answer.text : null;
+}
+
 /** The organizer's answer against the roster, as the interview and the build both read it. */
 export function organizerMatch(answers: AnswerStore): OrganizerMatch {
   const answer = answers.organizer_identity;
@@ -1789,6 +1838,8 @@ export interface SessionView {
   pendingAskText: string | null;
   /** What the router last sent, so it does not send it twice running. */
   lastPrompt: string | null;
+  /** The document recap the organizer has just read, if their next message is still about it (#413). */
+  recapMarker?: string | null;
   /**
    * Option ids currently selected per multi-select question.
    *
@@ -1922,6 +1973,19 @@ export interface InterviewUiState {
    */
   readingDocumentSince?: string;
   /**
+   * "The document recap is what they have just read" (#413).
+   *
+   * `say()` sets no `lastPrompt`, so after a document burst the only thing on
+   * record as on screen is the NEXT question the router put under the recap —
+   * `bot_name`, say — and the organizer's reply to the recap was read as the
+   * answer to that. This marks the recap: `recap:doc:<interpretation id>`, and
+   * `recap:doc:<id>:asked` once the router has asked a clarifying question about
+   * it. Alive for the next ONE inbound message (the router clears it the moment
+   * it reads that message), or the next tap on an answer; never a state the
+   * interview resumes from. Lives here, beside `lastPrompt`, not in a column.
+   */
+  recapMarker?: string;
+  /**
    * The optional question the interviewer has asked the router to put next.
    *
    * Optional questions are not walked automatically when an interviewer is
@@ -1991,6 +2055,15 @@ export interface InterviewUiState {
    * other way drops it.
    */
   suggestions?: Record<string, SuggestedAnswer>;
+  /**
+   * The name the opening greeted the organizer by -- the account's own name, else the Telegram first name -- kept
+   * ONLY on a session that was seeded from a dashboard trip (#438). It is display data, read once more when the
+   * roster is known: if it names exactly one traveller, "which of them are you?" is asked as a one-tap confirm
+   * (`organizerNameSuggestion`). Never an identity fact: the tap writes the roster's spelling, the name writes nothing.
+   */
+  organizerName?: string;
+  /** The organizer said "no" to the confirm above: `organizer_identity` is asked plainly from here on. */
+  organizerNameDeclined?: boolean;
 }
 
 /** A suggested answer, in the shape `submitAnswerForChat` takes. */
@@ -1999,6 +2072,11 @@ export interface SuggestedAnswer {
   otherText?: string;
   structuredData?: unknown;
   optionIds?: string[];
+  /**
+   * Where it came from, when not a document: `account_name` is the organizer's own name matched against the roster,
+   * which the router words as "you're Dana on the list, right?" rather than "I read this from your document".
+   */
+  source?: "account_name";
 }
 
 function parseSuggestions(raw: unknown): Record<string, SuggestedAnswer> | undefined {
@@ -2013,15 +2091,19 @@ function parseSuggestions(raw: unknown): Record<string, SuggestedAnswer> | undef
       ...(typeof v.otherText === "string" ? { otherText: v.otherText } : {}),
       ...(v.structuredData !== undefined ? { structuredData: v.structuredData } : {}),
       ...(Array.isArray(v.optionIds) ? { optionIds: v.optionIds.filter((id): id is string => typeof id === "string") } : {}),
+      ...(v.source === "account_name" ? { source: "account_name" as const } : {}),
     };
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
 function withoutSuggestion(ui: InterviewUiState, questionId: string): InterviewUiState {
-  if (!ui.suggestions?.[questionId]) return ui;
-  const { [questionId]: _dropped, ...rest } = ui.suggestions;
-  const { suggestions: _all, ...others } = ui;
+  // The organizer's-name confirm is derived from `organizerName` on every read, not stored, so a "no" has to be a
+  // fact of its own or the offer would come straight back.
+  const declined: InterviewUiState = questionId === "organizer_identity" && ui.organizerName ? { ...ui, organizerNameDeclined: true } : ui;
+  if (!declined.suggestions?.[questionId]) return declined;
+  const { [questionId]: _dropped, ...rest } = declined.suggestions;
+  const { suggestions: _all, ...others } = declined;
   return Object.keys(rest).length > 0 ? { ...others, suggestions: rest } : others;
 }
 
@@ -2060,6 +2142,9 @@ function parseUiState(raw: unknown): InterviewUiState {
     ...(typeof record.other_pending === "string" ? { otherPending: record.other_pending } : {}),
     ...((suggestions) => (suggestions ? { suggestions } : {}))(parseSuggestions(record.suggestions)),
     ...(typeof record.reading_document_since === "string" ? { readingDocumentSince: record.reading_document_since } : {}),
+    ...(typeof record.recap_marker === "string" && DOCUMENT_RECAP_MARKER.test(record.recap_marker) ? { recapMarker: record.recap_marker } : {}),
+    ...(typeof record.organizer_name === "string" && record.organizer_name.length > 0 ? { organizerName: record.organizer_name } : {}),
+    ...(record.organizer_name_declined === true ? { organizerNameDeclined: true } : {}),
   };
 }
 
@@ -2081,6 +2166,9 @@ function serializeUiState(ui: InterviewUiState): string {
     ...(ui.otherPending ? { other_pending: ui.otherPending } : {}),
     ...(ui.suggestions && Object.keys(ui.suggestions).length > 0 ? { suggestions: ui.suggestions } : {}),
     ...(ui.readingDocumentSince ? { reading_document_since: ui.readingDocumentSince } : {}),
+    ...(ui.recapMarker ? { recap_marker: ui.recapMarker } : {}),
+    ...(ui.organizerName ? { organizer_name: ui.organizerName } : {}),
+    ...(ui.organizerNameDeclined ? { organizer_name_declined: true } : {}),
   });
 }
 
@@ -2518,8 +2606,28 @@ function deriveSessionState(
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
+/**
+ * What a seeded session starts from, for the opening to say (#438): the card's destination and dates that were
+ * actually seeded (never a value the interview refused), and the name to greet the organizer by. `null` is
+ * "not seeded", and the opening then leaves that part out.
+ */
+export interface SeededOpening {
+  destination: string | null;
+  /** `YYYY-MM-DD`; the opening renders it in words. */
+  departureDate: string | null;
+  returnDate: string | null;
+  organizerName: string | null;
+}
+
 export type StartSessionResult =
-  | { ok: true; sessionId: string; sessionToken: string; view: SessionView }
+  | {
+      ok: true;
+      sessionId: string;
+      sessionToken: string;
+      view: SessionView;
+      /** Set only when the trip's card seeded the destination or the dates; absent for every other trip. */
+      seeded?: SeededOpening;
+    }
   | { ok: false; reason: "INVALID_TOKEN" | "EXPIRED" | "ALREADY_CONSUMED" | "REVOKED" | "TRIP_NOT_DRAFT" };
 
 export type GetSessionResult =
@@ -2623,8 +2731,18 @@ export async function startSession(
 
     // Verify the trip is still in 'draft' (enrollment could be issued and
     // the trip could have moved if something went wrong on a prior attempt).
-    const tripRow = await client.query<{ lifecycle_state: string }>(
-      "SELECT lifecycle_state FROM control_plane.trips WHERE id = $1 FOR UPDATE",
+    // The card (what the dashboard's new-trip form wrote) is read in the same statement that locks the row, so the
+    // seed below can never come from a different moment than the lifecycle check beside it. `::text` because the
+    // driver would otherwise turn a `date` into a JS Date in the server's time zone.
+    const tripRow = await client.query<{
+      lifecycle_state: string;
+      destination_label: string | null;
+      start_date: string | null;
+      end_date: string | null;
+      trip_type: string | null;
+    }>(
+      `SELECT lifecycle_state, destination_label, start_date::text AS start_date, end_date::text AS end_date, trip_type
+         FROM control_plane.trips WHERE id = $1 FOR UPDATE`,
       [enrollment.tripId],
     );
     const [trip] = tripRow.rows;
@@ -2632,6 +2750,10 @@ export async function startSession(
       await client.query("ROLLBACK");
       return { ok: false, reason: "TRIP_NOT_DRAFT" };
     }
+    const seed = seedAnswersFromCard({
+      destination: trip.destination_label, startDate: trip.start_date, endDate: trip.end_date, tripType: trip.trip_type,
+    });
+    const seededIds = Object.keys(seed);
 
     // Transition trip to 'intake_in_progress'.
     await client.query(
@@ -2673,11 +2795,29 @@ export async function startSession(
     // moment the interviewer reports what they really typed.
     const language = coerceLanguage(languageHint);
 
+    // The name the opening greets the organizer by (#438): the name they gave the product (`users.given_name`), and
+    // only when the account has none, the first name of the Telegram account that opened the link. NEVER
+    // `users.display_name`: for a Telegram signup or an invitation that is the local part of an email address, and
+    // `introductionReturning` already records why that is not a thing to greet someone with. Looked up only for a
+    // seeded session -- a trip with no card opens exactly as it always has.
+    let organizerName: string | null = null;
+    if (seededIds.length > 0) {
+      const named = await client.query<{ given_name: string | null }>(
+        "SELECT given_name FROM control_plane.users WHERE id = $1",
+        [enrollment.userId],
+      );
+      organizerName = named.rows[0]?.given_name?.trim() || telegramName?.firstName?.trim() || null;
+    }
+    const uiState: InterviewUiState = organizerName ? { organizerName } : {};
+
     await client.query(
       `INSERT INTO control_plane.intake_sessions
-         (id, trip_id, user_id, enrollment_id, session_token_digest, state, answers, telegram_chat_id, language, interpret_path)
-       VALUES ($1, $2, $3, $4, $5, 'interviewing', '{}'::jsonb, $6, $7, $8)`,
-      [sessionId, enrollment.tripId, enrollment.userId, enrollment.enrollmentId, digest, chatId, language, interpretPathDefault()],
+         (id, trip_id, user_id, enrollment_id, session_token_digest, state, answers, telegram_chat_id, language, interpret_path, ui_state)
+       VALUES ($1, $2, $3, $4, $5, 'interviewing', $9::jsonb, $6, $7, $8, $10::jsonb)`,
+      [
+        sessionId, enrollment.tripId, enrollment.userId, enrollment.enrollmentId, digest, chatId, language, interpretPathDefault(),
+        JSON.stringify(seed), serializeUiState(uiState),
+      ],
     );
 
     // The one moment both halves of "this Telegram person is this user" are
@@ -2699,28 +2839,56 @@ export async function startSession(
     await client.query("COMMIT");
 
     log(structuredLog("info", "interview.session_started", { session_id: sessionId, trip_id: enrollment.tripId }));
+    // Question ids only: the values are the organizer's trip and the name is theirs, and a log line is neither.
+    if (seededIds.length > 0) {
+      log(structuredLog("info", "interview.session_seeded", { session_id: sessionId, trip_id: enrollment.tripId, seeded: seededIds }));
+    }
+    // The other half of the same fact, so a card whose values were NOT taken is not invisible: a destination or a
+    // date the card holds that the interview refused is asked as today, and this line says it was. (A `group` or
+    // `other` trip type is a decision, not a refusal, and is not listed.) Question ids only.
+    const refused = [
+      trip.destination_label !== null && seed.destination === undefined ? "destination" : null,
+      trip.start_date !== null && seed.departure_date === undefined ? "departure_date" : null,
+      trip.end_date !== null && seed.return_date === undefined ? "return_date" : null,
+    ].filter((id): id is string => id !== null);
+    if (refused.length > 0) {
+      log(structuredLog("warn", "interview.session_seed_skipped", { session_id: sessionId, trip_id: enrollment.tripId, skipped: refused }));
+    }
 
-    const view: SessionView = {
-      sessionId,
-      tripId: enrollment.tripId,
-      state: "interviewing",
-      nextQuestion: INTAKE_QUESTIONS.find((q) => q.required) ?? null,
-      pendingAsk: null,
-      optionalRemaining: unansweredOptionalQuestions({}, INTAKE_QUESTIONS),
-      recap: null,
-      selections: {},
-      language: language ?? DEFAULT_LANGUAGE,
-      offeredMore: false,
-      lastPrompt: null,
-      phase: "opening",
-      awaiting: "person",
-      pendingEntry: null,
-      pendingSay: null,
-      pendingAskText: null,
-      suggestions: {},
-      otherPending: null,
-    };
-    return { ok: true, sessionId, sessionToken: rawSessionToken, view };
+    // Built from the answers the session now holds, so "the first question" is the first one still OPEN. For a trip
+    // with no card that is exactly the first required question, as before.
+    const view: SessionView = seededIds.length === 0
+      ? {
+          sessionId,
+          tripId: enrollment.tripId,
+          state: "interviewing",
+          nextQuestion: INTAKE_QUESTIONS.find((q) => q.required) ?? null,
+          pendingAsk: null,
+          optionalRemaining: unansweredOptionalQuestions({}, INTAKE_QUESTIONS),
+          recap: null,
+          selections: {},
+          language: language ?? DEFAULT_LANGUAGE,
+          offeredMore: false,
+          lastPrompt: null,
+          phase: "opening",
+          awaiting: "person",
+          pendingEntry: null,
+          pendingSay: null,
+          pendingAskText: null,
+          suggestions: {},
+          otherPending: null,
+        }
+      : buildSessionView(sessionId, enrollment.tripId, "interviewing", seed, uiState, language ?? DEFAULT_LANGUAGE, "opening", "person");
+    const opening =
+      seed.destination !== undefined || seed.departure_date !== undefined || seed.return_date !== undefined
+        ? {
+            destination: textAnswer(seed, "destination"),
+            departureDate: textAnswer(seed, "departure_date"),
+            returnDate: textAnswer(seed, "return_date"),
+            organizerName,
+          }
+        : undefined;
+    return { ok: true, sessionId, sessionToken: rawSessionToken, view, ...(opening ? { seeded: opening } : {}) };
   } catch (error) {
     try { await client.query("ROLLBACK"); } catch { /* ignore */ }
     throw error;
@@ -3329,6 +3497,30 @@ export async function getSessionForAgent(db: pg.Pool, chatId: string): Promise<G
   };
 }
 
+/**
+ * "You're Dana on the list, right?" (#438, AC-9).
+ *
+ * A session seeded from a dashboard trip knows the name it greeted the organizer by. Once the travellers are on
+ * record, that name names the organizer's row if it names EXACTLY ONE traveller by the same matcher the answer
+ * itself is settled with (`resolveOrganizer`); the router then offers that row as a Yes/No instead of the open
+ * question. Zero matches, several, a "no", an answer already on record, or a document's own suggestion for the
+ * question (which was read from evidence, and wins) all leave the question as it always was.
+ *
+ * Derived on every read, never stored: nothing here can go stale when the roster is corrected, and a Yes goes
+ * through the ordinary write path with the ROSTER's spelling, so the name itself never becomes an identity.
+ */
+function withOrganizerNameSuggestion(
+  stored: Record<string, SuggestedAnswer>,
+  answers: AnswerStore,
+  ui: InterviewUiState,
+): Record<string, SuggestedAnswer> {
+  if (!ui.organizerName || ui.organizerNameDeclined || stored.organizer_identity || answers.organizer_identity !== undefined) return stored;
+  const travelers = answers.travelers;
+  const match = resolveOrganizer(ui.organizerName, travelers?.kind === "structured" ? travelers.data : undefined);
+  if (match.kind !== "matched") return stored;
+  return { ...stored, organizer_identity: { optionId: null, otherText: match.name, source: "account_name" } };
+}
+
 function buildSessionView(
   sessionId: string,
   tripId: string,
@@ -3375,13 +3567,14 @@ function buildSessionView(
     language,
     offeredMore: ui.offeredMore === true,
     flightsOwed: flightsOwed(answers, ui),
+    recapMarker: ui.recapMarker ?? null,
     lastPrompt: ui.lastPrompt ?? null,
     phase,
     awaiting,
     pendingEntry: ui.pendingEntry ?? null,
     pendingSay: ui.pendingSay ?? null,
     pendingAskText: ui.pendingAskText ?? null,
-    suggestions: ui.suggestions ?? {},
+    suggestions: withOrganizerNameSuggestion(ui.suggestions ?? {}, answers, ui),
     choices: recordChoices(answers),
     subjects: recordSubjects(answers),
     unsettled: unsettledAnswers(answers),
@@ -4034,6 +4227,31 @@ export async function nominateQuestionForChat(
   return result;
 }
 
+/** `recap:doc:<interpretation id>` or `recap:doc:<id>:asked` — see `InterviewUiState.recapMarker`. */
+const DOCUMENT_RECAP_MARKER = /^recap:doc:[A-Za-z0-9_-]{1,80}(:asked)?$/;
+
+/** Marks the document recap just sent as what the organizer's next message may be about (#413). */
+export async function markDocumentRecap(db: pg.Pool, chatId: string, marker: string): Promise<void> {
+  if (!DOCUMENT_RECAP_MARKER.test(marker)) return;
+  await updateUiStateForChat(db, chatId, (ui) => ({ ...ui, recapMarker: marker })).catch(() => undefined);
+}
+
+/** The next message was read, or the organizer tapped an answer: the recap is no longer what they are replying to. */
+export async function clearDocumentRecap(db: pg.Pool, chatId: string): Promise<void> {
+  // Most taps and messages carry no marker: look before writing.
+  const marked = await db.query(
+    `SELECT 1 FROM control_plane.intake_sessions
+      WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND expired_at IS NULL AND ui_state ? 'recap_marker'`,
+    [chatId],
+  ).catch(() => null);
+  if (!marked || marked.rowCount === 0) return;
+  await updateUiStateForChat(db, chatId, (ui) => {
+    if (!ui.recapMarker) return ui;
+    const { recapMarker: _done, ...rest } = ui;
+    return rest;
+  }).catch(() => undefined);
+}
+
 /** Records what the router just sent, so it will not send the same thing again. */
 export async function recordLastPromptForChat(
   db: pg.Pool,
@@ -4621,6 +4839,81 @@ export async function confirmIntakeForChat(
   return confirmIntakeVia(db, { by: "chat", chatId }, log);
 }
 
+/** The action name `syncCardFromIntake` records; the admin audit view withholds its evidence by default (admin-dashboard.ts). */
+export const CARD_SYNC_AUDIT_ACTION = "trip.card_synced_from_intake";
+
+/**
+ * Writes the confirmed destination and dates back to the trip's dashboard card (#438, AC-10), so the dashboard and
+ * the interview hold one answer.
+ *
+ * Only what differs is written, and only a value the card could hold: a destination of 1-160 characters, and dates
+ * only when BOTH are real days in order (a half-readable pair would leave the card with a range nobody said). The
+ * trip's `title` follows the destination only while it is still the automatic one the dashboard made (`<old> trip`);
+ * a title the organizer wrote is theirs. The change is recorded in `audit_events` -- who (the session's user), when
+ * (`occurred_at`), and which fields -- and, deliberately, none of the values: the card's old values came from a
+ * form that is not held to the canonical-record rules the audit table enforces.
+ *
+ * Runs inside the confirm transaction, under a savepoint: a card that cannot take the new value (a constraint, a
+ * bad row) must never cost the organizer their confirmation. Not every trip has a card -- one made by Telegram
+ * signup has none, and gains one here, which is also what makes its dashboard row show a destination at all.
+ */
+async function syncCardFromIntake(
+  client: pg.PoolClient,
+  tripId: string,
+  userId: string,
+  answers: AnswerStore,
+  log: (line: string) => void,
+): Promise<void> {
+  const card =(await client.query<{ title: string | null; destination_label: string | null; start_date: string | null; end_date: string | null }>(
+    "SELECT title, destination_label, start_date::text AS start_date, end_date::text AS end_date FROM control_plane.trips WHERE id = $1",
+    [tripId],
+  )).rows[0];
+  if (!card) return;
+
+  const changed: string[] = [];
+  const destination = textAnswer(answers, "destination")?.trim() ?? "";
+  const destinationChanged = destination.length >= 1 && destination.length <= 160 && destination !== card.destination_label;
+  if (destinationChanged) changed.push("destination");
+
+  const day = (value: string | null) => (value !== null && /^\d{4}-\d{2}-\d{2}$/.test(value.trim()) && readableDate(value, "en") !== null ? value.trim() : null);
+  const start = day(textAnswer(answers, "departure_date"));
+  const end = day(textAnswer(answers, "return_date"));
+  const datesUsable = start !== null && end !== null && end >= start;
+  if (datesUsable && start !== card.start_date) changed.push("start_date");
+  if (datesUsable && end !== card.end_date) changed.push("end_date");
+  if (changed.length === 0) return;
+
+  const autoTitle = card.destination_label !== null && card.title === `${card.destination_label} trip`;
+  const title = destinationChanged && autoTitle ? `${destination} trip`.slice(0, 120) : card.title;
+
+  await client.query("SAVEPOINT card_sync");
+  try {
+    await client.query(
+      `UPDATE control_plane.trips
+          SET destination_label = $2, start_date = $3::date, end_date = $4::date, title = $5, updated_at = now()
+        WHERE id = $1`,
+      [
+        tripId,
+        destinationChanged ? destination : card.destination_label,
+        datesUsable ? start : card.start_date,
+        datesUsable ? end : card.end_date,
+        title,
+      ],
+    );
+    await client.query(
+      `INSERT INTO control_plane.audit_events (id, actor_ref, action, target_ref, correlation_id, evidence, occurred_at)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, now())`,
+      [generateId("audit"), userId, CARD_SYNC_AUDIT_ACTION, tripId, `corr_${randomBytes(8).toString("hex")}`, JSON.stringify({ changed })],
+    );
+    await client.query("RELEASE SAVEPOINT card_sync");
+  } catch {
+    // The card keeps what it had; the confirmation stands. Said out loud by the missing audit row and this line.
+    await client.query("ROLLBACK TO SAVEPOINT card_sync");
+    await client.query("RELEASE SAVEPOINT card_sync");
+    log(structuredLog("warn", "interview.card_sync_failed", { trip_id: tripId, safe_error_code: "CARD_UPDATE_REFUSED" }));
+  }
+}
+
 async function confirmIntakeVia(
   db: pg.Pool,
   locator: SessionLocator,
@@ -4744,6 +5037,11 @@ async function confirmIntakeVia(
       "UPDATE control_plane.trips SET lifecycle_state = 'intake_confirmed', updated_at = now() WHERE id = $1",
       [session.trip_id],
     );
+
+    // The dashboard's trip card follows the confirmed intake (#438, AC-10): the interview is where the destination
+    // and dates are confirmed, so the card must not keep showing the ones typed before it. In THIS transaction, so
+    // a confirmed intake and the card that shows it commit together or not at all.
+    await syncCardFromIntake(client, session.trip_id, session.user_id, session.answers, log);
 
     // Mark session confirmed. Token remains valid for idempotent re-confirmation.
     await client.query(

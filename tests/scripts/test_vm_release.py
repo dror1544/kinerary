@@ -18,18 +18,22 @@ dry-run and the rehearsal on a cloned VM (docs/control-plane-vm-deployment.md).
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -922,89 +926,951 @@ class RollbackPreparation(unittest.TestCase):
         self.assertIn("hermes", hermes.by_hand)
 
 
-class TripIntakeGatewayRestart(unittest.TestCase):
-    """Issue #420: start_switched recreates interview-mcp but the trip-intake
-    Hermes gateway keeps the tool list it registered at its own boot, so verify()
-    then reads an old `MCP server 'interview' ... registered` line (or none) and
-    the interview silently runs without the new tools. The gateway has to be
-    restarted after the compose up, whether or not the Hermes container was."""
+INTERVIEW_SOURCE = """
+if (AGENT_KEY) {
+  mcp.tool( "collect_answer_for_chat", schema, handler);
+  mcp.tool( "submit_answer_for_chat", schema, handler);
+}
+"""
+COMPANION_SOURCE = (ROOT / "control-plane" / "api" / "src" / "companion-mcp.ts").read_text()
 
-    REGISTERED = "INFO tools.mcp: MCP server 'interview' registered 3 tool(s): mcp__interview__a_for_chat"
 
-    class Stub(vr.ControlPlane):
-        def __init__(self, log, *, dry_run=False, write_new_line=True):
-            self.out = io.StringIO()
-            super().__init__(vr.Report(self.out, color=False))
-            self.calls = []
-            self.sh = self
-            self.dry_run = dry_run
-            self.log = log
-            self.write_new_line = write_new_line
+def reg(server, tools, count=None):
+    """The line Hermes logs when a gateway registers an MCP server's tools."""
+    prefix = "mcp__" + server.replace("-", "_") + "__"
+    names = ", ".join(prefix + t for t in tools)
+    return (f"2026-10-30 10:00:00 INFO tools.mcp: MCP server '{server}' registered "
+            f"{len(tools) if count is None else count} tool(s): {names}")
 
-        def r_text(self):
-            return self.out.getvalue()
 
-        def act(self, argv, *, describe="", **kwargs):  # stands in for cp.sh
-            argv = [str(a) for a in argv]
-            self.calls.append((" ".join(argv), describe, kwargs.get("timeout")))
-            if self.dry_run:
-                self.r.step(f"would run: {describe}")
-            elif "s6-svc" in " ".join(argv) and self.write_new_line:
-                with self.log.open("a") as handle:
-                    handle.write(TripIntakeGatewayRestart.REGISTERED + "\n")
-            return subprocess.CompletedProcess(list(argv), 0, b"", b"")
+def config_for(servers):
+    body = "".join(f"  {s}:\n    transport: sse\n    url: http://127.0.0.1:1/sse\n" for s in servers)
+    return "model:\n  default: x\nmcp_servers:\n" + body + "agent:\n  max_turns: 3\n"
+
+
+class RetiredPrefixMatchesRelay(unittest.TestCase):
+    """#420 AC-7: the Python retired-slug filter and the relay's NOT_RETIRED_SQL
+    are two copies of one rule; this is what stops them drifting apart."""
+
+    def test_the_prefix_equals_the_one_the_relay_uses(self):
+        source = (ROOT / "control-plane" / "api" / "src" / "trip-retirement.ts").read_text()
+        match = re.search(r'export const RETIRED_SLUG_PREFIX = "([^"]+)"', source)
+        self.assertIsNotNone(match, "trip-retirement.ts no longer exports RETIRED_SLUG_PREFIX")
+        self.assertEqual(vr.RETIRED_SLUG_PREFIX, match.group(1))
+
+    def test_live_companions_filters_on_that_constant(self):
+        cp = vr.ControlPlane(vr.Report(io.StringIO(), color=False))
+        sql = []
+        cp.psql = lambda text, **kw: (sql.append(text), "")[1]
+        cp.live_companions()
+        self.assertTrue(any(f"NOT LIKE '{vr.RETIRED_SLUG_PREFIX}%'" in s for s in sql), sql)
+
+
+class FakeShell:
+    """Stands in for cp.sh: answers `docker exec hermes …` from a table, records
+    what was RUN (act) apart from what was only read, and prints like the real one."""
+
+    def __init__(self, slots=(), down=(), ls_fails=False, restart_fails=(), listening=()):
+        self.report = None
+        self.dry_run = False
+        self.slots = list(slots)
+        self.down = set(down)
+        self.ls_fails = ls_fails
+        self.restart_fails = set(restart_fails)
+        self.listening = set(listening)
+        self.on_restart = lambda profile: None
+        self.executed = []          # act() calls that really ran
+        self.reads = []
+        self.argvs = []             # every argv, read or act: AC-9 looks for a key in all of them
+
+    def _answer(self, argv):
+        rest = argv[3:] if argv[:3] == ["docker", "exec", vr.HERMES_CONTAINER] else []
+        if rest[:1] == ["ls"]:
+            if self.ls_fails:
+                return 1, "Error response from daemon: container is not running"
+            return 0, "\n".join(["s6-linux-init-shutdownd", *[f"gateway-{s}" for s in self.slots], "user"])
+        if rest[:1] and rest[0].endswith("s6-svstat"):
+            profile = rest[1].rsplit("gateway-", 1)[1]
+            return 0, ("down (exitcode 0) 5 seconds" if profile in self.down else "up (pid 12) 100 seconds")
+        if rest[:1] and rest[0].endswith("s6-svc"):
+            profile = rest[2].rsplit("gateway-", 1)[1]
+            return (1, "") if profile in self.restart_fails else (0, "")
+        if argv[:1] == ["ss"]:
+            port = argv[-1].rsplit(":", 1)[1]
+            return 0, ("LISTEN 0 511 127.0.0.1:%s" % port) if port in self.listening else ""
+        return 0, ""
+
+    def read(self, argv, **kwargs):
+        argv = [str(a) for a in argv]
+        self.argvs.append(argv)
+        self.reads.append(argv)
+        rc, out = self._answer(argv)
+        return subprocess.CompletedProcess(argv, rc, out.encode(), b"")
+
+    def text(self, argv, **kwargs):
+        return self.read(argv, **kwargs).stdout.decode()
+
+    def act(self, argv, *, describe="", check=True, **kwargs):
+        argv = [str(a) for a in argv]
+        self.argvs.append(argv)
+        shown = describe or " ".join(argv)
+        if self.dry_run:
+            self.report.step(f"would run: {shown}")
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+        self.report.step(shown)
+        self.executed.append(argv)
+        rc, out = self._answer(argv)
+        rest = argv[3:] if argv[:3] == ["docker", "exec", vr.HERMES_CONTAINER] else []
+        if rest[:1] and rest[0].endswith("s6-svc") and rc == 0:
+            self.on_restart(rest[2].rsplit("gateway-", 1)[1])
+        if check and rc != 0:
+            raise vr.Refused(f"{shown} exited {rc}")
+        return subprocess.CompletedProcess(argv, rc, out.encode(), b"")
+
+    def executed_text(self):
+        return [" ".join(a) for a in self.executed]
+
+
+class FleetCP(vr.ControlPlane):
+    """A ControlPlane with the database and the relay stubbed and a FakeShell for
+    docker. What it does NOT stub is what these tests are about: discovery,
+    restarts, registration reads, bridge health and classification."""
+
+    def __init__(self, shell, *, live=(), retired=(), dry_run=False, events=(), core=False):
+        self.out = io.StringIO()
+        super().__init__(vr.Report(self.out, color=False), dry_run=dry_run)
+        self.sh = shell
+        shell.report, shell.dry_run = self.r, dry_run
+        self.live, self.retired, self.events, self.core = list(live), set(retired), list(events), core
+
+    def live_companions(self):
+        return list(self.live)
+
+    def retired_profiles(self):
+        return set(self.retired)
+
+    def relay_log(self):
+        return self.events
+
+    def vm_env(self):
+        return {"KINERARY_REV": "rev1111", "HERMES_REV": "h1"}
+
+    def core_checks(self, findings, events):
+        if self.core:
+            super().core_checks(findings, events)
+
+    def said(self):
+        return self.out.getvalue()
+
+
+class FleetWorld(unittest.TestCase):
+    """A scratch Hermes data directory, checkout and deploy root, patched in."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="vm-release-gateway-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="vm-release-fleet-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-        logs = self.tmp / "profiles" / "trip-intake" / "logs"
-        logs.mkdir(parents=True)
-        self.log = logs / "agent.log"
-        self.log.write_text(self.REGISTERED + "\n")  # the OLD registration, from before the switch
-        patcher = mock.patch.object(vr, "HERMES_DATA", self.tmp)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        self.data, self.repo, self.deploy = self.tmp / "hermes", self.tmp / "repo", self.tmp / "deploy"
+        (self.data / "profiles").mkdir(parents=True)
+        src = self.repo / "control-plane" / "api" / "src"
+        src.mkdir(parents=True)
+        (src / "interview-mcp.ts").write_text(INTERVIEW_SOURCE)
+        (src / "companion-mcp.ts").write_text(COMPANION_SOURCE)
+        (self.deploy / "trips").mkdir(parents=True)
+        for name, value in (("HERMES_DATA", self.data), ("REPO", self.repo), ("DEPLOY_ROOT", self.deploy),
+                            ("DEPLOYMENT_DIR", self.repo / "control-plane" / "deployment")):
+            patcher = mock.patch.object(vr, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         sleeper = mock.patch.object(vr.time, "sleep", lambda _s: None)
         sleeper.start()
         self.addCleanup(sleeper.stop)
 
-    def restart_calls(self, cp):
-        return [i for i, (argv, _d, _t) in enumerate(cp.calls) if "s6-svc" in argv]
+    def profile(self, name, servers, *log):
+        home = self.data / "profiles" / name
+        (home / "logs").mkdir(parents=True, exist_ok=True)
+        (home / "config.yaml").write_text(config_for(servers))
+        (home / "logs" / "agent.log").write_text("".join(line + "\n" for line in log))
+        return home
 
-    def test_restarts_the_gateway_after_the_compose_up_even_when_hermes_is_untouched(self):
-        cp = self.Stub(self.log)
+    def append_log(self, name, *lines):
+        with (self.data / "profiles" / name / "logs" / "agent.log").open("a") as handle:
+            handle.writelines(line + "\n" for line in lines)
+
+    def log_text(self, name):
+        return (self.data / "profiles" / name / "logs" / "agent.log").read_text()
+
+    INTERVIEW_TOOLS = ["collect_answer_for_chat", "submit_answer_for_chat"]
+    COMPANION_TOOLS = vr.extract_companion_tools(COMPANION_SOURCE)
+
+    def healthy(self, name, servers=None):
+        """A profile whose every configured server has registered."""
+        servers = servers or {"trip-mcp": ["get_config"], "trip-control": self.COMPANION_TOOLS}
+        return self.profile(name, list(servers), *[reg(s, t) for s, t in servers.items()])
+
+    def intake(self, *extra):
+        return self.profile("trip-intake", ["interview"], *extra, reg("interview", self.INTERVIEW_TOOLS))
+
+    @staticmethod
+    def by_id(result):
+        return {c.id: c for c in result.checks}
+
+
+class McpServerNames(unittest.TestCase):
+    """The servers a gateway is configured to use come from its config.yaml, not from a list in the tool."""
+
+    def test_the_keys_under_mcp_servers_and_nothing_else(self):
+        text = ("model:\n  default: x\n# a comment\nmcp_servers:\n"
+                "  trip-mcp:\n    transport: sse\n    url: \"SET_VIA_SECURE_CONFIG\"\n"
+                "  # the companion's line to the control plane\n"
+                "  trip-control:\n    transport: sse\n    headers:\n      Authorization: \"Bearer x\"\n"
+                "  'quoted-one':\n    url: http://x\n"
+                "agent:\n  disabled_toolsets:\n    - terminal\n")
+        self.assertEqual(vr.mcp_server_names(text), ["trip-mcp", "trip-control", "quoted-one"])
+
+    def test_none_configured(self):
+        self.assertEqual(vr.mcp_server_names("mcp_servers: {}\nagent: {}\n"), [])
+        self.assertEqual(vr.mcp_server_names("model: x\n"), [])
+        self.assertEqual(vr.mcp_server_names(""), [])
+
+    def test_a_disabled_server_is_not_expected_to_register(self):
+        text = "mcp_servers:\n  on:\n    url: x\n  off:\n    enabled: false\n    url: y\n"
+        self.assertEqual(vr.mcp_server_names(text), ["on"])
+
+    def test_the_companion_tool_list_is_read_from_the_server_source(self):
+        self.assertEqual(vr.extract_companion_tools(COMPANION_SOURCE),
+                         ["get_assistant_names", "set_assistant_names", "report_bug"])
+        self.assertEqual(vr.extract_companion_tools("nothing here"), [])
+
+
+class GatewayDiscovery(FleetWorld):
+    """#420: the running set is read off the supervisor, then judged."""
+
+    def discover(self, shell, **kwargs):
+        cp = FleetCP(shell, **kwargs)
+        return cp, cp.running_gateways()
+
+    def test_running_slots_with_a_profile_are_the_set_to_restart(self):
+        self.intake(); self.healthy("trip-a"); self.healthy("trip-monitor", {"fleet": ["alerts"]})
+        shell = FakeShell(slots=["trip-intake", "trip-a", "trip-monitor"])
+        _cp, found = self.discover(shell, live=[("a-trip", "trip-a")])
+        self.assertEqual(sorted(found.running), ["trip-a", "trip-intake", "trip-monitor"])
+        self.assertEqual(found.skipped, [])
+        self.assertIsNone(found.error)
+        self.assertEqual(found.not_running, [])
+        self.assertEqual(shell.executed, [], "discovery only reads")
+
+    def test_a_slot_without_a_profile_directory_is_a_teardown_leftover(self):
+        self.intake()
+        shell = FakeShell(slots=["trip-intake", "trip-b"])
+        _cp, found = self.discover(shell)
+        self.assertEqual(found.running, ["trip-intake"])
+        self.assertEqual(found.skipped, [("trip-b", "supervisor without a profile (teardown leftover)")])
+
+    def test_a_running_slot_of_a_retired_trip_is_reported_not_restarted(self):
+        self.intake(); self.healthy("trip-x")
+        shell = FakeShell(slots=["trip-intake", "trip-x"])
+        _cp, found = self.discover(shell, retired=["trip-x"])
+        self.assertEqual(found.running, ["trip-intake"])
+        self.assertEqual(found.skipped, [("trip-x", "retired trip")])
+
+    def test_a_slot_s6_says_is_down_is_not_restarted(self):
+        self.intake(); self.healthy("trip-a")
+        shell = FakeShell(slots=["trip-intake", "trip-a"], down=["trip-a"])
+        _cp, found = self.discover(shell, live=[("a-trip", "trip-a")])
+        self.assertEqual(found.running, ["trip-intake"])
+        self.assertEqual(found.not_running, ["trip-a"], "expected, and not running: verify fails it, the switch does not start it")
+        self.assertEqual([p for p, _why in found.skipped], ["trip-a"])
+
+    def test_a_slot_name_that_is_not_a_profile_name_is_never_passed_on(self):
+        self.intake()
+        shell = FakeShell(slots=["trip-intake", "Bad_Name", "x;reboot"])
+        _cp, found = self.discover(shell)
+        self.assertEqual(found.running, ["trip-intake"])
+        self.assertEqual(sorted(p for p, _w in found.skipped), ["Bad_Name", "x;reboot"])
+
+    def test_an_expected_profile_that_is_not_running_is_listed(self):
+        self.intake()
+        shell = FakeShell(slots=["trip-intake"])
+        _cp, found = self.discover(shell, live=[("a-trip", "trip-a")])
+        self.assertEqual(found.not_running, ["trip-a"])
+
+    def test_an_unreadable_supervisor_is_an_error_never_an_empty_set(self):
+        shell = FakeShell(ls_fails=True)
+        _cp, found = self.discover(shell)
+        self.assertEqual(found.running, [])
+        self.assertIn("could not read the Hermes supervisor", found.error)
+
+    def test_a_supervisor_listing_no_gateway_at_all_is_an_error_too(self):
+        shell = FakeShell(slots=[])
+        _cp, found = self.discover(shell)
+        self.assertIn("could not read the Hermes supervisor", found.error)
+
+
+class SwitchOrder(FleetWorld):
+    """#420 AC-1, 4, 5, 6, 8: what start_switched runs, and in what order."""
+
+    def world(self, *, restart_fails=(), ls_fails=False, registers=True, dry_run=False):
+        self.intake(); self.healthy("trip-a"); self.healthy("trip-monitor", {"fleet": ["alerts"]})
+        shell = FakeShell(slots=["trip-intake", "trip-a", "trip-monitor"], restart_fails=restart_fails, ls_fails=ls_fails)
+        # A restarted gateway registers again: that is the fresh line the release waits for.
+        def on_restart(profile):
+            servers = vr.mcp_server_names((self.data / "profiles" / profile / "config.yaml").read_text())
+            tools = {"interview": self.INTERVIEW_TOOLS, "trip-control": self.COMPANION_TOOLS}
+            self.append_log(profile, *[reg(s, tools.get(s, ["t"])) for s in servers])
+        shell.on_restart = on_restart if registers else (lambda _p: None)
+        cp = FleetCP(shell, live=[("a-trip", "trip-a")], dry_run=dry_run)
+        return cp, shell
+
+    def test_every_running_gateway_restarts_once_between_the_compose_up_and_the_relay(self):
+        cp, shell = self.world()
         cp.start_switched(None, restart_hermes=False)
-        compose_up = next(i for i, (argv, _d, _t) in enumerate(cp.calls) if "interview-mcp" in argv)
-        restarts = self.restart_calls(cp)
-        self.assertEqual(len(restarts), 1)
-        self.assertGreater(restarts[0], compose_up, "the gateway restarts after interview-mcp is up")
-        argv, _describe, timeout = cp.calls[restarts[0]]
-        self.assertEqual(argv.split()[:4], ["docker", "exec", vr.HERMES_CONTAINER, "/command/s6-svc"])
-        self.assertIn("-r /run/service/gateway-trip-intake", argv)
-        self.assertEqual(timeout, 60)
+        executed = shell.executed_text()
+        restarts = [i for i, a in enumerate(executed) if "/command/s6-svc -r" in a]
+        self.assertEqual(sorted(executed[i].split()[-1] for i in restarts),
+                         ["/run/service/gateway-trip-a", "/run/service/gateway-trip-intake", "/run/service/gateway-trip-monitor"])
+        up = next(i for i, a in enumerate(executed) if "up -d --wait" in a and "interview-mcp" in a and "companion-mcp" in a)
+        stop = next(i for i, a in enumerate(executed) if a.endswith(" stop relay"))
+        relay = next(i for i, a in enumerate(executed) if "vm-relay-restart.sh" in a)
+        self.assertTrue(up < stop < min(restarts) and max(restarts) < relay, executed)
+        self.assertNotIn("TRIP_INTAKE", cp.said())
+        self.assertEqual(set(cp.gateway_restarted), {"trip-intake", "trip-a", "trip-monitor"})
 
-    def test_restarts_the_gateway_when_hermes_is_restarted_too(self):
-        cp = self.Stub(self.log)
+    def test_each_profile_s_pre_restart_line_count_is_kept_for_verify(self):
+        cp, shell = self.world()
+        before = {p: self.log_text(p).count("\n") for p in ("trip-intake", "trip-a", "trip-monitor")}
+        cp.start_switched(None, restart_hermes=False)
+        self.assertEqual(cp.gateway_offsets, before)
+        self.assertGreater(self.log_text("trip-a").count("\n"), before["trip-a"])
+
+    def test_the_restart_is_one_function_per_profile(self):
+        cp, shell = self.world()
+        seen = []
+        original = cp.restart_gateway
+        cp.restart_gateway = lambda profile: (seen.append(profile), original(profile))[1]
+        cp.start_switched(None, restart_hermes=False)
+        self.assertEqual(sorted(seen), ["trip-a", "trip-intake", "trip-monitor"])
+
+    def test_a_hermes_recreate_restarts_no_gateway_by_hand(self):
+        cp, shell = self.world()
+        before = {p: self.log_text(p).count("\n") for p in ("trip-intake", "trip-a", "trip-monitor")}
         cp.start_switched("abc1234", restart_hermes=True)
-        hermes_up = next(i for i, (argv, _d, _t) in enumerate(cp.calls) if argv.endswith(" hermes"))
-        self.assertGreater(self.restart_calls(cp)[0], hermes_up)
+        executed = shell.executed_text()
+        self.assertFalse([a for a in executed if "s6-svc" in a], executed)
+        relay = next(i for i, a in enumerate(executed) if "vm-relay-restart.sh" in a)
+        hermes = next(i for i, a in enumerate(executed) if a.endswith(" hermes"))
+        self.assertGreater(hermes, relay, "Hermes is recreated after the relay restart, as before")
+        for profile, count in before.items():
+            self.assertEqual(cp.gateway_offsets[profile], count, "the log position is taken BEFORE the container goes")
 
-    def test_waits_for_a_new_registration_line_not_the_old_one(self):
-        cp = self.Stub(self.log, write_new_line=False)
-        cp.start_switched(None, restart_hermes=False)
-        self.assertEqual(self.log.read_text().count("registered"), 1, "nothing new was logged")
-        self.assertEqual(vr.count_interview_registrations(self.log), 1)
-        # The wait gave up (bounded) and said so, instead of passing on the stale line.
-        self.assertIn("did not log", cp.r_text())
+    def test_one_failed_restart_does_not_stop_the_others_or_the_relay(self):
+        cp, shell = self.world(restart_fails=["trip-a"])
+        cp.start_switched(None, restart_hermes=False)           # no Refused: this is after the point of no return
+        executed = shell.executed_text()
+        self.assertEqual(len([a for a in executed if "s6-svc -r" in a]), 3, "all three were tried")
+        self.assertTrue(any("vm-relay-restart.sh" in a for a in executed), "the relay still starts")
+        self.assertIn("trip-a", cp.gateway_restart_failed)
+        self.assertEqual(cp.gateway_restarted, {"trip-intake", "trip-monitor"})
+        failed = [line for line in cp.said().splitlines() if "trip-a" in line and "✗" in line]
+        self.assertTrue(failed, cp.said())
 
-    def test_a_dry_run_only_describes_the_restart(self):
-        cp = self.Stub(self.log, dry_run=True)
+    def test_a_dry_run_discovers_for_real_and_runs_nothing(self):
+        cp, shell = self.world(dry_run=True)
         cp.start_switched(None, restart_hermes=False)
-        restarts = self.restart_calls(cp)
-        self.assertEqual(len(restarts), 1)
-        self.assertEqual(self.log.read_text().count("registered"), 1, "a dry run changes nothing")
-        self.assertIn("would run:", cp.r_text())
-        self.assertNotIn("did not log", cp.r_text())
+        self.assertTrue([r for r in shell.reads if r[-2:] == ["ls", vr.S6_SCANDIR]], "discovery ran")
+        self.assertEqual(shell.executed, [])
+        said = cp.said()
+        for profile in ("trip-intake", "trip-a", "trip-monitor"):
+            self.assertRegex(said, rf"would run: .*{profile}")
+        self.assertIn("compose", said)
+        self.assertEqual(self.log_text("trip-a").count("registered"), 2, "a dry run changes nothing")
+
+    def test_an_unreadable_supervisor_is_carried_not_swallowed(self):
+        cp, shell = self.world(ls_fails=True)
+        cp.start_switched(None, restart_hermes=False)
+        self.assertIn("could not read the Hermes supervisor", cp.said())
+        self.assertIn("could not read the Hermes supervisor", cp.switch_gateway_error)
+        self.assertFalse([a for a in shell.executed_text() if "s6-svc" in a])
+        self.assertTrue(any("vm-relay-restart.sh" in a for a in shell.executed_text()))
+
+    def test_skipped_slots_are_reported_with_their_reason(self):
+        cp, shell = self.world()
+        shell.slots += ["trip-b", "trip-x"]
+        self.healthy("trip-x")
+        cp.retired = {"trip-x"}
+        cp.start_switched(None, restart_hermes=False)
+        self.assertIn("trip-b: supervisor without a profile (teardown leftover)", cp.said())
+        self.assertIn("trip-x: retired trip", cp.said())
+        self.assertFalse([a for a in shell.executed_text() if "gateway-trip-b" in a or "gateway-trip-x" in a])
+
+    def test_it_waits_for_a_new_registration_not_the_old_one(self):
+        cp, shell = self.world(registers=False)
+        cp.start_switched(None, restart_hermes=False)
+        self.assertEqual(self.log_text("trip-intake").count("registered"), 1, "nothing new was logged")
+        self.assertIn("did not log", cp.said())
+        self.assertIn("trip-intake", cp.said())
+
+    def test_it_says_so_when_every_gateway_re_registered(self):
+        cp, shell = self.world()
+        cp.start_switched(None, restart_hermes=False)
+        self.assertNotIn("did not log", cp.said())
+        self.assertIn("re-registered", cp.said())
+
+    def test_the_wait_is_bounded(self):
+        cp, shell = self.world(registers=False)
+        sleeps = []
+        with mock.patch.object(vr.time, "sleep", lambda s: sleeps.append(s)):
+            cp.start_switched(None, restart_hermes=False)
+        self.assertLessEqual(sum(sleeps), 60)
+
+
+class ProfileToolChecks(FleetWorld):
+    """#294: each gateway is judged against the MCP servers in its own config,
+    from lines written after its own restart."""
+
+    def verify(self, shell=None, *, baseline=None, setup=None, **kwargs):
+        shell = shell or FakeShell(slots=["trip-intake", "trip-a"])
+        cp = FleetCP(shell, **kwargs)
+        cp.companion_checks = lambda findings, events: None
+        if setup:
+            setup(cp)
+        return cp, cp.verify(baseline)
+
+    def test_a_companion_server_missing_a_tool_fails_with_its_name(self):
+        self.intake()
+        tools = [t for t in self.COMPANION_TOOLS if t != "report_bug"]
+        self.profile("trip-a", ["trip-mcp", "trip-control"], reg("trip-mcp", ["get_config"]), reg("trip-control", tools))
+        _cp, result = self.verify(live=[("a-trip", "trip-a")])
+        checks = self.by_id(result)
+        self.assertFalse(checks["tools:trip-a:trip-control"].ok)
+        self.assertEqual(checks["tools:trip-a:trip-control"].code, "MISSING:report_bug")
+        self.assertTrue(checks["tools:trip-a:trip-mcp"].ok)
+        self.assertTrue(checks["tools:trip-intake:interview"].ok)
+        self.assertFalse(result.ok)
+
+    def test_a_complete_registration_passes(self):
+        self.intake(); self.healthy("trip-a")
+        _cp, result = self.verify(live=[("a-trip", "trip-a")])
+        self.assertTrue(result.ok, [c for c in result.checks if not c.ok])
+        self.assertTrue(self.by_id(result)["tools:trip-a:trip-control"].ok)
+
+    def test_tool_names_are_exact_not_substrings(self):
+        self.intake()
+        # `answer_for_chat` is not registered: `collect_answer_for_chat` merely contains it.
+        source = self.repo / "control-plane" / "api" / "src" / "interview-mcp.ts"
+        source.write_text('if (AGENT_KEY) {\n mcp.tool( "answer_for_chat", s, h);\n mcp.tool( "collect_answer_for_chat", s, h);\n}\n')
+        _cp, result = self.verify(shell=FakeShell(slots=["trip-intake"]))
+        self.assertEqual(self.by_id(result)["tools:trip-intake:interview"].code, "MISSING:answer_for_chat")
+
+    def test_a_registration_older_than_the_restart_is_not_a_registration(self):
+        old = reg("interview", self.INTERVIEW_TOOLS)
+        self.profile("trip-intake", ["interview"], old)
+        _cp, result = self.verify(shell=FakeShell(slots=["trip-intake"]),
+                                  setup=lambda cp: (cp.gateway_offsets.update({"trip-intake": 1}),
+                                                    cp.gateway_restarted.add("trip-intake")))
+        check = self.by_id(result)["tools:trip-intake:interview"]
+        self.assertEqual((check.ok, check.code), (False, "NOT_REGISTERED"))
+
+    def test_a_line_written_after_the_restart_is_accepted(self):
+        old = reg("interview", ["stale_for_chat"])
+        self.profile("trip-intake", ["interview"], old)
+        self.append_log("trip-intake", reg("interview", self.INTERVIEW_TOOLS))
+        _cp, result = self.verify(shell=FakeShell(slots=["trip-intake"]),
+                                  setup=lambda cp: (cp.gateway_offsets.update({"trip-intake": 1}),
+                                                    cp.gateway_restarted.add("trip-intake")))
+        self.assertTrue(self.by_id(result)["tools:trip-intake:interview"].ok, "the fresh line is the one judged, not the old")
+
+    def test_a_rotated_log_is_read_whole(self):
+        self.intake()
+        _cp, result = self.verify(shell=FakeShell(slots=["trip-intake"]),
+                                  setup=lambda cp: (cp.gateway_offsets.update({"trip-intake": 500}),
+                                                    cp.gateway_restarted.add("trip-intake")))
+        self.assertTrue(self.by_id(result)["tools:trip-intake:interview"].ok)
+
+    def test_every_restarted_gateway_is_read_from_its_own_offset(self):
+        # AC-13: three profiles, three offsets, no profile name in the check list.
+        self.profile("trip-intake", ["interview"], "x", reg("interview", ["old_for_chat"]), "y")
+        self.append_log("trip-intake", reg("interview", self.INTERVIEW_TOOLS))                      # line 4: after offset 3
+        self.profile("trip-a", ["trip-mcp", "trip-control"], reg("trip-mcp", ["get_config"]),
+                     reg("trip-control", self.COMPANION_TOOLS))                                      # both before offset 2
+        self.profile("trip-monitor", ["fleet", "issues"], reg("fleet", ["alerts"]))
+        self.append_log("trip-monitor", reg("fleet", ["alerts"]))                                   # fleet re-registered, issues did not
+        self.profile("brand-new-gateway", ["whatever"], reg("whatever", ["t"]))
+        shell = FakeShell(slots=["trip-intake", "trip-a", "trip-monitor", "brand-new-gateway"])
+
+        def setup(cp):
+            cp.gateway_offsets.update({"trip-intake": 3, "trip-a": 2, "trip-monitor": 1})
+            cp.gateway_restarted.update({"trip-intake", "trip-a", "trip-monitor"})
+        _cp, result = self.verify(shell, live=[("a-trip", "trip-a")], setup=setup)
+        checks = self.by_id(result)
+        self.assertEqual({k for k in checks if k.startswith("tools:")},
+                         {"tools:trip-intake:interview", "tools:trip-a:trip-mcp", "tools:trip-a:trip-control",
+                          "tools:trip-monitor:fleet", "tools:trip-monitor:issues", "tools:brand-new-gateway:whatever"})
+        self.assertTrue(checks["tools:trip-intake:interview"].ok, "its own line 4 is after its own offset 3")
+        self.assertEqual(checks["tools:trip-a:trip-mcp"].code, "NOT_REGISTERED", "nothing after ITS offset, whatever the others logged")
+        self.assertEqual(checks["tools:trip-a:trip-control"].code, "NOT_REGISTERED")
+        self.assertTrue(checks["tools:trip-monitor:fleet"].ok)
+        self.assertEqual(checks["tools:trip-monitor:issues"].code, "NOT_REGISTERED")
+        self.assertTrue(checks["tools:brand-new-gateway:whatever"].ok, "no restart recorded for it: its newest line stands")
+
+    def test_a_restart_that_failed_leaves_a_recreated_server_stale(self):
+        # AC-14: companion-mcp was recreated; the gateway was not restarted, so
+        # its old trip-control connection is dead whatever its log says.
+        self.intake(); self.healthy("trip-a")
+
+        def setup(cp):
+            cp.gateway_offsets["trip-a"] = self.log_text("trip-a").count("\n")
+            cp.gateway_restart_failed.add("trip-a")
+        _cp, result = self.verify(live=[("a-trip", "trip-a")], setup=setup,
+                                  baseline=[vr.Check("tools:trip-a:trip-control", False, "STALE_REGISTRATION")])
+        checks = self.by_id(result)
+        self.assertEqual(checks["tools:trip-a:trip-control"].code, "STALE_REGISTRATION")
+        self.assertTrue(checks["tools:trip-a:trip-mcp"].ok, "trip-mcp was not replaced by the switch: its line stands")
+        self.assertIn("tools:trip-a:trip-control", [c.id for c in result.caused], "switch-owned: caused even if it failed before")
+
+    def test_an_unreadable_supervisor_fails_the_discovery_check_as_caused(self):
+        # AC-15
+        self.intake()
+        _cp, result = self.verify(shell=FakeShell(ls_fails=True), baseline=[vr.Check("gateways:discovery", False, "SUPERVISOR_UNREADABLE")])
+        check = self.by_id(result)["gateways:discovery"]
+        self.assertEqual((check.ok, check.code), (False, "SUPERVISOR_UNREADABLE"))
+        self.assertEqual([c.id for c in result.caused], ["gateways:discovery"])
+
+    def test_a_failure_carried_from_the_switch_still_fails_a_later_readable_discovery(self):
+        self.intake()
+        _cp, result = self.verify(shell=FakeShell(slots=["trip-intake"]), baseline=[],
+                                  setup=lambda cp: setattr(cp, "switch_gateway_error", "could not read the Hermes supervisor"))
+        self.assertEqual(self.by_id(result)["gateways:discovery"].code, "SUPERVISOR_UNREADABLE")
+
+    def test_an_expected_gateway_that_is_not_running_fails_not_running(self):
+        self.intake()
+        _cp, result = self.verify(shell=FakeShell(slots=["trip-intake"]), live=[("a-trip", "trip-a")])
+        check = self.by_id(result)["gateway:trip-a"]
+        self.assertEqual((check.ok, check.code), (False, "NOT_RUNNING"))
+        self.assertFalse([c for c in result.checks if c.id.startswith("tools:trip-a")])
+
+    def test_a_gateway_the_switch_restarted_that_did_not_come_back_fails(self):
+        self.intake(); self.profile("trip-monitor", ["fleet"], reg("fleet", ["alerts"]))
+        _cp, result = self.verify(shell=FakeShell(slots=["trip-intake"]),
+                                  setup=lambda cp: cp.gateway_restarted.add("trip-monitor"))
+        self.assertEqual(self.by_id(result)["gateway:trip-monitor"].code, "NOT_RUNNING")
+
+    def test_a_dormant_companion_has_no_checks_of_any_kind(self):
+        # AC-11: live_companions() already leaves it out, and a stopped gateway is not discovered.
+        self.intake(); self.healthy("dormant-one")
+        (self.deploy / "trips" / "dormant-trip" / "mcp").mkdir(parents=True)
+        (self.deploy / "trips" / "dormant-trip" / "mcp" / ".env").write_text("MCP_PORT=1\nMCP_API_KEY=k\n")
+        shell = FakeShell(slots=["trip-intake", "dormant-one"], down=["dormant-one"])
+        cp = FleetCP(shell, live=[])
+        result = cp.verify(None)
+        self.assertFalse([c for c in result.checks if "dormant" in c.id], [c.id for c in result.checks])
+
+    def test_a_server_that_registers_no_tool_fails(self):
+        self.intake()
+        self.profile("trip-monitor", ["fleet"], reg("fleet", [], count=0))
+        _cp, result = self.verify(shell=FakeShell(slots=["trip-intake", "trip-monitor"]))
+        self.assertEqual(self.by_id(result)["tools:trip-monitor:fleet"].code, "NO_TOOLS")
+
+    def test_the_interview_server_must_be_configured_on_the_interview_profile(self):
+        self.profile("trip-intake", [], )
+        _cp, result = self.verify(shell=FakeShell(slots=["trip-intake"]))
+        self.assertEqual(self.by_id(result)["tools:trip-intake:interview"].code, "NOT_CONFIGURED")
+
+    def test_a_running_gateway_without_a_readable_config_fails(self):
+        self.intake()
+        (self.data / "profiles" / "trip-intake" / "config.yaml").unlink()
+        _cp, result = self.verify(shell=FakeShell(slots=["trip-intake"]))
+        self.assertEqual(self.by_id(result)["tools:trip-intake:config"].code, "NO_CONFIG")
+
+    def test_standalone_verify_without_a_baseline_calls_every_failure_unknown(self):
+        self.intake()
+        tools = [t for t in self.COMPANION_TOOLS if t != "report_bug"]
+        self.profile("trip-a", ["trip-control"], reg("trip-control", tools))
+        cp, result = self.verify(live=[("a-trip", "trip-a")])
+        self.assertEqual([c.id for c in result.unknown], ["tools:trip-a:trip-control"])
+        self.assertEqual(result.caused, [])
+        self.assertIn("origin unknown", cp.said())
+        self.assertFalse(result.ok)
+
+
+class BridgeServer:
+    """A loopback stand-in for a trip-mcp bridge's /health route."""
+
+    def __init__(self, key, mode="ok"):
+        outer = self
+        self.key, self.mode, self.seen_keys = key, mode, []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                outer.seen_keys.append(self.headers.get("X-API-Key"))
+                if self.path != "/health":
+                    return self.reply(404, "text/html", "<pre>Cannot GET " + self.path + "</pre>")
+                if outer.mode == "no-route":
+                    return self.reply(404, "text/html", "<!DOCTYPE html><pre>Cannot GET /health</pre>")
+                if self.headers.get("X-API-Key") != outer.key:
+                    return self.reply(401, "application/json", '{"error":"unauthorized"}')
+                if outer.mode == "ok":
+                    return self.reply(200, "application/json", '{"ok":true,"site":"reachable"}')
+                if outer.mode == "site-401":
+                    return self.reply(503, "application/json", '{"ok":false,"site":"refused","code":"HTTP_401"}')
+                if outer.mode == "unreachable":
+                    return self.reply(503, "application/json", '{"ok":false,"site":"unreachable","code":"EHOSTUNREACH"}')
+                if outer.mode == "forged":
+                    return self.reply(503, "application/json", '{"ok":false,"code":"ok"}\n{"ok":true}')
+                return self.reply(500, "text/plain", "boom")
+
+            def reply(self, status, kind, body):
+                self.send_response(status)
+                self.send_header("Content-Type", kind)
+                self.end_headers()
+                self.wfile.write(body.encode())
+
+            def log_message(self, *args):
+                pass
+
+        self.httpd = HTTPServer(("127.0.0.1", 0), Handler)
+        self.port = str(self.httpd.server_address[1])
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+class BridgeHealth(FleetWorld):
+    """#294 AC-3, 4, 9: a bridge that listens is not yet a bridge that works."""
+
+    KEY = "k3y-0123456789-not-a-real-key"
+
+    def bridge(self, mode="ok", key=None):
+        server = BridgeServer(key or self.KEY, mode)
+        self.addCleanup(server.close)
+        return server
+
+    def trip(self, slug, port, key=None):
+        env = self.deploy / "trips" / slug / "mcp"
+        env.mkdir(parents=True, exist_ok=True)
+        text = f"MCP_PORT={port}\n" + (f'MCP_API_KEY="{key}"\n' if key else "")
+        (env / ".env").write_text(text)
+
+    def run_bridge_checks(self, server, slug="japan", listening=True, key=KEY):
+        self.intake(); self.healthy("japan2026")
+        self.trip(slug, server.port, key)
+        shell = FakeShell(slots=["trip-intake", "japan2026"], listening=[server.port] if listening else [])
+        cp = FleetCP(shell, live=[(slug, "japan2026")], events=[{"event": "relay.gateway_connected", "gateway_id": "japan2026"}])
+        return cp, shell, cp.verify(None)
+
+    def test_a_bridge_that_answers_ok_passes(self):
+        server = self.bridge("ok")
+        _cp, _sh, result = self.run_bridge_checks(server)
+        check = self.by_id(result)["bridge:japan"]
+        self.assertEqual((check.ok, check.code), (True, "ok"))
+        self.assertEqual(server.seen_keys, [self.KEY], "the key went in the X-API-Key header")
+
+    def test_a_stale_key_is_named_with_its_repair(self):
+        server = self.bridge("site-401")
+        cp, _sh, result = self.run_bridge_checks(server)
+        check = self.by_id(result)["bridge:japan"]
+        self.assertEqual((check.ok, check.code), (False, "HTTP_401"))
+        self.assertIn("restart-bridges", check.text)
+        self.assertIn("restart-bridges", cp.said())
+
+    def test_a_bridge_that_refuses_its_own_key(self):
+        server = self.bridge("ok", key="a-different-key")
+        _cp, _sh, result = self.run_bridge_checks(server)
+        self.assertEqual(self.by_id(result)["bridge:japan"].code, "BRIDGE_401")
+
+    def test_a_bridge_that_cannot_reach_its_trip_reports_the_errno(self):
+        _cp, _sh, result = self.run_bridge_checks(self.bridge("unreachable"))
+        self.assertEqual(self.by_id(result)["bridge:japan"].code, "EHOSTUNREACH")
+
+    def test_a_bridge_with_no_health_route_cannot_be_verified(self):
+        # AC-4: distinct from a failure.
+        cp, _sh, result = self.run_bridge_checks(self.bridge("no-route"))
+        check = self.by_id(result)["bridge:japan"]
+        self.assertEqual(check.code, "NO_HEALTH_ROUTE")
+        self.assertIn("cannot be verified", cp.said())
+        self.assertEqual([c.id for c in result.unverifiable], ["bridge:japan"])
+        self.assertEqual(result.unknown, [])
+        self.assertTrue(result.ok, "an old bridge is listed, it does not fail a standalone verify")
+
+    def test_a_body_cannot_forge_a_second_line(self):
+        _cp, _sh, result = self.run_bridge_checks(self.bridge("forged"))
+        self.assertEqual(self.by_id(result)["bridge:japan"].code, "UNRECOGNIZED")
+
+    def test_a_server_error_without_a_code_is_unrecognized(self):
+        _cp, _sh, result = self.run_bridge_checks(self.bridge("boom"))
+        self.assertEqual(self.by_id(result)["bridge:japan"].code, "UNRECOGNIZED")
+
+    def test_a_bridge_that_is_not_listening_is_not_asked(self):
+        server = self.bridge("ok")
+        _cp, shell, result = self.run_bridge_checks(server, listening=False)
+        check = self.by_id(result)["bridge:japan"]
+        self.assertEqual((check.ok, check.code), (False, "none"))
+        self.assertIn("restart-bridges", check.text)
+        self.assertEqual(server.seen_keys, [], "the port check comes first")
+
+    def test_no_key_beside_the_trip_means_nothing_could_be_asked(self):
+        server = self.bridge("ok")
+        _cp, _sh, result = self.run_bridge_checks(server, key=None)
+        self.assertEqual(self.by_id(result)["bridge:japan"].code, "NO_KEY")
+        self.assertEqual(server.seen_keys, [])
+
+    def test_a_trip_without_a_bridge_is_a_note_not_a_check(self):
+        self.intake(); self.healthy("japan2026")
+        cp = FleetCP(FakeShell(slots=["trip-intake", "japan2026"]), live=[("japan", "japan2026")],
+                     events=[{"event": "relay.gateway_connected", "gateway_id": "japan2026"}])
+        result = cp.verify(None)
+        self.assertNotIn("bridge:japan", self.by_id(result))
+        self.assertIn("no trip-mcp bridge configured", cp.said())
+
+    def test_the_key_is_never_on_a_command_line_or_in_any_output(self):
+        # AC-9
+        server = self.bridge("site-401")
+        with mock.patch.object(vr.subprocess, "run", side_effect=AssertionError("a process was spawned")), \
+                mock.patch.object(vr.subprocess, "Popen", side_effect=AssertionError("a process was spawned")):
+            cp, shell, result = self.run_bridge_checks(server)
+        self.assertFalse([a for a in shell.argvs if any(self.KEY in part for part in a)], "key on an argv")
+        self.assertNotIn(self.KEY, cp.said())
+        path = self.tmp / "baseline.json"
+        vr.save_baseline(result.checks, path)
+        self.assertNotIn(self.KEY, path.read_text())
+        self.assertFalse([c for c in result.checks if self.KEY in c.id + c.code + c.text])
+
+    def test_bridge_health_codes_match_the_install_script(self):
+        # companion-install-host.sh bridge_health_code(): same bodies, same codes.
+        for body, code in (("", "none"),
+                           ('{"ok":true,"site":"reachable"}', "ok"),
+                           ('{"ok":false,"code":"ok"}', "UNRECOGNIZED"),
+                           ('{"ok":false,"code":"E1"}\n{"ok":true}', "UNRECOGNIZED"),
+                           ('{"ok":false,"site":"refused","code":"HTTP_401"}', "HTTP_401"),
+                           ('{"ok":false,"site":"unreachable","code":"ETIMEDOUT"}', "ETIMEDOUT"),
+                           ('{"error":"unauthorized"}', "BRIDGE_401"),
+                           ("<!DOCTYPE html><pre>Cannot GET /health</pre>", "NO_HEALTH_ROUTE"),
+                           ("<html>nginx</html>", "UNRECOGNIZED"),
+                           ('{"ok":false,"code":"x y"}', "UNRECOGNIZED"),
+                           ('{"ok":false,"code":"' + "A" * 41 + '"}', "UNRECOGNIZED"),
+                           ('{"ok":false,"code":"E1"}\n{"ok":false,"code":"E2"}', "UNRECOGNIZED")):
+            self.assertEqual(vr.bridge_health_code(body), code, body)
+
+
+class BaselineClassification(unittest.TestCase):
+    """#294 AC-5 to AC-8, AC-12: a failure the upgrade did not cause is told apart from one it did."""
+
+    @staticmethod
+    def fail(id, code="X"):
+        return vr.Check(id, False, code)
+
+    @staticmethod
+    def good(id):
+        return vr.Check(id, True, "ok")
+
+    def test_a_bridge_that_failed_the_same_way_before_is_preexisting(self):
+        result = vr.classify([self.fail("bridge:japan", "HTTP_401")], [self.fail("bridge:japan", "HTTP_401")])
+        self.assertEqual([c.id for c in result.preexisting], ["bridge:japan"])
+        self.assertEqual((result.caused, result.unknown), ([], []))
+        self.assertTrue(result.ok)
+
+    def test_a_changed_code_is_caused(self):
+        result = vr.classify([self.fail("bridge:japan", "HTTP_401")], [self.fail("bridge:japan", "ECONNREFUSED")])
+        self.assertEqual([c.id for c in result.caused], ["bridge:japan"])
+        self.assertFalse(result.ok)
+
+    def test_a_non_exemptable_check_that_failed_before_still_counts(self):
+        for check_id in ("tools:trip-intake:interview", "readyz", "image:kinerary-cp-api-1", "web:portal-proxy",
+                         "relay:ready", "gateways:discovery", "gateway:trip-a", "tools:trip-a:trip-control"):
+            result = vr.classify([self.fail(check_id, "C")], [self.fail(check_id, "C")])
+            self.assertEqual([c.id for c in result.caused], [check_id], check_id)
+            self.assertFalse(result.ok, check_id)
+
+    def test_a_check_that_passed_before_and_fails_now_is_caused(self):
+        for check_id in ("bridge:japan", "companion-connected:japan2026"):
+            result = vr.classify([self.good(check_id)], [self.fail(check_id, "none")])
+            self.assertEqual([c.id for c in result.caused], [check_id])
+
+    def test_a_check_that_did_not_exist_before_and_fails_now_is_caused(self):
+        result = vr.classify([], [self.fail("bridge:newtrip", "none")])
+        self.assertEqual([c.id for c in result.caused], ["bridge:newtrip"])
+
+    def test_a_companion_that_was_not_connected_before_and_is_not_now_is_preexisting(self):
+        result = vr.classify([self.fail("companion-connected:t", "NOT_CONNECTED")], [self.fail("companion-connected:t", "NOT_CONNECTED")])
+        self.assertEqual([c.id for c in result.preexisting], ["companion-connected:t"])
+
+    def test_trip_mcp_tools_follow_a_preexisting_bridge_and_only_then(self):
+        bridge_broken = [self.fail("bridge:japan", "HTTP_401"), self.good("tools:japan2026:trip-mcp")]
+        now = [self.fail("bridge:japan", "HTTP_401"), self.fail("tools:japan2026:trip-mcp", "NOT_REGISTERED")]
+        result = vr.classify(bridge_broken, now, bridge_of={"japan2026": "japan"})
+        self.assertEqual(sorted(c.id for c in result.preexisting), ["bridge:japan", "tools:japan2026:trip-mcp"])
+        self.assertTrue(result.ok)
+        # The bridge worked before: a trip-mcp that no longer registers is this upgrade's.
+        result = vr.classify([self.good("bridge:japan")], now, bridge_of={"japan2026": "japan"})
+        self.assertEqual(sorted(c.id for c in result.caused), ["bridge:japan", "tools:japan2026:trip-mcp"])
+        # And every other server of that companion is never exempt, whatever its bridge did.
+        result = vr.classify(bridge_broken, [self.fail("bridge:japan", "HTTP_401"), self.fail("tools:japan2026:trip-control", "NOT_REGISTERED")],
+                             bridge_of={"japan2026": "japan"})
+        self.assertEqual([c.id for c in result.caused], ["tools:japan2026:trip-control"])
+
+    def test_no_health_route_is_caused_only_if_it_passed_before(self):
+        # AC-4
+        route_gone = self.fail("bridge:japan", "NO_HEALTH_ROUTE")
+        result = vr.classify([self.good("bridge:japan")], [route_gone])
+        self.assertEqual([c.id for c in result.caused], ["bridge:japan"])
+        for before in ([self.fail("bridge:japan", "HTTP_401")], [self.fail("bridge:japan", "NO_HEALTH_ROUTE")], []):
+            result = vr.classify(before, [route_gone])
+            self.assertEqual([c.id for c in result.unverifiable], ["bridge:japan"])
+            self.assertEqual(result.caused, [])
+            self.assertTrue(result.ok)
+
+    def test_with_no_baseline_every_failure_is_of_unknown_origin(self):
+        # AC-8
+        result = vr.classify(None, [self.fail("bridge:japan", "HTTP_401"), self.good("readyz"), self.fail("readyz2", "X")])
+        self.assertEqual([c.id for c in result.unknown], ["bridge:japan", "readyz2"])
+        self.assertEqual((result.caused, result.preexisting), ([], []))
+        self.assertFalse(result.ok)
+
+    def test_a_clean_run_is_ok(self):
+        result = vr.classify([self.good("readyz")], [self.good("readyz")])
+        self.assertTrue(result.ok)
+        self.assertEqual(len(result.checks), 1)
+
+    def test_the_exemptable_classes_are_exactly_those_the_upgrade_does_not_own(self):
+        self.assertEqual(sorted(vr.EXEMPTABLE), ["bridge:", "companion-connected:"])
+
+
+class BaselineFile(FleetWorld):
+    """#294 AC-10: a baseline is {id, ok, code} per check and nothing else."""
+
+    def test_the_file_holds_id_ok_and_code_only(self):
+        path = self.tmp / "state" / "baseline.json"
+        checks = [vr.Check("bridge:japan", False, "HTTP_401", "trip japan: bridge says SECRET words"),
+                  vr.Check("readyz", True, "ok", "readyz: ready")]
+        vr.save_baseline(checks, path)
+        data = json.loads(path.read_text())
+        self.assertEqual(data, [{"id": "bridge:japan", "ok": False, "code": "HTTP_401"},
+                                {"id": "readyz", "ok": True, "code": "ok"}])
+        self.assertNotIn("SECRET", path.read_text())
+        self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
+        self.assertEqual([(c.id, c.ok, c.code) for c in vr.load_baseline(path)], [("bridge:japan", False, "HTTP_401"), ("readyz", True, "ok")])
+
+    def test_taking_a_baseline_writes_the_file_and_keeps_the_checks(self):
+        cp = FleetCP(FakeShell(slots=["trip-intake"]))
+        cp.collect_checks = lambda: vr.Findings([vr.Check("readyz", True, "ok", "t"), vr.Check("bridge:j", False, "HTTP_401", "t")])
+        with mock.patch.object(vr, "STATE_DIR", self.tmp / "state"):
+            path = cp.take_baseline("upgrade")
+        self.assertTrue(path.exists())
+        self.assertEqual(path.parent, self.tmp / "state")
+        self.assertEqual([c.id for c in cp.baseline], ["readyz", "bridge:j"])
+        self.assertIn("bridge:j", cp.said())
+
+    def test_a_dry_run_reads_the_baseline_and_writes_nothing(self):
+        cp = FleetCP(FakeShell(slots=["trip-intake"]), dry_run=True)
+        cp.collect_checks = lambda: vr.Findings([vr.Check("readyz", True, "ok", "t")])
+        with mock.patch.object(vr, "STATE_DIR", self.tmp / "state"):
+            path = cp.take_baseline("upgrade")
+        self.assertIsNone(path)
+        self.assertFalse((self.tmp / "state").exists())
+
+    def test_a_baseline_that_cannot_be_taken_is_said_and_leaves_nothing_to_compare(self):
+        cp = FleetCP(FakeShell(slots=["trip-intake"]))
+
+        def boom():
+            raise vr.Refused("psql: connection refused")
+        cp.collect_checks = boom
+        with mock.patch.object(vr, "STATE_DIR", self.tmp / "state"):
+            self.assertIsNone(cp.take_baseline("upgrade"))
+        self.assertIsNone(cp.baseline)
+        self.assertIn("could not be taken", cp.said())
+        self.assertIn("psql: connection refused", cp.said())
+
+    def test_the_history_row_names_the_baseline_and_old_files_still_read(self):
+        # Eleven columns, as written before the field existed.
+        old = self.tmp / "history.tsv"
+        old_fields = vr.HISTORY_FIELDS[:-1]
+        self.assertEqual(vr.HISTORY_FIELDS[-1], "baseline")
+        old.write_text("\t".join(old_fields) + "\n" + "\t".join(["t0", "upgrade", "aa", "bb", "h1", "h1", "pre-bb", "/b", "compatible", "ok", "human"]) + "\n")
+        rows = vr.read_history(old)
+        self.assertEqual((rows[0]["result"], rows[0]["baseline"]), ("ok", ""))
+        vr.append_history({"utc": "t1", "action": "upgrade", "result": "ok", "baseline": "/var/lib/x/baseline-1.json"}, old)
+        self.assertEqual(vr.read_history(old)[-1]["baseline"], "/var/lib/x/baseline-1.json")
+        self.assertEqual(vr.read_history(old)[0]["result"], "ok")
+
+    def test_pre_existing_failures_are_listed_for_the_notification(self):
+        result = vr.classify([vr.Check("bridge:japan", False, "HTTP_401")], [vr.Check("bridge:japan", False, "HTTP_401"), vr.Check("readyz", True, "ok")])
+        text = vr.preexisting_summary(result)
+        self.assertIn("already failing before this upgrade", text)
+        self.assertIn("bridge:japan (HTTP_401)", text)
+        self.assertEqual(vr.preexisting_summary(vr.classify([], [vr.Check("readyz", True, "ok")])), "")
+
+
+class WebChecks(FleetWorld):
+    """#294 AC-12: the portal and runtime gateway belong to the switch, so a proxy that
+    failed before the upgrade and fails after it is still the upgrade's to fix."""
+
+    def web_findings(self, answers):
+        deployment = self.repo / "control-plane" / "deployment"
+        deployment.mkdir(parents=True, exist_ok=True)
+        (deployment / "compose.vm.yml").write_text("services:\n  portal:\n    image: p\n  runtime-gateway:\n    image: g\n")
+        cp = FleetCP(FakeShell())
+        cp.web_enabled = lambda: True
+        cp.probe_in = lambda container, url: answers[container]
+        findings = vr.Findings()
+        running = {"kinerary-cp-portal-1": "kinerary-cp/portal:abc1234", "kinerary-cp-runtime-gateway-1": "kinerary-cp/runtime-gateway:abc1234"}
+        cp.verify_web(findings, running, "abc1234")
+        return findings
+
+    def test_the_web_checks_have_stable_ids(self):
+        findings = self.web_findings({"kinerary-cp-portal-1": (True, '{"emailPassword":true}'),
+                                      "kinerary-cp-runtime-gateway-1": (True, '{"ok":true}')})
+        self.assertEqual([c.id for c in findings.checks],
+                         ["web:portal", "web:runtime-gateway", "web:portal-proxy", "web:gateway-health"])
+        self.assertTrue(all(c.ok for c in findings.checks))
+
+    def test_a_proxy_that_failed_before_and_after_is_caused(self):
+        answers = {"kinerary-cp-portal-1": (False, "bad gateway"), "kinerary-cp-runtime-gateway-1": (True, '{"ok":true}')}
+        before = self.web_findings(answers).checks
+        after = self.web_findings(answers).checks
+        result = vr.classify(before, after)
+        self.assertEqual([c.id for c in result.caused], ["web:portal-proxy"])
+        self.assertFalse(result.ok)
+
+
+def one_failing():
+    return vr.Findings([vr.Check("readyz", True, "ok", "readyz: ready"),
+                        vr.Check("bridge:japan", False, "HTTP_401", "trip japan: bridge refused")])
+
+
+class StandaloneVerify(unittest.TestCase):
+    """#294 AC-8: no baseline and one failing check: exit 1, origin unknown."""
+
+    def test_the_cli_exits_1(self):
+        out = io.StringIO()
+        with mock.patch.object(vr, "ON_THE_VM", False), \
+                mock.patch.object(vr.ControlPlane, "collect_checks", lambda self: one_failing()), \
+                contextlib.redirect_stdout(out):
+            code = vr.main(["verify"])
+        self.assertEqual(code, 1)
+        self.assertIn("origin unknown", out.getvalue())
+
+    def test_the_agent_gate_exits_1_and_says_origin_unknown(self):
+        out = io.StringIO()
+        with mock.patch.object(vr.ControlPlane, "collect_checks", lambda self: one_failing()), \
+                contextlib.redirect_stdout(out):
+            code = vr.cmd_gate(["verify"])
+        self.assertEqual(code, 1)
+        self.assertIn("origin unknown", out.getvalue())
+
+    def test_both_exit_0_when_nothing_fails(self):
+        clean = vr.Findings([vr.Check("readyz", True, "ok", "readyz: ready")])
+        with mock.patch.object(vr, "ON_THE_VM", False), mock.patch.object(vr.ControlPlane, "collect_checks", lambda self: clean), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(vr.main(["verify"]), 0)
+            self.assertEqual(vr.cmd_gate(["verify"]), 0)
+
+
+class SourceInvariants(unittest.TestCase):
+    def test_no_gateway_profile_is_named_in_the_check_code(self):
+        source = TOOL.read_text()
+        for name in ("trip-monitor", "familytrip"):
+            self.assertNotIn(f'"{name}"', source, name)
 
 
 class GateWrapper(unittest.TestCase):

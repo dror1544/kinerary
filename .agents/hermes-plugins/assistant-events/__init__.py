@@ -115,6 +115,8 @@ KNOWN_TOOL_NAMES: FrozenSet[str] = frozenset({
     "get_trivia_questions", "add_trivia_question", "get_phase_plan", "swap_plan_days",
     "set_plan_day_label", "add_plan_item", "update_plan_item", "delete_plan_item",
     "import_plan_from_bookings",
+    "get_stops", "update_stop", "split_stop", "set_stop_from_booking", "move_plan_day",
+    "plan_open_days",
     # control-plane/api/src/companion-mcp.ts (the trip CONTROL server)
     "get_assistant_names", "set_assistant_names", "report_bug",
 })
