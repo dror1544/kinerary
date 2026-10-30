@@ -634,8 +634,9 @@ mcp.tool('add_booking',
   'Record a reservation — a flight, hotel, car or ticketed attraction with a confirmation to keep. ' +
   'A booking is not part of the active plan and does not put anything on the family\'s day-by-day schedule: to make something ' +
   'appear on a day, use add_plan_item (optionally passing booking_id to show this confirmation inline). ' +
-  'A hotel booking does not change a stop either: the stop\'s dates and where the family sleeps stay as they were. If the organizer ' +
-  'means this hotel to be that stop\'s (its nights, its accommodation), call set_stop_from_booking with the new booking\'s id afterwards.', {
+  'A hotel booking does not change a stop by itself (its dates, where the family sleeps), so the Plan and the Map would not show it: ' +
+  'for a hotel the organizer gives you, always call set_stop_from_booking with the new booking\'s id afterwards. A hotel from anyone ' +
+  'else stays a booking; the organizer can link it on the site.', {
   phase:        z.string().describe('Phase id from trip.config.json (see get_config), plus "intl_flights" for international flights'),
   type:         z.enum(['flight','hotel','car','attraction','other']).describe('Booking type'),
   name:         z.string().describe('Booking name / description'),

@@ -36,10 +36,10 @@ A stop is a place the trip sleeps, with its dates and its hotel. The Journey tab
 1. Read the document. A confirmation number printed in it goes into `confirmation` on `add_booking` (or `update_booking`, when the booking already exists). Empty only when the document prints none; never invent one, never shorten one.
 2. Find the stop the hotel belongs to — the place it is in, the nights it covers. If two stops could fit, ask which.
 3. `add_booking` with type `hotel`, the stop's id as `phase`, `date_from` the check-in day and `date_to` the check-out day. Attach the PDF with `upload_booking_confirmation`.
-4. `set_stop_from_booking` with the stop id and the booking id. It sets the stop's dates and hotel from the booking, and creates one check-in item on its first day and one check-out item on its last; running it again never duplicates them.
+4. **Always** `set_stop_from_booking` with the stop id and the booking id. Not optional, and not conditional on the organizer saying so: a hotel the organizer gives you in their own chat is a hotel for its stop, so the Plan and the Map show it. It sets the stop's dates and hotel from the booking, and creates one check-in item on its first day and one check-out item on its last; running it again never duplicates them.
 5. `get_stops` again, then tell the organizer what the Journey tab now shows (see **Read back, then say it**).
 
-When someone other than the organizer sends the booking, record it as usual (with the approval **Daily plan → site update** asks for), and say in one line that linking it to its stop is the organizer's, who can ask you in their own chat or do it on the site. Promise no follow-up.
+When someone other than the organizer sends the booking, record it as usual (with the approval **Daily plan → site update** asks for), and say in one line that the organizer can link it to its stop on the site ("not on the plan yet"), or ask you in their own chat. Call no stop tool for it. Promise no follow-up.
 
 ### Refusals — what each one means, and what to say
 A refused call changed nothing. Say what happened in plain words, without the code.

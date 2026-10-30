@@ -359,6 +359,66 @@ describe("text with an ASCII quote is sent and shown exactly as typed (owner dec
   });
 });
 
+// #419: a hotel the organizer's companion recorded and did not link is on
+// Reservations only. The server lists it under its stop (GET /api/stops); the
+// organizer sees it here as "not on the plan yet", with one tap that links it.
+describe("an unlinked hotel booking (#419)", () => {
+  const hotel = { id: 7, name: "Hotel Colmar Centre", date_from: "2026-12-02", date_to: "2026-12-06" };
+  const withHotel = (over: Partial<typeof colmar> = {}) =>
+    stopsPayload({ stops: stopsPayload().stops.map((s) => (s.id === "colmar" ? { ...s, ...over, unlinked_hotel_bookings: [hotel] } : s)) });
+
+  it("an unlinked hotel offers to set the stop and calls from-booking", async () => {
+    const server = stubServer({
+      "GET /api/stops": [() => json(withHotel({ stop: { id: "colmar", title: colmar.stop.title, dates: colmar.stop.dates } as never })), () => json(stopsPayload())],
+      "POST /api/stops/colmar/from-booking": [() => json({ revision: "st-4", stop: colmar.stop, items: {} })],
+    });
+    const c = renderEditor();
+    const invalidate = vi.spyOn(c, "invalidateQueries");
+    const row = await screen.findByRole("article", { name: "Colmar" });
+    const notice = await within(row).findByRole("group", { name: "Hotel Colmar Centre" });
+    expect(notice).toHaveTextContent("not on the plan yet");
+    expect(notice).toHaveTextContent("2026-12-02 – 2026-12-06");
+    // Nothing links it by itself: no write until the tap.
+    expect(server.writes()).toHaveLength(0);
+    fireEvent.click(within(notice).getByRole("button", { name: "Use this hotel for Colmar" }));
+    await waitFor(() => expect(server.writes()).toHaveLength(1));
+    expect(server.writes()[0]).toMatchObject({ method: "POST", url: "/api/stops/colmar/from-booking", body: { booking_id: 7 }, ifMatch: '"st-3"' });
+    // Plan, Map and the stop list all refetch, and the notice goes once the list is fresh.
+    await waitFor(() => {
+      const keys = invalidate.mock.calls.map((call) => call[0]?.queryKey?.[0]);
+      expect(keys).toEqual(expect.arrayContaining(["stops", "config", "itinerary", "today"]));
+    });
+    await waitFor(() => expect(screen.queryByRole("group", { name: "Hotel Colmar Centre" })).not.toBeInTheDocument());
+  });
+
+  it("says in Hebrew what it says in English, and warns when linking replaces the stop's current hotel", async () => {
+    stubServer({ "GET /api/stops": [() => json(withHotel())] });
+    renderEditor("he");
+    const notice = await screen.findByRole("group", { name: "Hotel Colmar Centre" });
+    expect(notice).toHaveTextContent("עדיין לא במסלול");
+    expect(notice).toHaveTextContent("יחליף את Hotel Rive");
+    expect(within(notice).getByRole("button", { name: "להשתמש במלון הזה עבור קולמר" })).toBeInTheDocument();
+  });
+
+  it("a refusal is said in words and nothing is claimed as linked", async () => {
+    stubServer({
+      "GET /api/stops": [() => json(withHotel())],
+      "POST /api/stops/colmar/from-booking": [() => json({ error: "booking_linked_to_another_stop", stop: "frankfurt" }, 409)],
+    });
+    renderEditor();
+    fireEvent.click(await screen.findByRole("button", { name: "Use this hotel for Colmar" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("already sets another stop");
+    expect(screen.getByRole("group", { name: "Hotel Colmar Centre" })).toBeInTheDocument();
+  });
+
+  it("a stop with no unlinked hotel shows nothing extra", async () => {
+    stubServer({ "GET /api/stops": [() => json(stopsPayload())] });
+    renderEditor();
+    await screen.findByRole("article", { name: "Colmar" });
+    expect(screen.queryByText(/not on the plan yet/)).not.toBeInTheDocument();
+  });
+});
+
 describe("split and revert", () => {
   it("splits a stop at a day strictly inside it, with the new stop's title", async () => {
     const server = stubServer({

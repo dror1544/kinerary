@@ -1502,8 +1502,38 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
   }
 
   // ── organizer/agent read model ─────────────────────────────────────────────
+  // Approved, dated hotel bookings that no stop is set from, grouped by the
+  // stop they are filed under (#419). A booking alone never moves a stop, so a
+  // hotel recorded and not linked is on Reservations and nowhere else; this is
+  // how the organizer is told, with the one tap that links it (from-booking).
+  // Organizer/agent only because it is part of GET /api/stops: id, name and
+  // dates, never the PIN, notes or confirmation. A hotel whose name the stop
+  // already shows is left out — it is on the plan, whatever linked it there.
+  function unlinkedHotelsByStop(phases) {
+    const rows = db.prepare(
+      "SELECT id, phase, name, date_from, date_to FROM bookings " +
+      "WHERE type = 'hotel' AND COALESCE(review_status, 'approved') = 'approved' " +
+      "AND id NOT IN (SELECT booking_id FROM trip_stop_overrides WHERE booking_id IS NOT NULL) " +
+      "ORDER BY date_from, id"
+    ).all();
+    const shown = new Map(phases.map(p => [p.id, String(p.accommodation?.name || '').trim().toLowerCase()]));
+    const byStop = new Map();
+    for (const b of rows) {
+      if (!isStop(b.phase)) continue;
+      const from = isoDay(b.date_from);
+      const to = isoDay(b.date_to);
+      if (!from || !to || from > to) continue;
+      const name = String(b.name || '');
+      if (name.trim().toLowerCase() === shown.get(b.phase)) continue;
+      if (!byStop.has(b.phase)) byStop.set(b.phase, []);
+      byStop.get(b.phase).push({ id: b.id, name, date_from: from, date_to: to });
+    }
+    return byStop;
+  }
+
   function listStops() {
     const phases = effectiveConfig().phases || [];
+    const unlinked = unlinkedHotelsByStop(phases);
     const overrides = new Map(q.overrides.all().map(parseRow).map(o => [o.phase_id, o]));
     const stops = phases.map(phase => {
       const o = overrides.get(phase.id) || null;
@@ -1533,6 +1563,7 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
         override: o ? { fields: Object.keys(o.fields), booking_id: o.booking_id, updated_by: o.updated_by, updated_at: o.updated_at, after_phase_id: o.after_phase_id } : null,
         conflict,
         booking_out_of_sync: bookingOutOfSync,
+        unlinked_hotel_bookings: unlinked.get(phase.id) || [],
       };
     });
     const range = tripRange(base());

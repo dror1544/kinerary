@@ -35,7 +35,11 @@ export type StopEntry = {
   override: { fields: string[]; booking_id: number | null; updated_by: string; updated_at: string; after_phase_id: string | null } | null;
   conflict: { fields: string[]; base: Record<string, unknown> } | null;
   booking_out_of_sync: boolean;
+  // Approved, dated hotel bookings filed under this stop that no stop is set
+  // from (#419) — on Reservations only. Absent from a server that predates it.
+  unlinked_hotel_bookings?: UnlinkedHotel[];
 };
+export type UnlinkedHotel = { id: number; name: string; date_from: string; date_to: string };
 export type StopsPayload = {
   revision: string;
   trip: { start: string | null; end: string | null };
@@ -78,6 +82,12 @@ export const patchStop = (id: string, body: StopFields & { on_outside?: string }
 export const splitStop = (id: string, body: { at: string; new_stop: { title: Bilingual } }, revision?: string) =>
   api<{ revision: string; stops: StopSummary[]; moved: { items: string[]; days: string[] }; review?: { status: string; detail: string } }>(
     `/api/stops/${encodeURIComponent(id)}/split`, { method: "POST", body: JSON.stringify(body), headers: ifMatch(revision) });
+// "Use this hotel for <stop>": the same route the companion's set_stop_from_booking
+// calls. It sets the stop's dates and hotel and adds one check-in and one check-out.
+export const linkBookingToStop = (id: string, body: { booking_id: number; on_outside?: string }, revision?: string) =>
+  api<{ revision: string; stop: StopSummary; items: Record<string, string> }>(`/api/stops/${encodeURIComponent(id)}/from-booking`, {
+    method: "POST", body: JSON.stringify(body), headers: ifMatch(revision),
+  });
 export const revertStop = (id: string, body: { history_id?: number; on_outside?: string }, revision?: string) =>
   api<{ revision: string; stop: StopSummary }>(`/api/stops/${encodeURIComponent(id)}/revert`, {
     method: "POST", body: JSON.stringify(body), headers: ifMatch(revision),
@@ -231,6 +241,13 @@ export function describeStopError(error: unknown, lang: Lang): StopRefusal {
     unknown_phase: ["This day's stop no longer exists. Reload.", "התחנה של היום הזה כבר לא קיימת. טענו מחדש."],
     day_not_found: ["There is nothing planned on this day to move.", "אין ביום הזה שום דבר מתוכנן להעברה."],
     invalid_date: ["Choose a day.", "יש לבחור יום."],
+    booking_is_draft: ["Approve the booking on the Reservations page first, then link it.", "יש לאשר קודם את ההזמנה בדף ההזמנות, ואז לקשר אותה."],
+    booking_not_hotel: ["Only a hotel booking can set a stop.", "רק הזמנת מלון יכולה לקבוע תחנה."],
+    booking_has_no_dates: ["Add the check-in and check-out dates to the booking first.", "יש להוסיף להזמנה תאריכי כניסה ויציאה קודם."],
+    booking_not_found: ["This booking no longer exists. Reload the stops.", "ההזמנה הזו כבר לא קיימת. טענו מחדש את התחנות."],
+    invalid_booking_id: ["This booking cannot be linked.", "לא ניתן לקשר את ההזמנה הזו."],
+    booking_belongs_to_another_stop: ["This booking is filed under another stop.", "ההזמנה הזו משויכת לתחנה אחרת."],
+    booking_linked_to_another_stop: ["This booking already sets another stop.", "ההזמנה הזו כבר קובעת תחנה אחרת."],
     organizer_only: ["Only the trip organizer can change stops.", "רק מארגן הטיול יכול לשנות תחנות."],
   };
   const known = messages[code];
