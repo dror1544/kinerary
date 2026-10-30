@@ -3,6 +3,8 @@
 Status: draft (2026-10-19) · Issue: #189 · Track: T3 · Size: M · Tier: Normal
 Security path: yes (re-checks companion write confinement, #314, under the newer Hermes — `boundary-reviewer` evidence) · Migration: no · Live-trip behaviour: no (off production; nothing deploys)
 
+> **Unscheduled (2026-10-30):** waits on #380 (Sprint 8) and the Mac build engine.
+
 ## Problem
 
 Production runs Hermes `ab0d984145` (2026-08-24); the target is `4097709b0c`

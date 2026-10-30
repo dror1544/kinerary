@@ -3,6 +3,8 @@
 Status: draft (2026-10-19) · Issue: #127 (slice 1 of #190) · Track: T2 · Size: M · Tier: Normal
 Security path: no (none of the three named invariants; touches the forced-command script, which runs as the Hermes host user) · Migration: yes · Live-trip behaviour: no (existing trips are not rebuilt)
 
+> **Unscheduled (2026-10-30).**
+
 > **Partly built on integration/sprint-7 (2026-10-19):** `818e3b8` puts `built_from` into the worker's log message. Still owed: everything else here — the `PROVENANCE` line, the trip-row column, the allow file and the release-tool report.
 
 ## Problem

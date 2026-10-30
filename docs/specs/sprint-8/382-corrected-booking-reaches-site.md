@@ -1,7 +1,9 @@
 # A corrected booking or plan item reaches the live trip site
 
-Status: draft (2026-10-19) · Issue: #382 · Track: T1 · Size: L · Tier: High
+Status: draft, refreshed against 4510301 (2026-10-30) · Issue: #382 · Track: T1 · Size: L · Tier: High
 Security path: yes (`server/server.js` boot seed; plan import) · Migration: no (site SQLite, additive columns) · Live-trip behaviour: yes
+
+> **Sprint 8 (2026-10-30): in scope.**
 
 ## Problem
 
@@ -10,33 +12,43 @@ once a correction is committed, every surface shows the new value. On a
 **re-provision** the site does not.
 
 - **The files are rewritten.** A re-provision rewrites `trip.config.json` and
-  `bookings.json` in the trip dir (`control-plane/worker/control_plane_worker/provisioner.py:472-483`,
-  `:1225-1236`) and restarts the server (`:538-543`).
+  `bookings.json` in the trip dir (`control-plane/worker/control_plane_worker/provisioner.py:473-484`; the
+  sidecar is built at `:1259-1302`) and restarts the server (`deploy.sh …
+  --sync-config --restart`, `:539-545`).
 - **The database is not.** The server's DB is `DATA_DIR/trip.db`
   (`server/server.js:145`, `:172`). `DATA_DIR` is on the trip's persistent data
-  mount, and is wiped only on a first provision (`control-plane/worker/control_plane_worker/compute.py:190-203`;
-  `provisioning/adapters.py:260-276`, `:439-452`).
+  mount, and is wiped only on a first provision (`control-plane/worker/control_plane_worker/compute.py:190-206`;
+  `provisioning/adapters.py:260-277`, `_reset_trip_data` `:630-652`).
 - **Bookings: the seed never re-applies.** `INSERT OR IGNORE … seed_key`
-  (`server/server.js:706-724`) is a no-op once the row exists. Only a NULL
-  `location_url` is back-filled (`:717`).
-  - A hotel row's key is `hotel_<phase id>` (`transformer.py:2852`), so a
+  (`server/server.js:707-726`) is a no-op once the row exists. Only a NULL
+  `location_url` is back-filled (`:714-718`, `:725`).
+  - A hotel row's key is `hotel_<phase id>` (`transformer.py:2855`), so a
     corrected hotel date keeps its key and the old dates stay.
   - A structured anchor's key hashes `(type, name, date, confirmation)`
-    (`:2906-2913`), so a corrected flight date makes a **new** key. A second row
-    is inserted, the old one stays, and a seed row cannot be deleted (403,
-    `:2702-2706`).
+    (`:2896-2916`; a free-text anchor hashes its `detail` instead), so a
+    corrected flight date makes a **new** key. A second row is inserted, the
+    old one stays, and a seed row cannot be deleted (403,
+    `server/server.js:2729-2733`).
 - **The plan is imported from config once.** `importPlanOnce` latches
-  `legacy_owns_config = 1`, "never cleared" (`server/living-journey.js:849-862`,
+  `legacy_owns_config = 1`, "never cleared" (`server/living-journey.js:855-868`,
   `:261-262`). A corrected config day item never reaches the active plan.
 - **The result is a split-brain.** `/api/config` (from the file, through
-  `sanitizeConfig`, `server/server.js:807-819`) shows the corrected value, while
+  `effectiveConfig()` → `hotelPlaces.hydrateConfig` → `sanitizeConfig`,
+  `server/server.js:808-820`) shows the corrected value, while
   `/api/bookings` and the active plan show the old one. The companion's
-  `get_config` (`mcp/mcp.js:401`, `server/trip-mcp/tools.js:166`) agrees with
+  `get_config` (`mcp/mcp.js:411`, `server/trip-mcp/tools.js:170`) agrees with
   the file and disagrees with the tabs. That is an incident by MRD 5.3.
 - **What is already right.** A booking edited with `PATCH` is joined live onto
-  its linked plan item (`joinBooking`, `server/server.js:2891`;
-  `living-journey.js:645`). Only text copied once by `import-from-bookings`
-  (`:4139-4172`) goes stale.
+  its linked plan item (`joinBooking`, `server/server.js:2940`;
+  `serializeItinerary`, `living-journey.js:641-657`). Only text copied once by
+  `import-from-bookings` (`server/server.js:4188-4221`) goes stale.
+- **Checked 2026-10-30: nothing on main since 03c0e1c addresses this.** No
+  `seed_hash`, `retired_at`, `seed_changed` or `accept-seed` exists in
+  `server/`; the seed and `importPlanOnce` are unchanged except for line
+  shifts. `docs/reliability-guarantees.md:35-38` still marks A1, A2 and A4
+  `partial`. One adjacent change: `/api/config` now serves the stop layer
+  merged over the file (`effectiveConfig()`, PR #362), so the "file" side of
+  the split-brain is "file + stop overrides".
 
 ## Behaviour
 
@@ -62,7 +74,7 @@ On every boot the site reconciles the seed with the files:
 - AC-2 (A1, hotel) Given hotel row `hotel_colmar` seeded 2–7 Dec and never
   edited, when the file says 2–6 Dec and the server restarts, then the row is
   2–6 Dec. If the hotel is linked to a stop, the stop is `booking_out_of_sync`
-  (`server/trip-structure.js:1278-1291`). It is not silently moved.
+  (`listStops`, `server/trip-structure.js:1522-1535`). It is not silently moved.
 - AC-3 (A2) Given a seeded booking edited on the site (`PATCH`), when the file
   changes the same field and the server restarts, then the edit stands, and
   `GET /api/bookings` (organizer) carries `seed_changed: {field: new value}`.
@@ -89,7 +101,7 @@ On every boot the site reconciles the seed with the files:
   - additive columns on `phase_plan_items`: `config_hash`;
   - "edited" means the row's current values differ from the values its hash
     was taken from. #383's `row_version` can serve if it lands first;
-  - the boot seed (`:706-724`) becomes reconcile: insert, update-if-unedited,
+  - the boot seed (`:707-726`) becomes reconcile: insert, update-if-unedited,
     flag, retire;
   - a new organizer-only `POST /api/bookings/:id/accept-seed` and its plan-item
     twin.
@@ -149,3 +161,13 @@ policy). **Regression plan: needed, and High tier.**
 2. Should a live trip's first reconciling boot be gated by a flag
    (`SEED_RECONCILE=1`), so each trip is turned on one at a time after its
    dry run?
+3. (New.) A stop override (PR #362) and a corrected `bookings.json` can now
+   disagree about a hotel's dates. AC-2 flags the stop `booking_out_of_sync`
+   and leaves it; should a *never-edited* stop that was set from an unedited
+   seeded hotel follow the corrected booking automatically instead (re-run
+   `from-booking` at boot)?
+4. (New.) #383 is drafted to add `row_version` to `bookings` and
+   `phase_plan_items`; build order matters for the "edited" test here. Land
+   #383 first and use `row_version`, or keep `seed_hash` independent?
+
+Size: unchanged (L).

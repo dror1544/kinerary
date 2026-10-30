@@ -1,7 +1,9 @@
 # Same flight, two bookings: one Journey entry or two (decision)
 
-Status: draft (2026-10-19) · **needs Dror's decision before approval** · Issue: #415 · Track: T1 · Size: S · Tier: Normal
+Status: draft, refreshed against 4510301 (2026-10-30) · **needs Dror's decision before approval** · Issue: #415 · Track: T1 · Size: S · Tier: Normal
 Security path: no · Migration: no · Live-trip behaviour: yes (newly built trips)
+
+> **Sprint 8 (2026-10-30): decision first** — Dror decides before #414 is built.
 
 ## Problem
 
@@ -11,13 +13,13 @@ Reservations the owner ruled that two entries are right (#414). For the Journey
 he made no ruling.
 
 Why there are two today:
-- `derive_days_from_anchors` (`control-plane/worker/control_plane_worker/transformer.py:2589-2647`)
+- `derive_days_from_anchors` (`control-plane/worker/control_plane_worker/transformer.py:2592-2661`)
   appends one day item per booked anchor, with no dedupe. Flights are itinerary
-  items (`_NON_ITINERARY_ANCHORS` excludes only hotel, car and proposal, `:2586`,
-  `:2625`).
+  items (`_NON_ITINERARY_ANCHORS` excludes only hotel, car and proposal, `:2589`,
+  `:2628`).
 - The server imports config day items by position
-  (`config_ref = phase|date|index`, `server/server.js:3992`), so both are kept.
-- Each is matched to a booking by `findMatchingBooking` (`server/server.js:3445-3466`),
+  (`config_ref = phase|date|index`, `server/server.js:4041`), so both are kept.
+- Each is matched to a booking by `findMatchingBooking` (`server/server.js:3494-3515`),
   which picks the best token hit, ties to the first. Both lines can show the
   **same** booking's confirmation.
 
@@ -66,13 +68,15 @@ which ticket, twice. To make B cheap:
   bookings" and both confirmations on expand, organizer view only, as
   confirmations already are.
 - AC-5 Given an existing trip (built before this), then a re-provision adds or
-  removes no plan items (the plan import runs once, `server/living-journey.js:849-862`).
+  removes no plan items (the plan import runs once, `importPlanOnce`,
+  `server/living-journey.js:855-868`).
 
 ## Contracts (for B)
 
 - `transformer.py` `derive_days_from_anchors`.
-- `server/server.js`: day-item import and `joinBooking` (`:2890-2903`); `server/living-journey.js:645-672`,
-  the booking join over a list.
+- `server/server.js`: day-item import (`:4041`) and `joinBooking` (`:2940-2953`);
+  `server/living-journey.js:641-675` (`serializeItinerary`), the booking join
+  over a list.
 - `trip-web/src/App.tsx`: the Journey line.
 - Additive config key `booking_refs` on a day item. **This is a
   `shared/config-visibility.js` allow-list decision**: it carries `seed_key`s
@@ -100,3 +104,16 @@ entry).
 1. **Decision for Dror:** one Journey entry (B, recommended), two (A), or one
    with the first booking only (C)?
 2. If B: should members see "2 bookings" at all, or only the organizer?
+3. (New.) #382 proposes a boot-time reconcile of config-imported plan items
+   (`reconcileConfigItems`). If #382 lands, AC-5 ("a re-provision adds or
+   removes no plan items") no longer holds by itself for an *unedited* trip:
+   a rebuilt config that groups two flights into one item would retire one
+   positional `config_ref`. Should grouped items be excluded from #382's
+   reconcile, or is the change acceptable for unedited rows?
+
+Checked 2026-10-30: nothing on main since 03c0e1c changes the transformer's
+day derivation, the positional import or `findMatchingBooking` (line shifts
+only; the only transformer change is #201/#127's log message). No
+`booking_refs` exists. Size: S for the decision; option B as written is
+nearer M (worker, site join, allow-list entry, Journey UI) — size the brief
+M if B is chosen.

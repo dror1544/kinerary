@@ -3,6 +3,8 @@
 Status: draft (2026-10-19) · Issue: PR #359, issue #358 · Track: T5 · Size: M · Tier: High
 Security path: yes (portal session/CSRF; single-use enrollment tokens; Telegram launch data must grant nothing) · Migration: no · Live-trip behaviour: no (control-plane API + portal only)
 
+> **Landed in Sprint 7** through PR #478 and released 2026-10-27; PR #359 closed as landed. Kept as the acceptance record.
+
 > **What this spec is.** #359 is already built (branch
 > `feat/sprint6-miniapp-recovery`, published head `89c2a52`, draft, targets
 > `main`, stacked on #357). This spec is the **acceptance contract for landing it

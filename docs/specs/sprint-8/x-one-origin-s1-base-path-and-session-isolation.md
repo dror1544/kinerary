@@ -3,6 +3,8 @@
 Status: draft (2026-10-19) · Issue: none yet (`x-`) · Track: T4 · Size: M · Tier: High
 Security path: yes (`authRequired` / `organizerOrAgentRequired` JWT verification, session storage, CSP) · Migration: no · Live-trip behaviour: no (inert until a trip's `PUBLIC_BASE_URL` carries a path)
 
+> **Unscheduled, to be re-specced (2026-10-30):** the organizer web release (Sprint 7) put a portal and a runtime gateway on their own hosts, which changes this spec's starting point.
+
 Umbrella: `x-one-origin-trips.md` (decisions D1–D5 and the security model).
 
 ## Problem

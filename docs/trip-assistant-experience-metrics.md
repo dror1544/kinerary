@@ -61,5 +61,5 @@ design and link to it — do not fork a second vocabulary.
 
 Scheduled across two sprints in `onboarding-mvp-sprint-plan.md`: Sprint 6 takes
 the outcome events, the daily report and the control loop alongside the
-dashboard; Sprint 8 (renumbered from 7 on 2026-10-19) takes the weighted scoring and repeated-question reduction
+dashboard; the post-trip debrief (backlog since 2026-10-30) takes the weighted scoring and repeated-question reduction
 with reviewed learning.

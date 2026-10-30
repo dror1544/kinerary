@@ -3,6 +3,8 @@
 Status: draft (2026-10-19) · Issue: PR #357 (no separate issue) · Track: T5 · Size: L · Tier: High
 Security path: yes (`server/server.js` config warnings and document routes; portal session/CSRF; trip-MCP tool visibility) · Migration: no · Live-trip behaviour: yes (new or redeployed trips only)
 
+> **Landed in Sprint 7** through PR #478 and released 2026-10-27; PR #357 closed as landed. Kept as the acceptance record.
+
 > **What this spec is.** #357 is already built (branch `carry/ca01-to-sprint6`,
 > published head `9808def`, draft, targets `main`). This spec is the
 > **acceptance contract for landing it on `main`**, not a redesign. A behaviour

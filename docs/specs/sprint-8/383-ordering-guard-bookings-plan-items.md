@@ -1,30 +1,41 @@
 # An older booking or plan-item edit cannot overwrite a newer one
 
-Status: draft (2026-10-19) · Issue: #383 · Track: T1 · Size: M · Tier: Normal
+Status: draft, refreshed against 4510301 (2026-10-30) · Issue: #383 · Track: T1 · Size: M · Tier: Normal
 Security path: yes (`server/server.js` write routes; `server/trip-mcp/`) · Migration: no (site SQLite, additive column) · Live-trip behaviour: yes
+
+> **Sprint 8 (2026-10-30): stretch** — only if the in-scope items are done.
 
 ## Problem
 
 Guarantee A, scenario A3 (`docs/reliability-guarantees.md:37`): "Bookings and
 classic plan items have no ordering guard."
 
-- `PATCH /api/bookings/:id` (`server/server.js:2670-2699`) is a bare
+- `PATCH /api/bookings/:id` (`server/server.js:2697-2727`) is a bare
   `UPDATE … WHERE id = ?`. It has no precondition, and an unknown id still
   answers `{ok:true}`.
-- `PATCH /api/phases/:p/plan/:id` (`server/server.js:3112-3184`) is
+- `PATCH /api/phases/:p/plan/:id` (`server/server.js:3161-3233`) is
   last-write-wins too.
-- Neither table has `updated_at` or a version (`bookings` `:367-383`,
-  `:396-447`; `phase_plan_items` `:463-526`).
-- `If-Match` exists only on Modern itinerary routes (`server/living-journey.js:1335-1344`)
-  and stop routes (`server/trip-structure.js:820-823`), and is **optional** on
-  both: no header, no check.
+- Neither table has `updated_at` or a version (`bookings` `:368-384`,
+  `:396-446`; `phase_plan_items` `:464-527`).
+- `If-Match` exists only on Modern itinerary routes (`server/living-journey.js:1342-1351`)
+  and stop routes (`revisionMatches`, `server/trip-structure.js:951-953`), and is
+  **optional** on both: no header, no check.
 - No caller of the two routes sends it:
-  - `mcp/mcp.js` `update_booking` (`:644-668`, `writeApi` `:234`) and
-    `update_plan_item` (`:924-942`, `apiPatch` `:99-105`);
-  - the trip-site connector (`server/trip-mcp/tools.js:203-212`, `:249-258`;
-    `siteClient` `index.js:319-342` sends only auth and content-type);
-  - trip-web `updateBooking` (`trip-web/src/api.ts:372`);
-  - Classic (`site/app.js:3097`).
+  - `mcp/mcp.js` `update_booking` (`:654-679`, `writeApi` `:244`) and
+    `update_plan_item` (`:934-953`, `apiPatch` `:99-105`);
+  - the trip-site connector (`server/trip-mcp/tools.js:228-237`, `:286-295`;
+    `siteClient` `index.js:321-354` sends only auth and content-type);
+  - trip-web `updateBooking` (`trip-web/src/api.ts:374`);
+  - Classic: the booking form (`site/app.js:3131`) and the plan-item edit
+    (`:4155`).
+- **Checked 2026-10-30: nothing on main since 03c0e1c adds a guard.** The
+  routes, tables and callers above changed only by line shifts; no
+  `row_version` exists. `docs/reliability-guarantees.md:37` still says "Bookings
+  and classic plan items have no ordering guard". New writers since the draft
+  that also touch `phase_plan_items` without a precondition: `plan_open_days`
+  / `POST /api/stops` (#133, `f7a05e0`), which creates a stop and its plan
+  items in one call under the stop revision — they are new rows, so the guard
+  here does not apply to them, but they must start at `row_version` 1.
 - So a companion that read a booking, then saved an edit after the organizer
   corrected it on the site, silently puts the old value back. An incident by
   the MRD 5.3 definition.
@@ -54,7 +65,7 @@ revision is still accepted from a person's browser for one release, and logged.
   `server/trip-mcp/tools.js`, when called without a `revision` argument, then
   the tool reads the row first and sends that revision. When a `revision` is
   given, it is sent as is. A 409 is returned to the model with a hint to
-  re-read (`STOP_REFUSAL_HINTS` pattern, `mcp/mcp.js:150-175`).
+  re-read (`STOP_REFUSAL_HINTS` pattern, `mcp/mcp.js:147-186`).
 - AC-6 Given a sequence "companion reads B (r1) → organizer PATCHes B on the site
   (r2) → companion PATCHes with r1", then the companion's write is 409 and the
   organizer's value stands. This is scenario A3 end to end, against a real trip
@@ -69,22 +80,24 @@ revision is still accepted from a person's browser for one release, and logged.
 
 - `server/server.js`: an additive column `row_version INTEGER NOT NULL DEFAULT 1`
   on `bookings` and `phase_plan_items`, added in the same guarded `ALTER TABLE`
-  loops (`:396-400`, `:507-527`). It is bumped in the same `UPDATE`
+  loops (`:396-400`, `:524-527`). It is bumped in the same `UPDATE`
   (`row_version = row_version + 1 WHERE id = ? AND row_version = ?`), so the
   check and the write are one statement. 0 rows changed means 409.
   `revision` = `"bk-<id>-<n>"` / `"pi-<id>-<n>"`.
 - Every other writer of those rows bumps `row_version` too:
-  - `tripStructure.onBookingChanged` (`server/server.js:2697`);
+  - `tripStructure.onBookingChanged` (`server/server.js:2725`; defined
+    `server/trip-structure.js:1474`);
   - `from-booking`'s items, which go to the Modern itinerary and already carry
     its revision;
-  - `promoteConfigDays` back-fills (`:3939-3945`);
+  - `promoteConfigDays` back-fills (`backfillLinks`, `:3988-3993`, run at `:4060`);
+  - `plan_open_days` / `POST /api/stops` inserts (#133) start at 1;
   - enrichment and review writes.
   - Whether to use a trigger instead of call sites is a build decision.
     `server/trip-events.js:4-30` already has triggers per table.
 - `mcp/mcp.js`, `server/trip-mcp/tools.js`: `revision` argument; read-then-write
-  as `update_stop` does (`mcp/mcp.js:1033-1060`).
-- `trip-web/src/api.ts:372`, `site/app.js:3097`: send the revision the form was
-  opened with.
+  as `update_stop` does (`mcp/mcp.js:1021`, `revision` → `If-Match`).
+- `trip-web/src/api.ts:374`, `site/app.js:3131` and `:4155`: send the revision
+  the form was opened with.
 - `docs/reliability-guarantees.md` A3 row: updated by doc-keeper when built.
 
 ## Non-goals
@@ -140,3 +153,11 @@ on live trips; boundary path).
 2. Should a stale agent write (409) be reported to the fleet monitor as a
    metric for "stale-state incidents per trip" (Guarantee A's KPI), or only
    logged?
+3. (New.) The organizer web release (#478) put organizer editing in the
+   portal / Mini App. Does any organizer-facing surface outside `trip-web`
+   and Classic PATCH bookings or plan items (and so also need to send the
+   revision)? A search of `control-plane/` and `web/` on 2026-10-30 found
+   none (the portal reaches a trip through the trip site itself); confirm
+   that is the intended shape before approval.
+
+Size: unchanged (M); one more Classic call site.

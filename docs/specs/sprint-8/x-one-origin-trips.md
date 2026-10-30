@@ -3,6 +3,8 @@
 Status: draft (2026-10-19) · Issue: none yet (`x-`) · Track: T4 · Size: L · Tier: High
 Security path: yes (session isolation between trips, the `authRequired` JWT path, the runtime gateway, trip-mcp OAuth) · Migration: yes (S2) · Live-trip behaviour: yes (S4)
 
+> **Unscheduled, to be re-specced (2026-10-30):** the organizer web release (Sprint 7) put a portal and a runtime gateway on their own hosts, which changes this spec's starting point.
+
 This file holds the decisions, the target shape, the security model and the
 slice plan. Each slice has its own spec with its own acceptance criteria, so
 each brief can point at one of them:

@@ -1,6 +1,6 @@
 # Sprint 6 — the five tracks
 
-> **Status:** Sprint 6 CLOSED 2026-10-19. Unfinished items were triaged on 2026-10-19 into Sprint 7 (see `docs/onboarding-mvp-sprint-plan.md#sprint-7--hardening-safe-upgrades-one-origin`) or the backlog.
+> **Status:** Sprint 6 CLOSED 2026-10-19. Unfinished items were triaged on 2026-10-19 into Sprint 7 or the backlog; on 2026-10-30 the open ones were re-scoped into Sprint 8 (see `docs/onboarding-mvp-sprint-plan.md#sprint-8--hardening-short-sprint-2026-10-30--about-2026-11-06`) or the backlog.
 
 `docs/onboarding-mvp-sprint-plan.md:1438-1552` stays the authority on **what**
 Sprint 6 builds and what its exit gate is. This document is the authority on
@@ -356,7 +356,7 @@ Sprint plan `:1479-1496`.
 - Sprint 6 needs the **§5 base event envelope** (22 fields, `docs/trip-bot-analytics-and-metrics-design.md:258-292`) with outcome events inside it — grounded / partial / missing-data answers, unanswered group mentions, organizer follow-up requested/answered, post-write verification passed/failed — *"not as a second vocabulary"*. `funnel_events` shares nothing with that vocabulary.
 - Then the five derived rates, grouped by trip/phase/day/channel/role/topic; the daily control-plan report; and the missing-information control loop.
 - Also routed here from the live-run ledger: **per-user Telegram info-message logging** (`:1351-1353`).
-- Sprint 8 (renumbered from 7 on 2026-10-19) keeps the weighted 1–5 scoring and repeated-question reduction.
+- the post-trip debrief (backlog since 2026-10-30) keeps the weighted 1–5 scoring and repeated-question reduction.
 - **Unfinished-interview measurement is owned here (Dror, 2026-09-25)** — the question people stop at and outcome by duration, `docs/interview-without-an-agent.md` §8b; partial coverage today in `fleet-mcp.mjs` `statistics`/`stalled_interviews`. The sprint plan's Sprint 6.5 WITHDRAWN section, which said it had no owner, now points here.
 
 #### #114 — the interview cannot hold an organizer thinking out loud

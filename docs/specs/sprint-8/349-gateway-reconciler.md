@@ -3,6 +3,8 @@
 Status: draft (2026-10-19) · Issue: #349 · Track: T3 · Size: L · Tier: High
 Security path: yes (spawns processes that hold a trip's credentials; boundary review required) · Migration: yes · Live-trip behaviour: yes
 
+> **Superseded in Sprint 7:** the reconciler was built differently by PR #461 (landed through #478, released 2026-10-27), from Dror's 2026-10-20 companion model. This draft is not a record of what was built; the Hermes bump it unblocks is still open (#189).
+
 ## Problem
 
 Whether a gateway runs is decided by whoever last started it, and remembered by

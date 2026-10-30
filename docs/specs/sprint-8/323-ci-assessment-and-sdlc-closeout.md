@@ -3,6 +3,8 @@
 Status: draft (2026-10-19) · Issue: #323 · Track: Housekeeping · Size: S · Tier: Small (no repo code; one repository secret, one notes-folder report)
 Security path: no · Migration: no · Live-trip behaviour: no
 
+> **Unscheduled (2026-10-30):** the CI half was reworked in Sprint 7 (#470); the secret and the SDLC close-out remain.
+
 Short form (`docs/specs/README.md`, item 6).
 
 ## Problem

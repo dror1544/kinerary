@@ -3,6 +3,8 @@
 Status: draft (2026-10-19) · Issue: none yet (`x-`) · Track: T4 · Size: M · Tier: High
 Security path: yes (moves real travellers' sessions to the shared origin; trip-mcp connector continuity) · Migration: no (data writes through a tool, no schema) · Live-trip behaviour: yes
 
+> **Unscheduled, to be re-specced (2026-10-30):** the organizer web release (Sprint 7) put a portal and a runtime gateway on their own hosts, which changes this spec's starting point.
+
 Umbrella: `x-one-origin-trips.md`. Depends on S1 and S2. S3 is not required.
 
 ## Problem

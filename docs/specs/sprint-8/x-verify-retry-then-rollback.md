@@ -3,6 +3,8 @@
 Status: draft (2026-10-19) · Issue: none yet (x-) · Track: T2 · Size: M · Tier: High
 Security path: no (none of the three named invariants) · Migration: no · Live-trip behaviour: yes (an automatic rollback restarts the stack)
 
+> **Unscheduled (2026-10-30).**
+
 ## Problem
 
 On a failed verify, `cmd_upgrade` (`control-plane/deployment/vm-release.py:1557-1569`)

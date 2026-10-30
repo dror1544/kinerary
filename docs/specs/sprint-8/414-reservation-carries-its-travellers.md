@@ -1,7 +1,9 @@
 # Each flight reservation carries its own travellers and ticket
 
-Status: draft (2026-10-19) · Issue: #414 · Track: T1 · Size: M · Tier: Normal
+Status: draft, refreshed against 4510301 (2026-10-30) · Issue: #414 · Track: T1 · Size: M · Tier: Normal
 Security path: no · Migration: no (site column exists) · Live-trip behaviour: yes (newly built and rebuilt trips)
+
+> **Sprint 8 (2026-10-30): in scope.**
 
 Related: #412 (extraction; separate cause). #415 decides the Journey side, and
 uses the same per-booking travellers this spec adds.
@@ -17,28 +19,39 @@ carry its own names and ticket.**
 Root cause: **structural**, and independent of #412.
 
 - Reservations shows names from `booking.passengers` only (Modern
-  `trip-web/src/App.tsx:1553`; Classic `site/app.js:2890`), and the ticket from
-  `conf_file` (`App.tsx:1255-1264`).
+  `trip-web/src/App.tsx:1554`; Classic `site/app.js:2924`), and the ticket from
+  `conf_file` (`App.tsx:1256-1265`).
 - The worker never fills `passengers`. `derive_bookings` writes
-  `"passengers": None` on every row (`control-plane/worker/control_plane_worker/transformer.py:2841`
-  hotels, `:2906` anchors). So **neither** flight row can show names. #414's
+  `"passengers": None` on every row (`control-plane/worker/control_plane_worker/transformer.py:2844`
+  hotels, `:2909` anchors). So **neither** flight row can show names. #414's
   "unlike the first" likely overstates it; the owner's note says both lacked
   tickets.
 - Nothing ties travellers to a booking. A `travel_anchors` entry is
   `{type, name, date, time, confirmation}` (`control-plane/api/src/interview.ts:775`;
-  document prompt `interpret.ts:1872-1903`). Travellers are one trip-wide list
+  document prompt `interpret.ts:1895-1926`). Travellers are one trip-wide list
   (`interview.ts:680-707`).
 - The ticket link (`conf_file`) comes from `documents.for_anchor(index)`
-  (`document_handoff.py:259-260`, `:322-323`), the anchor index the confirmed
+  (`document_handoff.py:259-260`, `:322-323`; called at
+  `transformer.py:2889`), the anchor index the confirmed
   manifest names. The link is skipped unless exactly one entry matches the
   identity key recorded at upload (`interview.ts:57-60`; key built at
   `answer-merge.ts:251-252`). Two ways it can fail for the second ticket:
-  - `withoutFlightNumbersAsConfirmations` (`interview.ts:1215-1235`) strips a
+  - `withoutFlightNumbersAsConfirmations` (`interview.ts:1215-1235`, wired at `:779`) strips a
     confirmation after the key was recorded;
   - two flights with the same name and date and no confirmation share a key.
 - Identity of a flight row: `seed_key = _stable_id("anchor", type, name, date, confirmation)`
-  (`transformer.py:2897-2913`). Two same-flight anchors with no confirmation
-  collide, and the site's `INSERT OR IGNORE` keeps one (`server/server.js:709-724`).
+  (`transformer.py:2900-2902`, `:2916`). Two same-flight anchors with no
+  confirmation collide, and the site's `INSERT OR IGNORE` keeps one
+  (`server/server.js:707-730`).
+
+**Refresh against 4510301 (2026-10-30).** Every claim above still holds; only
+line numbers moved (`transformer.py` +3 from #201, `App.tsx` +1, `site/app.js`
++34, `interpret.ts` +23 from #339). Nothing on main fills `passengers`, ties
+travellers to an anchor, or changes the anchor `seed_key`. #339 changed only
+how an *unsure* structured reading is offered (merged into what is held); for
+`travel_anchors` that means a Yes on a later upload's unsure anchor now goes
+through `matchEntry`, so AC-3's "different passengers = different bookings"
+rule also governs what that tap writes.
 
 ## Behaviour
 
@@ -66,7 +79,7 @@ travellers (as printed), its own confirmation and its own ticket PDF.
   sanitizing, or the match ignores a stripped field).
 - AC-6 Given the built site seeded from AC-4's `bookings.json`, then
   `GET /api/bookings` returns both rows with their passengers and `conf_file`,
-  and the Modern Reservations list renders each row's names (`App.tsx:1553`).
+  and the Modern Reservations list renders each row's names (`App.tsx:1554`).
 - AC-7 Given an existing anchor with no `passengers` (every trip built so far),
   then its `seed_key` is unchanged. The new field joins the identity only when
   present, so a re-provision of an existing trip adds no duplicate row.
@@ -74,11 +87,11 @@ travellers (as printed), its own confirmation and its own ticket PDF.
 ## Contracts
 
 - `control-plane/api/src/interview.ts` (`travel_anchors.dataExample` `:775`,
-  sanitize `:1215-1235`, link key `:57-60`); `interpret.ts` (`:1872-1903`);
-  `answer-merge.ts` `matchEntry` (`:265-306`): `passengers` disagreeing with
+  sanitize `:1215-1235`, link key `:57-60`); `interpret.ts` (`:1895-1926`);
+  `answer-merge.ts` `matchEntry` (`:266-306`), `entryIdentity` (`:245-254`): `passengers` disagreeing with
   no references on either side is "different bookings" for segment types.
 - `control-plane/worker/control_plane_worker/transformer.py` `derive_bookings`
-  (`:2796-2918`): `passengers`; identity `(type, name, date, confirmation)` plus
+  (`:2799-2921`): `passengers`; identity `(type, name, date, confirmation)` plus
   `passengers` **only when non-empty** (AC-7).
 - `control-plane/worker/control_plane_worker/document_handoff.py`: no shape
   change.
@@ -129,5 +142,13 @@ re-provision-sensitive; AC-7 is the guard).
 
 ## Open questions
 
+Size: unchanged (M). Nothing in scope was built on main.
+
+
 1. When a ticket prints passengers but no PNR (rare), are two same-flight
    entries two bookings (this spec) or one booking needing a question?
+2. (new) `entryIdentity` keys a confirmation-less segment by type, name and
+   date only (`answer-merge.ts:252`), and that key is what links a ticket to
+   its anchor (AC-5). Should `passengers` join that key too (so two
+   confirmation-less same-flight entries each link their own PDF), or is AC-5
+   satisfied only for tickets with a PNR? The spec assumes the former.

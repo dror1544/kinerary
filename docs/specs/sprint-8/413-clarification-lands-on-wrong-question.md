@@ -1,7 +1,9 @@
 # A clarification about a document does not land on the question on screen
 
-Status: draft (2026-10-19) · Issue: #413 · Track: T1 · Size: M · Tier: Normal
+Status: draft, refreshed against 4510301 (2026-10-30) · Issue: #413 · Track: T1 · Size: M · Tier: Normal
 Security path: no · Migration: no · Live-trip behaviour: yes (the interview, for new trips)
+
+> **Sprint 8 (2026-10-30): in scope.**
 
 ## Problem
 
@@ -14,29 +16,50 @@ How the router got there (`control-plane/api/src/`):
 
 - After a document burst, `readDocumentsInto` ends with a recap sent through
   `say()`: "If any of that is wrong just tell me… Meanwhile, carrying on:"
-  (`relay/poller.ts:2322`; `intake-copy.ts:487`, he `:791`). `say()` sets no
-  `lastPrompt`. Then `sendNextStep` (`poller.ts:4818+`, called at `:1720`)
+  (`relay/poller.ts:2384`; `intake-copy.ts:487`, he `:820`). `say()` sets no
+  `lastPrompt`. Then `sendNextStep` (`poller.ts:4897+`, called at `:1710`)
   puts the next required question on screen. With travellers held (from the
   first ticket) and the organizer identified, that is `bot_name`, by array
-  order (`interview.ts:2118-2127`; `bot_name` at `:924-945`).
+  order (`interview.ts:2118-2129`; `bot_name` at `:925-944`).
 - The next typed message is read as a reply to the on-screen question
-  (`poller.ts:3167`). Three things push it there:
+  (`onScreen` from `lastPrompt`, `poller.ts:3246-3250`). Three things push it there:
   - **The prompt.** "this message is their reply to it … read a short or
-    bare answer as answering THAT question" (`interpret.ts:1673-1680`).
+    bare answer as answering THAT question" (`interpret.ts:1696-1703`).
   - **No way to say "travellers" is incomplete.** `travelers` is held, so it
-    is not outstanding; it is not in `correctable` either
-    (`poller.ts:3345-3350`), and a message with no names gives no `ops`.
+    is not outstanding; it is deliberately filtered out of `correctable`
+    whenever travellers are held (`poller.ts:3424-3428`; the prompt mirrors
+    it at `interpret.ts:1682-1685`), because held lists are changed through
+    `ops` (`changeSection`). A message with no names gives no `ops`.
   - **The gate.** The on-screen question is exempt from the confidence floor
-    (`interpret.ts:1168`, added for the 2026-09-12 re-ask loop). `bot_name`
-    validation is non-empty and at most 80 characters (`interview.ts:1305-1314`).
+    (`interpret.ts:1191`; the same `pendingQuestionId` test also at `:989` and
+    `:1049`; added for the 2026-09-12 re-ask loop). `bot_name`
+    validation is non-empty and at most 80 characters (`interview.ts:1305-1310`,
+    `maxLength` at `:942`).
     "נוסעים אחרים" passes evidence, example-echo and validation checks.
 - There is no on-screen state for "the recap you just read": no `q:`, `pc:` or
-  `cfl:` key exists for it (`routerPromptKey`, `poller.ts:4593-4607`).
-- The echo "Got it — <prompt>: <value>" (`poller.ts:3456-3484`) showed the
+  `cfl:` key exists for it (`routerPromptKey`, `poller.ts:4672-4686`).
+- The echo "Got it — <prompt>: <value>" (`poller.ts:3535-3560`) showed the
   misfile, but nothing invited an undo.
 - No test covers this sequence. The closest are
   `organizer-chaos.test.ts:63`, which checks the final intake only, and
   `recap-accepts-new-info-db.test.ts:215-299` (summary, not document recap).
+
+**Refresh against 4510301 (2026-10-30).** Not fixed on main; the trace above
+still holds line for line. What moved:
+
+- #51 (`8501225`) sends a "read only in part" notice before interpreting a
+  long typed message (`poller.ts:3235-3244`). Unrelated to the misfile, but it
+  sits in the same turn; the new tests should use a short message so it does
+  not fire.
+- #339 (`da74f26`, `b3777c1`) changed the document reply (an unsure reading of
+  a held answer is offered merged into it; a restating document is told
+  "already have that"). It does not touch the recap's on-screen state.
+- **A precedent to reuse.** `summaryOnScreen` (`poller.ts:3420`,
+  `interpret.ts:1627-1628`, `:1682-1695`, `:1739-1748`) already widens the
+  reader to "answered already or not" questions plus `summarySection` when the
+  summary is what the organizer is looking at. `afterDocumentRecap` should be
+  the same mechanism scoped to the recap's three question ids, not a parallel
+  prompt section.
 
 ## Behaviour
 
@@ -84,7 +107,8 @@ name without a confirm.
   `recap:doc:<burst id>` marker beside `lastPrompt`, alive for the next one
   inbound message. On that turn pass `afterDocumentRecap` and add `travelers`,
   `phases` and `travel_anchors` to `correctable`, as additions only.
-- `control-plane/api/src/interpret.ts`: the prompt section (`:1660-1720`); the
+- `control-plane/api/src/interpret.ts`: the prompt section (`:1680-1760`),
+  built on the `summaryOnScreen` path (`answeredToo`, `:1682`); the
   exemption narrowed by `looksLikePeopleWords` for `bot_name`; the "other
   travellers, no names" outcome expressed as `unclear` on `travelers`.
 - `control-plane/api/src/intake-copy.ts`: the he/en question "who are the
@@ -131,9 +155,19 @@ live interview).
 
 ## Open questions
 
+Size: unchanged (M). Reusing the `summaryOnScreen` path may make the interpret
+half smaller, but the relay marker and DB tests are as drafted.
+
+
 1. Is this the same bug family as #114 (Track 2) or its own? The trace says it
    is its own: a missing on-screen state after a document recap, not an
    unprompted fact. This spec keeps it in T1 and links #114.
 2. Should the closed people-word list (AC-5) exist at all, or is the recap
    marker (AC-1) enough? The list is a second line of defence. It could
    wrongly block an assistant someone deliberately names "Family".
+3. (new) Reuse `summaryOnScreen` for the turn after a document recap (the
+   reader sees the recap's questions as "answered already or not"), or keep a
+   separate `afterDocumentRecap` flag limited to travelers/phases/
+   travel_anchors? The spec now prefers reuse, scoped to those three ids; the
+   wider option (every answered question) is simpler but invites more
+   misreadings of a plain answer to the on-screen question (AC-3).

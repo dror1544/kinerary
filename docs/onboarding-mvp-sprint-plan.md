@@ -1783,61 +1783,28 @@ cutover:
 
 Archived design: `docs/archived/interviewer-lifecycle-design.md`. It was proposed to give a Hermes interviewer a lifecycle. `docs/interview-without-an-agent.md` removed the interviewer instead, so most of this sprint has nothing left to act on: per-interview rendered profile, chat id written into it, render/destroy lifecycle — rejected (no agent on the default path; `SESSION_NOT_AGENT_WRITABLE` in app.ts); lifecycle and TTL — idle expiry with a warning (migration 0049), orthogonal to `state` by decision; concurrency — kept apart by chat on the default path, still refused (409 AMBIGUOUS) on the agent path until Hermes leaves the intake path (§8 benchmark); localised question catalogue (#41) — built as `intake-copy.ts` (en/he) with completeness tests; template promotion — interview behaviour is code, so promotion is a reviewed commit plus `kinerary-cp-release`. **Still open, not scheduled here:** (1) unfinished-interview measurement (the question people stop at, and outcome by duration) — a requirement (Dror, 2026-09-09) whose shape is undecided, homed in `docs/interview-without-an-agent.md` §8b, partial coverage today in `fleet-mcp.mjs` `statistics`/`stalled_interviews` — **owned by Sprint 6 Track 2 (Dror, 2026-09-25; see `docs/sprint6-tracks.md`)**; (2) an offline judge of interview transcripts that proposes interview changes — not built, not restated since the agent-less switch (restated 2026-09-25 as issue #198, to be designed together with #117's pre-summary judge; see `docs/sprint6-tracks.md`, track owner undecided); it is not `plan-review.ts` (which judges a deployed plan) and not #117's pre-summary pass (which judges one interview's content in the organizer's path) — the owner decides whether it is still wanted; (3) un-namespaced Hermes session ids for companion profiles — a companion concern, homed with the companion work.
 
-### Sprint 7 — Hardening, safe upgrades, one origin
+### Sprint 7 — Issue carry-in fixes and the organizer web release — CLOSED 2026-10-30
 
-> **Decided by Dror, 2026-10-19.** Sprint 6 is closed (section above). Sprint 7
-> is this one, run spec-first. The post-trip debrief sprint that used to carry
-> the number is now Sprint 8 and keeps its gate.
+> **Recorded by Dror's decision, 2026-10-30.** Sprint 7 is what actually
+> shipped, not the plan drafted for it on 2026-10-19. It ran on
+> `integration/sprint-7` (the carry-in fixes below, PRs #425–#454, #470, #472)
+> and, beside it on `main`, the organizer web release (#357, #359 and their gate
+> fixes, landed together through PR #478). Both reached the production control
+> plane in one upgrade on 2026-10-27, release `41965f7`. What changed for people
+> is in `CHANGELOG.md`.
 
-**Goal:** a correction reaches every surface; an upgrade cannot silently leave a
-gateway stale; the newer Hermes becomes possible; trips live under one URL;
-organizers create trips from the web.
-
-**Way of working: spec-driven.** Each item gets an implementation spec in
-`docs/specs/sprint-7/<issue>-<slug>.md`, approved by Dror before it is briefed.
-Briefs carry a `Spec:` field, and "Done when" is the spec's acceptance criteria.
-The product-level sprint spec is in the notes folder (`KINERARY_NOTES_DIR`)
-`specs/`.
-
-Tracks (the specs hold the detail; this lists scope):
-
-- **T1 Trip correctness.** #419 a hotel added in chat reaches Plan and Map
-  (must-fix); #418 no private follow-up promise in groups (must-fix); #412 and
-  #414 second-ticket traveler names; #415 product decision first; #413
-  clarification lands on the wrong question; reliability A: #382 (a correction
-  reaches the site; the booking seed is `INSERT OR IGNORE`) and #383 (an older
-  edit must not overwrite a newer one).
-- **T2 Safe upgrades** (a partial of `docs/future/control-plane-ota-upgrades.md`).
-  #420 a switch restarts every Hermes gateway; verify checks tool registration
-  for every profile (#294, #289); a failed verify retries once, then rolls back
-  automatically; #127 slice 1, each trip records the release/checkout that built
-  it. GHCR images and the offer/gate flow stay future.
-- **T3 Hermes readiness.** #380, #379, #349 (a control-plane-owned gateway
-  reconciler), then the #189 rehearsal on the Mac. The VM bump stays behind the
-  MVP VM-upgrade gate.
-- **T4 One origin for trips.** Every trip site served under one hostname (path
-  routing, e.g. `/t/<slug>/`) instead of a subdomain per trip: a path-aware
-  proxy, a trip-web relative base, per-trip namespaced session storage, old
-  subdomains redirect, and provisioning stops creating per-trip DNS and proxy
-  records. Security path: boundary review. Reopens the host-per-trip decision in
-  `docs/future/k3s-home-deployment-sprint-plan.md`.
-- **T5 Trip creation from the web.** Land #357, then #359 (organizer sign-in,
-  original PDFs, Mini App entry, #358 link recovery); #417; real Telegram and
-  ChatGPT/Claude PDF tests.
-- **Housekeeping.** #323 and the SDLC process proposal §10 close-out
-  (`docs/kinerary-sdlc-process-proposal-2026-09-28.md`); #387; #381.
-
-**Out of scope** (Sprint 8 or backlog): post-trip debrief, CA-02..CA-08, the k3s
-migration, release channels slices 2 to 5, the #346 approval lane (designed
-alongside #380, not built), #186.
-
-**Capacity.** T4 and #349 are both L. If the sprint must shrink, T4 is cut to
-spec, proxy and one trip migrated.
-
-**Exit gate:** every Sprint 7 spec is marked verified, a green full-cycle e2e on
-`main`, and a regression plan for the release.
+Of the "Hardening, safe upgrades, one origin" plan drafted on 2026-10-19, these
+were built inside Sprint 7: #379 (Hermes image test step), #381, the
+trip-intake half of #420, #288, the #349 gateway reconciler (#461; the Hermes
+bump it unblocks is still open), and Track 5 (#357, #359; #417 is still open).
+Everything else moved to Sprint 8 below or to the backlog. The specs drafted then
+moved to `docs/specs/sprint-8/`, each marked with what is already built.
 
 #### Sprint 7 carry-in — open issues to fix (triage 2026-10-18)
+
+> **At Sprint 7's close (2026-10-30):** the 23 quick fixes shipped. What is
+> still open in the lists below is the backlog later sprints draw from; Sprint
+> 8 takes only the items in its own table.
 
 Every open issue was checked against `main` @ `03c0e1c` on 2026-10-18. 15 were
 already fixed or obsolete and are now closed. 23 small fixes are on five
@@ -1908,13 +1875,59 @@ before closing. #133 and #206 have code on `main` and close after a live walk.
 list. CA-01 and CA-07 are drafts #357 and #359, which must land in that order;
 CA-00 lands with #357.
 
-The tracks are the sprint's commitments, each with a spec in
-`docs/specs/sprint-7/`. The carry-in above is the triaged fix list the sprint
-also draws from; an item from it is built only after it has an approved spec
-(the short form is enough for a Small-tier fix). Where the carry-in and a track
-name the same issue, the track's spec governs.
+### Sprint 8 — Hardening (short sprint, 2026-10-30 → about 2026-11-06)
 
-### Sprint 8 — Post-trip debrief and reviewed learning
+> **Decided by Dror, 2026-10-30.** One week, a small scope, and work reaches
+> `main` during the sprint, not only at its end.
+
+**Goal:** what the family tells the assistant reaches the site, and a VM upgrade
+cannot silently leave something stale.
+
+**Cadence.** Work lands on `integration/sprint-8` (cut from `main` at
+`4510301`). The integration branch is merged to `main` **every 2–3 days**
+whenever it is green (CI on the merge ref plus the nightly e2e), so `main` never
+trails the sprint by more than a few days. A VM release can follow any of those
+merges, through the normal gates and with Dror's approval each time (hard rule
+2); there is no "release at sprint end" batch.
+
+**Way of working: spec-driven.** Each item has an implementation spec in
+`docs/specs/sprint-8/`; Dror approves it before it is built; briefs carry
+`Spec:` and "Done when" is the spec's acceptance criteria; the verifier reports
+criterion by criterion (`docs/specs/README.md`).
+
+**Scope** (each with its spec):
+
+| # | Item | Spec | Size |
+|---|---|---|---|
+| 1 | #419 a hotel added in chat reaches Plan and Map (must-fix) | `419-hotel-booking-reaches-plan-and-map.md` | M |
+| 2 | #418 no private follow-up promise in groups (must-fix) | `418-no-private-follow-up-promise-in-groups.md` | S |
+| 3 | #382 a corrected booking or plan item reaches the live site | `382-corrected-booking-reaches-site.md` | M |
+| 4 | #412 + #414 a second ticket's traveller names, extracted and shown | `412-…`, `414-…` | M |
+| 5 | #413 a clarification lands on the question it answers | `413-clarification-lands-on-wrong-question.md` | M |
+| 6 | #387 provisioning lock order (a built site recorded as failed) | `387-provision-lock-order.md` | S |
+| 7 | #294 + #289 upgrade verify: bridges answer `/health`, pre-existing failures told apart | `294-every-profile-verify.md` | M |
+| 8 | #380 the relay's Hermes mirror is pinned by a fixture (Hermes-bump prerequisite) | `380-hermes-mirror-fixture.md` | M |
+
+Decision first: **#415** (one Journey line or two for a flight booked twice)
+shapes how #414 renders; it is decided before item 4 is built.
+Stretch, only if the above is done: #383 (ordering guard), #417 (documents in
+Telegram's in-app browser).
+
+**Not this sprint** (specs kept in `docs/specs/sprint-8/`, unscheduled): one
+origin for trips (to be re-specced: the organizer web release already put a
+portal and a runtime gateway on their own hosts), the rest of #420 (every
+gateway restarted), retry-then-rollback, #127, the Hermes bump (#189 and #349's
+remaining part), #323 and the process close-out. Also out: the post-trip debrief
+(backlog, below), CA-02..CA-08, the k3s migration.
+
+**Exit gate:** the eight items' specs are marked verified (or deferred by Dror
+in writing), `integration/sprint-8` is merged to `main` with green CI and a green
+nightly, and a regression plan exists for whatever reaches the VM.
+
+### Post-trip debrief and reviewed learning — backlog, unscheduled
+
+> Numbered Sprint 7, then Sprint 8; moved to the backlog by Dror on 2026-10-30
+> when Sprint 8 became the short hardening sprint. Content and gate unchanged.
 
 > **Renumbered 2026-10-19 (Dror).** This was Sprint 7. Sprint 7 is now
 > "Hardening, safe upgrades, one origin" (above); the content and the exit gate
@@ -2039,7 +2052,7 @@ be unable to produce an active trip.
 
 The MVP onboarding milestone is complete when the Sprint 6 demo is repeatable
 from a clean test allocation, and the automated test suite covers every
-component seam plus the major refusal paths. Sprint 8 (renumbered from 7 on 2026-10-19) is the first
+component seam plus the major refusal paths. The post-trip debrief (backlog since 2026-10-30) is the first
 post-trip-learning milestone and can begin once a completed Japan demo exists.
 A human may still approve provisioning and activation; automation means those
 approvals trigger a durable, repeatable workflow rather than an operator's
