@@ -9,3 +9,9 @@ files, endpoints or hosts that never existed or have since changed.
 
 When work on one of these starts, its document moves back to `docs/` and gets
 a status line.
+
+The SDLC process proposal and its review used to live here; they moved back to
+`docs/` on 2026-10-19 (partly applied, see their status lines). Some documents
+here are pulled into a sprint in part and say so in their own status line
+(`control-plane-ota-upgrades.md`, `release-channels-and-organizer-spinoffs.md`:
+Sprint 7).

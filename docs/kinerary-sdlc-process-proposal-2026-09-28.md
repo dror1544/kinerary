@@ -1,5 +1,7 @@
 # Kinerary SDLC improvement proposal — request for Claude's opinion
 
+Status (2026-10-19): partly applied — regression-assessment pre-filter (#320) and the Small tier (#322); §10 close-out and the #323 secret owed in Sprint 7 housekeeping; the rest deferred.
+
 Prepared by Codex for Dror and Claude, 2026-09-28.
 
 **Status: discussion proposal, not an approved policy or implementation instruction.**
@@ -52,25 +54,25 @@ claims below are observations as of September 28, not continuing guarantees.
 
 ### Current strengths and costs
 
-- [CLAUDE.md](../../CLAUDE.md) already defines mechanical guardrails,
+- [CLAUDE.md](../CLAUDE.md) already defines mechanical guardrails,
   verification, security boundaries, and merge/deploy authority. Its MVP rules
   already narrow regression planning and permit CI evidence in defined cases.
-- [Agent-team plan](../agent-team-plan.md), section 3.1, requires delegation
+- [Agent-team plan](agent-team-plan.md), section 3.1, requires delegation
   even for a one-line product change. Section 3.6 gives the doc keeper a
   per-task seat as well as a daily sweep. These are candidates for adjustment,
   not permissions this proposal grants.
 - `CLAUDE.md` has 866 lines/about 7,742 words; the team plan has 954 lines/about
   9,139 words. File size is evidence of reading surface, not proof that every
   task loads both files or that every token is billed at an uncached rate.
-- [Regression assessment workflow](../../.github/workflows/regression-assessment.yml)
+- [Regression assessment workflow](../.github/workflows/regression-assessment.yml)
   invokes its configured Opus model on eligible PR-opening and issue events.
   Narrowing a report's contents does not itself prevent that invocation.
-- [September 27 handoff](../test-reports/sprint-6-integration-handoff-2026-09-27.md)
+- [September 27 handoff](test-reports/sprint-6-integration-handoff-2026-09-27.md)
   records boundary reviews finding an account bypass in #274 and sensitive
   data/validation defects in #275. These checks have demonstrated value.
-- [Process metrics](../../scripts/process-metrics.py) and hook-decision logging
+- [Process metrics](../scripts/process-metrics.py) and hook-decision logging
   already exist. The earlier baseline's statement that logging is only proposed
-  is historical. [Nightly e2e](../../scripts/nightly-e2e.sh) exists too, but the
+  is historical. [Nightly e2e](../scripts/nightly-e2e.sh) exists too, but the
   tracks document says it is not scheduled; script existence is not proof of
   an operating automation.
 
@@ -85,7 +87,7 @@ Read-only GitHub queries in this conversation returned:
 | 75th percentile | 1,805.12 minutes | 132.98 minutes |
 | Open-to-merge over 24 hours | 13 | 0 |
 
-The [baseline report](../test-reports/process-baseline-2026-09-26.md) explains
+The [baseline report](test-reports/process-baseline-2026-09-26.md) explains
 the original sample. The cutoff is #226's merge at
 `2026-09-26T07:46:12Z`. The before cohort merged before that timestamp; the
 after cohort opened after it and had merged when queried. #226 is excluded.
@@ -205,7 +207,7 @@ repair as an initial adoption step.
 
 ### What the existing schedule actually says
 
-[Sprint 6 decisions 51 and 55](../sprint6-tracks.md) and the September 27
+[Sprint 6 decisions 51 and 55](sprint6-tracks.md) and the September 27
 handoff record Release A for **Saturday, October 3, morning IDT**, with a
 separately pinned `release/a` at `a744c28` when recorded. The older Friday
 October 2 window is superseded. Ordinary Sprint 6 development continues;
