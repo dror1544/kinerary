@@ -90,7 +90,7 @@ While Kinerary is in early access, we read trip data and conversations to evalua
 We read it; we do not change it except at the organizer's request.
 
 This is on by default during early access. An organizer can turn it off at any time by writing to
-privacy@ara-united.store; a notice and a switch at sign-up, and in the account settings, are coming. Once it is
+privacy@ara-united.store; a notice on the sign-up screen and a switch in Settings are coming. Once it is
 off, we look at that organizer's trips only to provide the service, keep it secure, fix a fault, or when the
 law requires it.
 
