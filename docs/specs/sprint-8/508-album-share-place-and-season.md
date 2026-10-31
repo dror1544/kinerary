@@ -1,6 +1,6 @@
 # A shared album shows the place and the season, nothing per photo
 
-Status: draft (2026-10-31) · Issue: #508 · Track: T1 · Size: S · Tier: Normal
+Status: approved 2026-10-31 by Dror · Issue: #508 · Track: T1 · Size: S · Tier: Normal
 Security path: yes (`server/server.js`: what an unauthenticated link exposes) · Migration: no · Live-trip behaviour: yes
 
 ## Problem
@@ -68,7 +68,10 @@ Decided by Dror on 2026-10-31 (#508 comments):
 
 - No per-photo captions and no EXIF stripping service.
 - No change to what signed-in members see inside the trip site.
-- Captions are English only; a Hebrew caption is a follow-up if Dror wants one.
+- The caption is stored in English only. The app is natively English, and other
+  languages are a display-time translation (an LLM where needed), never a
+  second stored caption (Dror, 2026-10-31). The Immich share page is not our
+  display layer, so it shows the English caption.
 - No new share view of our own; the Immich share page stays.
 
 ## Security and boundary notes
@@ -108,5 +111,5 @@ path but no migration.
 
 ## Open questions
 
-None. Behaviour decided by Dror 2026-10-31; English-only caption and the
-northern-hemisphere default are the spec's recommendations.
+None. Behaviour and the English caption decided by Dror 2026-10-31; the
+northern-hemisphere default is the spec's recommendation.
