@@ -89,7 +89,9 @@ opening hours, prices, travel rules, visa or health advice can be out of date or
   withdraw it. Photos of people are never shown outside the trip; we leave out any photo in which we detect a
   person, and remove its location and camera details first.
 - Photos and comments on a trip site are visible to the trip's signed-in travellers. An album share link works
-  for anyone who has it, and can show when and where its photos were taken.
+  for anyone who has it. It shows the trip's place and the season and year, not when or where each photo was
+  taken, and photos cannot be downloaded from it. Links made before this change can still show each photo's
+  time and place until we update them.
 
 ## 9. Third-party services
 
