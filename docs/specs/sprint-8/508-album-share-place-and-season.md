@@ -69,8 +69,9 @@ Decided by Dror on 2026-10-31 (#508 comments):
 - No per-photo captions and no EXIF stripping service.
 - No change to what signed-in members see inside the trip site.
 - The caption is stored in English only. The app is natively English, and other
-  languages are a display-time translation (an LLM where needed), never a
-  second stored caption (Dror, 2026-10-31). The Immich share page is not our
+  languages are shown from an existing translation if there is one, otherwise
+  translated by an LLM once, cached, and retranslated only when the English
+  changes, never translated live on every view (Dror, 2026-10-31). The Immich share page is not our
   display layer, so it shows the English caption.
 - No new share view of our own; the Immich share page stays.
 
