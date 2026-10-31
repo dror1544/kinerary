@@ -3,6 +3,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { publicPart } = require('../shared/config-visibility');
 const { projectAgent } = require('../shared/agent-schema');
+const seedReconcile = require('./seed-reconcile');
 // Every plan date a route below is SENT must be a day on the calendar, not
 // only the shape (second boundary re-check of PR #373); reads keep ISO_DATE_RE.
 const { isCalendarDay, CALENDAR_DAY_DETAIL } = require('./calendar-day');
@@ -674,6 +675,20 @@ function serializeItinerary(db, rows, { includeOriginal = false, config = null, 
   };
 }
 
+// Organizer view only: the plan items the trip file changed under an edit (server/seed-reconcile.js).
+function withSeedFlags(db, payload) {
+  const flagged = db.prepare('SELECT itinerary_item_uid, config_ref, seed_pending, seed_removed FROM phase_plan_items WHERE seed_pending IS NOT NULL OR seed_removed = 1').all();
+  if (!flagged.length) return payload;
+  const byUid = new Map(flagged.map((row) => [row.itinerary_item_uid || `cfg_${digest(row.config_ref).slice(0, 16)}`, row]));
+  return {
+    ...payload,
+    items: payload.items.map((item) => {
+      const row = byUid.get(item.item_uid);
+      return row ? { ...item, ...seedReconcile.shapePlanItem({ seed_pending: row.seed_pending, seed_removed: row.seed_removed }, true) } : item;
+    }),
+  };
+}
+
 function issueFingerprint(issue) {
   return digest([issue.source, issue.severity, issue.phase_id || '', issue.date || '', issue.item_uid || '', issue.title].join('|'));
 }
@@ -1219,7 +1234,7 @@ function moveDayRows(rows, { from, to, date, lodging, headline }) {
   return { items: moved, headline: headlineMoved };
 }
 
-function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImpl, mediaDir, authRequired, organizerOrAgentRequired, requestItemEnrichment, phaseKnown, stopKnown, onPhasesReshuffled, reviewConfigured }) {
+function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImpl, mediaDir, authRequired, organizerOrAgentRequired, requestItemEnrichment, phaseKnown, stopKnown, onPhasesReshuffled, reviewConfigured, isOrganizer }) {
   // The trip as it is now. server.js passes the effective config (the file
   // with the stop layer merged over it, server/trip-structure.js); a caller
   // that passes only `config` gets exactly that object, as before.
@@ -1307,7 +1322,9 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
     if (!rows) return res.status(404).json({ error: 'itinerary_not_ready' });
     // The ETag is over the payload, so a stop edit — which changes the lodging
     // served, not the plan revision — is a new ETag, never a 304.
-    const payload = serializeItinerary(db, rows, { config: hotelPlaces ? hotelPlaces.hydrateConfig(cfg()) : cfg(), hotelPlaces });
+    let payload = serializeItinerary(db, rows, { config: hotelPlaces ? hotelPlaces.hydrateConfig(cfg()) : cfg(), hotelPlaces });
+    // "The trip file changed this item" (#382) is the organizer's to see; a member's payload is byte-for-byte what it was.
+    if (isOrganizer && isOrganizer(req)) payload = withSeedFlags(db, payload);
     const etag = etagForPayload(payload);
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('ETag', etag);
@@ -1715,6 +1732,14 @@ function create(options) {
     applyItemEnrichment: (legacy, fields) => applyItemEnrichment(db, legacy, fields),
     updateLegacyFromActive: () => updateLegacyFromActive(db),
     importPlanOnce: (promoteFromConfig) => importPlanOnce(db, promoteFromConfig),
+    // #382: update the config-imported plan items nobody edited to what the config now says, in ONE
+    // new revision, and flag the ones a person edited. importPlanOnce keeps its latch for ADDING
+    // items (a deleted item stays deleted); this never adds and never deletes.
+    reconcileConfigItems: (items, { mode = 'apply' } = {}) => {
+      const result = seedReconcile.reconcilePlanItems(db, items, { mode });
+      if (mode === 'apply' && result.changed) syncFromLegacy(db, raw, 'config-reconcile');
+      return result.report;
+    },
     setRestorePoint: (author) => setRestorePoint(db, author),
     uiSettings: () => uiSettings(db),
     // For server/trip-structure.js: read the active plan, and change it the

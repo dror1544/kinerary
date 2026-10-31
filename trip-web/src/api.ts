@@ -173,6 +173,8 @@ export const itemSchema = z.object({
   }).nullable().optional(),
   confirmation_state: z.string().optional(),
   provenance: z.object({ status: z.string() }).optional(),
+  seed_changed: z.record(z.string(), z.unknown()).optional(),
+  seed_removed: z.boolean().optional(),
 });
 
 export type TripConfig = z.infer<typeof configSchema>;
@@ -248,6 +250,10 @@ const bookingSchema = z.object({
   notes: z.string().nullable().optional(),
   place: hotelPlaceSchema.optional(),
   review_status: z.enum(["approved", "draft"]).optional(),
+  // The organizer's "the trip file changed this" (#382): the file's newer values for a booking someone edited
+  // on the site, or true when the file dropped it. Absent for members, always.
+  seed_changed: z.record(z.string(), z.unknown()).optional(),
+  seed_removed: z.boolean().optional(),
 });
 
 export type Booking = z.infer<typeof bookingSchema>;
@@ -369,6 +375,10 @@ export async function getAuthenticatedDocument(path: string) {
 }
 export const extractBookingDetails = (body: FormData) => api<ExtractedBooking>("/api/bookings/extract", { method: "POST", body });
 export const extractBookingDraft = (body: FormData) => api<{ ok: true; booking: Booking; extracted: unknown }>("/api/bookings/extract-draft", { method: "POST", body });
+// "The trip file changed this" — keep mine (`keep`) or use the new one (`accept`) (#382).
+export type SeedAnswer = "accept" | "keep";
+export const answerBookingSeed = (id: number, answer: SeedAnswer) => api<{ ok: true }>(`/api/bookings/${id}/${answer}-seed`, { method: "POST" });
+export const answerItemSeed = (itemUid: string, answer: SeedAnswer) => api<{ ok: true }>(`/api/itinerary/items/${encodeURIComponent(itemUid)}/${answer}-seed`, { method: "POST" });
 export const approveBookingDraft = (id: number) => api<{ ok: true }>(`/api/bookings/${id}/approve`, { method: "POST" });
 export const createBooking = (input: BookingInput) => api<{ ok: true; id: number }>("/api/bookings", { method: "POST", body: JSON.stringify(input) });
 export const updateBooking = (id: number, input: BookingInput) => api<{ ok: true }>(`/api/bookings/${id}`, { method: "PATCH", body: JSON.stringify(input) });

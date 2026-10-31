@@ -1550,10 +1550,13 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
         }
       }
       let bookingOutOfSync = false;
+      let bookingRetired = false;
       if (o?.booking_id) {
-        const b = db.prepare('SELECT date_from, date_to FROM bookings WHERE id = ?').get(o.booking_id);
+        const b = db.prepare('SELECT * FROM bookings WHERE id = ?').get(o.booking_id);
         const d = phaseDates(phase);
-        bookingOutOfSync = !b || !d || isoDay(b.date_from) !== d.start || isoDay(b.date_to) !== d.end;
+        // A re-provision that drops the linked hotel retires it (#382); the stop is not rewritten, the organizer is asked.
+        bookingRetired = Boolean(b?.retired_at);
+        bookingOutOfSync = !b || !d || bookingRetired || isoDay(b.date_from) !== d.start || isoDay(b.date_to) !== d.end;
       }
       return {
         id: phase.id,
@@ -1563,6 +1566,7 @@ function createTripStructure({ db, baseConfig, journey, queuePhaseReview = () =>
         override: o ? { fields: Object.keys(o.fields), booking_id: o.booking_id, updated_by: o.updated_by, updated_at: o.updated_at, after_phase_id: o.after_phase_id } : null,
         conflict,
         booking_out_of_sync: bookingOutOfSync,
+        ...(bookingRetired ? { booking_out_of_sync_reason: 'booking_retired' } : {}),
         unlinked_hotel_bookings: unlinked.get(phase.id) || [],
       };
     });
