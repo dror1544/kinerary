@@ -577,13 +577,22 @@ because the migration is additive.
 
 ## Decisions (Dror, 2026-10-30)
 
+- **UX guardrail (Dror, 2026-10-30, supersedes the two boxes above): no checkboxes on sign-up.**
+  Too many boxes cost sign-ups, and an explicit "are you 18 or older" question makes the site look
+  suspicious. The sign-up screen carries one quiet line under the button: "By creating an account you
+  agree to the Terms and Privacy Policy. We may read trips to improve Kinerary during early access —
+  you can turn this off in Settings." (he/en). Creating the account records, with the policy version:
+  terms accepted, evaluation reading on (legitimate interests, notice + opt-out). The age condition
+  lives in the Terms text, never as a question. The opt-out lives only in Personal settings. Existing
+  accounts see the same one-line notice once (dismissable), not a panel of boxes. Any future consent
+  addition must keep the sign-up screen box-free unless Dror decides otherwise.
 - **Health scope: medical only.** Allergies and intolerances (nut, gluten, lactose), mobility, and a
   child's age are asked once in the interview and not stored on a no. Kosher, kosher-style,
   vegetarian and vegan stay ordinary preferences; raised with the legal review.
 - **A no for a child drops only the age.** The name, family and login stay (the trip needs its
   roster).
 - **Every other open question: the spec's own recommendation**, adopted as Dror's decision —
-  box 1 also says "I'm 18 or older"; only material policy changes re-ask; a "no" for a later
+  only material policy changes re-ask; a "no" for a later
   settings switch governs new entries only (deleting old data stays an email request); a Mini App
   (Telegram-scoped) session may only turn choices off; a Telegram agreement is recorded against the
   link's account together with the Telegram account that agreed; members joining by site invite get
