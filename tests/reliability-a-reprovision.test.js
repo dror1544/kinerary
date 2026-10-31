@@ -374,6 +374,36 @@ describe('a re-provision reaches the tabs (#382)', () => {
     const asAgent = await call('/api/bookings', { key: AGENT_KEY });
     assert.ok(asAgent.body.find(b => b.seed_key === 'hotel_ny').seed_changed, 'the agent is organizer-scoped');
   });
+
+  test('a stop whose linked hotel was retired is reported out of sync with a reason, and is not moved', async () => {
+    const hotelRow = (await bookings()).find(b => b.seed_key === 'hotel_ny');
+    const stop = async (token = alice) => (await call('/api/stops', { token })).body.stops.find(s => s.id === PHASE);
+    // In sync to begin with: re-link the stop to the hotel as it is now.
+    assert.equal((await call(`/api/stops/${PHASE}/from-booking`, { method: 'POST', token: alice, body: { booking_id: hotelRow.id } })).status, 200);
+    const before = await stop();
+    assert.equal(before.booking_out_of_sync, false);
+    assert.equal(before.booking_out_of_sync_reason, undefined);
+    const phaseBefore = (await call('/api/config', { token: alice })).body.phases.find(p => p.id === PHASE);
+
+    // The re-provision books a different hotel; the linked one is no longer in the file and is retired
+    // (it was edited on the site, so the organizer answers "use the new one").
+    writeBookings([hotel('2027-03-13', { seed_key: 'hotel_ny_other', name: 'Hotel Other', confirmation: 'OTHER-1' })]);
+    await restart();
+    assert.equal((await call(`/api/bookings/${hotelRow.id}/accept-seed`, { method: 'POST', token: alice })).status, 200);
+    assert.ok(!(await bookings()).some(b => b.id === hotelRow.id), 'the old hotel is off the bookings tab');
+
+    const after = await stop();
+    assert.equal(after.booking_out_of_sync, true, 'the organizer is asked');
+    assert.equal(after.booking_out_of_sync_reason, 'booking_retired');
+    assert.equal(after.override.booking_id, hotelRow.id, 'the stop is not rewritten');
+    const phaseAfter = (await call('/api/config', { token: alice })).body.phases.find(p => p.id === PHASE);
+    assert.deepEqual(phaseAfter.dates, phaseBefore.dates, 'nothing moved at boot or on accept');
+
+    // A member never receives the stop layer's bookkeeping.
+    const asMember = await call('/api/stops', { token: bob });
+    assert.ok(!/booking_retired|booking_out_of_sync/.test(asMember.text), asMember.text.slice(0, 200));
+    assert.ok(!(await call('/api/config', { token: bob })).text.includes('booking_retired'));
+  });
 });
 
 describe('the rollout is gated per trip, and can be rehearsed on a copy (#382)', () => {
