@@ -161,7 +161,7 @@ in this interview. When the trigger fires:
 One card, "Privacy", holds three things:
 
 1. **Terms and Privacy Policy.** Read-only: "Accepted on 31 October 2026
-   (version 2026-10-30)", with links.
+   (version 2026-10-31)", with links.
 2. **Switch: "Let the Kinerary team read my trips to improve the product"**,
    showing its current value.
 3. **Switch: "I may add travellers' health needs and children's details, and I
@@ -170,6 +170,16 @@ One card, "Privacy", holds three things:
 
 Each change is one recorded choice. No other account setting moves here (see
 Non-goals).
+
+**Future switch, not built here: "Route and place summaries".** The Privacy
+Policy (section 7, version of 31 October 2026) promises a switch for
+de-identified route and place summaries offered to other travellers, and for
+learning about places from trip photos. It is on by default, with an email opt-out
+until the switch exists (Dror, 2026-10-30/31; MRD §5.5 "Route object and memory
+loop"; #486). It ships with that feature, as a fourth item on this card, and
+records its choice the same way (`choice_kind = 'route_summaries'`, its own
+notice version). This item only leaves room for it: the card is a list, not a
+fixed set of three.
 
 **Evaluation tooling (#501).** A trip is readable for evaluation only while
 every one of its owners has evaluation reading on.
