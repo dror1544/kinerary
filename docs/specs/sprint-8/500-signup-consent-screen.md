@@ -1,6 +1,6 @@
 # Sign-up privacy choices, the interview's health-and-children question, and a personal settings page
 
-Status: draft (2026-10-30) · Issue: #500 (with #499's remaining part and #501) · Track: T1 · Size: L · Tier: High
+Status: approved 2026-10-30 by Dror (decisions below) · Issue: #500 (with #499's remaining part and #501) · Track: T1 · Size: L · Tier: High
 Security path: yes (portal auth routes `/v1/auth/verify-email` and `/v1/auth/google`, a new account-level route, the interview's write path to `intake_versions`) · Migration: yes · Live-trip behaviour: yes (interview; no trip-site change)
 
 Shape: the owner's decision of 2026-10-30 21:08 on #500 and #501. It replaces the
@@ -575,52 +575,23 @@ Who feels it, and when:
 The way back is to turn off the flag and restart. The table stays, unread,
 because the migration is additive.
 
+## Decisions (Dror, 2026-10-30)
+
+- **Health scope: medical only.** Allergies and intolerances (nut, gluten, lactose), mobility, and a
+  child's age are asked once in the interview and not stored on a no. Kosher, kosher-style,
+  vegetarian and vegan stay ordinary preferences; raised with the legal review.
+- **A no for a child drops only the age.** The name, family and login stay (the trip needs its
+  roster).
+- **Every other open question: the spec's own recommendation**, adopted as Dror's decision —
+  box 1 also says "I'm 18 or older"; only material policy changes re-ask; a "no" for a later
+  settings switch governs new entries only (deleting old data stays an email request); a Mini App
+  (Telegram-scoped) session may only turn choices off; a Telegram agreement is recorded against the
+  link's account together with the Telegram account that agreed; members joining by site invite get
+  no box 1 for now; "the kids" with no stated age does not trigger the question; a yes is per trip
+  (the settings switch is the ahead-of-time answer); Telegram-only organizers get the one-time terms
+  message only at their next interview start, never mid-companion; the #501 evaluation-tooling half
+  becomes its own small issue.
+
 ## Open questions
 
-Decisions for Dror before approval.
-
-1. **Age line on box 1.** The Terms require 18+. Should box 1 read "I'm 18 or
-   older and I agree to …", or stay as the owner's sentence?
-   *Recommendation:* add it. It is the only place the age requirement is ever
-   affirmed.
-2. **Does every policy update re-ask?** The terms say "we will tell organizers
-   before a material change". *Recommendation:* re-ask only when
-   `TERMS_REASK_FROM` is raised, which happens for a material change. An
-   editorial update changes the recorded version only.
-3. **What a refusal removes for a child.** *Recommendation:* the age only. The
-   name, family group and login stay, because the trip cannot run without the
-   roster. Alternatively, should the child be removed entirely? That would
-   break the site login and the companion's roster.
-4. **Turning the settings switch off later.** What happens to details already
-   stored? *Recommendation:* the switch governs new entries. Removing existing
-   data stays an email request, as the policy says today. Alternatively,
-   turning it off strips the details from the next intake version.
-5. **Telegram-scoped sessions and forwarded links.**
-   - Should a Mini App session be able to *turn off* evaluation reading or
-     sensitive details? Turning off is harmless; turning on is not.
-     *Recommendation:* allow turning off only.
-   - Is recording a Telegram agreement against the link's account acceptable
-     when the agreeing Telegram account is not the one the invitation went to?
-     *Recommendation:* record it, with the digest, as specced.
-6. **Members.** Should people who join through a site invite get box 1?
-   *Recommendation:* not now. The Terms §1 already covers "signing in to a trip
-   website".
-7. **Scope of "health needs".**
-   - Do `kosher`, `kosher_style`, `vegetarian` and `vegan` count? They reveal
-     belief, which Amendment 13 also treats as sensitive, but they are not
-     health. *Recommendation:* not in this item. Raise it with the legal review.
-   - Does free text in other `constraints` keys count?
-   - Should facts a companion learns in conversation count?
-8. **Children with no stated age.** "The kids", with no number, does not
-   trigger the question. *Recommendation:* accept this. Every trigger is a
-   deterministic fact, and the interviewer prompt already asks for ages.
-9. **Yes in one interview, and later trips.** Should a Yes in one interview also
-   count for the organizer's next trips? *Recommendation:* no, it is per trip.
-   The settings switch is the ahead-of-time answer.
-10. **Telegram-only organizers between interviews.** Should they get the one-time
-    terms message on their next router-handled private message (the #499
-    comment's "one-time message in Telegram/email"), or only at their next
-    interview start? *Recommendation:* the next interview start only. Never
-    interrupt a live trip's companion.
-11. **Splitting #501's tooling half.** Should the fleet-MCP flag and the
-    evaluation rule ship as their own small issue rather than PR C?
+None blocking approval; factual checks noted above happen during build.

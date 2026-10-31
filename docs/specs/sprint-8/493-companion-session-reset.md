@@ -1,6 +1,6 @@
 # Companion conversations reset again: install the session-reset plugin, and warn when Hermes ignores a config key
 
-Status: draft (2026-10-30) · Issue: #493 · Track: T3 · Size: S–M · Tier: Normal
+Status: approved 2026-10-30 by Dror (decisions below) · Issue: #493 · Track: T3 · Size: S–M · Tier: Normal
 Security path: no (no `sanitizeConfig`, visibility or auth change). It does add third-party code to every companion gateway; see the security notes · Migration: no · Live-trip behaviour: yes (companion conversation length, after a refresh)
 
 ## Problem
@@ -282,29 +282,18 @@ Tests are written first.
   anything. Sequence this item first, or have the reconciler call the same
   `enable_hermes_plugins`.
 
+## Decisions (Dror, 2026-10-30)
+
+- **The reset plugin is reviewed and copied into the repo** at its pinned commit (licence
+  permitting) and installed from there; every later change is ours to review. The recorded source
+  review at the pin is a precondition of the PR.
+- **Every other open question: the spec's own recommendation**, adopted as Dror's decision — a
+  missing plugin or an ignored config key warns at install and fails in CI; a visible "new
+  conversation" line in family groups is checked during the source review and must be off for
+  groups; whether the VM's multiplexed gateway needs process-level enablement is a read-only check
+  done during build (no AC depends on guessing it); fleet-monitor alerting on these install warnings
+  is a follow-up issue.
+
 ## Open questions
 
-Decisions for Dror before approval.
-
-1. **Vendor or install from the catalog?** Vendor a reviewed copy into
-   `.agents/hermes-plugins/` (recommended: reviewable, no network at install,
-   history in this repo), or `hermes plugins install` from the catalog pin?
-   Vendoring needs the upstream licence to allow it, which is to be checked in
-   the PR.
-2. **Should a missing plugin or an ignored key fail the install, or warn?**
-   *Recommendation:* warn (AC-3, AC-4). Failing would stop a trip from being
-   built because of a Hermes upgrade, while the companion still works, just
-   with long conversations. CI (AC-5) is where it fails hard.
-3. **`notify: false`.** The catalog entry lists `mode`, `idle_minutes` and
-   `at_hour`, not `notify`. Does the plugin announce a reset in the chat? If it
-   does, and cannot be silenced, is a visible "new conversation" line in a
-   family group acceptable, or does that block adoption?
-4. **Multiplexed gateway on the VM.** Is a multiplexed gateway serving several
-   profiles from one process? Hermes checks `reset_plugin_enabled()` per
-   process, so the plugin may need enabling where the serving process loads
-   plugins, not only in each profile. This is to be read off the VM in the
-   rollout probe before choosing between image and per-profile install.
-5. **Who watches the `WARN` lines?** The worker logs them. Should the fleet
-   monitor also raise `companion_install.warning` as an alert?
-   *Recommendation:* yes, as a follow-up issue, since the monitor's MCP is a
-   separate surface.
+None blocking approval; factual checks noted above happen during build.
