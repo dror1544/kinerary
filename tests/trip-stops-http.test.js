@@ -637,3 +637,73 @@ describe('boundary review 2026-10-11 — hostile stop text is refused, and Class
     assert.deepEqual((await server.call('/api/stops/frankfurt/history', agent)).body.history, []);
   });
 });
+
+// ── #419: an unlinked hotel is visible to the organizer, with a one-tap fix ─
+// A booking alone never moves a stop (FRAMEWORK.md; the #362 decision), so a
+// hotel recorded and not linked is on Reservations and nowhere else. The
+// organizer's stops list says so, per stop, and only the organizer's.
+describe('#419 unlinked hotel bookings in GET /api/stops', () => {
+  let server, alice, bob;
+  const agent = { apiKey: AGENT_KEY };
+  const colmar = async (who) => (await server.call('/api/stops', who)).body.stops.find(s => s.id === 'colmar');
+  const plant = (row) => {
+    const db = new Database(join(server.dataDir, 'trip.db'));
+    try {
+      const cols = Object.keys(row);
+      return Number(db.prepare(`INSERT INTO bookings (${cols.join(',')}) VALUES (${cols.map(() => '?').join(',')})`).run(...Object.values(row)).lastInsertRowid);
+    } finally { db.close(); }
+  };
+  const book = async (body) => (await server.call('/api/bookings', { method: 'POST', token: alice, body })).body.id;
+  let hotel;
+
+  before(async () => {
+    server = await boot(colmarConfig(), PORTS.tripStopsUnlinked);
+    alice = await server.login('alice');
+    bob = await server.login('bob');
+  });
+  after(async () => { await server?.stop(); });
+
+  test('an approved hotel booking under a stop it does not set is listed as unlinked, to the organizer only', async () => {
+    hotel = await book({ phase: 'colmar', type: 'hotel', name: 'Hotel Colmar Centre', date_from: '2026-12-02', date_to: '2026-12-07',
+      confirmation: 'HCC-778', pin: 'DOOR-PIN-5521', notes: 'private booking notes' });
+    // None of these is a linkable hotel: a draft, a car, an undated hotel, a hotel under no stop.
+    plant({ phase: 'colmar', type: 'hotel', name: 'Draft Hotel', date_from: '2026-12-02', date_to: '2026-12-07', created_by: 'alice', review_status: 'draft' });
+    await book({ phase: 'colmar', type: 'car', name: 'Rental', date_from: '2026-12-02', date_to: '2026-12-07' });
+    await book({ phase: 'colmar', type: 'hotel', name: 'Undated Hotel' });
+    await book({ phase: 'intl_flights', type: 'hotel', name: 'Airport Hotel', date_from: '2026-12-02', date_to: '2026-12-03' });
+
+    // The booking alone changed nothing: Colmar still has no hotel.
+    assert.equal((await server.call('/api/config', { token: bob })).body.phases.find(p => p.id === 'colmar').accommodation, undefined);
+
+    const organizer = await colmar({ token: alice });
+    assert.deepEqual(organizer.unlinked_hotel_bookings,
+      [{ id: hotel, name: 'Hotel Colmar Centre', date_from: '2026-12-02', date_to: '2026-12-07' }]);
+    const listed = (await server.call('/api/stops', agent)).body.stops;
+    assert.deepEqual(listed.find(s => s.id === 'colmar').unlinked_hotel_bookings.map(b => b.id), [hotel], 'the agent key sees it too');
+    for (const s of listed.filter(s => s.id !== 'colmar')) assert.deepEqual(s.unlinked_hotel_bookings, [], s.id);
+
+    // Never a PIN, notes or confirmation; and a member never reaches the route.
+    const text = JSON.stringify(organizer);
+    for (const secret of ['DOOR-PIN-5521', 'private booking notes', 'HCC-778']) assert.ok(!text.includes(secret), secret);
+    const member = await server.call('/api/stops', { token: bob });
+    assert.equal(member.status, 403);
+    assert.ok(!member.text.includes('Hotel Colmar Centre'));
+    assert.equal((await server.call('/api/stops')).status, 401);
+    // And the public config is untouched by the flag.
+    assert.ok(!JSON.stringify((await server.call('/api/config', { token: bob })).body).includes('unlinked'));
+  });
+
+  test('nothing links it without the tap; after from-booking the booking is no longer unlinked', async () => {
+    assert.equal((await colmar({ token: alice })).unlinked_hotel_bookings.length, 1, 'listing it did not link it');
+    const r = await server.call('/api/stops/colmar/from-booking', { method: 'POST', token: alice, body: { booking_id: hotel } });
+    assert.equal(r.status, 200, r.text);
+    assert.deepEqual((await colmar({ token: alice })).unlinked_hotel_bookings, []);
+    const cfg = (await server.call('/api/config', { token: bob })).body.phases.find(p => p.id === 'colmar');
+    assert.equal(cfg.accommodation.name, 'Hotel Colmar Centre');
+  });
+
+  test('a booking carrying the name the stop already shows is not nagged about', async () => {
+    await book({ phase: 'colmar', type: 'hotel', name: 'hotel colmar centre', date_from: '2026-12-02', date_to: '2026-12-07' });
+    assert.deepEqual((await colmar({ token: alice })).unlinked_hotel_bookings, []);
+  });
+});

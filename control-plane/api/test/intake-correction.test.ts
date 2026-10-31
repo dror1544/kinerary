@@ -427,4 +427,153 @@ describe("correctIntake", () => {
       await teardownFixture(fix);
     }
   });
+
+  // ── #387 AC-8: one lock order with the worker's _complete ────────────────────
+  // correctIntake used to lock trips first. With the trip in
+  // provisioning_approved (the worker's _claim does not move it), a correction
+  // landing while the worker commits a finished build held `trips` and waited
+  // for the plan row the worker held, while the worker waited for `trips`: a
+  // 40P01. The holder below mirrors provisioner.py's `_complete` statement for
+  // statement; if that order changes, this is the test to update.
+  async function leasedBuild(fix: CorrectionFixture): Promise<{ planId: string; jobId: string }> {
+    const plan = await generatePlan(fix.pool, fix.tripId, fix.correlationId);
+    assert.equal(plan.ok, true);
+    if (!plan.ok) throw new Error("unreachable");
+    assert.equal((await issueApproval(fix.pool, plan.planId, "user:test", 3600)).ok, true);
+    await fix.pool.query(
+      `UPDATE control_plane.jobs SET state = 'leased', lease_owner = 'w387',
+              lease_expires_at = now() + interval '5 minutes', attempt = attempt + 1 WHERE id = $1`,
+      [plan.jobId],
+    );
+    return { planId: plan.planId, jobId: plan.jobId };
+  }
+
+  test("AC-8: a correction racing the worker's _complete blocks, never deadlocks, and the job stays succeeded", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    const holder = await pool.connect();
+    try {
+      const { planId, jobId } = await leasedBuild(fix);
+      const before = await fix.pool.query<{ lifecycle_state: string }>(
+        "SELECT lifecycle_state FROM control_plane.trips WHERE id = $1", [fix.tripId]);
+      assert.equal(before.rows[0]?.lifecycle_state, "provisioning_approved");
+
+      // _complete: job first...
+      await holder.query("BEGIN");
+      const upd = await holder.query(
+        `UPDATE control_plane.jobs
+            SET state = 'succeeded', result = '{}'::jsonb, lease_owner = NULL, lease_expires_at = NULL, updated_at = now()
+          WHERE id = $1 AND lease_owner = 'w387' AND state = 'leased'`, [jobId]);
+      assert.equal(upd.rowCount, 1);
+
+      let settled = false;
+      const correction = correctIntake(pool, fix.tripId, "user:test", CORRECTED_ANSWERS).then(
+        (r) => { settled = true; return { r }; },
+        (e: unknown) => { settled = true; return { e }; },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      assert.equal(settled, false, "the correction must block on the job row _complete already holds, not deadlock");
+
+      // ...then approvals, plans, trips, and commit.
+      let workerError: unknown = null;
+      try {
+        await holder.query("UPDATE control_plane.plan_approvals SET used_at = now() WHERE plan_id = $1 AND used_at IS NULL", [planId]);
+        await holder.query("UPDATE control_plane.plans SET status = 'executed', updated_at = now() WHERE id = $1 AND status = 'approved'", [planId]);
+        await holder.query("UPDATE control_plane.trips SET lifecycle_state = 'ready_private', updated_at = now() WHERE id = $1", [fix.tripId]);
+        await holder.query("COMMIT");
+      } catch (e) {
+        workerError = e;
+        await holder.query("ROLLBACK").catch(() => undefined);
+      }
+      assert.equal(workerError, null, `the worker's success commit must not lose to a deadlock: ${String((workerError as { code?: string })?.code)}`);
+
+      const outcome = await correction;
+      assert.equal("e" in outcome, false, `the correction must not throw (40P01?): ${String((outcome as { e?: { code?: string } }).e?.code)}`);
+      const result = (outcome as { r: Awaited<ReturnType<typeof correctIntake>> }).r;
+      assert.equal(result.ok, true, JSON.stringify(result));
+
+      const job = await fix.pool.query<{ state: string }>("SELECT state FROM control_plane.jobs WHERE id = $1", [jobId]);
+      assert.equal(job.rows[0]?.state, "succeeded", "the finished build is never recorded as failed");
+      const trip = await fix.pool.query<{ lifecycle_state: string }>(
+        "SELECT lifecycle_state FROM control_plane.trips WHERE id = $1", [fix.tripId]);
+      assert.equal(trip.rows[0]?.lifecycle_state, "intake_confirmed", "the correction applied to the now-live trip, as it would a second later");
+    } finally {
+      holder.release();
+      await teardownFixture(fix);
+    }
+  });
+
+  test("AC-8 (concurrent form): a worker _complete and a correction run together surface no 40P01 on either side", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    const holder = await pool.connect();
+    try {
+      const { planId, jobId } = await leasedBuild(fix);
+      const worker = (async () => {
+        await holder.query("BEGIN");
+        try {
+          await holder.query(
+            `UPDATE control_plane.jobs SET state = 'succeeded', lease_owner = NULL, lease_expires_at = NULL, updated_at = now()
+              WHERE id = $1 AND lease_owner = 'w387' AND state = 'leased'`, [jobId]);
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          await holder.query("UPDATE control_plane.plan_approvals SET used_at = now() WHERE plan_id = $1 AND used_at IS NULL", [planId]);
+          await holder.query("UPDATE control_plane.plans SET status = 'executed', updated_at = now() WHERE id = $1 AND status = 'approved'", [planId]);
+          await holder.query("UPDATE control_plane.trips SET lifecycle_state = 'ready_private', updated_at = now() WHERE id = $1", [fix.tripId]);
+          await holder.query("COMMIT");
+        } catch (e) {
+          await holder.query("ROLLBACK").catch(() => undefined);
+          throw e;
+        }
+      })();
+      const correction = (async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return correctIntake(pool, fix.tripId, "user:test", CORRECTED_ANSWERS);
+      })();
+      const [w, c] = await Promise.allSettled([worker, correction]);
+      assert.equal(w.status, "fulfilled", w.status === "rejected" ? String((w.reason as { code?: string }).code ?? w.reason) : "");
+      assert.equal(c.status, "fulfilled", c.status === "rejected" ? String((c.reason as { code?: string }).code ?? c.reason) : "");
+      const job = await fix.pool.query<{ state: string }>("SELECT state FROM control_plane.jobs WHERE id = $1", [jobId]);
+      assert.equal(job.rows[0]?.state, "succeeded");
+    } finally {
+      holder.release();
+      await teardownFixture(fix);
+    }
+  });
+
+  test("AC-8: a job committed by a concurrent generatePlan while the correction waits for trips is locked on the second pass and cancelled with its plan", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    const holder = await pool.connect();
+    try {
+      await holder.query("BEGIN");
+      await holder.query("SELECT 1 FROM control_plane.trips WHERE id = $1 FOR UPDATE", [fix.tripId]);
+
+      let settled = false;
+      const correction = correctIntake(pool, fix.tripId, "user:test", CORRECTED_ANSWERS).then((r) => { settled = true; return r; });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      assert.equal(settled, false, "the correction must block on the trips lock the concurrent generatePlan holds");
+
+      const planId = generateTestId("plan");
+      const jobId = generateTestId("job");
+      await holder.query(
+        `INSERT INTO control_plane.plans(id, trip_id, release_id, kind, digest, status, desired)
+         VALUES ($1, $2, $3, 'provision', $4, 'pending_approval', '{}'::jsonb)`,
+        [planId, fix.tripId, fix.releaseId, `sha256:${randomHex(64)}`],
+      );
+      await holder.query(
+        `INSERT INTO control_plane.jobs(id, trip_id, plan_id, job_type, idempotency_key, correlation_id, state)
+         VALUES ($1, $2, $3, 'provision', $4, $5, 'waiting_for_user_action')`,
+        [jobId, fix.tripId, planId, `idem_${randomHex(16)}`, fix.correlationId],
+      );
+      await holder.query("UPDATE control_plane.trips SET lifecycle_state = 'planned' WHERE id = $1", [fix.tripId]);
+      await holder.query("COMMIT");
+
+      const result = await correction;
+      assert.equal(result.ok, true, JSON.stringify(result));
+      const job = await fix.pool.query<{ state: string }>("SELECT state FROM control_plane.jobs WHERE id = $1", [jobId]);
+      assert.equal(job.rows[0]?.state, "cancelled", "never an orphan job pointing at a superseded plan");
+      const plan = await fix.pool.query<{ status: string }>("SELECT status FROM control_plane.plans WHERE id = $1", [planId]);
+      assert.equal(plan.rows[0]?.status, "superseded");
+    } finally {
+      holder.release();
+      await teardownFixture(fix);
+    }
+  });
 });

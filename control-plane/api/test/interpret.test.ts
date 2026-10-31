@@ -19,6 +19,7 @@ import {
   buildBoundaryPrompt,
   parseBoundaryReading,
   readBoundaryReply,
+  looksLikePeopleWords,
   type ProposedAnswer,
 } from "../src/interpret.js";
 import { fakeRunner, firstJsonObject, isRateLimitText, worthRetrying } from "../src/model-runner.js";
@@ -1325,13 +1326,40 @@ describe("an answer below the confidence floor becomes a suggestion", () => {
     assert.deepEqual(data.map((d) => d.name), ["Rome", "Florence"]);
   });
 
-  test("when any part of a structured answer was accepted, the unsure part is not offered beside it", () => {
+  // #412. This used to assert `suggested` was EMPTY: an unsure slice was
+  // dropped whenever a sibling passed, so a second ticket's travellers vanished
+  // beside the first ticket's. The accepted slice still wins what it says; the
+  // unsure slice's NEW entries are offered on top of it, never alone.
+  test("an unsure slice beside a passing one keeps its new entries as suggestions", () => {
     const { accepted, suggested } = applyProposals([
       stop("Rome", "2027-05-01", "2027-05-04", 0.9, "Rome 1 May - 4 May 2027"),
       stop("Florence", "2027-05-04", "2027-05-07", low, "Florence 4 May - 7 May 2027"),
     ], STOPS);
     assert.equal(accepted.length, 1);
+    assert.deepEqual((accepted[0]!.answer as { data: { name: string }[] }).data.map((d) => d.name), ["Rome"], "only the sure slice is written");
+    assert.equal(suggested.length, 1);
+    const offered = suggested[0]?.answer.kind === "structured" ? (suggested[0].answer.data as { name: string }[]) : [];
+    assert.deepEqual(offered.map((d) => d.name), ["Rome", "Florence"], "the offer is the union, so a Yes cannot drop the accepted stop");
+  });
+
+  test("an unsure slice that only repeats the passing one is not offered", () => {
+    const { accepted, suggested } = applyProposals([
+      stop("Rome", "2027-05-01", "2027-05-04", 0.9, "Rome 1 May - 4 May 2027"),
+      stop("Rome", "2027-05-01", "2027-05-04", low, "Rome 1 May - 4 May 2027"),
+    ], STOPS);
+    assert.equal(accepted.length, 1);
     assert.deepEqual(suggested, []);
+  });
+
+  test("an unsure slice beside a passing one that adds nothing to what is held is still offered", () => {
+    const held = { phases: { kind: "structured", schema_version: 3, data: [{ name: "Rome", start: "2027-05-01", end: "2027-05-04" }] } };
+    const { accepted, suggested } = applyProposals([
+      stop("Rome", "2027-05-01", "2027-05-04", 0.9, "Rome 1 May - 4 May 2027"),
+      stop("Florence", "2027-05-04", "2027-05-07", low, "Florence 4 May - 7 May 2027"),
+    ], { ...STOPS, outstanding: [], answered: ["phases"], held });
+    assert.deepEqual(accepted, [], "the sure slice restates what is held");
+    const offered = suggested[0]?.answer.kind === "structured" ? (suggested[0].answer.data as { name: string }[]) : [];
+    assert.deepEqual(offered.map((d) => d.name), ["Rome", "Florence"]);
   });
 });
 
@@ -1600,5 +1628,116 @@ describe("operations from the interpreter (#206)", () => {
     const v = validateAnswer("phases", null, null, STOPS_Q, [{ name: "Tokyo", additional_visit: true }]);
     assert.ok(v.ok);
     assert.doesNotMatch(JSON.stringify(v), /additional_visit/);
+  });
+});
+
+// ── #413: the message right after a document recap ───────────────────────────
+//
+// Owner's gate-3 run, 2026-10-18: two tickets uploaded, the second couple's
+// names not read, and "נוסעים אחרים" ("other travellers") — typed to explain
+// that — was filed as the ASSISTANT'S NAME, because the question on screen
+// after the recap was `bot_name` and the on-screen question is exempt from the
+// confidence floor.
+describe("the message after a document recap (#413)", () => {
+  const held = {
+    stops: [{ id: "s1", label: "Colmar, 2026-12-01 to 2026-12-05" }],
+    travellers: [{ id: "p1", label: "Dana Cohen" }],
+  };
+  const answeredAll = ["travelers", "phases", "travel_anchors", "trip_interests", "trip_type"];
+  const base = {
+    sourceText: "other travellers",
+    outstanding: ["bot_name", "bot_gender"],
+    answered: answeredAll,
+    language: "en",
+    onScreen: "bot_name",
+    heldLists: held,
+    correctable: [{ id: "travel_anchors", current: "XY1 A → B" }],
+  };
+
+  test("the recap's questions are addressable on the turn after it", () => {
+    const prompt = buildInterpretPrompt({ ...base, afterDocumentRecap: true });
+    assert.match(prompt, /JUST BEEN SHOWN WHAT THEIR DOCUMENT GAVE/);
+    assert.match(prompt, /Addressable now[^\n]*travelers[^\n]*phases[^\n]*travel_anchors/, "names the three ids");
+    assert.match(prompt, /is NOT a reply to the question on screen/, "and says such a message is not the on-screen answer");
+    assert.match(prompt, /put "travelers" in "unclear"/, "travellers with no names are unclear, not a bot_name");
+    // The widening is the summary mechanism's, scoped: the answered bookings
+    // question is described in full, and the held lists change through operations.
+    assert.match(prompt, /Questions \(answered already or not\):/);
+    assert.match(prompt, /- id: travel_anchors {2}\(structured\)\n {2}asks: /);
+    assert.doesNotMatch(prompt, /- id: travelers {2}\(/, "held travellers are still changed by operations");
+    assert.doesNotMatch(prompt, /- id: phases {2}\(/);
+    assert.match(prompt, /add_traveller/, "so an addition has somewhere to go");
+    // Scoped: the other answered questions are not opened up the way the summary opens them.
+    assert.doesNotMatch(prompt, /- id: trip_interests {2}\(/);
+    assert.doesNotMatch(prompt, /- id: trip_type {2}\(/);
+    assert.doesNotMatch(prompt, /THE SUMMARY IS ON THEIR SCREEN/);
+    // The on-screen question is still named, so a plain answer to it still lands.
+    assert.match(prompt, /\(id: bot_name\)/);
+  });
+
+  test("without the recap the prompt is what it was", () => {
+    const prompt = buildInterpretPrompt(base);
+    assert.doesNotMatch(prompt, /JUST BEEN SHOWN/);
+    assert.doesNotMatch(prompt, /Addressable now/);
+    assert.match(prompt, /this message is their reply to it/);
+    assert.match(prompt, /Questions still outstanding:/);
+  });
+
+  test("a recap turn with nothing held lists the answered recap questions in full", () => {
+    const prompt = buildInterpretPrompt({
+      ...base, afterDocumentRecap: true, heldLists: { stops: [], travellers: [] }, answered: ["travel_anchors", "phases"],
+    });
+    assert.match(prompt, /- id: phases {2}\(/);
+    assert.match(prompt, /- id: travel_anchors {2}\(/);
+  });
+});
+
+describe("people words are not exempt from the floor as a bot_name (#413)", () => {
+  const ctx = (text: string) => ({
+    sourceText: text,
+    outstanding: ["bot_name"],
+    answered: [] as string[],
+    pendingQuestionId: "bot_name",
+  });
+  const asBotName = (text: string, confidence: number) => [{
+    questionId: "bot_name", confidence, value: { kind: "text", text }, evidence: text,
+  }] as never;
+
+  for (const text of ["נוסעים אחרים", "other travellers", "the kids", "משפחה", "Passengers", "הילדים", "my family"]) {
+    test(`"${text}" below the floor is a suggestion to confirm, not a saved name`, () => {
+      const decided = applyProposals(asBotName(text, 0.4), ctx(text));
+      assert.equal(decided.accepted.length, 0);
+      assert.equal(decided.rejected[0]?.reason, "LOW_CONFIDENCE");
+      assert.equal(decided.suggested.length, 1, "kept to be confirmed");
+      assert.equal(decided.suggested[0]?.questionId, "bot_name");
+    });
+  }
+
+  test("a plain name below the floor is still taken as the answer (the 2026-09-12 loop fix)", () => {
+    const decided = applyProposals(asBotName("Mira", 0.4), ctx("Mira"));
+    assert.equal(decided.accepted.length, 1);
+    assert.equal(decided.accepted[0]?.questionId, "bot_name");
+  });
+
+  test("a confident read of a people word is not blocked — it is the floor that is no longer waived", () => {
+    const decided = applyProposals(asBotName("Family", 0.9), ctx("Family"));
+    assert.equal(decided.accepted.length, 1);
+  });
+
+  test("the exemption is narrowed for bot_name only", () => {
+    const decided = applyProposals(
+      [{ questionId: "organizer_identity", confidence: 0.4, value: { kind: "text", text: "family" }, evidence: "family" }] as never,
+      { sourceText: "family", outstanding: ["organizer_identity"], answered: [], pendingQuestionId: "organizer_identity" },
+    );
+    assert.equal(decided.accepted.length, 1);
+  });
+
+  test("looksLikePeopleWords: the closed list, and nothing that merely contains one", () => {
+    for (const yes of ["travellers", "Travelers", "other passengers", "kids", "the others", "נוסעים", "מטיילים", "ילדים", "אחרים", "נוסעים אחרים", "משפחה"]) {
+      assert.equal(looksLikePeopleWords(yes), true, yes);
+    }
+    for (const no of ["Mira", "Family Guy", "Botsan", "Noa and Ella", "", "   ", "Kids Club Tokyo", "בוטסאן"]) {
+      assert.equal(looksLikePeopleWords(no), false, no);
+    }
   });
 });

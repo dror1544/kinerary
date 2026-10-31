@@ -6,6 +6,7 @@ import { Link, Navigate, useLocation, useNavigate, useNavigationType, useParams 
 import { z } from "zod";
 import { api, getMe, getTrip, getTrips, passwordSignIn, getAuthCapabilities, emailPasswordSignIn, safeReturnTo, type TripSummary, type InterviewLinkState, ApiError } from "../api";
 import { Brand } from "../components/Brand";
+import { NamePrompt } from "../components/NamePrompt";
 import { GoogleSignInButton } from "../components/GoogleSignInButton";
 import { tripUsernameInputProps, tripUsernameRegisterOptions } from "../mini-app/username";
 import { isEmbedded } from "../mini-app/sdk";
@@ -101,7 +102,8 @@ function DashboardHeader({ name }: { name: string }) {
 
 function Trips() {
   const trips = useQuery({ queryKey: ["trips"], queryFn: getTrips });
-  const scoped = useQuery({ queryKey: ["me"], queryFn: getMe, retry: false }).data?.scope === "telegram";
+  const me = useQuery({ queryKey: ["me"], queryFn: getMe, retry: false }).data;
+  const scoped = me?.scope === "telegram";
   const sections = useMemo(() => {
     const grouped: Record<string, TripSummary[]> = { Setup: [], Provisioning: [], Ready: [], Completed: [] };
     for (const trip of trips.data?.trips || []) {
@@ -112,7 +114,7 @@ function Trips() {
     }
     return grouped;
   }, [trips.data]);
-  return <main className="dashboard-main"><div className="page-title"><div><p className="eyebrow">Personal space</p><h1>My trips</h1></div>{!scoped && <Link className="button" to="/trips/new">Plan a new trip</Link>}</div>{trips.isError && <Notice>We could not load your trips. Please retry.</Notice>}{trips.isPending && <p>Loading trips…</p>}{Object.entries(sections).map(([name, items]) => items.length > 0 && <section className="trip-section" key={name}><h2>{name}</h2><div className="trip-grid">{items.map((trip) => <TripCard key={trip.id} trip={trip} />)}</div></section>)}{trips.data?.trips.length === 0 && <div className="empty-state"><h2>{scoped ? "No trips yet." : "Your first trip starts here."}</h2>{scoped ? <p>No trip is linked to this Telegram account yet. Ask the organizer, or sign in with your password.</p> : <><p>Add the broad outline. The private Telegram interview will help fill in the rest.</p><Link className="button" to="/trips/new">Create a trip</Link></>}</div>}</main>;
+  return <main className="dashboard-main"><div className="page-title"><div><p className="eyebrow">Personal space</p><h1>My trips</h1></div>{!scoped && <Link className="button" to="/trips/new">Plan a new trip</Link>}</div>{me?.needsName && !scoped && <NamePrompt />}{trips.isError && <Notice>We could not load your trips. Please retry.</Notice>}{trips.isPending && <p>Loading trips…</p>}{Object.entries(sections).map(([name, items]) => items.length > 0 && <section className="trip-section" key={name}><h2>{name}</h2><div className="trip-grid">{items.map((trip) => <TripCard key={trip.id} trip={trip} />)}</div></section>)}{trips.data?.trips.length === 0 && <div className="empty-state"><h2>{scoped ? "No trips yet." : "Your first trip starts here."}</h2>{scoped ? <p>No trip is linked to this Telegram account yet. Ask the organizer, or sign in with your password.</p> : <><p>Add the broad outline. The private Telegram interview will help fill in the rest.</p><Link className="button" to="/trips/new">Create a trip</Link></>}</div>}</main>;
 }
 
 function TripCard({ trip }: { trip: TripSummary }) {

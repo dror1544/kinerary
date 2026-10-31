@@ -293,6 +293,22 @@ class RestoreAgainstPostgres(unittest.TestCase):
         self.assertNotIn(("retired-x-20260101", "retired2026"), result)
 
 
+    def test_retired_profiles_are_those_recorded_on_retired_trips_only(self):
+        # #420: a running gateway slot whose profile belongs to a torn-down trip is reported,
+        # not restarted. A profile any live trip also uses is never "retired".
+        self.sql("kinerary_control_plane", """
+            INSERT INTO control_plane.trips(id, slug, lifecycle_state, reachability) VALUES
+              ('trip_eeeeeee1', 'retired-x-20260101', 'ready_private', 'reachable'),
+              ('trip_eeeeeee2', 'live-one', 'ready_private', 'reachable'),
+              ('trip_eeeeeee3', 'retired-y-20260102', 'ready_private', 'reachable');
+            INSERT INTO control_plane.telegram_chat_bindings(id, trip_id, chat_id, hermes_profile) VALUES
+              ('tcb_r1', 'trip_eeeeeee1', '3001', 'gone-x'),
+              ('tcb_l1', 'trip_eeeeeee2', '3002', 'live2026'),
+              ('tcb_r2', 'trip_eeeeeee3', '3003', 'shared2026'),
+              ('tcb_l2', 'trip_eeeeeee2', '3004', 'shared2026');
+        """)
+        self.assertEqual(self.cp.retired_profiles(), {"gone-x"})
+
     # ---------------------------------------------------- issue #349 ---------
     GATEWAYS = ("CREATE TABLE control_plane.companion_gateways "
                 "(hermes_profile text PRIMARY KEY, desired text NOT NULL CHECK (desired IN ('running','stopped')), "
