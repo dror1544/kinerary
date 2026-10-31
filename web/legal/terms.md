@@ -84,8 +84,10 @@ opening hours, prices, travel rules, visa or health advice can be out of date or
 - You also give us permission to make de-identified route summaries from your trip and offer them to other
   users, as the Privacy Policy describes (section 7), unless the organizer has turned this off. A summary never
   identifies you or your family.
-- We do not show your photos outside your trip. If you choose to share a photo with other users, you give us a
-  free, non-exclusive permission to show it in Kinerary, with credit if you ask, until you withdraw it.
+- We do not show your photos outside your trip. If you choose to share a photo of a place or a view with other
+  users, you give us a free, non-exclusive permission to show it in Kinerary, with credit if you ask, until you
+  withdraw it. Photos of people are never shown outside the trip; we leave out any photo in which we detect a
+  person, and remove its location and camera details first.
 - Photos and comments on a trip site are visible to the trip's signed-in travellers. An album share link works
   for anyone who has it, and can show when and where its photos were taken.
 

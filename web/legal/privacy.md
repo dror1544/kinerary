@@ -64,7 +64,7 @@ We do not sell personal data. We do not use it for advertising.
 
 - **Contract**: to provide the service you asked for (account, trip site, companion).
 - **Legitimate interests**: security, preventing abuse, fixing faults and improving the product, including
-  reading trip data and making de-identified route summaries, as section 7 describes (you can turn both
+  reading trip data and making de-identified route and place summaries, as section 7 describes (you can turn both
   off). We weigh these against your rights.
 - **Consent**: where we ask for it, for example health-related needs, which the organizer provides on a
   traveller's behalf. You can withdraw consent at any time.
@@ -102,9 +102,20 @@ month at most), and nothing else that identifies you or your family. We leave ou
 to stay anonymous. This will be on by default; an organizer can turn it off by writing to
 privacy@ara-united.store, and a switch will come with the feature.
 
-**Your photos stay with your trip.** We do not show your photos to anyone outside your trip. If we later invite
-travellers to share a photo (for example of a place) as an example for other users, it will be a separate
-choice, made photo by photo or trip by trip, and off unless you choose it.
+**Learning about places from photos.** We may use the place and time stored in trip photos, and what a photo
+of a place or view shows, to learn about places (for example what a viewpoint looks like in April) and to
+improve suggestions. What we keep from this never identifies you or your family. It is covered by the same
+switch as route summaries.
+
+**Your photos stay with your trip.** We do not show your photos to anyone outside your trip. If we later let
+travellers share a photo of a place or a view with other users, it will be their choice, made photo by photo or
+trip by trip, and off unless they choose it. Even then:
+
+- photos of people are never shown outside the trip. We do not intend to use photos of children, and before any
+  shared photo is shown we check it automatically and leave it out if we detect a person or a face;
+- we remove the location, time and camera details from the copy we show;
+- if a photo with a person in it is ever shown by mistake, tell us at privacy@ara-united.store and we remove it
+  straight away.
 
 ## 8. Retention, trip end and archives
 
