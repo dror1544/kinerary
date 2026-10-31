@@ -1,6 +1,6 @@
 # Kinerary Terms of Service
 
-*Early-access version, 30 October 2026. These terms are under legal review and may be updated; we will tell
+*Version of 31 October 2026. These terms are under legal review and may be updated; we will tell
 organizers before a material change. A Hebrew version will follow.*
 
 **Operator:** Dror Elul, a sole trader in Israel ("we", "us"). **Contact:** privacy@ara-united.store.

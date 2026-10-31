@@ -1,6 +1,6 @@
 # Kinerary Privacy Policy
 
-*Early-access version, 30 October 2026. This policy is under legal review and may be updated; we will tell
+*Version of 31 October 2026. This policy is under legal review and may be updated; we will tell
 organizers before a material change. A Hebrew version will follow.*
 
 **Who we are:** Kinerary is run by Dror Elul, a sole trader in Israel ("we", "us"). We are the controller of the
