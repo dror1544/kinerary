@@ -64,6 +64,8 @@ import {
   Booking,
   BudgetItem,
   CurrentUser,
+  answerBookingSeed,
+  answerItemSeed,
   approveBookingDraft,
   createBooking,
   createBudgetItem,
@@ -1097,6 +1099,7 @@ export function JourneyView({
           {dayItems.length ? dayItems.map((item) => (
             <div className="timeline-item-wrap" id={`itinerary-item-${encodeURIComponent(item.item_uid)}`} key={item.item_uid}>
               <TimelineItem item={item} {...activityLinks.get(item.item_uid)} username={username} lang={lang} botName={botName} telegramUsername={telegramUsername} />
+              {isOrganizer ? <SeedFlagNotice kind="item" id={item.item_uid} changed={item.seed_changed} removed={item.seed_removed} lang={lang} /> : null}
               {isOrganizer ? <div className="timeline-editor-actions">
                 <button type="button" onClick={() => beginEdit(item)}><Pencil size={15} /> {copy(lang, "Edit", "עריכה")}</button>
                 <button className="danger-text" type="button" disabled={removeMutation.isPending} onClick={() => { if (window.confirm(copy(lang, "Remove this itinerary item?", "להסיר את הפריט הזה מהמסלול?"))) removeMutation.mutate(item.item_uid); }}><Trash2 size={15} /> {copy(lang, "Remove", "הסרה")}</button>
@@ -1250,6 +1253,48 @@ function AuthenticatedDocumentAction({ url, filename, download, label }: { url: 
     }
   };
   return <span className="document-action"><button type="button" onClick={open}>{label}</button>{error ? <small className="form-error">{error}</small> : null}</span>;
+}
+
+const SEED_FIELD_LABELS: Record<string, [string, string]> = {
+  phase: ["Stop", "תחנה"], type: ["Type", "סוג"], name: ["Name", "שם"], date_from: ["Start date", "תאריך התחלה"], date_to: ["End date", "תאריך סיום"],
+  passengers: ["Passengers", "נוסעים"], confirmation: ["Confirmation", "אישור"], pin: ["PIN", "קוד"], notes: ["Notes", "הערות"], cost: ["Cost", "עלות"],
+  conf_file: ["Confirmation file", "קובץ אישור"], location_url: ["Map link", "קישור מפה"], date: ["Date", "תאריך"], time: ["Time", "שעה"],
+  text_he: ["Text (Hebrew)", "טקסט (עברית)"], text_en: ["Text (English)", "טקסט (אנגלית)"], waze_url: ["Waze link", "קישור Waze"],
+  ticket_url: ["Ticket link", "קישור כרטיסים"], extra_links: ["Links", "קישורים"],
+};
+
+/**
+ * "The trip file changed this — keep mine / use the new one" (#382). A re-provision rewrote the trip file under
+ * something an organizer had edited on the site: the edit stands, and this asks which one wins. Organizer-only by
+ * the caller and by the server (a member never receives the flag). Pin and notes are named, never shown.
+ */
+export function SeedFlagNotice({ kind, id, changed, removed, lang }: { kind: "booking" | "item"; id: number | string; changed?: Record<string, unknown>; removed?: boolean; lang: Lang }) {
+  const queryClient = useQueryClient();
+  const mutation = useMutation({
+    mutationFn: (answer: "accept" | "keep") => kind === "booking" ? answerBookingSeed(Number(id), answer) : answerItemSeed(String(id), answer),
+    onSuccess: () => Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["bookings"] }),
+      queryClient.invalidateQueries({ queryKey: ["itinerary"] }),
+      queryClient.invalidateQueries({ queryKey: ["today"] }),
+    ]),
+  });
+  const entries = Object.entries(changed || {});
+  if (!entries.length && !removed) return null;
+  const noun = kind === "booking" ? copy(lang, "booking", "ההזמנה") : copy(lang, "item", "הפריט");
+  const label = (field: string) => { const l = SEED_FIELD_LABELS[field]; return l ? copy(lang, l[0], l[1]) : field; };
+  return (
+    <div className="seed-flag" role="status">
+      <p>{removed
+        ? copy(lang, `The trip file no longer lists this ${noun}.`, `קובץ הטיול כבר לא כולל את ${noun}.`)
+        : copy(lang, `The trip file changed this ${noun}.`, `קובץ הטיול שינה את ${noun}.`)}</p>
+      {entries.length ? <ul>{entries.map(([field, value]) => <li key={field}>{label(field)}: {typeof value === "string" || typeof value === "number" ? String(value) : copy(lang, "(changed)", "(שונה)")}</li>)}</ul> : null}
+      <div className="seed-flag-actions">
+        <button type="button" className="secondary-action" disabled={mutation.isPending} onClick={() => mutation.mutate("keep")}>{copy(lang, "Keep mine", "להשאיר את שלי")}</button>
+        {kind === "item" && removed ? null : <button type="button" className="secondary-action" disabled={mutation.isPending} onClick={() => mutation.mutate("accept")}>{removed ? copy(lang, "Use the new one (remove it)", "להשתמש בחדש (להסיר)") : copy(lang, "Use the new one", "להשתמש בחדש")}</button>}
+      </div>
+      {mutation.isError ? <p className="form-error">{copy(lang, "Could not save your choice. Try again.", "לא ניתן לשמור את הבחירה. נסו שוב.")}</p> : null}
+    </div>
+  );
 }
 
 function BookingActions({ booking, lang }: { booking: Booking; lang: Lang }) {
@@ -1553,6 +1598,7 @@ function BookingsView({ config, isOrganizer, lang }: { config?: TripConfig; isOr
                   <p>{bookingDateLine(booking, lang)}</p>
                   {booking.passengers ? <small>{booking.passengers}</small> : null}
                   <BookingActions booking={booking} lang={lang} />
+                  {isOrganizer ? <SeedFlagNotice kind="booking" id={booking.id} changed={booking.seed_changed} removed={booking.seed_removed} lang={lang} /> : null}
                   {isOrganizer && booking.review_status === "draft" ? <button className="secondary-action" type="button" disabled={approveMutation.isPending} onClick={() => approveMutation.mutate(booking.id)}>{approveMutation.isPending ? "Approving..." : "Approve for members"}</button> : null}
                   {isOrganizer ? <button className="secondary-action" type="button" onClick={() => setEditingBookingId((current) => current === booking.id ? null : booking.id)}><Pencil size={15} /> {lang === "he" ? "עריכה" : "Edit"}</button> : null}
                   {isOrganizer && editingBookingId === booking.id ? <BookingEditPanel booking={booking} config={config} lang={lang} onClose={() => setEditingBookingId(null)} /> : null}
