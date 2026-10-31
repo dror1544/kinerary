@@ -63,9 +63,9 @@ We do not sell personal data. We do not use it for advertising.
 ## 5. Legal bases
 
 - **Contract**: to provide the service you asked for (account, trip site, companion).
-- **Legitimate interests**: security, preventing abuse, fixing faults and improving the product, including,
-  during early access, reading trip data, and making de-identified route summaries, as section 7 describes
-  (you can turn both off). We weigh these against your rights.
+- **Legitimate interests**: security, preventing abuse, fixing faults and improving the product, including
+  reading trip data and making de-identified route summaries, as section 7 describes (you can turn both
+  off). We weigh these against your rights.
 - **Consent**: where we ask for it, for example health-related needs, which the organizer provides on a
   traveller's behalf. You can withdraw consent at any time.
 - **Legal obligation**: where the law requires us to keep or disclose data.
@@ -86,15 +86,14 @@ gives you the rights in section 10.
 
 ## 7. Reading trip data to improve Kinerary, and routes for others
 
-While Kinerary is in early access, we read trip data and conversations to evaluate and improve the product.
+The Kinerary team may read trip data and conversations to evaluate and improve the product.
 We read it; we do not change it except at the organizer's request.
 
-This is on by default during early access. An organizer can turn it off at any time by writing to
-privacy@ara-united.store; a notice on the sign-up screen and a switch in Settings are coming. Once it is
+This is on by default. An organizer can turn it off at any time in
+Personal settings, or by writing to privacy@ara-united.store until that setting is available. Once it is
 off, we look at that organizer's trips only to provide the service, keep it secure, fix a fault, or when the
 law requires it.
 
-When early access ends, we will ask organizers again before continuing.
 
 **Routes for other travellers (planned).** We plan to turn a trip's route (the places visited, their order, and
 how long was spent in each) into a de-identified summary, and to offer it as a suggestion to other people

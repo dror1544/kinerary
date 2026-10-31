@@ -77,8 +77,8 @@ opening hours, prices, travel rules, visa or health advice can be out of date or
 
 - You keep ownership of what you and your travellers add: answers, documents, photos, comments.
 - You give us permission to store, process and show that content only to run Kinerary for your trip, as the
-  Privacy Policy describes (including processing by our AI providers), and, during early access and unless the
-  organizer has turned it off, to evaluate and improve the product.
+  Privacy Policy describes (including processing by our AI providers), and, unless the organizer has turned it
+  off in Personal settings, to evaluate and improve the product.
 - That includes using a trip's photos, and the time and place stored in them, to make content for that same
   trip, such as albums, recaps, a journal or a route map.
 - You also give us permission to make de-identified route summaries from your trip and offer them to other
