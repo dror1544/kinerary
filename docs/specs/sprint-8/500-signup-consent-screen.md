@@ -10,7 +10,7 @@ interview asks **one** question:
 | | Where | Default | Legal basis (owner) | Issue |
 |---|---|---|---|---|
 | "I agree to the Terms and the Privacy Policy" | sign-up screen | unticked, **required** | contract | #499 |
-| "Let the Kinerary team read my trips to improve the product" | sign-up screen, later personal settings | **ticked** during early access, can be unticked | legitimate interests, with notice and an opt-out (not consent) | #501 |
+| "Let the Kinerary team read my trips to improve the product" | sign-up screen, later personal settings | **ticked**, can be unticked (may later depend on the plan) | legitimate interests, with notice and an opt-out (not consent) | #501 |
 | Health needs and children's details | the interview, once, when relevant; or ahead of time in personal settings | none: asked | consent | #500 |
 
 ## Problem
@@ -87,7 +87,7 @@ invited organizer who later signs in. On the next full sign-in to the dashboard,
 before the trip list, they see the same two boxes as a blocking panel.
 
 - Box 2 is ticked, and for an alpha family it also says "You agreed to this
-  during early access. You can turn it off."
+  when you signed up. You can turn it off."
 - The dashboard opens once box 1 is ticked.
 - This happens once per policy version (see Contracts: versions).
 
@@ -201,7 +201,7 @@ database, or a web component test. No live run is needed.
   are two `account_privacy_choices` rows:
   - `terms_privacy`, `true`, with the current policy version and channel
     `portal_email`;
-  - `evaluation_reading`, `false`, with the current early-access period.
+  - `evaluation_reading`, `false`, with the current notice version.
 
   A forced failure after `consumeSignUpToken` leaves neither the account nor the
   rows.
@@ -296,7 +296,7 @@ CREATE TABLE control_plane.account_privacy_choices (
   user_id                  text NOT NULL REFERENCES control_plane.users(id),
   choice                   text NOT NULL CHECK (choice IN ('terms_privacy', 'evaluation_reading', 'sensitive_details')),
   value                    boolean NOT NULL,
-  -- terms_privacy: the legal pages' version (YYYY-MM-DD). evaluation_reading: the notice period ('early-access').
+  -- terms_privacy: the legal pages' version (YYYY-MM-DD). evaluation_reading: the notice version ('v1').
   -- sensitive_details: the legal pages' version in force when it was given.
   policy_version           text NOT NULL CHECK (char_length(policy_version) BETWEEN 1 AND 40),
   basis                    text NOT NULL CHECK (basis IN ('contract', 'legitimate_interest', 'consent')),
@@ -326,15 +326,16 @@ CREATE INDEX account_privacy_choices_latest ON control_plane.account_privacy_cho
     The live wording is being updated by another session's text-only PR to
     `main`. This item references the version that PR's files carry, and does
     not edit `web/legal/`. AC-17 keeps the two in step.
-  - `EVALUATION_NOTICE_PERIOD = "early-access"`.
+  - `EVALUATION_NOTICE_PERIOD = "v1"` (a notice version, not a product phase).
 - `needsPrivacyChoices` is true when either of these holds:
   - there is no `terms_privacy` row at a version `>= TERMS_REASK_FROM`;
   - there is no `evaluation_reading` row for the current period.
 - `TERMS_REASK_FROM` is a separate constant. It is raised only for a material
   change, so that an editorial update does not re-ask everyone. See open
   question 2.
-- When early access ends, `EVALUATION_NOTICE_PERIOD` changes and everyone is
-  asked again (owner, #501).
+- When the evaluation-reading terms change (for example a plan where reading is
+  part of the free tier and the opt-out is a premium feature),
+  `EVALUATION_NOTICE_PERIOD` changes and everyone sees the new notice (owner, #501).
 
 ### API
 
@@ -439,9 +440,9 @@ The routes are all in `portal.ts` and classified in `portal-scope.ts`.
 
 ### Operator seed
 
-`scripts/seed-early-access-evaluation.py --user <user_id>… [--execute]`. It
+`scripts/seed-evaluation-notice.py --user <user_id>… [--execute]`. It
 inserts `evaluation_reading = true` with basis `legitimate_interest`, channel
-`operator_seed` and period `early-access`, for the alpha families' accounts. It
+`operator_seed` and version `v1`, for the alpha families' accounts. It
 prints a plan first and takes ids as arguments: no name or id lives in the
 repo (rule 6).
 
@@ -450,7 +451,7 @@ repo (rule 6).
 | Key | English | עברית |
 |---|---|---|
 | box 1 | I agree to the [Terms] and the [Privacy Policy]. | אני מסכים/ה ל[תנאי השימוש] ול[מדיניות הפרטיות]. |
-| box 2 | Let the Kinerary team read my trips to improve the product. On during early access; you can turn it off now or later in Personal settings. | צוות Kinerary רשאי לקרוא את הטיולים שלי כדי לשפר את המוצר. פעיל בתקופת הגישה המוקדמת; אפשר לכבות עכשיו או בהמשך בהגדרות האישיות. |
+| box 2 | Let the Kinerary team read my trips to improve the product. On by default; you can turn it off now or later in Personal settings. | צוות Kinerary רשאי לקרוא את הטיולים שלי כדי לשפר את המוצר. פעיל כברירת מחדל; אפשר לכבות עכשיו או בהמשך בהגדרות האישיות. |
 | settings switch | I may add travellers' health needs and children's details, and I have the right to share them. | אני רשאי/ת להוסיף צרכים בריאותיים של מטיילים ופרטים של ילדים, ויש לי הזכות לשתף אותם. |
 | interview ask | You mentioned {detail}. May I keep health needs and children's details for this trip? Saying yes confirms you are the parent or guardian, or have their permission. If not, I'll plan without them. | ציינת {detail}. האם לשמור צרכים בריאותיים ופרטי ילדים בטיול הזה? אישור פירושו שאת/ה ההורה או האפוטרופוס, או שיש לך את רשותם. אם לא — אתכנן בלעדיהם. |
 | buttons | Yes, keep them · No, leave them out | כן, לשמור · לא, בלי זה |
@@ -580,12 +581,18 @@ because the migration is additive.
 - **UX guardrail (Dror, 2026-10-30, supersedes the two boxes above): no checkboxes on sign-up.**
   Too many boxes cost sign-ups, and an explicit "are you 18 or older" question makes the site look
   suspicious. The sign-up screen carries one quiet line under the button: "By creating an account you
-  agree to the Terms and Privacy Policy. We may read trips to improve Kinerary during early access —
+  agree to the Terms and Privacy Policy. We may read trips to improve Kinerary —
   you can turn this off in Settings." (he/en). Creating the account records, with the policy version:
   terms accepted, evaluation reading on (legitimate interests, notice + opt-out). The age condition
   lives in the Terms text, never as a question. The opt-out lives only in Personal settings. Existing
   accounts see the same one-line notice once (dismissable), not a panel of boxes. Any future consent
   addition must keep the sign-up screen box-free unless Dror decides otherwise.
+- **No "early access" in the notice (Dror, 2026-10-31).** Evaluation reading is not tied to a product
+  phase: it may come to depend on the business model (for example, read on the free plan, opt-out on
+  premium). So no user-facing text names a period, and the stored notice is versioned
+  (`EVALUATION_NOTICE_PERIOD = "v1"`), so a later change of terms is a new notice version, not an
+  edit of history. Today everyone can opt out; whether the opt-out stays universal is a business-model
+  decision outside this item.
 - **Health scope: medical only.** Allergies and intolerances (nut, gluten, lactose), mobility, and a
   child's age are asked once in the interview and not stored on a no. Kosher, kosher-style,
   vegetarian and vegan stay ordinary preferences; raised with the legal review.
