@@ -79,8 +79,15 @@ opening hours, prices, travel rules, visa or health advice can be out of date or
 - You give us permission to store, process and show that content only to run Kinerary for your trip, as the
   Privacy Policy describes (including processing by our AI providers), and, during early access and unless the
   organizer has turned it off, to evaluate and improve the product.
-- Photos and comments on a trip site are visible to the trip's signed-in travellers. A photo share link works
-  for anyone who has it.
+- That includes using a trip's photos, and the time and place stored in them, to make content for that same
+  trip, such as albums, recaps, a journal or a route map.
+- You also give us permission to make de-identified route summaries from your trip and offer them to other
+  users, as the Privacy Policy describes (section 7), unless the organizer has turned this off. A summary never
+  identifies you or your family.
+- We do not show your photos outside your trip. If you choose to share a photo with other users, you give us a
+  free, non-exclusive permission to show it in Kinerary, with credit if you ask, until you withdraw it.
+- Photos and comments on a trip site are visible to the trip's signed-in travellers. An album share link works
+  for anyone who has it, and can show when and where its photos were taken.
 
 ## 9. Third-party services
 
