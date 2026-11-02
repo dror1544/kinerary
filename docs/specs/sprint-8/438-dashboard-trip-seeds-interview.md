@@ -226,6 +226,28 @@ Added acceptance criteria:
   stored name is the Google account's name; an existing account with no name is
   asked once on its next dashboard visit.
 
+## Decision (Dror, 2026-11-02): the stops question starts from what is known
+
+Found on Mac staging: a seeded session skipped the destination and the dates,
+then asked `phases` as "Where are you going, and when? The stops in order…",
+which reads as asking everything again. AC-3 never covered `phases`.
+
+- **AC-12** Given a session with `destination`, `departure_date` and
+  `return_date` on record (seeded or typed) and no answer, no document
+  suggestion and no earlier "no" for `phases`, when the router reaches
+  `phases`, then it asks a Yes/No confirm naming the place and both dates in
+  words — "You're going to Gatecity, 14 November – 21 November. Is that the
+  only stop?" / "אתם נוסעים לGatecity, 14 בנובמבר – 21 בנובמבר. זו התחנה
+  היחידה?" — with no `YYYY-MM-DD`. **Yes** records one stop through the
+  ordinary answer path (`name` and `name_en` = the destination, `start` and
+  `end` = the two dates). **No** is remembered for the session and asks the
+  stops as an open question that does not ask the destination or dates again
+  ("What are the stops, in order, with rough dates — and where you're staying
+  if it's booked?"). Typing an answer instead works as any typed answer. A value
+  `validateAnswer` would reject (for example a non-Latin destination with no
+  English name) is not offered, and the question is asked as today. Derived on
+  every read, like AC-9's confirm, never stored.
+
 ## Open questions
 
 None blocking approval.
