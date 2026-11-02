@@ -32,6 +32,8 @@ import type pg from "pg";
 export type Queryable = Pick<pg.Pool, "query">;
 import {
   askText,
+  askTextAfterKnownDeclined,
+  knownStopConfirmText,
   coerceLanguage,
   DEFAULT_LANGUAGE,
   lifecycleLabel,
@@ -1144,7 +1146,7 @@ export function renderQuestion(
    * is `IntakeQuestion.unsettledMatchKind`'s reading of WHY, when a question
    * has more than one way to be unsettled — see `unsettledText`.
    */
-  fromRecord: { choices?: readonly RosterChoice[]; unsettled?: string; unsettledKind?: string; subject?: string } = {},
+  fromRecord: { choices?: readonly RosterChoice[]; unsettled?: string; unsettledKind?: string; subject?: string; afterKnownDeclined?: boolean } = {},
 ): RenderedQuestion {
   const rows: InlineButton[][] = [];
 
@@ -1220,7 +1222,7 @@ export function renderQuestion(
   // cannot know it.
   const body = fromRecord.unsettled
     ? unsettledText(question, fromRecord.unsettled, language, fromRecord.unsettledKind)
-    : agentText?.trim() || askText(question, language);
+    : agentText?.trim() || (fromRecord.afterKnownDeclined ? askTextAfterKnownDeclined(question, language) : askText(question, language));
   // One question put once per thing it is about: "gluten-free — who is that for?"
   const text = fromRecord.subject ? `${fromRecord.subject} — ${body}` : body;
   return { text, replyMarkup: rows.length > 0 ? { inline_keyboard: rows } : null };
@@ -1260,7 +1262,9 @@ export function renderSuggestion(
   language: Language = DEFAULT_LANGUAGE,
   agentText?: string | null,
   /** `account_name`: the organizer's own name matched the roster (#438), asked as "you're Dana, right?" rather than read from a document. */
-  source?: "account_name",
+  source?: "account_name" | "known_place",
+  /** `known_place`: the stop the confirm is about (#438, AC-12), so the place and the dates can be said in words. */
+  structuredData?: unknown,
 ): RenderedQuestion {
   const shown = label.length > SUGGESTION_LABEL_MAX ? `${cutWhole(label, SUGGESTION_LABEL_MAX)}…` : label;
   const rows: InlineButton[][] = [[
@@ -1275,6 +1279,12 @@ export function renderSuggestion(
   }
   if (source === "account_name") {
     return { text: uiString("organizerNameConfirm", language).replace("{name}", () => shown), replyMarkup: { inline_keyboard: rows } };
+  }
+  if (source === "known_place") {
+    const stop = Array.isArray(structuredData) ? (structuredData[0] as Record<string, unknown> | undefined) : undefined;
+    const confirm = stop && typeof stop.name === "string" && typeof stop.start === "string" && typeof stop.end === "string"
+      ? knownStopConfirmText(stop.name, stop.start, stop.end, language) : null;
+    if (confirm) return { text: confirm, replyMarkup: { inline_keyboard: rows } };
   }
   const ask = agentText?.trim() || askText(question, language);
   return { text: `${ask}\n\n${uiString("suggestionIntro", language)}\n${shown}`, replyMarkup: { inline_keyboard: rows } };

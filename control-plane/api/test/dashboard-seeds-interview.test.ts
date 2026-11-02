@@ -18,7 +18,7 @@ import { buildApp } from "../src/app.js";
 import { validateArchitectureProfile } from "../src/config.js";
 import { issueEnrollment } from "../src/enrollment.js";
 import { applyMigrations } from "../src/migrations.js";
-import { renderDocumentOffer, renderSuggestion, startFromDeepLink, suggestionNoCallbackData, suggestionYesCallbackData } from "../src/chat-router.js";
+import { renderDocumentOffer, renderQuestion, renderSuggestion, startFromDeepLink, suggestionNoCallbackData, suggestionYesCallbackData } from "../src/chat-router.js";
 import {
   INTAKE_QUESTIONS,
   confirmIntakeForChat,
@@ -29,7 +29,7 @@ import {
   type AnswerStore,
   type SessionView,
 } from "../src/interview.js";
-import { readableDate, uiString } from "../src/intake-copy.js";
+import { askText, readableDate, uiString } from "../src/intake-copy.js";
 import { setInterpretPath } from "../src/interpret.js";
 import { sha256, type PortalDependencies } from "../src/portal.js";
 import { applyDecision, flushSettledInboundBursts } from "../src/relay/poller.js";
@@ -608,6 +608,171 @@ describe("AC-9 the organizer's name offers a one-tap confirm on the roster", { s
     assert.ok(view.ok);
     assert.equal(view.view.suggestions.organizer_identity, undefined);
     void tripId;
+  });
+});
+
+// ── The stops question starts from what is known ──────────────────────────────
+
+describe("AC-12 the stops question starts from the known place and dates", { skip }, () => {
+  const confirmEn = "You're going to Japan, April 12, 2027 – April 26, 2027. Is that the only stop?";
+  const openEn = "What are the stops, in order, with rough dates — and where you're staying if it's booked?";
+
+  /** A session at `phases`: every required question before it answered, the card's destination and dates on record. */
+  async function atPhases(opts: { card?: Record<string, unknown>; language?: "en" | "he"; bare?: boolean } = {}) {
+    const user = await organizer("Dana");
+    const { tripId, token } = opts.bare ? await bareTrip(user) : await dashboardTrip(user, opts.card ?? JAPAN);
+    const chat = nextChat();
+    const started = await startFromDeepLink(pool, chat, token);
+    assert.equal(started.kind, "started");
+    if (opts.language) await pool.query("UPDATE control_plane.intake_sessions SET language = $2 WHERE telegram_chat_id = $1", [chat, opts.language]);
+    for (const q of INTAKE_QUESTIONS.filter((x) => x.required)) {
+      if (q.id === "phases") break;
+      const have = await pool.query("SELECT answers ? $2 AS has FROM control_plane.intake_sessions WHERE telegram_chat_id = $1", [chat, q.id]);
+      if (have.rows[0].has) continue;
+      const text = q.id === "destination" ? "Japan" : q.id === "departure_date" ? "2027-04-12" : q.id === "return_date" ? "2027-04-26" : "x";
+      await putAnswer(chat, q.id, q.id === "travelers"
+        ? { kind: "structured", schema_version: 3, data: [{ name: "Dana Levi" }] }
+        : q.type === "choice" ? { kind: "choice", schema_version: 3, option_id: q.options![0]!.id, other_text: null }
+        : { kind: "text", schema_version: 3, text });
+    }
+    const view = await getSessionForChat(pool, chat);
+    assert.ok(view.ok);
+    return { tripId, chat, sessionId: (started as { sessionId: string }).sessionId, view: view.view };
+  }
+  const putAnswer = (chat: string, q: string, value: unknown) => pool.query(
+    `UPDATE control_plane.intake_sessions SET answers = answers || jsonb_build_object($2::text, $3::jsonb) WHERE telegram_chat_id = $1`,
+    [chat, q, JSON.stringify(value)]);
+
+  test("the confirm names the place and both dates in words, in English and in Hebrew, with Yes and No and no YYYY-MM-DD", async () => {
+    for (const language of ["en", "he"] as const) {
+      const a = await atPhases({ language });
+      assert.equal(a.view.nextQuestion?.id, "phases");
+      const suggestion = a.view.suggestions.phases;
+      assert.ok(suggestion, `${language}: a confirm is offered`);
+      assert.deepEqual(suggestion!.structuredData, [{ name: "Japan", name_en: "Japan", start: "2027-04-12", end: "2027-04-26" }]);
+      const tg = new Telegram();
+      await tapOn(a.chat, a.sessionId, "c:nodoc", tg, model([]));
+      const text = tg.last.text;
+      assert.doesNotMatch(text, ISO);
+      if (language === "en") assert.equal(text, confirmEn);
+      else assert.equal(text, `אתם נוסעים לJapan, ${readableDate("2027-04-12", "he")} – ${readableDate("2027-04-26", "he")}. זו התחנה היחידה?`);
+      assert.ok(tg.last.buttons.some((b) => b.callback_data === suggestionYesCallbackData("phases")));
+      assert.ok(tg.last.buttons.some((b) => b.callback_data === suggestionNoCallbackData("phases")));
+    }
+  });
+
+  test("Yes records one stop through the ordinary path and the interview moves on", async () => {
+    const a = await atPhases();
+    const tg = new Telegram();
+    await tapOn(a.chat, a.sessionId, suggestionYesCallbackData("phases"), tg, model([]));
+    const stored = await answersOf(a.tripId);
+    assert.deepEqual((stored.phases as { data: unknown }).data, [{ name: "Japan", name_en: "Japan", start: "2027-04-12", end: "2027-04-26" }]);
+    const after = await getSessionForChat(pool, a.chat);
+    assert.ok(after.ok);
+    assert.notEqual(after.view.nextQuestion?.id, "phases");
+    assert.equal(after.view.suggestions.phases, undefined);
+  });
+
+  test("No is remembered: the open question is asked, without the place or the dates, and the confirm does not return", async () => {
+    for (const language of ["en", "he"] as const) {
+      const a = await atPhases({ language });
+      const tg = new Telegram();
+      await tapOn(a.chat, a.sessionId, suggestionNoCallbackData("phases"), tg, model([]));
+      assert.ok(!("phases" in (await answersOf(a.tripId))), "nothing recorded");
+      const after = await getSessionForChat(pool, a.chat);
+      assert.ok(after.ok);
+      assert.equal(after.view.nextQuestion?.id, "phases");
+      assert.equal(after.view.suggestions.phases, undefined, "the offer does not return after a no");
+      const asked = tg.last.text;
+      if (language === "en") assert.equal(asked, openEn);
+      else assert.match(asked, /התחנות/);
+      assert.ok(!asked.includes("Japan") && !/Where are you going|לאן אתם/.test(asked), asked);
+      assert.doesNotMatch(asked, ISO);
+      // The next time the router asks, it is the same open question and not the confirm.
+      const again = new Telegram();
+      await tapOn(a.chat, a.sessionId, "c:nodoc", again, model([]));
+      assert.ok(again.sent.every((m) => m.text !== confirmEn && !m.text.includes("Is that the only stop")), "the confirm is not offered again");
+      assert.ok(again.sent.every((m) => !/Where are you going/.test(m.text)));
+    }
+  });
+
+  test("typing an answer instead works as any typed answer, and the offer is gone", async () => {
+    const a = await atPhases();
+    await setInterpretPath(pool, a.chat, true);
+    const stops = [{ name: "Tokyo", name_en: "Tokyo", start: "2027-04-12", end: "2027-04-19" }, { name: "Kyoto", name_en: "Kyoto", start: "2027-04-19", end: "2027-04-26" }];
+    await say(a.chat, "Tokyo first week, then Kyoto", new Telegram(), model([
+      { questionId: "phases", confidence: 0.95, evidence: "Tokyo first week, then Kyoto", value: { kind: "structured", dataJson: JSON.stringify(stops) } },
+    ]));
+    const stored = await answersOf(a.tripId);
+    assert.deepEqual((stored.phases as { data: unknown }).data, stops);
+    const after = await getSessionForChat(pool, a.chat);
+    assert.ok(after.ok);
+    assert.equal(after.view.suggestions.phases, undefined);
+  });
+
+  test("a document's own suggestion for the stops wins", async () => {
+    const a = await atPhases();
+    const fromDocument = { optionId: null, structuredData: [{ name: "Osaka", name_en: "Osaka", start: "2027-04-12", end: "2027-04-26" }] };
+    await pool.query(
+      `UPDATE control_plane.intake_sessions SET ui_state = ui_state || jsonb_build_object('suggestions', jsonb_build_object('phases', $2::jsonb)) WHERE telegram_chat_id = $1`,
+      [a.chat, JSON.stringify(fromDocument)]);
+    const view = await getSessionForChat(pool, a.chat);
+    assert.ok(view.ok);
+    assert.equal(view.view.suggestions.phases?.source, undefined);
+    assert.deepEqual(view.view.suggestions.phases?.structuredData, fromDocument.structuredData);
+  });
+
+  test("a stops answer already on record is never replaced by a confirm", async () => {
+    const a = await atPhases();
+    await putAnswer(a.chat, "phases", { kind: "structured", schema_version: 3, data: [{ name: "Tokyo", name_en: "Tokyo", start: "2027-04-12", end: "2027-04-14" }] });
+    const view = await getSessionForChat(pool, a.chat);
+    assert.ok(view.ok);
+    assert.equal(view.view.suggestions.phases, undefined);
+  });
+
+  test("without a destination or without one of the dates the stops are asked as today", async () => {
+    for (const drop of ["destination", "departure_date", "return_date"]) {
+      const a = await atPhases();
+      await pool.query("UPDATE control_plane.intake_sessions SET answers = answers - $2::text WHERE telegram_chat_id = $1", [a.chat, drop]);
+      const view = await getSessionForChat(pool, a.chat);
+      assert.ok(view.ok);
+      assert.equal(view.view.suggestions.phases, undefined, `${drop} missing: no confirm`);
+    }
+    // And with everything known but nothing declined, the plain question is today's words.
+    assert.equal(renderQuestion(INTAKE_QUESTIONS.find((q) => q.id === "phases")!, [], "en").text, askText(INTAKE_QUESTIONS.find((q) => q.id === "phases")!, "en"));
+  });
+
+  test("a destination that would not be recorded as a stop is not offered", async () => {
+    const a = await atPhases();
+    await putAnswer(a.chat, "destination", { kind: "text", schema_version: 3, text: "יפן" });
+    const view = await getSessionForChat(pool, a.chat);
+    assert.ok(view.ok);
+    assert.equal(view.view.suggestions.phases, undefined, "a Hebrew-only place has no English name to copy into name_en");
+    await putAnswer(a.chat, "destination", { kind: "text", schema_version: 3, text: "Japan (יפן)" });
+    const ok = await getSessionForChat(pool, a.chat);
+    assert.ok(ok.ok);
+    assert.ok(ok.view.suggestions.phases, "Latin script anywhere in the place is enough");
+  });
+
+  test("typed destination and dates are enough: the session need not have been seeded", async () => {
+    const a = await atPhases({ bare: true });
+    assert.equal(a.view.nextQuestion?.id, "phases");
+    assert.ok(a.view.suggestions.phases, "typed place and dates are offered back");
+  });
+
+  test("AC-7 still holds: an unseeded Telegram opening is today's, byte for byte, and stores nothing new", async () => {
+    const user = await organizer("Dana");
+    const { tripId, token } = await bareTrip(user);
+    const reply = await opening(nextChat(), token, "Telegram-Dror");
+    assert.equal(reply.text, uiString("introduction", "en"));
+    const ui = await pool.query("SELECT ui_state FROM control_plane.intake_sessions WHERE trip_id = $1", [tripId]);
+    assert.deepEqual(ui.rows[0].ui_state, {});
+  });
+
+  test("the confirm is derived on every read and never stored", async () => {
+    const a = await atPhases();
+    const ui = await pool.query("SELECT ui_state FROM control_plane.intake_sessions WHERE telegram_chat_id = $1", [a.chat]);
+    assert.equal(ui.rows[0].ui_state.suggestions, undefined);
   });
 });
 

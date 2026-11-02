@@ -13,6 +13,7 @@ import { linkTelegramOrganizerInTx } from "./organizer-trips.js";
 import {
   coerceLanguage,
   DEFAULT_LANGUAGE,
+  knownStopConfirmText,
   optionLabel,
   readableDate,
   recapLabel,
@@ -1850,6 +1851,8 @@ export interface SessionView {
   selections: Record<string, string[]>;
   /** Document answers waiting on "is this right?", by question id. */
   suggestions: Record<string, SuggestedAnswer>;
+  /** The stops were declined as "the only stop" (#438, AC-12): asked as an open question, not for the place and dates again. */
+  stopsAskedFromKnown?: boolean;
   /** Buttons for text questions drawn from the record (the roster, for the organizer), by question id. */
   choices?: Record<string, RosterChoice[]>;
   /** What a question is about right now ("gluten-free"), by question id. See `subjectFrom`. */
@@ -2064,6 +2067,12 @@ export interface InterviewUiState {
   organizerName?: string;
   /** The organizer said "no" to the confirm above: `organizer_identity` is asked plainly from here on. */
   organizerNameDeclined?: boolean;
+  /**
+   * The organizer said "no" to "is that the only stop?" (#438, AC-12), or declined a document's reading of the stops:
+   * `phases` is asked as an open question from here on, and the confirm built from the destination and dates (derived,
+   * never stored, like the organizer-name confirm) does not come back.
+   */
+  knownStopDeclined?: boolean;
 }
 
 /** A suggested answer, in the shape `submitAnswerForChat` takes. */
@@ -2075,8 +2084,10 @@ export interface SuggestedAnswer {
   /**
    * Where it came from, when not a document: `account_name` is the organizer's own name matched against the roster,
    * which the router words as "you're Dana on the list, right?" rather than "I read this from your document".
+   * `known_place`: the destination and dates already on record as one stop (#438, AC-12), worded "you're going to
+   * Gatecity, 14 November – 21 November. Is that the only stop?".
    */
-  source?: "account_name";
+  source?: "account_name" | "known_place";
 }
 
 function parseSuggestions(raw: unknown): Record<string, SuggestedAnswer> | undefined {
@@ -2091,7 +2102,7 @@ function parseSuggestions(raw: unknown): Record<string, SuggestedAnswer> | undef
       ...(typeof v.otherText === "string" ? { otherText: v.otherText } : {}),
       ...(v.structuredData !== undefined ? { structuredData: v.structuredData } : {}),
       ...(Array.isArray(v.optionIds) ? { optionIds: v.optionIds.filter((id): id is string => typeof id === "string") } : {}),
-      ...(v.source === "account_name" ? { source: "account_name" as const } : {}),
+      ...(v.source === "account_name" || v.source === "known_place" ? { source: v.source } : {}),
     };
   }
   return Object.keys(out).length > 0 ? out : undefined;
@@ -2100,7 +2111,9 @@ function parseSuggestions(raw: unknown): Record<string, SuggestedAnswer> | undef
 function withoutSuggestion(ui: InterviewUiState, questionId: string): InterviewUiState {
   // The organizer's-name confirm is derived from `organizerName` on every read, not stored, so a "no" has to be a
   // fact of its own or the offer would come straight back.
-  const declined: InterviewUiState = questionId === "organizer_identity" && ui.organizerName ? { ...ui, organizerNameDeclined: true } : ui;
+  // The same for the stops confirm built from the destination and dates (AC-12).
+  const afterName: InterviewUiState = questionId === "organizer_identity" && ui.organizerName ? { ...ui, organizerNameDeclined: true } : ui;
+  const declined: InterviewUiState = questionId === "phases" ? { ...afterName, knownStopDeclined: true } : afterName;
   if (!declined.suggestions?.[questionId]) return declined;
   const { [questionId]: _dropped, ...rest } = declined.suggestions;
   const { suggestions: _all, ...others } = declined;
@@ -2145,6 +2158,7 @@ function parseUiState(raw: unknown): InterviewUiState {
     ...(typeof record.recap_marker === "string" && DOCUMENT_RECAP_MARKER.test(record.recap_marker) ? { recapMarker: record.recap_marker } : {}),
     ...(typeof record.organizer_name === "string" && record.organizer_name.length > 0 ? { organizerName: record.organizer_name } : {}),
     ...(record.organizer_name_declined === true ? { organizerNameDeclined: true } : {}),
+    ...(record.known_stop_declined === true ? { knownStopDeclined: true } : {}),
   };
 }
 
@@ -2169,6 +2183,7 @@ function serializeUiState(ui: InterviewUiState): string {
     ...(ui.recapMarker ? { recap_marker: ui.recapMarker } : {}),
     ...(ui.organizerName ? { organizer_name: ui.organizerName } : {}),
     ...(ui.organizerNameDeclined ? { organizer_name_declined: true } : {}),
+    ...(ui.knownStopDeclined ? { known_stop_declined: true } : {}),
   });
 }
 
@@ -3521,6 +3536,40 @@ function withOrganizerNameSuggestion(
   return { ...stored, organizer_identity: { optionId: null, otherText: match.name, source: "account_name" } };
 }
 
+/**
+ * The destination and both dates already on record, as the one stop they make (#438, AC-12) -- the suggestion the
+ * stops question starts from when nothing else was said about the stops. Null when it cannot honestly be offered:
+ * a piece is missing, a date is not a real day or the return is before the departure, or the answer path would not
+ * take the stop (`suggestionAnswer`), or the place is written only in a non-Latin script, so copying it into
+ * `name_en` would put a name the site's English side cannot read where the stop's English name goes.
+ */
+export function knownStopSuggestion(answers: AnswerStore): SuggestedAnswer | null {
+  const place = textAnswer(answers, "destination")?.trim() ?? "";
+  const start = textAnswer(answers, "departure_date")?.trim() ?? "";
+  const end = textAnswer(answers, "return_date")?.trim() ?? "";
+  if (place === "" || knownStopConfirmText(place, start, end, "en") === null || end < start) return null;
+  const data = [{ name: place, name_en: place, start, end }];
+  if (stopsMissingEnglishName([{ name: place }]).length > 0) return null;
+  const suggestion: SuggestedAnswer = { optionId: null, structuredData: data, source: "known_place" };
+  return suggestionAnswer("phases", suggestion) ? suggestion : null;
+}
+
+/**
+ * "Is that the only stop?" (#438, AC-12). Once the destination and both dates are on record -- seeded from the card or
+ * typed -- the stops question starts from them instead of asking for the place and the dates a second time. A document's
+ * own suggestion for the stops (read from evidence) wins; an answer already on record, or a no, leaves the question as
+ * it was. Derived on every read, never stored, so it cannot go stale when the destination or a date is corrected.
+ */
+function withKnownStopSuggestion(
+  stored: Record<string, SuggestedAnswer>,
+  answers: AnswerStore,
+  ui: InterviewUiState,
+): Record<string, SuggestedAnswer> {
+  if (stored.phases || answers.phases !== undefined || ui.knownStopDeclined) return stored;
+  const known = knownStopSuggestion(answers);
+  return known ? { ...stored, phases: known } : stored;
+}
+
 function buildSessionView(
   sessionId: string,
   tripId: string,
@@ -3574,7 +3623,8 @@ function buildSessionView(
     pendingEntry: ui.pendingEntry ?? null,
     pendingSay: ui.pendingSay ?? null,
     pendingAskText: ui.pendingAskText ?? null,
-    suggestions: withOrganizerNameSuggestion(ui.suggestions ?? {}, answers, ui),
+    suggestions: withKnownStopSuggestion(withOrganizerNameSuggestion(ui.suggestions ?? {}, answers, ui), answers, ui),
+    stopsAskedFromKnown: ui.knownStopDeclined === true && knownStopSuggestion(answers) !== null,
     choices: recordChoices(answers),
     subjects: recordSubjects(answers),
     unsettled: unsettledAnswers(answers),

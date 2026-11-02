@@ -79,6 +79,11 @@ interface QuestionCopy {
   recap: Localised;
   options?: Record<string, Localised>;
   /**
+   * The question once the organizer has said no to the offer built from what is already known (#438, AC-12):
+   * it must not ask again for what they were just shown. Absent, `ask` stands.
+   */
+  askKnown?: Localised;
+  /**
    * Asking again when an answer is on record but does not settle the question
    * (`IntakeQuestion.satisfiedBy`). `{answer}` is what was written (a date as a person would say it).
    */
@@ -140,6 +145,10 @@ export const INTAKE_COPY: Record<string, QuestionCopy> = {
     ask: {
       en: "Where are you going, and when? The stops in order, with rough dates — and where you're staying if it's booked.",
       he: "לאן אתם הולכים, ומתי? התחנות לפי הסדר, עם תאריכים משוערים — ואיפה אתם ישנים אם כבר הזמנתם.",
+    },
+    askKnown: {
+      en: "What are the stops, in order, with rough dates — and where you're staying if it's booked?",
+      he: "מהן התחנות לפי הסדר, עם תאריכים משוערים — ואיפה אתם ישנים אם כבר הזמנתם?",
     },
     recap: { en: "Stops", he: "תחנות" },
   },
@@ -500,6 +509,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // The organizer's own name, matched against the roster they just listed (#438, AC-9): a one-tap confirm in
     // place of "which of them are you?". Said as a question to them, not as something read from a document.
     organizerNameConfirm: "You're {name} on the list, right?",
+    knownStopConfirm: "You're going to {place}, {start} – {end}. Is that the only stop?",
     // The opening of a trip that was created on the dashboard (#438): who they are to this trip, and what is
     // already chosen. Placed before the usual introduction, which follows unchanged.
     seedGreeting: "Hi {name} — you're the organizer of this trip.",
@@ -849,6 +859,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     suggestionYes: "✅ כן, נכון",
     suggestionNo: "✏️ לא",
     organizerNameConfirm: "אתה {name} ברשימה, נכון?",
+    knownStopConfirm: "אתם נוסעים ל{place}, {start} – {end}. זו התחנה היחידה?",
     seedGreeting: "היי {name} — אתה המארגן של הטיול הזה.",
     seedGreetingAnon: "אתה המארגן של הטיול הזה.",
     seedStart: "אני מתחיל ממה שבחרת בלוח הבקרה: {what}. אם משהו מזה לא נכון, פשוט תגיד לי ואשנה.",
@@ -1109,6 +1120,24 @@ export function seededOpening(seeded: SeededOpeningFacts, language: Language = D
 function pick(localised: Localised | undefined, language: Language): string | null {
   if (!localised) return null;
   return localised[language] ?? localised[DEFAULT_LANGUAGE] ?? null;
+}
+
+/** The question as asked after a no to the offer built from what is known; the plain question where it has none. */
+export function askTextAfterKnownDeclined(question: IntakeQuestion, language: Language = DEFAULT_LANGUAGE): string {
+  return pick(INTAKE_COPY[question.id]?.askKnown, language) ?? askText(question, language);
+}
+
+/**
+ * "You're going to Gatecity, November 14, 2027 – November 21, 2027. Is that the only stop?" (#438, AC-12): the place
+ * and both dates in words, never as `YYYY-MM-DD`, in the same wording the seeded opening uses. Null when a date is
+ * not a real day -- the caller then has nothing to confirm and asks the question as it always did.
+ */
+export function knownStopConfirmText(place: string, startIso: string, endIso: string, language: Language = DEFAULT_LANGUAGE): string | null {
+  const start = readableDate(startIso, language);
+  const end = readableDate(endIso, language);
+  if (!start || !end) return null;
+  return uiString("knownStopConfirm", language)
+    .replace("{place}", () => place).replace("{start}", () => start).replace("{end}", () => end);
 }
 
 /** The sentence to put to the organizer. Falls back to the agent-facing prompt. */
