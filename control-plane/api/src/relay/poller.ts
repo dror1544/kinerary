@@ -191,7 +191,7 @@ import type { MediaDeps } from "./normalize.js";
 import { PendingAttachments } from "./pending-attachments.js";
 import { GroupContext } from "./group-context.js";
 import {
-  askText, DEFAULT_LANGUAGE, optionLabel, readableDate, recapLabel, UI_STRINGS, uiString, writtenLanguage,
+  askText, askTextAfterKnownDeclined, DEFAULT_LANGUAGE, optionLabel, readableDate, recapLabel, UI_STRINGS, uiString, writtenLanguage,
   type Language,
 } from "../intake-copy.js";
 import { structuredLog } from "../redaction.js";
@@ -1365,7 +1365,7 @@ async function applyInterviewCallback(
         await deps.telegram.editMessageText({
           chatId: decision.chatId,
           messageId: decision.messageId,
-          text: suggestionConfirmedText(question, label, language),
+          text: suggestionConfirmedText(question, label, language, suggestion.source),
           replyMarkup: undefined,
         });
       }
@@ -2139,8 +2139,10 @@ async function askOpenConflict(view: SessionView, chatId: string, deps: TripBotP
  * is not valid UTF-8 and Telegram refuses the whole edit. `cutText` counted code
  * points, so 3000 emoji came out at 6000 units and the edit was refused.
  */
-export function suggestionConfirmedText(question: IntakeQuestion, label: string | null, language: Language): string {
-  return `${askText(question, language)}\n\n✅ ${cutWhole(label ?? "", SUGGESTION_EDIT_LABEL_MAX)}`;
+export function suggestionConfirmedText(question: IntakeQuestion, label: string | null, language: Language, source?: SuggestedAnswer["source"]): string {
+  // "Is that the only stop?" answered Yes must not turn into "Where are you going, and when?" over the recorded stop.
+  const asked = source === "known_place" ? askTextAfterKnownDeclined(question, language) : askText(question, language);
+  return `${asked}\n\n✅ ${cutWhole(label ?? "", SUGGESTION_EDIT_LABEL_MAX)}`;
 }
 const SUGGESTION_EDIT_LABEL_MAX = 3000;
 
@@ -2154,7 +2156,7 @@ function renderStep(question: IntakeQuestion, view: SessionView, phrasing?: stri
   const suggestion = view.suggestions[question.id];
   const label = suggestion ? suggestionLabel(question.id, suggestion, view.language) : null;
   return label
-    ? renderSuggestion(question, label, view.language, phrasing, suggestion?.source)
+    ? renderSuggestion(question, label, view.language, phrasing, suggestion?.source, suggestion?.structuredData)
     : renderQuestion(question, selectedOptionIds(view, question.id), view.language, phrasing, fromRecord(view, question.id));
 }
 
@@ -2164,7 +2166,7 @@ function renderStep(question: IntakeQuestion, view: SessionView, phrasing?: stri
  */
 function fromRecord(
   view: SessionView, questionId: string,
-): { choices?: RosterChoice[]; unsettled?: string; unsettledKind?: string; subject?: string } {
+): { choices?: RosterChoice[]; unsettled?: string; unsettledKind?: string; subject?: string; afterKnownDeclined?: boolean } {
   const subject = view.subjects?.[questionId];
   const from = subject ? findQuestion(subject.fromQuestion) : null;
   const unsettled = view.unsettled?.[questionId];
@@ -2173,6 +2175,7 @@ function fromRecord(
     unsettled: unsettled?.text,
     unsettledKind: unsettled?.matchKind,
     subject: from && subject ? optionLabel(from, subject.optionId, view.language) : undefined,
+    afterKnownDeclined: questionId === "phases" && view.stopsAskedFromKnown === true,
   };
 }
 
