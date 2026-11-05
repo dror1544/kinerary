@@ -1574,6 +1574,13 @@ export async function expiredSessionLanguage(db: pg.Pool, chatId: string): Promi
   // is, so a query that only asks "is there an expired session here" would
   // answer yes forever and refuse every message of the replacement interview.
   // An expired session only speaks for a chat that has nothing live on it.
+  //
+  // "Live" is not just `expired_at IS NULL`: a CONFIRMED session never expires
+  // (`claimExpiredSessions` skips it), so it has `expired_at IS NULL` forever,
+  // and counting it as live meant an organizer who had ever confirmed a trip in
+  // this chat was never told that a later interview had closed (#513). A
+  // confirmed session does not answer for the chat -- every reader of the live
+  // session filters `state <> 'confirmed'` the same way.
   const rows = await db.query<{ language: Language }>(
     `SELECT s.language
        FROM control_plane.intake_sessions s
@@ -1581,7 +1588,7 @@ export async function expiredSessionLanguage(db: pg.Pool, chatId: string): Promi
         AND s.expired_at IS NOT NULL
         AND NOT EXISTS (
           SELECT 1 FROM control_plane.intake_sessions live
-           WHERE live.telegram_chat_id = $1 AND live.expired_at IS NULL
+           WHERE live.telegram_chat_id = $1 AND live.expired_at IS NULL AND live.state <> 'confirmed'
         )
       ORDER BY s.expired_at DESC LIMIT 1`,
     [chatId],

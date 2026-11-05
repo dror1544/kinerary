@@ -1457,9 +1457,17 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
   app.get("/v1/trips/:id/interview-link", async (request, reply) => {
     const user = await requireUser(request, reply, deps); if (!user) return;
     const tripId = (request.params as { id?: string }).id ?? "";
-    const result = await deps.db.query<{ lifecycle_state: string; id: string | null; expires_at: Date | null; has_interview: boolean }>(
+    // A LIVE interview is one the organizer can still answer in: a confirmed one, or one that has not
+    // expired. An unconfirmed session whose `expired_at` is set is closed -- the bot tells whoever writes
+    // to it so -- and counting it made the page offer "Continue in Telegram" to a chat that had stopped
+    // listening (#513). `has_session` is the older, wider question (any session at all) and is what
+    // `replaceEnrollment` still refuses on, so it alone decides `recoverable`: the page must never be
+    // offered a replacement the route would then answer INTERVIEW_ALREADY_STARTED.
+    const result = await deps.db.query<{ lifecycle_state: string; id: string | null; expires_at: Date | null; has_interview: boolean; has_session: boolean }>(
       `SELECT t.lifecycle_state,e.id,e.expires_at,
-         EXISTS(SELECT 1 FROM control_plane.intake_sessions s WHERE s.trip_id=t.id) AS has_interview
+         EXISTS(SELECT 1 FROM control_plane.intake_sessions s WHERE s.trip_id=t.id
+                  AND (s.state='confirmed' OR s.expired_at IS NULL)) AS has_interview,
+         EXISTS(SELECT 1 FROM control_plane.intake_sessions s WHERE s.trip_id=t.id) AS has_session
        FROM control_plane.trips t
        JOIN control_plane.trip_memberships m ON m.trip_id=t.id
        LEFT JOIN control_plane.interview_enrollments e ON e.trip_id=t.id AND e.state='issued' AND e.expires_at>now()
@@ -1467,7 +1475,7 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     const row = result.rows[0]; if (!row) return reply.code(404).send({ error: "NOT_FOUND" });
     return reply.header("cache-control", "private, no-store").send({
       activeEnrollment: row.id ? { id: row.id, expiresAt: row.expires_at!.toISOString() } : null,
-      recoverable: Boolean(row.id) && row.lifecycle_state === "draft" && !row.has_interview,
+      recoverable: Boolean(row.id) && row.lifecycle_state === "draft" && !row.has_session,
       hasInterview: row.has_interview,
       telegramChatUrl: `https://t.me/${deps.telegramBotUsername}`,
     });
