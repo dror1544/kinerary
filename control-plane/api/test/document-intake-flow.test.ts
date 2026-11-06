@@ -495,6 +495,71 @@ describe("document intake through the interview", { skip: SKIP ? "no CONTROL_PLA
     });
   });
 
+  // #514. Found on staging: two ticket photos sent in an interview while image
+  // reading was off were recorded as a failure; the same photos sent in a NEW
+  // interview in the same chat were read, then dropped as `interpret_replayed`.
+  test("AC-1: the same file in a LATER interview in the chat is read again, and its answers land there", async () => {
+    await withFlow({ store: true }, async (flow) => {
+      await upload(flow, [PLAN]);
+      assert.equal(flow.calls.length, 1);
+
+      // The first interview closes; a fresh link for a new trip starts another in the same chat.
+      await flow.pool.query("UPDATE control_plane.intake_sessions SET expired_at = now() WHERE id = $1", [flow.sessionId]);
+      const userId = testId("user");
+      const tripId = testId("trip");
+      await flow.pool.query("INSERT INTO control_plane.users(id, status, display_name) VALUES ($1, 'active', 'Owner')", [userId]);
+      await flow.pool.query("INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ($1, $2, 'draft')", [tripId, tripId.replace(/_/g, "-")]);
+      await flow.pool.query(
+        "INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status) VALUES ($1, $2, $3, 'owner', 'active')",
+        [testId("memb"), tripId, userId],
+      );
+      const enrollment = await issueEnrollment(flow.pool, userId, tripId, { enrollmentTtlSeconds: 3600 });
+      assert.ok(enrollment.ok);
+      const started = await startFromDeepLink(flow.pool, CHAT, enrollment.token);
+      assert.equal(started.kind, "started");
+      await setInterpretPath(flow.pool, CHAT, true);
+      const second: Flow = { ...flow, tripId, sessionId: started.kind === "started" ? started.sessionId : "" };
+
+      await upload(second, [{ ...PLAN, messageId: "901" }]);
+
+      assert.ok(
+        !flow.logs.some((l) => l.includes("interview.interpret_replayed")),
+        "the earlier interview's reading is not replayed into this one",
+      );
+      assert.equal(flow.calls.length, 2, "the file was read for the new trip");
+      const answers = await answersForChat(flow.pool, CHAT);
+      assert.equal(structured(answers?.answers, "phases").length, 2, "and the answers landed in the new interview");
+    });
+  });
+
+  test("AC-2: a file that could not be read is read when it is sent again", async () => {
+    await withFlow({ store: true }, async (flow) => {
+      // No model configured: the burst is recorded as NOT_CONFIGURED.
+      const unconfigured: Flow = { ...flow, deps: { ...(flow.deps as object), modelRunner: undefined } as never };
+      await upload(unconfigured, [PLAN]);
+      assert.equal(flow.calls.length, 0, "nothing was read");
+      const failed = await flow.pool.query(
+        "SELECT failure_reason, committed_at FROM control_plane.interview_interpretations WHERE session_id = $1",
+        [flow.sessionId],
+      );
+      assert.equal(failed.rows[0]?.failure_reason, "NOT_CONFIGURED");
+      assert.ok(failed.rows[0]?.committed_at);
+
+      // The model is there now. The same file, again, in the same interview.
+      await upload(flow, [{ ...PLAN, messageId: "902" }]);
+
+      assert.ok(!flow.logs.some((l) => l.includes("interview.interpret_replayed")), "a failure is not replayed");
+      assert.equal(flow.calls.length, 1, "it was read this time");
+      const answers = await answersForChat(flow.pool, CHAT);
+      assert.equal(structured(answers?.answers, "phases").length, 2);
+      const row = await flow.pool.query(
+        "SELECT failure_reason, committed_at FROM control_plane.interview_interpretations WHERE session_id = $1",
+        [flow.sessionId],
+      );
+      assert.equal(row.rows[0]?.failure_reason, null, "and the record now says it worked");
+    });
+  });
+
   test("a photographed voucher is read by looking, kept as the photo, and its answer lands", async () => {
     await withFlow({ store: true }, async (flow) => {
       await upload(flow, [PHOTO_VOUCHER]);

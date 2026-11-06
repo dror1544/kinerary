@@ -2426,6 +2426,11 @@ export interface StoredOutcomes {
   malformed?: number;
 }
 
+/** A burst that carried files (`documentBurstKey`): `docs:<digests>[|<text>]`. */
+export function isDocumentBurstKey(key: string): boolean {
+  return key.startsWith("docs:");
+}
+
 /**
  * Claims one burst for interpretation, or hands back what a previous attempt
  * already learned about it.
@@ -2439,6 +2444,32 @@ export interface StoredOutcomes {
  * caller should do nothing. `fresh: false` with `committedAt` null is the crash
  * window: the model's answer survived but the commit did not, so the caller
  * resumes from the stored proposals rather than re-asking the model.
+ *
+ * WHAT A ROW IS A REPLAY OF (#514). The row stands in for a REDELIVERY: the same
+ * burst, arriving again in the same interview. Two cases that look like that
+ * are not, and the row is handed over to the new claimant instead:
+ *
+ *  1. ANOTHER SESSION'S ROW. The unique key is per chat, not per interview, and
+ *     a document burst's key is the files' CONTENT digests -- so the same
+ *     ticket photos sent in a later interview in that chat (a new trip) found
+ *     the earlier interview's row, were logged `interpret_replayed`, and got
+ *     nothing: no reading, no answers, no message saying why.
+ *  2. A FAILED DOCUMENT BURST. A committed row with a `failure_reason`
+ *     (`NO_READABLE_DOCUMENT`, `NOT_CONFIGURED`, an extraction that failed) is
+ *     a record that the file could not be read THEN. Sending it again is the
+ *     retry, and replaying the failure meant it could never succeed -- not
+ *     after image reading was switched on, not ever.
+ *     Only for document bursts: a typed burst's key is its Telegram message
+ *     ids, which do not repeat, so a typed row is only ever met by a genuine
+ *     redelivery and keeps its replay.
+ *
+ * Handing over is one UPDATE, not delete-then-insert: two claimants racing for
+ * the same stale row serialise on its lock, the first resets it, and the
+ * second's WHERE no longer matches (the row is now uncommitted and its own
+ * session's), so exactly one of them reads the file. The row gets a NEW id
+ * because `intake_pending_changes.interpretation_ids` is keyed on it -- a draft
+ * made by the earlier reading must not look like a replay of this one. No
+ * migration: the unique key and the columns are exactly what this needs.
  */
 export async function claimInterpretation(
   db: pg.Pool,
@@ -2454,6 +2485,20 @@ export async function claimInterpretation(
     [id, args.sessionId, args.chatId, args.burstKey, args.sourceText],
   );
   if (inserted.rowCount) return { fresh: true, id };
+
+  const handedOver = await db.query<{ id: string }>(
+    `UPDATE control_plane.interview_interpretations
+        SET id = $1, session_id = $2, source_text = $5,
+            proposals = '[]'::jsonb, outcomes = '{}'::jsonb, failure_reason = NULL,
+            attempts = 0, duration_ms = NULL, committed_at = NULL, created_at = now()
+      WHERE telegram_chat_id = $3 AND burst_key = $4
+        AND (session_id <> $2
+             OR ($6::boolean AND committed_at IS NOT NULL AND failure_reason IS NOT NULL))
+      RETURNING id`,
+    [id, args.sessionId, args.chatId, args.burstKey, args.sourceText, isDocumentBurstKey(args.burstKey)],
+  );
+  if (handedOver.rowCount) return { fresh: true, id };
+
   const existing = await findInterpretation(db, args.chatId, args.burstKey);
   // Losing the insert race and then not finding the row would mean it was
   // deleted between the two statements. Treat it as fresh rather than throwing:
