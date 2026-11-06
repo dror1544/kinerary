@@ -221,8 +221,27 @@ export async function consumeEnrollmentInTx(
   client: pg.PoolClient,
   rawToken: string,
 ): Promise<{ enrollmentId: string; tripId: string; userId: string } | null> {
-  const digest = tokenDigest(rawToken);
+  return consumeLockedEnrollment(client, "token_digest = $1", tokenDigest(rawToken));
+}
 
+/**
+ * The same consumption, for an enrollment named by its id rather than by its token: the organizer's approval of a link
+ * somebody else opened (#519, organizer-link-approval.ts). The token is a bearer and is not kept anywhere, so the approval
+ * cannot present it; the id comes from the request row the bound organizer answered, and every check `consumeEnrollmentInTx`
+ * makes (issued, not expired) is made again here under the same row lock.
+ */
+export async function consumeEnrollmentByIdInTx(
+  client: pg.PoolClient,
+  enrollmentId: string,
+): Promise<{ enrollmentId: string; tripId: string; userId: string } | null> {
+  return consumeLockedEnrollment(client, "id = $1", enrollmentId);
+}
+
+async function consumeLockedEnrollment(
+  client: pg.PoolClient,
+  where: "token_digest = $1" | "id = $1",
+  key: string,
+): Promise<{ enrollmentId: string; tripId: string; userId: string } | null> {
   // Row-level lock prevents two concurrent start-session calls from both
   // succeeding with the same token.
   const row = await client.query<{
@@ -234,9 +253,9 @@ export async function consumeEnrollmentInTx(
   }>(
     `SELECT id, trip_id, user_id, state, expires_at
      FROM control_plane.interview_enrollments
-     WHERE token_digest = $1
+     WHERE ${where}
      FOR UPDATE`,
-    [digest],
+    [key],
   );
   const [enrollment] = row.rows;
   if (!enrollment) return null;

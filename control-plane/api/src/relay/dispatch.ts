@@ -26,6 +26,7 @@
  */
 import type pg from "pg";
 import {
+  organizerLinkCallbackData,
   parseCallbackData,
   parseInbound,
   renderDocumentOffer,
@@ -54,6 +55,14 @@ import {
   tripLanguage,
 } from "../chat-router.js";
 import { listOrganizerTrips, switchChatToTrip, type OrganizerTrip } from "../organizer-trips.js";
+import {
+  answerLinkRequest,
+  linkAnswerFromText,
+  pendingRequestIdsForChat,
+  type ApproverNotice,
+  type LinkChoice,
+  type LinkDecisionResult,
+} from "../organizer-link-approval.js";
 import { redeemTelegramLinkToken, telegramLinkTokenFromStartPayload } from "../telegram-link-token.js";
 import { isAddressedToAssistant } from "./addressing.js";
 import { addressedMark, conversationMark, reactionAnswerMark } from "./stay-silent.js";
@@ -102,7 +111,7 @@ import type { GroupContext } from "./group-context.js";
 import { getSessionForChat, setFinishRequestedForChat, type SessionView } from "../interview.js";
 import { organizerDocumentRoute } from "../document-correction.js";
 import { visionProcessingConfig } from "../document-vision.js";
-import { digestTelegramId, telegramDisplayName } from "../identity.js";
+import { digestTelegramId, telegramDisplayName, type TelegramName } from "../identity.js";
 import type { StructuredModelRunner } from "../model-runner.js";
 import { handleModelCommand, isSwitchableRunner } from "../model-task-settings.js";
 import { looksLikeAQuestion, type ChatType, type WireMessageEvent } from "./protocol.js";
@@ -187,6 +196,13 @@ export type DispatchDecision =
     }
   /** A tap that is answered (the spinner stops) and gets NO message in the chat. */
   | { kind: "callback_ack"; callbackQueryId: string; text: string }
+  /**
+   * Several messages, possibly to DIFFERENT chats, sent in order -- the answer to a tap (`callbackQueryId`, answered first
+   * with `ackText`, so the button stops spinning) and what it set in motion. Used where one event owes words to two people:
+   * a link opened by someone other than its organizer (#519) tells the stranger and the organizer, and the organizer's
+   * answer tells both back. Each message is sent on its own; one that fails does not stop the others.
+   */
+  | { kind: "multi_reply"; callbackQueryId?: string; ackText?: string; replies: DirectReply[] }
   /** A tapped inline button that belongs to the interview flow. */
   | {
       kind: "interview_callback";
@@ -758,6 +774,16 @@ export async function dispatchUpdate(
       }
       case "already_in_interview":
         return { kind: "reply", reply: { chatId, text: strings.alreadyInterviewing } };
+      case "other_organizer": {
+        // The link is somebody else's (#519). The stranger gets one fixed sentence that names nothing about the trip; the
+        // organizer, if there is something to tell them and this is the first time, gets theirs in THEIR chat's language.
+        const language = await resolveChatLanguage(db, chatId, message.from?.language_code);
+        const key = outcome.toRequester === "asked" ? "linkOtherAsked"
+          : outcome.toRequester === "not_approved" ? "linkOtherNotApproved" : "linkOtherBelongs";
+        const replies: DirectReply[] = [{ chatId, text: uiString(key, language) }];
+        if (outcome.toApprover) replies.push(await renderApproverNotice(db, outcome.toApprover));
+        return { kind: "multi_reply", replies };
+      }
       case "rejected": {
         // A bare `/start` in a private chat that has no trip, from an account with live organizer links:
         // its trips to pick from, not "welcome" (a payload we rejected as bad keeps its bad-link answer).
@@ -782,6 +808,33 @@ export async function dispatchUpdate(
                   ? strings.notPrivate
                   : strings.badLink,
           },
+        };
+      }
+    }
+  }
+
+  // The typed form of Approve / Decline (#519, AC-7: buttons are shortcuts, not syntax). Only while a question is actually
+  // pending in THIS private chat, only for the whole message being one of the unambiguous words (organizer-link-approval.ts
+  // `linkAnswerFromText`: never "yes" or "no", which the same chat may be saying to something else), and only from the
+  // chat's own person (the update's `from.id` is the chat id). With more than one question waiting a typed word cannot say
+  // which is meant, and the organizer is pointed at the buttons instead of the wrong one being picked.
+  if (
+    parsed.kind === "text"
+    && message.chat?.type === "private"
+    && message.from?.id !== undefined
+    && String(message.from.id) === chatId
+  ) {
+    const choice: LinkChoice | null = linkAnswerFromText(parsed.text);
+    if (choice) {
+      const waiting = await pendingRequestIdsForChat(db, chatId);
+      if (waiting.length > 0) {
+        const language = await resolveChatLanguage(db, chatId, message.from?.language_code);
+        if (waiting.length > 1) return { kind: "reply", reply: { chatId, text: uiString("linkApproverMany", language) } };
+        const result = await answerLinkRequest(db, { requestId: waiting[0]!, choice, chatId, fromId: chatId }, log);
+        const answered = linkAnswerReplies(result, chatId, language);
+        return {
+          kind: "multi_reply",
+          replies: answered.replies.length > 0 ? answered.replies : [{ chatId, text: answered.ackText }],
         };
       }
     }
@@ -1968,6 +2021,87 @@ async function applySwitch(
   }
 }
 
+// ── One organizer, one Telegram (#519): the words, and the two people they go to ──────────────────────────────────────
+
+/** "Dana (@dana)", "Dana", "@dana", or a fixed phrase: the stranger's own display data and nothing else about them. */
+function whoText(name: TelegramName | null, language: Language): string {
+  const first = name?.firstName?.trim() || null;
+  const handle = name?.username ? `@${name.username}` : null;
+  if (first && handle) return `${first} (${handle})`;
+  return first ?? handle ?? uiString("linkWhoUnknown", language);
+}
+
+/** What the bound organizer is sent, in the language of THEIR chat: the question with its two buttons, or the plain notice. */
+async function renderApproverNotice(db: pg.Pool, notice: ApproverNotice): Promise<DirectReply> {
+  const language = await resolveChatLanguage(db, notice.chatId, undefined);
+  const trip = notice.tripTitle ?? uiString("linkTripUntitled", language);
+  if (notice.kind === "refused") {
+    return { chatId: notice.chatId, text: uiString("linkForeignOpened", language).replace("{trip}", () => trip) };
+  }
+  return {
+    chatId: notice.chatId,
+    text: uiString("linkApprovePrompt", language)
+      .replace("{who}", () => whoText(notice.requester, language))
+      .replace("{trip}", () => trip),
+    replyMarkup: {
+      inline_keyboard: [[
+        { text: uiString("linkApproveButton", language), callback_data: organizerLinkCallbackData(notice.requestId, "approve") },
+        { text: uiString("linkDeclineButton", language), callback_data: organizerLinkCallbackData(notice.requestId, "decline") },
+      ]],
+    },
+  };
+}
+
+/**
+ * What the organizer's answer sets in motion, as messages. `ackText` is the short toast for a tap; `replies` are the
+ * messages (the organizer's own confirmation first, then the stranger's). The stranger is told one fixed sentence and,
+ * once approved, gets the ordinary opening of the interview.
+ */
+function linkAnswerReplies(
+  result: LinkDecisionResult,
+  approverChatId: string,
+  approverLanguage: Language,
+): { ackText: string; replies: DirectReply[] } {
+  switch (result.kind) {
+    case "not_pending":
+    case "not_applicable":
+      return { ackText: uiString("linkApproverGone", approverLanguage), replies: [] };
+    case "requester_busy":
+      return { ackText: uiString("linkApproverNotNow", approverLanguage), replies: [] };
+    case "declined": {
+      const language = result.requester.language ?? DEFAULT_LINK_LANGUAGE;
+      return {
+        ackText: uiString("linkApproverDeclined", approverLanguage),
+        replies: [
+          { chatId: approverChatId, text: uiString("linkApproverDeclined", approverLanguage) },
+          { chatId: result.requester.chatId, text: uiString("linkOtherNotApproved", language) },
+        ],
+      };
+    }
+    case "approved": {
+      const language = result.view.language;
+      const trip = result.tripTitle ?? uiString("linkTripUntitled", approverLanguage);
+      const replies: DirectReply[] = [
+        {
+          chatId: approverChatId,
+          text: uiString("linkApproverApproved", approverLanguage)
+            .replace("{who}", () => whoText(result.requesterName, approverLanguage))
+            .replace("{trip}", () => trip),
+        },
+        { chatId: result.requester.chatId, text: uiString("linkOtherApproved", language) },
+      ];
+      // The ordinary opening of a fresh interview, exactly as `/start` sends it (see the `started` case).
+      if (result.view.nextQuestion) {
+        const offer = renderDocumentOffer(language, result.returning, result.seeded);
+        replies.push({ chatId: result.requester.chatId, text: offer.text, replyMarkup: offer.replyMarkup ?? undefined });
+      }
+      return { ackText: replies[0]!.text, replies };
+    }
+  }
+}
+
+const DEFAULT_LINK_LANGUAGE: Language = "en";
+
 async function dispatchCallback(
   db: pg.Pool,
   update: TelegramUpdate,
@@ -1978,6 +2112,25 @@ async function dispatchCallback(
 
   const chatId = callback.message?.chat?.id;
   const parsed = parseCallbackData(callback.data);
+
+  // The organizer's Approve / Decline of another Telegram account that opened their interview link (#519). Handled before
+  // the interview block, which would swallow it as a stale interview button when the organizer is mid-interview on
+  // another trip. The payload names the question and the choice and nothing else: whose question it is, and that the tapper
+  // is that person (the update's own `from.id`, in their own private chat), are checked against the stored request.
+  if (parsed.kind === "organizer_link" && chatId !== undefined && chatId !== null) {
+    const fromId = callback.from?.id;
+    const language = await resolveChatLanguage(db, String(chatId), callback.from?.language_code);
+    if (fromId === undefined || fromId === null) {
+      return { kind: "callback_ack", callbackQueryId: callback.id, text: uiString("linkApproverGone", language) };
+    }
+    const result = await answerLinkRequest(db, { requestId: parsed.requestId, choice: parsed.choice, chatId: String(chatId), fromId: String(fromId) }, log);
+    const answered = linkAnswerReplies(result, String(chatId), language);
+    if (answered.replies.length === 0) {
+      // Nothing happened: the tap is answered and says so, and posts nothing into whatever chat it came from.
+      return { kind: "callback_ack", callbackQueryId: callback.id, text: answered.ackText };
+    }
+    return { kind: "multi_reply", callbackQueryId: callback.id, ackText: answered.ackText, replies: answered.replies };
+  }
 
   // Handled BEFORE the interview block below, which would otherwise swallow a
   // trip-switch tap as a stale interview button — the chat performing a switch

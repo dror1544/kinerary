@@ -744,6 +744,25 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // organizer of both. One sentence for every way of being refused, so it confirms nothing about
     // who organizes what.
     groupMoveNotOrganizer: "This group belongs to another trip. Only its organizer can move it.",
+    // ── One organizer, one Telegram (#519) ──────────────────────────────
+    // What a stranger who opens somebody else's interview link is told. Three fixed sentences and NONE of them can name the
+    // trip -- no destination, dates, title or person -- because the stranger has proved nothing yet.
+    linkOtherBelongs: "This link was made for another organizer, so I can't open it for you. If it should be yours, please ask them for it.",
+    linkOtherAsked: "This link belongs to another organizer. I've asked them to approve you, and I'll write to you here as soon as they answer.",
+    linkOtherNotApproved: "The organizer didn't approve this. If you think that's a mistake, please ask them directly.",
+    linkOtherApproved: "The organizer approved — you're in. Let's get started.",
+    // To the organizer. `{trip}` is the trip's title; it is said only to them, who own it.
+    linkForeignOpened: "Someone else opened your interview link for \"{trip}\". If that wasn't you, get a new link from the dashboard.",
+    linkApprovePrompt: "{who} opened your interview link for \"{trip}\" and would run this trip from their own Telegram. Approve to hand it to them — this account will be unlinked from the trip. Decline to leave everything as it is. You can also type approve or decline.",
+    linkApproveButton: "Approve",
+    linkDeclineButton: "Decline",
+    linkApproverApproved: "Done — {who} now runs \"{trip}\" from Telegram, and this account is no longer linked to it.",
+    linkApproverDeclined: "Okay — nothing changed.",
+    linkApproverGone: "That request isn't open any more.",
+    linkApproverNotNow: "I couldn't do that just now. Try again in a moment.",
+    linkApproverMany: "More than one request is waiting for you. Please use the buttons under the one you mean.",
+    linkTripUntitled: "your trip",
+    linkWhoUnknown: "A Telegram account",
     // Posted at the top of the new introduction when the group's own organizer moved it to their next trip.
     groupMovedNotice: "This group now follows {trip}.",
     groupMovedNoticeUntitled: "the new trip",
@@ -1004,6 +1023,22 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     telegramLinked: "בוצע — חשבון הטלגרם הזה מקושר עכשיו אל \"{trip}\". שלחו ‎/trips‎ כדי לראות אותו, ו‎/switch‎ כדי לדבר איתו מהצ׳אט הזה.",
     telegramLinkRefused: "הקישור הזה לא עבד — ייתכן שפג תוקפו או שכבר נעשה בו שימוש. היכנסו ל-Kinerary, מצאו את הטיול ובחרו Link Telegram כדי לקבל קישור חדש.",
     groupMoveNotOrganizer: "הקבוצה הזו שייכת לטיול אחר. רק מי שמארגן אותו יכול להעביר אותה.",
+    // ── מארגן אחד, טלגרם אחד (#519) ──────────────────────────────────────
+    linkOtherBelongs: "הקישור הזה נוצר עבור מארגן אחר, ולכן אני לא יכול לפתוח אותו עבורכם. אם הוא אמור להיות שלכם, בקשו אותו מהמארגן.",
+    linkOtherAsked: "הקישור הזה שייך למארגן אחר. ביקשתי מהמארגן לאשר אתכם, ואכתוב לכם כאן ברגע שיענה.",
+    linkOtherNotApproved: "המארגן לא אישר את זה. אם לדעתכם זו טעות, פנו אל המארגן ישירות.",
+    linkOtherApproved: "המארגן אישר — אתם בפנים. מתחילים.",
+    linkForeignOpened: "מישהו אחר פתח את קישור הראיון שלכם עבור \"{trip}\". אם זה לא הייתם אתם, קבלו קישור חדש מלוח הבקרה.",
+    linkApprovePrompt: "קישור הראיון שלכם עבור \"{trip}\" נפתח על ידי {who}. אשרו כדי שהטיול ינוהל מהחשבון שלהם בטלגרם — החשבון הזה ינותק מהטיול. דחו כדי להשאיר הכול כמו שהוא. אפשר גם לכתוב אישור או דחייה.",
+    linkApproveButton: "אישור",
+    linkDeclineButton: "דחייה",
+    linkApproverApproved: "בוצע — \"{trip}\" מנוהל עכשיו מהחשבון של {who} בטלגרם, והחשבון הזה כבר לא מקושר אליו.",
+    linkApproverDeclined: "בסדר — לא השתנה כלום.",
+    linkApproverGone: "הבקשה הזו כבר לא פתוחה.",
+    linkApproverNotNow: "לא הצלחתי לעשות את זה כרגע. נסו שוב בעוד רגע.",
+    linkApproverMany: "יש כמה בקשות שממתינות לכם. השתמשו בכפתורים שמתחת לבקשה שהתכוונתם אליה.",
+    linkTripUntitled: "הטיול שלכם",
+    linkWhoUnknown: "חשבון טלגרם",
     groupMovedNotice: "מעכשיו הקבוצה הזו מלווה את {trip}.",
     groupMovedNoticeUntitled: "הטיול החדש",
     openTripText: "הטיול במרחק לחיצה — לחצו על פתיחת הטיול כדי לראות את התוכנית כאן בטלגרם.",

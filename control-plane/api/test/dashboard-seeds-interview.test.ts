@@ -406,9 +406,12 @@ describe("a trip created on the dashboard", { skip }, () => {
 
   test("a group or other dashboard type is not seeded: the interview asks the type as today", async () => {
     const user = await organizer("Dana");
+    // One organizer is one Telegram account (#519): the same chat opens both links, the first interview closed by then.
+    const chat = nextChat();
     for (const tripType of ["group", "other"]) {
       const { tripId, token } = await dashboardTrip(user, { ...JAPAN, tripType });
-      assert.equal((await startFromDeepLink(pool, nextChat(), token)).kind, "started");
+      await pool.query("UPDATE control_plane.intake_sessions SET expired_at = now() WHERE telegram_chat_id = $1 AND expired_at IS NULL", [chat]);
+      assert.equal((await startFromDeepLink(pool, chat, token)).kind, "started");
       const answers = await answersOf(tripId);
       assert.ok(!("trip_type" in answers), tripType);
       assert.ok("destination" in answers && "departure_date" in answers);
@@ -849,8 +852,11 @@ describe("the seed is read from the trip the enrollment names", { skip }, () => 
     const user = await organizer("Dana");
     const a = await dashboardTrip(user, JAPAN);
     const b = await dashboardTrip(user, { destination: "Peru", tripType: "couple", startDate: "2028-01-05", endDate: "2028-01-19" });
-    assert.equal((await startFromDeepLink(pool, nextChat(), b.token)).kind, "started");
-    assert.equal((await startFromDeepLink(pool, nextChat(), a.token)).kind, "started");
+    // One organizer is one Telegram account (#519): the same chat opens both links, the first interview closed by then.
+    const chat = nextChat();
+    assert.equal((await startFromDeepLink(pool, chat, b.token)).kind, "started");
+    await pool.query("UPDATE control_plane.intake_sessions SET expired_at = now() WHERE telegram_chat_id = $1 AND expired_at IS NULL", [chat]);
+    assert.equal((await startFromDeepLink(pool, chat, a.token)).kind, "started");
     assert.equal(textOf(await answersOf(a.tripId), "destination"), "Japan");
     assert.equal(textOf(await answersOf(b.tripId), "destination"), "Peru");
     assert.equal(textOf(await answersOf(b.tripId), "departure_date"), "2028-01-05");

@@ -23,6 +23,16 @@
  * (telegram-mini-app.ts) and the card lists it for Unlink. It is the same
  * trade the interview link makes, with a shorter fuse.
  *
+ * ONE ORGANIZER, ONE TELEGRAM (#519) DOES NOT APPLY HERE, ON PURPOSE. That rule asks "is the Telegram account that opened
+ * this interview link the one the organizer's account is bound to?" because an interview link is a bearer token that can be
+ * forwarded, and nothing else vouches for who opened it. This link is different in the one respect that matters: it is
+ * issued only to a SIGNED-IN owner (full session and CSRF) for a trip they run, so the account half is proven by the owner
+ * themselves, and the owner chose to hand this link to the Telegram account that opens it -- that is the point of it, and
+ * the way a second Telegram account is added or a revoked one is brought back. Asking the bound account to approve what
+ * the owner just did from their own dashboard would be asking them to approve themselves, and would leave an organizer
+ * who lost their phone with no way back. The costs of a leaked link are bounded instead, as below: short, single use, one
+ * trip, announced on first sign-in and listed on the card for Unlink.
+ *
  * The token pattern is the enrollment's (enrollment.ts): random bytes, only the
  * sha256 stored, row-locked consume. No new crypto.
  *

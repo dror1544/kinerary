@@ -127,6 +127,22 @@ function bindingId(): string {
  * the signed-in account as well as the Telegram identity. Other trips are
  * unaffected either way.
  */
+export type OrganizerLinkWrite =
+  /** A new live link row was written. */
+  | "linked"
+  /** The pair already had a live link for this trip. */
+  | "already_linked"
+  /** The owner Unlinked this pair for this trip: nothing was written, and nothing here may re-open it. */
+  | "revoked_pair"
+  /** Not a private chat id: there is no Telegram person to link. */
+  | "not_private";
+
+/**
+ * WHO MAY CALL THIS. Not every redeemer: `startSession` asks `organizerBindingVerdict` (below) first, under the trip
+ * lock, and only an account that is not bound yet, or is the bound one, reaches this line -- or the approved replacement
+ * (organizer-link-approval.ts), which is the organizer's own decision. A link opened by anyone else never gets here
+ * (#519). The function itself stays a plain write because both of those callers have already decided.
+ */
 export async function linkTelegramOrganizerInTx(
   client: pg.PoolClient,
   telegramUserId: string,
@@ -135,9 +151,10 @@ export async function linkTelegramOrganizerInTx(
   verifiedVia: "enrollment_redemption" | "backfill_intake_session" = "enrollment_redemption",
   /** First name and @username from the update's verified `from` (identity.ts, telegramDisplayName). Display data only. */
   telegramName: TelegramName | null = null,
-): Promise<void> {
-  if (!isPrivateChatId(telegramUserId)) return;
-  await client.query(
+): Promise<OrganizerLinkWrite> {
+  if (!isPrivateChatId(telegramUserId)) return "not_private";
+  const digest = digestTelegramId(telegramUserId);
+  const inserted = await client.query(
     `INSERT INTO control_plane.telegram_organizer_trip_links
        (id, user_id, trip_id, telegram_subject_digest, verified_via, telegram_first_name, telegram_username)
      SELECT $1, $2, $3, $4, $5, $6, $7
@@ -145,9 +162,135 @@ export async function linkTelegramOrganizerInTx(
         SELECT 1 FROM control_plane.telegram_organizer_trip_links r
          WHERE r.telegram_subject_digest = $4 AND r.user_id = $2 AND r.trip_id = $3
            AND r.revoked_at IS NOT NULL)
-     ON CONFLICT DO NOTHING`,
-    [`otl_${randomBytes(16).toString("hex")}`, userId, tripId, digestTelegramId(telegramUserId), verifiedVia, telegramName?.firstName ?? null, telegramName?.username ?? null],
+     ON CONFLICT DO NOTHING
+     RETURNING id`,
+    [`otl_${randomBytes(16).toString("hex")}`, userId, tripId, digest, verifiedVia, telegramName?.firstName ?? null, telegramName?.username ?? null],
   );
+  if (inserted.rows[0]) return "linked";
+  const revoked = await client.query(
+    `SELECT 1 FROM control_plane.telegram_organizer_trip_links
+      WHERE telegram_subject_digest = $1 AND user_id = $2 AND trip_id = $3 AND revoked_at IS NOT NULL LIMIT 1`,
+    [digest, userId, tripId],
+  );
+  return revoked.rowCount ? "revoked_pair" : "already_linked";
+}
+
+// ── One organizer, one Telegram (#519) ───────────────────────────────────────
+
+/** A Telegram account the organizer's account is bound to. The digest is the identity; nothing else decides. */
+export interface BoundTelegramAccount {
+  digest: string;
+  /** This account holds a live link to THE trip in question (it is preferred when somebody has to be asked). */
+  onThisTrip: boolean;
+  /** When it was bound, newest first among equals. */
+  boundAt: Date | null;
+}
+
+/**
+ * WHICH TELEGRAM ACCOUNTS AN ORGANIZER'S ACCOUNT IS BOUND TO. The one definition; every reader goes through it.
+ *
+ * Two sources, either is enough, and both are written only from a verified update or a verified sign-in:
+ *
+ *   `telegram_organizer_trip_links`  the non-revoked organizer links of this user, over EVERY trip. Account-wide on
+ *      purpose: a trip created on the dashboard has no link of its own until its interview link is redeemed, so a
+ *      per-trip reading would call every new trip "not bound yet" and let a forwarded link bind a stranger -- the very
+ *      case #519 closes. A revoked row is history, and does not count: an organizer who Unlinked their only Telegram has
+ *      nothing bound, which is what makes the dashboard's Link the way back.
+ *   `user_identities` (provider `telegram`)  the Telegram account the user SIGNED UP with. It is a verified Telegram
+ *      identity on the account, and it outlives an Unlink of a trip, so an account that signed up through Telegram stays
+ *      bound to that Telegram even after the owner unlinked it from one trip.
+ *
+ * The union is the stricter reading (a set at least as large, so "someone else" is asked about more often, never less).
+ * A retired (torn-down) trip's link still counts: the safe direction, and the cost is one approval prompt.
+ */
+export async function boundTelegramAccounts(
+  q: Pick<pg.PoolClient, "query">,
+  userId: string,
+  tripId: string,
+): Promise<BoundTelegramAccount[]> {
+  const rows = await q.query<{ digest: string; on_this_trip: boolean; bound_at: Date | null }>(
+    `SELECT telegram_subject_digest AS digest, bool_or(trip_id = $2) AS on_this_trip, max(created_at) AS bound_at
+       FROM control_plane.telegram_organizer_trip_links
+      WHERE user_id = $1 AND revoked_at IS NULL
+      GROUP BY telegram_subject_digest
+     UNION ALL
+     SELECT provider_subject_digest, false, verified_at
+       FROM control_plane.user_identities
+      WHERE user_id = $1 AND provider = 'telegram'`,
+    [userId, tripId],
+  );
+  const merged = new Map<string, BoundTelegramAccount>();
+  for (const row of rows.rows) {
+    const held = merged.get(row.digest);
+    if (!held) {
+      merged.set(row.digest, { digest: row.digest, onThisTrip: row.on_this_trip, boundAt: row.bound_at });
+      continue;
+    }
+    held.onThisTrip = held.onThisTrip || row.on_this_trip;
+    if (row.bound_at && (!held.boundAt || row.bound_at > held.boundAt)) held.boundAt = row.bound_at;
+  }
+  // This trip's own accounts first, then the most recently bound.
+  return [...merged.values()].sort((a, b) =>
+    Number(b.onThisTrip) - Number(a.onThisTrip) || (b.boundAt?.getTime() ?? 0) - (a.boundAt?.getTime() ?? 0));
+}
+
+/** Has any interview session ever been opened for this trip -- live, paused (closed unconfirmed) or confirmed? */
+export async function tripHasInterviewSession(q: Pick<pg.PoolClient, "query">, tripId: string): Promise<boolean> {
+  const row = await q.query("SELECT 1 FROM control_plane.intake_sessions WHERE trip_id = $1 LIMIT 1", [tripId]);
+  return (row.rowCount ?? 0) > 0;
+}
+
+export type OrganizerBindingVerdict =
+  /** The account is not bound to any Telegram yet, or is bound to this very one: redeem as before. */
+  | { kind: "proceed"; reason: "not_bound" | "same_account" }
+  /** A different Telegram account than the one the organizer is bound to. `started`: an interview exists, so no approval. */
+  | { kind: "other_account"; started: boolean; bound: BoundTelegramAccount[] };
+
+/**
+ * May THIS Telegram account redeem an interview link issued to `userId` for `tripId`?
+ *
+ * `telegramUserId` is the update's verified private-chat sender and nothing else is an input: not a message, not a
+ * callback payload, not a token field. Read under the caller's transaction (it holds the trip row), so the answer and the
+ * redemption it gates see the same moment.
+ */
+export async function organizerBindingVerdict(
+  q: Pick<pg.PoolClient, "query">,
+  input: { userId: string; tripId: string; telegramUserId: string },
+): Promise<OrganizerBindingVerdict> {
+  const bound = await boundTelegramAccounts(q, input.userId, input.tripId);
+  if (bound.length === 0) return { kind: "proceed", reason: "not_bound" };
+  const mine = digestTelegramId(input.telegramUserId);
+  if (bound.some((account) => account.digest === mine)) return { kind: "proceed", reason: "same_account" };
+  return { kind: "other_account", started: await tripHasInterviewSession(q, input.tripId), bound };
+}
+
+/**
+ * The private chat that reaches a bound Telegram account, or null.
+ *
+ * Organizer links keep only a digest (the raw id is not stored there), so the id is recovered from rows that hold one
+ * for the same person: the interviews this user ran, the chats of this user's trips, and the Telegram signup identity.
+ * A candidate is accepted only when it hashes to the digest, so a stale or foreign row cannot point the question at
+ * somebody else. Null means "nobody can be asked": the caller fails closed.
+ */
+export async function privateChatForDigest(
+  q: Pick<pg.PoolClient, "query">,
+  userId: string,
+  digest: string,
+): Promise<string | null> {
+  const candidates = await q.query<{ chat_id: string | null }>(
+    `SELECT provider_subject_id AS chat_id FROM control_plane.user_identities WHERE user_id = $1 AND provider = 'telegram'
+     UNION
+     SELECT telegram_chat_id FROM control_plane.intake_sessions WHERE user_id = $1
+     UNION
+     SELECT b.chat_id FROM control_plane.telegram_chat_bindings b
+       JOIN control_plane.trip_memberships m ON m.trip_id = b.trip_id AND m.user_id = $1`,
+    [userId],
+  );
+  for (const row of candidates.rows) {
+    const id = row.chat_id;
+    if (id && isPrivateChatId(id) && digestTelegramId(id) === digest) return id;
+  }
+  return null;
 }
 
 export interface OrganizerTrip {

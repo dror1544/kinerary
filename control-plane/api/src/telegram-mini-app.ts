@@ -755,36 +755,14 @@ export async function unlinkTelegramLink(db: pg.Pool, userId: string, linkId: st
       );
       if (!revoked.rowCount) { await client.query("ROLLBACK"); return false; }
     } else {
-      const revoked = await client.query<{ telegram_subject_digest: string; trip_id: string }>(
-        `UPDATE control_plane.telegram_organizer_trip_links
-            SET revoked_at = now(), revoked_reason = 'owner_unlinked', revoked_by = $2
-          WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
-          RETURNING telegram_subject_digest, trip_id`,
-        [linkId, userId],
-      );
-      const row = revoked.rows[0];
-      if (!row) { await client.query("ROLLBACK"); return false; }
-      await retireAccountWideLink(client, userId, row.telegram_subject_digest);
-      await closeChatHold(client, userId, row.telegram_subject_digest, row.trip_id);
-      // The bot's own organizer fact for this sender on this trip (migration 0051's person link,
-      // written at provisioning from whoever ran the interview) is demoted too: an Unlink must take
-      // the organizer powers the link gave, not only the Mini App (boundary review R1).
+      if (!(await revokeOrganizerLinkInTx(client, userId, linkId))) { await client.query("ROLLBACK"); return false; }
+    }
+    if (kind === "member") {
       await client.query(
-        `UPDATE control_plane.trip_person_links SET role = 'participant', demoted_from_role = 'organizer'
-          WHERE trip_id = $2 AND role = 'organizer' AND telegram_user_id ~ '^[0-9]{1,20}$'
-            AND ${CHAT_DIGEST_SQL("telegram_user_id")} = $1
-            -- the same guard as the membership-end trigger: another user's live link of this
-            -- Telegram account to this trip still stands, so the account is still an organizer there
-            AND NOT EXISTS (
-              SELECT 1 FROM control_plane.telegram_organizer_trip_links l
-               WHERE l.trip_id = $2 AND l.telegram_subject_digest = $1 AND l.revoked_at IS NULL)`,
-        [row.telegram_subject_digest, row.trip_id],
+        "UPDATE control_plane.web_sessions SET revoked_at = now() WHERE telegram_link_id = $1 AND revoked_at IS NULL",
+        [linkId],
       );
     }
-    await client.query(
-      "UPDATE control_plane.web_sessions SET revoked_at = now() WHERE telegram_link_id = $1 AND revoked_at IS NULL",
-      [linkId],
-    );
     await client.query("COMMIT");
     return true;
   } catch (error) {
@@ -793,6 +771,49 @@ export async function unlinkTelegramLink(db: pg.Pool, userId: string, linkId: st
   } finally {
     client.release();
   }
+}
+
+/**
+ * The organizer half of `unlinkTelegramLink`, inside the caller's transaction: the link is revoked in place, the pair's
+ * account-wide row retired, the chat's hold on THIS trip closed, the bot's organizer fact demoted and the web sessions the
+ * link minted ended. `false` for a link that is not the user's or is already gone.
+ *
+ * One body for two callers, so they cannot drift: the owner's Unlink, and an approved replacement (#519,
+ * organizer-link-approval.ts), where the bound Telegram account itself says another one takes over this trip. The second
+ * is recorded exactly like the first (`owner_unlinked`): it is the owner, from the Telegram the account is bound to, taking
+ * the link away, and the dashboard lists it as restorable like any other.
+ */
+export async function revokeOrganizerLinkInTx(client: pg.PoolClient, userId: string, linkId: string): Promise<boolean> {
+  const revoked = await client.query<{ telegram_subject_digest: string; trip_id: string }>(
+    `UPDATE control_plane.telegram_organizer_trip_links
+        SET revoked_at = now(), revoked_reason = 'owner_unlinked', revoked_by = $2
+      WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
+      RETURNING telegram_subject_digest, trip_id`,
+    [linkId, userId],
+  );
+  const row = revoked.rows[0];
+  if (!row) return false;
+  await retireAccountWideLink(client, userId, row.telegram_subject_digest);
+  await closeChatHold(client, userId, row.telegram_subject_digest, row.trip_id);
+  // The bot's own organizer fact for this sender on this trip (migration 0051's person link,
+  // written at provisioning from whoever ran the interview) is demoted too: an Unlink must take
+  // the organizer powers the link gave, not only the Mini App (boundary review R1).
+  await client.query(
+    `UPDATE control_plane.trip_person_links SET role = 'participant', demoted_from_role = 'organizer'
+      WHERE trip_id = $2 AND role = 'organizer' AND telegram_user_id ~ '^[0-9]{1,20}$'
+        AND ${CHAT_DIGEST_SQL("telegram_user_id")} = $1
+        -- the same guard as the membership-end trigger: another user's live link of this
+        -- Telegram account to this trip still stands, so the account is still an organizer there
+        AND NOT EXISTS (
+          SELECT 1 FROM control_plane.telegram_organizer_trip_links l
+           WHERE l.trip_id = $2 AND l.telegram_subject_digest = $1 AND l.revoked_at IS NULL)`,
+    [row.telegram_subject_digest, row.trip_id],
+  );
+  await client.query(
+    "UPDATE control_plane.web_sessions SET revoked_at = now() WHERE telegram_link_id = $1 AND revoked_at IS NULL",
+    [linkId],
+  );
+  return true;
 }
 
 /**
