@@ -37,6 +37,26 @@ non-revoked Telegram identity: an organizer link for that user, or a Telegram
 identity on the account. The builder names the exact source and uses one
 definition everywhere.
 
+### Decisions after the boundary review (Dror, 2026-11-06)
+
+- **An approval counts for that trip only.** When the organizer approves another
+  Telegram account for trip A, that account becomes the organizer's Telegram
+  for A only. For the account's other trips it is not "bound": opening a link
+  for another trip follows that trip's rule (refused, or the organizer is asked).
+  The approval prompt says so.
+- **The one exception: the dashboard's signed-in "link my Telegram" link**
+  (`lk_`, `telegram-link-token.ts`). It adds a Telegram account to its own trip
+  without approval, because it is the signed-in owner's own act and the way back
+  after a lost phone. It counts for that trip only, so a leaked dashboard link
+  cannot open the account's other trips.
+- So account-wide "bound" = the account's Telegram sign-up identity plus links
+  created by an ordinary redemption of the account's own interview links. Links
+  from an approval or a dashboard link count for their own trip only.
+- Typed approve/decline is ignored while the organizer's chat has a live
+  interview (the words go to the interview), and the Hebrew "אישור" is not an
+  approve word: it is the recap's own button label. Found by the boundary review
+  (F1).
+
 ## Acceptance criteria
 
 - AC-1 Given an organizer account with no bound Telegram, when a link is opened
