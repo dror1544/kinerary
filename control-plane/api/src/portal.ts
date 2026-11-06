@@ -3,7 +3,7 @@ import { promisify } from "node:util";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type pg from "pg";
 import { OAuth2Client } from "google-auth-library";
-import { issueEnrollment, replaceEnrollment } from "./enrollment.js";
+import { issueEnrollment, pausedInterviewSessionId, pausedInterviewSessionSql, replaceEnrollment } from "./enrollment.js";
 import { ensureUnknownPasswordCredential, hashPassword, resolveOrCreateEmailAccount, verifyPasswordLogin } from "./password-identity.js";
 import type { Mailer } from "./mailer.js";
 import {
@@ -618,7 +618,7 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
   );
   const trip = tripResult.rows[0];
   if (!trip) return null;
-  const [planResult, sessionResult, routeResult, invitesResult] = await Promise.all([
+  const [planResult, sessionResult, routeResult, invitesResult, pausedSessionId] = await Promise.all([
     deps.db.query<{ id: string; status: string; digest: string; release_id: string | null; job_state: string | null; safe_error_code: string | null }>(
       `SELECT p.id, p.status, p.digest, p.release_id, j.state AS job_state, j.safe_error_code
        FROM control_plane.plans p
@@ -628,6 +628,8 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
     deps.db.query<{ state: string }>("SELECT state FROM control_plane.runtime_routes WHERE trip_id = $1", [tripId]),
     deps.db.query<{ id: string; intended_display_name: string; runtime_username: string; state: string; expires_at: Date; created_at: Date }>(
       "SELECT id, intended_display_name, runtime_username, state, expires_at, created_at FROM control_plane.site_invites WHERE trip_id = $1 ORDER BY created_at DESC", [tripId]),
+    // Only a trip still being interviewed can be paused; a built one never is, whatever sessions it holds.
+    trip.lifecycle_state === "draft" || trip.lifecycle_state === "intake_in_progress" ? pausedInterviewSessionId(deps.db, tripId) : Promise.resolve(null),
   ]);
   const plan = planResult.rows[0];
   const runtimeReady = routeResult.rows[0]?.state === "ready";
@@ -668,7 +670,12 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
       invite: trip.role === "owner" || trip.role === "organizer",
       requestProvisioning: trip.role === "owner",
     },
-    interview: sessionResult.rows[0] ? { sessionId: sessionResult.rows[0].id, state: sessionResult.rows[0].state } : null,
+    // `paused` (#513): the session closed for idleness and nothing else holds the trip, so the page offers a NEW
+    // link rather than "Continue in Telegram" to a chat that has stopped listening. Read from the one definition
+    // `issueEnrollment` and `replaceEnrollment` share, so what the page offers is what the routes will accept.
+    interview: sessionResult.rows[0]
+      ? { sessionId: sessionResult.rows[0].id, state: sessionResult.rows[0].state, paused: pausedSessionId !== null }
+      : null,
     provisioning: plan ? {
       planId: plan.id, planStatus: plan.status, jobState: plan.job_state,
       releaseId: plan.release_id, digest: plan.digest, safeErrorCode: plan.safe_error_code,
@@ -1460,14 +1467,15 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     // A LIVE interview is one the organizer can still answer in: a confirmed one, or one that has not
     // expired. An unconfirmed session whose `expired_at` is set is closed -- the bot tells whoever writes
     // to it so -- and counting it made the page offer "Continue in Telegram" to a chat that had stopped
-    // listening (#513). `has_session` is the older, wider question (any session at all) and is what
-    // `replaceEnrollment` still refuses on, so it alone decides `recoverable`: the page must never be
-    // offered a replacement the route would then answer INTERVIEW_ALREADY_STARTED.
-    const result = await deps.db.query<{ lifecycle_state: string; id: string | null; expires_at: Date | null; has_interview: boolean; has_session: boolean }>(
+    // listening (#513). That is the very fact `replaceEnrollment` refuses on (a live or confirmed session
+    // is INTERVIEW_ALREADY_STARTED; a closed one is a paused interview it will replace the link for), so
+    // `has_interview` alone decides `recoverable`: the page must never be offered a replacement the route
+    // would then refuse. `paused` lets an `intake_in_progress` trip be replaceable, as the route allows.
+    const result = await deps.db.query<{ lifecycle_state: string; id: string | null; expires_at: Date | null; has_interview: boolean; paused: boolean }>(
       `SELECT t.lifecycle_state,e.id,e.expires_at,
          EXISTS(SELECT 1 FROM control_plane.intake_sessions s WHERE s.trip_id=t.id
                   AND (s.state='confirmed' OR s.expired_at IS NULL)) AS has_interview,
-         EXISTS(SELECT 1 FROM control_plane.intake_sessions s WHERE s.trip_id=t.id) AS has_session
+         (${pausedInterviewSessionSql("t.id")} IS NOT NULL) AS paused
        FROM control_plane.trips t
        JOIN control_plane.trip_memberships m ON m.trip_id=t.id
        LEFT JOIN control_plane.interview_enrollments e ON e.trip_id=t.id AND e.state='issued' AND e.expires_at>now()
@@ -1475,7 +1483,7 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     const row = result.rows[0]; if (!row) return reply.code(404).send({ error: "NOT_FOUND" });
     return reply.header("cache-control", "private, no-store").send({
       activeEnrollment: row.id ? { id: row.id, expiresAt: row.expires_at!.toISOString() } : null,
-      recoverable: Boolean(row.id) && row.lifecycle_state === "draft" && !row.has_session,
+      recoverable: Boolean(row.id) && !row.has_interview && (row.lifecycle_state === "draft" || (row.lifecycle_state === "intake_in_progress" && row.paused)),
       hasInterview: row.has_interview,
       telegramChatUrl: `https://t.me/${deps.telegramBotUsername}`,
     });

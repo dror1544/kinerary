@@ -117,6 +117,39 @@ it("directs an existing interview to its chat without offering replacement", asy
   expect(screen.queryByRole('button', { name: 'Replace lost interview link' })).toBeNull();
   expect(screen.queryByRole('button', { name: 'Prepare Telegram interview' })).toBeNull();
 });
+// #513 AC-1: an interview that closed for idleness is paused. The page says so and offers a NEW link; it does not send
+// the organizer to "Continue in Telegram" (a chat that has stopped listening) or to "Replace lost interview link".
+it("a paused interview offers a new link, not Continue in Telegram or Replace, and shows the issued link", async () => {
+  const posts: string[] = [];
+  mount(`/trips/${trip.id}`, (url, init) => {
+    if (url === '/v1/me') return json({ id: 'user_existing', displayName: 'Organizer' });
+    if (url.endsWith('/interview-link')) {
+      if (init?.method === 'POST') { posts.push(url); return json({ enrollmentId: 'enrl_abcdefgh', deepLink: 'https://t.me/example_bot?start=resume-token', expiresAt: '2027-03-01' }, 201); }
+      return json({ activeEnrollment: null, recoverable: false, hasInterview: false, telegramChatUrl: 'https://t.me/example_bot' });
+    }
+    return json({ ...trip, lifecycleState: 'intake_in_progress', interview: { sessionId: 'sess_existing', state: 'interviewing', paused: true } });
+  });
+  const button = await screen.findByRole('button', { name: 'Get a new interview link' });
+  expect(screen.getByText(/Your interview is paused/)).toBeInTheDocument();
+  expect(screen.getByText(/Interview paused/)).toBeInTheDocument();
+  expect(screen.queryByRole('link', { name: 'Continue in Telegram' })).toBeNull();
+  expect(screen.queryByRole('button', { name: 'Replace lost interview link' })).toBeNull();
+  expect(screen.queryByRole('button', { name: 'Prepare Telegram interview' })).toBeNull();
+  fireEvent.click(button);
+  expect(await screen.findByRole('link', { name: 'Open Telegram interview' })).toHaveAttribute('href', 'https://t.me/example_bot?start=resume-token');
+  expect(posts).toEqual([`/v1/trips/${trip.id}/interview-link`]);
+  expect(screen.queryByRole('button', { name: 'Get a new interview link' })).toBeNull();
+});
+it("a live interview still says Continue in Telegram, and a Telegram-minted session is not offered the paused button", async () => {
+  mount(`/trips/${trip.id}`, url => url === '/v1/me' ? json({ id: 'user_existing', displayName: 'Organizer' }) : url.endsWith('/interview-link') ? json({ activeEnrollment: null, recoverable: false, hasInterview: true, telegramChatUrl: 'https://t.me/example_bot' }) : json({ ...trip, lifecycleState: 'intake_in_progress', interview: { sessionId: 'sess_existing', state: 'interviewing', paused: false } }));
+  expect(await screen.findByRole('link', { name: 'Continue in Telegram' })).toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Get a new interview link' })).toBeNull();
+});
+it("a session minted by Telegram is not offered the new-link button for a paused interview", async () => {
+  mount(`/trips/${trip.id}`, url => url === '/v1/me' ? json({ id: 'user_existing', displayName: 'Organizer', scope: 'telegram' }) : url.endsWith('/interview-link') ? json({ activeEnrollment: null, recoverable: false, hasInterview: false, telegramChatUrl: 'https://t.me/example_bot' }) : json({ ...trip, lifecycleState: 'intake_in_progress', interview: { sessionId: 'sess_existing', state: 'interviewing', paused: true } }));
+  expect(await screen.findByText(/to prepare or replace an interview link, sign in with your password/)).toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Get a new interview link' })).toBeNull();
+});
 it("offers ordinary preparation after the conflicting link has expired", async () => {
   mount(`/trips/${trip.id}`, (url, init) => url === '/v1/me' ? json({ id: 'user_existing', displayName: 'Organizer' }) : url.endsWith('/interview-link') ? init?.method === 'POST' ? json({ error: 'ACTIVE_ENROLLMENT_EXISTS' }, 409) : json({ activeEnrollment: null, recoverable: false, hasInterview: false, telegramChatUrl: 'https://t.me/example_bot' }) : json(trip));
   fireEvent.click(await screen.findByRole('button', { name: 'Prepare Telegram interview' }));

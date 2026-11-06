@@ -7,8 +7,8 @@ import { assertCanonicalRecordSafe, UnsafeCanonicalRecordError } from "./canonic
 // fan-out UPDATE has to address the very rows saveConsularContacts writes here —
 // see country-key.ts for what divergence costs.
 import { normaliseCountryKey as normaliseCountry } from "./country-key.js";
-import { consumeEnrollmentInTx } from "./enrollment.js";
-import { isPrivateChatId, type TelegramName } from "./identity.js";
+import { consumeEnrollmentInTx, pausedInterviewSessionId } from "./enrollment.js";
+import { digestTelegramId, isPrivateChatId, type TelegramName } from "./identity.js";
 import { linkTelegramOrganizerInTx } from "./organizer-trips.js";
 import {
   coerceLanguage,
@@ -1569,6 +1569,22 @@ export async function claimExpiredSessions(db: pg.Pool, limit = 10): Promise<Exp
  * whole interview was in Hebrew, is its own small insult.
  */
 export async function expiredSessionLanguage(db: pg.Pool, chatId: string): Promise<Language | null> {
+  return (await expiredSessionNotice(db, chatId))?.language ?? null;
+}
+
+/**
+ * `expiredSessionLanguage`, and whether the person this closed interview belongs to has a dashboard (#513, AC-7).
+ *
+ * The notice sent to someone who writes into a closed interview has to point at the one door that opens it. For an
+ * organizer with a dashboard that is the trip's page there ("get a new interview link"); for a trip made by Telegram
+ * signup or an operator's invitation there is no page, and the door is whoever set the trip up. `dashboard` is read
+ * from the closed session's own trip and user -- the owner membership that carries `dashboard_access` -- never from
+ * anything the chat says.
+ */
+export async function expiredSessionNotice(
+  db: pg.Pool,
+  chatId: string,
+): Promise<{ language: Language; dashboard: boolean } | null> {
   // The NOT EXISTS is load-bearing, and getting it wrong locks people out: a
   // new deep link creates a NEW session and leaves the expired one where it
   // is, so a query that only asks "is there an expired session here" would
@@ -1581,8 +1597,14 @@ export async function expiredSessionLanguage(db: pg.Pool, chatId: string): Promi
   // this chat was never told that a later interview had closed (#513). A
   // confirmed session does not answer for the chat -- every reader of the live
   // session filters `state <> 'confirmed'` the same way.
-  const rows = await db.query<{ language: Language }>(
-    `SELECT s.language
+  const rows = await db.query<{ language: Language; dashboard: boolean }>(
+    `SELECT s.language,
+            EXISTS (
+              SELECT 1 FROM control_plane.trip_memberships m
+                JOIN control_plane.users u ON u.id = m.user_id
+               WHERE m.trip_id = s.trip_id AND m.user_id = s.user_id
+                 AND m.role = 'owner' AND m.status = 'active' AND m.dashboard_access = true AND u.status = 'active'
+            ) AS dashboard
        FROM control_plane.intake_sessions s
       WHERE s.telegram_chat_id = $1
         AND s.expired_at IS NOT NULL
@@ -1601,7 +1623,7 @@ export async function expiredSessionLanguage(db: pg.Pool, chatId: string): Promi
   // unknown", and the caller reads null as the first: the guard would never
   // fire for exactly the sessions most likely to hit it. Found by the test,
   // not by reading the code.
-  return row.language ?? DEFAULT_LANGUAGE;
+  return { language: row.language ?? DEFAULT_LANGUAGE, dashboard: row.dashboard === true };
 }
 
 export function interpretPathDefault(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -2080,6 +2102,12 @@ export interface InterviewUiState {
    * never stored, like the organizer-name confirm) does not come back.
    */
   knownStopDeclined?: boolean;
+  /**
+   * This session started on a paused trip whose earlier answers were NOT handed to it (#513: a link opened from a chat
+   * that was not the interview's). When it closes it must not become the session a later link resumes from; only the
+   * chat it ran in may resume it. Never carried to a successor.
+   */
+  notResumable?: boolean;
 }
 
 /** A suggested answer, in the shape `submitAnswerForChat` takes. */
@@ -2166,6 +2194,7 @@ function parseUiState(raw: unknown): InterviewUiState {
     ...(typeof record.organizer_name === "string" && record.organizer_name.length > 0 ? { organizerName: record.organizer_name } : {}),
     ...(record.organizer_name_declined === true ? { organizerNameDeclined: true } : {}),
     ...(record.known_stop_declined === true ? { knownStopDeclined: true } : {}),
+    ...(record.not_resumable === true ? { notResumable: true } : {}),
   };
 }
 
@@ -2191,7 +2220,48 @@ function serializeUiState(ui: InterviewUiState): string {
     ...(ui.organizerName ? { organizer_name: ui.organizerName } : {}),
     ...(ui.organizerNameDeclined ? { organizer_name_declined: true } : {}),
     ...(ui.knownStopDeclined ? { known_stop_declined: true } : {}),
+    ...(ui.notResumable ? { not_resumable: true } : {}),
   });
+}
+
+/**
+ * What a resumed interview (#513) takes from the closed session's `ui_state`: the organizer's own decisions, and
+ * nothing that was only on screen. The rule is "nothing already answered is asked again", so a fact belongs here when
+ * dropping it would put a question the organizer had settled back in front of them.
+ *
+ * CARRIED -- each is the organizer's word, or a record that a question was put to them:
+ *   organizerName          the name the opening greeted them by; read again when the roster is known
+ *   organizerNameDeclined  they said "no" to "which of them are you?": asked plainly from here on, not re-offered
+ *   knownStopDeclined      they said "no" to "is that the only stop?": `phases` stays an open question
+ *   skipped                optional questions they declined (final)
+ *   finishRequested        "that's everything": the summary, not the optional walk, is where they stopped
+ *   offeredMore            "essentials done: more, or the summary?" was already put to them
+ *   flightsAsked           typed flights already asked about ("once is enough")
+ *   typedFlights           the flights they typed, which `flightsAsked` is a record about
+ *   multiPending           a multi-select they were still ticking: its stored selection is NOT an answer until Done
+ *
+ * NOT CARRIED -- on screen, in flight, or derived per read; each would assert something that is no longer true:
+ *   lastPrompt, pendingEntry, pendingAsk, pendingAskText, pendingSay   what was on screen / owed at the moment of
+ *     closing; carrying `lastPrompt` would make the router believe the question is still on their screen and say nothing
+ *   suggestions            built from documents and the roster per read; a stale confirm would be asked against old data
+ *   recapMarker            "the recap is what they just read": alive for one message, never a state to resume from
+ *   otherPending           an Other button tapped before the pause; its next message is long gone
+ *   readingDocumentSince   a read that was running when the session closed is not running now
+ *   deferred               required questions stepped aside to stop repeating; after a pause they are simply asked
+ *   openingDone            set by the caller: the opening is over by definition
+ */
+function carriedUiState(ui: InterviewUiState): InterviewUiState {
+  return {
+    ...(ui.organizerName ? { organizerName: ui.organizerName } : {}),
+    ...(ui.organizerNameDeclined ? { organizerNameDeclined: true } : {}),
+    ...(ui.knownStopDeclined ? { knownStopDeclined: true } : {}),
+    ...(ui.skipped && ui.skipped.length > 0 ? { skipped: ui.skipped } : {}),
+    ...(ui.finishRequested ? { finishRequested: true } : {}),
+    ...(ui.offeredMore ? { offeredMore: true } : {}),
+    ...(ui.flightsAsked && ui.flightsAsked.length > 0 ? { flightsAsked: ui.flightsAsked } : {}),
+    ...(ui.typedFlights && ui.typedFlights.length > 0 ? { typedFlights: ui.typedFlights } : {}),
+    ...(ui.multiPending ? { multiPending: ui.multiPending } : {}),
+  };
 }
 
 function isSkipped(ui: InterviewUiState, questionId: string): boolean {
@@ -2649,6 +2719,11 @@ export type StartSessionResult =
       view: SessionView;
       /** Set only when the trip's card seeded the destination or the dates; absent for every other trip. */
       seeded?: SeededOpening;
+      /**
+       * Set when this session picks up a PAUSED one (#513): it holds the earlier session's answers, and its opening
+       * is "welcome back" rather than the introduction. Never set together with `seeded`.
+       */
+      resumed?: { fromSessionId: string };
     }
   | { ok: false; reason: "INVALID_TOKEN" | "EXPIRED" | "ALREADY_CONSUMED" | "REVOKED" | "TRIP_NOT_DRAFT" };
 
@@ -2768,13 +2843,65 @@ export async function startSession(
       [enrollment.tripId],
     );
     const [trip] = tripRow.rows;
-    if (!trip || trip.lifecycle_state !== "draft") {
+    // A draft starts an interview; so does a trip whose interview is PAUSED (#513) -- `intake_in_progress` with its
+    // latest session closed for idleness and nothing live or confirmed beside it. The pause is read under the trip
+    // lock just taken, so two links redeemed at once cannot both resume it: the second finds a live session.
+    const pausedId = trip && (trip.lifecycle_state === "draft" || trip.lifecycle_state === "intake_in_progress")
+      ? await pausedInterviewSessionId(client, enrollment.tripId)
+      : null;
+    if (!trip || !(trip.lifecycle_state === "draft" || (trip.lifecycle_state === "intake_in_progress" && pausedId !== null))) {
       await client.query("ROLLBACK");
       return { ok: false, reason: "TRIP_NOT_DRAFT" };
     }
-    const seed = seedAnswersFromCard({
+    // WHOSE ANSWERS THESE ARE. The paused interview is the owner's, and a link can be forwarded: whoever opens it
+    // would otherwise be handed the travellers, the dietary needs and the flights, and a summary built from them.
+    // The trip may be resumed by anyone the link reaches only in the sense that a session starts; the answers are
+    // carried only to the person who gave them -- the session's own user, redeeming from the chat that interview ran
+    // in, or from a Telegram account already linked to this trip for this user BEFORE this redemption (the link row
+    // for this redemption is written further down, so it cannot vouch for itself). Otherwise the session starts
+    // fresh, from the card, with the ordinary opening. The pause itself stays a per-trip fact (`pausedId`).
+    let resumeDeclined: "NOT_THE_SESSION_USER" | "CHAT_NOT_THE_OWNERS" | null = null;
+    //
+    // WHICH session is carried is therefore this redeemer's, not simply the trip's latest: a start that was declined
+    // (a forwarded link) is itself a closed session of the same user, newer than the owner's, and must not become the
+    // thing the owner resumes from. Such a session is marked `notResumable`; only the chat it ran in may resume it.
+    let prior: { id: string; answers: AnswerStore; ui_state: unknown; language: string | null; source_document: unknown } | null = null;
+    if (pausedId) {
+      const candidates = (await client.query<{
+        id: string; answers: AnswerStore; ui_state: unknown; language: string | null; source_document: unknown; telegram_chat_id: string | null;
+      }>(
+        `SELECT id, answers, ui_state, language, source_document, telegram_chat_id FROM control_plane.intake_sessions
+          WHERE trip_id = $1 AND user_id = $2 AND state <> 'confirmed' AND expired_at IS NOT NULL
+          ORDER BY expired_at DESC, created_at DESC`,
+        [enrollment.tripId, enrollment.userId],
+      )).rows;
+      const redeemingChat = verifiedTelegramChatId && isPrivateChatId(verifiedTelegramChatId) ? verifiedTelegramChatId : null;
+      if (candidates.length === 0) {
+        resumeDeclined = "NOT_THE_SESSION_USER";
+      } else if (!redeemingChat) {
+        // No verified chat (the HTTP/MCP path): nothing proves who is asking.
+        resumeDeclined = "CHAT_NOT_THE_OWNERS";
+      } else {
+        const linked = (await client.query(
+          `SELECT 1 FROM control_plane.telegram_organizer_trip_links
+            WHERE telegram_subject_digest = $1 AND user_id = $2 AND trip_id = $3 AND revoked_at IS NULL LIMIT 1`,
+          [digestTelegramId(redeemingChat), enrollment.userId, enrollment.tripId],
+        )).rowCount;
+        // A declined start is its own chat's, and only until that chat is itself vouched for as the trip's organizer:
+        // from then on the redeemer is entitled to the owner's real session, which a declined one would otherwise shadow.
+        prior = candidates.find((c) => parseUiState(c.ui_state).notResumable
+          ? c.telegram_chat_id === redeemingChat && !linked
+          : c.telegram_chat_id === redeemingChat || linked) ?? null;
+        if (!prior) resumeDeclined = "CHAT_NOT_THE_OWNERS";
+      }
+    }
+    const cardSeed = seedAnswersFromCard({
       destination: trip.destination_label, startDate: trip.start_date, endDate: trip.end_date, tripType: trip.trip_type,
     });
+    // The card seeds only what is still unanswered: a carried answer is the organizer's own and is never overwritten
+    // by the card (#438 AC-4 still holds, and so does #513 AC-5). Own keys, so "constructor" is not an answer.
+    const carriedAnswers: AnswerStore = prior?.answers && typeof prior.answers === "object" ? prior.answers : {};
+    const seed: AnswerStore = Object.fromEntries(Object.entries(cardSeed).filter(([questionId]) => !Object.hasOwn(carriedAnswers, questionId)));
     const seededIds = Object.keys(seed);
 
     // Transition trip to 'intake_in_progress'.
@@ -2815,7 +2942,9 @@ export async function startSession(
     // A hint, not a decision. It is the phone's setting rather than what the
     // organizer is actually writing, so `setLanguageForChat` overrides it the
     // moment the interviewer reports what they really typed.
-    const language = coerceLanguage(languageHint);
+    // A resumed interview speaks the language the closed one was held in: the phone's setting is a guess, and the
+    // organizer has already shown what they actually write.
+    const language = (prior ? coerceLanguage(prior.language) : null) ?? coerceLanguage(languageHint);
 
     // The name the opening greets the organizer by (#438): the name they gave the product (`users.given_name`), and
     // only when the account has none, the first name of the Telegram account that opened the link. NEVER
@@ -2830,15 +2959,44 @@ export async function startSession(
       );
       organizerName = named.rows[0]?.given_name?.trim() || telegramName?.firstName?.trim() || null;
     }
-    const uiState: InterviewUiState = organizerName ? { organizerName } : {};
+    const carriedUi = prior ? carriedUiState(parseUiState(prior.ui_state)) : {};
+    const uiState: InterviewUiState = {
+      ...carriedUi,
+      ...(organizerName && !carriedUi.organizerName ? { organizerName } : {}),
+      // The opening of a resumed interview is over before it begins: the document offer is not made twice.
+      ...(prior ? { openingDone: true } : {}),
+      // A start the owner's answers were withheld from: when it closes it is not where the owner resumes from.
+      ...(resumeDeclined ? { notResumable: true } : {}),
+      // A start the owner's answers were withheld from: when it closes it is not where the owner resumes from.
+    };
+    const answers: AnswerStore = { ...seed, ...carriedAnswers };
+    // Where the interview stands, derived from what it now holds -- the same fixpoint `advancePhaseForChat` runs. A
+    // fresh session is `opening`, as always; a resumed one lands on its first unanswered question (or the summary).
+    let phase: InterviewPhase = "opening";
+    if (prior) {
+      for (let step = 0; step < INTERVIEW_PHASES.length; step += 1) {
+        const next = nextPhase(phase, answers, INTAKE_QUESTIONS, uiState);
+        if (next === phase) break;
+        phase = next;
+      }
+    }
+    const storedState = stateForPhase(phase);
 
     await client.query(
       `INSERT INTO control_plane.intake_sessions
-         (id, trip_id, user_id, enrollment_id, session_token_digest, state, answers, telegram_chat_id, language, interpret_path, ui_state)
-       VALUES ($1, $2, $3, $4, $5, 'interviewing', $9::jsonb, $6, $7, $8, $10::jsonb)`,
+         (id, trip_id, user_id, enrollment_id, session_token_digest, state, answers, telegram_chat_id, language, interpret_path, ui_state,
+          phase, awaiting, source_document, router_prompt_due_at)
+       VALUES ($1, $2, $3, $4, $5, $11, $9::jsonb, $6, $7, $8, $10::jsonb,
+               $12, $13, $14::jsonb, CASE WHEN $15::boolean THEN now() ELSE NULL END)`,
       [
         sessionId, enrollment.tripId, enrollment.userId, enrollment.enrollmentId, digest, chatId, language, interpretPathDefault(),
-        JSON.stringify(seed), serializeUiState(uiState),
+        JSON.stringify(answers), serializeUiState(uiState),
+        storedState, phase,
+        // A resumed session owes its organizer the next question, so the floor is the machine's and the router's
+        // prompt is due: what they are sent first is the one-line welcome back, and the question follows it.
+        prior ? "machine" : "person",
+        prior?.source_document ? JSON.stringify(prior.source_document) : null,
+        Boolean(prior),
       ],
     );
 
@@ -2861,6 +3019,17 @@ export async function startSession(
     await client.query("COMMIT");
 
     log(structuredLog("info", "interview.session_started", { session_id: sessionId, trip_id: enrollment.tripId }));
+    if (resumeDeclined) {
+      // The reason only: no answer, name or chat id.
+      log(structuredLog("info", "interview.resume_declined", { session_id: sessionId, trip_id: enrollment.tripId, reason: resumeDeclined }));
+    }
+    if (prior && pausedId) {
+      // Question ids only, as with the seed: what was carried is the organizer's, and a log line is not.
+      log(structuredLog("info", "interview.session_resumed", {
+        session_id: sessionId, trip_id: enrollment.tripId, from_session_id: prior.id,
+        carried: Object.keys(carriedAnswers), phase,
+      }));
+    }
     // Question ids only: the values are the organizer's trip and the name is theirs, and a log line is neither.
     if (seededIds.length > 0) {
       log(structuredLog("info", "interview.session_seeded", { session_id: sessionId, trip_id: enrollment.tripId, seeded: seededIds }));
@@ -2868,10 +3037,12 @@ export async function startSession(
     // The other half of the same fact, so a card whose values were NOT taken is not invisible: a destination or a
     // date the card holds that the interview refused is asked as today, and this line says it was. (A `group` or
     // `other` trip type is a decision, not a refusal, and is not listed.) Question ids only.
+    // Measured against the card's own seed, not the one left after a carried answer took its place: an answer the
+    // organizer already gave is not a refusal.
     const refused = [
-      trip.destination_label !== null && seed.destination === undefined ? "destination" : null,
-      trip.start_date !== null && seed.departure_date === undefined ? "departure_date" : null,
-      trip.end_date !== null && seed.return_date === undefined ? "return_date" : null,
+      trip.destination_label !== null && cardSeed.destination === undefined ? "destination" : null,
+      trip.start_date !== null && cardSeed.departure_date === undefined ? "departure_date" : null,
+      trip.end_date !== null && cardSeed.return_date === undefined ? "return_date" : null,
     ].filter((id): id is string => id !== null);
     if (refused.length > 0) {
       log(structuredLog("warn", "interview.session_seed_skipped", { session_id: sessionId, trip_id: enrollment.tripId, skipped: refused }));
@@ -2879,7 +3050,9 @@ export async function startSession(
 
     // Built from the answers the session now holds, so "the first question" is the first one still OPEN. For a trip
     // with no card that is exactly the first required question, as before.
-    const view: SessionView = seededIds.length === 0
+    const view: SessionView = prior
+      ? buildSessionView(sessionId, enrollment.tripId, storedState, answers, uiState, language ?? DEFAULT_LANGUAGE, phase, "machine")
+      : seededIds.length === 0
       ? {
           sessionId,
           tripId: enrollment.tripId,
@@ -2910,6 +3083,7 @@ export async function startSession(
             organizerName,
           }
         : undefined;
+    if (prior && pausedId) return { ok: true, sessionId, sessionToken: rawSessionToken, view, resumed: { fromSessionId: prior.id } };
     return { ok: true, sessionId, sessionToken: rawSessionToken, view, ...(opening ? { seeded: opening } : {}) };
   } catch (error) {
     try { await client.query("ROLLBACK"); } catch { /* ignore */ }

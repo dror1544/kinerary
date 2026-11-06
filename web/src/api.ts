@@ -32,7 +32,8 @@ export type TripSummary = {
   tripType: string;
   lifecycleState: string;
   nextAction: string;
-  interview: { sessionId: string; state: string } | null;
+  /** `paused` (#513): the interview closed for idleness; a new link picks it up where it stopped. Absent from older servers. */
+  interview: { sessionId: string; state: string; paused?: boolean } | null;
   provisioning: { planId: string; planStatus: string; jobState: string | null; releaseId: string | null; digest: string; safeErrorCode: string | null } | null;
   runtimeReady: boolean;
   permissions: { role: string; dashboard: boolean; runtime: boolean; invite: boolean; requestProvisioning: boolean };
@@ -130,7 +131,7 @@ const telegramSchema = z.object({ links: z.array(telegramLinkSchema), unlinked: 
 const tripSchema: z.ZodType<TripSummary> = z.object({
   id: z.string(), title: z.string(), destination: z.string().nullable(), startDate: z.string().nullable(), endDate: z.string().nullable(),
   tripType: z.string(), lifecycleState: z.string(), nextAction: z.string(),
-  interview: z.object({ sessionId: z.string(), state: z.string() }).nullable(),
+  interview: z.object({ sessionId: z.string(), state: z.string(), paused: z.boolean().optional() }).nullable(),
   provisioning: z.object({ planId: z.string(), planStatus: z.string(), jobState: z.string().nullable(), releaseId: z.string().nullable(), digest: z.string(), safeErrorCode: z.string().nullable() }).nullable(),
   runtimeReady: z.boolean(),
   permissions: z.object({ role: z.string(), dashboard: z.boolean(), runtime: z.boolean(), invite: z.boolean(), requestProvisioning: z.boolean() }),

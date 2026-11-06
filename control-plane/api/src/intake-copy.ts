@@ -702,6 +702,13 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // for a button that does not exist.
     expiredWriteAfter:
       "This conversation has closed, so I can't add that to your trip. Opening a fresh interview link will pick things up again — the same kind of link that started us off. Ask whoever set your trip up for a new one, and everything you've already told me will still be there.",
+    // The same notice for an organizer who has a dashboard (#513, AC-7): the new link is theirs to get, there, so
+    // sending them to "whoever set the trip up" would point at themselves. Said only where that door exists.
+    expiredWriteAfterDashboard:
+      "This conversation has closed, so I can't add that to your trip. Open the trip on the dashboard and get a new interview link there — opening it picks things up again, and everything you've already told me will still be there.",
+    // The one line a resumed interview opens with (#513, AC-4): before the next question, instead of the
+    // introduction. They have met the introduction; what they want to know is that nothing was lost.
+    resumedOpening: "Welcome back — let's pick up where we stopped.",
     // ── /trips and /switch ──────────────────────────────────────────────
     // One shared bot serves every trip, so "which one is this chat on?" has no
     // answer visible anywhere in the conversation. These are that answer.
@@ -978,6 +985,9 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     expired: "סגרתי את השיחה בינתיים — כל מה שסיפרתם שמור, שום דבר לא הלך לאיבוד. כדי להמשיך צריך קישור ראיון חדש; בקשו ממי שהקים לכם את הטיול ונמשיך בדיוק מאיפה שעצרנו.",
     expiredWriteAfter:
       "השיחה הזו נסגרה, אז אני לא יכול להוסיף את זה לטיול. קישור הפעלה חדש לראיון יחזיר אותנו לאן שהיינו — אותו סוג קישור שפתח לנו את השיחה. בקשו קישור חדש ממי שהקים לכם את הטיול, וכל מה שכבר סיפרתם עדיין יהיה שם.",
+    expiredWriteAfterDashboard:
+      "השיחה הזו נסגרה, אז אני לא יכול להוסיף את זה לטיול. היכנסו לטיול בלוח הבקרה וקבלו שם קישור חדש לראיון — כשתפתחו אותו נמשיך מאיפה שעצרנו, וכל מה שכבר סיפרתם עדיין יהיה שם.",
+    resumedOpening: "ברוכים השבים — ממשיכים מאיפה שעצרנו.",
     tripsHeader: "הטיולים שלך:",
     tripsCurrent: "← הצ׳אט הזה",
     tripsFooter: "בחרו אחד כדי לחבר אליו את הצ׳אט הזה.",

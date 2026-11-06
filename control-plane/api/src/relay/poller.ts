@@ -69,7 +69,7 @@ import {
   INTAKE_QUESTIONS,
   claimExpiredSessions,
   claimSessionsDueWarning,
-  expiredSessionLanguage,
+  expiredSessionNotice,
   touchSessionDeadline,
   answersForChat,
   saveSourceDocumentForChat,
@@ -434,13 +434,14 @@ export async function applyDecision(
   // no reply and no reason.
   //
   // Only reached when the chat has NO live session — a fresh deep link makes a
-  // new one and leaves the expired one alone, so `expiredSessionLanguage`
+  // new one and leaves the expired one alone, so `expiredSessionNotice`
   // checks for that. A `/start` never lands here anyway: it is a `reply`
   // decision with its own text, not an interview one.
   if (chatId) {
-    const closedIn = await expiredSessionLanguage(deps.db, chatId);
-    if (closedIn) {
-      await deps.telegram.sendMessage({ chatId, text: uiString("expiredWriteAfter", closedIn) });
+    const closed = await expiredSessionNotice(deps.db, chatId);
+    if (closed) {
+      // An organizer with a dashboard is sent there for the new link; anyone else, to whoever set the trip up (#513).
+      await deps.telegram.sendMessage({ chatId, text: uiString(closed.dashboard ? "expiredWriteAfterDashboard" : "expiredWriteAfter", closed.language) });
       log(structuredLog("info", "interview.write_after_expiry", { chat_id_present: true }));
       return;
     }
