@@ -531,7 +531,10 @@ describe("a paused interview picks up where it stopped (#513)", { skip }, () => 
     // The link was not spent: the owner's own chat resumes with it.
     const ownerReply = await opened(ownerChat, tokenOf(forwarded.json().deepLink));
     assert.equal(ownerReply.text, uiString("resumedOpening", "en"));
-    assert.deepEqual((await liveSession(t.tripId))[0].answers.dietary, { kind: "text", schema_version: 3, text: "OWNER-peanut-allergy" });
+    const resumed = (await liveSession(t.tripId))[0];
+    assert.equal(resumed.telegram_chat_id, ownerChat, "the owner's own chat holds the resumed session, not the stranger's");
+    assert.deepEqual(resumed.answers.dietary, { kind: "text", schema_version: 3, text: "OWNER-peanut-allergy" });
+    assert.equal((await pool.query("SELECT count(*)::int AS n FROM control_plane.telegram_organizer_trip_links WHERE trip_id = $1 AND telegram_subject_digest = $2 AND revoked_at IS NULL", [t.tripId, (await import("../src/identity.js")).digestTelegramId(stranger)])).rows[0].n, 0, "and the stranger was never linked");
     await t.app.close();
   });
 

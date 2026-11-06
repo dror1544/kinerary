@@ -521,6 +521,33 @@ describe("AC-7: only T0, once, only while pending; buttons are shortcuts", { ski
     assert.equal(linkAnswerFromText("yes"), null);
   });
 
+  test("F1: T0 in a LIVE interview types every approve word: the request stays pending and the words reach the interview", async () => {
+    const { t0, t1, trip } = await askScenario({ linkedToTrip: true, leaveInterviewRunning: true });
+    multi(await dispatchUpdate(pool, startUpdate(t1, trip.token)));
+    for (const word of ["approve", "approved", "i approve", "אישור", "מאשר", "מאשרת", "מאשרים", "אשר", "אשרו", "decline", "דחייה", "לא מאשרים"]) {
+      const decision = await dispatchUpdate(pool, textUpdate(t0, word));
+      assert.notEqual(decision.kind, "multi_reply", word);
+      assert.ok(["interview_text", "interview_to_gateway"].includes(decision.kind), `${word}: handed to the interview, got ${decision.kind}`);
+    }
+    assert.equal((await requestsFor(trip.tripId))[0].state, "pending");
+    assert.equal((await liveLinks(trip.tripId, t1)).length, 0);
+    assert.equal((await liveLinks(trip.tripId, t0)).length, 1);
+    assert.equal(await enrollmentState(trip.token), "issued");
+  });
+
+  test("F1: once the interview is over, the same typed word answers the question again", async () => {
+    const { t0, t1, trip } = await askScenario({ leaveInterviewRunning: true });
+    multi(await dispatchUpdate(pool, startUpdate(t1, trip.token)));
+    await pool.query("UPDATE control_plane.intake_sessions SET expired_at = now() WHERE telegram_chat_id = $1 AND expired_at IS NULL", [t0]);
+    multi(await dispatchUpdate(pool, textUpdate(t0, "approve")));
+    assert.equal((await requestsFor(trip.tripId))[0].state, "approved");
+  });
+
+  test("F1: the Hebrew word on the recap's own confirm button is not an approve word", () => {
+    assert.equal(linkAnswerFromText("אישור"), null);
+    assert.equal(linkAnswerFromText("מאשרים"), "approve");
+  });
+
   test("typed 'approve' with nothing pending is ordinary text: no effect, no multi_reply", async () => {
     const { t0 } = await boundOrganizer();
     const decision = await dispatchUpdate(pool, textUpdate(t0, "approve"));

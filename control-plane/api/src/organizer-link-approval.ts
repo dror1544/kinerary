@@ -368,7 +368,7 @@ export async function answerLinkRequest(
  * here, because the same chat may be answering something else (an interview's confirmation), and a bare "yes" must never
  * hand a trip to a stranger. A message that is not exactly one of these is somebody talking, not answering.
  */
-const APPROVE_WORDS = new Set(["approve", "approved", "i approve", "אישור", "מאשר", "מאשרת", "מאשרים", "אשר", "אשרו"]);
+const APPROVE_WORDS = new Set(["approve", "approved", "i approve", "מאשר", "מאשרת", "מאשרים", "אשר", "אשרו"]);
 const DECLINE_WORDS = new Set(["decline", "declined", "deny", "reject", "i decline", "דחייה", "דחיה", "דוחה", "דוחים", "דחה", "דחו", "לא מאשר", "לא מאשרת", "לא מאשרים"]);
 
 export function linkAnswerFromText(text: string): LinkChoice | null {

@@ -825,7 +825,10 @@ export async function dispatchUpdate(
     && String(message.from.id) === chatId
   ) {
     const choice: LinkChoice | null = linkAnswerFromText(parsed.text);
-    if (choice) {
+    // NEVER while this chat has a live interview of its own: there the same words are answers to that interview (the
+    // recap's confirm, "I approve of the plan"), and a typed word must not decide a different trip's question. The buttons
+    // still work from inside an interview; only the typed form waits until it is over (boundary review F1).
+    if (choice && (await resolveChatRoute(db, chatId)).kind !== "interview") {
       const waiting = await pendingRequestIdsForChat(db, chatId);
       if (waiting.length > 0) {
         const language = await resolveChatLanguage(db, chatId, message.from?.language_code);
