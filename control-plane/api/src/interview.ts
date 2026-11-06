@@ -3084,7 +3084,7 @@ export async function startSessionInTx(
     // web session by itself — the Mini App exchange does, from verified
     // initData (telegram-mini-app.ts); /v1/auth/telegram stays retired (410).
     if (chatId) {
-      const written = await linkTelegramOrganizerInTx(client, chatId, enrollment.userId, enrollment.tripId, "enrollment_redemption", telegramName ?? null);
+      const written = await linkTelegramOrganizerInTx(client, chatId, enrollment.userId, enrollment.tripId, "enrollment_redemption", telegramName ?? null, input.approvedReplacement ? "trip" : "account");
       // AC-10: an Unlinked pair is never re-bound by a replacement, approved or not. A plain redemption by the bound
       // account keeps what it always did (the interview starts, the link stays revoked); a replacement exists FOR the
       // link, so without it there is nothing to apply and the whole transaction is the caller's to roll back.

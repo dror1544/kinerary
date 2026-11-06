@@ -127,6 +127,8 @@ function bindingId(): string {
  * the signed-in account as well as the Telegram identity. Other trips are
  * unaffected either way.
  */
+export type OrganizerLinkScope = "account" | "trip";
+
 export type OrganizerLinkWrite =
   /** A new live link row was written. */
   | "linked"
@@ -151,20 +153,26 @@ export async function linkTelegramOrganizerInTx(
   verifiedVia: "enrollment_redemption" | "backfill_intake_session" = "enrollment_redemption",
   /** First name and @username from the update's verified `from` (identity.ts, telegramDisplayName). Display data only. */
   telegramName: TelegramName | null = null,
+  /**
+   * How far the link reaches (migration 20261106130000). `account`: an ordinary redemption of the account's own interview
+   * link, which makes this Telegram the account's. `trip`: the organizer approved this Telegram for THIS trip only, so it
+   * does not speak for the account's other trips.
+   */
+  scope: OrganizerLinkScope = "account",
 ): Promise<OrganizerLinkWrite> {
   if (!isPrivateChatId(telegramUserId)) return "not_private";
   const digest = digestTelegramId(telegramUserId);
   const inserted = await client.query(
     `INSERT INTO control_plane.telegram_organizer_trip_links
-       (id, user_id, trip_id, telegram_subject_digest, verified_via, telegram_first_name, telegram_username)
-     SELECT $1, $2, $3, $4, $5, $6, $7
+       (id, user_id, trip_id, telegram_subject_digest, verified_via, telegram_first_name, telegram_username, binding_scope)
+     SELECT $1, $2, $3, $4, $5, $6, $7, $8
       WHERE NOT EXISTS (
         SELECT 1 FROM control_plane.telegram_organizer_trip_links r
          WHERE r.telegram_subject_digest = $4 AND r.user_id = $2 AND r.trip_id = $3
            AND r.revoked_at IS NOT NULL)
      ON CONFLICT DO NOTHING
      RETURNING id`,
-    [`otl_${randomBytes(16).toString("hex")}`, userId, tripId, digest, verifiedVia, telegramName?.firstName ?? null, telegramName?.username ?? null],
+    [`otl_${randomBytes(16).toString("hex")}`, userId, tripId, digest, verifiedVia, telegramName?.firstName ?? null, telegramName?.username ?? null, scope],
   );
   if (inserted.rows[0]) return "linked";
   const revoked = await client.query(
@@ -187,18 +195,25 @@ export interface BoundTelegramAccount {
 }
 
 /**
- * WHICH TELEGRAM ACCOUNTS AN ORGANIZER'S ACCOUNT IS BOUND TO. The one definition; every reader goes through it.
+ * WHICH TELEGRAM ACCOUNTS AN ORGANIZER'S ACCOUNT IS BOUND TO, FOR ONE TRIP. The one definition; every reader goes through it.
  *
- * Two sources, either is enough, and both are written only from a verified update or a verified sign-in:
+ * Sources, all written only from a verified update or a verified sign-in:
  *
- *   `telegram_organizer_trip_links`  the non-revoked organizer links of this user, over EVERY trip. Account-wide on
- *      purpose: a trip created on the dashboard has no link of its own until its interview link is redeemed, so a
- *      per-trip reading would call every new trip "not bound yet" and let a forwarded link bind a stranger -- the very
- *      case #519 closes. A revoked row is history, and does not count: an organizer who Unlinked their only Telegram has
- *      nothing bound, which is what makes the dashboard's Link the way back.
+ *   `telegram_organizer_trip_links` with `binding_scope = 'account'`  the non-revoked links an ordinary redemption of the
+ *      account's own interview links made, over EVERY trip. Account-wide on purpose: a trip created on the dashboard has
+ *      no link of its own until its interview link is redeemed, so a per-trip reading would call every new trip "not bound
+ *      yet" and let a forwarded link bind a stranger -- the very case #519 closes.
+ *   `telegram_organizer_trip_links` of THIS trip, whatever their scope  a Telegram the organizer approved for this trip, or
+ *      added to it with the dashboard's signed-in one-time link. It is the organizer's Telegram for this trip and for no
+ *      other: a `trip`-scoped link is invisible when the question is about a different trip, so a leaked one-time link, or
+ *      an approval for trip A, cannot open trip C (owner decision 2026-11-06).
  *   `user_identities` (provider `telegram`)  the Telegram account the user SIGNED UP with. It is a verified Telegram
- *      identity on the account, and it outlives an Unlink of a trip, so an account that signed up through Telegram stays
- *      bound to that Telegram even after the owner unlinked it from one trip.
+ *      identity on the account, and it outlives an Unlink of a trip.
+ *
+ * A revoked row is history and does not count. And an account that HOLDS a revoked link on this very trip and no live one
+ * is out of this trip's set even if the account's other trips still bind it: it was taken off THIS trip (by the owner, or
+ * by approving a replacement), so for this trip it is a different account, and opening this trip's next link is a
+ * question, not a "same account". Its other trips are untouched.
  *
  * The union is the stricter reading (a set at least as large, so "someone else" is asked about more often, never less).
  * A retired (torn-down) trip's link still counts: the safe direction, and the cost is one approval prompt.
@@ -209,14 +224,24 @@ export async function boundTelegramAccounts(
   tripId: string,
 ): Promise<BoundTelegramAccount[]> {
   const rows = await q.query<{ digest: string; on_this_trip: boolean; bound_at: Date | null }>(
-    `SELECT telegram_subject_digest AS digest, bool_or(trip_id = $2) AS on_this_trip, max(created_at) AS bound_at
-       FROM control_plane.telegram_organizer_trip_links
-      WHERE user_id = $1 AND revoked_at IS NULL
-      GROUP BY telegram_subject_digest
+    `WITH links AS (
+       SELECT telegram_subject_digest AS d, trip_id, created_at, revoked_at, binding_scope
+         FROM control_plane.telegram_organizer_trip_links WHERE user_id = $1
+     ), removed AS (
+       SELECT d FROM links WHERE trip_id = $2 AND revoked_at IS NOT NULL
+       EXCEPT
+       SELECT d FROM links WHERE trip_id = $2 AND revoked_at IS NULL
+     )
+     SELECT d AS digest, bool_or(trip_id = $2) AS on_this_trip, max(created_at) AS bound_at
+       FROM links
+      WHERE revoked_at IS NULL AND (binding_scope = 'account' OR trip_id = $2)
+        AND d NOT IN (SELECT d FROM removed)
+      GROUP BY d
      UNION ALL
      SELECT provider_subject_digest, false, verified_at
        FROM control_plane.user_identities
-      WHERE user_id = $1 AND provider = 'telegram'`,
+      WHERE user_id = $1 AND provider = 'telegram'
+        AND provider_subject_digest NOT IN (SELECT d FROM removed)`,
     [userId, tripId],
   );
   const merged = new Map<string, BoundTelegramAccount>();

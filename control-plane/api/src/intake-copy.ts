@@ -753,7 +753,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     linkOtherApproved: "The organizer approved — you're in. Let's get started.",
     // To the organizer. `{trip}` is the trip's title; it is said only to them, who own it.
     linkForeignOpened: "Someone else opened your interview link for \"{trip}\". If that wasn't you, get a new link from the dashboard.",
-    linkApprovePrompt: "{who} opened your interview link for \"{trip}\" and would run this trip from their own Telegram. Approve to hand it to them — this account will be unlinked from the trip. Decline to leave everything as it is. You can also type approve or decline.",
+    linkApprovePrompt: "{who} opened your interview link for \"{trip}\" and would run this trip from their own Telegram. Approve to hand this trip to them — for this trip only; your other trips stay as they are. This account will be unlinked from this trip. Decline to leave everything as it is. You can also type approve or decline.",
     linkApproveButton: "Approve",
     linkDeclineButton: "Decline",
     linkApproverApproved: "Done — {who} now runs \"{trip}\" from Telegram, and this account is no longer linked to it.",
@@ -1029,7 +1029,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     linkOtherNotApproved: "המארגן לא אישר את זה. אם לדעתכם זו טעות, פנו אל המארגן ישירות.",
     linkOtherApproved: "המארגן אישר — אתם בפנים. מתחילים.",
     linkForeignOpened: "מישהו אחר פתח את קישור הראיון שלכם עבור \"{trip}\". אם זה לא הייתם אתם, קבלו קישור חדש מלוח הבקרה.",
-    linkApprovePrompt: "קישור הראיון שלכם עבור \"{trip}\" נפתח על ידי {who}. אשרו כדי שהטיול ינוהל מהחשבון שלהם בטלגרם — החשבון הזה ינותק מהטיול. דחו כדי להשאיר הכול כמו שהוא. אפשר גם לכתוב מאשרים או דוחים.",
+    linkApprovePrompt: "קישור הראיון שלכם עבור \"{trip}\" נפתח על ידי {who}. אשרו כדי שהטיול הזה ינוהל מהחשבון שלהם בטלגרם — לטיול הזה בלבד, ושאר הטיולים שלכם נשארים כפי שהם. החשבון הזה ינותק מהטיול הזה. דחו כדי להשאיר הכול כמו שהוא. אפשר גם לכתוב מאשרים או דוחים.",
     linkApproveButton: "אישור",
     linkDeclineButton: "דחייה",
     linkApproverApproved: "בוצע — \"{trip}\" מנוהל עכשיו מהחשבון של {who} בטלגרם, והחשבון הזה כבר לא מקושר אליו.",
