@@ -497,6 +497,132 @@ describe("a paused interview picks up where it stopped (#513)", { skip }, () => 
     await t.app.close();
   });
 
+  // Boundary review of #517, finding 1. A link may be forwarded; the answers of a paused interview (travellers,
+  // dietary needs, a flight) are the owner's, and only the owner's chat may be handed them back.
+  async function pausedAtSummary(t: Awaited<ReturnType<typeof dashboardTrip>>, marker: string) {
+    const chat = nextChat();
+    await dispatchUpdate(pool, startUpdate(chat, t.token));
+    await answerSome(chat, 60);
+    await pool.query(
+      `UPDATE control_plane.intake_sessions
+          SET answers = answers || $2::jsonb,
+              ui_state = ui_state || $3::jsonb, phase = 'recap', state = 'awaiting_confirmation'
+        WHERE telegram_chat_id = $1 AND expired_at IS NULL`,
+      [chat, JSON.stringify({
+        travelers: { kind: "structured", schema_version: 3, data: [{ name: `${marker}-traveller` }] },
+        dietary: { kind: "text", schema_version: 3, text: `${marker}-peanut-allergy` },
+      }), JSON.stringify({ organizer_name: `${marker}-name`, typed_flights: [`${marker.slice(0, 2).toUpperCase()}8801`], finish_requested: true, offered_more: true })]);
+    await expire(t.tripId);
+    return chat;
+  }
+
+  test("a forwarded link: a stranger's chat gets the ordinary opening and none of the owner's answers; the owner's own chat still resumes", async () => {
+    const { renderDueRouterPrompts } = await import("../src/relay/poller.js");
+    const { DEFAULT_STRINGS } = await import("../src/relay/dispatch.js");
+    const t = await dashboardTrip(await organizer());
+    const ownerChat = await pausedAtSummary(t, "OWNER");
+    const forwarded = await t.call("POST", "/interview-link");
+    assert.equal(forwarded.statusCode, 201);
+
+    const stranger = nextChat();
+    const reply = await opened(stranger, tokenOf(forwarded.json().deepLink));
+    assert.notEqual(reply.text, uiString("resumedOpening", "en"), "no welcome back for someone who was not in the interview");
+    assert.ok(reply.text.endsWith(uiString("introduction", "en")), "the ordinary, seeded opening");
+    assert.ok(JSON.stringify(reply.replyMarkup).includes("c:nodoc"), "with the document offer");
+    const [row] = await liveSession(t.tripId);
+    assert.equal(row.telegram_chat_id, stranger);
+    assert.deepEqual(Object.keys(row.answers).sort(), [...SEEDED].sort(), "the card seed only");
+    assert.ok(!JSON.stringify(row).includes("OWNER"), "nothing of the owner's is on the stranger's session");
+    assert.equal(row.router_prompt_due_at, null, "and no summary is queued for them");
+    assert.equal(row.phase, "opening");
+    await pool.query("UPDATE control_plane.intake_sessions SET router_prompt_due_at = NULL WHERE telegram_chat_id <> $1", [stranger]);
+    const sent: string[] = [];
+    const deps = {
+      db: pool, connector: { pushInbound: () => true }, log: () => {},
+      telegram: { sendMessage: async (p: { text: string }) => { sent.push(p.text); return { ok: true as const, messageId: String(sent.length) }; } },
+    } as never;
+    await renderDueRouterPrompts(deps, DEFAULT_STRINGS, () => {}, 0);
+    assert.ok(!sent.some((text) => text.includes("OWNER")), `no recap with the owner's details reached the stranger: ${JSON.stringify(sent)}`);
+
+    // The closed session is still the owner's, untouched, and the owner's own chat resumes from a fresh link.
+    await pool.query("UPDATE control_plane.intake_sessions SET expires_at = now() - interval '1 minute' WHERE telegram_chat_id = $1 AND expired_at IS NULL", [stranger]);
+    await claimExpiredSessions(pool, 100);
+    const again = await t.call("POST", "/interview-link");
+    assert.equal(again.statusCode, 201, again.body);
+    const ownerReply = await opened(ownerChat, tokenOf(again.json().deepLink));
+    assert.equal(ownerReply.text, uiString("resumedOpening", "en"));
+    const resumed = (await liveSession(t.tripId))[0];
+    assert.equal(resumed.telegram_chat_id, ownerChat);
+    assert.deepEqual(resumed.answers.dietary, { kind: "text", schema_version: 3, text: "OWNER-peanut-allergy" });
+    await t.app.close();
+  });
+
+  test("a Telegram account already linked to the trip for this user resumes from a different chat; a revoked link does not", async () => {
+    const { digestTelegramId } = await import("../src/identity.js");
+    const t = await dashboardTrip(await organizer());
+    const ownerChat = await pausedAtSummary(t, "LINKED");
+    const newChat = nextChat();
+    const insertLink = (revoked: boolean) => pool.query(
+      `INSERT INTO control_plane.telegram_organizer_trip_links(id, user_id, trip_id, telegram_subject_digest, verified_via, revoked_at, revoked_reason)
+       VALUES ($1, $2, $3, $4, 'enrollment_redemption', ${revoked ? "now()" : "NULL"}, ${revoked ? "'owner_unlinked'" : "NULL"})`,
+      [id("otl"), t.userId, t.tripId, digestTelegramId(newChat)]);
+    await insertLink(true);
+    const first = await t.call("POST", "/interview-link");
+    const refused = await opened(newChat, tokenOf(first.json().deepLink));
+    assert.notEqual(refused.text, uiString("resumedOpening", "en"), "a revoked link is not an organizer link");
+    assert.ok(!JSON.stringify(await liveSession(t.tripId)).includes("LINKED"));
+    await pool.query("UPDATE control_plane.intake_sessions SET expires_at = now() - interval '1 minute' WHERE telegram_chat_id = $1 AND expired_at IS NULL", [newChat]);
+    await claimExpiredSessions(pool, 100);
+    // Now the account holds a live link from before this redemption.
+    await pool.query("DELETE FROM control_plane.telegram_organizer_trip_links WHERE trip_id = $1", [t.tripId]);
+    await insertLink(false);
+    const second = await t.call("POST", "/interview-link");
+    const accepted = await opened(newChat, tokenOf(second.json().deepLink));
+    assert.equal(accepted.text, uiString("resumedOpening", "en"));
+    assert.equal(JSON.stringify((await liveSession(t.tripId))[0].answers).includes("LINKED-peanut-allergy"), true);
+    void ownerChat;
+    await t.app.close();
+  });
+
+  test("a second owner does not inherit the first owner's session; paused stays a per-trip fact", async () => {
+    const first = await organizer("Olga");
+    const t = await dashboardTrip(first);
+    const chat = await pausedAtSummary(t, "OLGA");
+    const second = await organizer("Oren");
+    await pool.query("INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status, dashboard_access) VALUES ($1, $2, $3, 'owner', 'active', true)", [id("memb"), t.tripId, second]);
+    const s2 = await session(second);
+    const h2 = { cookie: s2.cookie, "x-csrf-token": s2.csrf };
+    assert.equal((await t.call("GET", "", undefined, h2)).json().interview.paused, true, "the trip is paused for both owners");
+    const link = await t.call("POST", "/interview-link", undefined, h2);
+    assert.equal(link.statusCode, 201, link.body);
+    // Opened in the FIRST owner's own chat, so only the user check can stop it.
+    const reply = await opened(chat, tokenOf(link.json().deepLink));
+    assert.notEqual(reply.text, uiString("resumedOpening", "en"));
+    const [row] = await liveSession(t.tripId);
+    assert.equal(row.user_id, second);
+    assert.ok(!JSON.stringify(row).includes("OLGA"), "none of the first owner's answers");
+    await t.app.close();
+  });
+
+  test("a suspended owner is not handed a link, for a draft or a paused trip", async () => {
+    const owner = await organizer();
+    const bare = await bareTrip(owner);
+    await pool.query("DELETE FROM control_plane.interview_enrollments WHERE trip_id = $1", [bare.tripId]);
+    await pool.query("UPDATE control_plane.users SET status = 'suspended' WHERE id = $1", [owner]);
+    assert.deepEqual(await issueEnrollment(pool, owner, bare.tripId, { enrollmentTtlSeconds: 3600 }), { ok: false, reason: "NOT_OWNER" });
+    await pool.query("UPDATE control_plane.users SET status = 'active' WHERE id = $1", [owner]);
+    const issued = await issueEnrollment(pool, owner, bare.tripId, { enrollmentTtlSeconds: 3600 });
+    assert.ok(issued.ok);
+    if (!issued.ok) return;
+    const chat = nextChat();
+    await dispatchUpdate(pool, startUpdate(chat, issued.token));
+    await expire(bare.tripId);
+    await pool.query("UPDATE control_plane.users SET status = 'suspended' WHERE id = $1", [owner]);
+    assert.deepEqual(await issueEnrollment(pool, owner, bare.tripId, { enrollmentTtlSeconds: 3600 }), { ok: false, reason: "NOT_OWNER" });
+    await pool.query("UPDATE control_plane.users SET status = 'active' WHERE id = $1", [owner]);
+    assert.ok((await issueEnrollment(pool, owner, bare.tripId, { enrollmentTtlSeconds: 3600 })).ok);
+  });
+
   test("once resumed the interview is live again: not paused (the older closed session is still there), no second link, no second resume", async () => {
     const t = await dashboardTrip(await organizer());
     const chat = nextChat();

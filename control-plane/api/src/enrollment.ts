@@ -89,7 +89,8 @@ export async function issueEnrollment(
       `SELECT t.lifecycle_state
        FROM control_plane.trips t
        JOIN control_plane.trip_memberships m ON m.trip_id = t.id
-       WHERE t.id = $1 AND m.user_id = $2 AND m.role = 'owner' AND m.status = 'active'`,
+       JOIN control_plane.users u ON u.id = m.user_id
+       WHERE t.id = $1 AND m.user_id = $2 AND m.role = 'owner' AND m.status = 'active' AND u.status = 'active'`,
       [tripId, userId],
     );
     const [trip] = tripRow.rows;

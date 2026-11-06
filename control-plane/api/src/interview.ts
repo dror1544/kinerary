@@ -8,7 +8,7 @@ import { assertCanonicalRecordSafe, UnsafeCanonicalRecordError } from "./canonic
 // see country-key.ts for what divergence costs.
 import { normaliseCountryKey as normaliseCountry } from "./country-key.js";
 import { consumeEnrollmentInTx, pausedInterviewSessionId } from "./enrollment.js";
-import { isPrivateChatId, type TelegramName } from "./identity.js";
+import { digestTelegramId, isPrivateChatId, type TelegramName } from "./identity.js";
 import { linkTelegramOrganizerInTx } from "./organizer-trips.js";
 import {
   coerceLanguage,
@@ -2102,6 +2102,12 @@ export interface InterviewUiState {
    * never stored, like the organizer-name confirm) does not come back.
    */
   knownStopDeclined?: boolean;
+  /**
+   * This session started on a paused trip whose earlier answers were NOT handed to it (#513: a link opened from a chat
+   * that was not the interview's). When it closes it must not become the session a later link resumes from; only the
+   * chat it ran in may resume it. Never carried to a successor.
+   */
+  notResumable?: boolean;
 }
 
 /** A suggested answer, in the shape `submitAnswerForChat` takes. */
@@ -2188,6 +2194,7 @@ function parseUiState(raw: unknown): InterviewUiState {
     ...(typeof record.organizer_name === "string" && record.organizer_name.length > 0 ? { organizerName: record.organizer_name } : {}),
     ...(record.organizer_name_declined === true ? { organizerNameDeclined: true } : {}),
     ...(record.known_stop_declined === true ? { knownStopDeclined: true } : {}),
+    ...(record.not_resumable === true ? { notResumable: true } : {}),
   };
 }
 
@@ -2213,6 +2220,7 @@ function serializeUiState(ui: InterviewUiState): string {
     ...(ui.organizerName ? { organizer_name: ui.organizerName } : {}),
     ...(ui.organizerNameDeclined ? { organizer_name_declined: true } : {}),
     ...(ui.knownStopDeclined ? { known_stop_declined: true } : {}),
+    ...(ui.notResumable ? { not_resumable: true } : {}),
   });
 }
 
@@ -2845,12 +2853,48 @@ export async function startSession(
       await client.query("ROLLBACK");
       return { ok: false, reason: "TRIP_NOT_DRAFT" };
     }
-    const prior = pausedId
-      ? (await client.query<{ answers: AnswerStore; ui_state: unknown; language: string | null; source_document: unknown }>(
-          "SELECT answers, ui_state, language, source_document FROM control_plane.intake_sessions WHERE id = $1",
-          [pausedId],
-        )).rows[0] ?? null
-      : null;
+    // WHOSE ANSWERS THESE ARE. The paused interview is the owner's, and a link can be forwarded: whoever opens it
+    // would otherwise be handed the travellers, the dietary needs and the flights, and a summary built from them.
+    // The trip may be resumed by anyone the link reaches only in the sense that a session starts; the answers are
+    // carried only to the person who gave them -- the session's own user, redeeming from the chat that interview ran
+    // in, or from a Telegram account already linked to this trip for this user BEFORE this redemption (the link row
+    // for this redemption is written further down, so it cannot vouch for itself). Otherwise the session starts
+    // fresh, from the card, with the ordinary opening. The pause itself stays a per-trip fact (`pausedId`).
+    let resumeDeclined: "NOT_THE_SESSION_USER" | "CHAT_NOT_THE_OWNERS" | null = null;
+    //
+    // WHICH session is carried is therefore this redeemer's, not simply the trip's latest: a start that was declined
+    // (a forwarded link) is itself a closed session of the same user, newer than the owner's, and must not become the
+    // thing the owner resumes from. Such a session is marked `notResumable`; only the chat it ran in may resume it.
+    let prior: { id: string; answers: AnswerStore; ui_state: unknown; language: string | null; source_document: unknown } | null = null;
+    if (pausedId) {
+      const candidates = (await client.query<{
+        id: string; answers: AnswerStore; ui_state: unknown; language: string | null; source_document: unknown; telegram_chat_id: string | null;
+      }>(
+        `SELECT id, answers, ui_state, language, source_document, telegram_chat_id FROM control_plane.intake_sessions
+          WHERE trip_id = $1 AND user_id = $2 AND state <> 'confirmed' AND expired_at IS NOT NULL
+          ORDER BY expired_at DESC, created_at DESC`,
+        [enrollment.tripId, enrollment.userId],
+      )).rows;
+      const redeemingChat = verifiedTelegramChatId && isPrivateChatId(verifiedTelegramChatId) ? verifiedTelegramChatId : null;
+      if (candidates.length === 0) {
+        resumeDeclined = "NOT_THE_SESSION_USER";
+      } else if (!redeemingChat) {
+        // No verified chat (the HTTP/MCP path): nothing proves who is asking.
+        resumeDeclined = "CHAT_NOT_THE_OWNERS";
+      } else {
+        const linked = (await client.query(
+          `SELECT 1 FROM control_plane.telegram_organizer_trip_links
+            WHERE telegram_subject_digest = $1 AND user_id = $2 AND trip_id = $3 AND revoked_at IS NULL LIMIT 1`,
+          [digestTelegramId(redeemingChat), enrollment.userId, enrollment.tripId],
+        )).rowCount;
+        // A declined start is its own chat's, and only until that chat is itself vouched for as the trip's organizer:
+        // from then on the redeemer is entitled to the owner's real session, which a declined one would otherwise shadow.
+        prior = candidates.find((c) => parseUiState(c.ui_state).notResumable
+          ? c.telegram_chat_id === redeemingChat && !linked
+          : c.telegram_chat_id === redeemingChat || linked) ?? null;
+        if (!prior) resumeDeclined = "CHAT_NOT_THE_OWNERS";
+      }
+    }
     const cardSeed = seedAnswersFromCard({
       destination: trip.destination_label, startDate: trip.start_date, endDate: trip.end_date, tripType: trip.trip_type,
     });
@@ -2921,6 +2965,9 @@ export async function startSession(
       ...(organizerName && !carriedUi.organizerName ? { organizerName } : {}),
       // The opening of a resumed interview is over before it begins: the document offer is not made twice.
       ...(prior ? { openingDone: true } : {}),
+      // A start the owner's answers were withheld from: when it closes it is not where the owner resumes from.
+      ...(resumeDeclined ? { notResumable: true } : {}),
+      // A start the owner's answers were withheld from: when it closes it is not where the owner resumes from.
     };
     const answers: AnswerStore = { ...seed, ...carriedAnswers };
     // Where the interview stands, derived from what it now holds -- the same fixpoint `advancePhaseForChat` runs. A
@@ -2972,10 +3019,14 @@ export async function startSession(
     await client.query("COMMIT");
 
     log(structuredLog("info", "interview.session_started", { session_id: sessionId, trip_id: enrollment.tripId }));
+    if (resumeDeclined) {
+      // The reason only: no answer, name or chat id.
+      log(structuredLog("info", "interview.resume_declined", { session_id: sessionId, trip_id: enrollment.tripId, reason: resumeDeclined }));
+    }
     if (prior && pausedId) {
       // Question ids only, as with the seed: what was carried is the organizer's, and a log line is not.
       log(structuredLog("info", "interview.session_resumed", {
-        session_id: sessionId, trip_id: enrollment.tripId, from_session_id: pausedId,
+        session_id: sessionId, trip_id: enrollment.tripId, from_session_id: prior.id,
         carried: Object.keys(carriedAnswers), phase,
       }));
     }
@@ -3032,7 +3083,7 @@ export async function startSession(
             organizerName,
           }
         : undefined;
-    if (prior && pausedId) return { ok: true, sessionId, sessionToken: rawSessionToken, view, resumed: { fromSessionId: pausedId } };
+    if (prior && pausedId) return { ok: true, sessionId, sessionToken: rawSessionToken, view, resumed: { fromSessionId: prior.id } };
     return { ok: true, sessionId, sessionToken: rawSessionToken, view, ...(opening ? { seeded: opening } : {}) };
   } catch (error) {
     try { await client.query("ROLLBACK"); } catch { /* ignore */ }
