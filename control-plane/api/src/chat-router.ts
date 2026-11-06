@@ -744,6 +744,11 @@ export type StartLinkOutcome =
       returning: boolean;
       /** The trip was created on the dashboard and its card seeded the session: what the opening should say (#438). */
       seeded?: SeededOpening;
+      /**
+       * The link picked up a PAUSED interview (#513): the session holds the closed one's answers, and the opening is
+       * `renderResumedOpening`, not the introduction. `returning` and `seeded` are never set alongside it.
+       */
+      resumed?: boolean;
     }
   | { kind: "already_in_interview"; sessionId: string; tripId: string }
   | {
@@ -878,6 +883,16 @@ export async function startFromDeepLink(
   if (!result.ok) {
     log(structuredLog("info", "chat_router.start_link_rejected", { safe_error_code: result.reason }));
     return { kind: "rejected", reason: result.reason };
+  }
+
+  // A paused interview picked up again: nothing to introduce, and no "have they had a trip before" to ask.
+  if (result.resumed) {
+    log(structuredLog("info", "chat_router.interview_resumed", {
+      session_id: result.sessionId,
+      trip_id: result.view.tripId,
+      from_session_id: result.resumed.fromSessionId,
+    }));
+    return { kind: "started", sessionId: result.sessionId, tripId: result.view.tripId, view: result.view, returning: false, resumed: true };
   }
 
   // Which opening they meet. A failure here must not cost anyone their
@@ -1364,6 +1379,18 @@ export function renderDocumentOffer(
       ]],
     },
   };
+}
+
+/**
+ * The opening of a resumed interview (#513): one line, in the closed session's language, and nothing to tap.
+ *
+ * Not the introduction -- they have met it -- and not the document offer, because the documents they sent are already
+ * read and their answers are on record. The next question is not in this message: the new session is created owing
+ * it (`awaiting = 'machine'`, router prompt due), so the router sends it on its own turn, with whatever the interview
+ * needs on it (the buttons, a suggestion to confirm, the summary). One writer for questions, here as everywhere.
+ */
+export function renderResumedOpening(language: Language = DEFAULT_LANGUAGE): RenderedQuestion {
+  return { text: uiString("resumedOpening", language), replyMarkup: null };
 }
 
 /**

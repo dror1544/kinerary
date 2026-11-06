@@ -29,6 +29,7 @@ import {
   parseCallbackData,
   parseInbound,
   renderDocumentOffer,
+  renderResumedOpening,
   renderQuestion,
   resolveChatRoute,
   startFromDeepLink,
@@ -739,6 +740,13 @@ export async function dispatchUpdate(
         //
         // The first question follows the moment they answer it — by sending
         // the document, by tapping "I don't have one", or by just typing.
+        //
+        // A resumed interview (#513) has no document offer and may have no next question at all (it can come back at
+        // the summary): its opening is one line, and the router sends what follows on its own turn.
+        if (outcome.resumed) {
+          const resumed = renderResumedOpening(outcome.view.language);
+          return { kind: "reply", reply: { chatId, text: resumed.text } };
+        }
         if (!outcome.view.nextQuestion) {
           return { kind: "reply", reply: { chatId, text: strings.badLink } };
         }

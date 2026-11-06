@@ -562,18 +562,30 @@ test("AC-5: the page is never offered a replacement link the replace route would
     const { startSession } = await import("../src/interview.js");
     assert.ok((await startSession(pool, new URL(first.json().deepLink).searchParams.get("start")!)).ok);
     await pool.query("UPDATE control_plane.intake_sessions SET expired_at = now() WHERE trip_id = $1", [tripId]);
-    // The trip is put back to draft and a link is outstanding: the one state where `recoverable` can be true.
-    await pool.query("UPDATE control_plane.trips SET lifecycle_state = 'draft' WHERE id = $1", [tripId]);
-    const second = await app.inject({ method: "POST", url, headers }); assert.equal(second.statusCode, 201);
+    // Two states can hold a closed interview and an outstanding link, and `recoverable` has to agree with what
+    // `/replace` answers in BOTH (#513): a trip a failed chat binding put back to `draft`, and the trip an expiry leaves
+    // in `intake_in_progress` (a paused interview, which the route now replaces the link for).
+    for (const lifecycle of ["draft", "intake_in_progress"]) {
+      await pool.query("UPDATE control_plane.trips SET lifecycle_state = $2 WHERE id = $1", [tripId, lifecycle]);
+      await pool.query("UPDATE control_plane.interview_enrollments SET state = 'revoked' WHERE trip_id = $1 AND state = 'issued'", [tripId]);
+      const second = await app.inject({ method: "POST", url, headers }); assert.equal(second.statusCode, 201, `${lifecycle}: ${second.body}`);
 
-    const metadata = (await app.inject({ url, headers })).json();
-    assert.equal(metadata.hasInterview, false);
-    const replaced = await app.inject({ method: "POST", url: url + "/replace", headers, payload: { expectedEnrollmentId: second.json().enrollmentId } });
-    assert.equal(
-      metadata.recoverable,
-      replaced.statusCode === 201,
-      `recoverable=${metadata.recoverable} but replace answered ${replaced.statusCode} ${replaced.body}`,
-    );
+      const metadata = (await app.inject({ url, headers })).json();
+      assert.equal(metadata.hasInterview, false, lifecycle);
+      const replaced = await app.inject({ method: "POST", url: url + "/replace", headers, payload: { expectedEnrollmentId: second.json().enrollmentId } });
+      assert.equal(
+        metadata.recoverable,
+        replaced.statusCode === 201,
+        `${lifecycle}: recoverable=${metadata.recoverable} but replace answered ${replaced.statusCode} ${replaced.body}`,
+      );
+      assert.equal(metadata.recoverable, true, lifecycle);
+    }
+    // And once the interview is LIVE again (or confirmed) both say no.
+    await pool.query("UPDATE control_plane.intake_sessions SET expired_at = NULL WHERE trip_id = $1", [tripId]);
+    const live = (await app.inject({ url, headers })).json();
+    assert.equal(live.recoverable, false);
+    const active = live.activeEnrollment?.id as string;
+    assert.equal((await app.inject({ method: "POST", url: url + "/replace", headers, payload: { expectedEnrollmentId: active } })).statusCode, 409);
   } finally {
     if (tripId) {
       await pool.query("DELETE FROM control_plane.intake_sessions WHERE trip_id=$1", [tripId]);
