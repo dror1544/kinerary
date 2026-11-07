@@ -38,7 +38,7 @@ WITH RECURSIVE chain(target, source_id, source_via) AS (
     FROM control_plane.telegram_organizer_trip_links r
     JOIN control_plane.telegram_organizer_trip_links o ON o.restored_link_id = r.id
    WHERE r.verified_via = 'dashboard_restore'
-  UNION ALL
+  UNION
   SELECT c.target, o.id, o.verified_via
     FROM chain c
     JOIN control_plane.telegram_organizer_trip_links o ON o.restored_link_id = c.source_id

@@ -292,23 +292,24 @@ export async function organizerBindingVerdict(
   const same = await boundTelegramAccounts(q, input.userId, input.tripId);
   const mine = digestTelegramId(input.telegramUserId);
   if (same.some((account) => account.digest === mine)) return { kind: "proceed", reason: "same_account" };
-  if (same.length === 0 && !(await anyTelegramBound(q, input.userId, input.tripId))) return { kind: "proceed", reason: "not_bound" };
+  if (same.length === 0 && !(await anyTelegramBound(q, input.userId))) return { kind: "proceed", reason: "not_bound" };
   // `bound` is who may be ASKED: the accounts that can speak for this trip. It may be empty (everyone bound is bound to some
   // other trip only, or was taken off this one), and then nobody is asked and the opener is refused: fail closed.
   return { kind: "other_account", started: await tripHasInterviewSession(q, input.tripId), bound: same };
 }
 
 /**
- * Is ANY Telegram bound to this account, of any reach? The sign-up identity, a live link of either scope on any trip, or a
- * revoked link on THIS trip (somebody was bound here and was taken off: the trip is not "fresh"). Never narrowed; it exists
- * so that a narrowed set cannot be mistaken for an empty account.
+ * Has this account EVER had a Telegram? A link row of either scope on any trip, live or revoked (a revoked row is an Unlink
+ * or a membership that ended: somebody WAS bound), or a Telegram sign-up identity. Never narrowed, and never forgetful: it
+ * exists so that a narrowed set cannot be mistaken for an empty account, and so that an account whose every Telegram was
+ * Unlinked does not read as "fresh" -- a stranger would otherwise be bound account-wide by the next trip's interview link
+ * (re-review R3). Only an account that has never had one binds its first opener (AC-1); the owner's way back is the dashboard.
  */
-export async function anyTelegramBound(q: Pick<pg.PoolClient, "query">, userId: string, tripId: string): Promise<boolean> {
+export async function anyTelegramBound(q: Pick<pg.PoolClient, "query">, userId: string): Promise<boolean> {
   const row = await q.query(
-    `SELECT 1 WHERE EXISTS (SELECT 1 FROM control_plane.telegram_organizer_trip_links WHERE user_id = $1 AND revoked_at IS NULL)
-         OR EXISTS (SELECT 1 FROM control_plane.telegram_organizer_trip_links WHERE user_id = $1 AND trip_id = $2 AND revoked_at IS NOT NULL)
+    `SELECT 1 WHERE EXISTS (SELECT 1 FROM control_plane.telegram_organizer_trip_links WHERE user_id = $1)
          OR EXISTS (SELECT 1 FROM control_plane.user_identities WHERE user_id = $1 AND provider = 'telegram')`,
-    [userId, tripId],
+    [userId],
   );
   return (row.rowCount ?? 0) > 0;
 }

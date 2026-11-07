@@ -755,6 +755,36 @@ describe("a narrowed set never reads as 'nobody is bound'", { skip }, () => {
     assert.equal((await pool.query("SELECT count(*)::int AS n FROM control_plane.telegram_organizer_trip_links WHERE telegram_subject_digest = $1", [digestOf(stranger)])).rows[0].n, 0, "bound nowhere");
   });
 
+  test("R3: the owner Unlinked every Telegram from every trip they had; a stranger opening a FRESH trip's link is refused, never bound account-wide", async () => {
+    const { unlinkTelegramLink } = await import("../src/telegram-mini-app.js");
+    const { user, t0, firstTripId } = await boundOrganizer();
+    const row = (await pool.query("SELECT id FROM control_plane.telegram_organizer_trip_links WHERE trip_id = $1 AND telegram_subject_digest = $2 AND revoked_at IS NULL", [firstTripId, digestOf(t0)])).rows[0];
+    assert.equal(await unlinkTelegramLink(pool, user, row.id), true);
+    assert.equal((await pool.query("SELECT count(*)::int AS n FROM control_plane.telegram_organizer_trip_links WHERE user_id = $1 AND revoked_at IS NULL", [user])).rows[0].n, 0, "nothing live is left");
+    const c = await draftTrip(user, "Fresh Trip");
+    const stranger = nextChat();
+    const refused = multi(await dispatchUpdate(pool, startUpdate(stranger, c.token)));
+    assert.equal(refused.replies[0]!.text, uiString("linkOtherBelongs", "en"));
+    assert.equal(refused.replies.length, 1, "nobody can be asked");
+    assert.equal((await liveLinks(c.tripId, stranger)).length, 0);
+    assert.equal((await sessionsFor(stranger)).length, 0);
+    assert.equal(await enrollmentState(c.token), "issued");
+    assert.equal((await pool.query("SELECT count(*)::int AS n FROM control_plane.telegram_organizer_trip_links WHERE telegram_subject_digest = $1", [digestOf(stranger)])).rows[0].n, 0, "bound nowhere");
+  });
+
+  test("R3: an account whose Telegram sign-up identity is its only Telegram is never 'fresh' either", async () => {
+    const user = await organizer();
+    const signup = nextChat();
+    await pool.query(
+      "INSERT INTO control_plane.user_identities(id, user_id, provider, provider_subject_digest, provider_subject_id, verified_at) VALUES ($1, $2, 'telegram', $3, $4, now())",
+      [id("idnt"), user, digestOf(signup), signup]);
+    const c = await draftTrip(user, "Fresh Trip");
+    const stranger = nextChat();
+    const decision = multi(await dispatchUpdate(pool, startUpdate(stranger, c.token)));
+    assert.equal(decision.replies[0]!.text, uiString("linkOtherAsked", "en"));
+    assert.equal((await liveLinks(c.tripId, stranger)).length, 0);
+  });
+
   test("R1 continued: the owner's new phone still opens its OWN trip, and is refused on the account's other trips (the dashboard link is their way in there)", async () => {
     const { unlinkTelegramLink } = await import("../src/telegram-mini-app.js");
     const { user, t0, firstTripId } = await boundOrganizer();
