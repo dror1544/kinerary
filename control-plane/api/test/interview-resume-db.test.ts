@@ -215,7 +215,7 @@ describe("a paused interview picks up where it stopped (#513)", { skip }, () => 
 
   test("AC-2 the replace route accepts a paused trip, and `recoverable` says exactly what it answers", async () => {
     const t = await dashboardTrip(await organizer());
-    await pausedInterview(t);
+    const paused = await pausedInterview(t);
     const issued = await t.call("POST", "/interview-link");
     const metadata = (await t.call("GET", "/interview-link")).json();
     assert.equal(metadata.recoverable, true);
@@ -223,7 +223,8 @@ describe("a paused interview picks up where it stopped (#513)", { skip }, () => 
     assert.equal(replaced.statusCode, 201, replaced.body);
     assert.equal(metadata.recoverable, replaced.statusCode === 201);
     // A LIVE interview is still refused, and `recoverable` still says so.
-    await dispatchUpdate(pool, startUpdate(nextChat(), tokenOf(replaced.json().deepLink)));
+    // Opened from the organizer's own Telegram: a different account is refused on a started trip (#519).
+    await dispatchUpdate(pool, startUpdate(paused.chat, tokenOf(replaced.json().deepLink)));
     const live = (await t.call("GET", "/interview-link")).json();
     assert.equal(live.recoverable, false);
     assert.equal(live.hasInterview, true);
@@ -516,11 +517,36 @@ describe("a paused interview picks up where it stopped (#513)", { skip }, () => 
     return chat;
   }
 
-  test("a forwarded link: a stranger's chat gets the ordinary opening and none of the owner's answers; the owner's own chat still resumes", async () => {
+  test("#519 a forwarded link: a stranger's chat is refused outright and reaches nothing of the owner's; the owner's own chat still resumes", async () => {
+    const t = await dashboardTrip(await organizer());
+    const ownerChat = await pausedAtSummary(t, "OWNER");
+    const forwarded = await t.call("POST", "/interview-link");
+    assert.equal(forwarded.statusCode, 201);
+    const stranger = nextChat();
+    const refused = await dispatchUpdate(pool, startUpdate(stranger, tokenOf(forwarded.json().deepLink)));
+    assert.equal(refused.kind, "multi_reply", "never reaches startSession: no session, no link, no answers");
+    assert.equal((await liveSession(t.tripId)).length, 0);
+    assert.equal((await pool.query("SELECT count(*)::int AS n FROM control_plane.intake_sessions WHERE telegram_chat_id = $1", [stranger])).rows[0].n, 0);
+    assert.ok(!JSON.stringify(refused).includes("OWNER"));
+    // The link was not spent: the owner's own chat resumes with it.
+    const ownerReply = await opened(ownerChat, tokenOf(forwarded.json().deepLink));
+    assert.equal(ownerReply.text, uiString("resumedOpening", "en"));
+    const resumed = (await liveSession(t.tripId))[0];
+    assert.equal(resumed.telegram_chat_id, ownerChat, "the owner's own chat holds the resumed session, not the stranger's");
+    assert.deepEqual(resumed.answers.dietary, { kind: "text", schema_version: 3, text: "OWNER-peanut-allergy" });
+    assert.equal((await pool.query("SELECT count(*)::int AS n FROM control_plane.telegram_organizer_trip_links WHERE trip_id = $1 AND telegram_subject_digest = $2 AND revoked_at IS NULL", [t.tripId, (await import("../src/identity.js")).digestTelegramId(stranger)])).rows[0].n, 0, "and the stranger was never linked");
+    await t.app.close();
+  });
+
+  test("#517 survives #519: with no Telegram bound at all, a new account is bound and gets the ordinary opening and none of the owner's answers", async () => {
     const { renderDueRouterPrompts } = await import("../src/relay/poller.js");
     const { DEFAULT_STRINGS } = await import("../src/relay/dispatch.js");
     const t = await dashboardTrip(await organizer());
     const ownerChat = await pausedAtSummary(t, "OWNER");
+    // The interview ran with no organizer link on record (the HTTP/MCP path writes none), and nobody else is bound: the next
+    // account is bound. (An Unlinked owner is NOT this case: a revoked link on the trip still means somebody was bound, and a
+    // stranger is then refused -- #519 re-review R2.)
+    await pool.query("DELETE FROM control_plane.telegram_organizer_trip_links WHERE trip_id = $1", [t.tripId]);
     const forwarded = await t.call("POST", "/interview-link");
     assert.equal(forwarded.statusCode, 201);
 
@@ -544,16 +570,9 @@ describe("a paused interview picks up where it stopped (#513)", { skip }, () => 
     await renderDueRouterPrompts(deps, DEFAULT_STRINGS, () => {}, 0);
     assert.ok(!sent.some((text) => text.includes("OWNER")), `no recap with the owner's details reached the stranger: ${JSON.stringify(sent)}`);
 
-    // The closed session is still the owner's, untouched, and the owner's own chat resumes from a fresh link.
-    await pool.query("UPDATE control_plane.intake_sessions SET expires_at = now() - interval '1 minute' WHERE telegram_chat_id = $1 AND expired_at IS NULL", [stranger]);
-    await claimExpiredSessions(pool, 100);
-    const again = await t.call("POST", "/interview-link");
-    assert.equal(again.statusCode, 201, again.body);
-    const ownerReply = await opened(ownerChat, tokenOf(again.json().deepLink));
-    assert.equal(ownerReply.text, uiString("resumedOpening", "en"));
-    const resumed = (await liveSession(t.tripId))[0];
-    assert.equal(resumed.telegram_chat_id, ownerChat);
-    assert.deepEqual(resumed.answers.dietary, { kind: "text", schema_version: 3, text: "OWNER-peanut-allergy" });
+    // The closed session is still the owner's, untouched.
+    const closed = await pool.query("SELECT answers FROM control_plane.intake_sessions WHERE telegram_chat_id = $1", [ownerChat]);
+    assert.deepEqual(closed.rows[0].answers.dietary, { kind: "text", schema_version: 3, text: "OWNER-peanut-allergy" });
     await t.app.close();
   });
 
@@ -568,11 +587,11 @@ describe("a paused interview picks up where it stopped (#513)", { skip }, () => 
       [id("otl"), t.userId, t.tripId, digestTelegramId(newChat)]);
     await insertLink(true);
     const first = await t.call("POST", "/interview-link");
-    const refused = await opened(newChat, tokenOf(first.json().deepLink));
-    assert.notEqual(refused.text, uiString("resumedOpening", "en"), "a revoked link is not an organizer link");
+    // A revoked link is not an organizer link, and the owner's own Telegram is still the bound one: refused outright (#519).
+    const refused = await dispatchUpdate(pool, startUpdate(newChat, tokenOf(first.json().deepLink)));
+    assert.equal(refused.kind, "multi_reply", "a revoked link is not an organizer link");
     assert.ok(!JSON.stringify(await liveSession(t.tripId)).includes("LINKED"));
-    await pool.query("UPDATE control_plane.intake_sessions SET expires_at = now() - interval '1 minute' WHERE telegram_chat_id = $1 AND expired_at IS NULL", [newChat]);
-    await claimExpiredSessions(pool, 100);
+    assert.equal((await liveSession(t.tripId)).length, 0);
     // Now the account holds a live link from before this redemption.
     await pool.query("DELETE FROM control_plane.telegram_organizer_trip_links WHERE trip_id = $1", [t.tripId]);
     await insertLink(false);

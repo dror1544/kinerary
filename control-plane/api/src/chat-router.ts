@@ -54,6 +54,7 @@ import {
   type SessionView,
 } from "./interview.js";
 import { peekEnrollmentTripId } from "./enrollment.js";
+import { recordForeignLinkOpen, type ApproverNotice, type ForeignLinkResult } from "./organizer-link-approval.js";
 import { digestTelegramId, isPrivateChatId, type TelegramName } from "./identity.js";
 import { structuredLog } from "./redaction.js";
 
@@ -751,6 +752,12 @@ export type StartLinkOutcome =
       resumed?: boolean;
     }
   | { kind: "already_in_interview"; sessionId: string; tripId: string }
+  /**
+   * The link is valid but this Telegram account is not the one the organizer is bound to (#519). Nothing was started,
+   * consumed or linked. `toRequester` is what the stranger is told (never anything about the trip); `toApprover` is the
+   * one message the bound organizer is owed, present only the first time (organizer-link-approval.ts).
+   */
+  | { kind: "other_organizer"; toRequester: ForeignLinkResult["toRequester"]; toApprover?: ApproverNotice }
   | {
       kind: "rejected";
       reason:
@@ -880,9 +887,23 @@ export async function startFromDeepLink(
   }
 
   const result = await startSession(db, payload, log, undefined, chatId, languageHint, telegramName);
+  if (!result.ok && result.reason === "OTHER_TELEGRAM_ACCOUNT") {
+    // A valid link opened by someone other than the Telegram account the organizer is bound to (#519). `startSession`
+    // rolled back, so the link is still unspent; what is left is to say so, and to ask or tell the organizer.
+    const foreign = await recordForeignLinkOpen(db, {
+      enrollmentId: result.enrollmentId, tripId: result.tripId, userId: result.userId, started: result.started,
+      requesterChatId: chatId, requesterName: telegramName ?? null, requesterLanguage: languageHint,
+    }, log);
+    if (!foreign) {
+      log(structuredLog("info", "chat_router.start_link_rejected", { safe_error_code: "INVALID_TOKEN" }));
+      return { kind: "rejected", reason: "INVALID_TOKEN" };
+    }
+    return { kind: "other_organizer", toRequester: foreign.toRequester, ...(foreign.toApprover ? { toApprover: foreign.toApprover } : {}) };
+  }
   if (!result.ok) {
-    log(structuredLog("info", "chat_router.start_link_rejected", { safe_error_code: result.reason }));
-    return { kind: "rejected", reason: result.reason };
+    const reason = result.reason === "REPLACEMENT_NOT_APPLICABLE" ? "INVALID_TOKEN" : result.reason;
+    log(structuredLog("info", "chat_router.start_link_rejected", { safe_error_code: reason }));
+    return { kind: "rejected", reason };
   }
 
   // A paused interview picked up again: nothing to introduce, and no "have they had a trip before" to ask.
@@ -1032,6 +1053,7 @@ export type ParsedCallback =
   | { kind: "switch"; tripId: string }
   | { kind: "conflict"; conflictId: string; choice: "keep" | "replace" }
   | { kind: "correction"; proposalId: string; choice: "approve" | "reject" }
+  | { kind: "organizer_link"; requestId: string; choice: "approve" | "decline" }
   | { kind: "change"; draftId: string; digest: string | null; choice: "apply" | "cancel" | "pick"; index?: number }
   | { kind: "unknown" };
 
@@ -1051,6 +1073,17 @@ export function conflictCallbackData(conflictId: string, choice: "keep" | "repla
  */
 export function correctionCallbackData(proposalId: string, choice: "approve" | "reject"): string {
   return `dc:${proposalId}:${choice === "approve" ? "a" : "r"}`;
+}
+
+/**
+ * `oa:<requestId>:<a|d>` -- the organizer's Approve or Decline of a different Telegram account that opened their interview
+ * link (#519). Carries only which question and which choice: whose question it is, and whether the sender is that person,
+ * are read from the stored request and the update's own sender, never from this.
+ *
+ * Length: `oa:` + `olr_`+32 hex (36) + `:a` = 41 bytes, under Telegram's 64.
+ */
+export function organizerLinkCallbackData(requestId: string, choice: "approve" | "decline"): string {
+  return `oa:${requestId}:${choice === "approve" ? "a" : "d"}`;
 }
 
 /**
@@ -1090,6 +1123,11 @@ export function parseCallbackData(data: string): ParsedCallback {
   const conflict = /^x:([a-z]{2,12}_[A-Za-z0-9]{8,64}):([kr])$/.exec(data);
   if (conflict?.[1] && conflict[2]) {
     return { kind: "conflict", conflictId: conflict[1], choice: conflict[2] === "k" ? "keep" : "replace" };
+  }
+
+  const organizerLink = /^oa:([a-z]{2,12}_[A-Za-z0-9]{8,64}):([ad])$/.exec(data);
+  if (organizerLink?.[1] && organizerLink[2]) {
+    return { kind: "organizer_link", requestId: organizerLink[1], choice: organizerLink[2] === "a" ? "approve" : "decline" };
   }
 
   const correction = /^dc:([a-z]{2,12}_[A-Za-z0-9]{8,64}):([ar])$/.exec(data);

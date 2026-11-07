@@ -9,7 +9,7 @@ import { assertCanonicalRecordSafe, UnsafeCanonicalRecordError } from "./canonic
 import { normaliseCountryKey as normaliseCountry } from "./country-key.js";
 import { consumeEnrollmentInTx, pausedInterviewSessionId } from "./enrollment.js";
 import { digestTelegramId, isPrivateChatId, type TelegramName } from "./identity.js";
-import { linkTelegramOrganizerInTx } from "./organizer-trips.js";
+import { linkTelegramOrganizerInTx, organizerBindingVerdict, tripHasInterviewSession } from "./organizer-trips.js";
 import {
   coerceLanguage,
   DEFAULT_LANGUAGE,
@@ -2725,7 +2725,16 @@ export type StartSessionResult =
        */
       resumed?: { fromSessionId: string };
     }
-  | { ok: false; reason: "INVALID_TOKEN" | "EXPIRED" | "ALREADY_CONSUMED" | "REVOKED" | "TRIP_NOT_DRAFT" };
+  | { ok: false; reason: "INVALID_TOKEN" | "EXPIRED" | "ALREADY_CONSUMED" | "REVOKED" | "TRIP_NOT_DRAFT" }
+  /**
+   * The link is valid, but the Telegram account that opened it is not the one the organizer is bound to (#519). NOTHING
+   * was consumed, created or linked: the transaction was rolled back, so the link is still the organizer's. The caller
+   * (chat-router.ts `startFromDeepLink`) decides what to say, and to whom; the ids are for it and never for a message.
+   * `started`: an interview already exists for the trip, so there is nothing for the organizer to approve.
+   */
+  | { ok: false; reason: "OTHER_TELEGRAM_ACCOUNT"; enrollmentId: string; tripId: string; userId: string; started: boolean }
+  /** The approved replacement could not be applied: an interview has been started since, or the pair was Unlinked (AC-10). */
+  | { ok: false; reason: "REPLACEMENT_NOT_APPLICABLE" };
 
 export type GetSessionResult =
   | { ok: true; view: SessionView }
@@ -2826,6 +2835,51 @@ export async function startSession(
       return { ok: false, reason: "INVALID_TOKEN" };
     }
 
+    const started = await startSessionInTx(client, enrollment, {
+      telegramChatIdHint, verifiedTelegramChatId, languageHint, telegramName,
+    });
+    // A refusal rolls the consumption back with it: the link is NOT spent by a start that did not happen, which is
+    // what leaves a link opened by the wrong Telegram account (#519) usable by the right one.
+    if (!started.result.ok) {
+      await client.query("ROLLBACK");
+      return started.result;
+    }
+    await client.query("COMMIT");
+    for (const line of started.logs) log(line);
+    return started.result;
+  } catch (error) {
+    try { await client.query("ROLLBACK"); } catch { /* ignore */ }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Everything `startSession` does once the enrollment is held, inside the CALLER's transaction: the caller consumed the
+ * enrollment (by token, or -- for an approved replacement -- by id), and commits or rolls back on the result. Log lines
+ * are returned, not written, so none is emitted for a start that is then rolled back.
+ *
+ * `approvedReplacement` is the one way past the question "is this the Telegram account the organizer is bound to?":
+ * the bound account itself answered it (organizer-link-approval.ts), so it is not asked again, and instead the trip must
+ * still have no interview, and the replacement's own link must not be one the owner Unlinked.
+ */
+export async function startSessionInTx(
+  client: pg.PoolClient,
+  enrollment: { enrollmentId: string; tripId: string; userId: string },
+  input: {
+    telegramChatIdHint?: string;
+    verifiedTelegramChatId?: string;
+    languageHint?: string;
+    telegramName?: TelegramName | null;
+    approvedReplacement?: boolean;
+  },
+): Promise<{ result: StartSessionResult; logs: string[] }> {
+  const { telegramChatIdHint, verifiedTelegramChatId, languageHint, telegramName } = input;
+  const logs: string[] = [];
+  const log = (line: string) => { logs.push(line); };
+  const refuse = (result: StartSessionResult) => ({ result, logs });
+  {
     // Verify the trip is still in 'draft' (enrollment could be issued and
     // the trip could have moved if something went wrong on a prior attempt).
     // The card (what the dashboard's new-trip form wrote) is read in the same statement that locks the row, so the
@@ -2843,6 +2897,24 @@ export async function startSession(
       [enrollment.tripId],
     );
     const [trip] = tripRow.rows;
+    // ONE ORGANIZER, ONE TELEGRAM (#519). Asked FIRST, under the trip lock just taken, and before the lifecycle question
+    // below: a link forwarded to a stranger on a trip whose interview is already running is a valid link that must say
+    // "this belongs to another organizer", not the "bad link" a non-draft trip answers. The only input about the person
+    // is the router's verified private chat id -- no message, no token field. No chat id at all (the HTTP and MCP
+    // routes, which never learn a Telegram identity and write no organizer link) leaves nothing to compare.
+    const redeemingTelegram = verifiedTelegramChatId && isPrivateChatId(verifiedTelegramChatId) ? verifiedTelegramChatId : null;
+    if (trip && redeemingTelegram && !input.approvedReplacement) {
+      const verdict = await organizerBindingVerdict(client, { userId: enrollment.userId, tripId: enrollment.tripId, telegramUserId: redeemingTelegram });
+      if (verdict.kind === "other_account") {
+        return refuse({
+          ok: false, reason: "OTHER_TELEGRAM_ACCOUNT",
+          enrollmentId: enrollment.enrollmentId, tripId: enrollment.tripId, userId: enrollment.userId, started: verdict.started,
+        });
+      }
+    }
+    if (trip && input.approvedReplacement && (await tripHasInterviewSession(client, enrollment.tripId))) {
+      return refuse({ ok: false, reason: "REPLACEMENT_NOT_APPLICABLE" });
+    }
     // A draft starts an interview; so does a trip whose interview is PAUSED (#513) -- `intake_in_progress` with its
     // latest session closed for idleness and nothing live or confirmed beside it. The pause is read under the trip
     // lock just taken, so two links redeemed at once cannot both resume it: the second finds a live session.
@@ -2850,8 +2922,7 @@ export async function startSession(
       ? await pausedInterviewSessionId(client, enrollment.tripId)
       : null;
     if (!trip || !(trip.lifecycle_state === "draft" || (trip.lifecycle_state === "intake_in_progress" && pausedId !== null))) {
-      await client.query("ROLLBACK");
-      return { ok: false, reason: "TRIP_NOT_DRAFT" };
+      return refuse({ ok: false, reason: "TRIP_NOT_DRAFT" });
     }
     // WHOSE ANSWERS THESE ARE. The paused interview is the owner's, and a link can be forwarded: whoever opens it
     // would otherwise be handed the travellers, the dietary needs and the flights, and a summary built from them.
@@ -3013,10 +3084,12 @@ export async function startSession(
     // web session by itself — the Mini App exchange does, from verified
     // initData (telegram-mini-app.ts); /v1/auth/telegram stays retired (410).
     if (chatId) {
-      await linkTelegramOrganizerInTx(client, chatId, enrollment.userId, enrollment.tripId, "enrollment_redemption", telegramName ?? null);
+      const written = await linkTelegramOrganizerInTx(client, chatId, enrollment.userId, enrollment.tripId, "enrollment_redemption", telegramName ?? null, input.approvedReplacement ? "trip" : "account");
+      // AC-10: an Unlinked pair is never re-bound by a replacement, approved or not. A plain redemption by the bound
+      // account keeps what it always did (the interview starts, the link stays revoked); a replacement exists FOR the
+      // link, so without it there is nothing to apply and the whole transaction is the caller's to roll back.
+      if (written === "revoked_pair" && input.approvedReplacement) return refuse({ ok: false, reason: "REPLACEMENT_NOT_APPLICABLE" });
     }
-
-    await client.query("COMMIT");
 
     log(structuredLog("info", "interview.session_started", { session_id: sessionId, trip_id: enrollment.tripId }));
     if (resumeDeclined) {
@@ -3083,13 +3156,8 @@ export async function startSession(
             organizerName,
           }
         : undefined;
-    if (prior && pausedId) return { ok: true, sessionId, sessionToken: rawSessionToken, view, resumed: { fromSessionId: prior.id } };
-    return { ok: true, sessionId, sessionToken: rawSessionToken, view, ...(opening ? { seeded: opening } : {}) };
-  } catch (error) {
-    try { await client.query("ROLLBACK"); } catch { /* ignore */ }
-    throw error;
-  } finally {
-    client.release();
+    if (prior && pausedId) return { result: { ok: true, sessionId, sessionToken: rawSessionToken, view, resumed: { fromSessionId: prior.id } }, logs };
+    return { result: { ok: true, sessionId, sessionToken: rawSessionToken, view, ...(opening ? { seeded: opening } : {}) }, logs };
   }
 }
 

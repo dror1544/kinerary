@@ -491,6 +491,22 @@ export async function applyDecision(
       return;
     }
 
+    case "multi_reply": {
+      // The tap first (the button stops spinning), then each message on its own: the stranger's chat may be unreachable
+      // (they blocked the bot), and that must not cost the organizer theirs, or the other way round (#519).
+      if (decision.callbackQueryId) {
+        await deps.telegram.answerCallbackQuery({ callbackQueryId: decision.callbackQueryId, text: decision.ackText }).catch(() => {});
+      }
+      for (const reply of decision.replies) {
+        try {
+          await deps.telegram.sendMessage({ chatId: reply.chatId, text: reply.text, replyMarkup: reply.replyMarkup });
+        } catch (error) {
+          log(structuredLog("warn", "trip_bot.multi_reply_send_failed", { detail: String((error as Error)?.message ?? error).slice(0, 200) }));
+        }
+      }
+      return;
+    }
+
     case "callback_ack":
       // Answered and nothing more: the button stops spinning and no message is
       // posted, so a tap from a chat we have no business in says nothing to it.

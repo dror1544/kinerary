@@ -23,6 +23,18 @@
  * (telegram-mini-app.ts) and the card lists it for Unlink. It is the same
  * trade the interview link makes, with a shorter fuse.
  *
+ * ONE ORGANIZER, ONE TELEGRAM (#519) DOES NOT APPLY HERE, ON PURPOSE. That rule asks "is the Telegram account that opened
+ * this interview link the one the organizer's account is bound to?" because an interview link is a bearer token that can be
+ * forwarded, and nothing else vouches for who opened it. This link is different in the one respect that matters: it is
+ * issued only to a SIGNED-IN owner (full session and CSRF) for a trip they run, so the account half is proven by the owner
+ * themselves, and the owner chose to hand this link to the Telegram account that opens it -- that is the point of it, and
+ * the way a second Telegram account is added or a revoked one is brought back. Asking the bound account to approve what
+ * the owner just did from their own dashboard would be asking them to approve themselves, and would leave an organizer
+ * who lost their phone with no way back. The costs of a leaked link are bounded instead, as below: short, single use, one
+ * trip, announced on first sign-in and listed on the card for Unlink. And it reaches that ONE trip only: the link is written
+ * with `binding_scope = 'trip'`, so the Telegram it adds is not "the account's Telegram" for the organizer's other trips and a
+ * leaked link cannot open their interview links (owner decision 2026-11-06; organizer-trips.ts `boundTelegramAccounts`).
+ *
  * The token pattern is the enrollment's (enrollment.ts): random bytes, only the
  * sha256 stored, row-locked consume. No new crypto.
  *
@@ -215,8 +227,8 @@ export async function redeemTelegramLinkToken(
       linkId = opaqueId("otl");
       await client.query(
         `INSERT INTO control_plane.telegram_organizer_trip_links
-           (id, user_id, trip_id, telegram_subject_digest, verified_via, telegram_first_name, telegram_username)
-         VALUES ($1, $2, $3, $4, 'dashboard_link_token', $5, $6)`,
+           (id, user_id, trip_id, telegram_subject_digest, verified_via, telegram_first_name, telegram_username, binding_scope)
+         VALUES ($1, $2, $3, $4, 'dashboard_link_token', $5, $6, 'trip')`,
         [linkId, token.user_id, token.trip_id, digest, telegramName?.firstName ?? null, telegramName?.username ?? null],
       );
     } else if (telegramName) {
@@ -378,8 +390,8 @@ export async function restoreTelegramLink(
     // Membership first, then the link row - the order the membership-end trigger takes them in.
     const tripTitle = await tripTheUserRuns(client, input.userId, peek.rows[0].trip_id, true);
     if (tripTitle === null) { await client.query("ROLLBACK"); return notFound; }
-    const old = await client.query<{ trip_id: string; telegram_subject_digest: string; telegram_first_name: string | null; telegram_username: string | null }>(
-      `SELECT trip_id, telegram_subject_digest, telegram_first_name, telegram_username FROM control_plane.telegram_organizer_trip_links
+    const old = await client.query<{ trip_id: string; telegram_subject_digest: string; telegram_first_name: string | null; telegram_username: string | null; binding_scope: string }>(
+      `SELECT trip_id, telegram_subject_digest, telegram_first_name, telegram_username, binding_scope FROM control_plane.telegram_organizer_trip_links
         WHERE id = $1 AND user_id = $2 AND revoked_reason = 'owner_unlinked' AND restored_at IS NULL FOR UPDATE`,
       [input.linkId, input.userId],
     );
@@ -400,9 +412,10 @@ export async function restoreTelegramLink(
     const linkId = opaqueId("otl");
     await client.query(
       `INSERT INTO control_plane.telegram_organizer_trip_links
-         (id, user_id, trip_id, telegram_subject_digest, verified_via, telegram_first_name, telegram_username)
-       VALUES ($1, $2, $3, $4, 'dashboard_restore', $5, $6)`,
-      [linkId, input.userId, row.trip_id, row.telegram_subject_digest, row.telegram_first_name, row.telegram_username],
+         (id, user_id, trip_id, telegram_subject_digest, verified_via, telegram_first_name, telegram_username, binding_scope)
+       VALUES ($1, $2, $3, $4, 'dashboard_restore', $5, $6, $7)`,
+      // A restore reaches exactly as far as the link it brings back (#519): a trip-scoped link stays trip-scoped.
+      [linkId, input.userId, row.trip_id, row.telegram_subject_digest, row.telegram_first_name, row.telegram_username, row.binding_scope],
     );
     await client.query(
       `UPDATE control_plane.telegram_organizer_trip_links
