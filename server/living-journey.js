@@ -1701,7 +1701,7 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
     const organizers = Array.isArray(agent?.organizers)
       ? agent.organizers
       : [agent?.organizer].filter(Boolean);
-    if (row.author !== req.user.username && !organizers.includes(req.user.username) && !req.user.isAgent) return res.status(403).json({ error: 'forbidden' });
+    if (row.author !== req.user.username && !organizers.includes(req.user.username) && !req.user.secondaryOrganizer && !req.user.isAgent) return res.status(403).json({ error: 'forbidden' });
     db.prepare("UPDATE trip_moments SET caption = COALESCE(?, caption), body = COALESCE(?, body), visibility = COALESCE(?, visibility), updated_at = datetime('now') WHERE id = ?")
       .run(req.body?.caption ?? null, req.body?.body ?? null, ['draft', 'published'].includes(req.body?.visibility) ? req.body.visibility : null, req.params.id);
     res.json(db.prepare('SELECT * FROM trip_moments WHERE id = ?').get(req.params.id));
@@ -1714,7 +1714,7 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
     const organizers = Array.isArray(agent?.organizers)
       ? agent.organizers
       : [agent?.organizer].filter(Boolean);
-    if (row.author !== req.user.username && !organizers.includes(req.user.username) && !req.user.isAgent) return res.status(403).json({ error: 'forbidden' });
+    if (row.author !== req.user.username && !organizers.includes(req.user.username) && !req.user.secondaryOrganizer && !req.user.isAgent) return res.status(403).json({ error: 'forbidden' });
     db.prepare('DELETE FROM trip_moments WHERE id = ?').run(req.params.id);
     res.json({ ok: true });
   });

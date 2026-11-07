@@ -740,6 +740,21 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // unknown, not yours any more): a distinguishable one confirms a guess.
     telegramLinked: "Done — this Telegram account is now linked to \"{trip}\". Send /trips to see it, and /switch to talk to it from this chat.",
     telegramLinkRefused: "That link didn't work — it may have expired or been used already. Open Kinerary, find the trip and choose Link Telegram for a fresh one.",
+    // ── A main Telegram per account, and secondary organizers (#523) ─────────
+    // The dashboard's Link Telegram now makes the opener the account's MAIN Telegram (all trips, present and future).
+    mainTelegramLinked: "Done — this Telegram account is now your main one for Kinerary. It runs all your trips, the ones you have now and the ones you create later. Send /trips to see them, and /switch to talk to one from this chat.",
+    // Said to the account that was just made main, when it replaced another one.
+    mainTelegramLinkedReplaced: "Done — this Telegram account is now your main one for Kinerary, and the one you used before has been unlinked from your trips. It runs all your trips, the ones you have now and the ones you create later. Send /trips to see them.",
+    // Said ONCE to the account that stopped being the main one, in its own chat. It names no trip.
+    mainTelegramReplaced: "Another Telegram account was just linked as the main one for your Kinerary account, so this one no longer runs your trips. If that wasn't you, sign in to Kinerary and link this account again.",
+    // The trip link a main organizer hands out: what the person who opens it is told. {trip} is the trip's title.
+    secondaryJoined: "Done — you now organize \"{trip}\" from Telegram. Send /trips to see it, /switch to talk to it from this chat, and ask me anything about it. You can't add organizers, create links or see this organizer's other trips.",
+    // Opened by someone who already organizes the trip (the main organizer's own Telegram, or an organizer already). The link is NOT spent.
+    secondaryAlready: "You already organize \"{trip}\", so this link is not for you. It adds someone else — send it to them.",
+    // ONE sentence for every refusal (expired, used, unknown, not the organizer's any more).
+    secondaryRefused: "That link didn't work — it may have expired or been used already. Ask the trip's organizer for a new one.",
+    // To the main organizer, in their chat. {who} is "Dana (@dana)"; {trip} the title.
+    secondaryJoinedNotice: "{who} joined \"{trip}\" as an organizer. They can organize this trip from Telegram and open its organizer view on the trip site. They can't add organizers, create links, approve requests or see your other trips. You can remove them from the trip's page in Kinerary.",
     // A valid group code posted in a group that belongs to ANOTHER trip, by someone who is not an
     // organizer of both. One sentence for every way of being refused, so it confirms nothing about
     // who organizes what.
@@ -1022,6 +1037,14 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     switchInGroup: "אני יכול להחליף טיול רק בצ׳אט הפרטי בינינו — הקבוצה הזו נשארת על הטיול שלה.",
     telegramLinked: "בוצע — חשבון הטלגרם הזה מקושר עכשיו אל \"{trip}\". שלחו ‎/trips‎ כדי לראות אותו, ו‎/switch‎ כדי לדבר איתו מהצ׳אט הזה.",
     telegramLinkRefused: "הקישור הזה לא עבד — ייתכן שפג תוקפו או שכבר נעשה בו שימוש. היכנסו ל-Kinerary, מצאו את הטיול ובחרו Link Telegram כדי לקבל קישור חדש.",
+    // ── טלגרם ראשי לכל חשבון, ומארגנים משניים (#523) ─────────────────────────
+    mainTelegramLinked: "בוצע — חשבון הטלגרם הזה הוא עכשיו הטלגרם הראשי שלכם ב-Kinerary. הוא מנהל את כל הטיולים שלכם, אלה שיש לכם עכשיו ואלה שתיצרו בהמשך. שלחו ‎/trips‎ כדי לראות אותם, ו‎/switch‎ כדי לדבר עם אחד מהם מהצ׳אט הזה.",
+    mainTelegramLinkedReplaced: "בוצע — חשבון הטלגרם הזה הוא עכשיו הטלגרם הראשי שלכם ב-Kinerary, והחשבון שבו השתמשתם קודם נותק מהטיולים שלכם. הוא מנהל את כל הטיולים שלכם, אלה שיש לכם עכשיו ואלה שתיצרו בהמשך. שלחו ‎/trips‎ כדי לראות אותם.",
+    mainTelegramReplaced: "חשבון טלגרם אחר חובר עכשיו כטלגרם הראשי של חשבון ה-Kinerary שלכם, ולכן החשבון הזה כבר לא מנהל את הטיולים שלכם. אם זה לא הייתם אתם, היכנסו ל-Kinerary וחברו את החשבון הזה מחדש.",
+    secondaryJoined: "בוצע — מעכשיו אתם מארגנים את \"{trip}\" מהטלגרם. שלחו ‎/trips‎ כדי לראות אותו, ‎/switch‎ כדי לדבר איתו מהצ׳אט הזה, ושאלו אותי עליו כל דבר. אי אפשר להוסיף מארגנים, ליצור קישורים או לראות את שאר הטיולים של המארגן.",
+    secondaryAlready: "אתם כבר מארגנים את \"{trip}\", ולכן הקישור הזה לא מיועד לכם. הוא מוסיף מישהו אחר — שלחו אותו אליו.",
+    secondaryRefused: "הקישור הזה לא עבד — ייתכן שפג תוקפו או שכבר נעשה בו שימוש. בקשו מהמארגן של הטיול קישור חדש.",
+    secondaryJoinedNotice: "{who} הצטרף כמארגן אל \"{trip}\". אפשר לארגן את הטיול מהטלגרם ולפתוח את תצוגת המארגן באתר הטיול. אי אפשר להוסיף מארגנים, ליצור קישורים, לאשר בקשות או לראות את שאר הטיולים שלכם. אפשר להסיר אותו מעמוד הטיול ב-Kinerary.",
     groupMoveNotOrganizer: "הקבוצה הזו שייכת לטיול אחר. רק מי שמארגן אותו יכול להעביר אותה.",
     // ── מארגן אחד, טלגרם אחד (#519) ──────────────────────────────────────
     linkOtherBelongs: "הקישור הזה נוצר עבור מארגן אחר, ולכן אני לא יכול לפתוח אותו עבורכם. אם הוא אמור להיות שלכם, בקשו אותו מהמארגן.",

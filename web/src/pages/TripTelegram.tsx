@@ -97,15 +97,16 @@ export function TripTelegram({ trip }: { trip: TripSummary }) {
         <div className="telegram-menu" role="menu" aria-label={`Telegram for ${trip.title}`}>
           <p className="subtle telegram-state">{linked ? `${links.length === 1 ? "A Telegram account is" : `${links.length} Telegram accounts are`} linked to this trip.` : "No Telegram account is linked to this trip."}</p>
           {organizerSide && scoped && <small>Signed in with Telegram: to link another Telegram account, sign in with your password.</small>}
+          {canLink && !link.data && <small className="subtle">Link Telegram sets your main Telegram account for all your trips. To add someone who helps organize just this trip, use "Other organizers" on the trip's page.</small>}
           {canLink && !link.data && (
             <button type="button" role="menuitem" className="text-button" onClick={() => link.mutate()} disabled={link.isPending}>
-              {link.isPending ? "Preparing link…" : linked ? "Link another Telegram" : "Link Telegram"}
+              {link.isPending ? "Preparing link…" : "Link Telegram"}
             </button>
           )}
           {link.data && (
             <div className="telegram-issued">
               <a className="button button-small" href={link.data.deepLink} target="_blank" rel="noopener noreferrer">Open in Telegram</a>
-              <small>Works once, until {formatTime(link.data.expiresAt)}. Open it in the Telegram account you want to link to this trip.</small>
+              <small>Works once, until {formatTime(link.data.expiresAt)}. Open it in the Telegram account you want as your main one. It will run all your trips, now and later, and replaces the main Telegram account you had.</small>
             </div>
           )}
           {/* Restore: no Telegram round trip, but it asks first - the label (first name, @username) is how the owner

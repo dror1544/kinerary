@@ -32,6 +32,26 @@ describe("the organizer's way back to the dashboard", () => {
     }
   });
 
+  it("offers a way to add or remove organizers beside it, to the same people and no others (#523)", () => {
+    renderMenu({ username: "alice", is_organizer: true, dashboard_url: "https://portal.example.test/trips/trip_abcdefgh/setup" });
+    expect(screen.getByRole("link", { name: "Add or remove organizers" })).toHaveAttribute("href", "https://portal.example.test/trips/trip_abcdefgh/setup#other-organizers");
+    cleanup();
+    renderMenu({ username: "alice", is_organizer: true, dashboard_url: "https://portal.example.test/trips/trip_abcdefgh/setup" }, "he");
+    expect(screen.getByRole("link", { name: "הוספה או הסרה של מארגנים" })).toBeInTheDocument();
+    cleanup();
+    // A secondary organizer is an organizer here and is sent no dashboard address, so neither entry appears.
+    renderMenu({ username: "org-0123456789ab", is_organizer: true, is_secondary_organizer: true });
+    expect(screen.queryByTestId("organizer-people-link")).toBeNull();
+    expect(screen.queryByTestId("organizer-dashboard-link")).toBeNull();
+    expect(screen.getByRole("link", { name: "Open Classic organizer fallback" })).toBeInTheDocument();
+    cleanup();
+    for (const user of [{ username: "bob" }, undefined] as (CurrentUser | undefined)[]) {
+      renderMenu(user);
+      expect(screen.queryByTestId("organizer-people-link")).toBeNull();
+      cleanup();
+    }
+  });
+
   it("refuses any href that is not plain http(s) without credentials", () => {
     for (const bad of ["javascript:alert(1)", "data:text/html,x", "vbscript:x", "//evil.example/x", "/relative", "https://user:pw@portal.example.test/", "not a url", ""]) {
       expect(dashboardHref(bad), bad).toBe("");

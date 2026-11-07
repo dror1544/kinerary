@@ -25,15 +25,15 @@
  *
  * ONE ORGANIZER, ONE TELEGRAM (#519) DOES NOT APPLY HERE, ON PURPOSE. That rule asks "is the Telegram account that opened
  * this interview link the one the organizer's account is bound to?" because an interview link is a bearer token that can be
- * forwarded, and nothing else vouches for who opened it. This link is different in the one respect that matters: it is
- * issued only to a SIGNED-IN owner (full session and CSRF) for a trip they run, so the account half is proven by the owner
- * themselves, and the owner chose to hand this link to the Telegram account that opens it -- that is the point of it, and
- * the way a second Telegram account is added or a revoked one is brought back. Asking the bound account to approve what
- * the owner just did from their own dashboard would be asking them to approve themselves, and would leave an organizer
- * who lost their phone with no way back. The costs of a leaked link are bounded instead, as below: short, single use, one
- * trip, announced on first sign-in and listed on the card for Unlink. And it reaches that ONE trip only: the link is written
- * with `binding_scope = 'trip'`, so the Telegram it adds is not "the account's Telegram" for the organizer's other trips and a
- * leaked link cannot open their interview links (owner decision 2026-11-06; organizer-trips.ts `boundTelegramAccounts`).
+ * forwarded. This link is different: it is issued only to a SIGNED-IN owner (full session and CSRF), so the account half is
+ * proven by the owner themselves, and the owner chose to hand it to the Telegram account that opens it.
+ *
+ * SINCE #523 IT MAKES THE ACCOUNT'S MAIN TELEGRAM, not a one-trip addition. The opener is linked on EVERY trip the issuer runs
+ * with `binding_scope = 'account'`, and a different Telegram that was the main one is replaced (its account-scoped links end
+ * through `revokeOrganizerLinkInTx` with the reason `main_telegram_replaced`). Trip-scoped links already in the table (an
+ * approval, or a link #519 narrowed) are not promoted by this release and not touched by a replacement; the owner widens one by
+ * linking from that Telegram. The costs of a leaked link are bounded as before: short, single use, announced on first sign-in
+ * and listed on the card for Unlink - and, new, the previous main is told in its own chat that it was replaced.
  *
  * The token pattern is the enrollment's (enrollment.ts): random bytes, only the
  * sha256 stored, row-locked consume. No new crypto.
@@ -45,8 +45,9 @@
 import { createHash, randomBytes } from "node:crypto";
 import type pg from "pg";
 import { digestTelegramId, isPrivateChatId, type TelegramName } from "./identity.js";
-import { LIVE_INTAKE_SESSION_PREDICATE } from "./organizer-trips.js";
-import { CHAT_DIGEST_SQL } from "./telegram-mini-app.js";
+import { LIVE_INTAKE_SESSION_PREDICATE, privateChatForDigest } from "./organizer-trips.js";
+import { endSecondaryBindingsOfDigestInTx } from "./secondary-organizers.js";
+import { CHAT_DIGEST_SQL, revokeOrganizerLinkInTx } from "./telegram-mini-app.js";
 import { NOT_RETIRED_SQL } from "./trip-retirement.js";
 
 /** How long an issued link works. Short on purpose; issuing another is one click. */
@@ -171,7 +172,16 @@ export async function issueTelegramLinkToken(
 }
 
 export type RedeemLinkTokenResult =
-  | { ok: true; tripTitle: string; alreadyLinked: boolean }
+  | {
+      ok: true;
+      tripTitle: string;
+      alreadyLinked: boolean;
+      /**
+       * The main Telegram accounts this link REPLACED (#523), one entry per account, each with the private chat that reaches
+       * it (read before its links ended) or null when none can be reached. The router tells each chat once.
+       */
+      replaced: Array<{ chatId: string | null }>;
+    }
   | { ok: false; reason: "INVALID" };
 
 /**
@@ -180,13 +190,26 @@ export type RedeemLinkTokenResult =
  * integer); anything else is refused without touching the token, so a link
  * opened in a group stays usable in the DM where it belongs.
  *
+ * WHAT IT MAKES (#523): the opener becomes the account's MAIN Telegram. A live
+ * `account`-scoped link is written (or, when this Telegram already holds a
+ * `trip`-scoped one, widened) on EVERY trip the issuer runs, so `/trips` lists them
+ * all and an interview link for any of them, or for a trip created later, opened
+ * from this Telegram is "the same account" (organizer-trips.ts
+ * `boundTelegramAccounts`). If ANOTHER Telegram account was the main one, its
+ * account-scoped links are revoked first, through the very function Unlink uses
+ * (`revokeOrganizerLinkInTx`) with the reason `main_telegram_replaced`, so a replaced
+ * main is never offered back by Restore. Left alone: trip-scoped links (an approval
+ * for one trip stays an approval for that trip), and everyone else's secondary
+ * organizer bindings. A Telegram that was a SECONDARY organizer of one of these trips
+ * stops being one: it is now the main organizer's own.
+ *
  * Everything is re-checked at redemption, not trusted from issue time: the
- * issuer must STILL run the trip. Consuming the token and writing the link are
+ * issuer must STILL run the trip. Consuming the token and writing the links are
  * one transaction, so a link is never left half made.
  *
- * A live link for the same (Telegram account, user, trip) is not an error — the
- * token is consumed and the chat is told it is linked. A REVOKED link does not
- * stand in the way: this is the path back from an Unlink.
+ * A live link for the same Telegram account is not an error: the token is
+ * consumed and the chat is told it is linked. A REVOKED link does not stand in the
+ * way: this is the path back from an Unlink.
  */
 export async function redeemTelegramLinkToken(
   db: pg.Pool,
@@ -217,34 +240,104 @@ export async function redeemTelegramLinkToken(
       return { ok: false, reason: "INVALID" };
     }
     const digest = digestTelegramId(telegramUserId);
-    const live = await client.query<{ id: string }>(
-      `SELECT id FROM control_plane.telegram_organizer_trip_links
-        WHERE telegram_subject_digest = $1 AND user_id = $2 AND trip_id = $3 AND revoked_at IS NULL`,
-      [digest, token.user_id, token.trip_id],
+
+    // Every trip the issuer runs today (the same predicate as the issuing check), locked in a stable order.
+    const trips = await client.query<{ trip_id: string }>(
+      `SELECT m.trip_id
+         FROM control_plane.trip_memberships m
+         JOIN control_plane.trips t ON t.id = m.trip_id
+         JOIN control_plane.users u ON u.id = m.user_id AND u.status = 'active'
+        WHERE m.user_id = $1 AND m.status = 'active' AND ${roleOk} AND ${NOT_RETIRED_SQL}
+          AND NOT EXISTS (
+                SELECT 1 FROM control_plane.telegram_chat_bindings d
+                 WHERE d.trip_id = t.id AND d.closed_reason = 'trip_destroyed')
+        ORDER BY m.trip_id
+          FOR UPDATE OF m`,
+      [token.user_id],
     );
-    let linkId = live.rows[0]?.id ?? null;
-    if (!linkId) {
-      linkId = opaqueId("otl");
+    const tripIds = trips.rows.map((r) => r.trip_id);
+
+    // 1. THE OLD MAIN(S) GO FIRST: every other Telegram account holding a live account-scoped link of this user. Each one's
+    //    chat is read BEFORE its links end (the reader looks at the rows the end touches).
+    const others = await client.query<{ id: string; telegram_subject_digest: string }>(
+      `SELECT id, telegram_subject_digest FROM control_plane.telegram_organizer_trip_links
+        WHERE user_id = $1 AND revoked_at IS NULL AND binding_scope = 'account' AND telegram_subject_digest <> $2
+        ORDER BY id FOR UPDATE`,
+      [token.user_id, digest],
+    );
+    const previous = new Map<string, string[]>();
+    for (const link of others.rows) previous.set(link.telegram_subject_digest, [...(previous.get(link.telegram_subject_digest) ?? []), link.id]);
+    // The sign-up identity, when it is a different Telegram account, stood for the account too (organizer-trips.ts
+    // `boundTelegramAccounts`). It has no link row to revoke, so the replacement is written as a revoked row (a tombstone) that
+    // `replaced_main` there reads.
+    const identities = await client.query<{ provider_subject_digest: string }>(
+      "SELECT provider_subject_digest FROM control_plane.user_identities WHERE user_id = $1 AND provider = 'telegram' AND provider_subject_digest <> $2",
+      [token.user_id, digest],
+    );
+    const replaced: Array<{ chatId: string | null }> = [];
+    const told = new Set<string>();
+    for (const [oldDigest, linkIds] of previous) {
+      replaced.push({ chatId: await privateChatForDigest(client, token.user_id, oldDigest) });
+      told.add(oldDigest);
+      for (const linkId of linkIds) await revokeOrganizerLinkInTx(client, token.user_id, linkId, "main_telegram_replaced");
+    }
+    for (const identity of identities.rows) {
+      const oldDigest = identity.provider_subject_digest;
+      const marked = await client.query(
+        `SELECT 1 FROM control_plane.telegram_organizer_trip_links
+          WHERE user_id = $1 AND telegram_subject_digest = $2 AND revoked_reason = 'main_telegram_replaced' LIMIT 1`,
+        [token.user_id, oldDigest],
+      );
+      if (marked.rowCount) continue;
+      if (!told.has(oldDigest)) replaced.push({ chatId: await privateChatForDigest(client, token.user_id, oldDigest) });
       await client.query(
         `INSERT INTO control_plane.telegram_organizer_trip_links
-           (id, user_id, trip_id, telegram_subject_digest, verified_via, telegram_first_name, telegram_username, binding_scope)
-         VALUES ($1, $2, $3, $4, 'dashboard_link_token', $5, $6, 'trip')`,
-        [linkId, token.user_id, token.trip_id, digest, telegramName?.firstName ?? null, telegramName?.username ?? null],
+           (id, user_id, trip_id, telegram_subject_digest, verified_via, binding_scope, revoked_at, revoked_reason, revoked_by)
+         VALUES ($1, $2, $3, $4, 'dashboard_link_token', 'account', now(), 'main_telegram_replaced', $2)`,
+        [opaqueId("otl"), token.user_id, token.trip_id, oldDigest],
       );
-    } else if (telegramName) {
-      await client.query(
-        `UPDATE control_plane.telegram_organizer_trip_links
-            SET telegram_first_name = COALESCE(telegram_first_name, $2), telegram_username = COALESCE(telegram_username, $3) WHERE id = $1`,
-        [linkId, telegramName.firstName, telegramName.username]);
     }
-    // A relink restores the bot's organizer fact an Unlink demoted, and only that (see the helper).
-    await restoreDemotedOrganizerPersonLink(client, token.trip_id, digest);
-    await client.query(
-      "UPDATE control_plane.telegram_link_tokens SET state = 'consumed', consumed_at = now(), consumed_link_id = $2 WHERE id = $1",
-      [token.id, linkId],
-    );
+
+    // 2. THE NEW MAIN: a live account-scoped link on every trip the issuer runs.
+    let alreadyLinked = false;
+    for (const tripId of tripIds) {
+      const live = await client.query<{ id: string; binding_scope: string }>(
+        `SELECT id, binding_scope FROM control_plane.telegram_organizer_trip_links
+          WHERE telegram_subject_digest = $1 AND user_id = $2 AND trip_id = $3 AND revoked_at IS NULL FOR UPDATE`,
+        [digest, token.user_id, tripId],
+      );
+      let linkId = live.rows[0]?.id ?? null;
+      if (linkId) {
+        if (tripId === token.trip_id && live.rows[0]!.binding_scope === "account") alreadyLinked = true;
+        await client.query(
+          `UPDATE control_plane.telegram_organizer_trip_links
+              SET binding_scope = 'account',
+                  telegram_first_name = COALESCE(telegram_first_name, $2), telegram_username = COALESCE(telegram_username, $3)
+            WHERE id = $1`,
+          [linkId, telegramName?.firstName ?? null, telegramName?.username ?? null],
+        );
+      } else {
+        linkId = opaqueId("otl");
+        await client.query(
+          `INSERT INTO control_plane.telegram_organizer_trip_links
+             (id, user_id, trip_id, telegram_subject_digest, verified_via, telegram_first_name, telegram_username, binding_scope)
+           VALUES ($1, $2, $3, $4, 'dashboard_link_token', $5, $6, 'account')`,
+          [linkId, token.user_id, tripId, digest, telegramName?.firstName ?? null, telegramName?.username ?? null],
+        );
+      }
+      // A relink restores the bot's organizer fact an Unlink demoted, and only that (see the helper).
+      await restoreDemotedOrganizerPersonLink(client, tripId, digest);
+      if (tripId === token.trip_id) {
+        await client.query(
+          "UPDATE control_plane.telegram_link_tokens SET state = 'consumed', consumed_at = now(), consumed_link_id = $2 WHERE id = $1",
+          [token.id, linkId],
+        );
+      }
+    }
+    // A Telegram that was a secondary organizer of one of these trips is now the main organizer's own account.
+    await endSecondaryBindingsOfDigestInTx(client, { tripIds, digest, reason: "became_main_organizer", revokedBy: token.user_id });
     await client.query("COMMIT");
-    return { ok: true, tripTitle, alreadyLinked: live.rows.length > 0 };
+    return { ok: true, tripTitle, alreadyLinked, replaced };
   } catch (error) {
     await client.query("ROLLBACK").catch(() => undefined);
     throw error;

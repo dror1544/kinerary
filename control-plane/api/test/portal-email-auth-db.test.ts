@@ -885,6 +885,6 @@ test("a reset revokes the user's unredeemed Telegram link tokens and interview l
     // A link issued from the new session works.
     const fresh = await issueTelegramLinkToken(pool, { userId, tripId });
     assert.ok(fresh.ok);
-    assert.deepEqual(await redeemTelegramLinkToken(pool, fresh.token, String(7_200_000_000 + Math.floor(Math.random() * 1_000_000))), { ok: true, tripTitle: "Rome", alreadyLinked: false });
+    assert.deepEqual(await redeemTelegramLinkToken(pool, fresh.token, String(7_200_000_000 + Math.floor(Math.random() * 1_000_000))), { ok: true, tripTitle: "Rome", alreadyLinked: false, replaced: [{ chatId: null }] }, "#523: the link redeemed before the reset belonged to another Telegram, which the new main replaces (no chat on record to tell)");
   } finally { await h.app.close(); }
 });

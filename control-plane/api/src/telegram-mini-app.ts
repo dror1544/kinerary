@@ -783,13 +783,23 @@ export async function unlinkTelegramLink(db: pg.Pool, userId: string, linkId: st
  * is recorded exactly like the first (`owner_unlinked`): it is the owner, from the Telegram the account is bound to, taking
  * the link away, and the dashboard lists it as restorable like any other.
  */
-export async function revokeOrganizerLinkInTx(client: pg.PoolClient, userId: string, linkId: string): Promise<boolean> {
+export async function revokeOrganizerLinkInTx(
+  client: pg.PoolClient,
+  userId: string,
+  linkId: string,
+  /**
+   * Why the link ended. `owner_unlinked` (the default) is an Unlink or an approved replacement and is listed for Restore.
+   * `main_telegram_replaced` (#523) is the owner linking a NEW main Telegram: the old one's account-scoped links end through
+   * this same function, with a reason of their own so the dashboard never offers a replaced main back for Restore.
+   */
+  reason: "owner_unlinked" | "main_telegram_replaced" = "owner_unlinked",
+): Promise<boolean> {
   const revoked = await client.query<{ telegram_subject_digest: string; trip_id: string }>(
     `UPDATE control_plane.telegram_organizer_trip_links
-        SET revoked_at = now(), revoked_reason = 'owner_unlinked', revoked_by = $2
+        SET revoked_at = now(), revoked_reason = $3, revoked_by = $2
       WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
       RETURNING telegram_subject_digest, trip_id`,
-    [linkId, userId],
+    [linkId, userId, reason],
   );
   const row = revoked.rows[0];
   if (!row) return false;

@@ -188,6 +188,8 @@ export type CurrentUser = {
   avatar_file?: string | null;
   google_picture?: string | null;
   is_organizer?: boolean;
+  /** A secondary organizer (#523): an organizer of this trip's site added by its main organizer, with no dashboard. */
+  is_secondary_organizer?: boolean;
   /** Only for an owner/organizer session opened from the dashboard. */
   dashboard_url?: string;
 };

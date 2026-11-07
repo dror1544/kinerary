@@ -21,6 +21,7 @@ import {
   type LabelVisibility, type TelegramMiniAppConfig,
 } from "./telegram-mini-app.js";
 import { issueTelegramLinkToken, restoreTelegramLink } from "./telegram-link-token.js";
+import { issueSecondaryOrganizerToken, listSecondaryOrganizers, removeSecondaryOrganizer } from "./secondary-organizers.js";
 import {
   ACCOUNT_SIGN_IN_REQUIRED, assertEveryRouteIsClassified, loadSessionScope, scopeDecision, scopedSessionDigest, sessionDigests,
   type SessionScope,
@@ -645,7 +646,10 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
               WHERE i.trip_id = m.trip_id AND i.redeemed_by = m.user_id AND i.state = 'redeemed'
               ORDER BY i.redeemed_at DESC LIMIT 1) AS runtime_username
        FROM control_plane.trip_memberships m JOIN control_plane.users u ON u.id = m.user_id
-      WHERE m.trip_id = $1 AND m.status = 'active' ORDER BY m.created_at, m.id`, [tripId]) : { rows: [] };
+      WHERE m.trip_id = $1 AND m.status = 'active'
+        -- a secondary organizer (#523) is listed, and removed, as one: not as a member the dashboard counts as an organizer
+        AND NOT EXISTS (SELECT 1 FROM control_plane.trip_secondary_organizers so WHERE so.trip_id = m.trip_id AND so.user_id = m.user_id)
+      ORDER BY m.created_at, m.id`, [tripId]) : { rows: [] };
   const isOrganizerSide = (role: string) => role === "owner" || role === "organizer";
   const members = memberRows.rows.map((row) => {
     const others = memberRows.rows.filter((other) => other.user_id !== row.user_id);
@@ -690,6 +694,11 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
       // session is never told which accounts were Unlinked, because it cannot restore one (portal-scope.ts).
       ...(opts.restorable ? { unlinked: (await unlinkedTelegramLinksByTrip(deps.db, userId, [tripId])).get(tripId) ?? [] } : {}),
     },
+    // Secondary organizers (#523), named for the MAIN organizer's page only: an owner on a full session. A Telegram-minted session
+    // is never handed this list (it cannot remove anyone, and the names are display data of other people).
+    ...(opts.restorable && trip.dashboard_access && trip.role === "owner"
+      ? { secondaryOrganizers: await listSecondaryOrganizers(deps.db, tripId) }
+      : {}),
     invites: invitesResult.rows.map((invite) => ({
       id: invite.id, displayName: invite.intended_display_name, runtimeUsername: invite.runtime_username,
       status: invite.state === "unused" && invite.expires_at.getTime() < Date.now() ? "expired" : invite.state,
@@ -1459,6 +1468,37 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     });
   });
 
+  // A TRIP LINK for a secondary organizer (#523): the trip's MAIN organizer (its owner, with dashboard access) hands it to
+  // somebody, who then organizes THIS trip from Telegram and gets its organizer view on the trip site. It MINTS a way into the
+  // trip, so a Telegram-minted (scoped) session may not ask for one - policy "account", a password or Google sign-in only - and a
+  // secondary organizer has no dashboard session at all. Not the owner, not a trip at all, retired: one 404.
+  const secondaryLinkAttempts: Attempts = new Map();
+  app.post("/v1/trips/:id/secondary-organizer-link", async (request, reply) => {
+    const user = await requireMutation(request, reply, deps);
+    if (!user) return;
+    reply.header("cache-control", "private, no-store");
+    if (!admitLogin(secondaryLinkAttempts, user.id, 10)) {
+      return reply.header("retry-after", "60").code(429).send({ error: "RATE_LIMITED" });
+    }
+    const tripId = (request.params as { id?: string }).id ?? "";
+    const issued = await issueSecondaryOrganizerToken(deps.db, { userId: user.id, tripId, ttlSeconds: deps.telegramLinkTtlSeconds });
+    if (!issued.ok) return reply.code(404).send({ error: "NOT_FOUND" });
+    return reply.code(201).send({
+      deepLink: `https://t.me/${deps.telegramBotUsername}?start=${encodeURIComponent(issued.token)}`,
+      expiresAt: issued.expiresAt.toISOString(),
+    });
+  });
+
+  // The main organizer removes a secondary organizer. Effective at once (secondary-organizers.ts `removeSecondaryOrganizer`).
+  app.delete("/v1/trips/:id/secondary-organizers/:secondaryId", async (request, reply) => {
+    const user = await requireMutation(request, reply, deps);
+    if (!user) return;
+    const params = request.params as { id?: string; secondaryId?: string };
+    const removed = await removeSecondaryOrganizer(deps.db, { actorUserId: user.id, tripId: params.id ?? "", secondaryId: params.secondaryId ?? "" });
+    if (!removed.ok) return reply.code(404).send({ error: "NOT_FOUND" });
+    return { status: "removed" };
+  });
+
   // Safe recovery metadata only: the original plaintext enrollment is never
   // persisted, reconstructed, or returned here.
   app.get("/v1/trips/:id/interview-link", async (request, reply) => {
@@ -1787,12 +1827,12 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     if (!exchangeKeyMatches(request.headers["x-api-key"], deps.runtimeExchangeKey)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
     const token = (request.body as Record<string, unknown>)?.token;
     if (typeof token !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
-    const result = await deps.db.query<{ id: string; trip_id: string; user_id: string; role: string; runtime_username: string | null; session_id: string | null }>(
+    const result = await deps.db.query<{ id: string; trip_id: string; user_id: string; role: string; dashboard_access: boolean; runtime_username: string | null; session_id: string | null }>(
       `UPDATE control_plane.runtime_launch_grants g SET consumed_at = now()
        FROM control_plane.trip_memberships m
        WHERE g.token_digest = $1 AND g.consumed_at IS NULL AND g.expires_at > now()
          AND m.trip_id = g.trip_id AND m.user_id = g.user_id AND m.status = 'active' AND m.runtime_access = true
-       RETURNING g.id, g.trip_id, g.user_id, g.session_id, m.role,
+       RETURNING g.id, g.trip_id, g.user_id, g.session_id, m.role, m.dashboard_access,
          (SELECT i.runtime_username FROM control_plane.site_invites i
           WHERE i.trip_id = g.trip_id AND i.redeemed_by = g.user_id AND i.state = 'redeemed'
           ORDER BY i.redeemed_at DESC LIMIT 1) AS runtime_username`, [sha256(token)]);
@@ -1801,7 +1841,8 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     // The way back to the dashboard, from this deployment's own configured
     // portal origin (no hostname in code). Only an owner/organizer has a
     // dashboard; the trip still re-checks the role before it serves the URL.
-    const dashboardUrl = row.role === "member" ? null : `${deps.publicOrigin}/trips/${row.trip_id}/setup`;
+    // A secondary organizer (#523) is an 'organizer' with NO dashboard access: no way back to a dashboard they cannot open.
+    const dashboardUrl = row.role === "member" || !row.dashboard_access ? null : `${deps.publicOrigin}/trips/${row.trip_id}/setup`;
     return { tripId: row.trip_id, userId: row.user_id, role: row.role, runtimeUsername: row.runtime_username, dashboardUrl, sessionId: row.session_id, audience: "runtime_gateway" };
   });
 

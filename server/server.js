@@ -834,6 +834,9 @@ function authRequired(req, res, next) {
     const payload = jwt.verify(token, JWT_SECRET);
     if (!controlPlaneAuth.validManagedPayload(payload)) return res.status(401).json({ error: 'invalid_token' });
     req.user = { username: payload.username };
+    // #523: a SECONDARY organizer (added by the main organizer with a trip link) is an organizer of THIS trip only. The mark
+    // exists only on a verified managed session whose binding is on file for this trip; it is read, never taken from a request.
+    if (controlPlaneAuth.isSecondaryOrganizerPayload(payload)) req.user.secondaryOrganizer = true;
     next();
   } catch {
     return res.status(401).json({ error: 'invalid_token' });
@@ -1020,24 +1023,45 @@ app.get('/api/config/warnings', authRequired, (_req, res) => {
 //     standing instructions it was given; and
 //   • the organizer's own browser session, which until now had no read path to
 //     organizer-only needs at all — they were stored and visible to nobody.
-function organizerOrAgentRequired(req, res, next) {
+//
+// TWO LEVELS OF ORGANIZER (#523). The MAIN organizer is a configured one (`agent.organizers`). A SECONDARY organizer is a person
+// the main organizer added with a trip link: the control plane vouches for them through the same session exchange as for any
+// member, and `controlPlaneAuth.isSecondaryOrganizerPayload` says so only for a managed session whose binding is on file for
+// THIS trip. `organizerOrAgentRequired` admits both. `mainOrganizerOrAgentRequired` admits only the main organizer and the
+// agent: it guards the routes that manage PEOPLE (participants, passwords, Telegram bindings, the trip group), because a
+// second organizer must not be able to add organizers, reset the main organizer's password or rebind their Telegram.
+function organizerSession(req, res) {
   const apiKey = req.headers['x-api-key'];
-  if (timingSafeKeyMatch(apiKey, HERMES_KEY)) { req.user = AGENT_USER; return next(); }
+  if (timingSafeKeyMatch(apiKey, HERMES_KEY)) return { agent: true };
 
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : (req.query._t || null);
-  if (!token) return res.status(401).json({ error: 'unauthorized' });
+  if (!token) { res.status(401).json({ error: 'unauthorized' }); return null; }
   let payload;
-  try { payload = jwt.verify(token, JWT_SECRET); } catch { return res.status(401).json({ error: 'invalid_token' }); }
+  try { payload = jwt.verify(token, JWT_SECRET); } catch { res.status(401).json({ error: 'invalid_token' }); return null; }
 
-  if (!controlPlaneAuth.validManagedPayload(payload)) return res.status(401).json({ error: 'invalid_token' });
+  if (!controlPlaneAuth.validManagedPayload(payload)) { res.status(401).json({ error: 'invalid_token' }); return null; }
   const organizers = normalizeOrganizers(TRIP_CONFIG.agent);
   // No configured organizer means nobody qualifies. Failing closed here matters
   // more than convenience: the alternative — treating "unset" as "everyone" —
   // would silently publish every organizer-only note the moment a trip is
   // scaffolded without an agent block.
-  if (!organizers.length || !organizers.includes(payload.username)) return res.status(403).json({ error: 'organizer_only' });
-  req.user = { username: payload.username };
+  return { username: payload.username, main: organizers.length > 0 && organizers.includes(payload.username), secondary: controlPlaneAuth.isSecondaryOrganizerPayload(payload) };
+}
+function organizerOrAgentRequired(req, res, next) {
+  const who = organizerSession(req, res);
+  if (!who) return undefined;
+  if (who.agent) { req.user = AGENT_USER; return next(); }
+  if (!who.main && !who.secondary) return res.status(403).json({ error: 'organizer_only' });
+  req.user = { username: who.username, ...(who.secondary && !who.main ? { secondaryOrganizer: true } : {}) };
+  next();
+}
+function mainOrganizerOrAgentRequired(req, res, next) {
+  const who = organizerSession(req, res);
+  if (!who) return undefined;
+  if (who.agent) { req.user = AGENT_USER; return next(); }
+  if (!who.main) return res.status(403).json({ error: 'organizer_only' });
+  req.user = { username: who.username };
   next();
 }
 
@@ -1273,7 +1297,7 @@ const ENROLLMENT_TTL_MS = 30 * 60 * 1000;
 // returns a one-time enrollment token for the organizer to relay — the
 // participant sets their own password via POST /api/auth/enroll, it is never
 // collected here or in chat.
-app.post('/api/agent/participants', organizerOrAgentRequired, async (req, res) => {
+app.post('/api/agent/participants', mainOrganizerOrAgentRequired, async (req, res) => {
   const { username, name, name_en, color, family, telegram_id } = req.body || {};
   if (!username || !name) {
     return res.status(400).json(!name && username ? textRules.requiredRefusal('missing_fields', 'name', textRules.PARTICIPANT_FIELDS) : { error: 'missing_fields' });
@@ -1360,7 +1384,7 @@ app.post('/api/agent/participants', organizerOrAgentRequired, async (req, res) =
 // the same terms as a brand-new participant; redeemed the same way, through
 // POST /api/auth/enroll. Does not touch trip.config.json or re-seed the
 // user — the row already exists, only its password needs to change.
-app.post('/api/agent/participants/:username/reset-password', organizerOrAgentRequired, async (req, res) => {
+app.post('/api/agent/participants/:username/reset-password', mainOrganizerOrAgentRequired, async (req, res) => {
   const uname = String(req.params.username).toLowerCase().trim();
   const existing = db.prepare('SELECT removed_at FROM users WHERE username = ?').get(uname);
   if (!existing) {
@@ -1422,7 +1446,7 @@ app.post('/api/agent/participants/:username/reset-password', organizerOrAgentReq
 // dror": the organizer already knows which site username maps to which
 // Telegram account, this just records it. Unlike POST /api/agent/participants,
 // this never creates a participant or touches a password.
-app.patch('/api/agent/participants/:username/telegram', organizerOrAgentRequired, (req, res) => {
+app.patch('/api/agent/participants/:username/telegram', mainOrganizerOrAgentRequired, (req, res) => {
   const uname = String(req.params.username).toLowerCase().trim();
   const { telegram_id } = req.body || {};
   if (!telegram_id) return res.status(400).json({ error: 'missing_telegram_id' });
@@ -1463,7 +1487,7 @@ app.patch('/api/agent/participants/:username/telegram', organizerOrAgentRequired
 // fresh working login. Blocks removing a currently-configured organizer;
 // that's a deliberate, separate decision, not something that should fall out
 // of a generic remove call.
-app.delete('/api/agent/participants/:username', organizerOrAgentRequired, async (req, res) => {
+app.delete('/api/agent/participants/:username', mainOrganizerOrAgentRequired, async (req, res) => {
   const uname = String(req.params.username).toLowerCase().trim();
   const idx = (TRIP_CONFIG.participants || []).findIndex(p => p.username === uname);
   if (idx === -1) return res.status(404).json({ error: 'user_not_found' });
@@ -1506,7 +1530,7 @@ app.delete('/api/agent/participants/:username', organizerOrAgentRequired, async 
 // via getChatMember, that a Telegram-bound organizer is really an active
 // member of the given chat before trusting it, so a wrong or made-up
 // chat_id can't silently become "the trip group."
-app.post('/api/agent/telegram-group', organizerOrAgentRequired, async (req, res) => {
+app.post('/api/agent/telegram-group', mainOrganizerOrAgentRequired, async (req, res) => {
   if (!TELEGRAM_BOT_TOKEN) return res.status(409).json({ error: 'telegram_bot_not_configured' });
   const chatId = String((req.body || {}).chat_id ?? '').trim();
   if (!/^-\d+$/.test(chatId)) return res.status(400).json({ error: 'invalid_chat_id' });
@@ -1638,7 +1662,10 @@ app.get('/api/auth/me', authRequired, (req, res) => {
   const user = getUser(req.user.username);
   if (!user) return res.status(404).json({ error: 'not_found' });
   const organizers = normalizeOrganizers(TRIP_CONFIG.agent);
-  const body = { ...user, is_organizer: organizers.includes(user.username) };
+  const secondary = Boolean(req.user.secondaryOrganizer);
+  // `is_secondary_organizer` (#523) tells the page which organizer controls to offer: a secondary organizer gets the organizer
+  // view without the ones that manage people (adding organizers lives on the dashboard, for the main organizer only).
+  const body = { ...user, is_organizer: organizers.includes(user.username) || secondary, ...(secondary ? { is_secondary_organizer: true } : {}) };
   // Present only for an organizer. authRequired is not an organizer check and
   // carries no claim, so the person is checked again here. Through the dashboard
   // the managed session is verified (signature, binding, active participant,
@@ -2561,7 +2588,7 @@ app.get('/photo/:id', (req, res) => {
 // — is organizer/agent-only, the same as before this fix for everyone else:
 // nobody's line becomes "anyone's to edit" by virtue of predating the column.
 function isOrganizerOrAgent(req) {
-  return Boolean(req.user?.isAgent) || normalizeOrganizers(TRIP_CONFIG.agent).includes(req.user?.username);
+  return Boolean(req.user?.isAgent) || Boolean(req.user?.secondaryOrganizer) || normalizeOrganizers(TRIP_CONFIG.agent).includes(req.user?.username);
 }
 function canEditBudgetItem(req, row) {
   return isOrganizerOrAgent(req) || row.created_by === req.user?.username;
@@ -3045,6 +3072,7 @@ function withCorrection(row) {
 // Classic plan projection below silently didn't.
 function canReviewDrafts(req) {
   return Boolean(req?.user?.isAgent)
+      || Boolean(req?.user?.secondaryOrganizer)
       || normalizeOrganizers(TRIP_CONFIG.agent).includes(req?.user?.username);
 }
 
