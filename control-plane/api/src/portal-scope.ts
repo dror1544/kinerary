@@ -121,6 +121,10 @@ export const PORTAL_SCOPE_POLICY: Readonly<Record<string, RouteScope>> = Object.
   "POST /v1/trips/:id/interview-link": "account",
   "POST /v1/trips/:id/interview-link/replace": "account",
   "POST /v1/trips/:id/telegram-link": "account",
+  // A trip link for a secondary organizer (#523) mints a way into the trip, and removing one takes it from another person: a
+  // password or Google sign-in only, like the site invites below.
+  "POST /v1/trips/:id/secondary-organizer-link": "account",
+  "DELETE /v1/trips/:id/secondary-organizers/:secondaryId": "account",
   "POST /v1/trips/:id/provisioning-request": "trip",
   "POST /v1/trips/:id/plans/:planId/approve": "trip",
   "POST /v1/trips/:id/plans/:planId/reject": "trip",

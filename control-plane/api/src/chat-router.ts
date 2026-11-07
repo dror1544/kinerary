@@ -43,7 +43,7 @@ import {
   type Language,
   unsettledText,
 } from "./intake-copy.js";
-import { hasEarlierBuiltTrip, LIVE_INTAKE_SESSION_PREDICATE, type OrganizerTrip } from "./organizer-trips.js";
+import { hasEarlierBuiltTrip, isSecondaryOrganizer, LIVE_INTAKE_SESSION_PREDICATE, secondaryOrganizerName, type OrganizerTrip } from "./organizer-trips.js";
 import type { RosterChoice } from "./organizer-identity.js";
 import {
   closeStaleSessionForChat,
@@ -293,6 +293,18 @@ export async function resolveTripPerson(
     [tripId, telegramUserId, digest],
   );
   const row = rows[0];
+  // A SECONDARY ORGANIZER (#523) is an organizer of this trip by the main organizer's own act, recorded in its own table
+  // (organizer-trips.ts). It outranks a participant row for the same Telegram account (a family member who is then made an
+  // organizer), and is the only fact there is for one who is on no participant row at all (empty username: the site's
+  // participant name is not theirs to claim, and no caller uses it as a key). Never reads a message.
+  const secondary = await secondaryOrganizerName(db, tripId, telegramUserId);
+  if (secondary) {
+    return {
+      username: row?.participant_username ?? "",
+      displayName: row?.display_name ?? secondary.displayName,
+      role: "organizer",
+    };
+  }
   return row
     ? { username: row.participant_username, displayName: row.display_name, role: row.role }
     : null;
@@ -708,6 +720,9 @@ export async function isTripOrganizer(db: Queryable, tripId: string, telegramUse
   if (!tripId || !telegramUserId) return false;
   if ((await resolveTripPerson(db, tripId, telegramUserId))?.role === "organizer") return true;
   if (!isPrivateChatId(telegramUserId)) return false;
+  // A secondary organizer (#523) organizes THIS trip only; `resolveTripPerson` above already counts one, so a person-link row
+  // that says 'participant' does not hide them. Asked again here by name so the rule survives a change to that function.
+  if (await isSecondaryOrganizer(db, tripId, telegramUserId)) return true;
   const result = await db.query(
     `SELECT 1
        FROM control_plane.telegram_organizer_trip_links l

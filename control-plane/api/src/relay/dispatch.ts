@@ -64,6 +64,7 @@ import {
   type LinkDecisionResult,
 } from "../organizer-link-approval.js";
 import { redeemTelegramLinkToken, telegramLinkTokenFromStartPayload } from "../telegram-link-token.js";
+import { bindSecondaryOrganizerChat, redeemSecondaryOrganizerToken, secondaryOrganizerTokenFromStartPayload } from "../secondary-organizers.js";
 import { isAddressedToAssistant } from "./addressing.js";
 import { addressedMark, conversationMark, reactionAnswerMark } from "./stay-silent.js";
 import type { GroupJudge, JudgeOutcome } from "./group-judge.js";
@@ -733,16 +734,66 @@ export async function dispatchUpdate(
       return { kind: "reply", reply: { chatId, text: strings.notPrivate } };
     }
     const linked = await redeemTelegramLinkToken(db, linkToken, String(message.from.id), telegramDisplayName(message.from));
-    log(structuredLog("info", "trip_bot.telegram_link", { outcome: linked.ok ? (linked.alreadyLinked ? "already_linked" : "linked") : "refused" }));
-    return {
-      kind: "reply",
-      reply: {
-        chatId,
-        text: linked.ok
-          ? uiString("telegramLinked", language).replace("{trip}", () => linked.tripTitle)
-          : uiString("telegramLinkRefused", language),
-      },
-    };
+    log(structuredLog("info", "trip_bot.telegram_link", {
+      outcome: linked.ok ? (linked.alreadyLinked ? "already_linked" : "linked") : "refused",
+      ...(linked.ok ? { replaced_main: linked.replaced.length } : {}),
+    }));
+    if (!linked.ok) return { kind: "reply", reply: { chatId, text: uiString("telegramLinkRefused", language) } };
+    // The opener is now the account's MAIN Telegram (#523). If it replaced another, that account is told ONCE in its own chat
+    // (in that chat's language) - and nothing about any trip: it learns only that it no longer runs the account's trips.
+    const mainReplies: DirectReply[] = [{
+      chatId,
+      text: uiString(linked.replaced.length > 0 ? "mainTelegramLinkedReplaced" : "mainTelegramLinked", language),
+    }];
+    for (const old of linked.replaced) {
+      if (!old.chatId || old.chatId === chatId) continue;
+      mainReplies.push({ chatId: old.chatId, text: uiString("mainTelegramReplaced", await resolveChatLanguage(db, old.chatId, undefined)) });
+    }
+    return mainReplies.length > 1 ? { kind: "multi_reply", replies: mainReplies } : { kind: "reply", reply: mainReplies[0]! };
+  }
+
+  // A SECONDARY ORGANIZER'S TRIP LINK (#523): `so_` + 32 characters, issued by the trip's main organizer. Whoever opens it, in
+  // their private chat, organizes THAT trip. Same discipline as the account link above: private chats only (a link opened in a
+  // group is not consumed), the sender is the update's own id, and every refusal is one sentence.
+  const secondaryToken = parsed.kind === "start" ? secondaryOrganizerTokenFromStartPayload(parsed.payload) : null;
+  if (secondaryToken) {
+    const language = await resolveChatLanguage(db, chatId, message.from?.language_code);
+    if (message.chat?.type !== "private" || message.from?.id === undefined) {
+      return { kind: "reply", reply: { chatId, text: strings.notPrivate } };
+    }
+    const joinedName = telegramDisplayName(message.from);
+    const joined = await redeemSecondaryOrganizerToken(db, secondaryToken, String(message.from.id), joinedName);
+    log(structuredLog("info", "trip_bot.secondary_organizer_link", {
+      outcome: joined.ok ? (joined.alreadyJoined ? "already_joined" : "joined") : joined.reason === "ALREADY_ORGANIZER" ? "already_organizer" : "refused",
+    }));
+    if (!joined.ok) {
+      return {
+        kind: "reply",
+        reply: {
+          chatId,
+          text: joined.reason === "ALREADY_ORGANIZER"
+            ? uiString("secondaryAlready", language).replace("{trip}", () => joined.tripTitle)
+            : uiString("secondaryRefused", language),
+        },
+      };
+    }
+    // Their DM reaches the trip's companion when the chat is free; otherwise /trips and /switch do. Never an error to the redemption.
+    await bindSecondaryOrganizerChat(db, chatId, joined.tripId).catch((error) => {
+      log(structuredLog("warn", "trip_bot.secondary_organizer_chat_bind_failed", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN" }));
+      return false;
+    });
+    const joinedReplies: DirectReply[] = [{ chatId, text: uiString("secondaryJoined", language).replace("{trip}", () => joined.tripTitle) }];
+    // The main organizer is told who joined (first name and @username) - once, the first time only.
+    if (!joined.alreadyJoined && joined.toMainOrganizer && joined.toMainOrganizer.chatId !== chatId) {
+      const mainLanguage = await resolveChatLanguage(db, joined.toMainOrganizer.chatId, undefined);
+      joinedReplies.push({
+        chatId: joined.toMainOrganizer.chatId,
+        text: uiString("secondaryJoinedNotice", mainLanguage)
+          .replace("{who}", () => whoText(joinedName, mainLanguage))
+          .replace("{trip}", () => joined.tripTitle),
+      });
+    }
+    return joinedReplies.length > 1 ? { kind: "multi_reply", replies: joinedReplies } : { kind: "reply", reply: joinedReplies[0]! };
   }
 
   if (parsed.kind === "start" && !groupStartToken) {

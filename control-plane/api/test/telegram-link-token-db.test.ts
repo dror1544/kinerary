@@ -205,7 +205,7 @@ test("issuing is rate limited per person", { skip }, async () => {
 
 // ── Redeeming: the Telegram-identity half ───────────────────────────────────
 
-test("opening the link in the bot's private chat links THAT Telegram account to the issuer for that trip only, once", { skip }, async () => {
+test("opening the link in the bot's private chat makes THAT Telegram account the issuer's MAIN one, on every trip they run, once", { skip }, async () => {
   const app = newApp();
   try {
     const user = await mkUser("Olive"); const rome = await mkTrip("Rome 2027"); const oslo = await mkTrip("Oslo 2027");
@@ -215,14 +215,18 @@ test("opening the link in the bot's private chat links THAT Telegram account to 
     const telegramId = tg();
 
     const reply = replyOf(await dispatch(startMessage(telegramId, token)));
-    assert.match(reply, /linked to "Rome 2027"/);
+    assert.equal(reply, uiString("mainTelegramLinked", "en"));
+    assert.match(reply, /main one/);
     assert.match(reply, /\/trips/);
     const links = await liveLinks(user, rome);
     assert.equal(links.rowCount, 1);
     assert.equal(links.rows[0].verified_via, "dashboard_link_token");
     assert.equal(links.rows[0].telegram_subject_digest, digestTelegramId(String(telegramId)));
-    assert.equal((await liveLinks(user, oslo)).rowCount, 0, "one trip, not the account");
-    assert.deepEqual((await listOrganizerTrips(pool, String(telegramId), String(telegramId))).map((t) => t.tripId), [rome]);
+    // #523 AC-1: account-wide. The other trip the account runs is linked too, and both are ACCOUNT scoped.
+    assert.equal((await liveLinks(user, oslo)).rowCount, 1, "every trip the account runs, not one");
+    const scopes = await pool.query("SELECT binding_scope FROM control_plane.telegram_organizer_trip_links WHERE user_id = $1 AND revoked_at IS NULL", [user]);
+    assert.deepEqual(scopes.rows.map((r) => r.binding_scope), ["account", "account"]);
+    assert.deepEqual((await listOrganizerTrips(pool, String(telegramId), String(telegramId))).map((t) => t.tripId).sort(), [rome, oslo].sort());
 
     // Single use: the same link, again, from anyone.
     const again = replyOf(await dispatch(startMessage(tg(), token)));
@@ -273,7 +277,7 @@ test("a link opened in a group is not consumed; the Telegram account is the upda
     assert.equal((await pool.query("SELECT state FROM control_plane.telegram_link_tokens WHERE user_id = $1", [user])).rows[0].state, "issued", "still usable in the DM");
     // In the DM it works, and what is linked is the SENDER's id, not anything in the text.
     const sender = tg();
-    assert.match(replyOf(await dispatch(startMessage(sender, token))), /linked to "Group trip"/);
+    assert.match(replyOf(await dispatch(startMessage(sender, token))), /main one/);
     assert.equal((await liveLinks(user, trip)).rows[0].telegram_subject_digest, digestTelegramId(String(sender)));
   } finally { await app.close(); }
 });
@@ -287,18 +291,20 @@ test("the reply is in the person's language", { skip }, async () => {
     const update = startMessage(tg(), token);
     (update.message as unknown as { from: Record<string, unknown> }).from.language_code = "he";
     const reply = replyOf(await dispatch(update));
-    assert.equal(reply, uiString("telegramLinked", "he").replace("{trip}", "Tel Aviv"));
-    assert.match(reply, /Tel Aviv/);
+    assert.equal(reply, uiString("mainTelegramLinked", "he"));
+    assert.match(reply, /הטלגרם הראשי/);
   } finally { await app.close(); }
 });
 
-test("a title with replacement patterns in it is shown as written", { skip }, async () => {
+test("the reply names no trip: it is about the account, so a title cannot leak into it or be mangled by it", { skip }, async () => {
   const user = await mkUser("Olive"); const trip = await mkTrip("Trip $& and $1");
   await mkMember(trip, user);
   const issued = await issueTelegramLinkToken(pool, { userId: user, tripId: trip });
   assert.ok(issued.ok);
   const update = startMessage(tg(), issued.ok ? issued.token : "");
-  assert.match(replyOf(await dispatch(update)), /"Trip \$& and \$1"/);
+  const reply = replyOf(await dispatch(update));
+  assert.equal(reply, uiString("mainTelegramLinked", "en"));
+  assert.doesNotMatch(reply, /Trip/);
 });
 
 // ── The path back, end to end ───────────────────────────────────────────────
@@ -332,7 +338,7 @@ test("after an Unlink the dashboard link (or Restore, from a full session) is th
 
     // The signed-in dashboard issues a link; the Telegram account redeems it.
     const token = tokenOf((await issue(app, rome, session)).json().deepLink);
-    assert.match(replyOf(await dispatch(startMessage(telegramId, token))), /linked to "Rome"/);
+    assert.match(replyOf(await dispatch(startMessage(telegramId, token))), /main one/);
     assert.deepEqual((await listOrganizerTrips(pool, String(telegramId), String(telegramId))).map((t) => t.tripId).sort(), [rome, oslo].sort());
     const back = await exchange(initData({ start_param: rome }));
     assert.deepEqual(back.json(), { kind: "session", appPath: `/mini-app/trips/${rome}` });
