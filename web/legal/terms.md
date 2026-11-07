@@ -1,6 +1,6 @@
 # Kinerary Terms of Service
 
-*Early-access version, 30 October 2026. These terms are under legal review and may be updated; we will tell
+*Version of 31 October 2026. These terms are under legal review and may be updated; we will tell
 organizers before a material change. A Hebrew version will follow.*
 
 **Operator:** Dror Elul, a sole trader in Israel ("we", "us"). **Contact:** privacy@ara-united.store.
@@ -77,10 +77,21 @@ opening hours, prices, travel rules, visa or health advice can be out of date or
 
 - You keep ownership of what you and your travellers add: answers, documents, photos, comments.
 - You give us permission to store, process and show that content only to run Kinerary for your trip, as the
-  Privacy Policy describes (including processing by our AI providers), and, for families who agreed, to
-  evaluate and improve the product.
-- Photos and comments on a trip site are visible to the trip's signed-in travellers. A photo share link works
-  for anyone who has it.
+  Privacy Policy describes (including processing by our AI providers), and, unless the organizer has turned it
+  off in Personal settings, to evaluate and improve the product.
+- That includes using a trip's photos, and the time and place stored in them, to make content for that same
+  trip, such as albums, recaps, a journal or a route map.
+- You also give us permission to make de-identified route summaries from your trip and offer them to other
+  users, as the Privacy Policy describes (section 7), unless the organizer has turned this off. A summary never
+  identifies you or your family.
+- We do not show your photos outside your trip. If you choose to share a photo of a place or a view with other
+  users, you give us a free, non-exclusive permission to show it in Kinerary, with credit if you ask, until you
+  withdraw it. Photos of people are never shown outside the trip; we leave out any photo in which we detect a
+  person, and remove its location and camera details first.
+- Photos and comments on a trip site are visible to the trip's signed-in travellers. An album share link works
+  for anyone who has it. It shows the trip's place and the season and year, not when or where each photo was
+  taken, and photos cannot be downloaded from it. Links made before this change can still show each photo's
+  time and place until we update them.
 
 ## 9. Third-party services
 
