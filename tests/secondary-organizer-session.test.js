@@ -133,3 +133,16 @@ test('the main organizer keeps every organizer power, and a member still gets no
   const bob = await (await api('/api/auth/login', { method: 'POST', body: { username: 'bob', password: '1234' } })).json();
   assert.equal((await api('/api/agent/brief', { token: bob.token })).status, 403);
 });
+
+// DECISION (Dror, 2026-11-07, #523 boundary review): a secondary organizer DOES see the organizer-only standing instructions and
+// needs that /api/agent/brief carries. They organize the trip; the notes exist so the organizer can act on them. Pinned here so
+// narrowing it later is a decision someone has to make on purpose, not a side effect.
+test('DECISION: a secondary organizer sees the organizer-only notes and needs, exactly as the main organizer does', async () => {
+  const mine = await (await api('/api/agent/brief', { token: secondaryToken })).json();
+  const main = await (await api('/api/agent/brief', { token: aliceToken })).json();
+  assert.deepEqual(mine, main);
+  assert.ok(mine.standing_instructions.some(i => i.visibility === 'organizer'), 'the fixture has organizer-only instructions');
+  assert.ok(mine.needs.some(n => n.visibility === 'organizer'), 'and organizer-only needs');
+  const bob = await (await api('/api/auth/login', { method: 'POST', body: { username: 'bob', password: '1234' } })).json();
+  assert.equal((await api('/api/agent/brief', { token: bob.token })).status, 403, 'a member still gets nothing');
+});

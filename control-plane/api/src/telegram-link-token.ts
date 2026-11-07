@@ -30,9 +30,11 @@
  *
  * SINCE #523 IT MAKES THE ACCOUNT'S MAIN TELEGRAM, not a one-trip addition. The opener is linked on EVERY trip the issuer runs
  * with `binding_scope = 'account'`, and a different Telegram that was the main one is replaced (its account-scoped links end
- * through `revokeOrganizerLinkInTx` with the reason `main_telegram_replaced`). Trip-scoped links already in the table (an
- * approval, or a link #519 narrowed) are not promoted by this release and not touched by a replacement; the owner widens one by
- * linking from that Telegram. The costs of a leaked link are bounded as before: short, single use, announced on first sign-in
+ * through `revokeOrganizerLinkInTx` with the reason `main_telegram_replaced`). "Its links" include any link made by this same
+ * dashboard link at any scope: a phone added before #523 is trip-scoped (#519 narrowed it) and is still the owner's OLD phone,
+ * so lost-phone recovery ends it too. Not touched: a trip-scoped link from an APPROVAL (another person the owner approved for
+ * one trip) or an ordinary redemption. Trip-scoped links are not promoted by this release; the owner widens one by linking
+ * from that Telegram. The costs of a leaked link are bounded as before: short, single use, announced on first sign-in
  * and listed on the card for Unlink - and, new, the previous main is told in its own chat that it was replaced.
  *
  * The token pattern is the enrollment's (enrollment.ts): random bytes, only the
@@ -198,9 +200,11 @@ export type RedeemLinkTokenResult =
  * `boundTelegramAccounts`). If ANOTHER Telegram account was the main one, its
  * account-scoped links are revoked first, through the very function Unlink uses
  * (`revokeOrganizerLinkInTx`) with the reason `main_telegram_replaced`, so a replaced
- * main is never offered back by Restore. Left alone: trip-scoped links (an approval
- * for one trip stays an approval for that trip), and everyone else's secondary
- * organizer bindings. A Telegram that was a SECONDARY organizer of one of these trips
+ * main is never offered back by Restore. "Its links" are the account-scoped ones AND any
+ * link made by this same dashboard link at any scope (a phone added before #523 is
+ * trip-scoped and is still the owner's old phone). Left alone: a trip-scoped link from an
+ * APPROVAL (another person the owner approved for one trip), and everyone else's
+ * secondary organizer bindings. A Telegram that was a SECONDARY organizer of one of these trips
  * stops being one: it is now the main organizer's own.
  *
  * Everything is re-checked at redemption, not trusted from issue time: the
@@ -259,10 +263,28 @@ export async function redeemTelegramLinkToken(
 
     // 1. THE OLD MAIN(S) GO FIRST: every other Telegram account holding a live account-scoped link of this user. Each one's
     //    chat is read BEFORE its links end (the reader looks at the rows the end touches).
+    //    "The old main" is every OTHER live link that is the owner's own: an account-scoped one, and ANY link whose origin is
+    //    this same dashboard link, at any scope - a phone added with it before #523 was narrowed to its trip (#519's backfill)
+    //    and is no less the owner's old phone for that (lost-phone recovery: it must not keep organizer access). A
+    //    `dashboard_restore` row counts when the chain of restores behind it ends at a dashboard link. What is NOT touched:
+    //    a trip-scoped link from an APPROVAL (another person the owner approved for that trip) or from an ordinary
+    //    redemption, and every secondary organizer's binding.
     const others = await client.query<{ id: string; telegram_subject_digest: string }>(
-      `SELECT id, telegram_subject_digest FROM control_plane.telegram_organizer_trip_links
-        WHERE user_id = $1 AND revoked_at IS NULL AND binding_scope = 'account' AND telegram_subject_digest <> $2
-        ORDER BY id FOR UPDATE`,
+      `WITH RECURSIVE chain(target, source_id, source_via) AS (
+         SELECT r.id, o.id, o.verified_via
+           FROM control_plane.telegram_organizer_trip_links r
+           JOIN control_plane.telegram_organizer_trip_links o ON o.restored_link_id = r.id
+          WHERE r.verified_via = 'dashboard_restore' AND r.user_id = $1
+         UNION
+         SELECT c.target, o.id, o.verified_via
+           FROM chain c JOIN control_plane.telegram_organizer_trip_links o ON o.restored_link_id = c.source_id
+       )
+       SELECT l.id, l.telegram_subject_digest FROM control_plane.telegram_organizer_trip_links l
+        WHERE l.user_id = $1 AND l.revoked_at IS NULL AND l.telegram_subject_digest <> $2
+          AND (l.binding_scope = 'account'
+               OR l.verified_via = 'dashboard_link_token'
+               OR l.id IN (SELECT target FROM chain WHERE source_via = 'dashboard_link_token'))
+        ORDER BY l.id FOR UPDATE OF l`,
       [token.user_id, digest],
     );
     const previous = new Map<string, string[]>();

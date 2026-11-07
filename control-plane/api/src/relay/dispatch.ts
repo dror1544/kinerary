@@ -51,6 +51,7 @@ import {
   setGroupProactiveLevel,
   PROACTIVE_JOINS_IN,
   type ProactiveLevel,
+  isMainTripOrganizer,
   isTripOrganizer,
   tripLanguage,
 } from "../chat-router.js";
@@ -1158,7 +1159,9 @@ export async function dispatchUpdate(
     // route, and the token (and the link carrying it) binds a group to the trip.
     // A demoted organizer (link revoked) fails it too. Same sentence as every
     // other refusal here; no token is issued.
-    if (!(await isTripOrganizer(db, route.tripId, senderId))) {
+    // MAIN organizer only (#523): the link this hands out binds a family group to the trip, and moving a group is the main
+    // organizer's (group-binding.ts `senderMayMoveGroup`). A secondary organizer gets the same sentence as a member.
+    if (!(await isMainTripOrganizer(db, route.tripId, senderId))) {
       log(structuredLog("info", "trip_bot.group_token_refused", { reason: "NOT_ORGANIZER" }));
       return { kind: "reply", reply: { chatId, text: strings.groupTokenUnavailable } };
     }

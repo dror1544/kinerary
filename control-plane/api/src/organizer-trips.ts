@@ -365,6 +365,9 @@ export const LIVE_SECONDARY_ORGANIZER_SQL = `
     ON som.trip_id = so.trip_id AND som.user_id = so.user_id AND som.status = 'active' AND som.role = 'organizer'
   WHERE so.revoked_at IS NULL`;
 
+/** The `resolveTripPerson` role of a secondary organizer. Distinct from 'organizer' (the main one) on purpose (#523). */
+export const SECONDARY_ORGANIZER_ROLE = "secondary_organizer";
+
 /** Is this verified Telegram sender a live secondary organizer of `tripId`? Private-chat senders only; anything else is "no". */
 export async function isSecondaryOrganizer(
   q: Pick<pg.PoolClient, "query">,

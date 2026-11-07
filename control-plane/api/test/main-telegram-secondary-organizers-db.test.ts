@@ -12,7 +12,9 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { buildApp } from "../src/app.js";
 import { validateArchitectureProfile } from "../src/config.js";
-import { isTripOrganizer, resolveTripPerson } from "../src/chat-router.js";
+import { isMainTripOrganizer, isTripOrganizer, resolveTripPerson } from "../src/chat-router.js";
+import { requesterRoleOf } from "../src/analytics/contract.js";
+import { issueGroupBindingToken, redeemGroupBindingToken } from "../src/group-binding.js";
 import { issueEnrollment } from "../src/enrollment.js";
 import { digestTelegramId } from "../src/identity.js";
 import { UI_STRINGS, uiString } from "../src/intake-copy.js";
@@ -343,7 +345,7 @@ describe("AC-2: linking another Telegram REPLACES the main one", { skip }, () =>
     } finally { await app.close(); }
   });
 
-  test("a legacy trip-scoped dashboard link (#519) is NOT promoted by the migration or by another Telegram's linking; it is widened only when that Telegram links itself as main", async () => {
+  test("a legacy trip-scoped dashboard link (#519) is not promoted by the migration; the owner widens it by linking from that Telegram, and it ENDS when another Telegram becomes main", async () => {
     const app = newApp();
     try {
       const user = await mkUser(); const a = await mkTrip("A"); const b = await mkTrip("B");
@@ -351,16 +353,69 @@ describe("AC-2: linking another Telegram REPLACES the main one", { skip }, () =>
       const legacy = nextChat();
       const client = await pool.connect();
       try { await linkTelegramOrganizerInTx(client, legacy, user, a, "dashboard_link_token", null, "trip"); } finally { client.release(); }
-      const t1 = nextChat();
-      await linkMain(app, user, a, t1);
-      // The legacy Telegram is a trip-only Telegram: it was not an account link, so linking T1 as main leaves it where it was.
-      assert.equal((await liveLinks(a, legacy))[0].binding_scope, "trip");
-      assert.equal((await liveLinks(b, legacy)).length, 0);
-      // The owner makes it the main one by linking from it.
+      assert.equal((await liveLinks(a, legacy))[0].binding_scope, "trip", "not promoted by being there");
+      // The owner makes it the main one by linking from it: widened, on every trip.
       await linkMain(app, user, a, legacy);
       assert.equal((await liveLinks(a, legacy))[0].binding_scope, "account");
       assert.equal((await liveLinks(b, legacy)).length, 1);
-      assert.equal((await liveLinks(a, t1)).length, 0, "and T1, the previous main, is replaced");
+    } finally { await app.close(); }
+  });
+});
+
+describe("lost-phone recovery: the OLD phone is unlinked, whatever scope the dashboard link gave it", { skip }, () => {
+  test("a phone added with the dashboard link before #523 (trip-scoped) loses every trip when a new main is linked; an APPROVAL's trip-only link stands", async () => {
+    const app = newApp();
+    try {
+      const user = await mkUser(); const a = await mkTrip("A"); const b = await mkTrip("B"); const c = await mkTrip("C");
+      for (const t of [a, b, c]) await mkMember(t, user);
+      const oldPhone = nextChat(); const spouse = nextChat();
+      for (const t of [a, b]) {
+        const client = await pool.connect();
+        try { await linkTelegramOrganizerInTx(client, oldPhone, user, t, "dashboard_link_token", null, "trip"); } finally { client.release(); }
+      }
+      // A DM binding so the bot can tell the old phone it was replaced.
+      await pool.query("INSERT INTO control_plane.telegram_chat_bindings(id,chat_id,trip_id,hermes_profile) VALUES ($1,$2,$3,'prof')", [id("tcb"), oldPhone, a]);
+      // Another person the owner approved for trip C only (#519): not the owner's phone.
+      const client = await pool.connect();
+      try { await linkTelegramOrganizerInTx(client, spouse, user, c, "enrollment_redemption", null, "trip"); } finally { client.release(); }
+      assert.equal(await isTripOrganizer(pool, a, oldPhone), true, "before: the old phone organizes");
+
+      const newPhone = nextChat();
+      const decision = multi(await linkMain(app, user, a, newPhone));
+      assert.deepEqual(decision.replies.map((r) => r.chatId), [newPhone, oldPhone], "and the old phone IS told, so the message is true");
+      assert.equal(decision.replies[1]!.text, uiString("mainTelegramReplaced", "en"));
+      for (const t of [a, b]) {
+        assert.equal((await liveLinks(t, oldPhone)).length, 0);
+        assert.equal(await isTripOrganizer(pool, t, oldPhone), false, "no organizer access anywhere");
+        assert.equal(await isMainTripOrganizer(pool, t, oldPhone), false);
+      }
+      assert.deepEqual((await listOrganizerTrips(pool, oldPhone, oldPhone)).map((x) => x.tripId), []);
+      assert.equal((await pool.query("SELECT 1 FROM control_plane.telegram_chat_bindings WHERE chat_id = $1 AND closed_at IS NULL", [oldPhone])).rowCount, 0, "and its companion DM route is closed");
+      assert.equal((await liveLinks(c, spouse)).length, 1, "the approved person is not the old phone");
+      assert.equal((await liveLinks(c, spouse))[0].binding_scope, "trip");
+      assert.equal((await unlinkedTelegramLinksByTrip(pool, user, [a, b])).size, 0, "and it is not offered back for Restore");
+    } finally { await app.close(); }
+  });
+
+  test("a Restore of a dashboard link's row is the owner's old phone too; a Restore of an approval's row is not", async () => {
+    const app = newApp();
+    try {
+      const user = await mkUser(); const a = await mkTrip("A"); const c = await mkTrip("C");
+      await mkMember(a, user); await mkMember(c, user);
+      const restoredPhone = nextChat(); const restoredSpouse = nextChat();
+      const { unlinkTelegramLink } = await import("../src/telegram-mini-app.js");
+      const { restoreTelegramLink } = await import("../src/telegram-link-token.js");
+      for (const [phone, trip, via] of [[restoredPhone, a, "dashboard_link_token"], [restoredSpouse, c, "enrollment_redemption"]] as const) {
+        const client = await pool.connect();
+        try { await linkTelegramOrganizerInTx(client, phone, user, trip, via, null, "trip"); } finally { client.release(); }
+        const row = (await liveLinks(trip, phone))[0];
+        assert.equal(await unlinkTelegramLink(pool, user, row.id), true);
+        assert.equal((await restoreTelegramLink(pool, { userId: user, linkId: row.id })).ok, true);
+        assert.equal((await liveLinks(trip, phone))[0].verified_via, "dashboard_restore");
+      }
+      await linkMain(app, user, a, nextChat());
+      assert.equal((await liveLinks(a, restoredPhone)).length, 0, "a restored dashboard-link phone ends");
+      assert.equal((await liveLinks(c, restoredSpouse)).length, 1, "a restored approval stays");
     } finally { await app.close(); }
   });
 });
@@ -522,7 +577,7 @@ describe("AC-5: what a secondary organizer can do in Telegram, and each thing th
       assert.equal(await isTripOrganizer(pool, trip, s), true);
       assert.equal(await isTripOrganizer(pool, other, s), false);
       const person = await resolveTripPerson(pool, trip, s);
-      assert.equal(person?.role, "organizer");
+      assert.equal(person?.role, "secondary_organizer", "its OWN role value: never 'organizer', which is the main organizer's");
       assert.equal(person?.displayName, "Noa");
       assert.equal((await resolveTripPerson(pool, other, s)), null, "and nothing on another trip");
       assert.equal((await pool.query("SELECT 1 FROM control_plane.telegram_chat_bindings WHERE chat_id = $1 AND trip_id = $2 AND closed_at IS NULL", [s, trip])).rowCount, 1, "the free DM reaches the trip");
@@ -852,4 +907,124 @@ test("the trip-link token is not an account link or an enrollment token, by pref
   assert.equal(SECONDARY_TOKEN_PATTERN.test(randomBytes(32).toString("base64url")), false);
   assert.equal(createHash("sha256").update("x").digest("hex").length, 64);
   void redeemSecondaryOrganizerToken; void redeemTelegramLinkToken; void unlinkedTelegramLinksByTrip;
+});
+
+// ═══ boundary review fixes ═══════════════════════════════════════════════════
+
+describe("a secondary organizer may not move a family group, or hand out a group link (boundary review, HIGH)", { skip }, () => {
+  async function scenario() {
+    const app = newApp();
+    const owner = await mkUser("Main"); const a = await mkTrip("Family Trip A"); await mkMember(a, owner);
+    const t0 = nextChat();
+    const client = await pool.connect();
+    try { await linkTelegramOrganizerInTx(client, t0, owner, a); } finally { client.release(); }
+    const group = `-100${Math.floor(Math.random() * 1e9)}`;
+    await pool.query("INSERT INTO control_plane.telegram_chat_bindings(id,chat_id,trip_id,hermes_profile) VALUES ($1,$2,$3,'prof-a')", [id("tcb"), group, a]);
+    const s = nextChat();
+    await addSecondary(app, owner, a, s);
+    // S also runs their own trip B under their own Kinerary account.
+    const sAccount = await mkUser("Noa own account"); const b = await mkTrip("Noa's other trip"); await mkMember(b, sAccount);
+    const c2 = await pool.connect();
+    try { await linkTelegramOrganizerInTx(c2, s, sAccount, b); } finally { c2.release(); }
+    return { app, owner, a, t0, group, s, b };
+  }
+  const groupTrip = async (group: string) => (await pool.query("SELECT trip_id FROM control_plane.telegram_chat_bindings WHERE chat_id = $1 AND closed_at IS NULL", [group])).rows.map((r) => r.trip_id);
+
+  test("the reviewer's scenario: S of trip A, who runs trip B, cannot carry A's group to B", async () => {
+    const { app, a, b, group, s } = await scenario();
+    try {
+      assert.equal(await isTripOrganizer(pool, a, s), true, "S organizes A (any level)");
+      assert.equal(await isMainTripOrganizer(pool, a, s), false, "but is not its MAIN organizer");
+      assert.equal(await isMainTripOrganizer(pool, b, s), true);
+      const token = await issueGroupBindingToken(pool, b, s, { ttlSeconds: 3600 });
+      const moved = await redeemGroupBindingToken(pool, token.token, group, s);
+      assert.deepEqual(moved, { ok: false, reason: "GROUP_MOVE_NOT_ORGANIZER" });
+      assert.deepEqual(await groupTrip(group), [a], "the group is still A's");
+    } finally { await app.close(); }
+  });
+
+  test("/group in a secondary organizer's DM bound to the trip hands out nothing; the main organizer's still does", async () => {
+    const { app, owner, a, s, t0 } = await scenario();
+    try {
+      const before = (await pool.query("SELECT count(*)::int AS n FROM control_plane.telegram_group_binding_tokens WHERE trip_id = $1", [a])).rows[0].n;
+      const refused = await dispatch(textUpdate(s, "/group", from(s, "Noa", "noa_s")));
+      assert.equal(replyText(refused), DEFAULT_STRINGS.groupTokenUnavailable);
+      assert.equal((await pool.query("SELECT count(*)::int AS n FROM control_plane.telegram_group_binding_tokens WHERE trip_id = $1", [a])).rows[0].n, before, "no token was issued");
+      await pool.query("INSERT INTO control_plane.telegram_chat_bindings(id,chat_id,trip_id,hermes_profile) VALUES ($1,$2,$3,'prof-a')", [id("tcb"), t0, a]);
+      const granted = await dispatch(textUpdate(t0, "/group", from(t0, "Dana")));
+      assert.notEqual(granted.kind === "reply" ? granted.reply.text : JSON.stringify(granted), DEFAULT_STRINGS.groupTokenUnavailable);
+      void owner;
+    } finally { await app.close(); }
+  });
+
+  test("the main organizer of both trips can still move the group", async () => {
+    const { app, owner, a, group, t0 } = await scenario();
+    try {
+      const b2 = await mkTrip("Main's other trip"); await mkMember(b2, owner);
+      const client = await pool.connect();
+      try { await linkTelegramOrganizerInTx(client, t0, owner, b2); } finally { client.release(); }
+      const token = await issueGroupBindingToken(pool, b2, t0, { ttlSeconds: 3600 });
+      const moved = await redeemGroupBindingToken(pool, token.token, group, t0);
+      assert.equal(moved.ok, true);
+      assert.deepEqual(await groupTrip(group), [b2]);
+      void a;
+    } finally { await app.close(); }
+  });
+
+  test("/proactive stays open to a secondary organizer (it changes no person, group or link)", async () => {
+    const { app, a, s } = await scenario();
+    try {
+      assert.equal(await isTripOrganizer(pool, a, s), true);
+    } finally { await app.close(); }
+  });
+});
+
+describe("a secondary organizer has its own role value everywhere it is read (boundary review, LOW)", { skip }, () => {
+  test("resolveTripPerson says secondary_organizer; the main organizer still says organizer; analytics counts both as organizers", async () => {
+    const app = newApp();
+    try {
+      const { user, t0, firstTripId } = await accountWithMain();
+      const s = nextChat();
+      await addSecondary(app, user, firstTripId, s);
+      await pool.query(
+        "INSERT INTO control_plane.trip_person_links(id,trip_id,telegram_user_id,participant_username,display_name,role,verified_via) VALUES ($1,$2,$3,'dana','Dana','organizer','interview_chat')",
+        [id("tpl"), firstTripId, t0]);
+      assert.equal((await resolveTripPerson(pool, firstTripId, s))?.role, "secondary_organizer");
+      assert.equal((await resolveTripPerson(pool, firstTripId, t0))?.role, "organizer");
+      assert.equal(requesterRoleOf("secondary_organizer"), "organizer");
+      // A person link that says organizer is never downgraded by a secondary binding on the same Telegram.
+      await pool.query(
+        "INSERT INTO control_plane.trip_person_links(id,trip_id,telegram_user_id,participant_username,display_name,role,verified_via) VALUES ($1,$2,$3,'noa','Noa P','participant','interview_chat')",
+        [id("tpl"), firstTripId, s]);
+      assert.equal((await resolveTripPerson(pool, firstTripId, s))?.role, "secondary_organizer", "outranks a participant row");
+      assert.equal(await isTripOrganizer(pool, firstTripId, s), true);
+    } finally { await app.close(); }
+  });
+});
+
+describe("a secondary organizer who unlinks their own member link RESIGNS (boundary review, LOW)", { skip }, () => {
+  test("their Mini App session can DELETE its own tml_ link; the binding, membership and Telegram access end with it", async () => {
+    const app = newApp();
+    try {
+      const { user, firstTripId } = await accountWithMain();
+      await pool.query("UPDATE control_plane.telegram_organizer_trip_links SET binding_scope = 'account' WHERE user_id = $1", [user]);
+      const s = nextChat(), keep = nextChat();
+      await addSecondary(app, user, firstTripId, s);
+      await addSecondary(app, user, firstTripId, keep, from(keep, "Kai", "kai_k"));
+      const { session } = await miniApp(app, s, firstTripId);
+      assert.ok(session);
+      const row = await secondaryRow(firstTripId, s);
+      const unlinked = await call(app, session!, "DELETE", `/v1/account/telegram-links/${row.member_link_id}`);
+      assert.equal(unlinked.statusCode, 200);
+      assert.equal(await isTripOrganizer(pool, firstTripId, s), false, "no organizer left in Telegram");
+      assert.deepEqual((await listOrganizerTrips(pool, s, s)).map((x) => x.tripId), []);
+      assert.equal((await secondaryRow(firstTripId, s)).revoked_reason, "membership_ended");
+      assert.equal((await pool.query("SELECT status FROM control_plane.trip_memberships WHERE trip_id = $1 AND user_id = $2", [firstTripId, row.user_id])).rows[0].status, "revoked");
+      assert.equal(await isTripOrganizer(pool, firstTripId, keep), true, "another secondary organizer is untouched");
+      // They cannot unlink somebody else's link.
+      const { session: keepSession } = await miniApp(app, keep, firstTripId);
+      const otherLink = (await secondaryRow(firstTripId, s)).member_link_id as string;
+      assert.equal((await call(app, keepSession!, "DELETE", `/v1/account/telegram-links/${otherLink}`)).statusCode, 404);
+    } finally { await app.close(); }
+  });
 });

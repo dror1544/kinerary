@@ -378,7 +378,7 @@ export async function removeSecondaryOrganizer(
  */
 export async function endSecondaryBindingInTx(
   client: pg.PoolClient,
-  input: { secondaryId: string; reason: "removed_by_organizer" | "became_main_organizer"; revokedBy: string },
+  input: { secondaryId: string; reason: "removed_by_organizer" | "became_main_organizer" | "membership_ended"; revokedBy: string },
 ): Promise<{ chatId: string | null } | null> {
   const revoked = await client.query<{ trip_id: string; user_id: string; telegram_subject_digest: string }>(
     `UPDATE control_plane.trip_secondary_organizers SET revoked_at = now(), revoked_reason = $2, revoked_by = $3
@@ -407,7 +407,7 @@ export async function endSecondaryBindingInTx(
 /** Ends every live secondary binding of one Telegram account on the given trips (see `endSecondaryBindingInTx`). */
 export async function endSecondaryBindingsOfDigestInTx(
   client: pg.PoolClient,
-  input: { tripIds: readonly string[]; digest: string; reason: "removed_by_organizer" | "became_main_organizer"; revokedBy: string },
+  input: { tripIds: readonly string[]; digest: string; reason: "removed_by_organizer" | "became_main_organizer" | "membership_ended"; revokedBy: string },
 ): Promise<number> {
   if (input.tripIds.length === 0) return 0;
   const live = await client.query<{ id: string }>(

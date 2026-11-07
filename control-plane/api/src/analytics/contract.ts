@@ -520,7 +520,8 @@ export function channelTypeOf(telegramChatType: string | null | undefined, role:
  */
 export function requesterRoleOf(linkRole: string | null | undefined): RequesterRole {
   if (linkRole === null || linkRole === undefined) return "unknown";
-  if (linkRole === "organizer") return "organizer";
+  // A secondary organizer (#523) is still an organizer asking, for counting; the role value differs so authority can tell them apart.
+  if (linkRole === "organizer" || linkRole === "secondary_organizer") return "organizer";
   if (linkRole === "participant") return "participant";
   return "unclassified";
 }
