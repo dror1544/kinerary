@@ -1,6 +1,6 @@
 # Kinerary Privacy Policy
 
-*Early-access version, 30 October 2026. This policy is under legal review and may be updated; we will tell
+*Version of 31 October 2026. This policy is under legal review and may be updated; we will tell
 organizers before a material change. A Hebrew version will follow.*
 
 **Who we are:** Kinerary is run by Dror Elul, a sole trader in Israel ("we", "us"). We are the controller of the
@@ -50,7 +50,8 @@ including children. This policy explains what we collect, why, who sees it, and 
 | Traveller details: names, ages, family group, needs (dietary, allergy, medical, mobility) | The organizer | To plan for each traveller (for example suitable food or pace) | The organizer; medical and allergy needs are organizer-only unless the organizer shares them | As trip details |
 | Documents you upload: bookings, tickets, PDFs, photos of documents | You or a traveller, through the bot, the group or the site | To read dates, bookings and plans into the trip | The organizer; booking details are shown to signed-in travellers on the trip site | As trip details; originals are archived when the trip is taken down (section 8) |
 | Bookings: supplier, confirmation number, cost, passengers, door codes or PINs that you add | You, the companion, or read from documents | To show the family what is booked and when | The organizer; signed-in travellers on the trip site (drafts are organizer-only) | As trip details |
-| Photos, comments, ratings, RSVPs, tasks, lost-and-found reports, trivia scores | Travellers using the trip site | To run the trip site's features | Signed-in travellers of that trip; a photo share link works for anyone who has the link | As trip details |
+| Photos and the information stored in them (when and where a photo was taken, from its location data, and the camera or phone) | Travellers uploading to the trip site | To show them on the trip site, sort them by day and place, and make content for that trip, such as albums, recaps, a journal or a route map | Signed-in travellers of that trip; an album share link works for anyone who has the link. It shows the trip's place and the season and year (for example "Kyoto, Autumn 2026"), not when or where each photo was taken, and photos cannot be downloaded from it. Links made before this change can still show each photo's time and place and allow downloads until we update them on every trip site. | As trip details |
+| Comments, ratings, RSVPs, tasks, lost-and-found reports, trivia scores | Travellers using the trip site | To run the trip site's features | Signed-in travellers of that trip | As trip details |
 | Messages to the bot, and messages in a group where the companion is added | You and group members | To answer questions, run the interview, and update the trip | The AI models that process them (section 6); our operator | Conversation state: 90 days; the last state is kept in the trip's archive |
 | Companion memory: short notes about how the family likes to be helped (tone, language, preferences) | The companion, from conversations | To serve the family better | The organizer can ask to see or delete it; never shown on the trip site | With the trip, then in its archive (section 8) |
 | Usage events, for example "reply sent" or "message not addressed to the bot" (no message text) | Our systems | To check the product works and to fix faults | Our operator | 90 days |
@@ -62,10 +63,11 @@ We do not sell personal data. We do not use it for advertising.
 ## 5. Legal bases
 
 - **Contract**: to provide the service you asked for (account, trip site, companion).
-- **Legitimate interests**: security, preventing abuse, fixing faults and improving the product. We weigh
-  these against your rights.
+- **Legitimate interests**: security, preventing abuse, fixing faults and improving the product, including
+  reading trip data and making de-identified route and place summaries, as section 7 describes (you can turn both
+  off). We weigh these against your rights.
 - **Consent**: where we ask for it, for example health-related needs, which the organizer provides on a
-  traveller's behalf, and the evaluation reading in section 7. You can withdraw consent at any time.
+  traveller's behalf. You can withdraw consent at any time.
 - **Legal obligation**: where the law requires us to keep or disclose data.
 
 Under the Israeli Privacy Protection Law, 5741-1981, and its regulations, you have the right to see the
@@ -82,17 +84,38 @@ gives you the rights in section 10.
 - We use these providers under their business or API terms.
 - The companion does not make legal or other significant decisions about anyone. It suggests and answers.
 
-## 7. Reading trip data to improve Kinerary
+## 7. Reading trip data to improve Kinerary, and routes for others
 
-Families in our early-access programme agreed that we may read their trip data and conversations to evaluate
-and improve Kinerary. We read it; we do not change it except at the organizer's request. They can withdraw
-this at any time by writing to us.
+The Kinerary team may read trip data and conversations to evaluate and improve the product.
+We read it; we do not change it except at the organizer's request.
 
-New organizers will be asked at sign-up, as a separate choice that is off by default. Until that choice is
-live, we do not read a new organizer's trip for evaluation unless they agree by message.
+This is on by default. An organizer can turn it off at any time in
+Personal settings, or by writing to privacy@ara-united.store until that setting is available. Once it is
+off, we look at that organizer's trips only to provide the service, keep it secure, fix a fault, or when the
+law requires it.
 
-Otherwise we look at trip data only to provide the service, keep it secure, fix a fault, or when the law
-requires it.
+
+**Routes for other travellers (planned).** We plan to turn a trip's route (the places visited, their order, and
+how long was spent in each) into a de-identified summary, and to offer it as a suggestion to other people
+planning a similar trip. A summary never includes names, photos, messages, booking details, or exact dates (the
+month at most), and nothing else that identifies you or your family. We leave out routes that are too unusual
+to stay anonymous. This will be on by default; an organizer can turn it off by writing to
+privacy@ara-united.store, and a switch will come with the feature.
+
+**Learning about places from photos.** We may use the place and time stored in trip photos, and what a photo
+of a place or view shows, to learn about places (for example what a viewpoint looks like in April) and to
+improve suggestions. What we keep from this never identifies you or your family. It is covered by the same
+switch as route summaries.
+
+**Your photos stay with your trip.** We do not show your photos to anyone outside your trip. If we later let
+travellers share a photo of a place or a view with other users, it will be their choice, made photo by photo or
+trip by trip, and off unless they choose it. Even then:
+
+- photos of people are never shown outside the trip. We do not intend to use photos of children, and before any
+  shared photo is shown we check it automatically and leave it out if we detect a person or a face;
+- we remove the location, time and camera details from the copy we show;
+- if a photo with a person in it is ever shown by mistake, tell us at privacy@ara-united.store and we remove it
+  straight away.
 
 ## 8. Retention, trip end and archives
 
