@@ -43,7 +43,7 @@ import {
   type Language,
   unsettledText,
 } from "./intake-copy.js";
-import { hasEarlierBuiltTrip, LIVE_INTAKE_SESSION_PREDICATE, type OrganizerTrip } from "./organizer-trips.js";
+import { SECONDARY_ORGANIZER_ROLE, hasEarlierBuiltTrip, isSecondaryOrganizer, LIVE_INTAKE_SESSION_PREDICATE, secondaryOrganizerName, type OrganizerTrip } from "./organizer-trips.js";
 import type { RosterChoice } from "./organizer-identity.js";
 import {
   closeStaleSessionForChat,
@@ -293,6 +293,24 @@ export async function resolveTripPerson(
     [tripId, telegramUserId, digest],
   );
   const row = rows[0];
+  // A SECONDARY ORGANIZER (#523) organizes this trip by the main organizer's own act, recorded in its own table
+  // (organizer-trips.ts). It has its OWN role value, `secondary_organizer`, NOT 'organizer': every reader that decides
+  // something about people, groups or links asks for the main organizer by name (`isMainTripOrganizer`), and a role that read
+  // 'organizer' for both would let the companion (which calls the people routes with the agent key) do for a secondary
+  // organizer what only the main organizer may. It outranks a 'participant' row for the same Telegram account (a family member
+  // who is then made an organizer) and never a person link that says 'organizer'. It is the only fact there is for one who is
+  // on no participant row at all (empty username: the site's participant name is not theirs to claim, and no caller uses it as
+  // a key). Never reads a message.
+  if (row?.role !== "organizer") {
+    const secondary = await secondaryOrganizerName(db, tripId, telegramUserId);
+    if (secondary) {
+      return {
+        username: row?.participant_username ?? "",
+        displayName: row?.display_name ?? secondary.displayName,
+        role: SECONDARY_ORGANIZER_ROLE,
+      };
+    }
+  }
   return row
     ? { username: row.participant_username, displayName: row.display_name, role: row.role }
     : null;
@@ -690,7 +708,7 @@ export async function setGroupProactiveLevel(
 }
 
 /**
- * Is this Telegram sender an organizer of this trip?
+ * Is this Telegram sender the MAIN organizer of this trip?
  *
  * Two proofs, either enough, both server-side facts and neither read from the
  * message: the trip's own person link says so (0051, written at provisioning),
@@ -704,7 +722,7 @@ export async function setGroupProactiveLevel(
  * (an 'organizer'-role membership, a revoked or invited owner, a plain member are
  * all "no"), and a person link must say 'organizer'. A failed lookup is "no".
  */
-export async function isTripOrganizer(db: Queryable, tripId: string, telegramUserId: string): Promise<boolean> {
+export async function isMainTripOrganizer(db: Queryable, tripId: string, telegramUserId: string): Promise<boolean> {
   if (!tripId || !telegramUserId) return false;
   if ((await resolveTripPerson(db, tripId, telegramUserId))?.role === "organizer") return true;
   if (!isPrivateChatId(telegramUserId)) return false;
@@ -718,6 +736,26 @@ export async function isTripOrganizer(db: Queryable, tripId: string, telegramUse
     [tripId, digestTelegramId(telegramUserId)],
   );
   return (result.rowCount ?? 0) > 0;
+}
+
+/**
+ * Is this sender an organizer of the trip at ANY level: the main organizer (`isMainTripOrganizer`) or a secondary organizer
+ * (#523), added by the main organizer to organize THIS trip only?
+ *
+ * WHICH ONE EACH CALLER ASKS (decided in #523 after the boundary review; every caller of either function, by file):
+ *   any organizer   `/proactive` (relay/dispatch.ts) - how talkative the assistant is in the family group. It changes no person,
+ *                   group or link, which is what a secondary organizer is there to do.
+ *   main only       `/group` (relay/dispatch.ts) - hands out a link that BINDS a group to the trip;
+ *                   `senderMayMoveGroup` (group-binding.ts) - both the trip a group leaves and the one it goes to. A secondary
+ *                   organizer of A who runs their own trip B could otherwise carry A's family group to B.
+ * The trip site draws the same line: `/api/agent/telegram-group` and the participants routes are main-organizer-only.
+ */
+export async function isTripOrganizer(db: Queryable, tripId: string, telegramUserId: string): Promise<boolean> {
+  if (!tripId || !telegramUserId) return false;
+  if (await isMainTripOrganizer(db, tripId, telegramUserId)) return true;
+  // `resolveTripPerson` counts a secondary organizer under its own role, and a person-link row that says 'participant' does
+  // not hide one. Asked by name so the rule survives a change to that function.
+  return isSecondaryOrganizer(db, tripId, telegramUserId);
 }
 
 /**

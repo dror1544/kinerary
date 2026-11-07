@@ -33,6 +33,7 @@ import type pg from "pg";
 import { digestTelegramId, isPrivateChatId, type TelegramName } from "./identity.js";
 import { structuredLog } from "./redaction.js";
 import { TELEGRAM_API_ROOT } from "./relay/telegram-api.js";
+import { endSecondaryBindingInTx } from "./secondary-organizers.js";
 import { NOT_RETIRED_SQL } from "./trip-retirement.js";
 import type { VerifiedInitData } from "./telegram-webapp-auth.js";
 
@@ -754,6 +755,15 @@ export async function unlinkTelegramLink(db: pg.Pool, userId: string, linkId: st
         [linkId, userId],
       );
       if (!revoked.rowCount) { await client.query("ROLLBACK"); return false; }
+      // A SECONDARY ORGANIZER (#523) unlinking the member link their Mini App access rests on RESIGNS: the binding ends with it
+      // (the Telegram organizer actions, the DM route, the membership). The alternative, refusing, would leave a person who
+      // wants to leave with no way to; and leaving the binding alive would leave an organizer in Telegram with no Mini App,
+      // a state nobody chose. Only their OWN link (the query above is by `user_id`, the hidden user is theirs alone).
+      const own = await client.query<{ id: string }>(
+        "SELECT id FROM control_plane.trip_secondary_organizers WHERE member_link_id = $1 AND user_id = $2 AND revoked_at IS NULL FOR UPDATE",
+        [linkId, userId],
+      );
+      if (own.rows[0]) await endSecondaryBindingInTx(client, { secondaryId: own.rows[0].id, reason: "membership_ended", revokedBy: userId });
     } else {
       if (!(await revokeOrganizerLinkInTx(client, userId, linkId))) { await client.query("ROLLBACK"); return false; }
     }
@@ -783,13 +793,23 @@ export async function unlinkTelegramLink(db: pg.Pool, userId: string, linkId: st
  * is recorded exactly like the first (`owner_unlinked`): it is the owner, from the Telegram the account is bound to, taking
  * the link away, and the dashboard lists it as restorable like any other.
  */
-export async function revokeOrganizerLinkInTx(client: pg.PoolClient, userId: string, linkId: string): Promise<boolean> {
+export async function revokeOrganizerLinkInTx(
+  client: pg.PoolClient,
+  userId: string,
+  linkId: string,
+  /**
+   * Why the link ended. `owner_unlinked` (the default) is an Unlink or an approved replacement and is listed for Restore.
+   * `main_telegram_replaced` (#523) is the owner linking a NEW main Telegram: the old one's account-scoped links end through
+   * this same function, with a reason of their own so the dashboard never offers a replaced main back for Restore.
+   */
+  reason: "owner_unlinked" | "main_telegram_replaced" = "owner_unlinked",
+): Promise<boolean> {
   const revoked = await client.query<{ telegram_subject_digest: string; trip_id: string }>(
     `UPDATE control_plane.telegram_organizer_trip_links
-        SET revoked_at = now(), revoked_reason = 'owner_unlinked', revoked_by = $2
+        SET revoked_at = now(), revoked_reason = $3, revoked_by = $2
       WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
       RETURNING telegram_subject_digest, trip_id`,
-    [linkId, userId],
+    [linkId, userId, reason],
   );
   const row = revoked.rows[0];
   if (!row) return false;

@@ -27,7 +27,7 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import type pg from "pg";
-import { isTripOrganizer } from "./chat-router.js";
+import { isMainTripOrganizer } from "./chat-router.js";
 import { NOT_RETIRED_SQL } from "./trip-retirement.js";
 
 /**
@@ -206,7 +206,7 @@ export type GroupBindingRedeemResult =
  * Redeems a token posted in a group, binding that group to the token's trip.
  *
  * A chat already bound to a DIFFERENT trip is MOVED only by someone who is an
- * organizer of that trip AND of the one the token is for (`isTripOrganizer`,
+ * MAIN organizer of that trip AND of the one the token is for (`isMainTripOrganizer`,
  * from the sender's verified Telegram id - the same proof `/proactive` asks
  * for). On a shared bot the group belongs to a real family, and a token is not
  * authority over a binding somebody else made - the organizer of the other trip
@@ -445,7 +445,7 @@ async function openBinding(client: pg.PoolClient, chatId: string, tripId: string
  * Telegram id (the update's `from.id`), never anything typed: they must be an
  * organizer of the trip the group belongs to now (it is theirs to give up) and
  * of the trip it is going to (it is theirs to receive). Reads go through
- * `isTripOrganizer` rather than restating the link tables here, so a change to
+ * `isMainTripOrganizer` rather than restating the link tables here, so a change to
  * what "linked organizer" means (revoked links, per-trip links) lands in one place.
  *
  * Runs on the redeeming transaction's own client: plain reads, no locks.
@@ -456,6 +456,7 @@ async function senderMayMoveGroup(
   toTripId: string,
   senderTelegramUserId: string,
 ): Promise<boolean> {
-  return (await isTripOrganizer(client, fromTripId, senderTelegramUserId))
-    && (await isTripOrganizer(client, toTripId, senderTelegramUserId));
+  // MAIN organizer of both (#523): a secondary organizer organizes one trip, and may not carry its family group elsewhere.
+  return (await isMainTripOrganizer(client, fromTripId, senderTelegramUserId))
+    && (await isMainTripOrganizer(client, toTripId, senderTelegramUserId));
 }

@@ -16,6 +16,7 @@ import { issueEnrollment } from "../src/enrollment.js";
 import { digestTelegramId } from "../src/identity.js";
 import { UI_STRINGS, uiString } from "../src/intake-copy.js";
 import { claimExpiredSessions } from "../src/interview.js";
+import { linkTelegramOrganizerInTx } from "../src/organizer-trips.js";
 import { applyMigrations } from "../src/migrations.js";
 import { linkAnswerFromText } from "../src/organizer-link-approval.js";
 import { DEFAULT_STRINGS, dispatchUpdate, type DispatchDecision } from "../src/relay/dispatch.js";
@@ -731,7 +732,7 @@ describe("a narrowed set never reads as 'nobody is bound'", { skip }, () => {
   const rowsFor = async (tripId: string, chat: string) =>
     (await pool.query("SELECT * FROM control_plane.organizer_link_requests WHERE trip_id = $1 AND requester_digest = $2", [tripId, digestOf(chat)])).rows;
 
-  test("R1 lost phone: the owner Unlinks the old phone and adds the new one with the one-time link; a stranger opening the account's next trip is refused, never bound", async () => {
+  test("R1 lost phone: the owner Unlinks the old phone and makes the new one their MAIN Telegram (#523); a stranger opening the account's next trip is refused, never bound", async () => {
     const { unlinkTelegramLink } = await import("../src/telegram-mini-app.js");
     const { user, t0, firstTripId } = await boundOrganizer();
     const row = (await pool.query("SELECT id FROM control_plane.telegram_organizer_trip_links WHERE trip_id = $1 AND telegram_subject_digest = $2 AND revoked_at IS NULL", [firstTripId, digestOf(t0)])).rows[0];
@@ -747,7 +748,9 @@ describe("a narrowed set never reads as 'nobody is bound'", { skip }, () => {
     const stranger = nextChat();
     const decision = multi(await dispatchUpdate(pool, startUpdate(stranger, c.token)));
     assert.equal(decision.replies[0]!.text, uiString("linkOtherBelongs", "en"), "refused, with nothing about the trip");
-    assert.equal(decision.replies.length, 1, "and nobody is asked: the trip-only Telegram may not approve for another trip, so it fails closed");
+    // The new phone has never spoken to the bot in an interview, so no chat id on record reaches it: nobody can be asked and it
+    // fails closed. (Once the main Telegram has an interview or a bound chat it is the one asked: see the #523 suite.)
+    assert.equal(decision.replies.length, 1, "nobody can be asked");
     assert.equal((await liveLinks(c.tripId, stranger)).length, 0, "the stranger is not bound");
     assert.equal((await sessionsFor(stranger)).length, 0);
     assert.equal(await enrollmentState(c.token), "issued");
@@ -785,7 +788,7 @@ describe("a narrowed set never reads as 'nobody is bound'", { skip }, () => {
     assert.equal((await liveLinks(c.tripId, stranger)).length, 0);
   });
 
-  test("R1 continued: the owner's new phone still opens its OWN trip, and is refused on the account's other trips (the dashboard link is their way in there)", async () => {
+  test("R1 continued: the owner's new phone, linked as the MAIN Telegram, opens its own trip AND the account's other trips (#523 AC-1)", async () => {
     const { unlinkTelegramLink } = await import("../src/telegram-mini-app.js");
     const { user, t0, firstTripId } = await boundOrganizer();
     const row = (await pool.query("SELECT id FROM control_plane.telegram_organizer_trip_links WHERE trip_id = $1 AND telegram_subject_digest = $2 AND revoked_at IS NULL", [firstTripId, digestOf(t0)])).rows[0];
@@ -799,8 +802,8 @@ describe("a narrowed set never reads as 'nobody is bound'", { skip }, () => {
     await redeemTelegramLinkToken(pool, issued.token, phone, null);
     assert.equal((await dispatchUpdate(pool, startUpdate(phone, a.token))).kind, "reply", "its own trip works");
     await pool.query("UPDATE control_plane.intake_sessions SET expired_at = now() WHERE telegram_chat_id = $1 AND expired_at IS NULL", [phone]);
-    multi(await dispatchUpdate(pool, startUpdate(phone, c.token)));
-    assert.equal((await liveLinks(c.tripId, phone)).length, 0);
+    assert.equal((await dispatchUpdate(pool, startUpdate(phone, c.token))).kind, "reply", "the account's other trip too: the main Telegram is account-wide");
+    assert.equal((await liveLinks(c.tripId, phone)).length, 1);
   });
 
   test("R2: the owner Unlinks T0 from one paused trip; a stranger opening that trip's link is refused, never bound account-wide (T0 bound elsewhere)", async () => {
@@ -847,7 +850,7 @@ describe("a narrowed set never reads as 'nobody is bound'", { skip }, () => {
 // ── The other places that link a Telegram identity ──────────────────────────
 
 describe("every other path that links a Telegram account to a trip", { skip }, () => {
-  test("the dashboard's one-time link is the signed-in organizer's own act, so it is NOT subject to the question: it adds a second Telegram", async () => {
+  test("the dashboard's one-time link is the signed-in organizer's own act, so it is NOT subject to the question: it makes the opener the main Telegram", async () => {
     const { user, t0 } = await boundOrganizer();
     const trip = await draftTrip(user);
     const second = nextChat();
@@ -858,6 +861,8 @@ describe("every other path that links a Telegram account to a trip", { skip }, (
     assert.equal(redeemed.ok, true, "the owner chose this account from a signed-in session: nobody is asked");
     assert.equal((await liveLinks(trip.tripId, second)).length, 1);
     assert.notEqual(second, t0);
+    // #523 AC-2: it REPLACES the main Telegram rather than adding a second one.
+    assert.equal((await liveLinks(trip.tripId, t0)).length, 0, "the previous main is unlinked from the account");
   });
 
   test("the HTTP/MCP start has no Telegram identity, so there is nothing to compare and no organizer link is written", async () => {
@@ -894,15 +899,29 @@ describe("a Telegram bound for ONE trip does not speak for the account's other t
     assert.equal(await enrollmentState(c.token), "issued");
   });
 
-  test("P8b: a Telegram added to trip A with the dashboard's one-time link cannot open the account's other trip's interview link", async () => {
+  test("P8b (#523): a Telegram added with the dashboard's one-time link is the MAIN Telegram, account-wide: it opens the account's other trip's interview link", async () => {
+    const { user, t0 } = await boundOrganizer();
+    const a = await draftTrip(user, "Trip A");
+    const b = await draftTrip(user, "Trip B");
+    const main = nextChat();
+    const issued = await issueTelegramLinkToken(pool, { userId: user, tripId: a.tripId });
+    assert.ok(issued.ok);
+    if (!issued.ok) return;
+    assert.equal((await redeemTelegramLinkToken(pool, issued.token, main, null)).ok, true);
+    assert.equal(await scopeOf(a.tripId, main), "account");
+    assert.equal((await dispatchUpdate(pool, startUpdate(main, b.token))).kind, "reply", "no refusal, no question");
+    assert.equal((await liveLinks(b.tripId, main)).length, 1);
+    // ...and the previous main is a different account now: it is the one that is asked about.
+    assert.equal(await scopeOf(a.tripId, t0), undefined, "T0 is no longer linked through the account");
+  });
+
+  test("P8b (#519, still true): a Telegram bound to trip A ONLY (a trip-scoped link) cannot open the account's other trip's interview link", async () => {
     const { user, t0 } = await boundOrganizer();
     const a = await draftTrip(user, "Trip A");
     const b = await draftTrip(user, "Trip B");
     const stranger = nextChat();
-    const issued = await issueTelegramLinkToken(pool, { userId: user, tripId: a.tripId });
-    assert.ok(issued.ok);
-    if (!issued.ok) return;
-    assert.equal((await redeemTelegramLinkToken(pool, issued.token, stranger, null)).ok, true);
+    const client = await pool.connect();
+    try { await linkTelegramOrganizerInTx(client, stranger, user, a.tripId, "enrollment_redemption", null, "trip"); } finally { client.release(); }
     assert.equal(await scopeOf(a.tripId, stranger), "trip");
     const decision = multi(await dispatchUpdate(pool, startUpdate(stranger, b.token)));
     assert.equal(decision.replies[0]!.text, uiString("linkOtherAsked", "en"));
@@ -963,10 +982,8 @@ describe("a Telegram bound for ONE trip does not speak for the account's other t
     // And a trip-scoped link restores as trip-scoped.
     const a = await draftTrip(user, "Trip A");
     const added = nextChat();
-    const issued = await issueTelegramLinkToken(pool, { userId: user, tripId: a.tripId });
-    assert.ok(issued.ok);
-    if (!issued.ok) return;
-    await redeemTelegramLinkToken(pool, issued.token, added, null);
+    const writer = await pool.connect();
+    try { await linkTelegramOrganizerInTx(writer, added, user, a.tripId, "enrollment_redemption", null, "trip"); } finally { writer.release(); }
     const linkRow = (await pool.query("SELECT id FROM control_plane.telegram_organizer_trip_links WHERE trip_id = $1 AND telegram_subject_digest = $2 AND revoked_at IS NULL", [a.tripId, digestOf(added)])).rows[0];
     await unlinkTelegramLink(pool, user, linkRow.id);
     assert.equal((await restoreTelegramLink(pool, { userId: user, linkId: linkRow.id })).ok, true);

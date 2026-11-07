@@ -2611,6 +2611,10 @@ export function AppMenu({
           </button>
           {isOrganizer ? <a href={classicHref()}>{copy(lang,"Open Classic organizer fallback","פתיחת הגרסה הקלאסית למארגן")}</a> : null}
           {dashboardLink ?<a href={dashboardLink} data-testid="organizer-dashboard-link">{copy(lang,"Organizer dashboard","לוח המארגן")}</a> : null}
+          {/* Adding and removing organizers lives on the dashboard's trip page (the control plane owns who organizes a trip), so this
+              is a way THERE, offered to whoever the server gave a dashboard address: the trip's main organizer. A secondary
+              organizer is sent none (#523), so they are offered neither this nor the dashboard. */}
+          {dashboardLink ?<a href={`${dashboardLink}#other-organizers`} data-testid="organizer-people-link">{copy(lang,"Add or remove organizers","הוספה או הסרה של מארגנים")}</a> : null}
           <button
             type="button"
             className="danger-menu"

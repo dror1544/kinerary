@@ -204,9 +204,9 @@ export interface BoundTelegramAccount {
  *      no link of its own until its interview link is redeemed, so a per-trip reading would call every new trip "not bound
  *      yet" and let a forwarded link bind a stranger -- the very case #519 closes.
  *   `telegram_organizer_trip_links` of THIS trip, whatever their scope  a Telegram the organizer approved for this trip, or
- *      added to it with the dashboard's signed-in one-time link. It is the organizer's Telegram for this trip and for no
- *      other: a `trip`-scoped link is invisible when the question is about a different trip, so a leaked one-time link, or
- *      an approval for trip A, cannot open trip C (owner decision 2026-11-06).
+ *      narrowed to it by #519 (a dashboard link before #523). It is the organizer's Telegram for this trip and for no
+ *      other: a `trip`-scoped link is invisible when the question is about a different trip, so an approval for trip A cannot
+ *      open trip C (owner decision 2026-11-06). The dashboard's one-time link now writes `account` links (#523).
  *   `user_identities` (provider `telegram`)  the Telegram account the user SIGNED UP with. It is a verified Telegram
  *      identity on the account, and it outlives an Unlink of a trip.
  *
@@ -225,12 +225,19 @@ export async function boundTelegramAccounts(
 ): Promise<BoundTelegramAccount[]> {
   const rows = await q.query<{ digest: string; on_this_trip: boolean; bound_at: Date | null }>(
     `WITH links AS (
-       SELECT telegram_subject_digest AS d, trip_id, created_at, revoked_at, binding_scope
+       SELECT telegram_subject_digest AS d, trip_id, created_at, revoked_at, revoked_reason, binding_scope
          FROM control_plane.telegram_organizer_trip_links WHERE user_id = $1
      ), removed AS (
        SELECT d FROM links WHERE trip_id = $2 AND revoked_at IS NOT NULL
        EXCEPT
        SELECT d FROM links WHERE trip_id = $2 AND revoked_at IS NULL
+     ), replaced_main AS (
+       -- A Telegram the owner REPLACED as the account's main one (#523) no longer stands for the account through the sign-up
+       -- identity either, until it is linked as main again (a live account-scoped link). Its trip-scoped links, if any,
+       -- were not touched by the replacement and still count for their own trip above.
+       SELECT d FROM links WHERE revoked_reason = 'main_telegram_replaced'
+       EXCEPT
+       SELECT d FROM links WHERE revoked_at IS NULL AND binding_scope = 'account'
      )
      SELECT d AS digest, bool_or(trip_id = $2) AS on_this_trip, max(created_at) AS bound_at
        FROM links
@@ -241,7 +248,8 @@ export async function boundTelegramAccounts(
      SELECT provider_subject_digest, false, verified_at
        FROM control_plane.user_identities
       WHERE user_id = $1 AND provider = 'telegram'
-        AND provider_subject_digest NOT IN (SELECT d FROM removed)`,
+        AND provider_subject_digest NOT IN (SELECT d FROM removed)
+        AND provider_subject_digest NOT IN (SELECT d FROM replaced_main)`,
     [userId, tripId],
   );
   const merged = new Map<string, BoundTelegramAccount>();
@@ -343,6 +351,51 @@ export async function privateChatForDigest(
   return null;
 }
 
+// ── Secondary organizers (#523) ──────────────────────────────────────────────
+
+/**
+ * The SQL fragment every Telegram-side reader shares: a LIVE secondary organizer row, whose hidden user still holds an ACTIVE
+ * membership of the trip it is bound to. Callers add their own filter on `so.trip_id` and `so.telegram_subject_digest`. One
+ * definition so `/trips`, `/switch`, the organizer check and the person role cannot drift apart, and so a membership that ends
+ * by ANY route (the dashboard's member removal included) ends the secondary organizer with it.
+ */
+export const LIVE_SECONDARY_ORGANIZER_SQL = `
+  FROM control_plane.trip_secondary_organizers so
+  JOIN control_plane.trip_memberships som
+    ON som.trip_id = so.trip_id AND som.user_id = so.user_id AND som.status = 'active' AND som.role = 'organizer'
+  WHERE so.revoked_at IS NULL`;
+
+/** The `resolveTripPerson` role of a secondary organizer. Distinct from 'organizer' (the main one) on purpose (#523). */
+export const SECONDARY_ORGANIZER_ROLE = "secondary_organizer";
+
+/** Is this verified Telegram sender a live secondary organizer of `tripId`? Private-chat senders only; anything else is "no". */
+export async function isSecondaryOrganizer(
+  q: Pick<pg.PoolClient, "query">,
+  tripId: string,
+  telegramUserId: string,
+): Promise<boolean> {
+  if (!tripId || !isPrivateChatId(telegramUserId)) return false;
+  const result = await q.query(
+    `SELECT 1 ${LIVE_SECONDARY_ORGANIZER_SQL} AND so.trip_id = $1 AND so.telegram_subject_digest = $2 LIMIT 1`,
+    [tripId, digestTelegramId(telegramUserId)],
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
+/** The first name stored for a live secondary organizer of this trip, or null when the sender is not one. */
+export async function secondaryOrganizerName(
+  q: Pick<pg.PoolClient, "query">,
+  tripId: string,
+  telegramUserId: string,
+): Promise<{ displayName: string | null } | null> {
+  if (!tripId || !isPrivateChatId(telegramUserId)) return null;
+  const result = await q.query<{ telegram_first_name: string | null }>(
+    `SELECT so.telegram_first_name ${LIVE_SECONDARY_ORGANIZER_SQL} AND so.trip_id = $1 AND so.telegram_subject_digest = $2 LIMIT 1`,
+    [tripId, digestTelegramId(telegramUserId)],
+  );
+  return result.rows[0] ? { displayName: result.rows[0].telegram_first_name } : null;
+}
+
 export interface OrganizerTrip {
   tripId: string;
   slug: string;
@@ -417,10 +470,13 @@ export async function listOrganizerTrips(
        FROM control_plane.trips t
        JOIN control_plane.trip_memberships m
          ON m.trip_id = t.id AND m.status = 'active'
-      WHERE EXISTS (
+      WHERE (EXISTS (
               SELECT 1 FROM control_plane.telegram_organizer_trip_links l
                WHERE l.telegram_subject_digest = $1 AND l.user_id = m.user_id
                  AND l.trip_id = t.id AND l.revoked_at IS NULL)
+             -- A secondary organizer (#523) sees the ONE trip they were added to, and no other: the row names a trip.
+             OR EXISTS (
+              SELECT 1 ${LIVE_SECONDARY_ORGANIZER_SQL} AND so.trip_id = t.id AND so.telegram_subject_digest = $1))
         AND ${NOT_RETIRED_SQL}
         AND NOT EXISTS (
               SELECT 1 FROM control_plane.telegram_chat_bindings d
@@ -537,10 +593,13 @@ export async function switchChatToTrip(
           -- retired trip. Same predicate as group-binding and the trip list;
           -- deliberately no lock — see #175 (40P01 against retire_in_db).
           AND ${NOT_RETIRED_SQL}
-          AND EXISTS (
+          AND (EXISTS (
                 SELECT 1 FROM control_plane.telegram_organizer_trip_links l
                  WHERE l.telegram_subject_digest = $2 AND l.user_id = m.user_id
                    AND l.trip_id = m.trip_id AND l.revoked_at IS NULL)
+               -- A secondary organizer (#523) may switch to the trip they were added to (and only that one).
+               OR EXISTS (
+                SELECT 1 ${LIVE_SECONDARY_ORGANIZER_SQL} AND so.trip_id = m.trip_id AND so.telegram_subject_digest = $2))
         LIMIT 1`,
       [tripId, digestTelegramId(telegramUserId)],
     );
