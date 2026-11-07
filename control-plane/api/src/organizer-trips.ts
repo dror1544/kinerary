@@ -282,11 +282,35 @@ export async function organizerBindingVerdict(
   q: Pick<pg.PoolClient, "query">,
   input: { userId: string; tripId: string; telegramUserId: string },
 ): Promise<OrganizerBindingVerdict> {
-  const bound = await boundTelegramAccounts(q, input.userId, input.tripId);
-  if (bound.length === 0) return { kind: "proceed", reason: "not_bound" };
+  // TWO QUESTIONS, kept apart on purpose (re-review R1, R2):
+  //   1. Is the opener the SAME account FOR THIS TRIP? -- the narrowed set (`boundTelegramAccounts`).
+  //   2. Is ANYONE bound to this account at all? -- `anyTelegramBound`, which does not narrow.
+  // Narrowing answers 1 only. Reading an empty narrowed set as "nobody is bound" would let a stranger be bound account-wide
+  // the moment the only account-scoped link is Unlinked (the lost-phone case: the new phone is a trip-scoped link) or the
+  // owner is Unlinked from this one trip. An opener who is not the same account but where somebody is bound is "another
+  // account"; only an account with nothing bound anywhere binds its first opener (AC-1).
+  const same = await boundTelegramAccounts(q, input.userId, input.tripId);
   const mine = digestTelegramId(input.telegramUserId);
-  if (bound.some((account) => account.digest === mine)) return { kind: "proceed", reason: "same_account" };
-  return { kind: "other_account", started: await tripHasInterviewSession(q, input.tripId), bound };
+  if (same.some((account) => account.digest === mine)) return { kind: "proceed", reason: "same_account" };
+  if (same.length === 0 && !(await anyTelegramBound(q, input.userId, input.tripId))) return { kind: "proceed", reason: "not_bound" };
+  // `bound` is who may be ASKED: the accounts that can speak for this trip. It may be empty (everyone bound is bound to some
+  // other trip only, or was taken off this one), and then nobody is asked and the opener is refused: fail closed.
+  return { kind: "other_account", started: await tripHasInterviewSession(q, input.tripId), bound: same };
+}
+
+/**
+ * Is ANY Telegram bound to this account, of any reach? The sign-up identity, a live link of either scope on any trip, or a
+ * revoked link on THIS trip (somebody was bound here and was taken off: the trip is not "fresh"). Never narrowed; it exists
+ * so that a narrowed set cannot be mistaken for an empty account.
+ */
+export async function anyTelegramBound(q: Pick<pg.PoolClient, "query">, userId: string, tripId: string): Promise<boolean> {
+  const row = await q.query(
+    `SELECT 1 WHERE EXISTS (SELECT 1 FROM control_plane.telegram_organizer_trip_links WHERE user_id = $1 AND revoked_at IS NULL)
+         OR EXISTS (SELECT 1 FROM control_plane.telegram_organizer_trip_links WHERE user_id = $1 AND trip_id = $2 AND revoked_at IS NOT NULL)
+         OR EXISTS (SELECT 1 FROM control_plane.user_identities WHERE user_id = $1 AND provider = 'telegram')`,
+    [userId, tripId],
+  );
+  return (row.rowCount ?? 0) > 0;
 }
 
 /**

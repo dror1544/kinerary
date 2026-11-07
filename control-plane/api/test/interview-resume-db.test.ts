@@ -538,13 +538,15 @@ describe("a paused interview picks up where it stopped (#513)", { skip }, () => 
     await t.app.close();
   });
 
-  test("#517 survives #519: with the owner's Telegram Unlinked (nothing bound), a new account is bound and gets the ordinary opening and none of the owner's answers", async () => {
+  test("#517 survives #519: with no Telegram bound at all, a new account is bound and gets the ordinary opening and none of the owner's answers", async () => {
     const { renderDueRouterPrompts } = await import("../src/relay/poller.js");
     const { DEFAULT_STRINGS } = await import("../src/relay/dispatch.js");
     const t = await dashboardTrip(await organizer());
     const ownerChat = await pausedAtSummary(t, "OWNER");
-    // The owner Unlinked their Telegram from the dashboard: the account has no Telegram bound, so the next account is bound.
-    await pool.query("UPDATE control_plane.telegram_organizer_trip_links SET revoked_at = now(), revoked_reason = 'owner_unlinked' WHERE trip_id = $1", [t.tripId]);
+    // The interview ran with no organizer link on record (the HTTP/MCP path writes none), and nobody else is bound: the next
+    // account is bound. (An Unlinked owner is NOT this case: a revoked link on the trip still means somebody was bound, and a
+    // stranger is then refused -- #519 re-review R2.)
+    await pool.query("DELETE FROM control_plane.telegram_organizer_trip_links WHERE trip_id = $1", [t.tripId]);
     const forwarded = await t.call("POST", "/interview-link");
     assert.equal(forwarded.statusCode, 201);
 

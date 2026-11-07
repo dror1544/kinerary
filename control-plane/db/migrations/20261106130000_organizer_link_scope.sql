@@ -28,3 +28,22 @@ ALTER TABLE control_plane.telegram_organizer_trip_links
 UPDATE control_plane.telegram_organizer_trip_links
    SET binding_scope = 'trip'
  WHERE verified_via = 'dashboard_link_token' AND binding_scope <> 'trip';
+
+-- A dashboard Restore writes a NEW row (verified_via 'dashboard_restore') and marks the one it brings back with
+-- `restored_link_id`. A restore of a one-time link's row is that one-time link again, so it reaches one trip too -- and so is
+-- a restore of such a restore (Unlink, Restore, Unlink, Restore), hence the walk down the chain. A restore of an ordinary
+-- redemption keeps the default.
+WITH RECURSIVE chain(target, source_id, source_via) AS (
+  SELECT r.id, o.id, o.verified_via
+    FROM control_plane.telegram_organizer_trip_links r
+    JOIN control_plane.telegram_organizer_trip_links o ON o.restored_link_id = r.id
+   WHERE r.verified_via = 'dashboard_restore'
+  UNION ALL
+  SELECT c.target, o.id, o.verified_via
+    FROM chain c
+    JOIN control_plane.telegram_organizer_trip_links o ON o.restored_link_id = c.source_id
+)
+UPDATE control_plane.telegram_organizer_trip_links l
+   SET binding_scope = 'trip'
+  FROM (SELECT DISTINCT target FROM chain WHERE source_via = 'dashboard_link_token') origin
+ WHERE l.id = origin.target AND l.binding_scope <> 'trip';

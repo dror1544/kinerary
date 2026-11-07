@@ -712,14 +712,105 @@ describe("AC-10: an Unlinked pair is never re-bound by a link, approval or not",
     assert.equal(await enrollmentState(trip.token), "issued", "and the link is still the organizer's");
   });
 
-  test("with NO account bound, a plain redemption by an Unlinked pair keeps what it always did: the interview starts, the link stays revoked", async () => {
+  test("an Unlinked pair opening the trip it was Unlinked from is refused even when nobody else is bound: the link stays revoked, no interview starts", async () => {
     const user = await organizer();
     const trip = await draftTrip(user);
     const t = nextChat();
     await unlinkedPair(trip.tripId, user, t);
-    const decision = await dispatchUpdate(pool, startUpdate(t, trip.token));
-    assert.equal(decision.kind, "reply");
+    const decision = multi(await dispatchUpdate(pool, startUpdate(t, trip.token)));
+    assert.equal(decision.replies[0]!.text, uiString("linkOtherBelongs", "en"));
     assert.equal((await liveLinks(trip.tripId, t)).length, 0, "not re-bound");
+    assert.equal((await sessionsFor(t)).length, 0);
+    assert.equal(await enrollmentState(trip.token), "issued");
+  });
+});
+
+// ── An Unlink or a trip-only link must not make the account "unbound" (re-review R1, R2) ────
+
+describe("a narrowed set never reads as 'nobody is bound'", { skip }, () => {
+  const rowsFor = async (tripId: string, chat: string) =>
+    (await pool.query("SELECT * FROM control_plane.organizer_link_requests WHERE trip_id = $1 AND requester_digest = $2", [tripId, digestOf(chat)])).rows;
+
+  test("R1 lost phone: the owner Unlinks the old phone and adds the new one with the one-time link; a stranger opening the account's next trip is refused, never bound", async () => {
+    const { unlinkTelegramLink } = await import("../src/telegram-mini-app.js");
+    const { user, t0, firstTripId } = await boundOrganizer();
+    const row = (await pool.query("SELECT id FROM control_plane.telegram_organizer_trip_links WHERE trip_id = $1 AND telegram_subject_digest = $2 AND revoked_at IS NULL", [firstTripId, digestOf(t0)])).rows[0];
+    assert.equal(await unlinkTelegramLink(pool, user, row.id), true);
+    const a = await draftTrip(user, "Trip A");
+    const phone = nextChat();
+    const issued = await issueTelegramLinkToken(pool, { userId: user, tripId: a.tripId });
+    assert.ok(issued.ok);
+    if (!issued.ok) return;
+    assert.equal((await redeemTelegramLinkToken(pool, issued.token, phone, null)).ok, true);
+
+    const c = await draftTrip(user, "Trip C");
+    const stranger = nextChat();
+    const decision = multi(await dispatchUpdate(pool, startUpdate(stranger, c.token)));
+    assert.equal(decision.replies[0]!.text, uiString("linkOtherBelongs", "en"), "refused, with nothing about the trip");
+    assert.equal(decision.replies.length, 1, "and nobody is asked: the trip-only Telegram may not approve for another trip, so it fails closed");
+    assert.equal((await liveLinks(c.tripId, stranger)).length, 0, "the stranger is not bound");
+    assert.equal((await sessionsFor(stranger)).length, 0);
+    assert.equal(await enrollmentState(c.token), "issued");
+    assert.equal((await rowsFor(c.tripId, stranger))[0].state, "refused");
+    assert.equal((await pool.query("SELECT count(*)::int AS n FROM control_plane.telegram_organizer_trip_links WHERE telegram_subject_digest = $1", [digestOf(stranger)])).rows[0].n, 0, "bound nowhere");
+  });
+
+  test("R1 continued: the owner's new phone still opens its OWN trip, and is refused on the account's other trips (the dashboard link is their way in there)", async () => {
+    const { unlinkTelegramLink } = await import("../src/telegram-mini-app.js");
+    const { user, t0, firstTripId } = await boundOrganizer();
+    const row = (await pool.query("SELECT id FROM control_plane.telegram_organizer_trip_links WHERE trip_id = $1 AND telegram_subject_digest = $2 AND revoked_at IS NULL", [firstTripId, digestOf(t0)])).rows[0];
+    await unlinkTelegramLink(pool, user, row.id);
+    const a = await draftTrip(user, "Trip A");
+    const c = await draftTrip(user, "Trip C");
+    const phone = nextChat();
+    const issued = await issueTelegramLinkToken(pool, { userId: user, tripId: a.tripId });
+    assert.ok(issued.ok);
+    if (!issued.ok) return;
+    await redeemTelegramLinkToken(pool, issued.token, phone, null);
+    assert.equal((await dispatchUpdate(pool, startUpdate(phone, a.token))).kind, "reply", "its own trip works");
+    await pool.query("UPDATE control_plane.intake_sessions SET expired_at = now() WHERE telegram_chat_id = $1 AND expired_at IS NULL", [phone]);
+    multi(await dispatchUpdate(pool, startUpdate(phone, c.token)));
+    assert.equal((await liveLinks(c.tripId, phone)).length, 0);
+  });
+
+  test("R2: the owner Unlinks T0 from one paused trip; a stranger opening that trip's link is refused, never bound account-wide (T0 bound elsewhere)", async () => {
+    const { t0, t1, trip, user } = await pausedTripWithLink();
+    const row = (await pool.query("SELECT id FROM control_plane.telegram_organizer_trip_links WHERE trip_id = $1 AND telegram_subject_digest = $2 AND revoked_at IS NULL", [trip.tripId, digestOf(t0)])).rows[0];
+    const { unlinkTelegramLink } = await import("../src/telegram-mini-app.js");
+    assert.equal(await unlinkTelegramLink(pool, user, row.id), true);
+    const decision = multi(await dispatchUpdate(pool, startUpdate(t1, trip.token)));
+    assert.equal(decision.replies[0]!.text, uiString("linkOtherBelongs", "en"));
+    assert.equal((await liveLinks(trip.tripId, t1)).length, 0);
+    assert.equal((await sessionsFor(t1)).length, 0);
+    assert.equal(await enrollmentState(trip.token), "issued");
+  });
+
+  test("R2 with T0's ONLY link being on that trip: still refused, because the trip holds a revoked link of an account that was bound", async () => {
+    const { unlinkTelegramLink } = await import("../src/telegram-mini-app.js");
+    const user = await organizer();
+    const trip = await draftTrip(user, "Only Trip");
+    const t0 = nextChat();
+    assert.equal((await dispatchUpdate(pool, startUpdate(t0, trip.token))).kind, "reply");
+    await pool.query("UPDATE control_plane.intake_sessions SET expires_at = now() - interval '1 minute' WHERE trip_id = $1 AND expired_at IS NULL", [trip.tripId]);
+    await claimExpiredSessions(pool, 100);
+    const next = await issueEnrollment(pool, user, trip.tripId, { enrollmentTtlSeconds: 3600 });
+    assert.ok(next.ok);
+    if (!next.ok) return;
+    const row = (await pool.query("SELECT id FROM control_plane.telegram_organizer_trip_links WHERE trip_id = $1 AND revoked_at IS NULL", [trip.tripId])).rows[0];
+    await unlinkTelegramLink(pool, user, row.id);
+    const stranger = nextChat();
+    const decision = multi(await dispatchUpdate(pool, startUpdate(stranger, next.token)));
+    assert.equal(decision.replies[0]!.text, uiString("linkOtherBelongs", "en"));
+    assert.equal((await liveLinks(trip.tripId, stranger)).length, 0);
+  });
+
+  test("AC-1 still holds: an account with truly nothing bound (no sign-up identity, no link of any scope, nothing revoked here) binds the first opener", async () => {
+    const user = await organizer();
+    const trip = await draftTrip(user);
+    const t = nextChat();
+    assert.equal((await dispatchUpdate(pool, startUpdate(t, trip.token))).kind, "reply");
+    assert.equal((await liveLinks(trip.tripId, t)).length, 1);
+    assert.equal((await pool.query("SELECT binding_scope FROM control_plane.telegram_organizer_trip_links WHERE trip_id = $1", [trip.tripId])).rows[0].binding_scope, "account");
   });
 });
 
