@@ -197,3 +197,59 @@ test("a request without the CSRF token is refused, and so is a retry when the bu
     assert.equal(notFailed.json().error, "NOT_FAILED");
   } finally { await app.close(); }
 });
+
+/** The ids and states that must not move when a refused retry is refused. */
+async function snapshot() {
+  const jobs = await pool.query("SELECT id, state FROM control_plane.jobs WHERE trip_id = $1 ORDER BY id", [ids.trip]);
+  const plans = await pool.query("SELECT id, status FROM control_plane.plans WHERE trip_id = $1 ORDER BY id", [ids.trip]);
+  const trip = await pool.query("SELECT lifecycle_state FROM control_plane.trips WHERE id = $1", [ids.trip]);
+  return { jobs: jobs.rows, plans: plans.rows, trip: trip.rows };
+}
+
+test("a retired (torn-down) trip is neither offered Try again nor rebuilt by it", { skip }, async () => {
+  const app = buildApp(profile, { portal: portalDeps(pool) });
+  try {
+    const { cookie, csrf } = await session(ids.owner, "retired");
+    await failTheBuild();
+    const original = (await pool.query("SELECT slug FROM control_plane.trips WHERE id = $1", [ids.trip])).rows[0].slug;
+    // scripts/teardown-trip.py retire_in_db: the slug is renamed; lifecycle_state and memberships are left as they were.
+    await pool.query("UPDATE control_plane.trips SET slug = $2 WHERE id = $1", [ids.trip, `retired-${original}-20261109`]);
+    try {
+      const detail = await app.inject({ method: "GET", url: `/v1/trips/${ids.trip}`, headers: { cookie } });
+      assert.equal(detail.statusCode, 200);
+      assert.notEqual(detail.json().nextAction, "retry_provisioning", "no button on a torn-down trip");
+
+      const before = await snapshot();
+      const response = await app.inject({ method: "POST", url: `/v1/trips/${ids.trip}/provisioning-retry`, headers: { cookie, "x-csrf-token": csrf } });
+      assert.equal(response.statusCode, 409);
+      assert.equal(response.json().error, "TRIP_RETIRED");
+      assert.deepEqual(await snapshot(), before, "nothing was queued, approved or superseded");
+    } finally {
+      await pool.query("UPDATE control_plane.trips SET slug = $2 WHERE id = $1", [ids.trip, original]);
+    }
+  } finally { await app.close(); }
+});
+
+test("a suspended trip is neither offered Try again nor given an approved build that would run on resume", { skip }, async () => {
+  const app = buildApp(profile, { portal: portalDeps(pool) });
+  try {
+    const { cookie, csrf } = await session(ids.owner, "suspended");
+    await failTheBuild();
+    await pool.query("UPDATE control_plane.trips SET suspended_at = now(), suspended_reason = 'test' WHERE id = $1", [ids.trip]);
+    try {
+      const detail = await app.inject({ method: "GET", url: `/v1/trips/${ids.trip}`, headers: { cookie } });
+      assert.notEqual(detail.json().nextAction, "retry_provisioning", "no button while suspended");
+
+      const before = await snapshot();
+      const response = await app.inject({ method: "POST", url: `/v1/trips/${ids.trip}/provisioning-retry`, headers: { cookie, "x-csrf-token": csrf } });
+      assert.equal(response.statusCode, 409);
+      assert.equal(response.json().error, "TRIP_SUSPENDED");
+      assert.deepEqual(await snapshot(), before, "nothing was queued or approved");
+    } finally {
+      await pool.query("UPDATE control_plane.trips SET suspended_at = NULL WHERE id = $1", [ids.trip]);
+    }
+    // Resumed, the same trip is offered it again.
+    const resumed = await app.inject({ method: "GET", url: `/v1/trips/${ids.trip}`, headers: { cookie } });
+    assert.equal(resumed.json().nextAction, "retry_provisioning");
+  } finally { await app.close(); }
+});

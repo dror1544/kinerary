@@ -505,6 +505,27 @@ describe("retryProvision", () => {
     }
   });
 
+  test("refuses a retired (torn-down) trip under the trips lock, changing nothing", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const first = await generatePlan(fix.pool, fix.tripId, fix.correlationId);
+      assert.equal(first.ok, true);
+      if (!first.ok) throw new Error("unreachable");
+      await issueApproval(fix.pool, first.planId, "user:test", 3600);
+      await simulateTerminalFailure(fix, first.planId, first.jobId);
+      await fix.pool.query("UPDATE control_plane.trips SET slug = 'retired-' || slug || '-20261109' WHERE id = $1", [fix.tripId]);
+      const stateBefore = (await fix.pool.query("SELECT lifecycle_state FROM control_plane.trips WHERE id = $1", [fix.tripId])).rows[0];
+      const plansBefore = (await fix.pool.query("SELECT count(*)::int AS n FROM control_plane.plans WHERE trip_id = $1", [fix.tripId])).rows[0];
+
+      const retry = await retryProvision(fix.pool, fix.tripId, `corr_${randomHex(12)}`);
+      assert.deepEqual(retry, { ok: false, reason: "TRIP_RETIRED" });
+      assert.deepEqual((await fix.pool.query("SELECT lifecycle_state FROM control_plane.trips WHERE id = $1", [fix.tripId])).rows[0], stateBefore);
+      assert.deepEqual((await fix.pool.query("SELECT count(*)::int AS n FROM control_plane.plans WHERE trip_id = $1", [fix.tripId])).rows[0], plansBefore);
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
   test("re-provision of a live trip: first_provision=false, executed plan untouched", { skip: SKIP }, async () => {
     const fix = await setupFixture(pool);
     try {

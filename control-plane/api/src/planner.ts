@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import type pg from "pg";
 import { INTAKE_SCHEMA_VERSION, organizerMatch, type AnswerStore } from "./interview.js";
 import { issueApproval } from "./plan-approval.js";
+import { RETIRED_SLUG_PREFIX } from "./trip-retirement.js";
 
 function generateId(prefix: string): string {
   return `${prefix}_${randomBytes(16).toString("hex")}`;
@@ -257,6 +258,7 @@ export type RetryProvisionResult =
       ok: false;
       reason:
         | "TRIP_NOT_FOUND"
+        | "TRIP_RETIRED"
         | "NOT_RETRYABLE_STATE"
         | "PROVISION_IN_PROGRESS"
         | "TRIP_NOT_CONFIRMED"
@@ -341,14 +343,23 @@ export async function retryProvision(
 
     // 2. `trips` LAST of the contended rows. The existence and state checks
     // are made HERE, under this lock, so the decision is taken under it.
-    const tripRow = await client.query<{ lifecycle_state: string }>(
-      "SELECT lifecycle_state FROM control_plane.trips WHERE id = $1 FOR UPDATE",
+    const tripRow = await client.query<{ lifecycle_state: string; slug: string }>(
+      "SELECT lifecycle_state, slug FROM control_plane.trips WHERE id = $1 FOR UPDATE",
       [tripId],
     );
     const trip = tripRow.rows[0];
     if (!trip) {
       await client.query("ROLLBACK");
       return { ok: false, reason: "TRIP_NOT_FOUND" };
+    }
+    // A torn-down trip (scripts/teardown-trip.py renames the slug to `retired-...` and leaves
+    // lifecycle_state and memberships as they were) must never be rebuilt: the new plan's deploy
+    // would recreate the container, ingress and DNS the teardown removed. Decided HERE, under the
+    // trips lock, so every caller is covered: the portal's Try again, POST /plan/retry and the
+    // admin dashboard's Retry.
+    if (trip.slug.startsWith(RETIRED_SLUG_PREFIX)) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "TRIP_RETIRED" };
     }
     if (!RETRYABLE_STATES.has(trip.lifecycle_state)) {
       await client.query("ROLLBACK");
