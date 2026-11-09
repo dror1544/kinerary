@@ -68,6 +68,11 @@ These are the whole point of this agent.
    served from** — `docker inspect` shows the mount. Its dependency step
    relinks worktree `node_modules` and disturbs the running stack. Name the
    suites you ran instead, and say that a full preflight was not among them.
+8. **Never remove, stop or recreate a container** (CLAUDE.md hard rule 7).
+   `kinerary-sprint5-testdb` is shared by every session's tests: make a clean
+   database inside it (`docker exec kinerary-sprint5-testdb psql -U postgres -c
+   'CREATE DATABASE cptest_<name>'`), drop only that one at the end, and leave
+   the container alone. If it is missing or broken, stop and report it.
 
 ## Report
 

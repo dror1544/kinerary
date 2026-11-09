@@ -35,6 +35,37 @@ class Classify(unittest.TestCase):
         ):
             self.assertEqual(classify(command), "deploy", command)
 
+    def test_removing_stopping_or_recreating_a_container_is_asked(self):
+        # Hard rule 7 (Dror, 2026-11-09): a verifier ran `docker rm -f` on the
+        # test Postgres every session shares, to get a "fresh" one.
+        for command in (
+            "docker rm -f kinerary-sprint5-testdb",
+            "docker rm -f kinerary-sprint5-testdb >/dev/null 2>&1; docker run -d --name kinerary-sprint5-testdb postgres:16",
+            "docker container rm kinerary-sprint5-testdb",
+            "docker stop kinerary-control-plane-local-api-1",
+            "docker container stop x",
+            "docker kill kinerary-sprint5-testdb",
+            "docker restart kinerary-control-plane-local-worker-1",
+            "docker compose -f control-plane/deployment/compose.local.yml down",
+            "docker compose -f x.yml rm -f api",
+            "docker compose stop worker",
+            "sudo docker rm kinerary-sprint5-testdb",
+            "ssh host \"docker stop trip-server\"",
+        ):
+            self.assertEqual(classify(command), "deploy", command)
+
+    def test_reading_containers_and_using_a_database_inside_one_is_not_asked(self):
+        for command in (
+            "docker ps -a",
+            "docker logs --since 5m kinerary-control-plane-local-worker-1",
+            "docker inspect -f '{{.State.StartedAt}}' x",
+            "docker exec kinerary-sprint5-testdb psql -U postgres -c 'DROP DATABASE IF EXISTS cptest_x'",
+            "docker exec kinerary-sprint5-testdb psql -U postgres -c 'CREATE DATABASE cptest_x'",
+            "docker image rm-unused-is-not-a-verb",
+            "cat > notes.md <<'EOF'\nnever docker rm a shared container\nEOF",
+        ):
+            self.assertEqual(classify(command), "none", command)
+
     def test_a_teardown_that_executes_is_a_live_change(self):
         self.assertEqual(classify("scripts/teardown-trip.py --trip japan-2026 --execute"), "deploy")
         self.assertEqual(classify("cd x && python3 scripts/teardown-trip.py --trip trip_abc --execute"), "deploy")
