@@ -126,6 +126,8 @@ export const PORTAL_SCOPE_POLICY: Readonly<Record<string, RouteScope>> = Object.
   "POST /v1/trips/:id/secondary-organizer-link": "account",
   "DELETE /v1/trips/:id/secondary-organizers/:secondaryId": "account",
   "POST /v1/trips/:id/provisioning-request": "trip",
+  // "Try again" on a build that failed for good: the same decision, by the same main organizer, as provisioning-request and approve above.
+  "POST /v1/trips/:id/provisioning-retry": "trip",
   "POST /v1/trips/:id/plans/:planId/approve": "trip",
   "POST /v1/trips/:id/plans/:planId/reject": "trip",
   // A site invite is a join URL that anyone can redeem anonymously with a password: it makes an account

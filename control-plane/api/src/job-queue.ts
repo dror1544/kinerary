@@ -1,5 +1,41 @@
 import type pg from "pg";
 
+/**
+ * Retry backoff for a job whose attempt failed (failJob) or whose worker
+ * vanished (recoverStaleLeases). Mirrored by RETRY_BACKOFF_* in the worker's
+ * provisioner.py; change both or neither.
+ *
+ * Why it exists: a requeued job used to be claimable on the very next poll, so
+ * max_attempts=3 was spent in about three seconds. On 2026-11-08 a few-second
+ * outage of the reverse proxy's admin API ("Connection refused") exhausted all
+ * three attempts inside that window and failed a trip's build for good - a
+ * blip no human would have noticed. The delay after the Nth failed attempt is
+ * BASE * FACTOR^(N-1), capped: 30s after the first, 120s after the second.
+ * That rides out an outage of a couple of minutes without making a genuinely
+ * broken deploy keep the organizer waiting long (the whole ladder is under
+ * 3 minutes at max_attempts=3). The cap only matters if max_attempts is raised.
+ *
+ * Stored in the existing `lease_expires_at` column, which is NULL on every
+ * queued job otherwise: on a 'queued' row it means "not claimable before".
+ * No migration, and nothing that writes `attempt` directly (tests, operators)
+ * is put into backoff by accident, which an `updated_at` rule would do.
+ */
+export const RETRY_BACKOFF_BASE_SECONDS = 30;
+export const RETRY_BACKOFF_FACTOR = 4;
+export const RETRY_BACKOFF_MAX_SECONDS = 600;
+
+/** Seconds a job that just failed its Nth attempt waits before it may be claimed again. */
+export function retryBackoffSeconds(attempt: number): number {
+  return Math.min(RETRY_BACKOFF_MAX_SECONDS, RETRY_BACKOFF_BASE_SECONDS * RETRY_BACKOFF_FACTOR ** Math.max(0, attempt - 1));
+}
+
+// SQL twin of retryBackoffSeconds for the UPDATEs that requeue. In them
+// `attempt` is the pre-update value: the count including the attempt that
+// just failed. NULL for a job that is about to go terminal.
+const requeueNotBeforeSql = (base: string, factor: string, cap: string) =>
+  `CASE WHEN attempt >= max_attempts THEN NULL
+             ELSE now() + make_interval(secs => LEAST(${cap}::float8, ${base}::float8 * power(${factor}::float8, GREATEST(attempt - 1, 0)))) END`;
+
 export interface JobClaim {
   jobId: string;
   tripId: string;
@@ -35,6 +71,10 @@ export type ClaimJobResult =
  * (not an error, not a block — the next claim tick sees the committed
  * `suspended_at` and correctly excludes the job via the WHERE clause, or
  * sees the suspend rolled back and claims normally).
+ *
+ * A requeued job is not claimable until its retry backoff has passed (see
+ * RETRY_BACKOFF_BASE_SECONDS): `lease_expires_at` on a queued row is "not
+ * before". Mirrored by provisioner.py's `_claim`.
  */
 export async function claimJob(
   db: pg.Pool,
@@ -62,6 +102,7 @@ export async function claimJob(
          AND pa.expires_at > now()
          AND pa.plan_digest = p.digest
          AND t.suspended_at IS NULL
+         AND (j.lease_expires_at IS NULL OR j.lease_expires_at <= now())
        ORDER BY j.created_at
        LIMIT 1
        FOR UPDATE OF j, pa, t SKIP LOCKED`,
@@ -141,6 +182,8 @@ export async function heartbeat(
  * covers the retry so the organizer does not need to re-approve a transient
  * failure. Jobs that have exhausted max_attempts are moved to 'failed' and
  * their approval is consumed so it cannot authorize a future attempt.
+ * A requeued job gets the same retry backoff as failJob's: a worker that dies
+ * on every attempt must not burn max_attempts in a few polls either.
  * Returns the number of jobs recovered.
  */
 export async function recoverStaleLeases(db: pg.Pool): Promise<number> {
@@ -161,11 +204,12 @@ export async function recoverStaleLeases(db: pg.Pool): Promise<number> {
              ELSE NULL
            END,
            lease_owner = NULL,
-           lease_expires_at = NULL,
+           lease_expires_at = ${requeueNotBeforeSql("$1", "$2", "$3")},
            updated_at = now()
        WHERE state = 'leased'
          AND lease_expires_at < now()
        RETURNING plan_id, attempt, max_attempts`,
+      [RETRY_BACKOFF_BASE_SECONDS, RETRY_BACKOFF_FACTOR, RETRY_BACKOFF_MAX_SECONDS],
     );
 
     // Terminal jobs only: consume the approval so it cannot authorize a new run.
@@ -276,6 +320,8 @@ export async function completeJob(
  * it moves back to 'queued' so the existing approval can authorize the next
  * claim — the organizer does not need to re-approve a transient failure. If
  * attempts are exhausted the job is marked failed and the approval is consumed.
+ * The requeued job waits out a backoff (retryBackoffSeconds) before claimJob
+ * may take it: 30s after the first failure, 120s after the second.
  */
 export async function failJob(
   db: pg.Pool,
@@ -300,11 +346,11 @@ export async function failJob(
              ELSE NULL
            END,
            lease_owner = NULL,
-           lease_expires_at = NULL,
+           lease_expires_at = ${requeueNotBeforeSql("$4", "$5", "$6")},
            updated_at = now()
        WHERE id = $2 AND lease_owner = $3 AND state = 'leased'
        RETURNING plan_id, attempt, max_attempts`,
-      [safeErrorCode, jobId, workerId],
+      [safeErrorCode, jobId, workerId, RETRY_BACKOFF_BASE_SECONDS, RETRY_BACKOFF_FACTOR, RETRY_BACKOFF_MAX_SECONDS],
     );
 
     if ((result.rowCount ?? 0) === 0) {
@@ -328,7 +374,7 @@ export async function failJob(
         [row.plan_id],
       );
     }
-    // Retriable: approval stays valid; claimJob will re-use it on the next attempt.
+    // Retriable: approval stays valid; claimJob will re-use it once the retry backoff has passed.
 
     await client.query("COMMIT");
     return true;

@@ -24,6 +24,7 @@ from control_plane_worker.provisioner import (
     ProvisionerWorker,
     TripRetired,
     bind_chat_to_trip,
+    retry_backoff_seconds,
     normalize_portal_origin,
     _record_trip_companion,
     attach_profile_to_orphan_bindings,
@@ -1600,6 +1601,82 @@ class ProvisionerFailureTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row["state"], "queued")
         self.assertEqual(row["attempt"], 1)
+
+    def _wait_seconds(self) -> float:
+        row = self.conn.execute(
+            "SELECT extract(epoch FROM lease_expires_at - now())::float8 AS s "
+            "FROM control_plane.jobs WHERE id = %s",
+            (self.fix["job_id"],),
+        ).fetchone()
+        return row["s"]
+
+    def _elapse_backoff(self) -> None:
+        self.conn.execute(
+            "UPDATE control_plane.jobs SET lease_expires_at = now() - interval '1 second' WHERE id = %s",
+            (self.fix["job_id"],),
+        )
+        self.conn.commit()
+
+    def test_a_failed_attempt_is_not_claimable_until_its_backoff_has_passed(self) -> None:
+        """The 2026-11-08 failure: all three attempts inside three seconds."""
+        self.assertTrue(self.worker.run_once())  # attempt 1 fails, requeued
+        self.conn.commit()
+        wait = self._wait_seconds()
+        self.assertTrue(25 < wait <= 30, f"first backoff is ~30s, got {wait}")
+
+        # Polled again at once: nothing to claim, attempt not spent.
+        self.assertFalse(self.worker.run_once())
+        row = self.conn.execute(
+            "SELECT state, attempt FROM control_plane.jobs WHERE id = %s", (self.fix["job_id"],),
+        ).fetchone()
+        self.assertEqual((row["state"], row["attempt"]), ("queued", 1))
+
+        # Once the backoff has passed it is claimed and tried (and backs off longer).
+        self._elapse_backoff()
+        self.assertTrue(self.worker.run_once())
+        self.conn.commit()
+        row = self.conn.execute(
+            "SELECT state, attempt FROM control_plane.jobs WHERE id = %s", (self.fix["job_id"],),
+        ).fetchone()
+        self.assertEqual((row["state"], row["attempt"]), ("queued", 2))
+        wait = self._wait_seconds()
+        self.assertTrue(115 < wait <= 120, f"second backoff is ~120s, got {wait}")
+        self.assertFalse(self.worker.run_once())
+
+    def test_the_last_attempt_leaves_no_backoff_on_the_failed_job(self) -> None:
+        self.conn.execute(
+            "UPDATE control_plane.jobs SET attempt = max_attempts - 1 WHERE id = %s",
+            (self.fix["job_id"],),
+        )
+        self.conn.commit()
+        self.worker.run_once()
+        row = self.conn.execute(
+            "SELECT state, lease_expires_at FROM control_plane.jobs WHERE id = %s", (self.fix["job_id"],),
+        ).fetchone()
+        self.assertEqual(row["state"], "failed")
+        self.assertIsNone(row["lease_expires_at"])
+
+    def test_backoff_schedule_matches_the_typescript_twin(self) -> None:
+        # job-queue.ts retryBackoffSeconds: 30, 120, 480, then the 600s cap.
+        self.assertEqual([retry_backoff_seconds(n) for n in (0, 1, 2, 3, 4)], [30, 30, 120, 480, 600])
+
+    def test_exhausted_failure_notification_carries_the_interview_language(self) -> None:
+        self.conn.execute(
+            "UPDATE control_plane.intake_versions SET language = 'he' WHERE id = %s",
+            (self.fix["intake_id"],),
+        )
+        self.conn.execute(
+            "UPDATE control_plane.jobs SET attempt = max_attempts - 1 WHERE id = %s",
+            (self.fix["job_id"],),
+        )
+        self.conn.commit()
+        self.worker.run_once()
+        row = self.conn.execute(
+            "SELECT payload FROM control_plane.notification_outbox WHERE trip_id = %s AND kind = 'provisioning_failed'",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertEqual(row["payload"]["language"], "he")
+        self.assertEqual(row["payload"]["safe_error_code"], "FAKE_DEPLOY_FAILURE")
 
     def test_deploy_failure_does_not_consume_approval_when_retriable(self) -> None:
         self.worker.run_once()

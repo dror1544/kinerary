@@ -134,6 +134,34 @@ test("a provisioning_failed row gets a generic, error-code-free message", { skip
   }
 });
 
+test("a provisioning_failed row tells the organizer they can tap Try again, in the interview's language", { skip }, async () => {
+  const pool = testPool();
+  const client = await pool.connect();
+  try {
+    await resetDb(client);
+    await applyMigrations(client, migrationsDir);
+    client.release();
+
+    const tripId = await insertTrip(pool);
+    await insertOutboxRow(pool, tripId, "provisioning_failed", "555000222", { safe_error_code: "PROVISIONER_ERROR" });
+    await insertOutboxRow(pool, tripId, "provisioning_failed", "555000333", { safe_error_code: "PROVISIONER_ERROR", language: "he" });
+
+    const notification = new FakeNotificationAdapter();
+    assert.equal(await dispatchPendingTripNotifications(pool, notification), 2);
+    const text = (chatId: string) => notification.messageCalls.find((call) => call.chatId === chatId)!.text;
+
+    assert.match(text("555000222"), /Try again/);
+    assert.doesNotMatch(text("555000222"), /no action needed/);
+    assert.match(text("555000333"), /נסו שוב/);
+    assert.doesNotMatch(text("555000333"), /Try again|PROVISIONER_ERROR/);
+  } finally {
+    const c2 = await pool.connect();
+    await resetDb(c2);
+    c2.release();
+    await pool.end();
+  }
+});
+
 test("send failure re-queues the row until max_attempts, then marks it failed", { skip }, async () => {
   const pool = testPool();
   const client = await pool.connect();

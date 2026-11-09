@@ -65,6 +65,26 @@ DRAFT_SLUG_PREFIX = "draft-"
 # Bounded so a pathological base cannot spin the worker.
 SLUG_COLLISION_LIMIT = 100
 
+# Retry backoff for a failed job attempt: mirrors RETRY_BACKOFF_* in
+# job-queue.ts (change both or neither; its comment has the full reasoning).
+# Short version: a requeued job used to be claimable on the next poll, so
+# max_attempts=3 was spent in ~3 seconds, and a few-second outage of the
+# reverse proxy's admin API (2026-11-08) failed a trip's build for good. The
+# delay after the Nth failed attempt is BASE * FACTOR^(N-1), capped: 30s, then
+# 120s. Held in `lease_expires_at`, which is NULL on every other queued job: on
+# a queued row it means "not claimable before". No migration.
+RETRY_BACKOFF_BASE_SECONDS = 30
+RETRY_BACKOFF_FACTOR = 4
+RETRY_BACKOFF_MAX_SECONDS = 600
+
+
+def retry_backoff_seconds(attempt: int) -> float:
+    """Seconds a job that just failed its Nth attempt waits before it may be claimed again."""
+    return min(
+        RETRY_BACKOFF_MAX_SECONDS,
+        RETRY_BACKOFF_BASE_SECONDS * RETRY_BACKOFF_FACTOR ** max(0, attempt - 1),
+    )
+
 # #review 2026-10-03: found live — gate_ready_private's runtime_health/
 # rendered_data probes used to run the instant deploy() returned, with no
 # grace period for ordinary DNS/NPM/Cloudflare propagation lag behind a
@@ -1481,6 +1501,9 @@ class ProvisionerWorker:
                       AND  pa.expires_at > now()
                       AND  pa.plan_digest = p.digest
                       AND  t.suspended_at IS NULL
+                      -- a requeued job waits out its retry backoff
+                      -- (RETRY_BACKOFF_*); NULL for a job never yet failed
+                      AND  (j.lease_expires_at IS NULL OR j.lease_expires_at <= now())
                     ORDER BY j.created_at
                     LIMIT  1
                     FOR UPDATE OF j, pa, t SKIP LOCKED
@@ -2417,7 +2440,8 @@ class ProvisionerWorker:
         error_code: str,
     ) -> None:
         """Re-queues the job if retries remain; marks it failed and consumes
-        the approval if attempts are exhausted (mirrors failJob in TypeScript)."""
+        the approval if attempts are exhausted (mirrors failJob in TypeScript).
+        A requeued job is held back by the retry backoff (RETRY_BACKOFF_*)."""
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
@@ -2432,12 +2456,25 @@ class ProvisionerWorker:
                                      ELSE NULL
                                    END,
                            lease_owner = NULL,
-                           lease_expires_at = NULL,
+                           -- retriable: not claimable again before the
+                           -- backoff (RETRY_BACKOFF_*) has passed; `attempt`
+                           -- here is the pre-update count, including the
+                           -- attempt that just failed
+                           lease_expires_at = CASE
+                                     WHEN attempt >= max_attempts THEN NULL
+                                     ELSE now() + make_interval(
+                                            secs => LEAST(%s::float8,
+                                                          %s::float8 * power(%s::float8, GREATEST(attempt - 1, 0))))
+                                   END,
                            updated_at = now()
                     WHERE  id = %s AND lease_owner = %s AND state = 'leased'
                     RETURNING attempt, max_attempts
                     """,
-                    (error_code, job_id, self._worker_id),
+                    (
+                        error_code,
+                        RETRY_BACKOFF_MAX_SECONDS, RETRY_BACKOFF_BASE_SECONDS, RETRY_BACKOFF_FACTOR,
+                        job_id, self._worker_id,
+                    ),
                 )
                 row = cur.fetchone()
                 if row is None:
@@ -2515,7 +2552,25 @@ class ProvisionerWorker:
                         if owner_row else None
                     )
 
-                    notif_payload = json.dumps({"safe_error_code": error_code})
+                    # The language the interview was held in, so the organizer's
+                    # message ("tap Try again on the dashboard") is worded in it.
+                    # Absent (older intake versions have none) reads as English.
+                    cur.execute(
+                        """
+                        SELECT iv.language
+                        FROM control_plane.jobs j
+                        JOIN control_plane.intake_versions iv ON iv.trip_id = j.trip_id
+                        WHERE j.id = %s
+                        ORDER BY iv.version DESC
+                        LIMIT 1
+                        """,
+                        (job_id,),
+                    )
+                    language_row = cur.fetchone()
+                    failure_payload: dict[str, Any] = {"safe_error_code": error_code}
+                    if language_row and language_row["language"]:
+                        failure_payload["language"] = language_row["language"]
+                    notif_payload = json.dumps(failure_payload)
                     cur.execute(
                         """
                         INSERT INTO control_plane.notification_outbox

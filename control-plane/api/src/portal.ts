@@ -11,7 +11,7 @@ import {
   recordGivenName, runInBackground, startPasswordReset, startSignUp, type EmailAuthContext,
 } from "./portal-email-auth.js";
 import { pickLanguage } from "./portal-email-templates.js";
-import { generatePlan } from "./planner.js";
+import { generatePlan, retryProvision } from "./planner.js";
 import { issueApproval } from "./plan-approval.js";
 import { removeMember } from "./member-removal.js";
 import { structuredLog } from "./redaction.js";
@@ -587,11 +587,17 @@ async function membership(deps: PortalDependencies, tripId: string, userId: stri
   return result.rows[0] ?? null;
 }
 
+// Trip states a terminally failed build can be retried from: `retryProvision`'s own RETRYABLE_STATES, minus
+// `intake_confirmed` (a trip there has no live build to retry: it is asked to request provisioning instead).
+const RETRY_FROM_STATES = new Set(["planned", "provisioning_approved", "provisioning", "ready_private"]);
+
 function nextAction(state: string, planStatus?: string | null, jobState?: string | null, runtimeReady = false): string {
   if (state === "draft" || state === "intake_in_progress") return "continue_interview";
   if (state === "intake_confirmed") return "request_provisioning";
   // The organizer's own next move, not a wait on someone else.
   if (planStatus === "pending_approval") return "review_plan";
+  // The build gave up after its attempts (worker `_fail`): the organizer can ask for it again (POST .../provisioning-retry).
+  if (jobState === "failed" && RETRY_FROM_STATES.has(state)) return "retry_provisioning";
   if (["queued", "leased", "running"].includes(jobState ?? "")) return "track_provisioning";
   if (state === "ready_private" || state === "active") return runtimeReady ? "open_trip" : "view_status";
   if (state === "completed" || state === "sealed") return "view_trip";
@@ -1558,6 +1564,47 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     }
     await recordFunnelEvent(deps.db, "provisioning_requested", { userId: user.id, tripId });
     return reply.code(201).send({ planId: generated.planId, digest: generated.planDigest, planStatus: "pending_approval" });
+  });
+
+  // "Try again" on a build that failed for good (the worker used up its attempts: `jobs.state = 'failed'`).
+  // The main organizer only - role 'owner' with dashboard access, as for provisioning-request; a secondary organizer
+  // (#523) holds a runtime-only 'organizer' membership and a member holds neither, so both are refused.
+  //
+  // One tap re-runs the build WITHOUT the review step. Reusing `retryProvision` (the same mechanism as
+  // POST /v1/trips/:id/plan/retry and the admin dashboard's Retry) builds a plan from the same confirmed intake, and
+  // the tap itself is the approval: the organizer already approved this build once and nothing about it has changed
+  // except that it failed, so a second review would only be a second tap for the same decision. If the approval step
+  // somehow fails the new plan is left `pending_approval`, which is the ordinary PlanReview state: recoverable.
+  app.post("/v1/trips/:id/provisioning-retry", async (request, reply) => {
+    const user = await requireMutation(request, reply, deps);
+    if (!user) return;
+    const tripId = (request.params as { id?: string }).id ?? "";
+    const member = await membership(deps, tripId, user.id);
+    if (!member) return reply.code(404).send({ error: "NOT_FOUND" });
+    if (member.role !== "owner" || !member.dashboard_access) return reply.code(403).send({ error: "NOT_OWNER" });
+    // Only a build that has finished failing. The same "latest plan" row `tripDetail` shows the page, so what the
+    // button offers is what the route accepts. A queued, running or pending one is 409: never a second build.
+    const latest = await deps.db.query<{ job_state: string | null }>(
+      `SELECT j.state AS job_state FROM control_plane.plans p
+       LEFT JOIN control_plane.jobs j ON j.plan_id = p.id
+       WHERE p.trip_id = $1 ORDER BY p.created_at DESC LIMIT 1`, [tripId]);
+    if (latest.rows[0]?.job_state !== "failed") return reply.code(409).send({ error: "NOT_FAILED" });
+    const retried = await retryProvision(deps.db, tripId, opaque("corr", 12));
+    if (!retried.ok) {
+      const status = retried.reason === "TRIP_NOT_FOUND" ? 404
+        : retried.reason === "NO_COMPATIBLE_RELEASE" || retried.reason === "ORGANIZER_NOT_ON_ROSTER" ? 422
+        : 409;
+      return reply.code(status).send({ error: retried.reason });
+    }
+    const approval = await issueApproval(deps.db, retried.planId, `user:${user.id}`, deps.approvalTtlSeconds, {
+      operatorChatId: deps.operatorChatId,
+    });
+    if (!approval.ok) {
+      // A plan created a moment ago cannot be refused, so this is a real fault: say so rather than report a success.
+      emailAuthLog(structuredLog("error", "portal.provisioning_retry_approval_failed", { trip_id: tripId, plan_id: retried.planId, reason: approval.reason }));
+      return reply.code(500).send({ error: "APPROVAL_FAILED" });
+    }
+    return reply.code(201).send({ planId: retried.planId, planStatus: "approved", jobId: retried.jobId });
   });
 
   // The organizer reviews the plan they just created, then approves or rejects

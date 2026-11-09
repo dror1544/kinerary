@@ -213,3 +213,41 @@ it("a stale replacement refreshes metadata and reports conflict without rotating
   expect(replacements).toBe(1);
   expect(screen.queryByRole('link', { name: 'Open Telegram interview' })).toBeNull();
 });
+const failedTrip = { ...trip, lifecycleState: "provisioning_approved", nextAction: "retry_provisioning", provisioning: { planId: "plan_abcdefgh", planStatus: "superseded", jobState: "failed", releaseId: null, digest: "sha256:abc", safeErrorCode: "PROVISIONER_ERROR" } };
+it("a build that failed for good says so in plain words, hides the error code, and Try again re-runs it", async () => {
+  let retried = 0;
+  mount(`/trips/${trip.id}/setup`, (url, init) => {
+    if (url === "/v1/me") return json({ id: "user_existing", displayName: "Organizer" });
+    if (url === `/v1/trips/${trip.id}/provisioning-retry` && init?.method === "POST") { retried++; return json({ planId: "plan_new", planStatus: "approved", jobId: "job_new" }, 201); }
+    if (url === `/v1/trips/${trip.id}`) return json(retried ? { ...failedTrip, nextAction: "track_provisioning", provisioning: { ...failedTrip.provisioning, planStatus: "approved", jobState: "queued", safeErrorCode: null } } : failedTrip);
+    return json({}, 404);
+  });
+  expect(await screen.findByText(/We couldn't finish building your trip site\. This is usually temporary\./)).toBeInTheDocument();
+  expect(screen.queryByText(/Provisioner error/i)).toBeNull();
+  expect(screen.queryByText(/PROVISIONER_ERROR/)).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+  await vi.waitFor(() => expect(retried).toBe(1));
+  // The page moves on to following the new build; the failure notice is gone.
+  await vi.waitFor(() => expect(screen.queryByRole("button", { name: "Try again" })).toBeNull());
+  expect(screen.queryByText(/We couldn't finish building/)).toBeNull();
+});
+it("a failed Try again is reported without the raw error code", async () => {
+  mount(`/trips/${trip.id}/setup`, (url, init) => {
+    if (url === "/v1/me") return json({ id: "user_existing", displayName: "Organizer" });
+    if (url === `/v1/trips/${trip.id}/provisioning-retry` && init?.method === "POST") return json({ error: "NO_COMPATIBLE_RELEASE" }, 422);
+    if (url === `/v1/trips/${trip.id}`) return json(failedTrip);
+    return json({}, 404);
+  });
+  fireEvent.click(await screen.findByRole("button", { name: "Try again" }));
+  expect(await screen.findByText(/We couldn't start it again just now/)).toBeInTheDocument();
+  expect(screen.queryByText(/NO_COMPATIBLE_RELEASE/)).toBeNull();
+});
+it("offers no Try again button to someone who is not the trip's owner", async () => {
+  mount(`/trips/${trip.id}/setup`, (url) => {
+    if (url === "/v1/me") return json({ id: "user_existing", displayName: "Organizer" });
+    if (url === `/v1/trips/${trip.id}`) return json({ ...failedTrip, permissions: { ...trip.permissions, role: "organizer", requestProvisioning: false } });
+    return json({}, 404);
+  });
+  expect(await screen.findByText(/We couldn't finish building your trip site/)).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+});
