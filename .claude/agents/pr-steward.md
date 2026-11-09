@@ -63,7 +63,11 @@ fix the same file twice.
 Agent worktrees pile up under `.claude/worktrees/` because nothing reaps them:
 Claude Code only auto-removes a worktree that changed nothing, and a
 developer's worktree always has commits. You are the one that removes them, so
-there is a single owner and no mess. Run this at the end of a sprint, once a
+there is a single owner and no mess. Since 2026-11-09 the mechanical part is
+`scripts/sweep-merged.py`, which the post-merge hook runs on every merge (see
+CLAUDE.md, "Merged work cleans up after itself"); run it first
+(`scripts/sweep-merged.py`, then `--execute`), and spend this sweep on what it
+kept and why. Run this at the end of a sprint, once a
 day with the other sweeps, and whenever asked.
 
 **Scope: only worktrees Claude created.** That means a path directly under
