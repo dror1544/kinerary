@@ -134,7 +134,14 @@ function messageTextFor(row: OutboxRow, options?: DispatchOptions): string | Int
   if (row.notification_type === "provisioning_failed") {
     // Deliberately no error code/detail here — payload.safe_error_code is an
     // operator-facing diagnostic, not organizer-facing content.
-    return "There was a problem setting up your trip site. We're looking into it — no action needed from you right now.";
+    // It tells the organizer what they CAN do: the dashboard's trip page offers
+    // "Try again" for a build that failed for good (portal.ts
+    // `retry_provisioning`). Worded in the interview's language when the worker
+    // recorded it; English otherwise.
+    if (payloadString(row, "language") === "he") {
+      return "הייתה בעיה בהקמת אתר הטיול שלכם. זה בדרך כלל זמני — אפשר ללחוץ על \"נסו שוב\" בעמוד הטיול בלוח הבקרה של Kinerary.";
+    }
+    return "There was a problem setting up your trip site. This is usually temporary — you can tap Try again on your trip's page in the Kinerary dashboard.";
   }
   return null;
 }

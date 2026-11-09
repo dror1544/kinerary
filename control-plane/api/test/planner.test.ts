@@ -5,7 +5,7 @@ import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
 import { generatePlan, retryProvision } from "../src/planner.js";
 import { issueApproval } from "../src/plan-approval.js";
-import { claimJob, heartbeat, recoverStaleLeases, recoverExpiredApprovals, completeJob, failJob } from "../src/job-queue.js";
+import { claimJob, heartbeat, recoverStaleLeases, recoverExpiredApprovals, completeJob, failJob, retryBackoffSeconds } from "../src/job-queue.js";
 import { buildReleaseManifest, type PayloadSource } from "../src/release-artifact.js";
 import { promoteRelease, registerCandidateRelease } from "../src/release-registry.js";
 import { executeClear, previewClear } from "../src/trip-clear.js";
@@ -37,6 +37,14 @@ function generateTestId(prefix: string): string {
 }
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
+
+/** Lets a requeued job's retry backoff elapse (it is held in `lease_expires_at` on the queued row). */
+async function elapseRetryBackoff(pool: pg.Pool, tripId: string): Promise<void> {
+  await pool.query(
+    "UPDATE control_plane.jobs SET lease_expires_at = now() - interval '1 second' WHERE trip_id = $1 AND state = 'queued'",
+    [tripId],
+  );
+}
 
 interface PlannerFixture {
   pool: pg.Pool;
@@ -492,6 +500,27 @@ describe("retryProvision", () => {
         "SELECT lifecycle_state FROM control_plane.trips WHERE id = $1", [fix.tripId],
       );
       assert.equal(trip.rows[0]?.lifecycle_state, "planned");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("refuses a retired (torn-down) trip under the trips lock, changing nothing", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const first = await generatePlan(fix.pool, fix.tripId, fix.correlationId);
+      assert.equal(first.ok, true);
+      if (!first.ok) throw new Error("unreachable");
+      await issueApproval(fix.pool, first.planId, "user:test", 3600);
+      await simulateTerminalFailure(fix, first.planId, first.jobId);
+      await fix.pool.query("UPDATE control_plane.trips SET slug = 'retired-' || slug || '-20261109' WHERE id = $1", [fix.tripId]);
+      const stateBefore = (await fix.pool.query("SELECT lifecycle_state FROM control_plane.trips WHERE id = $1", [fix.tripId])).rows[0];
+      const plansBefore = (await fix.pool.query("SELECT count(*)::int AS n FROM control_plane.plans WHERE trip_id = $1", [fix.tripId])).rows[0];
+
+      const retry = await retryProvision(fix.pool, fix.tripId, `corr_${randomHex(12)}`);
+      assert.deepEqual(retry, { ok: false, reason: "TRIP_RETIRED" });
+      assert.deepEqual((await fix.pool.query("SELECT lifecycle_state FROM control_plane.trips WHERE id = $1", [fix.tripId])).rows[0], stateBefore);
+      assert.deepEqual((await fix.pool.query("SELECT count(*)::int AS n FROM control_plane.plans WHERE trip_id = $1", [fix.tripId])).rows[0], plansBefore);
     } finally {
       await teardownFixture(fix);
     }
@@ -990,7 +1019,9 @@ describe("claimJob / heartbeat / completeJob / failJob", () => {
       );
       assert.equal(tripRow.rows[0]?.lifecycle_state, "provisioning_approved");
 
-      // The re-queued job is immediately claimable without a new approval.
+      // The re-queued job is claimable without a new approval once its retry backoff has passed.
+      assert.equal((await claimJob(fix.pool, "worker_02", 60)).ok, false, "a reaped job is also held back by the backoff");
+      await elapseRetryBackoff(fix.pool, fix.tripId);
       const reclaim = await claimJob(fix.pool, "worker_02", 60);
       assert.equal(reclaim.ok, true);
     } finally {
@@ -1083,7 +1114,8 @@ describe("claimJob / heartbeat / completeJob / failJob", () => {
       );
       assert.equal(tripRow.rows[0]?.lifecycle_state, "provisioning_approved");
 
-      // The re-queued job is immediately claimable without a new approval.
+      // The re-queued job is claimable without a new approval once the backoff has passed.
+      await elapseRetryBackoff(fix.pool, fix.tripId);
       const reclaim = await claimJob(fix.pool, "worker_02", 60);
       assert.equal(reclaim.ok, true);
       assert.equal(reclaim.ok && reclaim.claim.jobId, claim.claim.jobId);
@@ -1106,6 +1138,7 @@ describe("claimJob / heartbeat / completeJob / failJob", () => {
       await failJob(fix.pool, jobId, "worker_01", "TRANSIENT_ERROR");
 
       // Second attempt: re-claim using the same approval — no new approval needed.
+      await elapseRetryBackoff(fix.pool, fix.tripId);
       const second = await claimJob(fix.pool, "worker_02", 60);
       assert.equal(second.ok, true);
       if (!second.ok) throw new Error("unreachable");
@@ -1129,6 +1162,54 @@ describe("claimJob / heartbeat / completeJob / failJob", () => {
     } finally {
       await teardownFixture(fix);
     }
+  });
+
+  test("retry backoff: a failed attempt is not claimable at once; 30s after the first failure, 120s after the second", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const { jobId } = await setupApprovedJob(fix);
+      const notBeforeSeconds = async (): Promise<number> => (await fix.pool.query<{ s: number }>(
+        "SELECT extract(epoch FROM lease_expires_at - now())::float8 AS s FROM control_plane.jobs WHERE id = $1", [jobId],
+      )).rows[0]!.s;
+
+      const first = await claimJob(fix.pool, "worker_01", 60);
+      assert.equal(first.ok, true);
+      assert.equal(await failJob(fix.pool, jobId, "worker_01", "TRANSIENT_ERROR"), true);
+      // The 2026-11-08 failure: three attempts inside three seconds. Not any more.
+      assert.deepEqual(await claimJob(fix.pool, "worker_02", 60), { ok: false, reason: "NO_CLAIMABLE_JOB" });
+      let wait = await notBeforeSeconds();
+      assert.ok(wait > 25 && wait <= 30, `after the first failure the wait is ~30s, got ${wait}`);
+
+      // Time passing is what makes it claimable again.
+      await elapseRetryBackoff(fix.pool, fix.tripId);
+      const second = await claimJob(fix.pool, "worker_02", 60);
+      assert.equal(second.ok, true);
+      assert.equal(second.ok && second.claim.attempt, 2);
+      assert.equal(await failJob(fix.pool, jobId, "worker_02", "TRANSIENT_ERROR"), true);
+      assert.equal((await claimJob(fix.pool, "worker_03", 60)).ok, false);
+      wait = await notBeforeSeconds();
+      assert.ok(wait > 115 && wait <= 120, `after the second failure the wait is ~120s, got ${wait}`);
+
+      // The last attempt is terminal: no backoff is left behind on a failed job.
+      await elapseRetryBackoff(fix.pool, fix.tripId);
+      const third = await claimJob(fix.pool, "worker_03", 60);
+      assert.equal(third.ok, true);
+      assert.equal(await failJob(fix.pool, jobId, "worker_03", "TRANSIENT_ERROR"), true);
+      const done = await fix.pool.query<{ state: string; lease_expires_at: Date | null }>(
+        "SELECT state, lease_expires_at FROM control_plane.jobs WHERE id = $1", [jobId]);
+      assert.equal(done.rows[0]?.state, "failed");
+      assert.equal(done.rows[0]?.lease_expires_at, null);
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("retry backoff: retryBackoffSeconds is exponential and capped", () => {
+    assert.equal(retryBackoffSeconds(1), 30);
+    assert.equal(retryBackoffSeconds(2), 120);
+    assert.equal(retryBackoffSeconds(3), 480);
+    assert.equal(retryBackoffSeconds(4), 600, "bounded");
+    assert.equal(retryBackoffSeconds(0), 30);
   });
 
   test("failJob at max_attempts: marks job failed", { skip: SKIP }, async () => {
