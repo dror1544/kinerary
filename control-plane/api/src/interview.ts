@@ -23,6 +23,7 @@ import {
 import { structuredLog } from "./redaction.js";
 import { listTripDocuments } from "./document-registry.js";
 import { canonical, entryIdentity, stripVisitMarkers } from "./answer-merge.js";
+import { looksLikeDate, placeYearlessDay, readDayMonth, readFullDate } from "./date-words.js";
 import { applyOps, draftDigest, warningLines, type Line, type Op } from "./typed-changes.js";
 import { listAnswerSources, type SourceDisposition } from "./answer-provenance.js";
 
@@ -299,6 +300,13 @@ export interface IntakeQuestion {
    * when the roster arrives after the name.
    */
   canonicalize?: (answers: AnswerStore) => IntakeAnswer | null;
+  /**
+   * A TEXT question whose answer is a calendar day and is stored as `YYYY-MM-DD`, always. `validateAnswer` reads
+   * what was said with `readFullDate` and stores the ISO day; a value it cannot read - words with no year, a day
+   * that does not exist - is refused, and the question is asked again. The worker reads nothing but ISO, and a
+   * date stored as the organizer's words was built into a trip in the wrong year with no error (2026-11-08).
+   */
+  isDate?: boolean;
   /** Buttons for a TEXT or STRUCTURED question, drawn from what is already recorded. */
   choicesFrom?: (answers: AnswerStore) => RosterChoice[];
   /**
@@ -371,11 +379,32 @@ export function scopeWithChoice(answers: AnswerStore, value: string): Record<str
  * block an interview on a question it has not reached.
  */
 export function datesInOrder(answers: AnswerStore): boolean {
-  const start = answers.departure_date?.kind === "text" ? answers.departure_date.text.trim() : "";
-  const end = answers.return_date?.kind === "text" ? answers.return_date.text.trim() : "";
-  const iso = /^\d{4}-\d{2}-\d{2}$/;
-  if (!iso.test(start) || !iso.test(end)) return true;
+  const start = readFullDate(answers.departure_date?.kind === "text" ? answers.departure_date.text : "");
+  const end = readFullDate(answers.return_date?.kind === "text" ? answers.return_date.text : "");
+  if (start === null || end === null) return true;
   return end >= start;
+}
+
+/**
+ * Whether a stored date answer is a day we can use. A placeholder with no digit and no month word (an old
+ * fixture's "x") is left alone, as it always was; an answer that reads as an attempt at a date but is not one
+ * `readFullDate` can read ("22 בנובמבר" with no year) is NOT settled, so the question is asked again and the
+ * interview cannot be confirmed with it. `validateAnswer` stops new ones; this catches a stored one.
+ */
+function dateSettled(answer: IntakeAnswer | undefined): boolean {
+  if (answer?.kind !== "text") return true;
+  const text = answer.text.trim();
+  return readFullDate(text) !== null || !looksLikeDate(text);
+}
+
+/** The ISO form of a stored date written in words, or null when it is already ISO or cannot be read. */
+function isoDateAnswer(questionId: "departure_date" | "return_date") {
+  return (answers: AnswerStore): IntakeAnswer | null => {
+    const current = answers[questionId];
+    if (current?.kind !== "text") return null;
+    const day = readFullDate(current.text);
+    return day === null || day === current.text ? null : { ...current, text: day };
+  };
 }
 
 /**
@@ -694,6 +723,9 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     prompt: "What day does the trip start?",
     maxLength: 40,
     required: true,
+    isDate: true,
+    satisfiedBy: (answers) => dateSettled(answers.departure_date),
+    canonicalize: isoDateAnswer("departure_date"),
   },
   {
     id: "return_date",
@@ -708,7 +740,9 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     // two together. The recap read "12 July → 1 July" and the interview
     // confirmed. Settled here, so whichever of the two arrives second re-opens
     // the return question, quoting it.
-    satisfiedBy: (answers) => datesInOrder(answers),
+    isDate: true,
+    satisfiedBy: (answers) => dateSettled(answers.return_date) && datesInOrder(answers),
+    canonicalize: isoDateAnswer("return_date"),
   },
   {
     id: "timezone",
@@ -1284,6 +1318,24 @@ export function withoutFlightNumbersAsConfirmations(data: unknown): unknown {
   });
 }
 
+/** A year-less day and month for one of the two trip dates, placed against the other date or today; null if it cannot be. */
+function placedYearlessDay(
+  questionId: string,
+  said: string,
+  context: { answers?: AnswerStore; today?: Date } | undefined,
+): string | null {
+  const dm = readDayMonth(said);
+  if (dm === null) return null;
+  const held = (id: "departure_date" | "return_date"): string | null => {
+    const a = context?.answers?.[id];
+    return a?.kind === "text" ? readFullDate(a.text) : null;
+  };
+  const today = (context?.today ?? new Date()).toISOString().slice(0, 10);
+  if (questionId === "return_date") return placeYearlessDay(dm, held("departure_date") ?? today, "onOrAfter");
+  const returning = held("return_date");
+  return returning !== null ? placeYearlessDay(dm, returning, "onOrBefore") : placeYearlessDay(dm, today, "onOrAfter");
+}
+
 export function validateAnswer(
   questionId: string,
   optionId: string | "other" | null,
@@ -1291,6 +1343,8 @@ export function validateAnswer(
   questions: readonly IntakeQuestion[] = INTAKE_QUESTIONS,
   structuredData?: unknown,
   optionIds?: readonly string[],
+  /** What a year-less date is placed against: the answers on record, and today (default: the clock). */
+  context?: { answers?: AnswerStore; today?: Date },
 ): AnswerValidationResult {
   const question = questions.find((q) => q.id === questionId);
   if (!question) return { ok: false, reason: "UNKNOWN_QUESTION" };
@@ -1358,6 +1412,24 @@ export function validateAnswer(
   if (question.required && trimmed.length === 0) return { ok: false, reason: "TEXT_REQUIRED" };
   const max = question.maxLength ?? 500;
   if (trimmed.length > max) return { ok: false, reason: "TEXT_TOO_LONG" };
+  if (question.isDate && trimmed.length > 0) {
+    // ONE place, every writer: a model proposal, a typed correction, a document, the agent's tool and the card seed
+    // all arrive here, so none can store a day as words.
+    //
+    // A day and month with no year is PLACED, not refused: organizers say dates however they like and the interview
+    // confirms its reading back in words. The return is the first such day on or after the held departure, the
+    // departure the last on or before the held return, else the first on or after today.
+    const day = readFullDate(trimmed) ?? placedYearlessDay(question.id, trimmed, context);
+    if (day === null) {
+      return {
+        ok: false,
+        reason: "INCOMPLETE_ANSWER",
+        detail: `${question.id} must be one real day, written YYYY-MM-DD (got ${JSON.stringify(trimmed.slice(0, 40))}). ` +
+          "Work the day out from the dates already on record, or ask for the day and month - never store it as it was written.",
+      };
+    }
+    return { ok: true, answer: { kind: "text", schema_version: INTAKE_SCHEMA_VERSION, text: day } };
+  }
   return {
     ok: true,
     answer: { kind: "text", schema_version: INTAKE_SCHEMA_VERSION, text: trimmed },
@@ -4909,7 +4981,7 @@ async function submitAnswerVia(
       return { ok: false, reason: "STALE_ANSWER" };
     }
 
-    const validation = validateAnswer(questionId, optionId, otherText, INTAKE_QUESTIONS, structuredData, optionIds);
+    const validation = validateAnswer(questionId, optionId, otherText, INTAKE_QUESTIONS, structuredData, optionIds, { answers: session.answers });
     if (!validation.ok) {
       await client.query("ROLLBACK");
       return { ok: false, reason: validation.reason, ...(validation.detail ? { detail: validation.detail } : {}) };
@@ -5174,10 +5246,19 @@ async function syncCardFromIntake(
   const destinationChanged = destination.length >= 1 && destination.length <= 160 && destination !== card.destination_label;
   if (destinationChanged) changed.push("destination");
 
-  const day = (value: string | null) => (value !== null && /^\d{4}-\d{2}-\d{2}$/.test(value.trim()) && readableDate(value, "en") !== null ? value.trim() : null);
+  const day = (value: string | null) => (value !== null ? readFullDate(value) : null);
   const start = day(textAnswer(answers, "departure_date"));
   const end = day(textAnswer(answers, "return_date"));
   const datesUsable = start !== null && end !== null && end >= start;
+  // The card keeps its old dates when the confirmed ones cannot be used - and it must not do that quietly: the
+  // dashboard then shows dates the organizer changed (2026-11-08: a return stored as words left the card on 21 Nov).
+  if (!datesUsable && (textAnswer(answers, "departure_date")?.trim() || textAnswer(answers, "return_date")?.trim())) {
+    log(structuredLog("warn", "interview.card_sync_dates_skipped", {
+      trip_id: tripId,
+      departure_date_usable: start !== null,
+      return_date_usable: end !== null,
+    }));
+  }
   if (datesUsable && start !== card.start_date) changed.push("start_date");
   if (datesUsable && end !== card.end_date) changed.push("end_date");
   if (changed.length === 0) return;

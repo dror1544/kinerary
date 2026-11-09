@@ -41,7 +41,8 @@ function answerFor(q: IntakeQuestion): Record<string, unknown> {
       if (q.id === "travelers") return { questionId: q.id, data: [{ name: "Alex" }] };
       return { questionId: q.id, data: q.dataShape === "array" ? [{ note: "x" }] : { note: "x" } };
     case "text":
-      return { questionId: q.id, otherText: "an answer" };
+      // A date question stores a real day with its year (`isDate`), like travelers' completeness check above.
+      return { questionId: q.id, otherText: q.isDate ? "2026-11-22" : "an answer" };
     default:
       throw new Error(`no answer shape for question type ${(q as IntakeQuestion).type}`);
   }
