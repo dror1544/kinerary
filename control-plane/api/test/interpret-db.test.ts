@@ -1571,3 +1571,151 @@ describe("a typed message longer than one read takes", { skip: SKIP ? "no CONTRO
     });
   });
 });
+
+/**
+ * #321/#325: a typed name that matches two travellers narrows the question
+ * instead of offering the whole roster again — organizer-roster.test.ts and
+ * interview.test.ts cover that at the data layer. What only a database (and
+ * the real router) can show is the SECOND message: typing the same ambiguous
+ * name again must be read as a repeat of what is already on screen, not
+ * interpreted fresh as a brand-new answer — and the organizer must still hear
+ * something back, with the right lead.
+ */
+describe("the ambiguous organizer name, typed twice, then settled by a tap", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABASE_URL" : false }, () => {
+  const TWO_DANAS = {
+    kind: "structured", schema_version: 3,
+    data: [{ name: "Dana Levi" }, { name: "Dana Cohen" }],
+  };
+
+  /**
+   * Every required question except `organizer_identity` and `travelers` is
+   * pre-filled, and `travelers` is set to a roster with two Danas — so
+   * `organizer_identity` is the one thing left to ask, and asking it is where
+   * the ambiguity shows up.
+   */
+  async function readyForOrganizer(pool: pg.Pool, chatId: string) {
+    for (const q of INTAKE_QUESTIONS.filter((x) => x.required && x.id !== "organizer_identity")) {
+      await pool.query(
+        `UPDATE control_plane.intake_sessions
+            SET answers = answers || jsonb_build_object($2::text, $3::jsonb)
+          WHERE telegram_chat_id = $1`,
+        [chatId, q.id, JSON.stringify(q.id === "travelers" ? TWO_DANAS : { kind: "text", schema_version: 3, text: "x" })],
+      );
+    }
+    await pool.query(
+      `UPDATE control_plane.intake_sessions
+          SET language = 'en', state = 'interviewing', awaiting = 'person', phase = 'essentials'
+        WHERE telegram_chat_id = $1`,
+      [chatId],
+    );
+    await setInterpretPath(pool, chatId, true);
+  }
+
+  /**
+   * A stand-in interpreter that always reads the organizer's literal message
+   * as a successfully-parsed `organizer_identity` text proposal — the model
+   * never fails here, which is the whole point: the ambiguity is a property
+   * of the ROSTER, not of whether the model understood the message.
+   */
+  function echoOrganizer() {
+    const calls: string[] = [];
+    return {
+      calls,
+      async run(req: { prompt: string; parse: (raw: unknown) => unknown }) {
+        const text = req.prompt.split("Message:\n").pop()?.trim() ?? "";
+        calls.push(text);
+        const raw = {
+          proposals: [{
+            questionId: "organizer_identity",
+            value: { kind: "text", text },
+            confidence: 0.95,
+            evidence: text,
+            sourceMessageId: "",
+          }],
+          unclear: [],
+        };
+        const parsed = req.parse(raw);
+        if (parsed === null) return { ok: false as const, reason: "BAD_OUTPUT" as const, detail: "", attempts: 1, ms: 1 };
+        return { ok: true as const, value: parsed, attempts: 1, ms: 1 };
+      },
+    };
+  }
+
+  /** Taps a button the way production handles one — see the identical helper above. */
+  async function tap(pool: pg.Pool, chat: Chat, data: string, telegram: Recorder): Promise<string> {
+    const { applyDecision, renderDueRouterPrompts, advanceRouterOwnedQuestions } = await import("../src/relay/poller.js");
+    const { DEFAULT_STRINGS } = await import("../src/relay/dispatch.js");
+    const logs: string[] = [];
+    const log = (l: string) => logs.push(l);
+    const deps = { db: pool, telegram, connector: { pushInbound: () => true }, modelRunner: emptyRunner, log } as never;
+    await applyDecision(
+      { kind: "interview_callback", chatId: chat.chatId, callbackQueryId: `cq${++seq}`, data, sessionId: chat.sessionId } as never,
+      deps,
+    );
+    await advanceRouterOwnedQuestions(deps, DEFAULT_STRINGS, log);
+    await renderDueRouterPrompts(deps, DEFAULT_STRINGS, log, 0);
+    return logs.map((l) => (JSON.parse(l) as { event?: string }).event).join(", ");
+  }
+
+  test("typing the ambiguous name twice restates the ambiguous copy — then tapping settles it", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await readyForOrganizer(pool, a.chatId);
+      const telegram = new Recorder();
+
+      // FIRST "Dana": read, accepted, and recorded — but it names two
+      // travellers, so the question comes straight back, narrowed to them.
+      await say(pool, a.chatId, "Dana", telegram, echoOrganizer());
+
+      const firstAsk = telegram.sent[telegram.sent.length - 1]!;
+      assert.match(firstAsk.text, /More than one traveller is called “Dana” — which one are you\?/);
+      assert.equal(firstAsk.buttons, 2, "only the two it could be, never the whole roster");
+      const afterFirst = await getSessionForChat(pool, a.chatId);
+      assert.ok(afterFirst.ok);
+      assert.equal(afterFirst.view.lastPrompt, "q:organizer_identity:unsettled:Dana:ambiguous");
+
+      // SECOND "Dana", identical: a repeat of what is already on screen, not a
+      // fresh answer. The router must recognise it as such — logging the
+      // dedupe — and still say something back, since the organizer just
+      // spoke and silence here is indistinguishable from a broken bot.
+      const logs2: string[] = [];
+      const log2 = (l: string) => logs2.push(l);
+      await say(pool, a.chatId, "Dana", telegram, echoOrganizer(), log2);
+
+      const events2 = logs2.map((l) => JSON.parse(l) as { event?: string; [k: string]: unknown });
+      assert.ok(
+        events2.some((e) => e.event === "trip_bot.prompt_deduped"),
+        `expected trip_bot.prompt_deduped in: ${JSON.stringify(events2.map((e) => e.event))}`,
+      );
+      const restated = events2.find((e) => e.event === "trip_bot.expectation_restated");
+      assert.ok(restated, `expected trip_bot.expectation_restated in: ${JSON.stringify(events2.map((e) => e.event))}`);
+      assert.equal(restated?.lead_skipped_for_unsettled_answer, true);
+
+      const secondAsk = telegram.sent[telegram.sent.length - 1]!;
+      assert.match(secondAsk.text, /More than one traveller is called “Dana” — which one are you\?/);
+      assert.equal(secondAsk.buttons, 2);
+      assert.ok(
+        !secondAsk.text.includes(uiString("didNotFollow", "en")),
+        `never the generic "didn't follow" lead over an answer that was read and matched — got: ${secondAsk.text}`,
+      );
+
+      // A fresh interpretation was still paid for — this is a REPEAT the
+      // router recognised at the sending end, not something short-circuited
+      // before the model ever ran.
+      const second = await getSessionForChat(pool, a.chatId);
+      assert.ok(second.ok);
+      assert.equal(second.view.state, "interviewing", "still unsettled — nothing was decided for them");
+
+      // THEN A TAP settles it: the narrowed roster's own button records the
+      // roster's spelling, not the organizer's ambiguous text.
+      const optionId = second.ok ? second.view.choices?.organizer_identity?.[0]?.id : undefined;
+      assert.ok(optionId, "the narrowed roster is still offered as buttons");
+      await tap(pool, a, `a:organizer_identity:${optionId}`, telegram);
+
+      const settled = await getSessionForChat(pool, a.chatId);
+      assert.ok(settled.ok);
+      assert.equal(settled.view.unsettled?.organizer_identity, undefined, "a tap on one of the two settles it");
+      const store = await answersForChat(pool, a.chatId);
+      assert.equal((store?.answers.organizer_identity as { text?: string } | undefined)?.text, "Dana Levi");
+    });
+  });
+});
