@@ -92,7 +92,8 @@ When the organizer opens the interview link of a trip created on the dashboard:
   "Japan", `departure_date` = "2027-04-12", `return_date` = "2027-04-26" and
   `trip_type` = `family`, in the same transaction that creates the session,
   and the session's first `nextQuestion` is none of those four.
-- AC-2 Given that session, when the opening is rendered in English and in
+- AC-2 (wording superseded by AC-13, 2026-11-09: the opening says the month,
+  not both dates, and never the word dashboard) Given that session, when the opening is rendered in English and in
   Hebrew, then it contains the organizer's name (per the name rule), the
   destination, and both dates as `readableDate` (`intake-copy.ts:1034`) words,
   contains no `YYYY-MM-DD`, and asks for neither the destination nor the
@@ -133,7 +134,7 @@ When the organizer opens the interview link of a trip created on the dashboard:
   (destination, dates) for the opening; `chat-router.ts` `renderDocumentOffer`
   (`:1307`) takes it and the organizer's name.
 - `control-plane/api/src/intake-copy.ts`: new he/en strings for the seeded
-  opening line ("Hi {name} — let's set up {destination}, {dates}.") placed
+  opening line (wording: AC-13) placed
   before the existing introduction text; the rest of the introduction is
   unchanged.
 - **Name rule (proposal, Open question 2):** the Telegram account's first name
@@ -247,6 +248,64 @@ which reads as asking everything again. AC-3 never covered `phases`.
   `validateAnswer` would reject (for example a non-Latin destination with no
   English name) is not offered, and the question is asked as today. Derived on
   every read, like AC-9's confirm, never stored.
+
+## Decision (Dror, 2026-11-09): the opening, in the organizer's own language, for a first-time account
+
+Found on the Sprint 8 staging run (Hebrew interview, dashboard-created trip
+"Gatecity", 14-21 Nov 2026, organizer "Arlo"). The seeded opening was "not good,
+in Hebrew and in English": it talked about the dashboard, the Hebrew was
+masculine singular while the rest of the interview is plural, the name and the
+destination came out in Latin letters inside a Hebrew sentence, and it said
+"welcome back" to an account on its first trip. Dror chose the copy (option C).
+
+- **AC-13 (copy)** The seeded opening replaces the earlier lines (AC-2's wording)
+  with one friendly sentence, placed before the unchanged introduction:
+  - EN: "Hi {name}, {destination} in {month}. How exciting! 🎉 A few quick
+    questions and your trip will be ready for everyone."
+  - HE: "היי {name}, {destination} ב{month}. איזה כיף! 🎉 כמה שאלות קצרות והטיול
+    יהיה מוכן לכולם."
+  `{month}` is the departure month in words in the interview language
+  ("November" / "נובמבר"); a trip that crosses a month names both
+  ("November–December" / "נובמבר–דצמבר"). No name drops "{name}," ("Hi! …" /
+  "היי! …"). No usable date drops the month ("Hi {name}, {destination}. How
+  exciting! …"). No destination leaves the greeting and the quick-questions
+  sentence ("Hi {name}! A few quick questions …"). The opening never prints
+  `YYYY-MM-DD` and never says dashboard or card. The introduction (or the
+  returning one) follows unchanged.
+- **AC-14 (native names)** When the interview language is not English, the
+  organizer's name and the destination are written in that language for the
+  greeting: the name by sound (Arlo → ארלו), the destination by its common
+  native name if it has one (Paris → פריז, Rome → רומא), else by sound
+  (Gatecity → גייטסיטי). One bounded model call on the binding the interview
+  already uses for `interpret` (`INTERPRET_RUNNER` / `MODEL` / `EFFORT`), a
+  strict short JSON answer, a hard 5-second ceiling, and a validation gate
+  (non-empty, short, target-script letters only, no Latin letters, no line
+  breaks). On any failure, timeout or `NOT_CONFIGURED` the English as entered is
+  used, a warning is logged (reason only, never the values), and the opening is
+  never held beyond the ceiling. The call is made once per session, after the
+  session's transaction has committed, and the result is stored with the session
+  (`intake_sessions.ui_state.native_names`, each value next to the English it was
+  made from; no migration). Later uses read it and never call again: the AC-12
+  known-stop question names the place in the interview language, and the stop it
+  records has `name` in that language with `name_en` keeping the English. A
+  destination corrected afterwards no longer matches its stored source, so the
+  translation of another place is never shown. The destination answer itself
+  (and so the slug) stays the English as entered. An English interview makes no
+  call. A name already written in the target script is not sent.
+- **AC-15 (welcome back)** The returning opening is used only when THIS account
+  (the trip owner's `user_id`) has an earlier built trip. A built trip of another
+  account linked to the same Telegram no longer counts: since #523 a Telegram is
+  one account's main Telegram. `hasEarlierBuiltTrip` takes no Telegram id; both
+  callers (a plain `/start`, and the organizer's approval of another Telegram
+  account opening the link) mean "this account".
+- **AC-16 (suites)** `control-plane/api` against a `*test*` database, `tsc`
+  clean, verifier report attached to the PR.
+
+Known limit: the native names are made for the language the session starts in
+(Telegram's client locale). An interview that starts in English and switches to
+Hebrew when the organizer types Hebrew keeps the English place in the stops
+question, which is the fallback above, not an error.
+
 
 ## Open questions
 

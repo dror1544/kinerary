@@ -57,6 +57,8 @@ import { peekEnrollmentTripId } from "./enrollment.js";
 import { recordForeignLinkOpen, type ApproverNotice, type ForeignLinkResult } from "./organizer-link-approval.js";
 import { digestTelegramId, isPrivateChatId, type TelegramName } from "./identity.js";
 import { structuredLog } from "./redaction.js";
+import { nativeSeededOpening } from "./native-names.js";
+import type { StructuredModelRunner } from "./model-runner.js";
 
 // ── Inbound text ─────────────────────────────────────────────────────────────
 
@@ -854,6 +856,8 @@ export async function startFromDeepLink(
   languageHint?: string,
   /** The Telegram account's first name and @username, from the update's verified `from` (display data only). */
   telegramName?: TelegramName | null,
+  /** The relay's model runner, for the opening's native-language name and destination (#438, AC-14). Absent = English. */
+  modelRunner?: StructuredModelRunner,
 ): Promise<StartLinkOutcome> {
   // A chat already conducting an interview must not consume a second
   // enrollment. The partial unique index on (telegram_chat_id) would reject
@@ -959,7 +963,7 @@ export async function startFromDeepLink(
   // back to the opening every first-time organizer gets.
   let returning = false;
   try {
-    returning = await hasEarlierBuiltTrip(db, result.view.tripId, chatId);
+    returning = await hasEarlierBuiltTrip(db, result.view.tripId);
   } catch {
     returning = false;
   }
@@ -971,13 +975,19 @@ export async function startFromDeepLink(
       returning,
     }),
   );
+  // The greeting in the interview's own language (#438, AC-14): made here, after the session's transaction has
+  // committed (a model call never sits inside it), once, and stored with the session. Never throws, never waits
+  // longer than its own ceiling, and on any failure the opening carries the English as entered.
+  const seeded = result.seeded
+    ? await nativeSeededOpening(db, modelRunner, result.sessionId, result.view.language, result.seeded, log)
+    : undefined;
   return {
     kind: "started",
     sessionId: result.sessionId,
     tripId: result.view.tripId,
     view: result.view,
     returning,
-    ...(result.seeded ? { seeded: result.seeded } : {}),
+    ...(seeded ? { seeded } : {}),
   };
 }
 

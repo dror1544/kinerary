@@ -21,6 +21,7 @@ import {
   type Language,
 } from "./intake-copy.js";
 import { structuredLog } from "./redaction.js";
+import { nativeDestinationFor, parseNativeNames, type NativeNames } from "./native-names.js";
 import { listTripDocuments } from "./document-registry.js";
 import { canonical, entryIdentity, stripVisitMarkers } from "./answer-merge.js";
 import { looksLikeDate, placeYearlessDay, readDayMonth, readFullDate } from "./date-words.js";
@@ -2175,6 +2176,12 @@ export interface InterviewUiState {
    */
   knownStopDeclined?: boolean;
   /**
+   * The organizer's name and the destination in the interview's own language, made ONCE when the session started
+   * (#438, AC-14; `native-names.ts`), each next to the English it came from. The stops confirm and the stop it records
+   * read it and never ask a model again. Display data only: the destination ANSWER stays the English as entered.
+   */
+  nativeNames?: NativeNames;
+  /**
    * This session started on a paused trip whose earlier answers were NOT handed to it (#513: a link opened from a chat
    * that was not the interview's). When it closes it must not become the session a later link resumes from; only the
    * chat it ran in may resume it. Never carried to a successor.
@@ -2266,6 +2273,7 @@ function parseUiState(raw: unknown): InterviewUiState {
     ...(typeof record.organizer_name === "string" && record.organizer_name.length > 0 ? { organizerName: record.organizer_name } : {}),
     ...(record.organizer_name_declined === true ? { organizerNameDeclined: true } : {}),
     ...(record.known_stop_declined === true ? { knownStopDeclined: true } : {}),
+    ...((native) => (native ? { nativeNames: native } : {}))(parseNativeNames(record.native_names)),
     ...(record.not_resumable === true ? { notResumable: true } : {}),
   };
 }
@@ -2292,6 +2300,7 @@ function serializeUiState(ui: InterviewUiState): string {
     ...(ui.organizerName ? { organizer_name: ui.organizerName } : {}),
     ...(ui.organizerNameDeclined ? { organizer_name_declined: true } : {}),
     ...(ui.knownStopDeclined ? { known_stop_declined: true } : {}),
+    ...(ui.nativeNames ? { native_names: ui.nativeNames } : {}),
     ...(ui.notResumable ? { not_resumable: true } : {}),
   });
 }
@@ -2305,6 +2314,7 @@ function serializeUiState(ui: InterviewUiState): string {
  *   organizerName          the name the opening greeted them by; read again when the roster is known
  *   organizerNameDeclined  they said "no" to "which of them are you?": asked plainly from here on, not re-offered
  *   knownStopDeclined      they said "no" to "is that the only stop?": `phases` stays an open question
+ *   nativeNames            the name and destination in the interview's language, made once (display data, keyed by source)
  *   skipped                optional questions they declined (final)
  *   finishRequested        "that's everything": the summary, not the optional walk, is where they stopped
  *   offeredMore            "essentials done: more, or the summary?" was already put to them
@@ -2327,6 +2337,7 @@ function carriedUiState(ui: InterviewUiState): InterviewUiState {
     ...(ui.organizerName ? { organizerName: ui.organizerName } : {}),
     ...(ui.organizerNameDeclined ? { organizerNameDeclined: true } : {}),
     ...(ui.knownStopDeclined ? { knownStopDeclined: true } : {}),
+    ...(ui.nativeNames ? { nativeNames: ui.nativeNames } : {}),
     ...(ui.skipped && ui.skipped.length > 0 ? { skipped: ui.skipped } : {}),
     ...(ui.finishRequested ? { finishRequested: true } : {}),
     ...(ui.offeredMore ? { offeredMore: true } : {}),
@@ -3864,12 +3875,14 @@ function withOrganizerNameSuggestion(
  * take the stop (`suggestionAnswer`), or the place is written only in a non-Latin script, so copying it into
  * `name_en` would put a name the site's English side cannot read where the stop's English name goes.
  */
-export function knownStopSuggestion(answers: AnswerStore): SuggestedAnswer | null {
+export function knownStopSuggestion(answers: AnswerStore, ui: InterviewUiState = {}, language: Language = DEFAULT_LANGUAGE): SuggestedAnswer | null {
   const place = textAnswer(answers, "destination")?.trim() ?? "";
   const start = textAnswer(answers, "departure_date")?.trim() ?? "";
   const end = textAnswer(answers, "return_date")?.trim() ?? "";
   if (place === "" || knownStopConfirmText(place, start, end, "en") === null || end < start) return null;
-  const data = [{ name: place, name_en: place, start, end }];
+  // In an interview that is not in English, the stop is named in its language (made once at the start, and only while
+  // it still names the destination on record); `name_en` keeps the English as entered.
+  const data = [{ name: nativeDestinationFor(ui.nativeNames, language, place) ?? place, name_en: place, start, end }];
   if (stopsMissingEnglishName([{ name: place }]).length > 0) return null;
   const suggestion: SuggestedAnswer = { optionId: null, structuredData: data, source: "known_place" };
   return suggestionAnswer("phases", suggestion) ? suggestion : null;
@@ -3885,9 +3898,10 @@ function withKnownStopSuggestion(
   stored: Record<string, SuggestedAnswer>,
   answers: AnswerStore,
   ui: InterviewUiState,
+  language: Language,
 ): Record<string, SuggestedAnswer> {
   if (stored.phases || answers.phases !== undefined || ui.knownStopDeclined) return stored;
-  const known = knownStopSuggestion(answers);
+  const known = knownStopSuggestion(answers, ui, language);
   return known ? { ...stored, phases: known } : stored;
 }
 
@@ -3944,8 +3958,8 @@ function buildSessionView(
     pendingEntry: ui.pendingEntry ?? null,
     pendingSay: ui.pendingSay ?? null,
     pendingAskText: ui.pendingAskText ?? null,
-    suggestions: withKnownStopSuggestion(withOrganizerNameSuggestion(ui.suggestions ?? {}, answers, ui), answers, ui),
-    stopsAskedFromKnown: ui.knownStopDeclined === true && knownStopSuggestion(answers) !== null,
+    suggestions: withKnownStopSuggestion(withOrganizerNameSuggestion(ui.suggestions ?? {}, answers, ui), answers, ui, language),
+    stopsAskedFromKnown: ui.knownStopDeclined === true && knownStopSuggestion(answers, ui, language) !== null,
     choices: recordChoices(answers),
     subjects: recordSubjects(answers),
     unsettled: unsettledAnswers(answers),
