@@ -1092,3 +1092,10 @@ describe("AC-15 the returning opening is for an account that has had a trip buil
 });
 
 export type { SessionView };
+
+// Dror, 2026-11-09: the Hebrew confirm is his own wording, not a translation of the English line.
+test("the Hebrew organizer confirm reads as Dror worded it", () => {
+  const rendered = renderSuggestion(INTAKE_QUESTIONS.find((q) => q.id === "organizer_identity")!, "ארלו וספר", "he", null, "account_name");
+  assert.equal(rendered.text, "אני רק מוודא שאתה הוא ארלו וספר");
+  assert.ok(JSON.stringify(rendered.replyMarkup).includes(suggestionYesCallbackData("organizer_identity")));
+});

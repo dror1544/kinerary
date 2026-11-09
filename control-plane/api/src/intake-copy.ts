@@ -899,7 +899,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     suggestionIntro: "מהמסמך שלכם — זה נכון?",
     suggestionYes: "✅ כן, נכון",
     suggestionNo: "✏️ לא",
-    organizerNameConfirm: "אתה {name} ברשימה, נכון?",
+    organizerNameConfirm: "אני רק מוודא שאתה הוא {name}",
     knownStopConfirm: "אתם נוסעים ל{place}, {start} – {end}. זו התחנה היחידה?",
     seedHi: "היי {name}",
     seedHiAnon: "היי",
