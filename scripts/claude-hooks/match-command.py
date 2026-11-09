@@ -48,6 +48,12 @@ DEPLOY = re.compile(
     CMDPOS + r'(?:sudo\s+)?(?:bash\s+|sh\s+)?\S*(?:deploy\.sh|bring-up\.sh|deploy-trip\.sh|retarget-container\.sh)\b'
     r'|' + CMDPOS + r'(?:sudo\s+)?docker[ -]compose\b[^\n;&|]*\bup\b'
     r'|' + CMDPOS + r'(?:sudo\s+)?docker\s+restart\b'
+    # Hard rule 7: removing, stopping or recreating a container is Dror's call,
+    # every time. On 2026-11-09 a verifier ran `docker rm -f` on the test
+    # Postgres every session shares, to get a "fresh" one. `docker exec … psql`
+    # (creating or dropping your own cptest_* database inside it) stays quiet.
+    r'|' + CMDPOS + r'(?:sudo\s+)?docker\s+(?:container\s+)?(?:rm|stop|kill)\b'
+    r'|' + CMDPOS + r'(?:sudo\s+)?docker[ -]compose\b[^\n;&|]*\s(?:down|rm|stop|kill|restart)\b'
     r'|\bforce-recreate\b'
     r'|' + CMDPOS + r'(?:sudo\s+)?systemctl\s+restart\s+trip-server\b'
     # Tearing a trip down (container, DNS, proxy host, profile) is at least as

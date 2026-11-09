@@ -32,6 +32,14 @@ the one place the rules live, not two files kept in sync by hand.
    an SSH key, an `/opt` path, a chat id — and it belongs in `kinerary-deploy`,
    reached through an env var or a config file read at runtime. See
    "Two repositories" below for the shape and the escape hatch.
+7. **Never remove, stop or recreate a shared container without Dror's
+   specific approval** (Dror, 2026-11-09). That covers the test Postgres every
+   session shares (`kinerary-sprint5-testdb`), the staging stack's containers,
+   and anything else another session or a live trip may be using. A test
+   needs a clean database, not a clean container: create and drop your own
+   `cptest_<name>` database inside it. On 2026-11-09 a verifier ran
+   `docker rm -f` on the shared test Postgres to get a "fresh" one, and every
+   concurrent session's database tests lost their database.
 
 ## Notes, handovers and insights live outside the repo (owner's decision, 2026-09-28)
 
@@ -657,6 +665,8 @@ Every rule in "Hard Rules" above is now checked by
   and no script can check intent. Command classification lives in `scripts/claude-hooks/match-command.py`,
   which strips heredocs and quotes first — matching the bare words "git" and
   "commit" refuses any command that merely *writes documentation about* them.
+  Since 2026-11-09 it also covers `docker rm|stop|kill` and `docker compose
+  down|rm|stop|kill|restart` (rule 7); `docker exec … psql` stays silent.
   Since 2026-09-20 the same prompt covers the routes that create commits
   without the word: `git merge`, `cherry-pick`, `revert`, `rebase`, `am` and
   `gh pr merge` (all classified `none` until then — an integrator agent could
