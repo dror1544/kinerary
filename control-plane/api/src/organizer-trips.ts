@@ -55,22 +55,24 @@ export const LIVE_INTAKE_SESSION_PREDICATE =
   "telegram_chat_id = $1 AND state <> 'confirmed' AND expired_at IS NULL";
 
 /**
- * Has this person been through all of this before?
+ * Has THIS ACCOUNT been through all of this before?
  *
  * Asked once, at the moment an interview starts, to decide which opening they
  * meet: the full explanation of what Kinerary is, or the shorter one that does
  * not explain what they already have sitting on their phone.
  *
- * "Before" means a trip of theirs that was actually BUILT. A draft they
+ * "Before" means a trip of this account's that was actually BUILT. A draft they
  * abandoned is not a previous trip, and greeting them with "your previous trip
  * isn't touched" when there is no site to speak of would be a sentence about
  * nothing. Retired trips are excluded for the same reason.
  *
- * Identity is read from both directions, because one person here legitimately
- * owns several user_ids: the trip's own owner, and every user the sender's
- * Telegram identity has been PROVEN to own for THAT earlier trip (a link the
- * organizer unlinked does not count). The Telegram id
- * comes from the update's own chat, never from anything anyone typed.
+ * "This account" is the trip's own owner (`user_id`) and nobody else. It used to
+ * also count every built trip of ANY account linked to the same Telegram person,
+ * from the days when one person legitimately owned several user_ids. Since #523 a
+ * Telegram is ONE account's main Telegram, so a link to another account is not
+ * this account's history: a brand-new account whose Telegram had built trips under
+ * earlier test accounts was welcomed BACK to a product it had never used (Sprint 8
+ * staging, 2026-11-09). The Telegram id is therefore not an input at all.
  *
  * Wrong in the safe direction by construction: an unknown person, a first
  * trip, or a failed lookup all produce false, which is the ordinary opening.
@@ -78,9 +80,7 @@ export const LIVE_INTAKE_SESSION_PREDICATE =
 export async function hasEarlierBuiltTrip(
   db: pg.Pool,
   tripId: string,
-  telegramUserId: string | null,
 ): Promise<boolean> {
-  const digest = telegramUserId && isPrivateChatId(telegramUserId) ? digestTelegramId(telegramUserId) : null;
   const rows = await db.query<{ earlier: boolean }>(
     `SELECT EXISTS (
        SELECT 1
@@ -90,17 +90,11 @@ export async function hasEarlierBuiltTrip(
         WHERE t.id <> $1
           AND t.lifecycle_state IN ('ready_private', 'ready_public')
           AND ${NOT_RETIRED_SQL}
-          AND (
-            m.user_id IN (
-              SELECT own.user_id FROM control_plane.trip_memberships own
-               WHERE own.trip_id = $1 AND own.role = 'owner' AND own.status = 'active')
-            OR ($2::text IS NOT NULL AND EXISTS (
-              SELECT 1 FROM control_plane.telegram_organizer_trip_links l
-               WHERE l.telegram_subject_digest = $2 AND l.user_id = m.user_id
-                 AND l.trip_id = t.id AND l.revoked_at IS NULL))
-          )
+          AND m.user_id IN (
+            SELECT own.user_id FROM control_plane.trip_memberships own
+             WHERE own.trip_id = $1 AND own.role = 'owner' AND own.status = 'active')
      ) AS earlier`,
-    [tripId, digest],
+    [tripId],
   );
   return rows.rows[0]?.earlier === true;
 }

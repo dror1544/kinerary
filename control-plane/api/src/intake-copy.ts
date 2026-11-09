@@ -510,14 +510,14 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // place of "which of them are you?". Said as a question to them, not as something read from a document.
     organizerNameConfirm: "You're {name} on the list, right?",
     knownStopConfirm: "You're going to {place}, {start} – {end}. Is that the only stop?",
-    // The opening of a trip that was created on the dashboard (#438): who they are to this trip, and what is
-    // already chosen. Placed before the usual introduction, which follows unchanged.
-    seedGreeting: "Hi {name} — you're the organizer of this trip.",
-    seedGreetingAnon: "You're the organizer of this trip.",
-    seedStart: "I'm starting from what you chose on the dashboard: {what}. If any of it is off, just tell me and I'll change it.",
-    seedRange: "{start} to {end}",
-    seedFrom: "from {start}",
-    seedUntil: "until {end}",
+    // The opening of a trip that was created on the dashboard (#438, AC-13): a friendly greeting that says what is
+    // already known -- the place and the month -- and that a few questions are all that is left. It never says where
+    // the values came from. Placed before the usual introduction, which follows unchanged. See `seededOpening`.
+    seedHi: "Hi {name}",
+    seedHiAnon: "Hi",
+    seedPlaceMonth: "{place} in {month}",
+    seedExcited: "How exciting! 🎉",
+    seedQuick: "A few quick questions and your trip will be ready for everyone.",
     /** Instead of documentNothing, when nothing was certain but something was found. */
     documentUnsure: "I read it and found a few things I'm not sure I read right — I'll check each one with you as we go.",
     /** Beside what was taken, naming what will be checked. */
@@ -901,12 +901,11 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     suggestionNo: "✏️ לא",
     organizerNameConfirm: "אתה {name} ברשימה, נכון?",
     knownStopConfirm: "אתם נוסעים ל{place}, {start} – {end}. זו התחנה היחידה?",
-    seedGreeting: "היי {name} — אתה המארגן של הטיול הזה.",
-    seedGreetingAnon: "אתה המארגן של הטיול הזה.",
-    seedStart: "אני מתחיל ממה שבחרת בלוח הבקרה: {what}. אם משהו מזה לא נכון, פשוט תגיד לי ואשנה.",
-    seedRange: "{start} עד {end}",
-    seedFrom: "החל מ-{start}",
-    seedUntil: "עד {end}",
+    seedHi: "היי {name}",
+    seedHiAnon: "היי",
+    seedPlaceMonth: "{place} ב{month}",
+    seedExcited: "איזה כיף! 🎉",
+    seedQuick: "כמה שאלות קצרות והטיול יהיה מוכן לכולם.",
     documentUnsure: "קראתי, ומצאתי כמה דברים שאני לא בטוח שקראתי נכון — אבדוק איתכם כל אחד מהם בהמשך.",
     documentWillCheck: "לא בטוח שקראתי נכון — אבדוק איתכם",
     documentMoreTravelers: "מסמך נוסף מזכיר גם את {names} — להוסיף אותם לנוסעים?",
@@ -1162,27 +1161,50 @@ export interface SeededOpeningFacts {
 }
 
 /**
- * The lines that open an interview for a trip created on the dashboard (#438): who the organizer is to this trip,
- * by name when there is one, and what is already chosen -- the destination and the dates, in words, never as
- * `YYYY-MM-DD`. They go BEFORE the usual introduction; nothing after them changes.
+ * The month a trip departs in, in words -- "November" / "נובמבר" -- or both months when it crosses one:
+ * "November–December". Taken from the dates as given (a real `YYYY-MM-DD` only; anything `readableDate` refuses is
+ * ignored), the departure first. Null when there is no usable date: the opening then names no month.
+ */
+export function tripMonthInWords(departureIso: string | null, returnIso: string | null, language: Language = DEFAULT_LANGUAGE): string | null {
+  const names = MONTHS[language] ?? MONTHS[DEFAULT_LANGUAGE];
+  const monthOf = (iso: string | null): number | null => {
+    if (!iso || readableDate(iso, language) === null) return null;
+    return Number(iso.trim().slice(5, 7)) - 1;
+  };
+  const from = monthOf(departureIso);
+  const until = monthOf(returnIso);
+  const first = from ?? until;
+  if (first === null) return null;
+  const second = from !== null ? until : null;
+  return second !== null && second !== first ? `${names[first]}\u2013${names[second]}` : names[first]!;
+}
+
+/**
+ * The opening of an interview for a trip created on the dashboard (#438, AC-13): one friendly line that greets the
+ * organizer, says the place and the month they are going, and tells them a few quick questions are all that is left.
+ * It goes BEFORE the usual introduction; nothing after it changes.
  *
- * Only what was seeded is said: a trip with no dates names only the destination, one with a start date says
- * "from <day>". A date `readableDate` will not render is left out rather than shown raw.
+ *   "Hi Dana, Japan in April. How exciting! 🎉 A few quick questions and your trip will be ready for everyone."
+ *
+ * Only what is known is said: no name drops "Dana" ("Hi! Japan in April. …"), no dates drops the month, no
+ * destination leaves the greeting and the quick-questions sentence. It never names where the values came from, and
+ * never prints a date as `YYYY-MM-DD`. A date `readableDate` will not render counts as no date.
+ *
+ * `destination` and `organizerName` are shown exactly as given: the caller decides whether they are the interview
+ * language's own spelling (`native-names.ts`) or, when that was not possible, the English as entered.
  */
 export function seededOpening(seeded: SeededOpeningFacts, language: Language = DEFAULT_LANGUAGE): string {
   const fill = (key: string, values: Record<string, string>) =>
     Object.entries(values).reduce((text, [name, value]) => text.replace(`{${name}}`, () => value), uiString(key, language));
   const name = seeded.organizerName?.trim();
-  const greeting = name ? fill("seedGreeting", { name }) : uiString("seedGreetingAnon", language);
+  const place = seeded.destination?.trim();
+  const hi = name ? fill("seedHi", { name }) : uiString("seedHiAnon", language);
+  const quick = uiString("seedQuick", language);
+  if (!place) return `${hi}! ${quick}`;
 
-  const start = seeded.departureDate ? readableDate(seeded.departureDate, language) : null;
-  const end = seeded.returnDate ? readableDate(seeded.returnDate, language) : null;
-  const dates = start && end ? fill("seedRange", { start, end })
-    : start ? fill("seedFrom", { start })
-    : end ? fill("seedUntil", { end })
-    : null;
-  const what = [seeded.destination?.trim(), dates].filter((part): part is string => Boolean(part)).join(", ");
-  return what ? `${greeting} ${fill("seedStart", { what })}` : greeting;
+  const month = tripMonthInWords(seeded.departureDate, seeded.returnDate, language);
+  const where = month ? fill("seedPlaceMonth", { place, month }) : place;
+  return `${hi}${name ? "," : "!"} ${where}. ${uiString("seedExcited", language)} ${quick}`;
 }
 
 function pick(localised: Localised | undefined, language: Language): string | null {

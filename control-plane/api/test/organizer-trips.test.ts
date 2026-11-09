@@ -710,14 +710,22 @@ describe("a returning organizer's second trip (DB)", { skip: SKIP }, () => {
     });
   });
 
-  test("someone who has had a trip built before is recognised as returning", async () => {
-    await withFixture(async ({ pool, japanId, strangerTripId }) => {
+  test("AC-15 an account that has had a trip built before is recognised as returning; a Telegram shared with another account is not enough", async () => {
+    await withFixture(async ({ pool, italyId, japanId, strangerTripId }) => {
       const { hasEarlierBuiltTrip } = await import("../src/organizer-trips.js");
-      // italy-2026 is ready_private and belongs to the same Telegram person
-      // through a DIFFERENT user_id — the shape this deployment is really in.
-      assert.equal(await hasEarlierBuiltTrip(pool, japanId, ORGANIZER_CHAT), true);
-      // The stranger's chat owns nothing that was ever built.
-      assert.equal(await hasEarlierBuiltTrip(pool, strangerTripId, OTHER_CHAT), false);
+      // italy-2026 is ready_private and its Telegram link is the very chat that opened japan-2026, but it belongs to a
+      // DIFFERENT user_id. Since #523 a Telegram is one account's main Telegram, so that is another account's history:
+      // the Sprint 8 staging run welcomed a brand-new account "back" because its Telegram had built trips as test accounts.
+      assert.equal(await hasEarlierBuiltTrip(pool, japanId), false, "another account's built trip is not this account's");
+      // The same account that owns a built trip is returning when it starts another.
+      const owner = await pool.query<{ user_id: string }>(
+        "SELECT user_id FROM control_plane.trip_memberships WHERE trip_id = $1 AND role = 'owner'", [japanId]);
+      await pool.query(
+        "INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status) VALUES ($1,$2,$3,'owner','active')",
+        [testId("memb"), italyId, owner.rows[0]!.user_id]);
+      assert.equal(await hasEarlierBuiltTrip(pool, japanId), true, "the same account owns italy-2026, which was built");
+      // The stranger's trip has no other owned trip at all.
+      assert.equal(await hasEarlierBuiltTrip(pool, strangerTripId), false);
     });
   });
 
@@ -726,13 +734,13 @@ describe("a returning organizer's second trip (DB)", { skip: SKIP }, () => {
       const { hasEarlierBuiltTrip } = await import("../src/organizer-trips.js");
 
       await pool.query("UPDATE control_plane.trips SET lifecycle_state = 'draft' WHERE id = $1", [italyId]);
-      assert.equal(await hasEarlierBuiltTrip(pool, japanId, ORGANIZER_CHAT), false,
+      assert.equal(await hasEarlierBuiltTrip(pool, japanId), false,
         "a draft they never finished was greeted as a previous trip");
 
       await pool.query(
         "UPDATE control_plane.trips SET lifecycle_state = 'ready_private', slug = 'retired-italy-20260101' WHERE id = $1",
         [italyId]);
-      assert.equal(await hasEarlierBuiltTrip(pool, japanId, ORGANIZER_CHAT), false,
+      assert.equal(await hasEarlierBuiltTrip(pool, japanId), false,
         "a torn-down trip was greeted as one they still have");
     });
   });
@@ -755,7 +763,7 @@ describe("an unlinked Telegram account loses the bot too (DB)", { skip: SKIP }, 
       const before = await listOrganizerTrips(pool, ORGANIZER_CHAT, ORGANIZER_CHAT);
       assert.deepEqual(before.map((t) => t.slug).sort(), ["italy-2026", "japan-2026"]);
       assert.equal(await isTripOrganizer(pool, italyId, ORGANIZER_CHAT), true);
-      assert.equal(await hasEarlier(pool, japanId), true);
+      assert.equal(await hasEarlier(pool, japanId), false, "italy-2026 is another account's trip: sharing a Telegram does not make japan's owner returning");
 
       const italy = await linkOf(pool, italyId);
       assert.equal(await unlinkTelegramLink(pool, italy.user_id, italy.id), true);
@@ -768,7 +776,7 @@ describe("an unlinked Telegram account loses the bot too (DB)", { skip: SKIP }, 
       assert.deepEqual(refused, nonexistent, "the existing uniform refusal");
       assert.equal(await openBinding(pool, ORGANIZER_CHAT), null, "nothing was bound");
       assert.equal(await isTripOrganizer(pool, italyId, ORGANIZER_CHAT), false);
-      assert.equal(await hasEarlier(pool, japanId), false, "the unlinked account's built trip no longer makes them 'returning'");
+      assert.equal(await hasEarlier(pool, japanId), false, "and still not after the Unlink");
 
       const still = await switchChatToTrip(pool, ORGANIZER_CHAT, ORGANIZER_CHAT, japanId);
       assert.equal(still.kind, "switched");
@@ -781,7 +789,7 @@ describe("an unlinked Telegram account loses the bot too (DB)", { skip: SKIP }, 
 
   async function hasEarlier(pool: pg.Pool, tripId: string) {
     const { hasEarlierBuiltTrip } = await import("../src/organizer-trips.js");
-    return hasEarlierBuiltTrip(pool, tripId, ORGANIZER_CHAT);
+    return hasEarlierBuiltTrip(pool, tripId);
   }
 });
 
@@ -831,18 +839,24 @@ describe("a Telegram link is per trip (DB)", { skip: SKIP }, () => {
     assert.equal(await isTripOrganizer(pool, rome, ORGANIZER_CHAT), false);
     assert.equal(await isTripOrganizer(pool, oslo, ORGANIZER_CHAT), true);
     const { hasEarlierBuiltTrip } = await import("../src/organizer-trips.js");
-    // A new trip under ANOTHER user_id (the shape this deployment is really in),
-    // so the only thing tying it to Olive's earlier trips is the Telegram link.
+    // A new trip under ANOTHER user_id: the only thing tying it to Olive's built trips is the Telegram link, and since
+    // #523 that is not an account's history (AC-15).
     const other = testId("user");
     const third = testId("trip");
     await pool.query("INSERT INTO control_plane.users(id, status, display_name) VALUES ($1,'active','Olive again')", [other]);
     await pool.query("INSERT INTO control_plane.trips(id, slug, lifecycle_state, title) VALUES ($1,'new-2028','draft','new')", [third]);
     await pool.query("INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status) VALUES ($1,$2,$3,'owner','active')", [testId("memb"), third, other]);
-    assert.equal(await hasEarlierBuiltTrip(pool, third, ORGANIZER_CHAT), true, "Oslo, still linked, counts as an earlier trip of this Telegram account");
+    assert.equal(await hasEarlierBuiltTrip(pool, third), false, "Oslo is linked to this Telegram but belongs to Olive, not to the new account");
+    // The same account starting a third trip IS returning, whatever happens to a Telegram link: the history is the
+    // account's, not the link's.
+    const fourth = testId("trip");
+    await pool.query("INSERT INTO control_plane.trips(id, slug, lifecycle_state, title) VALUES ($1,'again-2028','draft','again')", [fourth]);
+    await pool.query("INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status) VALUES ($1,$2,$3,'owner','active')", [testId("memb"), fourth, userId]);
+    assert.equal(await hasEarlierBuiltTrip(pool, fourth), true, "Olive's own Rome and Oslo were built");
     const osloLink = await pool.query<{ id: string }>(
       "SELECT id FROM control_plane.telegram_organizer_trip_links WHERE trip_id = $1 AND revoked_at IS NULL", [oslo]);
     await unlinkTelegramLink(pool, userId, osloLink.rows[0]!.id);
-    assert.equal(await hasEarlierBuiltTrip(pool, third, ORGANIZER_CHAT), false, "Rome and Oslo are both unlinked: no earlier trip is theirs");
+    assert.equal(await hasEarlierBuiltTrip(pool, fourth), true, "unlinking changes who may reach a trip, not whether it was built");
   });
 
   test("an Unlink closes the chat's hold on THAT trip only", async () => {

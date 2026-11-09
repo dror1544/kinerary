@@ -640,7 +640,7 @@ export async function dispatchUpdate(
   botIdentity: BotIdentity = {},
   options: DispatchOptions = {},
 ): Promise<DispatchDecision> {
-  if (update.callback_query) return dispatchCallback(db, update, log);
+  if (update.callback_query) return dispatchCallback(db, update, log, options.modelRunner);
 
   // Added to a group. If that group is already bound to a trip, this is the
   // companion's arrival and it introduces itself; if it is not, saying so is
@@ -798,7 +798,7 @@ export async function dispatchUpdate(
   }
 
   if (parsed.kind === "start" && !groupStartToken) {
-    const outcome = await startFromDeepLink(db, chatId, parsed.payload, log, message.from?.language_code, telegramDisplayName(message.from));
+    const outcome = await startFromDeepLink(db, chatId, parsed.payload, log, message.from?.language_code, telegramDisplayName(message.from), options.modelRunner);
     switch (outcome.kind) {
       case "started": {
         // The opening is the document offer, not the first question. Asking
@@ -885,7 +885,7 @@ export async function dispatchUpdate(
       if (waiting.length > 0) {
         const language = await resolveChatLanguage(db, chatId, message.from?.language_code);
         if (waiting.length > 1) return { kind: "reply", reply: { chatId, text: uiString("linkApproverMany", language) } };
-        const result = await answerLinkRequest(db, { requestId: waiting[0]!, choice, chatId, fromId: chatId }, log);
+        const result = await answerLinkRequest(db, { requestId: waiting[0]!, choice, chatId, fromId: chatId }, log, options.modelRunner);
         const answered = linkAnswerReplies(result, chatId, language);
         return {
           kind: "multi_reply",
@@ -2163,6 +2163,7 @@ async function dispatchCallback(
   db: pg.Pool,
   update: TelegramUpdate,
   log: (line: string) => void,
+  modelRunner?: StructuredModelRunner,
 ): Promise<DispatchDecision> {
   const callback = update.callback_query;
   if (!callback?.data) return { kind: "ignore", reason: "NO_CALLBACK_DATA" };
@@ -2180,7 +2181,7 @@ async function dispatchCallback(
     if (fromId === undefined || fromId === null) {
       return { kind: "callback_ack", callbackQueryId: callback.id, text: uiString("linkApproverGone", language) };
     }
-    const result = await answerLinkRequest(db, { requestId: parsed.requestId, choice: parsed.choice, chatId: String(chatId), fromId: String(fromId) }, log);
+    const result = await answerLinkRequest(db, { requestId: parsed.requestId, choice: parsed.choice, chatId: String(chatId), fromId: String(fromId) }, log, modelRunner);
     const answered = linkAnswerReplies(result, String(chatId), language);
     if (answered.replies.length === 0) {
       // Nothing happened: the tap is answered and says so, and posts nothing into whatever chat it came from.

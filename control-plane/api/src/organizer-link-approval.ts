@@ -33,6 +33,8 @@ import { coerceLanguage, type Language } from "./intake-copy.js";
 import { startSessionInTx, type SessionView } from "./interview.js";
 import { boundTelegramAccounts, hasEarlierBuiltTrip, organizerBindingVerdict, privateChatForDigest } from "./organizer-trips.js";
 import { structuredLog } from "./redaction.js";
+import { nativeSeededOpening } from "./native-names.js";
+import type { StructuredModelRunner } from "./model-runner.js";
 import { revokeOrganizerLinkInTx } from "./telegram-mini-app.js";
 
 const opaque = (prefix: string) => `${prefix}_${randomBytes(16).toString("hex")}`;
@@ -242,6 +244,8 @@ export async function answerLinkRequest(
   db: pg.Pool,
   input: { requestId: string; choice: LinkChoice; chatId: string; fromId: string },
   log: (line: string) => void = () => {},
+  /** The relay's model runner, for the opening's native-language name and destination (#438, AC-14). Absent = English. */
+  modelRunner?: StructuredModelRunner,
 ): Promise<LinkDecisionResult> {
   // A private chat of the tapper's own: a button forwarded or copied into any other chat does nothing.
   if (!isPrivateChatId(input.chatId) || input.fromId !== input.chatId) return { kind: "not_pending" };
@@ -339,7 +343,10 @@ export async function answerLinkRequest(
 
     // Which opening they meet; a failure here must not cost them the interview, which is already started.
     let returning = false;
-    try { returning = await hasEarlierBuiltTrip(db, request.trip_id, request.requester_chat_id); } catch { returning = false; }
+    try { returning = await hasEarlierBuiltTrip(db, request.trip_id); } catch { returning = false; }
+    const seeded = started.result.seeded
+      ? await nativeSeededOpening(db, modelRunner, started.result.sessionId, started.result.view.language, started.result.seeded, log)
+      : undefined;
     return {
       kind: "approved",
       requester,
@@ -349,7 +356,7 @@ export async function answerLinkRequest(
       sessionId: started.result.sessionId,
       view: started.result.view,
       returning,
-      ...(started.result.seeded ? { seeded: started.result.seeded } : {}),
+      ...(seeded ? { seeded } : {}),
     };
   } catch (error) {
     try { await client.query("ROLLBACK"); } catch { /* ignore */ }
