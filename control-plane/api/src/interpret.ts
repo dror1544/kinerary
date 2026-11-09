@@ -829,6 +829,8 @@ export function mergeStructuredParts(parts: readonly unknown[], options: { peopl
 function validateProposed(
   proposal: ProposedAnswer,
   questions: readonly IntakeQuestion[],
+  /** The answers on record, for a year-less date to be placed against the other one. */
+  held?: AnswerStore,
 ): ReturnType<typeof validateAnswer> {
   const { questionId, value } = proposal;
   switch (value.kind) {
@@ -839,7 +841,7 @@ function validateProposed(
     case "multi_choice":
       return validateAnswer(questionId, null, null, questions, undefined, value.optionIds);
     case "text":
-      return validateAnswer(questionId, null, value.text, questions);
+      return validateAnswer(questionId, null, value.text, questions, undefined, undefined, { answers: held });
     case "structured":
       return validateAnswer(questionId, null, null, questions, value.data);
   }
@@ -899,6 +901,7 @@ export function applyProposals(
   modelProposals: readonly ProposedAnswer[],
   ctx: ApplyProposalsContext,
 ): ProposalDecisions {
+  const heldAnswers = (ctx.answers ?? ctx.held) as AnswerStore | undefined;
   const questions = ctx.questions ?? INTAKE_QUESTIONS;
   const proposals = ctx.literalOther ? [...modelProposals] : modelProposals.map((p) => settleTypedChoice(p, questions));
   const minConfidence = ctx.minConfidence ?? DEFAULT_MIN_CONFIDENCE;
@@ -932,7 +935,7 @@ export function applyProposals(
     // Merged from the RAW proposal, and the merged list put through the same
     // gate again, so its rules still apply to what is actually stored.
     const mergedData = mergeStructuredParts([existing.data, proposal.value.data], mergeOptionsFor(questionId));
-    const again = validateProposed({ ...proposal, value: { kind: "structured", data: mergedData } }, questions);
+    const again = validateProposed({ ...proposal, value: { kind: "structured", data: mergedData } }, questions, heldAnswers);
     return again.ok && again.answer.kind === "structured"
       ? again.answer
       : { ...answer, data: mergedData };
@@ -999,7 +1002,7 @@ export function applyProposals(
         }
         candidate = { ...original, value: { kind: "structured", data: step.merged } };
       }
-      const validated = validateProposed(candidate, questions);
+      const validated = validateProposed(candidate, questions, heldAnswers);
       if (validated.ok) {
         suggested.push({ questionId: candidate.questionId, answer: validated.answer, proposal: candidate });
         return;
@@ -1171,7 +1174,7 @@ export function applyProposals(
     // `corrected` is the typed path's own merge into `ctx.answers`, and a no-op
     // when nothing is held there — which is every document. The two never run
     // on the same proposal: `held` and `answers` come from different callers.
-    const validated = validateProposed(merged, questions);
+    const validated = validateProposed(merged, questions, heldAnswers);
     if (validated.ok) {
       accepted.push({
         questionId,
@@ -1195,7 +1198,7 @@ export function applyProposals(
     // merging existed, and say why the others were left out.
     const why = `merge refused: ${validated.reason}${validated.detail ? ` — ${validated.detail}` : ""}`;
     for (const other of ordered.slice(1)) reject(other, "DUPLICATE_PROPOSAL", why);
-    const alone = validateProposed(primary, questions);
+    const alone = validateProposed(primary, questions, heldAnswers);
     if (!alone.ok) return reject(primary, alone.reason, alone.detail);
     accepted.push({ questionId, answer: corrected(alone.answer, primary), proposal: primary, correction: correcting(primary) });
     offerBeside(alone.answer.kind === "structured" ? alone.answer.data : dataOf(primary));
@@ -1247,7 +1250,7 @@ export function applyProposals(
     const echoed = exampleEchoes(questions.find((q) => q.id === proposal.questionId)?.dataExample, proposal.value, ctx.sourceText);
     if (echoed.length > 0) return reject(proposal, "EXAMPLE_ECHO", echoed.slice(0, 4).join(", "));
 
-    const validated = validateProposed(proposal, questions);
+    const validated = validateProposed(proposal, questions, heldAnswers);
     if (!validated.ok) return reject(proposal, validated.reason, validated.detail);
     accepted.push({ questionId: proposal.questionId, answer: corrected(validated.answer, proposal), proposal, correction: correcting(proposal) });
   });
@@ -1690,6 +1693,13 @@ export interface BuildInterpretPromptArgs {
    * whose second couple was missed, was filed as the assistant's name.
    */
   afterDocumentRecap?: boolean;
+  /**
+   * The router has just asked "who are the other travellers?" (after a message about them that named nobody, at the
+   * summary or after a document recap), so this message is probably their names. Each is a NEW traveller: added to
+   * the ones we hold, never a replacement list. Live, 2026-11-08, at the summary: "Mira Vesper, Tom Vesper" had no
+   * context and came back unclear three times, so the two were never added.
+   */
+  askedOtherTravellers?: boolean;
   /** Ids of the questions that already have an answer. Read only with `summaryOnScreen` / `afterDocumentRecap`. */
   answered?: readonly string[];
   questions?: readonly IntakeQuestion[];
@@ -1755,7 +1765,30 @@ function summarySection(held: BuildInterpretPromptArgs["heldLists"]): string[] {
     `- If it plainly is a hotel (or another addition) but you cannot tell WHICH stop or question it`,
     `  belongs to, do not guess: put the question it most likely belongs to in "unclear" with a`,
     `  "why", and propose nothing.`,
+    `- TRAVELLERS: someone joining, named ("my sister Dana is coming too"), is an add_traveller`,
+    `  operation per person. If it is plainly about the travellers but names nobody ("the other`,
+    `  travellers", "my family", "the kids"), it names nobody: do not guess a name and do not propose`,
+    `  "travelers"; put "travelers" in "unclear" with a "why", and propose nothing. We will ask who.`,
+    `- The trip's DATES: "departure_date" and "return_date" are one real day each, "value" the text`,
+    `  YYYY-MM-DD with the year. A day said without a year takes the year of the dates already held`,
+    `  (currently listed below). Never write the day as they said it ("22 November").`,
     `- A message that adds nothing about the trip is still answered with silence.`,
+    ``,
+  ];
+}
+
+/**
+ * The turn after the router asked who the other travellers are (see `askedOtherTravellers`). Without real names,
+ * like every example in this prompt (`exampleEchoes`).
+ */
+function askedTravellersSection(): string[] {
+  return [
+    `WE HAVE JUST ASKED THEM WHO THE OTHER TRAVELLERS ARE:`,
+    `this message is very probably the names, as a list ("Dana Cohen, Avi Cohen") or one name.`,
+    `- Each name is a NEW traveller: one add_traveller operation per person (name as written; age or`,
+    `  family only if they said it). They are added to the travellers we hold, which stay: never`,
+    `  propose "travelers", never write a list, never remove or rename anyone.`,
+    `- Only when the message is plainly not names (a question, "never mind") is it something else.`,
     ``,
   ];
 }
@@ -1787,6 +1820,7 @@ export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
     `You are reading one message from someone planning a trip, written in ${languageName(args.language)}.`,
     `Decide which of the questions below it answers. Answer ONLY with JSON.`,
     ``,
+    ...(args.askedOtherTravellers ? askedTravellersSection() : []),
     ...(args.summaryOnScreen ? summarySection(args.heldLists) : args.afterDocumentRecap ? recapSection(args.heldLists, onScreen) : []),
     ...(onScreen
       ? [

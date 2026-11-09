@@ -2883,6 +2883,9 @@ async function settleChange(
   }
 }
 
+/** The recap marker the final summary uses after "who are the other travellers?" - it has no document behind it. */
+const SUMMARY_ASKED_MARKER = "recap:doc:summary:asked";
+
 /** Reasons a typed proposal for an answered question was refused that the organizer must hear about. */
 const ASK_ABOUT_REFUSED: ReadonlySet<string> = new Set([
   "ALREADY_ANSWERED", "LOW_CONFIDENCE", "EVIDENCE_NOT_IN_SOURCE", "CHANGE_NEEDS_CONFIRMATION",
@@ -3552,6 +3555,8 @@ async function runInterpretPath(
       // The recap is what they have just read: the message may be a correction
       // of what the document gave rather than the answer on screen (#413).
       afterDocumentRecap: recapTurn,
+      // The one reply after "who are the other travellers?" is probably their names.
+      askedOtherTravellers: recapTurn && recapMarker !== null && recapMarker.endsWith(":asked"),
       answered: state.answered,
       // What they have already told us, so "actually, it's only my wife" is
       // something the model can propose at all (2026-09-16).
@@ -3627,7 +3632,14 @@ async function runInterpretPath(
   // ("נוסעים אחרים" — the second couple's names were not read): the reader says
   // `unclear` for `travelers`. It is answered with a question about the
   // travellers, never filed against the question on screen (#413).
-  const clarifyTravellers = recapTurn
+  //
+  // THE FINAL SUMMARY IS A RECAP TOO (2026-11-08): "נוסעים אחרים" typed there came back `unclear` for
+  // `travelers`, and with no document recap behind it the question above was never asked, so it was met with
+  // "I wasn't sure what you wanted to change about the travellers" three times.
+  const atSummary = session.ok && session.view.state === "awaiting_confirmation";
+  // Asked at the summary and answered with another nameless message: not asked a second time in a row.
+  const summaryAsked = recapMarker === SUMMARY_ASKED_MARKER;
+  const clarifyTravellers = (recapTurn || atSummary) && !summaryAsked
     && state.answered.includes("travelers")
     && unclear.some((u) => u.questionId === "travelers")
     && !decisions.accepted.some((a) => a.questionId === "travelers")
@@ -3746,7 +3758,9 @@ async function runInterpretPath(
     if (now.ok && (await answerThisMessage(deps, burst.chatId, now.view, uiString("askOtherTravellers", now.view.language), log, "recap_clarify"))) {
       // The names are the next message, and it is still about the recap: one more
       // message, once — a second nameless reply does not renew it.
-      if (recapMarker && !recapMarker.endsWith(":asked")) await markDocumentRecap(deps.db, burst.chatId, `${recapMarker}:asked`);
+      // A summary has no document recap behind it: its own marker, same one-message life.
+      const asked = recapMarker ?? SUMMARY_ASKED_MARKER.replace(/:asked$/, "");
+      if (!asked.endsWith(":asked")) await markDocumentRecap(deps.db, burst.chatId, `${asked}:asked`);
       return;
     }
   }
