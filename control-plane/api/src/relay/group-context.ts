@@ -76,6 +76,15 @@ export class GroupContext {
   }
 
   /**
+   * Forget everything held for this chat. Called when the group is moved to
+   * another trip: what the family said while it was the old trip's is not for
+   * the new trip's assistant to be handed on its first addressed message.
+   */
+  clear(chatId: string): void {
+    this.chats.delete(chatId);
+  }
+
+  /**
    * Everything still fresh for this chat, oldest first, and forget it.
    *
    * Taking rather than reading is deliberate: these turns belong to the one

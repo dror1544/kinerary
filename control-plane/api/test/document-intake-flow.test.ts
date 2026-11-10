@@ -17,6 +17,7 @@
  */
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -186,6 +187,39 @@ const SCRIPT = [
   },
 ] as const;
 
+// ── Two tickets for two parties (#412): recorded readings, invented names ───
+
+const TICKET_DIR = new URL("./fixtures/two-parties-same-flight/", import.meta.url);
+const TICKET_READINGS = JSON.parse(readFileSync(new URL("readings.json", TICKET_DIR), "utf8")) as Record<
+  string, { confidence: number; evidence: string; data: unknown[] }
+>;
+const ticketUpload = (file: "ticket-1.txt" | "ticket-2.txt", messageId: string): Upload =>
+  ({ name: file, body: readFileSync(new URL(file, TICKET_DIR), "utf8"), messageId });
+const TICKET_1 = ticketUpload("ticket-1.txt", "801");
+const TICKET_2 = ticketUpload("ticket-2.txt", "802");
+
+/** Which recorded reading the model gives for the SECOND ticket. */
+let SECOND_TICKET: "ticket-2-sure" | "ticket-2-unsure" | "ticket-2-hebrew-evidence" = "ticket-2-sure";
+
+function ticketReply(prompt: string): { label: string; reply: unknown } | null {
+  // The second ticket first: a prompt may carry what is already held.
+  const key = prompt.includes("Booking reference: ZT3K9D") ? SECOND_TICKET : prompt.includes("Booking reference: QX7P2M") ? "ticket-1" : null;
+  if (!key) return null;
+  const r = TICKET_READINGS[key]!;
+  return {
+    label: key,
+    reply: {
+      proposals: [{
+        questionId: "travelers",
+        confidence: r.confidence,
+        value: { kind: "structured", dataJson: JSON.stringify(r.data) },
+        evidence: r.evidence,
+      }],
+      unclear: [],
+    },
+  };
+}
+
 // ── Fakes at the edges ───────────────────────────────────────────────────────
 
 class FakeMediaStore {
@@ -209,7 +243,11 @@ class Recorder {
     this.buttons.push((p.replyMarkup?.inline_keyboard ?? []).flat().map((b) => b.callback_data));
     return { ok: true as const, messageId: String(this.sent.length) };
   }
-  async editMessageText() { return { ok: true as const }; }
+  readonly edited: { messageId?: string; text: string; hasButtons: boolean }[] = [];
+  async editMessageText(p: { messageId?: string; text: string; replyMarkup?: { inline_keyboard: unknown[][] } }) {
+    this.edited.push({ messageId: p.messageId, text: p.text, hasButtons: (p.replyMarkup?.inline_keyboard.flat().length ?? 0) > 0 });
+    return { ok: true as const };
+  }
   async sendChatAction() {}
   async answerCallbackQuery() {}
   async getChatInfo() { return null; }
@@ -230,6 +268,13 @@ function scriptedRunner(): { runner: StructuredModelRunner; calls: string[] } {
         const lines = (req.attachments ?? []).flatMap((file) =>
           Buffer.from(file.bytes).toString("utf8").split("\n").filter(Boolean));
         const parsed = req.parse({ legible: lines.length > 0, identity_document: false, lines });
+        if (parsed === null) return { ok: false, reason: "BAD_OUTPUT", attempts: 1, ms: 0 };
+        return { ok: true, value: parsed, attempts: 1, ms: 0 };
+      }
+      const ticket = ticketReply(req.prompt);
+      if (ticket) {
+        calls.push(ticket.label);
+        const parsed = req.parse(JSON.parse(JSON.stringify(ticket.reply)));
         if (parsed === null) return { ok: false, reason: "BAD_OUTPUT", attempts: 1, ms: 0 };
         return { ok: true, value: parsed, attempts: 1, ms: 0 };
       }
@@ -447,6 +492,71 @@ describe("document intake through the interview", { skip: SKIP ? "no CONTROL_PLA
       const language = await languageOf(flow.pool);
       assert.ok(flow.telegram.sent.includes(uiString("documentAlreadyRead", language)));
       assert.ok(!flow.telegram.sent.includes(uiString("documentNothing", language)), "never 'nothing about the trip in it'");
+    });
+  });
+
+  // #514. Found on staging: two ticket photos sent in an interview while image
+  // reading was off were recorded as a failure; the same photos sent in a NEW
+  // interview in the same chat were read, then dropped as `interpret_replayed`.
+  test("AC-1: the same file in a LATER interview in the chat is read again, and its answers land there", async () => {
+    await withFlow({ store: true }, async (flow) => {
+      await upload(flow, [PLAN]);
+      assert.equal(flow.calls.length, 1);
+
+      // The first interview closes; a fresh link for a new trip starts another in the same chat.
+      await flow.pool.query("UPDATE control_plane.intake_sessions SET expired_at = now() WHERE id = $1", [flow.sessionId]);
+      const userId = testId("user");
+      const tripId = testId("trip");
+      await flow.pool.query("INSERT INTO control_plane.users(id, status, display_name) VALUES ($1, 'active', 'Owner')", [userId]);
+      await flow.pool.query("INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ($1, $2, 'draft')", [tripId, tripId.replace(/_/g, "-")]);
+      await flow.pool.query(
+        "INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status) VALUES ($1, $2, $3, 'owner', 'active')",
+        [testId("memb"), tripId, userId],
+      );
+      const enrollment = await issueEnrollment(flow.pool, userId, tripId, { enrollmentTtlSeconds: 3600 });
+      assert.ok(enrollment.ok);
+      const started = await startFromDeepLink(flow.pool, CHAT, enrollment.token);
+      assert.equal(started.kind, "started");
+      await setInterpretPath(flow.pool, CHAT, true);
+      const second: Flow = { ...flow, tripId, sessionId: started.kind === "started" ? started.sessionId : "" };
+
+      await upload(second, [{ ...PLAN, messageId: "901" }]);
+
+      assert.ok(
+        !flow.logs.some((l) => l.includes("interview.interpret_replayed")),
+        "the earlier interview's reading is not replayed into this one",
+      );
+      assert.equal(flow.calls.length, 2, "the file was read for the new trip");
+      const answers = await answersForChat(flow.pool, CHAT);
+      assert.equal(structured(answers?.answers, "phases").length, 2, "and the answers landed in the new interview");
+    });
+  });
+
+  test("AC-2: a file that could not be read is read when it is sent again", async () => {
+    await withFlow({ store: true }, async (flow) => {
+      // No model configured: the burst is recorded as NOT_CONFIGURED.
+      const unconfigured: Flow = { ...flow, deps: { ...(flow.deps as object), modelRunner: undefined } as never };
+      await upload(unconfigured, [PLAN]);
+      assert.equal(flow.calls.length, 0, "nothing was read");
+      const failed = await flow.pool.query(
+        "SELECT failure_reason, committed_at FROM control_plane.interview_interpretations WHERE session_id = $1",
+        [flow.sessionId],
+      );
+      assert.equal(failed.rows[0]?.failure_reason, "NOT_CONFIGURED");
+      assert.ok(failed.rows[0]?.committed_at);
+
+      // The model is there now. The same file, again, in the same interview.
+      await upload(flow, [{ ...PLAN, messageId: "902" }]);
+
+      assert.ok(!flow.logs.some((l) => l.includes("interview.interpret_replayed")), "a failure is not replayed");
+      assert.equal(flow.calls.length, 1, "it was read this time");
+      const answers = await answersForChat(flow.pool, CHAT);
+      assert.equal(structured(answers?.answers, "phases").length, 2);
+      const row = await flow.pool.query(
+        "SELECT failure_reason, committed_at FROM control_plane.interview_interpretations WHERE session_id = $1",
+        [flow.sessionId],
+      );
+      assert.equal(row.rows[0]?.failure_reason, null, "and the record now says it worked");
     });
   });
 
@@ -710,5 +820,99 @@ describe("documents that build on each other", { skip: SKIP ? "no CONTROL_PLANE_
       assert.deepEqual(phases[0]?.accommodation, { name: "Hotel Gracery Shinjuku", confirmation: "GR-4471" }, "and the voucher still filled the stay");
       assert.equal(await openConflicts(flow.pool, flow.tripId), 1, "the voucher's own dates disagree, so that is a question — not an overwrite");
     });
+  });
+});
+
+// ── #412: a second party's travellers are read, or offered ───────────────────
+
+describe("two tickets for two parties through the interview (#412)", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABASE_URL" : false }, () => {
+  const names = (answers: Record<string, unknown> | undefined) =>
+    (structured(answers, "travelers") as { name_en?: string }[]).map((p) => p.name_en).sort();
+  const FIRST = ["ARLO VESPER", "LENA VESPER"];
+  const BOTH = ["ARLO VESPER", "BRIA TALLIS", "COLE TALLIS", "LENA VESPER"];
+  /** The message that puts the people to the organizer: a Yes / No on `travelers`. */
+  const offerIn = (flow: Flow) => {
+    const at = flow.telegram.buttons.findIndex((b) => b.includes("y:travelers") && b.includes("x:travelers"));
+    return at < 0 ? undefined : { text: flow.telegram.sent[at]!, buttons: flow.telegram.buttons[at]! };
+  };
+  const committedLog = (flow: Flow) =>
+    flow.logs.map((l) => JSON.parse(l) as Record<string, unknown>).filter((e) => e.event === "interview.document_committed").at(-1);
+  const withSecond = async (variant: typeof SECOND_TICKET, fn: () => Promise<void>) => {
+    SECOND_TICKET = variant;
+    try { await fn(); } finally { SECOND_TICKET = "ticket-2-sure"; }
+  };
+
+  test("both tickets in one upload, both sure: all four travellers, both documents named, nothing to ask", async () => {
+    await withFlow({ store: true }, async (flow) => {
+      await upload(flow, [TICKET_1, TICKET_2]);
+      assert.deepEqual(names((await answersForChat(flow.pool, CHAT))?.answers), BOTH);
+      assert.equal(offerIn(flow), undefined);
+      assert.deepEqual(committedLog(flow)?.sources, ["travelers:2"], "the answer names both tickets");
+    });
+  });
+
+  test("the second ticket unsure: the first couple is written, and the reply itself offers the second with Yes / No", async () => {
+    await withSecond("ticket-2-unsure", () => withFlow({ store: true }, async (flow) => {
+      await upload(flow, [TICKET_1, TICKET_2]);
+
+      assert.deepEqual(names((await answersForChat(flow.pool, CHAT))?.answers), FIRST, "only the sure ticket is written");
+      const offer = offerIn(flow);
+      assert.ok(offer, `the organizer is asked — sent: ${JSON.stringify(flow.telegram.sent)}`);
+      assert.deepEqual(offer.buttons, ["y:travelers", "x:travelers"]);
+      assert.ok(offer.text.includes("בריה טאליס") && offer.text.includes("קול טאליס"), `it names the new people — got: ${offer.text}`);
+      assert.ok(!offer.text.includes("ארלו וספר"), "and only the new people");
+      assert.deepEqual(committedLog(flow)?.suggested, ["travelers"]);
+
+      await tap(flow, "y:travelers");
+      assert.deepEqual(names((await answersForChat(flow.pool, CHAT))?.answers), BOTH, "Yes adds the second couple and keeps the first");
+      const view = await getSessionForChat(flow.pool, CHAT);
+      assert.deepEqual(view.ok && view.view.suggestions, {});
+    }));
+  });
+
+  test("No leaves the travellers as they were, drops the offer, and does not ask the question again", async () => {
+    await withSecond("ticket-2-unsure", () => withFlow({ store: true }, async (flow) => {
+      await upload(flow, [TICKET_1, TICKET_2]);
+      const askedBefore = flow.telegram.sent.length;
+      await tap(flow, "x:travelers");
+
+      assert.deepEqual(names((await answersForChat(flow.pool, CHAT))?.answers), FIRST);
+      const view = await getSessionForChat(flow.pool, CHAT);
+      assert.deepEqual(view.ok && view.view.suggestions, {});
+      assert.notEqual(view.ok && view.view.nextQuestion?.id, "travelers", "travellers stay answered");
+      assert.equal(flow.telegram.edited.at(-1)?.text, uiString("documentMoreTravelersDeclined", "en"), "the offer says what happened");
+      assert.equal(flow.telegram.edited.at(-1)?.hasButtons, false);
+      assert.equal(flow.telegram.sent.length, askedBefore, "and nothing is put to the organizer on top of it");
+    }));
+  });
+
+  test("a later upload's unsure couple is shown, not only stored (AC-4)", async () => {
+    await withSecond("ticket-2-unsure", () => withFlow({ store: true }, async (flow) => {
+      await upload(flow, [TICKET_1]);
+      assert.deepEqual(names((await answersForChat(flow.pool, CHAT))?.answers), FIRST);
+      assert.equal(offerIn(flow), undefined);
+
+      await upload(flow, [TICKET_2]);
+      assert.deepEqual(names((await answersForChat(flow.pool, CHAT))?.answers), FIRST, "couple 1 is unchanged");
+      const offer = offerIn(flow);
+      assert.ok(offer, `the second couple is shown — sent: ${JSON.stringify(flow.telegram.sent)}`);
+      assert.ok(offer.text.includes("בריה טאליס") && !offer.text.includes("ארלו וספר"));
+      assert.ok(
+        !flow.telegram.sent.includes(uiString("documentNothing", "en")) && !flow.telegram.sent.includes(uiString("documentUnsure", "en")),
+        "and the offer is the reply — not 'nothing found', not a promise to ask later",
+      );
+
+      await tap(flow, "y:travelers");
+      assert.deepEqual(names((await answersForChat(flow.pool, CHAT))?.answers), BOTH);
+    }));
+  });
+
+  test("a second ticket quoted in the interview's script is accepted when its Latin names are printed", async () => {
+    await withSecond("ticket-2-hebrew-evidence", () => withFlow({ store: true }, async (flow) => {
+      await upload(flow, [TICKET_1, TICKET_2]);
+      assert.deepEqual(names((await answersForChat(flow.pool, CHAT))?.answers), BOTH);
+      assert.equal(offerIn(flow), undefined);
+      assert.ok(!(committedLog(flow)?.rejected_questions as string[]).some((r) => r.endsWith("EVIDENCE_NOT_IN_SOURCE")));
+    }));
   });
 });

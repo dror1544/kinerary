@@ -105,7 +105,7 @@ describe('visibleTags() — the tag block made visible or dropped, nothing else 
 
   test('both error paths run through it: tools.js tool() catches into toolError; mcp.js routes every mcp.tool() handler through it', () => {
     assert.match(TOOLS_SRC, /async args => \{ try \{ return ok\(await run\(args \|\| \{\}\)\); \} catch \(err\) \{ return toolError\(err\); \} \}\);/);
-    assert.equal((TOOLS_SRC.match(/mcp\.registerTool\(/g) || []).length, 1, 'tools.js registers every tool in one place');
+    assert.equal((TOOLS_SRC.match(/mcp\.registerTool\(/g) || []).length, 2, 'tools.js registers text tools through tool() and original PDFs through the resource callback');
     assert.match(MCP_SRC, /^function guardTools\(mcp\) \{$/m);
     assert.match(MCP_SRC, /^const mcp = guardTools\(new McpServer\(/m);
     assert.equal((MCP_SRC.match(/new McpServer\(/g) || []).length, 1, 'mcp.js builds one McpServer, and guards it');
@@ -153,7 +153,8 @@ describe('visibleTags() — the tag block made visible or dropped, nothing else 
     assert.match(MCP_SRC, /^function ok\(data\) \{\n  return \{ content: \[\{ type: 'text', text: JSON\.stringify\(visibleTags\(data\), null, 2\) \}\] \};\n\}$/m);
     assert.match(TOOLS_SRC, /^  const ok = data => \(\{ content: \[\{ type: 'text', text: JSON\.stringify\(visibleTags\(data\), null, 2\) \}\] \}\);$/m);
     assert.equal((MCP_SRC.match(/type: 'text', text: JSON\.stringify\(/g) || []).length, 1, 'mcp.js has one JSON output path');
-    assert.equal((TOOLS_SRC.match(/type: 'text', text: JSON\.stringify\(/g) || []).length, 1, 'tools.js has one JSON output path');
+    assert.match(TOOLS_SRC, /type: 'text', text: JSON\.stringify\(visibleTags\(\{ booking_id, byte_count, sha256 \}\)\)/);
+    assert.equal((TOOLS_SRC.match(/type: 'text', text: JSON\.stringify\(/g) || []).length, 2, 'tools.js has sanitized tool text and sanitized numeric PDF metadata output paths');
   });
 
   test('England, Scotland and Wales become a visible U+1F3F4[gbeng] / [gbsct] / [gbwls]', () => {
@@ -613,6 +614,16 @@ describe('server/trip-mcp/tools.js — the same output path, on a real McpServer
     const lines = text.split('\n');
     assert.ok(lines.includes(`Hebrew: השם ${ch(0x1F3F4)}`), text);
     assert.ok(lines.includes(`English: The name ${SEEN.england}`), text);
+  });
+
+  test('original PDF resource retrieval preserves the shared sanitized error boundary', async () => {
+    const site = {
+      get: async () => [{ id: 1, conf_file: 'original.pdf' }],
+      getConfirmation: async () => { throw new Error(`Confirmation refused ${HIDDEN} ${ENGLAND}`); },
+    };
+    const text = toolErrorText(await withTools(site, call => call('get_booking_confirmation', { booking_id: 1 })));
+    assertNoTags(text, 'get_booking_confirmation');
+    assert.equal(text, `Confirmation refused ${ch(0x1F3F4)} ${SEEN.england}`);
   });
 
   test('ordinary errors are byte for byte what they were, isError kept: a tool\'s own refusal, a site refusal, a network error, a thrown string', async () => {

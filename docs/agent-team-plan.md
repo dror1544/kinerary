@@ -155,8 +155,16 @@ it does not assign an owner to a gap the plan does not own (standing
 instruction — flag it); it never records approval; it does not touch the
 infrastructure window itself.
 
+**Spec-driven from Sprint 7 (owner's decision, 2026-10-19).** Every sprint
+item has an implementation spec in `docs/specs/sprint-N/` that Dror approved
+before it is briefed or built; the brief's `Done when` is the spec's acceptance
+criteria, the developer writes tests from them first, and `verifier` reports
+criterion by criterion. A behaviour change found mid-build is a spec PR before
+code. Small-tier items may use the short form. Lifecycle and template:
+`docs/specs/README.md`.
+
 **Small-tier exception (owner's decision, 2026-09-30, reviewed in
-`docs/future/kinerary-sdlc-process-proposal-review-2026-09-29.md` §4; CLAUDE.md
+`docs/kinerary-sdlc-process-proposal-review-2026-09-29.md` §4; CLAUDE.md
 MVP item 4):** the lead session may write the change itself, instead of
 briefing a developer, exactly when it is mechanically Small — `git diff
 --name-only <base>...HEAD | scripts/regression-assessment-scope.sh` exits 0
@@ -910,12 +918,15 @@ Base:        integration/sprint-6 @ <commit>     <- VERIFIED BY THE DEVELOPER,
              the handover as `Base check:`; fail is BLOCKED (needs: worktree
              based on <commit>) with no work done.
 Worktree:    (created by the spawn)
+Spec:        docs/specs/sprint-N/<issue>-<slug>.md  (Status: approved <date>)
+             <- from Sprint 7 a brief without an approved spec is not sent.
 
 Goal (one observable sentence):
 Unit of work: <for a drift or correctness fix on a document: the CLAIM, not the
              line range. Enumerate every place in the owned paths that makes
              it; correct each, or name the ones deliberately left.>
-Done when:   <the test that proves it> · verifier report attached · handover
+Done when:   <the spec's acceptance criteria, AC-1..n verbatim; the verifier
+             reports each one> · <the test that proves it> · verifier report attached · handover
              block returned. Not "PR opened" — the manager opens it after gate 1.
              Docs task: every status claim the diff changes carries (a) a named
              existing assertion, run and pasted, (b) a pasted command and output

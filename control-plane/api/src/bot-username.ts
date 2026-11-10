@@ -24,10 +24,12 @@ const BOT_USERNAME = /^[A-Za-z0-9_]{5,32}$/;
 
 const GETME_TIMEOUT_MS = 5000;
 
-function normalise(value: string | null | undefined): string | null {
+export function normalise(value: string | null | undefined): string | null {
   const handle = (value ?? "").trim().replace(/^@/, "");
   return BOT_USERNAME.test(handle) ? handle : null;
 }
+
+export { normalise as normaliseBotUsername };
 
 export interface BotUsernameOptions {
   /** `web.telegram_bot_username` / `TELEGRAM_BOT_USERNAME`, when the deployment states one. */

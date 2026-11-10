@@ -244,7 +244,7 @@ export default function LandingPage() {
       <footer className="site-footer">
         <Brand />
         <p>Kinerary keeps family trips aligned when plans change.</p>
-        <nav aria-label="Footer navigation"><a href="#how-it-works">How it works</a><a href="#privacy">Privacy</a><span>Terms</span><span>Help</span></nav>
+        <nav aria-label="Footer navigation"><a href="#how-it-works">How it works</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a><span>Help</span></nav>
         <small>© 2026 Kinerary</small>
       </footer>
     </div>

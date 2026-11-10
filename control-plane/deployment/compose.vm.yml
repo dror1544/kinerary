@@ -4,7 +4,8 @@
 # out: no dev `dist/` or worker-source overlays (the VM runs the images it
 # built), no /Users paths, no Docker Desktop `host.docker.internal`.
 #
-# Services: postgres, migrate, api, worker, relay, interview-mcp, hermes.
+# Services: postgres, migrate, api, worker, relay, companion-mcp, interview-mcp,
+# inbound, hermes; and, under the optional profile `web`, portal and runtime-gateway.
 #
 # Run from control-plane/deployment/ on the VM, env files in this order (later
 # wins, so vm.env overrides the shared provisioning.env):
@@ -17,6 +18,12 @@
 # VM's worker must not provision: IP allocation is a scan of this deploy root's
 # own topology files (compute.py _ips_already_claimed), so it cannot see trips
 # the Mac worker creates, and both workers edit the same RPi4 cloudflared config.
+#
+# The organizer portal and the runtime gateway (services `portal` and
+# `runtime-gateway`) belong to the compose profile `web` and are DARK by default:
+# without `COMPOSE_PROFILES=web` in vm.env neither is created, and nothing about
+# the stack above changes. What to set, and the order to do it in:
+# docs/control-plane-vm-deployment.md, "Organizer portal and runtime gateway".
 name: kinerary-cp
 
 x-api-image: &api-image
@@ -87,6 +94,19 @@ services:
       # through the router. Without this a session started that way lands on
       # the agent path, and this VM has no Hermes to answer it.
       INTERPRET_PATH_DEFAULT: ${INTERPRET_PATH_DEFAULT:-}
+      # The web portal's secrets (profile `web`). They are the targets of the
+      # `env://` references in the architecture profile's `web` block
+      # (architecture.vm-web.example.json), so they are read only when that
+      # block is there: with the default profile these are inert, and an
+      # empty one that the profile DOES name stops the api at boot
+      # ("secret reference env://… is unset or empty") rather than serving a
+      # portal that cannot sign anyone in. Google needs no variable: its OAuth client ID is a
+      # public string in the profile (`web.google_client_id`) and there is no client secret.
+      RUNTIME_EXCHANGE_KEY: ${RUNTIME_EXCHANGE_KEY:-}
+      # The email provider's API key for the portal's own sign-up and password reset
+      # (profile `web.email_api_key_secret_ref: env://PORTAL_EMAIL_API_KEY`). Optional:
+      # with no email block in the profile it is inert, and the sign-up routes answer 503.
+      PORTAL_EMAIL_API_KEY: ${PORTAL_EMAIL_API_KEY:-}
     # telegram_creds and trip_bot_creds are one file on purpose (see the secrets
     # block): identical refs are how the api stands its approval poller down in
     # favour of the relay's single getUpdates loop.
@@ -108,6 +128,83 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
     networks: [ingress, private]
+
+  # ── Organizer portal and runtime gateway: profile `web`, dark by default ────
+  #
+  # `COMPOSE_PROFILES=web` in vm.env creates these two; without it they do not
+  # exist and `up` is exactly the stack above. Neither is a database client, so
+  # the release tool's stop/restart of "the clients" leaves them alone, and both
+  # reach the api by its service name on the `ingress` network, never by a host
+  # address. Everything deployment-specific arrives from vm.env: the two public
+  # origins, the exchange key and cookie secret, and the interface the ingress
+  # reaches them on (`WEB_BIND_IP`, loopback unless vm.env says otherwise — the
+  # same posture as CONTROL_PLANE_BIND_IP above).
+  #
+  # The `:-` defaults below are deliberate. `:?` would be evaluated even with the
+  # profile off and refuse to parse the file for a stack that never asked for the
+  # web; the services fail loudly when started without a value instead
+  # (runtime-gateway/server.js throws "<NAME> is required" and the container
+  # exits, so `up --wait` fails).
+  portal:
+    image: kinerary-cp/portal:${KINERARY_REV:?set KINERARY_REV in vm.env}
+    build:
+      # The repository root, like the api: the SPA's stylesheet imports shared/brand-tokens.css.
+      context: ../..
+      dockerfile: web/Dockerfile
+    profiles: [web]
+    environment:
+      # Where the same-origin /v1 proxy goes: the api's service name on the
+      # shared network (web/nginx.conf is a template; the nginx image renders it).
+      CONTROL_PLANE_API_ORIGIN: http://api:4310
+    ports:
+      - "${WEB_BIND_IP:-127.0.0.1}:${PORTAL_PORT:-4173}:80"
+    # Liveness of nginx and the SPA bundle only. The path through to the api is
+    # checked by `kinerary-cp-release verify` (/v1/auth/capabilities), so an api
+    # that is restarting does not mark the portal unhealthy.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [ingress]
+
+  runtime-gateway:
+    image: kinerary-cp/runtime-gateway:${KINERARY_REV:?set KINERARY_REV in vm.env}
+    build:
+      context: ../runtime-gateway
+      dockerfile: Dockerfile
+    profiles: [web]
+    environment:
+      PORT: "4320"
+      # Inside the container it must listen on every interface for the published
+      # port to reach it; who can reach that port is WEB_BIND_IP's business.
+      BIND_HOST: 0.0.0.0
+      CONTROL_PLANE_INTERNAL_ORIGIN: http://api:4310
+      # The two origins are the browser-facing ones and must equal the `web`
+      # block's runtime_origin / public_origin in the architecture profile.
+      PORTAL_ORIGIN: ${PORTAL_ORIGIN:-}
+      RUNTIME_ORIGIN: ${RUNTIME_ORIGIN:-}
+      RUNTIME_EXCHANGE_KEY: ${RUNTIME_EXCHANGE_KEY:-}
+      RUNTIME_COOKIE_SECRET: ${RUNTIME_COOKIE_SECRET:-}
+      RUNTIME_PUBLIC_SUFFIXES: ${RUNTIME_PUBLIC_SUFFIXES:-}
+      RUNTIME_SAME_SITE_OK: ${RUNTIME_SAME_SITE_OK:-}
+      RUNTIME_UPSTREAM_TIMEOUT_MS: ${RUNTIME_UPSTREAM_TIMEOUT_MS:-}
+    ports:
+      - "${WEB_BIND_IP:-127.0.0.1}:${RUNTIME_GATEWAY_PORT:-4320}:4320"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4320/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [ingress]
 
   worker:
     image: kinerary-cp/worker:${KINERARY_REV:?set KINERARY_REV in vm.env}
@@ -133,6 +230,13 @@ services:
       PROVISIONER_COMPANION_PROFILE_ENABLED: ${PROVISIONER_COMPANION_PROFILE_ENABLED:-0}
       PROVISIONER_MCP_BRIDGE_ENABLED: ${PROVISIONER_MCP_BRIDGE_ENABLED:-0}
       PROVISIONER_BRIDGE_PROBE_MINUTES: ${PROVISIONER_BRIDGE_PROBE_MINUTES:-}
+      # #349: the control plane decides which companion gateways run. Unset
+      # means `observe` every 5 minutes: it records and reports and starts or
+      # stops nothing. `enforce` is a deliberate switch; an unreadable value
+      # makes the worker refuse to start. Needs the companion SSH settings
+      # above (not companion PROVISIONING) to see the host at all.
+      GATEWAY_RECONCILE_MODE: ${GATEWAY_RECONCILE_MODE:-}
+      GATEWAY_RECONCILE_MINUTES: ${GATEWAY_RECONCILE_MINUTES:-}
       # Companion host = this VM, reached from the container as
       # host.docker.internal (extra_hosts below). The key is VM-only — it never
       # authorizes into the Mac — and ~hermes/.ssh/authorized_keys pins it to one
@@ -161,7 +265,18 @@ services:
       # RETIRED (2026-10-15): ignored - every new trip site generates its own
       # password. Passed through only so the worker warns if it is still set.
       PROVISIONER_SEED_PASSWORD: ${PROVISIONER_SEED_PASSWORD:-}
+      # The key the portal's runtime gateway and each trip site share
+      # (docs/runtime-session-exchange.md). One name on this VM, the one the
+      # gateway and the api's `web` block use; the worker writes it into the
+      # .env of every trip site it BUILDS from now on, and an existing site is
+      # not touched. Empty (the default) writes nothing.
+      CONTROL_PLANE_EXCHANGE_KEY: ${RUNTIME_EXCHANGE_KEY:-}
       CONTROL_PLANE_OPERATOR_CHAT_ID: ${CONTROL_PLANE_OPERATOR_CHAT_ID:-}
+      # The portal's own origin (the API's web.public_origin), written into each
+      # trip's identity sidecar so an organizer who opens the trip on its own
+      # hostname still gets an "Organizer dashboard" link. Unset: no link for a
+      # direct login (said at worker start). Reaches a trip at its next provision.
+      CONTROL_PLANE_PORTAL_ORIGIN: ${CONTROL_PLANE_PORTAL_ORIGIN:-}
       NPM_URL: ${NPM_URL:-}
       NPM_API_TOKEN: ${NPM_API_TOKEN:-}
       NPM_IDENTITY: ${NPM_IDENTITY:-}
@@ -453,8 +568,13 @@ secrets:
     file: ./.local-secrets/control_plane_database_url_host
 
 configs:
+  # The api, migrate, relay and companion-mcp all read this one profile. The
+  # default is the repository's example. To switch the organizer portal on, a
+  # deployment keeps a copy of architecture.vm-web.example.json (the same profile
+  # plus the `web` block) in kinerary-deploy and points this at it from vm.env
+  # with an absolute path. Unset, nothing changes.
   architecture_profile:
-    file: ../config/architecture.local.example.json
+    file: ${KINERARY_ARCHITECTURE_PROFILE:-../config/architecture.local.example.json}
 
 volumes:
   control_plane_postgres_data:

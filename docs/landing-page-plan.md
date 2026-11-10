@@ -11,25 +11,32 @@ the runtime UI and data owner; it is not merged into React.
 
 - An organizer's identity is an **email account** in the control plane, and one
   address is one user. There are three ways in: a verified Google sign-in, the
-  email-and-password signup, and an operator's invitation. All three resolve the
+  email sign-up, and an operator's invitation. All three resolve the
   address through one function, `resolveOrCreateEmailAccount`, so a second way
   in never starts a second user.
-- A first Google sign-in whose address Google has verified attaches to the
-  account that address already names — one the person signed up for, or one an
-  operator invited. An unverified or missing address starts a fresh account.
+- A first Google sign-in whose address Google has verified AND runs (`@gmail.com`,
+  `@googlemail.com`, or a Workspace address whose `hd` claim equals its domain) attaches
+  to the account that address already names — one the person signed up for, or one an
+  operator invited — or creates it when there is none. An address Google has not
+  verified signs nobody in (`401 GOOGLE_SIGN_IN_FAILED`); a verified address Google
+  does not run (outlook.com, a company domain without `hd`) gets
+  `401 GOOGLE_USE_EMAIL_SIGN_UP` and uses the emailed-link sign-up instead, with or
+  without an existing account; there is no account without an address.
 - Every email account holds a credential from birth: the password the person
   chose, or, for an invitation or a Google sign-in, one built from random bytes
   nobody keeps. That is what stops an account being claimed by whoever signs up
-  with its address first. Until password recovery ships, an organizer who never
-  chose a password uses Google on the web; the Telegram bot needs no password.
-- What the SPA itself wires today (checked 2026-09-25): the personal space
-  (`/app`, `ProductApp.tsx`) starts Google sign-in through
-  `/v1/auth/google/start`. The public `/sign-in` and `/sign-up` screens
-  (`AuthPage.tsx`) and the forgot-password screen are **UI only** — they call no
-  API and say so on screen; the email-and-password signup above is the control
-  plane's `POST /v1/signup`, which no SPA screen calls yet. The password login the
-  SPA does call, `/v1/auth/password`, is a trip participant's runtime login
-  (trip id, runtime username), not an organizer email login.
+  with its address first. Since 2026-10-23 an organizer who never chose a password
+  can set one with the emailed "Forgot password" link (where the deployment
+  configures email); otherwise they use Google on the web; the Telegram bot needs
+  no password.
+- Google on the web (2026-10-23): `/sign-in` (`ProductApp.tsx`) and `/sign-up`
+  (`SignUpPage.tsx`) draw Google's own button with Google Identity Services, from
+  the public client ID that `GET /v1/auth/capabilities` returns, and post the signed
+  ID token to `POST /v1/auth/google`. The redirect flow (`/v1/auth/google/start` and
+  `/callback`, PKCE, a client secret) was removed. The button is not drawn inside the
+  Telegram Mini App. Setup is in `docs/control-plane-vm-deployment.md`. The
+  trip-participant login the SPA calls, `/v1/auth/password`, is a trip
+  participant's runtime login (trip id, runtime username), not an organizer email login.
 - Telegram is only the shared-bot planning interview and Hermes channel. A web
   profile returns `410 TELEGRAM_WEB_AUTH_RETIRED` from historical Telegram
   organizer-auth routes.
@@ -57,9 +64,11 @@ control-plane API on the same organizer origin.
 
 ## End-to-end control flow
 
-1. The organizer signs in. Google sign-in uses OIDC authorization code + PKCE,
-   state, and nonce. The API issues rotating opaque `Secure`, `HttpOnly`, `SameSite=Lax`
-   sessions plus a double-submit CSRF token for mutations.
+1. The organizer signs in. Google sign-in uses Google Identity Services: the page
+   posts Google's signed ID token, which the API verifies (signature, expiry, issuer,
+   audience = the public client ID) and requires `email_verified`. The API issues rotating
+   opaque `Secure`, `HttpOnly`, `SameSite=Lax` sessions plus a double-submit CSRF token
+   for mutations.
 2. The organizer creates a draft containing destination, approximate dates,
    and trip type. Anonymous starter fields remain in `sessionStorage` only.
 3. The API issues a short-lived, single-use shared-bot deep link. The private
@@ -105,6 +114,5 @@ until SSE, large uploads/downloads, Google participant linking, password joins,
 and mobile iframe behavior pass test-domain acceptance. New onboarding must
 present only the personal-space route after cutover.
 
-Deferred: password recovery (the landing SPA's screen for it sends nothing
-yet), billing, rename/archive/delete, full operational history,
+Deferred: billing, rename/archive/delete, full operational history,
 memories/community/commerce, and rewriting the legacy runtime in React.

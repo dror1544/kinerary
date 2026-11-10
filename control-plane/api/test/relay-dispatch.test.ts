@@ -19,6 +19,7 @@ import { PendingAttachments } from "../src/relay/pending-attachments.js";
 import { addressedMark, conversationMark, reactionAnswerMark, SILENCE_SENTINEL } from "../src/relay/stay-silent.js";
 import { confirmIntakeForChat, getSessionForChat, submitAnswerForChat } from "../src/interview.js";
 import { issueGroupBindingToken } from "../src/group-binding.js";
+import { groupAddLinkLine, groupAddUrl, organizerIntroText } from "../src/companion-intro.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
 import { testDatabaseUrl, testPool } from "./support/test-database.js";
 import { agentTextIsInLanguage } from "../src/relay/internal-leak.js";
@@ -124,6 +125,16 @@ async function bindCompanion(fix: Fixture, chatId: string, profile: string | nul
   await fix.pool.query(
     "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, $3)",
     [chatId, fix.tripId, profile],
+  );
+}
+
+/** Telegram user `telegramUserId` is this trip's organizer (what isTripOrganizer reads); msg() sends from 777. */
+async function makeOrganizer(fix: Fixture, telegramUserId = "777"): Promise<void> {
+  await fix.pool.query(
+    `INSERT INTO control_plane.trip_person_links
+       (id, trip_id, telegram_user_id, participant_username, display_name, role, verified_via)
+     VALUES ('tpl_' || md5(random()::text), $1, $2, 'organizer1', 'Dror', 'organizer', 'interview_chat')`,
+    [fix.tripId, telegramUserId],
   );
 }
 
@@ -949,6 +960,7 @@ describe("the companion arriving in a group", { skip: SKIP }, () => {
       }
 
       // And a bare /group still issues one — that is what it is for.
+      await makeOrganizer(fix);
       const bare = await dispatchUpdate(fix.pool, msg(dm, "/group"));
       assert.equal(bare.kind, "group_intro", "a bare /group still hands over a code");
     });
@@ -1090,7 +1102,8 @@ describe("the companion arriving in a group", { skip: SKIP }, () => {
         const d = await dispatchUpdate(
           fix.pool, startInGroup("-1002000507", issued.token), undefined, undefined, BOT,
         );
-        assert.equal(d.kind === "reply" && d.reply.text, DEFAULT_STRINGS.groupTokenRefused);
+        // Since the group-move rule: a valid code from a non-organizer gets the uniform "belongs to another trip" answer.
+        assert.equal(d.kind === "reply" && d.reply.text, uiString("groupMoveNotOrganizer", "en"));
         assert.deepEqual((await bindingsFor(fix, "-1002000507")).map((r) => r.trip_id), [otherTrip]);
       });
     });
@@ -2155,6 +2168,146 @@ describe("explicit addressing and reactions through dispatchUpdate (staging run 
       await setCompanionExpectsReply(fix.pool, chat, true);
       assert.deepEqual(await dispatch(fix, from(chat, "👍", DROR)), { kind: "ignore", reason: "NOT_ADDRESSED" });
       assert.equal((await dispatch(fix, from(chat, "Liv hi", DROR))).kind, "to_gateway");
+    });
+  });
+});
+
+describe("/group hands over the full add-to-group link, the same one the greeting sends", () => {
+  const BOT = { id: "8463178587", username: "Kinerary_bot" };
+  const tokenIn = (followUp: string | undefined): string => {
+    const m = /^\/group (\S+)$/.exec(followUp ?? "");
+    assert.ok(m, "the follow-up is still the copyable /group line");
+    return m![1];
+  };
+
+  test("an organizer's /group reply carries the link built by groupAddUrl with the issued token, and keeps its text", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const dm = "700000901";
+      await bindCompanion(fix, dm, "companion-japan");
+      await makeOrganizer(fix);
+      const decision = await dispatchUpdate(fix.pool, msg(dm, "/group"), undefined, () => {}, BOT);
+      assert.equal(decision.kind, "group_intro");
+      if (decision.kind !== "group_intro") return;
+      const token = tokenIn(decision.followUp);
+      const url = groupAddUrl(BOT.username, token);
+      assert.equal(url, `https://t.me/Kinerary_bot?startgroup=${token}&admin=pin_messages+invite_users`);
+      assert.ok(url && decision.text.includes(url), "the reply contains the full link");
+      // The existing instructions are untouched, and the link is added after them.
+      assert.ok(decision.text.startsWith(DEFAULT_STRINGS.groupTokenIssued(token)));
+      assert.equal(decision.pin, false);
+      // The greeting builds the SAME link for the same token and handle: one builder, not a copy.
+      const greeting = organizerIntroText({
+        assistantName: "Rio", tripTitle: null, siteUrl: "https://x.example", language: "en",
+        botUsername: BOT.username, groupBindingToken: token,
+      });
+      assert.ok(url && greeting.includes(url));
+    });
+  });
+
+  test("a Hebrew trip gets the link line in Hebrew, with the same URL", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const dm = "700000902";
+      await bindCompanion(fix, dm, "companion-japan");
+      await makeOrganizer(fix);
+      await fix.pool.query(
+        "UPDATE control_plane.trips SET companion_intro = $2::jsonb WHERE id = $1",
+        [fix.tripId, JSON.stringify({ assistant_name: "יפו", language: "he" })],
+      );
+      const decision = await dispatchUpdate(fix.pool, msg(dm, "/group"), undefined, () => {}, BOT);
+      assert.equal(decision.kind, "group_intro");
+      if (decision.kind !== "group_intro") return;
+      const token = tokenIn(decision.followUp);
+      const url = groupAddUrl(BOT.username, token)!;
+      assert.ok(decision.text.includes(groupAddLinkLine("he", url)));
+      assert.ok(decision.text.startsWith(DEFAULT_STRINGS.groupTokenIssued(token)));
+    });
+  });
+
+  test("with no bot handle the reply is the old one and the gap is logged, not silent", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const dm = "700000903";
+      await bindCompanion(fix, dm, "companion-japan");
+      await makeOrganizer(fix);
+      const lines: string[] = [];
+      const decision = await dispatchUpdate(fix.pool, msg(dm, "/group"), undefined, (l) => lines.push(l), {});
+      assert.equal(decision.kind, "group_intro");
+      if (decision.kind !== "group_intro") return;
+      const token = tokenIn(decision.followUp);
+      assert.equal(decision.text, DEFAULT_STRINGS.groupTokenIssued(token));
+      assert.ok(lines.some((l) => l.includes("trip_bot.group_link_unavailable")));
+    });
+  });
+
+  test("the refusals are unchanged: a group chat and an unbound chat get the same sentence and no link", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "-1002000901", "companion-japan");
+      const inGroup = await dispatchUpdate(fix.pool, msg("-1002000901", "/group", "supergroup"), undefined, () => {}, BOT);
+      assert.deepEqual(inGroup, { kind: "reply", reply: { chatId: "-1002000901", text: DEFAULT_STRINGS.groupTokenUnavailable } });
+      const unbound = await dispatchUpdate(fix.pool, msg("700000999", "/group"), undefined, () => {}, BOT);
+      assert.deepEqual(unbound, { kind: "reply", reply: { chatId: "700000999", text: DEFAULT_STRINGS.groupTokenUnavailable } });
+      // Nobody got a token out of either.
+      const rows = await fix.pool.query("SELECT 1 FROM control_plane.telegram_group_binding_tokens WHERE trip_id = $1", [fix.tripId]);
+      assert.equal(rows.rowCount, 0);
+    });
+  });
+
+  test("only the trip's organizer gets a code: a member's DM on a companion route is refused, with no token and no link", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const dm = "700000904";
+      await bindCompanion(fix, dm, "companion-japan");
+      // 777 is on the trip as a participant, not an organizer.
+      await fix.pool.query(
+        `INSERT INTO control_plane.trip_person_links
+           (id, trip_id, telegram_user_id, participant_username, display_name, role, verified_via)
+         VALUES ('tpl_' || md5(random()::text), $1, '777', 'member1', 'Dror', 'participant', 'interview_chat')`,
+        [fix.tripId],
+      );
+      for (const text of ["/group", "/bind"]) {
+        const decision = await dispatchUpdate(fix.pool, msg(dm, text), undefined, () => {}, BOT);
+        assert.deepEqual(decision, { kind: "reply", reply: { chatId: dm, text: DEFAULT_STRINGS.groupTokenUnavailable } });
+      }
+      const rows = await fix.pool.query("SELECT 1 FROM control_plane.telegram_group_binding_tokens WHERE trip_id = $1", [fix.tripId]);
+      assert.equal(rows.rowCount, 0);
+    });
+  });
+
+  test("a sender the trip does not know at all is refused the same way", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const dm = "700000905";
+      await bindCompanion(fix, dm, "companion-japan");
+      const decision = await dispatchUpdate(fix.pool, msg(dm, "/group"), undefined, () => {}, BOT);
+      assert.deepEqual(decision, { kind: "reply", reply: { chatId: dm, text: DEFAULT_STRINGS.groupTokenUnavailable } });
+      const rows = await fix.pool.query("SELECT 1 FROM control_plane.telegram_group_binding_tokens WHERE trip_id = $1", [fix.tripId]);
+      assert.equal(rows.rowCount, 0);
+    });
+  });
+
+  test("an organizer whose Telegram link was unlinked (demoted) is refused, and a relink restores /group", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const dm = "700000906";
+      await bindCompanion(fix, dm, "companion-japan");
+      await makeOrganizer(fix);
+      const digest = digestTelegramId("777");
+      await fix.pool.query(
+        `INSERT INTO control_plane.telegram_organizer_trip_links
+           (id, user_id, trip_id, telegram_subject_digest, verified_via, revoked_at, revoked_reason)
+         VALUES ('otl_revoked12345678', $1, $2, $3, 'enrollment_redemption', now(), 'owner_unlinked')`,
+        [fix.userId, fix.tripId, digest],
+      );
+      const demoted = await dispatchUpdate(fix.pool, msg(dm, "/group"), undefined, () => {}, BOT);
+      assert.deepEqual(demoted, { kind: "reply", reply: { chatId: dm, text: DEFAULT_STRINGS.groupTokenUnavailable } });
+      const none = await fix.pool.query("SELECT 1 FROM control_plane.telegram_group_binding_tokens WHERE trip_id = $1", [fix.tripId]);
+      assert.equal(none.rowCount, 0);
+
+      // A live link (a relink from the dashboard) lifts the override.
+      await fix.pool.query(
+        `INSERT INTO control_plane.telegram_organizer_trip_links
+           (id, user_id, trip_id, telegram_subject_digest, verified_via)
+         VALUES ('otl_relinked12345678', $1, $2, $3, 'dashboard_link_token')`,
+        [fix.userId, fix.tripId, digest],
+      );
+      const back = await dispatchUpdate(fix.pool, msg(dm, "/group"), undefined, () => {}, BOT);
+      assert.equal(back.kind, "group_intro");
     });
   });
 });

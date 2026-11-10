@@ -2,6 +2,7 @@ import { ArrowLeft, ArrowRight, CalendarDays, Check, MapPin, Users } from "lucid
 import { FormEvent, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { Brand } from "../components/Brand";
+import { DateInput, nextDay } from "../components/DateInput";
 
 type TripIntent = {
   destination: string;
@@ -48,7 +49,7 @@ export default function NewTripPage() {
           <p>Start with the shape of the trip. You can add bookings, travelers, and important constraints after signing in.</p>
           <form onSubmit={submitBasics}>
             <label>Destination<div className="input-wrap large-input"><MapPin /><input value={intent.destination} onChange={(event) => update("destination", event.target.value)} required placeholder="Japan, Greece, Northern Italy…" autoFocus /></div></label>
-            <div className="field-row"><label>Start date<div className="input-wrap"><CalendarDays /><input type="date" value={intent.startDate} onChange={(event) => update("startDate", event.target.value)} /></div></label><label>End date<div className="input-wrap"><CalendarDays /><input type="date" min={intent.startDate || undefined} value={intent.endDate} onChange={(event) => update("endDate", event.target.value)} /></div></label></div>
+            <div className="field-row"><label>Start date<div className="input-wrap"><CalendarDays /><DateInput value={intent.startDate} onChange={(event) => update("startDate", event.target.value)} /></div></label><label>End date<div className="input-wrap"><CalendarDays /><DateInput min={nextDay(intent.startDate)} value={intent.endDate} onChange={(event) => update("endDate", event.target.value)} /></div></label></div>
             <fieldset><legend>Who's traveling?</legend><div className="trip-type-grid">{[["family", "Family", "Kids, parents, grandparents"], ["multi-family", "Multi-family", "More than one household"], ["friends", "Friends", "A group traveling together"], ["road-trip", "Road trip", "Stops, driving, and pace"]].map(([value, label, help]) => <label className={intent.tripType === value ? "selected" : ""} key={value}><input type="radio" name="tripType" value={value} checked={intent.tripType === value} onChange={() => update("tripType", value)} /><Users /><strong>{label}</strong><span>{help}</span>{intent.tripType === value && <Check className="type-check" />}</label>)}</div></fieldset>
             <button className="button button-coral trip-continue" type="submit">Continue <ArrowRight size={18} /></button>
           </form>

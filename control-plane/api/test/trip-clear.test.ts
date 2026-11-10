@@ -893,6 +893,64 @@ describe("the operator's force-clear", { skip: SKIP ? "no CONTROL_PLANE_TEST_DAT
     }
   });
 
+  // #387 AC-6: scripts/teardown-trip.py's retire_in_db (rename branch) used to
+  // run tokens -> bindings -> TRIPS -> sessions, the opposite of executeClear's
+  // sessions -> bindings -> trips: a real 40P01 on a trip with a live
+  // unconfirmed session. It now runs tokens -> sessions -> bindings -> trips ->
+  // teardown-pin clear. The holder below mirrors that statement order (the
+  // statements are retire_in_db's REVOKE_GROUP_TOKENS, CLOSE_SESSIONS, the
+  // bindings close, the slug rename); if the script's order changes, this is
+  // the test to update (tests/scripts/test_teardown_trip.py pins the script's
+  // side of the same contract).
+  //
+  // executeClear absorbs ONE 40P01 by retrying on a fresh client (F-R9-1),
+  // which would hide the very thing this test is for, so it also asserts the
+  // transaction was opened exactly once.
+  test("#387 AC-6: does not deadlock against retire_in_db's order (tokens, sessions, bindings, trips)", async () => {
+    const { tripId } = await makeTrip(pool, "intake_in_progress", { session: true });
+    const holder = await pool.connect();
+    const realConnect = pool.connect.bind(pool);
+    let clearConnects = 0;
+    try {
+      const preview = await previewClear(pool, tripId);
+      const confirmValue = preview.plan!.slug;
+
+      await holder.query("BEGIN");
+      await holder.query(
+        "UPDATE control_plane.telegram_group_binding_tokens SET expires_at = now() WHERE trip_id = $1 AND expires_at > now()",
+        [tripId]);
+      await holder.query(
+        "UPDATE control_plane.intake_sessions SET expired_at = now() WHERE trip_id = $1 AND expired_at IS NULL AND state <> 'confirmed'",
+        [tripId]);
+
+      // Count only the promise form: Pool.query itself calls connect(callback).
+      (pool as unknown as { connect: (...a: unknown[]) => unknown }).connect = (...a: unknown[]) => {
+        if (a.length === 0) clearConnects++;
+        return (realConnect as (...b: unknown[]) => unknown)(...a);
+      };
+      let settled = false;
+      const clearPromise = executeClear(pool, tripId, confirmValue, "test:operator").then((r) => { settled = true; return r; });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      assert.equal(settled, false, "clear must block on the session row teardown already holds, not deadlock");
+
+      await holder.query(
+        "UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed' WHERE trip_id = $1 AND closed_at IS NULL",
+        [tripId]);
+      await holder.query(
+        "UPDATE control_plane.trips SET slug = $2, updated_at = now() WHERE id = $1",
+        [tripId, `retired-t387-${randomBytes(4).toString("hex")}-20261030`]);
+      await holder.query("COMMIT");
+
+      // No throw, and no swallowed-then-retried deadlock either.
+      const result = await clearPromise;
+      assert.ok(result, "clear settles with a defined result");
+      assert.equal(clearConnects, 1, "executeClear opened its transaction once: no 40P01 was absorbed by its retry");
+    } finally {
+      (pool as unknown as { connect: typeof realConnect }).connect = realConnect;
+      holder.release();
+    }
+  });
+
   test("a trip that finished provisioning successfully before clear cannot hit a stale-plan replan collision (G3)", async () => {
     // generatePlan always creates the plan and its job in the SAME
     // transaction (planner.ts), and completeJob/provisioner.py's success

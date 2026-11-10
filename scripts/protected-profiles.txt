@@ -1,0 +1,20 @@
+# Hermes profiles this system never starts, stops, marks or tears down as a trip
+# companion, whatever else is true of them (issue #349, boundary review R3).
+#
+# ONE list, read by two programs that must agree:
+#   scripts/companion-install-host.sh  the forced command: refuses any gateway
+#                                      action or backfill on these names
+#   scripts/teardown-trip.py           refuses to tear one of these down
+# (teardown adds the interviewer, trip-intake, itself: the interviewer IS managed
+# by the reconciler - always running, never stopped - so it is not on this list.)
+#
+# One lowercase name per line, [a-z0-9-] only; '#' starts a comment. An unreadable
+# or malformed list makes the forced command refuse everything. Adding a name
+# here is a security decision: it removes a profile from the control plane's
+# reach entirely.
+default
+trip-monitor
+kinerary-extract
+elulhome
+familytrip
+kinerarytest

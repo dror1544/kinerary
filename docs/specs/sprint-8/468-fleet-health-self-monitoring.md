@@ -1,6 +1,6 @@
 # Fleet health: production watches itself
 
-Status: draft (2026-10-21) · Issue: #468 · Track: T4 · Size: L (five slices) · Tier: High
+Status: draft (2026-10-21); unscheduled, not in Sprint 8's scope (plan, 2026-10-30) · Issue: #468 · Track: T4 · Size: L (five slices) · Tier: High
 Security path: yes (a new authenticated operator route; alert text built from trip data) · Migration: yes · Live-trip behaviour: no (operator-facing only)
 
 ## Problem
@@ -121,7 +121,7 @@ When this is done:
 2. **Delivery** (M): `notify.ts`, outbox kind, batching, quiet hours, reminders. AC-5/6/7.
 3. **Endpoint** (S): AC-8, with `timingSafeEqual` for the operator and admin keys. Boundary review.
 4. **Heartbeat** (S): AC-9, plus the runbook entry for creating the external check.
-5. **Retire the SSH path** (S–M): AC-11 and AC-12. The Hermes monitor's crons switch to the endpoint. Decide which ad-hoc read tools still need SQL; for those, keep the read-only role and #453's limiter. Close #295, #370 and #291 as superseded where they are.
+5. **Retire the SSH path** (S–M): AC-11 and AC-12. The Hermes monitor's crons switch to the endpoint. Decide which ad-hoc read tools still need SQL; for those, keep the read-only role and #453's limiter. Close #370 and #291 as superseded where they are (#295 is already closed).
 
 ## Non-goals
 
@@ -180,5 +180,6 @@ as "assessment: not needed (operator-only)" unless the review says otherwise.
    Proposed: unreachable live trip, failed provisioning job on a real trip, model
    failing mid-interview, checker gap.
 4. **Quiet hours:** default range, for example 23:00–07:00 local?
-5. **Sprint:** confirm this is Sprint 8, and whether slice 1 may start in Sprint 7
-   if capacity allows.
+5. **Sprint:** unscheduled. Sprint 8 became a short hardening sprint on
+   2026-10-30 and lists this under "Not this sprint"; which sprint takes it is
+   decided at approval.

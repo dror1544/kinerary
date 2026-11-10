@@ -90,8 +90,11 @@ export const RETRY_AFTER_CAP_SECONDS = 3;
  * follows a hang. The worst is a connector MarkdownV2 send - a 429, a 3 s wait,
  * then a parse error; then the plain-text fallback with a 429, a 3 s wait and a
  * 10 s hang - about 16 s plus round trips. That is under the 30 s a Hermes gateway
- * waits for an outbound send (`_OUTBOUND_TIMEOUT_S = 30.0`), a figure read only in
- * the Mac's Hermes checkout (`ab0d98414`), not in the VM's image.
+ * waits for an outbound send (`_OUTBOUND_TIMEOUT_S = 30.0`). That figure is not
+ * re-read by hand: it is captured from Hermes' source into
+ * `test/fixtures/hermes-mirror.json` (`outbound_timeout_seconds`, at the revision
+ * `hermes-patches/BASE_REV` pins), and `test/hermes-mirror.test.ts` (AC-3) fails
+ * if this arithmetic stops being below it.
  *
  * A constant, not a setting: nothing about a deployment makes Telegram slower.
  */
@@ -108,6 +111,19 @@ export function isPermanentRefusal(result: Pick<SendResult, "ok" | "permanent"> 
 export interface ChatInfo {
   name: string;
   type: string;
+}
+
+/**
+ * The message a chat currently has pinned on top, reduced to what is needed to
+ * recognise one of OUR own: who sent it, its text, and the URLs on its inline
+ * buttons. Never the rest of the message.
+ */
+export interface PinnedMessage {
+  messageId: string;
+  /** The sender's Telegram id, or null when Telegram did not say. */
+  fromId: string | null;
+  text: string;
+  buttonUrls: string[];
 }
 
 /** Who this token actually belongs to, per Telegram itself. */
@@ -161,6 +177,14 @@ export interface TelegramClient {
    * `false` as "carry on".
    */
   pinChatMessage?(params: { chatId: string; messageId: string }): Promise<boolean>;
+  /**
+   * The chat's top pinned message (`getChat.pinned_message`), or null when there
+   * is none or Telegram would not say. Used only to find our own "Open trip"
+   * message before replacing it; never throws.
+   */
+  getPinnedMessage?(chatId: string): Promise<PinnedMessage | null>;
+  /** Unpins ONE message by id. Needs the pin right; returns whether it worked, never throws. */
+  unpinChatMessage?(params: { chatId: string; messageId: string }): Promise<boolean>;
   /**
    * The group's own invite link, or null when the bot cannot read one (it needs
    * `can_invite_users`, and the chat must not be a private one).
@@ -406,6 +430,37 @@ export class HttpTelegramClient implements TelegramClient {
       return false;
     }
     return true;
+  }
+
+  async unpinChatMessage(params: { chatId: string; messageId: string }): Promise<boolean> {
+    const res = await this.post("unpinChatMessage", {
+      chat_id: params.chatId,
+      message_id: Number(params.messageId),
+    });
+    if (!res.ok) this.log(structuredLog("info", "telegram_api.unpin_unavailable", {}));
+    return res.ok;
+  }
+
+  async getPinnedMessage(chatId: string): Promise<PinnedMessage | null> {
+    const res = await this.post("getChat", { chat_id: chatId });
+    if (!res.ok) return null;
+    const pinned = (res.result as { pinned_message?: {
+      message_id?: number;
+      from?: { id?: number };
+      text?: string;
+      reply_markup?: { inline_keyboard?: { url?: unknown }[][] };
+    } } | undefined)?.pinned_message;
+    if (!pinned || typeof pinned.message_id !== "number") return null;
+    const buttonUrls: string[] = [];
+    for (const row of pinned.reply_markup?.inline_keyboard ?? []) {
+      for (const button of row ?? []) if (typeof button?.url === "string") buttonUrls.push(button.url);
+    }
+    return {
+      messageId: String(pinned.message_id),
+      fromId: typeof pinned.from?.id === "number" ? String(pinned.from.id) : null,
+      text: typeof pinned.text === "string" ? pinned.text : "",
+      buttonUrls,
+    };
   }
 
   async exportChatInviteLink(chatId: string): Promise<string | null> {

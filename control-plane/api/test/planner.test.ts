@@ -5,7 +5,7 @@ import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
 import { generatePlan, retryProvision } from "../src/planner.js";
 import { issueApproval } from "../src/plan-approval.js";
-import { claimJob, heartbeat, recoverStaleLeases, recoverExpiredApprovals, completeJob, failJob } from "../src/job-queue.js";
+import { claimJob, heartbeat, recoverStaleLeases, recoverExpiredApprovals, completeJob, failJob, retryBackoffSeconds } from "../src/job-queue.js";
 import { buildReleaseManifest, type PayloadSource } from "../src/release-artifact.js";
 import { promoteRelease, registerCandidateRelease } from "../src/release-registry.js";
 import { executeClear, previewClear } from "../src/trip-clear.js";
@@ -37,6 +37,14 @@ function generateTestId(prefix: string): string {
 }
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
+
+/** Lets a requeued job's retry backoff elapse (it is held in `lease_expires_at` on the queued row). */
+async function elapseRetryBackoff(pool: pg.Pool, tripId: string): Promise<void> {
+  await pool.query(
+    "UPDATE control_plane.jobs SET lease_expires_at = now() - interval '1 second' WHERE trip_id = $1 AND state = 'queued'",
+    [tripId],
+  );
+}
 
 interface PlannerFixture {
   pool: pg.Pool;
@@ -136,6 +144,7 @@ async function teardownFixture(fix: PlannerFixture) {
   await pool.query("DELETE FROM control_plane.jobs WHERE trip_id = $1", [tripId]);
   await pool.query("DELETE FROM control_plane.plans WHERE trip_id = $1", [tripId]);
   await pool.query("DELETE FROM control_plane.intake_versions WHERE trip_id = $1", [tripId]);
+  await pool.query("DELETE FROM control_plane.telegram_organizer_trip_links WHERE trip_id = $1", [tripId]);
   await pool.query("DELETE FROM control_plane.trip_memberships WHERE trip_id = $1", [tripId]);
   await pool.query("DELETE FROM control_plane.trips WHERE id = $1", [tripId]);
   await pool.query("DELETE FROM control_plane.telegram_organizer_links WHERE user_id = $1", [ownerId]);
@@ -491,6 +500,27 @@ describe("retryProvision", () => {
         "SELECT lifecycle_state FROM control_plane.trips WHERE id = $1", [fix.tripId],
       );
       assert.equal(trip.rows[0]?.lifecycle_state, "planned");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("refuses a retired (torn-down) trip under the trips lock, changing nothing", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const first = await generatePlan(fix.pool, fix.tripId, fix.correlationId);
+      assert.equal(first.ok, true);
+      if (!first.ok) throw new Error("unreachable");
+      await issueApproval(fix.pool, first.planId, "user:test", 3600);
+      await simulateTerminalFailure(fix, first.planId, first.jobId);
+      await fix.pool.query("UPDATE control_plane.trips SET slug = 'retired-' || slug || '-20261109' WHERE id = $1", [fix.tripId]);
+      const stateBefore = (await fix.pool.query("SELECT lifecycle_state FROM control_plane.trips WHERE id = $1", [fix.tripId])).rows[0];
+      const plansBefore = (await fix.pool.query("SELECT count(*)::int AS n FROM control_plane.plans WHERE trip_id = $1", [fix.tripId])).rows[0];
+
+      const retry = await retryProvision(fix.pool, fix.tripId, `corr_${randomHex(12)}`);
+      assert.deepEqual(retry, { ok: false, reason: "TRIP_RETIRED" });
+      assert.deepEqual((await fix.pool.query("SELECT lifecycle_state FROM control_plane.trips WHERE id = $1", [fix.tripId])).rows[0], stateBefore);
+      assert.deepEqual((await fix.pool.query("SELECT count(*)::int AS n FROM control_plane.plans WHERE trip_id = $1", [fix.tripId])).rows[0], plansBefore);
     } finally {
       await teardownFixture(fix);
     }
@@ -989,7 +1019,9 @@ describe("claimJob / heartbeat / completeJob / failJob", () => {
       );
       assert.equal(tripRow.rows[0]?.lifecycle_state, "provisioning_approved");
 
-      // The re-queued job is immediately claimable without a new approval.
+      // The re-queued job is claimable without a new approval once its retry backoff has passed.
+      assert.equal((await claimJob(fix.pool, "worker_02", 60)).ok, false, "a reaped job is also held back by the backoff");
+      await elapseRetryBackoff(fix.pool, fix.tripId);
       const reclaim = await claimJob(fix.pool, "worker_02", 60);
       assert.equal(reclaim.ok, true);
     } finally {
@@ -1082,7 +1114,8 @@ describe("claimJob / heartbeat / completeJob / failJob", () => {
       );
       assert.equal(tripRow.rows[0]?.lifecycle_state, "provisioning_approved");
 
-      // The re-queued job is immediately claimable without a new approval.
+      // The re-queued job is claimable without a new approval once the backoff has passed.
+      await elapseRetryBackoff(fix.pool, fix.tripId);
       const reclaim = await claimJob(fix.pool, "worker_02", 60);
       assert.equal(reclaim.ok, true);
       assert.equal(reclaim.ok && reclaim.claim.jobId, claim.claim.jobId);
@@ -1105,6 +1138,7 @@ describe("claimJob / heartbeat / completeJob / failJob", () => {
       await failJob(fix.pool, jobId, "worker_01", "TRANSIENT_ERROR");
 
       // Second attempt: re-claim using the same approval — no new approval needed.
+      await elapseRetryBackoff(fix.pool, fix.tripId);
       const second = await claimJob(fix.pool, "worker_02", 60);
       assert.equal(second.ok, true);
       if (!second.ok) throw new Error("unreachable");
@@ -1128,6 +1162,54 @@ describe("claimJob / heartbeat / completeJob / failJob", () => {
     } finally {
       await teardownFixture(fix);
     }
+  });
+
+  test("retry backoff: a failed attempt is not claimable at once; 30s after the first failure, 120s after the second", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const { jobId } = await setupApprovedJob(fix);
+      const notBeforeSeconds = async (): Promise<number> => (await fix.pool.query<{ s: number }>(
+        "SELECT extract(epoch FROM lease_expires_at - now())::float8 AS s FROM control_plane.jobs WHERE id = $1", [jobId],
+      )).rows[0]!.s;
+
+      const first = await claimJob(fix.pool, "worker_01", 60);
+      assert.equal(first.ok, true);
+      assert.equal(await failJob(fix.pool, jobId, "worker_01", "TRANSIENT_ERROR"), true);
+      // The 2026-11-08 failure: three attempts inside three seconds. Not any more.
+      assert.deepEqual(await claimJob(fix.pool, "worker_02", 60), { ok: false, reason: "NO_CLAIMABLE_JOB" });
+      let wait = await notBeforeSeconds();
+      assert.ok(wait > 25 && wait <= 30, `after the first failure the wait is ~30s, got ${wait}`);
+
+      // Time passing is what makes it claimable again.
+      await elapseRetryBackoff(fix.pool, fix.tripId);
+      const second = await claimJob(fix.pool, "worker_02", 60);
+      assert.equal(second.ok, true);
+      assert.equal(second.ok && second.claim.attempt, 2);
+      assert.equal(await failJob(fix.pool, jobId, "worker_02", "TRANSIENT_ERROR"), true);
+      assert.equal((await claimJob(fix.pool, "worker_03", 60)).ok, false);
+      wait = await notBeforeSeconds();
+      assert.ok(wait > 115 && wait <= 120, `after the second failure the wait is ~120s, got ${wait}`);
+
+      // The last attempt is terminal: no backoff is left behind on a failed job.
+      await elapseRetryBackoff(fix.pool, fix.tripId);
+      const third = await claimJob(fix.pool, "worker_03", 60);
+      assert.equal(third.ok, true);
+      assert.equal(await failJob(fix.pool, jobId, "worker_03", "TRANSIENT_ERROR"), true);
+      const done = await fix.pool.query<{ state: string; lease_expires_at: Date | null }>(
+        "SELECT state, lease_expires_at FROM control_plane.jobs WHERE id = $1", [jobId]);
+      assert.equal(done.rows[0]?.state, "failed");
+      assert.equal(done.rows[0]?.lease_expires_at, null);
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("retry backoff: retryBackoffSeconds is exponential and capped", () => {
+    assert.equal(retryBackoffSeconds(1), 30);
+    assert.equal(retryBackoffSeconds(2), 120);
+    assert.equal(retryBackoffSeconds(3), 480);
+    assert.equal(retryBackoffSeconds(4), 600, "bounded");
+    assert.equal(retryBackoffSeconds(0), 30);
   });
 
   test("failJob at max_attempts: marks job failed", { skip: SKIP }, async () => {
@@ -1331,6 +1413,232 @@ describe("generatePlan vs executeClear — the trips lock must make them seriali
 
       const job = await fix.pool.query<{ state: string }>("SELECT state FROM control_plane.jobs WHERE id = $1", [jobId]);
       assert.equal(job.rows[0]?.state, "waiting_for_user_action", "untouched — clear refused before touching anything");
+    } finally {
+      holder.release();
+      await teardownFixture(fix);
+    }
+  });
+});
+
+// ── #387: one lock order for re-provisioning ─────────────────────────────────
+//
+// `retryProvision` used to lock trips -> jobs -> plans while the worker's
+// `_complete` (control-plane/worker/control_plane_worker/provisioner.py)
+// locks jobs -> plan_approvals -> plans -> trips: a real 40P01 when the two
+// met on one trip, and if Postgres picked the worker as the victim a built
+// and verified site was recorded as a FAILED job. These tests hold the
+// worker's side open on a second connection, statement for statement, fire
+// the retry without awaiting it, and assert it BLOCKS (does not deadlock) and
+// that both sides end in a defined state. If `_complete`'s statement order
+// changes, this holder is the test to update (trip-clear.test.ts R4-2 carries
+// the same coupling).
+describe("retryProvision lock order (#387)", () => {
+  let pool: pg.Pool;
+
+  before(async () => {
+    if (SKIP) return;
+    pool = testPool({ max: 6 });
+    await runMigrations(pool);
+  });
+
+  after(async () => { if (!SKIP) await pool?.end(); });
+
+  // A trip mid-build: plan approved, job leased to a live worker, trip parked
+  // at provisioning_approved (the worker's _claim does not move it).
+  async function midBuild(fix: PlannerFixture): Promise<{ planId: string; jobId: string }> {
+    const first = await generatePlan(fix.pool, fix.tripId, fix.correlationId);
+    assert.equal(first.ok, true);
+    if (!first.ok) throw new Error("unreachable");
+    const approval = await issueApproval(fix.pool, first.planId, "user:test", 3600);
+    assert.equal(approval.ok, true);
+    await fix.pool.query(
+      `UPDATE control_plane.jobs SET state = 'leased', lease_owner = 'w387',
+              lease_expires_at = now() + interval '5 minutes', attempt = attempt + 1
+        WHERE id = $1`,
+      [first.jobId],
+    );
+    return { planId: first.planId, jobId: first.jobId };
+  }
+
+  const settleWindow = () => new Promise((resolve) => setTimeout(resolve, 250));
+
+  test("AC-3: a retry racing the worker's _complete blocks, never deadlocks, and the job stays succeeded", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    const holder = await pool.connect();
+    try {
+      const { planId, jobId } = await midBuild(fix);
+
+      // _complete, statement for statement (provisioner.py): job first...
+      await holder.query("BEGIN");
+      const jobUpd = await holder.query(
+        `UPDATE control_plane.jobs
+            SET state = 'succeeded', result = '{}'::jsonb, lease_owner = NULL, lease_expires_at = NULL, updated_at = now()
+          WHERE id = $1 AND lease_owner = 'w387' AND state = 'leased'`,
+        [jobId],
+      );
+      assert.equal(jobUpd.rowCount, 1);
+
+      let settled = false;
+      const retryPromise = retryProvision(fix.pool, fix.tripId, `corr_${randomHex(12)}`).then(
+        (r) => { settled = true; return { r }; },
+        (e: unknown) => { settled = true; return { e }; },
+      );
+      await settleWindow();
+      assert.equal(settled, false, "the retry must block on the job row _complete already holds, not deadlock");
+
+      // ...then approvals, plans, trips, in _complete's order, and commit.
+      let workerError: unknown = null;
+      try {
+        await holder.query("UPDATE control_plane.plan_approvals SET used_at = now() WHERE plan_id = $1 AND used_at IS NULL", [planId]);
+        await holder.query("UPDATE control_plane.plans SET status = 'executed', updated_at = now() WHERE id = $1 AND status = 'approved'", [planId]);
+        await holder.query("UPDATE control_plane.trips SET lifecycle_state = 'ready_private', updated_at = now() WHERE id = $1", [fix.tripId]);
+        await holder.query("COMMIT");
+      } catch (e) {
+        workerError = e;
+        await holder.query("ROLLBACK").catch(() => undefined);
+      }
+      assert.equal(workerError, null, `the worker's success commit must not lose to a deadlock: ${String((workerError as { code?: string })?.code)}`);
+
+      const outcome = await retryPromise;
+      assert.equal("e" in outcome, false, `the retry must not throw (40P01?): ${String((outcome as { e?: { code?: string } }).e?.code)}`);
+
+      const job = await fix.pool.query<{ state: string }>("SELECT state FROM control_plane.jobs WHERE id = $1", [jobId]);
+      assert.equal(job.rows[0]?.state, "succeeded", "the finished build is never recorded as failed or cancelled");
+      const result = (outcome as { r: Awaited<ReturnType<typeof retryProvision>> }).r;
+      // Defined result: the build had finished, so the retry supersedes it as
+      // it would have a second later.
+      assert.equal(result.ok, true, JSON.stringify(result));
+    } finally {
+      holder.release();
+      await teardownFixture(fix);
+    }
+  });
+
+  test("AC-3 (concurrent form): a worker _complete and a retry run together surface no 40P01 on either side", { skip: SKIP }, async () => {
+    // The #175 shape (group-binding.test.ts): both sides run at once so a real
+    // 40P01 surfaces as a rejection rather than being swallowed by a wait.
+    const fix = await setupFixture(pool);
+    const holder = await pool.connect();
+    try {
+      const { planId, jobId } = await midBuild(fix);
+      const worker = (async () => {
+        await holder.query("BEGIN");
+        try {
+          await holder.query(
+            `UPDATE control_plane.jobs SET state = 'succeeded', lease_owner = NULL, lease_expires_at = NULL, updated_at = now()
+              WHERE id = $1 AND lease_owner = 'w387' AND state = 'leased'`, [jobId]);
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          await holder.query("UPDATE control_plane.plan_approvals SET used_at = now() WHERE plan_id = $1 AND used_at IS NULL", [planId]);
+          await holder.query("UPDATE control_plane.plans SET status = 'executed', updated_at = now() WHERE id = $1 AND status = 'approved'", [planId]);
+          await holder.query("UPDATE control_plane.trips SET lifecycle_state = 'ready_private', updated_at = now() WHERE id = $1", [fix.tripId]);
+          await holder.query("COMMIT");
+        } catch (e) {
+          await holder.query("ROLLBACK").catch(() => undefined);
+          throw e;
+        }
+      })();
+      const retry = (async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return retryProvision(fix.pool, fix.tripId, `corr_${randomHex(12)}`);
+      })();
+      const [w, r] = await Promise.allSettled([worker, retry]);
+      assert.equal(w.status, "fulfilled", w.status === "rejected" ? String((w.reason as { code?: string }).code ?? w.reason) : "");
+      assert.equal(r.status, "fulfilled", r.status === "rejected" ? String((r.reason as { code?: string }).code ?? r.reason) : "");
+      const job = await fix.pool.query<{ state: string }>("SELECT state FROM control_plane.jobs WHERE id = $1", [jobId]);
+      assert.equal(job.rows[0]?.state, "succeeded");
+    } finally {
+      holder.release();
+      await teardownFixture(fix);
+    }
+  });
+
+  test("AC-4: a retry racing the worker's claim waits for it, sees the live lease, and cancels nothing", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    const holder = await pool.connect();
+    try {
+      const first = await generatePlan(fix.pool, fix.tripId, fix.correlationId);
+      assert.equal(first.ok, true);
+      if (!first.ok) throw new Error("unreachable");
+      assert.equal((await issueApproval(fix.pool, first.planId, "user:test", 3600)).ok, true);
+
+      // job-queue.ts claimJob / provisioner.py _claim: lock job, approval and
+      // trip in ONE statement, then lease.
+      await holder.query("BEGIN");
+      const claimed = await holder.query(
+        `SELECT j.id FROM control_plane.jobs j
+           JOIN control_plane.plan_approvals pa ON pa.plan_id = j.plan_id
+           JOIN control_plane.trips t ON t.id = j.trip_id
+          WHERE j.trip_id = $1 AND j.state = 'queued'
+          FOR UPDATE OF j, pa, t SKIP LOCKED`,
+        [fix.tripId],
+      );
+      assert.equal(claimed.rowCount, 1);
+      await holder.query(
+        `UPDATE control_plane.jobs SET state = 'leased', lease_owner = 'w387',
+                lease_expires_at = now() + interval '5 minutes', attempt = attempt + 1 WHERE id = $1`,
+        [first.jobId],
+      );
+
+      let settled = false;
+      const retryPromise = retryProvision(fix.pool, fix.tripId, `corr_${randomHex(12)}`).then((r) => { settled = true; return r; });
+      await settleWindow();
+      assert.equal(settled, false, "the retry must wait for the claim");
+      await holder.query("COMMIT");
+
+      const result = await retryPromise;
+      assert.equal(result.ok, false, JSON.stringify(result));
+      if (result.ok) return;
+      assert.equal(result.reason, "PROVISION_IN_PROGRESS");
+
+      const job = await fix.pool.query<{ state: string }>("SELECT state FROM control_plane.jobs WHERE id = $1", [first.jobId]);
+      assert.equal(job.rows[0]?.state, "leased", "nothing cancelled");
+      const plan = await fix.pool.query<{ status: string }>("SELECT status FROM control_plane.plans WHERE id = $1", [first.planId]);
+      assert.equal(plan.rows[0]?.status, "approved", "nothing superseded");
+    } finally {
+      holder.release();
+      await teardownFixture(fix);
+    }
+  });
+
+  test("AC-2: a job committed by a concurrent generatePlan while the retry waits for trips is refused, never cancelled", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    const holder = await pool.connect();
+    try {
+      // intake_confirmed, no jobs at all: the retry's first (locking) read of
+      // jobs returns and locks nothing.
+      await holder.query("BEGIN");
+      await holder.query("SELECT 1 FROM control_plane.trips WHERE id = $1 FOR UPDATE", [fix.tripId]);
+
+      let settled = false;
+      const retryPromise = retryProvision(fix.pool, fix.tripId, `corr_${randomHex(12)}`).then((r) => { settled = true; return r; });
+      await settleWindow();
+      assert.equal(settled, false, "the retry must block on the trips lock the concurrent generatePlan holds");
+
+      // generatePlan's own writes (planner.ts), then commit.
+      const planId = `plan_${randomHex(16)}`;
+      const jobId = `job_${randomHex(16)}`;
+      await holder.query(
+        `INSERT INTO control_plane.plans(id, trip_id, release_id, kind, digest, status, desired)
+         VALUES ($1, $2, $3, 'provision', $4, 'pending_approval', '{}'::jsonb)`,
+        [planId, fix.tripId, fix.releaseId, `sha256:${randomHex(64)}`],
+      );
+      await holder.query(
+        `INSERT INTO control_plane.jobs(id, trip_id, plan_id, job_type, idempotency_key, correlation_id, state)
+         VALUES ($1, $2, $3, 'provision', $4, $5, 'waiting_for_user_action')`,
+        [jobId, fix.tripId, planId, `idem_${randomHex(16)}`, fix.correlationId],
+      );
+      await holder.query("UPDATE control_plane.trips SET lifecycle_state = 'planned' WHERE id = $1", [fix.tripId]);
+      await holder.query("COMMIT");
+
+      const result = await retryPromise;
+      assert.equal(result.ok, false, JSON.stringify(result));
+      if (result.ok) return;
+      assert.equal(result.reason, "PROVISION_IN_PROGRESS");
+
+      const job = await fix.pool.query<{ state: string }>("SELECT state FROM control_plane.jobs WHERE id = $1", [jobId]);
+      assert.equal(job.rows[0]?.state, "waiting_for_user_action", "a job the retry never locked is never cancelled by it");
+      const plan = await fix.pool.query<{ status: string }>("SELECT status FROM control_plane.plans WHERE id = $1", [planId]);
+      assert.equal(plan.rows[0]?.status, "pending_approval", "and its plan is not superseded under it (no orphan job)");
     } finally {
       holder.release();
       await teardownFixture(fix);

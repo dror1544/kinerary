@@ -1,0 +1,35 @@
+{
+  "_about": "Recorded model readings of ticket-1.txt and ticket-2.txt for the `travelers` question. All names are invented. `name` is in the interview's script (Hebrew); `name_en` is the ticket's printed Latin spelling. Variants of ticket 2: sure; unsure (confidence 0.5); hebrew-evidence (evidence quoted in the interview's script, which the ticket does not contain).",
+  "ticket-1": {
+    "confidence": 0.92,
+    "evidence": "Passenger 1: ARLO VESPER\nPassenger 2: LENA VESPER",
+    "data": [
+      { "name": "ארלו וספר", "name_en": "ARLO VESPER" },
+      { "name": "לנה וספר", "name_en": "LENA VESPER" }
+    ]
+  },
+  "ticket-2-sure": {
+    "confidence": 0.9,
+    "evidence": "Passenger 1: BRIA TALLIS\nPassenger 2: COLE TALLIS",
+    "data": [
+      { "name": "בריה טאליס", "name_en": "BRIA TALLIS" },
+      { "name": "קול טאליס", "name_en": "COLE TALLIS" }
+    ]
+  },
+  "ticket-2-unsure": {
+    "confidence": 0.5,
+    "evidence": "Passenger 1: BRIA TALLIS\nPassenger 2: COLE TALLIS",
+    "data": [
+      { "name": "בריה טאליס", "name_en": "BRIA TALLIS" },
+      { "name": "קול טאליס", "name_en": "COLE TALLIS" }
+    ]
+  },
+  "ticket-2-hebrew-evidence": {
+    "confidence": 0.9,
+    "evidence": "נוסע 1: בריה טאליס\nנוסע 2: קול טאליס",
+    "data": [
+      { "name": "בריה טאליס", "name_en": "BRIA TALLIS" },
+      { "name": "קול טאליס", "name_en": "COLE TALLIS" }
+    ]
+  }
+}
