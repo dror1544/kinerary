@@ -232,21 +232,77 @@ def _parse_iso_date(value: Any) -> date | None:
         return None
 
 
+def _stops_window(data: Mapping[str, Any]) -> tuple[date | None, date | None]:
+    """The earliest start and latest end among the intake's dated stops."""
+    starts: list[date] = []
+    ends: list[date] = []
+    for stop in _structured_list(data, "phases"):
+        if not isinstance(stop, Mapping):
+            continue
+        start = _parse_iso_date(stop.get("start"))
+        end = _parse_iso_date(stop.get("end"))
+        if start:
+            starts.append(start)
+        if end:
+            ends.append(end)
+    # A stop with only one end still bounds the trip on that side.
+    first = min(starts + ends) if (starts or ends) else None
+    last = max(ends + starts) if (starts or ends) else None
+    return first, last
+
+
 def _resolve_dates(data: Mapping[str, Any], today: date) -> tuple[date, date, int]:
     """Resolve (departure, return, total_days) from the intake.
 
     Precise dates from the interview take priority over the placeholder
     duration-based guess — older confirmed intakes (pre-dating those questions)
     fall back to the original 90-days-from-today logic.
+
+    A date the organizer gave that is not a `YYYY-MM-DD` day (2026-11-08: a
+    return typed at the summary was stored as "22 בנובמבר 2026") never
+    silently becomes today + 90 days when the intake's own stops are dated: the
+    trip then runs from the earliest stop start to the latest stop end, and the
+    warning names which field was unreadable. The slug takes its year from this
+    too (`derive_trip_slug`), so a November trip is not built, and named, as a
+    February one.
     """
-    explicit_departure = _parse_iso_date(_text_value(data.get("departure_date", {})))
-    explicit_return = _parse_iso_date(_text_value(data.get("return_date", {})))
+    departure_text = _text_value(data.get("departure_date", {})).strip()
+    return_text = _text_value(data.get("return_date", {})).strip()
+    explicit_departure = _parse_iso_date(departure_text)
+    explicit_return = _parse_iso_date(return_text)
     if explicit_departure and explicit_return and explicit_return > explicit_departure:
         return (
             explicit_departure,
             explicit_return,
             (explicit_return - explicit_departure).days,
         )
+
+    unreadable = [
+        name
+        for name, text, parsed in (
+            ("departure_date", departure_text, explicit_departure),
+            ("return_date", return_text, explicit_return),
+        )
+        if text and parsed is None
+    ]
+    stops_first, stops_last = _stops_window(data)
+    departure = explicit_departure or stops_first
+    arrival = explicit_return or stops_last
+    if departure and arrival and arrival <= departure:
+        # One side is unusable or they contradict each other: the stops are the
+        # only dates left that the organizer gave and that agree with themselves.
+        departure, arrival = stops_first, stops_last
+    if unreadable or (departure_text and return_text):
+        logger.warning(
+            "intake dates not usable as given: unreadable=%s departure_date_present=%s "
+            "return_date_present=%s stops_window=%s",
+            ",".join(unreadable) or "none (return not after departure)",
+            bool(departure_text),
+            bool(return_text),
+            "yes" if stops_first and stops_last else "no",
+        )
+    if departure and arrival and arrival > departure:
+        return departure, arrival, (arrival - departure).days
 
     departure_date = today + timedelta(days=90)
     # `trip_duration` is a fallback for an intake that has no usable dates, and

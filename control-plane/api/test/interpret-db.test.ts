@@ -238,6 +238,133 @@ describe("interpret path — idempotency", { skip: SKIP ? "no CONTROL_PLANE_TEST
       assert.equal(await findInterpretation(pool, a.chatId, burst.burstKey), null);
     });
   });
+
+  // #514. A replay stands in for a REDELIVERY, and a redelivery belongs to one
+  // session. The key of a document burst is the files' content digests, so the
+  // same file in a later interview in the same chat has the same key -- and used
+  // to find the earlier interview's row and be dropped as "already read".
+  describe("replay is for the same delivery in the same session (#514)", () => {
+    const docBurst = { burstKey: "docs:3f2a9c,b71e04", sourceText: "" };
+
+    async function commitRow(
+      pool: pg.Pool,
+      claim: Awaited<ReturnType<typeof claimInterpretation>>,
+      result: { failureReason?: string; proposals?: ProposedAnswer[] },
+    ): Promise<string> {
+      assert.equal(claim.fresh, true, "set-up: the first claim of a burst is fresh");
+      const id = claim.fresh === true ? claim.id : "";
+      await recordInterpretationResult(pool, id, { ...result, attempts: 0, durationMs: 5 });
+      await markInterpretationCommitted(pool, id, { accepted: [], rejected: [], askAnyway: [], malformed: 0 });
+      return id;
+    }
+
+    async function secondInterviewOnTheChat(pool: pg.Pool, a: Chat): Promise<Chat> {
+      // The first interview closes (as it does after an hour of silence); a fresh link starts another.
+      await pool.query("UPDATE control_plane.intake_sessions SET expired_at = now() WHERE id = $1", [a.sessionId]);
+      return seedInterview(pool, a.chatId);
+    }
+
+    test("AC-1: a committed row from an earlier interview in the chat does not stand in for this one", async () => {
+      await withTwoInterviews(async ({ pool, a }) => {
+        const first = await claimInterpretation(pool, { sessionId: a.sessionId, chatId: a.chatId, ...docBurst });
+        const firstId = await commitRow(pool, first, { proposals: [PROPOSAL] });
+
+        const b = await secondInterviewOnTheChat(pool, a);
+        assert.notEqual(b.sessionId, a.sessionId);
+        const inB = await claimInterpretation(pool, { sessionId: b.sessionId, chatId: a.chatId, ...docBurst });
+        assert.equal(inB.fresh, true, "the second interview reads the file");
+        assert.notEqual(inB.fresh === true && inB.id, firstId, "a new interpretation id: drafts are keyed on it");
+
+        const row = await findInterpretation(pool, a.chatId, docBurst.burstKey);
+        assert.equal(row?.sessionId, b.sessionId, "the row now belongs to the interview that is reading");
+        assert.equal(row?.committedAt, null);
+        assert.deepEqual(row?.proposals, []);
+
+        // And from here on it IS that session's own, so a redelivery in it is replayed.
+        const again = await claimInterpretation(pool, { sessionId: b.sessionId, chatId: a.chatId, ...docBurst });
+        assert.equal(again.fresh, false);
+      });
+    });
+
+    for (const reason of ["NO_READABLE_DOCUMENT", "NOT_CONFIGURED", "FAILED", "SESSION_CLOSED"]) {
+      test(`AC-2: a ${reason} burst in the same session is read again when it is sent again`, async () => {
+        await withTwoInterviews(async ({ pool, a }) => {
+          const first = await claimInterpretation(pool, { sessionId: a.sessionId, chatId: a.chatId, ...docBurst });
+          const firstId = await commitRow(pool, first, { failureReason: reason });
+
+          const retry = await claimInterpretation(pool, { sessionId: a.sessionId, chatId: a.chatId, ...docBurst });
+          assert.equal(retry.fresh, true);
+          assert.notEqual(retry.fresh === true && retry.id, firstId);
+          const row = await findInterpretation(pool, a.chatId, docBurst.burstKey);
+          assert.equal(row?.failureReason, null, "the failure is not carried into the retry");
+          assert.equal(row?.committedAt, null);
+        });
+      });
+    }
+
+    test("AC-2: retries racing for a failed burst produce exactly one fresh claim", async () => {
+      await withTwoInterviews(async ({ pool, a }) => {
+        const first = await claimInterpretation(pool, { sessionId: a.sessionId, chatId: a.chatId, ...docBurst });
+        await commitRow(pool, first, { failureReason: "NO_READABLE_DOCUMENT" });
+
+        const claims = await Promise.all([
+          claimInterpretation(pool, { sessionId: a.sessionId, chatId: a.chatId, ...docBurst }),
+          claimInterpretation(pool, { sessionId: a.sessionId, chatId: a.chatId, ...docBurst }),
+          claimInterpretation(pool, { sessionId: a.sessionId, chatId: a.chatId, ...docBurst }),
+        ]);
+        assert.equal(claims.filter((c) => c.fresh).length, 1, "one reader, however many arrive together");
+      });
+    });
+
+    test("AC-3: a successful burst in the same session is still replayed, with its stored outcome", async () => {
+      await withTwoInterviews(async ({ pool, a }) => {
+        const first = await claimInterpretation(pool, { sessionId: a.sessionId, chatId: a.chatId, ...docBurst });
+        const firstId = await commitRow(pool, first, { proposals: [PROPOSAL] });
+
+        const redelivered = await claimInterpretation(pool, { sessionId: a.sessionId, chatId: a.chatId, ...docBurst });
+        assert.equal(redelivered.fresh, false);
+        assert.ok(redelivered.fresh === false && redelivered.row.committedAt instanceof Date);
+        assert.equal(redelivered.fresh === false && redelivered.row.id, firstId);
+        assert.equal(redelivered.fresh === false && redelivered.row.failureReason, null);
+      });
+    });
+
+    test("AC-4: a typed burst keeps today's behaviour, failed or not, in the same session", async () => {
+      await withTwoInterviews(async ({ pool, a }) => {
+        const text = { burstKey: "4101,4102", sourceText: "we fly on the 3rd" };
+        const first = await claimInterpretation(pool, { sessionId: a.sessionId, chatId: a.chatId, ...text });
+        const firstId = await commitRow(pool, first, { failureReason: "NOT_CONFIGURED" });
+
+        const again = await claimInterpretation(pool, { sessionId: a.sessionId, chatId: a.chatId, ...text });
+        assert.equal(again.fresh, false, "a text burst is never re-read because it failed");
+        assert.equal(again.fresh === false && again.row.id, firstId);
+        assert.equal(again.fresh === false && again.row.failureReason, "NOT_CONFIGURED");
+      });
+    });
+
+    test("an uncommitted failure row still resumes (the crash window is unchanged)", async () => {
+      await withTwoInterviews(async ({ pool, a }) => {
+        const first = await claimInterpretation(pool, { sessionId: a.sessionId, chatId: a.chatId, ...docBurst });
+        assert.equal(first.fresh, true);
+        await recordInterpretationResult(pool, first.fresh === true ? first.id : "", { failureReason: "FAILED", attempts: 1, durationMs: 1 });
+        const resumed = await claimInterpretation(pool, { sessionId: a.sessionId, chatId: a.chatId, ...docBurst });
+        assert.equal(resumed.fresh, false);
+        assert.equal(resumed.fresh === false && resumed.row.committedAt, null);
+      });
+    });
+
+    test("another chat's row is never touched by a claim", async () => {
+      await withTwoInterviews(async ({ pool, a, b }) => {
+        const inA = await claimInterpretation(pool, { sessionId: a.sessionId, chatId: a.chatId, ...docBurst });
+        await commitRow(pool, inA, { failureReason: "NO_READABLE_DOCUMENT" });
+        const inB = await claimInterpretation(pool, { sessionId: b.sessionId, chatId: b.chatId, ...docBurst });
+        assert.equal(inB.fresh, true);
+        const rowA = await findInterpretation(pool, a.chatId, docBurst.burstKey);
+        assert.equal(rowA?.sessionId, a.sessionId);
+        assert.equal(rowA?.failureReason, "NO_READABLE_DOCUMENT", "chat A's record is exactly as it was");
+      });
+    });
+  });
 });
 
 describe("one writer per session", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABASE_URL" : false }, () => {
@@ -449,6 +576,49 @@ describe("interview session expiry", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATAB
       // A fresh link: a new session on the same chat, expired one left alone.
       await seedInterview(pool, a.chatId);
       assert.equal(await expiredSessionLanguage(pool, a.chatId), null, "the new interview speaks for the chat now");
+    });
+  });
+
+  // #513. A confirmed session also has `expired_at IS NULL`, so it counted as "live"
+  // and an organizer who had ever confirmed a trip in the chat was never told that
+  // a LATER interview had closed: their message fell through to nothing at all.
+  test("AC-7: a confirmed trip earlier in the chat does not hide that a later interview closed", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await pool.query("UPDATE control_plane.intake_sessions SET state='confirmed' WHERE id=$1", [a.sessionId]);
+      assert.equal(await expiredSessionLanguage(pool, a.chatId), null, "a confirmed session alone is not a closed interview");
+
+      const second = await seedInterview(pool, a.chatId);
+      assert.equal(await expiredSessionLanguage(pool, a.chatId), null, "and a live interview after it still speaks for the chat");
+
+      await pool.query("UPDATE control_plane.intake_sessions SET language='he', expired_at = now() WHERE id=$1", [second.sessionId]);
+      assert.equal(await expiredSessionLanguage(pool, a.chatId), "he", "the closed one is reported, in its own language");
+    });
+  });
+
+  test("AC-7: that notice reaches the organizer through the relay's write-after-expiry guard", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await pool.query("UPDATE control_plane.intake_sessions SET state='confirmed' WHERE id=$1", [a.sessionId]);
+      const second = await seedInterview(pool, a.chatId);
+      await pool.query("UPDATE control_plane.intake_sessions SET expired_at = now() WHERE id=$1", [second.sessionId]);
+
+      const sent: { chatId: string; text: string }[] = [];
+      const deps = {
+        db: pool,
+        telegram: { sendMessage: async (p: { chatId: string; text: string }) => { sent.push(p); return { ok: true as const, messageId: "1" }; } },
+        connector: { pushInbound: () => true },
+        log: () => {},
+      } as never;
+      await applyDecision(
+        {
+          kind: "interview_to_gateway",
+          chatId: a.chatId,
+          sessionId: second.sessionId,
+          hadAttachment: false,
+          event: { text: "we also want a day in Nara", message_id: "9001", message_type: "text", source: { chat_id: a.chatId } },
+        } as never,
+        deps,
+      );
+      assert.deepEqual(sent.map((m) => m.text), [uiString("expiredWriteAfter", "en")]);
     });
   });
 

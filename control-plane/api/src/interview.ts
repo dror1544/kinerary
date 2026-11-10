@@ -7,12 +7,13 @@ import { assertCanonicalRecordSafe, UnsafeCanonicalRecordError } from "./canonic
 // fan-out UPDATE has to address the very rows saveConsularContacts writes here —
 // see country-key.ts for what divergence costs.
 import { normaliseCountryKey as normaliseCountry } from "./country-key.js";
-import { consumeEnrollmentInTx } from "./enrollment.js";
-import { isPrivateChatId } from "./identity.js";
-import { linkTelegramOrganizerInTx } from "./organizer-trips.js";
+import { consumeEnrollmentInTx, pausedInterviewSessionId } from "./enrollment.js";
+import { digestTelegramId, isPrivateChatId, type TelegramName } from "./identity.js";
+import { linkTelegramOrganizerInTx, organizerBindingVerdict, tripHasInterviewSession } from "./organizer-trips.js";
 import {
   coerceLanguage,
   DEFAULT_LANGUAGE,
+  knownStopConfirmText,
   optionLabel,
   readableDate,
   recapLabel,
@@ -20,8 +21,10 @@ import {
   type Language,
 } from "./intake-copy.js";
 import { structuredLog } from "./redaction.js";
+import { nativeDestinationFor, parseNativeNames, type NativeNames } from "./native-names.js";
 import { listTripDocuments } from "./document-registry.js";
 import { canonical, entryIdentity, stripVisitMarkers } from "./answer-merge.js";
+import { looksLikeDate, placeYearlessDay, readDayMonth, readFullDate } from "./date-words.js";
 import { applyOps, draftDigest, warningLines, type Line, type Op } from "./typed-changes.js";
 import { listAnswerSources, type SourceDisposition } from "./answer-provenance.js";
 
@@ -298,6 +301,13 @@ export interface IntakeQuestion {
    * when the roster arrives after the name.
    */
   canonicalize?: (answers: AnswerStore) => IntakeAnswer | null;
+  /**
+   * A TEXT question whose answer is a calendar day and is stored as `YYYY-MM-DD`, always. `validateAnswer` reads
+   * what was said with `readFullDate` and stores the ISO day; a value it cannot read - words with no year, a day
+   * that does not exist - is refused, and the question is asked again. The worker reads nothing but ISO, and a
+   * date stored as the organizer's words was built into a trip in the wrong year with no error (2026-11-08).
+   */
+  isDate?: boolean;
   /** Buttons for a TEXT or STRUCTURED question, drawn from what is already recorded. */
   choicesFrom?: (answers: AnswerStore) => RosterChoice[];
   /**
@@ -370,11 +380,81 @@ export function scopeWithChoice(answers: AnswerStore, value: string): Record<str
  * block an interview on a question it has not reached.
  */
 export function datesInOrder(answers: AnswerStore): boolean {
-  const start = answers.departure_date?.kind === "text" ? answers.departure_date.text.trim() : "";
-  const end = answers.return_date?.kind === "text" ? answers.return_date.text.trim() : "";
-  const iso = /^\d{4}-\d{2}-\d{2}$/;
-  if (!iso.test(start) || !iso.test(end)) return true;
+  const start = readFullDate(answers.departure_date?.kind === "text" ? answers.departure_date.text : "");
+  const end = readFullDate(answers.return_date?.kind === "text" ? answers.return_date.text : "");
+  if (start === null || end === null) return true;
   return end >= start;
+}
+
+/**
+ * Whether a stored date answer is a day we can use. A placeholder with no digit and no month word (an old
+ * fixture's "x") is left alone, as it always was; an answer that reads as an attempt at a date but is not one
+ * `readFullDate` can read ("22 בנובמבר" with no year) is NOT settled, so the question is asked again and the
+ * interview cannot be confirmed with it. `validateAnswer` stops new ones; this catches a stored one.
+ */
+function dateSettled(answer: IntakeAnswer | undefined): boolean {
+  if (answer?.kind !== "text") return true;
+  const text = answer.text.trim();
+  return readFullDate(text) !== null || !looksLikeDate(text);
+}
+
+/** The ISO form of a stored date written in words, or null when it is already ISO or cannot be read. */
+function isoDateAnswer(questionId: "departure_date" | "return_date") {
+  return (answers: AnswerStore): IntakeAnswer | null => {
+    const current = answers[questionId];
+    if (current?.kind !== "text") return null;
+    const day = readFullDate(current.text);
+    return day === null || day === current.text ? null : { ...current, text: day };
+  };
+}
+
+/**
+ * What the dashboard's new-trip form wrote on the trip row (`POST /v1/trips`): the values an organizer already
+ * chose before the interview. Any of them may be absent, and the trip types are the DASHBOARD's vocabulary
+ * (`family | couple | group | other`), not the interview's.
+ */
+export interface TripCard {
+  destination: string | null;
+  /** `YYYY-MM-DD` as the `date` column prints it. */
+  startDate: string | null;
+  endDate: string | null;
+  tripType: string | null;
+}
+
+/** The dashboard's trip types the interview has an equivalent for. `group` and `other` are asked (owner decision, 2026-10-30). */
+const CARD_TRIP_TYPES: Readonly<Record<string, string>> = { family: "family", couple: "couple" };
+
+/**
+ * The answers a trip's card already holds, as the interview would have recorded them (#438).
+ *
+ * Each value goes through the SAME `validateAnswer` a typed answer does, so the interview never holds something it
+ * would have refused to be told; one that fails is left out and its question is asked as today. Dates must also be
+ * real days and in order (`datesInOrder`): when they are not, neither is seeded, because there is no telling which
+ * of the two is the mistake. Pure: it reads nothing and writes nothing, so the session start can call it inside
+ * the transaction that already holds the trip row.
+ */
+export function seedAnswersFromCard(card: TripCard): AnswerStore {
+  const seed: AnswerStore = {};
+  const accept = (questionId: string, optionId: string | null, text: string | null) => {
+    const checked = validateAnswer(questionId, optionId, text);
+    if (checked.ok) seed[questionId] = checked.answer;
+  };
+  if (card.destination !== null) accept("destination", null, card.destination);
+  const day = (value: string | null) => (value !== null && /^\d{4}-\d{2}-\d{2}$/.test(value.trim()) && readableDate(value, "en") !== null ? value.trim() : null);
+  const start = day(card.startDate);
+  const end = day(card.endDate);
+  const ordered = start === null || end === null || end >= start;
+  if (ordered && start !== null) accept("departure_date", null, start);
+  if (ordered && end !== null) accept("return_date", null, end);
+  // Own keys only: a card holding "constructor" must not resolve against Object.prototype.
+  const interviewType = card.tripType !== null && Object.hasOwn(CARD_TRIP_TYPES, card.tripType) ? CARD_TRIP_TYPES[card.tripType] : undefined;
+  if (interviewType !== undefined) accept("trip_type", interviewType, null);
+  return seed;
+}
+
+function textAnswer(answers: AnswerStore, questionId: string): string | null {
+  const answer = answers[questionId];
+  return answer?.kind === "text" ? answer.text : null;
 }
 
 /** The organizer's answer against the roster, as the interview and the build both read it. */
@@ -644,6 +724,9 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     prompt: "What day does the trip start?",
     maxLength: 40,
     required: true,
+    isDate: true,
+    satisfiedBy: (answers) => dateSettled(answers.departure_date),
+    canonicalize: isoDateAnswer("departure_date"),
   },
   {
     id: "return_date",
@@ -658,7 +741,9 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     // two together. The recap read "12 July → 1 July" and the interview
     // confirmed. Settled here, so whichever of the two arrives second re-opens
     // the return question, quoting it.
-    satisfiedBy: (answers) => datesInOrder(answers),
+    isDate: true,
+    satisfiedBy: (answers) => dateSettled(answers.return_date) && datesInOrder(answers),
+    canonicalize: isoDateAnswer("return_date"),
   },
   {
     id: "timezone",
@@ -1234,6 +1319,24 @@ export function withoutFlightNumbersAsConfirmations(data: unknown): unknown {
   });
 }
 
+/** A year-less day and month for one of the two trip dates, placed against the other date or today; null if it cannot be. */
+function placedYearlessDay(
+  questionId: string,
+  said: string,
+  context: { answers?: AnswerStore; today?: Date } | undefined,
+): string | null {
+  const dm = readDayMonth(said);
+  if (dm === null) return null;
+  const held = (id: "departure_date" | "return_date"): string | null => {
+    const a = context?.answers?.[id];
+    return a?.kind === "text" ? readFullDate(a.text) : null;
+  };
+  const today = (context?.today ?? new Date()).toISOString().slice(0, 10);
+  if (questionId === "return_date") return placeYearlessDay(dm, held("departure_date") ?? today, "onOrAfter");
+  const returning = held("return_date");
+  return returning !== null ? placeYearlessDay(dm, returning, "onOrBefore") : placeYearlessDay(dm, today, "onOrAfter");
+}
+
 export function validateAnswer(
   questionId: string,
   optionId: string | "other" | null,
@@ -1241,6 +1344,8 @@ export function validateAnswer(
   questions: readonly IntakeQuestion[] = INTAKE_QUESTIONS,
   structuredData?: unknown,
   optionIds?: readonly string[],
+  /** What a year-less date is placed against: the answers on record, and today (default: the clock). */
+  context?: { answers?: AnswerStore; today?: Date },
 ): AnswerValidationResult {
   const question = questions.find((q) => q.id === questionId);
   if (!question) return { ok: false, reason: "UNKNOWN_QUESTION" };
@@ -1308,6 +1413,24 @@ export function validateAnswer(
   if (question.required && trimmed.length === 0) return { ok: false, reason: "TEXT_REQUIRED" };
   const max = question.maxLength ?? 500;
   if (trimmed.length > max) return { ok: false, reason: "TEXT_TOO_LONG" };
+  if (question.isDate && trimmed.length > 0) {
+    // ONE place, every writer: a model proposal, a typed correction, a document, the agent's tool and the card seed
+    // all arrive here, so none can store a day as words.
+    //
+    // A day and month with no year is PLACED, not refused: organizers say dates however they like and the interview
+    // confirms its reading back in words. The return is the first such day on or after the held departure, the
+    // departure the last on or before the held return, else the first on or after today.
+    const day = readFullDate(trimmed) ?? placedYearlessDay(question.id, trimmed, context);
+    if (day === null) {
+      return {
+        ok: false,
+        reason: "INCOMPLETE_ANSWER",
+        detail: `${question.id} must be one real day, written YYYY-MM-DD (got ${JSON.stringify(trimmed.slice(0, 40))}). ` +
+          "Work the day out from the dates already on record, or ask for the day and month - never store it as it was written.",
+      };
+    }
+    return { ok: true, answer: { kind: "text", schema_version: INTAKE_SCHEMA_VERSION, text: day } };
+  }
   return {
     ok: true,
     answer: { kind: "text", schema_version: INTAKE_SCHEMA_VERSION, text: trimmed },
@@ -1519,19 +1642,48 @@ export async function claimExpiredSessions(db: pg.Pool, limit = 10): Promise<Exp
  * whole interview was in Hebrew, is its own small insult.
  */
 export async function expiredSessionLanguage(db: pg.Pool, chatId: string): Promise<Language | null> {
+  return (await expiredSessionNotice(db, chatId))?.language ?? null;
+}
+
+/**
+ * `expiredSessionLanguage`, and whether the person this closed interview belongs to has a dashboard (#513, AC-7).
+ *
+ * The notice sent to someone who writes into a closed interview has to point at the one door that opens it. For an
+ * organizer with a dashboard that is the trip's page there ("get a new interview link"); for a trip made by Telegram
+ * signup or an operator's invitation there is no page, and the door is whoever set the trip up. `dashboard` is read
+ * from the closed session's own trip and user -- the owner membership that carries `dashboard_access` -- never from
+ * anything the chat says.
+ */
+export async function expiredSessionNotice(
+  db: pg.Pool,
+  chatId: string,
+): Promise<{ language: Language; dashboard: boolean } | null> {
   // The NOT EXISTS is load-bearing, and getting it wrong locks people out: a
   // new deep link creates a NEW session and leaves the expired one where it
   // is, so a query that only asks "is there an expired session here" would
   // answer yes forever and refuse every message of the replacement interview.
   // An expired session only speaks for a chat that has nothing live on it.
-  const rows = await db.query<{ language: Language }>(
-    `SELECT s.language
+  //
+  // "Live" is not just `expired_at IS NULL`: a CONFIRMED session never expires
+  // (`claimExpiredSessions` skips it), so it has `expired_at IS NULL` forever,
+  // and counting it as live meant an organizer who had ever confirmed a trip in
+  // this chat was never told that a later interview had closed (#513). A
+  // confirmed session does not answer for the chat -- every reader of the live
+  // session filters `state <> 'confirmed'` the same way.
+  const rows = await db.query<{ language: Language; dashboard: boolean }>(
+    `SELECT s.language,
+            EXISTS (
+              SELECT 1 FROM control_plane.trip_memberships m
+                JOIN control_plane.users u ON u.id = m.user_id
+               WHERE m.trip_id = s.trip_id AND m.user_id = s.user_id
+                 AND m.role = 'owner' AND m.status = 'active' AND m.dashboard_access = true AND u.status = 'active'
+            ) AS dashboard
        FROM control_plane.intake_sessions s
       WHERE s.telegram_chat_id = $1
         AND s.expired_at IS NOT NULL
         AND NOT EXISTS (
           SELECT 1 FROM control_plane.intake_sessions live
-           WHERE live.telegram_chat_id = $1 AND live.expired_at IS NULL
+           WHERE live.telegram_chat_id = $1 AND live.expired_at IS NULL AND live.state <> 'confirmed'
         )
       ORDER BY s.expired_at DESC LIMIT 1`,
     [chatId],
@@ -1544,7 +1696,7 @@ export async function expiredSessionLanguage(db: pg.Pool, chatId: string): Promi
   // unknown", and the caller reads null as the first: the guard would never
   // fire for exactly the sessions most likely to hit it. Found by the test,
   // not by reading the code.
-  return row.language ?? DEFAULT_LANGUAGE;
+  return { language: row.language ?? DEFAULT_LANGUAGE, dashboard: row.dashboard === true };
 }
 
 export function interpretPathDefault(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -1789,6 +1941,8 @@ export interface SessionView {
   pendingAskText: string | null;
   /** What the router last sent, so it does not send it twice running. */
   lastPrompt: string | null;
+  /** The document recap the organizer has just read, if their next message is still about it (#413). */
+  recapMarker?: string | null;
   /**
    * Option ids currently selected per multi-select question.
    *
@@ -1799,6 +1953,8 @@ export interface SessionView {
   selections: Record<string, string[]>;
   /** Document answers waiting on "is this right?", by question id. */
   suggestions: Record<string, SuggestedAnswer>;
+  /** The stops were declined as "the only stop" (#438, AC-12): asked as an open question, not for the place and dates again. */
+  stopsAskedFromKnown?: boolean;
   /** Buttons for text questions drawn from the record (the roster, for the organizer), by question id. */
   choices?: Record<string, RosterChoice[]>;
   /** What a question is about right now ("gluten-free"), by question id. See `subjectFrom`. */
@@ -1922,6 +2078,19 @@ export interface InterviewUiState {
    */
   readingDocumentSince?: string;
   /**
+   * "The document recap is what they have just read" (#413).
+   *
+   * `say()` sets no `lastPrompt`, so after a document burst the only thing on
+   * record as on screen is the NEXT question the router put under the recap —
+   * `bot_name`, say — and the organizer's reply to the recap was read as the
+   * answer to that. This marks the recap: `recap:doc:<interpretation id>`, and
+   * `recap:doc:<id>:asked` once the router has asked a clarifying question about
+   * it. Alive for the next ONE inbound message (the router clears it the moment
+   * it reads that message), or the next tap on an answer; never a state the
+   * interview resumes from. Lives here, beside `lastPrompt`, not in a column.
+   */
+  recapMarker?: string;
+  /**
    * The optional question the interviewer has asked the router to put next.
    *
    * Optional questions are not walked automatically when an interviewer is
@@ -1991,6 +2160,33 @@ export interface InterviewUiState {
    * other way drops it.
    */
   suggestions?: Record<string, SuggestedAnswer>;
+  /**
+   * The name the opening greeted the organizer by -- the account's own name, else the Telegram first name -- kept
+   * ONLY on a session that was seeded from a dashboard trip (#438). It is display data, read once more when the
+   * roster is known: if it names exactly one traveller, "which of them are you?" is asked as a one-tap confirm
+   * (`organizerNameSuggestion`). Never an identity fact: the tap writes the roster's spelling, the name writes nothing.
+   */
+  organizerName?: string;
+  /** The organizer said "no" to the confirm above: `organizer_identity` is asked plainly from here on. */
+  organizerNameDeclined?: boolean;
+  /**
+   * The organizer said "no" to "is that the only stop?" (#438, AC-12), or declined a document's reading of the stops:
+   * `phases` is asked as an open question from here on, and the confirm built from the destination and dates (derived,
+   * never stored, like the organizer-name confirm) does not come back.
+   */
+  knownStopDeclined?: boolean;
+  /**
+   * The organizer's name and the destination in the interview's own language, made ONCE when the session started
+   * (#438, AC-14; `native-names.ts`), each next to the English it came from. The stops confirm and the stop it records
+   * read it and never ask a model again. Display data only: the destination ANSWER stays the English as entered.
+   */
+  nativeNames?: NativeNames;
+  /**
+   * This session started on a paused trip whose earlier answers were NOT handed to it (#513: a link opened from a chat
+   * that was not the interview's). When it closes it must not become the session a later link resumes from; only the
+   * chat it ran in may resume it. Never carried to a successor.
+   */
+  notResumable?: boolean;
 }
 
 /** A suggested answer, in the shape `submitAnswerForChat` takes. */
@@ -1999,6 +2195,13 @@ export interface SuggestedAnswer {
   otherText?: string;
   structuredData?: unknown;
   optionIds?: string[];
+  /**
+   * Where it came from, when not a document: `account_name` is the organizer's own name matched against the roster,
+   * which the router words as "you're Dana on the list, right?" rather than "I read this from your document".
+   * `known_place`: the destination and dates already on record as one stop (#438, AC-12), worded "you're going to
+   * Gatecity, 14 November – 21 November. Is that the only stop?".
+   */
+  source?: "account_name" | "known_place";
 }
 
 function parseSuggestions(raw: unknown): Record<string, SuggestedAnswer> | undefined {
@@ -2013,15 +2216,21 @@ function parseSuggestions(raw: unknown): Record<string, SuggestedAnswer> | undef
       ...(typeof v.otherText === "string" ? { otherText: v.otherText } : {}),
       ...(v.structuredData !== undefined ? { structuredData: v.structuredData } : {}),
       ...(Array.isArray(v.optionIds) ? { optionIds: v.optionIds.filter((id): id is string => typeof id === "string") } : {}),
+      ...(v.source === "account_name" || v.source === "known_place" ? { source: v.source } : {}),
     };
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
 function withoutSuggestion(ui: InterviewUiState, questionId: string): InterviewUiState {
-  if (!ui.suggestions?.[questionId]) return ui;
-  const { [questionId]: _dropped, ...rest } = ui.suggestions;
-  const { suggestions: _all, ...others } = ui;
+  // The organizer's-name confirm is derived from `organizerName` on every read, not stored, so a "no" has to be a
+  // fact of its own or the offer would come straight back.
+  // The same for the stops confirm built from the destination and dates (AC-12).
+  const afterName: InterviewUiState = questionId === "organizer_identity" && ui.organizerName ? { ...ui, organizerNameDeclined: true } : ui;
+  const declined: InterviewUiState = questionId === "phases" ? { ...afterName, knownStopDeclined: true } : afterName;
+  if (!declined.suggestions?.[questionId]) return declined;
+  const { [questionId]: _dropped, ...rest } = declined.suggestions;
+  const { suggestions: _all, ...others } = declined;
   return Object.keys(rest).length > 0 ? { ...others, suggestions: rest } : others;
 }
 
@@ -2060,6 +2269,12 @@ function parseUiState(raw: unknown): InterviewUiState {
     ...(typeof record.other_pending === "string" ? { otherPending: record.other_pending } : {}),
     ...((suggestions) => (suggestions ? { suggestions } : {}))(parseSuggestions(record.suggestions)),
     ...(typeof record.reading_document_since === "string" ? { readingDocumentSince: record.reading_document_since } : {}),
+    ...(typeof record.recap_marker === "string" && DOCUMENT_RECAP_MARKER.test(record.recap_marker) ? { recapMarker: record.recap_marker } : {}),
+    ...(typeof record.organizer_name === "string" && record.organizer_name.length > 0 ? { organizerName: record.organizer_name } : {}),
+    ...(record.organizer_name_declined === true ? { organizerNameDeclined: true } : {}),
+    ...(record.known_stop_declined === true ? { knownStopDeclined: true } : {}),
+    ...((native) => (native ? { nativeNames: native } : {}))(parseNativeNames(record.native_names)),
+    ...(record.not_resumable === true ? { notResumable: true } : {}),
   };
 }
 
@@ -2081,7 +2296,55 @@ function serializeUiState(ui: InterviewUiState): string {
     ...(ui.otherPending ? { other_pending: ui.otherPending } : {}),
     ...(ui.suggestions && Object.keys(ui.suggestions).length > 0 ? { suggestions: ui.suggestions } : {}),
     ...(ui.readingDocumentSince ? { reading_document_since: ui.readingDocumentSince } : {}),
+    ...(ui.recapMarker ? { recap_marker: ui.recapMarker } : {}),
+    ...(ui.organizerName ? { organizer_name: ui.organizerName } : {}),
+    ...(ui.organizerNameDeclined ? { organizer_name_declined: true } : {}),
+    ...(ui.knownStopDeclined ? { known_stop_declined: true } : {}),
+    ...(ui.nativeNames ? { native_names: ui.nativeNames } : {}),
+    ...(ui.notResumable ? { not_resumable: true } : {}),
   });
+}
+
+/**
+ * What a resumed interview (#513) takes from the closed session's `ui_state`: the organizer's own decisions, and
+ * nothing that was only on screen. The rule is "nothing already answered is asked again", so a fact belongs here when
+ * dropping it would put a question the organizer had settled back in front of them.
+ *
+ * CARRIED -- each is the organizer's word, or a record that a question was put to them:
+ *   organizerName          the name the opening greeted them by; read again when the roster is known
+ *   organizerNameDeclined  they said "no" to "which of them are you?": asked plainly from here on, not re-offered
+ *   knownStopDeclined      they said "no" to "is that the only stop?": `phases` stays an open question
+ *   nativeNames            the name and destination in the interview's language, made once (display data, keyed by source)
+ *   skipped                optional questions they declined (final)
+ *   finishRequested        "that's everything": the summary, not the optional walk, is where they stopped
+ *   offeredMore            "essentials done: more, or the summary?" was already put to them
+ *   flightsAsked           typed flights already asked about ("once is enough")
+ *   typedFlights           the flights they typed, which `flightsAsked` is a record about
+ *   multiPending           a multi-select they were still ticking: its stored selection is NOT an answer until Done
+ *
+ * NOT CARRIED -- on screen, in flight, or derived per read; each would assert something that is no longer true:
+ *   lastPrompt, pendingEntry, pendingAsk, pendingAskText, pendingSay   what was on screen / owed at the moment of
+ *     closing; carrying `lastPrompt` would make the router believe the question is still on their screen and say nothing
+ *   suggestions            built from documents and the roster per read; a stale confirm would be asked against old data
+ *   recapMarker            "the recap is what they just read": alive for one message, never a state to resume from
+ *   otherPending           an Other button tapped before the pause; its next message is long gone
+ *   readingDocumentSince   a read that was running when the session closed is not running now
+ *   deferred               required questions stepped aside to stop repeating; after a pause they are simply asked
+ *   openingDone            set by the caller: the opening is over by definition
+ */
+function carriedUiState(ui: InterviewUiState): InterviewUiState {
+  return {
+    ...(ui.organizerName ? { organizerName: ui.organizerName } : {}),
+    ...(ui.organizerNameDeclined ? { organizerNameDeclined: true } : {}),
+    ...(ui.knownStopDeclined ? { knownStopDeclined: true } : {}),
+    ...(ui.nativeNames ? { nativeNames: ui.nativeNames } : {}),
+    ...(ui.skipped && ui.skipped.length > 0 ? { skipped: ui.skipped } : {}),
+    ...(ui.finishRequested ? { finishRequested: true } : {}),
+    ...(ui.offeredMore ? { offeredMore: true } : {}),
+    ...(ui.flightsAsked && ui.flightsAsked.length > 0 ? { flightsAsked: ui.flightsAsked } : {}),
+    ...(ui.typedFlights && ui.typedFlights.length > 0 ? { typedFlights: ui.typedFlights } : {}),
+    ...(ui.multiPending ? { multiPending: ui.multiPending } : {}),
+  };
 }
 
 function isSkipped(ui: InterviewUiState, questionId: string): boolean {
@@ -2518,9 +2781,43 @@ function deriveSessionState(
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
+/**
+ * What a seeded session starts from, for the opening to say (#438): the card's destination and dates that were
+ * actually seeded (never a value the interview refused), and the name to greet the organizer by. `null` is
+ * "not seeded", and the opening then leaves that part out.
+ */
+export interface SeededOpening {
+  destination: string | null;
+  /** `YYYY-MM-DD`; the opening renders it in words. */
+  departureDate: string | null;
+  returnDate: string | null;
+  organizerName: string | null;
+}
+
 export type StartSessionResult =
-  | { ok: true; sessionId: string; sessionToken: string; view: SessionView }
-  | { ok: false; reason: "INVALID_TOKEN" | "EXPIRED" | "ALREADY_CONSUMED" | "REVOKED" | "TRIP_NOT_DRAFT" };
+  | {
+      ok: true;
+      sessionId: string;
+      sessionToken: string;
+      view: SessionView;
+      /** Set only when the trip's card seeded the destination or the dates; absent for every other trip. */
+      seeded?: SeededOpening;
+      /**
+       * Set when this session picks up a PAUSED one (#513): it holds the earlier session's answers, and its opening
+       * is "welcome back" rather than the introduction. Never set together with `seeded`.
+       */
+      resumed?: { fromSessionId: string };
+    }
+  | { ok: false; reason: "INVALID_TOKEN" | "EXPIRED" | "ALREADY_CONSUMED" | "REVOKED" | "TRIP_NOT_DRAFT" }
+  /**
+   * The link is valid, but the Telegram account that opened it is not the one the organizer is bound to (#519). NOTHING
+   * was consumed, created or linked: the transaction was rolled back, so the link is still the organizer's. The caller
+   * (chat-router.ts `startFromDeepLink`) decides what to say, and to whom; the ids are for it and never for a message.
+   * `started`: an interview already exists for the trip, so there is nothing for the organizer to approve.
+   */
+  | { ok: false; reason: "OTHER_TELEGRAM_ACCOUNT"; enrollmentId: string; tripId: string; userId: string; started: boolean }
+  /** The approved replacement could not be applied: an interview has been started since, or the pair was Unlinked (AC-10). */
+  | { ok: false; reason: "REPLACEMENT_NOT_APPLICABLE" };
 
 export type GetSessionResult =
   | { ok: true; view: SessionView }
@@ -2608,6 +2905,8 @@ export async function startSession(
   telegramChatIdHint?: string,
   verifiedTelegramChatId?: string,
   languageHint?: string,
+  /** First name and @username of the Telegram account, from the update's verified `from` (display data only). */
+  telegramName?: TelegramName | null,
 ): Promise<StartSessionResult> {
   const client = await db.connect();
   try {
@@ -2619,17 +2918,145 @@ export async function startSession(
       return { ok: false, reason: "INVALID_TOKEN" };
     }
 
+    const started = await startSessionInTx(client, enrollment, {
+      telegramChatIdHint, verifiedTelegramChatId, languageHint, telegramName,
+    });
+    // A refusal rolls the consumption back with it: the link is NOT spent by a start that did not happen, which is
+    // what leaves a link opened by the wrong Telegram account (#519) usable by the right one.
+    if (!started.result.ok) {
+      await client.query("ROLLBACK");
+      return started.result;
+    }
+    await client.query("COMMIT");
+    for (const line of started.logs) log(line);
+    return started.result;
+  } catch (error) {
+    try { await client.query("ROLLBACK"); } catch { /* ignore */ }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Everything `startSession` does once the enrollment is held, inside the CALLER's transaction: the caller consumed the
+ * enrollment (by token, or -- for an approved replacement -- by id), and commits or rolls back on the result. Log lines
+ * are returned, not written, so none is emitted for a start that is then rolled back.
+ *
+ * `approvedReplacement` is the one way past the question "is this the Telegram account the organizer is bound to?":
+ * the bound account itself answered it (organizer-link-approval.ts), so it is not asked again, and instead the trip must
+ * still have no interview, and the replacement's own link must not be one the owner Unlinked.
+ */
+export async function startSessionInTx(
+  client: pg.PoolClient,
+  enrollment: { enrollmentId: string; tripId: string; userId: string },
+  input: {
+    telegramChatIdHint?: string;
+    verifiedTelegramChatId?: string;
+    languageHint?: string;
+    telegramName?: TelegramName | null;
+    approvedReplacement?: boolean;
+  },
+): Promise<{ result: StartSessionResult; logs: string[] }> {
+  const { telegramChatIdHint, verifiedTelegramChatId, languageHint, telegramName } = input;
+  const logs: string[] = [];
+  const log = (line: string) => { logs.push(line); };
+  const refuse = (result: StartSessionResult) => ({ result, logs });
+  {
     // Verify the trip is still in 'draft' (enrollment could be issued and
     // the trip could have moved if something went wrong on a prior attempt).
-    const tripRow = await client.query<{ lifecycle_state: string }>(
-      "SELECT lifecycle_state FROM control_plane.trips WHERE id = $1 FOR UPDATE",
+    // The card (what the dashboard's new-trip form wrote) is read in the same statement that locks the row, so the
+    // seed below can never come from a different moment than the lifecycle check beside it. `::text` because the
+    // driver would otherwise turn a `date` into a JS Date in the server's time zone.
+    const tripRow = await client.query<{
+      lifecycle_state: string;
+      destination_label: string | null;
+      start_date: string | null;
+      end_date: string | null;
+      trip_type: string | null;
+    }>(
+      `SELECT lifecycle_state, destination_label, start_date::text AS start_date, end_date::text AS end_date, trip_type
+         FROM control_plane.trips WHERE id = $1 FOR UPDATE`,
       [enrollment.tripId],
     );
     const [trip] = tripRow.rows;
-    if (!trip || trip.lifecycle_state !== "draft") {
-      await client.query("ROLLBACK");
-      return { ok: false, reason: "TRIP_NOT_DRAFT" };
+    // ONE ORGANIZER, ONE TELEGRAM (#519). Asked FIRST, under the trip lock just taken, and before the lifecycle question
+    // below: a link forwarded to a stranger on a trip whose interview is already running is a valid link that must say
+    // "this belongs to another organizer", not the "bad link" a non-draft trip answers. The only input about the person
+    // is the router's verified private chat id -- no message, no token field. No chat id at all (the HTTP and MCP
+    // routes, which never learn a Telegram identity and write no organizer link) leaves nothing to compare.
+    const redeemingTelegram = verifiedTelegramChatId && isPrivateChatId(verifiedTelegramChatId) ? verifiedTelegramChatId : null;
+    if (trip && redeemingTelegram && !input.approvedReplacement) {
+      const verdict = await organizerBindingVerdict(client, { userId: enrollment.userId, tripId: enrollment.tripId, telegramUserId: redeemingTelegram });
+      if (verdict.kind === "other_account") {
+        return refuse({
+          ok: false, reason: "OTHER_TELEGRAM_ACCOUNT",
+          enrollmentId: enrollment.enrollmentId, tripId: enrollment.tripId, userId: enrollment.userId, started: verdict.started,
+        });
+      }
     }
+    if (trip && input.approvedReplacement && (await tripHasInterviewSession(client, enrollment.tripId))) {
+      return refuse({ ok: false, reason: "REPLACEMENT_NOT_APPLICABLE" });
+    }
+    // A draft starts an interview; so does a trip whose interview is PAUSED (#513) -- `intake_in_progress` with its
+    // latest session closed for idleness and nothing live or confirmed beside it. The pause is read under the trip
+    // lock just taken, so two links redeemed at once cannot both resume it: the second finds a live session.
+    const pausedId = trip && (trip.lifecycle_state === "draft" || trip.lifecycle_state === "intake_in_progress")
+      ? await pausedInterviewSessionId(client, enrollment.tripId)
+      : null;
+    if (!trip || !(trip.lifecycle_state === "draft" || (trip.lifecycle_state === "intake_in_progress" && pausedId !== null))) {
+      return refuse({ ok: false, reason: "TRIP_NOT_DRAFT" });
+    }
+    // WHOSE ANSWERS THESE ARE. The paused interview is the owner's, and a link can be forwarded: whoever opens it
+    // would otherwise be handed the travellers, the dietary needs and the flights, and a summary built from them.
+    // The trip may be resumed by anyone the link reaches only in the sense that a session starts; the answers are
+    // carried only to the person who gave them -- the session's own user, redeeming from the chat that interview ran
+    // in, or from a Telegram account already linked to this trip for this user BEFORE this redemption (the link row
+    // for this redemption is written further down, so it cannot vouch for itself). Otherwise the session starts
+    // fresh, from the card, with the ordinary opening. The pause itself stays a per-trip fact (`pausedId`).
+    let resumeDeclined: "NOT_THE_SESSION_USER" | "CHAT_NOT_THE_OWNERS" | null = null;
+    //
+    // WHICH session is carried is therefore this redeemer's, not simply the trip's latest: a start that was declined
+    // (a forwarded link) is itself a closed session of the same user, newer than the owner's, and must not become the
+    // thing the owner resumes from. Such a session is marked `notResumable`; only the chat it ran in may resume it.
+    let prior: { id: string; answers: AnswerStore; ui_state: unknown; language: string | null; source_document: unknown } | null = null;
+    if (pausedId) {
+      const candidates = (await client.query<{
+        id: string; answers: AnswerStore; ui_state: unknown; language: string | null; source_document: unknown; telegram_chat_id: string | null;
+      }>(
+        `SELECT id, answers, ui_state, language, source_document, telegram_chat_id FROM control_plane.intake_sessions
+          WHERE trip_id = $1 AND user_id = $2 AND state <> 'confirmed' AND expired_at IS NOT NULL
+          ORDER BY expired_at DESC, created_at DESC`,
+        [enrollment.tripId, enrollment.userId],
+      )).rows;
+      const redeemingChat = verifiedTelegramChatId && isPrivateChatId(verifiedTelegramChatId) ? verifiedTelegramChatId : null;
+      if (candidates.length === 0) {
+        resumeDeclined = "NOT_THE_SESSION_USER";
+      } else if (!redeemingChat) {
+        // No verified chat (the HTTP/MCP path): nothing proves who is asking.
+        resumeDeclined = "CHAT_NOT_THE_OWNERS";
+      } else {
+        const linked = (await client.query(
+          `SELECT 1 FROM control_plane.telegram_organizer_trip_links
+            WHERE telegram_subject_digest = $1 AND user_id = $2 AND trip_id = $3 AND revoked_at IS NULL LIMIT 1`,
+          [digestTelegramId(redeemingChat), enrollment.userId, enrollment.tripId],
+        )).rowCount;
+        // A declined start is its own chat's, and only until that chat is itself vouched for as the trip's organizer:
+        // from then on the redeemer is entitled to the owner's real session, which a declined one would otherwise shadow.
+        prior = candidates.find((c) => parseUiState(c.ui_state).notResumable
+          ? c.telegram_chat_id === redeemingChat && !linked
+          : c.telegram_chat_id === redeemingChat || linked) ?? null;
+        if (!prior) resumeDeclined = "CHAT_NOT_THE_OWNERS";
+      }
+    }
+    const cardSeed = seedAnswersFromCard({
+      destination: trip.destination_label, startDate: trip.start_date, endDate: trip.end_date, tripType: trip.trip_type,
+    });
+    // The card seeds only what is still unanswered: a carried answer is the organizer's own and is never overwritten
+    // by the card (#438 AC-4 still holds, and so does #513 AC-5). Own keys, so "constructor" is not an answer.
+    const carriedAnswers: AnswerStore = prior?.answers && typeof prior.answers === "object" ? prior.answers : {};
+    const seed: AnswerStore = Object.fromEntries(Object.entries(cardSeed).filter(([questionId]) => !Object.hasOwn(carriedAnswers, questionId)));
+    const seededIds = Object.keys(seed);
 
     // Transition trip to 'intake_in_progress'.
     await client.query(
@@ -2669,13 +3096,62 @@ export async function startSession(
     // A hint, not a decision. It is the phone's setting rather than what the
     // organizer is actually writing, so `setLanguageForChat` overrides it the
     // moment the interviewer reports what they really typed.
-    const language = coerceLanguage(languageHint);
+    // A resumed interview speaks the language the closed one was held in: the phone's setting is a guess, and the
+    // organizer has already shown what they actually write.
+    const language = (prior ? coerceLanguage(prior.language) : null) ?? coerceLanguage(languageHint);
+
+    // The name the opening greets the organizer by (#438): the name they gave the product (`users.given_name`), and
+    // only when the account has none, the first name of the Telegram account that opened the link. NEVER
+    // `users.display_name`: for a Telegram signup or an invitation that is the local part of an email address, and
+    // `introductionReturning` already records why that is not a thing to greet someone with. Looked up only for a
+    // seeded session -- a trip with no card opens exactly as it always has.
+    let organizerName: string | null = null;
+    if (seededIds.length > 0) {
+      const named = await client.query<{ given_name: string | null }>(
+        "SELECT given_name FROM control_plane.users WHERE id = $1",
+        [enrollment.userId],
+      );
+      organizerName = named.rows[0]?.given_name?.trim() || telegramName?.firstName?.trim() || null;
+    }
+    const carriedUi = prior ? carriedUiState(parseUiState(prior.ui_state)) : {};
+    const uiState: InterviewUiState = {
+      ...carriedUi,
+      ...(organizerName && !carriedUi.organizerName ? { organizerName } : {}),
+      // The opening of a resumed interview is over before it begins: the document offer is not made twice.
+      ...(prior ? { openingDone: true } : {}),
+      // A start the owner's answers were withheld from: when it closes it is not where the owner resumes from.
+      ...(resumeDeclined ? { notResumable: true } : {}),
+      // A start the owner's answers were withheld from: when it closes it is not where the owner resumes from.
+    };
+    const answers: AnswerStore = { ...seed, ...carriedAnswers };
+    // Where the interview stands, derived from what it now holds -- the same fixpoint `advancePhaseForChat` runs. A
+    // fresh session is `opening`, as always; a resumed one lands on its first unanswered question (or the summary).
+    let phase: InterviewPhase = "opening";
+    if (prior) {
+      for (let step = 0; step < INTERVIEW_PHASES.length; step += 1) {
+        const next = nextPhase(phase, answers, INTAKE_QUESTIONS, uiState);
+        if (next === phase) break;
+        phase = next;
+      }
+    }
+    const storedState = stateForPhase(phase);
 
     await client.query(
       `INSERT INTO control_plane.intake_sessions
-         (id, trip_id, user_id, enrollment_id, session_token_digest, state, answers, telegram_chat_id, language, interpret_path)
-       VALUES ($1, $2, $3, $4, $5, 'interviewing', '{}'::jsonb, $6, $7, $8)`,
-      [sessionId, enrollment.tripId, enrollment.userId, enrollment.enrollmentId, digest, chatId, language, interpretPathDefault()],
+         (id, trip_id, user_id, enrollment_id, session_token_digest, state, answers, telegram_chat_id, language, interpret_path, ui_state,
+          phase, awaiting, source_document, router_prompt_due_at)
+       VALUES ($1, $2, $3, $4, $5, $11, $9::jsonb, $6, $7, $8, $10::jsonb,
+               $12, $13, $14::jsonb, CASE WHEN $15::boolean THEN now() ELSE NULL END)`,
+      [
+        sessionId, enrollment.tripId, enrollment.userId, enrollment.enrollmentId, digest, chatId, language, interpretPathDefault(),
+        JSON.stringify(answers), serializeUiState(uiState),
+        storedState, phase,
+        // A resumed session owes its organizer the next question, so the floor is the machine's and the router's
+        // prompt is due: what they are sent first is the one-line welcome back, and the question follows it.
+        prior ? "machine" : "person",
+        prior?.source_document ? JSON.stringify(prior.source_document) : null,
+        Boolean(prior),
+      ],
     );
 
     // The one moment both halves of "this Telegram person is this user" are
@@ -2685,43 +3161,86 @@ export async function startSession(
     // binding above is — a link recorded for a session that then failed to
     // commit would claim an ownership nothing else agrees with.
     //
-    // This is what lets /trips and /switch exist at all; see
-    // organizer-trips.ts. It is NOT an authentication path and grants no web
-    // session — Telegram SSO stays retired (/v1/auth/telegram answers 410).
+    // This is what lets /trips and /switch exist at all, and the Mini App sign
+    // in for THIS trip; see organizer-trips.ts. The link is per trip, so
+    // unlinking it later leaves the organizer's other trips alone. It grants no
+    // web session by itself — the Mini App exchange does, from verified
+    // initData (telegram-mini-app.ts); /v1/auth/telegram stays retired (410).
     if (chatId) {
-      await linkTelegramOrganizerInTx(client, chatId, enrollment.userId);
+      const written = await linkTelegramOrganizerInTx(client, chatId, enrollment.userId, enrollment.tripId, "enrollment_redemption", telegramName ?? null, input.approvedReplacement ? "trip" : "account");
+      // AC-10: an Unlinked pair is never re-bound by a replacement, approved or not. A plain redemption by the bound
+      // account keeps what it always did (the interview starts, the link stays revoked); a replacement exists FOR the
+      // link, so without it there is nothing to apply and the whole transaction is the caller's to roll back.
+      if (written === "revoked_pair" && input.approvedReplacement) return refuse({ ok: false, reason: "REPLACEMENT_NOT_APPLICABLE" });
     }
 
-    await client.query("COMMIT");
-
     log(structuredLog("info", "interview.session_started", { session_id: sessionId, trip_id: enrollment.tripId }));
+    if (resumeDeclined) {
+      // The reason only: no answer, name or chat id.
+      log(structuredLog("info", "interview.resume_declined", { session_id: sessionId, trip_id: enrollment.tripId, reason: resumeDeclined }));
+    }
+    if (prior && pausedId) {
+      // Question ids only, as with the seed: what was carried is the organizer's, and a log line is not.
+      log(structuredLog("info", "interview.session_resumed", {
+        session_id: sessionId, trip_id: enrollment.tripId, from_session_id: prior.id,
+        carried: Object.keys(carriedAnswers), phase,
+      }));
+    }
+    // Question ids only: the values are the organizer's trip and the name is theirs, and a log line is neither.
+    if (seededIds.length > 0) {
+      log(structuredLog("info", "interview.session_seeded", { session_id: sessionId, trip_id: enrollment.tripId, seeded: seededIds }));
+    }
+    // The other half of the same fact, so a card whose values were NOT taken is not invisible: a destination or a
+    // date the card holds that the interview refused is asked as today, and this line says it was. (A `group` or
+    // `other` trip type is a decision, not a refusal, and is not listed.) Question ids only.
+    // Measured against the card's own seed, not the one left after a carried answer took its place: an answer the
+    // organizer already gave is not a refusal.
+    const refused = [
+      trip.destination_label !== null && cardSeed.destination === undefined ? "destination" : null,
+      trip.start_date !== null && cardSeed.departure_date === undefined ? "departure_date" : null,
+      trip.end_date !== null && cardSeed.return_date === undefined ? "return_date" : null,
+    ].filter((id): id is string => id !== null);
+    if (refused.length > 0) {
+      log(structuredLog("warn", "interview.session_seed_skipped", { session_id: sessionId, trip_id: enrollment.tripId, skipped: refused }));
+    }
 
-    const view: SessionView = {
-      sessionId,
-      tripId: enrollment.tripId,
-      state: "interviewing",
-      nextQuestion: INTAKE_QUESTIONS.find((q) => q.required) ?? null,
-      pendingAsk: null,
-      optionalRemaining: unansweredOptionalQuestions({}, INTAKE_QUESTIONS),
-      recap: null,
-      selections: {},
-      language: language ?? DEFAULT_LANGUAGE,
-      offeredMore: false,
-      lastPrompt: null,
-      phase: "opening",
-      awaiting: "person",
-      pendingEntry: null,
-      pendingSay: null,
-      pendingAskText: null,
-      suggestions: {},
-      otherPending: null,
-    };
-    return { ok: true, sessionId, sessionToken: rawSessionToken, view };
-  } catch (error) {
-    try { await client.query("ROLLBACK"); } catch { /* ignore */ }
-    throw error;
-  } finally {
-    client.release();
+    // Built from the answers the session now holds, so "the first question" is the first one still OPEN. For a trip
+    // with no card that is exactly the first required question, as before.
+    const view: SessionView = prior
+      ? buildSessionView(sessionId, enrollment.tripId, storedState, answers, uiState, language ?? DEFAULT_LANGUAGE, phase, "machine")
+      : seededIds.length === 0
+      ? {
+          sessionId,
+          tripId: enrollment.tripId,
+          state: "interviewing",
+          nextQuestion: INTAKE_QUESTIONS.find((q) => q.required) ?? null,
+          pendingAsk: null,
+          optionalRemaining: unansweredOptionalQuestions({}, INTAKE_QUESTIONS),
+          recap: null,
+          selections: {},
+          language: language ?? DEFAULT_LANGUAGE,
+          offeredMore: false,
+          lastPrompt: null,
+          phase: "opening",
+          awaiting: "person",
+          pendingEntry: null,
+          pendingSay: null,
+          pendingAskText: null,
+          suggestions: {},
+          otherPending: null,
+        }
+      : buildSessionView(sessionId, enrollment.tripId, "interviewing", seed, uiState, language ?? DEFAULT_LANGUAGE, "opening", "person");
+    const opening =
+      seed.destination !== undefined || seed.departure_date !== undefined || seed.return_date !== undefined
+        ? {
+            destination: textAnswer(seed, "destination"),
+            departureDate: textAnswer(seed, "departure_date"),
+            returnDate: textAnswer(seed, "return_date"),
+            organizerName,
+          }
+        : undefined;
+    if (prior && pausedId) return { result: { ok: true, sessionId, sessionToken: rawSessionToken, view, resumed: { fromSessionId: prior.id } }, logs };
+    return { result: { ok: true, sessionId, sessionToken: rawSessionToken, view, ...(opening ? { seeded: opening } : {}) }, logs };
   }
 }
 
@@ -3325,6 +3844,67 @@ export async function getSessionForAgent(db: pg.Pool, chatId: string): Promise<G
   };
 }
 
+/**
+ * "You're Dana on the list, right?" (#438, AC-9).
+ *
+ * A session seeded from a dashboard trip knows the name it greeted the organizer by. Once the travellers are on
+ * record, that name names the organizer's row if it names EXACTLY ONE traveller by the same matcher the answer
+ * itself is settled with (`resolveOrganizer`); the router then offers that row as a Yes/No instead of the open
+ * question. Zero matches, several, a "no", an answer already on record, or a document's own suggestion for the
+ * question (which was read from evidence, and wins) all leave the question as it always was.
+ *
+ * Derived on every read, never stored: nothing here can go stale when the roster is corrected, and a Yes goes
+ * through the ordinary write path with the ROSTER's spelling, so the name itself never becomes an identity.
+ */
+function withOrganizerNameSuggestion(
+  stored: Record<string, SuggestedAnswer>,
+  answers: AnswerStore,
+  ui: InterviewUiState,
+): Record<string, SuggestedAnswer> {
+  if (!ui.organizerName || ui.organizerNameDeclined || stored.organizer_identity || answers.organizer_identity !== undefined) return stored;
+  const travelers = answers.travelers;
+  const match = resolveOrganizer(ui.organizerName, travelers?.kind === "structured" ? travelers.data : undefined);
+  if (match.kind !== "matched") return stored;
+  return { ...stored, organizer_identity: { optionId: null, otherText: match.name, source: "account_name" } };
+}
+
+/**
+ * The destination and both dates already on record, as the one stop they make (#438, AC-12) -- the suggestion the
+ * stops question starts from when nothing else was said about the stops. Null when it cannot honestly be offered:
+ * a piece is missing, a date is not a real day or the return is before the departure, or the answer path would not
+ * take the stop (`suggestionAnswer`), or the place is written only in a non-Latin script, so copying it into
+ * `name_en` would put a name the site's English side cannot read where the stop's English name goes.
+ */
+export function knownStopSuggestion(answers: AnswerStore, ui: InterviewUiState = {}, language: Language = DEFAULT_LANGUAGE): SuggestedAnswer | null {
+  const place = textAnswer(answers, "destination")?.trim() ?? "";
+  const start = textAnswer(answers, "departure_date")?.trim() ?? "";
+  const end = textAnswer(answers, "return_date")?.trim() ?? "";
+  if (place === "" || knownStopConfirmText(place, start, end, "en") === null || end < start) return null;
+  // In an interview that is not in English, the stop is named in its language (made once at the start, and only while
+  // it still names the destination on record); `name_en` keeps the English as entered.
+  const data = [{ name: nativeDestinationFor(ui.nativeNames, language, place) ?? place, name_en: place, start, end }];
+  if (stopsMissingEnglishName([{ name: place }]).length > 0) return null;
+  const suggestion: SuggestedAnswer = { optionId: null, structuredData: data, source: "known_place" };
+  return suggestionAnswer("phases", suggestion) ? suggestion : null;
+}
+
+/**
+ * "Is that the only stop?" (#438, AC-12). Once the destination and both dates are on record -- seeded from the card or
+ * typed -- the stops question starts from them instead of asking for the place and the dates a second time. A document's
+ * own suggestion for the stops (read from evidence) wins; an answer already on record, or a no, leaves the question as
+ * it was. Derived on every read, never stored, so it cannot go stale when the destination or a date is corrected.
+ */
+function withKnownStopSuggestion(
+  stored: Record<string, SuggestedAnswer>,
+  answers: AnswerStore,
+  ui: InterviewUiState,
+  language: Language,
+): Record<string, SuggestedAnswer> {
+  if (stored.phases || answers.phases !== undefined || ui.knownStopDeclined) return stored;
+  const known = knownStopSuggestion(answers, ui, language);
+  return known ? { ...stored, phases: known } : stored;
+}
+
 function buildSessionView(
   sessionId: string,
   tripId: string,
@@ -3371,13 +3951,15 @@ function buildSessionView(
     language,
     offeredMore: ui.offeredMore === true,
     flightsOwed: flightsOwed(answers, ui),
+    recapMarker: ui.recapMarker ?? null,
     lastPrompt: ui.lastPrompt ?? null,
     phase,
     awaiting,
     pendingEntry: ui.pendingEntry ?? null,
     pendingSay: ui.pendingSay ?? null,
     pendingAskText: ui.pendingAskText ?? null,
-    suggestions: ui.suggestions ?? {},
+    suggestions: withKnownStopSuggestion(withOrganizerNameSuggestion(ui.suggestions ?? {}, answers, ui), answers, ui, language),
+    stopsAskedFromKnown: ui.knownStopDeclined === true && knownStopSuggestion(answers, ui, language) !== null,
     choices: recordChoices(answers),
     subjects: recordSubjects(answers),
     unsettled: unsettledAnswers(answers),
@@ -4030,6 +4612,31 @@ export async function nominateQuestionForChat(
   return result;
 }
 
+/** `recap:doc:<interpretation id>` or `recap:doc:<id>:asked` — see `InterviewUiState.recapMarker`. */
+const DOCUMENT_RECAP_MARKER = /^recap:doc:[A-Za-z0-9_-]{1,80}(:asked)?$/;
+
+/** Marks the document recap just sent as what the organizer's next message may be about (#413). */
+export async function markDocumentRecap(db: pg.Pool, chatId: string, marker: string): Promise<void> {
+  if (!DOCUMENT_RECAP_MARKER.test(marker)) return;
+  await updateUiStateForChat(db, chatId, (ui) => ({ ...ui, recapMarker: marker })).catch(() => undefined);
+}
+
+/** The next message was read, or the organizer tapped an answer: the recap is no longer what they are replying to. */
+export async function clearDocumentRecap(db: pg.Pool, chatId: string): Promise<void> {
+  // Most taps and messages carry no marker: look before writing.
+  const marked = await db.query(
+    `SELECT 1 FROM control_plane.intake_sessions
+      WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND expired_at IS NULL AND ui_state ? 'recap_marker'`,
+    [chatId],
+  ).catch(() => null);
+  if (!marked || marked.rowCount === 0) return;
+  await updateUiStateForChat(db, chatId, (ui) => {
+    if (!ui.recapMarker) return ui;
+    const { recapMarker: _done, ...rest } = ui;
+    return rest;
+  }).catch(() => undefined);
+}
+
 /** Records what the router just sent, so it will not send the same thing again. */
 export async function recordLastPromptForChat(
   db: pg.Pool,
@@ -4388,7 +4995,7 @@ async function submitAnswerVia(
       return { ok: false, reason: "STALE_ANSWER" };
     }
 
-    const validation = validateAnswer(questionId, optionId, otherText, INTAKE_QUESTIONS, structuredData, optionIds);
+    const validation = validateAnswer(questionId, optionId, otherText, INTAKE_QUESTIONS, structuredData, optionIds, { answers: session.answers });
     if (!validation.ok) {
       await client.query("ROLLBACK");
       return { ok: false, reason: validation.reason, ...(validation.detail ? { detail: validation.detail } : {}) };
@@ -4617,6 +5224,90 @@ export async function confirmIntakeForChat(
   return confirmIntakeVia(db, { by: "chat", chatId }, log);
 }
 
+/** The action name `syncCardFromIntake` records; the admin audit view withholds its evidence by default (admin-dashboard.ts). */
+export const CARD_SYNC_AUDIT_ACTION = "trip.card_synced_from_intake";
+
+/**
+ * Writes the confirmed destination and dates back to the trip's dashboard card (#438, AC-10), so the dashboard and
+ * the interview hold one answer.
+ *
+ * Only what differs is written, and only a value the card could hold: a destination of 1-160 characters, and dates
+ * only when BOTH are real days in order (a half-readable pair would leave the card with a range nobody said). The
+ * trip's `title` follows the destination only while it is still the automatic one the dashboard made (`<old> trip`);
+ * a title the organizer wrote is theirs. The change is recorded in `audit_events` -- who (the session's user), when
+ * (`occurred_at`), and which fields -- and, deliberately, none of the values: the card's old values came from a
+ * form that is not held to the canonical-record rules the audit table enforces.
+ *
+ * Runs inside the confirm transaction, under a savepoint: a card that cannot take the new value (a constraint, a
+ * bad row) must never cost the organizer their confirmation. Not every trip has a card -- one made by Telegram
+ * signup has none, and gains one here, which is also what makes its dashboard row show a destination at all.
+ */
+async function syncCardFromIntake(
+  client: pg.PoolClient,
+  tripId: string,
+  userId: string,
+  answers: AnswerStore,
+  log: (line: string) => void,
+): Promise<void> {
+  const card =(await client.query<{ title: string | null; destination_label: string | null; start_date: string | null; end_date: string | null }>(
+    "SELECT title, destination_label, start_date::text AS start_date, end_date::text AS end_date FROM control_plane.trips WHERE id = $1",
+    [tripId],
+  )).rows[0];
+  if (!card) return;
+
+  const changed: string[] = [];
+  const destination = textAnswer(answers, "destination")?.trim() ?? "";
+  const destinationChanged = destination.length >= 1 && destination.length <= 160 && destination !== card.destination_label;
+  if (destinationChanged) changed.push("destination");
+
+  const day = (value: string | null) => (value !== null ? readFullDate(value) : null);
+  const start = day(textAnswer(answers, "departure_date"));
+  const end = day(textAnswer(answers, "return_date"));
+  const datesUsable = start !== null && end !== null && end >= start;
+  // The card keeps its old dates when the confirmed ones cannot be used - and it must not do that quietly: the
+  // dashboard then shows dates the organizer changed (2026-11-08: a return stored as words left the card on 21 Nov).
+  if (!datesUsable && (textAnswer(answers, "departure_date")?.trim() || textAnswer(answers, "return_date")?.trim())) {
+    log(structuredLog("warn", "interview.card_sync_dates_skipped", {
+      trip_id: tripId,
+      departure_date_usable: start !== null,
+      return_date_usable: end !== null,
+    }));
+  }
+  if (datesUsable && start !== card.start_date) changed.push("start_date");
+  if (datesUsable && end !== card.end_date) changed.push("end_date");
+  if (changed.length === 0) return;
+
+  const autoTitle = card.destination_label !== null && card.title === `${card.destination_label} trip`;
+  const title = destinationChanged && autoTitle ? `${destination} trip`.slice(0, 120) : card.title;
+
+  await client.query("SAVEPOINT card_sync");
+  try {
+    await client.query(
+      `UPDATE control_plane.trips
+          SET destination_label = $2, start_date = $3::date, end_date = $4::date, title = $5, updated_at = now()
+        WHERE id = $1`,
+      [
+        tripId,
+        destinationChanged ? destination : card.destination_label,
+        datesUsable ? start : card.start_date,
+        datesUsable ? end : card.end_date,
+        title,
+      ],
+    );
+    await client.query(
+      `INSERT INTO control_plane.audit_events (id, actor_ref, action, target_ref, correlation_id, evidence, occurred_at)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, now())`,
+      [generateId("audit"), userId, CARD_SYNC_AUDIT_ACTION, tripId, `corr_${randomBytes(8).toString("hex")}`, JSON.stringify({ changed })],
+    );
+    await client.query("RELEASE SAVEPOINT card_sync");
+  } catch {
+    // The card keeps what it had; the confirmation stands. Said out loud by the missing audit row and this line.
+    await client.query("ROLLBACK TO SAVEPOINT card_sync");
+    await client.query("RELEASE SAVEPOINT card_sync");
+    log(structuredLog("warn", "interview.card_sync_failed", { trip_id: tripId, safe_error_code: "CARD_UPDATE_REFUSED" }));
+  }
+}
+
 async function confirmIntakeVia(
   db: pg.Pool,
   locator: SessionLocator,
@@ -4740,6 +5431,11 @@ async function confirmIntakeVia(
       "UPDATE control_plane.trips SET lifecycle_state = 'intake_confirmed', updated_at = now() WHERE id = $1",
       [session.trip_id],
     );
+
+    // The dashboard's trip card follows the confirmed intake (#438, AC-10): the interview is where the destination
+    // and dates are confirmed, so the card must not keep showing the ones typed before it. In THIS transaction, so
+    // a confirmed intake and the card that shows it commit together or not at all.
+    await syncCardFromIntake(client, session.trip_id, session.user_id, session.answers, log);
 
     // Mark session confirmed. Token remains valid for idempotent re-confirmation.
     await client.query(

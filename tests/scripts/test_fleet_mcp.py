@@ -77,6 +77,11 @@ TOOLS = [
 #: What production looked like on 2026-09-28, as rows, for the three tools the
 #: daily digest calls. Ordered: the first marker found in a statement answers it.
 FIXTURES = [
+    # Production on 2026-09-28 had not applied the companion-gateways migration
+    # (20261021100000): the tools must degrade on a stack a schema behind, and
+    # the pinned texts below are what they say there. The gateway sections have
+    # their own fixtures further down.
+    ("to_regclass('control_plane.companion_gateways')", [['f']]),
     ('to_regclass', [['t']]),
     ('FROM control_plane.trips t GROUP BY 1,2', [['live', 'ready_private', '2'], ['prospect', 'draft', '6'], ['prospect', 'intake_confirmed', '2'], ['prospect', 'intake_in_progress', '3'], ['retired', 'draft', '1'], ['retired', 'intake_in_progress', '7'], ['retired', 'provisioning_approved', '1'], ['retired', 'ready_private', '30']]),
     ('SELECT j.job_type, j.state', [['provision', 'cancelled', '1'], ['provision', 'failed', '1'], ['provision', 'succeeded', '34']]),

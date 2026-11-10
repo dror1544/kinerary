@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -63,6 +64,26 @@ logger = logging.getLogger(__name__)
 DRAFT_SLUG_PREFIX = "draft-"
 # Bounded so a pathological base cannot spin the worker.
 SLUG_COLLISION_LIMIT = 100
+
+# Retry backoff for a failed job attempt: mirrors RETRY_BACKOFF_* in
+# job-queue.ts (change both or neither; its comment has the full reasoning).
+# Short version: a requeued job used to be claimable on the next poll, so
+# max_attempts=3 was spent in ~3 seconds, and a few-second outage of the
+# reverse proxy's admin API (2026-11-08) failed a trip's build for good. The
+# delay after the Nth failed attempt is BASE * FACTOR^(N-1), capped: 30s, then
+# 120s. Held in `lease_expires_at`, which is NULL on every other queued job: on
+# a queued row it means "not claimable before". No migration.
+RETRY_BACKOFF_BASE_SECONDS = 30
+RETRY_BACKOFF_FACTOR = 4
+RETRY_BACKOFF_MAX_SECONDS = 600
+
+
+def retry_backoff_seconds(attempt: int) -> float:
+    """Seconds a job that just failed its Nth attempt waits before it may be claimed again."""
+    return min(
+        RETRY_BACKOFF_MAX_SECONDS,
+        RETRY_BACKOFF_BASE_SECONDS * RETRY_BACKOFF_FACTOR ** max(0, attempt - 1),
+    )
 
 # #review 2026-10-03: found live — gate_ready_private's runtime_health/
 # rendered_data probes used to run the instant deploy() returned, with no
@@ -1038,6 +1059,50 @@ def _organizer_recipient_chat_id(cur: Any, trip_id: str) -> str | None:
     return _organizer_chat_ids(cur, trip_id)[1]
 
 
+_PORTAL_DNS_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+_PORTAL_PORT = r"(?::(?P<port>[1-9][0-9]{0,4}))?"
+_PORTAL_OCTET = r"(?:0|[1-9][0-9]{0,2})"
+_PORTAL_HTTPS = re.compile(rf"https://(?P<host>{_PORTAL_DNS_LABEL}(?:\.{_PORTAL_DNS_LABEL})*){_PORTAL_PORT}/?")
+_PORTAL_LOOPBACK = re.compile(rf"http://(?P<host>localhost|127(?:\.{_PORTAL_OCTET}){{3}}|\[::1\]){_PORTAL_PORT}/?")
+
+
+def normalize_portal_origin(value: str | None) -> str | None:
+    """The portal's origin as a trip site may be told it (canonical form), or None.
+
+    It is what the control plane calls `web.public_origin`, and it must be
+    refused here for exactly the inputs the trip site refuses
+    (`safePortalOrigin` in server/control-plane-auth.js), so that a bad value is
+    reported by the worker's WARNING instead of being written and silently
+    ignored at the site. The rule is decided on the raw text: https://<ASCII DNS
+    name>[:port] or http://<loopback>[:port], at most one trailing slash. No
+    userinfo, path, query, fragment, backslash, %-escape, whitespace, Unicode (a
+    host or a digit), trailing dot or leading-zero port; the last label of a name
+    is not all digits. Both validators are driven by
+    tests/fixtures/portal-origin-cases.json. The canonical form is lower-case,
+    with the default port and the slash dropped, and is not stripped of
+    surrounding whitespace: whitespace is a refusal."""
+    if not isinstance(value, str) or not value or len(value) > 2048:
+        return None
+    match = _PORTAL_HTTPS.fullmatch(value)
+    secure = match is not None
+    if not match:
+        match = _PORTAL_LOOPBACK.fullmatch(value)
+    if not match:
+        return None
+    host = match.group("host").lower()
+    port = match.group("port")
+    if secure and host.rsplit(".", 1)[-1].isdigit():
+        return None
+    if not secure and host.startswith("127."):
+        if any(int(octet) > 255 for octet in host.split(".")):
+            return None
+    if port is not None and int(port) > 65535:
+        return None
+    default = "443" if secure else "80"
+    suffix = f":{port}" if port is not None and port != default else ""
+    return f"{'https' if secure else 'http'}://{host}{suffix}"
+
+
 class ProvisionerWorker:
     """Claims one approved provision job at a time, transforms intake to
     trip.config.json, deploys via the deploy adapter, and records the result.
@@ -1073,8 +1138,27 @@ class ProvisionerWorker:
         verification_retry_attempts: int | None = None,
         verification_retry_delay_s: float | None = None,
         verification_sleep: "verification.SleepFn | None" = None,
+        portal_origin: str | None = None,
     ) -> None:
         self._db_url = db_url
+        # The control plane's web.public_origin (CONTROL_PLANE_PORTAL_ORIGIN),
+        # told to each trip site in its identity sidecar so an organizer who
+        # opens the trip on its own hostname still has a way back to the
+        # dashboard. Unset leaves it out (the site then shows no link for a
+        # direct login); a value that is not a plain origin is dropped LOUDLY
+        # rather than written, because the symptom of a missing link is silence.
+        configured = portal_origin if portal_origin is not None else os.environ.get("CONTROL_PLANE_PORTAL_ORIGIN", "")
+        self._portal_origin = normalize_portal_origin(configured)
+        if configured.strip() and not self._portal_origin:
+            logger.warning(
+                "provisioner.portal_origin_invalid: CONTROL_PLANE_PORTAL_ORIGIN is not a plain https origin; "
+                "trip sites will not show an organizer dashboard link to a direct login"
+            )
+        elif not configured.strip():
+            logger.info(
+                "provisioner.portal_origin_unset: CONTROL_PLANE_PORTAL_ORIGIN is not set; "
+                "trip sites built or redeployed now will not show an organizer dashboard link to a direct login"
+            )
         # Where the control plane keeps uploaded originals (DOCUMENT_STORE_DIR,
         # the same root the relay writes to). Unset: a trip is provisioned with
         # no source documents, exactly as before documents were kept at all.
@@ -1215,6 +1299,9 @@ class ProvisionerWorker:
                      if len(owners) == 1 and len(organizers) == 1 else None)
             sidecars["control-plane.identity.json"] = {
                 "version": 1, "tripId": trip_id, "owner": owner,
+                # Rewritten on every provision, so a trip built before this
+                # existed learns it at its next redeploy. Absent when unset.
+                **({"portalOrigin": self._portal_origin} if self._portal_origin else {}),
             }
 
             # The confirmed version's source documents: published beside the
@@ -1414,6 +1501,9 @@ class ProvisionerWorker:
                       AND  pa.expires_at > now()
                       AND  pa.plan_digest = p.digest
                       AND  t.suspended_at IS NULL
+                      -- a requeued job waits out its retry backoff
+                      -- (RETRY_BACKOFF_*); NULL for a job never yet failed
+                      AND  (j.lease_expires_at IS NULL OR j.lease_expires_at <= now())
                     ORDER BY j.created_at
                     LIMIT  1
                     FOR UPDATE OF j, pa, t SKIP LOCKED
@@ -2350,7 +2440,8 @@ class ProvisionerWorker:
         error_code: str,
     ) -> None:
         """Re-queues the job if retries remain; marks it failed and consumes
-        the approval if attempts are exhausted (mirrors failJob in TypeScript)."""
+        the approval if attempts are exhausted (mirrors failJob in TypeScript).
+        A requeued job is held back by the retry backoff (RETRY_BACKOFF_*)."""
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
@@ -2365,12 +2456,25 @@ class ProvisionerWorker:
                                      ELSE NULL
                                    END,
                            lease_owner = NULL,
-                           lease_expires_at = NULL,
+                           -- retriable: not claimable again before the
+                           -- backoff (RETRY_BACKOFF_*) has passed; `attempt`
+                           -- here is the pre-update count, including the
+                           -- attempt that just failed
+                           lease_expires_at = CASE
+                                     WHEN attempt >= max_attempts THEN NULL
+                                     ELSE now() + make_interval(
+                                            secs => LEAST(%s::float8,
+                                                          %s::float8 * power(%s::float8, GREATEST(attempt - 1, 0))))
+                                   END,
                            updated_at = now()
                     WHERE  id = %s AND lease_owner = %s AND state = 'leased'
                     RETURNING attempt, max_attempts
                     """,
-                    (error_code, job_id, self._worker_id),
+                    (
+                        error_code,
+                        RETRY_BACKOFF_MAX_SECONDS, RETRY_BACKOFF_BASE_SECONDS, RETRY_BACKOFF_FACTOR,
+                        job_id, self._worker_id,
+                    ),
                 )
                 row = cur.fetchone()
                 if row is None:
@@ -2448,7 +2552,25 @@ class ProvisionerWorker:
                         if owner_row else None
                     )
 
-                    notif_payload = json.dumps({"safe_error_code": error_code})
+                    # The language the interview was held in, so the organizer's
+                    # message ("tap Try again on the dashboard") is worded in it.
+                    # Absent (older intake versions have none) reads as English.
+                    cur.execute(
+                        """
+                        SELECT iv.language
+                        FROM control_plane.jobs j
+                        JOIN control_plane.intake_versions iv ON iv.trip_id = j.trip_id
+                        WHERE j.id = %s
+                        ORDER BY iv.version DESC
+                        LIMIT 1
+                        """,
+                        (job_id,),
+                    )
+                    language_row = cur.fetchone()
+                    failure_payload: dict[str, Any] = {"safe_error_code": error_code}
+                    if language_row and language_row["language"]:
+                        failure_payload["language"] = language_row["language"]
+                    notif_payload = json.dumps(failure_payload)
                     cur.execute(
                         """
                         INSERT INTO control_plane.notification_outbox

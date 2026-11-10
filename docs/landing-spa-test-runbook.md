@@ -3,6 +3,16 @@
 This runbook describes validation on an HTTPS test domain. It does not
 authorize deployment or production cutover.
 
+On the control-plane VM the two services below are run by `compose.vm.yml` under
+the optional profile `web`, configured entirely from `vm.env`:
+"Organizer portal and runtime gateway" in
+[control-plane-vm-deployment.md](control-plane-vm-deployment.md) is the deployment
+procedure, and the acceptance below is what to run after it. The web image is built
+from the repository root (`docker build -f web/Dockerfile .`: the stylesheet imports
+`shared/brand-tokens.css`), and `web/nginx.conf` is an envsubst template whose
+asset-cache regex must stay quoted (#441) — check a change to it with the `nginx -t`
+command in that section.
+
 ## Required topology
 
 - Organizer origin: SPA/Nginx and same-origin `/v1` proxy.
@@ -10,7 +20,9 @@ authorize deployment or production cutover.
 - Private network: control-plane API, PostgreSQL, worker, and isolated trip
   runtimes. The gateway and API share `RUNTIME_EXCHANGE_KEY`; runtimes receive
   the same key only for their private exchange endpoints.
-- Google OIDC redirect: `<organizer-origin>/v1/auth/google/callback`.
+- Google sign-in: an OAuth client of type Web application whose Authorized JavaScript
+  origins include `<organizer-origin>`; its client ID goes in the profile's
+  `web.google_client_id` (no secret, no redirect URI).
 
 Start from `control-plane/config/architecture.web.example.json`. Replace all
 example origins, secret references, upstream suffixes, bot username, and admin

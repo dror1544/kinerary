@@ -141,7 +141,7 @@ function labelLostFound(rows) {
     ? Object.assign({ source: LOST_FOUND_SOURCE }, r, { source: LOST_FOUND_SOURCE }) : r));
 }
 
-function registerTools(mcp, site, { write = true } = {}) {
+function registerTools(mcp, site, { write = true, origin } = {}) {
   // Every tool's one output path: the site's answer, with the tag block made
   // visible or dropped (visibleTags above); and its one error path, toolError.
   const ok = data => ({ content: [{ type: 'text', text: JSON.stringify(visibleTags(data), null, 2) }] });
@@ -189,11 +189,33 @@ function registerTools(mcp, site, { write = true } = {}) {
   const writeCall = async fn => {
     try { return await fn(); } catch (err) { throw explainWriteRefusal(err); }
   };
+  // Original file management remains organizer-only even though this is a read.
+  if (write) mcp.registerTool('get_booking_confirmation', {
+    title: 'Retrieve original booking confirmation PDF',
+    description: 'Retrieve the exact linked PDF (up to 5 MiB) with byte count and SHA-256. For larger or unsupported originals, open the authenticated trip site.',
+    annotations: { title: 'Retrieve original booking confirmation PDF', ...READ },
+    inputSchema: z.object({ booking_id: z.number().int().positive().max(Number.MAX_SAFE_INTEGER) }).strict(),
+  }, async ({ booking_id }) => {
+    try {
+      let bookings;
+      try { bookings = await site.get('/api/bookings'); }
+      catch { throw new Error('Booking confirmation lookup failed. Open the authenticated trip site to view the original.'); }
+      const booking = bookings.find(b => b.id === booking_id);
+      if (!booking) throw new Error('Booking not found on this trip');
+      if (!booking.conf_file) throw new Error('Booking has no linked confirmation. Open the authenticated trip site.');
+      const { bytes, byte_count, sha256 } = await site.getConfirmation(booking.conf_file);
+      return { content: [
+        { type: 'text', text: JSON.stringify(visibleTags({ booking_id, byte_count, sha256 })) },
+        { type: 'resource', resource: { uri: `urn:sha256:${sha256}`, mimeType: 'application/pdf', blob: bytes.toString('base64') } },
+      ] };
+    } catch (err) { return toolError(err); }
+  });
 
   tool('add_booking', 'Add a booking',
     'Record a reservation with its confirmation details. A booking does not put anything on the day-by-day schedule — use add_plan_item ' +
-    '(optionally with booking_id) for that. A hotel booking does not change a stop either (its dates, where the family sleeps); if the ' +
-    'organizer means this hotel to be that stop\'s, call set_stop_from_booking with the new booking\'s id afterwards.',
+    '(optionally with booking_id) for that. A hotel booking does not change a stop by itself (its dates, where the family sleeps), so ' +
+    'the Plan and the Map would not show it: for a hotel the organizer gives you, always call set_stop_from_booking with the new ' +
+    'booking\'s id afterwards. A hotel from anyone else stays a booking; the organizer can link it on the site.',
     WRITE, {
       phase: z.string().describe('Phase id from get_config, or "intl_flights"'),
       type: bookingType,
@@ -214,6 +236,18 @@ function registerTools(mcp, site, { write = true } = {}) {
       passengers: z.string().optional(), confirmation: z.string().optional(), pin: z.string().optional(),
       cost: z.number().optional(), notes: z.string().optional(), location_url: z.string().url().optional(),
     }, ({ id, ...fields }) => writeCall(() => site.patch(`/api/bookings/${id}`, fields)));
+
+  tool('get_booking_confirmation_upload_link', 'Upload a booking confirmation PDF',
+    'When this assistant cannot transfer the original PDF bytes, give the organizer this booking-specific link on the trip site. '
+    + 'The link is pending, not proof that a file was uploaded. Ask the organizer to open it while signed into the trip site and '
+    + 'report success only after the page says the saved PDF was verified.',
+    WRITE, { booking_id: z.number().int().positive().describe('Existing booking id from get_bookings') },
+    async ({ booking_id }) => {
+      if (!origin) throw new Error('Trip origin unavailable');
+      const bookings = await site.get('/api/bookings');
+      if (!bookings.some(booking => booking.id === booking_id)) throw new Error('Booking not found on this trip');
+      return { status: 'pending_upload', booking_id, url: origin + '/mcp/upload-confirmation/' + booking_id };
+    });
 
   tool('delete_booking', 'Delete a booking',
     'Delete a booking by id. Confirm with the organizer first.',
@@ -294,7 +328,8 @@ function registerTools(mcp, site, { write = true } = {}) {
     'The trip\'s STOPS as the site shows them now — each with its dates (nights), accommodation and title — plus the trip\'s own dates. ' +
     'Read this before changing a stop, and to find stop ids. kind "computed" is the "days not planned yet" block: not a stop, not editable. ' +
     '"conflict" means a rebuild changed a field the organizer had already changed (theirs is kept); "booking_out_of_sync" means the hotel ' +
-    'booking a stop was set from now has other dates. Who changed what is organizer information — never write it onto the site.',
+    'booking a stop was set from now has other dates; "unlinked_hotel_bookings" lists approved hotel bookings filed under the stop that no stop is set from yet ' +
+    '(on Reservations only, not on the Plan or the Map). Who changed what is organizer information — never write it onto the site.',
     READ, {}, () => stopCall(() => site.get('/api/stops')));
 
   tool('update_stop', 'Change a stop',

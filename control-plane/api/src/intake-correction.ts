@@ -89,10 +89,26 @@ function normalizeCorrectionAnswers(input: Record<string, unknown>): AnswerStore
   return normalized;
 }
 
+const MAX_LOCK_ATTEMPTS = 3;
+
 /**
  * Creates a new confirmed intake version from updated, schema-validated
  * answers, supersedes any active plan, cancels associated jobs, and reverts
  * the trip to 'intake_confirmed'. The previous confirmed version is immutable.
+ *
+ * LOCK ORDER (issue #387): every non-terminal `jobs` row of the trip
+ * (FOR UPDATE), then `trips` (FOR UPDATE), then the writes — the intake
+ * version insert, the `plans` supersede, the `jobs` cancel, the `trips`
+ * revert — with a PLAIN re-read of `jobs` once `trips` is held. It must agree
+ * with the worker's `_complete` / `_claim` (provisioner.py: jobs ->
+ * plan_approvals -> plans -> trips, `trips` last), `retryProvision`
+ * (planner.ts) and `executeClear` (trip-clear.ts), which use the same order.
+ * It used to lock `trips` first: with the trip in `provisioning_approved`
+ * (the worker's claim does not move it) a correction landing as the worker
+ * committed a finished build held `trips` and waited for the plan row the
+ * worker held, while the worker waited for `trips` — a 40P01 that could
+ * record a built site as a failed job. Like `retryProvision`, it does not
+ * lock `plans` before `trips` (`resumeTrip` takes trips -> plans).
  */
 export async function correctIntake(
   db: pg.Pool,
@@ -125,10 +141,27 @@ export async function correctIntake(
     throw error;
   }
 
+  // Lock order (issue #387): `jobs` FIRST, `trips` after, the writes last. See
+  // this function's doc. The loop re-takes both locks, in the same order, in
+  // the one case where a job we did not lock appeared in between.
+  for (let attempt = 1; attempt <= MAX_LOCK_ATTEMPTS; attempt++) {
   const client = await db.connect();
   try {
     await client.query("BEGIN");
 
+    // 1. Every non-terminal job of this trip, FOR UPDATE, before `trips`. A
+    // worker finishing a build (`_complete`) holds its job row first and
+    // `trips` last, so this statement queues behind it and the two never wait
+    // on each other. Locks nothing when the trip has no live job.
+    const lockedJobs = await client.query<{ id: string }>(
+      `SELECT id FROM control_plane.jobs
+       WHERE trip_id = $1 AND state NOT IN ('succeeded', 'failed', 'cancelled')
+       FOR UPDATE`,
+      [tripId],
+    );
+    const lockedJobIds = new Set(lockedJobs.rows.map((j) => j.id));
+
+    // 2. `trips`, and the existence / state decision under it.
     const tripRow = await client.query<{ lifecycle_state: string }>(
       "SELECT lifecycle_state FROM control_plane.trips WHERE id = $1 FOR UPDATE",
       [tripId],
@@ -141,6 +174,23 @@ export async function correctIntake(
     if (!CORRECTABLE_STATES.has(trip.lifecycle_state)) {
       await client.query("ROLLBACK");
       return { ok: false, reason: "INVALID_STATE" };
+    }
+
+    // 3. PLAIN re-read of the non-terminal jobs now that `trips` is held (a
+    // second FOR UPDATE would lock `jobs` after `trips` and reopen the
+    // deadlock). A job committed by a concurrent generatePlan between the
+    // locking read and the `trips` lock is one we do not hold: cancelling it
+    // below could meet a worker claiming it (job held, `trips` wanted) while
+    // we hold `trips` and want the job. Start over with it in the lock set —
+    // `trips` is released by the ROLLBACK, so retrying cannot deadlock.
+    const reread = await client.query<{ id: string }>(
+      `SELECT id FROM control_plane.jobs
+       WHERE trip_id = $1 AND state NOT IN ('succeeded', 'failed', 'cancelled')`,
+      [tripId],
+    );
+    if (reread.rows.some((j) => !lockedJobIds.has(j.id))) {
+      await client.query("ROLLBACK");
+      continue;
     }
 
     const existingRow = await client.query<{ max_version: number | null }>(
@@ -196,4 +246,9 @@ export async function correctIntake(
   } finally {
     client.release();
   }
+  }
+  // Every attempt found a job it had not locked. A job appearing three times in
+  // a row is not a race, it is something creating jobs in a loop: fail loudly
+  // rather than correct under a lock set we know is incomplete.
+  throw new Error(`correctIntake: provision jobs kept appearing during ${MAX_LOCK_ATTEMPTS} lock attempts for ${tripId}`);
 }

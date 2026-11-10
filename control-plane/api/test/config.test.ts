@@ -194,3 +194,53 @@ test("the relay block is optional — an api-only deployment omits it", async ()
   assert.doesNotThrow(() => validateArchitectureProfile(withoutRelay));
   assert.equal(validateArchitectureProfile(withoutRelay).relay, undefined);
 });
+
+const webExamplePath = fileURLToPath(new URL("../../config/architecture.web.example.json", import.meta.url));
+
+test("web.telegram_bot_token_secret_ref is optional, validated as an opaque reference, and the max age is bounded", async () => {
+  const raw = JSON.parse(await readFile(webExamplePath, "utf8"));
+  assert.equal(validateArchitectureProfile(raw).web?.telegram_init_data_max_age_seconds, 300);
+
+  const { telegram_bot_token_secret_ref: _ref, telegram_init_data_max_age_seconds: _age, ...bareWeb } = raw.web;
+  const bare = validateArchitectureProfile({ ...raw, web: bareWeb });
+  assert.equal(bare.web?.telegram_bot_token_secret_ref, undefined, "absent means the feature is off, not defaulted to another token");
+  assert.equal(bare.web?.telegram_init_data_max_age_seconds, 300, "the default freshness window is five minutes");
+
+  for (const bad of ["not-a-ref", "file://../../etc/passwd", "env://lower_case", "https://example.test/token"]) {
+    assert.throws(() => validateArchitectureProfile({ ...raw, web: { ...raw.web, telegram_bot_token_secret_ref: bad } }), bad);
+  }
+  for (const age of [59, 3601, 1.5, "300"]) {
+    assert.throws(() => validateArchitectureProfile({ ...raw, web: { ...raw.web, telegram_init_data_max_age_seconds: age } }), String(age));
+  }
+  for (const age of [60, 3600]) {
+    assert.doesNotThrow(() => validateArchitectureProfile({ ...raw, web: { ...raw.web, telegram_init_data_max_age_seconds: age } }));
+  }
+});
+
+test("public_api.trust_proxy is optional (default off) and takes hops or a list of proxies", async () => {
+  const raw = JSON.parse(await readFile(webExamplePath, "utf8"));
+  assert.equal(validateArchitectureProfile(raw).public_api.trust_proxy, undefined);
+  for (const good of [1, 2, ["10.0.0.0/8"], ["127.0.0.1", "::1"]]) {
+    assert.doesNotThrow(() => validateArchitectureProfile({ ...raw, public_api: { ...raw.public_api, trust_proxy: good } }), JSON.stringify(good));
+  }
+  for (const bad of [true, false, 0, 9, [], "10.0.0.1", [""], [1]]) {
+    assert.throws(() => validateArchitectureProfile({ ...raw, public_api: { ...raw.public_api, trust_proxy: bad } }), JSON.stringify(bad));
+  }
+});
+
+test("web origins are normalised to the browser's Origin form, so a differently written profile cannot 403 every mutation", async () => {
+  const raw = JSON.parse(await readFile(webExamplePath, "utf8"));
+  const parsed = (publicOrigin: string, runtimeOrigin = "https://runtime.example.test") =>
+    validateArchitectureProfile({ ...raw, web: { ...raw.web, public_origin: publicOrigin, runtime_origin: runtimeOrigin } }).web!;
+  for (const written of [
+    "https://portal.example.test", "https://portal.example.test/", "https://Portal.Example.TEST", "https://portal.example.test:443",
+    "https://portal.example.test:443/", "HTTPS://PORTAL.example.test/some/path?x=1#frag",
+  ]) assert.equal(parsed(written).public_origin, "https://portal.example.test", written);
+  assert.equal(parsed("http://portal.example.test:80/").public_origin, "http://portal.example.test");
+  assert.equal(parsed("http://localhost:8080/").public_origin, "http://localhost:8080", "a non-default port is kept");
+  assert.equal(parsed("https://portal.example.test", "https://Runtime.Example.test:443/").runtime_origin, "https://runtime.example.test");
+  // The isolation check compares NORMALISED values: the same origin written two ways is still the same origin.
+  assert.throws(() => parsed("https://portal.example.test/", "https://PORTAL.example.test:443"), /isolated/);
+  // Something that is not a usable origin is a configuration error, not a silent "null".
+  assert.throws(() => parsed("data:text/plain,hello"));
+});

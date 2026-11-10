@@ -1,0 +1,316 @@
+{
+ "_comment": "One list for both validators: safePortalOrigin (server/control-plane-auth.js, run by tests/control-plane-dashboard-url.test.js) and normalize_portal_origin (control-plane/worker/control_plane_worker/provisioner.py, run by control-plane/worker/tests/test_provisioner.py). Each case is [input, canonical origin or null when refused]. Add a case here, never to one side only.",
+ "cases": [
+  {
+   "input": "https://portal.example.test",
+   "accepted": true,
+   "canonical": "https://portal.example.test"
+  },
+  {
+   "input": "https://portal.example.test/",
+   "accepted": true,
+   "canonical": "https://portal.example.test"
+  },
+  {
+   "input": "https://Portal.Example.TEST",
+   "accepted": true,
+   "canonical": "https://portal.example.test"
+  },
+  {
+   "input": "https://portal.example.test:8443",
+   "accepted": true,
+   "canonical": "https://portal.example.test:8443"
+  },
+  {
+   "input": "https://portal.example.test:443",
+   "accepted": true,
+   "canonical": "https://portal.example.test"
+  },
+  {
+   "input": "https://portal",
+   "accepted": true,
+   "canonical": "https://portal"
+  },
+  {
+   "input": "http://localhost",
+   "accepted": true,
+   "canonical": "http://localhost"
+  },
+  {
+   "input": "http://localhost:5173",
+   "accepted": true,
+   "canonical": "http://localhost:5173"
+  },
+  {
+   "input": "http://127.0.0.1:5173",
+   "accepted": true,
+   "canonical": "http://127.0.0.1:5173"
+  },
+  {
+   "input": "http://127.0.0.1/",
+   "accepted": true,
+   "canonical": "http://127.0.0.1"
+  },
+  {
+   "input": "http://[::1]:5173",
+   "accepted": true,
+   "canonical": "http://[::1]:5173"
+  },
+  {
+   "input": "",
+   "accepted": false
+  },
+  {
+   "input": null,
+   "accepted": false
+  },
+  {
+   "input": 42,
+   "accepted": false
+  },
+  {
+   "input": {
+    "origin": "https://portal.example.test"
+   },
+   "accepted": false
+  },
+  {
+   "input": [
+    "https://portal.example.test"
+   ],
+   "accepted": false
+  },
+  {
+   "input": "   ",
+   "accepted": false
+  },
+  {
+   "input": " https://portal.example.test",
+   "accepted": false
+  },
+  {
+   "input": "https://portal.example.test ",
+   "accepted": false
+  },
+  {
+   "input": "https://portal.example.test\n",
+   "accepted": false
+  },
+  {
+   "input": "portal.example.test",
+   "accepted": false
+  },
+  {
+   "input": "//portal.example.test",
+   "accepted": false
+  },
+  {
+   "input": "https://",
+   "accepted": false
+  },
+  {
+   "input": "javascript:alert(1)",
+   "accepted": false
+  },
+  {
+   "input": "data:text/html,x",
+   "accepted": false
+  },
+  {
+   "input": "ftp://portal.example.test",
+   "accepted": false
+  },
+  {
+   "input": "http://portal.example.test",
+   "accepted": false
+  },
+  {
+   "input": "http://192.0.2.1",
+   "accepted": false
+  },
+  {
+   "input": "http://localhost.evil.example",
+   "accepted": false
+  },
+  {
+   "input": "https://u:p@portal.example.test",
+   "accepted": false
+  },
+  {
+   "input": "https://u@portal.example.test",
+   "accepted": false
+  },
+  {
+   "input": "https://portal.example.test/path",
+   "accepted": false
+  },
+  {
+   "input": "https://portal.example.test//",
+   "accepted": false
+  },
+  {
+   "input": "https://portal.example.test/?x=1",
+   "accepted": false
+  },
+  {
+   "input": "https://portal.example.test?x=1",
+   "accepted": false
+  },
+  {
+   "input": "https://portal.example.test/#x",
+   "accepted": false
+  },
+  {
+   "input": "https://portal.example.test#x",
+   "accepted": false
+  },
+  {
+   "input": "https://portal.example.test/trips/trip_other/setup",
+   "accepted": false
+  },
+  {
+   "input": "https://portal.example.test:notaport",
+   "accepted": false
+  },
+  {
+   "input": "https://portal.example.test:",
+   "accepted": false
+  },
+  {
+   "input": "https://portal.example.test:0",
+   "accepted": false
+  },
+  {
+   "input": "https://portal.example.test:08443",
+   "accepted": false
+  },
+  {
+   "input": "https://portal.example.test:65536",
+   "accepted": false
+  },
+  {
+   "input": "https://portal.example.test:99999999",
+   "accepted": false
+  },
+  {
+   "input": "https://portal example.test",
+   "accepted": false
+  },
+  {
+   "input": "https://portal.example.test\n@evil.example",
+   "accepted": false
+  },
+  {
+   "input": "https://portal.example.test\t",
+   "accepted": false
+  },
+  {
+   "input": "https://evil.example\\portal.example.test",
+   "accepted": false
+  },
+  {
+   "input": "https://evil.example%2f.portal.example.test",
+   "accepted": false
+  },
+  {
+   "input": "https://portal.example.test%2f",
+   "accepted": false
+  },
+  {
+   "input": "https://portal.example.test.",
+   "accepted": false
+  },
+  {
+   "input": "https://.portal.example.test",
+   "accepted": false
+  },
+  {
+   "input": "https://portal..example.test",
+   "accepted": false
+  },
+  {
+   "input": "https://-portal.example.test",
+   "accepted": false
+  },
+  {
+   "input": "https://portal-.example.test",
+   "accepted": false
+  },
+  {
+   "input": "https://portal_x.example.test",
+   "accepted": false
+  },
+  {
+   "input": "https://p\u00f6rtal.example.test",
+   "accepted": false
+  },
+  {
+   "input": "https://\u043f\u043e\u0440\u0442\u0430\u043b.example.test",
+   "accepted": false
+  },
+  {
+   "input": "https://portal.example.test\u3002",
+   "accepted": false
+  },
+  {
+   "input": "https://portal.example.test:\u0668\u0660",
+   "accepted": false
+  },
+  {
+   "input": "https://\uff50ortal.example.test",
+   "accepted": false
+  },
+  {
+   "input": "https://1.2.3.4",
+   "accepted": false
+  },
+  {
+   "input": "https://999.999.999.999",
+   "accepted": false
+  },
+  {
+   "input": "https://portal.123",
+   "accepted": false
+  },
+  {
+   "input": "https://[::1]",
+   "accepted": false
+  },
+  {
+   "input": "http://127.\u0661.\u0661.\u0661:5173",
+   "accepted": false
+  },
+  {
+   "input": "http://127.0.0.256",
+   "accepted": false
+  },
+  {
+   "input": "http://127.00.0.1",
+   "accepted": false
+  },
+  {
+   "input": "http://127.0.0",
+   "accepted": false
+  },
+  {
+   "input": "http://127.0.0.1.1",
+   "accepted": false
+  },
+  {
+   "input": "http://localhost.",
+   "accepted": false
+  },
+  {
+   "input": "http://localhost:5173/x",
+   "accepted": false
+  },
+  {
+   "input": "http://[::2]",
+   "accepted": false
+  },
+  {
+   "input": "https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test",
+   "accepted": false
+  }
+ ]
+}

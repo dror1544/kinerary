@@ -159,5 +159,92 @@ class NoDeadConfiguredGuards(unittest.TestCase):
         self.assertIn("steps.ctx.outputs.relevant == 'true'", text)
 
 
+def _step_block(text: str, step_name: str) -> str:
+    """The text of one `- name: <step_name>` step, up to the next step."""
+    start = text.index(f"      - name: {step_name}\n")
+    nxt = re.compile(r"^      - ", re.M).search(text, start + 1)
+    return text[start:nxt.start() if nxt else len(text)]
+
+
+class TheModelNeverHoldsAGitHubToken(unittest.TestCase):
+    """Rule 1 of the workflow header, now enforced, not just stated (#323).
+
+    claude-code-action always obtains a GitHub token for itself (OIDC to its
+    App, or `github_token`), so the first credentialed run failed on it.
+    Meanwhile actions/checkout's default left this job's token in .git/config,
+    where a model allowed to Read and run git could find it."""
+
+    def test_assess_runs_the_cli_not_the_action(self):
+        block = _step_block(_workflow_text(), "Assess")
+        # re.M: without it `^` only anchors at position 0 and this could not fail.
+        self.assertIsNone(re.search(r"^\s+uses:", block, re.M), "the Assess step must not use an action")
+        self.assertIn('claude -p "$PROMPT"', block)
+
+    def test_the_cli_is_pinned_and_installed_without_a_secret_in_reach(self):
+        text = _workflow_text()
+        install = _step_block(text, "Install the claude CLI")
+        self.assertRegex(install, r'CLAUDE_CODE_VERSION: "\d+\.\d+\.\d+"', "the CLI is pinned")
+        self.assertIn("npm install -g", install)
+        self.assertNotIn("secrets.", install, "no install script may see a credential")
+        self.assertNotIn("npm install", _step_block(text, "Assess"))
+        self.assertIn("uses: actions/setup-node@", text, "Node is pinned")
+
+    def test_the_model_has_no_shell_at_all(self):
+        # A positive allow-list, not a deny-list: in -p mode Bash(...) prefixes
+        # were measured not to bound what runs (assessment of 2026-10-21).
+        block = _step_block(_workflow_text(), "Assess")
+        allowed = set(re.search(r'--allowedTools "([^"]+)"', block).group(1).split(","))
+        self.assertLessEqual(allowed, {"Read", "Grep", "Glob", "Write"})
+        disallowed = set(re.search(r'--disallowedTools "([^"]+)"', block).group(1).split(","))
+        self.assertIn("Bash", disallowed)
+        self.assertIn("WebFetch", disallowed)
+
+    def test_the_model_loads_none_of_the_repos_settings_or_hooks(self):
+        block = _step_block(_workflow_text(), "Assess")
+        self.assertIn("--restricted", block)
+        self.assertIn("--strict-mcp-config", block)
+
+    def test_the_session_inventory_is_only_the_four_file_tools(self):
+        # --allowedTools is permission; --tools is what exists. Without it the
+        # session held PushNotification/SendMessage (fourth assessment).
+        block = _step_block(_workflow_text(), "Assess")
+        tools = set(re.search(r'--tools "([^"]+)"', block).group(1).split(","))
+        self.assertLessEqual(tools, {"Read", "Grep", "Glob", "Write"})
+        disallowed = set(re.search(r'--disallowedTools "([^"]+)"', block).group(1).split(","))
+        self.assertLessEqual({"PushNotification", "SendMessage", "ToolSearch", "Skill"}, disallowed)
+
+    def test_a_comment_from_a_run_that_touched_other_files_is_withheld(self):
+        post = _step_block(_workflow_text(), "Post the assessment")
+        self.assertIn("git status --porcelain --untracked-files=all", post)
+        self.assertLess(post.index("git status --porcelain"), post.index("> comment.md"))
+
+    def test_the_comment_is_scanned_for_credentials_before_it_is_posted(self):
+        post = _step_block(_workflow_text(), "Post the assessment")
+        scan = post.index('grep -qF -- "$secret" regression-assessment.md')
+        self.assertLess(scan, post.index("gh pr comment"), "scan before posting")
+        self.assertIn("sk-ant-", post)
+        self.assertNotRegex(post, r'echo[^\n]*\$(SCAN_OAUTH|SCAN_APIKEY|secret)\b', "never print a secret")
+
+    def test_the_git_facts_are_written_before_the_model_runs(self):
+        ctx = _step_block(_workflow_text(), "Collect context")
+        self.assertIn(".assessment-context/commits.txt", ctx)
+        self.assertIn(".assessment-context/diff-stat.txt", ctx)
+
+    def test_assess_is_given_no_github_credential(self):
+        block = _step_block(_workflow_text(), "Assess")
+        for needle in ("github.token", "GITHUB_TOKEN", "GH_TOKEN", "id-token"):
+            with self.subTest(needle=needle):
+                self.assertNotIn(needle, block)
+
+    def test_no_job_level_oidc_permission(self):
+        self.assertNotRegex(_workflow_text(), r"id-token:\s*write")
+
+    def test_checkout_does_not_persist_the_job_token(self):
+        text = _workflow_text()
+        start = text.index("uses: actions/checkout@")
+        nxt = re.compile(r"^      - ", re.M).search(text, start)
+        self.assertRegex(text[start:nxt.start()], r"persist-credentials:\s*false")
+
+
 if __name__ == "__main__":
     unittest.main()

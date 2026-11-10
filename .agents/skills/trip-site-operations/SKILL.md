@@ -65,7 +65,7 @@ Use when a user asks about the trip website itself: current published data, Tele
 2. Call `mcp__trip_mcp__get_bookings` first to obtain real live booking IDs.
 3. If the matching booking already exists, upload the PDF with `mcp__trip_mcp__upload_booking_confirmation` using that booking `id` and a local absolute PDF path.
 4. If `get_bookings` is empty or the matching booking is missing while `get_config` still shows summary booking data, treat that as **missing live editable records**, not as proof the site already has an upload target.
-5. In that case, create the missing live booking first with `mcp__trip_mcp__add_booking`, then upload the confirmation PDF to the returned booking ID.
+5. In that case, create the missing live booking first with `mcp__trip_mcp__add_booking`, then upload the confirmation PDF to the returned booking ID. For a hotel the organizer gave you, also call `mcp__trip_mcp__set_stop_from_booking` with that booking ID, or the hotel shows on Reservations but not on Plan or Map (#419).
 6. After upload, call `get_bookings` again and verify the intended booking now has a populated `conf_file`.
 7. Do not promise that vouchers were added until the upload succeeded for a specific booking ID **and** a follow-up read confirms the persisted attachment.
 8. If the user still cannot see the voucher on the website after server verification, say the booking exists on the server and distinguish that from a likely UI/cache/rendering problem.

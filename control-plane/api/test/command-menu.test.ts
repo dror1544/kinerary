@@ -5,11 +5,11 @@ import type { TelegramClient } from "../src/relay/telegram-api.js";
 
 // What the router answers itself (relay/dispatch.ts). Anything else a menu
 // offers is a command the command gate refuses.
-const ROUTER_COMMANDS = new Set(["help", "name", "proactive", "group", "trips", "switch"]);
+const ROUTER_COMMANDS = new Set(["help", "name", "app", "proactive", "group", "trips", "switch"]);
 
 describe("routerCommandMenus — the menu is the router's, not Hermes's", () => {
   test("every advertised command is one the router handles", () => {
-    for (const menu of routerCommandMenus()) {
+    for (const menu of [...routerCommandMenus(), ...routerCommandMenus({ tripApp: true })]) {
       for (const { command } of menu.commands) {
         assert.ok(ROUTER_COMMANDS.has(command), `${menu.scope}/${menu.languageCode ?? "-"} offers /${command}`);
       }
@@ -26,6 +26,24 @@ describe("routerCommandMenus — the menu is the router's, not Hermes's", () => 
         assert.equal(names.includes(outsideGroups), menu.scope !== "all_group_chats", `${menu.scope} /${outsideGroups} placement`);
       }
     }
+  });
+
+  test("/app is in NO menu until the Mini App is ready - the menus are exactly what they were before #443", () => {
+    for (const menus of [routerCommandMenus(), routerCommandMenus({}), routerCommandMenus({ tripApp: false })]) {
+      for (const menu of menus) {
+        assert.equal(menu.commands.some((c) => c.command === "app"), false, `${menu.scope}/${menu.languageCode ?? "-"} offers /app`);
+      }
+    }
+  });
+
+  test("/app is offered in every scope once ready - the same Open trip button for the chat's own trip", () => {
+    for (const menu of routerCommandMenus({ tripApp: true })) {
+      assert.ok(menu.commands.some((c) => c.command === "app"), `${menu.scope}/${menu.languageCode ?? "-"} lacks /app`);
+    }
+    // Only /app differs.
+    const without = routerCommandMenus().map((m) => m.commands.map((c) => c.command));
+    const withApp = routerCommandMenus({ tripApp: true }).map((m) => m.commands.map((c) => c.command).filter((c) => c !== "app"));
+    assert.deepEqual(withApp, without);
   });
 
   test("/proactive is offered in groups only - it is one group's preference, set there by the organizer", () => {
@@ -71,6 +89,19 @@ function fakeTelegram(setMyCommands?: TelegramClient["setMyCommands"]): Telegram
 }
 
 describe("publishCommandMenu", () => {
+  test("publishes the /app menus only when told the Mini App is ready - and republishing replaces them", async () => {
+    const published = async (options?: { tripApp?: boolean }) => {
+      const calls: Parameters<NonNullable<TelegramClient["setMyCommands"]>>[0][] = [];
+      await publishCommandMenu(fakeTelegram(async (params) => { calls.push(params); return true; }), () => {}, options);
+      return calls;
+    };
+    for (const call of await published()) assert.equal(call.commands.some((c) => c.command === "app"), false);
+    for (const call of await published({ tripApp: false })) assert.equal(call.commands.some((c) => c.command === "app"), false);
+    const ready = await published({ tripApp: true });
+    assert.equal(ready.length, routerCommandMenus().length);
+    for (const call of ready) assert.equal(call.commands.some((c) => c.command === "app"), true);
+  });
+
   test("publishes every menu with a scope object and no blank language_code", async () => {
     const calls: Parameters<NonNullable<TelegramClient["setMyCommands"]>>[0][] = [];
     const ok = await publishCommandMenu(fakeTelegram(async (params) => { calls.push(params); return true; }));

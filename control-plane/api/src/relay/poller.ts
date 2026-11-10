@@ -29,6 +29,8 @@ import {
   renderEssentialsDone,
   renderQuestion,
   renderSuggestion,
+  suggestionNoCallbackData,
+  suggestionYesCallbackData,
   type InlineKeyboard,
   type RenderedQuestion,
 } from "../chat-router.js";
@@ -67,7 +69,7 @@ import {
   INTAKE_QUESTIONS,
   claimExpiredSessions,
   claimSessionsDueWarning,
-  expiredSessionLanguage,
+  expiredSessionNotice,
   touchSessionDeadline,
   answersForChat,
   saveSourceDocumentForChat,
@@ -88,6 +90,8 @@ import {
   skipQuestionForChat,
   toggleMultiChoiceForChat,
   saveSuggestionsForChat,
+  markDocumentRecap,
+  clearDocumentRecap,
   dismissSuggestionForChat,
   suggestionLabel,
   type SuggestedAnswer,
@@ -187,7 +191,7 @@ import type { MediaDeps } from "./normalize.js";
 import { PendingAttachments } from "./pending-attachments.js";
 import { GroupContext } from "./group-context.js";
 import {
-  askText, DEFAULT_LANGUAGE, optionLabel, readableDate, recapLabel, UI_STRINGS, uiString, writtenLanguage,
+  askText, askTextAfterKnownDeclined, DEFAULT_LANGUAGE, optionLabel, readableDate, recapLabel, UI_STRINGS, uiString, writtenLanguage,
   type Language,
 } from "../intake-copy.js";
 import { structuredLog } from "../redaction.js";
@@ -199,6 +203,7 @@ import {
   type DispatchStrings,
 } from "./dispatch.js";
 import { toWireEvent, type TelegramUpdate } from "./normalize.js";
+import { isOurOpenTripMessage, type OpenTripMessage } from "./open-trip.js";
 import { agentTextIsInLanguage } from "./internal-leak.js";
 import type { WireMessageEvent } from "./protocol.js";
 import { isPermanentRefusal, type SendResult, type TelegramClient } from "./telegram-api.js";
@@ -228,6 +233,13 @@ export interface TripBotPollerDeps {
    * rather than "replying to us".
    */
   botIdentity?: BotIdentity;
+  /**
+   * The bot handle the "Open trip" link points at (`web.telegram_bot_username`);
+   * see DispatchOptions.tripAppBotUsername.
+   */
+  tripAppBotUsername?: string | null;
+  /** Whether the Mini App is ready for that bot, asked per update; see DispatchOptions.tripAppReady. */
+  tripAppReady?: () => boolean;
   /**
    * The Hermes profile that serves written interview answers, from
    * `relay.interviewer_profile`.
@@ -354,6 +366,48 @@ function interviewChatOf(decision: DispatchDecision): string | null {
   }
 }
 
+/**
+ * Takes down the "Open trip" message WE pinned earlier in this chat, if the top
+ * pin is one. Best effort and quiet: no pin rights, no such pin, or a client
+ * that cannot ask, and the new button is posted anyway. "Ours" is decided on
+ * the bot's own id plus the message's shape (open-trip.ts), never on text alone.
+ */
+async function unpinOurOpenTrip(chatId: string, deps: TripBotPollerDeps, log: (line: string) => void): Promise<void> {
+  const botId = deps.botIdentity?.id;
+  if (!botId || !deps.telegram.getPinnedMessage || !deps.telegram.unpinChatMessage) return;
+  try {
+    const pinned = await deps.telegram.getPinnedMessage(chatId);
+    if (!pinned || !isOurOpenTripMessage(pinned, botId)) return;
+    const unpinned = await deps.telegram.unpinChatMessage({ chatId, messageId: pinned.messageId });
+    log(structuredLog("info", "trip_bot.open_trip_unpinned", { unpinned }));
+  } catch (error) {
+    log(structuredLog("warn", "trip_bot.open_trip_unpin_failed", {
+      safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+    }));
+  }
+}
+
+/**
+ * Sends the "Open trip" message and pins it. If it cannot be pinned, the chat is
+ * told so ONCE, in the same breath, with what to do about it: the button already
+ * works where it stands, so this is advice, not an error, and nothing retries.
+ */
+async function postOpenTrip(
+  chatId: string,
+  open: OpenTripMessage,
+  deps: TripBotPollerDeps,
+  log: (line: string) => void,
+): Promise<void> {
+  const sent = await deps.telegram.sendMessage({ chatId, text: open.text, replyMarkup: open.replyMarkup });
+  log(structuredLog("info", "trip_bot.open_trip_sent", { ok: sent.ok }));
+  if (!sent.ok || !sent.messageId) return;
+  const pinned = deps.telegram.pinChatMessage
+    ? await deps.telegram.pinChatMessage({ chatId, messageId: sent.messageId })
+    : false;
+  log(structuredLog("info", "trip_bot.open_trip_pin", { pinned }));
+  if (!pinned) await deps.telegram.sendMessage({ chatId, text: open.pinFailedText });
+}
+
 export async function applyDecision(
   decision: DispatchDecision,
   deps: TripBotPollerDeps,
@@ -380,13 +434,14 @@ export async function applyDecision(
   // no reply and no reason.
   //
   // Only reached when the chat has NO live session — a fresh deep link makes a
-  // new one and leaves the expired one alone, so `expiredSessionLanguage`
+  // new one and leaves the expired one alone, so `expiredSessionNotice`
   // checks for that. A `/start` never lands here anyway: it is a `reply`
   // decision with its own text, not an interview one.
   if (chatId) {
-    const closedIn = await expiredSessionLanguage(deps.db, chatId);
-    if (closedIn) {
-      await deps.telegram.sendMessage({ chatId, text: uiString("expiredWriteAfter", closedIn) });
+    const closed = await expiredSessionNotice(deps.db, chatId);
+    if (closed) {
+      // An organizer with a dashboard is sent there for the new link; anyone else, to whoever set the trip up (#513).
+      await deps.telegram.sendMessage({ chatId, text: uiString(closed.dashboard ? "expiredWriteAfterDashboard" : "expiredWriteAfter", closed.language) });
       log(structuredLog("info", "interview.write_after_expiry", { chat_id_present: true }));
       return;
     }
@@ -433,6 +488,22 @@ export async function applyDecision(
         chatId: decision.event.source.chat_id,
         text: strings.gatewayUnavailable,
       });
+      return;
+    }
+
+    case "multi_reply": {
+      // The tap first (the button stops spinning), then each message on its own: the stranger's chat may be unreachable
+      // (they blocked the bot), and that must not cost the organizer theirs, or the other way round (#519).
+      if (decision.callbackQueryId) {
+        await deps.telegram.answerCallbackQuery({ callbackQueryId: decision.callbackQueryId, text: decision.ackText }).catch(() => {});
+      }
+      for (const reply of decision.replies) {
+        try {
+          await deps.telegram.sendMessage({ chatId: reply.chatId, text: reply.text, replyMarkup: reply.replyMarkup });
+        } catch (error) {
+          log(structuredLog("warn", "trip_bot.multi_reply_send_failed", { detail: String((error as Error)?.message ?? error).slice(0, 200) }));
+        }
+      }
       return;
     }
 
@@ -658,6 +729,11 @@ export async function applyDecision(
     }
 
     case "group_intro": {
+      // A pinned "Open trip" of ours from an earlier arrival or binding is taken
+      // down FIRST, so the new one is the only one - and the group is never left
+      // pointing at a trip it no longer is (#443). Before the introduction, so
+      // that what Telegram reports as the top pin is the button and not the intro.
+      if (decision.openTrip) await unpinOurOpenTrip(decision.chatId, deps, log);
       const sent = await deps.telegram.sendMessage({ chatId: decision.chatId, text: decision.text });
       log(structuredLog("info", "trip_bot.group_intro_sent", { ok: sent.ok }));
       // The copyable line, on its own, after the instructions that point at it.
@@ -674,6 +750,7 @@ export async function applyDecision(
         });
         log(structuredLog("info", "trip_bot.group_intro_pin", { pinned }));
       }
+      if (decision.openTrip) await postOpenTrip(decision.chatId, decision.openTrip, deps, log);
       return;
     }
 
@@ -1057,6 +1134,8 @@ async function applyInterviewCallback(
       await ack("That question is no longer part of the interview.");
       return;
     }
+    // A tap answers what is on screen: the recap is no longer what they are replying to (#413).
+    await clearDocumentRecap(deps.db, decision.chatId);
     // A multi_choice answer is a set, so it arrives as `toggle` taps and a
     // Done, never as a single `answer`. Reaching here with one means a stale
     // keyboard from before multi-select existed.
@@ -1303,7 +1382,7 @@ async function applyInterviewCallback(
         await deps.telegram.editMessageText({
           chatId: decision.chatId,
           messageId: decision.messageId,
-          text: suggestionConfirmedText(question, label, language),
+          text: suggestionConfirmedText(question, label, language, suggestion.source),
           replyMarkup: undefined,
         });
       }
@@ -1318,6 +1397,23 @@ async function applyInterviewCallback(
     }
     await ack();
     log(structuredLog("info", "trip_bot.suggestion_declined", { session_id: decision.sessionId, question_id: parsed.questionId }));
+    // A question that is ANSWERED already (more travellers offered beside the
+    // answer, #412): "No" means "leave it as it is", not "ask me again" — turning
+    // the offer into the plain question would put an answered question back on
+    // screen as if it were open.
+    const heldNow = (await answersForChat(deps.db, decision.chatId))?.answers[parsed.questionId];
+    if (heldNow !== undefined && OFFERED_BESIDE_ANSWER.has(parsed.questionId)) {
+      if (decision.messageId) {
+        await deps.telegram.editMessageText({
+          chatId: decision.chatId,
+          messageId: decision.messageId,
+          text: uiString("documentMoreTravelersDeclined", language),
+          // An empty keyboard REMOVES the buttons; an absent one leaves them.
+          replyMarkup: { inline_keyboard: [] },
+        });
+      }
+      return;
+    }
     // THE SAME MESSAGE becomes the plain question. It is already the last
     // prompt (`q:<id>`), so sending it anew would be deduped into silence —
     // and replacing it in place is also what reads right: the question stays,
@@ -1710,7 +1806,7 @@ async function runDocumentPath(
 
   await markReadingDocument(deps.db, burst.chatId, true);
   try {
-    await readDocumentsInto(deps, deps.modelRunner, burst, tripId, registered, language, say, commit, log);
+    await readDocumentsInto(deps, deps.modelRunner, burst, tripId, registered, language, say, commit, log, interpretationId);
   } finally {
     // THE NEXT QUESTION, NOW — after the flag is down, not before. `ask` used to
     // be a closure `readDocumentsInto` called at each of its own exits, all of
@@ -2060,8 +2156,10 @@ async function askOpenConflict(view: SessionView, chatId: string, deps: TripBotP
  * is not valid UTF-8 and Telegram refuses the whole edit. `cutText` counted code
  * points, so 3000 emoji came out at 6000 units and the edit was refused.
  */
-export function suggestionConfirmedText(question: IntakeQuestion, label: string | null, language: Language): string {
-  return `${askText(question, language)}\n\n✅ ${cutWhole(label ?? "", SUGGESTION_EDIT_LABEL_MAX)}`;
+export function suggestionConfirmedText(question: IntakeQuestion, label: string | null, language: Language, source?: SuggestedAnswer["source"]): string {
+  // "Is that the only stop?" answered Yes must not turn into "Where are you going, and when?" over the recorded stop.
+  const asked = source === "known_place" ? askTextAfterKnownDeclined(question, language) : askText(question, language);
+  return `${asked}\n\n✅ ${cutWhole(label ?? "", SUGGESTION_EDIT_LABEL_MAX)}`;
 }
 const SUGGESTION_EDIT_LABEL_MAX = 3000;
 
@@ -2075,7 +2173,7 @@ function renderStep(question: IntakeQuestion, view: SessionView, phrasing?: stri
   const suggestion = view.suggestions[question.id];
   const label = suggestion ? suggestionLabel(question.id, suggestion, view.language) : null;
   return label
-    ? renderSuggestion(question, label, view.language, phrasing)
+    ? renderSuggestion(question, label, view.language, phrasing, suggestion?.source, suggestion?.structuredData)
     : renderQuestion(question, selectedOptionIds(view, question.id), view.language, phrasing, fromRecord(view, question.id));
 }
 
@@ -2085,7 +2183,7 @@ function renderStep(question: IntakeQuestion, view: SessionView, phrasing?: stri
  */
 function fromRecord(
   view: SessionView, questionId: string,
-): { choices?: RosterChoice[]; unsettled?: string; unsettledKind?: string; subject?: string } {
+): { choices?: RosterChoice[]; unsettled?: string; unsettledKind?: string; subject?: string; afterKnownDeclined?: boolean } {
   const subject = view.subjects?.[questionId];
   const from = subject ? findQuestion(subject.fromQuestion) : null;
   const unsettled = view.unsettled?.[questionId];
@@ -2094,7 +2192,56 @@ function fromRecord(
     unsettled: unsettled?.text,
     unsettledKind: unsettled?.matchKind,
     subject: from && subject ? optionLabel(from, subject.optionId, view.language) : undefined,
+    afterKnownDeclined: questionId === "phases" && view.stopsAskedFromKnown === true,
   };
+}
+
+/**
+ * Questions whose unsure reading is kept even when this very read ANSWERED the
+ * question: the reading is more people on top of the answer just written, and
+ * for any other question it would be a second opinion about something now
+ * settled. Only `travelers` (#412); the gate offers the same for stops, and
+ * those stay unshown until someone decides they should be.
+ */
+const OFFERED_BESIDE_ANSWER: ReadonlySet<string> = new Set(["travelers"]);
+
+/**
+ * The people a stored travellers suggestion would ADD to the travellers held
+ * now, when `travelers` is answered — the case where the router never asks the
+ * question again, so the offer has to be made where the document is answered.
+ * Null when the question is not answered (the router will ask it, with the
+ * suggestion), or when the suggestion adds nobody. `alreadyShown`: the same
+ * suggestion is already stored, i.e. its offer is on the organizer's screen.
+ */
+async function moreTravelersOffer(
+  deps: TripBotPollerDeps,
+  chatId: string,
+  suggestion: SuggestedAnswer,
+): Promise<{ names: string[]; alreadyShown: boolean } | null> {
+  const held = (await answersForChat(deps.db, chatId))?.answers.travelers as { kind?: string; data?: unknown } | undefined;
+  if (!held || held.kind !== "structured" || !Array.isArray(held.data)) return null;
+  const offered = Array.isArray(suggestion.structuredData) ? suggestion.structuredData : [];
+  const names: string[] = [];
+  for (const entry of offered) {
+    if (!isRecordValue(entry)) continue;
+    if (matchEntry(held.data, held.data.length, entry, { people: true }).kind !== "new") continue;
+    const name = [entry.name, entry.name_en].find((n): n is string => typeof n === "string" && n.trim() !== "");
+    if (name) names.push(name.trim());
+  }
+  if (names.length === 0) return null;
+  const view = await getSessionForChat(deps.db, chatId);
+  const stored = view.ok ? view.view.suggestions.travelers : undefined;
+  return { names, alreadyShown: stored !== undefined && canonical(stored.structuredData) === canonical(suggestion.structuredData) };
+}
+
+/** "A", "A and B", "A, B and C" — and the Hebrew "A, B ו־C". Names come from a document, so they are cut. */
+function joinNames(names: readonly string[], language: Language): string {
+  const shown = names.slice(0, 12).map((n) => cutWhole(n, 80));
+  const more = names.length > shown.length ? ` +${names.length - shown.length}` : "";
+  if (shown.length === 1) return `${shown[0]}${more}`;
+  const last = shown[shown.length - 1]!;
+  const head = shown.slice(0, -1).join(", ");
+  return `${head} ${language === "he" ? "ו־" : "and "}${last}${more}`;
 }
 
 /**
@@ -2115,6 +2262,7 @@ async function readDocumentsInto(
   say: (text: string) => Promise<void>,
   commit: CommitDocumentBurst,
   log: (line: string) => void,
+  recapId?: string,
 ): Promise<void> {
   const started = Date.now();
   const extracted = await extractRegisteredDocuments(
@@ -2207,7 +2355,9 @@ async function readDocumentsInto(
   // question comes up. Only for questions this read did not just answer.
   const suggestions: Record<string, SuggestedAnswer> = {};
   for (const unsureRead of decisions.suggested) {
-    if (recorded.includes(unsureRead.questionId)) continue;
+    // Except more PEOPLE (#412): a second ticket's travellers beside the
+    // first's are exactly what this read answered AND left an offer about.
+    if (recorded.includes(unsureRead.questionId) && !OFFERED_BESIDE_ANSWER.has(unsureRead.questionId)) continue;
     const args = submitArgsFor(unsureRead.proposal.value);
     suggestions[unsureRead.questionId] = {
       optionId: args.optionId,
@@ -2217,7 +2367,27 @@ async function readDocumentsInto(
     };
   }
   const unsure = Object.keys(suggestions);
+  // More travellers for a question that is ANSWERED: the router will never ask
+  // it again, so the offer is made in this reply (#412). Decided before the
+  // suggestion is saved, to tell a fresh offer from the one already on screen.
+  const moreTravelers = suggestions.travelers ? await moreTravelersOffer(deps, burst.chatId, suggestions.travelers) : null;
   if (unsure.length > 0) await saveSuggestionsForChat(deps.db, burst.chatId, suggestions);
+  // What the router will ask about later, as before; the travellers offer is not among them.
+  const askLater = unsure.filter((q) => !(q === "travelers" && moreTravelers));
+  const sendMoreTravelers = async () => {
+    if (!moreTravelers || moreTravelers.alreadyShown) return;
+    const text = uiString("documentMoreTravelers", language).replace("{names}", joinNames(moreTravelers.names, language));
+    await deps.telegram.sendMessage({
+      chatId: burst.chatId,
+      text,
+      replyMarkup: {
+        inline_keyboard: [[
+          { text: uiString("suggestionYes", language), callback_data: suggestionYesCallbackData("travelers") },
+          { text: uiString("suggestionNo", language), callback_data: suggestionNoCallbackData("travelers") },
+        ]],
+      },
+    }).catch(() => undefined);
+  };
 
   log(structuredLog("info", "interview.document_committed", {
     session_id: burst.sessionId,
@@ -2273,16 +2443,20 @@ async function readDocumentsInto(
       // the trip was the reply on 2026-09-13's acceptance run.
       const agreed = proposed.length > 0 &&
         decisions.rejected.some((r) => r.reason === "NO_NEW_INFORMATION" || r.reason === "ALREADY_ANSWERED");
-      await say(uiString(
-        alreadyRead ? "documentAlreadyRead"
-          : failures.length > 0 ? "documentExtractFailed"
-          // "Found nothing" would be untrue when it found things it was unsure of.
-          : unsure.length > 0 ? "documentUnsure"
-          : agreed ? "documentNothingNew"
-          : "documentNothing",
-        language,
-      ));
+      // The travellers offer below IS the reply when it is all there is to say.
+      if (!(moreTravelers && !moreTravelers.alreadyShown && askLater.length === 0 && failures.length === 0)) {
+        await say(uiString(
+          alreadyRead ? "documentAlreadyRead"
+            : failures.length > 0 ? "documentExtractFailed"
+            // "Found nothing" would be untrue when it found things it was unsure of.
+            : askLater.length > 0 ? "documentUnsure"
+            : agreed ? "documentNothingNew"
+            : "documentNothing",
+          language,
+        ));
+      }
     }
+    await sendMoreTravelers();
     return;
   }
 
@@ -2315,9 +2489,9 @@ async function readDocumentsInto(
       lines.push(`• ${uiString("documentPlanned", language)}: ${shown}${unique.length > 12 ? ` +${unique.length - 12}` : ""}`);
     }
 
-    if (unsure.length > 0) {
+    if (askLater.length > 0) {
       const checking = buildRecap(
-        Object.fromEntries(decisions.suggested.filter((x) => unsure.includes(x.questionId)).map((x) => [x.questionId, x.answer])),
+        Object.fromEntries(decisions.suggested.filter((x) => askLater.includes(x.questionId)).map((x) => [x.questionId, x.answer])),
         INTAKE_QUESTIONS,
         language,
       ).map((entry) => entry.prompt);
@@ -2326,8 +2500,13 @@ async function readDocumentsInto(
 
     if (lines.length > 0) {
       await say(`${uiString("documentRead", language)}\n\n${lines.join("\n")}\n\n${uiString("documentCorrect", language)}`);
+      // THE RECAP IS NOW WHAT THEY ARE LOOKING AT, though `say` records no prompt
+      // and the question the router puts under it will be the one on record. The
+      // next message is read as possibly about the recap first (#413).
+      if (recapId) await markDocumentRecap(deps.db, burst.chatId, `recap:doc:${recapId}`);
     }
   }
+  await sendMoreTravelers();
 
   // IN THE BACKGROUND, AND DELIBERATELY NOT AWAITED. It is a second model call
   // taking up to minutes, and this runs inside the relay's one delivery loop:
@@ -2704,6 +2883,9 @@ async function settleChange(
   }
 }
 
+/** The recap marker the final summary uses after "who are the other travellers?" - it has no document behind it. */
+const SUMMARY_ASKED_MARKER = "recap:doc:summary:asked";
+
 /** Reasons a typed proposal for an answered question was refused that the organizer must hear about. */
 const ASK_ABOUT_REFUSED: ReadonlySet<string> = new Set([
   "ALREADY_ANSWERED", "LOW_CONFIDENCE", "EVIDENCE_NOT_IN_SOURCE", "CHANGE_NEEDS_CONFIRMATION",
@@ -2822,7 +3004,7 @@ async function retakeFloor(
   chatId: string,
   sessionId: string,
   log: (line: string) => void,
-  reply: "change_preview" | "change_refused" | "change_not_understood" | "required_reask",
+  reply: "change_preview" | "change_refused" | "change_not_understood" | "required_reask" | "recap_clarify",
   extra: Record<string, string> = {},
 ): Promise<SessionView | null> {
   log(structuredLog("info", "interview.change_floor_taken_back", { session_id: sessionId, reply, ...extra }));
@@ -2842,7 +3024,7 @@ async function answerThisMessage(
   view: SessionView,
   text: string,
   log: (line: string) => void,
-  reply: "change_refused" | "change_not_understood",
+  reply: "change_refused" | "change_not_understood" | "recap_clarify",
 ): Promise<boolean> {
   if (!(await takeFloor(chatId, view, deps))) {
     const again = await retakeFloor(deps, chatId, view.sessionId, log, reply);
@@ -3150,6 +3332,14 @@ async function runInterpretPath(
     }
   }
 
+  // THE MESSAGE RIGHT AFTER A DOCUMENT RECAP (#413). The marker is alive for one
+  // inbound message: read here, cleared here, so a later message is never taken
+  // for a reply to a recap it did not follow. A document replaces it (its own
+  // recap sets a new one); a tap on an answer clears it in `applyDecision`.
+  const recapMarker = session.ok ? session.view.recapMarker ?? null : null;
+  if (recapMarker) await clearDocumentRecap(deps.db, burst.chatId);
+  const recapTurn = documents.length === 0 && recapMarker !== null;
+
   // A DOCUMENT. Read it, and let what it says answer questions.
   //
   // Handled before the text branch and instead of it: someone who uploads a
@@ -3362,6 +3552,11 @@ async function runInterpretPath(
       // is looking at: what they type is then something to ADD or CHANGE, and the
       // reader is given every answerable question for it (2026-10-15).
       summaryOnScreen: session.ok && (session.view.state === "awaiting_confirmation" || boundaryOnScreen(session.view) !== null),
+      // The recap is what they have just read: the message may be a correction
+      // of what the document gave rather than the answer on screen (#413).
+      afterDocumentRecap: recapTurn,
+      // The one reply after "who are the other travellers?" is probably their names.
+      askedOtherTravellers: recapTurn && recapMarker !== null && recapMarker.endsWith(":asked"),
       answered: state.answered,
       // What they have already told us, so "actually, it's only my wife" is
       // something the model can propose at all (2026-09-16).
@@ -3432,6 +3627,45 @@ async function runInterpretPath(
     // The stops and the travellers change only through the confirmed flow.
     changeQuestions: CHANGE_QUESTIONS,
   });
+
+  // A MESSAGE ABOUT THE TRAVELLERS THAT NAMES NOBODY, right after the recap
+  // ("נוסעים אחרים" — the second couple's names were not read): the reader says
+  // `unclear` for `travelers`. It is answered with a question about the
+  // travellers, never filed against the question on screen (#413).
+  //
+  // THE FINAL SUMMARY IS A RECAP TOO (2026-11-08): "נוסעים אחרים" typed there came back `unclear` for
+  // `travelers`, and with no document recap behind it the question above was never asked, so it was met with
+  // "I wasn't sure what you wanted to change about the travellers" three times.
+  const atSummary = session.ok && session.view.state === "awaiting_confirmation";
+  // Asked at the summary and answered with another nameless message: not asked a second time in a row.
+  const summaryAsked = recapMarker === SUMMARY_ASKED_MARKER;
+  const clarifyTravellers = (recapTurn || atSummary) && !summaryAsked
+    && state.answered.includes("travelers")
+    && unclear.some((u) => u.questionId === "travelers")
+    && !decisions.accepted.some((a) => a.questionId === "travelers")
+    && !((ops ?? []).some((op) => questionOfOp(op) === "travelers"));
+
+  // THE ON-SCREEN ANSWER THE FLOOR DID NOT WAIVE: a bot_name that is only a word
+  // for people, below the floor (#413). It is kept as an offer — "is this right?"
+  // — so a deliberate "Family" costs one tap, not a refusal. Only the question on
+  // screen: a volunteered low-confidence read for another question stays dropped,
+  // as it always was on the typed path.
+  if (!clarifyTravellers && onScreen) {
+    const offered = decisions.suggested.filter((x) => x.questionId === onScreen && !state.answered.includes(onScreen));
+    if (offered.length > 0) {
+      const offers: Record<string, SuggestedAnswer> = {};
+      for (const o of offered) {
+        const args = submitArgsFor(o.proposal.value);
+        offers[o.questionId] = {
+          optionId: args.optionId,
+          ...(args.otherText !== undefined ? { otherText: args.otherText } : {}),
+          ...(args.structuredData !== undefined ? { structuredData: args.structuredData } : {}),
+          ...(args.optionIds ? { optionIds: [...args.optionIds] } : {}),
+        };
+      }
+      await saveSuggestionsForChat(deps.db, burst.chatId, offers);
+    }
+  }
 
   for (const accepted of decisions.accepted) {
     // The MERGED answer, not the raw reading — see `submitArgsForAccepted`. (The
@@ -3517,6 +3751,19 @@ async function runInterpretPath(
   const made = change as ProposeResult | null;
   if (made) draftShown = await announceChange(deps, burst, made, language, log);
   if (draftShown) return;
+
+  if (clarifyTravellers) {
+    log(structuredLog("info", "interview.recap_clarify_travellers", { session_id: burst.sessionId }));
+    const now = await getSessionForChat(deps.db, burst.chatId);
+    if (now.ok && (await answerThisMessage(deps, burst.chatId, now.view, uiString("askOtherTravellers", now.view.language), log, "recap_clarify"))) {
+      // The names are the next message, and it is still about the recap: one more
+      // message, once — a second nameless reply does not renew it.
+      // A summary has no document recap behind it: its own marker, same one-message life.
+      const asked = recapMarker ?? SUMMARY_ASKED_MARKER.replace(/:asked$/, "");
+      if (!asked.endsWith(":asked")) await markDocumentRecap(deps.db, burst.chatId, `${asked}:asked`);
+      return;
+    }
+  }
 
   // NEVER SILENT. A typed change to something already answered that the gate
   // would not take — an unsure read, a quote that is not in the message, a value
@@ -5418,6 +5665,8 @@ export function startTripBotPoller(
         ...(deps.assistantEvents ? { assistantEvents: true } : {}),
         ...(deps.groupJudge ? { groupJudge: deps.groupJudge } : {}),
         ...(deps.organizerDocumentRoute === true ? { organizerDocumentRoute: true } : {}),
+        ...(deps.tripAppBotUsername ? { tripAppBotUsername: deps.tripAppBotUsername } : {}),
+        ...(deps.tripAppReady ? { tripAppReady: deps.tripAppReady } : {}),
         // Asked per update rather than cached: a gateway can stop between
         // one message and the next, and a stale "reachable" spends the
         // organizer's turn on a socket that is gone.

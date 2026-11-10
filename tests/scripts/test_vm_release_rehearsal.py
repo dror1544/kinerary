@@ -15,7 +15,12 @@ touches VM 110, kept as a test so it runs in every preflight:
 - a --restore-db rollback puts the database back to the dump and the code back
   to the previous version, keeping what it replaced;
 - a rollback whose migrate fails undoes itself completely — the database it had
-  already swapped goes back and the services come up again.
+  already swapped goes back and the services come up again;
+- an upgrade restarts every running gateway (discovered from the supervisor, not
+  listed in the tool), skips a leftover slot and a retired trip's, and verify
+  judges each one by the MCP servers in its own config from lines newer than its
+  restart; a bridge that was already failing does not fail the upgrade, one the
+  upgrade broke does.
 
 Skipped when docker is not available.
 """
@@ -23,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -74,6 +80,8 @@ if args[:1] == ["compose"]:
         sys.exit(0)
     if verb == "stop":
         state["running"] = {k: v for k, v in state["running"].items() if k not in services}
+        if "relay" in services and state.get("bridge_mode_after"):
+            Path(os.environ["FAKE_BRIDGE_MODE"]).write_text(state["bridge_mode_after"])
         save(); sys.exit(0)
     if verb == "up":
         for service in services:
@@ -103,15 +111,31 @@ if args[:1] == ["ps"]:
 if args[:1] == ["logs"]:
     print(json.dumps({"event": "relay.bot_identity", "username": "Example_bot"}))
     print(json.dumps({"event": "relay.ready", "polling": True}))
+    for profile in state.get("connected", []):
+        print(json.dumps({"event": "relay.gateway_connected", "gateway_id": profile}))
     sys.exit(0)
 if args[:2] == ["image", "inspect"]:
     sys.exit(0)                      # every version's images are present
-if args[:1] == ["exec"] and any(a.endswith("s6-svc") for a in args):
-    # The trip-intake gateway restart (#420): a restarted gateway registers the
-    # interview tools again, which is the new log line the release waits for.
-    log = Path(os.environ["FAKE_AGENT_LOG"])
-    lines = [l for l in log.read_text().splitlines() if "registered" in l]
-    log.open("a").write((lines[-1] if lines else "MCP server 'interview' registered 0 tool(s):") + "\n")
+if args[:3] == ["exec", "hermes", "ls"]:
+    # The Hermes supervisor's scan directory: one gateway-<profile> slot each (#420).
+    print("s6-linux-init-shutdownd")
+    for profile in state["slots"]:
+        print(f"gateway-{profile}")
+    sys.exit(0)
+if args[:2] == ["exec", "hermes"] and args[2:3] and args[2].endswith("s6-svstat"):
+    profile = args[3].rsplit("gateway-", 1)[1]
+    print("down (exitcode 0) 4 seconds" if profile in state.get("down", []) else "up (pid 31) 900 seconds")
+    sys.exit(0)
+if args[:2] == ["exec", "hermes"] and args[2:3] and args[2].endswith("s6-svc"):
+    # A restarted gateway registers its MCP servers again: new lines in its own agent.log,
+    # which is what the release waits for and verify reads.
+    profile = args[-1].rsplit("gateway-", 1)[1]
+    if profile in state.get("restart_fails", []):
+        print("s6-svc: fatal: unable to control: supervisor not listening", file=sys.stderr); sys.exit(1)
+    log = Path(os.environ["KINERARY_CP_HERMES_DATA"]) / "profiles" / profile / "logs" / "agent.log"
+    with log.open("a") as handle:
+        for line in state.get("registrations", {}).get(profile, []):
+            handle.write(line + "\n")
     sys.exit(0)
 if args[:1] == ["exec"]:
     real(args)                        # psql, pg_dump and pg_restore are real
@@ -174,6 +198,19 @@ esac
 exit 0
 '''
 
+FAKE_SS = '''#!/bin/sh
+# ss -ltnH "sport = :PORT": the ports in FAKE_LISTENING are listening.
+port="${2##*:}"
+for p in $FAKE_LISTENING; do [ "$p" = "$port" ] && echo "LISTEN 0 511 127.0.0.1:$port"; done
+exit 0
+'''
+
+FAKE_INSTALL = '''#!/bin/sh
+# install -D ... : what install_tool_files runs after a green verify. Recorded, not done.
+echo "install $*" >> "$FAKE_CALLS"
+exit 0
+'''
+
 FAKE_FINDMNT = '''#!/bin/sh
 case "$*" in
   *FSTYPE*) echo ext4 ;;        # the VM's own disk
@@ -216,6 +253,25 @@ if (AGENT_KEY) {
   mcp.tool( "submit_answer_for_chat", schema, handler);
 }
 """
+
+COMPANION_MCP = """
+mcp.tool(
+  "get_assistant_names", "d", {}, handler);
+mcp.tool(
+  "set_assistant_names", "d", {}, handler);
+mcp.tool(
+  "report_bug", "d", {}, handler);
+"""
+
+COMPANION_TOOLS = ("get_assistant_names", "set_assistant_names", "report_bug")
+
+
+def registration(server, tools):
+    prefix = "mcp__" + server.replace("-", "_") + "__"
+    return f"[gateway] MCP server '{server}' registered {len(tools)} tool(s): " + ", ".join(prefix + t for t in tools)
+
+
+KEY = "rehearsal-bridge-key-0123456789"
 
 AGENT_LOG = ("[gateway] MCP server 'interview' registered 2 tool(s): "
              "mcp__interview__collect_answer_for_chat, mcp__interview__submit_answer_for_chat\n")
@@ -282,6 +338,8 @@ class Rehearsal(unittest.TestCase):
         for name in ("0001_foundation.sql", "0002_bindings.sql"):
             (source / "control-plane/db/migrations" / name).write_text("-- rollback: compatible — grandfathered\nSELECT 1;\n")
         (source / "control-plane/api/src/interview-mcp.ts").write_text(INTERVIEW_MCP)
+        (source / "control-plane/api/src/companion-mcp.ts").write_text(COMPANION_MCP)
+        (source / "control-plane/deployment/vm-release.py").write_text("# the target's own tool\n")
         (source / "control-plane/deployment/compose.vm.yml").write_text("services: {}\n")
         relay = source / "control-plane/deployment/vm-relay-restart.sh"
         relay.write_text("#!/bin/sh\nexec docker compose up -d --wait relay\n")
@@ -304,6 +362,7 @@ class Rehearsal(unittest.TestCase):
         deploy, hermes, bins = self.tmp / "deploy", self.tmp / "hermes-data", self.tmp / "bin"
         (hermes / "profiles/trip-intake/logs").mkdir(parents=True)
         (hermes / "profiles/trip-intake/logs/agent.log").write_text(AGENT_LOG)
+        (hermes / "profiles/trip-intake/config.yaml").write_text("mcp_servers:\n  interview:\n    transport: sse\n")
         (hermes / "auth.json").write_text('{"provider": "not a real token"}')
         deploy.mkdir()
         (deploy / "vm.env").write_text(f"KINERARY_REV={self.old_rev}\nHERMES_REV=h1\n")
@@ -312,8 +371,8 @@ class Rehearsal(unittest.TestCase):
             "CP_PROXMOX_KNOWN_HOSTS_ON_VM=/dev/null\nCP_REFUSE_STORAGE=nas-share\n")
         (deploy / "provisioning.env").write_text("PROXMOX_HOST=pve.example\nPROXMOX_SSH_USER=root\n")
         bins.mkdir()
-        for name, text in (("docker", FAKE_DOCKER), ("ssh", FAKE_SSH), ("sudo", FAKE_SUDO),
-                           ("hermes", FAKE_HERMES), ("findmnt", FAKE_FINDMNT)):
+        for name, text in (("docker", FAKE_DOCKER), ("ssh", FAKE_SSH), ("sudo", FAKE_SUDO), ("ss", FAKE_SS),
+                           ("install", FAKE_INSTALL), ("hermes", FAKE_HERMES), ("findmnt", FAKE_FINDMNT)):
             path = bins / name
             path.write_text(text)
             path.chmod(path.stat().st_mode | stat.S_IEXEC)
@@ -322,7 +381,9 @@ class Rehearsal(unittest.TestCase):
             "running": {f"kinerary-cp-{s}-1": f"kinerary-cp/{s}:{self.old_rev}"
                         for s in ("api", "worker", "relay", "interview-mcp", "companion-mcp")}
                        | {"hermes": "kinerary-cp/hermes:h1"},
-            "hermes_rev": "h1", "snapshots": {}, "migrate_fails": False}))
+            "hermes_rev": "h1", "snapshots": {}, "migrate_fails": False,
+            "slots": ["trip-intake"], "connected": [],
+            "registrations": {"trip-intake": [AGENT_LOG.strip()]}}))
         self.calls = self.tmp / "calls.log"
         self.calls.write_text("")
         host, port = self.readyz.server_address[0], self.readyz.server_address[1]
@@ -331,7 +392,7 @@ class Rehearsal(unittest.TestCase):
             "PATH": f"{bins}:{os.environ['PATH']}",
             "REAL_DOCKER": DOCKER,
             "FAKE_STATE": str(self.state), "FAKE_CALLS": str(self.calls),
-            "FAKE_AGENT_LOG": str(hermes / "profiles/trip-intake/logs/agent.log"),
+            "FAKE_LISTENING": "", "FAKE_BRIDGE_MODE": str(self.tmp / "bridge-mode"),
             "FAKE_VM_ENV": str(deploy / "vm.env"), "FAKE_REPO": str(self.repo), "FAKE_PG": self.container,
             "KINERARY_CP_REPO": str(self.repo), "KINERARY_CP_DEPLOY_ROOT": str(deploy),
             "KINERARY_CP_HERMES_DATA": str(hermes), "KINERARY_CP_PG_CONTAINER": self.container,
@@ -368,6 +429,53 @@ class Rehearsal(unittest.TestCase):
         state["migrate_fails"] = failing
         self.state.write_text(json.dumps(state))
 
+    def set_state(self, **fields):
+        state = json.loads(self.state.read_text())
+        state.update(fields)
+        self.state.write_text(json.dumps(state))
+
+    def calls_text(self) -> list[str]:
+        return self.calls.read_text().splitlines()
+
+    def restarts(self) -> list[str]:
+        """The profiles `s6-svc -r` was issued for, in order."""
+        return [m.group(1) for line in self.calls_text() if (m := re.search(r"s6-svc -r /run/service/gateway-(\S+)", line))]
+
+    def fleet(self, bridge="ok", bridge_after=None, restart_fails=()):
+        """A fleet beyond trip-intake: a companion with a bridge, the monitor, a slot whose
+        profile is gone, and a retired trip's gateway that is still running."""
+        hermes = self.tmp / "hermes-data"
+
+        def profile(name, servers, lines):
+            home = hermes / "profiles" / name
+            (home / "logs").mkdir(parents=True, exist_ok=True)
+            (home / "config.yaml").write_text("mcp_servers:\n" + "".join(f"  {s}:\n    transport: sse\n" for s in servers))
+            (home / "logs" / "agent.log").write_text("".join(line + "\n" for line in lines))
+        companion = [registration("trip-mcp", ["get_config"]), registration("trip-control", COMPANION_TOOLS)]
+        profile("trip-a", ["trip-mcp", "trip-control"], companion)
+        profile("trip-monitor", ["fleet"], [registration("fleet", ["alerts"])])
+        profile("trip-x", ["trip-mcp"], [registration("trip-mcp", ["get_config"])])
+        self.sql("""
+            INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES
+              ('trip_cccccccc', 'alsace', 'ready_private'), ('trip_dddddddd', 'retired-x-20261001', 'ready_private');
+            INSERT INTO control_plane.telegram_chat_bindings(id, trip_id, chat_id, hermes_profile) VALUES
+              ('tcb_a', 'trip_cccccccc', '1002', 'trip-a'), ('tcb_x', 'trip_dddddddd', '1003', 'trip-x');""")
+        self.bridge_server = HTTPServer(("127.0.0.1", 0), BridgeHandler)
+        BridgeHandler.mode_file, BridgeHandler.key = Path(self.env["FAKE_BRIDGE_MODE"]), KEY
+        Path(self.env["FAKE_BRIDGE_MODE"]).write_text(bridge)
+        threading.Thread(target=self.bridge_server.serve_forever, daemon=True).start()
+        self.addCleanup(self.bridge_server.server_close)
+        self.addCleanup(self.bridge_server.shutdown)
+        port = str(self.bridge_server.server_address[1])
+        (self.deploy / "trips/alsace/mcp").mkdir(parents=True)
+        (self.deploy / "trips/alsace/mcp/.env").write_text(f"MCP_PORT={port}\nMCP_API_KEY={KEY}\n")
+        self.env["FAKE_LISTENING"] = port
+        self.set_state(slots=["trip-intake", "trip-a", "trip-monitor", "trip-b", "trip-x"], connected=["trip-a"],
+                       restart_fails=list(restart_fails), bridge_mode_after=bridge_after or "",
+                       registrations={"trip-intake": [AGENT_LOG.strip()], "trip-a": companion,
+                                      "trip-monitor": [registration("fleet", ["alerts"])],
+                                      "trip-x": [registration("trip-mcp", ["get_config"])]})
+
     # ------------------------------------------------------------ tests --
     def test_the_vm_s_own_paths_still_need_root(self):
         bare = {k: v for k, v in self.env.items() if not k.startswith("KINERARY_CP_")}
@@ -383,7 +491,11 @@ class Rehearsal(unittest.TestCase):
         self.assertEqual(self.snapshots(), {}, "a dry run never takes a snapshot")
         self.assertEqual(self.history(), [])
         self.assertFalse((self.tmp / "backups").exists(), "and never writes a backup")
-        self.assertNotIn("s6-svc", self.calls.read_text(), "and never restarts the trip-intake gateway (#420)")
+        self.assertNotIn("s6-svc", self.calls.read_text(), "and never restarts a gateway (#420)")
+        self.assertIn("exec hermes ls /run/service", self.calls.read_text(), "but it does read the supervisor, for real")
+        self.assertNotIn("stop relay", self.calls.read_text(), "and never stops the relay")
+        self.assertFalse((self.tmp / "state").exists(), "and takes a baseline without saving one")
+        self.assertIn("baseline:", done.stdout)
 
     def test_an_upgrade_then_a_restore_db_rollback(self):
         done = self.release("upgrade", self.new_rev)
@@ -411,6 +523,105 @@ class Rehearsal(unittest.TestCase):
         rollback = self.history()[-1]
         self.assertEqual((rollback["action"], rollback["result"], rollback["verdict"]), ("rollback", "ok", "restore-db"))
 
+    def test_an_upgrade_restarts_every_running_gateway(self):
+        self.fleet()
+        done = self.release("upgrade", self.new_rev)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(sorted(self.restarts()), ["trip-a", "trip-intake", "trip-monitor"],
+                         "each running gateway once; the leftover slot and the retired trip's are not touched")
+        calls = self.calls_text()
+        up = next(i for i, line in enumerate(calls) if "interview-mcp" in line and " up " in line)
+        stop = next(i for i, line in enumerate(calls) if line.endswith(" stop relay"))
+        relay = next(i for i, line in enumerate(calls) if line == "compose up -d --wait relay")
+        svc = [i for i, line in enumerate(calls) if "s6-svc -r" in line]
+        first, last = min(svc), max(svc)
+        self.assertTrue(up < stop < first and last < relay, calls)
+        self.assertIn("trip-b: supervisor without a profile (teardown leftover)", done.stdout)
+        self.assertIn("trip-x: retired trip", done.stdout)
+        self.assertEqual(self.history()[-1]["result"], "ok")
+        self.assertTrue([l for l in calls if l.startswith("install ")], "a green verify installs the tool's own files")
+        for profile in ("trip-intake", "trip-a", "trip-monitor"):
+            log = (self.tmp / "hermes-data/profiles" / profile / "logs/agent.log").read_text()
+            self.assertGreaterEqual(log.count("registered"), 2, f"{profile} registered again after its restart")
+
+    def test_the_baseline_is_a_file_of_id_ok_and_code_and_the_key_is_nowhere(self):
+        self.fleet()
+        done = self.release("upgrade", self.new_rev)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        row = self.history()[-1]
+        baseline = Path(row["baseline"])
+        self.assertTrue(baseline.exists(), row)
+        self.assertEqual(baseline.parent, self.tmp / "state")
+        checks = json.loads(baseline.read_text())
+        self.assertTrue(all(set(c) == {"id", "ok", "code"} for c in checks), checks)
+        ids = {c["id"] for c in checks}
+        self.assertTrue({"readyz", "bridge:alsace", "gateways:discovery", "tools:trip-a:trip-control",
+                         "tools:trip-intake:interview", "tools:trip-monitor:fleet", "companion-connected:trip-a"} <= ids, ids)
+        for where in (baseline.read_text(), (self.tmp / "state/history.tsv").read_text(), self.calls.read_text(),
+                      done.stdout, done.stderr):
+            self.assertNotIn(KEY, where)
+
+    def test_a_preexisting_bridge_failure_does_not_fail_the_upgrade(self):
+        self.fleet(bridge="site-401")
+        done = self.release("upgrade", self.new_rev)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(self.history()[-1]["result"], "ok")
+        self.assertIn("already failing before this upgrade", done.stdout)
+        self.assertIn("bridge:alsace", done.stdout)
+        self.assertIn("restart-bridges", done.stdout, "the repair is named")
+        self.assertTrue([l for l in self.calls_text() if l.startswith("install ")], "install_tool_files ran")
+
+    def test_a_bridge_the_upgrade_broke_fails_it(self):
+        self.fleet(bridge="ok", bridge_after="site-401")
+        done = self.release("upgrade", self.new_rev)
+        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+        self.assertEqual(self.history()[-1]["result"], "verify-failed")
+        self.assertIn("[caused by this change]", done.stdout)
+        self.assertFalse([l for l in self.calls_text() if l.startswith("install ")], "the tool does not update itself on a failed verify")
+
+    def test_a_bridge_that_fails_differently_is_caused(self):
+        self.fleet(bridge="site-401", bridge_after="unreachable")
+        done = self.release("upgrade", self.new_rev)
+        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+        self.assertIn("ECONNREFUSED", done.stdout)
+
+    def test_a_gateway_whose_restart_failed_is_stale_and_the_rest_are_restarted(self):
+        self.fleet(restart_fails=["trip-a"])
+        done = self.release("upgrade", self.new_rev)
+        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+        self.assertEqual(sorted(self.restarts()), ["trip-a", "trip-intake", "trip-monitor"], "all three were tried")
+        self.assertIn("trip-a: the restart FAILED", done.stdout)
+        self.assertIn("STALE", done.stdout.upper())
+        self.assertIn("compose up -d --wait relay", self.calls_text(), "the relay still started")
+
+    def test_a_rollback_restarts_every_gateway_too(self):
+        self.fleet()
+        self.assertEqual(self.release("upgrade", self.new_rev).returncode, 0)
+        done = self.release("rollback")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(sorted(self.restarts()), ["trip-a"] * 2 + ["trip-intake"] * 2 + ["trip-monitor"] * 2)
+        self.assertEqual(self.history()[-1]["action"], "rollback")
+        self.assertTrue(Path(self.history()[-1]["baseline"]).exists())
+
+    def test_the_target_s_own_tool_runs_from_a_throwaway_copy(self):
+        # The first upgrade that carries this runs the OLD switch, because the tool installs itself
+        # only after a green verify. So the target's tool is run from a worktree of the target:
+        # it must not care where it lives, only which checkout and deploy root it is pointed at.
+        self.fleet()
+        throwaway = self.tmp / "throwaway-worktree" / "control-plane" / "deployment"
+        throwaway.mkdir(parents=True)
+        shutil.copy(TOOL, throwaway / "vm-release.py")
+        dry = subprocess.run(["python3", str(throwaway / "vm-release.py"), "upgrade", self.new_rev, "--dry-run"],
+                             capture_output=True, text=True, env=self.env, timeout=600)
+        self.assertEqual(dry.returncode, 0, dry.stdout + dry.stderr)
+        self.assertEqual(self.restarts(), [], "the dry run restarts nothing")
+        self.assertEqual(self.vm_env()["KINERARY_REV"], self.old_rev)
+        done = subprocess.run(["python3", str(throwaway / "vm-release.py"), "upgrade", self.new_rev],
+                              capture_output=True, text=True, env=self.env, timeout=600)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(sorted(self.restarts()), ["trip-a", "trip-intake", "trip-monitor"])
+        self.assertEqual(self.vm_env()["KINERARY_REV"], self.new_rev)
+
     def test_a_rollback_whose_migrate_fails_undoes_itself(self):
         self.assertEqual(self.release("upgrade", self.new_rev).returncode, 0)
         self.sql("INSERT INTO control_plane.trips VALUES ('trip_bbbbbbbb', 'after-upgrade', 'draft')")
@@ -428,6 +639,33 @@ class Rehearsal(unittest.TestCase):
             self.assertIn(f"kinerary-cp-{service}-1", running, "the bot and signups are back up")
         self.assertEqual(self.sql("SELECT count(*) FROM pg_database WHERE datname LIKE '%_restore_failed_%'"), "1",
                          "the copy it had restored is kept for inspection")
+
+
+class BridgeHandler(BaseHTTPRequestHandler):
+    """A trip-mcp bridge's /health. What it says is whatever its mode file says, so a test can
+    change it between the baseline and the verify."""
+    mode_file, key = None, ""
+
+    def do_GET(self):
+        mode = self.mode_file.read_text().strip()
+        if self.path != "/health" or mode == "no-route":
+            return self.reply(404, "<pre>Cannot GET /health</pre>")
+        if self.headers.get("X-API-Key") != self.key:
+            return self.reply(401, '{"error":"unauthorized"}')
+        if mode == "ok":
+            return self.reply(200, '{"ok":true,"site":"reachable"}')
+        if mode == "site-401":
+            return self.reply(503, '{"ok":false,"site":"refused","code":"HTTP_401"}')
+        return self.reply(503, '{"ok":false,"site":"unreachable","code":"ECONNREFUSED"}')
+
+    def reply(self, status, body):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(body.encode())
+
+    def log_message(self, *args):
+        pass
 
 
 class ReadyzHandler(BaseHTTPRequestHandler):

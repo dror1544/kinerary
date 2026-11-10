@@ -79,6 +79,11 @@ interface QuestionCopy {
   recap: Localised;
   options?: Record<string, Localised>;
   /**
+   * The question once the organizer has said no to the offer built from what is already known (#438, AC-12):
+   * it must not ask again for what they were just shown. Absent, `ask` stands.
+   */
+  askKnown?: Localised;
+  /**
    * Asking again when an answer is on record but does not settle the question
    * (`IntakeQuestion.satisfiedBy`). `{answer}` is what was written (a date as a person would say it).
    */
@@ -140,6 +145,10 @@ export const INTAKE_COPY: Record<string, QuestionCopy> = {
     ask: {
       en: "Where are you going, and when? The stops in order, with rough dates — and where you're staying if it's booked.",
       he: "לאן אתם הולכים, ומתי? התחנות לפי הסדר, עם תאריכים משוערים — ואיפה אתם ישנים אם כבר הזמנתם.",
+    },
+    askKnown: {
+      en: "What are the stops, in order, with rough dates — and where you're staying if it's booked?",
+      he: "מהן התחנות לפי הסדר, עם תאריכים משוערים — ואיפה אתם ישנים אם כבר הזמנתם?",
     },
     recap: { en: "Stops", he: "תחנות" },
   },
@@ -487,6 +496,9 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     documentCorrect: "If any of that is wrong just tell me and I'll fix it — no rush, later is fine too. Meanwhile, carrying on:",
     /** Places the document means to visit but has not booked. */
     documentPlanned: "Places from the document",
+    // The reply to a message right after the recap that is about the travellers
+    // but names nobody (#413). About travellers - never about the assistant.
+    askOtherTravellers: "Who are the other travellers? Write their names as on the ticket.",
     documentNothing: "I read it, but I couldn't find anything about the trip in it. No harm — I'll just ask.",
     documentNothingNew: "I read it — everything in it matches what I already have, so there's nothing new to add. Carrying on:",
     // A reading the model was unsure of, put to the organizer instead of lost.
@@ -494,10 +506,31 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     suggestionIntro: "From your document — is this right?",
     suggestionYes: "✅ Yes, that's right",
     suggestionNo: "✏️ No",
+    // The organizer's own name, matched against the roster they just listed (#438, AC-9): a one-tap confirm in
+    // place of "which of them are you?". Said as a question to them, not as something read from a document.
+    organizerNameConfirm: "You're {name} on the list, right?",
+    knownStopConfirm: "You're going to {place}, {start} – {end}. Is that the only stop?",
+    // The opening of a trip that was created on the dashboard (#438, AC-13): a friendly greeting that says what is
+    // already known -- the place and the month -- and that a few questions are all that is left. It never says where
+    // the values came from. Placed before the usual introduction, which follows unchanged. See `seededOpening`.
+    seedHi: "Hi {name}",
+    seedHiAnon: "Hi",
+    seedPlaceMonth: "{place} in {month}",
+    seedExcited: "How exciting! 🎉",
+    seedQuick: "A few quick questions and your trip will be ready for everyone.",
     /** Instead of documentNothing, when nothing was certain but something was found. */
     documentUnsure: "I read it and found a few things I'm not sure I read right — I'll check each one with you as we go.",
     /** Beside what was taken, naming what will be checked. */
     documentWillCheck: "Not sure I read these right — I'll check them with you",
+    /**
+     * Another document names people the trip does not hold yet and the reader
+     * was unsure of (#412), asked in the reply itself with Yes / No because
+     * `travelers` is already answered and the router will not ask it again.
+     * `{names}` is the new people only.
+     */
+    documentMoreTravelers: "Another document also names {names} — add them to the travellers?",
+    /** The same message after a No: nothing was added, and said so. */
+    documentMoreTravelersDeclined: "Okay — I left the travellers as they were.",
     // Said only when a day-by-day actually landed. An extraction nobody can
     // see reads as a document that was not understood — the same reason the
     // planned places are listed rather than hidden inside a phase name.
@@ -669,6 +702,13 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // for a button that does not exist.
     expiredWriteAfter:
       "This conversation has closed, so I can't add that to your trip. Opening a fresh interview link will pick things up again — the same kind of link that started us off. Ask whoever set your trip up for a new one, and everything you've already told me will still be there.",
+    // The same notice for an organizer who has a dashboard (#513, AC-7): the new link is theirs to get, there, so
+    // sending them to "whoever set the trip up" would point at themselves. Said only where that door exists.
+    expiredWriteAfterDashboard:
+      "This conversation has closed, so I can't add that to your trip. Open the trip on the dashboard and get a new interview link there — opening it picks things up again, and everything you've already told me will still be there.",
+    // The one line a resumed interview opens with (#513, AC-4): before the next question, instead of the
+    // introduction. They have met the introduction; what they want to know is that nothing was lost.
+    resumedOpening: "Welcome back — let's pick up where we stopped.",
     // ── /trips and /switch ──────────────────────────────────────────────
     // One shared bot serves every trip, so "which one is this chat on?" has no
     // answer visible anywhere in the conversation. These are that answer.
@@ -695,6 +735,63 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // distinguishable refusal confirms a guess to whoever is guessing.
     switchRefused: "I can't switch to that one. Send /trips to see the ones I have for you.",
     switchInGroup: "I can only switch trips in our private chat — this group stays on its own trip.",
+    // The dashboard's "Link Telegram" deep link, redeemed. {trip} is replaced by
+    // the trip's title. ONE refusal sentence for every reason (expired, used,
+    // unknown, not yours any more): a distinguishable one confirms a guess.
+    telegramLinked: "Done — this Telegram account is now linked to \"{trip}\". Send /trips to see it, and /switch to talk to it from this chat.",
+    telegramLinkRefused: "That link didn't work — it may have expired or been used already. Open Kinerary, find the trip and choose Link Telegram for a fresh one.",
+    // ── A main Telegram per account, and secondary organizers (#523) ─────────
+    // The dashboard's Link Telegram now makes the opener the account's MAIN Telegram (all trips, present and future).
+    mainTelegramLinked: "Done — this Telegram account is now your main one for Kinerary. It runs all your trips, the ones you have now and the ones you create later. Send /trips to see them, and /switch to talk to one from this chat.",
+    // Said to the account that was just made main, when it replaced another one.
+    mainTelegramLinkedReplaced: "Done — this Telegram account is now your main one for Kinerary, and the one you used before has been unlinked from your trips. It runs all your trips, the ones you have now and the ones you create later. Send /trips to see them.",
+    // Said ONCE to the account that stopped being the main one, in its own chat. It names no trip.
+    mainTelegramReplaced: "Another Telegram account was just linked as the main one for your Kinerary account, so this one no longer runs your trips. If that wasn't you, sign in to Kinerary and link this account again.",
+    // The trip link a main organizer hands out: what the person who opens it is told. {trip} is the trip's title.
+    secondaryJoined: "Done — you now organize \"{trip}\" from Telegram. Send /trips to see it, /switch to talk to it from this chat, and ask me anything about it. You can't add organizers, create links or see this organizer's other trips.",
+    // Opened by someone who already organizes the trip (the main organizer's own Telegram, or an organizer already). The link is NOT spent.
+    secondaryAlready: "You already organize \"{trip}\", so this link is not for you. It adds someone else — send it to them.",
+    // ONE sentence for every refusal (expired, used, unknown, not the organizer's any more).
+    secondaryRefused: "That link didn't work — it may have expired or been used already. Ask the trip's organizer for a new one.",
+    // To the main organizer, in their chat. {who} is "Dana (@dana)"; {trip} the title.
+    secondaryJoinedNotice: "{who} joined \"{trip}\" as an organizer. They can organize this trip from Telegram and open its organizer view on the trip site. They can't add organizers, create links, approve requests or see your other trips. You can remove them from the trip's page in Kinerary.",
+    // A valid group code posted in a group that belongs to ANOTHER trip, by someone who is not an
+    // organizer of both. One sentence for every way of being refused, so it confirms nothing about
+    // who organizes what.
+    groupMoveNotOrganizer: "This group belongs to another trip. Only its organizer can move it.",
+    // ── One organizer, one Telegram (#519) ──────────────────────────────
+    // What a stranger who opens somebody else's interview link is told. Three fixed sentences and NONE of them can name the
+    // trip -- no destination, dates, title or person -- because the stranger has proved nothing yet.
+    linkOtherBelongs: "This link was made for another organizer, so I can't open it for you. If it should be yours, please ask them for it.",
+    linkOtherAsked: "This link belongs to another organizer. I've asked them to approve you, and I'll write to you here as soon as they answer.",
+    linkOtherNotApproved: "The organizer didn't approve this. If you think that's a mistake, please ask them directly.",
+    linkOtherApproved: "The organizer approved — you're in. Let's get started.",
+    // To the organizer. `{trip}` is the trip's title; it is said only to them, who own it.
+    linkForeignOpened: "Someone else opened your interview link for \"{trip}\". If that wasn't you, get a new link from the dashboard.",
+    linkApprovePrompt: "{who} opened your interview link for \"{trip}\" and would run this trip from their own Telegram. Approve to hand this trip to them — for this trip only; your other trips stay as they are. This account will be unlinked from this trip. Decline to leave everything as it is. You can also type approve or decline.",
+    linkApproveButton: "Approve",
+    linkDeclineButton: "Decline",
+    linkApproverApproved: "Done — {who} now runs \"{trip}\" from Telegram, and this account is no longer linked to it.",
+    linkApproverDeclined: "Okay — nothing changed.",
+    linkApproverGone: "That request isn't open any more.",
+    linkApproverNotNow: "I couldn't do that just now. Try again in a moment.",
+    linkApproverMany: "More than one request is waiting for you. Please use the buttons under the one you mean.",
+    linkTripUntitled: "your trip",
+    linkWhoUnknown: "A Telegram account",
+    // Posted at the top of the new introduction when the group's own organizer moved it to their next trip.
+    groupMovedNotice: "This group now follows {trip}.",
+    groupMovedNoticeUntitled: "the new trip",
+    // ── The Mini App's way in (#443) ────────────────────────────────────
+    // The message carrying the "Open trip" URL button, in a trip's group (pinned
+    // there) or answering /app. It says nothing about passwords or access: the
+    // button only SELECTS the trip, and the Mini App decides who may open it.
+    openTripText: "The trip is one tap away — tap Open trip to see the plan right here in Telegram.",
+    openTripButton: "Open trip",
+    // Pinning needs the admin right to pin. Said once, with what to do about it;
+    // the button above works either way.
+    openTripPinFailed: "I couldn't pin the Open trip message. To keep it at the top of the group, make me an admin with the \"Pin messages\" right, then send the group code again. The button works from where it is.",
+    // The Mini App is not ready for this bot (or no handle is known): said plainly, not blank.
+    openTripUnavailable: "The trip app isn't available yet. The trip site link from /help works as usual.",
     switchInInterview: "We're in the middle of setting up a trip. Let's finish this one first, then I can switch.",
     // Migration 0042's reachability. Worth surfacing: this is the exact state
     // that produced "I don't have a trip for this chat" about a site that was
@@ -796,13 +893,23 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     documentRead: "הנה מה שלקחתי מהמסמך:",
     documentCorrect: "אם משהו מזה לא נכון פשוט תגידו לי ואתקן — אין לחץ, גם אחר כך אפשר. בינתיים נמשיך:",
     documentPlanned: "מקומות מהמסמך",
+    askOtherTravellers: "מי הנוסעים האחרים? כתבו את השמות שלהם כפי שהם מופיעים בכרטיס.",
     documentNothing: "קראתי, אבל לא מצאתי שם מידע על הטיול. לא נורא — פשוט אשאל.",
     documentNothingNew: "קראתי — כל מה שבמסמך כבר נמצא אצלי, כך שאין מה להוסיף. ממשיכים:",
     suggestionIntro: "מהמסמך שלכם — זה נכון?",
     suggestionYes: "✅ כן, נכון",
     suggestionNo: "✏️ לא",
+    organizerNameConfirm: "אני רק מוודא שאתה הוא {name}",
+    knownStopConfirm: "אתם נוסעים ל{place}, {start} – {end}. זו התחנה היחידה?",
+    seedHi: "היי {name}",
+    seedHiAnon: "היי",
+    seedPlaceMonth: "{place} ב{month}",
+    seedExcited: "איזה כיף! 🎉",
+    seedQuick: "כמה שאלות קצרות והטיול יהיה מוכן לכולם.",
     documentUnsure: "קראתי, ומצאתי כמה דברים שאני לא בטוח שקראתי נכון — אבדוק איתכם כל אחד מהם בהמשך.",
     documentWillCheck: "לא בטוח שקראתי נכון — אבדוק איתכם",
+    documentMoreTravelers: "מסמך נוסף מזכיר גם את {names} — להוסיף אותם לנוסעים?",
+    documentMoreTravelersDeclined: "בסדר — השארתי את רשימת הנוסעים כמו שהייתה.",
     documentDays: "הוספתי גם את התוכנית היומית מהמסמך לכל עצירה — תראו אותה באתר של הטיול, ותמיד אפשר לשנות.",
     documentExtractFailed: "קראתי, אבל לא הצלחתי להבין את זה כרגע — זה עליי, לא על הקובץ. אשאל במקום, ואפשר לשלוח שוב מאוחר יותר.",
     documentUnreadable: "לא הצלחתי לקרוא את הקובץ — יכול להיות שזו סריקה או תמונה ולא מסמך טקסט. אפשר לשלוח קובץ אחר אם יש, או שנמשיך ואשאל במקום.",
@@ -911,6 +1018,9 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     expired: "סגרתי את השיחה בינתיים — כל מה שסיפרתם שמור, שום דבר לא הלך לאיבוד. כדי להמשיך צריך קישור ראיון חדש; בקשו ממי שהקים לכם את הטיול ונמשיך בדיוק מאיפה שעצרנו.",
     expiredWriteAfter:
       "השיחה הזו נסגרה, אז אני לא יכול להוסיף את זה לטיול. קישור הפעלה חדש לראיון יחזיר אותנו לאן שהיינו — אותו סוג קישור שפתח לנו את השיחה. בקשו קישור חדש ממי שהקים לכם את הטיול, וכל מה שכבר סיפרתם עדיין יהיה שם.",
+    expiredWriteAfterDashboard:
+      "השיחה הזו נסגרה, אז אני לא יכול להוסיף את זה לטיול. היכנסו לטיול בלוח הבקרה וקבלו שם קישור חדש לראיון — כשתפתחו אותו נמשיך מאיפה שעצרנו, וכל מה שכבר סיפרתם עדיין יהיה שם.",
+    resumedOpening: "ברוכים השבים — ממשיכים מאיפה שעצרנו.",
     tripsHeader: "הטיולים שלך:",
     tripsCurrent: "← הצ׳אט הזה",
     tripsFooter: "בחרו אחד כדי לחבר אליו את הצ׳אט הזה.",
@@ -924,6 +1034,39 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     switchNoCompanion: "האתר מוכן — אני עדיין מסיים את העוזר של הטיול הזה, אז תנו לי רגע לפני שתשאלו אותי עליו.",
     switchRefused: "אני לא יכול לעבור לשם. שלחו ‎/trips‎ כדי לראות את הטיולים שיש לי עבורכם.",
     switchInGroup: "אני יכול להחליף טיול רק בצ׳אט הפרטי בינינו — הקבוצה הזו נשארת על הטיול שלה.",
+    telegramLinked: "בוצע — חשבון הטלגרם הזה מקושר עכשיו אל \"{trip}\". שלחו ‎/trips‎ כדי לראות אותו, ו‎/switch‎ כדי לדבר איתו מהצ׳אט הזה.",
+    telegramLinkRefused: "הקישור הזה לא עבד — ייתכן שפג תוקפו או שכבר נעשה בו שימוש. היכנסו ל-Kinerary, מצאו את הטיול ובחרו Link Telegram כדי לקבל קישור חדש.",
+    // ── טלגרם ראשי לכל חשבון, ומארגנים משניים (#523) ─────────────────────────
+    mainTelegramLinked: "בוצע — חשבון הטלגרם הזה הוא עכשיו הטלגרם הראשי שלכם ב-Kinerary. הוא מנהל את כל הטיולים שלכם, אלה שיש לכם עכשיו ואלה שתיצרו בהמשך. שלחו ‎/trips‎ כדי לראות אותם, ו‎/switch‎ כדי לדבר עם אחד מהם מהצ׳אט הזה.",
+    mainTelegramLinkedReplaced: "בוצע — חשבון הטלגרם הזה הוא עכשיו הטלגרם הראשי שלכם ב-Kinerary, והחשבון שבו השתמשתם קודם נותק מהטיולים שלכם. הוא מנהל את כל הטיולים שלכם, אלה שיש לכם עכשיו ואלה שתיצרו בהמשך. שלחו ‎/trips‎ כדי לראות אותם.",
+    mainTelegramReplaced: "חשבון טלגרם אחר חובר עכשיו כטלגרם הראשי של חשבון ה-Kinerary שלכם, ולכן החשבון הזה כבר לא מנהל את הטיולים שלכם. אם זה לא הייתם אתם, היכנסו ל-Kinerary וחברו את החשבון הזה מחדש.",
+    secondaryJoined: "בוצע — מעכשיו אתם מארגנים את \"{trip}\" מהטלגרם. שלחו ‎/trips‎ כדי לראות אותו, ‎/switch‎ כדי לדבר איתו מהצ׳אט הזה, ושאלו אותי עליו כל דבר. אי אפשר להוסיף מארגנים, ליצור קישורים או לראות את שאר הטיולים של המארגן.",
+    secondaryAlready: "אתם כבר מארגנים את \"{trip}\", ולכן הקישור הזה לא מיועד לכם. הוא מוסיף מישהו אחר — שלחו אותו אליו.",
+    secondaryRefused: "הקישור הזה לא עבד — ייתכן שפג תוקפו או שכבר נעשה בו שימוש. בקשו מהמארגן של הטיול קישור חדש.",
+    secondaryJoinedNotice: "{who} הצטרף כמארגן אל \"{trip}\". אפשר לארגן את הטיול מהטלגרם ולפתוח את תצוגת המארגן באתר הטיול. אי אפשר להוסיף מארגנים, ליצור קישורים, לאשר בקשות או לראות את שאר הטיולים שלכם. אפשר להסיר אותו מעמוד הטיול ב-Kinerary.",
+    groupMoveNotOrganizer: "הקבוצה הזו שייכת לטיול אחר. רק מי שמארגן אותו יכול להעביר אותה.",
+    // ── מארגן אחד, טלגרם אחד (#519) ──────────────────────────────────────
+    linkOtherBelongs: "הקישור הזה נוצר עבור מארגן אחר, ולכן אני לא יכול לפתוח אותו עבורכם. אם הוא אמור להיות שלכם, בקשו אותו מהמארגן.",
+    linkOtherAsked: "הקישור הזה שייך למארגן אחר. ביקשתי מהמארגן לאשר אתכם, ואכתוב לכם כאן ברגע שיענה.",
+    linkOtherNotApproved: "המארגן לא אישר את זה. אם לדעתכם זו טעות, פנו אל המארגן ישירות.",
+    linkOtherApproved: "המארגן אישר — אתם בפנים. מתחילים.",
+    linkForeignOpened: "מישהו אחר פתח את קישור הראיון שלכם עבור \"{trip}\". אם זה לא הייתם אתם, קבלו קישור חדש מלוח הבקרה.",
+    linkApprovePrompt: "קישור הראיון שלכם עבור \"{trip}\" נפתח על ידי {who}. אשרו כדי שהטיול הזה ינוהל מהחשבון שלהם בטלגרם — לטיול הזה בלבד, ושאר הטיולים שלכם נשארים כפי שהם. החשבון הזה ינותק מהטיול הזה. דחו כדי להשאיר הכול כמו שהוא. אפשר גם לכתוב מאשרים או דוחים.",
+    linkApproveButton: "אישור",
+    linkDeclineButton: "דחייה",
+    linkApproverApproved: "בוצע — \"{trip}\" מנוהל עכשיו מהחשבון של {who} בטלגרם, והחשבון הזה כבר לא מקושר אליו.",
+    linkApproverDeclined: "בסדר — לא השתנה כלום.",
+    linkApproverGone: "הבקשה הזו כבר לא פתוחה.",
+    linkApproverNotNow: "לא הצלחתי לעשות את זה כרגע. נסו שוב בעוד רגע.",
+    linkApproverMany: "יש כמה בקשות שממתינות לכם. השתמשו בכפתורים שמתחת לבקשה שהתכוונתם אליה.",
+    linkTripUntitled: "הטיול שלכם",
+    linkWhoUnknown: "חשבון טלגרם",
+    groupMovedNotice: "מעכשיו הקבוצה הזו מלווה את {trip}.",
+    groupMovedNoticeUntitled: "הטיול החדש",
+    openTripText: "הטיול במרחק לחיצה — לחצו על פתיחת הטיול כדי לראות את התוכנית כאן בטלגרם.",
+    openTripButton: "פתיחת הטיול",
+    openTripPinFailed: "לא הצלחתי להצמיד את הודעת פתיחת הטיול. כדי שתישאר בראש הקבוצה, הפכו אותי למנהל עם ההרשאה \"הצמדת הודעות\" ושלחו שוב את קוד הקבוצה. הכפתור עובד גם מהמקום שבו הוא נמצא.",
+    openTripUnavailable: "אפליקציית הטיול עדיין לא זמינה. הקישור לאתר הטיול מ-‎/help ממשיך לעבוד כרגיל.",
     switchInInterview: "אנחנו באמצע הקמת טיול. בואו נסיים את זה קודם, ואז אוכל להחליף.",
     tripUnreachable: "(האתר לא מגיב)",
     tripBridgeUnreachable: "(לצערי אני לא יכול לקרוא את נתוני הטיול כרגע)",
@@ -1009,9 +1152,82 @@ export function readableDate(iso: string, language: Language = DEFAULT_LANGUAGE)
   return language === "he" ? `${day} ב${name} ${year}` : `${name} ${day}, ${year}`;
 }
 
+/** What a seeded session starts from, as the opening says it (the shape `interview.ts` calls `SeededOpening`). */
+export interface SeededOpeningFacts {
+  destination: string | null;
+  departureDate: string | null;
+  returnDate: string | null;
+  organizerName: string | null;
+}
+
+/**
+ * The month a trip departs in, in words -- "November" / "נובמבר" -- or both months when it crosses one:
+ * "November–December". Taken from the dates as given (a real `YYYY-MM-DD` only; anything `readableDate` refuses is
+ * ignored), the departure first. Null when there is no usable date: the opening then names no month.
+ */
+export function tripMonthInWords(departureIso: string | null, returnIso: string | null, language: Language = DEFAULT_LANGUAGE): string | null {
+  const names = MONTHS[language] ?? MONTHS[DEFAULT_LANGUAGE];
+  const monthOf = (iso: string | null): number | null => {
+    if (!iso || readableDate(iso, language) === null) return null;
+    return Number(iso.trim().slice(5, 7)) - 1;
+  };
+  const from = monthOf(departureIso);
+  const until = monthOf(returnIso);
+  const first = from ?? until;
+  if (first === null) return null;
+  const second = from !== null ? until : null;
+  return second !== null && second !== first ? `${names[first]}\u2013${names[second]}` : names[first]!;
+}
+
+/**
+ * The opening of an interview for a trip created on the dashboard (#438, AC-13): one friendly line that greets the
+ * organizer, says the place and the month they are going, and tells them a few quick questions are all that is left.
+ * It goes BEFORE the usual introduction; nothing after it changes.
+ *
+ *   "Hi Dana, Japan in April. How exciting! 🎉 A few quick questions and your trip will be ready for everyone."
+ *
+ * Only what is known is said: no name drops "Dana" ("Hi! Japan in April. …"), no dates drops the month, no
+ * destination leaves the greeting and the quick-questions sentence. It never names where the values came from, and
+ * never prints a date as `YYYY-MM-DD`. A date `readableDate` will not render counts as no date.
+ *
+ * `destination` and `organizerName` are shown exactly as given: the caller decides whether they are the interview
+ * language's own spelling (`native-names.ts`) or, when that was not possible, the English as entered.
+ */
+export function seededOpening(seeded: SeededOpeningFacts, language: Language = DEFAULT_LANGUAGE): string {
+  const fill = (key: string, values: Record<string, string>) =>
+    Object.entries(values).reduce((text, [name, value]) => text.replace(`{${name}}`, () => value), uiString(key, language));
+  const name = seeded.organizerName?.trim();
+  const place = seeded.destination?.trim();
+  const hi = name ? fill("seedHi", { name }) : uiString("seedHiAnon", language);
+  const quick = uiString("seedQuick", language);
+  if (!place) return `${hi}! ${quick}`;
+
+  const month = tripMonthInWords(seeded.departureDate, seeded.returnDate, language);
+  const where = month ? fill("seedPlaceMonth", { place, month }) : place;
+  return `${hi}${name ? "," : "!"} ${where}. ${uiString("seedExcited", language)} ${quick}`;
+}
+
 function pick(localised: Localised | undefined, language: Language): string | null {
   if (!localised) return null;
   return localised[language] ?? localised[DEFAULT_LANGUAGE] ?? null;
+}
+
+/** The question as asked after a no to the offer built from what is known; the plain question where it has none. */
+export function askTextAfterKnownDeclined(question: IntakeQuestion, language: Language = DEFAULT_LANGUAGE): string {
+  return pick(INTAKE_COPY[question.id]?.askKnown, language) ?? askText(question, language);
+}
+
+/**
+ * "You're going to Gatecity, November 14, 2027 – November 21, 2027. Is that the only stop?" (#438, AC-12): the place
+ * and both dates in words, never as `YYYY-MM-DD`, in the same wording the seeded opening uses. Null when a date is
+ * not a real day -- the caller then has nothing to confirm and asks the question as it always did.
+ */
+export function knownStopConfirmText(place: string, startIso: string, endIso: string, language: Language = DEFAULT_LANGUAGE): string | null {
+  const start = readableDate(startIso, language);
+  const end = readableDate(endIso, language);
+  if (!start || !end) return null;
+  return uiString("knownStopConfirm", language)
+    .replace("{place}", () => place).replace("{start}", () => start).replace("{end}", () => end);
 }
 
 /** The sentence to put to the organizer. Falls back to the agent-facing prompt. */

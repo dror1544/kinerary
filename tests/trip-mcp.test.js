@@ -12,8 +12,12 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
-import { startTestServer, stopTestServer, loginAsAlice, api } from './helpers/server.js';
+import { runInNewContext } from 'node:vm';
+import { readdirSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { startTestServer, stopTestServer, loginAsAlice, api, testTripDir } from './helpers/server.js';
 import { PORTS } from './helpers/ports.js';
+import { makeConfirmationPdf } from './connected-assistants/confirmation-fixtures.mjs';
 
 const CLAUDE_CALLBACK = 'https://claude.ai/api/mcp/auth_callback';
 
@@ -207,6 +211,186 @@ describe('trip MCP — an organizer connects an assistant', () => {
     for (const n of ['reset_participant_password', 'bind_participant_telegram', 'publish_companion_reply', 'add_photo']) assert.ok(!names.includes(n), n);
     const del = list.result.tools.find(t => t.name === 'delete_booking');
     assert.equal(del.annotations.destructiveHint, true);
+  });
+
+  it('offers a pending booking upload link only to an organizer with an existing booking', async () => {
+    const created = await (await api('/api/bookings', { method: 'POST', token: aliceSession, body: {
+      phase: 'intl_flights', type: 'flight', name: 'Synthetic flight',
+    } })).json();
+    assert.equal(created.ok, true);
+    const call = await (await rpc(tokens.access_token, 'tools/call', {
+      name: 'get_booking_confirmation_upload_link', arguments: { booking_id: created.id },
+    })).json();
+    assert.ok(!call.result.isError, JSON.stringify(call));
+    const result = JSON.parse(call.result.content[0].text);
+    assert.equal(result.status, 'pending_upload');
+    assert.equal(result.booking_id, created.id);
+    assert.equal(result.url, base + '/mcp/upload-confirmation/' + created.id);
+    assert.doesNotMatch(JSON.stringify(result), /access_token|Bearer|test-hermes-key|trip-token|tripToken/);
+    const missing = await (await rpc(tokens.access_token, 'tools/call', {
+      name: 'get_booking_confirmation_upload_link', arguments: { booking_id: 999999 },
+    })).json();
+    assert.equal(missing.result.isError, true);
+    const member = await connect(bobSession);
+    const names = (await (await rpc(member.access_token, 'tools/list')).json()).result.tools.map(t => t.name);
+    assert.ok(!names.includes('get_booking_confirmation_upload_link'));
+    await fetch(base + '/oauth/revoke', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ token: member.refresh_token, client_id: client.client_id }).toString() });
+  });
+
+  it('the browser page checks session and booking, uploads a PDF, and verifies exact stored bytes', async () => {
+    const created = await (await api('/api/bookings', { method: 'POST', token: aliceSession, body: {
+      phase: 'intl_flights', type: 'flight', name: 'Synthetic document booking',
+    } })).json();
+    const page = await fetch(base + '/mcp/upload-confirmation/' + created.id);
+    assert.equal(page.status, 200);
+    assert.match(page.headers.get('content-security-policy'), /default-src 'none'/);
+    const html = await page.text();
+    assert.doesNotMatch(html, new RegExp(aliceSession));
+    const scriptStart = html.indexOf('<script nonce=');
+    const script = html.slice(html.indexOf('>', scriptStart) + 1, html.indexOf('</script>', scriptStart));
+    assert.ok(script, 'the actual browser script is served');
+
+    async function browser(session, bookingId = created.id, intercept = () => null) {
+      const elements = Object.fromEntries(['status', 'file', 'submit', 'upload-form', 'booking-name'].map(id => [id, {
+        textContent: '', disabled: true, files: [], addEventListener(event, fn) { this[event] = fn; },
+      }]));
+      const requests = [];
+      const context = {
+        document: { documentElement: { dataset: { bookingId: String(bookingId) } }, getElementById: id => elements[id] },
+        localStorage: { getItem: () => session },
+        fetch: (path, options = {}) => { requests.push({ path, method: options.method || 'GET' }); return intercept(path, options) || fetch(new URL(path, base), options); },
+        FormData, Uint8Array, Promise,
+      };
+      await runInNewContext(script, context);
+      return { elements, requests };
+    }
+    const confDir = join(dirname(testTripDir()), 'confirmations');
+    const fileCount = () => readdirSync(confDir).length;
+    const initialFiles = fileCount();
+    const noSession = await browser(null);
+    assert.equal(noSession.elements.submit.disabled, true);
+    assert.equal(noSession.requests.length, 0);
+    const member = await browser(bobSession);
+    assert.equal(member.elements.submit.disabled, true);
+    assert.ok(!member.requests.some(r => r.method === 'POST'));
+    const missing = await browser(aliceSession, 999999);
+    assert.equal(missing.elements.submit.disabled, true);
+    assert.ok(!missing.requests.some(r => r.method === 'POST'));
+
+    const before = (await (await api('/api/bookings', { token: aliceSession })).json()).find(b => b.id === created.id);
+    assert.equal(before.conf_file, null, 'denial and absent booking created no file link');
+    assert.equal(fileCount(), initialFiles, 'denied page states wrote no file');
+    const rejected = await browser(aliceSession);
+    rejected.elements.file.files = [{ type: 'application/pdf', size: 50 * 1024 * 1024 + 1 }];
+    await rejected.elements['upload-form'].submit({ preventDefault() {} });
+    assert.match(rejected.elements.status.textContent, /smaller than 50 MB/);
+    assert.ok(!rejected.requests.some(r => r.method === 'POST'));
+    const failedPost = await browser(aliceSession, created.id, (path, options) =>
+      options.method === 'POST' ? Promise.resolve(new Response('failed', { status: 503 })) : null);
+    const failureFile = new Blob([makeConfirmationPdf('Panel Test', 'FAILED-POST')], { type: 'application/pdf' });
+    failureFile.name = 'failed.pdf';
+    failedPost.elements.file.files = [failureFile];
+    await failedPost.elements['upload-form'].submit({ preventDefault() {} });
+    assert.match(failedPost.elements.status.textContent, /Upload failed \(503\)/);
+    assert.equal((await (await api('/api/bookings', { token: aliceSession })).json()).find(b => b.id === created.id).conf_file, null);
+    assert.equal(fileCount(), initialFiles, 'failed POST wrote no file');
+
+    const working = await browser(aliceSession);
+    assert.equal(working.elements.submit.disabled, false);
+    const pdf = makeConfirmationPdf('Panel Test', 'PANEL-01');
+    const file = new Blob([pdf], { type: 'application/pdf' });
+    file.name = 'synthetic.pdf';
+    working.elements.file.files = [file];
+    await working.elements['upload-form'].submit({ preventDefault() {} });
+    assert.match(working.elements.status.textContent, /PDF uploaded, linked/);
+    const booking = (await (await api('/api/bookings', { token: aliceSession })).json()).find(b => b.id === created.id);
+    assert.ok(booking.conf_file);
+    const original = await api('/api/bookings/confirmation/' + encodeURIComponent(booking.conf_file), { token: aliceSession });
+    assert.deepEqual(Buffer.from(await original.arrayBuffer()), pdf);
+    assert.ok(working.requests.some(r => r.method === 'POST'));
+
+    const revised = makeConfirmationPdf('Panel Test', 'PANEL-02');
+    const replacement = new Blob([revised], { type: 'application/pdf' });
+    replacement.name = 'replacement.pdf';
+    const verifyFailure = await browser(aliceSession, created.id, path =>
+      path.startsWith('/api/bookings/confirmation/') ? Promise.resolve(new Response('missing', { status: 404 })) : null);
+    verifyFailure.elements.file.files = [replacement];
+    await verifyFailure.elements['upload-form'].submit({ preventDefault() {} });
+    assert.match(verifyFailure.elements.status.textContent, /Cannot read back/);
+    assert.doesNotMatch(verifyFailure.elements.status.textContent, /PDF uploaded, linked/);
+    const current = (await (await api('/api/bookings', { token: aliceSession })).json()).find(b => b.id === created.id);
+    assert.notEqual(current.conf_file, booking.conf_file);
+    const prior = await api('/api/bookings/confirmation/' + encodeURIComponent(booking.conf_file), { token: aliceSession });
+    assert.deepEqual(Buffer.from(await prior.arrayBuffer()), pdf, 'replacing a PDF preserves the prior original');
+    const storedReplacement = await api('/api/bookings/confirmation/' + encodeURIComponent(current.conf_file), { token: aliceSession });
+    assert.deepEqual(Buffer.from(await storedReplacement.arrayBuffer()), revised);
+  });
+
+  it('retrieves only an organizer booking PDF as exact bytes with a digest', async () => {
+    const own = await connect();
+    const created = await (await api('/api/bookings', { method: 'POST', token: aliceSession, body: {
+      phase: 'intl_flights', type: 'flight', name: 'Readback synthetic booking',
+    } })).json();
+    const call = async arguments_ => (await (await rpc(own.access_token, 'tools/call', {
+      name: 'get_booking_confirmation', arguments: arguments_,
+    })).json());
+    const absent = await call({ booking_id: created.id });
+    assert.equal(absent.result?.isError, true);
+    assert.match(absent.result.content[0].text, /no linked confirmation/i);
+    const pdf = makeConfirmationPdf('Readback Test', 'READBACK-01');
+    const form = new FormData();
+    form.append('file', new Blob([pdf], { type: 'application/pdf' }), 'readback.pdf');
+    const uploaded = await fetch(base + '/api/bookings/' + created.id + '/confirmation', {
+      method: 'POST', headers: { authorization: `Bearer ${aliceSession}` }, body: form,
+    });
+    assert.equal(uploaded.status, 200);
+    const r = await call({ booking_id: created.id });
+    assert.ok(!r.result?.isError, JSON.stringify(r));
+    const resource = r.result.content.find(c => c.type === 'resource').resource;
+    assert.equal(resource.mimeType, 'application/pdf');
+    assert.deepEqual(Buffer.from(resource.blob, 'base64'), pdf);
+    assert.deepEqual(JSON.parse(r.result.content.find(c => c.type === 'text').text), {
+      booking_id: created.id, byte_count: pdf.length, sha256: createHash('sha256').update(pdf).digest('hex'),
+    });
+    assert.doesNotMatch(JSON.stringify(r), /Bearer |test-secret|trip-test-/);
+    for (const args of [{ booking_id: 999999 }, { booking_id: 0 }, { booking_id: 1.5 },
+      { booking_id: Number.MAX_SAFE_INTEGER + 1 }, { booking_id: '../private-guide.docx' },
+      { booking_id: created.id, url: 'https://evil.example/file.pdf' }, { booking_id: created.id, path: '../file.pdf' }]) {
+      const denied = await call(args);
+      assert.ok(denied.error || denied.result?.isError, JSON.stringify(args));
+    }
+    const Database = (await import('node:module')).createRequire(new URL('../server/package.json', import.meta.url))('better-sqlite3');
+    const db = new Database(join(dirname(testTripDir()), 'trip.db'));
+    const original = db.prepare('SELECT conf_file FROM bookings WHERE id = ?').get(created.id).conf_file;
+    const safeLegacyName = 'אישור הזמנה מקורי.pdf';
+    writeFileSync(join(dirname(testTripDir()), 'confirmations', safeLegacyName), pdf);
+    db.prepare('UPDATE bookings SET conf_file = ? WHERE id = ?').run(safeLegacyName, created.id);
+    const legacy = await call({ booking_id: created.id });
+    assert.ok(!legacy.result?.isError, JSON.stringify(legacy));
+    const legacyResource = legacy.result.content.find(c => c.type === 'resource').resource;
+    assert.deepEqual(Buffer.from(legacyResource.blob, 'base64'), pdf);
+    assert.deepEqual(JSON.parse(legacy.result.content.find(c => c.type === 'text').text), {
+      booking_id: created.id, byte_count: pdf.length, sha256: createHash('sha256').update(pdf).digest('hex'),
+    });
+    for (const [file, expected] of [['../private-guide.docx', /unsafe/i], ['missing.pdf', /unavailable/i], ['private-guide.docx', /PDF/i]]) {
+      if (file === 'private-guide.docx') writeFileSync(join(dirname(testTripDir()), 'confirmations', file), 'unsupported');
+      db.prepare('UPDATE bookings SET conf_file = ? WHERE id = ?').run(file, created.id);
+      const denied = await call({ booking_id: created.id });
+      assert.equal(denied.result?.isError, true);
+      assert.match(denied.result.content[0].text, expected);
+    }
+    db.prepare('UPDATE bookings SET conf_file = ? WHERE id = ?').run(original, created.id);
+    db.close();
+    const member = await connect(bobSession);
+    const names = (await (await rpc(member.access_token, 'tools/list')).json()).result.tools.map(t => t.name);
+    assert.ok(!names.includes('get_booking_confirmation'));
+    const denied = await (await rpc(member.access_token, 'tools/call', { name: 'get_booking_confirmation', arguments: { booking_id: created.id } })).json();
+    assert.ok(denied.error || denied.result?.isError);
+    await fetch(base + '/oauth/revoke', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ token: member.access_token, client_id: client.client_id }) });
+    await fetch(base + '/oauth/revoke', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ token: own.access_token, client_id: client.client_id }) });
+    assert.equal((await rpc(own.access_token, 'tools/call', { name: 'get_booking_confirmation', arguments: { booking_id: created.id } })).status, 401);
   });
 
   it('acts as the organizer, not as the agent', async () => {

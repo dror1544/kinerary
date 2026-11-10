@@ -32,6 +32,16 @@ also undoes a snapshot that stalls — the guest cannot thaw itself while frozen
 --dry-run runs every guard and preflight for real, prints each step with its
 command and what it costs, and changes nothing (it may `git fetch`).
 
+THE SWITCH RESTARTS EVERY GATEWAY, AND VERIFY CHECKS EACH. A Hermes gateway keeps the
+MCP connections it opened at boot, so after the containers come up every gateway
+running in the Hermes container (discovered from its supervisor; retired and
+leftover slots skipped) is restarted once, and verify reads, per gateway, the MCP
+servers in its own config.yaml against the registration lines it logged AFTER that
+restart. Bridges must answer /health, not just listen. Guards takes a baseline of the
+same checks; a failure in a class the upgrade does not own (a bridge, a companion's
+relay connection) that failed the same way before is reported and does not fail the
+upgrade. Everything the switch restarts or replaces always counts.
+
 GATE. `gate` is what the trip-monitor agent reaches, through the `cprelease`
 user's forced command and one sudoers line. It can read, plan, dry-run and
 REQUEST; it can never approve. A request sends Dror a one-time code through
@@ -50,17 +60,19 @@ import os
 import pwd
 import re
 import secrets
+import select
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
 # --------------------------------------------------------------------------- #
 # Where things are. Environment overrides exist for tests and the rehearsal
@@ -99,6 +111,24 @@ COMPOSE_PROJECT = "kinerary-cp"
 PG_CONTAINER = ENV.get("KINERARY_CP_PG_CONTAINER", "kinerary-cp-postgres-1")
 RELAY_CONTAINER = "kinerary-cp-relay-1"
 HERMES_CONTAINER = "hermes"
+# Hermes runs one s6-supervised gateway per profile: a service directory named
+# gateway-<profile> in the container's scan directory (the Hermes image's layout,
+# not this deployment's). The interview's profile is the one every install has.
+S6_SCANDIR = "/run/service"
+GATEWAY_SLOT_PREFIX = "gateway-"
+INTERVIEW_PROFILE = "trip-intake"
+# Same rule as RETIRED_SLUG_PREFIX in control-plane/api/src/trip-retirement.ts, which the
+# relay's gateway wait uses; tests/scripts/test_vm_release.py pins the two together.
+RETIRED_SLUG_PREFIX = "retired-"
+# The worker's own profile-name shape (gateway_reconcile.PROFILE_RE): a name from the
+# supervisor or the database is matched against it before it reaches an argv.
+PROFILE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{1,62}")
+GATEWAY_WAIT_POLLS, GATEWAY_WAIT_STEP_SECONDS = 30, 2   # a restarted gateway has 60 s to re-register its tools
+# The optional organizer portal and runtime gateway: compose profile `web`, off
+# unless COMPOSE_PROFILES in vm.env/provisioning.env names it. They are images of
+# their own (kinerary-cp/<service>:<rev>), built beside the three above.
+WEB_PROFILE = "web"
+WEB_SERVICES = ("portal", "runtime-gateway")
 DB_USER = DB_NAME = "kinerary_control_plane"
 READYZ = ENV.get("KINERARY_CP_READYZ", "http://127.0.0.1:4310/readyz")
 
@@ -178,22 +208,6 @@ class Report:
 # Running things. read() always runs; act() is what --dry-run replaces with a
 # description, so a dry run can never change anything by accident.
 # --------------------------------------------------------------------------- #
-INTERVIEW_REGISTERED_RE = re.compile(r"MCP server 'interview'.*registered.*tool\(s\):")
-TRIP_INTAKE_GATEWAY_SERVICE = "/run/service/gateway-trip-intake"
-
-
-def interview_registrations(agent_log: Path) -> List[str]:
-    """Every line in the trip-intake agent log where the gateway registered the
-    interview MCP server's tools, oldest first. verify() reads the last one."""
-    if not agent_log.exists():
-        return []
-    return [raw for raw in agent_log.read_text(errors="replace").splitlines() if INTERVIEW_REGISTERED_RE.search(raw)]
-
-
-def count_interview_registrations(agent_log: Path) -> int:
-    return len(interview_registrations(agent_log))
-
-
 class Shell:
     def __init__(self, report: Report, dry_run: bool = False):
         self.report = report
@@ -295,6 +309,96 @@ def site_from_texts(control_plane_env: Optional[str], provisioning_env: str, vm_
     return {key: site[key] for key in (*SITE_REQUIRED, "CP_REFUSE_STORAGE") if key in site}
 
 
+def compose_profiles(*env_texts: str) -> List[str]:
+    """COMPOSE_PROFILES as compose itself reads it from the env files: the last file to set it wins."""
+    value = ""
+    for text in env_texts:
+        value = read_env_text(text).get("COMPOSE_PROFILES", value)
+    return [p.strip().strip("\"'") for p in value.split(",") if p.strip()]
+
+
+def compose_defines_web(compose_text: str) -> bool:
+    """Whether a compose.vm.yml carries both web services. Looked up in the TARGET
+    revision's file: a rollback to a version from before the portal existed has none,
+    and must neither expect its images nor start it."""
+    return all(re.search(rf"^  {re.escape(name)}:\s*$", compose_text, re.M) for name in WEB_SERVICES)
+
+
+# The env:// targets compose.vm.yml gives the api for the `web` block's secret references.
+WEB_API_ENV = ("RUNTIME_EXCHANGE_KEY", "PORTAL_EMAIL_API_KEY")
+WEB_REQUIRED_ENV = ("RUNTIME_EXCHANGE_KEY", "RUNTIME_COOKIE_SECRET", "PORTAL_ORIGIN", "RUNTIME_ORIGIN",
+                    "KINERARY_ARCHITECTURE_PROFILE")
+
+
+def registrable_domain(hostname: str, public_suffixes: Sequence[str] = ()) -> str:
+    """The same approximation runtime-gateway/server.js makes (its comment explains it):
+    the last two labels, three when the last two are a listed public suffix; an IP or a
+    single-label host is its own site."""
+    hostname = hostname.lower()
+    labels = hostname.split(".")
+    if len(labels) < 2 or re.fullmatch(r"[\d.]+", hostname) or ":" in hostname or hostname.startswith("["):
+        return hostname
+    tail2 = ".".join(labels[-2:])
+    return ".".join(labels[-3:]) if tail2 in public_suffixes and len(labels) >= 3 else tail2
+
+
+def web_config_problems(env: Dict[str, str], profile: Optional[Dict]) -> List[str]:
+    """What would stop the portal and gateway from working, found BEFORE anything is
+    switched. Names only, never values: the env holds the exchange key and cookie secret.
+
+    The gateway and the api's `web` block each state the two public origins; they must
+    agree or every sign-in and every launch is refused at runtime, in a way that points
+    nowhere near the cause."""
+    problems = [f"{name} is not set in vm.env" for name in WEB_REQUIRED_ENV if not env.get(name)]
+    if env.get("PORTAL_ORIGIN") and env.get("RUNTIME_ORIGIN") and env.get("RUNTIME_SAME_SITE_OK") != "1":
+        # The gateway refuses to start across sites (its trip cookie is SameSite=Strict).
+        # Found here, that is a refused plan; found there, it is a failed upgrade.
+        suffixes = [s.strip().lower() for s in env.get("RUNTIME_PUBLIC_SUFFIXES", "").split(",") if s.strip()]
+        try:
+            hosts = [urllib.parse.urlparse(env[name]).hostname or "" for name in ("PORTAL_ORIGIN", "RUNTIME_ORIGIN")]
+        except ValueError:
+            hosts = []
+        if len(hosts) != 2 or not all(hosts):
+            problems.append("PORTAL_ORIGIN and RUNTIME_ORIGIN must be origins with a host name")
+        elif registrable_domain(hosts[0], suffixes) != registrable_domain(hosts[1], suffixes):
+            problems.append("PORTAL_ORIGIN and RUNTIME_ORIGIN are not the same site (the trip cookie is SameSite=Strict, so every "
+                            "launch would loop and the gateway refuses to start); put both under one registrable domain, "
+                            "or list a public suffix in RUNTIME_PUBLIC_SUFFIXES")
+    if env.get("KINERARY_ARCHITECTURE_PROFILE") and profile is None:
+        problems.append("KINERARY_ARCHITECTURE_PROFILE does not name a readable JSON file")
+    elif profile is not None:
+        web = profile.get("web")
+        if not isinstance(web, dict):
+            problems.append("the architecture profile has no `web` block, so the api would serve no portal routes")
+        else:
+            for env_name, key in (("PORTAL_ORIGIN", "public_origin"), ("RUNTIME_ORIGIN", "runtime_origin")):
+                have, want = env.get(env_name, "").rstrip("/"), str(web.get(key, "")).rstrip("/")
+                if have and want and have != want:
+                    problems.append(f"{env_name} differs from the profile's web.{key}")
+            # Google sign-in is the Identity Services ID-token flow: ONE public string, no secret, no env variable. The
+            # old secret-ref pair is refused by the api's config loader at boot; found here it is a refused plan instead.
+            for retired in ("google_client_id_secret_ref", "google_client_secret_ref"):
+                if retired in web:
+                    problems.append(f"web.{retired} is no longer supported: replace the pair with web.google_client_id "
+                                    f"(the OAuth client ID, a string ending in .apps.googleusercontent.com)")
+            google_id = web.get("google_client_id")
+            if google_id is not None and not (isinstance(google_id, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.apps\.googleusercontent\.com", google_id)):
+                problems.append("web.google_client_id is not an OAuth client ID (it must end in .apps.googleusercontent.com)")
+            # An env:// reference can only be satisfied by a variable compose.vm.yml hands the
+            # api; anything else is empty there and stops the api at boot.
+            for key, ref in sorted(web.items()):
+                if key in ("google_client_id_secret_ref", "google_client_secret_ref"):
+                    continue  # already reported above, with the instruction
+                if key.endswith("_secret_ref") and isinstance(ref, str) and ref.startswith("env://"):
+                    name = ref[len("env://"):]
+                    if name not in WEB_API_ENV:
+                        problems.append(f"web.{key} names env://{name}, which compose.vm.yml does not pass to the api "
+                                        f"(it passes {', '.join(WEB_API_ENV)})")
+                    elif not env.get(name):
+                        problems.append(f"web.{key} names env://{name}, which is not set in vm.env")
+    return problems
+
+
 def rollback_declaration(sql: str) -> Optional[Tuple[str, str]]:
     """(`compatible`|`breaking`, reason) from a migration's first 20 lines, or None."""
     match = ROLLBACK_HEADER.search("\n".join(sql.splitlines()[:20]))
@@ -330,6 +434,253 @@ def extract_agent_tools(interview_mcp_source: str) -> List[str]:
         return []
     body = interview_mcp_source[start:].replace("\n", " ")
     return re.findall(r'mcp\.tool\( *"([a-z_]+)"', body)
+
+
+def extract_companion_tools(companion_mcp_source: str) -> List[str]:
+    """The tools companion-mcp.ts registers (the `trip-control` server every
+    companion's gateway connects to): every `mcp.tool( "name"` in the file."""
+    return re.findall(r'mcp\.tool\(\s*"([a-z_]+)"', companion_mcp_source)
+
+
+# The MCP servers whose containers the switch recreates, and the source file that says
+# which tools each must offer. A gateway holds its connection to one of these from before
+# the switch until it is restarted, so these are the servers a failed restart leaves STALE.
+MCP_SERVER_SOURCES: Dict[str, Tuple[str, Callable[[str], List[str]]]] = {
+    "interview": ("interview-mcp.ts", extract_agent_tools),
+    "trip-control": ("companion-mcp.ts", extract_companion_tools),
+}
+
+
+def mcp_server_names(config_text: str) -> List[str]:
+    """The MCP servers a Hermes profile is configured to use: the keys under the
+    top-level `mcp_servers:` of its config.yaml, minus any marked `enabled: false`.
+    The tool carries no YAML parser, and needs only this one shape."""
+    lines = config_text.splitlines()
+    names: List[str] = []
+    for index, raw in enumerate(lines):
+        if not re.match(r"^mcp_servers\s*:\s*(#.*)?$", raw):
+            continue
+        indent: Optional[int] = None
+        current: Optional[str] = None
+        for line in lines[index + 1:]:
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            lead = len(line) - len(line.lstrip(" "))
+            if lead == 0:
+                break
+            if indent is None:
+                indent = lead
+            if lead == indent:
+                match = re.match(r"^\s*(?:\"([^\"]+)\"|'([^']+)'|([A-Za-z0-9_.-]+))\s*:", line)
+                current = next((g for g in match.groups() if g), None) if match else None
+                if current:
+                    names.append(current)
+            elif current and re.match(r"^\s*enabled\s*:\s*(false|no|off)\s*(#.*)?$", line, re.I) and current in names:
+                names.remove(current)
+        break
+    return names
+
+
+class Registration(NamedTuple):
+    count: int
+    tools: str   # what the gateway logged after "tool(s):"
+
+
+REGISTERED_LINE = re.compile(r"MCP server '([^']+)'.*?registered (\d+) tool(?:\(s\))?:?(.*)$")
+
+
+def log_lines(path: Path) -> List[str]:
+    return path.read_text(errors="replace").splitlines() if path.exists() else []
+
+
+def registrations(lines: Sequence[str], server: str) -> List[Registration]:
+    """Every line where a gateway registered `server`'s tools, oldest first."""
+    found = []
+    for raw in lines:
+        match = REGISTERED_LINE.search(raw)
+        if match and match.group(1) == server:
+            found.append(Registration(int(match.group(2)), match.group(3)))
+    return found
+
+
+def missing_tools(registered: Registration, expected: Sequence[str]) -> List[str]:
+    """Expected tool names the registration line does not carry. Whole names only:
+    `answer_for_chat` is not there because `collect_answer_for_chat` is."""
+    return [name for name in expected
+            if not re.search(rf"(?<![A-Za-z0-9_])(?:mcp__[A-Za-z0-9_-]+?__)?{re.escape(name)}(?![A-Za-z0-9_])", registered.tools)]
+
+
+# --------------------------------------------------------------------------- #
+# Verify's vocabulary: checks, and what an upgrade did to them
+# --------------------------------------------------------------------------- #
+class Check(NamedTuple):
+    """One thing verify looked at. `id` is stable between runs (it is what a baseline is
+    compared on), `code` is `ok` or a short reason, `text` is the line a person reads and
+    is never saved."""
+    id: str
+    ok: bool
+    code: str
+    text: str = ""
+
+
+class Findings:
+    """What a verify run found, in the order it should be printed: Checks, and plain notes."""
+
+    def __init__(self, items: Iterable[Union[Check, str]] = ()):
+        self.items: List[Union[Check, str]] = list(items)
+        self.bridge_of: Dict[str, str] = {}   # companion profile -> the trip slug whose bridge it uses
+
+    def check(self, check_id: str, ok: bool, code: str, text: str) -> None:
+        self.items.append(Check(check_id, bool(ok), "ok" if ok else code, text))
+
+    def note(self, text: str) -> None:
+        self.items.append(text)
+
+    @property
+    def checks(self) -> List[Check]:
+        return [item for item in self.items if isinstance(item, Check)]
+
+
+class VerifyResult(NamedTuple):
+    checks: List[Check]
+    caused: List[Check]         # failing now, and the upgrade's doing (or its to own)
+    preexisting: List[Check]    # failing the same way before the upgrade, in a class it does not own
+    unknown: List[Check]        # failing, with no baseline to say where it came from
+    unverifiable: List[Check]   # a bridge too old to answer /health: listed, never a failure
+
+    @property
+    def ok(self) -> bool:
+        return not self.caused and not self.unknown
+
+
+class Gateways(NamedTuple):
+    """What the Hermes supervisor says is running, and what to do about each slot."""
+    running: List[str]                  # up, with a profile, not retired: the set to restart
+    skipped: List[Tuple[str, str]]      # (profile, why it is left alone)
+    expected: List[str]                 # the interview's profile and every live companion's
+    not_running: List[str]              # expected and not running: reported, never started here
+    error: Optional[str]                # the supervisor could not be read
+
+
+#: The classes of check an upgrade does not own, and so may find already failing. Everything the
+#: switch restarts or replaces (readyz, migrations, image tags, the relay, the gateways and
+#: their tools) is its own work and always counts. The one derived exemption: a companion's
+#: site-connection tools while its bridge is pre-existing (see classify()).
+EXEMPTABLE = ("bridge:", "companion-connected:")
+UNVERIFIABLE_CODE = "NO_HEALTH_ROUTE"
+
+
+def classify(baseline: Optional[Sequence[Check]], now: Sequence[Check],
+             bridge_of: Optional[Mapping[str, str]] = None) -> VerifyResult:
+    """Sort the failures of a verify run by origin.
+
+    With a baseline (the same checks, taken before anything changed):
+      - a failure in an exemptable class that failed the SAME WAY before is pre-existing;
+      - anything else that fails is caused: it passed before, did not exist, failed
+        differently (the safe reading), or is the switch's own work;
+      - `tools:<profile>:<server>` for a companion's site connection (a server the switch
+        does not replace) follows its trip's bridge: pre-existing exactly when that
+        bridge is;
+      - a bridge too old to have /health is "cannot be verified": caused only if it
+        answered /health in the baseline.
+    Without one, every failure is of unknown origin. `bridge_of` maps companion profile to
+    the trip slug whose `bridge:<slug>` check governs it."""
+    now = list(now)
+    order = {check.id: index for index, check in enumerate(now)}
+    failing = [c for c in now if not c.ok]
+    unverifiable = [c for c in failing if c.id.startswith("bridge:") and c.code == UNVERIFIABLE_CODE]
+    rest = [c for c in failing if c not in unverifiable]
+    if baseline is None:
+        return VerifyResult(now, [], [], rest, unverifiable)
+    before = {c.id: c for c in baseline}
+    caused, pre = [], []
+    for c in unverifiable[:]:
+        if before.get(c.id) is not None and before[c.id].ok:
+            unverifiable.remove(c)
+            caused.append(c)
+    pending: List[Check] = []
+    for c in rest:
+        earlier = before.get(c.id)
+        if c.id.startswith(EXEMPTABLE) and earlier is not None and not earlier.ok and earlier.code == c.code:
+            pre.append(c)
+        else:
+            pending.append(c)
+    bridges_before = {c.id for c in pre if c.id.startswith("bridge:")}
+    for c in pending:
+        parts = c.id.split(":", 2)
+        slug = (bridge_of or {}).get(parts[1]) if len(parts) == 3 and parts[0] == "tools" else None
+        if slug and parts[2] not in MCP_SERVER_SOURCES and f"bridge:{slug}" in bridges_before:
+            pre.append(c)
+        else:
+            caused.append(c)
+    key = lambda c: order[c.id]  # noqa: E731
+    return VerifyResult(now, sorted(caused, key=key), sorted(pre, key=key), [], sorted(unverifiable, key=key))
+
+
+def preexisting_summary(result: VerifyResult) -> str:
+    """The line the notification carries for failures the upgrade did not cause."""
+    if not result.preexisting:
+        return ""
+    shown = [f"{c.id} ({c.code})" for c in result.preexisting[:10]]
+    more = len(result.preexisting) - len(shown)
+    return ("Not caused by this upgrade (already failing before this upgrade): " + ", ".join(shown)
+            + (f", and {more} more" if more > 0 else ""))
+
+
+def save_baseline(checks: Sequence[Check], path: Path) -> None:
+    """{id, ok, code} per check and nothing else: no text, so nothing a bridge or a log said."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        json.dump([{"id": c.id, "ok": c.ok, "code": c.code} for c in checks], handle, indent=1)
+        handle.write("\n")
+
+
+def load_baseline(path: Path) -> List[Check]:
+    return [Check(item["id"], bool(item["ok"]), str(item["code"])) for item in json.loads(path.read_text())]
+
+
+# The bridge's /health answers in the shapes scripts/companion-install-host.sh
+# (bridge_health_code) reads; the codes are the same words, so one vocabulary serves both.
+BRIDGE_CODE = re.compile(r'^\{.*"code":"([A-Za-z0-9_]{1,40})"[,}]')
+
+
+def bridge_health_code(body: str) -> str:
+    """`ok` or the one short word a /health body amounts to. The body is another
+    process's output: only a single line, and only a code in [A-Za-z0-9_]{1,40}, gets through,
+    so a body cannot forge a second line of the report."""
+    body = body.strip()
+    if not body:
+        return "none"
+    if len(body.splitlines()) == 1:
+        if '"ok":true' in body:
+            return "ok"
+        match = BRIDGE_CODE.match(body)
+        if match and match.group(1) != "ok":
+            return match.group(1)
+    if body == '{"error":"unauthorized"}':
+        return "BRIDGE_401"
+    if "Cannot GET /health" in body:
+        return "NO_HEALTH_ROUTE"
+    return "UNRECOGNIZED"
+
+
+def bridge_health(port: str, key: str, timeout: float = 15) -> str:
+    """Ask a trip-mcp bridge on loopback whether it can reach its trip. The key travels in
+    a request header from this process: never in an argv, where `ps` would show it."""
+    if not key:
+        return "NO_KEY"
+    if not re.fullmatch(r"[0-9]{1,5}", port or ""):
+        return "none"
+    request = urllib.request.Request(f"http://127.0.0.1:{port}/health", headers={"X-API-Key": key})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read(4096).decode(errors="replace")
+    except urllib.error.HTTPError as error:   # 401/404/503 carry the verdict in their body
+        body = error.read(4096).decode(errors="replace")
+    except Exception:  # noqa: BLE001 - refused, reset, timed out: no answer
+        return "none"
+    return bridge_health_code(body)
 
 
 def parse_runner_output(text: str) -> Tuple[Dict[str, str], List[Tuple[str, str]], List[Tuple[str, int, str]]]:
@@ -383,14 +734,14 @@ def backups_to_prune(backups: Sequence[Tuple[str, int]], *, keep: int, max_total
 
 
 def images_to_prune(tags: Iterable[str], keep_revs: Iterable[str]) -> List[str]:
-    """kinerary-cp/{api,worker,agent-runtime}:<rev> images not in keep_revs.
+    """kinerary-cp/{api,worker,agent-runtime,portal,runtime-gateway}:<rev> images not in keep_revs.
 
     Hermes images are never pruned here: building one is a manual step.
     """
     keep = {r for r in keep_revs if r}
     doomed = []
     for tag in tags:
-        match = re.match(r"^kinerary-cp/(api|worker|agent-runtime):([0-9a-f]{7,40})$", tag)
+        match = re.match(r"^kinerary-cp/(api|worker|agent-runtime|portal|runtime-gateway):([0-9a-f]{7,40})$", tag)
         if match and match.group(2) not in keep:
             doomed.append(tag)
     return sorted(doomed)
@@ -400,7 +751,7 @@ def images_to_prune(tags: Iterable[str], keep_revs: Iterable[str]) -> List[str]:
 # History
 # --------------------------------------------------------------------------- #
 HISTORY_FIELDS = ["utc", "action", "from_rev", "to_rev", "hermes_from", "hermes_to", "snapshot",
-                  "backup_dir", "verdict", "result", "actor"]
+                  "backup_dir", "verdict", "result", "actor", "baseline"]
 
 
 def history_path() -> Path:
@@ -746,6 +1097,13 @@ class ControlPlane:
         self.dry_run = dry_run
         self.actor = actor
         self._site: Optional[Dict[str, str]] = None
+        self.target_full: Optional[str] = None
+        # What the switch did to the gateways, kept for verify() to judge it by:
+        self.gateway_offsets: Dict[str, int] = {}      # profile -> agent.log lines before its restart
+        self.gateway_restarted: Set[str] = set()       # restarted by the switch, so expected up again
+        self.gateway_restart_failed: Set[str] = set()  # `s6-svc -r` was tried and did not succeed
+        self.switch_gateway_error: Optional[str] = None  # the supervisor could not be read during the switch
+        self.baseline: Optional[List[Check]] = None    # taken in Guards, before anything changed
 
     @property
     def site(self) -> Dict[str, str]:
@@ -760,9 +1118,42 @@ class ControlPlane:
         return self.site["CP_VMID"]
 
     # ------------------------------------------------------------ basics --
+    def web_enabled(self) -> bool:
+        """Is the optional `web` profile switched on in this VM's env files? Read from
+        the files alone — the same two compose reads — never from the caller's
+        environment, which sudo resets and a rehearsal sets differently."""
+        read = lambda path: path.read_text() if path.exists() else ""  # noqa: E731
+        return WEB_PROFILE in compose_profiles(read(PROVISIONING_ENV), read(VM_ENV))
+
     def compose(self, *args: str) -> List[str]:
+        # `--profile web` is passed explicitly rather than left to COMPOSE_PROFILES:
+        # every command this tool builds then agrees with web_enabled(), whatever
+        # an older compose does with the variable in an --env-file.
+        profile = ["--profile", WEB_PROFILE] if self.web_enabled() else []
         return ["docker", "compose", "-f", str(DEPLOYMENT_DIR / "compose.vm.yml"),
-                "--env-file", str(PROVISIONING_ENV), "--env-file", str(VM_ENV), *args]
+                "--env-file", str(PROVISIONING_ENV), "--env-file", str(VM_ENV), *profile, *args]
+
+    def web_in_compose(self, full: str) -> bool:
+        proc = self.sh.read(self.git_argv("show", f"{full}:control-plane/deployment/compose.vm.yml"), timeout=60)
+        return proc.returncode == 0 and compose_defines_web(proc.stdout.decode(errors="replace"))
+
+    def web_services(self) -> List[str]:
+        """The web services to start now: those the checked-out compose.vm.yml defines,
+        when the profile is on. Empty when it is off — and also, with a note, when the
+        profile is on but this version predates the portal (a rollback), because naming
+        a service compose does not know fails the whole `up`."""
+        if not self.web_enabled():
+            return []
+        if self.dry_run and self.target_full:
+            has_web = self.web_in_compose(self.target_full)
+        else:
+            compose_file = DEPLOYMENT_DIR / "compose.vm.yml"
+            has_web = compose_file.exists() and compose_defines_web(compose_file.read_text())
+        if has_web:
+            return list(WEB_SERVICES)
+        self.r.note(f"{WEB_PROFILE} is on in vm.env but this version's compose.vm.yml has no portal or runtime gateway — "
+                    "they are not started (a running pair from a newer version is removed with the other orphans)")
+        return []
 
     def vm_env(self) -> Dict[str, str]:
         return read_env_text(VM_ENV.read_text())
@@ -1172,11 +1563,20 @@ class ControlPlane:
     def image_exists(self, tag: str) -> bool:
         return self.sh.read(["docker", "image", "inspect", tag], timeout=30).returncode == 0
 
-    def kinerary_images(self, rev: str) -> List[str]:
-        return [f"kinerary-cp/api:{rev}", f"kinerary-cp/worker:{rev}", f"kinerary-cp/agent-runtime:{rev}"]
+    def web_images_wanted(self, full: Optional[str]) -> bool:
+        """The portal and gateway images belong to a release only when the profile is on
+        AND that revision's compose.vm.yml defines them — so a stack that never enabled
+        the web builds, checks and prunes exactly what it did before."""
+        return bool(full) and self.web_enabled() and self.web_in_compose(full)
+
+    def kinerary_images(self, rev: str, full: Optional[str] = None) -> List[str]:
+        images = [f"kinerary-cp/api:{rev}", f"kinerary-cp/worker:{rev}", f"kinerary-cp/agent-runtime:{rev}"]
+        if self.web_images_wanted(full):
+            images += [f"kinerary-cp/{name}:{rev}" for name in WEB_SERVICES]
+        return images
 
     def build_images(self, full: str, short: str) -> None:
-        missing = [t for t in self.kinerary_images(short) if not self.image_exists(t)]
+        missing = [t for t in self.kinerary_images(short, full) if not self.image_exists(t)]
         if not missing:
             self.r.ok(f"images for {short} already built")
             return
@@ -1187,6 +1587,13 @@ class ControlPlane:
             ["docker", "build", "-f", "control-plane/deployment/agent-runtime.Dockerfile",
              "--build-arg", f"BASE=kinerary-cp/api:{short}", "-t", f"kinerary-cp/agent-runtime:{short}", "."],
         ]
+        if self.web_images_wanted(full):
+            # Each image's own build context, as compose.vm.yml's `build:` blocks name them.
+            builds += [
+                ["docker", "build", "-f", "web/Dockerfile", "-t", f"kinerary-cp/portal:{short}", "."],
+                ["docker", "build", "-f", "control-plane/runtime-gateway/Dockerfile",
+                 "-t", f"kinerary-cp/runtime-gateway:{short}", "control-plane/runtime-gateway"],
+            ]
         if self.dry_run:
             self.r.step(f"would build {len(builds)} images for {short} in a worktree at {worktree} (~1.6 GB, before the snapshot so builds do not grow it)")
             return
@@ -1202,7 +1609,7 @@ class ControlPlane:
                     raise Refused("image build failed:\n      " + "\n      ".join(tail))
         finally:
             self.sh.read(self.git_argv("worktree", "remove", "--force", str(worktree)))
-        self.r.ok(f"built {', '.join(self.kinerary_images(short))}")
+        self.r.ok(f"built {', '.join(self.kinerary_images(short, full))}")
 
     def validate_compose(self, full: str) -> None:
         text = self.sh.read(self.git_argv("show", f"{full}:control-plane/deployment/compose.vm.yml"), check=True).stdout
@@ -1210,8 +1617,9 @@ class ControlPlane:
             handle.write(text)
             temp = handle.name
         try:
+            profile = ["--profile", WEB_PROFILE] if self.web_enabled() else []
             proc = self.sh.read(["docker", "compose", "--project-directory", str(DEPLOYMENT_DIR), "-f", temp,
-                                 "--env-file", str(PROVISIONING_ENV), "--env-file", str(VM_ENV), "config", "-q"], timeout=60)
+                                 "--env-file", str(PROVISIONING_ENV), "--env-file", str(VM_ENV), *profile, "config", "-q"], timeout=60)
         finally:
             os.unlink(temp)
         if proc.returncode != 0:
@@ -1219,6 +1627,28 @@ class ControlPlane:
                         f"{proc.stderr.decode(errors='replace').strip()[-300:]}")
         else:
             self.r.ok("the target's compose.vm.yml validates against this VM's env files and secrets")
+
+    def guard_web(self, full: str) -> None:
+        """With the `web` profile on and the target carrying the portal, its configuration
+        must be whole BEFORE the switch: a gateway missing a value exits at start and an
+        api whose profile names a variable it was never given stops at boot — the second
+        takes the interview with it. Nothing is checked, and nothing printed, when the
+        profile is off."""
+        if not self.web_images_wanted(full):
+            return
+        read = lambda path: path.read_text() if path.exists() else ""  # noqa: E731
+        env = {**read_env_text(read(PROVISIONING_ENV)), **read_env_text(read(VM_ENV))}
+        profile: Optional[Dict] = None
+        if env.get("KINERARY_ARCHITECTURE_PROFILE"):
+            try:
+                profile = json.loads((DEPLOYMENT_DIR / env["KINERARY_ARCHITECTURE_PROFILE"]).read_text())
+            except (OSError, ValueError):
+                profile = None
+        problems = web_config_problems(env, profile)
+        for problem in problems:
+            self.r.fail(f"{WEB_PROFILE} profile: {problem}")
+        if not problems:
+            self.r.ok(f"{WEB_PROFILE} profile: the portal and gateway are configured (names checked, no values shown)")
 
     # ---------------------------------------------------------- switch --
     def switch_to(self, full: str, short: str, hermes_rev: Optional[str], previous: Dict[str, str],
@@ -1231,6 +1661,7 @@ class ControlPlane:
         """Checkout, vm.env, migrate — nothing that is running is touched yet, and a
         failed migrate puts the checkout and vm.env back. Everything here is still
         undoable, which is what lets a failed rollback put its database back too."""
+        self.target_full = full  # a dry run never checks it out; web_services() asks git instead
         self.sh.act(self.git_argv("checkout", "--quiet", "--detach", full), describe=f"git checkout --detach {short}")
         self.sh.act(self.git_argv("tag", "-f", f"deployed/{short}", full), describe=f"git tag deployed/{short}")
         updates = {"KINERARY_REV": short}
@@ -1252,44 +1683,188 @@ class ControlPlane:
             raise MigrateFailed(f"migrate with {short} failed; running {previous['KINERARY_REV']} again"
                                 + (f", with these new migrations committed: {', '.join(committed)}" if committed else ""))
 
-    def trip_intake_log(self) -> Path:
-        return HERMES_DATA / "profiles" / "trip-intake" / "logs" / "agent.log"
+    # ------------------------------------------------------- gateways --
+    # A Hermes gateway reads its MCP servers' tool lists once, when it boots, and does not
+    # re-establish a connection when the server's container is recreated underneath it.
+    # So after a switch every gateway is restarted (#420) and judged from what it logs
+    # afterwards (#294). The set is read off the supervisor, not typed into the tool.
+    def agent_log(self, profile: str) -> Path:
+        return HERMES_DATA / "profiles" / profile / "logs" / "agent.log"
 
-    def restart_trip_intake_gateway(self) -> None:
-        """The gateway reads interview-mcp's tool list once, when it boots, so a
-        recreated interview-mcp is invisible to it until it restarts (#420).
-        Restarted whether or not the Hermes container was: a code-only switch
-        leaves Hermes running with the tool list it registered last time."""
-        log = self.trip_intake_log()
-        before = count_interview_registrations(log)
-        self.sh.act(["docker", "exec", HERMES_CONTAINER, "/command/s6-svc", "-r", TRIP_INTAKE_GATEWAY_SERVICE],
-                    describe="restart the trip-intake gateway so it re-registers the interview tools  (downtime: interviews pause for seconds)",
-                    timeout=60)
-        if self.dry_run:
+    def expected_profiles(self) -> List[str]:
+        """The gateways that should be running: the interview's, and every live companion's.
+        Which ones SHOULD run is the reconciler's decision (#349), already in live_companions()."""
+        names = [INTERVIEW_PROFILE]
+        try:
+            names += [profile for _slug, profile in self.live_companions()]
+        except Refused as error:
+            self.r.note(f"could not read the live companions ({error}): only the interview's gateway is expected")
+        return list(dict.fromkeys(names))
+
+    def retired_profiles(self) -> Set[str]:
+        """Profiles recorded on retired trips and on no other: a running slot of one is a
+        teardown that did not finish, not a gateway to bring back."""
+        rows = self.psql(
+            "SELECT b.hermes_profile FROM control_plane.telegram_chat_bindings b "
+            "JOIN control_plane.trips t ON t.id = b.trip_id WHERE b.hermes_profile IS NOT NULL "
+            f"GROUP BY b.hermes_profile HAVING bool_and(t.slug LIKE '{RETIRED_SLUG_PREFIX}%')", check=False)
+        return set(rows.split())
+
+    def running_gateways(self) -> Gateways:
+        """What is running in the Hermes container, and what to do about each slot."""
+        expected = self.expected_profiles()
+        unreadable = "could not read the Hermes supervisor"
+        try:
+            listing = self.sh.read(["docker", "exec", HERMES_CONTAINER, "ls", S6_SCANDIR], timeout=30)
+        except (subprocess.TimeoutExpired, OSError) as error:
+            return Gateways([], [], expected, [], f"{unreadable} ({type(error).__name__})")
+        if listing.returncode != 0:
+            detail = (listing.stderr or listing.stdout or b"").decode(errors="replace").strip()[-160:]
+            return Gateways([], [], expected, [], f"{unreadable}: {detail or 'exit ' + str(listing.returncode)}")
+        slots = sorted(n for n in listing.stdout.decode(errors="replace").split() if n.startswith(GATEWAY_SLOT_PREFIX))
+        if not slots:
+            return Gateways([], [], expected, [], f"{unreadable}: it lists no {GATEWAY_SLOT_PREFIX}* service in {S6_SCANDIR}")
+        retired = self.retired_profiles()
+        running: List[str] = []
+        skipped: List[Tuple[str, str]] = []
+        for slot in slots:
+            profile = slot[len(GATEWAY_SLOT_PREFIX):]
+            if not PROFILE_NAME.fullmatch(profile):
+                skipped.append((profile, "not a profile name"))
+            elif not (HERMES_DATA / "profiles" / profile).is_dir():
+                skipped.append((profile, "supervisor without a profile (teardown leftover)"))
+            elif profile in retired:
+                skipped.append((profile, "retired trip"))
+            else:
+                state = self.sh.text(["docker", "exec", HERMES_CONTAINER, "/command/s6-svstat", f"{S6_SCANDIR}/{slot}"], timeout=30)
+                if state.split()[:1] == ["up"]:
+                    running.append(profile)
+                else:
+                    skipped.append((profile, "the supervisor says it is down"))
+        return Gateways(running, skipped, expected, [p for p in expected if p not in running], None)
+
+    def restart_gateway(self, profile: str) -> bool:
+        """The one place a gateway restart is issued. `s6-svc -r`, not `gateway stop/start`:
+        a restart keeps the recorded intent, so a failure cannot leave a gateway persistently
+        stopped. Remembers where the profile's log stood, so verify reads only what the
+        restarted gateway wrote. Never raises: this is after the point of no return, and
+        verify judges the result."""
+        self.gateway_offsets[profile] = len(log_lines(self.agent_log(profile)))
+        detail = ""
+        try:
+            proc = self.sh.act(["docker", "exec", HERMES_CONTAINER, "/command/s6-svc", "-r", f"{S6_SCANDIR}/{GATEWAY_SLOT_PREFIX}{profile}"],
+                               describe=f"restart gateway {profile} (s6-svc -r)", timeout=60, check=False)
+            restarted = proc.returncode == 0
+            detail = (proc.stderr or b"").decode(errors="replace").strip()[-160:]
+        except (subprocess.TimeoutExpired, OSError) as error:
+            restarted, detail = False, type(error).__name__
+        if restarted:
+            self.gateway_restarted.add(profile)
+            self.gateway_restart_failed.discard(profile)
+            if not self.dry_run:
+                self.r.ok(f"{profile}: restarted")
+        else:
+            self.gateway_restart_failed.add(profile)
+            self.r.fail(f"{profile}: the restart FAILED{': ' + detail if detail else ''} — the others were still restarted; verify judges this one")
+        return restarted
+
+    def restart_gateways(self, found: Gateways) -> None:
+        for profile, why in found.skipped:
+            self.r.note(f"{profile}: {why} — not restarted")
+        for profile in found.not_running:
+            self.r.note(f"{profile}: expected, and not running — the switch does not start gateways (the reconciler decides); verify will fail it")
+        if found.error:
+            self.switch_gateway_error = found.error
+            self.r.fail(f"{found.error} — no gateway was restarted; verify will fail this")
             return
-        for _ in range(30):
-            if count_interview_registrations(log) > before:
-                self.r.ok("trip-intake gateway re-registered the interview tools")
-                return
-            time.sleep(2)
-        self.r.note("trip-intake gateway did not log a new interview tool registration within 60s — verify will say if tools are missing")
+        for profile in found.running:
+            self.restart_gateway(profile)
+
+    def record_gateway_offsets(self) -> None:
+        """Before Hermes itself is recreated: where every profile's log stands now."""
+        profiles = HERMES_DATA / "profiles"
+        for home in sorted(profiles.iterdir()) if profiles.is_dir() else []:
+            if home.is_dir():
+                self.gateway_offsets[home.name] = len(log_lines(self.agent_log(home.name)))
+
+    def profile_servers(self, profile: str) -> Optional[List[str]]:
+        """The MCP servers the profile's config.yaml names; None when it cannot be read."""
+        try:
+            return mcp_server_names((HERMES_DATA / "profiles" / profile / "config.yaml").read_text(errors="replace"))
+        except OSError:
+            return None
+
+    def fresh_registrations(self, profile: str, server: str, lines: Sequence[str]) -> List[Registration]:
+        """The registrations of `server` the profile's gateway logged since its restart."""
+        offset = self.gateway_offsets.get(profile)
+        fresh = lines[offset:] if offset is not None and offset <= len(lines) else lines   # a shorter log was rotated
+        return registrations(fresh, server)
+
+    def wait_for_registrations(self, profiles: Sequence[str]) -> None:
+        """Wait (bounded) until each restarted gateway has re-registered every server it is
+        configured for. Giving up is only said here; verify is what fails it."""
+        if self.dry_run or not profiles:
+            return
+
+        def waiting() -> Dict[str, List[str]]:
+            out = {}
+            for profile in profiles:
+                lines = log_lines(self.agent_log(profile))
+                missing = [s for s in self.profile_servers(profile) or [] if not self.fresh_registrations(profile, s, lines)]
+                if missing:
+                    out[profile] = missing
+            return out
+
+        pending = waiting()
+        for _ in range(GATEWAY_WAIT_POLLS):
+            if not pending:
+                break
+            time.sleep(GATEWAY_WAIT_STEP_SECONDS)
+            pending = waiting()
+        if not pending:
+            self.r.ok(f"{len(profiles)} gateway(s) re-registered their tools")
+        for profile, servers in pending.items():
+            self.r.note(f"{profile} did not log a new registration for {', '.join(servers)} within "
+                        f"{GATEWAY_WAIT_POLLS * GATEWAY_WAIT_STEP_SECONDS}s — verify will say what is missing")
 
     def start_switched(self, hermes_rev: Optional[str], *, restart_hermes: bool) -> None:
         """The point of no return: the target's containers start. From here a failure
         rolls forward (verify, then rollback), because putting an older database back
         under running newer code would strand it."""
-        self.sh.act(self.compose("up", "-d", "--wait", "--remove-orphans", "api", "worker", "interview-mcp", "companion-mcp"),
-                    describe="compose up -d --wait api worker interview-mcp companion-mcp  (downtime: none for trips)", timeout=900,
+        # The portal and gateway follow the api in the same command, so --wait covers
+        # them and they come up on the new revision's images; the api is recreated
+        # first, and the portal's resolver (web/nginx.conf) finds its new address.
+        services = ["api", "worker", "interview-mcp", "companion-mcp", *self.web_services()]
+        self.sh.act(self.compose("up", "-d", "--wait", "--remove-orphans", *services),
+                    describe=f"compose up -d --wait {' '.join(services)}  (downtime: none for trips)", timeout=900,
                     stream_output=True)
-        self.sh.act([str(DEPLOYMENT_DIR / "vm-relay-restart.sh"), "--force-live"],
-                    describe="vm-relay-restart.sh --force-live  (downtime: the Telegram bot pauses; messages wait at Telegram)",
-                    env={"KINERARY_RELAY_READY_SECONDS": "120"}, timeout=300, stream_output=True)
+        relay_restart = lambda: self.sh.act(  # noqa: E731
+            [str(DEPLOYMENT_DIR / "vm-relay-restart.sh"), "--force-live"],
+            describe="vm-relay-restart.sh --force-live  (downtime: the Telegram bot pauses; messages wait at Telegram)",
+            env={"KINERARY_RELAY_READY_SECONDS": "120"}, timeout=300, stream_output=True)
         if restart_hermes:
+            # Recreating the container restarts every gateway in it. Their logs outlive it, so
+            # where each one stands is taken first.
+            relay_restart()
+            self.record_gateway_offsets()
             self.sh.act(self.compose("up", "-d", "--wait", "hermes"),
                         describe="compose up -d hermes  (downtime: companions and site AI features restart)", timeout=900)
+            wait_for = self.expected_profiles()
         else:
-            self.r.ok("Hermes untouched — companions and site AI features keep running")
-        self.restart_trip_intake_gateway()
+            # Every running gateway is restarted - not only those whose servers changed, which
+            # is how a gateway comes to run unchanged for a month - while the relay is stopped,
+            # so Telegram holds the messages instead of answering "companion pending".
+            # `s6-svc -r` returns without waiting, so issuing them one after another still
+            # restarts them all at once.
+            stopped = self.sh.act(self.compose("stop", "relay"), check=False, timeout=120,
+                                  describe="compose stop relay  (downtime: the bot pauses while the gateways restart; messages wait at Telegram)")
+            if stopped.returncode != 0:
+                self.r.note("the relay did not stop: gateways restart while it answers, so a message may meet a companion that is starting")
+            self.restart_gateways(self.running_gateways())
+            relay_restart()
+            self.r.ok("Hermes untouched — its gateways were restarted one by one")
+            wait_for = sorted(self.gateway_restarted)
+        self.wait_for_registrations(wait_for)
 
     # ---------------------------------------------------------- verify --
     def relay_log(self) -> List[Dict]:
@@ -1314,76 +1889,190 @@ class ControlPlane:
         # excluded — waiting on those would cost every trip the full timeout
         # for a companion that was never coming back.
         #
-        # The same special case, for the same reason, lives in
+        #
+        # A DORMANT companion is not live either (issue #349): one the control
+        # plane's reconciler has actually STOPPED on purpose and the host
+        # confirmed stopped, so "NOT connected to the relay" is the right state
+        # and must neither fail a verify nor have its bridge restarted. Dormant is
+        # what HAPPENED, not what was decided: desired 'stopped' AND the last
+        # action a successful stop AND the host last saying stopped/absent. A
+        # decision alone is not enough - in observe mode the reconciler decides
+        # and never acts, and a running (or later crashed) gateway must stay
+        # expected. No row (not decided about) or no table (a database from before
+        # the migration) means NOT dormant: when in doubt a companion is expected up.
+        #
+        # The same two special cases, for the same reasons, live in
         # control-plane/api/src/relay/gateway-wait.ts's expectedGatewayProfiles
         # — if another UNREACHABLE_REASONS value ever needs the same
         # treatment, update both queries together. The retired-slug filter is
         # the same NOT_RETIRED_SQL (trip-retirement.ts) that file uses (#288).
+        dormant = ""
+        if self.psql("SELECT to_regclass('control_plane.companion_gateways') IS NOT NULL") == "t":
+            dormant = (" AND NOT EXISTS (SELECT 1 FROM control_plane.companion_gateways g "
+                       "WHERE g.hermes_profile = b.hermes_profile AND g.desired = 'stopped' AND g.last_action = 'stop' AND g.last_result = 'ok' AND g.observed IN ('stopped', 'absent'))")
         rows = self.psql(
             "SELECT DISTINCT t.slug || '|' || b.hermes_profile FROM control_plane.telegram_chat_bindings b "
             "JOIN control_plane.trips t ON t.id = b.trip_id WHERE b.closed_at IS NULL AND b.hermes_profile IS NOT NULL "
             "AND (t.reachability <> 'unreachable' OR t.unreachable_reason = 'TRIP_MCP_BRIDGE_FAILED') "
-            "AND t.slug NOT LIKE 'retired-%' ORDER BY 1")
+            f"AND t.slug NOT LIKE '{RETIRED_SLUG_PREFIX}%'"
+            + dormant + " ORDER BY 1")
         return [tuple(row.split("|", 1)) for row in rows.splitlines() if "|" in row]  # type: ignore[misc]
 
-    def verify(self) -> bool:
-        before = self.r.failures
+    def probe_in(self, container: str, url: str) -> Tuple[bool, str]:
+        """GET a URL from INSIDE a container — the question is whether that service answers,
+        not whether the interface it is published on is reachable from here."""
+        proc = self.sh.read(["docker", "exec", container, "wget", "-q", "-O", "-", url], timeout=30)
+        return proc.returncode == 0, (proc.stdout or proc.stderr).decode(errors="replace").strip()[:200]
+
+    def verify_web(self, f: Findings, running: Dict[str, str], rev: str) -> None:
+        """The optional portal and gateway. Off means not looked at — except to say so when
+        they are running anyway, because turning the profile off does not stop them."""
+        names = {service: f"{COMPOSE_PROJECT}-{service}-1" for service in WEB_SERVICES}
+        if not self.web_enabled():
+            leftover = [name for name in names.values() if name in running]
+            if leftover:
+                f.note(f"profile {WEB_PROFILE} is off in vm.env but {', '.join(leftover)} is still running — "
+                       "see 'Organizer portal and runtime gateway' in docs/control-plane-vm-deployment.md to remove it")
+            return
+        compose_file = DEPLOYMENT_DIR / "compose.vm.yml"
+        if not (compose_file.exists() and compose_defines_web(compose_file.read_text())):
+            f.note(f"profile {WEB_PROFILE} is on in vm.env but this version has no portal or runtime gateway — not checked")
+            return
+        for service, container in names.items():
+            image = running.get(container, "")
+            f.check(f"web:{service}", image.endswith(f":{rev}"), "NOT_RUNNING" if not image else "WRONG_REV",
+                    f"{container}: {image or 'NOT RUNNING'}")
+        # Through the portal's own nginx to the api: proves the same-origin /v1 proxy and
+        # the api behind it in one request.
+        ok, body = self.probe_in(names["portal"], "http://127.0.0.1/v1/auth/capabilities")
+        ok = ok and '"emailPassword"' in body
+        f.check("web:portal-proxy", ok, "NO_ANSWER",
+                "portal: /v1/auth/capabilities answers through its proxy" if ok else f"portal: /v1/auth/capabilities did not answer through its proxy: {body or 'no output'}")
+        ok, body = self.probe_in(names["runtime-gateway"], "http://127.0.0.1:4320/health")
+        ok = ok and '"ok":true' in body.replace(" ", "")
+        f.check("web:gateway-health", ok, "NO_ANSWER",
+                "runtime gateway: /health answers" if ok else f"runtime gateway: /health did not answer: {body or 'no output'}")
+
+    def versions_in_env(self) -> Tuple[str, str]:
+        try:
+            env = self.vm_env()
+        except OSError:
+            return "", ""
+        return env.get("KINERARY_REV", ""), env.get("HERMES_REV", "")
+
+    def core_checks(self, f: Findings, events: List[Dict]) -> None:
+        """The checks that do not depend on which gateways run: the control plane itself."""
         env = self.vm_env()
         rev, hermes_rev = env.get("KINERARY_REV", ""), env.get("HERMES_REV", "")
-        self.r.head(f"Verify — KINERARY_REV={rev} HERMES_REV={hermes_rev}")
-
         ready, body = self.readyz()
-        (self.r.ok if ready else self.r.fail)(f"readyz: {'ready' if ready else body}")
+        f.check("readyz", ready, "NOT_READY", f"readyz: {'ready' if ready else body}")
         head = self.git("rev-parse", "--short=7", "HEAD", check=False)
-        (self.r.ok if head == rev else self.r.fail)(f"checkout HEAD {head} {'matches' if head == rev else 'does not match'} KINERARY_REV")
+        f.check("checkout", head == rev, "HEAD_MISMATCH", f"checkout HEAD {head} {'matches' if head == rev else 'does not match'} KINERARY_REV")
         try:
             files = set(self.migration_files("HEAD"))
             applied = set(self.applied_migrations())
             missing = sorted(files - applied)
             extra = sorted(applied - files)
-            (self.r.ok if not missing else self.r.fail)(
-                f"{len(files)} migration(s) in the checkout {'all applied' if not missing else 'NOT applied: ' + ', '.join(missing)}")
+            f.check("migrations", not missing, "NOT_APPLIED",
+                    f"{len(files)} migration(s) in the checkout {'all applied' if not missing else 'NOT applied: ' + ', '.join(missing)}")
             if extra:
-                self.r.note(f"the database carries {len(extra)} newer migration(s) this version does not know: {', '.join(extra)}")
+                f.note(f"the database carries {len(extra)} newer migration(s) this version does not know: {', '.join(extra)}")
         except Refused as error:
-            self.r.fail(f"migrations: {error}")
+            f.check("migrations", False, "UNREADABLE", f"migrations: {error}")
 
         ps = self.sh.text(["docker", "ps", "--format", "{{.Names}}\t{{.Image}}"])
         running = dict(line.split("\t", 1) for line in ps.splitlines() if "\t" in line)
         for name in ("api", "worker", "relay", "interview-mcp", "companion-mcp"):
             container = f"{COMPOSE_PROJECT}-{name}-1"
             image = running.get(container, "")
-            (self.r.ok if image.endswith(f":{rev}") else self.r.fail)(f"{container}: {image or 'NOT RUNNING'}")
+            f.check(f"image:{container}", image.endswith(f":{rev}"), "NOT_RUNNING" if not image else "WRONG_REV",
+                    f"{container}: {image or 'NOT RUNNING'}")
         image = running.get(HERMES_CONTAINER, "")
-        (self.r.ok if image.endswith(f":{hermes_rev}") else self.r.fail)(f"{HERMES_CONTAINER}: {image or 'NOT RUNNING'}")
+        f.check(f"image:{HERMES_CONTAINER}", image.endswith(f":{hermes_rev}"), "NOT_RUNNING" if not image else "WRONG_REV",
+                f"{HERMES_CONTAINER}: {image or 'NOT RUNNING'}")
+        self.verify_web(f, running, rev)
 
-        events = self.relay_log()
         identity = [e for e in events if e.get("event") == "relay.bot_identity"]
         bot = identity[-1].get("username") if identity else None
         expected_bot = self.site["CP_EXPECT_BOT"]
-        (self.r.ok if bot == expected_bot else self.r.fail)(f"relay bot: @{bot or 'unknown'} (expected @{expected_bot})")
+        f.check("relay:bot", bot == expected_bot, "WRONG_BOT", f"relay bot: @{bot or 'unknown'} (expected @{expected_bot})")
         polling = [e for e in events if e.get("event") == "relay.ready"]
-        (self.r.ok if polling and polling[-1].get("polling") else self.r.fail)("relay reported relay.ready with polling")
+        f.check("relay:ready", bool(polling and polling[-1].get("polling")), "NOT_READY", "relay reported relay.ready with polling")
         conflicts = [e for e in events if e.get("event") == "telegram_api.get_updates_failed" and e.get("status") == 409]
-        (self.r.ok if not conflicts else self.r.fail)(
-            "no 409/Conflict — this relay is the only getUpdates loop" if not conflicts else f"{len(conflicts)} 409/Conflict line(s) — a second poller exists")
-
-        source = REPO / "control-plane" / "api" / "src" / "interview-mcp.ts"
-        expected_tools = extract_agent_tools(source.read_text()) if source.exists() else []
-        registrations = interview_registrations(self.trip_intake_log())
-        registered = registrations[-1] if registrations else ""
-        if not expected_tools:
-            self.r.note("could not extract the *_for_chat tool list from interview-mcp.ts — gateway tools not checked")
-        else:
-            missing_tools = [t for t in expected_tools if f"mcp__interview__{t}" not in registered]
-            (self.r.ok if not missing_tools else self.r.fail)(
-                f"trip-intake registered all {len(expected_tools)} *_for_chat tools" if not missing_tools
-                else f"trip-intake is MISSING tools: {', '.join(missing_tools)}")
+        f.check("relay:409", not conflicts, "CONFLICT",
+                "no 409/Conflict — this relay is the only getUpdates loop" if not conflicts else f"{len(conflicts)} 409/Conflict line(s) — a second poller exists")
 
         creds = self.sh.text(["sudo", "-u", "hermes", "-H", "hermes", "auth", "list"], timeout=60)
         count = len(re.findall(r"openai-codex|anthropic|openrouter|ollama", creds))
-        (self.r.ok if count else self.r.fail)(f"Hermes has {count} provider credential entr{'y' if count == 1 else 'ies'}")
+        f.check("hermes:credentials", bool(count), "NO_CREDENTIALS", f"Hermes has {count} provider credential entr{'y' if count == 1 else 'ies'}")
 
+    def server_expectations(self, f: Findings) -> Dict[str, List[str]]:
+        """The tools each switch-recreated server must offer, from the checkout's own source."""
+        out: Dict[str, List[str]] = {}
+        for server, (filename, extract) in MCP_SERVER_SOURCES.items():
+            source = REPO / "control-plane" / "api" / "src" / filename
+            tools = extract(source.read_text()) if source.exists() else []
+            if tools:
+                out[server] = tools
+            else:
+                f.note(f"could not extract the tool list of '{server}' from {filename} — only that it registers a tool is checked")
+        return out
+
+    def tool_check(self, f: Findings, profile: str, server: str, lines: Sequence[str], expected: Dict[str, List[str]]) -> None:
+        check_id = f"tools:{profile}:{server}"
+        offset = self.gateway_offsets.get(profile)
+        fresh = self.fresh_registrations(profile, server, lines)
+        if offset is not None and not fresh:
+            # The gateway was restarted (or Hermes was recreated) and has not registered this server since.
+            older = registrations(lines, server)
+            if profile in self.gateway_restart_failed and older and server in MCP_SERVER_SOURCES:
+                f.check(check_id, False, "STALE_REGISTRATION",
+                        f"{profile}: stale registration — its restart failed, and its {server} connection predates the switch that "
+                        f"recreated {server}; restart the gateway")
+                return
+            if profile in self.gateway_restart_failed and older:
+                fresh = older   # a server the switch did not replace: the connection it has still stands
+        if not fresh:
+            f.check(check_id, False, "NOT_REGISTERED", f"{profile}: '{server}' has not registered any tool since its gateway started")
+            return
+        latest = fresh[-1]
+        wanted = expected.get(server)
+        if wanted:
+            gone = missing_tools(latest, wanted)
+            f.check(check_id, not gone, "MISSING:" + ",".join(gone),
+                    f"{profile}: '{server}' registered all {len(wanted)} expected tool(s)" if not gone
+                    else f"{profile}: '{server}' is MISSING tools: {', '.join(gone)}")
+        else:
+            f.check(check_id, latest.count >= 1, "NO_TOOLS",
+                    f"{profile}: '{server}' registered {latest.count} tool(s)" if latest.count >= 1
+                    else f"{profile}: '{server}' registered no tools")
+
+    def gateway_checks(self, f: Findings) -> None:
+        """Every gateway that should be, or is, running, against the MCP servers in its own
+        config.yaml and the lines it logged since the switch restarted it."""
+        found = self.running_gateways()
+        error = self.switch_gateway_error or found.error
+        if error:
+            f.check("gateways:discovery", False, "SUPERVISOR_UNREADABLE", f"gateways: {error} — they cannot be checked")
+            return
+        f.check("gateways:discovery", True, "ok", f"gateways: {len(found.running)} running in the supervisor")
+        expected = list(dict.fromkeys([*found.expected, *sorted(self.gateway_restarted)]))
+        for profile in expected:
+            up = profile in found.running
+            f.check(f"gateway:{profile}", up, "NOT_RUNNING", f"gateway {profile}: {'running' if up else 'NOT RUNNING'}")
+        wanted = self.server_expectations(f)
+        for profile in list(dict.fromkeys([*[p for p in expected if p in found.running], *found.running])):
+            servers = self.profile_servers(profile)
+            if servers is None:
+                f.check(f"tools:{profile}:config", False, "NO_CONFIG", f"{profile}: its config.yaml cannot be read — its tools cannot be checked")
+                continue
+            if profile == INTERVIEW_PROFILE and "interview" not in servers:
+                f.check(f"tools:{profile}:interview", False, "NOT_CONFIGURED", f"{profile}: its config.yaml does not name the 'interview' server")
+            lines = log_lines(self.agent_log(profile))
+            for server in servers:
+                self.tool_check(f, profile, server, lines, wanted)
+
+    def companion_checks(self, f: Findings, events: List[Dict]) -> None:
         awaited = [e for e in events if e.get("event") == "relay.gateways_awaited"]
         connected_ids = {e.get("gateway_id") for e in events if e.get("event") == "relay.gateway_connected"}
         for slug, profile in self.live_companions():
@@ -1392,17 +2081,91 @@ class ControlPlane:
                 ok = not gone or profile in connected_ids
             else:
                 ok = profile in connected_ids
-            (self.r.ok if ok else self.r.fail)(f"trip {slug}: companion {profile} {'connected to the relay' if ok else 'NOT connected to the relay'}")
+            f.check(f"companion-connected:{profile}", ok, "NOT_CONNECTED",
+                    f"trip {slug}: companion {profile} {'connected to the relay' if ok else 'NOT connected to the relay'}")
             env_file = DEPLOY_ROOT / "trips" / slug / "mcp" / ".env"
             if not env_file.exists():
-                self.r.note(f"trip {slug}: no trip-mcp bridge configured")
+                f.note(f"trip {slug}: no trip-mcp bridge configured")
                 continue
-            port = read_env_text(env_file.read_text()).get("MCP_PORT", "")
+            f.bridge_of[profile] = slug
+            values = read_env_text(env_file.read_text())
+            port = values.get("MCP_PORT", "")
+            key = values.get("MCP_API_KEY", "").replace('"', "").replace("\r", "")
             listening = bool(port) and bool(self.sh.text(["ss", "-ltnH", f"sport = :{port}"]).strip())
-            (self.r.ok if listening else self.r.fail)(
-                f"trip {slug}: trip-mcp bridge {'listening on' if listening else 'NOT listening on'} :{port or '?'}"
-                + ("" if listening else " — run: kinerary-cp-release restart-bridges"))
-        return self.r.failures == before
+            code = bridge_health(port, key) if listening else "none"
+            repair = " — run: kinerary-cp-release restart-bridges"
+            if code == "ok":
+                text = f"trip {slug}: trip-mcp bridge answers /health on :{port}"
+            elif not listening:
+                text = f"trip {slug}: trip-mcp bridge NOT listening on :{port or '?'}{repair}"
+            elif code == UNVERIFIABLE_CODE:
+                text = f"trip {slug}: trip-mcp bridge on :{port} cannot be verified — its mcp.js predates /health"
+            else:
+                text = f"trip {slug}: trip-mcp bridge on :{port} is not healthy ({code}){repair}"
+            f.check(f"bridge:{slug}", code == "ok", code, text)
+
+    def collect_checks(self) -> Findings:
+        f = Findings()
+        events = self.relay_log()
+        self.core_checks(f, events)
+        self.gateway_checks(f)
+        self.companion_checks(f, events)
+        return f
+
+    def take_baseline(self, action: str) -> Optional[Path]:
+        """The same checks as verify, run in Guards before anything changes. Saved as {id, ok,
+        code} so the verify that follows the switch can tell a failure the upgrade caused from
+        one it found. Returns where it was saved (None for a dry run, which writes nothing, or
+        when it could not be taken, which is said and means every failure will count)."""
+        self.baseline = None
+        try:
+            checks = self.collect_checks().checks
+        except Exception as error:  # noqa: BLE001 - whatever stopped it is reported, then the upgrade goes on without one
+            self.r.note(f"the baseline could not be taken ({type(error).__name__}: {error}) — nothing will tell this {action}'s "
+                        "failures from older ones, so every failure after the switch counts against it")
+            return None
+        self.baseline = checks
+        failing = [c for c in checks if not c.ok]
+        self.r.ok(f"baseline: {len(checks)} checks taken before anything changes, {len(failing)} failing already")
+        for c in failing:
+            self.r.note(f"already failing: {c.id} ({c.code})" + ("" if c.id.startswith(EXEMPTABLE) else
+                        " — the switch owns this class, so it counts against the " + action + " whatever it was before"))
+        if self.dry_run:
+            self.r.step("would save the baseline next to the history")
+            return None
+        path = STATE_DIR / f"baseline-{utcnow().strftime('%Y%m%dT%H%M%SZ')}.json"
+        save_baseline(checks, path)
+        self.r.ok(f"baseline saved: {path}")
+        return path
+
+    def verify(self, baseline: Optional[Sequence[Check]] = None) -> VerifyResult:
+        """Run every check and sort the failures by origin. With the baseline an upgrade or
+        rollback took in Guards, a failure it did not cause is listed and does not fail it;
+        without one (standalone verify, restart-bridges) every failure is of unknown origin."""
+        rev, hermes_rev = self.versions_in_env()
+        self.r.head(f"Verify — KINERARY_REV={rev} HERMES_REV={hermes_rev}")
+        findings = self.collect_checks()
+        result = classify(baseline, findings.checks, findings.bridge_of)
+        caused, pre = {c.id for c in result.caused}, {c.id for c in result.preexisting}
+        unknown, unverifiable = {c.id for c in result.unknown}, {c.id for c in result.unverifiable}
+        for item in findings.items:
+            if isinstance(item, str):
+                self.r.note(item)
+            elif item.ok:
+                self.r.ok(item.text or item.id)
+            else:
+                text = item.text or f"{item.id}: {item.code}"
+                if item.id in caused:
+                    self.r.fail(text + "  [caused by this change]")
+                elif item.id in unknown:
+                    self.r.fail(text + "  [origin unknown: no baseline was taken]")
+                elif item.id in pre:
+                    self.r.note(text + "  [already failing before this upgrade — does not fail it]")
+                elif item.id in unverifiable:
+                    self.r.note(text + "  [not counted as a failure]")
+                else:
+                    self.r.fail(text)
+        return result
 
     # ----------------------------------------------------------- notify --
     def notify(self, text: str) -> bool:
@@ -1429,6 +2192,117 @@ def current_versions(cp: ControlPlane) -> Dict[str, str]:
     env = cp.vm_env()
     return {"KINERARY_REV": env.get("KINERARY_REV", ""), "HERMES_REV": env.get("HERMES_REV", ""),
             "full": cp.git("rev-parse", "HEAD", check=False)}
+
+
+#: The text the worker's reconciler, scripts/teardown-trip.py and this tool all
+#: pass to hashtext() to name ONE advisory lock. tests/scripts pins that the
+#: three spell it identically.
+GATEWAY_LOCK_TEXT = "control_plane.companion_gateways"
+
+
+class GatewayLock:
+    """Holds the companion-gateway advisory lock for the length of a release
+    action that stops or starts gateways (upgrade, rollback, restart-bridges).
+
+    The worker's reconciler takes the same lock for every sweep and skips the
+    sweep when it is held, so it cannot start a gateway this tool just stopped,
+    or stop one it is waiting for, halfway through an upgrade. The lock lives as
+    long as one database SESSION, so a `psql` is kept open in the Postgres
+    container with its stdin as the lease: closing the pipe ends the session
+    and releases the lock, whatever happens to this process.
+
+    If the lock cannot be had within WAIT_SECONDS something else (a sweep, a
+    teardown, an operator pin) is mid-flight: the action is REFUSED, not run
+    unguarded. If the DATABASE cannot be reached at all it is noted and the
+    action goes on — a rollback must stay possible when the database is the
+    thing that is broken, and with it down no reconciler can act either.
+    `--restore-db` kills this session by design; the lock is gone by then and
+    that is fine, the swap replaces the database it was held in."""
+
+    WAIT_SECONDS = 120
+
+    def __init__(self, cp: "ControlPlane") -> None:
+        self.cp = cp
+        self.proc: Optional["subprocess.Popen[bytes]"] = None
+
+    def __enter__(self) -> "GatewayLock":
+        cp = self.cp
+        if cp.dry_run:
+            cp.r.step("would hold the companion-gateway lock while this runs (the reconciler pauses)")
+            return self
+        argv = ["docker", "exec", "-i", PG_CONTAINER, "psql", "-U", DB_USER, "-d", DB_NAME, "-q", "-At",
+                "-v", "ON_ERROR_STOP=1"]
+        try:
+            self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            assert self.proc.stdin is not None and self.proc.stdout is not None
+            self.proc.stdin.write((f"SET lock_timeout = '{int(self.WAIT_SECONDS)}s';\n"
+                                   f"SELECT pg_advisory_lock(hashtext('{GATEWAY_LOCK_TEXT}'));\n"
+                                   "SELECT 'LOCKED';\n").encode())
+            self.proc.stdin.flush()
+            deadline = time.monotonic() + self.WAIT_SECONDS + 15
+            # Unbuffered reads on the pipe's descriptor: select() on a descriptor
+            # whose data a BufferedReader has already pulled in never fires, and
+            # psql's blank line and 'LOCKED' can arrive in one chunk.
+            fd, seen = self.proc.stdout.fileno(), b""
+            while True:
+                remaining = deadline - time.monotonic()
+                ready = select.select([fd], [], [], remaining)[0] if remaining > 0 else []
+                if not ready:
+                    self._release()
+                    raise Refused("the companion-gateway lock is held by something else (a reconcile sweep, a "
+                                  "teardown or a pin): retry in a few minutes")
+                chunk = os.read(fd, 4096)
+                seen += chunk
+                if b"LOCKED" in seen.split():
+                    cp.r.ok("holding the companion-gateway lock: the reconciler pauses until this finishes")
+                    return self
+                if chunk == b"":
+                    self.proc.wait(timeout=10)
+                    err = (self.proc.stderr.read() if self.proc.stderr else b"").decode(errors="replace")
+                    self._release()
+                    if "lock timeout" in err:
+                        raise Refused("the companion-gateway lock is held by something else (a reconcile sweep, a "
+                                      "teardown or a pin): retry in a few minutes")
+                    reason = err.strip().splitlines()[-1][:160] if err.strip() else "no reason given"
+                    cp.r.note(f"could not take the companion-gateway lock ({reason}): continuing without it — "
+                              "with the database unreachable no reconciler can act either")
+                    return self
+        except OSError as error:
+            cp.r.note(f"could not take the companion-gateway lock ({type(error).__name__}): continuing without it")
+            self.proc = None
+            return self
+
+    def _release(self) -> None:
+        proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+            proc.wait(timeout=10)
+        except (subprocess.TimeoutExpired, OSError):
+            proc.kill()
+        for stream in (proc.stdout, proc.stderr):
+            if stream:
+                stream.close()
+
+    def __exit__(self, *exc: object) -> bool:
+        self._release()
+        return False
+
+
+def holds_gateway_lock(fn):  # type: ignore[no-untyped-def]
+    """Run a release action that moves gateways under the companion-gateway lock."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(cp, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if not isinstance(cp, ControlPlane):
+            return fn(cp, *args, **kwargs)
+        with GatewayLock(cp):
+            return fn(cp, *args, **kwargs)
+
+    return wrapper
 
 
 def cmd_status(cp: ControlPlane) -> int:
@@ -1496,11 +2370,13 @@ def cmd_plan(cp: ControlPlane, rev: str) -> int:
         (r.ok if verdict == "compatible" else r.note)(
             "a later rollback can keep the database" if verdict == "compatible"
             else "a later rollback will need --restore-db (or --keep-db after reading the reasons)")
-    for tag in cp.kinerary_images(short):
+    for tag in cp.kinerary_images(short, full):
         (r.ok if cp.image_exists(tag) else r.note)(f"{tag} {'present' if cp.image_exists(tag) else 'will be built'}")
+    cp.guard_web(full)
     return 1 if r.failures else 0
 
 
+@holds_gateway_lock
 def cmd_upgrade(cp: ControlPlane, rev: str, hermes_rev: Optional[str], force_live: bool) -> int:
     r = cp.r
     r.head("1/5 Prepare" + ("  [DRY RUN — nothing will change]" if cp.dry_run else ""))
@@ -1527,6 +2403,7 @@ def cmd_upgrade(cp: ControlPlane, rev: str, hermes_rev: Optional[str], force_liv
         tag = f"kinerary-cp/hermes:{hermes_rev}"
         (r.ok if cp.image_exists(tag) else r.fail)(f"{tag} {'present' if cp.image_exists(tag) else 'missing — build it first (runbook: Hermes)'}")
     cp.validate_compose(full)
+    cp.guard_web(full)
     cp.guard_storage(extra_bytes=cp.db_size_bytes() + (2 * 1024 ** 3))
     cp.refuse_if_failed("nothing was changed")
     cp.build_images(full, short)
@@ -1534,6 +2411,9 @@ def cmd_upgrade(cp: ControlPlane, rev: str, hermes_rev: Optional[str], force_liv
     r.head("2/5 Guards")
     cp.guard_jobs()
     cp.guard_interview(force_live)
+    # The same checks verify will run after the switch, taken now: whatever already fails is
+    # then told apart from what this upgrade breaks. Read-only, and it cannot fail the guards.
+    baseline_path = cp.take_baseline("upgrade")
     doomed_snapshots = snapshots_to_prune(cp.snapshot_list(), time.time(), keep_newest=1, max_age_days=None)
     if doomed_snapshots:
         r.ok(f"will delete older release snapshot(s) before taking a new one: {', '.join(doomed_snapshots)}")
@@ -1565,7 +2445,8 @@ def cmd_upgrade(cp: ControlPlane, rev: str, hermes_rev: Optional[str], force_liv
     r.head("4/5 Switch")
     record = {"action": "upgrade", "from_rev": versions["KINERARY_REV"], "to_rev": short,
               "hermes_from": versions["HERMES_REV"], "hermes_to": hermes_rev if hermes_changes else versions["HERMES_REV"],
-              "snapshot": snapshot, "backup_dir": str(backup), "verdict": verdict, "actor": cp.actor}
+              "snapshot": snapshot, "backup_dir": str(backup), "verdict": verdict, "actor": cp.actor,
+              "baseline": str(baseline_path or "")}
     if not cp.dry_run:
         # Before anything switches: if this process dies mid-switch, the way back
         # (from_rev, dump, snapshot) is already on record.
@@ -1586,25 +2467,35 @@ def cmd_upgrade(cp: ControlPlane, rev: str, hermes_rev: Optional[str], force_liv
 
     r.head("5/5 Verify")
     if cp.dry_run:
-        r.step("would verify: readyz, migrations, image tags, relay bot + polling + no 409, trip-intake tools, "
-               "Hermes credentials, every live trip's companion and trip-mcp bridge")
+        r.step("would verify: readyz, migrations, image tags, relay bot + polling + no 409, every running gateway's tools "
+               "(against its own config.yaml, from lines newer than its restart), Hermes credentials, every live trip's "
+               "companion and trip-mcp bridge (/health)"
+               + (", the portal's /v1 proxy and the runtime gateway" if cp.web_enabled() else ""))
         r.line()
         r.line(f"Dry run complete: {r.failures} problem(s). Nothing was changed.")
         return 1 if r.failures else 0
-    ok = cp.verify()
+    result = cp.verify(cp.baseline)
+    ok = result.ok
     append_history({**record, "utc": iso(utcnow()), "result": "ok" if ok else "verify-failed"})
     back = "kinerary-cp-release rollback" + ("" if verdict == "compatible" else " --restore-db")
+    already = preexisting_summary(result)
     if ok:
         install_tool_files(cp, quiet=True)
         prune_after_upgrade(cp)
         r.line(); r.line(f"Upgraded to {short}. The way back: {back}")
-        cp.notify(f"Kinerary control plane upgraded {versions['KINERARY_REV']} -> {short} ({cp.actor}). Verify passed.\nWay back: {back}")
+        if already:
+            r.note(already)
+        cp.notify(f"Kinerary control plane upgraded {versions['KINERARY_REV']} -> {short} ({cp.actor}). Verify passed.\nWay back: {back}"
+                  + (f"\n{already}" if already else ""))
         return 0
     r.line(); r.line(f"Upgraded to {short}, but verify FAILED. To go back: {back}")
-    cp.notify(f"Kinerary control plane upgraded {versions['KINERARY_REV']} -> {short} ({cp.actor}) but VERIFY FAILED.\nTo go back: {back}")
+    cp.notify(f"Kinerary control plane upgraded {versions['KINERARY_REV']} -> {short} ({cp.actor}) but VERIFY FAILED.\n"
+              f"Failing: {', '.join(f'{c.id} ({c.code})' for c in result.caused[:10] + result.unknown[:10])}\nTo go back: {back}"
+              + (f"\n{already}" if already else ""))
     return 2
 
 
+@holds_gateway_lock
 def cmd_rollback(cp: ControlPlane, to: Optional[str], restore_db: bool, keep_db: bool, restore_hermes: bool, force_live: bool) -> int:
     r = cp.r
     r.head("1/5 Target" + ("  [DRY RUN — nothing will change]" if cp.dry_run else ""))
@@ -1628,7 +2519,7 @@ def cmd_rollback(cp: ControlPlane, to: Optional[str], restore_db: bool, keep_db:
     hermes_changes = hermes_target != versions["HERMES_REV"]
     r.ok(f"{versions['KINERARY_REV']} → {short} \"{cp.subject(full)}\"" + (f", Hermes {versions['HERMES_REV']} → {hermes_target}" if hermes_changes else ""))
     r.fact("target", f"{versions['KINERARY_REV']} -> {short} \"{cp.subject(full)}\"")
-    for tag in cp.kinerary_images(short):
+    for tag in cp.kinerary_images(short, full):
         (r.ok if cp.image_exists(tag) else r.fail)(f"{tag} {'present' if cp.image_exists(tag) else 'MISSING — pruned? rebuild it or pick another target'}")
     if hermes_changes:
         (r.ok if cp.image_exists(f"kinerary-cp/hermes:{hermes_target}") else r.fail)(f"kinerary-cp/hermes:{hermes_target}")
@@ -1679,6 +2570,7 @@ def cmd_rollback(cp: ControlPlane, to: Optional[str], restore_db: bool, keep_db:
     r.head("3/5 Guards")
     cp.guard_jobs()
     cp.guard_interview(force_live)
+    baseline_path = cp.take_baseline("rollback")
     cp.guard_storage(extra_bytes=cp.db_size_bytes())
     cp.refuse_if_failed("nothing was changed")
 
@@ -1686,7 +2578,8 @@ def cmd_rollback(cp: ControlPlane, to: Optional[str], restore_db: bool, keep_db:
     pre_label = f"{versions['KINERARY_REV']}-before-rollback-to-{short}"
     record = {"action": "rollback", "from_rev": versions["KINERARY_REV"], "to_rev": short,
               "hermes_from": versions["HERMES_REV"], "hermes_to": hermes_target, "backup_dir": str(dump_dir or ""),
-              "verdict": "restore-db" if restore_db else ("keep-db" if newer else "no-newer-migrations"), "actor": cp.actor}
+              "verdict": "restore-db" if restore_db else ("keep-db" if newer else "no-newer-migrations"), "actor": cp.actor,
+              "baseline": str(baseline_path or "")}
     if not cp.dry_run:
         # Before anything changes: a run that dies mid-rollback still leaves a row.
         append_history({**record, "utc": iso(utcnow()), "result": "switching"})
@@ -1711,13 +2604,17 @@ def cmd_rollback(cp: ControlPlane, to: Optional[str], restore_db: bool, keep_db:
 
     r.head("5/5 Verify")
     if cp.dry_run:
-        r.step("would verify: readyz, migrations, image tags, relay, trip-intake tools, Hermes credentials, live trips")
+        r.step("would verify: readyz, migrations, image tags, relay, every running gateway's tools, Hermes credentials, live trips and their bridges"
+               + (", the portal's /v1 proxy and the runtime gateway" if cp.web_enabled() else ""))
         r.line(); r.line(f"Dry run complete: {r.failures} problem(s). Nothing was changed.")
         return 1 if r.failures else 0
-    ok = cp.verify()
+    result = cp.verify(cp.baseline)
+    ok = result.ok
     append_history({**record, "utc": iso(utcnow()), "result": "ok" if ok else "verify-failed"})
+    already = preexisting_summary(result)
     cp.notify(f"Kinerary control plane rolled back {versions['KINERARY_REV']} -> {short} ({cp.actor})"
-              f"{' with the database restored' if restore_db else ''}. Verify {'passed' if ok else 'FAILED'}.")
+              f"{' with the database restored' if restore_db else ''}. Verify {'passed' if ok else 'FAILED'}."
+              + (f"\n{already}" if already else ""))
     return 0 if ok else 2
 
 
@@ -1893,6 +2790,7 @@ def undo_hermes_data(cp: ControlPlane, aside: Path) -> None:
               describe="compose up -d hermes  (companions and site AI features come back)", timeout=900)
 
 
+@holds_gateway_lock
 def cmd_restart_bridges(cp: ControlPlane) -> int:
     r = cp.r
     r.head("Restart trip-mcp bridges and their companions" + ("  [DRY RUN]" if cp.dry_run else ""))
@@ -1907,12 +2805,16 @@ def cmd_restart_bridges(cp: ControlPlane) -> int:
         cp.sh.act(["sudo", "-u", "hermes", "-H", "env", f"REPO_ROOT={REPO}", f"KINERARY_DEPLOY_ROOT={DEPLOY_ROOT}",
                    str(DEPLOY_ROOT / "setup-mcp.sh"), "--restart-only", "--trip-dir", str(trip_dir)],
                   describe=f"{slug}: setup-mcp.sh --restart-only", timeout=180, check=False)
+        # Where the log stands before the gateway goes, so verify asks for a registration written after it.
+        cp.gateway_offsets[profile] = len(log_lines(cp.agent_log(profile)))
+        cp.gateway_restarted.add(profile)
         cp.sh.act(["sudo", "-u", "hermes", "-H", "hermes", "-p", profile, "gateway", "stop"], describe=f"{profile}: gateway stop",
                   timeout=120, check=False)
         cp.sh.act(["sudo", "-u", "hermes", "-H", "hermes", "-p", profile, "gateway", "start"], describe=f"{profile}: gateway start",
                   timeout=120, check=False)
     if not cp.dry_run:
         time.sleep(20)
+        cp.wait_for_registrations(sorted(cp.gateway_restarted))
         cp.verify()
     return 1 if r.failures else 0
 
@@ -2107,7 +3009,7 @@ def cmd_gate(tokens: Sequence[str]) -> int:
                 print(f"{name}  {iso(dt.datetime.fromtimestamp(snaptime, dt.timezone.utc))}  {desc}", file=out)
             return 0
         if verb == "verify":
-            return 0 if cp.verify() else 1
+            return 0 if cp.verify().ok else 1
         if verb == "plan":
             return cmd_plan(ControlPlane(report, dry_run=True, actor="agent"), args[0])
         if verb == "dry-run":
@@ -2286,7 +3188,7 @@ def main(argv: Sequence[str]) -> int:
                 print(f"{name}\t{iso(dt.datetime.fromtimestamp(snaptime, dt.timezone.utc))}\t{desc}")
             return 0
         if command == "verify":
-            return 0 if ControlPlane(report).verify() else 1
+            return 0 if ControlPlane(report).verify().ok else 1
         if command == "plan":
             if len(rest) != 1:
                 raise Refused("plan <rev|main>")

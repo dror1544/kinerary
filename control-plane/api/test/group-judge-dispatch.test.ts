@@ -384,6 +384,26 @@ describe("/proactive - how much the assistant takes part in one group", { skip: 
     });
   });
 
+  test("an organizer whose Telegram link was unlinked is refused like anyone else (boundary review R1)", async () => {
+    await withFixture(async (fix) => {
+      const chat = "-1005000009";
+      await bindNamed(fix, chat);
+      await linkOrganizer(fix, DROR);
+      const client = await fix.pool.connect();
+      try {
+        const { linkTelegramOrganizerInTx } = await import("../src/organizer-trips.js");
+        await linkTelegramOrganizerInTx(client, String(DROR), fix.userId, fix.tripId);
+      } finally { client.release(); }
+      assert.match(reply(await dispatch(fix, from(chat, "/proactive 1", DROR), { assistantEvents: true })), /Level 1/);
+      const { unlinkTelegramLink } = await import("../src/telegram-mini-app.js");
+      const linkId = (await fix.pool.query("SELECT id FROM control_plane.telegram_organizer_trip_links WHERE revoked_at IS NULL")).rows[0].id;
+      assert.equal(await unlinkTelegramLink(fix.pool, fix.userId, linkId), true);
+      const refused = await dispatch(fix, from(chat, "/proactive 3", DROR), { assistantEvents: true });
+      assert.match(reply(refused), /Only the trip organizer can change this/);
+      assert.equal(await column(fix, chat), 1, "the level stayed where it was");
+    });
+  });
+
   test("the organizer sets 1, 2, 3; it persists; anyone can read it; a repeat is not a change", async () => {
     await withFixture(async (fix) => {
       const chat = "-1005000003";
@@ -415,8 +435,8 @@ describe("/proactive - how much the assistant takes part in one group", { skip: 
       const chat = "-1005000004";
       await bindNamed(fix, chat);
       await fix.pool.query(
-        "INSERT INTO control_plane.telegram_organizer_links(id, user_id, telegram_subject_digest, verified_via) VALUES ($1, $2, $3, 'enrollment_redemption')",
-        [testId("tol"), fix.userId, digestTelegramId(String(DROR))],
+        "INSERT INTO control_plane.telegram_organizer_trip_links(id, user_id, trip_id, telegram_subject_digest, verified_via) VALUES ($1, $2, $3, $4, 'enrollment_redemption')",
+        [testId("otl"), fix.userId, fix.tripId, digestTelegramId(String(DROR))],
       );
       assert.match(reply(await dispatch(fix, from(chat, "/proactive 1", DROR))), /Level 1/);
       assert.equal(await column(fix, chat), 1);

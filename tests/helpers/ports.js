@@ -149,6 +149,10 @@ export const BASE_PORTS = {
   mcpTripStopsLive:        28319,  // mcp/mcp.js against the real trip server below
   mcpTripStopsSite:        28320,  // the real trip server mcpTripStopsLive talks to
   stopFollowups:           28321,  // tests/stop-followups.test.js — split-then-link, gershayim (second review 2026-10-11)
+  // #419 — a hotel told to the companion reaches Plan and Map.
+  tripStopsUnlinked:       28344,  // tests/trip-stops-http.test.js — unlinked hotel bookings, organizer only
+  mcpHotelLinkSite:        28345,  // tests/mcp-trip-stops.test.js — add_booking then set_stop_from_booking, real trip server
+  mcpHotelLinkMcp:         28346,  // mcp/mcp.js against it
   // "Tonight:" lodging computed at serve time — tests/tonight-lodging.test.js.
   tonightLodging:          28322,
   // Write-time validation of booking and participant text, bilingual refusals

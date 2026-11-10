@@ -96,6 +96,58 @@ export function verifyTelegramLogin(
   };
 }
 
+export const TELEGRAM_FIRST_NAME_MAX_LENGTH = 40;
+
+/** The two facts the dashboard may show about a Telegram account, kept APART so one cannot pose as the other. */
+export interface TelegramName {
+  firstName: string | null;
+  username: string | null;
+}
+
+// Characters that render as blank (Hangul/Braille fillers): a "name" made only of them is no name.
+const INVISIBLE_FILLERS = /[\u3164\u2800\u115F\u1160\uFFA0]/g;
+const AT_SIGNS = /[@\uFF20\uFE6B]/g;
+const MAX_COMBINING_MARKS = 2;
+
+/**
+ * What the dashboard shows next to a link so an owner can tell their own phone from a stranger's: the
+ * account's FIRST NAME and its @USERNAME, as two separate fields. DISPLAY DATA ONLY: free text the other
+ * person chose, never used to decide anything (who a link belongs to, what it may open, whether it can be
+ * restored) - the digest decides, and these are never compared, parsed or trusted.
+ *
+ * Callers pass only what Telegram delivered on a VERIFIED path: the `from` of an update the bot received on
+ * its own connection, or the user object inside signature-checked initData. NEVER a request body.
+ *
+ * Why two fields: a forwardee can type "@owner_handle" as their first name, and one joined label would then
+ * read as if the owner's handle belonged to them. So the username is stored and rendered on its own, and
+ * every '@' is stripped from the first name. The first name is also bounded; stripped of control, format and
+ * bidi characters (it cannot reorder the text around it or smuggle a line break); stripped of invisible
+ * fillers (a name that is blank apart from them is no name); and limited to two combining marks per base
+ * character (no stacked-diacritic towers). A username that is not a real Telegram handle is dropped. Null
+ * when nothing usable is left. Surname and id are never kept.
+ */
+export function telegramDisplayName(from: { first_name?: unknown; username?: unknown } | null | undefined): TelegramName | null {
+  let firstName: string | null = null;
+  if (typeof from?.first_name === "string") {
+    const cleaned = from.first_name
+      .replace(/[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Zl}\p{Zp}]/gu, " ")
+      .replace(INVISIBLE_FILLERS, " ")
+      .replace(AT_SIGNS, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    let marks = 0;
+    const capped = Array.from(cleaned).filter((ch) => {
+      if (!/\p{M}/u.test(ch)) { marks = 0; return true; }
+      marks += 1;
+      return marks <= MAX_COMBINING_MARKS;
+    });
+    const clipped = capped.slice(0, TELEGRAM_FIRST_NAME_MAX_LENGTH).join("").trim();
+    firstName = clipped.length > 0 ? clipped : null;
+  }
+  const username = typeof from?.username === "string" && /^[A-Za-z0-9_]{1,32}$/.test(from.username) ? from.username : null;
+  return firstName === null && username === null ? null : { firstName, username };
+}
+
 /** Produces the SHA256 digest stored in user_identities for a Telegram numeric ID. */
 export function digestTelegramId(telegramId: string): string {
   return "sha256:" + createHash("sha256").update(telegramId).digest("hex");

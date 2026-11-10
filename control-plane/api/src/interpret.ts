@@ -829,6 +829,8 @@ export function mergeStructuredParts(parts: readonly unknown[], options: { peopl
 function validateProposed(
   proposal: ProposedAnswer,
   questions: readonly IntakeQuestion[],
+  /** The answers on record, for a year-less date to be placed against the other one. */
+  held?: AnswerStore,
 ): ReturnType<typeof validateAnswer> {
   const { questionId, value } = proposal;
   switch (value.kind) {
@@ -839,7 +841,7 @@ function validateProposed(
     case "multi_choice":
       return validateAnswer(questionId, null, null, questions, undefined, value.optionIds);
     case "text":
-      return validateAnswer(questionId, null, value.text, questions);
+      return validateAnswer(questionId, null, value.text, questions, undefined, undefined, { answers: held });
     case "structured":
       return validateAnswer(questionId, null, null, questions, value.data);
   }
@@ -871,15 +873,53 @@ function settleTypedChoice(proposal: ProposedAnswer, questions: readonly IntakeQ
  * question the interview is not asking is rejected before we spend anything on
  * validating it.
  */
+/**
+ * The closed list of words that describe people rather than name an assistant
+ * (#413), in the two languages an interview is held in. Singular and plural, and
+ * the filler that goes with them ("the kids", "other travellers", "my family").
+ * Deliberately not a classifier: the list is closed so a real name is never in
+ * doubt, and "Family Guy" or "Kids Club Tokyo" are not people words — every word
+ * has to be on it.
+ */
+const PEOPLE_WORDS: ReadonlySet<string> = new Set([
+  "traveller", "travellers", "traveler", "travelers", "passenger", "passengers",
+  "kid", "kids", "children", "family", "families", "other", "others",
+  "נוסעים", "נוסע", "מטיילים", "מטייל", "ילדים", "ילד", "משפחה", "משפחות", "אחרים", "אחר",
+]);
+const PEOPLE_FILLER: ReadonlySet<string> = new Set(["the", "my", "our", "all", "of", "and", "some", "other"]);
+
+export function looksLikePeopleWords(text: string): boolean {
+  const words = text.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  if (words.length === 0 || words.length > 4) return false;
+  // Hebrew attaches "the" (ה) and "and" (ו) to the word: הילדים, ואחרים.
+  const base = (w: string) => (PEOPLE_WORDS.has(w) ? w : /^[הו]/u.test(w) && PEOPLE_WORDS.has(w.slice(1)) ? w.slice(1) : w);
+  const bare = words.map(base);
+  return bare.some((w) => PEOPLE_WORDS.has(w)) && bare.every((w) => PEOPLE_WORDS.has(w) || PEOPLE_FILLER.has(w));
+}
+
 export function applyProposals(
   modelProposals: readonly ProposedAnswer[],
   ctx: ApplyProposalsContext,
 ): ProposalDecisions {
+  const heldAnswers = (ctx.answers ?? ctx.held) as AnswerStore | undefined;
   const questions = ctx.questions ?? INTAKE_QUESTIONS;
   const proposals = ctx.literalOther ? [...modelProposals] : modelProposals.map((p) => settleTypedChoice(p, questions));
   const minConfidence = ctx.minConfidence ?? DEFAULT_MIN_CONFIDENCE;
   const outstanding = new Set(ctx.outstanding);
   const answered = new Set(ctx.answered);
+
+  /**
+   * The reply to the question on screen is not held to the confidence floor
+   * (`pendingQuestionId`) — except an assistant's name that is only a word for
+   * people. "other travellers" typed to explain a document is about the trip,
+   * not a name for the bot (#413): below the floor it becomes a suggestion the
+   * organizer confirms, the same as any other unsure read. It is not refused —
+   * a deliberate "Family" is one tap — and it is the second line of defence
+   * behind the recap marker, which reads the message as being about the recap.
+   */
+  const floorWaived = (p: ProposedAnswer): boolean =>
+    p.questionId === ctx.pendingQuestionId
+    && !(p.questionId === "bot_name" && p.value.kind === "text" && looksLikePeopleWords(p.value.text));
 
   /**
    * A correction to a structured answer ADDS to it. "My mother is joining too"
@@ -895,7 +935,7 @@ export function applyProposals(
     // Merged from the RAW proposal, and the merged list put through the same
     // gate again, so its rules still apply to what is actually stored.
     const mergedData = mergeStructuredParts([existing.data, proposal.value.data], mergeOptionsFor(questionId));
-    const again = validateProposed({ ...proposal, value: { kind: "structured", data: mergedData } }, questions);
+    const again = validateProposed({ ...proposal, value: { kind: "structured", data: mergedData } }, questions, heldAnswers);
     return again.ok && again.answer.kind === "structured"
       ? again.answer
       : { ...answer, data: mergedData };
@@ -933,7 +973,7 @@ export function applyProposals(
    * are merged exactly as accepted parts are; if the merge does not validate,
    * the most confident part alone is tried.
    */
-  const suggestFrom = (parts: readonly ProposedAnswer[]) => {
+  const suggestFrom = (parts: readonly ProposedAnswer[], base?: unknown) => {
     const usable = parts.filter((p) =>
       evidenceAppears(p.evidence, ctx.sourceText)
       && exampleEchoes(questions.find((q) => q.id === p.questionId)?.dataExample, p.value, ctx.sourceText).length === 0);
@@ -950,7 +990,10 @@ export function applyProposals(
       // same shape as #205 reached through a tap). A reading that adds and
       // fills nothing is not worth a question, and is not offered.
       let candidate = original;
-      const heldAnswer = ctx.held?.[original.questionId];
+      // `base` stands in for `held` when a sibling slice of this very question
+      // passed (#412): what is offered is the reading merged into the answer
+      // that sibling just made, so a Yes can never drop the accepted people.
+      const heldAnswer = base ?? ctx.held?.[original.questionId];
       if (original.value.kind === "structured" && isRecord(heldAnswer) && heldAnswer.kind === "structured") {
         const step = reconcileStructured(heldAnswer.data, original.value.data, mergeOptionsFor(original.questionId));
         if (!step.changed) {
@@ -959,7 +1002,7 @@ export function applyProposals(
         }
         candidate = { ...original, value: { kind: "structured", data: step.merged } };
       }
-      const validated = validateProposed(candidate, questions);
+      const validated = validateProposed(candidate, questions, heldAnswers);
       if (validated.ok) {
         suggested.push({ questionId: candidate.questionId, answer: validated.answer, proposal: candidate });
         return;
@@ -986,7 +1029,7 @@ export function applyProposals(
   // and its start by document order between two itineraries that both scored 1.
   const TRIP_EDGE: Readonly<Record<string, "earliest" | "latest">> = { departure_date: "earliest", return_date: "latest" };
   const credible = (p: ProposedAnswer) =>
-    (p.confidence >= minConfidence || p.questionId === ctx.pendingQuestionId) && evidenceAppears(p.evidence, ctx.sourceText);
+    (p.confidence >= minConfidence || floorWaived(p)) && evidenceAppears(p.evidence, ctx.sourceText);
   const isoDayOf = (p: ProposedAnswer): string | null =>
     p.value.kind === "text" && /^\d{4}-\d{2}-\d{2}$/.test(p.value.text) ? p.value.text : null;
   const winner = new Map<string, number>();
@@ -1046,7 +1089,7 @@ export function applyProposals(
     } else if (!outstanding.has(p.questionId) && !reconcilable) {
       return { reason: "NOT_OUTSTANDING" };
     }
-    if (p.confidence < minConfidence && p.questionId !== ctx.pendingQuestionId) {
+    if (p.confidence < minConfidence && !floorWaived(p)) {
       return { reason: "LOW_CONFIDENCE" };
     }
     if (!evidenceAppears(p.evidence, ctx.sourceText)) return { reason: "EVIDENCE_NOT_IN_SOURCE" };
@@ -1065,9 +1108,16 @@ export function applyProposals(
         if (refused.reason === "LOW_CONFIDENCE") unsure.push(p);
       } else passing.push(p);
     }
-    // Only when nothing for this question passed: a suggestion never competes
-    // with an answer the gate accepted.
+    // Nothing for this question passed: the unsure readings are the whole offer.
     if (passing.length === 0) return suggestFrom(unsure);
+    // Something passed. An unsure slice used to be dropped here ("a suggestion
+    // never competes with an answer the gate accepted"), and a second ticket's
+    // travellers vanished beside the first ticket's (#412). It still does not
+    // compete: the accepted answer is written as it is, and only the unsure
+    // slices' NEW entries are offered, merged on top of it (`offerBeside`).
+    const offerBeside = (accepted: unknown) => {
+      if (unsure.length > 0) suggestFrom(unsure, { kind: "structured", data: accepted });
+    };
     // Stable, so a tie keeps document order — the same rule as `winner`.
     const ordered = [...passing].sort((a, b) => b.confidence - a.confidence);
     const primary = ordered[0]!;
@@ -1100,6 +1150,8 @@ export function applyProposals(
       for (const a of step.ambiguous) ambiguous.push({ ...a, questionId, proposal: primary });
       if (!step.changed) {
         for (const p of ordered) reject(p, "NO_NEW_INFORMATION");
+        // What passed adds nothing to what is held; the unsure slices may.
+        if (unsure.length > 0) suggestFrom(unsure);
         return;
       }
       combined = step.merged;
@@ -1122,7 +1174,7 @@ export function applyProposals(
     // `corrected` is the typed path's own merge into `ctx.answers`, and a no-op
     // when nothing is held there — which is every document. The two never run
     // on the same proposal: `held` and `answers` come from different callers.
-    const validated = validateProposed(merged, questions);
+    const validated = validateProposed(merged, questions, heldAnswers);
     if (validated.ok) {
       accepted.push({
         questionId,
@@ -1132,6 +1184,7 @@ export function applyProposals(
         ...(reconciled ? { reconciled } : {}),
         correction: correcting(primary),
       });
+      offerBeside(validated.answer.kind === "structured" ? validated.answer.data : combined);
       return;
     }
     if (reconciled || ordered.length === 1) {
@@ -1145,9 +1198,10 @@ export function applyProposals(
     // merging existed, and say why the others were left out.
     const why = `merge refused: ${validated.reason}${validated.detail ? ` — ${validated.detail}` : ""}`;
     for (const other of ordered.slice(1)) reject(other, "DUPLICATE_PROPOSAL", why);
-    const alone = validateProposed(primary, questions);
+    const alone = validateProposed(primary, questions, heldAnswers);
     if (!alone.ok) return reject(primary, alone.reason, alone.detail);
     accepted.push({ questionId, answer: corrected(alone.answer, primary), proposal: primary, correction: correcting(primary) });
+    offerBeside(alone.answer.kind === "structured" ? alone.answer.data : dataOf(primary));
   };
 
   proposals.forEach((proposal, i) => {
@@ -1188,7 +1242,7 @@ export function applyProposals(
     } else if (!outstanding.has(proposal.questionId)) return reject(proposal, "NOT_OUTSTANDING");
     if (contested.has(proposal.questionId)) return reject(proposal, "CONFLICTING_PROPOSALS");
     if (winner.get(proposal.questionId) !== i) return reject(proposal, "DUPLICATE_PROPOSAL");
-    if (proposal.confidence < minConfidence && proposal.questionId !== ctx.pendingQuestionId) {
+    if (proposal.confidence < minConfidence && !floorWaived(proposal)) {
       suggestFrom([proposal]);
       return reject(proposal, "LOW_CONFIDENCE");
     }
@@ -1196,7 +1250,7 @@ export function applyProposals(
     const echoed = exampleEchoes(questions.find((q) => q.id === proposal.questionId)?.dataExample, proposal.value, ctx.sourceText);
     if (echoed.length > 0) return reject(proposal, "EXAMPLE_ECHO", echoed.slice(0, 4).join(", "));
 
-    const validated = validateProposed(proposal, questions);
+    const validated = validateProposed(proposal, questions, heldAnswers);
     if (!validated.ok) return reject(proposal, validated.reason, validated.detail);
     accepted.push({ questionId: proposal.questionId, answer: corrected(validated.answer, proposal), proposal, correction: correcting(proposal) });
   });
@@ -1625,7 +1679,28 @@ export interface BuildInterpretPromptArgs {
    * not, and a hotel is told where it lives (a stop's accommodation).
    */
   summaryOnScreen?: boolean;
-  /** Ids of the questions that already have an answer. Read only with `summaryOnScreen`. */
+  /**
+   * The document recap was the last thing they read ("here is what I took from
+   * your file — tell me if anything is wrong"), and the question on screen is
+   * only the next one the router put underneath it (#413).
+   *
+   * Then a typed message is first of all about WHAT THE DOCUMENT GAVE — the
+   * travellers, the stops, the bookings — and only if it plainly is not, a reply
+   * to the question on screen. It is the `summaryOnScreen` widening, scoped to
+   * those three questions (`RECAP_QUESTION_IDS`), not every answered one: the
+   * summary invites a hotel or an interest, a recap only invites a correction of
+   * what it showed. Live, 2026-10-18: "נוסעים אחרים", said to explain a ticket
+   * whose second couple was missed, was filed as the assistant's name.
+   */
+  afterDocumentRecap?: boolean;
+  /**
+   * The router has just asked "who are the other travellers?" (after a message about them that named nobody, at the
+   * summary or after a document recap), so this message is probably their names. Each is a NEW traveller: added to
+   * the ones we hold, never a replacement list. Live, 2026-11-08, at the summary: "Mira Vesper, Tom Vesper" had no
+   * context and came back unclear three times, so the two were never added.
+   */
+  askedOtherTravellers?: boolean;
+  /** Ids of the questions that already have an answer. Read only with `summaryOnScreen` / `afterDocumentRecap`. */
   answered?: readonly string[];
   questions?: readonly IntakeQuestion[];
 }
@@ -1638,6 +1713,32 @@ export interface BuildInterpretPromptArgs {
  */
 function summaryAnswerableIds(): ReadonlySet<string> {
   return new Set([...DOCUMENT_ANSWERABLE_QUESTION_IDS, "trip_interests", "trip_pace"]);
+}
+
+/** What a document recap shows, so what a message after it may be about (#413). */
+export const RECAP_QUESTION_IDS: readonly string[] = ["travelers", "phases", "travel_anchors"];
+
+/**
+ * What to tell the reader on the turn after a document recap (#413). Without
+ * real names or places, like every example in this prompt (`exampleEchoes`).
+ */
+function recapSection(held: BuildInterpretPromptArgs["heldLists"], onScreen: IntakeQuestion | undefined): string[] {
+  return [
+    `THEY HAVE JUST BEEN SHOWN WHAT THEIR DOCUMENT GAVE: the travellers, the stops and the bookings it`,
+    `found, with "if any of that is wrong, tell me". ${onScreen ? `The question "${onScreen.id}" is only the next one we put under it.` : ``}`,
+    `So read this message FIRST as being about that: a correction or an addition to the travellers, the`,
+    `stops or the bookings ("my parents are coming too", "the hotel is X", "the flight is on the 3rd").`,
+    `Addressable now, besides the question on screen: ${RECAP_QUESTION_IDS.join(", ")}.`,
+    `- A message about one of those is NOT a reply to the question on screen. Do not file it there.`,
+    ...(held && held.travellers.length > 0
+      ? [`  Travellers and stops we already hold change through the operations below (add_traveller, add_stop…).`]
+      : []),
+    `- If it is plainly about the travellers but names nobody ("the other travellers", "my family", "the kids"),`,
+    `  do not guess a name and do not answer the question on screen with it: put "travelers" in "unclear"`,
+    `  with a "why", and propose nothing for it.`,
+    `- Only when it plainly answers the question on screen (a short name, a choice) is it a reply to it.`,
+    ``,
+  ];
 }
 
 /**
@@ -1664,7 +1765,30 @@ function summarySection(held: BuildInterpretPromptArgs["heldLists"]): string[] {
     `- If it plainly is a hotel (or another addition) but you cannot tell WHICH stop or question it`,
     `  belongs to, do not guess: put the question it most likely belongs to in "unclear" with a`,
     `  "why", and propose nothing.`,
+    `- TRAVELLERS: someone joining, named ("my sister Dana is coming too"), is an add_traveller`,
+    `  operation per person. If it is plainly about the travellers but names nobody ("the other`,
+    `  travellers", "my family", "the kids"), it names nobody: do not guess a name and do not propose`,
+    `  "travelers"; put "travelers" in "unclear" with a "why", and propose nothing. We will ask who.`,
+    `- The trip's DATES: "departure_date" and "return_date" are one real day each, "value" the text`,
+    `  YYYY-MM-DD with the year. A day said without a year takes the year of the dates already held`,
+    `  (currently listed below). Never write the day as they said it ("22 November").`,
     `- A message that adds nothing about the trip is still answered with silence.`,
+    ``,
+  ];
+}
+
+/**
+ * The turn after the router asked who the other travellers are (see `askedOtherTravellers`). Without real names,
+ * like every example in this prompt (`exampleEchoes`).
+ */
+function askedTravellersSection(): string[] {
+  return [
+    `WE HAVE JUST ASKED THEM WHO THE OTHER TRAVELLERS ARE:`,
+    `this message is very probably the names, as a list ("Dana Cohen, Avi Cohen") or one name.`,
+    `- Each name is a NEW traveller: one add_traveller operation per person (name as written; age or`,
+    `  family only if they said it). They are added to the travellers we hold, which stay: never`,
+    `  propose "travelers", never write a list, never remove or rename anyone.`,
+    `- Only when the message is plainly not names (a question, "never mind") is it something else.`,
     ``,
   ];
 }
@@ -1679,8 +1803,12 @@ export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
   // At the summary, the answered questions a message can add to are described in
   // full too — except the stops and the travellers once held, which change only
   // through operations (`changeSection`), never as a proposal.
-  const answeredToo = args.summaryOnScreen
-    ? new Set((args.answered ?? []).filter((id) => summaryAnswerableIds().has(id)
+  //
+  // After a document recap the same widening applies, scoped to the recap's own
+  // three questions (#413).
+  const widened = Boolean(args.summaryOnScreen || args.afterDocumentRecap);
+  const answeredToo = widened
+    ? new Set((args.answered ?? []).filter((id) => (args.summaryOnScreen ? summaryAnswerableIds().has(id) : RECAP_QUESTION_IDS.includes(id))
         && !(id === "phases" && (args.heldLists?.stops.length ?? 0) > 0)
         && !(id === "travelers" && (args.heldLists?.travellers.length ?? 0) > 0)))
     : new Set<string>();
@@ -1692,13 +1820,18 @@ export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
     `You are reading one message from someone planning a trip, written in ${languageName(args.language)}.`,
     `Decide which of the questions below it answers. Answer ONLY with JSON.`,
     ``,
-    ...(args.summaryOnScreen ? summarySection(args.heldLists) : []),
+    ...(args.askedOtherTravellers ? askedTravellersSection() : []),
+    ...(args.summaryOnScreen ? summarySection(args.heldLists) : args.afterDocumentRecap ? recapSection(args.heldLists, onScreen) : []),
     ...(onScreen
       ? [
           `They were just asked "${onScreen.prompt.replace(/\s+/g, " ").trim()}" (id: ${onScreen.id}),`,
-          `and this message is their reply to it. So read a short or bare answer as answering`,
-          `THAT question — "13/9" to a date question is that date, "4" to a how-many question is`,
-          `four. Only look elsewhere if the message plainly is not about it.`,
+          args.afterDocumentRecap
+            ? `and a short or bare answer to it IS its reply — "13/9" to a date question is that date.`
+            : `and this message is their reply to it. So read a short or bare answer as answering`,
+          ...(args.afterDocumentRecap
+            ? [`Anything about the travellers, stops or bookings is not (see above).`]
+            : [`THAT question — "13/9" to a date question is that date, "4" to a how-many question is`,
+               `four. Only look elsewhere if the message plainly is not about it.`]),
           ``,
         ]
       : []),
@@ -1736,16 +1869,16 @@ export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
     ...(asked.some((q) => q.id === "phases") ? stopsSection() : []),
     ...(asked.some((q) => q.id === "travelers") ? travelersSection(args.language) : []),
     ...(asked.some((q) => q.id === "travel_anchors") && !asked.some((q) => q.id === "phases") ? bookingsSection() : []),
-    args.summaryOnScreen ? `Questions (answered already or not):` : `Questions still outstanding:`,
+    widened ? `Questions (answered already or not):` : `Questions still outstanding:`,
     ...asked.map(describeQuestion),
     ``,
     ...changeSection(args.heldLists),
     ...(args.correctable?.length
       ? [
-          args.summaryOnScreen
+          widened
             ? `Already answered — propose one of these if this message ADDS to it or CHANGES it ("also…", "add…", "actually…", "make it…"). A message that merely repeats what they already said adds nothing. For a list,`
             : `Already answered — propose one of these ONLY if this message plainly corrects it`,
-          ...(args.summaryOnScreen ? [] : [
+          ...(widened ? [] : [
             `("actually…", "no, it's…", "add…", "make it…"). A passing mention is not a correction,`,
             `and a message that merely repeats what they already said is not one either. For a list,`,
           ]),
@@ -2327,6 +2460,11 @@ export interface StoredOutcomes {
   malformed?: number;
 }
 
+/** A burst that carried files (`documentBurstKey`): `docs:<digests>[|<text>]`. */
+export function isDocumentBurstKey(key: string): boolean {
+  return key.startsWith("docs:");
+}
+
 /**
  * Claims one burst for interpretation, or hands back what a previous attempt
  * already learned about it.
@@ -2340,6 +2478,32 @@ export interface StoredOutcomes {
  * caller should do nothing. `fresh: false` with `committedAt` null is the crash
  * window: the model's answer survived but the commit did not, so the caller
  * resumes from the stored proposals rather than re-asking the model.
+ *
+ * WHAT A ROW IS A REPLAY OF (#514). The row stands in for a REDELIVERY: the same
+ * burst, arriving again in the same interview. Two cases that look like that
+ * are not, and the row is handed over to the new claimant instead:
+ *
+ *  1. ANOTHER SESSION'S ROW. The unique key is per chat, not per interview, and
+ *     a document burst's key is the files' CONTENT digests -- so the same
+ *     ticket photos sent in a later interview in that chat (a new trip) found
+ *     the earlier interview's row, were logged `interpret_replayed`, and got
+ *     nothing: no reading, no answers, no message saying why.
+ *  2. A FAILED DOCUMENT BURST. A committed row with a `failure_reason`
+ *     (`NO_READABLE_DOCUMENT`, `NOT_CONFIGURED`, an extraction that failed) is
+ *     a record that the file could not be read THEN. Sending it again is the
+ *     retry, and replaying the failure meant it could never succeed -- not
+ *     after image reading was switched on, not ever.
+ *     Only for document bursts: a typed burst's key is its Telegram message
+ *     ids, which do not repeat, so a typed row is only ever met by a genuine
+ *     redelivery and keeps its replay.
+ *
+ * Handing over is one UPDATE, not delete-then-insert: two claimants racing for
+ * the same stale row serialise on its lock, the first resets it, and the
+ * second's WHERE no longer matches (the row is now uncommitted and its own
+ * session's), so exactly one of them reads the file. The row gets a NEW id
+ * because `intake_pending_changes.interpretation_ids` is keyed on it -- a draft
+ * made by the earlier reading must not look like a replay of this one. No
+ * migration: the unique key and the columns are exactly what this needs.
  */
 export async function claimInterpretation(
   db: pg.Pool,
@@ -2355,6 +2519,20 @@ export async function claimInterpretation(
     [id, args.sessionId, args.chatId, args.burstKey, args.sourceText],
   );
   if (inserted.rowCount) return { fresh: true, id };
+
+  const handedOver = await db.query<{ id: string }>(
+    `UPDATE control_plane.interview_interpretations
+        SET id = $1, session_id = $2, source_text = $5,
+            proposals = '[]'::jsonb, outcomes = '{}'::jsonb, failure_reason = NULL,
+            attempts = 0, duration_ms = NULL, committed_at = NULL, created_at = now()
+      WHERE telegram_chat_id = $3 AND burst_key = $4
+        AND (session_id <> $2
+             OR ($6::boolean AND committed_at IS NOT NULL AND failure_reason IS NOT NULL))
+      RETURNING id`,
+    [id, args.sessionId, args.chatId, args.burstKey, args.sourceText, isDocumentBurstKey(args.burstKey)],
+  );
+  if (handedOver.rowCount) return { fresh: true, id };
+
   const existing = await findInterpretation(db, args.chatId, args.burstKey);
   // Losing the insert race and then not finding the row would mean it was
   // deleted between the two statements. Treat it as fresh rather than throwing:
