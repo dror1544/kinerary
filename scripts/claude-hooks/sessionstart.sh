@@ -65,4 +65,12 @@ notes_line() {
 }
 line="$line $(notes_line)"
 
+# Leftovers of merged work: worktrees and branches the post-merge hook did not
+# get to (a merge made on GitHub's web page, or by another tool). Counted from
+# the refs already fetched, so this stays fast and offline; silent when zero.
+if [ -f scripts/sweep-merged.py ]; then
+  to=""; command -v timeout >/dev/null 2>&1 && to="timeout 20"
+  sweep="$($to python3 scripts/sweep-merged.py --count --no-fetch 2>/dev/null)" && [ -n "$sweep" ] && line="$line $sweep"
+fi
+
 jq -cn --arg c "$line" '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$c}}'

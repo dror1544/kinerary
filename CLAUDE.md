@@ -926,6 +926,28 @@ can speak" is read off the gateway rather than inferred from an upstream
 process being alive. It refuses to restart the relay under a live conversation
 (`awaiting = 'machine'`, updated recently) unless told to anyway.
 
+## Merged work cleans up after itself (owner's decision, 2026-11-09)
+
+When a branch is merged — a PR, or a local `git merge` into another branch —
+its branch (local and remote) and its worktree are deleted then, not at a
+later sweep. On 2026-11-09 the repository held 39 worktrees and ~300 branches,
+nearly all for work merged weeks before; pr-steward's Sweep 4 was right but
+ran only when asked. Three mechanisms, so nobody has to remember:
+
+- **GitHub** deletes a merged PR's head branch (`delete_branch_on_merge`). The
+  ruleset "long-lived branches survive merges" protects `integration/**` and
+  `release/**` from deletion; `main` was already protected.
+- **`scripts/sweep-merged.py --execute`** removes the rest: merged worktrees
+  under `.claude/worktrees/`, local branches, and remote branches merged
+  locally. `scripts/claude-hooks/posttooluse-bash.sh` runs it after every
+  successful merge in the lead session; the session-start line counts what is
+  left over (a merge made on GitHub's page) and names the command.
+- **What it never touches** is in the script's docstring and its tests: an
+  open PR, a dirty worktree, one a running container mounts or a process works
+  in, a detached HEAD, `codex/*`, anything outside `.claude/worktrees/`, and a
+  branch whose tip sits on a mainline's first-parent line (just created, not
+  merged). Unmerged work is reported, never deleted.
+
 ## Working style
 
 Write the test first where it's practical. Prefer fixing something at its
