@@ -285,9 +285,14 @@ busy="$(live_sql "SELECT count(*) FROM control_plane.jobs WHERE state IN ('lease
 run "api build"                control-plane/api            npm run build
 [ "$FAILED" = 0 ] || exit 1
 [ -d "$CHECKOUT/control-plane/worker" ] || die "$CHECKOUT is not a checkout — refusing to hand it to compose"
+# KINERARY_COMPOSE_OVERRIDE (optional): the deployment's own compose file, layered
+# on top — e.g. secrets pinned to one fixed folder instead of this checkout's
+# .local-secrets, which every redeploy would otherwise re-point. Set but
+# missing refuses: deploying without it would silently undo what it pins.
+[ -z "${KINERARY_COMPOSE_OVERRIDE:-}" ] || [ -f "$KINERARY_COMPOSE_OVERRIDE" ] || die "KINERARY_COMPOSE_OVERRIDE is set but $KINERARY_COMPOSE_OVERRIDE does not exist"
 if ( set -a; . "$HOME/kinerary-deploy/provisioning.env"; set +a
      WORKER_REPO_ROOT_HOST="$CHECKOUT" BUILDX_CONFIG="$HOME/.docker/buildx-local" \
-       docker compose -f control-plane/deployment/compose.local.yml up -d --build --wait ) >"$LOGS/compose.log" 2>&1; then
+       docker compose -f control-plane/deployment/compose.local.yml ${KINERARY_COMPOSE_OVERRIDE:+-f "$KINERARY_COMPOSE_OVERRIDE"} up -d --build --wait ) >"$LOGS/compose.log" 2>&1; then
   pass "compose stack up (worker mounts $CHECKOUT)"
 else die "compose up failed (log: $LOGS/compose.log)"; fi
 

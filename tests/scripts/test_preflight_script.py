@@ -39,6 +39,24 @@ class OwnVariables(unittest.TestCase):
         self.assertRegex(SCRIPT, r'\[ -d "\$[A-Z_]+/control-plane/worker" \]')
 
 
+class ComposeOverride(unittest.TestCase):
+    """A deployment's compose override reaches the --deploy bring-up.
+
+    compose.local.yml reads its secrets from ./.local-secrets of the checkout it
+    runs from, so every nightly redeploy re-pointed staging's secret mounts into
+    the nightly checkout — undoing a deployment that keeps them in one fixed
+    folder (2026-11-11). The path is the deployment's, so it arrives by an env
+    var; the script never names it.
+    """
+
+    def test_the_override_is_passed_to_compose_when_set(self):
+        self.assertRegex(SCRIPT, r'docker compose -f control-plane/deployment/compose\.local\.yml '
+                                 r'\$\{KINERARY_COMPOSE_OVERRIDE:\+-f "\$KINERARY_COMPOSE_OVERRIDE"\}')
+
+    def test_a_set_but_missing_override_refuses_rather_than_deploying_without_it(self):
+        self.assertRegex(SCRIPT, r'\[ -f "\$KINERARY_COMPOSE_OVERRIDE" \][^\n]*\|\|\s*die')
+
+
 if __name__ == "__main__":
     unittest.main()
 
