@@ -1933,7 +1933,9 @@ Telegram's in-app browser).
 origin for trips (to be re-specced: the organizer web release already put a
 portal and a runtime gateway on their own hosts), retry-then-rollback, #127,
 the Hermes bump (#189 and #349's remaining part), #323 and the process
-close-out. Also out: the post-trip debrief (backlog, below), CA-02..CA-08, the
+close-out, fleet health (#468, `468-fleet-health-self-monitoring.md`, draft:
+production watches itself, superseding the Mac-hosted monitor's SSH path; #453
+is its stopgap). Also out: the post-trip debrief (backlog, below), CA-02..CA-08, the
 k3s migration; the rest of the **dashboard-first trip creation** direction
 (Dror, 2026-10-30: destination check and seasonal attractions #485, livelier
 suggestions #486, join and switch links from the dashboard #487; notes folder
