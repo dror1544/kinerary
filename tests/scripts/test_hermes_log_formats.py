@@ -2,9 +2,12 @@
 
 Two consumers parse Hermes' own log lines, and each copied the format by hand:
 
-  * the release verify regex, `INTERVIEW_REGISTERED_RE` in
-    `control-plane/deployment/vm-release.py`: "the gateway registered the
-    interview MCP server's tools" (`MCP server '%s' (%s): registered %d tool(s): %s`);
+  * the release verify's registration reader, `REGISTERED_LINE` / `registrations()` /
+    `missing_tools()` in `control-plane/deployment/vm-release.py`: "this gateway
+    registered that MCP server's tools" (`MCP server '%s' (%s): registered %d tool(s): %s`).
+    It began as one interview-only regex (`INTERVIEW_REGISTERED_RE`, #420's first
+    commit) and became server-generic when verify started checking every gateway's
+    own servers (#294/#420, d69c7b86); this file follows the generic reader;
   * the fleet monitor's tool-usage counter, `toolUsageScript` in
     `.agents/skills/trip-fleet-monitor/fleet-mcp.mjs`: "a tool ran"
     (`tool %s completed (%.2fs, %d chars)`).
@@ -60,7 +63,7 @@ def hermes_log_line(day: str, logger: str, message: str, session: str = "2026103
 
 
 class ReleaseVerifyRegex(unittest.TestCase):
-    """AC-4b, half one: the release verify regex reads the captured registration format."""
+    """AC-4b, half one: the release verify reads the captured registration format."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -71,15 +74,20 @@ class ReleaseVerifyRegex(unittest.TestCase):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def test_a_registration_line_rendered_from_the_captured_format_matches(self):
-        message = FORMATS["mcp_registered"] % ("interview", "stdio", 2, "ask_question_for_chat, show_summary_for_chat")
+        tools = ["ask_question_for_chat", "show_summary_for_chat"]
+        message = FORMATS["mcp_registered"] % ("interview", "stdio", 2, ", ".join(tools))
         line = hermes_log_line("2026-10-30", "tools.mcp_tool_discovery", message)
-        self.assertTrue(
-            self.vr.INTERVIEW_REGISTERED_RE.search(line),
-            f"vm-release.py INTERVIEW_REGISTERED_RE no longer matches Hermes' registration line "
+        found = self.vr.registrations([line], "interview")
+        self.assertEqual(
+            [r.count for r in found], [2],
+            f"vm-release.py registrations() no longer reads Hermes' registration line "
             f"{FORMATS['mcp_registered']!r}: `kinerary-cp-release verify` would read a healthy gateway as one that "
-            f"never registered the interview tools. Rendered: {line!r}")
+            f"never registered its tools. Rendered: {line!r}")
+        self.assertEqual(self.vr.missing_tools(found[0], tools), [],
+                         f"the tool names after 'tool(s):' are no longer readable from {line!r}")
+        self.assertEqual(self.vr.missing_tools(found[0], tools + ["not_a_tool_for_chat"]), ["not_a_tool_for_chat"])
 
-    def test_interview_registrations_counts_it_in_a_real_log_file(self):
+    def test_registrations_reads_each_one_in_a_real_log_file(self):
         message = FORMATS["mcp_registered"] % ("interview", "stdio", 2, "a, b")
         other = FORMATS["mcp_registered"] % ("trip-mcp", "sse", 5, "a, b, c, d, e")
         log = Path(self.tmp) / "agent.log"
@@ -88,12 +96,14 @@ class ReleaseVerifyRegex(unittest.TestCase):
             hermes_log_line("2026-10-30", "tools.mcp_tool_discovery", message),
             hermes_log_line("2026-10-30", "tools.mcp_tool_discovery", message),
         ]) + "\n", encoding="utf-8")
-        self.assertEqual(self.vr.count_interview_registrations(log), 2,
+        lines = self.vr.log_lines(log)
+        self.assertEqual([r.count for r in self.vr.registrations(lines, "interview")], [2, 2],
                          "only the interview server's registrations count, and both of them do")
+        self.assertEqual([r.count for r in self.vr.registrations(lines, "trip-mcp")], [5])
 
     def test_another_server_is_not_the_interview_server(self):
         message = FORMATS["mcp_registered"] % ("trip-mcp", "sse", 5, "a, b")
-        self.assertFalse(self.vr.INTERVIEW_REGISTERED_RE.search(hermes_log_line("2026-10-30", "x", message)))
+        self.assertEqual(self.vr.registrations([hermes_log_line("2026-10-30", "x", message)], "interview"), [])
 
 
 @unittest.skipUnless(fleet.NODE, "node is required to run fleet-mcp.mjs")

@@ -420,7 +420,9 @@ class ReleaseToolFollowsTheProfile(unittest.TestCase):
                 "kinerary-cp/runtime-gateway:bbbbbbb", "kinerary-cp/hermes:ccccccc", "nginx:stable-alpine"]
         self.assertEqual(vr.images_to_prune(tags, ["bbbbbbb"]), ["kinerary-cp/portal:aaaaaaa", "kinerary-cp/runtime-gateway:aaaaaaa"])
 
-    def verify_with(self, outputs: dict, running: dict, rev="abc1234") -> vr.Report:
+    def verify_with(self, outputs: dict, running: dict, rev="abc1234") -> vr.Findings:
+        """verify_web now records into a Findings (checks and notes) rather than printing
+        to a Report; the helpers below read it the way the old Report was read."""
         calls = []
 
         class FakeShell:
@@ -430,9 +432,19 @@ class ReleaseToolFollowsTheProfile(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, code, out.encode(), b"")
 
         self.cp.sh = FakeShell()
-        self.cp.verify_web(running, rev)
+        findings = vr.Findings()
+        self.cp.verify_web(findings, running, rev)
         self.calls = calls
-        return self.cp.r
+        return findings
+
+    @staticmethod
+    def failed(findings: vr.Findings) -> dict:
+        """{check id: code} for every check that did not pass."""
+        return {c.id: c.code for c in findings.checks if not c.ok}
+
+    @staticmethod
+    def text(findings: vr.Findings) -> str:
+        return "\n".join(i.text if isinstance(i, vr.Check) else i for i in findings.items)
 
     def web_tree(self):
         vr.DEPLOYMENT_DIR = self.dir
@@ -440,44 +452,61 @@ class ReleaseToolFollowsTheProfile(unittest.TestCase):
 
     def test_verify_does_nothing_when_off_and_nothing_runs(self):
         report = self.verify_with({}, {})
-        self.assertEqual((report.failures, self.calls, report.stream.getvalue()), (0, [], ""))
+        self.assertEqual((report.items, self.calls), ([], []))
 
     def test_verify_says_so_when_off_but_the_pair_is_still_running(self):
         report = self.verify_with({}, {"kinerary-cp-portal-1": "kinerary-cp/portal:abc1234"})
-        self.assertEqual((report.failures, self.calls), (0, []))
-        self.assertIn("still running", report.stream.getvalue())
+        self.assertEqual((self.failed(report), self.calls), ({}, []))
+        self.assertIn("still running", self.text(report))
 
     def test_verify_passes_when_both_answer_through_their_own_services(self):
         self.enable(); self.web_tree()
         report = self.verify_with(
             {"kinerary-cp-portal-1": (0, '{"google":false,"emailPassword":true}'), "kinerary-cp-runtime-gateway-1": (0, '{"ok":true}')},
             {"kinerary-cp-portal-1": "kinerary-cp/portal:abc1234", "kinerary-cp-runtime-gateway-1": "kinerary-cp/runtime-gateway:abc1234"})
-        self.assertEqual(report.failures, 0, report.stream.getvalue())
+        self.assertEqual(self.failed(report), {}, self.text(report))
+        # Four checks ran and passed: the two images at the target revision, the proxy, the health route.
+        self.assertEqual([c.id for c in report.checks],
+                         ["web:portal", "web:runtime-gateway", "web:portal-proxy", "web:gateway-health"])
         self.assertIn("/v1/auth/capabilities", " ".join(" ".join(c) for c in self.calls))
         self.assertIn("/health", " ".join(" ".join(c) for c in self.calls))
 
     def test_verify_fails_for_a_missing_container_a_stale_image_and_a_dead_proxy(self):
         self.enable(); self.web_tree()
         report = self.verify_with({}, {"kinerary-cp-portal-1": "kinerary-cp/portal:0000000"})
-        out = report.stream.getvalue()
-        self.assertEqual(report.failures, 4, out)  # portal image, gateway not running, capabilities, health
+        out = self.text(report)
+        # portal image from another revision, gateway not running, capabilities, health
+        self.assertEqual(self.failed(report), {"web:portal": "WRONG_REV", "web:runtime-gateway": "NOT_RUNNING",
+                                               "web:portal-proxy": "NO_ANSWER", "web:gateway-health": "NO_ANSWER"}, out)
         self.assertIn("NOT RUNNING", out)
         self.assertIn("did not answer through its proxy", out)
+
+    def test_the_images_are_judged_against_the_revision_verify_was_given(self):
+        # Both containers run abc1234 and answer; verifying def5678 must still fail both images.
+        self.enable(); self.web_tree()
+        answers = {"kinerary-cp-portal-1": (0, '{"google":false,"emailPassword":true}'),
+                   "kinerary-cp-runtime-gateway-1": (0, '{"ok":true}')}
+        running = {"kinerary-cp-portal-1": "kinerary-cp/portal:abc1234",
+                   "kinerary-cp-runtime-gateway-1": "kinerary-cp/runtime-gateway:abc1234"}
+        self.assertEqual(self.failed(self.verify_with(answers, running, rev="abc1234")), {})
+        self.assertEqual(self.failed(self.verify_with(answers, running, rev="def5678")),
+                         {"web:portal": "WRONG_REV", "web:runtime-gateway": "WRONG_REV"})
 
     def test_an_answer_that_is_not_the_capabilities_json_is_not_a_pass(self):
         self.enable(); self.web_tree()
         report = self.verify_with(
             {"kinerary-cp-portal-1": (0, "<html>502 Bad Gateway</html>"), "kinerary-cp-runtime-gateway-1": (0, "OK")},
             {"kinerary-cp-portal-1": "kinerary-cp/portal:abc1234", "kinerary-cp-runtime-gateway-1": "kinerary-cp/runtime-gateway:abc1234"})
-        self.assertEqual(report.failures, 2, report.stream.getvalue())
+        self.assertEqual(self.failed(report), {"web:portal-proxy": "NO_ANSWER", "web:gateway-health": "NO_ANSWER"},
+                         self.text(report))
 
     def test_verify_after_a_rollback_to_a_version_without_the_portal_notes_instead_of_failing(self):
         self.enable()
         vr.DEPLOYMENT_DIR = self.dir
         (self.dir / "compose.vm.yml").write_text("services:\n  api:\n    image: x\n")
         report = self.verify_with({}, {})
-        self.assertEqual((report.failures, self.calls), (0, []))
-        self.assertIn("has no portal or runtime gateway", report.stream.getvalue())
+        self.assertEqual((self.failed(report), self.calls), ({}, []))
+        self.assertIn("has no portal or runtime gateway", self.text(report))
 
 
 class ConfigurationIsCheckedBeforeTheSwitch(unittest.TestCase):
