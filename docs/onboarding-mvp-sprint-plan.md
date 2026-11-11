@@ -1935,7 +1935,9 @@ portal and a runtime gateway on their own hosts), retry-then-rollback, #127,
 the Hermes bump (#189 and #349's remaining part), #323 and the process
 close-out, fleet health (#468, `468-fleet-health-self-monitoring.md`, draft:
 production watches itself, superseding the Mac-hosted monitor's SSH path; #453
-is its stopgap). Also out: the post-trip debrief (backlog, below), CA-02..CA-08, the
+is its stopgap), companion bug reports reaching GitHub (#125,
+`125-companion-bug-reports-reach-github.md`, draft, all open questions
+answered). Also out: the post-trip debrief (backlog, below), CA-02..CA-08, the
 k3s migration; the rest of the **dashboard-first trip creation** direction
 (Dror, 2026-10-30: destination check and seasonal attractions #485, livelier
 suggestions #486, join and switch links from the dashboard #487; notes folder

@@ -1,6 +1,6 @@
 # A companion's report reaches GitHub through the monitor, and the reporter hears back
 
-Status: draft (2026-10-22; all open questions answered by Dror 2026-10-22, awaiting approval) · Issue: #125 · Track: T4 · Size: L (three slices) · Tier: High
+Status: draft (2026-10-22; all open questions answered by Dror 2026-10-22, awaiting approval); unscheduled, not in Sprint 8's scope (plan, 2026-10-30) · Issue: #125 · Track: T4 · Size: L (three slices) · Tier: High
 Security path: yes (the issue-filing token; traveller text in a public tracker; a new monitor write path) · Migration: yes (verdicts, beta flag) · Live-trip behaviour: yes (companion replies; companions need a re-render)
 
 ## Problem
