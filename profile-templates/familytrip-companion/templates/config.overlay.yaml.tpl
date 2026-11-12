@@ -103,11 +103,17 @@ agent:
   # installed on the host. The companion reads the web through `web_search` /
   # `web_extract` (the `web` toolset, which stays); it has never called a
   # browser_* tool.
+  #
+  # `connections` (`manage_connections`) goes too: a tool that can authorise and
+  # install a connector, which, if connectors ever become available on a host,
+  # would add an MCP server with no approval card in a chat anyone in the family
+  # can type into. A companion has no use for it.
   disabled_toolsets:
     - terminal
     - code_execution
     - computer_use
     - browser
+    - connections
 
 # `write_file`, `patch` and `skill_manage` are deliberately NOT in
 # disabled_toolsets above — the companion still needs read_file,
@@ -138,22 +144,20 @@ agent:
 # `skill_manage` itself cannot be taken out of the tool list from config: it
 # lives in the `skills` toolset beside `skill_view` (which the companion reads its
 # skills through), `disabled_toolsets` removes whole toolsets only, and Hermes has
-# no per-tool deny. So #547 closes the two ways a conversation reaches it. (1) The
-# gate above stays on: on 2026-11-12 a `skill_manage` call "completed" in the log
-# and changed nothing on disk — it was staged (pending/skills/<id>.json, never
-# applied). (2) Hermes's own post-turn "review the conversation and update the
-# skill library" fork — origin=background_review, which is what made that call, on
-# a turn about a pasted shell command — is switched off: `creation_nudge_interval: 0`
-# stops the nudge counter that starts it, and `auxiliary.background_review.enabled:
-# false` skips the auto spawn. The latter is read fail-OPEN (anything but a real
-# boolean false leaves it on), so keep it an unquoted boolean; test_template.py
-# asserts the type.
+# no per-tool deny (#547). Hermes's own post-turn skill review ("review the
+# conversation and update the skill library", origin=background_review) is LEFT ON
+# on purpose (Dror, 2026-11-12: the companion is meant to evolve through the trip).
+# Be plain about what that is: the review drafts skills FROM CONVERSATION TEXT,
+# which is traveller-typed. `write_approval` below is the ONLY barrier between a
+# draft and the companion's own skills, so it is not a setting to relax in passing:
+# on 2026-11-12 the review's `skill_manage` call "completed" in the log and changed
+# nothing on disk, because it was staged (pending/skills/<id>.json). A known gap in
+# this barrier is tracked privately. Whether the hold stays or becomes automatic
+# apply is a separate decision; do not change this key as a side effect of
+# anything else. (The same review also drafts MEMORY from the conversation, and
+# `memory.write_approval` is not set here, so those writes apply.)
 skills:
   write_approval: true
-  creation_nudge_interval: 0
-auxiliary:
-  background_review:
-    enabled: false
 
 # Sessions must NOT accumulate forever, and Hermes will not stop them on its
 # own: SessionResetPolicy defaults to mode "none" — "sessions never auto-reset

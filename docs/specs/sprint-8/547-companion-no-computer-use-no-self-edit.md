@@ -1,6 +1,6 @@
-# A companion exposes no desktop or browser control and cannot start its own skill edits
+# A companion exposes no desktop, browser or connector tools; skill writes stay held
 
-Status: draft 2026-11-12; approval at merge · Issue: #547 · Track: Sprint 8 staging-test fixes · Size: S–M
+Status: draft 2026-11-12; approval at merge · Issue: #547 · Track: Sprint 8 staging-test fixes · Size: S · Decision recorded 2026-11-12 (Dror): Hermes's background skill review stays ON
 Security path: yes (what a model can be talked into calling; boundary-reviewer) · Migration: no · Live-trip behaviour: yes, but only for a companion whose profile is re-rendered (see Rollout)
 
 ## Problem
@@ -30,73 +30,88 @@ What the evidence shows (read-only look at the profile, 2026-11-12):
 - **The tool surface is the real finding.** Resolving the rendered overlay
   through Hermes's own resolver (before `check_fn` filtering) gives **38 tools**
   for `telegram` and `cron`, including `computer_use`, all 18 `browser_*` tools
-  (navigate, click, type, `browser_cdp`, and the password-vault tools), `write_file`,
-  `patch` and `skill_manage`. The overlay disabled only `terminal` and
-  `code_execution`. `computer_use` and `browser` ride in the `hermes-telegram`
-  bundle. They are inert on a host with no driver or browser, and live on one with.
-- **The skill-writing fork is automatic.** Hermes starts it after turns on its own
-  (`skills.creation_nudge_interval`, default 10, and `auxiliary.background_review`,
-  default enabled). A traveller's text does not have to ask for it.
+  (navigate, click, type, `browser_cdp`, and the password-vault tools),
+  `manage_connections`, `write_file`, `patch` and `skill_manage`. The overlay
+  disabled only `terminal` and `code_execution`. `computer_use` and `browser`
+  ride in the `hermes-telegram` bundle. They are inert on a host with no driver
+  or browser, and live on one with.
 
 A companion's context is full of text travellers typed; acting on pasted shell text
 is the injection shape the companion/monitor split exists to contain.
 
+## Decision (Dror, 2026-11-12)
+
+The companion is meant to evolve through the trip, so **Hermes's background skill
+review stays on.** The first draft of this spec switched it off
+(`skills.creation_nudge_interval: 0`, `auxiliary.background_review.enabled: false`);
+those two keys are not in the template, and there is no test for them.
+
+State it plainly, because it is the trade being made:
+
+- **The review drafts skills from conversation text**, and conversation text is what
+  travellers typed (and what documents and web pages they pasted or had fetched).
+- **`skills.write_approval: true` is the only barrier** between those drafts and the
+  companion's own skills. Each draft is staged under `<profile>/pending/skills/` and
+  nothing applies it. If the hold is lifted, a traveller's words can become a standing
+  instruction in the companion's skills. A known gap in this barrier is tracked
+  privately; it is not described here.
+- **The same review also drafts memory, and that is not held.** The review's toolset is
+  `memory` and `skills`; `memory.write_approval` is not set in the overlay and Hermes
+  defaults it to off, so the review's memory writes apply. This change does not alter
+  that: memory is a tool the companion keeps on purpose, and the question of holding its
+  review writes is left open for a decision.
+- Whether the hold on skills stays or becomes automatic apply is a separate decision
+  Dror has not made. `write_approval` is left exactly as it was.
+
 ## Acceptance criteria
 
 - **AC-1.** A companion profile rendered from `profile-templates/familytrip-companion`
-  resolves to no `computer_use` and no `browser_*` tool, on `telegram` and `cron`.
-  It still resolves `skill_view`, `read_file`, `web_search`, `web_extract` and
+  resolves to no `computer_use`, no `browser_*` and no `manage_connections` tool, on
+  `telegram` and `cron`. It still resolves `skill_view`, `read_file`, `web_search` and
   `memory` (the tools it is used for).
-- **AC-2.** The rendered overlay's `agent.disabled_toolsets` lists `computer_use`
-  and `browser` as well as `terminal` and `code_execution`, and does not list
-  `file`, `memory`, `cronjob`, `skills` or `web`.
-- **AC-3.** A conversation cannot apply a change to the companion's skills:
-  `skills.write_approval` stays `true` (writes are staged, never applied), and
-  Hermes's automatic skill review does not run: `skills.creation_nudge_interval`
-  is the integer `0`, and `auxiliary.background_review.enabled` is the boolean
-  `false`.
-- **AC-4.** The template says why, beside each key, including why `skill_manage`
-  is not simply removed (see Decisions).
-- **AC-5.** A pasted shell command is answered as text. This follows from AC-1
-  (no tool to run it with) and the existing `terminal`/`code_execution` removal;
-  no SOUL change is needed. Not separately asserted — see Test plan.
+- **AC-2.** The rendered overlay's `agent.disabled_toolsets` lists `computer_use`,
+  `browser` and `connections` as well as `terminal` and `code_execution`, and does not
+  list `file`, `memory`, `cronjob`, `skills` or `web`.
+- **AC-3.** `skills.write_approval` stays `true`, unchanged, and the review is not
+  switched off. The template says beside the key that the review is on by decision, that
+  it drafts from conversation text, that the key is the only barrier to skill edits, and
+  that a known gap in it is tracked privately.
+- **AC-4.** A pasted shell command is answered as text. This follows from AC-1 (no tool
+  to run it with) and the existing `terminal`/`code_execution` removal; no SOUL change is
+  needed. Not separately asserted — see Test plan.
 
 ## Non-goals
 
-- Removing `skill_manage` from the tool list. Not possible from config (below).
+- Removing `skill_manage` from the tool list. Not possible from config: it shares the
+  `skills` toolset with `skill_view`, which the companion reads its skills through
+  (about 36 production calls). `disabled_toolsets` and `platform_toolsets` take toolset
+  names only (an unknown name is "Unknown toolset" in `_apply_toolset_selection`), so
+  disabling `skills` would break every companion to remove a tool whose writes are
+  already staged. Rejected.
+- Switching the skill review off, or changing `write_approval` or `memory.write_approval`
+  (Decision above).
 - Existing companions. `merge_overlay` never overwrites a top-level key the profile
   already has, and the `ALREADY_PRESENT` path merges the overlay file already in the
   profile, so this reaches new companions only. See Rollout.
-- The curator (`curator.enabled`, a weekly archive pass over agent-created skills).
-  It is not a conversation, and it refused the user-owned skill in this very
-  incident (`created_by=None`).
-- `write_file` / `patch` (confined by `HERMES_WRITE_SAFE_ROOT`, #314), `manage_connections`,
-  `image_generate`, and the memory review (`memory.nudge_interval`) — the memory tool
-  stays and is not what this incident touched.
-- The Hermes mirror fixture (#380, `control-plane/api`): `skills.creation_nudge_interval`
-  is not in Hermes's config defaults, so the fixture cannot guard it. This spec's
-  Hermes-gated test does (below).
+- The curator (`curator.enabled`, a weekly archive pass over agent-created skills). It is
+  not a conversation, and it refused the user-owned skill in this very incident
+  (`created_by=None`).
+- `write_file` / `patch` (confined by `HERMES_WRITE_SAFE_ROOT`, #314) and `image_generate`.
+  Other findings from the boundary review are separate work and are not fixed here.
 
 ## Decisions
 
-- **`skill_manage` is contained, not removed.** It lives in the `skills` toolset
-  with `skill_view` and `skills_list`. `disabled_toolsets` subtracts whole toolsets
-  (proved again 2026-11-12 against Hermes `4097709b0c`: `platform_toolsets` and
-  `disabled_toolsets` accept toolset names only, `resolve_toolset` has no per-tool
-  form), and the companion reads its skills through `skill_view` (36 calls in
-  production, the largest non-trip tool after web search). Disabling `skills` would
-  break every companion to remove a tool whose writes are already staged. Rejected.
-- **Switch the review off instead of relying on the gate alone.** The gate stages
-  the write; it does not stop the review fork from spending a model call on every
-  nth turn proposing one, and a proposal queue nobody reads is a slow leak of
-  traveller-derived text into a file. `creation_nudge_interval: 0` stops the counter
-  that starts it; `auxiliary.background_review.enabled: false` stops the spawn.
-  Both, because the second is read fail-open (anything but a real boolean leaves it
-  on) and the first is not in Hermes's defaults.
 - **Deny `browser`, not just `computer_use`.** The brief names "other desktop/browser
   control". The companion has never called a `browser_*` tool; it reads the web through
   `web`. Rejected: leaving `browser` for later — it holds a CDP escape hatch and a
   password-vault unlock.
+- **Deny `connections` too** (boundary review). `manage_connections` can authorise and
+  install a connector; if connectors ever become available on a host, it could add an MCP
+  server with no approval card, in a chat anyone in the family can type into. Companions
+  do not use it.
+- **Leave the skill review on, and `write_approval` as is.** Dror, 2026-11-12 (see
+  Decision). Rejected, in this spec's first draft: switching the review off with
+  `skills.creation_nudge_interval: 0` and `auxiliary.background_review.enabled: false`.
 - **No installer change.** The renderer and `companion-install-host.sh` already carry
   the overlay; the change is in the overlay. Changing `merge_overlay` to deep-merge
   deny lists for existing profiles is a separate, riskier decision (it overrides a
@@ -104,16 +119,17 @@ is the injection shape the companion/monitor split exists to contain.
 
 ## Security notes
 
-- This removes capability; it adds none. The deny list is read by Hermes at tool
-  resolution and applied last, at tool granularity (`model_tools._select_tool_names`).
-- The failure mode to watch is **silent**: `background_review.enabled` fails open and
-  `creation_nudge_interval` is an undocumented key. A Hermes upgrade that renames
-  either leaves the review running with no sign. `test_hermes_still_reads_the_two_switches_that_stop_the_skill_review`
-  (skipped where no Hermes is installed, such as CI) reads both back through Hermes's
-  own config loader and checks the readers are still in its source.
-- `skill_manage` stays resolvable. Anything that reaches it is staged by the gate
-  (`pending/skills/`), not applied. The gate is `skills.write_approval: true`, asserted
-  in `test_rendered_overlay_gates_skill_manage_writes` and the worker's template test.
+- The toolset change removes capability and adds none. The deny list is read by Hermes at
+  tool resolution and applied last, at tool granularity (`model_tools._select_tool_names`).
+- **Accepted exposure, by decision:** the background review reads conversation text and
+  proposes skill and memory edits from it. For skills, the only control is
+  `skills.write_approval: true`, which stages rather than applies. Nothing else in the
+  profile confines `skill_manage`: it is not covered by `HERMES_WRITE_SAFE_ROOT` (it
+  writes through `atomic_write_text`). The gate also fails open if Hermes's
+  `tools.write_approval` module cannot be imported. Lifting the gate is therefore a
+  security-relevant change and needs boundary review of its own.
+- Staged proposals accumulate in `pending/skills/` until someone approves or discards
+  them; nothing reads that directory today.
 - Not proven: that `computer_use`'s `check_fn` ever passes on a VM (it does not resolve
   there today). On a Mac host with `cua-driver` it passes, which is the case this closes.
 
@@ -121,28 +137,45 @@ is the injection shape the companion/monitor split exists to contain.
 
 `profile-templates/familytrip-companion/tests/test_template.py`:
 
-- `test_rendered_overlay_exposes_no_desktop_browser_or_self_edit_path` — AC-2, AC-3 on the
-  rendered overlay (types asserted: `0` not `False`, boolean `False` not `"off"`).
-- `test_rendered_overlay_resolves_to_no_computer_or_browser_tool_in_hermes` — AC-1 against
+- `test_rendered_overlay_exposes_no_desktop_or_browser_control` — AC-2 on the rendered overlay.
+- `test_rendered_overlay_resolves_to_no_desktop_browser_or_connector_tool_in_hermes` — AC-1 against
   Hermes's real resolver. Skipped when no Hermes venv exists (CI). Failed before the
-  change: 38 tools including `computer_use` and 18 `browser_*`.
-- `test_hermes_still_reads_the_two_switches_that_stop_the_skill_review` — AC-3 read back
-  through Hermes's loader.
-- `test_rendered_overlay_gates_skill_manage_writes` — the gate, and that nothing the
-  companion reads through was disabled.
+  change: 38 tools including `computer_use`, 18 `browser_*` and `manage_connections`.
+- `test_rendered_overlay_gates_skill_manage_writes` — AC-3: `write_approval` is `true`, and
+  nothing the companion reads through was disabled.
+- The first draft's tests for the two review switches were deleted with the switches.
 
 `control-plane/worker/tests/test_companion_profile.py::test_skill_manage_writes_are_staged_and_toolsets_are_unchanged`
 — the same template, exact deny list.
 
-AC-5 is not asserted end to end: it needs a live model turn. It was the observed behaviour
+AC-4 is not asserted end to end: it needs a live model turn. It was the observed behaviour
 that the tool surface above caused; the surface is what is asserted.
 
-## Rollout (the second clock)
+## Rollout
 
-Companion templates reach a companion only when its profile is re-rendered or
-newly installed. Existing companions keep their `config.yaml` and need an operator's
-config edit (add `computer_use` and `browser` to `agent.disabled_toolsets`, set the
-two review switches), or a re-render with a deliberate merge. On the Mac that is every
-profile under `~/.hermes/profiles` rendered from this template before this change;
-`gatecity20262` included (it has the gate, not the switches). On the VM, every live
-companion.
+Companion templates reach a companion only when its profile is re-rendered or newly
+installed. The installer does NOT update an existing companion: `merge_overlay` keeps any
+top-level key the profile already has, and the `ALREADY_PRESENT` path merges the overlay
+file already in the profile, so re-running it changes nothing here.
+
+Existing companions that need the edit by hand:
+
+- Mac: `alsacefrance2027`, `bakuazerbaijan2026`, `banskobulgaria2026`, `colmar2026`,
+  `colmar20262`, `gatecity20262`, `italy2027`, `japan2027`.
+- VM: to be listed at release, from the VM's profiles.
+
+The edit, in each profile's `config.yaml`, under `agent.disabled_toolsets` (keep the two
+entries already there):
+
+```yaml
+agent:
+  disabled_toolsets:
+    - terminal
+    - code_execution
+    - computer_use
+    - browser
+    - connections
+```
+
+Then restart that profile's gateway. Nothing else changes: `skills.write_approval` stays
+`true`, and the skill review stays on.

@@ -68,29 +68,21 @@ class Tests(unittest.TestCase):
   disabled=overlay['agent']['disabled_toolsets']
   # #547: the toolsets this change adds must not take the ones the companion needs with them.
   for keep in ('file','memory','cronjob','skills','web'): self.assertNotIn(keep,disabled)
- def test_rendered_overlay_exposes_no_desktop_browser_or_self_edit_path(self):
+ def test_rendered_overlay_exposes_no_desktop_or_browser_control(self):
   # #547 (2026-11-12, Sprint 8 staging): a tester pasted a Terminal command into a
-  # companion's private chat; it called `computer_use`, then `skill_manage` on its
-  # own operations skill. Resolving the pre-#547 overlay through Hermes's own
-  # resolver gave 38 tools including computer_use and all 18 browser_*; it must now
-  # give none of them. `skill_manage` cannot be dropped by toolset: it shares the
-  # all-or-nothing `skills` toolset with skill_view, which the companion reads its
-  # skills through, and Hermes has no per-tool deny. It is contained instead by
-  # (a) write_approval, which stages every write, and (b) the two switches that
-  # stop Hermes starting its own post-turn skill-writing review at all (that review,
-  # origin=background_review, is what produced the call).
+  # companion's private chat; it called `computer_use`. Resolving the pre-#547
+  # overlay through Hermes's resolver gave 38 tools including computer_use and 18
+  # browser_*; it must now give none. `skill_manage` cannot be dropped by toolset
+  # (shared `skills` toolset with skill_view) and Hermes's background skill review
+  # stays ON by decision; skill writes are held by write_approval, asserted in
+  # test_rendered_overlay_gates_skill_manage_writes.
   td,o,c=self.go(); self.addCleanup(td.cleanup); self.assertEqual(c.returncode,0,c.stderr)
   overlay=yaml.safe_load((o/'config.overlay.yaml').read_text())
   disabled=overlay['agent']['disabled_toolsets']
-  for ts in ('terminal','code_execution','computer_use','browser'): self.assertIn(ts,disabled)
-  self.assertIs(overlay['skills']['write_approval'],True)
-  nudge=overlay['skills']['creation_nudge_interval']
-  self.assertEqual(nudge,0); self.assertNotIsInstance(nudge,bool)
-  # Hermes reads this with a fail-open default of True: only a real boolean False turns it off.
-  self.assertIs(overlay['auxiliary']['background_review']['enabled'],False)
+  for ts in ('terminal','code_execution','computer_use','browser','connections'): self.assertIn(ts,disabled)
  HERMES_PY=Path.home()/'.hermes'/'hermes-agent'/'venv'/'bin'/'python'
  @unittest.skipUnless(HERMES_PY.exists(),'no Hermes install on this machine (CI): config-level assertions above still run')
- def test_rendered_overlay_resolves_to_no_computer_or_browser_tool_in_hermes(self):
+ def test_rendered_overlay_resolves_to_no_desktop_browser_or_connector_tool_in_hermes(self):
   # The same claim against Hermes's real resolver, before check_fn filtering, so the
   # answer does not depend on whether this machine happens to have cua-driver or a
   # browser installed (the tool was reachable on the staging Mac; it failed only
@@ -113,28 +105,8 @@ class Tests(unittest.TestCase):
   for plat,names in got.items():
    self.assertGreater(len(names),5,plat)  # not vacuous: the tools it needs are still there
    for need in ('skill_view','read_file','web_search','memory'): self.assertIn(need,names,plat)
-   bad=[n for n in names if n=='computer_use' or n.startswith('browser_') or n in ('terminal','execute_code')]
+   bad=[n for n in names if n in ('computer_use','manage_connections') or n.startswith('browser_') or n in ('terminal','execute_code')]
    self.assertEqual(bad,[],plat)
- @unittest.skipUnless(HERMES_PY.exists(),'no Hermes install on this machine (CI): config-level assertions above still run')
- def test_hermes_still_reads_the_two_switches_that_stop_the_skill_review(self):
-  # `skills.creation_nudge_interval` is not in Hermes's config defaults (the #380
-  # mirror fixture cannot see it) and `auxiliary.background_review.enabled` is read
-  # fail-open, so a Hermes that renamed either would go on reviewing and nothing
-  # would say so. Read both back through Hermes's own loader, and check the
-  # readers are still in its source.
-  td,o,c=self.go(); self.addCleanup(td.cleanup); self.assertEqual(c.returncode,0,c.stderr)
-  cfg=yaml.safe_load((o/'config.overlay.yaml').read_text()); cfg.pop('mcp_servers',None)
-  home=Path(td.name)/'hermes-home2'; home.mkdir(); (home/'config.yaml').write_text(yaml.safe_dump(cfg))
-  hermes=Path.home()/'.hermes'/'hermes-agent'
-  prog=('import sys,json\nsys.path.insert(0,sys.argv[1])\nfrom hermes_cli.config import load_config_readonly\n'
-        'c=load_config_readonly()\nprint("LOADED"+json.dumps({"nudge":c["skills"]["creation_nudge_interval"],'
-        '"gate":c["skills"]["write_approval"],"review":c["auxiliary"]["background_review"]["enabled"]}))\n')
-  env={'PATH':'/usr/bin:/bin','HOME':td.name,'HERMES_HOME':str(home)}
-  r=subprocess.run([str(self.HERMES_PY),'-c',prog,str(hermes)],text=True,capture_output=True,env=env)
-  self.assertEqual(r.returncode,0,r.stderr[-800:])
-  self.assertEqual(json.loads(r.stdout.split('LOADED',1)[1]),{'nudge':0,'gate':True,'review':False})
-  self.assertIn('creation_nudge_interval',(hermes/'agent'/'agent_init.py').read_text())
-  self.assertIn('"background_review"',(hermes/'agent'/'background_review.py').read_text())
  def test_rendered_overlay_silences_the_codex_autoraise_notice(self):
   # #65: Hermes replays "auto-compaction was raised ..." (naming the model and
   # a `hermes config set` command) into the FIRST group reply of every fresh

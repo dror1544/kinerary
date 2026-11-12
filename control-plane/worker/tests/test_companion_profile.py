@@ -396,8 +396,9 @@ class CompanionOverlayTemplateTests(unittest.TestCase):
                 "the gate stages skill writes; it must not disable the toolsets "
                 "the companion reads through",
             )
-        # #547 adds desktop/browser control to the deny list, and nothing else.
+        # #547 adds desktop/browser control and connector install to the deny list, and nothing else.
         self.assertEqual(
-            disabled, ["terminal", "code_execution", "computer_use", "browser"],
+            disabled,
+            ["terminal", "code_execution", "computer_use", "browser", "connections"],
         )
 
