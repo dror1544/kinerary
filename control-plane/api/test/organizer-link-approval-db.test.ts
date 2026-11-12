@@ -24,6 +24,7 @@ import type { TelegramUpdate } from "../src/relay/normalize.js";
 import { applyDecision } from "../src/relay/poller.js";
 import { issueTelegramLinkToken, redeemTelegramLinkToken } from "../src/telegram-link-token.js";
 import { testDatabaseUrl, testPool } from "./support/test-database.js";
+import { assertOpening } from "./support/opening.js";
 
 const skip = !testDatabaseUrl();
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
@@ -89,7 +90,7 @@ async function boundOrganizer(language?: string, options: { leaveInterviewRunnin
   const first = await draftTrip(user, "First Trip");
   const t0 = nextChat();
   const opened = await dispatchUpdate(pool, startUpdate(t0, first.token, from(t0, "Dana", "dana_k", language)));
-  assert.equal(opened.kind, "reply");
+  assertOpening(opened);
   // The first interview is over by the time the next link is opened (a chat already in an interview is told so and its
   // link is left alone); one test keeps it running to show the approval buttons still work from inside another interview.
   if (!options.leaveInterviewRunning) {
@@ -152,7 +153,7 @@ async function pausedTripWithLink() {
   await pool.query("UPDATE control_plane.intake_sessions SET expires_at = now() - interval '1 minute' WHERE trip_id = $1 AND expired_at IS NULL", [base.firstTripId]);
   await claimExpiredSessions(pool, 100);
   const opened = await dispatchUpdate(pool, startUpdate(t0, trip.token));
-  assert.equal(opened.kind, "reply");
+  assertOpening(opened);
   await pool.query("UPDATE control_plane.intake_sessions SET expires_at = now() - interval '1 minute' WHERE trip_id = $1 AND expired_at IS NULL", [trip.tripId]);
   assert.ok((await claimExpiredSessions(pool, 100)).length >= 1);
   const reissued = await issueEnrollment(pool, base.user, trip.tripId, { enrollmentTtlSeconds: 3600 });
@@ -168,7 +169,7 @@ describe("AC-1 and AC-2: the bound account, and the first one", { skip }, () => 
     const trip = await draftTrip(user);
     const t = nextChat();
     const decision = await dispatchUpdate(pool, startUpdate(t, trip.token));
-    assert.equal(decision.kind, "reply", "the ordinary opening, not a refusal");
+    assertOpening(decision, "the ordinary opening, not a refusal");
     assert.equal((await liveLinks(trip.tripId, t)).length, 1, "bound as the trip's organizer");
     assert.equal((await sessionsFor(t)).length, 1, "the interview started");
     assert.equal(await enrollmentState(trip.token), "consumed");
@@ -179,7 +180,7 @@ describe("AC-1 and AC-2: the bound account, and the first one", { skip }, () => 
     const { user, t0 } = await boundOrganizer();
     const second = await draftTrip(user, "Second Trip");
     const decision = await dispatchUpdate(pool, startUpdate(t0, second.token));
-    assert.equal(decision.kind, "reply");
+    assertOpening(decision);
     assert.equal((await sessionsFor(t0)).filter((s) => s.trip_id === second.tripId).length, 1);
     assert.equal((await requestsFor(second.tripId)).length, 0);
   });
@@ -358,9 +359,14 @@ describe("AC-5: the organizer approves", { skip }, () => {
     const tap = tapUpdate(t0, approveData(asked.replies[1]!), from(t0, "Dana"));
     const approved = multi(await dispatchUpdate(pool, tap));
     assert.ok(approved.callbackQueryId, "the tap is answered");
-    assert.deepEqual(approved.replies.map((r) => r.chatId), [t0, t1, t1]);
+    // The trip has a destination, so it is a dashboard trip: T1's opening is the greeting, then the document offer (#548).
+    assert.deepEqual(approved.replies.map((r) => r.chatId), [t0, t1, t1, t1]);
     assert.equal(approved.replies[1]!.text, uiString("linkOtherApproved", "en"));
-    assert.ok(approved.replies[2]!.replyMarkup, "T1 gets the ordinary opening, with its buttons");
+    assert.ok(approved.replies[2]!.text.startsWith("Hi Mallory, Kyoto"), approved.replies[2]!.text);
+    assert.equal(approved.replies[2]!.text.split("\n").length, 2, "the greeting and one explanation line, nothing else");
+    assert.ok(!approved.replies[2]!.replyMarkup);
+    assert.equal(approved.replies[3]!.text, uiString("documentOffer", "en"));
+    assert.ok(approved.replies[3]!.replyMarkup, "and the document offer carries the buttons");
     assert.ok(approved.replies[0]!.text.includes(trip.title) && approved.replies[0]!.text.includes("Mallory"));
 
     assert.equal((await liveLinks(trip.tripId, t0)).length, 0, "T0's link to this trip is revoked");
@@ -391,14 +397,14 @@ describe("AC-5: the organizer approves", { skip }, () => {
     const { sent, answered, deps } = recorder();
     await applyDecision(decision, deps);
     assert.equal(answered.length, 1);
-    assert.deepEqual(sent.map((m) => m.chatId), [t0, t1, t1]);
+    assert.deepEqual(sent.map((m) => m.chatId), [t0, t1, t1, t1]);
   });
 
   test("the buttons work while the organizer is in the middle of ANOTHER trip's interview (they are not swallowed as a stale interview button)", async () => {
     const { t0, t1, trip } = await askScenario({ leaveInterviewRunning: true });
     const asked = multi(await dispatchUpdate(pool, startUpdate(t1, trip.token)));
     const approved = multi(await dispatchUpdate(pool, tapUpdate(t0, approveData(asked.replies[1]!))));
-    assert.equal(approved.replies.length, 3);
+    assert.equal(approved.replies.length, 4);
     assert.equal((await liveLinks(trip.tripId, t1)).length, 1);
     assert.equal((await sessionsFor(t0)).filter((s) => s.expired_at === null).length, 1, "the organizer's own interview was not disturbed");
   });
@@ -409,7 +415,7 @@ describe("AC-5: the organizer approves", { skip }, () => {
     multi(await dispatchUpdate(pool, tapUpdate(t0, approveData(asked.replies[1]!))));
     // T0 is still bound through its first trip, T1 through this one: both are the account's Telegram, per the one definition.
     const more = await draftTrip(user);
-    assert.equal((await dispatchUpdate(pool, startUpdate(t1, more.token))).kind, "reply");
+    assertOpening((await dispatchUpdate(pool, startUpdate(t1, more.token))));
   });
 });
 
@@ -426,7 +432,7 @@ describe("AC-6: the organizer declines, or does not answer", { skip }, () => {
     assert.equal((await sessionsFor(t1)).length, 0);
     assert.equal(await enrollmentState(trip.token), "issued");
     assert.equal((await requestsFor(trip.tripId))[0].state, "declined");
-    assert.equal((await dispatchUpdate(pool, startUpdate(t0, trip.token))).kind, "reply", "T0 can still use the link");
+    assertOpening((await dispatchUpdate(pool, startUpdate(t0, trip.token))), "T0 can still use the link");
     assert.equal(await enrollmentState(trip.token), "consumed");
   });
 
@@ -494,7 +500,7 @@ describe("AC-7: only T0, once, only while pending; buttons are shortcuts", { ski
     multi(await dispatchUpdate(pool, startUpdate(t1, trip.token)));
     const typed = multi(await dispatchUpdate(pool, textUpdate(t0, "Approve")));
     assert.equal(typed.callbackQueryId, undefined, "there is no tap to answer");
-    assert.deepEqual(typed.replies.map((r) => r.chatId), [t0, t1, t1]);
+    assert.deepEqual(typed.replies.map((r) => r.chatId), [t0, t1, t1, t1]);
     assert.equal((await liveLinks(trip.tripId, t1)).length, 1);
     assert.equal((await liveLinks(trip.tripId, t0)).length, 0);
     assert.equal((await requestsFor(trip.tripId))[0].state, "approved");
@@ -580,7 +586,7 @@ describe("AC-7: only T0, once, only while pending; buttons are shortcuts", { ski
   test("the link used by its owner first: a later Approve is moot and T1 is never linked", async () => {
     const { t0, t1, trip } = await askScenario();
     const asked = multi(await dispatchUpdate(pool, startUpdate(t1, trip.token)));
-    assert.equal((await dispatchUpdate(pool, startUpdate(t0, trip.token))).kind, "reply");
+    assertOpening((await dispatchUpdate(pool, startUpdate(t0, trip.token))));
     const late = await dispatchUpdate(pool, tapUpdate(t0, approveData(asked.replies[1]!)));
     assert.equal(late.kind, "callback_ack");
     assert.equal((await liveLinks(trip.tripId, t1)).length, 0);
@@ -800,9 +806,9 @@ describe("a narrowed set never reads as 'nobody is bound'", { skip }, () => {
     assert.ok(issued.ok);
     if (!issued.ok) return;
     await redeemTelegramLinkToken(pool, issued.token, phone, null);
-    assert.equal((await dispatchUpdate(pool, startUpdate(phone, a.token))).kind, "reply", "its own trip works");
+    assertOpening((await dispatchUpdate(pool, startUpdate(phone, a.token))), "its own trip works");
     await pool.query("UPDATE control_plane.intake_sessions SET expired_at = now() WHERE telegram_chat_id = $1 AND expired_at IS NULL", [phone]);
-    assert.equal((await dispatchUpdate(pool, startUpdate(phone, c.token))).kind, "reply", "the account's other trip too: the main Telegram is account-wide");
+    assertOpening((await dispatchUpdate(pool, startUpdate(phone, c.token))), "the account's other trip too: the main Telegram is account-wide");
     assert.equal((await liveLinks(c.tripId, phone)).length, 1);
   });
 
@@ -823,7 +829,7 @@ describe("a narrowed set never reads as 'nobody is bound'", { skip }, () => {
     const user = await organizer();
     const trip = await draftTrip(user, "Only Trip");
     const t0 = nextChat();
-    assert.equal((await dispatchUpdate(pool, startUpdate(t0, trip.token))).kind, "reply");
+    assertOpening((await dispatchUpdate(pool, startUpdate(t0, trip.token))));
     await pool.query("UPDATE control_plane.intake_sessions SET expires_at = now() - interval '1 minute' WHERE trip_id = $1 AND expired_at IS NULL", [trip.tripId]);
     await claimExpiredSessions(pool, 100);
     const next = await issueEnrollment(pool, user, trip.tripId, { enrollmentTtlSeconds: 3600 });
@@ -841,7 +847,7 @@ describe("a narrowed set never reads as 'nobody is bound'", { skip }, () => {
     const user = await organizer();
     const trip = await draftTrip(user);
     const t = nextChat();
-    assert.equal((await dispatchUpdate(pool, startUpdate(t, trip.token))).kind, "reply");
+    assertOpening((await dispatchUpdate(pool, startUpdate(t, trip.token))));
     assert.equal((await liveLinks(trip.tripId, t)).length, 1);
     assert.equal((await pool.query("SELECT binding_scope FROM control_plane.telegram_organizer_trip_links WHERE trip_id = $1", [trip.tripId])).rows[0].binding_scope, "account");
   });
@@ -909,7 +915,7 @@ describe("a Telegram bound for ONE trip does not speak for the account's other t
     if (!issued.ok) return;
     assert.equal((await redeemTelegramLinkToken(pool, issued.token, main, null)).ok, true);
     assert.equal(await scopeOf(a.tripId, main), "account");
-    assert.equal((await dispatchUpdate(pool, startUpdate(main, b.token))).kind, "reply", "no refusal, no question");
+    assertOpening((await dispatchUpdate(pool, startUpdate(main, b.token))), "no refusal, no question");
     assert.equal((await liveLinks(b.tripId, main)).length, 1);
     // ...and the previous main is a different account now: it is the one that is asked about.
     assert.equal(await scopeOf(a.tripId, t0), undefined, "T0 is no longer linked through the account");
@@ -939,7 +945,7 @@ describe("a Telegram bound for ONE trip does not speak for the account's other t
     if (!issued.ok) return;
     await redeemTelegramLinkToken(pool, issued.token, added, null);
     const decision = await dispatchUpdate(pool, startUpdate(added, a.token));
-    assert.equal(decision.kind, "reply", "no refusal, no question");
+    assertOpening(decision, "no refusal, no question");
     assert.equal((await sessionsFor(added)).filter((s) => s.trip_id === a.tripId).length, 1);
   });
 

@@ -32,6 +32,7 @@ import { issueTelegramLinkToken, redeemTelegramLinkToken } from "../src/telegram
 import { unlinkedTelegramLinksByTrip } from "../src/telegram-mini-app.js";
 import { TEST_BOT_TOKEN, launchFields, signedInitData } from "./support/mini-app-init-data.js";
 import { testDatabaseUrl, testPool } from "./support/test-database.js";
+import { assertOpening } from "./support/opening.js";
 
 const databaseUrl = testDatabaseUrl();
 const skip = !databaseUrl;
@@ -148,7 +149,7 @@ async function accountWithMain(name = "Olive") {
   const user = await mkUser(name);
   const first = await draftTrip(user, "First Trip");
   const t0 = nextChat();
-  assert.equal((await dispatch(startUpdate(t0, first.token, from(t0, "Dana", "dana_k")))).kind, "reply");
+  assertOpening((await dispatch(startUpdate(t0, first.token, from(t0, "Dana", "dana_k")))));
   await pool.query("UPDATE control_plane.intake_sessions SET expired_at = now() WHERE telegram_chat_id = $1 AND expired_at IS NULL", [t0]);
   return { user, t0, firstTripId: first.tripId };
 }
@@ -223,7 +224,7 @@ describe("AC-1: Link Telegram makes the opener the account's MAIN Telegram, acco
       const later = await draftTrip(user, "Created later");
       for (const trip of [before, later]) {
         const decision = await dispatch(startUpdate(t, trip.token));
-        assert.equal(decision.kind, "reply", "the ordinary opening: no refusal, no question");
+        assertOpening(decision, "the ordinary opening: no refusal, no question");
         assert.equal((await pool.query("SELECT 1 FROM control_plane.intake_sessions WHERE trip_id = $1 AND telegram_chat_id = $2", [trip.tripId, t])).rowCount, 1, "the interview started");
         await pool.query("UPDATE control_plane.intake_sessions SET expired_at = now() WHERE telegram_chat_id = $1 AND expired_at IS NULL", [t]);
       }
@@ -838,7 +839,7 @@ describe("AC-9: #519's rules still hold", { skip }, () => {
       assert.deepEqual(await boundTelegramAccounts(pool, user, trip.tripId), []);
       // So the account's first interview opener still binds (AC-1 of #519), and from then on the account is never empty.
       const t = nextChat();
-      assert.equal((await dispatch(startUpdate(t, trip.token))).kind, "reply");
+      assertOpening((await dispatch(startUpdate(t, trip.token))));
       assert.equal((await liveLinks(trip.tripId, t)).length, 1);
       assert.equal(await anyTelegramBound(pool, user), true);
     } finally { await app.close(); }

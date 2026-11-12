@@ -29,7 +29,7 @@ import {
   organizerLinkCallbackData,
   parseCallbackData,
   parseInbound,
-  renderDocumentOffer,
+  renderOpeningMessages,
   renderResumedOpening,
   renderQuestion,
   resolveChatRoute,
@@ -818,11 +818,11 @@ export async function dispatchUpdate(
         if (!outcome.view.nextQuestion) {
           return { kind: "reply", reply: { chatId, text: strings.badLink } };
         }
-        const rendered = renderDocumentOffer(outcome.view.language, outcome.returning, outcome.seeded);
-        return {
-          kind: "reply",
-          reply: { chatId, text: rendered.text, replyMarkup: rendered.replyMarkup ?? undefined },
-        };
+        // One message for an ordinary trip; for a dashboard trip the greeting and then the document offer, each its
+        // own message (#548).
+        const opening = renderOpeningMessages(outcome.view.language, outcome.returning, outcome.seeded)
+          .map((m): DirectReply => ({ chatId, text: m.text, replyMarkup: m.replyMarkup ?? undefined }));
+        return opening.length > 1 ? { kind: "multi_reply", replies: opening } : { kind: "reply", reply: opening[0]! };
       }
       case "already_in_interview":
         return { kind: "reply", reply: { chatId, text: strings.alreadyInterviewing } };
@@ -2149,8 +2149,9 @@ function linkAnswerReplies(
       ];
       // The ordinary opening of a fresh interview, exactly as `/start` sends it (see the `started` case).
       if (result.view.nextQuestion) {
-        const offer = renderDocumentOffer(language, result.returning, result.seeded);
-        replies.push({ chatId: result.requester.chatId, text: offer.text, replyMarkup: offer.replyMarkup ?? undefined });
+        for (const m of renderOpeningMessages(language, result.returning, result.seeded)) {
+          replies.push({ chatId: result.requester.chatId, text: m.text, replyMarkup: m.replyMarkup ?? undefined });
+        }
       }
       return { ackText: replies[0]!.text, replies };
     }

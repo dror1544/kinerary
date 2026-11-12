@@ -1435,12 +1435,6 @@ export function renderConfirmPrompt(
 export function renderDocumentOffer(
   language: Language = DEFAULT_LANGUAGE,
   returning = false,
-  /**
-   * Set when the trip was created on the dashboard (#438): who the organizer is to it, and the destination and dates
-   * already chosen. Said BEFORE the introduction, which follows unchanged; absent, the opening is exactly what it
-   * always was, byte for byte.
-   */
-  seeded?: SeededOpening,
 ): RenderedQuestion {
   return {
     // One message, not two: an opening that arrives as a pair of notifications
@@ -1456,15 +1450,41 @@ export function renderDocumentOffer(
     // is a bot talking past them. What that version says instead is the one
     // thing only a second trip raises — that the first one is not being
     // replaced.
-    text: seeded
-      ? `${seededOpening(seeded, language)}\n\n${uiString(returning ? "introductionReturning" : "introduction", language)}`
-      : uiString(returning ? "introductionReturning" : "introduction", language),
+    text: uiString(returning ? "introductionReturning" : "introduction", language),
     replyMarkup: {
       inline_keyboard: [[
         { text: uiString("noDocument", language), callback_data: NO_DOCUMENT_CALLBACK_DATA },
       ]],
     },
   };
+}
+
+/**
+ * Every message an interview opens with, in the order they are sent.
+ *
+ * An unseeded trip opens with the one message it always has (`renderDocumentOffer`). A trip created on the dashboard
+ * (#438) has told the product its destination and dates already, so the older introduction -- nine paragraphs about
+ * what Kinerary is -- does not belong after "Hi Dana, Japan in April": its first message is the greeting and one
+ * line saying a few quick questions will fill in the details, and nothing else (#548). What it said that is still
+ * needed follows as its own message: the document offer, with its button, and for an account that already has a
+ * built trip, first the note that the earlier trip is untouched. The first question follows when it is answered, as
+ * for any other opening.
+ */
+export function renderOpeningMessages(
+  language: Language = DEFAULT_LANGUAGE,
+  returning = false,
+  /** Set when the trip was created on the dashboard (#438): who the organizer is to it, and the destination and dates already chosen. */
+  seeded?: SeededOpening,
+): RenderedQuestion[] {
+  if (!seeded) return [renderDocumentOffer(language, returning)];
+  const offer = uiString("documentOffer", language);
+  return [
+    { text: seededOpening(seeded, language), replyMarkup: null },
+    {
+      text: returning ? `${uiString("seedReturningNote", language)}\n\n${offer}` : offer,
+      replyMarkup: { inline_keyboard: [[{ text: uiString("noDocument", language), callback_data: NO_DOCUMENT_CALLBACK_DATA }]] },
+    },
+  ];
 }
 
 /**

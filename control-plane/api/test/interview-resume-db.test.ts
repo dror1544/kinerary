@@ -32,6 +32,7 @@ import { applyDecision } from "../src/relay/poller.js";
 import { dispatchUpdate } from "../src/relay/dispatch.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
 import { testDatabaseUrl, testPool } from "./support/test-database.js";
+import { assertOpening } from "./support/opening.js";
 
 const skip = !testDatabaseUrl();
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
@@ -126,9 +127,12 @@ function startUpdate(chatId: string, token: string, languageCode?: string): Tele
 /** What the organizer is sent when they open `token`'s link. */
 async function opened(chatId: string, token: string, languageCode?: string) {
   const decision = await dispatchUpdate(pool, startUpdate(chatId, token, languageCode));
-  assert.equal(decision.kind, "reply");
-  if (decision.kind !== "reply") throw new Error("unreachable");
-  return decision.reply;
+  // A resumed interview is one line; a first opening on a dashboard trip is the greeting and then the document offer
+  // (#548): the first message is what these callers look at.
+  assertOpening(decision);
+  if (decision.kind === "reply") return decision.reply;
+  if (decision.kind !== "multi_reply") throw new Error("unreachable");
+  return decision.replies[0]!;
 }
 
 /** Answer whatever is asked, `steps` times, straight into the row (the way the #438 tests walk an interview). */
@@ -162,7 +166,7 @@ async function expire(tripId: string) {
 async function pausedInterview(trip: { tripId: string; token: string }, steps = 3, languageCode?: string) {
   const chat = nextChat();
   const first = await dispatchUpdate(pool, startUpdate(chat, trip.token, languageCode));
-  assert.equal(first.kind, "reply");
+  assertOpening(first);
   const answered = await answerSome(chat, steps);
   const before = await pool.query("SELECT id, answers, language FROM control_plane.intake_sessions WHERE trip_id = $1", [trip.tripId]);
   const seen = await getSessionForChat(pool, chat);
@@ -551,10 +555,14 @@ describe("a paused interview picks up where it stopped (#513)", { skip }, () => 
     assert.equal(forwarded.statusCode, 201);
 
     const stranger = nextChat();
-    const reply = await opened(stranger, tokenOf(forwarded.json().deepLink));
-    assert.notEqual(reply.text, uiString("resumedOpening", "en"), "no welcome back for someone who was not in the interview");
-    assert.ok(reply.text.endsWith(uiString("introduction", "en")), "the ordinary, seeded opening");
-    assert.ok(JSON.stringify(reply.replyMarkup).includes("c:nodoc"), "with the document offer");
+    const messages = await dispatchUpdate(pool, startUpdate(stranger, tokenOf(forwarded.json().deepLink)));
+    assert.equal(messages.kind, "multi_reply");
+    if (messages.kind !== "multi_reply") return;
+    const [reply, offer] = messages.replies;
+    assert.notEqual(reply!.text, uiString("resumedOpening", "en"), "no welcome back for someone who was not in the interview");
+    assert.ok(reply!.text.startsWith("Hi "), "the ordinary, seeded opening (#548: the greeting)");
+    assert.equal(offer!.text, uiString("documentOffer", "en"));
+    assert.ok(JSON.stringify(offer!.replyMarkup).includes("c:nodoc"), "with the document offer");
     const [row] = await liveSession(t.tripId);
     assert.equal(row.telegram_chat_id, stranger);
     assert.deepEqual(Object.keys(row.answers).sort(), [...SEEDED].sort(), "the card seed only");

@@ -510,14 +510,18 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // place of "which of them are you?". Said as a question to them, not as something read from a document.
     organizerNameConfirm: "You're {name} on the list, right?",
     knownStopConfirm: "You're going to {place}, {start} – {end}. Is that the only stop?",
-    // The opening of a trip that was created on the dashboard (#438, AC-13): a friendly greeting that says what is
-    // already known -- the place and the month -- and that a few questions are all that is left. It never says where
-    // the values came from. Placed before the usual introduction, which follows unchanged. See `seededOpening`.
+    // The opening of a trip that was created on the dashboard (#438, AC-13; #548): a friendly greeting that says what
+    // is already known -- the place and the month -- and, on its own second line, that a few quick questions will
+    // fill in the rest. That is the WHOLE first message: the older introduction is not sent after it. It never says
+    // where the values came from. See `seededOpening`.
     seedHi: "Hi {name}",
     seedHiAnon: "Hi",
     seedPlaceMonth: "{place} in {month}",
     seedExcited: "How exciting! 🎉",
-    seedQuick: "A few quick questions and your trip will be ready for everyone.",
+    seedQuick: "A few quick questions will fill in your trip's details.",
+    // For an account that already has a built trip, said with the document offer (#548): the one thing the old
+    // returning introduction said that a second trip raises. The first trip is not being replaced.
+    seedReturningNote: "Your previous trip isn't touched — its site and its assistant stay exactly as they are. While we set this one up, messages here come to me rather than to that assistant; /trips moves between them once this trip is built.",
     /** Instead of documentNothing, when nothing was certain but something was found. */
     documentUnsure: "I read it and found a few things I'm not sure I read right — I'll check each one with you as we go.",
     /** Beside what was taken, naming what will be checked. */
@@ -905,7 +909,8 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     seedHiAnon: "היי",
     seedPlaceMonth: "{place} ב{month}",
     seedExcited: "איזה כיף! 🎉",
-    seedQuick: "כמה שאלות קצרות והטיול יהיה מוכן לכולם.",
+    seedQuick: "כמה שאלות קצרות ישלימו את פרטי הטיול.",
+    seedReturningNote: "הטיול הקודם שלכם לא משתנה — האתר והעוזר שלו נשארים בדיוק כמו שהם. בזמן שנקים את הטיול הזה, הודעות כאן מגיעות אליי ולא לעוזר ההוא; אפשר לעבור ביניהם עם ‎/trips‎ אחרי שהטיול הזה יוקם.",
     documentUnsure: "קראתי, ומצאתי כמה דברים שאני לא בטוח שקראתי נכון — אבדוק איתכם כל אחד מהם בהמשך.",
     documentWillCheck: "לא בטוח שקראתי נכון — אבדוק איתכם",
     documentMoreTravelers: "מסמך נוסף מזכיר גם את {names} — להוסיף אותם לנוסעים?",
@@ -1180,11 +1185,13 @@ export function tripMonthInWords(departureIso: string | null, returnIso: string 
 }
 
 /**
- * The opening of an interview for a trip created on the dashboard (#438, AC-13): one friendly line that greets the
- * organizer, says the place and the month they are going, and tells them a few quick questions are all that is left.
- * It goes BEFORE the usual introduction; nothing after it changes.
+ * The first message of an interview for a trip created on the dashboard (#438, AC-13; #548): a greeting that names the
+ * organizer, the place and the month they are going, and, on a second line, says a few quick questions will fill in
+ * the trip's details. It is the WHOLE message -- the older introduction is not appended to it (the document offer
+ * follows as its own message, `renderOpeningMessages`).
  *
- *   "Hi Dana, Japan in April. How exciting! 🎉 A few quick questions and your trip will be ready for everyone."
+ *   "Hi Dana, Japan in April. How exciting! 🎉
+ *    A few quick questions will fill in your trip's details."
  *
  * Only what is known is said: no name drops "Dana" ("Hi! Japan in April. …"), no dates drops the month, no
  * destination leaves the greeting and the quick-questions sentence. It never names where the values came from, and
@@ -1200,11 +1207,11 @@ export function seededOpening(seeded: SeededOpeningFacts, language: Language = D
   const place = seeded.destination?.trim();
   const hi = name ? fill("seedHi", { name }) : uiString("seedHiAnon", language);
   const quick = uiString("seedQuick", language);
-  if (!place) return `${hi}! ${quick}`;
+  if (!place) return `${hi}!\n${quick}`;
 
   const month = tripMonthInWords(seeded.departureDate, seeded.returnDate, language);
   const where = month ? fill("seedPlaceMonth", { place, month }) : place;
-  return `${hi}${name ? "," : "!"} ${where}. ${uiString("seedExcited", language)} ${quick}`;
+  return `${hi}${name ? "," : "!"} ${where}. ${uiString("seedExcited", language)}\n${quick}`;
 }
 
 function pick(localised: Localised | undefined, language: Language): string | null {
