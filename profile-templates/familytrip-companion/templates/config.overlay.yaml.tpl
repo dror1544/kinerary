@@ -92,9 +92,22 @@ agent:
   #
   # `file` and `memory` stay: the companion reads its own references and
   # remembers its family. `cronjob` stays too — trip reminders are the job.
+  #
+  # `computer_use` and `browser` go for the same reason (#547, 2026-11-12). The
+  # `hermes-telegram` bundle includes them, and Hermes's resolver gave this
+  # overlay 18 browser_* tools (navigate/click/type, a CDP escape, a password-vault
+  # unlock) and `computer_use` (screenshots, mouse, keyboard). A tester pasted a
+  # Terminal command into a companion's private chat and the companion reached for
+  # `computer_use` to run it: text a traveller types must never be one model turn
+  # from driving a desktop. It failed that time only because cua-driver was not
+  # installed on the host. The companion reads the web through `web_search` /
+  # `web_extract` (the `web` toolset, which stays); it has never called a
+  # browser_* tool.
   disabled_toolsets:
     - terminal
     - code_execution
+    - computer_use
+    - browser
 
 # `write_file`, `patch` and `skill_manage` are deliberately NOT in
 # disabled_toolsets above — the companion still needs read_file,
@@ -121,8 +134,26 @@ agent:
 # nothing legitimate ever writes into, so a write anywhere else — another
 # profile's config.yaml, this profile's own skill files — is hard-denied by
 # Hermes itself (agent/file_safety.py) rather than staged.
+#
+# `skill_manage` itself cannot be taken out of the tool list from config: it
+# lives in the `skills` toolset beside `skill_view` (which the companion reads its
+# skills through), `disabled_toolsets` removes whole toolsets only, and Hermes has
+# no per-tool deny. So #547 closes the two ways a conversation reaches it. (1) The
+# gate above stays on: on 2026-11-12 a `skill_manage` call "completed" in the log
+# and changed nothing on disk — it was staged (pending/skills/<id>.json, never
+# applied). (2) Hermes's own post-turn "review the conversation and update the
+# skill library" fork — origin=background_review, which is what made that call, on
+# a turn about a pasted shell command — is switched off: `creation_nudge_interval: 0`
+# stops the nudge counter that starts it, and `auxiliary.background_review.enabled:
+# false` skips the auto spawn. The latter is read fail-OPEN (anything but a real
+# boolean false leaves it on), so keep it an unquoted boolean; test_template.py
+# asserts the type.
 skills:
   write_approval: true
+  creation_nudge_interval: 0
+auxiliary:
+  background_review:
+    enabled: false
 
 # Sessions must NOT accumulate forever, and Hermes will not stop them on its
 # own: SessionResetPolicy defaults to mode "none" — "sessions never auto-reset

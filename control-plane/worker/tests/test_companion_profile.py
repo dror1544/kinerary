@@ -388,9 +388,16 @@ class CompanionOverlayTemplateTests(unittest.TestCase):
         scripts/companion-install-host.sh, not this template).
         """
         overlay = yaml.safe_load(self.OVERLAY.read_text(encoding="utf-8"))
-        self.assertEqual(overlay["skills"], {"write_approval": True})
+        self.assertIs(overlay["skills"]["write_approval"], True)
+        disabled = overlay["agent"]["disabled_toolsets"]
+        for needed in ("file", "memory", "cronjob", "skills", "web"):
+            self.assertNotIn(
+                needed, disabled,
+                "the gate stages skill writes; it must not disable the toolsets "
+                "the companion reads through",
+            )
+        # #547 adds desktop/browser control to the deny list, and nothing else.
         self.assertEqual(
-            overlay["agent"]["disabled_toolsets"], ["terminal", "code_execution"],
-            "this change must not disable file/memory/cronjob/skills too",
+            disabled, ["terminal", "code_execution", "computer_use", "browser"],
         )
 
