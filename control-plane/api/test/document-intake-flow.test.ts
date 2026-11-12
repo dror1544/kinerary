@@ -916,3 +916,111 @@ describe("two tickets for two parties through the interview (#412)", { skip: SKI
     }));
   });
 });
+
+// ── #543 / #544: one reply per upload burst, and a photo is kept like a PDF ──
+
+/** A ticket sent as a photo: its words as the bytes, so looking at it reads them back. */
+const photoOf = (upload: Upload, name: string): Upload => ({ ...upload, name, mime: "image/jpeg" });
+
+describe("an album of ticket photos (#543, #544)", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABASE_URL" : false }, () => {
+  test("#543: two photos sent as one album are acknowledged once, not once per photo", async () => {
+    await withFlow({ store: true }, async (flow) => {
+      await upload(flow, [photoOf(TICKET_1, "IMG_5001.jpg"), photoOf(TICKET_2, "IMG_5002.jpg")]);
+
+      const language = await languageOf(flow.pool);
+      const reading = uiString("documentReading", language);
+      assert.equal(
+        flow.telegram.sent.filter((text) => text === reading).length,
+        1,
+        `the 'reading it now' line is sent once for the album — sent: ${JSON.stringify(flow.telegram.sent)}`,
+      );
+      assert.equal(flow.calls.filter((c) => c === "read_image").length, 2, "and both photos were still looked at");
+    });
+  });
+
+  test("#543: no message is sent twice by one album, whatever its text", async () => {
+    await withFlow({ store: true }, async (flow) => {
+      await upload(flow, [photoOf(TICKET_1, "IMG_5001.jpg"), photoOf(TICKET_2, "IMG_5002.jpg")]);
+
+      const repeated = flow.telegram.sent.filter((text, i, all) => all.indexOf(text) !== i);
+      assert.deepEqual(repeated, [], "every message the organizer got from the album is distinct");
+    });
+  });
+
+  test("#543: a later upload, after the album's burst was read, is acknowledged again", async () => {
+    await withFlow({ store: true }, async (flow) => {
+      await upload(flow, [photoOf(TICKET_1, "IMG_5001.jpg")]);
+      await upload(flow, [photoOf(TICKET_2, "IMG_5002.jpg")]);
+
+      const language = await languageOf(flow.pool);
+      assert.equal(
+        flow.telegram.sent.filter((text) => text === uiString("documentReading", language)).length,
+        2,
+        "two separate uploads are two acknowledgements: the dedupe is per burst, not per chat",
+      );
+    });
+  });
+
+  test("#544: each photo is kept as an original, named in the confirmed version, and tied to what it supplied", async () => {
+    await withFlow({ store: true }, async (flow) => {
+      await upload(flow, [photoOf(HOTEL, "IMG_6001.jpg"), photoOf(VOUCHER, "IMG_6002.jpg")]);
+
+      const documents = await flow.pool.query<{ id: string; ingest_state: string; storage_key: string; mime: string }>(
+        "SELECT id, ingest_state, storage_key, mime FROM control_plane.trip_documents WHERE trip_id = $1 ORDER BY storage_key",
+        [flow.tripId],
+      );
+      assert.equal(documents.rowCount, 2);
+      assert.ok(documents.rows.every((d) => d.ingest_state === "stored" && /\.jpg$/.test(d.storage_key) && d.mime === "image/jpeg"));
+      assert.equal((await flow.store!.list(flow.tripId)).length, 2, "the photos' bytes are on disk, not only their transcripts");
+      assert.ok(
+        !flow.logs.some((line) => line.includes("interview.originals_not_kept")),
+        "with a store configured nothing says the originals were dropped",
+      );
+
+      // Confirm, exactly as the PDF test does.
+      const current = await answersForChat(flow.pool, CHAT);
+      const answers: Record<string, unknown> = { ...(current?.answers ?? {}) };
+      answers.travelers ??= { kind: "structured", schema_version: INTAKE_SCHEMA_VERSION, data: [{ name: "Dana" }] };
+      for (const question of INTAKE_QUESTIONS.filter((q) => q.required)) {
+        answers[question.id] ??= { kind: "text", schema_version: INTAKE_SCHEMA_VERSION, text: "filler" };
+      }
+      answers.organizer_identity = { kind: "text", schema_version: INTAKE_SCHEMA_VERSION, text: "Dana" };
+      await flow.pool.query("UPDATE control_plane.intake_sessions SET answers = $2::jsonb WHERE telegram_chat_id = $1", [CHAT, JSON.stringify(answers)]);
+      const confirmed = await confirmIntakeForChat(flow.pool, CHAT);
+      assert.ok(confirmed.ok, JSON.stringify(confirmed));
+
+      const version = await flow.pool.query(
+        "SELECT source_document FROM control_plane.intake_versions WHERE trip_id = $1",
+        [flow.tripId],
+      );
+      const manifest = version.rows[0]?.source_document as {
+        documents: { documentId: string; stored: boolean; mime: string }[];
+        sources: { questionId: string; documentId: string }[];
+      };
+      assert.equal(manifest.documents.length, 2);
+      assert.ok(manifest.documents.every((d) => d.stored && d.mime === "image/jpeg"), "the version says both photos are kept");
+      assert.ok(manifest.sources.some((s) => s.questionId === "travel_anchors"), "a photographed booking is tied to the entry it produced");
+      for (const doc of manifest.documents) {
+        assert.ok(manifest.sources.some((s) => s.documentId === doc.documentId), `${doc.documentId} supports at least one answer`);
+      }
+    });
+  });
+
+  test("#544: with no document store, a photo is still read — and the relay says out loud that it was not kept", async () => {
+    await withFlow({ store: false }, async (flow) => {
+      await upload(flow, [photoOf(HOTEL, "IMG_6001.jpg")]);
+
+      const documents = await flow.pool.query(
+        "SELECT ingest_state, storage_key FROM control_plane.trip_documents WHERE trip_id = $1",
+        [flow.tripId],
+      );
+      assert.deepEqual(documents.rows, [{ ingest_state: "unstored", storage_key: null }]);
+      const line = flow.logs.find((l) => l.includes("interview.originals_not_kept"));
+      assert.ok(line, `a warning names the dropped originals — logs: ${flow.logs.length}`);
+      const parsed = JSON.parse(line) as { level: string; documents: number; reason: string };
+      assert.equal(parsed.level, "warn");
+      assert.equal(parsed.documents, 1);
+      assert.equal(parsed.reason, "NO_DOCUMENT_STORE");
+    });
+  });
+});

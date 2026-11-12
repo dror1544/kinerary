@@ -686,6 +686,45 @@ describe("the confirm button is a real confirmation", () => {
     });
   });
 
+  test("#543: repeat taps on Confirm, one after another, say the confirmation once and are not errors", { skip: SKIP }, async () => {
+    // Pins behaviour that was already right (it passes on the tree before #543):
+    // once the session is confirmed it is no longer a live interview, so
+    // `dispatchUpdate` drops a later tap as a stale interview button.
+    await withFixture(async (fix) => {
+      await beginInterview(fix, "700100024");
+      await fillRequired(fix, "700100024");
+      await turn(fix, tap("700100024", CONFIRM_CALLBACK_DATA));
+      await turn(fix, tap("700100024", CONFIRM_CALLBACK_DATA));
+      await turn(fix, tap("700100024", CONFIRM_CALLBACK_DATA));
+
+      const said = fix.telegram.sent.filter((m) => /everything|זהו, יש לי הכול/.test(m.text));
+      assert.equal(said.length, 1, `the confirmation is sent once - sent: ${JSON.stringify(fix.telegram.sent.map((m) => m.text))}`);
+      assert.equal(fix.telegram.sent.filter((m) => /couldn't|wrong/i.test(m.text)).length, 0, "and the repeat taps are not errors");
+    });
+  });
+
+  test("#543: two Confirm taps handled at the same time say the confirmation once", { skip: SKIP }, async () => {
+    // The case the sequential test cannot reach: both taps were dispatched while
+    // the session was still live (two relay processes during a restart, a
+    // redelivered callback). `confirmIntakeVia` answers the second as the
+    // idempotent success it is - and the branch used to send the confirmation
+    // message again on that answer. FAILS on the tree before #543 (two messages).
+    await withFixture(async (fix) => {
+      await beginInterview(fix, "700100025");
+      await fillRequired(fix, "700100025");
+      await Promise.all([
+        turn(fix, tap("700100025", CONFIRM_CALLBACK_DATA)),
+        turn(fix, tap("700100025", CONFIRM_CALLBACK_DATA)),
+      ]);
+
+      const said = fix.telegram.sent.filter((m) => /everything|זהו, יש לי הכול/.test(m.text));
+      assert.equal(said.length, 1, `sent: ${JSON.stringify(fix.telegram.sent.map((m) => m.text))}`);
+      const versions = await fix.pool.query("SELECT version FROM control_plane.intake_versions WHERE trip_id = $1", [fix.tripId]);
+      assert.equal(versions.rowCount, 1, "and one intake version exists");
+      assert.equal(fix.telegram.answered.length, 2, "both taps are answered, so neither button is left spinning");
+    });
+  });
+
   test("Confirm before the required questions are done refuses and says so", { skip: SKIP }, async () => {
     await withFixture(async (fix) => {
       await beginInterview(fix, "700100022");
