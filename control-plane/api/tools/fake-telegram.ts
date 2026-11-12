@@ -16,6 +16,9 @@
  *
  *   POST /_control/message   {chatId, text, languageCode?}    they type
  *   POST /_control/document  {chatId, filename, mime, base64}  they send a file
+ *   POST /_control/photo     {chatId, base64, caption?}        they send ONE photo (compressed, as a camera roll does)
+ *   POST /_control/album     {chatId, photos:[{base64}], caption?}  they send several photos TOGETHER: one message
+ *                                                              per photo, one shared media_group_id (tools/fake-telegram-media.ts)
  *   POST /_control/tap       {chatId, messageId, data}         they tap a button
  *   POST /_control/join      {chatId, fromId, status?}         the bot is added to a group
  *   GET  /_control/sent?chatId=&after=                         what the bot said
@@ -34,6 +37,7 @@
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
+import { buildAlbum } from "./fake-telegram-media.js";
 
 type Update = Record<string, unknown> & { update_id: number };
 interface Sent {
@@ -62,8 +66,11 @@ const files = new Map<string, { path: string; bytes: Buffer; mime: string; name:
 const waiters: (() => void)[] = [];
 const unknownMethods = new Set<string>();
 
-function push(update: Omit<Update, "update_id">): void {
-  updates.push({ update_id: nextUpdateId++, ...update } as Update);
+function push(...batch: Omit<Update, "update_id">[]): void {
+  // All at once, then wake the pollers: an album is several updates Telegram
+  // hands over together, and waking after the first would let a getUpdates
+  // answer with half of it.
+  for (const update of batch) updates.push({ update_id: nextUpdateId++, ...update } as Update);
   for (const wake of waiters.splice(0)) wake();
 }
 
@@ -214,6 +221,29 @@ async function control(path: string, req: IncomingMessage, url: URL, res: Server
     push({ message: { ...base, ...documentOf(fileId),
       ...(p.caption ? { caption: String(p.caption) } : {}) } });
     return ok(res, { queued: true, fileId, messageId: base.message_id });
+  }
+  if (path === "/_control/photo" || path === "/_control/album") {
+    const single = path === "/_control/photo";
+    const given = single ? [{ base64: p.base64 }] : p.photos;
+    if (!Array.isArray(given) || given.length === 0 || given.length > 10) return bad(res, "an album is 1 to 10 photos");
+    const photos = given.map((g) => ({
+      bytes: Buffer.from(String((g as { base64?: unknown }).base64 ?? ""), "base64"),
+      ...(Number((g as { width?: unknown }).width) ? { width: Number((g as { width?: unknown }).width) } : {}),
+      ...(Number((g as { height?: unknown }).height) ? { height: Number((g as { height?: unknown }).height) } : {}),
+    }));
+    if (photos.some((x) => x.bytes.length === 0)) return bad(res, "a photo with no bytes");
+    // `base` already took one message id; the rest of the album takes the next ones.
+    nextMessageId += photos.length - 1;
+    const album = buildAlbum({
+      photos, base, firstMessageId: base.message_id, newFileId: () => `P${randomBytes(12).toString("hex")}`,
+      ...(single ? {} : { mediaGroupId: String(Math.floor(Math.random() * 1e15)) }),
+      ...(p.caption ? { caption: String(p.caption) } : {}),
+    });
+    for (const f of album.files) files.set(f.id, { path: f.path, bytes: f.bytes, mime: f.mime, name: f.name });
+    push(...album.messages.map((message) => ({ message })));
+    return ok(res, { queued: true, messageIds: album.messages.map((m) => m.message_id),
+      mediaGroupId: album.messages[0]?.media_group_id ?? null,
+      fileIds: album.messages.map((m) => ((m.photo as { file_id: string }[]).at(-1))!.file_id) });
   }
   if (path === "/_control/join") {
     // The bot added to a group, as Telegram announces it: `my_chat_member`.
