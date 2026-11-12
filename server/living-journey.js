@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const { publicPart } = require('../shared/config-visibility');
 const { projectAgent } = require('../shared/agent-schema');
 const seedReconcile = require('./seed-reconcile');
+const planConflicts = require('./plan-conflicts');
 // Every plan date a route below is SENT must be a day on the calendar, not
 // only the shape (second boundary re-check of PR #373); reads keep ISO_DATE_RE.
 const { isCalendarDay, CALENDAR_DAY_DETAIL } = require('./calendar-day');
@@ -223,6 +224,15 @@ function schema(db) {
       resolution_note TEXT,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
+    );
+
+    -- #550: a plan-time conflict the organizer chose to keep ("keep both"). The key is the pair of
+    -- items and their times (server/plan-conflicts.js), so moving either is a new conflict. Not on
+    -- the item rows: itinerary revisions are immutable, and a Classic rewrite must not clear it.
+    CREATE TABLE IF NOT EXISTS plan_conflict_acks (
+      pair_key TEXT PRIMARY KEY,
+      accepted_by TEXT NOT NULL,
+      accepted_at TEXT DEFAULT (datetime('now'))
     );
 
     CREATE TABLE IF NOT EXISTS trip_daily_messages (
@@ -685,6 +695,43 @@ function withSeedFlags(db, payload) {
     items: payload.items.map((item) => {
       const row = byUid.get(item.item_uid);
       return row ? { ...item, ...seedReconcile.shapePlanItem({ seed_pending: row.seed_pending, seed_removed: row.seed_removed }, true) } : item;
+    }),
+  };
+}
+
+// Organizer view only (#550): items that claim the same time as another and whose conflict the
+// organizer has not accepted. A member's payload never passes through here, so the key is absent
+// for them, not empty.
+// The same-flight rule needs each item's booking type, and both callers (the served payload, which
+// only carries approved bookings, and the accept route, which reads raw rows) must decide alike, so
+// the type is looked up here for both. Only the type is read; it is never served.
+function conflictsFor(db, items) {
+  const types = new Map(db.prepare('SELECT id, type FROM bookings').all().map((row) => [row.id, row.type]));
+  return planConflicts.findPlanConflicts(items.map((item) => (
+    item.booking_id != null && types.has(item.booking_id) ? { ...item, booking: { type: types.get(item.booking_id) } } : item
+  )));
+}
+
+function unacceptedConflicts(db, items) {
+  const found = conflictsFor(db, items);
+  if (!found.size) return found;
+  const accepted = new Set(db.prepare('SELECT pair_key FROM plan_conflict_acks').all().map((row) => row.pair_key));
+  const out = new Map();
+  for (const [uid, others] of found) {
+    const open = others.filter((other) => !accepted.has(other.key));
+    if (open.length) out.set(uid, open);
+  }
+  return out;
+}
+
+function withPlanConflicts(db, payload) {
+  const found = unacceptedConflicts(db, payload.items);
+  if (!found.size) return payload;
+  return {
+    ...payload,
+    items: payload.items.map((item) => {
+      const others = found.get(item.item_uid);
+      return others ? { ...item, plan_conflicts: others.map(({ key, ...other }) => other) } : item;
     }),
   };
 }
@@ -1324,12 +1371,30 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
     // served, not the plan revision — is a new ETag, never a 304.
     let payload = serializeItinerary(db, rows, { config: hotelPlaces ? hotelPlaces.hydrateConfig(cfg()) : cfg(), hotelPlaces });
     // "The trip file changed this item" (#382) is the organizer's to see; a member's payload is byte-for-byte what it was.
-    if (isOrganizer && isOrganizer(req)) payload = withSeedFlags(db, payload);
+    if (isOrganizer && isOrganizer(req)) payload = withPlanConflicts(db, withSeedFlags(db, payload));
     const etag = etagForPayload(payload);
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('ETag', etag);
     if (req.headers['if-none-match'] === etag) return res.status(304).end();
     res.json(payload);
+  });
+
+  // "Keep both" (#550): the organizer accepts a same-time conflict between two plan items, e.g. a
+  // different family staying at that place. The pair is recomputed here; the client names only the
+  // other item, never the key. Organizer or agent only; not a revision.
+  app.post('/api/itinerary/items/:item_uid/keep-both', organizerOrAgentRequired, (req, res) => {
+    const withUid = req.body?.with;
+    if (typeof withUid !== 'string' || !withUid) return res.status(400).json({ error: 'with is required (the other item uid)' });
+    const rows = activeRows(db);
+    if (!rows) return res.status(404).json({ error: 'itinerary_not_ready' });
+    const uid = req.params.item_uid;
+    if (!rows.items.some((item) => item.item_uid === uid) || !rows.items.some((item) => item.item_uid === withUid)) {
+      return res.status(404).json({ error: 'not found' });
+    }
+    const conflict = (conflictsFor(db, rows.items).get(uid) || []).find((other) => other.item_uid === withUid);
+    if (!conflict) return res.status(409).json({ error: 'no_conflict' });
+    db.prepare('INSERT OR IGNORE INTO plan_conflict_acks (pair_key, accepted_by) VALUES (?, ?)').run(conflict.key, req.user.username);
+    res.json({ ok: true });
   });
 
   app.get('/api/itinerary/original', organizerOrAgentRequired, (_req, res) => {
