@@ -600,6 +600,31 @@ If unattended Mac companion testing is ever needed, move the bridges to a
 LaunchAgent (`launchctl bootstrap gui/$UID`) so they inherit the logged-in
 user's grant instead of the SSH session's.
 
+**Reminder for every staging test run (Dror, 2026-11-12): after a trip is
+built on the Mac, its companion is NOT wired until a person wires it from
+Terminal.** Until the LaunchAgent move above lands, a staging test that reaches
+"the companion uses its trip tools" stops there. On 2026-11-12 the test trip
+came out of provisioning with no `mcp_servers` in its profile's `config.yaml` at
+all (the health check refused the step, as designed), so the companion
+apologised that its tools were unavailable. `--restart-only` does not help in
+that state; the full wiring does, followed by a gateway restart:
+
+```bash
+cd ~/kinerary-deploy && REPO_ROOT=<staging checkout> ./setup-mcp.sh <profile> \
+  http://<trip LAN ip>:8080 https://<public host> --trip-dir ./trips/<slug> \
+  --vmid <vmid> --port <bridge port> \
+  && launchctl kickstart -k gui/$UID/ai.hermes.gateway-<profile>
+```
+
+The values are in `trips/<slug>/topology.yaml`; the profile is
+`trips.hermes_profile`. Two more things a Mac staging run needs that nothing
+starts for it: the companion-control MCP (`dist/companion-mcp.js` on `:4313`,
+the companion's `trip-control` connection — a container on the VM, absent from
+`bring-up.sh` on the Mac), and the relay and interview sidecar after the
+nightly redeploys staging. A lead session preparing a staging test checks all
+three and tells the tester before the run starts, not when the companion fails.
+The automatic fix is #541; when it lands, remove this paragraph.
+
 ### Restarting a live interview for a test run
 
 Testing the Trip Bot router end to end means starting the interview over
