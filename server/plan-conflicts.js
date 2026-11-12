@@ -63,19 +63,35 @@ function meets(a, b) {
 }
 
 /**
- * The identity of a conflict, for acceptance. Items are ordered by uid so the same pair is the same
- * key whichever is named first; the date and BOTH times are in it, so moving either item is a
- * different conflict and is raised on its own terms.
+ * "Keep both" (#550) is recorded on the plan items themselves, as `keep_both_with` on each of the
+ * two: a list of { uid, date, time, other_time }. `uid` is the other item; the date and both times
+ * are what the two items were at when the organizer accepted, so moving either one is a different
+ * conflict and is raised on its own terms. Nothing else needs to know the shape.
  */
-function conflictKey(a, b) {
-  const [x, y] = String(a.item_uid) < String(b.item_uid) ? [a, b] : [b, a];
-  return JSON.stringify([x.item_uid, y.item_uid, x.date, x.time, y.time]);
+function acknowledgements(item) {
+  let list = item.keep_both_with;
+  if (typeof list === 'string') { try { list = JSON.parse(list); } catch { list = null; } }
+  return Array.isArray(list) ? list.filter((e) => e && typeof e === 'object') : [];
 }
 
+/** The entry `item` carries when the organizer keeps it alongside `other` as they stand now. */
+function acknowledgement(item, other) {
+  return { uid: other.item_uid, date: item.date, time: item.time, other_time: other.time };
+}
+
+function acknowledged(item, other) {
+  return acknowledgements(item).some((e) => e.uid === other.item_uid && e.date === item.date
+    && e.time === item.time && e.other_time === other.time);
+}
+
+// The same wording, case and spacing aside: what makes two lines of one booking the same line.
+const wordingOf = (item) => (item.text_en || item.text_he || '').toLowerCase().replace(/\s+/g, ' ').trim();
+
 /**
- * Map of item_uid -> the other items it conflicts with ({ item_uid, text_he, text_en, time, key }).
+ * Map of item_uid -> the other items it conflicts with ({ item_uid, text_he, text_en, time, accepted }).
+ * `accepted` is true when either item carries the organizer's keep-both for this pair as it stands.
  * Items with no conflict are absent. `items` are itinerary items (item_uid, phase_id, date, time,
- * duration_minutes, booking_id, text_he, text_en).
+ * duration_minutes, booking_id, keep_both_with, text_he, text_en).
  */
 function findPlanConflicts(items) {
   const byDay = new Map();
@@ -95,15 +111,18 @@ function findPlanConflicts(items) {
       text_he: to.text_he ?? null,
       text_en: to.text_en ?? null,
       time: to.time,
-      key: conflictKey(from, to),
+      accepted: acknowledged(from, to) || acknowledged(to, from),
     });
   };
   for (const day of byDay.values()) {
     for (let i = 0; i < day.length; i++) {
       for (let j = i + 1; j < day.length; j++) {
         const a = day[i], b = day[j];
-        // One reservation is one claim on the time, not two (a booking's own legs).
-        if (a.item.booking_id != null && a.item.booking_id === b.item.booking_id) continue;
+        // One reservation's own line shown twice is one claim on the time, not two: the same
+        // booking AND the same wording. Two different activities that both link to one booking
+        // ("Opera" and "Dinner" on booking 1) are still two things at one time.
+        if (a.item.booking_id != null && a.item.booking_id === b.item.booking_id
+            && wordingOf(a.item) === wordingOf(b.item)) continue;
         if (sameFlight(a.item, b.item)) continue;
         if (!meets(a, b)) continue;
         note(a.item, b.item);
@@ -114,4 +133,4 @@ function findPlanConflicts(items) {
   return out;
 }
 
-module.exports = { findPlanConflicts, conflictKey, flightNumberOf };
+module.exports = { findPlanConflicts, acknowledgement, acknowledgements, flightNumberOf };

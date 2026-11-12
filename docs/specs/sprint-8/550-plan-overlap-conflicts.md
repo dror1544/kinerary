@@ -1,7 +1,7 @@
 # An activity added at the same time as another raises a conflict the organizer can accept
 
 Status: draft 2026-11-12 — behaviour decided by Dror in #550; approval at merge · Issue: #550 · Track: Sprint 8 staging-test fixes · Size: M · Tier: Normal
-Security path: yes (organizer-only visibility on `GET /api/itinerary/active`; one new `organizerOrAgentRequired` write route) · Migration: no (one additive `CREATE TABLE IF NOT EXISTS` in the trip site's own SQLite, the site's usual pattern; no data is changed) · Live-trip behaviour: yes (reaches a trip on redeploy)
+Security path: yes (organizer-only visibility on `GET /api/itinerary/active`; one new `organizerOrAgentRequired` write route) · Migration: no (one additive nullable column, `keep_both_with`, on `itinerary_plan_items` and `phase_plan_items` in the trip site's own SQLite, added by the site's usual guarded `ALTER TABLE ADD COLUMN`; no data is changed, no new table) · Live-trip behaviour: yes (reaches a trip on redeploy)
 
 ## Problem
 
@@ -28,8 +28,13 @@ What the code does today:
   `organizerOrAgentRequired` (`/api/itinerary/items/:item_uid/keep-seed`). A
   plan-conflict notice follows that pattern; it is not a second mechanism.
 - Itinerary revisions are immutable (`itinerary_plan_items` has update/delete
-  triggers), so an acceptance cannot live on an item row. It needs its own small
-  table.
+  triggers), but every item edit is a new revision that copies the item's fields
+  forward, and the Classic rows (`phase_plan_items`) are projected from and back into
+  it (`updateLegacyFromActive`, `rowsFromLegacyPlan`, `syncFromLegacy`). An acceptance
+  can therefore live on the item like any other field, as long as that projection
+  carries it. (An earlier draft of this spec used a separate table because the Classic
+  rewrite did not carry unknown fields; Dror decided against the extra table, see
+  Decisions 2.)
 
 Dror's decision (#550): "it should if same time, however this conflict need to be
 accepted if for example different family is sleeping on that place."
@@ -54,8 +59,10 @@ A conflict exists between two items when all of these hold:
    position, not a time, and never conflicts;
 3. their time ranges meet: equal start times, or one starts before the other ends,
    where an item's end is its start plus `duration_minutes` (no duration = a point);
-4. they are not the same booking (two items sharing a `booking_id`, e.g. a flight's
-   own legs, are one reservation, not two claims on the same time);
+4. they are not one booking's own line shown twice: a shared `booking_id` skips a pair
+   only when the wording is identical too (case and spacing aside), like rule 5. Two
+   different activities that both link to one booking ("Opera" and "Dinner" on booking
+   1) are two things at one time and still conflict;
 5. they are not the same flight. Two couples who book separately on one flight make
    two bookings and two plan items at one time, but the group is on one plane. The
    rule mirrors the plan board's identity rule (#549, `trip-web/src/same-flight.ts`),
@@ -94,8 +101,10 @@ on `GET /api/itinerary/active` covers every way an item gets on the plan.
   then a new conflict is raised. When the item moves to a time where nothing
   meets, no conflict is shown.
 - AC-8 Given two items that should not conflict — different day, different stop,
-  different times with no overlap, a rough time against anything, both with the same
-  `booking_id` — then no `plan_conflicts` appears.
+  different times with no overlap, a rough time against anything, or one booking's
+  own line twice (same `booking_id` AND identical wording) — then no `plan_conflicts`
+  appears. Given two different activities at one time that both link to the same
+  booking, a conflict is raised.
 - AC-9 Given the accept route with a pair that is not currently in conflict, then 409
   `no_conflict` and nothing is recorded; an unknown item uid is 404; a missing or
   non-string `with` is 400.
@@ -108,30 +117,52 @@ on `GET /api/itinerary/active` covers every way an item gets on the plan.
   `no_conflict` for that pair. Given two different flights at the same time, or a
   flight and an activity at the same time, a conflict is raised. A line with no
   flight number ("Museum 12") is never skipped.
+- AC-12 Given an accepted pair, when a Classic/agent write rewrites the plan (a
+  `POST /api/phases/:id/plan` of another item, a `PATCH` of one of the two, moving it
+  away and back), then the acceptance survives: the pair stays accepted while both
+  times stand. Neither the Classic plan read, a member's itinerary, `/api/today`, nor
+  the organizer's own itinerary payload ever contains the stored `keep_both_with`.
 
 ## Contracts
 
 - `server/plan-conflicts.js` (new, pure): `findPlanConflicts(items)` (items may carry
   `booking: { type }`, which `living-journey.js` fills from the bookings table for the
   served payload and the accept route alike so both decide the same) returns, per
-  item uid, the other items it conflicts with; `conflictKey(a, b)` is the identity of
-  an accepted pair.
+  item uid, the other items it conflicts with, each with `accepted` (true when either
+  item carries the organizer's keep-both for this pair as it stands);
+  `acknowledgement(item, other)` is the entry written on an item.
+- **Where acceptance is stored: on the plan items themselves.** Each of the two items
+  carries `keep_both_with`, a JSON list of `{ uid, date, time, other_time }`: `uid` is
+  the OTHER item's `item_uid`; `date`, `time` (this item's) and `other_time` are what
+  they were at when the organizer accepted. An entry matches only while all of those
+  still hold, so moving either item is a different conflict, raised on its own terms
+  (AC-7); one entry per other uid is kept (a later accept replaces it). Either item's
+  entry is enough. No table.
 - `server/living-journey.js`:
-  - table `plan_conflict_acks (pair_key TEXT PRIMARY KEY, accepted_by TEXT NOT NULL,
-    accepted_at TEXT DEFAULT (datetime('now')))`, created `IF NOT EXISTS` in
-    `schema()` like its siblings. **This is where acceptance is stored.** It is
-    outside the immutable revision tables on purpose, and outside `phase_plan_items`
-    so a Classic rewrite or a reconcile cannot clear it.
-  - `pair_key` = `JSON.stringify([uidA, uidB, date, timeA, timeB])` with the two
-    items ordered by uid, so the same pair at the same times is the same key whichever
-    item is named first, and a time change is a different key (AC-7).
-  - `withPlanConflicts(db, payload)` adds `plan_conflicts: [{ item_uid, text_he,
-    text_en, time }]` to an item, unaccepted conflicts only. Called from
-    `GET /api/itinerary/active` under the same `isOrganizer(req)` guard as
-    `withSeedFlags`; not called for a member, so the key is absent, not empty.
+  - column `keep_both_with TEXT` (nullable) on `itinerary_plan_items`, added by a
+    guarded `ALTER TABLE ADD COLUMN` in `schema()` (like `legacy_owns_config`), read and
+    written with the item's other fields (`getVersionRows`, `toWritableRows`,
+    `insertVersionRows`).
+  - **Carried through the Classic projection like the item's other fields**:
+    `rowsFromLegacyPlan` reads it from `phase_plan_items`, `updateLegacyFromActive`
+    writes it there (insert and `ON CONFLICT` update), and `syncFromLegacy`'s
+    comparison includes it (normalised, so a text and a parsed value compare equal and
+    no spurious revision is made). `server/server.js` adds the nullable
+    `keep_both_with` column to `phase_plan_items` in its existing column list.
+  - `keep_both_with` is an internal, never served: `serializeItinerary` and the
+    `/api/today` item decoration (`withHotelPlace`) drop it, and
+    `server/seed-reconcile.js` `PLAN_INTERNALS` lists it so the Classic plan read
+    (`shapePlanItem`) drops it. The organizer sees only the derived `plan_conflicts`.
+  - `withPlanConflicts(db, payload, rows)` adds `plan_conflicts: [{ item_uid, text_he,
+    text_en, time }]` to an item, unaccepted conflicts only, computed from the active
+    revision's raw rows. Called from `GET /api/itinerary/active` under the same
+    `isOrganizer(req)` guard as `withSeedFlags`; not called for a member, so the key is
+    absent, not empty.
   - `POST /api/itinerary/items/:item_uid/keep-both`, `organizerOrAgentRequired`,
-    body `{ with }`. Recomputes the conflict server-side; the client does not say
-    what the key is. Idempotent. Does not create an itinerary revision.
+    body `{ with }`. Recomputes the conflict server-side. If not already accepted it
+    writes the entry on both items as a normal item update (`cloneWith`: one new
+    itinerary revision, projected into the Classic rows). Idempotent: a repeat makes no
+    revision.
 - `trip-web/src/api.ts`: `itemSchema` gains `plan_conflicts` (optional);
   `keepBothPlanItems(itemUid, withUid)`.
 - `trip-web/src/App.tsx`: `PlanConflictNotice`, rendered under `SeedFlagNotice`,
@@ -145,7 +176,9 @@ on `GET /api/itinerary/active` covers every way an item gets on the plan.
   notice either; the organizer's Modern view is where the notice lives. The Classic
   routes still *feed* it (AC-2).
 - Un-accepting a conflict from the screen. Moving either item to another time and
-  back does not revive it (same key); there is no "reopen" button.
+  back to the accepted times does not revive it (the entry matches again); there is no
+  "reopen" button. Accepting makes a new itinerary revision, so an editor holding an
+  older `If-Match` revision gets the usual "itinerary changed, reload" once.
 - The "Overlapping events" quality issue in `recomputeQualityIssues` is left as it
   is. It is a separate, unread signal; unifying the two is a later decision.
 - Activity-type labels and de-duplicating the same flight on the plan (#545/#549).
@@ -169,6 +202,10 @@ Organizer-only visibility is the point of this change, so:
 - Fails safe: an `isOrganizer` that is not wired adds nothing.
 - The payload carries only item text and time that a member already sees on the
   plan; nothing from a booking (no PIN, notes or confirmation).
+- The stored `keep_both_with` names another item's uid and times, so it is itself
+  organizer-private: every reader of a raw plan item drops it (the itinerary payload,
+  `/api/today`, the Classic plan read), and AC-12's test asserts the string is absent
+  from each of those bodies for a member.
 - `GET /api/itinerary/active`'s ETag is over the served payload, so an organizer's
   and a member's responses never share one.
 
@@ -179,7 +216,10 @@ Write first (each fails before the change):
 - `tests/plan-conflicts.test.js`
   - unit: `findPlanConflicts` — equal start; overlapping with duration; touching
     ranges (end == next start) are not a conflict; rough time never conflicts; other
-    day / other stop; same `booking_id` (AC-8).
+    day / other stop; one booking's own line twice is skipped, two different
+    activities on one booking are not (AC-8); the acknowledgement entry matches only
+    while both times stand, on either item, as text or list, and garbage fails safe
+    to "raised".
   - AC-11 unit: two `SL 482` copies with different booking ids (also with case and
     spacing differences, the word "flight", and a flight booking with no arrow) raise
     nothing; two legs on one flight number, two different flights and a flight with an
@@ -191,7 +231,13 @@ Write first (each fails before the change):
     clears it and it stays cleared after a reload and after an unrelated edit (AC-5);
     a third item conflicts, the pair stays accepted (AC-6); moving to an overlap at
     different times re-raises, moving away clears (AC-7); 409 / 404 / 400 (AC-9);
-    the agent key can accept (AC-5).
+    the agent key can accept (AC-5); Opera and Dinner on one booking conflict, a
+    booking's own line twice does not (AC-8); after accepting, a Classic POST and
+    PATCH (a location edit, a move to 11:00 and back to 10:00) leave it accepted, and
+    no member/agent/organizer body contains `keep_both_with` (AC-12), and `/api/today`
+    for a member does not either (AC-12). Mutation-checked: dropping the carry-forward
+    from `rowsFromLegacyPlan` fails the Classic-write test, and dropping the strip from
+    `withHotelPlace` fails the `/api/today` test.
 - `trip-web/src/plan-conflict.test.tsx` (AC-10): the notice names the other item
   and posts to the route with `{ with }`; nothing renders without conflicts; the
   Journey renders it for an organizer and not for a member.
@@ -209,15 +255,26 @@ is needed (organizer-only visibility on an authenticated route).
 ## Decisions
 
 1. **A notice with an accept button, not a block** (Dror, #550).
-2. **Acceptance in its own table keyed by the pair and their times**, not on the
-   item rows (revisions are immutable) and not in `trip_quality_issues` (its
-   fingerprint carries only the later item, so an acceptance would survive a move
-   to a different conflict).
+2. **Acceptance lives on the plan items, keyed by the other item's uid** (Dror,
+   2026-11-12: "Each item has its own ID… it seems to me like unnecessary
+   complication"). A first draft used a new table `plan_conflict_acks`; it was dropped
+   because it was a second place to keep in step with the plan, for something an item
+   can carry. Its reason, that a Classic rewrite (`syncFromLegacy` /
+   `rowsFromLegacyPlan`) would not carry an unknown field, is fixed at the source
+   instead: the projection now carries `keep_both_with` like every other item field
+   (AC-12). The entry stores the date and both times so that moving either item is
+   still a new conflict. Also rejected: `trip_quality_issues` 'ignored' (its
+   fingerprint carries only the later item, so an acceptance would survive a move to a
+   different conflict).
 3. **Exact times only; rough times never conflict**, so two items both marked
    "morning" are not flagged.
 4. **The same-flight skip is a server-side copy of #549's rule, not an import** from
    trip-web (coordinator, 2026-11-12). Rejected: relying on #549's board collapse, which
    is display-only and would still leave the conflict in the payload.
+5. **A shared booking skips a pair only with identical wording** (boundary review,
+   2026-11-12): "any two items on one booking" was too broad, because "Opera" and
+   "Dinner" both linked to booking 1 at 18:00 raised nothing. Same rule as the flight
+   skip: only a booking's own line shown twice is one claim on the time.
 
 ## Open questions
 

@@ -42,6 +42,21 @@ function writeJson(value) {
   return value == null ? null : JSON.stringify(value);
 }
 
+// The stored form of an item's keep_both_with (#550): JSON text, or null when there is nothing.
+// Accepts the text or the parsed list, so every path (legacy rows, revision rows, a write) compares
+// and stores the same thing.
+function keepBothText(value) {
+  const list = typeof value === 'string' ? readJson(value, null) : value;
+  return Array.isArray(list) && list.length ? JSON.stringify(list) : null;
+}
+
+// What no reader of a plan item is ever served: the organizer's accepted conflicts (#550).
+function publicItem(item) {
+  if (!item || !Object.hasOwn(item, 'keep_both_with')) return item;
+  const { keep_both_with, ...rest } = item;
+  return rest;
+}
+
 function stripTags(html) {
   return String(html || '')
     .replace(/<[^>]*>/g, '')
@@ -226,15 +241,6 @@ function schema(db) {
       updated_at TEXT DEFAULT (datetime('now'))
     );
 
-    -- #550: a plan-time conflict the organizer chose to keep ("keep both"). The key is the pair of
-    -- items and their times (server/plan-conflicts.js), so moving either is a new conflict. Not on
-    -- the item rows: itinerary revisions are immutable, and a Classic rewrite must not clear it.
-    CREATE TABLE IF NOT EXISTS plan_conflict_acks (
-      pair_key TEXT PRIMARY KEY,
-      accepted_by TEXT NOT NULL,
-      accepted_at TEXT DEFAULT (datetime('now'))
-    );
-
     CREATE TABLE IF NOT EXISTS trip_daily_messages (
       date TEXT PRIMARY KEY,
       he TEXT NOT NULL,
@@ -271,6 +277,9 @@ function schema(db) {
   `);
   // Set once importPlanOnce() has made phase_plan_* the plan; never cleared.
   try { db.exec('ALTER TABLE trip_itinerary_state ADD COLUMN legacy_owns_config INTEGER NOT NULL DEFAULT 0'); } catch {}
+  // #550: the organizer's "keep both" for same-time plan items, on the item like its other fields
+  // (JSON [{uid,date,time,other_time}], see server/plan-conflicts.js). Additive, nullable.
+  try { db.exec('ALTER TABLE itinerary_plan_items ADD COLUMN keep_both_with TEXT'); } catch {}
   db.prepare('INSERT OR IGNORE INTO trip_ui_settings (id, design_variant) VALUES (1, ?)').run(normalizeUiVariant(process.env.TRIP_DESIGN_VARIANT));
   db.prepare('INSERT OR IGNORE INTO trip_settings (id, timezone) VALUES (1, NULL)').run();
 }
@@ -523,6 +532,7 @@ function rowsFromLegacyPlan(db) {
     source_ref: row.itinerary_item_uid ? `modern:${row.itinerary_item_uid}` : row.config_ref || `legacy:${row.id}`,
     created_by: row.created_by || 'legacy',
     extra_links: row.extra_links || null,
+    keep_both_with: keepBothText(row.keep_both_with),
   })).filter((row) => row.text_he);
   const hasDay = new Set(days.map((day) => `${day.phase_id}|${day.date}`));
   for (const item of items) {
@@ -546,7 +556,7 @@ function insertVersionRows(db, versionId, rows) {
     'INSERT INTO itinerary_plan_days (revision_id, phase_id, date, label_he, label_en, lodging_context, pickup_context, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
   );
   const insertItem = db.prepare(
-    'INSERT INTO itinerary_plan_items (revision_id,item_uid,phase_id,date,time,time_sort,item_type,text_he,text_en,location_url,waze_url,website_url,ticket_url,booking_id,confirmation_state,duration_minutes,sort_order,source_ref,created_by,extra_links) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
+    'INSERT INTO itinerary_plan_items (revision_id,item_uid,phase_id,date,time,time_sort,item_type,text_he,text_en,location_url,waze_url,website_url,ticket_url,booking_id,confirmation_state,duration_minutes,sort_order,source_ref,created_by,extra_links,keep_both_with) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
   );
   for (const day of rows.days) {
     insertDay.run(versionId, day.phase_id, day.date, day.label_he, day.label_en, day.lodging_context, day.pickup_context, day.sort_order || 0);
@@ -556,7 +566,7 @@ function insertVersionRows(db, versionId, rows) {
       versionId, item.item_uid, item.phase_id, item.date, item.time, item.time_sort, normalizeType(item.item_type),
       item.text_he, item.text_en, item.location_url, item.waze_url, item.website_url, item.ticket_url,
       item.booking_id, normalizeConfirmation(item.confirmation_state), item.duration_minutes, item.sort_order || 0,
-      item.source_ref, item.created_by || 'system', item.extra_links || null
+      item.source_ref, item.created_by || 'system', item.extra_links || null, keepBothText(item.keep_both_with)
     );
   }
 }
@@ -620,6 +630,7 @@ function getVersionRows(db, revisionIdValue) {
   ).all(revisionIdValue).map((item) => ({
     ...item,
     extra_links: readJson(item.extra_links, []),
+    keep_both_with: readJson(item.keep_both_with, []),
   }));
   return { version, days, items };
 }
@@ -664,7 +675,7 @@ function serializeItinerary(db, rows, { includeOriginal = false, config = null, 
     // it was. Lodging is computed from the trip as it is now (withServedLodging).
     days: includeOriginal ? rows.days : rows.days.map((day) => publicDayContext(config ? withServedLodging(day, config.phases) : day)),
     items: rows.items.map((item) => ({
-      ...item,
+      ...publicItem(item),
       booking: item.booking_id ? bookingsById.get(item.booking_id) || null : null,
     })),
   };
@@ -712,26 +723,19 @@ function conflictsFor(db, items) {
   )));
 }
 
-function unacceptedConflicts(db, items) {
-  const found = conflictsFor(db, items);
-  if (!found.size) return found;
-  const accepted = new Set(db.prepare('SELECT pair_key FROM plan_conflict_acks').all().map((row) => row.pair_key));
-  const out = new Map();
-  for (const [uid, others] of found) {
-    const open = others.filter((other) => !accepted.has(other.key));
-    if (open.length) out.set(uid, open);
+// `rows` are the active revision's raw rows (they carry keep_both_with; the served payload does not).
+function withPlanConflicts(db, payload, rows) {
+  const open = new Map();
+  for (const [uid, others] of conflictsFor(db, rows.items)) {
+    const unaccepted = others.filter((other) => !other.accepted);
+    if (unaccepted.length) open.set(uid, unaccepted);
   }
-  return out;
-}
-
-function withPlanConflicts(db, payload) {
-  const found = unacceptedConflicts(db, payload.items);
-  if (!found.size) return payload;
+  if (!open.size) return payload;
   return {
     ...payload,
     items: payload.items.map((item) => {
-      const others = found.get(item.item_uid);
-      return others ? { ...item, plan_conflicts: others.map(({ key, ...other }) => other) } : item;
+      const others = open.get(item.item_uid);
+      return others ? { ...item, plan_conflicts: others.map(({ accepted, ...other }) => other) } : item;
     }),
   };
 }
@@ -822,7 +826,7 @@ function toWritableRows(rows) {
       lodging_context: writeJson(day.lodging_context),
       pickup_context: writeJson(day.pickup_context),
     })),
-    items: rows.items.map((item) => ({ ...item, extra_links: writeJson(item.extra_links) })),
+    items: rows.items.map((item) => ({ ...item, extra_links: writeJson(item.extra_links), keep_both_with: keepBothText(item.keep_both_with) })),
   };
 }
 
@@ -873,14 +877,14 @@ function updateLegacyFromActive(db) {
       dayInsert.run(day.phase_id, day.date, day.label_he, day.label_en, `${day.phase_id}\u001f${day.date}`);
     }
     const itemInsert = db.prepare(
-      `INSERT INTO phase_plan_items (phase_id,date,time,time_sort,text_he,text_en,location_url,waze_url,website_url,ticket_url,booking_id,status,sort_order,created_by,enrichment_status,config_ref,itinerary_item_uid,extra_links)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      `INSERT INTO phase_plan_items (phase_id,date,time,time_sort,text_he,text_en,location_url,waze_url,website_url,ticket_url,booking_id,status,sort_order,created_by,enrichment_status,config_ref,itinerary_item_uid,extra_links,keep_both_with)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT(itinerary_item_uid) WHERE itinerary_item_uid IS NOT NULL DO UPDATE SET
          phase_id=excluded.phase_id, date=excluded.date, time=excluded.time, time_sort=excluded.time_sort,
          text_he=excluded.text_he, text_en=excluded.text_en, location_url=excluded.location_url,
          waze_url=excluded.waze_url, website_url=excluded.website_url, ticket_url=excluded.ticket_url,
          booking_id=excluded.booking_id, status=excluded.status, sort_order=excluded.sort_order,
-         extra_links=excluded.extra_links`
+         extra_links=excluded.extra_links, keep_both_with=excluded.keep_both_with`
     );
     for (const item of rows.items) {
       const configRef = typeof item.source_ref === 'string' && CONFIG_REF_RE.test(item.source_ref) ? item.source_ref : null;
@@ -888,7 +892,7 @@ function updateLegacyFromActive(db) {
         item.phase_id, item.date, item.time, item.time_sort, item.text_he, item.text_en,
         item.location_url, item.waze_url, item.website_url, item.ticket_url, item.booking_id,
         item.confirmation_state === 'verified' ? 'confirmed' : 'needs_review',
-        item.sort_order || 0, item.created_by || 'modern', 'none', configRef, item.item_uid, writeJson(item.extra_links)
+        item.sort_order || 0, item.created_by || 'modern', 'none', configRef, item.item_uid, writeJson(item.extra_links), keepBothText(item.keep_both_with)
       );
     }
     const dayKeys = rows.days.map((day) => `${day.phase_id}\u001f${day.date}`);
@@ -958,8 +962,8 @@ function syncFromLegacy(db, raw, author = 'legacy-api') {
     days: value.days.map(({ phase_id, date, label_he, label_en, lodging_context, pickup_context, sort_order }) => ({
       phase_id, date, label_he, label_en, lodging_context: writeJson(lodging_context), pickup_context: writeJson(pickup_context), sort_order,
     })),
-    items: value.items.map(({ item_uid, phase_id, date, time, time_sort, item_type, text_he, text_en, location_url, waze_url, website_url, ticket_url, booking_id, confirmation_state, duration_minutes, sort_order, source_ref, created_by, extra_links }) => ({
-      item_uid, phase_id, date, time, time_sort, item_type, text_he, text_en, location_url, waze_url, website_url, ticket_url, booking_id, confirmation_state, duration_minutes, sort_order, source_ref, created_by, extra_links: writeJson(extra_links),
+    items: value.items.map(({ item_uid, phase_id, date, time, time_sort, item_type, text_he, text_en, location_url, waze_url, website_url, ticket_url, booking_id, confirmation_state, duration_minutes, sort_order, source_ref, created_by, extra_links, keep_both_with }) => ({
+      item_uid, phase_id, date, time, time_sort, item_type, text_he, text_en, location_url, waze_url, website_url, ticket_url, booking_id, confirmation_state, duration_minutes, sort_order, source_ref, created_by, extra_links: writeJson(extra_links), keep_both_with: keepBothText(keep_both_with),
     })),
   });
   const nextDigest = digest(JSON.stringify(comparable(rows)));
@@ -1184,7 +1188,8 @@ async function weatherObservation(db, fetchImpl, query) {
 
 // An item with its hotel's links, for the routes that serve raw plan rows
 // (/api/today): the same decoration the active itinerary applies.
-function withHotelPlace(db, item, hotelPlaces) {
+function withHotelPlace(db, rawItem, hotelPlaces) {
+  const item = publicItem(rawItem);
   if (!hotelPlaces || !item?.booking_id) return item;
   const booking = db.prepare("SELECT id, type, name, phase, location_url FROM bookings WHERE id = ? AND COALESCE(review_status, 'approved') = 'approved'").get(item.booking_id);
   return hotelPlaces.decorateItem(item, booking);
@@ -1371,7 +1376,7 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
     // served, not the plan revision — is a new ETag, never a 304.
     let payload = serializeItinerary(db, rows, { config: hotelPlaces ? hotelPlaces.hydrateConfig(cfg()) : cfg(), hotelPlaces });
     // "The trip file changed this item" (#382) is the organizer's to see; a member's payload is byte-for-byte what it was.
-    if (isOrganizer && isOrganizer(req)) payload = withPlanConflicts(db, withSeedFlags(db, payload));
+    if (isOrganizer && isOrganizer(req)) payload = withPlanConflicts(db, withSeedFlags(db, payload), rows);
     const etag = etagForPayload(payload);
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('ETag', etag);
@@ -1393,7 +1398,22 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
     }
     const conflict = (conflictsFor(db, rows.items).get(uid) || []).find((other) => other.item_uid === withUid);
     if (!conflict) return res.status(409).json({ error: 'no_conflict' });
-    db.prepare('INSERT OR IGNORE INTO plan_conflict_acks (pair_key, accepted_by) VALUES (?, ?)').run(conflict.key, req.user.username);
+    if (!conflict.accepted) {
+      // A normal item update: the acceptance is written on BOTH items (keyed by the other's uid, with
+      // the date and times it was accepted at) as a new revision, then projected into the Classic
+      // rows, whose own rewrites carry it forward like any other item field.
+      const mine = rows.items.find((item) => item.item_uid === uid);
+      const theirs = rows.items.find((item) => item.item_uid === withUid);
+      cloneWith(db, req.user.username, 'Organizer kept two same-time plan items', (next) => {
+        next.items = next.items.map((item) => {
+          const other = item.item_uid === uid ? theirs : item.item_uid === withUid ? mine : null;
+          if (!other) return item;
+          const kept = planConflicts.acknowledgements(item).filter((entry) => entry.uid !== other.item_uid);
+          return { ...item, keep_both_with: keepBothText([...kept, planConflicts.acknowledgement(item, other)]) };
+        });
+      });
+      updateLegacyFromActive(db);
+    }
     res.json({ ok: true });
   });
 

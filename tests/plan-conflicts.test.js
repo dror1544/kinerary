@@ -16,7 +16,7 @@ const DAY = '2027-03-12';
 const OTHER_DAY = '2027-03-13';
 
 describe('findPlanConflicts (the rule)', () => {
-  const { findPlanConflicts, conflictKey } = require('../server/plan-conflicts.js');
+  const { findPlanConflicts, acknowledgement } = require('../server/plan-conflicts.js');
   const item = (uid, time, over = {}) => ({ item_uid: uid, phase_id: PHASE, date: DAY, time, time_sort: null, duration_minutes: null, booking_id: null, text_he: uid, text_en: uid, ...over });
   const pairs = (items) => [...findPlanConflicts(items).entries()].map(([uid, others]) => [uid, others.map(o => o.item_uid)]);
 
@@ -33,7 +33,9 @@ describe('findPlanConflicts (the rule)', () => {
     assert.equal(findPlanConflicts([item('a', 'morning'), item('b', '09:00')]).size, 0);
     assert.equal(findPlanConflicts([item('a', '10:00'), item('b', '10:00', { date: OTHER_DAY })]).size, 0);
     assert.equal(findPlanConflicts([item('a', '10:00'), item('b', '10:00', { phase_id: 'colorado' })]).size, 0);
-    assert.equal(findPlanConflicts([item('a', '10:00', { booking_id: 7 }), item('b', '10:00', { booking_id: 7 })]).size, 0, 'one reservation');
+    const line = { text_en: 'Opera Garnier', text_he: 'אופרה', booking_id: 7 };
+    assert.equal(findPlanConflicts([item('a', '10:00', line), item('b', '10:00', { ...line, text_en: ' opera  GARNIER' })]).size, 0, 'one booking\'s own line, shown twice');
+    assert.equal(findPlanConflicts([item('a', '18:00', { booking_id: 1, text_en: 'Opera', text_he: 'Opera' }), item('b', '18:00', { booking_id: 1, text_en: 'Dinner', text_he: 'Dinner' })]).size, 2, 'two different activities that both link to one booking are still two things at one time');
     assert.equal(findPlanConflicts([item('a', null), item('b', null)]).size, 0);
     assert.equal(findPlanConflicts([item('a', '10:00', { date: null }), item('b', '10:00', { date: null })]).size, 0, 'undated');
   });
@@ -58,10 +60,18 @@ describe('findPlanConflicts (the rule)', () => {
     const bare = (uid) => item(uid, '08:00', { text_en: 'Harbortown → Gatecity', text_he: 'Harbortown → Gatecity', booking_id: uid === 'a' ? 1 : 2 });
     assert.equal(findPlanConflicts([bare('a'), bare('b')]).size, 2, 'an unnumbered line is never grouped');
   });
-  test('the key is the same whichever item is named first, and changes when a time changes', () => {
+  test('an acceptance on either item holds only while both times stand; it is keyed by the other item\'s uid', () => {
     const a = item('a', '10:00'), b = item('b', '10:00');
-    assert.equal(conflictKey(a, b), conflictKey(b, a));
-    assert.notEqual(conflictKey(a, b), conflictKey(a, item('b', '10:30')));
+    const accepted = (over) => findPlanConflicts([{ ...a, ...over }, b]).get('a')[0].accepted;
+    assert.equal(accepted({}), false, 'nothing recorded yet');
+    assert.deepEqual(acknowledgement(a, b), { uid: 'b', date: DAY, time: '10:00', other_time: '10:00' });
+    assert.equal(accepted({ keep_both_with: [acknowledgement(a, b)] }), true, 'recorded on item a');
+    assert.equal(accepted({ keep_both_with: JSON.stringify([acknowledgement(a, b)]) }), true, 'stored as JSON text');
+    assert.equal(findPlanConflicts([a, { ...b, keep_both_with: [acknowledgement(b, a)] }]).get('a')[0].accepted, true, 'or on item b');
+    assert.equal(accepted({ keep_both_with: [{ ...acknowledgement(a, b), uid: 'c' }] }), false, 'for another item');
+    assert.equal(accepted({ keep_both_with: [{ ...acknowledgement(a, b), other_time: '10:30' }] }), false, 'the other item has moved since');
+    assert.equal(accepted({ keep_both_with: [{ ...acknowledgement(a, b), time: '09:30' }] }), false, 'this item has moved since');
+    assert.equal(accepted({ keep_both_with: 'not json' }), false, 'garbage fails safe: raised');
   });
 });
 
@@ -159,6 +169,46 @@ describe('plan conflicts over HTTP (#550)', () => {
     assert.equal(byText(await active(alice), 'Seine cruise').plan_conflicts, undefined);
   });
 
+  test('AC-12: the acceptance is on the items, and a Classic/agent write to the plan carries it forward', async () => {
+    const classic = async (path, method, body) => api(path, { method, apiKey: AGENT_KEY, body });
+    const plan = async () => (await (await api(`/api/phases/${PHASE}/plan`, { apiKey: AGENT_KEY })).json());
+    const louvre = (await plan()).find(r => r.text_en === 'Louvre visit');
+    // A Classic POST (an unrelated item) and a Classic PATCH of one accepted item both rewrite the
+    // itinerary from the Classic rows (syncFromLegacy).
+    assert.equal((await classic(`/api/phases/${PHASE}/plan`, 'POST', { date: OTHER_DAY, time: '20:00', text_he: 'Late dinner', text_en: 'Late dinner' })).status, 201);
+    assert.equal((await classic(`/api/phases/${PHASE}/plan/${louvre.id}`, 'PATCH', { location_url: 'https://example.com/louvre' })).status, 200);
+    let organizer = await active(alice);
+    assert.equal(byText(organizer, 'Louvre visit').location_url, 'https://example.com/louvre', 'the Classic write did land');
+    assert.equal(byText(organizer, 'Louvre visit').plan_conflicts, undefined, 'and the accepted pair is still accepted');
+    assert.equal(byText(organizer, 'Pottery class (kids)').plan_conflicts, undefined);
+    // Moving it by a Classic PATCH is a different conflict situation: nothing meets at 11:00, and the
+    // pair at 10:00 again is the one the organizer accepted.
+    assert.equal((await classic(`/api/phases/${PHASE}/plan/${louvre.id}`, 'PATCH', { time: '11:00' })).status, 200);
+    assert.equal(byText(await active(alice), 'Louvre visit').plan_conflicts, undefined);
+    assert.equal((await classic(`/api/phases/${PHASE}/plan/${louvre.id}`, 'PATCH', { time: '10:00' })).status, 200);
+    assert.equal(byText(await active(alice), 'Louvre visit').plan_conflicts, undefined, 'back at the accepted times: still accepted');
+    // The agent key reads the Classic plan; neither it nor a member ever gets the stored acceptance.
+    const bodies = [
+      await (await api(`/api/phases/${PHASE}/plan`, { apiKey: AGENT_KEY })).text(),
+      await (await api(`/api/phases/${PHASE}/plan`, { token: bob })).text(),
+      await (await api('/api/itinerary/active', { token: bob })).text(),
+      await (await api('/api/itinerary/active', { token: alice })).text(),
+    ];
+    for (const body of bodies) assert.ok(!body.includes('keep_both_with'), 'the stored acceptance is an internal');
+  });
+
+  test('AC-12: the stored acceptance never reaches a member through /api/today either', async () => {
+    const today = (await (await api('/api/today', { token: bob })).json()).today;
+    assert.match(today, /^\d{4}-\d{2}-\d{2}$/);
+    const a = await api('/api/itinerary/items', { method: 'POST', token: alice, body: { phase_id: PHASE, date: today, time: '12:00', text_he: 'Today A', text_en: 'Today A' } });
+    const b = await api('/api/itinerary/items', { method: 'POST', token: alice, body: { phase_id: PHASE, date: today, time: '12:00', text_he: 'Today B', text_en: 'Today B' } });
+    const [uidA, uidB] = [(await a.json()).item_uid, (await b.json()).item_uid];
+    assert.equal((await keepBoth(uidA, uidB)).status, 200);
+    const text = await (await api('/api/today', { token: bob })).text();
+    assert.ok(text.includes('Today A'), 'sanity: the day\'s events are served');
+    assert.ok(!text.includes('keep_both_with') && !text.includes('plan_conflicts'));
+  });
+
   test('AC-6: a third item at the same time conflicts with each; the accepted pair stays accepted', async () => {
     const third = await addModern('Walking tour', '10:00');
     const organizer = await active(alice);
@@ -199,6 +249,17 @@ describe('plan conflicts over HTTP (#550)', () => {
     const [c1, c2] = organizer.items.filter(i => i.text_en === 'SL 482 Harbortown → Gatecity');
     assert.equal((await keepBoth(c1.item_uid, c2.item_uid)).status, 409);
     assert.equal((await keepBoth(c1.item_uid, ly.item_uid)).status, 200);
+  });
+
+  test('AC-8: two different activities linked to one booking are still a conflict; one booking line twice is not', async () => {
+    await addModern('Opera', '18:00', { booking_id: 1 });
+    await addModern('Dinner', '18:00', { booking_id: 1 });
+    await addModern('Gala', '19:30', { booking_id: 2 });
+    await addModern('gala ', '19:30', { booking_id: 2 });
+    const organizer = await active(alice);
+    assert.deepEqual(byText(organizer, 'Opera').plan_conflicts.map(c => c.text_en), ['Dinner']);
+    assert.deepEqual(byText(organizer, 'Dinner').plan_conflicts.map(c => c.text_en), ['Opera']);
+    assert.ok(!organizer.items.filter(i => /^gala/i.test(i.text_en)).some(i => i.plan_conflicts), 'the same booking line twice');
   });
 
   test('AC-8: nothing is raised for different days or rough times', async () => {

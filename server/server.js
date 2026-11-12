@@ -545,6 +545,9 @@ for (const [col, decl] of [
   ['seed_pending',      'TEXT'],
   ['seed_removed',      'INTEGER NOT NULL DEFAULT 0'],
   ['seed_ack',          'TEXT'],
+  // #550 — the organizer's "keep both" for same-time plan items: [{uid,date,time,other_time}], carried
+  // through the Classic <-> itinerary projection like every other item field (never served).
+  ['keep_both_with',    'TEXT'],
 ]) {
   try { db.exec(`ALTER TABLE phase_plan_items ADD COLUMN ${col} ${decl}`); } catch {}
 }

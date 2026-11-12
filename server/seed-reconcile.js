@@ -82,7 +82,8 @@ function flagView(pendingJson) {
 }
 
 const SEED_INTERNALS = ['seed_hash', 'seed_pending', 'seed_removed', 'seed_ack', 'retired_at'];
-const PLAN_INTERNALS = ['config_hash', 'seed_pending', 'seed_removed', 'seed_ack'];
+// keep_both_with (#550) is the organizer's accepted plan-time conflicts: never served on a plan row.
+const PLAN_INTERNALS = ['config_hash', 'seed_pending', 'seed_removed', 'seed_ack', 'keep_both_with'];
 
 // A row as a client may see it: internals never, flags for organizers only.
 function shapeSeedRow(row, internals, organizer) {
