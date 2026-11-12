@@ -155,36 +155,22 @@ class NotesReadIsBounded(Harness):
         else:
             self.env["KINERARY_NOTES_READ_TIMEOUT_SECONDS"] = str(limit)
         payload = {"tool_name": "Bash", "tool_input": {"command": self.DEPLOY}}
-        before = self.tick_slowdown()
         t0 = time.monotonic()
         out = subprocess.run(["bash", "scripts/claude-hooks/pretooluse-bash.sh"], cwd=self.root, env=self.env,
                              input=json.dumps(payload), capture_output=True, text=True, timeout=wait).stdout.strip()
         took = time.monotonic() - t0
-        self.slowdown = max(before, self.tick_slowdown())
         return json.loads(out)["hookSpecificOutput"], took
 
-    @staticmethod
-    def tick_slowdown() -> float:
-        """How much slower than idle this machine runs the hook's own wait loop right now.
+    SLACK = 3.0  # the hook's own work (git, grep, jq) plus one stretched poll tick, on a loaded host
 
-        The hook counts its limit in ticks of `sleep 0.1`, not in clock time (macOS has no
-        `timeout`, so the loop is portable bash). On an idle machine ten ticks take one
-        second; under the nightly's parallel suites a tick costs several times that (7.6s
-        observed for a 3s limit, 24s for 10s on 2026-11-10) because every `sleep` is a fork
-        that has to be scheduled. Timing ten ticks the same way, right beside the hook run,
-        measures that stretch, so the upper bound below stays "the limit, as this machine
-        is running it" instead of a wall-clock guess that fails whenever the host is busy.
-        """
-        import time
-        t0 = time.monotonic()
-        subprocess.run(["bash", "-c", 'n=0; while [ "$n" -lt 10 ]; do sleep 0.1; n=$((n+1)); done'], check=True)
-        return max(1.0, time.monotonic() - t0)
+    def bound(self, limit: float) -> float:
+        """The latest a hook with this limit may answer: the limit plus a small constant.
 
-    def bound(self, limit: int) -> float:
-        """The latest a hook with this limit may answer: its limit at the measured tick rate,
-        plus the 2s the hook's own work (git, grep, jq) was always allowed. An unbounded read
-        still fails this: it hits timed_hook's own 25s wait and raises."""
-        return limit * self.slowdown + 2
+        The wait is a wall-clock deadline, not a count of `sleep 0.1` ticks, so a busy machine
+        cannot stretch it (the tick-counted loop ran a 10s limit for 24s and a 3s limit for
+        7.6s on 2026-11-10, and #539 scaled this bound by a measured tick rate to cope). An
+        unbounded read still fails this: it hits timed_hook's own 25s wait and raises."""
+        return limit + self.SLACK
 
     def test_a_hanging_vault_still_asks_within_the_limit_and_says_so(self):
         self.hang()
@@ -201,7 +187,7 @@ class NotesReadIsBounded(Harness):
         self.assertIn("limit 3s", d["permissionDecisionReason"])
         # The person can only retry with a longer wait if the prompt names the knob.
         self.assertIn("KINERARY_NOTES_READ_TIMEOUT_SECONDS", d["permissionDecisionReason"])
-        self.assertGreaterEqual(took, 2.5)
+        self.assertGreaterEqual(took, 2.0)  # whole-second clock: between limit-1 and limit
         self.assertLess(took, self.bound(3))
 
     def test_no_reader_is_left_behind_when_the_limit_passes(self):
@@ -245,12 +231,93 @@ class NotesReadIsBounded(Harness):
 
     def test_a_limit_above_ten_waits_ten_seconds_not_longer(self):
         self.hang()
-        # `wait` is only the harness's hang guard (a 10s limit stretched 2.4x ran 24s on 2026-11-10);
-        # the assertion is bound().
+        # `wait` is only the harness's hang guard; the assertion is bound().
         d, took = self.timed_hook(limit=99, wait=60)
         self.assertIn("limit 10s", d["permissionDecisionReason"])
-        self.assertGreaterEqual(took, 9.5)
+        self.assertGreaterEqual(took, 9.0)  # whole-second clock: between limit-1 and limit
         self.assertLess(took, self.bound(10))
+
+    # --- the wall-clock deadline and the one budget for the whole hook (2026-11-11) ---
+
+    @staticmethod
+    def busy(n):
+        """n CPU-spinning processes, as the nightly's parallel suites are; the caller kills them."""
+        return [subprocess.Popen(["bash", "-c", "while :; do :; done"]) for _ in range(n)]
+
+    def strays_after(self):
+        import time
+        for _ in range(20):
+            if not self.strays():
+                break
+            time.sleep(0.1)
+        return self.strays()
+
+    def test_the_limit_holds_when_every_tick_is_stretched(self):
+        """Deterministic reproduction of 2026-11-10: a `sleep 0.1` that takes 0.5s (what a loaded
+        host does to each fork) made the tick-counted loop run a 3s limit for 15s. A clock
+        deadline ignores how long a tick takes. (A plain CPU-load run does not stretch ticks
+        enough on a fast Mac to tell the two apart, so the stretch is injected.)"""
+        shim = Path(self.tmp.name) / "slowbin"
+        shim.mkdir()
+        (shim / "sleep").write_text("#!/bin/sh\nexec /bin/sleep 0.5\n")
+        (shim / "sleep").chmod(0o755)
+        self.env["PATH"] = "%s:%s" % (shim, self.env["PATH"])
+        self.hang()
+        d, took = self.timed_hook(limit=3, wait=40)
+        self.assertEqual(d["permissionDecision"], "ask")
+        self.assertIn(self.SENTENCE, d["permissionDecisionReason"])
+        self.assertLess(took, self.bound(3))
+        self.assertGreaterEqual(took, 2.0)
+
+    def test_the_limit_holds_on_a_loaded_machine(self):
+        """A fixed bound with CPU-spinning processes alongside, as the nightly runs. On an idle
+        or fast host this passes against the tick-counted loop too (see the test above for the
+        discriminating one); it guards the real-load shape."""
+        self.hang()
+        spinners = self.busy((os.cpu_count() or 4) * 8)
+        try:
+            d, took = self.timed_hook(limit=3, wait=40)
+        finally:
+            for p in spinners:
+                p.kill()
+                p.wait()
+        self.assertEqual(d["permissionDecision"], "ask")
+        self.assertIn(self.SENTENCE, d["permissionDecisionReason"])
+        self.assertLess(took, self.bound(3))
+        # Not wildly less than asked either: the clock is whole seconds, so up to one under.
+        self.assertGreaterEqual(took, 2.0)
+
+    def test_a_mostly_spent_budget_shortens_the_vault_wait(self):
+        """KINERARY_HOOK_TEST_ELAPSED_SECONDS (a seam production never sets) makes the hook behave
+        as if that much of its 15s budget had already gone. 14 spent leaves ~1s for a 10s limit."""
+        self.hang()
+        self.env["KINERARY_HOOK_TEST_ELAPSED_SECONDS"] = "14"
+        d, took = self.timed_hook(limit=10, wait=40)
+        self.assertEqual(d["permissionDecision"], "ask")
+        self.assertIn(self.SENTENCE, d["permissionDecisionReason"])
+        self.assertIn("not the same as nothing having been assessed", d["permissionDecisionReason"])
+        self.assertLess(took, self.bound(1))  # the remaining ~1s, not the configured 10
+        self.assertEqual(self.strays_after(), [])
+
+    def test_a_spent_budget_skips_the_vault_read_and_still_asks(self):
+        self.hang()
+        self.env["KINERARY_HOOK_TEST_ELAPSED_SECONDS"] = "15"
+        d, took = self.timed_hook(limit=10, wait=40)
+        self.assertEqual(d["permissionDecision"], "ask")  # never allow or deny on that account
+        self.assertIn(self.SENTENCE, d["permissionDecisionReason"])
+        self.assertIn("budget", d["permissionDecisionReason"])
+        self.assertLess(took, 2.5)  # no wait at all
+        self.assertEqual(self.strays_after(), [])
+
+    def test_the_test_seam_cannot_lengthen_the_hook(self):
+        """Only whole non-negative seconds are read; anything else is ignored, so the seam can
+        shorten the budget and never stretch it."""
+        self.hang()
+        for raw in ("-100", "abc", "1.5"):
+            with self.subTest(value=raw):
+                self.env["KINERARY_HOOK_TEST_ELAPSED_SECONDS"] = raw
+                d, _ = self.timed_hook(limit=1)
+                self.assertIn("limit 1s", d["permissionDecisionReason"])
 
     def test_only_file_names_reach_the_prompt_and_control_characters_are_stripped(self):
         (self.plans / "regression-plan-a\x1bb.md").write_text("assessed %s SECRET-BODY\n" % self.short())
