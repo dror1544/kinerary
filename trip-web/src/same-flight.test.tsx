@@ -125,20 +125,23 @@ describe("#549 Reservations keeps both bookings and tells them apart", () => {
     expect(within(cards[1]!).getByText("Same flight · booking 2 of 2")).toBeInTheDocument();
   });
 
-  it("AC-8 member: still two rows told apart by 'booking N of 2' even with no travellers named, and no reference shown", async () => {
+  it("AC-8 member: still two rows told apart by 'booking N of 2' even with no travellers named, each with its own reference", async () => {
     reservations(BOOKINGS.map((b) => ({ ...b, passengers: null })), { isOrganizer: false, lang: "he" });
     const cards = await screen.findAllByRole("article");
     expect(cards).toHaveLength(2);
     expect(within(cards[0]!).getByText("אותה טיסה · הזמנה 1 מתוך 2")).toBeInTheDocument();
     expect(within(cards[1]!).getByText("אותה טיסה · הזמנה 2 מתוך 2")).toBeInTheDocument();
-    expect(screen.queryByText(/QX7P2M|ZT3K9D/)).not.toBeInTheDocument();
+    // Members see the trip's data too (Dror, 2026-11-13, #555): each row its own reference, never the other's.
+    expect(within(cards[0]!).getByText(/QX7P2M/)).toBeInTheDocument();
+    expect(within(cards[0]!).queryByText(/ZT3K9D/)).not.toBeInTheDocument();
+    expect(within(cards[1]!).getByText(/ZT3K9D/)).toBeInTheDocument();
   });
 
-  it("AC-9 a flight booked once shows nothing extra", async () => {
+  it("AC-9 a flight booked once shows no same-flight line, and its reference as any booking does", async () => {
     reservations([BOOKINGS[0]], { isOrganizer: true });
     const cards = await screen.findAllByRole("article");
     expect(cards).toHaveLength(1);
     expect(within(cards[0]!).queryByText(/Same flight/)).not.toBeInTheDocument();
-    expect(within(cards[0]!).queryByText(/QX7P2M/)).not.toBeInTheDocument();
+    expect(within(cards[0]!).getByText(/QX7P2M/)).toBeInTheDocument();
   });
 });

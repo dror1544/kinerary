@@ -72,7 +72,8 @@ which ticket, twice. To make B cheap:
   only. Reservations still shows two entries, one per booking (#414).
 - AC-6 Given a member token, when the Journey is loaded, then the member sees
   the one line with each booking's travellers, and no confirmation number
-  appears in the line or in the member's `GET /api/itinerary/active` response.
+  appears in the line or in the member's `GET /api/itinerary/active` response. *(Superseded 2026-11-13, #555:
+  members see confirmation numbers; see the last section.)*
   (Booking `passengers` already reach members through `GET /api/bookings`,
   `tests/write-validation.test.js`.)
 - AC-5 Given an existing trip (built before this), then a re-provision adds or
@@ -117,7 +118,8 @@ entry).
 2. **Members see it too** (the spec's recommendation for the members
    question): the grouped line and each booking's travellers are shown to
    members as well as the organizer. Confirmation numbers keep today's
-   organizer-only display (AC-4, AC-6).
+   organizer-only display (AC-4, AC-6). *Superseded 2026-11-13 (#555), see the
+   last section.*
 
 ## Amendment 2026-11-12 — #549: Reservations tells the rows apart; Plan and Map show the flight once
 
@@ -134,7 +136,7 @@ This confirms decisions 1 and 2 above and adds what was missing from option B:
   be identical. A booking that shares its flight number and day with another now
   shows "Same flight · booking N of M" (always — it is what tells two rows apart
   when no one's names were extracted), its own `passengers` as before, and, for
-  the organizer only, its reference. Members never see a reference (decision 2).
+  the organizer only, its reference. Members never see a reference (decision 2; superseded 2026-11-13, see below: every member sees each row's reference).
 - **Plan and Map show the flight once, whoever produced the two items.** Option
   B's worker grouping (`booking_refs`) reaches only trips built after it ships
   (AC-5). The site therefore also collapses, at render, plan items that are the
@@ -157,8 +159,9 @@ Acceptance criteria (site side, additive to AC-1..AC-6):
 
 - AC-7 Given two flight bookings with the same flight number and date, when
   Reservations is shown, then there are two rows; each carries "Same flight ·
-  booking N of 2" and its own `passengers`; the organizer's rows also carry that
-  booking's own reference and never the other's; a member sees no reference.
+  booking N of 2" and its own `passengers`; each row also carries that booking's own
+  reference and never the other's, for members and the organizer alike
+  (2026-11-13; it said "a member sees no reference" before).
 - AC-8 Given two plan items for the same flight number and date, then the Plan
   board lists that flight once, and the Map's daily stops and pins list it once;
   every other item of the day is unchanged.
@@ -192,3 +195,22 @@ day derivation, the positional import or `findMatchingBooking` (line shifts
 only; the only transformer change is #201/#127's log message). No
 `booking_refs` exists. Size: M (option B: worker, site join, allow-list entry,
 Journey UI).
+
+## Decision 2026-11-13 — #555: members see the trip's data, references included
+
+Dror, verbatim: "no need to hide anything from members regarding the trip, if
+he is a member of the trip he allow to see data about the trip unless
+specificly ased not to by the orginizer."
+
+This supersedes decision 2's "confirmation numbers keep today's organizer-only
+display" and AC-6's "no confirmation number appears in the member's
+`GET /api/itinerary/active` response". The API already serves a booking's
+confirmation, notes and cost to members (#555's evidence), so nothing changes on
+the server. Reservations shows each booking's own reference to every member, on
+every row, not only on a same-flight row (`trip-web/src/same-flight.test.tsx`,
+AC-7 to AC-9).
+
+Unchanged: `booking_refs` in the served config still carries no confirmation.
+That is the config allow-list's blanket rule (no raw `trip.config.json` value is
+served), not a member rule. A way for the organizer to mark something private
+is a separate item, not built here.

@@ -1603,12 +1603,9 @@ export function BookingsView({ config, isOrganizer, lang }: { config?: TripConfi
                   <h4>{booking.name}</h4>
                   <p>{bookingDateLine(booking, lang)}</p>
                   {booking.passengers ? <small>{booking.passengers}</small> : null}
-                  {sameFlight.get(booking.id) ? (
-                    <>
-                      <small className="booking-same-flight">{copy(lang, `Same flight · booking ${sameFlight.get(booking.id)!.position} of ${sameFlight.get(booking.id)!.size}`, `אותה טיסה · הזמנה ${sameFlight.get(booking.id)!.position} מתוך ${sameFlight.get(booking.id)!.size}`)}</small>
-                      {isOrganizer && booking.confirmation ? <small className="booking-reference">{copy(lang, "Reference", "מספר הזמנה")} {booking.confirmation}</small> : null}
-                    </>
-                  ) : null}
+                  {sameFlight.get(booking.id) ? <small className="booking-same-flight">{copy(lang, `Same flight · booking ${sameFlight.get(booking.id)!.position} of ${sameFlight.get(booking.id)!.size}`, `אותה טיסה · הזמנה ${sameFlight.get(booking.id)!.position} מתוך ${sameFlight.get(booking.id)!.size}`)}</small> : null}
+                  {/* Every member sees the trip's data unless the organizer asks otherwise (Dror, 2026-11-13, #555). */}
+                  {booking.confirmation ? <small className="booking-reference">{copy(lang, "Reference", "מספר הזמנה")} {booking.confirmation}</small> : null}
                   <BookingActions booking={booking} lang={lang} />
                   {isOrganizer ? <SeedFlagNotice kind="booking" id={booking.id} changed={booking.seed_changed} removed={booking.seed_removed} lang={lang} /> : null}
                   {isOrganizer && booking.review_status === "draft" ? <button className="secondary-action" type="button" disabled={approveMutation.isPending} onClick={() => approveMutation.mutate(booking.id)}>{approveMutation.isPending ? "Approving..." : "Approve for members"}</button> : null}
