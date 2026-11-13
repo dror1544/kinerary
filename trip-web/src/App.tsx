@@ -5,6 +5,8 @@ import { safeExternalUrl } from "./external-url";
 import { dashboardHref } from "./dashboard-link";
 export { safeExternalUrl } from "./external-url";
 import { MobileSelect } from "./MobileSelect";
+import { BOOKING_TYPES, bookingTypeLabel, ITEM_TYPES, itemTypeLabel } from "./item-types";
+import { collapseSameFlight, sameFlightGroups } from "./same-flight";
 import { rsvpForItem, venueForItem } from "./activity-rsvp";
 import { datesInPhase, phaseDates as mergePhaseDates } from "./phase-calendar";
 export { datesInPhase } from "./phase-calendar";
@@ -544,7 +546,7 @@ function TimelineItem({
       <div className="item-body">
         <div className="item-kicker">
           <Icon size={16} />
-          <span>{item.item_type.replace("_", " ")}</span>
+          <span>{itemTypeLabel(item.item_type, lang)}</span>
           {item.provenance?.status === "updated_from_original" ? <b>{copy(lang, "Updated from original", "עודכן מהתוכנית המקורית")}</b> : null}
           {item.provenance?.status === "added" ? <b>{copy(lang, "Added", "נוסף")}</b> : null}
         </div>
@@ -803,7 +805,9 @@ export function JourneyView({
   }, [activePhase]);
   const [selected, setSelected] = useState(phaseDates[0] || "");
   const activeDate = phaseDates.includes(selected) ? selected : phaseDates[0] || "";
-  const dayItems = itinerary?.items.filter((item) => item.date === activeDate && (!activePhase?.id || item.phase_id === activePhase.id)) || [];
+  // One flight is one line on the plan, however many bookings are on it (#549);
+  // Reservations keeps a row per booking.
+  const dayItems = collapseSameFlight(itinerary?.items.filter((item) => item.date === activeDate && (!activePhase?.id || item.phase_id === activePhase.id)) || []);
   const activityLinks = useMemo(() => new globalThis.Map((itinerary?.items || []).map(item => [item.item_uid, {
     rsvpId: rsvpForItem(item, config, itinerary)?.id,
     venueId: venueForItem(item, config)?.id,
@@ -1079,7 +1083,7 @@ export function JourneyView({
               </label> : null}
               <label>{copy(lang, "Type", "סוג")}
                 <MobileSelect value={draft.item_type || "activity"} onChange={(event) => setDraft({ ...draft, item_type: event.target.value })}>
-                  {["activity", "travel", "meal", "lodging", "free_time", "booking", "task", "note"].map((type) => <option key={type} value={type}>{type.replace("_", " ")}</option>)}
+                  {ITEM_TYPES.map((type) => <option key={type} value={type}>{itemTypeLabel(type, lang)}</option>)}
                 </MobileSelect>
               </label>
               <label className="editor-field-wide">{copy(lang, "Activity name", "שם הפעילות")}<input value={draft.text_he} onChange={(event) => setDraft({ ...draft, text_he: event.target.value })} required /></label>
@@ -1419,7 +1423,7 @@ export function BookingCreatePanel({ config, isOrganizer, lang }: { config?: Tri
       {extractMutation.isSuccess ? <p className="saved-note">{lang === "he" ? "הפרטים חולצו — כדאי לעבור עליהם לפני השמירה." : "Details extracted — please review them before saving."}</p> : null}
       <div className="booking-create-fields">
         <label>{lang === "he" ? "שלב" : "Phase"}<MobileSelect value={draft.phase || defaultPhase} onChange={(event) => setDraft({ ...draft, phase: event.target.value })} required><option value="" disabled>{lang === "he" ? "בחירת שלב" : "Choose a phase"}</option>{(config?.phases || []).map((phase) => <option key={phase.id} value={phase.id}>{text(phase.title, lang) || phase.id}</option>)}</MobileSelect></label>
-        <label>{lang === "he" ? "סוג" : "Type"}<MobileSelect value={draft.type} onChange={(event) => setDraft({ ...draft, type: event.target.value })}><option value="flight">{lang === "he" ? "טיסה" : "Flight"}</option><option value="hotel">{lang === "he" ? "לינה" : "Stay"}</option><option value="car">{lang === "he" ? "רכב" : "Car"}</option><option value="attraction">{lang === "he" ? "אטרקציה" : "Attraction"}</option><option value="other">{lang === "he" ? "אחר" : "Other"}</option></MobileSelect></label>
+        <label>{lang === "he" ? "סוג" : "Type"}<MobileSelect value={draft.type} onChange={(event) => setDraft({ ...draft, type: event.target.value })}>{BOOKING_TYPES.map((type) => <option key={type} value={type}>{bookingTypeLabel(type, lang)}</option>)}</MobileSelect></label>
         <label className="editor-field-wide">{lang === "he" ? "שם ההזמנה" : "Booking name"}<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} required placeholder={lang === "he" ? "לדוגמה: טיסת JL 12" : "For example: Flight JL 12"} /></label>
         <label>{lang === "he" ? "מתאריך" : "From"}<input type="date" value={draft.date_from} onChange={(event) => setDraft({ ...draft, date_from: event.target.value })} /></label>
         <label>{lang === "he" ? "עד תאריך" : "To"}<input type="date" value={draft.date_to} onChange={(event) => setDraft({ ...draft, date_to: event.target.value })} /></label>
@@ -1501,7 +1505,7 @@ export function BookingEditPanel({ booking, config, lang, onClose }: { booking: 
       </div>
       <div className="booking-create-fields">
         <label>{lang === "he" ? "שלב" : "Phase"}<MobileSelect value={draft.phase} onChange={(event) => setDraft({ ...draft, phase: event.target.value })} required><option value="" disabled>{lang === "he" ? "בחירת שלב" : "Choose a phase"}</option>{(config?.phases || []).map((phase) => <option key={phase.id} value={phase.id}>{text(phase.title, lang) || phase.id}</option>)}</MobileSelect></label>
-        <label>{lang === "he" ? "סוג" : "Type"}<MobileSelect value={draft.type} onChange={(event) => setDraft({ ...draft, type: event.target.value })}><option value="flight">{lang === "he" ? "טיסה" : "Flight"}</option><option value="hotel">{lang === "he" ? "לינה" : "Stay"}</option><option value="car">{lang === "he" ? "רכב" : "Car"}</option><option value="attraction">{lang === "he" ? "אטרקציה" : "Attraction"}</option><option value="other">{lang === "he" ? "אחר" : "Other"}</option></MobileSelect></label>
+        <label>{lang === "he" ? "סוג" : "Type"}<MobileSelect value={draft.type} onChange={(event) => setDraft({ ...draft, type: event.target.value })}>{BOOKING_TYPES.map((type) => <option key={type} value={type}>{bookingTypeLabel(type, lang)}</option>)}</MobileSelect></label>
         <label className="editor-field-wide">{lang === "he" ? "שם ההזמנה" : "Booking name"}<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} required /></label>
         <label>{lang === "he" ? "מתאריך" : "From"}<input type="date" value={draft.date_from} onChange={(event) => setDraft({ ...draft, date_from: event.target.value })} /></label>
         <label>{lang === "he" ? "עד תאריך" : "To"}<input type="date" value={draft.date_to} onChange={(event) => setDraft({ ...draft, date_to: event.target.value })} /></label>
@@ -1529,7 +1533,7 @@ export function BookingEditPanel({ booking, config, lang, onClose }: { booking: 
   );
 }
 
-function BookingsView({ config, isOrganizer, lang }: { config?: TripConfig; isOrganizer?: boolean; lang: Lang }) {
+export function BookingsView({ config, isOrganizer, lang }: { config?: TripConfig; isOrganizer?: boolean; lang: Lang }) {
   const queryClient = useQueryClient();
   const [filter, setFilter] = useState<BookingFilter>("phase");
   const [editingBookingId, setEditingBookingId] = useState<number | null>(null);
@@ -1555,6 +1559,8 @@ function BookingsView({ config, isOrganizer, lang }: { config?: TripConfig; isOr
     }, new globalThis.Map<string, Booking[]>()).entries()).sort(([a], [b]) => (order.get(a) ?? 999) - (order.get(b) ?? 999));
   }, [config?.phases, rows]);
   const needsReview = rows.filter((booking) => bookingState(booking) !== "verified").length;
+  // Two bookings on one flight stay two rows (#549); each says which it is.
+  const sameFlight = useMemo(() => sameFlightGroups(allRows), [allRows]);
   const approveMutation = useMutation({
     mutationFn: approveBookingDraft,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["bookings"] }),
@@ -1591,12 +1597,15 @@ function BookingsView({ config, isOrganizer, lang }: { config?: TripConfig; isOr
               {phaseBookings.map((booking) => (
                 <article className="booking-card" key={booking.id}>
                   <div className="booking-card-head">
-                    <span className="booking-type">{booking.type}</span>
+                    <span className="booking-type">{bookingTypeLabel(booking.type, lang)}</span>
                     <span className={`status-pill ${bookingState(booking)}`}>{bookingState(booking) === "verified" ? "Verified" : bookingState(booking) === "draft" ? "Draft" : "Needs review"}</span>
                   </div>
                   <h4>{booking.name}</h4>
                   <p>{bookingDateLine(booking, lang)}</p>
                   {booking.passengers ? <small>{booking.passengers}</small> : null}
+                  {sameFlight.get(booking.id) ? <small className="booking-same-flight">{copy(lang, `Same flight · booking ${sameFlight.get(booking.id)!.position} of ${sameFlight.get(booking.id)!.size}`, `אותה טיסה · הזמנה ${sameFlight.get(booking.id)!.position} מתוך ${sameFlight.get(booking.id)!.size}`)}</small> : null}
+                  {/* Every member sees the trip's data unless the organizer asks otherwise (Dror, 2026-11-13, #555). */}
+                  {booking.confirmation ? <small className="booking-reference">{copy(lang, "Reference", "מספר הזמנה")} {booking.confirmation}</small> : null}
                   <BookingActions booking={booking} lang={lang} />
                   {isOrganizer ? <SeedFlagNotice kind="booking" id={booking.id} changed={booking.seed_changed} removed={booking.seed_removed} lang={lang} /> : null}
                   {isOrganizer && booking.review_status === "draft" ? <button className="secondary-action" type="button" disabled={approveMutation.isPending} onClick={() => approveMutation.mutate(booking.id)}>{approveMutation.isPending ? "Approving..." : "Approve for members"}</button> : null}
@@ -1614,7 +1623,8 @@ function BookingsView({ config, isOrganizer, lang }: { config?: TripConfig; isOr
 }
 
 export function dailyMapStops(items: ItineraryItem[] | undefined) {
-  return [...(items || [])]
+  // The same flight on two bookings is one stop (#549).
+  return [...(collapseSameFlight(items) || [])]
     .filter((item) => Boolean(item.date && (item.location_url || item.waze_url)))
     .sort((a, b) => {
       const byDate = (a.date || "").localeCompare(b.date || "");
@@ -2009,7 +2019,7 @@ export function MapView({ config, itinerary, lang, onOpenItinerary }: { config?:
         <div className="module-grid">
           {dailyStops.map((item) => (
             <article className="map-anchor" key={item.item_uid}>
-              <span className="booking-type">{item.item_type}</span>
+              <span className="booking-type">{itemTypeLabel(item.item_type, lang)}</span>
               <h3>{itemTitle(item, lang)}</h3>
               <p>{dateLabel(item.date!, lang)}{item.time ? ` · ${itineraryTimeLabel(item.time, lang)}` : ""}</p>
               <div className="action-strip">
