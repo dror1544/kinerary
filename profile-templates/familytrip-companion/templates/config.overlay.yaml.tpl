@@ -229,3 +229,13 @@ onboarding:
 # control-plane/api/src/relay/internal-leak.ts.
 compression:
   codex_gpt55_autoraise_notice: false
+
+# Each companion is its own gateway process, one per profile, as on the Mac's
+# launch agents. Hermes 0.21 (4097709b0c) starts ONE combined gateway per
+# container unless a profile opts out with this key, and the VM's container has
+# no relay settings on that combined gateway, so a profile without it would go
+# silent after the next container restart, with no error (2026-11-13, the
+# Sprint 8 VM release). 0.20.5 ignores the key. Upstream calls it a transition
+# shim; the control-plane-owned answer to "which gateways run" is #349.
+gateway:
+  standalone: true
