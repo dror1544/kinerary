@@ -510,16 +510,22 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // place of "which of them are you?". Said as a question to them, not as something read from a document.
     organizerNameConfirm: "You're {name} on the list, right?",
     knownStopConfirm: "You're going to {place}, {start} – {end}. Is that the only stop?",
-    // The opening of a trip that was created on the dashboard (#438, AC-13; #548): a friendly greeting that says what
-    // is already known -- the place and the month -- and, on its own second line, that a few quick questions will
-    // fill in the rest. That is the WHOLE first message: the older introduction is not sent after it. It never says
-    // where the values came from. See `seededOpening`.
-    seedHi: "Hi {name}",
-    seedHiAnon: "Hi",
-    seedPlaceMonth: "{place} in {month}",
-    seedExcited: "How exciting! 🎉",
-    seedQuick: "A few quick questions will fill in your trip's details.",
-    // For an account that already has a built trip, said with the document offer (#548): the one thing the old
+    // The opening of a trip that was created on the dashboard (#438, AC-13; #548): a friendly greeting that says who
+    // is writing and what is already known -- the place and the month -- then, as its own paragraph, that a few short
+    // questions follow and that any plan, ticket or booking can be sent instead. Dror's wording, 2026-11-13. That is
+    // the WHOLE opening: the older introduction is not sent. It never says where the values came from. See
+    // `seededOpening`.
+    seedHi: "Hi {name} 👋",
+    seedHiAnon: "Hi 👋",
+    seedHelp: "I'm your Kinerary travel assistant, and I'd love to help you plan {trip}. How exciting! 🎉",
+    seedTripPlaceMonth: "your trip to {place} in {month}",
+    seedTripPlace: "your trip to {place}",
+    seedTripAny: "your trip",
+    // The button under it (Dror, 2026-11-13): "I don't have one" read oddly after an invitation they can act on any
+    // time. Same callback as noDocument -- it moves on to the first question; a document can still be sent later.
+    seedStart: "Let's start",
+    seedInvite: "To plan the trip that suits you best, I'll ask a few short questions. If you have a trip plan, flight tickets or any other booking, send it to me here in the chat and I'll learn more about the trip. So let's start!",
+    // For an account that already has a built trip, said inside the opening (#548): the one thing the old
     // returning introduction said that a second trip raises. The first trip is not being replaced.
     seedReturningNote: "Your previous trip isn't touched — its site and its assistant stay exactly as they are. While we set this one up, messages here come to me rather than to that assistant; /trips moves between them once this trip is built.",
     /** Instead of documentNothing, when nothing was certain but something was found. */
@@ -905,11 +911,14 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     suggestionNo: "✏️ לא",
     organizerNameConfirm: "אני רק מוודא שאתה הוא {name}",
     knownStopConfirm: "אתם נוסעים ל{place}, {start} – {end}. זו התחנה היחידה?",
-    seedHi: "היי {name}",
-    seedHiAnon: "היי",
-    seedPlaceMonth: "{place} ב{month}",
-    seedExcited: "איזה כיף! 🎉",
-    seedQuick: "כמה שאלות קצרות ישלימו את פרטי הטיול.",
+    seedHi: "היי {name} 👋",
+    seedHiAnon: "היי 👋",
+    seedHelp: "אני עוזר הטיולים שלכם מבית Kinerary, ואשמח לעזור לכם לתכנן {trip}. איזה כיף! 🎉",
+    seedTripPlaceMonth: "את הטיול ל{place} ב{month}",
+    seedTripPlace: "את הטיול ל{place}",
+    seedTripAny: "את הטיול",
+    seedStart: "בואו נתחיל",
+    seedInvite: "כדי שנתכנן את הטיול שהכי מתאים לכם, נעבור על כמה שאלות קצרות. אם יש לכם תוכנית טיול, כרטיסי טיסה או כל הזמנה אחרת, שלחו לי אותם כאן בצ׳אט ואלמד מהם עוד על הטיול. אז בואו נתחיל!",
     seedReturningNote: "הטיול הקודם שלכם לא משתנה — האתר והעוזר שלו נשארים בדיוק כמו שהם. בזמן שנקים את הטיול הזה, הודעות כאן מגיעות אליי ולא לעוזר ההוא; אפשר לעבור ביניהם עם ‎/trips‎ אחרי שהטיול הזה יוקם.",
     documentUnsure: "קראתי, ומצאתי כמה דברים שאני לא בטוח שקראתי נכון — אבדוק איתכם כל אחד מהם בהמשך.",
     documentWillCheck: "לא בטוח שקראתי נכון — אבדוק איתכם",
@@ -1185,33 +1194,35 @@ export function tripMonthInWords(departureIso: string | null, returnIso: string 
 }
 
 /**
- * The first message of an interview for a trip created on the dashboard (#438, AC-13; #548): a greeting that names the
- * organizer, the place and the month they are going, and, on a second line, says a few quick questions will fill in
- * the trip's details. It is the WHOLE message -- the older introduction is not appended to it (the document offer
- * follows as its own message, `renderOpeningMessages`).
+ * The opening of an interview for a trip created on the dashboard (#438, AC-13; #548, in Dror's wording of 2026-11-13):
+ * a greeting that names the organizer, says who is writing, names the place and the month they are going, and then, as
+ * its own paragraph, says a few short questions follow and that a plan, a ticket or a booking can be sent instead. It
+ * is the WHOLE opening -- the older introduction is not sent -- and `renderOpeningMessages` puts a "Let's start"
+ * button under it.
  *
- *   "Hi Dana, Japan in April. How exciting! 🎉
- *    A few quick questions will fill in your trip's details."
+ *   "Hi Dana 👋
+ *    I'm your Kinerary travel assistant, and I'd love to help you plan your trip to Japan in April. How exciting! 🎉
  *
- * Only what is known is said: no name drops "Dana" ("Hi! Japan in April. …"), no dates drops the month, no
- * destination leaves the greeting and the quick-questions sentence. It never names where the values came from, and
- * never prints a date as `YYYY-MM-DD`. A date `readableDate` will not render counts as no date.
+ *    To plan the trip that suits you best, I'll ask a few short questions. If you have a trip plan, … So let's start!"
+ *
+ * Only what is known is said: no name drops "Dana" ("Hi 👋"), no dates drops the month, no destination says "your
+ * trip". It never names where the values came from, and never prints a date as `YYYY-MM-DD`. A date `readableDate`
+ * will not render counts as no date. `returningNote`, when given, is its own paragraph between the two.
  *
  * `destination` and `organizerName` are shown exactly as given: the caller decides whether they are the interview
  * language's own spelling (`native-names.ts`) or, when that was not possible, the English as entered.
  */
-export function seededOpening(seeded: SeededOpeningFacts, language: Language = DEFAULT_LANGUAGE): string {
+export function seededOpening(seeded: SeededOpeningFacts, language: Language = DEFAULT_LANGUAGE, returningNote?: string): string {
   const fill = (key: string, values: Record<string, string>) =>
     Object.entries(values).reduce((text, [name, value]) => text.replace(`{${name}}`, () => value), uiString(key, language));
   const name = seeded.organizerName?.trim();
   const place = seeded.destination?.trim();
   const hi = name ? fill("seedHi", { name }) : uiString("seedHiAnon", language);
-  const quick = uiString("seedQuick", language);
-  if (!place) return `${hi}!\n${quick}`;
-
-  const month = tripMonthInWords(seeded.departureDate, seeded.returnDate, language);
-  const where = month ? fill("seedPlaceMonth", { place, month }) : place;
-  return `${hi}${name ? "," : "!"} ${where}. ${uiString("seedExcited", language)}\n${quick}`;
+  const month = place ? tripMonthInWords(seeded.departureDate, seeded.returnDate, language) : null;
+  const trip = !place ? uiString("seedTripAny", language)
+    : month ? fill("seedTripPlaceMonth", { place, month }) : fill("seedTripPlace", { place });
+  const paragraphs = [`${hi}\n${fill("seedHelp", { trip })}`, returningNote, uiString("seedInvite", language)];
+  return paragraphs.filter((p): p is string => Boolean(p)).join("\n\n");
 }
 
 function pick(localised: Localised | undefined, language: Language): string | null {

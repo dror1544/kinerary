@@ -556,13 +556,13 @@ describe("a paused interview picks up where it stopped (#513)", { skip }, () => 
 
     const stranger = nextChat();
     const messages = await dispatchUpdate(pool, startUpdate(stranger, tokenOf(forwarded.json().deepLink)));
-    assert.equal(messages.kind, "multi_reply");
-    if (messages.kind !== "multi_reply") return;
-    const [reply, offer] = messages.replies;
-    assert.notEqual(reply!.text, uiString("resumedOpening", "en"), "no welcome back for someone who was not in the interview");
-    assert.ok(reply!.text.startsWith("Hi "), "the ordinary, seeded opening (#548: the greeting)");
-    assert.equal(offer!.text, uiString("documentOffer", "en"));
-    assert.ok(JSON.stringify(offer!.replyMarkup).includes("c:nodoc"), "with the document offer");
+    assert.equal(messages.kind, "reply");
+    if (messages.kind !== "reply") return;
+    const reply = messages.reply;
+    assert.notEqual(reply.text, uiString("resumedOpening", "en"), "no welcome back for someone who was not in the interview");
+    assert.ok(reply.text.startsWith("Hi "), "the ordinary, seeded opening (#548: the greeting)");
+    assert.ok(reply.text.endsWith(uiString("seedInvite", "en")), "with the invitation to send documents");
+    assert.ok(JSON.stringify(reply.replyMarkup).includes("c:nodoc"), "and its button");
     const [row] = await liveSession(t.tripId);
     assert.equal(row.telegram_chat_id, stranger);
     assert.deepEqual(Object.keys(row.answers).sort(), [...SEEDED].sort(), "the card seed only");

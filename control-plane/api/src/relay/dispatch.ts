@@ -818,8 +818,7 @@ export async function dispatchUpdate(
         if (!outcome.view.nextQuestion) {
           return { kind: "reply", reply: { chatId, text: strings.badLink } };
         }
-        // One message for an ordinary trip; for a dashboard trip the greeting and then the document offer, each its
-        // own message (#548).
+        // One message either way: the introduction for an ordinary trip, the greeting for a dashboard trip (#548).
         const opening = renderOpeningMessages(outcome.view.language, outcome.returning, outcome.seeded)
           .map((m): DirectReply => ({ chatId, text: m.text, replyMarkup: m.replyMarkup ?? undefined }));
         return opening.length > 1 ? { kind: "multi_reply", replies: opening } : { kind: "reply", reply: opening[0]! };

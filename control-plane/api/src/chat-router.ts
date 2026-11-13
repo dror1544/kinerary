@@ -1460,14 +1460,12 @@ export function renderDocumentOffer(
 }
 
 /**
- * Every message an interview opens with, in the order they are sent.
- *
  * An unseeded trip opens with the one message it always has (`renderDocumentOffer`). A trip created on the dashboard
  * (#438) has told the product its destination and dates already, so the older introduction -- nine paragraphs about
- * what Kinerary is -- does not belong after "Hi Dana, Japan in April": its first message is the greeting and one
- * line saying a few quick questions will fill in the details, and nothing else (#548). What it said that is still
- * needed follows as its own message: the document offer, with its button, and for an account that already has a
- * built trip, first the note that the earlier trip is untouched. The first question follows when it is answered, as
+ * what Kinerary is -- does not belong after "Hi Dana": its opening is one message in Dror's wording (#548,
+ * 2026-11-13), the greeting, who is writing and the trip, then that a few short questions follow and that documents
+ * can be sent instead, with a "Let's start" button under it (the "I don't have one" callback). For an account that already has a built trip, the
+ * note that the earlier trip is untouched sits between the two. The first question follows when it is answered, as
  * for any other opening.
  */
 export function renderOpeningMessages(
@@ -1477,14 +1475,10 @@ export function renderOpeningMessages(
   seeded?: SeededOpening,
 ): RenderedQuestion[] {
   if (!seeded) return [renderDocumentOffer(language, returning)];
-  const offer = uiString("documentOffer", language);
-  return [
-    { text: seededOpening(seeded, language), replyMarkup: null },
-    {
-      text: returning ? `${uiString("seedReturningNote", language)}\n\n${offer}` : offer,
-      replyMarkup: { inline_keyboard: [[{ text: uiString("noDocument", language), callback_data: NO_DOCUMENT_CALLBACK_DATA }]] },
-    },
-  ];
+  return [{
+    text: seededOpening(seeded, language, returning ? uiString("seedReturningNote", language) : undefined),
+    replyMarkup: { inline_keyboard: [[{ text: uiString("seedStart", language), callback_data: NO_DOCUMENT_CALLBACK_DATA }]] },
+  }];
 }
 
 /**

@@ -1,7 +1,7 @@
 /**
- * #548: a dashboard-seeded interview opens with the greeting and one short explanation, and nothing else in that
- * message. What the older greeting body said that is still needed (the document offer; for an account with an earlier
- * trip, the note that it is untouched) follows as its own message. No database: this is the opening's shape.
+ * #548: a dashboard-seeded interview opens with one message in Dror's wording (2026-11-13): the greeting, who is
+ * writing and the trip, then that a few short questions follow and that any plan, ticket or booking can be sent, with a
+ * "Let's start" button. The older introduction is not sent. No database: this is the opening's shape.
  */
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
@@ -12,43 +12,43 @@ const seeded = { destination: "Gatecity", departureDate: "2026-11-14", returnDat
 const seededHe = { ...seeded, destination: "גייטסיטי", organizerName: "ארלו" };
 
 describe("#548 the seeded opening is a greeting, one explanation, and then its own messages", () => {
-  test("AC-17 the first message, exactly, in English", () => {
-    const [first] = renderOpeningMessages("en", false, seeded);
-    assert.equal(first!.text, "Hi Arlo, Gatecity in November. How exciting! 🎉\nA few quick questions will fill in your trip's details.");
-    assert.equal(first!.replyMarkup, null);
+  test("AC-17 the opening, exactly, in English", () => {
+    const messages = renderOpeningMessages("en", false, seeded);
+    assert.equal(messages.length, 1);
+    assert.equal(messages[0]!.text, "Hi Arlo 👋\nI'm your Kinerary travel assistant, and I'd love to help you plan your trip to Gatecity in November. How exciting! 🎉\n\nTo plan the trip that suits you best, I'll ask a few short questions. If you have a trip plan, flight tickets or any other booking, send it to me here in the chat and I'll learn more about the trip. So let's start!");
   });
 
-  test("AC-17 the first message, exactly, in Hebrew (plural voice, name and destination as given)", () => {
-    const [first] = renderOpeningMessages("he", false, seededHe);
-    assert.equal(first!.text, "היי ארלו, גייטסיטי בנובמבר. איזה כיף! 🎉\nכמה שאלות קצרות ישלימו את פרטי הטיול.");
-    assert.equal(first!.replyMarkup, null);
+  test("AC-17 the opening, exactly, in Hebrew (plural voice, name and destination as given)", () => {
+    const messages = renderOpeningMessages("he", false, seededHe);
+    assert.equal(messages.length, 1);
+    assert.equal(messages[0]!.text, "היי ארלו 👋\nאני עוזר הטיולים שלכם מבית Kinerary, ואשמח לעזור לכם לתכנן את הטיול לגייטסיטי בנובמבר. איזה כיף! 🎉\n\nכדי שנתכנן את הטיול שהכי מתאים לכם, נעבור על כמה שאלות קצרות. אם יש לכם תוכנית טיול, כרטיסי טיסה או כל הזמנה אחרת, שלחו לי אותם כאן בצ׳אט ואלמד מהם עוד על הטיול. אז בואו נתחיל!");
+    assert.doesNotMatch(messages[0]!.text, /אתה|תענה|תשלח|בוא נתחיל/, "plural, never the masculine singular");
   });
 
-  test("AC-17 none of the introduction's paragraphs (bar the returning note) is in any message of a seeded opening", () => {
+  test("AC-18 the one button is Let's start, and it moves on exactly as I-don't-have-one does", () => {
+    for (const language of ["en", "he"] as const) {
+      const [button, ...more] = renderOpeningMessages(language, false, seeded)[0]!.replyMarkup!.inline_keyboard.flat();
+      assert.equal(more.length, 0, language);
+      assert.equal(button!.text, uiString("seedStart", language));
+      assert.equal(button!.callback_data, renderDocumentOffer(language, false).replyMarkup!.inline_keyboard.flat()[0]!.callback_data);
+    }
+  });
+
+  test("AC-17 none of the introduction's paragraphs (bar the returning note) is in a seeded opening", () => {
     for (const language of ["en", "he"] as const) {
       for (const returning of [false, true]) {
         const intro = uiString(returning ? "introductionReturning" : "introduction", language);
-        const messages = renderOpeningMessages(language, returning, seeded);
-        for (const m of messages) {
-          // The one paragraph a returning account still needs is kept, as the note in its own message (AC-18).
-          for (const paragraph of intro.split("\n\n").filter((p) => p !== uiString("seedReturningNote", language))) assert.ok(!m.text.includes(paragraph), `${language}/${returning}: ${paragraph.slice(0, 30)}`);
-        }
+        const [m] = renderOpeningMessages(language, returning, seeded);
+        for (const paragraph of intro.split("\n\n").filter((p) => p !== uiString("seedReturningNote", language))) assert.ok(!m!.text.includes(paragraph), `${language}/${returning}: ${paragraph.slice(0, 30)}`);
       }
     }
   });
 
-  test("AC-18 the second message is the document offer, with the 'I don't have one' button; a returning account's carries its note first", () => {
+  test("AC-18 a returning account's opening carries the untouched-trip note between the greeting and the invitation", () => {
     for (const language of ["en", "he"] as const) {
-      const fresh = renderOpeningMessages(language, false, seeded);
-      assert.equal(fresh.length, 2, language);
-      assert.equal(fresh[1]!.text, uiString("documentOffer", language));
-      assert.equal(fresh[1]!.replyMarkup?.inline_keyboard.flat()[0]?.text, uiString("noDocument", language));
-
-      const back = renderOpeningMessages(language, true, seeded);
-      assert.equal(back.length, 2, language);
-      assert.equal(back[0]!.text, fresh[0]!.text, "the greeting is the same for a returning account");
-      assert.equal(back[1]!.text, `${uiString("seedReturningNote", language)}\n\n${uiString("documentOffer", language)}`);
-      assert.equal(back[1]!.replyMarkup?.inline_keyboard.flat()[0]?.text, uiString("noDocument", language));
+      const fresh = renderOpeningMessages(language, false, seeded)[0]!.text.split("\n\n");
+      const back = renderOpeningMessages(language, true, seeded)[0]!.text.split("\n\n");
+      assert.deepEqual(back, [fresh[0], uiString("seedReturningNote", language), fresh[1]], language);
     }
   });
 

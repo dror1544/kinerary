@@ -359,14 +359,13 @@ describe("AC-5: the organizer approves", { skip }, () => {
     const tap = tapUpdate(t0, approveData(asked.replies[1]!), from(t0, "Dana"));
     const approved = multi(await dispatchUpdate(pool, tap));
     assert.ok(approved.callbackQueryId, "the tap is answered");
-    // The trip has a destination, so it is a dashboard trip: T1's opening is the greeting, then the document offer (#548).
-    assert.deepEqual(approved.replies.map((r) => r.chatId), [t0, t1, t1, t1]);
+    // The trip has a destination, so it is a dashboard trip: T1's opening is the one seeded greeting (#548).
+    assert.deepEqual(approved.replies.map((r) => r.chatId), [t0, t1, t1]);
     assert.equal(approved.replies[1]!.text, uiString("linkOtherApproved", "en"));
-    assert.ok(approved.replies[2]!.text.startsWith("Hi Mallory, Kyoto"), approved.replies[2]!.text);
-    assert.equal(approved.replies[2]!.text.split("\n").length, 2, "the greeting and one explanation line, nothing else");
-    assert.ok(!approved.replies[2]!.replyMarkup);
-    assert.equal(approved.replies[3]!.text, uiString("documentOffer", "en"));
-    assert.ok(approved.replies[3]!.replyMarkup, "and the document offer carries the buttons");
+    assert.ok(approved.replies[2]!.text.startsWith("Hi Mallory 👋"), approved.replies[2]!.text);
+    assert.ok(approved.replies[2]!.text.includes("your trip to Kyoto"), approved.replies[2]!.text);
+    assert.ok(approved.replies[2]!.text.endsWith(uiString("seedInvite", "en")));
+    assert.ok(approved.replies[2]!.replyMarkup, "and it carries the Let's-start button"); 
     assert.ok(approved.replies[0]!.text.includes(trip.title) && approved.replies[0]!.text.includes("Mallory"));
 
     assert.equal((await liveLinks(trip.tripId, t0)).length, 0, "T0's link to this trip is revoked");
@@ -397,14 +396,14 @@ describe("AC-5: the organizer approves", { skip }, () => {
     const { sent, answered, deps } = recorder();
     await applyDecision(decision, deps);
     assert.equal(answered.length, 1);
-    assert.deepEqual(sent.map((m) => m.chatId), [t0, t1, t1, t1]);
+    assert.deepEqual(sent.map((m) => m.chatId), [t0, t1, t1]);
   });
 
   test("the buttons work while the organizer is in the middle of ANOTHER trip's interview (they are not swallowed as a stale interview button)", async () => {
     const { t0, t1, trip } = await askScenario({ leaveInterviewRunning: true });
     const asked = multi(await dispatchUpdate(pool, startUpdate(t1, trip.token)));
     const approved = multi(await dispatchUpdate(pool, tapUpdate(t0, approveData(asked.replies[1]!))));
-    assert.equal(approved.replies.length, 4);
+    assert.equal(approved.replies.length, 3);
     assert.equal((await liveLinks(trip.tripId, t1)).length, 1);
     assert.equal((await sessionsFor(t0)).filter((s) => s.expired_at === null).length, 1, "the organizer's own interview was not disturbed");
   });
@@ -500,7 +499,7 @@ describe("AC-7: only T0, once, only while pending; buttons are shortcuts", { ski
     multi(await dispatchUpdate(pool, startUpdate(t1, trip.token)));
     const typed = multi(await dispatchUpdate(pool, textUpdate(t0, "Approve")));
     assert.equal(typed.callbackQueryId, undefined, "there is no tap to answer");
-    assert.deepEqual(typed.replies.map((r) => r.chatId), [t0, t1, t1, t1]);
+    assert.deepEqual(typed.replies.map((r) => r.chatId), [t0, t1, t1]);
     assert.equal((await liveLinks(trip.tripId, t1)).length, 1);
     assert.equal((await liveLinks(trip.tripId, t0)).length, 0);
     assert.equal((await requestsFor(trip.tripId))[0].state, "approved");
