@@ -2852,7 +2852,20 @@ export interface AnswerPrecondition {
 }
 
 export type ConfirmIntakeResult =
-  | { ok: true; sessionId: string; intakeVersionId: string; digest: string; versionNumber: number }
+  | {
+      ok: true;
+      sessionId: string;
+      intakeVersionId: string;
+      digest: string;
+      versionNumber: number;
+      /**
+       * Set only on the repeat of a confirmation that already happened (a second tap, a redelivered callback). The
+       * result is the same success, and a caller that SAYS something on confirming (the router's "that's everything"
+       * message, the provisioning request) must not say or do it again - on 2026-11-12 it did, and the organizer got
+       * the confirmation twice (#543).
+       */
+      alreadyConfirmed?: true;
+    }
   | { ok: false; reason: "NOT_FOUND" | "NOT_ALL_REQUIRED_ANSWERED" | "UNSAFE_ANSWER_CONTENT" | "PENDING_CHANGE"; unsafePath?: string };
 
 // A private Telegram chat id is always a positive integer in string form —
@@ -3560,7 +3573,7 @@ export async function queueInboundMessage(
   db: pg.Pool,
   chatId: string,
   event: QueuedInboundEvent,
-): Promise<void> {
+): Promise<{ uploadAlreadyQueued: boolean }> {
   // A DOCUMENT SILENCES THE PENDING QUESTION.
   //
   // Reading a booking takes about two minutes, and the burst does not even
@@ -3588,13 +3601,30 @@ export async function queueInboundMessage(
   // written. Writing it as now()+N here would make the two disagree about
   // what the timestamp MEANS, and every later message in the burst pushing it
   // forward again is exactly the debounce this needs.
-  await db.query(
-    `UPDATE control_plane.intake_sessions
-        SET pending_inbound = pending_inbound || to_jsonb($2::jsonb),
+  //
+  // WHETHER A FILE WAS ALREADY WAITING is read in the same statement, off the row as it stood before this message
+  // was added: an album arrives as one Telegram message per photo, and the caller acknowledges an upload once per
+  // burst, not once per photo (#543). Decided here, under the row lock, so two photos handled at once cannot both
+  // find the queue empty.
+  const queued = await db.query<{ upload_already_queued: boolean }>(
+    `WITH before AS (
+       SELECT id, pending_inbound
+         FROM control_plane.intake_sessions
+        WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND expired_at IS NULL
+          FOR UPDATE
+     )
+     UPDATE control_plane.intake_sessions s
+        SET pending_inbound = s.pending_inbound || to_jsonb($2::jsonb),
             inbound_settle_due_at = now()
-      WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND expired_at IS NULL`,
+       FROM before
+      WHERE s.id = before.id
+     RETURNING EXISTS (
+       SELECT 1 FROM jsonb_array_elements(before.pending_inbound) AS queued
+        WHERE jsonb_typeof(queued->'media_urls') = 'array' AND jsonb_array_length(queued->'media_urls') > 0
+     ) AS upload_already_queued`,
     [chatId, JSON.stringify(event)],
   );
+  return { uploadAlreadyQueued: queued.rows.some((row) => row.upload_already_queued) };
 }
 
 export interface SettledInboundBurst {
@@ -5329,7 +5359,7 @@ async function confirmIntakeVia(
       await client.query("ROLLBACK");
       const [ver] = existing.rows;
       if (!ver) return { ok: false, reason: "NOT_FOUND" };
-      return { ok: true, sessionId: session.id, intakeVersionId: ver.id, digest: ver.digest, versionNumber: ver.version };
+      return { ok: true, sessionId: session.id, intakeVersionId: ver.id, digest: ver.digest, versionNumber: ver.version, alreadyConfirmed: true };
     }
 
     // A CHANGE THE ORGANIZER HAS NOT SETTLED. Confirming now would lock in the

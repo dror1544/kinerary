@@ -568,29 +568,9 @@ export async function applyDecision(
       // it. Requested during the 2026-09-04 run 3. Unaffected by the settle
       // window below: the organizer should see this the instant the file
       // lands, burst or not.
-      if ((decision.event.media_urls?.length ?? 0) > 0) {
-        const view = await getSessionForChat(deps.db, decision.chatId);
-        const language = view.ok ? view.view.language : DEFAULT_LANGUAGE;
-        // ONE acknowledgement, and this is it.
-        //
-        // The interpret path used to add a second from `runDocumentPath` after
-        // the burst settled, so the organizer got "קיבלתי — קורא את זה עכשיו…"
-        // and then, seconds later, "קיבלתי — אני קורא את זה עכשיו. זה לוקח
-        // דקה…" — the same sentence twice, with a question wedged between them.
-        //
-        // Said HERE rather than there because here is instant: the burst has a
-        // settle window and reading takes a minute, and the acknowledgement is
-        // the one message whose entire job is to arrive immediately. The
-        // interpret path's wording is the better one — it sets the
-        // expectation — so it is used when that path will do the reading.
-        await deps.telegram.sendMessage({
-          chatId: decision.chatId,
-          text: uiString(
-            (await isInterpretPath(deps.db, decision.chatId)) ? "documentReading" : "fileReceived",
-            language,
-          ),
-        });
-      }
+      // The queueing is below, and the acknowledgement follows it: whether this
+      // upload is the first of its burst is only known from the queue (#543).
+      const carriesFile = (decision.event.media_urls?.length ?? 0) > 0;
       // Queued, not forwarded. Run 9: five rapid messages used to mean five
       // immediate forwards, each tearing down the turn the last one opened —
       // Hermes kept each torn-down turn's own conversation loop running
@@ -608,7 +588,38 @@ export async function applyDecision(
       // happening must never expire under the person having it — including
       // while a model call or a document read is still in flight.
       await touchSessionDeadline(deps.db, decision.chatId);
-      await queueInboundMessage(deps.db, decision.chatId, decision.event);
+      const queued = await queueInboundMessage(deps.db, decision.chatId, decision.event);
+      // ONE acknowledgement PER BURST, and this is it.
+      //
+      // An album arrives as one Telegram message per photo, and each used to be
+      // acknowledged on its own: two ticket photos produced "reading it now"
+      // twice, which read as the bot repeating itself (2026-11-12, #543). The
+      // burst is read once and answered once, so it is acknowledged once - by
+      // the first file in the queue. A file that arrives after the burst was
+      // claimed starts a new burst, and is acknowledged like any other.
+      //
+      // And one acknowledgement per burst, not per file, was already the rule
+      // for the interpret path's own second sentence: it used to add one from
+      // `runDocumentPath` after the burst settled, so the organizer got
+      // "קיבלתי — קורא את זה עכשיו…" and then, seconds later, "קיבלתי — אני
+      // קורא את זה עכשיו. זה לוקח דקה…" — the same sentence twice, with a
+      // question wedged between them. Said HERE rather than there because here
+      // is instant: the burst has a settle window and reading takes a minute,
+      // and the acknowledgement is the one message whose entire job is to
+      // arrive immediately. The interpret path's wording sets the expectation,
+      // so it is used when that path will do the reading.
+      if (carriesFile && !queued.uploadAlreadyQueued) {
+        const view = await getSessionForChat(deps.db, decision.chatId);
+        const language = view.ok ? view.view.language : DEFAULT_LANGUAGE;
+        await deps.telegram.sendMessage({
+          chatId: decision.chatId,
+          text: uiString(
+            (await isInterpretPath(deps.db, decision.chatId)) ? "documentReading" : "fileReceived",
+            language,
+          ),
+        });
+        log(structuredLog("info", "trip_bot.upload_acknowledged", { session_id: decision.sessionId }));
+      }
       return;
     }
 
@@ -1514,6 +1525,16 @@ async function applyInterviewCallback(
       return;
     }
     await ack("Confirmed");
+    // A REPEAT OF A CONFIRMATION THAT ALREADY HAPPENED - a second tap on a
+    // button that stays on screen, a redelivered callback, two taps racing -
+    // is a success (the toast above) and nothing more. The confirmation message
+    // and the request to build the site belong to the confirmation that did the
+    // work: this branch used to say "That's everything - thank you" again on
+    // every tap, so the organizer got the confirmation twice (#543, 2026-11-12).
+    if (result.alreadyConfirmed) {
+      log(structuredLog("info", "trip_bot.confirm_repeat_ignored", { session_id: decision.sessionId }));
+      return;
+    }
     // In the interview's own language, and naming the assistant they chose.
     const confirmedView = sessionBeforeConfirm;
     const confirmedLanguage = confirmedView.ok ? confirmedView.view.language : DEFAULT_LANGUAGE;
@@ -1531,6 +1552,11 @@ async function applyInterviewCallback(
         ? uiString("intakeConfirmed", confirmedLanguage).replace("{name}", botName)
         : uiString("intakeConfirmedNoName", confirmedLanguage),
     });
+    // One line per confirmation message actually sent, so a duplicate on screen
+    // can be counted in the log instead of argued about: the relay log carries
+    // no timestamps, and #543's step 8 could not be told apart from a different
+    // message by reading it.
+    log(structuredLog("info", "trip_bot.confirmation_sent", { session_id: decision.sessionId }));
 
     // CONFIRMING IS THE APPROVAL, so provisioning starts here.
     //
@@ -1916,6 +1942,24 @@ async function ingestBurstDocuments(
   }
   // The same file attached twice in one burst is one document, read once.
   const unique = [...new Map(registered.map((doc) => [doc.documentId, doc])).values()];
+  // READ IS NOT KEPT, and nothing else says so. A relay with no document store
+  // (DOCUMENT_STORE_DIR unset) registers and reads every file and keeps none of
+  // the bytes - no error, no warning at start-up, only `stored:false` on each
+  // `interview.document_read` line. The 2026-11-12 staging run built a trip from
+  // two ticket photos whose originals were therefore never attached to its
+  // reservation (#544), and looked like a photo problem when it was every file
+  // type. Said once per burst, with the reason, at warn.
+  const unkept = unique.filter((doc) => !doc.stored);
+  if (unkept.length > 0) {
+    log(structuredLog("warn", "interview.originals_not_kept", {
+      session_id: burst.sessionId,
+      documents: unkept.length,
+      reason: deps.documentStore ? "STORE_WRITE_FAILED" : "NO_DOCUMENT_STORE",
+      hint: deps.documentStore
+        ? "see document.store_failed above"
+        : "DOCUMENT_STORE_DIR is unset on this relay: documents are read but their originals are dropped",
+    }));
+  }
   return { registered: unique, identity, unreadable };
 }
 
