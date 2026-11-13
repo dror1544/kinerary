@@ -1,6 +1,6 @@
 # A trip created on the dashboard seeds the interview
 
-Status: approved 2026-10-30 by Dror (decisions below) · Issue: #438 · Track: T1 · Size: L (M + sign-up name + card write-back) · Tier: Normal
+Status: approved 2026-10-30 by Dror (decisions below); AC-17 to AC-19 added 2026-11-12, AC-13/17/18 reworded 2026-11-13 (draft — behaviour decided by Dror in #548; approval at merge) · Issue: #438 · Track: T1 · Size: L (M + sign-up name + card write-back) · Tier: Normal
 Security path: yes since AC-11 (sign-up and Google sign-in write the account name: auth routes, boundary review) · Migration: possibly (an account display-name column if none fits; timestamped, rollback header) · Live-trip behaviour: yes (interviews started after the relay restart)
 
 > **Sprint 8 (2026-10-30): in scope, prioritised — first in the build order** (Dror via the lead session, 2026-10-30).
@@ -259,26 +259,38 @@ destination came out in Latin letters inside a Hebrew sentence, and it said
 "welcome back" to an account on its first trip. Dror chose the copy (option C).
 
 - **AC-13 (copy)** The seeded opening replaces the earlier lines (AC-2's wording)
-  with one friendly sentence, placed before the unchanged introduction:
-  - EN: "Hi {name}, {destination} in {month}. How exciting! 🎉 A few quick
-    questions and your trip will be ready for everyone."
-  - HE: "היי {name}, {destination} ב{month}. איזה כיף! 🎉 כמה שאלות קצרות והטיול
-    יהיה מוכן לכולם."
+  with one message in Dror's wording (2026-11-13, #548; it replaces the
+  two-line "Hi {name}, {destination} in {month}. How exciting! 🎉⏎A few quick
+  questions will fill in your trip's details." of 2026-11-12, and before that
+  "…and your trip will be ready for everyone"):
+  - EN: "Hi {name} 👋⏎I'm your Kinerary travel assistant, and I'd love to help
+    you plan your trip to {destination} in {month}. How exciting! 🎉⏎⏎To plan
+    the trip that suits you best, I'll ask a few short questions. If you have a
+    trip plan, flight tickets or any other booking, send it to me here in the
+    chat and I'll learn more about the trip. So let's start!"
+  - HE: "היי {name} 👋⏎אני עוזר הטיולים שלכם מבית Kinerary, ואשמח לעזור לכם
+    לתכנן את הטיול ל{destination} ב{month}. איזה כיף! 🎉⏎⏎כדי שנתכנן את הטיול
+    שהכי מתאים לכם, נעבור על כמה שאלות קצרות. אם יש לכם תוכנית טיול, כרטיסי
+    טיסה או כל הזמנה אחרת, שלחו לי אותם כאן בצ׳אט ואלמד מהם עוד על הטיול. אז
+    בואו נתחיל!"
+  (⏎ is a line break inside the one message.) Dror wrote it in the masculine
+  singular ("שתענה", "תשלח", "בוא נתחיל"); it is set in the plural voice the
+  rest of the interview uses, his tone kept.
   `{month}` is the departure month in words in the interview language
   ("November" / "נובמבר"); a trip that crosses a month names both
-  ("November–December" / "נובמבר–דצמבר"). No name drops "{name}," ("Hi! …" /
-  "היי! …"). No usable date drops the month ("Hi {name}, {destination}. How
-  exciting! …"). No destination leaves the greeting and the quick-questions
-  sentence ("Hi {name}! A few quick questions …"). The opening never prints
-  `YYYY-MM-DD` and never says dashboard or card. The introduction (or the
-  returning one) follows unchanged.
+  ("November–December" / "נובמבר–דצמבר"). No name drops "{name}" ("Hi 👋" /
+  "היי 👋"). No usable date drops the month ("…your trip to {destination}.").
+  No destination says "your trip" / "את הטיול". The opening never prints
+  `YYYY-MM-DD` and never says dashboard or card. What follows it is AC-17 and
+  AC-18.
 - **AC-14 (native names)** When the interview language is not English, the
   organizer's name and the destination are written in that language for the
   greeting: the name by sound (Arlo → ארלו), the destination by its common
   native name if it has one (Paris → פריז, Rome → רומא), else by sound
   (Gatecity → גייטסיטי). One bounded model call on the binding the interview
   already uses for `interpret` (`INTERPRET_RUNNER` / `MODEL` / `EFFORT`), a
-  strict short JSON answer, a hard 5-second ceiling, and a validation gate
+  strict short JSON answer, a hard ceiling (5 s as first written; 15 s since
+  2026-11-12, #546, see `546-native-names-budget.md`), and a validation gate
   (non-empty, short, target-script letters only, no Latin letters, no line
   breaks). On any failure, timeout or `NOT_CONFIGURED` the English as entered is
   used, a warning is logged (reason only, never the values), and the opening is
@@ -300,6 +312,49 @@ destination came out in Latin letters inside a Hebrew sentence, and it said
   account opening the link) mean "this account".
 - **AC-16 (suites)** `control-plane/api` against a `*test*` database, `tsc`
   clean, verifier report attached to the PR.
+
+## Decision (Dror, 2026-11-12 and 11-13, #548): the opening is one message, the greeting and the invitation
+
+Found on the Sprint 8 staging run, step 3 (Hebrew interview, dashboard-created
+trip "Gatecity"). Dror: "The greeting starts with the right greeting but then
+added the whole entire greeting message, this does not fit to the beginning of
+the greeting." His decision: "After it set from the user dashboard the greeting
+should include the beginning and explanation about a short questions to fill up
+the data." The first message was AC-13's opening followed by the whole
+introduction (nine paragraphs about what Kinerary is, ending "send me whatever
+you already have, or just type Let's start"): an organizer who has already
+chosen a destination and dates was welcomed twice, and told twice what to send.
+
+On 2026-11-13 Dror gave the wording himself ("this is the tone I like"): the
+greeting says who is writing and the trip, then one paragraph that a short
+questionnaire follows and that a trip plan, flight tickets or any booking can
+be sent in the chat, ending "so let's start"; and the button under it reads
+"Let's start", not "I don't have one".
+
+- **AC-17 (the first message)** Given an interview started from a trip created
+  on the dashboard (a seeded session), when the organizer opens the link, then
+  the opening is ONE message, exactly AC-13's: no introduction paragraph and no
+  separate document offer (its invitation is AC-13's second paragraph). English
+  and Hebrew, Hebrew in the plural voice, with the name and the destination in
+  Hebrew where AC-14 made them. For an English-entered value that could not be
+  translated the Latin spelling stands, as in AC-14. (Revised 2026-11-13: the
+  2026-11-12 build sent the greeting and the document offer as two messages.)
+- **AC-18 (its button)** The message carries one button, "Let's start" /
+  "בואו נתחיל" (Dror, 2026-11-13: "I don't have one" read oddly, and a document
+  can be sent at any time). It does exactly what "I don't have one" does on
+  an unseeded opening (same callback): the first question follows. The older
+  introduction is not sent at all. For an account that already has a built trip
+  (AC-15) one note, from the old returning introduction, sits between the two
+  paragraphs: the earlier trip and its assistant are untouched, and messages
+  here come to this interview until this trip is built (`/trips` moves between
+  them). It is the one fact a second trip raises, kept because dropping it
+  leaves the organizer thinking the first trip is being replaced.
+- **AC-19 (both ways in)** The same opening is sent when
+  the organizer opens the link (`/start <token>`) and when the account's own
+  organizer approves another Telegram account opening it (AC-5 of the
+  organizer-link spec): one renderer, `renderOpeningMessages`, behind both.
+  A trip with no dashboard card (AC-7) is unchanged: the one message it always
+  had.
 
 Known limit: the native names are made for the language the session starts in
 (Telegram's client locale). An interview that starts in English and switches to

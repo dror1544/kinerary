@@ -7,7 +7,7 @@
  * Rome -> רומא), else written by sound (Gatecity -> גייטסיטי).
  *
  * A BOUNDED model function, like `interpret`: one short call on the binding the interview already uses for it
- * (INTERPRET_RUNNER / MODEL / EFFORT -- the `interpret` task), a strict JSON answer, a hard timeout, and a validation
+ * (INTERPRET_RUNNER / MODEL / EFFORT -- the `interpret` task), a strict JSON answer, a hard timeout (`NATIVE_NAMES_TIMEOUT_MS`), and a validation
  * gate that decides whether what came back is acceptable. It is a convenience, never a dependency:
  *
  *   - English interview, nothing to translate, or no runner  -> no call, the English as entered.
@@ -33,8 +33,16 @@ import { structuredLog } from "./redaction.js";
 
 /** The task whose binding is used: the interview's own (`INTERPRET_*`). A separate task name would need its own env. */
 export const NATIVE_NAMES_TASK = "interpret";
-/** A hard ceiling on how long the opening may wait for this. The opening is sent without it after this. */
-export const NATIVE_NAMES_TIMEOUT_MS = 5_000;
+/**
+ * A hard ceiling on how long the opening may wait for this. The opening is sent without it after this.
+ *
+ * 15 s, not 5 (#546): on the Sprint 8 staging run (2026-11-12) the interview's `interpret` binding took 7137-9432 ms
+ * per call, so a 5 s ceiling timed out on every session and a Hebrew greeting went out with "Arlo" and "Gatecity" in
+ * Latin letters. 15 s is the slowest call seen plus about half again; it is the longest a first message may wait, once
+ * per session, and the fallback is still the English as entered. The wait cannot be taken off the opening: the
+ * language is the Telegram client's, known only when the organizer opens the link, so nothing can start earlier.
+ */
+export const NATIVE_NAMES_TIMEOUT_MS = 15_000;
 const MAX_NAME_CHARS = 30;
 const MAX_DESTINATION_CHARS = 60;
 

@@ -35,7 +35,7 @@ import { sha256, type PortalDependencies } from "../src/portal.js";
 import { applyDecision, flushSettledInboundBursts } from "../src/relay/poller.js";
 import { DEFAULT_STRINGS, dispatchUpdate } from "../src/relay/dispatch.js";
 import { digestTelegramId } from "../src/identity.js";
-import { nativeSeedNames } from "../src/native-names.js";
+import { NATIVE_NAMES_TIMEOUT_MS, nativeSeedNames } from "../src/native-names.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
 import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
@@ -144,6 +144,15 @@ async function opening(chatId: string, token: string, firstName?: string, langua
   return decision.reply;
 }
 
+/** Every message the organizer is sent when they open `token`'s link, in order (#548: a seeded opening is more than one). */
+async function openingMessages(chatId: string, token: string, firstName?: string, languageCode?: string, options: Parameters<typeof dispatchUpdate>[5] = {}) {
+  const decision = await dispatchUpdate(pool, startUpdate(chatId, token, firstName, languageCode), DEFAULT_STRINGS, () => {}, {}, options);
+  if (decision.kind === "reply") return [decision.reply];
+  assert.equal(decision.kind, "multi_reply");
+  if (decision.kind !== "multi_reply") throw new Error("unreachable");
+  return decision.replies;
+}
+
 async function answersOf(tripId: string): Promise<AnswerStore> {
   const r = await pool.query("SELECT answers FROM control_plane.intake_sessions WHERE trip_id = $1", [tripId]);
   assert.equal(r.rowCount, 1);
@@ -198,49 +207,50 @@ describe("seedAnswersFromCard", () => {
 
 describe("the seeded opening, as copy", () => {
   const seeded = { destination: "Japan", departureDate: "2027-04-12", returnDate: "2027-04-26", organizerName: "Dana" };
-  const EN_QUICK = "A few quick questions and your trip will be ready for everyone.";
-  const HE_QUICK = "כמה שאלות קצרות והטיול יהיה מוכן לכולם.";
-  const FORBIDDEN = /dashboard|card|לוח הבקרה|כרטיס|undefined|null/i;
+  const EN_INVITE = uiString("seedInvite", "en");
+  const HE_INVITE = uiString("seedInvite", "he");
+  const en = (hi: string, trip: string) => `${hi} 👋\nI'm your Kinerary travel assistant, and I'd love to help you plan ${trip}. How exciting! 🎉\n\n${EN_INVITE}`;
+  const he = (hi: string, trip: string) => `${hi} 👋\nאני עוזר הטיולים שלכם מבית Kinerary, ואשמח לעזור לכם לתכנן ${trip}. איזה כיף! 🎉\n\n${HE_INVITE}`;
+  // "card" as in the dashboard card; the Hebrew invitation's "כרטיסי טיסה" (flight tickets) is not it.
+  const FORBIDDEN = /dashboard|\bcard\b|לוח הבקרה|כרטיס הטיול|undefined|null/i;
 
-  test("AC-13 the full opening, in English and in Hebrew, exactly", () => {
-    assert.equal(seededOpening(seeded, "en"), `Hi Dana, Japan in April. How exciting! 🎉 ${EN_QUICK}`);
-    assert.equal(seededOpening({ ...seeded, destination: "יפן", organizerName: "דנה" }, "he"), `היי דנה, יפן באפריל. איזה כיף! 🎉 ${HE_QUICK}`);
+  test("AC-13 the full opening, in English and in Hebrew, exactly (Dror's wording, 2026-11-13)", () => {
+    assert.equal(seededOpening(seeded, "en"), en("Hi Dana", "your trip to Japan in April"));
+    assert.equal(seededOpening({ ...seeded, destination: "יפן", organizerName: "דנה" }, "he"), he("היי דנה", "את הטיול ליפן באפריל"));
+    assert.equal(EN_INVITE, "To plan the trip that suits you best, I'll ask a few short questions. If you have a trip plan, flight tickets or any other booking, send it to me here in the chat and I'll learn more about the trip. So let's start!");
+    assert.equal(HE_INVITE, "כדי שנתכנן את הטיול שהכי מתאים לכם, נעבור על כמה שאלות קצרות. אם יש לכם תוכנית טיול, כרטיסי טיסה או כל הזמנה אחרת, שלחו לי אותם כאן בצ׳אט ואלמד מהם עוד על הטיול. אז בואו נתחיל!");
   });
 
   test("AC-13 a trip that crosses a month names both, and a Hebrew one keeps the single ב", () => {
     const crossing = { ...seeded, departureDate: "2026-11-28", returnDate: "2026-12-06" };
-    assert.equal(seededOpening(crossing, "en"), `Hi Dana, Japan in November\u2013December. How exciting! 🎉 ${EN_QUICK}`);
-    assert.equal(seededOpening({ ...crossing, destination: "יפן", organizerName: "דנה" }, "he"), `היי דנה, יפן בנובמבר\u2013דצמבר. איזה כיף! 🎉 ${HE_QUICK}`);
+    assert.equal(seededOpening(crossing, "en"), en("Hi Dana", "your trip to Japan in November\u2013December"));
+    assert.equal(seededOpening({ ...crossing, destination: "יפן", organizerName: "דנה" }, "he"), he("היי דנה", "את הטיול ליפן בנובמבר\u2013דצמבר"));
     // Two dates in the same month are one month, not "April–April".
     assert.equal(tripMonthInWords("2027-04-12", "2027-04-26", "en"), "April");
   });
 
-  test("AC-13 no name drops 'Dana,'; no dates drops the month; no destination leaves the greeting and the quick questions", () => {
-    assert.equal(seededOpening({ ...seeded, organizerName: null }, "en"), `Hi! Japan in April. How exciting! 🎉 ${EN_QUICK}`);
-    assert.equal(seededOpening({ ...seeded, organizerName: null, destination: "יפן" }, "he"), `היי! יפן באפריל. איזה כיף! 🎉 ${HE_QUICK}`);
-    assert.equal(seededOpening({ ...seeded, departureDate: null, returnDate: null }, "en"), `Hi Dana, Japan. How exciting! 🎉 ${EN_QUICK}`);
-    assert.equal(seededOpening({ ...seeded, destination: "יפן", organizerName: "דנה", departureDate: null, returnDate: null }, "he"), `היי דנה, יפן. איזה כיף! 🎉 ${HE_QUICK}`);
-    assert.equal(seededOpening({ ...seeded, destination: null }, "en"), `Hi Dana! ${EN_QUICK}`);
-    assert.equal(seededOpening({ ...seeded, destination: null, organizerName: "דנה" }, "he"), `היי דנה! ${HE_QUICK}`);
-    assert.equal(seededOpening({ ...seeded, destination: null, organizerName: null }, "en"), `Hi! ${EN_QUICK}`);
-    assert.equal(seededOpening({ ...seeded, destination: null, organizerName: null }, "he"), `היי! ${HE_QUICK}`);
+  test("AC-13 no name drops 'Dana'; no dates drops the month; no destination says 'your trip'", () => {
+    assert.equal(seededOpening({ ...seeded, organizerName: null }, "en"), en("Hi", "your trip to Japan in April"));
+    assert.equal(seededOpening({ ...seeded, organizerName: null, destination: "יפן" }, "he"), he("היי", "את הטיול ליפן באפריל"));
+    assert.equal(seededOpening({ ...seeded, departureDate: null, returnDate: null }, "en"), en("Hi Dana", "your trip to Japan"));
+    assert.equal(seededOpening({ ...seeded, destination: "יפן", organizerName: "דנה", departureDate: null, returnDate: null }, "he"), he("היי דנה", "את הטיול ליפן"));
+    assert.equal(seededOpening({ ...seeded, destination: null }, "en"), en("Hi Dana", "your trip"));
+    assert.equal(seededOpening({ ...seeded, destination: null, organizerName: "דנה" }, "he"), he("היי דנה", "את הטיול"));
+    assert.equal(seededOpening({ ...seeded, destination: null, organizerName: null }, "en"), en("Hi", "your trip"));
+    assert.equal(seededOpening({ ...seeded, destination: null, organizerName: null }, "he"), he("היי", "את הטיול"));
     // A start date alone still gives a month; a date that is not a day gives none rather than a raw string.
     assert.match(seededOpening({ ...seeded, returnDate: null }, "en"), /Japan in April\./);
-    assert.match(seededOpening({ ...seeded, departureDate: "2027-02-30", returnDate: "nonsense" }, "en"), /^Hi Dana, Japan\. /);
+    assert.match(seededOpening({ ...seeded, departureDate: "2027-02-30", returnDate: "nonsense" }, "en"), /your trip to Japan\. /);
   });
 
   test("AC-13 the opening never says dashboard or card, never prints YYYY-MM-DD, and is in the plural voice in Hebrew", () => {
     for (const language of ["en", "he"] as const) {
-      for (const returning of [false, true]) {
-        const text = renderDocumentOffer(language, returning, seeded).text;
-        const head = text.slice(0, text.length - uiString(returning ? "introductionReturning" : "introduction", language).length);
-        assert.ok(head.length > 0 && text.endsWith(uiString(returning ? "introductionReturning" : "introduction", language)), `${language}/${returning}: the introduction follows unchanged`);
-        assert.doesNotMatch(head, FORBIDDEN, `${language}/${returning}: ${head}`);
-        assert.doesNotMatch(text, ISO, `${language}/${returning}: no YYYY-MM-DD`);
-        assert.ok(head.includes("Dana") && head.includes("Japan"), `${language}/${returning}: the name and the place`);
-        for (const asked of [INTAKE_QUESTIONS.find((q) => q.id === "destination")!.prompt, INTAKE_QUESTIONS.find((q) => q.id === "departure_date")!.prompt]) {
-          assert.ok(!text.includes(asked), `${language}: the question is not asked`);
-        }
+      const head = seededOpening(language === "he" ? { ...seeded, destination: "יפן", organizerName: "דנה" } : seeded, language);
+      assert.doesNotMatch(head, FORBIDDEN, `${language}: ${head}`);
+      assert.doesNotMatch(head, ISO, `${language}: no YYYY-MM-DD`);
+      assert.ok(head.includes(language === "he" ? "דנה" : "Dana") && head.includes(language === "he" ? "יפן" : "Japan"), `${language}: the name and the place`);
+      for (const asked of [INTAKE_QUESTIONS.find((q) => q.id === "destination")!.prompt, INTAKE_QUESTIONS.find((q) => q.id === "departure_date")!.prompt]) {
+        assert.ok(!head.includes(asked), `${language}: the question is not asked`);
       }
     }
     // Plural, never the masculine singular the first draft used ("אתה המארגן", "בחרת", "תגיד").
@@ -248,11 +258,18 @@ describe("the seeded opening, as copy", () => {
     assert.doesNotMatch(he, /אתה|בחרת|תגיד|ואשנה/);
   });
 
+  test("AC-17 the opening is two paragraphs: the greeting and the trip, then the questions and the invitation to send documents", () => {
+    for (const language of ["en", "he"] as const) {
+      const paragraphs = seededOpening(language === "he" ? { ...seeded, destination: "יפן", organizerName: "דנה" } : seeded, language).split("\n\n");
+      assert.equal(paragraphs.length, 2, `${language}: ${paragraphs.join(" | ")}`);
+      assert.equal(paragraphs[1], language === "he" ? HE_INVITE : EN_INVITE);
+    }
+  });
+
   test("AC-7 an unseeded opening is byte-identical to today's", () => {
     for (const language of ["en", "he"] as const) {
       assert.equal(renderDocumentOffer(language, false).text, uiString("introduction", language));
       assert.equal(renderDocumentOffer(language, true).text, uiString("introductionReturning", language));
-      assert.equal(renderDocumentOffer(language, false, undefined).text, uiString("introduction", language));
     }
   });
 });
@@ -299,31 +316,45 @@ describe("a trip created on the dashboard", { skip }, () => {
     assert.equal(trip.rows[0].lifecycle_state, "draft", "and the trip did not move");
   });
 
-  test("AC-2 the opening the organizer is sent greets them by name, states the destination and dates in words, and keeps the document offer", async () => {
+  test("AC-2 the opening the organizer is sent greets them by name and states the destination and month in words", async () => {
     const user = await organizer("Dana");
     const { token } = await dashboardTrip(user, JAPAN);
-    const reply = await opening(nextChat(), token, "Telegram-Dror");
-    assert.ok(reply.text.startsWith("Hi Dana, Japan in April. How exciting!"), reply.text);
-    assert.ok(!reply.text.includes("Telegram-Dror"), "the account's own name wins over the Telegram first name");
-    assert.doesNotMatch(reply.text, ISO);
-    assert.doesNotMatch(reply.text, /dashboard|card/i);
-    assert.ok(reply.text.endsWith(uiString("introduction", "en")));
-    assert.ok(JSON.stringify(reply.replyMarkup).includes("c:nodoc"), "the document offer's button is still there");
+    const messages = await openingMessages(nextChat(), token, "Telegram-Dror");
+    assert.equal(messages.length, 1);
+    const [first] = messages;
+    assert.ok(first!.text.startsWith("Hi Dana 👋\nI'm your Kinerary travel assistant, and I'd love to help you plan your trip to Japan in April. How exciting!"), first!.text);
+    assert.ok(!first!.text.includes("Telegram-Dror"), "the account's own name wins over the Telegram first name");
+    assert.doesNotMatch(first!.text, ISO);
+    assert.doesNotMatch(first!.text, /dashboard|card/i);
+  });
+
+  test("AC-17/AC-18 a dashboard-seeded session opens with one message: the greeting, the invitation, and a Let's-start button", async () => {
+    for (const language of ["en", "he"] as const) {
+      // One organizer is one Telegram account (#519): each language gets its own account, or the second chat would be asked about.
+      const fresh = await dashboardTrip(await organizer("Dana"), JAPAN);
+      const messages = await openingMessages(nextChat(), fresh.token, "Telegram-Dror", language);
+      assert.equal(messages.length, 1, language);
+      assert.ok(messages[0]!.text.endsWith(uiString("seedInvite", language)), `${language}: ${messages[0]!.text}`);
+      const [button] = messages[0]!.replyMarkup!.inline_keyboard.flat();
+      assert.equal(button!.text, uiString("seedStart", language), `${language}: the button says let's start`);
+      assert.equal(button!.callback_data, "c:nodoc", `${language}: and moves on exactly as "I don't have one" does`);
+      assert.ok(!messages[0]!.text.includes(uiString("introduction", language).slice(0, 30)), `${language}: no introduction`);
+      assert.ok(!messages[0]!.text.includes(uiString("documentOffer", language)), `${language}: the invitation replaces the old offer`);
+    }
   });
 
   test("AC-2 a Hebrew interview greets in Hebrew", async () => {
     const user = await organizer("דנה");
     const { token } = await dashboardTrip(user, JAPAN);
-    const reply = await opening(nextChat(), token, "Dror", "he");
-    assert.ok(reply.text.startsWith("היי דנה, Japan באפריל. איזה כיף!"), "no runner here, so the destination stays as entered: " + reply.text);
-    assert.ok(reply.text.endsWith(uiString("introduction", "he")));
-    assert.doesNotMatch(reply.text, ISO);
+    const [first] = await openingMessages(nextChat(), token, "Dror", "he");
+    assert.ok(first!.text.startsWith("היי דנה 👋\nאני עוזר הטיולים שלכם מבית Kinerary, ואשמח לעזור לכם לתכנן את הטיול לJapan באפריל."), "no runner here, so the destination stays as entered: " + first!.text);
+    assert.doesNotMatch(first!.text, ISO);
   });
 
   test("AC-2 an account with no name of its own is greeted by its Telegram first name, never by its email-derived display name", async () => {
     const user = await organizer(null, "dror.elul+kin7");
     const { token } = await dashboardTrip(user, JAPAN);
-    const reply = await opening(nextChat(), token, "Dror");
+    const reply = (await openingMessages(nextChat(), token, "Dror"))[0]!;
     assert.ok(reply.text.includes("Dror"), reply.text);
     assert.ok(!reply.text.includes("dror.elul"), "the display name is never used");
     // And with neither, the opening states the starting point without a name.
@@ -394,10 +425,10 @@ describe("a trip created on the dashboard", { skip }, () => {
   test("AC-5 a card with no dates seeds no date and the opening names only the destination", async () => {
     const user = await organizer("Dana");
     const { tripId, token } = await dashboardTrip(user, { destination: "Japan", tripType: "family" });
-    const reply = await opening(nextChat(), token);
+    const reply = (await openingMessages(nextChat(), token))[0]!;
     const answers = await answersOf(tripId);
     assert.ok(!("departure_date" in answers) && !("return_date" in answers));
-    assert.ok(reply.text.includes("Japan") && !/20\d\d/.test(reply.text.split(uiString("introduction", "en"))[0]!), reply.text);
+    assert.ok(reply.text.includes("Japan") && !/20\d\d/.test(reply.text), reply.text);
   });
 
   test("AC-6 a card value the interview would not accept is not seeded, and the session still starts", async () => {
@@ -888,7 +919,12 @@ function nativeRunner(answer: (req: NativeRequest) => unknown) {
   const runner = {
     async run(req: NativeRequest) {
       calls.push(req);
-      const raw = answer(req);
+      let raw = answer(req);
+      // A model that answers, but slowly: `{ after: ms, value }`.
+      if (typeof raw === "object" && raw !== null && "after" in raw) {
+        await new Promise((resolve) => setTimeout(resolve, (raw as { after: number }).after));
+        raw = (raw as { value: unknown }).value;
+      }
       if (raw === "hang") return new Promise<never>(() => {});
       if (raw === "throw") throw new Error("boom");
       if (typeof raw === "object" && raw !== null && "failure" in raw) {
@@ -904,13 +940,14 @@ function nativeRunner(answer: (req: NativeRequest) => unknown) {
 
 describe("AC-14 the greeting in the interview's own language", { skip }, () => {
   const GATECITY = { destination: "Gatecity", tripType: "family", startDate: "2026-11-14", endDate: "2026-11-21" };
-  const HE_TAIL = "איזה כיף! 🎉 כמה שאלות קצרות והטיול יהיה מוכן לכולם.";
+  const heOpening = (name: string, place: string) =>
+    `היי ${name} 👋\nאני עוזר הטיולים שלכם מבית Kinerary, ואשמח לעזור לכם לתכנן את הטיול ל${place} בנובמבר. איזה כיף! 🎉\n\n${uiString("seedInvite", "he")}`;
   const SUCCESS = { name: "ארלו", destination: "גייטסיטי" };
   const headOf = (started: Awaited<ReturnType<typeof startFromDeepLink>>) => {
     assert.equal(started.kind, "started");
     if (started.kind !== "started") throw new Error("unreachable");
-    const text = renderDocumentOffer(started.view.language, started.returning, started.seeded).text;
-    return text.slice(0, text.indexOf("\n\n"));
+    // The first message is the whole opening (#548).
+    return seededOpening(started.seeded!, started.view.language);
   };
   async function start(language: string | undefined, runner: unknown, opts: { name?: string; card?: Record<string, unknown> } = {}) {
     const user = await organizer(opts.name ?? "Arlo");
@@ -926,10 +963,10 @@ describe("AC-14 the greeting in the interview's own language", { skip }, () => {
   test("success: the Hebrew opening names Arlo and Gatecity in Hebrew, once, and the destination answer stays English", async () => {
     const { runner, calls } = nativeRunner(() => SUCCESS);
     const { tripId, started, lines } = await start("he", runner);
-    assert.equal(headOf(started), `היי ארלו, גייטסיטי בנובמבר. ${HE_TAIL}`);
+    assert.equal(headOf(started), heOpening("ארלו", "גייטסיטי"));
     assert.equal(calls.length, 1);
     assert.equal(calls[0]!.task, "interpret", "the interview's own binding");
-    assert.equal(calls[0]!.timeoutMs, 5000, "a hard ceiling");
+    assert.equal(calls[0]!.timeoutMs, NATIVE_NAMES_TIMEOUT_MS, "a hard ceiling");
     assert.equal(textOf(await answersOf(tripId), "destination"), "Gatecity", "the slug is made from the English as entered");
     assert.deepEqual(await storedNames(tripId), {
       language: "he", organizer: { source: "Arlo", text: "ארלו" }, destination: { source: "Gatecity", text: "גייטסיטי" },
@@ -946,7 +983,7 @@ describe("AC-14 the greeting in the interview's own language", { skip }, () => {
     const decision = await dispatchUpdate(pool, startUpdate(nextChat(), token, "Telegram-Dror", "he"), DEFAULT_STRINGS, () => {}, {}, { modelRunner: runner });
     assert.equal(decision.kind, "reply");
     if (decision.kind !== "reply") return;
-    assert.ok(decision.reply.text.startsWith(`היי ארלו, גייטסיטי בנובמבר. ${HE_TAIL}`), decision.reply.text);
+    assert.equal(decision.reply.text, heOpening("ארלו", "גייטסיטי"));
     assert.equal(calls.length, 1);
   });
 
@@ -963,7 +1000,7 @@ describe("AC-14 the greeting in the interview's own language", { skip }, () => {
     for (const [label, answer] of failures) {
       const { runner, calls } = nativeRunner(() => answer);
       const { tripId, started, lines } = await start("he", runner);
-      assert.equal(headOf(started), `היי Arlo, Gatecity בנובמבר. ${HE_TAIL}`, label);
+      assert.equal(headOf(started), heOpening("Arlo", "Gatecity"), label);
       assert.equal(calls.length, 1, label);
       assert.equal(await storedNames(tripId), null, `${label}: nothing stored`);
       assert.ok(lines.some((l) => l.includes("interview.native_names_unavailable") && JSON.parse(l).level === "warn"), `${label}: a warning`);
@@ -974,7 +1011,7 @@ describe("AC-14 the greeting in the interview's own language", { skip }, () => {
   test("one usable field is kept when the other is not", async () => {
     const { runner } = nativeRunner(() => ({ name: "ארלו", destination: "Gatecity" }));
     const { started, tripId } = await start("he", runner);
-    assert.equal(headOf(started), `היי ארלו, Gatecity בנובמבר. ${HE_TAIL}`);
+    assert.equal(headOf(started), heOpening("ארלו", "Gatecity"));
     assert.deepEqual(await storedNames(tripId), { language: "he", organizer: { source: "Arlo", text: "ארלו" } });
   });
 
@@ -994,11 +1031,25 @@ describe("AC-14 the greeting in the interview's own language", { skip }, () => {
     assert.equal(await storedNames(tripId), null);
   });
 
+  test("#546 the ceiling clears the binding's measured latency (7.1-9.4 s per call on staging, 2026-11-12) and is what the runner is given", () => {
+    assert.ok(NATIVE_NAMES_TIMEOUT_MS > 9_432, `${NATIVE_NAMES_TIMEOUT_MS} ms is below the slowest call seen`);
+    assert.ok(NATIVE_NAMES_TIMEOUT_MS <= 20_000, "and it is still a ceiling, not an open door");
+  });
+
+  test("#546 a translation that takes 5.5 s (past the old 5 s ceiling) still lands in the greeting", async () => {
+    const { runner, calls } = nativeRunner(() => ({ after: 5_500, value: SUCCESS }));
+    const { tripId, started, lines } = await start("he", runner);
+    assert.equal(headOf(started), heOpening("ארלו", "גייטסיטי"));
+    assert.equal(calls.length, 1);
+    assert.ok(!lines.some((l) => l.includes("native_names_unavailable")), "no fallback warning");
+    assert.ok(await storedNames(tripId), "and it is stored for the later uses");
+  });
+
   test("an English interview makes no call at all", async () => {
     for (const language of ["en", undefined]) {
       const { runner, calls } = nativeRunner(() => SUCCESS);
       const { started, tripId } = await start(language, runner);
-      assert.equal(headOf(started), "Hi Arlo, Gatecity in November. How exciting! 🎉 A few quick questions and your trip will be ready for everyone.");
+      assert.equal(headOf(started), `Hi Arlo 👋\nI'm your Kinerary travel assistant, and I'd love to help you plan your trip to Gatecity in November. How exciting! 🎉\n\n${uiString("seedInvite", "en")}`);
       assert.equal(calls.length, 0, String(language));
       assert.equal(await storedNames(tripId), null);
     }
@@ -1006,14 +1057,14 @@ describe("AC-14 the greeting in the interview's own language", { skip }, () => {
 
   test("with no runner at all the opening is the English as entered, and says why in the log", async () => {
     const { started, lines } = await start("he", undefined);
-    assert.equal(headOf(started), `היי Arlo, Gatecity בנובמבר. ${HE_TAIL}`);
+    assert.equal(headOf(started), heOpening("Arlo", "Gatecity"));
     assert.ok(lines.some((l) => l.includes("native_names_unavailable") && l.includes("NOT_CONFIGURED")));
   });
 
   test("a name already in Hebrew is not sent to the model", async () => {
     const { runner, calls } = nativeRunner(() => ({ destination: "גייטסיטי" }));
     const { started } = await start("he", runner, { name: "דנה" });
-    assert.equal(headOf(started), `היי דנה, גייטסיטי בנובמבר. ${HE_TAIL}`);
+    assert.equal(headOf(started), heOpening("דנה", "גייטסיטי"));
     assert.equal(calls.length, 1);
     assert.ok(!calls[0]!.prompt.includes("דנה") && !/"name"/.test(calls[0]!.prompt.split("Input:")[0]!.split("Return ONLY")[1]!), "only the destination was asked");
   });
@@ -1070,24 +1121,25 @@ describe("AC-15 the returning opening is for an account that has had a trip buil
 
     const fresh = await organizer("Arlo");
     const next = await dashboardTrip(fresh, { destination: "Gatecity", tripType: "family", startDate: "2026-11-14", endDate: "2026-11-21" });
-    const started = await startFromDeepLink(pool, chat, next.token);
-    assert.equal(started.kind, "started");
-    if (started.kind !== "started") return;
-    assert.equal(started.returning, false, "Telegram history under another account is not this account's");
-    assert.ok(renderDocumentOffer("en", started.returning, started.seeded).text.endsWith(uiString("introduction", "en")));
+    // Telegram history under another account is not this account's: no "your previous trip is untouched" note.
+    const messages = await openingMessages(chat, next.token, "Arlo");
+    assert.equal(messages.length, 1);
+    assert.ok(messages[0]!.text.startsWith("Hi Arlo 👋"), messages[0]!.text);
+    assert.ok(!messages[0]!.text.includes(uiString("seedReturningNote", "en")), "a first-time account is not told about a previous trip");
   });
 
-  test("the same account starting a second trip is welcomed back", async () => {
+  test("the same account starting a second trip is told its first one is untouched, between the greeting and the invitation", async () => {
     const chat = nextChat();
     const user = await organizer("Dana");
     const first = await dashboardTrip(user, JAPAN);
     await pool.query("UPDATE control_plane.trips SET lifecycle_state = 'ready_private' WHERE id = $1", [first.tripId]);
     const second = await dashboardTrip(user, { destination: "Peru", tripType: "couple", startDate: "2028-01-05", endDate: "2028-01-19" });
-    const started = await startFromDeepLink(pool, chat, second.token);
-    assert.equal(started.kind, "started");
-    if (started.kind !== "started") return;
-    assert.equal(started.returning, true);
-    assert.ok(renderDocumentOffer("en", started.returning, started.seeded).text.endsWith(uiString("introductionReturning", "en")));
+    const messages = await openingMessages(chat, second.token, "Dana");
+    assert.equal(messages.length, 1);
+    const paragraphs = messages[0]!.text.split("\n\n");
+    assert.ok(paragraphs[0]!.includes("your trip to Peru in January."), messages[0]!.text);
+    assert.deepEqual(paragraphs.slice(1), [uiString("seedReturningNote", "en"), uiString("seedInvite", "en")]);
+    assert.ok(JSON.stringify(messages[0]!.replyMarkup).includes("c:nodoc"));
   });
 });
 

@@ -1435,12 +1435,6 @@ export function renderConfirmPrompt(
 export function renderDocumentOffer(
   language: Language = DEFAULT_LANGUAGE,
   returning = false,
-  /**
-   * Set when the trip was created on the dashboard (#438): who the organizer is to it, and the destination and dates
-   * already chosen. Said BEFORE the introduction, which follows unchanged; absent, the opening is exactly what it
-   * always was, byte for byte.
-   */
-  seeded?: SeededOpening,
 ): RenderedQuestion {
   return {
     // One message, not two: an opening that arrives as a pair of notifications
@@ -1456,15 +1450,35 @@ export function renderDocumentOffer(
     // is a bot talking past them. What that version says instead is the one
     // thing only a second trip raises — that the first one is not being
     // replaced.
-    text: seeded
-      ? `${seededOpening(seeded, language)}\n\n${uiString(returning ? "introductionReturning" : "introduction", language)}`
-      : uiString(returning ? "introductionReturning" : "introduction", language),
+    text: uiString(returning ? "introductionReturning" : "introduction", language),
     replyMarkup: {
       inline_keyboard: [[
         { text: uiString("noDocument", language), callback_data: NO_DOCUMENT_CALLBACK_DATA },
       ]],
     },
   };
+}
+
+/**
+ * An unseeded trip opens with the one message it always has (`renderDocumentOffer`). A trip created on the dashboard
+ * (#438) has told the product its destination and dates already, so the older introduction -- nine paragraphs about
+ * what Kinerary is -- does not belong after "Hi Dana": its opening is one message in Dror's wording (#548,
+ * 2026-11-13), the greeting, who is writing and the trip, then that a few short questions follow and that documents
+ * can be sent instead, with a "Let's start" button under it (the "I don't have one" callback). For an account that already has a built trip, the
+ * note that the earlier trip is untouched sits between the two. The first question follows when it is answered, as
+ * for any other opening.
+ */
+export function renderOpeningMessages(
+  language: Language = DEFAULT_LANGUAGE,
+  returning = false,
+  /** Set when the trip was created on the dashboard (#438): who the organizer is to it, and the destination and dates already chosen. */
+  seeded?: SeededOpening,
+): RenderedQuestion[] {
+  if (!seeded) return [renderDocumentOffer(language, returning)];
+  return [{
+    text: seededOpening(seeded, language, returning ? uiString("seedReturningNote", language) : undefined),
+    replyMarkup: { inline_keyboard: [[{ text: uiString("seedStart", language), callback_data: NO_DOCUMENT_CALLBACK_DATA }]] },
+  }];
 }
 
 /**
