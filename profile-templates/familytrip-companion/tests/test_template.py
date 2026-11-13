@@ -64,8 +64,49 @@ class Tests(unittest.TestCase):
   # companion still needs (file/memory/cronjob/skills).
   td,o,c=self.go(); self.addCleanup(td.cleanup); self.assertEqual(c.returncode,0,c.stderr)
   overlay=yaml.safe_load((o/'config.overlay.yaml').read_text())
-  self.assertEqual(overlay['skills'],{'write_approval':True})
-  self.assertEqual(overlay['agent']['disabled_toolsets'],['terminal','code_execution'])
+  self.assertIs(overlay['skills']['write_approval'],True)
+  disabled=overlay['agent']['disabled_toolsets']
+  # #547: the toolsets this change adds must not take the ones the companion needs with them.
+  for keep in ('file','memory','cronjob','skills','web'): self.assertNotIn(keep,disabled)
+ def test_rendered_overlay_exposes_no_desktop_or_browser_control(self):
+  # #547 (2026-11-12, Sprint 8 staging): a tester pasted a Terminal command into a
+  # companion's private chat; it called `computer_use`. Resolving the pre-#547
+  # overlay through Hermes's resolver gave 38 tools including computer_use and 18
+  # browser_*; it must now give none. `skill_manage` cannot be dropped by toolset
+  # (shared `skills` toolset with skill_view) and Hermes's background skill review
+  # stays ON by decision; skill writes are held by write_approval, asserted in
+  # test_rendered_overlay_gates_skill_manage_writes.
+  td,o,c=self.go(); self.addCleanup(td.cleanup); self.assertEqual(c.returncode,0,c.stderr)
+  overlay=yaml.safe_load((o/'config.overlay.yaml').read_text())
+  disabled=overlay['agent']['disabled_toolsets']
+  for ts in ('terminal','code_execution','computer_use','browser','connections'): self.assertIn(ts,disabled)
+ HERMES_PY=Path.home()/'.hermes'/'hermes-agent'/'venv'/'bin'/'python'
+ @unittest.skipUnless(HERMES_PY.exists(),'no Hermes install on this machine (CI): config-level assertions above still run')
+ def test_rendered_overlay_resolves_to_no_desktop_browser_or_connector_tool_in_hermes(self):
+  # The same claim against Hermes's real resolver, before check_fn filtering, so the
+  # answer does not depend on whether this machine happens to have cua-driver or a
+  # browser installed (the tool was reachable on the staging Mac; it failed only
+  # because its backend was unavailable).
+  td,o,c=self.go(); self.addCleanup(td.cleanup); self.assertEqual(c.returncode,0,c.stderr)
+  cfg=yaml.safe_load((o/'config.overlay.yaml').read_text()); cfg.pop('mcp_servers',None)
+  home=Path(td.name)/'hermes-home'; home.mkdir(); (home/'config.yaml').write_text(yaml.safe_dump(cfg))
+  prog=('import sys,json,yaml\n'
+        'sys.path.insert(0,sys.argv[1])\n'
+        'from hermes_cli.tools_config import _get_platform_tools\n'
+        'import model_tools\n'
+        'cfg=yaml.safe_load(open(sys.argv[2]))\n'
+        'dis=(cfg.get("agent") or {}).get("disabled_toolsets")\n'
+        'out={p:sorted(model_tools._select_tool_names(sorted(_get_platform_tools(cfg,p)),dis,True)) for p in ("telegram","cron")}\n'
+        'print("RESOLVED"+json.dumps(out))\n')
+  env={'PATH':'/usr/bin:/bin','HOME':td.name,'HERMES_HOME':str(home)}
+  r=subprocess.run([str(self.HERMES_PY),'-c',prog,str(Path.home()/'.hermes'/'hermes-agent'),str(home/'config.yaml')],text=True,capture_output=True,env=env)
+  self.assertEqual(r.returncode,0,r.stderr[-800:])
+  got=json.loads(r.stdout.split('RESOLVED',1)[1])
+  for plat,names in got.items():
+   self.assertGreater(len(names),5,plat)  # not vacuous: the tools it needs are still there
+   for need in ('skill_view','read_file','web_search','memory'): self.assertIn(need,names,plat)
+   bad=[n for n in names if n in ('computer_use','manage_connections') or n.startswith('browser_') or n in ('terminal','execute_code')]
+   self.assertEqual(bad,[],plat)
  def test_rendered_overlay_silences_the_codex_autoraise_notice(self):
   # #65: Hermes replays "auto-compaction was raised ..." (naming the model and
   # a `hermes config set` command) into the FIRST group reply of every fresh
