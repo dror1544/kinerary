@@ -22,6 +22,26 @@ export interface Scenario {
    * as well as one who taps Couple. Used by `star`.
    */
   typedChoice?: Record<string, string>;
+  /**
+   * The documents are PHOTOS, sent together as one album (Telegram's media
+   * group), read from the `--photos` directory. Used by `gatecity`. Exclusive
+   * with `documents`: that one sends files, one message each.
+   */
+  photos?: boolean;
+  /**
+   * Said in words at the summary, before it is confirmed — a correction the
+   * organizer thinks of on reading it ("actually we fly back on 22 November").
+   * Whatever the interview answers (a draft to apply, or the change applied
+   * outright), the summary is confirmed after.
+   */
+  summaryChange?: string;
+  /**
+   * Buttons the organizer taps whenever the interview offers them outside a
+   * question of its own, by callback data. `y:travelers` is the offer to add a
+   * second ticket's passengers to the roster (#412), which the router never
+   * asks as a question: the travellers question is already answered.
+   */
+  tapOffers?: string[];
 }
 
 /**
@@ -113,3 +133,46 @@ export const STAR_SCENARIO: Scenario = {
   multi: {},
   typedChoice: { trip_type: "טיול זוגות ולא משפחה, נהיה שני זוגות" },
 };
+
+/**
+ * Scenario 7 — Dror's manual Sprint 8 staging test (2026-11-12), replayed.
+ *
+ * A trip created on the DASHBOARD (so destination, dates and type arrive
+ * seeded, #438), an interview in Hebrew, and two e-tickets for the same flight
+ * sent as PHOTOS in one album — two couples, two booking references. Everything
+ * the interview asks that the seed and the tickets do not settle is answered
+ * below, in case it is asked anyway: being asked something already known is a
+ * finding the transcript and `asked` (--findings) show, not a stall.
+ *
+ * Consistent with tools/ticket_photos.py, which draws the tickets and holds the
+ * expectations the run checks on the finished trip (organizer-scenarios.test.ts
+ * proves the correction and the dates agree).
+ *
+ * The dashboard seeds a return date one day short of the real one, so the
+ * correction at the summary is a real change; `summaryChange` is that sentence.
+ */
+export const GATECITY_SCENARIO: Scenario = {
+  language: "he",
+  documents: false,
+  photos: true,
+  text: {
+    destination: "גייטסיטי",
+    departure_date: "14 בנובמבר 2026",
+    return_date: "22 בנובמבר 2026",
+    travelers: "ארלו וספר, לנה וספר, בריה טאליס וקול טאליס",
+    phases: "גייטסיטי, 14-22 בנובמבר",
+    bot_name: "גיטי",
+    trip_interests: "אוכל ושוטטות בעיר",
+    organizer_identity: "ארלו וספר",
+  },
+  choice: { trip_type: "family", bot_gender: "female", bot_tone: "warm", trip_pace: "balanced" },
+  multi: { dietary: ["none"] },
+  summaryChange: "בעצם אנחנו טסים חזרה ב-22 בנובמבר",
+  tapOffers: ["y:travelers"],
+};
+
+/** The questions a dashboard-created trip answers before the interview starts (#438): asking one is a regression. */
+export const SEEDED_QUESTIONS = ["destination", "departure_date", "return_date", "trip_type"] as const;
+
+/** What the Apply button of a drafted change carries (`changeCallbackData`, chat-router.ts): `pc:<draft>[:<8 hex>]:a`. */
+export const APPLY_CHANGE_DATA = /^pc:[a-z]{2,12}_[A-Za-z0-9]{8,64}(?::[0-9a-f]{8})?:a$/;

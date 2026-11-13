@@ -93,6 +93,9 @@ GREEN, RED, YELLOW, DIM, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[2m", 
 # The scenario that is not a fixture: a person's own trip. Named once so the
 # places that must treat it differently cannot drift apart.
 OWN = "own"
+# Dror's manual Sprint 8 test with the tickets sent as photos — see the section
+# "The `gatecity` scenario" below and docs/specs/sprint-8/e2e-photo-tickets-scenario.md.
+GATECITY = "gatecity"
 
 
 class Failed(Exception):
@@ -103,6 +106,9 @@ class Failed(Exception):
 # green until the interview-shape fix lands and the companion can edit stops,
 # and `all` is what hands-off runs use — a scenario that is red for known
 # reasons must be asked for by name.
+#
+# `gatecity` is not here either, for a reason of the same kind: it judges fixes
+# that are still being built, so it is red until they merge. Ask for it by name.
 ALL_SCENARIOS = ["japan", "multi", "manual"]
 
 
@@ -311,18 +317,27 @@ def stage_signup(trip_name: str) -> dict:
 
 def stage_interview(ctx: dict, scenario: str, work: Path, auto: "Auto | None" = None) -> None:
     stage(f"Interview — scenario '{scenario}'" + (" (automated organizer)" if auto else ""))
+    photos = None
     if scenario == OWN:
         docs = None
         ok("your own trip — nothing is scripted; answer about a trip you mean to take")
         note("the checks afterwards come from the intake you confirm, not from a fixture")
+    elif scenario == GATECITY:
+        docs = None
+        photos = _ticket_photos(ctx, work)
     else:
         docs = _fixture_documents(scenario, work)
-    enrollment = api("POST", f"/v1/trips/{ctx['trip_id']}/enrollment", {},
-                     auth_header(ctx["email"], ctx["password"]))
-    ctx["enrollment"] = enrollment
-    ok(f"enrollment issued ({enrollment['enrollmentId']})")
+    if ctx.get("enrollment"):
+        # The dashboard issued the link (stage_dashboard_trip), as its button does.
+        enrollment = ctx["enrollment"]
+        ok(f"interview link from the dashboard ({enrollment.get('enrollmentId')})")
+    else:
+        enrollment = api("POST", f"/v1/trips/{ctx['trip_id']}/enrollment", {},
+                         auth_header(ctx["email"], ctx["password"]))
+        ctx["enrollment"] = enrollment
+        ok(f"enrollment issued ({enrollment['enrollmentId']})")
     if auto:
-        auto.interview(ctx, scenario, enrollment["token"], docs)
+        auto.interview(ctx, scenario, enrollment["token"], docs, photos)
         return
     print(f"\n  {YELLOW}🧍 HUMAN{RESET} open this, answer the interview, and CONFIRM:\n")
     print(f"     https://t.me/{bot_username()}?start={enrollment['token']}\n")
@@ -343,6 +358,20 @@ def _fixture_documents(scenario: str, work: Path) -> "Path | None":
     else:
         ok("no documents — every answer typed, which is the control case")
     return docs
+
+
+def _ticket_photos(ctx: dict, work: Path) -> Path:
+    """Draw the scenario's ticket photos into the run's own directory — never the tree.
+
+    The sha256 of each is kept in the run's context: the finished trip is
+    judged against exactly the bytes that were sent."""
+    import hashlib
+    out = work / "gatecity-photos"
+    paths = _gatecity().build(out)
+    ctx["ticket_shas"] = {t["ref"]: hashlib.sha256((out / t["file"]).read_bytes()).hexdigest()
+                          for t in _gatecity().TICKETS}
+    ok(f"drew {len(paths)} ticket photo(s): {', '.join(p.name for p in paths)}")
+    return out
 
 
 class Auto:
@@ -367,8 +396,8 @@ class Auto:
         self.work = work
         self.log = work / "fake-telegram.log"
 
-    def begin(self) -> None:
-        stage("Automated organizer — relay pointed at the Telegram stand-in")
+    def start(self) -> None:
+        """Run the Telegram stand-in and wait until it answers. Touches no relay."""
         self.proc = subprocess.Popen(
             ["node", "--import", "tsx", "tools/fake-telegram.ts", "--port", str(self.port)],
             cwd=REPO / "control-plane/api", stdout=self.log.open("w"), stderr=subprocess.STDOUT,
@@ -382,10 +411,15 @@ class Auto:
                 return False
         wait_for("the Telegram stand-in", healthy, timeout=30, interval=1)
         ok(f"Telegram stand-in on {self.root}")
+
+    def begin(self) -> None:
+        stage("Automated organizer — relay pointed at the Telegram stand-in")
+        self.start()
         relay_restart(self.root)
         ok("relay restarted against the stand-in (agentless, runners set, gateways reconnected)")
 
-    def interview(self, ctx: dict, scenario: str, token: str, docs: Path | None) -> None:
+    def interview(self, ctx: dict, scenario: str, token: str, docs: Path | None,
+                  photos: Path | None = None) -> None:
         # A private-chat id no real Telegram user has (real ids are ~10 digits),
         # fresh per run so no earlier session or binding is inherited.
         chat = str(9_000_000_000_000 + secrets.randbelow(10**9))
@@ -396,6 +430,8 @@ class Auto:
                "--token", token, "--chat", chat, "--telegram", self.root]
         if docs:
             cmd += ["--docs", str(docs)]
+        if photos:
+            cmd += ["--photos", str(photos)]
         report = None
         if scenario == "chaos":
             # Outside the run's work dir on purpose: that goes away with a passing
@@ -404,7 +440,7 @@ class Auto:
             report.parent.mkdir(parents=True, exist_ok=True)
             cmd += ["--report", str(report)]
         findings = None
-        if scenario == "star":
+        if scenario in ("star", GATECITY):
             # What the organizer saw about ITSELF — whether its typed trip type
             # had to fall back to the button. Read back after the build and turned
             # into a verdict, so it fails alongside the site's own expectations
@@ -1838,6 +1874,457 @@ def stage_companion_changes(ctx: dict, auto: "Auto", spec: dict) -> None:
     report_verdicts(verdicts, deferred_with_reasons(expect), ctx)
 
 
+# ── The `gatecity` scenario: Dror's manual Sprint 8 test, with ticket PHOTOS ──
+#
+# docs/specs/sprint-8/e2e-photo-tickets-scenario.md. A trip made on the dashboard,
+# a Hebrew interview, two tickets for one flight sent as an album of photos, a
+# correction in words at the summary — then the finished trip is read back.
+#
+# Every check is its own Verdict, NAMED BY THE ISSUE IT PROTECTS, so a red run
+# says which fix regressed. They are not deferred: several are red until the
+# fixes land, and a red check is the point. All of them are printed, at the stage
+# that can judge them and again in one scorecard at the end, before anything is
+# raised; a stage that cannot run says so instead of hiding the rest.
+
+#: What the first message to the organizer may be (#548): an opening line and one
+#: line of explanation. Two lines, and short; the old greeting was a page.
+GREETING_MAX_LINES = 2
+GREETING_MAX_CHARS = 320
+#: A message that offers the document, which must arrive on its own, after the greeting (#548).
+DOCUMENT_OFFER_BUTTON = "c:nodoc"
+_ISO_DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+_WELCOME_BACK_RE = re.compile(r"welcome back|ברוכים השבים|ברוך השב|ברוכה השבה", re.IGNORECASE)
+_HEBREW_RE = re.compile(r"[֐-׿]")
+#: The interview's "I'm building your trip site now" (intake-copy.ts intakeConfirmed /
+#: intakeConfirmedNoName), the message sent once when the intake is confirmed (#543).
+_CONFIRMATION_RE = re.compile(r"אני מקים לכם עכשיו את אתר הטיול|building your trip site now", re.IGNORECASE)
+#: Questions a dashboard-created trip answers before the interview begins (#438).
+SEEDED_QUESTIONS = ("destination", "departure_date", "return_date", "trip_type")
+
+
+def _gatecity() -> dict:
+    """The scenario's facts and the ticket drawing, from control-plane/api/tools/ticket_photos.py."""
+    tools = str(REPO / "control-plane/api/tools")
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    import ticket_photos  # noqa: E402
+    return ticket_photos  # type: ignore[return-value]
+
+
+def _preview(text: str, limit: int = 110) -> str:
+    one_line = " ⏎ ".join(line for line in text.splitlines() if line.strip())
+    return one_line if len(one_line) <= limit else one_line[:limit] + "…"
+
+
+def _sends(messages: list) -> list:
+    return [m for m in messages if m.get("kind") == "send"]
+
+
+def greeting_verdicts(messages: list, organizer: str, destination: str) -> "list[Verdict]":
+    """The first message of a dashboard-seeded interview (#548, #546).
+
+    Judged on shape, not on exact words — the copy is the product's to change:
+    short, in two lines at most, with no buttons and the document offer after it;
+    the organizer and the destination in Hebrew, not as typed; no "welcome back"
+    for a first trip and no ISO date.
+    """
+    sends = _sends(messages)
+    if not sends:
+        gone = "the organizer was sent nothing at all"
+        return [Verdict(name, False, "", gone) for name in (
+            "greeting_shape_548", "greeting_names_in_hebrew_546", "greeting_clean_548")]
+    first = sends[0]
+    text = str(first.get("text") or "")
+    lines = [line for line in text.splitlines() if line.strip()]
+    offer_separate = any(b.get("data") == DOCUMENT_OFFER_BUTTON
+                         for m in sends[1:3] for b in (m.get("buttons") or []))
+    shape_ok = (len(lines) <= GREETING_MAX_LINES and len(text) <= GREETING_MAX_CHARS
+                and not first.get("buttons") and offer_separate)
+    reasons = []
+    if len(lines) > GREETING_MAX_LINES or len(text) > GREETING_MAX_CHARS:
+        reasons.append(f"it is {len(lines)} line(s) and {len(text)} characters "
+                       f"(at most {GREETING_MAX_LINES} and {GREETING_MAX_CHARS})")
+    if first.get("buttons"):
+        reasons.append("it carries buttons")
+    if not offer_separate:
+        reasons.append(f"the document offer ({DOCUMENT_OFFER_BUTTON}) is not one of the next two messages, on its own")
+    latin = [w for w in (organizer, destination) if re.search(re.escape(w), text, re.IGNORECASE)]
+    hebrew = bool(_HEBREW_RE.search(text))
+    stale = _WELCOME_BACK_RE.search(text) or _ISO_DATE_RE.search(text)
+    return [
+        Verdict("greeting_shape_548", shape_ok,
+                f"the first message is the opening and one line of explanation ({len(lines)} line(s), {len(text)} characters), "
+                "and the document offer follows on its own",
+                "the first message is not just the opening and a short explanation: " + "; ".join(reasons)
+                + f" — it reads {_preview(text)!r}"),
+        Verdict("greeting_names_in_hebrew_546", hebrew and not latin,
+                "the greeting names the organizer and the destination in Hebrew",
+                ("the greeting has no Hebrew in it" if not hebrew else
+                 f"the greeting says {', '.join(latin)} as typed, not in Hebrew (the native-name "
+                 f"translation fell back to the English)") + f" — it reads {_preview(text)!r}"),
+        Verdict("greeting_clean_548", not stale,
+                "the greeting says nothing about welcoming them back, and prints no ISO date",
+                f"the greeting says {stale.group(0)!r}" if stale else ""),
+    ]
+
+
+def duplicate_reply_verdict(messages: list, after_seq: "int | None") -> Verdict:
+    """Nothing the bot said after the album was said twice (#543).
+
+    "The reply for each ticket arrived twice". Judged as: no two messages after
+    the album share text and buttons. A re-ask of a question the organizer has
+    NOT answered would too, but the interview is not meant to repeat itself
+    verbatim, and a stand-in that asks twice is the symptom.
+    """
+    name = "ticket_replies_once_543"
+    if after_seq is None:
+        return Verdict(name, False, "", "the organizer never reported where the album was sent — it did not get that far")
+    window = [m for m in _sends(messages) if int(m.get("seq", 0)) > after_seq]
+    if not window:
+        return Verdict(name, False, "", "the bot said nothing at all after the album was sent")
+    groups: "dict[tuple, list]" = {}
+    for m in window:
+        text = " ".join(str(m.get("text") or "").split())
+        if len(text) < 20:
+            continue
+        key = (text, tuple((b.get("text"), b.get("data")) for b in (m.get("buttons") or [])))
+        groups.setdefault(key, []).append(m)
+    twice = [(key, ms) for key, ms in groups.items() if len(ms) > 1]
+    if not twice:
+        return Verdict(name, True, f"nothing the bot said after the album was said twice ({len(window)} message(s))", "")
+    detail = "; ".join(f"{len(ms)}x {_preview(key[0], 70)!r} (seq {', '.join(str(m['seq']) for m in ms)})"
+                       for key, ms in twice)
+    return Verdict(name, False, "", f"the same message was sent more than once after the album: {detail}")
+
+
+def confirmation_once_verdict(messages: list) -> Verdict:
+    """Confirming the trip is answered once (#543)."""
+    sent = [m for m in _sends(messages) if _CONFIRMATION_RE.search(str(m.get("text") or ""))]
+    if len(sent) == 1:
+        return Verdict("confirmation_once_543", True, "confirming the trip was answered once", "")
+    if not sent:
+        return Verdict("confirmation_once_543", False, "",
+                       "no confirmation message ('I'm building your trip site now') reached the organizer")
+    return Verdict("confirmation_once_543", False, "",
+                   f"the confirmation was sent {len(sent)} times (seq {', '.join(str(m['seq']) for m in sent)})")
+
+
+def seeded_not_reasked_verdict(findings: "dict | None") -> Verdict:
+    """The dashboard's destination, dates and type were not asked again (#438)."""
+    name = "seeded_values_not_reasked_438"
+    if not isinstance(findings, dict) or "asked" not in findings:
+        return Verdict(name, False, "", "the organizer reported no list of questions it was asked")
+    reasked = [q for q in SEEDED_QUESTIONS if q in findings["asked"]]
+    return Verdict(name, not reasked, "the interview did not ask for what the dashboard already held",
+                   f"the interview asked again for {', '.join(reasked)}, which the dashboard trip already had")
+
+
+def chat_verdicts(messages: list, findings: "dict | None", facts: dict) -> "list[Verdict]":
+    after = (findings or {}).get("album_after_seq")
+    return [
+        *greeting_verdicts(messages, facts["organizer_name"], facts["destination"]),
+        seeded_not_reasked_verdict(findings),
+        duplicate_reply_verdict(messages, after if isinstance(after, int) else None),
+        confirmation_once_verdict(messages),
+    ]
+
+
+def _flight_row(row: dict, flight: dict) -> bool:
+    text = f"{row.get('name') or ''} {row.get('notes') or ''}"
+    return re.search(re.escape(flight["number"]).replace(r"\ ", r"\s?"), text, re.IGNORECASE) is not None
+
+
+def ticket_photo_verdicts(bookings: list, digest_by_file: dict, tickets: list) -> "list[Verdict]":
+    """Each ticket's photo is stored and attached to the reservation it produced (#544).
+
+    `tickets` are {ref, sha}: the booking reference printed on the photo and the
+    sha256 of the bytes that were sent. `digest_by_file` is sha256 by `conf_file`
+    name as the SITE serves it, so what is compared is what a traveller can
+    download, byte for byte — not what a database says it holds.
+    """
+    out = []
+    for ticket in tickets:
+        ref, sha = ticket["ref"], ticket["sha"]
+        name = f"photo_{ref}_attached_544"
+        rows = [b for b in bookings if ref.lower() in json.dumps(b, ensure_ascii=False).lower()]
+        if not rows:
+            out.append(Verdict(name, False, "", f"no reservation carries {ref}; the site has {len(bookings)} booking(s)"))
+            continue
+        attached = [b.get("conf_file") for b in rows if b.get("conf_file")]
+        if not attached:
+            out.append(Verdict(name, False, "",
+                               f"the reservation for {ref} exists but has no ticket attached "
+                               "(the photo was read and not kept)"))
+        elif any(digest_by_file.get(f) == sha for f in attached):
+            out.append(Verdict(name, True, f"the reservation for {ref} carries its own photo, byte for byte", ""))
+        else:
+            out.append(Verdict(name, False, "",
+                               f"the reservation for {ref} has {attached[0]!r} attached, which is not the photo "
+                               "that was sent (or could not be downloaded)"))
+    return out
+
+
+def same_flight_verdicts(bookings: list, plan_items: list, flight: dict, tickets: list) -> "list[Verdict]":
+    """One flight, booked twice: two Reservations rows told apart, one Plan entry (#549)."""
+    rows = [b for b in bookings if _flight_row(b, flight)]
+    out = [Verdict("flight_twice_on_reservations_549", len(rows) == 2,
+                   f"{flight['number']} is on Reservations twice, once per booking",
+                   f"{flight['number']} is on Reservations {len(rows)} time(s), not 2 "
+                   f"(the site has {len(bookings)} booking(s))")]
+    unclear = []
+    for ticket in tickets:
+        mine = next((r for r in rows if ticket["ref"].lower() in json.dumps(r, ensure_ascii=False).lower()), None)
+        if mine is None:
+            unclear.append(f"no {flight['number']} row carries {ticket['ref']}")
+            continue
+        shown = str(mine.get("passengers") or "")
+        others = [s for t in tickets if t is not ticket for s in t["surnames"]]
+        if not any(_mentions(shown, s) for s in ticket["surnames"]):
+            unclear.append(f"{ticket['ref']}'s row names {shown!r}, not {ticket['surnames'][0]}")
+        elif any(_mentions(shown, s) for s in others):
+            unclear.append(f"{ticket['ref']}'s row also names the other booking's passengers ({shown!r})")
+    out.append(Verdict("reservations_tell_bookings_apart_549", not unclear,
+                       "each reservation row says whose it is (its own passengers)",
+                       "the two rows cannot be told apart: " + "; ".join(unclear)))
+    day = flight["date"]
+    on_plan = [i for i in plan_items if str(i.get("date") or "")[:10] == day and _is_this_flight(_item_text(i), flight)]
+    out.append(Verdict("flight_once_on_plan_549", len(on_plan) == 1,
+                       f"the plan shows {flight['number']} on {day} once",
+                       f"the plan shows {flight['number']} on {day} {len(on_plan)} time(s), not once "
+                       f"({sum(1 for i in plan_items if str(i.get('date') or '')[:10] == day)} item(s) that day, "
+                       f"{len(plan_items)} in the plan)"))
+    return out
+
+
+def _is_this_flight(text: str, flight: dict) -> bool:
+    if re.search(re.escape(flight["number"]).replace(r"\ ", r"\s?"), text, re.IGNORECASE):
+        return True
+    airports = re.findall(r"\((\w{3})\)", f"{flight['from']} {flight['to']}")
+    return bool(re.search(r"\bflight\b|טיסה", text, re.IGNORECASE)
+                and any(re.search(rf"\b{a}\b", text) for a in airports))
+
+
+def trip_dates_verdict(config: dict, start: str, end: str) -> Verdict:
+    meta = config.get("meta") or {}
+    got = (str(meta.get("departure") or "")[:10], str(meta.get("returnDate") or "")[:10])
+    return Verdict("trip_dates_14_22_nov", got == (start, end),
+                   f"the trip runs {start} to {end}, the return date as corrected at the summary",
+                   f"the trip runs {got[0] or '(no departure)'} to {got[1] or '(no return)'}, not {start} to {end}")
+
+
+def travellers_verdict(intake: dict, want: int) -> Verdict:
+    """Both tickets' passengers reached the roster (#412)."""
+    got = len(_structured_items(intake, "travelers"))
+    return Verdict("travellers_from_both_tickets_412", got == want,
+                   f"the roster holds all {want} passengers of the two tickets",
+                   f"the roster holds {got} traveller(s), not {want}")
+
+
+def gatecity_scorecard(verdicts: "list[Verdict]") -> str:
+    """Every check, one line, in the order judged — what to read first on a red run."""
+    lines = []
+    for v in verdicts:
+        lines.append(f"  {GREEN}✓{RESET} {v.name}" if v.passed else f"  {RED}✗{RESET} {v.name} — {v.bad}")
+    failed = sum(1 for v in verdicts if not v.passed)
+    lines.append(f"  {len(verdicts) - failed} of {len(verdicts)} checks pass" + (f", {failed} fail" if failed else ""))
+    return "\n".join(lines)
+
+
+# ── The dashboard half: sign up, give a name, make the trip, get the link ────
+
+def portal_session(email: str, password: str) -> dict:
+    """The cookies the dashboard holds after a sign-in, as a browser would keep them."""
+    request = urllib.request.Request(
+        API + "/v1/auth/email-password", method="POST",
+        data=json.dumps({"email": email, "password": password}).encode(),
+        headers={"content-type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            cookies = response.headers.get_all("Set-Cookie") or []
+    except urllib.error.HTTPError as exc:
+        raise Failed(f"dashboard sign-in -> {exc.code}: {exc.read().decode(errors='replace')[:200]}") from exc
+    jar = {}
+    for line in cookies:
+        name, _, rest = line.partition("=")
+        jar[name.strip()] = rest.split(";")[0]
+    if not (jar.get("kit_session") and jar.get("kit_csrf")):
+        raise Failed(f"dashboard sign-in set no session/CSRF cookies (got {sorted(jar)})")
+    return jar
+
+
+def portal_call(method: str, path: str, body: dict, jar: dict) -> dict:
+    request = urllib.request.Request(
+        API + path, method=method, data=json.dumps(body).encode() if method == "POST" else None,
+        headers={"content-type": "application/json", "X-CSRF-Token": jar["kit_csrf"],
+                 "Cookie": "; ".join(f"{k}={v}" for k, v in jar.items())})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            raw = response.read().decode()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        raise Failed(f"{method} {path} -> {exc.code}: {exc.read().decode(errors='replace')[:200]}") from exc
+
+
+def stage_dashboard_trip(ctx: dict) -> None:
+    """What the owner did on the dashboard before opening Telegram.
+
+    Signs in as the account signup just made (the e-mail sign-up needs a mailbox
+    nobody here has; the account is the same kind), gives it a name, creates the
+    trip with destination, dates and type — which is what seeds the interview
+    (#438) — and asks for its interview link, the way the "Start interview"
+    button does. The trip this builds is the NEW one, not signup's own.
+    """
+    stage("Dashboard — a name, a trip, and its interview link")
+    facts = _gatecity().GATECITY
+    jar = portal_session(ctx["email"], ctx["password"])
+    ok("signed in to the dashboard")
+    portal_call("POST", "/v1/account/name", {"displayName": facts["organizer_name"]}, jar)
+    ok(f"the account is named {facts['organizer_name']!r}")
+    trip = portal_call("POST", "/v1/trips", {
+        "destination": facts["destination"], "tripType": facts["trip_type"],
+        "startDate": facts["departure_date"], "endDate": facts["seed_return_date"],
+    }, jar)
+    trip_id = trip.get("id") or trip.get("tripId") or (trip.get("trip") or {}).get("id")
+    check(bool(trip_id), f"trip created on the dashboard -> {trip_id}", f"POST /v1/trips returned no trip id: {str(trip)[:200]}")
+    link = portal_call("POST", f"/v1/trips/{trip_id}/interview-link", {}, jar)
+    start = urllib.parse.parse_qs(urllib.parse.urlparse(str(link.get("deepLink") or "")).query).get("start") or []
+    check(bool(start), "the interview link carries a start token",
+          f"the interview link has no token: {str(link)[:160]}")
+    ctx["signup_trip_id"] = ctx["trip_id"]  # signup's own placeholder trip: never interviewed, never built
+    ctx["trip_id"] = trip_id
+    ctx["enrollment"] = {"token": start[0], "enrollmentId": link.get("enrollmentId")}
+
+
+def stage_gatecity_chat(ctx: dict, auto: "Auto", settle: bool = True) -> None:
+    """What the organizer was actually told, read off the stand-in's record of it.
+
+    `settle` is False when the interview did not finish: nothing more is coming,
+    so there is nothing to wait for."""
+    stage("What the organizer was told — greeting, replies, confirmation")
+    chat = ctx["chat"]
+    findings = ctx.get("organizer_findings") or {}
+    if settle:
+        # The confirmation follows the last tap, and a duplicate follows its twin
+        # within seconds; give both time to land before counting.
+        wait_for_confirmation = time.time() + 120
+        while time.time() < wait_for_confirmation:
+            if any(_CONFIRMATION_RE.search(str(m.get("text") or "")) for m in _sends(auto.said(chat))):
+                break
+            time.sleep(5)
+        time.sleep(25)
+    verdicts = chat_verdicts(auto.said(chat), findings, _gatecity().GATECITY)
+    ctx.setdefault("gatecity_verdicts", []).extend(verdicts)
+    report_verdicts(verdicts, {}, ctx, raise_on_hard=False)
+
+
+def _digests_by_file(base: str, token: str, bookings: list) -> dict:
+    """sha256 of what the site serves for each booking's attached ticket, by file name."""
+    import hashlib
+    out = {}
+    for booking in bookings:
+        name = booking.get("conf_file")
+        if not name or name in out:
+            continue
+        blob = subprocess.run(
+            ["curl", "-s", "-m", "30", f"{base}/api/bookings/confirmation/{urllib.parse.quote(name)}",
+             "-H", f"Authorization: Bearer {token}"], capture_output=True).stdout
+        out[name] = hashlib.sha256(blob).hexdigest()
+    return out
+
+
+def stage_gatecity_site(ctx: dict) -> None:
+    """The finished trip, read the way a traveller reads it: dates, reservations, plan."""
+    stage("The trip — dates, reservations with their photos, the plan")
+    facts = _gatecity().GATECITY
+    base, token = site_login(ctx)
+    config, bookings, _ = served_state(base, token)
+    active = site_get(base, "/api/itinerary/active", token)
+    items = active.get("items") if isinstance(active, dict) else None
+    if not isinstance(items, list):
+        raise Failed(f"/api/itinerary/active served no items: {str(active)[:160]}")
+    tickets = [{"ref": t["ref"], "sha": ctx["ticket_shas"][t["ref"]], "surnames": t["surnames"]}
+               for t in facts["tickets"]]
+    verdicts = [
+        trip_dates_verdict(config, facts["departure_date"], facts["return_date"]),
+        travellers_verdict(ctx.get("intake") or _load_intake(ctx), facts["travellers"]),
+        *ticket_photo_verdicts(bookings, _digests_by_file(base, token, bookings), tickets),
+        *same_flight_verdicts(bookings, items, facts["flight"], tickets),
+    ]
+    ctx.setdefault("gatecity_verdicts", []).extend(verdicts)
+    report_verdicts(verdicts, {}, ctx, raise_on_hard=False)
+
+
+def finish_gatecity(ctx: dict) -> None:
+    """Every check in one place, and the run fails if any did."""
+    verdicts = ctx.get("gatecity_verdicts") or []
+    print(f"\n{DIM}── scorecard: the Sprint 8 manual test, by issue ──{RESET}")
+    print(gatecity_scorecard(verdicts))
+    failed = [v for v in verdicts if not v.passed]
+    if failed:
+        raise Failed(f"{len(failed)} of {len(verdicts)} gatecity check(s) failed: " + ", ".join(v.name for v in failed))
+
+
+def dry_run_gatecity() -> int:
+    """Everything the scenario can prove without a stack: nothing is signed up, built or restarted.
+
+    Draws the two tickets, starts the Telegram stand-in, sends them as an album,
+    and reads them back the way the relay does — getUpdates, the last photo size,
+    getFile, then the download — comparing every byte. If the stand-in could not
+    carry the photos to the relay, no run against a stack could have worked.
+    """
+    import hashlib
+    facts = _gatecity()
+    work = Path(tempfile.mkdtemp(prefix="kinerary-e2e-dry-", dir="/tmp"))
+    auto = Auto(work)
+    try:
+        stage("Dry run — the ticket photos, and the stand-in that carries them")
+        paths = facts.build(work / "photos")
+        sent = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
+        for p in paths:
+            ok(f"drew {p.name}: {p.stat().st_size} bytes, sha256 {sent[p.name][:12]}…")
+        auto.start()
+        chat = "9000000000001"
+        album = auto.control("album", {"chatId": chat, "languageCode": "he",
+                                       "photos": [{"base64": base64.b64encode(p.read_bytes()).decode()} for p in paths]})
+        ok(f"album sent: messages {album['messageIds']}, media_group_id {album['mediaGroupId']}")
+        def bot(method: str, params: dict) -> dict:
+            """A Bot API call as the relay makes it: POST, JSON, the token in the path."""
+            call = urllib.request.Request(f"{auto.root}/bot0:dry/{method}", method="POST",
+                                          data=json.dumps(params).encode(),
+                                          headers={"content-type": "application/json"})
+            return json.loads(urllib.request.urlopen(call, timeout=15).read())["result"]
+
+        messages = [u["message"] for u in bot("getUpdates", {"offset": 0, "timeout": 0})]
+        check(len(messages) == len(paths) and len({m.get("media_group_id") for m in messages}) == 1,
+              f"getUpdates hands over {len(messages)} messages sharing one media_group_id, in one poll",
+              f"expected {len(paths)} messages in one media group, got {messages!r}")
+        for message, path in zip(messages, paths):
+            largest = message["photo"][-1]
+            info = bot("getFile", {"file_id": largest["file_id"]})
+            with urllib.request.urlopen(f"{auto.root}/file/bot0:dry/{info['file_path']}") as download:
+                body, mime = download.read(), download.headers.get("content-type")
+            check(hashlib.sha256(body).hexdigest() == sent[path.name] and mime == "image/jpeg",
+                  f"{path.name} comes back through getFile byte for byte ({mime})",
+                  f"{path.name} came back different from what was sent")
+        names = [v for v in (
+            "greeting_shape_548", "greeting_names_in_hebrew_546", "greeting_clean_548",
+            "seeded_values_not_reasked_438", "ticket_replies_once_543", "confirmation_once_543",
+            "trip_dates_14_22_nov", "travellers_from_both_tickets_412",
+            *(f"photo_{t['ref']}_attached_544" for t in facts.TICKETS),
+            "flight_twice_on_reservations_549", "reservations_tell_bookings_apart_549", "flight_once_on_plan_549")]
+        note(f"a real run judges {len(names)} checks: {', '.join(names)}")
+        print(f"\n{GREEN}✓ dry run green (gatecity){RESET}: the photos are drawn and the stand-in delivers them; "
+              "no stack was touched.")
+        return 0
+    except Failed as exc:
+        print(f"\n{RED}✗ FAILED (gatecity dry run){RESET}: {exc}\n")
+        return 1
+    finally:
+        if auto.proc and auto.proc.poll() is None:
+            auto.proc.terminate()
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def _scenario_spec(scenario: str) -> dict:
     sys.path.insert(0, str(REPO / "control-plane/api/test/fixtures"))
     from make_documents import SCENARIOS  # noqa: E402
@@ -1846,6 +2333,8 @@ def _scenario_spec(scenario: str) -> dict:
 
 TRIP_NAMES = {"japan": "Japan 2026", "multi": "Italy 2026", "manual": "Portugal 2026", "chaos": "Greece 2027",
               "vietnam": "Vietnam 2028", "star": "Alsace 2027",
+              # signup's own placeholder trip; the one that is interviewed is made on the dashboard.
+              GATECITY: "Signup placeholder",
               # A placeholder the organizer would have typed on the signup form,
               # deliberately not a destination: naming it would be this script
               # deciding what an `own` run is about. --trip-name replaces it.
@@ -1854,8 +2343,11 @@ TRIP_NAMES = {"japan": "Japan 2026", "multi": "Italy 2026", "manual": "Portugal 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--scenario", default="multi", choices=["japan", "multi", "manual", "chaos", "vietnam", "star", OWN, "all"],
-                    help="a fixture (japan, multi, manual), 'chaos' — an automated organizer who does "
+    ap.add_argument("--scenario", default="multi", choices=["japan", "multi", "manual", "chaos", "vietnam", "star", GATECITY, OWN, "all"],
+                    help="a fixture (japan, multi, manual), 'gatecity' — Dror's manual Sprint 8 test with the "
+                         "two tickets sent as PHOTOS in one album, judged check by check against the issue each "
+                         "protects (needs --auto; red until those fixes land; not part of `all`), "
+                         "'chaos' — an automated organizer who does "
                          "not follow the interview (tools/organizer-chaos.ts), 'star' — a couples trip "
                          "from one base with day trips, then a change of stops through the companion "
                          "(needs --auto; known gaps are reported, not failed), or 'own' — a person's real "
@@ -1876,7 +2368,17 @@ def main() -> int:
     ap.add_argument("--stop-after", choices=["confirm"], default=None,
                     help="stop once the intake is confirmed, before the build — for a stack that must "
                          "not provision (the Proxmox VM while the Mac stack is live)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="gatecity only: draw the ticket photos, send them through the Telegram stand-in and read "
+                         "them back as the relay does. Touches no stack: nothing is signed up, built or restarted")
     args = ap.parse_args()
+    if args.dry_run:
+        if args.scenario != GATECITY:
+            ap.error("--dry-run is for --scenario gatecity only")
+        return dry_run_gatecity()
+    if args.scenario == GATECITY and not args.auto:
+        ap.error("--scenario gatecity needs --auto: it sends the tickets as photos and taps through "
+                 "the interview as the organizer")
     if not MAC_STACK and args.auto and not os.environ.get("KINERARY_RELAY_RESTART"):
         ap.error(f"--auto on {PROJECT} needs KINERARY_RELAY_RESTART: the default, scripts/relay-restart.sh, "
                  "restarts the Mac's live relay")
@@ -1947,15 +2449,39 @@ def run_scenario(scenario: str, args: argparse.Namespace, auto: "Auto | None", c
     trip_name = args.trip_name if (args.trip_name and args.scenario != "all") else TRIP_NAMES[scenario]
     try:
         ctx.update(stage_signup(trip_name))
-        stage_interview(ctx, scenario, work, auto)
+        if scenario == GATECITY:
+            if auto is None:
+                raise Failed("--scenario gatecity needs --auto: it sends photos and taps as the organizer")
+            stage_dashboard_trip(ctx)
+            interviewed = False
+            try:
+                stage_interview(ctx, scenario, work, auto)
+                interviewed = True
+            finally:
+                # Judged even when the organizer stalled: what the bot said up to
+                # that point is the most useful thing a stalled run has.
+                if ctx.get("chat"):
+                    try:
+                        stage_gatecity_chat(ctx, auto, settle=interviewed)
+                    except Exception as exc:  # noqa: BLE001 — never hide the stall behind this
+                        note(f"could not read back what the organizer was told: {exc}")
+        else:
+            stage_interview(ctx, scenario, work, auto)
         stage_confirm_and_build(ctx, args.wait_minutes, build=args.stop_after != "confirm")
         if args.stop_after == "confirm":
             print(f"\n{GREEN}✓ interview green ({scenario}){RESET}: signup, interview and confirm verified; "
                   "stopped before the build as asked.")
             print(f"  trip:  {ctx['trip_id']}")
+            if scenario == GATECITY:
+                finish_gatecity(ctx)
             return 0
         stage_site(ctx)
-        stage_own_content(ctx) if scenario == OWN else stage_content(ctx, scenario)
+        if scenario == GATECITY:
+            stage_gatecity_site(ctx)
+        elif scenario == OWN:
+            stage_own_content(ctx)
+        else:
+            stage_content(ctx, scenario)
         stage_served(ctx)
         stage_bridge_reach(ctx)
         stage_companion(ctx)
@@ -1964,7 +2490,9 @@ def run_scenario(scenario: str, args: argparse.Namespace, auto: "Auto | None", c
             if auto is None:
                 raise Failed("--documents needs --auto: sending a file is a person's action")
             stage_documents(ctx, auto, work)
-        if scenario != OWN and "after_companion" in _scenario_spec(scenario):
+        if scenario == GATECITY:
+            finish_gatecity(ctx)
+        elif scenario != OWN and "after_companion" in _scenario_spec(scenario):
             if auto is None:
                 raise Failed(f"--scenario {scenario} changes the trip through the companion; it needs --auto")
             stage_companion_changes(ctx, auto, _scenario_spec(scenario))
@@ -1978,6 +2506,10 @@ def run_scenario(scenario: str, args: argparse.Namespace, auto: "Auto | None", c
         return 0
     except Failed as exc:
         print(f"\n{RED}✗ FAILED ({scenario}){RESET}: {exc}\n")
+        if scenario == GATECITY and ctx.get("gatecity_verdicts") and "gatecity check(s) failed" not in str(exc):
+            # Stopped before the scorecard: show what had been judged by then.
+            print(f"{DIM}── scorecard so far: the Sprint 8 manual test, by issue ──{RESET}")
+            print(gatecity_scorecard(ctx["gatecity_verdicts"]) + "\n")
         if ctx.get("trip_id"):
             print(f"  trip:  {ctx['trip_id']}  ({ctx.get('slug', 'no slug yet')})")
             print(f"  login: {ctx.get('email')} / {ctx.get('password')}")
