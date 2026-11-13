@@ -175,6 +175,13 @@ export const itemSchema = z.object({
   provenance: z.object({ status: z.string() }).optional(),
   seed_changed: z.record(z.string(), z.unknown()).optional(),
   seed_removed: z.boolean().optional(),
+  // #550: other plan items at the same time. Sent to organizers only; a member's payload has no such key.
+  plan_conflicts: z.array(z.object({
+    item_uid: z.string(),
+    text_he: z.string().nullable().optional(),
+    text_en: z.string().nullable().optional(),
+    time: z.string().nullable().optional(),
+  })).optional(),
 });
 
 export type TripConfig = z.infer<typeof configSchema>;
@@ -381,6 +388,8 @@ export const extractBookingDraft = (body: FormData) => api<{ ok: true; booking: 
 export type SeedAnswer = "accept" | "keep";
 export const answerBookingSeed = (id: number, answer: SeedAnswer) => api<{ ok: true }>(`/api/bookings/${id}/${answer}-seed`, { method: "POST" });
 export const answerItemSeed = (itemUid: string, answer: SeedAnswer) => api<{ ok: true }>(`/api/itinerary/items/${encodeURIComponent(itemUid)}/${answer}-seed`, { method: "POST" });
+// "Keep both" (#550): the organizer accepts a same-time conflict between two plan items.
+export const keepBothPlanItems = (itemUid: string, withUid: string) => api<{ ok: true }>(`/api/itinerary/items/${encodeURIComponent(itemUid)}/keep-both`, { method: "POST", body: JSON.stringify({ with: withUid }) });
 export const approveBookingDraft = (id: number) => api<{ ok: true }>(`/api/bookings/${id}/approve`, { method: "POST" });
 export const createBooking = (input: BookingInput) => api<{ ok: true; id: number }>("/api/bookings", { method: "POST", body: JSON.stringify(input) });
 export const updateBooking = (id: number, input: BookingInput) => api<{ ok: true }>(`/api/bookings/${id}`, { method: "PATCH", body: JSON.stringify(input) });

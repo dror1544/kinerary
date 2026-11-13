@@ -68,6 +68,7 @@ import {
   CurrentUser,
   answerBookingSeed,
   answerItemSeed,
+  keepBothPlanItems,
   approveBookingDraft,
   createBooking,
   createBudgetItem,
@@ -1104,6 +1105,7 @@ export function JourneyView({
             <div className="timeline-item-wrap" id={`itinerary-item-${encodeURIComponent(item.item_uid)}`} key={item.item_uid}>
               <TimelineItem item={item} {...activityLinks.get(item.item_uid)} username={username} lang={lang} botName={botName} telegramUsername={telegramUsername} />
               {isOrganizer ? <SeedFlagNotice kind="item" id={item.item_uid} changed={item.seed_changed} removed={item.seed_removed} lang={lang} /> : null}
+              {isOrganizer ? <PlanConflictNotice itemUid={item.item_uid} conflicts={item.plan_conflicts} lang={lang} /> : null}
               {isOrganizer ? <div className="timeline-editor-actions">
                 <button type="button" onClick={() => beginEdit(item)}><Pencil size={15} /> {copy(lang, "Edit", "עריכה")}</button>
                 <button className="danger-text" type="button" disabled={removeMutation.isPending} onClick={() => { if (window.confirm(copy(lang, "Remove this itinerary item?", "להסיר את הפריט הזה מהמסלול?"))) removeMutation.mutate(item.item_uid); }}><Trash2 size={15} /> {copy(lang, "Remove", "הסרה")}</button>
@@ -1296,6 +1298,39 @@ export function SeedFlagNotice({ kind, id, changed, removed, lang }: { kind: "bo
         <button type="button" className="secondary-action" disabled={mutation.isPending} onClick={() => mutation.mutate("keep")}>{copy(lang, "Keep mine", "להשאיר את שלי")}</button>
         {kind === "item" && removed ? null : <button type="button" className="secondary-action" disabled={mutation.isPending} onClick={() => mutation.mutate("accept")}>{removed ? copy(lang, "Use the new one (remove it)", "להשתמש בחדש (להסיר)") : copy(lang, "Use the new one", "להשתמש בחדש")}</button>}
       </div>
+      {mutation.isError ? <p className="form-error">{copy(lang, "Could not save your choice. Try again.", "לא ניתן לשמור את הבחירה. נסו שוב.")}</p> : null}
+    </div>
+  );
+}
+
+/**
+ * "Same time as another plan item — keep both" (#550). The server sends `plan_conflicts` to an organizer
+ * only; the caller renders this for an organizer only. Keep both records the acceptance on the server (the
+ * pair at these times), so it is not raised again; both items' notices go away on the refresh.
+ */
+export function PlanConflictNotice({ itemUid, conflicts, lang }: { itemUid: string; conflicts?: NonNullable<ItineraryItem["plan_conflicts"]>; lang: Lang }) {
+  const queryClient = useQueryClient();
+  const mutation = useMutation({
+    mutationFn: (withUid: string) => keepBothPlanItems(itemUid, withUid),
+    onSuccess: () => Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["itinerary"] }),
+      queryClient.invalidateQueries({ queryKey: ["today"] }),
+    ]),
+  });
+  if (!conflicts?.length) return null;
+  return (
+    <div className="seed-flag plan-conflict" role="status">
+      {conflicts.map((other) => {
+        const name = (lang === "he" ? other.text_he || other.text_en : other.text_en || other.text_he) || other.item_uid;
+        return (
+          <div key={other.item_uid}>
+            <p>{copy(lang, "Same time as", "באותה שעה כמו")} <bdi>{name}</bdi>{other.time ? <> (<bdi dir="ltr">{other.time}</bdi>)</> : null}</p>
+            <div className="seed-flag-actions">
+              <button type="button" className="secondary-action" disabled={mutation.isPending} onClick={() => mutation.mutate(other.item_uid)}>{copy(lang, "Keep both", "להשאיר את שניהם")}</button>
+            </div>
+          </div>
+        );
+      })}
       {mutation.isError ? <p className="form-error">{copy(lang, "Could not save your choice. Try again.", "לא ניתן לשמור את הבחירה. נסו שוב.")}</p> : null}
     </div>
   );
