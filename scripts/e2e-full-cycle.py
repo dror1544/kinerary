@@ -1886,11 +1886,13 @@ def stage_companion_changes(ctx: dict, auto: "Auto", spec: dict) -> None:
 # that can judge them and again in one scorecard at the end, before anything is
 # raised; a stage that cannot run says so instead of hiding the rest.
 
-#: What the first message to the organizer may be (#548): an opening line and one
-#: line of explanation. Two lines, and short; the old greeting was a page.
-GREETING_MAX_LINES = 2
-GREETING_MAX_CHARS = 320
-#: A message that offers the document, which must arrive on its own, after the greeting (#548).
+#: What the opening to the organizer may be (#548, Dror's wording of 2026-11-13): ONE
+#: message -- the greeting and the trip, then the short-questions-and-send-documents
+#: paragraph (a returning account's note between them) -- with one button under it.
+#: Four lines at most, and short; the old greeting was a page.
+GREETING_MAX_LINES = 4
+GREETING_MAX_CHARS = 700
+#: The one button on the opening ("Let's start"; the same callback "I don't have one" uses).
 DOCUMENT_OFFER_BUTTON = "c:nodoc"
 _ISO_DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 _WELCOME_BACK_RE = re.compile(r"welcome back|ברוכים השבים|ברוך השב|ברוכה השבה", re.IGNORECASE)
@@ -1924,7 +1926,8 @@ def greeting_verdicts(messages: list, organizer: str, destination: str) -> "list
     """The first message of a dashboard-seeded interview (#548, #546).
 
     Judged on shape, not on exact words — the copy is the product's to change:
-    short, in two lines at most, with no buttons and the document offer after it;
+    one short message, four lines at most, whose one button moves on to the first
+    question (the document invitation is inside it, not a second message);
     the organizer and the destination in Hebrew, not as typed; no "welcome back"
     for a first trip and no ISO date.
     """
@@ -1936,26 +1939,29 @@ def greeting_verdicts(messages: list, organizer: str, destination: str) -> "list
     first = sends[0]
     text = str(first.get("text") or "")
     lines = [line for line in text.splitlines() if line.strip()]
-    offer_separate = any(b.get("data") == DOCUMENT_OFFER_BUTTON
-                         for m in sends[1:3] for b in (m.get("buttons") or []))
+    buttons = [b.get("data") for b in (first.get("buttons") or [])]
+    one_button = buttons == [DOCUMENT_OFFER_BUTTON]
+    # The old shape sent the offer as its own message; now nothing with that button follows the opening.
+    offer_after = any(b.get("data") == DOCUMENT_OFFER_BUTTON
+                      for m in sends[1:3] for b in (m.get("buttons") or []))
     shape_ok = (len(lines) <= GREETING_MAX_LINES and len(text) <= GREETING_MAX_CHARS
-                and not first.get("buttons") and offer_separate)
+                and one_button and not offer_after)
     reasons = []
     if len(lines) > GREETING_MAX_LINES or len(text) > GREETING_MAX_CHARS:
         reasons.append(f"it is {len(lines)} line(s) and {len(text)} characters "
                        f"(at most {GREETING_MAX_LINES} and {GREETING_MAX_CHARS})")
-    if first.get("buttons"):
-        reasons.append("it carries buttons")
-    if not offer_separate:
-        reasons.append(f"the document offer ({DOCUMENT_OFFER_BUTTON}) is not one of the next two messages, on its own")
+    if not one_button:
+        reasons.append(f"its buttons are {buttons}, not the one {DOCUMENT_OFFER_BUTTON} button")
+    if offer_after:
+        reasons.append("a separate document offer follows it")
     latin = [w for w in (organizer, destination) if re.search(re.escape(w), text, re.IGNORECASE)]
     hebrew = bool(_HEBREW_RE.search(text))
     stale = _WELCOME_BACK_RE.search(text) or _ISO_DATE_RE.search(text)
     return [
         Verdict("greeting_shape_548", shape_ok,
-                f"the first message is the opening and one line of explanation ({len(lines)} line(s), {len(text)} characters), "
-                "and the document offer follows on its own",
-                "the first message is not just the opening and a short explanation: " + "; ".join(reasons)
+                f"the opening is one short message ({len(lines)} line(s), {len(text)} characters) "
+                "with its one Let's-start button",
+                "the opening is not one short message with one button: " + "; ".join(reasons)
                 + f" — it reads {_preview(text)!r}"),
         Verdict("greeting_names_in_hebrew_546", hebrew and not latin,
                 "the greeting names the organizer and the destination in Hebrew",

@@ -243,9 +243,12 @@ def say(seq, text, *buttons, kind="send"):
             "buttons": [{"text": t, "data": d} for t, d in buttons]}
 
 
-GREETING = "היי ארלו, גייטסיטי בנובמבר. איזה כיף! 🎉\nכמה שאלות קצרות ויהיה לנו הטיול מוכן לכולם."
-OFFER = ("לפני שנתחיל בפרטים — אם כבר יש לכם תוכנית, אישור הזמנה או כרטיסים, שלחו אותו לכאן.",
-         ("אין לי מסמך", "c:nodoc"))
+GREETING = ("היי ארלו 👋\nאני עוזר הטיולים שלכם מבית Kinerary, ואשמח לעזור לכם לתכנן את הטיול לגייטסיטי בנובמבר. איזה כיף! 🎉\n\n"
+            "כדי שנתכנן את הטיול שהכי מתאים לכם, נעבור על כמה שאלות קצרות. אם יש לכם תוכנית טיול, כרטיסי טיסה או כל הזמנה אחרת, "
+            "שלחו לי אותם כאן בצ׳אט ואלמד מהם עוד על הטיול. אז בואו נתחיל!")
+START = ("בואו נתחיל", "c:nodoc")
+OLD_OFFER = ("לפני שנתחיל בפרטים — אם כבר יש לכם תוכנית, אישור הזמנה או כרטיסים, שלחו אותו לכאן.",
+             ("אין לי מסמך", "c:nodoc"))
 
 
 class GreetingChecks(unittest.TestCase):
@@ -253,28 +256,29 @@ class GreetingChecks(unittest.TestCase):
         return {v.name: v for v in E2E.greeting_verdicts(messages, "Arlo", "Gatecity")}
 
     def test_the_intended_greeting_passes_all_three(self) -> None:
-        got = self.verdicts([say(1, GREETING), say(2, OFFER[0], OFFER[1])])
+        got = self.verdicts([say(1, GREETING, START), say(2, "שאלה ראשונה?")])
         self.assertTrue(all(v.passed for v in got.values()), [v.bad for v in got.values() if not v.passed])
 
     def test_the_old_greeting_after_the_opening_fails_the_shape_check(self) -> None:
-        # The staging run: the right opening, then the whole previous greeting body.
+        # The 2026-11-12 staging run: the right opening, then the whole previous greeting body.
         long_body = GREETING + "\n\n" + "היי 👋 אני עוזר הטיולים שלכם מבית Kinerary.\n\nתנו לי שיחה אחת. " * 6
-        got = self.verdicts([say(1, long_body), say(2, OFFER[0], OFFER[1])])
+        got = self.verdicts([say(1, long_body, START)])
         self.assertFalse(got["greeting_shape_548"].passed)
         self.assertIn("characters", got["greeting_shape_548"].bad)
 
-    def test_a_greeting_with_the_document_offer_attached_fails_the_shape_check(self) -> None:
-        got = self.verdicts([say(1, GREETING, OFFER[1])])
+    def test_the_two_message_shape_of_11_12_fails_the_shape_check(self) -> None:
+        got = self.verdicts([say(1, "היי ארלו, גייטסיטי בנובמבר. איזה כיף! 🎉\nכמה שאלות קצרות."), say(2, OLD_OFFER[0], OLD_OFFER[1])])
         self.assertFalse(got["greeting_shape_548"].passed)
         self.assertIn("buttons", got["greeting_shape_548"].bad)
+        self.assertIn("separate document offer", got["greeting_shape_548"].bad)
 
-    def test_a_missing_document_offer_fails_the_shape_check(self) -> None:
+    def test_an_opening_with_no_button_fails_the_shape_check(self) -> None:
         got = self.verdicts([say(1, GREETING), say(2, "שאלה ראשונה?")])
         self.assertFalse(got["greeting_shape_548"].passed)
 
     def test_english_names_in_a_hebrew_greeting_fail_the_names_check_and_say_which(self) -> None:
-        text = "היי Arlo, Gatecity בנובמבר. איזה כיף!\nכמה שאלות קצרות."
-        got = self.verdicts([say(1, text), say(2, OFFER[0], OFFER[1])])
+        text = "היי Arlo 👋\nאשמח לעזור לכם לתכנן את הטיול לGatecity בנובמבר. איזה כיף!\n\nכמה שאלות קצרות."
+        got = self.verdicts([say(1, text, START)])
         self.assertFalse(got["greeting_names_in_hebrew_546"].passed)
         self.assertIn("Arlo", got["greeting_names_in_hebrew_546"].bad)
         self.assertIn("Gatecity", got["greeting_names_in_hebrew_546"].bad)
@@ -282,7 +286,7 @@ class GreetingChecks(unittest.TestCase):
 
     def test_welcome_back_and_an_iso_date_fail_the_clean_check(self) -> None:
         for text in ("ברוכים השבים ארלו! גייטסיטי\nכמה שאלות.", "היי ארלו, גייטסיטי 2026-11-14\nכמה שאלות."):
-            got = self.verdicts([say(1, text), say(2, OFFER[0], OFFER[1])])
+            got = self.verdicts([say(1, text, START)])
             self.assertFalse(got["greeting_clean_548"].passed, text)
 
     def test_a_chat_with_nothing_in_it_fails_all_three_instead_of_crashing(self) -> None:
@@ -291,7 +295,7 @@ class GreetingChecks(unittest.TestCase):
         self.assertFalse(any(v.passed for v in got.values()))
 
     def test_edits_are_not_the_greeting(self) -> None:
-        got = self.verdicts([say(1, "x", kind="edit"), say(2, GREETING), say(3, OFFER[0], OFFER[1])])
+        got = self.verdicts([say(1, "x", kind="edit"), say(2, GREETING, START)])
         self.assertTrue(got["greeting_shape_548"].passed)
 
 
