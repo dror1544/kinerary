@@ -74,8 +74,8 @@ S1
   row with switch, scope, trip id or null, old value, new value, a `sha256:` digest of
   the actor and a timestamp, written in the same transaction as the change.
 - AC-8 Given a trip at `ready_private` or later (changed in review, 2026-11-14: both
-  production trips sit at `ready_private`; the draft said "past"; the owner's
-  confirmation is pending), or in a state the code does not recognise, when an operator sets a trip-scoped switch
+  production trips sit at `ready_private`; the draft said "past"; confirmed
+  by Dror the same day), or in a state the code does not recognise, when an operator sets a trip-scoped switch
   without `--live`, then the command refuses and says the trip is in use. Given
   `--all` or `--new-trips`, the same refusal applies without `--live`.
 - AC-9 Given a set command carrying `--live`, when Claude Code runs it, then the
