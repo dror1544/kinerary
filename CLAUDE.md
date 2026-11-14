@@ -16,6 +16,8 @@ the one place the rules live, not two files kept in sync by hand.
    to a running container, `docker compose up -d --force-recreate`, restarting
    `trip-server`, etc. Ask "ready to deploy?" after committing; a commit
    instruction does not imply a deploy instruction.
+   (Since 2026-11-14 one approval may cover a whole named rollout, and a
+   feature switch on a test trip needs none — see "Faster delivery" below.)
 3. **Never commit binary files (PDFs, images, audio) into git.** They belong
    outside the repo — NFS, iCloud, wherever the deployment already syncs media
    from — not in the tree.
@@ -155,7 +157,8 @@ Two branches carry names in this document. The **leading branch** is
    hop unchanged. Full shape: `docs/agent-team-plan.md` §3.1 and §3.6.
 
 What stays a gate: the integrator, boundary review for security paths, a
-regression plan (sprint mode) before each release, and every merge to `main`
+regression plan before a release that carries a risk-class change (narrowed
+2026-11-14, see "Faster delivery" below), and every merge to `main`
 and deploy. What is narrower since 2026-09-26, by the owner's decision:
 
 - the per-PR regression plan is for PRs that add a migration, touch auth or a
@@ -175,6 +178,59 @@ and deploy. What is narrower since 2026-09-26, by the owner's decision:
   carry-forward; a third round is the owner's call.
 
 Rules 2–6 are untouched.
+
+## Faster delivery (owner's decision, 2026-11-14)
+
+Between 2 October and 14 November 2026 a PR reached the leading branch a
+median 1.9 hours after it opened (101 PRs), and then waited: the leading
+branch reached `main` four times in six weeks, the last time as one batch of
+about 33,000 changed lines, and a merged change reached a running trip only
+through three hand-run steps per trip, each with its own prompt. Nothing let
+anyone choose *which* trips a feature reached. Dror's decision: deliver
+faster, and make "one trip, every trip, or future trips" a choice.
+
+**The method, in build order** (each has, or gets, a spec under `docs/specs/`
+before it is briefed):
+
+1. **Per-trip feature switches.** A new feature ships switched off and its
+   code goes to every trip. Switching it on is a data change: for one trip,
+   for every trip, or as the default for trips created from then on. A switch
+   nobody recognises is **off** — the same fail-safe direction as the
+   visibility rules under "Security-sensitive paths".
+2. **One rollout command per trip.** Site payload, bridge restart, health
+   check and prompt refresh, in that order, with the version recorded on the
+   trip and the previous one kept as the way back. A rollout goes to a staging
+   trip first, then one trip, then the rest.
+3. **`main` becomes the leading branch** once item 1 is merged: PRs then target
+   `main` and `integration/sprint-N` stops being cut. Until that is recorded
+   here, the two branch names in "MVP phase" above mean what they say.
+4. **Control-plane images are built in CI and pulled by the VM**
+   (`docs/future/control-plane-ota-upgrades.md`).
+
+**Rules that changed on 2026-11-14:**
+
+- **A regression plan, and the owner's manual test, before a merge to `main`
+  are for a change set that carries a risk-class change**: a migration, an auth
+  or boundary path, or relay behaviour — the same list the per-PR plan already
+  uses. For any other change set, green CI on the merge ref and the last green
+  nightly are the evidence, and the PR records "assessment: not needed (why)".
+  The merge to `main` itself still asks.
+- **A deploy is approved per rollout, not per step.** One approval names the
+  commit, the trips and the steps, and covers exactly those. A step that fails
+  stops the rollout; anything outside the named set asks again. Until the
+  rollout command of item 2 exists the hooks cannot tell that several commands
+  are one rollout and still prompt for each: ask once in words, with the whole
+  list, and do not re-argue it at every prompt.
+- **Switching a feature on or off for a test trip needs no approval.** A test
+  trip is one on staging, or one `scripts/teardown-trip.py` would accept (not
+  past `ready_private`: nobody real has used it). For any other trip a switch
+  changes what a family sees, so it is a deploy under hard rule 2.
+
+**What did not change:** hard rules 3–7; boundary review with live
+request/response evidence for security paths; migration naming and the
+`-- rollback:` header; `kinerary-cp-release` with its snapshot before any VM
+upgrade; and the owner's own approval for a production deploy that carries a
+migration, which a rollout approval never implies.
 
 ## What this repo is
 
