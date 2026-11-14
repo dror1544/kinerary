@@ -1,6 +1,6 @@
 # Per-trip feature switches
 
-Status: draft (2026-11-14) · Issue: none yet · Track: delivery · Size: L (three slices) · Tier: High
+Status: approved (2026-11-14, by Dror: "Agree with your recommendations") · Issue: #567 · Track: delivery · Size: L (three slices) · Tier: High
 Security path: yes (`shared/config-visibility.js`, `server/server.js`, an admin route) · Migration: yes · Live-trip behaviour: no, until a switch is turned on
 
 Decision behind it: `CLAUDE.md`, "Faster delivery (owner's decision, 2026-11-14)", item 1;
@@ -46,7 +46,7 @@ Slices, each useful alone:
    relay-side features (interview, group handling) the moment it is set.
 2. **S2: the site.** The worker writes the resolved switches into the trip when it
    provisions or rolls out, and the site serves them to its pages. A change reaches a
-   running site at the next rollout (see the trip-rollout spec).
+   running site at the next rollout (see `568-trip-rollout.md`).
 3. **S3: the site, live.** The control plane pushes a change to a running site, and
    open pages pick it up without a reload. Where a trip cannot be pushed to, the
    operator command says the change is waiting for a rollout.
@@ -223,15 +223,18 @@ Written first, from the criteria.
 - S2 and S3 touch `server/server.js` and `shared/`: boundary review, and a rollout of
   each trip before the site half works there. With every switch off a rolled-out
   trip shows no difference.
-- Order: S1, then S2 together with the trip-rollout spec's first slice, then S3.
+- Order: S1, then S2 together with `568-trip-rollout.md`'s first slice, then S3.
+
+## Decisions (Dror, 2026-11-14)
+
+1. **Member-visible by default: no.** A switch is served to members only when its
+   registry entry says so.
+2. **S3 waits.** S1 and S2 are built first; S3 is decided after the first two
+   features have shipped behind switches.
 
 ## Open questions
 
-1. **Member-visible by default?** Proposed: no. A switch is served to members only
-   when its registry entry says so.
-2. **S3 or not.** Without S3 a site switch changes at the next rollout, which the
-   rollout command makes one step. Proposed: build S1 and S2 first, and decide S3
-   after the first two features have shipped behind switches.
-3. **Which trips have a control-plane identity** (needed for S3's push)? To be read
+1. **Which trips have a control-plane identity** (needed for S3's push)? To be read
    from the fleet before S3 is briefed.
-4. **The 30-day removal rule** in Non-goals: adopt it now, or leave switches in place?
+2. **The 30-day removal rule** in Non-goals: adopt it, or leave switches in place?
+   Not needed before S1 or S2.

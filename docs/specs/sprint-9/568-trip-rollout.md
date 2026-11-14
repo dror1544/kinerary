@@ -1,6 +1,6 @@
 # One rollout command per trip
 
-Status: draft (2026-11-14) · Issue: none yet (#127 and #190 are related) · Track: delivery · Size: L (three slices) · Tier: High
+Status: approved (2026-11-14, by Dror: "Agree with your recommendations") · Issue: #568 (#127 and #190 are related) · Track: delivery · Size: L (three slices) · Tier: High
 Security path: yes (the approval hooks; a process spawned with an environment) · Migration: yes · Live-trip behaviour: yes (it is the deploy)
 
 Decision behind it: `CLAUDE.md`, "Faster delivery (owner's decision, 2026-11-14)", item 2
@@ -58,8 +58,8 @@ One command brings a named release to named trips.
   3. **companion**: re-render the profile's instructions and skills from the same
      release, clear the saved prompts, restart the gateway, and wait until its tools
      are registered;
-  4. **switches**: write the trip's resolved feature switches (the feature-switches
-     spec, S2).
+  4. **switches**: write the trip's resolved feature switches (`567-feature-switches.md`,
+     S2).
 - The trip's row records the release it now runs and the one it ran before. Rolling
   back is the same command naming the previous release.
 - Trips are done one at a time. With more than one trip, the first is a canary: the
@@ -248,18 +248,14 @@ Written first, from the criteria.
 - The hook change means the bridge restart and prompt refresh start asking where
   they were silent. That is intended and is said in the PR.
 
-## Open questions
+## Decisions (Dror, 2026-11-14)
 
-1. **R2's manifest change**: put `mcp/` and `profile-templates/` in the release, or
-   keep them on the host checkout and record only its commit? Proposed: in the
-   release, so a trip's site, bridge and companion are one version.
-2. **A profile edited in place** (AC-14): refuse, or overwrite after capturing it?
-   Proposed: refuse and report, since the capture rule in `CLAUDE.md` ("capture
-   before you deploy") already exists.
-3. **The Mac staging bridge** cannot reach its trip when started over SSH
-   (`CLAUDE.md`, "A Mac-provisioned companion that cannot read its own trip"). Does
-   R1 on staging need the bridges moved to a LaunchAgent first? Proposed: yes, as a
-   small prerequisite, otherwise step 2 fails on every staging rollout.
-4. **Trips with no recorded release** (built by hand, or the legacy trip): allow a
-   first rollout from "unknown", with no way back recorded? Proposed: yes, with the
-   plan saying so.
+1. **The bridge and the companion templates go into the release** (R2), so a trip's
+   site, bridge and companion are one version.
+2. **A profile edited in place is refused and reported** (AC-14), never overwritten;
+   it is captured first under the existing rule in `CLAUDE.md`.
+3. **Staging bridges move to a LaunchAgent before R1 is exercised on staging.** That
+   is deployment work on the staging host, outside this repository; until it is done
+   the bridge step is expected to fail there and is proved in tests.
+4. **A trip with no recorded release may be rolled out** from "unknown"; the plan
+   says that no way back is recorded for that first rollout.
