@@ -6,7 +6,16 @@
  * value is: the trip's own setting, else the every-trip setting, else the
  * future-trips setting if the trip was created after it, else OFF — decided in
  * SQL by `control_plane.feature_enabled`, so there is one resolution and every
- * caller (relay code here; the worker in slice S2) gets the same answer.
+ * caller (relay code here; the worker in slice S2) gets the same answer. The SQL
+ * function is also what refuses a trip it does not know: anything that is not
+ * the id of a row in `trips` (a slug, '', NULL, a deleted id) is off for every
+ * scope, so pass the trip's id, never its slug.
+ *
+ * THE REGISTRY IS NOT IN SQL. `feature_enabled` resolves a row for an
+ * unregistered name as written; only the registry (shared/feature-switches.js)
+ * says which names exist. Every caller of the SQL function must check the
+ * registry first — `featureEnabled` below does, and the S2 worker, which will
+ * call SQL directly, must do the same before it asks.
  *
  * FAIL SAFE. Everything uncertain is off: a name the registry does not hold, a
  * blank trip, a read that fails, a table or function that is missing, an answer
@@ -35,11 +44,30 @@ export type SwitchScope = (typeof SWITCH_SCOPES)[number];
 export type SwitchSource = SwitchScope | "default";
 
 /**
- * Trip states past `ready_private`: real people have used the site. The same
- * four states `scripts/teardown-trip.py` refuses (REFUSED_STATES); a test pins
- * the two together.
+ * "In use" is an ALLOW-LIST, so it fails safe (owner's confirmation pending).
+ *
+ * A trip-scoped set needs no `--live` ONLY when the trip's lifecycle state is
+ * one of these, the states strictly before `ready_private`. `ready_private`
+ * itself, every state after it, and any state this code does not recognise need
+ * `--live`: both real production trips sit at `ready_private`, and a deny-list
+ * of "later" states would let a state added tomorrow through without a prompt.
+ * A test pins this list against the lifecycle CHECK on `trips` so a new state
+ * must be decided here.
  */
-export const IN_USE_TRIP_STATES: readonly string[] = ["activation_approved", "active", "completed", "sealed"];
+export const SAFE_WITHOUT_LIVE_TRIP_STATES: readonly string[] = [
+  "pending_signup_approval",
+  "draft",
+  "intake_in_progress",
+  "intake_confirmed",
+  "planned",
+  "provisioning_approved",
+  "provisioning",
+];
+
+/** Does a trip in this lifecycle state need `--live` to be changed? Anything unlisted does. */
+export function tripNeedsLive(state: unknown): boolean {
+  return !(typeof state === "string" && SAFE_WITHOUT_LIVE_TRIP_STATES.includes(state));
+}
 
 /** Named in every refusal of an unregistered switch, so the reader knows where to look. */
 export const REGISTRY_FILE = "shared/feature-switches.js";
@@ -153,8 +181,8 @@ export async function findTrip(db: Queryable, ref: string): Promise<TripRef | nu
  * Set a switch for one trip, every trip, or future trips; the change and its
  * history row are one transaction. Refusals never write.
  *
- * `live` means "I know this reaches trips in use". The trip scope needs it only
- * when the trip is past `ready_private`; the every-trip and future-trips scopes
+ * `live` means "I know this reaches trips in use". The trip scope needs it unless
+ * the trip is in a state strictly before `ready_private` (`tripNeedsLive`); the every-trip and future-trips scopes
  * always need it, because they are not about one test trip.
  *
  * For the future-trips scope the moment it takes effect moves when the VALUE
@@ -195,11 +223,11 @@ export async function setFeatureSwitch(db: pg.Pool, input: SetFeatureSwitchInput
         await client.query("ROLLBACK");
         return fail("TRIP_NOT_FOUND", `no trip "${input.trip!.slice(0, 80)}"`);
       }
-      if (IN_USE_TRIP_STATES.includes(trip.lifecycleState) && !live) {
+      if (tripNeedsLive(trip.lifecycleState) && !live) {
         await client.query("ROLLBACK");
         return fail(
           "TRIP_IN_USE",
-          `${trip.slug} is ${trip.lifecycleState}: the trip is in use, so this change is a live change. Re-run with --live, once you have approval to change a trip in use.`,
+          `${trip.slug} is ${trip.lifecycleState}: a trip at ready_private or later (or in a state not known here) is in use, so this change is a live change. Re-run with --live, once you have approval to change a trip in use.`,
         );
       }
     } else if (!live) {

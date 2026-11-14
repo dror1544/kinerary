@@ -9,7 +9,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
 import { after, before, beforeEach, describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -17,10 +16,11 @@ import type pg from "pg";
 import { buildApp } from "../src/app.js";
 import { validateArchitectureProfile } from "../src/config.js";
 import {
-  IN_USE_TRIP_STATES,
+  SAFE_WITHOUT_LIVE_TRIP_STATES,
   describeFeatureSwitches,
   featureEnabled,
   setFeatureSwitch,
+  tripNeedsLive,
 } from "../src/feature-switches.js";
 import { tripStates } from "../src/lifecycle.js";
 import { applyMigrations } from "../src/migrations.js";
@@ -76,7 +76,7 @@ describe("feature switches (S1)", { skip: SKIP }, () => {
     await pool.query("ALTER TABLE control_plane.feature_switch_history DISABLE TRIGGER feature_switch_history_append_only");
     await pool.query("DELETE FROM control_plane.feature_switch_history");
     await pool.query("ALTER TABLE control_plane.feature_switch_history ENABLE TRIGGER feature_switch_history_append_only");
-    await pool.query("DELETE FROM control_plane.trips WHERE id IN ($1, $2) OR id LIKE 'trip_state%'", [TRIP_A, TRIP_B]);
+    await pool.query("DELETE FROM control_plane.trips WHERE id IN ($1, $2) OR id LIKE 'trip_state%' OR id LIKE 'trip_early%' OR id LIKE 'trip_gone%'", [TRIP_A, TRIP_B]);
     await addTrip(pool, TRIP_A);
     await addTrip(pool, TRIP_B);
   });
@@ -113,6 +113,51 @@ describe("feature switches (S1)", { skip: SKIP }, () => {
     ).then(() => ({ code: 0, stderr: "" }), (error: { code: number; stderr: string }) => ({ code: error.code, stderr: error.stderr }));
     assert.notEqual(result.code, 0);
     assert.match(result.stderr, /shared\/feature-switches\.js/);
+  });
+
+  // ── AC-1/AC-2, review M1: a trip the resolver does not know is off ───────
+
+  test("M1: with every trip on, anything that is not an existing trip id is off, in SQL and through featureEnabled", async () => {
+    await setFeatureSwitch(pool, { switch: SWITCH, enabled: true, scope: "all_trips", live: true });
+    assert.equal(await featureEnabled(pool, TRIP_A, SWITCH), true, "control: a real trip is on");
+    const slug = TRIP_A.replace(/_/g, "-");
+    for (const ref of ["trip_doesnotexist99", slug, "not-a-trip-at-all", ""]) {
+      assert.equal(await featureEnabled(pool, ref, SWITCH), false, `featureEnabled(${JSON.stringify(ref)})`);
+      const sql = await pool.query("SELECT control_plane.feature_enabled($1, $2) AS on", [ref, SWITCH]);
+      assert.equal(sql.rows[0].on, false, `feature_enabled(${JSON.stringify(ref)}) in SQL`);
+    }
+    const nul = await pool.query("SELECT control_plane.feature_enabled(NULL, $1) AS on", [SWITCH]);
+    assert.equal(nul.rows[0].on, false, "NULL trip in SQL");
+    assert.equal(await featureEnabled(pool, null as unknown as string, SWITCH), false);
+  });
+
+  test("M1: a per-trip off cannot be bypassed by passing the slug", async () => {
+    await setFeatureSwitch(pool, { switch: SWITCH, enabled: true, scope: "all_trips", live: true });
+    await setFeatureSwitch(pool, { switch: SWITCH, enabled: false, scope: "trip", trip: TRIP_A });
+    assert.equal(await featureEnabled(pool, TRIP_A, SWITCH), false);
+    assert.equal(await featureEnabled(pool, TRIP_A.replace(/_/g, "-"), SWITCH), false);
+  });
+
+  test("M1: a trip id that no longer exists is off, whatever is stored", async () => {
+    await addTrip(pool, "trip_gonegone01");
+    await setFeatureSwitch(pool, { switch: SWITCH, enabled: true, scope: "all_trips", live: true });
+    assert.equal(await featureEnabled(pool, "trip_gonegone01", SWITCH), true);
+    await pool.query("DELETE FROM control_plane.trips WHERE id = 'trip_gonegone01'");
+    assert.equal(await featureEnabled(pool, "trip_gonegone01", SWITCH), false);
+    const sql = await pool.query("SELECT control_plane.feature_enabled('trip_gonegone01', $1) AS on", [SWITCH]);
+    assert.equal(sql.rows[0].on, false);
+  });
+
+  test("M1: the registry gate is in code, not SQL — featureEnabled keeps a planted row off", async () => {
+    await pool.query(
+      "INSERT INTO control_plane.feature_switch_settings(switch, scope, trip_id, enabled, changed_by) VALUES ('rogue_switch','all_trips',NULL,true,$1)",
+      [`sha256:${"c".repeat(64)}`],
+    );
+    assert.equal(await featureEnabled(pool, TRIP_A, "rogue_switch"), false);
+    // The SQL function alone does not know the registry; every SQL caller must
+    // go through a registry check first (see the function's comment).
+    const sql = await pool.query("SELECT control_plane.feature_enabled($1, 'rogue_switch') AS on", [TRIP_A]);
+    assert.equal(sql.rows[0].on, true, "documented: SQL has no registry");
   });
 
   // ── AC-2 ────────────────────────────────────────────────────────────────
@@ -260,8 +305,15 @@ describe("feature switches (S1)", { skip: SKIP }, () => {
 
   // ── AC-8 ────────────────────────────────────────────────────────────────
 
-  test("AC-8: a trip in use refuses a trip-scoped set without --live, and takes it with --live", async () => {
-    for (const state of ["activation_approved", "active", "completed", "sealed"]) {
+  // ── "In use" is an allow-list (owner's confirmation pending) ──────────────
+  // A trip-scoped set needs no --live only for a trip strictly BEFORE
+  // ready_private. ready_private itself, everything after it and any state this
+  // code does not recognise need --live: both real production trips sit at
+  // ready_private.
+
+  test("AC-8: ready_private and every later state refuse a trip-scoped set without --live, and take it with --live", async () => {
+    const states = ["ready_private", "activation_approved", "active", "completed", "sealed"];
+    for (const state of states) {
       const id = `trip_state${state.replace(/_/g, "")}`;
       await addTrip(pool, id, state);
       const refused = await setFeatureSwitch(pool, { switch: SWITCH, enabled: true, scope: "trip", trip: id });
@@ -269,6 +321,7 @@ describe("feature switches (S1)", { skip: SKIP }, () => {
       if (!refused.ok) {
         assert.equal(refused.reason, "TRIP_IN_USE", state);
         assert.match(refused.message, /in use/);
+        assert.match(refused.message, /--live/);
       }
       assert.equal(await featureEnabled(pool, id, SWITCH), false, state);
       const allowed = await setFeatureSwitch(pool, { switch: SWITCH, enabled: true, scope: "trip", trip: id, live: true });
@@ -276,26 +329,80 @@ describe("feature switches (S1)", { skip: SKIP }, () => {
       assert.equal(await featureEnabled(pool, id, SWITCH), true, state);
     }
     const rows = await pool.query("SELECT count(*)::int AS n FROM control_plane.feature_switch_history");
-    assert.equal(rows.rows[0].n, 4, "only the four --live sets were recorded");
+    assert.equal(rows.rows[0].n, states.length, "only the --live sets were recorded");
   });
 
-  test("AC-8: 'in use' is the same set of states teardown refuses", async () => {
-    const teardown = await readFile(fileURLToPath(new URL("../../../scripts/teardown-trip.py", import.meta.url)), "utf8");
-    const match = /^REFUSED_STATES = \{([^}]*)\}/m.exec(teardown);
-    assert.ok(match, "REFUSED_STATES not found in scripts/teardown-trip.py");
-    const refused = [...match![1]!.matchAll(/"([a-z_]+)"/g)].map((m) => m[1]!).sort();
-    assert.deepEqual([...IN_USE_TRIP_STATES].sort(), refused);
-    // And every one of them is a real lifecycle state, past ready_private.
-    const order = tripStates as readonly string[];
-    for (const state of IN_USE_TRIP_STATES) assert.ok(order.indexOf(state) > order.indexOf("ready_private"), state);
+  test("AC-8: the states that need no --live are exactly those before ready_private in the lifecycle CHECK", async () => {
+    const res = await pool.query(
+      `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
+        WHERE conrelid = 'control_plane.trips'::regclass AND contype = 'c' AND pg_get_constraintdef(oid) LIKE '%lifecycle_state%'`,
+    );
+    const lists = res.rows.map((row) => [...String(row.def).matchAll(/'([a-z_]+)'/g)].map((m) => m[1]!));
+    const checked = lists.sort((x, y) => y.length - x.length)[0]!;
+    assert.ok(checked.includes("ready_private"), "the CHECK names ready_private");
+    const before = checked.slice(0, checked.indexOf("ready_private"));
+    assert.deepEqual([...SAFE_WITHOUT_LIVE_TRIP_STATES], before,
+      "a state added before ready_private must be decided here; one added after it lands on the --live side");
+    assert.deepEqual(checked, [...tripStates], "lifecycle.ts and the CHECK agree on the states and their order");
+    for (const state of checked) {
+      assert.equal(tripNeedsLive(state), !before.includes(state), state);
+    }
+    // Fail safe: a state this code has never heard of needs --live, as do non-strings.
+    for (const unknown of ["ready_public", "archived", "", "READY_PRIVATE ", undefined, null, 7]) {
+      assert.equal(tripNeedsLive(unknown as string), true, String(unknown));
+    }
   });
 
-  test("AC-8: ready_private and earlier states are not in use", async () => {
-    for (const state of ["draft", "intake_in_progress", "provisioning", "ready_private"]) {
-      const id = `trip_state${state.slice(0, 5)}`;
+  test("AC-8: states strictly before ready_private need no --live", async () => {
+    for (const state of SAFE_WITHOUT_LIVE_TRIP_STATES) {
+      const id = `trip_early${state.replace(/_/g, "")}`;
       await addTrip(pool, id, state);
       const set = await setFeatureSwitch(pool, { switch: SWITCH, enabled: true, scope: "trip", trip: id });
       assert.equal(set.ok, true, state);
+    }
+    await pool.query("DELETE FROM control_plane.feature_switch_settings");
+    await pool.query("DELETE FROM control_plane.trips WHERE id LIKE 'trip_early%'");
+  });
+
+  test("AC-8: ready_private is refused without --live through the command line too", async () => {
+    await addTrip(pool, "trip_statereadypriv", "ready_private");
+    const cwd = fileURLToPath(new URL("..", import.meta.url));
+    const env = { ...process.env, CONTROL_PLANE_DATABASE_URL: DB_URL! };
+    const bare = await run(
+      process.execPath,
+      ["--import", "tsx", "src/feature-cli.ts", "set", SWITCH, "on", "--trip", "trip-statereadypriv"],
+      { cwd, env },
+    ).then(() => ({ code: 0, stderr: "" }), (error: { code: number; stderr: string }) => ({ code: error.code, stderr: error.stderr }));
+    assert.notEqual(bare.code, 0);
+    assert.match(bare.stderr, /TRIP_IN_USE/);
+    assert.equal(await featureEnabled(pool, "trip_statereadypriv", SWITCH), false);
+    await run(
+      process.execPath,
+      ["--import", "tsx", "src/feature-cli.ts", "set", SWITCH, "on", "--trip", "trip-statereadypriv", "--live"],
+      { cwd, env },
+    );
+    assert.equal(await featureEnabled(pool, "trip_statereadypriv", SWITCH), true);
+  });
+
+  test("AC-8: ready_private is refused without live through the route too", async () => {
+    await addTrip(pool, "trip_statereadypriv", "ready_private");
+    const app = buildApp(profile, { admin: { db: pool, apiKey: KEY } });
+    try {
+      const headers = { "x-api-key": KEY };
+      const refused = await app.inject({
+        method: "POST", url: "/v1/admin/feature-switches", headers,
+        payload: { switch: SWITCH, enabled: true, scope: "trip", trip: "trip_statereadypriv" },
+      });
+      assert.equal(refused.statusCode, 409);
+      assert.equal(JSON.parse(refused.body).error, "TRIP_IN_USE");
+      assert.equal(await featureEnabled(pool, "trip_statereadypriv", SWITCH), false);
+      const live = await app.inject({
+        method: "POST", url: "/v1/admin/feature-switches", headers,
+        payload: { switch: SWITCH, enabled: true, scope: "trip", trip: "trip_statereadypriv", live: true },
+      });
+      assert.equal(live.statusCode, 200);
+    } finally {
+      await app.close();
     }
   });
 

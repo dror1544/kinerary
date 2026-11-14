@@ -453,9 +453,9 @@ merge_evidence() {
 # characters from the command reach the prompt.
 feature_live_note() {
   local re rest tok name="" value="" trip="" scope="" next="" words=() i
-  re='(feature-cli(\.[jt]s)?|run[[:space:]]+feature)([[:space:]]+--prefix[[:space:]]+[^[:space:]]+)?([[:space:]]+--)?[[:space:]]+set[[:space:]]+([^;&|]*)'
+  re='(feature-cli(\.[jt]s)?|run(-script)?[[:space:]]+feature)(([[:space:]]+(--prefix=[^[:space:]]+|(--prefix|-C)[[:space:]]+[^[:space:]]+))*)([[:space:]]+--)?[[:space:]]+set[[:space:]]+([^;&|]*)'
   [[ "$1" =~ $re ]] || return 1
-  rest="${BASH_REMATCH[5]}"
+  rest="${BASH_REMATCH[${#BASH_REMATCH[@]}-1]}"   # the last group, whatever the groups before it are
   read -r -a words <<<"$rest"
   for ((i = 0; i < ${#words[@]}; i++)); do
     tok="$(printf '%s' "${words[$i]}" | tr -cd '[:alnum:]_.:/=-')"

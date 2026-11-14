@@ -10,7 +10,8 @@
 //   --all        every trip, present and future
 //   --new-trips  trips created after this moment
 //   --live       "I know this reaches trips in use". Required for --all and
-//                --new-trips, and for a --trip past ready_private. It is a
+//                --new-trips, and for any --trip at ready_private or later (only a trip
+//                before ready_private is free of it). It is a
 //                deploy under CLAUDE.md hard rule 2, and the Claude Code hook
 //                asks before running a command that carries it.
 //   --by         who is changing it (stored as a sha256 digest). Default:

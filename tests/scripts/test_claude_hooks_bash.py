@@ -430,6 +430,42 @@ class ALiveFeatureSwitchNamesWhatItChanges(Harness):
         self.assertEqual(d.get("permissionDecision"), "deny")
         self.assertIn("hard rule 2", d["permissionDecisionReason"])
 
+    # Review M2: every spelling that hands the CLI --live is asked, and refused to a subagent.
+    OTHER_SPELLINGS = (
+        "npm run-script feature -- set delivery_probe on --all --live",
+        "npm --prefix=control-plane/api run feature -- set delivery_probe on --all --live",
+        "npm -C control-plane/api run feature -- set delivery_probe on --all --live",
+        "npm run feature -- set delivery_probe on --all \"--live\"",
+        "npm run feature -- set delivery_probe on --all '--live'",
+        "curl -s -X POST http://127.0.0.1:4310/v1/admin/feature-switches -H 'x-api-key: k' "
+        "-d '{\"switch\":\"delivery_probe\",\"enabled\":true,\"scope\":\"all_trips\",\"live\": true}'",
+    )
+
+    def test_the_other_spellings_are_asked(self):
+        for command in self.OTHER_SPELLINGS:
+            d = self.hook(command)
+            self.assertEqual(d.get("permissionDecision"), "ask", command)
+            self.assertIn("hard rule 2", d["permissionDecisionReason"], command)
+
+    def test_the_cli_spellings_still_name_the_switch_and_scope(self):
+        for command in self.OTHER_SPELLINGS[:5]:
+            reason = self.hook(command)["permissionDecisionReason"]
+            self.assertIn("Switch: delivery_probe -> on", reason, command)
+            self.assertIn("Scope:  all", reason, command)
+
+    def test_a_subagent_is_refused_for_the_other_spellings(self):
+        for command in self.OTHER_SPELLINGS:
+            d = self.hook(command, agent_type="developer")
+            self.assertEqual(d.get("permissionDecision"), "deny", command)
+            self.assertIn("hard rule 2", d["permissionDecisionReason"], command)
+
+    def test_a_get_and_a_non_live_post_to_the_route_are_silent(self):
+        for command in (
+            "curl -s -H 'x-api-key: k' http://127.0.0.1:4310/v1/admin/feature-switches?trip=japan-2026",
+            "curl -s -X POST http://127.0.0.1:4310/v1/admin/feature-switches -d '{\"live\":false}'",
+        ):
+            self.assertEqual(self.hook(command), {}, command)
+
 
 class ASubagentIsRefused(Harness):
     def test_every_landing_verb_is_a_refusal_naming_the_agent(self):

@@ -85,22 +85,39 @@ CREATE TRIGGER feature_switch_history_append_only
   BEFORE UPDATE OR DELETE ON control_plane.feature_switch_history
   FOR EACH ROW EXECUTE FUNCTION control_plane.feature_switch_history_is_append_only();
 
--- The resolution order, in one place. A trip that does not exist, a switch with
--- no row, an 'off' that applies: all false. The value is only ever true when a
--- row that applies says true.
+-- The resolution order, in one place.
+--
+-- FAILS SAFE for a trip it does not know: unless p_trip is the id of a row in
+-- control_plane.trips (by id only — not a slug, not NULL, not ''), the answer is
+-- false for EVERY branch, the every-trip one included. Otherwise an "on for every
+-- trip" row would turn a feature on for a typo, a retired id or a slug, and
+-- would bypass a per-trip "off" the caller reached by naming the trip another way.
+-- A switch with no row, an 'off' that applies: also false. The value is only ever
+-- true when a row that applies says true, for a trip that exists.
+--
+-- NOT in SQL: the registry. This function does not know which switch names are
+-- registered (shared/feature-switches.js is the only list), so a row for an
+-- unregistered name resolves here as written. Every caller must check the
+-- registry first: featureEnabled() in feature-switches.ts does, and the worker
+-- (slice S2) must do the same before it asks SQL.
 CREATE OR REPLACE FUNCTION control_plane.feature_enabled(p_trip text, p_switch text)
 RETURNS boolean LANGUAGE sql STABLE AS $$
-  SELECT COALESCE(
-    (SELECT s.enabled
-       FROM control_plane.feature_switch_settings s
-      WHERE s.switch = p_switch AND s.scope = 'trip' AND s.trip_id = p_trip),
-    (SELECT s.enabled
-       FROM control_plane.feature_switch_settings s
-      WHERE s.switch = p_switch AND s.scope = 'all_trips'),
-    (SELECT s.enabled
-       FROM control_plane.feature_switch_settings s
-       JOIN control_plane.trips t ON t.id = p_trip
-      WHERE s.switch = p_switch AND s.scope = 'new_trips' AND t.created_at > s.effective_from),
-    false
-  );
+  SELECT CASE
+    WHEN p_trip IS NULL OR p_switch IS NULL
+      OR NOT EXISTS (SELECT 1 FROM control_plane.trips t WHERE t.id = p_trip)
+    THEN false
+    ELSE COALESCE(
+      (SELECT s.enabled
+         FROM control_plane.feature_switch_settings s
+        WHERE s.switch = p_switch AND s.scope = 'trip' AND s.trip_id = p_trip),
+      (SELECT s.enabled
+         FROM control_plane.feature_switch_settings s
+        WHERE s.switch = p_switch AND s.scope = 'all_trips'),
+      (SELECT s.enabled
+         FROM control_plane.feature_switch_settings s
+         JOIN control_plane.trips t ON t.id = p_trip
+        WHERE s.switch = p_switch AND s.scope = 'new_trips' AND t.created_at > s.effective_from),
+      false
+    )
+  END;
 $$;
