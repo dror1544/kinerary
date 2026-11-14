@@ -371,6 +371,14 @@ class CompanionOverlayTemplateTests(unittest.TestCase):
         # And the one-shot flag is spent before the profile ever speaks.
         self.assertIs(onboarding["seen"]["profile_build_offered"], True)
 
+    def test_the_companion_is_its_own_gateway(self) -> None:
+        """Hermes 0.21 serves every profile from one combined gateway unless the
+        profile sets gateway.standalone; the VM's combined gateway has no relay
+        settings, so a companion without the key is silently never connected
+        (2026-11-13). A real boolean: a string "true" is not what Hermes reads."""
+        overlay = yaml.safe_load(self.OVERLAY.read_text(encoding="utf-8"))
+        self.assertIs(overlay["gateway"]["standalone"], True)
+
     def test_skill_manage_writes_are_staged_and_toolsets_are_unchanged(self) -> None:
         """companion-write-confinement (2026-09-29): production usage showed
         write_file/patch (zero calls, ever) and skill_manage (one call, ever —
@@ -388,9 +396,17 @@ class CompanionOverlayTemplateTests(unittest.TestCase):
         scripts/companion-install-host.sh, not this template).
         """
         overlay = yaml.safe_load(self.OVERLAY.read_text(encoding="utf-8"))
-        self.assertEqual(overlay["skills"], {"write_approval": True})
+        self.assertIs(overlay["skills"]["write_approval"], True)
+        disabled = overlay["agent"]["disabled_toolsets"]
+        for needed in ("file", "memory", "cronjob", "skills", "web"):
+            self.assertNotIn(
+                needed, disabled,
+                "the gate stages skill writes; it must not disable the toolsets "
+                "the companion reads through",
+            )
+        # #547 adds desktop/browser control and connector install to the deny list, and nothing else.
         self.assertEqual(
-            overlay["agent"]["disabled_toolsets"], ["terminal", "code_execution"],
-            "this change must not disable file/memory/cronjob/skills too",
+            disabled,
+            ["terminal", "code_execution", "computer_use", "browser", "connections"],
         )
 

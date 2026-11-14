@@ -1,0 +1,367 @@
+# A trip created on the dashboard seeds the interview
+
+Status: approved 2026-10-30 by Dror (decisions below); AC-17 to AC-19 added 2026-11-12, AC-13/17/18 reworded 2026-11-13 (draft — behaviour decided by Dror in #548; approval at merge) · Issue: #438 · Track: T1 · Size: L (M + sign-up name + card write-back) · Tier: Normal
+Security path: yes since AC-11 (sign-up and Google sign-in write the account name: auth routes, boundary review) · Migration: possibly (an account display-name column if none fits; timestamped, rollback header) · Live-trip behaviour: yes (interviews started after the relay restart)
+
+> **Sprint 8 (2026-10-30): in scope, prioritised — first in the build order** (Dror via the lead session, 2026-10-30).
+
+## Problem
+
+Staging acceptance run, 2026-10-19 (combined candidate served as `404ea2b`;
+organizer on iPhone and Mac Chrome; issue #438): the organizer created a trip on
+the dashboard with a destination and dates, started the interview from it, and
+the interview asked for the destination and the dates again. Owner, round-2
+acceptance (2026-10-20): values entered on the dashboard's new-trip form are set
+on the trip and skipped in the interview, unless they could not be resolved.
+Owner, scope extension (2026-10-30, issue comment): the account that created the
+trip is the organizer and is greeted **by name**; the greeting states the
+**destination and dates** already chosen; destination, dates and trip type are
+confirmed, never re-asked, and changing them is an explicit correction. Product
+direction: dashboard-first trip creation, step 1 (notes folder,
+`specs/2026-10-30-dashboard-first-trip-creation.md`).
+
+What the code does today (4510301):
+
+- **The card is stored and never read by the interview.** `POST /v1/trips`
+  (`control-plane/api/src/portal.ts:1314-1347`) writes `destination_label`,
+  `start_date`, `end_date`, `trip_type` and `draft_inputs`
+  (`{destination, trip_type, departure_date?, return_date?}`, `:1328`).
+  Nothing reads `draft_inputs` (its only writer is that route; column from
+  migration `0020_web_portal.sql:10`), and no route edits the card afterwards.
+- **The interview link is bound to the organizer.** `POST
+  /v1/trips/:id/interview-link` (`portal.ts:1358-1371`) requires the `owner`
+  membership and calls `issueEnrollment` (`enrollment.ts:40`) for that user and
+  trip.
+- **The session starts empty.** `/start <token>` → `relay/dispatch.ts:731-750`
+  → `startFromDeepLink` (`chat-router.ts:792`, `startSession` at `:871`) →
+  `startSession` (`interview.ts:2604`), which inserts `intake_sessions` with
+  `answers = '{}'` (`:2677-2681`). The first question is the first required
+  one.
+- **The opening is generic.** `renderDocumentOffer` (`chat-router.ts:1307-1333`)
+  sends `introduction` or `introductionReturning` (`intake-copy.ts:389`, `:422`;
+  Hebrew `:779`, `:801`). Neither carries a name, a destination or dates.
+  `introductionReturning` omits the name on purpose: "The display name on a
+  password signup is the local part of an email address" (`intake-copy.ts:419`). That holds: `users.display_name` is the email's local
+  part for a password signup (`password-identity.ts:99`, `:323`) and Google's
+  name or the local part for a Google sign-in (`portal.ts:206`). The Telegram
+  account's first name, from the update's verified `from`, already reaches
+  `startSession` as `telegramName` (`dispatch.ts:732`).
+- **The questions it would re-ask.** `trip_type` (router-owned choice,
+  `interview.ts:605`), `destination` (`:623`), `departure_date` (`:642`),
+  `return_date` (`:649`). `timezone` derives from `destination` (`:664-678`), so
+  a seeded destination also settles it where the zone is known.
+- **"Who are you" is a separate question.** `organizer_identity` (`:887-930`)
+  asks which traveller on the roster is speaking; its prompt says "Never infer
+  it from anything else — not from who signed up". The trip-level organizer is
+  already settled: the enrollment's user holds the `owner` membership, and
+  `startSession` links the Telegram chat to that user (`:2696`).
+- **Trip type vocabularies differ.** Dashboard: `family | couple | group |
+  other` (`web/src/pages/ProductApp.tsx:139`; migration `0020` check).
+  Interview: `family | group_of_families | couple` plus free text
+  (`interview.ts:605-617`). `web/src/pages/NewTripPage.tsx` holds a third set
+  (`multi-family`, `friends`, `road-trip`) but is not routed (`web/src/App.tsx:55`
+  sends `/trips/new` to `ProductApp`).
+
+## Behaviour
+
+When the organizer opens the interview link of a trip created on the dashboard:
+
+- The opening greets them by name (see the name rule in Contracts), as the
+  organizer of this trip, and states what is already chosen as the starting
+  point — "Japan, 12–26 April 2027" — in words, never as `YYYY-MM-DD`. It does
+  not ask for the destination or the dates. The document offer follows as
+  today.
+- The router does not ask a seeded question. The values appear in the final
+  summary with everything else, which is where they are confirmed.
+- Changing one is an ordinary correction ("actually it's May"): an answered
+  question is already correctable, so it goes through the existing path.
+- A value the interview would not accept from a typed answer (fails
+  `validateAnswer`, `interview.ts:1237`, or dates out of order,
+  `datesInOrder`, `:372`) is not seeded; that question is asked as today.
+- A partial card seeds only what it holds: a start date without an end date
+  seeds `departure_date`, and `return_date` is asked.
+- A trip created anywhere else (Telegram signup, `signup.ts:98`; operator
+  invitation, `organizer-invite.ts:319`) has no card values and opens exactly as
+  today.
+
+## Acceptance criteria
+
+- AC-1 Given a trip created through `POST /v1/trips` with destination "Japan",
+  start 2027-04-12, end 2027-04-26 and type `family`, when the organizer's
+  interview session starts, then its stored answers hold `destination` =
+  "Japan", `departure_date` = "2027-04-12", `return_date` = "2027-04-26" and
+  `trip_type` = `family`, in the same transaction that creates the session,
+  and the session's first `nextQuestion` is none of those four.
+- AC-2 (wording superseded by AC-13, 2026-11-09: the opening says the month,
+  not both dates, and never the word dashboard) Given that session, when the opening is rendered in English and in
+  Hebrew, then it contains the organizer's name (per the name rule), the
+  destination, and both dates as `readableDate` (`intake-copy.ts:1034`) words,
+  contains no `YYYY-MM-DD`, and asks for neither the destination nor the
+  dates. The returning-organizer opening does the same.
+- AC-3 Given the same session, when the organizer answers every remaining
+  required question, then the router never puts `destination`,
+  `departure_date`, `return_date` or a seeded `trip_type` on screen, and the
+  final summary lists all four.
+- AC-4 Given a seeded session, when the organizer writes "actually we go in
+  May, 3 to 17", then `departure_date` and `return_date` take the new values
+  through the existing correction path, and the card's values are not
+  re-applied afterwards.
+- AC-5 Given a card with only a start date, then only `departure_date` is
+  seeded and `return_date` is the router's question when dates come up; given
+  a card with no dates, no date is seeded and the opening names only the
+  destination.
+- AC-6 Given a card value that `validateAnswer` rejects (for example a
+  destination over the question's `maxLength`), then that question is not
+  seeded and is asked as today, and the session still starts.
+- AC-7 Given a trip created by Telegram signup or by an operator invitation
+  (no card values), then the session starts with `answers = '{}'` and the
+  opening text is byte-identical to today's.
+- AC-8 Given a session start with a seed, then one structured log line
+  `interview.session_seeded` names the seeded question ids and no values.
+
+## Contracts
+
+- `control-plane/api/src/interview.ts` `startSession` (`:2604`): reads the
+  trip's card (`destination_label`, `start_date`, `end_date`, `trip_type`) in
+  the transaction that already locks the trip row (`:2627`), builds the
+  seed through a new pure `seedAnswersFromCard(card) -> AnswerStore` that runs
+  each value through `validateAnswer` and `datesInOrder`, and inserts the
+  session with those answers. The card columns are the source; `draft_inputs`
+  holds the same values and stays unread.
+- Trip type mapping, in `seedAnswersFromCard`: `family` → `family`, `couple`
+  → `couple`. `group` and `other` are not seeded (Open question 3).
+- `SessionView` (or `StartSessionResult`) carries a `seeded` summary
+  (destination, dates) for the opening; `chat-router.ts` `renderDocumentOffer`
+  (`:1307`) takes it and the organizer's name.
+- `control-plane/api/src/intake-copy.ts`: new he/en strings for the seeded
+  opening line (wording: AC-13) placed
+  before the existing introduction text; the rest of the introduction is
+  unchanged.
+- **Name rule (proposal, Open question 2):** the Telegram account's first name
+  from the verified update (`telegramName`, already passed to `startSession`);
+  if absent, no name. `users.display_name` is not used, for the reason
+  `introductionReturning` already records.
+- `relay/dispatch.ts:745`: passes the seed and the name through; no other
+  relay change.
+- No migration, no route change, no change to the dashboard.
+
+## Non-goals
+
+- Checking that the destination is a real place, or offering its main cities
+  (#485, dashboard-first step 2). Any text the interview would accept from a
+  typed answer is seeded.
+- Month-and-year dates (#484). Today the card holds exact days or none; #484
+  extends the seed and the greeting to a month when it lands.
+- Recording the card as a source in `trip_answer_sources` (that table is
+  document provenance: `documentId` is required, `answer-provenance.ts:25-35`).
+- Retiring the Telegram interview (dashboard-first spec: not planned).
+
+## Security and boundary notes
+
+None of the three invariants in CLAUDE.md "Security-sensitive paths" applies.
+The seed is read from the trip the enrollment names, inside the same
+transaction, so no value crosses trips. The name in the greeting comes from the
+verified Telegram update and is display data only; it is never used as an
+identity or routing fact (the rule `startSession`'s own header states for chat
+ids). The log line carries question ids, never values.
+
+## Test plan
+
+Written first:
+- `control-plane/api/test/interview.test.ts` (unit): `seedAnswersFromCard`
+  — `a full card seeds four answers`, `a start date alone seeds only the
+  departure`, `an invalid value is not seeded`, `group and other are not
+  seeded`.
+- `control-plane/api/test/chat-router.test.ts` (DB, only with a `*test*`
+  database): `a dashboard trip's session starts with the card's answers and
+  asks none of them` (AC-1, AC-3); `a signup trip's session starts empty`
+  (AC-7); `the seeded opening names the organizer, the destination and the
+  dates in words` (AC-2, he and en).
+- `control-plane/api/test/relay-dispatch.test.ts`: `the opening for a seeded
+  start carries the seed line and the document offer` (AC-2).
+- `control-plane/api/test/interview-transcript.test.ts` or the
+  `recap-accepts-new-info-db.test.ts` harness: `a seeded date is corrected in
+  words` (AC-4).
+- Manual: one dashboard-created trip on Mac staging, interview opened from the
+  card on a phone; record the opening text.
+
+Suites: `control-plane/api` unit and DB.
+
+## Rollout and regression
+
+Relay and API restart; affects interviews started afterwards. A trip whose
+interview is already running is not touched (its session already exists).
+**Per-PR regression plan: needed** (router behaviour in a live interview, and
+the session-start transaction).
+
+## Decisions (Dror, 2026-10-30)
+
+1. **Name source (AC-2):** the name the organizer gave the product, not the
+   email. A Google sign-in uses the Google account's name (the verified
+   `name`/`given_name` claim); a password sign-up asks for a name once, on the
+   dashboard's sign-up form, and stores it on the account. The interview greets
+   with that name. An account that has none (created before this change) is
+   asked for it once on the dashboard. The Telegram first name is used only
+   when neither exists.
+2. **Trip type:** seed `family` and `couple` only; for `group` and `other` the
+   interview asks the type as today.
+3. **Organizer identity:** when the greeting name matches exactly one roster
+   entry, the question becomes a one-tap confirm ("You're Dana on the list,
+   right?"); otherwise it is asked as today. Adds **AC-9**.
+4. **Card follows the interview:** in this item. On intake confirm, the
+   confirmed destination and dates are written back to the trip card, so the
+   dashboard and the interview hold one answer. Adds **AC-10**.
+5. **"Could not be resolved":** this item seeds whatever a typed answer would
+   accept; place recognition is #485.
+
+Added acceptance criteria:
+- **AC-9** Given a seeded trip whose organizer name matches exactly one roster
+  entry, when the interview reaches `organizer_identity`, then it offers that
+  entry as a one-tap confirm, and a "no" falls back to today's open question;
+  with zero or several matches it asks as today.
+- **AC-10** Given an intake confirmed with a destination or dates different
+  from the card's, when the intake is confirmed, then the trip card shows the
+  confirmed values, and the change is recorded with who and when.
+- **AC-11** Given a password sign-up, when the account is created, then the
+  dashboard has asked for and stored a display name; given a Google sign-in, the
+  stored name is the Google account's name; an existing account with no name is
+  asked once on its next dashboard visit.
+
+## Decision (Dror, 2026-11-02): the stops question starts from what is known
+
+Found on Mac staging: a seeded session skipped the destination and the dates,
+then asked `phases` as "Where are you going, and when? The stops in order…",
+which reads as asking everything again. AC-3 never covered `phases`.
+
+- **AC-12** Given a session with `destination`, `departure_date` and
+  `return_date` on record (seeded or typed) and no answer, no document
+  suggestion and no earlier "no" for `phases`, when the router reaches
+  `phases`, then it asks a Yes/No confirm naming the place and both dates in
+  words — "You're going to Gatecity, 14 November – 21 November. Is that the
+  only stop?" / "אתם נוסעים לGatecity, 14 בנובמבר – 21 בנובמבר. זו התחנה
+  היחידה?" — with no `YYYY-MM-DD`. **Yes** records one stop through the
+  ordinary answer path (`name` and `name_en` = the destination, `start` and
+  `end` = the two dates). **No** is remembered for the session and asks the
+  stops as an open question that does not ask the destination or dates again
+  ("What are the stops, in order, with rough dates — and where you're staying
+  if it's booked?"). Typing an answer instead works as any typed answer. A value
+  `validateAnswer` would reject (for example a non-Latin destination with no
+  English name) is not offered, and the question is asked as today. Derived on
+  every read, like AC-9's confirm, never stored.
+
+## Decision (Dror, 2026-11-09): the opening, in the organizer's own language, for a first-time account
+
+Found on the Sprint 8 staging run (Hebrew interview, dashboard-created trip
+"Gatecity", 14-21 Nov 2026, organizer "Arlo"). The seeded opening was "not good,
+in Hebrew and in English": it talked about the dashboard, the Hebrew was
+masculine singular while the rest of the interview is plural, the name and the
+destination came out in Latin letters inside a Hebrew sentence, and it said
+"welcome back" to an account on its first trip. Dror chose the copy (option C).
+
+- **AC-13 (copy)** The seeded opening replaces the earlier lines (AC-2's wording)
+  with one message in Dror's wording (2026-11-13, #548; it replaces the
+  two-line "Hi {name}, {destination} in {month}. How exciting! 🎉⏎A few quick
+  questions will fill in your trip's details." of 2026-11-12, and before that
+  "…and your trip will be ready for everyone"):
+  - EN: "Hi {name} 👋⏎I'm your Kinerary travel assistant, and I'd love to help
+    you plan your trip to {destination} in {month}. How exciting! 🎉⏎⏎To plan
+    the trip that suits you best, I'll ask a few short questions. If you have a
+    trip plan, flight tickets or any other booking, send it to me here in the
+    chat and I'll learn more about the trip. So let's start!"
+  - HE: "היי {name} 👋⏎אני עוזר הטיולים שלכם מבית Kinerary, ואשמח לעזור לכם
+    לתכנן את הטיול ל{destination} ב{month}. איזה כיף! 🎉⏎⏎כדי שנתכנן את הטיול
+    שהכי מתאים לכם, נעבור על כמה שאלות קצרות. אם יש לכם תוכנית טיול, כרטיסי
+    טיסה או כל הזמנה אחרת, שלחו לי אותם כאן בצ׳אט ואלמד מהם עוד על הטיול. אז
+    בואו נתחיל!"
+  (⏎ is a line break inside the one message.) Dror wrote it in the masculine
+  singular ("שתענה", "תשלח", "בוא נתחיל"); it is set in the plural voice the
+  rest of the interview uses, his tone kept.
+  `{month}` is the departure month in words in the interview language
+  ("November" / "נובמבר"); a trip that crosses a month names both
+  ("November–December" / "נובמבר–דצמבר"). No name drops "{name}" ("Hi 👋" /
+  "היי 👋"). No usable date drops the month ("…your trip to {destination}.").
+  No destination says "your trip" / "את הטיול". The opening never prints
+  `YYYY-MM-DD` and never says dashboard or card. What follows it is AC-17 and
+  AC-18.
+- **AC-14 (native names)** When the interview language is not English, the
+  organizer's name and the destination are written in that language for the
+  greeting: the name by sound (Arlo → ארלו), the destination by its common
+  native name if it has one (Paris → פריז, Rome → רומא), else by sound
+  (Gatecity → גייטסיטי). One bounded model call on the binding the interview
+  already uses for `interpret` (`INTERPRET_RUNNER` / `MODEL` / `EFFORT`), a
+  strict short JSON answer, a hard ceiling (5 s as first written; 15 s since
+  2026-11-12, #546, see `546-native-names-budget.md`), and a validation gate
+  (non-empty, short, target-script letters only, no Latin letters, no line
+  breaks). On any failure, timeout or `NOT_CONFIGURED` the English as entered is
+  used, a warning is logged (reason only, never the values), and the opening is
+  never held beyond the ceiling. The call is made once per session, after the
+  session's transaction has committed, and the result is stored with the session
+  (`intake_sessions.ui_state.native_names`, each value next to the English it was
+  made from; no migration). Later uses read it and never call again: the AC-12
+  known-stop question names the place in the interview language, and the stop it
+  records has `name` in that language with `name_en` keeping the English. A
+  destination corrected afterwards no longer matches its stored source, so the
+  translation of another place is never shown. The destination answer itself
+  (and so the slug) stays the English as entered. An English interview makes no
+  call. A name already written in the target script is not sent.
+- **AC-15 (welcome back)** The returning opening is used only when THIS account
+  (the trip owner's `user_id`) has an earlier built trip. A built trip of another
+  account linked to the same Telegram no longer counts: since #523 a Telegram is
+  one account's main Telegram. `hasEarlierBuiltTrip` takes no Telegram id; both
+  callers (a plain `/start`, and the organizer's approval of another Telegram
+  account opening the link) mean "this account".
+- **AC-16 (suites)** `control-plane/api` against a `*test*` database, `tsc`
+  clean, verifier report attached to the PR.
+
+## Decision (Dror, 2026-11-12 and 11-13, #548): the opening is one message, the greeting and the invitation
+
+Found on the Sprint 8 staging run, step 3 (Hebrew interview, dashboard-created
+trip "Gatecity"). Dror: "The greeting starts with the right greeting but then
+added the whole entire greeting message, this does not fit to the beginning of
+the greeting." His decision: "After it set from the user dashboard the greeting
+should include the beginning and explanation about a short questions to fill up
+the data." The first message was AC-13's opening followed by the whole
+introduction (nine paragraphs about what Kinerary is, ending "send me whatever
+you already have, or just type Let's start"): an organizer who has already
+chosen a destination and dates was welcomed twice, and told twice what to send.
+
+On 2026-11-13 Dror gave the wording himself ("this is the tone I like"): the
+greeting says who is writing and the trip, then one paragraph that a short
+questionnaire follows and that a trip plan, flight tickets or any booking can
+be sent in the chat, ending "so let's start"; and the button under it reads
+"Let's start", not "I don't have one".
+
+- **AC-17 (the first message)** Given an interview started from a trip created
+  on the dashboard (a seeded session), when the organizer opens the link, then
+  the opening is ONE message, exactly AC-13's: no introduction paragraph and no
+  separate document offer (its invitation is AC-13's second paragraph). English
+  and Hebrew, Hebrew in the plural voice, with the name and the destination in
+  Hebrew where AC-14 made them. For an English-entered value that could not be
+  translated the Latin spelling stands, as in AC-14. (Revised 2026-11-13: the
+  2026-11-12 build sent the greeting and the document offer as two messages.)
+- **AC-18 (its button)** The message carries one button, "Let's start" /
+  "בואו נתחיל" (Dror, 2026-11-13: "I don't have one" read oddly, and a document
+  can be sent at any time). It does exactly what "I don't have one" does on
+  an unseeded opening (same callback): the first question follows. The older
+  introduction is not sent at all. For an account that already has a built trip
+  (AC-15) one note, from the old returning introduction, sits between the two
+  paragraphs: the earlier trip and its assistant are untouched, and messages
+  here come to this interview until this trip is built (`/trips` moves between
+  them). It is the one fact a second trip raises, kept because dropping it
+  leaves the organizer thinking the first trip is being replaced.
+- **AC-19 (both ways in)** The same opening is sent when
+  the organizer opens the link (`/start <token>`) and when the account's own
+  organizer approves another Telegram account opening it (AC-5 of the
+  organizer-link spec): one renderer, `renderOpeningMessages`, behind both.
+  A trip with no dashboard card (AC-7) is unchanged: the one message it always
+  had.
+
+Known limit: the native names are made for the language the session starts in
+(Telegram's client locale). An interview that starts in English and switches to
+Hebrew when the organizer types Hebrew keeps the English place in the stops
+question, which is the fallback above, not an error.
+
+
+## Open questions
+
+None blocking approval.

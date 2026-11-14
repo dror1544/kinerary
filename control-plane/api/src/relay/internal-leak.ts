@@ -154,6 +154,39 @@ const GATEWAY_STATUS_PHRASES: readonly string[] = [
   // covers companions rendered before them.
   "context_file_max_chars",
   "context file soul.md",
+  // What Hermes 4097709b0c (the revision test/fixtures/hermes-mirror.json
+  // pins, and the one the VM runs once the patch set is applied) says in
+  // place of the wording above. The stems above are KEPT for one release:
+  // an older gateway may still be running during a rollback, and a stem is
+  // only ever removed after the fixture proves the old wording is gone.
+  // `test/hermes-mirror.test.ts` (AC-2) renders every approval and status
+  // string in the fixture and fails, by name, on one this list misses;
+  // recapture with scripts/capture-hermes-mirror.py after a Hermes bump.
+  //
+  // The approval prompt is now built from catalog keys, no longer the one
+  // sentence "Dangerous command requires approval":
+  //
+  //     ⚠️ **Hermes wants to run a command that needs your OK**
+  //     ```…```  Why it was flagged: …
+  //     Reply `/approve` to run it once, `/approve session` to allow this
+  //     pattern …, or `/deny` to cancel.
+  //     If you don't answer within 5 minutes it will NOT run.
+  //
+  // and a smart-deny prompt offers only once/deny, so "/approve session" is
+  // not guaranteed to appear — each part is a stem of its own.
+  "wants to run a command that needs your ok",
+  "reply `/approve`",
+  "`/deny` to cancel",
+  "if you don't answer within",
+  "smart deny",
+  "approval timed out after",
+  // The provider-failover notice is reworded too:
+  //     ⚠️ Model fallback: <model> via <provider> unavailable (<reason>);
+  //     using <model> via <provider>.
+  "model fallback:",
+  // The truncation warning names the file it cut; SOUL.md is the one that
+  // matters here, but the sentence is the same for any context file.
+  "chars exceeds limit of",
 ];
 
 /**

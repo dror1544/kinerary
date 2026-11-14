@@ -105,7 +105,25 @@ export function cleanDisplayName(value: unknown): string | null {
   return length >= 1 && length <= DISPLAY_NAME_MAX_LENGTH ? cleaned : null;
 }
 
-const EMAIL_LOCAL = /^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*$/;
+/**
+ * Stores the name an account holder gave the product, ONLY while the account has none (`users.given_name`, the
+ * name the interview greets by). Cleaned like every name here; a name that is unusable is dropped, never clipped.
+ * Returns whether a name was written. `given_name_asked_at` is stamped with it: someone who has told us their name
+ * is not asked again.
+ */
+export async function recordGivenName(client: pg.PoolClient | pg.Pool, userId: string, name: unknown): Promise<boolean> {
+  const cleaned = cleanDisplayName(name);
+  if (cleaned === null) return false;
+  const written = await client.query(
+    `UPDATE control_plane.users
+        SET given_name = $2, given_name_asked_at = COALESCE(given_name_asked_at, now())
+      WHERE id = $1 AND given_name IS NULL`,
+    [userId, cleaned],
+  );
+  return written.rowCount === 1;
+}
+
+const EMAIL_LOCAL =/^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*$/;
 const EMAIL_LABEL = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/;
 
 /**
@@ -378,6 +396,10 @@ export async function consumeSignUpToken(client: pg.PoolClient, token: unknown, 
   );
   // A concurrent invitation or Google sign-in won the address between the check and here: leave theirs alone.
   if (credential.rowCount !== 1) return { ok: false, error: "ACCOUNT_EXISTS" };
+  // The name the person typed on the verify page is THE name they gave the product (#438): the interview greets
+  // them with it. Written only now that this request owns the account (the credential insert above won), and only
+  // while the account has none -- never over a name already on it.
+  await recordGivenName(client, userId, displayName);
   return { ok: true, userId, returnTo: row.return_to ?? "/trips" };
 }
 

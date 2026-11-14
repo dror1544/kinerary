@@ -8,6 +8,11 @@ export type Me = {
    * account is linked to; the full dashboard needs a password or Google sign-in. Absent = full.
    */
   scope?: "telegram" | "full";
+  /**
+   * The dashboard should ask, once, what to call this person: the Telegram interview greets the organizer by it.
+   * False (or absent) once they answered or said "not now", and for a Telegram-minted session, which cannot answer.
+   */
+  needsName?: boolean;
 };
 
 export type InviteSummary = {
@@ -27,7 +32,8 @@ export type TripSummary = {
   tripType: string;
   lifecycleState: string;
   nextAction: string;
-  interview: { sessionId: string; state: string } | null;
+  /** `paused` (#513): the interview closed for idleness; a new link picks it up where it stopped. Absent from older servers. */
+  interview: { sessionId: string; state: string; paused?: boolean } | null;
   provisioning: { planId: string; planStatus: string; jobState: string | null; releaseId: string | null; digest: string; safeErrorCode: string | null } | null;
   runtimeReady: boolean;
   permissions: { role: string; dashboard: boolean; runtime: boolean; invite: boolean; requestProvisioning: boolean };
@@ -36,7 +42,12 @@ export type TripSummary = {
   members?: MemberSummary[];
   /** The Telegram accounts that can open THIS trip as the viewer: the card's icon and its Unlink entries. */
   telegram?: { links: TelegramLink[]; /** Unlinked accounts that can be restored without Telegram: absent for a Telegram-minted session. */ unlinked?: UnlinkedTelegramLink[] };
+  /** The trip's secondary organizers (#523). Present only for its main organizer on a password or Google session. */
+  secondaryOrganizers?: SecondaryOrganizer[];
 };
+
+/** A person the main organizer added with a trip link. Display data from Telegram (first name, @username); `id` is only the handle for Remove. */
+export type SecondaryOrganizer = { id: string; name: string | null; username: string | null; joinedAt: string };
 
 export type TelegramLinkVia = "interview_link" | "earlier_interview" | "dashboard_link" | "dashboard_restore" | "trip_password" | "invite";
 
@@ -125,13 +136,14 @@ const telegramSchema = z.object({ links: z.array(telegramLinkSchema), unlinked: 
 const tripSchema: z.ZodType<TripSummary> = z.object({
   id: z.string(), title: z.string(), destination: z.string().nullable(), startDate: z.string().nullable(), endDate: z.string().nullable(),
   tripType: z.string(), lifecycleState: z.string(), nextAction: z.string(),
-  interview: z.object({ sessionId: z.string(), state: z.string() }).nullable(),
+  interview: z.object({ sessionId: z.string(), state: z.string(), paused: z.boolean().optional() }).nullable(),
   provisioning: z.object({ planId: z.string(), planStatus: z.string(), jobState: z.string().nullable(), releaseId: z.string().nullable(), digest: z.string(), safeErrorCode: z.string().nullable() }).nullable(),
   runtimeReady: z.boolean(),
   permissions: z.object({ role: z.string(), dashboard: z.boolean(), runtime: z.boolean(), invite: z.boolean(), requestProvisioning: z.boolean() }),
   invites: z.array(inviteSchema).optional(),
   members: z.array(memberSchema).optional(),
   telegram: telegramSchema.optional(),
+  secondaryOrganizers: z.array(z.object({ id: z.string(), name: z.string().nullable(), username: z.string().nullable(), joinedAt: z.string() })).optional(),
 });
 // What a member WITHOUT dashboard access gets in their list: name, place, dates, their own
 // permissions and whether it opens. Filled out to a TripSummary with neutral defaults.
@@ -144,7 +156,11 @@ const memberTripSchema = z.object({
   ...trip, tripType: "other", lifecycleState: "ready_private", nextAction: trip.runtimeReady ? "open_trip" : "view_status",
   interview: null, provisioning: null,
 }));
-const meSchema: z.ZodType<Me> = z.object({ id: z.string(), displayName: z.string(), scope: z.enum(["telegram", "full"]).optional() });
+const meSchema: z.ZodType<Me> = z.object({ id: z.string(), displayName: z.string(), scope: z.enum(["telegram", "full"]).optional(), needsName: z.boolean().optional() });
+/** The name this person gives the product, stored on their own account. The server cleans it and refuses an unusable one (INVALID_NAME). */
+export const saveAccountName = (displayName: string) => api<{ ok: true }>("/v1/account/name", { method: "POST", body: JSON.stringify({ displayName }) });
+/** "Not now": the dashboard does not ask again, and no name is stored. */
+export const dismissAccountName = () => api<{ ok: true }>("/v1/account/name", { method: "POST", body: JSON.stringify({ dismiss: true }) });
 
 /**
  * Sign-up and sign-in with Google in one: posts the signed ID token Google Identity Services gave the page
@@ -217,6 +233,13 @@ const issuedLinkSchema = z.object({ deepLink: z.string().regex(/^https:\/\/t\.me
 /** A one-time, short-lived t.me link that links whichever Telegram account opens it to THIS trip. */
 export const issueTelegramLink = (tripId: string) =>
   api<unknown>(`/v1/trips/${encodeURIComponent(tripId)}/telegram-link`, { method: "POST" }).then((value) => issuedLinkSchema.parse(value));
+
+/** A one-time, short-lived t.me link that makes whoever opens it a SECONDARY organizer of this trip only (the trip's main organizer, password or Google session only). */
+export const issueSecondaryOrganizerLink = (tripId: string) =>
+  api<unknown>(`/v1/trips/${encodeURIComponent(tripId)}/secondary-organizer-link`, { method: "POST" }).then((value) => issuedLinkSchema.parse(value));
+/** Removes a secondary organizer; effective at once in Telegram and on the trip site. */
+export const removeSecondaryOrganizer = (tripId: string, secondaryId: string) =>
+  api<{ status: string }>(`/v1/trips/${encodeURIComponent(tripId)}/secondary-organizers/${encodeURIComponent(secondaryId)}`, { method: "DELETE" });
 
 export const getMe = () => api<unknown>("/v1/me").then((value) => meSchema.parse(value));
 export const getTrips = () => api<unknown>("/v1/trips").then((value) => z.object({ trips: z.array(z.union([tripSchema, memberTripSchema])) }).parse(value));

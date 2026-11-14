@@ -32,6 +32,14 @@ the one place the rules live, not two files kept in sync by hand.
    an SSH key, an `/opt` path, a chat id — and it belongs in `kinerary-deploy`,
    reached through an env var or a config file read at runtime. See
    "Two repositories" below for the shape and the escape hatch.
+7. **Never remove, stop or recreate a shared container without Dror's
+   specific approval** (Dror, 2026-11-09). That covers the test Postgres every
+   session shares (`kinerary-sprint5-testdb`), the staging stack's containers,
+   and anything else another session or a live trip may be using. A test
+   needs a clean database, not a clean container: create and drop your own
+   `cptest_<name>` database inside it. On 2026-11-09 a verifier ran
+   `docker rm -f` on the shared test Postgres to get a "fresh" one, and every
+   concurrent session's database tests lost their database.
 
 ## Notes, handovers and insights live outside the repo (owner's decision, 2026-09-28)
 
@@ -592,6 +600,31 @@ If unattended Mac companion testing is ever needed, move the bridges to a
 LaunchAgent (`launchctl bootstrap gui/$UID`) so they inherit the logged-in
 user's grant instead of the SSH session's.
 
+**Reminder for every staging test run (Dror, 2026-11-12): after a trip is
+built on the Mac, its companion is NOT wired until a person wires it from
+Terminal.** Until the LaunchAgent move above lands, a staging test that reaches
+"the companion uses its trip tools" stops there. On 2026-11-12 the test trip
+came out of provisioning with no `mcp_servers` in its profile's `config.yaml` at
+all (the health check refused the step, as designed), so the companion
+apologised that its tools were unavailable. `--restart-only` does not help in
+that state; the full wiring does, followed by a gateway restart:
+
+```bash
+cd ~/kinerary-deploy && REPO_ROOT=<staging checkout> ./setup-mcp.sh <profile> \
+  http://<trip LAN ip>:8080 https://<public host> --trip-dir ./trips/<slug> \
+  --vmid <vmid> --port <bridge port> \
+  && launchctl kickstart -k gui/$UID/ai.hermes.gateway-<profile>
+```
+
+The values are in `trips/<slug>/topology.yaml`; the profile is
+`trips.hermes_profile`. Two more things a Mac staging run needs that nothing
+starts for it: the companion-control MCP (`dist/companion-mcp.js` on `:4313`,
+the companion's `trip-control` connection — a container on the VM, absent from
+`bring-up.sh` on the Mac), and the relay and interview sidecar after the
+nightly redeploys staging. A lead session preparing a staging test checks all
+three and tells the tester before the run starts, not when the companion fails.
+The automatic fix is #541; when it lands, remove this paragraph.
+
 ### Restarting a live interview for a test run
 
 Testing the Trip Bot router end to end means starting the interview over
@@ -657,6 +690,8 @@ Every rule in "Hard Rules" above is now checked by
   and no script can check intent. Command classification lives in `scripts/claude-hooks/match-command.py`,
   which strips heredocs and quotes first — matching the bare words "git" and
   "commit" refuses any command that merely *writes documentation about* them.
+  Since 2026-11-09 it also covers `docker rm|stop|kill` and `docker compose
+  down|rm|stop|kill|restart` (rule 7); `docker exec … psql` stays silent.
   Since 2026-09-20 the same prompt covers the routes that create commits
   without the word: `git merge`, `cherry-pick`, `revert`, `rebase`, `am` and
   `gh pr merge` (all classified `none` until then — an integrator agent could
@@ -915,6 +950,28 @@ greps the **gateway's own** post-restart log line for each one, so "the agent
 can speak" is read off the gateway rather than inferred from an upstream
 process being alive. It refuses to restart the relay under a live conversation
 (`awaiting = 'machine'`, updated recently) unless told to anyway.
+
+## Merged work cleans up after itself (owner's decision, 2026-11-09)
+
+When a branch is merged — a PR, or a local `git merge` into another branch —
+its branch (local and remote) and its worktree are deleted then, not at a
+later sweep. On 2026-11-09 the repository held 39 worktrees and ~300 branches,
+nearly all for work merged weeks before; pr-steward's Sweep 4 was right but
+ran only when asked. Three mechanisms, so nobody has to remember:
+
+- **GitHub** deletes a merged PR's head branch (`delete_branch_on_merge`). The
+  ruleset "long-lived branches survive merges" protects `integration/**` and
+  `release/**` from deletion; `main` was already protected.
+- **`scripts/sweep-merged.py --execute`** removes the rest: merged worktrees
+  under `.claude/worktrees/`, local branches, and remote branches merged
+  locally. `scripts/claude-hooks/posttooluse-bash.sh` runs it after every
+  successful merge in the lead session; the session-start line counts what is
+  left over (a merge made on GitHub's page) and names the command.
+- **What it never touches** is in the script's docstring and its tests: an
+  open PR, a dirty worktree, one a running container mounts or a process works
+  in, a detached HEAD, `codex/*`, anything outside `.claude/worktrees/`, and a
+  branch whose tip sits on a mainline's first-parent line (just created, not
+  merged). Unmerged work is reported, never deleted.
 
 ## Working style
 

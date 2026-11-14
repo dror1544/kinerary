@@ -5,6 +5,8 @@ import { safeExternalUrl } from "./external-url";
 import { dashboardHref } from "./dashboard-link";
 export { safeExternalUrl } from "./external-url";
 import { MobileSelect } from "./MobileSelect";
+import { BOOKING_TYPES, bookingTypeLabel, ITEM_TYPES, itemTypeLabel } from "./item-types";
+import { collapseSameFlight, sameFlightGroups } from "./same-flight";
 import { rsvpForItem, venueForItem } from "./activity-rsvp";
 import { datesInPhase, phaseDates as mergePhaseDates } from "./phase-calendar";
 export { datesInPhase } from "./phase-calendar";
@@ -64,6 +66,9 @@ import {
   Booking,
   BudgetItem,
   CurrentUser,
+  answerBookingSeed,
+  answerItemSeed,
+  keepBothPlanItems,
   approveBookingDraft,
   createBooking,
   createBudgetItem,
@@ -542,7 +547,7 @@ function TimelineItem({
       <div className="item-body">
         <div className="item-kicker">
           <Icon size={16} />
-          <span>{item.item_type.replace("_", " ")}</span>
+          <span>{itemTypeLabel(item.item_type, lang)}</span>
           {item.provenance?.status === "updated_from_original" ? <b>{copy(lang, "Updated from original", "עודכן מהתוכנית המקורית")}</b> : null}
           {item.provenance?.status === "added" ? <b>{copy(lang, "Added", "נוסף")}</b> : null}
         </div>
@@ -801,7 +806,9 @@ export function JourneyView({
   }, [activePhase]);
   const [selected, setSelected] = useState(phaseDates[0] || "");
   const activeDate = phaseDates.includes(selected) ? selected : phaseDates[0] || "";
-  const dayItems = itinerary?.items.filter((item) => item.date === activeDate && (!activePhase?.id || item.phase_id === activePhase.id)) || [];
+  // One flight is one line on the plan, however many bookings are on it (#549);
+  // Reservations keeps a row per booking.
+  const dayItems = collapseSameFlight(itinerary?.items.filter((item) => item.date === activeDate && (!activePhase?.id || item.phase_id === activePhase.id)) || []);
   const activityLinks = useMemo(() => new globalThis.Map((itinerary?.items || []).map(item => [item.item_uid, {
     rsvpId: rsvpForItem(item, config, itinerary)?.id,
     venueId: venueForItem(item, config)?.id,
@@ -1077,7 +1084,7 @@ export function JourneyView({
               </label> : null}
               <label>{copy(lang, "Type", "סוג")}
                 <MobileSelect value={draft.item_type || "activity"} onChange={(event) => setDraft({ ...draft, item_type: event.target.value })}>
-                  {["activity", "travel", "meal", "lodging", "free_time", "booking", "task", "note"].map((type) => <option key={type} value={type}>{type.replace("_", " ")}</option>)}
+                  {ITEM_TYPES.map((type) => <option key={type} value={type}>{itemTypeLabel(type, lang)}</option>)}
                 </MobileSelect>
               </label>
               <label className="editor-field-wide">{copy(lang, "Activity name", "שם הפעילות")}<input value={draft.text_he} onChange={(event) => setDraft({ ...draft, text_he: event.target.value })} required /></label>
@@ -1097,6 +1104,8 @@ export function JourneyView({
           {dayItems.length ? dayItems.map((item) => (
             <div className="timeline-item-wrap" id={`itinerary-item-${encodeURIComponent(item.item_uid)}`} key={item.item_uid}>
               <TimelineItem item={item} {...activityLinks.get(item.item_uid)} username={username} lang={lang} botName={botName} telegramUsername={telegramUsername} />
+              {isOrganizer ? <SeedFlagNotice kind="item" id={item.item_uid} changed={item.seed_changed} removed={item.seed_removed} lang={lang} /> : null}
+              {isOrganizer ? <PlanConflictNotice itemUid={item.item_uid} conflicts={item.plan_conflicts} lang={lang} /> : null}
               {isOrganizer ? <div className="timeline-editor-actions">
                 <button type="button" onClick={() => beginEdit(item)}><Pencil size={15} /> {copy(lang, "Edit", "עריכה")}</button>
                 <button className="danger-text" type="button" disabled={removeMutation.isPending} onClick={() => { if (window.confirm(copy(lang, "Remove this itinerary item?", "להסיר את הפריט הזה מהמסלול?"))) removeMutation.mutate(item.item_uid); }}><Trash2 size={15} /> {copy(lang, "Remove", "הסרה")}</button>
@@ -1252,6 +1261,81 @@ function AuthenticatedDocumentAction({ url, filename, download, label }: { url: 
   return <span className="document-action"><button type="button" onClick={open}>{label}</button>{error ? <small className="form-error">{error}</small> : null}</span>;
 }
 
+const SEED_FIELD_LABELS: Record<string, [string, string]> = {
+  phase: ["Stop", "תחנה"], type: ["Type", "סוג"], name: ["Name", "שם"], date_from: ["Start date", "תאריך התחלה"], date_to: ["End date", "תאריך סיום"],
+  passengers: ["Passengers", "נוסעים"], confirmation: ["Confirmation", "אישור"], pin: ["PIN", "קוד"], notes: ["Notes", "הערות"], cost: ["Cost", "עלות"],
+  conf_file: ["Confirmation file", "קובץ אישור"], location_url: ["Map link", "קישור מפה"], date: ["Date", "תאריך"], time: ["Time", "שעה"],
+  text_he: ["Text (Hebrew)", "טקסט (עברית)"], text_en: ["Text (English)", "טקסט (אנגלית)"], waze_url: ["Waze link", "קישור Waze"],
+  ticket_url: ["Ticket link", "קישור כרטיסים"], extra_links: ["Links", "קישורים"],
+};
+
+/**
+ * "The trip file changed this — keep mine / use the new one" (#382). A re-provision rewrote the trip file under
+ * something an organizer had edited on the site: the edit stands, and this asks which one wins. Organizer-only by
+ * the caller and by the server (a member never receives the flag). Pin and notes are named, never shown.
+ */
+export function SeedFlagNotice({ kind, id, changed, removed, lang }: { kind: "booking" | "item"; id: number | string; changed?: Record<string, unknown>; removed?: boolean; lang: Lang }) {
+  const queryClient = useQueryClient();
+  const mutation = useMutation({
+    mutationFn: (answer: "accept" | "keep") => kind === "booking" ? answerBookingSeed(Number(id), answer) : answerItemSeed(String(id), answer),
+    onSuccess: () => Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["bookings"] }),
+      queryClient.invalidateQueries({ queryKey: ["itinerary"] }),
+      queryClient.invalidateQueries({ queryKey: ["today"] }),
+    ]),
+  });
+  const entries = Object.entries(changed || {});
+  if (!entries.length && !removed) return null;
+  const noun = kind === "booking" ? copy(lang, "booking", "ההזמנה") : copy(lang, "item", "הפריט");
+  const label = (field: string) => { const l = SEED_FIELD_LABELS[field]; return l ? copy(lang, l[0], l[1]) : field; };
+  return (
+    <div className="seed-flag" role="status">
+      <p>{removed
+        ? copy(lang, `The trip file no longer lists this ${noun}.`, `קובץ הטיול כבר לא כולל את ${noun}.`)
+        : copy(lang, `The trip file changed this ${noun}.`, `קובץ הטיול שינה את ${noun}.`)}</p>
+      {entries.length ? <ul>{entries.map(([field, value]) => <li key={field}>{label(field)}: {typeof value === "string" || typeof value === "number" ? String(value) : copy(lang, "(changed)", "(שונה)")}</li>)}</ul> : null}
+      <div className="seed-flag-actions">
+        <button type="button" className="secondary-action" disabled={mutation.isPending} onClick={() => mutation.mutate("keep")}>{copy(lang, "Keep mine", "להשאיר את שלי")}</button>
+        {kind === "item" && removed ? null : <button type="button" className="secondary-action" disabled={mutation.isPending} onClick={() => mutation.mutate("accept")}>{removed ? copy(lang, "Use the new one (remove it)", "להשתמש בחדש (להסיר)") : copy(lang, "Use the new one", "להשתמש בחדש")}</button>}
+      </div>
+      {mutation.isError ? <p className="form-error">{copy(lang, "Could not save your choice. Try again.", "לא ניתן לשמור את הבחירה. נסו שוב.")}</p> : null}
+    </div>
+  );
+}
+
+/**
+ * "Same time as another plan item — keep both" (#550). The server sends `plan_conflicts` to an organizer
+ * only; the caller renders this for an organizer only. Keep both records the acceptance on the server (the
+ * pair at these times), so it is not raised again; both items' notices go away on the refresh.
+ */
+export function PlanConflictNotice({ itemUid, conflicts, lang }: { itemUid: string; conflicts?: NonNullable<ItineraryItem["plan_conflicts"]>; lang: Lang }) {
+  const queryClient = useQueryClient();
+  const mutation = useMutation({
+    mutationFn: (withUid: string) => keepBothPlanItems(itemUid, withUid),
+    onSuccess: () => Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["itinerary"] }),
+      queryClient.invalidateQueries({ queryKey: ["today"] }),
+    ]),
+  });
+  if (!conflicts?.length) return null;
+  return (
+    <div className="seed-flag plan-conflict" role="status">
+      {conflicts.map((other) => {
+        const name = (lang === "he" ? other.text_he || other.text_en : other.text_en || other.text_he) || other.item_uid;
+        return (
+          <div key={other.item_uid}>
+            <p>{copy(lang, "Same time as", "באותה שעה כמו")} <bdi>{name}</bdi>{other.time ? <> (<bdi dir="ltr">{other.time}</bdi>)</> : null}</p>
+            <div className="seed-flag-actions">
+              <button type="button" className="secondary-action" disabled={mutation.isPending} onClick={() => mutation.mutate(other.item_uid)}>{copy(lang, "Keep both", "להשאיר את שניהם")}</button>
+            </div>
+          </div>
+        );
+      })}
+      {mutation.isError ? <p className="form-error">{copy(lang, "Could not save your choice. Try again.", "לא ניתן לשמור את הבחירה. נסו שוב.")}</p> : null}
+    </div>
+  );
+}
+
 function BookingActions({ booking, lang }: { booking: Booking; lang: Lang }) {
   const confirmationUrl = safeFileUrl("/api/bookings/confirmation", booking.conf_file);
   const appleWalletUrl = safeFileUrl("/api/bookings/wallet-apple", booking.pkpass_file);
@@ -1374,7 +1458,7 @@ export function BookingCreatePanel({ config, isOrganizer, lang }: { config?: Tri
       {extractMutation.isSuccess ? <p className="saved-note">{lang === "he" ? "הפרטים חולצו — כדאי לעבור עליהם לפני השמירה." : "Details extracted — please review them before saving."}</p> : null}
       <div className="booking-create-fields">
         <label>{lang === "he" ? "שלב" : "Phase"}<MobileSelect value={draft.phase || defaultPhase} onChange={(event) => setDraft({ ...draft, phase: event.target.value })} required><option value="" disabled>{lang === "he" ? "בחירת שלב" : "Choose a phase"}</option>{(config?.phases || []).map((phase) => <option key={phase.id} value={phase.id}>{text(phase.title, lang) || phase.id}</option>)}</MobileSelect></label>
-        <label>{lang === "he" ? "סוג" : "Type"}<MobileSelect value={draft.type} onChange={(event) => setDraft({ ...draft, type: event.target.value })}><option value="flight">{lang === "he" ? "טיסה" : "Flight"}</option><option value="hotel">{lang === "he" ? "לינה" : "Stay"}</option><option value="car">{lang === "he" ? "רכב" : "Car"}</option><option value="attraction">{lang === "he" ? "אטרקציה" : "Attraction"}</option><option value="other">{lang === "he" ? "אחר" : "Other"}</option></MobileSelect></label>
+        <label>{lang === "he" ? "סוג" : "Type"}<MobileSelect value={draft.type} onChange={(event) => setDraft({ ...draft, type: event.target.value })}>{BOOKING_TYPES.map((type) => <option key={type} value={type}>{bookingTypeLabel(type, lang)}</option>)}</MobileSelect></label>
         <label className="editor-field-wide">{lang === "he" ? "שם ההזמנה" : "Booking name"}<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} required placeholder={lang === "he" ? "לדוגמה: טיסת JL 12" : "For example: Flight JL 12"} /></label>
         <label>{lang === "he" ? "מתאריך" : "From"}<input type="date" value={draft.date_from} onChange={(event) => setDraft({ ...draft, date_from: event.target.value })} /></label>
         <label>{lang === "he" ? "עד תאריך" : "To"}<input type="date" value={draft.date_to} onChange={(event) => setDraft({ ...draft, date_to: event.target.value })} /></label>
@@ -1456,7 +1540,7 @@ export function BookingEditPanel({ booking, config, lang, onClose }: { booking: 
       </div>
       <div className="booking-create-fields">
         <label>{lang === "he" ? "שלב" : "Phase"}<MobileSelect value={draft.phase} onChange={(event) => setDraft({ ...draft, phase: event.target.value })} required><option value="" disabled>{lang === "he" ? "בחירת שלב" : "Choose a phase"}</option>{(config?.phases || []).map((phase) => <option key={phase.id} value={phase.id}>{text(phase.title, lang) || phase.id}</option>)}</MobileSelect></label>
-        <label>{lang === "he" ? "סוג" : "Type"}<MobileSelect value={draft.type} onChange={(event) => setDraft({ ...draft, type: event.target.value })}><option value="flight">{lang === "he" ? "טיסה" : "Flight"}</option><option value="hotel">{lang === "he" ? "לינה" : "Stay"}</option><option value="car">{lang === "he" ? "רכב" : "Car"}</option><option value="attraction">{lang === "he" ? "אטרקציה" : "Attraction"}</option><option value="other">{lang === "he" ? "אחר" : "Other"}</option></MobileSelect></label>
+        <label>{lang === "he" ? "סוג" : "Type"}<MobileSelect value={draft.type} onChange={(event) => setDraft({ ...draft, type: event.target.value })}>{BOOKING_TYPES.map((type) => <option key={type} value={type}>{bookingTypeLabel(type, lang)}</option>)}</MobileSelect></label>
         <label className="editor-field-wide">{lang === "he" ? "שם ההזמנה" : "Booking name"}<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} required /></label>
         <label>{lang === "he" ? "מתאריך" : "From"}<input type="date" value={draft.date_from} onChange={(event) => setDraft({ ...draft, date_from: event.target.value })} /></label>
         <label>{lang === "he" ? "עד תאריך" : "To"}<input type="date" value={draft.date_to} onChange={(event) => setDraft({ ...draft, date_to: event.target.value })} /></label>
@@ -1484,7 +1568,7 @@ export function BookingEditPanel({ booking, config, lang, onClose }: { booking: 
   );
 }
 
-function BookingsView({ config, isOrganizer, lang }: { config?: TripConfig; isOrganizer?: boolean; lang: Lang }) {
+export function BookingsView({ config, isOrganizer, lang }: { config?: TripConfig; isOrganizer?: boolean; lang: Lang }) {
   const queryClient = useQueryClient();
   const [filter, setFilter] = useState<BookingFilter>("phase");
   const [editingBookingId, setEditingBookingId] = useState<number | null>(null);
@@ -1510,6 +1594,8 @@ function BookingsView({ config, isOrganizer, lang }: { config?: TripConfig; isOr
     }, new globalThis.Map<string, Booking[]>()).entries()).sort(([a], [b]) => (order.get(a) ?? 999) - (order.get(b) ?? 999));
   }, [config?.phases, rows]);
   const needsReview = rows.filter((booking) => bookingState(booking) !== "verified").length;
+  // Two bookings on one flight stay two rows (#549); each says which it is.
+  const sameFlight = useMemo(() => sameFlightGroups(allRows), [allRows]);
   const approveMutation = useMutation({
     mutationFn: approveBookingDraft,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["bookings"] }),
@@ -1546,13 +1632,17 @@ function BookingsView({ config, isOrganizer, lang }: { config?: TripConfig; isOr
               {phaseBookings.map((booking) => (
                 <article className="booking-card" key={booking.id}>
                   <div className="booking-card-head">
-                    <span className="booking-type">{booking.type}</span>
+                    <span className="booking-type">{bookingTypeLabel(booking.type, lang)}</span>
                     <span className={`status-pill ${bookingState(booking)}`}>{bookingState(booking) === "verified" ? "Verified" : bookingState(booking) === "draft" ? "Draft" : "Needs review"}</span>
                   </div>
                   <h4>{booking.name}</h4>
                   <p>{bookingDateLine(booking, lang)}</p>
                   {booking.passengers ? <small>{booking.passengers}</small> : null}
+                  {sameFlight.get(booking.id) ? <small className="booking-same-flight">{copy(lang, `Same flight · booking ${sameFlight.get(booking.id)!.position} of ${sameFlight.get(booking.id)!.size}`, `אותה טיסה · הזמנה ${sameFlight.get(booking.id)!.position} מתוך ${sameFlight.get(booking.id)!.size}`)}</small> : null}
+                  {/* Every member sees the trip's data unless the organizer asks otherwise (Dror, 2026-11-13, #555). */}
+                  {booking.confirmation ? <small className="booking-reference">{copy(lang, "Reference", "מספר הזמנה")} {booking.confirmation}</small> : null}
                   <BookingActions booking={booking} lang={lang} />
+                  {isOrganizer ? <SeedFlagNotice kind="booking" id={booking.id} changed={booking.seed_changed} removed={booking.seed_removed} lang={lang} /> : null}
                   {isOrganizer && booking.review_status === "draft" ? <button className="secondary-action" type="button" disabled={approveMutation.isPending} onClick={() => approveMutation.mutate(booking.id)}>{approveMutation.isPending ? "Approving..." : "Approve for members"}</button> : null}
                   {isOrganizer ? <button className="secondary-action" type="button" onClick={() => setEditingBookingId((current) => current === booking.id ? null : booking.id)}><Pencil size={15} /> {lang === "he" ? "עריכה" : "Edit"}</button> : null}
                   {isOrganizer && editingBookingId === booking.id ? <BookingEditPanel booking={booking} config={config} lang={lang} onClose={() => setEditingBookingId(null)} /> : null}
@@ -1568,7 +1658,8 @@ function BookingsView({ config, isOrganizer, lang }: { config?: TripConfig; isOr
 }
 
 export function dailyMapStops(items: ItineraryItem[] | undefined) {
-  return [...(items || [])]
+  // The same flight on two bookings is one stop (#549).
+  return [...(collapseSameFlight(items) || [])]
     .filter((item) => Boolean(item.date && (item.location_url || item.waze_url)))
     .sort((a, b) => {
       const byDate = (a.date || "").localeCompare(b.date || "");
@@ -1963,7 +2054,7 @@ export function MapView({ config, itinerary, lang, onOpenItinerary }: { config?:
         <div className="module-grid">
           {dailyStops.map((item) => (
             <article className="map-anchor" key={item.item_uid}>
-              <span className="booking-type">{item.item_type}</span>
+              <span className="booking-type">{itemTypeLabel(item.item_type, lang)}</span>
               <h3>{itemTitle(item, lang)}</h3>
               <p>{dateLabel(item.date!, lang)}{item.time ? ` · ${itineraryTimeLabel(item.time, lang)}` : ""}</p>
               <div className="action-strip">
@@ -2565,6 +2656,10 @@ export function AppMenu({
           </button>
           {isOrganizer ? <a href={classicHref()}>{copy(lang,"Open Classic organizer fallback","פתיחת הגרסה הקלאסית למארגן")}</a> : null}
           {dashboardLink ?<a href={dashboardLink} data-testid="organizer-dashboard-link">{copy(lang,"Organizer dashboard","לוח המארגן")}</a> : null}
+          {/* Adding and removing organizers lives on the dashboard's trip page (the control plane owns who organizes a trip), so this
+              is a way THERE, offered to whoever the server gave a dashboard address: the trip's main organizer. A secondary
+              organizer is sent none (#523), so they are offered neither this nor the dashboard. */}
+          {dashboardLink ?<a href={`${dashboardLink}#other-organizers`} data-testid="organizer-people-link">{copy(lang,"Add or remove organizers","הוספה או הסרה של מארגנים")}</a> : null}
           <button
             type="button"
             className="danger-menu"

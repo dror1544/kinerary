@@ -86,14 +86,37 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
   if (identity && ![undefined, null, ''].includes(identity.portalOrigin) && !configuredDashboardUrl) {
     console.warn('control_plane.portal_origin_invalid: the identity sidecar\'s portalOrigin is not a plain https origin; organizers reaching this trip directly will see no dashboard link');
   }
+  // SECONDARY ORGANIZERS (#523): a person the trip's main organizer added with a trip link. They are an 'organizer' of THIS
+  // trip's site and nothing else: no participant row in the config, no password, no Telegram login here, no dashboard. The
+  // control plane vouches for them exactly as it does for a member (a launch grant, consumed by the gateway) and this table
+  // is what makes the vouching count on this site: a row exists only for a user the exchange-key holder named as an
+  // 'organizer' who is NOT one of the configured organizers, and it is tied to THIS trip's id. Removal is the control plane's
+  // (the membership ends, the gateway's liveness check fails); the row is only ever a binding, never a grant.
+  db.exec(`CREATE TABLE IF NOT EXISTS control_plane_secondary_organizers (
+    user_id TEXT PRIMARY KEY, trip_id TEXT NOT NULL, username TEXT NOT NULL UNIQUE REFERENCES users(username) ON DELETE CASCADE
+  )`);
+  const findSecondary = db.prepare('SELECT * FROM control_plane_secondary_organizers WHERE user_id = ? AND trip_id = ?');
+  const secondaryByName = db.prepare('SELECT user_id FROM control_plane_secondary_organizers WHERE username = ?');
+  const isSecondaryUsername = username => Boolean(secondaryByName.get(username));
   const find = db.prepare('SELECT * FROM control_plane_identities WHERE user_id = ? AND trip_id = ?');
   const localUser = db.prepare('SELECT username FROM users WHERE username = ?');
   const insert = db.prepare('INSERT INTO control_plane_identities(user_id, trip_id, username, role, invite_id) VALUES (?, ?, ?, ?, ?)');
   const organizers = () => normalizeOrganizers(config().agent);
-  const activeUser = username => localUser.get(username) && (config().participants || []).some(p => p.username === username);
-  const roleMatchesLocal = (role, username) => role === 'member'
-    ? !organizers().includes(username)
-    : ['owner', 'organizer'].includes(role) && organizers().includes(username);
+  const activeUser = username => localUser.get(username) &&
+    ((config().participants || []).some(p => p.username === username) || isSecondaryUsername(username));
+  // A secondary organizer is never a 'member' and never an 'owner': the role on its identity row is 'organizer' and the
+  // username must be one the secondary table holds. A configured organizer keeps the rules it always had.
+  const roleMatchesLocal = (role, username) => {
+    if (isSecondaryUsername(username)) return role === 'organizer';
+    return role === 'member'
+      ? !organizers().includes(username)
+      : ['owner', 'organizer'].includes(role) && organizers().includes(username);
+  };
+  // The local name a secondary organizer gets. Derived from the control-plane user id, so it is stable, unguessable enough to
+  // never be typed by hand, and can never be a configured participant's (the `org-` prefix + 12 hex is not a username the
+  // scaffolder or the participants route makes: `usernameValid` allows it, the participant routes' own pattern does not
+  // forbid it, so the collision check below is what keeps it honest).
+  const secondaryUsername = userId => `org-${crypto.createHash('sha256').update(userId).digest('hex').slice(0, 12)}`;
 
   async function internal(req, res, next) {
     res.set('Cache-Control', 'no-store');
@@ -139,7 +162,26 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
         (runtimeUsername !== null && !usernameValid(runtimeUsername))) {
       return res.status(400).json({ error: 'INVALID_REQUEST' });
     }
-    const row = find.get(userId, identity.tripId);
+    let row = find.get(userId, identity.tripId);
+    // A first launch of a SECONDARY organizer (#523): the control plane consumed a grant for a user holding an 'organizer'
+    // membership with no dashboard, and this site has never seen them. Bound once, here, to a local name of its own; never to a
+    // configured participant (runtimeUsername must be absent), never as the owner. The exchange key is what vouches, as for
+    // every other row this route reads.
+    if (!row && role === 'organizer' && (runtimeUsername === null || runtimeUsername === undefined)) {
+      const username = secondaryUsername(userId);
+      const taken = localUser.get(username);
+      if (!taken || isSecondaryUsername(username)) {
+        try {
+          db.transaction(() => {
+            // No password anyone knows: a random bcrypt-shaped value that no input matches (login compares with bcrypt).
+            if (!taken) db.prepare('INSERT INTO users (username, name, password) VALUES (?, ?, ?)').run(username, 'Organizer', `!${crypto.randomBytes(24).toString('hex')}`);
+            db.prepare('INSERT OR IGNORE INTO control_plane_secondary_organizers(user_id, trip_id, username) VALUES (?, ?, ?)').run(userId, identity.tripId, username);
+            insert.run(userId, identity.tripId, username, 'organizer', null);
+          })();
+        } catch { return res.status(409).json({ error: 'IDENTITY_CONFLICT' }); }
+        row = find.get(userId, identity.tripId);
+      }
+    }
     if (!row || row.role !== role || (runtimeUsername !== null && runtimeUsername !== row.username) ||
         !activeUser(row.username) || !roleMatchesLocal(role, row.username)) {
       return res.status(403).json({ error: 'IDENTITY_MISMATCH' });
@@ -173,6 +215,7 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
     // replace a Classic password, or grant organizer privileges.
     if (!activeUser(runtimeUsername)) return res.status(404).json({ error: 'NOT_FOUND' });
     if (!roleMatchesLocal('member', runtimeUsername)) return res.status(403).json({ error: 'ORGANIZER_BINDING_FORBIDDEN' });
+    if (isSecondaryUsername(runtimeUsername)) return res.status(403).json({ error: 'ORGANIZER_BINDING_FORBIDDEN' });
     const existing = find.get(userId, identity.tripId);
     if (existing) {
       if (existing.username === runtimeUsername && existing.role === 'member' && existing.invite_id === inviteId) return res.json({ ok: true });
@@ -189,6 +232,8 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
   // configured address for an organizer who has none.
   function dashboardUrlFor(claim, username) {
     if (!claim || typeof claim !== 'object' || !['owner', 'organizer'].includes(claim.role)) return null;
+    // A secondary organizer has no dashboard (#523): whatever a claim says, there is no way back to one for them.
+    if (isSecondaryUsername(username)) return null;
     if (!roleMatchesLocal(claim.role, username)) return null;
     return safeDashboardUrl(claim.dashboardUrl, identity?.tripId);
   }
@@ -205,6 +250,17 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
     if (!configuredDashboardUrl || !activeUser(username) || !organizers().includes(username)) return null;
     return configuredDashboardUrl;
   }
-  return { validManagedPayload, dashboardUrlFor, dashboardUrlForOrganizer };
+  // Is this verified payload a SECONDARY organizer of this trip? Only a managed claim counts - a plain password, Telegram or
+  // Google token for a secondary username is nothing (they have none of those) - and it is re-checked against the stored
+  // binding on every request, so a removed or never-bound identity is not one.
+  function isSecondaryOrganizerPayload(payload) {
+    if (!payload || typeof payload !== 'object' || !Object.prototype.hasOwnProperty.call(payload, 'controlPlane')) return false;
+    if (!validManagedPayload(payload)) return false;
+    const subject = payload.controlPlane;
+    if (subject.role !== 'organizer' || !identity) return false;
+    const row = findSecondary.get(subject.userId, identity.tripId);
+    return Boolean(row && row.username === payload.username);
+  }
+  return { validManagedPayload, dashboardUrlFor, dashboardUrlForOrganizer, isSecondaryOrganizerPayload, isSecondaryUsername };
 }
 module.exports = { createControlPlaneAuth, safeDashboardUrl, safePortalOrigin };

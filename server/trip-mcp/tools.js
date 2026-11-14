@@ -213,8 +213,9 @@ function registerTools(mcp, site, { write = true, origin } = {}) {
 
   tool('add_booking', 'Add a booking',
     'Record a reservation with its confirmation details. A booking does not put anything on the day-by-day schedule — use add_plan_item ' +
-    '(optionally with booking_id) for that. A hotel booking does not change a stop either (its dates, where the family sleeps); if the ' +
-    'organizer means this hotel to be that stop\'s, call set_stop_from_booking with the new booking\'s id afterwards.',
+    '(optionally with booking_id) for that. A hotel booking does not change a stop by itself (its dates, where the family sleeps), so ' +
+    'the Plan and the Map would not show it: for a hotel the organizer gives you, always call set_stop_from_booking with the new ' +
+    'booking\'s id afterwards. A hotel from anyone else stays a booking; the organizer can link it on the site.',
     WRITE, {
       phase: z.string().describe('Phase id from get_config, or "intl_flights"'),
       type: bookingType,
@@ -327,7 +328,8 @@ function registerTools(mcp, site, { write = true, origin } = {}) {
     'The trip\'s STOPS as the site shows them now — each with its dates (nights), accommodation and title — plus the trip\'s own dates. ' +
     'Read this before changing a stop, and to find stop ids. kind "computed" is the "days not planned yet" block: not a stop, not editable. ' +
     '"conflict" means a rebuild changed a field the organizer had already changed (theirs is kept); "booking_out_of_sync" means the hotel ' +
-    'booking a stop was set from now has other dates. Who changed what is organizer information — never write it onto the site.',
+    'booking a stop was set from now has other dates; "unlinked_hotel_bookings" lists approved hotel bookings filed under the stop that no stop is set from yet ' +
+    '(on Reservations only, not on the Plan or the Map). Who changed what is organizer information — never write it onto the site.',
     READ, {}, () => stopCall(() => site.get('/api/stops')));
 
   tool('update_stop', 'Change a stop',

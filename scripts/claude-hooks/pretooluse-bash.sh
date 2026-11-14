@@ -15,6 +15,28 @@
 # written BY a command, and matching those refuses real work.
 set -uo pipefail
 
+# One time budget for the whole hook (owner decision 2026-11-11). codex-adapter.py runs
+# this script under a 20s POLICY_TIMEOUT, and past it an `ask` becomes `deny ...
+# TimeoutExpired`. Everything this script does shares that 20s, so it allows itself 15:
+# the headroom covers what runs after the vault wait (the repo grep, git, jq, the emit)
+# and the clock below being whole seconds. The vault wait is the one step that can
+# stall, so it is the one that is capped to what remains (see notes_wait_seconds).
+HOOK_BUDGET_SECONDS=15
+now_s() {  # whole seconds since the epoch, or fail if the clock cannot be read
+  local n
+  n="$(date +%s 2>/dev/null)"
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$n"
+}
+HOOK_START="$(now_s)" || HOOK_START=""
+# Test seam, never set in production: act as if this many whole seconds of the budget were
+# already spent, so a test can exercise "the budget is nearly gone" without a slow hook.
+# Only digits are read, so it can shorten the budget and never lengthen it.
+case "${KINERARY_HOOK_TEST_ELAPSED_SECONDS:-}" in
+  ''|*[!0-9]*) ;;
+  *) [ -n "$HOOK_START" ] && HOOK_START=$((HOOK_START - 10#$KINERARY_HOOK_TEST_ELAPSED_SECONDS)) ;;
+esac
+
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 CHECKS="$REPO_ROOT/scripts/preflight-checks.sh"
 MATCH="$REPO_ROOT/scripts/claude-hooks/match-command.py"
@@ -135,16 +157,30 @@ plan_note_with_notes() {
     "$short" "$branch" "$searched"
 }
 
-# The vault read is bounded (owner decision 2026-10-21). On a machine where the
-# notes folder is a synced, network-backed share a read has taken >20s (measured
-# 2026-10-20), which stalls this prompt and, under codex-adapter.py's 20s
-# POLICY_TIMEOUT, turned an `ask` into `deny ... TimeoutExpired`. So the notes search
-# runs in a background process group with a short limit; past it the hook still ASKS,
-# searches the repo only, and says plainly that the vault was not checked.
-# Limit: KINERARY_NOTES_READ_TIMEOUT_SECONDS, whole seconds, default 3, clamped 1..10.
-# Portable on purpose: macOS has no `timeout` and its /bin/bash is 3.2, so this is
-# `set -m` + a done-marker file + a polling loop, no GNU-only tools and no `wait`
-# (a process stuck in uninterruptible network I/O must never be waited for).
+# The vault read is bounded twice (owner decisions 2026-10-21 and 2026-11-11).
+#
+# Why: on a machine where the notes folder is a synced, network-backed share a read has
+# taken >20s (measured 2026-10-20), which stalls this prompt and, under
+# codex-adapter.py's 20s POLICY_TIMEOUT, turned an `ask` into `deny ... TimeoutExpired`.
+# So the notes search runs in a background process group with a short limit; past it the
+# hook still ASKS, searches the repo only, and says plainly that the vault was not checked.
+#
+# 1. Per wait, by the CLOCK. Limit: KINERARY_NOTES_READ_TIMEOUT_SECONDS, whole seconds,
+#    default 3, clamped 1..10. The first version counted `sleep 0.1` ticks, and under
+#    load each tick stretches (the 2026-11-10 nightly: a 10s limit ran 24.25s, a 3s limit
+#    7.57s). The wait now ends when `date +%s` reaches its deadline, however slow the
+#    ticks are. `date +%s` because it is all macOS has: /bin/bash is 3.2 (no EPOCHREALTIME,
+#    no printf %T, no fractional `read -t`) and BSD date has no %N. Whole seconds mean the
+#    deadline (the second the clock read at the start, plus the limit) falls between
+#    limit-1 and limit seconds after the wait began: never more than the limit, at most
+#    one second less. An unreadable clock falls back to counting ticks.
+# 2. Per hook. The rest of the hook (the repo grep, match-command.py, git, the best-effort
+#    `gh pr view` on a merge) shares the same 20s with that wait. HOOK_BUDGET_SECONDS,
+#    set at the top of this file, is the total the hook allows itself; the vault wait gets
+#    min(its limit, what remains of it). With nothing remaining the vault read is skipped
+#    and the same "could not be checked in time" note is printed, still as an ASK.
+# Portable on purpose: `set -m` + a done-marker file + a polling loop, no GNU-only tools
+# and no `wait` (a process stuck in uninterruptible network I/O must never be waited for).
 notes_read_limit() {
   local v="${KINERARY_NOTES_READ_TIMEOUT_SECONDS:-}"
   if [[ "$v" =~ ^-[0-9]+$ ]]; then
@@ -159,15 +195,31 @@ notes_read_limit() {
   fi
 }
 
+# Whole seconds the vault wait may take: its limit, or what is left of the hook's budget
+# if that is less. With no readable clock there is nothing to subtract, so the limit stands.
+notes_wait_seconds() {
+  local limit="$1" now left
+  if [ -n "$HOOK_START" ] && now="$(now_s)"; then
+    left=$((HOOK_BUDGET_SECONDS - (now - HOOK_START)))
+    [ "$left" -lt 0 ] && left=0
+    [ "$left" -lt "$limit" ] && limit="$left"
+  fi
+  printf '%s' "$limit"
+}
+
 plan_note() {
   if [ -z "${KINERARY_NOTES_DIR:-}" ]; then
     plan_note_repo
     return
   fi
-  local limit work pid ticks=0 max
+  local limit wait_s work="" pid ticks=0 max deadline="" now why=""
   limit="$(notes_read_limit)"
-  max=$((limit * 10))
-  work="$(mktemp -d 2>/dev/null)" || work=""
+  wait_s="$(notes_wait_seconds "$limit")"
+  max=$((wait_s * 10))
+  if [ "$wait_s" -lt "$limit" ]; then
+    why=" — shortened to ${wait_s}s: the hook's ${HOOK_BUDGET_SECONDS}s time budget was nearly spent"
+  fi
+  [ "$wait_s" -gt 0 ] && { work="$(mktemp -d 2>/dev/null)" || work=""; }
   if [ -n "$work" ]; then
     # Its own process group (set -m), so one kill reaches the grep under it too. Its
     # stdout/stderr never touch our pipe: a straggler stuck in the kernel must not be
@@ -178,9 +230,15 @@ plan_note() {
     pid=$!
     disown "$pid" 2>/dev/null
     set +m 2>/dev/null
-    while [ ! -e "$work/done" ] && [ "$ticks" -lt "$max" ]; do
+    now="$(now_s)" && deadline=$((now + wait_s))
+    while [ ! -e "$work/done" ]; do
       sleep 0.1
       ticks=$((ticks + 1))
+      if [ -n "$deadline" ] && now="$(now_s)"; then
+        [ "$now" -ge "$deadline" ] && break
+      else
+        [ "$ticks" -ge "$max" ] && break  # no readable clock: count ticks, the old load-stretched bound
+      fi
     done
     if [ -e "$work/done" ]; then
       cat "$work/out" 2>/dev/null
@@ -190,7 +248,7 @@ plan_note() {
     kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
     rm -rf "$work"
   fi
-  printf 'The notes folder ($KINERARY_NOTES_DIR/regression-plans) could not be checked for a regression plan in time (limit %ss) — this is not the same as nothing having been assessed. To wait longer, set KINERARY_NOTES_READ_TIMEOUT_SECONDS (up to 10). Only docs/test-reports could be searched:\n' "$limit"
+  printf 'The notes folder ($KINERARY_NOTES_DIR/regression-plans) could not be checked for a regression plan in time (limit %ss%s) — this is not the same as nothing having been assessed. To wait longer, set KINERARY_NOTES_READ_TIMEOUT_SECONDS (up to 10). Only docs/test-reports could be searched:\n' "$limit" "$why"
   plan_note_repo
 }
 

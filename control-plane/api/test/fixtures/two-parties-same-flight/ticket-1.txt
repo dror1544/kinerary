@@ -1,0 +1,7 @@
+SKYLINE AIR - E-TICKET RECEIPT
+Flight SL 482   Harbortown (HBT) to Gatecity (GCY)
+Date: 14 NOV 2026   Departs 09:40   Arrives 12:05
+Booking reference: QX7P2M
+Passenger 1: ARLO VESPER
+Passenger 2: LENA VESPER
+Fare: 2 adults, economy

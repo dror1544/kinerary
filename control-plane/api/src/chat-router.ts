@@ -32,26 +32,33 @@ import type pg from "pg";
 export type Queryable = Pick<pg.Pool, "query">;
 import {
   askText,
+  askTextAfterKnownDeclined,
+  knownStopConfirmText,
   coerceLanguage,
   DEFAULT_LANGUAGE,
   lifecycleLabel,
   optionLabel,
+  seededOpening,
   uiString,
   type Language,
   unsettledText,
 } from "./intake-copy.js";
-import { hasEarlierBuiltTrip, LIVE_INTAKE_SESSION_PREDICATE, type OrganizerTrip } from "./organizer-trips.js";
+import { SECONDARY_ORGANIZER_ROLE, hasEarlierBuiltTrip, isSecondaryOrganizer, LIVE_INTAKE_SESSION_PREDICATE, secondaryOrganizerName, type OrganizerTrip } from "./organizer-trips.js";
 import type { RosterChoice } from "./organizer-identity.js";
 import {
   closeStaleSessionForChat,
   INTAKE_QUESTIONS,
   startSession,
   type IntakeQuestion,
+  type SeededOpening,
   type SessionView,
 } from "./interview.js";
 import { peekEnrollmentTripId } from "./enrollment.js";
+import { recordForeignLinkOpen, type ApproverNotice, type ForeignLinkResult } from "./organizer-link-approval.js";
 import { digestTelegramId, isPrivateChatId, type TelegramName } from "./identity.js";
 import { structuredLog } from "./redaction.js";
+import { nativeSeededOpening } from "./native-names.js";
+import type { StructuredModelRunner } from "./model-runner.js";
 
 // ── Inbound text ─────────────────────────────────────────────────────────────
 
@@ -288,6 +295,24 @@ export async function resolveTripPerson(
     [tripId, telegramUserId, digest],
   );
   const row = rows[0];
+  // A SECONDARY ORGANIZER (#523) organizes this trip by the main organizer's own act, recorded in its own table
+  // (organizer-trips.ts). It has its OWN role value, `secondary_organizer`, NOT 'organizer': every reader that decides
+  // something about people, groups or links asks for the main organizer by name (`isMainTripOrganizer`), and a role that read
+  // 'organizer' for both would let the companion (which calls the people routes with the agent key) do for a secondary
+  // organizer what only the main organizer may. It outranks a 'participant' row for the same Telegram account (a family member
+  // who is then made an organizer) and never a person link that says 'organizer'. It is the only fact there is for one who is
+  // on no participant row at all (empty username: the site's participant name is not theirs to claim, and no caller uses it as
+  // a key). Never reads a message.
+  if (row?.role !== "organizer") {
+    const secondary = await secondaryOrganizerName(db, tripId, telegramUserId);
+    if (secondary) {
+      return {
+        username: row?.participant_username ?? "",
+        displayName: row?.display_name ?? secondary.displayName,
+        role: SECONDARY_ORGANIZER_ROLE,
+      };
+    }
+  }
   return row
     ? { username: row.participant_username, displayName: row.display_name, role: row.role }
     : null;
@@ -685,7 +710,7 @@ export async function setGroupProactiveLevel(
 }
 
 /**
- * Is this Telegram sender an organizer of this trip?
+ * Is this Telegram sender the MAIN organizer of this trip?
  *
  * Two proofs, either enough, both server-side facts and neither read from the
  * message: the trip's own person link says so (0051, written at provisioning),
@@ -699,7 +724,7 @@ export async function setGroupProactiveLevel(
  * (an 'organizer'-role membership, a revoked or invited owner, a plain member are
  * all "no"), and a person link must say 'organizer'. A failed lookup is "no".
  */
-export async function isTripOrganizer(db: Queryable, tripId: string, telegramUserId: string): Promise<boolean> {
+export async function isMainTripOrganizer(db: Queryable, tripId: string, telegramUserId: string): Promise<boolean> {
   if (!tripId || !telegramUserId) return false;
   if ((await resolveTripPerson(db, tripId, telegramUserId))?.role === "organizer") return true;
   if (!isPrivateChatId(telegramUserId)) return false;
@@ -713,6 +738,26 @@ export async function isTripOrganizer(db: Queryable, tripId: string, telegramUse
     [tripId, digestTelegramId(telegramUserId)],
   );
   return (result.rowCount ?? 0) > 0;
+}
+
+/**
+ * Is this sender an organizer of the trip at ANY level: the main organizer (`isMainTripOrganizer`) or a secondary organizer
+ * (#523), added by the main organizer to organize THIS trip only?
+ *
+ * WHICH ONE EACH CALLER ASKS (decided in #523 after the boundary review; every caller of either function, by file):
+ *   any organizer   `/proactive` (relay/dispatch.ts) - how talkative the assistant is in the family group. It changes no person,
+ *                   group or link, which is what a secondary organizer is there to do.
+ *   main only       `/group` (relay/dispatch.ts) - hands out a link that BINDS a group to the trip;
+ *                   `senderMayMoveGroup` (group-binding.ts) - both the trip a group leaves and the one it goes to. A secondary
+ *                   organizer of A who runs their own trip B could otherwise carry A's family group to B.
+ * The trip site draws the same line: `/api/agent/telegram-group` and the participants routes are main-organizer-only.
+ */
+export async function isTripOrganizer(db: Queryable, tripId: string, telegramUserId: string): Promise<boolean> {
+  if (!tripId || !telegramUserId) return false;
+  if (await isMainTripOrganizer(db, tripId, telegramUserId)) return true;
+  // `resolveTripPerson` counts a secondary organizer under its own role, and a person-link row that says 'participant' does
+  // not hide one. Asked by name so the rule survives a change to that function.
+  return isSecondaryOrganizer(db, tripId, telegramUserId);
 }
 
 /**
@@ -738,8 +783,21 @@ export type StartLinkOutcome =
       view: SessionView;
       /** They have had a trip built before, so the opening greets them as such. */
       returning: boolean;
+      /** The trip was created on the dashboard and its card seeded the session: what the opening should say (#438). */
+      seeded?: SeededOpening;
+      /**
+       * The link picked up a PAUSED interview (#513): the session holds the closed one's answers, and the opening is
+       * `renderResumedOpening`, not the introduction. `returning` and `seeded` are never set alongside it.
+       */
+      resumed?: boolean;
     }
   | { kind: "already_in_interview"; sessionId: string; tripId: string }
+  /**
+   * The link is valid but this Telegram account is not the one the organizer is bound to (#519). Nothing was started,
+   * consumed or linked. `toRequester` is what the stranger is told (never anything about the trip); `toApprover` is the
+   * one message the bound organizer is owed, present only the first time (organizer-link-approval.ts).
+   */
+  | { kind: "other_organizer"; toRequester: ForeignLinkResult["toRequester"]; toApprover?: ApproverNotice }
   | {
       kind: "rejected";
       reason:
@@ -798,6 +856,8 @@ export async function startFromDeepLink(
   languageHint?: string,
   /** The Telegram account's first name and @username, from the update's verified `from` (display data only). */
   telegramName?: TelegramName | null,
+  /** The relay's model runner, for the opening's native-language name and destination (#438, AC-14). Absent = English. */
+  modelRunner?: StructuredModelRunner,
 ): Promise<StartLinkOutcome> {
   // A chat already conducting an interview must not consume a second
   // enrollment. The partial unique index on (telegram_chat_id) would reject
@@ -869,9 +929,33 @@ export async function startFromDeepLink(
   }
 
   const result = await startSession(db, payload, log, undefined, chatId, languageHint, telegramName);
+  if (!result.ok && result.reason === "OTHER_TELEGRAM_ACCOUNT") {
+    // A valid link opened by someone other than the Telegram account the organizer is bound to (#519). `startSession`
+    // rolled back, so the link is still unspent; what is left is to say so, and to ask or tell the organizer.
+    const foreign = await recordForeignLinkOpen(db, {
+      enrollmentId: result.enrollmentId, tripId: result.tripId, userId: result.userId, started: result.started,
+      requesterChatId: chatId, requesterName: telegramName ?? null, requesterLanguage: languageHint,
+    }, log);
+    if (!foreign) {
+      log(structuredLog("info", "chat_router.start_link_rejected", { safe_error_code: "INVALID_TOKEN" }));
+      return { kind: "rejected", reason: "INVALID_TOKEN" };
+    }
+    return { kind: "other_organizer", toRequester: foreign.toRequester, ...(foreign.toApprover ? { toApprover: foreign.toApprover } : {}) };
+  }
   if (!result.ok) {
-    log(structuredLog("info", "chat_router.start_link_rejected", { safe_error_code: result.reason }));
-    return { kind: "rejected", reason: result.reason };
+    const reason = result.reason === "REPLACEMENT_NOT_APPLICABLE" ? "INVALID_TOKEN" : result.reason;
+    log(structuredLog("info", "chat_router.start_link_rejected", { safe_error_code: reason }));
+    return { kind: "rejected", reason };
+  }
+
+  // A paused interview picked up again: nothing to introduce, and no "have they had a trip before" to ask.
+  if (result.resumed) {
+    log(structuredLog("info", "chat_router.interview_resumed", {
+      session_id: result.sessionId,
+      trip_id: result.view.tripId,
+      from_session_id: result.resumed.fromSessionId,
+    }));
+    return { kind: "started", sessionId: result.sessionId, tripId: result.view.tripId, view: result.view, returning: false, resumed: true };
   }
 
   // Which opening they meet. A failure here must not cost anyone their
@@ -879,7 +963,7 @@ export async function startFromDeepLink(
   // back to the opening every first-time organizer gets.
   let returning = false;
   try {
-    returning = await hasEarlierBuiltTrip(db, result.view.tripId, chatId);
+    returning = await hasEarlierBuiltTrip(db, result.view.tripId);
   } catch {
     returning = false;
   }
@@ -891,7 +975,20 @@ export async function startFromDeepLink(
       returning,
     }),
   );
-  return { kind: "started", sessionId: result.sessionId, tripId: result.view.tripId, view: result.view, returning };
+  // The greeting in the interview's own language (#438, AC-14): made here, after the session's transaction has
+  // committed (a model call never sits inside it), once, and stored with the session. Never throws, never waits
+  // longer than its own ceiling, and on any failure the opening carries the English as entered.
+  const seeded = result.seeded
+    ? await nativeSeededOpening(db, modelRunner, result.sessionId, result.view.language, result.seeded, log)
+    : undefined;
+  return {
+    kind: "started",
+    sessionId: result.sessionId,
+    tripId: result.view.tripId,
+    view: result.view,
+    returning,
+    ...(seeded ? { seeded } : {}),
+  };
 }
 
 // ── Inline keyboards ─────────────────────────────────────────────────────────
@@ -1004,6 +1101,7 @@ export type ParsedCallback =
   | { kind: "switch"; tripId: string }
   | { kind: "conflict"; conflictId: string; choice: "keep" | "replace" }
   | { kind: "correction"; proposalId: string; choice: "approve" | "reject" }
+  | { kind: "organizer_link"; requestId: string; choice: "approve" | "decline" }
   | { kind: "change"; draftId: string; digest: string | null; choice: "apply" | "cancel" | "pick"; index?: number }
   | { kind: "unknown" };
 
@@ -1023,6 +1121,17 @@ export function conflictCallbackData(conflictId: string, choice: "keep" | "repla
  */
 export function correctionCallbackData(proposalId: string, choice: "approve" | "reject"): string {
   return `dc:${proposalId}:${choice === "approve" ? "a" : "r"}`;
+}
+
+/**
+ * `oa:<requestId>:<a|d>` -- the organizer's Approve or Decline of a different Telegram account that opened their interview
+ * link (#519). Carries only which question and which choice: whose question it is, and whether the sender is that person,
+ * are read from the stored request and the update's own sender, never from this.
+ *
+ * Length: `oa:` + `olr_`+32 hex (36) + `:a` = 41 bytes, under Telegram's 64.
+ */
+export function organizerLinkCallbackData(requestId: string, choice: "approve" | "decline"): string {
+  return `oa:${requestId}:${choice === "approve" ? "a" : "d"}`;
 }
 
 /**
@@ -1062,6 +1171,11 @@ export function parseCallbackData(data: string): ParsedCallback {
   const conflict = /^x:([a-z]{2,12}_[A-Za-z0-9]{8,64}):([kr])$/.exec(data);
   if (conflict?.[1] && conflict[2]) {
     return { kind: "conflict", conflictId: conflict[1], choice: conflict[2] === "k" ? "keep" : "replace" };
+  }
+
+  const organizerLink = /^oa:([a-z]{2,12}_[A-Za-z0-9]{8,64}):([ad])$/.exec(data);
+  if (organizerLink?.[1] && organizerLink[2]) {
+    return { kind: "organizer_link", requestId: organizerLink[1], choice: organizerLink[2] === "a" ? "approve" : "decline" };
   }
 
   const correction = /^dc:([a-z]{2,12}_[A-Za-z0-9]{8,64}):([ar])$/.exec(data);
@@ -1133,7 +1247,7 @@ export function renderQuestion(
    * is `IntakeQuestion.unsettledMatchKind`'s reading of WHY, when a question
    * has more than one way to be unsettled — see `unsettledText`.
    */
-  fromRecord: { choices?: readonly RosterChoice[]; unsettled?: string; unsettledKind?: string; subject?: string } = {},
+  fromRecord: { choices?: readonly RosterChoice[]; unsettled?: string; unsettledKind?: string; subject?: string; afterKnownDeclined?: boolean } = {},
 ): RenderedQuestion {
   const rows: InlineButton[][] = [];
 
@@ -1209,7 +1323,7 @@ export function renderQuestion(
   // cannot know it.
   const body = fromRecord.unsettled
     ? unsettledText(question, fromRecord.unsettled, language, fromRecord.unsettledKind)
-    : agentText?.trim() || askText(question, language);
+    : agentText?.trim() || (fromRecord.afterKnownDeclined ? askTextAfterKnownDeclined(question, language) : askText(question, language));
   // One question put once per thing it is about: "gluten-free — who is that for?"
   const text = fromRecord.subject ? `${fromRecord.subject} — ${body}` : body;
   return { text, replyMarkup: rows.length > 0 ? { inline_keyboard: rows } : null };
@@ -1248,6 +1362,10 @@ export function renderSuggestion(
   label: string,
   language: Language = DEFAULT_LANGUAGE,
   agentText?: string | null,
+  /** `account_name`: the organizer's own name matched the roster (#438), asked as "you're Dana, right?" rather than read from a document. */
+  source?: "account_name" | "known_place",
+  /** `known_place`: the stop the confirm is about (#438, AC-12), so the place and the dates can be said in words. */
+  structuredData?: unknown,
 ): RenderedQuestion {
   const shown = label.length > SUGGESTION_LABEL_MAX ? `${cutWhole(label, SUGGESTION_LABEL_MAX)}…` : label;
   const rows: InlineButton[][] = [[
@@ -1259,6 +1377,15 @@ export function renderSuggestion(
       { text: uiString("skip", language), callback_data: skipCallbackData(question.id) },
       { text: uiString("finish", language), callback_data: FINISH_CALLBACK_DATA },
     ]);
+  }
+  if (source === "account_name") {
+    return { text: uiString("organizerNameConfirm", language).replace("{name}", () => shown), replyMarkup: { inline_keyboard: rows } };
+  }
+  if (source === "known_place") {
+    const stop = Array.isArray(structuredData) ? (structuredData[0] as Record<string, unknown> | undefined) : undefined;
+    const confirm = stop && typeof stop.name === "string" && typeof stop.start === "string" && typeof stop.end === "string"
+      ? knownStopConfirmText(stop.name, stop.start, stop.end, language) : null;
+    if (confirm) return { text: confirm, replyMarkup: { inline_keyboard: rows } };
   }
   const ask = agentText?.trim() || askText(question, language);
   return { text: `${ask}\n\n${uiString("suggestionIntro", language)}\n${shown}`, replyMarkup: { inline_keyboard: rows } };
@@ -1330,6 +1457,40 @@ export function renderDocumentOffer(
       ]],
     },
   };
+}
+
+/**
+ * An unseeded trip opens with the one message it always has (`renderDocumentOffer`). A trip created on the dashboard
+ * (#438) has told the product its destination and dates already, so the older introduction -- nine paragraphs about
+ * what Kinerary is -- does not belong after "Hi Dana": its opening is one message in Dror's wording (#548,
+ * 2026-11-13), the greeting, who is writing and the trip, then that a few short questions follow and that documents
+ * can be sent instead, with a "Let's start" button under it (the "I don't have one" callback). For an account that already has a built trip, the
+ * note that the earlier trip is untouched sits between the two. The first question follows when it is answered, as
+ * for any other opening.
+ */
+export function renderOpeningMessages(
+  language: Language = DEFAULT_LANGUAGE,
+  returning = false,
+  /** Set when the trip was created on the dashboard (#438): who the organizer is to it, and the destination and dates already chosen. */
+  seeded?: SeededOpening,
+): RenderedQuestion[] {
+  if (!seeded) return [renderDocumentOffer(language, returning)];
+  return [{
+    text: seededOpening(seeded, language, returning ? uiString("seedReturningNote", language) : undefined),
+    replyMarkup: { inline_keyboard: [[{ text: uiString("seedStart", language), callback_data: NO_DOCUMENT_CALLBACK_DATA }]] },
+  }];
+}
+
+/**
+ * The opening of a resumed interview (#513): one line, in the closed session's language, and nothing to tap.
+ *
+ * Not the introduction -- they have met it -- and not the document offer, because the documents they sent are already
+ * read and their answers are on record. The next question is not in this message: the new session is created owing
+ * it (`awaiting = 'machine'`, router prompt due), so the router sends it on its own turn, with whatever the interview
+ * needs on it (the buttons, a suggestion to confirm, the summary). One writer for questions, here as everywhere.
+ */
+export function renderResumedOpening(language: Language = DEFAULT_LANGUAGE): RenderedQuestion {
+  return { text: uiString("resumedOpening", language), replyMarkup: null };
 }
 
 /**

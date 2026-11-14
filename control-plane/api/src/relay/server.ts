@@ -44,6 +44,7 @@ import { createTripAppReadiness, type TripAppReadiness } from "./trip-app-readin
 import { checkBotIdentity } from "../telegram-mini-app.js";
 import { startTripBotPoller } from "./poller.js";
 import { checkDocumentStore, documentStoreFromEnv } from "../document-store.js";
+import { documentStoreNotice } from "./document-store-notice.js";
 import { startDocumentSweeper } from "../document-sweeper.js";
 import { codexIsolationProblem, runnerForBinding, taskTimeoutMs } from "../model-runner.js";
 import { startTaskOverrideRefresh, switchableRunner } from "../model-task-settings.js";
@@ -297,19 +298,15 @@ async function main(): Promise<void> {
   // mounted volume is refused. DOCUMENT_STORE_REQUIRED=1 (compose.vm.yml) makes
   // that fatal at startup; elsewhere the relay runs without keeping originals
   // rather than keeping them somewhere they will be lost.
-  const storeReadiness = process.env.DOCUMENT_STORE_DIR || process.env.DOCUMENT_STORE_REQUIRED === "1"
-    ? await checkDocumentStore(process.env)
-    : null;
-  if (storeReadiness && !storeReadiness.ok) {
-    const fatal = process.env.DOCUMENT_STORE_REQUIRED === "1";
-    log(structuredLog(fatal ? "error" : "warn", "relay.document_store_not_ready", {
-      reason: storeReadiness.reason,
-      detail: storeReadiness.detail,
-      hint: fatal ? "refusing to start: originals would not be kept safely" : "running without keeping originals",
-    }));
-    if (fatal) process.exit(1);
-  }
-  const documentStore = storeReadiness?.ok ? documentStoreFromEnv() : undefined;
+  //
+  // CHECKED EVEN WHEN UNSET (#544): unset is the case that drops every original,
+  // so it is the one that has to say so at start - it used to be the one case
+  // with no line at all.
+  const storeReadiness = await checkDocumentStore(process.env);
+  const storeNotice = documentStoreNotice(storeReadiness);
+  log(structuredLog(storeNotice.level, storeNotice.event, storeNotice.fields));
+  if (storeNotice.fatal) process.exit(1);
+  const documentStore = storeReadiness.ok ? documentStoreFromEnv() : undefined;
   // The environment's pinned models, overridable per task at runtime by the
   // super admin (/model) — see model-task-settings.ts. Undefined when nothing is
   // configured, which keeps the no-runner behaviour exactly as it was.

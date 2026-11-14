@@ -100,6 +100,13 @@ class ClassificationTests(unittest.TestCase):
         for name in ("get_assistant_names", "set_assistant_names", "report_bug"):
             self.assertIn(name, plugin.KNOWN_TOOL_NAMES)
 
+    def test_stop_tools_are_known_so_a_live_call_emits_an_event(self) -> None:
+        # #419: the six stop tools were on the bridge but not on this list, so a
+        # set_stop_from_booking call recorded nothing.
+        for name in ("get_stops", "update_stop", "split_stop", "set_stop_from_booking",
+                     "move_plan_day", "plan_open_days"):
+            self.assertIn(name, plugin.KNOWN_TOOL_NAMES)
+
 
 class ConfigGateTests(unittest.TestCase):
     def setUp(self) -> None:

@@ -411,6 +411,59 @@ class TransformerTests(unittest.TestCase):
         config = transform_intake(intake, today=date(2026, 8, 20))
         self.assertEqual(config["meta"]["departure"][:10], "2026-11-18")
 
+    # ── 2026-11-08: a return date stored as words must not become today + 90 ──
+
+    GATECITY = _structured([
+        {"name": "Gatecity", "name_en": "Gatecity", "start": "2026-11-14", "end": "2026-11-22"},
+    ])
+
+    def _gatecity(self, **overrides) -> dict:
+        return {
+            **JAPAN_INTAKE,
+            "destination": _text("Gatecity"),
+            "departure_date": _text("2026-11-14"),
+            "return_date": _text("22 בנובמבר 2026"),
+            "phases": self.GATECITY,
+            **overrides,
+        }
+
+    def test_unreadable_return_date_uses_the_stops_not_today_plus_90(self) -> None:
+        with self.assertLogs("control_plane_worker.transformer", level="WARNING") as logs:
+            config = transform_intake(self._gatecity(), today=date(2026, 11, 8))
+        self.assertEqual(config["meta"]["departure"][:10], "2026-11-14")
+        self.assertEqual(config["meta"]["returnDate"], "2026-11-22")
+        self.assertEqual(config["meta"]["totalDays"], 8)
+        self.assertTrue(any("return_date" in line for line in logs.output), logs.output)
+        self.assertFalse(any("departure_date," in line or "unreadable=departure_date" in line for line in logs.output), logs.output)
+
+    def test_slug_year_follows_the_stops_when_a_date_is_unreadable(self) -> None:
+        with self.assertLogs("control_plane_worker.transformer", level="WARNING"):
+            slug = derive_trip_slug(self._gatecity(), today=date(2026, 11, 8))
+        self.assertEqual(slug, "gatecity-2026")
+
+    def test_both_dates_unreadable_use_the_stops_and_name_both(self) -> None:
+        intake = self._gatecity(departure_date=_text("14 בנובמבר"), return_date=_text("22 בנובמבר"))
+        with self.assertLogs("control_plane_worker.transformer", level="WARNING") as logs:
+            config = transform_intake(intake, today=date(2026, 11, 8))
+        self.assertEqual(config["meta"]["departure"][:10], "2026-11-14")
+        self.assertEqual(config["meta"]["returnDate"], "2026-11-22")
+        joined = "\n".join(logs.output)
+        self.assertIn("departure_date", joined)
+        self.assertIn("return_date", joined)
+
+    def test_unreadable_dates_with_undated_stops_still_use_the_placeholder_but_warn(self) -> None:
+        intake = self._gatecity(phases=_structured([{"name": "Gatecity"}]))
+        with self.assertLogs("control_plane_worker.transformer", level="WARNING") as logs:
+            config = transform_intake(intake, today=date(2026, 11, 8))
+        self.assertEqual(config["meta"]["departure"][:10], "2027-02-06")
+        self.assertTrue(any("return_date" in line for line in logs.output), logs.output)
+
+    def test_readable_dates_win_over_the_stops_and_log_nothing(self) -> None:
+        intake = self._gatecity(return_date=_text("2026-11-25"))
+        with self.assertNoLogs("control_plane_worker.transformer", level="WARNING"):
+            config = transform_intake(intake, today=date(2026, 11, 8))
+        self.assertEqual(config["meta"]["returnDate"], "2026-11-25")
+
     def test_return_before_departure_falls_back_to_placeholder(self) -> None:
         intake = {
             **JAPAN_INTAKE,

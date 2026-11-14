@@ -387,16 +387,24 @@ class AgainstPostgres(unittest.TestCase):
         cls.canaries = cls.logs / "canaries.txt"
 
         # PSQL_CMD: the deployment's admin psql, here `docker exec` as the owner.
-        # It records its arguments and everything it is fed.
+        # It records its arguments and everything it is fed. It runs under the
+        # script's scrubbed environment (HOME is a temp dir), and the docker CLI
+        # finds its context through HOME/.docker: with that gone it falls back
+        # to /var/run/docker.sock, which on a Docker Desktop Mac is a symlink
+        # into one user's home and answers "permission denied" to anyone else
+        # (the nightly's whole database half failed that way). So the shim hands
+        # docker, and only docker, the runner's own way of reaching its daemon.
+        docker_env = {k: v for k, v in os.environ.items()
+                      if k in ("HOME", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "XDG_CONFIG_HOME")}
         admin_psql = cls.bin / "admin-psql"
         admin_psql.write_text(
             f"#!{sys.executable}\n"
-            "import subprocess, sys\n"
+            "import os, subprocess, sys\n"
             f"open({str(cls.argv_log)!r}, 'a').write('admin-psql ' + ' '.join(sys.argv[1:]) + '\\n')\n"
             "data = sys.stdin.buffer.read()\n"
             f"open({str(cls.stdin_log)!r}, 'ab').write(data + b'\\n\\x00\\n')\n"
             f"p = subprocess.run([{DOCKER!r}, 'exec', '-i', {cls.container!r}, 'psql', '-X', '-U', {ADMIN!r}, "
-            f"'-d', {ADMIN!r}] + sys.argv[1:], input=data)\n"
+            f"'-d', {ADMIN!r}] + sys.argv[1:], input=data, env={{**os.environ, **{docker_env!r}}})\n"
             "sys.exit(p.returncode)\n")
         admin_psql.chmod(0o755)
 

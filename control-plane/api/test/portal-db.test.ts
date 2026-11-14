@@ -510,6 +510,94 @@ test("lost interview recovery is owner-only, CSRF-protected and explicit; expire
   }
 });
 
+// #513. `has_interview` was EXISTS(any session), so a closed interview still read as a live one and the
+// dashboard offered "Continue in Telegram" to a chat whose bot had stopped answering.
+test("AC-5: an expired, unconfirmed interview is not a live interview; a live or confirmed one is", { skip }, async () => {
+  const app = buildApp(profile, { portal: portalDeps(pool) });
+  const owner = await session(ids.owner, "expiredlink");
+  let tripId: string | undefined;
+  try {
+    const headers = { cookie: owner.cookie, "x-csrf-token": owner.csrf };
+    const created = await app.inject({ method: "POST", url: "/v1/trips", headers, payload: { destination: "Expiry test", tripType: "family" } });
+    assert.equal(created.statusCode, 201); tripId = created.json().id;
+    const url = `/v1/trips/${tripId}/interview-link`;
+    const issued = await app.inject({ method: "POST", url, headers }); assert.equal(issued.statusCode, 201);
+    const { startSession } = await import("../src/interview.js");
+    assert.ok((await startSession(pool, new URL(issued.json().deepLink).searchParams.get("start")!)).ok);
+
+    const live = await app.inject({ url, headers });
+    assert.equal(live.json().hasInterview, true, "a session that has not expired is a live interview");
+
+    await pool.query("UPDATE control_plane.intake_sessions SET expired_at = now() WHERE trip_id = $1", [tripId]);
+    const closed = await app.inject({ url, headers });
+    assert.equal(closed.statusCode, 200);
+    assert.equal(closed.json().hasInterview, false, "an expired, unconfirmed session is no longer a live interview");
+    assert.equal(closed.json().activeEnrollment, null);
+
+    // Confirmed never expires: it stays an interview that happened and the page must say so.
+    await pool.query("UPDATE control_plane.intake_sessions SET state = 'confirmed', expired_at = NULL WHERE trip_id = $1", [tripId]);
+    assert.equal((await app.inject({ url, headers })).json().hasInterview, true, "a confirmed session is still an interview");
+  } finally {
+    if (tripId) {
+      await pool.query("DELETE FROM control_plane.intake_sessions WHERE trip_id=$1", [tripId]);
+      await pool.query("DELETE FROM control_plane.interview_enrollments WHERE trip_id=$1", [tripId]);
+      await pool.query("DELETE FROM control_plane.funnel_events WHERE trip_id=$1", [tripId]);
+      await pool.query("DELETE FROM control_plane.trip_memberships WHERE trip_id=$1", [tripId]);
+      await pool.query("DELETE FROM control_plane.trips WHERE id=$1", [tripId]);
+    }
+    await app.close();
+  }
+});
+
+test("AC-5: the page is never offered a replacement link the replace route would refuse after an expiry", { skip }, async () => {
+  const app = buildApp(profile, { portal: portalDeps(pool) });
+  const owner = await session(ids.owner, "expiredreplace");
+  let tripId: string | undefined;
+  try {
+    const headers = { cookie: owner.cookie, "x-csrf-token": owner.csrf };
+    const created = await app.inject({ method: "POST", url: "/v1/trips", headers, payload: { destination: "Expiry replace test", tripType: "family" } });
+    assert.equal(created.statusCode, 201); tripId = created.json().id;
+    const url = `/v1/trips/${tripId}/interview-link`;
+    const first = await app.inject({ method: "POST", url, headers }); assert.equal(first.statusCode, 201);
+    const { startSession } = await import("../src/interview.js");
+    assert.ok((await startSession(pool, new URL(first.json().deepLink).searchParams.get("start")!)).ok);
+    await pool.query("UPDATE control_plane.intake_sessions SET expired_at = now() WHERE trip_id = $1", [tripId]);
+    // Two states can hold a closed interview and an outstanding link, and `recoverable` has to agree with what
+    // `/replace` answers in BOTH (#513): a trip a failed chat binding put back to `draft`, and the trip an expiry leaves
+    // in `intake_in_progress` (a paused interview, which the route now replaces the link for).
+    for (const lifecycle of ["draft", "intake_in_progress"]) {
+      await pool.query("UPDATE control_plane.trips SET lifecycle_state = $2 WHERE id = $1", [tripId, lifecycle]);
+      await pool.query("UPDATE control_plane.interview_enrollments SET state = 'revoked' WHERE trip_id = $1 AND state = 'issued'", [tripId]);
+      const second = await app.inject({ method: "POST", url, headers }); assert.equal(second.statusCode, 201, `${lifecycle}: ${second.body}`);
+
+      const metadata = (await app.inject({ url, headers })).json();
+      assert.equal(metadata.hasInterview, false, lifecycle);
+      const replaced = await app.inject({ method: "POST", url: url + "/replace", headers, payload: { expectedEnrollmentId: second.json().enrollmentId } });
+      assert.equal(
+        metadata.recoverable,
+        replaced.statusCode === 201,
+        `${lifecycle}: recoverable=${metadata.recoverable} but replace answered ${replaced.statusCode} ${replaced.body}`,
+      );
+      assert.equal(metadata.recoverable, true, lifecycle);
+    }
+    // And once the interview is LIVE again (or confirmed) both say no.
+    await pool.query("UPDATE control_plane.intake_sessions SET expired_at = NULL WHERE trip_id = $1", [tripId]);
+    const live = (await app.inject({ url, headers })).json();
+    assert.equal(live.recoverable, false);
+    const active = live.activeEnrollment?.id as string;
+    assert.equal((await app.inject({ method: "POST", url: url + "/replace", headers, payload: { expectedEnrollmentId: active } })).statusCode, 409);
+  } finally {
+    if (tripId) {
+      await pool.query("DELETE FROM control_plane.intake_sessions WHERE trip_id=$1", [tripId]);
+      await pool.query("DELETE FROM control_plane.interview_enrollments WHERE trip_id=$1", [tripId]);
+      await pool.query("DELETE FROM control_plane.funnel_events WHERE trip_id=$1", [tripId]);
+      await pool.query("DELETE FROM control_plane.trip_memberships WHERE trip_id=$1", [tripId]);
+      await pool.query("DELETE FROM control_plane.trips WHERE id=$1", [tripId]);
+    }
+    await app.close();
+  }
+});
+
 test("the gateway can ask whether a trip session is still entitled, and portal logout ends it", { skip }, async () => {
   const app = buildApp(profile, { portal: portalDeps(pool) });
   const check = (apiKey: string | undefined, userId = ids.outsider, tripId = ids.otherTrip) =>

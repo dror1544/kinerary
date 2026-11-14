@@ -174,6 +174,9 @@ describe('mcp/mcp.js stop tools — against a stand-in trip site', () => {
       assert.match(tools[name].description, /does not change (a|the) stop/i, name);
       assert.match(tools[name].description, /set_stop_from_booking/, name);
     }
+    // #419: the Hermes bridge says the same as the site's own MCP — always link, not "if they mean it".
+    assert.match(tools.add_booking.description, /always call set_stop_from_booking/i);
+    assert.doesNotMatch(tools.add_booking.description, /if the organizer means/i);
   });
 
   test('argument validation refuses bad ids, dates, booking ids and a PIN — before any request is made', async () => {
@@ -593,6 +596,55 @@ describe('mcp/mcp.js stop tools — against the real trip server (the colmar tri
   });
 });
 
+// ── 2b. #419: a hotel told to the companion reaches Plan and Map ─────────────
+// The companion's two calls, through mcp/mcp.js against a real trip server on
+// the colmar trip: add_booking, then set_stop_from_booking. In between the
+// hotel is on Reservations only — get_stops says so — and after the second
+// call it is on the active itinerary (the Modern Plan's source), on the stop
+// (/api/config, which the Map cards and pins are drawn from; MapView's card
+// for a named hotel is pinned in trip-web/src/hotel-places.test.tsx).
+describe('#419 add_booking then set_stop_from_booking — Plan and Map follow the stop (AC-1)', () => {
+  let site;
+  const phase = async (id) => (await site.call('/api/config')).body.phases.find(p => p.id === id);
+  const items = async () => (await site.call('/api/itinerary/active')).body.items;
+
+  before(async () => {
+    site = await bootTripServer(PORTS.mcpHotelLinkSite);
+    await startTestMcp({ API_BASE_URL: site.base, MCP_PORT: String(PORTS.mcpHotelLinkMcp), MCP_API_KEY });
+  });
+  after(async () => {
+    stopTestMcp();
+    await site?.stop();
+  });
+
+  test('add_booking then set_stop_from_booking puts check-in and check-out on the active itinerary and the hotel on the stop', async () => {
+    assert.equal((await phase('colmar')).accommodation, undefined, 'Colmar starts with no hotel');
+    const added = parseToolJson(await mcpCallTool('add_booking', {
+      phase: 'colmar', type: 'hotel', name: 'Hotel Colmar Centre', date_from: '2026-12-02', date_to: '2026-12-07', confirmation: 'HCC-778',
+    }));
+    const bookingId = added.id;
+
+    // The booking alone: on Reservations, nowhere else — and get_stops says it is not linked yet.
+    assert.equal((await phase('colmar')).accommodation, undefined);
+    assert.deepEqual((await items()).filter(i => i.booking_id === bookingId), []);
+    const before = parseToolJson(await mcpCallTool('get_stops')).stops.find(s => s.id === 'colmar');
+    assert.deepEqual(before.unlinked_hotel_bookings.map(b => b.id), [bookingId]);
+
+    parseToolJson(await mcpCallTool('set_stop_from_booking', { phase_id: 'colmar', booking_id: bookingId }));
+
+    const linked = (await items()).filter(i => i.booking_id === bookingId).map(i => [i.item_uid, i.phase_id, i.date]).sort();
+    assert.deepEqual(linked, [
+      [`booking_${bookingId}_checkin`, 'colmar', '2026-12-02'],
+      [`booking_${bookingId}_checkout`, 'colmar', '2026-12-07'],
+    ]);
+    const colmar = await phase('colmar');
+    assert.deepEqual(colmar.dates, { start: '2026-12-02', end: '2026-12-07' });
+    assert.equal(colmar.accommodation.name, 'Hotel Colmar Centre');
+    const after = parseToolJson(await mcpCallTool('get_stops')).stops.find(s => s.id === 'colmar');
+    assert.deepEqual(after.unlinked_hotel_bookings, []);
+  });
+});
+
 // ── 3. server/trip-mcp/tools.js — write gating and routes ────────────────────
 describe('server/trip-mcp/tools.js stop tools — absent on a read-only connection', () => {
   const { McpServer } = require('../server/node_modules/@modelcontextprotocol/sdk/dist/cjs/server/mcp.js');
@@ -666,6 +718,9 @@ describe('server/trip-mcp/tools.js stop tools — absent on a read-only connecti
         assert.match(tools[name].description, /does not change (a|the) stop/i, name);
         assert.match(tools[name].description, /set_stop_from_booking/, name);
       }
+      // #419: a hotel the organizer gives is always linked afterwards — not "if they mean it".
+      assert.match(tools.add_booking.description, /always call set_stop_from_booking/i);
+      assert.doesNotMatch(tools.add_booking.description, /if the organizer means/i);
     } finally { await close(); }
   });
 

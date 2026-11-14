@@ -15,6 +15,39 @@ function tokenDigest(token: string): string {
   return `sha256:${sha256hex(token)}`;
 }
 
+/**
+ * The interview of a trip that is PAUSED (#513): its latest session closed for idleness (`expired_at`) without being
+ * confirmed, and nothing else holds the trip -- no live session, no confirmed one. The answer is that session's id, or
+ * null when the trip is not paused.
+ *
+ * ONE definition, read by every caller that has to agree on it: `issueEnrollment` and `replaceEnrollment` (who may be
+ * handed a link), `startSession` (whose answers a new session carries), the portal's trip detail (the paused flag the
+ * page reads) and `recoverable`. It is deliberately about the sessions, not the lifecycle: expiry leaves the trip in
+ * `intake_in_progress` (see `claimExpiredSessions`), and a trip a failed chat binding put back to `draft` carries the
+ * same closed session. A confirmed session anywhere on the trip means the interview is over, whatever the rest says.
+ *
+ * A scalar subquery so it can be spliced into a larger statement, with `tripRef` naming the trip id it is keyed on
+ * (an SQL expression, never user input).
+ */
+export function pausedInterviewSessionSql(tripRef: string): string {
+  return `(SELECT s.id FROM control_plane.intake_sessions s
+            WHERE s.trip_id = ${tripRef} AND s.state <> 'confirmed' AND s.expired_at IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM control_plane.intake_sessions live
+                               WHERE live.trip_id = ${tripRef} AND (live.state = 'confirmed' OR live.expired_at IS NULL))
+            ORDER BY s.expired_at DESC, s.created_at DESC LIMIT 1)`;
+}
+
+/** `pausedInterviewSessionSql` for one trip, run on a pool or on a transaction's client. */
+export async function pausedInterviewSessionId(q: Pick<pg.Pool, "query">, tripId: string): Promise<string | null> {
+  const row = await q.query<{ id: string | null }>(`SELECT ${pausedInterviewSessionSql("$1::text")} AS id`, [tripId]);
+  return row.rows[0]?.id ?? null;
+}
+
+/** A trip can be handed an interview link when it is a draft, or when its interview is paused (see above). */
+function linkable(lifecycleState: string, pausedSessionId: string | null): boolean {
+  return lifecycleState === "draft" || (lifecycleState === "intake_in_progress" && pausedSessionId !== null);
+}
+
 export interface EnrollmentConfig {
   /** Seconds until an issued enrollment link expires. */
   enrollmentTtlSeconds: number;
@@ -30,12 +63,15 @@ export type EnrollmentVerifyResult =
 
 /**
  * Issues a single-use, expiring enrollment link for the trip's owner to hand
- * to the Hermes interviewer. Verifies the trip is in 'draft' and the
- * requesting user holds an active owner membership.
+ * to the Hermes interviewer. Verifies the trip is in 'draft' -- or in
+ * 'intake_in_progress' with a PAUSED interview (#513) -- and the requesting
+ * user holds an active owner membership.
  *
  * At most one active ('issued') enrollment per trip is allowed — re-requesting
  * while one is still live returns an error rather than silently creating a
- * second link that could confuse an ongoing interview.
+ * second link that could confuse an ongoing interview. A paused trip is the
+ * exception: nothing is ongoing, the organizer who asks again has lost or
+ * given up on the earlier link, so it is revoked and replaced (AC-2).
  */
 export async function issueEnrollment(
   db: pg.Pool,
@@ -53,7 +89,8 @@ export async function issueEnrollment(
       `SELECT t.lifecycle_state
        FROM control_plane.trips t
        JOIN control_plane.trip_memberships m ON m.trip_id = t.id
-       WHERE t.id = $1 AND m.user_id = $2 AND m.role = 'owner' AND m.status = 'active'`,
+       JOIN control_plane.users u ON u.id = m.user_id
+       WHERE t.id = $1 AND m.user_id = $2 AND m.role = 'owner' AND m.status = 'active' AND u.status = 'active'`,
       [tripId, userId],
     );
     const [trip] = tripRow.rows;
@@ -61,9 +98,15 @@ export async function issueEnrollment(
       await client.query("ROLLBACK");
       return { ok: false, reason: "NOT_OWNER" };
     }
-    if (trip.lifecycle_state !== "draft") {
+    const paused = await pausedInterviewSessionId(client, tripId);
+    if (!linkable(trip.lifecycle_state, paused)) {
       await client.query("ROLLBACK");
       return { ok: false, reason: "TRIP_NOT_DRAFT" };
+    }
+    // A paused interview has nothing ongoing for an unredeemed link to confuse, and the person asking has just
+    // asked for a NEW one: the earlier one stops working, so it is never the one that is opened by mistake.
+    if (paused) {
+      await client.query("UPDATE control_plane.interview_enrollments SET state = 'revoked' WHERE trip_id = $1 AND state = 'issued'", [tripId]);
     }
 
     // Expire any issued enrollments for this trip that are past their deadline.
@@ -178,8 +221,27 @@ export async function consumeEnrollmentInTx(
   client: pg.PoolClient,
   rawToken: string,
 ): Promise<{ enrollmentId: string; tripId: string; userId: string } | null> {
-  const digest = tokenDigest(rawToken);
+  return consumeLockedEnrollment(client, "token_digest = $1", tokenDigest(rawToken));
+}
 
+/**
+ * The same consumption, for an enrollment named by its id rather than by its token: the organizer's approval of a link
+ * somebody else opened (#519, organizer-link-approval.ts). The token is a bearer and is not kept anywhere, so the approval
+ * cannot present it; the id comes from the request row the bound organizer answered, and every check `consumeEnrollmentInTx`
+ * makes (issued, not expired) is made again here under the same row lock.
+ */
+export async function consumeEnrollmentByIdInTx(
+  client: pg.PoolClient,
+  enrollmentId: string,
+): Promise<{ enrollmentId: string; tripId: string; userId: string } | null> {
+  return consumeLockedEnrollment(client, "id = $1", enrollmentId);
+}
+
+async function consumeLockedEnrollment(
+  client: pg.PoolClient,
+  where: "token_digest = $1" | "id = $1",
+  key: string,
+): Promise<{ enrollmentId: string; tripId: string; userId: string } | null> {
   // Row-level lock prevents two concurrent start-session calls from both
   // succeeding with the same token.
   const row = await client.query<{
@@ -191,9 +253,9 @@ export async function consumeEnrollmentInTx(
   }>(
     `SELECT id, trip_id, user_id, state, expires_at
      FROM control_plane.interview_enrollments
-     WHERE token_digest = $1
+     WHERE ${where}
      FOR UPDATE`,
-    [digest],
+    [key],
   );
   const [enrollment] = row.rows;
   if (!enrollment) return null;
@@ -243,8 +305,11 @@ export async function replaceEnrollment(
     if (!row.rows[0] || row.rows[0].state !== "issued" || row.rows[0].expires_at.getTime() <= Date.now()) {
       return await refuse("ENROLLMENT_NOT_REPLACEABLE");
     }
-    if (trip.rows[0].lifecycle_state !== "draft") return await refuse("TRIP_NOT_DRAFT");
-    const sessions = await client.query("SELECT 1 FROM control_plane.intake_sessions WHERE trip_id=$1 LIMIT 1", [tripId]);
+    if (!linkable(trip.rows[0].lifecycle_state, await pausedInterviewSessionId(client, tripId))) return await refuse("TRIP_NOT_DRAFT");
+    // A LIVE or confirmed interview is what a replacement would disturb. A closed one is paused, not started (#513):
+    // this is the same fact the portal's `has_interview` reads, which is what keeps `recoverable` and this route agreeing.
+    const sessions = await client.query(
+      "SELECT 1 FROM control_plane.intake_sessions WHERE trip_id=$1 AND (state='confirmed' OR expired_at IS NULL) LIMIT 1", [tripId]);
     if (sessions.rowCount) return await refuse("INTERVIEW_ALREADY_STARTED");
     const token = randomBytes(32).toString("base64url"), enrollmentId = generateId("enrl");
     const expiresAt = new Date(Date.now() + config.enrollmentTtlSeconds * 1000);

@@ -6,9 +6,11 @@
  * invented; none comes from that folder.
  */
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { describe, test } from "node:test";
 import { reconcileStructured, samePerson } from "../src/answer-merge.js";
 import { clockTime, normaliseDatesAndTimes, tripWindow } from "../src/document-dates.js";
+import { gateDocumentProposals } from "../src/document-gate.js";
 import { applyProposals, type ProposedAnswer } from "../src/interpret.js";
 import { INTAKE_QUESTIONS } from "../src/interview.js";
 
@@ -282,5 +284,121 @@ describe("applyProposals — several documents in one burst", () => {
     assert.ok(travelers, JSON.stringify(decisions.rejected));
     assert.equal(((travelers.answer as unknown as { data: unknown[] }).data).length, 2);
     assert.deepEqual(decisions.conflicts, []);
+  });
+});
+
+// ── #412: two tickets for two parties on the same flight ─────────────────────
+//
+// The fixture is two invented ticket texts (same flight, same date, different
+// booking references and passengers) and the model readings recorded for them.
+// `gateDocumentProposals` is the production gate; only the model is absent.
+
+describe("two tickets for two parties (#412)", () => {
+  const dir = new URL("./fixtures/two-parties-same-flight/", import.meta.url);
+  const ticket1 = readFileSync(new URL("ticket-1.txt", dir), "utf8");
+  const ticket2 = readFileSync(new URL("ticket-2.txt", dir), "utf8");
+  type Recorded = { confidence: number; evidence: string; data: unknown[] };
+  const recorded = JSON.parse(readFileSync(new URL("readings.json", dir), "utf8")) as Record<string, Recorded>;
+
+  const reading = (documentId: string, text: string, key: string, confidence?: number) => {
+    const r = recorded[key]!;
+    const proposal: ProposedAnswer = {
+      questionId: "travelers",
+      value: { kind: "structured", data: structuredClone(r.data) },
+      confidence: confidence ?? r.confidence,
+      evidence: r.evidence,
+      sourceMessageId: "",
+    };
+    return { documentId, text, payload: { proposals: [proposal], unclear: [] } as never };
+  };
+  const gate = (second: ReturnType<typeof reading>, held?: Record<string, unknown>) =>
+    gateDocumentProposals(
+      held ? [second] : [reading("doc-1", ticket1, "ticket-1"), second],
+      held
+        ? { outstanding: ALL.filter((id) => id !== "travelers"), answered: ["travelers"], held }
+        : { outstanding: ALL, answered: [] },
+    );
+  const namesEn = (answer: unknown) => ((answer as { data: { name_en: string }[] } | undefined)?.data ?? []).map((p) => p.name_en).sort();
+  const BOTH = ["ARLO VESPER", "BRIA TALLIS", "COLE TALLIS", "LENA VESPER"];
+  const FIRST = ["ARLO VESPER", "LENA VESPER"];
+
+  test("two tickets for two parties give all four travellers", () => {
+    const { decisions, sources } = gate(reading("doc-2", ticket2, "ticket-2-sure"));
+    const travelers = decisions.accepted.find((a) => a.questionId === "travelers");
+    assert.ok(travelers, JSON.stringify(decisions.rejected));
+    assert.deepEqual(namesEn(travelers.answer), BOTH);
+    assert.deepEqual(sources.get("travelers")?.sort(), ["doc-1", "doc-2"], "the answer names both tickets");
+    assert.deepEqual(decisions.suggested, []);
+  });
+
+  test("a low-confidence second party is suggested, not dropped", () => {
+    const { decisions } = gate(reading("doc-2", ticket2, "ticket-2-unsure"));
+    const accepted = decisions.accepted.find((a) => a.questionId === "travelers");
+    assert.ok(accepted, JSON.stringify(decisions.rejected));
+    assert.deepEqual(namesEn(accepted.answer), FIRST, "only the sure ticket is written");
+
+    assert.equal(decisions.suggested.length, 1, `the unsure couple must be offered — rejected: ${JSON.stringify(decisions.rejected.map((r) => r.reason))}`);
+    const offer = decisions.suggested[0]!;
+    assert.equal(offer.questionId, "travelers");
+    assert.deepEqual(namesEn(offer.answer), BOTH, "a Yes writes the union, never the unsure couple alone");
+    assert.deepEqual(namesEn(offer.proposal.value), BOTH, "and what the relay stores is the same union");
+    assert.ok(decisions.rejected.some((r) => r.questionId === "travelers" && r.reason === "LOW_CONFIDENCE"), "the refusal is still on record");
+  });
+
+  test("an unsure ticket that adds nobody is not offered", () => {
+    const { decisions } = gateDocumentProposals(
+      [reading("doc-1", ticket1, "ticket-1"), reading("doc-2", ticket1, "ticket-1", 0.3)],
+      { outstanding: ALL, answered: [] },
+    );
+    assert.deepEqual(decisions.suggested, []);
+    assert.deepEqual(namesEn(decisions.accepted.find((a) => a.questionId === "travelers")?.answer), FIRST);
+  });
+
+  test("a traveller slice quoted in the interview's script passes when name_en is printed", () => {
+    const { decisions, sources } = gate(reading("doc-2", ticket2, "ticket-2-hebrew-evidence"));
+    const travelers = decisions.accepted.find((a) => a.questionId === "travelers");
+    assert.ok(travelers, `rejected: ${JSON.stringify(decisions.rejected.map((r) => `${r.questionId}:${r.reason}`))}`);
+    assert.deepEqual(namesEn(travelers.answer), BOTH);
+    assert.deepEqual(sources.get("travelers")?.sort(), ["doc-1", "doc-2"]);
+    assert.ok(!decisions.rejected.some((r) => r.reason === "EVIDENCE_NOT_IN_SOURCE"));
+  });
+
+  test("an unsure reading whose evidence is in the interview's script is still offered (both causes at once)", () => {
+    const { decisions } = gate(reading("doc-2", ticket2, "ticket-2-hebrew-evidence", 0.5));
+    assert.deepEqual(namesEn(decisions.accepted.find((a) => a.questionId === "travelers")?.answer), FIRST);
+    assert.deepEqual(namesEn(decisions.suggested[0]?.answer), BOTH);
+  });
+
+  test("script evidence does NOT pass when a name_en is not printed in the ticket", () => {
+    const r = reading("doc-2", ticket2, "ticket-2-hebrew-evidence");
+    // One name the ticket never printed: the model made her up.
+    ((r.payload.proposals[0] as ProposedAnswer).value as { data: { name_en: string }[] }).data[1]!.name_en = "DINA MARLOW";
+    const { decisions } = gate(r);
+    assert.deepEqual(namesEn(decisions.accepted.find((a) => a.questionId === "travelers")?.answer), FIRST);
+    assert.ok(decisions.rejected.some((x) => x.reason === "EVIDENCE_NOT_IN_SOURCE"), "refused, as before");
+    assert.deepEqual(decisions.suggested, [], "and an invented traveller is not offered either");
+  });
+
+  test("a name_en printed only in ANOTHER ticket does not satisfy this ticket's evidence", () => {
+    // Ticket 2's slice claims ticket 1's people while quoting script text:
+    // each proposal must quote its own document.
+    const r = reading("doc-2", ticket2, "ticket-2-hebrew-evidence");
+    ((r.payload.proposals[0] as ProposedAnswer).value as { data: unknown[] }).data = structuredClone(recorded["ticket-1"]!.data);
+    const { decisions } = gate(r);
+    assert.ok(decisions.rejected.some((x) => x.reason === "EVIDENCE_NOT_IN_SOURCE"));
+  });
+
+  test("a later upload's unsure couple is offered on top of the held couple (the gate half of AC-4)", () => {
+    const held = { travelers: { kind: "structured", schema_version: 3, data: structuredClone(recorded["ticket-1"]!.data) } };
+    const { decisions } = gate(reading("doc-2", ticket2, "ticket-2-unsure"), held);
+    assert.deepEqual(decisions.accepted, []);
+    assert.deepEqual(namesEn(decisions.suggested[0]?.answer), BOTH);
+  });
+
+  test("a sure second couple beside a held couple is added, and nothing is left to ask", () => {
+    const held = { travelers: { kind: "structured", schema_version: 3, data: structuredClone(recorded["ticket-1"]!.data) } };
+    const { decisions } = gate(reading("doc-2", ticket2, "ticket-2-sure"), held);
+    assert.deepEqual(namesEn(decisions.accepted[0]?.answer), BOTH);
+    assert.deepEqual(decisions.suggested, []);
   });
 });

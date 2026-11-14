@@ -18,9 +18,13 @@
 #       returned, never by name (scripts/teardown-trip.py). Nothing that existed
 #       before the run is touched.
 #
-#   --scenario japan|multi|manual|chaos|vietnam|star|all|none   the trip to walk (default japan);
+#   --scenario japan|multi|manual|chaos|vietnam|star|gatecity|all|none   the trip to walk (default japan);
 #                                        star = couples, one base with day trips, then changes by chat
 #                                        (needs --auto; not part of `all` until its known gaps close)
+#                                        gatecity = Dror's manual Sprint 8 test: a dashboard trip, two
+#                                        tickets sent as PHOTOS in one album, a correction at the summary,
+#                                        every check named by its issue (needs --auto; red until those
+#                                        fixes land, so not part of `all`)
 #                                        chaos = an organizer who does not follow (needs --auto)
 #                                        none = deploy + automated checks only
 #   --auto                               an automated organizer plays the person
@@ -66,19 +70,23 @@ while [ $# -gt 0 ]; do
     --deploy) DEPLOY=1 ;;
     --cleanup) CLEANUP=1 ;;
     --auto) AUTO=1 ;;
-    --scenario) SCENARIO="${2:?--scenario needs japan|multi|manual|chaos|vietnam|star|all|none}"; shift ;;
-    -h|--help) sed -n '2,48p' "$0"; exit 0 ;;
+    --scenario) SCENARIO="${2:?--scenario needs japan|multi|manual|chaos|vietnam|star|gatecity|all|none}"; shift ;;
+    -h|--help) sed -n '2,52p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
   esac
   shift
 done
-case "$SCENARIO" in japan|multi|manual|chaos|vietnam|star|all|none) ;; *) echo "--scenario must be japan|multi|manual|chaos|vietnam|star|all|none" >&2; exit 2 ;; esac
+case "$SCENARIO" in japan|multi|manual|chaos|vietnam|star|gatecity|all|none) ;; *) echo "--scenario must be japan|multi|manual|chaos|vietnam|star|gatecity|all|none" >&2; exit 2 ;; esac
 if [ "$SCENARIO" = chaos ] && [ "$AUTO" = 0 ]; then
   echo "--scenario chaos is the automated organizer misbehaving on purpose; it needs --auto" >&2
   exit 2
 fi
 if [ "$SCENARIO" = star ] && [ "$AUTO" = 0 ]; then
   echo "--scenario star speaks as the organizer on both sides of the build; it needs --auto" >&2
+  exit 2
+fi
+if [ "$SCENARIO" = gatecity ] && [ "$AUTO" = 0 ]; then
+  echo "--scenario gatecity sends the tickets as photos and answers as the organizer; it needs --auto" >&2
   exit 2
 fi
 if [ "$SCENARIO" = all ] && [ "$AUTO" = 0 ]; then
@@ -285,9 +293,14 @@ busy="$(live_sql "SELECT count(*) FROM control_plane.jobs WHERE state IN ('lease
 run "api build"                control-plane/api            npm run build
 [ "$FAILED" = 0 ] || exit 1
 [ -d "$CHECKOUT/control-plane/worker" ] || die "$CHECKOUT is not a checkout — refusing to hand it to compose"
+# KINERARY_COMPOSE_OVERRIDE (optional): the deployment's own compose file, layered
+# on top — e.g. secrets pinned to one fixed folder instead of this checkout's
+# .local-secrets, which every redeploy would otherwise re-point. Set but
+# missing refuses: deploying without it would silently undo what it pins.
+[ -z "${KINERARY_COMPOSE_OVERRIDE:-}" ] || [ -f "$KINERARY_COMPOSE_OVERRIDE" ] || die "KINERARY_COMPOSE_OVERRIDE is set but $KINERARY_COMPOSE_OVERRIDE does not exist"
 if ( set -a; . "$HOME/kinerary-deploy/provisioning.env"; set +a
      WORKER_REPO_ROOT_HOST="$CHECKOUT" BUILDX_CONFIG="$HOME/.docker/buildx-local" \
-       docker compose -f control-plane/deployment/compose.local.yml up -d --build --wait ) >"$LOGS/compose.log" 2>&1; then
+       docker compose -f control-plane/deployment/compose.local.yml ${KINERARY_COMPOSE_OVERRIDE:+-f "$KINERARY_COMPOSE_OVERRIDE"} up -d --build --wait ) >"$LOGS/compose.log" 2>&1; then
   pass "compose stack up (worker mounts $CHECKOUT)"
 else die "compose up failed (log: $LOGS/compose.log)"; fi
 

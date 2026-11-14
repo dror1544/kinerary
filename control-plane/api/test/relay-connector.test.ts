@@ -6,6 +6,7 @@ import { SILENCE_SENTINEL } from "../src/relay/stay-silent.js";
 import type { ReplyObserver } from "../src/analytics/emitter.js";
 import { makeUpgradeToken, type WireMessageEvent } from "../src/relay/protocol.js";
 import type { ChatInfo, SendResult, TelegramClient } from "../src/relay/telegram-api.js";
+import { hermesIsRetryable, hermesIsTimeout } from "./support/hermes-mirror.js";
 
 const SECRET = "test-gateway-secret";
 
@@ -362,27 +363,18 @@ describe("RelayConnector — outbound actions", () => {
     });
   });
 
-  /**
-   * Hermes' own reading of the error string the relay answers with. A MIRROR of
-   * its two predicates, copied from gateway/platforms/base.py (`_is_timeout_error`
-   * ~5472, `_is_retryable_error` ~5464, `_RETRYABLE_ERROR_PATTERNS` ~2770) - read in
-   * the Mac checkout ~/.hermes/hermes-agent @ ab0d98414 and, by the lead, in the
-   * VM's image kinerary-cp/hermes:ab0d98414-pbf43d580 (/opt/hermes), identical.
-   *
-   * What each verdict does to a companion's reply (`_send_with_retry` ~5545-5620):
-   * a TIMEOUT is returned as-is - no retry, no re-send, "the message may have been
-   * delivered"; RETRYABLE is retried with backoff; ANYTHING ELSE falls to the
-   * plain-text fallback, which re-sends the reply prefixed "(Response formatting
-   * failed, plain text:)". If Hermes changes these, change the mirror.
-   */
-  const hermesIsTimeout = (error: string) => {
-    const lowered = error.toLowerCase();
-    return lowered.includes("timed out") || lowered.includes("readtimeout") || lowered.includes("writetimeout");
-  };
-  const hermesIsRetryable = (error: string) => [
-    "connecterror", "connectionerror", "connectionreset", "connectionrefused", "connecttimeout",
-    "network", "broken pipe", "remotedisconnected", "eoferror",
-  ].some((pat) => error.toLowerCase().includes(pat));
+  // Hermes' own reading of the error string the relay answers with
+  // (`hermesIsTimeout`, `hermesIsRetryable`) is no longer a hand copy here: it
+  // is evaluated over the substrings captured from Hermes' source
+  // (`BasePlatformAdapter._is_timeout_error`, `_RETRYABLE_ERROR_PATTERNS`) into
+  // test/fixtures/hermes-mirror.json, at the revision hermes-patches/BASE_REV
+  // pins (#380; test/hermes-mirror.test.ts AC-1/AC-5 hold the two together).
+  //
+  // What each verdict does to a companion's reply (`_send_with_retry`): a
+  // TIMEOUT is returned as-is - no retry, no re-send, "the message may have been
+  // delivered"; RETRYABLE is retried with backoff; ANYTHING ELSE falls to the
+  // plain-text fallback, which re-sends the reply prefixed "(Response formatting
+  // failed, plain text:)".
 
   for (const op of ["send", "edit"] as const) {
     test(`round 2 (R5): a companion ${op} that TIMED OUT is answered with a timeout Hermes recognises - not re-sent as plain text, not retried`, async () => {

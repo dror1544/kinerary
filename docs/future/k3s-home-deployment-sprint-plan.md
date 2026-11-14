@@ -86,6 +86,7 @@ PR without an explicit architecture update:
    and the `trip-web` front-end (already built with a relative base) replaces
    `site/app.js`. Use a **first-level** wildcard (`*.<trip-domain>`) so
    Cloudflare Universal SSL covers it without a paid certificate.
+   > **Note (2026-10-19, Dror)**: Sprint 7 Track 4 (`docs/onboarding-mvp-sprint-plan.md`) reopens host-per-trip against one origin (path routing) for the *current compose deployment*. The k3s migration itself stays unscheduled; if Track 4 changes the routing decision, this document's routing decision needs a matching update when the migration is scheduled.
 4. **Dedicated in-cluster Cloudflare tunnel.** A `cloudflared` Deployment in
    `kinerary-system` runs its own named tunnel. The RPi4's locally managed
    `/etc/cloudflared/config.yml` (which also serves the home services) is never

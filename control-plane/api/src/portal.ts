@@ -3,15 +3,16 @@ import { promisify } from "node:util";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type pg from "pg";
 import { OAuth2Client } from "google-auth-library";
-import { issueEnrollment, replaceEnrollment } from "./enrollment.js";
+import { issueEnrollment, pausedInterviewSessionId, pausedInterviewSessionSql, replaceEnrollment } from "./enrollment.js";
 import { ensureUnknownPasswordCredential, hashPassword, resolveOrCreateEmailAccount, verifyPasswordLogin } from "./password-identity.js";
 import type { Mailer } from "./mailer.js";
 import {
   PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH, cleanDisplayName, consumePasswordReset, consumeSignUpToken, normalizeEmail, portalMailIdle,
-  runInBackground, startPasswordReset, startSignUp, type EmailAuthContext,
+  recordGivenName, runInBackground, startPasswordReset, startSignUp, type EmailAuthContext,
 } from "./portal-email-auth.js";
 import { pickLanguage } from "./portal-email-templates.js";
-import { generatePlan } from "./planner.js";
+import { generatePlan, retryProvision } from "./planner.js";
+import { RETIRED_SLUG_PREFIX } from "./trip-retirement.js";
 import { issueApproval } from "./plan-approval.js";
 import { removeMember } from "./member-removal.js";
 import { structuredLog } from "./redaction.js";
@@ -21,6 +22,7 @@ import {
   type LabelVisibility, type TelegramMiniAppConfig,
 } from "./telegram-mini-app.js";
 import { issueTelegramLinkToken, restoreTelegramLink } from "./telegram-link-token.js";
+import { issueSecondaryOrganizerToken, listSecondaryOrganizers, removeSecondaryOrganizer } from "./secondary-organizers.js";
 import {
   ACCOUNT_SIGN_IN_REQUIRED, assertEveryRouteIsClassified, loadSessionScope, scopeDecision, scopedSessionDigest, sessionDigests,
   type SessionScope,
@@ -139,6 +141,12 @@ export function validatedReturnTo(value: unknown): string {
 export interface GoogleIdentity {
   subject: string;
   displayName: string;
+  /**
+   * The name Google itself put in the signed token -- its `given_name` claim, else its `name` -- and ONLY that.
+   * `displayName` above falls back to the local part of the email address when Google sent no name, which is a
+   * label and not a name; this is absent in that case. It is what the interview greets the organizer by (#438).
+   */
+  givenName?: string;
   email?: string;
   /**
    * Google's own `email_verified` claim, and only ever true when it said so.
@@ -201,9 +209,11 @@ export class GoogleIdTokenClient implements GoogleIdTokenVerifier {
     // `=== true`, not `!== false`: an absent claim must not read as verified, because this is what decides
     // that Google's address and an existing account's address are the same person.
     if (payload.email_verified !== true) throw new GoogleSignInRefused("EMAIL_UNVERIFIED");
+    const claimedName = [payload.given_name, payload.name].find((value): value is string => typeof value === "string" && value.trim() !== "");
     return {
       subject: payload.sub,
       displayName: payload.name?.trim().slice(0, 120) || payload.email.split("@")[0]?.slice(0, 120) || "Kinerary organizer",
+      ...(claimedName ? { givenName: claimedName.trim().slice(0, 120) } : {}),
       email: payload.email,
       emailVerified: true,
       ...(typeof payload.nonce === "string" ? { nonce: payload.nonce } : {}),
@@ -337,6 +347,10 @@ export interface PortalDependencies {
 interface PortalUser {
   id: string;
   displayName: string;
+  /** The name the account holder gave the product (`users.given_name`); null until somebody told us. */
+  givenName: string | null;
+  /** The dashboard has already put the question "what should we call you?" to them (answered or "not now"). */
+  givenNameAsked: boolean;
   googleSubjectDigest: string | null;
   sessionDigest: string;
   sessionId: string;
@@ -389,10 +403,11 @@ async function portalUser(request: FastifyRequest, deps: PortalDependencies): Pr
   const raw = parseCookies(request.headers.cookie).kit_session;
   if (!raw) return null;
   const result = await deps.db.query<{
-    id: string; display_name: string; provider_subject_digest: string | null; session_digest: string; session_id: string; session_created_at: Date;
+    id: string; display_name: string; given_name: string | null; given_name_asked_at: Date | null;
+    provider_subject_digest: string | null; session_digest: string; session_id: string; session_created_at: Date;
     telegram_link_id: string | null;
   }>(
-    `SELECT u.id, u.display_name, ui.provider_subject_digest, s.token_digest AS session_digest, s.id AS session_id, s.created_at AS session_created_at,
+    `SELECT u.id, u.display_name, u.given_name, u.given_name_asked_at, ui.provider_subject_digest, s.token_digest AS session_digest, s.id AS session_id, s.created_at AS session_created_at,
             s.telegram_link_id
      FROM control_plane.web_sessions s
      JOIN control_plane.users u ON u.id = s.user_id AND u.status = 'active'
@@ -410,6 +425,8 @@ async function portalUser(request: FastifyRequest, deps: PortalDependencies): Pr
   return {
     id: row.id,
     displayName: row.display_name,
+    givenName: row.given_name,
+    givenNameAsked: row.given_name_asked_at !== null,
     googleSubjectDigest: row.provider_subject_digest,
     sessionDigest: row.session_digest,
     sessionId: row.session_id,
@@ -571,11 +588,18 @@ async function membership(deps: PortalDependencies, tripId: string, userId: stri
   return result.rows[0] ?? null;
 }
 
-function nextAction(state: string, planStatus?: string | null, jobState?: string | null, runtimeReady = false): string {
+// Trip states a terminally failed build can be retried from: `retryProvision`'s own RETRYABLE_STATES, minus
+// `intake_confirmed` (a trip there has no live build to retry: it is asked to request provisioning instead).
+const RETRY_FROM_STATES = new Set(["planned", "provisioning_approved", "provisioning", "ready_private"]);
+
+function nextAction(state: string, planStatus?: string | null, jobState?: string | null, runtimeReady = false, canRetry = true): string {
   if (state === "draft" || state === "intake_in_progress") return "continue_interview";
   if (state === "intake_confirmed") return "request_provisioning";
   // The organizer's own next move, not a wait on someone else.
   if (planStatus === "pending_approval") return "review_plan";
+  // The build gave up after its attempts (worker `_fail`): the organizer can ask for it again (POST .../provisioning-retry).
+  // Never for a retired (torn-down) or suspended trip: a rebuild must not be offered where the route refuses it.
+  if (jobState === "failed" && canRetry && RETRY_FROM_STATES.has(state)) return "retry_provisioning";
   if (["queued", "leased", "running"].includes(jobState ?? "")) return "track_provisioning";
   if (state === "ready_private" || state === "active") return runtimeReady ? "open_trip" : "view_status";
   if (state === "completed" || state === "sealed") return "view_trip";
@@ -593,17 +617,17 @@ function linkView(user: PortalUser): { restorable: boolean; labels: LabelVisibil
 async function tripDetail(deps: PortalDependencies, tripId: string, userId: string, opts: { restorable?: boolean; labels?: LabelVisibility } = {}) {
   const tripResult = await deps.db.query<{
     id: string; title: string | null; destination_label: string | null; start_date: string | null; end_date: string | null;
-    trip_type: string | null; lifecycle_state: string; slug: string; role: string; dashboard_access: boolean; runtime_access: boolean;
+    trip_type: string | null; lifecycle_state: string; slug: string; suspended: boolean; role: string; dashboard_access: boolean; runtime_access: boolean;
   }>(
     `SELECT t.id, t.title, t.destination_label, t.start_date::text, t.end_date::text, t.trip_type,
-            t.lifecycle_state, t.slug, m.role, m.dashboard_access, m.runtime_access
+            t.lifecycle_state, t.slug, (t.suspended_at IS NOT NULL) AS suspended, m.role, m.dashboard_access, m.runtime_access
      FROM control_plane.trips t JOIN control_plane.trip_memberships m ON m.trip_id = t.id
      WHERE t.id = $1 AND m.user_id = $2 AND m.status = 'active'`,
     [tripId, userId],
   );
   const trip = tripResult.rows[0];
   if (!trip) return null;
-  const [planResult, sessionResult, routeResult, invitesResult] = await Promise.all([
+  const [planResult, sessionResult, routeResult, invitesResult, pausedSessionId] = await Promise.all([
     deps.db.query<{ id: string; status: string; digest: string; release_id: string | null; job_state: string | null; safe_error_code: string | null }>(
       `SELECT p.id, p.status, p.digest, p.release_id, j.state AS job_state, j.safe_error_code
        FROM control_plane.plans p
@@ -613,6 +637,8 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
     deps.db.query<{ state: string }>("SELECT state FROM control_plane.runtime_routes WHERE trip_id = $1", [tripId]),
     deps.db.query<{ id: string; intended_display_name: string; runtime_username: string; state: string; expires_at: Date; created_at: Date }>(
       "SELECT id, intended_display_name, runtime_username, state, expires_at, created_at FROM control_plane.site_invites WHERE trip_id = $1 ORDER BY created_at DESC", [tripId]),
+    // Only a trip still being interviewed can be paused; a built one never is, whatever sessions it holds.
+    trip.lifecycle_state === "draft" || trip.lifecycle_state === "intake_in_progress" ? pausedInterviewSessionId(deps.db, tripId) : Promise.resolve(null),
   ]);
   const plan = planResult.rows[0];
   const runtimeReady = routeResult.rows[0]?.state === "ready";
@@ -628,7 +654,10 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
               WHERE i.trip_id = m.trip_id AND i.redeemed_by = m.user_id AND i.state = 'redeemed'
               ORDER BY i.redeemed_at DESC LIMIT 1) AS runtime_username
        FROM control_plane.trip_memberships m JOIN control_plane.users u ON u.id = m.user_id
-      WHERE m.trip_id = $1 AND m.status = 'active' ORDER BY m.created_at, m.id`, [tripId]) : { rows: [] };
+      WHERE m.trip_id = $1 AND m.status = 'active'
+        -- a secondary organizer (#523) is listed, and removed, as one: not as a member the dashboard counts as an organizer
+        AND NOT EXISTS (SELECT 1 FROM control_plane.trip_secondary_organizers so WHERE so.trip_id = m.trip_id AND so.user_id = m.user_id)
+      ORDER BY m.created_at, m.id`, [tripId]) : { rows: [] };
   const isOrganizerSide = (role: string) => role === "owner" || role === "organizer";
   const members = memberRows.rows.map((row) => {
     const others = memberRows.rows.filter((other) => other.user_id !== row.user_id);
@@ -645,7 +674,7 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
     endDate: trip.end_date,
     tripType: trip.trip_type ?? "other",
     lifecycleState: trip.lifecycle_state,
-    nextAction: nextAction(trip.lifecycle_state, plan?.status, plan?.job_state, runtimeReady),
+    nextAction: nextAction(trip.lifecycle_state, plan?.status, plan?.job_state, runtimeReady, !trip.suspended && !trip.slug.startsWith(RETIRED_SLUG_PREFIX)),
     permissions: {
       role: trip.role,
       dashboard: trip.dashboard_access,
@@ -653,7 +682,12 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
       invite: trip.role === "owner" || trip.role === "organizer",
       requestProvisioning: trip.role === "owner",
     },
-    interview: sessionResult.rows[0] ? { sessionId: sessionResult.rows[0].id, state: sessionResult.rows[0].state } : null,
+    // `paused` (#513): the session closed for idleness and nothing else holds the trip, so the page offers a NEW
+    // link rather than "Continue in Telegram" to a chat that has stopped listening. Read from the one definition
+    // `issueEnrollment` and `replaceEnrollment` share, so what the page offers is what the routes will accept.
+    interview: sessionResult.rows[0]
+      ? { sessionId: sessionResult.rows[0].id, state: sessionResult.rows[0].state, paused: pausedSessionId !== null }
+      : null,
     provisioning: plan ? {
       planId: plan.id, planStatus: plan.status, jobState: plan.job_state,
       releaseId: plan.release_id, digest: plan.digest, safeErrorCode: plan.safe_error_code,
@@ -668,6 +702,11 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
       // session is never told which accounts were Unlinked, because it cannot restore one (portal-scope.ts).
       ...(opts.restorable ? { unlinked: (await unlinkedTelegramLinksByTrip(deps.db, userId, [tripId])).get(tripId) ?? [] } : {}),
     },
+    // Secondary organizers (#523), named for the MAIN organizer's page only: an owner on a full session. A Telegram-minted session
+    // is never handed this list (it cannot remove anyone, and the names are display data of other people).
+    ...(opts.restorable && trip.dashboard_access && trip.role === "owner"
+      ? { secondaryOrganizers: await listSecondaryOrganizers(deps.db, tripId) }
+      : {}),
     invites: invitesResult.rows.map((invite) => ({
       id: invite.id, displayName: invite.intended_display_name, runtimeUsername: invite.runtime_username,
       status: invite.state === "unused" && invite.expires_at.getTime() < Date.now() ? "expired" : invite.state,
@@ -1200,6 +1239,10 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
       }
       const active = await client.query("SELECT 1 FROM control_plane.users WHERE id = $1 AND status = 'active' FOR SHARE", [userId]);
       if (!active.rows[0]) { await client.query("ROLLBACK"); return await refuse("ACCOUNT_INACTIVE"); }
+      // The name Google vouches for, signed in the token we just verified, is the name this person gave the product
+      // (#438) -- stored for the account the token resolved to, and only while that account has none of its own.
+      // Whatever else the request carries is not read: the body is never the source of a name.
+      if (identity.givenName) await recordGivenName(client, userId, identity.givenName);
       const session = await createWebSession(client, userId, deps.sessionTtlSeconds);
       await recordFunnelEvent(client, "google_auth", { outcome: "success", userId });
       await client.query("COMMIT");
@@ -1283,7 +1326,40 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     const user = await requireUser(request, reply, deps);
     if (!user) return;
     // `scope: "telegram"` tells the page this session sees only the trips its Telegram account is linked to.
-    return { id: user.id, displayName: user.displayName, scope: user.scope ? "telegram" : "full" };
+    // `needsName`: the dashboard should ask, once, what to call this person -- the interview greets the organizer by
+    // it (#438). Present only when true, so the answer for everyone else keeps the shape it always had. Never for a
+    // Telegram-scoped session: it cannot change the account (`POST /v1/account/name` is account-level), so asking
+    // would offer something that is then refused.
+    const needsName = !user.scope && user.givenName === null && !user.givenNameAsked;
+    return {
+      id: user.id, displayName: user.displayName, scope: user.scope ? "telegram" : "full",
+      ...(needsName ? { needsName: true } : {}),
+    };
+  });
+
+  // The name an organizer gives the product, for the interview to greet them by (#438, AC-11).
+  //   POST /v1/account/name  { displayName }   200 { ok: true }   stores it on the CALLER's own account
+  //   POST /v1/account/name  { dismiss: true } 200 { ok: true }   "not now": the dashboard does not ask again
+  // Exactly those two shapes: any other field is refused rather than ignored, so nothing is accepted by accident.
+  // The account is the session's, never a body field; the name is cleaned like every name (cleanDisplayName). Full
+  // sessions only (portal-scope.ts "account"): a Telegram-minted session cannot rename the account it borrowed.
+  app.post("/v1/account/name", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    const user = await requireMutation(request, reply, deps);
+    if (!user) return;
+    const body = jsonBody(request);
+    const keys = Object.keys(body);
+    const naming = keys.length === 1 && keys[0] === "displayName";
+    const dismissing = keys.length === 1 && keys[0] === "dismiss" && body.dismiss === true;
+    if (!naming && !dismissing) return reply.code(400).send({ error: "INVALID_REQUEST" });
+    if (dismissing) {
+      await deps.db.query("UPDATE control_plane.users SET given_name_asked_at = COALESCE(given_name_asked_at, now()) WHERE id = $1", [user.id]);
+      return { ok: true };
+    }
+    const name = cleanDisplayName(body.displayName);
+    if (name === null) return reply.code(400).send({ error: "INVALID_NAME" });
+    await deps.db.query("UPDATE control_plane.users SET given_name = $2, given_name_asked_at = now() WHERE id = $1", [user.id, name]);
+    return { ok: true };
   });
 
   app.post("/v1/logout", async (request, reply) => {
@@ -1400,14 +1476,54 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     });
   });
 
+  // A TRIP LINK for a secondary organizer (#523): the trip's MAIN organizer (its owner, with dashboard access) hands it to
+  // somebody, who then organizes THIS trip from Telegram and gets its organizer view on the trip site. It MINTS a way into the
+  // trip, so a Telegram-minted (scoped) session may not ask for one - policy "account", a password or Google sign-in only - and a
+  // secondary organizer has no dashboard session at all. Not the owner, not a trip at all, retired: one 404.
+  const secondaryLinkAttempts: Attempts = new Map();
+  app.post("/v1/trips/:id/secondary-organizer-link", async (request, reply) => {
+    const user = await requireMutation(request, reply, deps);
+    if (!user) return;
+    reply.header("cache-control", "private, no-store");
+    if (!admitLogin(secondaryLinkAttempts, user.id, 10)) {
+      return reply.header("retry-after", "60").code(429).send({ error: "RATE_LIMITED" });
+    }
+    const tripId = (request.params as { id?: string }).id ?? "";
+    const issued = await issueSecondaryOrganizerToken(deps.db, { userId: user.id, tripId, ttlSeconds: deps.telegramLinkTtlSeconds });
+    if (!issued.ok) return reply.code(404).send({ error: "NOT_FOUND" });
+    return reply.code(201).send({
+      deepLink: `https://t.me/${deps.telegramBotUsername}?start=${encodeURIComponent(issued.token)}`,
+      expiresAt: issued.expiresAt.toISOString(),
+    });
+  });
+
+  // The main organizer removes a secondary organizer. Effective at once (secondary-organizers.ts `removeSecondaryOrganizer`).
+  app.delete("/v1/trips/:id/secondary-organizers/:secondaryId", async (request, reply) => {
+    const user = await requireMutation(request, reply, deps);
+    if (!user) return;
+    const params = request.params as { id?: string; secondaryId?: string };
+    const removed = await removeSecondaryOrganizer(deps.db, { actorUserId: user.id, tripId: params.id ?? "", secondaryId: params.secondaryId ?? "" });
+    if (!removed.ok) return reply.code(404).send({ error: "NOT_FOUND" });
+    return { status: "removed" };
+  });
+
   // Safe recovery metadata only: the original plaintext enrollment is never
   // persisted, reconstructed, or returned here.
   app.get("/v1/trips/:id/interview-link", async (request, reply) => {
     const user = await requireUser(request, reply, deps); if (!user) return;
     const tripId = (request.params as { id?: string }).id ?? "";
-    const result = await deps.db.query<{ lifecycle_state: string; id: string | null; expires_at: Date | null; has_interview: boolean }>(
+    // A LIVE interview is one the organizer can still answer in: a confirmed one, or one that has not
+    // expired. An unconfirmed session whose `expired_at` is set is closed -- the bot tells whoever writes
+    // to it so -- and counting it made the page offer "Continue in Telegram" to a chat that had stopped
+    // listening (#513). That is the very fact `replaceEnrollment` refuses on (a live or confirmed session
+    // is INTERVIEW_ALREADY_STARTED; a closed one is a paused interview it will replace the link for), so
+    // `has_interview` alone decides `recoverable`: the page must never be offered a replacement the route
+    // would then refuse. `paused` lets an `intake_in_progress` trip be replaceable, as the route allows.
+    const result = await deps.db.query<{ lifecycle_state: string; id: string | null; expires_at: Date | null; has_interview: boolean; paused: boolean }>(
       `SELECT t.lifecycle_state,e.id,e.expires_at,
-         EXISTS(SELECT 1 FROM control_plane.intake_sessions s WHERE s.trip_id=t.id) AS has_interview
+         EXISTS(SELECT 1 FROM control_plane.intake_sessions s WHERE s.trip_id=t.id
+                  AND (s.state='confirmed' OR s.expired_at IS NULL)) AS has_interview,
+         (${pausedInterviewSessionSql("t.id")} IS NOT NULL) AS paused
        FROM control_plane.trips t
        JOIN control_plane.trip_memberships m ON m.trip_id=t.id
        LEFT JOIN control_plane.interview_enrollments e ON e.trip_id=t.id AND e.state='issued' AND e.expires_at>now()
@@ -1415,7 +1531,7 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     const row = result.rows[0]; if (!row) return reply.code(404).send({ error: "NOT_FOUND" });
     return reply.header("cache-control", "private, no-store").send({
       activeEnrollment: row.id ? { id: row.id, expiresAt: row.expires_at!.toISOString() } : null,
-      recoverable: Boolean(row.id) && row.lifecycle_state === "draft" && !row.has_interview,
+      recoverable: Boolean(row.id) && !row.has_interview && (row.lifecycle_state === "draft" || (row.lifecycle_state === "intake_in_progress" && row.paused)),
       hasInterview: row.has_interview,
       telegramChatUrl: `https://t.me/${deps.telegramBotUsername}`,
     });
@@ -1450,6 +1566,52 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     }
     await recordFunnelEvent(deps.db, "provisioning_requested", { userId: user.id, tripId });
     return reply.code(201).send({ planId: generated.planId, digest: generated.planDigest, planStatus: "pending_approval" });
+  });
+
+  // "Try again" on a build that failed for good (the worker used up its attempts: `jobs.state = 'failed'`).
+  // The main organizer only - role 'owner' with dashboard access, as for provisioning-request; a secondary organizer
+  // (#523) holds a runtime-only 'organizer' membership and a member holds neither, so both are refused.
+  //
+  // One tap re-runs the build WITHOUT the review step. Reusing `retryProvision` (the same mechanism as
+  // POST /v1/trips/:id/plan/retry and the admin dashboard's Retry) builds a plan from the same confirmed intake, and
+  // the tap itself is the approval: the organizer already approved this build once and nothing about it has changed
+  // except that it failed, so a second review would only be a second tap for the same decision. If the approval step
+  // somehow fails the new plan is left `pending_approval`, which is the ordinary PlanReview state: recoverable.
+  app.post("/v1/trips/:id/provisioning-retry", async (request, reply) => {
+    const user = await requireMutation(request, reply, deps);
+    if (!user) return;
+    const tripId = (request.params as { id?: string }).id ?? "";
+    const member = await membership(deps, tripId, user.id);
+    if (!member) return reply.code(404).send({ error: "NOT_FOUND" });
+    if (member.role !== "owner" || !member.dashboard_access) return reply.code(403).send({ error: "NOT_OWNER" });
+    // Only a build that has finished failing. The same "latest plan" row `tripDetail` shows the page, so what the
+    // button offers is what the route accepts. A queued, running or pending one is 409: never a second build.
+    // A suspended trip's jobs are not claimed until an admin resumes it, so a retry would sit approved and unseen
+    // and then run unannounced on resume: refused here, and the page does not offer it. (A retired trip is refused
+    // by `retryProvision` itself under its trips lock: TRIP_RETIRED.)
+    const tripState = await deps.db.query<{ suspended: boolean }>("SELECT suspended_at IS NOT NULL AS suspended FROM control_plane.trips WHERE id = $1", [tripId]);
+    if (tripState.rows[0]?.suspended) return reply.code(409).send({ error: "TRIP_SUSPENDED" });
+    const latest = await deps.db.query<{ job_state: string | null }>(
+      `SELECT j.state AS job_state FROM control_plane.plans p
+       LEFT JOIN control_plane.jobs j ON j.plan_id = p.id
+       WHERE p.trip_id = $1 ORDER BY p.created_at DESC LIMIT 1`, [tripId]);
+    if (latest.rows[0]?.job_state !== "failed") return reply.code(409).send({ error: "NOT_FAILED" });
+    const retried = await retryProvision(deps.db, tripId, opaque("corr", 12));
+    if (!retried.ok) {
+      const status = retried.reason === "TRIP_NOT_FOUND" ? 404
+        : retried.reason === "NO_COMPATIBLE_RELEASE" || retried.reason === "ORGANIZER_NOT_ON_ROSTER" ? 422
+        : 409;
+      return reply.code(status).send({ error: retried.reason });
+    }
+    const approval = await issueApproval(deps.db, retried.planId, `user:${user.id}`, deps.approvalTtlSeconds, {
+      operatorChatId: deps.operatorChatId,
+    });
+    if (!approval.ok) {
+      // A plan created a moment ago cannot be refused, so this is a real fault: say so rather than report a success.
+      emailAuthLog(structuredLog("error", "portal.provisioning_retry_approval_failed", { trip_id: tripId, plan_id: retried.planId, reason: approval.reason }));
+      return reply.code(500).send({ error: "APPROVAL_FAILED" });
+    }
+    return reply.code(201).send({ planId: retried.planId, planStatus: "approved", jobId: retried.jobId });
   });
 
   // The organizer reviews the plan they just created, then approves or rejects
@@ -1719,12 +1881,12 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     if (!exchangeKeyMatches(request.headers["x-api-key"], deps.runtimeExchangeKey)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
     const token = (request.body as Record<string, unknown>)?.token;
     if (typeof token !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
-    const result = await deps.db.query<{ id: string; trip_id: string; user_id: string; role: string; runtime_username: string | null; session_id: string | null }>(
+    const result = await deps.db.query<{ id: string; trip_id: string; user_id: string; role: string; dashboard_access: boolean; runtime_username: string | null; session_id: string | null }>(
       `UPDATE control_plane.runtime_launch_grants g SET consumed_at = now()
        FROM control_plane.trip_memberships m
        WHERE g.token_digest = $1 AND g.consumed_at IS NULL AND g.expires_at > now()
          AND m.trip_id = g.trip_id AND m.user_id = g.user_id AND m.status = 'active' AND m.runtime_access = true
-       RETURNING g.id, g.trip_id, g.user_id, g.session_id, m.role,
+       RETURNING g.id, g.trip_id, g.user_id, g.session_id, m.role, m.dashboard_access,
          (SELECT i.runtime_username FROM control_plane.site_invites i
           WHERE i.trip_id = g.trip_id AND i.redeemed_by = g.user_id AND i.state = 'redeemed'
           ORDER BY i.redeemed_at DESC LIMIT 1) AS runtime_username`, [sha256(token)]);
@@ -1733,7 +1895,8 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     // The way back to the dashboard, from this deployment's own configured
     // portal origin (no hostname in code). Only an owner/organizer has a
     // dashboard; the trip still re-checks the role before it serves the URL.
-    const dashboardUrl = row.role === "member" ? null : `${deps.publicOrigin}/trips/${row.trip_id}/setup`;
+    // A secondary organizer (#523) is an 'organizer' with NO dashboard access: no way back to a dashboard they cannot open.
+    const dashboardUrl = row.role === "member" || !row.dashboard_access ? null : `${deps.publicOrigin}/trips/${row.trip_id}/setup`;
     return { tripId: row.trip_id, userId: row.user_id, role: row.role, runtimeUsername: row.runtime_username, dashboardUrl, sessionId: row.session_id, audience: "runtime_gateway" };
   });
 

@@ -251,6 +251,14 @@ describe("validateAssistantEvent", () => {
     }
   });
 
+  test("stop tools are on the tool allow-list (#419), so a live call emits tool_call_completed", () => {
+    for (const toolName of ["get_stops", "update_stop", "split_stop", "set_stop_from_booking", "move_plan_day", "plan_open_days"]) {
+      assert.ok((TOOL_NAMES as readonly string[]).includes(toolName), `${toolName} missing from TOOL_NAMES`);
+      const result = validateAssistantEvent(toolCallCompleted({ tool_name: toolName }));
+      assert.ok(result.ok, `${toolName}: ${JSON.stringify(result)}`);
+    }
+  });
+
   test("tool_name is null, never required, for every OTHER event type", () => {
     const result = validateAssistantEvent(valid({ tool_name: undefined }));
     assert.ok(result.ok, JSON.stringify(result));

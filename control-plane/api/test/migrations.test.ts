@@ -106,6 +106,10 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "20261023130000_telegram_link_restore.sql",
       "20261023140000_portal_email_auth.sql",
       "20261024100000_google_signin_nonces.sql",
+      "20261030120000_account_given_name.sql",
+      "20261106120000_organizer_link_requests.sql",
+      "20261106130000_organizer_link_scope.sql",
+      "20261107120000_main_telegram_and_secondary_organizers.sql",
     ]);
     assert.deepEqual(await applyMigrations(client, migrationsDir), []);
     const tables = await client.query("SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema = 'control_plane'");
@@ -192,6 +196,10 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "20261023130000_telegram_link_restore.sql",
       "20261023140000_portal_email_auth.sql",
       "20261024100000_google_signin_nonces.sql",
+      "20261030120000_account_given_name.sql",
+      "20261106120000_organizer_link_requests.sql",
+      "20261106130000_organizer_link_scope.sql",
+      "20261107120000_main_telegram_and_secondary_organizers.sql",
     ]);
   } finally {
     await reset(client);
@@ -532,6 +540,55 @@ test("20260922060001 gives an invited account with no rival an identity of its o
     const stale = await client.query<{ status: string }>("SELECT status FROM control_plane.users WHERE id = $1", [invitedUser]);
     assert.equal(stale.rows[0].status, "active");
   } finally {
+    client.release();
+    await pool.end();
+  }
+});
+
+test("20261106130000 narrows every link that came from a dashboard one-time link to its own trip, restores of it included", { skip: !databaseUrl }, async () => {
+  const pool = testPool();
+  const client = await pool.connect();
+  try {
+    await reset(client);
+    assert.ok((await applyMigrations(client, migrationsDir)).includes("20261106130000_organizer_link_scope.sql"));
+    // Un-apply it, so the rows below are what a database looked like BEFORE the column existed.
+    await client.query("ALTER TABLE control_plane.telegram_organizer_trip_links DROP COLUMN binding_scope");
+    await client.query("DELETE FROM public.control_plane_schema_migrations WHERE version = '20261106130000_organizer_link_scope.sql'");
+
+    const user = "user_" + "1".repeat(32);
+    const trip = "trip_" + "2".repeat(32);
+    await client.query("INSERT INTO control_plane.users(id, status, display_name) VALUES ($1,'active','Owner')", [user]);
+    await client.query("INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ($1,$2,'draft')", [trip, "scope-" + trip.replace(/_/g, "-")]);
+    const digest = (c: string) => "sha256:" + c.repeat(64);
+    const link = (id: string, d: string, via: string, restoredTo: string | null, live: boolean) => client.query(
+      `INSERT INTO control_plane.telegram_organizer_trip_links
+         (id, user_id, trip_id, telegram_subject_digest, verified_via, revoked_at, revoked_reason, restored_at, restored_by, restored_link_id)
+       VALUES ($1,$2,$3,$4,$5, ${live ? "NULL" : "now()"}, ${live ? "NULL" : "'owner_unlinked'"},
+               ${restoredTo ? "now()" : "NULL"}, ${restoredTo ? "$2" : "NULL"}, $6)`,
+      [id, user, trip, digest(d), via, restoredTo]);
+    // 'a': one-time link, unlinked, restored once. 'b': one-time link, restored, unlinked, restored again (a chain).
+    // 'c': an ordinary redemption, unlinked, restored. 'd': a live one-time link. 'e': a live ordinary redemption.
+    await link("otl_a1aaaaaaaa", "a", "dashboard_link_token", "otl_a2aaaaaaaa", false);
+    await link("otl_a2aaaaaaaa", "a", "dashboard_restore", null, true);
+    await link("otl_b1bbbbbbbb", "b", "dashboard_link_token", "otl_b2bbbbbbbb", false);
+    await link("otl_b2bbbbbbbb", "b", "dashboard_restore", "otl_b3bbbbbbbb", false);
+    await link("otl_b3bbbbbbbb", "b", "dashboard_restore", null, true);
+    await link("otl_c1cccccccc", "c", "enrollment_redemption", "otl_c2cccccccc", false);
+    await link("otl_c2cccccccc", "c", "dashboard_restore", null, true);
+    await link("otl_d1dddddddd", "d", "dashboard_link_token", null, true);
+    await link("otl_e1eeeeeeee", "e", "enrollment_redemption", null, true);
+
+    assert.deepEqual(await applyMigrations(client, migrationsDir), ["20261106130000_organizer_link_scope.sql"]);
+    const scopes = await client.query<{ id: string; binding_scope: string }>("SELECT id, binding_scope FROM control_plane.telegram_organizer_trip_links ORDER BY id");
+    assert.deepEqual(Object.fromEntries(scopes.rows.map((r) => [r.id, r.binding_scope])), {
+      otl_a1aaaaaaaa: "trip", otl_a2aaaaaaaa: "trip",
+      otl_b1bbbbbbbb: "trip", otl_b2bbbbbbbb: "trip", otl_b3bbbbbbbb: "trip",
+      otl_c1cccccccc: "account", otl_c2cccccccc: "account",
+      otl_d1dddddddd: "trip",
+      otl_e1eeeeeeee: "account",
+    });
+  } finally {
+    await reset(client);
     client.release();
     await pool.end();
   }

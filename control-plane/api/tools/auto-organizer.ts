@@ -35,6 +35,8 @@ import {
   type ChaosMove,
 } from "./organizer-chaos.js";
 import {
+  APPLY_CHANGE_DATA,
+  GATECITY_SCENARIO,
   STAR_SCENARIO,
   buildFindings,
   choiceAnswer,
@@ -51,11 +53,14 @@ const token = arg("token");
 const chatId = arg("chat", "9000000000001");
 const telegram = arg("telegram", "http://127.0.0.1:4399").replace(/\/+$/, "");
 const docsDir = arg("docs");
+/** The directory of ticket photos a `photos` scenario sends as one album. */
+const photosDir = arg("photos");
 /** The organizer who does not follow — see tools/organizer-chaos.ts. */
 const chaos = scenarioName === "chaos";
 // A chaos run reads documents in the middle of other questions and gets
-// re-asked on purpose, so each turn and the whole run get more time.
-const turnSeconds = Number(arg("turn-seconds", chaos ? "480" : "240"));
+// re-asked on purpose, so each turn and the whole run get more time. So does a
+// run that sends photos: each is read by looking at it, not from a text layer.
+const turnSeconds = Number(arg("turn-seconds", chaos ? "480" : scenarioName === "gatecity" ? "420" : "240"));
 const totalMinutes = Number(arg("minutes", chaos ? "60" : "30"));
 const reportPath = arg("report");
 /** Where to write what this organizer observed about itself (see buildFindings). */
@@ -72,6 +77,7 @@ const databaseUrl = process.env.CONTROL_PLANE_DATABASE_URL;
 // a test can import them: this file runs an interview the moment it loads.
 const SCENARIOS: Record<string, Scenario> = {
   star: STAR_SCENARIO,
+  gatecity: GATECITY_SCENARIO,
   japan: {
     language: "he",
     documents: true,
@@ -330,6 +336,9 @@ async function type(text: string, languageCode: string): Promise<void> {
 }
 
 const MIME: Record<string, string> = {
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".png": "image/png",
   ".pdf": "application/pdf",
   ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -399,6 +408,12 @@ async function answer(q: IntakeQuestion, s: Scenario, suggestions: SessionView["
   // an outright accept (2026-09-13) — see organizer-suggestions.ts.
   const suggested = suggestionTapData(q, suggestions);
   if (suggested) {
+    // Already answered as an offer (tapOffer): the same button is not tapped twice.
+    const carrier = await messageWith(suggested);
+    if (carrier !== null && tappedOffers.has(carrier)) {
+      asked.add(q.id);
+      return true;
+    }
     if (!(await tap(suggested))) return notYet();
     asked.add(q.id);
     return true;
@@ -462,10 +477,83 @@ async function answer(q: IntakeQuestion, s: Scenario, suggestions: SessionView["
   return true;
 }
 
+// ── What a photo scenario adds: an album, offers, a correction at the summary ─
+
+/** What this organizer reports about the run, beyond typed fallbacks — written to --findings. */
+const extras: Record<string, unknown> = {};
+/** Offers tapped so far, by the message that carried them: an offer is answered once. */
+const tappedOffers = new Set<number>();
+const offersTapped: string[] = [];
+let offerGraceSpent = false;
+const summaryChange = { sent: false };
+
+/** The highest sequence number the stand-in has handed out for this chat so far. */
+async function lastSeq(): Promise<number> {
+  return Math.max(0, ...(await botMessages()).map((m) => m.seq));
+}
+
+/** Taps an offer the interview made outside any question, once per message that carries it. */
+async function tapOffer(data: string): Promise<boolean> {
+  const messageId = await messageWith(data);
+  if (messageId === null || tappedOffers.has(messageId)) return false;
+  tappedOffers.add(messageId);
+  offersTapped.push(data);
+  say(`  YOU tap (offer): ${data}`);
+  await control("tap", { chatId, messageId, data });
+  return true;
+}
+
+/** The newest Apply button the bot put up since `afterSeq` — a drafted change waiting for a yes. */
+async function tapApply(afterSeq: number): Promise<boolean> {
+  const all = await botMessages();
+  for (let i = all.length - 1; i >= 0 && all[i]!.seq > afterSeq; i -= 1) {
+    const apply = all[i]!.buttons.find((b) => APPLY_CHANGE_DATA.test(b.data));
+    if (apply) return await tap(apply.data);
+  }
+  return false;
+}
+
+/** Whether the summary has been put on screen again since `afterSeq`. */
+async function summaryShownAgain(afterSeq: number): Promise<boolean> {
+  return (await botMessages()).some((m) => m.seq > afterSeq && m.buttons.some((b) => b.data === "c:confirm"));
+}
+
+/**
+ * The correction at the summary, in words. The interview answers it either with
+ * a drafted change to apply (a button) or by applying it outright and showing
+ * the summary again; both end with the summary on screen, to be confirmed. What
+ * happened is reported (`summary_change.via`), and whether it WORKED is judged
+ * on the finished trip, not here.
+ */
+async function correctSummary(text: string): Promise<void> {
+  const since = await lastSeq();
+  const before = fingerprint(await view());
+  await type(text, phoneLanguage);
+  await settle(before, "the correction at the summary", since);
+  let via = "none";
+  for (const deadline = Date.now() + 60_000; Date.now() < deadline;) {
+    const beforeTap = await lastSeq();
+    if (await tapApply(since)) {
+      via = "apply_button";
+      await settle(fingerprint(await view()), "applying the correction", beforeTap);
+      break;
+    }
+    if (await summaryShownAgain(since)) { via = "applied_directly"; break; }
+    await sleep(3000);
+    await drain();
+  }
+  if (via === "none") say("  FINDING: the correction got neither a button to apply nor a new summary within 60s; confirming anyway");
+  extras.summary_change = { text, via };
+}
+
 async function main(): Promise<number> {
   const s = SCENARIOS[scenarioName];
   if (!s || !token || !databaseUrl) {
-    console.error("usage: CONTROL_PLANE_DATABASE_URL=… auto-organizer.ts --scenario japan|multi|manual|chaos|vietnam|star --token T [--docs DIR] [--report FILE] [--findings FILE]");
+    console.error("usage: CONTROL_PLANE_DATABASE_URL=… auto-organizer.ts --scenario japan|multi|manual|chaos|vietnam|star|gatecity --token T [--docs DIR | --photos DIR] [--report FILE] [--findings FILE]");
+    return 2;
+  }
+  if (s.photos && !photosDir) {
+    console.error(`--scenario ${scenarioName} sends photos and needs --photos <dir of .jpg/.png files>`);
     return 2;
   }
   const deadline = Date.now() + totalMinutes * 60_000;
@@ -489,6 +577,20 @@ async function main(): Promise<number> {
       });
     }
     v = await settle(before, `${files.length} document(s)`);
+  } else if (s.photos) {
+    // The photos are the documents, sent the way a person sends several from
+    // the camera roll: ONE album, which Telegram delivers as one message per
+    // photo joined by a media_group_id (fake-telegram.ts /_control/album).
+    const files = (await readdir(photosDir)).filter((f) => /\.(jpe?g|png)$/i.test(f)).sort();
+    if (files.length === 0) throw new Stalled(`no .jpg/.png photos in ${photosDir}`);
+    const before = fingerprint(v);
+    extras.album_after_seq = await lastSeq();
+    say(`  YOU send an album of ${files.length} photos: ${files.join(", ")}`);
+    await control("album", {
+      chatId, languageCode: phoneLanguage,
+      photos: await Promise.all(files.map(async (f) => ({ base64: (await readFile(join(photosDir, f))).toString("base64") }))),
+    });
+    v = await settle(before, `an album of ${files.length} photos`);
   } else {
     for (let n = 0; chaos && chaosMove("opening", n); n += 1) {
       await perform(chaosMove("opening", n)!, "opening", fingerprint(await view()));
@@ -509,7 +611,32 @@ async function main(): Promise<number> {
     if (v.state === "confirmed") break;
     const before = fingerprint(v);
 
+    // An offer was just answered, so what `v` says is already out of date: read it again.
+    let answeredOffer = false;
+    for (const data of s.tapOffers ?? []) {
+      if (await tapOffer(data)) answeredOffer = true;
+    }
+    if (answeredOffer) { await sleep(2500); await drain(); continue; }
+
     if (v.state === "awaiting_confirmation") {
+      // The second ticket's offer can land after the questions are done. A
+      // summary confirmed without it is a different trip, so wait for it — but
+      // only so long: an offer that never comes is reported, not waited on.
+      if (s.tapOffers?.length && offersTapped.length === 0 && !offerGraceSpent) {
+        for (const until = Date.now() + 90_000; Date.now() < until && offersTapped.length === 0;) {
+          for (const data of s.tapOffers) await tapOffer(data);
+          if (offersTapped.length === 0) { await sleep(3000); await drain(); }
+        }
+        offerGraceSpent = true;
+        if (offersTapped.length === 0) say(`  FINDING: ${s.tapOffers.join(", ")} was never offered; confirming without it`);
+        else { await sleep(2500); await drain(); }
+        continue;
+      }
+      if (s.summaryChange && !summaryChange.sent) {
+        summaryChange.sent = true;
+        await correctSummary(s.summaryChange);
+        continue;
+      }
       if (!(await tap("c:confirm"))) { await sleep(2000); await drain(); continue; }
       await settle(before, "confirm");
       continue;
@@ -570,7 +697,12 @@ async function main(): Promise<number> {
     asked: [...asked], unknownTelegramMethods: unknown }));
   // Always written when asked for, even if empty: a missing file must mean
   // "the organizer died", never "nothing to report".
-  if (findingsPath) await writeFile(findingsPath, JSON.stringify(buildFindings(typedFallbacks)));
+  // `asked` is what the e2e judges "was a seeded question asked again" from.
+  if (findingsPath) {
+    await writeFile(findingsPath, JSON.stringify({
+      ...buildFindings(typedFallbacks), asked: [...asked], offers_tapped: offersTapped, ...extras,
+    }));
+  }
   if (!chaos) return 0;
 
   const intake = await pool.query(

@@ -9,6 +9,13 @@ the owner's notes vault, `insights/2026-10-18-vm-upgrade-debrief.md`). That
 incident was resolved by hand; this document is about not needing hands next
 time.
 
+Status: **pulled into Sprint 7 in part (2026-10-19, Dror)** — the switch
+phase restarts every Hermes gateway (#420), verify checks tool registration
+for every profile (#294, #289), and a failed verify retries once and then rolls
+back automatically. See Sprint 7 Track 2 in `docs/onboarding-mvp-sprint-plan.md`.
+GHCR images and the offer/gate flow stay future, and this document stays here
+for them.
+
 ## Where things stand today
 
 `kinerary-cp-release` (`control-plane/deployment/vm-release.py`) is a real,

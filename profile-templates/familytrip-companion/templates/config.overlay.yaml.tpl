@@ -92,9 +92,28 @@ agent:
   #
   # `file` and `memory` stay: the companion reads its own references and
   # remembers its family. `cronjob` stays too — trip reminders are the job.
+  #
+  # `computer_use` and `browser` go for the same reason (#547, 2026-11-12). The
+  # `hermes-telegram` bundle includes them, and Hermes's resolver gave this
+  # overlay 18 browser_* tools (navigate/click/type, a CDP escape, a password-vault
+  # unlock) and `computer_use` (screenshots, mouse, keyboard). A tester pasted a
+  # Terminal command into a companion's private chat and the companion reached for
+  # `computer_use` to run it: text a traveller types must never be one model turn
+  # from driving a desktop. It failed that time only because cua-driver was not
+  # installed on the host. The companion reads the web through `web_search` /
+  # `web_extract` (the `web` toolset, which stays); it has never called a
+  # browser_* tool.
+  #
+  # `connections` (`manage_connections`) goes too: a tool that can authorise and
+  # install a connector, which, if connectors ever become available on a host,
+  # would add an MCP server with no approval card in a chat anyone in the family
+  # can type into. A companion has no use for it.
   disabled_toolsets:
     - terminal
     - code_execution
+    - computer_use
+    - browser
+    - connections
 
 # `write_file`, `patch` and `skill_manage` are deliberately NOT in
 # disabled_toolsets above — the companion still needs read_file,
@@ -121,6 +140,22 @@ agent:
 # nothing legitimate ever writes into, so a write anywhere else — another
 # profile's config.yaml, this profile's own skill files — is hard-denied by
 # Hermes itself (agent/file_safety.py) rather than staged.
+#
+# `skill_manage` itself cannot be taken out of the tool list from config: it
+# lives in the `skills` toolset beside `skill_view` (which the companion reads its
+# skills through), `disabled_toolsets` removes whole toolsets only, and Hermes has
+# no per-tool deny (#547). Hermes's own post-turn skill review ("review the
+# conversation and update the skill library", origin=background_review) is LEFT ON
+# on purpose (Dror, 2026-11-12: the companion is meant to evolve through the trip).
+# Be plain about what that is: the review drafts skills FROM CONVERSATION TEXT,
+# which is traveller-typed. `write_approval` below is the ONLY barrier between a
+# draft and the companion's own skills, so it is not a setting to relax in passing:
+# on 2026-11-12 the review's `skill_manage` call "completed" in the log and changed
+# nothing on disk, because it was staged (pending/skills/<id>.json). A known gap in
+# this barrier is tracked privately. Whether the hold stays or becomes automatic
+# apply is a separate decision; do not change this key as a side effect of
+# anything else. (The same review also drafts MEMORY from the conversation, and
+# `memory.write_approval` is not set here, so those writes apply.)
 skills:
   write_approval: true
 
@@ -194,3 +229,13 @@ onboarding:
 # control-plane/api/src/relay/internal-leak.ts.
 compression:
   codex_gpt55_autoraise_notice: false
+
+# Each companion is its own gateway process, one per profile, as on the Mac's
+# launch agents. Hermes 0.21 (4097709b0c) starts ONE combined gateway per
+# container unless a profile opts out with this key, and the VM's container has
+# no relay settings on that combined gateway, so a profile without it would go
+# silent after the next container restart, with no error (2026-11-13, the
+# Sprint 8 VM release). 0.20.5 ignores the key. Upstream calls it a transition
+# shim; the control-plane-owned answer to "which gateways run" is #349.
+gateway:
+  standalone: true

@@ -626,6 +626,15 @@ REVOKE_GROUP_TOKENS = ("UPDATE control_plane.telegram_group_binding_tokens SET e
 
 
 def retire_in_db(trip: dict) -> str:
+    # LOCK ORDER (issue #387), both branches: group-binding tokens, intake
+    # sessions, chat bindings, `trips` (rename branch), then the teardown-pin
+    # clear LAST. It must agree with `executeClear` (control-plane/api/src/
+    # trip-clear.ts: tokens, enrollments, sessions, bindings, `trips` LAST) and
+    # `redeemGroupBindingToken` (token row first). The sessions used to be
+    # closed AFTER the `trips` slug update - the opposite of executeClear - and
+    # the two met in a real 40P01 on a trip with a live unconfirmed session.
+    # The pin clear touches `companion_gateways` only and has no order against
+    # `trips`; keep it the last statement (#349/#461).
     if trip["slug"].startswith("retired-"):
         # One transaction, not three bare calls: three separate `psql()`
         # calls can die between any two of them, and a process that dies
@@ -638,9 +647,9 @@ def retire_in_db(trip: dict) -> str:
         # redeemGroupBindingToken.
         psql(f"""BEGIN;
 {REVOKE_GROUP_TOKENS.format(id=trip['id'])};
+{CLOSE_SESSIONS.format(id=trip['id'])};
 UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed'
  WHERE trip_id = '{trip['id']}' AND closed_at IS NULL;
-{CLOSE_SESSIONS.format(id=trip['id'])};
 {CLEAR_TEARDOWN_PIN.format(id=trip['id'])};
 COMMIT;""")
         return trip["slug"]
@@ -652,11 +661,11 @@ COMMIT;""")
         new = f"{base}-{n}"
     psql(f"""BEGIN;
 {REVOKE_GROUP_TOKENS.format(id=trip['id'])};
+{CLOSE_SESSIONS.format(id=trip['id'])};
 UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed'
  WHERE trip_id = '{trip['id']}' AND closed_at IS NULL;
 UPDATE control_plane.trips SET slug = '{new}', updated_at = now()
  WHERE id = '{trip['id']}' AND slug = '{trip['slug']}';
-{CLOSE_SESSIONS.format(id=trip['id'])};
 {CLEAR_TEARDOWN_PIN.format(id=trip['id'])};
 COMMIT;""")
     return new

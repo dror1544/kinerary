@@ -102,6 +102,9 @@ export const PORTAL_SCOPE_POLICY: Readonly<Record<string, RouteScope>> = Object.
   "GET /v1/trips": "filtered",
 
   "POST /v1/trips": "account",
+  // The name the interview greets the organizer by. It changes the ACCOUNT, which a Telegram-minted session only
+  // borrows: a password or Google sign-in only (#438).
+  "POST /v1/account/name": "account",
   "POST /v1/site-invites/redeem": "account",
 
   "DELETE /v1/account/telegram-links/:linkId": "link",
@@ -118,7 +121,13 @@ export const PORTAL_SCOPE_POLICY: Readonly<Record<string, RouteScope>> = Object.
   "POST /v1/trips/:id/interview-link": "account",
   "POST /v1/trips/:id/interview-link/replace": "account",
   "POST /v1/trips/:id/telegram-link": "account",
+  // A trip link for a secondary organizer (#523) mints a way into the trip, and removing one takes it from another person: a
+  // password or Google sign-in only, like the site invites below.
+  "POST /v1/trips/:id/secondary-organizer-link": "account",
+  "DELETE /v1/trips/:id/secondary-organizers/:secondaryId": "account",
   "POST /v1/trips/:id/provisioning-request": "trip",
+  // "Try again" on a build that failed for good: the same decision, by the same main organizer, as provisioning-request and approve above.
+  "POST /v1/trips/:id/provisioning-retry": "trip",
   "POST /v1/trips/:id/plans/:planId/approve": "trip",
   "POST /v1/trips/:id/plans/:planId/reject": "trip",
   // A site invite is a join URL that anyone can redeem anonymously with a password: it makes an account

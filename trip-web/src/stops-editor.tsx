@@ -14,9 +14,9 @@ import { useLiveEditGuard } from "./live-updates";
 import { type Lang, tr } from "./parity-ui";
 import {
   bilingualFromInputs, bilingualText, describeStopError, editableAccommodation, getStopHistory, getStops,
-  inputsFromBilingual, patchStop, revertStop, splitStop, stopTitle, STOP_CHANGE_KEYS,
+  inputsFromBilingual, linkBookingToStop, patchStop, revertStop, splitStop, stopTitle, STOP_CHANGE_KEYS,
   type StopAccommodation, type StopDates, type StopEntry, type StopFields, type StopHistoryEntry,
-  type StopRefusal, type StopsPayload,
+  type StopRefusal, type StopsPayload, type UnlinkedHotel,
 } from "./stops";
 
 // What the organizer types is what is sent: a `"` in Hebrew (ארה"ב, ת"א) or
@@ -381,6 +381,35 @@ function HistoryPanel({ entry, payload, lang, onClose, reload }: { entry: StopEn
   );
 }
 
+// A hotel booking that is on Reservations and on no stop (#419). The booking
+// alone never moves a stop, so nothing here links it by itself: the organizer
+// taps once, and it is the same call the companion makes.
+function UnlinkedHotelNotice({ hotel, entry, payload, lang, reload }: {
+  hotel: UnlinkedHotel; entry: StopEntry; payload: StopsPayload; lang: Lang; reload: () => unknown;
+}) {
+  const write = useStopWrite(lang);
+  const title = stopTitle(entry.stop, lang);
+  const current = entry.stop.accommodation ? bilingualText(entry.stop.accommodation.name, lang) || entry.stop.accommodation.name_en : "";
+  const send = (onOutside?: string) =>
+    linkBookingToStop(entry.id, onOutside ? { booking_id: hotel.id, on_outside: onOutside } : { booking_id: hotel.id }, payload.revision);
+  return (
+    <div role="group" aria-label={hotel.name} className="stop-hint stop-unlinked-hotel">
+      <p>
+        {tr(lang, "Booked, but not on the plan yet", "הוזמן, אבל עדיין לא במסלול")}: <bdi>{hotel.name}</bdi>{" "}
+        <bdi dir="ltr">{hotel.date_from} – {hotel.date_to}</bdi>
+      </p>
+      {current ? <p>{tr(lang, `Linking it replaces ${current} as this stop's hotel.`, `הקישור יחליף את ${current} כלינה של התחנה.`)}</p> : null}
+      <div className="parity-actions">
+        <button type="button" disabled={write.pending} onClick={() => write.run(send)}>
+          {tr(lang, `Use this hotel for ${title}`, `להשתמש במלון הזה עבור ${title}`)}
+        </button>
+      </div>
+      <Refusal refusal={write.refusal} lang={lang} stopId={entry.id} stops={payload.stops} onRetry={write.retry} onReload={reload} />
+      {write.pending ? <p role="status">{tr(lang, "Saving…", "שומר…")}</p> : null}
+    </div>
+  );
+}
+
 type Open = { kind: "edit" | "split" | "history"; id: string } | null;
 
 function StopRow({ entry, payload, lang, open, setOpen, reload }: {
@@ -406,6 +435,9 @@ function StopRow({ entry, payload, lang, open, setOpen, reload }: {
       )}
       {entry.override ? <p className="stop-hint">{tr(lang, `Changed on the site by ${entry.override.updated_by}`, `שונה באתר על ידי ${entry.override.updated_by}`)}{entry.kind === "added" ? tr(lang, " (a stop added on the site)", " (תחנה שנוספה באתר)") : ""}</p> : null}
       {entry.booking_out_of_sync ? <p className="stop-hint">{tr(lang, "The linked hotel booking's dates no longer match this stop.", "תאריכי הזמנת המלון המקושרת כבר לא תואמים את התחנה.")}</p> : null}
+      {!entry.unplanned ? (entry.unlinked_hotel_bookings || []).map((hotel) => (
+        <UnlinkedHotelNotice key={hotel.id} hotel={hotel} entry={entry} payload={payload} lang={lang} reload={reload} />
+      )) : null}
       {entry.conflict ? <Conflict entry={entry} payload={payload} lang={lang} reload={reload} /> : null}
       {notice ? <p role="status">{notice}</p> : null}
       {!entry.unplanned ? (

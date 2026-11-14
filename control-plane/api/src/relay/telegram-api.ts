@@ -90,8 +90,11 @@ export const RETRY_AFTER_CAP_SECONDS = 3;
  * follows a hang. The worst is a connector MarkdownV2 send - a 429, a 3 s wait,
  * then a parse error; then the plain-text fallback with a 429, a 3 s wait and a
  * 10 s hang - about 16 s plus round trips. That is under the 30 s a Hermes gateway
- * waits for an outbound send (`_OUTBOUND_TIMEOUT_S = 30.0`), a figure read only in
- * the Mac's Hermes checkout (`ab0d98414`), not in the VM's image.
+ * waits for an outbound send (`_OUTBOUND_TIMEOUT_S = 30.0`). That figure is not
+ * re-read by hand: it is captured from Hermes' source into
+ * `test/fixtures/hermes-mirror.json` (`outbound_timeout_seconds`, at the revision
+ * `hermes-patches/BASE_REV` pins), and `test/hermes-mirror.test.ts` (AC-3) fails
+ * if this arithmetic stops being below it.
  *
  * A constant, not a setting: nothing about a deployment makes Telegram slower.
  */

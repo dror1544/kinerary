@@ -64,8 +64,49 @@ class Tests(unittest.TestCase):
   # companion still needs (file/memory/cronjob/skills).
   td,o,c=self.go(); self.addCleanup(td.cleanup); self.assertEqual(c.returncode,0,c.stderr)
   overlay=yaml.safe_load((o/'config.overlay.yaml').read_text())
-  self.assertEqual(overlay['skills'],{'write_approval':True})
-  self.assertEqual(overlay['agent']['disabled_toolsets'],['terminal','code_execution'])
+  self.assertIs(overlay['skills']['write_approval'],True)
+  disabled=overlay['agent']['disabled_toolsets']
+  # #547: the toolsets this change adds must not take the ones the companion needs with them.
+  for keep in ('file','memory','cronjob','skills','web'): self.assertNotIn(keep,disabled)
+ def test_rendered_overlay_exposes_no_desktop_or_browser_control(self):
+  # #547 (2026-11-12, Sprint 8 staging): a tester pasted a Terminal command into a
+  # companion's private chat; it called `computer_use`. Resolving the pre-#547
+  # overlay through Hermes's resolver gave 38 tools including computer_use and 18
+  # browser_*; it must now give none. `skill_manage` cannot be dropped by toolset
+  # (shared `skills` toolset with skill_view) and Hermes's background skill review
+  # stays ON by decision; skill writes are held by write_approval, asserted in
+  # test_rendered_overlay_gates_skill_manage_writes.
+  td,o,c=self.go(); self.addCleanup(td.cleanup); self.assertEqual(c.returncode,0,c.stderr)
+  overlay=yaml.safe_load((o/'config.overlay.yaml').read_text())
+  disabled=overlay['agent']['disabled_toolsets']
+  for ts in ('terminal','code_execution','computer_use','browser','connections'): self.assertIn(ts,disabled)
+ HERMES_PY=Path.home()/'.hermes'/'hermes-agent'/'venv'/'bin'/'python'
+ @unittest.skipUnless(HERMES_PY.exists(),'no Hermes install on this machine (CI): config-level assertions above still run')
+ def test_rendered_overlay_resolves_to_no_desktop_browser_or_connector_tool_in_hermes(self):
+  # The same claim against Hermes's real resolver, before check_fn filtering, so the
+  # answer does not depend on whether this machine happens to have cua-driver or a
+  # browser installed (the tool was reachable on the staging Mac; it failed only
+  # because its backend was unavailable).
+  td,o,c=self.go(); self.addCleanup(td.cleanup); self.assertEqual(c.returncode,0,c.stderr)
+  cfg=yaml.safe_load((o/'config.overlay.yaml').read_text()); cfg.pop('mcp_servers',None)
+  home=Path(td.name)/'hermes-home'; home.mkdir(); (home/'config.yaml').write_text(yaml.safe_dump(cfg))
+  prog=('import sys,json,yaml\n'
+        'sys.path.insert(0,sys.argv[1])\n'
+        'from hermes_cli.tools_config import _get_platform_tools\n'
+        'import model_tools\n'
+        'cfg=yaml.safe_load(open(sys.argv[2]))\n'
+        'dis=(cfg.get("agent") or {}).get("disabled_toolsets")\n'
+        'out={p:sorted(model_tools._select_tool_names(sorted(_get_platform_tools(cfg,p)),dis,True)) for p in ("telegram","cron")}\n'
+        'print("RESOLVED"+json.dumps(out))\n')
+  env={'PATH':'/usr/bin:/bin','HOME':td.name,'HERMES_HOME':str(home)}
+  r=subprocess.run([str(self.HERMES_PY),'-c',prog,str(Path.home()/'.hermes'/'hermes-agent'),str(home/'config.yaml')],text=True,capture_output=True,env=env)
+  self.assertEqual(r.returncode,0,r.stderr[-800:])
+  got=json.loads(r.stdout.split('RESOLVED',1)[1])
+  for plat,names in got.items():
+   self.assertGreater(len(names),5,plat)  # not vacuous: the tools it needs are still there
+   for need in ('skill_view','read_file','web_search','memory'): self.assertIn(need,names,plat)
+   bad=[n for n in names if n in ('computer_use','manage_connections') or n.startswith('browser_') or n in ('terminal','execute_code')]
+   self.assertEqual(bad,[],plat)
  def test_rendered_overlay_silences_the_codex_autoraise_notice(self):
   # #65: Hermes replays "auto-compaction was raised ..." (naming the model and
   # a `hermes config set` command) into the FIRST group reply of every fresh
@@ -85,6 +126,54 @@ class Tests(unittest.TestCase):
   self.assertIs(overlay['display']['suppress_warning_notifications'],True)
   soul=(o/'SOUL.md').read_text()
   self.assertLess(len(soul),overlay['context_file_max_chars'],'SOUL.md outgrew the pinned context_file_max_chars: raise it in config.overlay.yaml.tpl or trim the file')
+ # Issue #418. The companion promised "I'll handle it with you privately" in the
+ # group (france-2026, 2026-10-18) and nothing could keep the promise: it has no
+ # tool that opens a conversation. The instruction lived in the SOUL and in three
+ # skills; these tests read the RENDERED text of every variant, every file.
+ NO_FOLLOW_UP_PHRASES=('pick it up privately','take it up with them privately','taken up with them privately','continue in the organizer-private channel','take them to the organizer-private channel','offer the stop link to the organizer privately','present a summary to the organizer privately','privately with the organizer','בפרטי')
+ # Every remaining "privately" in the rendered bundle, named. None is an answer
+ # to a group message: a rule about whom to message, briefing delivery (the
+ # person chooses it), the organizer's own instruction, and a failure report to
+ # the organizer that the group never sees, and the SOUL's account of the
+ # 2026-09-13 approval loop (history, not an instruction to anyone).
+ PRIVATELY_ALLOWED=('Do not privately message ordinary participants','the organizer approved privately and was told','Organizer only**: send privately to','If the organizer tells you privately','Report failures privately to the authorized organizer')
+ def test_no_group_reply_promises_a_private_follow_up(self):
+  for lang in ('he','en'):
+   for gender in ('male','female','neutral'):
+    for tone in ('warm','playful','dry'):
+     d=json.loads((ROOT/'example.handoff.json').read_text()); d['trip']['default_language']=lang; d['assistant']['gender']=gender; d['assistant']['tone']=tone
+     td,o,c=self.go(d); self.addCleanup(td.cleanup); self.assertEqual(c.returncode,0,c.stderr)
+     files=sorted(o.rglob('*.md')); self.assertTrue(any(f.name=='SOUL.md' for f in files)); self.assertGreaterEqual(len(files),4)
+     for f in files:
+      text=' '.join(f.read_text().split())
+      for phrase in self.NO_FOLLOW_UP_PHRASES: self.assertNotIn(phrase,text,(lang,gender,tone,f.name))
+      for m in re.finditer(r'privately',text):
+       around=text[max(0,m.start()-60):m.end()+60]
+       self.assertTrue(any(a in around for a in self.PRIVATELY_ALLOWED),(lang,gender,tone,f.name,around))
+ def test_plumbing_question_in_the_group_is_answered_not_deferred(self):
+  # AC-3. Infrastructure questions used to be "picked up privately with the
+  # organizer"; the group now gets a plain answer, here, naming no component.
+  td,o,c=self.go(); self.addCleanup(td.cleanup); self.assertEqual(c.returncode,0,c.stderr)
+  soul=(o/'SOUL.md').read_text()
+  sec=' '.join(soul.split('## Never discuss your own plumbing')[1].split('\n## ')[0].split())
+  self.assertIn('When such a question arrives in the GROUP, answer it right there',sec)
+  self.assertIn('what you can and cannot do',sec)
+  self.assertIn('never send it to another chat and never promise to continue elsewhere',sec)
+  self.assertNotIn('do not answer it there at all',sec)
+  self.assertNotIn('audience of one',sec)
+ def test_daily_planning_approval_matches_soul(self):
+  # AC-5. The SOUL says anyone in the group approves a plan or site change;
+  # the planning skill said only the organizer does, and to present the plan to
+  # the organizer privately: the two contradicted, and the second is a private
+  # follow-up nobody could make.
+  td,o,c=self.go(); self.addCleanup(td.cleanup); self.assertEqual(c.returncode,0,c.stderr)
+  soul=' '.join((o/'SOUL.md').read_text().split())
+  self.assertIn('Anyone in the family group can approve a plan or a site change',soul)
+  skill=' '.join((o/'skills/planning/trip-daily-planning/SKILL.md').read_text().split())
+  self.assertIn('Anyone in the group can approve a plan or a site change',skill)
+  self.assertIn('The first clear yes from anyone there is the approval',skill)
+  for stale in ('Only the organizer','can approve writing to the trip site','address the organizer','explicit organizer approval','after the organizer approves','group consensus alone','present a summary to the organizer'):
+   self.assertNotIn(stale,skill,stale)
  def test_shipped_skills_find_their_own_files(self):
   # trip-kml-export ran its script from $PROFILE_SKILLS_DIR, which nothing
   # defines, so on every companion the path pointed at /travel/... (#71). A

@@ -154,4 +154,59 @@ describe("internal leak detection", () => {
       assert.equal(detectInternalLeak(text).leaks, false, text);
     }
   });
+
+  // #380: Hermes 4097709b0c words these differently from the incidents above.
+  // test/hermes-mirror.test.ts (AC-2) checks every string in the fixture one by
+  // one; these pin the shapes a family would actually see, including the ones
+  // with no "/approve session" in them for an old stem to lean on.
+  test("the target Hermes' approval prompt is caught in each shape it takes", () => {
+    const body = [
+      "⚠️ **Hermes wants to run a command that needs your OK**",
+      "```",
+      "ls /tmp",
+      "```",
+      "Why it was flagged: dangerous command",
+      "",
+    ].join("\n");
+    for (const tail of [
+      "Reply `/approve` to run it once, `/approve session` to allow this pattern for the rest of this session, `/approve always` to allow it permanently, or `/deny` to cancel.\nIf you don't answer within 5 minutes it will NOT run.",
+      // A smart-deny or no-session prompt offers only once / deny.
+      "Reply `/approve` to run it once, or `/deny` to cancel.\nIf you don't answer within 5 minutes it will NOT run.",
+    ]) {
+      assert.equal(detectInternalLeak(body + tail).leaks, true, tail);
+    }
+    // Each part alone: a prompt split across messages, or reworded around one of them.
+    assert.equal(detectInternalLeak("⚠️ **Smart DENY — owner override for one operation:**").leaks, true);
+    assert.equal(detectInternalLeak("Reply `/approve` to run it once").leaks, true);
+    assert.equal(
+      detectInternalLeak("⌛ Approval timed out after 5 minutes — the command was NOT run. Ask me to try again.").leaks,
+      true,
+    );
+    // The 2026-09-12 wording still is (old stems are kept one release): see the test above.
+  });
+
+  test("the target Hermes' model-fallback notice and any-file truncation warning are caught", () => {
+    assert.equal(
+      detectInternalLeak(
+        "⚠️ Model fallback: gpt-5.6-terra via openai-codex unavailable (rate limited); using claude-haiku-4-5 via anthropic.",
+      ).leaks,
+      true,
+    );
+    assert.equal(
+      detectInternalLeak("⚠️  Context file AGENTS.md TRUNCATED: 51390 chars exceeds limit of 48000 — trim the file.").leaks,
+      true,
+    );
+  });
+
+  test("the new approval and fallback stems do not swallow real trip sentences", () => {
+    for (const text of [
+      "The hotel wants to run a late check-in for us, which suits the 11pm landing.",
+      "If you answer within the hour, I'll keep the table at the first restaurant.",
+      "Reply to the host and I'll book it; the show will not run past midnight.",
+      "Plan B if it rains: the fallback is the aquarium, which is a short walk from the station.",
+      "The sign says the ride exceeds the limit for small children.",
+    ]) {
+      assert.equal(detectInternalLeak(text).leaks, false, text);
+    }
+  });
 });

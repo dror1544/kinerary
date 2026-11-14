@@ -133,6 +133,8 @@ export const TOOL_NAMES = [
   "get_trivia_questions", "add_trivia_question", "get_phase_plan", "swap_plan_days",
   "set_plan_day_label", "add_plan_item", "update_plan_item", "delete_plan_item",
   "import_plan_from_bookings",
+  "get_stops", "update_stop", "split_stop", "set_stop_from_booking", "move_plan_day",
+  "plan_open_days",
   // control-plane/api/src/companion-mcp.ts (the trip CONTROL server)
   "get_assistant_names", "set_assistant_names", "report_bug",
 ] as const;
@@ -518,7 +520,8 @@ export function channelTypeOf(telegramChatType: string | null | undefined, role:
  */
 export function requesterRoleOf(linkRole: string | null | undefined): RequesterRole {
   if (linkRole === null || linkRole === undefined) return "unknown";
-  if (linkRole === "organizer") return "organizer";
+  // A secondary organizer (#523) is still an organizer asking, for counting; the role value differs so authority can tell them apart.
+  if (linkRole === "organizer" || linkRole === "secondary_organizer") return "organizer";
   if (linkRole === "participant") return "participant";
   return "unclassified";
 }

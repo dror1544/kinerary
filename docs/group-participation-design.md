@@ -10,10 +10,14 @@ headers say how, this document says what was decided and what was rejected.
 
 | Piece | State |
 |---|---|
-| Conversation window, mark and stay-silent | **Built and merged**: PR #406 (`ddb575c`) on the sprint branch. Not on `main`, not deployed. |
-| Judge ("is this for the assistant?") | **Pending, unmerged**: PR #407 is a draft being reworked. Nothing in section 3 is shipped. |
-| `/proactive 1\|2\|3` | **Pending, unmerged**: not in this tree; belongs to the #407 line of work. |
-| Judge KPIs and benchmark harness | **Pending**: agreed targets only; `tools/judge-benchmark.ts` is not in this tree. |
+| Conversation window, mark and stay-silent | **Built and merged**: PR #406 (`ddb575c`). |
+| Judge ("is this for the assistant?") | **Built and merged**: PR #407, reworked before merge. **Dormant until `JUDGE_*` is set**: with no judge runner configured every unaddressed group message stays `NOT_ADDRESSED`, as before the judge existed. |
+| `/proactive 1\|2\|3` | **Built and merged** with the #407 line of work (default 3); replaces `/listen`, which never merged. |
+| Judge KPIs and benchmark harness | **Harness built and merged**: `control-plane/api/tools/judge-benchmark.ts` with a starter set. The targets in section 6 are agreed; no measured result is recorded here. |
+| Group addressing fixes and the end-to-end test | **Merged**: PR #409 (explicit group addressing, silence on it counted, reactions only answer questions) and PR #408 (the window, end to end). |
+
+PRs #406 to #409 merged on 2026-10-16 and 2026-10-17 into `integration/sprint-6-into-main`
+and reached `main` with PR #356 on 2026-10-18 (verified with `gh pr view`, 2026-10-19).
 
 ## Why this was decided
 
@@ -111,10 +115,10 @@ member of the group (the gateway keeps one session per member per group, and a
 continuing session reuses its stored system prompt verbatim). Ending the session
 rows in the companion's `state.db` makes the next message start a fresh one.
 
-## 3. The judge (pending, unmerged: PR #407, draft, being reworked)
+## 3. The judge (built, PR #407; dormant until `JUDGE_*` is set)
 
-Nothing in this section is shipped. It records the owner's decision so the
-rework builds to it.
+This section records the owner's decision the build followed. The judge is merged
+but does nothing until a judge runner and model are configured.
 
 **Decision.**
 
@@ -129,7 +133,7 @@ rework builds to it.
   in configuration (`JUDGE_RUNNER` / `JUDGE_MODEL`).
 - A typed-decision model such as TypeSafe Jev will be benchmarked later.
 
-## 4. Proactive level: a preference, not a privacy switch (pending, unmerged)
+## 4. Proactive level: a preference, not a privacy switch (built)
 
 **Decision.** How much the group expects the bot to be part of the conversation
 is a preference, set per group. `/listen` is replaced by `/proactive 1|2|3`. The
@@ -146,8 +150,8 @@ to be part of the conversation". The risk the owner cares about is nagging, not
 privacy. If the companion is fast and right, groups will be happy; otherwise they
 will turn it down.
 
-Levels 1 and 2 describe behaviour that already exists (name/mention/reply, and the
-two windows); only the setting and level 3's judge are pending. `/listen on|off`
+Levels 1 and 2 describe behaviour that already existed (name/mention/reply, and the
+two windows); the setting and level 3's judge were added by the #407 line of work. `/listen on|off`
 was the first draft of this setting in PR #407 (a judge on/off switch, worded
 partly as a privacy notice); it never merged, and the owner replaced it with the
 three levels.
@@ -159,7 +163,7 @@ about AI. It is phrased purely as a preference.
 
 **Why.** The owner: "TMI, users will fail to understand".
 
-## 6. The judge must be accountable (agreed targets, pending)
+## 6. The judge must be accountable (agreed targets; harness built)
 
 **Decision.** The judge's quality and speed must be measurable, with these agreed
 targets:
@@ -172,7 +176,7 @@ targets:
 | Hard timeout | 3 s |
 
 - **Offline:** a benchmark harness, `tools/judge-benchmark.ts`, over a 60-message
-  synthetic Hebrew/English set. (Planned; not in this tree.)
+  synthetic Hebrew/English starter set. (Built: `control-plane/api/tools/judge-benchmark.ts`.)
 - **Live proxies:**
   - *missed*: after a judge-no, the same sender re-addresses the companion within
     3 minutes;
