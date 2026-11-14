@@ -251,6 +251,41 @@ OLD_OFFER = ("לפני שנתחיל בפרטים — אם כבר יש לכם ת�
              ("אין לי מסמך", "c:nodoc"))
 
 
+class ExistingAccount(unittest.TestCase):
+    """--account-file: a stack serving the web dashboard retires /v1/signup (2026-11-14, the VM)."""
+
+    def account(self, text: str) -> dict:
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "account"
+            path.write_text(text, encoding="utf-8")
+            with redirect_stdout(io.StringIO()) as out:
+                ctx = E2E.stage_existing_account(str(path))
+            self.assertNotIn("s3cret pass", out.getvalue(), "the password is never printed")
+            return ctx
+
+    def test_reads_email_and_password_and_makes_no_trip(self) -> None:
+        ctx = self.account("arlo@example.test\ns3cret pass\n")
+        self.assertEqual((ctx["email"], ctx["password"], ctx["trip_id"]), ("arlo@example.test", "s3cret pass", None))
+
+    def test_the_chat_is_the_same_every_run_for_one_account_and_differs_between_accounts(self) -> None:
+        a = self.account("arlo@example.test\ns3cret pass\n")["fixed_chat"]
+        self.assertEqual(a, self.account("ARLO@example.test\nother\n")["fixed_chat"])
+        self.assertNotEqual(a, self.account("lena@example.test\ns3cret pass\n")["fixed_chat"])
+        self.assertTrue(a.startswith("9") and len(a) == 13, a)
+
+    def test_a_malformed_file_fails_without_echoing_it(self) -> None:
+        for text in ("", "no-at-sign\npw\n", "arlo@example.test\n"):
+            with self.assertRaises(E2E.Failed) as caught, redirect_stdout(io.StringIO()):
+                self.account(text)
+            self.assertNotIn("pw", str(caught.exception).split(":")[-1])
+
+    def test_only_gatecity_takes_it(self) -> None:
+        result = subprocess.run([sys.executable, str(SCRIPT), "--scenario", "multi", "--account-file", "/nonexistent"],
+                                capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--account-file is for --scenario gatecity", result.stderr)
+
+
 class GreetingChecks(unittest.TestCase):
     def verdicts(self, messages):
         return {v.name: v for v in E2E.greeting_verdicts(messages, "Arlo", "Gatecity")}
