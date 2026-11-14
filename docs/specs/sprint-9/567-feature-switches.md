@@ -120,14 +120,17 @@ that S2 and S3 can be proved end to end on staging.
 `-- rollback: compatible — new tables and one function only`.
 
 - `control_plane.feature_switch_settings (switch text, scope text CHECK (scope IN
-  ('trip','all_trips','new_trips')), trip_id uuid NULL REFERENCES trips, enabled
+  ('trip','all_trips','new_trips')), trip_id text NULL REFERENCES trips, enabled
   boolean NOT NULL, effective_from timestamptz NOT NULL DEFAULT now(), changed_by
   text NOT NULL, changed_at timestamptz NOT NULL DEFAULT now())`, with a CHECK on the
   switch-name shape, `trip_id` required exactly when scope is `trip`, and one row per
   (switch, scope, trip).
 - `control_plane.feature_switch_history`, append-only, the AC-7 columns.
-- `control_plane.feature_enabled(trip uuid, switch text) RETURNS boolean`, the
+- `control_plane.feature_enabled(trip text, switch text) RETURNS boolean`, the
   resolution order above, returning false when no row applies.
+- Trip ids are `text` (`trip_…`), as everywhere in this schema (corrected in build,
+  2026-11-14: the draft said `uuid`). The history table also carries an append-only
+  trigger, and its `trip_id` has no foreign key so a history row outlives its trip.
 - Modelled on `model_task_settings` (`20260918110131_model_task_settings.sql`).
 
 **Control plane API (`control-plane/api/src/`)**

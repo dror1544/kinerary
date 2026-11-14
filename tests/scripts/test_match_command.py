@@ -126,6 +126,33 @@ class Classify(unittest.TestCase):
         ):
             self.assertEqual(classify(command), "none", command)
 
+    def test_a_live_feature_switch_set_is_a_deploy(self):
+        # #567 AC-9: a switch set with --live reaches trips in use.
+        for command in (
+            "npm run feature -- set delivery_probe on --all --live",
+            "cd control-plane/api && npm run feature -- set delivery_probe off --trip japan-2026 --live",
+            "npm run feature --prefix control-plane/api -- set delivery_probe on --new-trips --live",
+            "npm --prefix control-plane/api run feature -- set delivery_probe on --all --live",
+            "node --import tsx src/feature-cli.ts set delivery_probe on --live --all",
+            "node dist/feature-cli.js set delivery_probe on --all --live=true",
+            "npm run feature -- set delivery_probe on --trip 'a;b|c' --live",
+            "npm run feature -- set delivery_probe on --trip \"a&b\" --by 'x y' --live",
+            "ssh host \"cd api && npm run feature -- set delivery_probe on --all --live\"",
+        ):
+            self.assertEqual(classify(command), "deploy", command)
+
+    def test_a_feature_switch_set_without_live_and_the_reads_are_silent(self):
+        for command in (
+            "npm run feature -- set delivery_probe on --trip staging-test-trip",
+            "node --import tsx src/feature-cli.ts set delivery_probe off --trip staging-test-trip --by dror",
+            "npm run feature -- list",
+            "npm run feature -- show --trip japan-2026",
+            "npm run feature -- show --trip japan-2026 --live",
+            "npm run feature -- set delivery_probe on --trip x --live-run",
+            "cat > notes.md <<'EOF'\nnpm run feature -- set delivery_probe on --all --live\nEOF",
+        ):
+            self.assertEqual(classify(command), "none", command)
+
     def test_pushes(self):
         for command in (
             "git push origin HEAD",

@@ -44,6 +44,14 @@ CMDPOS = r'(?:^|[\n;&|(){\'"])\s*'
 # Options may take a value (git -C <dir> commit), so allow an optional
 # argument after each flag; backtracking keeps `commit` itself unconsumed.
 COMMIT = re.compile(CMDPOS + r'(?:sudo\s+)?git\b(?:\s+-\S+(?:\s+\S+)?)*\s+commit\b')
+# `npm run feature -- set <switch> on|off <scope> --live`, or the file run
+# directly (`node --import tsx src/feature-cli.ts set …`). `set` must be the verb
+# right after the tool, and --live a whole flag (not --live-run, not --livelier).
+# Quoted arguments are skipped whole, so a `;` or `|` inside `--trip 'a;b'`
+# cannot hide the flag that follows it.
+FEATURE_SET_LIVE = (
+    r'\b(?:npm\s+(?:--prefix\s+\S+\s+)?run\s+feature(?:\s+--prefix\s+\S+)?|feature-cli(?:\.[jt]s)?)'
+    r'\s+(?:--\s+)?set\b(?:\'[^\']*\'|"[^"]*"|[^\n;&|\'"])*?\s--live(?![\w-])')
 DEPLOY = re.compile(
     CMDPOS + r'(?:sudo\s+)?(?:bash\s+|sh\s+)?\S*(?:deploy\.sh|bring-up\.sh|deploy-trip\.sh|retarget-container\.sh)\b'
     r'|' + CMDPOS + r'(?:sudo\s+)?docker[ -]compose\b[^\n;&|]*\bup\b'
@@ -82,7 +90,13 @@ DEPLOY = re.compile(
     # rebuilt runs this tree — while trips already provisioned stay on the
     # release they were pinned to. The earlier hops (candidate -> verified)
     # are checkpoints and reach nobody, so only 'available' prompts.
-    r'|' + CMDPOS + r'[^\n;&|]*\brelease\b[^\n;&|]*\bpromote\b[^\n;&|]*--to[=\s]+available\b')
+    r'|' + CMDPOS + r'[^\n;&|]*\brelease\b[^\n;&|]*\bpromote\b[^\n;&|]*--to[=\s]+available\b'
+    # A feature switch set with --live (#567): it changes what trips in use do,
+    # and for the every-trip and future-trips scopes it is required. Anywhere on
+    # the line, because it is run through ssh. Without --live the command only
+    # touches a test trip (or the command refuses), and `list`/`show` read, so
+    # those stay prompt-free. pretooluse-bash.sh words the prompt for it.
+    r'|' + FEATURE_SET_LIVE)
 
 # A commit by another name. Each of these creates or rewrites commits on the
 # current branch, so each is hard rule 1 by a route on which the word "commit"

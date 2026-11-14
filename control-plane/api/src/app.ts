@@ -39,6 +39,7 @@ import { structuredLog } from "./redaction.js";
 import { registerPortalRoutes, type PortalDependencies } from "./portal.js";
 import { ingestHermesToolOutcomes } from "./hermes-ingest.js";
 import { timingSafeKeyMatch } from "./secure-compare.js";
+import { describeFeatureSwitches, findTrip, listFeatureSwitches, setFeatureSwitch, type SetFeatureSwitchFailure } from "./feature-switches.js";
 import {
   startSignup,
   processApprovalCallback,
@@ -1988,6 +1989,82 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       return reply.code(status).send({ error: result.reason });
     }
     return reply.code(200).send({ tripId: result.tripId, reapprovalNeeded: result.reapprovalNeeded });
+  });
+
+  // ── Per-trip feature switches (#567, slice S1) ───────────────────────────
+  //
+  // Operator-only, behind the same admin key as the rest of /v1/admin: no
+  // organizer route and no companion tool reaches this. The trip a switch is
+  // set for is named in the body by the operator, and nothing a trip itself
+  // sends can change one. Everything uncertain is OFF (feature-switches.ts);
+  // an unregistered name is refused, naming shared/feature-switches.js.
+  //
+  // GET  ?trip=<id|slug>   every registered switch with its value for that trip
+  //                        and where the value came from; without ?trip, just
+  //                        the registry.
+  // POST { switch, enabled, scope: trip|all_trips|new_trips, trip?, live?, by? }
+  //                        `live` is the operator's acknowledgement that the
+  //                        change reaches trips in use (CLAUDE.md hard rule 2);
+  //                        every-trip and future-trips always need it. The
+  //                        history row is the audit record, written in the
+  //                        same transaction as the change.
+  const FEATURE_SWITCH_STATUS: Record<SetFeatureSwitchFailure, number> = {
+    UNKNOWN_SWITCH: 422,
+    INVALID_REQUEST: 400,
+    TRIP_REQUIRED: 400,
+    TRIP_NOT_FOUND: 404,
+    TRIP_IN_USE: 409,
+    LIVE_REQUIRED: 409,
+  };
+
+  app.get("/v1/admin/feature-switches", async (request, reply) => {
+    if (!dependencies.admin) return reply.code(503).send({ error: "ADMIN_NOT_CONFIGURED" });
+    if (!adminAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const ref = (request.query as Record<string, unknown>)?.trip;
+    if (ref === undefined) {
+      await auditAdminRead("admin.read.feature_switches", "registry");
+      return reply.code(200).send({ switches: listFeatureSwitches() });
+    }
+    if (typeof ref !== "string" || ref.length === 0) return reply.code(400).send({ error: "INVALID_REQUEST" });
+    const trip = await findTrip(dependencies.admin.db, ref);
+    if (!trip) return reply.code(404).send({ error: "TRIP_NOT_FOUND" });
+    const switches = await describeFeatureSwitches(dependencies.admin.db, trip.id);
+    await auditAdminRead("admin.read.feature_switches", trip.id);
+    return reply.code(200).send({
+      trip: { id: trip.id, slug: trip.slug, lifecycleState: trip.lifecycleState },
+      switches,
+    });
+  });
+
+  app.post("/v1/admin/feature-switches", async (request, reply) => {
+    if (!dependencies.admin) return reply.code(503).send({ error: "ADMIN_NOT_CONFIGURED" });
+    if (!adminAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const body = request.body;
+    if (body === null || typeof body !== "object" || Array.isArray(body)) {
+      return reply.code(400).send({ error: "INVALID_REQUEST" });
+    }
+    const input = body as Record<string, unknown>;
+    const result = await setFeatureSwitch(dependencies.admin.db, {
+      switch: input.switch as string,
+      enabled: input.enabled as boolean,
+      scope: input.scope as "trip" | "all_trips" | "new_trips",
+      trip: input.trip as string | undefined,
+      live: input.live as boolean | undefined,
+      by: (input.by as string | undefined) ?? "admin:api-key",
+    });
+    if (!result.ok) {
+      return reply.code(FEATURE_SWITCH_STATUS[result.reason]).send({ error: result.reason, message: result.message });
+    }
+    return reply.code(200).send({
+      switch: result.switch,
+      scope: result.scope,
+      tripId: result.tripId,
+      previous: result.previous,
+      enabled: result.enabled,
+      effectiveFrom: result.effectiveFrom,
+    });
   });
 
   // ── Hermes tool-outcome ingest ───────────────────────────────────────────

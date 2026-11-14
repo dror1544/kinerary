@@ -387,6 +387,50 @@ class TheLeadSessionIsAsked(Harness):
             self.assertEqual(self.hook(command), {}, command)
 
 
+class ALiveFeatureSwitchNamesWhatItChanges(Harness):
+    """#567 AC-9: `feature set … --live` asks under hard rule 2 and says which
+    switch, which scope and which trips; without --live it is silent."""
+
+    def test_every_trip_names_the_switch_the_scope_and_the_trips(self):
+        d = self.hook("cd control-plane/api && npm run feature -- set delivery_probe on --all --live")
+        self.assertEqual(d.get("permissionDecision"), "ask")
+        reason = d["permissionDecisionReason"]
+        self.assertIn("hard rule 2", reason)
+        self.assertIn("Switch: delivery_probe -> on", reason)
+        self.assertIn("Scope:  all", reason)
+        self.assertIn("EVERY trip", reason)
+
+    def test_one_trip_and_future_trips_are_named_too(self):
+        d = self.hook("npm run feature -- set delivery_probe off --trip japan-2026 --live --by dror")
+        self.assertEqual(d.get("permissionDecision"), "ask")
+        self.assertIn("Switch: delivery_probe -> off", d["permissionDecisionReason"])
+        self.assertIn("Scope:  trip", d["permissionDecisionReason"])
+        self.assertIn("the trip japan-2026 only", d["permissionDecisionReason"])
+        d = self.hook("node --import tsx src/feature-cli.ts set delivery_probe on --new-trips --live")
+        self.assertEqual(d.get("permissionDecision"), "ask")
+        self.assertIn("Scope:  new", d["permissionDecisionReason"])
+        self.assertIn("created from now on", d["permissionDecisionReason"])
+
+    def test_the_prompt_carries_nothing_a_command_could_inject(self):
+        d = self.hook("npm run feature -- set delivery_probe$(id) on --trip 'a b;c' --live")
+        self.assertEqual(d.get("permissionDecision"), "ask")
+        self.assertNotIn("$(", d["permissionDecisionReason"])
+        self.assertNotIn(";", d["permissionDecisionReason"].split("Switch:")[1])
+
+    def test_a_test_trip_without_live_and_the_reads_are_silent(self):
+        for command in (
+            "npm run feature -- set delivery_probe on --trip staging-test-trip",
+            "npm run feature -- list",
+            "npm run feature -- show --trip staging-test-trip",
+        ):
+            self.assertEqual(self.hook(command), {}, command)
+
+    def test_a_subagent_is_refused_under_hard_rule_2(self):
+        d = self.hook("npm run feature -- set delivery_probe on --all --live", agent_type="developer")
+        self.assertEqual(d.get("permissionDecision"), "deny")
+        self.assertIn("hard rule 2", d["permissionDecisionReason"])
+
+
 class ASubagentIsRefused(Harness):
     def test_every_landing_verb_is_a_refusal_naming_the_agent(self):
         for command in ("git commit -m 'note'", "git merge feat/x", "gh pr merge 116", "git push origin HEAD",
