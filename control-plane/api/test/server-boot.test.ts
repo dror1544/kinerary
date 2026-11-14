@@ -563,3 +563,22 @@ test("the real server entrypoint reports the Mini App as not configured on /read
     assert.deepEqual((await response.json() as { telegram_mini_app: unknown }).telegram_mini_app, { configured: false, enabled: false, has_main_web_app: null });
   } finally { await server.stop(); }
 });
+
+/**
+ * 2026-11-14, the first VM end-to-end after the Sprint 8 release: two ticket photos sent during the
+ * interview were never read, so no reservation reached the site. model-runner.ts reads photos and scans
+ * only when VISION_RUNNER is set ("unset = not read"), and compose.vm.yml's relay passed INTERPRET_* and
+ * EXTRACT_* but no VISION_*, so whatever vm.env held never reached the process. Unset is a silent
+ * downgrade, not an error, which is why it went unseen until a run checked the reservations.
+ */
+test("compose.vm.yml's relay passes through every model binding the interview reads, photos included", async () => {
+  const composePath = fileURLToPath(new URL("../../deployment/compose.vm.yml", import.meta.url));
+  const relayBlock = extractServiceBlock(await readFile(composePath, "utf8"), "relay");
+  for (const name of [
+    "INTERPRET_RUNNER", "INTERPRET_MODEL", "INTERPRET_EFFORT",
+    "EXTRACT_RUNNER", "EXTRACT_MODEL", "EXTRACT_EFFORT",
+    "VISION_RUNNER", "VISION_MODEL", "VISION_EFFORT",
+  ]) {
+    assert.match(relayBlock, new RegExp(`\\n\\s+${name}: \\$\\{${name}:`), `compose.vm.yml's relay must pass ${name} through`);
+  }
+});

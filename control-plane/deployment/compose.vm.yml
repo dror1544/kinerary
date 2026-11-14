@@ -332,6 +332,17 @@ services:
       INTERPRET_MODEL: ${INTERPRET_MODEL:-}
       EXTRACT_RUNNER: ${EXTRACT_RUNNER:?EXTRACT_RUNNER must be set}
       EXTRACT_MODEL: ${EXTRACT_MODEL:-}
+      # Photos and scans (a ticket sent as a picture) are read ONLY when
+      # VISION_RUNNER is set: unset means "not read", silently, and the
+      # interview asks for what the picture already said. Missing here until
+      # 2026-11-14, so no photo sent on the VM was ever read. Optional (`:-`)
+      # because a stack may choose not to read pictures; vm.env sets it.
+      VISION_RUNNER: ${VISION_RUNNER:-}
+      VISION_MODEL: ${VISION_MODEL:-}
+      # Empty = the effort in CLAUDE_CONFIG_DIR below, as before; set to pin it per task.
+      INTERPRET_EFFORT: ${INTERPRET_EFFORT:-}
+      EXTRACT_EFFORT: ${EXTRACT_EFFORT:-}
+      VISION_EFFORT: ${VISION_EFFORT:-}
       CODEX_HOME: /codex
       # Empty = api.telegram.org. The e2e runner's automated organizer points it
       # at a loopback Telegram stand-in through vm-relay-restart.sh, and puts it
