@@ -336,8 +336,15 @@ def stage_existing_account(path: str) -> dict:
     email, password = lines[0].strip(), lines[1]
     digest = int(hashlib.sha256(email.lower().encode()).hexdigest()[:12], 16)
     ok(f"signing in as {email}")
-    return {"trip_id": None, "email": email, "password": password,
+    return {"trip_id": None, "email": email, "password": password, "password_from_file": True,
             "fixed_chat": str(9_000_000_000_000 + digest % 10**9)}
+
+
+def login_line(ctx: dict) -> str:
+    """The summary's sign-in line. A password read from --account-file is a kept credential and never shown;
+    one this run made up for a throw-away account is, so a person can sign in and look."""
+    shown = "(from the account file)" if ctx.get("password_from_file") else ctx.get("password")
+    return f"  login: {ctx.get('email')} / {shown}"
 
 
 def stage_interview(ctx: dict, scenario: str, work: Path, auto: "Auto | None" = None) -> None:
@@ -2540,7 +2547,7 @@ def run_scenario(scenario: str, args: argparse.Namespace, auto: "Auto | None", c
             for name, reason in ctx["known_gaps"]:
                 print(f"    - {name}" + (f": {reason}" if reason else ""))
         print(f"  trip:  {ctx['trip_id']}  ({ctx['slug']})")
-        print(f"  login: {ctx['email']} / {ctx['password']}")
+        print(login_line(ctx))
         return 0
     except Failed as exc:
         print(f"\n{RED}✗ FAILED ({scenario}){RESET}: {exc}\n")
@@ -2550,7 +2557,7 @@ def run_scenario(scenario: str, args: argparse.Namespace, auto: "Auto | None", c
             print(gatecity_scorecard(ctx["gatecity_verdicts"]) + "\n")
         if ctx.get("trip_id"):
             print(f"  trip:  {ctx['trip_id']}  ({ctx.get('slug', 'no slug yet')})")
-            print(f"  login: {ctx.get('email')} / {ctx.get('password')}")
+            print(login_line(ctx))
         return 1
 
 

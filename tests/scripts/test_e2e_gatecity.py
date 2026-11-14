@@ -279,6 +279,14 @@ class ExistingAccount(unittest.TestCase):
                 self.account(text)
             self.assertNotIn("pw", str(caught.exception).split(":")[-1])
 
+    def test_the_summary_never_shows_a_stored_password(self) -> None:
+        ctx = self.account("arlo@example.test\ns3cret pass\n")
+        line = E2E.login_line(ctx)
+        self.assertIn("arlo@example.test", line)
+        self.assertNotIn("s3cret pass", line)
+        # A throw-away account the run made itself is still printed whole, so a person can sign in to look.
+        self.assertIn("pw-made-here", E2E.login_line({"email": "a@example.test", "password": "pw-made-here"}))
+
     def test_only_gatecity_takes_it(self) -> None:
         result = subprocess.run([sys.executable, str(SCRIPT), "--scenario", "multi", "--account-file", "/nonexistent"],
                                 capture_output=True, text=True)
