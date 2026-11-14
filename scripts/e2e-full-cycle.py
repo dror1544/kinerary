@@ -48,6 +48,7 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime as dt
+import hashlib
 import json
 import os
 import platform
@@ -315,6 +316,30 @@ def stage_signup(trip_name: str) -> dict:
     return {"trip_id": result["tripId"], "email": email, "password": password}
 
 
+def stage_existing_account(path: str) -> dict:
+    """Sign in as an account that already exists, instead of signing one up.
+
+    For a stack that serves the web dashboard (the VM): there `/v1/signup` is
+    retired (410 TELEGRAM_WEB_AUTH_RETIRED) and a dashboard sign-up mails a
+    verification link nobody here can open. A person makes the account once and
+    stores it in a root-only file, e-mail on the first line and password on the
+    second; the password is read here and never printed.
+
+    The stand-in Telegram chat is fixed per account rather than fresh per run:
+    one account is one main Telegram (#519), so a second run from a new chat
+    would be a stranger opening the organizer's link and be asked about.
+    """
+    stage("Account — an existing one, from a file")
+    lines = Path(path).read_text(encoding="utf-8").splitlines()
+    if len(lines) < 2 or "@" not in lines[0] or not lines[1]:
+        raise Failed(f"{path}: expected the e-mail on line 1 and the password on line 2")
+    email, password = lines[0].strip(), lines[1]
+    digest = int(hashlib.sha256(email.lower().encode()).hexdigest()[:12], 16)
+    ok(f"signing in as {email}")
+    return {"trip_id": None, "email": email, "password": password,
+            "fixed_chat": str(9_000_000_000_000 + digest % 10**9)}
+
+
 def stage_interview(ctx: dict, scenario: str, work: Path, auto: "Auto | None" = None) -> None:
     stage(f"Interview — scenario '{scenario}'" + (" (automated organizer)" if auto else ""))
     photos = None
@@ -421,8 +446,9 @@ class Auto:
     def interview(self, ctx: dict, scenario: str, token: str, docs: Path | None,
                   photos: Path | None = None) -> None:
         # A private-chat id no real Telegram user has (real ids are ~10 digits),
-        # fresh per run so no earlier session or binding is inherited.
-        chat = str(9_000_000_000_000 + secrets.randbelow(10**9))
+        # fresh per run so no earlier session or binding is inherited -- except
+        # for an existing account, whose chat stays the same (stage_existing_account).
+        chat = ctx.get("fixed_chat") or str(9_000_000_000_000 + secrets.randbelow(10**9))
         ctx["chat"] = chat
         env = {**os.environ, "CONTROL_PLANE_DATABASE_URL": live_database_url(),
                "PATH": f"/opt/homebrew/bin:{os.environ.get('PATH', '')}"}
@@ -2374,6 +2400,10 @@ def main() -> int:
     ap.add_argument("--stop-after", choices=["confirm"], default=None,
                     help="stop once the intake is confirmed, before the build — for a stack that must "
                          "not provision (the Proxmox VM while the Mac stack is live)")
+    ap.add_argument("--account-file", default=None, metavar="PATH",
+                    help="gatecity only: sign in as an existing account (e-mail, then password, one per "
+                         "line) instead of signing up -- for a stack that serves the web dashboard, where "
+                         "/v1/signup is retired")
     ap.add_argument("--dry-run", action="store_true",
                     help="gatecity only: draw the ticket photos, send them through the Telegram stand-in and read "
                          "them back as the relay does. Touches no stack: nothing is signed up, built or restarted")
@@ -2400,6 +2430,8 @@ def main() -> int:
     if args.scenario == "star" and not args.auto:
         ap.error("--scenario star needs --auto: it types its trip type in words and then talks to the "
                  "companion as the organizer")
+    if args.account_file and args.scenario != GATECITY:
+        ap.error("--account-file is for --scenario gatecity: the other scenarios interview signup's own trip")
     if args.scenario == "all" and not args.auto:
         ap.error("--scenario all needs --auto: three interviews back to back are not a thing to ask a person for")
 
@@ -2454,7 +2486,7 @@ def main() -> int:
 def run_scenario(scenario: str, args: argparse.Namespace, auto: "Auto | None", ctx: dict, work: Path) -> int:
     trip_name = args.trip_name if (args.trip_name and args.scenario != "all") else TRIP_NAMES[scenario]
     try:
-        ctx.update(stage_signup(trip_name))
+        ctx.update(stage_existing_account(args.account_file) if args.account_file else stage_signup(trip_name))
         if scenario == GATECITY:
             if auto is None:
                 raise Failed("--scenario gatecity needs --auto: it sends photos and taps as the organizer")
