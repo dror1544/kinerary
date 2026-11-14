@@ -222,9 +222,15 @@ before it is briefed):
   are one rollout and still prompt for each: ask once in words, with the whole
   list, and do not re-argue it at every prompt.
 - **Switching a feature on or off for a test trip needs no approval.** A test
-  trip is one on staging, or one `scripts/teardown-trip.py` would accept (not
-  past `ready_private`: nobody real has used it). For any other trip a switch
-  changes what a family sees, so it is a deploy under hard rule 2.
+  trip is one still being built: a lifecycle state before `ready_private`.
+  A trip at `ready_private` or later is treated as in use, whatever
+  `scripts/teardown-trip.py` would accept, and a switch on it is a deploy
+  under hard rule 2 (Dror, 2026-11-14: both production families' trips sat at
+  `ready_private` that day, so "not past `ready_private`" would have let a
+  switch reach them unasked). The command enforces it with `--live`. On
+  staging a trip at `ready_private` or later still gets the prompt, because
+  the hook cannot tell which stack a command reaches; approving it there is
+  routine.
 
 **What did not change:** hard rules 3–7; boundary review with live
 request/response evidence for security paths; migration naming and the
