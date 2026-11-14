@@ -773,6 +773,23 @@ Principles behind the table:
     `scripts/claude-hooks/pretooluse-bash.sh` and the integrator, developer and
     doc-keeper roles.
 
+12. **Faster delivery: features behind per-trip switches, one rollout per trip,
+    `main` as the leading branch (2026-11-14).** Measured over 2 October to
+    14 November: 101 PRs reached the leading branch a median 1.9 hours after
+    opening, while the leading branch reached `main` four times and a merged
+    change reached a running trip only through three hand-run steps per trip.
+    The delay had moved from the merge (decision 11) to everything after it.
+    Dror accepted four changes, in build order: per-trip feature switches
+    (off by default; on for one trip, every trip or future trips as a data
+    change), one rollout command per trip with a recorded version and way
+    back, `main` as the leading branch once the switches are merged, and
+    control-plane images built in CI. Three rules changed the same day: the
+    regression plan and the owner's manual test before a merge to `main` are
+    for risk-class change sets only; a deploy is approved per rollout, not per
+    step; a switch on a test trip needs no approval. Implemented in CLAUDE.md
+    ("Faster delivery"); the hooks follow with the rollout command. Until
+    `main` leads, §4's task life and the integrator's seat are unchanged.
+
 ---
 
 ## 10. Rollout and what to measure
