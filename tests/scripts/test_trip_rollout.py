@@ -686,6 +686,58 @@ class PlanChangesNothing(DatabaseCase):
         self.assertIn("no way back is recorded", out)
         self.assertIsNone(json.loads(path.read_text())["trips"][0]["from_release_id"])
 
+    def provisioned(self, slug: str, release: str, days_ago: int = 0, state: str = "succeeded", plan_status: str = "executed") -> None:
+        """A provision of `slug` onto `release`, as the worker leaves one: an executed plan and a job."""
+        n = secrets.token_hex(6)
+        self.rig.sql.run(
+            """WITH p AS (INSERT INTO control_plane.plans(id, trip_id, release_id, kind, digest, status, desired, created_at)
+                          SELECT 'plan_' || :'n', id, :'rel', 'provision', 'sha256:' || :'dig', :'pstatus', '{}'::jsonb,
+                                 now() - (:'days' || ' days')::interval
+                            FROM control_plane.trips WHERE slug = :'slug' RETURNING id, trip_id)
+               INSERT INTO control_plane.jobs(id, trip_id, plan_id, job_type, idempotency_key, correlation_id, state, safe_error_code, updated_at)
+               SELECT 'job_' || :'n', trip_id, id, 'provision', 'idem-' || :'n', 'corr_' || :'n', :'jstate',
+                      CASE WHEN :'jstate' = 'failed' THEN 'FAKE_FAILURE' END, now() - (:'days' || ' days')::interval FROM p""",
+            n=n, rel=release, dig=(n * 6)[:64].ljust(64, "0"), pstatus=plan_status, days=str(days_ago), slug=slug, jstate=state)
+
+    def test_a_record_that_disagrees_with_the_latest_provision_is_warned_about_in_the_output_and_the_plan_file(self):
+        # Review round 1: a control-plane rollback followed by a re-provision leaves the record stale, and the
+        # migration's backfill does not run again. A warning, never a refusal.
+        slug = self.rig.trip("a")                       # the record says r1
+        self.provisioned(slug, self.rig.r2)             # the trip was last provisioned onto r2
+        code, out, err, path, _ = self.rig.plan(self.rig.r2, [slug])
+        self.assertEqual(0, code, out + err)
+        self.assertRegex(out, rf"WARNING  {slug}: .*{self.rig.r1}.*{self.rig.r2}")
+        doc = json.loads(path.read_text())
+        self.assertEqual([slug], [t["slug"] for t in doc["trips"]], "it is still planned")
+        self.assertEqual([slug], [w["slug"] for w in doc["warnings"]])
+        self.assertIn(self.rig.r1, doc["warnings"][0]["warning"])
+        self.assertIn(self.rig.r2, doc["warnings"][0]["warning"])
+        self.assertEqual([], doc["refused"])
+
+    def test_no_warning_when_the_record_agrees_or_the_provision_did_not_succeed_or_a_rollout_came_after(self):
+        agree = self.rig.trip("agree")
+        self.provisioned(agree, self.rig.r1)
+        failed = self.rig.trip("failed")
+        self.provisioned(failed, self.rig.r2, state="failed")
+        unexecuted = self.rig.trip("unexec")
+        self.provisioned(unexecuted, self.rig.r2, plan_status="approved")
+        never = self.rig.trip("never")                  # no provision on record at all
+        # A trip provisioned onto r1 three days ago and rolled out to r2 since: current r2 differs from its
+        # provision's r1 on purpose, and is not stale.
+        rolled = self.rig.trip("rolled")
+        self.provisioned(rolled, self.rig.r1, days_ago=3)
+        plan_path, plan_digest = self.planned([rolled], release=self.rig.r2)
+        self.assertEqual(0, self.rig.execute(plan_path, plan_digest)[0])
+        self.assertEqual(self.rig.r2, self.rig.trip_state(rolled)["current_release_id"])
+        for name, slug in (("agree", agree), ("failed", failed), ("unexec", unexecuted), ("never", never), ("rolled", rolled)):
+            with self.subTest(name):
+                # (planned onto the release it does not run, so the plan has something to say)
+                target = self.rig.r1 if name == "rolled" else self.rig.r2
+                code, out, err, path, _ = self.rig.plan(target, [slug], name=f"w-{name}.json")
+                self.assertEqual(0, code, out + err)
+                self.assertNotIn("WARNING", out)
+                self.assertEqual([], json.loads(path.read_text())["warnings"])
+
     def test_status_reports_the_record_and_changes_nothing(self):
         slug = self.rig.trip("a")
         before = self.rig.counts()

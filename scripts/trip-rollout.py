@@ -283,8 +283,18 @@ SELECT row_to_json(x) FROM (
          (SELECT iv.schema_version FROM control_plane.intake_versions iv
            WHERE iv.trip_id = t.id ORDER BY iv.version DESC LIMIT 1) AS data_schema,
          EXISTS (SELECT 1 FROM control_plane.jobs j
-                  WHERE j.trip_id = t.id AND j.state IN ('queued', 'leased', 'running', 'waiting')) AS job_in_flight
-    FROM control_plane.trips t WHERE t.slug = :'slug') x;
+                  WHERE j.trip_id = t.id AND j.state IN ('queued', 'leased', 'running', 'waiting')) AS job_in_flight,
+         pv.release_id AS provisioned_release_id,
+         COALESCE(pv.finished_at > (SELECT max(r.started_at) FROM control_plane.trip_rollouts r WHERE r.trip_id = t.id),
+                  pv.finished_at IS NOT NULL) AS provisioned_after_last_rollout
+    FROM control_plane.trips t
+    LEFT JOIN LATERAL (
+      SELECT p.release_id, j.updated_at AS finished_at
+        FROM control_plane.plans p
+        JOIN control_plane.jobs j ON j.plan_id = p.id AND j.job_type = 'provision' AND j.state = 'succeeded'
+       WHERE p.trip_id = t.id AND p.status = 'executed' AND p.release_id IS NOT NULL
+       ORDER BY p.created_at DESC, p.id DESC LIMIT 1) pv ON true
+   WHERE t.slug = :'slug') x;
 """
 
 
@@ -412,6 +422,19 @@ def release_refusal(cfg: Config, release: dict, row: dict) -> Optional[str]:
     return None
 
 
+def stale_record_warning(row: dict) -> Optional[str]:
+    """A warning, never a refusal: the trip's recorded release disagrees with the release of its latest
+    successful provision, and no rollout has run since. A control-plane rollback followed by a re-provision
+    leaves the record stale this way, and the migration's backfill does not run again. After a rollout the two
+    differ on purpose (the record is newer), which is why a rollout since the provision silences it."""
+    current, provisioned = row.get("current_release_id"), row.get("provisioned_release_id")
+    if current and provisioned and current != provisioned and row.get("provisioned_after_last_rollout"):
+        return (f"the recorded release is {current}, but the trip's latest successful provision was onto "
+                f"{provisioned} and no rollout has run since, so the record may be stale; check what the trip "
+                "really runs before relying on it as the way back")
+    return None
+
+
 def commit_present(cfg: Config, revision: str) -> bool:
     out = subprocess.run(["git", "-C", str(cfg.repo_root), "cat-file", "-e", f"{revision}^{{commit}}"],
                          capture_output=True, stdin=subprocess.DEVNULL)
@@ -453,7 +476,7 @@ def cmd_plan(cfg: Config, db: Db, args) -> int:
     release = get_release(db, args.release)
 
     present = commit_present(cfg, release["source_revision"])
-    trips, refused, notes = [], [], []
+    trips, refused, notes, warnings = [], [], [], []
     say(f"release {release['id']}  commit {release['source_revision']}  ({release['status']})")
     say(f"steps   {', '.join(steps)}")
     for slug in slugs:
@@ -471,6 +494,10 @@ def cmd_plan(cfg: Config, db: Db, args) -> int:
         current = trip.current
         entry = {"slug": slug, "trip_id": trip.row["id"], "from_release_id": current}
         trips.append(entry)
+        stale = stale_record_warning(trip.row)
+        if stale:
+            warnings.append({"slug": slug, "warning": stale})
+            say(f"  WARNING  {slug}: {stale}")
         if current is None:
             runs = "unknown (no release recorded)"
             note = "no way back is recorded for this first rollout"
@@ -494,6 +521,7 @@ def cmd_plan(cfg: Config, db: Db, args) -> int:
         "trips": trips,
         "refused": refused,
         "notes": notes,
+        "warnings": warnings,
     }
     data = (json.dumps(plan, indent=2, sort_keys=True) + "\n").encode("utf-8")
     path = Path(args.plan_file)

@@ -823,6 +823,8 @@ class OneRolloutIsOneApproval(Harness):
     def test_each_step_run_on_its_own_asks_the_lead_and_refuses_a_subagent(self):
         for command in ("cd ~/dep && ./setup-mcp.sh --restart-only --trip-dir ./trips/alpha-2026",
                         "scripts/companion-refresh-prompts.sh alpha2026",
+                        "./restart-trip-mcp.sh alpha-2026",
+                        "cd ~/dep && ./restart-all-trip-mcp.sh",
                         "hermes -p alpha2026 gateway stop",
                         "hermes -p alpha2026 gateway start",
                         "launchctl kickstart -k gui/501/ai.hermes.gateway-alpha2026"):
@@ -834,6 +836,19 @@ class OneRolloutIsOneApproval(Harness):
                 d = self.hook(command, agent_type="developer")
                 self.assertEqual("deny", d.get("permissionDecision"))
                 self.assertIn("hard rule 2", d["permissionDecisionReason"])
+
+    def test_a_commit_that_mentions_a_step_is_still_a_commit_and_a_search_for_one_is_silent(self):
+        # Review round 1: neither may be read as the step itself.
+        d = self.hook('git commit -m "hermes gateway restart now asks"')
+        self.assertEqual("ask", d.get("permissionDecision"))
+        self.assertIn("hard rule 1", d["permissionDecisionReason"])
+        self.assertNotIn("rollout", d["permissionDecisionReason"].lower())
+        d = self.hook('git commit -m "setup-mcp.sh --restart-only now asks"', agent_type="developer")
+        self.assertIn("hard rule 1", d["permissionDecisionReason"])
+        for command in ('grep "setup-mcp.sh --restart-only" docs/x.md', "rg 'companion-refresh-prompts.sh' docs",
+                        'git grep "hermes gateway restart" -- docs', 'grep -rn "restart-trip-mcp.sh" docs'):
+            self.assertEqual({}, self.hook(command), command)
+            self.assertEqual({}, self.hook(command, agent_type="developer"), command)
 
     def test_the_prompt_for_other_deploys_is_unchanged(self):
         text = self.reason("docker compose -f x.yml up -d --build")

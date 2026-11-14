@@ -276,6 +276,71 @@ class Rollout(unittest.TestCase):
         self.assertEqual(classify("git commit -m 'the hook now asks before hermes -p x gateway start'"), "commit")
         self.assertEqual(classify("cat > notes.md <<'EOF'\nrun trip-rollout.py execute --plan-file p\nEOF"), "none")
 
+    def test_a_commit_whose_message_starts_with_a_step_stays_a_commit(self):
+        # Review round 1: a double-quoted message that BEGINS with a step's words read as a command position.
+        for command in (
+            'git commit -m "hermes gateway restart now asks"',
+            'git commit -m "setup-mcp.sh --restart-only is now asked about"',
+            'git commit -m "companion-refresh-prompts.sh asks too"',
+            'git commit -m "trip-rollout.py execute is one approval"',
+            'git commit -m "restart-trip-mcp.sh and restart-all-trip-mcp.sh ask"',
+            "git commit -m 'hermes -p x gateway stop is asked'",
+            "git commit -m \"$(cat <<'EOF'\nhermes gateway restart now asks\nEOF\n)\"",
+        ):
+            self.assertEqual(classify(command), "commit", command)
+
+    def test_searching_for_or_printing_a_step_is_not_running_it(self):
+        # A documentation sweep greps for these words; a subagent doing one must not be refused.
+        for command in (
+            'grep "setup-mcp.sh --restart-only" docs/runbook.md',
+            "rg 'companion-refresh-prompts.sh' docs",
+            "rg \"hermes -p x gateway stop\" docs",
+            'git grep "hermes gateway restart" -- docs',
+            'grep -rn "trip-rollout.py execute" docs scripts',
+            'grep -n "restart-trip-mcp.sh" docs/runbook.md',
+            'echo "hermes -p x gateway stop"',
+            "printf 'setup-mcp.sh --restart-only\\n'",
+            'sed -n 1,5p "companion-refresh-prompts.sh"',
+            "cat docs/runbook.md | grep 'hermes gateway start'",
+            "ssh host grep -n setup-mcp.sh --restart-only docs/x.md",
+            "ssh host \"grep -n 'setup-mcp.sh --restart-only' docs/x.md\"",
+            "docker exec hermes grep -rn 'gateway stop' /docs",
+            'bash -c "grep -n setup-mcp.sh docs/x.md"',
+        ):
+            self.assertEqual(classify(command), "none", command)
+
+    def test_a_step_that_really_runs_after_a_search_still_asks(self):
+        self.assertEqual(classify('grep -rn "hermes gateway stop" docs && hermes -p a gateway stop'), "deploy")
+        self.assertEqual(classify("echo done; ./setup-mcp.sh --restart-only --trip-dir t"), "deploy")
+
+    def test_a_step_inside_a_shell_payload_is_still_a_deploy(self):
+        for command in (
+            'bash -c "hermes -p a gateway stop"',
+            "sh -c 'cd x && ./setup-mcp.sh --restart-only --trip-dir t'",
+            'ssh -i key -o BatchMode=yes host "cd x && ./setup-mcp.sh --restart-only --trip-dir t"',
+            "ssh host 'scripts/companion-refresh-prompts.sh alpha'",
+            'ssh host "sudo hermes -p a gateway restart"',
+            "docker exec -u 10000 -e X=1 hermes sh -c 'hermes -p a gateway start'",
+            'ssh host "ssh inner hermes -p a gateway stop"',
+        ):
+            self.assertEqual(classify(command), "deploy", command)
+
+    def test_the_generic_bridge_restart_wrappers_are_deploys_and_reading_them_is_not(self):
+        for command in (
+            "./restart-trip-mcp.sh alpha-2026",
+            "~/some-deployment/restart-all-trip-mcp.sh",
+            "bash restart-trip-mcp.sh alpha-2026",
+            "sudo ./restart-all-trip-mcp.sh",
+            "cd ~/dep && ./restart-trip-mcp.sh a",
+            "KINERARY_DEPLOY_ROOT=/x ./restart-all-trip-mcp.sh",
+            "ssh host sudo ./restart-all-trip-mcp.sh",
+            'ssh host "cd x && ./restart-trip-mcp.sh a"',
+        ):
+            self.assertEqual(classify(command), "deploy", command)
+        for command in ("cat restart-trip-mcp.sh", "grep -n pid restart-all-trip-mcp.sh", "ls restart-trip-mcp.sh",
+                        "bash -n restart-trip-mcp.sh"):
+            self.assertEqual(classify(command), "none", command)
+
     def test_the_older_deploy_verbs_still_win_and_keep_their_class(self):
         self.assertEqual(classify("git push origin x && python3 scripts/trip-rollout.py execute --plan-file p"), "deploy")
         self.assertEqual(classify("docker restart trip-server"), "deploy")

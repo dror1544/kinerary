@@ -464,7 +464,7 @@ rollout_note() {
   local c="$1" args plan_file digest steps_arg base="" path got="" line summary steps_shown="" hex=""
   case "$c" in
     *trip-rollout.py*) ;;
-    *setup-mcp.sh*--restart-only*|*companion-refresh-prompts.sh*|*'gateway stop'*|*'gateway start'*|*'gateway restart'*|*launchctl*hermes.gateway*)
+    *setup-mcp.sh*--restart-only*|*restart-trip-mcp.sh*|*restart-all-trip-mcp.sh*|*companion-refresh-prompts.sh*|*'gateway stop'*|*'gateway start'*|*'gateway restart'*|*launchctl*hermes.gateway*)
       printf 'This is one step of a rollout run on its own. A whole rollout is approved once, per plan: scripts/trip-rollout.py plan, then execute.'
       return 0 ;;
     *) return 0 ;;
