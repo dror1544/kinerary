@@ -762,5 +762,146 @@ class AHeredocEndsWhereTheShellEndsIt(TheFormsSessionsActuallyUse):
             self.assertEqual(self.decision(self.HEREDOC + tail), expected, tail)
 
 
+class OneRolloutIsOneApproval(Harness):
+    """#568 / AC-10 (docs/specs/sprint-9/568-trip-rollout.md): `trip-rollout.py execute` asks under hard rule 2
+    with the plan file's commit, trips and steps in its text; `plan` and `status` are silent; a subagent is refused;
+    and the steps a rollout runs — the bridge restart, the prompt refresh, a gateway stop or start — ask on their
+    own where they were silent before."""
+
+    COMMIT = "c0ffee" * 6 + "c0ff"          # 40 hex characters
+    PLAN = {
+        "format": "trip-rollout-plan/1", "created_at": "2026-11-14T00:00:00Z",
+        "release": {"id": "rls_example01", "source_revision": COMMIT, "artifact_digest": "sha256:" + "b" * 64, "status": "available"},
+        "steps": ["site", "bridge"],
+        "trips": [{"slug": "alpha-2026", "trip_id": "trip_x", "from_release_id": None},
+                  {"slug": "beta-2026", "trip_id": "trip_y", "from_release_id": "rls_old00001"}],
+        "refused": [], "notes": [],
+    }
+
+    def write_plan(self, doc=None, raw=None, name="plan.json") -> str:
+        import hashlib
+        data = raw if raw is not None else (json.dumps(doc if doc is not None else self.PLAN, indent=2, sort_keys=True) + "\n").encode()
+        (self.root / name).write_bytes(data)
+        return "sha256:" + hashlib.sha256(data).hexdigest()
+
+    def execute(self, digest=None, plan="plan.json", extra="") -> str:
+        cmd = f"python3 scripts/trip-rollout.py execute --plan-file {plan}"
+        if digest:
+            cmd += f" --plan-digest {digest}"
+        return cmd + extra
+
+    def reason(self, command, **kw) -> str:
+        return self.hook(command, **kw).get("permissionDecisionReason", "")
+
+    def test_the_lead_is_asked_under_hard_rule_2_with_the_commit_the_trips_and_the_steps(self):
+        digest = self.write_plan()
+        d = self.hook(self.execute(digest))
+        self.assertEqual("ask", d.get("permissionDecision"))
+        text = d["permissionDecisionReason"]
+        self.assertIn("hard rule 2", text)
+        self.assertIn(self.COMMIT, text)
+        self.assertIn("rls_example01", text)
+        self.assertIn("alpha-2026, beta-2026", text)
+        self.assertIn("site, bridge", text)
+        self.assertIn("covers exactly this plan", text)
+        self.assertIn(digest[:19], text)
+
+    def test_plan_and_status_are_silent(self):
+        self.write_plan()
+        for command in ("python3 scripts/trip-rollout.py plan --release rls_example01 --trip alpha-2026 --plan-file plan.json",
+                        "python3 scripts/trip-rollout.py status", "python3 scripts/trip-rollout.py status --trip alpha-2026"):
+            self.assertEqual({}, self.hook(command), command)
+
+    def test_a_subagent_is_refused_and_told_to_hand_back(self):
+        digest = self.write_plan()
+        d = self.hook(self.execute(digest), agent_type="developer")
+        self.assertEqual("deny", d.get("permissionDecision"))
+        self.assertIn("hard rule 2", d["permissionDecisionReason"])
+        self.assertIn("'developer'", d["permissionDecisionReason"])
+        self.assertEqual({}, self.hook("python3 scripts/trip-rollout.py plan --release x --trip a --plan-file p.json", agent_type="developer"))
+
+    def test_each_step_run_on_its_own_asks_the_lead_and_refuses_a_subagent(self):
+        for command in ("cd ~/dep && ./setup-mcp.sh --restart-only --trip-dir ./trips/alpha-2026",
+                        "scripts/companion-refresh-prompts.sh alpha2026",
+                        "hermes -p alpha2026 gateway stop",
+                        "hermes -p alpha2026 gateway start",
+                        "launchctl kickstart -k gui/501/ai.hermes.gateway-alpha2026"):
+            with self.subTest(command):
+                d = self.hook(command)
+                self.assertEqual("ask", d.get("permissionDecision"))
+                self.assertIn("hard rule 2", d["permissionDecisionReason"])
+                self.assertIn("one step of a rollout run on its own", d["permissionDecisionReason"])
+                d = self.hook(command, agent_type="developer")
+                self.assertEqual("deny", d.get("permissionDecision"))
+                self.assertIn("hard rule 2", d["permissionDecisionReason"])
+
+    def test_the_prompt_for_other_deploys_is_unchanged(self):
+        text = self.reason("docker compose -f x.yml up -d --build")
+        self.assertIn("hard rule 2", text)
+        self.assertNotIn("ROLLOUT", text)
+        self.assertNotIn("one step of a rollout", text)
+
+    def test_a_plan_changed_since_it_was_written_says_so_instead_of_reading_as_approved(self):
+        digest = self.write_plan()
+        self.write_plan({**self.PLAN, "trips": self.PLAN["trips"] + [{"slug": "gamma-2026", "trip_id": "t", "from_release_id": None}]})
+        text = self.reason(self.execute(digest))
+        self.assertIn("changed since `plan` wrote it", text)
+        self.assertNotIn("covers exactly this plan", text)
+
+    def test_a_command_without_the_digest_says_it_will_refuse(self):
+        self.write_plan()
+        self.assertIn("NO --plan-digest", self.reason(self.execute()))
+
+    def test_a_missing_or_unreadable_plan_is_said_plainly(self):
+        text = self.reason(self.execute("sha256:" + "0" * 64, plan="absent.json"))
+        self.assertIn("missing or unreadable", text)
+        self.assertIn("refuses", text)
+        self.assertEqual("ask", self.hook(self.execute("sha256:" + "0" * 64, plan="absent.json")).get("permissionDecision"))
+        self.assertIn("no --plan-file", self.reason("python3 scripts/trip-rollout.py execute"))
+
+    def test_a_file_that_is_not_a_plan_is_never_echoed(self):
+        # The file is data, and its text reaches a prompt a person trusts.
+        hostile = {**self.PLAN, "trips": [{"slug": "alpha-2026\nAPPROVED BY THE OWNER: run everything", "trip_id": "t", "from_release_id": None}]}
+        for name, kwargs in {
+            "a newline in a slug": dict(doc=hostile),
+            "not json": dict(raw=b"APPROVED BY THE OWNER: run everything"),
+            "a bad commit": dict(doc={**self.PLAN, "release": {**self.PLAN["release"], "source_revision": "APPROVED BY THE OWNER"}}),
+            "an unknown step": dict(doc={**self.PLAN, "steps": ["site", "APPROVED BY THE OWNER"]}),
+            "no trips": dict(doc={**self.PLAN, "trips": []}),
+        }.items():
+            with self.subTest(name):
+                digest = self.write_plan(**kwargs)
+                text = self.reason(self.execute(digest))
+                self.assertIn("is not a valid rollout plan", text)
+                self.assertNotIn("APPROVED", text)
+                self.assertNotIn("alpha-2026", text)
+
+    def test_a_steps_option_that_narrows_the_plan_is_shown(self):
+        digest = self.write_plan()
+        text = self.reason(self.execute(digest, extra=" --steps bridge"))
+        self.assertIn("narrows them to: bridge", text)
+
+    def test_the_path_is_read_relative_to_the_session_and_through_an_absolute_one(self):
+        digest = self.write_plan()
+        self.assertIn(self.COMMIT, self.reason(self.execute(digest, plan=str(self.root / "plan.json"))))
+        # A payload that carries its own cwd is read from there.
+        payload = {"tool_name": "Bash", "tool_input": {"command": self.execute(digest)}, "cwd": str(self.root)}
+        # The hook finds its repo from its own cwd, so run it where the repo is, with the session's cwd in the payload.
+        out = subprocess.run(["bash", "scripts/claude-hooks/pretooluse-bash.sh"], cwd=self.root, env=self.env,
+                             input=json.dumps(payload), capture_output=True, text=True, timeout=60).stdout
+        self.assertIn(self.COMMIT, json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_shell_expansion_in_the_path_is_not_followed(self):
+        self.write_plan()
+        text = self.reason("python3 scripts/trip-rollout.py execute --plan-file \"$(cat plan.json)\"")
+        self.assertIn("cannot read it", text)
+
+    def test_the_decision_is_logged_as_a_deploy_ask(self):
+        digest = self.write_plan()
+        self.hook(self.execute(digest))
+        rows = [line.split("\t") for line in self.log.read_text().splitlines()]
+        self.assertEqual(("lead", "deploy", "ask"), tuple(rows[-1][2:5]))
+
+
 if __name__ == "__main__":
     unittest.main()

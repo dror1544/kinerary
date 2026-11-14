@@ -1422,6 +1422,7 @@ class ProvisionerWorker:
             # deploy into a failed one over a nice-to-have. Same posture as
             # the enrichment call above: never fatal.
             self._record_plan_snapshot(conn, trip_id, config)
+            self._record_release(conn, trip_id, plan_id)
 
             logger.info(
                 "provisioner.job_succeeded",
@@ -1733,6 +1734,53 @@ class ProvisionerWorker:
             logger.warning(
                 "provisioner.plan_snapshot_failed",
                 extra={"trip_id": trip_id},
+                exc_info=True,
+            )
+
+    def _record_release(self, conn: psycopg.Connection, trip_id: str, plan_id: str) -> None:
+        """Record which release this trip's site now runs (#568).
+
+        ``trips.current_release_id`` is what ``scripts/trip-rollout.py`` reads as
+        "the version it runs now", so a trip built or rebuilt here must say so
+        from its first day, or its first rollout would start from "unknown".
+        A re-provision onto a DIFFERENT release moves the old one to
+        ``previous_release_id`` (the way back); onto the same release it leaves
+        ``previous_release_id`` alone.
+
+        After ``_complete`` and in its own transaction, for the reason
+        ``_record_plan_snapshot`` gives: this worker can be newer than the
+        schema it talks to, and an UPDATE naming a column migration
+        20261114130000 has not added must cost the record, never the deploy.
+        Unlike the snapshot, the loss is LOUD: a record that silently does not
+        land is the very gap this column closes, so every failure — and a plan
+        that names no release — is a warning with the trip id in it.
+        """
+        try:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE control_plane.trips t
+                           SET previous_release_id = CASE
+                                 WHEN t.current_release_id IS NOT NULL
+                                  AND t.current_release_id IS DISTINCT FROM p.release_id
+                                 THEN t.current_release_id
+                                 ELSE t.previous_release_id END,
+                               current_release_id = p.release_id
+                          FROM control_plane.plans p
+                         WHERE t.id = %s AND p.id = %s AND p.release_id IS NOT NULL
+                        """,
+                        (trip_id, plan_id),
+                    )
+                    if cur.rowcount == 0:
+                        logger.warning(
+                            "provisioner.release_unrecorded",
+                            extra={"trip_id": trip_id, "plan_id": plan_id},
+                        )
+        except Exception:
+            logger.warning(
+                "provisioner.release_record_failed",
+                extra={"trip_id": trip_id, "plan_id": plan_id},
                 exc_info=True,
             )
 

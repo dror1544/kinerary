@@ -103,6 +103,32 @@ MERGE = re.compile(
 # force push rewrites what they already had.
 PUSH = re.compile(CMDPOS + r'(?:sudo\s+)?git\b(?:\s+-\S+(?:\s+\S+)?)*\s+push(?![\w-])')
 
+# One rollout is one approval (CLAUDE.md, "Faster delivery", 2026-11-14), so the
+# command that IS the rollout and each step it runs on its own are all deploys.
+# Until this list, a bridge restart, a prompt refresh and a gateway stop/start
+# were never asked at all (#568); now they are, and the prompt for the command
+# that covers them all names the commit, the trips and the steps.
+#
+# Kept apart from DEPLOY, and joined to it only at the dispatch below, so the
+# two lists are edited without touching each other's lines.
+#
+#   * `trip-rollout.py execute` — and only `execute`, as the first word after the
+#     script: `plan` and `status` read, and `--plan-file …/execute.json` is a name.
+#   * the bridge restart (`setup-mcp.sh --restart-only`), the prompt refresh
+#     (`companion-refresh-prompts.sh`, whose own `--dry-run` reads) and a Hermes
+#     gateway stop/start/restart, which cuts a family's companion off mid-turn.
+#     These sit at a command position, after ssh, or inside `docker exec`, with
+#     optional VAR=value words before them, so prose that merely mentions them
+#     (a commit message, an issue body) does not prompt.
+ENVWORDS = r'(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*'
+STEPPOS = r'(?:' + CMDPOS + r'|\b(?:ssh|exec)\b[^\n;&|]*\s)' + ENVWORDS + r'(?:sudo\s+(?:-\S+\s+)*)?'
+ROLLOUT = re.compile(
+    CMDPOS + ENVWORDS + r'(?:sudo\s+)?(?:python3?(?:\s+-\S+)*\s+)?\S*trip-rollout\.py\s+execute(?=[\s;&|"\')]|$)'
+    r'|' + STEPPOS + r'(?:bash\s+|sh\s+)?\S*setup-mcp\.sh\b[^\n;&|]*--restart-only\b'
+    r'|' + STEPPOS + r'(?:bash\s+|sh\s+)?\S*companion-refresh-prompts\.sh\b(?![^\n;&|]*--dry-run\b)'
+    r'|' + STEPPOS + r'(?:\S*/)?hermes\b[^\n;&|]*\bgateway\s+(?:stop|start|restart)\b'
+    r'|' + STEPPOS + r'launchctl\s+(?:kickstart|bootout|bootstrap|unload|load|stop|start|kill)\b[^\n;&|]*hermes\.gateway')
+
 # --normalize: rewrite the inert shapes sessions actually type into the plain form
 # the hook's exemptions match (2026-09-26, from the decision log: 8 of 9 prompts
 # in 90 minutes were for commits the exemptions meant to allow). Only two things
@@ -157,6 +183,53 @@ if len(sys.argv) > 1 and sys.argv[1] == "--normalize":
     sys.stdout.write(normalize(sys.stdin.read()))
     sys.exit(0)
 
+# --rollout-args: `execute`, then the three options of `trip-rollout.py execute` the
+# approval prompt needs, one per line — the plan file, its digest, the narrowed steps
+# (each empty when absent). Read with shlex from the one statement that runs the command, so what the
+# prompt describes is what the shell will hand the script. Prints nothing when the
+# command is not that, or cannot be read as words.
+ROLLOUT_EXECUTE = re.compile(r'trip-rollout\.py\s+execute(?=[\s;&|"\')]|$)')
+STATEMENT_END = re.compile(r'[;&|\n]')
+
+
+def rollout_args(command: str):
+    import shlex
+    m = ROLLOUT_EXECUTE.search(strip_heredocs(command))
+    if not m:
+        return None
+    tail = strip_heredocs(command)[m.end():]
+    cut = STATEMENT_END.search(tail)
+    tail = tail[:cut.start()] if cut else tail
+    try:
+        words = shlex.split(tail)
+    except ValueError:
+        # Run through ssh, the statement ends at the quote that closed the payload.
+        try:
+            words = shlex.split(tail.rstrip().rstrip("\"'"))
+        except ValueError:
+            return None
+    found = {"--plan-file": "", "--plan-digest": "", "--steps": ""}
+    i = 0
+    while i < len(words):
+        w = words[i]
+        for opt in found:
+            if w == opt and i + 1 < len(words):
+                found[opt] = words[i + 1]
+                i += 1
+                break
+            if w.startswith(opt + "="):
+                found[opt] = w[len(opt) + 1:]
+                break
+        i += 1
+    return found
+
+
+if len(sys.argv) > 1 and sys.argv[1] == "--rollout-args":
+    got = rollout_args(sys.stdin.read())
+    if got:
+        sys.stdout.write("execute\n" + "\n".join(got[o] for o in ("--plan-file", "--plan-digest", "--steps")) + "\n")
+    sys.exit(0)
+
 raw = strip_heredocs(sys.stdin.read())
 
 # Asymmetric on purpose. Deploy verbs are matched with quotes intact, because a
@@ -167,7 +240,7 @@ raw = strip_heredocs(sys.stdin.read())
 # Merge and push follow commit's rule: quotes stripped, prose does not prompt.
 # Order is by consequence, so `git push && deploy.sh` is a deploy and
 # `git merge x && git commit` is a commit.
-if DEPLOY.search(raw):
+if DEPLOY.search(raw) or ROLLOUT.search(raw):
     print("deploy")
 elif COMMIT.search(strip_quotes(raw)):
     print("commit")
