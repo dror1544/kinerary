@@ -739,3 +739,51 @@ class PinGatewayOff(unittest.TestCase):
                 with contextlib.redirect_stdout(out):
                     code = teardown.main()
         return {"code": code, "log": log, "stdout": out.getvalue()}
+
+
+class BridgeLaunchAgents(unittest.TestCase):
+    """A Mac bridge runs as a LaunchAgent (kinerary-deploy's setup-mcp.sh, 2026-11-15).
+    Killing its pid is not enough: KeepAlive restarts it, and on 2026-11-15 a torn-down
+    trip's agent stayed loaded, respawning against a directory that had been moved away.
+    Teardown finds the agent by what it RUNS (a program inside the trip's directory), not
+    by a label the deployment chose."""
+
+    def _agent(self, agents: Path, label: str, program: str) -> Path:
+        import plistlib
+        path = agents / f"{label}.plist"
+        path.write_bytes(plistlib.dumps({"Label": label, "ProgramArguments": ["/bin/bash", program]}))
+        return path
+
+    def test_finds_only_agents_whose_program_lives_in_the_trip_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            agents, trip, other = root / "LaunchAgents", root / "trips/italy-2026", root / "trips/italy-2026-2"
+            for d in (agents, trip / "mcp", other / "mcp"):
+                d.mkdir(parents=True)
+            mine = self._agent(agents, "com.example.bridge.italy", str(trip / "mcp/run-bridge.sh"))
+            self._agent(agents, "com.example.bridge.italy2", str(other / "mcp/run-bridge.sh"))
+            self._agent(agents, "ai.hermes.gateway-italy2026", "/usr/local/bin/hermes")
+            (agents / "broken.plist").write_text("not a plist")
+            with mock.patch.object(teardown, "LAUNCH_AGENTS", agents):
+                found = teardown.bridge_launch_agents(trip)
+            self.assertEqual(found, [("com.example.bridge.italy", mine)])
+
+    def test_no_launch_agents_directory_means_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(teardown, "LAUNCH_AGENTS", Path(tmp) / "absent"):
+                self.assertEqual(teardown.bridge_launch_agents(Path(tmp) / "trips/x"), [])
+
+    def test_unloading_boots_out_then_deletes_the_plist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            agents, trip = root / "LaunchAgents", root / "trips/italy-2026"
+            agents.mkdir(); (trip / "mcp").mkdir(parents=True)
+            plist = self._agent(agents, "com.example.bridge.italy", str(trip / "mcp/run-bridge.sh"))
+            calls = []
+            with mock.patch.object(teardown, "LAUNCH_AGENTS", agents), \
+                 mock.patch.object(teardown.subprocess, "run", side_effect=lambda a, **k: calls.append(a)):
+                removed = teardown.unload_bridge_agents(trip)
+            self.assertEqual(removed, ["com.example.bridge.italy"])
+            self.assertEqual(calls[0][:2], ["launchctl", "bootout"])
+            self.assertTrue(calls[0][2].endswith("/com.example.bridge.italy"))
+            self.assertFalse(plist.exists())

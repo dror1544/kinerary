@@ -21,8 +21,11 @@ found a step that quietly undoes itself. This is that run's order, as a command:
                 companion-install-host.sh only tests that the directory exists,
                 reports ALREADY_PRESENT, and skips rendering the companion.
   3. gateway    hermes gateway uninstall (+ launchctl bootout if launchd lags)
-  4. bridge     stop this trip's trip-mcp, by its pid file, after checking the
-                pid really is the listener on this trip's port
+  4. bridge     unload any LaunchAgent whose program lives in this trip's
+                directory (a Mac bridge under launchd; KeepAlive would restart
+                a killed pid) and delete its plist; then stop this trip's
+                trip-mcp, by its pid file, after checking the pid really is
+                the listener on this trip's port
   5. infra      Cloudflare DNS + ingress rule, NPM host, LXC — through the
                 worker's own provisioner (LxcProvisionAdapter), outside-in, so
                 auth and adapters are exactly provisioning's
@@ -402,6 +405,45 @@ def listeners(port: str) -> list[str]:
                               capture_output=True, text=True).stdout.split()
     out = subprocess.run(["ss", "-ltnpH", f"sport = :{port}"], capture_output=True, text=True).stdout
     return re.findall(r"pid=(\d+)", out)
+
+
+def bridge_launch_agents(trip_dir: Path) -> list[tuple[str, Path]]:
+    """(label, plist) for every LaunchAgent whose program lives inside this trip's
+    directory. A Mac bridge may run under launchd (the deployment's setup-mcp.sh,
+    2026-11-15), and KeepAlive restarts a killed pid, so the agent itself has to go.
+    Matched by what it RUNS, never by a label the deployment chose: a second
+    deployment names its agents however it likes. No agents directory (the VM): none."""
+    import plistlib
+    if not LAUNCH_AGENTS.is_dir():
+        return []
+    root = trip_dir.resolve()
+    found = []
+    for plist in sorted(LAUNCH_AGENTS.glob("*.plist")):
+        try:
+            doc = plistlib.loads(plist.read_bytes())
+        except Exception:
+            continue
+        label, argv = doc.get("Label"), doc.get("ProgramArguments") or []
+        if not isinstance(label, str) or not isinstance(argv, list):
+            continue
+        for arg in argv:
+            if isinstance(arg, str) and arg.startswith("/"):
+                p = Path(arg).resolve()
+                if p == root or root in p.parents:
+                    found.append((label, plist))
+                    break
+    return found
+
+
+def unload_bridge_agents(trip_dir: Path) -> list[str]:
+    """Boot each of this trip's LaunchAgents out, then delete its plist so a reboot
+    or a login cannot load it again. Returns the labels removed."""
+    removed = []
+    for label, plist in bridge_launch_agents(trip_dir):
+        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"], capture_output=True, text=True)
+        plist.unlink(missing_ok=True)
+        removed.append(label)
+    return removed
 
 
 def bridge(trip_dir: Path) -> tuple[str, str] | None:
@@ -790,6 +832,7 @@ def main() -> int:
         topo_vmid = str((raw.get("proxmox") or {}).get("vmid") or "")
 
     b = bridge(trip_dir)
+    agents = bridge_launch_agents(trip_dir)
     store = document_store(trip)
     originals = kept_originals(store)
     plan = [
@@ -798,7 +841,9 @@ def main() -> int:
          "cannot restart it between the stop and the retirement"),
         ("allowlist", interviewer_allows(profile), f"drop {profile} from the interviewer's allowlist, restart it"),
         ("gateway", gateway_installed(profile), f"uninstall the {profile} gateway"),
-        ("bridge", b is not None, f"stop trip-mcp pid {b[0]} on :{b[1]}" if b else "no bridge"),
+        ("bridge", b is not None or bool(agents), "; ".join(
+            ([f"unload LaunchAgent {label}" for label, _ in agents])
+            + ([f"stop trip-mcp pid {b[0]} on :{b[1]}"] if b else [])) or "no bridge"),
         ("infra", topo is not None,
          (f"Cloudflare + NPM for {orig}; KEEP the container as {reference_name(orig)} "
           f"on http://{topo.proxy.forward_host}:{topo.proxy.forward_port}/" if args.keep_container
@@ -878,6 +923,9 @@ def main() -> int:
             time.sleep(3)
         say(f"{GREEN}✓{RESET}" if not gateway_loaded(profile) else f"{RED}✗{RESET}", "gateway    uninstalled")
 
+    # The agent first: launchd's KeepAlive would restart a pid killed under it.
+    for label in unload_bridge_agents(trip_dir):
+        say(f"{GREEN}✓{RESET}", f"bridge     unloaded LaunchAgent {label}")
     if b:
         pid, port = b
         listener = listeners(port)
