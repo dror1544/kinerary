@@ -446,6 +446,45 @@ merge_evidence() {
   printf '\n\nPR #%s -> %s. Checks: %s.%s' "$n" "$where" "$checks" "$draft"
 }
 
+# A `feature set <switch> on|off <scope> --live` command (#567): name the switch,
+# the scope and the trips in the prompt, because "approve a deploy" alone does not
+# say who feels it. Sets FEATURE_NOTE and returns 0 when $1 is such a command, 1
+# otherwise (the ordinary deploy prompt then applies). Only printable, harmless
+# characters from the command reach the prompt.
+feature_live_note() {
+  local re rest tok name="" value="" trip="" scope="" next="" words=() i
+  re='(feature-cli(\.[jt]s)?|run(-script)?[[:space:]]+feature)(([[:space:]]+(--prefix=[^[:space:]]+|(--prefix|-C)[[:space:]]+[^[:space:]]+))*)([[:space:]]+--)?[[:space:]]+set[[:space:]]+([^;&|]*)'
+  [[ "$1" =~ $re ]] || return 1
+  rest="${BASH_REMATCH[${#BASH_REMATCH[@]}-1]}"   # the last group, whatever the groups before it are
+  read -r -a words <<<"$rest"
+  for ((i = 0; i < ${#words[@]}; i++)); do
+    tok="$(printf '%s' "${words[$i]}" | tr -cd '[:alnum:]_.:/=-')"
+    case "$tok" in
+      --all) scope="all" ;;
+      --new-trips) scope="new" ;;
+      --trip) scope="trip"; trip="$(printf '%s' "${words[$((i + 1))]:-}" | tr -cd '[:alnum:]_.:/-')"; i=$((i + 1)) ;;
+      --trip=*) scope="trip"; trip="${tok#--trip=}" ;;
+      --by|--database-url) i=$((i + 1)) ;;
+      --*) ;;
+      *) if [ -z "$name" ]; then name="$tok"; elif [ -z "$value" ]; then value="$tok"; fi ;;
+    esac
+  done
+  case "$scope" in
+    all)  next="EVERY trip, present and future — including any trip in use" ;;
+    new)  next="trips created from now on (no existing trip changes)" ;;
+    trip) next="the trip ${trip:-?} only — it may be in use" ;;
+    *)    next="none named: the command will refuse" ;;
+  esac
+  FEATURE_NOTE="CLAUDE.md hard rule 2 — a feature switch set with --live changes what trips in use do, and that is a deploy: it needs explicit approval, and a commit instruction does not imply it.
+
+Switch: ${name:-?} -> ${value:-?}
+Scope:  ${scope:-none}
+Trips:  ${next}
+
+Approve only if you meant to change that right now."
+  return 0
+}
+
 if [ -n "$agent" ]; then
   case "$kind" in
     deploy) rule="hard rule 2 — never deploy a live trip site without explicit approval" ;;
@@ -471,6 +510,11 @@ case "$kind" in
     emit ask "Pushing publishes commits to origin: after this they exist for everyone who fetches, and a force push rewrites what they already had. Approve only if you meant to push right now."
     ;;
   deploy)
+    # A feature switch set with --live gets a prompt that names what it changes,
+    # because "approve a deploy" says nothing about which trips feel it (#567).
+    if feature_live_note "$cmd"; then
+      emit ask "$FEATURE_NOTE"
+    fi
     # Deploys do not go through git, so this is the only place to catch them.
     emit ask "CLAUDE.md hard rule 2 — never deploy a live trip site without explicit approval. A commit instruction does not imply a deploy instruction. Approve only if you meant to deploy right now.
 

@@ -126,6 +126,54 @@ class Classify(unittest.TestCase):
         ):
             self.assertEqual(classify(command), "none", command)
 
+    def test_a_live_feature_switch_set_is_a_deploy(self):
+        # #567 AC-9: a switch set with --live reaches trips in use.
+        for command in (
+            "npm run feature -- set delivery_probe on --all --live",
+            "cd control-plane/api && npm run feature -- set delivery_probe off --trip japan-2026 --live",
+            "npm run feature --prefix control-plane/api -- set delivery_probe on --new-trips --live",
+            "npm --prefix control-plane/api run feature -- set delivery_probe on --all --live",
+            "node --import tsx src/feature-cli.ts set delivery_probe on --live --all",
+            "node dist/feature-cli.js set delivery_probe on --all --live=true",
+            "npm run feature -- set delivery_probe on --trip 'a;b|c' --live",
+            # review M2: other spellings that hand the CLI the same --live argv
+            "npm run-script feature -- set delivery_probe on --all --live",
+            "npm --prefix=control-plane/api run feature -- set delivery_probe on --all --live",
+            "npm -C control-plane/api run feature -- set delivery_probe on --all --live",
+            "npm run feature -- set delivery_probe on --all \"--live\"",
+            "npm run feature -- set delivery_probe on --all '--live'",
+            "npm --prefix=control-plane/api run-script feature --prefix=x -- set delivery_probe on --new-trips '--live'",
+            # an HTTP POST to the admin route whose body carries "live": true
+            "curl -s -X POST http://127.0.0.1:4310/v1/admin/feature-switches -H 'x-api-key: k' -d '{\"switch\":\"delivery_probe\",\"enabled\":true,\"scope\":\"all_trips\",\"live\":true}'",
+            "curl -s -X POST http://127.0.0.1:4310/v1/admin/feature-switches -d '{\"live\" :   true, \"switch\":\"delivery_probe\"}'",
+            "curl -s -d \"{\\\"live\\\": true}\" -X POST $BASE/v1/admin/feature-switches",
+            "curl -X POST -d '{\"live\":true}' http://x/v1/admin/feature-switches?trip=a",
+            "ssh host \"curl -s -X POST http://127.0.0.1:4310/v1/admin/feature-switches -d '{\\\"live\\\":true}'\"",
+            # a body this hook cannot read: asked, because it might say live
+            "curl -s -X POST http://127.0.0.1:4310/v1/admin/feature-switches -H 'x-api-key: k' --data-binary @body.json",
+            "curl -s -X POST $BASE/v1/admin/feature-switches -d @- <<'EOF'\n{\"live\":true}\nEOF",
+            "npm run feature -- set delivery_probe on --trip \"a&b\" --by 'x y' --live",
+            "ssh host \"cd api && npm run feature -- set delivery_probe on --all --live\"",
+        ):
+            self.assertEqual(classify(command), "deploy", command)
+
+    def test_a_feature_switch_set_without_live_and_the_reads_are_silent(self):
+        for command in (
+            "npm run feature -- set delivery_probe on --trip staging-test-trip",
+            "node --import tsx src/feature-cli.ts set delivery_probe off --trip staging-test-trip --by dror",
+            "npm run feature -- list",
+            "npm run feature -- show --trip japan-2026",
+            "npm run feature -- show --trip japan-2026 --live",
+            "npm run feature -- set delivery_probe on --trip x --live-run",
+            "npm run-script feature -- show --trip japan-2026",
+            "npm -C control-plane/api run feature -- set delivery_probe on --trip staging-test-trip",
+            "curl -s -H 'x-api-key: k' http://127.0.0.1:4310/v1/admin/feature-switches?trip=japan-2026",
+            "curl -s -X POST http://127.0.0.1:4310/v1/admin/feature-switches -d '{\"switch\":\"delivery_probe\",\"enabled\":true,\"scope\":\"trip\",\"trip\":\"t\",\"live\":false}'",
+            "curl -s -X POST http://127.0.0.1:4310/v1/admin/trips/x/resume -d '{\"live\":true}'",
+            "cat > notes.md <<'EOF'\nnpm run feature -- set delivery_probe on --all --live\nEOF",
+        ):
+            self.assertEqual(classify(command), "none", command)
+
     def test_pushes(self):
         for command in (
             "git push origin HEAD",
