@@ -107,6 +107,7 @@ class ReportsTheContractItCannotYetSatisfy(unittest.TestCase):
             root = Path(tmp) / "store"
             root.mkdir()
             (root / ".kinerary-document-store").mkdir()
+            (root / ".kinerary-document-store" / ".kinerary-document-store").touch()
             env = dict(BASE_ENV, DOCUMENT_STORE_MOUNT=str(root), DOCUMENT_STORE_ROOT=str(root))
             result = run(["--check"], env)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -132,10 +133,25 @@ class ReportsTheContractItCannotYetSatisfy(unittest.TestCase):
             root = Path(tmp) / "store"
             root.mkdir()
             (root / ".kinerary-document-store").mkdir()
+            (root / ".kinerary-document-store" / ".kinerary-document-store").touch()
             env = dict(BASE_ENV, DOCUMENT_STORE_MOUNT=str(root), DOCUMENT_STORE_ROOT=str(root))
             result = run(["--check"], env)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("contract satisfied", result.stdout)
+
+    def test_the_store_without_its_own_marker_fails_as_the_services_would(self):
+        """The services' DOCUMENT_STORE_DIR is <root>/.kinerary-document-store (compose.vm.yml), and
+        checkDocumentStore / check_document_store stat the marker INSIDE it. A store folder without that
+        marker passed this script and then stopped both services with NO_MARKER (found 2026-11-15)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "store"
+            root.mkdir()
+            (root / ".kinerary-document-store").mkdir()
+            env = dict(BASE_ENV, DOCUMENT_STORE_MOUNT=str(root), DOCUMENT_STORE_ROOT=str(root))
+            result = run(["--check"], env)
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("NO_MARKER", result.stdout)
+            self.assertIn(".kinerary-document-store/.kinerary-document-store", result.stdout)
 
     def test_a_missing_marker_alone_fails_the_contract(self):
         """The marker is the whole point: present means the real volume is here."""
@@ -154,6 +170,7 @@ class TheEnvFileIsDeploymentOwned(unittest.TestCase):
             root = Path(tmp) / "store"
             root.mkdir()
             (root / ".kinerary-document-store").mkdir()
+            (root / ".kinerary-document-store" / ".kinerary-document-store").touch()
             env = dict(BASE_ENV, DOCUMENT_STORE_MOUNT=str(root), DOCUMENT_STORE_ROOT=str(root))
             result = run(["--check"], env)
             self.assertIn(f"KINERARY_NFS_ROOT={root}", result.stdout)
@@ -164,6 +181,7 @@ class TheEnvFileIsDeploymentOwned(unittest.TestCase):
             root = Path(tmp) / "store"
             root.mkdir()
             (root / ".kinerary-document-store").mkdir()
+            (root / ".kinerary-document-store" / ".kinerary-document-store").touch()
             env_file = Path(tmp) / "vm.env"
             env_file.write_text("KINERARY_REV=abc\nKINERARY_NFS_ROOT=/somewhere/else\n")
             env = dict(
@@ -182,6 +200,7 @@ class TheEnvFileIsDeploymentOwned(unittest.TestCase):
             root = Path(tmp) / "store"
             root.mkdir()
             (root / ".kinerary-document-store").mkdir()
+            (root / ".kinerary-document-store" / ".kinerary-document-store").touch()
             env_file = Path(tmp) / "vm.env"
             env_file.write_text(f"KINERARY_NFS_ROOT={root}\n")
             before = env_file.read_text()

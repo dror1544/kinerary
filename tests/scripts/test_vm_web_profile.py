@@ -68,7 +68,7 @@ HAVE_NGINX = docker_works("image", "inspect", NGINX_IMAGE)
 BASE_ENV = {
     "KINERARY_REV": "abc1234", "HERMES_REV": "def5678", "INTERPRET_PATH_DEFAULT": "1",
     "INTERPRET_RUNNER": "claude", "EXTRACT_RUNNER": "claude", "INTERVIEW_MCP_KEY": "k-interview",
-    "CONTROL_PLANE_INTERVIEW_AGENT_KEY": "k-agent",
+    "CONTROL_PLANE_INTERVIEW_AGENT_KEY": "k-agent", "KINERARY_NFS_ROOT": "/srv/kinerary-nfs",
 }
 WEB_ENV = {
     "COMPOSE_PROFILES": "web", "PORTAL_ORIGIN": "https://portal.example.com", "RUNTIME_ORIGIN": "https://runtime.example.com",

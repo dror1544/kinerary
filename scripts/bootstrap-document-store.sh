@@ -178,6 +178,15 @@ else
     ok "marker directory created"
   fi
 
+  # The store's OWN marker. The services' DOCUMENT_STORE_DIR is this directory
+  # (compose.vm.yml: <root>/.kinerary-document-store), and both readiness checks
+  # stat <DOCUMENT_STORE_DIR>/.kinerary-document-store — a marker INSIDE it, the
+  # file docs/document-intake-operations.md touches. Without it the script passed
+  # and both services then refused to start with NO_MARKER (found 2026-11-15).
+  if [ -e "$ROOT/$MARKER/$MARKER" ]; then ok "store marker present"
+  elif [ "$MODE" != apply ]; then step "touch $ROOT/$MARKER/$MARKER (the marker the services check)"
+  else touch "$ROOT/$MARKER/$MARKER"; ok "store marker created"; fi
+
   if [ -n "$OWNER" ]; then
     if [ "$MODE" = apply ]; then chown "$OWNER" "$ROOT" "$ROOT/$MARKER" 2>/dev/null || say "note: could not chown to $OWNER (NFS squash?) — the write probe below is what decides"
     else step "chown $OWNER $ROOT $ROOT/$MARKER"; fi
@@ -209,6 +218,9 @@ verify() {
   # checks and then breaks the provisioner. Fail here, where it is cheap.
   if [ -e "$ROOT/$MARKER" ] && [ ! -d "$ROOT/$MARKER" ]; then
     say "FAIL NOT_A_DIRECTORY $ROOT/$MARKER is a file; the provisioner needs to create trip_<id> inside it"; failed=1
+  fi
+  if [ -d "$ROOT/$MARKER" ] && [ ! -e "$ROOT/$MARKER/$MARKER" ]; then
+    say "FAIL NO_MARKER       $ROOT/$MARKER/$MARKER is missing — the services' store is $ROOT/$MARKER and they check for it"; failed=1
   fi
   if [ -d "$ROOT/$MARKER" ]; then
     local trialdir="$ROOT/$MARKER/.trip-probe-$$"
