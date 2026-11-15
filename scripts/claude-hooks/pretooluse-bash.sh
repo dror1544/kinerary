@@ -446,6 +446,129 @@ merge_evidence() {
   printf '\n\nPR #%s -> %s. Checks: %s.%s' "$n" "$where" "$checks" "$draft"
 }
 
+# A rollout is approved once, per plan (CLAUDE.md "Faster delivery", 2026-11-14; spec
+# docs/specs/sprint-9/568-trip-rollout.md, AC-10). `scripts/trip-rollout.py execute`
+# runs exactly the plan file it is given, bound to it by digest, so the prompt READS
+# that file and says what the approval covers: the commit, the trips and the steps.
+#
+# The file is data, written by whoever ran `plan`, and its text reaches a prompt a
+# person trusts. So nothing from it is shown unless it matches the shape `plan`
+# writes — a full commit id, slugs, a release id, step names — and anything else
+# is reported as "not a valid rollout plan", never echoed. A file that is missing,
+# unreadable, or whose digest is not the one on the command line is said so plainly:
+# the command refuses it, and the prompt must not read as if it would run.
+#
+# Best effort and bounded: a small file, one jq, one hash. It adds no wait, so it
+# sits inside the hook's time budget, and any failure leaves the standard prompt.
+rollout_note() {
+  local c="$1" args plan_file digest steps_arg base="" path got="" line summary steps_shown="" hex=""
+  case "$c" in
+    *trip-rollout.py*) ;;
+    *setup-mcp.sh*--restart-only*|*restart-trip-mcp.sh*|*restart-all-trip-mcp.sh*|*companion-refresh-prompts.sh*|*'gateway stop'*|*'gateway start'*|*'gateway restart'*|*launchctl*hermes.gateway*)
+      printf 'This is one step of a rollout run on its own. A whole rollout is approved once, per plan: scripts/trip-rollout.py plan, then execute.'
+      return 0 ;;
+    *) return 0 ;;
+  esac
+  args="$(printf '%s' "$c" | python3 "$MATCH" --rollout-args 2>/dev/null)" || return 0
+  [ "${args%%$'\n'*}" = "execute" ] || return 0
+  args="${args#execute}"
+  { IFS= read -r plan_file; IFS= read -r plan_file; IFS= read -r digest; IFS= read -r steps_arg; } <<EOF
+$args
+EOF
+  if [ -z "$plan_file" ]; then
+    printf 'ROLLOUT: no --plan-file on this command, so it runs nothing (the command refuses).'
+    return 0
+  fi
+  case "$plan_file" in
+    *'$'*|*'`'*) printf 'ROLLOUT: the plan file path uses shell expansion, so this prompt cannot read it; the command refuses a plan that has changed.'; return 0 ;;
+    '~'/*) plan_file="$HOME/${plan_file#\~/}" ;;
+  esac
+  case "$plan_file" in
+    /*) path="$plan_file" ;;
+    *)  base="$(printf '%s' "$payload" | jq -r '.cwd // empty' 2>/dev/null)"
+        path="${base:-$PWD}/$plan_file" ;;
+  esac
+  if [ ! -f "$path" ] || [ ! -r "$path" ]; then
+    printf 'ROLLOUT: the plan file %s is missing or unreadable, so this prompt cannot say what would run, and the command refuses it.' "${plan_file//[[:cntrl:]]/?}"
+    return 0
+  fi
+  if command -v shasum >/dev/null 2>&1; then hex="$(shasum -a 256 "$path" 2>/dev/null | cut -d' ' -f1)"
+  elif command -v sha256sum >/dev/null 2>&1; then hex="$(sha256sum "$path" 2>/dev/null | cut -d' ' -f1)"; fi
+  summary="$(head -c 262144 "$path" 2>/dev/null | jq -r '
+    def slug: type == "string" and length <= 63 and test("^[a-z0-9]+(-[a-z0-9]+)*$");
+    if (type == "object" and .format == "trip-rollout-plan/1"
+        and (.release | type == "object")
+        and (.release.source_revision | type == "string" and test("^[a-f0-9]{40}$"))
+        and (.release.id | type == "string" and test("^[A-Za-z0-9_.-]{1,80}$"))
+        and (.steps | type == "array" and length > 0 and all(.[]; . == "site" or . == "bridge" or . == "companion" or . == "switches"))
+        and (.trips | type == "array" and length > 0 and length <= 200 and all(.[]; (type == "object") and (.slug | slug))))
+    then "OK\t\(.release.source_revision)\t\(.release.id)\t\(.steps | join(", "))\t\(.trips | map(.slug) | join(", "))"
+    else "BAD" end' 2>/dev/null)" || summary=""
+  case "$summary" in
+    OK*) ;;
+    *) printf 'ROLLOUT: %s is not a valid rollout plan (or this hook cannot read it), so this prompt cannot say what would run; the command refuses it.' "${plan_file//[[:cntrl:]]/?}"
+       return 0 ;;
+  esac
+  line="$(printf '%s' "$summary" | tr '\t' '\n')"
+  got="$(printf '%s\n' "$line" | sed -n '2p')"; local release steps trips
+  release="$(printf '%s\n' "$line" | sed -n '3p')"
+  steps="$(printf '%s\n' "$line" | sed -n '4p')"
+  trips="$(printf '%s\n' "$line" | sed -n '5p')"
+  if [[ "$steps_arg" =~ ^[a-z]+(,[a-z]+)*$ ]]; then
+    steps_shown=" (this command narrows them to: ${steps_arg//,/, })"
+  elif [ -n "$steps_arg" ]; then
+    steps_shown=" (this command also has a --steps this prompt cannot read)"
+  fi
+  printf 'ROLLOUT, read from the plan file %s:\n  commit  %s (release %s)\n  trips   %s\n  steps   %s%s\n' \
+    "${plan_file//[[:cntrl:]]/?}" "$got" "$release" "$trips" "$steps" "$steps_shown"
+  if [ -z "$digest" ]; then
+    printf '  NO --plan-digest on this command: it refuses to run without one.'
+  elif [ -n "$hex" ] && [ "$digest" = "sha256:$hex" ]; then
+    printf '  This approval covers exactly this plan (digest %s…). A changed plan file is refused by the command and asks again.' "${digest:0:19}"
+  else
+    printf '  WARNING: the plan file does not have the digest on the command line, so it has changed since `plan` wrote it; the command refuses it.'
+  fi
+}
+
+# A `feature set <switch> on|off <scope> --live` command (#567): name the switch,
+# the scope and the trips in the prompt, because "approve a deploy" alone does not
+# say who feels it. Sets FEATURE_NOTE and returns 0 when $1 is such a command, 1
+# otherwise (the ordinary deploy prompt then applies). Only printable, harmless
+# characters from the command reach the prompt.
+feature_live_note() {
+  local re rest tok name="" value="" trip="" scope="" next="" words=() i
+  re='(feature-cli(\.[jt]s)?|run(-script)?[[:space:]]+feature)(([[:space:]]+(--prefix=[^[:space:]]+|(--prefix|-C)[[:space:]]+[^[:space:]]+))*)([[:space:]]+--)?[[:space:]]+set[[:space:]]+([^;&|]*)'
+  [[ "$1" =~ $re ]] || return 1
+  rest="${BASH_REMATCH[${#BASH_REMATCH[@]}-1]}"   # the last group, whatever the groups before it are
+  read -r -a words <<<"$rest"
+  for ((i = 0; i < ${#words[@]}; i++)); do
+    tok="$(printf '%s' "${words[$i]}" | tr -cd '[:alnum:]_.:/=-')"
+    case "$tok" in
+      --all) scope="all" ;;
+      --new-trips) scope="new" ;;
+      --trip) scope="trip"; trip="$(printf '%s' "${words[$((i + 1))]:-}" | tr -cd '[:alnum:]_.:/-')"; i=$((i + 1)) ;;
+      --trip=*) scope="trip"; trip="${tok#--trip=}" ;;
+      --by|--database-url) i=$((i + 1)) ;;
+      --*) ;;
+      *) if [ -z "$name" ]; then name="$tok"; elif [ -z "$value" ]; then value="$tok"; fi ;;
+    esac
+  done
+  case "$scope" in
+    all)  next="EVERY trip, present and future — including any trip in use" ;;
+    new)  next="trips created from now on (no existing trip changes)" ;;
+    trip) next="the trip ${trip:-?} only — it may be in use" ;;
+    *)    next="none named: the command will refuse" ;;
+  esac
+  FEATURE_NOTE="CLAUDE.md hard rule 2 — a feature switch set with --live changes what trips in use do, and that is a deploy: it needs explicit approval, and a commit instruction does not imply it.
+
+Switch: ${name:-?} -> ${value:-?}
+Scope:  ${scope:-none}
+Trips:  ${next}
+
+Approve only if you meant to change that right now."
+  return 0
+}
+
 if [ -n "$agent" ]; then
   case "$kind" in
     deploy) rule="hard rule 2 — never deploy a live trip site without explicit approval" ;;
@@ -471,9 +594,17 @@ case "$kind" in
     emit ask "Pushing publishes commits to origin: after this they exist for everyone who fetches, and a force push rewrites what they already had. Approve only if you meant to push right now."
     ;;
   deploy)
+    # A feature switch set with --live gets a prompt that names what it changes,
+    # because "approve a deploy" says nothing about which trips feel it (#567).
+    if feature_live_note "$cmd"; then
+      emit ask "$FEATURE_NOTE"
+    fi
     # Deploys do not go through git, so this is the only place to catch them.
+    rollout="$(rollout_note "$cmd")"
     emit ask "CLAUDE.md hard rule 2 — never deploy a live trip site without explicit approval. A commit instruction does not imply a deploy instruction. Approve only if you meant to deploy right now.
-
+${rollout:+
+$rollout
+}
 $(plan_note)"
     ;;
   commit)

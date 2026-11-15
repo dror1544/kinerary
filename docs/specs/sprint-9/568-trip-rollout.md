@@ -143,10 +143,21 @@ R3
 
 ```
 trip-rollout.py plan    --release <id|commit> (--trip <slug>[,<slug>…] | --all) --plan-file <path>
-trip-rollout.py execute --plan-file <path> [--steps site,bridge,companion,switches]
+trip-rollout.py execute --plan-file <path> --plan-digest sha256:<hex> [--steps site,bridge,companion,switches]
 trip-rollout.py status  [--trip <slug>]
 ```
 
+- `plan` prints the sha256 of the plan file's bytes and the exact `execute` command.
+  `execute` requires that digest on the command line, so the approval prompt covers
+  exactly that file and an edit between approval and run is refused (added in build,
+  2026-11-14; this is what binds AC-11).
+- R1 also requires `KINERARY_CONTAINER_HOSTNAME_CMD` and `KINERARY_ROLLOUT_PSQL_CMD`,
+  and moves `current_release_id` when the site step succeeds: a failed bridge step
+  leaves the trip recorded on the release its site now runs, with the rollout row
+  `failed` at `bridge`.
+- The monitor's read grant is not in the migration: the grant list is
+  `control-plane/deployment/monitor-db-role.sql`, applied by an operator, and it
+  revokes what it does not list. It is a follow-up with a fleet-monitor query.
 - Resolves a trip the way `scripts/teardown-trip.py` does: the database row, then the
   trip's `topology.yaml` under the deployment root, then a check that the container's
   hostname is the one the topology names (`teardown-trip.py:287-322`, `:775-830`).

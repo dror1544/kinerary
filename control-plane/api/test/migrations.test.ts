@@ -110,6 +110,8 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "20261106120000_organizer_link_requests.sql",
       "20261106130000_organizer_link_scope.sql",
       "20261107120000_main_telegram_and_secondary_organizers.sql",
+      "20261114120000_feature_switches.sql",
+      "20261114130000_trip_rollouts.sql",
     ]);
     assert.deepEqual(await applyMigrations(client, migrationsDir), []);
     const tables = await client.query("SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema = 'control_plane'");
@@ -200,6 +202,8 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "20261106120000_organizer_link_requests.sql",
       "20261106130000_organizer_link_scope.sql",
       "20261107120000_main_telegram_and_secondary_organizers.sql",
+      "20261114120000_feature_switches.sql",
+      "20261114130000_trip_rollouts.sql",
     ]);
   } finally {
     await reset(client);
@@ -587,6 +591,86 @@ test("20261106130000 narrows every link that came from a dashboard one-time link
       otl_d1dddddddd: "trip",
       otl_e1eeeeeeee: "account",
     });
+  } finally {
+    await reset(client);
+    client.release();
+    await pool.end();
+  }
+});
+
+test("20261114130000 backfills a trip's release from its latest executed provision plan, and trip_rollouts only closes its own row", { skip: !databaseUrl }, async () => {
+  const pool = testPool();
+  const client = await pool.connect();
+  try {
+    await reset(client);
+    assert.ok((await applyMigrations(client, migrationsDir)).includes("20261114130000_trip_rollouts.sql"));
+    // Un-apply it, so the rows below are what a database looked like BEFORE the columns existed.
+    await client.query("DROP TABLE control_plane.trip_rollouts");
+    await client.query("DROP FUNCTION control_plane.trip_rollouts_guard()");
+    await client.query("ALTER TABLE control_plane.trips DROP COLUMN current_release_id, DROP COLUMN previous_release_id");
+    await client.query("DELETE FROM public.control_plane_schema_migrations WHERE version = '20261114130000_trip_rollouts.sql'");
+
+    const digest = (c: string) => "sha256:" + c.repeat(64);
+    for (const [id, rev] of [["rls_aaaaaaaa", "a"], ["rls_bbbbbbbb", "b"], ["rls_cccccccc", "c"]]) {
+      await client.query(
+        `INSERT INTO control_plane.releases(id, source_revision, artifact_digest, application_schema, data_schema_min, data_schema_max, status, promoted_to_available_at, promoted_by)
+         VALUES ($1, $2, $3, 1, 1, 1, 'available', now(), 'test:fixture')`, [id, rev.repeat(40), digest(rev)]);
+    }
+    const trips = { executed: "trip_" + "1".repeat(32), failedjob: "trip_" + "2".repeat(32), approvedonly: "trip_" + "3".repeat(32), twice: "trip_" + "4".repeat(32), none: "trip_" + "5".repeat(32) };
+    for (const [name, id] of Object.entries(trips)) {
+      await client.query("INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ($1,$2,'ready_private')", [id, `backfill-${name}`]);
+    }
+    let n = 0;
+    const plan = async (trip: string, release: string, status: string, job: string | null, ageDays: number) => {
+      n += 1;
+      const planId = `plan_${String(n).padStart(8, "0")}`;
+      await client.query(
+        `INSERT INTO control_plane.plans(id, trip_id, release_id, kind, digest, status, desired, created_at)
+         VALUES ($1,$2,$3,'provision',$4,$5,'{}'::jsonb, now() - ($6 || ' days')::interval)`,
+        [planId, trip, release, digest(String(n)), status, String(ageDays)]);
+      if (job) {
+        await client.query(
+          `INSERT INTO control_plane.jobs(id, trip_id, plan_id, job_type, idempotency_key, correlation_id, state, safe_error_code)
+           VALUES ($1,$2,$3,'provision',$4,$5,$6,$7)`,
+          [`job_${String(n).padStart(8, "0")}`, trip, planId, `idem-${n}`, `corr_${String(n).padStart(8, "0")}`, job, job === "failed" ? "FAKE_FAILURE" : null]);
+      }
+    };
+    await plan(trips.executed, "rls_aaaaaaaa", "executed", "succeeded", 1);
+    await plan(trips.failedjob, "rls_aaaaaaaa", "executed", "failed", 1);
+    await plan(trips.approvedonly, "rls_aaaaaaaa", "approved", "succeeded", 1);
+    await plan(trips.twice, "rls_aaaaaaaa", "executed", "succeeded", 5);
+    await plan(trips.twice, "rls_bbbbbbbb", "executed", "succeeded", 1);
+
+    assert.deepEqual(await applyMigrations(client, migrationsDir), ["20261114130000_trip_rollouts.sql"]);
+    const rows = await client.query<{ slug: string; current_release_id: string | null; previous_release_id: string | null }>(
+      "SELECT slug, current_release_id, previous_release_id FROM control_plane.trips ORDER BY slug");
+    assert.deepEqual(Object.fromEntries(rows.rows.map((r) => [r.slug, r.current_release_id])), {
+      "backfill-approvedonly": null,
+      "backfill-executed": "rls_aaaaaaaa",
+      "backfill-failedjob": null,
+      "backfill-none": null,
+      "backfill-twice": "rls_bbbbbbbb",
+    });
+    assert.ok(rows.rows.every((r) => r.previous_release_id === null), "previous_release_id has nothing to be read from, so it is never backfilled");
+
+    // A rollout row: written running, closed once, then frozen.
+    const insert = (id: string) => client.query(
+      `INSERT INTO control_plane.trip_rollouts(id, trip_id, from_release_id, to_release_id, steps, result, actor, plan_digest)
+       VALUES ($1,$2,'rls_aaaaaaaa','rls_bbbbbbbb','["site","bridge"]'::jsonb,'running','cli:tester',$3)`, [id, trips.executed, digest("d")]);
+    await insert("rollout_aaaaaaaa");
+    await assert.rejects(insert("rollout_bbbbbbbb"), /trip_rollouts_one_running_idx/, "one running rollout per trip");
+    await assert.rejects(
+      client.query("UPDATE control_plane.trip_rollouts SET to_release_id = 'rls_cccccccc' WHERE id = 'rollout_aaaaaaaa'"),
+      /only result, failed_step and finished_at close a row/);
+    await assert.rejects(
+      client.query("UPDATE control_plane.trip_rollouts SET result = 'ok' WHERE id = 'rollout_aaaaaaaa'"),
+      /trip_rollouts_finished_when_closed/, "closing without finished_at is refused");
+    await client.query("UPDATE control_plane.trip_rollouts SET result = 'failed', failed_step = 'bridge', finished_at = now() WHERE id = 'rollout_aaaaaaaa'");
+    await assert.rejects(
+      client.query("UPDATE control_plane.trip_rollouts SET result = 'ok', failed_step = NULL WHERE id = 'rollout_aaaaaaaa'"),
+      /already closed/);
+    await assert.rejects(client.query("DELETE FROM control_plane.trip_rollouts WHERE id = 'rollout_aaaaaaaa'"), /never deleted/);
+    await insert("rollout_bbbbbbbb"); // the previous one is closed, so the trip may run another
   } finally {
     await reset(client);
     client.release();

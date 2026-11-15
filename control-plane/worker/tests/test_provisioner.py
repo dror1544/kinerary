@@ -395,6 +395,89 @@ class ProvisionerHappyPathTests(unittest.TestCase):
             self.conn.execute("ALTER TABLE control_plane.trips ADD COLUMN plan_snapshot jsonb")
             self.conn.commit()
 
+    def test_happy_path_records_the_release_the_trip_now_runs(self) -> None:
+        # #568: nothing said which version a trip runs. A successful provision
+        # is the first place that is known, so the record is true from day one.
+        self.worker.run_once()
+        row = self.conn.execute(
+            "SELECT current_release_id, previous_release_id FROM control_plane.trips WHERE id = %s",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertEqual(self.fix["release_id"], row["current_release_id"])
+        self.assertIsNone(row["previous_release_id"])
+
+    def test_a_reprovision_onto_another_release_keeps_the_old_one_as_the_way_back(self) -> None:
+        other = f"rls_{rnd()}"
+        self.conn.execute(
+            """INSERT INTO control_plane.releases(id, source_revision, artifact_digest, application_schema, data_schema_min, data_schema_max, status, promoted_to_available_at, promoted_by)
+               VALUES (%s, %s, %s, 1, 1, 1, 'available', now(), 'test:fixture')""",
+            (other, rnd(20), sha256(f"artifact-{other}")),
+        )
+        self.conn.commit()
+        try:
+            self.worker.run_once()
+            # The same trip, planned again against a different release.
+            plan_id, job_id = f"plan_{rnd()}", f"job_{rnd()}"
+            self.conn.execute(
+                """INSERT INTO control_plane.plans(id, trip_id, release_id, kind, digest, status, desired, updated_at)
+                   SELECT %s, trip_id, %s, 'provision', %s, 'approved', desired, now()
+                     FROM control_plane.plans WHERE id = %s""",
+                (plan_id, other, sha256(plan_id), self.fix["plan_id"]),
+            )
+            self.conn.execute(
+                """INSERT INTO control_plane.jobs(id, trip_id, plan_id, job_type, idempotency_key, correlation_id, state, max_attempts)
+                   VALUES (%s, %s, %s, 'provision', %s, %s, 'queued', 3)""",
+                (job_id, self.fix["trip_id"], plan_id, f"prov-{rnd(6)}", f"corr_{rnd(8)}"),
+            )
+            self.conn.execute(
+                """INSERT INTO control_plane.plan_approvals(id, plan_id, plan_digest, token_digest, issued_by, expires_at)
+                   VALUES (%s, %s, %s, %s, 'test:organizer', now() + interval '1 hour')""",
+                (f"appr_{rnd()}", plan_id, sha256(plan_id), sha256(f"tok-{plan_id}")),
+            )
+            self.conn.commit()
+            self.assertTrue(self.worker.run_once())
+            row = self.conn.execute(
+                "SELECT current_release_id, previous_release_id FROM control_plane.trips WHERE id = %s",
+                (self.fix["trip_id"],),
+            ).fetchone()
+            self.assertEqual(other, row["current_release_id"])
+            self.assertEqual(self.fix["release_id"], row["previous_release_id"])
+        finally:
+            self.conn.rollback()
+            self.conn.execute("UPDATE control_plane.trips SET current_release_id = NULL, previous_release_id = NULL WHERE id = %s", (self.fix["trip_id"],))
+            self.conn.execute("DELETE FROM control_plane.plan_approvals WHERE plan_id IN (SELECT id FROM control_plane.plans WHERE trip_id = %s)", (self.fix["trip_id"],))
+            self.conn.execute("DELETE FROM control_plane.job_steps WHERE job_id IN (SELECT id FROM control_plane.jobs WHERE trip_id = %s)", (self.fix["trip_id"],))
+            self.conn.execute("DELETE FROM control_plane.jobs WHERE trip_id = %s", (self.fix["trip_id"],))
+            self.conn.execute("DELETE FROM control_plane.plans WHERE trip_id = %s", (self.fix["trip_id"],))
+            self.conn.execute("DELETE FROM control_plane.releases WHERE id = %s", (other,))
+            self.conn.commit()
+
+    def test_a_worker_newer_than_the_schema_still_finishes_the_deploy_and_says_the_record_was_lost(self) -> None:
+        # The same posture as the plan snapshot: the record is written outside
+        # the transaction that succeeds the job, so a database that has not
+        # run 20261114130000 costs the record, not the deploy — and the loss
+        # is logged, because a record that silently does not land is the
+        # failure this column exists to end.
+        self.conn.execute("ALTER TABLE control_plane.trips DROP COLUMN current_release_id")
+        self.conn.commit()
+        try:
+            with self.assertLogs("control_plane_worker.provisioner", level="WARNING") as logs:
+                self.assertTrue(self.worker.run_once())
+            row = self.conn.execute(
+                "SELECT state FROM control_plane.jobs WHERE id = %s", (self.fix["job_id"],),
+            ).fetchone()
+            self.assertEqual("succeeded", row["state"])
+            self.assertTrue(
+                any("provisioner.release_record_failed" in line for line in logs.output),
+                logs.output,
+            )
+        finally:
+            self.conn.rollback()
+            self.conn.execute(
+                "ALTER TABLE control_plane.trips ADD COLUMN current_release_id text REFERENCES control_plane.releases(id)"
+            )
+            self.conn.commit()
+
     def test_happy_path_calls_deploy_adapter_with_slug_and_config(self) -> None:
         self.worker.run_once()
         self.assertEqual(len(self.fake_deploy.deployed), 1)
