@@ -47,7 +47,7 @@ re-decide:
 | **Developer** | new | `developer` subagent, one worktree each, in the background | Sonnet 5 · high; Opus 5 when the brief is marked *design-heavy* (§7) | code and tests inside its owned paths, spawn `verifier`, ask the manager | commit, push, merge, deploy, touch paths outside its brief, edit plan/ledger/agents/hooks |
 | **Reviewer** | exists as `/code-review` + `boundary-reviewer` | run by the manager against the developer's worktree, fresh context | Opus 5 · high | read, report | fix |
 | **Integrator** | half exists (`pr-steward`, `sprint-scribe`) | `integrator` subagent | Sonnet 5 · high; an Opus 5 consult for the same-intent check and conflict resolution | order the merge queue, `merge-tree`, resolve conflicts on a throwaway branch, verify the merged tree, prepare carry-forward | merge, push, close issues, record approval, promote a release |
-| **Regression planner** | exists | as today: CI on PR open; locally before a risk-class merge; sprint mode at sprint end | Opus 5 (CI already pins it) · high | assess, cost, plan | deploy, approve, edit the plan doc |
+| **Regression planner** | exists | as today: CI on PR open; locally before a risk-class merge, including a risk-class merge to `main` | Opus 5 (CI already pins it) · high | assess, cost, plan | deploy, approve, edit the plan doc |
 | `verifier` | exists | spawned by developer and integrator | Sonnet 5 · medium | run the suites, paste real output | edit |
 | `sprint-scribe`, `run-capture` | exist | once a day, for the merges since the last run / after every live run | Sonnet 5 · high | mark plan and ledger, route rows | invent an owner, record approval |
 | `pr-steward` | exists | once a day; sprint end | Sonnet 5 · medium | sweep branches and PRs (doc drift is `doc-keeper`'s since 2026-09-20) | delete an unmerged branch |
@@ -303,8 +303,9 @@ Runs when the manager says a PR is ready, and at sprint end.
 6. **Re-run `regression-planner` (branch mode) on the merged result** when the
    merge changes the risk class — a migration, `shared/`, the sanitizer, an
    authenticated route, or relay behaviour. A site-only, test-only, tooling or
-   docs PR needs no plan: the handover says `not needed (<why>)`. The
-   sprint-mode plan before each release is unchanged.
+   docs PR needs no plan: the handover says `not needed (<why>)`. Since
+   2026-11-14 the same test decides the plan before a merge to `main`
+   (decision 12): no risk-class change, no plan and no manual test.
 7. **Carry forward.** Unresolved review items from the PR are written into the
    integration PR's "Carried-forward open items" section, grouped under the PR
    number, deliberate-decision rows marked as such (memory
@@ -317,8 +318,9 @@ Runs when the manager says a PR is ready, and at sprint end.
    day for the merges since the last run, and at sprint end, not per merge
    (2026-09-26).
 
-**At sprint end:** the same procedure for `integration/sprint-6 → main`, plus
-`regression-planner` in sprint mode, plus the deploy hook's plan note (it greps
+**Before a merge to `main`:** the same procedure for the leading branch →
+`main`, plus `regression-planner` when the change set carries a risk-class
+change (decision 12, 2026-11-14), plus the deploy hook's plan note (it greps
 `docs/test-reports/` for the exact HEAD — so the plan is written *after* the
 final commit, or it names an earlier commit and says so).
 
@@ -343,8 +345,8 @@ started. Not from a memory file, not from a person.
 ### 3.5 Regression planner — unchanged
 
 Three seats in the flow: CI on PR open (no fleet access, says so); locally,
-triggered by the integrator, when a merge changes the risk class; sprint mode
-before the VM upgrade. Its plan file is what the deploy hook reads back to Dror.
+triggered by the integrator, when a merge changes the risk class; and before a
+merge to `main` or a VM upgrade that carries a risk-class change (decision 12). Its plan file is what the deploy hook reads back to Dror.
 Model stays Opus 5 — the CI workflow already pins `claude-opus-5`.
 
 ### 3.6 Doc keeper — `.claude/agents/doc-keeper.md`
@@ -509,7 +511,7 @@ tracks doc · issues · monitor reports · ledger
    doc-keeper sweeps the tree for drift → fixes batch into one docs: commit
                 │
    ── sprint end ──────────────────────────────────────────────
-   integrator: integration → main · regression-planner sprint mode
+   integrator: leading branch → main · regression-planner if risk-class
                 ▼
    ═══ GATE 3: Dror — deploy (kinerary-cp-release, hook prompt) ═══
                 │
@@ -773,6 +775,23 @@ Principles behind the table:
     `scripts/claude-hooks/pretooluse-bash.sh` and the integrator, developer and
     doc-keeper roles.
 
+12. **Faster delivery: features behind per-trip switches, one rollout per trip,
+    `main` as the leading branch (2026-11-14).** Measured over 2 October to
+    14 November: 101 PRs reached the leading branch a median 1.9 hours after
+    opening, while the leading branch reached `main` four times and a merged
+    change reached a running trip only through three hand-run steps per trip.
+    The delay had moved from the merge (decision 11) to everything after it.
+    Dror accepted four changes, in build order: per-trip feature switches
+    (off by default; on for one trip, every trip or future trips as a data
+    change), one rollout command per trip with a recorded version and way
+    back, `main` as the leading branch once the switches are merged, and
+    control-plane images built in CI. Three rules changed the same day: the
+    regression plan and the owner's manual test before a merge to `main` are
+    for risk-class change sets only; a deploy is approved per rollout, not per
+    step; a switch on a test trip needs no approval. Implemented in CLAUDE.md
+    ("Faster delivery"); the hooks follow with the rollout command. Until
+    `main` leads, §4's task life and the integrator's seat are unchanged.
+
 ---
 
 ## 10. Rollout and what to measure
@@ -815,7 +834,7 @@ pass — as four developers in parallel. They share no file, by that document's
 own check, so any collision is a defect in the mechanism, not in the work.
 
 **Sprint end.** The integrator prepares `integration/sprint-6 → main`; the
-regression planner runs in sprint mode; the doc keeper sweeps; Dror deploys with
+regression planner runs if the change set is risk-class (decision 12); the doc keeper sweeps; Dror deploys with
 `kinerary-cp-release` (`--dry-run` first); live run from one script;
 `run-capture` afterwards. The next sprint starts the same way with its own
 inputs.

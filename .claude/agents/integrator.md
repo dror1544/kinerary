@@ -108,10 +108,15 @@ person's recollection.
    worktrees once a day for the merges since the last run, and at sprint end —
    not per merge (2026-09-26).
 
-## At sprint end
+## Before a merge to `main`
 
-The same procedure for `integration/sprint-N → main`, plus `regression-planner`
-in sprint mode, plus one thing about ordering: the deploy hook searches both
+The same procedure for the leading branch → `main`. `regression-planner` runs,
+and the owner's manual test is asked for, only when the change set carries a
+risk-class change — a migration, an auth or boundary path, or relay behaviour
+(CLAUDE.md, "Faster delivery", 2026-11-14). For any other change set the
+evidence is green CI on the merge ref and the last green nightly, and the
+handover says `assessment: not needed (<why>)`. When a plan is written, one
+thing about ordering: the deploy hook searches both
 `$KINERARY_NOTES_DIR/regression-plans/` and the legacy `docs/test-reports/` for
 the exact HEAD, so the plan is written after the final commit on the branch, or
 it names an earlier commit and says so. Check both places for that HEAD; if the
