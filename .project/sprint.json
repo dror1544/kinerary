@@ -1,17 +1,17 @@
 {
   "format": 1,
-  "updated_at": "2026-10-30T10:24:53Z",
-  "updated_by": "Dror (recorded by Claude, sprint-planning session)",
+  "updated_at": "2026-11-15T11:40:46Z",
+  "updated_by": "Dror (recorded by Claude, faster-delivery session)",
   "sprint": {
-    "id": "8",
-    "title": "Hardening (short sprint)",
-    "integration_branch": "integration/sprint-8",
+    "id": "9",
+    "title": "Faster delivery: feature switches and trip rollout",
+    "integration_branch": "main",
     "target_branch": "main",
-    "milestone": "Sprint 8",
+    "milestone": "Sprint 9",
     "scope": {
-      "plan": "docs/onboarding-mvp-sprint-plan.md#sprint-8--hardening-short-sprint-2026-10-30--about-2026-11-06",
-      "specs": "docs/specs/sprint-8/",
-      "team": "docs/agent-team-plan.md"
+      "specs": "docs/specs/sprint-9/",
+      "team": "docs/agent-team-plan.md",
+      "rules": "CLAUDE.md#faster-delivery-owners-decision-2026-11-14"
     }
   },
   "baseline": {
@@ -90,6 +90,12 @@
       "by": "Dror (recorded by Claude, sprint-planning session)",
       "change": "set-sprint 6 on main -> 8 on integration/sprint-8",
       "reason": "Dror, 2026-10-30: Sprint 7 closed as shipped (released 41965f7 on 2026-10-27); Sprint 8 is a one-week hardening sprint on integration/sprint-8, cut from main at 4510301 and merged to main every 2-3 days"
+    },
+    {
+      "at": "2026-11-15T11:40:46Z",
+      "by": "Dror (recorded by Claude, faster-delivery session)",
+      "change": "set-sprint 8 on integration/sprint-8 -> 9 on main",
+      "reason": "Dror, 2026-11-15: 'Open sprint 9'. main is the leading branch since 2026-11-15 (#583), so Sprint 9 has no integration/sprint-9 branch; work targets main. Baseline left as is: moving it needs --override, which is Dror's call"
     }
   ]
 }

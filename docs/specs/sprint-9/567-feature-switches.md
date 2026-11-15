@@ -182,8 +182,9 @@ silent. Tests in `tests/scripts/test_match_command.py`.
   `trip-control` is a later decision.
 - Migrating the existing ad hoc switches (`companion_reply_capture_enabled`,
   `agent.proactive`, `proactive_level`).
-- Removing a switch once its feature is on everywhere. That is a follow-up rule: a
-  switch that has been on for every trip for 30 days is deleted with its off branch.
+- Removing a switch once its feature is on everywhere. That is a follow-up rule,
+  adopted 2026-11-15 (decision 3): a switch that has been on for every trip for 30
+  days is deleted with its off branch.
 
 ## Security and boundary notes
 
@@ -236,10 +237,14 @@ Written first, from the criteria.
    registry entry says so.
 2. **S3 waits.** S1 and S2 are built first; S3 is decided after the first two
    features have shipped behind switches.
+3. **The 30-day removal rule: adopted (2026-11-15).** A switch that has been on for
+   every trip (scope `all_trips`) for 30 days is removed from the registry together
+   with its off branch, in one PR. Reason: switches that outlive their rollout pile
+   up as dead branches nobody tests. Enforcement (a reminder or a check reading
+   `feature_switch_history`) is not built yet; until it is, the PR that turns a
+   switch on for all trips names the removal date in its carry-forward.
 
 ## Open questions
 
 1. **Which trips have a control-plane identity** (needed for S3's push)? To be read
    from the fleet before S3 is briefed.
-2. **The 30-day removal rule** in Non-goals: adopt it, or leave switches in place?
-   Not needed before S1 or S2.
