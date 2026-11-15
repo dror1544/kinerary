@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "updated_at": "2026-11-15T11:40:46Z",
+  "updated_at": "2026-11-15T13:46:14Z",
   "updated_by": "Dror (recorded by Claude, faster-delivery session)",
   "sprint": {
     "id": "9",
@@ -15,8 +15,8 @@
     }
   },
   "baseline": {
-    "branch": "integration/sprint-6",
-    "commit": "97582b6bab1832a2f614c836717b229a828907c9",
+    "branch": "main",
+    "commit": "525593ba19815c477a2a4081a0078bc6149f11b9",
     "report": "docs/test-reports/sprint-6-baseline-2026-09-20.md",
     "release": null
   },
@@ -96,6 +96,13 @@
       "by": "Dror (recorded by Claude, faster-delivery session)",
       "change": "set-sprint 8 on integration/sprint-8 -> 9 on main",
       "reason": "Dror, 2026-11-15: 'Open sprint 9'. main is the leading branch since 2026-11-15 (#583), so Sprint 9 has no integration/sprint-9 branch; work targets main. Baseline left as is: moving it needs --override, which is Dror's call"
+    },
+    {
+      "at": "2026-11-15T13:46:14Z",
+      "by": "Dror (recorded by Claude, faster-delivery session)",
+      "change": "set-baseline 97582b6 -> 525593b while locked",
+      "reason": "Dror, 2026-11-15: 'Move the baseline'. Sprint 9 builds on main at 525593b (#583, main leads). Evidence: the VM runs 525593b and its gatecity end-to-end passed 13 of 13 there on 2026-11-15 (VM session kinerary-98; test trip torn down); CI green on #582/#583. The report field still names the Sprint 6 baseline report because no report file for this run exists in the repo",
+      "override": true
     }
   ]
 }
