@@ -1901,3 +1901,28 @@ class GateWrapper(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NetworkMountGuard(unittest.TestCase):
+    """The documents mount is the one network filesystem a release tolerates (2026-11-15, Dror)."""
+
+    def test_nothing_mounted_is_nothing_to_refuse(self):
+        self.assertEqual(vr.foreign_network_mounts("", "/srv/kinerary-nfs"), [])
+
+    def test_the_documents_mount_named_in_vm_env_is_allowed(self):
+        self.assertEqual(vr.foreign_network_mounts("/srv/kinerary-nfs\n", "/srv/kinerary-nfs"), [])
+
+    def test_a_trailing_slash_in_vm_env_still_names_the_same_mount(self):
+        self.assertEqual(vr.foreign_network_mounts("/srv/kinerary-nfs", "/srv/kinerary-nfs/"), [])
+
+    def test_any_other_network_mount_is_still_refused(self):
+        out = "/srv/kinerary-nfs\n/mnt/backups\n"
+        self.assertEqual(vr.foreign_network_mounts(out, "/srv/kinerary-nfs"), ["/mnt/backups"])
+
+    def test_without_a_documents_mount_configured_every_network_mount_is_refused(self):
+        self.assertEqual(vr.foreign_network_mounts("/srv/kinerary-nfs", None), ["/srv/kinerary-nfs"])
+        self.assertEqual(vr.foreign_network_mounts("/srv/kinerary-nfs", ""), ["/srv/kinerary-nfs"])
+
+    def test_a_mount_below_the_documents_mount_is_not_the_documents_mount(self):
+        self.assertEqual(vr.foreign_network_mounts("/srv/kinerary-nfs/other", "/srv/kinerary-nfs"),
+                         ["/srv/kinerary-nfs/other"])

@@ -248,6 +248,21 @@ class Shell:
 # --------------------------------------------------------------------------- #
 # Pure helpers (tested in tests/scripts/test_vm_release.py)
 # --------------------------------------------------------------------------- #
+def foreign_network_mounts(findmnt_targets: str, documents_mount: Optional[str]) -> List[str]:
+    """The network mounts a release still refuses: every one except the documents mount vm.env names.
+
+    The guard exists because a snapshot's filesystem freeze could hang on a network filesystem (and on
+    2026-09-13 a vzdump onto the trips' NFS share froze this VM). The document store is the one network
+    mount the product needs here (KINERARY_NFS_ROOT: originals hard-linked into the trips' directories on
+    the same export), so it is tolerated by its exact path and nothing else is: a mount below it, or any
+    second share, is still refused. With no documents mount configured, every network mount is refused,
+    as before. A stalled freeze is still thawed host-side by the snapshot step's own limit.
+    """
+    allowed = (documents_mount or "").rstrip("/")
+    targets = [t.strip() for t in findmnt_targets.splitlines() if t.strip()]
+    return [t for t in targets if not allowed or t.rstrip("/") != allowed]
+
+
 def read_env_text(text: str) -> Dict[str, str]:
     values: Dict[str, str] = {}
     for raw in text.splitlines():
@@ -1285,8 +1300,12 @@ class ControlPlane:
         else:
             self.r.fail(f"{BACKUP_DIR} is on '{fstype or 'unknown'}' — backups are only written to a local filesystem")
         netfs = self.sh.text(["findmnt", "-rn", "-t", "nfs,nfs4,cifs,smb3,fuse.sshfs", "-o", "TARGET"]).strip()
-        if netfs:
-            self.r.fail(f"this VM has network filesystems mounted ({netfs.replace(chr(10), ', ')}) — a snapshot freeze could hang on them")
+        documents = self.vm_env().get("KINERARY_NFS_ROOT") if VM_ENV.exists() else None
+        foreign = foreign_network_mounts(netfs, documents)
+        if foreign:
+            self.r.fail(f"this VM has network filesystems mounted ({', '.join(foreign)}) — a snapshot freeze could hang on them")
+        elif netfs:
+            self.r.ok(f"only the documents mount is a network filesystem ({documents}, KINERARY_NFS_ROOT)")
         else:
             self.r.ok("no network filesystem mounted in this VM")
         free = shutil.disk_usage("/").free

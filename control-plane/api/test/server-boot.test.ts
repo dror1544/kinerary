@@ -582,3 +582,20 @@ test("compose.vm.yml's relay passes through every model binding the interview re
     assert.match(relayBlock, new RegExp(`\\n\\s+${name}: \\$\\{${name}:`), `compose.vm.yml's relay must pass ${name} through`);
   }
 });
+
+/**
+ * 2026-11-15: the agreed document store (originals on the trips' NFS export, one mount shared by the
+ * worker and the relay, so an original hard-links into <slug>/documents) was built on 2026-09-18 but its
+ * compose wiring never reached main, so every VM reservation came without its ticket (#544). Required on
+ * both services: unset means originals are silently dropped, which is the failure this exists to prevent.
+ */
+test("compose.vm.yml's worker and relay both mount the document store on the trips' NFS export, required", async () => {
+  const composeText = await readFile(fileURLToPath(new URL("../../deployment/compose.vm.yml", import.meta.url)), "utf8");
+  for (const service of ["worker", "relay"]) {
+    const block = extractServiceBlock(composeText, service);
+    assert.match(block, /DOCUMENT_STORE_DIR: \S+/, `${service} must set DOCUMENT_STORE_DIR`);
+    assert.match(block, /DOCUMENT_STORE_REQUIRED: "1"/, `${service} must require the store`);
+    assert.match(block, /- \$\{KINERARY_NFS_ROOT:\?[^}]*\}/, `${service} must mount KINERARY_NFS_ROOT, required`);
+  }
+  assert.match(extractServiceBlock(composeText, "worker"), /PROVISIONER_TRIP_NFS_LOCAL_BASE: \/srv\/kinerary-nfs/);
+});

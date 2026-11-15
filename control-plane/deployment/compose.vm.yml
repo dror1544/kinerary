@@ -283,7 +283,15 @@ services:
       NPM_SECRET: ${NPM_SECRET:-}
       CLOUDFLARE_ZONE_ID: ${CLOUDFLARE_ZONE_ID:-}
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
+      # The relay's store and the trips' NFS directories, through ONE mount of
+      # the export: an original is hard-linked into <slug>/documents, and a
+      # hard link cannot cross mount points. REQUIRED: the worker refuses to
+      # start if the store is not the real volume (marker, writable, mounted).
+      DOCUMENT_STORE_DIR: /srv/kinerary-nfs/.kinerary-document-store
+      DOCUMENT_STORE_REQUIRED: "1"
+      PROVISIONER_TRIP_NFS_LOCAL_BASE: /srv/kinerary-nfs
     volumes:
+      - ${KINERARY_NFS_ROOT:?set KINERARY_NFS_ROOT in vm.env to the VM mount of the trips NFS export (scripts/bootstrap-document-store.sh)}:/srv/kinerary-nfs
       - ${KINERARY_DEPLOY_ROOT_HOST:-/opt/kinerary-deploy}:/deploy-root
       - ${KINERARY_REPO_HOST:-/opt/kinerary}:/repo:ro
       - /root/.ssh/id_ed25519_proxmox_hermes:/root/.ssh/id_ed25519_proxmox_hermes:ro
@@ -343,6 +351,12 @@ services:
       INTERPRET_EFFORT: ${INTERPRET_EFFORT:-}
       EXTRACT_EFFORT: ${EXTRACT_EFFORT:-}
       VISION_EFFORT: ${VISION_EFFORT:-}
+      # Uploaded originals, on the trips' NFS export (see
+      # docs/document-intake-operations.md). REQUIRED: the relay refuses to start
+      # unless this is a mounted, writable volume carrying the store's marker,
+      # so originals can never land in the container's own filesystem.
+      DOCUMENT_STORE_DIR: /var/lib/kinerary/document-store
+      DOCUMENT_STORE_REQUIRED: "1"
       CODEX_HOME: /codex
       # Empty = api.telegram.org. The e2e runner's automated organizer points it
       # at a loopback Telegram stand-in through vm-relay-restart.sh, and puts it
@@ -371,6 +385,9 @@ services:
     volumes:
       - /opt/agent-auth/codex:/codex
       - /opt/agent-auth/claude-config:/home/node/.claude-config
+      # KINERARY_NFS_ROOT is the VM's mount of the TrueNAS export the trips'
+      # directories live on, the same export the Proxmox host gives each trip.
+      - ${KINERARY_NFS_ROOT:?set KINERARY_NFS_ROOT in vm.env to the VM mount of the trips NFS export (scripts/bootstrap-document-store.sh)}/.kinerary-document-store:/var/lib/kinerary/document-store
     secrets:
       - source: control_plane_database_url_host
         target: control_plane_database_url
