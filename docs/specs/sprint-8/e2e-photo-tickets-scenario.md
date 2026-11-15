@@ -68,8 +68,8 @@ What the finished trip serves:
 
 - AC-7 `photo_QX7P2M_attached_544` and `photo_ZT3K9D_attached_544`: For each ticket, the reservation that carries its reference has a ticket attached, and the bytes the site serves for it are **the photo that was sent**, byte for byte (sha256 compared), not merely "some file".
 - AC-8 `flight_twice_on_reservations_549`: SL 482 is on Reservations exactly twice, once per booking.
-- AC-9 `reservations_tell_bookings_apart_549`: Each of the two rows names its own passengers (a surname of its own ticket) and not the other ticket's.
-- AC-10 `flight_once_on_plan_549`: The active itinerary has exactly one item for SL 482 on 2026-11-14.
+- AC-9 `reservations_tell_bookings_apart_549`: Each of the two rows carries its own booking reference and not the other ticket's, as Reservations shows it (#551). Passengers are judged only when a row has some, and must then be its own. (Revised 2026-11-15, Dror: "keep the site as it is". The trip builder stores no passengers on a reservation.)
+- AC-10 `flight_once_on_plan_549`: The Plan board shows SL 482 on 2026-11-14 once: the active itinerary's lines for it, collapsed as `collapseSameFlight` collapses them (same flight, day and wording), are one line. (Revised 2026-11-15, Dror: the data keeps a line per booking; the board shows the flight once.)
 - AC-11 `trip_dates_14_22_nov`: The trip runs 2026-11-14 to 2026-11-22: the return date **as corrected at the summary**, not as the dashboard seeded it.
 - AC-12 `travellers_from_both_tickets_412`: The confirmed intake's roster holds all four passengers.
 
