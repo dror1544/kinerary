@@ -450,12 +450,23 @@ class SameFlightChecks(unittest.TestCase):
         got = self.verdicts(GOOD_ROWS, PLAN_ONCE)
         self.assertTrue(all(v.passed for v in got.values()), [v.bad for v in got.values() if not v.passed])
 
-    def test_two_rows_that_say_nothing_about_whose_they_are_fail_only_the_tell_apart_check(self) -> None:
+    def test_two_rows_told_apart_by_their_own_reference_pass_with_no_passengers(self) -> None:
+        # Dror, 2026-11-15: keep the site as it is. Reservations tells the rows apart by booking reference
+        # and "1 of 2" (#551); the trip builder stores no passengers on a reservation.
         rows = [row("SL 482", "QX7P2M"), row("SL 482", "ZT3K9D")]
         got = self.verdicts(rows, PLAN_ONCE)
         self.assertTrue(got["flight_twice_on_reservations_549"].passed)
-        self.assertFalse(got["reservations_tell_bookings_apart_549"].passed)
-        self.assertIn("QX7P2M", got["reservations_tell_bookings_apart_549"].bad)
+        self.assertTrue(got["reservations_tell_bookings_apart_549"].passed, got["reservations_tell_bookings_apart_549"].bad)
+
+    def test_a_row_carrying_the_other_bookings_reference_too_is_not_telling_them_apart(self) -> None:
+        rows = [row("SL 482", "QX7P2M", conf_file="ZT3K9D.jpg"), row("SL 482", "ZT3K9D")]
+        got = self.verdicts(rows, PLAN_ONCE)["reservations_tell_bookings_apart_549"]
+        self.assertFalse(got.passed)
+        self.assertIn("QX7P2M", got.bad)
+
+    def test_a_row_with_no_reference_cannot_be_told_apart(self) -> None:
+        rows = [row("SL 482", ""), row("SL 482", "ZT3K9D")]
+        self.assertFalse(self.verdicts(rows, PLAN_ONCE)["reservations_tell_bookings_apart_549"].passed)
 
     def test_a_row_naming_both_couples_is_not_telling_them_apart(self) -> None:
         rows = [row("SL 482", "QX7P2M", "ARLO VESPER, BRIA TALLIS"), GOOD_ROWS[1]]
@@ -466,6 +477,13 @@ class SameFlightChecks(unittest.TestCase):
         got = self.verdicts(GOOD_ROWS, plan)
         self.assertFalse(got["flight_once_on_plan_549"].passed)
         self.assertIn("2 time(s)", got["flight_once_on_plan_549"].bad)
+
+    def test_two_bookings_of_one_flight_on_the_plan_are_the_one_line_the_site_shows(self) -> None:
+        # The plan data keeps a line per booking; the Plan board collapses identical lines of one flight and
+        # day (trip-web/src/same-flight.ts, collapseSameFlight). The check follows what the traveller sees.
+        line = {"date": "2026-11-14", "text_en": "SL 482 HARBORTOWN → GATECITY", "text_he": ""}
+        got = self.verdicts(GOOD_ROWS, [dict(line), dict(line), PLAN_ONCE[1]])["flight_once_on_plan_549"]
+        self.assertTrue(got.passed, got.bad)
 
     def test_a_merged_reservation_row_fails_the_twice_check(self) -> None:
         self.assertFalse(self.verdicts(GOOD_ROWS[:1], PLAN_ONCE)["flight_twice_on_reservations_549"].passed)

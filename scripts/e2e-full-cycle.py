@@ -2110,26 +2110,37 @@ def same_flight_verdicts(bookings: list, plan_items: list, flight: dict, tickets
                    f"{flight['number']} is on Reservations twice, once per booking",
                    f"{flight['number']} is on Reservations {len(rows)} time(s), not 2 "
                    f"(the site has {len(bookings)} booking(s))")]
+    # Told apart the way Reservations tells them apart (#551; Dror, 2026-11-15, "keep the site as it is"):
+    # each row carries its OWN booking reference and not the other's. The trip builder stores no passengers
+    # on a reservation, so passengers are judged only when a row has some: then they must be its own.
     unclear = []
     for ticket in tickets:
         mine = next((r for r in rows if ticket["ref"].lower() in json.dumps(r, ensure_ascii=False).lower()), None)
         if mine is None:
             unclear.append(f"no {flight['number']} row carries {ticket['ref']}")
             continue
+        text = json.dumps(mine, ensure_ascii=False).lower()
+        other_refs = [t["ref"] for t in tickets if t is not ticket and t["ref"].lower() in text]
         shown = str(mine.get("passengers") or "")
         others = [s for t in tickets if t is not ticket for s in t["surnames"]]
-        if not any(_mentions(shown, s) for s in ticket["surnames"]):
+        if other_refs:
+            unclear.append(f"{ticket['ref']}'s row also carries the other booking's reference ({', '.join(other_refs)})")
+        elif shown and not any(_mentions(shown, s) for s in ticket["surnames"]):
             unclear.append(f"{ticket['ref']}'s row names {shown!r}, not {ticket['surnames'][0]}")
         elif any(_mentions(shown, s) for s in others):
             unclear.append(f"{ticket['ref']}'s row also names the other booking's passengers ({shown!r})")
     out.append(Verdict("reservations_tell_bookings_apart_549", not unclear,
-                       "each reservation row says whose it is (its own passengers)",
+                       "each reservation row says which booking it is (its own reference)",
                        "the two rows cannot be told apart: " + "; ".join(unclear)))
     day = flight["date"]
     on_plan = [i for i in plan_items if str(i.get("date") or "")[:10] == day and _is_this_flight(_item_text(i), flight)]
-    out.append(Verdict("flight_once_on_plan_549", len(on_plan) == 1,
+    # What the Plan board shows, not the rows behind it: collapseSameFlight (trip-web/src/same-flight.ts)
+    # draws one line for lines of one flight and day that read the same, and keeps differently worded
+    # ones apart (one number can be two legs of a day).
+    shown_lines = {re.sub(r"\s+", " ", str(i.get("text_en") or i.get("text_he") or "")).strip().lower() for i in on_plan}
+    out.append(Verdict("flight_once_on_plan_549", len(shown_lines) == 1,
                        f"the plan shows {flight['number']} on {day} once",
-                       f"the plan shows {flight['number']} on {day} {len(on_plan)} time(s), not once "
+                       f"the plan shows {flight['number']} on {day} {len(shown_lines)} time(s), not once "
                        f"({sum(1 for i in plan_items if str(i.get('date') or '')[:10] == day)} item(s) that day, "
                        f"{len(plan_items)} in the plan)"))
     return out
