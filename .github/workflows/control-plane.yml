@@ -34,10 +34,15 @@ jobs:
   # 11m19s, 11m47s, 13m21s); one run of a docs-only PR was cancelled at the old
   # 15-minute limit while still running, with no failing test in its log. Raise
   # it rather than trim the suite, as CLAUDE.md says of --test-timeout.
+  #
+  # 45 since 2026-11-15 (owner's decision): the suite is about 3,400 tests and the
+  # job took 18-27 minutes across 13-15 November; on #572 it was cancelled at the
+  # 30-minute limit with no failing test, and passed on a re-run in 25m49s. This
+  # is a stopgap: the fix is to split the suite across two jobs.
   api:
     name: TypeScript API
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     services:
       postgres:
