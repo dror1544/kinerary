@@ -78,9 +78,15 @@ kinds of friction are removed. They remove a prompt, not a protection: the
 approval for code moves to the merge, and every hard rule above still holds
 for deploys, binaries and this deployment's names.
 
-Two branches carry names in this document. The **leading branch** is
-`integration/sprint-N` — where sprint work lands. The **production branch** is
-`main` — what a release is cut from. Nothing below exempts either of them.
+Two branch roles carry names in this document. The **leading branch** is
+where work lands; the **production branch** is what a release is cut from.
+**Since 2026-11-15 both are `main`** ("Faster delivery" below, item 3): a PR
+targets `main`, and no further `integration/sprint-N` is cut. Until then the
+leading branch was `integration/sprint-N`, and the items below were written
+with that name: wherever one says the merge into `integration/sprint-*` is the
+one prompt, that prompt is now the merge into `main`. Nothing below exempts
+`main`: a merge onto it always asks, and nothing is committed to it directly —
+docs-only work goes through a `docs/*` branch and a PR like everything else.
 
 1. **Docs-only work needs no per-commit approval.** A commit whose every staged
    path is documentation (`docs/**/*.md`, `CHANGELOG.md`, `FRAMEWORK.md`,
@@ -201,9 +207,12 @@ before it is briefed):
    check and prompt refresh, in that order, with the version recorded on the
    trip and the previous one kept as the way back. A rollout goes to a staging
    trip first, then one trip, then the rest.
-3. **`main` becomes the leading branch** once item 1 is merged: PRs then target
-   `main` and `integration/sprint-N` stops being cut. Until that is recorded
-   here, the two branch names in "MVP phase" above mean what they say.
+3. **`main` is the leading branch — in force since 2026-11-15**, when item 1's
+   first slice reached `main` (#582). PRs target `main` and
+   `integration/sprint-N` stops being cut; `integration/sprint-8` is kept, not
+   used. `.project/sprint.json` still names it until the next sprint is opened
+   with `scripts/project-state.py set-sprint`, which is the owner's call. A
+   feature that is not ready ships switched off instead of waiting on a branch.
 4. **Control-plane images are built in CI and pulled by the VM**
    (`docs/future/control-plane-ota-upgrades.md`).
 

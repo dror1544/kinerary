@@ -789,8 +789,12 @@ Principles behind the table:
     regression plan and the owner's manual test before a merge to `main` are
     for risk-class change sets only; a deploy is approved per rollout, not per
     step; a switch on a test trip needs no approval. Implemented in CLAUDE.md
-    ("Faster delivery"); the hooks follow with the rollout command. Until
-    `main` leads, §4's task life and the integrator's seat are unchanged.
+    ("Faster delivery"); the hooks follow with the rollout command. **`main`
+    leads since 2026-11-15** (#582 took the first slice of the switches and of
+    the rollout command to `main`): a brief's `Base:` is `main @ <commit>`, a
+    PR targets `main`, and the integrator prepares that one merge. §4's
+    diagram still draws the integration branch between the PR and `main`;
+    read it with that hop removed.
 
 ---
 
