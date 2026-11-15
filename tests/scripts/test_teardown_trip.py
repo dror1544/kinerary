@@ -717,6 +717,7 @@ class PinGatewayOff(unittest.TestCase):
                 mock.patch.object(teardown, "DEPLOY_ROOT", tmp),
                 mock.patch.object(teardown, "PROFILES", tmp / "profiles"),
                 mock.patch.object(teardown, "bridge", lambda d: None),
+                mock.patch.object(teardown, "LAUNCH_AGENTS", tmp / "no-launch-agents"),
                 mock.patch.object(teardown, "document_store", lambda t: None),
                 mock.patch.object(teardown, "kept_originals", lambda s: 0),
                 mock.patch.object(teardown, "interviewer_allows", lambda p: True),
@@ -773,17 +774,60 @@ class BridgeLaunchAgents(unittest.TestCase):
             with mock.patch.object(teardown, "LAUNCH_AGENTS", Path(tmp) / "absent"):
                 self.assertEqual(teardown.bridge_launch_agents(Path(tmp) / "trips/x"), [])
 
+    def _unload(self, trip: Path, agents: Path, still_loaded: bool):
+        calls = []
+        def run(args, **kw):
+            calls.append(args)
+            return mock.Mock(returncode=0 if (args[1] == "print" and still_loaded) else (113 if args[1] == "print" else 0))
+        with mock.patch.object(teardown, "LAUNCH_AGENTS", agents), mock.patch.object(teardown, "MACOS", True), \
+             mock.patch.object(teardown.subprocess, "run", side_effect=run):
+            return teardown.unload_bridge_agents(trip), calls
+
+    def _fixture(self, tmp: str):
+        root = Path(tmp)
+        agents, trip = root / "LaunchAgents", root / "trips/italy-2026"
+        agents.mkdir(); (trip / "mcp").mkdir(parents=True)
+        # The shape kinerary-deploy's setup-mcp.sh writes (2026-11-15): bash + the trip's runner.
+        plist = self._agent(agents, "com.example.bridge.italy", str(trip / "mcp/run-bridge.sh"))
+        return trip, agents, plist
+
     def test_unloading_boots_out_then_deletes_the_plist(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            agents, trip = root / "LaunchAgents", root / "trips/italy-2026"
-            agents.mkdir(); (trip / "mcp").mkdir(parents=True)
-            plist = self._agent(agents, "com.example.bridge.italy", str(trip / "mcp/run-bridge.sh"))
-            calls = []
-            with mock.patch.object(teardown, "LAUNCH_AGENTS", agents), \
-                 mock.patch.object(teardown.subprocess, "run", side_effect=lambda a, **k: calls.append(a)):
-                removed = teardown.unload_bridge_agents(trip)
-            self.assertEqual(removed, ["com.example.bridge.italy"])
+            trip, agents, plist = self._fixture(tmp)
+            done, calls = self._unload(trip, agents, still_loaded=False)
+            self.assertEqual(done, [("com.example.bridge.italy", True)])
             self.assertEqual(calls[0][:2], ["launchctl", "bootout"])
             self.assertTrue(calls[0][2].endswith("/com.example.bridge.italy"))
             self.assertFalse(plist.exists())
+
+    def test_an_agent_still_loaded_after_bootout_keeps_its_plist_and_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trip, agents, plist = self._fixture(tmp)
+            done, _ = self._unload(trip, agents, still_loaded=True)
+            self.assertEqual(done, [("com.example.bridge.italy", False)])
+            self.assertTrue(plist.exists())
+
+    def test_off_macos_nothing_is_unloaded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trip, agents, plist = self._fixture(tmp)
+            with mock.patch.object(teardown, "LAUNCH_AGENTS", agents), mock.patch.object(teardown, "MACOS", False), \
+                 mock.patch.object(teardown.subprocess, "run") as run:
+                self.assertEqual(teardown.unload_bridge_agents(trip), [])
+            run.assert_not_called()
+            self.assertTrue(plist.exists())
+
+    def test_backup_copies_the_bridge_agent_it_will_delete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trip, agents, plist = self._fixture(tmp)
+            dest = Path(tmp) / "backup"
+            with mock.patch.object(teardown, "LAUNCH_AGENTS", agents), \
+                 mock.patch.object(teardown, "PROFILES", Path(tmp) / "profiles"), \
+                 mock.patch.object(teardown, "INTERVIEWER_CONFIG", Path(tmp) / "none.yaml"), \
+                 mock.patch.object(teardown, "DOCUMENT_TABLES", ()), \
+                 mock.patch.object(teardown, "psql", lambda sql: ""), \
+                 mock.patch.object(teardown, "kept_originals", lambda s: 0, create=True):
+                try:
+                    teardown.backup({"profile": "italy2026", "id": "trip_x"}, trip, dest)
+                except Exception:
+                    pass  # later backup steps need a real store; the copy happens before them
+            self.assertEqual((dest / plist.name).read_bytes(), plist.read_bytes())

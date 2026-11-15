@@ -435,15 +435,28 @@ def bridge_launch_agents(trip_dir: Path) -> list[tuple[str, Path]]:
     return found
 
 
-def unload_bridge_agents(trip_dir: Path) -> list[str]:
+def agent_loaded(label: str) -> bool:
+    return subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+                          capture_output=True, text=True).returncode == 0
+
+
+def unload_bridge_agents(trip_dir: Path) -> list[tuple[str, bool]]:
     """Boot each of this trip's LaunchAgents out, then delete its plist so a reboot
-    or a login cannot load it again. Returns the labels removed."""
-    removed = []
+    or a login cannot load it again. (label, unloaded) per agent. An agent still
+    loaded after the bootout KEEPS its plist: deleting it would leave a running
+    agent with nothing left to name it or boot it out by. backup() has already
+    copied every plist this deletes."""
+    if not MACOS:
+        return []
+    done = []
     for label, plist in bridge_launch_agents(trip_dir):
         subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"], capture_output=True, text=True)
+        if agent_loaded(label):
+            done.append((label, False))
+            continue
         plist.unlink(missing_ok=True)
-        removed.append(label)
-    return removed
+        done.append((label, True))
+    return done
 
 
 def bridge(trip_dir: Path) -> tuple[str, str] | None:
@@ -588,6 +601,9 @@ def backup(trip: dict, trip_dir: Path, dest: Path) -> None:
     plist = LAUNCH_AGENTS / f"ai.hermes.gateway-{trip['profile']}.plist"
     if plist.is_file():
         shutil.copy2(plist, dest / plist.name)
+    # The bridge's own agents, which the bridge step deletes (and nothing else keeps).
+    for _, agent in bridge_launch_agents(trip_dir):
+        shutil.copy2(agent, dest / agent.name)
     if INTERVIEWER_CONFIG.is_file():
         shutil.copy2(INTERVIEWER_CONFIG, dest / "trip-intake-config.yaml")
     for table in ("trips", "telegram_chat_bindings", *DOCUMENT_TABLES):
@@ -924,19 +940,33 @@ def main() -> int:
         say(f"{GREEN}✓{RESET}" if not gateway_loaded(profile) else f"{RED}✗{RESET}", "gateway    uninstalled")
 
     # The agent first: launchd's KeepAlive would restart a pid killed under it.
-    for label in unload_bridge_agents(trip_dir):
-        say(f"{GREEN}✓{RESET}", f"bridge     unloaded LaunchAgent {label}")
+    bridge_failed = False
+    for label, unloaded in unload_bridge_agents(trip_dir):
+        if unloaded:
+            say(f"{GREEN}✓{RESET}", f"bridge     unloaded LaunchAgent {label}")
+        else:
+            bridge_failed = True
+            say(f"{RED}✗{RESET}", f"bridge     LaunchAgent {label} is still loaded after bootout; its plist is kept")
     if b:
         pid, port = b
         listener = listeners(port)
         cmd = subprocess.run(["ps", "-o", "command=", "-p", pid], capture_output=True, text=True).stdout
         if pid in listener and "mcp.js" in cmd:
             subprocess.run(["kill", pid])
-            say(f"{GREEN}✓{RESET}", f"bridge     stopped pid {pid} (:{port})")
+        # The observable, whatever shape the agent had: is anything listening on the
+        # bridge's port once it should be gone? A KeepAlive respawn shows up here.
+        for _ in range(10):
+            if not listeners(port):
+                break
+            time.sleep(0.5)
+        still = listeners(port)
+        if not still:
+            say(f"{GREEN}✓{RESET}", f"bridge     nothing listening on :{port}")
         else:
-            say(f"{DIM}·{RESET}", f"bridge     pid {pid} is not the listener on :{port} — left alone")
+            bridge_failed = True
+            say(f"{RED}✗{RESET}", f"bridge     :{port} is still served (pid {', '.join(still)}) — a respawn, or not this trip's bridge")
 
-    failed = False
+    failed = bridge_failed
     kept = None
     if topo and args.keep_container:
         prov.cloudflare.delete(topo.cloudflare)
