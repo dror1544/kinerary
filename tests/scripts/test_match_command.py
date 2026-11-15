@@ -246,5 +246,179 @@ class Classify(unittest.TestCase):
             self.assertEqual(classify(command), "none", command)
 
 
+class Rollout(unittest.TestCase):
+    """#568 / AC-10: one rollout is one approval, and the steps it runs are deploys on their own.
+
+    Until now a bridge restart, a prompt refresh and a gateway stop/start were never asked at all.
+    """
+
+    def test_executing_a_rollout_is_a_deploy_however_it_is_run(self):
+        for command in (
+            "python3 scripts/trip-rollout.py execute --plan-file /tmp/p.json --plan-digest sha256:" + "0" * 64,
+            "scripts/trip-rollout.py execute --plan-file p.json --plan-digest sha256:" + "0" * 64,
+            "./scripts/trip-rollout.py execute --plan-file p.json",
+            "python3 -I scripts/trip-rollout.py execute --plan-file p.json",
+            "sudo python3 scripts/trip-rollout.py execute --plan-file p.json",
+            "KINERARY_DEPLOY_ROOT=/x python3 scripts/trip-rollout.py execute --plan-file p.json",
+            "cd /somewhere && python3 scripts/trip-rollout.py execute --plan-file p.json",
+            "git status && python3 scripts/trip-rollout.py execute --plan-file p.json",
+            "ssh host 'python3 scripts/trip-rollout.py execute --plan-file p.json'",
+            "ssh host \"cd x && scripts/trip-rollout.py execute --plan-file p.json\"",
+        ):
+            self.assertEqual(classify(command), "deploy", command)
+
+    def test_planning_and_status_are_reads_and_stay_silent(self):
+        for command in (
+            "python3 scripts/trip-rollout.py plan --release rls_x --trip japan-2026 --plan-file /tmp/p.json",
+            "scripts/trip-rollout.py status",
+            "scripts/trip-rollout.py status --trip japan-2026",
+            "scripts/trip-rollout.py --help",
+            "scripts/trip-rollout.py plan --release x --trip a --plan-file /tmp/execute.json",  # a name, not the verb
+            "python3 scripts/trip-rollout.py plan --release x --all --plan-file execute.json",
+            "ls scripts/trip-rollout.py",
+            "grep -n execute scripts/trip-rollout.py",
+        ):
+            self.assertEqual(classify(command), "none", command)
+
+    def test_each_step_run_on_its_own_is_a_deploy(self):
+        for command in (
+            # the bridge restart
+            "cd ~/some-deployment && ./setup-mcp.sh --restart-only --trip-dir ./trips/a",
+            "REPO_ROOT=$PWD KINERARY_DEPLOY_ROOT=/x ./setup-mcp.sh --restart-only --trip-dir ./trips/a",
+            "bash setup-mcp.sh --restart-only --trip-dir t",
+            "ssh host sudo ./setup-mcp.sh --restart-only --trip-dir t",
+            # the prompt refresh
+            "scripts/companion-refresh-prompts.sh japan2026",
+            "bash scripts/companion-refresh-prompts.sh japan2026",
+            "ssh host sudo scripts/companion-refresh-prompts.sh japan2026",
+            # a gateway stop, start or restart
+            "hermes -p japan2026 gateway stop",
+            "hermes -p japan2026 gateway start",
+            "hermes -p japan2026 gateway restart",
+            "~/.local/bin/hermes -p japan2026 gateway start",
+            "ssh host hermes -p japan2026 gateway stop",
+            "docker exec -u 10000 hermes hermes -p japan2026 gateway restart",
+            "cd x && hermes -p a gateway stop && hermes -p a gateway start",
+            "launchctl kickstart -k gui/501/ai.hermes.gateway-japan2026",
+            "launchctl bootout gui/501/ai.hermes.gateway-japan2026",
+        ):
+            self.assertEqual(classify(command), "deploy", command)
+
+    def test_reading_a_step_or_its_state_is_silent(self):
+        for command in (
+            "scripts/companion-refresh-prompts.sh --dry-run japan2026",
+            "hermes -p japan2026 gateway status",
+            "hermes gateway --help",
+            "launchctl list | grep hermes",
+            "ls scripts/companion-refresh-prompts.sh",
+            "cat setup-mcp.sh",
+            "grep -n restart-only setup-mcp.sh",
+            "tail -n 50 ~/.hermes/profiles/japan2026/logs/agent.log",
+        ):
+            self.assertEqual(classify(command), "none", command)
+
+    def test_prose_that_merely_names_a_step_does_not_prompt_as_a_deploy(self):
+        # A commit message, an issue body or an echo that mentions the commands is not running them.
+        self.assertEqual(classify("echo see setup-mcp.sh --restart-only for details"), "none")
+        self.assertEqual(classify("echo then hermes -p x gateway start by hand"), "none")
+        self.assertEqual(classify("git commit -m 'the hook now asks before hermes -p x gateway start'"), "commit")
+        self.assertEqual(classify("cat > notes.md <<'EOF'\nrun trip-rollout.py execute --plan-file p\nEOF"), "none")
+
+    def test_a_commit_whose_message_starts_with_a_step_stays_a_commit(self):
+        # Review round 1: a double-quoted message that BEGINS with a step's words read as a command position.
+        for command in (
+            'git commit -m "hermes gateway restart now asks"',
+            'git commit -m "setup-mcp.sh --restart-only is now asked about"',
+            'git commit -m "companion-refresh-prompts.sh asks too"',
+            'git commit -m "trip-rollout.py execute is one approval"',
+            'git commit -m "restart-trip-mcp.sh and restart-all-trip-mcp.sh ask"',
+            "git commit -m 'hermes -p x gateway stop is asked'",
+            "git commit -m \"$(cat <<'EOF'\nhermes gateway restart now asks\nEOF\n)\"",
+        ):
+            self.assertEqual(classify(command), "commit", command)
+
+    def test_searching_for_or_printing_a_step_is_not_running_it(self):
+        # A documentation sweep greps for these words; a subagent doing one must not be refused.
+        for command in (
+            'grep "setup-mcp.sh --restart-only" docs/runbook.md',
+            "rg 'companion-refresh-prompts.sh' docs",
+            "rg \"hermes -p x gateway stop\" docs",
+            'git grep "hermes gateway restart" -- docs',
+            'grep -rn "trip-rollout.py execute" docs scripts',
+            'grep -n "restart-trip-mcp.sh" docs/runbook.md',
+            'echo "hermes -p x gateway stop"',
+            "printf 'setup-mcp.sh --restart-only\\n'",
+            'sed -n 1,5p "companion-refresh-prompts.sh"',
+            "cat docs/runbook.md | grep 'hermes gateway start'",
+            "ssh host grep -n setup-mcp.sh --restart-only docs/x.md",
+            "ssh host \"grep -n 'setup-mcp.sh --restart-only' docs/x.md\"",
+            "docker exec hermes grep -rn 'gateway stop' /docs",
+            'bash -c "grep -n setup-mcp.sh docs/x.md"',
+        ):
+            self.assertEqual(classify(command), "none", command)
+
+    def test_a_step_that_really_runs_after_a_search_still_asks(self):
+        self.assertEqual(classify('grep -rn "hermes gateway stop" docs && hermes -p a gateway stop'), "deploy")
+        self.assertEqual(classify("echo done; ./setup-mcp.sh --restart-only --trip-dir t"), "deploy")
+
+    def test_a_step_inside_a_shell_payload_is_still_a_deploy(self):
+        for command in (
+            'bash -c "hermes -p a gateway stop"',
+            "sh -c 'cd x && ./setup-mcp.sh --restart-only --trip-dir t'",
+            'ssh -i key -o BatchMode=yes host "cd x && ./setup-mcp.sh --restart-only --trip-dir t"',
+            "ssh host 'scripts/companion-refresh-prompts.sh alpha'",
+            'ssh host "sudo hermes -p a gateway restart"',
+            "docker exec -u 10000 -e X=1 hermes sh -c 'hermes -p a gateway start'",
+            'ssh host "ssh inner hermes -p a gateway stop"',
+        ):
+            self.assertEqual(classify(command), "deploy", command)
+
+    def test_the_generic_bridge_restart_wrappers_are_deploys_and_reading_them_is_not(self):
+        for command in (
+            "./restart-trip-mcp.sh alpha-2026",
+            "~/some-deployment/restart-all-trip-mcp.sh",
+            "bash restart-trip-mcp.sh alpha-2026",
+            "sudo ./restart-all-trip-mcp.sh",
+            "cd ~/dep && ./restart-trip-mcp.sh a",
+            "KINERARY_DEPLOY_ROOT=/x ./restart-all-trip-mcp.sh",
+            "ssh host sudo ./restart-all-trip-mcp.sh",
+            'ssh host "cd x && ./restart-trip-mcp.sh a"',
+        ):
+            self.assertEqual(classify(command), "deploy", command)
+        for command in ("cat restart-trip-mcp.sh", "grep -n pid restart-all-trip-mcp.sh", "ls restart-trip-mcp.sh",
+                        "bash -n restart-trip-mcp.sh"):
+            self.assertEqual(classify(command), "none", command)
+
+    def test_the_older_deploy_verbs_still_win_and_keep_their_class(self):
+        self.assertEqual(classify("git push origin x && python3 scripts/trip-rollout.py execute --plan-file p"), "deploy")
+        self.assertEqual(classify("docker restart trip-server"), "deploy")
+
+
+class RolloutArgs(unittest.TestCase):
+    """--rollout-args: what the prompt reads off the command is what the shell hands the script."""
+
+    def args(self, command: str) -> list[str]:
+        out = subprocess.run([sys.executable, str(SCRIPT), "--rollout-args"], input=command, capture_output=True, text=True).stdout
+        return out.split("\n")[1:4] if out.startswith("execute\n") else []   # the first line marks "this is an execute"
+
+    def test_the_three_options_are_read_in_order(self):
+        self.assertEqual(
+            ["/tmp/p.json", "sha256:" + "a" * 64, "site,bridge"],
+            self.args("python3 scripts/trip-rollout.py execute --plan-file /tmp/p.json --plan-digest sha256:" + "a" * 64 + " --steps site,bridge"))
+
+    def test_the_equals_form_and_quotes_are_read(self):
+        self.assertEqual(["a b.json", "", ""], self.args("scripts/trip-rollout.py execute --plan-file='a b.json'"))
+        self.assertEqual(["/p.json", "", ""], self.args("scripts/trip-rollout.py execute --plan-file \"/p.json\""))
+
+    def test_only_the_statement_that_runs_the_command_is_read(self):
+        self.assertEqual(["p.json", "", ""], self.args("scripts/trip-rollout.py execute --plan-file p.json ; echo --plan-digest nope"))
+        self.assertEqual(["p.json", "", ""], self.args("cd x && scripts/trip-rollout.py execute --plan-file p.json | tee log"))
+
+    def test_nothing_is_printed_for_a_command_that_is_not_an_execute(self):
+        self.assertEqual([], self.args("scripts/trip-rollout.py plan --plan-file p.json"))
+        self.assertEqual([], self.args("git status"))
+        self.assertEqual([], self.args("scripts/trip-rollout.py execute --plan-file 'unterminated"))
+
+
 if __name__ == "__main__":
     unittest.main()
