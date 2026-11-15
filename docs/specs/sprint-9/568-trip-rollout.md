@@ -270,3 +270,11 @@ Written first, from the criteria.
    the bridge step is expected to fail there and is proved in tests.
 4. **A trip with no recorded release may be rolled out** from "unknown"; the plan
    says that no way back is recorded for that first rollout.
+5. **A rollback may target a deprecated release (Dror, 2026-11-15).** When the target
+   is the trip's own `previous_release_id`, `plan` accepts it even if that release is
+   no longer `available` (for example `deprecated`), and says so as a warning in the
+   plan and in the hard-rule-2 prompt. Reason: the way back is the safety net, and a
+   release being retired from new builds must not remove it for trips that ran it.
+   Any other release that is not `available` is still refused (AC-2). R1 refuses every
+   non-`available` target today (`release_refusal` in `scripts/trip-rollout.py`); the
+   exception is built in R2.
