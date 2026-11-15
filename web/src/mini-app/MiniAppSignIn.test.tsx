@@ -5,6 +5,10 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { App } from "../App";
 import { digestInitData, launchMarker } from "./launch";
 
+// vi.waitFor gives up after 1s by default. Under scripts/preflight-deploy.sh every suite
+// runs at once and a passing exchange took 1067ms (nightly, 2026-11-15); CI never saw it.
+const WAIT = { timeout: 5000 };
+
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status });
 function LocationProbe() { const location = useLocation(); return <output data-testid="route">{location.pathname}</output>; }
 
@@ -42,7 +46,7 @@ afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); delete (window as
 it("sends the SDK's signed initData and nothing else, ignoring initDataUnsafe", async () => {
   telegram();
   const { exchanges } = mount("/mini-app", (path) => path === "/v1/auth/telegram-mini-app" ? json({ kind: "session", appPath: "/mini-app/trips/trip_abcdefgh" }) : undefined);
-  await vi.waitFor(() => expect(submissions).toHaveLength(1));
+  await vi.waitFor(() => expect(submissions).toHaveLength(1), WAIT);
   expect(exchanges()).toHaveLength(1);
   expect(exchanges()[0].body).toEqual({ initData: INIT });
   expect(JSON.stringify(exchanges())).not.toContain("Forged");
@@ -52,7 +56,7 @@ it("sends the SDK's signed initData and nothing else, ignoring initDataUnsafe", 
 it("lands on the trip the server chose, not the one the URL asked for", async () => {
   telegram();
   mount("/mini-app/trips/trip_ijklmnop", (path) => path === "/v1/auth/telegram-mini-app" ? json({ kind: "session", appPath: "/mini-app/trips/trip_abcdefgh", notice: "TRIP_UNAVAILABLE" }) : undefined);
-  await vi.waitFor(() => expect(submissions).toHaveLength(1));
+  await vi.waitFor(() => expect(submissions).toHaveLength(1), WAIT);
   expect(screen.getByTestId("route")).toHaveTextContent("/mini-app/trips/trip_abcdefgh");
   expect(screen.getByText(/isn't available to your account/)).toBeInTheDocument();
 });
@@ -97,7 +101,7 @@ it("a marker for a different launch does not skip the exchange, and an expired s
   // Same launch, but the cookie session is gone: the marker alone is not trusted.
   launchMarker.write(await digestInitData(INIT));
   const second = mount("/mini-app", (path) => path === "/v1/auth/telegram-mini-app" ? json({ kind: "session", appPath: "/mini-app" }) : undefined, { authenticated: false });
-  await vi.waitFor(() => expect(second.exchanges()).toHaveLength(1));
+  await vi.waitFor(() => expect(second.exchanges()).toHaveLength(1), WAIT);
 });
 
 it("several accounts: shows the chooser, then exchanges again with the chosen trip only", async () => {
@@ -111,7 +115,7 @@ it("several accounts: shows the chooser, then exchanges again with the chosen tr
     return JSON.parse(String(init?.body)).tripId ? json({ kind: "session", appPath: "/mini-app/trips/trip_ijklmnop" }) : json({ kind: "choose", trips });
   });
   fireEvent.click(await screen.findByRole("button", { name: "Oslo" }));
-  await vi.waitFor(() => expect(submissions).toHaveLength(1));
+  await vi.waitFor(() => expect(submissions).toHaveLength(1), WAIT);
   expect(exchanges().map((e) => e.body)).toEqual([{ initData: INIT }, { initData: INIT, tripId: "trip_ijklmnop" }]);
   expect(screen.getByTestId("route")).toHaveTextContent("/mini-app/trips/trip_ijklmnop");
 });
@@ -132,7 +136,7 @@ it("not linked, trip in context: the trip-password form with an unticked 'Next t
   fireEvent.change(screen.getByLabelText("Trip username"), { target: { value: "  Dana " } });
   fireEvent.change(screen.getByLabelText("Password"), { target: { value: "member-password" } });
   fireEvent.click(screen.getByRole("button", { name: "Continue with trip password" }));
-  await vi.waitFor(() => expect(calls.some((c) => c.path === "/v1/auth/password")).toBe(true));
+  await vi.waitFor(() => expect(calls.some((c) => c.path === "/v1/auth/password")).toBe(true), WAIT);
   const plain = calls.find((c) => c.path === "/v1/auth/password")!;
   expect(plain.body).toEqual({ tripId: "trip_abcdefgh", returnTo: "/mini-app/trips/trip_abcdefgh", runtimeUsername: "dana", password: "member-password" });
   expect(JSON.stringify(plain.body)).not.toContain("initData");
@@ -149,7 +153,7 @@ it("not linked: ticking the control sends consent with the initData in the same 
   fireEvent.change(screen.getByLabelText("Trip username"), { target: { value: "dana" } });
   fireEvent.change(screen.getByLabelText("Password"), { target: { value: "member-password" } });
   fireEvent.click(screen.getByRole("button", { name: "Continue with trip password" }));
-  await vi.waitFor(() => expect(calls.some((c) => c.path === "/v1/auth/password")).toBe(true));
+  await vi.waitFor(() => expect(calls.some((c) => c.path === "/v1/auth/password")).toBe(true), WAIT);
   expect(calls.find((c) => c.path === "/v1/auth/password")!.body).toMatchObject({ telegramLink: { initData: INIT, consent: true } });
 });
 
@@ -221,7 +225,7 @@ it("Telegram Web: the chooser's follow-up and the trip-password sign-in carry th
   fireEvent.change(await screen.findByLabelText("Trip username"), { target: { value: "dana" } });
   fireEvent.change(screen.getByLabelText("Password"), { target: { value: "member-password" } });
   fireEvent.click(screen.getByRole("button", { name: "Continue with trip password" }));
-  await vi.waitFor(() => expect(calls.some((c) => c.path === "/v1/auth/password")).toBe(true));
+  await vi.waitFor(() => expect(calls.some((c) => c.path === "/v1/auth/password")).toBe(true), WAIT);
   expect(calls.find((c) => c.path === "/v1/auth/password")!.body).toMatchObject({ embedded: true });
 });
 
