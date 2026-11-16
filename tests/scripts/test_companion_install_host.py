@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -486,3 +488,332 @@ class EnrollRelay(unittest.TestCase):
         self.assertIn("left UNENROLLED", result.stderr)
         self.assertFalse((self.profile_dir / ".env").exists())
         self.assertFalse((self.profile_dir / "write-sandbox").exists())
+
+
+class RerenderRequest(unittest.TestCase):
+    """`companion_profile_rerender` (#568 slice R2, AC-14): an existing companion follows its trip to a newer release.
+
+    The request carries a handoff and a mode; the render code and templates come from the RELEASE'S tree, handed over
+    through the environment by the rollout and never by the request. These tests run the real script in a sandboxed
+    HOME with a stand-in `hermes`, a real release-shaped tree, and a gateway the script must not touch.
+    """
+
+    NAME = "sampletrip2027"
+    RELEASE = {"id": "rls_abc12345", "commit": "c" * 40}
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.calls = self.root / "gateway.calls"
+        # `hermes profile create` makes the directory; anything about a gateway is recorded, and must never happen.
+        BridgeRequest._exe(self.bin / "hermes",
+                           '#!/bin/sh\n'
+                           f'case "$*" in *gateway*) echo "hermes $*" >> "{self.calls}";; esac\n'
+                           '[ "$1 $2" = "profile create" ] && mkdir -p "$HOME/.hermes/profiles/$3"\nexit 0\n')
+        BridgeRequest._exe(self.bin / "launchctl", f'#!/bin/sh\necho "launchctl $*" >> "{self.calls}"\nexit 0\n')
+        # PyYAML for the overlay merge: this interpreter has it.
+        (self.bin / "python3").symlink_to(sys.executable)
+        self.profile = self.home / ".hermes" / "profiles" / self.NAME
+        self.handoff = json.loads((REPO / "profile-templates/familytrip-companion/example.handoff.json").read_text())
+        self.handoff["profile"]["name"] = self.NAME
+        self.tree = self.make_release_tree("release one")
+        self.install_with_the_scripts_own_checkout()
+
+    # -- fixtures
+
+    def make_release_tree(self, mark: str, name: str = "tree") -> Path:
+        """What a release materializes: profile-templates/familytrip-companion, with `mark` in the SOUL template."""
+        tree = self.root / name
+        shutil.copytree(REPO / "profile-templates/familytrip-companion",
+                        tree / "profile-templates/familytrip-companion",
+                        ignore=shutil.ignore_patterns("tests", "eval", "__pycache__"))
+        soul = tree / "profile-templates/familytrip-companion/templates/SOUL.md.tpl"
+        soul.write_text(soul.read_text() + f"\nRELEASE-MARK: {mark}\n")
+        return tree
+
+    def env(self, tree="unset") -> dict:
+        tree = self.tree if tree == "unset" else tree
+        env = {"HOME": str(self.home), "PATH": f"{self.bin}:/usr/bin:/bin",
+               "KINERARY_ARCHITECTURE_PROFILE": str(self.home / "none.json")}
+        if tree is not None:
+            env["KINERARY_RELEASE_TREE"] = str(tree)
+        return env
+
+    def run_request(self, request: dict, tree="unset") -> subprocess.CompletedProcess:
+        return subprocess.run(["bash", str(SCRIPT)], input=json.dumps(request), capture_output=True, text=True,
+                              env=self.env(tree), timeout=120)
+
+    def install_with_the_scripts_own_checkout(self) -> None:
+        """The ordinary install path: INSTALLED, marked as this system's, and its render recorded."""
+        result = self.run_request(self.handoff, tree=None)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(f"INSTALLED {self.NAME}", result.stdout.strip())
+        for rel, body in {"state.db": b"SQLite format 3\x00 history", "memories/MEMORY.md": b"remembered\n",
+                          ".env": b"GATEWAY_RELAY_SECRET=untouchable\n", "logs/agent.log": b"line\n"}.items():
+            (self.profile / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.profile / rel).write_bytes(body)
+        (self.profile / "config.yaml").write_text("model:\n  default: the-profiles-own-choice\n")
+        if self.calls.exists():
+            self.calls.unlink()
+
+    def rerender(self, mode: str = "apply", allow: bool = False, tree="unset", **over):
+        request = {"record_type": "companion_profile_rerender", "schema_version": 1, "profile": {"name": self.NAME},
+                   "handoff": self.handoff, "mode": mode, "allow_edited": allow, "release": dict(self.RELEASE), **over}
+        return self.run_request(request, tree)
+
+    def snapshot(self) -> dict:
+        return {str(p.relative_to(self.profile)): (p.read_bytes() if p.is_file() and not p.is_symlink() else os.readlink(p))
+                for p in sorted(self.profile.rglob("*")) if p.is_file() or p.is_symlink()}
+
+    def untouched(self) -> dict:
+        keep = ("state.db", "memories/MEMORY.md", ".env", "logs/agent.log", "kinerary-managed")
+        return {k: (self.profile / k).read_bytes() for k in keep}
+
+    def verdict(self, result) -> str:
+        return result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+
+    # -- the request is refused unless it can be trusted
+
+    def test_without_a_release_tree_in_the_environment_it_is_refused_and_the_scripts_own_checkout_is_not_used_instead(self) -> None:
+        before = self.snapshot()
+        result = self.rerender(tree=None)
+        self.assertEqual(2, result.returncode)
+        self.assertIn("KINERARY_RELEASE_TREE", result.stderr)
+        self.assertEqual(before, self.snapshot())
+
+    def test_a_tree_that_is_not_a_release_tree_is_refused(self) -> None:
+        link = self.root / "link"
+        link.symlink_to(self.tree)
+        empty = self.root / "empty"
+        empty.mkdir()
+        for label, tree in (("relative", "tree"), ("absent", self.root / "absent"), ("a symlink", link), ("no render script", empty)):
+            with self.subTest(label):
+                before = self.snapshot()
+                result = self.rerender(tree=tree)
+                self.assertEqual(2, result.returncode, result.stdout)
+                self.assertEqual(before, self.snapshot())
+
+    def test_a_request_cannot_name_the_tree(self) -> None:
+        # The envelope has no field for it, and a field smuggled in is ignored: the tree is the environment's.
+        hostile = self.make_release_tree("HOSTILE", "hostile")
+        result = self.rerender(tree=self.tree, release_tree=str(hostile), tree_path=str(hostile), render=str(hostile))
+        self.assertEqual(f"RERENDER {self.NAME} applied", self.verdict(result), result.stderr)
+        self.assertIn("RELEASE-MARK: release one", (self.profile / "SOUL.md").read_text())
+        self.assertNotIn("HOSTILE", (self.profile / "SOUL.md").read_text())
+
+    def test_a_malformed_request_is_refused_before_anything_runs(self) -> None:
+        before = self.snapshot()
+        cases = {
+            "unknown mode": dict(mode="force"),
+            "allow that is a word": dict(allow_edited="yes"),
+            "allow that is a number": dict(allow_edited=1),
+            "no release": dict(release=None),
+            "a release id with a space": dict(release={"id": "a b", "commit": "c" * 40}),
+            "a short commit": dict(release={"id": "rls_ok", "commit": "abc123"}),
+            "a commit with a newline": dict(release={"id": "rls_ok", "commit": "c" * 39 + "\n"}),
+            "a handoff for another profile": dict(handoff={**self.handoff, "profile": {**self.handoff["profile"], "name": "someoneelse"}}),
+            "no handoff": dict(handoff=None),
+            "a handoff of another kind": dict(handoff={**self.handoff, "record_type": "trip_mcp_bridge_request"}),
+            "an unsafe profile name": dict(profile={"name": "../x"}),
+        }
+        for label, over in cases.items():
+            with self.subTest(label):
+                result = self.rerender(**over)
+                self.assertEqual(2, result.returncode, f"{label}: {result.stdout!r} {result.stderr!r}")
+                self.assertEqual(before, self.snapshot())
+
+    def test_a_profile_this_system_did_not_install_is_refused(self) -> None:
+        (self.profile / "kinerary-managed").unlink()
+        before = self.snapshot()
+        result = self.rerender()
+        self.assertEqual(2, result.returncode)
+        self.assertIn("provenance marker", result.stderr)
+        self.assertEqual(before, self.snapshot())
+
+    def test_a_profile_on_the_deny_list_is_refused_even_with_a_marker(self) -> None:
+        names = [ln.strip() for ln in (REPO / "scripts/protected-profiles.txt").read_text().splitlines()
+                 if ln.strip() and not ln.startswith("#") and re.fullmatch(r"[a-z][a-z0-9]{2,31}", ln.strip())]
+        self.assertTrue(names, "no protected profile with a name a handoff may carry")
+        protected = self.home / ".hermes" / "profiles" / names[0]
+        protected.mkdir(parents=True)
+        (protected / "kinerary-managed").write_text("kinerary-managed\n")
+        (protected / "SOUL.md").write_text("somebody's own bot")
+        handoff = {**self.handoff, "profile": {**self.handoff["profile"], "name": names[0]}}
+        result = self.rerender(profile={"name": names[0]}, handoff=handoff)
+        self.assertEqual(2, result.returncode)
+        self.assertIn("not a profile this system manages", result.stderr)
+        self.assertEqual("somebody's own bot", (protected / "SOUL.md").read_text())
+
+    def test_a_profile_directory_that_is_a_symlink_is_refused_and_its_target_untouched(self) -> None:
+        target = self.root / "somewhere-else"
+        shutil.move(str(self.profile), str(target))
+        self.profile.symlink_to(target)
+        before = {p.name: p.read_bytes() for p in target.iterdir() if p.is_file()}
+        result = self.rerender()
+        self.assertEqual(2, result.returncode)
+        self.assertEqual(before, {p.name: p.read_bytes() for p in target.iterdir() if p.is_file()})
+
+    def test_no_such_profile_is_refused_not_created(self) -> None:
+        other = {**self.handoff, "profile": {**self.handoff["profile"], "name": "notinstalled"}}
+        result = self.rerender(profile={"name": "notinstalled"}, handoff=other)
+        self.assertEqual(2, result.returncode)
+        self.assertFalse((self.home / ".hermes/profiles/notinstalled").exists())
+
+    # -- AC-14: what a re-render does
+
+    def test_a_fresh_install_records_what_it_rendered_so_the_first_rerender_can_tell_an_edit(self) -> None:
+        self.assertTrue((self.profile / ".kinerary-render.json").is_file())
+        result = self.rerender(mode="check")
+        self.assertEqual(f"RERENDER {self.NAME} clean", self.verdict(result), result.stderr)
+
+    def test_check_writes_nothing_and_starts_nothing(self) -> None:
+        tree2 = self.make_release_tree("release two", "tree2")
+        for edit in (lambda: None, lambda: (self.profile / "SOUL.md").write_text("edited"),
+                     lambda: (self.profile / ".kinerary-render.json").unlink()):
+            edit()
+            before = self.snapshot()
+            result = self.rerender(mode="check", tree=tree2)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual(before, self.snapshot())
+        self.assertFalse(self.calls.exists(), "a re-render never touches a gateway")
+
+    def test_apply_leaves_the_profiles_soul_and_skills_equal_to_a_fresh_render_of_the_release(self) -> None:
+        tree = self.make_release_tree("release two", "tree2")
+        kept = self.untouched()
+        result = self.rerender(tree=tree)
+        self.assertEqual(f"RERENDER {self.NAME} applied", self.verdict(result), result.stderr)
+        inp = self.root / "in.json"
+        inp.write_text(json.dumps(self.handoff))
+        subprocess.run([sys.executable, str(tree / "profile-templates/familytrip-companion/render_profile.py"),
+                        "--input", str(inp), "--output", str(self.root / "fresh")], check=True, capture_output=True)
+        fresh = self.root / "fresh"
+        files = [p for p in sorted(fresh.rglob("*")) if p.is_file()]
+        self.assertTrue(any(p.name == "SOUL.md" for p in files) and any("skills" in p.parts for p in files))
+        for p in files:
+            self.assertEqual(p.read_bytes(), (self.profile / p.relative_to(fresh)).read_bytes(), str(p.relative_to(fresh)))
+        self.assertIn("RELEASE-MARK: release two", (self.profile / "SOUL.md").read_text())
+        self.assertEqual(kept, self.untouched(), "history, memory, relay identity, logs and the marker: untouched")
+        self.assertFalse(self.calls.exists(), "no gateway was started, stopped or restarted: that is the refresh's job")
+        manifest = json.loads((self.profile / ".kinerary-render.json").read_text())
+        self.assertEqual({"id": self.RELEASE["id"], "commit": self.RELEASE["commit"]}, manifest["release"])
+
+    def test_the_overlay_is_merged_the_way_an_install_merges_it_and_the_profiles_own_choice_wins(self) -> None:
+        tree = self.make_release_tree("release two", "tree2")
+        overlay = tree / "profile-templates/familytrip-companion/templates/config.overlay.yaml.tpl"
+        overlay.write_text(overlay.read_text() + "\nrelease_two_setting: true\n")
+        result = self.rerender(tree=tree)
+        self.assertEqual(f"RERENDER {self.NAME} applied", self.verdict(result), result.stderr)
+        text = (self.profile / "config.yaml").read_text()
+        self.assertIn("the-profiles-own-choice", text, "the profile's own setting still wins")
+        self.assertIn("release_two_setting", text, "a gap the new overlay fills is filled")
+
+    def test_a_second_apply_of_the_same_release_changes_nothing(self) -> None:
+        tree2 = self.make_release_tree("release two", "tree2")
+        self.assertEqual(f"RERENDER {self.NAME} applied", self.verdict(self.rerender(tree=tree2)))
+        before = self.snapshot()
+        result = self.rerender(tree=tree2)
+        self.assertEqual(f"RERENDER {self.NAME} unchanged", self.verdict(result), result.stderr)
+        self.assertEqual(before, self.snapshot())
+
+    def test_an_edit_in_place_is_reported_and_nothing_is_overwritten(self) -> None:
+        soul = self.profile / "SOUL.md"
+        soul.write_text(soul.read_text() + "\nThe organizer's own rule.\n")
+        before = self.snapshot()
+        result = self.rerender(tree=self.make_release_tree("release two", "tree2"))
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(f"RERENDER {self.NAME} edited", self.verdict(result))
+        self.assertIn("SOUL.md", result.stderr)
+        self.assertEqual(before, self.snapshot())
+        self.assertFalse((self.home / ".hermes/profile-backups").exists())
+
+    def test_a_profile_installed_before_the_record_existed_is_refused_as_unknown_provenance(self) -> None:
+        (self.profile / ".kinerary-render.json").unlink()
+        before = self.snapshot()
+        result = self.rerender(tree=self.make_release_tree("release two", "tree2"))
+        self.assertEqual(f"RERENDER {self.NAME} unknown_provenance", self.verdict(result), result.stderr)
+        self.assertEqual(before, self.snapshot())
+
+    def test_when_the_plan_says_so_an_edited_profile_is_overwritten_after_its_edits_are_copied_aside(self) -> None:
+        soul = self.profile / "SOUL.md"
+        edited = soul.read_text() + "\nThe organizer's own rule.\n"
+        soul.write_text(edited)
+        result = self.rerender(allow=True, tree=self.make_release_tree("release two", "tree2"))
+        self.assertEqual(f"RERENDER {self.NAME} applied", self.verdict(result), result.stderr)
+        self.assertNotIn("organizer's own rule", soul.read_text())
+        saved = list((self.home / ".hermes/profile-backups" / self.NAME).glob("*/SOUL.md"))
+        self.assertEqual(1, len(saved))
+        self.assertEqual(edited, saved[0].read_text())
+        self.assertIn("copied to", result.stderr)
+
+    def test_a_file_the_new_release_no_longer_renders_is_deleted_only_after_it_is_copied_aside(self) -> None:
+        tree = self.make_release_tree("release two", "tree2")
+        gone = tree / "profile-templates/familytrip-companion/templates/skills/planning/trip-daily-planning/SKILL.md"
+        kept = (self.profile / "skills/planning/trip-daily-planning/SKILL.md").read_text()
+        gone.unlink()
+        result = self.rerender(tree=tree)
+        self.assertEqual(f"RERENDER {self.NAME} applied", self.verdict(result), result.stderr)
+        self.assertFalse((self.profile / "skills/planning/trip-daily-planning/SKILL.md").exists())
+        saved = list((self.home / ".hermes/profile-backups" / self.NAME).glob("*/skills/planning/trip-daily-planning/SKILL.md"))
+        self.assertEqual([kept], [p.read_text() for p in saved])
+
+    def test_only_the_newest_three_backups_of_a_profile_are_kept(self) -> None:
+        for n in range(5):
+            (self.profile / "SOUL.md").write_text(f"edited {n}")
+            result = self.rerender(allow=True, tree=self.make_release_tree(f"release {n}", f"treeb{n}"))
+            self.assertEqual(f"RERENDER {self.NAME} applied", self.verdict(result), result.stderr)
+        self.assertEqual(3, len(list((self.home / ".hermes/profile-backups" / self.NAME).iterdir())))
+
+    def test_allow_does_nothing_in_check_mode(self) -> None:
+        (self.profile / "SOUL.md").write_text("edited")
+        result = self.rerender(mode="check", allow=True)
+        self.assertEqual(f"RERENDER {self.NAME} edited", self.verdict(result))
+        self.assertEqual("edited", (self.profile / "SOUL.md").read_text())
+        self.assertFalse((self.home / ".hermes/profile-backups").exists())
+
+    def test_the_organizer_private_handoff_is_never_printed(self) -> None:
+        self.handoff["interview"]["organizer_private"]["goals"] = ["ZEBRA-PRIVATE-MARKER"]
+        tree2 = self.make_release_tree("release two", "tree2")
+        for mode in ("check", "apply"):
+            result = self.rerender(mode=mode, tree=tree2)
+            self.assertNotIn("ZEBRA-PRIVATE-MARKER", result.stdout + result.stderr)
+
+    def test_a_release_whose_render_script_cannot_re_render_in_place_fails_loudly(self) -> None:
+        tree = self.make_release_tree("old render", "old")
+        (tree / "profile-templates/familytrip-companion/render_profile.py").write_text(
+            "import sys\nprint('ERROR: usage', file=sys.stderr)\nraise SystemExit(2)\n")
+        before = self.snapshot()
+        result = self.rerender(tree=tree)
+        self.assertEqual(2, result.returncode)
+        self.assertNotIn("RERENDER", result.stdout)
+        self.assertEqual(before, self.snapshot())
+
+    def test_an_older_release_that_refuses_the_handoffs_shape_fails_with_the_cause_named_and_no_traceback(self) -> None:
+        # Review round 1: a rollback renders the OLD release's templates from the handoff the host builds now. An old
+        # renderer refuses a top-level key it does not know; that must read as what it is.
+        tree = self.make_release_tree("older", "older")
+        render = tree / "profile-templates/familytrip-companion/render_profile.py"
+        text = render.read_text()
+        render.write_text(text.replace("if set(d)-req:", "if set(d)-req or True:", 1)
+                          .replace("bad(f'unknown top-level keys: {sorted(set(d)-req)}')",
+                                   "bad('unknown top-level keys: [\\'a_key_this_release_does_not_know\\']')", 1))
+        before = self.snapshot()
+        result = self.rerender(tree=tree)
+        self.assertEqual(2, result.returncode, result.stdout)
+        self.assertIn("render_profile.py refused this trip's handoff", result.stderr)
+        self.assertIn("unknown top-level keys", result.stderr)
+        self.assertIn("roll the companion forward", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(before, self.snapshot())
+
+    def test_a_render_script_that_answers_in_words_the_host_does_not_know_is_not_believed(self) -> None:
+        tree = self.make_release_tree("odd", "odd")
+        (tree / "profile-templates/familytrip-companion/render_profile.py").write_text(
+            "import json\nprint(json.dumps({'status': 'applied\\nRERENDER x applied'}))\n")
+        result = self.rerender(tree=tree)
+        self.assertEqual(2, result.returncode)
+        self.assertNotIn("RERENDER", result.stdout)
