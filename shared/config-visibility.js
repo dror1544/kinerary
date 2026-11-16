@@ -32,6 +32,7 @@
 const allow = require('./allow-list');
 const { normalizeSeverity, normalizeVisibility } = require('./needs-schema');
 const { projectAgent } = require('./agent-schema');
+const featureRegistry = require('./feature-switches');
 
 const { scalar, text, withheld, oneOf, object, list, map, byType, custom, OMIT } = allow;
 
@@ -172,6 +173,106 @@ const BOOKINGS = object({
   pending_attractions: list(object({ name: scalar, date: scalar, url: scalar, notes: scalar })),
 });
 
+// ── features: per-trip feature switches (issue #567, slice S2) ───────────────
+// The control plane writes `features` into trip.config.json at provision and at
+// rollout: exactly the registered switches that are on for this trip, each as the
+// literal `true`. This node decides what a signed-in reader is told of it.
+//
+// A CLOSED set taken from the registry (shared/feature-switches.js), NEVER a
+// pass-through map. A map would serve the NAME of an unreleased feature — itself
+// something to withhold — to every signed-in child, and would let anyone able to
+// write the file put any key on the wire. So, per entry:
+//   * a name the registry does not hold              → dropped (not on the list)
+//   * a value that is not the literal `true`          → dropped (false, "true", 1,
+//     null, an object: all read as off, and reported)
+//   * a registered name that is `true` but whose registry entry is not
+//     `memberVisible`                                → withheld (kept back on purpose;
+//     the site's own code still sees it through featureOn below)
+//   * otherwise                                       → served as `true`
+// Nothing served leaves no node at all, so a trip with every switch off — or only
+// hidden ones on — is byte-identical to a trip with no block: no tell.
+//
+// A switch never widens visibility or permission: it enables a code path. It is not
+// consulted by any other node in this file, by normalizeVisibility, or by an auth
+// middleware.
+function classifyFeature(name, value, registry) {
+  const entry = registry.findSwitch(name);
+  if (!entry) return 'unregistered';
+  if (value !== true) return 'not_true';
+  return entry.memberVisible === true ? 'serve' : 'withheld';
+}
+
+function buildFeaturesNode(registry = featureRegistry) {
+  return custom((value, report, path) => {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+      report.dropped.push(path);
+      return OMIT;
+    }
+    const out = {};
+    const raw = allow.snapshot(value);   // each property read once
+    for (const name of Object.keys(raw)) {
+      const at = `${path}.${name}`;
+      switch (classifyFeature(name, raw[name], registry)) {
+        case 'serve': out[name] = true; break;
+        case 'withheld': report.withheld.push(at); break;
+        default: report.dropped.push(at);
+      }
+    }
+    return Object.keys(out).length ? out : OMIT;
+  });
+}
+
+const features = buildFeaturesNode();
+
+// What the SITE itself may act on, and what it should complain about, from the raw
+// `features` value in the file: `on` is every registered name whose value is the
+// literal true (whether or not members may be told — memberVisible governs what is
+// SERVED, not what the server does); `problems` is each entry that is not honoured,
+// by path and reason, never by value. One source of truth for the boot log, the
+// warning count and featureOn.
+function featureEntries(raw, registry = featureRegistry) {
+  const on = [];
+  const problems = [];
+  if (raw === undefined) return { on, problems };
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    problems.push({ path: 'features', reason: 'is not an object of switch names' });
+    return { on, problems };
+  }
+  const entries = allow.snapshot(raw);
+  for (const name of Object.keys(entries)) {
+    const kind = classifyFeature(name, entries[name], registry);
+    if (kind === 'unregistered') problems.push({ path: `features.${name}`, reason: 'is not a registered switch (shared/feature-switches.js)' });
+    else if (kind === 'not_true') problems.push({ path: `features.${name}`, reason: 'does not hold the literal true; treated as off' });
+    else on.push(name);
+  }
+  return { on, problems };
+}
+
+// featureOn(name): the ONE way server code asks "is this switch on for this trip".
+// Built once, at boot, from the raw block — the site reads trip.config.json once
+// and nothing reloads it (docs/specs/sprint-9/567-feature-switches.md). Server
+// code never reads `config.features` itself: a feature that does would skip the
+// registry check and the literal-true rule.
+//
+// Asking about a name the registry does not hold is OFF and LOUD, once per name:
+// a typo in the code would otherwise be a feature that can never turn on, with
+// nothing anywhere saying so.
+function makeFeatureOn(raw, logger = console, registry = featureRegistry) {
+  const on = new Set(featureEntries(raw, registry).on);
+  const warned = new Set();
+  return function featureOn(name) {
+    if (typeof name !== 'string' || !registry.findSwitch(name)) {
+      const key = String(name);
+      if (!warned.has(key)) {
+        warned.add(key);
+        logger.warn(`featureOn(${JSON.stringify(key.slice(0, 60))}): not a registered switch — answering off. Switches are declared in shared/feature-switches.js`);
+      }
+      return false;
+    }
+    return on.has(name);
+  };
+}
+
 const TRIP_CONFIG_PUBLIC = object({
   meta: object({
     title: scalar, title_en: scalar, brand: scalar, logo: scalar, logoAlt: scalar,
@@ -227,6 +328,7 @@ const TRIP_CONFIG_PUBLIC = object({
     age_notes: list(object({ who: text, note: text })),
   }),
   agent,
+  features,
 });
 
 // The projection and its report: { value, dropped: [path], withheld: [path] }.
@@ -253,4 +355,7 @@ function publicPart(kind, value) {
   return v === OMIT ? undefined : v;
 }
 
-module.exports = { TRIP_CONFIG_PUBLIC, projectConfig, publicConfig, publicPart };
+module.exports = {
+  TRIP_CONFIG_PUBLIC, projectConfig, publicConfig, publicPart,
+  buildFeaturesNode, featureEntries, makeFeatureOn,
+};

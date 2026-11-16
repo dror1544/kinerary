@@ -3271,6 +3271,17 @@ document.querySelector('.t-close')?.addEventListener('click', () => {
 /* =========================================================
    TRIP CONFIG LOADING
    ========================================================= */
+// Per-trip feature switches (issue #567 S2). The server serves `features` only with
+// the switches this trip has ON and members may see, each as the literal `true`
+// (shared/config-visibility.js). A feature's entry points render only when this says
+// so: absent, false, "true", 1 — anything but the literal true — is off. Never read
+// `cfg.features` directly in a render; ask this.
+function tripFeatureOn(name) {
+  const f = window.TRIP_CONFIG?.features;
+  return Boolean(f) && typeof f === 'object' && !Array.isArray(f)
+    && Object.prototype.hasOwnProperty.call(f, name) && f[name] === true;
+}
+
 async function loadTripConfig() {
   try {
     const token = localStorage.getItem('trip-token');

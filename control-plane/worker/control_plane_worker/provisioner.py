@@ -32,6 +32,7 @@ from .companion_profile import (
     build_companion_handoff,
 )
 from .compute import ComputeAdapter, NullComputeAdapter
+from .feature_block import resolve_features, with_features
 from .mcp_bridge import McpBridgeAdapter, NullMcpBridgeAdapter, log_fields
 from .release_source import ReleaseSourceError, materialize_release_source
 from . import verification
@@ -1334,6 +1335,17 @@ class ProvisionerWorker:
             # hand-seeded dev release has no manifest and no real digest, so it
             # falls back to REPO_ROOT with a warning.
             source_dir = self._materialize_release_if_verified(plan_desired, job_id)
+
+            # Per-trip feature switches (#567 S2): what this deploy writes into the
+            # trip's files carries a `features` block — exactly the registered
+            # switches that are on for THIS trip, each the literal true. Resolved
+            # now, at the moment of writing, and in SQL (one resolution, one answer).
+            # Added to the DEPLOYED copy only: `config` stays what the transformer
+            # built, which is what the plan snapshot, the verification gate and the
+            # review read. A deploy overwrites the trip's config (--sync-config), so
+            # without this a re-provision would silently switch every feature off.
+            # A failed read is an empty block (every switch off), never a failed job.
+            deploy_config = with_features(config, resolve_features(conn, trip_id))
             try:
                 # first_provision (from plan.desired, computed by the planner)
                 # tells the compute adapter whether this trip has ever been
@@ -1341,7 +1353,7 @@ class ProvisionerWorker:
                 # data is debris from a failed earlier attempt and is cleared so
                 # the freshly seeded users/config take.
                 private_url = self._deploy.deploy(
-                    slug, config,
+                    slug, deploy_config,
                     first_provision=bool(plan_desired.get("first_provision", False)),
                     sidecars=sidecars,
                     source_dir=source_dir,

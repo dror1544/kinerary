@@ -201,6 +201,10 @@ export const BASE_PORTS = {
   mcpPlanOpenDaysMcp:       28355,  // mcp/mcp.js against the real trip server below
   mcpPlanOpenDaysSite:      28356,  // the real trip server mcpPlanOpenDaysMcp talks to
 
+  // Per-trip feature switches, the site half (issue #567 S2) — tests/feature-switches-site.test.js.
+  featureSwitchesSite:      28357,  // the trip server, one planted `features` block at a time
+  featureSwitchesHidden:    28358,  // the trip server booted from a temp copy whose registry has a hidden switch
+
   // ── Stand-ins for services the server calls out to ─────────────────────
   bookingExtractMockHermes: 28103,
   mcpHealthTripSite:        28124,
