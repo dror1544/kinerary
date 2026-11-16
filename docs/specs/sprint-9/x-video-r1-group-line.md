@@ -1,6 +1,6 @@
 # Video Release 1, part 1C: one line to the group when the plan changes
 
-Status: draft for approval (2026-11-16) · Issue: none yet (`x-` until filed) · Track: video plan, Release 1 · Size: L (two slices) · Tier: High
+Status: approved (2026-11-16, by Dror: all open questions answered) · Issue: none yet (`x-` until filed) · Track: video plan, Release 1 · Size: L (two slices) · Tier: High
 Security path: yes (a new sending path; a new site route behind `internal()`; `adapters/telegram.ts` gains a configurable API root that receives the bot token; one entry and one surface in `shared/feature-switches.js`) · Migration: yes · Live-trip behaviour: no, until the switch is turned on for a trip
 
 Decision behind it: the approved plan "Make Kinerary match the marketing video" (Dror, 2026-11-14),
@@ -536,7 +536,9 @@ Answered by Dror, 2026-11-16:
     is no date check: an open group binding with the setting and the switch on is enough.
 13. **The night window is 22:00–08:00 trip time**, one constant for every trip.
 
+14. **The exchange-key finding is handled on its own after the Alsace trip** (from 2026-12-07), with no change
+    in 1C.
+
 ## Open questions
 
-1. **The exchange-key finding** (owner's private security notes). Recommendation: handled on its own, with no
-   change in 1C.
+None open.
