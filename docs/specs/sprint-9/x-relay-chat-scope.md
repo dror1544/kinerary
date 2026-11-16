@@ -1,6 +1,6 @@
 # Outbound relay actions are scoped to the caller's own chats
 
-Status: draft for approval · Issue: none yet (file one; this file is renamed to `<n>-relay-chat-scope.md` then) · Track: hardening · Size: S–M (one slice) · Tier: High
+Status: approved (2026-11-16, by Dror: the four open questions answered) · Issue: none yet (file one; this file is renamed to `<n>-relay-chat-scope.md` then) · Track: hardening · Size: S–M (one slice) · Tier: High
 Security path: yes (the relay's gateway identity; `control-plane/api/src/relay/connector.ts`) · Migration: no · Live-trip behaviour: yes (relay behaviour; risk class)
 
 Related: `docs/per-trip-gateway-architecture.md` §4 (inbound routing by authenticated
@@ -219,21 +219,17 @@ Written first, from the criteria.
 - Docs updated in the same PR: `docs/per-trip-gateway-architecture.md` §4 (outbound now
   follows the same identity rule) and the connector's file header.
 
+## Decisions (Dror, 2026-11-16)
+
+1. **The multiplex exception covers every bound chat** (option (a), as AC-5 is written). Not tied to live
+   socket state.
+2. **The refusal log line carries `chat_id`**, and still no content, length or message ids.
+3. **An interview is bound to one private chat, and only that chat is closed to the companion.** While a
+   person is mid-interview, the companion is refused in that person's private chat only. Every other chat
+   bound to the trip, every group included, keeps working with the companion as before. A test proves a
+   group of the same trip is unaffected while its organizer's private chat is mid-interview.
+4. **A relay without a database refuses all outbound.** The pre-merge probe confirms no deployment runs one.
+
 ## Open questions
 
-1. **How wide is the multiplex exception outbound?** (a) every bound route, as written in
-   AC-5; or (b) only interview routes and companion routes whose profile has no own
-   gateway connected, mirroring `socketsFor`. Recommendation: (a) for this change. (b)
-   makes an authorization decision depend on live socket state, so a trip gateway
-   reconnecting mid-turn would make the fallback's reply fail; narrowing is better done
-   by unsetting the multiplex id once the interviewer has its own.
-2. **Does the refusal log carry `chat_id`?** Existing relay lines already log it
-   (`relay.agent_send_converted`, `connector.ts:470-474`). Recommendation: include it,
-   since it is what an operator needs to find the binding, and keep content, length and
-   message ids out.
-3. **A companion whose trip is bound to a DM that is now mid-interview** is refused there
-   (today its send would be converted into the interview through `say`). Recommendation:
-   accept; the interview chat has one writer. Confirm.
-4. **Relay without a database refuses all outbound.** Recommendation: accept; inbound
-   already routes nothing without one. Confirm no deployment runs the relay without a
-   database (the probe above answers it).
+None open.
