@@ -214,6 +214,9 @@ services:
       # (otherwise the change would be silent). Remove it from provisioning.env.
       PROVISIONER_SEED_PASSWORD: ${PROVISIONER_SEED_PASSWORD:-}
       CONTROL_PLANE_EXCHANGE_KEY: ${CONTROL_PLANE_EXCHANGE_KEY:-}
+      # Optional. Set: a NEW trip's site gets derive(master, trip_id) as its key, not the one above, and its
+      # route is recorded `derived` (docs/runtime-session-exchange.md, "Per-trip keys"). Unset: as before.
+      CONTROL_PLANE_TRIP_KEY_MASTER: ${CONTROL_PLANE_TRIP_KEY_MASTER:-}
       # The portal's own origin (the API's web.public_origin), written into each
       # trip's identity sidecar so an organizer who opens the trip on its own
       # hostname still gets an "Organizer dashboard" link. Unset: no link for a

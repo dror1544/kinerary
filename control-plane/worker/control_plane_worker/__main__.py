@@ -439,6 +439,10 @@ def main(argv: list[str] | None = None) -> int:
                     # generates its own at bootstrap (provisioning.adapters),
                     # and the worker reads it back to tell the organizer.
                     control_plane_exchange_key=os.environ.get("CONTROL_PLANE_EXCHANGE_KEY", ""),
+                    # Optional. Set: a new trip's site gets derive(master, trip_id) as its
+                    # key and its route says `derived`. Unset: the shared key, as before.
+                    # The master goes to no site and no log (compute.derive_trip_key).
+                    trip_key_master=os.environ.get("CONTROL_PLANE_TRIP_KEY_MASTER", ""),
                     nfs_host_base=os.environ.get("PROVISIONER_NFS_HOST_BASE", "/mnt/pve/truenas-nfs"),
                     nfs_mount_base=os.environ.get("PROVISIONER_NFS_MOUNT_BASE", "/nfs"),
                     routing=args.trip_routing,

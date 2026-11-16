@@ -11,7 +11,8 @@ A managed runtime needs `CONTROL_PLANE_EXCHANGE_KEY`, matching the gateway's
 `RUNTIME_EXCHANGE_KEY` and the API's configured `runtimeExchangeKey`. It must
 be distinct from the runtime's `JWT_SECRET` and `HERMES_API_KEY`. The gateway
 and control plane are trusted identity services; possession of this exchange
-key is privileged. The key is never sent to a browser or companion.
+key is privileged. The key is never sent to a browser or companion. (A deployment
+can give each trip site a key of its own instead: "Per-trip keys" below.)
 
 The private `$TRIP_DIR/control-plane.identity.json` file binds the runtime to
 its control-plane trip and owner. `CONTROL_PLANE_IDENTITY_FILE` can override
@@ -314,6 +315,69 @@ optional `TRIP_HOST_RESPONSE_TIMEOUT_MS`. Covered by
 `control-plane/runtime-gateway/test/host-mode.test.js` and
 `host-mode-off.test.js`, and, on the control-plane side, by
 `control-plane/api/test/runtime-route-hosts.test.ts`.
+
+## Per-trip keys: one key for each trip site
+
+Spec: `docs/specs/sprint-9/597-per-gateway-and-per-trip-keys.md` (K2). Everything
+in this section is **off** unless the gateway has `RUNTIME_TRIP_KEY_MASTER` set
+(and, for a new trip's key, the worker has `CONTROL_PLANE_TRIP_KEY_MASTER`);
+unset, one key does everything, as described under Configuration.
+
+Three keys, where there was one:
+
+- the **control-plane key** (`RUNTIME_EXCHANGE_KEY`, unchanged) authenticates the
+  gateway to the control plane and the control plane to the gateway's own
+  `/internal/t/*` routes. A trip site is never sent it once per-trip keys are on;
+- the **trip key master** (`RUNTIME_TRIP_KEY_MASTER` on the gateway,
+  `CONTROL_PLANE_TRIP_KEY_MASTER` on the worker, one value) never leaves those two. A trip site
+  holds `derive(master, trip_id) = hex(HMAC-SHA256(master, "kinerary-trip-exchange:v1:" + trip_id))`
+  in its `.env` as `CONTROL_PLANE_EXCHANGE_KEY`, so what one trip holds opens no other;
+- the **legacy trip key** (`RUNTIME_LEGACY_TRIP_KEY`) is the old shared value, kept only to
+  reach trips that have not been re-keyed.
+
+The trip site's own code does not change: it compares the key it is sent with its
+`.env` value, as before. What changes is which key the gateway sends. Each route
+records the kind its trip holds, `runtime_routes.trip_key` (`shared`, the default, or
+`derived`; migration `20261116140000_runtime_route_trip_key.sql`), and both route
+lookups return it as `tripKey` (a kind, never a key; only behind the exchange key).
+With the master set, for the three calls the gateway makes to a trip (the launch's
+`session`, `participants` and `participants/<name>`):
+
+| route's `tripKey` | sent to the trip |
+|---|---|
+| `derived` | `derive(master, trip_id)`, for the trip id the route was looked up for |
+| `shared` | `RUNTIME_LEGACY_TRIP_KEY`; if it is unset, **503 and nothing is sent** |
+| anything else, or absent (an older control plane) | **503 and nothing is sent** |
+
+One key per request, chosen before it is sent. A trip that answers 401 to its key is
+not tried with another: a retry would hand the legacy key to whichever trip asked for
+it. The refusal is logged without a key (`runtime_gateway.trip_key_unavailable`), and a
+legacy key set with no master is logged at start (`runtime_gateway.trip_keys_off`).
+A route is cached for 30 seconds, so a trip whose `trip_key` was just changed may
+answer 401 for that long.
+
+**The worker.** With `CONTROL_PLANE_TRIP_KEY_MASTER` set, a new trip's `.env` is born with
+its derived key and the worker, after the deploy, asks the container which key it holds
+(`ProxmoxLxcAdapter.exchange_key_kind`: compared in constant time, only the kind comes
+back) and records that kind on the route in the transaction that marks the trip
+`ready_private`. Asking the container, not the worker's settings, is what makes a
+re-provision right: bootstrap writes `.env` only when there is none, so a re-provisioned
+trip keeps the key it has, and its route keeps (or is corrected to) the kind it holds. A container
+that holds neither candidate leaves the route as it is. Unset, nothing is read or derived and
+a new trip gets the shared key and the column's default. Without the migration, a `shared` kind is
+a warning (it is what a missing column means) and a `derived` one fails the job.
+The key is never logged, never on a command line, and listed for redaction with the other
+secrets of the bootstrap script.
+
+Rolling it out (per deployment, in this order): deploy the migration; set the gateway's
+`RUNTIME_TRIP_KEY_MASTER` and `RUNTIME_LEGACY_TRIP_KEY` (the value `RUNTIME_EXCHANGE_KEY` had)
+and, if you want a new control-plane key, a new `RUNTIME_EXCHANGE_KEY` on the gateway and API
+together; set the same master on the worker; build a test trip. Moving an existing trip to a
+derived key is writing its derived key into its `.env`, restarting its server and setting its
+route's `trip_key = 'derived'` (a deploy, per trip, with approval). Derivation parity
+between the gateway and the worker is pinned by
+`control-plane/runtime-gateway/test/fixtures/trip-key-vectors.json`, read by
+`runtime-gateway/test/trip-keys.test.js` and `control-plane/worker/tests/test_trip_keys.py`.
 
 ## Classic, Modern, and logout
 

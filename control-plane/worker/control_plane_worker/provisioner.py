@@ -545,6 +545,17 @@ class ShellDeployAdapter:
             return None
         return self._compute.site_login_password(slug)
 
+    def site_trip_key(self, slug: str) -> str | None:
+        """Which kind of exchange key this trip's site holds ("shared" or
+        "derived"), as its own container reports it; None when nothing can say
+        - a vmid_map trip (a hand-built box this worker never keyed), a compute
+        adapter that does not read it back, or per-trip keys being off. None
+        leaves the trip's route as it is."""
+        if self._vmid_map.get(slug):
+            return None
+        reader = getattr(self._compute, "site_trip_key", None)
+        return reader(slug) if callable(reader) else None
+
     def deploy(
         self,
         slug: str,
@@ -1490,6 +1501,9 @@ class ProvisionerWorker:
             # people already use). Per trip - there is no deployment-wide one.
             # Held in a local and passed on; never logged.
             site_password = self._site_login_password(slug)
+            # Which kind of exchange key the site holds, as its container
+            # reports it (None: not known, leave the route's as it is).
+            trip_key = self._site_trip_key(slug)
 
             # Verification aggregator (Sprint 6, docs/sprint6-tracks.md:472):
             # a real gate before `ready_private`, not the unconditional UPDATE
@@ -1553,7 +1567,7 @@ class ProvisionerWorker:
                 conn, job_id, plan_id, trip_id, private_url,
                 slug=slug, config=config, intake_version_id=intake_version_id,
                 deployment_ref=deployment_ref, site_password=site_password,
-                route=route,
+                route=route, trip_key=trip_key,
             )
 
             # Hand the deployed plan to the post-deploy review pass
@@ -1586,6 +1600,14 @@ class ProvisionerWorker:
         has no such notion (a fake, a hand-built trip) simply reports none."""
         reader = getattr(self._deploy, "site_login_password", None)
         return reader(slug) if callable(reader) else None
+
+    def _site_trip_key(self, slug: str) -> str | None:
+        """Ask the deploy adapter which kind of exchange key this trip's site
+        holds. An adapter with no such notion (a fake, a hand-built trip) says
+        nothing, and the route keeps the kind it has."""
+        reader = getattr(self._deploy, "site_trip_key", None)
+        answer = reader(slug) if callable(reader) else None
+        return answer if answer in ("shared", "derived") else None
 
     def _materialize_release_if_verified(
         self, plan_desired: Mapping[str, Any], job_id: str,
@@ -1984,6 +2006,40 @@ class ProvisionerWorker:
             ))
             cur.execute(legacy, (trip_id, _generate_route_id()))
 
+    def _record_trip_key(
+        self, conn: psycopg.Connection, cur: psycopg.Cursor, trip_id: str, trip_key: str | None,
+    ) -> None:
+        """Record which kind of exchange key the trip's site holds on its route
+        (migration `runtime_route_trip_key`), in the transaction that marks the
+        trip ready. `None` writes nothing: a re-provision that did not look, or
+        could not tell, keeps the kind the route already has, and a new row
+        holds the column's default, `shared`.
+
+        The kind is what the site's own container reported, so a re-provision
+        records the key the site holds, not the one this worker would have
+        written: bootstrap never rewrites an existing .env.
+
+        A worker newer than its schema: "shared" is what the missing column
+        would have meant anyway, so that is a warning; "derived" is the only
+        thing that tells the gateway which key to send, so that fails the job."""
+        if trip_key is None:
+            return
+        try:
+            with conn.transaction():  # a savepoint: a refused statement leaves the outer transaction usable
+                cur.execute(
+                    "UPDATE control_plane.runtime_routes SET trip_key = %s, updated_at = now() WHERE trip_id = %s",
+                    (trip_key, trip_id),
+                )
+        except psycopg.errors.UndefinedColumn:
+            if trip_key == "derived":
+                raise
+            logger.warning(log_fields(
+                "provisioner.trip_key_not_recorded", trip_id=trip_id, trip_key=trip_key,
+                reason="control_plane.runtime_routes has no trip_key column",
+                effect="the route reads as shared, which is what this trip holds; apply migration "
+                       "runtime_route_trip_key before giving any trip a derived key",
+            ))
+
     def _complete(
         self,
         conn: psycopg.Connection,
@@ -1997,6 +2053,7 @@ class ProvisionerWorker:
         deployment_ref: str | None = None,
         site_password: str | None = None,
         route: TripRoute | None = None,
+        trip_key: str | None = None,
     ) -> None:
         result_json = json.dumps({"private_url": private_url})
         with conn.transaction():
@@ -2056,6 +2113,7 @@ class ProvisionerWorker:
                 # dashboard's real launch path. Re-provisioning keeps the
                 # opaque route_ref stable and only restores readiness.
                 self._register_runtime_route(conn, cur, trip_id, route)
+                self._record_trip_key(conn, cur, trip_id, trip_key)
 
                 # Enqueue organizer notification. recipient is the owner's real,
                 # sendable Telegram chat id when one is on file (added in

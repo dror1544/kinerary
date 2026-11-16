@@ -1,12 +1,13 @@
 """Provider adapters. Transport is injected so tests never contact infrastructure."""
 from __future__ import annotations
 
+import hmac
 import re
 import secrets
 import shlex
 import subprocess
 import time
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 import yaml
 
@@ -626,6 +627,43 @@ BOOTSTRAP_INNER
             if line.startswith("SEED_PASSWORD="):
                 return line.split("=", 1)[1].strip() or None
         return None
+
+    def exchange_key_kind(self, spec: LxcSpec, candidates: Mapping[str, str]) -> str | None:
+        """Which of `candidates` (kind -> key value) the container's own .env
+        holds as CONTROL_PLANE_EXCHANGE_KEY, by name; None when it holds none of
+        them, holds no key, or there is no such container.
+
+        The key is written once, when the .env is first made (see create(): a
+        re-provision finds the file and leaves it alone), so what this container
+        holds is a fact about the container, not about this worker's current
+        settings. The control plane records it on the trip's route so the gateway
+        sends the key the site actually accepts. Asking the container, rather
+        than inferring from configuration, is what keeps a re-provision from
+        recording a kind the site does not hold.
+
+        The command carries no secret; the held value comes back on stdout, is
+        compared in constant time and never returned or logged - only the kind."""
+        record = self.inspect(spec)
+        if record is None:
+            return None
+        read = "grep '^CONTROL_PLANE_EXCHANGE_KEY=' /opt/kinerary/.env || true"
+        try:
+            output = self.ssh.run(f"pct exec {shlex.quote(record['vmid'])} -- sh -c {shlex.quote(read)}")
+        except RuntimeError:
+            # The transport's error text quotes the command's output, which here is the key itself.
+            raise RuntimeError(f"could not read the exchange key of container {record['vmid']}") from None
+        held = ""
+        for line in output.splitlines():
+            if line.startswith("CONTROL_PLANE_EXCHANGE_KEY="):
+                held = line.split("=", 1)[1].strip()
+        if not held:
+            return None
+        found: str | None = None
+        for kind, value in candidates.items():
+            # No short-circuit: every candidate is compared whatever the first one said.
+            if value and hmac.compare_digest(held.encode(), value.encode()) and found is None:
+                found = kind
+        return found
 
     def _reset_trip_data(self, nfs_host_dir: str) -> None:
         """Wipe the trip's persisted app state (SQLite DB under server-data/)

@@ -73,7 +73,7 @@ test("AC-R1.2: a ready route is returned as { tripId, routeRef, upstreamOrigin }
     const { tripId, routeRef } = await seedRoute({ host });
     const response = await get(app, `/internal/runtime-routes/by-host/${host}`);
     assert.equal(response.statusCode, 200);
-    assert.deepEqual(response.json(), { tripId, routeRef, upstreamOrigin: "http://192.0.2.10:8080" });
+    assert.deepEqual(response.json(), { tripId, routeRef, upstreamOrigin: "http://192.0.2.10:8080", tripKey: "shared" }); // AC-K2.2 added tripKey; a row seeded with no key kind holds the shared one
     // The name is matched case-insensitively (the gateway lowercases, so this only protects a hand-made call).
     assert.equal((await get(app, `/internal/runtime-routes/by-host/${host.toUpperCase()}`)).statusCode, 200);
     for (const headers of [{}, { "x-api-key": "wrong" }, { "x-api-key": "exchange-key-and-more" }]) {
@@ -166,7 +166,7 @@ test("AC-R1.3: the per-trip-id endpoint is unchanged, and by-host and :tripId ca
     try {
       const old = await get(app, `/internal/runtime-routes/${tripId}`);
       assert.equal(old.statusCode, 200);
-      assert.deepEqual(old.json(), { routeRef, upstreamOrigin: "http://trip.internal", upstreamBasePath: "/base" });
+      assert.deepEqual(old.json(), { routeRef, upstreamOrigin: "http://trip.internal", upstreamBasePath: "/base", tripKey: "shared" }); // AC-K2.2 added tripKey
     } finally {
       await pool.query("DELETE FROM control_plane.jobs WHERE id = $1", [`job_${suffix}j`]);
       await pool.query("DELETE FROM control_plane.plans WHERE id = $1", [planId]);

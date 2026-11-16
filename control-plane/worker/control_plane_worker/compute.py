@@ -34,6 +34,7 @@ undo. A trip that already has a topology.yaml keeps whatever it says.
 """
 from __future__ import annotations
 
+import hmac
 import ipaddress
 import os
 from pathlib import Path
@@ -54,6 +55,23 @@ from provisioning.models import (
 from provisioning.runtime import HttpJsonTransport
 
 
+#: Label of a trip's own exchange key (docs/specs/sprint-9/597-per-gateway-and-per-trip-keys.md, K2). Versioned and
+#: fixed, so a key made for this purpose is never valid for another.
+TRIP_KEY_LABEL = "kinerary-trip-exchange:v1:"
+
+#: What `runtime_routes.trip_key` can say about the key a trip's site holds.
+TRIP_KEY_KINDS = ("shared", "derived")
+
+
+def derive_trip_key(master: str, trip_id: str) -> str:
+    """hex(HMAC-SHA256(master, "kinerary-trip-exchange:v1:" + trip_id)). The runtime gateway
+    computes the same value (runtime-gateway/server.js deriveTripKey); both tests read
+    runtime-gateway/test/fixtures/trip-key-vectors.json."""
+    if not master or not trip_id:
+        raise ValueError("a trip key needs both the trip key master and the trip id")
+    return hmac.new(master.encode("utf-8"), (TRIP_KEY_LABEL + trip_id).encode("utf-8"), "sha256").hexdigest()
+
+
 class ComputeAdapter(Protocol):
     """Creates (or reuses an already-created) compute instance for a trip.
     Returns its vmid as a string."""
@@ -65,6 +83,11 @@ class ComputeAdapter(Protocol):
     def site_login_password(self, slug: str) -> str | None:
         """The login password the trip's site was built with, as that site's
         own .env holds it; None when there is none to report."""
+        ...
+
+    def site_trip_key(self, slug: str) -> str | None:
+        """Which kind of exchange key the trip's site holds - "shared" or
+        "derived" - as its own .env says; None when this adapter cannot say."""
         ...
 
 
@@ -83,6 +106,9 @@ class NullComputeAdapter:
         )
 
     def site_login_password(self, slug: str) -> str | None:
+        return None
+
+    def site_trip_key(self, slug: str) -> str | None:
         return None
 
 
@@ -132,6 +158,7 @@ class LxcProvisionAdapter:
         disk_gb: int = 8,
         forward_port: int = 8080,
         control_plane_exchange_key: str = "",
+        trip_key_master: str = "",
         npm_identity: str = "",
         npm_secret: str = "",
         provisioner_factory: Callable[[], Provisioner] | None = None,
@@ -188,6 +215,17 @@ class LxcProvisionAdapter:
         # password: each site generates its own at bootstrap.
         self._site_passwords: dict[str, str | None] = {}
         self._control_plane_exchange_key = control_plane_exchange_key
+        # CONTROL_PLANE_TRIP_KEY_MASTER. Set: a NEW trip's site is born with
+        # derive(master, trip_id) instead of the shared key above, and its route
+        # says so. Unset (the default): every behaviour is what it was. The master
+        # is never written to a site, a topology, a log or a command line.
+        if "\n" in trip_key_master or "\r" in trip_key_master:
+            raise ValueError("trip key master must be one line")
+        self._trip_key_master = trip_key_master
+        # slug -> the kind of key the trip's site holds ("shared" / "derived"),
+        # read back from the container after apply(); None when not asked or
+        # unknowable. Held in this process only, like the site password.
+        self._site_key_kinds: dict[str, str | None] = {}
         # Set per-call by create_container (the worker is single-threaded — one
         # job at a time via run_once), read by _build_provisioner when it
         # constructs the ProxmoxLxcAdapter.
@@ -204,6 +242,12 @@ class LxcProvisionAdapter:
     def create_container(
         self, slug: str, *, first_provision: bool = False, trip_id: str | None = None,
     ) -> str:
+        # The key a NEW site's .env is born with, and the keys this trip's site
+        # may already hold (a re-provision finds its .env and leaves it alone,
+        # so what it holds was fixed when it was first made). First, so a
+        # missing trip id fails before anything is written.
+        exchange_key, key_candidates = self._exchange_keys_for(trip_id)
+        self._site_key_kinds.pop(slug, None)
         topology_path = self._topology_path(slug)
         topology = self._load_topology(topology_path)
         if topology is None:
@@ -220,7 +264,7 @@ class LxcProvisionAdapter:
         # record never gets, or authenticates, a transport to NPM or Cloudflare.
         provisioner = (
             self._provisioner_factory() if self._provisioner_factory is not None
-            else self._build_provisioner(topology)
+            else self._build_provisioner(topology, exchange_key=exchange_key)
         )
 
         # ProxmoxLxcAdapter.create() runs that wipe, but only when it runs —
@@ -246,6 +290,15 @@ class LxcProvisionAdapter:
         # failure here raises on purpose: the job retries, rather than the
         # organizer being introduced to a site with no password to type.
         self._site_passwords[slug] = provisioner.proxmox.site_password(topology.lxc)
+        # Which key the site really holds, asked of the container itself: the
+        # route the gateway reads must name the key the site accepts, and a
+        # re-provision (which never rewrites an existing .env) must not record
+        # the key this worker WOULD have written. Asked only when per-trip keys
+        # are on; off, nothing extra is read and the route is left as it is.
+        self._site_key_kinds[slug] = (
+            self._key_kind_of(provisioner.proxmox.exchange_key_kind(topology.lxc, key_candidates))
+            if key_candidates else None
+        )
         # Only known after apply(), so this rewrites the file _write_topology
         # already wrote pre-apply — same fields, plus vmid. mcp_bridge.py
         # reads it back for slugs that (unlike the two legacy trips) have no
@@ -255,6 +308,33 @@ class LxcProvisionAdapter:
 
     def site_login_password(self, slug: str) -> str | None:
         return self._site_passwords.get(slug)
+
+    def site_trip_key(self, slug: str) -> str | None:
+        return self._site_key_kinds.get(slug)
+
+    @staticmethod
+    def _key_kind_of(answer: object) -> str | None:
+        # Anything but a kind the schema accepts is "could not say", never a value to write.
+        return answer if isinstance(answer, str) and answer in TRIP_KEY_KINDS else None
+
+    def _exchange_keys_for(self, trip_id: str | None) -> tuple[str, dict[str, str]]:
+        """(the key a new site for this trip is born with, {kind: key} to ask the
+        container which it holds). With no trip key master: today's shared key and
+        no candidates - nothing is derived and nothing extra is read."""
+        if not self._trip_key_master:
+            return self._control_plane_exchange_key, {}
+        if not trip_id:
+            # Never fall back to the shared key: a site built with it while the
+            # deployment believes per-trip keys are on is the silent downgrade.
+            raise RuntimeError(
+                "CONTROL_PLANE_TRIP_KEY_MASTER is set but no trip id was given: "
+                "cannot derive this trip's exchange key"
+            )
+        derived = derive_trip_key(self._trip_key_master, trip_id)
+        candidates = {"derived": derived}
+        if self._control_plane_exchange_key:
+            candidates["shared"] = self._control_plane_exchange_key
+        return derived, candidates
 
     # ── topology construction ────────────────────────────────────────────
 
@@ -447,7 +527,9 @@ class LxcProvisionAdapter:
     def _cloudflare_configured(self) -> bool:
         return bool(self._cloudflare_zone_id and self._cloudflare_api_token)
 
-    def _build_provisioner(self, topology: Topology | None = None) -> Provisioner:
+    def _build_provisioner(
+        self, topology: Topology | None = None, *, exchange_key: str | None = None,
+    ) -> Provisioner:
         """The provisioner for one topology - or, with none given, for every
         resource this worker is configured to manage.
 
@@ -497,7 +579,12 @@ class LxcProvisionAdapter:
         return Provisioner(
             ProxmoxLxcAdapter(
                 proxmox_ssh, reset_data=self._reset_data,
-                control_plane_exchange_key=self._control_plane_exchange_key,
+                # What a NEW site's .env gets: the trip's own key when per-trip
+                # keys are on (create_container passes it), else the shared one.
+                # teardown-trip.py builds with no topology and writes no .env.
+                control_plane_exchange_key=(
+                    self._control_plane_exchange_key if exchange_key is None else exchange_key
+                ),
             ),
             npm_adapter,
             cloudflare_adapter,

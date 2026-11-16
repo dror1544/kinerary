@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import http from "node:http";
 import https from "node:https";
 
@@ -6,6 +6,17 @@ const PORT = Number(process.env.PORT || 4320);
 const BIND_HOST = process.env.BIND_HOST || "127.0.0.1";
 const CONTROL_PLANE_ORIGIN = required("CONTROL_PLANE_INTERNAL_ORIGIN").replace(/\/$/, "");
 const EXCHANGE_KEY = required("RUNTIME_EXCHANGE_KEY");
+// Per-trip exchange keys (docs/runtime-session-exchange.md, "Per-trip keys"). EXCHANGE_KEY is the
+// control-plane key: it authenticates this gateway to the control plane and the control plane (and the
+// worker's tools) to this gateway's own /internal/t/* routes, and nothing else. What a TRIP SITE is sent
+// is a separate key per trip. OFF unless RUNTIME_TRIP_KEY_MASTER is set: unset, every trip is sent
+// EXCHANGE_KEY, as before.
+const TRIP_KEY_MASTER = process.env.RUNTIME_TRIP_KEY_MASTER || "";
+const LEGACY_TRIP_KEY = process.env.RUNTIME_LEGACY_TRIP_KEY || "";
+if (!TRIP_KEY_MASTER && LEGACY_TRIP_KEY) {
+  // A legacy key with no master is a half-made change of keys, and nothing else would say so.
+  console.error("runtime_gateway.trip_keys_off: RUNTIME_LEGACY_TRIP_KEY is set but RUNTIME_TRIP_KEY_MASTER is not; every trip is sent RUNTIME_EXCHANGE_KEY");
+}
 const COOKIE_SECRET = required("RUNTIME_COOKIE_SECRET");
 const PORTAL_ORIGIN = required("PORTAL_ORIGIN").replace(/\/$/, "");
 const RUNTIME_ORIGIN = required("RUNTIME_ORIGIN").replace(/\/$/, "");
@@ -105,6 +116,31 @@ async function controlPlane(path, init = {}) {
     throw error;
   }
   return response.json();
+}
+
+// derive(master, trip_id) = hex(HMAC-SHA256(master, "kinerary-trip-exchange:v1:" + trip_id)). The worker
+// computes the same value into a new trip's .env (test/fixtures/trip-key-vectors.json is read by both tests).
+export function deriveTripKey(master, tripId) {
+  return createHmac("sha256", master).update(`kinerary-trip-exchange:v1:${tripId}`).digest("hex");
+}
+
+// The key to send to ONE trip site, chosen by what the control plane recorded for that trip's route
+// (`tripKey`), never by anything the client sent and never by what the trip answered. `tripId` is the id the
+// route was looked up for. A trip that holds a key other than the one chosen answers 401 and that is the
+// end of it: no second key is tried, so a trip cannot be made to ask for the legacy key.
+// With a master set, anything but "derived" or "shared" (a kind this gateway does not know, or an older
+// control plane that does not say) is refused rather than guessed, and so is a "shared" trip when there is
+// no legacy key to send. Nothing is sent in any of those cases.
+function tripKeyFor(tripId, route) {
+  if (!TRIP_KEY_MASTER) return EXCHANGE_KEY;
+  let reason;
+  if (route?.tripKey === "derived") return deriveTripKey(TRIP_KEY_MASTER, tripId);
+  if (route?.tripKey === "shared") {
+    if (LEGACY_TRIP_KEY) return LEGACY_TRIP_KEY;
+    reason = "shared_trip_no_legacy_key";
+  } else reason = "route_key_kind_unknown";
+  console.error(`runtime_gateway.trip_key_unavailable: trip=${tripId} reason=${reason}`);
+  throw Object.assign(new Error("TRIP_KEY_UNAVAILABLE"), { statusCode: 503 });
 }
 
 async function routeFor(tripId) {
@@ -216,7 +252,7 @@ async function launch(req, res, tripId) {
   if (grant.dashboardUrl === `${PORTAL_ORIGIN}/trips/${tripId}/setup`) identity.dashboardUrl = grant.dashboardUrl;
   else if (grant.role === "owner" || grant.role === "organizer") logDashboardDropped(tripId, grant);
   const sessionResponse = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/session`, {
-    method: "POST", headers: { "content-type": "application/json", "x-api-key": EXCHANGE_KEY },
+    method: "POST", headers: { "content-type": "application/json", "x-api-key": tripKeyFor(tripId, route) },
     body: JSON.stringify(identity),
   });
   if (!sessionResponse.ok) return launchRefused(res, [400, 401, 403].includes(sessionResponse.status) ? 401 : 503);
@@ -239,7 +275,7 @@ async function provisionParticipant(req, res, tripId) {
   const body = await readJson(req);
   if (body.tripId !== tripId) return json(res, 400, { error: "INVALID_REQUEST" });
   const response = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants`, {
-    method: "POST", headers: { "content-type": "application/json", "x-api-key": EXCHANGE_KEY }, body: JSON.stringify(body),
+    method: "POST", headers: { "content-type": "application/json", "x-api-key": tripKeyFor(tripId, route) }, body: JSON.stringify(body),
   });
   const payload = await response.text();
   res.writeHead(response.status, { "content-type": "application/json", "cache-control": "no-store" });
@@ -252,7 +288,7 @@ async function participantExists(req, res, tripId, runtimeUsername) {
   if (!/^[a-z0-9][a-z0-9._-]{1,63}$/.test(runtimeUsername)) return json(res, 400, { error: "INVALID_REQUEST" });
   const route = await routeFor(tripId);
   const response = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants/${encodeURIComponent(runtimeUsername)}`, {
-    method: "GET", headers: { "x-api-key": EXCHANGE_KEY, "x-control-plane-trip-id": tripId },
+    method: "GET", headers: { "x-api-key": tripKeyFor(tripId, route), "x-control-plane-trip-id": tripId },
   });
   const payload = await response.text();
   res.writeHead(response.status, { "content-type": "application/json", "cache-control": "no-store" });

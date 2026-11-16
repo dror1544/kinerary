@@ -1970,8 +1970,8 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
   app.get("/internal/runtime-routes/:tripId", async (request, reply) => {
     if (!exchangeKeyMatches(request.headers["x-api-key"], deps.runtimeExchangeKey)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
     const tripId = (request.params as { tripId?: string }).tripId ?? "";
-    const result = await deps.db.query<{ route_ref: string; private_url: string | null }>(
-      `SELECT r.route_ref, j.result->>'private_url' AS private_url
+    const result = await deps.db.query<{ route_ref: string; private_url: string | null; trip_key: string }>(
+      `SELECT r.route_ref, r.trip_key, j.result->>'private_url' AS private_url
        FROM control_plane.runtime_routes r
        LEFT JOIN LATERAL (
          SELECT result FROM control_plane.jobs
@@ -1987,7 +1987,8 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     if (!["http:", "https:"].includes(upstream.protocol) || upstream.username || upstream.password || upstream.search || upstream.hash || !allowed) {
       return reply.code(503).send({ error: "RUNTIME_ROUTE_INVALID" });
     }
-    return { routeRef: row.route_ref, upstreamOrigin: upstream.origin, upstreamBasePath: upstream.pathname.replace(/\/$/, "") };
+    // tripKey says which KIND of key this trip's site holds (never a key), so the gateway sends the right one.
+    return { routeRef: row.route_ref, upstreamOrigin: upstream.origin, upstreamBasePath: upstream.pathname.replace(/\/$/, ""), tripKey: row.trip_key };
   });
 
   // The gateway's host mode asks "which trip is this Host?" (docs/runtime-session-exchange.md, "Host mode").
@@ -2001,8 +2002,8 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     const notReady = () => reply.code(404).send({ error: "RUNTIME_NOT_READY" });
     const host = String((request.params as { host?: string }).host ?? "").toLowerCase();
     if (host.length > 253 || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(host)) return notReady();
-    const result = await deps.db.query<{ trip_id: string; route_ref: string; upstream_url: string }>(
-      `SELECT trip_id, route_ref, upstream_url FROM control_plane.runtime_routes
+    const result = await deps.db.query<{ trip_id: string; route_ref: string; upstream_url: string; trip_key: string }>(
+      `SELECT trip_id, route_ref, upstream_url, trip_key FROM control_plane.runtime_routes
        WHERE public_host = $1 AND state = 'ready' AND upstream_url IS NOT NULL`, [host]);
     const row = result.rows[0];
     if (!row) return notReady();
@@ -2012,6 +2013,6 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
       || upstream.search || upstream.hash || /[?#]/.test(row.upstream_url) || !upstreamHostAllowed(upstream.hostname, deps.runtimeUpstreamAllowedHosts)) {
       return reply.code(503).send({ error: "RUNTIME_ROUTE_INVALID" });
     }
-    return { tripId: row.trip_id, routeRef: row.route_ref, upstreamOrigin: upstream.origin };
+    return { tripId: row.trip_id, routeRef: row.route_ref, upstreamOrigin: upstream.origin, tripKey: row.trip_key };
   });
 }
