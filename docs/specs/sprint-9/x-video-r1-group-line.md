@@ -527,16 +527,16 @@ Proposed in this draft:
 9. The setting lives on the site (`trip_settings.group_change_line`). The companion changes it only in the
    organizer's private chat, by the rule it already has.
 10. The registry gains the surface `control_plane`.
-1. **The relay finding: fix it in 1C, or on its own?** Recommendation: **on its own, now, High tier,
-   boundary-reviewed, in parallel, not a gate for 1C.** 1C does not use the relay. Details are in the owner's
-   private security notes.
-     profile, an interview route for the interviewer profile, or the documented multiplex gateway. Apply it to
-     all four operations, and invert the test at `relay-connector.test.ts:218-229`.
-2. **When does a trip start getting lines?** Recommendation: **from 2 days before the first trip day until the
-   last day.**
-   - Weeks of planning edits would otherwise post a line each time to a group that is not travelling yet.
-   - 1B's marks already show those edits on the site.
-4. **The exchange-key finding.** Recommendation: **handled on its own**, no change in 1C. Details are in the
-   owner's private security notes.
-   direction, with no change in 1C. It is pre-existing, larger than this work, and lies on the launch path every
-   trip uses.
+
+Answered by Dror, 2026-11-16:
+
+11. **The relay finding is fixed on its own** (spec `x-relay-chat-scope.md`, approved 2026-11-16), in parallel
+    and not a gate for 1C. 1C does not use the relay.
+12. **A trip gets lines from the moment its group is connected**, not only from shortly before the trip. There
+    is no date check: an open group binding with the setting and the switch on is enough.
+13. **The night window is 22:00–08:00 trip time**, one constant for every trip.
+
+## Open questions
+
+1. **The exchange-key finding** (owner's private security notes). Recommendation: handled on its own, with no
+   change in 1C.
