@@ -278,3 +278,12 @@ Written first, from the criteria.
    Any other release that is not `available` is still refused (AC-2). R1 refuses every
    non-`available` target today (`release_refusal` in `scripts/trip-rollout.py`); the
    exception is built in R2.
+6. **A companion re-render is built from the trip as it stands (Dror, 2026-11-16).**
+   The rollout builds the companion handoff with the same `build_companion_handoff` the
+   provisioner uses, from the trip's current `trip.config.json` on the host plus the
+   confirmed intake's provenance, not by re-running the transform from the interview.
+   Reason: organizer edits made after the interview are kept, and the step does not
+   re-run enrichment, which reaches the network. The handoff carries organizer-private
+   data, so it goes to the installer on stdin only and is never printed, logged or
+   stored by the rollout. A rollback across a change in the handoff's shape fails the
+   companion step with the cause named (#591).
