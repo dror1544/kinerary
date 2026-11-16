@@ -506,6 +506,12 @@ Answered by Dror, 2026-11-16 (were the open questions):
 11. **Tabs stay in the bottom bar on phones, as today.** Not the video's pills under the header.
 12. **Members stop receiving `created_by`** in this work (AC-28).
 13. **If #567 S2 is not merged by about 28 November, 1A/1B are held for Alsace.** No one-off unswitched build.
+14. **Automatic system edits do not mark items** (Dror, 2026-11-16). A plan version written by a system
+    writer (enrichment and the other automated writers, one closed list in `server/recent-changes.js`) is not
+    a change source, so a freshly built trip shows no Updated or New marks. To tell them apart,
+    `recent-changes.js` reads a version's `author` for that classification only; no author, note or
+    `created_by` ever reaches `recent_change` or any response. This narrows "never reads author" in
+    Behaviour and Security notes to "never serves author".
 
 ## Open questions
 
