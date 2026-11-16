@@ -299,6 +299,11 @@ describe('config allow-list — golden round trip (nothing the site needs is los
     const tokyo = configs['venues-path'].phases.find(p => p.id === 'tokyo');
     assert.ok(tokyo.venues.some(v => v.url_source), 'enrichment should have filled a url_source');
     assert.ok(tokyo.days?.length && tokyo.accommodation?.confirmation);
+    // #567 S2: the provisioner's `features` block rides through the allow-list whole.
+    for (const [name, cfg] of Object.entries(configs)) {
+      assert.deepEqual(cfg.features, { delivery_probe: true }, `${name}: the helper writes the block`);
+      assert.deepEqual(projectConfig(cfg).value.features, { delivery_probe: true }, `${name}: and the list serves it`);
+    }
     assert.ok(projectConfig(configs['planned-path']).withheld.some(p => /\.needs\[/.test(p)),
       'organizer-only dietary needs should be withheld on the planned path');
   });

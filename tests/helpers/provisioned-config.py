@@ -28,6 +28,7 @@ WORKER = Path(__file__).resolve().parents[2] / "control-plane" / "worker"
 sys.path.insert(0, str(WORKER))
 
 from control_plane_worker.enrichment import enrich_config  # noqa: E402
+from control_plane_worker.feature_block import REGISTERED_SWITCHES, build_features_block, with_features  # noqa: E402
 from control_plane_worker.transformer import transform_intake  # noqa: E402
 
 
@@ -153,12 +154,16 @@ DESTINATION_INFO = {
 def provisioned(phases, language, **overrides):
     intake = {**COMMON, "phases": phases, **overrides}
     config = transform_intake(intake, today=date(2026, 8, 20), language=language)
-    return enrich_config(
+    config = enrich_config(
         config, "Japan", http=FakeHttp(), pause=0,
         consular_lookup=lambda dest, home: CONSULAR,
         venue_lookup=lambda dest, names: {"teamlab planets": "https://www.teamlab.art/e/planets/"},
         destination_info_lookup=lambda country: DESTINATION_INFO,
     )
+    # The provisioner's last addition (#567 S2): the `features` block, here with EVERY
+    # registered switch on — the widest block it can write, so the allow-list round trip
+    # fails if the site's list does not know the key or a switch it ships.
+    return with_features(config, build_features_block(REGISTERED_SWITCHES))
 
 
 if __name__ == "__main__":

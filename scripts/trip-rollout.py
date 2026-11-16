@@ -5,11 +5,11 @@ Until this command a merged change reached a running trip in pieces — site
 payload, then the trip's bridge, then the companion — each run by hand, each with
 its own prompt, and nothing recorded which version a trip ran. This is the
 order as a command (docs/specs/sprint-9/568-trip-rollout.md, slices R1 and R2: the
-site, bridge and companion steps, the record, the approval):
+site, bridge and companion steps, the record, the approval; and, from #567 S2, the switches step):
 
     trip-rollout.py plan    --release <id|commit> --trip <slug>[,<slug>...] --plan-file <path>
-                            [--steps site,bridge,companion] [--overwrite-edited-companion <slug>[,<slug>...]]
-    trip-rollout.py execute --plan-file <path> --plan-digest <sha256:...> [--steps site,bridge,companion]
+                            [--steps site,bridge,companion,switches] [--overwrite-edited-companion <slug>[,<slug>...]]
+    trip-rollout.py execute --plan-file <path> --plan-digest <sha256:...> [--steps site,bridge,companion,switches]
     trip-rollout.py status  [--trip <slug>]
 
 `plan` changes nothing. For each trip it says what the trip runs now, what it
@@ -38,11 +38,33 @@ For each trip, steps run in order and stop at the first failure:
              overwritten, unless the plan says so for that trip
              (--overwrite-edited-companion), and then its files are copied aside first. A
              conversation turn in flight is waited for, boundedly, never cut.
+  4. switches
+             the trip's per-trip feature switches (docs/specs/sprint-9/567-feature-switches.md, S2):
+             the registered switches that are ON for this trip are read from the control plane
+             (`control_plane.feature_enabled`, the one resolution) and written into the trip's
+             trip.config.json ON ITS HOST as a `features` block — exactly those switches, each the
+             literal true — by the deployment's own command, which touches no other key (it says so
+             with a digest of the rest of the file before and after, and this step refuses the
+             verdict if they differ). The command STOPS the site, merges, and STARTS it, in that order:
+             a site that is running while its file is rewritten can write its own in-memory copy back
+             over the merge (a participant added meanwhile) or lose the participant. Then this step
+             waits for the site's own /api/health and READS BACK what the site now serves: GET
+             /api/config with the trip's site key (TRIP_API_KEY, else MCP_API_KEY, from the trip's
+             mcp/.env, as the bridge uses it — sent as a header, never on a command line, never
+             printed), whose `features` must be exactly the member-visible part of what was written.
+             The command's own verdict is its word; the readback is the evidence, and it is what
+             catches a command that wrote nothing, or a site that did not pick the file up. With no
+             key at all, the step says the readback was skipped, in its output, and goes on; a key
+             the site REJECTS (HTTP 401/403) fails the step, since skipping would let a command that
+             wrote nothing pass. Unlike a provision, a read that fails is a
+             FAILED step, not an empty block: an operator is watching, and "every switch off" on a
+             doubtful read would silently switch features off on a live trip. The site reads the
+             file once at boot, so this is what makes a switch change reach it.
 
 A release built before releases carried mcp/ and profile-templates/ is valid for step 1
 and refused for steps 2 and 3 with a message saying so: its seal does not cover them.
 Steps run only when named: the default is `site,bridge`, so a deployment that has not yet
-configured the companion commands below is not broken by this slice.
+configured the companion or features commands below is not broken by either slice.
 
 The way back is the trip's recorded previous release. It is accepted even when that release
 is no longer `available` (it was withdrawn from new builds, not from the trips that ran it):
@@ -72,6 +94,20 @@ and, only when the companion step is planned (each refused by name when it is un
                                   profile (scripts/companion-install-host.sh); the request arrives on stdin,
                                   KINERARY_RELEASE_TREE names the release's materialized tree
   KINERARY_COMPANION_REFRESH_CMD  the command that runs scripts/companion-refresh-prompts.sh there
+and, only when the switches step is planned (refused by name when unset):
+  KINERARY_TRIP_FEATURES_CMD      <cmd> <slug> <vmid> --trip-dir <dir> --restart, with the trip's features block as
+                                  JSON on STDIN and a per-run nonce in KINERARY_ROLLOUT_FEATURES_NONCE. In this
+                                  order: STOP the trip's site; merge ONLY the `features` key into the trip's live
+                                  trip.config.json on its host (every other key, participants added since
+                                  provisioning included, left as it is); START the site. (Not merge-then-restart:
+                                  a running site rewrites the file from memory when a participant is written.)
+                                  Print as its LAST stdout line
+                                  `FEATURES <slug> nonce=<n> block=sha256:<h> rest_before=sha256:<r> rest_after=sha256:<r>`
+                                  where <n> repeats the nonce, <h> is the sha256 of the block as compact,
+                                  key-sorted JSON and <r> is any digest of the rest of the file taken before and
+                                  after the write (they must be equal). It never prints the file's content to
+                                  stdout or stderr (a failed step shows the tail of both). Exit non-zero on any
+                                  failure.
 Optional: KINERARY_ROLLOUT_REPO_ROOT (the checkout holding the release commits; default: this one),
 KINERARY_ROLLOUT_CHILD_ENV (comma-separated extra variable NAMES the deployment's commands need),
 KINERARY_ROLLOUT_SITE_WAIT_SECONDS / _BRIDGE_WAIT_SECONDS / _STEP_TIMEOUT_SECONDS, and for the companion step
@@ -117,17 +153,14 @@ RELEASE_REF = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
 COMMIT = re.compile(r"^[a-f0-9]{40}$")
 DIGEST = re.compile(r"^sha256:[a-f0-9]{64}$")
 ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
-# The steps, in the only order they run. R1 built the first two and R2 the third; the last is named so a
-# request for it is refused with a reason rather than ignored.
+# The steps, in the only order they run. R1 built the first two, R2 the third and #567 S2 the last.
 ALL_STEPS = ("site", "bridge", "companion", "switches")
-BUILT_STEPS = ("site", "bridge", "companion")
-# What runs when no --steps is given. NOT the companion step yet: it needs two deployment commands that a
-# deployment configured for R1 does not have, and a default that suddenly refuses is not a default. Adding it
-# is this one line, once the deployment's wrapper sets KINERARY_COMPANION_INSTALL_CMD and _REFRESH_CMD.
+BUILT_STEPS = ALL_STEPS
+# What runs when no --steps is given. NOT the companion or switches steps yet: they need deployment commands
+# (KINERARY_COMPANION_INSTALL_CMD and _REFRESH_CMD; KINERARY_TRIP_FEATURES_CMD) that a deployment configured for
+# R1 does not have, and a default that suddenly refuses is not a default. Adding them is this one line, once the
+# deployment's wrapper sets those.
 DEFAULT_STEPS = ("site", "bridge")
-NOT_IN_THIS_SLICE = {
-    "switches": "the switches step is the feature-switch work (#567 S2) and is not in this slice",
-}
 # The release payload each step runs from: a release sealed before these trees were part of it covers neither.
 STEP_ROOTS = {"bridge": ("mcp",), "companion": ("profile-templates", "mcp")}
 # The steps that run from the release's materialized tree, so need its commit in the checkout.
@@ -196,6 +229,7 @@ class Config:
     environ: dict
     companion_install_cmd: list = dataclasses.field(default_factory=list)
     companion_refresh_cmd: list = dataclasses.field(default_factory=list)
+    features_cmd: list = dataclasses.field(default_factory=list)
     turn_wait: int = 120
     registration_wait: int = 90
 
@@ -227,6 +261,22 @@ COMPANION_ENV = (
     ("KINERARY_COMPANION_INSTALL_CMD", "the command that runs the companion installer on the host that holds the profile"),
     ("KINERARY_COMPANION_REFRESH_CMD", "the command that clears a companion's saved prompts and restarts its gateway"),
 )
+
+
+# Needed only when the switches step is planned or run, for the same reason.
+FEATURES_ENV = (
+    ("KINERARY_TRIP_FEATURES_CMD", "the command that writes a trip's features block into its live trip.config.json on its host and restarts the site"),
+)
+
+
+def require_features_config(cfg: "Config") -> None:
+    missing = [(n, why) for n, why in FEATURES_ENV if not cfg.environ.get(n)]
+    if missing:
+        lines = "\n".join(f"  {n}  — {why}" for n, why in missing)
+        raise Refused("the switches step needs the deployment's own command; unset:\n" + lines +
+                      "\nThe deployment's wrapper sets it (hard rule 6: this repository names no host, container or path).")
+    if not cfg.features_cmd:
+        raise Refused("KINERARY_TRIP_FEATURES_CMD must not be empty")
 
 
 def require_companion_config(cfg: "Config") -> None:
@@ -302,6 +352,7 @@ def load_config(environ: dict, need: tuple = tuple(n for n, _ in REQUIRED_ENV)) 
         environ=dict(environ),
         companion_install_cmd=words_optional(environ, "KINERARY_COMPANION_INSTALL_CMD"),
         companion_refresh_cmd=words_optional(environ, "KINERARY_COMPANION_REFRESH_CMD"),
+        features_cmd=words_optional(environ, "KINERARY_TRIP_FEATURES_CMD"),
         turn_wait=_seconds(environ, "KINERARY_ROLLOUT_TURN_WAIT_SECONDS", TURN_WAIT_DEFAULT),
         registration_wait=_seconds(environ, "KINERARY_ROLLOUT_REGISTRATION_WAIT_SECONDS", REGISTRATION_WAIT_DEFAULT),
     )
@@ -435,8 +486,9 @@ IPV4 = re.compile(rf"^{OCTET}(\.{OCTET}){{3}}$")
 
 def run_child(cfg: Config, args: list, extra_env: Optional[dict] = None, timeout: Optional[int] = None,
               input_text: Optional[str] = None):
-    """A child with the allow-listed environment. No stdin unless `input_text` is given: the one thing that is, is
-    the companion handoff, which carries organizer-private interview data and so travels on stdin and nowhere else.
+    """A child with the allow-listed environment. No stdin unless `input_text` is given: the two things that are are the
+    companion handoff, which carries organizer-private interview data and so travels on stdin and nowhere else, and
+    the switches step's features block (a few registered names, no trip data).
     Output is captured, never streamed: the caller decides what part of it, scrubbed, is shown."""
     return subprocess.run(args, capture_output=True, text=True,
                           stdin=subprocess.DEVNULL if input_text is None else None, input=input_text,
@@ -555,7 +607,7 @@ def parse_steps(raw: Optional[str]) -> tuple:
         raise Refused(f"unknown step {unknown[0]!r}; the steps are {', '.join(ALL_STEPS)}")
     for s in wanted:
         if s not in BUILT_STEPS:
-            raise Refused(NOT_IN_THIS_SLICE.get(s, f"the {s} step is not built"))
+            raise Refused(f"the {s} step is not built")
     if not wanted:
         raise Refused("no steps named")
     return tuple(s for s in ALL_STEPS if s in wanted)   # always in running order
@@ -585,6 +637,8 @@ def cmd_plan(cfg: Config, db: Db, args) -> int:
         raise Refused(f"--overwrite-edited-companion names {sorted(overwrite - set(slugs))[0]!r}, which is not a trip in this plan")
     if "companion" in steps:
         require_companion_config(cfg)
+    if "switches" in steps:
+        require_features_config(cfg)
     release = get_release(db, args.release)
 
     present = commit_present(cfg, release["source_revision"])
@@ -740,16 +794,16 @@ def scrub(text: str, limit: int = 15) -> str:
     return "\n".join("      | " + ln for ln in lines)
 
 
-def http_get(url: str, headers: Optional[dict] = None, timeout: int = 15) -> tuple:
+def http_get(url: str, headers: Optional[dict] = None, timeout: int = 15, limit: int = 8192) -> tuple:
     """(status, body) — no proxy, whatever the environment says: these are
-    loopback and LAN addresses."""
+    loopback and LAN addresses. The body is read up to `limit` bytes."""
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     req = urllib.request.Request(url, headers=headers or {})
     try:
         with opener.open(req, timeout=timeout) as r:
-            return r.status, r.read(8192).decode("utf-8", "replace")
+            return r.status, r.read(limit).decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.read(8192).decode("utf-8", "replace")
+        return exc.code, exc.read(limit).decode("utf-8", "replace")
 
 
 def site_healthy(trip: Trip, wait: int) -> bool:
@@ -806,6 +860,21 @@ def read_bridge_key(trip: Trip) -> Optional[str]:
     return None
 
 
+def read_site_key(trip: Trip) -> Optional[str]:
+    """The key the trip's bridge presents to the trip's SITE (mcp/mcp.js: TRIP_API_KEY, falling back to its own
+    MCP_API_KEY), read from the same file the bridge step reads. None when there is none."""
+    try:
+        text = (trip.trip_dir / "mcp" / ".env").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    found = {}
+    for line in text.splitlines():
+        for name in ("TRIP_API_KEY", "MCP_API_KEY"):
+            if line.startswith(name + "="):
+                found[name] = line.split("=", 1)[1].strip().strip("\"'\r") or None
+    return found.get("TRIP_API_KEY") or found.get("MCP_API_KEY")
+
+
 def file_digest(path: Path) -> Optional[str]:
     try:
         return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -823,6 +892,12 @@ def _load_worker_module(filename: str, name: str):
 
 def load_release_source():
     return _load_worker_module("release_source.py", "kinerary_release_source")
+
+
+def load_feature_block():
+    """The worker's own `features` block builder and registry mirror: the SAME code a provision uses, so a rollout writes
+    the block a provision would. Stdlib-only, which is why it can be read by path here."""
+    return _load_worker_module("feature_block.py", "kinerary_feature_block")
 
 
 def load_companion_profile():
@@ -856,6 +931,18 @@ WITH moved AS (
    RETURNING 1)
 SELECT count(*) FROM moved;
 """
+
+# The answer for every registered switch, from the same SQL function a provision and the relay use — one
+# resolution, never recomputed here. A trip that is not in `trips` yields no rows, which the step reports.
+FEATURES_SQL = """
+SELECT row_to_json(x) FROM (
+  SELECT s AS switch, control_plane.feature_enabled(t.id, s) AS enabled
+    FROM control_plane.trips t, unnest(string_to_array(:'names', ',')) AS s
+   WHERE t.id = :'trip_id') x;
+"""
+
+FEATURES_VERDICT = re.compile(
+    r"^FEATURES ([a-z0-9][a-z0-9-]{0,62}) nonce=([a-f0-9]{32}) block=(sha256:[a-f0-9]{64}) rest_before=(sha256:[a-f0-9]{64}) rest_after=(sha256:[a-f0-9]{64})$")
 
 OPEN_ROLLOUT_SQL = """
 BEGIN;
@@ -1094,6 +1181,95 @@ class Executor:
             raise StepFailed("companion", "the prompt refresh did not confirm the gateway's tools")
         say(f"      gateway restarted, {found.group(2)} saved prompt(s) cleared, {found.group(3)} bridge tool(s) registered")
 
+    def step_switches(self, trip: Trip, rollout: dict) -> None:
+        """Write the trip's resolved `features` block into its live config on its host, touching no other key, then wait
+        for the site to be healthy again. Every failure is a failed step; nothing here falls back to "all off"."""
+        feature_block = load_feature_block()
+        names = list(feature_block.REGISTERED_SWITCHES)
+        if not names:
+            raise StepFailed("switches", "the worker's switch registry is empty, so there is nothing to resolve")
+        try:
+            rows = self.db.rows(FEATURES_SQL, names=",".join(names), trip_id=trip.row["id"])
+        except (DbError, RuntimeError) as exc:
+            raise StepFailed("switches", "the trip's switches could not be read from the control plane; nothing was written\n"
+                                         + scrub(str(exc)))
+        answers = {}
+        for row in rows:
+            if isinstance(row, dict) and isinstance(row.get("switch"), str) and isinstance(row.get("enabled"), bool):
+                answers[row["switch"]] = row["enabled"]
+        absent = [n for n in names if n not in answers]
+        if absent:
+            raise StepFailed("switches", f"the control plane gave no answer for {', '.join(absent)}; nothing was written")
+        block = feature_block.build_features_block(answers)
+        payload = json.dumps(block, sort_keys=True, separators=(",", ":"))
+        expected = digest_of(payload.encode("utf-8"))
+
+        config_path = trip.trip_dir / "trip.config.json"
+        local_before = file_digest(config_path)
+        args = self.cfg.features_cmd + [trip.slug, trip.vmid, "--trip-dir", str(trip.trip_dir), "--restart"]
+        nonce = secrets.token_hex(16)     # a verdict must repeat it: a line printed without running this run's command fails
+        try:
+            done = run_child(self.cfg, args, {"KINERARY_ROLLOUT_FEATURES_NONCE": nonce}, input_text=payload)
+        except OSError as exc:
+            raise StepFailed("switches", f"the features command did not run ({type(exc).__name__})")
+        except subprocess.TimeoutExpired:
+            raise StepFailed("switches", f"the features command did not finish within {self.cfg.step_timeout}s")
+        if done.returncode != 0:
+            raise StepFailed("switches", f"the features command exited {done.returncode}\n{scrub(done.stdout + done.stderr)}")
+        lines = [ln for ln in done.stdout.splitlines() if ln.strip()]
+        found = FEATURES_VERDICT.match(lines[-1]) if lines else None
+        if not found or found.group(1) != trip.slug:
+            raise StepFailed("switches", "the features command gave no verdict this command recognises, so what it wrote is unknown")
+        if found.group(2) != nonce:
+            raise StepFailed("switches", "the features command's verdict does not carry this run's nonce, so it is not a verdict of this run")
+        if found.group(3) != expected:
+            raise StepFailed("switches", "the features command wrote a different block from the one it was given")
+        if found.group(4) != found.group(5):
+            raise StepFailed("switches", "the features command changed something other than `features` in the trip's config; "
+                                         "a rollout writes the features block and nothing else")
+        if file_digest(config_path) != local_before:
+            raise StepFailed("switches", "the trip's local trip.config.json changed during the step; this step writes the live copy only")
+        if not site_healthy(trip, self.cfg.site_wait):
+            raise StepFailed("switches", f"the site's own /api/health did not answer ok within {self.cfg.site_wait}s after the restart")
+        say(f"      features written: {', '.join(block) if block else 'none (every switch is off for this trip)'}")
+        self.read_back_features(trip, block)
+
+    def read_back_features(self, trip: Trip, block: dict) -> None:
+        """What the SITE now serves, as the trip's own site key sees it: the member-visible part of `block`, exactly. The
+        command's verdict is its own word; this is the evidence, and it fails the step when the site disagrees (a command
+        that wrote nothing, a site that kept its old file), and when the site rejects the key (a misconfiguration, and a skip
+        would let the liar through). No key at all is said in the output and not failed: the check cannot be made, and a
+        silent skip is how a stale block would go unseen."""
+        feature_block = load_feature_block()
+        expected = {n: True for n in block if n in feature_block.MEMBER_VISIBLE_SWITCHES}
+        key = read_site_key(trip)
+        if not key:
+            say("      readback SKIPPED: no site key beside the trip (mcp/.env), so what the site now serves was not checked")
+            return
+        try:
+            status, body = http_get(f"http://{trip.site_host}:{trip.site_port}/api/config", {"X-API-Key": key},
+                                    timeout=20, limit=16 * 1024 * 1024)
+        except OSError as exc:
+            raise StepFailed("switches", f"the site could not be asked what it serves after the restart ({type(exc).__name__})")
+        if status in (401, 403):
+            raise StepFailed("switches", f"the site did not accept the trip's key (HTTP {status}), so what it now serves could not be "
+                                         "checked; a key the site rejects is a misconfiguration, and skipping the check would let a "
+                                         "command that wrote nothing pass")
+        if status != 200:
+            raise StepFailed("switches", f"GET /api/config answered HTTP {status} after the restart")
+        try:
+            doc = json.loads(body)
+        except ValueError:
+            doc = None
+        if not isinstance(doc, dict):
+            raise StepFailed("switches", "GET /api/config did not answer a JSON object after the restart")
+        served = doc.get("features", {})
+        if served != expected:
+            names = (", ".join(sorted(str(k) for k in served)) if isinstance(served, dict) else "something that is not a block") or "none"
+            raise StepFailed("switches", "the site does not serve the features that were written (serves: " + names + "; expected: "
+                                         + (", ".join(expected) or "none") + "): it did not pick the file up, or the command did not write it")
+        say(f"      readback ok: the site serves {', '.join(expected) if expected else 'no features'} to a member")
+
     # ---- one trip
 
     def run_trip(self, entry: dict) -> bool:
@@ -1176,10 +1352,12 @@ def cmd_execute(cfg: Config, db: Db, args) -> int:
         steps = list(wanted)
     for s in steps:
         if s not in BUILT_STEPS:
-            raise Refused(NOT_IN_THIS_SLICE.get(s, f"the {s} step is not built"))
+            raise Refused(f"the {s} step is not built")
     steps = tuple(s for s in ALL_STEPS if s in steps)
     if "companion" in steps:
         require_companion_config(cfg)
+    if "switches" in steps:
+        require_features_config(cfg)
 
     release = get_release(db, plan["release"]["id"])
     if (release["id"] != plan["release"]["id"] or release["source_revision"] != plan["release"]["source_revision"]
@@ -1258,7 +1436,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--trip", action="append", help="trip slug, or several separated by commas (repeatable)")
     p.add_argument("--all", action="store_true", help="every eligible trip (not in this slice)")
     p.add_argument("--plan-file", required=True)
-    p.add_argument("--steps", help="comma-separated; default site,bridge")
+    p.add_argument("--steps", help="comma-separated, from site,bridge,companion,switches; default site,bridge")
     p.add_argument("--overwrite-edited-companion", action="append", metavar="SLUG[,SLUG...]",
                    help="let the companion step replace a profile edited in place (its files are copied aside first); "
                         "default: an edited profile is reported and left alone")

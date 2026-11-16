@@ -28,6 +28,13 @@ const bi = nullAsAbsent(
 );
 const packing = z.array(z.tuple([bi, bi])).optional();
 export const parityFields = {
+  // Per-trip feature switches (#567 S2). The server serves only the switches that are
+  // ON for this trip and member-visible, each as the literal `true`
+  // (shared/config-visibility.js) — and omits the key when there are none. Accepted
+  // loosely here on purpose: a surprise in this map must never take the whole config
+  // down (the 2026-09-13 lesson at the top of this file), so the VALUE is checked at
+  // the point of use (features.ts `featureOn`), not here.
+  features: nullAsAbsent(z.record(z.string(), z.unknown()).optional()),
   tasks: z
     .array(
       z.object({

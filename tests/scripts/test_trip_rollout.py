@@ -26,6 +26,10 @@ Slice R2 adds, in the classes at the end:
   Decision 5: the trip's own previous release is accepted for a rollback even when it is no longer available,
         with a warning; any other release that is not available is still refused
 
+#567 slice S2 adds the fourth step, in `SwitchesStep` at the end: the trip's resolved feature switches are written, as a
+`features` block and nothing else, into its live config on its host; the site is restarted and health-checked; any
+failure fails the step (never "all off"); the plan and the child's environment are held to the same rules as the others.
+
 The companion tests run the REAL installer and prompt-refresh scripts, in a sandboxed HOME, behind a wrapper (as the
 deployment's own wrapper would be), with a stand-in `hermes`, `launchctl` and `uname`: a rollout here changes a real
 profile directory and a real SQLite state.db, and starts nothing.
@@ -91,6 +95,7 @@ release_source = _load(RELEASE_SOURCE, "release_source_under_test")
 
 PYTHON = sys.executable
 KEY = "KEY-" + "9f8e7d6c5b4a" * 3          # the bridge's key: it must never appear in any output or argument
+SITE_KEY = "SITE-" + "1a2b3c4d5e6f" * 3    # what the bridge presents to the site: it must never appear in any output or argument
 SECRET_IN_OUTPUT = "SECRET123XYZ"          # what a failing deploy command prints; it must be redacted when shown
 CANARY = "RELAY_PROVIDER_KEY_CANARY"      # a variable of the parent that no child may inherit
 ORGANIZER_PRIVATE = "ORGANIZER-PRIVATE-STANDING-ORDER"   # organizer-only interview text: it must never be printed or stored
@@ -236,6 +241,56 @@ if sys.argv[1] == "kickstart":
                 f"registered {len(tools)} tool(s): {names}\n")
 '''
 
+# The deployment's features command, as the contract in scripts/trip-rollout.py describes it: it holds the trip's LIVE
+# config on its host (here, a file under FAKE_DIR/live, separate from the deployment root's local copy), merges ONLY the
+# `features` key into it, and says what it did. It does what the contract says, IN THE ORDER the contract says: stop the
+# site, merge, start the site (each is a line in features-steps.log, and "stop" empties the fake site's view of the
+# file until "start"). Behaviours a broken or lying one might have are switched on by marker files.
+FAKE_FEATURES = r'''
+import hashlib, json, os, sys
+d = os.environ["FAKE_DIR"]
+argv = sys.argv[1:]
+slug = argv[0]
+raw = sys.stdin.read()
+block = json.loads(raw)
+with open(os.path.join(d, "features.log"), "a") as f:
+    f.write(json.dumps({"argv": argv, "stdin": raw, "env": sorted(os.environ)}) + "\n")
+def digest(obj):
+    return "sha256:" + hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+def step(name):
+    open(os.path.join(d, "features-steps.log"), "a").write(name + "\n")
+nonce = os.environ.get("KINERARY_ROLLOUT_FEATURES_NONCE", "")
+if os.path.exists(os.path.join(d, "features-liar")):
+    # Writes nothing and prints a perfect verdict: every field is computable from what it was given.
+    print("FEATURES " + slug + " nonce=" + nonce + " block=" + digest(block) + " rest_before=" + digest({}) + " rest_after=" + digest({}))
+    sys.exit(0)
+if os.path.exists(os.path.join(d, "features-liar-without-this-runs-nonce")):
+    print("FEATURES " + slug + " nonce=" + "0" * 32 + " block=" + digest(block) + " rest_before=" + digest({}) + " rest_after=" + digest({}))
+    sys.exit(0)
+if os.path.exists(os.path.join(d, "fail-features")):
+    print("writing features for " + slug + " token=SECRET123XYZ went wrong")
+    sys.exit(9)
+trip_dir = argv[argv.index("--trip-dir") + 1]
+if os.path.exists(os.path.join(d, "features-touches-local-config")):
+    open(os.path.join(trip_dir, "trip.config.json"), "a").write(" ")
+live = os.path.join(d, "live", slug + ".json")
+step("stop")
+cfg = json.load(open(live))
+rest = lambda c: {k: v for k, v in c.items() if k != "features"}
+before = digest(rest(cfg))
+cfg["features"] = block
+if os.path.exists(os.path.join(d, "features-clobbers-participants")):
+    cfg["participants"] = []
+step("merge")
+json.dump(cfg, open(live, "w"))
+step("start")
+shown = {} if os.path.exists(os.path.join(d, "features-reports-another-block")) else block
+if os.path.exists(os.path.join(d, "features-no-verdict")):
+    sys.exit(0)
+print("restarted " + slug)
+print("FEATURES " + slug + " nonce=" + nonce + " block=" + digest(shown) + " rest_before=" + before + " rest_after=" + digest(rest(cfg)))
+'''
+
 FAKE_HOSTNAME = r'''
 import json, os, sys
 names = json.load(open(os.path.join(os.environ["FAKE_DIR"], "hostnames.json")))
@@ -265,10 +320,28 @@ def serve(handler_factory, port: int) -> Serve:
 
 class SiteHandler(BaseHTTPRequestHandler):
     healthy = True
+    live = None            # the trip's live config file, which a restarted site serves from
+    fake = None            # the rig's FAKE_DIR
+    site_key = None
 
     def do_GET(self):  # noqa: N802
-        if self.path == "/api/health" and type(self).healthy:
+        cls = type(self)
+        if self.path == "/api/health" and cls.healthy:
             body, status = b'{"ok": true}', 200
+        elif self.path == "/api/config" and cls.live is not None:
+            if self.headers.get("X-API-Key") != cls.site_key:
+                body, status = b'{"error":"unauthorized"}', 401
+            elif (cls.fake / "site-answers-500").exists():
+                body, status = b'{"error":"boom"}', 500
+            else:
+                # What shared/config-visibility.js does to the file's block: member-visible and literally true, else the key
+                # is absent. A site that "did not pick the file up" serves what it booted with.
+                booted = {"left_over_from_before": True} if (cls.fake / "site-keeps-its-old-file").exists() else None
+                features = booted if booted is not None else json.loads(cls.live.read_text()).get("features", {})
+                visible = rt.load_feature_block().MEMBER_VISIBLE_SWITCHES
+                served = {k: True for k, v in features.items() if v is True and k in visible}
+                doc = {"meta": {"title": "t"}, **({"features": served} if served else {})}
+                body, status = json.dumps(doc).encode(), 200
         else:
             body, status = b'{"ok": false}', 503
         self.send_response(status)
@@ -333,7 +406,7 @@ class Rig:
         self.trips: dict[str, dict] = {}
         self.hostnames: dict[str, str] = {}
         for name, body in (("deploy.py", FAKE_DEPLOY), ("bridge.py", FAKE_BRIDGE_RESTART), ("hostname.py", FAKE_HOSTNAME),
-                           ("companion_wrapper.py", FAKE_COMPANION_WRAPPER)):
+                           ("companion_wrapper.py", FAKE_COMPANION_WRAPPER), ("features.py", FAKE_FEATURES)):
             (self.dir / name).write_text(body)
         self._hermes_sandbox()
         self._git_repo()
@@ -503,13 +576,14 @@ class Rig:
         slug = f"ro-{self.tag}-{name}"
         vmid = vmid or self._free_vmid()
         site_port = free_port()
-        handler = type("H", (SiteHandler,), {"healthy": site_ok})
+        handler = type("H", (SiteHandler,), {"healthy": site_ok, "live": self.fake / "live" / f"{slug}.json",
+                                             "fake": self.fake, "site_key": SITE_KEY})
         self.servers.append(serve(handler, site_port))
         if bridge is not None:
             self.servers.append(serve(bridge_handler(bridge), 3000 + vmid))
         tdir = self.root / "trips" / slug
         (tdir / "mcp").mkdir(parents=True)
-        (tdir / "mcp" / ".env").write_text(f'PORT=1\nMCP_API_KEY="{KEY}"\n')
+        (tdir / "mcp" / ".env").write_text(f'PORT=1\nMCP_API_KEY="{KEY}"\nTRIP_API_KEY="{SITE_KEY}"\n')
         config = {"participants": [{"username": "ana"}], "slug": slug}
         if companion:
             # What transform_intake leaves for a trip whose organizer named an assistant: enough for build_companion_handoff.
@@ -520,6 +594,12 @@ class Rig:
                       "agent": {"name": "Robin", "gender": "neutral", "tone": "warm", "timezone": "Europe/Paris",
                                 "organizers": ["ana"], "standing_instructions": ORGANIZER_PRIVATE}}
         (tdir / "trip.config.json").write_text(json.dumps(config))
+        # The LIVE config on the trip's host: what the container holds, with a participant added since provisioning (which
+        # the local copy above does not know) and an old features block the switches step must replace.
+        (self.fake / "live").mkdir(exist_ok=True)
+        (self.fake / "live" / f"{slug}.json").write_text(json.dumps(
+            {**config, "participants": config["participants"] + [{"username": "added-at-runtime", "pin": "4321"}],
+             "features": {"left_over_from_before": True}}))
         (tdir / "data.sqlite").write_bytes(b"SQLite format 3\x00 participants and everything travellers wrote")
         (tdir / "topology.yaml").write_text(
             "# fixture\nversion: 1\n"
@@ -595,6 +675,7 @@ class Rig:
             "RIG_REPO": str(ROOT),
             "KINERARY_COMPANION_INSTALL_CMD": shlex.join([PYTHON, str(self.dir / "companion_wrapper.py"), "install"]),
             "KINERARY_COMPANION_REFRESH_CMD": shlex.join([PYTHON, str(self.dir / "companion_wrapper.py"), "refresh"]),
+            "KINERARY_TRIP_FEATURES_CMD": shlex.join([PYTHON, str(self.dir / "features.py")]),
             "KINERARY_ROLLOUT_TURN_WAIT_SECONDS": "3",
             "KINERARY_ROLLOUT_REGISTRATION_WAIT_SECONDS": "3",
             "KINERARY_ROLLOUT_SITE_WAIT_SECONDS": "2",
@@ -651,6 +732,17 @@ class Rig:
                  'plans', (SELECT count(*) FROM control_plane.plans),
                  'jobs', (SELECT count(*) FROM control_plane.jobs),
                  'rollouts', (SELECT count(*) FROM control_plane.trip_rollouts))"""))
+
+    def live_config(self, slug: str) -> dict:
+        return json.loads((self.fake / "live" / f"{slug}.json").read_text())
+
+    def set_switch(self, slug: str, name: str, enabled: bool, scope: str = "trip") -> None:
+        """What an operator's `feature set` leaves behind: a settings row (the registry is the code's job, not the table's)."""
+        self.sql.run(
+            """INSERT INTO control_plane.feature_switch_settings(switch, scope, trip_id, enabled, changed_by)
+               VALUES (:'name', :'scope', CASE WHEN :'scope' = 'trip' THEN (SELECT id FROM control_plane.trips WHERE slug = :'slug') END,
+                       :'enabled'::boolean, 'sha256:' || repeat('a', 64))""",
+            name=name, scope=scope, slug=slug, enabled="true" if enabled else "false")
 
     def trip_files(self, slug: str) -> dict[str, str | None]:
         d = self.trips[slug]["dir"]
@@ -811,11 +903,41 @@ class ThePlanFileIsTheApproval(unittest.TestCase):
                 self.assertEqual(2, code)
                 self.assertRegex(err, "not valid JSON|is not a rollout plan")
 
-    def test_a_step_that_is_not_built_in_this_slice_is_refused_with_the_reason(self):
-        code, _, err = self.rig.run(["plan", "--release", "x", "--trip", "ro-a", "--steps", "switches",
+    def test_a_step_nobody_built_is_refused_by_name(self):
+        code, _, err = self.rig.run(["plan", "--release", "x", "--trip", "ro-a", "--steps", "rm",
                                      "--plan-file", str(self.rig.dir / "p.json")])
         self.assertEqual(2, code)
-        self.assertIn("not in this slice", err)
+        self.assertIn("unknown step 'rm'", err)
+
+    def test_the_switches_step_is_built_and_asks_for_the_deployments_command_by_name_when_it_is_unset(self):
+        env = self.rig.env()
+        del env["KINERARY_TRIP_FEATURES_CMD"]
+        code, out, err = self.rig.run(["plan", "--release", "x", "--trip", "ro-a", "--steps", "switches",
+                                       "--plan-file", str(self.rig.dir / "p.json")], env)
+        self.assertEqual(2, code)
+        self.assertIn("KINERARY_TRIP_FEATURES_CMD", err)
+        self.assertNotIn("not in this slice", err)
+        self.assertFalse((self.rig.dir / "p.json").exists(), "a refusal writes nothing")
+
+    def test_execute_asks_for_it_too_so_a_plan_cannot_outrun_the_deployments_configuration(self):
+        doc = {"format": rt.PLAN_FORMAT, "release": {"id": "rls_abcdefgh", "source_revision": "a" * 40,
+                                                       "artifact_digest": "sha256:" + "b" * 64},
+               "steps": ["switches"], "trips": [{"slug": "ro-a", "trip_id": "trip_x", "from_release_id": None}]}
+        path = self.rig.dir / "p.json"
+        data = (json.dumps(doc, indent=2, sort_keys=True) + "\n").encode()
+        path.write_bytes(data)
+        env = self.rig.env()
+        del env["KINERARY_TRIP_FEATURES_CMD"]
+        code, _, err = self.rig.run(["execute", "--plan-file", str(path), "--plan-digest", rt.digest_of(data)], env)
+        self.assertEqual(2, code)
+        self.assertIn("KINERARY_TRIP_FEATURES_CMD", err)
+
+    def test_without_the_switches_step_the_features_command_is_not_needed(self):
+        env = self.rig.env()
+        del env["KINERARY_TRIP_FEATURES_CMD"]
+        code, _, err = self.rig.run(["plan", "--release", "x", "--trip", "ro-a", "--plan-file", str(self.rig.dir / "p.json")], env)
+        self.assertNotEqual(0, code)
+        self.assertNotIn("KINERARY_TRIP_FEATURES_CMD", err, "it got as far as the database, which is not there")
 
     def test_the_companion_step_is_built_and_asks_for_the_deployments_commands_by_name_when_they_are_unset(self):
         for name in ("KINERARY_COMPANION_INSTALL_CMD", "KINERARY_COMPANION_REFRESH_CMD"):
@@ -837,7 +959,9 @@ class ThePlanFileIsTheApproval(unittest.TestCase):
         self.assertNotEqual(0, code)
         self.assertNotIn("KINERARY_COMPANION", err, "it got as far as the database, which is not there")
         self.assertEqual(("site", "bridge"), rt.DEFAULT_STEPS)
-        self.assertEqual(("site", "bridge", "companion"), rt.BUILT_STEPS, "R2 builds the third step; switches is #567 S2")
+        self.assertEqual(("site", "bridge", "companion", "switches"), rt.BUILT_STEPS, "every named step is built")
+        self.assertEqual(rt.ALL_STEPS, rt.BUILT_STEPS)
+        self.assertFalse(hasattr(rt, "NOT_IN_THIS_SLICE"), "no step is waiting on another slice")
 
     def test_all_is_not_in_this_slice(self):
         code, _, err = self.rig.run(["plan", "--release", "x", "--all", "--plan-file", str(self.rig.dir / "p.json")])
@@ -2034,6 +2158,290 @@ class RollingBackToAWithdrawnRelease(DatabaseCase):
         digest = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
         self.assertEqual(0, self.rig.execute(path, digest)[0])
         self.assertEqual(self.rig.r2, self.rig.trip_state(slug)["current_release_id"])
+
+
+class SwitchesStep(DatabaseCase):
+    """#567 S2: the fourth step writes the trip's resolved features block into its live config, and nothing else."""
+
+    def setUp(self):
+        super().setUp()
+        # The database lives for the whole class and an every-trip row would reach the next test's trips.
+        self.sql.run("DELETE FROM control_plane.feature_switch_settings")
+        self.addCleanup(self.sql.run, "DELETE FROM control_plane.feature_switch_settings")
+
+    def go(self, slug, steps="switches", release=None, name="plan.json", env=None):
+        code, out, err, path, digest = self.rig.plan(release or self.rig.r2, [slug], steps, name)
+        self.assertEqual(0, code, out + err)
+        return self.rig.run(["execute", "--plan-file", str(path), "--plan-digest", digest], env) + (path, digest)
+
+    def rest(self, cfg):
+        return {k: v for k, v in cfg.items() if k != "features"}
+
+    def test_a_switch_on_for_the_trip_is_written_as_the_literal_true_and_nothing_else_in_the_config_moves(self):
+        slug = self.rig.trip("a")
+        self.rig.set_switch(slug, "delivery_probe", True)
+        live_before, local_before = self.rig.live_config(slug), self.rig.trip_files(slug)
+        code, out, err, _, _ = self.go(slug)
+        self.assertEqual(0, code, out + err)
+        self.assertIn("switches ok", out)
+        live = self.rig.live_config(slug)
+        self.assertEqual({"delivery_probe": True}, live["features"], "the old block was replaced, not merged")
+        self.assertIs(live["features"]["delivery_probe"], True)
+        self.assertEqual(self.rest(live_before), self.rest(live), "every other key, the participant added at runtime included, is as it was")
+        self.assertIn({"username": "added-at-runtime", "pin": "4321"}, live["participants"])
+        self.assertEqual(local_before, self.rig.trip_files(slug), "the deployment root's own config and data are untouched")
+        self.assertEqual([], self.rig.log("deploy.log"), "the site step did not run: the switches step is not a code deploy")
+
+    def test_the_command_is_given_the_slug_the_vmid_the_dir_and_restart_and_the_block_on_stdin_only(self):
+        slug = self.rig.trip("a")
+        self.rig.set_switch(slug, "delivery_probe", True)
+        self.assertEqual(0, self.go(slug)[0])
+        (call,) = self.rig.log("features.log")
+        trip = self.rig.trips[slug]
+        self.assertEqual([slug, str(trip["vmid"]), "--trip-dir", str(trip["dir"]), "--restart"], call["argv"])
+        self.assertEqual({"delivery_probe": True}, json.loads(call["stdin"]))
+        self.assertEqual('{"delivery_probe":true}', call["stdin"], "compact, key-sorted: the form whose digest the verdict repeats")
+        self.assertIn("KINERARY_ROLLOUT_FEATURES_NONCE", call["env"], "the per-run nonce reaches the command")
+        self.assertNotIn(SITE_KEY, json.dumps(call), "the site key is not handed to the command, in any form")
+        self.assertNotIn("--sync-config", call["argv"])
+        self.assertNotIn(CANARY, call["env"], "the command gets the allow-listed environment, not this one's")
+        self.assertNotIn(KEY, json.dumps(call))
+
+    def test_with_every_switch_off_an_empty_block_is_written_and_the_old_one_is_gone(self):
+        slug = self.rig.trip("a")
+        self.assertEqual({"left_over_from_before": True}, self.rig.live_config(slug)["features"])
+        code, out, err, _, _ = self.go(slug)
+        self.assertEqual(0, code, out + err)
+        self.assertEqual({}, self.rig.live_config(slug)["features"])
+        self.assertIn("every switch is off", out)
+
+    def test_a_switch_turned_off_since_the_last_rollout_is_taken_out(self):
+        slug = self.rig.trip("a")
+        self.rig.set_switch(slug, "delivery_probe", True)
+        self.assertEqual(0, self.go(slug, name="one.json")[0])
+        self.assertEqual({"delivery_probe": True}, self.rig.live_config(slug)["features"])
+        self.rig.sql.run("UPDATE control_plane.feature_switch_settings SET enabled = false")
+        self.assertEqual(0, self.go(slug, name="two.json")[0])
+        self.assertEqual({}, self.rig.live_config(slug)["features"])
+
+    def test_the_answer_is_the_sql_resolution_trip_over_every_trip(self):
+        on_for_all_off_for_a = self.rig.trip("a")
+        other = self.rig.trip("b")
+        self.rig.set_switch(on_for_all_off_for_a, "delivery_probe", True, scope="all_trips")
+        self.rig.set_switch(on_for_all_off_for_a, "delivery_probe", False)
+        self.assertEqual(0, self.go(on_for_all_off_for_a, name="a.json")[0])
+        self.assertEqual(0, self.go(other, name="b.json")[0])
+        self.assertEqual({}, self.rig.live_config(on_for_all_off_for_a)["features"])
+        self.assertEqual({"delivery_probe": True}, self.rig.live_config(other)["features"])
+
+    def test_a_stored_row_for_a_name_the_registry_does_not_hold_never_reaches_the_block(self):
+        slug = self.rig.trip("a")
+        self.rig.set_switch(slug, "ghost_feature", True)
+        self.rig.set_switch(slug, "delivery_probe", True)
+        self.assertEqual(0, self.go(slug)[0])
+        self.assertEqual({"delivery_probe": True}, self.rig.live_config(slug)["features"])
+
+    def test_it_runs_after_site_and_bridge_and_the_rollout_row_records_all_three_steps(self):
+        slug = self.rig.trip("a")
+        self.rig.set_switch(slug, "delivery_probe", True)
+        code, out, err, _, digest = self.go(slug, steps="site,bridge,switches")
+        self.assertEqual(0, code, out + err)
+        self.assertLess(out.index("site ok"), out.index("bridge ok"))
+        self.assertLess(out.index("bridge ok"), out.index("switches ok"))
+        (row,) = self.rig.rollouts(slug)
+        self.assertEqual(("ok", ["site", "bridge", "switches"]), (row["result"], row["steps"]))
+        self.assertEqual(self.rig.r2, self.rig.trip_state(slug)["current_release_id"])
+
+    def test_the_switches_step_alone_moves_neither_release_column_and_creates_no_approval_or_notification(self):
+        slug = self.rig.trip("a")
+        before = self.rig.counts()
+        self.assertEqual(0, self.go(slug)[0])
+        state = self.rig.trip_state(slug)
+        self.assertEqual((self.rig.r1, None, "active"), (state["current_release_id"], state["previous_release_id"], state["lifecycle_state"]))
+        after = self.rig.counts()
+        self.assertEqual(before["approvals"], after["approvals"])
+        self.assertEqual(before["notifications"], after["notifications"])
+        self.assertEqual(before["rollouts"] + 1, after["rollouts"])
+
+    def test_the_command_is_told_to_stop_the_site_merge_and_start_it_in_that_order(self):
+        # Merge-then-restart races the site's own rewrite of the file (a participant write copies its in-memory config
+        # over the merge). The contract says stop, merge, start; the fake does, and records it.
+        slug = self.rig.trip("a")
+        self.rig.set_switch(slug, "delivery_probe", True)
+        self.assertEqual(0, self.go(slug)[0])
+        self.assertEqual(["stop", "merge", "start"], (self.rig.fake / "features-steps.log").read_text().split())
+        doc = Path(SCRIPT).read_text()
+        self.assertIn("STOP the trip's site; merge ONLY the `features` key", doc)
+        self.assertIn("(Not merge-then-restart", doc)
+
+    def test_the_site_is_read_back_and_serves_exactly_what_was_written_to_a_member(self):
+        slug = self.rig.trip("a")
+        self.rig.set_switch(slug, "delivery_probe", True)
+        code, out, err, _, _ = self.go(slug)
+        self.assertEqual(0, code, out + err)
+        self.assertIn("readback ok: the site serves delivery_probe to a member", out)
+        self.assertNotIn(SITE_KEY, out + err, "the site key is never printed")
+
+    def test_a_trip_with_nothing_on_is_read_back_too_and_serves_no_features(self):
+        slug = self.rig.trip("a")
+        code, out, err, _, _ = self.go(slug)
+        self.assertEqual(0, code, out + err)
+        self.assertIn("readback ok: the site serves no features to a member", out)
+
+    def test_a_command_that_writes_nothing_and_prints_a_perfect_verdict_is_caught_by_the_readback(self):
+        # The audit's liar: every field of the verdict is computable from what the command was given. The nonce stops a
+        # line printed without this run; only the site can say whether the file was really written.
+        slug = self.rig.trip("a")
+        self.rig.set_switch(slug, "delivery_probe", True)
+        (self.rig.fake / "features-liar").write_text("")
+        code, out, _, _, _ = self.go(slug)
+        self.assertEqual(1, code)
+        self.failed_at_switches(slug, out)
+        self.assertIn("does not serve the features that were written", out)
+        self.assertEqual({"left_over_from_before": True}, self.rig.live_config(slug)["features"], "nothing was written")
+
+    def test_a_verdict_without_this_runs_nonce_is_refused(self):
+        slug = self.rig.trip("a")
+        (self.rig.fake / "features-liar-without-this-runs-nonce").write_text("")
+        code, out, _, _, _ = self.go(slug)
+        self.assertEqual(1, code)
+        self.failed_at_switches(slug, out)
+        self.assertIn("does not carry this run's nonce", out)
+
+    def test_a_site_that_kept_its_old_file_is_caught_by_the_readback(self):
+        slug = self.rig.trip("a")
+        self.rig.set_switch(slug, "delivery_probe", True)
+        (self.rig.fake / "site-keeps-its-old-file").write_text("")
+        code, out, _, _, _ = self.go(slug)
+        self.assertEqual(1, code)
+        self.failed_at_switches(slug, out)
+        self.assertIn("serves: none; expected: delivery_probe", out)
+
+    def test_a_site_that_answers_500_to_the_readback_fails_the_step(self):
+        slug = self.rig.trip("a")
+        (self.rig.fake / "site-answers-500").write_text("")
+        code, out, _, _, _ = self.go(slug)
+        self.assertEqual(1, code)
+        self.failed_at_switches(slug, out)
+        self.assertIn("HTTP 500", out)
+
+    def test_with_no_site_key_the_readback_is_skipped_and_says_so(self):
+        slug = self.rig.trip("a")
+        self.rig.set_switch(slug, "delivery_probe", True)
+        (self.rig.trips[slug]["dir"] / "mcp" / ".env").write_text("PORT=1\n")
+        code, out, err, _, _ = self.go(slug)
+        self.assertEqual(0, code, out + err)
+        self.assertIn("readback SKIPPED: no site key", out)
+        self.assertNotIn("readback ok", out)
+
+    def test_a_key_the_site_rejects_fails_the_step_and_is_never_printed(self):
+        # A rejected key is a misconfiguration; skipping the check would let a command that wrote nothing pass.
+        slug = self.rig.trip("a")
+        self.rig.set_switch(slug, "delivery_probe", True)
+        (self.rig.trips[slug]["dir"] / "mcp" / ".env").write_text('PORT=1\nTRIP_API_KEY="NOT-THE-SITES-KEY-0123"\n')
+        (self.rig.fake / "features-liar").write_text("")
+        code, out, err, _, _ = self.go(slug)
+        self.assertEqual(1, code)
+        self.failed_at_switches(slug, out)
+        self.assertIn("the site did not accept the trip's key (HTTP 401)", out)
+        self.assertNotIn("readback SKIPPED", out)
+        self.assertNotIn("NOT-THE-SITES-KEY-0123", out + err)
+
+    def test_the_key_the_bridge_falls_back_to_is_used_when_there_is_no_trip_key(self):
+        slug = self.rig.trip("a")
+        (self.rig.trips[slug]["dir"] / "mcp" / ".env").write_text(f'PORT=1\nMCP_API_KEY="{SITE_KEY}"\n')
+        code, out, err, _, _ = self.go(slug)
+        self.assertEqual(0, code, out + err)
+        self.assertIn("readback ok", out)
+
+    # -- every failure fails the step
+
+    def failed_at_switches(self, slug, out):
+        self.assertIn("FAILED at step switches", out)
+        (row,) = self.rig.rollouts(slug)
+        self.assertEqual(("failed", "switches"), (row["result"], row["failed_step"]))
+        self.assertTrue(row["finished"])
+
+    def test_a_features_command_that_fails_fails_the_step_and_what_it_printed_is_scrubbed(self):
+        slug = self.rig.trip("a")
+        (self.rig.fake / "fail-features").write_text("")
+        code, out, err, _, _ = self.go(slug)
+        self.assertEqual(1, code)
+        self.failed_at_switches(slug, out)
+        self.assertNotIn(SECRET_IN_OUTPUT, out + err)
+        self.assertEqual({"left_over_from_before": True}, self.rig.live_config(slug)["features"], "a failed command wrote nothing")
+
+    def test_a_command_that_says_nothing_is_a_failed_step_not_a_pass(self):
+        slug = self.rig.trip("a")
+        (self.rig.fake / "features-no-verdict").write_text("")
+        code, out, _, _, _ = self.go(slug)
+        self.assertEqual(1, code)
+        self.failed_at_switches(slug, out)
+        self.assertIn("no verdict", out)
+
+    def test_a_command_that_reports_a_different_block_from_the_one_it_was_given_fails_the_step(self):
+        slug = self.rig.trip("a")
+        self.rig.set_switch(slug, "delivery_probe", True)
+        (self.rig.fake / "features-reports-another-block").write_text("")
+        code, out, _, _, _ = self.go(slug)
+        self.assertEqual(1, code)
+        self.failed_at_switches(slug, out)
+        self.assertIn("different block", out)
+
+    def test_a_command_that_changed_any_other_key_fails_the_step_and_says_so(self):
+        slug = self.rig.trip("a")
+        (self.rig.fake / "features-clobbers-participants").write_text("")
+        code, out, _, _, _ = self.go(slug)
+        self.assertEqual(1, code)
+        self.failed_at_switches(slug, out)
+        self.assertIn("something other than `features`", out)
+
+    def test_a_command_that_touched_the_deployment_roots_local_config_fails_the_step(self):
+        slug = self.rig.trip("a")
+        (self.rig.fake / "features-touches-local-config").write_text("")
+        code, out, _, _, _ = self.go(slug)
+        self.assertEqual(1, code)
+        self.failed_at_switches(slug, out)
+        self.assertIn("local trip.config.json changed", out)
+
+    def test_a_site_that_is_not_healthy_after_the_restart_fails_the_step(self):
+        slug = self.rig.trip("a", site_ok=False)
+        code, out, _, _, _ = self.go(slug)
+        self.assertEqual(1, code)
+        self.failed_at_switches(slug, out)
+        self.assertIn("/api/health", out)
+
+    def test_a_failed_read_of_the_switches_fails_the_step_and_does_not_write_an_empty_block(self):
+        # The provision's posture (fail to "every switch off") is not this step's: a live trip would silently lose features.
+        slug = self.rig.trip("a")
+        self.rig.sql.run("ALTER FUNCTION control_plane.feature_enabled(text, text) RENAME TO feature_enabled_gone")
+        try:
+            code, out, _, _, _ = self.go(slug)
+        finally:
+            self.rig.sql.run("ALTER FUNCTION control_plane.feature_enabled_gone(text, text) RENAME TO feature_enabled")
+        self.assertEqual(1, code)
+        self.failed_at_switches(slug, out)
+        self.assertIn("could not be read from the control plane", out)
+        self.assertEqual([], self.rig.log("features.log"), "the command never ran")
+        self.assertEqual({"left_over_from_before": True}, self.rig.live_config(slug)["features"])
+
+    def test_a_failed_switches_step_after_a_good_site_step_leaves_the_site_recorded_and_says_where_it_stopped(self):
+        slug = self.rig.trip("a")
+        (self.rig.fake / "fail-features").write_text("")
+        code, out, _, _, _ = self.go(slug, steps="site,switches")
+        self.assertEqual(1, code)
+        self.assertIn("site ok", out)
+        self.failed_at_switches(slug, out)
+        self.assertEqual(self.rig.r2, self.rig.trip_state(slug)["current_release_id"], "the site step succeeded and is recorded")
+
+    def test_a_trip_that_no_longer_has_a_running_site_is_refused_before_anything_is_written(self):
+        slug = self.rig.trip("a")
+        path, digest = self.planned([slug], steps="switches")
+        self.rig.sql.run("UPDATE control_plane.trips SET lifecycle_state = 'draft' WHERE slug = :'slug'", slug=slug)
+        code, out, _ = self.rig.execute(path, digest)
+        self.assertEqual(1, code)
+        self.assertIn("REFUSED", out)
+        self.assertEqual([], self.rig.log("features.log"))
 
 
 if __name__ == "__main__":

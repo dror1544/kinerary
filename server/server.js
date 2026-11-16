@@ -18,7 +18,7 @@ const { createControlPlaneAuth } = require('./control-plane-auth');
 const { NEED_TYPES, NEED_SEVERITIES, VISIBILITIES, normalizeSeverity, normalizeVisibility } = require('../shared/needs-schema');
 const { AGENT_TONES, AGENT_GENDERS, PROACTIVE_KEYS, normalizeInstructionVisibility, normalizeTone, normalizeGender, normalizeOrganizers } = require('../shared/agent-schema');
 const { repairDayStamp, stampRest } = require('../shared/day-stamp');
-const { projectConfig, publicConfig, publicPart } = require('../shared/config-visibility');
+const { projectConfig, publicConfig, publicPart, featureEntries, makeFeatureOn } = require('../shared/config-visibility');
 const { publicUser } = require('./public-user');
 const textRules = require('./text-rules');
 const { rateLimitKey } = require('./client-address');
@@ -183,6 +183,16 @@ try {
   TRIP_CONFIG = JSON.parse(TRIP_CONFIG_RAW);
   console.log(`Loaded trip config: ${TRIP_CONFIG.meta?.title || '(untitled)'}`);
 } catch (e) { console.error('trip.config.json not found:', e.message); }
+
+// Per-trip feature switches (issue #567 S2): the control plane writes a `features`
+// block into trip.config.json at provision and at rollout. THIS is the one place the
+// raw block is read; every server-side gate asks `featureOn('<name>')`, which is on
+// only for a name the registry (shared/feature-switches.js) holds whose value in the
+// file is the literal `true`. Never read the raw block anywhere else — that
+// would skip the registry check. The site reads the file once at boot, so a change
+// reaches a running site at the next rollout.
+const FEATURES_IN_FILE = TRIP_CONFIG.features;
+const featureOn = makeFeatureOn(FEATURES_IN_FILE, console);
 
 // Diagnostic only — malformed needs entries are logged, never fatal, so a
 // typo in one participant's config can't take the whole trip site down.
@@ -877,10 +887,31 @@ function sanitizeConfig(cfg) {
 // /api/config/warnings, which every authed member can read, gets a count only,
 // because a key name is itself authored config text.
 (() => {
-  const { dropped } = projectConfig(TRIP_CONFIG);
-  if (!dropped.length) return;
-  console.warn(`trip.config.json: ${dropped.length} field(s) not on the served allow-list (shared/config-visibility.js) — withheld from every client: ${dropped.join(', ')}`);
-  CONFIG_WARNINGS.push({ scope: 'config', issue: `${dropped.length} config field(s) are not on the served allow-list and are withheld from the site (field names in the server log)` });
+  // `features.*` entries are reported separately below, with the reason: "not a
+  // registered switch" and "not the literal true" are not "not on the allow-list".
+  // Exact, not by path prefix: the config WITHOUT its `features` key is projected, so a
+  // top-level key that merely spells like one of the node's paths ("features.x") is still
+  // an unknown field, logged and counted like any other.
+  const { features: _featuresNode, ...withoutFeatures } = TRIP_CONFIG;
+  const { dropped: others } = projectConfig(withoutFeatures);
+  if (!others.length) return;
+  console.warn(`trip.config.json: ${others.length} field(s) not on the served allow-list (shared/config-visibility.js) — withheld from every client: ${others.join(', ')}`);
+  CONFIG_WARNINGS.push({ scope: 'config', issue: `${others.length} config field(s) are not on the served allow-list and are withheld from the site (field names in the server log)` });
+})();
+
+// A `features` entry that is not honoured is named ONCE, here, at boot — by path and
+// reason, never by value. The server log is organizer-only by definition; the API
+// gets a count only, because a switch name is authored text and the name of an
+// unreleased feature is itself withheld. A registered switch that is on but not
+// member-visible is NOT a problem and is not reported: it is served to nobody, and
+// saying so would be the tell the allow-list exists to avoid.
+(() => {
+  const { problems } = featureEntries(FEATURES_IN_FILE);
+  if (!problems.length) return;
+  for (const p of problems) {
+    console.warn(`trip.config.json: ${JSON.stringify(p.path)} ${p.reason} — not served`);
+  }
+  CONFIG_WARNINGS.push({ scope: 'config', issue: `${problems.length} features entr${problems.length === 1 ? 'y is' : 'ies are'} not honoured (unregistered name or a value that is not true; details in the server log)` });
 })();
 
 app.get('/api/config', authRequired, (_req, res) => {
