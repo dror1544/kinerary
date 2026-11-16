@@ -26,6 +26,26 @@ function originOf(value: string, ctx: z.RefinementCtx): string {
   return origin;
 }
 
+/**
+ * One entry of `web.runtime_upstream_allowed_hosts`: an exact hostname, an IPv4 address, or an IPv4 CIDR
+ * block (`10.0.0.0/16`). IPv6 is not supported: an IPv6 entry is refused at load rather than ignored, and
+ * a CIDR prefix shorter than /8 is refused because it would allow most of the address space. Lower-cased.
+ */
+const upstreamAllowedHost = z.string().trim().min(1).max(253).transform((value) => value.toLowerCase()).superRefine((value, ctx) => {
+  const cidr = /^(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})$/.exec(value);
+  const address = cidr?.[1] ?? value;
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(address)) {
+    if (!address.split(".").every((octet) => Number(octet) <= 255 && String(Number(octet)) === octet)) ctx.addIssue({ code: "custom", message: `${value} is not a dotted-quad IPv4 address` });
+    else if (cidr && (Number(cidr[2]) < 8 || Number(cidr[2]) > 32)) ctx.addIssue({ code: "custom", message: `${value}: the CIDR prefix must be between /8 and /32` });
+    return;
+  }
+  if (value.includes(":") || value.includes("/")) {
+    ctx.addIssue({ code: "custom", message: `${value}: only exact hostnames, IPv4 addresses and IPv4 CIDR blocks are supported` });
+    return;
+  }
+  if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/.test(value)) ctx.addIssue({ code: "custom", message: `${value} is not a hostname` });
+});
+
 export const GOOGLE_CLIENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*\.apps\.googleusercontent\.com$/;
 
 /** A key the profile used to carry, now refused with the instruction instead of a bare "unrecognized key". */
@@ -141,6 +161,14 @@ export const architectureProfileSchema = z.object({
     google_client_secret_ref: removedGoogleField("google_client_secret_ref"),
     runtime_exchange_key_secret_ref: secretReference,
     runtime_upstream_host_suffixes: z.array(z.string().min(1).max(253).regex(/^[A-Za-z0-9.-]+$/)).min(1),
+    /**
+     * Where the host-mode route lookup (`GET /internal/runtime-routes/by-host/:host`) may send the gateway:
+     * exact hostnames, IPv4 addresses and IPv4 CIDR blocks (IPv6 is not supported), matched against the
+     * registered upstream's host. ABSENT or empty allows nothing, so that endpoint answers 503
+     * RUNTIME_ROUTE_INVALID for every host until an operator names the addresses trips live at. Separate from
+     * `runtime_upstream_host_suffixes`, which the per-trip-id endpoint keeps using unchanged.
+     */
+    runtime_upstream_allowed_hosts: z.array(upstreamAllowedHost).max(256).optional(),
     telegram_bot_username: z.string().regex(/^[A-Za-z0-9_]{5,32}$/),
     /**
      * The token of the bot whose Mini App signs people in. OPTIONAL, and absent

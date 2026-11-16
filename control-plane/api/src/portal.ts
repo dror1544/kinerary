@@ -37,6 +37,34 @@ function exchangeKeyMatches(supplied: unknown, expected: string): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+/**
+ * Is the registered upstream's host one the operator named in `web.runtime_upstream_allowed_hosts`?
+ * Entries are exact hostnames, IPv4 addresses and IPv4 CIDR blocks (config.ts); an absent or empty list
+ * allows nothing. `hostname` is `URL.hostname`, which has already canonicalised an IPv4 spelling such as
+ * `0x7f.1`; an IPv6 literal (bracketed) matches nothing.
+ */
+export function upstreamHostAllowed(hostname: string, allowed: readonly string[] | undefined): boolean {
+  if (!allowed?.length) return false;
+  const host = hostname.toLowerCase();
+  const ipv4 = (value: string): number | null => {
+    const parts = value.split(".");
+    if (parts.length !== 4 || !parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255)) return null;
+    return ((Number(parts[0]) << 24) | (Number(parts[1]) << 16) | (Number(parts[2]) << 8) | Number(parts[3])) >>> 0;
+  };
+  const address = ipv4(host);
+  for (const raw of allowed) {
+    const entry = raw.toLowerCase();
+    if (entry === host) return true;
+    const slash = entry.indexOf("/");
+    if (slash === -1 || address === null) continue;
+    const base = ipv4(entry.slice(0, slash)), bits = Number(entry.slice(slash + 1));
+    if (base === null || !Number.isInteger(bits) || bits < 0 || bits > 32) continue;
+    const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+    if (((address & mask) >>> 0) === ((base & mask) >>> 0)) return true;
+  }
+  return false;
+}
+
 function opaque(prefix: string, bytes = 16): string {
   return `${prefix}_${randomBytes(bytes).toString("hex")}`;
 }
@@ -319,6 +347,8 @@ export interface PortalDependencies {
   runtimeOrigin: string;
   runtimeExchangeKey: string;
   runtimeUpstreamHostSuffixes: readonly string[];
+  /** `web.runtime_upstream_allowed_hosts`: what the host-mode lookup may return. Absent allows nothing. */
+  runtimeUpstreamAllowedHosts?: readonly string[];
   telegramBotUsername: string;
   sessionTtlSeconds: number;
   enrollmentTtlSeconds: number;
@@ -1958,5 +1988,30 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
       return reply.code(503).send({ error: "RUNTIME_ROUTE_INVALID" });
     }
     return { routeRef: row.route_ref, upstreamOrigin: upstream.origin, upstreamBasePath: upstream.pathname.replace(/\/$/, "") };
+  });
+
+  // The gateway's host mode asks "which trip is this Host?" (docs/runtime-session-exchange.md, "Host mode").
+  // The static `by-host` segment and the `:tripId` parameter cannot capture each other: this path has one more
+  // segment than that one, and a trip id that spelled "by-host" would still reach the other handler.
+  // Every "no" is the same 404 with the same body (no such host, not ready, no upstream, not a name), so the
+  // answer says nothing about which names exist. upstream_url is returned as an origin only, to the gateway,
+  // and only when its host is on the operator's allow-list.
+  app.get("/internal/runtime-routes/by-host/:host", async (request, reply) => {
+    if (!exchangeKeyMatches(request.headers["x-api-key"], deps.runtimeExchangeKey)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+    const notReady = () => reply.code(404).send({ error: "RUNTIME_NOT_READY" });
+    const host = String((request.params as { host?: string }).host ?? "").toLowerCase();
+    if (host.length > 253 || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(host)) return notReady();
+    const result = await deps.db.query<{ trip_id: string; route_ref: string; upstream_url: string }>(
+      `SELECT trip_id, route_ref, upstream_url FROM control_plane.runtime_routes
+       WHERE public_host = $1 AND state = 'ready' AND upstream_url IS NOT NULL`, [host]);
+    const row = result.rows[0];
+    if (!row) return notReady();
+    let upstream: URL;
+    try { upstream = new URL(row.upstream_url); } catch { return reply.code(503).send({ error: "RUNTIME_ROUTE_INVALID" }); }
+    if (!["http:", "https:"].includes(upstream.protocol) || upstream.username || upstream.password || upstream.pathname !== "/"
+      || upstream.search || upstream.hash || /[?#]/.test(row.upstream_url) || !upstreamHostAllowed(upstream.hostname, deps.runtimeUpstreamAllowedHosts)) {
+      return reply.code(503).send({ error: "RUNTIME_ROUTE_INVALID" });
+    }
+    return { tripId: row.trip_id, routeRef: row.route_ref, upstreamOrigin: upstream.origin };
   });
 }

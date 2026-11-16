@@ -188,7 +188,7 @@ if (profile.web) {
       miniAppLog(structuredLog("error", "email_auth.key_unresolved", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN", effect: "sign-up and password reset answer 503 SIGN_UP_UNAVAILABLE" }));
     }
   }
-  portal = { db: pool, google, telegramMiniApp, mailer, emailAuthLog: miniAppLog, runtimeAccounts: new HttpRuntimeAccountAdapter(profile.web.runtime_origin, runtimeExchangeKey), publicOrigin: profile.web.public_origin, runtimeOrigin: profile.web.runtime_origin, runtimeExchangeKey, runtimeUpstreamHostSuffixes: profile.web.runtime_upstream_host_suffixes, telegramBotUsername: profile.web.telegram_bot_username, sessionTtlSeconds: profile.web.session_ttl_seconds, enrollmentTtlSeconds: profile.signup?.enrollment_ttl_seconds ?? 86400, approvalTtlSeconds: 86400, operatorChatId };
+  portal = { db: pool, google, telegramMiniApp, mailer, emailAuthLog: miniAppLog, runtimeAccounts: new HttpRuntimeAccountAdapter(profile.web.runtime_origin, runtimeExchangeKey), publicOrigin: profile.web.public_origin, runtimeOrigin: profile.web.runtime_origin, runtimeExchangeKey, runtimeUpstreamHostSuffixes: profile.web.runtime_upstream_host_suffixes, runtimeUpstreamAllowedHosts: profile.web.runtime_upstream_allowed_hosts, telegramBotUsername: profile.web.telegram_bot_username, sessionTtlSeconds: profile.web.session_ttl_seconds, enrollmentTtlSeconds: profile.signup?.enrollment_ttl_seconds ?? 86400, approvalTtlSeconds: 86400, operatorChatId };
 }
 
 // The interviewer agent's chat-addressed interview routes, which the MCP

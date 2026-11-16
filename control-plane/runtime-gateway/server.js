@@ -314,9 +314,204 @@ async function proxy(req, res, tripId, suffix, session) {
   req.pipe(upstream);
 }
 
+// ---------------------------------------------------------------------------
+// Host mode (docs/runtime-session-exchange.md, "Host mode"; spec
+// docs/specs/sprint-9/x-wildcard-host-and-shared-bridge.md, R1).
+//
+// One wildcard name points at this gateway and the Host header picks the trip:
+// <label>.<TRIP_HOST_SUFFIX> is looked up in the control plane's registry
+// (GET /internal/runtime-routes/by-host/:host) and proxied, transparently, to
+// the upstream the registry holds for that exact name. Each trip is its own
+// origin, so Cookie, Authorization and Set-Cookie pass straight through: the
+// session cookie and launch flow above are not involved.
+//
+// OFF unless TRIP_HOST_SUFFIX is set. Unset, none of this code runs.
+// ---------------------------------------------------------------------------
+const DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+const TRIP_HOST_SUFFIX = (() => {
+  const raw = String(process.env.TRIP_HOST_SUFFIX ?? "").trim().toLowerCase().replace(/^\./, "");
+  if (!raw) return "";
+  // A malformed suffix is a configuration error, not a reason to quietly route nothing.
+  if (raw.length > 200 || !raw.split(".").every((label) => DNS_LABEL.test(label))) throw new Error("TRIP_HOST_SUFFIX must be a lowercase DNS name such as trips.example.org");
+  return raw;
+})();
+const RUNTIME_HOSTNAME = new URL(RUNTIME_ORIGIN).hostname.toLowerCase();
+const HOST_HIT_TTL_MS = 30_000;
+const HOST_MISS_TTL_MS = 5_000;
+const HOST_CACHE_MAX = 2000;
+// Once the whole request has been sent, how long the upstream may stay silent
+// before the answer is 502. Not a bound on uploads or streams: it starts at the
+// end of the request body and stops at the first response byte.
+const HOST_RESPONSE_TIMEOUT_MS = Math.max(50, Number(process.env.TRIP_HOST_RESPONSE_TIMEOUT_MS ?? 120_000) || 120_000);
+const hostRouteCache = new Map(); // host -> { route | null, expiresAt }
+const hostLookupsInFlight = new Map();
+// A fresh connection per request: a stale pooled socket would turn a photo upload into a 502.
+const hostHttpAgent = new http.Agent({ keepAlive: false });
+const hostHttpsAgent = new https.Agent({ keepAlive: false });
+const HOP_BY_HOP = new Set(["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"]);
+
+// null: not a host-mode request (today's handling). { valid: false }: under the
+// suffix but cannot be a trip (the bare suffix, a deeper name, not a DNS label).
+function hostModeFor(req) {
+  if (!TRIP_HOST_SUFFIX) return null;
+  const header = String(req.headers.host ?? "").toLowerCase();
+  if (!header || header.startsWith("[")) return null;
+  const name = header.replace(/:\d*$/, "");
+  if (name === RUNTIME_HOSTNAME) return null;
+  if (name === TRIP_HOST_SUFFIX) return { valid: false };
+  if (!name.endsWith(`.${TRIP_HOST_SUFFIX}`)) return null;
+  const label = name.slice(0, -(TRIP_HOST_SUFFIX.length + 1));
+  return DNS_LABEL.test(label) ? { valid: true, host: name } : { valid: false };
+}
+
+// The same small page for every name that is not a ready trip, so the gateway is
+// no oracle for which trips exist. Nothing the client sent is reflected.
+const HOST_NOT_FOUND_BODY = Buffer.from('<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Not found</title></head><body><p>There is nothing here.</p></body></html>');
+function hostNotFound(res) {
+  res.writeHead(404, { "content-type": "text/html; charset=utf-8", "content-length": HOST_NOT_FOUND_BODY.length, "cache-control": "no-store", "referrer-policy": "no-referrer", "x-content-type-options": "nosniff" });
+  res.end(HOST_NOT_FOUND_BODY);
+}
+
+// Is this request target under /api/internal/, however it is spelled? Express
+// (the trip site) matches case-insensitively and decodes percent-escapes, and a
+// proxy in front may collapse "//" and resolve dots, so every one of those is
+// applied here before looking. Returns "unreadable" for what cannot be decoded.
+function internalApiPath(target) {
+  const cut = target.search(/[?#]/);
+  let path = cut === -1 ? target : target.slice(0, cut);
+  let settled = false;
+  for (let round = 0; round < 4 && !settled; round += 1) {
+    let decoded;
+    // Only the first round can be unreadable. A later round failing means the
+    // path held an encoded "%" (a file called 100%.jpg), which is a real path.
+    try { decoded = decodeURIComponent(path); } catch { if (round === 0) return "unreadable"; settled = true; break; }
+    settled = decoded === path;
+    path = decoded;
+  }
+  if (!settled) return "unreadable";
+  const segments = [];
+  for (const raw of path.replace(/\\/g, "/").split("/")) {
+    const segment = raw.split(";")[0].toLowerCase();
+    if (segment === "" || segment === ".") continue;
+    if (segment === "..") { segments.pop(); continue; }
+    segments.push(segment);
+  }
+  return segments[0] === "api" && segments[1] === "internal";
+}
+
+function hostRouteFromBody(body) {
+  const origin = body?.upstreamOrigin;
+  if (typeof origin !== "string" || typeof body?.tripId !== "string") return null;
+  let url;
+  try { url = new URL(origin); } catch { return null; }
+  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.pathname !== "/" || url.search || url.hash) return null;
+  return { tripId: body.tripId, upstreamOrigin: url.origin };
+}
+
+async function lookUpHost(host) {
+  let response;
+  try {
+    response = await timedFetch(`${CONTROL_PLANE_ORIGIN}/internal/runtime-routes/by-host/${encodeURIComponent(host)}`, { headers: { "x-api-key": EXCHANGE_KEY } });
+  } catch { throw Object.assign(new Error("HOST_LOOKUP_UNAVAILABLE"), { statusCode: 503 }); }
+  if (response.status === 404) { await response.body?.cancel(); return null; }
+  if (!response.ok) { await response.body?.cancel(); throw Object.assign(new Error("HOST_LOOKUP_UNAVAILABLE"), { statusCode: 503 }); }
+  let body;
+  try { body = await response.json(); } catch { throw Object.assign(new Error("HOST_LOOKUP_UNAVAILABLE"), { statusCode: 503 }); }
+  const route = hostRouteFromBody(body);
+  if (!route) throw Object.assign(new Error("HOST_ROUTE_INVALID"), { statusCode: 502 });
+  return route;
+}
+
+// A route, or null for "no ready route for this name". Throws with a statusCode
+// when the registry cannot be asked or answered nonsense; that is never cached.
+async function hostRouteFor(host) {
+  const cached = hostRouteCache.get(host);
+  if (cached && cached.expiresAt > Date.now()) return cached.route;
+  let pending = hostLookupsInFlight.get(host);
+  if (!pending) {
+    pending = lookUpHost(host).then((route) => {
+      hostRouteCache.delete(host);
+      hostRouteCache.set(host, { route, expiresAt: Date.now() + (route ? HOST_HIT_TTL_MS : HOST_MISS_TTL_MS) });
+      if (hostRouteCache.size > HOST_CACHE_MAX) {
+        for (const [key, entry] of hostRouteCache) if (entry.expiresAt <= Date.now()) hostRouteCache.delete(key);
+        for (const key of hostRouteCache.keys()) { if (hostRouteCache.size <= HOST_CACHE_MAX) break; hostRouteCache.delete(key); }
+      }
+      return route;
+    }).finally(() => hostLookupsInFlight.delete(host));
+    hostLookupsInFlight.set(host, pending);
+  }
+  return pending;
+}
+
+function hostFailure(res, status) {
+  if (res.headersSent) return res.destroy();
+  const data = Buffer.from(JSON.stringify({ error: "RUNTIME_UNAVAILABLE" }));
+  // Close the connection: the request body may be unread, and it is not worth draining.
+  res.writeHead(status, { "content-type": "application/json", "content-length": data.length, "cache-control": "no-store", connection: "close" });
+  res.end(data);
+}
+
+function proxyToHost(req, res, host, route) {
+  const origin = new URL(route.upstreamOrigin);
+  const headers = {};
+  const named = String(req.headers.connection ?? "").toLowerCase().split(",").map((token) => token.trim()).filter(Boolean);
+  for (const [name, value] of Object.entries(req.headers)) if (!HOP_BY_HOP.has(name) && !named.includes(name)) headers[name] = value;
+  delete headers["x-forwarded-prefix"];
+  headers.host = req.headers.host; // unchanged: the trip sees the name the browser used
+  headers["x-forwarded-host"] = req.headers.host;
+  // The scheme of the public side. A client's own X-Forwarded-Proto is never believed.
+  headers["x-forwarded-proto"] = secureCookie ? "https" : "http";
+  const peer = req.socket.remoteAddress ?? "";
+  headers["x-forwarded-for"] = [req.headers["x-forwarded-for"], peer].filter(Boolean).join(", ");
+  const secure = origin.protocol === "https:";
+  const upstream = (secure ? https : http).request({ protocol: origin.protocol, hostname: origin.hostname, port: origin.port || undefined, method: req.method, path: req.url, headers, agent: secure ? hostHttpsAgent : hostHttpAgent });
+  let connectTimer = null, responseTimer = null;
+  const clearTimers = () => { clearTimeout(connectTimer); clearTimeout(responseTimer); };
+  upstream.on("socket", (socket) => {
+    if (!socket.connecting) return;
+    connectTimer = setTimeout(() => upstream.destroy(new Error("UPSTREAM_CONNECT_TIMEOUT")), UPSTREAM_TIMEOUT_MS);
+    socket.once("connect", () => clearTimeout(connectTimer));
+  });
+  upstream.on("finish", () => { responseTimer = setTimeout(() => upstream.destroy(new Error("UPSTREAM_RESPONSE_TIMEOUT")), HOST_RESPONSE_TIMEOUT_MS); });
+  upstream.on("response", (upstreamResponse) => {
+    clearTimers();
+    const out = {};
+    const hopNamed = String(upstreamResponse.headers.connection ?? "").toLowerCase().split(",").map((token) => token.trim()).filter(Boolean);
+    for (const [name, value] of Object.entries(upstreamResponse.headers)) if (!HOP_BY_HOP.has(name) && !hopNamed.includes(name)) out[name] = value;
+    res.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.statusMessage, out);
+    upstreamResponse.pipe(res);
+    upstreamResponse.on("error", () => res.destroy());
+    upstreamResponse.on("close", () => { if (!upstreamResponse.complete) res.destroy(); });
+  });
+  upstream.on("error", () => { clearTimers(); console.error(`runtime_gateway.host_upstream_unavailable: host=${host}`); hostFailure(res, 502); });
+  // A closed browser must release the upstream, whether it was uploading or holding a stream open.
+  res.on("close", () => { clearTimers(); upstream.destroy(); });
+  req.on("error", () => upstream.destroy());
+  req.pipe(upstream);
+}
+
+async function handleHostMode(req, res, mode) {
+  if (!mode.valid) return hostNotFound(res);
+  if (typeof req.url !== "string" || !req.url.startsWith("/")) return json(res, 400, { error: "BAD_REQUEST" });
+  // Before any lookup, so a known trip and an unknown name answer identically.
+  const internal = internalApiPath(req.url);
+  if (internal === "unreadable") return json(res, 400, { error: "BAD_REQUEST" });
+  if (internal) return hostNotFound(res);
+  let route;
+  try { route = await hostRouteFor(mode.host); }
+  catch (error) {
+    console.error(`runtime_gateway.host_lookup_failed: host=${mode.host} status=${error?.statusCode ?? 503}`);
+    return hostFailure(res, error?.statusCode === 502 ? 502 : 503);
+  }
+  if (!route) return hostNotFound(res);
+  return proxyToHost(req, res, mode.host, route);
+}
+
 export function createRuntimeGateway() {
   return http.createServer(async (req, res) => {
     try {
+      const hostMode = hostModeFor(req);
+      if (hostMode) return await handleHostMode(req, res, hostMode);
       const url = new URL(req.url, RUNTIME_ORIGIN);
       if (url.pathname === "/health") return json(res, 200, { ok: true });
       const internal = url.pathname.match(/^\/internal\/t\/([^/]+)\/participants$/);

@@ -255,6 +255,66 @@ dashboard link is never persisted; the proxied responses keep the trip's
 HTML/SVG/JS-as-`octet-stream` rules, and the gateway adds `frame-ancestors
 'none'` (and `X-Frame-Options: DENY`) because nothing frames the trip any more.
 
+## Host mode: a trip by its own hostname
+
+Spec: `docs/specs/sprint-9/x-wildcard-host-and-shared-bridge.md` (R1). Everything
+in this section is **off** unless the gateway has `TRIP_HOST_SUFFIX` set; unset,
+the gateway behaves exactly as described above and none of this code runs.
+
+With `TRIP_HOST_SUFFIX=<suffix>` a request whose `Host` (lower-cased, port
+removed) is exactly one DNS label under the suffix, and is not `RUNTIME_ORIGIN`'s
+own host, is routed **by host**. The bare suffix, a deeper name and a name that
+is not a valid label are answered 404 with no lookup. Every other host keeps the
+`/t/<trip_id>/` handling above. A deployment points one wildcard name at the
+gateway; no per-trip record is needed.
+
+**Registry.** The gateway asks the control plane
+`GET /internal/runtime-routes/by-host/<host>` (exchange key in `x-api-key`, the
+same as the lookups above). It reads `control_plane.runtime_routes`
+(`public_host`, `upstream_url`, added by `20261116120000_runtime_route_hosts.sql`;
+both are nullable, and a row without them behaves exactly as before) and answers
+`{ tripId, routeRef, upstreamOrigin }` for a row in state `ready` with that host
+and an upstream. Every other case is `404 RUNTIME_NOT_READY` with one body (no
+such host, not ready, no upstream, not a name). The upstream must be `http:` or
+`https:`, with no credentials, path, query or fragment, and its host must be in
+`web.runtime_upstream_allowed_hosts` in the API's profile: exact hostnames, IPv4
+addresses and IPv4 CIDR blocks (no IPv6; a prefix shorter than /8 is refused at
+load). An empty or absent list allows nothing, and then the answer is
+`503 RUNTIME_ROUTE_INVALID`. `GET /internal/runtime-routes/<trip_id>` and
+`runtime_upstream_host_suffixes` are unchanged. The gateway checks the answer
+again and proxies only to the origin returned for that exact host.
+
+**Transparent proxy.** Each trip hostname is its own origin, so the gateway adds
+and removes no credential: method, path, query, body, `Cookie`, `Authorization`
+and `Host` reach the trip unchanged, and the status, headers (`Set-Cookie`
+included) and body come back unchanged. The gateway adds `X-Forwarded-Host`,
+`X-Forwarded-Proto` (the scheme of `RUNTIME_ORIGIN`; a client's own value is
+never believed) and an `X-Forwarded-For` that ends with the peer address, and
+removes a client-sent `X-Forwarded-Prefix` and the hop-by-hop headers. Bodies
+are streamed in both directions and never buffered, so a photo upload larger
+than the gateway's JSON limits goes straight through; a `text/event-stream`
+response streams, and closing the browser side closes the upstream. The trip
+site does not use WebSocket upgrades (nothing in `server/` or `site/` does), so
+none are proxied. `/api/internal/*` on a trip host is 404 in any spelling
+(case, percent-encoding, `//`, dot segments) and is refused before the lookup.
+
+**Failure and caching.** A name with no ready route gets one small 404 page,
+identical for every such name, `cache-control: no-store`. A miss is cached for
+5 seconds and a hit for 30 (so tearing a trip down is seen within 30 seconds).
+A control plane that cannot be asked is 503, an answer that fails the checks
+above or an upstream that cannot be reached is 502, and failures are not cached.
+Per-connection timeouts: `RUNTIME_UPSTREAM_TIMEOUT_MS` bounds the control-plane
+call and the connection to the upstream; `TRIP_HOST_RESPONSE_TIMEOUT_MS`
+(default 120000) bounds the wait for the upstream's first byte *after* the
+request has been fully sent.
+
+Gateway environment: `TRIP_HOST_SUFFIX` (a lower-case DNS name such as
+`trips.example.org`; a malformed value stops the gateway at start) and the
+optional `TRIP_HOST_RESPONSE_TIMEOUT_MS`. Covered by
+`control-plane/runtime-gateway/test/host-mode.test.js` and
+`host-mode-off.test.js`, and, on the control-plane side, by
+`control-plane/api/test/runtime-route-hosts.test.ts`.
+
 ## Classic, Modern, and logout
 
 Both interfaces call the same authenticated endpoints and see the same
