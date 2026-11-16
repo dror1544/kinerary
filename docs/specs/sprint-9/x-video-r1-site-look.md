@@ -1,6 +1,6 @@
 # Video Release 1, parts 1A and 1B: the trip site looks like the video, and updates are obvious on it
 
-Status: draft for approval (2026-11-16) · Issue: none yet (`x-` until filed) · Track: video plan, Release 1 · Size: L (two slices) · Tier: High
+Status: approved (2026-11-16, by Dror: the four open questions answered, recommendations 1, 3, 4 taken, tabs at the bottom) · Issue: none yet (`x-` until filed) · Track: video plan, Release 1 · Size: L (two slices) · Tier: High
 Security path: yes (new member-visible data on `/api/itinerary/active` and `/api/today`; two entries in `shared/feature-switches.js`) · Migration: no · Live-trip behaviour: no, until a switch is turned on for a trip
 
 Decision behind it: the approved plan "Make Kinerary match the marketing video" (Dror, 2026-11-14),
@@ -89,8 +89,9 @@ landing page (1E) and is not used here.
 - On the end side, the signed-in user's avatar and a **More** button. More opens the existing menu
   (`AppMenu`, `App.tsx:2584-2683`), which gains the modules that are no longer tabs.
 
-**Tabs.** **Today · Plan · Bookings · Photos**, as pills in one row directly under the header that stays
-in view on scroll (see Open question 2).
+**Tabs.** **Today · Plan · Bookings · Photos**, in the bottom bar where today's site already puts its
+tabs (decision 11: easier to reach with a thumb than the video's pills under the header). The bar keeps
+today's position and behaviour; only its four entries change.
 
 - **Plan** is Journey renamed, with the SmarTrip structure listed below.
 - **Bookings** is the existing bookings module.
@@ -142,7 +143,7 @@ or "יום חמישי · דרך היין".
 
 - Hebrew sets `dir="rtl"` as today (`App.tsx:2711-2714`). Times and the struck-through old time are
   isolated left-to-right inside right-to-left text, so "19:00" never renders as "00:19".
-- At 880px and wider (`styles.css:853`) the pill tabs sit in the header. Today keeps its two columns,
+- At 880px and wider (`styles.css:853`) the tabs sit where today's desktop layout puts them. Today keeps its two columns,
   with the day card first and the panels beside it (`styles.css:94`).
 - The phone layout is the one specified, and is checked at 390px wide.
 
@@ -168,7 +169,7 @@ migration:
   no marker.
 - **When.** `at` is the `created_at` of the newest version in the window that changed that item.
 
-**The window.** It is 24 hours (Open question 1).
+**The window.** It is a plain 24 hours (decision 10): a change made at 22:00 to today's dinner is still marked at breakfast. Markers are not cleared at the start of a trip day.
 
 **What the page shows.**
 
@@ -285,6 +286,11 @@ Verification (from the approved plan)
   report in the notes vault, never in the repository (hard rule 3).
 - AC-27 Given that page open, when dinner is changed 20:00 → 19:00 through the trip's connector, then
   the row turns coral with 20:00 struck through, as AC-21; changing it back removes the marker (AC-15).
+
+- AC-28 Given a signed-in member (not an organizer, not the agent key), when they request
+  `/api/itinerary/active`, `/api/today` or any route serving plan items, then no item carries
+  `created_by`; given an organizer or the agent key, then it is served as today. Proven with real
+  request/response pairs in the boundary review.
 
 ## Contracts
 
@@ -403,8 +409,9 @@ when `featureOn('plan_change_marks')`):
 - **Pre-existing, found while writing this spec:** served plan items already carry `created_by`. For an
   item added through the site it is the adder's username (`living-journey.js:1508, 1751`). `publicItem`
   removes only `keep_both_with` (`living-journey.js:54-58`), so a member can already see who *added* an
-  item. This spec adds nothing to that. Whether to drop `created_by` from the member projection here is
-  Open question 3.
+  item. **This spec removes it** (decision 12): `publicItem` drops `created_by` for every caller that is
+  not organizer-or-agent, on `/api/itinerary/active`, `/api/today` and every route that serves plan items
+  through it (AC-28). No member-facing renderer reads it.
 - **No organizer-only data through the marker.**
   - `fields` is a closed list of columns a member already sees on the item itself.
   - `previous_time` and `previous_date` are earlier values of fields the member could read in that
@@ -484,7 +491,7 @@ Taken by Dror, 2026-11-14, and carried here:
    landing backdrop only.
 5. "Recently changed" is derived from plan versions, with no migration.
 
-Proposed in this draft, not yet approved:
+Proposed in the draft and approved with it (Dror, 2026-11-16):
 
 6. Two switches, not one, so 1A can ship without 1B if 1B's boundary review runs late.
 7. The Go chip goes straight to Google Maps, with Waze in the row's detail. A choice sheet on every tap
@@ -493,19 +500,13 @@ Proposed in this draft, not yet approved:
 9. Coral is reserved for change. The Updated badge is ink text on a coral tint with a coral edge, because
    white on #f26b3a falls below 4.5:1. New is a coral outline.
 
+Answered by Dror, 2026-11-16 (were the open questions):
+
+10. **The window is a plain 24 hours.** Markers are not cleared each morning.
+11. **Tabs stay in the bottom bar on phones, as today.** Not the video's pills under the header.
+12. **Members stop receiving `created_by`** in this work (AC-28).
+13. **If #567 S2 is not merged by about 28 November, 1A/1B are held for Alsace.** No one-off unswitched build.
+
 ## Open questions
 
-1. **What does the window mean?** The plan says "24 hours, or since the start of the trip day". The
-   trip-day start is always within the last 24 hours, so "or" only changes anything if the intent is to
-   *clear* markers at the start of each trip day. Recommendation: a plain 24 hours, so last night's
-   22:00 change to today's dinner is still marked at breakfast.
-2. **Where do the tabs go on phones?** The video shows pills under the header. SmarTrip and today's
-   site use a bottom bar, which is easier to reach with a thumb. Recommendation: pills under the header,
-   sticky, as the video shows, because the video is the promise.
-3. **Should `created_by` stop being served to members** in this work (`publicItem`,
-   `living-journey.js:54-58`)? Today it already tells a member who added an item through the site.
-   Recommendation: yes, here. It is the same boundary this spec is promising to keep, and no member-facing
-   renderer reads it.
-4. **What if #567 S2 is not merged by about 28 November?** Alsace then has no way to read a switch.
-   Recommendation: hold 1A/1B for Alsace rather than ship them unswitched. The alternative is a one-off
-   build for that trip, which is exactly what the switches were built to stop.
+None open.
