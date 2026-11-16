@@ -21,6 +21,10 @@ def _required_env(name: str) -> str:
     return value
 
 
+def _optional_env(name: str) -> str:
+    return os.environ.get(name) or ""
+
+
 def safe_failure_message(exc: BaseException) -> str:
     """Describe an unexpected failure without echoing driver text.
 
@@ -99,6 +103,26 @@ def _reconcile_mode(raw: str) -> str:
     if value not in MODES:
         raise argparse.ArgumentTypeError(f"must be one of {', '.join(MODES)}: {raw!r}")
     return value
+
+
+def _choice_of(name: str, allowed: tuple[str, ...]) -> Callable[[str], str]:
+    """An exact, lower-case member of `allowed`. An empty value means the
+    variable was passed through unset (compose's `${NAME:-}`) and is the
+    default; anything else that is not exactly a member REFUSES at startup. A
+    typo that quietly became `host` would leave the operator believing new
+    trips were being built without per-trip DNS and proxy records, and one that
+    became `wildcard` would stop creating the records existing hostnames need."""
+    def parse(raw: str) -> str:
+        if raw == "":
+            return allowed[0]
+        if raw not in allowed:
+            raise argparse.ArgumentTypeError(f"{name} must be exactly one of {', '.join(allowed)}: {raw!r}")
+        return raw
+    return parse
+
+
+TRIP_ROUTINGS = ("host", "wildcard")
+TRIP_MCP_BRIDGES = ("per_trip", "shared")
 
 
 def _add_companion_ssh_arguments(parser: argparse.ArgumentParser) -> None:
@@ -210,6 +234,24 @@ def build_parser() -> argparse.ArgumentParser:
                                 "CLOUDFLARE_ZONE_ID/CLOUDFLARE_API_TOKEN, and "
                                 "PROVISIONER_LXC_IP_POOL/PROVISIONER_LXC_HOSTNAME_DOMAIN/PROVISIONER_LXC_TUNNEL_ID "
                                 "(PROVISIONER_COMPUTE_ENABLED=1)")
+    # How a NEW trip's public hostname reaches its container. `host` (default):
+    # one NPM proxy host, one Cloudflare DNS record and one tunnel ingress rule
+    # per trip - the only behaviour that existed before this flag. `wildcard`:
+    # none of those; the operator's wildcard record sends every trip hostname
+    # to the runtime gateway and the worker records the trip's hostname and LAN
+    # address in runtime_routes. Trips that already have a topology.yaml keep
+    # what it says whichever this is. Compose passes `${TRIP_ROUTING:-}`, so an
+    # unset variable arrives as "" and means `host`.
+    provision.add_argument("--trip-routing", type=_choice_of("TRIP_ROUTING", TRIP_ROUTINGS),
+                           default=os.environ.get("TRIP_ROUTING") or "host",
+                           help="host (default) | wildcard — see above (TRIP_ROUTING)")
+    # Where the trip-mcp bridge runs. `per_trip` (default): one process per trip
+    # on a port derived from its vmid, as always. `shared`: one bridge serves
+    # every trip, so a vmid that gives no sane port no longer stops the worker
+    # asking for a bridge. The request the worker sends is the same either way.
+    provision.add_argument("--trip-mcp-bridge", type=_choice_of("TRIP_MCP_BRIDGE", TRIP_MCP_BRIDGES),
+                           default=os.environ.get("TRIP_MCP_BRIDGE") or "per_trip",
+                           help="per_trip (default) | shared (TRIP_MCP_BRIDGE)")
     provision.add_argument("--poll-seconds", type=float, default=10.0)
     # Issue #119. ON by default, like the bridge itself: a bridge that stops
     # reaching its trip after provisioning is otherwise found by an organizer,
@@ -334,6 +376,11 @@ def main(argv: list[str] | None = None) -> int:
             from .runtime import read_secret_file
             db_url = read_secret_file(args.database_url_file)
             _warn_if_retired_seed_password_is_set()
+            # Said at every start, because both are chosen by an environment
+            # variable and neither shows in a conversation: `wildcard` means a
+            # new trip gets no DNS record or proxy host, `shared` means the
+            # trip-mcp bridge is not this worker's to start.
+            print(f"trip routing: {args.trip_routing}; trip-mcp bridge: {args.trip_mcp_bridge}", flush=True)
             # Off by default: an unconfigured deployment keeps the pre-Phase-G
             # behavior exactly (a slug missing from --vmid-map fails loudly
             # instead of a real LXC/NPM/Cloudflare create happening).
@@ -341,7 +388,13 @@ def main(argv: list[str] | None = None) -> int:
                 ip_pool = json.loads(_required_env("PROVISIONER_LXC_IP_POOL"))
                 if not isinstance(ip_pool, list) or not ip_pool:
                     raise ValueError("PROVISIONER_LXC_IP_POOL must be a non-empty JSON array of IPv4 addresses")
-                if not os.environ.get("NPM_API_TOKEN") and not (
+                # The public-infrastructure variables are required only where a
+                # new trip creates public infrastructure: `host` routing. In
+                # `wildcard` they may all be unset - and a worker that does
+                # still carry them keeps being able to re-provision the host-
+                # routed trips that exist (compute._build_provisioner).
+                host_routing = args.trip_routing == "host"
+                if host_routing and not os.environ.get("NPM_API_TOKEN") and not (
                     os.environ.get("NPM_IDENTITY") and os.environ.get("NPM_SECRET")
                 ):
                     raise ValueError(
@@ -356,16 +409,16 @@ def main(argv: list[str] | None = None) -> int:
                     bridge=_required_env("PROXMOX_BRIDGE"),
                     ip_pool=ip_pool,
                     hostname_domain=_required_env("PROVISIONER_LXC_HOSTNAME_DOMAIN"),
-                    tunnel_id=_required_env("PROVISIONER_LXC_TUNNEL_ID"),
-                    npm_url=_required_env("NPM_URL"),
+                    tunnel_id=(_required_env if host_routing else _optional_env)("PROVISIONER_LXC_TUNNEL_ID"),
+                    npm_url=(_required_env if host_routing else _optional_env)("NPM_URL"),
                     # NPM tokens expire in ~1 day. Prefer identity/secret so the
                     # worker mints a fresh token per job (compute._mint_npm_token);
                     # a static NPM_API_TOKEN still works but goes stale.
                     npm_api_token=os.environ.get("NPM_API_TOKEN", ""),
                     npm_identity=os.environ.get("NPM_IDENTITY", ""),
                     npm_secret=os.environ.get("NPM_SECRET", ""),
-                    cloudflare_zone_id=_required_env("CLOUDFLARE_ZONE_ID"),
-                    cloudflare_api_token=_required_env("CLOUDFLARE_API_TOKEN"),
+                    cloudflare_zone_id=(_required_env if host_routing else _optional_env)("CLOUDFLARE_ZONE_ID"),
+                    cloudflare_api_token=(_required_env if host_routing else _optional_env)("CLOUDFLARE_API_TOKEN"),
                     # Proxmox itself and the RPi4 that runs cloudflared —
                     # confirmed live (2026-08-25) at these defaults; override
                     # via env only if either box ever changes. No Proxmox API
@@ -388,6 +441,7 @@ def main(argv: list[str] | None = None) -> int:
                     control_plane_exchange_key=os.environ.get("CONTROL_PLANE_EXCHANGE_KEY", ""),
                     nfs_host_base=os.environ.get("PROVISIONER_NFS_HOST_BASE", "/mnt/pve/truenas-nfs"),
                     nfs_mount_base=os.environ.get("PROVISIONER_NFS_MOUNT_BASE", "/nfs"),
+                    routing=args.trip_routing,
                 )
             else:
                 compute_adapter = NullComputeAdapter()
@@ -458,7 +512,10 @@ def main(argv: list[str] | None = None) -> int:
             elif args.companion_templates_dir:
                 companion_adapter = RenderProfileAdapter(templates_dir=args.companion_templates_dir)
                 mcp_bridge_adapter = (
-                    ShellMcpBridgeAdapter(deploy_root=args.deploy_root, vmid_map=vmid_map)
+                    ShellMcpBridgeAdapter(
+                        deploy_root=args.deploy_root, vmid_map=vmid_map,
+                        shared_bridge=args.trip_mcp_bridge == "shared",
+                    )
                     if args.enable_mcp_bridge else NullMcpBridgeAdapter()
                 )
             else:

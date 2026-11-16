@@ -26,11 +26,20 @@ found a step that quietly undoes itself. This is that run's order, as a command:
                 a killed pid) and delete its plist; then stop this trip's
                 trip-mcp, by its pid file, after checking the pid really is
                 the listener on this trip's port
+  4b. bridge route  when KINERARY_SHARED_BRIDGE_ROUTES_DIR is set and holds
+                <slug>.json as a regular file: delete that one file (the shared
+                trip-mcp bridge's route for this trip, which another process
+                owns; a symlink of that name is left alone)
   5. infra      Cloudflare DNS + ingress rule, NPM host, LXC — through the
                 worker's own provisioner (LxcProvisionAdapter), outside-in, so
-                auth and adapters are exactly provisioning's
+                auth and adapters are exactly provisioning's. A topology with
+                no `npm:` / `cloudflare:` section (wildcard routing) has no such
+                step; one that has the section gets it, whatever `routing` says
   6. database   revoke any still-live group-binding token FIRST (issue #175),
                 then close chat bindings (closed_reason 'trip_destroyed'),
+                clear the gateway route (runtime_routes: no public_host, no
+                upstream_url, state 'suspended' — the gateway then answers the
+                name with the 404 of a name that never existed),
                 then slug -> retired-<slug>-<yyyymmdd>, which frees the slug —
                 the revoke-first order avoids a real deadlock against a
                 concurrent redemption; see REVOKE_GROUP_TOKENS's comment
@@ -230,6 +239,10 @@ def reference_topology(raw: dict, orig: str) -> dict:
         host = out.get(section, {}).get("hostname", "")
         if host.startswith(f"{orig}."):
             out[section]["hostname"] = ref + host[len(orig):]
+    # A wildcard topology keeps its hostname here instead (no npm: section).
+    own = lxc.get("public_hostname", "")
+    if isinstance(own, str) and own.startswith(f"{orig}."):
+        lxc["public_hostname"] = ref + own[len(orig):]
     out["reference"] = {"of": orig, "kept": f"{datetime.now():%Y-%m-%d}",
                         "note": "a kept site, not a live trip: no DNS, no NPM host, no companion"}
     return out
@@ -468,8 +481,30 @@ def bridge(trip_dir: Path) -> tuple[str, str] | None:
     return pid_file.read_text().strip(), port
 
 
-def build_provisioner():
+def put_repo_on_path() -> None:
     sys.path[:0] = [str(REPO / "control-plane/worker"), str(REPO)]
+
+
+def shared_bridge_route(slug: str) -> Path | None:
+    """The shared trip-mcp bridge's route file for this trip, if there is one to
+    remove: KINERARY_SHARED_BRIDGE_ROUTES_DIR is set and <dir>/<slug>.json is a
+    REGULAR FILE. A symlink of that name is not this script's to follow or
+    delete (the bridge itself ignores one), and a directory is not a route.
+    The file belongs to another process and this removes that one name only."""
+    root = os.environ.get("KINERARY_SHARED_BRIDGE_ROUTES_DIR", "").strip()
+    if not root or not SLUG.match(slug):
+        return None
+    path = Path(root) / f"{slug}.json"
+    if path.is_symlink() or not path.is_file():
+        return None
+    return path
+
+
+def build_provisioner(topo=None):
+    """The provisioner for this trip's topology. A topology with no npm: /
+    cloudflare: section gets no NPM or Cloudflare adapter, so teardown of a
+    wildcard-routed trip needs none of those credentials."""
+    put_repo_on_path()
     from control_plane_worker.compute import LxcProvisionAdapter
     load_provisioning_env()
     e = os.environ.get
@@ -486,17 +521,47 @@ def build_provisioner():
         rpi_host=e("RPI_HOST", "192.168.0.41"), rpi_ssh_user=e("RPI_SSH_USER", "dror"),
         rpi_ssh_key=os.path.expanduser("~/.ssh/id_ed25519_rpi4_hermes"),
     )
-    return adapter._build_provisioner()
+    return adapter._build_provisioner(topo)
 
 
 def infra_state(prov, topo) -> dict:
-    dns = [r for r in prov.cloudflare._dns_records(topo.cloudflare) if r.get("name") == topo.cloudflare.hostname]
+    """What exists now. A section the topology does not have is reported as
+    absent without asking anyone: there is no NPM host or DNS record of this
+    trip's to find, and no adapter (or credentials) to ask with."""
+    dns = ([r for r in prov.cloudflare._dns_records(topo.cloudflare) if r.get("name") == topo.cloudflare.hostname]
+           if topo.cloudflare is not None else [])
     return {
         "lxc": prov.proxmox.inspect(topo.lxc),
-        "npm": prov.npm.inspect(topo.proxy),
+        "npm": prov.npm.inspect(topo.proxy) if topo.proxy is not None else None,
         "dns": dns,
-        "ingress": prov.cloudflare._ingress_rule_present(topo.cloudflare),
+        "ingress": prov.cloudflare._ingress_rule_present(topo.cloudflare) if topo.cloudflare is not None else False,
     }
+
+
+def public_steps(topo) -> str:
+    """What the infra step undoes outside the container, for the plan: only what
+    the topology has a section for."""
+    names = (["Cloudflare"] if topo.cloudflare is not None else []) + (["NPM"] if topo.proxy is not None else [])
+    return " + ".join(names) if names else "no public records (wildcard routing)"
+
+
+def delete_public_names(prov, topo) -> None:
+    """Cloudflare first, then NPM, each only if the topology has the section —
+    by presence, never by the `routing` label: a section that is there is a
+    record that exists, whatever the file says about how it is routed."""
+    if topo.cloudflare is not None:
+        prov.cloudflare.delete(topo.cloudflare)
+    if topo.proxy is not None:
+        prov.npm.delete(topo.proxy)
+
+
+def site_address(topo) -> tuple[str, int]:
+    """Where the kept site answers on the LAN: the proxy host's own target when
+    the topology has one (as it always has), otherwise the container's address
+    and the forward port the topology records under lxc."""
+    if topo.proxy is not None:
+        return topo.proxy.forward_host, topo.proxy.forward_port
+    return topo.lxc.ipv4.split("/", 1)[0], topo.lxc.forward_port
 
 
 # ── the steps ────────────────────────────────────────────────────────────────
@@ -683,9 +748,38 @@ REVOKE_GROUP_TOKENS = ("UPDATE control_plane.telegram_group_binding_tokens SET e
                        "WHERE trip_id = '{id}' AND expires_at > now()")
 
 
+# The trip's gateway route (control_plane.runtime_routes): its hostname and LAN
+# upstream are cleared and the route is suspended, so the runtime gateway
+# answers the name with the same 404 as one that never existed — and so the
+# unique public_host is free for the next trip that takes the slug. `suspended`
+# is a state the table has always allowed; nothing deleted, the row and its
+# route_ref stay. Guarded for a database from before the columns existed
+# (migration runtime_route_hosts): there the route is only suspended, which is
+# all it could say. A trip that never had a route row matches nothing.
+#
+# Runs after the group-binding revoke and the bindings close, before `trips`
+# (rename branch): the row's only foreign key is to `trips`, and updating its
+# other columns takes no lock on the parent, so it adds no edge to the lock
+# order below — it is placed where a child table of `trips` already sits.
+CLEAR_RUNTIME_ROUTE = """DO $route$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'control_plane'
+               AND table_name = 'runtime_routes' AND column_name = 'public_host') THEN
+    UPDATE control_plane.runtime_routes
+       SET public_host = NULL, upstream_url = NULL, state = 'suspended', updated_at = now()
+     WHERE trip_id = '{id}';
+  ELSE
+    UPDATE control_plane.runtime_routes SET state = 'suspended', updated_at = now()
+     WHERE trip_id = '{id}';
+  END IF;
+END
+$route$"""
+
+
 def retire_in_db(trip: dict) -> str:
     # LOCK ORDER (issue #387), both branches: group-binding tokens, intake
-    # sessions, chat bindings, `trips` (rename branch), then the teardown-pin
+    # sessions, chat bindings, the gateway route (CLEAR_RUNTIME_ROUTE),
+    # `trips` (rename branch), then the teardown-pin
     # clear LAST. It must agree with `executeClear` (control-plane/api/src/
     # trip-clear.ts: tokens, enrollments, sessions, bindings, `trips` LAST) and
     # `redeemGroupBindingToken` (token row first). The sessions used to be
@@ -708,6 +802,7 @@ def retire_in_db(trip: dict) -> str:
 {CLOSE_SESSIONS.format(id=trip['id'])};
 UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed'
  WHERE trip_id = '{trip['id']}' AND closed_at IS NULL;
+{CLEAR_RUNTIME_ROUTE.format(id=trip['id'])};
 {CLEAR_TEARDOWN_PIN.format(id=trip['id'])};
 COMMIT;""")
         return trip["slug"]
@@ -722,6 +817,7 @@ COMMIT;""")
 {CLOSE_SESSIONS.format(id=trip['id'])};
 UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed'
  WHERE trip_id = '{trip['id']}' AND closed_at IS NULL;
+{CLEAR_RUNTIME_ROUTE.format(id=trip['id'])};
 UPDATE control_plane.trips SET slug = '{new}', updated_at = now()
  WHERE id = '{trip['id']}' AND slug = '{trip['slug']}';
 {CLEAR_TEARDOWN_PIN.format(id=trip['id'])};
@@ -838,17 +934,21 @@ def main() -> int:
     topo_vmid = ""
     if topology_path.is_file():
         import yaml
-        prov = build_provisioner()  # also puts the repo's packages on sys.path
+        put_repo_on_path()
         from provisioning.models import load_topology
         raw = yaml.safe_load(topology_path.read_text())
         topo = load_topology(raw)
-        if topo.lxc.name != expected_lxc_name(orig) or not topo.proxy.hostname.startswith(f"{orig}."):
-            print(f"{RED}refused{RESET}: {topology_path} does not describe {orig} ({topo.lxc.name}, {topo.proxy.hostname})")
+        # Built for THIS topology: no NPM or Cloudflare adapter (or credential)
+        # for one that has no such section.
+        prov = build_provisioner(topo)
+        if topo.lxc.name != expected_lxc_name(orig) or not topo.public_host.startswith(f"{orig}."):
+            print(f"{RED}refused{RESET}: {topology_path} does not describe {orig} ({topo.lxc.name}, {topo.public_host})")
             return 2
         topo_vmid = str((raw.get("proxmox") or {}).get("vmid") or "")
 
     b = bridge(trip_dir)
     agents = bridge_launch_agents(trip_dir)
+    shared_route = shared_bridge_route(orig)
     store = document_store(trip)
     originals = kept_originals(store)
     plan = [
@@ -860,10 +960,11 @@ def main() -> int:
         ("bridge", b is not None or bool(agents), "; ".join(
             ([f"unload LaunchAgent {label}" for label, _ in agents])
             + ([f"stop trip-mcp pid {b[0]} on :{b[1]}"] if b else [])) or "no bridge"),
+        ("bridge route", shared_route is not None, f"delete the shared trip-mcp bridge's route file {shared_route}"),
         ("infra", topo is not None,
-         (f"Cloudflare + NPM for {orig}; KEEP the container as {reference_name(orig)} "
-          f"on http://{topo.proxy.forward_host}:{topo.proxy.forward_port}/" if args.keep_container
-          else f"Cloudflare + NPM + LXC for {orig}") if topo else "never provisioned"),
+         (f"{public_steps(topo)} for {orig}; KEEP the container as {reference_name(orig)} "
+          f"on http://{site_address(topo)[0]}:{site_address(topo)[1]}/" if args.keep_container
+          else f"{public_steps(topo)} + LXC for {orig}") if topo else "never provisioned"),
         ("database", trip["open_bindings"] > 0 or trip["live_group_tokens"] > 0
          or not trip["slug"].startswith("retired-"),
          f"close {trip['open_bindings']} binding(s), revoke {trip['live_group_tokens']} live "
@@ -884,7 +985,7 @@ def main() -> int:
         if state["lxc"] and topo_vmid and str(state["lxc"].get("vmid")) != topo_vmid:
             print(f"{RED}refused{RESET}: live vmid {state['lxc'].get('vmid')} is not topology's {topo_vmid}")
             return 2
-        if state["npm"] and state["npm"].get("forward_host") != topo.proxy.forward_host:
+        if topo.proxy is not None and state["npm"] and state["npm"].get("forward_host") != topo.proxy.forward_host:
             print(f"{RED}refused{RESET}: NPM forwards {topo.proxy.hostname} to {state['npm'].get('forward_host')}, "
                   f"not {topo.proxy.forward_host} — someone else's host")
             return 2
@@ -966,25 +1067,36 @@ def main() -> int:
             bridge_failed = True
             say(f"{RED}✗{RESET}", f"bridge     :{port} is still served (pid {', '.join(still)}) — a respawn, or not this trip's bridge")
 
+    # The shared bridge's route for this trip. Its token is the companion
+    # profile's way in, and the profile is going; the file is deleted by name
+    # only (see shared_bridge_route), and a route that stays would keep serving
+    # a trip that no longer exists.
+    if shared_route is not None:
+        try:
+            shared_route.unlink()
+            say(f"{GREEN}✓{RESET}", f"bridge     removed shared-bridge route {shared_route.name}")
+        except OSError as exc:
+            bridge_failed = True
+            say(f"{RED}✗{RESET}", f"bridge     could not remove shared-bridge route {shared_route} ({type(exc).__name__})")
+
     failed = bridge_failed
     kept = None
     if topo and args.keep_container:
-        prov.cloudflare.delete(topo.cloudflare)
-        prov.npm.delete(topo.proxy)
+        delete_public_names(prov, topo)
         kept = keep_container(prov, topo, orig)
         after = infra_state(prov, topo)
         renamed = prov.proxmox.inspect(dataclasses.replace(topo.lxc, name=kept["name"]))
         public_gone = not after["npm"] and not after["dns"] and not after["ingress"]
-        answers = site_answers(topo.proxy.forward_host, topo.proxy.forward_port)
+        site_host, site_port = site_address(topo)
+        answers = site_answers(site_host, site_port)
         ok = public_gone and not after["lxc"] and bool(renamed) and answers
         say(f"{GREEN}✓{RESET}" if ok else f"{RED}✗{RESET}",
             f"infra      public hostname gone={public_gone}; CT {kept['vmid']} is {kept['name']} "
             f"({(renamed or {}).get('status')}), data at {kept['nfs_host_dir']}, "
-            f"site answers on http://{topo.proxy.forward_host}:{topo.proxy.forward_port}/ = {answers}")
+            f"site answers on http://{site_host}:{site_port}/ = {answers}")
         failed |= not ok
     elif topo:
-        prov.cloudflare.delete(topo.cloudflare)
-        prov.npm.delete(topo.proxy)
+        delete_public_names(prov, topo)
         prov.proxmox.delete(topo.lxc)
         after = infra_state(prov, topo)
         gone = not after["lxc"] and not after["npm"] and not after["dns"] and not after["ingress"]
@@ -1062,7 +1174,7 @@ def main() -> int:
         print(f"\n{RED}✗ something remains{RESET}")
     elif kept:
         print(f"\n{GREEN}✓ {orig} torn down; its site is kept as {kept['name']} on "
-              f"http://{topo.proxy.forward_host}:{topo.proxy.forward_port}/{RESET}")
+              f"http://{site_address(topo)[0]}:{site_address(topo)[1]}/{RESET}")
     else:
         print(f"\n{GREEN}✓ {orig} torn down{RESET}")
     return 1 if failed else 0

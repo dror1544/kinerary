@@ -24,6 +24,13 @@ smart-home-expert reference docs written during the real Shiran deployment.
 Every trip's Cloudflare ingress rule points at NPM's local listener
 (http://127.0.0.1:8080 on the RPi4 itself), never at the trip's own LXC —
 NPM is what does the per-Host-header routing to the actual container.
+
+That is `routing: host`, the default. With TRIP_ROUTING=wildcard a NEW trip gets
+only its container: the operator's wildcard record sends every trip hostname to
+the runtime gateway, which routes by Host from control_plane.runtime_routes (the
+worker records the hostname and LAN address there - provisioner.py), so there
+is no proxy host, no DNS record and no tunnel rule to create, authenticate or
+undo. A trip that already has a topology.yaml keeps whatever it says.
 """
 from __future__ import annotations
 
@@ -41,7 +48,9 @@ from provisioning.adapters import (
     SubprocessSshTransport,
 )
 from provisioning.engine import Provisioner
-from provisioning.models import CloudflareSpec, LxcSpec, ProxySpec, Topology, load_topology
+from provisioning.models import (
+    CloudflareSpec, LxcSpec, ProxySpec, ROUTING_HOST, ROUTING_WILDCARD, ROUTINGS, Topology, load_topology,
+)
 from provisioning.runtime import HttpJsonTransport
 
 
@@ -126,7 +135,21 @@ class LxcProvisionAdapter:
         npm_identity: str = "",
         npm_secret: str = "",
         provisioner_factory: Callable[[], Provisioner] | None = None,
+        routing: str = ROUTING_HOST,
     ) -> None:
+        # TRIP_ROUTING. `host`: every NEW trip gets an NPM proxy host, a
+        # Cloudflare DNS record and a tunnel ingress rule (all the parameters
+        # below are then required by the worker's startup, as before).
+        # `wildcard`: a new trip gets its container and nothing public - the
+        # operator's wildcard record sends <slug>.<hostname_domain> to the
+        # runtime gateway, which routes by Host from runtime_routes - so
+        # tunnel_id, NPM and Cloudflare may be empty. An existing trip keeps
+        # whatever its own topology.yaml says. This constructor takes empty
+        # strings either way, as teardown-trip.py's does; __main__ is what
+        # refuses to start without a variable its mode needs.
+        if routing not in ROUTINGS:
+            raise ValueError(f"routing must be one of {', '.join(ROUTINGS)}")
+        self._routing = routing
         self._deploy_root = deploy_root
         self._node = node
         self._template = template
@@ -176,7 +199,7 @@ class LxcProvisionAdapter:
         # build_provisioner(), which is likewise credential-driven and
         # exercised only via the adapter/engine layer's own fake-transport
         # tests, not directly.
-        self._provisioner_factory = provisioner_factory or self._build_provisioner
+        self._provisioner_factory = provisioner_factory
 
     def create_container(
         self, slug: str, *, first_provision: bool = False, trip_id: str | None = None,
@@ -192,7 +215,13 @@ class LxcProvisionAdapter:
         # it intact, so a failed earlier attempt can leave a stale SQLite
         # users table that server.js won't re-seed over.
         self._reset_data = first_provision
-        provisioner = self._provisioner_factory()
+        # An injected factory (tests) builds the whole provisioner itself. The
+        # real one is told the topology, so a trip with no proxy host or DNS
+        # record never gets, or authenticates, a transport to NPM or Cloudflare.
+        provisioner = (
+            self._provisioner_factory() if self._provisioner_factory is not None
+            else self._build_provisioner(topology)
+        )
 
         # ProxmoxLxcAdapter.create() runs that wipe, but only when it runs —
         # i.e. when the LXC is absent. A first attempt that created the
@@ -267,9 +296,11 @@ class LxcProvisionAdapter:
         ipv4 = self._allocate_ip(slug)
         name = self._lxc_name(slug)
         hostname = f"{slug}.{self._hostname_domain}"
+        wildcard = self._routing == ROUTING_WILDCARD
         return Topology(
             version=1,
             name=slug,
+            routing=self._routing,
             lxc=LxcSpec(
                 name=name, node=self._node, template=self._template, storage=self._storage,
                 cores=self._cores, memory_mb=self._memory_mb, disk_gb=self._disk_gb,
@@ -281,6 +312,7 @@ class LxcProvisionAdapter:
                 # The same host NPM and the tunnel serve the trip on, so the
                 # member MCP connector's OAuth issuer is a name assistants reach.
                 public_origin=f"https://{hostname}",
+                forward_port=self._forward_port,
             ),
             # forward_host is the container's IP, deliberately not its LXC name.
             # No trip-* hostname resolves on this LAN — the containers hold
@@ -288,8 +320,14 @@ class LxcProvisionAdapter:
             # and NPM (on the RPi4) answers 502 for an unresolvable upstream.
             # Every working proxy host is IP-based; the name form was inherited
             # from topology.yaml files that were never actually applied.
-            proxy=ProxySpec(hostname=hostname, forward_host=ipv4, forward_port=self._forward_port),
-            cloudflare=CloudflareSpec(
+            #
+            # Wildcard routing has neither a proxy host nor a DNS record and
+            # tunnel rule, so there is nothing for the engine to plan or for
+            # teardown to undo. The gateway's upstream is the same address and
+            # port, recorded on the trip's runtime_routes row instead.
+            proxy=None if wildcard else ProxySpec(
+                hostname=hostname, forward_host=ipv4, forward_port=self._forward_port),
+            cloudflare=None if wildcard else CloudflareSpec(
                 tunnel_id=self._tunnel_id, hostname=hostname,
                 # NOT the trip's own LXC address — every trip's ingress rule
                 # points at NPM's local listener on the RPi4 itself. NPM is
@@ -345,6 +383,10 @@ class LxcProvisionAdapter:
         payload = {
             "version": 1,
             "name": topology.name,
+            # Written only when it is not the default: a host topology stays
+            # byte-for-byte what it was (plus lxc.forward_port), and a file with
+            # no `routing` line reads as `host`.
+            **({"routing": topology.routing} if topology.routing != ROUTING_HOST else {}),
             "proxmox": {
                 "node": topology.lxc.node,
                 **({"vmid": vmid} if vmid else {}),
@@ -355,16 +397,24 @@ class LxcProvisionAdapter:
                     "bridge": topology.lxc.bridge, "ipv4": topology.lxc.ipv4,
                     "gateway": topology.lxc.gateway, "nameserver": topology.lxc.nameserver,
                     "nfs_host_dir": topology.lxc.nfs_host_dir, "nfs_mount_path": topology.lxc.nfs_mount_path,
+                    # Both modes: the port the site listens on in the container.
+                    # With no npm: section (wildcard) this is the only place it
+                    # is written, and the gateway's upstream is built from it.
+                    "forward_port": topology.lxc.forward_port,
+                    # With no npm: section this is where the trip's own public
+                    # hostname lives. A topology that has one keeps it in
+                    # npm.hostname - a second copy could only ever disagree.
+                    **({"public_hostname": topology.public_host} if topology.proxy is None else {}),
                 },
             },
-            "npm": {
+            **({"npm": {
                 "hostname": topology.proxy.hostname, "forward_host": topology.proxy.forward_host,
                 "forward_port": topology.proxy.forward_port,
-            },
-            "cloudflare": {
+            }} if topology.proxy is not None else {}),
+            **({"cloudflare": {
                 "tunnel_id": topology.cloudflare.tunnel_id, "hostname": topology.cloudflare.hostname,
                 "service": topology.cloudflare.service,
-            },
+            }} if topology.cloudflare is not None else {}),
         }
         header = (
             f"# Auto-generated by control_plane_worker.compute.LxcProvisionAdapter for {slug}.\n"
@@ -391,22 +441,64 @@ class LxcProvisionAdapter:
             return token
         return self._npm_api_token
 
-    def _build_provisioner(self) -> Provisioner:
-        npm_transport = HttpJsonTransport(self._npm_url, {"Authorization": f"Bearer {self._mint_npm_token()}"})
-        cloudflare_transport = HttpJsonTransport("https://api.cloudflare.com", {
-            "Authorization": f"Bearer {self._cloudflare_api_token}",
-        })
+    def _npm_configured(self) -> bool:
+        return bool(self._npm_url and (self._npm_api_token or (self._npm_identity and self._npm_secret)))
+
+    def _cloudflare_configured(self) -> bool:
+        return bool(self._cloudflare_zone_id and self._cloudflare_api_token)
+
+    def _build_provisioner(self, topology: Topology | None = None) -> Provisioner:
+        """The provisioner for one topology - or, with none given, for every
+        resource this worker is configured to manage.
+
+        A topology with no `npm:` section gets no NPM transport (and no token
+        minted), and one with no `cloudflare:` section gets neither the
+        Cloudflare transport nor the SSH transport to the tunnel's host: in
+        wildcard routing nothing public is created, so nothing public is
+        reached. A section the topology HAS but this worker has no credentials
+        for fails here, loudly, rather than as a 401 half-way through a build.
+
+        With no topology (teardown-trip.py's way in), `host` routing builds all
+        of it, exactly as before; `wildcard` builds whichever half is configured.
+        """
+        if topology is not None:
+            need_npm, need_cloudflare = topology.proxy is not None, topology.cloudflare is not None
+        elif self._routing == ROUTING_HOST:
+            need_npm = need_cloudflare = True
+        else:
+            need_npm, need_cloudflare = self._npm_configured(), self._cloudflare_configured()
+        if topology is not None and self._routing != ROUTING_HOST:
+            # In `host` routing an empty value is the operator's existing
+            # problem and fails where it always did; only the wildcard worker,
+            # which starts without these on purpose, needs the explicit check.
+            if need_npm and not self._npm_configured():
+                raise RuntimeError(
+                    f"{topology.name} has an NPM proxy host but this worker has no NPM_URL / NPM credentials")
+            if need_cloudflare and not self._cloudflare_configured():
+                raise RuntimeError(
+                    f"{topology.name} has a Cloudflare record but this worker has no Cloudflare credentials")
+
+        npm_adapter = None
+        if need_npm:
+            npm_transport = HttpJsonTransport(self._npm_url, {"Authorization": f"Bearer {self._mint_npm_token()}"})
+            npm_adapter = NpmProxyHostAdapter(npm_transport)
+        cloudflare_adapter = None
+        if need_cloudflare:
+            cloudflare_transport = HttpJsonTransport("https://api.cloudflare.com", {
+                "Authorization": f"Bearer {self._cloudflare_api_token}",
+            })
+            rpi_ssh = SubprocessSshTransport(
+                host=self._rpi_host, user=self._rpi_ssh_user, identity_file=self._rpi_ssh_key,
+            )
+            cloudflare_adapter = CloudflareTunnelDnsAdapter(cloudflare_transport, self._cloudflare_zone_id, rpi_ssh)
         proxmox_ssh = SubprocessSshTransport(
             host=self._proxmox_host, user=self._proxmox_ssh_user, identity_file=self._proxmox_ssh_key,
-        )
-        rpi_ssh = SubprocessSshTransport(
-            host=self._rpi_host, user=self._rpi_ssh_user, identity_file=self._rpi_ssh_key,
         )
         return Provisioner(
             ProxmoxLxcAdapter(
                 proxmox_ssh, reset_data=self._reset_data,
                 control_plane_exchange_key=self._control_plane_exchange_key,
             ),
-            NpmProxyHostAdapter(npm_transport),
-            CloudflareTunnelDnsAdapter(cloudflare_transport, self._cloudflare_zone_id, rpi_ssh),
+            npm_adapter,
+            cloudflare_adapter,
         )

@@ -11,6 +11,8 @@ kinerary-deploy/deploy.sh via subprocess.
 """
 from __future__ import annotations
 
+import dataclasses
+import ipaddress
 import json
 import logging
 import os
@@ -24,6 +26,8 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 import psycopg
+import psycopg.errors
+import yaml
 from psycopg.rows import dict_row
 
 from .companion_profile import (
@@ -110,6 +114,77 @@ class DeployAdapter(Protocol):
         documents: Sequence[TripDocumentFile] | None = None,
         trip_id: str | None = None,
     ) -> str: ...
+
+
+# ── Where a trip's site is, for the runtime gateway ─────────────────────────
+
+#: A lower-case DNS name of two or more labels - the shape the runtime_routes
+#: public_host column accepts. A value that does not match is not recorded.
+_PUBLIC_HOST = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+")
+
+
+@dataclasses.dataclass(frozen=True)
+class TripRoute:
+    """What the runtime gateway needs to reach one trip's site.
+
+    `public_host` is the hostname the family uses; `upstream_url` is where the
+    site listens on the LAN, `http://<container address>:<port>`. `routing` is
+    the topology's own (`host` or `wildcard`): in `wildcard` nothing else makes
+    the hostname reach the container, so the route is not optional there.
+    """
+
+    public_host: str
+    upstream_url: str
+    routing: str = "host"
+
+
+def topology_public_hostname(raw: Any) -> str | None:
+    """The trip's own public hostname from a parsed topology.yaml, or None.
+
+    `proxmox.lxc.public_hostname` when the topology has no proxy host (wildcard
+    routing), otherwise `npm.hostname`, as every older file records it. An
+    unresolved `${VAR}` placeholder is not a hostname."""
+    if not isinstance(raw, Mapping):
+        return None
+    lxc = (raw.get("proxmox") or {}).get("lxc") if isinstance(raw.get("proxmox"), Mapping) else None
+    npm = raw.get("npm")
+    for source, key in ((lxc, "public_hostname"), (npm, "hostname")):
+        if isinstance(source, Mapping):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip() and not value.strip().startswith("$"):
+                return value.strip()
+    return None
+
+
+def topology_route(raw: Any) -> TripRoute | None:
+    """The route a parsed topology.yaml describes, or None when it does not
+    describe one (a hand-written topology with no usable address or port, a
+    DHCP container, an unresolved placeholder). Nothing is guessed: every part
+    is checked, and a part that fails makes the whole answer None."""
+    hostname = topology_public_hostname(raw)
+    if hostname is None:
+        return None
+    hostname = hostname.lower()
+    if not _PUBLIC_HOST.fullmatch(hostname):
+        return None
+    proxmox = raw.get("proxmox") if isinstance(raw.get("proxmox"), Mapping) else {}
+    lxc = proxmox.get("lxc") if isinstance(proxmox.get("lxc"), Mapping) else {}
+    npm = raw.get("npm") if isinstance(raw.get("npm"), Mapping) else {}
+    ipv4 = lxc.get("ipv4")
+    if not isinstance(ipv4, str):
+        return None
+    try:
+        address = ipaddress.IPv4Address(ipv4.split("/", 1)[0].strip())
+    except ValueError:
+        return None
+    port = lxc.get("forward_port", npm.get("forward_port"))
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        return None
+    routing = raw.get("routing", "host")
+    return TripRoute(
+        public_host=hostname, upstream_url=f"http://{address}:{port}",
+        routing=routing if routing in ("host", "wildcard") else "host",
+    )
 
 
 # ── Reachability ─────────────────────────────────────────────────────────────
@@ -580,7 +655,30 @@ class ShellDeployAdapter:
 
         return self._private_url(trip_dir)
 
+    def _load_topology_dict(self, trip_dir: str) -> dict | None:
+        """topology.yaml as plain data, or None when there is none to read.
+
+        Not `provisioning.models.load_topology`: that raises on a hand-written
+        legacy topology that lacks fields the compute adapter writes (see
+        `_trip_nfs_dirname`), and that is exactly the file this has to read."""
+        try:
+            with open(os.path.join(trip_dir, "topology.yaml"), encoding="utf-8") as fh:
+                raw = yaml.safe_load(fh)
+        except (FileNotFoundError, yaml.YAMLError):
+            return None
+        return raw if isinstance(raw, dict) else None
+
     def _private_url(self, trip_dir: str) -> str:
+        """https://<the trip's own hostname>, read from its topology.yaml.
+
+        The topology's own hostname - `proxmox.lxc.public_hostname`, which a
+        wildcard-routed trip has instead of an `npm:` section, else
+        `npm.hostname`, which every older file has. A file the YAML reader
+        cannot make a hostname from falls back to the old line scan, so a legacy
+        file gives the value it always did."""
+        hostname = topology_public_hostname(self._load_topology_dict(trip_dir))
+        if hostname:
+            return f"https://{hostname}"
         topology_path = os.path.join(trip_dir, "topology.yaml")
         try:
             with open(topology_path, encoding="utf-8") as fh:
@@ -594,6 +692,26 @@ class ShellDeployAdapter:
         except FileNotFoundError:
             pass
         raise ValueError(f"could not determine private URL from {topology_path}")
+
+    def route_for(self, slug: str) -> TripRoute | None:
+        """The gateway route this trip's topology.yaml describes, or None.
+
+        None for a trip whose topology cannot give a usable address and port -
+        a vmid_map trip, say - which then keeps exactly the runtime_routes row
+        it has always had. For a `wildcard` trip None is not an answer: nothing
+        else makes its hostname reach the container, so it raises and the job
+        fails where someone looks, instead of finishing as a trip whose
+        hostname answers 404."""
+        trip_dir = os.path.join(self._deploy_root, "trips", slug)
+        raw = self._load_topology_dict(trip_dir)
+        route = topology_route(raw) if raw is not None else None
+        wildcard = isinstance(raw, dict) and raw.get("routing") == "wildcard"
+        if route is None and wildcard:
+            raise ValueError(
+                f"{slug}'s topology.yaml is wildcard-routed but gives no usable hostname, "
+                "container address and forward_port to record as its route"
+            )
+        return route
 
 
 def _generate_notif_id() -> str:
@@ -1385,6 +1503,18 @@ class ProvisionerWorker:
             # See verification.py's module docstring for why isolation,
             # messaging binding and backup checkpoint are not hard-gated yet.
             deployment_ref = plan_desired.get("release_source_revision") or plan_desired.get("release_id")
+            # Where the gateway will reach this trip (None for a trip whose
+            # topology gives no usable address, which keeps its old route row).
+            route = self._route_for(slug)
+            # A wildcard-routed trip is reachable by its hostname only THROUGH the
+            # gateway, and the gateway routes only a trip whose runtime_routes row
+            # says so - which is written below, in the transaction that marks the
+            # trip ready. Probing the public name here would ask a door that
+            # cannot open yet, so such a trip is verified at its own address: the
+            # same /api/health, roster and deployment-nonce checks, one hop closer.
+            verification_url = (
+                route.upstream_url if route is not None and route.routing == "wildcard" else private_url
+            )
             # #review 2026-10-03 [P2], round 1: rendered_data used to accept
             # ANY reachable trip's nonempty roster, so a misrouted
             # private_url (a stale ingress entry, two trips racing onto the
@@ -1409,7 +1539,7 @@ class ProvisionerWorker:
             meta = config.get("meta") or {}
             verification.gate_ready_private(
                 conn, trip_id=trip_id, deployment_ref=deployment_ref,
-                plan_desired=plan_desired, private_url=private_url,
+                plan_desired=plan_desired, private_url=verification_url,
                 http_get=self._verification_http_get,
                 expected_usernames=expected_usernames,
                 expected_deployment_nonce=meta.get("deploymentNonce"),
@@ -1423,6 +1553,7 @@ class ProvisionerWorker:
                 conn, job_id, plan_id, trip_id, private_url,
                 slug=slug, config=config, intake_version_id=intake_version_id,
                 deployment_ref=deployment_ref, site_password=site_password,
+                route=route,
             )
 
             # Hand the deployed plan to the post-deploy review pass
@@ -1796,6 +1927,63 @@ class ProvisionerWorker:
                 exc_info=True,
             )
 
+    def _route_for(self, slug: str) -> TripRoute | None:
+        """The deploy adapter's answer to "where is this trip's site", if it
+        has one. An adapter without `route_for` (a test double, a future
+        orchestrator) records no hosts and the route row is what it always was."""
+        route_for = getattr(self._deploy, "route_for", None)
+        return route_for(slug) if callable(route_for) else None
+
+    def _register_runtime_route(
+        self, conn: psycopg.Connection, cur: psycopg.Cursor, trip_id: str, route: TripRoute | None,
+    ) -> None:
+        """Register the runtime in the same transaction that marks the
+        deployment successful. Migration 0034 backfilled old jobs, but without
+        this writer every newly provisioned trip stayed permanently invisible
+        to the gateway, invitations, and the dashboard's real launch path.
+        Re-provisioning keeps the opaque route_ref stable and only restores
+        readiness - and, with a route, rewrites the trip's host and upstream.
+
+        `public_host` / `upstream_url` are what the gateway routes the trip's
+        own hostname by. They come from migration `runtime_route_hosts`: a worker
+        newer than its schema must not turn a finished deploy into a failed one
+        over them, EXCEPT where they are the only thing that makes the hostname
+        work (a wildcard-routed trip), which fails loudly instead.
+        """
+        legacy = """
+            INSERT INTO control_plane.runtime_routes
+              (trip_id, route_ref, state)
+            VALUES (%s, %s, 'ready')
+            ON CONFLICT (trip_id) DO UPDATE
+            SET state = 'ready', updated_at = now()
+        """
+        if route is None:
+            cur.execute(legacy, (trip_id, _generate_route_id()))
+            return
+        try:
+            with conn.transaction():  # a savepoint: a refused statement leaves the outer transaction usable
+                cur.execute(
+                    """
+                    INSERT INTO control_plane.runtime_routes
+                      (trip_id, route_ref, state, public_host, upstream_url)
+                    VALUES (%s, %s, 'ready', %s, %s)
+                    ON CONFLICT (trip_id) DO UPDATE
+                    SET state = 'ready', public_host = excluded.public_host,
+                        upstream_url = excluded.upstream_url, updated_at = now()
+                    """,
+                    (trip_id, _generate_route_id(), route.public_host, route.upstream_url),
+                )
+        except psycopg.errors.UndefinedColumn:
+            if route.routing == "wildcard":
+                raise
+            logger.warning(log_fields(
+                "provisioner.route_hosts_not_recorded", trip_id=trip_id, host=route.public_host,
+                reason="control_plane.runtime_routes has no public_host/upstream_url columns",
+                effect="the route row is written as before; apply migration runtime_route_hosts "
+                       "before moving this trip behind the gateway",
+            ))
+            cur.execute(legacy, (trip_id, _generate_route_id()))
+
     def _complete(
         self,
         conn: psycopg.Connection,
@@ -1808,6 +1996,7 @@ class ProvisionerWorker:
         intake_version_id: str,
         deployment_ref: str | None = None,
         site_password: str | None = None,
+        route: TripRoute | None = None,
     ) -> None:
         result_json = json.dumps({"private_url": private_url})
         with conn.transaction():
@@ -1866,16 +2055,7 @@ class ProvisionerWorker:
                 # permanently invisible to the gateway, invitations, and the
                 # dashboard's real launch path. Re-provisioning keeps the
                 # opaque route_ref stable and only restores readiness.
-                cur.execute(
-                    """
-                    INSERT INTO control_plane.runtime_routes
-                      (trip_id, route_ref, state)
-                    VALUES (%s, %s, 'ready')
-                    ON CONFLICT (trip_id) DO UPDATE
-                    SET state = 'ready', updated_at = now()
-                    """,
-                    (trip_id, _generate_route_id()),
-                )
+                self._register_runtime_route(conn, cur, trip_id, route)
 
                 # Enqueue organizer notification. recipient is the owner's real,
                 # sendable Telegram chat id when one is on file (added in

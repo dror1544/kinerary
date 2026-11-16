@@ -25,3 +25,16 @@ cloudflare:
   tunnel_id: ${CLOUDFLARE_TUNNEL_ID}
   hostname: ${PUBLIC_HOSTNAME}
   service: ${CLOUDFLARE_TUNNEL_SERVICE}
+
+# Wildcard routing (TRIP_ROUTING=wildcard in the control-plane worker): no
+# proxy host, no DNS record, no tunnel rule - delete the `npm:` and `cloudflare:`
+# sections above, add `routing: wildcard` under `name:`, and give the container's
+# own section the two things those sections carried:
+#
+#   routing: wildcard
+#   proxmox:
+#     lxc:
+#       forward_port: 8080                  # where the site listens in the container
+#       public_hostname: ${PUBLIC_HOSTNAME} # sent to the runtime gateway by a wildcard record
+#
+# A file with no `routing:` line is `host`, as every file written before it was.
