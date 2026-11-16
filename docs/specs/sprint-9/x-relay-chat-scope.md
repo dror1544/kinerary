@@ -223,12 +223,14 @@ Written first, from the criteria.
 
 1. **The multiplex exception covers every bound chat** (option (a), as AC-5 is written). Not tied to live
    socket state.
-2. **The refusal log line carries `chat_id`**, and still no content, length or message ids.
+2. **The refusal log line identifies the chat by digest** (`chat_ref`, the same digest form the database matches; revised by Dror 2026-11-16 from "carries `chat_id`"), so a refusal can be traced to its binding while the redaction rule for Telegram ids holds. No content, length or message ids.
 3. **An interview is bound to one private chat, and only that chat is closed to the companion.** While a
    person is mid-interview, the companion is refused in that person's private chat only. Every other chat
    bound to the trip, every group included, keeps working with the companion as before. A test proves a
    group of the same trip is unaffected while its organizer's private chat is mid-interview.
 4. **A relay without a database refuses all outbound.** The pre-merge probe confirms no deployment runs one.
+
+5. **Per-gateway relay keys are separate work**, after the Alsace trip, with #597 (Dror, 2026-11-16).
 
 ## Open questions
 
