@@ -13,7 +13,8 @@
  * way for an AI runtime to change the control plane.
  *
  * AUTHENTICATION — NO NEW SECRET. Every companion is already enrolled with the
- * relay: its profile holds the relay's gateway secret and its gateway id, and
+ * relay: its profile holds the relay's gateway key (the shared secret, or the
+ * key derived for its id when `relay.gateway_key_mode` says so) and its gateway id, and
  * the relay proves identity with a signed `id:expiry:signature` token checked by
  * `verifyUpgradeToken`. The companion's token here is that exact format (minted
  * by the installer with no expiry), verified by that exact function. So the
@@ -37,17 +38,21 @@ import { getAssistantNames, parseAssistantNames, setAssistantNames } from "./ass
 import { loadArchitectureProfile } from "./config.js";
 import { createDatabasePool } from "./database.js";
 import { structuredLog } from "./redaction.js";
-import { verifyUpgradeToken } from "./relay/protocol.js";
+import { verifyUpgradeToken, type GatewayKeyMode } from "./relay/protocol.js";
 import { resolveSecretRef } from "./secrets.js";
 
 const log = (line: string) => process.stderr.write(`${line}\n`);
 
 /** The gateway id a request proves, or null. Bearer only — never a query string. */
-export function gatewayFromAuthorization(header: unknown, secrets: readonly string[]): string | null {
+export function gatewayFromAuthorization(
+  header: unknown,
+  secrets: readonly string[],
+  mode: GatewayKeyMode = "shared",
+): string | null {
   const value = typeof header === "string" ? header : "";
   const token = value.startsWith("Bearer ") ? value.slice("Bearer ".length).trim() : "";
   if (!token || secrets.length === 0) return null;
-  return verifyUpgradeToken(token, secrets);
+  return verifyUpgradeToken(token, secrets, undefined, mode);
 }
 
 export type CompanionTrip =
@@ -247,6 +252,11 @@ async function main(): Promise<void> {
     log(structuredLog("error", "companion_mcp.empty_gateway_secrets", {}));
     process.exit(1);
   }
+  // The same `relay.gateway_key_mode` the relay connector reads: one setting,
+  // two checkers, so the companion's token is judged by the scheme the relay
+  // judges the gateway's own.
+  const keyMode = architecture.relay.gateway_key_mode;
+  log(structuredLog("info", "companion_mcp.gateway_key_mode", { mode: keyMode }));
   const db = createDatabasePool(connectionString);
 
   const sessions = new Map<string, { transport: SSEServerTransport; server: McpServer }>();
@@ -259,7 +269,7 @@ async function main(): Promise<void> {
 
   const app = express();
   app.get("/sse", async (req: Request, res: Response) => {
-    const profile = gatewayFromAuthorization(req.headers.authorization, secrets);
+    const profile = gatewayFromAuthorization(req.headers.authorization, secrets, keyMode);
     if (!profile) { res.status(401).json({ error: "unauthorized" }); return; }
     const transport = new SSEServerTransport("/messages", res);
     const server = buildCompanionMcpServer(db, profile);

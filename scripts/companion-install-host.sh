@@ -624,9 +624,30 @@ PY
     return 0
   fi
 
-  local secret
-  secret="$(cat "$secret_file")"
-  [ -n "$secret" ] || {
+  # `relay.gateway_key_mode` (#597 K1) from the SAME profile the relay reads, so
+  # what is written here and what the relay accepts cannot be set apart. Absent
+  # is `shared`: the master itself, as before. `both` and `derived` write
+  # derive(master, this profile's id) instead, and the master never reaches the
+  # profile's .env. Anything else is refused rather than guessed at: writing the
+  # master under a mode this script does not know is the downgrade to avoid, and
+  # the relay refuses to load such a profile anyway.
+  local key_mode
+  key_mode="$(/usr/bin/python3 - "$ARCH_PROFILE" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1])).get("relay") or {}
+mode = r["gateway_key_mode"] if "gateway_key_mode" in r else "shared"
+print(mode if mode in ("shared", "both", "derived") else "INVALID")
+PY
+  )" || key_mode="INVALID"
+  if [ "$key_mode" = INVALID ]; then
+    printf 'companion-install-host: relay.gateway_key_mode in %s is not shared, both or derived; %s left UNENROLLED\n' \
+      "$ARCH_PROFILE" "$name" >&2
+    return 0
+  fi
+
+  # The key itself is read from its file by the Python below and never passes
+  # through a shell variable or a command line: argv is visible to `ps`.
+  [ -n "$(tr -d '[:space:]' < "$secret_file")" ] || {
     printf 'companion-install-host: relay secret file is empty; %s left UNENROLLED\n' "$name" >&2
     return 0
   }
@@ -649,9 +670,27 @@ PY
   # copies of GATEWAY_RELAY_ID with different values is a worse state than none.
   umask 077
   touch "$env_file"
-  /usr/bin/python3 - "$env_file" "$relay_url" "$name" "$secret" "$sandbox_dir" <<'PY'
+  /usr/bin/python3 - "$env_file" "$relay_url" "$name" "$secret_file" "$sandbox_dir" "$key_mode" <<'PY'
 import base64, hashlib, hmac, sys
-env_path, url, gid, secret, sandbox_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+env_path, url, gid, secret_file, sandbox_dir, key_mode = sys.argv[1:7]
+with open(secret_file) as fh:
+    master = fh.read().strip()
+if not master:
+    sys.exit("relay secret file is empty")
+
+
+def derive_gateway_key(master_key, gateway_id):
+    # hex(HMAC-SHA256(master, "kinerary-relay-gateway:v1:" + id)): the same
+    # function as deriveGatewayKey in control-plane/api/src/relay/protocol.ts,
+    # pinned to it by control-plane/api/test/fixtures/relay-key-vectors.json. The
+    # hex string is then used as the HMAC KEY STRING, exactly as the master was.
+    label = "kinerary-relay-gateway:v1:"
+    return hmac.new(master_key.encode(), (label + gateway_id).encode(), hashlib.sha256).hexdigest()
+
+
+# `shared` hands the master out; `both` and `derived` hand out only the key
+# derived for this id, so the master does not leave the host's secret file.
+secret = master if key_mode == "shared" else derive_gateway_key(master, gid)
 
 
 def control_token(gateway_id, key):

@@ -30,6 +30,7 @@ import { structuredLog } from "../redaction.js";
 import { resolveSecretRef } from "../secrets.js";
 import type { SignupConfig } from "../signup.js";
 import { RelayConnector } from "./connector.js";
+import type { GatewayKeyMode } from "./protocol.js";
 import { renewCompanionConversation, resolveChatRoute, setCompanionExpectsReply } from "../chat-router.js";
 import { sayForChat,
   agentAlreadySpokeThisTurn,
@@ -93,6 +94,8 @@ const unconfigured: TelegramClient = {
 
 interface Runtime {
   gatewaySecrets: string[];
+  /** `relay.gateway_key_mode`. Required, so both ways of building a Runtime must say. */
+  gatewayKeyMode: GatewayKeyMode;
   port: number;
   host: string;
   telegram: TelegramClient;
@@ -151,6 +154,12 @@ async function serveRuntime(path: string): Promise<Runtime> {
     log(structuredLog("error", "relay.empty_gateway_secrets", {}));
     process.exit(1);
   }
+  // The mode changes what the relay accepts and nothing else shows it, so it is
+  // said at boot. `both` is transitional and says so.
+  log(structuredLog(relay.gateway_key_mode === "both" ? "warn" : "info", "relay.gateway_key_mode", {
+    mode: relay.gateway_key_mode,
+    ...(relay.gateway_key_mode === "both" ? { hint: "accepts shared and derived keys; move to derived once every gateway is re-keyed" } : {}),
+  }));
 
   const db = createDatabasePool(connectionString, () => {
     log(structuredLog("error", "database.pool_idle_error", {
@@ -252,6 +261,7 @@ async function serveRuntime(path: string): Promise<Runtime> {
 
   return {
     gatewaySecrets: resolved,
+    gatewayKeyMode: relay.gateway_key_mode,
     port: relay.port,
     host: relay.bind_host,
     telegram,
@@ -279,6 +289,8 @@ function conformanceRuntime(secret: string): Runtime {
   }));
   return {
     gatewaySecrets,
+    // The conformance harness stands in for a gateway signing with the secret itself.
+    gatewayKeyMode: "shared",
     port: Number(process.env.RELAY_PORT ?? "4312"),
     host: process.env.RELAY_HOST ?? "127.0.0.1",
     telegram: unconfigured,
@@ -367,6 +379,7 @@ async function main(): Promise<void> {
 
   const connector = new RelayConnector({
     gatewaySecrets: runtime.gatewaySecrets,
+    gatewayKeyMode: runtime.gatewayKeyMode,
     telegram: runtime.telegram,
     port: runtime.port,
     host: runtime.host,

@@ -158,6 +158,22 @@ test("the relay block binds its secrets through secret_ref, like every other sec
   }));
 });
 
+test("relay.gateway_key_mode: absent is shared, three names are accepted, anything else fails config load (AC-K1.3)", async () => {
+  const raw = JSON.parse(await readFile(examplePath, "utf8"));
+  assert.equal(raw.relay.gateway_key_mode, undefined, "the committed example leaves the mode at its default");
+  assert.equal(validateArchitectureProfile(raw).relay?.gateway_key_mode, "shared");
+  for (const mode of ["shared", "both", "derived"]) {
+    const profile = validateArchitectureProfile({ ...raw, relay: { ...raw.relay, gateway_key_mode: mode } });
+    assert.equal(profile.relay?.gateway_key_mode, mode);
+  }
+  for (const bad of ["", "Derived", "any", "none", "true", 1, null]) {
+    assert.throws(
+      () => validateArchitectureProfile({ ...raw, relay: { ...raw.relay, gateway_key_mode: bad } }),
+      `${JSON.stringify(bad)} must fail`,
+    );
+  }
+});
+
 test("the relay socket cannot be bound to a public interface", async () => {
   const raw = JSON.parse(await readFile(examplePath, "utf8"));
   // The connector holds the bot token and sends as the trip bot. Anything that

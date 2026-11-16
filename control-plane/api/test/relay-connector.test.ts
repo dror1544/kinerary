@@ -4,7 +4,8 @@ import { WebSocket } from "ws";
 import { RelayConnector } from "../src/relay/connector.js";
 import { SILENCE_SENTINEL } from "../src/relay/stay-silent.js";
 import type { ReplyObserver } from "../src/analytics/emitter.js";
-import { makeUpgradeToken, type WireMessageEvent } from "../src/relay/protocol.js";
+import { gatewayFromAuthorization } from "../src/companion-mcp.js";
+import { deriveGatewayKey, makeUpgradeToken, type GatewayKeyMode, type WireMessageEvent } from "../src/relay/protocol.js";
 import type { ChatInfo, SendResult, TelegramClient } from "../src/relay/telegram-api.js";
 import { hermesIsRetryable, hermesIsTimeout } from "./support/hermes-mirror.js";
 
@@ -174,6 +175,76 @@ describe("RelayConnector — upgrade auth", () => {
     } finally {
       await connector.close();
     }
+  });
+});
+
+describe("RelayConnector — gateway key mode (#597 K1, AC-K1.2/K1.3)", () => {
+  const MEDIA_ID = "0123456789abcdef0123456789abcdef";
+  const tokens = {
+    master: makeUpgradeToken("gw_1", SECRET, 300),
+    derived: makeUpgradeToken("gw_1", deriveGatewayKey(SECRET, "gw_1"), 300),
+    // Signed with the key that belongs to gw_2, naming gw_1.
+    crossed: makeUpgradeToken("gw_1", deriveGatewayKey(SECRET, "gw_2"), 300),
+  };
+  /** What each mode must do with each token, on the upgrade AND the media plane. */
+  const expected: Record<GatewayKeyMode, Record<keyof typeof tokens, boolean>> = {
+    shared: { master: true, derived: false, crossed: false },
+    both: { master: true, derived: true, crossed: false },
+    derived: { master: false, derived: true, crossed: false },
+  };
+
+  async function withMode(mode: GatewayKeyMode | undefined, fn: (c: RelayConnector, port: number) => Promise<void>) {
+    const connector = new RelayConnector({
+      gatewaySecrets: [SECRET],
+      ...(mode ? { gatewayKeyMode: mode } : {}),
+      mediaStore: { get: (id) => (id === MEDIA_ID ? { mime: "text/plain", bytes: Buffer.from("hello") } : null) },
+      telegram: new FakeTelegram(),
+      port: 0,
+    });
+    await connector.listen();
+    try {
+      await fn(connector, connector.address!);
+    } finally {
+      await connector.close();
+    }
+  }
+
+  for (const mode of ["shared", "both", "derived"] as GatewayKeyMode[]) {
+    test(`${mode}: the upgrade and the media plane agree, and agree with the companion control MCP`, async () => {
+      await withMode(mode, async (connector, port) => {
+        for (const [name, token] of Object.entries(tokens) as [keyof typeof tokens, string][]) {
+          const want = expected[mode][name];
+          // WebSocket upgrade.
+          if (want) {
+            const { ws } = await dial(port, token);
+            ws.close();
+          } else {
+            await assert.rejects(dial(port, token), `${mode}/${name}: upgrade must be refused`);
+          }
+          // Media plane.
+          const res = await fetch(`http://127.0.0.1:${port}/relay/media/${MEDIA_ID}`, {
+            headers: { authorization: `Bearer ${token}` },
+          });
+          assert.equal(res.status, want ? 200 : 401, `${mode}/${name}: media`);
+          await res.arrayBuffer();
+          // The other checker, one setting.
+          assert.equal(
+            gatewayFromAuthorization(`Bearer ${token}`, [SECRET], mode),
+            want ? "gw_1" : null,
+            `${mode}/${name}: companion-mcp`,
+          );
+        }
+        void connector;
+      });
+    });
+  }
+
+  test("no mode given behaves as shared", async () => {
+    await withMode(undefined, async (_c, port) => {
+      const { ws } = await dial(port, tokens.master);
+      ws.close();
+      await assert.rejects(dial(port, tokens.derived));
+    });
   });
 });
 

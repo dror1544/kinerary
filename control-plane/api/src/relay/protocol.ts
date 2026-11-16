@@ -397,6 +397,29 @@ export function splitFrames(chunk: string, carry = ""): { frames: string[]; carr
   return { frames: parts.filter((line) => line.trim().length > 0), carry: trailing };
 }
 
+// ── Per-gateway keys (#597 K1) ───────────────────────────────────────────────
+
+/** `relay.gateway_key_mode`: see `verifyUpgradeToken`. */
+export const GATEWAY_KEY_MODES = ["shared", "both", "derived"] as const;
+export type GatewayKeyMode = (typeof GATEWAY_KEY_MODES)[number];
+
+/** Versioned and fixed: a key made for this purpose is never valid for another. */
+export const GATEWAY_KEY_LABEL = "kinerary-relay-gateway:v1:";
+
+/**
+ * The key one gateway holds: `hex(HMAC-SHA256(master, label + id))`.
+ *
+ * Returned as the hex STRING the gateway then uses, unchanged, as the HMAC key
+ * string it signs "<id>:<exp>" with. Mirrored by `enroll_relay` in
+ * `scripts/companion-install-host.sh` and by `scripts/relay-rekey.py`; the
+ * three are pinned to one vector file, `test/fixtures/relay-key-vectors.json`.
+ */
+export function deriveGatewayKey(master: string, gatewayId: string): string {
+  if (!master) throw new Error("deriveGatewayKey: empty master");
+  if (!gatewayId) throw new Error("deriveGatewayKey: empty gateway id");
+  return createHmac("sha256", master).update(GATEWAY_KEY_LABEL + gatewayId, "utf8").digest("hex");
+}
+
 // ── Upgrade-token auth (§6.1) ────────────────────────────────────────────────
 
 /**
@@ -415,8 +438,26 @@ export function splitFrames(chunk: string, carry = ""): { frames: string[]; carr
  *
  * `secrets` is a verify LIST so a secret rotation does not invalidate tokens
  * already in flight. Returns the payload (the gateway id) or null.
+ *
+ * `mode` (`relay.gateway_key_mode`, #597 K1) says what the entries of `secrets`
+ * are MASTERS for:
+ *   shared   a token is signed with a master itself (today's behaviour);
+ *   derived  a token is signed with `deriveGatewayKey(master, <the id it names>)`
+ *            and a master-signed token is refused;
+ *   both     either, for the changeover.
+ * The key a gateway holds is a hex STRING used as the HMAC key exactly as a
+ * master string is, so the gateway signs the same way in every mode. Because the
+ * candidate is derived from the id the token NAMES, a key derived for one id
+ * never verifies a token for another. Absent means `shared`, and anything that
+ * is not one of the three names verifies nothing: an unknown mode falling
+ * through to an accepting one is the failure this exists to prevent.
  */
-export function verifyUpgradeToken(token: string, secrets: readonly string[], nowSeconds?: number): string | null {
+export function verifyUpgradeToken(
+  token: string,
+  secrets: readonly string[],
+  nowSeconds?: number,
+  mode: GatewayKeyMode = "shared",
+): string | null {
   let decoded: string;
   try {
     decoded = Buffer.from(token, "base64url").toString("utf8");
@@ -437,7 +478,21 @@ export function verifyUpgradeToken(token: string, secrets: readonly string[], no
   const now = nowSeconds ?? Math.floor(Date.now() / 1000);
   if (exp !== 0 && now > exp) return null;
 
-  return verifySignature(`${payload}:${exp}`, sig, secrets) ? payload : null;
+  const candidates = gatewayKeyCandidates(secrets, payload, mode);
+  return verifySignature(`${payload}:${exp}`, sig, candidates) ? payload : null;
+}
+
+/** Which keys may sign a token for `gatewayId` in this mode. Empty for an unknown mode. */
+function gatewayKeyCandidates(secrets: readonly string[], gatewayId: string, mode: GatewayKeyMode): string[] {
+  if (mode !== "shared" && mode !== "both" && mode !== "derived") return [];
+  const masters = secrets.filter(Boolean);
+  const out: string[] = [];
+  if (mode === "shared" || mode === "both") out.push(...masters);
+  // A token naming no gateway has no derived key to be signed with.
+  if ((mode === "derived" || mode === "both") && gatewayId) {
+    for (const master of masters) out.push(deriveGatewayKey(master, gatewayId));
+  }
+  return out;
 }
 
 /** Constant-time HMAC check against any secret in the rotation list. */

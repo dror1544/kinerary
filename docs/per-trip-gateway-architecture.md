@@ -161,9 +161,44 @@ itself reads; neither comes from the handoff.
 
 **Not** `hermes gateway enroll`, despite the name. That subcommand redeems a
 single-use token against the hosted Nous connector and requires a portal
-login. This relay authenticates a gateway with a shared secret and takes its
-identity from the id, so per-trip enrollment here is "same secret, distinct
+login. This relay authenticates a gateway with a secret and takes its
+identity from the id, so per-trip enrollment here is "a key, a distinct
 id" — three env stamps, no round trip.
+
+#### What `GATEWAY_RELAY_SECRET` holds: `relay.gateway_key_mode`
+
+Which key a gateway is given depends on `relay.gateway_key_mode` in the
+architecture profile (#597 K1). The relay and the companion control MCP read
+the same field; the installer reads it from the same profile.
+
+| Mode | A gateway's `GATEWAY_RELAY_SECRET` | The relay accepts |
+|---|---|---|
+| `shared` (default; the field absent means this) | the relay's master secret, the same for every gateway | a token signed with a master |
+| `both` | `derive(master, <that gateway's id>)` | either of those |
+| `derived` | `derive(master, <that gateway's id>)` | only a token signed with the key derived for the id it names |
+
+`derive(master, id)` is `hex(HMAC-SHA256(master, "kinerary-relay-gateway:v1:" + id))`,
+the 64-character hex string; the gateway uses that string as its HMAC key
+exactly as it uses a master string today, so the Hermes side does not change.
+The relay derives the key from the id the token names, so a key made for one
+id cannot sign for another. `COMPANION_CONTROL_TOKEN` is minted with the same
+key the profile holds. In `both` and `derived` the master is never written
+into a profile's `.env`.
+
+The **gateway id** is what is derived from: `GATEWAY_RELAY_ID` in that
+profile's `.env`. For a trip's own gateway that is the profile name; for the
+multiplexing interviewer it is its declared id (see the exception below), not
+its profile name.
+
+To move a deployment: set `both` and restart the relay and the companion
+control MCP; run `scripts/relay-rekey.py --all-enrolled` (a plan), then with
+`--execute`; restart each gateway it lists (it restarts nothing itself); once
+every gateway is re-keyed, set `derived` and restart the relay and the control
+MCP again. `relay-rekey.py` refuses to run in `shared`, because the relay
+would still be checking the master. A gateway enrolled by hand in `both` or
+`derived` takes the value from `relay-rekey.py`'s derivation, never the master.
+`both` is a changeover state; a deployment is not hardened until it is
+`derived`.
 
 Until 2026-09-10 nothing performed that step at all, and this section
 described the wrong command as though it did. Two trips shipped unenrolled.

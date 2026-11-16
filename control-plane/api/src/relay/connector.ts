@@ -32,6 +32,7 @@ import {
   parseOutboundAction,
   TELEGRAM_DESCRIPTOR,
   verifyUpgradeToken,
+  type GatewayKeyMode,
   type OutboundResult,
   type WireMessageEvent,
 } from "./protocol.js";
@@ -110,6 +111,13 @@ export interface ConnectorOptions {
   mediaStore?: { get(id: string): { mime: string; bytes: Buffer; filename?: string } | null };
   /** HMAC verify list for the upgrade token. Multiple entries support rotation. */
   gatewaySecrets: readonly string[];
+  /**
+   * What `gatewaySecrets` are masters for (`relay.gateway_key_mode`, #597 K1).
+   * Absent is `shared`: a token is signed with a secret itself, as before. One
+   * value for both bearer checks, the upgrade and the media plane, because two
+   * settings would be two ways to leave one of them on the weaker scheme.
+   */
+  gatewayKeyMode?: GatewayKeyMode;
   /**
    * The gateway that receives turns no per-trip gateway serves.
    *
@@ -299,7 +307,7 @@ export class RelayConnector {
     if (typeof header !== "string") return null;
     const match = /^Bearer\s+(.+)$/i.exec(header.trim());
     if (!match?.[1]) return null;
-    return verifyUpgradeToken(match[1], this.options.gatewaySecrets) ?? null;
+    return verifyUpgradeToken(match[1], this.options.gatewaySecrets, undefined, this.options.gatewayKeyMode ?? "shared") ?? null;
   }
 
   private onConnection(ws: WebSocket, gatewayId: string): void {

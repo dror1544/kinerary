@@ -1,0 +1,42 @@
+{
+  "label": "kinerary-relay-gateway:v1:",
+  "note": "derived = hex(HMAC-SHA256(master, label + id)); token = base64url(id:0:hex(HMAC-SHA256(derived hex string as the key, 'id:0'))), unpadded. Generated with Python hmac, independent of the TypeScript derive.",
+  "vectors": [
+    {
+      "master": "master-secret-one",
+      "id": "trip-example-a",
+      "derived": "24649edaa57fb0740ca89f2ea77326a89d4ee8fee53766e49b2e176eb09ceaa8",
+      "token": "dHJpcC1leGFtcGxlLWE6MDo4MTRjNDk5ZDRiYjlmMTQyNjc1Y2VmNDA4OTU3OTkxMTUzMzEwNTE0YmM5YzRmYzhhNDg1ZmE2NzAxMmI0N2Yy"
+    },
+    {
+      "master": "s3cret",
+      "id": "gw_abc",
+      "derived": "1a40b4632b28d42db1e8767ce70dbebcc2099295acdd11fb9fd4a971b7603731",
+      "token": "Z3dfYWJjOjA6MmQyODEzNzY2YTEyN2M1MzI4NDI2NjY0YzEwNGJjZWQyODFjNDU1NTVmODRlY2JiMmE1YzQ1MDY3YmFlNTgxYQ"
+    },
+    {
+      "master": "k",
+      "id": "gw:with:colons",
+      "derived": "1b8e8c6307ecb833776452b14be4f36c19c2b9497d6b13924451ee3ed01bf41f",
+      "token": "Z3c6d2l0aDpjb2xvbnM6MDoyOTlkZDQ0OWM3OTNjYTZlZWViZDM0YTFmM2RjODI1MjQzZTBkMTBjNjM1YTYyOTEwMjYzOWIxY2E2NjI4YWQw"
+    },
+    {
+      "master": "another-secret",
+      "id": "gateway-1",
+      "derived": "5a5936c37bdf38806543d04db42ca247b02ca3a34d1c04e0945b1e4a419f06df",
+      "token": "Z2F0ZXdheS0xOjA6ZTQ1MjQxMmUyNWJmZmE5MTgxODgxYTZiNDZiZTc5ZGZkYThiODJmODY0NWYwMzc1MWE0MTQ0NzM1OWMxMTQwMw"
+    },
+    {
+      "master": "master-secret-one",
+      "id": "trip-example-b",
+      "derived": "8967b4d571ad4fcf9e89498fd6f0ecd222c6f0c016d56e9ba06bc14f5d6ab9df",
+      "token": "dHJpcC1leGFtcGxlLWI6MDo3OTgyNDM4MDA4MmY5ZDlmYjM0Mjk1ZDE0MzE4MTJiNzkwZjA0OWVlZjExMGUxNDg3YzNjZmUxYzdhYzc5NzM5"
+    },
+    {
+      "master": "unicode-master",
+      "id": "טיול-1",
+      "derived": "fd6166043dab7453baa375b155e9b503f80aa50de4b927e6b2a2d2a8f0d3ec7a",
+      "token": "15jXmdeV15wtMTowOjllYzA2ODQ2MmQwODgwYmE0ZjU3NzQ1ZWNmMzVhY2M3MjZiNGI5MmMzM2UwMTJlODMyZGFhZDIwNmZiYTA3NzI"
+    }
+  ]
+}

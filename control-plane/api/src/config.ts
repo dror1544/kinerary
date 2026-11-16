@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { z } from "zod";
+import { GATEWAY_KEY_MODES } from "./relay/protocol.js";
 
 const secretReference = z.string().regex(
   // vault:// carries a #field selector because a KV secret holds several
@@ -230,6 +231,20 @@ export const architectureProfileSchema = z.object({
      * through the change.
      */
     gateway_secret_refs: z.array(secretReference).min(1),
+    /**
+     * What those secrets are MASTERS for (#597 K1; `deriveGatewayKey`).
+     * `shared`: a gateway signs its token with the secret itself, so a
+     * credential held for one gateway id is valid for every id. `derived`: a
+     * gateway holds `derive(secret, its id)` and a master-signed token is
+     * refused. `both`: either, for the changeover.
+     *
+     * One setting, read by both checkers: the relay connector (WebSocket
+     * upgrade and media plane) and the companion control MCP. A value that is
+     * not one of the three fails config load: an unknown mode quietly meaning
+     * "accept" is the failure to avoid. Absent is `shared`, today's behaviour,
+     * so shipping this switches nothing on.
+     */
+    gateway_key_mode: z.enum(GATEWAY_KEY_MODES).default("shared"),
     /**
      * The shared trip bot's token, kept as its own ref because signup and trip
      * are distinct ROLES — not because they are guaranteed to be distinct bots.

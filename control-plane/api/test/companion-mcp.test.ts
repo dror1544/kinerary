@@ -19,7 +19,7 @@ import {
   tripForCompanion,
 } from "../src/companion-mcp.js";
 import { applyMigrations } from "../src/migrations.js";
-import { makeUpgradeToken } from "../src/relay/protocol.js";
+import { deriveGatewayKey, makeUpgradeToken, type GatewayKeyMode } from "../src/relay/protocol.js";
 import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const SECRET = "relay-gateway-secret-for-tests";
@@ -42,6 +42,33 @@ describe("gatewayFromAuthorization — identity is the relay's token, nothing el
 
   test("with no secret configured, nothing is accepted", () => {
     assert.equal(gatewayFromAuthorization(`Bearer ${makeUpgradeToken("japan2026", SECRET)}`, []), null);
+  });
+});
+
+describe("gatewayFromAuthorization — gateway key mode (#597 K1, AC-K1.2/K1.3)", () => {
+  const masterToken = `Bearer ${makeUpgradeToken("japan2026", SECRET)}`;
+  const derivedToken = `Bearer ${makeUpgradeToken("japan2026", deriveGatewayKey(SECRET, "japan2026"))}`;
+  const otherGatewaysToken = `Bearer ${makeUpgradeToken("japan2026", deriveGatewayKey(SECRET, "usa2026"))}`;
+
+  test("absent mode is shared: a master-signed token only", () => {
+    assert.equal(gatewayFromAuthorization(masterToken, [SECRET]), "japan2026");
+    assert.equal(gatewayFromAuthorization(derivedToken, [SECRET]), null);
+  });
+
+  test("derived: the key derived for that id only; the master itself is refused", () => {
+    assert.equal(gatewayFromAuthorization(derivedToken, [SECRET], "derived"), "japan2026");
+    assert.equal(gatewayFromAuthorization(masterToken, [SECRET], "derived"), null);
+  });
+
+  test("both: either", () => {
+    assert.equal(gatewayFromAuthorization(derivedToken, [SECRET], "both"), "japan2026");
+    assert.equal(gatewayFromAuthorization(masterToken, [SECRET], "both"), "japan2026");
+  });
+
+  test("a key derived for another gateway cannot name this one, in any mode", () => {
+    for (const mode of ["shared", "both", "derived"] as GatewayKeyMode[]) {
+      assert.equal(gatewayFromAuthorization(otherGatewaysToken, [SECRET], mode), null, mode);
+    }
   });
 });
 
