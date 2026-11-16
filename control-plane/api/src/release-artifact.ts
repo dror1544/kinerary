@@ -1,7 +1,8 @@
 // Release-artifact renderer + sanitation scan + sealed manifest.
 //
 // Sprint 4.7 — release-artifact hardening. A "release" is the trip-runtime
-// source tree (site/, server/, shared/) frozen at a git revision. This module
+// source tree (site/, server/, shared/, and since #568 slice R2 mcp/ and
+// profile-templates/) frozen at a git revision. This module
 // turns that revision into a *sealed manifest*: the exact file list with git's
 // own per-file content hash, the schema-compatibility range, and a sanitation
 // scan report. The manifest's artifactDigest is a pure function of its file
@@ -21,7 +22,19 @@ export const RELEASE_MANIFEST_SCHEMA = 1 as const;
 // site/ is served to browsers, server/ is the node app, shared/ is the schema
 // code both import. Not .agents/skills/create-trip/ — that is the human
 // scaffolding path, not what a control-plane provision renders against.
-export const PAYLOAD_ROOTS = ["site", "server", "shared"] as const;
+export const SITE_PAYLOAD_ROOTS = ["site", "server", "shared"] as const;
+
+// What runs BESIDE the site (#568 R2): mcp/ is the trip's bridge, and
+// profile-templates/ is what its companion's SOUL.md and skills are rendered
+// from. They are in the release so one release is one version of a trip's site,
+// bridge and companion, and a rollback returns all three. A release built before
+// R2 sealed the site roots only and stays valid for the site step (its digest is
+// over those alone); steps that need these roots refuse it.
+export const RUNTIME_PAYLOAD_ROOTS = ["mcp", "profile-templates"] as const;
+
+// Python twin: release_source.py SITE_ROOTS + RUNTIME_ROOTS — change them together
+// (release-artifact.test.ts reads the twin and fails when they differ).
+export const PAYLOAD_ROOTS = [...SITE_PAYLOAD_ROOTS, ...RUNTIME_PAYLOAD_ROOTS] as const;
 
 export interface TreeEntry {
   /** repo-root-relative POSIX path, e.g. "site/app.js" */
@@ -142,6 +155,51 @@ export function scanLine(line: string): string[] {
   return hits;
 }
 
+// What the new roots (#568 R2) are allowed that the site is not. The bridge and
+// the companion templates exist to talk to services on the host they run on, so
+// they name loopback (`127.0.0.1:3001`, `http://127.0.0.1:4313/sse`) in code,
+// templates and docs alike; that identifies no deployment. A private address
+// that is not loopback is still a finding there, on the same line as a loopback
+// one too. And a README, or a Markdown file under a docs/ directory, outside any
+// templates/ directory, is prose: its example LAN addresses are illustrations, the same line the
+// repository's own rule 6 check draws ("code, not prose"). The secret rules stay
+// on for prose — a token in a README is a leak wherever it sits. The site roots
+// get none of this: what they were scanned for before, they are scanned for now.
+const LOOPBACK_IPV4 = /(?<![0-9.])127\.\d{1,3}\.\d{1,3}\.\d{1,3}(?![0-9.])/g;
+
+function underRuntimeRoot(path: string): boolean {
+  return RUNTIME_PAYLOAD_ROOTS.some((root) => path.startsWith(`${root}/`));
+}
+
+/**
+ * Prose, for the private-address rule: a README, or a Markdown file under a docs/ directory, that is not under a
+ * templates/ directory. A SKILL.md or a .tpl under templates/ is rendered into every companion as instructions, so
+ * it is code as far as this scan is concerned; so is a runbook-shaped file that is not named README.
+ */
+function isProse(path: string): boolean {
+  const parts = path.split("/");
+  if (parts.includes("templates")) return false;
+  const name = parts[parts.length - 1] ?? "";
+  if (!/\.md$/i.test(name)) return false;
+  return /^README(\..*)?\.md$/i.test(name) || parts.slice(0, -1).includes("docs");
+}
+
+/** Rules that fire on one line of one file. Same rules as `scanLine`, relaxed only as described above. */
+export function scanFileLine(path: string, line: string): string[] {
+  if (!underRuntimeRoot(path)) return scanLine(line);
+  const prose = isProse(path);
+  const withoutLoopback = line.replace(LOOPBACK_IPV4, "loopback");
+  const hits: string[] = [];
+  for (const { rule, pattern } of SCAN_RULES) {
+    if (rule === "private-ipv4") {
+      if (!prose && pattern.test(withoutLoopback)) hits.push(rule);
+    } else if (pattern.test(line)) {
+      hits.push(rule);
+    }
+  }
+  return hits;
+}
+
 export async function scanPayload(
   source: PayloadSource,
   revision: string,
@@ -156,7 +214,7 @@ export async function scanPayload(
     scannedFiles += 1;
     const lines = text.split("\n");
     for (let i = 0; i < lines.length; i += 1) {
-      for (const rule of scanLine(lines[i] ?? "")) {
+      for (const rule of scanFileLine(file.path, lines[i] ?? "")) {
         findings.push({ path: file.path, line: i + 1, rule });
       }
     }

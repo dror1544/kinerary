@@ -502,7 +502,7 @@ EOF
         and (.release.id | type == "string" and test("^[A-Za-z0-9_.-]{1,80}$"))
         and (.steps | type == "array" and length > 0 and all(.[]; . == "site" or . == "bridge" or . == "companion" or . == "switches"))
         and (.trips | type == "array" and length > 0 and length <= 200 and all(.[]; (type == "object") and (.slug | slug))))
-    then "OK\t\(.release.source_revision)\t\(.release.id)\t\(.steps | join(", "))\t\(.trips | map(.slug) | join(", "))"
+    then . as $p | "OK\t\(.release.source_revision)\t\(.release.id)\t\(.steps | join(", "))\t\(.trips | map(.slug) | join(", "))\t\([$p.trips[] | select(.target_status == "deprecated" and .previous_release_id == $p.release.id) | .slug] | join(", "))\t\([$p.trips[] | select(.overwrite_edited_companion == true) | .slug] | join(", "))"
     else "BAD" end' 2>/dev/null)" || summary=""
   case "$summary" in
     OK*) ;;
@@ -510,10 +510,12 @@ EOF
        return 0 ;;
   esac
   line="$(printf '%s' "$summary" | tr '\t' '\n')"
-  got="$(printf '%s\n' "$line" | sed -n '2p')"; local release steps trips
+  got="$(printf '%s\n' "$line" | sed -n '2p')"; local release steps trips withdrawn overwrite
   release="$(printf '%s\n' "$line" | sed -n '3p')"
   steps="$(printf '%s\n' "$line" | sed -n '4p')"
   trips="$(printf '%s\n' "$line" | sed -n '5p')"
+  withdrawn="$(printf '%s\n' "$line" | sed -n '6p')"
+  overwrite="$(printf '%s\n' "$line" | sed -n '7p')"
   if [[ "$steps_arg" =~ ^[a-z]+(,[a-z]+)*$ ]]; then
     steps_shown=" (this command narrows them to: ${steps_arg//,/, })"
   elif [ -n "$steps_arg" ]; then
@@ -521,6 +523,15 @@ EOF
   fi
   printf 'ROLLOUT, read from the plan file %s:\n  commit  %s (release %s)\n  trips   %s\n  steps   %s%s\n' \
     "${plan_file//[[:cntrl:]]/?}" "$got" "$release" "$trips" "$steps" "$steps_shown"
+  # Two things an approval must not pass over, stated from fields this hook validated (a closed status, a slug list), never
+  # from the plan's free text. A rollback to a release withdrawn from new builds (Decision 5, 2026-11-15): allowed only as
+  # a trip's own previous release, and said so. And a companion that was edited in place being overwritten (Decision 2).
+  if [ -n "$withdrawn" ]; then
+    printf '  WARNING: this plan rolls back to release %s, which is DEPRECATED (no longer available for new builds), for: %s. It is accepted only because it is each of those trips'"'"'s own recorded previous release.\n' "$release" "$withdrawn"
+  fi
+  if [ -n "$overwrite" ]; then
+    printf '  WARNING: a companion profile edited in place WILL BE OVERWRITTEN (its files are copied aside first) for: %s.\n' "$overwrite"
+  fi
   if [ -z "$digest" ]; then
     printf '  NO --plan-digest on this command: it refuses to run without one.'
   elif [ -n "$hex" ] && [ "$digest" = "sha256:$hex" ]; then

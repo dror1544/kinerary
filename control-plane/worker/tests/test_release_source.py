@@ -9,8 +9,12 @@ import tempfile
 import unittest
 
 from control_plane_worker.release_source import (
+    PAYLOAD_ROOTS,
+    RUNTIME_ROOTS,
+    SITE_ROOTS,
     ReleaseSourceError,
     materialize_release_source,
+    release_payload_roots,
     tree_digest,
 )
 
@@ -32,6 +36,8 @@ class ReleaseSourceTests(unittest.TestCase):
             "server/server.js": "// server\n",
             "server/Dockerfile": "FROM node:20\n",
             "shared/schema.js": "export const V = 1;\n",
+            "mcp/mcp.js": "// the bridge\n",
+            "profile-templates/familytrip-companion/render_profile.py": "# render\n",
             "docs/not-payload.md": "ignore me\n",
         }.items():
             path = os.path.join(self.repo, rel)
@@ -54,13 +60,19 @@ class ReleaseSourceTests(unittest.TestCase):
         return d
 
     def test_digest_matches_the_ts_formula(self) -> None:
-        listing = _git(self.repo, "ls-tree", "-r", self.rev, "--", "site", "server", "shared")
+        listing = _git(self.repo, "ls-tree", "-r", self.rev, "--", *PAYLOAD_ROOTS)
         rows = sorted(
             f"{line.partition(chr(9))[2]} {line.split()[2]}"
             for line in listing.splitlines() if line
         )
         expected = "sha256:" + hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()
         self.assertEqual(tree_digest(self.repo, self.rev), expected)
+
+    def test_the_payload_roots_are_the_site_and_the_runtime_trees_in_the_ts_twins_order(self) -> None:
+        # control-plane/api/src/release-artifact.ts PAYLOAD_ROOTS: change them together (R2, #568).
+        self.assertEqual(("site", "server", "shared"), SITE_ROOTS)
+        self.assertEqual(("mcp", "profile-templates"), RUNTIME_ROOTS)
+        self.assertEqual(SITE_ROOTS + RUNTIME_ROOTS, PAYLOAD_ROOTS)
 
     def test_digest_ignores_paths_outside_the_payload_roots(self) -> None:
         before = tree_digest(self.repo, self.rev)
@@ -84,6 +96,60 @@ class ReleaseSourceTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(dest, "server", "Dockerfile")))
         self.assertTrue(os.path.isfile(os.path.join(dest, "shared", "schema.js")))
         self.assertFalse(os.path.exists(os.path.join(dest, "docs")))
+
+    def test_materialize_carries_the_bridge_and_the_companion_templates(self) -> None:
+        dest = self._materialize(self.repo, self.rev, tree_digest(self.repo, self.rev))
+        self.assertTrue(os.path.isfile(os.path.join(dest, "mcp", "mcp.js")))
+        self.assertTrue(os.path.isfile(os.path.join(dest, "profile-templates", "familytrip-companion", "render_profile.py")))
+
+    def test_a_release_sealed_before_the_runtime_roots_still_verifies_and_carries_the_site_only(self) -> None:
+        # "Releases built before this stay valid for the site step" (spec, release manifest). The old seal covers
+        # site/ server/ shared/ and nothing else; the checkout at that revision may well hold mcp/ today.
+        legacy = tree_digest(self.repo, self.rev, SITE_ROOTS)
+        self.assertNotEqual(legacy, tree_digest(self.repo, self.rev))
+        self.assertEqual(SITE_ROOTS, release_payload_roots(self.repo, self.rev, legacy))
+        dest = self._materialize(self.repo, self.rev, legacy)
+        self.assertTrue(os.path.isfile(os.path.join(dest, "site", "app.js")))
+        self.assertFalse(os.path.exists(os.path.join(dest, "mcp")), "what the seal did not cover is not shipped")
+        self.assertFalse(os.path.exists(os.path.join(dest, "profile-templates")))
+
+    def test_a_current_release_is_detected_as_covering_every_root(self) -> None:
+        self.assertEqual(PAYLOAD_ROOTS, release_payload_roots(self.repo, self.rev, tree_digest(self.repo, self.rev)))
+
+    def test_a_digest_matching_neither_seal_detects_nothing(self) -> None:
+        self.assertIsNone(release_payload_roots(self.repo, self.rev, "sha256:" + "0" * 64))
+
+    def test_a_change_inside_the_bridge_or_the_templates_changes_the_digest(self) -> None:
+        before = tree_digest(self.repo, self.rev)
+        for rel in ("mcp/mcp.js", "profile-templates/familytrip-companion/render_profile.py"):
+            with open(os.path.join(self.repo, rel), "a", encoding="utf-8") as fh:
+                fh.write("// changed\n")
+            _git(self.repo, "commit", "-aqm", f"change {rel}")
+            rev = _git(self.repo, "rev-parse", "HEAD").strip()
+            self.assertNotEqual(tree_digest(self.repo, rev), before, rel)
+            self.assertEqual(tree_digest(self.repo, rev, SITE_ROOTS), tree_digest(self.repo, self.rev, SITE_ROOTS),
+                             "the site seal is blind to them, which is why the new seal exists")
+            before = tree_digest(self.repo, rev)
+
+    def test_a_revision_without_the_runtime_trees_materializes_what_it_has(self) -> None:
+        # A commit from before mcp/ existed: both seals are the same string, and the archive must not be asked
+        # for a path the revision does not have.
+        _git(self.repo, "rm", "-rq", "mcp", "profile-templates")
+        _git(self.repo, "commit", "-qm", "no runtime trees")
+        rev = _git(self.repo, "rev-parse", "HEAD").strip()
+        digest = tree_digest(self.repo, rev)
+        self.assertEqual(digest, tree_digest(self.repo, rev, SITE_ROOTS))
+        dest = self._materialize(self.repo, rev, digest)
+        self.assertTrue(os.path.isfile(os.path.join(dest, "site", "app.js")))
+        self.assertFalse(os.path.exists(os.path.join(dest, "mcp")))
+
+    def test_a_revision_with_no_payload_at_all_is_refused_and_never_archives_the_whole_repository(self) -> None:
+        _git(self.repo, "rm", "-rq", "site", "server", "shared", "mcp", "profile-templates")
+        _git(self.repo, "commit", "-qm", "nothing left")
+        rev = _git(self.repo, "rev-parse", "HEAD").strip()
+        with self.assertRaises(ReleaseSourceError) as ctx:
+            materialize_release_source(self.repo, rev, None)
+        self.assertEqual("RELEASE_PAYLOAD_EMPTY", ctx.exception.safe_error_code)
 
     def test_no_expected_digest_still_materializes(self) -> None:
         dest = self._materialize(self.repo, self.rev, None)

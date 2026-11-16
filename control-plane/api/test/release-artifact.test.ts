@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { test, describe } from "node:test";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { createGitPayloadSource } from "../src/release-git.js";
 import {
+  PAYLOAD_ROOTS,
+  RUNTIME_PAYLOAD_ROOTS,
+  SITE_PAYLOAD_ROOTS,
   buildReleaseManifest,
   computeArtifactDigest,
   isBinaryExtension,
@@ -213,5 +219,157 @@ describe("verifyManifest", () => {
     const m = await fresh();
     assert.equal(verifyManifest({ ...m, files: [] }).ok, false);
     assert.equal(verifyManifest({ ...m, sourceRevision: "nope" }).ok, false);
+  });
+});
+
+// ── R2 (#568): the release carries the bridge and the companion templates ─────
+
+describe("the payload roots", () => {
+  test("a release covers the site, the bridge and the companion templates", () => {
+    assert.deepEqual([...PAYLOAD_ROOTS], ["site", "server", "shared", "mcp", "profile-templates"]);
+    assert.deepEqual([...SITE_PAYLOAD_ROOTS], ["site", "server", "shared"]);
+    assert.deepEqual([...RUNTIME_PAYLOAD_ROOTS], ["mcp", "profile-templates"]);
+  });
+
+  test("the Python twin that re-verifies the tree before a deploy names the same roots in the same order", () => {
+    const text = readFileSync(
+      fileURLToPath(new URL("../../worker/control_plane_worker/release_source.py", import.meta.url)), "utf8");
+    const tuple = (name: string) => {
+      const m = new RegExp(`^${name} = \\(([^)]*)\\)`, "m").exec(text);
+      assert.ok(m, `release_source.py no longer defines ${name}`);
+      return [...m[1]!.matchAll(/"([^"]+)"/g)].map((x) => x[1]);
+    };
+    assert.deepEqual(tuple("SITE_ROOTS"), [...SITE_PAYLOAD_ROOTS]);
+    assert.deepEqual(tuple("RUNTIME_ROOTS"), [...RUNTIME_PAYLOAD_ROOTS]);
+  });
+
+  test("a manifest built over the new roots lists their files and the digest covers them (AC-13)", async () => {
+    const files = {
+      ...CLEAN_PAYLOAD,
+      "mcp/mcp.js": "const BIND = process.env.MCP_BIND || '127.0.0.1';\n",
+      "profile-templates/familytrip-companion/render_profile.py": "# renders SOUL.md\n",
+    };
+    const opts = { applicationSchema: 1, dataSchemaMin: 1, dataSchemaMax: 1, now: () => new Date("2026-11-16T00:00:00.000Z") };
+    const manifest = await buildReleaseManifest(fakeSource(files), opts);
+    assert.ok(manifest.files.some((f) => f.path === "mcp/mcp.js"));
+    assert.ok(manifest.files.some((f) => f.path.startsWith("profile-templates/")));
+    assert.deepEqual(verifyManifest(manifest), { ok: true });
+    // The seal is over them: a release built before this (whose digest is over the site alone) cannot be
+    // mistaken for one that carries the bridge.
+    const without = await buildReleaseManifest(fakeSource(CLEAN_PAYLOAD), opts);
+    assert.notEqual(manifest.artifactDigest, without.artifactDigest);
+  });
+});
+
+describe("the sanitation scan over the new roots", () => {
+  const opts = { applicationSchema: 1, dataSchemaMin: 1, dataSchemaMax: 1, now: () => new Date("2026-11-16T00:00:00.000Z") };
+
+  test("a leak in the bridge or a companion template is caught exactly as in the site", async () => {
+    const manifest = await buildReleaseManifest(fakeSource({
+      ...CLEAN_PAYLOAD,
+      "mcp/mcp.js": "const TRIP = 'http://192.168.0.61:8080';\n",
+      "profile-templates/familytrip-companion/templates/config.overlay.yaml.tpl": "url: http://10.0.0.9/sse\n# /Users/someone/x/\n",
+      "mcp/provision.js": "const key = 'sk-" + "a".repeat(40) + "';\n",
+    }), opts);
+    assert.equal(manifest.sanitation.passed, false);
+    assert.deepEqual(manifest.sanitation.findings.map((f) => `${f.path}:${f.line}:${f.rule}`).sort(), [
+      "mcp/mcp.js:1:private-ipv4",
+      "mcp/provision.js:1:openai-key",
+      "profile-templates/familytrip-companion/templates/config.overlay.yaml.tpl:1:private-ipv4",
+      "profile-templates/familytrip-companion/templates/config.overlay.yaml.tpl:2:host-path",
+    ]);
+  });
+
+  test("a loopback address is not a leak under the new roots: the bridge and the templates name the local services they bind", async () => {
+    const manifest = await buildReleaseManifest(fakeSource({
+      ...CLEAN_PAYLOAD,
+      "mcp/mcp.js": "const BIND_HOST = process.env.PROVISION_BIND || '127.0.0.1';\n",
+      "profile-templates/familytrip-companion/templates/config.overlay.yaml.tpl": "url: http://127.0.0.1:4313/sse\n",
+    }), opts);
+    assert.deepEqual(manifest.sanitation.findings, []);
+    assert.equal(manifest.sanitation.passed, true);
+  });
+
+  test("...but only there: the same address in the site is still a finding, so the old roots are no looser than before", async () => {
+    const manifest = await buildReleaseManifest(fakeSource({
+      ...CLEAN_PAYLOAD,
+      "site/app.js": "const API = 'http://127.0.0.1:3000';\n",
+    }), opts);
+    assert.deepEqual(manifest.sanitation.findings, [{ path: "site/app.js", line: 1, rule: "private-ipv4" }]);
+  });
+
+  test("a loopback address does not hide a private one on the same line", async () => {
+    const manifest = await buildReleaseManifest(fakeSource({
+      ...CLEAN_PAYLOAD,
+      "mcp/mcp.js": "// from 127.0.0.1 to http://192.168.1.50:3001\n",
+    }), opts);
+    assert.deepEqual(manifest.sanitation.findings, [{ path: "mcp/mcp.js", line: 1, rule: "private-ipv4" }]);
+  });
+
+  test("a private example address in a README under the new roots is prose, not a leak; a secret in one still is", async () => {
+    const ok = await buildReleaseManifest(fakeSource({
+      ...CLEAN_PAYLOAD,
+      "mcp/README.md": "reach it at http://192.168.1.50:3001 on your LAN\n",
+    }), opts);
+    assert.deepEqual(ok.sanitation.findings, []);
+    const bad = await buildReleaseManifest(fakeSource({
+      ...CLEAN_PAYLOAD,
+      "mcp/README.md": "reach it at http://192.168.1.50:3001\nghp_" + "a".repeat(36) + "\n/Users/someone/x/\n",
+    }), opts);
+    assert.deepEqual(bad.sanitation.findings.map((f) => `${f.line}:${f.rule}`), ["2:github-pat", "3:host-path"]);
+  });
+
+  test("only README and docs are prose: a skill or any file under a templates/ directory ships to every companion as instructions and stays under the rule", async () => {
+    for (const path of [
+      "profile-templates/familytrip-companion/templates/skills/travel/x/SKILL.md",
+      "profile-templates/familytrip-companion/templates/references/sources.md.tpl",
+      "profile-templates/familytrip-companion/templates/README.md",
+      "profile-templates/familytrip-companion/INTERVIEW-HANDOFF.md",
+      "mcp/PROVISIONING.md",
+    ]) {
+      const manifest = await buildReleaseManifest(fakeSource({
+        ...CLEAN_PAYLOAD,
+        [path]: "fetch it from http://192.168.0.60:8080\n",
+      }), opts);
+      assert.deepEqual(manifest.sanitation.findings, [{ path, line: 1, rule: "private-ipv4" }], path);
+    }
+    for (const path of ["mcp/README.md", "profile-templates/familytrip-companion/README.md", "mcp/docs/setup.md"]) {
+      const manifest = await buildReleaseManifest(fakeSource({
+        ...CLEAN_PAYLOAD,
+        [path]: "reach it at http://192.168.1.50:3001\n",
+      }), opts);
+      assert.deepEqual(manifest.sanitation.findings, [], path);
+    }
+  });
+
+  test("a loopback address in a skill is still fine: it names a local service", async () => {
+    const manifest = await buildReleaseManifest(fakeSource({
+      ...CLEAN_PAYLOAD,
+      "profile-templates/familytrip-companion/templates/skills/travel/x/SKILL.md": "call http://127.0.0.1:4313/sse\n",
+    }), opts);
+    assert.deepEqual(manifest.sanitation.findings, []);
+  });
+
+  test("the same README in the SITE is still scanned in full", async () => {
+    const manifest = await buildReleaseManifest(fakeSource({
+      ...CLEAN_PAYLOAD,
+      "site/README.md": "reach it at http://192.168.1.50:3001\n",
+    }), opts);
+    assert.deepEqual(manifest.sanitation.findings, [{ path: "site/README.md", line: 1, rule: "private-ipv4" }]);
+  });
+
+  test("scanLine, the pure per-line rule, is unchanged: loopback is relaxed by where the file is, not by the pattern", () => {
+    assert.deepEqual(scanLine("bind 127.0.0.1"), ["private-ipv4"]);
+  });
+
+  test("the real tree at HEAD, over every payload root, passes its own scan and lists the bridge and the templates", async () => {
+    const repoRoot = fileURLToPath(new URL("../../../", import.meta.url));
+    const manifest = await buildReleaseManifest(createGitPayloadSource(repoRoot), opts);
+    assert.ok(manifest.files.some((f) => f.path === "mcp/mcp.js"), "mcp/ is in the sealed list");
+    assert.ok(manifest.files.some((f) => f.path.startsWith("profile-templates/familytrip-companion/")),
+      "profile-templates/ is in the sealed list");
+    assert.deepEqual(manifest.sanitation.findings, [],
+      "the shipped bridge and templates must pass the scan the site already passes");
+    assert.deepEqual(verifyManifest(manifest), { ok: true });
   });
 });

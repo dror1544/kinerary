@@ -79,6 +79,18 @@ head -c 65537 > "$HANDOFF"
 # which carries a `profile` object and so both are validated separately; and
 # `companion_gateway_action`, one profile name, a verb from the closed set
 # start|stop, and optionally the trip slug whose bridge to check first.
+#
+# Since 2026-11-16 (#568 slice R2) one more: `companion_profile_rerender`, which
+# brings an EXISTING companion's SOUL.md and skills to the release a rollout is
+# bringing its trip to. It carries a profile name, a mode (check|apply), whether
+# an edited profile may be overwritten, the release's id and commit, and the
+# handoff the render needs. It is the one request that is not self-contained:
+# the render code and templates it uses are the RELEASE's, in a directory the
+# caller hands over through the environment (KINERARY_RELEASE_TREE). An SSH
+# forced command cannot set an environment variable, so the worker's key can
+# never point this at a tree of its own choosing; only a process already running
+# on this host as this user can, which is the rollout command. Without the
+# variable the request is refused (see rerender_profile below).
 VALIDATED="$(
   /usr/bin/python3 - "$HANDOFF" <<'PY'
 import json, re, sys
@@ -90,7 +102,8 @@ if not isinstance(d, dict):
     print("refusing a request that is not a JSON object", file=sys.stderr); raise SystemExit(2)
 kind = d.get("record_type") or "trip_assistant_profile_input"
 if kind not in ("trip_assistant_profile_input", "trip_mcp_bridge_request", "trip_mcp_bridge_probe",
-                "companion_gateway_status", "companion_gateway_backfill", "companion_gateway_action"):
+                "companion_gateway_status", "companion_gateway_backfill", "companion_gateway_action",
+                "companion_profile_rerender"):
     print(f"refusing unknown request type: {kind!r}", file=sys.stderr); raise SystemExit(2)
 if kind in ("companion_gateway_status", "companion_gateway_backfill"):
     # A list of profile NAMES and nothing else (issue 349). Each one is checked
@@ -124,6 +137,32 @@ if kind in ("trip_mcp_bridge_request", "trip_mcp_bridge_probe", "companion_gatew
         print(f"refusing unsafe trip slug: {slug!r}", file=sys.stderr); raise SystemExit(2)
     if slug == "" and kind != "companion_gateway_action":
         print(f"refusing unsafe trip slug: {slug!r}", file=sys.stderr); raise SystemExit(2)
+if kind == "companion_profile_rerender":
+    # Every value that reaches the tab-separated line below is matched against an
+    # ASCII pattern first: a tab or a newline in one would be a second, forged field.
+    mode = d.get("mode")
+    if mode not in ("check", "apply"):
+        print(f"refusing unknown re-render mode: {mode!r}", file=sys.stderr); raise SystemExit(2)
+    allow = d.get("allow_edited")
+    if allow is not True and allow is not False:
+        print("refusing a re-render whose allow_edited is not true or false", file=sys.stderr); raise SystemExit(2)
+    release = d.get("release")
+    rid = release.get("id") if isinstance(release, dict) else None
+    commit = release.get("commit") if isinstance(release, dict) else None
+    if (not isinstance(rid, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", rid)
+            or not isinstance(commit, str) or not re.fullmatch(r"[a-f0-9]{40}", commit)):
+        print("refusing a re-render that does not name its release", file=sys.stderr); raise SystemExit(2)
+    handoff = d.get("handoff")
+    if (not isinstance(handoff, dict) or handoff.get("record_type") != "trip_assistant_profile_input"
+            or not isinstance(handoff.get("profile"), dict) or handoff["profile"].get("name") != name):
+        print("refusing a re-render whose handoff is not the profile's own", file=sys.stderr); raise SystemExit(2)
+    # The handoff goes to its own file, mode 600 (umask 077 is already set), for render_profile.py.
+    import os
+    fd = os.open(os.path.join(os.path.dirname(sys.argv[1]), "rerender-handoff.json"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(handoff, fh, ensure_ascii=False)
+    print(f"{kind}\t{name}\t\t{mode}\t{1 if allow else 0}\t{rid}\t{commit}")
+    raise SystemExit(0)
 print(f"{kind}\t{name}\t{slug}\t{action}")
 PY
 )" || die "handoff validation failed"
@@ -131,6 +170,9 @@ REQUEST_KIND="$(printf '%s' "$VALIDATED" | cut -f1)"
 PROFILE_NAME="$(printf '%s' "$VALIDATED" | cut -f2)"
 TRIP_SLUG="$(printf '%s' "$VALIDATED" | cut -f3)"
 GATEWAY_ACTION="$(printf '%s' "$VALIDATED" | cut -f4)"
+RERENDER_ALLOW="$(printf '%s' "$VALIDATED" | cut -f5)"
+RERENDER_RELEASE_ID="$(printf '%s' "$VALIDATED" | cut -f6)"
+RERENDER_RELEASE_COMMIT="$(printf '%s' "$VALIDATED" | cut -f7)"
 
 # ── Which companion gateways run on THIS host (issue #349) ────────────────────
 #
@@ -1252,6 +1294,107 @@ if [ "$REQUEST_KIND" = "trip_mcp_bridge_request" ]; then
   fi
   tail -20 "$WORK/setup-mcp.log" >&2
   die "setup-mcp.sh failed for $TRIP_SLUG"
+fi
+
+# ── Re-render an existing companion from a release (#568 slice R2) ─────────────
+#
+# `render_profile.py` refuses an existing profile and the install path below
+# answers ALREADY_PRESENT and leaves SOUL.md as it was, so until now a companion
+# could never follow its trip to a newer release: the site and the bridge moved
+# and its instructions did not. This brings the files a RENDER OWNS (SOUL.md,
+# profile.yaml, INSTALL.md, config.overlay.yaml, references/, skills/) to a fresh
+# render of the release's templates for this trip, in place, and nothing else:
+# conversation history (state.db), memory, sessions, logs, the relay identity in
+# .env and the profile's own config.yaml are not read or written, except that the
+# overlay is merged into config.yaml exactly as an install merges it (the profile's
+# own settings win).
+#
+#   check   READ-ONLY. RERENDER <name> clean|edited|unknown_provenance
+#   apply   RERENDER <name> applied|unchanged, or the same two refusals with nothing written
+#
+# A profile somebody edited in place, or one installed before what was rendered
+# was recorded (so there is nothing to tell an edit from the original), is
+# REFUSED and reported, never overwritten (spec Decision 2). `allow_edited` is
+# the plan's explicit permission to overwrite it, and the edited files are copied
+# to $HOME/.hermes/profile-backups/<name>/<stamp>/ first (capture before deploy).
+#
+# What this refuses, whatever it is asked: a profile on the deny list, one that
+# is a symlink, one this system did not install (no provenance marker; the backfill
+# marks the ones it can prove), and any request when the release's tree is not a
+# real directory this user owns holding the release's render_profile.py. The tree
+# is the caller's environment, never the request's: see the header of the
+# validation block.
+#
+# It does NOT start, stop or restart the gateway and it enrols nothing: the caller
+# clears the saved prompts and restarts the gateway afterwards
+# (scripts/companion-refresh-prompts.sh), which is what makes a running
+# conversation follow the new SOUL.
+rerender_profile() {
+  local name="$PROFILE_NAME" home="$HOME/.hermes/profiles/$PROFILE_NAME" tree="${KINERARY_RELEASE_TREE:-}"
+  local render flags out code status
+  [ -n "$tree" ] || die "a re-render renders from a release: KINERARY_RELEASE_TREE is not set (only a rollout on this host sets it)"
+  case "$tree" in /*) ;; *) die "KINERARY_RELEASE_TREE is not an absolute path" ;; esac
+  render="$tree/profile-templates/familytrip-companion/render_profile.py"
+  [ -d "$tree" ] && [ ! -L "$tree" ] && [ -O "$tree" ] || die "KINERARY_RELEASE_TREE is not a real directory this user owns"
+  [ -f "$render" ] && [ ! -L "$render" ] && [ -O "$render" ] || die "the release carries no render_profile.py (a release built before the companion templates were part of it cannot re-render a companion)"
+  if gateway_denied "$name"; then die "$name is not a profile this system manages"; fi
+  [ ! -L "$home" ] || die "$name: its profile directory is a symlink"
+  [ -d "$home" ] || die "no companion profile $name on this host"
+  if [ -L "$home/$GATEWAY_MARKER" ] || [ ! -f "$home/$GATEWAY_MARKER" ]; then
+    die "$name carries no provenance marker: this system did not install it (run the backfill for it)"
+  fi
+
+  flags=(--reinstall-profile "$name" --release-id "$RERENDER_RELEASE_ID" --release-commit "$RERENDER_RELEASE_COMMIT")
+  if [ "$GATEWAY_ACTION" = check ]; then flags+=(--check); fi
+  # An apply always has a place to copy aside what it replaces or deletes (the newest three backups per profile are kept).
+  if [ "$GATEWAY_ACTION" = apply ]; then flags+=(--backup-root "$HOME/.hermes/profile-backups"); fi
+  if [ "$RERENDER_ALLOW" = 1 ] && [ "$GATEWAY_ACTION" = apply ]; then flags+=(--allow-edited); fi
+  out="$WORK/rerender.out"
+  code=0
+  /usr/bin/env python3 "$render" --input "$WORK/rerender-handoff.json" --output "$WORK/rerender-bundle" "${flags[@]}" \
+    > "$out" 2> "$WORK/rerender.err" || code=$?
+  if [ "$code" -ne 0 ] && [ "$code" -ne 3 ]; then
+    # The release's own renderer said no. The usual cause is the handoff's SHAPE: this host builds it with the
+    # control plane's current builder, and a release older than that shape refuses a key it does not know (or lacks one it
+    # requires). Name that, with the renderer's own one-line reason, rather than a bare exit code.
+    reason="$(grep -m1 '^ERROR:' "$WORK/rerender.err" | tr -c '[:print:]' '?' | cut -c1-240)"
+    tail -5 "$WORK/rerender.err" | tr -c '[:print:]\n' '?' >&2
+    die "the release's render_profile.py refused this trip's handoff for $name (exit $code): ${reason:-no reason given}. A release older than the handoff shape the control plane builds now cannot render it; roll the companion forward to a later release, or leave the companion step out"
+  fi
+  # The verdict is JSON written by the release's render_profile.py, i.e. by code that came from a
+  # release but is still another program's output: read through a closed set, one word out.
+  status="$(/usr/bin/python3 - "$out" <<'PYVERDICT'
+import json, re, sys
+try:
+    v = json.loads(open(sys.argv[1]).read().strip().splitlines()[-1])
+except Exception:
+    print("invalid"); raise SystemExit(0)
+status = v.get("status") if isinstance(v, dict) else None
+print(status if status in ("clean", "edited", "unknown_provenance", "applied", "unchanged") else "invalid")
+if isinstance(v, dict):
+    names = [n for n in (v.get("edited") or []) if isinstance(n, str) and re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", n)][:20]
+    if names:
+        print("edited: " + ", ".join(names), file=sys.stderr)
+    backup = v.get("backup")
+    if isinstance(backup, str) and re.fullmatch(r"[A-Za-z0-9._/ -]{1,300}", backup):
+        print("the edited files were copied to " + backup, file=sys.stderr)
+PYVERDICT
+  )" || status=invalid
+  [ "$status" != invalid ] || die "$name: the release's render_profile.py gave no verdict this host recognises"
+  case "$status" in
+    edited) printf 'companion-install-host: %s was edited in place; nothing was overwritten\n' "$name" >&2 ;;
+    unknown_provenance) printf 'companion-install-host: %s predates the record of what was rendered, so an edit cannot be told from the original; nothing was overwritten\n' "$name" >&2 ;;
+  esac
+  case "$status" in applied|unchanged)
+    if [ "$GATEWAY_ACTION" = apply ] && [ "$status" = applied ]; then merge_overlay "$name"; fi ;;
+  esac
+  printf 'RERENDER %s %s\n' "$name" "$status"
+}
+
+if [ "$REQUEST_KIND" = "companion_profile_rerender" ]; then
+  gateway_denied none || true     # load (and validate) the protected list before anything else
+  rerender_profile
+  exit 0
 fi
 
 if [ -d "$HOME/.hermes/profiles/$PROFILE_NAME" ]; then

@@ -4,11 +4,12 @@
 Until this command a merged change reached a running trip in pieces — site
 payload, then the trip's bridge, then the companion — each run by hand, each with
 its own prompt, and nothing recorded which version a trip ran. This is the
-order as a command (docs/specs/sprint-9/568-trip-rollout.md, slice R1: the site
-and bridge steps, the record, the approval):
+order as a command (docs/specs/sprint-9/568-trip-rollout.md, slices R1 and R2: the
+site, bridge and companion steps, the record, the approval):
 
     trip-rollout.py plan    --release <id|commit> --trip <slug>[,<slug>...] --plan-file <path>
-    trip-rollout.py execute --plan-file <path> --plan-digest <sha256:...> [--steps site,bridge]
+                            [--steps site,bridge,companion] [--overwrite-edited-companion <slug>[,<slug>...]]
+    trip-rollout.py execute --plan-file <path> --plan-digest <sha256:...> [--steps site,bridge,companion]
     trip-rollout.py status  [--trip <slug>]
 
 `plan` changes nothing. For each trip it says what the trip runs now, what it
@@ -24,8 +25,29 @@ For each trip, steps run in order and stop at the first failure:
              digest-verified, the deployment's deploy command run with a restart
              and WITHOUT the flag that overwrites the trip's config, then the
              site's own /api/health
-  2. bridge  the deployment's bridge restart, then the bridge's own /health
-             ("can you reach your trip"), whose code is the failure message
+  2. bridge  the deployment's bridge restart, run from the release's own mcp/ (the
+             materialized tree, not the host's checkout), then the bridge's own
+             /health ("can you reach your trip"), whose code is the failure message
+  3. companion
+             the profile's SOUL.md and skills re-rendered IN PLACE from the release's
+             profile-templates/ for this trip (the installer's `companion_profile_rerender`
+             request), then the saved prompts cleared, the gateway restarted and every tool
+             the release's bridge declares confirmed registered, read off the gateway's own
+             log (companion-refresh-prompts.sh). A profile edited in place, or installed
+             before the record of what was rendered existed, is REFUSED and reported, never
+             overwritten, unless the plan says so for that trip
+             (--overwrite-edited-companion), and then its files are copied aside first. A
+             conversation turn in flight is waited for, boundedly, never cut.
+
+A release built before releases carried mcp/ and profile-templates/ is valid for step 1
+and refused for steps 2 and 3 with a message saying so: its seal does not cover them.
+Steps run only when named: the default is `site,bridge`, so a deployment that has not yet
+configured the companion commands below is not broken by this slice.
+
+The way back is the trip's recorded previous release. It is accepted even when that release
+is no longer `available` (it was withdrawn from new builds, not from the trips that ran it):
+`plan` says so as a warning in its output and in the plan file, and so does the approval
+prompt. Any other release that is not `available` is refused.
 
 A `trip_rollouts` row is written as `running` before the first step acts and
 closed `ok` or `failed` (with the NAME of the failed step). Once the site step
@@ -45,14 +67,24 @@ REFUSES, naming each one, when any is unset:
   KINERARY_BRIDGE_RESTART_CMD     <cmd> --restart-only --trip-dir <dir>
   KINERARY_CONTAINER_HOSTNAME_CMD <cmd> <vmid>  prints the hostname of that container
   KINERARY_ROLLOUT_PSQL_CMD       a psql command line to the control plane database; SQL arrives on stdin
+and, only when the companion step is planned (each refused by name when it is unset):
+  KINERARY_COMPANION_INSTALL_CMD  the command that runs the companion installer on the host that holds the
+                                  profile (scripts/companion-install-host.sh); the request arrives on stdin,
+                                  KINERARY_RELEASE_TREE names the release's materialized tree
+  KINERARY_COMPANION_REFRESH_CMD  the command that runs scripts/companion-refresh-prompts.sh there
 Optional: KINERARY_ROLLOUT_REPO_ROOT (the checkout holding the release commits; default: this one),
 KINERARY_ROLLOUT_CHILD_ENV (comma-separated extra variable NAMES the deployment's commands need),
-KINERARY_ROLLOUT_SITE_WAIT_SECONDS / _BRIDGE_WAIT_SECONDS / _STEP_TIMEOUT_SECONDS.
+KINERARY_ROLLOUT_SITE_WAIT_SECONDS / _BRIDGE_WAIT_SECONDS / _STEP_TIMEOUT_SECONDS, and for the companion step
+KINERARY_ROLLOUT_TURN_WAIT_SECONDS (how long a turn in flight is waited for, default 120) and
+KINERARY_ROLLOUT_REGISTRATION_WAIT_SECONDS (how long the gateway has to register the bridge's tools, default 90).
 
-The deploy, bridge and hostname commands run with an ALLOW-LISTED environment, not
+The deploy, bridge, hostname and companion commands run with an ALLOW-LISTED environment, not
 this one's: a trip's keys are read inside the step, sent only to the trip's own
 loopback bridge as a header, and never printed, logged, stored or put on a command line.
-The rollout reads versions and health, never what travellers wrote.
+The companion step reads the trip's own config to build the same handoff a provision builds
+(the control plane's `build_companion_handoff`) and feeds it to the installer on STDIN: it
+carries organizer-private interview answers, so it is never printed, logged or stored.
+Otherwise the rollout reads versions and health, never what travellers wrote.
 """
 from __future__ import annotations
 
@@ -85,15 +117,24 @@ RELEASE_REF = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
 COMMIT = re.compile(r"^[a-f0-9]{40}$")
 DIGEST = re.compile(r"^sha256:[a-f0-9]{64}$")
 ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
-# The steps, in the only order they run. R1 builds the first two; the others are
-# named so a request for them is refused with a reason rather than ignored.
+# The steps, in the only order they run. R1 built the first two and R2 the third; the last is named so a
+# request for it is refused with a reason rather than ignored.
 ALL_STEPS = ("site", "bridge", "companion", "switches")
-BUILT_STEPS = ("site", "bridge")
-DEFAULT_STEPS = BUILT_STEPS
+BUILT_STEPS = ("site", "bridge", "companion")
+# What runs when no --steps is given. NOT the companion step yet: it needs two deployment commands that a
+# deployment configured for R1 does not have, and a default that suddenly refuses is not a default. Adding it
+# is this one line, once the deployment's wrapper sets KINERARY_COMPANION_INSTALL_CMD and _REFRESH_CMD.
+DEFAULT_STEPS = ("site", "bridge")
 NOT_IN_THIS_SLICE = {
-    "companion": "the companion step is slice R2 and is not in this slice",
     "switches": "the switches step is the feature-switch work (#567 S2) and is not in this slice",
 }
+# The release payload each step runs from: a release sealed before these trees were part of it covers neither.
+STEP_ROOTS = {"bridge": ("mcp",), "companion": ("profile-templates", "mcp")}
+# The steps that run from the release's materialized tree, so need its commit in the checkout.
+RUNS_FROM_TREE = frozenset(("site", "bridge", "companion"))
+# A rollback to the trip's own previous release is accepted when that release was withdrawn from new builds:
+# `deprecated`. A `retired` release was pulled on purpose and is not a way back; candidate and verified never ran.
+ROLLBACK_STATUSES = ("deprecated",)
 # A trip with no site yet, or one that is gone, has nothing to roll out to.
 # Past ready_private real people have used the site; that is exactly who a
 # rollout is for, so `active` is eligible by design.
@@ -106,6 +147,8 @@ STALE_RUNNING_SECONDS = 4 * 3600
 SITE_WAIT_DEFAULT = 90
 BRIDGE_WAIT_DEFAULT = 30
 STEP_TIMEOUT_DEFAULT = 900
+TURN_WAIT_DEFAULT = 120
+REGISTRATION_WAIT_DEFAULT = 90
 # mcp_bridge.mcp_port_for_vmid's rule, mirrored (the same one
 # companion-install-host.sh applies): 3000 + vmid, inside 3100-3999.
 BRIDGE_PORT_BASE = 3000
@@ -151,6 +194,10 @@ class Config:
     bridge_wait: int
     step_timeout: int
     environ: dict
+    companion_install_cmd: list = dataclasses.field(default_factory=list)
+    companion_refresh_cmd: list = dataclasses.field(default_factory=list)
+    turn_wait: int = 120
+    registration_wait: int = 90
 
     def child_env(self, extra: Optional[dict] = None) -> dict:
         names = CHILD_ENV_BASE + self.extra_child_env
@@ -175,6 +222,23 @@ REQUIRED_ENV = (
 )
 
 
+# Needed only when the companion step is planned or run: asked for then, by name, not at every command.
+COMPANION_ENV = (
+    ("KINERARY_COMPANION_INSTALL_CMD", "the command that runs the companion installer on the host that holds the profile"),
+    ("KINERARY_COMPANION_REFRESH_CMD", "the command that clears a companion's saved prompts and restarts its gateway"),
+)
+
+
+def require_companion_config(cfg: "Config") -> None:
+    missing = [(n, why) for n, why in COMPANION_ENV if not cfg.environ.get(n)]
+    if missing:
+        lines = "\n".join(f"  {n}  — {why}" for n, why in missing)
+        raise Refused("the companion step needs the deployment's own commands; unset:\n" + lines +
+                      "\nThe deployment's wrapper sets them (hard rule 6: this repository names no host, container or path).")
+    if not cfg.companion_install_cmd or not cfg.companion_refresh_cmd:
+        raise Refused("KINERARY_COMPANION_INSTALL_CMD and KINERARY_COMPANION_REFRESH_CMD must not be empty")
+
+
 def _seconds(environ: dict, name: str, default: int) -> int:
     raw = environ.get(name, "")
     if not raw:
@@ -182,6 +246,13 @@ def _seconds(environ: dict, name: str, default: int) -> int:
     if not raw.isdigit() or int(raw) < 1:
         raise Refused(f"{name} must be a whole number of seconds, not {raw!r}")
     return int(raw)
+
+
+def words_optional(environ: dict, name: str) -> list:
+    try:
+        return shlex.split(environ.get(name, ""))
+    except ValueError as exc:
+        raise Refused(f"{name} is not a command line: {exc}")
 
 
 def load_config(environ: dict, need: tuple = tuple(n for n, _ in REQUIRED_ENV)) -> Config:
@@ -229,6 +300,10 @@ def load_config(environ: dict, need: tuple = tuple(n for n, _ in REQUIRED_ENV)) 
         bridge_wait=_seconds(environ, "KINERARY_ROLLOUT_BRIDGE_WAIT_SECONDS", BRIDGE_WAIT_DEFAULT),
         step_timeout=_seconds(environ, "KINERARY_ROLLOUT_STEP_TIMEOUT_SECONDS", STEP_TIMEOUT_DEFAULT),
         environ=dict(environ),
+        companion_install_cmd=words_optional(environ, "KINERARY_COMPANION_INSTALL_CMD"),
+        companion_refresh_cmd=words_optional(environ, "KINERARY_COMPANION_REFRESH_CMD"),
+        turn_wait=_seconds(environ, "KINERARY_ROLLOUT_TURN_WAIT_SECONDS", TURN_WAIT_DEFAULT),
+        registration_wait=_seconds(environ, "KINERARY_ROLLOUT_REGISTRATION_WAIT_SECONDS", REGISTRATION_WAIT_DEFAULT),
     )
 
 
@@ -269,7 +344,13 @@ class DbError(RuntimeError):
 RELEASE_SQL = """
 SELECT row_to_json(r) FROM (
   SELECT id, source_revision, artifact_digest, status, data_schema_min, data_schema_max,
-         COALESCE(jsonb_typeof(manifest -> 'files') = 'array', false) AS has_manifest
+         COALESCE(jsonb_typeof(manifest -> 'files') = 'array', false) AS has_manifest,
+         CASE WHEN jsonb_typeof(manifest -> 'files') = 'array'
+              THEN EXISTS (SELECT 1 FROM jsonb_array_elements(manifest -> 'files') f WHERE f ->> 'path' LIKE 'mcp/%')
+              ELSE false END AS has_bridge,
+         CASE WHEN jsonb_typeof(manifest -> 'files') = 'array'
+              THEN EXISTS (SELECT 1 FROM jsonb_array_elements(manifest -> 'files') f WHERE f ->> 'path' LIKE 'profile-templates/%')
+              ELSE false END AS has_companion
     FROM control_plane.releases
    WHERE id = :'ref' OR source_revision = :'ref'
    ORDER BY (status = 'available') DESC, created_at DESC
@@ -352,10 +433,13 @@ OCTET = r"(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
 IPV4 = re.compile(rf"^{OCTET}(\.{OCTET}){{3}}$")
 
 
-def run_child(cfg: Config, args: list, extra_env: Optional[dict] = None, timeout: Optional[int] = None):
-    """A child with the allow-listed environment and no stdin. Output is captured,
-    never streamed: the caller decides what part of it, scrubbed, is shown."""
-    return subprocess.run(args, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+def run_child(cfg: Config, args: list, extra_env: Optional[dict] = None, timeout: Optional[int] = None,
+              input_text: Optional[str] = None):
+    """A child with the allow-listed environment. No stdin unless `input_text` is given: the one thing that is, is
+    the companion handoff, which carries organizer-private interview data and so travels on stdin and nowhere else.
+    Output is captured, never streamed: the caller decides what part of it, scrubbed, is shown."""
+    return subprocess.run(args, capture_output=True, text=True,
+                          stdin=subprocess.DEVNULL if input_text is None else None, input=input_text,
                           env=cfg.child_env(extra_env), timeout=timeout or cfg.step_timeout,
                           cwd=str(cfg.deploy_root))
 
@@ -407,10 +491,18 @@ def resolve_trip(cfg: Config, db: Db, slug: str) -> Trip:
                 container=container)
 
 
-def release_refusal(cfg: Config, release: dict, row: dict) -> Optional[str]:
-    """Why this release may not go to this trip, or None."""
-    if release["status"] != "available":
-        return f"release {release['id']} is {release['status']}, not available"
+ROOT_FLAGS = {"mcp": "has_bridge", "profile-templates": "has_companion"}
+
+
+def release_refusal(cfg: Config, release: dict, row: dict, steps: tuple = ("site",), rollback_ok: bool = False) -> Optional[str]:
+    """Why this release may not go to this trip, or None.
+
+    `rollback_ok` is the caller's finding that the release IS this trip's own recorded previous release: the way
+    back stays open after the release was withdrawn from new builds (`deprecated`), because the trips that ran it
+    still need it as their safety net (spec Decision 5). Every other release that is not `available` is refused."""
+    status = release["status"]
+    if status != "available" and not (rollback_ok and status in ROLLBACK_STATUSES):
+        return f"release {release['id']} is {status}, not available"
     if not release["has_manifest"]:
         return f"release {release['id']} has no sealed manifest, so its tree cannot be verified"
     schema = row.get("data_schema")
@@ -419,7 +511,18 @@ def release_refusal(cfg: Config, release: dict, row: dict) -> Optional[str]:
     if not (release["data_schema_min"] <= schema <= release["data_schema_max"]):
         return (f"the trip's data schema {schema} is outside what release {release['id']} covers "
                 f"({release['data_schema_min']}..{release['data_schema_max']})")
+    for step in steps:
+        absent = [r for r in STEP_ROOTS.get(step, ()) if not release.get(ROOT_FLAGS[r])]
+        if absent:
+            return (f"release {release['id']} was built before releases carried the bridge (mcp/) and the companion "
+                    f"templates (profile-templates/): its seal does not cover {' or '.join(absent)}, so the {step} step "
+                    "cannot run from it. Run the site step alone (--steps site) or name a later release")
     return None
+
+
+def rollback_warning(release: dict) -> str:
+    return (f"release {release['id']} is {release['status']}, no longer available for new builds. It is accepted "
+            "because it is this trip's own recorded previous release: the way back stays open for a trip that ran it")
 
 
 def stale_record_warning(row: dict) -> Optional[str]:
@@ -451,8 +554,8 @@ def parse_steps(raw: Optional[str]) -> tuple:
     if unknown:
         raise Refused(f"unknown step {unknown[0]!r}; the steps are {', '.join(ALL_STEPS)}")
     for s in wanted:
-        if s in NOT_IN_THIS_SLICE:
-            raise Refused(NOT_IN_THIS_SLICE[s])
+        if s not in BUILT_STEPS:
+            raise Refused(NOT_IN_THIS_SLICE.get(s, f"the {s} step is not built"))
     if not wanted:
         raise Refused("no steps named")
     return tuple(s for s in ALL_STEPS if s in wanted)   # always in running order
@@ -473,6 +576,15 @@ def cmd_plan(cfg: Config, db: Db, args) -> int:
     if len(set(slugs)) != len(slugs):
         raise Refused("a trip is named twice")
     steps = parse_steps(args.steps)
+    overwrite = set()
+    for item in args.overwrite_edited_companion or []:
+        overwrite.update(x for x in item.split(",") if x)
+    if overwrite and "companion" not in steps:
+        raise Refused("--overwrite-edited-companion belongs to the companion step, which this plan does not run")
+    if overwrite - set(slugs):
+        raise Refused(f"--overwrite-edited-companion names {sorted(overwrite - set(slugs))[0]!r}, which is not a trip in this plan")
+    if "companion" in steps:
+        require_companion_config(cfg)
     release = get_release(db, args.release)
 
     present = commit_present(cfg, release["source_revision"])
@@ -482,8 +594,9 @@ def cmd_plan(cfg: Config, db: Db, args) -> int:
     for slug in slugs:
         try:
             trip = resolve_trip(cfg, db, slug)
-            why = release_refusal(cfg, release, trip.row)
-            if why is None and "site" in steps and not present:
+            rollback = trip.row.get("previous_release_id") == release["id"]
+            why = release_refusal(cfg, release, trip.row, steps, rollback)
+            if why is None and RUNS_FROM_TREE.intersection(steps) and not present:
                 why = f"commit {release['source_revision'][:12]} is not in this checkout; fetch it first"
             if why:
                 raise Refused(f"{slug}: {why}")
@@ -492,7 +605,17 @@ def cmd_plan(cfg: Config, db: Db, args) -> int:
             say(f"  REFUSED  {exc}")
             continue
         current = trip.current
-        entry = {"slug": slug, "trip_id": trip.row["id"], "from_release_id": current}
+        entry = {"slug": slug, "trip_id": trip.row["id"], "from_release_id": current,
+                 "previous_release_id": trip.row.get("previous_release_id")}
+        if release["status"] != "available":
+            # Only reachable for the trip's own previous release (release_refusal). Recorded as data, not just
+            # prose, so the approval prompt can state it from a field it validates rather than from free text.
+            entry["target_status"] = release["status"]
+            note_text = rollback_warning(release)
+            warnings.append({"slug": slug, "warning": note_text})
+            say(f"  WARNING  {slug}: {note_text}")
+        if slug in overwrite:
+            entry["overwrite_edited_companion"] = True
         trips.append(entry)
         stale = stale_record_warning(trip.row)
         if stale:
@@ -509,6 +632,8 @@ def cmd_plan(cfg: Config, db: Db, args) -> int:
             note = "rollback: this is the trip's recorded previous release" \
                 if trip.row.get("previous_release_id") == release["id"] else ""
         say(f"  {slug}: runs {runs}  ->  {release['id']}")
+        if slug in overwrite:
+            say("      a companion edited in place WILL BE OVERWRITTEN, after its files are copied aside")
         if note:
             say(f"      {note}")
             notes.append({"slug": slug, "note": note})
@@ -591,6 +716,18 @@ def validate_plan(plan) -> Optional[str]:
         f = t.get("from_release_id")
         if not (f is None or (isinstance(f, str) and RELEASE_REF.match(f))):
             return f"{t['slug']}: the recorded current release is malformed"
+        # Added in R2; a plan written by R1 has none of them and stays valid.
+        prev = t.get("previous_release_id")
+        if not (prev is None or (isinstance(prev, str) and RELEASE_REF.match(prev))):
+            return f"{t['slug']}: the recorded previous release is malformed"
+        status = t.get("target_status")
+        if not (status is None or status in ROLLBACK_STATUSES):
+            return f"{t['slug']}: the target status is not one a rollback accepts"
+        if status is not None and prev != rel["id"]:
+            return f"{t['slug']}: it records a withdrawn target that is not its previous release"
+        overwrite = t.get("overwrite_edited_companion", False)
+        if not isinstance(overwrite, bool) or (overwrite and "companion" not in steps):
+            return f"{t['slug']}: overwrite_edited_companion is malformed or names a step the plan does not run"
     return None
 
 
@@ -676,13 +813,38 @@ def file_digest(path: Path) -> Optional[str]:
         return None
 
 
-def load_release_source():
-    path = REPO / "control-plane" / "worker" / "control_plane_worker" / "release_source.py"
-    spec = importlib.util.spec_from_file_location("kinerary_release_source", path)
+def _load_worker_module(filename: str, name: str):
+    path = REPO / "control-plane" / "worker" / "control_plane_worker" / filename
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
+
+def load_release_source():
+    return _load_worker_module("release_source.py", "kinerary_release_source")
+
+
+def load_companion_profile():
+    """The control plane's own `build_companion_handoff`: the SAME function a provision calls, so the companion a
+    rollout renders is built from the same shape. It is stdlib-only, which is why it can be read by path here."""
+    return _load_worker_module("companion_profile.py", "kinerary_companion_profile")
+
+
+# What `_attach_companion` hands `build_companion_handoff` besides the config: the confirmed intake's provenance and
+# the site's canonical address (the private URL the provision recorded). Read-only, by slug.
+HANDOFF_SQL = """
+SELECT row_to_json(x) FROM (
+  SELECT t.id AS trip_id, iv.id AS intake_version_id, iv.schema_version, iv.digest, iv.confirmed_at,
+         (SELECT j.result ->> 'private_url' FROM control_plane.jobs j
+           WHERE j.trip_id = t.id AND j.job_type = 'provision' AND j.state = 'succeeded'
+             AND j.result ->> 'private_url' IS NOT NULL
+           ORDER BY j.updated_at DESC LIMIT 1) AS private_url
+    FROM control_plane.trips t
+    JOIN control_plane.intake_versions iv ON iv.trip_id = t.id
+   WHERE t.slug = :'slug'
+   ORDER BY iv.version DESC LIMIT 1) x;
+"""
 
 MOVE_RECORD_SQL = """
 WITH moved AS (
@@ -717,6 +879,15 @@ class Interrupted(BaseException):
     pass
 
 
+class StepSkipped(Exception):
+    """A step that has nothing to do for this trip, and says why. Not a failure, and not silence."""
+
+
+RERENDER_VERDICT = re.compile(r"^RERENDER ([a-z0-9][a-z0-9-]{1,62}) (clean|edited|unknown_provenance|applied|unchanged)$")
+REFRESHED = re.compile(r"^REFRESHED ([a-z0-9][a-z0-9_-]{0,63}) prompts=([0-9]+) tools=([0-9]+)$")
+DRYRUN = re.compile(r"^DRYRUN ([a-z0-9][a-z0-9_-]{0,63}) turns_in_flight=([0-9]+) prompts=([0-9]+)$")
+
+
 def _raise_interrupted(signum, _frame):
     raise Interrupted(signal.Signals(signum).name)
 
@@ -728,7 +899,7 @@ class Executor:
         self.release_row = release_row   # the control plane's own row, re-read at execute
         self.tree: Optional[str] = None
 
-    def materialized(self) -> str:
+    def materialized(self, step: str = "site") -> str:
         if self.tree is None:
             source = load_release_source()
             try:
@@ -736,8 +907,18 @@ class Executor:
                     str(self.cfg.repo_root), self.release["source_revision"], self.release["artifact_digest"])
             except Exception as exc:
                 code = getattr(exc, "safe_error_code", type(exc).__name__)
-                raise StepFailed("site", f"the release tree could not be materialized and verified ({code})")
+                raise StepFailed(step, f"the release tree could not be materialized and verified ({code})")
         return self.tree
+
+    def tree_for(self, step: str) -> str:
+        """The release's tree, which must hold what this step runs from. The plan checked the manifest; this checks the
+        tree itself, the thing that is actually run."""
+        tree = self.materialized(step)
+        absent = [r for r in STEP_ROOTS.get(step, ()) if not (Path(tree) / r).is_dir()]
+        if absent:
+            raise StepFailed(step, f"release {self.release['id']} does not carry {', '.join(r + '/' for r in absent)}: it "
+                                   "was built before releases did, so the step cannot run from it")
+        return tree
 
     def cleanup(self) -> None:
         if self.tree:
@@ -747,7 +928,7 @@ class Executor:
     # ---- steps
 
     def step_site(self, trip: Trip, rollout: dict) -> None:
-        tree = self.materialized()
+        tree = self.materialized("site")
         config_path = trip.trip_dir / "trip.config.json"
         before = file_digest(config_path)
         args = self.cfg.deploy_cmd + [trip.slug, trip.vmid, "--restart", "--trip-dir", str(trip.trip_dir)]
@@ -772,10 +953,13 @@ class Executor:
         port = BRIDGE_PORT_BASE + int(trip.vmid)
         if not (BRIDGE_PORT_RANGE[0] <= port <= BRIDGE_PORT_RANGE[1]):
             raise StepFailed("bridge", "the trip's container id gives no usable bridge port")
+        # The bridge runs the RELEASE's mcp/, from the materialized tree, exactly as the site step deploys the
+        # release's site/: REPO_ROOT names the tree and the deployment's restart reads mcp/ under it. Not the
+        # host's checkout, which may be any commit.
+        tree = self.tree_for("bridge")
         args = self.cfg.bridge_cmd + ["--restart-only", "--trip-dir", str(trip.trip_dir)]
-        # The bridge's own code is not part of a release until slice R2, so the
-        # restart runs what the host has; the release is named for the wrapper.
-        extra = {"KINERARY_ROLLOUT_RELEASE_COMMIT": self.release["source_revision"],
+        extra = {"REPO_ROOT": tree,
+                 "KINERARY_ROLLOUT_RELEASE_COMMIT": self.release["source_revision"],
                  "KINERARY_ROLLOUT_RELEASE_ID": self.release["id"]}
         try:
             done = run_child(self.cfg, args, extra)
@@ -799,6 +983,117 @@ class Executor:
         if not reachable:
             raise StepFailed("bridge", f"bridge health {code}: the bridge cannot reach its trip")
 
+    def build_handoff(self, trip: Trip) -> Optional[dict]:
+        """The handoff a provision of this trip builds, from the trip's own config on this host and the control plane's
+        record of its confirmed intake: through the SAME `build_companion_handoff`. None when the trip has no
+        companion (its config names no assistant, or no organizer that resolves to a participant)."""
+        try:
+            config = json.loads((trip.trip_dir / "trip.config.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise StepFailed("companion", "the trip's trip.config.json cannot be read, so its companion cannot be rendered")
+        if not isinstance(config, dict):
+            raise StepFailed("companion", "the trip's trip.config.json is not an object")
+        builder = load_companion_profile().build_companion_handoff
+        # Whether this trip has a companion at all is the builder's own call (no assistant named, or no organizer that
+        # resolves to a participant, is None), made before anything is read from the control plane: ask it first.
+        try:
+            probe = builder(trip_id=trip.row["id"], slug=trip.slug, config=config, intake_version_id="probe",
+                            intake_schema_version=1, intake_digest="probe", confirmed_at="probe",
+                            canonical_site_url="http://probe.invalid")
+        except Exception as exc:    # a malformed config: say which kind of thing, never what it held
+            raise StepFailed("companion", f"the companion handoff could not be built from the trip's config ({type(exc).__name__})")
+        if probe is None:
+            return None
+        rows = self.db.rows(HANDOFF_SQL, slug=trip.slug)
+        if not rows or not rows[0].get("private_url"):
+            raise StepFailed("companion", "the control plane has no confirmed intake or no recorded site address for this trip; "
+                                          "its companion cannot be rendered from what a provision would have built")
+        row = rows[0]
+        return builder(trip_id=row["trip_id"], slug=trip.slug, config=config, intake_version_id=row["intake_version_id"],
+                       intake_schema_version=row["schema_version"], intake_digest=row["digest"], confirmed_at=row["confirmed_at"],
+                       canonical_site_url=row["private_url"])
+
+    def installer(self, tree: str, handoff: dict, mode: str, allow: bool) -> tuple:
+        """One `companion_profile_rerender` request: (verdict, scrubbed stderr). The request, which holds the handoff,
+        goes on stdin and is never printed."""
+        name = handoff["profile"]["name"]
+        request = {"record_type": "companion_profile_rerender", "schema_version": 1, "profile": {"name": name},
+                   "handoff": handoff, "mode": mode, "allow_edited": allow,
+                   "release": {"id": self.release["id"], "commit": self.release["source_revision"]}}
+        try:
+            done = run_child(self.cfg, self.cfg.companion_install_cmd, {"KINERARY_RELEASE_TREE": tree},
+                             input_text=json.dumps(request, ensure_ascii=False))
+        except OSError as exc:
+            raise StepFailed("companion", f"the companion installer did not run ({type(exc).__name__})")
+        except subprocess.TimeoutExpired:
+            raise StepFailed("companion", f"the companion installer did not finish within {self.cfg.step_timeout}s")
+        if done.returncode != 0:
+            raise StepFailed("companion", f"the companion installer exited {done.returncode}\n{scrub(done.stdout + done.stderr)}")
+        lines = [ln for ln in done.stdout.splitlines() if ln.strip()]
+        found = RERENDER_VERDICT.match(lines[-1]) if lines else None
+        if not found or found.group(1) != name:
+            raise StepFailed("companion", "the companion installer gave no verdict this command recognises")
+        return found.group(2), scrub(done.stderr, limit=6)
+
+    def refresh(self, name: str, *flags: str) -> str:
+        args = self.cfg.companion_refresh_cmd + list(flags) + [name]
+        timeout = max(self.cfg.step_timeout, self.cfg.turn_wait + self.cfg.registration_wait + 120)
+        try:
+            done = run_child(self.cfg, args, timeout=timeout)
+        except OSError as exc:
+            raise StepFailed("companion", f"the prompt refresh did not run ({type(exc).__name__})")
+        except subprocess.TimeoutExpired:
+            raise StepFailed("companion", f"the prompt refresh did not finish within {timeout}s")
+        if done.returncode != 0:
+            why = {3: f"a conversation turn was still in flight after waiting {self.cfg.turn_wait}s, so the gateway was NOT "
+                      "restarted and nothing was cut; run the step again when the conversation is quiet",
+                   5: "the gateway did not register every tool the release's bridge declares",
+                   6: "the release's bridge source could not be read for its tool names"}.get(done.returncode,
+                                                                                         f"the prompt refresh exited {done.returncode}")
+            raise StepFailed("companion", f"{why}\n{scrub(done.stdout + done.stderr)}")
+        lines = [ln for ln in done.stdout.splitlines() if ln.strip()]
+        return lines[-1] if lines else ""
+
+    def step_companion(self, trip: Trip, rollout: dict) -> None:
+        tree = self.tree_for("companion")
+        handoff = self.build_handoff(trip)
+        if handoff is None:
+            raise StepSkipped("this trip has no companion: its config names no assistant, or no organizer that resolves to a "
+                              "participant, so a provision builds none either")
+        name = handoff["profile"]["name"]
+        allow = bool(rollout.get("overwrite_edited_companion"))
+        bridge_source = str(Path(tree) / "mcp" / "mcp.js")
+        server = str(handoff["trip"].get("site_connection_name") or "trip-mcp")
+
+        # 1. Is the profile one that may be re-rendered? Asked first, writing nothing, so a refusal changes nothing.
+        verdict, noise = self.installer(tree, handoff, "check", False)
+        if verdict in ("edited", "unknown_provenance") and not allow:
+            what = ("was edited in place" if verdict == "edited" else
+                    "was installed before the record of what was rendered existed, so an edit cannot be told from the original")
+            raise StepFailed("companion", f"the companion profile {name} {what}; nothing was overwritten.\n{noise}\n"
+                                          f"      Copy what is worth keeping into the release's templates, then plan again with "
+                                          f"--overwrite-edited-companion {trip.slug} to replace it (its files are copied aside first).")
+        # 2. Can the gateway's database be read, and is a turn in flight? Informational: the wait is the refresh's.
+        pre = self.refresh(name, "--dry-run", "--expect-tools-from", bridge_source, "--server", server)
+        if not DRYRUN.match(pre):
+            raise StepFailed("companion", "the prompt refresh's dry run gave no answer this command recognises")
+        if int(DRYRUN.match(pre).group(2)):
+            say(f"      a conversation turn is in flight; it is waited for up to {self.cfg.turn_wait}s, never cut")
+        # 3. Re-render in place.
+        verdict, noise = self.installer(tree, handoff, "apply", allow)
+        if verdict not in ("applied", "unchanged"):
+            raise StepFailed("companion", f"the companion profile {name} was not re-rendered ({verdict}); nothing was overwritten\n{noise}")
+        if allow and "copied to" in noise:
+            say(noise)
+        say(f"      profile {name}: {verdict}")
+        # 4. Clear the saved prompts, restart the gateway, and read its own log for every tool the bridge declares.
+        done = self.refresh(name, "--wait", str(self.cfg.turn_wait), "--expect-tools-from", bridge_source, "--server", server,
+                            "--registration-wait", str(self.cfg.registration_wait))
+        found = REFRESHED.match(done)
+        if not found or found.group(1) != name or int(found.group(3)) < 1:
+            raise StepFailed("companion", "the prompt refresh did not confirm the gateway's tools")
+        say(f"      gateway restarted, {found.group(2)} saved prompt(s) cleared, {found.group(3)} bridge tool(s) registered")
+
     # ---- one trip
 
     def run_trip(self, entry: dict) -> bool:
@@ -810,14 +1105,22 @@ class Executor:
                 raise Refused(
                     f"{slug}: it now runs {trip.current or 'an unknown release'}, but the plan recorded "
                     f"{entry['from_release_id'] or 'unknown'}; no step ran. Plan again.")
-            row_refusal = release_refusal(self.cfg, self.release_row, trip.row)
+            # The same rule `plan` applied, against what `plan` recorded: the way back is open only when the release
+            # is this trip's own previous release NOW and was when the plan was written.
+            # ...and only when the plan recorded the very status the approval displayed (target_status): a release
+            # deprecated AFTER a plan that said "available" carried no warning, so it is not waved through.
+            rollback = (entry.get("previous_release_id") == self.release["id"]
+                        and trip.row.get("previous_release_id") == self.release["id"]
+                        and entry.get("target_status") == self.release_row["status"])
+            row_refusal = release_refusal(self.cfg, self.release_row, trip.row, self.steps, rollback)
             if row_refusal:
                 raise Refused(f"{slug}: {row_refusal}")
         except Refused as exc:
             say(f"  REFUSED  {exc}")
             return False
 
-        rollout = {"id": "rollout_" + secrets.token_hex(8), "from": trip.current}
+        rollout = {"id": "rollout_" + secrets.token_hex(8), "from": trip.current,
+                   "overwrite_edited_companion": entry.get("overwrite_edited_companion") is True}
         steps = [s for s in self.steps]
         actor = "cli:" + re.sub(r"[^A-Za-z0-9_.-]", "_", getpass.getuser())[:60]
         try:
@@ -833,7 +1136,11 @@ class Executor:
             for step in steps:
                 current_step = step
                 say(f"  {step} ...")
-                getattr(self, f"step_{step}")(trip, rollout)
+                try:
+                    getattr(self, f"step_{step}")(trip, rollout)
+                except StepSkipped as skipped:
+                    say(f"  {step} skipped: {skipped}")
+                    continue
                 say(f"  {step} ok")
         except StepFailed as exc:
             self.close(rollout, "failed", exc.step)
@@ -868,15 +1175,17 @@ def cmd_execute(cfg: Config, db: Db, args) -> int:
             raise Refused(f"step {extra[0]} is not in the plan; the approval covers the plan's steps only")
         steps = list(wanted)
     for s in steps:
-        if s in NOT_IN_THIS_SLICE:
-            raise Refused(NOT_IN_THIS_SLICE[s])
+        if s not in BUILT_STEPS:
+            raise Refused(NOT_IN_THIS_SLICE.get(s, f"the {s} step is not built"))
     steps = tuple(s for s in ALL_STEPS if s in steps)
+    if "companion" in steps:
+        require_companion_config(cfg)
 
     release = get_release(db, plan["release"]["id"])
     if (release["id"] != plan["release"]["id"] or release["source_revision"] != plan["release"]["source_revision"]
             or release["artifact_digest"] != plan["release"]["artifact_digest"]):
         raise Refused("the release in the control plane is not the one the plan names")
-    if "site" in steps and not commit_present(cfg, release["source_revision"]):
+    if RUNS_FROM_TREE.intersection(steps) and not commit_present(cfg, release["source_revision"]):
         raise Refused(f"commit {release['source_revision'][:12]} is not in this checkout; fetch it first")
 
     for item in plan.get("refused") or []:
@@ -950,6 +1259,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--all", action="store_true", help="every eligible trip (not in this slice)")
     p.add_argument("--plan-file", required=True)
     p.add_argument("--steps", help="comma-separated; default site,bridge")
+    p.add_argument("--overwrite-edited-companion", action="append", metavar="SLUG[,SLUG...]",
+                   help="let the companion step replace a profile edited in place (its files are copied aside first); "
+                        "default: an edited profile is reported and left alone")
     e = sub.add_parser("execute", help="run a plan file")
     e.add_argument("--plan-file", required=True)
     e.add_argument("--plan-digest", help="the digest `plan` printed; required")
