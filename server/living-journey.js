@@ -1,10 +1,11 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { publicPart } = require('../shared/config-visibility');
+const { publicPart, makeFeatureOn } = require('../shared/config-visibility');
 const { projectAgent } = require('../shared/agent-schema');
 const seedReconcile = require('./seed-reconcile');
 const planConflicts = require('./plan-conflicts');
+const { recentChanges, withRecentChange } = require('./recent-changes');
 // Every plan date a route below is SENT must be a day on the calendar, not
 // only the shape (second boundary re-check of PR #373); reads keep ISO_DATE_RE.
 const { isCalendarDay, CALENDAR_DAY_DETAIL } = require('./calendar-day');
@@ -50,11 +51,19 @@ function keepBothText(value) {
   return Array.isArray(list) && list.length ? JSON.stringify(list) : null;
 }
 
-// What no reader of a plan item is ever served: the organizer's accepted conflicts (#550).
-function publicItem(item) {
-  if (!item || !Object.hasOwn(item, 'keep_both_with')) return item;
-  const { keep_both_with, ...rest } = item;
-  return rest;
+// What no reader of a plan item is ever served: the organizer's accepted conflicts (#550), and — unless
+// the caller says it is an organizer or the agent key — who added it (`created_by`, a username; video
+// Release 1B, decision 12). Fail safe: a caller that passes nothing is a member and is not told who.
+function publicItem(item, { author = false } = {}) {
+  if (!item) return item;
+  const dropConflicts = Object.hasOwn(item, 'keep_both_with');
+  const dropAuthor = !author && Object.hasOwn(item, 'created_by');
+  if (!dropConflicts && !dropAuthor) return item;
+  // A copy with the same key order the caller always saw, minus what it may not.
+  const out = { ...item };
+  if (dropConflicts) delete out.keep_both_with;
+  if (dropAuthor) delete out.created_by;
+  return out;
 }
 
 function stripTags(html) {
@@ -660,7 +669,7 @@ function markProvenance(db, payload) {
 // `config` is the effective (raw-shaped) config the participant view computes
 // each night's lodging from; /api/itinerary/original (includeOriginal) serves
 // the immutable snapshot as stored and takes none.
-function serializeItinerary(db, rows, { includeOriginal = false, config = null, hotelPlaces = null } = {}) {
+function serializeItinerary(db, rows, { includeOriginal = false, config = null, hotelPlaces = null, includeAuthor = false } = {}) {
   // A booking imported for organizer review is not participant-visible yet.
   // Every participant-facing itinerary projection must enforce that boundary;
   // filtering only /api/bookings leaked draft details through attached cards.
@@ -675,7 +684,7 @@ function serializeItinerary(db, rows, { includeOriginal = false, config = null, 
     // it was. Lodging is computed from the trip as it is now (withServedLodging).
     days: includeOriginal ? rows.days : rows.days.map((day) => publicDayContext(config ? withServedLodging(day, config.phases) : day)),
     items: rows.items.map((item) => ({
-      ...publicItem(item),
+      ...publicItem(item, { author: includeAuthor }),
       booking: item.booking_id ? bookingsById.get(item.booking_id) || null : null,
     })),
   };
@@ -1188,14 +1197,14 @@ async function weatherObservation(db, fetchImpl, query) {
 
 // An item with its hotel's links, for the routes that serve raw plan rows
 // (/api/today): the same decoration the active itinerary applies.
-function withHotelPlace(db, rawItem, hotelPlaces) {
-  const item = publicItem(rawItem);
+function withHotelPlace(db, rawItem, hotelPlaces, { includeAuthor = false } = {}) {
+  const item = publicItem(rawItem, { author: includeAuthor });
   if (!hotelPlaces || !item?.booking_id) return item;
   const booking = db.prepare("SELECT id, type, name, phase, location_url FROM bookings WHERE id = ? AND COALESCE(review_status, 'approved') = 'approved'").get(item.booking_id);
   return hotelPlaces.decorateItem(item, booking);
 }
 
-function buildTodayContext(db, config, { hotelPlaces = null } = {}) {
+function buildTodayContext(db, config, { hotelPlaces = null, includeAuthor = false } = {}) {
   const rows = activeRows(db);
   const clock = localClock(db, config);
   const today = clock.date;
@@ -1232,9 +1241,9 @@ function buildTodayContext(db, config, { hotelPlaces = null } = {}) {
     first_date: firstDate,
     last_date: lastDate,
     countdown_days: firstDate ? Math.ceil((new Date(`${firstDate}T00:00:00Z`) - new Date(`${today}T00:00:00Z`)) / 86400000) : null,
-    current: todayItems[0] ? withHotelPlace(db, todayItems[0], hotelPlaces) : null,
-    next: nextItem ? withHotelPlace(db, nextItem, hotelPlaces) : null,
-    events: todayItems.map((item) => withHotelPlace(db, item, hotelPlaces)),
+    current: todayItems[0] ? withHotelPlace(db, todayItems[0], hotelPlaces, { includeAuthor }) : null,
+    next: nextItem ? withHotelPlace(db, nextItem, hotelPlaces, { includeAuthor }) : null,
+    events: todayItems.map((item) => withHotelPlace(db, item, hotelPlaces, { includeAuthor })),
     flights: flightToday,
   };
 }
@@ -1286,11 +1295,30 @@ function moveDayRows(rows, { from, to, date, lodging, headline }) {
   return { items: moved, headline: headlineMoved };
 }
 
-function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImpl, mediaDir, authRequired, organizerOrAgentRequired, requestItemEnrichment, phaseKnown, stopKnown, onPhasesReshuffled, reviewConfigured, isOrganizer }) {
+function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImpl, mediaDir, authRequired, organizerOrAgentRequired, requestItemEnrichment, phaseKnown, stopKnown, onPhasesReshuffled, reviewConfigured, isOrganizer, featureOn }) {
   // The trip as it is now. server.js passes the effective config (the file
   // with the stop layer merged over it, server/trip-structure.js); a caller
   // that passes only `config` gets exactly that object, as before.
   const cfg = () => (getConfig ? getConfig() : config);
+  // Per-trip feature switches (#567 S2). server.js passes its own `featureOn`; a caller that does not
+  // (a test, a stand-in) gets one built from the same file block with the same literal-true rule, so
+  // a switch nobody recognises is off either way.
+  const switchOn = featureOn || makeFeatureOn(config?.features, console);
+  // Who may be told who added a plan item: the organizers and the agent key — the same people
+  // who see booking drafts. Anything else, including a missing predicate, is a member.
+  const mayKnowAuthor = (req) => Boolean(isOrganizer && isOrganizer(req));
+  // The last day's "what changed" markers (video Release 1B), or null — switch off, or the version
+  // walk failed. A failure must never fail the route: the page just has no markers, and the log
+  // names the event with nothing about the trip in it.
+  const recentChangeMarks = () => {
+    if (!switchOn('plan_change_marks')) return null;
+    try {
+      return recentChanges(db);
+    } catch (error) {
+      console.error(`recent_changes.failed ${error?.code || error?.name || 'error'}`);
+      return null;
+    }
+  };
   // A phase id a plan row may be filed under. Without the stop layer: any
   // phase the config names.
   const isKnownPhase = (id) => typeof id === 'string' && (phaseKnown ? phaseKnown(id) : (cfg().phases || []).some(p => p?.id === id));
@@ -1374,7 +1402,9 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
     if (!rows) return res.status(404).json({ error: 'itinerary_not_ready' });
     // The ETag is over the payload, so a stop edit — which changes the lodging
     // served, not the plan revision — is a new ETag, never a 304.
-    let payload = serializeItinerary(db, rows, { config: hotelPlaces ? hotelPlaces.hydrateConfig(cfg()) : cfg(), hotelPlaces });
+    let payload = serializeItinerary(db, rows, { config: hotelPlaces ? hotelPlaces.hydrateConfig(cfg()) : cfg(), hotelPlaces, includeAuthor: mayKnowAuthor(req) });
+    const marks = recentChangeMarks();
+    if (marks) payload = { ...payload, items: payload.items.map((item) => withRecentChange(item, marks)) };
     // "The trip file changed this item" (#382) is the organizer's to see; a member's payload is byte-for-byte what it was.
     if (isOrganizer && isOrganizer(req)) payload = withPlanConflicts(db, withSeedFlags(db, payload), rows);
     const etag = etagForPayload(payload);
@@ -1421,7 +1451,7 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
     const state = getState(db);
     const rows = state ? getVersionRows(db, state.original_version_id) : null;
     if (!rows) return res.status(404).json({ error: 'itinerary_not_ready' });
-    res.json(serializeItinerary(db, rows, { includeOriginal: true }));
+    res.json(serializeItinerary(db, rows, { includeOriginal: true, includeAuthor: true }));
   });
 
   app.get('/api/itinerary/revisions', organizerOrAgentRequired, (_req, res) => {
@@ -1690,9 +1720,17 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
     res.json(db.prepare('SELECT date, he, en FROM trip_daily_messages WHERE date = ?').get(date));
   });
 
-  app.get('/api/today', authRequired, (_req, res) => {
+  app.get('/api/today', authRequired, (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
-    res.json(buildTodayContext(db, cfg(), { hotelPlaces }));
+    const context = buildTodayContext(db, cfg(), { hotelPlaces, includeAuthor: mayKnowAuthor(req) });
+    const marks = recentChangeMarks();
+    if (!marks) return res.json(context);
+    res.json({
+      ...context,
+      current: withRecentChange(context.current, marks),
+      next: withRecentChange(context.next, marks),
+      events: context.events.map((item) => withRecentChange(item, marks)),
+    });
   });
 
   app.get('/api/confirmations/summary', authRequired, (_req, res) => {

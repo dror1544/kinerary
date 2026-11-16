@@ -98,7 +98,13 @@ function shapeSeedRow(row, internals, organizer) {
   return out;
 }
 const shapeBooking = (row, organizer) => shapeSeedRow(row, SEED_INTERNALS, organizer);
-const shapePlanItem = (row, organizer) => shapeSeedRow(row, PLAN_INTERNALS, organizer);
+// created_by is who added the item (a username): the organizer's and the agent's to see, never a member's
+// (video Release 1B, AC-28 — the same rule living-journey.js's publicItem applies to the Modern routes).
+const shapePlanItem = (row, organizer) => {
+  const out = shapeSeedRow(row, PLAN_INTERNALS, organizer);
+  if (out && !organizer) delete out.created_by;
+  return out;
+};
 
 // The seed's long-standing back-fill: a row seeded before bookings.json carried location_url keeps
 // NULL, and is given the file's link on a later boot — only where it is still unset, so a hand edit

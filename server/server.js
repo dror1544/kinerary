@@ -1139,6 +1139,8 @@ const journey = livingJourney.create({
   reviewConfigured: () => Boolean(HERMES_URL),
   // Who sees "the trip file changed this" (#382): the same people who see booking drafts.
   isOrganizer: (req) => canReviewDrafts(req),
+  // The one featureOn (built above from the file's block), so living-journey never reads the raw block itself.
+  featureOn,
   raw: TRIP_CONFIG_RAW,
   fetchImpl: fetch,
   mediaDir: MEDIA_DIR,

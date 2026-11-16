@@ -300,9 +300,14 @@ describe('config allow-list — golden round trip (nothing the site needs is los
     assert.ok(tokyo.venues.some(v => v.url_source), 'enrichment should have filled a url_source');
     assert.ok(tokyo.days?.length && tokyo.accommodation?.confirmation);
     // #567 S2: the provisioner's `features` block rides through the allow-list whole.
+    // The helper turns on EVERY registered switch; the list serves the member-visible ones. Both come from
+    // the registry, so adding a switch does not mean editing this test (video Release 1 added two).
+    const { FEATURE_SWITCHES } = createRequire(import.meta.url)('../shared/feature-switches.js');
+    const written = Object.fromEntries(FEATURE_SWITCHES.map((entry) => [entry.name, true]));
+    const served = Object.fromEntries(FEATURE_SWITCHES.filter((entry) => entry.memberVisible).map((entry) => [entry.name, true]));
     for (const [name, cfg] of Object.entries(configs)) {
-      assert.deepEqual(cfg.features, { delivery_probe: true }, `${name}: the helper writes the block`);
-      assert.deepEqual(projectConfig(cfg).value.features, { delivery_probe: true }, `${name}: and the list serves it`);
+      assert.deepEqual(cfg.features, written, `${name}: the helper writes the block`);
+      assert.deepEqual(projectConfig(cfg).value.features, served, `${name}: and the list serves it`);
     }
     assert.ok(projectConfig(configs['planned-path']).withheld.some(p => /\.needs\[/.test(p)),
       'organizer-only dietary needs should be withheld on the planned path');
