@@ -154,10 +154,13 @@ test("autoApprove grants the trip at signup, with no operator and no outbox row"
     assert.equal(trip.rows[0].lifecycle_state, "draft");
 
     const owner = await pool.query(
-      "SELECT role, status FROM control_plane.trip_memberships WHERE trip_id = $1", [result.tripId],
+      "SELECT role, status, dashboard_access, runtime_access FROM control_plane.trip_memberships WHERE trip_id = $1", [result.tripId],
     );
     assert.equal(owner.rows[0].role, "owner");
     assert.equal(owner.rows[0].status, "active");
+    // An owner who cannot open their own trip is the bug: every access query filters on these two flags.
+    assert.equal(owner.rows[0].dashboard_access, true);
+    assert.equal(owner.rows[0].runtime_access, true);
 
     // And the status endpoint agrees, so enrollment's owner check will too.
     const status = await getSignupStatus(pool, identity.provider, identity.providerSubjectDigest);
@@ -306,6 +309,9 @@ test("approval callback creates draft trip and membership exactly once", { skip 
     const memberships = await pool.query("SELECT count(*)::int AS c FROM control_plane.trip_memberships");
     assert.equal(trips.rows[0].c, 1);
     assert.equal(memberships.rows[0].c, 1);
+    // The tapped-approval path writes the same owner row as autoApprove: able to open the trip.
+    const access = await pool.query("SELECT dashboard_access, runtime_access FROM control_plane.trip_memberships");
+    assert.deepEqual(access.rows, [{ dashboard_access: true, runtime_access: true }]);
   } finally {
     const c2 = await pool.connect();
     await resetDb(c2);

@@ -115,6 +115,16 @@ describe("organizer invitations", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABASE
     assert.deepEqual(enrollment.rows.map((r) => r.state), ["issued"]);
   });
 
+  test("an invited owner can open their own trip: both access flags are true", async () => {
+    const result = await invite(pool, address());
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    const membership = await pool.query(
+      "SELECT role, status, dashboard_access, runtime_access FROM control_plane.trip_memberships WHERE trip_id = $1 AND user_id = $2",
+      [result.tripId, result.userId]);
+    assert.deepEqual(membership.rows, [{ role: "owner", status: "active", dashboard_access: true, runtime_access: true }]);
+  });
+
   test("an invited organizer gets a structurally normal account", async () => {
     const email = address();
     const result = await invite(pool, email);
