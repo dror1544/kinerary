@@ -2,7 +2,7 @@
 // build (rootDir: src, no allowJs) can resolve the registry's types without
 // compiling it. Same arrangement as child-env.d.ts; keep in sync by hand.
 
-export type FeatureSurface = "relay" | "site" | "companion";
+export type FeatureSurface = "relay" | "site" | "companion" | "control_plane";
 
 export interface FeatureSwitchEntry {
   readonly name: string;

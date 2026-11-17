@@ -14,7 +14,8 @@
 // Entry shape:
 //   name           ^[a-z][a-z0-9_]{2,40}$  — also the database's CHECK
 //   summary        one line: what turning it on does
-//   surfaces       where the feature's code runs — 'relay', 'site', 'companion'
+//   surfaces       where the feature's code runs — 'relay', 'site', 'companion', 'control_plane'
+//                  (the API process: the outbox dispatcher and the pollers that start beside it)
 //   memberVisible  true only if a signed-in trip member may be told the switch
 //                  is on (the site serves it to them). Default false: the NAME
 //                  of an unreleased feature is itself something to withhold.
@@ -27,7 +28,7 @@
 // the control plane (`import`, via feature-switches.d.ts) read the same list.
 
 const NAME_PATTERN = /^[a-z][a-z0-9_]{2,40}$/;
-const SURFACES = Object.freeze(['relay', 'site', 'companion']);
+const SURFACES = Object.freeze(['relay', 'site', 'companion', 'control_plane']);
 
 const FEATURE_SWITCHES = Object.freeze([
   Object.freeze({
@@ -46,6 +47,14 @@ const FEATURE_SWITCHES = Object.freeze([
     name: 'plan_change_marks',
     summary: 'Plan items carry recent_change; Updated/New badges and "Updated for everyone" on the site',
     surfaces: Object.freeze(['site']),
+    memberVisible: true,
+  }),
+  // Video Release 1C (docs/specs/sprint-9/x-video-r1-group-line.md). memberVisible because the site's
+  // organizer toggle reads features.plan_change_group_line, and #567 S2 serves only member-visible names.
+  Object.freeze({
+    name: 'plan_change_group_line',
+    summary: 'Control plane posts one merged line to the trip group when the plan changes; organizer toggle on the site',
+    surfaces: Object.freeze(['control_plane', 'site', 'companion']),
     memberVisible: true,
   }),
 ]);

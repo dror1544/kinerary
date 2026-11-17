@@ -21,6 +21,7 @@ import { Trivia } from "./trivia";
 import { heroCandidates, useHeroPhoto } from "./hero-photo";
 import { useTripUpdates, useLiveEditGuard } from "./live-updates";
 import { featureOn } from "./features";
+import { GroupLineToggle } from "./group-line";
 import { hasGoChip, mapUrlFor, wazeUrlFor } from "./nav-links";
 import { ChangeBadge, ChangeTime, UpdatedForEveryone, changeClass, changeOf, movedFromLabel, useFreshChanges, weekdayName } from "./recent-change";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -2786,6 +2787,7 @@ export function MoreView({ config, currentUser, isOrganizer, lang, openModule }:
             <input type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={uploadHero} disabled={busy} />
           </label>
           <MemberLogins config={config} lang={lang} />
+          {featureOn(config, "plan_change_group_line") ? <GroupLineToggle lang={lang} /> : null}
         </section>
       ) : null}
       {/* Everyone on the trip: organizers connect read-and-write, members read only. */}

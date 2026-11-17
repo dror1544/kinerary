@@ -21,8 +21,8 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const Database = require('../server/node_modules/better-sqlite3');
 const { create } = require('../server/living-journey.js');
-const { recentChanges, RECENT_CHANGE_KEYS, WINDOW_MS } = require('../server/recent-changes.js');
-const { FEATURE_SWITCHES, findSwitch } = require('../shared/feature-switches.js');
+const { recentChanges, diffPlanVersions, DIFF_ITEM_KEYS, RECENT_CHANGE_KEYS, WINDOW_MS } = require('../server/recent-changes.js');
+const { FEATURE_SWITCHES, SURFACES, findSwitch } =require('../shared/feature-switches.js');
 
 const NOW = Date.parse('2026-11-16T12:00:00Z');
 const H = 3600_000;
@@ -316,8 +316,149 @@ describe('the registry (AC-3)', () => {
       assert.ok(entry.summary.length > 10 && !entry.summary.includes('\n'));
     });
   }
+  test('plan_change_group_line (1C): control_plane, site and companion surfaces, member-visible for the organizer toggle', () => {
+    const entry = findSwitch('plan_change_group_line');
+    assert.ok(entry, 'plan_change_group_line is not registered');
+    assert.deepEqual([...entry.surfaces], ['control_plane', 'site', 'companion']);
+    assert.equal(entry.memberVisible, true);
+    assert.ok(entry.summary.length > 10 && !entry.summary.includes('\n'));
+    assert.ok(SURFACES.includes('control_plane'));
+  });
   test('the registry still loads (its shape check ran at require time) and keeps delivery_probe first', () => {
     assert.equal(FEATURE_SWITCHES[0].name, 'delivery_probe');
-    assert.deepEqual(FEATURE_SWITCHES.map((s) => s.name), ['delivery_probe', 'site_video_layout', 'plan_change_marks']);
+    assert.deepEqual(FEATURE_SWITCHES.map((s) => s.name), ['delivery_probe', 'site_video_layout', 'plan_change_marks', 'plan_change_group_line']);
+  });
+});
+
+// ── diffPlanVersions: the one function a mark and the group line both come from ─────────
+// (video Release 1C, x-video-r1-group-line.md AC-21, AC-18, AC-13, and the closed shape of AC-27)
+describe('diffPlanVersions (1C)', () => {
+  const activeId = (t) => t.db.prepare('SELECT active_version_id AS id FROM trip_itinerary_state WHERE id = 1').get().id;
+  const uidOf = (t, needle) => t.item(needle).item_uid;
+  const NONE = { known: true, updated: [], added: [], removed: [] };
+
+  test('AC-21: the updated and added sets equal the site\'s marks between the same two revisions', () => {
+    const t = trip();
+    const base = activeId(t);
+    t.edit(5 * H, setTime('Visit Central Park', '19:00'));
+    t.edit(4 * H, (rows) => { rows.items.push({ ...rows.items[0], item_uid: 'item_new', source_ref: 'item_new', text_en: 'Rooftop drinks' }); });
+    t.edit(3 * H, (rows) => { rows.items.find((i) => i.text_en === 'Breakfast').text_en = 'Late breakfast'; });
+    const diff = diffPlanVersions(t.db, base, activeId(t));
+    // The trip is younger than the window, so the marks' baseline is the original plan: `base`.
+    const marks = t.marks();
+    assert.equal(diff.known, true);
+    assert.deepEqual(new Set(diff.updated.map((i) => i.item_uid)), new Set([...marks].filter(([, m]) => m.kind === 'updated').map(([uid]) => uid)));
+    assert.deepEqual(new Set(diff.added.map((i) => i.item_uid)), new Set([...marks].filter(([, m]) => m.kind === 'added').map(([uid]) => uid)));
+    assert.equal(diff.updated.length, 2);
+    assert.equal(diff.added.length, 1);
+  });
+
+  test('a time change carries the new and the previous time and the title in both languages', () => {
+    const t = trip();
+    const base = activeId(t);
+    t.edit(H, setTime('Visit Central Park', '19:00'));
+    const diff = diffPlanVersions(t.db, base, activeId(t));
+    assert.equal(diff.updated.length, 1);
+    const [park] = diff.updated;
+    assert.equal(park.item_uid, uidOf(t, 'Visit Central Park'));
+    assert.deepEqual(park.fields, ['time']);
+    assert.equal(park.time, '19:00');
+    assert.equal(park.previous_time, '11:00');
+    assert.equal(park.text_en, 'Visit Central Park');
+    assert.ok(park.text_he);
+  });
+
+  test('a renamed and moved item carries the previous title and the previous date', () => {
+    const t = trip();
+    const base = activeId(t);
+    const parkDate = t.item('Visit Central Park').date;
+    t.edit(H, (rows) => {
+      const r = rows.items.find((i) => i.text_en === 'Visit Central Park');
+      r.text_en = 'Central Park walk';
+      r.date = '2027-03-12';
+    });
+    const [park] = diffPlanVersions(t.db, base, activeId(t)).updated;
+    assert.deepEqual(park.fields, ['date', 'title']);
+    assert.equal(park.previous_date, parkDate);
+    assert.equal(park.previous_text_en, 'Visit Central Park');
+    assert.equal(park.text_en, 'Central Park walk');
+  });
+
+  test('AC-13: an item changed and changed back is in no list', () => {
+    const t = trip();
+    const base = activeId(t);
+    const original = t.item('Visit Central Park').time;
+    t.edit(3 * H, setTime('Visit Central Park', '19:00'));
+    t.edit(2 * H, setTime('Visit Central Park', original));
+    assert.deepEqual(diffPlanVersions(t.db, base, activeId(t)), NONE);
+  });
+
+  test('three edits to one time are one change, from the value the group last heard', () => {
+    const t = trip();
+    t.edit(5 * H, setTime('Visit Central Park', '20:00'));
+    const heard = activeId(t);
+    t.edit(3 * H, setTime('Visit Central Park', '19:30'));
+    t.edit(2 * H, setTime('Visit Central Park', '19:00'));
+    const diff = diffPlanVersions(t.db, heard, activeId(t));
+    assert.equal(diff.updated.length, 1);
+    assert.equal(diff.updated[0].previous_time, '20:00');
+    assert.equal(diff.updated[0].time, '19:00');
+  });
+
+  test('AC-18: a removed item is in `removed` with its last text, date and time', () => {
+    const t = trip();
+    const base = activeId(t);
+    const park = t.item('Visit Central Park');
+    t.edit(H, (rows) => { rows.items = rows.items.filter((i) => i.text_en !== 'Visit Central Park'); });
+    const diff = diffPlanVersions(t.db, base, activeId(t));
+    assert.deepEqual(diff.updated, []);
+    assert.equal(diff.removed.length, 1);
+    assert.deepEqual(
+      { uid: diff.removed[0].item_uid, text: diff.removed[0].text_en, date: diff.removed[0].date, time: diff.removed[0].time },
+      { uid: park.item_uid, text: 'Visit Central Park', date: park.date, time: park.time },
+    );
+  });
+
+  test('an item added and then removed, and one removed and put back unchanged, are in no list', () => {
+    const t = trip();
+    const base = activeId(t);
+    t.edit(4 * H, (rows) => { rows.items.push({ ...rows.items[0], item_uid: 'item_new', source_ref: 'item_new', text_en: 'Rooftop drinks' }); });
+    t.edit(3 * H, (rows) => { rows.items = rows.items.filter((i) => i.item_uid !== 'item_new'); });
+    let removedRow;
+    t.edit(2 * H, (rows) => { removedRow = rows.items.find((i) => i.text_en === 'Breakfast'); rows.items = rows.items.filter((i) => i.text_en !== 'Breakfast'); });
+    t.edit(H, (rows) => { rows.items.push({ ...removedRow }); });
+    assert.deepEqual(diffPlanVersions(t.db, base, activeId(t)), NONE);
+  });
+
+  test('system writers never produce a change (the same closed set as the marks)', () => {
+    const t = trip();
+    const base = activeId(t);
+    for (const author of ['config', 'legacy-plan', 'legacy-promote-config-days', 'config-reconcile', 'enrichment']) {
+      t.edit(H, setTime('Visit Central Park', author.length > 8 ? '18:00' : '17:00'), author);
+    }
+    assert.deepEqual(diffPlanVersions(t.db, base, activeId(t)), NONE);
+  });
+
+  test('a revision that is not in the active plan\'s chain is unknown, and describes nothing', () => {
+    const t = trip();
+    t.edit(H, setTime('Visit Central Park', '19:00'));
+    const unknown = { known: false, updated: [], added: [], removed: [] };
+    assert.deepEqual(diffPlanVersions(t.db, 'rev_does_not_exist', activeId(t)), unknown);
+    assert.deepEqual(diffPlanVersions(t.db, activeId(t), null), unknown);
+    assert.deepEqual(diffPlanVersions(t.db, activeId(t), activeId(t)), NONE);
+  });
+
+  test('AC-27: every entry carries only DIFF_ITEM_KEYS, and no author, note or created_by', () => {
+    const t = trip();
+    const base = activeId(t);
+    t.edit(2 * H, setTime('Visit Central Park', '19:00'), 'organizer-secret-name');
+    t.edit(H, (rows) => { rows.items.push({ ...rows.items[0], item_uid: 'item_new', source_ref: 'item_new', text_en: 'Rooftop drinks', created_by: 'organizer-secret-name' }); }, 'organizer-secret-name');
+    const diff = diffPlanVersions(t.db, base, activeId(t));
+    for (const entry of [...diff.updated, ...diff.added, ...diff.removed]) {
+      for (const key of Object.keys(entry)) assert.ok(DIFF_ITEM_KEYS.includes(key), key);
+    }
+    const wire = JSON.stringify(diff);
+    assert.ok(!/organizer-secret-name|a private note|created_by|author/.test(wire), wire);
+    assert.deepEqual([...DIFF_ITEM_KEYS].sort(), ['at', 'date', 'fields', 'item_uid', 'previous_date', 'previous_text_en', 'previous_text_he', 'previous_time', 'text_en', 'text_he', 'time']);
   });
 });

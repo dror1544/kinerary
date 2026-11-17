@@ -21,6 +21,8 @@ export interface NotificationAdapterDeps {
     superAdminChatId: string;
     db: pg.Pool;
     log?: (line: string) => void;
+    /** See TelegramAdapterConfig.apiRoot. */
+    apiRoot?: string;
   };
 }
 
