@@ -688,6 +688,8 @@ describe("the connector's reply hook", () => {
         gatewaySecrets: [secret],
         telegram,
         port: 0,
+        // The chat is the calling gateway's own (outbound actions are scoped to the caller's chats).
+        resolveRoute: async () => ({ kind: "companion", tripId: "trip-x", hermesProfile: "companion-x", assistantNames: [] }),
         ...(withHook ? { assistantEvents: { replySent: (chat: string, delivery: string) => { observed.push([chat, delivery]); } } } : {}),
       });
       await connector.listen();

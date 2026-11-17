@@ -192,6 +192,54 @@ structurally impossible. Naming the multiplexing gateway makes the exception
 visible, auditable, and deletable: unset the key and routing is exact, with no
 code change.
 
+### Outbound follows the same identity rule
+
+Routing is not only inbound. Every outbound action a gateway sends over the
+socket (`send`, `edit`, `typing`, `get_chat_info`) is performed only for a chat
+that belongs to that gateway's authenticated identity, decided from the
+database at the time of the action: the connector resolves the chat's route
+once (`resolveChatRoute`, no cache, so a closed or switched binding takes
+effect on the next action) and `outbound-scope.ts` allows it only when:
+
+| Route for the chat | Allowed for |
+|---|---|
+| `companion`, profile P | gateway id P, or the declared multiplex gateway |
+| `companion`, no profile (companion not installed yet) | nobody |
+| `interview` (a live session on that chat) | the interviewer profile (`relay.interviewer_profile`), or the declared multiplex gateway |
+| `unbound` | nobody |
+| lookup failed, timed out (5 seconds), or no database configured | nobody |
+
+One exception to the `unbound` row: after an interview is confirmed and before
+the companion is bound to the organizer's private chat, that chat resolves
+`unbound`. The interviewer keeps it: the same identities as the `interview` row
+are allowed on a private chat (an all-digit chat id; a group never qualifies)
+with no open binding whose interview session was confirmed within the last 24
+hours and has not expired. Once the binding opens the chat is the companion's.
+A companion is refused throughout the window.
+
+The gateway id is the one from the upgrade token; nothing in a frame is an
+input. A refused action is answered `CHAT_NOT_IN_SCOPE` (or
+`SCOPE_CHECK_FAILED` when the route could not be resolved) before any side
+effect, and is logged as `relay.outbound_out_of_scope` with the op, gateway id,
+`chat_ref` (the chat's digest, `digestTelegramId`, the form `CHAT_DIGEST_SQL`
+matches; never the raw id), `chat_kind` (`group` or `private`), the route kind
+and a fixed reason word, never the message. Both words read to the gateway as
+neither a timeout nor retryable (`test/hermes-mirror.test.ts`), so a refused
+action is not retried or re-sent.
+
+Two consequences. A chat that is mid-interview belongs to the interviewer: only
+that private chat is closed to the companion, and every other chat bound to the
+same trip, a group included, keeps working. And where a stack declares
+`relay.multiplex_gateway_id` (the Mac staging stack does), the interviewer's
+gateway authenticates under that id, not under `relay.interviewer_profile`, so
+the `interview` row depends on the key until the interviewer has an id of its
+own; unsetting it makes outbound as exact as inbound. The VM declares no
+multiplex id, so there its interviewer is refused in every chat. The VM's interviewer gateway (`kinerary-trip-intake`) does not match
+`relay.interviewer_profile` (`trip-intake`) today, and on the interpret path
+that is harmless, because no interview turn is pushed to a gateway or sent back
+by one; the relay logs `relay.gateway_identity_unmatched` (warn, gateway id and
+a fixed reason) once per such id, and it changes no routing. Spec: `docs/specs/sprint-9/x-relay-chat-scope.md`.
+
 ### Defence in depth
 
 With `multiplex_profiles` **off**, `gateway/run.py:7810` honours

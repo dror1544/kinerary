@@ -44,7 +44,7 @@ import { describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 import pg from "pg";
-import { startFromDeepLink } from "../src/chat-router.js";
+import { startFromDeepLink, type ChatRoute } from "../src/chat-router.js";
 import { filesystemDocumentStore } from "../src/document-store.js";
 import { issueEnrollment } from "../src/enrollment.js";
 import { confirmIntakeForChat } from "../src/interview.js";
@@ -156,6 +156,10 @@ async function waitFor<T>(get: () => T | undefined, timeoutMs = 5000): Promise<T
 
 const SECRET = "assistant-events-paths-secret";
 
+/** A route lookup that binds every chat to the calling gateway: the action is in its own chat. */
+const ownChat = (profile: string) => async (): Promise<ChatRoute> =>
+  ({ kind: "companion", tripId: "trip-paths", hermesProfile: profile, assistantNames: [] });
+
 describe("#327 precondition 3 — connector suppressed / {ok:false}", () => {
   test("an internal-leak send is suppressed, delivered as far as the gateway is concerned, and recorded as reply_suppressed", async () => {
     const { sink, rows } = recordingSink();
@@ -172,7 +176,7 @@ describe("#327 precondition 3 — connector suppressed / {ok:false}", () => {
       async deleteWebhookIfPresent(): Promise<void> {},
     } as unknown as TelegramClient;
 
-    const connector = new RelayConnector({ gatewaySecrets: [SECRET], telegram, port: 0, log: () => {}, assistantEvents: events });
+    const connector = new RelayConnector({ gatewaySecrets: [SECRET], telegram, port: 0, log: () => {}, assistantEvents: events, resolveRoute: ownChat("gw_paths") });
     await connector.listen();
     try {
       // A chat context the emitter already knows about, exactly as a real
@@ -222,7 +226,7 @@ describe("#327 precondition 3 — connector suppressed / {ok:false}", () => {
       async deleteWebhookIfPresent(): Promise<void> {},
     } as unknown as TelegramClient;
 
-    const connector = new RelayConnector({ gatewaySecrets: [SECRET], telegram, port: 0, log: () => {}, assistantEvents: events });
+    const connector = new RelayConnector({ gatewaySecrets: [SECRET], telegram, port: 0, log: () => {}, assistantEvents: events, resolveRoute: ownChat("gw_paths2") });
     await connector.listen();
     try {
       events.handedOff("901", inboundFacts({
