@@ -520,6 +520,48 @@ class FleetMcp(unittest.TestCase):
         self.tool("alerts", {}, env=self.fixtures_env([]))
         self.assertFalse([s for s in self.statements() if "ve.check_name = 'mcp_isolation'" in s])
 
+    # The site -> shared bridge direction (site_to_bridge, PR #599 review).
+    SITE_BRIDGE_LINE = ("trip-s — site_to_bridge failed as of 2026-11-17 08:00 UTC; the site is up, but it "
+                        "could not be confirmed able to reach the shared trip-mcp bridge, so booking extraction "
+                        "and enrichment will fail")
+
+    def test_a_live_trip_whose_site_cannot_reach_the_shared_bridge_appears_in_alerts(self):
+        text, is_error = self.tool("alerts", {}, env=self.fixtures_env([
+            ("to_regclass", [["t"]]),
+            ("ve.check_name = 'site_to_bridge'", [["trip-s", "2026-11-17 08:00 UTC"]]),
+        ]))
+        self.assertFalse(is_error, text)
+        self.assertEqual(text, "\n\n".join([
+            "⚠️ Kinerary fleet — a control plane",
+            "SITE CANNOT REACH SHARED BRIDGE\n  • " + self.SITE_BRIDGE_LINE,
+        ]))
+        # A different incident from the companion -> bridge check.
+        self.assertNotIn("COMPANION BRIDGE CHECK FAILED", text)
+
+    def test_the_site_bridge_alert_has_a_digest_line_too(self):
+        text = self.rendered("alerts", {"format": "digest"}, [
+            ["to_regclass", [["t"]]],
+            ["ve.check_name = 'site_to_bridge'", [["trip-s", "2026-11-17 08:00 UTC"]]],
+        ])
+        self.assertEqual(text, "**⚠️ Needs attention**\n• site cannot reach shared bridge: " + self.SITE_BRIDGE_LINE)
+        self.assert_telegram_safe(text)
+
+    def test_the_site_bridge_query_counts_only_the_latest_failed_row_of_a_live_trip(self):
+        self.tool("alerts", {}, env=self.fixtures_env([("to_regclass", [["t"]])]))
+        queries = [s for s in self.statements() if "ve.check_name = 'site_to_bridge'" in s]
+        self.assertEqual(len(queries), 1, queries)
+        sql = queries[0]
+        self.assertIn("ve.outcome = 'failed'", sql)
+        self.assertRegex(sql, r"ve\.observed_at = \(SELECT max\(ve2\.observed_at\)")
+        self.assertRegex(sql, r"ve2\.trip_id = ve\.trip_id AND ve2\.check_name = ve\.check_name")
+        self.assertIn("= 'live'", sql)
+        for column in re.findall(r"\bve2?\.(\w+)", sql):
+            self.assertIn(column, {"trip_id", "check_name", "outcome", "observed_at"}, column)
+
+    def test_the_site_bridge_alert_is_not_checked_without_the_table(self):
+        self.tool("alerts", {}, env=self.fixtures_env([]))
+        self.assertFalse([s for s in self.statements() if "ve.check_name = 'site_to_bridge'" in s])
+
     # ------------------------------------------------- stale reachability (#295) --
     STALE = "reachability_checked_at"
 

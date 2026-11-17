@@ -379,6 +379,19 @@ def web_config_problems(env: Dict[str, str], profile: Optional[Dict]) -> List[st
             problems.append("PORTAL_ORIGIN and RUNTIME_ORIGIN are not the same site (the trip cookie is SameSite=Strict, so every "
                             "launch would loop and the gateway refuses to start); put both under one registrable domain, "
                             "or list a public suffix in RUNTIME_PUBLIC_SUFFIXES")
+    # Per-trip keys are a rotation (docs/runtime-session-exchange.md, "Rolling it out"):
+    # with the master set, the gateway refuses to start when any two of these hold one
+    # value, and the worker (fed RUNTIME_TRIP_KEY_MASTER and RUNTIME_EXCHANGE_KEY by
+    # compose.vm.yml) refuses the same. Found here, that is a refused plan instead of a
+    # failed upgrade. Names only, never values.
+    if env.get("RUNTIME_TRIP_KEY_MASTER"):
+        keys = [name for name in ("RUNTIME_EXCHANGE_KEY", "RUNTIME_TRIP_KEY_MASTER", "RUNTIME_LEGACY_TRIP_KEY") if env.get(name)]
+        for i, first in enumerate(keys):
+            for second in keys[i + 1:]:
+                if env[first] == env[second]:
+                    problems.append(f"{first} and {second} hold the same value; with RUNTIME_TRIP_KEY_MASTER set they must "
+                                    f"all differ (rotate RUNTIME_EXCHANGE_KEY: the current value becomes "
+                                    f"RUNTIME_LEGACY_TRIP_KEY and a new one goes to the api and the gateway)")
     if env.get("KINERARY_ARCHITECTURE_PROFILE") and profile is None:
         problems.append("KINERARY_ARCHITECTURE_PROFILE does not name a readable JSON file")
     elif profile is not None:

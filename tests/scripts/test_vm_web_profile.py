@@ -528,6 +528,28 @@ class ConfigurationIsCheckedBeforeTheSwitch(unittest.TestCase):
         self.assertEqual(problems, ["RUNTIME_COOKIE_SECRET is not set in vm.env"])
         self.assertNotIn("do-not-print-this", " ".join(problems))
 
+    def test_per_trip_keys_that_reuse_a_value_are_a_problem_named_without_the_value(self):
+        """The gateway and the worker refuse to start on an equal pair; found here it is
+        a refused plan (PR #599 review)."""
+        base = {**self.GOOD_ENV, "RUNTIME_EXCHANGE_KEY": "cp-key-0001"}
+        distinct = {**base, "RUNTIME_TRIP_KEY_MASTER": "master-0001", "RUNTIME_LEGACY_TRIP_KEY": "legacy-0001"}
+        self.assertEqual(vr.web_config_problems(distinct, self.profile()), [])
+        self.assertEqual(vr.web_config_problems({**distinct, "RUNTIME_LEGACY_TRIP_KEY": ""}, self.profile()), [])
+        # No master: per-trip keys are off and nothing is compared.
+        self.assertEqual(vr.web_config_problems({**base, "RUNTIME_LEGACY_TRIP_KEY": "cp-key-0001"}, self.profile()), [])
+        for pair, env in (
+            (("RUNTIME_EXCHANGE_KEY", "RUNTIME_LEGACY_TRIP_KEY"), {**distinct, "RUNTIME_LEGACY_TRIP_KEY": "cp-key-0001"}),
+            (("RUNTIME_EXCHANGE_KEY", "RUNTIME_TRIP_KEY_MASTER"), {**distinct, "RUNTIME_TRIP_KEY_MASTER": "cp-key-0001"}),
+            (("RUNTIME_TRIP_KEY_MASTER", "RUNTIME_LEGACY_TRIP_KEY"), {**distinct, "RUNTIME_LEGACY_TRIP_KEY": "master-0001"}),
+        ):
+            problems = vr.web_config_problems(env, self.profile())
+            self.assertEqual(len(problems), 1, problems)
+            self.assertTrue(problems[0].startswith(f"{pair[0]} and {pair[1]} hold the same value"), problems)
+            for value in ("cp-key-0001", "master-0001", "legacy-0001"):
+                self.assertNotIn(value, problems[0])
+        all_three = {**base, "RUNTIME_TRIP_KEY_MASTER": "cp-key-0001", "RUNTIME_LEGACY_TRIP_KEY": "cp-key-0001"}
+        self.assertEqual(len(vr.web_config_problems(all_three, self.profile())), 3)
+
     def test_origins_that_disagree_with_the_profile_are_a_problem(self):
         problems = vr.web_config_problems({**self.GOOD_ENV, "PORTAL_ORIGIN": "https://elsewhere.example.com"}, self.profile())
         self.assertEqual(problems, ["PORTAL_ORIGIN differs from the profile's web.public_origin"])
