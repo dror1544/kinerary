@@ -50,8 +50,8 @@ describe("one change is its line alone (the table)", () => {
   test("removed, with the day it had", () => {
     const c = change({ kind: "removed", date: "2026-12-13" });
     assert.equal(render([c]), "Removed from the plan: Dinner (Sunday, Dec 13)");
-    assert.equal(render([{ ...c, ...FEMININE }], "he"), "הסרה מהתוכנית: ארוחת ערב (יום ראשון, 13 בדצמבר)");
-    assert.equal(render([{ ...c, ...MASCULINE }], "he"), "הסרה מהתוכנית: ביקור במוזיאון (יום ראשון, 13 בדצמבר)");
+    assert.equal(render([{ ...c, ...FEMININE }], "he"), "הוסר מהתוכנית: ארוחת ערב (יום ראשון, 13 בדצמבר)");
+    assert.equal(render([{ ...c, ...MASCULINE }], "he"), "הוסר מהתוכנית: ביקור במוזיאון (יום ראשון, 13 בדצמבר)");
   });
 
   test("a title, place or type change says the details changed, and when the item is", () => {
@@ -65,7 +65,7 @@ describe("one change is its line alone (the table)", () => {
 });
 
 describe("Hebrew never uses a verb that has to agree with the title (Dror, 2026-11-17)", () => {
-  test("no template, for a masculine or a feminine title, contains 'עבר'/'עברה'/'נוסף'/'בוטל'/'עודכן'", () => {
+  test("no template, for a masculine or a feminine title, contains 'עבר'/'עברה'/'נוסף'/'בוטל'/'עודכן' (except Dror's own removed label)", () => {
     const shapes: PlanChange[] = [
       change({ kind: "updated", fields: ["time"], previous_time: "20:00" }),
       change({ kind: "updated", fields: ["date"], date: "2026-12-13", previous_date: "2026-12-10" }),
@@ -76,8 +76,10 @@ describe("Hebrew never uses a verb that has to agree with the title (Dror, 2026-
     ];
     for (const shape of shapes) {
       for (const title of [MASCULINE, FEMININE]) {
-        const out = render([{ ...shape, ...title }], "he")!;
-        for (const verb of ["עבר", "עברה", "נוסף", "בוטל", "עודכן", "הועבר", "הועברה"]) {
+        // "הוסר מהתוכנית" is Dror's own choice for the removed-item label (2026-11-17, after reading the Hebrew): the one
+        // label that is a passive verb, exempt from this test. It stands before the title, so it never agrees with it.
+        const out = render([{ ...shape, ...title }], "he")!.replace("הוסר מהתוכנית:", "");
+        for (const verb of ["עבר", "עברה", "נוסף", "בוטל", "עודכן", "הועבר", "הועברה", "הוסר", "הוסרה"]) {
           assert.ok(!out.split(/[\s,:()—]+/).includes(verb), `${verb} in: ${out}`);
         }
       }
@@ -111,7 +113,7 @@ describe("a date is always the date (Dror, 2026-11-17)", () => {
   test("a different month and a Saturday", () => {
     const c = change({ kind: "removed", date: "2027-01-02" });
     assert.equal(render([c]), "Removed from the plan: Dinner (Saturday, Jan 2)");
-    assert.equal(render([c], "he"), "הסרה מהתוכנית: ארוחת ערב (יום שבת, 2 בינואר)");
+    assert.equal(render([c], "he"), "הוסר מהתוכנית: ארוחת ערב (יום שבת, 2 בינואר)");
   });
 });
 
@@ -119,7 +121,7 @@ describe("today and tomorrow, in the TRIP's day, keep the date beside them", () 
   test("replace the weekday when they apply, and still say the date", () => {
     assert.equal(render([change({ kind: "added", date: "2026-12-03", time: "16:00" })]), "Added to the plan: Dinner — today (Thursday, Dec 3) at 16:00");
     assert.equal(render([change({ kind: "added", date: "2026-12-04", time: "16:00" })]), "Added to the plan: Dinner — tomorrow (Friday, Dec 4) at 16:00");
-    assert.equal(render([change({ kind: "removed", date: "2026-12-04" })], "he"), "הסרה מהתוכנית: ארוחת ערב (יום שישי, 4 בדצמבר)");
+    assert.equal(render([change({ kind: "removed", date: "2026-12-04" })], "he"), "הוסר מהתוכנית: ארוחת ערב (יום שישי, 4 בדצמבר)");
     assert.equal(
       render([change({ kind: "updated", fields: ["date"], date: "2026-12-04", previous_date: "2026-12-03" })]),
       "Plan change: Dinner — now tomorrow (Friday, Dec 4) (was Thursday, Dec 3)",

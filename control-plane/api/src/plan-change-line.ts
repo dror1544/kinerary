@@ -7,7 +7,7 @@
  *
  * NOUN-LED, SO IT AGREES WITH ANY TITLE (Dror, 2026-11-17). A Hebrew verb about the item ("עברה" / "עבר")
  * must agree with the item's gender, and the title is whatever the family typed. So every template opens
- * with a noun label ("שינוי בתוכנית:", "תוספת לתוכנית:", "הסרה מהתוכנית:") and the title is only ever quoted,
+ * with a label ("שינוי בתוכנית:", "תוספת לתוכנית:", "הוסר מהתוכנית:" — see the note at WORDS.he) and the title is only ever quoted,
  * never the subject of a verb. English follows the same shape ("Plan change: Dinner — now at 19:30").
  *
  * DATES ARE ALWAYS THE DATE (Dror, 2026-11-17): a day is written "Thursday, Dec 3" / "יום חמישי, 3 בדצמבר",
@@ -79,7 +79,10 @@ const WORDS = {
     more: (n: number) => `+${n} more on the trip site`,
   },
   he: {
-    change: "שינוי בתוכנית", added: "תוספת לתוכנית", removed: "הסרה מהתוכנית", heading: "עדכון בתוכנית",
+    // "הוסר מהתוכנית" ("removed from the plan") is a passive verb, not a noun: Dror chose this label himself on
+    // 2026-11-17, after reading the Hebrew, so it is the one deliberate exception to the noun-led rule above. It stands
+    // before the title ("הוסר מהתוכנית: ארוחת ערב"), so its verb does not have to agree with the title's gender.
+    change: "שינוי בתוכנית", added: "תוספת לתוכנית", removed: "הוסר מהתוכנית", heading: "עדכון בתוכנית",
     now: "עכשיו", was: "במקום", today: "היום", tomorrow: "מחר", details: "עדכון פרטים", anytime: "בכל שעה",
     more: (n: number) => `ועוד ${n} באתר הטיול`,
   },
