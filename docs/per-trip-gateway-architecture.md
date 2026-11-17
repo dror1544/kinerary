@@ -229,11 +229,12 @@ action is not retried or re-sent.
 
 Two consequences. A chat that is mid-interview belongs to the interviewer: only
 that private chat is closed to the companion, and every other chat bound to the
-same trip, a group included, keeps working. And the interviewer's gateway
-authenticates under the multiplex id today, not under `relay.interviewer_profile`,
-so the `interview` row depends on `relay.multiplex_gateway_id` until the
-interviewer has an id of its own; unsetting the key makes outbound as exact as
-inbound. The VM's interviewer gateway (`kinerary-trip-intake`) does not match
+same trip, a group included, keeps working. And where a stack declares
+`relay.multiplex_gateway_id` (the Mac staging stack does), the interviewer's
+gateway authenticates under that id, not under `relay.interviewer_profile`, so
+the `interview` row depends on the key until the interviewer has an id of its
+own; unsetting it makes outbound as exact as inbound. The VM declares no
+multiplex id, so there its interviewer is refused in every chat. The VM's interviewer gateway (`kinerary-trip-intake`) does not match
 `relay.interviewer_profile` (`trip-intake`) today, and on the interpret path
 that is harmless, because no interview turn is pushed to a gateway or sent back
 by one; the relay logs `relay.gateway_identity_unmatched` (warn, gateway id and
