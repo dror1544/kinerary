@@ -13,6 +13,9 @@
 .mini-app-bar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .85rem 1rem; border-bottom: 1px solid #cad5de; font-size: .85rem; font-weight: 600; }
 .mini-app-bar a { color: inherit; text-underline-offset: 3px; }
 .mini-app-unavailable { max-width: 34rem; margin: auto; padding: 3rem 1.25rem; }
+/* The shell is a fixed-height, overflow:hidden column, so the sign-in / "Choose a trip" screen has to scroll itself:
+   it shrinks to the space left (min-height:0) and scrolls past that, while margin:auto above still centres a short one. */
+.mini-app-shell > .mini-app-unavailable { flex: 0 1 auto; min-height: 0; overflow-y: auto; }
 /* The launcher is an ordinary page inside this shell's remaining safe area. */
 .mini-app-shell > .product-shell { flex: 1; min-height: 0; overflow: auto; }
 .mini-app-trip > .product-shell { display: flex; flex-direction: column; overflow: hidden; }

@@ -99,7 +99,9 @@ async function grantApproved(
     [tripId, slug],
   );
   await client.query(
-    "INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status) VALUES ($1, $2, $3, 'owner', 'active')",
+    // Both access flags default to false (migration 0020); an owner who holds neither cannot open their own trip.
+    // Same shape as the dashboard's own create path (portal.ts).
+    "INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status, dashboard_access, runtime_access) VALUES ($1, $2, $3, 'owner', 'active', true, true)",
     [generateId("memb"), tripId, userId],
   );
   await client.query(

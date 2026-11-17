@@ -7,6 +7,7 @@ import { buildApp } from "../src/app.js";
 import { validateArchitectureProfile } from "../src/config.js";
 import { digestTelegramId } from "../src/identity.js";
 import { applyMigrations } from "../src/migrations.js";
+import { inviteOrganizer } from "../src/organizer-invite.js";
 import { dispatchPendingTripNotifications } from "../src/outbox-dispatcher.js";
 import { sha256, type PortalDependencies } from "../src/portal.js";
 import { scopedSessionDigest } from "../src/portal-scope.js";
@@ -359,6 +360,26 @@ test("the DM binding is a last-resort hint: used only with no start_param and in
     const ignored = await exchange(app, initDataFor(stranger));
     assert.doesNotMatch(ignored.body, new RegExp(foreign));
     assert.equal(ignored.json().kind, "session");
+  } finally { await app.close(); }
+});
+
+test("a trip created by an invitation opens from the DM that is bound to it, not the chooser", { skip }, async () => {
+  const app = newApp();
+  try {
+    const telegramId = tg();
+    const invited = await inviteOrganizer(pool,
+      { email: `mini-${suffix}${hex()}@example.test`, language: "en", botUsername: "kinerary_bot", invitedBy: "an operator" },
+      { enrollmentTtlSeconds: 3600 });
+    assert.equal(invited.ok, true);
+    if (!invited.ok) return;
+    // The same person also runs a second trip, so the launch has a real choice to make; the DM binding makes it.
+    const other = await mkTrip("Their other trip");
+    await mkMember(other, invited.userId);
+    await linkOrganizer(invited.userId, telegramId);
+    await bindDm(invited.tripId, telegramId);
+
+    const dm = await exchange(app, initDataFor(telegramId));
+    assert.deepEqual(dm.json(), { kind: "session", appPath: `/mini-app/trips/${invited.tripId}` });
   } finally { await app.close(); }
 });
 
