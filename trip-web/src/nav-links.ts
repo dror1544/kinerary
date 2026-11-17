@@ -4,6 +4,8 @@
 // and a Journey row showed Map and Waze only when the item carried a URL. Now the Today row, the Plan
 // row and "Up next" ask here, so a place is navigated the same way wherever it is shown.
 //
+// The trip's navigation app (Google Maps or Waze) decides which of the two the Go chip opens, see `navUrlFor`.
+//
 // Every URL passes `safeExternalUrl` (http and https only); an item's stored link is never trusted
 // as written. The search fallback is built here, from the item's own title and its phase's name.
 import { safeExternalUrl } from "./external-url";
@@ -31,7 +33,22 @@ export function mapUrlFor(item: NavItem, title: string, destination?: string): s
     || `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent([title, destination].filter(Boolean).join(", "))}`;
 }
 
-/** Waze, only when there is one to give — Waze has no search URL worth guessing. */
+/** Waze, only when the item (or its booking's place) carries one. The Go chip falls back to a Waze search itself. */
 export function wazeUrlFor(item: NavItem): string | null {
   return safeExternalUrl(item.waze_url) || safeExternalUrl(item.booking?.place?.waze_url) || null;
+}
+
+/** The trip's navigation app (`/api/settings` → `nav_app`). Anything unrecognised is Google Maps. */
+export type NavApp = "google" | "waze";
+export const normalizeNavApp = (value: unknown): NavApp => (value === "waze" ? "waze" : "google");
+
+/**
+ * The one Go target: the organizer's chosen app. Google behaves as `mapUrlFor`. Waze opens the item's
+ * (or its booking place's) Waze link, else a Waze search on title + destination that starts navigation.
+ */
+export function navUrlFor(item: NavItem, title: string, destination: string | undefined, app: NavApp): string {
+  if (app !== "waze") return mapUrlFor(item, title, destination);
+  return wazeUrlFor(item)
+    || safeExternalUrl(`https://waze.com/ul?q=${encodeURIComponent([title, destination].filter(Boolean).join(", "))}&navigate=yes`)
+    || mapUrlFor(item, title, destination);
 }

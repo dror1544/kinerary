@@ -904,6 +904,10 @@ textarea { min-height: 132px; resize: vertical; }
 .group-line-toggle label { display: flex; align-items: center; gap: 10px; min-height: 44px; font-weight: 700; cursor: pointer; }
 .group-line-toggle input { width: 22px; height: 22px; }
 .group-line-toggle p { margin: 6px 0 0; color: var(--kit-ink-soft); }
+.nav-app-setting label { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 44px; font-weight: 700; }
+.nav-app-setting select { min-height: 44px; }
+.nav-app-setting small { display: block; color: var(--kit-ink-soft); }
+.nav-app-setting p { margin: 6px 0 0; color: var(--kit-ink-soft); }
 .member-logins { margin-top: 18px; }
 .member-logins h3 { margin: 0 0 4px; font: 800 20px/1.2 var(--kit-font-display); }
 .member-logins p { margin: 0 0 12px; color: var(--kit-ink-soft); line-height: 1.6; }
@@ -1175,25 +1179,49 @@ textarea { min-height: 132px; resize: vertical; }
 }
 
 /* Header: a teal gradient over the hero photo, or over a skyline drawn in code. */
+/* Scroll behaviour (src/hero-scroll.ts). The header is sticky with a negative top equal to its own height minus the compact
+   bar (--hero-stick, set from JS): its box never changes size, so nothing below it jumps; the browser scrolls it up with
+   the page until only its top bar (logo, title, menu button) is left, and holds that. --hero-progress (0..1) fades the big
+   title line; --hero-pull (px, only while the page is pulled down at the top) stretches the photo and wash upward. */
 .video-layout .video-hero {
+  position: sticky;
+  top: calc(-1 * var(--hero-stick, 0px));
+  z-index: 12;
+  overflow: visible;
   min-height: 0;
   padding-block: 14px 20px;
   background: linear-gradient(180deg, #0a625c, var(--kit-teal) 72%, #2fa99d);
 }
-.video-hero-photo { z-index: -3; background-size: cover; background-color: transparent; }
-.video-hero-wash { position: absolute; inset: 0; z-index: -2; background: linear-gradient(180deg, rgba(10, 98, 92, .94), rgba(14, 143, 134, .82) 62%, rgba(14, 143, 134, .6)); }
+.video-layout .video-hero.is-compact { box-shadow: 0 6px 18px rgba(16, 38, 58, .22); }
+.video-hero-photo { z-index: -3; inset-block-start: calc(-1 * var(--hero-pull, 0px)); background-size: cover; background-color: transparent; }
+.video-hero-wash { position: absolute; inset: 0; inset-block-start: calc(-1 * var(--hero-pull, 0px)); z-index: -2; }
+/* No photo: the teal gradient over the skyline motif. */
+.video-hero-wash.is-skyline { background: linear-gradient(180deg, rgba(10, 98, 92, .94), rgba(14, 143, 134, .82) 62%, rgba(14, 143, 134, .6)); }
+/* A photo: it is the vacation, so it shows. No teal; only a navy shade for the white text, faint behind the top bar and
+   strongest behind the title at the bottom. */
+.video-hero-wash.is-photo { background: linear-gradient(180deg, rgba(16, 38, 58, .28), rgba(16, 38, 58, 0) 32%, rgba(16, 38, 58, .12) 50%, rgba(16, 38, 58, .58)); }
 .skyline-motif { position: absolute; inset-inline: 0; bottom: 0; z-index: -1; width: 100%; height: 78%; color: rgba(16, 38, 58, .2); pointer-events: none; }
 .video-layout .video-hero-copy { min-height: 0; margin-top: 12px; max-width: none; }
+.video-layout .video-hero-copy { opacity: calc(1 - var(--hero-progress, 0) * 1.5); }
+@media (prefers-reduced-motion: reduce) {
+  /* No fade and no stretch (the pull is never applied from JS either): the big line is on, then off, in one step. */
+  .video-layout .video-hero-copy { opacity: 1; }
+  .video-layout .video-hero.is-compact .video-hero-copy { opacity: 0; }
+}
 .video-layout .video-hero-copy h1 { font: 800 clamp(24px, 6vw, 38px)/1.12 var(--kit-font-display); text-shadow: 0 2px 14px rgba(16, 38, 58, .3); overflow-wrap: anywhere; }
 .video-layout .topline { gap: 10px; min-height: 48px; }
 .video-layout .brand-lockup { flex: 1 1 auto; }
 .video-layout .brand-lockup .hero-logo { width: 38px; height: 38px; }
 .video-layout .hero-identity { padding: 3px; }
-.video-layout .more-button { order: 0; display: inline-flex; align-items: center; gap: 6px; min-height: 40px; padding: 0 12px; }
+/* The header's More button is the menu icon alone (its aria-label names it); 44px is the least a thumb should be asked to hit. */
+.video-layout .more-button { order: 0; display: inline-flex; align-items: center; justify-content: center; min-width: 44px; min-height: 44px; padding: 0 10px; }
 .video-layout .desktop-tabs a.active { color: var(--go-chip-bg); }
 .video-layout .app-content { margin-top: 18px; }
 
-/* Bottom bar: today's bar, with the video's four entries. */
+/* Bottom bar: today's bar, with the video's four entries. The bar is fixed, 12px up, 64px tall at least: the page keeps
+   that much (plus the phone's home-indicator inset and some air) free at its foot so the last row is never under it. */
+.video-layout.modern-trip-app { padding-bottom: calc(64px + 12px + 24px + env(safe-area-inset-bottom, 0px)); }
+.video-layout .bottom-nav { bottom: calc(12px + env(safe-area-inset-bottom, 0px)); }
 .video-layout .bottom-nav a.active { background: var(--go-chip-bg); }
 
 /* Today: one card for the whole day. */
@@ -1208,7 +1236,7 @@ textarea { min-height: 132px; resize: vertical; }
 .day-row {
   position: relative;
   display: grid;
-  grid-template-columns: 76px minmax(0, 1fr) auto;
+  grid-template-columns: 76px minmax(0, 1fr) 88px;
   gap: 10px;
   align-items: center;
   padding: 12px 18px;
@@ -1216,11 +1244,11 @@ textarea { min-height: 132px; resize: vertical; }
 }
 .day-row-time { font-weight: 800; font-variant-numeric: tabular-nums; color: var(--kit-ink); overflow-wrap: anywhere; }
 .day-row-main { display: grid; gap: 4px; min-width: 0; }
-.day-row-title { border: 0; padding: 0; background: none; color: var(--kit-ink); font: 700 16px/1.35 var(--kit-font-body); text-align: start; cursor: pointer; }
+.day-row-title { border: 0; padding: 0; background: none; color: var(--kit-ink); font: 700 16px/1.35 var(--kit-font-body); text-align: start; cursor: pointer; overflow-wrap: anywhere; min-width: 0; }
 .day-row-flags { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .day-row-flags:empty { display: none; }
-.day-row-actions { display: inline-flex; align-items: center; gap: 6px; }
-.day-row-waze { display: inline-flex; align-items: center; gap: 5px; color: var(--go-chip-bg); font-weight: 800; }
+/* A fixed third column, so the Go chips of every row sit in one column whatever the row has or lacks. */
+.day-row-actions { display: flex; align-items: center; justify-content: flex-end; }
 .day-row.is-next::before { content: ""; position: absolute; inset-block: 8px; inset-inline-start: 0; width: 4px; border-radius: 0 4px 4px 0; background: var(--go-chip-bg); }
 [dir="rtl"] .day-row.is-next::before { border-radius: 4px 0 0 4px; }
 .next-marker { color: var(--go-chip-bg); font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em; }
@@ -1232,20 +1260,41 @@ textarea { min-height: 132px; resize: vertical; }
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  justify-content: center;
+  min-width: 72px;
   min-height: 36px;
-  padding: 0 14px;
+  padding: 0 12px;
   border-radius: 999px;
   color: #fff;
   background: var(--go-chip-bg);
   font-size: 14px;
   font-weight: 800;
 }
-.detail-toggle { display: inline-flex; align-items: center; min-height: 36px; padding: 0 10px; border: 1px solid var(--kit-line); border-radius: var(--kit-radius); background: #fff; color: var(--kit-ink); font-weight: 700; cursor: pointer; }
-.detail-toggle[aria-expanded="true"] svg { transform: rotate(90deg); }
+/* A Plan row with detail is itself the control: a tap anywhere on it (not on Go, a link or a button) opens it. No arrow. */
+.video-layout .timeline-item.has-detail { cursor: pointer; }
+.video-layout .item-title-toggle { display: inline; padding: 0; border: 0; background: none; color: inherit; font: inherit; text-align: start; cursor: pointer; }
 .item-go-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
 .item-detail { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 10px; }
 .item-detail a { display: inline-flex; align-items: center; gap: 5px; color: var(--go-chip-bg); font-weight: 800; }
 .provenance-note { border-radius: var(--kit-radius); padding: 3px 7px; color: var(--go-chip-bg); background: rgba(95, 211, 196, .16); font-size: 12px; }
+
+/* Today: the announcement board above the day card. One control, the whole of it; folded it is a single line. */
+.video-layout .clock-board { cursor: pointer; }
+.video-layout .clock-board.is-folded { display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 8px 14px; box-shadow: none; }
+.video-layout .clock-board.is-folded svg { flex: none; color: var(--go-chip-bg); }
+.video-layout .clock-board-line { min-width: 0; font-weight: 800; color: var(--kit-ink); overflow-wrap: anywhere; }
+.video-layout .clock-board:focus-visible { outline: 0; box-shadow: var(--kit-focus); }
+
+/* Today: weather and flights, one card with two tabs. */
+.video-layout .weather-flights { display: grid; gap: 10px; }
+.video-layout .weather-flights-tabs { display: flex; gap: 6px; padding: 4px; border: 1px solid var(--kit-line); border-radius: var(--kit-radius); background: var(--kit-surface); }
+.video-layout .weather-flights-tabs button { position: relative; flex: 1 1 0; display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 44px; border: 0; border-radius: var(--kit-radius); background: transparent; color: var(--kit-ink); font: 800 14px/1 var(--kit-font-body); cursor: pointer; }
+.video-layout .weather-flights-tabs button.active { background: var(--go-chip-bg); color: #fff; }
+.video-layout .weather-flights-tabs button svg { color: currentColor; }
+.video-layout .tab-dot { position: absolute; inset-block-start: 8px; inset-inline-end: 10px; width: 9px; height: 9px; border-radius: 50%; background: var(--kit-coral); box-shadow: 0 0 0 2px #fff; }
+.video-layout .flights-panel ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+.video-layout .flights-panel li { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.video-layout .flights-panel .flight-change { padding: 2px 8px; border-radius: 999px; background: var(--change-tint); color: var(--kit-ink); font-size: 12px; }
 
 /* 1B: changed things are coral. Badge text is ink — white on #f26b3a is below 4.5:1. */
 .day-row.is-updated, .video-layout .timeline-item.is-updated { background: var(--change-tint); box-shadow: inset 0 0 0 1px var(--change-edge); }
@@ -1292,6 +1341,7 @@ textarea { min-height: 132px; resize: vertical; }
 @media (max-width: 520px) {
   .video-layout .video-hero { padding-inline: 16px; }
   .video-layout .brand-lockup strong { max-width: 110px; }
-  .day-row { grid-template-columns: 62px minmax(0, 1fr) auto; padding-inline: 14px; gap: 8px; }
+  .day-row { grid-template-columns: 62px minmax(0, 1fr) 84px; padding-inline: 14px; gap: 8px; }
+  .go-chip { min-width: 70px; }
   .day-card-head { padding-inline: 14px; }
 }

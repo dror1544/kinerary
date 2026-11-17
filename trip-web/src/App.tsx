@@ -22,7 +22,10 @@ import { heroCandidates, useHeroPhoto } from "./hero-photo";
 import { useTripUpdates, useLiveEditGuard } from "./live-updates";
 import { featureOn } from "./features";
 import { GroupLineToggle } from "./group-line";
-import { hasGoChip, mapUrlFor, wazeUrlFor } from "./nav-links";
+import { hasGoChip, mapUrlFor, navUrlFor, wazeUrlFor } from "./nav-links";
+import { useNavApp } from "./trip-settings";
+import { WeatherFlightsCard } from "./today-cards";
+import { useHeroScroll } from "./hero-scroll";
 import { ChangeBadge, ChangeTime, UpdatedForEveryone, changeClass, changeOf, movedFromLabel, useFreshChanges, weekdayName } from "./recent-change";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -120,7 +123,7 @@ import {
 } from "./api";
 
 type Tab = "today" | "journey" | "moments" | "more";
-type Module = "bookings" | "map" | "budget" | "photos" | "readiness" | "account" | "activities" | "lostfound" | "trivia" | "plan-tools";
+type Module = "bookings" | "map" | "budget" | "photos" | "readiness" | "account" | "activities" | "lostfound" | "trivia" | "plan-tools" | "companion";
 type Lang = "he" | "en";
 type BookingFilter = "phase" | "today" | "current" | "flight" | "hotel" | "attraction";
 type ItineraryTimeMode = "exact" | "rough" | "none";
@@ -226,8 +229,12 @@ const moduleShortcuts: Array<{ id: Module; en: string; he: string }> = [
   { id: "plan-tools", en: "Plan tools", he: "כלי מסלול" },
 ];
 
+// The trip conversation is a page of its own in the video layout (it used to sit on Today): a module with a hash,
+// listed in the header menu. It is not in `moduleShortcuts` because that list feeds the current layout's lists too.
+const companionShortcut: { id: Module; en: string; he: string } = { id: "companion", en: "Trip conversation", he: "השיחה של הטיול" };
+
 function moduleLabel(module: Module, lang: Lang) {
-  const shortcut = moduleShortcuts.find((item) => item.id === module);
+  const shortcut = [...moduleShortcuts, companionShortcut].find((item) => item.id === module);
   return shortcut ? shortcut[lang] : module;
 }
 
@@ -236,7 +243,7 @@ function isTab(value: string): value is Tab {
 }
 
 function isModule(value: string): value is Module {
-  return moduleShortcuts.some((shortcut) => shortcut.id === value);
+  return moduleShortcuts.some((shortcut) => shortcut.id === value) || value === companionShortcut.id;
 }
 
 export function preferredLang(): Lang {
@@ -574,10 +581,15 @@ function TimelineItem({
   const previousTime = change?.fields.includes("time") && change.previous_time ? itineraryTimeLabel(change.previous_time, lang) : null;
   const provenanceLabel = item.provenance?.status === "updated_from_original" ? copy(lang, "Updated from original", "עודכן מהתוכנית המקורית")
     : item.provenance?.status === "added" ? copy(lang, "Added", "נוסף") : "";
-  const detailWaze = videoLayout ? wazeUrlFor(item) : null;
-  const hasDetail = videoLayout && Boolean(detailWaze || provenanceLabel);
+  const hasDetail = videoLayout && Boolean(provenanceLabel);
   return (
-    <article className={`timeline-item ${compact ? "compact" : ""}${changeClass(change)}${fresh ? " is-fresh" : ""}`}>
+    <article className={`timeline-item ${compact ? "compact" : ""}${changeClass(change)}${fresh ? " is-fresh" : ""}${hasDetail ? " has-detail" : ""}`}
+      onClick={hasDetail ? (event) => {
+        // The whole row is the control (no arrow, no separate button), but a tap on anything interactive inside it
+        // (Go, Rate, RSVP, a link, the title button itself) does that thing and does not also toggle the detail.
+        if ((event.target as HTMLElement).closest("a, button, input, select, textarea, label, [role='button']")) return;
+        setDetailOpen((open) => !open);
+      } : undefined}>
       <div className="time-rail">
         {change ? <ChangeTime time={itineraryTimeLabel(item.time, lang)} previous={previousTime} /> : <span>{itineraryTimeLabel(item.time, lang)}</span>}
         <i />
@@ -591,22 +603,22 @@ function TimelineItem({
           {moved ? <small className="moved-from">{moved}</small> : null}
           {videoLayout && item.booking ? <small className="booked-tick"><CheckCircle2 size={13} /> {copy(lang, "Booked", "הוזמן")}</small> : null}
         </div>
-        <h3>{title}</h3>
+        <h3>{hasDetail
+          ? <button className="item-title-toggle" type="button" aria-expanded={detailOpen} onClick={() => setDetailOpen((open) => !open)}>{title}</button>
+          : title}</h3>
         <div className="item-meta">
           {item.booking?.confirmation ? <span><CheckCircle2 size={14} /> {copy(lang, "Confirmation stored", "אישור שמור")}</span> : null}
           {!videoLayout && locationUrl ? <a href={locationUrl} target="_blank" rel="noreferrer"><MapPin size={14} /> {copy(lang, "Map", "מפה")}</a> : null}
           {!videoLayout && wazeUrl ? <a href={wazeUrl} target="_blank" rel="noreferrer"><Navigation size={14} /> Waze</a> : null}
           {item.confirmation_state && item.confirmation_state !== "verified" ? <span><AlertTriangle size={14} /> {copy(lang, "Needs review", "נדרשת בדיקה")}</span> : null}
         </div>
-        {videoLayout && (hasGoChip(item) || hasDetail) ? (
+        {videoLayout && hasGoChip(item) ? (
           <div className="item-go-bar">
-            {hasGoChip(item) ? <GoChip item={item} title={title} destination={destination} lang={lang} /> : null}
-            {hasDetail ? <button className="detail-toggle" type="button" aria-expanded={detailOpen} onClick={() => setDetailOpen((open) => !open)}>{copy(lang, "Details", "פרטים")}</button> : null}
+            <GoChip item={item} title={title} destination={destination} lang={lang} />
           </div>
         ) : null}
         {videoLayout && detailOpen ? (
           <div className="item-detail">
-            {detailWaze ? <a href={detailWaze} target="_blank" rel="noreferrer"><Navigation size={14} /> Waze</a> : null}
             {provenanceLabel ? <b className="provenance-note">{provenanceLabel}</b> : null}
           </div>
         ) : null}
@@ -641,13 +653,19 @@ export function TripClockPanel({
   today,
   next,
   lang,
+  board = false,
 }: {
   config?: TripConfig;
   itinerary?: ActiveItinerary;
   today?: Awaited<ReturnType<typeof getToday>>;
   next?: ItineraryItem | null;
   lang: Lang;
+  /** Video layout: the trip's announcement board. Folded to one line unless the companion has a message for today. */
+  board?: boolean;
 }) {
+  const todaysMessage = (today?.companion_message?.date === today?.today && today?.companion_message?.[lang]) || "";
+  const [boardOpen, setBoardOpen] = useState<boolean | null>(null);
+  const expanded = !board || (boardOpen ?? Boolean(todaysMessage));
   const activePhaseId = next?.phase_id || today?.current?.phase_id || today?.next?.phase_id || "";
   const phase = config?.phases?.find((entry) => entry.id === activePhaseId)
     || config?.phases?.find((entry) => today?.today && entry.start && entry.end && entry.start <= today.today && entry.end >= today.today);
@@ -658,23 +676,40 @@ export function TripClockPanel({
   const label = today ? phaseLabel(today.phase, lang) : copy(lang, "Trip clock", "שעון הטיול");
   const destination = phase ? text(phase.title, lang) || phase.id : config?.meta?.destination || config?.meta?.title || copy(lang, "the journey", "הטיול");
 
+  const headline = today?.phase === "pre_trip" && today.countdown_days != null
+    ? copy(lang, `${Math.max(today.countdown_days, 0)} days until the adventure starts`, `נותרו ${Math.max(today.countdown_days, 0)} ימים עד תחילת ההרפתקה`)
+    : phaseDayIndex > 0
+      ? copy(lang, `Day ${phaseDayIndex} in ${destination}`, `יום ${phaseDayIndex} ב${destination}`)
+      : copy(lang, `Now tracking ${destination}`, `עוקבים עכשיו אחרי ${destination}`);
+  // The board is one control, the whole of it: a tap anywhere folds or unfolds it. No arrow; aria-expanded says which.
+  const boardControl = board ? {
+    role: "button" as const,
+    tabIndex: 0,
+    "aria-expanded": expanded,
+    onClick: () => setBoardOpen(!expanded),
+    onKeyDown: (event: React.KeyboardEvent) => {
+      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setBoardOpen(!expanded); }
+    },
+  } : {};
+  if (board && !expanded) {
+    return (
+      <section className="clock-panel clock-board is-folded" {...boardControl}>
+        <Clock3 size={18} aria-hidden="true" />
+        <span className="clock-board-line">{headline}</span>
+      </section>
+    );
+  }
   return (
-    <section className="clock-panel">
+    <section className={board ? "clock-panel clock-board" : "clock-panel"} {...boardControl}>
       <div className="clock-orb" aria-hidden="true">
         <Clock3 size={24} />
         <span>{today?.countdown_days != null && today.countdown_days > 0 ? today.countdown_days : totalIndex || "•"}</span>
       </div>
       <div className="clock-copy">
         <span className="panel-label"><Route size={16} /> {label}</span>
-        <h3>
-          {today?.phase === "pre_trip" && today.countdown_days != null
-            ? copy(lang, `${Math.max(today.countdown_days, 0)} days until the adventure starts`, `נותרו ${Math.max(today.countdown_days, 0)} ימים עד תחילת ההרפתקה`)
-            : phaseDayIndex > 0
-              ? copy(lang, `Day ${phaseDayIndex} in ${destination}`, `יום ${phaseDayIndex} ב${destination}`)
-              : copy(lang, `Now tracking ${destination}`, `עוקבים עכשיו אחרי ${destination}`)}
-        </h3>
+        <h3>{headline}</h3>
         {totalDays > 0 && totalIndex > 0 && <p>{copy(lang, `Trip day ${totalIndex} of ${totalDays}.`, `יום ${totalIndex} מתוך ${totalDays} בטיול.`)}</p>}
-        <p>{(today?.companion_message?.date === today?.today && today?.companion_message?.[lang]) || copy(lang,
+        <p>{todaysMessage || copy(lang,
           "Take today at your own pace. Some of the best moments are the ones you didn't plan.",
           "קחו את היום בקצב שלכם. לפעמים הרגעים הכי יפים הם אלה שלא תכננתם.",
         )}</p>
@@ -714,10 +749,11 @@ export function UpcomingActivity({ item, config, lang, onOpenItinerary }: {
 // ── The video layout (Release 1A/1B; docs/specs/sprint-9/x-video-r1-site-look.md) ─────────────────────────
 // Everything from here to TodayView renders only behind `site_video_layout`.
 
-/** The Go chip: Google Maps at the item's place. Waze is the second option, in the row's detail. */
+/** The Go chip: opens the item's place in the navigation app the organizer chose for the trip (Google Maps by default). */
 export function GoChip({ item, title, destination, lang }: { item: ItineraryItem; title: string; destination?: string; lang: Lang }) {
+  const navApp = useNavApp();
   return (
-    <a className="go-chip" href={mapUrlFor(item, title, destination)} target="_blank" rel="noreferrer"
+    <a className="go-chip" href={navUrlFor(item, title, destination, navApp)} target="_blank" rel="noreferrer"
       aria-label={copy(lang, `Go to ${title}`, `ניווט אל ${title}`)}>
       <Navigation size={14} aria-hidden="true" />{copy(lang, "Go", "ניווט")}
     </a>
@@ -733,13 +769,11 @@ export function DayRow({ item, config, lang, isNext, marks, fresh, onOpenItinera
   fresh: boolean;
   onOpenItinerary: (focus: JourneyFocus) => void;
 }) {
-  const [open, setOpen] = useState(false);
   const title = itemTitle(item, lang);
   const destination = text(config?.phases?.find((entry) => entry.id === item.phase_id)?.title, lang);
   const change = marks ? changeOf(item) : undefined;
   const moved = movedFromLabel(change, lang);
   const previousTime = change?.fields.includes("time") && change.previous_time ? itineraryTimeLabel(change.previous_time, lang) : null;
-  const waze = wazeUrlFor(item);
   return (
     <li className={`day-row${changeClass(change)}${isNext ? " is-next" : ""}${fresh ? " is-fresh" : ""}`} data-item-uid={item.item_uid}>
       <span className="day-row-time">
@@ -753,11 +787,9 @@ export function DayRow({ item, config, lang, isNext, marks, fresh, onOpenItinera
           {moved ? <small className="moved-from">{moved}</small> : null}
           {item.booking ? <small className="booked-tick"><CheckCircle2 size={13} /> {copy(lang, "Booked", "הוזמן")}</small> : null}
         </span>
-        {open && waze ? <a className="day-row-waze" href={waze} target="_blank" rel="noreferrer"><Navigation size={14} /> Waze</a> : null}
       </div>
       <div className="day-row-actions">
         {hasGoChip(item) ? <GoChip item={item} title={title} destination={destination} lang={lang} /> : null}
-        {waze ? <button className="detail-toggle" type="button" aria-expanded={open} aria-label={copy(lang, `More options for ${title}`, `אפשרויות נוספות ל${title}`)} onClick={() => setOpen((value) => !value)}><ChevronRight size={16} aria-hidden="true" /></button> : null}
       </div>
     </li>
   );
@@ -863,10 +895,13 @@ export function VideoHero({ config, settings, lang, placePhaseId, pageName, acti
   const heroLogo = tripLogoUrl(config?.meta?.logo) || brandMark;
   const heroLogoAlt = config?.meta?.logoAlt || config?.meta?.title || "Trip";
   const backgroundPosition = `${(settings?.hero.focal_x ?? 0.5) * 100}% ${(settings?.hero.focal_y ?? 0.45) * 100}%`;
+  // Scroll-linked header (hero-scroll.ts): shrinks to a compact bar going down, stretches when pulled at the top.
+  const heroRef = useRef<HTMLElement>(null);
+  const compact = useHeroScroll(heroRef);
   return (
-    <header className="trip-hero video-hero" data-photo-state={photo ? "ready" : unavailable ? "unavailable" : "loading"}>
+    <header ref={heroRef} className={`trip-hero video-hero${compact ? " is-compact" : ""}`} data-photo-state={photo ? "ready" : unavailable ? "unavailable" : "loading"}>
       {photo ? <div key={photo} className="hero-image-layer video-hero-photo" aria-hidden="true" style={{ backgroundImage: `url("${photo}")`, backgroundPosition }} /> : <SkylineMotif />}
-      <div className="video-hero-wash" aria-hidden="true" />
+      <div className={`video-hero-wash ${photo ? "is-photo" : "is-skyline"}`} aria-hidden="true" />
       <nav className="topline" aria-label="Trip">
         <a className="brand-lockup" href="#today" onClick={() => openVideoTab("today")} aria-label="Kinerary home">
           <img className="hero-logo" src={heroLogo} alt={heroLogoAlt} />
@@ -886,7 +921,7 @@ export function VideoHero({ config, settings, lang, placePhaseId, pageName, acti
           </button>
         ) : null}
         <button className="menu-button more-button" type="button" onClick={openMenu} aria-label={copy(lang, "More", "עוד")}>
-          <Menu size={18} aria-hidden="true" /><span>{copy(lang, "More", "עוד")}</span>
+          <Menu size={20} aria-hidden="true" />
         </button>
       </nav>
       <div className="hero-copy video-hero-copy">
@@ -929,8 +964,8 @@ export function TodayView({
     <section className="view-grid today-grid">
       {dayCard ? (
         <div className="focus-panel day-card-panel">
+          <TripClockPanel board config={config} itinerary={itinerary} today={today.data} next={next} lang={lang} />
           <DayCard today={dayCard} itinerary={itinerary} config={config} lang={lang} marks={marks} onOpenItinerary={onOpenItinerary} />
-          <TripClockPanel config={config} itinerary={itinerary} today={today.data} next={next} lang={lang} />
         </div>
       ) : (
       <div className="focus-panel">
@@ -944,18 +979,24 @@ export function TodayView({
       </div>
       )}
 
-      <aside className="ops-strip">
-        {today.data?.today && <TodayWeather key={today.data.today} config={config} itinerary={itinerary} today={today.data.today} lang={lang} />}
-        <section className="mini-panel">
-          <Plane size={20} />
-          <h3>{copy(lang,"Flights","טיסות")}</h3>
-          <p>{flights.data?.statuses[0]?.facts.name || today.data?.flights[0]?.name || "Stored booking facts are the fallback."}</p>
-          {flights.data?.statuses[0]?.stale ? <small>{copy(lang,"Using last known status","מציגים את המצב האחרון הידוע")}</small> : null}
-        </section>
+      {videoLayout ? (
+        <aside className="ops-strip">
+          <WeatherFlightsCard config={config} itinerary={itinerary} today={today.data?.today}
+            flights={flights.data?.statuses || []} fallbackFlights={(today.data?.flights || []).map((flight) => flight.name)} lang={lang} />
+        </aside>
+      ) : (
+        <aside className="ops-strip">
+          {today.data?.today && <TodayWeather key={today.data.today} config={config} itinerary={itinerary} today={today.data.today} lang={lang} />}
+          <section className="mini-panel">
+            <Plane size={20} />
+            <h3>{copy(lang,"Flights","טיסות")}</h3>
+            <p>{flights.data?.statuses[0]?.facts.name || today.data?.flights[0]?.name || "Stored booking facts are the fallback."}</p>
+            {flights.data?.statuses[0]?.stale ? <small>{copy(lang,"Using last known status","מציגים את המצב האחרון הידוע")}</small> : null}
+          </section>
+        </aside>
+      )}
 
-      </aside>
-
-      <CompanionPanel name={companionName} isOrganizer={isOrganizer} lang={lang} />
+      {videoLayout ? null : <CompanionPanel name={companionName} isOrganizer={isOrganizer} lang={lang} />}
 
       <section className="section-band">
         <div className="section-heading">
@@ -2967,6 +3008,7 @@ export function AppMenu({
           {moduleShortcuts.filter(m=>m.id!=="plan-tools"||isOrganizer).filter(m => !videoLayout || (m.id !== "bookings" && m.id !== "photos")).map((shortcut) => (
             <button key={shortcut.id} type="button" onClick={() => openModule(shortcut.id)}>{shortcut[lang]}</button>
           ))}
+          {videoLayout ? <button type="button" onClick={() => openModule("companion")}>{companionShortcut[lang]}</button> : null}
           {videoLayout ? <button type="button" onClick={() => openTab("more")}>{copy(lang, "Who is coming", "מי משתתף בטיול")}</button> : null}
         </div>
         <div className="menu-section">
@@ -3091,7 +3133,9 @@ export default function App() {
     else openModule(tab);
   };
   // `#moments` is Photos in the video layout (Moments is a section inside it); `#journey` is Plan.
-  const shownModule: Module | null = activeModule ?? (videoLayout && activeTab === "moments" ? "photos" : null);
+  // The trip conversation is a page only in the video layout; with the switch off #companion is not a page.
+  const pageModule = activeModule === "companion" && !videoLayout ? null : activeModule;
+  const shownModule: Module | null = pageModule ?? (videoLayout && activeTab === "moments" ? "photos" : null);
   const videoActive: VideoTab | null = shownModule === "bookings" ? "bookings" : shownModule === "photos" ? "photos"
     : shownModule ? null : activeTab === "today" ? "today" : activeTab === "journey" ? "plan" : null;
   const videoPageName = shownModule ? moduleLabel(shownModule, lang) : activeTab === "more" ? tabLabel("more", lang) : videoTabLabel(activeTab === "journey" ? "plan" : "today", lang);
@@ -3117,6 +3161,7 @@ export default function App() {
     activities: <GroupActivities config={config.data} currentUser={me.data} lang={lang}/>,
     lostfound: <LostFound lang={lang}/>,
     trivia: <Trivia config={config.data} currentUser={me.data} lang={lang}/>,
+    companion: <CompanionPanel name={companionName} isOrganizer={me.data?.is_organizer} lang={lang} />,
     "plan-tools": me.data?.is_organizer ? <PlanTools isOrganizer config={config.data} itinerary={itinerary.data} lang={lang}/> : <p>{copy(lang,"Organizer access required.","נדרשת הרשאת מארגן.")}</p>,
   }[shownModule] : null;
   const content = moduleContent || tabContent;
