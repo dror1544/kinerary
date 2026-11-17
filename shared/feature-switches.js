@@ -36,6 +36,18 @@ const FEATURE_SWITCHES = Object.freeze([
     surfaces: Object.freeze(['site']),
     memberVisible: true,
   }),
+  Object.freeze({
+    name: 'site_video_layout',
+    summary: 'Modern site: video layout (Today · Plan · Bookings · Photos, day card, Go chip)',
+    surfaces: Object.freeze(['site']),
+    memberVisible: true,
+  }),
+  Object.freeze({
+    name: 'plan_change_marks',
+    summary: 'Plan items carry recent_change; Updated/New badges and "Updated for everyone" on the site',
+    surfaces: Object.freeze(['site']),
+    memberVisible: true,
+  }),
 ]);
 
 // Fail loud at load: a malformed registry is a code bug, not a runtime state.
