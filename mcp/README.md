@@ -144,7 +144,7 @@ no port per trip. (Design: `docs/specs/sprint-9/x-wildcard-host-and-shared-bridg
 | Env var | Default | Purpose |
 |---|---|---|
 | `MCP_ROUTES_DIR` | unset | Turns shared mode on. An existing directory of route files; the process refuses to start if it is not one. `MCP_API_KEY` is not required, and `API_BASE_URL`, `TRIP_PUBLIC_URL`, `TRIP_API_KEY` and `HERMES_API_KEY` are ignored (the log says so, by name). |
-| `MCP_BIND_HOST` | `127.0.0.1` in shared mode (`0.0.0.0` otherwise) | Address to listen on. Shared mode holds every trip's key, so it listens on loopback until told otherwise; whatever is placed in front of it decides who may reach it. |
+| `MCP_BIND_HOST` | `127.0.0.1` in shared mode (`0.0.0.0` otherwise) | Address to listen on. Shared mode holds every trip's key, so it listens on loopback until told otherwise; whatever is placed in front of it decides who may reach it. **A trip's own container calls this bridge too (below), so on a deployment where trips run in containers it has to listen on an address those containers can reach**, and whatever is in front of it should admit those containers and the companion host only. |
 | `MCP_TRIP_TIMEOUT_MS` | `120000` | How long one call to a trip site may take before it is abandoned (`ETIMEDOUT`), so one slow trip cannot hold the process. Not applied to a call that carries its own timeout (`/health` keeps its 5 s). |
 | `MCP_EXTRACT_CONCURRENCY` | `2` | At most this many `/extract` and `/enrich` jobs run at once; the rest wait their turn, first in first out. |
 | `MCP_PORT`, `HERMES_EXTRACT_PROFILE`, `HERMES_BIN` | as above | Unchanged. |
@@ -192,9 +192,40 @@ the host is set up for shared mode (`KINERARY_SHARED_BRIDGE_ROUTES_DIR` and
 | | |
 |---|---|
 | `GET /sse`, `POST /messages` | As before, with the trip's token as `X-API-Key` (or `Authorization: Bearer`, or `?key=`). A `/messages` POST that carries a token must carry its own session's. |
-| `GET /health` | Behind the token, today's body shapes, for that token's trip only. |
+| `GET /health` | Behind the token, or the trip site's own key (as `/extract` and `/enrich`), today's body shapes, for that trip only. A key two routes share names no trip and is refused. |
 | `GET /ready` | **No key.** `{ "ok": true }` and nothing else: the process is up. Exists only in shared mode, for a supervisor that holds no token. |
 | `POST /extract`, `POST /enrich` | Accept either a companion's token or the trip site's own key, and run as that trip. |
+
+### The trip site calls the bridge too
+
+The companion's connection (`/sse`) is one direction. The other goes **from the trip's
+container to the bridge**: the trip site calls `${EXTRACTION_SERVICE_URL || HERMES_URL}/extract`
+(booking extraction) and `${HERMES_URL}/enrich` (enrichment, reviews) with its own key
+(`HERMES_API_KEY`), and the bridge resolves the trip from that key. Those three calls, `/extract`,
+`/enrich` and `/health`, are what a trip makes. A per-trip bridge listens on `3000 + vmid`; a shared
+bridge starts no such listener, so a site still pointed at one fails every extraction and
+enrichment call, and nothing in any conversation says why.
+
+- **A new trip.** The worker is told the bridge's address as a container reaches it
+  (`TRIP_MCP_SHARED_SITE_URL`, required with `TRIP_MCP_BRIDGE=shared`), writes it into the trip's
+  `.env` as `HERMES_URL`, and, once the trip is wired, runs a check **inside the container**: the
+  site's own `GET <HERMES_URL>/health` with its own key (read inside the container, handed to curl on
+  stdin, on no command line). One request shows that the container reaches the bridge, that the bridge
+  recognises the key as that trip's, and that the bridge reaches the site. It is recorded as the
+  `site_to_bridge` verification row, and a failure is logged as an error. `scripts/companion-install-host.sh`
+  wires the companion side only and says so; it has no access to the container.
+- **An existing trip** keeps whatever `HERMES_URL` it has (the worker only writes a new `.env`), which
+  is normally its old per-trip bridge port. Moving it is a cutover, per trip and with approval (a
+  deploy): rewrite `HERMES_URL` in the trip's `.env` to the shared bridge's address, restart the trip's
+  server, then from inside the container ask `GET <HERMES_URL>/health` with the site's key and expect
+  `{"ok":true,"site":"reachable"}`. Until then that trip's extraction and enrichment keep calling the
+  per-trip port. (If a trip's `.env` also sets `EXTRACTION_SERVICE_URL`, that wins for `/extract`
+  and has to be moved too; the worker's check reads `HERMES_URL` only.)
+- **Binding beyond loopback** (`MCP_BIND_HOST`) makes `/ready`, which needs no key, reachable from the
+  LAN. It answers `{"ok":true}` and nothing else; every other route wants a token or a site key.
+  `tests/mcp-shared-bridge.test.js` pins both with the bridge bound to `0.0.0.0`.
+- `KINERARY_SHARED_BRIDGE_URL` (the companion host's own view of the bridge) must stay loopback; the
+  address containers use is a different variable, `TRIP_MCP_SHARED_SITE_URL`, on the worker.
 
 ### Operating it
 

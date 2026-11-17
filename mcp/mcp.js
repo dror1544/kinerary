@@ -1900,7 +1900,14 @@ app.post('/enrich', requireSiteOrAgentKey, express.json({ limit: '256kb' }), ext
  * and does not belong in this repo's output), never a key, never anything
  * about the trip.
  */
-app.get('/health', requireKey, inTrip(async (_req, res) => {
+// Shared mode only: /health also accepts the trip SITE's own key, the one /extract and /enrich take
+// (requireSiteOrAgentKey). The site is the caller that matters for the direction the companion's own
+// connection does not cover: a request from the trip's container to this bridge, with the key the
+// site itself holds, shows that the container can reach it, that the bridge recognises that key as that
+// trip, and that the bridge can reach the site (the worker makes it after wiring a trip; spec F3).
+// Single-trip mode is unchanged: only the agent key opens it.
+const requireHealthKey = (req, res, next) => (SHARED ? requireSiteOrAgentKey(req, res, next) : requireKey(req, res, next));
+app.get('/health', requireHealthKey, inTrip(async (_req, res) => {
   try {
     const r = await fetchTrip('/api/config', { headers: h(), signal: AbortSignal.timeout(5000) });
     // A reply of any kind means the hop works. 401 is a key problem, not a

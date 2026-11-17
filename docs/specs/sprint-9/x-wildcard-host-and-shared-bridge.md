@@ -84,7 +84,8 @@ unset every path behaves as it does today.
   credentials, a path other than `/`, a query or a fragment, or whose host is
   not in `web.runtime_upstream_allowed_hosts` (exact hostnames, IPs or CIDRs).
   An empty or absent list allows nothing. The existing
-  `/internal/runtime-routes/:tripId` endpoint is unchanged.
+  `/internal/runtime-routes/:tripId` endpoint is unchanged except as AC-R1.11
+  says.
 - **AC-R1.4 Host mode is opt-in.** With `TRIP_HOST_SUFFIX` unset the gateway's
   behaviour is unchanged and its existing tests pass unmodified.
 - **AC-R1.5 Which requests are host-mode.** With `TRIP_HOST_SUFFIX=<suffix>`, a
@@ -109,6 +110,28 @@ unset every path behaves as it does today.
   upstream other than the one the registry returned for that exact host.
 - **AC-R1.10 Uploads.** A request body larger than the gateway's JSON limits
   (a photo upload) is streamed through in host mode, not buffered or refused.
+- **AC-R1.11 The by-trip-ID lookup uses the registered LAN origin** (owner review
+  of #599, F1). The worker verifies a wildcard trip over the LAN but the job's
+  `private_url` is its public name, where host mode answers 404 for
+  `/api/internal/*`. So `GET /internal/runtime-routes/:tripId`, which tells the
+  gateway where to SEND the launch's session exchange, participant provisioning
+  and the participant check, selects the route's `upstream_url` too:
+  - with a non-empty `web.runtime_upstream_allowed_hosts` and a route that has an
+    `upstream_url`, `upstreamOrigin` is that origin, validated exactly as AC-R1.3
+    validates it, and `upstreamBasePath` is `""`. An `upstream_url` that fails the
+    validation is 503 `RUNTIME_ROUTE_INVALID`, never a fall-back to the public URL;
+  - with an empty or absent list, or a NULL `upstream_url` (every row written
+    before R2), the answer is what it was: from `private_url` and the suffix
+    check, with its base path;
+  - `private_url`, and every link a browser is sent, are unchanged.
+  Tested end to end: the real API (`buildApp`, listening) and the real gateway (a
+  child process with `TRIP_HOST_SUFFIX` set) with a recording fake trip site on
+  loopback. A wildcard trip is seeded with a public `private_url`; participant
+  provisioning through the gateway reaches the site's
+  `/api/internal/control-plane/participants`, and a portal launch (`POST
+  /t/<id>/__launch` with the portal's Origin and a real grant row) reaches
+  `/api/internal/control-plane/session` and ends in the 303. The same test fails
+  against the lookup as it was (all three assertions).
 
 ### R2: provisioning without per-trip records
 
@@ -231,18 +254,70 @@ unset every path behaves as it does today.
 - **AC-B2.5 Gateway start.** In shared mode `revive_bridge_before_start` starts
   and restarts nothing. A shared bridge that does not answer `/ready` is a
   `failed` start with a reason that says the shared bridge is down.
-- **AC-B2.6 The worker is unchanged.** The worker sends the same request kinds
-  with the same fields. `mcp_port_for_vmid` is no longer a precondition for a
+- **AC-B2.6 The worker sends the same companion requests.** The worker sends the
+  same request kinds with the same fields (what it adds for the site's own
+  direction is AC-B2.7 and AC-B2.8). `mcp_port_for_vmid` is no longer a precondition for a
   host in shared mode; where the worker itself refuses a trip for having no
   bridge port, that refusal is lifted only when the worker is told the host is
   shared (`TRIP_MCP_BRIDGE=shared`, default `per_trip`).
+
+The companion's connection is one direction of the bridge. The other is the trip
+**site** calling its bridge: booking extraction (`${EXTRACTION_SERVICE_URL ||
+HERMES_URL}/extract`) and enrichment (`${HERMES_URL}/enrich`) go from the trip's
+container to the bridge, with the site's own key. A per-trip bridge listens on
+`3000 + vmid`; a shared bridge starts no such listener and, by default, binds
+loopback, so a site still pointed at a per-trip port fails every such call with
+nothing in any conversation to say why (owner review of #599, F3).
+
+- **AC-B2.7 The site's address for a shared bridge.** Worker env
+  `TRIP_MCP_SHARED_SITE_URL`: the shared bridge's address as a trip container
+  reaches it, `http(s)://host[:port]`, no path, credentials, query or fragment.
+  Validated at start. **Required** with `TRIP_MCP_BRIDGE=shared` and **refused**
+  without it, so it cannot be half-set; the error names the variable. When set, a
+  NEW trip's `.env` is written with `HERMES_URL=<it>` (inside the existing "no
+  `.env` yet" branch, so a re-provision never rewrites a live site's value). Unset
+  (per-trip mode): nothing is written, as before. The value reaches the container
+  adapter through the compute adapter's constructor, next to the exchange key.
+- **AC-B2.8 The site-to-bridge check, from inside the container.** In shared mode,
+  after the companion step has wired the trip (the bridge's route for it exists only
+  from then), the worker runs, through the Proxmox SSH path the adapter already uses
+  for `site_password` and `exchange_key_kind`, a script **inside the trip's
+  container** that reads the site's own `HERMES_URL` and `HERMES_API_KEY` from its
+  `.env` and calls `<HERMES_URL>/health` with that key. One request proves the
+  container reaches the bridge, the bridge recognises the key as that trip's, and
+  the bridge reaches the site. The key is read inside the container and handed to
+  `curl --config -` on stdin from a shell builtin: it is on no command line (not
+  ssh's, not `pct exec`'s, not curl's), in no file and in no output; the evidence
+  carries neither the key nor the address. It is recorded as the
+  `site_to_bridge` row of `verification_evidence` (`passed` or `failed`, never
+  `skipped` when it could not run), and a failure is also an error log line naming
+  what stops working. A site whose own `HERMES_URL` is not the configured address
+  (for example a deployment's `setup-mcp.sh` pointed it at a per-trip port) is a
+  named failure and is not asked at the other address. Not a hard gate: the trip is
+  already `ready_private` when the companion step runs (`verification.py`, module
+  docstring), exactly as for `mcp_isolation`.
+- **AC-B2.9 `/health` takes the site's key.** In shared mode `GET /health` also
+  answers a request carrying the trip site's own key (`requireSiteOrAgentKey`, as
+  `/extract` and `/enrich` do), for that trip only; a key held by two routes names
+  no trip and is refused; an unknown key or none is 401, before the site is asked.
+  Single-trip mode is unchanged (the site's key is still refused on `/health`).
+  `/ready`, which needs no key, is still exactly `{"ok":true}` and every other route
+  still needs a key when the bridge listens beyond loopback.
+- **AC-B2.10 Documented, and the install script says so.** `mcp/README.md`
+  ("Shared mode") says the bridge must listen on an address trip containers reach
+  (`MCP_BIND_HOST`), that `/extract`, `/enrich` and `/health` are what the trip calls,
+  and how an existing trip is cut over (rewrite `HERMES_URL` in its `.env`, restart
+  its server: a deploy, per trip, with approval). `scripts/companion-install-host.sh`,
+  in shared mode, says on stderr that the site-side direction is wired by the worker,
+  not there (it has no access to the trip's container).
 
 ## Contracts
 
 - **Migration**: `control-plane/db/migrations/<stamp>_runtime_route_hosts.sql`.
 - **API config**: `web.runtime_upstream_allowed_hosts: string[]`.
 - **Gateway env**: `TRIP_HOST_SUFFIX` (new). Existing variables unchanged.
-- **Worker env**: `TRIP_ROUTING=host|wildcard`, `TRIP_MCP_BRIDGE=per_trip|shared`.
+- **Worker env**: `TRIP_ROUTING=host|wildcard`, `TRIP_MCP_BRIDGE=per_trip|shared`,
+  `TRIP_MCP_SHARED_SITE_URL` (required with `shared`, refused without it).
 - **Bridge env**: `MCP_ROUTES_DIR`, `MCP_BIND_HOST`, `MCP_TRIP_TIMEOUT_MS`,
   `MCP_EXTRACT_CONCURRENCY`.
 - **Host env**: `KINERARY_SHARED_BRIDGE_ROUTES_DIR`, `KINERARY_SHARED_BRIDGE_URL`.
@@ -262,7 +337,7 @@ Files expected to change:
 | R1 | `control-plane/runtime-gateway/**`, `control-plane/api/src/portal.ts`, `config.ts`, `server.ts`, `control-plane/api/test/**` for those, `control-plane/db/migrations/<new>.sql`, `docs/runtime-session-exchange.md` |
 | R2 | `provisioning/**`, `tests/provisioning/**`, `control-plane/worker/control_plane_worker/{compute,__main__,provisioner,mcp_bridge}.py`, `control-plane/worker/tests/**`, `scripts/teardown-trip.py`, `scripts/trip-route.py`, `tests/scripts/**` |
 | B1 | `mcp/**`, `tests/mcp-*.test.js`, `tests/package.json` |
-| B2 | `scripts/companion-install-host.sh` and its tests |
+| B2 | `scripts/companion-install-host.sh` and its tests; for AC-B2.7 to B2.10 also `provisioning/**`, `control-plane/worker/control_plane_worker/{__main__,compute,provisioner,verification}.py`, `mcp/**`, `control-plane/deployment/{compose.local.yml,compose.vm.yml,vm.env.example}` |
 
 ## Non-goals
 
@@ -294,6 +369,13 @@ Files expected to change:
   it is never the process that serves `provision.js` (hard rule 5).
 - **A wildcard record sends unknown names to us.** The 404 is uniform so the
   gateway is not an oracle for which slugs exist.
+- **Binding the bridge beyond loopback** (so trip containers can reach it) puts its
+  unauthenticated `/ready` on the LAN. It says `{"ok":true}` and nothing else, and
+  every other route wants a token or a site key (tested with the bridge bound to
+  `0.0.0.0`). The address the bridge listens on is the operator's to restrict to the
+  trip containers' network.
+- **A site key opens `/health`, `/extract` and `/enrich` for its own trip only**, and
+  nothing else: no MCP session, no tool. A key two routes share names no trip.
 - **One process is one point of failure**, for the sites and for the
   companions. Both need a supervisor and a health check; that is an operator
   step, and the fleet monitor should watch `/health` and `/ready`.
@@ -323,6 +405,13 @@ Tests are written first.
 ## Rollout and regression
 
 - Merging changes nothing: every part is off by default.
+- Existing trips and the shared bridge (AC-B2.7): the worker writes `HERMES_URL` only
+  into a NEW trip's `.env`. A trip that already exists keeps a `HERMES_URL` pointing at
+  its per-trip bridge port, which a shared bridge does not serve. Moving it is a cutover,
+  per trip and with approval (a deploy under hard rule 2): rewrite `HERMES_URL` in its
+  `.env` to the shared bridge's address, restart its server, and ask the bridge's
+  `/health` from inside the container with the site's key (the worker's check, run by
+  hand).
 - Order on a deployment: the migration; the gateway with `TRIP_HOST_SUFFIX`
   and one test trip registered by `trip-route.py`; then `TRIP_ROUTING=wildcard`
   for new trips. Separately: the shared bridge with one test trip's companion;

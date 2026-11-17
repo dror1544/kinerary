@@ -348,6 +348,8 @@ class McpBridgeModeTests(unittest.TestCase):
                     code, text, _a, bridge = _run_main({
                         **_REQUIRED_BASE, "PROVISIONER_COMPUTE_ENABLED": "0",
                         "PROVISIONER_COMPANION_TEMPLATES_DIR": templates, "TRIP_MCP_BRIDGE": value,
+                        # Required with `shared` since the F3 fix, refused without it.
+                        **({"TRIP_MCP_SHARED_SITE_URL": "http://192.0.2.77:3999"} if value == "shared" else {}),
                     })
                     self.assertEqual(0, code, text)
                     self.assertIs(expected, bridge["shared_bridge"])

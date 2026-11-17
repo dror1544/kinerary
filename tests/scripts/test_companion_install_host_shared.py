@@ -236,6 +236,16 @@ class SharedWiring(SharedSandbox):
         prov = json.loads((self.trip / "companion-provenance.json").read_text())
         self.assertEqual(prov["profile"], "italy2026")
 
+    def test_it_says_the_site_side_direction_is_the_workers_not_this_hosts(self) -> None:
+        # AC-B2.10 (owner review of #599, F3): booking extraction and enrichment go from the trip's container to
+        # the bridge. This host cannot reach the container, so it must not look as if it wired that direction.
+        result = self.send(self.wire())
+        self.assertWired(result)
+        self.assertIn("wires the companion side only", result.stderr)
+        self.assertIn("HERMES_URL", result.stderr)
+        self.assertIn("worker", result.stderr)
+        self.assertNotIn(TRIP_KEY, result.stdout + result.stderr, "the note names a variable, never a value")
+
     def test_a_profile_this_system_did_not_mark_gets_no_provenance_record_but_is_still_wired(self) -> None:
         (self.profile / "kinerary-managed").unlink()
         result = self.send(self.wire())

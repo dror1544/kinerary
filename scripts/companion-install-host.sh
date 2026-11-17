@@ -1351,6 +1351,10 @@ wire_shared_bridge() {
         "$TRIP_SLUG" "$BRIDGE_HEALTH" >&2
       die "trip-mcp (shared bridge) wired for $TRIP_SLUG but it cannot reach the trip site"
     fi
+    # The other direction is not this host's to wire: booking extraction and enrichment go FROM the trip's
+    # container TO the bridge (the site's HERMES_URL), and this host has no access to the container. The
+    # worker writes that address into a new trip's .env and checks it from inside the container.
+    printf 'companion-install-host: shared mode wires the companion side only; the trip site calls the bridge itself (HERMES_URL, for booking extraction and enrichment), which the worker wires and checks from inside the trip container, not this host\n' >&2
     finish_wired
   fi
   printf 'companion-install-host: %s gateway registered no trip-mcp tools after restart\n' "$PROFILE_NAME" >&2

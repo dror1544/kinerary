@@ -207,6 +207,10 @@ services:
       # Unset means host / per_trip. The worker refuses any other spelling.
       TRIP_ROUTING: ${TRIP_ROUTING:-}
       TRIP_MCP_BRIDGE: ${TRIP_MCP_BRIDGE:-}
+      # With TRIP_MCP_BRIDGE=shared: the shared bridge as a trip CONTAINER reaches it, http(s)://<host>:<port>.
+      # Required with `shared`, refused without it (the worker will not start half-set). A new trip's .env
+      # gets HERMES_URL=<this>, and the worker checks from inside the container that the bridge answers.
+      TRIP_MCP_SHARED_SITE_URL: ${TRIP_MCP_SHARED_SITE_URL:-}
       # RETIRED (2026-10-15). This used to become the login of EVERY new trip
       # site. Each site now generates its own password at bootstrap and the
       # organizer is told it; this value is ignored. It is still passed through

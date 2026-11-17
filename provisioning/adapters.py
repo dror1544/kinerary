@@ -187,6 +187,7 @@ class ProxmoxLxcAdapter:
     def __init__(
         self, ssh: SshTransport, reset_data: bool = False, control_plane_exchange_key: str = "",
         password_factory: Callable[[], str] = generate_site_password,
+        hermes_url: str = "",
     ) -> None:
         self.ssh = ssh
         # Each new site is born with its OWN login password (`SEED_PASSWORD` in
@@ -201,6 +202,14 @@ class ProxmoxLxcAdapter:
         if "\n" in control_plane_exchange_key or "\r" in control_plane_exchange_key:
             raise ValueError("control-plane exchange key must be one line")
         self._control_plane_exchange_key = control_plane_exchange_key
+        # The shared trip-mcp bridge as THIS container reaches it (TRIP_MCP_SHARED_SITE_URL). The site calls
+        # `${HERMES_URL}/extract` and `/enrich` with its own key; the deployment's setup-mcp.sh points that at
+        # a per-trip bridge port, a listener the shared bridge never starts. Empty (the default): the .env
+        # gets no HERMES_URL line from here, as before. Plain http(s) origin only - it is written into a file
+        # a shell and systemd both read.
+        if hermes_url and not self._BRIDGE_ORIGIN.fullmatch(hermes_url):
+            raise ValueError("hermes_url must be a plain http(s) origin, http(s)://<host>[:<port>]")
+        self._hermes_url = hermes_url
         # When true, create() wipes the trip's NFS data dir (SQLite DB + media)
         # before anything else. The control plane sets this only for a first
         # provision — a container teardown leaves that dir intact, so a failed
@@ -276,6 +285,11 @@ class ProxmoxLxcAdapter:
         if record is not None and record.get("status") == "running":
             self.ssh.run(f"pct stop {shlex.quote(record['vmid'])}")
         self._reset_trip_data(spec.nfs_host_dir)
+
+    # A plain http(s) origin for the shared bridge: scheme, a DNS-shaped host or IPv4 address, an optional port.
+    _BRIDGE_ORIGIN = re.compile(
+        r"https?://[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*(:[0-9]{1,5})?"
+    )
 
     # A plain https origin: scheme, a DNS-shaped host, nothing else. The value
     # lands in an UNQUOTED .env heredoc that a shell expands, so anything else
@@ -403,6 +417,13 @@ class ProxmoxLxcAdapter:
             f"  printf 'CONTROL_PLANE_EXCHANGE_KEY=%s\\n' {shlex.quote(self._control_plane_exchange_key)} >> {app_dir}/.env\n"
             if self._control_plane_exchange_key else ""
         )
+        # Not a secret, but appended the same way: the heredoc above it is unquoted, and this value must not be
+        # subject to its expansion. Only a NEW .env gets it (the `[ ! -f ... ]` guard), so a live trip's
+        # existing HERMES_URL is never rewritten by a re-provision; moving one is a deliberate, per-trip cutover.
+        hermes_url_line = (
+            f"  printf 'HERMES_URL=%s\\n' {shlex.quote(self._hermes_url)} >> {app_dir}/.env\n"
+            if self._hermes_url else ""
+        )
         script = f"""#!/bin/bash
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -452,7 +473,7 @@ TRIP_DESIGN_VARIANT=modern
 {self._trip_mcp_env_lines(spec)}JWT_SECRET=${{JWT_SECRET}}
 HERMES_API_KEY=${{HERMES_API_KEY}}
 ENVEOF
-{seed_password_line}{exchange_key_line}  chmod 600 {app_dir}/.env
+{seed_password_line}{exchange_key_line}{hermes_url_line}  chmod 600 {app_dir}/.env
 fi
 
 cat > /etc/systemd/system/kinerary-server.service <<'UNITEOF'
@@ -664,6 +685,75 @@ BOOTSTRAP_INNER
             if value and hmac.compare_digest(held.encode(), value.encode()) and found is None:
                 found = kind
         return found
+
+    # Run INSIDE the container by check_site_to_bridge. It reads the site's own HERMES_URL and key out of
+    # the site's own .env and calls the bridge's /health with them, so what is proved is what the site will
+    # really do. The key is handed to curl on stdin as a config line made by the shell's printf BUILTIN: it
+    # is on no command line (this script's, or curl's, or ssh's) and in no file. Only the result of the
+    # request is printed - never the key and never the address. Plain POSIX sh (the container's dash).
+    _SITE_TO_BRIDGE_SCRIPT = r"""
+ENVFILE=/opt/kinerary/.env
+EXPECT=@EXPECT@
+val() { grep "^$1=" "$ENVFILE" 2>/dev/null | tail -n 1 | cut -d= -f2-; }
+URL=$(val HERMES_URL)
+KEY=$(val HERMES_API_KEY)
+if [ -z "$URL" ]; then echo "result=no_hermes_url"; exit 0; fi
+if [ "$URL" != "$EXPECT" ]; then echo "result=hermes_url_differs"; exit 0; fi
+if [ -z "$KEY" ]; then echo "result=no_site_key"; exit 0; fi
+case "$KEY" in *[!A-Za-z0-9._~+/=-]*) echo "result=site_key_unusable"; exit 0;; esac
+CODE=$(printf 'header = "X-API-Key: %s"\n' "$KEY" | curl -sS --max-time 15 --config - -o /dev/null -w '%{http_code}' "$URL/health" 2>/dev/null)
+RC=$?
+echo "result=answered status=$CODE curl_exit=$RC"
+"""
+
+    def check_site_to_bridge(self, spec: LxcSpec, expected_url: str) -> tuple[bool, str]:
+        """Can this container's own site reach the shared bridge, and does the bridge know it? (ok, evidence).
+
+        The companion's SSE connection covers companion -> bridge -> site. A booking extraction or enrichment
+        goes the other way: the trip site calls `${HERMES_URL}/extract` and `/enrich` with its own key. In
+        shared mode there is no per-trip bridge port, so a site still pointed at one fails every such call
+        with nothing in any conversation to show for it. This asks, from inside the container, for the
+        bridge's /health with the key the site itself holds. One request therefore shows that the container
+        reaches the bridge (a loopback-bound bridge does not answer), that the bridge recognises that key as
+        that trip's, and that the bridge reaches the site.
+
+        `expected_url` is the address the worker was told (never a secret): a site whose own HERMES_URL has
+        become something else is reported as that, not as whatever the other address answers.
+
+        The command carries no secret and no address; the evidence returned carries neither. An ssh failure
+        raises (could not look is not looked and failed); the transport's error text is not passed on."""
+        if not self._BRIDGE_ORIGIN.fullmatch(expected_url):
+            raise ValueError("expected_url must be a plain http(s) origin, http(s)://<host>[:<port>]")
+        record = self.inspect(spec)
+        if record is None:
+            return False, "no such container"
+        script = self._SITE_TO_BRIDGE_SCRIPT.replace("@EXPECT@", shlex.quote(expected_url))
+        try:
+            output = self.ssh.run(f"pct exec {shlex.quote(record['vmid'])} -- sh -c {shlex.quote(script)}")
+        except RuntimeError:
+            raise RuntimeError(f"could not run the site-to-bridge check in container {record['vmid']}") from None
+        fields: dict[str, str] = {}
+        for line in output.splitlines():
+            if line.startswith("result="):
+                fields = dict(part.split("=", 1) for part in line.split() if "=" in part)
+        result, status, curl_exit = fields.get("result"), fields.get("status", ""), fields.get("curl_exit", "")
+        if result == "answered":
+            if curl_exit == "0" and status == "200":
+                return True, "health 200: the container reached the bridge, which knows this trip and reached its site"
+            if curl_exit == "0" and status == "401":
+                return False, "health 401: the bridge does not recognise this site's key (no route for the trip, or a key mismatch)"
+            if curl_exit == "0" and status == "503":
+                return False, "health 503: the bridge recognised the trip but cannot reach its site"
+            if curl_exit != "0":
+                return False, f"the container could not reach the bridge (curl exit {curl_exit or 'unknown'})"
+            return False, f"health answered an unexpected status {status or 'unknown'}"
+        reasons = {
+            "no_hermes_url": "the site's .env has no HERMES_URL: it is not pointed at the shared bridge",
+            "hermes_url_differs": "the site's HERMES_URL is not the shared bridge address the worker was given",
+            "no_site_key": "the site's .env has no HERMES_API_KEY",
+            "site_key_unusable": "the site's HERMES_API_KEY has characters this check will not send",
+        }
+        return False, reasons.get(result or "", "the check printed no usable result")
 
     def _reset_trip_data(self, nfs_host_dir: str) -> None:
         """Wipe the trip's persisted app state (SQLite DB under server-data/)

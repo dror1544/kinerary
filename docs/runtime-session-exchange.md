@@ -12,7 +12,9 @@ A managed runtime needs `CONTROL_PLANE_EXCHANGE_KEY`, matching the gateway's
 be distinct from the runtime's `JWT_SECRET` and `HERMES_API_KEY`. The gateway
 and control plane are trusted identity services; possession of this exchange
 key is privileged. The key is never sent to a browser or companion. (A deployment
-can give each trip site a key of its own instead: "Per-trip keys" below.)
+can give each trip site a key of its own instead: "Per-trip keys" below. Once it does,
+a trip site no longer holds this key at all, and this key must be a different value from
+the trip key master and the legacy trip key.)
 
 The private `$TRIP_DIR/control-plane.identity.json` file binds the runtime to
 its control-plane trip and owner. `CONTROL_PLANE_IDENTITY_FILE` can override
@@ -281,9 +283,23 @@ such host, not ready, no upstream, not a name). The upstream must be `http:` or
 `web.runtime_upstream_allowed_hosts` in the API's profile: exact hostnames, IPv4
 addresses and IPv4 CIDR blocks (no IPv6; a prefix shorter than /8 is refused at
 load). An empty or absent list allows nothing, and then the answer is
-`503 RUNTIME_ROUTE_INVALID`. `GET /internal/runtime-routes/<trip_id>` and
-`runtime_upstream_host_suffixes` are unchanged. The gateway checks the answer
+`503 RUNTIME_ROUTE_INVALID`. The gateway checks the answer
 again and proxies only to the origin returned for that exact host.
+
+**The by-trip-ID lookup answers where the gateway SENDS a trip's calls** (the launch's session
+exchange, participant provisioning, the participant check), not where a browser goes. A wildcard
+trip's `private_url` is its public name, and in host mode `/api/internal/*` on a public name is 404
+by design, so `GET /internal/runtime-routes/<trip_id>` answers with the route's registered LAN
+`upstream_url` when the API has a non-empty `web.runtime_upstream_allowed_hosts` and the route
+has an `upstream_url`: `upstreamOrigin` is that origin, validated exactly like the by-host answer,
+and `upstreamBasePath` is empty. An `upstream_url` that fails that validation is
+`503 RUNTIME_ROUTE_INVALID`; it is never replaced by the public URL. With no list, or no
+`upstream_url` (every row written before the host columns existed), the answer is the one it
+always was, from the job's `private_url` and `runtime_upstream_host_suffixes`. `private_url` itself,
+and every link a browser is sent, are unchanged. Covered by
+`control-plane/api/test/runtime-wildcard-e2e.test.ts` (the real API and the real gateway, with only
+the trip site faked: a portal launch and participant provisioning both reach the site's internal
+routes on the LAN) and `runtime-route-hosts.test.ts`.
 
 **Transparent proxy.** Each trip hostname is its own origin, so the gateway adds
 and removes no credential: method, path, query, body, `Cookie`, `Authorization`
@@ -369,15 +385,58 @@ a warning (it is what a missing column means) and a `derived` one fails the job.
 The key is never logged, never on a command line, and listed for redaction with the other
 secrets of the bootstrap script.
 
-Rolling it out (per deployment, in this order): deploy the migration; set the gateway's
-`RUNTIME_TRIP_KEY_MASTER` and `RUNTIME_LEGACY_TRIP_KEY` (the value `RUNTIME_EXCHANGE_KEY` had)
-and, if you want a new control-plane key, a new `RUNTIME_EXCHANGE_KEY` on the gateway and API
-together; set the same master on the worker; build a test trip. Moving an existing trip to a
-derived key is writing its derived key into its `.env`, restarting its server and setting its
-route's `trip_key = 'derived'` (a deploy, per trip, with approval). Derivation parity
-between the gateway and the worker is pinned by
+**The three secrets must be three different values, and the services enforce it.** With
+`RUNTIME_TRIP_KEY_MASTER` set, the gateway **refuses to start** when any two of
+`RUNTIME_EXCHANGE_KEY`, `RUNTIME_TRIP_KEY_MASTER` and `RUNTIME_LEGACY_TRIP_KEY` (when set) are
+equal, and the worker refuses to start when `CONTROL_PLANE_TRIP_KEY_MASTER` equals
+`CONTROL_PLANE_EXCHANGE_KEY`. The message names the variables (for example
+`runtime_gateway.trip_keys_not_distinct: RUNTIME_EXCHANGE_KEY and RUNTIME_LEGACY_TRIP_KEY hold the
+same value; ...`) and never a value. Copying the current exchange key into
+`RUNTIME_LEGACY_TRIP_KEY` and stopping there is therefore not a way to turn per-trip keys on: it
+would leave every trip not yet re-keyed holding a credential that the control plane and the
+gateway's own `/internal/t/*` routes also accept, which is the exposure per-trip keys exist to end.
+
+**Rolling it out is a rotation** (per deployment, in this order; every step is required):
+
+1. Deploy the migration.
+2. Rotate the control-plane key. Make three new values, each independent of the others and of
+   `RUNTIME_COOKIE_SECRET`:
+   - the **current** `RUNTIME_EXCHANGE_KEY` becomes `RUNTIME_LEGACY_TRIP_KEY` (on the gateway only);
+   - a **new** `RUNTIME_EXCHANGE_KEY` is given to the API and the gateway **together** (and, on the VM,
+     reaches the worker through the same name). Until both have restarted on it, their calls to each
+     other answer 401, so restart the two in one step;
+   - a new `RUNTIME_TRIP_KEY_MASTER` is given to the gateway and the worker (the worker reads it as
+     `CONTROL_PLANE_TRIP_KEY_MASTER`).
+3. Restart the gateway and the worker. A start-up refusal above means a step was skipped.
+4. Check, before any trip is moved: a trip that has not been re-keyed still launches from the portal
+   (it is sent the legacy key), a new test trip is built with a derived key and launches, and the old
+   value is refused by the control plane: `POST /internal/runtime-sessions/check` with the old value in
+   `x-api-key` answers 401.
+5. Move trips to a derived key one at a time: write the trip's derived key into its `.env`, restart its
+   server and set its route's `trip_key = 'derived'` (a deploy, per trip, with approval).
+6. When no route is `shared`, unset `RUNTIME_LEGACY_TRIP_KEY` and restart the gateway. The old value
+   then opens nothing anywhere.
+
+**What the legacy key still opens, once the rotation is done.** Only a trip site that has not yet been
+re-keyed: each such site's `.env` still holds the old value, so the old value still passes that site's
+own check on `/api/internal/control-plane/*`, and nothing else does. The control plane, the API's calls to
+the gateway and the gateway's own `/internal/t/*` routes all compare against the NEW
+`RUNTIME_EXCHANGE_KEY` and never accept the legacy key; the gateway never sends it to the control
+plane, and it sends it to a trip only when that trip's route says `shared`. Each trip that is re-keyed
+leaves that set, and the set is empty at step 6. Until then a holder of the old value (it was shared
+by every site, so every site's operator and anyone who ever read one site's `.env`) can still call the
+internal routes of the not-yet-re-keyed sites; rotation closes the control plane and the gateway to
+it, not those sites, which is why step 5 is not optional in the long run.
+
+(After the rotation the worker's own `CONTROL_PLANE_EXCHANGE_KEY` is the new key, so the "shared"
+candidate `exchange_key_kind` compares against no longer matches a not-yet-re-keyed site, which holds
+the old value. That leaves such a trip's route as it is, `shared`, which is right.)
+
+Derivation parity between the gateway and the worker is pinned by
 `control-plane/runtime-gateway/test/fixtures/trip-key-vectors.json`, read by
-`runtime-gateway/test/trip-keys.test.js` and `control-plane/worker/tests/test_trip_keys.py`.
+`runtime-gateway/test/trip-keys.test.js` and `control-plane/worker/tests/test_trip_keys.py`. The
+refusals are pinned by `trip-keys.test.js` ("AC-K2.8") and
+`control-plane/worker/tests/test_shared_bridge_site.py` ("AC-K2.9").
 
 ## Classic, Modern, and logout
 

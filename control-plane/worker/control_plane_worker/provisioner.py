@@ -556,6 +556,16 @@ class ShellDeployAdapter:
         reader = getattr(self._compute, "site_trip_key", None)
         return reader(slug) if callable(reader) else None
 
+    def verify_site_bridge(self, slug: str) -> "tuple[bool, str] | None":
+        """Ask the compute side to prove, from inside the trip's container, that the
+        trip site reaches the shared bridge and the bridge knows its key. None: no
+        shared bridge is configured, or this is a hand-built vmid_map box this worker
+        never wrote a HERMES_URL into."""
+        if self._vmid_map.get(slug):
+            return None
+        reader = getattr(self._compute, "verify_site_bridge", None)
+        return reader(slug) if callable(reader) else None
+
     def deploy(
         self,
         slug: str,
@@ -1609,6 +1619,12 @@ class ProvisionerWorker:
         answer = reader(slug) if callable(reader) else None
         return answer if answer in ("shared", "derived") else None
 
+    def _site_bridge_check(self, slug: str) -> "tuple[bool, str] | None":
+        """The trip site -> shared bridge check (verification.SITE_TO_BRIDGE), or None when the deploy
+        adapter has none to make (a fake, a hand-built trip, no shared bridge configured)."""
+        reader = getattr(self._deploy, "verify_site_bridge", None)
+        return reader(slug) if callable(reader) else None
+
     def _materialize_release_if_verified(
         self, plan_desired: Mapping[str, Any], job_id: str,
     ) -> str | None:
@@ -2348,6 +2364,9 @@ class ProvisionerWorker:
         # written, so a successful chat binding cannot overwrite the fact that
         # the companion cannot read its own trip (issue #119).
         bridge_failed = False
+        # Set when the bridge request went through and the adapter said it wired the trip: only then is
+        # there a route for the trip site's own call to be recognised by (the site -> shared bridge check).
+        bridge_wired = False
         try:
             provenance = self._load_intake_provenance(conn, intake_version_id)
             handoff = build_companion_handoff(
@@ -2410,6 +2429,7 @@ class ProvisionerWorker:
                     # trip-mcp tools yet.
                     try:
                         wired = self._mcp_bridge.setup(slug, hermes_profile)
+                        bridge_wired = bool(wired)
                         built_from = getattr(self._mcp_bridge, "built_from", "unreported")
                         logger.info(
                             # built_from is in the MESSAGE too: LOG_FORMAT drops extra= (#127, #201).
@@ -2667,10 +2687,24 @@ class ProvisionerWorker:
         # recording failure must not cost the trip its companion, so this is
         # best-effort like every other side effect in this function.
         try:
-            verification.record_post_attach_evidence(
+            results = verification.record_post_attach_evidence(
                 conn, trip_id=trip_id, deployment_ref=deployment_ref,
                 slug=slug, hermes_profile=hermes_profile, mcp_bridge_adapter=self._mcp_bridge,
+                site_bridge_check=(lambda: self._site_bridge_check(slug)) if bridge_wired else None,
             )
+            for result in results or []:
+                if result.check_name == verification.SITE_TO_BRIDGE and result.outcome == "failed":
+                    # The trip is already ready_private (the companion step runs after that commit, by
+                    # design), so this cannot fail the job; it is a failed evidence row AND an error line
+                    # naming what stops working, so it is read, not discovered by an organizer. The
+                    # consequence is in the MESSAGE: LOG_FORMAT drops extra= (#127, #201).
+                    logger.error(
+                        "provisioner.site_bridge_check_failed trip_id=%s consequence=%s",
+                        trip_id,
+                        "booking extraction and enrichment on this trip's site will fail: the site cannot "
+                        "use the shared bridge (see the site_to_bridge evidence)",
+                        extra={"trip_id": trip_id},
+                    )
         except Exception:
             logger.warning(
                 "provisioner.post_attach_verification_failed",

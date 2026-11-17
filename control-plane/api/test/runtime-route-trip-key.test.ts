@@ -95,7 +95,9 @@ test("AC-K2.2: both lookups return tripKey, shared and derived, and only behind 
       const byId = await app.inject({ method: "GET", url: `/internal/runtime-routes/${trip.tripId}`, headers: KEY });
       assert.equal(byId.statusCode, 200);
       assert.equal(byId.json().tripKey, kind, "by trip id");
-      assert.deepEqual(byId.json(), { routeRef: trip.routeRef, upstreamOrigin: "http://trip.internal", upstreamBasePath: "", tripKey: kind });
+      // AC-R1.11: with an allow-list and a registered upstream_url, the by-trip-ID answer is the LAN origin the route registered
+      // (this row has both), not the job's private_url (http://trip.internal) - which stays what a browser is sent to.
+      assert.deepEqual(byId.json(), { routeRef: trip.routeRef, upstreamOrigin: "http://192.0.2.10:8080", upstreamBasePath: "", tripKey: kind });
       const byHost = await app.inject({ method: "GET", url: `/internal/runtime-routes/by-host/${trip.host}`, headers: KEY });
       assert.equal(byHost.statusCode, 200);
       assert.deepEqual(byHost.json(), { tripId: trip.tripId, routeRef: trip.routeRef, upstreamOrigin: "http://192.0.2.10:8080", tripKey: kind }, "by host");

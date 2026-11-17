@@ -1967,11 +1967,18 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     return { live: true };
   });
 
+  // The by-trip-ID lookup answers where the gateway SENDS a trip's calls (session exchange, participant
+  // provisioning, session checks), not where a browser goes. A wildcard trip's private_url is its PUBLIC
+  // hostname, which host mode answers 404 for /api/internal/* - so when the operator has an upstream
+  // allow-list and the route row registered a LAN upstream_url, that LAN origin is the answer, validated by
+  // the same upstreamHostAllowed the by-host lookup uses. A registered upstream that is not on the list is
+  // RUNTIME_ROUTE_INVALID, never a fall-back to the public URL. With no list, or no upstream_url (every row
+  // written before R2), the answer is the private_url one it always was. private_url itself is untouched.
   app.get("/internal/runtime-routes/:tripId", async (request, reply) => {
     if (!exchangeKeyMatches(request.headers["x-api-key"], deps.runtimeExchangeKey)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
     const tripId = (request.params as { tripId?: string }).tripId ?? "";
-    const result = await deps.db.query<{ route_ref: string; private_url: string | null; trip_key: string }>(
-      `SELECT r.route_ref, r.trip_key, j.result->>'private_url' AS private_url
+    const result = await deps.db.query<{ route_ref: string; private_url: string | null; upstream_url: string | null; trip_key: string }>(
+      `SELECT r.route_ref, r.trip_key, r.upstream_url, j.result->>'private_url' AS private_url
        FROM control_plane.runtime_routes r
        LEFT JOIN LATERAL (
          SELECT result FROM control_plane.jobs
@@ -1981,6 +1988,15 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
        WHERE r.trip_id = $1 AND r.state = 'ready'`, [tripId]);
     const row = result.rows[0];
     if (!row?.private_url) return reply.code(404).send({ error: "RUNTIME_NOT_READY" });
+    if (row.upstream_url && deps.runtimeUpstreamAllowedHosts?.length) {
+      let lan: URL;
+      try { lan = new URL(row.upstream_url); } catch { return reply.code(503).send({ error: "RUNTIME_ROUTE_INVALID" }); }
+      if (!["http:", "https:"].includes(lan.protocol) || lan.username || lan.password || lan.pathname !== "/"
+        || lan.search || lan.hash || /[?#]/.test(row.upstream_url) || !upstreamHostAllowed(lan.hostname, deps.runtimeUpstreamAllowedHosts)) {
+        return reply.code(503).send({ error: "RUNTIME_ROUTE_INVALID" });
+      }
+      return { routeRef: row.route_ref, upstreamOrigin: lan.origin, upstreamBasePath: "", tripKey: row.trip_key };
+    }
     let upstream: URL;
     try { upstream = new URL(row.private_url); } catch { return reply.code(503).send({ error: "RUNTIME_ROUTE_INVALID" }); }
     const allowed = deps.runtimeUpstreamHostSuffixes.some((suffix) => upstream.hostname === suffix || upstream.hostname.endsWith(`.${suffix}`));

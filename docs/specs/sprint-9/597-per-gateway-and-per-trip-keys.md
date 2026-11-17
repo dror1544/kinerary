@@ -62,9 +62,14 @@ produce the others never leaves the components that need it.
   (`runtime_routes.trip_key`: `shared` or `derived`). The gateway sends the
   derived key to a `derived` trip and the legacy key to a `shared` one. It
   never tries one key and then the other.
-- Once a deployment gives the control plane and the trip master new values,
-  the legacy key opens only trips that still hold it, and each re-keyed trip
-  leaves that set.
+- Turning per-trip keys on **is a rotation of the control-plane key**, not an
+  option on top of it: the current value becomes the legacy key, and a new
+  value goes to the API and the gateway together. Once it has, the legacy key
+  opens only trips that still hold it (never the control plane, never the
+  gateway's own `/internal/t/*` routes), and each re-keyed trip leaves that
+  set. Left un-rotated the legacy key would still be the control-plane key, and
+  every legacy trip would hold a credential the control plane and the gateway
+  accept. The services therefore refuse to start in that state (AC-K2.8, K2.9).
 
 ## Acceptance criteria
 
@@ -133,6 +138,27 @@ produce the others never leaves the components that need it.
   derive the same value for a published vector.
 - **AC-K2.7 Compose.** The new variables pass through `compose.local.yml` and
   `compose.vm.yml` and `vm-release.py`'s env lists, unset by default.
+- **AC-K2.8 Rotation is enforced at the gateway** (owner review of #599, F2). With
+  `RUNTIME_TRIP_KEY_MASTER` set, the gateway refuses to start when any two of
+  `RUNTIME_EXCHANGE_KEY`, `RUNTIME_TRIP_KEY_MASTER` and `RUNTIME_LEGACY_TRIP_KEY`
+  (when set) are equal. The error names the variables in the pair, and no value
+  appears in it. With the master unset nothing is compared. Tested by starting
+  the real gateway as a child process with each equal pair, and with three
+  different values.
+- **AC-K2.9 Rotation is enforced at the worker.** `provision` refuses to start
+  when `CONTROL_PLANE_TRIP_KEY_MASTER` is set and equals
+  `CONTROL_PLANE_EXCHANGE_KEY`, whether or not compute is enabled. The error
+  names both variables and no value. Different values, or no master, start as
+  before.
+- **AC-K2.10 The rollout says rotate, in order.** `docs/runtime-session-exchange.md`
+  ("Rolling it out") and this spec's Rollout section make rotation a required,
+  ordered step (current key to the legacy variable; a new exchange key to the API
+  and gateway together; a new master to the gateway and worker), say what the
+  legacy key still opens afterwards (only trips not yet re-keyed) and that the
+  API-to-gateway and gateway-to-control-plane calls never accept it.
+  `docs/control-plane-vm-deployment.md`, `vm.env.example`, `compose.vm.yml` and the
+  gateway's `.env.example` describe the key the same way (it is no longer "one key
+  shared by every trip site" once per-trip keys are on).
 
 ## Non-goals
 
@@ -141,7 +167,11 @@ produce the others never leaves the components that need it.
   `trip_key`. That is a deploy, done per trip with approval. Making it a
   rollout step is a follow-up.
 - Changing the trip site's own code.
-- Rotating the control-plane key, which is an operator step.
+- Generating the new values. Choosing and distributing them is an operator step;
+  what the code does is refuse to start without them being different (AC-K2.8,
+  K2.9). (Until the owner's review of #599 this item read "Rotating the
+  control-plane key, which is an operator step", and the documented rollout made
+  rotation optional.)
 
 ## Security and boundary notes
 
@@ -163,6 +193,12 @@ with a derived key and opened from the portal.
 
 ## Rollout
 
-Staging first: K1 `shared → both`, re-key, restart gateways, `derived`. K2: set
-new control-plane and trip-master values, keep the old value as the legacy key,
-build a test trip. The VM after the Alsace trip, in the same order.
+Staging first: K1 `shared → both`, re-key, restart gateways, `derived`. K2, in
+this order, each step required: (1) the migration; (2) the current
+`RUNTIME_EXCHANGE_KEY` becomes `RUNTIME_LEGACY_TRIP_KEY` on the gateway, a NEW
+`RUNTIME_EXCHANGE_KEY` goes to the API and the gateway together, a NEW master goes
+to the gateway and the worker; (3) restart them (a start-up refusal means a step
+was skipped); (4) check that a legacy trip still launches, that a new test trip is
+built with a derived key and launches, and that the old value is 401 at the control
+plane; (5) re-key trips one at a time; (6) when no route is `shared`, unset the
+legacy key. The VM after the Alsace trip, in the same order.

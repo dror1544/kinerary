@@ -9,6 +9,7 @@
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import { spawn } from "node:child_process";
 import { createHmac } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -237,4 +238,42 @@ test("AC-K2.3: the key comes from the trip the ROUTE was looked up for, never fr
   assert.equal(hostile.status, 200);
   assert.deepEqual(trips[TRIP_B].seen, []);
   assert.deepEqual(trips[TRIP_A].seen.map((r) => r.key), [derive(TRIP_A)]);
+});
+
+// F2 of the owner's review of #599: rotation is part of the rollout, so the gateway enforces it.
+test("AC-K2.8: with a master set, the gateway refuses to start when any two of the exchange key, the master and the legacy key are equal, naming variables and never a value", async () => {
+  const server = fileURLToPath(new URL("../server.js", import.meta.url));
+  const run = (extra) => new Promise((resolve) => {
+    const child = spawn(process.execPath, [server], {
+      env: { PATH: process.env.PATH, PORT: "0", BIND_HOST: "127.0.0.1", CONTROL_PLANE_INTERNAL_ORIGIN: "http://127.0.0.1:9", RUNTIME_COOKIE_SECRET: "cookie-secret-at-least-random", PORTAL_ORIGIN: PORTAL, RUNTIME_ORIGIN: "https://runtime.example.test", ...extra },
+    });
+    let out = "", err = "";
+    child.stdout.on("data", (c) => { out += c; if (/listening/.test(out)) child.kill(); });
+    child.stderr.on("data", (c) => { err += c; });
+    child.on("close", (code) => resolve({ code, out, err }));
+    setTimeout(() => child.kill(), 4000);
+  });
+  const SAME = "the-one-value-reused-0001";
+  const cases = [
+    ["RUNTIME_EXCHANGE_KEY and RUNTIME_LEGACY_TRIP_KEY", { RUNTIME_EXCHANGE_KEY: SAME, RUNTIME_TRIP_KEY_MASTER: "m-0001", RUNTIME_LEGACY_TRIP_KEY: SAME }], // the documented rollout, un-rotated
+    ["RUNTIME_EXCHANGE_KEY and RUNTIME_TRIP_KEY_MASTER", { RUNTIME_EXCHANGE_KEY: SAME, RUNTIME_TRIP_KEY_MASTER: SAME, RUNTIME_LEGACY_TRIP_KEY: "l-0001" }],
+    ["RUNTIME_EXCHANGE_KEY and RUNTIME_TRIP_KEY_MASTER", { RUNTIME_EXCHANGE_KEY: SAME, RUNTIME_TRIP_KEY_MASTER: SAME }], // no legacy key at all
+    ["RUNTIME_TRIP_KEY_MASTER and RUNTIME_LEGACY_TRIP_KEY", { RUNTIME_EXCHANGE_KEY: "e-0001", RUNTIME_TRIP_KEY_MASTER: SAME, RUNTIME_LEGACY_TRIP_KEY: SAME }],
+  ];
+  for (const [named, env] of cases) {
+    const refused = await run(env);
+    console.log(`refusal for ${named}: exit=${refused.code}\n${refused.err.split("\n").filter((l) => l.startsWith("runtime_gateway.")).join("\n")}`);
+    assert.notEqual(refused.code, 0, named);
+    assert.equal(refused.out, "", `${named}: nothing is listening`);
+    assert.match(refused.err, /runtime_gateway\.trip_keys_not_distinct/, named);
+    assert.ok(refused.err.includes(named), `names ${named}: ${refused.err}`);
+    assert.ok(!refused.err.includes(SAME), "the value is never printed");
+  }
+  const allThree = await run({ RUNTIME_EXCHANGE_KEY: SAME, RUNTIME_TRIP_KEY_MASTER: SAME, RUNTIME_LEGACY_TRIP_KEY: SAME });
+  assert.notEqual(allThree.code, 0);
+  assert.match(allThree.err, /RUNTIME_EXCHANGE_KEY and RUNTIME_TRIP_KEY_MASTER; RUNTIME_EXCHANGE_KEY and RUNTIME_LEGACY_TRIP_KEY; RUNTIME_TRIP_KEY_MASTER and RUNTIME_LEGACY_TRIP_KEY/);
+  // Three different values start; so do per-trip keys left off (no master), which is today's single-key deployment.
+  assert.match((await run({ RUNTIME_EXCHANGE_KEY: "e-0001", RUNTIME_TRIP_KEY_MASTER: "m-0001", RUNTIME_LEGACY_TRIP_KEY: "l-0001" })).out, /listening/);
+  assert.match((await run({ RUNTIME_EXCHANGE_KEY: "e-0001", RUNTIME_TRIP_KEY_MASTER: "m-0001" })).out, /listening/, "no legacy key set: nothing to compare it with");
+  assert.match((await run({ RUNTIME_EXCHANGE_KEY: SAME })).out, /listening/, "per-trip keys off: one key, as before");
 });

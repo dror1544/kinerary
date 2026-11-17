@@ -515,6 +515,65 @@ describe('AC-B1.6 /health and /ready', () => {
     assert.equal(r.status, 200);
     assert.deepEqual(await r.json(), { ok: true });
   });
+
+  // F3 (owner review of #599): the trip's container calls this bridge with the key its own site holds.
+  test("AC-B2.9: /health also answers a request that carries the trip SITE's key, for that trip only", async () => {
+    const up = await fetch(`${bridge.base}/health`, { headers: { 'X-API-Key': 'key-for-up-0123456789' } });
+    assert.equal(up.status, 200);
+    assert.deepEqual(await up.json(), { ok: true, site: 'reachable' });
+    // The same route, but the site behind it is down: the bridge says so with its own code, naming nothing.
+    const down = await fetch(`${bridge.base}/health`, { headers: { 'X-API-Key': 'key-for-down-0123456789' } });
+    assert.equal(down.status, 503);
+    const body = await down.json();
+    assert.equal(body.site, 'unreachable');
+    assert.ok(!/127\.0\.0\.1|http:/.test(JSON.stringify(body)));
+    // A key that no route holds is as refused as a bad token, however it is presented.
+    assert.equal((await fetch(`${bridge.base}/health`, { headers: { 'X-API-Key': 'key-for-nobody-0123456789' } })).status, 401);
+    assert.equal((await fetch(`${bridge.base}/health`, { headers: { Authorization: 'Bearer key-for-nobody-0123456789' } })).status, 401);
+    assert.equal((await fetch(`${bridge.base}/health`)).status, 401);
+  });
+});
+
+describe('AC-B2.9 a site key two routes share names no trip, so /health refuses it', () => {
+  let dir, bridge, site;
+  before(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'routes-'));
+    site = await startSite('Twin');
+    writeRoute(dir, 'twin-a', { api_base_url: site.url, trip_api_key: 'one-key-held-by-two-routes-0123' });
+    writeRoute(dir, 'twin-b', { api_base_url: site.url, trip_api_key: 'one-key-held-by-two-routes-0123' });
+    bridge = await startShared(dir);
+  });
+  after(async () => { await bridge.stop(); await site.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+
+  test('401, and the site is never asked', async () => {
+    const r = await fetch(`${bridge.base}/health`, { headers: { 'X-API-Key': 'one-key-held-by-two-routes-0123' } });
+    assert.equal(r.status, 401);
+    assert.deepEqual(site.seen, []);
+  });
+});
+
+describe('AC-B2.9 a bridge bound beyond loopback still says nothing without a key', () => {
+  let dir, bridge, site;
+  before(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'routes-'));
+    site = await startSite('Beyond');
+    writeRoute(dir, 'beyond', { api_base_url: site.url });
+    bridge = await startShared(dir, { MCP_BIND_HOST: '0.0.0.0' });
+  });
+  after(async () => { await bridge.stop(); await site.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+
+  test('/ready is exactly { ok: true } on a non-loopback address, and every other route wants a key', async () => {
+    const other = Object.values(os.networkInterfaces()).flat().find((i) => i && i.family === 'IPv4' && !i.internal);
+    const base = other ? `http://${other.address}:${bridge.port}` : bridge.base;
+    const ready = await fetch(`${base}/ready`);
+    assert.equal(ready.status, 200);
+    assert.equal(await ready.text(), '{"ok":true}', 'the whole body: no count, no name, no version');
+    for (const [method, p] of [['GET', '/health'], ['GET', '/sse'], ['POST', '/extract'], ['POST', '/enrich'], ['POST', '/messages?sessionId=x']]) {
+      const r = await fetch(`${base}${p}`, { method, headers: { 'Content-Type': 'application/json' }, body: method === 'POST' ? '{}' : undefined });
+      assert.ok([401, 404].includes(r.status), `${method} ${p} without a key answers ${r.status}`);
+    }
+    assert.deepEqual(site.seen, [], 'nothing reached a trip site without a key');
+  });
 });
 
 describe('single-trip mode is unchanged', () => {

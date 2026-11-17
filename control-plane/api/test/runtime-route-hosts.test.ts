@@ -152,7 +152,7 @@ test("AC-R1.3: the per-trip-id endpoint is unchanged, and by-host and :tripId ca
   const app = buildApp(profile, { portal: portalDeps(pool, ["192.0.2.0/24"]) });
   try {
     const host = `both-${suffix}.example.test`;
-    const { tripId, routeRef } = await seedRoute({ host });
+    const { tripId, routeRef } = await seedRoute({ host, upstream: null }); // a row written before R2 has no upstream_url
     // The old endpoint reads the job result, never the new columns: a trip with a host but no succeeded job is not ready there.
     const noJob = await get(app, `/internal/runtime-routes/${tripId}`);
     assert.equal(noJob.statusCode, 404);
@@ -182,6 +182,60 @@ test("AC-R1.3: the per-trip-id endpoint is unchanged, and by-host and :tripId ca
     assert.equal(hostAsTrip.statusCode, 404);
     assert.equal((await get(app, "/internal/runtime-routes/by-host/")).statusCode, 404);
   } finally { await app.close(); }
+});
+
+// AC-R1.11: the by-trip-ID answer is where the gateway SENDS a trip's calls. A wildcard trip's private_url is its
+// public name; its registered LAN upstream is what the gateway has to use (owner review of #599, F1).
+test("AC-R1.11: with an allow-list, the by-trip-ID answer is the registered LAN origin, validated like the by-host one; without one, or without upstream_url, it is the private_url one", { skip }, async () => {
+  const planId = `plan_${suffix}q`, releaseId = `rls_${suffix}q`, jobIds: string[] = [];
+  await pool.query("INSERT INTO control_plane.releases(id, source_revision, artifact_digest, application_schema, data_schema_min, data_schema_max, status, promoted_to_available_at, promoted_by) VALUES ($1,$2,$3,1,1,1,'available',now(),'test:fixture')", [releaseId, hex.slice(0, 40), `sha256:${hex}`]);
+  const withJob = async (upstream: string | null, privateUrl: string, tripKey = "shared") => {
+    const route = await seedRoute({ host: `lan-${counter + 1}-${suffix}.example.test`, upstream });
+    await pool.query("UPDATE control_plane.runtime_routes SET trip_key = $2 WHERE trip_id = $1", [route.tripId, tripKey]);
+    const planRow = `${planId}${counter}`, jobRow = `job_${suffix}q${counter}`;
+    await pool.query("INSERT INTO control_plane.plans(id, trip_id, release_id, kind, digest, status, desired) VALUES ($1,$2,$3,'provision',$4,'executed','{}'::jsonb)", [planRow, route.tripId, releaseId, `sha256:${createHash("sha256").update(planRow).digest("hex")}`]);
+    await pool.query("INSERT INTO control_plane.jobs(id, trip_id, plan_id, job_type, idempotency_key, correlation_id, state, result) VALUES ($1,$2,$3,'provision',$4,$5,'succeeded',$6::jsonb)",
+      [jobRow, route.tripId, planRow, `idem-${jobRow}`, `corr_${suffix}q${counter}`, JSON.stringify({ private_url: privateUrl })]);
+    jobIds.push(jobRow);
+    return route;
+  };
+  const publicUrl = "https://wild.internal";
+  try {
+    const listed = buildApp(profile, { portal: portalDeps(pool, ["192.0.2.0/24"]) });
+    const unlisted = buildApp(profile, { portal: portalDeps(pool, undefined) });
+    const empty = buildApp(profile, { portal: portalDeps(pool, []) });
+    try {
+      // A list and a registered LAN upstream: the LAN origin, no base path, the key kind untouched; private_url is not echoed.
+      const lan = await withJob("http://192.0.2.10:8080", `${publicUrl}/base`, "derived");
+      const answer = await get(listed, `/internal/runtime-routes/${lan.tripId}`);
+      assert.equal(answer.statusCode, 200);
+      assert.deepEqual(answer.json(), { routeRef: lan.routeRef, upstreamOrigin: "http://192.0.2.10:8080", upstreamBasePath: "", tripKey: "derived" });
+      assert.doesNotMatch(answer.body, /wild\.internal/);
+      // No list (absent or empty): today's answer, from the private_url, whatever upstream_url holds.
+      for (const app of [unlisted, empty]) {
+        const old = await get(app, `/internal/runtime-routes/${lan.tripId}`);
+        assert.equal(old.statusCode, 200);
+        assert.deepEqual(old.json(), { routeRef: lan.routeRef, upstreamOrigin: publicUrl, upstreamBasePath: "/base", tripKey: "derived" });
+      }
+      // A list but no upstream_url (a row written before R2): today's answer.
+      const pre = await withJob(null, `${publicUrl}/base`);
+      assert.deepEqual((await get(listed, `/internal/runtime-routes/${pre.tripId}`)).json(), { routeRef: pre.routeRef, upstreamOrigin: publicUrl, upstreamBasePath: "/base", tripKey: "shared" });
+      // A registered upstream that is not on the list, or is not a plain origin: 503, never a fall-back to the public URL.
+      for (const [name, upstream] of [["outside", "http://198.51.100.10:8080"], ["path", "http://192.0.2.10:8080/base"], ["creds", "http://u:p@192.0.2.10"], ["junk", "not a url"], ["ftp", "ftp://192.0.2.10"]] as const) {
+        const bad = await withJob(upstream, publicUrl);
+        const refused = await get(listed, `/internal/runtime-routes/${bad.tripId}`);
+        assert.equal(refused.statusCode, 503, name);
+        assert.deepEqual(refused.json(), { error: "RUNTIME_ROUTE_INVALID" }, name);
+        assert.doesNotMatch(refused.body, /192\.0\.2|198\.51|wild/);
+      }
+      // The key is still required.
+      assert.equal((await get(listed, `/internal/runtime-routes/${lan.tripId}`, {})).statusCode, 401);
+    } finally { await Promise.all([listed.close(), unlisted.close(), empty.close()]); }
+  } finally {
+    await pool.query("DELETE FROM control_plane.jobs WHERE id = ANY($1)", [jobIds]);
+    await pool.query("DELETE FROM control_plane.plans WHERE id LIKE $1", [`${planId}%`]);
+    await pool.query("DELETE FROM control_plane.releases WHERE id = $1", [releaseId]);
+  }
 });
 
 test("upstreamHostAllowed: exact names, exact IPv4 and IPv4 CIDR; IPv6 and anything unlisted is refused", () => {

@@ -90,6 +90,12 @@ class ComputeAdapter(Protocol):
         "derived" - as its own .env says; None when this adapter cannot say."""
         ...
 
+    def verify_site_bridge(self, slug: str) -> "tuple[bool, str] | None":
+        """From INSIDE the trip's container, ask the shared bridge whether it
+        answers this trip's own site key: (ok, evidence), or None when this
+        deployment has no shared bridge for the adapter to check."""
+        ...
+
 
 class NullComputeAdapter:
     """No compute adapter configured — ShellDeployAdapter falls back to this
@@ -109,6 +115,9 @@ class NullComputeAdapter:
         return None
 
     def site_trip_key(self, slug: str) -> str | None:
+        return None
+
+    def verify_site_bridge(self, slug: str) -> "tuple[bool, str] | None":
         return None
 
 
@@ -163,6 +172,7 @@ class LxcProvisionAdapter:
         npm_secret: str = "",
         provisioner_factory: Callable[[], Provisioner] | None = None,
         routing: str = ROUTING_HOST,
+        shared_bridge_site_url: str = "",
     ) -> None:
         # TRIP_ROUTING. `host`: every NEW trip gets an NPM proxy host, a
         # Cloudflare DNS record and a tunnel ingress rule (all the parameters
@@ -222,6 +232,11 @@ class LxcProvisionAdapter:
         if "\n" in trip_key_master or "\r" in trip_key_master:
             raise ValueError("trip key master must be one line")
         self._trip_key_master = trip_key_master
+        # TRIP_MCP_SHARED_SITE_URL, set only with TRIP_MCP_BRIDGE=shared: the shared bridge as a trip
+        # CONTAINER reaches it. A new trip's .env is written with HERMES_URL=<this> (the site calls
+        # `${HERMES_URL}/extract` and `/enrich`), and verify_site_bridge asks, from inside the container,
+        # whether the bridge answers there. Unset (the default): nothing is written and nothing is checked.
+        self._shared_bridge_site_url = shared_bridge_site_url
         # slug -> the kind of key the trip's site holds ("shared" / "derived"),
         # read back from the container after apply(); None when not asked or
         # unknowable. Held in this process only, like the site password.
@@ -311,6 +326,27 @@ class LxcProvisionAdapter:
 
     def site_trip_key(self, slug: str) -> str | None:
         return self._site_key_kinds.get(slug)
+
+    def verify_site_bridge(self, slug: str) -> "tuple[bool, str] | None":
+        """The trip site -> shared bridge direction, proved from inside the trip's container (the
+        companion's own connection covers the other direction). None with no shared bridge configured,
+        or for a trip this adapter has no topology for. An ssh failure raises, like site_password:
+        "could not look" is not "looked and it is down".
+
+        Needs the trip's bridge route to exist, so the worker calls it AFTER the companion step has
+        wired the trip, never before."""
+        if not self._shared_bridge_site_url:
+            return None
+        topology = self._load_topology(self._topology_path(slug))
+        if topology is None:
+            return None
+        if self._provisioner_factory is not None:
+            proxmox = self._provisioner_factory().proxmox
+        else:
+            proxmox = ProxmoxLxcAdapter(SubprocessSshTransport(
+                host=self._proxmox_host, user=self._proxmox_ssh_user, identity_file=self._proxmox_ssh_key,
+            ))
+        return proxmox.check_site_to_bridge(topology.lxc, self._shared_bridge_site_url)
 
     @staticmethod
     def _key_kind_of(answer: object) -> str | None:
@@ -585,6 +621,8 @@ class LxcProvisionAdapter:
                 control_plane_exchange_key=(
                     self._control_plane_exchange_key if exchange_key is None else exchange_key
                 ),
+                # A NEW site's HERMES_URL when the bridge is shared ("" otherwise: nothing written).
+                hermes_url=self._shared_bridge_site_url,
             ),
             npm_adapter,
             cloudflare_adapter,

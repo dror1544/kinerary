@@ -17,6 +17,22 @@ if (!TRIP_KEY_MASTER && LEGACY_TRIP_KEY) {
   // A legacy key with no master is a half-made change of keys, and nothing else would say so.
   console.error("runtime_gateway.trip_keys_off: RUNTIME_LEGACY_TRIP_KEY is set but RUNTIME_TRIP_KEY_MASTER is not; every trip is sent RUNTIME_EXCHANGE_KEY");
 }
+// With per-trip keys on, the three secrets must be three different values. A legacy key equal to the
+// control-plane key leaves every legacy trip holding a credential the control plane and this gateway's own
+// /internal/t/* routes accept, which is the exposure per-trip keys exist to end; a master equal to either
+// would make every derived key a function of a key that is already shared. The rollout is therefore a
+// ROTATION: the current key becomes the legacy key and a NEW exchange key goes to the API and this gateway
+// (docs/runtime-session-exchange.md, "Rolling it out"). Refused at start, naming variables, never a value.
+if (TRIP_KEY_MASTER) {
+  const held = [["RUNTIME_EXCHANGE_KEY", EXCHANGE_KEY], ["RUNTIME_TRIP_KEY_MASTER", TRIP_KEY_MASTER], ["RUNTIME_LEGACY_TRIP_KEY", LEGACY_TRIP_KEY]].filter(([, value]) => value);
+  const equal = [];
+  for (let i = 0; i < held.length; i += 1) for (let j = i + 1; j < held.length; j += 1) if (held[i][1] === held[j][1]) equal.push(`${held[i][0]} and ${held[j][0]}`);
+  if (equal.length) {
+    const message = `${equal.join("; ")} hold the same value; with RUNTIME_TRIP_KEY_MASTER set the three must all differ (rotate RUNTIME_EXCHANGE_KEY: the current value becomes RUNTIME_LEGACY_TRIP_KEY and a new one goes to the API and the gateway)`;
+    console.error(`runtime_gateway.trip_keys_not_distinct: ${message}`);
+    throw new Error(message);
+  }
+}
 const COOKIE_SECRET = required("RUNTIME_COOKIE_SECRET");
 const PORTAL_ORIGIN = required("PORTAL_ORIGIN").replace(/\/$/, "");
 const RUNTIME_ORIGIN = required("RUNTIME_ORIGIN").replace(/\/$/, "");

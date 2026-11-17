@@ -124,6 +124,53 @@ def _choice_of(name: str, allowed: tuple[str, ...]) -> Callable[[str], str]:
 TRIP_ROUTINGS = ("host", "wildcard")
 TRIP_MCP_BRIDGES = ("per_trip", "shared")
 
+# TRIP_MCP_SHARED_SITE_URL: where a TRIP CONTAINER reaches the shared bridge. A plain http(s) origin and
+# nothing else: it is written into a new trip's .env and used by the site as the base of its /extract,
+# /enrich and /health calls, so a path, credentials, a query or a stray character must never get that far.
+_SHARED_SITE_URL = re.compile(
+    r"https?://[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*(:[0-9]{1,5})?"
+)
+
+
+def _shared_site_url(raw: str) -> str:
+    """"" (unset, or passed through empty by compose) or a plain http(s) origin with a valid port."""
+    if raw == "":
+        return ""
+    port = raw.rsplit(":", 1)[-1] if re.search(r":[0-9]+$", raw) else ""
+    if not _SHARED_SITE_URL.fullmatch(raw) or (port and not 0 < int(port) < 65536):
+        raise argparse.ArgumentTypeError(
+            "TRIP_MCP_SHARED_SITE_URL must be a plain http(s) origin, http(s)://<host>[:<port>], "
+            "with no path, credentials, query or fragment"
+        )
+    return raw
+
+
+def _refuse_unsafe_key_and_bridge_settings(args: argparse.Namespace) -> None:
+    """Start-up refusals for the two settings that are otherwise silently half-made.
+
+    1. Per-trip keys on (`CONTROL_PLANE_TRIP_KEY_MASTER`) with the master EQUAL to the control-plane key
+       (`CONTROL_PLANE_EXCHANGE_KEY`): every derived key would be a function of a key the API and the
+       gateway already share, and rotation - a required step of the rollout - would not have happened.
+       Names the variables, never a value.
+    2. The shared bridge: `TRIP_MCP_SHARED_SITE_URL` is required with `TRIP_MCP_BRIDGE=shared` (a new trip's
+       site would otherwise keep calling a per-trip bridge port that mode never starts) and refused
+       without it (so it cannot be half-set and believed to be in force)."""
+    master = os.environ.get("CONTROL_PLANE_TRIP_KEY_MASTER", "")
+    if master and master == os.environ.get("CONTROL_PLANE_EXCHANGE_KEY", ""):
+        raise ValueError(
+            "CONTROL_PLANE_TRIP_KEY_MASTER and CONTROL_PLANE_EXCHANGE_KEY hold the same value; with per-trip "
+            "keys on they must differ (rotate the control-plane key first: docs/runtime-session-exchange.md, "
+            "\"Rolling it out\")"
+        )
+    shared = args.trip_mcp_bridge == "shared"
+    if shared and not args.trip_mcp_shared_site_url:
+        raise ValueError(
+            "TRIP_MCP_SHARED_SITE_URL is required with TRIP_MCP_BRIDGE=shared: the address trip containers "
+            "use to reach the shared bridge, http(s)://<host>:<port>"
+        )
+    if args.trip_mcp_shared_site_url and not shared:
+        raise ValueError("TRIP_MCP_SHARED_SITE_URL is set but TRIP_MCP_BRIDGE is not shared; unset one of them")
+
 
 def _add_companion_ssh_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--companion-ssh-host", default=os.environ.get("PROVISIONER_COMPANION_SSH_HOST"))
@@ -252,6 +299,14 @@ def build_parser() -> argparse.ArgumentParser:
     provision.add_argument("--trip-mcp-bridge", type=_choice_of("TRIP_MCP_BRIDGE", TRIP_MCP_BRIDGES),
                            default=os.environ.get("TRIP_MCP_BRIDGE") or "per_trip",
                            help="per_trip (default) | shared (TRIP_MCP_BRIDGE)")
+    # The shared bridge as a trip CONTAINER reaches it. The trip site calls its bridge for booking extraction
+    # and enrichment (HERMES_URL), the opposite direction from the companion's connection, and a shared
+    # bridge has no per-trip port, so a new trip's .env is written with this address and the worker checks,
+    # from inside the container, that the bridge answers there. Required with `shared`, refused without it.
+    provision.add_argument("--trip-mcp-shared-site-url", type=_shared_site_url,
+                           default=os.environ.get("TRIP_MCP_SHARED_SITE_URL") or "",
+                           help="http(s)://<host>[:<port>] of the shared bridge as trip containers reach it "
+                                "(TRIP_MCP_SHARED_SITE_URL); required with --trip-mcp-bridge shared")
     provision.add_argument("--poll-seconds", type=float, default=10.0)
     # Issue #119. ON by default, like the bridge itself: a bridge that stops
     # reaching its trip after provisioning is otherwise found by an organizer,
@@ -376,6 +431,7 @@ def main(argv: list[str] | None = None) -> int:
             from .runtime import read_secret_file
             db_url = read_secret_file(args.database_url_file)
             _warn_if_retired_seed_password_is_set()
+            _refuse_unsafe_key_and_bridge_settings(args)
             # Said at every start, because both are chosen by an environment
             # variable and neither shows in a conversation: `wildcard` means a
             # new trip gets no DNS record or proxy host, `shared` means the
@@ -446,6 +502,10 @@ def main(argv: list[str] | None = None) -> int:
                     nfs_host_base=os.environ.get("PROVISIONER_NFS_HOST_BASE", "/mnt/pve/truenas-nfs"),
                     nfs_mount_base=os.environ.get("PROVISIONER_NFS_MOUNT_BASE", "/nfs"),
                     routing=args.trip_routing,
+                    # Set only with TRIP_MCP_BRIDGE=shared (refused above otherwise): a new trip's
+                    # .env gets HERMES_URL=<this> and its site is checked against the bridge from
+                    # inside its own container.
+                    shared_bridge_site_url=args.trip_mcp_shared_site_url,
                 )
             else:
                 compute_adapter = NullComputeAdapter()
