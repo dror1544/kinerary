@@ -19,11 +19,25 @@
  * **every `outbound` frame must get exactly one `outbound_result`**, including
  * for ops we do not implement. A missing result is not a dropped message; it
  * is a stalled gateway turn until its timeout.
+ *
+ * Outbound actions are scoped to the caller's own chats: the gateway id from
+ * the upgrade token (never a frame field) must own the chat the action names,
+ * by the same rule inbound routing follows (`outbound-scope.ts`; spec
+ * docs/specs/sprint-9/x-relay-chat-scope.md). A refused action has no side
+ * effect and is answered `CHAT_NOT_IN_SCOPE` or `SCOPE_CHECK_FAILED`.
  */
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
+import { digestTelegramId, isPrivateChatId } from "../identity.js";
 import { structuredLog } from "../redaction.js";
 import { detectInternalLeak } from "./internal-leak.js";
+import {
+  CHAT_NOT_IN_SCOPE,
+  SCOPE_CHECK_FAILED,
+  outboundChatAllowed,
+  type OutboundRouteKind,
+  type ScopeRoute,
+} from "./outbound-scope.js";
 import { ExplicitTurns, silenceVerdict } from "./stay-silent.js";
 import {
   decodeFrame,
@@ -101,6 +115,10 @@ const CLOSE_UNAUTHORIZED = 4401;
 // stream cannot exhaust memory.
 const MAX_PARTIAL_FRAME_BYTES = 1_000_000;
 
+const SCOPE_LOOKUP_TIMEOUT_MS = 5_000;
+
+class ScopeLookupTimeout extends Error {}
+
 export interface ConnectorOptions {
   /**
    * Re-host store for inbound attachments. Absent, `/relay/media/{id}` 404s —
@@ -134,15 +152,38 @@ export interface ConnectorOptions {
   path?: string;
   log?: (line: string) => void;
   /**
-   * Whether a chat is mid-interview, and therefore one the agent may not write
-   * to directly.
+   * Resolves a chat to its route (`resolveChatRoute`), once per outbound
+   * action and never cached: it decides whether the calling gateway may act in
+   * that chat at all (`outbound-scope.ts`), and whether the chat is
+   * mid-interview and therefore one the agent may not write to directly.
    *
-   * A predicate rather than a database handle on purpose: the connector's job
-   * is the wire, and giving it a pool would make every relay test carry a
-   * schema. The relay server injects the real lookup; anything without one
-   * keeps the old behaviour, which is correct for a companion-only deployment.
+   * A function rather than a database handle on purpose: the connector's job is
+   * the wire, and giving it a pool would make every relay test carry a schema.
+   * Absent, every outbound action is refused (`SCOPE_CHECK_FAILED`): fail
+   * closed, the direction inbound routing takes with no database.
    */
-  interviewChat?: (chatId: string) => Promise<boolean>;
+  resolveRoute?: (chatId: string) => Promise<ScopeRoute>;
+  /**
+   * `relay.interviewer_profile`: the id the interviewer's gateway may
+   * authenticate under, allowed on interview chats alongside the declared
+   * `fallbackGatewayId`. Unset, interview chats belong to the fallback gateway
+   * alone.
+   */
+  interviewerProfile?: string;
+  /**
+   * How long the route lookup may take before the action is refused
+   * (`SCOPE_CHECK_FAILED`). The gateway blocks on a result per frame, so a
+   * database that accepts the connection and never answers must not leave it
+   * waiting for its own timeout. Default 5 seconds.
+   */
+  scopeLookupTimeoutMs?: number;
+  /**
+   * Whether a Hermes profile has an open chat binding. Used for one thing only:
+   * the `relay.gateway_identity_unmatched` warning when a gateway connects. It
+   * never changes routing or any outbound decision. Absent, the warning is not
+   * judged at all (nothing to compare a companion id against).
+   */
+  profileHasOpenBinding?: (profile: string) => Promise<boolean>;
   /**
    * Delivers an agent message on an interview chat through the router.
    *
@@ -168,7 +209,7 @@ export interface ConnectorOptions {
    * Never called on an interview chat — that branch above returns before
    * reaching Telegram at all, so this option only ever sees companion sends.
    * A predicate/setter pair rather than a database handle, same reasoning as
-   * `interviewChat`/`interviewSay`: the connector's job is the wire.
+   * `resolveRoute`/`interviewSay`: the connector's job is the wire.
    */
   setExpectsReply?: (chatId: string, expects: boolean) => Promise<void>;
   /**
@@ -302,7 +343,36 @@ export class RelayConnector {
     return verifyUpgradeToken(match[1], this.options.gatewaySecrets) ?? null;
   }
 
+  /** Gateway ids already warned about as matching no identity: once per id per process, not once per reconnect. */
+  private readonly unmatchedWarned = new Set<string>();
+
+  /**
+   * A gateway whose id is neither an interviewer identity (`interviewerProfile`
+   * or the declared multiplex id) nor a companion profile with an open binding
+   * is logged once (`relay.gateway_identity_unmatched`, gateway id and a fixed
+   * reason, no chat data). Observation only: it runs off the connection path,
+   * never throws, and changes no routing. A failed lookup warns nothing, since
+   * nothing can be concluded from it.
+   */
+  private async checkGatewayIdentity(gatewayId: string): Promise<void> {
+    const lookup = this.options.profileHasOpenBinding;
+    if (!lookup || this.unmatchedWarned.has(gatewayId)) return;
+    if (gatewayId === this.options.interviewerProfile || gatewayId === this.options.fallbackGatewayId) return;
+    try {
+      if (await lookup(gatewayId)) return;
+    } catch {
+      return;
+    }
+    if (this.unmatchedWarned.has(gatewayId)) return;
+    this.unmatchedWarned.add(gatewayId);
+    this.log(structuredLog("warn", "relay.gateway_identity_unmatched", {
+      gateway_id: gatewayId,
+      reason: "matches_no_interviewer_identity_and_no_open_binding",
+    }));
+  }
+
   private onConnection(ws: WebSocket, gatewayId: string): void {
+    void this.checkGatewayIdentity(gatewayId);
     let peers = this.gateways.get(gatewayId);
     if (!peers) {
       peers = new Set<WebSocket>();
@@ -333,7 +403,7 @@ export class RelayConnector {
         this.log(structuredLog("warn", "relay.partial_frame_discarded", { bytes: carry.length }));
         carry = "";
       }
-      for (const frame of split.frames) void this.onFrame(ws, frame);
+      for (const frame of split.frames) void this.onFrame(ws, frame, gatewayId);
     });
     ws.on("close", () => {
       const set = this.gateways.get(gatewayId);
@@ -360,7 +430,7 @@ export class RelayConnector {
     });
   }
 
-  private async onFrame(ws: WebSocket, raw: string): Promise<void> {
+  private async onFrame(ws: WebSocket, raw: string, gatewayId: string): Promise<void> {
     const frame = decodeFrame(raw);
     // A malformed frame must not close the socket: the gateway would redial
     // straight into the same failure and spin.
@@ -376,7 +446,7 @@ export class RelayConnector {
         this.send(ws, { type: "descriptor", descriptor: TELEGRAM_DESCRIPTOR });
         return;
       case "outbound":
-        await this.onOutbound(ws, frame);
+        await this.onOutbound(ws, frame, gatewayId);
         return;
       case "interrupt":
       case "going_idle":
@@ -391,7 +461,7 @@ export class RelayConnector {
     }
   }
 
-  private async onOutbound(ws: WebSocket, frame: Record<string, unknown>): Promise<void> {
+  private async onOutbound(ws: WebSocket, frame: Record<string, unknown>, gatewayId: string): Promise<void> {
     const requestId = frame.requestId;
     if (typeof requestId !== "string") {
       // Without a requestId there is nothing to resolve, so this can only be
@@ -414,7 +484,7 @@ export class RelayConnector {
 
     let result: OutboundResult;
     try {
-      result = await this.performAction(action);
+      result = await this.performAction(action, gatewayId);
     } catch (error) {
       this.log(
         structuredLog("error", "relay.outbound_failed", {
@@ -427,8 +497,19 @@ export class RelayConnector {
     this.send(ws, { type: "outbound_result", requestId, result });
   }
 
-  private async performAction(action: ReturnType<typeof parseOutboundAction>): Promise<OutboundResult> {
+  /**
+   * `gatewayId` is the authenticated id closed over at connection, never
+   * anything read from a frame. The scope check is the first thing here: a
+   * refused action reaches no branch below, so it has no side effect.
+   */
+  private async performAction(
+    action: ReturnType<typeof parseOutboundAction>,
+    gatewayId: string,
+  ): Promise<OutboundResult> {
     if (!action) return { success: false, error: "UNSUPPORTED_OP" };
+    const scope = await this.checkScope(action, gatewayId);
+    if (!scope.ok) return scope.result;
+    const route = scope.route;
     const telegram = this.options.telegram;
     switch (action.op) {
       case "send": {
@@ -452,7 +533,7 @@ export class RelayConnector {
         // Every one of those was a prompt rule first, and every prompt rule
         // failed live at least once. This is the same rule expressed where it
         // cannot be talked around.
-        if (this.options.interviewChat && (await this.options.interviewChat(action.chat_id))) {
+        if (route.kind === "interview") {
           // The leak filter still applies, and still DROPS rather than
           // converts: a message naming field ids or tool names is one the
           // organizer must not read, whichever door it arrives through.
@@ -610,6 +691,59 @@ export class RelayConnector {
           : { success: false, error: "CHAT_NOT_FOUND" };
       }
     }
+  }
+
+  /**
+   * Resolves the action's chat once and decides whether `gatewayId` may act in
+   * it. Never throws: a failed or missing lookup is a refusal
+   * (`SCOPE_CHECK_FAILED`), like every other input this cannot place.
+   * One `relay.outbound_out_of_scope` line per refusal: the op, the gateway,
+   * a digest of the chat (never the raw id) and whether it is a group or a
+   * private chat, and the kind of route; never content, length, reply or
+   * message ids, or a profile other than the caller's own.
+   */
+  private async checkScope(
+    action: NonNullable<ReturnType<typeof parseOutboundAction>>,
+    gatewayId: string,
+  ): Promise<{ ok: true; route: ScopeRoute } | { ok: false; result: OutboundResult }> {
+    const refuse = (error: string, routeKind: OutboundRouteKind | "lookup_failed", reason: string) => {
+      // The chat is named by its digest (the form `CHAT_DIGEST_SQL` matches, so
+      // a refusal can be traced to a chat in the database) and never by its raw
+      // id, which is a person's identifier.
+      this.log(structuredLog("warn", "relay.outbound_out_of_scope", {
+        op: action.op,
+        gateway_id: gatewayId,
+        chat_ref: digestTelegramId(action.chat_id),
+        chat_kind: isPrivateChatId(action.chat_id) ? "private" : "group",
+        route_kind: routeKind,
+        reason,
+      }));
+      return { ok: false as const, result: { success: false as const, error } };
+    };
+    const resolveRoute = this.options.resolveRoute;
+    if (!resolveRoute) return refuse(SCOPE_CHECK_FAILED, "lookup_failed", "no_route_resolver");
+    let route: ScopeRoute;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const timedOut = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new ScopeLookupTimeout()), this.options.scopeLookupTimeoutMs ?? SCOPE_LOOKUP_TIMEOUT_MS);
+      });
+      route = await Promise.race([resolveRoute(action.chat_id), timedOut]);
+    } catch (error) {
+      return refuse(
+        SCOPE_CHECK_FAILED,
+        "lookup_failed",
+        error instanceof ScopeLookupTimeout ? "route_lookup_timeout" : "route_lookup_failed",
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+    const verdict = outboundChatAllowed(route, gatewayId, {
+      interviewerProfile: this.options.interviewerProfile,
+      multiplexGatewayId: this.options.fallbackGatewayId,
+    });
+    if (!verdict.allowed) return refuse(CHAT_NOT_IN_SCOPE, verdict.routeKind, verdict.reason);
+    return { ok: true, route };
   }
 
   /**

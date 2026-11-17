@@ -1,10 +1,16 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { WebSocket } from "ws";
+import type { ScopeRoute } from "../src/relay/outbound-scope.js";
+
+/** Every route the scope check can be handed: a chat router route, or the interviewer's own chat after confirmation. */
+type ChatRoute = ScopeRoute;
 import { RelayConnector } from "../src/relay/connector.js";
 import { SILENCE_SENTINEL } from "../src/relay/stay-silent.js";
 import type { ReplyObserver } from "../src/analytics/emitter.js";
 import { makeUpgradeToken, type WireMessageEvent } from "../src/relay/protocol.js";
+import { digestTelegramId } from "../src/identity.js";
+import { CHAT_NOT_IN_SCOPE, SCOPE_CHECK_FAILED } from "../src/relay/outbound-scope.js";
 import type { ChatInfo, SendResult, TelegramClient } from "../src/relay/telegram-api.js";
 import { hermesIsRetryable, hermesIsTimeout } from "./support/hermes-mirror.js";
 
@@ -15,6 +21,7 @@ class FakeTelegram implements TelegramClient {
   readonly sent: { chatId: string; text: string; replyTo?: string }[] = [];
   readonly edited: { chatId: string; messageId: string; text: string }[] = [];
   readonly typing: string[] = [];
+  readonly infoCalls: string[] = [];
   failSend = false;
   /** The fixed word HttpTelegramClient returns for a call that failed this way (e.g. "TIMEOUT", "NETWORK"). */
   sendError: string | null = null;
@@ -36,6 +43,7 @@ class FakeTelegram implements TelegramClient {
   }
   async answerCallbackQuery(): Promise<void> {}
   async getChatInfo(chatId: string): Promise<ChatInfo | null> {
+    this.infoCalls.push(chatId);
     return chatId === "missing" ? null : { name: "Japan Trip", type: "group" };
   }
   async getUpdates(): Promise<unknown[]> {
@@ -50,10 +58,46 @@ interface Harness {
   port: number;
 }
 
+/**
+ * What `resolveChatRoute` would answer, per chat: an interview chat, an explicit
+ * route, or - the default - a companion chat bound to the gateway these tests dial
+ * as (`gw_1`), so every outbound test is an action in the caller's own chat.
+ */
+function defaultRouteResolver(options: {
+  interviewChats?: readonly string[];
+  routes?: Record<string, ChatRoute>;
+  defaultProfile?: string | null;
+}): (chatId: string) => Promise<ChatRoute> {
+  return async (chatId) => {
+    const explicit = options.routes?.[chatId];
+    if (explicit) return explicit;
+    if (options.interviewChats?.includes(chatId)) return { kind: "interview", sessionId: "s1", tripId: "trip-1" };
+    return {
+      kind: "companion",
+      tripId: "trip-1",
+      hermesProfile: options.defaultProfile === undefined ? "gw_1" : options.defaultProfile,
+      assistantNames: [],
+    };
+  };
+}
+
 async function withConnector(
   fn: (h: Harness) => Promise<void>,
   options: {
+    /** Chats whose route is `interview` (everything else is the caller's own companion chat unless `routes` says so). */
     interviewChats?: readonly string[];
+    /** Explicit route per chat id; wins over the default. */
+    routes?: Record<string, ChatRoute>;
+    /** The Hermes profile the default (unlisted) chats are bound to. `gw_1` unless a test dials as another gateway. */
+    defaultProfile?: string | null;
+    /** Replaces the route lookup entirely (to make it throw, count calls, or flip a binding mid-test). */
+    resolveRoute?: (chatId: string) => Promise<ChatRoute>;
+    /** Builds the connector with no route resolver at all. */
+    noResolver?: boolean;
+    interviewerProfile?: string;
+    scopeLookupTimeoutMs?: number;
+    /** Whether a profile has an open chat binding (the unmatched-identity warning's only database question). */
+    profileHasOpenBinding?: (profile: string) => Promise<boolean>;
     interviewSay?: (chatId: string, text: string) => Promise<boolean>;
     fallbackGatewayId?: string;
     setExpectsReply?: (chatId: string, expects: boolean) => Promise<void>;
@@ -67,9 +111,10 @@ async function withConnector(
     gatewaySecrets: [SECRET],
     telegram,
     port: 0,
-    ...(options.interviewChats
-      ? { interviewChat: async (chatId: string) => options.interviewChats!.includes(chatId) }
-      : {}),
+    ...(options.noResolver ? {} : { resolveRoute: options.resolveRoute ?? defaultRouteResolver(options) }),
+    ...(options.interviewerProfile ? { interviewerProfile: options.interviewerProfile } : {}),
+    ...(options.scopeLookupTimeoutMs ? { scopeLookupTimeoutMs: options.scopeLookupTimeoutMs } : {}),
+    ...(options.profileHasOpenBinding ? { profileHasOpenBinding: options.profileHasOpenBinding } : {}),
     ...(options.interviewSay ? { interviewSay: options.interviewSay } : {}),
     ...(options.fallbackGatewayId ? { fallbackGatewayId: options.fallbackGatewayId } : {}),
     ...(options.setExpectsReply ? { setExpectsReply: options.setExpectsReply } : {}),
@@ -265,7 +310,7 @@ describe("RelayConnector — outbound actions", () => {
       // there is nothing here it could usefully retry.
       assert.deepEqual(result, { success: true });
       assert.deepEqual(h.telegram.sent, [], "nothing reached the organizer");
-    }, { interviewChats: ["900"] });
+    }, { interviewChats: ["900"], interviewerProfile: "gw_1" });
   });
 
   test("an interview send is routed through say, not lost", async () => {
@@ -286,7 +331,7 @@ describe("RelayConnector — outbound actions", () => {
       assert.deepEqual(h.telegram.sent, [], "not sent directly — the router delivers it");
       assert.deepEqual(routed, [{ chatId: "900", text: "רשמתי — נשאר רק תאריך החזרה." }]);
     }, {
-      interviewChats: ["900"],
+      interviewChats: ["900"], interviewerProfile: "gw_1",
       interviewSay: async (chatId: string, text: string) => {
         routed.push({ chatId, text });
         return true;
@@ -309,7 +354,7 @@ describe("RelayConnector — outbound actions", () => {
       assert.deepEqual(h.telegram.sent, [], "nothing reached the organizer");
       assert.deepEqual(routed, [], "and it was not laundered through say either");
     }, {
-      interviewChats: ["900"],
+      interviewChats: ["900"], interviewerProfile: "gw_1",
       interviewSay: async (_chatId: string, text: string) => {
         routed.push(text);
         return true;
@@ -325,7 +370,7 @@ describe("RelayConnector — outbound actions", () => {
       const result = await roundTrip(h, { op: "send", chat_id: "901", content: "hello" });
       assert.equal(result.success, true);
       assert.equal(h.telegram.sent.length, 1, "the companion still speaks");
-    }, { interviewChats: ["900"] });
+    }, { interviewChats: ["900"], interviewerProfile: "gw_1" });
   });
 
   test("edit and typing are performed", async () => {
@@ -504,7 +549,7 @@ describe("RelayConnector — reply-expected capture (migration 0053)", () => {
       assert.deepEqual(result, { success: true });
       assert.deepEqual(calls, [], "the interview branch never calls setExpectsReply");
     }, {
-      interviewChats: ["900"],
+      interviewChats: ["900"], interviewerProfile: "gw_1",
       setExpectsReply: async (chatId, expects) => {
         calls.push({ chatId, expects });
       },
@@ -608,7 +653,7 @@ describe("RelayConnector — reply-expected capture (migration 0053)", () => {
     await withConnector(async (h) => {
       await roundTrip(h, { op: "send", chat_id: "900", content: "The next question is destination." });
       assert.deepEqual(renewed, []);
-    }, { interviewChats: ["900"], renewConversation: async (chatId) => { renewed.push(chatId); } });
+    }, { interviewChats: ["900"], interviewerProfile: "gw_1", renewConversation: async (chatId) => { renewed.push(chatId); } });
   });
 
   test("a renewal write failure does not turn a delivered message into a failure, and is logged", async () => {
@@ -919,7 +964,7 @@ describe("RelayConnector - silence on a turn that named the assistant (staging r
       assert.equal(lines.filter((l) => l.includes("trip_bot.companion_stayed_silent")).length, 1, "the ordinary line is kept");
       assert.ok(lines.every((l) => !l.includes("901") && !l.includes("4141")), "no chat id, no message id");
       assert.deepEqual(rec.calls, [{ delivery: "suppressed", flags: { silentOnAddressed: true } }]);
-    }, { log: (l) => lines.push(l), assistantEvents: rec.observer });
+    }, { defaultProfile: profile, log: (l) => lines.push(l), assistantEvents: rec.observer });
   });
 
   test("the sentinel on a window / judge turn is unchanged: no defect log, no flag", async () => {
@@ -931,7 +976,7 @@ describe("RelayConnector - silence on a turn that named the assistant (staging r
       assert.equal(defects(lines), 0);
       assert.equal(lines.filter((l) => l.includes("trip_bot.companion_stayed_silent")).length, 1);
       assert.deepEqual(rec.calls, [{ delivery: "suppressed", flags: undefined }]);
-    }, { log: (l) => lines.push(l), assistantEvents: rec.observer });
+    }, { defaultProfile: profile, log: (l) => lines.push(l), assistantEvents: rec.observer });
   });
 
   test("correlation: reply_to picks the turn it names; without it the latest forwarded turn decides", async () => {
@@ -939,17 +984,17 @@ describe("RelayConnector - silence on a turn that named the assistant (staging r
     await withConnector(async (h) => {
       await replyAfter(h, [{ id: "43", explicit: true }, { id: "44", explicit: false }], SILENCE_SENTINEL, "44");
       assert.equal(defects(a), 0, "reply_to names the window turn that followed the explicit one");
-    }, { log: (l) => a.push(l) });
+    }, { defaultProfile: profile, log: (l) => a.push(l) });
     const b: string[] = [];
     await withConnector(async (h) => {
       await replyAfter(h, [{ id: "45", explicit: true }, { id: "46", explicit: false }], SILENCE_SENTINEL, "45");
       assert.equal(defects(b), 1, "reply_to names the explicit turn");
-    }, { log: (l) => b.push(l) });
+    }, { defaultProfile: profile, log: (l) => b.push(l) });
     const c: string[] = [];
     await withConnector(async (h) => {
       await replyAfter(h, [{ id: "47", explicit: false }, { id: "48", explicit: true }], SILENCE_SENTINEL);
       assert.equal(defects(c), 1, "no reply_to: the latest forwarded turn");
-    }, { log: (l) => c.push(l) });
+    }, { defaultProfile: profile, log: (l) => c.push(l) });
   });
 
   test("a real answer to an explicit turn is delivered and flags nothing; a chat with no remembered turn is never a defect", async () => {
@@ -963,11 +1008,439 @@ describe("RelayConnector - silence on a turn that named the assistant (staging r
       // The same silence in a chat nothing was pushed to (a proactive turn, a restart): unknown is not a defect.
       await replyAfter(h, [], SILENCE_SENTINEL);
       assert.equal(defects(lines), 1, "the earlier explicit turn in this chat is the latest known one");
-    }, { log: (l) => lines.push(l), assistantEvents: rec.observer });
+    }, { defaultProfile: profile, log: (l) => lines.push(l), assistantEvents: rec.observer });
     const fresh: string[] = [];
     await withConnector(async (h) => {
       await replyAfter(h, [], SILENCE_SENTINEL);
       assert.equal(defects(fresh), 0);
-    }, { log: (l) => fresh.push(l) });
+    }, { defaultProfile: profile, log: (l) => fresh.push(l) });
+  });
+});
+
+describe("RelayConnector - outbound actions are scoped to the caller's own chats", () => {
+  const GW = "companion-colmar";
+  const OTHER = "companion-japan";
+  const INTERVIEWER = "kinerary-interviewer";
+  const MULTIPLEX = "kinerary-trip-intake";
+  const own: ChatRoute = { kind: "companion", tripId: "t-colmar", hermesProfile: GW, assistantNames: [] };
+  const other: ChatRoute = { kind: "companion", tripId: "t-japan", hermesProfile: OTHER, assistantNames: [] };
+  const noProfile: ChatRoute = { kind: "companion", tripId: "t-new", hermesProfile: null, assistantNames: [] };
+  const unbound: ChatRoute = { kind: "unbound" };
+  const interview: ChatRoute = { kind: "interview", sessionId: "s1", tripId: "t-colmar" };
+
+  const OPS: ReadonlyArray<{ name: string; action: (chat: string) => Record<string, unknown> }> = [
+    { name: "send", action: (chat) => ({ op: "send", chat_id: chat, content: "SECRET-TEXT hello", reply_to: "REPLY-9", metadata: { expects_reply: true } }) },
+    { name: "edit", action: (chat) => ({ op: "edit", chat_id: chat, message_id: "MSG-12", content: "SECRET-TEXT revised" }) },
+    { name: "typing", action: (chat) => ({ op: "typing", chat_id: chat }) },
+    { name: "get_chat_info", action: (chat) => ({ op: "get_chat_info", chat_id: chat }) },
+  ];
+
+  /** What reached Telegram, whatever the op. */
+  const telegramCalls = (t: FakeTelegram): number =>
+    t.sent.length + t.edited.length + t.typing.length + t.infoCalls.length;
+
+  /** One outbound frame from a gateway authenticated as `as`; returns the whole wire exchange. */
+  async function ask(
+    h: Harness,
+    as: string,
+    action: Record<string, unknown>,
+  ): Promise<{ frame: Record<string, unknown>; reply: Record<string, unknown>; result: Record<string, unknown> }> {
+    const { ws, frames } = await dial(h.port, makeUpgradeToken(as, SECRET, 300));
+    const frame = { type: "outbound", requestId: "req_scope", action };
+    sendFrame(ws, frame);
+    const reply = await waitFor(() => frames.find((f) => f.type === "outbound_result"));
+    ws.close();
+    return { frame, reply, result: reply.result as Record<string, unknown> };
+  }
+
+  const refusedIn = (lines: string[]) =>
+    lines.filter((l) => l.includes("relay.outbound_out_of_scope")).map((l) => JSON.parse(l) as Record<string, unknown>);
+
+  for (const op of OPS) {
+    test(`AC-1 ${op.name}: in the caller's own chat it is performed exactly as before`, async () => {
+      await withConnector(async (h) => {
+        const { result } = await ask(h, GW, op.action("C1"));
+        assert.equal(result.success, true);
+        if (op.name === "send") {
+          assert.equal(result.message_id, "555");
+          assert.equal(h.telegram.sent.length, 1);
+        }
+        if (op.name === "edit") assert.equal(h.telegram.edited.length, 1);
+        if (op.name === "typing") assert.deepEqual(h.telegram.typing, ["C1"]);
+        if (op.name === "get_chat_info") assert.deepEqual(result, { success: true, name: "Japan Trip", type: "group" });
+      }, { routes: { C1: own } });
+    });
+
+    test(`AC-2 ${op.name}: in a chat bound to another profile it is refused, with no Telegram call`, async () => {
+      const lines: string[] = [];
+      await withConnector(async (h) => {
+        const { result } = await ask(h, GW, op.action("C2"));
+        assert.deepEqual(result, { success: false, error: CHAT_NOT_IN_SCOPE });
+        assert.equal(telegramCalls(h.telegram), 0);
+        assert.equal(refusedIn(lines).length, 1, "one log line per refusal");
+      }, { routes: { C2: other }, log: (l) => lines.push(l) });
+    });
+
+    test(`AC-3 ${op.name}: an unbound chat and a companion route with no profile refuse every caller, the multiplex gateway included`, async () => {
+      await withConnector(async (h) => {
+        for (const caller of [GW, OTHER, INTERVIEWER, MULTIPLEX]) {
+          for (const chat of ["CU", "CN"]) {
+            const { result } = await ask(h, caller, op.action(chat));
+            assert.deepEqual(result, { success: false, error: CHAT_NOT_IN_SCOPE }, `${caller} in ${chat}`);
+          }
+        }
+        assert.equal(telegramCalls(h.telegram), 0);
+      }, { routes: { CU: unbound, CN: noProfile }, interviewerProfile: INTERVIEWER, fallbackGatewayId: MULTIPLEX });
+    });
+
+    test(`AC-4 ${op.name}: an interview chat refuses a companion gateway`, async () => {
+      const said: string[] = [];
+      await withConnector(async (h) => {
+        const { result } = await ask(h, GW, op.action("CI"));
+        assert.deepEqual(result, { success: false, error: CHAT_NOT_IN_SCOPE });
+        assert.equal(telegramCalls(h.telegram), 0);
+        assert.deepEqual(said, [], "and the interview's router was not touched");
+      }, {
+        routes: { CI: interview },
+        interviewerProfile: INTERVIEWER,
+        fallbackGatewayId: MULTIPLEX,
+        interviewSay: async (_c, text) => { said.push(text); return true; },
+      });
+    });
+
+    test(`AC-5 ${op.name}: the declared multiplex gateway is allowed on every bound companion chat; undeclared, it is nobody`, async () => {
+      await withConnector(async (h) => {
+        for (const chat of ["CA", "CB"]) {
+          const { result } = await ask(h, MULTIPLEX, op.action(chat));
+          assert.equal(result.success, true, chat);
+        }
+      }, { routes: { CA: own, CB: other }, fallbackGatewayId: MULTIPLEX });
+      await withConnector(async (h) => {
+        const { result } = await ask(h, MULTIPLEX, op.action("CA"));
+        assert.deepEqual(result, { success: false, error: CHAT_NOT_IN_SCOPE });
+        assert.equal(telegramCalls(h.telegram), 0);
+      }, { routes: { CA: own } });
+    });
+
+    test(`AC-7 ${op.name}: a failed lookup, or no resolver, is SCOPE_CHECK_FAILED with no Telegram call`, async () => {
+      const lines: string[] = [];
+      await withConnector(async (h) => {
+        const { result } = await ask(h, GW, op.action("C1"));
+        assert.deepEqual(result, { success: false, error: SCOPE_CHECK_FAILED });
+        assert.equal(telegramCalls(h.telegram), 0);
+        assert.equal(refusedIn(lines)[0]?.route_kind, "lookup_failed");
+      }, { resolveRoute: async () => { throw new Error("db down"); }, log: (l) => lines.push(l) });
+      const noResolverLines: string[] = [];
+      await withConnector(async (h) => {
+        const { result } = await ask(h, GW, op.action("C1"));
+        assert.deepEqual(result, { success: false, error: SCOPE_CHECK_FAILED });
+        assert.equal(telegramCalls(h.telegram), 0);
+        assert.equal(refusedIn(noResolverLines).length, 1);
+      }, { noResolver: true, log: (l) => noResolverLines.push(l) });
+    });
+  }
+
+  test("the old permissive case, inverted: a gateway sending to a chat that is not its own gets nothing delivered", async () => {
+    // Every chat here is bound to gw_1; only gw_1 may send in it.
+    await withConnector(async (h) => {
+      const mine = await ask(h, "gw_1", { op: "send", chat_id: "900", content: "hello" });
+      assert.deepEqual(mine.result, { success: true, message_id: "555" });
+      const theirs = await ask(h, OTHER, { op: "send", chat_id: "900", content: "hello" });
+      assert.deepEqual(theirs.result, { success: false, error: CHAT_NOT_IN_SCOPE });
+      assert.equal(h.telegram.sent.length, 1, "only the owner's send reached Telegram");
+    });
+  });
+
+  test("AC-4: the interviewer profile and the multiplex gateway keep today's interview behaviour (send converted through say)", async () => {
+    for (const caller of [INTERVIEWER, MULTIPLEX]) {
+      const routed: Array<{ chatId: string; text: string }> = [];
+      await withConnector(async (h) => {
+        const { result } = await ask(h, caller, { op: "send", chat_id: "CI", content: "רשמתי." });
+        assert.deepEqual(result, { success: true });
+        assert.deepEqual(h.telegram.sent, [], "the router delivers it, not the gateway");
+        assert.deepEqual(routed, [{ chatId: "CI", text: "רשמתי." }], caller);
+      }, {
+        routes: { CI: interview },
+        interviewerProfile: INTERVIEWER,
+        fallbackGatewayId: MULTIPLEX,
+        interviewSay: async (chatId, text) => { routed.push({ chatId, text }); return true; },
+      });
+    }
+  });
+
+  test("AC-4: with no interviewer profile configured, the interview chat is the multiplex gateway's alone", async () => {
+    await withConnector(async (h) => {
+      const viaName = await ask(h, INTERVIEWER, { op: "typing", chat_id: "CI" });
+      assert.deepEqual(viaName.result, { success: false, error: CHAT_NOT_IN_SCOPE });
+      const viaMux = await ask(h, MULTIPLEX, { op: "typing", chat_id: "CI" });
+      assert.equal(viaMux.result.success, true);
+    }, { routes: { CI: interview }, fallbackGatewayId: MULTIPLEX });
+  });
+
+  test("AC-6: a binding closed between the turn and the reply refuses the reply", async () => {
+    let bound = true;
+    const resolveRoute = async (): Promise<ChatRoute> => (bound ? own : unbound);
+    await withConnector(async (h) => {
+      const { ws, frames } = await dial(h.port, makeUpgradeToken(GW, SECRET, 300));
+      await waitFor(() => (h.connector.connectedGateways === 1 ? true : undefined));
+      const turn: WireMessageEvent = {
+        text: "when do we land?", message_type: "text", message_id: "4141",
+        source: {
+          platform: "telegram", chat_id: "C1", chat_type: "group", chat_name: null,
+          user_id: "777", user_name: "Dror", thread_id: null, chat_topic: null, profile: GW,
+        },
+      };
+      assert.equal(h.connector.pushInbound(turn), true);
+      await waitFor(() => frames.find((f) => f.type === "inbound"));
+      bound = false; // the binding is closed before the companion answers
+      sendFrame(ws, { type: "outbound", requestId: "r1", action: { op: "send", chat_id: "C1", content: "Saturday.", reply_to: "4141" } });
+      const reply = await waitFor(() => frames.find((f) => f.type === "outbound_result"));
+      assert.deepEqual(reply.result, { success: false, error: CHAT_NOT_IN_SCOPE });
+      assert.deepEqual(h.telegram.sent, []);
+      ws.close();
+    }, { resolveRoute });
+  });
+
+  test("no cache: a binding switched between two actions takes effect on the next one, one lookup per action", async () => {
+    let calls = 0;
+    let route: ChatRoute = own;
+    await withConnector(async (h) => {
+      assert.equal((await ask(h, GW, { op: "typing", chat_id: "C1" })).result.success, true);
+      route = other; // e.g. a DM switched to another trip
+      assert.deepEqual((await ask(h, GW, { op: "typing", chat_id: "C1" })).result, { success: false, error: CHAT_NOT_IN_SCOPE });
+      assert.equal(calls, 2);
+      route = own;
+      await ask(h, GW, { op: "send", chat_id: "C1", content: "hello" });
+      assert.equal(calls, 3, "a send resolves once: the interview branch reuses the same answer");
+    }, { resolveRoute: async () => { calls += 1; return route; } });
+  });
+
+  test("AC-10: a refused action has no side effect - no window write, no renewal, no say, no assistant event, no silence bookkeeping", async () => {
+    const effects: string[] = [];
+    const lines: string[] = [];
+    const observer: ReplyObserver = { replySent: () => { effects.push("assistantEvents"); } };
+    await withConnector(async (h) => {
+      for (const content of ["hello", SILENCE_SENTINEL, "`bot_gender` leaks"]) {
+        const { result } = await ask(h, GW, { op: "send", chat_id: "C2", content, metadata: { expects_reply: true } });
+        assert.deepEqual(result, { success: false, error: CHAT_NOT_IN_SCOPE });
+        const toInterview = await ask(h, GW, { op: "send", chat_id: "CI", content });
+        assert.deepEqual(toInterview.result, { success: false, error: CHAT_NOT_IN_SCOPE });
+      }
+      assert.deepEqual(effects, []);
+      assert.equal(telegramCalls(h.telegram), 0);
+      assert.ok(!lines.some((l) => l.includes("companion_stayed_silent") || l.includes("internal_leak") || l.includes("agent_send")), "none of the later branches ran");
+    }, {
+      routes: { C2: other, CI: interview },
+      interviewerProfile: INTERVIEWER,
+      setExpectsReply: async () => { effects.push("setExpectsReply"); },
+      renewConversation: async () => { effects.push("renewConversation"); },
+      interviewSay: async () => { effects.push("interviewSay"); return true; },
+      assistantEvents: observer,
+      log: (l) => lines.push(l),
+    });
+  });
+
+  test("AC-8: the refusal line carries op, gateway, a digest of the chat, its kind and the route kind - never the raw chat id or anything of the message", async () => {
+    const lines: string[] = [];
+    await withConnector(async (h) => {
+      for (const chat of ["-100987654", "424242"]) {
+        for (const op of OPS) await ask(h, GW, op.action(chat));
+      }
+      const logged = refusedIn(lines);
+      assert.equal(logged.length, 8);
+      assert.deepEqual(logged.slice(0, 4).map((l) => l.op), ["send", "edit", "typing", "get_chat_info"]);
+      for (const [i, line] of logged.entries()) {
+        const group = i < 4;
+        assert.equal(line.level, "warn");
+        assert.equal(line.gateway_id, GW);
+        assert.equal(line.chat_ref, digestTelegramId(group ? "-100987654" : "424242"), "the digest form CHAT_DIGEST_SQL matches");
+        assert.equal(line.chat_kind, group ? "group" : "private");
+        assert.equal(line.route_kind, "companion");
+        assert.equal(typeof line.reason, "string");
+        assert.deepEqual(Object.keys(line).sort(), ["chat_kind", "chat_ref", "event", "gateway_id", "level", "op", "reason", "route_kind"]);
+      }
+      const raw = lines.filter((l) => l.includes("relay.outbound_out_of_scope")).join("\n");
+      for (const secret of ["SECRET-TEXT", "REPLY-9", "MSG-12", OTHER, "100987654", "424242"]) {
+        assert.ok(!raw.includes(secret), `the line must not contain ${secret}`);
+      }
+    }, { routes: { "-100987654": other, "424242": other }, log: (l) => lines.push(l) });
+  });
+
+  test("AC-8: every route kind logs its own route_kind", async () => {
+    const lines: string[] = [];
+    await withConnector(async (h) => {
+      for (const chat of ["R1", "R2", "R3", "R4"]) await ask(h, GW, { op: "typing", chat_id: chat });
+      assert.deepEqual(refusedIn(lines).map((l) => l.route_kind), ["companion", "companion_no_profile", "interview", "unbound"]);
+    }, { routes: { R1: other, R2: noProfile, R3: interview, R4: unbound }, log: (l) => lines.push(l) });
+  });
+
+  test("AC-7: a route lookup that never answers is bounded: SCOPE_CHECK_FAILED, exactly one result, nothing reaches Telegram", async () => {
+    const lines: string[] = [];
+    await withConnector(async (h) => {
+      for (const op of OPS) {
+        const started = Date.now();
+        const { ws, frames } = await dial(h.port, makeUpgradeToken(GW, SECRET, 300));
+        sendFrame(ws, { type: "outbound", requestId: `hang_${op.name}`, action: op.action("C1") });
+        const reply = await waitFor(() => frames.find((f) => f.type === "outbound_result"), 3000);
+        assert.deepEqual(reply.result, { success: false, error: SCOPE_CHECK_FAILED }, op.name);
+        assert.ok(Date.now() - started < 2500, "answered within the bound, not at the gateway's own timeout");
+        await new Promise((r) => setTimeout(r, 100));
+        assert.equal(frames.filter((f) => f.type === "outbound_result").length, 1, "exactly one result");
+        ws.close();
+      }
+      assert.equal(telegramCalls(h.telegram), 0);
+      const logged = refusedIn(lines);
+      assert.equal(logged.length, 4);
+      assert.ok(logged.every((l) => l.route_kind === "lookup_failed" && l.reason === "route_lookup_timeout"));
+    }, { resolveRoute: () => new Promise<ChatRoute>(() => {}), scopeLookupTimeoutMs: 200, log: (l) => lines.push(l) });
+  });
+
+  test("AC-7: every outbound frame gets exactly one outbound_result, refused or not", async () => {
+    await withConnector(async (h) => {
+      const { ws, frames } = await dial(h.port, makeUpgradeToken(GW, SECRET, 300));
+      const ids = ["a", "b", "c", "d", "e"];
+      const chats = ["C1", "C2", "CU", "CX", "C1"]; // own, other, unbound, lookup throws, own
+      ids.forEach((id, i) => sendFrame(ws, { type: "outbound", requestId: id, action: { op: "typing", chat_id: chats[i] } }));
+      await waitFor(() => (frames.filter((f) => f.type === "outbound_result").length >= 5 ? true : undefined));
+      await new Promise((r) => setTimeout(r, 100));
+      const results = frames.filter((f) => f.type === "outbound_result");
+      assert.deepEqual(results.map((f) => f.requestId).sort(), ids);
+      const byId = Object.fromEntries(results.map((f) => [f.requestId as string, f.result]));
+      assert.deepEqual(byId.a, { success: true });
+      assert.deepEqual(byId.b, { success: false, error: CHAT_NOT_IN_SCOPE });
+      assert.deepEqual(byId.c, { success: false, error: CHAT_NOT_IN_SCOPE });
+      assert.deepEqual(byId.d, { success: false, error: SCOPE_CHECK_FAILED });
+      assert.deepEqual(byId.e, { success: true });
+      ws.close();
+    }, {
+      resolveRoute: async (chat) => {
+        if (chat === "CX") throw new Error("boom");
+        const routes: Record<string, ChatRoute> = { C1: own, C2: other, CU: unbound };
+        return routes[chat] ?? unbound;
+      },
+    });
+  });
+
+  test("identity is the upgrade token's: a hello or frame field naming another profile changes nothing", async () => {
+    await withConnector(async (h) => {
+      const { ws, frames } = await dial(h.port, makeUpgradeToken(GW, SECRET, 300));
+      sendFrame(ws, { type: "hello", platform: "telegram", profile: OTHER, gateway_id: OTHER, botId: "1" });
+      await waitFor(() => frames.find((f) => f.type === "descriptor"));
+      sendFrame(ws, {
+        type: "outbound", requestId: "x1", profile: OTHER, gateway_id: OTHER,
+        action: { op: "send", chat_id: "C2", content: "hello", profile: OTHER, gateway_id: OTHER, hermes_profile: OTHER },
+      });
+      const reply = await waitFor(() => frames.find((f) => f.type === "outbound_result"));
+      assert.deepEqual(reply.result, { success: false, error: CHAT_NOT_IN_SCOPE });
+      assert.deepEqual(h.telegram.sent, []);
+      ws.close();
+    }, { routes: { C2: other } });
+  });
+
+  test("the interviewer keeps its own private chat after the interview is confirmed and before the companion is bound; a companion does not", async () => {
+    await withConnector(async (h) => {
+      // The interviewer's send goes to Telegram directly: the session is over, there is no router turn to convert it into.
+      const mine = await ask(h, INTERVIEWER, { op: "send", chat_id: "HO", content: "your trip is being built" });
+      assert.deepEqual(mine.result, { success: true, message_id: "555" });
+      assert.equal(h.telegram.sent.length, 1);
+      assert.equal((await ask(h, MULTIPLEX, { op: "typing", chat_id: "HO" })).result.success, true);
+      for (const op of OPS) {
+        assert.deepEqual((await ask(h, GW, op.action("HO"))).result, { success: false, error: CHAT_NOT_IN_SCOPE }, `${op.name} by a companion`);
+      }
+      assert.equal(h.telegram.sent.length, 1, "the companion's actions reached nothing");
+    }, { routes: { HO: { kind: "interview_handover" } }, interviewerProfile: INTERVIEWER, fallbackGatewayId: MULTIPLEX });
+  });
+
+  test("Decision 3: while the organizer's private chat is mid-interview, a group of the same trip keeps working; only that private chat refuses the companion", async () => {
+    const trip = "t-colmar";
+    const privateChat = "700"; // the organizer's DM: a live interview session
+    const group = "-1001"; // a group bound to the same trip, companion installed
+    await withConnector(async (h) => {
+      for (const op of OPS) {
+        const inGroup = await ask(h, GW, op.action(group));
+        assert.equal(inGroup.result.success, true, `${op.name} in the group`);
+        const inPrivate = await ask(h, GW, op.action(privateChat));
+        assert.deepEqual(inPrivate.result, { success: false, error: CHAT_NOT_IN_SCOPE }, `${op.name} in the private chat`);
+      }
+      assert.equal(h.telegram.sent.length, 1);
+      assert.equal(h.telegram.sent[0]!.chatId, group);
+      // ...and the interviewer's own gateway is the one that speaks in the private chat.
+      const interviewer = await ask(h, INTERVIEWER, { op: "typing", chat_id: privateChat });
+      assert.equal(interviewer.result.success, true);
+    }, {
+      routes: {
+        [privateChat]: { kind: "interview", sessionId: "s1", tripId: trip },
+        [group]: { kind: "companion", tripId: trip, hermesProfile: GW, assistantNames: [] },
+      },
+      interviewerProfile: INTERVIEWER,
+    });
+  });
+});
+
+describe("RelayConnector - a gateway whose id matches no interviewer identity and no bound companion is warned about, once", () => {
+  const unmatched = (lines: string[]) =>
+    lines.filter((l) => l.includes("relay.gateway_identity_unmatched")).map((l) => JSON.parse(l) as Record<string, unknown>);
+  const settle = () => new Promise((r) => setTimeout(r, 150));
+
+  test("the VM shape - interviewer gateway `kinerary-trip-intake`, interviewer_profile `trip-intake`, no multiplex id - logs exactly one warning, however often it reconnects, and routing is untouched", async () => {
+    const lines: string[] = [];
+    await withConnector(async (h) => {
+      for (let i = 0; i < 3; i += 1) {
+        const { ws } = await dial(h.port, makeUpgradeToken("kinerary-trip-intake", SECRET, 300));
+        await waitFor(() => (h.connector.connectedGateways === 1 ? true : undefined));
+        await settle();
+        ws.close();
+        await waitFor(() => (h.connector.connectedGateways === 0 ? true : undefined));
+      }
+      const warned = unmatched(lines);
+      assert.equal(warned.length, 1);
+      assert.deepEqual(Object.keys(warned[0]!).sort(), ["event", "gateway_id", "level", "reason"]);
+      assert.equal(warned[0]!.level, "warn");
+      assert.equal(warned[0]!.gateway_id, "kinerary-trip-intake");
+      assert.equal(typeof warned[0]!.reason, "string");
+      // A warning only: the gateway still connects and is still reachable under its own id.
+      const { ws } = await dial(h.port, makeUpgradeToken("kinerary-trip-intake", SECRET, 300));
+      await waitFor(() => (h.connector.canReachProfile("kinerary-trip-intake") ? true : undefined));
+      ws.close();
+    }, { interviewerProfile: "trip-intake", profileHasOpenBinding: async () => false, log: (l) => lines.push(l) });
+  });
+
+  test("a matching id logs nothing: the interviewer profile, the multiplex id, a companion with an open binding", async () => {
+    const lines: string[] = [];
+    const asked: string[] = [];
+    await withConnector(async (h) => {
+      for (const id of ["trip-intake", "kinerary-mux", "companion-colmar"]) {
+        const { ws } = await dial(h.port, makeUpgradeToken(id, SECRET, 300));
+        await waitFor(() => (h.connector.canReachProfile(id) ? true : undefined));
+        await settle();
+        ws.close();
+      }
+      assert.deepEqual(unmatched(lines), []);
+      assert.deepEqual(asked, ["companion-colmar"], "the database is asked only for an id that is neither interviewer identity");
+    }, {
+      interviewerProfile: "trip-intake",
+      fallbackGatewayId: "kinerary-mux",
+      profileHasOpenBinding: async (profile) => { asked.push(profile); return profile === "companion-colmar"; },
+      log: (l) => lines.push(l),
+    });
+  });
+
+  test("a failed binding lookup logs no warning and breaks nothing; with no lookup configured nothing is judged", async () => {
+    const lines: string[] = [];
+    await withConnector(async (h) => {
+      const { ws } = await dial(h.port, makeUpgradeToken("anything", SECRET, 300));
+      await waitFor(() => (h.connector.connectedGateways === 1 ? true : undefined));
+      await settle();
+      assert.deepEqual(unmatched(lines), []);
+      ws.close();
+    }, { profileHasOpenBinding: async () => { throw new Error("db down"); }, log: (l) => lines.push(l) });
+    const quiet: string[] = [];
+    await withConnector(async (h) => {
+      const { ws } = await dial(h.port, makeUpgradeToken("anything", SECRET, 300));
+      await waitFor(() => (h.connector.connectedGateways === 1 ? true : undefined));
+      await settle();
+      assert.deepEqual(unmatched(quiet), []);
+      ws.close();
+    }, { log: (l) => quiet.push(l) });
   });
 });

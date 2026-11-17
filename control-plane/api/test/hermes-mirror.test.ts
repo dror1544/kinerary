@@ -19,6 +19,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { describe, test } from "node:test";
 import { WebSocket } from "ws";
+import type { ChatRoute } from "../src/chat-router.js";
+import { CHAT_NOT_IN_SCOPE, SCOPE_CHECK_FAILED } from "../src/relay/outbound-scope.js";
 import { GATEWAY_TIMEOUT_ERROR, RelayConnector } from "../src/relay/connector.js";
 import { detectInternalLeak } from "../src/relay/internal-leak.js";
 import {
@@ -64,9 +66,13 @@ class FakeTelegram {
 }
 
 /** One outbound frame, sent the way the gateway sends it (`json.dumps(frame) + "\n"`). */
-async function outbound(frame: Record<string, unknown>): Promise<{ result: Record<string, unknown> | null; telegram: FakeTelegram }> {
+async function outbound(
+  frame: Record<string, unknown>,
+  // The chat is the calling gateway's own unless a test says otherwise.
+  resolveRoute: (chatId: string) => Promise<ChatRoute> = async () => ({ kind: "companion", tripId: "trip-1", hermesProfile: "gw_1", assistantNames: [] }),
+): Promise<{ result: Record<string, unknown> | null; telegram: FakeTelegram }> {
   const telegram = new FakeTelegram();
-  const connector = new RelayConnector({ gatewaySecrets: [SECRET], telegram: telegram as never, port: 0 });
+  const connector = new RelayConnector({ gatewaySecrets: [SECRET], telegram: telegram as never, port: 0, resolveRoute });
   await connector.listen();
   const port = connector.address;
   assert.ok(port, "connector should have bound a port");
@@ -242,6 +248,22 @@ describe("the Hermes mirror fixture (#380)", () => {
     const echoed = await outbound({ ...extraFrame, action: { op: "send", chat_id: "900", content: "hello", metadata } });
     assert.deepEqual(echoed.result, plain.result);
     assert.deepEqual(echoed.telegram.sent, plain.telegram.sent, "the extra fields changed what reached Telegram");
+  });
+
+  test("outbound scope (AC-9): the refusal words the gateway receives are neither a timeout nor retryable to Hermes, so a refused action is not retried or re-sent", async () => {
+    const refusals: Array<[string, (chatId: string) => Promise<ChatRoute>]> = [
+      [CHAT_NOT_IN_SCOPE, async () => ({ kind: "unbound" })],
+      [SCOPE_CHECK_FAILED, async () => { throw new Error("lookup failed"); }],
+    ];
+    for (const [word, resolveRoute] of refusals) {
+      for (const op of ["send", "edit", "typing", "get_chat_info"]) {
+        const { result, telegram } = await outbound({ action: { op, chat_id: "900", content: "hello", message_id: "7" } }, resolveRoute);
+        assert.deepEqual(result, { success: false, error: word }, `${op}: the word on the wire`);
+        assert.equal(hermesIsTimeout(word), false, `${word} must not read as a timeout`);
+        assert.equal(hermesIsRetryable(word), false, `${word} must not be retried (fixture retryable_substrings ${JSON.stringify(mirror.error_classifier.retryable_substrings)})`);
+        assert.equal(telegram.sent.length, 0);
+      }
+    }
   });
 
   test("AC-5: the fixture describes the revision the patch set is based on (hermes-patches/BASE_REV)", () => {
