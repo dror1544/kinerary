@@ -261,6 +261,7 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
     const row = findSecondary.get(subject.userId, identity.tripId);
     return Boolean(row && row.username === payload.username);
   }
-  return { validManagedPayload, dashboardUrlFor, dashboardUrlForOrganizer, isSecondaryOrganizerPayload, isSecondaryUsername };
+  // `internal` is exported so a second module can mount a route behind the same gate (the plan-changes read, video Release 1C).
+  return { internal, validManagedPayload, dashboardUrlFor, dashboardUrlForOrganizer, isSecondaryOrganizerPayload, isSecondaryUsername };
 }
 module.exports = { createControlPlaneAuth, safeDashboardUrl, safePortalOrigin };

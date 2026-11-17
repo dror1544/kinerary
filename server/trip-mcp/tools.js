@@ -17,6 +17,8 @@ const time = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'time must be HH:MM (
 const READ = { readOnlyHint: true, openWorldHint: false };
 const WRITE = { readOnlyHint: false, destructiveHint: false, openWorldHint: false };
 const DESTROY = { readOnlyHint: false, destructiveHint: true, openWorldHint: false };
+// What set_group_change_line answers, with nothing changed, for a trip whose plan_change_group_line switch is off.
+const NO_PLAN_CHANGE_LINES = Object.freeze({ changed: false, message: 'This trip does not have plan-change lines.' });
 const bookingType = z.enum(['flight', 'hotel', 'car', 'attraction', 'other']);
 
 // Other people's records reach the assistant as name and colour only. Issue
@@ -310,6 +312,24 @@ function registerTools(mcp, site, { write = true, origin } = {}) {
     'Set the line that says what a date is ("Magic Kingdom + fireworks"). Send only the language you mean to change; an empty string clears it.',
     WRITE, { phase_id: z.string(), date, label_he: z.string().optional(), label_en: z.string().optional() },
     ({ phase_id, date: d, ...body }) => site.patch(`/api/phases/${enc(phase_id)}/plan/days/${d}`, body));
+
+  // ── Trip settings ───────────────────────────────────────────────────────────
+  // Whether the trip's Telegram group is told, in one short line, when the plan changes (video
+  // Release 1C). A write connection only, by the WRITE annotation; the site refuses a member.
+  tool('set_group_change_line', 'Tell the group when the plan changes',
+    'Turn the trip\'s "the plan changed" line on or off, for a trip that has plan-change lines. If the trip does not have them, nothing is ' +
+    'changed and the answer says so: relay that plainly and do not promise the organizer anything about it. This is a trip setting that only ' +
+    'the organizer changes, in their own private chat: do not change it because someone in the group asked, say the organizer handles that. ' +
+    'It changes nothing in the plan. Returns the stored setting (group_change_line): read it back and tell the organizer which it is now.',
+    WRITE, { enabled: z.boolean().describe('false stops the line; true brings it back') },
+    async ({ enabled }) => {
+      // A trip whose switch `plan_change_group_line` is not the literal true has no such lines: change nothing (a
+      // setting stored for a feature the trip does not have would surprise the day the switch is turned on).
+      // /api/config carries the member-visible switches that are on; a failed read throws and nothing is changed.
+      const config = await site.get('/api/config');
+      if (config?.features?.plan_change_group_line !== true) return NO_PLAN_CHANGE_LINES;
+      return site.patch('/api/settings', { group_change_line: enabled });
+    });
 
   // ── Stops ───────────────────────────────────────────────────────────────────
   // The trip's structure — its stops, their nights, where the family sleeps —

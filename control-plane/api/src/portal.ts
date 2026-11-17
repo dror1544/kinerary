@@ -28,6 +28,7 @@ import {
   type SessionScope,
 } from "./portal-scope.js";
 import { verifyMiniAppInitData, type VerifiedInitData } from "./telegram-webapp-auth.js";
+import { runtimeUpstreamFor } from "./runtime-upstream.js";
 
 // The gateway's key, compared in constant time (a plain !== leaks how many
 // leading bytes were right).
@@ -1940,23 +1941,9 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
   app.get("/internal/runtime-routes/:tripId", async (request, reply) => {
     if (!exchangeKeyMatches(request.headers["x-api-key"], deps.runtimeExchangeKey)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
     const tripId = (request.params as { tripId?: string }).tripId ?? "";
-    const result = await deps.db.query<{ route_ref: string; private_url: string | null }>(
-      `SELECT r.route_ref, j.result->>'private_url' AS private_url
-       FROM control_plane.runtime_routes r
-       LEFT JOIN LATERAL (
-         SELECT result FROM control_plane.jobs
-         WHERE trip_id = r.trip_id AND state = 'succeeded' AND result ? 'private_url'
-         ORDER BY updated_at DESC LIMIT 1
-       ) j ON true
-       WHERE r.trip_id = $1 AND r.state = 'ready'`, [tripId]);
-    const row = result.rows[0];
-    if (!row?.private_url) return reply.code(404).send({ error: "RUNTIME_NOT_READY" });
-    let upstream: URL;
-    try { upstream = new URL(row.private_url); } catch { return reply.code(503).send({ error: "RUNTIME_ROUTE_INVALID" }); }
-    const allowed = deps.runtimeUpstreamHostSuffixes.some((suffix) => upstream.hostname === suffix || upstream.hostname.endsWith(`.${suffix}`));
-    if (!["http:", "https:"].includes(upstream.protocol) || upstream.username || upstream.password || upstream.search || upstream.hash || !allowed) {
-      return reply.code(503).send({ error: "RUNTIME_ROUTE_INVALID" });
-    }
-    return { routeRef: row.route_ref, upstreamOrigin: upstream.origin, upstreamBasePath: upstream.pathname.replace(/\/$/, "") };
+    // One lookup, shared with the group-line poller (runtime-upstream.ts), so both apply the same host allow-list.
+    const upstream = await runtimeUpstreamFor(deps.db, tripId, deps.runtimeUpstreamHostSuffixes);
+    if (!upstream.ok) return reply.code(upstream.status).send({ error: upstream.error });
+    return { routeRef: upstream.routeRef, upstreamOrigin: upstream.upstreamOrigin, upstreamBasePath: upstream.upstreamBasePath };
   });
 }

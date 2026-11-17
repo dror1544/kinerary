@@ -900,6 +900,10 @@ textarea { min-height: 132px; resize: vertical; }
   .readiness-row small { grid-column: 2; text-align: start; }
 }
 
+.group-line-toggle { margin-top: 18px; }
+.group-line-toggle label { display: flex; align-items: center; gap: 10px; min-height: 44px; font-weight: 700; cursor: pointer; }
+.group-line-toggle input { width: 22px; height: 22px; }
+.group-line-toggle p { margin: 6px 0 0; color: var(--kit-ink-soft); }
 .member-logins { margin-top: 18px; }
 .member-logins h3 { margin: 0 0 4px; font: 800 20px/1.2 var(--kit-font-display); }
 .member-logins p { margin: 0 0 12px; color: var(--kit-ink-soft); line-height: 1.6; }

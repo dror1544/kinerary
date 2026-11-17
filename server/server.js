@@ -1241,7 +1241,7 @@ app.post('/api/ui-settings/hero', organizerOrAgentRequired, heroUpload.single('h
   res.json(journey.uiSettings());
 });
 
-journey.registerRoutes(app, { authRequired, organizerOrAgentRequired });
+journey.registerRoutes(app, { authRequired, organizerOrAgentRequired, internal: controlPlaneAuth.internal });
 // GET /api/stops and the stop writes: organizer or agent only — provenance,
 // conflicts and history are never served to a member.
 tripStructure.registerRoutes(app, { organizerOrAgentRequired });

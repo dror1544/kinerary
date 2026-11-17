@@ -17,6 +17,13 @@ export interface TelegramAdapterConfig {
   superAdminChatId: string;
   db: pg.Pool;
   log?: (line: string) => void;
+  /**
+   * Where the Bot API lives. Absent is `https://api.telegram.org`. Every request to it carries the BOT TOKEN
+   * in its path, so a caller takes it from `telegramApiRoot(process.env.TELEGRAM_API_ROOT)` (relay/telegram-api.ts),
+   * which refuses anything but https or plain http to this machine; the adapter does not re-validate it.
+   * It exists so an outbox send can be pointed at the Bot API stand-in (tools/fake-telegram.ts).
+   */
+  apiRoot?: string;
 }
 
 /**
@@ -26,7 +33,11 @@ export interface TelegramAdapterConfig {
  * ~190-200 bytes, well over Telegram's 64-byte callback_data limit.
  */
 export class TelegramNotificationAdapter implements NotificationAdapter {
-  constructor(private readonly config: TelegramAdapterConfig) {}
+  private readonly apiRoot: string;
+
+  constructor(private readonly config: TelegramAdapterConfig) {
+    this.apiRoot = (config.apiRoot ?? TELEGRAM_API_ROOT).replace(/\/+$/, "");
+  }
 
   async sendApprovalRequest(params: {
     requestId: string;
@@ -69,7 +80,7 @@ export class TelegramNotificationAdapter implements NotificationAdapter {
       },
     };
 
-    const response = await fetch(`${TELEGRAM_API_ROOT}/bot${this.config.botToken}/sendMessage`, {
+    const response = await fetch(`${this.apiRoot}/bot${this.config.botToken}/sendMessage`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
@@ -104,7 +115,7 @@ export class TelegramNotificationAdapter implements NotificationAdapter {
     parseMode?: "HTML";
     plainText?: string;
   }): Promise<void> {
-    const post = (body: Record<string, unknown>) => fetch(`${TELEGRAM_API_ROOT}/bot${this.config.botToken}/sendMessage`, {
+    const post = (body: Record<string, unknown>) => fetch(`${this.apiRoot}/bot${this.config.botToken}/sendMessage`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
