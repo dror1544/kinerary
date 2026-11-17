@@ -539,6 +539,18 @@ Answered by Dror, 2026-11-16:
 14. **The exchange-key finding is handled on its own after the Alsace trip** (from 2026-12-07), with no change
     in 1C.
 
+15. **Hebrew lines are gender-neutral** (Dror, 2026-11-17). The templates lead with a noun ("שינוי בתוכנית:
+    ‹title› — עכשיו ב-19:30") instead of a verb that agrees with the title; "עברה" read wrong for masculine
+    titles such as "ביקור". English follows the same shape ("Plan change: ‹title› — now at 19:30"). This
+    replaces the fixed Hebrew templates under Behaviour.
+
+16. **A date always carries the date, not the weekday alone** (Dror, 2026-11-17): "Thursday, Dec 3" / "יום
+    חמישי, 3 בדצמבר", never YYYY-MM-DD. A weekday alone was ambiguous for a change more than six days ahead.
+
+17. **`trip_organizer` (a direct message to the organizer, AC-5) is not built in Release 1** (Dror,
+    2026-11-17). The database CHECK still allows the value, so adding it later needs no migration; until then a
+    row carrying it ends `skipped (target_unsupported)`.
+
 ## Open questions
 
 None open.
