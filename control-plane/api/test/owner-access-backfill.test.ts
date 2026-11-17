@@ -21,7 +21,7 @@ async function reset(client: pg.PoolClient) {
   await client.query("DROP TABLE IF EXISTS public.control_plane_schema_migrations");
 }
 
-test("the owner-access backfill flips active f/f owners only, and a rerun changes nothing", { skip }, async () => {
+test("the owner-access backfill flips active f/f owners of live trips only, and a rerun changes nothing", { skip }, async () => {
   const pool = testPool();
   const client = await pool.connect();
   try {
@@ -51,6 +51,13 @@ test("the owner-access backfill flips active f/f owners only, and a rerun change
         [opaque("memb", u), opaque("user", u), role, status, d, r],
       );
     }
+    // A torn-down trip keeps its owner's membership active (teardown-trip.py); the backfill leaves it alone.
+    await client.query("INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ('trip_oab00002', 'retired-oab-2-20261101', 'draft')");
+    await client.query("INSERT INTO control_plane.users(id, status, display_name) VALUES ($1, 'active', 'owner_retired')", [opaque("user", "owner_retired")]);
+    await client.query(
+      "INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status, dashboard_access, runtime_access) VALUES ($1, 'trip_oab00002', $2, 'owner', 'active', false, false)",
+      [opaque("memb", "owner_retired"), opaque("user", "owner_retired")],
+    );
     const snapshot = async () => (await client.query(
       "SELECT user_id, role, status, dashboard_access d, runtime_access r FROM control_plane.trip_memberships ORDER BY user_id")).rows;
     const before = await snapshot();

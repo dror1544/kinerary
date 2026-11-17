@@ -9,10 +9,16 @@
 --
 -- Scope is deliberately narrow: role = 'owner' AND status = 'active' AND both flags false. Secondary organizers
 -- (role 'organizer') are dashboard_access = false on purpose (secondary-organizers.ts), and members never get
--- dashboard access, so neither is touched. Re-running changes nothing: no row matches once it has run.
-UPDATE control_plane.trip_memberships
+-- dashboard access, so neither is touched. A torn-down trip (slug renamed `retired-…`, or a binding closed
+-- 'trip_destroyed') is left as it is: teardown keeps the owner's membership active, and granting access to a trip
+-- that no longer exists would only reopen routes that do not check retirement. Re-running changes nothing: no row
+-- matches once it has run.
+UPDATE control_plane.trip_memberships m
 SET dashboard_access = true, runtime_access = true
-WHERE role = 'owner'
-  AND status = 'active'
-  AND dashboard_access = false
-  AND runtime_access = false;
+WHERE m.role = 'owner'
+  AND m.status = 'active'
+  AND m.dashboard_access = false
+  AND m.runtime_access = false
+  AND NOT EXISTS (SELECT 1 FROM control_plane.trips t WHERE t.id = m.trip_id AND t.slug LIKE 'retired-%')
+  AND NOT EXISTS (SELECT 1 FROM control_plane.telegram_chat_bindings d
+                   WHERE d.trip_id = m.trip_id AND d.closed_reason = 'trip_destroyed');
