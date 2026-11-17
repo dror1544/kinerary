@@ -542,12 +542,14 @@ describe("feature switches (S1)", { skip: SKIP }, () => {
         assert.equal(body.trip.id, TRIP_A);
         assert.deepEqual(
           body.switches.map((s: { name: string; enabled: boolean; source: string }) => [s.name, s.enabled, s.source]),
-          [[SWITCH, true, "trip"]],
+          // Every registered switch is in the view; only the one this test set is on. (The registry has grown past
+          // delivery_probe, so this reads the names from it instead of assuming there is one.)
+          FEATURE_SWITCHES.map((s) => (s.name === SWITCH ? [SWITCH, true, "trip"] : [s.name, false, "default"])),
         );
 
         const list = await app.inject({ method: "GET", url: "/v1/admin/feature-switches", headers });
         assert.equal(list.statusCode, 200);
-        assert.deepEqual(JSON.parse(list.body).switches.map((s: { name: string }) => s.name), [SWITCH]);
+        assert.deepEqual(JSON.parse(list.body).switches.map((s: { name: string }) => s.name), FEATURE_SWITCHES.map((s) => s.name));
 
         const unknownTrip = await app.inject({ method: "GET", url: "/v1/admin/feature-switches?trip=no-such-trip", headers });
         assert.equal(unknownTrip.statusCode, 404);
