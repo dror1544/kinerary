@@ -118,6 +118,47 @@ class TeardownInterpreterTests(unittest.TestCase):
         self.assertEqual(argv[:2], [sys.executable, "/somewhere/other-teardown.py"])
 
 
+class TeardownIsRunAgainAfterAFailure(unittest.TestCase):
+    """A teardown that fails part-way is run again, after a pause, up to TEARDOWN_ATTEMPTS times.
+
+    teardown-trip.py reads what is left before each step, so a second run carries on where the first stopped.
+    On 2026-11-18 one SSH connect to the Proxmox host timed out mid-teardown and failed the night; the same
+    command finished cleanly later that day.
+    """
+
+    def setUp(self) -> None:
+        self.mod = load()
+
+    def run_with(self, codes: list[int]) -> tuple[int, int, list[float]]:
+        calls: list[list[str]] = []
+        sleeps: list[float] = []
+
+        def fake_run(argv, *a, **kw):
+            calls.append(list(argv))
+            return mock.Mock(returncode=codes[len(calls) - 1])
+
+        with mock.patch.dict(os.environ, {"KINERARY_TEARDOWN": ""}, clear=False), \
+                mock.patch.object(self.mod.subprocess, "run", fake_run), \
+                mock.patch.object(self.mod.time, "sleep", sleeps.append):
+            code = self.mod.stage_teardown({"trip_id": "trip_deadbeef"})
+        self.assertTrue(all(call[-3:] == ["--trip", "trip_deadbeef", "--execute"] for call in calls),
+                        "every attempt removes the same trip, by its id")
+        return code, len(calls), sleeps
+
+    def test_a_failure_then_a_success_passes(self) -> None:
+        code, attempts, sleeps = self.run_with([1, 0])
+        self.assertEqual((code, attempts), (0, 2))
+        self.assertEqual(sleeps, [self.mod.TEARDOWN_RETRY_SECONDS])
+
+    def test_it_gives_up_after_the_last_attempt_and_reports_the_failure(self) -> None:
+        code, attempts, sleeps = self.run_with([1] * self.mod.TEARDOWN_ATTEMPTS)
+        self.assertEqual((code, attempts), (1, self.mod.TEARDOWN_ATTEMPTS))
+        self.assertEqual(len(sleeps), self.mod.TEARDOWN_ATTEMPTS - 1, "no pause after the last attempt")
+
+    def test_a_clean_teardown_runs_once_with_no_pause(self) -> None:
+        self.assertEqual(self.run_with([0]), (0, 1, []))
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -2572,6 +2572,10 @@ def run_scenario(scenario: str, args: argparse.Namespace, auto: "Auto | None", c
         return 1
 
 
+TEARDOWN_ATTEMPTS = 3
+TEARDOWN_RETRY_SECONDS = 60
+
+
 def stage_teardown(ctx: dict) -> int:
     """Only ever the trip this run signed up — its id came back from /v1/signup
     above. Anything that existed before the run is not this function's to touch."""
@@ -2596,11 +2600,19 @@ def stage_teardown(ctx: dict) -> int:
     # works. A shell's PATH no longer decides. The `.py` test is deliberate:
     # the VM's twin is a shell script and must keep being run as itself.
     argv = [sys.executable, script] if script.endswith(".py") else [script]
-    result = subprocess.run([*argv, "--trip", ctx["trip_id"], "--execute"])
-    if result.returncode == 0:
-        ok(f"{ctx['trip_id']} torn down")
-    else:
-        print(f"  {RED}✗{RESET} teardown exited {result.returncode} — see above; the trip may be half-removed")
+    # A teardown that fails part-way is run again. It picks up where it stopped (every step reads what is left
+    # before acting), so a second run is safe, and a short outage no longer fails the night: on 2026-11-18 one
+    # SSH connect to the Proxmox host timed out mid-teardown, and the same command finished cleanly hours later.
+    for attempt in range(1, TEARDOWN_ATTEMPTS + 1):
+        result = subprocess.run([*argv, "--trip", ctx["trip_id"], "--execute"])
+        if result.returncode == 0:
+            ok(f"{ctx['trip_id']} torn down" + (f" (attempt {attempt})" if attempt > 1 else ""))
+            return 0
+        if attempt < TEARDOWN_ATTEMPTS:
+            note(f"teardown exited {result.returncode} — running it again in {TEARDOWN_RETRY_SECONDS}s "
+                 f"(attempt {attempt + 1} of {TEARDOWN_ATTEMPTS})")
+            time.sleep(TEARDOWN_RETRY_SECONDS)
+    print(f"  {RED}✗{RESET} teardown exited {result.returncode} — see above; the trip may be half-removed")
     return result.returncode
 
 
