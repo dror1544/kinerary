@@ -102,11 +102,19 @@ SIDECAR_KEY="$(grep -A8 "interview:" "${HOME}/.hermes/profiles/trip-intake/confi
 [ -n "$SIDECAR_KEY" ] || die "could not read the sidecar's own X-API-Key from trip-intake/config.yaml"
 
 # ── 3. Restart the control-plane API, WITH the key sourced ──────────────────
+# KINERARY_COMPOSE_OVERRIDE is the deployment's own compose file, layered on top
+# exactly as preflight-deploy.sh layers it. Recreating the API from
+# compose.local.yml alone drops whatever that file adds: on 2026-11-18 the
+# nightly's run of this script left Mac staging without its portal settings, and
+# the Mini App's sign-in route answered 404 until staging-up.sh put them back.
 step "Restarting control-plane API"
+[ -z "${KINERARY_COMPOSE_OVERRIDE:-}" ] || [ -f "$KINERARY_COMPOSE_OVERRIDE" ] \
+  || die "KINERARY_COMPOSE_OVERRIDE is set but $KINERARY_COMPOSE_OVERRIDE does not exist"
 ( set -a; . "$PROVISIONING_ENV"; set +a
   cd "$DEPLOY_DIR"
   DOCKER_BUILDKIT=0 COMPOSE_DOCKER_CLI_BUILD=0 \
-    docker compose -f compose.local.yml up -d --no-build --force-recreate api
+    docker compose -f compose.local.yml ${KINERARY_COMPOSE_OVERRIDE:+-f "$KINERARY_COMPOSE_OVERRIDE"} \
+      up -d --no-build --force-recreate api
 ) || die "API restart failed"
 
 for _ in $(seq 1 20); do
