@@ -10,7 +10,7 @@ import { resolve } from "node:path";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { VideoHero } from "./App";
-import { COMPACT_PX, heroScrollState, MAX_PULL_PX } from "./hero-scroll";
+import { COMPACT_PX, heroGrowFor, heroScrollState, MAX_PULL_PX } from "./hero-scroll";
 
 const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
 const FULL = 200; // the header's height at rest
@@ -19,6 +19,11 @@ const STICK = FULL - COMPACT_PX;
 function scrollTo(y: number) {
   Object.defineProperty(window, "scrollY", { value: y, configurable: true });
   act(() => { window.dispatchEvent(new Event("scroll")); });
+}
+function touch(type: "touchstart" | "touchmove" | "touchend", y?: number) {
+  const event = new Event(type) as Event & { touches: Array<{ clientY: number }> };
+  event.touches = y === undefined ? [] : [{ clientY: y }];
+  act(() => { window.dispatchEvent(event); });
 }
 function reducedMotion(on: boolean) {
   vi.stubGlobal("matchMedia", (query: string) => ({ matches: on && query.includes("reduce"), media: query, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} }));
@@ -52,6 +57,12 @@ describe("heroScrollState", () => {
     expect(heroScrollState(-40, STICK, false)).toMatchObject({ progress: 0, compact: false, pull: 40 });
     expect(heroScrollState(-5000, STICK, false).pull).toBe(MAX_PULL_PX);
     expect(heroScrollState(-40, STICK, true).pull).toBe(0);
+  });
+  it("a finger pull grows the header by half its travel, capped; up or reduced motion grows nothing", () => {
+    expect(heroGrowFor(100, false)).toBe(50);
+    expect(heroGrowFor(5000, false)).toBe(MAX_PULL_PX);
+    expect(heroGrowFor(-30, false)).toBe(0);
+    expect(heroGrowFor(100, true)).toBe(0);
   });
   it("a header that has not been measured (no travel) never goes compact", () => {
     expect(heroScrollState(500, 0, false)).toMatchObject({ progress: 0, compact: false });
@@ -88,6 +99,35 @@ describe("the header follows the scroll", () => {
     expect(header).not.toHaveClass("is-compact");
     scrollTo(0);
     await waitFor(() => expect(header.style.getPropertyValue("--hero-pull")).toBe("0px"));
+  });
+
+  it("a finger pulling down at the top grows the header with it, and lets go when the finger lifts", () => {
+    const { header } = renderHero();
+    touch("touchstart", 100);
+    touch("touchmove", 220);
+    expect(header.style.getPropertyValue("--hero-grow")).toBe("60px");
+    expect(header.hasAttribute("data-pulling")).toBe(true); // no transition while the finger is down
+    touch("touchend");
+    expect(header.style.getPropertyValue("--hero-grow")).toBe("0px");
+    expect(header.hasAttribute("data-pulling")).toBe(false); // the CSS transition springs it back
+  });
+
+  it("a finger that starts below the top is an ordinary scroll and grows nothing", () => {
+    const { header } = renderHero();
+    scrollTo(300);
+    touch("touchstart", 100);
+    touch("touchmove", 220);
+    expect(header.style.getPropertyValue("--hero-grow")).toBe("");
+    expect(header.hasAttribute("data-pulling")).toBe(false);
+  });
+
+  it("a pull in progress is not counted as the header's own height", async () => {
+    const { header } = renderHero();
+    await waitFor(() => expect(header.style.getPropertyValue("--hero-stick")).toBe(`${STICK}px`));
+    touch("touchstart", 100);
+    touch("touchmove", 200);
+    act(() => { window.dispatchEvent(new Event("resize")); }); // offsetHeight is stubbed, so this re-measures FULL
+    expect(header.style.getPropertyValue("--hero-stick")).toBe(`${STICK - 50}px`);
   });
 
   it("reduced motion: no stretch, no gradual fade — full, then compact in one step", async () => {
@@ -135,6 +175,9 @@ describe("the stylesheet turns that state into pixels", () => {
     expect(header).toMatch(/top:\s*calc\(-1 \* var\(--hero-stick, 0px\)\)/);
     expect(header).not.toMatch(/(^|[\s;])(height|max-height):/);
     expect(header).toMatch(/overflow:\s*visible/); // so the photo can reach above it when pulled
+    expect(header).toContain("calc(20px + var(--hero-grow, 0px))"); // the finger pull grows its bottom padding
+    expect(header).toMatch(/transition:\s*padding-block-end/); // and it springs back
+    expect(css).toMatch(/\.video-layout \.video-hero\[data-pulling\] \{ transition: none; \}/);
   });
 
   it("the photo and its wash stretch upward by the pull; the big line fades with the progress", () => {

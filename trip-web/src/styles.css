@@ -1182,16 +1182,20 @@ textarea { min-height: 132px; resize: vertical; }
 /* Scroll behaviour (src/hero-scroll.ts). The header is sticky with a negative top equal to its own height minus the compact
    bar (--hero-stick, set from JS): its box never changes size, so nothing below it jumps; the browser scrolls it up with
    the page until only its top bar (logo, title, menu button) is left, and holds that. --hero-progress (0..1) fades the big
-   title line; --hero-pull (px, only while the page is pulled down at the top) stretches the photo and wash upward. */
+   title line; --hero-grow (px, while a finger pulls down at the top) adds to the bottom padding, so the photo takes more
+   of the screen, and springs back when the finger lifts; --hero-pull (px, while Safari bounces) reaches the photo and
+   wash up over the gap the bounce opens. */
 .video-layout .video-hero {
   position: sticky;
   top: calc(-1 * var(--hero-stick, 0px));
   z-index: 12;
   overflow: visible;
   min-height: 0;
-  padding-block: 14px 20px;
+  padding-block: 14px calc(20px + var(--hero-grow, 0px));
   background: linear-gradient(180deg, #0a625c, var(--kit-teal) 72%, #2fa99d);
+  transition: padding-block-end 360ms cubic-bezier(.2, .9, .25, 1);
 }
+.video-layout .video-hero[data-pulling] { transition: none; }
 .video-layout .video-hero.is-compact { box-shadow: 0 6px 18px rgba(16, 38, 58, .22); }
 .video-hero-photo { z-index: -3; inset-block-start: calc(-1 * var(--hero-pull, 0px)); background-size: cover; background-color: transparent; }
 .video-hero-wash { position: absolute; inset: 0; inset-block-start: calc(-1 * var(--hero-pull, 0px)); z-index: -2; }
@@ -1207,6 +1211,7 @@ textarea { min-height: 132px; resize: vertical; }
   /* No fade and no stretch (the pull is never applied from JS either): the big line is on, then off, in one step. */
   .video-layout .video-hero-copy { opacity: 1; }
   .video-layout .video-hero.is-compact .video-hero-copy { opacity: 0; }
+  .video-layout .video-hero { transition: none; }
 }
 .video-layout .video-hero-copy h1 { font: 800 clamp(24px, 6vw, 38px)/1.12 var(--kit-font-display); text-shadow: 0 2px 14px rgba(16, 38, 58, .3); overflow-wrap: anywhere; }
 .video-layout .topline { gap: 10px; min-height: 48px; }
