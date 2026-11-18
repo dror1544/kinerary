@@ -357,6 +357,48 @@ def registrable_domain(hostname: str, public_suffixes: Sequence[str] = ()) -> st
     return ".".join(labels[-3:]) if tail2 in public_suffixes and len(labels) >= 3 else tail2
 
 
+def relay_key_problems(env: Dict[str, str], profile: Dict) -> List[str]:
+    """The relay's per-gateway key setting, found BEFORE anything is switched (#597 K1).
+    In `both` and `derived` the profile must name `relay.gateway_key_master_refs`, and no
+    derivation master may hold the same value as a shared secret in
+    `relay.gateway_secret_refs`: the master has to be one no gateway profile has held, and
+    the relay and the companion control MCP refuse to start otherwise. Only references this
+    host can read are compared (`env://` from vm.env, `file://` when the file is here);
+    names of fields only, never a value."""
+    relay = profile.get("relay")
+    if not isinstance(relay, dict):
+        return []
+    mode = relay.get("gateway_key_mode", "shared")
+    if mode not in ("shared", "both", "derived"):
+        return ["relay.gateway_key_mode is not shared, both or derived"]
+    if mode == "shared":
+        return []
+    masters = [r for r in (relay.get("gateway_key_master_refs") or []) if isinstance(r, str)]
+    if not masters:
+        return [f"relay.gateway_key_mode is {mode} but relay.gateway_key_master_refs is missing: per-gateway keys "
+                f"are derived from a secret no gateway profile has held, not from relay.gateway_secret_refs"]
+
+    def value(ref: str) -> Optional[str]:
+        if ref.startswith("env://"):
+            return env.get(ref[len("env://"):]) or None
+        if ref.startswith("file://"):
+            try:
+                return Path(ref[len("file://"):]).read_text().strip() or None
+            except OSError:
+                return None
+        return None
+
+    shared_refs = [r for r in (relay.get("gateway_secret_refs") or []) if isinstance(r, str)]
+    problems = []
+    if any(m in shared_refs for m in masters):
+        problems.append("a relay.gateway_key_master_refs reference is also in relay.gateway_secret_refs")
+    shared_values = {v for v in (value(r) for r in shared_refs) if v}
+    if any(v in shared_values for v in (value(m) for m in masters) if v):
+        problems.append("a relay.gateway_key_master_refs secret equals a relay.gateway_secret_refs secret; "
+                        "the derivation master must be one no gateway profile has held")
+    return problems
+
+
 def web_config_problems(env: Dict[str, str], profile: Optional[Dict]) -> List[str]:
     """What would stop the portal and gateway from working, found BEFORE anything is
     switched. Names only, never values: the env holds the exchange key and cookie secret.
@@ -395,6 +437,7 @@ def web_config_problems(env: Dict[str, str], profile: Optional[Dict]) -> List[st
     if env.get("KINERARY_ARCHITECTURE_PROFILE") and profile is None:
         problems.append("KINERARY_ARCHITECTURE_PROFILE does not name a readable JSON file")
     elif profile is not None:
+        problems.extend(relay_key_problems(env, profile))
         web = profile.get("web")
         if not isinstance(web, dict):
             problems.append("the architecture profile has no `web` block, so the api would serve no portal routes")

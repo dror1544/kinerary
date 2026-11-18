@@ -1,6 +1,11 @@
 """scripts/relay-rekey.py — move enrolled profiles to per-gateway relay keys.
 
-docs/specs/sprint-9/597-per-gateway-and-per-trip-keys.md, AC-K1.5 and AC-K1.6.
+docs/specs/sprint-9/597-per-gateway-and-per-trip-keys.md, AC-K1.5, AC-K1.6 and AC-K1.8.
+
+Profiles start out holding the SHARED secret (`relay.gateway_secret_refs`); the
+re-key writes keys derived from the DERIVATION master
+(`relay.gateway_key_master_refs[0]`), a different secret no profile has held. The
+script refuses when the master is missing or equals a shared secret.
 
 The real script, run as a subprocess against a sandboxed HOME and a sandboxed
 architecture profile. The derived values are checked against the vector file the
@@ -26,7 +31,8 @@ REPO = Path(__file__).resolve().parents[2]
 SCRIPT = REPO / "scripts" / "relay-rekey.py"
 VECTORS = json.loads((REPO / "control-plane/api/test/fixtures/relay-key-vectors.json").read_text(encoding="utf-8"))["vectors"]
 
-MASTER = "master-secret-one"
+SHARED = "shared-secret-every-profile-holds"  # what every enrolled profile holds before the re-key
+MASTER = "master-secret-one"  # the derivation master: no profile has held it
 SHARED_ID = "trip-example-a"
 INTERVIEWER_ID = "kinerary-trip-intake"
 
@@ -48,7 +54,9 @@ class RelayRekey(unittest.TestCase):
         self.home = self.root / "home"
         self.profiles = self.home / ".hermes" / "profiles"
         self.profiles.mkdir(parents=True)
-        self.master_file = self.root / "relay.secret"
+        self.shared_file = self.root / "relay.secret"
+        self.shared_file.write_text(SHARED + "\n")
+        self.master_file = self.root / "relay-key-master.secret"
         self.master_file.write_text(MASTER + "\n")
         self.arch = self.root / "architecture.json"
         self.write_arch("both")
@@ -56,12 +64,16 @@ class RelayRekey(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def write_arch(self, mode: str | None, refs: list[str] | None = None) -> None:
+    def write_arch(self, mode: str | None, refs: list[str] | None = None, master_refs: object = "default") -> None:
         relay: dict = {
             "bind_host": "127.0.0.1",
             "port": 4312,
-            "gateway_secret_refs": refs if refs is not None else [f"file://{self.master_file}"],
+            "gateway_secret_refs": refs if refs is not None else [f"file://{self.shared_file}"],
         }
+        if master_refs == "default":
+            relay["gateway_key_master_refs"] = [f"file://{self.master_file}"]
+        elif master_refs is not None:
+            relay["gateway_key_master_refs"] = master_refs
         if mode is not None:
             relay["gateway_key_mode"] = mode
         self.arch.write_text(json.dumps({"relay": relay}))
@@ -99,7 +111,7 @@ class RelayRekey(unittest.TestCase):
     # -- the plan changes nothing ---------------------------------------------------------
 
     def test_the_plan_names_the_change_and_writes_nothing(self) -> None:
-        env = self.profile("trip-one", SHARED_ID, MASTER)
+        env = self.profile("trip-one", SHARED_ID, SHARED)
         before = env.read_text()
         result = self.run_script("--profile", "trip-one")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -125,7 +137,7 @@ class RelayRekey(unittest.TestCase):
             with self.subTest(id=vector["id"]):
                 self.master_file.write_text(vector["master"])
                 name = "trip-v" + hashlib.sha256(vector["id"].encode()).hexdigest()[:8]
-                env = self.profile(name, vector["id"], vector["master"])
+                env = self.profile(name, vector["id"], SHARED)
                 lines_before = env.read_text().splitlines()
                 result = self.run_script("--profile", name, "--execute")
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -142,28 +154,28 @@ class RelayRekey(unittest.TestCase):
 
     def test_it_uses_each_profiles_own_gateway_id_not_its_name(self) -> None:
         # The interviewer's profile is `trip-intake` and its gateway id is something else.
-        env = self.profile("trip-intake", INTERVIEWER_ID, MASTER)
+        env = self.profile("trip-intake", INTERVIEWER_ID, SHARED)
         result = self.run_script("--profile", "trip-intake", "--execute")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.values(env)["GATEWAY_RELAY_SECRET"], derive(MASTER, INTERVIEWER_ID))
         self.assertNotEqual(self.values(env)["GATEWAY_RELAY_SECRET"], derive(MASTER, "trip-intake"))
 
     def test_a_profile_without_a_control_token_does_not_gain_one(self) -> None:
-        env = self.profile("trip-one", SHARED_ID, MASTER, with_token=False)
+        env = self.profile("trip-one", SHARED_ID, SHARED, with_token=False)
         self.run_script("--profile", "trip-one", "--execute")
         self.assertNotIn("COMPANION_CONTROL_TOKEN", env.read_text())
         self.assertEqual(self.values(env)["GATEWAY_RELAY_SECRET"], derive(MASTER, SHARED_ID))
 
     def test_the_replacement_is_atomic_and_leaves_no_temp_file(self) -> None:
-        env = self.profile("trip-one", SHARED_ID, MASTER)
+        env = self.profile("trip-one", SHARED_ID, SHARED)
         inode_before = env.stat().st_ino
         self.run_script("--profile", "trip-one", "--execute")
         self.assertNotEqual(env.stat().st_ino, inode_before, "a replaced file, not a rewritten one")
         self.assertEqual(sorted(p.name for p in env.parent.iterdir()), [".env"])
 
     def test_several_profiles_and_all_enrolled(self) -> None:
-        a = self.profile("trip-one", "gw-one", MASTER)
-        b = self.profile("trip-two", "gw-two", MASTER)
+        a = self.profile("trip-one", "gw-one", SHARED)
+        b = self.profile("trip-two", "gw-two", SHARED)
         (self.profiles / "not-enrolled").mkdir()
         (self.profiles / "not-enrolled" / ".env").write_text("OTHER=1\n")
         (self.profiles / "no-env-at-all").mkdir()
@@ -174,15 +186,15 @@ class RelayRekey(unittest.TestCase):
         self.assertEqual((self.profiles / "not-enrolled" / ".env").read_text(), "OTHER=1\n")
         self.assertNotIn("not-enrolled", result.stdout)
 
-        c = self.profile("trip-three", "gw-three", MASTER)
-        d = self.profile("trip-four", "gw-four", MASTER)
+        c = self.profile("trip-three", "gw-three", SHARED)
+        d = self.profile("trip-four", "gw-four", SHARED)
         result = self.run_script("--profile", "trip-three,trip-four", "--execute")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.values(c)["GATEWAY_RELAY_SECRET"], derive(MASTER, "gw-three"))
         self.assertEqual(self.values(d)["GATEWAY_RELAY_SECRET"], derive(MASTER, "gw-four"))
 
     def test_it_restarts_nothing_and_lists_what_needs_a_restart(self) -> None:
-        self.profile("trip-one", SHARED_ID, MASTER)
+        self.profile("trip-one", SHARED_ID, SHARED)
         result = self.run_script("--profile", "trip-one", "--execute")
         self.assertIn("restart these gateways", result.stdout)
         self.assertIn("trip-one", result.stdout)
@@ -197,7 +209,7 @@ class RelayRekey(unittest.TestCase):
             self.assertEqual(env.read_text(), snapshot[env], f"{env} was changed")
 
     def test_it_refuses_while_the_relay_mode_is_shared_or_absent(self) -> None:
-        env = self.profile("trip-one", SHARED_ID, MASTER)
+        env = self.profile("trip-one", SHARED_ID, SHARED)
         snap = {env: env.read_text()}
         for mode in ("shared", None):
             with self.subTest(mode=mode):
@@ -212,18 +224,18 @@ class RelayRekey(unittest.TestCase):
             with self.subTest(mode=mode):
                 self.write_arch(mode)
                 self.assertEqual(self.run_script("--profile", "nothing-here").returncode, 1)  # refused for the profile, not the mode
-                self.profile("trip-" + mode, "gw-" + mode, MASTER)
+                self.profile("trip-" + mode, "gw-" + mode, SHARED)
                 result = self.run_script("--profile", "trip-" + mode)
                 self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_it_refuses_an_unknown_mode(self) -> None:
-        self.profile("trip-one", SHARED_ID, MASTER)
+        self.profile("trip-one", SHARED_ID, SHARED)
         self.write_arch("Derived")
         self.assertEqual(self.run_script("--profile", "trip-one").returncode, 1)
 
     def test_it_refuses_a_profile_with_no_gateway_id_or_no_secret(self) -> None:
-        no_id = self.profile("trip-no-id", None, MASTER)
-        no_id.write_text(no_id.read_text() + f"GATEWAY_RELAY_SECRET={MASTER}\n")
+        no_id = self.profile("trip-no-id", None, SHARED)
+        no_id.write_text(no_id.read_text() + f"GATEWAY_RELAY_SECRET={SHARED}\n")
         no_secret = self.profile("trip-no-secret", SHARED_ID, None)
         snap = {no_id: no_id.read_text(), no_secret: no_secret.read_text()}
         for name in ("trip-no-id", "trip-no-secret"):
@@ -231,9 +243,9 @@ class RelayRekey(unittest.TestCase):
             self.assert_refused_and_unchanged(result, no_id, no_secret, snapshot=snap)
 
     def test_it_refuses_symlinks(self) -> None:
-        real = self.profile("trip-real", SHARED_ID, MASTER)
+        real = self.profile("trip-real", SHARED_ID, SHARED)
         (self.profiles / "trip-link").symlink_to(self.profiles / "trip-real")
-        linked_env = self.profile("trip-envlink", SHARED_ID, MASTER)
+        linked_env = self.profile("trip-envlink", SHARED_ID, SHARED)
         target = self.root / "elsewhere.env"
         target.write_text(linked_env.read_text())
         linked_env.unlink()
@@ -248,8 +260,8 @@ class RelayRekey(unittest.TestCase):
         self.assert_refused_and_unchanged(result, real, target, snapshot=snap)
 
     def test_one_refused_profile_means_nothing_is_written(self) -> None:
-        good = self.profile("trip-good", "gw-good", MASTER)
-        bad = self.profile("trip-bad", None, MASTER)
+        good = self.profile("trip-good", "gw-good", SHARED)
+        bad = self.profile("trip-bad", None, SHARED)
         snap = {good: good.read_text(), bad: bad.read_text()}
         result = self.run_script("--profile", "trip-good,trip-bad", "--execute")
         self.assert_refused_and_unchanged(result, good, bad, snapshot=snap)
@@ -260,41 +272,90 @@ class RelayRekey(unittest.TestCase):
             self.assertEqual(result.returncode, 1, name)
 
     def test_it_refuses_a_master_it_cannot_read(self) -> None:
-        env = self.profile("trip-one", SHARED_ID, MASTER)
+        env = self.profile("trip-one", SHARED_ID, SHARED)
         snap = {env: env.read_text()}
         cases = {
             "env ref": ["env://SOME_VARIABLE"],
             "missing file": [f"file://{self.root}/does-not-exist"],
             "no refs": [],
+            "field absent": None,
         }
-        for label, refs in cases.items():
-            with self.subTest(label):
-                self.write_arch("both", refs)
-                result = self.run_script("--profile", "trip-one", "--execute")
-                self.assert_refused_and_unchanged(result, env, snapshot=snap)
+        for mode in ("both", "derived"):
+            for label, refs in cases.items():
+                with self.subTest(mode=mode, label=label):
+                    self.write_arch(mode, master_refs=refs)
+                    result = self.run_script("--profile", "trip-one", "--execute")
+                    self.assert_refused_and_unchanged(result, env, snapshot=snap)
+                    self.assertIn("gateway_key_master_refs", result.stderr)
         self.master_file.write_text("  \n")
         self.write_arch("both")
         self.assert_refused_and_unchanged(self.run_script("--profile", "trip-one", "--execute"), env, snapshot=snap)
 
+    def test_it_refuses_a_derivation_master_equal_to_a_shared_secret(self) -> None:
+        env = self.profile("trip-one", SHARED_ID, SHARED)
+        snap = {env: env.read_text()}
+        later = self.root / "previous-shared.secret"
+        later.write_text(MASTER + "\n")
+        for label, master_text, shared_refs in (
+            ("first shared", SHARED, None),
+            ("a later shared in the rotation list", MASTER, [f"file://{self.shared_file}", f"file://{later}"]),
+        ):
+            for mode in ("both", "derived"):
+                with self.subTest(label=label, mode=mode):
+                    self.master_file.write_text(master_text + "\n")
+                    self.write_arch(mode, shared_refs)
+                    for extra in ([], ["--execute"]):
+                        result = self.run_script("--profile", "trip-one", *extra)
+                        self.assert_refused_and_unchanged(result, env, snapshot=snap)
+                        self.assertIn("gateway_key_master_refs", result.stderr)
+                        self.assertIn("gateway_secret_refs", result.stderr)
+                        self.assertNotIn(master_text, result.stdout + result.stderr)
+
+    def test_it_uses_the_derivation_master_not_the_shared_secret(self) -> None:
+        env = self.profile("trip-one", SHARED_ID, SHARED)
+        self.run_script("--profile", "trip-one", "--execute")
+        key = self.values(env)["GATEWAY_RELAY_SECRET"]
+        self.assertEqual(key, derive(MASTER, SHARED_ID))
+        self.assertNotEqual(key, derive(SHARED, SHARED_ID), "a key derived from what profiles hold is no credential")
+        self.assertNotIn(SHARED, env.read_text())
+
+    def test_a_profile_holding_a_key_derived_from_the_shared_secret_is_replaced(self) -> None:
+        env = self.profile("trip-one", SHARED_ID, derive(SHARED, SHARED_ID))
+        result = self.run_script("--profile", "trip-one", "--execute")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("unrecognised -> derived", result.stdout)
+        self.assertEqual(self.values(env)["GATEWAY_RELAY_SECRET"], derive(MASTER, SHARED_ID))
+
+    def test_it_refuses_a_gateway_id_the_derivation_does_not_accept(self) -> None:
+        refused = json.loads((REPO / "control-plane/api/test/fixtures/relay-key-vectors.json").read_text(encoding="utf-8"))["refused_ids"]
+        for index, gateway_id in enumerate(refused):
+            with self.subTest(id=gateway_id):
+                env = self.profile(f"trip-odd-{index}", gateway_id, SHARED)
+                snap = {env: env.read_text()}
+                result = self.run_script("--profile", f"trip-odd-{index}", "--execute")
+                self.assert_refused_and_unchanged(result, env, snapshot=snap)
+
     # -- never prints a key ---------------------------------------------------------------------
 
     def test_no_key_token_or_master_is_ever_printed(self) -> None:
-        env = self.profile("trip-one", SHARED_ID, MASTER)
+        env = self.profile("trip-one", SHARED_ID, SHARED)
         derived = derive(MASTER, SHARED_ID)
-        old_token = token(SHARED_ID, MASTER)
+        old_token = token(SHARED_ID, SHARED)
         new_token = token(SHARED_ID, derived)
         runs = [
             self.run_script("--profile", "trip-one"),
             self.run_script("--profile", "trip-one", "--execute"),
             self.run_script("--profile", "trip-one", "--execute"),
         ]
-        self.write_arch("both", [f"file://{self.root}/missing"])
+        self.write_arch("both", master_refs=[f"file://{self.root}/missing"])
+        runs.append(self.run_script("--profile", "trip-one"))
+        self.write_arch("both", master_refs=[f"file://{self.shared_file}"])
         runs.append(self.run_script("--profile", "trip-one"))
         self.write_arch("shared")
         runs.append(self.run_script("--profile", "trip-one"))
         for result in runs:
             out = result.stdout + result.stderr
-            for secret in (MASTER, derived, old_token, new_token, str(self.master_file)):
+            for secret in (SHARED, MASTER, derived, old_token, new_token, str(self.master_file), str(self.shared_file)):
                 self.assertNotIn(secret, out)
         self.assertEqual(self.values(env)["GATEWAY_RELAY_SECRET"], derived)
 

@@ -405,9 +405,31 @@ export type GatewayKeyMode = (typeof GATEWAY_KEY_MODES)[number];
 
 /** Versioned and fixed: a key made for this purpose is never valid for another. */
 export const GATEWAY_KEY_LABEL = "kinerary-relay-gateway:v1:";
+/** What no gateway id may begin with, in any mode (domain separation, see `isDerivableGatewayId`). */
+const GATEWAY_KEY_LABEL_PREFIX = "kinerary-relay-gateway:";
+
+/**
+ * Whether a gateway id may take part in key derivation at all. Derived keys and
+ * token signatures are kept in separate domains: an id never begins with the
+ * derivation label, and a derived key is only made for an id with no `:` (the
+ * separator the signed token uses). Real gateway ids are profile names, which
+ * contain neither. Checked by the verifier, by `deriveGatewayKey`, and by both
+ * minters (`enroll_relay`, `scripts/relay-rekey.py`).
+ */
+export function isDerivableGatewayId(gatewayId: string): boolean {
+  return gatewayId.length > 0 && !gatewayId.includes(":");
+}
+
+/** An id that starts with the derivation label is refused in every mode. */
+export function startsWithGatewayKeyLabel(gatewayId: string): boolean {
+  return gatewayId.startsWith(GATEWAY_KEY_LABEL_PREFIX);
+}
 
 /**
  * The key one gateway holds: `hex(HMAC-SHA256(master, label + id))`.
+ *
+ * `master` is the DERIVATION master (`relay.gateway_key_master_refs`): a secret
+ * no gateway profile has held, and never one of `relay.gateway_secret_refs`.
  *
  * Returned as the hex STRING the gateway then uses, unchanged, as the HMAC key
  * string it signs "<id>:<exp>" with. Mirrored by `enroll_relay` in
@@ -417,6 +439,7 @@ export const GATEWAY_KEY_LABEL = "kinerary-relay-gateway:v1:";
 export function deriveGatewayKey(master: string, gatewayId: string): string {
   if (!master) throw new Error("deriveGatewayKey: empty master");
   if (!gatewayId) throw new Error("deriveGatewayKey: empty gateway id");
+  if (!isDerivableGatewayId(gatewayId)) throw new Error("deriveGatewayKey: a gateway id with ':' has no derived key");
   return createHmac("sha256", master).update(GATEWAY_KEY_LABEL + gatewayId, "utf8").digest("hex");
 }
 
@@ -439,24 +462,32 @@ export function deriveGatewayKey(master: string, gatewayId: string): string {
  * `secrets` is a verify LIST so a secret rotation does not invalidate tokens
  * already in flight. Returns the payload (the gateway id) or null.
  *
- * `mode` (`relay.gateway_key_mode`, #597 K1) says what the entries of `secrets`
- * are MASTERS for:
- *   shared   a token is signed with a master itself (today's behaviour);
+ * `mode` (`relay.gateway_key_mode`, #597 K1) says which key material applies:
+ *   shared   a token is signed with an entry of `secrets` itself (today's
+ *            behaviour); `derivationMasters` is not consulted;
  *   derived  a token is signed with `deriveGatewayKey(master, <the id it names>)`
- *            and a master-signed token is refused;
- *   both     either, for the changeover.
- * The key a gateway holds is a hex STRING used as the HMAC key exactly as a
- * master string is, so the gateway signs the same way in every mode. Because the
- * candidate is derived from the id the token NAMES, a key derived for one id
- * never verifies a token for another. Absent means `shared`, and anything that
- * is not one of the three names verifies nothing: an unknown mode falling
- * through to an accepting one is the failure this exists to prevent.
+ *            for a master in `derivationMasters`; `secrets` is not consulted at
+ *            all, so a token signed with a shared secret, or with a key derived
+ *            from one, is refused;
+ *   both     either: signed with an entry of `secrets`, or derived from an entry
+ *            of `derivationMasters`, for the changeover.
+ * `derivationMasters` (`relay.gateway_key_master_refs`) must be secrets no
+ * gateway profile has held; the callers refuse to start when one equals an
+ * entry of `secrets` (`gatewayKeyMasterProblem`). The key a gateway holds is a
+ * hex STRING used as the HMAC key exactly as a master string is, so the gateway
+ * signs the same way in every mode. Because the candidate is derived from the id
+ * the token NAMES, a key derived for one id never verifies a token for another.
+ * An id beginning with the derivation label is refused in every mode, and a
+ * derived key is only considered for an id with no `:`. Absent means `shared`,
+ * and anything that is not one of the three names verifies nothing: an unknown
+ * mode falling through to an accepting one is the failure this exists to prevent.
  */
 export function verifyUpgradeToken(
   token: string,
   secrets: readonly string[],
   nowSeconds?: number,
   mode: GatewayKeyMode = "shared",
+  derivationMasters: readonly string[] = [],
 ): string | null {
   let decoded: string;
   try {
@@ -465,8 +496,8 @@ export function verifyUpgradeToken(
     return null;
   }
 
-  // Split from the RIGHT: a payload may itself contain colons, and the gateway
-  // ids in the wild do (`gw:with:colons` is in the conformance vectors).
+  // Split from the RIGHT: a payload may itself contain colons in `shared` mode
+  // (`gw:with:colons` is in the conformance vectors); `derived` refuses such an id.
   const parts = decoded.split(":");
   if (parts.length < 3) return null;
   const sig = parts[parts.length - 1] ?? "";
@@ -478,21 +509,57 @@ export function verifyUpgradeToken(
   const now = nowSeconds ?? Math.floor(Date.now() / 1000);
   if (exp !== 0 && now > exp) return null;
 
-  const candidates = gatewayKeyCandidates(secrets, payload, mode);
+  // Domain separation: no gateway id begins with the derivation label.
+  if (startsWithGatewayKeyLabel(payload)) return null;
+
+  const candidates = gatewayKeyCandidates(secrets, derivationMasters, payload, mode);
   return verifySignature(`${payload}:${exp}`, sig, candidates) ? payload : null;
 }
 
-/** Which keys may sign a token for `gatewayId` in this mode. Empty for an unknown mode. */
-function gatewayKeyCandidates(secrets: readonly string[], gatewayId: string, mode: GatewayKeyMode): string[] {
+/**
+ * Which keys may sign a token for `gatewayId` in this mode. Empty for an unknown
+ * mode. `shared` reads `secrets` only, `derived` reads `derivationMasters` only,
+ * `both` reads each for its own kind of key.
+ */
+function gatewayKeyCandidates(
+  secrets: readonly string[],
+  derivationMasters: readonly string[],
+  gatewayId: string,
+  mode: GatewayKeyMode,
+): string[] {
   if (mode !== "shared" && mode !== "both" && mode !== "derived") return [];
-  const masters = secrets.filter(Boolean);
   const out: string[] = [];
-  if (mode === "shared" || mode === "both") out.push(...masters);
-  // A token naming no gateway has no derived key to be signed with.
-  if ((mode === "derived" || mode === "both") && gatewayId) {
-    for (const master of masters) out.push(deriveGatewayKey(master, gatewayId));
+  if (mode === "shared" || mode === "both") out.push(...secrets.filter(Boolean));
+  // A token naming no gateway, or an id with a `:` in it, has no derived key to be signed with.
+  if ((mode === "derived" || mode === "both") && isDerivableGatewayId(gatewayId)) {
+    for (const master of derivationMasters.filter(Boolean)) out.push(deriveGatewayKey(master, gatewayId));
   }
   return out;
+}
+
+/**
+ * The start-up check every process that verifies tokens runs: in `both` and
+ * `derived` the derivation masters must resolve to something and none may equal
+ * a shared secret (the derivation master is one no gateway profile has held).
+ * Returns a problem that names FIELDS, never a value, or null. `shared` has no
+ * derivation master to check.
+ */
+export function gatewayKeyMasterProblem(
+  mode: GatewayKeyMode,
+  sharedSecrets: readonly string[],
+  derivationMasters: readonly string[],
+): string | null {
+  if (mode !== "both" && mode !== "derived") return null;
+  const masters = derivationMasters.filter(Boolean);
+  if (masters.length === 0) {
+    return `relay.gateway_key_master_refs resolves to no secret, and relay.gateway_key_mode is ${mode}`;
+  }
+  const shared = new Set(sharedSecrets.filter(Boolean));
+  if (masters.some((m) => shared.has(m))) {
+    return "a relay.gateway_key_master_refs secret equals a relay.gateway_secret_refs secret; "
+      + "the derivation master must be one no gateway profile has held";
+  }
+  return null;
 }
 
 /** Constant-time HMAC check against any secret in the rotation list. */

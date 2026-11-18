@@ -163,7 +163,10 @@ test("relay.gateway_key_mode: absent is shared, three names are accepted, anythi
   assert.equal(raw.relay.gateway_key_mode, undefined, "the committed example leaves the mode at its default");
   assert.equal(validateArchitectureProfile(raw).relay?.gateway_key_mode, "shared");
   for (const mode of ["shared", "both", "derived"]) {
-    const profile = validateArchitectureProfile({ ...raw, relay: { ...raw.relay, gateway_key_mode: mode } });
+    const profile = validateArchitectureProfile({
+      ...raw,
+      relay: { ...raw.relay, gateway_key_mode: mode, gateway_key_master_refs: ["env://CONTROL_PLANE_RELAY_GATEWAY_KEY_MASTER"] },
+    });
     assert.equal(profile.relay?.gateway_key_mode, mode);
   }
   for (const bad of ["", "Derived", "any", "none", "true", 1, null]) {
@@ -172,6 +175,39 @@ test("relay.gateway_key_mode: absent is shared, three names are accepted, anythi
       `${JSON.stringify(bad)} must fail`,
     );
   }
+});
+
+test("relay.gateway_key_master_refs: required in both and derived, never the shared secret's own reference (AC-K1.7)", async () => {
+  const raw = JSON.parse(await readFile(examplePath, "utf8"));
+  const masterRefs = ["env://CONTROL_PLANE_RELAY_GATEWAY_KEY_MASTER", "env://CONTROL_PLANE_RELAY_GATEWAY_KEY_MASTER_PREVIOUS"];
+  // shared never needs it (absent is today's behaviour) and may carry it ahead of the changeover.
+  assert.doesNotThrow(() => validateArchitectureProfile(raw));
+  assert.deepEqual(
+    validateArchitectureProfile({ ...raw, relay: { ...raw.relay, gateway_key_master_refs: masterRefs } }).relay?.gateway_key_master_refs,
+    masterRefs,
+  );
+  for (const mode of ["both", "derived"]) {
+    // Absent, or empty, fails config load and names the field.
+    for (const refs of [undefined, []]) {
+      const relay = { ...raw.relay, gateway_key_mode: mode, ...(refs ? { gateway_key_master_refs: refs } : {}) };
+      assert.throws(() => validateArchitectureProfile({ ...raw, relay }), /gateway_key_master_refs/, `${mode}/${JSON.stringify(refs)}`);
+    }
+    // The same reference in both lists is the derivation master being a secret every profile holds.
+    assert.throws(
+      () => validateArchitectureProfile({
+        ...raw,
+        relay: { ...raw.relay, gateway_key_mode: mode, gateway_key_master_refs: [raw.relay.gateway_secret_refs[0]] },
+      }),
+      /gateway_key_master_refs.*gateway_secret_refs/,
+      mode,
+    );
+    assert.doesNotThrow(() => validateArchitectureProfile({
+      ...raw,
+      relay: { ...raw.relay, gateway_key_mode: mode, gateway_key_master_refs: masterRefs },
+    }));
+  }
+  // A raw value where a reference belongs is refused here too.
+  assert.throws(() => validateArchitectureProfile({ ...raw, relay: { ...raw.relay, gateway_key_master_refs: ["a-raw-secret"] } }));
 });
 
 test("the relay socket cannot be bound to a public interface", async () => {

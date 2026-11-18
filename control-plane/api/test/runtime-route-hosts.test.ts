@@ -267,3 +267,20 @@ test("web.runtime_upstream_allowed_hosts: hostnames, IPv4 and IPv4 CIDR load; IP
   }
   assert.throws(() => validateArchitectureProfile({ ...raw, web: { ...raw.web, runtime_upstream_allowed_hosts: "192.0.2.10" } }));
 });
+
+test("web.runtime_upstream_allowed_hosts: an IPv4 lookalike is refused at load with the entry named and the canonical form asked for (AC-R1.13)", async () => {
+  const raw = JSON.parse(await readFile(fileURLToPath(new URL("../../config/architecture.web.example.json", import.meta.url)), "utf8"));
+  const load = (value: string) => validateArchitectureProfile({ ...raw, web: { ...raw.web, runtime_upstream_allowed_hosts: [value] } });
+  for (const lookalike of ["0300.0.2.10", "0x7f.0.0.1", "127.1", "2130706433", "0x7f000001", "1.2.3", "10.0.0.0x1", "trip.0x10", "192.0.2.10.5"]) {
+    assert.throws(
+      () => load(lookalike),
+      (error: Error) => error.message.includes(lookalike) && /canonical dotted quad/.test(error.message),
+      `refuses ${lookalike}`,
+    );
+  }
+  // Names that merely contain digits, and canonical quads, still load.
+  assert.deepEqual(
+    validateArchitectureProfile({ ...raw, web: { ...raw.web, runtime_upstream_allowed_hosts: ["10.0.2.10", "trip-1.example.test", "1password.example.test", "host1"] } }).web?.runtime_upstream_allowed_hosts,
+    ["10.0.2.10", "trip-1.example.test", "1password.example.test", "host1"],
+  );
+});

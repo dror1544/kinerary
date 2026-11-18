@@ -45,29 +45,34 @@ describe("gatewayFromAuthorization — identity is the relay's token, nothing el
   });
 });
 
-describe("gatewayFromAuthorization — gateway key mode (#597 K1, AC-K1.2/K1.3)", () => {
+describe("gatewayFromAuthorization — gateway key mode (#597 K1, AC-K1.2/K1.3/K1.7)", () => {
+  /** The derivation master: a secret no gateway profile has held. SECRET is what every profile holds. */
+  const MASTER = "derivation-master-no-profile-holds";
   const masterToken = `Bearer ${makeUpgradeToken("japan2026", SECRET)}`;
-  const derivedToken = `Bearer ${makeUpgradeToken("japan2026", deriveGatewayKey(SECRET, "japan2026"))}`;
-  const otherGatewaysToken = `Bearer ${makeUpgradeToken("japan2026", deriveGatewayKey(SECRET, "usa2026"))}`;
+  const derivedToken = `Bearer ${makeUpgradeToken("japan2026", deriveGatewayKey(MASTER, "japan2026"))}`;
+  const derivedFromSharedToken = `Bearer ${makeUpgradeToken("japan2026", deriveGatewayKey(SECRET, "japan2026"))}`;
+  const otherGatewaysToken = `Bearer ${makeUpgradeToken("japan2026", deriveGatewayKey(MASTER, "usa2026"))}`;
 
-  test("absent mode is shared: a master-signed token only", () => {
+  test("absent mode is shared: a shared-secret-signed token only", () => {
     assert.equal(gatewayFromAuthorization(masterToken, [SECRET]), "japan2026");
-    assert.equal(gatewayFromAuthorization(derivedToken, [SECRET]), null);
+    assert.equal(gatewayFromAuthorization(derivedToken, [SECRET], "shared", [MASTER]), null);
   });
 
-  test("derived: the key derived for that id only; the master itself is refused", () => {
-    assert.equal(gatewayFromAuthorization(derivedToken, [SECRET], "derived"), "japan2026");
-    assert.equal(gatewayFromAuthorization(masterToken, [SECRET], "derived"), null);
+  test("derived: the key derived from the derivation master for that id only; the shared secret is not consulted", () => {
+    assert.equal(gatewayFromAuthorization(derivedToken, [SECRET], "derived", [MASTER]), "japan2026");
+    assert.equal(gatewayFromAuthorization(masterToken, [SECRET], "derived", [MASTER]), null);
+    assert.equal(gatewayFromAuthorization(derivedFromSharedToken, [SECRET], "derived", [MASTER]), null);
   });
 
-  test("both: either", () => {
-    assert.equal(gatewayFromAuthorization(derivedToken, [SECRET], "both"), "japan2026");
-    assert.equal(gatewayFromAuthorization(masterToken, [SECRET], "both"), "japan2026");
+  test("both: either; a key derived from the shared secret is still refused", () => {
+    assert.equal(gatewayFromAuthorization(derivedToken, [SECRET], "both", [MASTER]), "japan2026");
+    assert.equal(gatewayFromAuthorization(masterToken, [SECRET], "both", [MASTER]), "japan2026");
+    assert.equal(gatewayFromAuthorization(derivedFromSharedToken, [SECRET], "both", [MASTER]), null);
   });
 
   test("a key derived for another gateway cannot name this one, in any mode", () => {
     for (const mode of ["shared", "both", "derived"] as GatewayKeyMode[]) {
-      assert.equal(gatewayFromAuthorization(otherGatewaysToken, [SECRET], mode), null, mode);
+      assert.equal(gatewayFromAuthorization(otherGatewaysToken, [SECRET], mode, [MASTER]), null, mode);
     }
   });
 });

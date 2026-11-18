@@ -626,11 +626,13 @@ PY
 
   # `relay.gateway_key_mode` (#597 K1) from the SAME profile the relay reads, so
   # what is written here and what the relay accepts cannot be set apart. Absent
-  # is `shared`: the master itself, as before. `both` and `derived` write
-  # derive(master, this profile's id) instead, and the master never reaches the
-  # profile's .env. Anything else is refused rather than guessed at: writing the
-  # master under a mode this script does not know is the downgrade to avoid, and
-  # the relay refuses to load such a profile anyway.
+  # is `shared`: the shared secret itself, as before. `both` and `derived` write
+  # derive(DERIVATION master, this profile's id) instead, where the derivation
+  # master is `relay.gateway_key_master_refs[0]`: a secret no gateway profile has
+  # held, never the shared secret, and it never reaches a profile's .env. Anything
+  # else is refused rather than guessed at: writing the shared secret under a mode
+  # this script does not know is the downgrade to avoid, and the relay refuses to
+  # load such a profile anyway.
   local key_mode
   key_mode="$(/usr/bin/python3 - "$ARCH_PROFILE" <<'PY'
 import json, sys
@@ -643,6 +645,66 @@ PY
     printf 'companion-install-host: relay.gateway_key_mode in %s is not shared, both or derived; %s left UNENROLLED\n' \
       "$ARCH_PROFILE" "$name" >&2
     return 0
+  fi
+
+  # In `both` and `derived` the key is derived from the derivation master, not
+  # from the shared secret every profile holds. Refused, with nothing written,
+  # when it is missing, unreadable, not a file:// reference, or EQUAL to a shared
+  # secret (the relay refuses to start on that too). Only paths go on argv here;
+  # the values are compared inside the Python and never printed. A gateway id the
+  # derivation does not accept (a ':' in it, or one beginning with the label) is
+  # refused the same way.
+  if [ "$key_mode" != shared ]; then
+    local master_check master_verdict
+    master_check="$(/usr/bin/python3 - "$ARCH_PROFILE" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1])).get("relay") or {}
+refs = [x for x in (r.get("gateway_key_master_refs") or []) if isinstance(x, str)]
+if not refs:
+    print("MISSING"); sys.exit(0)
+if not refs[0].startswith("file://"):
+    print("NOTFILE"); sys.exit(0)
+
+
+def read(ref):
+    try:
+        with open(ref[len("file://"):]) as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+masters = [read(x) if x.startswith("file://") else None for x in refs]
+if not masters[0]:
+    print("UNREADABLE"); sys.exit(0)
+shared = [read(x) for x in (r.get("gateway_secret_refs") or []) if isinstance(x, str) and x.startswith("file://")]
+if any(m and s and m == s for m in masters for s in shared):
+    print("EQUAL"); sys.exit(0)
+print("OK")
+print(refs[0][len("file://"):])
+PY
+    )" || master_check="UNREADABLE"
+    master_verdict="${master_check%%$'\n'*}"
+    case "$master_verdict" in
+      OK) secret_file="${master_check#*$'\n'}" ;;
+      MISSING)
+        printf 'companion-install-host: relay.gateway_key_mode is %s but relay.gateway_key_master_refs is missing in %s; %s left UNENROLLED\n' \
+          "$key_mode" "$ARCH_PROFILE" "$name" >&2
+        return 0 ;;
+      EQUAL)
+        printf 'companion-install-host: a relay.gateway_key_master_refs secret equals a relay.gateway_secret_refs secret in %s (the derivation master must be one no gateway profile has held); %s left UNENROLLED\n' \
+          "$ARCH_PROFILE" "$name" >&2
+        return 0 ;;
+      *)
+        printf 'companion-install-host: relay.gateway_key_master_refs[0] in %s is not a readable file:// reference (%s); %s left UNENROLLED\n' \
+          "$ARCH_PROFILE" "$master_verdict" "$name" >&2
+        return 0 ;;
+    esac
+    case "$name" in
+      *:*|kinerary-relay-gateway:*)
+        printf 'companion-install-host: gateway id %s cannot take a derived key; %s left UNENROLLED\n' "$name" "$name" >&2
+        return 0 ;;
+    esac
   fi
 
   # The key itself is read from its file by the Python below and never passes
@@ -674,6 +736,8 @@ PY
 import base64, hashlib, hmac, sys
 env_path, url, gid, secret_file, sandbox_dir, key_mode = sys.argv[1:7]
 with open(secret_file) as fh:
+    # `shared`: the shared secret. `both`/`derived`: the DERIVATION master
+    # (relay.gateway_key_master_refs[0]), chosen by the caller above.
     master = fh.read().strip()
 if not master:
     sys.exit("relay secret file is empty")
@@ -684,12 +748,17 @@ def derive_gateway_key(master_key, gateway_id):
     # function as deriveGatewayKey in control-plane/api/src/relay/protocol.ts,
     # pinned to it by control-plane/api/test/fixtures/relay-key-vectors.json. The
     # hex string is then used as the HMAC KEY STRING, exactly as the master was.
+    # An id with ':' has no derived key (derived keys and token signatures are
+    # kept in separate domains), and neither does one that begins with the label.
     label = "kinerary-relay-gateway:v1:"
+    if not gateway_id or ":" in gateway_id:
+        sys.exit("a gateway id with ':' has no derived key")
     return hmac.new(master_key.encode(), (label + gateway_id).encode(), hashlib.sha256).hexdigest()
 
 
-# `shared` hands the master out; `both` and `derived` hand out only the key
-# derived for this id, so the master does not leave the host's secret file.
+# `shared` hands the shared secret out; `both` and `derived` hand out only the
+# key derived for this id, so neither the shared secret nor the derivation master
+# is added to a profile's .env by this script in those modes.
 secret = master if key_mode == "shared" else derive_gateway_key(master, gid)
 
 

@@ -38,7 +38,7 @@ import { getAssistantNames, parseAssistantNames, setAssistantNames } from "./ass
 import { loadArchitectureProfile } from "./config.js";
 import { createDatabasePool } from "./database.js";
 import { structuredLog } from "./redaction.js";
-import { verifyUpgradeToken, type GatewayKeyMode } from "./relay/protocol.js";
+import { gatewayKeyMasterProblem, verifyUpgradeToken, type GatewayKeyMode } from "./relay/protocol.js";
 import { resolveSecretRef } from "./secrets.js";
 
 const log = (line: string) => process.stderr.write(`${line}\n`);
@@ -48,11 +48,12 @@ export function gatewayFromAuthorization(
   header: unknown,
   secrets: readonly string[],
   mode: GatewayKeyMode = "shared",
+  derivationMasters: readonly string[] = [],
 ): string | null {
   const value = typeof header === "string" ? header : "";
   const token = value.startsWith("Bearer ") ? value.slice("Bearer ".length).trim() : "";
-  if (!token || secrets.length === 0) return null;
-  return verifyUpgradeToken(token, secrets, undefined, mode);
+  if (!token || (secrets.length === 0 && derivationMasters.length === 0)) return null;
+  return verifyUpgradeToken(token, secrets, undefined, mode, derivationMasters);
 }
 
 export type CompanionTrip =
@@ -242,11 +243,13 @@ async function main(): Promise<void> {
     log(structuredLog("error", "companion_mcp.not_configured", { hint: "the architecture profile has no relay block" }));
     process.exit(1);
   }
-  const [connectionString, ...secretValues] = await Promise.all([
+  const [connectionString, secretValues, masterValues] = await Promise.all([
     resolveSecretRef(architecture.database.connection_secret_ref),
-    ...architecture.relay.gateway_secret_refs.map((ref) => resolveSecretRef(ref)),
+    Promise.all(architecture.relay.gateway_secret_refs.map((ref) => resolveSecretRef(ref))),
+    Promise.all((architecture.relay.gateway_key_master_refs ?? []).map((ref) => resolveSecretRef(ref))),
   ]);
   const secrets = secretValues.map((s) => s.trim()).filter(Boolean);
+  const masters = masterValues.map((s) => s.trim()).filter(Boolean);
   if (secrets.length === 0) {
     // Serving with no secret would accept no token and look healthy doing it.
     log(structuredLog("error", "companion_mcp.empty_gateway_secrets", {}));
@@ -256,6 +259,13 @@ async function main(): Promise<void> {
   // two checkers, so the companion's token is judged by the scheme the relay
   // judges the gateway's own.
   const keyMode = architecture.relay.gateway_key_mode;
+  // The derivation master must be one no gateway profile has held: refuse a
+  // master that equals a shared secret, as the relay does. Fields named, never values.
+  const masterProblem = gatewayKeyMasterProblem(keyMode, secrets, masters);
+  if (masterProblem) {
+    log(structuredLog("error", "companion_mcp.gateway_key_master_invalid", { problem: masterProblem }));
+    process.exit(1);
+  }
   log(structuredLog("info", "companion_mcp.gateway_key_mode", { mode: keyMode }));
   const db = createDatabasePool(connectionString);
 
@@ -269,7 +279,7 @@ async function main(): Promise<void> {
 
   const app = express();
   app.get("/sse", async (req: Request, res: Response) => {
-    const profile = gatewayFromAuthorization(req.headers.authorization, secrets, keyMode);
+    const profile = gatewayFromAuthorization(req.headers.authorization, secrets, keyMode, masters);
     if (!profile) { res.status(401).json({ error: "unauthorized" }); return; }
     const transport = new SSEServerTransport("/messages", res);
     const server = buildCompanionMcpServer(db, profile);

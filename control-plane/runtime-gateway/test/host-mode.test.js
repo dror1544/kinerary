@@ -24,6 +24,17 @@ function listen(server) {
 function close(server) { server.closeAllConnections?.(); return new Promise((resolve) => server.close(resolve)); }
 function collect(req) { return new Promise((resolve) => { const chunks = []; req.on("data", (c) => chunks.push(c)); req.on("end", () => resolve(Buffer.concat(chunks))); }); }
 
+// What a trip origin might send: a dotted suffix domain, the parent domain, odd case and spacing, a bare attribute.
+const DOMAIN_COOKIES_FROM_TRIP = [
+  `a=1; Domain=.${SUFFIX}; Path=/; HttpOnly`,
+  "b=2; domain=example.test; Secure; SameSite=Lax",
+  "c=3; Path=/;  DOMAIN =.test ; Max-Age=60",
+  "d=4;Domain=.Example.Test;Path=/x",
+  "e=5; Path=/; Domain",
+  "f=6; Path=/; SameSite=Strict; HttpOnly",
+  "g=domain=keep-me; Path=/",
+];
+
 function recorder(which) {
   return async (req, res) => {
     if (req.url === "/sse") {
@@ -45,6 +56,10 @@ function recorder(which) {
     if (req.url.startsWith("/api/cookies")) {
       res.writeHead(201, { "content-type": "application/json", "set-cookie": ["a=1; Path=/; HttpOnly", "b=2; Path=/; Secure"], "x-custom": "kept", "content-security-policy": "default-src 'self'" });
       return res.end(JSON.stringify({ ok: true }));
+    }
+    if (req.url.startsWith("/set-domain-cookies")) {
+      res.writeHead(200, { "content-type": "application/json", "set-cookie": DOMAIN_COOKIES_FROM_TRIP });
+      return res.end("{}");
     }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ upstream: which, url: req.url }));
@@ -164,6 +179,22 @@ test("AC-R1.6: method, path, query, body, Cookie, Authorization and Host reach t
   assert.equal(response.headers["content-security-policy"], "default-src 'self'", "the trip's CSP is not rewritten in host mode");
   assert.deepEqual(response.headers["set-cookie"], ["a=1; Path=/; HttpOnly", "b=2; Path=/; Secure"]);
   assert.deepEqual(JSON.parse(response.body), { ok: true });
+});
+
+test("AC-R1.12: a trip can only set host-only cookies: Domain is removed from every upstream Set-Cookie, the rest kept", async () => {
+  reset();
+  const response = await send({ host: `alpha.${SUFFIX}`, path: "/set-domain-cookies" });
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.headers["set-cookie"], [
+    "a=1; Path=/; HttpOnly",
+    "b=2; Secure; SameSite=Lax",
+    "c=3; Path=/; Max-Age=60",
+    "d=4;Path=/x",
+    "e=5; Path=/",
+    "f=6; Path=/; SameSite=Strict; HttpOnly",
+    "g=domain=keep-me; Path=/",
+  ]);
+  for (const cookie of response.headers["set-cookie"]) assert.doesNotMatch(cookie.split(";").slice(1).join(";"), /domain/i, cookie);
 });
 
 test("AC-R1.6: with no incoming X-Forwarded-For the chain is the peer alone; Host keeps the port a client sent", async () => {
@@ -298,9 +329,51 @@ test("AC-R1.9: a registry answer that is not a plain http(s) origin is not proxi
   for (const [name, upstreamOrigin] of bad) {
     routes.set(`bad-${name}.${SUFFIX}`, { status: 200, body: { tripId: "trip_bad000001", routeRef: "route_bad000001", upstreamOrigin } });
     const response = await send({ host: `bad-${name}.${SUFFIX}` });
-    assert.equal(response.status, 502, name);
+    assert.equal(response.status, 404, `${name}: the same uniform page as an unknown name`);
   }
   assert.deepEqual(seen.a, []);
+});
+
+test("AC-R1.8: a name whose registered upstream is invalid answers the same 404 page as an unknown name, and the reason is logged", async () => {
+  reset();
+  routes.set(`invalid.${SUFFIX}`, { status: 503, body: { error: "RUNTIME_ROUTE_INVALID" } });
+  routes.set(`badorigin.${SUFFIX}`, { status: 200, body: { tripId: "trip_bad000002", routeRef: "route_bad000002", upstreamOrigin: "ftp://127.0.0.1:9" } });
+  const logged = mock.method(console, "error", () => {});
+  let unknown, invalid, badOrigin;
+  try {
+    unknown = await send({ host: `nobody-here.${SUFFIX}`, path: "/p" });
+    invalid = await send({ host: `invalid.${SUFFIX}`, path: "/p" });
+    badOrigin = await send({ host: `badorigin.${SUFFIX}`, path: "/p" });
+  } finally { logged.mock.restore(); }
+  const shape = (r) => JSON.stringify([r.status, r.body, Object.entries(r.headers).filter(([k]) => !["date", "connection", "keep-alive"].includes(k))]);
+  assert.equal(unknown.status, 404);
+  assert.equal(shape(invalid), shape(unknown), "identical status, headers and body");
+  assert.equal(shape(badOrigin), shape(unknown));
+  const lines = logged.mock.calls.map((call) => String(call.arguments[0]));
+  assert.ok(lines.includes(`runtime_gateway.host_route_invalid host=invalid.${SUFFIX} reason=registry_route_invalid`), lines.join("\n"));
+  assert.ok(lines.includes(`runtime_gateway.host_route_invalid host=badorigin.${SUFFIX} reason=origin_refused`), lines.join("\n"));
+  assert.deepEqual(seen.a, []);
+});
+
+test("AC-R1.8: an invalid answer is cached no longer than a miss, and a 503 that is not ROUTE_INVALID is still 503", async () => {
+  reset();
+  mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const logged = mock.method(console, "error", () => {});
+  try {
+    const host = `fixed-later.${SUFFIX}`;
+    routes.set(host, { status: 503, body: { error: "RUNTIME_ROUTE_INVALID" } });
+    assert.equal((await send({ host })).status, 404);
+    assert.equal((await send({ host })).status, 404);
+    assert.deepEqual(lookups, [host], "the second answer came from the cache");
+    routes.set(host, { status: 200, body: { tripId: "trip_fixed0001", routeRef: "route_fixed0001", upstreamOrigin: originA } });
+    mock.timers.tick(5_001);
+    assert.equal((await send({ host, path: "/hi" })).status, 200, "served once the miss window passes");
+
+    routes.set(`unwell.${SUFFIX}`, { status: 503, body: { error: "SOMETHING_ELSE" } });
+    assert.equal((await send({ host: `unwell.${SUFFIX}` })).status, 503, "the control plane could not answer: unavailable, not 'not found'");
+    routes.set(`noisy.${SUFFIX}`, { status: 502, body: { error: "RUNTIME_ROUTE_INVALID" } });
+    assert.equal((await send({ host: `noisy.${SUFFIX}` })).status, 503, "only a 503 carrying the code is an invalid route");
+  } finally { logged.mock.restore(); mock.timers.reset(); }
 });
 
 test("AC-R1.9: an unreachable upstream is 502; a hung one is 502 once the request is sent and no response comes", async () => {

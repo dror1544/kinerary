@@ -3,11 +3,14 @@
 
 #597 K1 (docs/specs/sprint-9/597-per-gateway-and-per-trip-keys.md, AC-K1.5).
 
-A gateway holds `derive(master, its id)` instead of the master itself, where
+A gateway holds `derive(master, its id)` instead of the shared secret, where
 
     derive(m, id) = hex(HMAC-SHA256(m, "kinerary-relay-gateway:v1:" + id))
 
-so a key held for one gateway id is not valid for another. This rewrites the
+and `master` is the DERIVATION master, `relay.gateway_key_master_refs[0]`: a secret
+no gateway profile has ever held, never the shared secret every profile holds. So
+a key held for one gateway id is not valid for another, and a profile's old key
+opens nothing once the relay is `derived`. This rewrites the
 relay key of profiles that already exist on this host, so a deployment can move
 from `shared` through `both` to `derived`:
 
@@ -24,19 +27,25 @@ What it does and does not do:
     own GATEWAY_RELAY_ID. Every other line is kept. The file is replaced
     atomically and stays 0600.
   * Refuses to run while the architecture profile's relay.gateway_key_mode is
-    `shared` (or absent): the relay would then still be checking the master, and
-    every gateway re-keyed here would be locked out. Set `both` first, restart
-    the relay and the companion control MCP, then run this.
+    `shared` (or absent): the relay would then still be checking the shared
+    secret, and every gateway re-keyed here would be locked out. Add a NEW
+    derivation master (`relay.gateway_key_master_refs`), set `both`, restart the
+    relay and the companion control MCP, then run this.
+  * Refuses when relay.gateway_key_master_refs[0] is missing, is not a readable
+    file:// reference, or holds the same value as any readable file://
+    relay.gateway_secret_refs entry: the derivation master must be one no profile
+    has held. The refusal names the fields, never a value.
   * Refuses a profile with no GATEWAY_RELAY_ID or no GATEWAY_RELAY_SECRET, a
-    symlinked profile directory or `.env`, a name that is not a profile name,
-    and a master it cannot read. If any selected profile is refused, nothing at
-    all is written.
+    symlinked profile directory or `.env`, a name that is not a profile name, a
+    gateway id with a ':' in it (which includes one that begins with the
+    derivation label), and a master it cannot read. If any selected profile is refused, nothing at all
+    is written.
   * Restarts nothing. A gateway reads its key at start, so it lists the gateways
     that need a restart to pick the new one up.
   * Never prints a key, a token, or the path of the master's file.
 
 The master is found the way `enroll_relay` in companion-install-host.sh finds it:
-`relay.gateway_secret_refs[0]` of the architecture profile, which must be a
+`relay.gateway_key_master_refs[0]` of the architecture profile, which must be a
 `file://` reference. `KINERARY_ARCHITECTURE_PROFILE` names the profile; unset, the
 same default path as that script. Profiles live in `$HOME/.hermes/profiles/`
 (the install script does not honour HERMES_HOME either; set HOME to point
@@ -73,6 +82,10 @@ class Refusal(Exception):
 def derive_gateway_key(master: str, gateway_id: str) -> str:
     if not master or not gateway_id:
         raise Refusal("cannot derive a key from an empty master or gateway id")
+    # Derived keys and token signatures are kept in separate domains: no id with
+    # a ':' (the token's separator), which also covers one beginning with the label.
+    if ":" in gateway_id:
+        raise Refusal("a gateway id with ':' (or one beginning with the derivation label) has no derived key")
     return hmac.new(master.encode(), (GATEWAY_KEY_LABEL + gateway_id).encode(), hashlib.sha256).hexdigest()
 
 
@@ -106,18 +119,36 @@ def key_mode(relay: dict) -> str:
     return mode
 
 
-def read_master(relay: dict) -> str:
-    refs = relay.get("gateway_secret_refs")
-    ref = refs[0] if isinstance(refs, list) and refs else ""
+def _read_file_ref(ref: object) -> str | None:
     if not isinstance(ref, str) or not ref.startswith("file://"):
-        raise Refusal("relay.gateway_secret_refs[0] is not a file:// reference, so the master cannot be read here")
+        return None
     try:
-        master = Path(ref[len("file://"):]).read_text(encoding="utf-8").strip()
+        return Path(ref[len("file://"):]).read_text(encoding="utf-8").strip() or None
     except OSError:
-        raise Refusal("the master secret file cannot be read")
+        return None
+
+
+def read_master(relay: dict) -> tuple[str, list[str]]:
+    """(the derivation master, the readable shared secrets). Refuses a master that is a shared secret."""
+    refs = relay.get("gateway_key_master_refs")
+    ref = refs[0] if isinstance(refs, list) and refs else ""
+    if not isinstance(ref, str) or not ref:
+        raise Refusal("relay.gateway_key_master_refs is missing: per-gateway keys are derived from a secret no profile has held")
+    if not ref.startswith("file://"):
+        raise Refusal("relay.gateway_key_master_refs[0] is not a file:// reference, so the master cannot be read here")
+    master = _read_file_ref(ref)
     if not master:
-        raise Refusal("the master secret file is empty")
-    return master
+        raise Refusal("relay.gateway_key_master_refs[0] cannot be read, or is empty")
+    shared_refs = relay.get("gateway_secret_refs")
+    shared = [v for v in (_read_file_ref(r) for r in (shared_refs if isinstance(shared_refs, list) else [])) if v]
+    # Every readable master in the rotation list is held to it, not only the first.
+    masters = [master] + [v for v in (_read_file_ref(r) for r in refs[1:]) if v]
+    if any(hmac.compare_digest(m.encode(), s.encode()) for m in masters for s in shared):
+        raise Refusal(
+            "a relay.gateway_key_master_refs secret equals a relay.gateway_secret_refs secret; "
+            "the derivation master must be one no gateway profile has held"
+        )
+    return master, shared
 
 
 # -- one profile's .env -----------------------------------------------------------------
@@ -151,7 +182,7 @@ class Target:
         self.has_token = has_token
 
 
-def inspect_profile(profiles_dir: Path, name: str, master: str) -> Target:
+def inspect_profile(profiles_dir: Path, name: str, master: str, shared: list[str]) -> Target:
     if not PROFILE_NAME.fullmatch(name):
         raise Refusal(f"{name!r} is not a profile name")
     profile = profiles_dir / name
@@ -175,11 +206,14 @@ def inspect_profile(profiles_dir: Path, name: str, master: str) -> Target:
     current = values.get(SECRET_KEY, "")
     if not current:
         raise Refusal(f"{name}: no {SECRET_KEY} in .env")
-    derived = derive_gateway_key(master, gateway_id)
-    # Compared in constant time out of habit: these are the two values that matter.
+    try:
+        derived = derive_gateway_key(master, gateway_id)
+    except Refusal as exc:
+        raise Refusal(f"{name}: {exc}")
+    # Compared in constant time out of habit: these are the values that matter.
     if hmac.compare_digest(current.encode(), derived.encode()):
         state = "already derived"
-    elif hmac.compare_digest(current.encode(), master.encode()):
+    elif any(hmac.compare_digest(current.encode(), s.encode()) for s in shared):
         state = "shared -> derived"
     else:
         state = "unrecognised -> derived"
@@ -256,11 +290,11 @@ def main(argv: list[str] | None = None) -> int:
         mode = key_mode(relay)
         if mode == "shared":
             raise Refusal(
-                "relay.gateway_key_mode is shared (or absent): the relay still checks the master, and a re-keyed "
-                "gateway would be refused. Set it to both, restart the relay and the companion control MCP, "
-                "then run this again."
+                "relay.gateway_key_mode is shared (or absent): the relay still checks the shared secret, and a re-keyed "
+                "gateway would be refused. Add relay.gateway_key_master_refs (a NEW secret), set the mode to both, "
+                "restart the relay and the companion control MCP, then run this again."
             )
-        master = read_master(relay)
+        master, shared = read_master(relay)
         names = enrolled_names(profiles_dir) if args.all_enrolled else [n.strip() for n in args.profile.split(",") if n.strip()]
         if not names:
             raise Refusal("no profile selected" if not args.all_enrolled else "no enrolled profile found")
@@ -272,7 +306,7 @@ def main(argv: list[str] | None = None) -> int:
     refusals: list[str] = []
     for name in dict.fromkeys(names):
         try:
-            targets.append(inspect_profile(profiles_dir, name, master))
+            targets.append(inspect_profile(profiles_dir, name, master, shared))
         except Refusal as exc:
             refusals.append(str(exc))
     if refusals:

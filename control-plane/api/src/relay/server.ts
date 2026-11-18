@@ -30,7 +30,7 @@ import { structuredLog } from "../redaction.js";
 import { resolveSecretRef } from "../secrets.js";
 import type { SignupConfig } from "../signup.js";
 import { RelayConnector } from "./connector.js";
-import type { GatewayKeyMode } from "./protocol.js";
+import { gatewayKeyMasterProblem, type GatewayKeyMode } from "./protocol.js";
 import { renewCompanionConversation, resolveChatRoute, setCompanionExpectsReply } from "../chat-router.js";
 import { sayForChat,
   agentAlreadySpokeThisTurn,
@@ -93,7 +93,14 @@ const unconfigured: TelegramClient = {
 };
 
 interface Runtime {
+  /** `relay.gateway_secret_refs`, resolved: what a `shared`-mode gateway signs with. */
   gatewaySecrets: string[];
+  /**
+   * `relay.gateway_key_master_refs`, resolved: the derivation masters, which no
+   * gateway profile has held. Required, like the mode, so both ways of building
+   * a Runtime must say (empty is right for `shared`).
+   */
+  gatewayKeyMasters: string[];
   /** `relay.gateway_key_mode`. Required, so both ways of building a Runtime must say. */
   gatewayKeyMode: GatewayKeyMode;
   port: number;
@@ -141,17 +148,27 @@ async function serveRuntime(path: string): Promise<Runtime> {
     process.exit(1);
   }
   const relay = profile.relay;
-  const [connectionString, botToken, ...gatewaySecrets] = await Promise.all([
+  const [connectionString, botToken, sharedValues, masterValues] = await Promise.all([
     resolveSecretRef(profile.database.connection_secret_ref),
     resolveSecretRef(relay.telegram_bot_token_secret_ref),
-    ...relay.gateway_secret_refs.map((ref) => resolveSecretRef(ref)),
+    Promise.all(relay.gateway_secret_refs.map((ref) => resolveSecretRef(ref))),
+    Promise.all((relay.gateway_key_master_refs ?? []).map((ref) => resolveSecretRef(ref))),
   ]);
 
-  const resolved = gatewaySecrets.map((s) => s.trim()).filter(Boolean);
+  const resolved = sharedValues.map((s) => s.trim()).filter(Boolean);
   if (resolved.length === 0) {
     // Every ref resolved to whitespace. Continuing would serve a connector
     // that accepts no upgrade token at all and looks healthy doing it.
     log(structuredLog("error", "relay.empty_gateway_secrets", {}));
+    process.exit(1);
+  }
+  const masters = masterValues.map((s) => s.trim()).filter(Boolean);
+  // The derivation master must be one no gateway profile has held; every profile
+  // holds a shared-mode secret, so a master equal to one is refused. Fields are
+  // named, values never.
+  const masterProblem = gatewayKeyMasterProblem(relay.gateway_key_mode, resolved, masters);
+  if (masterProblem) {
+    log(structuredLog("error", "relay.gateway_key_master_invalid", { problem: masterProblem }));
     process.exit(1);
   }
   // The mode changes what the relay accepts and nothing else shows it, so it is
@@ -261,6 +278,7 @@ async function serveRuntime(path: string): Promise<Runtime> {
 
   return {
     gatewaySecrets: resolved,
+    gatewayKeyMasters: masters,
     gatewayKeyMode: relay.gateway_key_mode,
     port: relay.port,
     host: relay.bind_host,
@@ -290,6 +308,7 @@ function conformanceRuntime(secret: string): Runtime {
   return {
     gatewaySecrets,
     // The conformance harness stands in for a gateway signing with the secret itself.
+    gatewayKeyMasters: [],
     gatewayKeyMode: "shared",
     port: Number(process.env.RELAY_PORT ?? "4312"),
     host: process.env.RELAY_HOST ?? "127.0.0.1",
@@ -379,6 +398,7 @@ async function main(): Promise<void> {
 
   const connector = new RelayConnector({
     gatewaySecrets: runtime.gatewaySecrets,
+    gatewayKeyMasters: runtime.gatewayKeyMasters,
     gatewayKeyMode: runtime.gatewayKeyMode,
     telegram: runtime.telegram,
     port: runtime.port,

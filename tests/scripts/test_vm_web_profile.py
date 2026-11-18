@@ -550,6 +550,42 @@ class ConfigurationIsCheckedBeforeTheSwitch(unittest.TestCase):
         all_three = {**base, "RUNTIME_TRIP_KEY_MASTER": "cp-key-0001", "RUNTIME_LEGACY_TRIP_KEY": "cp-key-0001"}
         self.assertEqual(len(vr.web_config_problems(all_three, self.profile())), 3)
 
+    def test_a_relay_derivation_master_that_is_a_shared_secret_is_a_problem_named_without_the_value(self):
+        """#597 K1: in both/derived the derivation master must be one no gateway profile has
+        held; the relay and the companion control MCP refuse to start otherwise, so found
+        here it is a refused plan. Fields are named, values never."""
+        data = self.profile()
+        data["relay"] = {**data.get("relay", {}), "gateway_secret_refs": ["env://SHARED_REF", "env://SHARED_PREVIOUS_REF"]}
+        env = {**self.GOOD_ENV, "SHARED_REF": "shared-value-0001", "SHARED_PREVIOUS_REF": "shared-value-0002",
+               "MASTER_REF": "master-value-0001"}
+
+        def check(mode, masters, env=env):
+            relay = {**data["relay"], "gateway_key_mode": mode}
+            if masters is not None:
+                relay["gateway_key_master_refs"] = masters
+            return vr.web_config_problems(env, {**data, "relay": relay})
+
+        # shared: nothing is compared, whatever the refs hold.
+        self.assertEqual(check("shared", ["env://SHARED_REF"]), [])
+        self.assertEqual(check("shared", None), [])
+        for mode in ("both", "derived"):
+            self.assertEqual(check(mode, ["env://MASTER_REF"]), [], mode)
+            missing = check(mode, None)
+            self.assertEqual(len(missing), 1, missing)
+            self.assertIn("relay.gateway_key_master_refs is missing", missing[0])
+            # Same value reached through a different reference, and through a later one in the rotation list.
+            for refs, equal_env in ((["env://MASTER_REF"], {**env, "MASTER_REF": "shared-value-0001"}),
+                                    (["env://MASTER_REF"], {**env, "MASTER_REF": "shared-value-0002"})):
+                problems = check(mode, refs, equal_env)
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn("relay.gateway_key_master_refs secret equals a relay.gateway_secret_refs secret", problems[0])
+                for value in ("shared-value-0001", "shared-value-0002", "master-value-0001"):
+                    self.assertNotIn(value, problems[0])
+            # The same reference in both lists.
+            same = check(mode, ["env://SHARED_REF"])
+            self.assertTrue(any("is also in relay.gateway_secret_refs" in p for p in same), same)
+        self.assertEqual(check("Derived", ["env://MASTER_REF"]), ["relay.gateway_key_mode is not shared, both or derived"])
+
     def test_origins_that_disagree_with_the_profile_are_a_problem(self):
         problems = vr.web_config_problems({**self.GOOD_ENV, "PORTAL_ORIGIN": "https://elsewhere.example.com"}, self.profile())
         self.assertEqual(problems, ["PORTAL_ORIGIN differs from the profile's web.public_origin"])

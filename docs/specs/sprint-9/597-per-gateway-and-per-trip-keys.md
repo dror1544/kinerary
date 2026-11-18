@@ -35,14 +35,21 @@ produce the others never leaves the components that need it.
   `derive(m, id) = hex(HMAC-SHA256(m, "kinerary-relay-gateway:v1:" + id))`.
   The gateway signs its token with that key exactly as it signs today, so the
   Hermes side does not change.
+- The **derivation master** is a secret no gateway profile has ever held:
+  `relay.gateway_key_master_refs` (a rotation list), separate from
+  `relay.gateway_secret_refs`, which keeps meaning "the shared-mode secrets".
+  Turning on per-gateway keys is a rotation, like K2: a NEW secret is added
+  first.
 - The relay verifies a token by deriving the key for the id the token names.
   A key derived for one id cannot sign for another.
 - `relay.gateway_key_mode` in the architecture profile: `shared` (default,
-  today's behaviour), `both` (accept either, for the changeover) or `derived`
-  (a token signed with a master is refused). The relay and the companion
-  control MCP read the same setting.
-- Enrolling a gateway writes the derived key when the mode is `both` or
-  `derived`, and the master otherwise.
+  today's behaviour: a token signed with a `gateway_secret_refs` secret),
+  `both` (accept that, or a key derived from `gateway_key_master_refs`, for the
+  changeover) or `derived` (only a key derived from `gateway_key_master_refs`;
+  `gateway_secret_refs` is not consulted, so the old shared secret opens
+  nothing). The relay and the companion control MCP read the same setting.
+- Enrolling a gateway writes the key derived from the derivation master when
+  the mode is `both` or `derived`, and the shared secret otherwise.
 - `scripts/relay-rekey.py` rewrites the relay key of existing profiles on a
   host, so a deployment can move from `shared` through `both` to `derived`.
 
@@ -79,22 +86,26 @@ produce the others never leaves the components that need it.
   matches published test vectors, and the shell and Python minters produce the
   same value for the same inputs (one shared vector file, read by the
   TypeScript and Python tests).
-- **AC-K1.2 Modes.** For a token for id A:
-  - in `shared` mode it verifies only when signed with a master;
-  - in `derived` mode it verifies only when signed with `derive(master, A)`;
+- **AC-K1.2 Modes.** For a token for id A, with S the shared secrets
+  (`gateway_secret_refs`) and M the derivation masters
+  (`gateway_key_master_refs`; AC-K1.7):
+  - in `shared` mode it verifies only when signed with a secret in S;
+  - in `derived` mode it verifies only when signed with `derive(m, A)` for m in
+    M;
   - in `both` mode it verifies with either.
-  In every mode a token signed with `derive(master, B)` and naming A is
-  refused. Rotation (several masters) works in every mode. The comparison stays
-  constant-time across all candidates.
+  In every mode a token signed with `derive(m, B)` and naming A is refused.
+  Rotation (several secrets, several masters) works in every mode. The
+  comparison stays constant-time across all candidates.
 - **AC-K1.3 One setting, two checkers.** The relay connector (WebSocket upgrade
   and media plane) and `companion-mcp.ts` take the mode from the same
   architecture-profile field. An unknown value fails config load. Absent means
   `shared`.
 - **AC-K1.4 Enrolment.** `enroll_relay` writes `GATEWAY_RELAY_SECRET =
-  derive(master, profile)` and mints `COMPANION_CONTROL_TOKEN` with that key
-  when the architecture profile's mode is `both` or `derived`; it writes
-  today's values otherwise. The master never appears in the profile's `.env`
-  in those modes. No key is printed or put on a command line.
+  derive(m, profile)` (m = `gateway_key_master_refs[0]`, AC-K1.8) and mints
+  `COMPANION_CONTROL_TOKEN` with that key when the architecture profile's mode
+  is `both` or `derived`; it writes today's values otherwise. Neither the
+  derivation master nor the shared secret appears in the profile's `.env` in
+  those modes. No key is printed or put on a command line.
 - **AC-K1.5 Re-key.** `scripts/relay-rekey.py --profile <name>[,<name>…] |
   --all-enrolled`:
   - prints a plan (profile, gateway id, `shared → derived` or `already
@@ -110,6 +121,46 @@ produce the others never leaves the components that need it.
 - **AC-K1.6 Interviewer and multiplex.** The re-key script works for any
   enrolled profile, the interviewer included. The docs that tell an operator to
   set `GATEWAY_RELAY_SECRET` say what value to set in each mode.
+- **AC-K1.7 The derivation master is one no profile has held** (owner review of
+  #599, F1). `relay.gateway_key_master_refs` is required (at least one
+  reference) when `gateway_key_mode` is `both` or `derived`; config load fails
+  without it, and fails when a reference in it is also in
+  `gateway_secret_refs`.
+  - `shared` verifies against `gateway_secret_refs` only. `both` verifies
+    against `gateway_secret_refs` or a key derived from
+    `gateway_key_master_refs`. `derived` verifies only against a key derived
+    from `gateway_key_master_refs` and does not consult `gateway_secret_refs`.
+    A key derived from a shared secret verifies in no mode.
+  - The relay (both ways of building its runtime, and the connector itself) and
+    `companion-mcp.ts` refuse to start in `both` or `derived` when any resolved
+    derivation master equals any resolved shared secret. The error names the
+    two fields and never a value.
+  - `vm-release.py`'s pre-switch configuration check reports the same
+    condition (and a missing `gateway_key_master_refs`) for the references it
+    can read, so it is a refused plan instead of a failed start.
+  - Tested live-shaped: with a profile holding the old shared secret, after the
+    re-key and `derived`, a key derived from that secret is refused for every
+    gateway id on the WebSocket upgrade, on the media plane and by
+    `companion-mcp`, and a key derived from the new master for its own id is
+    accepted on all three.
+- **AC-K1.8 Enrolment and re-key derive from the derivation master.**
+  `enroll_relay` and `scripts/relay-rekey.py` derive from
+  `gateway_key_master_refs[0]` (a `file://` reference, like today), and refuse
+  when it is missing, unreadable, or equal to a shared secret in
+  `gateway_secret_refs`; the refusal names fields, never a value. `enroll_relay`
+  writes nothing and says `UNENROLLED`; `relay-rekey.py` writes nothing at all.
+  No key on a command line, 0600 atomic writes, no key printed, and the script
+  still parses under macOS `/bin/bash` 3.2. The re-key plan reports a profile
+  holding a shared secret as `shared -> derived`.
+- **AC-K1.9 Derived keys and token signatures are separate domains.** In every
+  mode `verifyUpgradeToken` refuses a token whose id begins with the derivation
+  label (`kinerary-relay-gateway:`), whoever signed it. In `both` and `derived`
+  a derived key is considered only for an id containing no `:`;
+  `deriveGatewayKey` throws for one, and `enroll_relay` and `relay-rekey.py`
+  refuse such an id. In `shared` a token for an id with colons still verifies
+  (the conformance vector `gw:with:colons` is unchanged). Real gateway ids are
+  profile names (`^[a-z0-9][a-z0-9-]{1,62}$`), which contain no `:`. The shared
+  vector file lists the refused ids (`refused_ids`) for all three minters.
 
 ### K2
 
@@ -179,6 +230,10 @@ produce the others never leaves the components that need it.
   purpose is never valid for the other.
 - `both` modes are transitional. A deployment is not hardened until the relay
   is `derived` and no route is `shared`.
+- The derivation master must be one no gateway profile has held (AC-K1.7).
+  Deriving per-gateway keys from the shared secret would leave every profile
+  able to compute every other gateway's key.
+- Derived keys and token signatures are kept in separate domains (AC-K1.9).
 - `boundary-reviewer` reviews both parts before any merge, with evidence for
   AC-K1.2, K1.4 and K2.3.
 
@@ -193,7 +248,14 @@ with a derived key and opened from the portal.
 
 ## Rollout
 
-Staging first: K1 `shared → both`, re-key, restart gateways, `derived`. K2, in
+Staging first: K1, in this order, each step required: (1) a NEW derivation
+master goes into `relay.gateway_key_master_refs` (it must not be a secret any
+gateway profile holds: the services refuse to start if it is; the mode is still
+`shared`, so nothing changes); (2) `shared → both`, restart the relay and the
+companion control MCP; (3) `scripts/relay-rekey.py --all-enrolled` (plan, then
+`--execute`) and restart each gateway it lists; (4) `derived`, restart the relay
+and the companion control MCP. What the old shared secret opens: in `shared` and
+`both`, a gateway connection; in `derived`, nothing. K2, in
 this order, each step required: (1) the migration; (2) the current
 `RUNTIME_EXCHANGE_KEY` becomes `RUNTIME_LEGACY_TRIP_KEY` on the gateway, a NEW
 `RUNTIME_EXCHANGE_KEY` goes to the API and the gateway together, a NEW master goes

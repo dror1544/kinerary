@@ -460,22 +460,37 @@ function hostRouteFromBody(body) {
   return { tripId: body.tripId, upstreamOrigin: url.origin };
 }
 
+// Every "cannot route this name" answer is a null route, so the caller answers the one uniform 404 page: a
+// registry that says the registered upstream is invalid (503 RUNTIME_ROUTE_INVALID), and an answer this
+// gateway's own origin validation refuses. The real reason is logged here, once per lookup, and the null is
+// cached no longer than any other miss. Only "the control plane could not be asked" throws (503).
+function hostRouteInvalid(host, reason) {
+  console.error(`runtime_gateway.host_route_invalid host=${host} reason=${reason}`);
+  return null;
+}
+
 async function lookUpHost(host) {
   let response;
   try {
     response = await timedFetch(`${CONTROL_PLANE_ORIGIN}/internal/runtime-routes/by-host/${encodeURIComponent(host)}`, { headers: { "x-api-key": EXCHANGE_KEY } });
   } catch { throw Object.assign(new Error("HOST_LOOKUP_UNAVAILABLE"), { statusCode: 503 }); }
   if (response.status === 404) { await response.body?.cancel(); return null; }
+  if (response.status === 503) {
+    let reported;
+    try { reported = (await response.json())?.error; } catch { reported = undefined; }
+    if (reported === "RUNTIME_ROUTE_INVALID") return hostRouteInvalid(host, "registry_route_invalid");
+    throw Object.assign(new Error("HOST_LOOKUP_UNAVAILABLE"), { statusCode: 503 });
+  }
   if (!response.ok) { await response.body?.cancel(); throw Object.assign(new Error("HOST_LOOKUP_UNAVAILABLE"), { statusCode: 503 }); }
   let body;
   try { body = await response.json(); } catch { throw Object.assign(new Error("HOST_LOOKUP_UNAVAILABLE"), { statusCode: 503 }); }
   const route = hostRouteFromBody(body);
-  if (!route) throw Object.assign(new Error("HOST_ROUTE_INVALID"), { statusCode: 502 });
+  if (!route) return hostRouteInvalid(host, "origin_refused");
   return route;
 }
 
-// A route, or null for "no ready route for this name". Throws with a statusCode
-// when the registry cannot be asked or answered nonsense; that is never cached.
+// A route, or null for "no usable route for this name". Throws with a statusCode
+// when the registry cannot be asked; that is never cached.
 async function hostRouteFor(host) {
   const cached = hostRouteCache.get(host);
   if (cached && cached.expiresAt > Date.now()) return cached.route;
@@ -501,6 +516,13 @@ function hostFailure(res, status) {
   // Close the connection: the request body may be unread, and it is not worth draining.
   res.writeHead(status, { "content-type": "application/json", "content-length": data.length, "cache-control": "no-store", connection: "close" });
   res.end(data);
+}
+
+// A trip origin may only set host-only cookies: the Domain attribute (any case, any spacing, with or
+// without a leading dot) is removed from every upstream Set-Cookie and the rest of the cookie is kept.
+function hostOnlyCookie(cookie) {
+  const [pair, ...attributes] = String(cookie).split(";");
+  return [pair, ...attributes.filter((attribute) => !/^\s*domain\s*(?:=|$)/i.test(attribute))].join(";");
 }
 
 function proxyToHost(req, res, host, route) {
@@ -530,6 +552,7 @@ function proxyToHost(req, res, host, route) {
     const out = {};
     const hopNamed = String(upstreamResponse.headers.connection ?? "").toLowerCase().split(",").map((token) => token.trim()).filter(Boolean);
     for (const [name, value] of Object.entries(upstreamResponse.headers)) if (!HOP_BY_HOP.has(name) && !hopNamed.includes(name)) out[name] = value;
+    if (out["set-cookie"]) out["set-cookie"] = [].concat(out["set-cookie"]).map(hostOnlyCookie);
     res.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.statusMessage, out);
     upstreamResponse.pipe(res);
     upstreamResponse.on("error", () => res.destroy());
@@ -553,7 +576,7 @@ async function handleHostMode(req, res, mode) {
   try { route = await hostRouteFor(mode.host); }
   catch (error) {
     console.error(`runtime_gateway.host_lookup_failed: host=${mode.host} status=${error?.statusCode ?? 503}`);
-    return hostFailure(res, error?.statusCode === 502 ? 502 : 503);
+    return hostFailure(res, 503);
   }
   if (!route) return hostNotFound(res);
   return proxyToHost(req, res, mode.host, route);

@@ -98,14 +98,22 @@ unset every path behaves as it does today.
   unchanged, plus `X-Forwarded-Host`, `X-Forwarded-Proto` and an
   `X-Forwarded-For` that ends with the peer address. A client-sent
   `X-Forwarded-Prefix` is removed. The response's status, headers (including
-  `Set-Cookie`) and body are passed through unchanged. A `text/event-stream`
-  response streams, and closing the browser side closes the upstream.
+  `Set-Cookie`, except as AC-R1.12 says) and body are passed through unchanged.
+  A `text/event-stream` response streams, and closing the browser side closes
+  the upstream.
 - **AC-R1.7 Internal paths refused.** `/api/internal/*` on a trip host is 404
   and never reaches the upstream.
 - **AC-R1.8 Unknown hosts are uniform.** A host with no ready route gets one
   small 404 page, identical for every such host, with `cache-control: no-store`.
-  A miss is cached for at most 5 seconds and a hit for at most 30.
-- **AC-R1.9 Failure is closed.** A control plane that cannot be asked, or an
+  A miss is cached for at most 5 seconds and a hit for at most 30. Every
+  "cannot route this name" answer is that same page (owner review of #599, F4):
+  also a name whose registry answer is 503 `RUNTIME_ROUTE_INVALID`, and one whose
+  answer the gateway's own origin validation refuses, so the page does not tell
+  a registered name with a bad upstream from an unknown one. The real reason is
+  logged (`runtime_gateway.host_route_invalid host=<name> reason=...`) and the
+  answer is cached no longer than a miss.
+- **AC-R1.9 Failure is closed.** A control plane that cannot be asked (a timeout,
+  an unparseable answer, any 5xx other than `RUNTIME_ROUTE_INVALID`), or an
   upstream that cannot be reached, is 502/503. No request is ever proxied to an
   upstream other than the one the registry returned for that exact host.
 - **AC-R1.10 Uploads.** A request body larger than the gateway's JSON limits
@@ -132,6 +140,17 @@ unset every path behaves as it does today.
   /t/<id>/__launch` with the portal's Origin and a real grant row) reaches
   `/api/internal/control-plane/session` and ends in the 303. The same test fails
   against the lookup as it was (all three assertions).
+- **AC-R1.12 A trip origin can only set host-only cookies** (owner review of
+  #599, F2). In host mode the gateway removes the `Domain` attribute (any case,
+  any spacing, with or without a leading dot) from every `Set-Cookie` the
+  upstream sends and keeps the rest of each cookie as it was. Tested with a
+  dotted suffix domain and a parent domain.
+- **AC-R1.13 An IPv4 lookalike in `web.runtime_upstream_allowed_hosts` is refused
+  at config load** (owner review of #599, F5). An entry whose last label is
+  numeric or `0x`-hex, or whose labels are all numeric or hex, and which is not
+  a canonical dotted quad (`0300.0.2.10`, `0x7f.0.0.1`, `127.1`, `2130706433`)
+  would load as a hostname and match nothing. The load fails with a message
+  naming the entry and asking for the canonical dotted quad.
 
 ### R2: provisioning without per-trip records
 

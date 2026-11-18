@@ -171,34 +171,65 @@ Which key a gateway is given depends on `relay.gateway_key_mode` in the
 architecture profile (#597 K1). The relay and the companion control MCP read
 the same field; the installer reads it from the same profile.
 
+Two different secrets are involved, and keeping them apart is the point:
+
+- the **shared secret** (`relay.gateway_secret_refs`): what every gateway
+  profile holds in `shared` mode. It means "the shared-mode secrets" and
+  nothing else;
+- the **derivation master** (`relay.gateway_key_master_refs`, a rotation list
+  like the other): a different secret that **no gateway profile has ever
+  held**. Per-gateway keys are derived from it, and it is never written into a
+  profile's `.env`. It is required when the mode is `both` or `derived` (config
+  load fails without it), and the relay, the companion control MCP, the
+  installer and `relay-rekey.py` all refuse to run when it holds the same
+  value as a shared secret.
+
 | Mode | A gateway's `GATEWAY_RELAY_SECRET` | The relay accepts |
 |---|---|---|
-| `shared` (default; the field absent means this) | the relay's master secret, the same for every gateway | a token signed with a master |
-| `both` | `derive(master, <that gateway's id>)` | either of those |
-| `derived` | `derive(master, <that gateway's id>)` | only a token signed with the key derived for the id it names |
+| `shared` (default; the field absent means this) | the shared secret, the same for every gateway | a token signed with a shared secret |
+| `both` | `derive(derivation master, <that gateway's id>)` | a token signed with a shared secret, or with the key derived from the derivation master for the id it names |
+| `derived` | `derive(derivation master, <that gateway's id>)` | only a token signed with the key derived from the derivation master for the id it names; `gateway_secret_refs` is not consulted at all |
+
+What the old shared secret opens: in `shared` and `both`, a gateway
+connection and the media plane (for any id); in `derived`, **nothing**. A key
+derived from the shared secret is accepted in no mode.
 
 `derive(master, id)` is `hex(HMAC-SHA256(master, "kinerary-relay-gateway:v1:" + id))`,
 the 64-character hex string; the gateway uses that string as its HMAC key
-exactly as it uses a master string today, so the Hermes side does not change.
-The relay derives the key from the id the token names, so a key made for one
-id cannot sign for another. `COMPANION_CONTROL_TOKEN` is minted with the same
-key the profile holds. In `both` and `derived` the master is never written
-into a profile's `.env`.
+exactly as it uses a shared secret string today, so the Hermes side does not
+change. The relay derives the key from the id the token names, so a key made
+for one id cannot sign for another. Derived keys and token signatures are kept
+in separate domains: a token whose id begins with the derivation label is
+refused in every mode, and no derived key exists for an id containing `:`
+(real gateway ids are profile names, which never do). `COMPANION_CONTROL_TOKEN`
+is minted with the same key the profile holds.
 
 The **gateway id** is what is derived from: `GATEWAY_RELAY_ID` in that
 profile's `.env`. For a trip's own gateway that is the profile name; for the
 multiplexing interviewer it is its declared id (see the exception below), not
 its profile name.
 
-To move a deployment: set `both` and restart the relay and the companion
-control MCP; run `scripts/relay-rekey.py --all-enrolled` (a plan), then with
-`--execute`; restart each gateway it lists (it restarts nothing itself); once
-every gateway is re-keyed, set `derived` and restart the relay and the control
-MCP again. `relay-rekey.py` refuses to run in `shared`, because the relay
-would still be checking the master. A gateway enrolled by hand in `both` or
-`derived` takes the value from `relay-rekey.py`'s derivation, never the master.
-`both` is a changeover state; a deployment is not hardened until it is
-`derived`.
+To move a deployment, in this order:
+
+1. Create a NEW secret for the derivation master and add it to the
+   architecture profile as `relay.gateway_key_master_refs` (it must not be a
+   secret any profile holds; the services refuse to start if it is). Nothing
+   changes yet: the mode is still `shared`.
+2. Set `relay.gateway_key_mode` to `both`; restart the relay and the companion
+   control MCP. Existing gateways, still holding the shared secret, keep
+   working.
+3. Run `scripts/relay-rekey.py --all-enrolled` (a plan), then with `--execute`;
+   restart each gateway it lists (it restarts nothing itself). New enrolments
+   by `companion-install-host.sh` already write the derived key.
+4. When every gateway is re-keyed, set `derived`; restart the relay and the
+   control MCP again. From here the old shared secret opens nothing.
+5. Retire the shared secret once nothing refers to it (it can stay listed in
+   `gateway_secret_refs`, which `derived` does not consult).
+
+`relay-rekey.py` refuses to run in `shared`, because the relay would still be
+checking the shared secret. A gateway enrolled by hand in `both` or `derived`
+takes the value from `relay-rekey.py`'s derivation, never a shared secret. `both`
+is a changeover state; a deployment is not hardened until it is `derived`.
 
 Until 2026-09-10 nothing performed that step at all, and this section
 described the wrong command as though it did. Two trips shipped unenrolled.
