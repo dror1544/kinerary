@@ -1228,6 +1228,14 @@ textarea { min-height: 132px; resize: vertical; }
 .video-layout.modern-trip-app { padding-bottom: calc(64px + 12px + 24px + env(safe-area-inset-bottom, 0px)); }
 .video-layout .bottom-nav { bottom: calc(12px + env(safe-area-inset-bottom, 0px)); }
 .video-layout .bottom-nav a.active { background: var(--go-chip-bg); }
+/* The same bar must not sit over a section title when something scrolls to it (a focused control, an anchor): the page's
+   scroll area and every heading keep the bar's height clear below them. The page's own foot is the padding above. */
+html:has(.video-layout) { scroll-padding-bottom: calc(64px + 12px + 24px + env(safe-area-inset-bottom, 0px)); }
+.video-layout h2, .video-layout h3 { scroll-margin-bottom: calc(64px + 12px + 24px + env(safe-area-inset-bottom, 0px)); }
+/* Account and Organizer settings: stacked panels with room between them (More's own grid gap, for the account page). */
+.video-layout .account-page { display: grid; gap: 20px; }
+.video-layout .organizer-settings .organizer-tools { padding: 18px; }
+.video-layout .organizer-settings .member-logins { margin-top: 0; }
 
 /* Today: one card for the whole day. */
 .day-card-panel { gap: 14px; padding: clamp(14px, 3vw, 26px); }
