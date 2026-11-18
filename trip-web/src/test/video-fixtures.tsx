@@ -49,7 +49,7 @@ export function todayContext(items: ItineraryItem[], extra: Partial<TodayContext
   };
 }
 
-export type Served = { config: unknown; today: TodayContext; items: ItineraryItem[]; days?: ItineraryDay[]; user?: Record<string, unknown> };
+export type Served = { config: unknown; today: TodayContext; items: ItineraryItem[]; days?: ItineraryDay[]; user?: Record<string, unknown>; settings?: Record<string, unknown>; flights?: unknown[]; bookings?: unknown[] };
 
 export const LABELLED_DAY: ItineraryDay = { phase_id: "colmar", date: TODAY, label_en: "Thu 12/3 — Wine Route", label_he: "יום ה׳ 3/12 — דרך היין" };
 
@@ -66,11 +66,12 @@ export function stubTripFetch(served: () => Served) {
       case "/api/hermes/status": return json({ identity: { name: "Victor" }, available: true, ask_in_telegram: false, telegram_username: null, verification_freshness: { open_issues: 0, checked_at: "" } });
       case "/api/itinerary/active": return json({ revision: "rev_1", days: state.days ?? [LABELLED_DAY], items: state.items });
       case "/api/today": return json(state.today);
+      case "/api/settings": return json({ timezone: null, group_change_line: true, nav_app: "google", ...(state.settings ?? {}) });
       case "/api/confirmations/summary": return json({ items: [] });
-      case "/api/operations/flights": return json({ statuses: [] });
+      case "/api/operations/flights": return json({ statuses: state.flights ?? [] });
       case "/api/moments": return json([]);
       case "/api/photos": return json([]);
-      case "/api/bookings": return json([]);
+      case "/api/bookings": return json(state.bookings ?? []);
       default: return json({ error: "not stubbed" }, 404);
     }
   });

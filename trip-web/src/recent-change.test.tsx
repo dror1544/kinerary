@@ -106,7 +106,7 @@ describe("relativeAgo", () => {
 });
 
 describe("AC-20: the same treatment on Plan, with the teal provenance only in the detail", () => {
-  it("shows Updated and the struck-through time on the Plan row; \"Updated from original\" only after Details is opened", async () => {
+  it("shows Updated and the struck-through time on the Plan row; \"Updated from original\" only after the row is opened", async () => {
     const items = dayItems(ago(5)).map((entry) => (entry.item_uid === "dinner" ? { ...entry, provenance: { status: "updated_from_original" } } : entry));
     serve(BOTH, items);
     renderTrip({ hash: "journey" });
@@ -116,7 +116,7 @@ describe("AC-20: the same treatment on Plan, with the teal provenance only in th
     expect(dinner.querySelector("del")?.textContent).toBe("20:00");
     // The kicker no longer carries the provenance; the detail does.
     expect(within(dinner).queryByText("Updated from original")).toBeNull();
-    fireEvent.click(within(dinner).getByRole("button", { name: "Details" }));
+    fireEvent.click(within(dinner).getByRole("button", { name: "Dinner at the Winstub" }));
     const detail = dinner.querySelector(".item-detail") as HTMLElement;
     expect(within(detail).getByText("Updated from original")).toBeInTheDocument();
     expect(dinner.querySelector(".item-kicker")?.textContent).not.toContain("Updated from original");

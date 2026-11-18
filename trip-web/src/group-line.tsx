@@ -7,10 +7,7 @@
 // (featureOn). The server is the boundary that matters: PATCH /api/settings refuses a member.
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./api";
-
-type Settings = { group_change_line?: boolean };
-
-const SETTINGS_KEY = ["trip-settings"] as const;
+import { SETTINGS_KEY, type TripSettings as Settings } from "./trip-settings";
 
 export function GroupLineToggle({ lang }: { lang: "en" | "he" }) {
   const queryClient = useQueryClient();

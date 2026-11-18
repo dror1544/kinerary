@@ -292,6 +292,9 @@ function schema(db) {
   // Video Release 1C: "tell the group when the plan changes" is on until an organizer turns it off. A trip
   // setting like the timezone, so it lives here and not in the trip file. Additive, defaulted, idempotent.
   try { db.exec('ALTER TABLE trip_settings ADD COLUMN group_change_line INTEGER NOT NULL DEFAULT 1 CHECK (group_change_line IN (0,1))'); } catch {}
+  // The organizer's navigation app for every Go chip: Google Maps (the default) or Waze. A trip setting like the
+  // two above. Additive, defaulted, idempotent.
+  try { db.exec("ALTER TABLE trip_settings ADD COLUMN nav_app TEXT NOT NULL DEFAULT 'google' CHECK (nav_app IN ('google','waze'))"); } catch {}
   db.prepare('INSERT OR IGNORE INTO trip_ui_settings (id, design_variant) VALUES (1, ?)').run(normalizeUiVariant(process.env.TRIP_DESIGN_VARIANT));
   db.prepare('INSERT OR IGNORE INTO trip_settings (id, timezone) VALUES (1, NULL)').run();
 }
@@ -1058,6 +1061,13 @@ function groupChangeLine(row) {
   return false;
 }
 
+// Only the exact string "waze" is Waze. A missing row, a missing column or any other value is the default, Google
+// Maps: unlike the group line, nobody is messaged by this, and "open the map as before" is the safe reading.
+const NAV_APPS = new Set(['google', 'waze']);
+function navApp(row) {
+  return row && row.nav_app === 'waze' ? 'waze' : 'google';
+}
+
 function tripSettings(db) {
   const row = db.prepare('SELECT * FROM trip_settings WHERE id = 1').get();
   return {
@@ -1066,6 +1076,7 @@ function tripSettings(db) {
     // older site had gets it there; a read that finds no row, no column or no value is NOT the default, it is a setting
     // nobody can read, and it reads as off (and says so once) rather than sending a trip's group a line nobody chose.
     group_change_line: groupChangeLine(row),
+    nav_app: navApp(row),
     updated_by: row?.updated_by || null,
     updated_at: row?.updated_at || null,
   };
@@ -1375,7 +1386,11 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
     if (hasLine && typeof body.group_change_line !== 'boolean') {
       return res.status(400).json({ error: 'group_change_line must be true or false' });
     }
-    if ((body.timezone !== undefined || !hasLine) && !isValidTimeZone(body.timezone)) {
+    const hasNav = body.nav_app !== undefined;
+    if (hasNav && !NAV_APPS.has(body.nav_app)) {
+      return res.status(400).json({ error: 'nav_app must be "google" or "waze"' });
+    }
+    if ((body.timezone !== undefined || !(hasLine || hasNav)) && !isValidTimeZone(body.timezone)) {
       return res.status(400).json({ error: 'timezone must be a valid IANA time zone identifier, e.g. "America/New_York"' });
     }
     // Store Intl's canonical spelling, never the caller's own — the same rule
@@ -1388,8 +1403,8 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
       ? new Intl.DateTimeFormat(undefined, { timeZone: body.timezone }).resolvedOptions().timeZone
       : null;
     db.prepare(
-      "UPDATE trip_settings SET timezone = COALESCE(?, timezone), group_change_line = COALESCE(?, group_change_line), updated_by = ?, updated_at = datetime('now') WHERE id = 1"
-    ).run(canonical, hasLine ? (body.group_change_line ? 1 : 0) : null, req.user.username);
+      "UPDATE trip_settings SET timezone = COALESCE(?, timezone), group_change_line = COALESCE(?, group_change_line), nav_app = COALESCE(?, nav_app), updated_by = ?, updated_at = datetime('now') WHERE id = 1"
+    ).run(canonical, hasLine ? (body.group_change_line ? 1 : 0) : null, hasNav ? body.nav_app : null, req.user.username);
     res.json(tripSettings(db));
   });
 
