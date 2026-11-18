@@ -1318,7 +1318,7 @@ textarea { min-height: 132px; resize: vertical; }
 .video-layout .flights-panel .flight-change { padding: 2px 8px; border-radius: 999px; background: #fff; color: var(--kit-ink); font-size: 12px; }
 .video-layout .flight-ok { color: var(--go-chip-bg); font-weight: 700; }
 /* A booking opened from a flight on Today. */
-.booking-card.is-focused { outline: 2px solid var(--go-chip-bg); outline-offset: 2px; }
+.video-layout .booking-card.is-focused { outline: 2px solid var(--go-chip-bg); outline-offset: 2px; }
 
 /* 1B: changed things are coral. Badge text is ink — white on #f26b3a is below 4.5:1. */
 .day-row.is-updated, .video-layout .timeline-item.is-updated { background: var(--change-tint); box-shadow: inset 0 0 0 1px var(--change-edge); }
