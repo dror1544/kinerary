@@ -4,6 +4,8 @@ import { structuredLog } from "./redaction.js";
 import { organizerIntroMessages, type IntroMessage, type ProactiveSettings } from "./companion-intro.js";
 import { issueGroupBindingToken } from "./group-binding.js";
 import { SIGN_IN_NOTICE_TYPE, signInNoticeText } from "./telegram-mini-app.js";
+import { confirmAudience, skippedLine } from "./trip-audience.js";
+import { renderPlanChangeLine, type PlanChange } from "./plan-change-line.js";
 
 interface OutboxRow {
   id: string;
@@ -13,6 +15,41 @@ interface OutboxRow {
   payload: Record<string, unknown> | null;
   attempt: number;
   max_attempts: number;
+  /** A role of the trip ("trip_group"), for a row that has no recipient: see trip-audience.ts. */
+  target: string | null;
+  binding_id: string | null;
+}
+
+export const TRIP_PLAN_CHANGED_TYPE = "trip_plan_changed";
+
+/**
+ * The group line, worded from the row's structured payload (`changes` and the trip's language, zone and the instant
+ * they are about). Null when nothing in it can be put into words: the row is then skipped, not sent empty.
+ * The payload is read through the same closed shape the poller writes; an unreadable one says nothing.
+ */
+function planChangedText(row: OutboxRow): string | null {
+  const payload = row.payload;
+  if (!payload || !Array.isArray(payload.changes)) return null;
+  const asOf = typeof payload.as_of === "string" ? new Date(payload.as_of) : null;
+  if (!asOf || Number.isNaN(asOf.getTime())) return null;
+  const changes = payload.changes.flatMap((entry): PlanChange[] => {
+    if (!entry || typeof entry !== "object") return [];
+    const e = entry as Record<string, unknown>;
+    if (e.kind !== "updated" && e.kind !== "added" && e.kind !== "removed") return [];
+    const str = (value: unknown) => (typeof value === "string" ? value : null);
+    return [{
+      kind: e.kind,
+      fields: Array.isArray(e.fields) ? e.fields.filter((f): f is string => typeof f === "string") : [],
+      date: str(e.date), time: str(e.time),
+      previous_date: str(e.previous_date), previous_time: str(e.previous_time),
+      text_he: str(e.text_he), text_en: str(e.text_en),
+    }];
+  });
+  return renderPlanChangeLine(changes, {
+    language: payload.language === "he" ? "he" : "en",
+    timeZone: typeof payload.time_zone === "string" ? payload.time_zone : "UTC",
+    now: asOf,
+  });
 }
 
 function payloadString(row: OutboxRow, key: string): string | null {
@@ -89,6 +126,7 @@ function operatorMessageTextFor(row: OutboxRow): string | null {
  */
 function messageTextFor(row: OutboxRow, options?: DispatchOptions): string | IntroMessage[] | null {
   if (row.notification_type.startsWith("operator_")) return operatorMessageTextFor(row);
+  if (row.notification_type === TRIP_PLAN_CHANGED_TYPE) return planChangedText(row);
   if (row.notification_type === SIGN_IN_NOTICE_TYPE) {
     // About an account, not a trip (trip_id is NULL). Wording lives with the
     // sign-in code that queues it.
@@ -196,7 +234,7 @@ export async function dispatchPendingTripNotifications(
   options?: DispatchOptions,
 ): Promise<number> {
   const { rows } = await db.query<OutboxRow>(
-    `SELECT id, trip_id, notification_type, recipient, payload, attempt, max_attempts
+    `SELECT id, trip_id, notification_type, recipient, payload, attempt, max_attempts, target, binding_id
      FROM control_plane.notification_outbox
      WHERE state = 'pending'
        AND (trip_id IS NOT NULL OR notification_type = '${SIGN_IN_NOTICE_TYPE}')
@@ -206,6 +244,13 @@ export async function dispatchPendingTripNotifications(
 
   let dispatched = 0;
   for (const row of rows) {
+    // A row addressed to a ROLE of the trip, not to a chat. Its `recipient` is never read (the database refuses one
+    // beside a target): the chat is the trip's own open binding, re-read now. Everything else below is the path every
+    // other type has always taken, untouched.
+    if (row.target != null) {
+      if (await dispatchTargetedRow(db, notification, row, log, options)) dispatched++;
+      continue;
+    }
     // The organizer's introduction carries a group-binding token, so one is
     // issued here — addressed to the chat this message is going to, which for a
     // DM is the organizer's own Telegram user id. That is what later makes a
@@ -306,4 +351,55 @@ export async function dispatchPendingTripNotifications(
     }
   }
   return dispatched;
+}
+
+/**
+ * One row addressed to a trip's audience (target set). Returns whether a message was sent.
+ *
+ * Order matters: the audience is confirmed FIRST (the binding must still be open and on this row's own trip), and only
+ * then is the text worded, so a group that left in between costs nothing and shows nothing. A row that cannot be
+ * delivered by its nature ends `skipped` with the reason in a structured log (no chat id in it), exactly as an
+ * unwordable type always has. A send that fails is retried like any other row, up to max_attempts.
+ */
+async function dispatchTargetedRow(
+  db: pg.Pool,
+  notification: NotificationAdapter,
+  row: OutboxRow,
+  log: (line: string) => void,
+  options?: DispatchOptions,
+): Promise<boolean> {
+  const skip = async (reason: Parameters<typeof skippedLine>[2]) => {
+    log(skippedLine(row.id, row.target, reason));
+    await db.query(
+      "UPDATE control_plane.notification_outbox SET state = 'skipped', updated_at = now() WHERE id = $1 AND state = 'pending'",
+      [row.id],
+    );
+    return false;
+  };
+  const audience = await confirmAudience(db, row);
+  if (!audience.ok) return skip(audience.reason);
+  const text = messageTextFor(row, options);
+  if (typeof text !== "string" || text.length === 0) return skip("no_text");
+  try {
+    // Plain text on purpose: the line carries a title a person typed, and no parse mode means it cannot be markup.
+    await notification.sendMessage({ chatId: audience.chatId, text });
+  } catch {
+    log(structuredLog("error", "outbox.dispatch_failed", {
+      safe_error_code: "NOTIFICATION_SEND_FAILED",
+      notification_id: row.id,
+    }));
+    await db.query(
+      `UPDATE control_plane.notification_outbox
+       SET state = CASE WHEN attempt + 1 >= max_attempts THEN 'failed' ELSE 'pending' END,
+           attempt = attempt + 1, updated_at = now()
+       WHERE id = $1`,
+      [row.id],
+    );
+    return false;
+  }
+  await db.query(
+    "UPDATE control_plane.notification_outbox SET state = 'sent', sent_at = now(), updated_at = now() WHERE id = $1",
+    [row.id],
+  );
+  return true;
 }

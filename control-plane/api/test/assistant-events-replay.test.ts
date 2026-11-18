@@ -28,7 +28,7 @@ import { describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { WebSocket } from "ws";
-import { resolveChatRoute, startFromDeepLink } from "../src/chat-router.js";
+import { startFromDeepLink } from "../src/chat-router.js";
 import { issueEnrollment } from "../src/enrollment.js";
 import { digestTelegramId } from "../src/identity.js";
 import { confirmIntakeForChat } from "../src/interview.js";
@@ -43,6 +43,7 @@ import {
 } from "../src/analytics/emitter.js";
 import { rollupAssistantEvents } from "../src/analytics/store.js";
 import { RelayConnector } from "../src/relay/connector.js";
+import { outboundScopeOptions } from "../src/relay/outbound-scope.js";
 import { dispatchUpdate, DEFAULT_STRINGS, OutageNoticeLimiter } from "../src/relay/dispatch.js";
 import { uiString } from "../src/intake-copy.js";
 import { GroupContext } from "../src/relay/group-context.js";
@@ -309,7 +310,7 @@ async function playWeek(pool: pg.Pool, tripId: string, events: RelayAssistantEve
     port: 0,
     log,
     // As server.ts wires it.
-    interviewChat: async (chatId: string) => (await resolveChatRoute(pool, chatId)).kind === "interview",
+    ...outboundScopeOptions(pool, undefined),
     ...(events ? { assistantEvents: events } : {}),
   });
   await connector.listen();

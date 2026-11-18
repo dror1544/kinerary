@@ -28,6 +28,9 @@ import {
   type SessionScope,
 } from "./portal-scope.js";
 import { verifyMiniAppInitData, type VerifiedInitData } from "./telegram-webapp-auth.js";
+import { runtimeUpstreamFor, upstreamHostAllowed } from "./runtime-upstream.js";
+
+export { upstreamHostAllowed };
 
 // The gateway's key, compared in constant time (a plain !== leaks how many
 // leading bytes were right).
@@ -37,33 +40,6 @@ function exchangeKeyMatches(supplied: unknown, expected: string): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
-/**
- * Is the registered upstream's host one the operator named in `web.runtime_upstream_allowed_hosts`?
- * Entries are exact hostnames, IPv4 addresses and IPv4 CIDR blocks (config.ts); an absent or empty list
- * allows nothing. `hostname` is `URL.hostname`, which has already canonicalised an IPv4 spelling such as
- * `0x7f.1`; an IPv6 literal (bracketed) matches nothing.
- */
-export function upstreamHostAllowed(hostname: string, allowed: readonly string[] | undefined): boolean {
-  if (!allowed?.length) return false;
-  const host = hostname.toLowerCase();
-  const ipv4 = (value: string): number | null => {
-    const parts = value.split(".");
-    if (parts.length !== 4 || !parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255)) return null;
-    return ((Number(parts[0]) << 24) | (Number(parts[1]) << 16) | (Number(parts[2]) << 8) | Number(parts[3])) >>> 0;
-  };
-  const address = ipv4(host);
-  for (const raw of allowed) {
-    const entry = raw.toLowerCase();
-    if (entry === host) return true;
-    const slash = entry.indexOf("/");
-    if (slash === -1 || address === null) continue;
-    const base = ipv4(entry.slice(0, slash)), bits = Number(entry.slice(slash + 1));
-    if (base === null || !Number.isInteger(bits) || bits < 0 || bits > 32) continue;
-    const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
-    if (((address & mask) >>> 0) === ((base & mask) >>> 0)) return true;
-  }
-  return false;
-}
 
 function opaque(prefix: string, bytes = 16): string {
   return `${prefix}_${randomBytes(bytes).toString("hex")}`;
@@ -1977,34 +1953,11 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
   app.get("/internal/runtime-routes/:tripId", async (request, reply) => {
     if (!exchangeKeyMatches(request.headers["x-api-key"], deps.runtimeExchangeKey)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
     const tripId = (request.params as { tripId?: string }).tripId ?? "";
-    const result = await deps.db.query<{ route_ref: string; private_url: string | null; upstream_url: string | null; trip_key: string }>(
-      `SELECT r.route_ref, r.trip_key, r.upstream_url, j.result->>'private_url' AS private_url
-       FROM control_plane.runtime_routes r
-       LEFT JOIN LATERAL (
-         SELECT result FROM control_plane.jobs
-         WHERE trip_id = r.trip_id AND state = 'succeeded' AND result ? 'private_url'
-         ORDER BY updated_at DESC LIMIT 1
-       ) j ON true
-       WHERE r.trip_id = $1 AND r.state = 'ready'`, [tripId]);
-    const row = result.rows[0];
-    if (!row?.private_url) return reply.code(404).send({ error: "RUNTIME_NOT_READY" });
-    if (row.upstream_url && deps.runtimeUpstreamAllowedHosts?.length) {
-      let lan: URL;
-      try { lan = new URL(row.upstream_url); } catch { return reply.code(503).send({ error: "RUNTIME_ROUTE_INVALID" }); }
-      if (!["http:", "https:"].includes(lan.protocol) || lan.username || lan.password || lan.pathname !== "/"
-        || lan.search || lan.hash || /[?#]/.test(row.upstream_url) || !upstreamHostAllowed(lan.hostname, deps.runtimeUpstreamAllowedHosts)) {
-        return reply.code(503).send({ error: "RUNTIME_ROUTE_INVALID" });
-      }
-      return { routeRef: row.route_ref, upstreamOrigin: lan.origin, upstreamBasePath: "", tripKey: row.trip_key };
-    }
-    let upstream: URL;
-    try { upstream = new URL(row.private_url); } catch { return reply.code(503).send({ error: "RUNTIME_ROUTE_INVALID" }); }
-    const allowed = deps.runtimeUpstreamHostSuffixes.some((suffix) => upstream.hostname === suffix || upstream.hostname.endsWith(`.${suffix}`));
-    if (!["http:", "https:"].includes(upstream.protocol) || upstream.username || upstream.password || upstream.search || upstream.hash || !allowed) {
-      return reply.code(503).send({ error: "RUNTIME_ROUTE_INVALID" });
-    }
-    // tripKey says which KIND of key this trip's site holds (never a key), so the gateway sends the right one.
-    return { routeRef: row.route_ref, upstreamOrigin: upstream.origin, upstreamBasePath: upstream.pathname.replace(/\/$/, ""), tripKey: row.trip_key };
+    // One lookup, shared with the group-line poller (runtime-upstream.ts), so both apply the same host allow-list
+    // and both reach a wildcard-routed trip at its registered LAN address. tripKey is the KIND of key, never a key.
+    const upstream = await runtimeUpstreamFor(deps.db, tripId, deps.runtimeUpstreamHostSuffixes, deps.runtimeUpstreamAllowedHosts);
+    if (!upstream.ok) return reply.code(upstream.status).send({ error: upstream.error });
+    return { routeRef: upstream.routeRef, upstreamOrigin: upstream.upstreamOrigin, upstreamBasePath: upstream.upstreamBasePath, tripKey: upstream.tripKey };
   });
 
   // The gateway's host mode asks "which trip is this Host?" (docs/runtime-session-exchange.md, "Host mode").

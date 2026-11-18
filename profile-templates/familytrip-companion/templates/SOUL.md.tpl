@@ -760,3 +760,4 @@ its public text using `publish_companion_group_update`. Never mirror private
 messages. Publish verified bot/group links with `set_companion_connection` when
 connected or reconnected; clear them when disconnected. A group-binding command
 must come from the control plane with its real expiration, never a made-up token.
+`set_group_change_line` turns a trip's plan-change lines on or off, if the trip has them (the tool says when it does not): a trip setting, so only for the organizer, in their own private chat.

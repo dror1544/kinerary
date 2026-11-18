@@ -31,7 +31,8 @@ import { resolveSecretRef } from "../secrets.js";
 import type { SignupConfig } from "../signup.js";
 import { RelayConnector } from "./connector.js";
 import { gatewayKeyMasterProblem, type GatewayKeyMode } from "./protocol.js";
-import { renewCompanionConversation, resolveChatRoute, setCompanionExpectsReply } from "../chat-router.js";
+import { renewCompanionConversation, setCompanionExpectsReply } from "../chat-router.js";
+import { outboundScopeOptions } from "./outbound-scope.js";
 import { sayForChat,
   agentAlreadySpokeThisTurn,
   getSessionForChat,
@@ -407,16 +408,16 @@ async function main(): Promise<void> {
     log,
     ...(assistantEvents ? { assistantEvents } : {}),
     ...(runtime.multiplexGatewayId ? { fallbackGatewayId: runtime.multiplexGatewayId } : {}),
-    // Track 4: on an interview chat the agent's words reach the organizer only
-    // through `say_for_chat` / `ask_question_for_chat`, so the router keeps the
-    // keyboard, the record and the order. Resolved from the binding, never from
-    // anything the gateway says about itself — same rule as inbound routing.
+    // Outbound actions are scoped to the caller's own chats, and on an
+    // interview chat the agent's words reach the organizer only through
+    // `say_for_chat` / `ask_question_for_chat`, so the router keeps the
+    // keyboard, the record and the order. Both are decided from the chat's
+    // route (binding or live session), never from anything the gateway says
+    // about itself — same rule as inbound routing. No database, no resolver:
+    // every outbound action is refused.
+    ...outboundScopeOptions(runtime.db, runtime.interviewerProfile),
     ...(runtime.db
       ? {
-          interviewChat: async (chatId: string) => {
-            const route = await resolveChatRoute(runtime.db!, chatId);
-            return route.kind === "interview";
-          },
           // Anything the agent writes to an organizer mid-interview is routed
           // through `say`, not dropped. The router still delivers it, so it
           // keeps the keyboard, the record and the order — and a turn that

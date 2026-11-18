@@ -44,6 +44,9 @@ logger = logging.getLogger(__name__)
 # names: whether members may be told is the SITE's serving rule, not the worker's.
 REGISTERED_SWITCHES: tuple[str, ...] = (
     "delivery_probe",
+    "site_video_layout",
+    "plan_change_marks",
+    "plan_change_group_line",
 )
 
 # The subset of REGISTERED_SWITCHES whose registry entry says `memberVisible: true`:
@@ -52,6 +55,9 @@ REGISTERED_SWITCHES: tuple[str, ...] = (
 # Pinned to the JavaScript registry by tests/test_feature_block.py, like the names.
 MEMBER_VISIBLE_SWITCHES: tuple[str, ...] = (
     "delivery_probe",
+    "site_video_layout",
+    "plan_change_marks",
+    "plan_change_group_line",
 )
 
 FEATURES_KEY = "features"

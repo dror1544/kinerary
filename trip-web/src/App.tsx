@@ -20,6 +20,13 @@ import { AssistantConnect } from "./assistant-connect";
 import { Trivia } from "./trivia";
 import { heroCandidates, useHeroPhoto } from "./hero-photo";
 import { useTripUpdates, useLiveEditGuard } from "./live-updates";
+import { featureOn } from "./features";
+import { GroupLineToggle } from "./group-line";
+import { hasGoChip, mapUrlFor, navUrlFor, wazeUrlFor } from "./nav-links";
+import { useNavApp } from "./trip-settings";
+import { WeatherFlightsCard } from "./today-cards";
+import { useHeroScroll } from "./hero-scroll";
+import { ChangeBadge, ChangeTime, UpdatedForEveryone, changeClass, changeOf, movedFromLabel, useFreshChanges, weekdayName } from "./recent-change";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -116,7 +123,7 @@ import {
 } from "./api";
 
 type Tab = "today" | "journey" | "moments" | "more";
-type Module = "bookings" | "map" | "budget" | "photos" | "readiness" | "account" | "activities" | "lostfound" | "trivia" | "plan-tools";
+type Module = "bookings" | "map" | "budget" | "photos" | "readiness" | "account" | "activities" | "lostfound" | "trivia" | "plan-tools" | "companion";
 type Lang = "he" | "en";
 type BookingFilter = "phase" | "today" | "current" | "flight" | "hotel" | "attraction";
 type ItineraryTimeMode = "exact" | "rough" | "none";
@@ -130,6 +137,20 @@ const tabIcons = {
   moments: Camera,
   more: Menu,
 };
+
+// The two video-release switches (docs/specs/sprint-9/x-video-r1-site-look.md). Unknown = off: the current layout.
+// The change marks are drawn only inside the video layout — with plan_change_marks on and the layout off the server
+// still serves `recent_change` and this page ignores it (AC-4).
+export function videoLayoutOn(config?: TripConfig) { return featureOn(config, "site_video_layout"); }
+export function changeMarksOn(config?: TripConfig) { return videoLayoutOn(config) && featureOn(config, "plan_change_marks"); }
+
+type VideoTab = "today" | "plan" | "bookings" | "photos";
+const videoTabs: Array<{ id: VideoTab; en: string; he: string; icon: typeof Home }> = [
+  { id: "today", en: "Today", he: "היום", icon: Home },
+  { id: "plan", en: "Plan", he: "תוכנית", icon: Compass },
+  { id: "bookings", en: "Bookings", he: "הזמנות", icon: TicketCheck },
+  { id: "photos", en: "Photos", he: "תמונות", icon: Camera },
+];
 
 function text(value: unknown, lang: Lang) {
   if (!value) return "";
@@ -208,8 +229,12 @@ const moduleShortcuts: Array<{ id: Module; en: string; he: string }> = [
   { id: "plan-tools", en: "Plan tools", he: "כלי מסלול" },
 ];
 
+// The trip conversation is a page of its own in the video layout (it used to sit on Today): a module with a hash,
+// listed in the header menu. It is not in `moduleShortcuts` because that list feeds the current layout's lists too.
+const companionShortcut: { id: Module; en: string; he: string } = { id: "companion", en: "Trip conversation", he: "השיחה של הטיול" };
+
 function moduleLabel(module: Module, lang: Lang) {
-  const shortcut = moduleShortcuts.find((item) => item.id === module);
+  const shortcut = [...moduleShortcuts, companionShortcut].find((item) => item.id === module);
   return shortcut ? shortcut[lang] : module;
 }
 
@@ -218,7 +243,7 @@ function isTab(value: string): value is Tab {
 }
 
 function isModule(value: string): value is Module {
-  return moduleShortcuts.some((shortcut) => shortcut.id === value);
+  return moduleShortcuts.some((shortcut) => shortcut.id === value) || value === companionShortcut.id;
 }
 
 export function preferredLang(): Lang {
@@ -507,6 +532,10 @@ function TimelineItem({
   lang = "en",
   botName,
   telegramUsername,
+  videoLayout = false,
+  marks = false,
+  fresh = false,
+  destination = "",
 }: {
   item: ItineraryItem;
   compact?: boolean;
@@ -516,7 +545,15 @@ function TimelineItem({
   lang?: Lang;
   botName?: string;
   telegramUsername?: string | null;
+  /** site_video_layout: a Go chip, a Booked tick, and the original-plan provenance moved into the item's detail. */
+  videoLayout?: boolean;
+  /** plan_change_marks (inside the video layout): the Updated / New treatment. */
+  marks?: boolean;
+  /** The marker arrived while this page was open: play the short highlight. */
+  fresh?: boolean;
+  destination?: string;
 }) {
+  const [detailOpen, setDetailOpen] = useState(false);
   const [rsvpOpen, setRsvpOpen] = useState(false);
   const [ratingOpen, setRatingOpen] = useState(false);
   const [visitedPanels, setVisitedPanels] = useState({ rating: false, rsvp: false });
@@ -538,26 +575,53 @@ function TimelineItem({
     url: safeExternalUrl(link.url || link.href),
   })).filter((link) => link.url);
 
+  // The video layout (1A/1B). Everything below is inert with the switch off, so the current row is exactly what it was.
+  const change = videoLayout && marks ? changeOf(item) : undefined;
+  const moved = movedFromLabel(change, lang);
+  const previousTime = change?.fields.includes("time") && change.previous_time ? itineraryTimeLabel(change.previous_time, lang) : null;
+  const provenanceLabel = item.provenance?.status === "updated_from_original" ? copy(lang, "Updated from original", "עודכן מהתוכנית המקורית")
+    : item.provenance?.status === "added" ? copy(lang, "Added", "נוסף") : "";
+  const hasDetail = videoLayout && Boolean(provenanceLabel);
   return (
-    <article className={`timeline-item ${compact ? "compact" : ""}`}>
+    <article className={`timeline-item ${compact ? "compact" : ""}${changeClass(change)}${fresh ? " is-fresh" : ""}${hasDetail ? " has-detail" : ""}`}
+      onClick={hasDetail ? (event) => {
+        // The whole row is the control (no arrow, no separate button), but a tap on anything interactive inside it
+        // (Go, Rate, RSVP, a link, the title button itself) does that thing and does not also toggle the detail.
+        if ((event.target as HTMLElement).closest("a, button, input, select, textarea, label, [role='button']")) return;
+        setDetailOpen((open) => !open);
+      } : undefined}>
       <div className="time-rail">
-        <span>{itineraryTimeLabel(item.time, lang)}</span>
+        {change ? <ChangeTime time={itineraryTimeLabel(item.time, lang)} previous={previousTime} /> : <span>{itineraryTimeLabel(item.time, lang)}</span>}
         <i />
       </div>
       <div className="item-body">
         <div className="item-kicker">
           <Icon size={16} />
           <span>{itemTypeLabel(item.item_type, lang)}</span>
-          {item.provenance?.status === "updated_from_original" ? <b>{copy(lang, "Updated from original", "עודכן מהתוכנית המקורית")}</b> : null}
-          {item.provenance?.status === "added" ? <b>{copy(lang, "Added", "נוסף")}</b> : null}
+          {!videoLayout && provenanceLabel ? <b>{provenanceLabel}</b> : null}
+          <ChangeBadge change={change} lang={lang} />
+          {moved ? <small className="moved-from">{moved}</small> : null}
+          {videoLayout && item.booking ? <small className="booked-tick"><CheckCircle2 size={13} /> {copy(lang, "Booked", "הוזמן")}</small> : null}
         </div>
-        <h3>{title}</h3>
+        <h3>{hasDetail
+          ? <button className="item-title-toggle" type="button" aria-expanded={detailOpen} onClick={() => setDetailOpen((open) => !open)}>{title}</button>
+          : title}</h3>
         <div className="item-meta">
           {item.booking?.confirmation ? <span><CheckCircle2 size={14} /> {copy(lang, "Confirmation stored", "אישור שמור")}</span> : null}
-          {locationUrl ? <a href={locationUrl} target="_blank" rel="noreferrer"><MapPin size={14} /> {copy(lang, "Map", "מפה")}</a> : null}
-          {wazeUrl ? <a href={wazeUrl} target="_blank" rel="noreferrer"><Navigation size={14} /> Waze</a> : null}
+          {!videoLayout && locationUrl ? <a href={locationUrl} target="_blank" rel="noreferrer"><MapPin size={14} /> {copy(lang, "Map", "מפה")}</a> : null}
+          {!videoLayout && wazeUrl ? <a href={wazeUrl} target="_blank" rel="noreferrer"><Navigation size={14} /> Waze</a> : null}
           {item.confirmation_state && item.confirmation_state !== "verified" ? <span><AlertTriangle size={14} /> {copy(lang, "Needs review", "נדרשת בדיקה")}</span> : null}
         </div>
+        {videoLayout && hasGoChip(item) ? (
+          <div className="item-go-bar">
+            <GoChip item={item} title={title} destination={destination} lang={lang} />
+          </div>
+        ) : null}
+        {videoLayout && detailOpen ? (
+          <div className="item-detail">
+            {provenanceLabel ? <b className="provenance-note">{provenanceLabel}</b> : null}
+          </div>
+        ) : null}
         <div className="item-actions" aria-label={`Actions for ${title}`}>
           {venueId && <button className="item-action" type="button" aria-expanded={ratingOpen} aria-controls={`rating-${item.item_uid}`} ref={ratingButton} onClick={() => { setVisitedPanels(p => ({ ...p, rating: true })); setRatingOpen(open => !open); }}><Star size={15} />{ratingOpen ? copy(lang, "Hide rating", "סגירת הדירוג") : copy(lang, "Rate", "דירוג")}</button>}
           {rsvpId && <button className="item-action" type="button" aria-expanded={rsvpOpen} aria-controls={`rsvp-${item.item_uid}`} ref={rsvpButton} onClick={() => { setVisitedPanels(p => ({ ...p, rsvp: true })); setRsvpOpen(open => !open); }}><CheckCircle2 size={15} />{rsvpOpen ? copy(lang, "Hide RSVP", "סגירת ההשתתפות") : copy(lang, "RSVP", "אישור השתתפות")}</button>}
@@ -589,13 +653,19 @@ export function TripClockPanel({
   today,
   next,
   lang,
+  board = false,
 }: {
   config?: TripConfig;
   itinerary?: ActiveItinerary;
   today?: Awaited<ReturnType<typeof getToday>>;
   next?: ItineraryItem | null;
   lang: Lang;
+  /** Video layout: the trip's announcement board. Folded to one line unless the companion has a message for today. */
+  board?: boolean;
 }) {
+  const todaysMessage = (today?.companion_message?.date === today?.today && today?.companion_message?.[lang]) || "";
+  const [boardOpen, setBoardOpen] = useState<boolean | null>(null);
+  const expanded = !board || (boardOpen ?? Boolean(todaysMessage));
   const activePhaseId = next?.phase_id || today?.current?.phase_id || today?.next?.phase_id || "";
   const phase = config?.phases?.find((entry) => entry.id === activePhaseId)
     || config?.phases?.find((entry) => today?.today && entry.start && entry.end && entry.start <= today.today && entry.end >= today.today);
@@ -606,23 +676,40 @@ export function TripClockPanel({
   const label = today ? phaseLabel(today.phase, lang) : copy(lang, "Trip clock", "שעון הטיול");
   const destination = phase ? text(phase.title, lang) || phase.id : config?.meta?.destination || config?.meta?.title || copy(lang, "the journey", "הטיול");
 
+  const headline = today?.phase === "pre_trip" && today.countdown_days != null
+    ? copy(lang, `${Math.max(today.countdown_days, 0)} days until the adventure starts`, `נותרו ${Math.max(today.countdown_days, 0)} ימים עד תחילת ההרפתקה`)
+    : phaseDayIndex > 0
+      ? copy(lang, `Day ${phaseDayIndex} in ${destination}`, `יום ${phaseDayIndex} ב${destination}`)
+      : copy(lang, `Now tracking ${destination}`, `עוקבים עכשיו אחרי ${destination}`);
+  // The board is one control, the whole of it: a tap anywhere folds or unfolds it. No arrow; aria-expanded says which.
+  const boardControl = board ? {
+    role: "button" as const,
+    tabIndex: 0,
+    "aria-expanded": expanded,
+    onClick: () => setBoardOpen(!expanded),
+    onKeyDown: (event: React.KeyboardEvent) => {
+      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setBoardOpen(!expanded); }
+    },
+  } : {};
+  if (board && !expanded) {
+    return (
+      <section className="clock-panel clock-board is-folded" {...boardControl}>
+        <Clock3 size={18} aria-hidden="true" />
+        <span className="clock-board-line">{headline}</span>
+      </section>
+    );
+  }
   return (
-    <section className="clock-panel">
+    <section className={board ? "clock-panel clock-board" : "clock-panel"} {...boardControl}>
       <div className="clock-orb" aria-hidden="true">
         <Clock3 size={24} />
         <span>{today?.countdown_days != null && today.countdown_days > 0 ? today.countdown_days : totalIndex || "•"}</span>
       </div>
       <div className="clock-copy">
         <span className="panel-label"><Route size={16} /> {label}</span>
-        <h3>
-          {today?.phase === "pre_trip" && today.countdown_days != null
-            ? copy(lang, `${Math.max(today.countdown_days, 0)} days until the adventure starts`, `נותרו ${Math.max(today.countdown_days, 0)} ימים עד תחילת ההרפתקה`)
-            : phaseDayIndex > 0
-              ? copy(lang, `Day ${phaseDayIndex} in ${destination}`, `יום ${phaseDayIndex} ב${destination}`)
-              : copy(lang, `Now tracking ${destination}`, `עוקבים עכשיו אחרי ${destination}`)}
-        </h3>
+        <h3>{headline}</h3>
         {totalDays > 0 && totalIndex > 0 && <p>{copy(lang, `Trip day ${totalIndex} of ${totalDays}.`, `יום ${totalIndex} מתוך ${totalDays} בטיול.`)}</p>}
-        <p>{(today?.companion_message?.date === today?.today && today?.companion_message?.[lang]) || copy(lang,
+        <p>{todaysMessage || copy(lang,
           "Take today at your own pace. Some of the best moments are the ones you didn't plan.",
           "קחו את היום בקצב שלכם. לפעמים הרגעים הכי יפים הם אלה שלא תכננתם.",
         )}</p>
@@ -640,9 +727,8 @@ export function UpcomingActivity({ item, config, lang, onOpenItinerary }: {
   const title = itemTitle(item, lang);
   const phase = config?.phases?.find((entry) => entry.id === item.phase_id);
   const destination = text(phase?.title, lang);
-  const mapUrl = safeExternalUrl(item.location_url) || safeExternalUrl(item.booking?.location_url)
-    || `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent([title, destination].filter(Boolean).join(", "))}`;
-  const wazeUrl = safeExternalUrl(item.waze_url) || safeExternalUrl(item.booking?.place?.waze_url);
+  const mapUrl = mapUrlFor(item, title, destination);
+  const wazeUrl = wazeUrlFor(item);
   const confirmationUrl = safeFileUrl("/api/bookings/confirmation", item.booking?.conf_file);
   return <article className="timeline-item compact upcoming-activity">
     <div className="time-rail"><span>{itineraryTimeLabel(item.time, lang)}</span><i /></div>
@@ -659,18 +745,213 @@ export function UpcomingActivity({ item, config, lang, onOpenItinerary }: {
   </article>;
 }
 
+
+// ── The video layout (Release 1A/1B; docs/specs/sprint-9/x-video-r1-site-look.md) ─────────────────────────
+// Everything from here to TodayView renders only behind `site_video_layout`.
+
+/** The Go chip: opens the item's place in the navigation app the organizer chose for the trip (Google Maps by default). */
+export function GoChip({ item, title, destination, lang }: { item: ItineraryItem; title: string; destination?: string; lang: Lang }) {
+  const navApp = useNavApp();
+  return (
+    <a className="go-chip" href={navUrlFor(item, title, destination, navApp)} target="_blank" rel="noreferrer"
+      aria-label={copy(lang, `Go to ${title}`, `ניווט אל ${title}`)}>
+      <Navigation size={14} aria-hidden="true" />{copy(lang, "Go", "ניווט")}
+    </a>
+  );
+}
+
+export function DayRow({ item, config, lang, isNext, marks, fresh, onOpenItinerary }: {
+  item: ItineraryItem;
+  config?: TripConfig;
+  lang: Lang;
+  isNext: boolean;
+  marks: boolean;
+  fresh: boolean;
+  onOpenItinerary: (focus: JourneyFocus) => void;
+}) {
+  const title = itemTitle(item, lang);
+  const destination = text(config?.phases?.find((entry) => entry.id === item.phase_id)?.title, lang);
+  const change = marks ? changeOf(item) : undefined;
+  const moved = movedFromLabel(change, lang);
+  const previousTime = change?.fields.includes("time") && change.previous_time ? itineraryTimeLabel(change.previous_time, lang) : null;
+  return (
+    <li className={`day-row${changeClass(change)}${isNext ? " is-next" : ""}${fresh ? " is-fresh" : ""}`} data-item-uid={item.item_uid}>
+      <span className="day-row-time">
+        {change ? <ChangeTime time={itineraryTimeLabel(item.time, lang)} previous={previousTime} /> : <bdi dir="ltr">{itineraryTimeLabel(item.time, lang)}</bdi>}
+      </span>
+      <div className="day-row-main">
+        <button className="day-row-title" type="button" onClick={() => onOpenItinerary({ phaseId: item.phase_id, date: item.date || undefined, itemUid: item.item_uid })}>{title}</button>
+        <span className="day-row-flags">
+          {isNext ? <small className="next-marker">{copy(lang, "Next", "הבא")}</small> : null}
+          <ChangeBadge change={change} lang={lang} />
+          {moved ? <small className="moved-from">{moved}</small> : null}
+          {item.booking ? <small className="booked-tick"><CheckCircle2 size={13} /> {copy(lang, "Booked", "הוזמן")}</small> : null}
+        </span>
+      </div>
+      <div className="day-row-actions">
+        {hasGoChip(item) ? <GoChip item={item} title={title} destination={destination} lang={lang} /> : null}
+      </div>
+    </li>
+  );
+}
+
+// "Thursday · Wine Route": the plan day's own label (its descriptive part, as the day picker shows it), else the phase.
+function dayCardLabel(day: ItineraryDay | undefined, phaseName: string, lang: Lang) {
+  const labelled = day && (day.label_he || day.label_en) ? daySelectorSubtitle(day, lang) : "";
+  return labelled && labelled !== day?.phase_id ? labelled : phaseName;
+}
+
+export function DayCard({ today, itinerary, config, lang, marks, onOpenItinerary }: {
+  today: TodayContext;
+  itinerary?: ActiveItinerary;
+  config?: TripConfig;
+  lang: Lang;
+  marks: boolean;
+  onOpenItinerary: (focus: JourneyFocus) => void;
+}) {
+  const beforeTrip = today.phase === "pre_trip";
+  const date = beforeTrip ? (today.first_date || "") : today.today;
+  // The day's items come from /api/today as served; a row also takes its booking from the plan, which /api/today does not join.
+  const rows = useMemo(() => {
+    const planned = new globalThis.Map((itinerary?.items || []).map((item) => [item.item_uid, item]));
+    const served = beforeTrip ? (itinerary?.items || []).filter((item) => item.date === date) : today.events;
+    return collapseSameFlight(served.map((item) => ({ ...item, booking: item.booking ?? planned.get(item.item_uid)?.booking ?? null })));
+  }, [beforeTrip, date, itinerary?.items, today.events]);
+  const fresh = useFreshChanges(rows);
+  const day = itinerary?.days.find((entry) => entry.date === date);
+  const phaseId = day?.phase_id || rows[0]?.phase_id || today.next?.phase_id || "";
+  const phase = config?.phases?.find((entry) => entry.id === phaseId) || (beforeTrip ? config?.phases?.[0] : undefined);
+  const label = dayCardLabel(day, phase ? text(phase.title, lang) : "", lang);
+  const title = [date ? weekdayName(date, lang) : "", label].filter(Boolean).join(" · ") || copy(lang, "Today", "היום");
+  const nextUid = today.next?.date === date ? today.next.item_uid : "";
+  const changes = marks ? rows.map((row) => changeOf(row)).filter((change): change is NonNullable<typeof change> => Boolean(change)) : [];
+  const days = Math.max(today.countdown_days ?? 0, 0);
+  return (
+    <>
+      <section className="day-card" aria-label={title}>
+        <header className="day-card-head">
+          <h2>{title}</h2>
+          {beforeTrip ? <p className="day-card-starts">{days === 1 ? copy(lang, "Starts tomorrow", "מתחיל מחר") : copy(lang, `Starts in ${days} days`, `מתחיל בעוד ${days} ימים`)}</p> : null}
+        </header>
+        {rows.length ? (
+          <ol className="day-rows">
+            {rows.map((row) => (
+              <DayRow key={row.item_uid} item={row} config={config} lang={lang} isNext={row.item_uid === nextUid} marks={marks} fresh={fresh.has(row.item_uid)} onOpenItinerary={onOpenItinerary} />
+            ))}
+          </ol>
+        ) : (
+          <p className="empty-state">
+            {copy(lang, "Nothing is planned for this day yet.", "עוד אין תוכנית ליום הזה.")}{" "}
+            <a href="#journey">{copy(lang, "Open the plan", "פתיחת התוכנית")}</a>
+          </p>
+        )}
+      </section>
+      {changes.length ? (
+        <UpdatedForEveryone changes={changes} lang={lang} avatars={(config?.participants || []).map((person) => (
+          <PersonAvatar key={person.username} username={person.username} name={personName(person, lang)} color={person.color} size="small" />
+        ))} />
+      ) : null}
+    </>
+  );
+}
+
+// A skyline drawn in code (no raster file): gabled roofs and one church spire, for a trip with no hero photo.
+function SkylineMotif() {
+  return (
+    <svg className="skyline-motif" viewBox="0 0 600 120" preserveAspectRatio="xMidYEnd slice" aria-hidden="true" focusable="false">
+      <path fill="currentColor" d="M0 120V84l18-14 18 14v-8h22V62l20-16 20 16v14h18V90h26V70l16-18 16 18v20h24V76h20l20-24 20 24h18V96h28V58l8-10V28l4-14 4 14v20l8 10v38h26V80l20-16 20 16v14h24V74h18l18-18 18 18v22h26V82h20l16-14 16 14v10h28V68l22-20 22 20v26h24V86h20l16-12 16 12v34z" />
+    </svg>
+  );
+}
+
+function videoPlacePhaseId(config?: TripConfig, itinerary?: ActiveItinerary, today?: TodayContext) {
+  const phases = config?.phases || [];
+  if (!phases.length) return "";
+  if (today?.phase === "pre_trip") return phases[0]!.id;
+  if (today?.phase === "post_trip") return phases[phases.length - 1]!.id;
+  return todayPhaseId(config, itinerary, today) || phases[0]!.id;
+}
+
+function videoTabLabel(tab: VideoTab, lang: Lang) {
+  const entry = videoTabs.find((item) => item.id === tab)!;
+  return lang === "he" ? entry.he : entry.en;
+}
+
+/** The header of the video layout: logo and title, "<place> · <tab>", the signed-in user and More. */
+export function VideoHero({ config, settings, lang, placePhaseId, pageName, active, openVideoTab, openMenu, currentUser }: {
+  config?: TripConfig;
+  settings?: { hero: { url: string | null; focal_x: number; focal_y: number } };
+  lang: Lang;
+  placePhaseId: string;
+  /** What the page is called after the dot: the tab, or the module when one is open. */
+  pageName: string;
+  active: VideoTab | null;
+  openVideoTab: (tab: VideoTab) => void;
+  openMenu: () => void;
+  currentUser?: CurrentUser;
+}) {
+  const place = text(config?.phases?.find((phase) => phase.id === placePhaseId)?.title, lang);
+  const { photo, unavailable } = useHeroPhoto(heroCandidates(config, settings?.hero.url, placePhaseId));
+  const heroLogo = tripLogoUrl(config?.meta?.logo) || brandMark;
+  const heroLogoAlt = config?.meta?.logoAlt || config?.meta?.title || "Trip";
+  const backgroundPosition = `${(settings?.hero.focal_x ?? 0.5) * 100}% ${(settings?.hero.focal_y ?? 0.45) * 100}%`;
+  // Scroll-linked header (hero-scroll.ts): shrinks to a compact bar going down, stretches when pulled at the top.
+  const heroRef = useRef<HTMLElement>(null);
+  const compact = useHeroScroll(heroRef);
+  return (
+    <header ref={heroRef} className={`trip-hero video-hero${compact ? " is-compact" : ""}`} data-photo-state={photo ? "ready" : unavailable ? "unavailable" : "loading"}>
+      {photo ? <div key={photo} className="hero-image-layer video-hero-photo" aria-hidden="true" style={{ backgroundImage: `url("${photo}")`, backgroundPosition }} /> : <SkylineMotif />}
+      <div className={`video-hero-wash ${photo ? "is-photo" : "is-skyline"}`} aria-hidden="true" />
+      <nav className="topline" aria-label="Trip">
+        <a className="brand-lockup" href="#today" onClick={() => openVideoTab("today")} aria-label="Kinerary home">
+          <img className="hero-logo" src={heroLogo} alt={heroLogoAlt} />
+          <strong>{config?.meta?.title || "Family Trip"}</strong>
+        </a>
+        <div className="desktop-tabs">
+          {videoTabs.map((tab) => (
+            <a key={tab.id} href={tab.id === "plan" ? "#journey" : `#${tab.id}`} className={active === tab.id ? "active" : ""} onClick={() => openVideoTab(tab.id)}>
+              {videoTabLabel(tab.id, lang)}
+            </a>
+          ))}
+        </div>
+        {currentUser ? (
+          <button className="hero-identity" type="button" onClick={openMenu}
+            aria-label={copy(lang, `Signed in as ${personName(currentUser, lang)} — open menu`, `מחוברים בתור ${personName(currentUser, lang)} — פתיחת התפריט`)}>
+            <PersonAvatar username={currentUser.username} name={personName(currentUser, lang)} color={currentUser.color} avatarFile={currentUser.avatar_file} size="small" />
+          </button>
+        ) : null}
+        <button className="menu-button more-button" type="button" onClick={openMenu} aria-label={copy(lang, "More", "עוד")}>
+          <Menu size={20} aria-hidden="true" />
+        </button>
+      </nav>
+      <div className="hero-copy video-hero-copy">
+        <h1>{[place, pageName].filter(Boolean).join(" · ")}</h1>
+      </div>
+    </header>
+  );
+}
+
 export function TodayView({
   itinerary,
   config,
   lang,
   isOrganizer,
   onOpenItinerary,
+  onOpenBooking,
+  videoLayout = false,
+  marks = false,
 }: {
   itinerary?: ActiveItinerary;
   config?: TripConfig;
   lang: Lang;
   isOrganizer?: boolean;
   onOpenItinerary: (focus: JourneyFocus) => void;
+  /** A tapped flight opens its booking (the ticket) on the Bookings page; null opens the page on its flights. */
+  onOpenBooking?: (bookingId: number | null) => void;
+  /** site_video_layout: one card for the whole day instead of "Up next". */
+  videoLayout?: boolean;
+  /** plan_change_marks, inside the video layout. */
+  marks?: boolean;
 }) {
   const today = useQuery({ queryKey: ["today"], queryFn: getToday, refetchInterval: 60_000 });
   const confirmations = useQuery({ queryKey: ["confirmations"], queryFn: getConfirmations });
@@ -680,8 +961,16 @@ export function TodayView({
   const next = today.data?.next || null;
   const companionName = botDisplayName(config, hermes.data?.identity.name, lang);
 
+  // After the trip there is no day to show: the page is what it was (and so it is while the clock is still loading).
+  const dayCard = videoLayout && today.data && today.data.phase !== "post_trip" ? today.data : null;
   return (
     <section className="view-grid today-grid">
+      {dayCard ? (
+        <div className="focus-panel day-card-panel">
+          <TripClockPanel board config={config} itinerary={itinerary} today={today.data} next={next} lang={lang} />
+          <DayCard today={dayCard} itinerary={itinerary} config={config} lang={lang} marks={marks} onOpenItinerary={onOpenItinerary} />
+        </div>
+      ) : (
       <div className="focus-panel">
         <span className="panel-label">{today.data ? phaseLabel(today.data.phase, lang) : copy(lang, "Today", "היום")}</span>
         <h2>{next ? itemTitle(next, lang) : today.data ? copy(lang, "No upcoming activities scheduled.", "אין פעילויות קרובות מתוכננות.") : copy(lang, "Your trip clock is warming up.", "שעון הטיול מתכונן לצאת לדרך.")}</h2>
@@ -691,19 +980,26 @@ export function TodayView({
         {next ? <UpcomingActivity item={next} config={config} lang={lang} onOpenItinerary={onOpenItinerary} /> : null}
         <TripClockPanel config={config} itinerary={itinerary} today={today.data} next={next} lang={lang} />
       </div>
+      )}
 
-      <aside className="ops-strip">
-        {today.data?.today && <TodayWeather key={today.data.today} config={config} itinerary={itinerary} today={today.data.today} lang={lang} />}
-        <section className="mini-panel">
-          <Plane size={20} />
-          <h3>{copy(lang,"Flights","טיסות")}</h3>
-          <p>{flights.data?.statuses[0]?.facts.name || today.data?.flights[0]?.name || "Stored booking facts are the fallback."}</p>
-          {flights.data?.statuses[0]?.stale ? <small>{copy(lang,"Using last known status","מציגים את המצב האחרון הידוע")}</small> : null}
-        </section>
+      {videoLayout ? (
+        <aside className="ops-strip">
+          <WeatherFlightsCard config={config} itinerary={itinerary} today={today.data?.today}
+            flights={flights.data?.statuses || []} bookedFlights={today.data?.flights || []} lang={lang} onOpenFlight={onOpenBooking} />
+        </aside>
+      ) : (
+        <aside className="ops-strip">
+          {today.data?.today && <TodayWeather key={today.data.today} config={config} itinerary={itinerary} today={today.data.today} lang={lang} />}
+          <section className="mini-panel">
+            <Plane size={20} />
+            <h3>{copy(lang,"Flights","טיסות")}</h3>
+            <p>{flights.data?.statuses[0]?.facts.name || today.data?.flights[0]?.name || "Stored booking facts are the fallback."}</p>
+            {flights.data?.statuses[0]?.stale ? <small>{copy(lang,"Using last known status","מציגים את המצב האחרון הידוע")}</small> : null}
+          </section>
+        </aside>
+      )}
 
-      </aside>
-
-      <CompanionPanel name={companionName} isOrganizer={isOrganizer} lang={lang} />
+      {videoLayout ? null : <CompanionPanel name={companionName} isOrganizer={isOrganizer} lang={lang} />}
 
       <section className="section-band">
         <div className="section-heading">
@@ -762,6 +1058,53 @@ export function buildPhaseGroups(
 }
 
 
+// A day's date as a column: day number, month, weekday (the SmarTrip structure, in the video's colours).
+function DateColumn({ date, lang, className = "date-col" }: { date: string; lang: Lang; className?: string }) {
+  const value = new Date(`${date}T12:00:00`);
+  const locale = lang === "he" ? "he-IL" : "en-US";
+  return (
+    <span className={className}>
+      <strong>{value.getDate()}</strong>
+      <small>{value.toLocaleDateString(locale, { month: "short" })}</small>
+      <small>{value.toLocaleDateString(locale, { weekday: "short" })}</small>
+    </span>
+  );
+}
+
+/** The Plan's days across the top, grouped by phase — each phase is a city, so a one-city trip shows one group. */
+function PlanDayStrip({ groups, activePhaseId, activeDate, lang, onSelect }: {
+  groups: ReturnType<typeof buildPhaseGroups>;
+  activePhaseId?: string;
+  activeDate: string;
+  lang: Lang;
+  onSelect: (phaseId: string, date: string) => void;
+}) {
+  return (
+    <nav className="plan-strip" aria-label={copy(lang, "Days of the trip", "ימי הטיול")}>
+      {groups.map((group) => {
+        const dates = mergePhaseDates(group.calendar, group.days.map((day) => day.date));
+        return (
+          <div className="plan-strip-group" key={group.id}>
+            <h3>{group.title}</h3>
+            <div className="plan-strip-days">
+              {dates.length ? dates.map((date) => {
+                const planned = group.days.find((entry) => entry.date === date);
+                const selected = group.id === activePhaseId && date === activeDate;
+                return (
+                  <button key={`${group.id}-${date}`} type="button" className={selected ? "plan-day active" : "plan-day"} aria-pressed={selected} onClick={() => onSelect(group.id, date)}>
+                    <DateColumn date={date} lang={lang} />
+                    <span className="plan-day-label">{planned ? daySelectorSubtitle(planned, lang) : copy(lang, "open", "פנוי")}</span>
+                  </button>
+                );
+              }) : <button type="button" className={group.id === activePhaseId ? "plan-day active" : "plan-day"} onClick={() => onSelect(group.id, "")}><span className="plan-day-label">{copy(lang, "no plan yet", "אין עדיין תוכנית")}</span></button>}
+            </div>
+          </div>
+        );
+      })}
+    </nav>
+  );
+}
+
 export function JourneyView({
   itinerary,
   config,
@@ -773,6 +1116,8 @@ export function JourneyView({
   onHeroPhaseChange,
   focus,
   today,
+  videoLayout = false,
+  marks = false,
 }: {
   itinerary?: ActiveItinerary;
   config?: TripConfig;
@@ -784,6 +1129,10 @@ export function JourneyView({
   onHeroPhaseChange: (phaseId: string) => void;
   focus?: JourneyFocus | null;
   today?: TodayContext;
+  /** site_video_layout: the Plan — a day strip grouped by phase, a date column, a Booked tick. */
+  videoLayout?: boolean;
+  /** plan_change_marks, inside the video layout. */
+  marks?: boolean;
 }) {
   const days = itinerary?.days || [];
   const phaseGroups = useMemo(() => buildPhaseGroups(config?.phases, days, lang), [config?.phases, days, lang]);
@@ -821,6 +1170,7 @@ export function JourneyView({
   // The same links the hotel has on every other screen (server/hotel-place.js).
   const tonightMapUrl = safeExternalUrl(tonightPlace?.location_url);
   const tonightWazeUrl = safeExternalUrl(tonightPlace?.waze_url);
+  const fresh = useFreshChanges(videoLayout && marks ? itinerary?.items : undefined);
   const daySpineRef = useRef<HTMLElement>(null);
   const handledFocus = useRef<JourneyFocus | null>(null);
   const initializedForTripDate = useRef(false);
@@ -965,7 +1315,16 @@ export function JourneyView({
   };
 
   return (
-    <section className="journey-layout">
+    <section className={videoLayout ? "journey-layout plan-video" : "journey-layout"}>
+      {videoLayout ? (
+        <PlanDayStrip
+          groups={phaseGroups}
+          activePhaseId={activePhase?.id}
+          activeDate={activeDate}
+          lang={lang}
+          onSelect={(phaseId, date) => { setSelectedPhase(phaseId); setSelected(date); }}
+        />
+      ) : (
       <aside className="destination-rail" aria-label="Trip phases">
         <div className="rail-heading">
           <Map size={17} />
@@ -996,8 +1355,10 @@ export function JourneyView({
           </button>
         ))}
       </aside>
+      )}
       <section ref={daySpineRef} className="day-spine">
         <div className="day-heading">
+          {videoLayout && activeDate ? <DateColumn date={activeDate} lang={lang} className="date-col day-date-col" /> : null}
           <div className="day-heading-top">
             <span className="panel-label">{activePhase?.title || "Journey"}</span>
             {isOrganizer && <a className="journey-settings" href="#plan-tools" aria-label={copy(lang, "Plan settings", "הגדרות מסלול")}><Settings size={20} aria-hidden="true" /></a>}
@@ -1008,7 +1369,7 @@ export function JourneyView({
             {tonightWazeUrl ? <> · <a href={tonightWazeUrl} target="_blank" rel="noreferrer">Waze</a></> : null}
           </p> : null}
           {isOrganizer ? <button className="secondary-action journey-edit-trigger" type="button" onClick={beginNew}><Plus size={17} /> {copy(lang, "Add itinerary item", "הוספת פריט למסלול")}</button> : null}
-          <label className="mobile-day-picker">
+          {!videoLayout ? <label className="mobile-day-picker">
             <span>{copy(lang, "Day", "יום")}</span>
             <MobileSelect value={activeDate} onChange={(event) => setSelected(event.target.value)} disabled={!phaseDates.length}>
               {!phaseDates.length && <option value="">{copy(lang, "No dates yet", "עדיין אין תאריכים")}</option>}
@@ -1017,8 +1378,8 @@ export function JourneyView({
                 return <option key={date} value={date}>{dateLabel(date, lang)} — {planned ? daySelectorSubtitle(planned, lang) : copy(lang, "open", "פנוי")}</option>;
               })}
             </MobileSelect>
-          </label>
-          <div className="day-selector" aria-label="Days in selected phase">
+          </label> : null}
+          {!videoLayout ? <div className="day-selector" aria-label="Days in selected phase">
             {phaseDates.map((date) => {
               const planned = activePhase?.days.find((entry) => entry.date === date);
               return (
@@ -1028,7 +1389,7 @@ export function JourneyView({
                 </button>
               );
             })}
-          </div>
+          </div> : null}
         </div>
         {isOrganizer && editing ? (
           <form
@@ -1103,7 +1464,8 @@ export function JourneyView({
         <div className="timeline">
           {dayItems.length ? dayItems.map((item) => (
             <div className="timeline-item-wrap" id={`itinerary-item-${encodeURIComponent(item.item_uid)}`} key={item.item_uid}>
-              <TimelineItem item={item} {...activityLinks.get(item.item_uid)} username={username} lang={lang} botName={botName} telegramUsername={telegramUsername} />
+              <TimelineItem item={item} {...activityLinks.get(item.item_uid)} username={username} lang={lang} botName={botName} telegramUsername={telegramUsername}
+                videoLayout={videoLayout} marks={marks} fresh={fresh.has(item.item_uid)} destination={activePhase?.title || ""} />
               {isOrganizer ? <SeedFlagNotice kind="item" id={item.item_uid} changed={item.seed_changed} removed={item.seed_removed} lang={lang} /> : null}
               {isOrganizer ? <PlanConflictNotice itemUid={item.item_uid} conflicts={item.plan_conflicts} lang={lang} /> : null}
               {isOrganizer ? <div className="timeline-editor-actions">
@@ -1568,9 +1930,13 @@ export function BookingEditPanel({ booking, config, lang, onClose }: { booking: 
   );
 }
 
-export function BookingsView({ config, isOrganizer, lang }: { config?: TripConfig; isOrganizer?: boolean; lang: Lang }) {
+export function BookingsView({ config, isOrganizer, lang, focus }: {
+  config?: TripConfig; isOrganizer?: boolean; lang: Lang;
+  /** Opened from a flight on Today: that booking's card is brought into view and marked; null shows the flights. */
+  focus?: { bookingId: number | null } | null;
+}) {
   const queryClient = useQueryClient();
-  const [filter, setFilter] = useState<BookingFilter>("phase");
+  const [filter, setFilter] = useState<BookingFilter>(focus && focus.bookingId === null ? "flight" : "phase");
   const [editingBookingId, setEditingBookingId] = useState<number | null>(null);
   const bookings = useQuery({ queryKey: ["bookings"], queryFn: getBookings });
   const today = useQuery({ queryKey: ["today"], queryFn: getToday, refetchInterval: 60_000 });
@@ -1600,6 +1966,13 @@ export function BookingsView({ config, isOrganizer, lang }: { config?: TripConfi
     mutationFn: approveBookingDraft,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["bookings"] }),
   });
+  const focusId = focus?.bookingId ?? null;
+  const focusShown = focusId !== null && rows.some((booking) => booking.id === focusId);
+  useEffect(() => {
+    if (!focusShown) return;
+    const frame = window.requestAnimationFrame(() => document.getElementById(`booking-${focusId}`)?.scrollIntoView?.({ behavior: "smooth", block: "center" }));
+    return () => window.cancelAnimationFrame(frame);
+  }, [focus, focusId, focusShown]);
 
   return (
     <section className="module-layout">
@@ -1630,7 +2003,7 @@ export function BookingsView({ config, isOrganizer, lang }: { config?: TripConfi
             <h3>{phaseTitle(config, phaseId, lang)}</h3>
             <div className="module-grid">
               {phaseBookings.map((booking) => (
-                <article className="booking-card" key={booking.id}>
+                <article className={booking.id === focusId ? "booking-card is-focused" : "booking-card"} id={`booking-${booking.id}`} key={booking.id}>
                   <div className="booking-card-head">
                     <span className="booking-type">{bookingTypeLabel(booking.type, lang)}</span>
                     <span className={`status-pill ${bookingState(booking)}`}>{bookingState(booking) === "verified" ? "Verified" : bookingState(booking) === "draft" ? "Draft" : "Needs review"}</span>
@@ -2469,6 +2842,7 @@ export function MoreView({ config, currentUser, isOrganizer, lang, openModule }:
             <input type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={uploadHero} disabled={busy} />
           </label>
           <MemberLogins config={config} lang={lang} />
+          {featureOn(config, "plan_change_group_line") ? <GroupLineToggle lang={lang} /> : null}
         </section>
       ) : null}
       {/* Everyone on the trip: organizers connect read-and-write, members read only. */}
@@ -2590,6 +2964,8 @@ export function AppMenu({
   setLang,
   openTab,
   openModule,
+  videoLayout = false,
+  openVideoTab,
 }: {
   open: boolean;
   lang: Lang;
@@ -2599,6 +2975,9 @@ export function AppMenu({
   setLang: (lang: Lang) => void;
   openTab: (tab: Tab) => void;
   openModule: (module: Module) => void;
+  /** site_video_layout: Bookings and Photos are tabs now, so the menu holds the rest, and "Who is coming". */
+  videoLayout?: boolean;
+  openVideoTab?: (tab: VideoTab) => void;
 }) {
   useEffect(() => {
     if (!open) return;
@@ -2632,15 +3011,19 @@ export function AppMenu({
         ) : null}
         <div className="menu-section">
           <small>{lang === "he" ? "ניווט" : "Navigation"}</small>
-          {(Object.keys(tabIcons) as Tab[]).map((tab) => (
-            <button key={tab} type="button" onClick={() => openTab(tab)}>{tabLabel(tab, lang)}</button>
-          ))}
+          {videoLayout && openVideoTab
+            ? videoTabs.map((tab) => <button key={tab.id} type="button" onClick={() => openVideoTab(tab.id)}>{videoTabLabel(tab.id, lang)}</button>)
+            : (Object.keys(tabIcons) as Tab[]).map((tab) => (
+              <button key={tab} type="button" onClick={() => openTab(tab)}>{tabLabel(tab, lang)}</button>
+            ))}
         </div>
         <div className="menu-section">
           <small>{lang === "he" ? "כלי הטיול" : "Trip tools"}</small>
-          {moduleShortcuts.filter(m=>m.id!=="plan-tools"||isOrganizer).map((shortcut) => (
+          {moduleShortcuts.filter(m=>m.id!=="plan-tools"||isOrganizer).filter(m => !videoLayout || (m.id !== "bookings" && m.id !== "photos")).map((shortcut) => (
             <button key={shortcut.id} type="button" onClick={() => openModule(shortcut.id)}>{shortcut[lang]}</button>
           ))}
+          {videoLayout ? <button type="button" onClick={() => openModule("companion")}>{companionShortcut[lang]}</button> : null}
+          {videoLayout ? <button type="button" onClick={() => openTab("more")}>{copy(lang, "Who is coming", "מי משתתף בטיול")}</button> : null}
         </div>
         <div className="menu-section">
           <small>{lang === "he" ? "הגדרות" : "Settings"}</small>
@@ -2689,6 +3072,7 @@ export default function App() {
   const [lang, setLang] = useState<Lang>(() => preferredLang());
   const [journeyHeroPhaseId, setJourneyHeroPhaseId] = useState("");
   const [journeyFocus, setJourneyFocus] = useState<JourneyFocus | null>(null);
+  const [bookingFocus, setBookingFocus] = useState<{ bookingId: number | null } | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [enrollment, setEnrollment] = useState(() => initialHash.startsWith("enroll=") ? initialHash.slice(7) : "");
   // State, not a read: the session can end while the app is open — a token the
@@ -2736,6 +3120,10 @@ export default function App() {
   if (!authed) return activeModule === "lostfound" ? <main className="app-content"><LostFound lang={lang} authenticated={false}/><a href="#today">{copy(lang,"Back to sign in","חזרה לכניסה")}</a></main> : <LoginScreen />;
 
   const tabs = Object.keys(tabIcons) as Tab[];
+  // The video layout is known only once the config has arrived; until then (and whenever the switch is not the literal
+  // true) the page is the current one.
+  const videoLayout = videoLayoutOn(config.data);
+  const marks = changeMarksOn(config.data);
   const openTab = (tab: Tab) => {
     setActiveTab(tab);
     setActiveModule(null);
@@ -2743,6 +3131,7 @@ export default function App() {
     setMenuOpen(false);
   };
   const openModule = (module: Module) => {
+    if (module !== "bookings") setBookingFocus(null);
     setActiveModule(module);
     window.location.hash = module;
     setMenuOpen(false);
@@ -2754,6 +3143,26 @@ export default function App() {
     window.location.hash = "journey";
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
+  const openBooking = (bookingId: number | null) => {
+    setBookingFocus({ bookingId });
+    setActiveModule("bookings");
+    window.location.hash = "bookings";
+    setMenuOpen(false);
+    window.scrollTo({ top: 0 });
+  };
+  const openVideoTab = (tab: VideoTab) => {
+    if (tab === "bookings") setBookingFocus(null);
+    if (tab === "today") openTab("today");
+    else if (tab === "plan") openTab("journey");
+    else openModule(tab);
+  };
+  // `#moments` is Photos in the video layout (Moments is a section inside it); `#journey` is Plan.
+  // The trip conversation is a page only in the video layout; with the switch off #companion is not a page.
+  const pageModule = activeModule === "companion" && !videoLayout ? null : activeModule;
+  const shownModule: Module | null = pageModule ?? (videoLayout && activeTab === "moments" ? "photos" : null);
+  const videoActive: VideoTab | null = shownModule === "bookings" ? "bookings" : shownModule === "photos" ? "photos"
+    : shownModule ? null : activeTab === "today" ? "today" : activeTab === "journey" ? "plan" : null;
+  const videoPageName = shownModule ? moduleLabel(shownModule, lang) : activeTab === "more" ? tabLabel("more", lang) : videoTabLabel(activeTab === "journey" ? "plan" : "today", lang);
   const companionName = botDisplayName(config.data, hermes.data?.identity.name, lang);
   const heroPhaseId = !activeModule && activeTab === "journey"
     ? journeyHeroPhaseId
@@ -2761,32 +3170,43 @@ export default function App() {
       ? todayPhaseId(config.data, itinerary.data, today.data)
       : "";
   const tabContent = {
-    today: <TodayView itinerary={itinerary.data} config={config.data} lang={lang} isOrganizer={me.data?.is_organizer} onOpenItinerary={openMapItinerary} />,
-    journey: <JourneyView username={me.data?.username} itinerary={itinerary.data} config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} botName={companionName} telegramUsername={hermes.data?.telegram_username} onHeroPhaseChange={setJourneyHeroPhaseId} focus={journeyFocus} today={today.data} />,
+    today: <TodayView itinerary={itinerary.data} config={config.data} lang={lang} isOrganizer={me.data?.is_organizer} onOpenItinerary={openMapItinerary} onOpenBooking={openBooking} videoLayout={videoLayout} marks={marks} />,
+    journey: <JourneyView username={me.data?.username} itinerary={itinerary.data} config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} botName={companionName} telegramUsername={hermes.data?.telegram_username} onHeroPhaseChange={setJourneyHeroPhaseId} focus={journeyFocus} today={today.data} videoLayout={videoLayout} marks={marks} />,
     moments: <MomentsView todayDate={today.data?.today} lang={lang} />,
     more: <MoreView config={config.data} currentUser={me.data} isOrganizer={me.data?.is_organizer} lang={lang} openModule={openModule} />,
   }[activeTab];
-  const moduleContent = activeModule ? {
-    bookings: <BookingsView config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} />,
+  const moduleContent = shownModule ? {
+    bookings: <BookingsView config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} focus={bookingFocus} />,
     map: <MapView config={config.data} itinerary={itinerary.data} lang={lang} onOpenItinerary={openMapItinerary} />,
     budget: <><BudgetView config={config.data} lang={lang} /><CurrencyConverter lang={lang}/></>,
-    photos: <><PhotosView config={config.data} currentUser={me.data} lang={lang} /><ImmichAlbum config={config.data} lang={lang}/></>,
+    photos: <><PhotosView config={config.data} currentUser={me.data} lang={lang} /><ImmichAlbum config={config.data} lang={lang}/>{videoLayout ? <MomentsView todayDate={today.data?.today} lang={lang} /> : null}</>,
     readiness: <Readiness config={config.data} lang={lang}/>,
     account: <Account currentUser={me.data} lang={lang}/>,
     activities: <GroupActivities config={config.data} currentUser={me.data} lang={lang}/>,
     lostfound: <LostFound lang={lang}/>,
     trivia: <Trivia config={config.data} currentUser={me.data} lang={lang}/>,
+    companion: <CompanionPanel name={companionName} isOrganizer={me.data?.is_organizer} lang={lang} />,
     "plan-tools": me.data?.is_organizer ? <PlanTools isOrganizer config={config.data} itinerary={itinerary.data} lang={lang}/> : <p>{copy(lang,"Organizer access required.","נדרשת הרשאת מארגן.")}</p>,
-  }[activeModule] : null;
+  }[shownModule] : null;
   const content = moduleContent || tabContent;
 
   return (
-    <div className="modern-trip-app">
-      <Hero config={config.data} settings={ui.data} lang={lang} activeTab={activeTab} activeModule={activeModule} heroPhaseId={heroPhaseId} openTab={openTab} openModule={openModule} openMenu={() => setMenuOpen(true)} currentUser={me.data} />
+    <div className={videoLayout ? "modern-trip-app video-layout" : "modern-trip-app"}>
+      {videoLayout
+        ? <VideoHero config={config.data} settings={ui.data} lang={lang} placePhaseId={videoPlacePhaseId(config.data, itinerary.data, today.data)} pageName={videoPageName} active={videoActive} openVideoTab={openVideoTab} openMenu={() => setMenuOpen(true)} currentUser={me.data} />
+        : <Hero config={config.data} settings={ui.data} lang={lang} activeTab={activeTab} activeModule={activeModule} heroPhaseId={heroPhaseId} openTab={openTab} openModule={openModule} openMenu={() => setMenuOpen(true)} currentUser={me.data} />}
       <main className="app-content">{content}</main>
-      <AppMenu open={menuOpen} lang={lang} currentUser={me.data} isOrganizer={me.data?.is_organizer} setOpen={setMenuOpen} setLang={setLang} openTab={openTab} openModule={openModule} />
+      <AppMenu open={menuOpen} lang={lang} currentUser={me.data} isOrganizer={me.data?.is_organizer} setOpen={setMenuOpen} setLang={setLang} openTab={openTab} openModule={openModule} videoLayout={videoLayout} openVideoTab={openVideoTab} />
       <nav className="bottom-nav" aria-label="Primary">
-        {tabs.map((tab) => {
+        {videoLayout ? videoTabs.map((tab) => {
+          const Icon = tab.icon;
+          return (
+            <a key={tab.id} href={tab.id === "plan" ? "#journey" : `#${tab.id}`} className={videoActive === tab.id ? "active" : ""} onClick={() => openVideoTab(tab.id)}>
+              <Icon size={20} />
+              <span>{videoTabLabel(tab.id, lang)}</span>
+            </a>
+          );
+        }) : tabs.map((tab) => {
           const Icon = tabIcons[tab];
           return (
             <a

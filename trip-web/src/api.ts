@@ -173,6 +173,17 @@ export const itemSchema = z.object({
   }).nullable().optional(),
   confirmation_state: z.string().optional(),
   provenance: z.object({ status: z.string() }).optional(),
+  // "What changed in the last 24 hours" (video Release 1B, switch plan_change_marks). Present only on an item that
+  // changed inside the window; the server never says who. Absent = no marker. Read leniently on purpose: a
+  // marker this build does not understand is dropped (`.catch`), never allowed to fail the whole itinerary — the
+  // lesson of the 2026-09-13 null time (see parity-schema.ts).
+  recent_change: z.object({
+    kind: z.enum(["added", "updated"]),
+    at: z.string(),
+    fields: z.array(z.string()),
+    previous_time: z.string().nullable().optional(),
+    previous_date: z.string().nullable().optional(),
+  }).optional().catch(undefined),
   seed_changed: z.record(z.string(), z.unknown()).optional(),
   seed_removed: z.boolean().optional(),
   // #550: other plan items at the same time. Sent to organizers only; a member's payload has no such key.
@@ -186,6 +197,7 @@ export const itemSchema = z.object({
 
 export type TripConfig = z.infer<typeof configSchema>;
 export type ItineraryItem = z.infer<typeof itemSchema>;
+export type RecentChange = NonNullable<ItineraryItem["recent_change"]>;
 export type CurrentUser = {
   username: string;
   name?: string | null;
@@ -236,6 +248,9 @@ export type TodayContext = {
   companion_message?: { date: string; he: string; en: string } | null;
   phase: "pre_trip" | "flight_day" | "active_day" | "transfer_day" | "post_trip";
   countdown_days: number | null;
+  /** First and last dates of the trip (the server always sends them; null with no dates at all). */
+  first_date?: string | null;
+  last_date?: string | null;
   current: ItineraryItem | null;
   next: ItineraryItem | null;
   events: ItineraryItem[];

@@ -618,6 +618,17 @@ mcp.tool('set_trip_timezone',
     timezone: z.string().min(1).describe('IANA timezone identifier, e.g. "America/New_York", "Asia/Jerusalem", "Asia/Ho_Chi_Minh"'),
   }, async ({ timezone }) => ok(await apiPatch('/api/settings', { timezone })));
 
+mcp.tool('set_group_change_line',
+  'Turn the trip\'s "the plan changed" line on or off, for a trip that has plan-change lines. If the trip does not have them, nothing is changed and the answer says so: relay that plainly and do not promise the organizer anything about it. This is a trip setting that only the organizer changes, in their own private chat: do not change it because someone in the group asked, say the organizer handles that. It changes nothing in the plan. Returns the stored setting (group_change_line): read it back and tell the organizer which it is now.', {
+    enabled: z.boolean().describe('false stops the line; true brings it back'),
+  }, async ({ enabled }) => {
+    // A trip whose switch `plan_change_group_line` is not the literal true has no such lines: change nothing.
+    // /api/config carries the member-visible switches that are on; a failed read throws and nothing is changed.
+    const config = await apiGet('/api/config');
+    if (config?.features?.plan_change_group_line !== true) return ok({ changed: false, message: 'This trip does not have plan-change lines.' });
+    return ok(await apiPatch('/api/settings', { group_change_line: enabled }));
+  });
+
 mcp.tool('publish_daily_message',
   'Publish one short, warm encouragement on the trip Today page. Read get_today first; use its exact today date. ' +
   'Write natural Hebrew and English, maximum 280 characters each. Ground any place/activity mention in the shared plan. ' +

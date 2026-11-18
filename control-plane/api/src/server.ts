@@ -3,6 +3,8 @@ import { createNotificationAdapter } from "./adapters/notification.js";
 import { loadArchitectureProfile, validateBeforeProvider } from "./config.js";
 import { createDatabasePool, databaseReadiness } from "./database.js";
 import { dispatchPendingTripNotifications } from "./outbox-dispatcher.js";
+import { startPlanChangePoller } from "./plan-change-poller.js";
+import { telegramApiRoot } from "./relay/telegram-api.js";
 import { createBotUsernameResolver } from "./bot-username.js";
 import { recoverStaleLeases, recoverExpiredApprovals } from "./job-queue.js";
 import { destinationInfoSearchConfigured, refreshStaleDestinationInfo } from "./destination-info-store.js";
@@ -33,6 +35,11 @@ const pool = createDatabasePool(connectionString, () => {
   })}\n`);
 });
 
+// Where this process's own Telegram sender (the approval DM and the outbox dispatcher) talks to the Bot API. Every
+// request carries the bot token in its path, so the root goes through the relay's validator: https, or plain http to
+// this machine, and anything else stops the API here, before a token is read. Unset is Telegram's own root.
+const telegramRoot = telegramApiRoot(process.env.TELEGRAM_API_ROOT);
+
 let signup: SignupDependencies | undefined;
 // Hoisted out of the signup block because the approval routes address their
 // operator notification to the same chat as the signup DM. One configured
@@ -54,7 +61,7 @@ if (profile.signup) {
   // constructed provider.
   operatorChatId = superAdminChatId;
   const notification = validateBeforeProvider(profile, () => createNotificationAdapter(profile.adapters.messaging, {
-    telegram: superAdminChatId ? { botToken, superAdminChatId, db: pool, log: (line) => process.stderr.write(`${line}\n`) } : undefined,
+    telegram: superAdminChatId ? { botToken, superAdminChatId, db: pool, log: (line) => process.stderr.write(`${line}\n`), apiRoot: telegramRoot } : undefined,
   }));
   signup = {
     db: pool,
@@ -307,7 +314,7 @@ const outboxBotToken = signup?.botToken ?? portal?.telegramMiniApp?.botToken;
 const outboxNotification = signup?.notification ?? (outboxBotToken
   ? createNotificationAdapter(profile.adapters.messaging, {
     // `superAdminChatId` is for approval DMs, which a web-only deployment never sends.
-    telegram: { botToken: outboxBotToken, superAdminChatId: operatorChatId ?? "", db: pool, log: (line) => process.stderr.write(`${line}\n`) },
+    telegram: { botToken: outboxBotToken, superAdminChatId: operatorChatId ?? "", db: pool, log: (line) => process.stderr.write(`${line}\n`), apiRoot: telegramRoot },
   })
   : undefined);
 if (outboxNotification && outboxBotToken) {
@@ -345,6 +352,23 @@ if (outboxNotification && outboxBotToken) {
       .finally(() => { dispatching = false; });
   }, OUTBOX_POLL_INTERVAL_MS);
   timer.unref();
+
+  // The group line's trigger (video Release 1C). It only enqueues; the dispatcher above is the one sender. It needs
+  // the portal's runtime exchange key (the key every trip site checks) and its host allow-list, so a deployment
+  // without a web profile has no group line, and says so once here rather than never sending without a word.
+  if (portal?.runtimeExchangeKey) {
+    startPlanChangePoller({
+      db: pool,
+      exchangeKey: portal.runtimeExchangeKey,
+      upstreamHostSuffixes: portal.runtimeUpstreamHostSuffixes,
+      upstreamAllowedHosts: portal.runtimeUpstreamAllowedHosts,
+      log: (line) => process.stderr.write(`${line}\n`),
+    });
+  } else {
+    process.stderr.write(`${structuredLog("warn", "plan_change_poll.disabled", {
+      reason: "no web profile with runtime_exchange_key_secret_ref: the group line cannot reach any trip site",
+    })}\n`);
+  }
 }
 
 // Reclaims jobs whose worker died mid-run. `claimJob` sets a 900s lease

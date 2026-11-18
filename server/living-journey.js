@@ -1,10 +1,11 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { publicPart } = require('../shared/config-visibility');
+const { publicPart, makeFeatureOn } = require('../shared/config-visibility');
 const { projectAgent } = require('../shared/agent-schema');
 const seedReconcile = require('./seed-reconcile');
 const planConflicts = require('./plan-conflicts');
+const { recentChanges, diffPlanVersions, revisionCreatedAt, withRecentChange } = require('./recent-changes');
 // Every plan date a route below is SENT must be a day on the calendar, not
 // only the shape (second boundary re-check of PR #373); reads keep ISO_DATE_RE.
 const { isCalendarDay, CALENDAR_DAY_DETAIL } = require('./calendar-day');
@@ -50,11 +51,19 @@ function keepBothText(value) {
   return Array.isArray(list) && list.length ? JSON.stringify(list) : null;
 }
 
-// What no reader of a plan item is ever served: the organizer's accepted conflicts (#550).
-function publicItem(item) {
-  if (!item || !Object.hasOwn(item, 'keep_both_with')) return item;
-  const { keep_both_with, ...rest } = item;
-  return rest;
+// What no reader of a plan item is ever served: the organizer's accepted conflicts (#550), and — unless
+// the caller says it is an organizer or the agent key — who added it (`created_by`, a username; video
+// Release 1B, decision 12). Fail safe: a caller that passes nothing is a member and is not told who.
+function publicItem(item, { author = false } = {}) {
+  if (!item) return item;
+  const dropConflicts = Object.hasOwn(item, 'keep_both_with');
+  const dropAuthor = !author && Object.hasOwn(item, 'created_by');
+  if (!dropConflicts && !dropAuthor) return item;
+  // A copy with the same key order the caller always saw, minus what it may not.
+  const out = { ...item };
+  if (dropConflicts) delete out.keep_both_with;
+  if (dropAuthor) delete out.created_by;
+  return out;
 }
 
 function stripTags(html) {
@@ -280,6 +289,12 @@ function schema(db) {
   // #550: the organizer's "keep both" for same-time plan items, on the item like its other fields
   // (JSON [{uid,date,time,other_time}], see server/plan-conflicts.js). Additive, nullable.
   try { db.exec('ALTER TABLE itinerary_plan_items ADD COLUMN keep_both_with TEXT'); } catch {}
+  // Video Release 1C: "tell the group when the plan changes" is on until an organizer turns it off. A trip
+  // setting like the timezone, so it lives here and not in the trip file. Additive, defaulted, idempotent.
+  try { db.exec('ALTER TABLE trip_settings ADD COLUMN group_change_line INTEGER NOT NULL DEFAULT 1 CHECK (group_change_line IN (0,1))'); } catch {}
+  // The organizer's navigation app for every Go chip: Google Maps (the default) or Waze. A trip setting like the
+  // two above. Additive, defaulted, idempotent.
+  try { db.exec("ALTER TABLE trip_settings ADD COLUMN nav_app TEXT NOT NULL DEFAULT 'google' CHECK (nav_app IN ('google','waze'))"); } catch {}
   db.prepare('INSERT OR IGNORE INTO trip_ui_settings (id, design_variant) VALUES (1, ?)').run(normalizeUiVariant(process.env.TRIP_DESIGN_VARIANT));
   db.prepare('INSERT OR IGNORE INTO trip_settings (id, timezone) VALUES (1, NULL)').run();
 }
@@ -660,7 +675,7 @@ function markProvenance(db, payload) {
 // `config` is the effective (raw-shaped) config the participant view computes
 // each night's lodging from; /api/itinerary/original (includeOriginal) serves
 // the immutable snapshot as stored and takes none.
-function serializeItinerary(db, rows, { includeOriginal = false, config = null, hotelPlaces = null } = {}) {
+function serializeItinerary(db, rows, { includeOriginal = false, config = null, hotelPlaces = null, includeAuthor = false } = {}) {
   // A booking imported for organizer review is not participant-visible yet.
   // Every participant-facing itinerary projection must enforce that boundary;
   // filtering only /api/bookings leaked draft details through attached cards.
@@ -675,7 +690,7 @@ function serializeItinerary(db, rows, { includeOriginal = false, config = null, 
     // it was. Lodging is computed from the trip as it is now (withServedLodging).
     days: includeOriginal ? rows.days : rows.days.map((day) => publicDayContext(config ? withServedLodging(day, config.phases) : day)),
     items: rows.items.map((item) => ({
-      ...publicItem(item),
+      ...publicItem(item, { author: includeAuthor }),
       booking: item.booking_id ? bookingsById.get(item.booking_id) || null : null,
     })),
   };
@@ -1035,10 +1050,33 @@ function isValidTimeZone(value) {
   }
 }
 
+let warnedGroupLineUnreadable = false;
+function groupChangeLine(row) {
+  if (row && row.group_change_line === 1) return true;
+  if (row && row.group_change_line === 0) return false;
+  if (!warnedGroupLineUnreadable) {
+    warnedGroupLineUnreadable = true;
+    console.warn('trip_settings.group_change_line_unreadable: the setting has no value here; it reads as off');
+  }
+  return false;
+}
+
+// Only the exact string "waze" is Waze. A missing row, a missing column or any other value is the default, Google
+// Maps: unlike the group line, nobody is messaged by this, and "open the map as before" is the safe reading.
+const NAV_APPS = new Set(['google', 'waze']);
+function navApp(row) {
+  return row && row.nav_app === 'waze' ? 'waze' : 'google';
+}
+
 function tripSettings(db) {
   const row = db.prepare('SELECT * FROM trip_settings WHERE id = 1').get();
   return {
     timezone: row?.timezone || null,
+    // On only when the row says 1. The default (on) lives in the column's DEFAULT, so every new row and every row an
+    // older site had gets it there; a read that finds no row, no column or no value is NOT the default, it is a setting
+    // nobody can read, and it reads as off (and says so once) rather than sending a trip's group a line nobody chose.
+    group_change_line: groupChangeLine(row),
+    nav_app: navApp(row),
     updated_by: row?.updated_by || null,
     updated_at: row?.updated_at || null,
   };
@@ -1188,14 +1226,14 @@ async function weatherObservation(db, fetchImpl, query) {
 
 // An item with its hotel's links, for the routes that serve raw plan rows
 // (/api/today): the same decoration the active itinerary applies.
-function withHotelPlace(db, rawItem, hotelPlaces) {
-  const item = publicItem(rawItem);
+function withHotelPlace(db, rawItem, hotelPlaces, { includeAuthor = false } = {}) {
+  const item = publicItem(rawItem, { author: includeAuthor });
   if (!hotelPlaces || !item?.booking_id) return item;
   const booking = db.prepare("SELECT id, type, name, phase, location_url FROM bookings WHERE id = ? AND COALESCE(review_status, 'approved') = 'approved'").get(item.booking_id);
   return hotelPlaces.decorateItem(item, booking);
 }
 
-function buildTodayContext(db, config, { hotelPlaces = null } = {}) {
+function buildTodayContext(db, config, { hotelPlaces = null, includeAuthor = false } = {}) {
   const rows = activeRows(db);
   const clock = localClock(db, config);
   const today = clock.date;
@@ -1232,9 +1270,9 @@ function buildTodayContext(db, config, { hotelPlaces = null } = {}) {
     first_date: firstDate,
     last_date: lastDate,
     countdown_days: firstDate ? Math.ceil((new Date(`${firstDate}T00:00:00Z`) - new Date(`${today}T00:00:00Z`)) / 86400000) : null,
-    current: todayItems[0] ? withHotelPlace(db, todayItems[0], hotelPlaces) : null,
-    next: nextItem ? withHotelPlace(db, nextItem, hotelPlaces) : null,
-    events: todayItems.map((item) => withHotelPlace(db, item, hotelPlaces)),
+    current: todayItems[0] ? withHotelPlace(db, todayItems[0], hotelPlaces, { includeAuthor }) : null,
+    next: nextItem ? withHotelPlace(db, nextItem, hotelPlaces, { includeAuthor }) : null,
+    events: todayItems.map((item) => withHotelPlace(db, item, hotelPlaces, { includeAuthor })),
     flights: flightToday,
   };
 }
@@ -1286,11 +1324,30 @@ function moveDayRows(rows, { from, to, date, lodging, headline }) {
   return { items: moved, headline: headlineMoved };
 }
 
-function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImpl, mediaDir, authRequired, organizerOrAgentRequired, requestItemEnrichment, phaseKnown, stopKnown, onPhasesReshuffled, reviewConfigured, isOrganizer }) {
+function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImpl, mediaDir, authRequired, organizerOrAgentRequired, internal, requestItemEnrichment, phaseKnown, stopKnown, onPhasesReshuffled, reviewConfigured, isOrganizer, featureOn }) {
   // The trip as it is now. server.js passes the effective config (the file
   // with the stop layer merged over it, server/trip-structure.js); a caller
   // that passes only `config` gets exactly that object, as before.
   const cfg = () => (getConfig ? getConfig() : config);
+  // Per-trip feature switches (#567 S2). server.js passes its own `featureOn`; a caller that does not
+  // (a test, a stand-in) gets one built from the same file block with the same literal-true rule, so
+  // a switch nobody recognises is off either way.
+  const switchOn = featureOn || makeFeatureOn(config?.features, console);
+  // Who may be told who added a plan item: the organizers and the agent key — the same people
+  // who see booking drafts. Anything else, including a missing predicate, is a member.
+  const mayKnowAuthor = (req) => Boolean(isOrganizer && isOrganizer(req));
+  // The last day's "what changed" markers (video Release 1B), or null — switch off, or the version
+  // walk failed. A failure must never fail the route: the page just has no markers, and the log
+  // names the event with nothing about the trip in it.
+  const recentChangeMarks = () => {
+    if (!switchOn('plan_change_marks')) return null;
+    try {
+      return recentChanges(db);
+    } catch (error) {
+      console.error(`recent_changes.failed ${error?.code || error?.name || 'error'}`);
+      return null;
+    }
+  };
   // A phase id a plan row may be filed under. Without the stop layer: any
   // phase the config names.
   const isKnownPhase = (id) => typeof id === 'string' && (phaseKnown ? phaseKnown(id) : (cfg().phases || []).some(p => p?.id === id));
@@ -1323,7 +1380,17 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
 
   app.patch('/api/settings', organizerOrAgentRequired, (req, res) => {
     const body = req.body || {};
-    if (!isValidTimeZone(body.timezone)) {
+    // A partial update (video Release 1C): each setting is validated only when the body carries it,
+    // and one the body does not carry is left as it is. A body with neither is still the timezone's 400.
+    const hasLine = body.group_change_line !== undefined;
+    if (hasLine && typeof body.group_change_line !== 'boolean') {
+      return res.status(400).json({ error: 'group_change_line must be true or false' });
+    }
+    const hasNav = body.nav_app !== undefined;
+    if (hasNav && !NAV_APPS.has(body.nav_app)) {
+      return res.status(400).json({ error: 'nav_app must be "google" or "waze"' });
+    }
+    if ((body.timezone !== undefined || !(hasLine || hasNav)) && !isValidTimeZone(body.timezone)) {
       return res.status(400).json({ error: 'timezone must be a valid IANA time zone identifier, e.g. "America/New_York"' });
     }
     // Store Intl's canonical spelling, never the caller's own — the same rule
@@ -1332,12 +1399,88 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
     // name, never the config's own spelling). "america/new_york" must not be
     // stored verbatim just because a companion or a PATCH body happened to
     // type it that way.
-    const canonical = new Intl.DateTimeFormat(undefined, { timeZone: body.timezone }).resolvedOptions().timeZone;
+    const canonical = body.timezone !== undefined
+      ? new Intl.DateTimeFormat(undefined, { timeZone: body.timezone }).resolvedOptions().timeZone
+      : null;
     db.prepare(
-      "UPDATE trip_settings SET timezone = ?, updated_by = ?, updated_at = datetime('now') WHERE id = 1"
-    ).run(canonical, req.user.username);
+      "UPDATE trip_settings SET timezone = COALESCE(?, timezone), group_change_line = COALESCE(?, group_change_line), nav_app = COALESCE(?, nav_app), updated_by = ?, updated_at = datetime('now') WHERE id = 1"
+    ).run(canonical, hasLine ? (body.group_change_line ? 1 : 0) : null, hasNav ? body.nav_app : null, req.user.username);
     res.json(tripSettings(db));
   });
+
+  // Video Release 1C (docs/specs/sprint-9/x-video-r1-group-line.md): what the control plane reads, about
+  // once a minute, to decide whether the group has news. The control plane is the only caller: the route
+  // sits behind internal() (the dedicated exchange key, this trip's own id, the owner mapping), and when
+  // the caller did not pass that middleware the route is simply not mounted, never mounted open.
+  //
+  // It answers from diffPlanVersions, the function the site's "Updated" marks come from (AC-21), through
+  // an allow-list of keys: a future column on a plan item does not ride along (AC-27). It is a read: it
+  // makes no version and moves nothing.
+  if (typeof internal === 'function') {
+    const REVISION_ID_RE = /^[A-Za-z0-9_-]{1,100}$/;
+    const CHANGE_KEYS = ['kind', 'fields', 'date', 'time', 'previous_date', 'previous_time', 'text_he', 'text_en', 'previous_text_he', 'previous_text_en'];
+    // The control plane's poller refuses a body that does not fit its schema (control-plane/api/src/plan-change-poller.ts,
+    // planChangesSchema), and a refused body means no line for the trip until the plan changes again, so one long title
+    // would wedge a trip silently. This route therefore answers inside those limits however the plan was written: free
+    // text is cut to MAX_TEXT, a day or time not in the shape the schema takes is left out, and at most MAX_CHANGES
+    // changes are sent (the nearest days first), the rest counted in `changes_omitted`. The numbers are pinned to the
+    // schema by tests/plan-changes-limits.test.js (it writes the fixture control-plane/api/test/plan-changes-contract.test.ts parses).
+    const MAX_TEXT = 400;
+    const MAX_CHANGES = 200;
+    const TEXT_KEYS = new Set(['text_he', 'text_en', 'previous_text_he', 'previous_text_en']);
+    const clip = (value) => {
+      if (typeof value !== 'string' || value.length <= MAX_TEXT) return value;
+      let cut = value.slice(0, MAX_TEXT - 1);
+      if (/[\ud800-\udbff]$/.test(cut)) cut = cut.slice(0, -1); // never half of a surrogate pair
+      return `${cut.trimEnd()}…`;
+    };
+    const validDay = (value) => typeof value === 'string' && ISO_DATE_RE.test(value);
+    const validTime = (value) => value === null || (typeof value === 'string' && (HHMM_RE.test(value) || Object.prototype.hasOwnProperty.call(ROUGH_TIMES, value)));
+    app.get('/api/internal/control-plane/plan-changes', internal, (req, res) => {
+      res.setHeader('Cache-Control', 'no-store');
+      const activeId = getState(db)?.active_version_id;
+      const createdAt = activeId ? revisionCreatedAt(db, activeId) : null;
+      if (!activeId || !createdAt) return res.status(409).json({ error: 'NO_ACTIVE_PLAN' });
+      const config = cfg();
+      const clock = localClock(db, config);
+      const since = typeof req.query.since === 'string' && REVISION_ID_RE.test(req.query.since) ? req.query.since : null;
+      // An unknown, malformed or missing since describes nothing: the caller then moves its cursor
+      // and sends nothing, rather than a description of an unrelated plan.
+      const diff = since ? diffPlanVersions(db, since, activeId) : { known: false, updated: [], added: [], removed: [] };
+      const all = [];
+      for (const [kind, list] of [['updated', diff.updated], ['added', diff.added], ['removed', diff.removed]]) {
+        for (const item of list) {
+          if (!validDay(item.date) || item.date < clock.date) continue; // a day already past is not news
+          const out = {};
+          for (const key of CHANGE_KEYS) {
+            let value = key === 'kind' ? kind : item[key];
+            if (value === undefined) continue;
+            if (key === 'previous_date' && value !== null && !validDay(value)) value = null;
+            if ((key === 'time' || key === 'previous_time') && !validTime(value)) value = null;
+            out[key] = TEXT_KEYS.has(key) ? clip(value) : value;
+          }
+          all.push(out);
+        }
+      }
+      // Nearest day first, then by time; the cap drops the furthest, and says how many.
+      all.sort((a, b) => a.date.localeCompare(b.date) || (planTimeSort(a.time) ?? 1e9) - (planTimeSort(b.time) ?? 1e9));
+      const changes = all.slice(0, MAX_CHANGES);
+      const language = config.agent?.default_language || config.meta?.defaultLang || 'he';
+      res.json({
+        active_revision_id: activeId,
+        active_created_at: createdAt,
+        since_known: Boolean(since && diff.known),
+        group_change_line: tripSettings(db).group_change_line,
+        time_zone: clock.time_zone,
+        // The two languages the line has wording for; anything else reads as English.
+        language: language === 'he' ? 'he' : 'en',
+        today: clock.date,
+        now_local: minutesToHHMM(clock.minutes),
+        changes,
+        changes_omitted: all.length - changes.length,
+      });
+    });
+  }
 
   app.patch('/api/ui-settings', organizerOrAgentRequired, (req, res) => {
     const body = req.body || {};
@@ -1374,7 +1517,9 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
     if (!rows) return res.status(404).json({ error: 'itinerary_not_ready' });
     // The ETag is over the payload, so a stop edit — which changes the lodging
     // served, not the plan revision — is a new ETag, never a 304.
-    let payload = serializeItinerary(db, rows, { config: hotelPlaces ? hotelPlaces.hydrateConfig(cfg()) : cfg(), hotelPlaces });
+    let payload = serializeItinerary(db, rows, { config: hotelPlaces ? hotelPlaces.hydrateConfig(cfg()) : cfg(), hotelPlaces, includeAuthor: mayKnowAuthor(req) });
+    const marks = recentChangeMarks();
+    if (marks) payload = { ...payload, items: payload.items.map((item) => withRecentChange(item, marks)) };
     // "The trip file changed this item" (#382) is the organizer's to see; a member's payload is byte-for-byte what it was.
     if (isOrganizer && isOrganizer(req)) payload = withPlanConflicts(db, withSeedFlags(db, payload), rows);
     const etag = etagForPayload(payload);
@@ -1421,7 +1566,7 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
     const state = getState(db);
     const rows = state ? getVersionRows(db, state.original_version_id) : null;
     if (!rows) return res.status(404).json({ error: 'itinerary_not_ready' });
-    res.json(serializeItinerary(db, rows, { includeOriginal: true }));
+    res.json(serializeItinerary(db, rows, { includeOriginal: true, includeAuthor: true }));
   });
 
   app.get('/api/itinerary/revisions', organizerOrAgentRequired, (_req, res) => {
@@ -1690,9 +1835,17 @@ function registerRoutes({ app, db, config, getConfig, hotelPlaces, raw, fetchImp
     res.json(db.prepare('SELECT date, he, en FROM trip_daily_messages WHERE date = ?').get(date));
   });
 
-  app.get('/api/today', authRequired, (_req, res) => {
+  app.get('/api/today', authRequired, (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
-    res.json(buildTodayContext(db, cfg(), { hotelPlaces }));
+    const context = buildTodayContext(db, cfg(), { hotelPlaces, includeAuthor: mayKnowAuthor(req) });
+    const marks = recentChangeMarks();
+    if (!marks) return res.json(context);
+    res.json({
+      ...context,
+      current: withRecentChange(context.current, marks),
+      next: withRecentChange(context.next, marks),
+      events: context.events.map((item) => withRecentChange(item, marks)),
+    });
   });
 
   app.get('/api/confirmations/summary', authRequired, (_req, res) => {

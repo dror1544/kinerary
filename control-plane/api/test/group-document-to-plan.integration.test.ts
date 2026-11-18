@@ -33,6 +33,7 @@ import pg from "pg";
 import { documentText } from "../src/document-text.js";
 import { applyMigrations } from "../src/migrations.js";
 import { RelayConnector } from "../src/relay/connector.js";
+import { outboundScopeOptions } from "../src/relay/outbound-scope.js";
 import { dispatchUpdate, DEFAULT_STRINGS } from "../src/relay/dispatch.js";
 import { MediaStore } from "../src/relay/media-store.js";
 import type { TelegramMessage } from "../src/relay/normalize.js";
@@ -123,6 +124,7 @@ describe("an itinerary PDF sent to the family group reaches the trip's plan", { 
       telegram: { async sendMessage() { return { ok: true }; } } as never,
       port: 0,
       mediaStore,
+      ...outboundScopeOptions(pool, undefined),
     });
     await connector.listen();
 

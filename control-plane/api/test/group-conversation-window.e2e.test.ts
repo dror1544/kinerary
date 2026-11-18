@@ -22,7 +22,7 @@
  * live, not here.
  *
  * Wiring note: relay/server.ts runs `main()` on import, so it cannot be loaded
- * by a test. The connector options below are copied from it (interviewChat,
+ * by a test. The connector options below are copied from it (outboundScopeOptions,
  * setExpectsReply, renewConversation). If server.ts stops passing one of them
  * the production relay loses the feature and this test stays green - the
  * hand-back names that gap.
@@ -41,9 +41,10 @@ import { fileURLToPath } from "node:url";
 import { after, before, beforeEach, describe, test } from "node:test";
 import pg from "pg";
 import { WebSocket } from "ws";
-import { renewCompanionConversation, resolveChatRoute, setCompanionExpectsReply } from "../src/chat-router.js";
+import { renewCompanionConversation, setCompanionExpectsReply } from "../src/chat-router.js";
 import { applyMigrations } from "../src/migrations.js";
 import { RelayConnector } from "../src/relay/connector.js";
+import { outboundScopeOptions } from "../src/relay/outbound-scope.js";
 import { GroupContext } from "../src/relay/group-context.js";
 import { startTripBotPoller } from "../src/relay/poller.js";
 import { makeUpgradeToken, type WireMessageEvent } from "../src/relay/protocol.js";
@@ -280,7 +281,7 @@ describe("group conversation window - the real relay, a fake Telegram and a scri
       telegram,
       port: 0,
       log,
-      interviewChat: async (chatId) => (await resolveChatRoute(pool, chatId)).kind === "interview",
+      ...outboundScopeOptions(pool, undefined),
       setExpectsReply: async (chatId, expects) => { await setCompanionExpectsReply(pool, chatId, expects); },
       renewConversation: async (chatId) => { await renewCompanionConversation(pool, chatId); },
     });

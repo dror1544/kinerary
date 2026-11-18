@@ -1139,6 +1139,8 @@ const journey = livingJourney.create({
   reviewConfigured: () => Boolean(HERMES_URL),
   // Who sees "the trip file changed this" (#382): the same people who see booking drafts.
   isOrganizer: (req) => canReviewDrafts(req),
+  // The one featureOn (built above from the file's block), so living-journey never reads the raw block itself.
+  featureOn,
   raw: TRIP_CONFIG_RAW,
   fetchImpl: fetch,
   mediaDir: MEDIA_DIR,
@@ -1239,7 +1241,7 @@ app.post('/api/ui-settings/hero', organizerOrAgentRequired, heroUpload.single('h
   res.json(journey.uiSettings());
 });
 
-journey.registerRoutes(app, { authRequired, organizerOrAgentRequired });
+journey.registerRoutes(app, { authRequired, organizerOrAgentRequired, internal: controlPlaneAuth.internal });
 // GET /api/stops and the stop writes: organizer or agent only — provenance,
 // conflicts and history are never served to a member.
 tripStructure.registerRoutes(app, { organizerOrAgentRequired });

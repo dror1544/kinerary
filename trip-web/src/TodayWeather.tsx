@@ -32,8 +32,10 @@ const shiftDate = (date: string, offset: number) => {
   return value.toISOString().slice(0, 10);
 };
 
-export function TodayWeather({ config, itinerary, today, lang }: {
+export function TodayWeather({ config, itinerary, today, lang, bare = false }: {
   config?: TripConfig; itinerary?: ActiveItinerary; today: string; lang: Lang;
+  /** Inside the weather/flights card the tab already says "Weather": no icon and heading of its own. */
+  bare?: boolean;
 }) {
   const [offset, setOffset] = useState(0);
   // A phase without scheduled activities is still part of the trip.
@@ -64,8 +66,8 @@ export function TodayWeather({ config, itinerary, today, lang }: {
   const NextArrow = lang === "he" ? ChevronLeft : ChevronRight;
   const name = label(stop?.name, lang) || label(phase?.title, lang) || phase?.id;
   return <section className="mini-panel weather-panel" aria-label={copy("Weather", "מזג אוויר")}>
-    <CloudSun size={20} />
-    <h3>{copy("Weather", "מזג אוויר")}</h3>
+    {bare ? null : <><CloudSun size={20} />
+    <h3>{copy("Weather", "מזג אוויר")}</h3></>}
     <strong>{name || copy("No planned location", "אין מיקום מתוכנן")}</strong>
     <nav className="weather-navigation" dir={lang === "he" ? "rtl" : "ltr"} aria-label={copy("Forecast days", "ימי התחזית")}>
       <button type="button" aria-label={copy("Back", "הקודם")} title={copy("Back", "הקודם")} disabled={dayOffset === 0} onClick={() => setOffset(dayOffset - 1)}><BackArrow size={20} aria-hidden="true" /></button>
