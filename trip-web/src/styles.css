@@ -1291,15 +1291,34 @@ textarea { min-height: 132px; resize: vertical; }
 .video-layout .clock-board:focus-visible { outline: 0; box-shadow: var(--kit-focus); }
 
 /* Today: weather and flights, one card with two tabs. */
-.video-layout .weather-flights { display: grid; gap: 10px; }
-.video-layout .weather-flights-tabs { display: flex; gap: 6px; padding: 4px; border: 1px solid var(--kit-line); border-radius: var(--kit-radius); background: var(--kit-surface); }
-.video-layout .weather-flights-tabs button { position: relative; flex: 1 1 0; display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 44px; border: 0; border-radius: var(--kit-radius); background: transparent; color: var(--kit-ink); font: 800 14px/1 var(--kit-font-body); cursor: pointer; }
-.video-layout .weather-flights-tabs button.active { background: var(--go-chip-bg); color: #fff; }
+/* Weather and flights: one card, folder tabs on its top edge. The selected tab is outlined in the card's frame colour
+   and opens into it (no line under it); the other tab sits quietly beside it. Both panels share one grid cell, the
+   hidden one kept for its height only, so the card is the same size on either tab. */
+.video-layout .weather-flights { --wf-frame: var(--go-chip-bg); display: grid; }
+.video-layout .weather-flights-tabs { position: relative; z-index: 1; display: flex; gap: 4px; padding-inline: 10px; margin-bottom: -1.5px; }
+.video-layout .weather-flights-tabs button { position: relative; flex: 0 1 auto; display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 44px; padding-inline: 16px; border: 1.5px solid transparent; border-bottom: 0; border-radius: 14px 14px 0 0; background: transparent; color: var(--kit-muted); font: 800 14px/1 var(--kit-font-body); cursor: pointer; }
+.video-layout .weather-flights-tabs button.active { border-color: var(--wf-frame); background: var(--kit-surface); color: var(--wf-frame); }
 .video-layout .weather-flights-tabs button svg { color: currentColor; }
-.video-layout .tab-dot { position: absolute; inset-block-start: 8px; inset-inline-end: 10px; width: 9px; height: 9px; border-radius: 50%; background: var(--kit-coral); box-shadow: 0 0 0 2px #fff; }
+.video-layout .weather-flights-body { display: grid; border: 1.5px solid var(--wf-frame); border-radius: var(--kit-radius-lg); background: var(--kit-surface); box-shadow: 0 12px 32px rgba(16, 38, 58, .07); }
+.video-layout .weather-flights-body > [role="tabpanel"] { grid-area: 1 / 1; min-width: 0; }
+.video-layout .weather-flights-body > [role="tabpanel"][hidden] { display: block; visibility: hidden; }
+.video-layout .weather-flights-body .mini-panel { height: 100%; border: 0; box-shadow: none; background: transparent; padding: 14px 16px; }
+.video-layout .tab-dot { position: absolute; inset-block-start: 8px; inset-inline-end: 6px; width: 9px; height: 9px; border-radius: 50%; background: var(--kit-coral); box-shadow: 0 0 0 2px #fff; }
+/* Weather, tighter than its stand-alone panel: place, day switcher, then the numbers. */
+.video-layout .weather-flights-body .weather-panel strong { display: block; font-size: 16px; }
+.video-layout .weather-flights-body .weather-panel p { line-height: 1.4; }
+/* Flights, roomier: each one a row you tap for its ticket. */
 .video-layout .flights-panel ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; }
-.video-layout .flights-panel li { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-.video-layout .flights-panel .flight-change { padding: 2px 8px; border-radius: 999px; background: var(--change-tint); color: var(--kit-ink); font-size: 12px; }
+.video-layout .flight-row { display: flex; align-items: center; gap: 12px; width: 100%; min-height: 56px; padding: 10px 12px; border: 1px solid var(--kit-line); border-radius: var(--kit-radius); background: var(--kit-paper); color: var(--kit-ink); text-align: start; cursor: pointer; }
+.video-layout .flight-changed .flight-row { border-color: var(--change-edge); background: var(--change-tint); }
+.video-layout .flight-row-main { display: grid; gap: 4px; flex: 1 1 auto; min-width: 0; }
+.video-layout .flight-row-main strong { font-size: 15px; overflow-wrap: anywhere; }
+.video-layout .flight-row-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: var(--kit-muted); font-size: 13px; }
+.video-layout .flight-row-ticket { flex: none; color: var(--wf-frame); }
+.video-layout .flights-panel .flight-change { padding: 2px 8px; border-radius: 999px; background: #fff; color: var(--kit-ink); font-size: 12px; }
+.video-layout .flight-ok { color: var(--go-chip-bg); font-weight: 700; }
+/* A booking opened from a flight on Today. */
+.booking-card.is-focused { outline: 2px solid var(--go-chip-bg); outline-offset: 2px; }
 
 /* 1B: changed things are coral. Badge text is ink — white on #f26b3a is below 4.5:1. */
 .day-row.is-updated, .video-layout .timeline-item.is-updated { background: var(--change-tint); box-shadow: inset 0 0 0 1px var(--change-edge); }

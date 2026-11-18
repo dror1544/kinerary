@@ -10,7 +10,7 @@ import { resolve } from "node:path";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { VideoHero } from "./App";
-import { COMPACT_PX, heroGrowFor, heroScrollState, MAX_PULL_PX } from "./hero-scroll";
+import { COMPACT_PX, heroGrowFor, heroOpenExtra, heroScrollState, MAX_PULL_PX, OPEN_AT_PX } from "./hero-scroll";
 
 const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
 const FULL = 200; // the header's height at rest
@@ -101,15 +101,47 @@ describe("the header follows the scroll", () => {
     await waitFor(() => expect(header.style.getPropertyValue("--hero-pull")).toBe("0px"));
   });
 
-  it("a finger pulling down at the top grows the header with it, and lets go when the finger lifts", () => {
+  it("a short pull grows the header with the finger and springs back when it lifts", () => {
     const { header } = renderHero();
     touch("touchstart", 100);
-    touch("touchmove", 220);
-    expect(header.style.getPropertyValue("--hero-grow")).toBe("60px");
+    touch("touchmove", 180); // grows 40, under OPEN_AT_PX
+    expect(header.style.getPropertyValue("--hero-grow")).toBe("40px");
     expect(header.hasAttribute("data-pulling")).toBe(true); // no transition while the finger is down
     touch("touchend");
     expect(header.style.getPropertyValue("--hero-grow")).toBe("0px");
     expect(header.hasAttribute("data-pulling")).toBe(false); // the CSS transition springs it back
+  });
+
+  it("a longer pull leaves the photo open, filling most of the screen, after the finger lifts", () => {
+    const { header } = renderHero();
+    touch("touchstart", 100);
+    touch("touchmove", 100 + (OPEN_AT_PX + 10) * 2);
+    touch("touchend");
+    const extra = heroOpenExtra(FULL, window.innerHeight);
+    expect(header.style.getPropertyValue("--hero-grow")).toBe(`${extra}px`);
+    expect(header.style.getPropertyValue("--hero-stick")).toBe(`${STICK + extra}px`); // scrolling down closes it too
+  });
+
+  it("scrolled down to the compact bar, the opening is let go without moving what is on screen", async () => {
+    const scrollBy = vi.fn();
+    vi.stubGlobal("scrollBy", scrollBy);
+    const { header } = renderHero();
+    touch("touchstart", 100);
+    touch("touchmove", 400);
+    touch("touchend");
+    const extra = heroOpenExtra(FULL, window.innerHeight);
+    scrollTo(STICK + extra / 2); // part way: still open, the photo reducing as it scrolls
+    await waitFor(() => expect(header.style.getPropertyValue("--hero-progress")).not.toBe(""));
+    expect(header.style.getPropertyValue("--hero-grow")).toBe(`${extra}px`);
+    scrollTo(STICK + extra + 5);
+    await waitFor(() => expect(scrollBy).toHaveBeenCalledWith(0, -extra));
+    expect(header.style.getPropertyValue("--hero-grow")).toBe("0px");
+    expect(header.style.getPropertyValue("--hero-stick")).toBe(`${STICK}px`);
+  });
+
+  it("the opened size fills OPEN_SHARE of the screen, and never less than a full pull", () => {
+    expect(heroOpenExtra(200, 800)).toBe(Math.round(800 * 0.72 - 200));
+    expect(heroOpenExtra(500, 600)).toBe(MAX_PULL_PX);
   });
 
   it("a finger that starts below the top is an ordinary scroll and grows nothing", () => {

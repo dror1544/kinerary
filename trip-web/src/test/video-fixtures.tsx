@@ -49,7 +49,7 @@ export function todayContext(items: ItineraryItem[], extra: Partial<TodayContext
   };
 }
 
-export type Served = { config: unknown; today: TodayContext; items: ItineraryItem[]; days?: ItineraryDay[]; user?: Record<string, unknown>; settings?: Record<string, unknown>; flights?: unknown[] };
+export type Served = { config: unknown; today: TodayContext; items: ItineraryItem[]; days?: ItineraryDay[]; user?: Record<string, unknown>; settings?: Record<string, unknown>; flights?: unknown[]; bookings?: unknown[] };
 
 export const LABELLED_DAY: ItineraryDay = { phase_id: "colmar", date: TODAY, label_en: "Thu 12/3 — Wine Route", label_he: "יום ה׳ 3/12 — דרך היין" };
 
@@ -71,7 +71,7 @@ export function stubTripFetch(served: () => Served) {
       case "/api/operations/flights": return json({ statuses: state.flights ?? [] });
       case "/api/moments": return json([]);
       case "/api/photos": return json([]);
-      case "/api/bookings": return json([]);
+      case "/api/bookings": return json(state.bookings ?? []);
       default: return json({ error: "not stubbed" }, 404);
     }
   });

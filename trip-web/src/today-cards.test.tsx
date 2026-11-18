@@ -6,6 +6,8 @@
  *   F. the trip conversation is not on Today: it is a page of its own, reached from the header menu or its hash.
  * With the switch off Today is what it was.
  */
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { flightChange, type FlightEntry } from "./today-cards";
@@ -21,9 +23,9 @@ const flight = (status: unknown, over: Partial<FlightEntry> = {}): FlightEntry =
 });
 const DELAYED = { status: "Scheduled", scheduled_out: "2026-12-02T06:00:00Z", estimated_out: "2026-12-02T06:40:00Z", scheduled_in: "2026-12-02T10:00:00Z", estimated_in: "2026-12-02T10:40:00Z" };
 
-function serve({ today, flights, features = VIDEO }: { today?: Partial<TodayContext>; flights?: unknown[]; features?: Record<string, boolean> } = {}) {
+function serve({ today, flights, bookings, features = VIDEO }: { today?: Partial<TodayContext>; flights?: unknown[]; bookings?: unknown[]; features?: Record<string, boolean> } = {}) {
   const items = dayItems();
-  stubTripFetch(() => ({ config: config(features), today: todayContext(items, today), items, flights }));
+  stubTripFetch(() => ({ config: config(features), today: todayContext(items, today), items, flights, bookings }));
 }
 
 describe("flightChange — what counts as a change", () => {
@@ -230,6 +232,37 @@ describe("E. weather and flights, one card, two tabs", () => {
     const [, flights] = await waitFor(() => { const found = screen.getAllByRole("tab"); expect(found).toHaveLength(2); return found; });
     fireEvent.click(flights!);
     expect(screen.getByText("LY345 Tel Aviv - Frankfurt")).toBeInTheDocument();
+  });
+
+  it("the tabs name the panels: no Weather or Flights heading inside the card, and both panels share one cell", async () => {
+    serve({ flights: [flight(null, { source: "stored_booking" })] });
+    const { container } = renderTrip();
+    await screen.findByRole("tablist");
+    await waitFor(() => expect(container.querySelector(".weather-flights-body .weather-panel")).not.toBeNull());
+    expect(container.querySelector(".weather-flights-body h3")).toBeNull();
+    expect(container.querySelector(".weather-flights-body .weather-panel > svg")).toBeNull();
+    const body = container.querySelector(".weather-flights-body")!;
+    expect(body.querySelectorAll(":scope > [role='tabpanel']")).toHaveLength(2);
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+    expect(css).toContain(".video-layout .weather-flights-body > [role=\"tabpanel\"] { grid-area: 1 / 1;");
+    expect(css).toContain(".video-layout .weather-flights-body > [role=\"tabpanel\"][hidden] { display: block; visibility: hidden; }");
+  });
+
+  it("a flight row shows its date and opens its booking — the ticket — on the Bookings page", async () => {
+    serve({
+      today: { flights: [{ id: 7, name: "TLV → FRA", date_from: "2026-12-02" }] },
+      flights: [flight(DELAYED)],
+      bookings: [{ id: 6, phase: "colmar", type: "hotel", name: "Hotel Colmar" }, { id: 7, phase: "colmar", type: "flight", name: "TLV → FRA", date_from: "2026-12-02", confirmation: "ABC123" }],
+    });
+    const { container } = renderTrip();
+    fireEvent.click(await screen.findByRole("tab", { name: "Flights — changed" }));
+    const row = screen.getByRole("button", { name: "TLV → FRA — Delayed — open the booking" });
+    expect(row).toHaveTextContent("Wed 2 Dec");
+    fireEvent.click(row);
+    expect(window.location.hash).toBe("#bookings");
+    await waitFor(() => expect(container.querySelector("#booking-7")).not.toBeNull());
+    expect(container.querySelector("#booking-7")).toHaveClass("is-focused");
+    expect(container.querySelector("#booking-6")).not.toHaveClass("is-focused");
   });
 
   it("switch off: the two separate panels, no tabs", async () => {

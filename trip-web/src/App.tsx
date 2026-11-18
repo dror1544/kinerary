@@ -937,6 +937,7 @@ export function TodayView({
   lang,
   isOrganizer,
   onOpenItinerary,
+  onOpenBooking,
   videoLayout = false,
   marks = false,
 }: {
@@ -945,6 +946,8 @@ export function TodayView({
   lang: Lang;
   isOrganizer?: boolean;
   onOpenItinerary: (focus: JourneyFocus) => void;
+  /** A tapped flight opens its booking (the ticket) on the Bookings page; null opens the page on its flights. */
+  onOpenBooking?: (bookingId: number | null) => void;
   /** site_video_layout: one card for the whole day instead of "Up next". */
   videoLayout?: boolean;
   /** plan_change_marks, inside the video layout. */
@@ -982,7 +985,7 @@ export function TodayView({
       {videoLayout ? (
         <aside className="ops-strip">
           <WeatherFlightsCard config={config} itinerary={itinerary} today={today.data?.today}
-            flights={flights.data?.statuses || []} fallbackFlights={(today.data?.flights || []).map((flight) => flight.name)} lang={lang} />
+            flights={flights.data?.statuses || []} bookedFlights={today.data?.flights || []} lang={lang} onOpenFlight={onOpenBooking} />
         </aside>
       ) : (
         <aside className="ops-strip">
@@ -1927,9 +1930,13 @@ export function BookingEditPanel({ booking, config, lang, onClose }: { booking: 
   );
 }
 
-export function BookingsView({ config, isOrganizer, lang }: { config?: TripConfig; isOrganizer?: boolean; lang: Lang }) {
+export function BookingsView({ config, isOrganizer, lang, focus }: {
+  config?: TripConfig; isOrganizer?: boolean; lang: Lang;
+  /** Opened from a flight on Today: that booking's card is brought into view and marked; null shows the flights. */
+  focus?: { bookingId: number | null } | null;
+}) {
   const queryClient = useQueryClient();
-  const [filter, setFilter] = useState<BookingFilter>("phase");
+  const [filter, setFilter] = useState<BookingFilter>(focus && focus.bookingId === null ? "flight" : "phase");
   const [editingBookingId, setEditingBookingId] = useState<number | null>(null);
   const bookings = useQuery({ queryKey: ["bookings"], queryFn: getBookings });
   const today = useQuery({ queryKey: ["today"], queryFn: getToday, refetchInterval: 60_000 });
@@ -1959,6 +1966,13 @@ export function BookingsView({ config, isOrganizer, lang }: { config?: TripConfi
     mutationFn: approveBookingDraft,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["bookings"] }),
   });
+  const focusId = focus?.bookingId ?? null;
+  const focusShown = focusId !== null && rows.some((booking) => booking.id === focusId);
+  useEffect(() => {
+    if (!focusShown) return;
+    const frame = window.requestAnimationFrame(() => document.getElementById(`booking-${focusId}`)?.scrollIntoView?.({ behavior: "smooth", block: "center" }));
+    return () => window.cancelAnimationFrame(frame);
+  }, [focus, focusId, focusShown]);
 
   return (
     <section className="module-layout">
@@ -1989,7 +2003,7 @@ export function BookingsView({ config, isOrganizer, lang }: { config?: TripConfi
             <h3>{phaseTitle(config, phaseId, lang)}</h3>
             <div className="module-grid">
               {phaseBookings.map((booking) => (
-                <article className="booking-card" key={booking.id}>
+                <article className={booking.id === focusId ? "booking-card is-focused" : "booking-card"} id={`booking-${booking.id}`} key={booking.id}>
                   <div className="booking-card-head">
                     <span className="booking-type">{bookingTypeLabel(booking.type, lang)}</span>
                     <span className={`status-pill ${bookingState(booking)}`}>{bookingState(booking) === "verified" ? "Verified" : bookingState(booking) === "draft" ? "Draft" : "Needs review"}</span>
@@ -3058,6 +3072,7 @@ export default function App() {
   const [lang, setLang] = useState<Lang>(() => preferredLang());
   const [journeyHeroPhaseId, setJourneyHeroPhaseId] = useState("");
   const [journeyFocus, setJourneyFocus] = useState<JourneyFocus | null>(null);
+  const [bookingFocus, setBookingFocus] = useState<{ bookingId: number | null } | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [enrollment, setEnrollment] = useState(() => initialHash.startsWith("enroll=") ? initialHash.slice(7) : "");
   // State, not a read: the session can end while the app is open — a token the
@@ -3116,6 +3131,7 @@ export default function App() {
     setMenuOpen(false);
   };
   const openModule = (module: Module) => {
+    if (module !== "bookings") setBookingFocus(null);
     setActiveModule(module);
     window.location.hash = module;
     setMenuOpen(false);
@@ -3127,7 +3143,15 @@ export default function App() {
     window.location.hash = "journey";
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
+  const openBooking = (bookingId: number | null) => {
+    setBookingFocus({ bookingId });
+    setActiveModule("bookings");
+    window.location.hash = "bookings";
+    setMenuOpen(false);
+    window.scrollTo({ top: 0 });
+  };
   const openVideoTab = (tab: VideoTab) => {
+    if (tab === "bookings") setBookingFocus(null);
     if (tab === "today") openTab("today");
     else if (tab === "plan") openTab("journey");
     else openModule(tab);
@@ -3146,13 +3170,13 @@ export default function App() {
       ? todayPhaseId(config.data, itinerary.data, today.data)
       : "";
   const tabContent = {
-    today: <TodayView itinerary={itinerary.data} config={config.data} lang={lang} isOrganizer={me.data?.is_organizer} onOpenItinerary={openMapItinerary} videoLayout={videoLayout} marks={marks} />,
+    today: <TodayView itinerary={itinerary.data} config={config.data} lang={lang} isOrganizer={me.data?.is_organizer} onOpenItinerary={openMapItinerary} onOpenBooking={openBooking} videoLayout={videoLayout} marks={marks} />,
     journey: <JourneyView username={me.data?.username} itinerary={itinerary.data} config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} botName={companionName} telegramUsername={hermes.data?.telegram_username} onHeroPhaseChange={setJourneyHeroPhaseId} focus={journeyFocus} today={today.data} videoLayout={videoLayout} marks={marks} />,
     moments: <MomentsView todayDate={today.data?.today} lang={lang} />,
     more: <MoreView config={config.data} currentUser={me.data} isOrganizer={me.data?.is_organizer} lang={lang} openModule={openModule} />,
   }[activeTab];
   const moduleContent = shownModule ? {
-    bookings: <BookingsView config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} />,
+    bookings: <BookingsView config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} focus={bookingFocus} />,
     map: <MapView config={config.data} itinerary={itinerary.data} lang={lang} onOpenItinerary={openMapItinerary} />,
     budget: <><BudgetView config={config.data} lang={lang} /><CurrencyConverter lang={lang}/></>,
     photos: <><PhotosView config={config.data} currentUser={me.data} lang={lang} /><ImmichAlbum config={config.data} lang={lang}/>{videoLayout ? <MomentsView todayDate={today.data?.today} lang={lang} /> : null}</>,
