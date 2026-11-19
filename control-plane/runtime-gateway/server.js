@@ -311,6 +311,64 @@ async function participantExists(req, res, tripId, runtimeUsername) {
   res.end(payload);
 }
 
+// The group line's read (video Release 1C): the control plane asks what changed in a trip's plan since the
+// revision the group last heard about. The control plane never holds a trip's key, so it asks HERE, with
+// RUNTIME_EXCHANGE_KEY like the participant routes, and this gateway reads the trip's own site with the key the
+// ROUTE says that trip holds (tripKeyFor). Only `since` is carried over, and only in the shape the site accepts
+// (server/living-journey.js REVISION_ID_RE). The answer is JSON passed through at the site's status; a redirect
+// is never followed (the trip's key rides this request and goes nowhere else) and is a 502, as is a body over
+// PLAN_CHANGES_MAX_BYTES (the same cap the poller applies) or a 2xx that is not JSON.
+const PLAN_CHANGES_MAX_BYTES = 512 * 1024;
+const REVISION_ID_RE = /^[A-Za-z0-9_-]{1,100}$/;
+
+async function readCapped(response, limit) {
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > limit) { await response.body?.cancel().catch(() => {}); return null; }
+  const chunks = [];
+  let size = 0;
+  if (response.body) {
+    for await (const chunk of response.body) {
+      size += chunk.length;
+      if (size > limit) { await response.body.cancel().catch(() => {}); return null; }
+      chunks.push(chunk);
+    }
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function planChanges(req, res, tripId, searchParams) {
+  if (!sameKey(req.headers["x-api-key"])) return json(res, 401, { error: "AUTHENTICATION_REQUIRED" });
+  if (!/^trip_[A-Za-z0-9]{8,64}$/.test(tripId)) return json(res, 404, { error: "NOT_FOUND" });
+  const sinceValues = searchParams.getAll("since");
+  if (sinceValues.length > 1 || (sinceValues.length === 1 && !REVISION_ID_RE.test(sinceValues[0]))) return json(res, 400, { error: "INVALID_REQUEST" });
+  const route = await routeFor(tripId);
+  const key = tripKeyFor(tripId, route); // throws 503 before any request to the trip
+  const query = sinceValues.length ? `?since=${encodeURIComponent(sinceValues[0])}` : "";
+  const response = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/plan-changes${query}`, {
+    method: "GET", redirect: "manual",
+    headers: { "x-api-key": key, "x-control-plane-trip-id": tripId, accept: "application/json" },
+  });
+  if (response.status >= 300 && response.status < 400) {
+    await response.body?.cancel().catch(() => {});
+    console.error(`runtime_gateway.plan_changes_redirect: trip=${tripId} status=${response.status}`);
+    return json(res, 502, { error: "UPSTREAM_REDIRECT" });
+  }
+  const payload = await readCapped(response, PLAN_CHANGES_MAX_BYTES);
+  if (payload === null) {
+    console.error(`runtime_gateway.plan_changes_body_too_large: trip=${tripId}`);
+    return json(res, 502, { error: "UPSTREAM_BODY_TOO_LARGE" });
+  }
+  let parsedOk = true;
+  try { JSON.parse(payload); } catch { parsedOk = false; }
+  if (!parsedOk) {
+    // A site's own error page keeps its status; a 2xx that is not an answer is the gateway's 502.
+    if (response.ok) return json(res, 502, { error: "UPSTREAM_NOT_JSON" });
+    return json(res, response.status, { error: "UPSTREAM_ERROR" });
+  }
+  res.writeHead(response.status, { "content-type": "application/json", "cache-control": "no-store" });
+  res.end(payload);
+}
+
 // Ask again while a stream is open, at half the cache window so a revocation
 // is seen within one window after the cached "live" runs out (30 s + 15 s with
 // the defaults). A negative answer, an outage and a hung control plane all end
@@ -591,6 +649,8 @@ export function createRuntimeGateway() {
       if (url.pathname === "/health") return json(res, 200, { ok: true });
       const internal = url.pathname.match(/^\/internal\/t\/([^/]+)\/participants$/);
       if (internal && req.method === "POST") return await provisionParticipant(req, res, decodeURIComponent(internal[1]));
+      const internalPlanChanges = url.pathname.match(/^\/internal\/t\/([^/]+)\/plan-changes$/);
+      if (internalPlanChanges && req.method === "GET") return await planChanges(req, res, decodeURIComponent(internalPlanChanges[1]), url.searchParams);
       const internalParticipant = url.pathname.match(/^\/internal\/t\/([^/]+)\/participants\/([^/]+)$/);
       if (internalParticipant && req.method === "GET") return await participantExists(req, res, decodeURIComponent(internalParticipant[1]), decodeURIComponent(internalParticipant[2]));
       const match = url.pathname.match(/^\/t\/([^/]+)(\/.*)?$/);

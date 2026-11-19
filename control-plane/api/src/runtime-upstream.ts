@@ -1,11 +1,12 @@
 import type pg from "pg";
 
 /**
- * Where a trip's own site answers: the one lookup both the runtime gateway's route lookup
- * (`GET /internal/runtime-routes/:tripId`, portal.ts) and the group-line poller
- * (plan-change-poller.ts) make, so the two apply the SAME allow-list. A poller that read
- * `private_url` on its own would be a second place that decides which hosts the exchange key may
- * be sent to.
+ * Where a trip's own site answers: the one lookup the runtime gateway's route lookup
+ * (`GET /internal/runtime-routes/:tripId`, portal.ts) makes. The group-line poller
+ * (plan-change-poller.ts) calls it too, but only to learn whether a trip has a ready, valid route
+ * before asking the gateway; it never uses the origin (the control plane sends no key to a trip
+ * site, the gateway does), so the allow-list that decides where a key may go is still applied in
+ * one place, here, on the gateway's behalf.
  *
  * The answer comes from `runtime_routes` (state `ready`) and the trip's last succeeded job's
  * `private_url`. The URL must be http(s) with no userinfo, query or fragment, and its host must

@@ -353,13 +353,15 @@ if (outboxNotification && outboxBotToken) {
   }, OUTBOX_POLL_INTERVAL_MS);
   timer.unref();
 
-  // The group line's trigger (video Release 1C). It only enqueues; the dispatcher above is the one sender. It needs
-  // the portal's runtime exchange key (the key every trip site checks) and its host allow-list, so a deployment
-  // without a web profile has no group line, and says so once here rather than never sending without a word.
+  // The group line's trigger (video Release 1C). It only enqueues; the dispatcher above is the one sender. It reads
+  // each trip's plan through the runtime gateway (portal.runtimeOrigin) with the control-plane exchange key, and
+  // never calls a trip site itself, so a deployment without a web profile has no group line, and says so once here
+  // rather than never sending without a word.
   if (portal?.runtimeExchangeKey) {
     startPlanChangePoller({
       db: pool,
       exchangeKey: portal.runtimeExchangeKey,
+      runtimeOrigin: portal.runtimeOrigin,
       upstreamHostSuffixes: portal.runtimeUpstreamHostSuffixes,
       upstreamAllowedHosts: portal.runtimeUpstreamAllowedHosts,
       log: (line) => process.stderr.write(`${line}\n`),

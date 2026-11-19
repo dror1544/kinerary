@@ -18,8 +18,11 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { buildApp } from "../src/app.js";
 import { validateArchitectureProfile } from "../src/config.js";
+import { setFeatureSwitch } from "../src/feature-switches.js";
 import { applyMigrations } from "../src/migrations.js";
+import { pollPlanChangesOnce } from "../src/plan-change-poller.js";
 import { sha256, type PortalDependencies } from "../src/portal.js";
+import { BASE_PLAN, bindGroup } from "./support/plan-change-site.js";
 import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
@@ -80,6 +83,7 @@ before(async () => {
     req.on("end", () => {
       seen.push({ method: req.method ?? "", url: req.url ?? "", headers: req.headers, body: Buffer.concat(chunks).toString() });
       res.writeHead(200, { "content-type": "application/json" });
+      if (req.url?.startsWith("/api/internal/control-plane/plan-changes")) return res.end(JSON.stringify(BASE_PLAN));
       res.end(JSON.stringify(req.url === "/api/internal/control-plane/session" ? { token: "trip-runtime-token" } : { ok: true }));
     });
   });
@@ -137,6 +141,9 @@ after(async () => {
   await app?.close();
   upstream.closeAllConnections?.();
   await new Promise((resolve) => upstream.close(resolve));
+  await pool.query("DELETE FROM control_plane.plan_change_cursors WHERE trip_id = $1", [ids.trip]);
+  await pool.query("DELETE FROM control_plane.telegram_chat_bindings WHERE trip_id = $1", [ids.trip]);
+  await pool.query("DELETE FROM control_plane.feature_switch_settings WHERE trip_id = $1", [ids.trip]);
   await pool.query("DELETE FROM control_plane.runtime_launch_grants WHERE trip_id = $1", [ids.trip]);
   await pool.query("DELETE FROM control_plane.jobs WHERE id = $1", [ids.job]);
   await pool.query("DELETE FROM control_plane.plans WHERE id = $1", [ids.plan]);
@@ -197,4 +204,28 @@ test("AC-R1.11: a portal launch exchanges its session with the trip site on the 
   assert.deepEqual({ tripId: JSON.parse(seen[0].body).tripId, userId: JSON.parse(seen[0].body).userId, role: JSON.parse(seen[0].body).role }, { tripId: ids.trip, userId: ids.user, role: "owner" });
   const grant = await pool.query("SELECT consumed_at FROM control_plane.runtime_launch_grants WHERE id = $1", [`launch_${suffix}a`]);
   assert.ok(grant.rows[0].consumed_at, "the control plane consumed the grant");
+});
+
+test("AC-K2.11: the group-line poller reaches a derived wildcard trip only through the gateway: the site sees derived(trip), never RUNTIME_EXCHANGE_KEY", { skip }, async () => {
+  await bindGroup(pool, ids.trip, "-1001000000099");
+  const on = await setFeatureSwitch(pool, { switch: "plan_change_group_line", enabled: true, scope: "trip", trip: ids.trip, live: true, by: "test" });
+  assert.equal(on.ok, true);
+  const logs: string[] = [];
+  const poll = () => pollPlanChangesOnce({
+    db: pool, exchangeKey: EXCHANGE_KEY, runtimeOrigin: gatewayOrigin,
+    upstreamHostSuffixes: [TRIP_HOST_SUFFIX], upstreamAllowedHosts: ["127.0.0.1"], log: (line) => logs.push(line),
+  });
+  seen.length = 0;
+  assert.deepEqual(await poll(), { polled: 1, enqueued: 0, failed: 0 }, `poll log: ${logs.join(" | ")} gateway log: ${gatewayOutput}`); // first sight: no cursor, no since
+  assert.deepEqual(await poll(), { polled: 1, enqueued: 0, failed: 0 }, `poll log: ${logs.join(" | ")}`); // second: since=<revision>
+  const label = (key: string | string[] | undefined) => key === derivedKey(ids.trip) ? "derived(A)" : key === LEGACY ? "legacy" : key === EXCHANGE_KEY ? "exchange" : "OTHER";
+  console.log(`poller request:  GET gateway /internal/t/<trip id>/plan-changes?since=… with the control-plane key`);
+  for (const request of seen) console.log(`site received:   ${request.method} ${request.url} x-api-key=${label(request.headers["x-api-key"])} x-control-plane-trip-id=${request.headers["x-control-plane-trip-id"] === ids.trip ? "<trip id>" : "OTHER"}`);
+  assert.deepEqual(seen.map((r) => [r.method, r.url]), [
+    ["GET", "/api/internal/control-plane/plan-changes"],
+    ["GET", `/api/internal/control-plane/plan-changes?since=${BASE_PLAN.active_revision_id}`],
+  ]);
+  assert.deepEqual(seen.map((r) => label(r.headers["x-api-key"])), ["derived(A)", "derived(A)"]);
+  assert.ok(seen.every((r) => r.headers["x-control-plane-trip-id"] === ids.trip));
+  assert.ok(!seen.some((r) => JSON.stringify(r.headers).includes(EXCHANGE_KEY)), "the site never saw the control-plane key anywhere in its request");
 });

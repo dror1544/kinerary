@@ -5,7 +5,7 @@ import pg from "pg";
 import { setFeatureSwitch } from "../src/feature-switches.js";
 import { applyMigrations } from "../src/migrations.js";
 import { MAX_WAIT_MS, QUIET_MS, pollPlanChangesOnce, type PlanChangePollerDeps } from "../src/plan-change-poller.js";
-import { BASE_PLAN, bindGroup, seedTrip, startStubSite, type StubSite } from "./support/plan-change-site.js";
+import { BASE_PLAN, bindGroup, seedTrip, startFakeGateway, startStubSite, tripKeyFor, type FakeGateway, type StubSite } from "./support/plan-change-site.js";
 import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 // Video Release 1C, G2: the trigger (docs/specs/sprint-9/x-video-r1-group-line.md, AC-9 to AC-20).
@@ -22,12 +22,13 @@ const at = (iso: string) => new Date(iso);
 
 let pool: pg.Pool;
 let site: StubSite;
+let gateway: FakeGateway;
 let tripId: string;
 let clock: Date;
 let logs: string[];
 
 const deps = (over: Partial<PlanChangePollerDeps> = {}): PlanChangePollerDeps => ({
-  db: pool, exchangeKey: KEY, upstreamHostSuffixes: ["localhost"], now: () => clock, log: (line) => logs.push(line), ...over,
+  db: pool, exchangeKey: KEY, runtimeOrigin: gateway.origin, upstreamHostSuffixes: ["localhost"], now: () => clock, log: (line) => logs.push(line), ...over,
 });
 const tick = () => pollPlanChangesOnce(deps());
 const advance = async (ms: number) => { clock = new Date(clock.getTime() + ms); return tick(); };
@@ -53,6 +54,7 @@ const failedLines = () => logs.map((line) => JSON.parse(line)).filter((entry) =>
 
 describe("the group line's trigger (G2)", { skip }, () => {
   before(async () => {
+    gateway = await startFakeGateway(KEY);
     pool = testPool();
     const client = await pool.connect();
     try {
@@ -83,7 +85,7 @@ describe("the group line's trigger (G2)", { skip }, () => {
     assert.equal((await cursor())?.revision_id, BASE_PLAN.active_revision_id);
     site.requests.length = 0;
   });
-  after(async () => { await site?.close(); });
+  after(async () => { await site?.close(); await gateway?.close(); });
 
   test("AC-17: a trip seen for the first time stores the active revision and sends nothing, however much history it has", async () => {
     await pool.query("TRUNCATE control_plane.plan_change_cursors");
@@ -96,10 +98,42 @@ describe("the group line's trigger (G2)", { skip }, () => {
     assert.equal(site.requests[0]!.since, null, "no cursor, so no since: the site is only asked where the plan is");
   });
 
-  test("the poll carries the exchange key and this trip's own id, and asks since the group's revision", async () => {
+  test("AC-K2.11: the poll goes to the gateway with the control-plane key; the site is read with the trip's own key and id, since the group's revision", async () => {
+    gateway.requests.length = 0;
     await tick();
-    assert.deepEqual(site.requests.map((r) => ({ key: r.apiKey, trip: r.tripId, since: r.since })), [{ key: KEY, trip: tripId, since: BASE_PLAN.active_revision_id }]);
+    assert.deepEqual(gateway.requests, [{ url: `/internal/t/${tripId}/plan-changes?since=rev_base0001`, since: BASE_PLAN.active_revision_id, apiKey: KEY }]);
+    assert.deepEqual(site.requests.map((r) => ({ key: r.apiKey, trip: r.tripId, since: r.since })), [{ key: tripKeyFor(tripId), trip: tripId, since: BASE_PLAN.active_revision_id }]);
     assert.match(site.requests[0]!.url, /^\/api\/internal\/control-plane\/plan-changes\?since=rev_base0001$/);
+  });
+
+  test("AC-K2.11: the control-plane key is sent to runtimeOrigin and to nothing else: the site's address is never contacted by the poller", async () => {
+    const calls: Array<{ url: string; key: string | undefined; redirect: RequestRedirect | undefined }> = [];
+    const spy = (async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(input), key: (init?.headers as Record<string, string> | undefined)?.["x-api-key"], redirect: init?.redirect });
+      return fetch(input, init);
+    }) as typeof fetch;
+    gateway.requests.length = 0; site.requests.length = 0;
+    await pollPlanChangesOnce(deps({ fetchImpl: spy }));
+    assert.equal(calls.length, 1);
+    assert.ok(calls[0]!.url.startsWith(`${gateway.origin}/internal/t/${tripId}/plan-changes`), calls[0]!.url);
+    assert.equal(calls[0]!.key, KEY);
+    assert.equal(calls[0]!.redirect, "manual");
+    assert.ok(calls.every((c) => !c.url.startsWith(site.origin)), "no request to the site's own address");
+    assert.ok(site.requests.every((r) => r.apiKey !== KEY), "the site never saw the control-plane key");
+  });
+
+  test("AC-K2.11: a gateway that refuses the key, or is not there, is a logged failure code with no cursor move", async () => {
+    revise("rev_2", [dinner()], 10 * min);
+    assert.deepEqual(await pollPlanChangesOnce(deps({ exchangeKey: "not-the-key" })), { polled: 1, enqueued: 0, failed: 1 });
+    assert.equal(failedLines().at(-1)!.safe_error_code, "SITE_HTTP_401");
+    const away = await startFakeGateway(KEY);
+    const gone = away.origin;
+    await away.close();
+    assert.deepEqual(await pollPlanChangesOnce(deps({ runtimeOrigin: gone })), { polled: 1, enqueued: 0, failed: 1 });
+    assert.equal(failedLines().at(-1)!.safe_error_code, "SITE_UNREACHABLE");
+    assert.equal((await cursor())?.revision_id, BASE_PLAN.active_revision_id);
+    const text = logs.join("\n");
+    assert.ok(!text.includes(KEY) && !text.includes(gone) && !text.includes(gateway.origin), "no key and no address in a log line");
   });
 
   test("AC-9: with the switch off nothing is asked of the site and nothing is enqueued", async () => {
@@ -341,13 +375,13 @@ describe("the group line's trigger (G2)", { skip }, () => {
       });
     }
 
-    test("an unreachable site (nothing listening)", async () => {
+    test("an unreachable site (nothing listening): the gateway answers 503, which is the code the poller logs", async () => {
       clock = at("2026-12-03T13:00:00Z");
       await tick();
       await site.close();
       revise("rev_2", [dinner()], 10 * min);
       assert.deepEqual(await tick(), { polled: 1, enqueued: 0, failed: 1 });
-      assert.equal(failedLines()[0].safe_error_code, "SITE_UNREACHABLE");
+      assert.equal(failedLines()[0].safe_error_code, "SITE_HTTP_503");
       assert.equal((await cursor())?.revision_id, BASE_PLAN.active_revision_id);
       site = await startStubSite(); // so afterEach hooks have something to close
     });

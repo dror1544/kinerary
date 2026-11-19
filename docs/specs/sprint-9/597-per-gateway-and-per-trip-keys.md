@@ -211,6 +211,27 @@ produce the others never leaves the components that need it.
   gateway's `.env.example` describe the key the same way (it is no longer "one key
   shared by every trip site" once per-trip keys are on).
 
+- **AC-K2.11 The control plane never calls a trip site.** The group-line poller
+  (`control-plane/api/src/plan-change-poller.ts`) reads a trip's plan through the
+  gateway: `GET <runtimeOrigin>/internal/t/<trip id>/plan-changes[?since=]`, with
+  `RUNTIME_EXCHANGE_KEY`, `redirect: manual`, and the poller's own timeout and size
+  cap. The control-plane key is sent to `runtimeOrigin` and to no trip site; the
+  API builds no trip-site URL (it asks `runtimeUpstreamFor` only whether the trip
+  has a ready, valid route, and never uses the origin). The gateway route checks its
+  caller like the participant routes (401 with no request to any trip), forwards
+  only a well-formed `since`, sends the key the route's `tripKey` names (AC-K2.3: a
+  `shared` trip with no legacy key is 503 and nothing is sent; with the master unset,
+  `RUNTIME_EXCHANGE_KEY`), does not follow a redirect (502), caps the answer at
+  512 KiB (502) and passes JSON through. Tested by
+  `runtime-gateway/test/plan-changes.test.js` (key per `tripKey`, 401 and 503 with
+  zero upstream requests, `since` only, redirect, oversize), `plan-change-poller-db.test.ts`
+  (the key goes to `runtimeOrigin` only; a gateway that refuses or is away is a
+  logged code), `plan-change-boundary.test.ts` (source shape) and
+  `runtime-wildcard-e2e.test.ts` (real API, real gateway, fake site: the site
+  receives `derive(master, trip id)` and never `RUNTIME_EXCHANGE_KEY`).
+  Operationally the group line now needs the gateway up; a poll then fails
+  `SITE_UNREACHABLE` and is retried next minute.
+
 ## Non-goals
 
 - Re-keying a live trip. A trip moves from `shared` to `derived` by writing

@@ -11,8 +11,11 @@ import { dayInZone, minutesInZone } from "./plan-change-line.js";
  *
  * Once a minute the control plane asks each switched-on trip's own site "what changed since the plan the group
  * last heard about?" through one read-only `internal()` route, waits until the plan has settled, and enqueues
- * ONE message for the trip's group. The site never calls out and holds no key for this: the control plane already
- * holds the exchange key the site checks, and already knows each trip's private address (runtime-upstream.ts).
+ * ONE message for the trip's group. The site never calls out and holds no key for this. The control plane does not
+ * call the site either: it asks the runtime gateway (`GET <runtimeOrigin>/internal/t/<trip id>/plan-changes`, the way
+ * portal.ts asks it about participants) with the control-plane exchange key, and the gateway reads the site with the
+ * key that trip holds (docs/specs/sprint-9/597-per-gateway-and-per-trip-keys.md, K2). The control-plane key is sent to
+ * the gateway and nowhere else; no trip site's address is built here.
  *
  * THE GATE. A line is sent for a trip only when ALL of these hold, and anything uncertain counts as off:
  *   1. the switch `plan_change_group_line` is on for the trip (feature-switches.ts: unknown, failed read = off);
@@ -41,7 +44,8 @@ export const NIGHT_END_MINUTES = 8 * 60;
 export const POLL_INTERVAL_MS = 60_000;
 const SITE_TIMEOUT_MS = 5_000;
 const MAX_BODY_BYTES = 512 * 1024;
-const ROUTE = "/api/internal/control-plane/plan-changes";
+/** The gateway's route for the read (runtime-gateway/server.js planChanges), which reads the trip's own site with that trip's key. */
+const ROUTE = "/plan-changes";
 
 const text = (max: number) => z.string().max(max);
 const day = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
@@ -113,11 +117,12 @@ export function keepValidEntries(entries: readonly unknown[]): { kept: PlanChang
 
 export interface PlanChangePollerDeps {
   db: pg.Pool;
-  /** The key the trip sites check on their `internal()` routes (the portal's runtime exchange key). */
+  /** The control-plane exchange key (the portal's runtime exchange key): what the runtime gateway checks on its `/internal/t/*` routes. It is sent to `runtimeOrigin` and to nothing else. */
   exchangeKey: string;
-  /** The hosts a site may live on: the same allow-list the runtime gateway's route lookup applies. */
+  /** The runtime gateway's own origin (`web.runtime_origin`): the only address this module sends a request to. */
+  runtimeOrigin: string;
+  /** With the next field, only the readiness check: is there a ready route for this trip? The address it finds is never used. */
   upstreamHostSuffixes: readonly string[];
-  /** `web.runtime_upstream_allowed_hosts`: with it, a wildcard-routed trip is reached at its registered LAN address. */
   upstreamAllowedHosts?: readonly string[];
   fetchImpl?: typeof fetch;
   now?: () => Date;
@@ -146,18 +151,16 @@ type SiteResult = { ok: true; body: PlanChangesResponse; invalid: number; surplu
 
 async function readSite(
   deps: PlanChangePollerDeps,
-  origin: string,
-  basePath: string,
   tripId: string,
   since: string | null,
 ): Promise<SiteResult> {
   const fetchImpl = deps.fetchImpl ?? fetch;
-  const url = `${origin}${basePath}${ROUTE}${since ? `?since=${encodeURIComponent(since)}` : ""}`;
+  const url = `${deps.runtimeOrigin.replace(/\/$/, "")}/internal/t/${encodeURIComponent(tripId)}${ROUTE}${since ? `?since=${encodeURIComponent(since)}` : ""}`;
   let response: Response;
   try {
     response = await fetchImpl(url, {
       method: "GET",
-      headers: { "x-api-key": deps.exchangeKey, "x-control-plane-trip-id": tripId, accept: "application/json" },
+      headers: { "x-api-key": deps.exchangeKey, accept: "application/json" },
       // The key rides this request: it is never forwarded to wherever a redirect points.
       redirect: "manual",
       signal: AbortSignal.timeout(SITE_TIMEOUT_MS),
@@ -186,8 +189,10 @@ async function pollTrip(deps: PlanChangePollerDeps, tripId: string, now: Date, l
     return "failed" as const;
   };
 
-  const upstream = await runtimeUpstreamFor(db, tripId, deps.upstreamHostSuffixes, deps.upstreamAllowedHosts);
-  if (!upstream.ok) return fail(upstream.error);
+  // Readiness only: a trip with no ready route, or one the gateway's own lookup would refuse, is not polled, and the
+  // code says which. The address this finds is deliberately not used: the gateway looks the site up itself.
+  const ready = await runtimeUpstreamFor(db, tripId, deps.upstreamHostSuffixes, deps.upstreamAllowedHosts);
+  if (!ready.ok) return fail(ready.error);
 
   const cursorRow = await db.query<Cursor>(
     "SELECT revision_id, pending_since, held_for_night FROM control_plane.plan_change_cursors WHERE trip_id = $1",
@@ -195,7 +200,7 @@ async function pollTrip(deps: PlanChangePollerDeps, tripId: string, now: Date, l
   );
   const cursor = cursorRow.rows[0] ?? null;
 
-  const site = await readSite(deps, upstream.upstreamOrigin, upstream.upstreamBasePath, tripId, cursor?.revision_id ?? null);
+  const site = await readSite(deps, tripId, cursor?.revision_id ?? null);
   if (!site.ok) return fail(site.code); // the cursor does not move: the next good poll sends the net difference
   const plan = site.body;
   // An entry that did not fit the contract, or arrived past the cap, was left out and the trip carries on: say so once,

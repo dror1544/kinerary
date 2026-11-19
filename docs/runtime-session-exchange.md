@@ -356,14 +356,28 @@ The trip site's own code does not change: it compares the key it is sent with it
 records the kind its trip holds, `runtime_routes.trip_key` (`shared`, the default, or
 `derived`; migration `20261116140000_runtime_route_trip_key.sql`), and both route
 lookups return it as `tripKey` (a kind, never a key; only behind the exchange key).
-With the master set, for the three calls the gateway makes to a trip (the launch's
-`session`, `participants` and `participants/<name>`):
+With the master set, for the four calls the gateway makes to a trip (the launch's
+`session`, `participants`, `participants/<name>` and the group line's `plan-changes`):
 
 | route's `tripKey` | sent to the trip |
 |---|---|
 | `derived` | `derive(master, trip_id)`, for the trip id the route was looked up for |
 | `shared` | `RUNTIME_LEGACY_TRIP_KEY`; if it is unset, **503 and nothing is sent** |
 | anything else, or absent (an older control plane) | **503 and nothing is sent** |
+
+**`plan-changes` (the group line's read).** The control plane never calls a trip site: the group-line
+poller (`plan-change-poller.ts`) asks the gateway, `GET /internal/t/<trip id>/plan-changes[?since=<revision id>]`
+with `RUNTIME_EXCHANGE_KEY`, checked like the participant routes (wrong or absent: 401, and nothing is sent to
+any trip). The gateway looks the trip's route up, picks the key by the table above as for every other call,
+and reads `GET <upstream>/api/internal/control-plane/plan-changes` with that key and `X-Control-Plane-Trip-Id`.
+Only `since` is carried over, and only if it fits the site's own shape (`[A-Za-z0-9_-]{1,100}`, once; anything
+else is 400 with no request; a trip id of the wrong shape is 404). A redirect from the site is never followed and is a 502; so is a body over 512 KiB
+or a 2xx that is not JSON; other statuses pass through with the site's JSON body. With per-trip keys off the site
+is read with `RUNTIME_EXCHANGE_KEY`, as before. The group line therefore depends on the gateway being up: when it
+is not, a poll fails with `plan_change_poll.failed` and `safe_error_code: SITE_UNREACHABLE` (a gateway that
+answers 503/502 shows as `SITE_HTTP_503`/`SITE_HTTP_502`), the trip's cursor does not move and the next
+minute's poll sends the net difference. Pinned by `runtime-gateway/test/plan-changes.test.js` and
+`control-plane/api/test/runtime-wildcard-e2e.test.ts` ("AC-K2.11").
 
 One key per request, chosen before it is sent. A trip that answers 401 to its key is
 not tried with another: a retry would hand the legacy key to whichever trip asked for

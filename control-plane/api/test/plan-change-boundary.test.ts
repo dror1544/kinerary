@@ -49,12 +49,26 @@ describe("no chat id is an input to a targeted row", () => {
   });
 });
 
-describe("the poller sends the key only where the gateway's allow-list says", () => {
-  test("it finds the site through runtimeUpstreamFor, the one lookup the gateway route also uses, and never follows a redirect", () => {
+describe("the poller sends the control-plane key to the runtime gateway and nowhere else (K2, AC-K2.11)", () => {
+  test("it builds no trip-site URL: the only address it requests is runtimeOrigin, and it never follows a redirect", () => {
+    const poller = src("plan-change-poller.ts");
+    const code = poller.split("\n").filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line)).join("\n");
+    // Exactly one place builds a URL, and it starts at deps.runtimeOrigin.
+    assert.deepEqual(code.match(/const url = .*/g), ['const url = `${deps.runtimeOrigin.replace(/\\/$/, "")}/internal/t/${encodeURIComponent(tripId)}${ROUTE}${since ? `?since=${encodeURIComponent(since)}` : ""}`;']);
+    assert.equal((code.match(/fetchImpl\(/g) ?? []).length, 1, "one outbound call");
+    assert.match(code, /redirect: "manual"/);
+    assert.ok(!/upstreamOrigin|upstreamBasePath|private_url|api\/internal\/control-plane/.test(code), "no trip-site address or route is built here");
+  });
+
+  test("runtimeUpstreamFor is a readiness check only: its origin is never read, and the gateway route uses the same lookup", () => {
     const poller = src("plan-change-poller.ts");
     assert.match(poller, /runtimeUpstreamFor\(db, tripId, deps\.upstreamHostSuffixes, deps\.upstreamAllowedHosts\)/);
-    assert.match(poller, /redirect: "manual"/);
+    assert.ok(!/ready\.(upstream|routeRef|tripKey)/.test(poller));
     assert.match(src("portal.ts"), /runtimeUpstreamFor\(deps\.db, tripId, deps\.runtimeUpstreamHostSuffixes, deps\.runtimeUpstreamAllowedHosts\)/);
+  });
+
+  test("server.ts hands the poller the portal's runtimeOrigin", () => {
+    assert.match(src("server.ts"), /startPlanChangePoller\(\{[^}]*runtimeOrigin: portal\.runtimeOrigin/s);
   });
 
   test("a failure line names the trip and a code, and never the address or the key", () => {
