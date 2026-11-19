@@ -2018,18 +2018,27 @@ class ProvisionerWorker:
             cur.execute(legacy, (trip_id, _generate_route_id()))
             return
 
+        # A row's `upstream_url` means "this trip's public name is served THROUGH the gateway" (AC-R2.5): the
+        # by-host lookup routes only a row that has one, and the by-trip lookup then answers with that LAN origin
+        # (AC-R1.11). So a host-routed trip, which its own proxy host still serves, records its name and NOT its
+        # address - unless it was already moved behind the gateway (scripts/trip-route.py --set), in which case a
+        # rebuild keeps it there and refreshes the address from the same topology that command reads.
+        wildcard = route.routing == "wildcard"
+
         def write_hosts() -> None:
             with conn.transaction():  # a savepoint: a refused statement leaves the outer transaction usable
                 cur.execute(
                     """
                     INSERT INTO control_plane.runtime_routes
                       (trip_id, route_ref, state, public_host, upstream_url)
-                    VALUES (%s, %s, 'ready', %s, %s)
+                    VALUES (%s, %s, 'ready', %s, CASE WHEN %s THEN %s END)
                     ON CONFLICT (trip_id) DO UPDATE
                     SET state = 'ready', public_host = excluded.public_host,
-                        upstream_url = excluded.upstream_url, updated_at = now()
+                        upstream_url = CASE WHEN %s OR runtime_routes.upstream_url IS NOT NULL THEN %s END,
+                        updated_at = now()
                     """,
-                    (trip_id, _generate_route_id(), route.public_host, route.upstream_url),
+                    (trip_id, _generate_route_id(), route.public_host, wildcard, route.upstream_url,
+                     wildcard, route.upstream_url),
                 )
 
         try:

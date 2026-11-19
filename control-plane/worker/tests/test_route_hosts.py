@@ -1,8 +1,10 @@
 """The route a provisioned trip leaves for the runtime gateway.
 
-On success the worker writes the trip's hostname and LAN address into its
+On success the worker writes the trip's hostname into its
 `control_plane.runtime_routes` row, in the transaction that marks it
-`ready_private`, in BOTH routing modes. Those two columns come from migration
+`ready_private`, in both routing modes; its LAN address only when the trip's
+public name is served through the gateway (a wildcard trip, or one moved there by
+`scripts/trip-route.py --set`) - AC-R2.5. Those two columns come from migration
 `20261116120000_runtime_route_hosts.sql`.
 """
 from __future__ import annotations
@@ -88,16 +90,17 @@ class RouteRecordedOnSuccess(unittest.TestCase):
             "SELECT lifecycle_state FROM control_plane.trips WHERE id = %s", (self.fix["trip_id"],)
         ).fetchone()["lifecycle_state"]
 
-    def test_a_host_routed_trip_records_its_hostname_and_upstream(self) -> None:
-        # AC-R2.5: both modes
+    def test_a_host_routed_trip_records_its_hostname_and_not_its_address(self) -> None:
+        # AC-R2.5: its own proxy host serves its name, so nothing may route it through the gateway or answer
+        # the by-trip lookup with its LAN address (AC-R1.11) - an existing-style trip stays exactly as it was.
         self._run(HOST_ROUTE)
         row = self._route_row()
         self.assertEqual("ready", row["state"])
         self.assertEqual("tokyo-2026.example.invalid", row["public_host"])
-        self.assertEqual("http://192.0.2.210:8080", row["upstream_url"])
+        self.assertIsNone(row["upstream_url"])
         self.assertEqual("ready_private", self._trip_state())
 
-    def test_a_wildcard_routed_trip_records_the_same_two_values(self) -> None:
+    def test_a_wildcard_routed_trip_records_its_hostname_and_its_address(self) -> None:
         self._run(WILDCARD_ROUTE)
         row = self._route_row()
         self.assertEqual(("ready", "tokyo-2026.example.invalid", "http://192.0.2.210:8080"),
@@ -117,18 +120,39 @@ class RouteRecordedOnSuccess(unittest.TestCase):
         self.assertNotEqual("ready_private", self._trip_state())
         self.assertIsNone(self._route_row(), "the route of a trip that did not become ready must not exist")
 
-    def test_re_provisioning_rewrites_both_and_keeps_the_route_ref(self) -> None:
-        self._run(HOST_ROUTE)
-        first = self._route_row()
+    def _register(self, route: TripRoute) -> None:
         worker = ProvisionerWorker(db_url=DB_URL, deploy=RoutedDeploy(None), worker_id="test-routes")
-        moved = TripRoute("tokyo-2026.example.invalid", "http://192.0.2.77:8080", "host")
         self.conn.rollback()
         with psycopg.connect(DB_URL, row_factory=dict_row) as conn, conn.transaction(), conn.cursor() as cur:
-            worker._register_runtime_route(conn, cur, self.fix["trip_id"], moved)
+            worker._register_runtime_route(conn, cur, self.fix["trip_id"], route)
+
+    def test_re_provisioning_a_wildcard_trip_rewrites_both_and_keeps_the_route_ref(self) -> None:
+        self._run(WILDCARD_ROUTE)
+        first = self._route_row()
+        self._register(TripRoute("tokyo-2026.example.invalid", "http://192.0.2.77:8080", "wildcard"))
         again = self._route_row()
         self.assertEqual(first["route_ref"], again["route_ref"])
         self.assertEqual("http://192.0.2.77:8080", again["upstream_url"])
         self.assertEqual("ready", again["state"])
+
+    def test_re_provisioning_a_host_trip_leaves_it_off_the_gateway(self) -> None:
+        self._run(HOST_ROUTE)
+        first = self._route_row()
+        self._register(TripRoute("tokyo-2026.example.invalid", "http://192.0.2.77:8080", "host"))
+        again = self._route_row()
+        self.assertEqual(first["route_ref"], again["route_ref"])
+        self.assertIsNone(again["upstream_url"])
+
+    def test_a_host_trip_moved_behind_the_gateway_stays_there_through_a_rebuild(self) -> None:
+        # scripts/trip-route.py --set gave the row its address; a rebuild must not silently take the trip back
+        # off the gateway (its public name would stop answering), and refreshes the address from the topology.
+        self._run(HOST_ROUTE)
+        self.conn.rollback()
+        self.conn.execute("UPDATE control_plane.runtime_routes SET upstream_url = 'http://192.0.2.210:8080' "
+                          "WHERE trip_id = %s", (self.fix["trip_id"],))
+        self.conn.commit()
+        self._register(TripRoute("tokyo-2026.example.invalid", "http://192.0.2.77:8080", "host"))
+        self.assertEqual("http://192.0.2.77:8080", self._route_row()["upstream_url"])
 
     def test_a_suspended_route_is_made_ready_again_by_a_re_provision(self) -> None:
         self._run(HOST_ROUTE)
@@ -282,7 +306,7 @@ class HostnameAlreadyHeldByAnotherTrip(unittest.TestCase):
         self._seed_other(state="suspended")
         lines = self._run(HOST_ROUTE)
         mine = self._row(self.fix["trip_id"])
-        self.assertEqual(("ready", HOST_ROUTE.public_host, HOST_ROUTE.upstream_url),
+        self.assertEqual(("ready", HOST_ROUTE.public_host, None),  # a host trip records no address (AC-R2.5)
                          (mine["state"], mine["public_host"], mine["upstream_url"]))
         theirs = self._row(self.other_trip)
         self.assertEqual(("suspended", None, None), (theirs["state"], theirs["public_host"], theirs["upstream_url"]))

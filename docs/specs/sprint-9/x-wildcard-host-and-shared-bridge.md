@@ -129,8 +129,8 @@ unset every path behaves as it does today.
     validates it, and `upstreamBasePath` is `""`. An `upstream_url` that fails the
     validation is 503 `RUNTIME_ROUTE_INVALID`, never a fall-back to the public URL;
   - with an empty or absent list, or a NULL `upstream_url` (every row written
-    before R2), the answer is what it was: from `private_url` and the suffix
-    check, with its base path;
+    before R2, and every host-routed trip's row, AC-R2.5), the answer is what it
+    was: from `private_url` and the suffix check, with its base path;
   - `private_url`, and every link a browser is sent, are unchanged.
   Tested end to end: the real API (`buildApp`, listening) and the real gateway (a
   child process with `TRIP_HOST_SUFFIX` set) with a recording fake trip site on
@@ -169,8 +169,15 @@ unset every path behaves as it does today.
   unchanged.
 - **AC-R2.5 Route recorded.** On provision success, in the transaction that
   marks the trip `ready_private`, the `runtime_routes` row gets `public_host =
-  <slug>.<domain>` and `upstream_url = http://<lan address>:<forward port>`, in
-  both modes. Re-provisioning rewrites both.
+  <slug>.<domain>` in both modes. `upstream_url = http://<lan address>:<forward
+  port>` means "this trip's public name is served through the gateway", so it is
+  written only for a `wildcard` trip (owner review of #599, D4, 2026-11-19): a
+  `host` trip, which its own proxy host still serves, gets NULL, and the by-trip
+  lookup (AC-R1.11) answers it from `private_url` exactly as before.
+  Re-provisioning rewrites `public_host`, and rewrites `upstream_url` for a
+  wildcard trip or for a host trip whose row already has one (moved behind the
+  gateway by `scripts/trip-route.py --set`): a rebuild never takes a trip off the
+  gateway, and refreshes its address from the same topology that command reads.
 - **AC-R2.6 URL derivation.** `private_url` is derived from the topology's own
   hostname in both modes and no longer requires an `npm:` section. Existing
   topologies give the same value as today.
