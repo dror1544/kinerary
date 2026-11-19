@@ -187,6 +187,31 @@ class Classify(unittest.TestCase):
         self.assertEqual(classify("git push && ~/kinerary-deploy/trips/japan-2026/deploy.sh"), "deploy")
         self.assertEqual(classify("git fetch && git merge origin/main && git push"), "merge")
 
+    def test_moving_a_trip_onto_the_gateway_or_rekeying_a_gateway_is_a_live_change(self):
+        for command in (
+            "scripts/trip-route.py --trip japan-2026 --set --execute",
+            "scripts/trip-route.py --trip japan-2026 --clear --execute --live",
+            "python3 scripts/trip-route.py --trip trip_abc --set --execute",
+            "sudo KINERARY_DEPLOY_ROOT=/srv/deploy python3 scripts/trip-route.py --trip x --set --execute",
+            "sudo env KINERARY_DEPLOY_ROOT=/srv/deploy python3 scripts/trip-route.py --trip x --set --execute",
+            "cd x && KINERARY_DEPLOY_ROOT=/srv/d scripts/trip-route.py --trip x --set --execute",
+            'ssh host "sudo python3 /opt/k/scripts/trip-route.py --trip x --set --execute"',
+            "scripts/relay-rekey.py --all-enrolled --execute",
+            "sudo python3 scripts/relay-rekey.py --profile a,b --execute",
+        ):
+            self.assertEqual(classify(command), "deploy", command)
+
+    def test_showing_or_planning_a_route_or_a_rekey_is_read_only(self):
+        for command in (
+            "scripts/trip-route.py --trip japan-2026",
+            "scripts/trip-route.py --trip japan-2026 --set",
+            "sudo KINERARY_DEPLOY_ROOT=/srv/deploy python3 scripts/trip-route.py --trip x --clear",
+            "scripts/relay-rekey.py --all-enrolled",
+            "python3 -m unittest tests/scripts/test_trip_route.py",
+            "grep -n -- --execute scripts/trip-route.py",
+        ):
+            self.assertEqual(classify(command), "none", command)
+
     def test_a_teardown_dry_run_is_read_only(self):
         self.assertEqual(classify("scripts/teardown-trip.py --trip japan-2026"), "none")
 

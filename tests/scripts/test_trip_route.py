@@ -151,7 +151,7 @@ class Set(unittest.TestCase):
 
     def test_execute_writes_exactly_the_two_columns_for_this_trip(self):
         db = FakeDb()
-        code, text = run(db, topology(), ["--set", "--execute"])
+        code, text = run(db, topology(), ["--set", "--execute", "--live"])
         self.assertEqual(0, code, text)
         self.assertEqual(1, len(db.writes))
         self.assertIn(f"WHERE trip_id = '{TRIP_ID}'", db.writes[0])
@@ -164,13 +164,13 @@ class Set(unittest.TestCase):
         raw["routing"] = "wildcard"
         raw["proxmox"]["lxc"]["public_hostname"] = "japan-2026.example.invalid"
         db = FakeDb()
-        code, _text = run(db, raw, ["--set", "--execute"])
+        code, _text = run(db, raw, ["--set", "--execute", "--live"])
         self.assertEqual(0, code)
         self.assertEqual("japan-2026.example.invalid", db.route["public_host"])
 
     def test_the_port_falls_back_to_the_proxy_hosts_for_an_old_topology(self):
         db = FakeDb()
-        code, _ = run(db, topology(proxmox__lxc__forward_port=None), ["--set", "--execute"])
+        code, _ = run(db, topology(proxmox__lxc__forward_port=None), ["--set", "--execute", "--live"])
         self.assertEqual(0, code)
         self.assertEqual("http://192.0.2.210:8080", db.route["upstream_url"])
 
@@ -199,7 +199,7 @@ class Set(unittest.TestCase):
         for what, raw in bad.items():
             with self.subTest(what):
                 db = FakeDb()
-                code, text = run(db, raw, ["--set", "--execute"])
+                code, text = run(db, raw, ["--set", "--execute", "--live"])
                 self.assertEqual(2, code, text)
                 self.assertEqual([], db.writes)
                 self.assertIn("refused", text)
@@ -207,7 +207,7 @@ class Set(unittest.TestCase):
     def test_a_port_that_is_missing_everywhere_is_refused(self):
         db = FakeDb()
         raw = topology(proxmox__lxc__forward_port=None, npm__forward_port=None)
-        code, _ = run(db, raw, ["--set", "--execute"])
+        code, _ = run(db, raw, ["--set", "--execute", "--live"])
         self.assertEqual(2, code)
         self.assertEqual([], db.writes)
 
@@ -216,7 +216,7 @@ class Set(unittest.TestCase):
                      "japan-2026.example\n", "jäpan.example"):
             with self.subTest(host=host):
                 db = FakeDb()
-                code, _ = run(db, topology(npm__hostname=host), ["--set", "--execute"])
+                code, _ = run(db, topology(npm__hostname=host), ["--set", "--execute", "--live"])
                 self.assertEqual(2, code)
                 self.assertEqual([], db.writes)
 
@@ -224,28 +224,28 @@ class Set(unittest.TestCase):
         for raw in (topology(name="italy-2026"), topology(proxmox__lxc__name="trip-italy-2026")):
             with self.subTest(name=raw["name"]):
                 db = FakeDb()
-                code, text = run(db, raw, ["--set", "--execute"])
+                code, text = run(db, raw, ["--set", "--execute", "--live"])
                 self.assertEqual(2, code)
                 self.assertIn("does not describe japan-2026", text)
                 self.assertEqual([], db.writes)
 
     def test_no_topology_is_refused(self):
         db = FakeDb()
-        code, text = run(db, None, ["--set", "--execute"])
+        code, text = run(db, None, ["--set", "--execute", "--live"])
         self.assertEqual(2, code)
         self.assertEqual([], db.writes)
         self.assertIn("no topology", text)
 
     def test_a_hostname_another_trip_already_has_is_refused(self):
         db = FakeDb(other_holder="italy-2026")
-        code, text = run(db, topology(), ["--set", "--execute"])
+        code, text = run(db, topology(), ["--set", "--execute", "--live"])
         self.assertEqual(2, code)
         self.assertIn("already the route of italy-2026", text)
         self.assertEqual([], db.writes)
 
     def test_a_database_without_the_columns_is_refused_not_failed_half_way(self):
         db = FakeDb(columns=False)
-        code, text = run(db, topology(), ["--set", "--execute"])
+        code, text = run(db, topology(), ["--set", "--execute", "--live"])
         self.assertEqual(2, code)
         self.assertIn("apply migration runtime_route_hosts", text)
         self.assertEqual([], db.writes)
@@ -254,13 +254,13 @@ class Set(unittest.TestCase):
         for db in (FakeDb(route=False), FakeDb(slug="retired-japan-2026-20260101")):
             with self.subTest(slug=db.trip["slug"], route=db.route):
                 code, _ = run(db, topology(name=db.trip["slug"], proxmox__lxc__name=f"trip-{db.trip['slug']}"),
-                              ["--set", "--execute"])
+                              ["--set", "--execute", "--live"])
                 self.assertEqual(2, code)
                 self.assertEqual([], db.writes)
 
     def test_a_route_that_is_not_ready_is_warned_about_and_left_in_its_state(self):
         db = FakeDb(route_state="suspended")
-        code, text = run(db, topology(), ["--set", "--execute"])
+        code, text = run(db, topology(), ["--set", "--execute", "--live"])
         self.assertEqual(0, code)
         self.assertIn("the gateway routes only 'ready'", text)
         self.assertEqual("suspended", db.route["state"])
@@ -280,16 +280,55 @@ class Clear(unittest.TestCase):
 
     def test_execute_takes_both_columns_away_and_nothing_else(self):
         db = FakeDb(public_host="japan-2026.example.invalid", upstream_url="http://192.0.2.210:8080")
-        code, _text = run(db, topology(), ["--clear", "--execute"])
+        code, _text = run(db, topology(), ["--clear", "--execute", "--live"])
         self.assertEqual(0, code)
         self.assertEqual((None, None, "ready"), (db.route["public_host"], db.route["upstream_url"], db.route["state"]))
         self.assertEqual(1, len(db.writes))
 
     def test_clear_needs_no_topology(self):
         db = FakeDb(public_host="japan-2026.example.invalid", upstream_url="http://192.0.2.210:8080")
-        code, _ = run(db, None, ["--clear", "--execute"])
+        code, _ = run(db, None, ["--clear", "--execute", "--live"])
         self.assertEqual(0, code)
         self.assertIsNone(db.route["public_host"])
+
+
+class InUse(unittest.TestCase):
+    """Moving a trip people use is a deploy: --execute on a trip at ready_private or later needs --live."""
+
+    def test_execute_on_a_trip_in_use_without_live_is_refused_before_any_write(self):
+        for args in (["--set", "--execute"], ["--clear", "--execute"]):
+            db = FakeDb(state="ready_private", public_host="japan-2026.example.invalid",
+                        upstream_url="http://192.0.2.210:8080")
+            code, text = run(db, topology(), args)
+            self.assertEqual(2, code, text)
+            self.assertIn("--live", text)
+            self.assertIn("hard rule 2", text)
+            self.assertEqual([], db.writes, args)
+
+    def test_a_later_state_or_one_this_script_does_not_know_needs_live_too(self):
+        for state in ("activation_approved", "active", "completed", "something_new"):
+            db = FakeDb(state=state)
+            code, _text = run(db, topology(), ["--set", "--execute"])
+            self.assertEqual(2, code, state)
+            self.assertEqual([], db.writes, state)
+
+    def test_a_test_trip_before_ready_private_needs_no_live(self):
+        db = FakeDb(state="provisioning")
+        code, text = run(db, topology(), ["--set", "--execute"])
+        self.assertEqual(0, code, text)
+        self.assertEqual(1, len(db.writes))
+
+    def test_the_plan_of_a_trip_in_use_says_live_will_be_needed_and_still_writes_nothing(self):
+        db = FakeDb(state="ready_private")
+        code, text = run(db, topology(), ["--set"])
+        self.assertEqual(0, code, text)
+        self.assertIn("--execute --live", text)
+        self.assertEqual([], db.writes)
+
+    def test_the_states_match_the_feature_switch_commands_list(self):
+        source = (SCRIPT.parents[1] / "control-plane" / "api" / "src" / "feature-switches.ts").read_text()
+        block = re.search(r"SAFE_WITHOUT_LIVE_TRIP_STATES: readonly string\[\] = \[(.*?)\];", source, re.S).group(1)
+        self.assertEqual(tuple(re.findall(r'"([a-z_]+)"', block)), trip_route.SAFE_WITHOUT_LIVE_TRIP_STATES)
 
 
 class Arguments(unittest.TestCase):
@@ -299,7 +338,7 @@ class Arguments(unittest.TestCase):
 
     def test_execute_alone_is_refused_rather_than_ignored(self):
         db = FakeDb()
-        code, _ = run(db, topology(), ["--execute"])
+        code, _ = run(db, topology(), ["--execute", "--live"])
         self.assertEqual(2, code)
         self.assertEqual([], db.writes)
 

@@ -22,7 +22,12 @@ non-ASCII digits, and these values end up in SQL and in a URL a gateway fetches)
 
 Nothing changes without --execute. Moving a trip that people use is a deploy
 (CLAUDE.md hard rule 2): the plan prints the trip's lifecycle state, and the
-approval is yours to have before --execute.
+approval is yours to have before --execute. A trip at `ready_private` or later,
+or in a state this script does not know, is treated as in use (the same
+allow-list as the feature-switch command, control-plane/api/src/feature-switches.ts):
+--execute on it also needs --live, which says "I have approval to change a trip
+in use". Every routed trip has finished provisioning, so in practice that is
+every trip; the flag is there so the in-use case is never reached by accident.
 
 This changes the route row and nothing else - not DNS, not the proxy host, not
 the tunnel. Whether the hostname reaches the gateway at all is the operator's
@@ -162,6 +167,19 @@ def topology_route(slug: str, deploy_root: Path | None = None) -> tuple[str, str
     return hostname, f"http://{ipv4.split('/')[0]}:{int(port)}"
 
 
+#: The lifecycle states strictly before `ready_private`: the only ones --execute may change without --live. An
+#: allow-list, so a state added tomorrow needs --live until it is decided here (feature-switches.ts keeps the same
+#: list; tests/scripts/test_trip_route.py pins the two together).
+SAFE_WITHOUT_LIVE_TRIP_STATES = (
+    "pending_signup_approval", "draft", "intake_in_progress", "intake_confirmed",
+    "planned", "provisioning_approved", "provisioning",
+)
+
+
+def trip_needs_live(state: object) -> bool:
+    return not (isinstance(state, str) and state in SAFE_WITHOUT_LIVE_TRIP_STATES)
+
+
 def host_holder(host: str, trip_id: str) -> str | None:
     """Another trip that already holds this public_host, if any (it is unique)."""
     if not HOSTNAME.fullmatch(host):
@@ -185,6 +203,8 @@ def main(argv: list[str] | None = None) -> int:
     what.add_argument("--set", action="store_true", help="record the hostname and address from the trip's topology.yaml")
     what.add_argument("--clear", action="store_true", help="remove the hostname and upstream from the route")
     ap.add_argument("--execute", action="store_true", help="actually change the route (default: print the plan)")
+    ap.add_argument("--live", action="store_true",
+                    help="the trip is in use (ready_private or later) and you have approval to change it")
     args = ap.parse_args(argv)
     if args.execute and not (args.set or args.clear):
         ap.error("--execute needs --set or --clear")
@@ -240,9 +260,16 @@ def main(argv: list[str] | None = None) -> int:
                    f"updated_at = now() WHERE trip_id = '{trip['id']}'")
             todo = "clear public_host and upstream_url (the gateway then answers the name as one that never existed)"
         say(f"{YELLOW}→{RESET}", todo)
+        live = trip_needs_live(trip["lifecycle_state"])
+        if live:
+            say(f"{YELLOW}!{RESET}", f"{trip['slug']} is {trip['lifecycle_state']}: a trip in use - this is a deploy, "
+                "and --execute needs --live")
         if not args.execute:
-            print(f"\n{DIM}dry run — re-run with --execute to do this{RESET}")
+            print(f"\n{DIM}dry run — re-run with --execute{' --live' if live else ''} to do this{RESET}")
             return 0
+        if live and not args.live:
+            raise Refused(f"{trip['slug']} is {trip['lifecycle_state']}, a trip in use: re-run with --live once "
+                          "you have approval to change it (CLAUDE.md hard rule 2)")
         psql(sql)
         after = resolve(trip["id"])["route"]
         ok = (after is not None and

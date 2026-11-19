@@ -85,6 +85,14 @@ DEPLOY = re.compile(
     # live as deploying one. Only --execute: its dry run is read-only, and a
     # prompt that fires on read-only commands teaches people to click through.
     r'|' + CMDPOS + r'(?:sudo\s+)?(?:python3?\s+)?\S*teardown-trip\.py\b[^\n;&|]*--execute\b'
+    # The same shape for the two route/key tools of #599: `trip-route.py
+    # --execute` moves a trip's public name onto or off the gateway, and
+    # `relay-rekey.py --execute` rewrites which key a companion's gateway holds.
+    # Both are run as `sudo KINERARY_DEPLOY_ROOT=<root> python3 scripts/…` on a
+    # server, so leading VAR=value words are allowed (sudo or env first). Their
+    # show and plan modes stay prompt-free.
+    r'|' + CMDPOS + r'(?:sudo\s+)?(?:env\s+)?(?:[A-Za-z_]\w*=\S*\s+)*(?:python3?\s+)?'
+    r'\S*(?:trip-route|relay-rekey)\.py\b[^\n;&|]*--execute\b'
     # The production control plane's release tool: every verb that moves the
     # running version, the database, the trip bridges, or deletes a way back.
     # Anywhere on the line, not only at a command position, because it is run
