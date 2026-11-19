@@ -1,13 +1,12 @@
 # Trip members sign in without a password
 
-Status: draft (2026-11-19) · Issue: none yet (`x-`); folds in #614 · Track: T5 · Size: L · Tier: High
+Status: approved (2026-11-19, by Dror) · Issue: none yet (`x-`); folds in #614 · Track: T5 · Size: L · Tier: High
 Security path: yes (Mini App sign-in links, runtime launch exchange, site invites, password recovery) · Migration: yes · Live-trip behaviour: yes, behind a per-trip switch, off by default
 
 > **Build timing.** Built on its own branch, merged to `main` **after 2026-12-06** (the VM is
 > frozen 2026-11-24 to 12-06). Nothing here may reach `main` before then.
 >
-> **Approval is blocked on Open question Q1.** Slice S1 depends on its answer. S2 and S3 do not,
-> and may be built while Q1 is open.
+> **Approved 2026-11-19 by Dror**, with the decisions recorded under "Decisions" at the end.
 
 ## Problem
 
@@ -237,7 +236,7 @@ it does not exist today.
 ## Security and boundary notes
 
 - **This changes who can open a trip.** With S1 on, anyone the organizer admits to the group can
-  open the trip as a member. That is Q1, and the reason the switch exists.
+  open the trip as a member. Dror accepted this (D1). It is the reason the switch exists.
 - **The CHAT'S TRIP only SELECTS** (`telegram-mini-app.ts` header). `start_param` still only
   names a trip. The grant comes from the live `getChatMember` answer for the trip's own open
   binding, which the person cannot choose.
@@ -247,8 +246,8 @@ it does not exist today.
 - **A refusal never confirms a guess** (AC-3, AC-14).
 - **The switch-registry rule.** It says "a switch never widens visibility or permission"
   (`shared/feature-switches.js` header). This switch gates a new way in, which is a permission
-  path. Either the registry text gains a recorded exception for sign-in paths, or the gate is a
-  per-trip setting outside the registry. See Q3. Do not silently ignore the rule.
+  path. The registry header gains a recorded exception for sign-in paths (D3), in the same PR as the
+  switch.
 - **`boundary-reviewer` before merge**, with live request/response evidence for AC-1, AC-3,
   AC-5 (double claim), AC-6 (leave the group, then relaunch) and AC-14.
 
@@ -286,9 +285,27 @@ Write the tests first, from the ACs.
 - Live trips feel nothing until the switch is on for them. S2 and S3 add routes and buttons,
   but no existing route changes.
 
-## Open questions
+## Decisions (Dror, 2026-11-19)
 
-Decisions for Dror before approval.
+- **D1, from Q1: yes.** Being in the trip's Telegram group, plus picking an unclaimed traveller,
+  is enough to open the trip as a member (S1). The personal invite (S2) must stay a full way in
+  for anyone who does not want to be on Telegram. It is not a fallback to be dropped later.
+- **D2, from Q2: someone in the group who is not on the traveller list is told to ask the
+  organizer, and nothing is created.**
+  - If the organizer then sends that person a personal invite, it works.
+  - This is today's site-invite path, which adds a new traveller.
+  - S2 must keep that path working beside the new "invite an existing traveller" path.
+- **D3, from Q3: a recorded exception.**
+  - Add a paragraph to the header of `shared/feature-switches.js`: a switch may gate a new
+    sign-in path, as long as it never changes an allow-list, a role or a visibility rule. Cite
+    this spec.
+  - `member_group_sign_in` is the first switch to use it.
+- **D4, from Q4: no organizer approval per claim.** The notice (AC-7) and Release are the
+  control.
+
+## Open questions (answered, kept for the record)
+
+Answered in Decisions D1–D4 above.
 
 - **Q1 (blocks S1).** May being in the trip's Telegram group be enough to open the trip as a
   member, once the person picks a name that nobody has claimed?
