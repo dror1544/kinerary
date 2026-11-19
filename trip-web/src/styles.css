@@ -753,6 +753,11 @@ textarea { min-height: 132px; resize: vertical; }
 .signed-in-user > div { display: grid; min-width: 0; gap: 2px; }
 .signed-in-user strong, .signed-in-user small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .signed-in-user small { color: var(--kit-muted); }
+/* Video layout: the card is a button to Account. Same look, plus a chevron at the end that points the way the page reads. */
+.signed-in-user-button { width: 100%; min-height: 56px; font: inherit; color: inherit; text-align: start; cursor: pointer; }
+.signed-in-user-button > div { flex: 1 1 auto; }
+.signed-in-user-chevron { display: inline-flex; flex: 0 0 auto; color: var(--kit-teal); }
+.signed-in-user-button:active { background: rgba(14,143,134,.14); }
 .menu-head button, .menu-section button, .menu-section a {
   min-height: 46px;
   border: 1px solid var(--kit-line);
@@ -1217,7 +1222,11 @@ textarea { min-height: 132px; resize: vertical; }
 .video-layout .topline { gap: 10px; min-height: 48px; }
 .video-layout .brand-lockup { flex: 1 1 auto; }
 .video-layout .brand-lockup .hero-logo { width: 38px; height: 38px; }
-.video-layout .hero-identity { padding: 3px; }
+.video-layout .hero-identity { padding: 3px; flex: 0 0 auto; }
+/* The header's avatar is the person. `.hero-identity span` (the classic name label, hidden under 620px) also matched the
+   initial a missing photo falls back to, which is a span: the ring showed empty. Say what the avatar is, at 32px. */
+.video-layout .hero-identity .person-avatar { display: block; width: 32px; height: 32px; max-width: none; overflow: visible; }
+.video-layout .hero-identity .person-avatar.avatar-initial { display: grid; font-size: 15px; }
 /* The header's More button is the menu icon alone (its aria-label names it); 44px is the least a thumb should be asked to hit. */
 .video-layout .more-button { order: 0; display: inline-flex; align-items: center; justify-content: center; min-width: 44px; min-height: 44px; padding: 0 10px; }
 .video-layout .desktop-tabs a.active { color: var(--go-chip-bg); }

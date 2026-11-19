@@ -3060,21 +3060,34 @@ export function AppMenu({
           <img src={brandLogo} alt="Kinerary" />
           <button type="button" onClick={() => setOpen(false)} aria-label={copy(lang,"Close menu","סגירת תפריט")}><X size={20} /></button>
         </div>
-        {currentUser ? (
-          <section className="signed-in-user" aria-label={copy(lang, "Signed-in user", "המשתמש המחובר")}>
-            <PersonAvatar
-              username={currentUser.username}
-              name={personName(currentUser, lang)}
-              color={currentUser.color}
-              avatarFile={currentUser.avatar_file}
-              googlePicture={currentUser.google_picture}
-            />
-            <div>
-              <strong>{personName(currentUser, lang)}</strong>
-              <small>{currentUser.is_organizer ? copy(lang, "Trip organizer", "מארגן הטיול") : `@${currentUser.username}`}</small>
-            </div>
-          </section>
-        ) : null}
+        {currentUser ? (() => {
+          const name = personName(currentUser, lang);
+          const card = (
+            <>
+              <PersonAvatar
+                username={currentUser.username}
+                name={name}
+                color={currentUser.color}
+                avatarFile={currentUser.avatar_file}
+                googlePicture={currentUser.google_picture}
+              />
+              <div>
+                <strong>{name}</strong>
+                <small>{currentUser.is_organizer ? copy(lang, "Trip organizer", "מארגן הטיול") : `@${currentUser.username}`}</small>
+              </div>
+            </>
+          );
+          // Video layout: the card is the way to the account (#612 follow-up: the owner tapped it and nothing happened).
+          return videoLayout ? (
+            <button type="button" className="signed-in-user signed-in-user-button" onClick={() => openModule("account")}
+              aria-label={`${copy(lang, "Open your account", "פתיחת החשבון")} — ${name}`}>
+              {card}
+              <span className="signed-in-user-chevron" aria-hidden="true">{lang === "he" ? <ChevronLeft size={20} /> : <ChevronRight size={20} />}</span>
+            </button>
+          ) : (
+            <section className="signed-in-user" aria-label={copy(lang, "Signed-in user", "המשתמש המחובר")}>{card}</section>
+          );
+        })() : null}
         <div className="menu-section">
           <small>{lang === "he" ? "ניווט" : "Navigation"}</small>
           {videoLayout && openVideoTab
