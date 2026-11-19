@@ -153,6 +153,41 @@ describe("the identity button opens Account", () => {
   });
 });
 
+describe("the menu's signed-in card opens Account (video layout)", () => {
+  it("is a button that closes the menu and opens Account", async () => {
+    serve(VIDEO);
+    renderTrip();
+    const menu = await openMenu();
+    const card = within(menu).getByRole("button", { name: /Open your account.*Avi/ });
+    expect(card.querySelector(".signed-in-user-chevron")).not.toBeNull();
+    fireEvent.click(card);
+    expect(await screen.findByRole("heading", { level: 1, name: "Colmar · Account" })).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Trip menu" })).toBeNull();
+    expect(window.location.hash).toBe("#account");
+  });
+
+  it("Hebrew: פתיחת החשבון", async () => {
+    localStorage.setItem("tripLang", "he");
+    serve(VIDEO);
+    renderTrip();
+    const menu = await openMenu();
+    fireEvent.click(within(menu).getByRole("button", { name: /פתיחת החשבון/ }));
+    expect(await screen.findByRole("heading", { level: 1, name: /Colmar|קולמר/ })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /החשבון/ })).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Trip menu" })).toBeNull();
+  });
+
+  it("classic layout: the card stays a plain section, not a button", async () => {
+    serve(undefined);
+    renderTrip();
+    fireEvent.click(await screen.findByRole("button", { name: "Open menu" }));
+    const menu = await screen.findByRole("dialog", { name: "Trip menu" });
+    expect(within(menu).queryByRole("button", { name: /Open your account/ })).toBeNull();
+    expect(menu.querySelector("section.signed-in-user")).not.toBeNull();
+    expect(menu.querySelector("button.signed-in-user")).toBeNull();
+  });
+});
+
 describe("classic layout unchanged", () => {
   it("More still holds the travellers, the organizer tools and the assistant block; the menu has no Organizer settings", async () => {
     serve(undefined);
