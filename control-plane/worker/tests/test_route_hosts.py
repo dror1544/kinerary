@@ -143,6 +143,14 @@ class RouteRecordedOnSuccess(unittest.TestCase):
         self.assertEqual(first["route_ref"], again["route_ref"])
         self.assertIsNone(again["upstream_url"])
 
+    def test_a_wildcard_rebuild_writes_the_address_into_a_row_that_had_none(self) -> None:
+        # A row written as a host trip (or before the columns existed) whose topology is now wildcard: the rebuild
+        # is what puts the trip behind the gateway, so the address must land even though the row had none.
+        self._run(HOST_ROUTE)
+        self.assertIsNone(self._route_row()["upstream_url"])
+        self._register(TripRoute("tokyo-2026.example.invalid", "http://192.0.2.77:8080", "wildcard"))
+        self.assertEqual("http://192.0.2.77:8080", self._route_row()["upstream_url"])
+
     def test_a_host_trip_moved_behind_the_gateway_stays_there_through_a_rebuild(self) -> None:
         # scripts/trip-route.py --set gave the row its address; a rebuild must not silently take the trip back
         # off the gateway (its public name would stop answering), and refreshes the address from the topology.
