@@ -128,6 +128,14 @@ def _read_file_ref(ref: object) -> str | None:
         return None
 
 
+def _read_shared_ref(ref: object) -> str | None:
+    """A shared secret by its reference: file:// or env://, else None. Trimmed in both cases; the relay trims
+    only file://, so a padded env value can only cause a refusal here, never a missed match."""
+    if isinstance(ref, str) and ref.startswith("env://"):
+        return os.environ.get(ref[len("env://"):], "").strip() or None
+    return _read_file_ref(ref)
+
+
 def read_master(relay: dict) -> tuple[str, list[str]]:
     """(the derivation master, the readable shared secrets). Refuses a master that is a shared secret."""
     refs = relay.get("gateway_key_master_refs")
@@ -139,10 +147,28 @@ def read_master(relay: dict) -> tuple[str, list[str]]:
     master = _read_file_ref(ref)
     if not master:
         raise Refusal("relay.gateway_key_master_refs[0] cannot be read, or is empty")
+    # Every shared secret must be read before a key is written: one that cannot be read here (a vault://
+    # reference, an unreadable file, an unset variable) cannot be proved different from the master, and a
+    # master equal to it would write keys no running relay accepts.
     shared_refs = relay.get("gateway_secret_refs")
-    shared = [v for v in (_read_file_ref(r) for r in (shared_refs if isinstance(shared_refs, list) else [])) if v]
-    # Every readable master in the rotation list is held to it, not only the first.
-    masters = [master] + [v for v in (_read_file_ref(r) for r in refs[1:]) if v]
+    shared: list[str] = []
+    for shared_ref in shared_refs if isinstance(shared_refs, list) else []:
+        value = _read_shared_ref(shared_ref)
+        if not value:
+            raise Refusal(
+                "a relay.gateway_secret_refs entry cannot be read here (only file:// and env:// can), "
+                "so the derivation master cannot be proved different from it"
+            )
+        shared.append(value)
+    # Every master in the rotation list is held to it, not only the first, and each must be readable here:
+    # one that cannot be read cannot be proved different from the shared secrets.
+    masters = [master]
+    for later in refs[1:]:
+        value = _read_file_ref(later)
+        if not value:
+            raise Refusal("a later relay.gateway_key_master_refs entry cannot be read here (only file:// can), "
+                          "so it cannot be proved different from the shared secrets")
+        masters.append(value)
     if any(hmac.compare_digest(m.encode(), s.encode()) for m in masters for s in shared):
         raise Refusal(
             "a relay.gateway_key_master_refs secret equals a relay.gateway_secret_refs secret; "

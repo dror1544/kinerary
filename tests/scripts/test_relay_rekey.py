@@ -311,6 +311,44 @@ class RelayRekey(unittest.TestCase):
                         self.assertIn("gateway_secret_refs", result.stderr)
                         self.assertNotIn(master_text, result.stdout + result.stderr)
 
+    def test_a_shared_secret_it_cannot_read_is_refused_and_an_env_one_is_compared(self) -> None:
+        """Every shared secret is read before a key is written: one that cannot be read cannot be proved
+        different from the master (PR #599 boundary re-check)."""
+        env = self.profile("trip-one", SHARED_ID, SHARED)
+        snap = {env: env.read_text()}
+        for label, refs in (
+            ("vault", ["vault://secret/data/kinerary/relay#gateway"]),
+            ("missing file", [f"file://{self.root / 'absent.secret'}"]),
+            ("unset variable", ["env://RELAY_SHARED_UNSET"]),
+            ("readable then unreadable", [f"file://{self.shared_file}", "vault://secret/data/x#y"]),
+        ):
+            with self.subTest(label=label):
+                self.write_arch("both", refs)
+                result = self.run_script("--profile", "trip-one", "--execute")
+                self.assert_refused_and_unchanged(result, env, snapshot=snap)
+                self.assertIn("gateway_secret_refs", result.stderr)
+        # An env:// shared secret is read from the environment and compared, as the relay reads it.
+        self.write_arch("both", ["env://RELAY_SHARED_FOR_TEST"])
+        base = {"HOME": str(self.home), "PATH": "/usr/bin:/bin", "KINERARY_ARCHITECTURE_PROFILE": str(self.arch)}
+        equal = subprocess.run([sys.executable, str(SCRIPT), "--profile", "trip-one", "--execute"], capture_output=True,
+                               text=True, timeout=60, env={**base, "RELAY_SHARED_FOR_TEST": f"  {MASTER}\n"})
+        self.assert_refused_and_unchanged(equal, env, snapshot=snap)
+        self.assertNotIn(MASTER, equal.stdout + equal.stderr)
+        distinct = subprocess.run([sys.executable, str(SCRIPT), "--profile", "trip-one", "--execute"], capture_output=True,
+                                  text=True, timeout=60, env={**base, "RELAY_SHARED_FOR_TEST": SHARED})
+        self.assertEqual(distinct.returncode, 0, distinct.stderr)
+        self.assertEqual(self.values(env)["GATEWAY_RELAY_SECRET"], derive(MASTER, SHARED_ID))
+
+    def test_a_later_master_it_cannot_read_is_refused(self) -> None:
+        env = self.profile("trip-one", SHARED_ID, SHARED)
+        snap = {env: env.read_text()}
+        for later in ("vault://secret/data/x#y", f"file://{self.root / 'absent-master.secret'}"):
+            with self.subTest(later=later):
+                self.write_arch("both", master_refs=[f"file://{self.master_file}", later])
+                result = self.run_script("--profile", "trip-one", "--execute")
+                self.assert_refused_and_unchanged(result, env, snapshot=snap)
+                self.assertIn("gateway_key_master_refs", result.stderr)
+
     def test_it_uses_the_derivation_master_not_the_shared_secret(self) -> None:
         env = self.profile("trip-one", SHARED_ID, SHARED)
         self.run_script("--profile", "trip-one", "--execute")
