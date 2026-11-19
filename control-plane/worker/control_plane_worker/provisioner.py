@@ -187,6 +187,25 @@ def topology_route(raw: Any) -> TripRoute | None:
     )
 
 
+#: The two database objects that can refuse a route's hostname (migration runtime_route_hosts).
+_PUBLIC_HOST_KEY = "runtime_routes_public_host_key"
+_PUBLIC_HOST_DNS = "runtime_routes_public_host_dns"
+
+
+def _violated_constraint(error: psycopg.Error) -> str | None:
+    """The name of the constraint a refused statement violated, as the server reported it."""
+    return getattr(getattr(error, "diag", None), "constraint_name", None)
+
+
+class RouteHostError(RuntimeError):
+    """A wildcard-routed trip's hostname could not be recorded. `safe_error_code` is what the job keeps; the
+    message (never the database's own text) is what the log keeps."""
+
+    def __init__(self, safe_error_code: str, message: str) -> None:
+        super().__init__(message)
+        self.safe_error_code = safe_error_code
+
+
 # ── Reachability ─────────────────────────────────────────────────────────────
 
 #: Why a provisioned trip cannot be reached from Telegram. A closed set on
@@ -1998,7 +2017,8 @@ class ProvisionerWorker:
         if route is None:
             cur.execute(legacy, (trip_id, _generate_route_id()))
             return
-        try:
+
+        def write_hosts() -> None:
             with conn.transaction():  # a savepoint: a refused statement leaves the outer transaction usable
                 cur.execute(
                     """
@@ -2011,6 +2031,18 @@ class ProvisionerWorker:
                     """,
                     (trip_id, _generate_route_id(), route.public_host, route.upstream_url),
                 )
+
+        try:
+            try:
+                write_hosts()
+            except psycopg.errors.UniqueViolation as exc:
+                if _violated_constraint(exc) != _PUBLIC_HOST_KEY:
+                    raise
+                # Another trip's row holds this hostname. One that is no longer in use (suspended, pending, or a
+                # retired trip's) gives it up, and the write is made once more; one that is in use does not.
+                if not self._release_stale_public_host(conn, cur, trip_id, route.public_host):
+                    raise
+                write_hosts()
         except psycopg.errors.UndefinedColumn:
             if route.routing == "wildcard":
                 raise
@@ -2021,6 +2053,80 @@ class ProvisionerWorker:
                        "before moving this trip behind the gateway",
             ))
             cur.execute(legacy, (trip_id, _generate_route_id()))
+        except psycopg.errors.UniqueViolation as exc:
+            if _violated_constraint(exc) != _PUBLIC_HOST_KEY:
+                raise
+            self._host_not_recordable(cur, trip_id, route, "public_host_in_use", legacy)
+        except psycopg.errors.CheckViolation as exc:
+            if _violated_constraint(exc) != _PUBLIC_HOST_DNS:
+                raise
+            self._host_not_recordable(cur, trip_id, route, "public_host_invalid", legacy)
+
+    def _release_stale_public_host(
+        self, conn: psycopg.Connection, cur: psycopg.Cursor, trip_id: str, public_host: str,
+    ) -> bool:
+        """Clears `public_host` and `upstream_url` on every OTHER trip's row that holds this hostname and is not
+        in use: its route is not `ready` (suspended or pending: the gateway does not answer it), or its trip was
+        retired (teardown renames the slug `retired-...`, which is the only way a trip is marked torn down; its
+        lifecycle_state keeps whatever it had). A `ready` route of a trip that is not retired is in use, and
+        anything this cannot tell is treated as in use. Returns whether any row was released.
+
+        Inside the caller's transaction, so the clear stands or falls with the write that follows it. The log line
+        carries both trip ids and never the hostname or an address."""
+        with conn.transaction():
+            cur.execute(
+                """
+                UPDATE control_plane.runtime_routes r
+                SET    public_host = NULL, upstream_url = NULL, updated_at = now()
+                FROM   control_plane.trips t
+                WHERE  t.id = r.trip_id AND r.trip_id <> %s AND r.public_host = %s
+                  AND  (r.state <> 'ready' OR t.slug LIKE 'retired-%%')
+                RETURNING r.trip_id, r.state, (t.slug LIKE 'retired-%%') AS retired
+                """,
+                (trip_id, public_host),
+            )
+            released = cur.fetchall()
+        for row in released:
+            other, state, retired = (row["trip_id"], row["state"], row["retired"]) if isinstance(row, Mapping) else row
+            logger.warning(log_fields(
+                "provisioner.route_host_released", trip_id=trip_id, released_from_trip_id=other,
+                reason="trip_retired" if retired else f"route_{state}",
+                effect="the other trip's route row no longer names this hostname",
+            ))
+        return bool(released)
+
+    def _host_not_recordable(
+        self, cur: psycopg.Cursor, trip_id: str, route: TripRoute, reason: str, legacy: str,
+    ) -> None:
+        """The hostname cannot be recorded for this trip: in use by another trip's live route, or not a name
+        the column accepts. A host-routed trip does not need it recorded to work, so its job is not failed: the
+        row is written without the host columns and the line says why. A wildcard trip has no other way in, so
+        its job fails, naming the other trip when there is one. The refused statement was rolled back by its
+        savepoint, so the outer transaction (the ready_private mark, the job's own success) is still usable."""
+        other: str | None = None
+        if reason == "public_host_in_use":
+            cur.execute(
+                "SELECT trip_id FROM control_plane.runtime_routes WHERE public_host = %s AND trip_id <> %s",
+                (route.public_host, trip_id),
+            )
+            found = cur.fetchone()
+            if found is not None:
+                other = found["trip_id"] if isinstance(found, Mapping) else found[0]
+        if route.routing == "wildcard":
+            code = "ROUTE_PUBLIC_HOST_IN_USE" if reason == "public_host_in_use" else "ROUTE_PUBLIC_HOST_INVALID"
+            message = log_fields(
+                "provisioner.route_host_refused", trip_id=trip_id, reason=reason, conflicting_trip_id=other,
+                effect="a wildcard-routed trip has no other route, so the job fails instead of finishing unrouted",
+            )
+            logger.warning(message)
+            # `from None`: the database's DETAIL quotes the other row, upstream address included.
+            raise RouteHostError(code, message) from None
+        logger.warning(log_fields(
+            "provisioner.route_hosts_not_recorded", trip_id=trip_id, reason=reason, conflicting_trip_id=other,
+            effect="the route row is written as before, without its host and upstream; the trip works as a "
+                   "host-routed one, and the gateway cannot route its hostname until this is resolved",
+        ))
+        cur.execute(legacy, (trip_id, _generate_route_id()))
 
     def _record_trip_key(
         self, conn: psycopg.Connection, cur: psycopg.Cursor, trip_id: str, trip_key: str | None,

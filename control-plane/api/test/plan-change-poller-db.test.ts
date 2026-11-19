@@ -136,6 +136,55 @@ describe("the group line's trigger (G2)", { skip }, () => {
     assert.ok(!text.includes(KEY) && !text.includes(gone) && !text.includes(gateway.origin), "no key and no address in a log line");
   });
 
+  test("AC-K2.14: when every poll of a tick fails the way a missing gateway fails, one aggregate line says so, once per ten minutes, with no address or key", async () => {
+    const away = await startFakeGateway(KEY);
+    const gone = away.origin;
+    await away.close();
+    const suspect = { lastLoggedAt: null as number | null };
+    const lines = () => logs.map((line) => JSON.parse(line)).filter((entry) => entry.event === "plan_change_poll.gateway_suspect");
+    const tickGone = () => pollPlanChangesOnce(deps({ runtimeOrigin: gone, gatewaySuspect: suspect }));
+
+    assert.deepEqual(await tickGone(), { polled: 1, enqueued: 0, failed: 1 });
+    assert.equal(lines().length, 1, "the tick's one failure is also said once as a whole");
+    assert.equal(lines()[0].level, "warn");
+    assert.equal(lines()[0].safe_error_codes, "SITE_UNREACHABLE=1");
+    assert.match(lines()[0].consequence, /the group line cannot reach any trip until the runtime gateway answers/);
+    assert.equal(failedLines().length, 1, "the per-trip line is still written");
+
+    clock = new Date(clock.getTime() + 9 * min);
+    await tickGone();
+    assert.equal(lines().length, 1, "nine minutes later: no second line");
+    clock = new Date(clock.getTime() + 2 * min);
+    await tickGone();
+    assert.equal(lines().length, 2, "eleven minutes after the first: the next one");
+
+    const text = logs.join("\n");
+    assert.ok(!text.includes(KEY) && !text.includes(gone) && !text.includes(gateway.origin), "no key and no address in any line");
+  });
+
+  test("AC-K2.14: the aggregate names the road, not the trip: a site's own failure, or one trip that polled fine, is not it", async () => {
+    const suspect = { lastLoggedAt: null as number | null };
+    const lines = () => logs.map((line) => JSON.parse(line)).filter((entry) => entry.event === "plan_change_poll.gateway_suspect");
+    // the gateway refuses the key: SITE_HTTP_401 is not a code that points at the road
+    await pollPlanChangesOnce(deps({ exchangeKey: "not-the-key", gatewaySuspect: suspect }));
+    assert.equal(lines().length, 0);
+    // a good tick
+    await pollPlanChangesOnce(deps({ gatewaySuspect: suspect }));
+    assert.equal(lines().length, 0);
+    // a site's own 500 comes back through the gateway unchanged
+    site.broken = { status: 500, body: "{}" };
+    await pollPlanChangesOnce(deps({ gatewaySuspect: suspect }));
+    assert.equal(lines().length, 0);
+    // a gateway that has no such route, or cannot reach the site, is what the aggregate is for
+    for (const status of [404, 502, 503]) {
+      suspect.lastLoggedAt = null;
+      site.broken = { status, body: "{}" };
+      await pollPlanChangesOnce(deps({ gatewaySuspect: suspect }));
+      assert.equal(lines().at(-1)?.safe_error_codes, `SITE_HTTP_${status}=1`);
+    }
+    assert.equal(lines().length, 3);
+  });
+
   test("AC-9: with the switch off nothing is asked of the site and nothing is enqueued", async () => {
     const off = await setFeatureSwitch(pool, { switch: "plan_change_group_line", enabled: false, scope: "trip", trip: tripId, live: true, by: "test" });
     assert.equal(off.ok, true);

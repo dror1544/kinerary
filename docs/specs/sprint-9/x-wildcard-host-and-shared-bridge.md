@@ -191,6 +191,31 @@ unset every path behaves as it does today.
   `upstream_url` from its `topology.yaml`; `--clear` removes them. It prints
   the plan and changes nothing without `--execute`. This is how one test trip
   is moved behind the gateway before any live trip is.
+- **AC-R2.10 A refused hostname does not fail a finished provision for a host-routed
+  trip.** Writing `public_host` can be refused by the unique index
+  (`runtime_routes_public_host_key`) or the DNS-name CHECK
+  (`runtime_routes_public_host_dns`); any other refusal still fails the job. The
+  write runs in a savepoint, so the ready mark and the job's own success commit
+  whatever the outcome:
+  - **Unique, another trip's row not in use** (its route is not `ready`, or its trip
+    is retired: slug `retired-...`, which is how teardown marks it): that row's
+    `public_host` and `upstream_url` are cleared in the same transaction, one
+    `provisioner.route_host_released` line carries both trip ids (never the
+    hostname or an address), and the write is made again. A failure later in the
+    transaction takes the clear back with it.
+  - **Unique, another trip's `ready` route of a live trip** (anything not known to
+    be unused counts as in use): that row is untouched. A host-routed trip is
+    written without the host columns and `provisioner.route_hosts_not_recorded
+    reason=public_host_in_use` names the other trip id; a wildcard trip fails the
+    job with `safe_error_code` `ROUTE_PUBLIC_HOST_IN_USE` and a log line
+    (`provisioner.route_host_refused`) naming the conflicting trip id, since it has
+    no other route.
+  - **CHECK violation**: a host-routed trip is written without the host columns,
+    `reason=public_host_invalid`; a wildcard trip fails with
+    `ROUTE_PUBLIC_HOST_INVALID`.
+  No exception message carries the database's own text (it quotes the other row).
+  Tested by `control-plane/worker/tests/test_route_hosts.py`
+  (`HostnameAlreadyHeldByAnotherTrip`, `OtherRefusalsAreNotSwallowed`).
 
 ### B1: shared mode in `mcp/mcp.js`
 
@@ -409,7 +434,7 @@ Tests are written first.
 - `control-plane/runtime-gateway/test/gateway.test.js`: AC-R1.4 to R1.10, with
   a fake control plane and a fake upstream that records what it received.
 - `control-plane/api/test/`: AC-R1.2, R1.3, and the migration list.
-- `tests/provisioning/`, `control-plane/worker/tests/`: AC-R2.1 to R2.7.
+- `tests/provisioning/`, `control-plane/worker/tests/`: AC-R2.1 to R2.7, R2.10.
 - `tests/scripts/test_teardown_trip.py` and a new test for `trip-route.py`:
   AC-R2.8, R2.9.
 - `tests/mcp-shared-bridge.test.js` (new): AC-B1.1 to B1.9, with two fake trip

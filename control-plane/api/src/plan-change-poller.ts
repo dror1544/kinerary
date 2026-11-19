@@ -129,7 +129,21 @@ export interface PlanChangePollerDeps {
   log?: (line: string) => void;
   /** Overrides the switch read (tests). Absent: feature-switches.ts, which fails to off. */
   switchOn?: (tripId: string) => Promise<boolean>;
+  /**
+   * Where the last `plan_change_poll.gateway_suspect` line was written, so a gateway that is down for an hour is
+   * one line in ten minutes and not sixty. One per poller (`startPlanChangePoller` makes it); a caller that passes
+   * none gets the line on every tick that earns it.
+   */
+  gatewaySuspect?: { lastLoggedAt: number | null };
 }
+
+/** Every poll of a tick failing with one of these says "the gateway", not "this trip": see the aggregate line below. */
+export const GATEWAY_SUSPECT_CODES: readonly string[] = ["SITE_UNREACHABLE", "SITE_HTTP_404", "SITE_HTTP_502", "SITE_HTTP_503"];
+/** At most one `gateway_suspect` line in this long. */
+export const GATEWAY_SUSPECT_EVERY_MS = 10 * 60_000;
+/** The start-up probe of `GET <runtimeOrigin>/health`. */
+const GATEWAY_PROBE_TIMEOUT_MS = 3_000;
+const GATEWAY_CONSEQUENCE = "the group line cannot reach any trip until the runtime gateway answers";
 
 export interface PollSummary {
   /** Trips whose switch was on and that have an open group. */
@@ -182,10 +196,11 @@ async function readSite(
 }
 
 /** One trip, one tick. Everything here is a read, a cursor write, or one transactional enqueue. */
-async function pollTrip(deps: PlanChangePollerDeps, tripId: string, now: Date, log: (line: string) => void): Promise<"enqueued" | "ok" | "failed"> {
+async function pollTrip(deps: PlanChangePollerDeps, tripId: string, now: Date, log: (line: string) => void, codes: string[]): Promise<"enqueued" | "ok" | "failed"> {
   const { db } = deps;
   const fail = (code: string) => {
     log(structuredLog("warn", "plan_change_poll.failed", { trip_id: tripId, safe_error_code: code }));
+    codes.push(code);
     return "failed" as const;
   };
 
@@ -310,6 +325,7 @@ async function pollTrip(deps: PlanChangePollerDeps, tripId: string, now: Date, l
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
     log(structuredLog("error", "plan_change_poll.enqueue_failed", { trip_id: tripId, safe_error_code: error instanceof Error ? error.name : "UNKNOWN" }));
+    codes.push("ENQUEUE_FAILED");
     return "failed";
   } finally {
     client.release();
@@ -372,26 +388,109 @@ export async function pollPlanChangesOnce(deps: PlanChangePollerDeps): Promise<P
     log(structuredLog("error", "plan_change_poll.tick_failed", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN" }));
     return summary;
   }
+  const codes: string[] = [];
   for (const tripId of eligible) {
     summary.polled++;
     try {
-      const outcome = await pollTrip(deps, tripId, now, log);
+      const outcome = await pollTrip(deps, tripId, now, log, codes);
       if (outcome === "enqueued") summary.enqueued++;
       if (outcome === "failed") summary.failed++;
     } catch (error) {
       summary.failed++;
-      log(structuredLog("warn", "plan_change_poll.failed", { trip_id: tripId, safe_error_code: error instanceof Error ? error.name : "UNKNOWN" }));
+      const code = error instanceof Error ? error.name : "UNKNOWN";
+      codes.push(code);
+      log(structuredLog("warn", "plan_change_poll.failed", { trip_id: tripId, safe_error_code: code }));
     }
   }
+  reportGatewaySuspect(deps, now, summary, codes, log);
   return summary;
+}
+
+/**
+ * N trips failing one by one reads as N trips in trouble. When EVERY poll of a tick failed, and each one with a
+ * code that points at the road (the gateway not answering, or answering 404/502/503 for a route it does not have
+ * or cannot reach), it is one thing, and this says so once: a count and the codes, never an address or a key.
+ * It is a suspicion on purpose: one trip whose own site is down looks the same from here when it is the only trip.
+ */
+function reportGatewaySuspect(deps: PlanChangePollerDeps, now: Date, summary: PollSummary, codes: readonly string[], log: (line: string) => void): void {
+  if (summary.polled === 0 || codes.length !== summary.polled || !codes.every((code) => GATEWAY_SUSPECT_CODES.includes(code))) return;
+  const state = deps.gatewaySuspect;
+  if (state && state.lastLoggedAt !== null && now.getTime() - state.lastLoggedAt < GATEWAY_SUSPECT_EVERY_MS) return;
+  if (state) state.lastLoggedAt = now.getTime();
+  const counts = new Map<string, number>();
+  for (const code of codes) counts.set(code, (counts.get(code) ?? 0) + 1);
+  log(structuredLog("warn", "plan_change_poll.gateway_suspect", {
+    failed: summary.failed,
+    safe_error_codes: [...counts].map(([code, count]) => `${code}=${count}`).join(","),
+    consequence: GATEWAY_CONSEQUENCE,
+  }));
+}
+
+async function probeGateway(deps: Pick<PlanChangePollerDeps, "runtimeOrigin" | "fetchImpl">): Promise<string | null> {
+  try {
+    const response = await (deps.fetchImpl ?? fetch)(`${deps.runtimeOrigin.replace(/\/$/, "")}/health`, {
+      method: "GET",
+      redirect: "manual",
+      signal: AbortSignal.timeout(GATEWAY_PROBE_TIMEOUT_MS),
+    });
+    await response.body?.cancel().catch(() => {});
+    return response.ok ? null : `GATEWAY_HTTP_${response.status}`;
+  } catch (error) {
+    return error instanceof Error && error.name === "TimeoutError" ? "GATEWAY_TIMEOUT" : "GATEWAY_UNREACHABLE";
+  }
+}
+
+export interface GatewayProbeOptions {
+  /** How many times to ask before saying so. On the VM the API starts before the gateway, so one try warns on every boot. */
+  attempts?: number;
+  /** The wait between tries. */
+  retryMs?: number;
+  /** Stops the retries (the poller was stopped). */
+  stopped?: () => boolean;
+}
+
+/** At start: about a minute of tries, which covers a normal cold start where the gateway comes up after the API. */
+export const GATEWAY_START_PROBE: Required<Omit<GatewayProbeOptions, "stopped">> = { attempts: 7, retryMs: 10_000 };
+
+/**
+ * Asks the runtime gateway's `GET /health` (no key: the route needs none, and the control-plane key is sent only to
+ * the routes that do), up to `attempts` times, and says so ONCE, only when the last try also fails. The reason is a
+ * code from a closed set, never the driver's message (Node's fetch errors quote the address). It never throws.
+ */
+export async function checkGatewayReachable(
+  deps: Pick<PlanChangePollerDeps, "runtimeOrigin" | "fetchImpl" | "log">,
+  options: GatewayProbeOptions = {},
+): Promise<boolean> {
+  const log = deps.log ?? (() => {});
+  const attempts = Math.max(1, options.attempts ?? 1);
+  let reason: string | null = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    if (options.stopped?.()) return false;
+    reason = await probeGateway(deps);
+    if (reason === null) return true;
+    if (attempt < attempts) await new Promise((resolve) => setTimeout(resolve, options.retryMs ?? 0).unref?.());
+  }
+  if (options.stopped?.()) return false;
+  log(structuredLog("warn", "plan_change_poll.gateway_unreachable", { safe_error_code: reason, consequence: GATEWAY_CONSEQUENCE }));
+  return false;
 }
 
 /**
  * Starts the loop beside the outbox dispatcher: every minute, one tick at a time (a slow site cannot stack ticks),
  * `unref`'d so it never keeps the process alive. Returns the function that stops it.
  */
-export function startPlanChangePoller(deps: PlanChangePollerDeps, intervalMs = POLL_INTERVAL_MS): () => void {
+export function startPlanChangePoller(
+  deps: PlanChangePollerDeps,
+  intervalMs = POLL_INTERVAL_MS,
+  startupProbe: Omit<GatewayProbeOptions, "stopped"> = GATEWAY_START_PROBE,
+): () => void {
   let running = false;
+  let stopped = false;
+  // A readiness probe at start, in the background: a gateway that is still not there after about a minute is said
+  // once, here, and not left to surface as one failure per trip per minute. Retried because on the VM the API starts
+  // before the gateway. It does not delay the loop and never rejects.
+  void checkGatewayReachable(deps, { ...startupProbe, stopped: () => stopped }).catch(() => {});
+  deps = { ...deps, gatewaySuspect: deps.gatewaySuspect ?? { lastLoggedAt: null } };
   const timer = setInterval(() => {
     if (running) return;
     running = true;
@@ -400,5 +499,5 @@ export function startPlanChangePoller(deps: PlanChangePollerDeps, intervalMs = P
       .finally(() => { running = false; });
   }, intervalMs);
   timer.unref();
-  return () => clearInterval(timer);
+  return () => { stopped = true; clearInterval(timer); };
 }

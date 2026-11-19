@@ -231,6 +231,38 @@ produce the others never leaves the components that need it.
   receives `derive(master, trip id)` and never `RUNTIME_EXCHANGE_KEY`).
   Operationally the group line now needs the gateway up; a poll then fails
   `SITE_UNREACHABLE` and is retried next minute.
+- **AC-K2.12 The real poller against the real gateway.** One test runs
+  `pollPlanChangesOnce` (the function the minute loop calls) against
+  `runtime-gateway/server.js` as a child process, the API listening, and a
+  recording site, and asserts what the site received: with the master unset,
+  `RUNTIME_EXCHANGE_KEY`; a `derived` trip, `derive(master, trip id)`; a `shared`
+  trip, the legacy key; a wildcard trip (public name that resolves nowhere, route
+  registered at a LAN address) reached at the LAN address with its derived key.
+  Each case ends with a changed plan enqueuing exactly one outbox row and a further
+  tick adding none. With the gateway process stopped, the poll fails
+  `SITE_UNREACHABLE`, the cursor does not move and nothing is enqueued. Tested by
+  `plan-change-gateway-e2e.test.ts`.
+- **AC-K2.13 The poller says when it cannot reach the gateway.** When the poller
+  starts it asks `GET <runtimeOrigin>/health`, with no key (the route needs
+  none), a short timeout and no redirect, up to seven times ten seconds apart
+  (on the VM the API starts before the gateway, so one try would warn on every
+  boot). If every try fails it writes one `warn` line,
+  `plan_change_poll.gateway_unreachable`, with `safe_error_code`
+  (`GATEWAY_UNREACHABLE`, `GATEWAY_TIMEOUT` or `GATEWAY_HTTP_<status>`) and the
+  consequence ("the group line cannot reach any trip until the runtime gateway
+  answers"), never the address or a key. A gateway that answers on a later try
+  writes nothing, and stopping the poller ends the tries. It does not delay the
+  loop. Tested by
+  `plan-change-gateway-readiness.test.ts`.
+- **AC-K2.14 One line when the whole tick points at the gateway.** When every poll
+  of a tick (at least one) fails with `SITE_UNREACHABLE`, `SITE_HTTP_404`,
+  `SITE_HTTP_502` or `SITE_HTTP_503`, the poller also writes one `warn` line,
+  `plan_change_poll.gateway_suspect`, with the count, the codes and the same
+  consequence, at most once per ten minutes per poller. The per-trip
+  `plan_change_poll.failed` lines are unchanged. It is a suspicion: one trip whose
+  own site is down looks the same when it is the only trip polled. Any other code,
+  or one trip that polled fine, writes no such line. Tested by
+  `plan-change-poller-db.test.ts`.
 
 ## Non-goals
 

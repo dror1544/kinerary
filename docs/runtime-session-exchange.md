@@ -376,8 +376,13 @@ or a 2xx that is not JSON; other statuses pass through with the site's JSON body
 is read with `RUNTIME_EXCHANGE_KEY`, as before. The group line therefore depends on the gateway being up: when it
 is not, a poll fails with `plan_change_poll.failed` and `safe_error_code: SITE_UNREACHABLE` (a gateway that
 answers 503/502 shows as `SITE_HTTP_503`/`SITE_HTTP_502`), the trip's cursor does not move and the next
-minute's poll sends the net difference. Pinned by `runtime-gateway/test/plan-changes.test.js` and
-`control-plane/api/test/runtime-wildcard-e2e.test.ts` ("AC-K2.11").
+minute's poll sends the net difference. The poller says so out loud: at start it asks `GET /health` (no key) for about a minute, since the API starts before the gateway, and
+writes one `plan_change_poll.gateway_unreachable` warn line (a reason code and the consequence, never the address)
+only when every try fails, and a tick in which every poll fails `SITE_UNREACHABLE`, `SITE_HTTP_404`, `SITE_HTTP_502` or
+`SITE_HTTP_503` adds one `plan_change_poll.gateway_suspect` line, at most once per ten minutes. Pinned by
+`runtime-gateway/test/plan-changes.test.js`, `control-plane/api/test/runtime-wildcard-e2e.test.ts` ("AC-K2.11"),
+`plan-change-gateway-e2e.test.ts` (the real poller against the real gateway: "AC-K2.12") and
+`plan-change-gateway-readiness.test.ts` ("AC-K2.13").
 
 One key per request, chosen before it is sent. A trip that answers 401 to its key is
 not tried with another: a retry would hand the legacy key to whichever trip asked for

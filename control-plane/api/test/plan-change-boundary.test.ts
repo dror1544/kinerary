@@ -55,7 +55,12 @@ describe("the poller sends the control-plane key to the runtime gateway and nowh
     const code = poller.split("\n").filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line)).join("\n");
     // Exactly one place builds a URL, and it starts at deps.runtimeOrigin.
     assert.deepEqual(code.match(/const url = .*/g), ['const url = `${deps.runtimeOrigin.replace(/\\/$/, "")}/internal/t/${encodeURIComponent(tripId)}${ROUTE}${since ? `?since=${encodeURIComponent(since)}` : ""}`;']);
-    assert.equal((code.match(/fetchImpl\(/g) ?? []).length, 1, "one outbound call");
+    assert.equal((code.match(/fetchImpl\(/g) ?? []).length, 1, "one outbound call per trip");
+    // The start-up readiness probe is the only other one: GET <runtimeOrigin>/health, sent with no key and no headers.
+    const probes = code.match(/\(deps\.fetchImpl \?\? fetch\)\(.*/g) ?? [];
+    assert.equal(probes.length, 1, "one readiness probe");
+    assert.match(probes[0]!, /^\(deps\.fetchImpl \?\? fetch\)\(`\$\{deps\.runtimeOrigin\.replace\(\/\\\/\$\/, ""\)\}\/health`, \{$/);
+    assert.ok(!/fetch\(/.test(code.replace(/\(deps\.fetchImpl \?\? fetch\)\(/g, "").replace(/fetchImpl\(/g, "")), "no other call to fetch");
     assert.match(code, /redirect: "manual"/);
     assert.ok(!/upstreamOrigin|upstreamBasePath|private_url|api\/internal\/control-plane/.test(code), "no trip-site address or route is built here");
   });
