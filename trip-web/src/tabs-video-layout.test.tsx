@@ -66,14 +66,14 @@ describe("AC-5: the video layout", () => {
     expect(within(container.querySelector(".video-hero") as HTMLElement).queryAllByRole("link", { name: "Bookings" }).length).toBe(1); // the desktop tabs, hidden by CSS below 880px
   });
 
-  it("More is a header button; its menu lists the modules that are no longer tabs, and Who is coming", async () => {
+  it("More is a header button; its menu lists the modules that are no longer tabs, and Organizer settings", async () => {
     serve({ site_video_layout: true });
     renderTrip();
     const more = await screen.findByRole("button", { name: "More" });
     fireEvent.click(more);
     const menu = await screen.findByRole("dialog", { name: "Trip menu" });
     const entries = within(menu).getAllByRole("button").map((button) => button.textContent?.trim());
-    for (const wanted of ["Map", "Budget", "Readiness", "Account", "Group activities", "Lost & Found", "Trivia", "Plan tools", "Who is coming", "עברית"]) {
+    for (const wanted of ["Map", "Budget", "Readiness", "Account", "Group activities", "Lost & Found", "Trivia", "Plan tools", "Organizer settings", "עברית"]) {
       expect(entries, wanted).toContain(wanted);
     }
     // Bookings and Photos are tabs now: listed once, under Navigation, not again among the tools.
@@ -89,14 +89,6 @@ describe("AC-5: the video layout", () => {
     const menu = await screen.findByRole("dialog", { name: "Trip menu" });
     expect(within(menu).queryByRole("button", { name: "Plan tools" })).toBeNull();
     expect(within(menu).queryByRole("link", { name: "Open Classic organizer fallback" })).toBeNull();
-  });
-
-  it("Who is coming opens the participants", async () => {
-    serve({ site_video_layout: true });
-    renderTrip();
-    fireEvent.click(await screen.findByRole("button", { name: "More" }));
-    fireEvent.click(within(await screen.findByRole("dialog", { name: "Trip menu" })).getByRole("button", { name: "Who is coming" }));
-    expect(await screen.findByRole("heading", { name: "Who is coming" })).toBeInTheDocument();
   });
 
   it("Hebrew: היום · תוכנית · הזמנות · תמונות, right-to-left", async () => {

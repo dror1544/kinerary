@@ -123,7 +123,7 @@ import {
 } from "./api";
 
 type Tab = "today" | "journey" | "moments" | "more";
-type Module = "bookings" | "map" | "budget" | "photos" | "readiness" | "account" | "activities" | "lostfound" | "trivia" | "plan-tools" | "companion";
+type Module = "bookings" | "map" | "budget" | "photos" | "readiness" | "account" | "activities" | "lostfound" | "trivia" | "plan-tools" | "companion" | "organizer-settings";
 type Lang = "he" | "en";
 type BookingFilter = "phase" | "today" | "current" | "flight" | "hotel" | "attraction";
 type ItineraryTimeMode = "exact" | "rough" | "none";
@@ -232,9 +232,12 @@ const moduleShortcuts: Array<{ id: Module; en: string; he: string }> = [
 // The trip conversation is a page of its own in the video layout (it used to sit on Today): a module with a hash,
 // listed in the header menu. It is not in `moduleShortcuts` because that list feeds the current layout's lists too.
 const companionShortcut: { id: Module; en: string; he: string } = { id: "companion", en: "Trip conversation", he: "השיחה של הטיול" };
+// The organizer's page of the video layout (#612): the controls that sat under More's "Appearance". Not in `moduleShortcuts`
+// for the same reason as the conversation; the menu lists it for organizers only.
+const organizerSettingsShortcut: { id: Module; en: string; he: string } = { id: "organizer-settings", en: "Organizer settings", he: "הגדרות מארגן" };
 
 function moduleLabel(module: Module, lang: Lang) {
-  const shortcut = [...moduleShortcuts, companionShortcut].find((item) => item.id === module);
+  const shortcut = [...moduleShortcuts, companionShortcut, organizerSettingsShortcut].find((item) => item.id === module);
   return shortcut ? shortcut[lang] : module;
 }
 
@@ -243,7 +246,7 @@ function isTab(value: string): value is Tab {
 }
 
 function isModule(value: string): value is Module {
-  return moduleShortcuts.some((shortcut) => shortcut.id === value) || value === companionShortcut.id;
+  return moduleShortcuts.some((shortcut) => shortcut.id === value) || value === companionShortcut.id || value === organizerSettingsShortcut.id;
 }
 
 export function preferredLang(): Lang {
@@ -878,7 +881,7 @@ function videoTabLabel(tab: VideoTab, lang: Lang) {
 }
 
 /** The header of the video layout: logo and title, "<place> · <tab>", the signed-in user and More. */
-export function VideoHero({ config, settings, lang, placePhaseId, pageName, active, openVideoTab, openMenu, currentUser }: {
+export function VideoHero({ config, settings, lang, placePhaseId, pageName, active, openVideoTab, openMenu, openAccount, currentUser }: {
   config?: TripConfig;
   settings?: { hero: { url: string | null; focal_x: number; focal_y: number } };
   lang: Lang;
@@ -888,6 +891,8 @@ export function VideoHero({ config, settings, lang, placePhaseId, pageName, acti
   active: VideoTab | null;
   openVideoTab: (tab: VideoTab) => void;
   openMenu: () => void;
+  /** The name and picture open the Account page (#612); the More button opens the menu. */
+  openAccount?: () => void;
   currentUser?: CurrentUser;
 }) {
   const place = text(config?.phases?.find((phase) => phase.id === placePhaseId)?.title, lang);
@@ -915,8 +920,8 @@ export function VideoHero({ config, settings, lang, placePhaseId, pageName, acti
           ))}
         </div>
         {currentUser ? (
-          <button className="hero-identity" type="button" onClick={openMenu}
-            aria-label={copy(lang, `Signed in as ${personName(currentUser, lang)} — open menu`, `מחוברים בתור ${personName(currentUser, lang)} — פתיחת התפריט`)}>
+          <button className="hero-identity" type="button" onClick={openAccount ?? openMenu}
+            aria-label={copy(lang, `Signed in as ${personName(currentUser, lang)} — open your account`, `מחוברים בתור ${personName(currentUser, lang)} — פתיחת החשבון`)}>
             <PersonAvatar username={currentUser.username} name={personName(currentUser, lang)} color={currentUser.color} avatarFile={currentUser.avatar_file} size="small" />
           </button>
         ) : null}
@@ -2768,7 +2773,8 @@ export function PhotosView({ config, currentUser, lang }: { config?: TripConfig;
   );
 }
 
-export function MoreView({ config, currentUser, isOrganizer, lang, openModule }: { config?: TripConfig; currentUser?: CurrentUser; isOrganizer?: boolean; lang: Lang; openModule: (module: Module) => void }) {
+/** The trip's picture, changed from a file: organizer-only at the server (`POST /api/ui-settings/hero`). Shared by the classic More page and the video layout's Organizer settings. */
+function HeroPictureControl({ lang }: { lang: Lang }) {
   const [busy, setBusy] = useState(false);
   const [heroError,setHeroError] = useState(false);
   const queryClient = useQueryClient();
@@ -2798,6 +2804,94 @@ export function MoreView({ config, currentUser, isOrganizer, lang, openModule }:
     }
   }
 
+  return (
+    <>
+      {heroError && <p role="alert">{copy(lang,"Could not upload the picture. Please try again.","לא ניתן להעלות את התמונה. נסו שוב.")}</p>}
+      <label className="upload-control">
+        <Upload size={18} />
+        <span>{busy ? copy(lang,"Uploading…","מעלה…") : copy(lang,"Change hero picture","שינוי תמונת הטיול")}</span>
+        <input type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={uploadHero} disabled={busy} />
+      </label>
+    </>
+  );
+}
+
+/** Everyone on the trip. On the classic More page, and on the video layout's Account page (#612). */
+function TravellerList({ config, currentUser, lang }: { config?: TripConfig; currentUser?: CurrentUser; lang: Lang }) {
+  return (
+    <section className="participants-panel" aria-labelledby="participants-heading">
+      <div className="participants-heading">
+        <div>
+          <span className="panel-label"><Users size={16} /> {copy(lang, "Travelers", "משתתפי הטיול")}</span>
+          <h3 id="participants-heading">{copy(lang, "Who is coming", "מי משתתף בטיול")}</h3>
+        </div>
+        <span className="participant-count">{config?.participants?.length || 0}</span>
+      </div>
+      <div className="participants-grid">
+        {config?.participants?.map((participant) => {
+          const displayName = personName(participant, lang);
+          const isCurrentUser = currentUser?.username === participant.username;
+          return (
+            <article className="participant-card" key={participant.username}>
+              <PersonAvatar username={participant.username} name={displayName} color={participant.color} size="regular" />
+              <div>
+                <strong>{displayName}</strong>
+                <small>{isCurrentUser ? copy(lang, "You", "את/ה") : `@${participant.username}`}</small>
+              </div>
+            </article>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+/**
+ * The video layout's Account page (#612), top to bottom: the account's own settings (password, picture — `Account`),
+ * connecting Claude or ChatGPT (organizers read and write, members read only: the server decides, the block says which),
+ * and who is on the trip. Everyone sees all three.
+ */
+function AccountPage({ config, currentUser, lang }: { config?: TripConfig; currentUser?: CurrentUser; lang: Lang }) {
+  return (
+    <div className="account-page">
+      <Account currentUser={currentUser} lang={lang} />
+      <AssistantConnect lang={lang} tripName={typeof config?.meta?.title === "string" ? config.meta.title : undefined} />
+      <TravellerList config={config} currentUser={currentUser} lang={lang} />
+    </div>
+  );
+}
+
+/**
+ * The video layout's Organizer settings page (#612): the organizer-only controls that sat under More's "Appearance",
+ * each under its own title. Organizer-only at the server too (`PATCH /api/settings`, `POST /api/ui-settings/hero`,
+ * the password routes); this page only decides where the controls are.
+ */
+export function OrganizerSettings({ config, isOrganizer, lang }: { config?: TripConfig; isOrganizer?: boolean; lang: Lang }) {
+  if (!isOrganizer) return <p>{copy(lang,"Organizer access required.","נדרשת הרשאת מארגן.")}</p>;
+  return (
+    <section className="more-layout organizer-settings">
+      <div className="section-heading">
+        <span className="panel-label"><Settings size={16} /> {copy(lang,"Organizer","מארגן")}</span>
+        <h2>{copy(lang,"Organizer settings","הגדרות מארגן")}</h2>
+      </div>
+      <section className="organizer-tools" aria-labelledby="os-signing-in">
+        <MemberLogins config={config} lang={lang} headingId="os-signing-in" />
+      </section>
+      {featureOn(config, "plan_change_group_line") ? (
+        <section className="organizer-tools" aria-labelledby="os-notifications">
+          <h3 id="os-notifications">{copy(lang,"Notifications","התראות")}</h3>
+          <GroupLineToggle lang={lang} />
+        </section>
+      ) : null}
+      <section className="organizer-tools" aria-labelledby="os-look">
+        <h3 id="os-look">{copy(lang,"Trip look","מראה הטיול")}</h3>
+        <HeroPictureControl lang={lang} />
+      </section>
+    </section>
+  );
+}
+
+export function MoreView({ config, currentUser, isOrganizer, lang, openModule }: { config?: TripConfig; currentUser?: CurrentUser; isOrganizer?: boolean; lang: Lang; openModule: (module: Module) => void }) {
   const workflows: Array<{ label: string; module: Module }> = moduleShortcuts
     .filter(m => m.id !== "plan-tools" || isOrganizer)
     .map(m=>({label:m[lang],module:m.id}));
@@ -2808,39 +2902,11 @@ export function MoreView({ config, currentUser, isOrganizer, lang, openModule }:
         <h2>{copy(lang,"Everything for your trip","כל מה שצריך לטיול")}</h2>
         <p>{copy(lang,"Manage your preparations, account and group activities.","נהלו את ההכנות, החשבון והפעילויות הקבוצתיות.")}</p>
       </div>
-      <section className="participants-panel" aria-labelledby="participants-heading">
-        <div className="participants-heading">
-          <div>
-            <span className="panel-label"><Users size={16} /> {copy(lang, "Travelers", "משתתפי הטיול")}</span>
-            <h3 id="participants-heading">{copy(lang, "Who is coming", "מי משתתף בטיול")}</h3>
-          </div>
-          <span className="participant-count">{config?.participants?.length || 0}</span>
-        </div>
-        <div className="participants-grid">
-          {config?.participants?.map((participant) => {
-            const displayName = personName(participant, lang);
-            const isCurrentUser = currentUser?.username === participant.username;
-            return (
-              <article className="participant-card" key={participant.username}>
-                <PersonAvatar username={participant.username} name={displayName} color={participant.color} size="regular" />
-                <div>
-                  <strong>{displayName}</strong>
-                  <small>{isCurrentUser ? copy(lang, "You", "את/ה") : `@${participant.username}`}</small>
-                </div>
-              </article>
-            );
-          })}
-        </div>
-      </section>
+      <TravellerList config={config} currentUser={currentUser} lang={lang} />
       {isOrganizer ? (
         <section className="organizer-tools">
           <h3>{copy(lang,"Appearance","מראה")}</h3>
-          {heroError && <p role="alert">{copy(lang,"Could not upload the picture. Please try again.","לא ניתן להעלות את התמונה. נסו שוב.")}</p>}
-          <label className="upload-control">
-            <Upload size={18} />
-            <span>{busy ? copy(lang,"Uploading…","מעלה…") : copy(lang,"Change hero picture","שינוי תמונת הטיול")}</span>
-            <input type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={uploadHero} disabled={busy} />
-          </label>
+          <HeroPictureControl lang={lang} />
           <MemberLogins config={config} lang={lang} />
           {featureOn(config, "plan_change_group_line") ? <GroupLineToggle lang={lang} /> : null}
         </section>
@@ -2886,7 +2952,7 @@ export function MoreView({ config, currentUser, isOrganizer, lang, openModule }:
  * server too — `organizerOrAgentRequired` refuses anyone else, which is the
  * boundary that actually matters. Hiding the panel is courtesy, not security.
  */
-function MemberLogins({ config, lang }: { config?: TripConfig; lang: Lang }) {
+function MemberLogins({ config, lang, headingId }: { config?: TripConfig; lang: Lang; headingId?: string }) {
   const [pending, setPending] = useState("");
   const [result, setResult] = useState<{ username: string; text: string; link?: string } | null>(null);
 
@@ -2924,7 +2990,7 @@ function MemberLogins({ config, lang }: { config?: TripConfig; lang: Lang }) {
 
   return (
     <div className="member-logins">
-      <h3>{copy(lang, "Signing in", "כניסה לאתר")}</h3>
+      <h3 id={headingId}>{copy(lang, "Signing in", "כניסה לאתר")}</h3>
       <p>{copy(lang,
         "Everyone signs in with their own name and the trip password. If someone set their own and forgot it, put it back here.",
         "כל אחד נכנס עם השם שלו וסיסמת הטיול. אם מישהו הגדיר סיסמה משלו ושכח אותה, אפשר להחזיר אותה כאן.")}</p>
@@ -2975,7 +3041,7 @@ export function AppMenu({
   setLang: (lang: Lang) => void;
   openTab: (tab: Tab) => void;
   openModule: (module: Module) => void;
-  /** site_video_layout: Bookings and Photos are tabs now, so the menu holds the rest, and "Who is coming". */
+  /** site_video_layout: Bookings and Photos are tabs now, so the menu holds the rest, and "Organizer settings" for an organizer. */
   videoLayout?: boolean;
   openVideoTab?: (tab: VideoTab) => void;
 }) {
@@ -2994,21 +3060,34 @@ export function AppMenu({
           <img src={brandLogo} alt="Kinerary" />
           <button type="button" onClick={() => setOpen(false)} aria-label={copy(lang,"Close menu","סגירת תפריט")}><X size={20} /></button>
         </div>
-        {currentUser ? (
-          <section className="signed-in-user" aria-label={copy(lang, "Signed-in user", "המשתמש המחובר")}>
-            <PersonAvatar
-              username={currentUser.username}
-              name={personName(currentUser, lang)}
-              color={currentUser.color}
-              avatarFile={currentUser.avatar_file}
-              googlePicture={currentUser.google_picture}
-            />
-            <div>
-              <strong>{personName(currentUser, lang)}</strong>
-              <small>{currentUser.is_organizer ? copy(lang, "Trip organizer", "מארגן הטיול") : `@${currentUser.username}`}</small>
-            </div>
-          </section>
-        ) : null}
+        {currentUser ? (() => {
+          const name = personName(currentUser, lang);
+          const card = (
+            <>
+              <PersonAvatar
+                username={currentUser.username}
+                name={name}
+                color={currentUser.color}
+                avatarFile={currentUser.avatar_file}
+                googlePicture={currentUser.google_picture}
+              />
+              <div>
+                <strong>{name}</strong>
+                <small>{currentUser.is_organizer ? copy(lang, "Trip organizer", "מארגן הטיול") : `@${currentUser.username}`}</small>
+              </div>
+            </>
+          );
+          // Video layout: the card is the way to the account (#612 follow-up: the owner tapped it and nothing happened).
+          return videoLayout ? (
+            <button type="button" className="signed-in-user signed-in-user-button" onClick={() => openModule("account")}
+              aria-label={`${copy(lang, "Open your account", "פתיחת החשבון")} — ${name}`}>
+              {card}
+              <span className="signed-in-user-chevron" aria-hidden="true">{lang === "he" ? <ChevronLeft size={20} /> : <ChevronRight size={20} />}</span>
+            </button>
+          ) : (
+            <section className="signed-in-user" aria-label={copy(lang, "Signed-in user", "המשתמש המחובר")}>{card}</section>
+          );
+        })() : null}
         <div className="menu-section">
           <small>{lang === "he" ? "ניווט" : "Navigation"}</small>
           {videoLayout && openVideoTab
@@ -3023,7 +3102,7 @@ export function AppMenu({
             <button key={shortcut.id} type="button" onClick={() => openModule(shortcut.id)}>{shortcut[lang]}</button>
           ))}
           {videoLayout ? <button type="button" onClick={() => openModule("companion")}>{companionShortcut[lang]}</button> : null}
-          {videoLayout ? <button type="button" onClick={() => openTab("more")}>{copy(lang, "Who is coming", "מי משתתף בטיול")}</button> : null}
+          {videoLayout && isOrganizer ? <button type="button" onClick={() => openModule("organizer-settings")}>{organizerSettingsShortcut[lang]}</button> : null}
         </div>
         <div className="menu-section">
           <small>{lang === "he" ? "הגדרות" : "Settings"}</small>
@@ -3158,11 +3237,11 @@ export default function App() {
   };
   // `#moments` is Photos in the video layout (Moments is a section inside it); `#journey` is Plan.
   // The trip conversation is a page only in the video layout; with the switch off #companion is not a page.
-  const pageModule = activeModule === "companion" && !videoLayout ? null : activeModule;
+  const pageModule = (activeModule === "companion" || activeModule === "organizer-settings") && !videoLayout ? null : activeModule;
   const shownModule: Module | null = pageModule ?? (videoLayout && activeTab === "moments" ? "photos" : null);
   const videoActive: VideoTab | null = shownModule === "bookings" ? "bookings" : shownModule === "photos" ? "photos"
     : shownModule ? null : activeTab === "today" ? "today" : activeTab === "journey" ? "plan" : null;
-  const videoPageName = shownModule ? moduleLabel(shownModule, lang) : activeTab === "more" ? tabLabel("more", lang) : videoTabLabel(activeTab === "journey" ? "plan" : "today", lang);
+  const videoPageName = shownModule ? moduleLabel(shownModule, lang) : activeTab === "more" ? moduleLabel("account", lang) : videoTabLabel(activeTab === "journey" ? "plan" : "today", lang);
   const companionName = botDisplayName(config.data, hermes.data?.identity.name, lang);
   const heroPhaseId = !activeModule && activeTab === "journey"
     ? journeyHeroPhaseId
@@ -3173,7 +3252,9 @@ export default function App() {
     today: <TodayView itinerary={itinerary.data} config={config.data} lang={lang} isOrganizer={me.data?.is_organizer} onOpenItinerary={openMapItinerary} onOpenBooking={openBooking} videoLayout={videoLayout} marks={marks} />,
     journey: <JourneyView username={me.data?.username} itinerary={itinerary.data} config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} botName={companionName} telegramUsername={hermes.data?.telegram_username} onHeroPhaseChange={setJourneyHeroPhaseId} focus={journeyFocus} today={today.data} videoLayout={videoLayout} marks={marks} />,
     moments: <MomentsView todayDate={today.data?.today} lang={lang} />,
-    more: <MoreView config={config.data} currentUser={me.data} isOrganizer={me.data?.is_organizer} lang={lang} openModule={openModule} />,
+    more: videoLayout
+      ? <AccountPage config={config.data} currentUser={me.data} lang={lang} /> // the old #more address: its parts live on Account now (#612)
+      : <MoreView config={config.data} currentUser={me.data} isOrganizer={me.data?.is_organizer} lang={lang} openModule={openModule} />,
   }[activeTab];
   const moduleContent = shownModule ? {
     bookings: <BookingsView config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} focus={bookingFocus} />,
@@ -3181,11 +3262,12 @@ export default function App() {
     budget: <><BudgetView config={config.data} lang={lang} /><CurrencyConverter lang={lang}/></>,
     photos: <><PhotosView config={config.data} currentUser={me.data} lang={lang} /><ImmichAlbum config={config.data} lang={lang}/>{videoLayout ? <MomentsView todayDate={today.data?.today} lang={lang} /> : null}</>,
     readiness: <Readiness config={config.data} lang={lang}/>,
-    account: <Account currentUser={me.data} lang={lang}/>,
+    account: videoLayout ? <AccountPage config={config.data} currentUser={me.data} lang={lang} /> : <Account currentUser={me.data} lang={lang}/>,
     activities: <GroupActivities config={config.data} currentUser={me.data} lang={lang}/>,
     lostfound: <LostFound lang={lang}/>,
     trivia: <Trivia config={config.data} currentUser={me.data} lang={lang}/>,
     companion: <CompanionPanel name={companionName} isOrganizer={me.data?.is_organizer} lang={lang} />,
+    "organizer-settings": <OrganizerSettings config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} />,
     "plan-tools": me.data?.is_organizer ? <PlanTools isOrganizer config={config.data} itinerary={itinerary.data} lang={lang}/> : <p>{copy(lang,"Organizer access required.","נדרשת הרשאת מארגן.")}</p>,
   }[shownModule] : null;
   const content = moduleContent || tabContent;
@@ -3193,7 +3275,7 @@ export default function App() {
   return (
     <div className={videoLayout ? "modern-trip-app video-layout" : "modern-trip-app"}>
       {videoLayout
-        ? <VideoHero config={config.data} settings={ui.data} lang={lang} placePhaseId={videoPlacePhaseId(config.data, itinerary.data, today.data)} pageName={videoPageName} active={videoActive} openVideoTab={openVideoTab} openMenu={() => setMenuOpen(true)} currentUser={me.data} />
+        ? <VideoHero config={config.data} settings={ui.data} lang={lang} placePhaseId={videoPlacePhaseId(config.data, itinerary.data, today.data)} pageName={videoPageName} active={videoActive} openVideoTab={openVideoTab} openMenu={() => setMenuOpen(true)} openAccount={() => openModule("account")} currentUser={me.data} />
         : <Hero config={config.data} settings={ui.data} lang={lang} activeTab={activeTab} activeModule={activeModule} heroPhaseId={heroPhaseId} openTab={openTab} openModule={openModule} openMenu={() => setMenuOpen(true)} currentUser={me.data} />}
       <main className="app-content">{content}</main>
       <AppMenu open={menuOpen} lang={lang} currentUser={me.data} isOrganizer={me.data?.is_organizer} setOpen={setMenuOpen} setLang={setLang} openTab={openTab} openModule={openModule} videoLayout={videoLayout} openVideoTab={openVideoTab} />
