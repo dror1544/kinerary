@@ -174,12 +174,16 @@ DOCKER_EXEC_VALUE_OPTIONS = {"-u", "--user", "-w", "--workdir", "-e", "--env", "
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
 
 
-def _statements(text):
+def _statements(text, comments=True):
     """The words of each simple command in `text`, quotes resolved the way a shell
-    resolves them. None when the text cannot be read as words."""
+    resolves them. None when the text cannot be read as words. comments=False keeps
+    `#` as an ordinary character: shlex would otherwise drop everything after one,
+    even mid-word, where bash does not."""
     import shlex
     lex = shlex.shlex(text.replace("\n", " ; "), posix=True, punctuation_chars=True)
     lex.whitespace_split = True
+    if not comments:
+        lex.commenters = ""
     try:
         words = list(lex)
     except ValueError:
@@ -258,7 +262,7 @@ def embedded_commands(raw):
 # and plan modes have no such word and stay quiet. A command that cannot be read as
 # words, and names a script and something like the flag, is asked: a spurious prompt
 # costs a keystroke. ssh / sh -c / docker exec payloads are read as their own commands.
-EXECUTE_TOOLS = re.compile(r'(?:^|/)(?:teardown-trip|trip-route|relay-rekey)\.py$')
+EXECUTE_TOOLS = re.compile(r'(?:^|/)(?:teardown-trip|trip-route|relay-rekey)\.py$', re.I)
 
 
 def _is_execute_flag(word):
@@ -266,10 +270,22 @@ def _is_execute_flag(word):
     return len(flag) >= 3 and "--execute".startswith(flag)
 
 
+# The line-based half, kept alongside the word reader (re-check of #599, 2026-11-20: the
+# word reader alone missed a comment line, `timeout … ssh`, `eval`, `bash <<<` and
+# `$(…)`, which this catches). Anywhere on the line, like the release tool's entry,
+# because these run through ssh and wrappers; backslash-newline continuations are
+# joined first; the script name in any case (the Mac's file system ignores it).
+EXECUTE_TOOL_LINE = re.compile(
+    r'(?:teardown-trip|trip-route|relay-rekey)\.py\b[^\n;&|]*--execute\b', re.I)
+
+
 def execute_tool_hit(raw, depth=0):
-    statements = _statements(raw)
+    joined = raw.replace("\\\n", " ")
+    if EXECUTE_TOOL_LINE.search(joined):
+        return True
+    statements = _statements(joined, comments=False)
     if statements is None:
-        return bool(re.search(r'(?:teardown-trip|trip-route|relay-rekey)\.py\b[^\n]*--e', raw))
+        return bool(re.search(r'(?:teardown-trip|trip-route|relay-rekey)\.py\b[^\n]*--e', joined, re.I))
     for words in statements:
         for i, word in enumerate(words):
             if EXECUTE_TOOLS.search(word) and any(_is_execute_flag(w) for w in words[i + 1:]):

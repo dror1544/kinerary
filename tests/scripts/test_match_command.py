@@ -221,6 +221,27 @@ class Classify(unittest.TestCase):
         ):
             self.assertEqual(classify(command), "deploy", command)
 
+    def test_wrappers_comments_and_continuations_do_not_hide_the_flag(self):
+        # Re-check of #599 (2026-11-20): forms the word reader alone missed.
+        T = "python3 scripts/trip-route.py --trip x --set --execute --live"
+        R = "python3 scripts/relay-rekey.py --all-enrolled --execute"
+        for command in (
+            "# move the test trip\nsudo KINERARY_DEPLOY_ROOT=/srv/d " + T,
+            "curl -s http://h/#top >/dev/null; " + R,
+            "python3 scripts/trip-route.py --trip a#b --set --execute",
+            "X=a#b " + T,
+            f"timeout 120 ssh host 'sudo {R}'",
+            f"sshpass -f pw ssh host '{R}'",
+            f"eval '{T}'",
+            f"timeout 60 bash -c '{T}'",
+            f"su root -c '{R}'",
+            f"bash <<< '{T}'",
+            f"echo '{R}' | sh",
+            "python3 scripts/trip-route.py --trip x --set \\\n  --execute --live",
+            "python3 scripts/TRIP-ROUTE.PY --trip x --set --execute",
+        ):
+            self.assertEqual(classify(command), "deploy", command)
+
     def test_the_scripts_refuse_a_shortened_execute(self):
         root = Path(__file__).resolve().parents[2] / "scripts"
         for name in ("trip-route.py", "relay-rekey.py", "teardown-trip.py"):
