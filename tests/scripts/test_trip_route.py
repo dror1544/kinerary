@@ -55,11 +55,12 @@ class FakeDb:
     """Just enough of the control plane for this script's statements."""
 
     def __init__(self, *, slug="japan-2026", state="ready_private", route=True, columns=True,
-                 route_state="ready", public_host=None, upstream_url=None, other_holder=None):
+                 route_state="ready", public_host=None, upstream_url=None, other_holder=None, upstream_holder=None):
         self.trip = {"id": TRIP_ID, "slug": slug, "lifecycle_state": state}
         self.route = {"state": route_state, "public_host": public_host, "upstream_url": upstream_url} if route else None
         self.columns = columns
         self.other_holder = other_holder
+        self.upstream_holder = upstream_holder
         self.statements: list[str] = []
 
     @property
@@ -75,6 +76,8 @@ class FakeDb:
             return json.dumps(row)
         if "SELECT state, public_host, upstream_url" in sql:
             return json.dumps(self.route)
+        if "JOIN control_plane.trips t" in sql and "upstream_url" in sql:
+            return self.upstream_holder or ""
         if "JOIN control_plane.trips t" in sql:
             return self.other_holder or ""
         if sql.startswith("UPDATE control_plane.runtime_routes"):
@@ -242,6 +245,15 @@ class Set(unittest.TestCase):
         self.assertEqual(2, code)
         self.assertIn("already the route of italy-2026", text)
         self.assertEqual([], db.writes)
+
+    def test_an_address_another_live_trip_has_is_refused_before_any_write(self):
+        # Boundary review of #599 (2026-11-19, F2): one LAN address is one trip.
+        db = FakeDb(upstream_holder="other-trip-2026")
+        code, text = run(db, topology(), ["--set", "--execute", "--live"])
+        self.assertEqual(2, code, text)
+        self.assertIn("other-trip-2026", text)
+        self.assertEqual([], db.writes)
+        self.assertTrue(any("'http://192.0.2.210:8080'" in s for s in db.statements), "asked about the topology's address")
 
     def test_a_database_without_the_columns_is_refused_not_failed_half_way(self):
         db = FakeDb(columns=False)

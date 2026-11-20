@@ -189,6 +189,17 @@ def host_holder(host: str, trip_id: str) -> str | None:
         f"WHERE r.public_host = '{host}' AND r.trip_id <> '{trip_id}'") or None
 
 
+def upstream_holder(upstream: str, trip_id: str) -> str | None:
+    """Another trip whose READY route already has this LAN address: one address is one trip, or the gateway sends
+    one trip's visitors and key to the other's container (boundary review of #599, F2). `upstream` passed the
+    ASCII-only checks in topology_route before it reaches this SQL."""
+    if not re.fullmatch(r"http://[0-9.]+:[0-9]+", upstream):
+        return None
+    return psql(
+        "SELECT t.slug FROM control_plane.runtime_routes r JOIN control_plane.trips t ON t.id = r.trip_id "
+        f"WHERE r.state = 'ready' AND lower(rtrim(r.upstream_url, '/')) = '{upstream}' AND r.trip_id <> '{trip_id}'") or None
+
+
 def describe(route: dict | None) -> str:
     if route is None:
         return "no runtime route row"
@@ -197,7 +208,8 @@ def describe(route: dict | None) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 allow_abbrev=False)  # --exec must not mean --execute (the deploy prompt reads the word)
     ap.add_argument("--trip", required=True, help="trip id (trip_...) or slug")
     what = ap.add_mutually_exclusive_group()
     what.add_argument("--set", action="store_true", help="record the hostname and address from the trip's topology.yaml")
@@ -248,6 +260,9 @@ def main(argv: list[str] | None = None) -> int:
             holder = host_holder(host, trip["id"])
             if holder:
                 raise Refused(f"{host} is already the route of {holder}")
+            holder = upstream_holder(upstream, trip["id"])
+            if holder:
+                raise Refused(f"{holder}'s live route already has this trip's LAN address: check both topology.yaml files")
             if route["state"] != "ready":
                 say(f"{YELLOW}!{RESET}", f"the route's state is {route['state']!r}; the gateway routes only 'ready' "
                     "(this does not change it)")

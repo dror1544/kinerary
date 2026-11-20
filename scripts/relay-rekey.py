@@ -302,7 +302,8 @@ def enrolled_names(profiles_dir: Path) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Re-key enrolled gateway profiles to per-gateway relay keys.")
+    parser = argparse.ArgumentParser(description="Re-key enrolled gateway profiles to per-gateway relay keys.",
+                                     allow_abbrev=False)  # --exec must not mean --execute (the deploy prompt reads the word)
     which = parser.add_mutually_exclusive_group(required=True)
     which.add_argument("--profile", help="profile name, or a comma-separated list")
     which.add_argument("--all-enrolled", action="store_true", help="every profile whose .env has a GATEWAY_RELAY_ID")

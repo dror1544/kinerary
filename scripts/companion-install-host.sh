@@ -674,11 +674,29 @@ def read(ref):
         return None
 
 
+import os
+
+
+def read_shared(ref):
+    if isinstance(ref, str) and ref.startswith("env://"):
+        return os.environ.get(ref[len("env://"):], "").strip() or None
+    return read(ref) if isinstance(ref, str) and ref.startswith("file://") else None
+
+
 masters = [read(x) if x.startswith("file://") else None for x in refs]
 if not masters[0]:
     print("UNREADABLE"); sys.exit(0)
-shared = [read(x) for x in (r.get("gateway_secret_refs") or []) if isinstance(x, str) and x.startswith("file://")]
-if any(m and s and m == s for m in masters for s in shared):
+# Every master and every shared secret must be READ before a key is written, as
+# relay-rekey.py does: one that cannot be read here (vault://, an unset variable,
+# an unreadable file) cannot be proved different, and a master equal to a shared
+# secret writes a key no running relay accepts.
+if not all(masters):
+    print("MASTERUNREADABLE"); sys.exit(0)
+shared_refs = r.get("gateway_secret_refs")
+shared = [read_shared(x) for x in (shared_refs if isinstance(shared_refs, list) else [])]
+if not all(shared):
+    print("SHAREDUNREADABLE"); sys.exit(0)
+if any(m == s for m in masters for s in shared):
     print("EQUAL"); sys.exit(0)
 print("OK")
 print(refs[0][len("file://"):])
@@ -691,12 +709,16 @@ PY
         printf 'companion-install-host: relay.gateway_key_mode is %s but relay.gateway_key_master_refs is missing in %s; %s left UNENROLLED\n' \
           "$key_mode" "$ARCH_PROFILE" "$name" >&2
         return 0 ;;
+      SHAREDUNREADABLE)
+        printf 'companion-install-host: a relay.gateway_secret_refs entry in %s cannot be read here (only file:// and env:// can), so the derivation master cannot be proved different from it; %s left UNENROLLED\n' \
+          "$ARCH_PROFILE" "$name" >&2
+        return 0 ;;
       EQUAL)
         printf 'companion-install-host: a relay.gateway_key_master_refs secret equals a relay.gateway_secret_refs secret in %s (the derivation master must be one no gateway profile has held); %s left UNENROLLED\n' \
           "$ARCH_PROFILE" "$name" >&2
         return 0 ;;
       *)
-        printf 'companion-install-host: relay.gateway_key_master_refs[0] in %s is not a readable file:// reference (%s); %s left UNENROLLED\n' \
+        printf 'companion-install-host: relay.gateway_key_master_refs in %s is not readable file:// references (%s); %s left UNENROLLED\n' \
           "$ARCH_PROFILE" "$master_verdict" "$name" >&2
         return 0 ;;
     esac

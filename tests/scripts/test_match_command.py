@@ -201,6 +201,32 @@ class Classify(unittest.TestCase):
         ):
             self.assertEqual(classify(command), "deploy", command)
 
+    def test_no_spelling_of_the_command_or_the_flag_gets_past_the_prompt(self):
+        # Boundary review of #599 (2026-11-19, F1): each of these ran, or would run, the change with no prompt.
+        for command in (
+            "scripts/trip-route.py --trip x --set --exec --li",
+            "scripts/trip-route.py --trip x --clear --e",
+            "scripts/trip-route.py --trip x --set --exe\"\"cute",
+            "scripts/trip-route.py --trip 'a;b' --set --execute",
+            "python3 -u scripts/trip-route.py --trip x --set --execute",
+            "python3.12 scripts/trip-route.py --trip x --set --execute",
+            "/usr/bin/python3 scripts/trip-route.py --trip x --set --execute",
+            "sudo -E python3 scripts/trip-route.py --trip x --set --execute",
+            "timeout 60 scripts/trip-route.py --trip x --set --execute",
+            "uv run scripts/relay-rekey.py --all-enrolled --execute",
+            "scripts/relay-rekey.py --all-enrolled --exec",
+            "scripts/teardown-trip.py --trip x --exec",
+            "ssh host 'sudo -E /usr/bin/python3 /opt/k/scripts/trip-route.py --trip x --set --exec'",
+            "bash -c 'timeout 9 python3 scripts/relay-rekey.py --all-enrolled --execute'",
+        ):
+            self.assertEqual(classify(command), "deploy", command)
+
+    def test_the_scripts_refuse_a_shortened_execute(self):
+        root = Path(__file__).resolve().parents[2] / "scripts"
+        for name in ("trip-route.py", "relay-rekey.py", "teardown-trip.py"):
+            text = (root / name).read_text()
+            self.assertIn("allow_abbrev=False", text, name)
+
     def test_showing_or_planning_a_route_or_a_rekey_is_read_only(self):
         for command in (
             "scripts/trip-route.py --trip japan-2026",

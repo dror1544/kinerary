@@ -908,7 +908,8 @@ def _stop_gateway(profile: str) -> None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 allow_abbrev=False)  # --exec must not mean --execute (the deploy prompt reads the word)
     ap.add_argument("--trip", required=True, help="trip id (trip_...) or slug")
     ap.add_argument("--execute", action="store_true", help="actually tear down (default: print the plan)")
     ap.add_argument("--keep-container", action="store_true",

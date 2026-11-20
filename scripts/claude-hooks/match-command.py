@@ -85,14 +85,6 @@ DEPLOY = re.compile(
     # live as deploying one. Only --execute: its dry run is read-only, and a
     # prompt that fires on read-only commands teaches people to click through.
     r'|' + CMDPOS + r'(?:sudo\s+)?(?:python3?\s+)?\S*teardown-trip\.py\b[^\n;&|]*--execute\b'
-    # The same shape for the two route/key tools of #599: `trip-route.py
-    # --execute` moves a trip's public name onto or off the gateway, and
-    # `relay-rekey.py --execute` rewrites which key a companion's gateway holds.
-    # Both are run as `sudo KINERARY_DEPLOY_ROOT=<root> python3 scripts/…` on a
-    # server, so leading VAR=value words are allowed (sudo or env first). Their
-    # show and plan modes stay prompt-free.
-    r'|' + CMDPOS + r'(?:sudo\s+)?(?:env\s+)?(?:[A-Za-z_]\w*=\S*\s+)*(?:python3?\s+)?'
-    r'\S*(?:trip-route|relay-rekey)\.py\b[^\n;&|]*--execute\b'
     # The production control plane's release tool: every verb that moves the
     # running version, the database, the trip bridges, or deletes a way back.
     # Anywhere on the line, not only at a command position, because it is run
@@ -254,6 +246,39 @@ def embedded_commands(raw):
     return found
 
 
+# Plan-by-default tools whose --execute changes something people use: tearing a trip
+# down, moving a trip's public name onto or off the gateway (#599), re-keying the
+# companions' gateways (#599). Read as WORDS, the way the shell will hand them to the
+# script, so nothing in front of the script matters (sudo -E, env, VAR=value,
+# timeout, python3.12 -u, /usr/bin/python3, uv run …) and shell quoting cannot split
+# the flag (`--exe""cute` is `--execute`). A statement is one when a word names the
+# script and a LATER word is --execute, or anything argparse could have expanded to it
+# (the scripts set allow_abbrev=False; this does not rely on that). `grep -- --execute
+# scripts/trip-route.py` names the flag before the script and stays quiet; the show
+# and plan modes have no such word and stay quiet. A command that cannot be read as
+# words, and names a script and something like the flag, is asked: a spurious prompt
+# costs a keystroke. ssh / sh -c / docker exec payloads are read as their own commands.
+EXECUTE_TOOLS = re.compile(r'(?:^|/)(?:teardown-trip|trip-route|relay-rekey)\.py$')
+
+
+def _is_execute_flag(word):
+    flag = word.split("=", 1)[0]
+    return len(flag) >= 3 and "--execute".startswith(flag)
+
+
+def execute_tool_hit(raw, depth=0):
+    statements = _statements(raw)
+    if statements is None:
+        return bool(re.search(r'(?:teardown-trip|trip-route|relay-rekey)\.py\b[^\n]*--e', raw))
+    for words in statements:
+        for i, word in enumerate(words):
+            if EXECUTE_TOOLS.search(word) and any(_is_execute_flag(w) for w in words[i + 1:]):
+                return True
+    if depth < 3:
+        return any(execute_tool_hit(payload, depth + 1) for payload in embedded_commands(raw))
+    return False
+
+
 def rollout_hit(raw, depth=0):
     if ROLLOUT.search(strip_quotes(raw)):
         return True
@@ -372,7 +397,7 @@ raw = strip_heredocs(sys.stdin.read())
 # Merge and push follow commit's rule: quotes stripped, prose does not prompt.
 # Order is by consequence, so `git push && deploy.sh` is a deploy and
 # `git merge x && git commit` is a commit.
-if DEPLOY.search(raw) or rollout_hit(raw):
+if DEPLOY.search(raw) or rollout_hit(raw) or execute_tool_hit(raw):
     print("deploy")
 elif COMMIT.search(strip_quotes(raw)):
     print("commit")

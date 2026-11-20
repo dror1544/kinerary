@@ -88,9 +88,9 @@ class EnrollRelay(unittest.TestCase):
         path.write_text(json.dumps({"relay": relay}))
         return path
 
-    def enroll(self, arch: Path, name: str = PROFILE) -> subprocess.CompletedProcess:
+    def enroll(self, arch: Path, name: str = PROFILE, extra_env: dict | None = None) -> subprocess.CompletedProcess:
         script = f'set -euo pipefail\nARCH_PROFILE="{arch}"\n{self.function}\nenroll_relay "{name}"\n'
-        env = {"HOME": str(self.home), "PATH": "/usr/bin:/bin"}
+        env = {"HOME": str(self.home), "PATH": "/usr/bin:/bin", **(extra_env or {})}
         return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=60)
 
     def env_file(self, name: str = PROFILE) -> Path:
@@ -265,6 +265,44 @@ class EnrollRelay(unittest.TestCase):
             gateway_key_mode="derived",
             gateway_secret_refs=[f"file://{self.secret_file}", f"file://{later}"],
         ))
+        self.assertIn("UNENROLLED", result.stderr)
+        self.assertFalse(self.env_file().exists())
+
+    def test_every_shared_secret_is_read_before_a_derived_key_is_written(self) -> None:
+        # Boundary review of #599 (2026-11-19, F3): an env:// shared secret equal to the master was enrolled. The
+        # first entry must be a file:// (it is what shared mode hands out); a LATER one, in a rotation list, may be
+        # any reference the relay reads, and is where the check used to look away.
+        env_ref = "env://KINERARY_TEST_RELAY_SHARED"
+        cases = (
+            ("env:// equal to the master", [env_ref], {"KINERARY_TEST_RELAY_SHARED": MASTER}, "gateway_key_master_refs"),
+            ("env:// not set here", [env_ref], {}, "cannot be read here"),
+            ("vault://", ["vault://kv/relay#secret"], {}, "cannot be read here"),
+            ("unreadable file", ["file:///nonexistent/relay.secret"], {}, "cannot be read here"),
+        )
+        for label, refs, env, said in cases:
+            for mode in ("both", "derived"):
+                with self.subTest(case=label, mode=mode):
+                    self.make_profile()
+                    result = self.enroll(self.arch(gateway_key_mode=mode,
+                                                   gateway_secret_refs=[f"file://{self.secret_file}", *refs]), extra_env=env)
+                    self.assertIn("UNENROLLED", result.stderr)
+                    self.assertIn(said, result.stderr)
+                    self.assertNotIn(MASTER, result.stdout + result.stderr)
+                    self.assertFalse(self.env_file().exists())
+
+    def test_an_env_shared_secret_that_differs_from_the_master_enrolls(self) -> None:
+        self.make_profile()
+        result = self.enroll(self.arch(gateway_key_mode="derived", gateway_secret_refs=[
+            f"file://{self.secret_file}", "env://KINERARY_TEST_RELAY_SHARED"]),
+                             extra_env={"KINERARY_TEST_RELAY_SHARED": SHARED})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("UNENROLLED", result.stderr)
+        self.assertTrue(self.env_file().exists())
+
+    def test_a_later_master_that_cannot_be_read_is_refused(self) -> None:
+        self.make_profile()
+        result = self.enroll(self.arch(gateway_key_mode="derived", gateway_key_master_refs=[
+            f"file://{self.master_file}", "file:///nonexistent/old-master"]))
         self.assertIn("UNENROLLED", result.stderr)
         self.assertFalse(self.env_file().exists())
 
