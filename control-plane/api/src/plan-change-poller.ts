@@ -163,6 +163,38 @@ const minutesOf = (hhmm: string) => Number(hhmm.slice(0, 2)) * 60 + Number(hhmm.
 
 type SiteResult = { ok: true; body: PlanChangesResponse; invalid: number; surplus: number } | { ok: false; code: string };
 
+/**
+ * The body as text, read no further than `maxBytes` BYTES: a larger declared length is refused before reading, and a
+ * stream that runs past the cap is cancelled there (boundary review of #599, F5 - the whole body used to be read
+ * first, and its UTF-16 length compared). The gateway caps bodies too; this does not rely on it.
+ */
+export async function readCapped(response: Response, maxBytes: number): Promise<string | "too_large" | "unreachable"> {
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    await response.body?.cancel().catch(() => {});
+    return "too_large";
+  }
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {});
+        return "too_large";
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return "unreachable";
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 async function readSite(
   deps: PlanChangePollerDeps,
   tripId: string,
@@ -183,9 +215,9 @@ async function readSite(
     return { ok: false, code: "SITE_UNREACHABLE" };
   }
   if (!response.ok) return { ok: false, code: `SITE_HTTP_${response.status}` };
-  let raw: string;
-  try { raw = await response.text(); } catch { return { ok: false, code: "SITE_UNREACHABLE" }; }
-  if (raw.length > MAX_BODY_BYTES) return { ok: false, code: "SITE_BODY_INVALID" };
+  const raw = await readCapped(response, MAX_BODY_BYTES);
+  if (raw === "unreachable") return { ok: false, code: "SITE_UNREACHABLE" };
+  if (raw === "too_large") return { ok: false, code: "SITE_BODY_INVALID" };
   let json: unknown;
   try { json = JSON.parse(raw); } catch { return { ok: false, code: "SITE_BODY_INVALID" }; }
   const parsed = planChangesEnvelopeSchema.safeParse(json);

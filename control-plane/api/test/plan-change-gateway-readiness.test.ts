@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import net from "node:net";
 import { test } from "node:test";
-import { checkGatewayReachable, startPlanChangePoller } from "../src/plan-change-poller.js";
+import { checkGatewayReachable, readCapped, startPlanChangePoller } from "../src/plan-change-poller.js";
 
 // The group line's one dependency, said out loud at start (docs/specs/sprint-9/597-per-gateway-and-per-trip-keys.md,
 // AC-K2.13): the poller asks the runtime gateway's GET /health, with no key, retrying at start, and a gateway that never
@@ -133,4 +133,40 @@ test("AC-K2.13: stopping the poller ends the start-up retries without a line", a
   )), false);
   assert.equal(tries, 1);
   assert.deepEqual(logs, []);
+});
+
+// Boundary review of #599 (2026-11-19, F5): a trip site's answer is read no further than the cap, counted in BYTES.
+test("readCapped: a body within the cap is returned whole, in UTF-8", async () => {
+  assert.equal(await readCapped(new Response("{\"a\":\"שלום\"}"), 64), "{\"a\":\"שלום\"}");
+  assert.equal(await readCapped(new Response(null), 64), "");
+});
+
+test("readCapped: a declared length over the cap is refused without reading the body", async () => {
+  let pulled = 0;
+  const body = new ReadableStream<Uint8Array>({ pull(controller) { pulled += 1; controller.enqueue(new Uint8Array(10)); } });
+  const response = new Response(body, { headers: { "content-length": "1000" } });
+  assert.equal(await readCapped(response, 100), "too_large");
+  assert.ok(pulled <= 1, "the body is not drained");
+});
+
+test("readCapped: a stream that runs past the cap is cancelled there, not read to the end", async () => {
+  let pulled = 0, cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) { pulled += 1; controller.enqueue(new Uint8Array(64)); },
+    cancel() { cancelled = true; },
+  });
+  assert.equal(await readCapped(new Response(body), 100), "too_large");
+  assert.ok(cancelled, "the stream is cancelled");
+  assert.ok(pulled < 10, `stopped at the cap, not after ${pulled} chunks`);
+});
+
+test("readCapped: the cap counts bytes, not UTF-16 units", async () => {
+  // 40 Hebrew letters are 40 UTF-16 units and 80 UTF-8 bytes.
+  assert.equal(await readCapped(new Response("א".repeat(40)), 60), "too_large");
+  assert.equal(await readCapped(new Response("א".repeat(40)), 80), "א".repeat(40));
+});
+
+test("readCapped: a stream that fails part-way is unreachable", async () => {
+  const body = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(new Uint8Array(4)); controller.error(new Error("reset")); } });
+  assert.equal(await readCapped(new Response(body), 100), "unreachable");
 });

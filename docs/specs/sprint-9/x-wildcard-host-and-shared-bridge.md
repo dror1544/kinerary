@@ -128,9 +128,13 @@ unset every path behaves as it does today.
     `upstream_url`, `upstreamOrigin` is that origin, validated exactly as AC-R1.3
     validates it, and `upstreamBasePath` is `""`. An `upstream_url` that fails the
     validation is 503 `RUNTIME_ROUTE_INVALID`, never a fall-back to the public URL;
-  - with an empty or absent list, or a NULL `upstream_url` (every row written
-    before R2, and every host-routed trip's row, AC-R2.5), the answer is what it
-    was: from `private_url` and the suffix check, with its base path;
+  - with an empty or absent list and an `upstream_url`, 503
+    `RUNTIME_ROUTE_INVALID`: there is nothing to validate the origin against, and
+    the public URL cannot carry `/api/internal/*` for such a trip (boundary review
+    of #599, 2026-11-19, F4);
+  - with a NULL `upstream_url` (every row written before R2, and every
+    host-routed trip's row, AC-R2.5), the answer is what it was: from
+    `private_url` and the suffix check, with its base path;
   - `private_url`, and every link a browser is sent, are unchanged.
   Tested end to end: the real API (`buildApp`, listening) and the real gateway (a
   child process with `TRIP_HOST_SUFFIX` set) with a recording fake trip site on
@@ -151,6 +155,13 @@ unset every path behaves as it does today.
   a canonical dotted quad (`0300.0.2.10`, `0x7f.0.0.1`, `127.1`, `2130706433`)
   would load as a hostname and match nothing. The load fails with a message
   naming the entry and asking for the canonical dotted quad.
+- **AC-R1.14 One LAN address is one trip** (boundary review of #599,
+  2026-11-19, F2). A route whose `upstream_url` another `ready` route also
+  registers (case and a trailing slash ignored) is 503 `RUNTIME_ROUTE_INVALID`
+  from both the by-host and the by-trip lookups, whatever wrote the rows: the
+  gateway would otherwise send one trip's visitors, and its key, to the other
+  trip's container. A suspended twin does not count. The worker (AC-R2.11) and
+  `trip-route.py --set` (AC-R2.9) refuse to write such a row.
 
 ### R2: provisioning without per-trip records
 
@@ -197,7 +208,15 @@ unset every path behaves as it does today.
   <slug|trip_id>` shows the trip's route; `--set` writes `public_host` and
   `upstream_url` from its `topology.yaml`; `--clear` removes them. It prints
   the plan and changes nothing without `--execute`. This is how one test trip
-  is moved behind the gateway before any live trip is.
+  is moved behind the gateway before any live trip is. `--execute` on a trip at
+  `ready_private` or later, or in a state the script does not know, also needs
+  `--live` (the feature-switch command's allow-list of states, pinned by a test).
+  `--set` refuses a LAN address another trip's `ready` route has (AC-R1.14).
+  The script, `relay-rekey.py` and `teardown-trip.py` refuse shortened flags
+  (`allow_abbrev=False`), and the Claude Code hook classifies any statement that
+  names one of them followed by `--execute` (read as shell words, whatever comes
+  before the script, and inside ssh / `sh -c` / `docker exec` payloads) as a
+  deploy (boundary review of #599, 2026-11-19, F1).
 - **AC-R2.10 A refused hostname does not fail a finished provision for a host-routed
   trip.** Writing `public_host` can be refused by the unique index
   (`runtime_routes_public_host_key`) or the DNS-name CHECK
@@ -205,7 +224,9 @@ unset every path behaves as it does today.
   write runs in a savepoint, so the ready mark and the job's own success commit
   whatever the outcome:
   - **Unique, another trip's row not in use** (its route is not `ready`, or its trip
-    is retired: slug `retired-...`, which is how teardown marks it): that row's
+    is retired: slug `retired-<slug>-<yyyymmdd>[-N]`, the whole shape teardown
+    gives it, never just the prefix — a trip to "Retired in Lisbon" is live,
+    boundary review F6): that row's
     `public_host` and `upstream_url` are cleared in the same transaction, one
     `provisioner.route_host_released` line carries both trip ids (never the
     hostname or an address), and the write is made again. A failure later in the
@@ -223,6 +244,14 @@ unset every path behaves as it does today.
   No exception message carries the database's own text (it quotes the other row).
   Tested by `control-plane/worker/tests/test_route_hosts.py`
   (`HostnameAlreadyHeldByAnotherTrip`, `OtherRefusalsAreNotSwallowed`).
+- **AC-R2.11 The worker records one LAN address for one trip** (boundary review
+  of #599, 2026-11-19, F2). Before writing an `upstream_url` (AC-R2.5), another
+  trip's row holding the same address is cleared when it is not in use (route not
+  `ready`, or a retired trip, as AC-R2.10 decides), with one
+  `provisioner.route_upstream_released` line; when it is in use the job fails with
+  `safe_error_code` `ROUTE_UPSTREAM_IN_USE` and a `provisioner.route_upstream_refused`
+  line naming the other trip id and no address. A host-routed trip off the gateway
+  records no address, so it never conflicts. Tested by `test_route_hosts.py`.
 
 ### B1: shared mode in `mcp/mcp.js`
 

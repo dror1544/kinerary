@@ -161,6 +161,14 @@ produce the others never leaves the components that need it.
   (the conformance vector `gw:with:colons` is unchanged). Real gateway ids are
   profile names (`^[a-z0-9][a-z0-9-]{1,62}$`), which contain no `:`. The shared
   vector file lists the refused ids (`refused_ids`) for all three minters.
+- **AC-K1.10 Every secret is read before a derived key is written** (boundary
+  review of #599, 2026-11-19, F3). `enroll_relay` and `relay-rekey.py` read every
+  `gateway_key_master_refs` entry and every `gateway_secret_refs` entry (`file://`,
+  or `env://` from the running environment) before writing a key. One that cannot
+  be read (`vault://`, an unset variable, an unreadable file) refuses the profile
+  with nothing written, because it cannot be proved different from the master;
+  a master equal to any of them refuses too. Tested by `test_enroll_relay.py` and
+  `test_relay_rekey.py`.
 
 ### K2
 
@@ -263,6 +271,12 @@ produce the others never leaves the components that need it.
   own site is down looks the same when it is the only trip polled. Any other code,
   or one trip that polled fine, writes no such line. Tested by
   `plan-change-poller-db.test.ts`.
+- **AC-K2.15 A site's answer is read no further than its cap** (boundary review
+  of #599, 2026-11-19, F5). The poller refuses a declared `content-length` over
+  512 KiB without reading the body, and cancels a stream at the first byte past
+  it (`SITE_BODY_INVALID`); the cap counts bytes, not UTF-16 units. A stream that
+  fails part-way is `SITE_UNREACHABLE`. Tested by
+  `plan-change-gateway-readiness.test.ts` (`readCapped`).
 
 ## Non-goals
 

@@ -39,6 +39,10 @@ function portalDeps(db: pg.Pool): PortalDependencies {
 }
 
 let counter = 0;
+// Each seeded trip has its own LAN address: two ready routes on one address are refused (boundary review F2).
+const upstreamOf = (n: number) => `http://192.0.2.10:${9000 + n}`;
+const upstreamOfTrip = (tripId: string) => upstreamOf(Number(tripId.slice(-3)));
+
 // A trip whose route is ready by BOTH lookups: it has a host and upstream (by-host) and a succeeded job with a private_url (by trip id).
 async function seed(tripKey: string | null): Promise<{ tripId: string; host: string; routeRef: string }> {
   counter += 1;
@@ -47,9 +51,9 @@ async function seed(tripKey: string | null): Promise<{ tripId: string; host: str
   tripIds.push(tripId);
   await pool.query("INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ($1,$2,'ready_private')", [tripId, `trip-key-${suffix}-${n}`]);
   if (tripKey === null) {
-    await pool.query("INSERT INTO control_plane.runtime_routes(trip_id, route_ref, state, public_host, upstream_url) VALUES ($1,$2,'ready',$3,'http://192.0.2.10:8080')", [tripId, routeRef, host]);
+    await pool.query("INSERT INTO control_plane.runtime_routes(trip_id, route_ref, state, public_host, upstream_url) VALUES ($1,$2,'ready',$3,$4)", [tripId, routeRef, host, upstreamOf(counter)]);
   } else {
-    await pool.query("INSERT INTO control_plane.runtime_routes(trip_id, route_ref, state, public_host, upstream_url, trip_key) VALUES ($1,$2,'ready',$3,'http://192.0.2.10:8080',$4)", [tripId, routeRef, host, tripKey]);
+    await pool.query("INSERT INTO control_plane.runtime_routes(trip_id, route_ref, state, public_host, upstream_url, trip_key) VALUES ($1,$2,'ready',$3,$4,$5)", [tripId, routeRef, host, upstreamOf(counter), tripKey]);
   }
   const planId = `plan_${suffix}k${n}`, jobId = `job_${suffix}k${n}`;
   planIds.push(planId); jobIds.push(jobId);
@@ -97,10 +101,10 @@ test("AC-K2.2: both lookups return tripKey, shared and derived, and only behind 
       assert.equal(byId.json().tripKey, kind, "by trip id");
       // AC-R1.11: with an allow-list and a registered upstream_url, the by-trip-ID answer is the LAN origin the route registered
       // (this row has both), not the job's private_url (http://trip.internal) - which stays what a browser is sent to.
-      assert.deepEqual(byId.json(), { routeRef: trip.routeRef, upstreamOrigin: "http://192.0.2.10:8080", upstreamBasePath: "", tripKey: kind });
+      assert.deepEqual(byId.json(), { routeRef: trip.routeRef, upstreamOrigin: upstreamOfTrip(trip.tripId), upstreamBasePath: "", tripKey: kind });
       const byHost = await app.inject({ method: "GET", url: `/internal/runtime-routes/by-host/${trip.host}`, headers: KEY });
       assert.equal(byHost.statusCode, 200);
-      assert.deepEqual(byHost.json(), { tripId: trip.tripId, routeRef: trip.routeRef, upstreamOrigin: "http://192.0.2.10:8080", tripKey: kind }, "by host");
+      assert.deepEqual(byHost.json(), { tripId: trip.tripId, routeRef: trip.routeRef, upstreamOrigin: upstreamOfTrip(trip.tripId), tripKey: kind }, "by host");
       for (const url of [`/internal/runtime-routes/${trip.tripId}`, `/internal/runtime-routes/by-host/${trip.host}`]) {
         for (const headers of [{}, { "x-api-key": "wrong" }]) {
           const refused = await app.inject({ method: "GET", url, headers });

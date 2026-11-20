@@ -47,7 +47,8 @@ async function seedRoute(opts: { host?: string | null; upstream?: string | null;
   await pool.query("INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ($1,$2,'ready_private')", [tripId, `host-route-${suffix}-${counter}`]);
   await pool.query(
     "INSERT INTO control_plane.runtime_routes(trip_id, route_ref, state, public_host, upstream_url) VALUES ($1,$2,$3,$4,$5)",
-    [tripId, routeRef, opts.state ?? "ready", opts.host ?? null, opts.upstream === undefined ? "http://192.0.2.10:8080" : opts.upstream]);
+    [tripId, routeRef, opts.state ?? "ready", opts.host ?? null, opts.upstream === undefined ? `http://192.0.2.10:${9000 + counter}` : opts.upstream]);
+  // Each seeded route has its own address by default: two ready routes on one address are refused (F2).
   return { tripId, routeRef };
 }
 
@@ -73,7 +74,7 @@ test("AC-R1.2: a ready route is returned as { tripId, routeRef, upstreamOrigin }
     const { tripId, routeRef } = await seedRoute({ host });
     const response = await get(app, `/internal/runtime-routes/by-host/${host}`);
     assert.equal(response.statusCode, 200);
-    assert.deepEqual(response.json(), { tripId, routeRef, upstreamOrigin: "http://192.0.2.10:8080", tripKey: "shared" }); // AC-K2.2 added tripKey; a row seeded with no key kind holds the shared one
+    assert.deepEqual(response.json(), { tripId, routeRef, upstreamOrigin: `http://192.0.2.10:${9000 + counter}`, tripKey: "shared" }); // AC-K2.2 added tripKey; a row seeded with no key kind holds the shared one
     // The name is matched case-insensitively (the gateway lowercases, so this only protects a hand-made call).
     assert.equal((await get(app, `/internal/runtime-routes/by-host/${host.toUpperCase()}`)).statusCode, 200);
     for (const headers of [{}, { "x-api-key": "wrong" }, { "x-api-key": "exchange-key-and-more" }]) {
@@ -186,7 +187,7 @@ test("AC-R1.3: the per-trip-id endpoint is unchanged, and by-host and :tripId ca
 
 // AC-R1.11: the by-trip-ID answer is where the gateway SENDS a trip's calls. A wildcard trip's private_url is its
 // public name; its registered LAN upstream is what the gateway has to use (owner review of #599, F1).
-test("AC-R1.11: with an allow-list, the by-trip-ID answer is the registered LAN origin, validated like the by-host one; without one, or without upstream_url, it is the private_url one", { skip }, async () => {
+test("AC-R1.11: with an allow-list, the by-trip-ID answer is the registered LAN origin, validated like the by-host one; a registered origin with no list is refused; without upstream_url it is the private_url one", { skip }, async () => {
   const planId = `plan_${suffix}q`, releaseId = `rls_${suffix}q`, jobIds: string[] = [];
   await pool.query("INSERT INTO control_plane.releases(id, source_revision, artifact_digest, application_schema, data_schema_min, data_schema_max, status, promoted_to_available_at, promoted_by) VALUES ($1,$2,$3,1,1,1,'available',now(),'test:fixture')", [releaseId, hex.slice(0, 40), `sha256:${hex}`]);
   const withJob = async (upstream: string | null, privateUrl: string, tripKey = "shared") => {
@@ -206,16 +207,22 @@ test("AC-R1.11: with an allow-list, the by-trip-ID answer is the registered LAN 
     const empty = buildApp(profile, { portal: portalDeps(pool, []) });
     try {
       // A list and a registered LAN upstream: the LAN origin, no base path, the key kind untouched; private_url is not echoed.
-      const lan = await withJob("http://192.0.2.10:8080", `${publicUrl}/base`, "derived");
+      const lan = await withJob("http://192.0.2.10:8090", `${publicUrl}/base`, "derived");
       const answer = await get(listed, `/internal/runtime-routes/${lan.tripId}`);
       assert.equal(answer.statusCode, 200);
-      assert.deepEqual(answer.json(), { routeRef: lan.routeRef, upstreamOrigin: "http://192.0.2.10:8080", upstreamBasePath: "", tripKey: "derived" });
+      assert.deepEqual(answer.json(), { routeRef: lan.routeRef, upstreamOrigin: "http://192.0.2.10:8090", upstreamBasePath: "", tripKey: "derived" });
       assert.doesNotMatch(answer.body, /wild\.internal/);
-      // No list (absent or empty): today's answer, from the private_url, whatever upstream_url holds.
+      // No list (absent or empty) and a registered upstream: refused, never the public URL (boundary review F4).
       for (const app of [unlisted, empty]) {
-        const old = await get(app, `/internal/runtime-routes/${lan.tripId}`);
-        assert.equal(old.statusCode, 200);
-        assert.deepEqual(old.json(), { routeRef: lan.routeRef, upstreamOrigin: publicUrl, upstreamBasePath: "/base", tripKey: "derived" });
+        const refused = await get(app, `/internal/runtime-routes/${lan.tripId}`);
+        assert.equal(refused.statusCode, 503);
+        assert.deepEqual(refused.json(), { error: "RUNTIME_ROUTE_INVALID" });
+        assert.doesNotMatch(refused.body, /192\.0\.2|wild/);
+      }
+      // No list and no upstream_url (a host-routed trip, or a row written before R2): today's answer.
+      const hostTrip = await withJob(null, `${publicUrl}/base`);
+      for (const app of [unlisted, empty]) {
+        assert.deepEqual((await get(app, `/internal/runtime-routes/${hostTrip.tripId}`)).json(), { routeRef: hostTrip.routeRef, upstreamOrigin: publicUrl, upstreamBasePath: "/base", tripKey: "shared" });
       }
       // A list but no upstream_url (a row written before R2): today's answer.
       const pre = await withJob(null, `${publicUrl}/base`);
@@ -228,6 +235,13 @@ test("AC-R1.11: with an allow-list, the by-trip-ID answer is the registered LAN 
         assert.deepEqual(refused.json(), { error: "RUNTIME_ROUTE_INVALID" }, name);
         assert.doesNotMatch(refused.body, /192\.0\.2|198\.51|wild/);
       }
+      // Another ready route on the same address: refused (F2), and answered again once the twin is gone.
+      const twin = await seedRoute({ host: `lan-twin-${suffix}.example.test`, upstream: "http://192.0.2.10:8090" });
+      const shared = await get(listed, `/internal/runtime-routes/${lan.tripId}`);
+      assert.equal(shared.statusCode, 503);
+      assert.deepEqual(shared.json(), { error: "RUNTIME_ROUTE_INVALID" });
+      await pool.query("UPDATE control_plane.runtime_routes SET upstream_url = NULL WHERE trip_id = $1", [twin.tripId]);
+      assert.equal((await get(listed, `/internal/runtime-routes/${lan.tripId}`)).statusCode, 200);
       // The key is still required.
       assert.equal((await get(listed, `/internal/runtime-routes/${lan.tripId}`, {})).statusCode, 401);
     } finally { await Promise.all([listed.close(), unlisted.close(), empty.close()]); }
@@ -236,6 +250,29 @@ test("AC-R1.11: with an allow-list, the by-trip-ID answer is the registered LAN 
     await pool.query("DELETE FROM control_plane.plans WHERE id LIKE $1", [`${planId}%`]);
     await pool.query("DELETE FROM control_plane.releases WHERE id = $1", [releaseId]);
   }
+});
+
+// Boundary review of #599 (2026-11-19, F2): one LAN address is one trip. Two ready routes on one address would send
+// one trip's visitors, and its key, to the other's container; neither is answered until the rows are fixed.
+test("F2: two ready routes on one LAN address are both refused by both lookups, and a suspended twin does not count", { skip }, async () => {
+  const app = buildApp(profile, { portal: portalDeps(pool, ["192.0.2.0/24"]) });
+  try {
+    const shared = "http://192.0.2.77:8080";
+    const a = await seedRoute({ host: `twin-a-${suffix}.example.test`, upstream: shared });
+    const b = await seedRoute({ host: `twin-b-${suffix}.example.test`, upstream: `${shared}/` }); // same origin, spelled with a slash
+    for (const host of [`twin-a-${suffix}.example.test`, `twin-b-${suffix}.example.test`]) {
+      const refused = await get(app, `/internal/runtime-routes/by-host/${host}`);
+      assert.equal(refused.statusCode, 503, host);
+      assert.deepEqual(refused.json(), { error: "RUNTIME_ROUTE_INVALID" });
+      assert.doesNotMatch(refused.body, /192\.0\.2|trip_/);
+    }
+    // The by-trip lookup's shared case is in AC-R1.11's fixture: it needs a succeeded job.
+    // The twin is suspended: the address is one trip's again.
+    await pool.query("UPDATE control_plane.runtime_routes SET state = 'suspended' WHERE trip_id = $1", [b.tripId]);
+    const back = await get(app, `/internal/runtime-routes/by-host/twin-a-${suffix}.example.test`);
+    assert.equal(back.statusCode, 200);
+    assert.equal(back.json().tripId, a.tripId);
+  } finally { await app.close(); }
 });
 
 test("upstreamHostAllowed: exact names, exact IPv4 and IPv4 CIDR; IPv6 and anything unlisted is refused", () => {

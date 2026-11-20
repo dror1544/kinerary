@@ -188,6 +188,9 @@ def topology_route(raw: Any) -> TripRoute | None:
 
 
 #: The two database objects that can refuse a route's hostname (migration runtime_route_hosts).
+#: The slug teardown gives a trip (scripts/teardown-trip.py: `retired-<slug>-<yyyymmdd>`, plus `-N` on a second
+#: teardown the same day). A POSIX regex for `~`; a slug that merely STARTS with "retired-" is a live trip's.
+_RETIRED_SLUG = r"^retired-.+-[0-9]{8}(-[0-9]+)?$"
 _PUBLIC_HOST_KEY = "runtime_routes_public_host_key"
 _PUBLIC_HOST_DNS = "runtime_routes_public_host_dns"
 
@@ -2023,7 +2026,53 @@ class ProvisionerWorker:
         # (AC-R1.11). So a host-routed trip, which its own proxy host still serves, records its name and NOT its
         # address - unless it was already moved behind the gateway (scripts/trip-route.py --set), in which case a
         # rebuild keeps it there and refreshes the address from the same topology that command reads.
-        wildcard = route.routing == "wildcard"
+        upstream: str | None = None
+
+        def behind_gateway_upstream() -> str | None:
+            """The upstream_url this write records: the route's for a wildcard trip or one already behind the gateway,
+            None otherwise. One LAN address is one trip (boundary review of #599, F2): another trip's row that holds
+            the same address and is not in use gives it up; one that is in use refuses the write, because the gateway
+            would send this trip's visitors - and its key - to that trip's container."""
+            with conn.transaction():
+                if route.routing != "wildcard":
+                    cur.execute("SELECT upstream_url FROM control_plane.runtime_routes WHERE trip_id = %s", (trip_id,))
+                    found = cur.fetchone()
+                    had = (found["upstream_url"] if isinstance(found, Mapping) else found[0]) if found else None
+                    if not had:
+                        return None
+                cur.execute(
+                    """
+                    UPDATE control_plane.runtime_routes r
+                    SET    upstream_url = NULL, updated_at = now()
+                    FROM   control_plane.trips t
+                    WHERE  t.id = r.trip_id AND r.trip_id <> %s AND r.upstream_url = %s
+                      AND  (r.state <> 'ready' OR t.slug ~ %s)
+                    RETURNING r.trip_id
+                    """,
+                    (trip_id, route.upstream_url, _RETIRED_SLUG),
+                )
+                for row in cur.fetchall():
+                    logger.warning(log_fields(
+                        "provisioner.route_upstream_released", trip_id=trip_id,
+                        released_from_trip_id=row["trip_id"] if isinstance(row, Mapping) else row[0],
+                        effect="the other trip's route row no longer names this address",
+                    ))
+                cur.execute(
+                    "SELECT trip_id FROM control_plane.runtime_routes WHERE upstream_url = %s AND trip_id <> %s LIMIT 1",
+                    (route.upstream_url, trip_id),
+                )
+                holder = cur.fetchone()
+            if holder is not None:
+                other = holder["trip_id"] if isinstance(holder, Mapping) else holder[0]
+                message = log_fields(
+                    "provisioner.route_upstream_refused", trip_id=trip_id, conflicting_trip_id=other,
+                    reason="upstream_in_use",
+                    effect="another trip's live route has this LAN address; the job fails instead of routing "
+                           "this trip's name to that trip's container (check both topology.yaml files)",
+                )
+                logger.warning(message)
+                raise RouteHostError("ROUTE_UPSTREAM_IN_USE", message)
+            return route.upstream_url
 
         def write_hosts() -> None:
             with conn.transaction():  # a savepoint: a refused statement leaves the outer transaction usable
@@ -2031,18 +2080,17 @@ class ProvisionerWorker:
                     """
                     INSERT INTO control_plane.runtime_routes
                       (trip_id, route_ref, state, public_host, upstream_url)
-                    VALUES (%s, %s, 'ready', %s, CASE WHEN %s THEN %s END)
+                    VALUES (%s, %s, 'ready', %s, %s)
                     ON CONFLICT (trip_id) DO UPDATE
                     SET state = 'ready', public_host = excluded.public_host,
-                        upstream_url = CASE WHEN %s OR runtime_routes.upstream_url IS NOT NULL THEN %s END,
-                        updated_at = now()
+                        upstream_url = excluded.upstream_url, updated_at = now()
                     """,
-                    (trip_id, _generate_route_id(), route.public_host, wildcard, route.upstream_url,
-                     wildcard, route.upstream_url),
+                    (trip_id, _generate_route_id(), route.public_host, upstream),
                 )
 
         try:
             try:
+                upstream = behind_gateway_upstream()
                 write_hosts()
             except psycopg.errors.UniqueViolation as exc:
                 if _violated_constraint(exc) != _PUBLIC_HOST_KEY:
@@ -2076,9 +2124,10 @@ class ProvisionerWorker:
     ) -> bool:
         """Clears `public_host` and `upstream_url` on every OTHER trip's row that holds this hostname and is not
         in use: its route is not `ready` (suspended or pending: the gateway does not answer it), or its trip was
-        retired (teardown renames the slug `retired-...`, which is the only way a trip is marked torn down; its
-        lifecycle_state keeps whatever it had). A `ready` route of a trip that is not retired is in use, and
-        anything this cannot tell is treated as in use. Returns whether any row was released.
+        retired (teardown renames the slug `retired-<slug>-<yyyymmdd>[-N]`, which is the only way a trip is marked
+        torn down; its lifecycle_state keeps whatever it had). The whole shape is matched, not the prefix: a trip
+        to "Retired in Lisbon" is `retired-in-lisbon-2026` and is not torn down (boundary review of #599, F6). A
+        `ready` route of a trip that is not retired is in use, and anything this cannot tell is treated as in use. Returns whether any row was released.
 
         Inside the caller's transaction, so the clear stands or falls with the write that follows it. The log line
         carries both trip ids and never the hostname or an address."""
@@ -2089,10 +2138,10 @@ class ProvisionerWorker:
                 SET    public_host = NULL, upstream_url = NULL, updated_at = now()
                 FROM   control_plane.trips t
                 WHERE  t.id = r.trip_id AND r.trip_id <> %s AND r.public_host = %s
-                  AND  (r.state <> 'ready' OR t.slug LIKE 'retired-%%')
-                RETURNING r.trip_id, r.state, (t.slug LIKE 'retired-%%') AS retired
+                  AND  (r.state <> 'ready' OR t.slug ~ %s)
+                RETURNING r.trip_id, r.state, (t.slug ~ %s) AS retired
                 """,
-                (trip_id, public_host),
+                (trip_id, public_host, _RETIRED_SLUG, _RETIRED_SLUG),
             )
             released = cur.fetchall()
         for row in released:

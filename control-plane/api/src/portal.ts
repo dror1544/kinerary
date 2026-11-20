@@ -28,7 +28,7 @@ import {
   type SessionScope,
 } from "./portal-scope.js";
 import { verifyMiniAppInitData, type VerifiedInitData } from "./telegram-webapp-auth.js";
-import { runtimeUpstreamFor, upstreamHostAllowed } from "./runtime-upstream.js";
+import { runtimeUpstreamFor, UPSTREAM_SHARED_SQL, upstreamHostAllowed } from "./runtime-upstream.js";
 
 export { upstreamHostAllowed };
 
@@ -1945,11 +1945,12 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
 
   // The by-trip-ID lookup answers where the gateway SENDS a trip's calls (session exchange, participant
   // provisioning, session checks), not where a browser goes. A wildcard trip's private_url is its PUBLIC
-  // hostname, which host mode answers 404 for /api/internal/* - so when the operator has an upstream
-  // allow-list and the route row registered a LAN upstream_url, that LAN origin is the answer, validated by
-  // the same upstreamHostAllowed the by-host lookup uses. A registered upstream that is not on the list is
-  // RUNTIME_ROUTE_INVALID, never a fall-back to the public URL. With no list, or no upstream_url (every row
-  // written before R2), the answer is the private_url one it always was. private_url itself is untouched.
+  // hostname, which host mode answers 404 for /api/internal/* - so when the route row registered a LAN
+  // upstream_url, that LAN origin is the answer, validated by the same
+  // upstreamHostAllowed the by-host lookup uses. A registered upstream that is not on the list, any upstream
+  // when there is no list, and one another ready route shares, are RUNTIME_ROUTE_INVALID - never a fall-back
+  // to the public URL. With no upstream_url (every row written before R2, every host-routed trip's) the answer
+  // is the private_url one it always was. private_url itself is untouched.
   app.get("/internal/runtime-routes/:tripId", async (request, reply) => {
     if (!exchangeKeyMatches(request.headers["x-api-key"], deps.runtimeExchangeKey)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
     const tripId = (request.params as { tripId?: string }).tripId ?? "";
@@ -1971,11 +1972,15 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     const notReady = () => reply.code(404).send({ error: "RUNTIME_NOT_READY" });
     const host = String((request.params as { host?: string }).host ?? "").toLowerCase();
     if (host.length > 253 || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(host)) return notReady();
-    const result = await deps.db.query<{ trip_id: string; route_ref: string; upstream_url: string; trip_key: string }>(
-      `SELECT trip_id, route_ref, upstream_url, trip_key FROM control_plane.runtime_routes
-       WHERE public_host = $1 AND state = 'ready' AND upstream_url IS NOT NULL`, [host]);
+    const result = await deps.db.query<{ trip_id: string; route_ref: string; upstream_url: string; trip_key: string; shared: boolean }>(
+      `SELECT r.trip_id, r.route_ref, r.upstream_url, r.trip_key, ${UPSTREAM_SHARED_SQL} AS shared
+       FROM control_plane.runtime_routes r
+       WHERE r.public_host = $1 AND r.state = 'ready' AND r.upstream_url IS NOT NULL`, [host]);
     const row = result.rows[0];
     if (!row) return notReady();
+    // One LAN address, one trip: two ready routes on one address send each other's visitors (and keys) to one
+    // container, so neither is answered until an operator fixes the rows (boundary review of #599, F2).
+    if (row.shared) return reply.code(503).send({ error: "RUNTIME_ROUTE_INVALID" });
     let upstream: URL;
     try { upstream = new URL(row.upstream_url); } catch { return reply.code(503).send({ error: "RUNTIME_ROUTE_INVALID" }); }
     if (!["http:", "https:"].includes(upstream.protocol) || upstream.username || upstream.password || upstream.pathname !== "/"

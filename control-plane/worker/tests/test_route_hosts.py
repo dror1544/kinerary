@@ -217,7 +217,7 @@ class _Cursor:
     def execute(self, sql: str, params: Any = None) -> None:
         self.statements.append(" ".join(sql.split()))
         if self._fail_on and self._fail_on in sql:
-            raise psycopg.errors.UndefinedColumn("column \"public_host\" does not exist")
+            raise psycopg.errors.UndefinedColumn(f"column \"{self._fail_on}\" does not exist")
 
 
 class _Conn:
@@ -255,16 +255,19 @@ class HostnameAlreadyHeldByAnotherTrip(unittest.TestCase):
         self.conn.commit()
         teardown_fixture(self.conn, self.fix)
 
-    def _seed_other(self, *, state: str = "ready", retired: bool = False, host: str = HOST_ROUTE.public_host) -> None:
+    def _seed_other(self, *, state: str = "ready", retired: bool = False, host: str | None = HOST_ROUTE.public_host,
+                    upstream: str = OTHER_UPSTREAM, slug: str | None = None) -> None:
         self.conn.rollback()
+        # A retired trip's slug is the shape teardown gives it: retired-<slug>-<yyyymmdd>.
+        slug = slug or (f"retired-other-{self.other_trip[-8:]}-20261119" if retired else f"other-{self.other_trip[-8:]}")
         self.conn.execute(
             "INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES (%s, %s, 'ready_private')",
-            (self.other_trip, f"{'retired-' if retired else ''}other-{self.other_trip[-8:]}"),
+            (self.other_trip, slug),
         )
         self.conn.execute(
             "INSERT INTO control_plane.runtime_routes(trip_id, route_ref, state, public_host, upstream_url) "
             "VALUES (%s, %s, %s, %s, %s)",
-            (self.other_trip, f"route_other{os.urandom(5).hex()}", state, host, OTHER_UPSTREAM),
+            (self.other_trip, f"route_other{os.urandom(5).hex()}", state, host, upstream),
         )
         self.conn.commit()
 
@@ -380,6 +383,56 @@ class HostnameAlreadyHeldByAnotherTrip(unittest.TestCase):
         self.assertEqual(HOST_ROUTE.public_host, self._row(self.other_trip)["public_host"])
         self._assert_no_address(lines)
 
+    def test_a_live_trip_whose_slug_merely_starts_with_retired_keeps_its_name(self) -> None:
+        # Boundary review of #599 (2026-11-19, F6): a trip to "Retired in Lisbon" is not a torn-down trip.
+        self._seed_other(state="ready", slug=f"retired-in-lisbon-2026-{self.other_trip[-6:]}")
+        lines = self._run(WILDCARD_ROUTE)
+        self.assertNotEqual("succeeded", self._job_state())
+        self.assertEqual((HOST_ROUTE.public_host, OTHER_UPSTREAM),
+                         (self._row(self.other_trip)["public_host"], self._row(self.other_trip)["upstream_url"]))
+        self.assertFalse(any("route_host_released" in line for line in lines), lines)
+
+    # -- one LAN address, one trip (boundary review of #599, 2026-11-19, F2) -------------------------------------------
+
+    def test_a_wildcard_trip_whose_address_a_live_trip_holds_fails_naming_that_trip(self) -> None:
+        self._seed_other(state="ready", host="someone-else.example.invalid", upstream=WILDCARD_ROUTE.upstream_url)
+        lines = self._run(WILDCARD_ROUTE)
+        self.assertNotEqual("ready_private", self._trip_state())
+        self.assertNotEqual("succeeded", self._job_state())
+        self.assertIsNone(self._row(self.fix["trip_id"]), "no half-written route behind the failure")
+        refused = [line for line in lines if line.startswith(f"WARNING:{LOGGER}:provisioner.route_upstream_refused")]
+        self.assertEqual(1, len(refused), lines)
+        self.assertIn(self.other_trip, refused[0])
+        self.assertEqual(WILDCARD_ROUTE.upstream_url, self._row(self.other_trip)["upstream_url"], "the live trip is untouched")
+        self._assert_no_address(lines)
+
+    def test_the_address_refusal_is_a_code_a_job_can_keep(self) -> None:
+        self._seed_other(state="ready", host="someone-else.example.invalid", upstream=WILDCARD_ROUTE.upstream_url)
+        worker = ProvisionerWorker(db_url=DB_URL, deploy=RoutedDeploy(None), worker_id="test-routes")
+        with psycopg.connect(DB_URL, row_factory=dict_row) as conn, self.assertRaises(RouteHostError) as caught:
+            with conn.transaction(), conn.cursor() as cur:
+                worker._register_runtime_route(conn, cur, self.fix["trip_id"], WILDCARD_ROUTE)
+        self.assertEqual("ROUTE_UPSTREAM_IN_USE", caught.exception.safe_error_code)
+        self.assertNotIn(WILDCARD_ROUTE.upstream_url, str(caught.exception))
+
+    def test_an_address_a_suspended_or_retired_row_holds_is_released_and_the_write_goes_through(self) -> None:
+        for kwargs in ({"state": "suspended"}, {"state": "ready", "retired": True}):
+            with self.subTest(**kwargs):
+                self.tearDown(); self.setUp()
+                self._seed_other(host="someone-else.example.invalid", upstream=WILDCARD_ROUTE.upstream_url, **kwargs)
+                lines = self._run(WILDCARD_ROUTE)
+                self.assertEqual("succeeded", self._job_state(), lines)
+                self.assertEqual(WILDCARD_ROUTE.upstream_url, self._row(self.fix["trip_id"])["upstream_url"])
+                self.assertIsNone(self._row(self.other_trip)["upstream_url"])
+                self.assertTrue(any("provisioner.route_upstream_released" in line for line in lines), lines)
+
+    def test_a_host_trip_off_the_gateway_records_no_address_so_shares_none(self) -> None:
+        self._seed_other(state="ready", host="someone-else.example.invalid", upstream=HOST_ROUTE.upstream_url)
+        self._run(HOST_ROUTE)
+        self.assertEqual("succeeded", self._job_state())
+        self.assertIsNone(self._row(self.fix["trip_id"])["upstream_url"])
+        self.assertEqual(HOST_ROUTE.upstream_url, self._row(self.other_trip)["upstream_url"])
+
     def test_the_wildcard_refusal_carries_a_code_a_job_can_keep_and_no_database_text(self) -> None:
         self._seed_other(state="ready")
         worker = ProvisionerWorker(db_url=DB_URL, deploy=RoutedDeploy(None), worker_id="test-routes")
@@ -447,7 +500,7 @@ class SchemaWithoutTheColumns(unittest.TestCase):
             return ProvisionerWorker()
 
     def test_a_host_trip_falls_back_to_the_old_row_and_says_so(self) -> None:
-        cur = _Cursor(fail_on="public_host")
+        cur = _Cursor(fail_on="upstream_url")
         with self.assertLogs("control_plane_worker.provisioner", level=logging.WARNING) as logs:
             self._worker()._register_runtime_route(_Conn(), cur, "trip_x", HOST_ROUTE)
         self.assertEqual(2, len(cur.statements))
@@ -456,7 +509,7 @@ class SchemaWithoutTheColumns(unittest.TestCase):
         self.assertIn("route_hosts_not_recorded", logs.output[0])
 
     def test_a_wildcard_trip_fails_instead_of_finishing_unrouted(self) -> None:
-        cur = _Cursor(fail_on="public_host")
+        cur = _Cursor(fail_on="upstream_url")
         with self.assertRaises(psycopg.errors.UndefinedColumn):
             self._worker()._register_runtime_route(_Conn(), cur, "trip_x", WILDCARD_ROUTE)
         self.assertEqual(1, len(cur.statements), "no old-style row written behind the failure")
