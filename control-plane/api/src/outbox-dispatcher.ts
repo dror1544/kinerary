@@ -3,7 +3,7 @@ import type { NotificationAdapter } from "./signup.js";
 import { structuredLog } from "./redaction.js";
 import { organizerIntroMessages, type IntroMessage, type ProactiveSettings } from "./companion-intro.js";
 import { issueGroupBindingToken } from "./group-binding.js";
-import { SIGN_IN_NOTICE_TYPE, signInNoticeText } from "./telegram-mini-app.js";
+import { GROUP_CLAIM_LINK_KIND, SIGN_IN_NOTICE_TYPE, groupClaimNoticeText, signInNoticeText } from "./telegram-mini-app.js";
 import { confirmAudience, skippedLine } from "./trip-audience.js";
 import { renderPlanChangeLine, type PlanChange } from "./plan-change-line.js";
 
@@ -130,6 +130,8 @@ function messageTextFor(row: OutboxRow, options?: DispatchOptions): string | Int
   if (row.notification_type === SIGN_IN_NOTICE_TYPE) {
     // About an account, not a trip (trip_id is NULL). Wording lives with the
     // sign-in code that queues it.
+    // A group claim (docs/specs/sprint-9/x-member-sign-in.md, AC-7) tells the organizers in the trip's language.
+    if (payloadString(row, "link_kind") === GROUP_CLAIM_LINK_KIND) return groupClaimNoticeText(row.payload);
     return signInNoticeText({
       accountName: payloadString(row, "account_name") ?? "your account",
       linkKind: payloadString(row, "link_kind") === "member" ? "member" : "organizer",

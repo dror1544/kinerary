@@ -259,6 +259,39 @@ async function participantExists(req, res, tripId, runtimeUsername) {
   res.end(payload);
 }
 
+// ADOPT and RELEASE: bind a control-plane user to an EXISTING participant of the trip site, and end that binding (group
+// sign-in's claim and its release; the personal invite for an existing traveller reuses them). Same key as the rest of
+// /internal/t/..., and the body is forwarded untouched with the trip id in it, as `provisionParticipant` does.
+async function bindingAction(req, res, tripId, action) {
+  if (!sameKey(req.headers["x-api-key"])) return json(res, 401, { error: "AUTHENTICATION_REQUIRED" });
+  if (!/^trip_[A-Za-z0-9]{8,64}$/.test(tripId)) return json(res, 404, { error: "NOT_FOUND" });
+  const route = await routeFor(tripId);
+  const body = await readJson(req);
+  if (body.tripId !== tripId) return json(res, 400, { error: "INVALID_REQUEST" });
+  const response = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants/${action}`, {
+    method: "POST", headers: { "content-type": "application/json", "x-api-key": EXCHANGE_KEY }, body: JSON.stringify(body),
+  });
+  const payload = await response.text();
+  res.writeHead(response.status, { "content-type": "application/json", "cache-control": "no-store" });
+  res.end(payload);
+}
+
+// The trip site's participants (username, display name, role), for the control plane's group sign-in: who a person in
+// the trip's Telegram group may pick as themselves. Behind the same key as the lookup above, and the trip site checks
+// that key and the trip id again (the id travels in a header on a GET, as for `participantExists`). The body is the
+// trip site's own three-field list, passed through untouched.
+async function listParticipants(req, res, tripId) {
+  if (!sameKey(req.headers["x-api-key"])) return json(res, 401, { error: "AUTHENTICATION_REQUIRED" });
+  if (!/^trip_[A-Za-z0-9]{8,64}$/.test(tripId)) return json(res, 404, { error: "NOT_FOUND" });
+  const route = await routeFor(tripId);
+  const response = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants`, {
+    method: "GET", headers: { "x-api-key": EXCHANGE_KEY, "x-control-plane-trip-id": tripId },
+  });
+  const payload = await response.text();
+  res.writeHead(response.status, { "content-type": "application/json", "cache-control": "no-store" });
+  res.end(payload);
+}
+
 // Ask again while a stream is open, at half the cache window so a revocation
 // is seen within one window after the cached "live" runs out (30 s + 15 s with
 // the defaults). A negative answer, an outage and a hung control plane all end
@@ -321,6 +354,9 @@ export function createRuntimeGateway() {
       if (url.pathname === "/health") return json(res, 200, { ok: true });
       const internal = url.pathname.match(/^\/internal\/t\/([^/]+)\/participants$/);
       if (internal && req.method === "POST") return await provisionParticipant(req, res, decodeURIComponent(internal[1]));
+      if (internal && req.method === "GET") return await listParticipants(req, res, decodeURIComponent(internal[1]));
+      const binding = url.pathname.match(/^\/internal\/t\/([^/]+)\/participants\/(adopt|release)$/);
+      if (binding && req.method === "POST") return await bindingAction(req, res, decodeURIComponent(binding[1]), binding[2]);
       const internalParticipant = url.pathname.match(/^\/internal\/t\/([^/]+)\/participants\/([^/]+)$/);
       if (internalParticipant && req.method === "GET") return await participantExists(req, res, decodeURIComponent(internalParticipant[1]), decodeURIComponent(internalParticipant[2]));
       const match = url.pathname.match(/^\/t\/([^/]+)(\/.*)?$/);

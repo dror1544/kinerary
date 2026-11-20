@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 let upstream, controlPlane, gateway;
 let upstreamOrigin, gatewayOrigin;
 let proxiedAuthorization;
+let participantListCalls = 0, participantListHeaders;
+const bindingCalls = [];
 let eventStreamClosed = false;
 const sessionBodies = [];
 const consumed = new Set();
@@ -48,6 +50,17 @@ before(async () => {
       sessionBodies.push(await body(req));
       res.setHeader("content-type", "application/json");
       return res.end(JSON.stringify({ token: "runtime-jwt" }));
+    }
+    if (req.url === "/api/internal/control-plane/participants/adopt" || req.url === "/api/internal/control-plane/participants/release") {
+      bindingCalls.push({ url: req.url, method: req.method, key: req.headers["x-api-key"], body: await body(req) });
+      res.setHeader("content-type", "application/json");
+      return res.end(JSON.stringify({ ok: true }));
+    }
+    if (req.url === "/api/internal/control-plane/participants") {
+      participantListCalls += 1;
+      participantListHeaders = { "x-api-key": req.headers["x-api-key"], "x-control-plane-trip-id": req.headers["x-control-plane-trip-id"] };
+      res.setHeader("content-type", "application/json");
+      return res.end(JSON.stringify({ participants: [{ username: "bob", displayName: "Bob", role: "member" }] }));
     }
     if (req.url === "/api/internal/control-plane/participants/bob") {
       assert.equal(req.headers["x-api-key"], "exchange-key");
@@ -405,6 +418,42 @@ test("never serves a postMessage bootstrap or lets anything frame the trip", asy
 test("rejects trip paths without a valid gateway session", async () => {
   const response = await fetch(`${gatewayOrigin}/t/trip_abcdefgh/api/config`);
   assert.equal(response.status, 401);
+});
+
+test("forwards the participant list for group sign-in, behind the same key, with the trip's id as the trip site expects it", async () => {
+  const response = await fetch(`${gatewayOrigin}/internal/t/trip_abcdefgh/participants`, { headers: { "x-api-key": "exchange-key" } });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { participants: [{ username: "bob", displayName: "Bob", role: "member" }] });
+  assert.deepEqual(participantListHeaders, { "x-api-key": "exchange-key", "x-control-plane-trip-id": "trip_abcdefgh" });
+});
+
+test("the participant list is refused without the key, with a wrong key, and for a malformed trip id; nothing is forwarded", async () => {
+  const before = participantListCalls;
+  for (const headers of [{}, { "x-api-key": "wrong" }, { "x-api-key": "" }]) {
+    const response = await fetch(`${gatewayOrigin}/internal/t/trip_abcdefgh/participants`, { headers });
+    assert.equal(response.status, 401);
+    assert.deepEqual(await response.json(), { error: "AUTHENTICATION_REQUIRED" });
+  }
+  const malformed = await fetch(`${gatewayOrigin}/internal/t/not-a-trip/participants`, { headers: { "x-api-key": "exchange-key" } });
+  assert.equal(malformed.status, 404);
+  assert.equal(participantListCalls, before, "no request reached the trip site");
+  // the cookie-bearing trip surface does not serve it either
+  const viaTrip = await fetch(`${gatewayOrigin}/t/trip_abcdefgh/api/internal/control-plane/participants`, { headers: { "x-api-key": "exchange-key" } });
+  assert.equal(viaTrip.status, 404);
+});
+
+test("adopt and release (a claim's binding on the trip site) are forwarded with the gateway's own key and the body untouched, and only behind the key", async () => {
+  const body = { tripId: "trip_abcdefgh", userId: "user_abcdefgh", runtimeUsername: "bob" };
+  for (const action of ["adopt", "release"]) {
+    const response = await fetch(`${gatewayOrigin}/internal/t/trip_abcdefgh/participants/${action}`, { method: "POST", headers: { "x-api-key": "exchange-key", "content-type": "application/json" }, body: JSON.stringify(body) });
+    assert.equal(response.status, 200);
+    assert.deepEqual(bindingCalls.at(-1), { url: `/api/internal/control-plane/participants/${action}`, method: "POST", key: "exchange-key", body });
+    const noKey = await fetch(`${gatewayOrigin}/internal/t/trip_abcdefgh/participants/${action}`, { method: "POST", headers: { "x-api-key": "wrong", "content-type": "application/json" }, body: JSON.stringify(body) });
+    assert.equal(noKey.status, 401);
+    const otherTrip = await fetch(`${gatewayOrigin}/internal/t/trip_abcdefgh/participants/${action}`, { method: "POST", headers: { "x-api-key": "exchange-key", "content-type": "application/json" }, body: JSON.stringify({ ...body, tripId: "trip_someoneelse1" }) });
+    assert.equal(otherTrip.status, 400);
+  }
+  assert.equal(bindingCalls.length, 2, "only the two well-formed, keyed requests reached the trip site");
 });
 
 test("forwards internal participant existence checks", async () => {

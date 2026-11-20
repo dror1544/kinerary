@@ -84,6 +84,8 @@ export const PORTAL_SCOPE_POLICY: Readonly<Record<string, RouteScope>> = Object.
   "POST /v1/auth/password/forgot": "open",
   "POST /v1/auth/password/reset": "open",
   "POST /v1/auth/telegram-mini-app": "open",
+  // Group sign-in (docs/specs/sprint-9/x-member-sign-in.md, S1). The signed initData is the whole authority; no session is read.
+  "POST /v1/mini-app/claim": "open",
   // Sign in with Google (ID token). Never reads the session cookie: the signed token is the whole authority.
   "POST /v1/auth/google": "open",
   // The single-use nonce for it: sets a random cookie and returns its hash. Reads no session.
@@ -115,6 +117,10 @@ export const PORTAL_SCOPE_POLICY: Readonly<Record<string, RouteScope>> = Object.
 
   "GET /v1/trips/:id": "trip",
   "GET /v1/trips/:id/interview-link": "trip",
+  // The organizers' list of group claims. The handler itself answers 404 to anyone who is not an organizer with dashboard access.
+  "GET /v1/trips/:id/member-claims": "trip",
+  // Releasing a claim takes a way in from another person, like removing a member: a password or Google sign-in only.
+  "DELETE /v1/trips/:id/member-claims/:claimId": "account",
   // These three MINT a way into the account: an interview link or a Telegram link redeemed by
   // another Telegram account becomes a link of its own, one that outlives the Unlink of the
   // session's own account (boundary review round 2, M1). They need a password or Google sign-in.

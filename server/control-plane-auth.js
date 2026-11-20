@@ -225,6 +225,48 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
     catch { return res.status(409).json({ error: 'IDENTITY_CONFLICT' }); }
     return res.json({ ok: true });
   });
+  // GROUP SIGN-IN (docs/specs/sprint-9/x-member-sign-in.md, slice S1): the control plane lets a person in the trip's
+  // Telegram group claim an EXISTING participant, and writes only its own rows. Without a binding here the session
+  // exchange answers IDENTITY_MISMATCH, so this is the other half of the claim. ONE mechanism, which the personal invite
+  // for an existing traveller (S2) reuses: ADOPT binds a control-plane user to a participant that already exists, and
+  // RELEASE ends that binding. Both sit behind `internal` exactly like the routes above (the dedicated exchange key, the
+  // trip id in the body, the identity manifest), so a family JWT, the agent key and the Hermes key get 401.
+  //
+  // ADOPT never creates a participant, never touches its role, password or data, and refuses an organizer, a secondary
+  // organizer and a name that is not a current participant (the same three tests the invite route applies). The
+  // control plane is the authority on who holds a traveller, and it holds a lock on the trip while it asks, so a binding
+  // already on this name that is NOT invite-bound is a leftover of a claim that ended without its release arriving
+  // (a site that was down): it is replaced. An invite-bound binding (invite_id set) or an owner's is never displaced:
+  // 409 IDENTITY_CONFLICT. RELEASE removes only the binding it is asked about (this user, this name, a member, no invite):
+  // it can never end an invited member's or an organizer's, and releasing twice is not an error. Removing the row is
+  // what makes a token already issued stop working (validManagedPayload reads it on every request).
+  app.post('/api/internal/control-plane/participants/adopt', internal, (req, res) => {
+    const { userId, runtimeUsername } = req.body || {};
+    if (!userIdValid(userId) || !usernameValid(runtimeUsername)) return res.status(400).json({ error: 'INVALID_REQUEST' });
+    if (!activeUser(runtimeUsername)) return res.status(404).json({ error: 'NOT_FOUND' });
+    if (!roleMatchesLocal('member', runtimeUsername) || isSecondaryUsername(runtimeUsername)) return res.status(403).json({ error: 'ORGANIZER_BINDING_FORBIDDEN' });
+    const onName = db.prepare('SELECT * FROM control_plane_identities WHERE username = ?').get(runtimeUsername);
+    if (onName && onName.user_id === userId && onName.trip_id === identity.tripId && onName.role === 'member') return res.json({ ok: true });
+    if (onName && (onName.role !== 'member' || onName.invite_id !== null || onName.trip_id !== identity.tripId)) return res.status(409).json({ error: 'IDENTITY_CONFLICT' });
+    const ofUser = find.get(userId, identity.tripId);
+    if (ofUser && ofUser.username !== runtimeUsername) return res.status(409).json({ error: 'IDENTITY_CONFLICT' });
+    try {
+      db.transaction(() => {
+        if (onName) db.prepare('DELETE FROM control_plane_identities WHERE user_id = ? AND trip_id = ?').run(onName.user_id, identity.tripId);
+        insert.run(userId, identity.tripId, runtimeUsername, 'member', null);
+      })();
+    } catch { return res.status(409).json({ error: 'IDENTITY_CONFLICT' }); }
+    return res.json({ ok: true });
+  });
+
+  app.post('/api/internal/control-plane/participants/release', internal, (req, res) => {
+    const { userId, runtimeUsername } = req.body || {};
+    if (!userIdValid(userId) || !usernameValid(runtimeUsername)) return res.status(400).json({ error: 'INVALID_REQUEST' });
+    const gone = db.prepare("DELETE FROM control_plane_identities WHERE user_id = ? AND trip_id = ? AND username = ? AND role = 'member' AND invite_id IS NULL")
+      .run(userId, identity.tripId, runtimeUsername);
+    return res.json({ ok: true, released: gone.changes > 0 });
+  });
+
   // Only for a managed session whose claim passed validManagedPayload on this
   // request (so the binding, the participant and the local organizer role were
   // all re-checked just now). A direct login, a member and the agent key have

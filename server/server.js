@@ -1242,6 +1242,29 @@ app.post('/api/ui-settings/hero', organizerOrAgentRequired, heroUpload.single('h
 });
 
 journey.registerRoutes(app, { authRequired, organizerOrAgentRequired, internal: controlPlaneAuth.internal });
+
+// Who is on this trip, for the control plane's group sign-in (docs/specs/sprint-9/x-member-sign-in.md, slice S1): the
+// control plane offers a Telegram person in the trip's group the travellers nobody has claimed, and needs to know
+// who they are and whether the site calls them a plain member. Behind `internal` and nothing else: the dedicated
+// exchange key the gateway holds, the trip id header, the identity manifest. A family member's JWT, the agent key and
+// the Hermes key all get 401, exactly as for the sibling routes in control-plane-auth.js.
+//
+// It does NOT go through sanitizeConfig() and is not a view of the config: it names three fields, written out here,
+// and nothing else of a participant (no telegram_id, no color, no family, no needs) can reach the response. `role`
+// is 'organizer' for every configured organizer and 'member' for everyone else; the control plane offers only
+// 'member' and treats any other word, or none, as not offered, so a participant this list cannot classify is never
+// the one it gets wrong.
+app.get('/api/internal/control-plane/participants', controlPlaneAuth.internal, (req, res) => {
+  const organizers = normalizeOrganizers(TRIP_CONFIG.agent);
+  const participants = (TRIP_CONFIG.participants || [])
+    .filter(p => p && typeof p.username === 'string' && getUser(p.username))
+    .map(p => ({
+      username: p.username,
+      displayName: typeof p.name === 'string' && p.name.trim() ? p.name.trim() : p.username,
+      role: organizers.includes(p.username) ? 'organizer' : 'member',
+    }));
+  res.json({ participants });
+});
 // GET /api/stops and the stop writes: organizer or agent only — provenance,
 // conflicts and history are never served to a member.
 tripStructure.registerRoutes(app, { organizerOrAgentRequired });

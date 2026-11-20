@@ -18,6 +18,7 @@ import { deleteWebhookIfPresent, startTelegramApprovalPoller } from "./telegram-
 import { GoogleIdTokenClient, HttpRuntimeAccountAdapter, type PortalDependencies } from "./portal.js";
 import { LogMailer, ResendMailer, type Mailer } from "./mailer.js";
 import { checkBotIdentity } from "./telegram-mini-app.js";
+import { groupMembershipChecker } from "./telegram-group-membership.js";
 import { createBotCheckRound, createMiniAppStatus, withMiniAppReadiness } from "./mini-app-status.js";
 
 const profilePath = process.env.CONTROL_PLANE_ARCHITECTURE_PROFILE;
@@ -179,6 +180,25 @@ if (profile.web) {
       }
     }
   }
+  // Group sign-in (docs/specs/sprint-9/x-member-sign-in.md, slice S1) asks Telegram whether a person is in a trip's
+  // group, so it needs a bot that IS in the group: the relay's (the companion lives in the group through it), which may
+  // or may not be the Mini App's bot, so it is read from the relay's own secret and never falls back to the Mini App's.
+  // UNSET IS A DOWNGRADE: without it the path does not exist whatever the per-trip switch says, and this is the line
+  // that says so. Only whether the two tokens are the same bot is logged, never a token.
+  let memberGroupSignIn: PortalDependencies["memberGroupSignIn"];
+  if (!profile.relay) {
+    miniAppLog(structuredLog("warn", "member_group_sign_in.unavailable", { reason: "no relay block, so no bot token for the group", effect: "member_group_sign_in does nothing even when switched on" }));
+  } else {
+    try {
+      const groupBotToken = await resolveSecretRef(profile.relay.telegram_bot_token_secret_ref);
+      memberGroupSignIn = { isActiveMember: groupMembershipChecker({ botToken: groupBotToken, apiRoot: telegramRoot, log: miniAppLog }) };
+      miniAppLog(structuredLog("info", "member_group_sign_in.wired", { same_bot_as_mini_app: telegramMiniApp ? telegramMiniApp.botToken === groupBotToken : null }));
+    } catch (error) {
+      miniAppLog(structuredLog("warn", "member_group_sign_in.unavailable", {
+        reason: "relay bot token unresolved", safe_error_code: error instanceof Error ? error.name : "UNKNOWN", effect: "member_group_sign_in does nothing even when switched on",
+      }));
+    }
+  }
   // Email for the portal's own sign-up and password reset. UNSET IS NOT SILENT: with no mailer the
   // routes answer 503 SIGN_UP_UNAVAILABLE and the page says sign-up is not open yet, and this is the
   // one line that tells whoever reads the boot log why.
@@ -195,7 +215,7 @@ if (profile.web) {
       miniAppLog(structuredLog("error", "email_auth.key_unresolved", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN", effect: "sign-up and password reset answer 503 SIGN_UP_UNAVAILABLE" }));
     }
   }
-  portal = { db: pool, google, telegramMiniApp, mailer, emailAuthLog: miniAppLog, runtimeAccounts: new HttpRuntimeAccountAdapter(profile.web.runtime_origin, runtimeExchangeKey), publicOrigin: profile.web.public_origin, runtimeOrigin: profile.web.runtime_origin, runtimeExchangeKey, runtimeUpstreamHostSuffixes: profile.web.runtime_upstream_host_suffixes, telegramBotUsername: profile.web.telegram_bot_username, sessionTtlSeconds: profile.web.session_ttl_seconds, enrollmentTtlSeconds: profile.signup?.enrollment_ttl_seconds ?? 86400, approvalTtlSeconds: 86400, operatorChatId };
+  portal = { db: pool, google, telegramMiniApp, memberGroupSignIn, mailer, emailAuthLog: miniAppLog, runtimeAccounts: new HttpRuntimeAccountAdapter(profile.web.runtime_origin, runtimeExchangeKey), publicOrigin: profile.web.public_origin, runtimeOrigin: profile.web.runtime_origin, runtimeExchangeKey, runtimeUpstreamHostSuffixes: profile.web.runtime_upstream_host_suffixes, telegramBotUsername: profile.web.telegram_bot_username, sessionTtlSeconds: profile.web.session_ttl_seconds, enrollmentTtlSeconds: profile.signup?.enrollment_ttl_seconds ?? 86400, approvalTtlSeconds: 86400, operatorChatId };
 }
 
 // The interviewer agent's chat-addressed interview routes, which the MCP
