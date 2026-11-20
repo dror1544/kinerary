@@ -101,3 +101,64 @@ test('after the claim is released the real traveller still logs in with their ow
   assert.equal((await login('bob', 'claimants-own-password')).status, 401);
   assert.equal((await login('bob', 'too-late')).status, 401);
 });
+
+// ── round 4: the rest of what a claimed session could read or end ────────────────────────────────────────────────────
+
+const consentParams = async () => {
+  const reg = await post('/oauth/register', { client_name: 'Claude', redirect_uris: [CALLBACK], token_endpoint_auth_method: 'none', grant_types: ['authorization_code', 'refresh_token'] });
+  const client = await reg.json();
+  return { client_id: client.client_id, redirect_uri: CALLBACK, response_type: 'code', code_challenge: createHash('sha256').update(randomBytes(32).toString('base64url')).digest('base64url'), code_challenge_method: 'S256', state: 's', resource: `${base}/mcp`, decision: 'allow' };
+};
+const consent = async (token) => post('/oauth/authorize/decision', await consentParams(), { origin: base, authorization: `Bearer ${token}` });
+const THIRD_PARTY = ['google_sub', 'google_email', 'google_picture', 'telegram_id', 'removed_at'];
+
+test('a claimed session cannot list or end the real traveller\'s assistant connections; every other session can, as before', async () => {
+  assert.equal((await internal('participants/adopt', { userId: claimant, runtimeUsername: 'bob' })).status, 200);
+  const claimed = await exchange(claimant, 'bob');
+  // the real traveller connects an assistant first (a plain login)
+  const bob = (await (await login('bob', '1234')).json()).token;
+  const granted = await consent(bob);
+  assert.equal(granted.status, 200);
+  const list = await api('/api/mcp/connection', { token: bob });
+  assert.equal(list.status, 200);
+  // the claimant gets neither the list nor the disconnect
+  for (const [name, request] of [['GET /api/mcp/connection', () => api('/api/mcp/connection', { token: claimed })], ['DELETE /api/mcp/connections/:id', () => api('/api/mcp/connections/mcpg_anything', { method: 'DELETE', token: claimed })]]) {
+    const r = await request();
+    assert.equal(r.status, 403, name);
+    assert.deepEqual(await r.json(), { error: 'claimed_session_cannot_change_credentials' }, name);
+  }
+  // everyone else as today: the list for a plain member, a 404 for an id that is not theirs, a read for an invite-bound member
+  assert.equal((await api('/api/mcp/connection', { token: await exchange(invited, 'eve') })).status, 200);
+  assert.equal((await api('/api/mcp/connections/mcpg_anything', { method: 'DELETE', token: bob })).status, 404);
+  assert.equal((await internal('participants/release', { userId: claimant, runtimeUsername: 'bob' })).status, 200);
+});
+
+test('/api/auth/me tells a claimed session who the traveller is, and none of the traveller\'s third-party identities', async () => {
+  assert.equal((await internal('participants/adopt', { userId: claimant, runtimeUsername: 'bob' })).status, 200);
+  const claimed = await (await api('/api/auth/me', { token: await exchange(claimant, 'bob') })).json();
+  assert.equal(claimed.username, 'bob');
+  assert.equal(claimed.is_organizer, false);
+  for (const field of THIRD_PARTY) assert.equal(field in claimed, false, `${field} is not served to a claimed session`);
+  // a plain login and an invite-bound managed member get the row exactly as before (the fields are there)
+  const plain = await (await api('/api/auth/me', { token: (await (await login('bob', '1234')).json()).token })).json();
+  for (const field of THIRD_PARTY) assert.equal(field in plain, true, `${field} is still served to the traveller's own login`);
+  const invitedMe = await (await api('/api/auth/me', { token: await exchange(invited, 'eve') })).json();
+  for (const field of THIRD_PARTY) assert.equal(field in invitedMe, true);
+  assert.equal((await internal('participants/release', { userId: claimant, runtimeUsername: 'bob' })).status, 200);
+});
+
+test('every session that is not a claim: Google link reaches its handler, MCP consent works, a secondary organizer keeps its password', async () => {
+  const owner = await exchange(ownerId, null, 'owner');
+  const organizerLogin = (await (await login('alice', 'alices-third-password')).json()).token;
+  for (const [name, token] of [['invite-bound member', await exchange(invited, 'eve')], ['owner-managed', owner], ['plain organizer', organizerLogin]]) {
+    const google = await api('/api/auth/google-link', { method: 'PUT', token, body: { idToken: 'x' } });
+    assert.equal(google.status, 503, `${name}: the Google link reaches its handler (not configured), not the claimed-session refusal`);
+    assert.deepEqual(await google.json(), { error: 'google_not_configured' });
+    assert.equal((await consent(token)).status, 200, `${name}: MCP consent`);
+  }
+  // a secondary organizer (bound with no participant): it may set the password it has, exactly as before
+  const secondaryUser = 'user_credssecondary1';
+  const secondary = await exchange(secondaryUser, null, 'organizer');
+  assert.ok(secondary);
+  assert.equal((await setPassword(secondary, 'secondary-new-password')).status, 200);
+});

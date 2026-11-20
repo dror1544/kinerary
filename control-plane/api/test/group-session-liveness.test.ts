@@ -229,6 +229,7 @@ describe("4: small items", { skip }, () => {
       const offer = (await launch(plain, initDataFor(person, { tripId }))).json() as { travellers: { claimId: string; name: string }[] };
       const snapshot = await h.snapshot();
       h.siteCalls.release.length = 0;
+      h.logs.length = 0;
       const r = await claim(app, initDataFor(person, { tripId }), tripId, offer.travellers[0]!.claimId);
       assert.equal(r.statusCode, 500);
       assert.equal(r.body, '{"error":"INTERNAL_ERROR"}');
@@ -236,7 +237,9 @@ describe("4: small items", { skip }, () => {
       assert.ok(!h.logs.join("\n").includes("secret_internal_name"), "and not in the log either");
       assert.deepEqual(await h.snapshot(), snapshot);
       assert.equal(h.siteCalls.release.length, 1, "the site binding made before the commit was undone");
-      assert.equal(h.siteBindings.size >= 0, true);
+      assert.equal(h.siteBindings.has(`${tripId}:dl17`), false, "and the compensation really removed it from the site");
+      assert.ok(!h.logs.some((line) => line.includes('"outcome":"claimed"')), "a claim that did not commit never logged that it was made");
+      assert.ok(h.logs.some((line) => line.includes('"outcome":"error"')));
     } finally { await app.close(); await plain.close(); }
   });
 
@@ -252,7 +255,131 @@ describe("4: small items", { skip }, () => {
       assert.equal(consume.statusCode, 401); assert.deepEqual(consume.json(), { error: "LAUNCH_INVALID" });
       assert.equal((await runtimeLaunch(c.app, c)).statusCode, 401, "the session itself ended with the membership");
       assert.equal((await claimState(c.tripId)).released_reason, "membership_ended");
+      assert.equal((await claimState(c.tripId)).telegram_user_id, null, "the membership-end trigger nulls the Telegram id too");
       assert.equal(h.siteBindings.get(`${c.tripId}:dl17`), c.user_id, "(the binding on the site is still there: no reconciler, by decision)");
+    } finally { await c.app.close(); }
+  });
+});
+
+
+describe("round 4: what the checks must and must not cost", { skip }, () => {
+  const sha = (v: string) => `sha256:${v.padEnd(64, "0").slice(0, 64)}`;
+  test("the window: just under 10 minutes asks nobody, past it asks once", async () => {
+    const c = await claimed();
+    try {
+      await age(c.tripId, 9);
+      const start = await h.telegram.calls("getChatMember");
+      assert.equal((await check(c.app, c)).statusCode, 200);
+      assert.equal(await h.telegram.calls("getChatMember"), start, "9 minutes: inside the window");
+      await age(c.tripId, 11);
+      assert.equal((await check(c.app, c)).statusCode, 200);
+      assert.equal(await h.telegram.calls("getChatMember"), start + 1, "10.5 minutes: past it");
+    } finally { await c.app.close(); }
+  });
+
+  test("a Telegram-linked session that is NOT a group session, and an invite-bound member's session, never cost a Telegram call on launch or liveness", async () => {
+    const c = await claimed();
+    try {
+      await age(c.tripId, 120);
+      // (1) a member with a Telegram link proved by an invite redemption, and a scoped session minted from it
+      const viaInvite = await h.mkUser("Invited by link"); await h.mkMember(c.tripId, viaInvite, "member", { dashboard: false });
+      const linkId = `tml_${Date.now().toString(16)}${Math.random().toString(16).slice(2, 10)}`;
+      await h.pool.query("INSERT INTO control_plane.telegram_member_links(id,user_id,trip_id,telegram_subject_digest,verified_via) VALUES ($1,$2,$3,$4,'mini_app_invite_redemption')", [linkId, viaInvite, c.tripId, sha(`${Date.now()}`)]);
+      const scoped = await h.webSession(viaInvite, "scoped-invite");
+      await h.pool.query("UPDATE control_plane.web_sessions SET telegram_link_id = $1 WHERE user_id = $2", [linkId, viaInvite]);
+      // (2) an invite-bound member on a full session
+      const invited = await h.mkUser("Invited member"); await h.mkMember(c.tripId, invited, "member", { dashboard: false });
+      const full = await h.webSession(invited, "invited-full");
+      const start = await h.telegram.calls("getChatMember");
+      for (const [name, user, session] of [["telegram-linked, not group", viaInvite, scoped], ["invite-bound", invited, full]] as const) {
+        const grant = await c.app.inject({ method: "POST", url: `/v1/trips/${c.tripId}/launch`, headers: { origin: ORIGIN, cookie: session.cookie, "x-csrf-token": session.csrf } });
+        assert.equal(grant.statusCode, 200, `${name}: ${grant.body}`);
+        const sessionId = (await h.pool.query("SELECT id FROM control_plane.web_sessions WHERE user_id = $1 AND revoked_at IS NULL", [user])).rows[0].id;
+        const live = await c.app.inject({ method: "POST", url: "/internal/runtime-sessions/check", headers: { "x-api-key": "exchange-key", "content-type": "application/json" }, payload: JSON.stringify({ tripId: c.tripId, userId: user, sessionId, role: "member" }) });
+        assert.equal(live.statusCode, 200, `${name}: ${live.body}`);
+      }
+      assert.equal(await h.telegram.calls("getChatMember"), start, "no Telegram call for either");
+    } finally { await c.app.close(); }
+  });
+
+  test("an unreadable switch is dormant for launch and liveness: no grant, not live, no Telegram call, nothing revoked", async () => {
+    const c = await claimed();
+    const unreadable = new Proxy(h.pool, {
+      get(target, prop, receiver) {
+        if (prop === "query") {
+          return (sql: unknown, ...rest: unknown[]) => /feature_enabled/.test(String(sql))
+            ? Promise.reject(Object.assign(new Error("boom"), { code: "57P01" }))
+            : (target.query as (...a: unknown[]) => unknown)(sql, ...rest);
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const broken = h.newApp({ db: unreadable });
+    try {
+      await age(c.tripId, 120);
+      const start = await h.telegram.calls("getChatMember");
+      assert.equal((await runtimeLaunch(broken, c)).statusCode, 404);
+      const dead = await check(broken, c);
+      assert.equal(dead.statusCode, 401); assert.deepEqual(dead.json(), { error: "SESSION_REVOKED" });
+      assert.equal(await h.telegram.calls("getChatMember"), start);
+      assert.equal(await linkReason(c.link_id), null);
+      assert.equal((await claimState(c.tripId)).released_reason, null);
+      assert.equal((await check(c.app, c)).statusCode, 200, "readable again: live");
+    } finally { await broken.close(); await c.app.close(); }
+  });
+
+  test("the liveness path waits at most 2 s for Telegram, the launch path keeps the deployment's wait, and a caller can only SHORTEN it", async () => {
+    const c = await claimed();
+    const seen: Array<number | undefined> = [];
+    const spy = h.newApp({ memberGroupSignIn: { isActiveMember: async (_chat, _user, options) => { seen.push(options?.timeoutMs); return true; } } });
+    try {
+      await age(c.tripId, 120);
+      assert.equal((await check(spy, c)).statusCode, 200);
+      assert.equal((await runtimeLaunch(spy, c)).statusCode, 200);
+      assert.deepEqual(seen, [2000, undefined]);
+    } finally { await spy.close(); await c.app.close(); }
+    const { groupMembershipChecker } = await import("../src/telegram-group-membership.js");
+    const chat = (await h.pool.query("SELECT chat_id FROM control_plane.telegram_chat_bindings WHERE trip_id = $1", [c.tripId])).rows[0].chat_id as string;
+    await h.telegram.member(chat, c.person, "member", { mode: "timeout" });
+    const shortened = groupMembershipChecker({ botToken: "1:abc", apiRoot: h.telegram.root, timeoutMs: 4000 });
+    const t0 = Date.now();
+    assert.equal(await shortened(chat, String(c.person), { timeoutMs: 300 }), "unknown");
+    assert.ok(Date.now() - t0 < 2000, "shortened to 300 ms");
+    const clamped = groupMembershipChecker({ botToken: "1:abc", apiRoot: h.telegram.root, timeoutMs: 300 });
+    const t1 = Date.now();
+    assert.equal(await clamped(chat, String(c.person), { timeoutMs: 60_000 }), "unknown");
+    assert.ok(Date.now() - t1 < 2000, "a caller cannot lengthen the deployment's wait");
+  });
+
+  test("an ended claim leaves one audit line with the reason and no ids", async () => {
+    const c = await claimed();
+    try {
+      assert.ok(h.logs.some((line) => line.includes('"outcome":"claimed"')), "a committed claim says so, once, after the commit");
+      h.logs.length = 0;
+      await h.telegram.member(c.chatId, c.person, "kicked");
+      assert.equal((await runtimeLaunch(c.app, c)).statusCode, 401);
+      const lines = h.logs.filter((line) => line.includes('"outcome":"ended"'));
+      assert.equal(lines.length, 1);
+      assert.match(lines[0]!, /"reason":"left_group"/);
+      const log = h.logs.join("\n");
+      for (const secret of [c.tripId, c.user_id, c.link_id, String(c.person), c.chatId]) assert.ok(!log.includes(secret), "no id in the audit trail");
+    } finally { await c.app.close(); }
+  });
+});
+
+describe("the claims table's own CHECKs", { skip }, () => {
+  test("a released claim cannot hold a Telegram id, and the id must be digits", async () => {
+    const c = await claimed();
+    try {
+      await assert.rejects(
+        h.pool.query("UPDATE control_plane.trip_participant_claims SET released_at = now(), released_reason = 'left_group' WHERE trip_id = $1 AND released_at IS NULL", [c.tripId]),
+        (error: { code?: string; constraint?: string }) => error.code === "23514" && error.constraint === "trip_participant_claims_released_holds_no_id");
+      await assert.rejects(
+        h.pool.query("UPDATE control_plane.trip_participant_claims SET telegram_user_id = 'not-digits' WHERE trip_id = $1 AND released_at IS NULL", [c.tripId]),
+        (error: { code?: string; constraint?: string }) => error.code === "23514" && error.constraint === "trip_participant_claims_telegram_user_id_shape");
+      const ok = await h.pool.query("UPDATE control_plane.trip_participant_claims SET released_at = now(), released_reason = 'left_group', telegram_user_id = NULL WHERE trip_id = $1 AND released_at IS NULL", [c.tripId]);
+      assert.equal(ok.rowCount, 1, "released with the id cleared is the one legal shape");
     } finally { await c.app.close(); }
   });
 });

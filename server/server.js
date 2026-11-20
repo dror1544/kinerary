@@ -1727,7 +1727,10 @@ app.get('/api/auth/me', authRequired, (req, res) => {
   const secondary = Boolean(req.user.secondaryOrganizer);
   // `is_secondary_organizer` (#523) tells the page which organizer controls to offer: a secondary organizer gets the organizer
   // view without the ones that manage people (adding organizers lives on the dashboard, for the main organizer only).
-  const body = { ...user, is_organizer: organizers.includes(user.username) || secondary, ...(secondary ? { is_secondary_organizer: true } : {}) };
+  // A session that came from a group claim is told who the traveller is, not the traveller's third-party identities:
+  // the Google subject, address and picture, the raw Telegram id and the removal stamp stay with the real person.
+  const { google_sub: _gs, google_email: _ge, google_picture: _gp, telegram_id: _tg, removed_at: _ra, ...claimedView } = user;
+  const body = { ...(req.user.claimedSession ? claimedView : user), is_organizer: organizers.includes(user.username) || secondary, ...(secondary ? { is_secondary_organizer: true } : {}) };
   // Present only for an organizer. authRequired is not an organizer check and
   // carries no claim, so the person is checked again here. Through the dashboard
   // the managed session is verified (signature, binding, active participant,

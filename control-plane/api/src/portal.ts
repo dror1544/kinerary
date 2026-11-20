@@ -1100,6 +1100,8 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
    */
   const releaseSiteBindings = async (released: readonly ReleasedClaim[]): Promise<void> => {
     for (const claim of released) {
+      // The audit trail of a claim that ended (the reason only: no trip, person, traveller or chat id).
+      miniAppLog(structuredLog("info", "mini_app.group_claim", { outcome: "ended", reason: claim.reason ?? "unknown" }));
       try { await deps.runtimeAccounts.releaseParticipant(claim); }
       catch { miniAppLog(structuredLog("warn", "member_claim.site_release_failed", {})); }
     }
@@ -1119,6 +1121,7 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
    *            revoked, no Telegram call. Switching the feature back on makes the same session work again.
    */
   const GROUP_RECHECK_INTERVAL = "10 minutes";
+  const GROUP_LIVENESS_TIMEOUT_MS = 2000;
   const groupSessionVerdict = async (input: { tripId: string; userId: string; sessionId: string | null; everyTime: boolean }): Promise<"not_group" | "live" | "revoked" | "unknown" | "dormant"> => {
     const sessions = await deps.db.query<{ is_group: boolean | null }>(
       `SELECT (l.verified_via = $3) AS is_group
@@ -1137,7 +1140,9 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     if (!input.everyTime && claim.rows[0]!.fresh) return "live";
     const chat = await openGroupChat(deps.db, input.tripId);
     if (!chat) return "dormant";
-    const member = await groupSignIn.isActiveMember(chat, telegramUserId);
+    // The liveness path answers the gateway, which gives up after 5 s: its Telegram wait is shorter than a launch's, so a slow
+    // database cannot tip a Telegram hang into a logout.
+    const member = await groupSignIn.isActiveMember(chat, telegramUserId, input.everyTime ? undefined : { timeoutMs: GROUP_LIVENESS_TIMEOUT_MS });
     if (member === "unknown") return "unknown";
     if (member === true) {
       await deps.db.query("UPDATE control_plane.trip_participant_claims SET last_group_check_at = now() WHERE trip_id = $1 AND user_id = $2 AND released_at IS NULL", [input.tripId, input.userId]);
@@ -1326,6 +1331,8 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
       siteBound = wanted;
       await client.query("COMMIT");
       committed = true;
+      // Logged AFTER the commit: a claim that failed to commit must never have said it was made.
+      miniAppLog(structuredLog("info", "mini_app.group_claim", { outcome: "claimed" }));
       setWebSessionCookies(reply, deps, session, { embedded: embeddedRequest(body) });
       return { kind: "session", appPath: result.target.appPath };
     } catch (error) {
@@ -2087,7 +2094,7 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
       "SELECT runtime_username FROM control_plane.trip_participant_claims WHERE trip_id = $1 AND user_id = $2 AND released_at IS NULL", [tripId, target.rows[0].user_id]);
     const removal = await removeMember(deps.db, { tripId, actorUserId: user.id, targetUserId: target.rows[0].user_id });
     if (!removal.ok) return reply.code(removal.status).send({ error: removal.error });
-    await releaseSiteBindings(claimed.rows.map((row) => ({ tripId, userId: target.rows[0]!.user_id, runtimeUsername: row.runtime_username })));
+    await releaseSiteBindings(claimed.rows.map((row) => ({ tripId, userId: target.rows[0]!.user_id, runtimeUsername: row.runtime_username, reason: "membership_ended" })));
     return { status: "removed" };
   });
 

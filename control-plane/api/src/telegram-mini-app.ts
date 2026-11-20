@@ -934,7 +934,7 @@ export async function claimTravellerInTx(
     tripId, travellerName: picked.displayName, telegramFirstName: launch.name?.firstName ?? null,
     tripTitle, language: trip.rows[0]?.language === "he" ? "he" : "en",
   });
-  input.log?.(structuredLog("info", "mini_app.group_claim", { outcome: "claimed", notices_queued: noticed }));
+  void noticed;
   return {
     kind: "claimed",
     runtimeUsername: picked.username,
@@ -1043,7 +1043,7 @@ export async function endGroupClaimInTx(
         AND NOT EXISTS (SELECT 1 FROM control_plane.trip_memberships m WHERE m.user_id = $1 AND m.status = 'active')`,
     [input.userId],
   );
-  return released.rows.map((row) => ({ tripId: input.tripId, userId: input.userId, runtimeUsername: row.runtime_username }));
+  return released.rows.map((row) => ({ tripId: input.tripId, userId: input.userId, runtimeUsername: row.runtime_username, reason: input.claimReason }));
 }
 
 /**
@@ -1051,7 +1051,7 @@ export async function endGroupClaimInTx(
  * transaction has COMMITTED (never before: a rolled-back release must not unbind anyone). Best effort by design; see the
  * header of `releaseSiteBindings` in portal.ts for why a release that does not arrive costs nothing.
  */
-export interface ReleasedClaim { tripId: string; userId: string; runtimeUsername: string }
+export interface ReleasedClaim { tripId: string; userId: string; runtimeUsername: string; /** why it ended, for the audit line */ reason?: string }
 
 // ── The owner's view: the trip card's Telegram status, and Unlink ───────────
 

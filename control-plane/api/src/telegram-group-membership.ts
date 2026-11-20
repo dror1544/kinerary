@@ -46,7 +46,7 @@ export interface GroupMembershipConfig {
 }
 
 /** What callers hold: the question, with the bot and the wait already decided. */
-export type GroupMembershipCheck = (chatId: string, telegramUserId: string) => Promise<GroupMembership>;
+export type GroupMembershipCheck = (chatId: string, telegramUserId: string, options?: { timeoutMs?: number }) => Promise<GroupMembership>;
 
 const IN_STATUSES = new Set(["creator", "administrator", "member"]);
 const OUT_STATUSES = new Set(["left", "kicked"]);
@@ -90,5 +90,7 @@ export async function activeGroupMember(chatId: string, telegramUserId: string, 
 
 /** `activeGroupMember` with the bot, root and timeout fixed once, at boot. */
 export function groupMembershipChecker(config: GroupMembershipConfig): GroupMembershipCheck {
-  return (chatId, telegramUserId) => activeGroupMember(chatId, telegramUserId, config);
+  // A caller may only SHORTEN the wait (the gateway's liveness path does), never lengthen what the deployment set.
+  return (chatId, telegramUserId, options) =>
+    activeGroupMember(chatId, telegramUserId, options?.timeoutMs === undefined ? config : { ...config, timeoutMs: Math.min(options.timeoutMs, config.timeoutMs ?? 4000) });
 }

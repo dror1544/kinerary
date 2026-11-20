@@ -141,7 +141,7 @@ describe("every way a claim ends takes the site binding with it, so another acco
       const claimId = ((await c.app.inject({ method: "GET", url: `/v1/trips/${c.tripId}/member-claims`, headers: { cookie: c.ownerSession.cookie } })).json() as { claims: { claimId: string }[] }).claims[0]!.claimId;
       const released = await c.app.inject({ method: "DELETE", url: `/v1/trips/${c.tripId}/member-claims/${claimId}`, headers: { origin: ORIGIN, cookie: c.ownerSession.cookie, "x-csrf-token": c.ownerSession.csrf } });
       assert.equal(released.statusCode, 200);
-      assert.deepEqual(h.siteCalls.release, [{ tripId: c.tripId, userId: c.userId, runtimeUsername: "dl17" }]);
+      assert.deepEqual(h.siteCalls.release, [{ tripId: c.tripId, userId: c.userId, runtimeUsername: "dl17", reason: "organizer_released" }]);
       assert.equal(h.siteBindings.has(keyOf(c.tripId, "dl17")), false);
       assert.notEqual(await reclaim(c), c.userId);
     } finally { await c.app.close(); }
@@ -153,7 +153,7 @@ describe("every way a claim ends takes the site binding with it, so another acco
       await h.telegram.member(c.chatId, c.person, "left");
       const gone = await launch(c.app, initDataFor(c.person, { tripId: c.tripId }));
       assert.equal(gone.statusCode, 401);
-      assert.deepEqual(h.siteCalls.release, [{ tripId: c.tripId, userId: c.userId, runtimeUsername: "dl17" }]);
+      assert.deepEqual(h.siteCalls.release, [{ tripId: c.tripId, userId: c.userId, runtimeUsername: "dl17", reason: "left_group" }]);
       assert.equal(h.siteBindings.has(keyOf(c.tripId, "dl17")), false);
       assert.notEqual(await reclaim(c), c.userId);
     } finally { await c.app.close(); }
@@ -165,7 +165,7 @@ describe("every way a claim ends takes the site binding with it, so another acco
       const linkId = (await h.pool.query("SELECT id FROM control_plane.telegram_member_links WHERE trip_id = $1", [c.tripId])).rows[0].id;
       const unlinked = await c.app.inject({ method: "DELETE", url: `/v1/account/telegram-links/${linkId}`, headers: { origin: ORIGIN, cookie: asCookie(c.session), "x-csrf-token": cookieOf(c.session, "kit_csrf")! } });
       assert.equal(unlinked.statusCode, 200, unlinked.body);
-      assert.deepEqual(h.siteCalls.release, [{ tripId: c.tripId, userId: c.userId, runtimeUsername: "dl17" }]);
+      assert.deepEqual(h.siteCalls.release, [{ tripId: c.tripId, userId: c.userId, runtimeUsername: "dl17", reason: "unlinked" }]);
       assert.notEqual(await reclaim(c), c.userId);
     } finally { await c.app.close(); }
   });
@@ -176,7 +176,7 @@ describe("every way a claim ends takes the site binding with it, so another acco
       const membershipId = (await h.pool.query("SELECT id FROM control_plane.trip_memberships WHERE trip_id = $1 AND user_id = $2", [c.tripId, c.userId])).rows[0].id;
       const removed = await c.app.inject({ method: "DELETE", url: `/v1/trips/${c.tripId}/members/${membershipId}`, headers: { origin: ORIGIN, cookie: c.ownerSession.cookie, "x-csrf-token": c.ownerSession.csrf } });
       assert.equal(removed.statusCode, 200, removed.body);
-      assert.deepEqual(h.siteCalls.release, [{ tripId: c.tripId, userId: c.userId, runtimeUsername: "dl17" }]);
+      assert.deepEqual(h.siteCalls.release, [{ tripId: c.tripId, userId: c.userId, runtimeUsername: "dl17", reason: "membership_ended" }]);
       assert.notEqual(await reclaim(c), c.userId);
     } finally { await c.app.close(); }
   });

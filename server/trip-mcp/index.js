@@ -407,8 +407,11 @@ function registerTripMcp({
   // else sees and disconnects their own. A person, never the agent key: the
   // companion's context is full of text travellers typed, and one crafted
   // message must not be able to disconnect somebody's assistant.
+  // A session that came from a GROUP CLAIM (control-plane-auth.js) may neither list nor end the real traveller's assistant
+  // connections: the list says which apps they connected, and a disconnect is theirs to make.
   const person = (req, res, next) => authRequired(req, res, () =>
-    (req.user?.isAgent ? res.status(403).json({ error: 'person_only' }) : next()));
+    (req.user?.isAgent ? res.status(403).json({ error: 'person_only' })
+      : req.user?.claimedSession ? res.status(403).json({ error: 'claimed_session_cannot_change_credentials' }) : next()));
   app.get('/api/mcp/connection', person, (req, res) => {
     const me = req.user.username, organizer = isOrganizer(me);
     res.set('Cache-Control', 'no-store');
