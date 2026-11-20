@@ -303,6 +303,41 @@ Write the tests first, from the ACs.
 - **D4, from Q4: no organizer approval per claim.** The notice (AC-7) and Release are the
   control.
 
+## Amendments (Dror, 2026-11-20, after two boundary-review rounds on S1)
+
+Each was found with live request/response evidence while S1's server half was built. Where one
+contradicts the text above, the amendment wins.
+
+- **A1: a claim binds the site, and every way a claim ends unbinds it.**
+  - The claim binds the new account to the *existing* trip-site participant before it commits
+    (an adopt route on the site, forwarded by the runtime gateway, internal key only). Without
+    it the site refuses the session exchange with `IDENTITY_MISMATCH`.
+  - Adopt never creates a participant, never changes a role, password or data, and never
+    displaces an owner, organizer or invite-bound binding.
+  - Release, leaving the group, Unlink and member removal remove the binding.
+  - S2's invite for an existing traveller (AC-10) reuses this pair.
+- **A2: a session from a group claim cannot set a password or link Google on the trip site.**
+  - Otherwise a claimant sets the traveller's password, logs in directly, and holds a 30-day
+    site token that Release cannot end, which defeats D4.
+  - This narrows "the trip-site routes stay exactly as they are": they stay as they are for
+    every session that exists today. A claimed member who wants a password uses S2.
+- **A3: leaving the group ends existing access, not only the next Mini App launch.** This
+  extends AC-6.
+  - Minting a trip launch from a group-link session re-checks the group live.
+  - The session liveness check re-asks Telegram at most once per 10 minutes per link.
+  - Telegram unreachable: no new launch, nothing revoked, and an open session stays live until
+    the next check. An outage must not sign a whole family out.
+- **A4: switching `member_group_sign_in` off closes existing group-claim access too.** The
+  links are dormant, not revoked: no launch, not live, no Telegram call. They work again when
+  the switch is back on.
+- **A5: the claims list stays in the trip site's Organizer settings**, as written above. The
+  trip site gets a route that forwards the list and Release to the control plane for a
+  signed-in organizer, because `trip-web` talks only to the trip site (S1's UI half).
+- **A6: whether a pending personal invite reserves its traveller from group claims is decided
+  in S2.** Today only a redeemed invite does (AC-4).
+- **A7: the group check uses the relay's bot**, the one that sits in the trip groups. It never
+  falls back to the Mini App's token.
+
 ## Open questions (answered, kept for the record)
 
 Answered in Decisions D1–D4 above.
