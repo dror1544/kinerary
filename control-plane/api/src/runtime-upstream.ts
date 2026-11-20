@@ -25,7 +25,9 @@ import type pg from "pg";
  * SQL for "another READY route registers the same LAN origin as row `r`" (trailing slash and case ignored). One
  * address is one trip: when two ready rows share one, the gateway would send one trip's visitors and key to the
  * other's container, so both lookups refuse such a row (boundary review of #599, 2026-11-19, F2). The worker
- * refuses to write one; this holds whatever wrote the rows.
+ * and trip-route.py refuse to write one, and both write only the canonical `http://a.b.c.d:port`. This compares
+ * the stored text, so a row written by hand in another spelling of the same address (`127.1`, a leading-zero
+ * port, a hostname) is not caught here: write rows through those tools, never by hand.
  */
 export const UPSTREAM_SHARED_SQL = `EXISTS (
   SELECT 1 FROM control_plane.runtime_routes o
