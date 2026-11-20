@@ -18,7 +18,12 @@ const outOfScopeTrips = new Set(); // trips a Telegram-scoped session no longer 
 let lastCheck;
 let currentRole = "owner", hangControlPlane = false;
 let checkCalls = 0, checkDown = false;
+// The control plane's answer to the organizers' claims hop, and what it was asked.
+const claimsCalls = [];
+const CLAIM = { claimId: "tpc_0123456789abcdef", travellerName: "Dana Levi", telegramFirstName: "Maya", telegramUsername: "maya_tg", via: "group_membership", claimedAt: "2026-11-20T08:00:00.000Z", lastSignedInAt: null };
+let claimsAnswer = { status: 200, list: { claims: [CLAIM] }, release: { status: "released" }, hang: false };
 const PORTAL = "https://app.example.test";
+const RUNTIME = "https://runtime.example.test";
 // What a browser sends for a page navigation (undici would otherwise say sec-fetch-mode: cors).
 const NAV = { "sec-fetch-mode": "navigate", "sec-fetch-dest": "document", accept: "text/html" };
 
@@ -105,6 +110,12 @@ before(async () => {
       if (checkDown) { res.statusCode = 500; return res.end("{}"); }
       if (revokedUsers.has(payload.userId) || revokedSessions.has(payload.sessionId) || outOfScopeTrips.has(payload.tripId)) { res.statusCode = 401; return res.end(JSON.stringify({ error: "SESSION_REVOKED" })); }
       return res.end(JSON.stringify({ live: true }));
+    }
+    if (req.url === "/internal/member-claims/list" || req.url === "/internal/member-claims/release") {
+      claimsCalls.push({ url: req.url, method: req.method, headers: req.headers, body: await body(req) });
+      if (claimsAnswer.hang) return; // never answers
+      res.statusCode = claimsAnswer.status;
+      return res.end(JSON.stringify(req.url.endsWith("/list") ? claimsAnswer.list : claimsAnswer.release));
     }
     if (req.url === "/internal/runtime-routes/trip_abcdefgh") return res.end(JSON.stringify({ routeRef: "route_abcdefgh", upstreamOrigin, upstreamBasePath: "" }));
     res.statusCode = 404; res.end(JSON.stringify({ error: "missing" }));
@@ -486,4 +497,157 @@ test("streams authenticated events without buffering, scopes the cookie, and clo
     for (let attempt = 0; attempt < 100 && !eventStreamClosed; attempt++) await new Promise(resolve => setTimeout(resolve, 10));
     assert.equal(eventStreamClosed, true);
   } finally { clearTimeout(timeout); controller.abort(); }
+});
+
+// ── The organizers' claims hop: trip-web -> gateway -> control plane (spec A5) ─────────────────────────────────────
+
+const SAME_ORIGIN_DELETE = { origin: RUNTIME, "x-kinerary-member-claims": "1" };
+async function organizerCookie(token = "valid-grant") { return (await formLaunch(token)).headers.get("set-cookie").split(";")[0]; }
+const claimsGet = (cookie, headers = {}, path = "/t/trip_abcdefgh/__member-claims") => fetch(`${gatewayOrigin}${path}`, { headers: { ...(cookie ? { cookie } : {}), ...headers } });
+const claimsDelete = (cookie, claimId = CLAIM.claimId, headers = SAME_ORIGIN_DELETE) => fetch(`${gatewayOrigin}/t/trip_abcdefgh/__member-claims/${claimId}`, { method: "DELETE", headers: { ...(cookie ? { cookie } : {}), ...headers } });
+function resetClaims() { claimsCalls.length = 0; claimsAnswer = { status: 200, list: { claims: [CLAIM] }, release: { status: "released" }, hang: false }; }
+
+test("claims list: asks the control plane with the gateway's own key and only what its sealed cookie says, and returns only the fields the page shows", async () => {
+  resetClaims();
+  const cookie = await organizerCookie("once-claims-list");
+  claimsAnswer.list = { claims: [{ ...CLAIM, secret: "nope", runtimeUsername: "dl17" }, { ...CLAIM, claimId: "not-a-claim" }], extra: "nope" };
+  const response = await claimsGet(cookie);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.deepEqual(await response.json(), { claims: [CLAIM] }, "one well-formed row, no extra fields, no extra keys");
+  assert.equal(claimsCalls.length, 1);
+  assert.equal(claimsCalls[0].url, "/internal/member-claims/list");
+  assert.equal(claimsCalls[0].method, "POST");
+  assert.equal(claimsCalls[0].headers["x-api-key"], "exchange-key");
+  assert.deepEqual(claimsCalls[0].body, { tripId: "trip_abcdefgh", userId: "user_abcdefgh", sessionId: "wsess_devicea0001" }, "trip, user and portal session from the sealed cookie, nothing else");
+});
+
+test("claims list: nothing the browser supplies is trusted or forwarded (key, user id, cookie, query, body)", async () => {
+  resetClaims();
+  const cookie = await organizerCookie("once-claims-forge");
+  const response = await fetch(`${gatewayOrigin}/t/trip_abcdefgh/__member-claims?userId=user_attacker&tripId=trip_otherxyz1&sessionId=wsess_x`, {
+    headers: {
+      cookie: `${cookie}; kit_session=portal-cookie`, "x-api-key": "attacker-key", "x-user-id": "user_attacker", "x-trip-id": "trip_otherxyz1",
+      authorization: "Bearer attacker", "x-forwarded-user": "user_attacker",
+    },
+  });
+  assert.equal(response.status, 200);
+  assert.equal(claimsCalls.length, 1);
+  assert.equal(claimsCalls[0].headers["x-api-key"], "exchange-key", "the control plane saw the gateway's key, never the browser's");
+  assert.equal(claimsCalls[0].headers["x-user-id"], undefined);
+  assert.equal(claimsCalls[0].headers.authorization, undefined);
+  assert.equal(claimsCalls[0].headers.cookie, undefined, "no browser cookie travels to the control plane");
+  assert.deepEqual(claimsCalls[0].body, { tripId: "trip_abcdefgh", userId: "user_abcdefgh", sessionId: "wsess_devicea0001" });
+});
+
+test("claims list: no session, a garbled cookie, another trip's cookie and an ended session are the gateway's ordinary 401, and the control plane is never asked", async () => {
+  resetClaims();
+  const good = await organizerCookie("once-claims-401");
+  const [name, value] = good.split("=");
+  const other = `__Host-kit_rt_trip_otherxyz1=${value}`; // this trip's sealed session presented under another trip's cookie name
+  for (const [label, cookie] of [["none", null], ["garbled", `${name}=garbage`], ["a cookie for another trip", other], ["tampered", `${name}=${value.slice(0, -4)}AAAA`]]) {
+    // This trip's own sealed session, planted under another trip's cookie name and aimed at that trip, must not open it.
+    const response = await claimsGet(cookie, {}, cookie === other ? "/t/trip_otherxyz1/__member-claims" : undefined);
+    assert.equal(response.status, 401, label);
+    assert.deepEqual(await response.json(), { error: "AUTHENTICATION_REQUIRED" }, label);
+  }
+  // A page navigation is not redirected to the portal either: this is a data route.
+  const nav = await rawGet("/t/trip_abcdefgh/__member-claims", { ...NAV });
+  assert.equal(nav.status, 401);
+  assert.equal(claimsCalls.length, 0, "refused before the control plane was asked");
+  revokedSessions.add("wsess_devicea0001");
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal((await claimsGet(good)).status, 401, "a session the portal ended is not an organizer here either");
+    assert.equal(claimsCalls.length, 0);
+  } finally { revokedSessions.delete("wsess_devicea0001"); }
+});
+
+test("claims: whoever the control plane does not accept (a member, a claimed member, a stranger, another trip's organizer) gets its one 404, with no reason", async () => {
+  resetClaims();
+  const cookie = await organizerCookie("once-claims-404");
+  claimsAnswer = { ...claimsAnswer, status: 404, list: { error: "NOT_FOUND", why: "x" }, release: { error: "NOT_FOUND" } };
+  const listed = await claimsGet(cookie);
+  assert.equal(listed.status, 404);
+  assert.deepEqual(await listed.json(), { error: "NOT_FOUND" });
+  const released = await claimsDelete(cookie);
+  assert.equal(released.status, 404);
+  assert.deepEqual(await released.json(), { error: "NOT_FOUND" });
+});
+
+test("claims: an outage, a refusal of the key, a hung control plane and a malformed answer are one 503 that says nothing, never a 200", async () => {
+  resetClaims();
+  const cookie = await organizerCookie("once-claims-503");
+  for (const status of [500, 502, 401]) {
+    claimsAnswer = { status, list: { error: "x" }, release: { error: "x" }, hang: false };
+    const response = await claimsGet(cookie);
+    assert.equal(response.status, 503, String(status));
+    assert.deepEqual(await response.json(), { error: "RUNTIME_UNAVAILABLE" });
+  }
+  claimsAnswer = { status: 200, list: { claims: "not-a-list" }, release: {}, hang: false };
+  assert.equal((await claimsGet(cookie)).status, 503, "a 200 without a list is not an empty list");
+  assert.equal((await claimsDelete(cookie)).status, 503, "a 200 that does not say released is not a release");
+  claimsAnswer = { ...claimsAnswer, hang: true };
+  assert.equal((await claimsGet(cookie)).status, 503, "a hung control plane fails within the timeout");
+});
+
+test("claims release: forwards ONE release for the claim in the path, with the gateway's key and the cookie's identity", async () => {
+  resetClaims();
+  const cookie = await organizerCookie("once-claims-release");
+  const response = await claimsDelete(cookie, CLAIM.claimId, { ...SAME_ORIGIN_DELETE, "x-api-key": "attacker-key", "x-user-id": "user_attacker" });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { status: "released" });
+  assert.equal(claimsCalls.length, 1);
+  assert.equal(claimsCalls[0].url, "/internal/member-claims/release");
+  assert.equal(claimsCalls[0].headers["x-api-key"], "exchange-key");
+  assert.deepEqual(claimsCalls[0].body, { tripId: "trip_abcdefgh", userId: "user_abcdefgh", sessionId: "wsess_devicea0001", claimId: CLAIM.claimId });
+});
+
+test("claims release: a Telegram-minted organizer session is told to use the dashboard (the control plane's 403), and nothing else is passed on", async () => {
+  resetClaims();
+  const cookie = await organizerCookie("once-claims-403");
+  claimsAnswer = { ...claimsAnswer, status: 403, release: { error: "ACCOUNT_SIGN_IN_REQUIRED", message: "Sign in with your password to do this.", leak: "x" } };
+  const response = await claimsDelete(cookie);
+  assert.equal(response.status, 403);
+  assert.deepEqual(await response.json(), { error: "ACCOUNT_SIGN_IN_REQUIRED" });
+});
+
+test("claims release: refused without this origin and the custom header, and with a claim id that is not shaped like one, before the control plane is asked", async () => {
+  resetClaims();
+  const cookie = await organizerCookie("once-claims-csrf");
+  for (const headers of [{}, { origin: RUNTIME }, { "x-kinerary-member-claims": "1" }, { origin: PORTAL, "x-kinerary-member-claims": "1" }, { origin: "null", "x-kinerary-member-claims": "1" }, { origin: "https://evil.example", "x-kinerary-member-claims": "1" }]) {
+    const response = await claimsDelete(cookie, CLAIM.claimId, headers);
+    assert.equal(response.status, 403, JSON.stringify(headers));
+    assert.deepEqual(await response.json(), { error: "ORIGIN_REJECTED" });
+  }
+  for (const bad of ["x", "tpc_", "tpc_..%2F..", "pick_0123456789abcdef", "tpc_0123456789abcdef%00"]) {
+    assert.equal((await claimsDelete(cookie, bad)).status, 404, bad);
+  }
+  assert.equal((await claimsDelete(null)).status, 401, "no session: the ordinary 401");
+  assert.equal(claimsCalls.length, 0, "nothing reached the control plane");
+});
+
+test("the claims paths accept only their own verbs and are never proxied to the trip site", async () => {
+  resetClaims();
+  const cookie = await organizerCookie("once-claims-verbs");
+  const before = proxiedAuthorization;
+  proxiedAuthorization = undefined;
+  for (const [method, path] of [["POST", "/t/trip_abcdefgh/__member-claims"], ["PUT", "/t/trip_abcdefgh/__member-claims"], ["GET", `/t/trip_abcdefgh/__member-claims/${CLAIM.claimId}`], ["DELETE", "/t/trip_abcdefgh/__member-claims"], ["GET", "/t/trip_abcdefgh/__member-claims/a/b"]]) {
+    const response = await fetch(`${gatewayOrigin}${path}`, { method, headers: { cookie, ...SAME_ORIGIN_DELETE } });
+    assert.equal(response.status, 404, `${method} ${path}`);
+  }
+  assert.equal(proxiedAuthorization, undefined, "the trip site never saw these");
+  assert.equal(claimsCalls.length, 0);
+  proxiedAuthorization = before;
+});
+
+test("claims: nothing is logged by the gateway for these calls", async () => {
+  resetClaims();
+  const cookie = await organizerCookie("once-claims-log");
+  const logged = [];
+  const originals = ["log", "error", "warn", "info"].map((name) => [name, console[name]]);
+  for (const [name] of originals) console[name] = (...args) => logged.push(args.join(" "));
+  try { await claimsGet(cookie); await claimsDelete(cookie); } finally { for (const [name, fn] of originals) console[name] = fn; }
+  assert.equal(logged.join("\n").includes(CLAIM.claimId), false);
+  assert.equal(logged.join("\n").includes("user_abcdefgh"), false);
 });

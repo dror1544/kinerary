@@ -1357,14 +1357,10 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     return Boolean(member && ["owner", "organizer"].includes(member.role) && member.dashboard_access);
   };
 
-  // GET /v1/trips/:id/member-claims  ->  200 { claims: [{ claimId, travellerName, telegramFirstName, telegramUsername,
-  //                                                       via, claimedAt, lastSignedInAt }] } | 404 NOT_FOUND
-  app.get("/v1/trips/:id/member-claims", async (request, reply) => {
-    const user = await requireUser(request, reply, deps);
-    if (!user) return;
-    reply.header("cache-control", "private, no-store");
-    const tripId = (request.params as { id?: string }).id ?? "";
-    if (!(await organizerOf(tripId, user.id))) return reply.code(404).send({ error: "NOT_FOUND" });
+  // The list and the release are ONE implementation with two doors: the portal routes below (an organizer's own portal session) and
+  // the internal routes after them (the runtime gateway, for an organizer's TRIP-SITE session). Neither door decides who may ask
+  // the way the other does; both call these once they have decided, so the SQL and its effects exist once.
+  const listMemberClaims = async (tripId: string) => {
     const result = await deps.db.query<{
       id: string; via: string; created_at: Date; display_name: string;
       telegram_first_name: string | null; telegram_username: string | null; last_signed_in_at: Date | null;
@@ -1385,35 +1381,119 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
         via: row.via, claimedAt: row.created_at.toISOString(), lastSignedInAt: row.last_signed_in_at ? row.last_signed_in_at.toISOString() : null,
       })),
     };
-  });
+  };
 
-  // DELETE /v1/trips/:id/member-claims/:claimId  ->  200 { status: "released" } | 404 NOT_FOUND
-  // Ends the claim, revokes its link, ends the sessions it minted and frees the traveller (endGroupClaimInTx).
-  app.delete("/v1/trips/:id/member-claims/:claimId", async (request, reply) => {
-    const user = await requireMutation(request, reply, deps);
-    if (!user) return;
-    reply.header("cache-control", "private, no-store");
-    const params = request.params as { id?: string; claimId?: string };
-    const tripId = params.id ?? "";
-    if (!(await organizerOf(tripId, user.id)) || !/^tpc_[A-Za-z0-9]{8,64}$/.test(params.claimId ?? "")) return reply.code(404).send({ error: "NOT_FOUND" });
+  /** Ends the claim, revokes its link, ends the sessions it minted and frees the traveller (endGroupClaimInTx). False: no such live claim on this trip. */
+  const releaseMemberClaim = async (tripId: string, claimId: string): Promise<boolean> => {
+    if (!/^tpc_[A-Za-z0-9]{8,64}$/.test(claimId)) return false;
     const client = await deps.db.connect();
     try {
       await client.query("BEGIN");
       const claim = await client.query<{ user_id: string }>(
         "SELECT user_id FROM control_plane.trip_participant_claims WHERE id = $1 AND trip_id = $2 AND released_at IS NULL FOR UPDATE",
-        [params.claimId, tripId]);
-      if (!claim.rows[0]) { await client.query("ROLLBACK"); return reply.code(404).send({ error: "NOT_FOUND" }); }
+        [claimId, tripId]);
+      if (!claim.rows[0]) { await client.query("ROLLBACK"); return false; }
       const ended = await endGroupClaimInTx(client, { tripId, userId: claim.rows[0].user_id, linkReason: "claim_released", claimReason: "organizer_released" });
       await client.query("COMMIT");
       await releaseSiteBindings(ended);
       miniAppLog(structuredLog("info", "mini_app.group_claim", { outcome: "released" }));
-      return { status: "released" };
+      return true;
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     } finally {
       client.release();
     }
+  };
+
+  // GET /v1/trips/:id/member-claims  ->  200 { claims: [{ claimId, travellerName, telegramFirstName, telegramUsername,
+  //                                                       via, claimedAt, lastSignedInAt }] } | 404 NOT_FOUND
+  app.get("/v1/trips/:id/member-claims", async (request, reply) => {
+    const user = await requireUser(request, reply, deps);
+    if (!user) return;
+    reply.header("cache-control", "private, no-store");
+    const tripId = (request.params as { id?: string }).id ?? "";
+    if (!(await organizerOf(tripId, user.id))) return reply.code(404).send({ error: "NOT_FOUND" });
+    return listMemberClaims(tripId);
+  });
+
+  // DELETE /v1/trips/:id/member-claims/:claimId  ->  200 { status: "released" } | 404 NOT_FOUND
+  app.delete("/v1/trips/:id/member-claims/:claimId", async (request, reply) => {
+    const user = await requireMutation(request, reply, deps);
+    if (!user) return;
+    reply.header("cache-control", "private, no-store");
+    const params = request.params as { id?: string; claimId?: string };
+    const tripId = params.id ?? "";
+    if (!(await organizerOf(tripId, user.id)) || !(await releaseMemberClaim(tripId, params.claimId ?? ""))) return reply.code(404).send({ error: "NOT_FOUND" });
+    return { status: "released" };
+  });
+
+  // ── The same two operations for an organizer's TRIP-SITE session (the runtime gateway's hop) ─────────────────
+  //
+  //   POST /internal/member-claims/list     { tripId, userId, sessionId }            -> 200 { claims: [...] }
+  //   POST /internal/member-claims/release  { tripId, userId, sessionId, claimId }   -> 200 { status: "released" }
+  //
+  // `trip-web` talks only to the trip site, and the trip site cannot call this service, so the runtime gateway (which holds the
+  // person's sealed session: user, trip, portal session id) asks on the person's behalf, with the exchange key. The gateway is
+  // trusted for WHO IT HEARD FROM (a sealed cookie it made), never for what that person may do: everything is decided again here,
+  // from the database, on every call:
+  //
+  //   1. the key (401 AUTHENTICATION_REQUIRED, as every internal route);
+  //   2. the portal session `sessionId` is that user's own, live, and the user is active;
+  //   3. the user is owner or organizer of THIS trip with dashboard access (`organizerOf`, exactly the portal routes' rule);
+  //   4. `member_group_sign_in` is on for the trip and the path is wired. Off or absent is the answer an unknown trip gets: the
+  //      name of an unreleased feature is withheld, and no claim is shown that no longer grants anything (A4);
+  //   5. the session's SCOPE, by the portal routes' own policy rows (portal-scope.ts, the one source): a session a Telegram link
+  //      minted (an organizer in the Mini App) may list a trip in its scope (GET policy `trip`) but may NOT release (DELETE policy
+  //      `account`, as for removing a member): answered 403 ACCOUNT_SIGN_IN_REQUIRED, and ONLY to a caller who passed 2-4, so it
+  //      tells a stranger nothing. A scope that cannot be read is the empty scope.
+  //
+  // A member, a claimed member, a stranger, another trip's organizer, a dead or foreign session and an unknown trip are all one
+  // byte-identical 404 (steps 2-4); nothing is written before step 5 passes.
+  const claimsActor = async (request: FastifyRequest, reply: FastifyReply, kind: "list" | "release"): Promise<{ tripId: string; claimId: string } | null> => {
+    reply.header("cache-control", "no-store");
+    if (!exchangeKeyMatches(request.headers["x-api-key"], deps.runtimeExchangeKey)) { await reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" }); return null; }
+    const body = jsonBody(request);
+    const { tripId, userId, sessionId, claimId } = body;
+    if (typeof tripId !== "string" || !TRIP_ID_PATTERN.test(tripId) || typeof userId !== "string" || typeof sessionId !== "string"
+      || (kind === "release" && typeof claimId !== "string")) {
+      await reply.code(400).send({ error: "INVALID_REQUEST" });
+      return null;
+    }
+    const refused = async () => { await reply.code(404).send({ error: "NOT_FOUND" }); return null; };
+    const session = await deps.db.query<{ telegram_link_id: string | null }>(
+      `SELECT s.telegram_link_id FROM control_plane.web_sessions s
+         JOIN control_plane.users u ON u.id = s.user_id AND u.status = 'active'
+        WHERE s.id = $1 AND s.user_id = $2 AND s.revoked_at IS NULL AND s.expires_at > now()`,
+      [sessionId, userId]);
+    if (!session.rows[0]) return refused();
+    if (!(await organizerOf(tripId, userId))) return refused();
+    if (!groupSignIn || !(await featureEnabled(deps.db, tripId, "member_group_sign_in", miniAppLog))) return refused();
+    const telegramLinkId = session.rows[0].telegram_link_id;
+    if (telegramLinkId !== null) {
+      const decision = await scopeDecision(deps.db, {
+        routeKey: kind === "list" ? "GET /v1/trips/:id/member-claims" : "DELETE /v1/trips/:id/member-claims/:claimId",
+        params: { id: tripId }, scope: await readSessionScope(deps, userId, telegramLinkId),
+      });
+      if (!decision.allow) {
+        await reply.code(decision.status).send(decision.body);
+        return null;
+      }
+    }
+    return { tripId, claimId: typeof claimId === "string" ? claimId : "" };
+  };
+
+  app.post("/internal/member-claims/list", async (request, reply) => {
+    const actor = await claimsActor(request, reply, "list");
+    if (!actor) return;
+    return listMemberClaims(actor.tripId);
+  });
+
+  app.post("/internal/member-claims/release", async (request, reply) => {
+    const actor = await claimsActor(request, reply, "release");
+    if (!actor) return;
+    if (!(await releaseMemberClaim(actor.tripId, actor.claimId))) return reply.code(404).send({ error: "NOT_FOUND" });
+    return { status: "released" };
   });
 
   // Ends one Telegram link — one TRIP's link — of the signed-in user's own, with

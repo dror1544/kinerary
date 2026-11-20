@@ -97,6 +97,12 @@ export const PORTAL_SCOPE_POLICY: Readonly<Record<string, RouteScope>> = Object.
   // exactly like consume above. Added at integration: the two lines were built apart.
   "POST /internal/runtime-sessions/check": "open",
   "GET /internal/runtime-routes/:tripId": "open",
+  // The runtime gateway's hop for an organizer's TRIP-SITE session (docs/specs/sprint-9/x-member-sign-in.md, A5). Authenticated by the
+  // exchange key and never reads the portal cookie, so `open` here is only "no portal session is read". The handler holds the person to
+  // the SAME rows as the portal routes: it loads the session's scope and asks `scopeDecision` for "GET /v1/trips/:id/member-claims"
+  // (`trip`) or "DELETE /v1/trips/:id/member-claims/:claimId" (`account`), so a Telegram-minted organizer session lists but never releases.
+  "POST /internal/member-claims/list": "open",
+  "POST /internal/member-claims/release": "open",
 
   "GET /v1/me": "session",
   "POST /v1/logout": "session",

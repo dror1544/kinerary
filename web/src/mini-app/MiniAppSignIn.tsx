@@ -2,7 +2,9 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router-dom";
-import { getMe, passwordSignIn, safeReturnTo, telegramMiniAppSignIn, type MiniAppSignInResult, type MiniAppTrip } from "../api";
+import { getMe, miniAppClaim, passwordSignIn, safeReturnTo, telegramMiniAppSignIn, type MiniAppSignInResult, type MiniAppTraveller, type MiniAppTrip } from "../api";
+import { ClaimScreen } from "./ClaimScreen";
+import { claimCopy, miniLanguage } from "./claim-copy";
 import { digestInitData, launchMarker } from "./launch";
 import { isEmbedded, openedByTelegram, readLaunch, stripLaunchFragment, type MiniLaunch, type MiniSdk } from "./sdk";
 import { tripUsernameInputProps, tripUsernameRegisterOptions } from "./username";
@@ -15,6 +17,12 @@ type View =
   | { name: "unsupported" }
   | { name: "choose"; trips: MiniAppTrip[]; notice: boolean }
   | { name: "password"; tripId: string }
+  /** Group sign-in: pick your own name. `generation` restarts the screen when the list was refreshed under the person. */
+  | { name: "claim"; tripId: string; travellers: MiniAppTraveller[]; takenName: string | null; generation: number }
+  /** The server could not check the group right now; nothing was decided. */
+  | { name: "retry" }
+  /** The launch string is too old for a claim: close and reopen. */
+  | { name: "stale" }
   | { name: "message"; kind: "no_trip" | "invalid" | "limited" };
 
 const messages: Record<"no_trip" | "invalid" | "limited", { title: string; body: string }> = {
@@ -38,8 +46,10 @@ const messages: Record<"no_trip" | "invalid" | "limited", { title: string; body:
  *
  * The SERVER does all of the deciding (POST /v1/auth/telegram-mini-app); this
  * component only sends the signed string it was handed and renders the answer:
- * a session (go where it says), a chooser, "not linked" (the trip-password form,
- * but only when the launch named a trip), or a refusal. Outside Telegram — no
+ * a session (go where it says), a chooser, a group sign-in offer ("which traveller
+ * are you?", ClaimScreen: pick, confirm, claim), "not linked" (the trip-password form,
+ * but only when the launch named a trip), a "try again" when the server could not
+ * check, or a refusal. Outside Telegram — no
  * launch parameters — it is a pass-through, and an ordinary browser keeps the
  * ordinary sign-in page. So does a deployment that has the feature switched off.
  */
@@ -52,12 +62,15 @@ export default function MiniAppSignIn({ sdk, settled, children }: { sdk: MiniSdk
   const [banner, setBanner] = useState<string | null>(null);
   const launch = useRef<MiniLaunch | null>(null);
   const started = useRef(false);
+  /** The trip the last exchange named, so "Try again" asks the same question. */
+  const lastTripId = useRef<string | undefined>(undefined);
+  const claimGeneration = useRef(0);
   const path = useRef(location.pathname);
   path.current = location.pathname;
 
   // Whatever the exchange concluded, the page's cached data belonged to whoever
   // held the WebView before: drop it.
-  const settle = async (result: MiniAppSignInResult, digest: string | null) => {
+  const settle = async (result: MiniAppSignInResult, digest: string | null, takenName: string | null = null) => {
     queryClient.clear();
     if (result.kind === "session") {
       // Inside Telegram Web the session is a partitioned cross-site cookie. Some
@@ -77,6 +90,13 @@ export default function MiniAppSignIn({ sdk, settled, children }: { sdk: MiniSdk
     } else if (result.kind === "choose") {
       launchMarker.clear();
       setView({ name: "choose", trips: result.trips, notice: result.notice === "TRIP_UNAVAILABLE" });
+    } else if (result.kind === "claim") {
+      launchMarker.clear();
+      claimGeneration.current += 1;
+      setView({ name: "claim", tripId: result.tripId, travellers: result.travellers, takenName, generation: claimGeneration.current });
+    } else if (result.kind === "retry") {
+      launchMarker.clear();
+      setView({ name: "retry" });
     } else if (result.kind === "not_linked") {
       launchMarker.clear();
       setView(result.fallback === "trip_password" && result.tripId ? { name: "password", tripId: result.tripId } : { name: "message", kind: "no_trip" });
@@ -121,8 +141,44 @@ export default function MiniAppSignIn({ sdk, settled, children }: { sdk: MiniSdk
   const choose = async (tripId: string) => {
     const found = launch.current;
     if (!found?.initData) return;
+    lastTripId.current = tripId;
     setView({ name: "checking" });
     await settle(await telegramMiniAppSignIn({ initData: found.initData, tripId, embedded: isEmbedded(found.platform) }), await digestInitData(found.initData));
+  };
+
+  /** Asks the launch question again (after "Try again", and to refresh the list when somebody else took a name). */
+  const relaunch = async (takenName: string | null = null) => {
+    const found = readLaunch(sdk);
+    const initData = found.initData ?? launch.current?.initData ?? null;
+    if (!initData) { setView({ name: "message", kind: "invalid" }); return; }
+    const platform = found.platform ?? launch.current?.platform ?? null;
+    if (takenName === null) setView({ name: "checking" });
+    await settle(await telegramMiniAppSignIn({ initData, ...(lastTripId.current ? { tripId: lastTripId.current } : {}), embedded: isEmbedded(platform) }), await digestInitData(initData), takenName);
+  };
+
+  /**
+   * The person confirmed a name. The launch string is read from the SDK NOW, not from the copy taken at launch, exactly as
+   * the server wants it: it refuses one older than a minute (STALE) and the SDK's is the freshest there is. A double tap
+   * never gets here twice (ClaimScreen), and nothing is retried on its own: a claim that did not complete is the person's
+   * to repeat. Resolves "retry" to leave the screen on the confirm step with a button; every other outcome changes the view.
+   */
+  const claim = async (tripId: string, traveller: MiniAppTraveller): Promise<"retry" | void> => {
+    const found = readLaunch(sdk);
+    const initData = found.initData ?? launch.current?.initData ?? null;
+    if (!initData) { setView({ name: "message", kind: "invalid" }); return; }
+    const platform = found.platform ?? launch.current?.platform ?? null;
+    const result = await miniAppClaim({ initData, tripId, claimId: traveller.claimId, embedded: isEmbedded(platform) });
+    switch (result.kind) {
+      case "session": return settle(result, await digestInitData(initData));
+      // Somebody else signed in as that name first. Say so, and show the list as it is now.
+      case "taken": return relaunch(traveller.name);
+      // Every other refusal is the same to the person: this trip does not offer them a way in by name. The trip password is the way left.
+      case "not_found": return settle({ kind: "not_linked", fallback: "trip_password", tripId }, null);
+      case "stale": setView({ name: "stale" }); return;
+      case "invalid": launchMarker.clear(); setView({ name: "message", kind: "invalid" }); return;
+      case "limited": setView({ name: "message", kind: "limited" }); return;
+      default: return "retry";
+    }
   };
 
   const shell = (title: string, body: ReactNode) => (
@@ -138,6 +194,21 @@ export default function MiniAppSignIn({ sdk, settled, children }: { sdk: MiniSdk
     return shell("Open Kinerary in the Telegram app", <p>Your browser didn't keep the sign-in inside Telegram Web — it blocks cookies from sites opened in another site's frame. Open this chat in the Telegram app on your phone or desktop, or allow third-party cookies for web.telegram.org and try again.</p>);
   }
   if (view.name === "message") return shell(messages[view.kind].title, <p>{messages[view.kind].body}</p>);
+  if (view.name === "claim") {
+    return <ClaimScreen key={view.generation} lang={miniLanguage()} travellers={view.travellers} takenName={view.takenName} onClaim={(traveller) => claim(view.tripId, traveller)} />;
+  }
+  if (view.name === "stale" || view.name === "retry") {
+    const lang = miniLanguage();
+    const copy = claimCopy[lang];
+    return (
+      <main className="mini-app-unavailable" data-testid="mini-app-sign-in" lang={lang} dir={lang === "he" ? "rtl" : "ltr"}>
+        <p className="eyebrow">Kinerary</p>
+        <h1>{view.name === "stale" ? copy.staleTitle : copy.retryTitle}</h1>
+        <p>{view.name === "stale" ? copy.staleBody : copy.retryBody}</p>
+        {view.name === "retry" && <button className="button wide" onClick={() => void relaunch()}>{copy.retryButton}</button>}
+      </main>
+    );
+  }
   if (view.name === "choose") {
     return shell("Choose a trip", <>
       {view.notice && <p role="status">That trip isn't available to your account. Choose one of yours.</p>}

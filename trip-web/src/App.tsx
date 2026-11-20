@@ -22,6 +22,7 @@ import { heroCandidates, useHeroPhoto } from "./hero-photo";
 import { useTripUpdates, useLiveEditGuard } from "./live-updates";
 import { featureOn } from "./features";
 import { GroupLineToggle } from "./group-line";
+import { MemberClaims } from "./member-claims";
 import { hasGoChip, mapUrlFor, navUrlFor, wazeUrlFor } from "./nav-links";
 import { useNavApp } from "./trip-settings";
 import { WeatherFlightsCard } from "./today-cards";
@@ -3017,6 +3018,8 @@ function MemberLogins({ config, lang, headingId }: { config?: TripConfig; lang: 
           </li>
         ))}
       </ul>
+      {/* Who signed in from the trip's Telegram group, with Release. Draws nothing unless the gateway answers with a list. */}
+      <MemberClaims lang={lang} />
     </div>
   );
 }

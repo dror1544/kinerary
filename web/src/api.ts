@@ -185,6 +185,10 @@ export type MiniAppTrip = { tripId: string; title: string; destination: string |
 export type MiniAppSignInResult =
   | { kind: "session"; appPath: string; notice?: "TRIP_UNAVAILABLE" }
   | { kind: "choose"; trips: MiniAppTrip[]; notice?: "TRIP_UNAVAILABLE" }
+  /** Group sign-in: the person is in the trip's Telegram group and may pick their own name. `travellers` can be EMPTY ("ask the organizer"). */
+  | { kind: "claim"; tripId: string; travellers: MiniAppTraveller[] }
+  /** The server could not check the group (or the trip site) right now: nothing was decided, try again. */
+  | { kind: "retry" }
   | { kind: "not_linked"; fallback: "trip_password" | "none"; tripId?: string }
   /** Telegram's signature did not verify, or the launch has been used up: reopen from Telegram. */
   | { kind: "invalid" }
@@ -192,6 +196,11 @@ export type MiniAppSignInResult =
   /** Feature off, wrong origin, network: nothing to retry in place. */
   | { kind: "unavailable" };
 
+/** A name the person may pick. `claimId` is opaque and means nothing outside the claim request; it is never shown. */
+export type MiniAppTraveller = { claimId: string; name: string };
+const claimIdPattern = /^tpc_[A-Za-z0-9]{8,64}$/;
+const tripIdShape = /^trip_[A-Za-z0-9]{8,64}$/;
+const miniAppTravellerSchema = z.object({ claimId: z.string().regex(claimIdPattern), name: z.string().min(1).max(200) });
 const miniAppTripSchema = z.object({ tripId: z.string(), title: z.string(), destination: z.string().nullable(), startDate: z.string().nullable(), endDate: z.string().nullable() });
 const miniAppAppPath = /^\/mini-app(?:\/trips\/trip_[A-Za-z0-9]{8,64})?$/;
 
@@ -211,6 +220,7 @@ export async function telegramMiniAppSignIn(input: { initData: string; tripId?: 
   } catch { return { kind: "unavailable" }; }
   const body = await response.json().catch(() => ({})) as Record<string, unknown>;
   if (response.status === 429) return { kind: "limited" };
+  if (response.status === 503 && body.error === "MEMBERSHIP_CHECK_UNAVAILABLE") return { kind: "retry" };
   if (response.status === 401 && body.error === "TELEGRAM_INIT_DATA_INVALID") return { kind: "invalid" };
   if (response.status === 401 && body.error === "TELEGRAM_NOT_LINKED") {
     const tripId = typeof body.tripId === "string" && /^trip_[A-Za-z0-9]{8,64}$/.test(body.tripId) ? body.tripId : undefined;
@@ -223,6 +233,48 @@ export async function telegramMiniAppSignIn(input: { initData: string; tripId?: 
     const trips = z.array(miniAppTripSchema).safeParse(body.trips);
     if (trips.success) return { kind: "choose", trips: trips.data, ...(notice ? { notice } : {}) };
   }
+  if (body.kind === "claim" && typeof body.tripId === "string" && tripIdShape.test(body.tripId)) {
+    const travellers = z.array(miniAppTravellerSchema).safeParse(body.travellers);
+    if (travellers.success) return { kind: "claim", tripId: body.tripId, travellers: travellers.data };
+  }
+  return { kind: "unavailable" };
+}
+
+export type MiniAppClaimResult =
+  | { kind: "session"; appPath: string }
+  /** Somebody else holds that name now (or this Telegram account already holds one on this trip). */
+  | { kind: "taken" }
+  /** The one refusal for everything else: switch off, not in the group, a name that is not on the list. */
+  | { kind: "not_found" }
+  /** The launch string is older than the claim allows: the person must reopen the Mini App. */
+  | { kind: "stale" }
+  | { kind: "invalid" }
+  | { kind: "limited" }
+  /** Telegram or the trip site could not be asked: nothing was written, try again. */
+  | { kind: "retry" }
+  | { kind: "unavailable" };
+
+/**
+ * Picks a name from a group-sign-in offer. The launch string is sent in the POST body only, like the exchange above, and
+ * the server decides everything: whether the person is in the group, whether the name is still free, what they become.
+ */
+export async function miniAppClaim(input: { initData: string; tripId: string; claimId: string; embedded?: boolean }): Promise<MiniAppClaimResult> {
+  let response: Response;
+  try {
+    response = await fetch("/v1/mini-app/claim", {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ initData: input.initData, tripId: input.tripId, claimId: input.claimId, ...(input.embedded ? { embedded: true } : {}) }),
+    });
+  } catch { return { kind: "unavailable" }; }
+  const body = await response.json().catch(() => ({})) as Record<string, unknown>;
+  if (response.status === 429) return { kind: "limited" };
+  if (response.status === 503 && body.error === "MEMBERSHIP_CHECK_UNAVAILABLE") return { kind: "retry" };
+  if (response.status === 409 && body.error === "ALREADY_CLAIMED") return { kind: "taken" };
+  if (response.status === 404) return { kind: "not_found" };
+  if (response.status === 401 && body.error === "TELEGRAM_INIT_DATA_STALE") return { kind: "stale" };
+  if (response.status === 401 && body.error === "TELEGRAM_INIT_DATA_INVALID") return { kind: "invalid" };
+  if (response.ok && body.kind === "session" && typeof body.appPath === "string" && miniAppAppPath.test(body.appPath)) return { kind: "session", appPath: body.appPath };
   return { kind: "unavailable" };
 }
 

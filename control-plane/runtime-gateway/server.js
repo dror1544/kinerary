@@ -292,6 +292,58 @@ async function listParticipants(req, res, tripId) {
   res.end(payload);
 }
 
+// ORGANIZERS' GROUP CLAIMS: the hop between the trip site's Organizer settings and the control plane (docs/specs/sprint-9/
+// x-member-sign-in.md, amendment A5). `trip-web` talks only to the trip site, and the trip site cannot call the control
+// plane, so the gateway, which holds the person's sealed session, asks on their behalf:
+//
+//   GET    /t/:tripId/__member-claims            the live claims          -> control plane POST /internal/member-claims/list
+//   DELETE /t/:tripId/__member-claims/:claimId   release one              -> control plane POST /internal/member-claims/release
+//
+// THE GATEWAY DECIDES NOTHING ABOUT WHO MAY. It forwards three facts it knows from its OWN sealed cookie (trip, user, the
+// portal session that opened this trip) and the control plane re-decides everything from its database: a live session that is
+// that user's, owner/organizer of that trip, the feature on, the session's scope. Nothing the browser sends is forwarded: no
+// header (the key is the gateway's own, set last), no cookie, no query, no user id, no body. A caller without a session gets
+// the gateway's ordinary 401; anyone the control plane does not accept gets its one 404, whoever they are.
+// Release additionally needs what the gateway's own POSTs need (logout): a header a cross-site form cannot send, and this
+// origin as the request's Origin.
+const CLAIM_ID_SHAPE = /^tpc_[A-Za-z0-9]{8,64}$/;
+const text = (value) => (typeof value === "string" ? value : null);
+async function memberClaims(req, res, tripId, claimId) {
+  const releasing = req.method === "DELETE";
+  if (releasing && (req.headers["x-kinerary-member-claims"] !== "1" || req.headers.origin !== RUNTIME_ORIGIN)) {
+    return json(res, 403, { error: "ORIGIN_REJECTED" });
+  }
+  const session = decodeSession(cookieValue(req, cookieName(tripId)));
+  if (!session || session.tripId !== tripId || typeof session.userId !== "string" || !(await sessionLive(session))) {
+    return json(res, 401, { error: "AUTHENTICATION_REQUIRED" });
+  }
+  // A grant minted before session binding names no portal session: the control plane cannot decide for it, so nothing is shown.
+  if (typeof session.sessionId !== "string") return json(res, 404, { error: "NOT_FOUND" });
+  if (releasing && !CLAIM_ID_SHAPE.test(claimId ?? "")) return json(res, 404, { error: "NOT_FOUND" });
+  let answer;
+  try {
+    answer = await controlPlane(releasing ? "/internal/member-claims/release" : "/internal/member-claims/list", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ tripId: session.tripId, userId: session.userId, sessionId: session.sessionId, ...(releasing ? { claimId } : {}) }),
+    });
+  } catch (error) {
+    const status = error?.message === "CONTROL_PLANE_REJECTED" ? error.statusCode : 0;
+    if (status === 404) return json(res, 404, { error: "NOT_FOUND" });
+    // A Telegram-minted organizer session may look but not release: the one refusal that says why, and only to a caller the
+    // control plane has already accepted as this trip's organizer.
+    if (status === 403) return json(res, 403, { error: "ACCOUNT_SIGN_IN_REQUIRED" });
+    return json(res, 503, { error: "RUNTIME_UNAVAILABLE" });
+  }
+  if (releasing) return answer?.status === "released" ? json(res, 200, { status: "released" }) : json(res, 503, { error: "RUNTIME_UNAVAILABLE" });
+  if (!Array.isArray(answer?.claims)) return json(res, 503, { error: "RUNTIME_UNAVAILABLE" });
+  // Only the fields the page shows, and only rows shaped like claims: whatever else the control plane says stops here.
+  const claims = answer.claims.filter((c) => CLAIM_ID_SHAPE.test(c?.claimId ?? "")).map((c) => ({
+    claimId: c.claimId, travellerName: text(c.travellerName) ?? "", telegramFirstName: text(c.telegramFirstName), telegramUsername: text(c.telegramUsername),
+    via: text(c.via), claimedAt: text(c.claimedAt), lastSignedInAt: text(c.lastSignedInAt),
+  }));
+  return json(res, 200, { claims });
+}
+
 // Ask again while a stream is open, at half the cache window so a revocation
 // is seen within one window after the cached "live" runs out (30 s + 15 s with
 // the defaults). A negative answer, an outage and a hung control plane all end
@@ -384,6 +436,14 @@ export function createRuntimeGateway() {
         }
         res.setHeader("set-cookie", `${cookieName(tripId)}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secureCookie ? "; Secure" : ""}`);
         return json(res, 200, { portalUrl: PORTAL_ORIGIN });
+      }
+      // The organizers' claims hop. Any other method on these paths is not proxied to the trip site with a session on it.
+      if (suffix === "/__member-claims" || suffix.startsWith("/__member-claims/")) {
+        const target = suffix.match(/^\/__member-claims(?:\/([^/]+))?$/);
+        let claimId = null;
+        try { claimId = target?.[1] ? decodeURIComponent(target[1]) : null; } catch { return json(res, 404, { error: "NOT_FOUND" }); }
+        if (target && ((req.method === "GET" && !target[1]) || (req.method === "DELETE" && target[1]))) return await memberClaims(req, res, tripId, claimId);
+        return json(res, 404, { error: "NOT_FOUND" });
       }
       // Internal identity endpoints are exclusively server-to-server.
       if (suffix.startsWith("/api/internal/")) return json(res, 404, { error: "NOT_FOUND" });
