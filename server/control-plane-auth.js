@@ -292,6 +292,19 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
     if (!configuredDashboardUrl || !activeUser(username) || !organizers().includes(username)) return null;
     return configuredDashboardUrl;
   }
+  // Is this verified payload a session that came from a GROUP CLAIM (docs/specs/sprint-9/x-member-sign-in.md, slice S1)?
+  // That is a managed member session whose binding was ADOPTED (no invite behind it): the control plane let a person in
+  // the trip's Telegram group stand in for an existing participant, and the binding ends when the claim does. Such a
+  // session may OPEN the trip and use it as the traveller, but it must never mint a credential that outlives the
+  // binding: a password, a Google link, an MCP connection. Everything else (a plain password login, an invite-bound
+  // managed member, an owner or organizer, a secondary organizer) is NOT this. Read from the stored binding on every
+  // call, never from the token: the claim in the token is only a pointer to the row.
+  function isClaimedSessionPayload(payload) {
+    if (!payload || typeof payload !== 'object' || !Object.prototype.hasOwnProperty.call(payload, 'controlPlane')) return false;
+    if (!validManagedPayload(payload)) return false;
+    const row = find.get(payload.controlPlane.userId, identity.tripId);
+    return Boolean(row && row.role === 'member' && (row.invite_id === null || row.invite_id === undefined) && !isSecondaryUsername(row.username));
+  }
   // Is this verified payload a SECONDARY organizer of this trip? Only a managed claim counts - a plain password, Telegram or
   // Google token for a secondary username is nothing (they have none of those) - and it is re-checked against the stored
   // binding on every request, so a removed or never-bound identity is not one.
@@ -304,6 +317,6 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
     return Boolean(row && row.username === payload.username);
   }
   // `internal` is exported so a second module can mount a route behind the same gate (the plan-changes read, video Release 1C).
-  return { internal, validManagedPayload, dashboardUrlFor, dashboardUrlForOrganizer, isSecondaryOrganizerPayload, isSecondaryUsername };
+  return { internal, validManagedPayload, isClaimedSessionPayload, dashboardUrlFor, dashboardUrlForOrganizer, isSecondaryOrganizerPayload, isSecondaryUsername };
 }
 module.exports = { createControlPlaneAuth, safeDashboardUrl, safePortalOrigin };

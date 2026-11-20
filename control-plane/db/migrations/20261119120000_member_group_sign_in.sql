@@ -52,8 +52,18 @@ CREATE TABLE control_plane.trip_participant_claims (
   created_at       timestamptz NOT NULL DEFAULT now(),
   released_at      timestamptz,
   released_reason  text,
+  -- What the live group check needs and nothing else can supply: Telegram's `getChatMember` takes the person's numeric
+  -- id, and everywhere else this system keeps only its digest (a digest of a short numeric id is brute-forceable, so
+  -- it is as sensitive as the id). It is held ONLY WHILE THE CLAIM IS LIVE: ending a claim sets it NULL (the CHECK
+  -- below makes a released row unable to keep one), the same rule the outbox applies to a recipient chat id.
+  telegram_user_id text,
+  -- When Telegram last said "in the group" for this claim's open session. The runtime liveness check asks again at most
+  -- once per 10 minutes per claim (portal.ts); NULL = never asked since the claim.
+  last_group_check_at timestamptz,
 
   CONSTRAINT trip_participant_claims_pkey PRIMARY KEY (id),
+  CONSTRAINT trip_participant_claims_telegram_user_id_shape CHECK (telegram_user_id IS NULL OR telegram_user_id ~ '^[0-9]{1,20}$'),
+  CONSTRAINT trip_participant_claims_released_holds_no_id CHECK (released_at IS NULL OR telegram_user_id IS NULL),
   CONSTRAINT trip_participant_claims_id_is_opaque CHECK (id ~ '^tpc_[A-Za-z0-9]{8,64}$'),
   CONSTRAINT trip_participant_claims_username_shape CHECK (runtime_username ~ '^[a-z0-9][a-z0-9._-]{1,63}$'),
   CONSTRAINT trip_participant_claims_via_check CHECK (via IN ('group_membership', 'invite')),
@@ -92,7 +102,7 @@ CREATE OR REPLACE FUNCTION control_plane.trg_membership_ended_releases_claim() R
 LANGUAGE plpgsql AS $$
 BEGIN
   UPDATE control_plane.trip_participant_claims
-     SET released_at = now(), released_reason = 'membership_ended'
+     SET released_at = now(), released_reason = 'membership_ended', telegram_user_id = NULL
    WHERE trip_id = NEW.trip_id AND user_id = NEW.user_id AND released_at IS NULL;
   RETURN NEW;
 END;

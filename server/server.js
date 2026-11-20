@@ -850,6 +850,8 @@ function authRequired(req, res, next) {
     // #523: a SECONDARY organizer (added by the main organizer with a trip link) is an organizer of THIS trip only. The mark
     // exists only on a verified managed session whose binding is on file for this trip; it is read, never taken from a request.
     if (controlPlaneAuth.isSecondaryOrganizerPayload(payload)) req.user.secondaryOrganizer = true;
+    // A session that came from a GROUP CLAIM (control-plane-auth.js): read from the stored binding, once per request.
+    if (controlPlaneAuth.isClaimedSessionPayload(payload)) req.user.claimedSession = true;
     next();
   } catch {
     return res.status(401).json({ error: 'invalid_token' });
@@ -1278,6 +1280,7 @@ require('./companion-control').registerCompanionControl({ app, authRequired, org
 try { require('./trip-mcp').registerTripMcp({
   app, db, jwt, jwtSecret: JWT_SECRET, jwtSecretIsDefault: JWT_SECRET === 'trip-dev-secret-change-me',
   validManagedPayload: payload => controlPlaneAuth.validManagedPayload(payload),
+  claimedPayload: payload => controlPlaneAuth.isClaimedSessionPayload(payload),
   organizers: () => normalizeOrganizers(TRIP_CONFIG.agent),
   userExists: username => Boolean(getUser(username)) && (TRIP_CONFIG.participants || []).some(p => p.username === username),
   // Never the raw config: whatever the connector says about the trip is what
@@ -1751,7 +1754,17 @@ app.delete('/api/auth/avatar', authRequired, (req, res) => {
   res.json({ ok: true });
 });
 
+// A session that came from a group claim opens the trip as the traveller and nothing more: it may not set a password,
+// link or unlink Google, or (trip-mcp) approve an MCP connection, because each of those outlives the binding and the
+// control plane's Release, leave-the-group and Unlink would never reach it. Refused alike for all of them.
+function refuseClaimedSession(req, res) {
+  if (!req.user?.claimedSession) return false;
+  res.status(403).json({ error: 'claimed_session_cannot_change_credentials' });
+  return true;
+}
+
 app.put('/api/auth/password', authRequired, async (req, res) => {
+  if (refuseClaimedSession(req, res)) return;
   const { password } = req.body || {};
   if (!password || password.length < 4) return res.status(400).json({ error: 'password_too_short' });
   const hash = await bcrypt.hash(password, 10);
@@ -1763,6 +1776,7 @@ app.put('/api/auth/password', authRequired, async (req, res) => {
 // This never creates accounts — it only links a Google identity onto a
 // username the trip admin already seeded in trip.config.json.
 app.put('/api/auth/google-link', authRequired, async (req, res) => {
+  if (refuseClaimedSession(req, res)) return;
   if (!googleClient) return res.status(503).json({ error: 'google_not_configured' });
   const { idToken } = req.body || {};
   if (!idToken) return res.status(400).json({ error: 'missing_id_token' });
@@ -1781,6 +1795,7 @@ app.put('/api/auth/google-link', authRequired, async (req, res) => {
 });
 
 app.delete('/api/auth/google-link', authRequired, (req, res) => {
+  if (refuseClaimedSession(req, res)) return;
   db.prepare('UPDATE users SET google_sub = NULL, google_email = NULL, google_picture = NULL WHERE username = ?').run(req.user.username);
   res.json({ ok: true });
 });

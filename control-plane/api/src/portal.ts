@@ -17,7 +17,7 @@ import { issueApproval } from "./plan-approval.js";
 import { removeMember } from "./member-removal.js";
 import { structuredLog } from "./redaction.js";
 import {
-  CLAIM_ID_SHAPE, GROUP_VERIFIED_VIA, TRIP_ID_PATTERN, claimSessionSlot, claimTravellerInTx, endGroupClaimInTx, enqueueSignInNotice, linkMemberOrSkip,
+  CLAIM_ID_SHAPE, GROUP_VERIFIED_VIA, TRIP_ID_PATTERN, openGroupChat, claimSessionSlot, claimTravellerInTx, endGroupClaimInTx, enqueueSignInNotice, linkMemberOrSkip,
   recordLinkSignIn, resolveMiniAppLaunch, telegramLinksByTrip, unlinkTelegramLink, unlinkedTelegramLinksByTrip,
   type GroupSignInDeps, type LabelVisibility, type ReleasedClaim, type SiteParticipant, type TelegramMiniAppConfig,
 } from "./telegram-mini-app.js";
@@ -423,6 +423,8 @@ interface PortalUser {
   sessionDigest: string;
   sessionId: string;
   sessionCreatedAt: Date;
+  /** The Telegram link that minted this session, if one did (group sign-in asks the group again through it). */
+  telegramLinkId: string | null;
   /**
    * NULL for a full (password / Google) session. For a session a Telegram link
    * minted, the trips that Telegram account is linked to - possibly none. See
@@ -499,6 +501,7 @@ async function portalUser(request: FastifyRequest, deps: PortalDependencies): Pr
     sessionDigest: row.session_digest,
     sessionId: row.session_id,
     sessionCreatedAt: row.session_created_at,
+    telegramLinkId: row.telegram_link_id,
     scope,
   };
 }
@@ -1101,6 +1104,60 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
       catch { miniAppLog(structuredLog("warn", "member_claim.site_release_failed", {})); }
     }
   };
+  /**
+   * GROUP SESSIONS STAY AS GOOD AS THE SEAT IN THE GROUP (spec S1, owner's decisions of 2026-11-20). A session a group claim
+   * minted is asked about at two moments that are not a Mini App launch: when it asks for a runtime grant
+   * (`POST /v1/trips/:id/launch`, every time) and when the gateway asks whether the trip session it opened is still live
+   * (`/internal/runtime-sessions/check`, at most once per 10 minutes per claim: `last_group_check_at`). Never a Telegram
+   * call for any other session: the first query decides, and a session that is not wholly a group session is `not_group`.
+   *   live     Telegram said "in" (now, or inside the last 10 minutes): carry on.
+   *   revoked  Telegram said "not in": the link, claim, sessions and membership end HERE (as at a Mini App launch,
+   *            `left_group`), the site binding is released after commit, and the caller refuses like any revoked session.
+   *   unknown  Telegram did not say: no grant for a launch (retry), STILL LIVE for the liveness check, nothing revoked, and
+   *            `last_group_check_at` is not advanced so the next check asks again (an outage must not log a family out).
+   *   dormant  the switch is off or unreadable, the group is not exactly one, or the path is not wired: not live, nothing
+   *            revoked, no Telegram call. Switching the feature back on makes the same session work again.
+   */
+  const GROUP_RECHECK_INTERVAL = "10 minutes";
+  const groupSessionVerdict = async (input: { tripId: string; userId: string; sessionId: string | null; everyTime: boolean }): Promise<"not_group" | "live" | "revoked" | "unknown" | "dormant"> => {
+    const sessions = await deps.db.query<{ is_group: boolean | null }>(
+      `SELECT (l.verified_via = $3) AS is_group
+         FROM control_plane.web_sessions s
+         LEFT JOIN control_plane.telegram_member_links l ON l.id = s.telegram_link_id
+        WHERE s.user_id = $1 AND s.revoked_at IS NULL AND s.expires_at > now() AND ($2::text IS NULL OR s.id = $2::text)`,
+      [input.userId, input.sessionId, GROUP_VERIFIED_VIA]);
+    if (sessions.rows.length === 0 || !sessions.rows.every((row) => row.is_group === true)) return "not_group";
+    if (!groupSignIn || !(await featureEnabled(deps.db, input.tripId, "member_group_sign_in", miniAppLog))) return "dormant";
+    const claim = await deps.db.query<{ telegram_user_id: string | null; fresh: boolean }>(
+      `SELECT telegram_user_id, (last_group_check_at IS NOT NULL AND last_group_check_at > now() - interval '${GROUP_RECHECK_INTERVAL}') AS fresh
+         FROM control_plane.trip_participant_claims WHERE trip_id = $1 AND user_id = $2 AND released_at IS NULL`,
+      [input.tripId, input.userId]);
+    const telegramUserId = claim.rows[0]?.telegram_user_id;
+    if (!telegramUserId) return "dormant";
+    if (!input.everyTime && claim.rows[0]!.fresh) return "live";
+    const chat = await openGroupChat(deps.db, input.tripId);
+    if (!chat) return "dormant";
+    const member = await groupSignIn.isActiveMember(chat, telegramUserId);
+    if (member === "unknown") return "unknown";
+    if (member === true) {
+      await deps.db.query("UPDATE control_plane.trip_participant_claims SET last_group_check_at = now() WHERE trip_id = $1 AND user_id = $2 AND released_at IS NULL", [input.tripId, input.userId]);
+      return "live";
+    }
+    const client = await deps.db.connect();
+    let ended: ReleasedClaim[];
+    try {
+      await client.query("BEGIN");
+      ended = await endGroupClaimInTx(client, { tripId: input.tripId, userId: input.userId, linkReason: "left_group", claimReason: "left_group" });
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+    await releaseSiteBindings(ended);
+    return "revoked";
+  };
   app.post("/v1/auth/telegram-mini-app", {
     // initData is capped at 4096 bytes; a body that cannot hold one is not one.
     bodyLimit: 65536,
@@ -1234,6 +1291,8 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
         miniAppLog(structuredLog("info", "mini_app.group_claim", { outcome: result.kind }));
         if (result.kind === "stale") return reply.code(401).send({ error: "TELEGRAM_INIT_DATA_STALE" });
         if (result.kind === "already_claimed") return reply.code(409).send({ error: "ALREADY_CLAIMED" });
+        // The site could not say who is on the trip: nothing is known, so say "try again", not "no".
+        if (result.kind === "unavailable") return reply.header("retry-after", "5").code(503).send({ error: "MEMBERSHIP_CHECK_UNAVAILABLE", retryable: true });
         return reply.code(404).send({ error: "NOT_FOUND" });
       }
       if (!(await claimSessionSlot(client, launch, cfg.maxAgeSeconds))) {
@@ -1274,7 +1333,10 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
       if (siteBound && !committed) await releaseSiteBindings([siteBound]);
       // The one error a concurrent claim may legitimately raise past the locks: the unique index said "taken".
       if ((error as { code?: string } | null)?.code === "23505") return reply.code(409).send({ error: "ALREADY_CLAIMED" });
-      throw error;
+      // Anything else (a failed COMMIT included) is answered with a body that says nothing: the database's own message
+      // can quote a constraint, a column or a value. The kind is logged; nothing is echoed.
+      miniAppLog(structuredLog("error", "mini_app.group_claim", { outcome: "error", safe_error_code: (error as { code?: string } | null)?.code ?? "UNKNOWN" }));
+      return reply.code(500).send({ error: "INTERNAL_ERROR" });
     } finally {
       client.release();
     }
@@ -2140,6 +2202,13 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     const tripId = (request.params as { id?: string }).id ?? "";
     const member = await membership(deps, tripId, user.id);
     if (!member?.runtime_access) return reply.code(404).send({ error: "NOT_FOUND" });
+    // A session a group claim minted gets no runtime grant unless its person is still in the group (groupSessionVerdict).
+    if (user.telegramLinkId) {
+      const verdict = await groupSessionVerdict({ tripId, userId: user.id, sessionId: user.sessionId, everyTime: true });
+      if (verdict === "dormant") return reply.code(404).send({ error: "NOT_FOUND" });
+      if (verdict === "revoked") return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+      if (verdict === "unknown") return reply.header("retry-after", "5").code(503).send({ error: "MEMBERSHIP_CHECK_UNAVAILABLE", retryable: true });
+    }
     const token = base64url(32);
     await deps.db.query(
       `INSERT INTO control_plane.runtime_launch_grants(id, trip_id, user_id, token_digest, audience, expires_at, session_id)
@@ -2213,6 +2282,10 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     if (!(await sessionMayOpenTrip(deps, { userId, tripId, sessionId: typeof sessionId === "string" ? sessionId : null }))) {
       return reply.code(401).send({ error: "SESSION_REVOKED" });
     }
+    // A group-claim session is only as live as the person's seat in the group (at most one Telegram question per 10
+    // minutes per claim; none for any other session). A Telegram outage answers LIVE: it must not log a family out.
+    const group = await groupSessionVerdict({ tripId, userId, sessionId: typeof sessionId === "string" ? sessionId : null, everyTime: false });
+    if (group === "dormant" || group === "revoked") return reply.code(401).send({ error: "SESSION_REVOKED" });
     return { live: true };
   });
 

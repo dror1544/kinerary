@@ -376,7 +376,7 @@ function sameClaimId(a: string, b: string): boolean {
  * would not say which group is "the" group; none means no group to ask; a retired or destroyed trip has none. The
  * caller treats null as "no", which is the answer for every one of those, so nothing tells them apart.
  */
-async function openGroupChat(client: pg.PoolClient, tripId: string): Promise<string | null> {
+export async function openGroupChat(client: Pick<pg.PoolClient, "query">, tripId: string): Promise<string | null> {
   const result = await client.query<{ chat_id: string }>(
     `SELECT b.chat_id
        FROM control_plane.telegram_chat_bindings b
@@ -832,6 +832,8 @@ export async function linkMemberOrSkip(
 
 export type ClaimResult =
   | { kind: "claimed"; target: SessionTarget; runtimeUsername: string }
+  /** The trip site cannot be asked who is on the trip: nothing is known, so nothing is written; retryable. */
+  | { kind: "unavailable" }
   /** Every way of being refused that must look the same: switch off, no single group, not in it, no such traveller, a stale race. */
   | { kind: "refused" }
   | { kind: "already_claimed" }
@@ -873,7 +875,7 @@ export async function claimTravellerInTx(
   // Not "unknown" either: a person mid-claim whose Telegram check wobbles is refused like a stranger, and tries again.
   if ((await group.isActiveMember(chat, launch.telegramUserId)) !== true) return { kind: "refused" };
   const candidates = await siteCandidates(group, tripId);
-  if (!candidates) return { kind: "refused" };
+  if (!candidates) return { kind: "unavailable" };
   // No early exit: how long the comparison takes does not say how far down the list a guess matched.
   let picked: Candidate | undefined;
   for (const candidate of candidates) if (sameClaimId(candidate.claimId, input.claimId)) picked = candidate;
@@ -906,9 +908,9 @@ export async function claimTravellerInTx(
   );
   try {
     await client.query(
-      `INSERT INTO control_plane.trip_participant_claims(id, trip_id, user_id, runtime_username, via)
-       VALUES ($1, $2, $3, $4, 'group_membership')`,
-      [opaqueId("tpc"), tripId, userId, picked.username],
+      `INSERT INTO control_plane.trip_participant_claims(id, trip_id, user_id, runtime_username, via, telegram_user_id, last_group_check_at)
+       VALUES ($1, $2, $3, $4, 'group_membership', $5, now())`,
+      [opaqueId("tpc"), tripId, userId, picked.username, launch.telegramUserId],
     );
   } catch (error) {
     // The partial unique index is the last word: the check above is not the only thing keeping one traveller to one person.
@@ -1022,7 +1024,7 @@ export async function endGroupClaimInTx(
     );
   }
   const released = await client.query<{ runtime_username: string }>(
-    `UPDATE control_plane.trip_participant_claims SET released_at = now(), released_reason = $3
+    `UPDATE control_plane.trip_participant_claims SET released_at = now(), released_reason = $3, telegram_user_id = NULL
       WHERE trip_id = $1 AND user_id = $2 AND released_at IS NULL
       RETURNING runtime_username`,
     [input.tripId, input.userId, input.claimReason],

@@ -1,0 +1,24 @@
+{
+  "_about": "The ONE case table for the trip site's adopt/release rules (server/control-plane-auth.js). It is run against the REAL site by tests/control-plane-binding-cases.test.js and against the control-plane tests' FAKE site by control-plane/api/test/site-binding-cases.test.ts, which loads this same file by relative path (the control-plane workflow checks out the whole repository). Edit a rule on one side and the other side's run of this table fails.",
+  "_vocabulary": {
+    "participant": "member = a plain member of the trip site; organizer = a configured organizer; unknown = not a participant",
+    "existing": "none | actor | other_user | invite | actor_on_other_participant: what the site already holds for the participant being asked about (the actor is the control-plane user making the call)",
+    "holder": "who can open the participant afterwards: actor | previous (whoever held it before) | nobody",
+    "order": "cases run in this order against one site; the invite case permanently consumes the second plain member, so it is last"
+  },
+  "adopt": [
+    { "name": "a free plain member is bound to the actor", "participant": "member", "existing": "none", "result": "ok", "holder": "actor" },
+    { "name": "the same actor adopting again is not an error", "participant": "member", "existing": "actor", "result": "ok", "holder": "actor" },
+    { "name": "a leftover binding of another account is replaced", "participant": "member", "existing": "other_user", "result": "ok", "holder": "actor" },
+    { "name": "an actor already bound to another participant is refused", "participant": "member", "existing": "actor_on_other_participant", "result": "conflict", "holder": "nobody" },
+    { "name": "an organizer is never bound", "participant": "organizer", "existing": "none", "result": "refused", "holder": "nobody" },
+    { "name": "a name that is not a participant is never bound", "participant": "unknown", "existing": "none", "result": "refused", "holder": "nobody" },
+    { "name": "an invite-bound binding is never displaced", "participant": "member2", "existing": "invite", "result": "conflict", "holder": "previous" }
+  ],
+  "release": [
+    { "name": "the actor releases its own binding", "participant": "member", "existing": "actor", "as": "actor", "released": true, "holder": "nobody" },
+    { "name": "another account's release changes nothing", "participant": "member", "existing": "other_user", "as": "actor", "released": false, "holder": "previous" },
+    { "name": "releasing what nobody holds is not an error", "participant": "member", "existing": "none", "as": "actor", "released": false, "holder": "nobody" },
+    { "name": "an invite-bound binding is never released through this path", "participant": "member2", "existing": "invite", "as": "previous", "released": false, "holder": "previous" }
+  ]
+}

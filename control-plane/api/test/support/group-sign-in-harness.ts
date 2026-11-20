@@ -25,6 +25,7 @@ import { applyMigrations } from "../../src/migrations.js";
 import { sha256, type PortalDependencies } from "../../src/portal.js";
 import { groupMembershipChecker } from "../../src/telegram-group-membership.js";
 import { TEST_BOT_TOKEN, launchFields, signedInitData, userField } from "./mini-app-init-data.js";
+import { fakeAdopt, fakeRelease, newFakeSiteState } from "./fake-site.js";
 import { testPool } from "./test-database.js";
 
 export const ORIGIN = "http://portal.example.test";
@@ -126,9 +127,10 @@ export async function startHarness(): Promise<Harness> {
 
   const logs: string[] = [];
   const site = new Map<string, SitePerson[] | "unreachable">();
-  const siteBindings = new Map<string, string>();
+  const siteState = newFakeSiteState();
+  const siteBindings = siteState.bindings;
   const siteFail: Harness["siteFail"] = {};
-  const siteHeld = new Set<string>();
+  const siteHeld = siteState.invited;
   const siteCalls: Harness["siteCalls"] = { adopt: [], release: [] };
   const portalDeps = (db: pg.Pool, overrides: Partial<PortalDependencies>): PortalDependencies => ({
     db,
@@ -137,22 +139,19 @@ export async function startHarness(): Promise<Harness> {
       provisionParticipant: async () => {},
       adoptParticipant: async (input: { tripId: string; userId: string; runtimeUsername: string }) => {
         siteCalls.adopt.push(input);
-        const key = `${input.tripId}:${input.runtimeUsername}`;
         const fail = siteFail.adopt; delete siteFail.adopt;
         if (fail === "unavailable") throw new Error("RUNTIME_PARTICIPANT_ADOPT_FAILED");
         if (fail === "refused" || fail === "conflict") return fail;
-        // the site's rule: an invite-bound name is never displaced; any other binding is a leftover and is replaced
-        if (siteHeld.has(key)) return "conflict" as const;
-        siteBindings.set(key, input.userId);
+        const people = site.get(input.tripId);
+        const answer = fakeAdopt(siteState, people === "unreachable" ? [] : people, input);
         if (fail === "bind_then_fail") throw new Error("RUNTIME_PARTICIPANT_ADOPT_FAILED");
-        return "ok" as const;
+        return answer;
       },
       releaseParticipant: async (input: { tripId: string; userId: string; runtimeUsername: string }) => {
         siteCalls.release.push(input);
         const fail = siteFail.release; delete siteFail.release;
         if (fail === "unavailable") throw new Error("RUNTIME_PARTICIPANT_RELEASE_FAILED");
-        const key = `${input.tripId}:${input.runtimeUsername}`;
-        if (siteBindings.get(key) === input.userId) siteBindings.delete(key);
+        fakeRelease(siteState, input);
       },
       listParticipants: async (tripId: string) => {
         const people = site.get(tripId);

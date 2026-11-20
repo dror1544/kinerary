@@ -41,7 +41,7 @@ function resolveOrigin(raw) {
 }
 
 function registerTripMcp({
-  app, db, env = process.env, jwt, jwtSecret, jwtSecretIsDefault, validManagedPayload, organizers, userExists,
+  app, db, env = process.env, jwt, jwtSecret, jwtSecretIsDefault, validManagedPayload, claimedPayload = () => false, organizers, userExists,
   getPublicConfig, authRequired, listenPort, listenHost,
 }) {
   const wanted = ['1', 'true'].includes(String(env.TRIP_MCP_ENABLED || '').toLowerCase());
@@ -233,6 +233,8 @@ function registerTripMcp({
     try {
       const payload = jwt.verify(m[1], jwtSecret, { algorithms: ['HS256'] });
       if (!payload?.username || !validManagedPayload(payload)) return null;
+      // A group-claim session (control-plane-auth.js) may not approve a connection: the grant would outlive the binding.
+      if (claimedPayload(payload)) return null;
       return payload.username;
     } catch { return null; }
   }
