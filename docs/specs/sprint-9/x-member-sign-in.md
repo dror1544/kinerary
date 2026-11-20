@@ -331,8 +331,11 @@ contradicts the text above, the amendment wins.
   links are dormant, not revoked: no launch, not live, no Telegram call. They work again when
   the switch is back on.
 - **A5: the claims list stays in the trip site's Organizer settings**, as written above. The
-  trip site gets a route that forwards the list and Release to the control plane for a
-  signed-in organizer, because `trip-web` talks only to the trip site (S1's UI half).
+  runtime gateway forwards the list and Release to the control plane
+  (`/t/:tripId/__member-claims`), because `trip-web` talks only to the trip site and the trip
+  site has no way to call the control plane. The gateway passes only the user, trip and session
+  from its own sealed cookie, and the control plane re-decides that the caller is an organizer
+  of that trip. Opened on the trip site's own hostname, the list does not render.
 - **A6: whether a pending personal invite reserves its traveller from group claims is decided
   in S2.** Today only a redeemed invite does (AC-4).
 - **A7: the group check uses the relay's bot**, the one that sits in the trip groups. It never
