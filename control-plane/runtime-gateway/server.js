@@ -402,20 +402,29 @@ async function memberInvites(req, res, tripId, username) {
 }
 
 // Is this path (under /t/:trip) one of the trip site's INTERNAL routes? The site's router is case-insensitive and may decode what it is
-// given, so the gateway's block has to match the SAME paths: it percent-decodes (up to four times, so a doubly-encoded spelling is
-// seen), lower-cases and collapses repeated slashes before it looks, and a path that cannot be decoded is treated as internal (a site
-// route that cannot be read cannot be shown to be harmless). Previously `/API/internal/...` got past a case-sensitive prefix test and was
-// held only because the gateway strips x-api-key.
+// given, so the gateway's block has to match the SAME paths. Every form the path can take is looked at: the raw path, then each round of
+// percent-decoding (up to ten, so a many-times-encoded spelling is seen), each lower-cased with repeated slashes collapsed; if ANY of them
+// is `/api/internal` or under it, the path is internal. A round that cannot be decoded (a malformed escape such as `%zz`, or a literal
+// percent sign that an earlier round produced, as in `100%25.jpg`) does NOT make the path internal and does not stop the look: it is
+// decoded leniently instead (valid `%XX` escapes only, anything else left as it is), so `/%2561pi/internal/100%25.jpg` is still seen as
+// `/api/internal/...` while `/api/photos/file/100%25.jpg` never becomes anything internal. Previously `/API/internal/...` got past a
+// case-sensitive prefix test and was held only because the gateway strips x-api-key; a first version of this treated any decode failure as
+// internal, which blocked ordinary file names with a literal percent sign.
+const isInternalForm = (value) => {
+  const form = value.toLowerCase().replace(/\/{2,}/g, "/");
+  return form === "/api/internal" || form.startsWith("/api/internal/");
+};
+const lenientDecode = (value) => value.replace(/%([0-9a-fA-F]{2})/g, (_match, hex) => String.fromCharCode(parseInt(hex, 16)));
 export function isInternalPath(suffix) {
   let path = String(suffix);
-  for (let round = 0; round < 4; round += 1) {
+  for (let round = 0; round < 10; round += 1) {
+    if (isInternalForm(path)) return true;
     let decoded;
-    try { decoded = decodeURIComponent(path); } catch { return true; }
-    if (decoded === path) break;
+    try { decoded = decodeURIComponent(path); } catch { decoded = lenientDecode(path); }
+    if (decoded === path) return false;
     path = decoded;
   }
-  path = path.toLowerCase().replace(/\/{2,}/g, "/");
-  return path === "/api/internal" || path.startsWith("/api/internal/");
+  return isInternalForm(path);
 }
 
 // Ask again while a stream is open, at half the cache window so a revocation

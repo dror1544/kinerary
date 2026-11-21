@@ -135,6 +135,73 @@ describe("removing an invite-bound member ends their trip-site binding", { skip 
   });
 });
 
+describe("the audit lines and the refused removals", { skip }, () => {
+  const events = () => h.logs.map((line) => { try { return JSON.parse(line) as Record<string, unknown>; } catch { return null; } }).filter((x): x is Record<string, unknown> => x !== null);
+
+  test("removing an INVITE member logs member_invite.binding_released (reason only), never a group-claim end; removing a CLAIM logs the group-claim line and no invite line; no id is in either", async () => {
+    const f = await fixture();
+    try {
+      const m = await member(f);
+      const start = h.logs.length;
+      assert.equal((await removeViaMembers(f, m.userId)).statusCode, 200);
+      const lines = h.logs.slice(start);
+      const mine = events().filter((e) => lines.some((line) => line.includes(String(e.event))));
+      assert.ok(lines.some((line) => line.includes("member_invite.binding_released")), "the invite release has its own event");
+      assert.deepEqual(events().filter((e) => e.event === "member_invite.binding_released").at(-1), { ...events().filter((e) => e.event === "member_invite.binding_released").at(-1)!, reason: "membership_ended" });
+      assert.equal(lines.some((line) => line.includes("mini_app.group_claim")), false, "no group claim ended, so no group-claim line");
+      for (const secret of [m.inviteId, m.userId, "dl17", f.tripId]) assert.equal(lines.join("\n").includes(secret), false, "no id in the audit line");
+      void mine;
+      // revoking the redeemed invite: the same event, its own reason
+      const n = await member(f, "nl23");
+      const before = h.logs.length;
+      assert.equal((await removeViaInvite(f, n.inviteId)).statusCode, 200);
+      const revoked = h.logs.slice(before);
+      assert.ok(revoked.some((line) => line.includes("member_invite.binding_released") && line.includes("invite_revoked")));
+      assert.equal(revoked.some((line) => line.includes("mini_app.group_claim")), false);
+      // a removed group claim: the group-claim line stays, and there is no invite line
+      const person = tg();
+      await h.telegram.member(f.groupChat, person, "member");
+      const offer = (await launch(f.app, initDataFor(person, { tripId: f.tripId }))).json() as { travellers: { claimId: string; name: string }[] };
+      assert.equal((await claim(f.app, initDataFor(person, { tripId: f.tripId }), f.tripId, offer.travellers[0]!.claimId)).statusCode, 200);
+      const claimant = (await h.pool.query("SELECT user_id FROM control_plane.trip_participant_claims WHERE trip_id = $1 AND released_at IS NULL", [f.tripId])).rows[0].user_id as string;
+      const mark = h.logs.length;
+      assert.equal((await removeViaMembers(f, claimant)).statusCode, 200);
+      const claimLines = h.logs.slice(mark);
+      assert.ok(claimLines.some((line) => line.includes("mini_app.group_claim") && line.includes("membership_ended")));
+      assert.equal(claimLines.some((line) => line.includes("member_invite.binding_released")), false);
+    } finally { await f.app.close(); }
+  });
+
+  test("a REFUSED removal sends no release to the site: an unknown membership (404), an owner removing themselves (409), and an organizer removing an owner (409 OWNER_ONLY), by the members route and by revoking the redeemed invite", async () => {
+    const f = await fixture();
+    try {
+      // the invite member is an OWNER too (promoted), so the removal rules refuse in each way below
+      const m = await member(f);
+      await h.pool.query("UPDATE control_plane.trip_memberships SET role = 'owner', dashboard_access = true WHERE trip_id = $1 AND user_id = $2", [f.tripId, m.userId]);
+      const ownerSelf = await h.webSession(m.userId, "owner-self");
+      const organizerUser = await h.mkUser("Organizer"); await h.mkMember(f.tripId, organizerUser, "organizer");
+      const organizer = await h.webSession(organizerUser, "organizer");
+      const membershipId = (await h.pool.query("SELECT id FROM control_plane.trip_memberships WHERE trip_id = $1 AND user_id = $2", [f.tripId, m.userId])).rows[0].id as string;
+      const releases = h.siteCalls.release.length;
+      const as = (who: { cookie: string; csrf: string }, method: "DELETE", url: string) => f.app.inject({ method, url, headers: { cookie: who.cookie, "x-csrf-token": who.csrf } });
+      const unknown = await as(f.ownerSession, "DELETE", `/v1/trips/${f.tripId}/members/memb_doesnotexist`);
+      assert.equal(unknown.statusCode, 404);
+      const self = await as(ownerSelf, "DELETE", `/v1/trips/${f.tripId}/members/${membershipId}`);
+      assert.equal(self.statusCode, 409, self.body);
+      assert.equal((self.json() as { error: string }).error, "CANNOT_REMOVE_SELF");
+      const ownerOnly = await as(organizer, "DELETE", `/v1/trips/${f.tripId}/members/${membershipId}`);
+      assert.equal(ownerOnly.statusCode, 409, ownerOnly.body);
+      assert.equal((ownerOnly.json() as { error: string }).error, "OWNER_ONLY");
+      assert.equal((await as(ownerSelf, "DELETE", `/v1/trips/${f.tripId}/site-invites/${m.inviteId}`)).statusCode, 409, "revoking the redeemed invite is refused the same way");
+      assert.equal((await as(organizer, "DELETE", `/v1/trips/${f.tripId}/site-invites/${m.inviteId}`)).statusCode, 409);
+      assert.equal(h.siteCalls.release.length, releases, "no release was sent for any refused removal");
+      assert.equal(h.siteBindings.get(siteKey(f.tripId, "dl17")), m.userId, "the binding is intact");
+      assert.equal((await h.pool.query("SELECT status FROM control_plane.trip_memberships WHERE id = $1", [membershipId])).rows[0].status, "active");
+      assert.equal((await h.pool.query("SELECT state FROM control_plane.site_invites WHERE id = $1", [m.inviteId])).rows[0].state, "redeemed");
+    } finally { await f.app.close(); }
+  });
+});
+
 describe("deadInviteIdsFor: what it returns for each state, and why it can never name a live member's invite", { skip }, () => {
   test("a redeemed ACTIVE member's invite is never listed, however the row is tampered with; once they are removed it is, and only then", async () => {
     const f = await fixture();

@@ -1212,8 +1212,10 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
    */
   const releaseSiteBindings = async (released: readonly ReleasedClaim[]): Promise<void> => {
     for (const claim of released) {
-      // The audit trail of a claim that ended (the reason only: no trip, person, traveller or chat id).
-      miniAppLog(structuredLog("info", "mini_app.group_claim", { outcome: "ended", reason: claim.reason ?? "unknown" }));
+      // The audit trail (the reason only: no trip, person, traveller, invite or chat id). A removed INVITE member's binding is not a group
+      // claim ending, and must not read as one: it has its own event.
+      if (claim.inviteId) miniAppLog(structuredLog("info", "member_invite.binding_released", { reason: claim.reason ?? "unknown" }));
+      else miniAppLog(structuredLog("info", "mini_app.group_claim", { outcome: "ended", reason: claim.reason ?? "unknown" }));
       try { await deps.runtimeAccounts.releaseParticipant(claim); }
       catch { miniAppLog(structuredLog("warn", "member_claim.site_release_failed", {})); }
     }

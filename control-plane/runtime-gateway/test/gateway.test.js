@@ -814,7 +814,7 @@ test("the trip site's internal routes are unreachable through /t/<trip>/ however
     "/api/internal/control-plane/participants", "/API/internal/control-plane/participants", "/Api/Internal/control-plane/participants", "/api/INTERNAL/control-plane/participants",
     "/api%2Finternal/control-plane/participants", "/api%2fINTERNAL/control-plane/participants", "/%61pi/internal/control-plane/participants", "/api/%69nternal/control-plane/participants",
     "/%41pi/%49nternal/control-plane/session", "/api%252Finternal/control-plane/participants", "/%2561pi/internal/control-plane/participants", "/api//internal/control-plane/participants",
-    "/api/internal", "/API/INTERNAL", "/api/internal%2Fcontrol-plane/session", "/api/internal/../internal/control-plane/session", "/api/%E0%A4%A/internal/control-plane/session",
+    "/api/internal", "/API/INTERNAL", "/api/internal%2Fcontrol-plane/session", "/api/internal/../internal/control-plane/session", "/api/internal/%E0%A4%A", "/api/internal/%zz", "/API/INTERNAL/%zz/x", "/api/internal%2F%zz",
   ];
   for (const path of spellings) {
     for (const method of ["GET", "POST"]) {
@@ -831,6 +831,24 @@ test("the trip site's internal routes are unreachable through /t/<trip>/ however
   // an ordinary path that merely contains the word is still proxied
   const ordinary = await fetch(`${gatewayOrigin}/t/trip_abcdefgh/api/internals-are-not-a-thing`, { headers: { cookie } });
   assert.equal(ordinary.status, 200);
+});
+
+test("a correctly encoded literal percent sign in an ordinary path is NOT mistaken for an internal route: 100%25.jpg and friends are proxied", async () => {
+  const cookie = await organizerCookie("once-percent-paths");
+  for (const name of ["100%25.jpg", "100%25%20fun.jpg", "50%25off.jpg", "100%2525.jpg", "a%252Fb.jpg", "%E2%82%AC5.jpg"]) {
+    proxiedAuthorization = undefined;
+    const response = await fetch(`${gatewayOrigin}/t/trip_abcdefgh/api/photos/file/${name}`, { headers: { cookie } });
+    assert.equal(response.status, 200, name);
+    assert.deepEqual(await response.json(), { path: `/api/photos/file/${name}` }, `${name}: reached the trip site unchanged`);
+    assert.ok(proxiedAuthorization, `${name}: proxied with the session`);
+  }
+  // ...while a malformed escape beside the internal prefix, or an internal prefix reached by decoding, is still the gateway's 404
+  for (const path of ["/api/internal/100%25.jpg", "/API/internal/%zz", "/%2561pi/internal/100%25.jpg", "/api%2Finternal/%E0%A4%A"]) {
+    proxiedAuthorization = undefined;
+    const response = await fetch(`${gatewayOrigin}/t/trip_abcdefgh${path}`, { headers: { cookie } });
+    assert.equal(response.status, 404, path);
+    assert.equal(proxiedAuthorization, undefined, `${path}: not proxied`);
+  }
 });
 
 test("invites: the gateway logs nothing for these calls: no link, no token, no user id", async () => {
