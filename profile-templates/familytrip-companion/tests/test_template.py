@@ -174,6 +174,22 @@ class Tests(unittest.TestCase):
   self.assertIn('The first clear yes from anyone there is the approval',skill)
   for stale in ('Only the organizer','can approve writing to the trip site','address the organizer','explicit organizer approval','after the organizer approves','group consensus alone','present a summary to the organizer'):
    self.assertNotIn(stale,skill,stale)
+ def test_plan_items_are_added_on_a_day_and_never_reported_as_added_unseen(self):
+  # An organizer asked for "dinner on the first day"; the companion called add_plan_item with no date, the item
+  # landed on no day, and the companion said "added to day 1". The planning skill and the SOUL now say: pass the
+  # day, or say plainly it has none, and report "added" only when the read-back shows it on that day.
+  td,o,c=self.go(); self.addCleanup(td.cleanup); self.assertEqual(c.returncode,0,c.stderr)
+  skill=' '.join((o/'skills/planning/trip-daily-planning/SKILL.md').read_text().split())
+  soul=' '.join((o/'SOUL.md').read_text().split())
+  for text,name in ((skill,'skill'),(soul,'SOUL')):
+   self.assertIn('Not on a day yet',text,name)
+   self.assertIn('unscheduled: true',text,name)
+   self.assertIn('`date`',text,name)
+  self.assertIn("pass it as `date`",skill)
+  self.assertIn("it has no day yet",skill)
+  self.assertIn("Say \"added to <day>\" only when the read-back shows it on that day",skill)
+  self.assertIn('is on **no day**',soul)
+  self.assertIn('only when the read-back shows it there',soul)
  def test_shipped_skills_find_their_own_files(self):
   # trip-kml-export ran its script from $PROFILE_SKILLS_DIR, which nothing
   # defines, so on every companion the path pointed at /travel/... (#71). A

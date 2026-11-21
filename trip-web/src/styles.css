@@ -272,6 +272,12 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .timeline-editor-actions .danger-text { color: #b42318; }
 .timeline-editor-actions .danger-text:hover { background: rgba(180, 35, 24, .08); color: #8c1d18; }
 .journey-edit-trigger { margin-top: 16px; }
+/* Items filed under a phase with no day yet — listed apart from the day on screen. Logical properties so it holds in RTL. */
+.plan-undated { display: grid; gap: 10px; margin-block-start: 22px; padding-block-start: 16px; border-block-start: 1px dashed var(--kit-line); }
+.plan-undated h3 { margin: 0; font-size: 1.05rem; }
+.plan-undated-note { margin: 0; color: var(--kit-muted); font-size: .92rem; }
+.plan-undated-actions { flex-wrap: wrap; align-items: center; }
+.plan-undated-actions select { min-height: 34px; max-width: 100%; }
 .itinerary-editor {
   display: grid;
   gap: 18px;
