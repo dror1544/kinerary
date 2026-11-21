@@ -28,6 +28,7 @@ from psycopg.rows import dict_row
 
 from control_plane_worker import feature_block
 from control_plane_worker.feature_block import (
+    MEMBER_VISIBLE_SWITCHES,
     REGISTERED_SWITCHES,
     build_features_block,
     resolve_features,
@@ -103,6 +104,14 @@ class BlockBuilderTests(unittest.TestCase):
         block = build_features_block({"delivery_probe": True, "ghost_feature": True})
         self.assertEqual({"delivery_probe": True}, block)
         self.assertIs(block["delivery_probe"], True)
+
+    def test_a_retired_switch_is_never_written_even_when_a_stored_setting_says_on(self) -> None:
+        # site_video_layout was retired on 2026-11-21 (the video layout is the only layout). A row left in the
+        # database must not put the name back into a trip's file at its next rollout.
+        self.assertNotIn("site_video_layout", REGISTERED_SWITCHES)
+        self.assertNotIn("site_video_layout", MEMBER_VISIBLE_SWITCHES)
+        self.assertEqual({}, build_features_block({"site_video_layout": True}))
+        self.assertEqual({"delivery_probe": True}, build_features_block(["site_video_layout", "delivery_probe"]))
 
     def test_anything_but_the_literal_true_is_off(self) -> None:
         for answer in (False, None, 1, "true", "t", "yes", [], {"on": True}, 0):

@@ -1,8 +1,8 @@
 /**
  * #612 — the More page of the video layout, reorganised:
  *   - the name/picture in the header opens Account; Account reads: settings, connect Claude/ChatGPT, who is coming;
- *   - "Organizer settings" (organizers only) holds Signing in, Notifications and Trip look, and no module links;
- *   - the classic layout keeps its More page exactly as it was.
+ *   - "Organizer settings" (organizers only) holds Signing in, Notifications and Trip look, and no module links.
+ * (The classic layout's More page is gone with the classic layout, 2026-11-21: #more opens Account.)
  * The whole App against the fetch stand-in of the video-release tests.
  */
 import { cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
@@ -12,7 +12,7 @@ import { config, dayItems, renderTrip, stubTripFetch, todayContext, useJsdomBasi
 beforeEach(() => { useJsdomBasics(); });
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); localStorage.clear(); window.location.hash = ""; });
 
-const VIDEO = { site_video_layout: true, plan_change_group_line: true };
+const VIDEO = { plan_change_group_line: true };
 const MEMBER = { username: "bat", name: "בת", name_en: "Bat", is_organizer: false };
 
 /** The trip stand-in, plus the assistant-connection route the shared fixture does not serve. */
@@ -84,7 +84,7 @@ describe("Organizer settings", () => {
   });
 
   it("without the group-line switch there is no Notifications section", async () => {
-    serve({ site_video_layout: true });
+    serve({});
     renderTrip({ hash: "organizer-settings" });
     expect(await screen.findByRole("heading", { name: "Trip look" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Notifications" })).toBeNull();
@@ -153,7 +153,7 @@ describe("the identity button opens Account", () => {
   });
 });
 
-describe("the menu's signed-in card opens Account (video layout)", () => {
+describe("the menu's signed-in card opens Account", () => {
   it("is a button that closes the menu and opens Account", async () => {
     serve(VIDEO);
     renderTrip();
@@ -175,43 +175,5 @@ describe("the menu's signed-in card opens Account (video layout)", () => {
     expect(await screen.findByRole("heading", { level: 1, name: /Colmar|קולמר/ })).toBeInTheDocument();
     expect(await screen.findByRole("heading", { name: /החשבון/ })).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: "Trip menu" })).toBeNull();
-  });
-
-  it("classic layout: the card stays a plain section, not a button", async () => {
-    serve(undefined);
-    renderTrip();
-    fireEvent.click(await screen.findByRole("button", { name: "Open menu" }));
-    const menu = await screen.findByRole("dialog", { name: "Trip menu" });
-    expect(within(menu).queryByRole("button", { name: /Open your account/ })).toBeNull();
-    expect(menu.querySelector("section.signed-in-user")).not.toBeNull();
-    expect(menu.querySelector("button.signed-in-user")).toBeNull();
-  });
-});
-
-describe("classic layout unchanged", () => {
-  it("More still holds the travellers, the organizer tools and the assistant block; the menu has no Organizer settings", async () => {
-    serve(undefined);
-    const { container } = renderTrip({ hash: "more" });
-    expect(await screen.findByRole("heading", { name: "Who is coming" })).toBeInTheDocument();
-    expect(await screen.findByRole("heading", { name: "Appearance" })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Signing in" })).toBeInTheDocument();
-    expect(await screen.findByRole("heading", { name: "Connect your AI assistant" })).toBeInTheDocument();
-    expect(container.querySelector(".workflow-link")).not.toBeNull();
-    expect(container.querySelector(".video-layout")).toBeNull();
-  });
-
-  it("#organizer-settings is not a page there, and Account is the account alone", async () => {
-    serve(undefined);
-    renderTrip({ hash: "organizer-settings" });
-    expect(await screen.findByRole("heading", { level: 1, name: "Alsace" })).toBeInTheDocument(); // falls back to the tab content (Today)
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    expect(screen.queryByText("Organizer access required.")).toBeNull();
-    expect(screen.queryByRole("heading", { name: "Trip look" })).toBeNull();
-    cleanup();
-    serve(undefined);
-    renderTrip({ hash: "account" });
-    expect(await screen.findByRole("heading", { name: "Your account" })).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "Who is coming" })).toBeNull();
-    expect(screen.queryByRole("heading", { name: "Connect your AI assistant" })).toBeNull();
   });
 });

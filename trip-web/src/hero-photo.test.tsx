@@ -1,4 +1,4 @@
-import { Hero } from "./App";
+import { VideoHero } from "./App";
 import { act, cleanup, render, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
 import { heroCandidates, loadHeroPhoto, useHeroPhoto } from './hero-photo';
@@ -101,15 +101,15 @@ it('keeps the last working image when all replacements fail', async () => {
 });
 
 
-it('renders an authenticated, decoded photo in the actual Hero component', async () => {
+it('renders an authenticated, decoded photo in the actual header component', async () => {
   tokenStore.set('private-token');
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, blob: async () => new Blob(['image'], { type: 'image/png' }) }));
   vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:rendered-hero');
   vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
   vi.stubGlobal('Image', class { src = ''; decode = vi.fn().mockResolvedValue(undefined); });
-  const { container } = render(<Hero config={{ meta: { homePhoto: '/api/ui/hero/photo.png' } }}
-    lang="en" activeTab="today" activeModule={null} openTab={vi.fn()} openModule={vi.fn()} openMenu={vi.fn()} />);
+  const { container } = render(<VideoHero config={{ meta: { homePhoto: '/api/ui/hero/photo.png' } }}
+    lang="en" placePhaseId="" pageName="Today" active="today" openVideoTab={vi.fn()} openMenu={vi.fn()} />);
   await waitFor(() => expect(container.querySelector('header')).toHaveAttribute('data-photo-state', 'ready'));
-  expect((container.querySelector('.hero-image-arriving') as HTMLElement).style.backgroundImage).toContain('blob:rendered-hero');
-  expect((container.querySelector('.hero-image-arriving') as HTMLElement).style.backgroundImage).not.toContain('/api/ui/hero/');
+  expect((container.querySelector('.video-hero-photo') as HTMLElement).style.backgroundImage).toContain('blob:rendered-hero');
+  expect((container.querySelector('.video-hero-photo') as HTMLElement).style.backgroundImage).not.toContain('/api/ui/hero/');
 });

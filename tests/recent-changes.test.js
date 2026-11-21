@@ -307,7 +307,7 @@ describe('system writers do not mark (Dror, 2026-11-16)', () => {
 });
 
 describe('the registry (AC-3)', () => {
-  for (const name of ['site_video_layout', 'plan_change_marks']) {
+  for (const name of ['plan_change_marks']) {
     test(`${name}: site surface, member-visible, with a one-line summary`, () => {
       const entry = findSwitch(name);
       assert.ok(entry, `${name} is not registered`);
@@ -316,6 +316,9 @@ describe('the registry (AC-3)', () => {
       assert.ok(entry.summary.length > 10 && !entry.summary.includes('\n'));
     });
   }
+  test('site_video_layout is retired (2026-11-21): not registered, so it is off everywhere and cannot be set', () => {
+    assert.equal(findSwitch('site_video_layout'), null);
+  });
   test('plan_change_group_line (1C): control_plane, site and companion surfaces, member-visible for the organizer toggle', () => {
     const entry = findSwitch('plan_change_group_line');
     assert.ok(entry, 'plan_change_group_line is not registered');
@@ -326,7 +329,7 @@ describe('the registry (AC-3)', () => {
   });
   test('the registry still loads (its shape check ran at require time) and keeps delivery_probe first', () => {
     assert.equal(FEATURE_SWITCHES[0].name, 'delivery_probe');
-    assert.deepEqual(FEATURE_SWITCHES.map((s) => s.name), ['delivery_probe', 'site_video_layout', 'plan_change_marks', 'plan_change_group_line']);
+    assert.deepEqual(FEATURE_SWITCHES.map((s) => s.name), ['delivery_probe', 'plan_change_marks', 'plan_change_group_line']);
   });
 });
 

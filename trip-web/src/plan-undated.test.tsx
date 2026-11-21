@@ -28,10 +28,9 @@ const itinerary = {
   items: [dated, idea, otherStop],
 };
 const client = () => new QueryClient({ defaultOptions: { queries: { retry: false } } });
-const journey = (props: { isOrganizer: boolean; lang?: "en" | "he"; itinerary?: unknown; videoLayout?: boolean }) => render(
+const journey = (props: { isOrganizer: boolean; lang?: "en" | "he"; itinerary?: unknown }) => render(
   <QueryClientProvider client={client()}>
-    <JourneyView itinerary={(props.itinerary ?? itinerary) as never} config={CONFIG} isOrganizer={props.isOrganizer} lang={props.lang ?? "en"}
-      videoLayout={props.videoLayout} onHeroPhaseChange={vi.fn()} />
+    <JourneyView itinerary={(props.itinerary ?? itinerary) as never} config={CONFIG} isOrganizer={props.isOrganizer} lang={props.lang ?? "en"} />
   </QueryClientProvider>,
 );
 
@@ -63,11 +62,6 @@ describe("the plan's 'Not on a day yet' group", () => {
     journey({ isOrganizer: false, lang: "he" });
     const group = screen.getByRole("region", { name: "עדיין לא שובץ ליום" });
     expect(within(group).getByText("ארוחת ערב מקומית")).toBeTruthy();
-  });
-
-  it("is the same in the video layout", () => {
-    journey({ isOrganizer: false, videoLayout: true });
-    expect(within(screen.getByRole("region", { name: "Not on a day yet" })).getByText("Local dinner")).toBeTruthy();
   });
 
   it("lets an organizer put an item on a day of its phase: PATCH to the item's own route with the day", async () => {
@@ -113,8 +107,8 @@ describe("through the whole app", () => {
     expect(within(group).getByRole("combobox")).toBeTruthy();
   });
 
-  it("video layout (site_video_layout): a member sees the group, without the picker", async () => {
-    serve({ site_video_layout: true }, { username: "bat", name: "בת", name_en: "Bat", is_organizer: false });
+  it("a member sees the group, without the picker", async () => {
+    serve({}, { username: "bat", name: "בת", name_en: "Bat", is_organizer: false });
     renderTrip({ hash: "journey" });
     const group = await screen.findByRole("region", { name: "Not on a day yet" });
     expect(within(group).getByText("Local dinner")).toBeTruthy();

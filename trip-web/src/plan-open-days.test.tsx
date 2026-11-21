@@ -51,10 +51,16 @@ const PLANNED = {
   ],
 };
 
+// The Plan's day strip: one group per phase (an h3 with the phase's name), each holding that phase's day buttons.
+const strip = () => screen.getByRole("navigation", { name: "Days of the trip" });
+const phaseNames = () => within(strip()).getAllByRole("heading", { level: 3 }).map((h) => h.textContent ?? "");
+const daysOf = (phase: string) =>
+  within(within(strip()).getByRole("heading", { name: phase }).closest(".plan-strip-group") as HTMLElement).getAllByRole("button");
+
 function tree(config: unknown, itinerary: unknown) {
   return (
     <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
-      <JourneyView itinerary={itinerary as never} config={config as never} isOrganizer lang="en" onHeroPhaseChange={vi.fn()} />
+      <JourneyView itinerary={itinerary as never} config={config as never} isOrganizer lang="en" />
     </QueryClientProvider>
   );
 }
@@ -62,47 +68,37 @@ function tree(config: unknown, itinerary: unknown) {
 describe("a trip with days no stop covers", () => {
   it("shows the open days as a phase of their own, with their count, between the two stops", () => {
     render(tree(BEFORE, EMPTY));
-    const rail = screen.getByLabelText("Trip phases");
-    expect(within(rail).getByText("Days not planned yet")).toBeInTheDocument();
-    expect(within(rail).getByText("Frankfurt")).toBeInTheDocument();
-    expect(within(rail).getByText("Colmar")).toBeInTheDocument();
-    const names = within(rail).getAllByRole("button").map((b) => b.textContent ?? "");
-    expect(names.findIndex((n) => /Frankfurt/.test(n))).toBeLessThan(names.findIndex((n) => /Days not planned yet/.test(n)));
-    expect(names.findIndex((n) => /Days not planned yet/.test(n))).toBeLessThan(names.findIndex((n) => /Colmar/.test(n)));
+    const names = phaseNames();
+    expect(names).toEqual(["Frankfurt", "Days not planned yet", "Colmar"]);
+    expect(daysOf("Days not planned yet")).toHaveLength(2);
   });
 });
 
 describe("after the one action that plans them", () => {
-  it("the placeholder is gone and the new stop is in the rail, in order, with its days", () => {
+  it("the placeholder is gone and the new stop is in the strip, in order, with its days", () => {
     const view = render(tree(BEFORE, EMPTY));
-    expect(within(screen.getByLabelText("Trip phases")).queryByText("Days not planned yet")).toBeInTheDocument();
+    expect(phaseNames()).toContain("Days not planned yet");
     // The refetch after POST /api/stops: new config, new itinerary, same component.
     view.rerender(tree(AFTER, PLANNED));
-    const rail = screen.getByLabelText("Trip phases");
-    expect(within(rail).queryByText("Days not planned yet")).not.toBeInTheDocument();
+    expect(phaseNames()).not.toContain("Days not planned yet");
     expect(screen.queryByText(/do not belong to a stop yet/)).not.toBeInTheDocument();
-    const names = within(rail).getAllByRole("button").map((b) => b.textContent ?? "");
-    expect(names.findIndex((n) => /Frankfurt/.test(n))).toBeLessThan(names.findIndex((n) => /Strasbourg/.test(n)));
-    expect(names.findIndex((n) => /Strasbourg/.test(n))).toBeLessThan(names.findIndex((n) => /Colmar/.test(n)));
-    expect(within(rail).getAllByText("2 days").length).toBeGreaterThanOrEqual(1);
+    expect(phaseNames()).toEqual(["Frankfurt", "Strasbourg", "Colmar"]);
+    expect(daysOf("Strasbourg")).toHaveLength(2);
   });
 
   it("selecting the new stop shows its itinerary: both days, the headline and the items", () => {
     render(tree(AFTER, PLANNED));
-    const rail = screen.getByLabelText("Trip phases");
-    fireEvent.click(within(rail).getByText("Strasbourg"));
-    const strip = screen.getByLabelText("Days in selected phase");
-    expect(within(strip).getAllByRole("button")).toHaveLength(2);
+    const days = daysOf("Strasbourg");
+    expect(days).toHaveLength(2);
+    fireEvent.click(days[0]!);
     expect(screen.getByText("Strasbourg Cathedral")).toBeInTheDocument();
-    fireEvent.click(within(strip).getAllByRole("button")[1]!);
+    fireEvent.click(daysOf("Strasbourg")[1]!);
     expect(screen.getByText("Christmas market")).toBeInTheDocument();
   });
 
   it("the stop and its items arrive together: a stop with no items yet still offers its days as open, never the placeholder", () => {
     render(tree(AFTER, EMPTY));
-    const rail = screen.getByLabelText("Trip phases");
-    expect(within(rail).queryByText("Days not planned yet")).not.toBeInTheDocument();
-    fireEvent.click(within(rail).getByText("Strasbourg"));
-    expect(within(screen.getByLabelText("Days in selected phase")).getAllByText("open")).toHaveLength(2);
+    expect(phaseNames()).not.toContain("Days not planned yet");
+    expect(daysOf("Strasbourg").filter((day) => /open/.test(day.textContent || ""))).toHaveLength(2);
   });
 });

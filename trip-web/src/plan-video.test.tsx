@@ -17,9 +17,9 @@ const days: ItineraryDay[] = [
   { phase_id: "colmar", date: "2026-12-04", label_en: "Fri 12/4 — Old Town" },
 ];
 
-function serve(features: Record<string, boolean> | null = { site_video_layout: true }) {
+function serve() {
   const items = [...dayItems(), item({ item_uid: "walk", text_en: "Walk the old town", date: "2026-12-04", time: "10:00", time_sort: 600 })];
-  stubTripFetch(() => ({ config: config(features ?? undefined), today: todayContext(items.filter((entry) => entry.date === TODAY)), items, days }));
+  stubTripFetch(() => ({ config: config(), today: todayContext(items.filter((entry) => entry.date === TODAY)), items, days }));
 }
 
 describe("the Plan in the video layout", () => {
@@ -27,7 +27,8 @@ describe("the Plan in the video layout", () => {
     serve();
     renderTrip({ hash: "journey" });
     const strip = await screen.findByRole("navigation", { name: "Days of the trip" });
-    const group = within(strip).getByRole("heading", { name: "Colmar" }).closest(".plan-strip-group") as HTMLElement;
+    // The strip is on screen before the trip config arrives; its groups come with the config.
+    const group = (await within(strip).findByRole("heading", { name: "Colmar" })).closest(".plan-strip-group") as HTMLElement;
     const buttons = within(group).getAllByRole("button");
     // 2–6 December: five calendar days in the one phase, planned or not.
     expect(buttons).toHaveLength(5);
@@ -42,13 +43,14 @@ describe("the Plan in the video layout", () => {
 
   it("a trip with two phases gets two groups", async () => {
     const items = dayItems();
-    const two = { ...config({ site_video_layout: true }), phases: [
+    const two = { ...config(), phases: [
       { id: "colmar", title: { en: "Colmar" }, dates: { start: "2026-12-02", end: "2026-12-03" } },
       { id: "strasbourg", title: { en: "Strasbourg" }, dates: { start: "2026-12-04", end: "2026-12-05" } },
     ] };
     stubTripFetch(() => ({ config: two, today: todayContext(items), items, days }));
     renderTrip({ hash: "journey" });
     const strip = await screen.findByRole("navigation", { name: "Days of the trip" });
+    await within(strip).findByRole("heading", { name: "Strasbourg" });
     expect(within(strip).getAllByRole("heading").map((heading) => heading.textContent)).toEqual(["Colmar", "Strasbourg"]);
   });
 
@@ -82,14 +84,12 @@ describe("the Plan in the video layout", () => {
     expect(ticks[0]).toHaveTextContent("Booked");
   });
 
-  it("with the switch off none of this exists: the rail, the pickers, no Booked tick, no Go", async () => {
-    serve(null);
+  it("there is no second layout: no rail, no day pickers, and the row's own Map and Waze links are the Go chip's job", async () => {
+    serve();
     renderTrip({ hash: "journey" });
     await screen.findByRole("heading", { name: "Winery tour" });
-    expect(document.querySelector(".plan-strip, .booked-tick, .go-chip, .date-col")).toBeNull();
-    expect(document.querySelector(".destination-rail")).not.toBeNull();
-    expect(document.querySelector(".mobile-day-picker")).not.toBeNull();
-    // Today's Map and Waze links are the Journey row's, as they were.
-    expect(screen.getByRole("link", { name: "Waze" })).toHaveAttribute("href", "https://waze.com/ul?q=winery");
+    expect(document.querySelector(".destination-rail, .day-selector, .mobile-day-picker")).toBeNull();
+    expect(document.querySelector(".plan-strip, .go-chip")).not.toBeNull();
+    expect(screen.queryByRole("link", { name: "Waze" })).toBeNull();
   });
 });

@@ -15,7 +15,7 @@ afterEach(() => { cleanup(); vi.unstubAllGlobals(); localStorage.clear(); window
 
 function serve() {
   const items = dayItems();
-  stubTripFetch(() => ({ config: config({ site_video_layout: true, plan_change_marks: true }), today: todayContext(items), items }));
+  stubTripFetch(() => ({ config: config({ plan_change_marks: true }), today: todayContext(items), items }));
 }
 
 describe("Hebrew in the video layout", () => {

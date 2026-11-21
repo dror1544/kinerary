@@ -61,7 +61,7 @@ describe("the Journey", () => {
   };
   const journey = (isOrganizer: boolean) => render(
     <QueryClientProvider client={client()}>
-      <JourneyView itinerary={itinerary as never} config={CONFIG} isOrganizer={isOrganizer} lang="en" onHeroPhaseChange={vi.fn()} />
+      <JourneyView itinerary={itinerary as never} config={CONFIG} isOrganizer={isOrganizer} lang="en" />
     </QueryClientProvider>,
   );
 
