@@ -1,6 +1,6 @@
 # The companion on WhatsApp, in a group or a private chat, through the relay (first slice)
 
-Status: draft (2026-11-21; two consult reviews applied, the second on the dashboard binding design; not yet approved) · Issue: none yet (file one; this file is renamed to `<n>-whatsapp-via-relay.md` then) · Track: unowned (sprint to be named by Dror, open question 1) · Size: L (five slices) · Tier: High
+Status: draft (2026-11-21; two consult reviews applied; the owner's answers to the open questions recorded the same day; approval not yet recorded) · Issue: none yet (file one; this file is renamed to `<n>-whatsapp-via-relay.md` then) · Track: its own track, after Release 1 (Dror, 2026-11-21) · Size: L (five slices) · Tier: High
 Security path: yes (the relay's trust boundary, chat-to-trip resolution, outbound scope, portal routes, and in S5 an account and membership path) · Migration: yes (S2 and S5) · Live-trip behaviour: yes (relay behaviour; risk class), switched off by default
 
 Related: `docs/per-trip-gateway-architecture.md` §4; `docs/specs/sprint-9/x-relay-chat-scope.md`
@@ -610,7 +610,7 @@ group is bound and again on `title_changed`; the API reads it from the row, sinc
 the relay can reach the bridge.
 
 Whether the sidecar is written fresh or adapted from the MIT-licensed bridge that ships
-with Hermes is open question 3.
+with Hermes was open; decided 2026-11-21: adapted, in our own package (Decisions, 3).
 
 ### Configuration
 
@@ -628,7 +628,7 @@ Feature switch `whatsapp`: `surfaces: ["relay", "control_plane"]`, `memberVisibl
 added to `shared/feature-switches.js` and to the worker's mirror in `feature_block.py`.
 The registry's rule is that a switch never widens visibility or permission; this one
 gates new ways to bind a chat and, in S5, to sign in, so it needs the recorded exception
-`x-member-sign-in.md` asks for its own switch (open question 7). It is read with
+`x-member-sign-in.md` asks for its own switch (agreed, Decisions 5). It is read with
 `featureEnabled(db, tripId, "whatsapp")` at: the portal routes, code redemption, the two
 no-code bindings (AC-28, AC-29), inbound after the route resolves, and outbound inside
 `resolveOutboundRoute` (`outbound-scope.ts`; the connector holds no database handle by
@@ -706,7 +706,7 @@ pairing.
 - Storing an owner's email address for notices (the control plane keeps digests only).
 - The official WhatsApp Business API.
 - Production. This slice is built and tried on staging; putting an unofficial client's
-  number in a real family's group is a separate decision (open question 5).
+  number in a real family's group is a separate decision (still open).
 - Renaming Telegram-named tables, columns, functions or triggers.
 
 ## Security and boundary notes
@@ -761,7 +761,7 @@ pairing.
 - **The bridge receives every message of every group the number is in**, addressed or
   not, and the judge model reads group text at the trip's proactive level, as on Telegram.
   The introduction says so in one line (AC-10). The privacy policy drafts in the notes
-  folder do not mention WhatsApp (open question 4).
+  folder do not mention WhatsApp (still open).
 - **The session directory is a credential** that gives full control of the WhatsApp
   account. It is deployment state, never in this repository, never in a container image.
 - **Boundary review** is required for S2, S3 and S5, with live request/response evidence
@@ -828,38 +828,30 @@ Tests are written first, from the criteria.
   (compatible). A release rolled back past S2 while WhatsApp rows exist leaves the old
   fleet monitor labelling them as private chats until it is rolled forward.
 
-## Open questions
+## Decisions and open questions
 
-Decisions for Dror before approval.
+**Answered by Dror, 2026-11-21:**
 
-1. **Which sprint owns this.** Sprint 9's scope is faster delivery. Proposed: its own
-   track after Release 1, with S1 allowed earlier because it changes no behaviour.
-2. **Three places where the review made a choice for you.** Each is written into the
-   criteria; say if you want it otherwise.
-   - Adding the number binds the group only for the trip's owner, not a secondary
-     organizer, as on Telegram (AC-28). The group lands on the trip the owner's own
-     WhatsApp chat is connected to; another trip needs the group code.
-   - Remove sends nothing to the chat (AC-15).
-   - With no connected WhatsApp, the owner's notice goes to their Telegram chat if they
-     have one, otherwise only the dashboard shows it (AC-18). An email notice would need
-     the control plane to start storing addresses, which it does not today.
-3. **Bridge source.** Recommended: our own small sidecar, adapted from the MIT-licensed
-   bridge that ships with Hermes, with the library version pinned. The alternative, running
-   Hermes's bridge as it is, is faster but makes the relay's intake depend on a file inside
-   another product's install, with its own allow-list and drop rules.
-4. **Privacy wording.** The group introduction line, and whether the published privacy
-   policy needs a WhatsApp paragraph before a group outside the owner's family is bound.
-5. **Production.** The unofficial client breaks WhatsApp's terms and the number can be
-   banned without notice; a ban also cuts every connected private chat. This spec stops
-   at staging; whether and when a real family's group gets it is a later decision, with a
-   dedicated number that is nobody's personal one.
-6. **Product documents.** The MRD entry of 2026-10-30 says "WhatsApp Business", and the
-   business plan and product spec price WhatsApp "per conversation"; Meta has billed per
-   message since July 2025. Those documents are not edited by this spec. Should the
-   doc-keeper update them to today's decision?
-7. **The switch gates a sign-in path.** The switch registry says a switch never widens
-   permission. `x-member-sign-in.md` asks for a recorded exception for its switch; this
-   one needs the same, or S5 gets a switch of its own.
-8. **Dependence on member sign-in.** Travellers connecting from the group (AC-29) need
-   that spec's traveller list, and S5 is its invitation delivered by email. If WhatsApp is
-   built first, S3 builds the traveller list to that spec's contract. Agreed?
+1. **When.** Its own track, after Release 1.
+2. **The review's three choices stand.** Only the trip's owner binds a group by adding
+   the number, onto the trip their own WhatsApp chat is connected to (AC-28); Remove
+   sends nothing (AC-15); the owner's notice goes to WhatsApp, else Telegram, else the
+   dashboard only (AC-18).
+3. **Bridge source.** Our own sidecar in `control-plane/whatsapp-bridge/`, adapted from
+   the MIT-licensed bridge that ships with Hermes, with the library version pinned. The
+   relay does not depend on a file inside another product's install.
+4. **Product documents.** The doc-keeper updates the MRD, business plan and product spec
+   in the notes folder to these decisions.
+5. **The switch gates a sign-in path.** Agreed: the `whatsapp` switch gets a recorded
+   exception in the registry, as `x-member-sign-in.md` asks for its own.
+6. **Dependence on member sign-in.** Agreed: if WhatsApp is built first, S3 builds the
+   traveller list to that spec's contract.
+
+**Still open, neither blocks the build on staging:**
+
+- **Privacy wording.** The exact introduction line, and whether the published privacy
+  policy needs a WhatsApp paragraph before a group outside the owner's family is bound.
+- **Production.** The unofficial client breaks WhatsApp's terms and the number can be
+  banned without notice; a ban also cuts every connected private chat. This spec stops
+  at staging; whether and when a real family's group gets it is a later decision, with a
+  dedicated number that is nobody's personal one.
