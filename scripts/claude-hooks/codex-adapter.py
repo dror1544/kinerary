@@ -63,9 +63,13 @@ def run_policy(name: str, payload: dict, deadline: float) -> dict:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise ValueError("Policy check exceeded its total time budget")
+    # The owner's standing deploy approval is for his Claude Code lead session only
+    # (pretooluse-bash.sh, standing_deploy_ok): a Codex session started from that
+    # session's shell would otherwise inherit it.
+    env = {k: v for k, v in os.environ.items() if k != "KINERARY_STANDING_DEPLOY_APPROVAL"}
     result = subprocess.run(
         ["bash", str(script)], input=json.dumps(payload), text=True,
-        capture_output=True, cwd=Path.cwd(), timeout=remaining,
+        capture_output=True, cwd=Path.cwd(), timeout=remaining, env=env,
     )
     if result.returncode:
         # Do not expose stderr: tool inputs and process diagnostics can contain secrets.

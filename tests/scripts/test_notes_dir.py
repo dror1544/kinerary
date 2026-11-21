@@ -38,7 +38,7 @@ TYPE_FOLDERS = ("handovers", "regression-plans", "test-reports", "run-notes", "i
 
 
 def scrub_env(**extra) -> dict:
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_") and k != "KINERARY_NOTES_DIR"}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_") and k not in ("KINERARY_NOTES_DIR", "KINERARY_STANDING_DEPLOY_APPROVAL")}
     env.update(extra)
     return env
 
