@@ -112,6 +112,10 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
       PASSWORD_TOO_SHORT: "Use at least 8 characters for the password.",
       TOKEN_INVALID: "This link has expired or was already used.",
       ACCOUNT_EXISTS: "You already have an account. Sign in, or reset your password.",
+      // The join page's refusals (portal.ts, /v1/site-invites/redeem): one for every reason the invitation cannot be used, and one for
+      // a trip site that did not answer. This page is English only, like the rest of this file.
+      INVITE_UNAVAILABLE: "This link can't be used. Ask the organizer for a new one.",
+      RUNTIME_NOT_READY: "The trip isn't answering right now. Please try again in a moment.",
     };
     throw new ApiError(typeof payload.error === "string" ? payload.error : "REQUEST_FAILED", messages[payload.error] || payload.message || payload.error || "The request could not be completed.");
   }

@@ -16,10 +16,23 @@ export interface FakeSitePerson { username: string; role?: string | undefined }
 
 export const newFakeSiteState = (): FakeSiteState => ({ bindings: new Map(), invited: new Set(), inviteIds: new Map() });
 
-export function fakeAdopt(state: FakeSiteState, people: readonly FakeSitePerson[] | undefined, input: { tripId: string; userId: string; runtimeUsername: string }): "ok" | "refused" | "conflict" {
+/**
+ * `deadInviteIds`: the invite ids the control plane has checked (under its trip lock) are revoked or expired AND were never redeemed.
+ * An invite-bound binding whose invite id is in that list is a stale leftover of a redemption that never completed there, and is
+ * dropped; an invite-bound binding whose id is NOT in the list (a redeemed member's) is never displaced.
+ */
+function dropStaleInviteBinding(state: FakeSiteState, key: string, deadInviteIds: readonly string[] | undefined): void {
+  const invite = state.inviteIds.get(key);
+  if (state.invited.has(key) && invite !== undefined && (deadInviteIds ?? []).includes(invite)) {
+    state.bindings.delete(key); state.invited.delete(key); state.inviteIds.delete(key);
+  }
+}
+
+export function fakeAdopt(state: FakeSiteState, people: readonly FakeSitePerson[] | undefined, input: { tripId: string; userId: string; runtimeUsername: string; deadInviteIds?: readonly string[] }): "ok" | "refused" | "conflict" {
   const key = `${input.tripId}:${input.runtimeUsername}`;
   const person = (people ?? []).find((p) => p.username === input.runtimeUsername);
   if (!person || person.role !== "member") return "refused";                       // not a participant, or an organizer
+  dropStaleInviteBinding(state, key, input.deadInviteIds);
   if (state.invited.has(key)) return "conflict";                                  // an invite-bound binding is never displaced
   for (const [other, user] of state.bindings) {
     if (user === input.userId && other !== key && other.startsWith(`${input.tripId}:`)) return "conflict"; // this user already stands for someone else
@@ -41,10 +54,11 @@ export function fakeRelease(state: FakeSiteState, input: { tripId: string; userI
  * a leftover claim binding (not invite-bound) on the name is replaced: the control plane has already checked that no
  * claim is live. Held to the `provision` section of tests/fixtures/site-binding-cases.json.
  */
-export function fakeProvision(state: FakeSiteState, people: readonly FakeSitePerson[] | undefined, input: { tripId: string; userId: string; runtimeUsername: string; inviteId: string }): "ok" | "refused" | "conflict" {
+export function fakeProvision(state: FakeSiteState, people: readonly FakeSitePerson[] | undefined, input: { tripId: string; userId: string; runtimeUsername: string; inviteId: string; deadInviteIds?: readonly string[] }): "ok" | "refused" | "conflict" {
   const key = `${input.tripId}:${input.runtimeUsername}`;
   const person = (people ?? []).find((p) => p.username === input.runtimeUsername);
   if (!person || person.role !== "member") return "refused";
+  if (state.inviteIds.get(key) !== input.inviteId) dropStaleInviteBinding(state, key, input.deadInviteIds);
   if (state.invited.has(key)) {
     // The same invite by the same account again is idempotent; anyone else's invite binding is never displaced.
     return state.bindings.get(key) === input.userId && state.inviteIds.get(key) === input.inviteId ? "ok" : "conflict";

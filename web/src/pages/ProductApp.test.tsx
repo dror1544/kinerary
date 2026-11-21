@@ -85,7 +85,8 @@ it("a password invitation stays usable without an unavailable Google choice", as
   fireEvent.change(await screen.findByLabelText("Choose a password"), { target: { value: "guest-password" } });
   expect(screen.queryByRole("button", { name: "Use Google" })).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: "Join this trip" }));
-  expect(await screen.findByText("INVITE_UNAVAILABLE")).toBeInTheDocument();
+  expect(await screen.findByText("This link can't be used. Ask the organizer for a new one.")).toBeInTheDocument();
+  expect(document.body.textContent).not.toContain("INVITE_UNAVAILABLE");
   expect(payloads).toEqual([{ token: "invite-fixture", method: "password", password: "guest-password" }]);
 });
 it("a configured Google provider remains available for an invitation", async () => {

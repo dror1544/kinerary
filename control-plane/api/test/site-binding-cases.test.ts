@@ -10,7 +10,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { fakeAdopt, fakeProvision, fakeRelease, newFakeSiteState, type FakeSitePerson } from "./support/fake-site.js";
 
-interface AdoptCase { name: string; participant: string; existing: string; result: "ok" | "refused" | "conflict"; holder: string }
+interface AdoptCase { dead?: string; name: string; participant: string; existing: string; result: "ok" | "refused" | "conflict"; holder: string }
 interface ReleaseCase { name: string; participant: string; existing: string; as: string; released: boolean; holder: string }
 const table = JSON.parse(readFileSync(fileURLToPath(new URL("../../../tests/fixtures/site-binding-cases.json", import.meta.url)), "utf8")) as { adopt: AdoptCase[]; release: ReleaseCase[]; provision: AdoptCase[] };
 
@@ -19,12 +19,16 @@ const people: FakeSitePerson[] = [{ username: "bob", role: "member" }, { usernam
 const nameOf = (participant: string) => ({ member: "bob", member2: "eve", organizer: "alice", unknown: "nobody" } as Record<string, string>)[participant]!;
 const [ACTOR, PREVIOUS] = ["user_actor000001", "user_previous0001"];
 
+/** What a case's `dead` says the control plane sends (the table's _vocabulary): the binding's own invite id, an unrelated one, or nothing. */
+const deadFor = (c: { dead?: string }, bindingInvite: string): { deadInviteIds?: string[] } =>
+  c.dead === "binding_invite" ? { deadInviteIds: [bindingInvite] } : c.dead === "other_invite" ? { deadInviteIds: ["invite_unrelated0001"] } : {};
+
 /** Brings the fake to `existing` for `participant`, as the real runner does through the real routes. */
 function arrange(state: ReturnType<typeof newFakeSiteState>, existing: string, participant: string) {
   const username = nameOf(participant);
   if (existing === "actor") fakeAdopt(state, people, { tripId: trip, userId: ACTOR, runtimeUsername: username });
   if (existing === "other_user") fakeAdopt(state, people, { tripId: trip, userId: PREVIOUS, runtimeUsername: username });
-  if (existing === "invite") { state.bindings.set(`${trip}:${username}`, PREVIOUS); state.invited.add(`${trip}:${username}`); }
+  if (existing === "invite") { state.bindings.set(`${trip}:${username}`, PREVIOUS); state.invited.add(`${trip}:${username}`); state.inviteIds.set(`${trip}:${username}`, "invite_bindingcases01"); }
   if (existing === "actor_on_other_participant") fakeAdopt(state, people, { tripId: trip, userId: ACTOR, runtimeUsername: "eve" });
 }
 const holderOf = (state: ReturnType<typeof newFakeSiteState>, participant: string) => {
@@ -36,7 +40,7 @@ test("the fake site answers every ADOPT case of the shared table as the real sit
   for (const c of table.adopt) {
     const state = newFakeSiteState();
     arrange(state, c.existing, c.participant);
-    assert.equal(fakeAdopt(state, people, { tripId: trip, userId: ACTOR, runtimeUsername: nameOf(c.participant) }), c.result, c.name);
+    assert.equal(fakeAdopt(state, people, { tripId: trip, userId: ACTOR, runtimeUsername: nameOf(c.participant), ...deadFor(c, "invite_bindingcases01") }), c.result, c.name);
     assert.equal(holderOf(state, c.participant), c.holder, `${c.name}: who holds it afterwards`);
   }
 });
@@ -66,7 +70,7 @@ test("the fake site answers every PROVISION case of the shared table as the real
   for (const c of table.provision) {
     const state = newFakeSiteState();
     arrangeProvision(state, c.existing, c.participant);
-    assert.equal(fakeProvision(state, people, { tripId: trip, userId: ACTOR, runtimeUsername: nameOf(c.participant), inviteId: INVITE }), c.result, c.name);
+    assert.equal(fakeProvision(state, people, { tripId: trip, userId: ACTOR, runtimeUsername: nameOf(c.participant), inviteId: INVITE, ...deadFor(c, OTHER_INVITE) }), c.result, c.name);
     assert.equal(holderOf(state, c.participant), c.holder, `${c.name}: who holds it afterwards`);
   }
 });

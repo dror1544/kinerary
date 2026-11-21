@@ -21,7 +21,9 @@ const key = 'test-dedicated-exchange-key';
 const [ACTOR, PREVIOUS] = ['user_actor000001', 'user_previous0001'];
 const INVITE = 'invite_provisioncase01', OTHER_INVITE = 'invite_provisioncase02';
 const USERNAME = { member: 'bob', organizer: 'alice', unknown: 'nobody' };
-const provision = (userId, runtimeUsername, inviteId = INVITE) => api('/api/internal/control-plane/participants', { method: 'POST', apiKey: key, body: { tripId, userId, runtimeUsername, inviteId } });
+const provision = (userId, runtimeUsername, inviteId = INVITE, deadInviteIds) => api('/api/internal/control-plane/participants', { method: 'POST', apiKey: key, body: { tripId, userId, runtimeUsername, inviteId, ...(deadInviteIds ? { deadInviteIds } : {}) } });
+// What a case's `dead` says the control plane sends: the binding's own invite id (OTHER_INVITE), or one it does not carry.
+const deadFor = (c) => (c.dead === 'binding_invite' ? [OTHER_INVITE] : c.dead === 'other_invite' ? ['invite_unrelated0001'] : undefined);
 const adopt = (userId, runtimeUsername) => api('/api/internal/control-plane/participants/adopt', { method: 'POST', apiKey: key, body: { tripId, userId, runtimeUsername } });
 const exchange = (userId, runtimeUsername) => api('/api/internal/control-plane/session', { method: 'POST', apiKey: key, body: { tripId, userId, runtimeUsername, role: 'member' } });
 const holderOf = async (name) => ((await exchange(ACTOR, name)).status === 200 ? 'actor' : (await exchange(PREVIOUS, name)).status === 200 ? 'previous' : 'nobody');
@@ -44,7 +46,7 @@ test('the real site answers every PROVISION case of the shared table', async () 
       await startTestServer({ PORT: await freePort(), CONTROL_PLANE_EXCHANGE_KEY: key, CONTROL_PLANE_IDENTITY_FILE: manifest, SITE_DIR: fileURLToPath(new URL('../site', import.meta.url)) });
       const name = USERNAME[c.participant];
       await arrange(c.existing, name);
-      const r = await provision(ACTOR, name);
+      const r = await provision(ACTOR, name, INVITE, deadFor(c));
       assert.ok(STATUS[c.result].includes(r.status), `${c.name}: got ${r.status}`);
       assert.equal(await holderOf(name), c.holder, `${c.name}: who holds it afterwards`);
     } finally { stopTestServer(); rmSync(temp, { recursive: true, force: true }); }

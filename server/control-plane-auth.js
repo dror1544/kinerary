@@ -102,6 +102,13 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
   const localUser = db.prepare('SELECT username FROM users WHERE username = ?');
   const insert = db.prepare('INSERT INTO control_plane_identities(user_id, trip_id, username, role, invite_id) VALUES (?, ?, ?, ?, ?)');
   const organizers = () => normalizeOrganizers(config().agent);
+  // `deadInviteIds` (optional, on provision and adopt): invite ids the control plane has checked, under its own trip lock, are
+  // revoked or expired AND were never redeemed. An invite-bound binding is a leftover of a redemption that never completed there (a
+  // lost answer, then "send it again"), and is replaced, ONLY when its invite id is in this list: a redeemed member's binding, an
+  // owner's, another trip's and a binding whose invite is not named are never displaced. Anything malformed is "no list".
+  const deadInviteIdsOf = body => Array.isArray(body?.deadInviteIds) && body.deadInviteIds.length <= 50 &&
+    body.deadInviteIds.every(id => typeof id === 'string' && /^invite_[A-Za-z0-9]{8,64}$/.test(id)) ? body.deadInviteIds : [];
+  const staleInviteBinding = (row, dead) => Boolean(row && row.role === 'member' && typeof row.invite_id === 'string' && dead.includes(row.invite_id));
   const activeUser = username => localUser.get(username) &&
     ((config().participants || []).some(p => p.username === username) || isSecondaryUsername(username));
   // A secondary organizer is never a 'member' and never an 'owner': the role on its identity row is 'organizer' and the
@@ -226,7 +233,8 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
     // under its own lock that no claim on this name is live. Anything else on the name is never displaced: an owner's,
     // another trip's, or another invite's binding (invite_id set) is a 409.
     const onName = db.prepare('SELECT * FROM control_plane_identities WHERE username = ?').get(runtimeUsername);
-    if (onName && (onName.role !== 'member' || onName.invite_id !== null || onName.trip_id !== identity.tripId)) return res.status(409).json({ error: 'IDENTITY_CONFLICT' });
+    const dead = deadInviteIdsOf(req.body);
+    if (onName && (onName.role !== 'member' || onName.trip_id !== identity.tripId || (onName.invite_id !== null && !staleInviteBinding(onName, dead)))) return res.status(409).json({ error: 'IDENTITY_CONFLICT' });
     try {
       db.transaction(() => {
         if (onName) db.prepare('DELETE FROM control_plane_identities WHERE user_id = ? AND trip_id = ?').run(onName.user_id, identity.tripId);
@@ -247,7 +255,8 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
   // control plane is the authority on who holds a traveller, and it holds a lock on the trip while it asks, so a binding
   // already on this name that is NOT invite-bound is a leftover of a claim that ended without its release arriving
   // (a site that was down): it is replaced. An invite-bound binding (invite_id set) or an owner's is never displaced:
-  // 409 IDENTITY_CONFLICT. RELEASE removes only the binding it is asked about (this user, this name, a member, no invite):
+  // 409 IDENTITY_CONFLICT, with ONE exception: an invite-bound binding whose invite id the control plane names in `deadInviteIds`
+  // (revoked or expired and never redeemed, checked under its trip lock: a redemption whose answer was lost) is replaced. RELEASE removes only the binding it is asked about (this user, this name, a member, no invite):
   // it can never end an invited member's or an organizer's, and releasing twice is not an error. Removing the row is
   // what makes a token already issued stop working (validManagedPayload reads it on every request).
   app.post('/api/internal/control-plane/participants/adopt', internal, (req, res) => {
@@ -257,7 +266,8 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
     if (!roleMatchesLocal('member', runtimeUsername) || isSecondaryUsername(runtimeUsername)) return res.status(403).json({ error: 'ORGANIZER_BINDING_FORBIDDEN' });
     const onName = db.prepare('SELECT * FROM control_plane_identities WHERE username = ?').get(runtimeUsername);
     if (onName && onName.user_id === userId && onName.trip_id === identity.tripId && onName.role === 'member') return res.json({ ok: true });
-    if (onName && (onName.role !== 'member' || onName.invite_id !== null || onName.trip_id !== identity.tripId)) return res.status(409).json({ error: 'IDENTITY_CONFLICT' });
+    const dead = deadInviteIdsOf(req.body);
+    if (onName && (onName.role !== 'member' || onName.trip_id !== identity.tripId || (onName.invite_id !== null && !staleInviteBinding(onName, dead)))) return res.status(409).json({ error: 'IDENTITY_CONFLICT' });
     const ofUser = find.get(userId, identity.tripId);
     if (ofUser && ofUser.username !== runtimeUsername) return res.status(409).json({ error: 'IDENTITY_CONFLICT' });
     try {

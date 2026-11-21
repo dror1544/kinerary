@@ -18,7 +18,9 @@ const [ACTOR, PREVIOUS, OTHER, INVITED] = ['user_actor000001', 'user_previous000
 const previousOf = (participant) => (participant === 'member2' ? INVITED : PREVIOUS);
 const USERNAME = { member: 'bob', member2: 'eve', organizer: 'alice', unknown: 'nobody' };
 let temp;
-const call = (action, userId, runtimeUsername) => api(`/api/internal/control-plane/participants/${action}`, { method: 'POST', apiKey: key, body: { tripId, userId, runtimeUsername } });
+const call = (action, userId, runtimeUsername, deadInviteIds) => api(`/api/internal/control-plane/participants/${action}`, { method: 'POST', apiKey: key, body: { tripId, userId, runtimeUsername, ...(deadInviteIds ? { deadInviteIds } : {}) } });
+// What a case's `dead` says the control plane sends (see _vocabulary.dead): the invite id arranged for 'invite' is invite_bindingcases01.
+const deadFor = (c) => (c.dead === 'binding_invite' ? ['invite_bindingcases01'] : c.dead === 'other_invite' ? ['invite_unrelated0001'] : undefined);
 const canOpen = async (userId, runtimeUsername) => (await api('/api/internal/control-plane/session', { method: 'POST', apiKey: key, body: { tripId, userId, runtimeUsername, role: 'member' } })).status === 200;
 const holderOf = async (participant) => {
   const name = USERNAME[participant];
@@ -50,7 +52,7 @@ test('the real site answers every ADOPT case of the shared table', async () => {
   for (const c of table.adopt) {
     await reset();
     await arrange(c.existing, c.participant);
-    const r = await call('adopt', ACTOR, USERNAME[c.participant]);
+    const r = await call('adopt', ACTOR, USERNAME[c.participant], deadFor(c));
     const expected = STATUS[c.result];
     assert.ok(Array.isArray(expected) ? expected.includes(r.status) : r.status === expected, `${c.name}: got ${r.status}`);
     assert.equal(await holderOf(c.participant), c.holder, `${c.name}: who holds it afterwards`);

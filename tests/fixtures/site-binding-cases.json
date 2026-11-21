@@ -3,6 +3,7 @@
   "_vocabulary": {
     "participant": "member = a plain member of the trip site; organizer = a configured organizer; unknown = not a participant",
     "existing": "none | actor | other_user | invite | actor_on_other_participant | actor_invite: what the site already holds for the participant being asked about (the actor is the control-plane user making the call; actor_invite = the actor already bound by THIS invite, the one a provision call names)",
+    "dead": "what the control plane sends as deadInviteIds (invite ids it has checked, under its trip lock, are revoked or expired AND never redeemed): none = the field is omitted | binding_invite = the invite id the existing binding carries | other_invite = an id the binding does not carry",
     "holder": "who can open the participant afterwards: actor | previous (whoever held it before) | nobody",
     "order": "cases run in this order against one site; the invite case permanently consumes the second plain member, so it is last"
   },
@@ -13,7 +14,9 @@
     { "name": "an actor already bound to another participant is refused", "participant": "member", "existing": "actor_on_other_participant", "result": "conflict", "holder": "nobody" },
     { "name": "an organizer is never bound", "participant": "organizer", "existing": "none", "result": "refused", "holder": "nobody" },
     { "name": "a name that is not a participant is never bound", "participant": "unknown", "existing": "none", "result": "refused", "holder": "nobody" },
-    { "name": "an invite-bound binding is never displaced", "participant": "member2", "existing": "invite", "result": "conflict", "holder": "previous" }
+    { "name": "a stale invite binding whose invite the control plane names dead is replaced", "participant": "member2", "existing": "invite", "dead": "binding_invite", "result": "ok", "holder": "actor" },
+    { "name": "an invite-bound binding is never displaced", "participant": "member2", "existing": "invite", "result": "conflict", "holder": "previous" },
+    { "name": "an invite-bound binding is not displaced when the dead list names another invite (a redeemed member is safe)", "participant": "member2", "existing": "invite", "dead": "other_invite", "result": "conflict", "holder": "previous" }
   ],
   "release": [
     { "name": "the actor releases its own binding", "participant": "member", "existing": "actor", "as": "actor", "released": true, "holder": "nobody" },
@@ -27,6 +30,8 @@
     { "name": "the same invite again is not an error", "participant": "member", "existing": "actor_invite", "result": "ok", "holder": "actor" },
     { "name": "a leftover claim binding of another account is replaced", "participant": "member", "existing": "other_user", "result": "ok", "holder": "actor" },
     { "name": "another invite's binding is never displaced", "participant": "member", "existing": "invite", "result": "conflict", "holder": "previous" },
+    { "name": "another invite's binding is replaced when the control plane names that invite dead (a lost answer then \"send it again\")", "participant": "member", "existing": "invite", "dead": "binding_invite", "result": "ok", "holder": "actor" },
+    { "name": "another invite's binding is not displaced when the dead list names a different invite (a redeemed member is safe)", "participant": "member", "existing": "invite", "dead": "other_invite", "result": "conflict", "holder": "previous" },
     { "name": "an account already bound to another participant is refused", "participant": "member", "existing": "actor_on_other_participant", "result": "conflict", "holder": "nobody" },
     { "name": "an organizer is never bound", "participant": "organizer", "existing": "none", "result": "refused", "holder": "nobody" },
     { "name": "a name that is not a participant is never bound", "participant": "unknown", "existing": "none", "result": "refused", "holder": "nobody" }

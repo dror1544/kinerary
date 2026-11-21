@@ -287,6 +287,8 @@ export interface RuntimeAccountAdapter {
     userId: string;
     runtimeUsername: string;
     displayName: string;
+    /** Invite ids the control plane has checked are dead for this name (see `deadInviteIds`); omitted when there are none. */
+    deadInviteIds?: string[];
   }): Promise<void>;
   /**
    * The trip site's participants: username, display name and ROLE as the site says it. Group sign-in
@@ -302,7 +304,7 @@ export interface RuntimeAccountAdapter {
    * invite-bound or owner binding holds the name. THROWS when the site cannot be asked: nothing is known, and a caller
    * must not read that as either answer. The personal invite for an existing traveller (spec AC-10) reuses this.
    */
-  adoptParticipant(input: { tripId: string; userId: string; runtimeUsername: string }): Promise<"ok" | "refused" | "conflict">;
+  adoptParticipant(input: { tripId: string; userId: string; runtimeUsername: string; deadInviteIds?: string[] }): Promise<"ok" | "refused" | "conflict">;
   /** Ends that binding (only that user's, only a claim's, never an invited member's or an organizer's). Idempotent. Throws when the site cannot be asked. */
   releaseParticipant(input: { tripId: string; userId: string; runtimeUsername: string }): Promise<void>;
 }
@@ -339,16 +341,16 @@ export class HttpRuntimeAccountAdapter implements RuntimeAccountAdapter {
     });
   }
 
-  private async binding(action: "adopt" | "release", input: { tripId: string; userId: string; runtimeUsername: string }): Promise<Response> {
+  private async binding(action: "adopt" | "release", input: { tripId: string; userId: string; runtimeUsername: string; deadInviteIds?: string[] }): Promise<Response> {
     return fetch(`${this.runtimeOrigin}/internal/t/${encodeURIComponent(input.tripId)}/participants/${action}`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-api-key": this.apiKey },
-      body: JSON.stringify({ tripId: input.tripId, userId: input.userId, runtimeUsername: input.runtimeUsername }),
+      body: JSON.stringify({ tripId: input.tripId, userId: input.userId, runtimeUsername: input.runtimeUsername, ...(action === "adopt" && input.deadInviteIds?.length ? { deadInviteIds: input.deadInviteIds } : {}) }),
       signal: AbortSignal.timeout(this.timeoutMs),
     });
   }
 
-  async adoptParticipant(input: { tripId: string; userId: string; runtimeUsername: string }): Promise<"ok" | "refused" | "conflict"> {
+  async adoptParticipant(input: { tripId: string; userId: string; runtimeUsername: string; deadInviteIds?: string[] }): Promise<"ok" | "refused" | "conflict"> {
     const response = await this.binding("adopt", input);
     if (response.ok) return "ok";
     if (response.status === 404 || response.status === 403) return "refused";
@@ -665,6 +667,24 @@ async function membership(deps: PortalDependencies, tripId: string, userId: stri
     [tripId, userId],
   );
   return result.rows[0] ?? null;
+}
+
+/**
+ * The invite ids that are DEAD for one traveller of one trip: revoked or expired (by state, or by the clock while still `unused`) AND
+ * never redeemed. Sent to the trip site with an invite provision or a claim's adopt so that it can replace an invite-bound binding that
+ * a redemption which never completed here (a lost answer; the organizer then "sent it again") left behind: the site replaces an
+ * invite-bound binding only when its invite id is on this list. A REDEEMED invite is a person on the trip and is never on it, nor is
+ * a pending invite. Read inside the caller's trip-row lock (a redemption and a claim both hold it), so the list cannot go stale
+ * between the question and the call. Bounded (50): the site refuses a longer list as no list.
+ */
+export async function deadInviteIdsFor(db: { query: (text: string, values?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }> }, tripId: string, runtimeUsername: string): Promise<string[]> {
+  const result = await db.query(
+    `SELECT id FROM control_plane.site_invites
+      WHERE trip_id = $1 AND runtime_username = $2 AND redeemed_by IS NULL AND redeemed_at IS NULL
+        AND (state IN ('revoked', 'expired') OR (state = 'unused' AND expires_at <= now()))
+      ORDER BY created_at DESC LIMIT 50`,
+    [tripId, runtimeUsername]);
+  return result.rows.map((row) => String(row.id));
 }
 
 export type SiteInviteResult =
@@ -1404,8 +1424,11 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
       //   the site cannot be asked -> ROLLBACK; the retryable 503 that names nothing, and the person tries again.
       // Never "session minted but the site cannot be opened", and never "site bound but the claim rolled back and stuck".
       const wanted = { tripId, userId: result.target.userId, runtimeUsername: result.runtimeUsername };
+      // An invite for this name that was revoked or expired without ever being redeemed may have left an invite-bound binding on the site
+      // (a lost answer): the site replaces it only when told, here, under this transaction's trip lock, that its invite is dead.
+      const deadInviteIds = await deadInviteIdsFor(client, tripId, result.runtimeUsername);
       let bound: "ok" | "refused" | "conflict" | "unavailable";
-      try { bound = await deps.runtimeAccounts.adoptParticipant(wanted); } catch { bound = "unavailable"; }
+      try { bound = await deps.runtimeAccounts.adoptParticipant({ ...wanted, ...(deadInviteIds.length ? { deadInviteIds } : {}) }); } catch { bound = "unavailable"; }
       if (bound !== "ok") {
         await client.query("ROLLBACK");
         miniAppLog(structuredLog("info", "mini_app.group_claim", { outcome: `site_${bound}` }));
@@ -2358,6 +2381,15 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
       // replaced by the provision below.
       const holder = await client.query("SELECT 1 FROM control_plane.trip_participant_claims WHERE trip_id = $1 AND runtime_username = $2 AND released_at IS NULL", [invite.trip_id, invite.runtime_username]);
       if (holder.rowCount) { await client.query("ROLLBACK"); return reply.code(409).send({ error: "INVITE_UNAVAILABLE" }); }
+      // An owner or organizer of THIS trip (a secondary organizer included, and one whose membership was ended: the membership row
+      // would be revived below) cannot take a MEMBER invite with their own account: the site would bind their user to the traveller,
+      // their own launch would then fail on the role, and the traveller would be stuck. The same refusal as any other; nothing is
+      // written and the site is not asked.
+      if (signedIn) {
+        const organizing = await client.query("SELECT 1 FROM control_plane.trip_memberships WHERE trip_id = $1 AND user_id = $2 AND role IN ('owner', 'organizer')", [invite.trip_id, signedIn.id]);
+        if (organizing.rowCount) { await client.query("ROLLBACK"); return reply.code(409).send({ error: "INVITE_UNAVAILABLE" }); }
+      }
+      const deadInviteIds = await deadInviteIdsFor(client, invite.trip_id, invite.runtime_username);
       if (!signedIn) await client.query("INSERT INTO control_plane.users(id, status, display_name) VALUES ($1, 'active', $2)", [userId, invite.intended_display_name]);
       // The runtime adapter is idempotent by invite id. Holding the invite row
       // lock prevents concurrent redemption; if the database transaction later
@@ -2365,6 +2397,7 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
       try {
         await deps.runtimeAccounts.provisionParticipant({
           tripId: invite.trip_id, inviteId: invite.id, userId, runtimeUsername: invite.runtime_username, displayName: invite.intended_display_name,
+          ...(deadInviteIds.length ? { deadInviteIds } : {}),
         });
       } catch (error) {
         // Never a raw 500 (a person is looking at the join page). The site SAID NO: one refusal for every reason, naming nothing (an

@@ -93,9 +93,26 @@ it("a refusal is shown to the person (not swallowed), and the invitation can be 
     return json({}, 404);
   });
   fireEvent.click(await screen.findByRole("button", { name: "Join this trip" }));
-  expect(await screen.findByText("INVITE_UNAVAILABLE")).toBeInTheDocument();
+  expect(await screen.findByText("This link can't be used. Ask the organizer for a new one.")).toBeInTheDocument();
+  expect(document.body.textContent).not.toContain("INVITE_UNAVAILABLE");
   expect(screen.getByTestId("where").textContent).toBe("/join");
   refuse = false;
+  fireEvent.click(screen.getByRole("button", { name: "Join this trip" }));
+  await waitFor(() => expect(screen.getByTestId("where").textContent).toBe("/trips/trip_abcdefgh/app"));
+});
+
+it("when the trip site did not answer, the person is told to try again, in words and not a code, and the same link then works", async () => {
+  let down = true;
+  mount((url) => {
+    if (url === "/v1/auth/capabilities") return json(DASHBOARD_GOOGLE);
+    if (url === "/v1/site-invites/inspect") return json(inspect);
+    if (url === "/v1/site-invites/redeem") return down ? json({ error: "RUNTIME_NOT_READY", retryable: true }, 503) : json({ status: "redeemed", tripId: "trip_abcdefgh", appPath: "/trips/trip_abcdefgh/app" });
+    return json({}, 404);
+  });
+  fireEvent.click(await screen.findByRole("button", { name: "Join this trip" }));
+  expect(await screen.findByText("The trip isn't answering right now. Please try again in a moment.")).toBeInTheDocument();
+  expect(document.body.textContent).not.toContain("RUNTIME_NOT_READY");
+  down = false;
   fireEvent.click(screen.getByRole("button", { name: "Join this trip" }));
   await waitFor(() => expect(screen.getByTestId("where").textContent).toBe("/trips/trip_abcdefgh/app"));
 });

@@ -85,9 +85,9 @@ export interface Harness {
    * `siteHeld` names (trip:username) are bound by an invite: never displaced.
    */
   siteBindings: Map<string, string>;
-  siteFail: { adopt?: "unavailable" | "bind_then_fail" | "refused" | "conflict"; release?: "unavailable"; provision?: "unavailable" };
+  siteFail: { adopt?: "unavailable" | "bind_then_fail" | "refused" | "conflict"; release?: "unavailable"; provision?: "unavailable" | "bind_then_fail" };
   siteHeld: Set<string>;
-  siteCalls: { adopt: { tripId: string; userId: string; runtimeUsername: string }[]; release: { tripId: string; userId: string; runtimeUsername: string }[]; provision: { tripId: string; userId: string; runtimeUsername: string; inviteId: string }[] };
+  siteCalls: { adopt: { tripId: string; userId: string; runtimeUsername: string; deadInviteIds?: string[] }[]; release: { tripId: string; userId: string; runtimeUsername: string }[]; provision: { tripId: string; userId: string; runtimeUsername: string; inviteId: string; deadInviteIds?: string[] }[] };
   newApp(overrides?: Partial<PortalDependencies>): ReturnType<typeof buildApp>;
   /** The dependencies `newApp` builds the portal from, for a caller of an exported portal function (createSiteInvite). */
   deps(overrides?: Partial<PortalDependencies>): PortalDependencies;
@@ -144,16 +144,19 @@ export async function startHarness(): Promise<Harness> {
         if (people === "unreachable") throw new Error("RUNTIME_PARTICIPANT_LOOKUP_FAILED");
         return people === undefined ? true : people.some((p) => p.username === runtimeUsername);
       },
-      provisionParticipant: async (input: { tripId: string; inviteId: string; userId: string; runtimeUsername: string; displayName: string }) => {
-        siteCalls.provision.push({ tripId: input.tripId, userId: input.userId, runtimeUsername: input.runtimeUsername, inviteId: input.inviteId });
+      provisionParticipant: async (input: { tripId: string; inviteId: string; userId: string; runtimeUsername: string; displayName: string; deadInviteIds?: string[] }) => {
+        siteCalls.provision.push({ tripId: input.tripId, userId: input.userId, runtimeUsername: input.runtimeUsername, inviteId: input.inviteId, ...(input.deadInviteIds ? { deadInviteIds: input.deadInviteIds } : {}) });
         const fail = siteFail.provision; delete siteFail.provision;
         if (fail === "unavailable") throw new Error("RUNTIME_PARTICIPANT_PROVISION_FAILED");
         const people = site.get(input.tripId);
         if (people === undefined) return;
         if (people === "unreachable") throw new Error("RUNTIME_PARTICIPANT_PROVISION_FAILED");
-        if (fakeProvision(siteState, people, input) !== "ok") throw new Error("RUNTIME_PARTICIPANT_REFUSED");
+        const answer = fakeProvision(siteState, people, input);
+        // "bind_then_fail": the site DID bind, and the answer never came back (the lost reply that strands a name).
+        if (fail === "bind_then_fail") throw new Error("RUNTIME_PARTICIPANT_PROVISION_FAILED");
+        if (answer !== "ok") throw new Error("RUNTIME_PARTICIPANT_REFUSED");
       },
-      adoptParticipant: async (input: { tripId: string; userId: string; runtimeUsername: string }) => {
+      adoptParticipant: async (input: { tripId: string; userId: string; runtimeUsername: string; deadInviteIds?: string[] }) => {
         siteCalls.adopt.push(input);
         const fail = siteFail.adopt; delete siteFail.adopt;
         if (fail === "unavailable") throw new Error("RUNTIME_PARTICIPANT_ADOPT_FAILED");
@@ -243,7 +246,7 @@ export async function startHarness(): Promise<Harness> {
       return { cookie: `kit_session=${raw}; kit_csrf=${csrf}`, csrf, raw };
     },
     snapshot: async () => {
-      const tables = ["users", "trip_memberships", "telegram_member_links", "trip_participant_claims", "notification_outbox", "web_sessions", "telegram_mini_app_launches"];
+      const tables = ["users", "trip_memberships", "telegram_member_links", "trip_participant_claims", "notification_outbox", "web_sessions", "telegram_mini_app_launches", "web_password_credentials", "user_identities"];
       const out: Record<string, number> = {};
       for (const table of tables) {
         out[table] = Number((await pool.query(`SELECT count(*)::int AS n FROM control_plane.${table}`)).rows[0].n);
