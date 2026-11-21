@@ -1,6 +1,6 @@
-# The companion in a WhatsApp group, through the relay (first slice)
+# The companion on WhatsApp, in a group or a private chat, through the relay (first slice)
 
-Status: draft (2026-11-21; consult review of 2026-11-20 applied) · Issue: none yet (file one; this file is renamed to `<n>-whatsapp-group-via-relay.md` then) · Track: unowned (sprint to be named by Dror, open question 1) · Size: L (four slices) · Tier: High
+Status: draft (2026-11-21; consult review of 2026-11-20 applied; binding reworked the same day to the owner's dashboard-code design, not yet re-reviewed) · Issue: none yet (file one; this file is renamed to `<n>-whatsapp-group-via-relay.md` then) · Track: unowned (sprint to be named by Dror, open question 1) · Size: L (four slices) · Tier: High
 Security path: yes (the relay's trust boundary: `control-plane/api/src/relay/`, chat-to-trip resolution, outbound scope) · Migration: yes · Live-trip behaviour: yes (relay behaviour; risk class), switched off by default
 
 Related: `docs/per-trip-gateway-architecture.md` §4; `docs/specs/sprint-9/x-relay-chat-scope.md`
@@ -10,7 +10,10 @@ Related: `docs/per-trip-gateway-architecture.md` §4; `docs/specs/sprint-9/x-rel
 Decisions already taken by Dror (2026-11-20): WhatsApp connects through the relay, never
 directly to a companion's gateway; the transport is the unofficial WhatsApp Web client (the
 official Business API cannot join an existing group); the existing binding table is widened
-to carry a platform, not duplicated.
+to carry a platform, not duplicated. 2026-11-21: a WhatsApp chat is bound from the
+organizer dashboard by a one-time code sent as a WhatsApp message, not through Telegram;
+a private chat binds the sender's number to the trip, a group binds the group; several
+codes may be live for one trip.
 
 ## Problem
 
@@ -34,36 +37,43 @@ Families coordinate in WhatsApp groups. The companion is reachable only on Teleg
 ## Behaviour
 
 When this is done, on a deployment that has configured a WhatsApp number for its relay, and
-for a trip whose `whatsapp_group` switch is on:
+for a trip whose `whatsapp_group` switch is on, the trip's page in the organizer dashboard
+has a WhatsApp section with three actions and a list.
 
-1. The main organizer sends `/group whatsapp` in their private Telegram chat with the bot.
-   The bot answers with a short code and one sentence of instructions.
-2. Someone adds the deployment's WhatsApp number to the family's existing WhatsApp group
-   and types the code there.
-3. The bot posts a one-time approval word in the WhatsApp group, and tells the organizer
-   on Telegram that a WhatsApp group asked to join the trip and that typing the word shown
-   in that group approves it.
-4. The organizer types the word in the same private Telegram chat. The group is bound to
-   the trip and the companion introduces itself in the WhatsApp group, including one line
-   saying it reads the group's messages to know when it is addressed. The introduction
-   never carries the trip site's password.
-5. From then on the group behaves as a Telegram trip group does: the companion answers
-   when addressed (its name, a reply to its message, a mention of the number, the
-   conversation window, the group judge at the default proactive level), stays silent
-   otherwise, receives a photo or PDF under the same rules as on Telegram, and answers in
-   plain WhatsApp text.
-6. Everything else stays on Telegram: the interview, buttons, the command menu, the Mini
-   App, organizer-gated actions, plan-change lines and scheduled messages.
+1. **Connect my WhatsApp.** The dashboard opens WhatsApp on a chat with the deployment's
+   number, with a message already written that carries a one-time code. The organizer
+   presses send. That private chat is now bound to the trip and to the organizer's
+   account: the companion answers there, and treats the sender as the organizer they are.
+2. **Connect a WhatsApp group.** The organizer adds the deployment's number to the
+   family's existing group, then the dashboard opens WhatsApp's share screen with a coded
+   message; the organizer picks the group and sends. The group is now bound to the trip
+   and the companion introduces itself, including one line saying it reads the group's
+   messages to know when it is addressed. The introduction never carries the trip site's
+   password.
+3. **Invite a traveller on WhatsApp.** The organizer picks an existing traveller and gets
+   a link to forward. Whoever opens it and sends the coded message has their private chat
+   bound to the trip as that traveller.
+4. **Connected chats.** The section lists the trip's WhatsApp groups (by title) and people
+   (by traveller name and the last four digits of the number), each with Remove.
+5. Every code works once and for 15 minutes. Any number of codes can be issued for a trip
+   over time, so more people and more groups can be added later.
+6. In a bound group the companion behaves as in a Telegram trip group: it answers when
+   addressed (its name, a reply to its message, a mention of the number, the conversation
+   window, the group judge at the default proactive level) and stays silent otherwise. In
+   a bound private chat every message is addressed to it. In both it receives a photo or
+   PDF under the same rules as on Telegram and answers in plain WhatsApp text.
+7. Telegram is not needed for any of this. The interview, buttons, the command menu, the
+   Mini App, plan-change lines and scheduled messages stay on Telegram.
 
-With the switch off, or with no WhatsApp number configured, nothing changes for anyone:
-`/group whatsapp` behaves exactly as `/group` does today.
+With the switch off, or with no WhatsApp number configured, the section is not shown and
+nothing changes for anyone.
 
 ## Slices
 
 | Slice | Content | Behaviour change |
 |---|---|---|
 | S1 | Extract the companion gate into one platform-neutral function | none (every existing test passes unedited) |
-| S2 | Migration, chat kind by one predicate, binding request and approval | none until a WhatsApp chat exists |
+| S2 | Migration, chat kind by one predicate, binding codes, the dashboard section and its routes | none until the switch is on |
 | S3 | WhatsApp bridge sidecar, relay client, inbound loop, outbound through the connector, stand-in for tests | behind the switch |
 | S4 | Staging sitting on one test trip | staging only |
 
@@ -112,58 +122,63 @@ in this file; if either contradicts a contract below, a spec PR amends it first.
 
 **S2: schema and binding**
 
-- AC-3 Given the migration, then every existing binding row has `platform = 'telegram'`,
-  the active-chat unique index keeps its name and definition, and the previous release's
-  code runs unchanged against the new schema (header `-- rollback: compatible`).
-- AC-4 Given any attempt to store a `whatsapp` binding whose `chat_id` is not a group id
-  of the accepted shape, or a `telegram` binding whose id contains `@`, then the database
-  refuses it.
+- AC-3 Given the migration, then every existing binding row and person link has
+  `platform = 'telegram'`, the active-chat unique index keeps its name and definition, and
+  the previous release's code runs unchanged against the new schema (header
+  `-- rollback: compatible`).
+- AC-4 Given any attempt to store a `whatsapp` binding whose `chat_id` is not a WhatsApp
+  id of an accepted shape, or a `telegram` binding whose id contains `@`, then the
+  database refuses it.
 - AC-5 Given `resolveChatRoute`, then a `companion` route carries `platform` from the
   binding row, and no caller passes a platform in: the chat id alone selects the row.
   Given a database that does not have the column yet (new code, old schema), then routing
   for Telegram chats works exactly as before and no WhatsApp route can resolve.
-- AC-6 Given a trip with `whatsapp_group` off, when its main organizer sends
-  `/group whatsapp`, then the reply and every side effect are those of `/group` today.
-- AC-7 Given the switch on, then `/group whatsapp` from the trip's main organizer in a
-  private Telegram chat issues a code that is single-use, expires after
-  `relay.whatsapp.code_ttl_seconds` (default 900), is stored only as a digest, and expires
-  any earlier request of the trip that is still `issued` or `pending`. The trip's Telegram
-  group token is not touched. Anyone else, or any other chat, gets the existing `/group`
-  refusals.
-- AC-8 Given a message in a WhatsApp group with no open binding whose whole text is a
-  valid, unexpired, unused code, then the request becomes `pending` with the group's id
-  and title, the code is spent, the group gets one message carrying a one-time approval
-  word, and the organizer's private Telegram chat gets one message saying a WhatsApp group
-  asked to join the trip and that the word shown in that group approves it. The Telegram
-  message does not contain the word, and names the group's title only as "says it is
-  called".
-- AC-9 Given a pending request, when the Telegram user the code was issued to types the
-  approval word (shape under Contracts), as a whole message, in the private Telegram chat the code was issued in,
-  and at that moment that user is still the trip's main organizer, the trip is not
-  retired, the switch is on and the chat has no live interview, then one binding row opens
-  with `platform = 'whatsapp'` and the trip's companion profile (the rule of
-  `openBinding`, `group-binding.ts:422-439`), the request becomes `approved`, and the
-  introduction is sent to the WhatsApp group. The introduction never includes the site
-  password, whatever `groupIntroIncludesPassword` says.
-- AC-10 Given the approval word from any other Telegram user or chat, or a wrong word of
-  the approval-word shape, then nothing changes; three wrong words close the request as
-  `declined`. A message that is not exactly of that shape is never an attempt and is
-  handled as any other message in that chat. `yes`, `no`
-  and button taps are not approval forms. Not answered within
-  `relay.whatsapp.approval_ttl_seconds` (default 3600), the request expires and the group
-  gets one line saying so.
-- AC-11 Given a code-shaped message that is wrong, expired or already used, or one typed
-  in a WhatsApp private chat, in a group already bound to any trip, or in a group whose id
-  is not of the accepted shape, then no request is created, nothing is sent on Telegram,
-  and the WhatsApp reply is at most one fixed line. A message that is not exactly
-  code-shaped is never an attempt. More than `relay.whatsapp.code_attempts_per_hour`
-  (default 5) failed attempts from one group, or 50 across all groups, silence code
-  handling for that group, or for all unbound groups, for the rest of the hour.
-- AC-12 Given `teardown-trip.py --execute`, then the trip's WhatsApp requests are expired
-  before any other statement in the transaction (the lock order of
-  `REVOKE_GROUP_TOKENS`), and its WhatsApp bindings close with the same reason as its
-  Telegram ones. A trip clear refuses a trip that ever had a binding, as today
-  (`trip-clear.ts`, `EVER_PROVISIONED`), whichever platform the binding was on.
+- AC-6 Given a trip with `whatsapp_group` off, or a deployment with no WhatsApp number,
+  then the dashboard shows no WhatsApp section and every route below answers 404.
+- AC-7 Given the switch on, when the trip's owner, in a dashboard session signed in by
+  password or Google (the "account" policy of `secondary-organizer-link`,
+  `portal.ts`), asks for a code of kind `me`, `group` or `traveller` (with an existing
+  traveller of that trip), then a code is issued that is single-use, expires after
+  `relay.whatsapp.code_ttl_seconds` (default 900), and is stored only as a digest. The
+  answer carries the link to open and the expiry, is `no-store`, and is rate-limited per
+  user as the Telegram link route is. Earlier codes of the trip stay valid; at most 10 are
+  live per trip, and the oldest is expired to make room. Anyone else gets one 404.
+- AC-8 Given a valid code of kind `me` or `traveller` in a message sent in a WhatsApp
+  private chat, then in one transaction the code is spent, any open binding of that chat
+  is closed, one binding row opens for that chat with `platform = 'whatsapp'` and the
+  trip's companion profile (the rule of `openBinding`, `group-binding.ts:422-439`), and
+  one person link is written for the sender: the issuing account and its traveller for
+  `me`, the chosen traveller and no account for `traveller`. The chat gets one fixed
+  confirmation line naming the trip.
+- AC-9 Given a valid code of kind `group` in a message sent in a WhatsApp group that has
+  no open binding, then the code is spent, one binding row opens for the group, and the
+  introduction is sent to the group. The introduction never includes the site password,
+  whatever `groupIntroIncludesPassword` says. Who sent the message does not matter
+  (open question 2).
+- AC-10 Given a code whose kind does not fit the chat (a `group` code in a private chat,
+  a `me` or `traveller` code in a group), a code that is wrong, expired or already used,
+  a `group` code in a group bound to a different trip, a group whose id is not of an
+  accepted shape, or a trip that is retired or switched off at that moment, then nothing
+  is bound, the code is not spent unless it was the right kind for the chat, and the
+  WhatsApp reply is at most one fixed line. A `group` code in a group already bound to
+  the same trip is spent and answered "already connected".
+- AC-11 Given any message, then only a token of exactly the code shape (Contracts)
+  anywhere in its text is a code attempt; everything else is never an attempt. More than
+  `relay.whatsapp.code_attempts_per_hour` (default 5) failed attempts from one chat, or
+  50 across all chats, silence code handling for that chat, or for all unbound chats, for
+  the rest of the hour.
+- AC-12 Given a WhatsApp sender in a bound chat of trip T, then that sender resolves to a
+  trip person only through a WhatsApp person link of T, and is an organizer only while the
+  link's account holds an owner or organizer membership of T at that moment; a link with
+  no account is never more than a participant. A sender with no link resolves to nobody.
+- AC-12a Given Remove in the dashboard, then the binding closes, the person link (for a
+  private chat) is deleted, the next message from that chat is dropped (AC-14), and a
+  group gets one fixed goodbye line.
+- AC-12b Given `teardown-trip.py --execute`, then the trip's live codes are expired before
+  any other statement in the transaction (the lock order of `REVOKE_GROUP_TOKENS`), and
+  its WhatsApp bindings close with the same reason as its Telegram ones. A trip clear
+  refuses a trip that ever had a binding, as today (`trip-clear.ts`, `EVER_PROVISIONED`),
+  whichever platform the binding was on.
 
 **S3: transport**
 
@@ -174,7 +189,7 @@ in this file; if either contradicts a contract below, a spec PR amends it first.
   `{ success: false, error: "PLATFORM_UNAVAILABLE" }` and no Telegram call is made.
 - AC-14 Given a message in a WhatsApp chat with no open binding, then it is dropped
   without a reply and without reaching any gateway or any model, unless it is a code
-  attempt (AC-8, AC-11). This includes every private chat with the number.
+  attempt (AC-8 to AC-11). This includes every unbound private chat with the number.
 - AC-15 Given a bound WhatsApp group whose trip has the switch off, then inbound is
   dropped as in AC-14 and every outbound action for that chat is refused as
   `CHAT_NOT_IN_SCOPE`.
@@ -199,12 +214,15 @@ in this file; if either contradicts a contract below, a spec PR amends it first.
   message of an addressed reply from the same sender, or (documents only) when held and
   followed by an addressed message from the same sender within the existing hold window.
   The relay never downloads media of a message that did not join a turn.
-- AC-20 Given any WhatsApp participant, then that person's id or phone number is not
-  written to the database, not written to a log line, and not sent to a gateway or to the
-  judge model, in an id field or inside message text; logs and the wire carry only the
-  keyed opaque id. A WhatsApp sender is never passed to `resolveTripPerson`,
-  `isTripOrganizer`, `isMainTripOrganizer` or any lookup keyed by a Telegram user id, and
-  resolves to no trip person and no organizer role.
+- AC-20 Given a WhatsApp participant who has not connected a private chat, then that
+  person's id or phone number is not written to the database, not written to a log line,
+  and not sent to a gateway or to the judge model, in an id field or inside message text.
+  Given a person who connected, then their id is stored in exactly two places (the
+  binding's `chat_id` and their person link) and appears on the wire only as the
+  `chat_id` of their own private chat. For everyone, `source.user_id` and every log line
+  carry the keyed opaque id, never a number. A WhatsApp id is never looked up in a column
+  or table that holds Telegram identities other than through the platform-aware person
+  link (AC-12).
 - AC-21 Given the bridge is unreachable, logged out or restarted, then the relay logs one
   state change, keeps serving Telegram unaffected, and resumes WhatsApp when the bridge
   reports connected. A gateway action for a WhatsApp chat while the bridge is down gets
@@ -217,7 +235,8 @@ staging rollout)
 
 - AC-23 The companion is bound to a real WhatsApp group by the flow above, answers a trip
   question when named, stays silent on ordinary chatter for ten minutes, reads a PDF sent
-  with a question, and the same trip's Telegram group keeps working throughout.
+  with a question, answers the organizer in a connected private chat, and the same trip's
+  Telegram group keeps working throughout.
 
 ## Contracts
 
@@ -228,8 +247,10 @@ drops everything else) and nothing in a frame is trusted, so the transport canno
 chosen from the frame. It is chosen from the binding row. That requires a chat id to
 identify one chat on one platform:
 
-- A WhatsApp chat id is stored and sent on the wire as the full group id, suffix included
-  (`<digits>@g.us`). The suffix is never stripped, anywhere.
+- A WhatsApp chat id is stored and sent on the wire in full, suffix included: a group as
+  `<digits>@g.us`, a private chat as the person's id (`<digits>@s.whatsapp.net`, or the
+  linked-identity form if AC-0 finds private chats arrive that way). The suffix is never
+  stripped, anywhere.
 - A Telegram chat id matches `^-?[0-9]{1,20}$`. The two shapes cannot overlap.
 - `telegram_chat_bindings_active_chat_idx` (unique on `chat_id` where open) therefore
   stays as it is, name included (`group-binding.ts:410` matches the name).
@@ -243,24 +264,30 @@ identify one chat on one platform:
 
 - `telegram_chat_bindings.platform text NOT NULL DEFAULT 'telegram'`, CHECK in
   (`'telegram'`, `'whatsapp'`).
-- CHECK: `platform = 'whatsapp'` implies `chat_id ~ '^[0-9]{5,40}@g\.us$'`; and
+- CHECK: `platform = 'whatsapp'` implies `chat_id` matches a group id
+  (`^[0-9]{5,40}@g\.us$`) or a private id (`^[0-9]{5,20}@(s\.whatsapp\.net|lid)$`); and
   `platform = 'telegram'` implies `chat_id !~ '@'`. The second also stops a legacy writer
   that re-inserts a row without a platform from turning a WhatsApp id into a Telegram row.
   Staging holds no row that fails either (checked 2026-11-21: 125 rows, none); the
   production count is read before the release that carries the migration.
-- New table `chat_binding_requests`: `id` (opaque), `trip_id` (FK), `platform`,
-  `code_digest`, `word_digest`, `state` in (`issued`, `pending`, `approved`, `declined`,
-  `expired`), `issued_to_digest` and `issued_in_chat_id` (the organizer's Telegram digest
-  and private chat), `chat_id`, `chat_name` (set when pending), `wrong_words` (count),
-  `expires_at`, `created_at`, `decided_at`. Unique partial indexes over the live states
-  (`issued`, `pending`): one per (`trip_id`, `platform`), and one on `code_digest`.
+- `trip_person_links` gains `platform text NOT NULL DEFAULT 'telegram'` and a nullable
+  `account_user_id` (FK to users). Its id-shape CHECK (`^[0-9]{1,20}$`) becomes
+  per-platform, and `verified_via` gains `'dashboard_code'`. `telegram_user_id` keeps its
+  name and holds the WhatsApp id on `whatsapp` rows. The Telegram-digest triggers do not
+  match such rows; a WhatsApp person's role is derived at read time (AC-12), so no trigger
+  is added.
+- New table `chat_binding_codes`: `id` (opaque), `trip_id` (FK), `platform`, `kind` in
+  (`me`, `traveller`, `group`), `issued_by_user_id`, `participant_username` (for `me` and
+  `traveller`), `code_digest`, `state` in (`issued`, `redeemed`, `expired`), `binding_id`
+  (set when redeemed), `expires_at`, `created_at`, `redeemed_at`. Unique partial index on
+  `code_digest` over `issued`; no one-per-trip index.
 - The table is platform-neutral by name; only `whatsapp` rows are written in this slice.
-- **Code and word shape.** The code is `KWA-` plus 8 characters of the alphabet the group
-  tokens use (`group-binding.ts:50-79`); only a message that is exactly that shape is a
-  code attempt. The approval word is `OK-` plus 6 characters of the same alphabet, and
-  only a message that is exactly that shape, in a chat with a pending request, is an
-  approval attempt; with no pending request it is ordinary text. Failed-attempt
-  counts are kept in the relay's memory; a relay restart resets them.
+- **Code shape.** `KWA-` plus 8 characters of the alphabet the group tokens use
+  (`group-binding.ts:50-79`). The dashboard wraps it in a short sentence in the
+  organizer's language; the relay reads only the token. Failed-attempt counts are kept in
+  the relay's memory; a relay restart resets them.
+- New binding close reasons: `dashboard_removed`, `rebound_by_code`. No existing reader
+  branches on either.
 - The table and column are not renamed. A rename breaks the monitor role's column grants
   (`control-plane/deployment/monitor-db-role.sql:89`), about forty readers in four
   languages, and the `compatible` rollback. Renaming `telegram_chat_bindings` is a later,
@@ -271,22 +298,25 @@ identify one chat on one platform:
   (absent reads as `telegram`; for example `COALESCE(to_jsonb(b)->>'platform','telegram')`),
   and no other query in S2 or S3 selects the column on a path Telegram traffic uses (AC-5).
 
-**What "widen" covers in this slice:** `telegram_chat_bindings` only. Deferred, each to
-the slice that first needs it: `intake_sessions.telegram_chat_id` and the interview tables
-(WhatsApp interview), `trip_person_links.telegram_user_id` and the `telegram_*_links`
-tables (WhatsApp identity), `telegram_group_binding_tokens` (replaced here by the request
-table because a WhatsApp sender cannot be matched to `issued_to_telegram_user_id`),
-`notification_outbox` targeting. `messaging_bindings` (migration 0001; `provider`,
+**What "widen" covers in this slice:** `telegram_chat_bindings` and `trip_person_links`.
+Deferred, each to the slice that first needs it: `intake_sessions.telegram_chat_id` and
+the interview tables (WhatsApp interview), the `telegram_*_links` tables (they model the
+Telegram sign-in to the dashboard and Mini App, which WhatsApp does not have),
+`telegram_group_binding_tokens` (a Telegram deep-link token tied to a Telegram sender;
+the codes table serves WhatsApp), `notification_outbox` targeting. `messaging_bindings` (migration 0001; `provider`,
 `bot_ref`, `chat_ref`) stays unused: nothing reads or writes it, and moving routing onto
 it would be the duplicate table this decision rules out.
 
 ### Chat kind: one predicate instead of the sign of the id
 
 `chatKind(chatId): "private" | "group" | "unknown"` in `identity.ts`, beside
-`isPrivateChatId` (Telegram: digits private, minus-digits group; WhatsApp: `@g.us` group;
-anything else `unknown`, which every caller treats as the most restrictive answer). It
-reads the id's shape only, so no reader needs the new column. Intended result for a
-WhatsApp group row at each reader that sniffs the sign today:
+`isPrivateChatId` (Telegram: digits private, minus-digits group; WhatsApp: `@g.us` group,
+`@s.whatsapp.net` or `@lid` private; anything else `unknown`, which every caller treats as the most restrictive answer). It
+reads the id's shape only, so no reader needs the new column. `isPrivateChatId` itself
+keeps meaning "a Telegram private chat": a WhatsApp private chat is never an organizer's
+notification chat, never an `interview_handover` and never a Mini App chat, and the
+digits-only readers below exclude it without a change. Intended result for a WhatsApp
+row at each reader that sniffs the sign today:
 
 | Reader | Today | Required for a WhatsApp group row |
 |---|---|---|
@@ -331,7 +361,7 @@ export interface InboundTurn {
 
 export interface GateDeps {
   assistantHandle?: string;          // the bot's @username on Telegram; unset on WhatsApp
-  resolvePerson(tripId: string, senderId: string): Promise<TripPerson | null>; // WhatsApp supplies one that returns null
+  resolvePerson(tripId: string, senderId: string): Promise<TripPerson | null>; // WhatsApp supplies the platform-aware lookup of AC-12
   beforeMarks?(turn: InboundTurn, route: CompanionRoute): Promise<GateDecision | null>; // Telegram supplies the organizer document route here, at its present position
   fetchAttachment(ref: string, maxBytes: number): Promise<FetchedFile | null>;
   /* plus the existing db, judge, group context, pending attachments, media store, log */
@@ -366,8 +396,11 @@ stable. The key is its own secret (`relay.whatsapp.sender_id_secret_ref`), so ro
 gateway secret does not change every sender. The same derivation applies to the sender,
 to the replied-to participant and to anything logged.
 
-- The opaque id is `source.user_id`, the key of the conversation window
-  (`conversation_user_ids`) and of held attachments. In the relay a raw participant id
+- A person who connected a private chat chose to give their number: it is stored in the
+  binding's `chat_id` and in their person link, and nowhere else. Everyone else in a
+  group stays opaque.
+- The opaque id is `source.user_id` for every sender, connected or not, the key of the
+  conversation window (`conversation_user_ids`) and of held attachments. In the relay a raw participant id
   exists only in memory. The bridge's session directory is the one place numbers rest on
   disk: the WhatsApp Web library keeps per-participant key files there (seen in an old
   session folder: file names carry participant ids). That directory is already a
@@ -414,8 +447,8 @@ with Hermes is open question 3.
 ### Configuration
 
 Architecture profile, `relay.whatsapp` (absent = feature not present):
-`bridge_url`, `bridge_secret_ref`, `sender_id_secret_ref`, `code_ttl_seconds`,
-`approval_ttl_seconds`, `code_attempts_per_hour`. `bridge_url` passes a new validator that
+`bridge_url`, `bridge_secret_ref`, `sender_id_secret_ref`, `number` (what the dashboard's
+links open; read by the API as well), `code_ttl_seconds`, `code_attempts_per_hour`. `bridge_url` passes a new validator that
 accepts loopback addresses only (`telegramApiRoot` is not reused: it accepts https to any
 host). How a containerised relay shares loopback with the bridge is the deployment's
 concern. The bridge's session directory is the bridge's own argument and holds a
@@ -425,25 +458,45 @@ ships the generic package and a runbook section in `docs/`.
 
 Feature switch `whatsapp_group`: `surfaces: ["relay"]`, `memberVisible: false`, added to
 `shared/feature-switches.js` and to the worker's mirror in `feature_block.py`. It is read
-with `featureEnabled(db, tripId, "whatsapp_group")` at four points: code issue
-(`dispatch.ts`), approval, inbound after the route resolves, and outbound inside
+with `featureEnabled(db, tripId, "whatsapp_group")` at four points: the dashboard
+routes, code redemption, inbound after the route resolves, and outbound inside
 `resolveOutboundRoute` (`outbound-scope.ts`; the connector holds no database handle by
 design). The outbound read happens only when the route's platform is `whatsapp`: a
 Telegram route never reads the switch, so an unreadable switch cannot refuse a Telegram
-send. The relay's own messages to a WhatsApp chat (the approval word, the
-introduction) do not pass `checkScope` and are sent only from the request flow.
+send. The relay's own messages to a WhatsApp chat (code replies, the confirmation, the
+introduction, the goodbye) do not pass `checkScope` and are sent only from the code flow.
+
+### Dashboard routes and page
+
+All under the existing portal (`portal.ts`), `requireMutation` for writes, the "account"
+session policy, the trip's owner only, one 404 for everything else:
+
+| Route | Does |
+|---|---|
+| `POST /v1/trips/:id/whatsapp-codes` `{ kind, participant? }` | issues a code; returns `{ link, expiresAt }` |
+| `GET /v1/trips/:id/whatsapp-connections` | open WhatsApp bindings of the trip: groups with title, people with traveller name and the number's last four digits |
+| `DELETE /v1/trips/:id/whatsapp-connections/:bindingId` | Remove (AC-12a) |
+
+Links: `me` and `traveller` open `https://wa.me/<number>?text=<message>`; `group` opens
+`https://wa.me/?text=<message>`, WhatsApp's share screen, because a link cannot target a
+group. The page (`web/src/pages/TripWhatsApp.tsx`, beside `TripTelegram.tsx`) shows the
+number to add to the group before the group link. The removal reaches the relay through
+the database (the binding is closed); the goodbye line is sent by the relay when it next
+sees the closed binding's chat, or by an outbox row if AC-0 shows that is simpler.
 
 ### Files expected to change
 
 `relay/dispatch.ts`, `relay/poller.ts`, `relay/normalize.ts`,
 `relay/pending-attachments.ts`, `relay/group-judge.ts`, `relay/stay-silent.ts`,
 `relay/connector.ts`, `relay/outbound-scope.ts`, `relay/server.ts`, `chat-router.ts`
-(`ChatRoute.platform`), `identity.ts`, `config.ts`, `trip-audience.ts` and
+(`ChatRoute.platform`, `resolveTripPerson`), `identity.ts`, `config.ts`, `portal.ts`,
+`web/src/api.ts`, `trip-audience.ts` and
 `plan-change-poller.ts` (comment and test only), `analytics/store.ts`,
 `analytics/contract.ts`, `shared/feature-switches.js`, worker `feature_block.py`, worker
 tests for `gateway_reconcile.py`, `scripts/teardown-trip.py`,
 `.agents/skills/trip-fleet-monitor/fleet-mcp.mjs`. New:
-`relay/companion-gate.ts`, `chat-binding-requests.ts`, `relay/whatsapp/*`,
+`relay/companion-gate.ts`, `chat-binding-codes.ts`, `web/src/pages/TripWhatsApp.tsx`,
+`relay/whatsapp/*`,
 `control-plane/whatsapp-bridge/`, `control-plane/api/tools/fake-whatsapp.ts`. Retired or
 rewritten in S3: `.agents/skills/trip-bot-messaging-platform-setup/`, which teaches the
 rejected direct pairing.
@@ -451,13 +504,15 @@ rejected direct pairing.
 ## Non-goals
 
 - The interview, signup, organizer approval flows or any button on WhatsApp.
-- Private WhatsApp chats with the number (dropped silently, AC-14).
-- Organizer or member identity on WhatsApp; organizer-gated actions from a WhatsApp group.
+- Unbound private chats with the number (dropped silently, AC-14).
+- Signing in to the dashboard or the trip site with WhatsApp. A WhatsApp person link gives
+  a role inside the chat only.
+- Switching a private chat between trips by command: sending a newer code rebinds it.
 - Router commands on WhatsApp (`/trips`, `/proactive`, `/app`, …). The proactive level of
   a WhatsApp group is the default until a later slice.
 - Plan-change lines, scheduled messages and outbox notifications to WhatsApp groups.
-- Unbinding or moving a WhatsApp group other than by teardown. After teardown the number
-  is still a member of the family's group and the bridge still receives its messages; the
+- Moving a bound group to another trip other than Remove, then a new code. After Remove
+  or teardown the number is still a member of the family's group and the bridge still receives its messages; the
   relay drops them (AC-14). Leaving the group is a later slice.
 - Old-style WhatsApp groups whose id carries a phone number.
 - The official WhatsApp Business API.
@@ -473,36 +528,48 @@ rejected direct pairing.
   lookup, an unreadable switch or a missing client all resolve to "drop" inbound and
   "refuse" outbound, the same fail-safe direction as the visibility rules.
 - **Binding is the one place a WhatsApp message causes a privileged change**, and a
-  WhatsApp sender is not a verified identity. Members see all of a trip's data through the
-  companion, so a wrongly bound group is a disclosure. The code proves only possession, so
-  it binds nothing. Approval needs the word that was posted in the asking group, typed by
-  the verified organizer on Telegram: a stranger who obtained the code and named their
-  group like the family's still cannot get it approved, because the organizer cannot see
-  the stranger's group. The organizer, the trip and the switch are re-checked at approval,
-  as `answerLinkRequest` re-checks its approver.
+  WhatsApp sender is not a verified identity. What is verified is the dashboard session
+  that minted the code: the trip's owner, signed in by password or Google. The code then
+  proves possession, once, for 15 minutes. This is the trust model the dashboard's
+  Telegram link already uses (`POST /v1/trips/:id/telegram-link`, `telegram-link-token.ts`).
+  Consequences that are accepted and stated:
+  - A `me` code binds whoever sends it as the issuing organizer. The organizer sends it
+    from their own phone seconds after it is minted; it is never meant to be forwarded.
+  - A `traveller` link is meant to be forwarded, so whoever opens it first becomes that
+    traveller in the chat, with a member's view of the trip. Members see all of a trip's
+    data, so this is the disclosure to weigh; the dashboard list and Remove are the
+    control, and the link dies after 15 minutes or one use.
+  - A `group` code is visible to the whole group once sent, and is already spent by then.
+  - A wrongly bound chat is visible in the dashboard list at once.
+- **Roles are derived, not stored.** A WhatsApp organizer is an organizer only while the
+  linked account's membership says so (AC-12), so ending a membership ends the role with
+  no trigger to forget.
 - **A gateway sends only to its own chats**, by the rule of `x-relay-chat-scope.md`,
   including its declared exception: the multiplex gateway, while one is configured, may
   send to any companion chat on either platform.
-- **Everyone in a bound group can talk to the companion**, as in a Telegram group. No
-  WhatsApp participant has an organizer role (AC-20), so nothing organizer-gated can be
-  triggered from WhatsApp.
+- **Everyone in a bound group can talk to the companion**, as in a Telegram group. Only a
+  sender with a person link has a role; an organizer-gated action from WhatsApp is allowed
+  exactly when AC-12 says the sender is an organizer at that moment.
 - **Phone numbers.** A WhatsApp participant id is a phone number, and an @mention writes
-  one into message text. Neither is stored in the database, logged or sent to a gateway or
-  a model (AC-20); the bridge's session directory is the one place they rest. A plain hash of a phone number is reversible by enumeration, so the opaque id
+  one into message text. For people who did not connect, neither is stored in the
+  database, logged or sent to a gateway or a model; for a person who connected, the id is
+  stored in two named places (AC-20). The bridge's session directory also holds them. A plain hash of a phone number is reversible by enumeration, so the opaque id
   is keyed.
 - **The bridge receives every message of every group the number is in**, addressed or
   not, and the judge model reads group text at the trip's proactive level, as on Telegram.
-  The introduction says so in one line (Behaviour 4). The privacy policy drafts in the
+  The introduction says so in one line (Behaviour 2). The privacy policy drafts in the
   notes folder do not mention WhatsApp (open question 4).
-- **Lock order.** Approval takes: request row `FOR UPDATE`, then the open binding for the
-  chat `FOR UPDATE`, then the binding insert. Teardown expires requests first, the order
+- **Lock order.** Redemption takes: code row `FOR UPDATE`, then the open binding for the
+  chat `FOR UPDATE`, then the binding insert. Teardown expires codes first, the order
   `REVOKE_GROUP_TOKENS` already documents (issue #175).
 - **The session directory is a credential** that gives full control of the WhatsApp
   account. It is deployment state, never in this repository, never in a container image.
 - **Boundary review** is required for S2 and S3, with live request/response evidence for:
   an unbound group gets nothing; a bound group with the switch off gets nothing; a
-  companion's gateway cannot send to a WhatsApp chat that is not its own; a code typed by
-  a stranger binds nothing; no phone number appears in a log line, a database row or an
+  companion's gateway cannot send to a WhatsApp chat that is not its own; a spent, expired
+  or wrong-kind code binds nothing; the code routes refuse a non-owner, a Telegram-minted
+  session and a switched-off trip with the same 404; no phone number of an unconnected
+  person appears in a log line, a database row or an
   inbound frame after a turn with an @mention.
 
 ## Test plan
@@ -511,10 +578,11 @@ Tests are written first, from the criteria.
 
 - S1: no edit to any existing test (AC-1); new `companion-gate.test.ts` drives the gate
   with `InboundTurn` for both platforms over the same table of cases.
-- S2: `chat-binding-requests.test.ts` (AC-6 to AC-11, the lock order under concurrent
-  approve and teardown, as `group-binding`'s deadlock test does); a migration test for
+- S2: `chat-binding-codes.test.ts` (AC-7 to AC-12a, the lock order under concurrent
+  redeem and teardown, as `group-binding`'s deadlock test does); portal route tests for
+  AC-6 and AC-7; `TripWhatsApp.test.tsx`; a migration test for
   AC-3 and AC-4; an old-schema test for AC-5 (the route query against a table without the
-  column); `chatKind` cases; `tests/scripts/test_teardown_trip.py` for AC-12; worker and
+  column); `chatKind` cases; `tests/scripts/test_teardown_trip.py` for AC-12b; worker and
   fleet-monitor tests with a WhatsApp row.
 - S3: `control-plane/api/tools/fake-whatsapp.ts`, a loopback stand-in for the bridge with a
   `/_control` API like `fake-telegram.ts`, so CI never needs the WhatsApp library or a
@@ -549,11 +617,15 @@ Decisions for Dror before approval.
 
 1. **Which sprint owns this.** Sprint 9's scope is faster delivery. Proposed: its own
    track after Release 1, with S1 allowed earlier because it changes no behaviour.
-2. **Proof at binding.** Recommended, and written into AC-8 to AC-10: the code typed in
-   the group, then the organizer types on Telegram the word the bot posted in that group.
-   The lighter alternative is the code alone with a notice to the organizer and an undo;
-   it is two steps shorter and lets a leaked code bind a stranger's group, with the
-   companion answering trip questions there, until someone notices.
+2. **Who may send a group code.** As you described it, and as written (AC-9): whoever
+   sends the coded message in the group binds it. A tighter option costs one step: accept
+   a group code only from a number already connected to that trip as an organizer, so
+   "Connect my WhatsApp" comes first. Recommended: as written; the code lives 15 minutes,
+   works once, and the result shows in the dashboard at once.
+2a. **Inviting travellers.** Written in as the third action (AC-8, `traveller`). It is the
+   one part with a forwardable link, and it overlaps the personal invite of
+   `x-member-sign-in.md`. Keep it in this slice, or ship "me" and groups first and add
+   travellers with member sign-in?
 3. **Bridge source.** Recommended: our own small sidecar, adapted from the MIT-licensed
    bridge that ships with Hermes, with the library version pinned. The alternative, running
    Hermes's bridge as it is, is faster but makes the relay's intake depend on a file inside
@@ -561,7 +633,7 @@ Decisions for Dror before approval.
 4. **Privacy wording.** The group introduction line, and whether the published privacy
    policy needs a WhatsApp paragraph before a group outside the owner's family is bound.
 5. **Production.** The unofficial client breaks WhatsApp's terms and the number can be
-   banned without notice. This spec stops at staging; whether and when a real family's
+   banned without notice; a ban now also cuts every connected private chat. This spec stops at staging; whether and when a real family's
    group gets it is a later decision, with a dedicated number that is nobody's personal
    one.
 6. **Product documents.** The MRD entry of 2026-10-30 says "WhatsApp Business", and the
