@@ -18,7 +18,9 @@ const [ACTOR, PREVIOUS, OTHER, INVITED] = ['user_actor000001', 'user_previous000
 const previousOf = (participant) => (participant === 'member2' ? INVITED : PREVIOUS);
 const USERNAME = { member: 'bob', member2: 'eve', organizer: 'alice', unknown: 'nobody' };
 let temp;
-const call = (action, userId, runtimeUsername, deadInviteIds) => api(`/api/internal/control-plane/participants/${action}`, { method: 'POST', apiKey: key, body: { tripId, userId, runtimeUsername, ...(deadInviteIds ? { deadInviteIds } : {}) } });
+const call = (action, userId, runtimeUsername, deadInviteIds, inviteId) => api(`/api/internal/control-plane/participants/${action}`, { method: 'POST', apiKey: key, body: { tripId, userId, runtimeUsername, ...(deadInviteIds ? { deadInviteIds } : {}), ...(inviteId ? { inviteId } : {}) } });
+// release only: what the case says the call names (see _vocabulary.names).
+const namesFor = (c) => (c.names === 'binding_invite' ? 'invite_bindingcases01' : c.names === 'other_invite' ? 'invite_unrelated0001' : undefined);
 // What a case's `dead` says the control plane sends (see _vocabulary.dead): the invite id arranged for 'invite' is invite_bindingcases01.
 const deadFor = (c) => (c.dead === 'binding_invite' ? ['invite_bindingcases01'] : c.dead === 'other_invite' ? ['invite_unrelated0001'] : undefined);
 const canOpen = async (userId, runtimeUsername) => (await api('/api/internal/control-plane/session', { method: 'POST', apiKey: key, body: { tripId, userId, runtimeUsername, role: 'member' } })).status === 200;
@@ -63,7 +65,7 @@ test('the real site answers every RELEASE case of the shared table', async () =>
   for (const c of table.release) {
     await reset();
     await arrange(c.existing, c.participant);
-    const r = await call('release', c.as === 'actor' ? ACTOR : previousOf(c.participant), USERNAME[c.participant]);
+    const r = await call('release', c.as === 'actor' ? ACTOR : previousOf(c.participant), USERNAME[c.participant], undefined, namesFor(c));
     assert.equal(r.status, 200, c.name);
     assert.equal((await r.json()).released, c.released, c.name);
     assert.equal(await holderOf(c.participant), c.holder, `${c.name}: who holds it afterwards`);

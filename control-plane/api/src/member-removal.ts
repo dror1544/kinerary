@@ -17,10 +17,10 @@
  *     a portal session is per person, not per trip, and every trip route checks
  *     membership on every request, so they cannot reach this one anyway.
  *
- * NOT covered here: the trip SITE's own session for them (its cookie lives in
- * the runtime gateway, and the control plane has no call to end it). Their
- * portal membership is gone, so they cannot mint a new launch; an existing
- * runtime session runs out on its own clock.
+ * The trip SITE's binding of the invite they redeemed is ended by the caller after the commit (`releasedInvites`): the site removes it
+ * only when account, name and invite id all match, and the token it issued before stops working at once, because the site reads the
+ * binding on every request. If that call is lost, `deadInviteIds` (portal.ts) lets the next redemption or claim of the name replace it.
+ * Their portal membership is gone, so they cannot mint a new launch either.
  *
  * Refusals: a caller who is not an owner/organizer of the trip with dashboard
  * access gets the SAME 404 as a trip that does not exist; the owner/organizer
@@ -30,7 +30,12 @@
 import type pg from "pg";
 
 export type RemoveMemberOutcome =
-  | { ok: true }
+  /**
+   * `releasedInvites`: the redeemed site invites that were this person's way in, with the trip-site participant each one bound. The caller
+   * tells the trip site to end THOSE bindings once the transaction has COMMITTED (best effort, as for a claim's release: never before the
+   * commit, so a rolled-back removal unbinds nobody).
+   */
+  | { ok: true; releasedInvites: { inviteId: string; runtimeUsername: string }[] }
   | { ok: false; status: 404 | 409; error: "NOT_FOUND" | "CANNOT_REMOVE_SELF" | "LAST_OWNER" | "LAST_ORGANIZER" | "OWNER_ONLY" };
 
 const NOT_FOUND: RemoveMemberOutcome = { ok: false, status: 404, error: "NOT_FOUND" };
@@ -75,9 +80,10 @@ export async function removeMember(
       "DELETE FROM control_plane.web_password_credentials WHERE trip_id = $1 AND user_id = $2",
       [input.tripId, input.targetUserId],
     );
-    await client.query(
+    const revokedInvites = await client.query<{ id: string; runtime_username: string }>(
       `UPDATE control_plane.site_invites SET state = 'revoked', updated_at = now()
-        WHERE trip_id = $1 AND redeemed_by = $2 AND state = 'redeemed'`,
+        WHERE trip_id = $1 AND redeemed_by = $2 AND state = 'redeemed'
+        RETURNING id, runtime_username`,
       [input.tripId, input.targetUserId],
     );
     await client.query(
@@ -92,7 +98,7 @@ export async function removeMember(
       [input.targetUserId],
     );
     await client.query("COMMIT");
-    return { ok: true };
+    return { ok: true, releasedInvites: revokedInvites.rows.map((row) => ({ inviteId: row.id, runtimeUsername: row.runtime_username })) };
   } catch (error) {
     await client.query("ROLLBACK").catch(() => undefined);
     throw error;

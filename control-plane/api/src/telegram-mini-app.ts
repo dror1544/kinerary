@@ -1058,7 +1058,7 @@ export async function endGroupClaimInTx(
  * transaction has COMMITTED (never before: a rolled-back release must not unbind anyone). Best effort by design; see the
  * header of `releaseSiteBindings` in portal.ts for why a release that does not arrive costs nothing.
  */
-export interface ReleasedClaim { tripId: string; userId: string; runtimeUsername: string; /** why it ended, for the audit line */ reason?: string }
+export interface ReleasedClaim { tripId: string; userId: string; runtimeUsername: string; /** set for a removed member's INVITE binding: the site ends it only when account, name and this id all match */ inviteId?: string; /** why it ended, for the audit line */ reason?: string }
 
 // ── The owner's view: the trip card's Telegram status, and Unlink ───────────
 

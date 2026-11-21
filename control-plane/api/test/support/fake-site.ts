@@ -41,8 +41,14 @@ export function fakeAdopt(state: FakeSiteState, people: readonly FakeSitePerson[
   return "ok";
 }
 
-export function fakeRelease(state: FakeSiteState, input: { tripId: string; userId: string; runtimeUsername: string }): boolean {
+export function fakeRelease(state: FakeSiteState, input: { tripId: string; userId: string; runtimeUsername: string; inviteId?: string }): boolean {
   const key = `${input.tripId}:${input.runtimeUsername}`;
+  if (input.inviteId !== undefined) {
+    // A removed member's invite binding: ended only when the account, the name AND the invite id all match what the control plane names.
+    if (!state.invited.has(key) || state.bindings.get(key) !== input.userId || state.inviteIds.get(key) !== input.inviteId) return false;
+    state.bindings.delete(key); state.invited.delete(key); state.inviteIds.delete(key);
+    return true;
+  }
   if (state.invited.has(key) || state.bindings.get(key) !== input.userId) return false;
   state.bindings.delete(key);
   return true;

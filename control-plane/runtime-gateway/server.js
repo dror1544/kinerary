@@ -401,6 +401,23 @@ async function memberInvites(req, res, tripId, username) {
   return json(res, 201, { joinUrl: link, displayName: answer.displayName, expiresAt: answer.expiresAt });
 }
 
+// Is this path (under /t/:trip) one of the trip site's INTERNAL routes? The site's router is case-insensitive and may decode what it is
+// given, so the gateway's block has to match the SAME paths: it percent-decodes (up to four times, so a doubly-encoded spelling is
+// seen), lower-cases and collapses repeated slashes before it looks, and a path that cannot be decoded is treated as internal (a site
+// route that cannot be read cannot be shown to be harmless). Previously `/API/internal/...` got past a case-sensitive prefix test and was
+// held only because the gateway strips x-api-key.
+export function isInternalPath(suffix) {
+  let path = String(suffix);
+  for (let round = 0; round < 4; round += 1) {
+    let decoded;
+    try { decoded = decodeURIComponent(path); } catch { return true; }
+    if (decoded === path) break;
+    path = decoded;
+  }
+  path = path.toLowerCase().replace(/\/{2,}/g, "/");
+  return path === "/api/internal" || path.startsWith("/api/internal/");
+}
+
 // Ask again while a stream is open, at half the cache window so a revocation
 // is seen within one window after the cached "live" runs out (30 s + 15 s with
 // the defaults). A negative answer, an outage and a hung control plane all end
@@ -511,7 +528,7 @@ export function createRuntimeGateway() {
         return json(res, 404, { error: "NOT_FOUND" });
       }
       // Internal identity endpoints are exclusively server-to-server.
-      if (suffix.startsWith("/api/internal/")) return json(res, 404, { error: "NOT_FOUND" });
+      if (isInternalPath(suffix)) return json(res, 404, { error: "NOT_FOUND" });
 
       let session = decodeSession(cookieValue(req, cookieName(tripId)));
       if (session && session.tripId !== tripId) session = null;

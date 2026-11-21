@@ -31,6 +31,7 @@ const STATUS = { ok: [200], refused: [403, 404], conflict: [409] };
 
 async function arrange(existing, name) {
   if (existing === 'actor_invite') assert.equal((await provision(ACTOR, name)).status, 200);
+  if (existing === 'actor_other_invite') assert.equal((await provision(ACTOR, name, OTHER_INVITE)).status, 200);
   if (existing === 'other_user') assert.equal((await adopt(PREVIOUS, name)).status, 200);
   if (existing === 'invite') assert.equal((await provision(PREVIOUS, name, OTHER_INVITE)).status, 200);
   if (existing === 'actor_on_other_participant') assert.equal((await adopt(ACTOR, 'eve')).status, 200);
@@ -80,4 +81,70 @@ test('redeeming an invite for an existing traveller changes nothing about the tr
     assert.equal(after.username, 'bob');
     assert.equal(after.name, me.name, 'the display name is the one it always was');
   } finally { stopTestServer(); rmSync(temp, { recursive: true, force: true }); }
+});
+
+async function withSite(fn) {
+  const temp = mkdtempSync(join(tmpdir(), 'provision-cases-test-'));
+  try {
+    const manifest = join(temp, 'identity.json');
+    writeFileSync(manifest, JSON.stringify({ version: 1, tripId, owner: { userId: ownerId, username: 'alice' }, portalOrigin: 'https://portal.example.test' }));
+    await startTestServer({ PORT: await freePort(), CONTROL_PLANE_EXCHANGE_KEY: key, CONTROL_PLANE_IDENTITY_FILE: manifest, SITE_DIR: fileURLToPath(new URL('../site', import.meta.url)) });
+    await fn();
+  } finally { stopTestServer(); rmSync(temp, { recursive: true, force: true }); }
+}
+const release = (userId, runtimeUsername, inviteId) => api('/api/internal/control-plane/participants/release', { method: 'POST', apiKey: key, body: { tripId, userId, runtimeUsername, ...(inviteId === undefined ? {} : { inviteId }) } });
+const ids = n => Array.from({ length: n }, (_, i) => `invite_filler${String(i).padStart(6, '0')}`);
+
+test('the dead-invite list: 50 well-formed ids work; 51, a malformed entry, a non-array and an object are all "no list" (a 409), and nothing is displaced', async () => {
+  await withSite(async () => {
+    assert.equal((await provision(PREVIOUS, 'bob', OTHER_INVITE)).status, 200);
+    const cases = [
+      ['51 ids (the binding\'s own among them)', [...ids(50), OTHER_INVITE]],
+      ['a malformed entry', [OTHER_INVITE, 7]],
+      ['an entry that is not an invite id', [OTHER_INVITE, 'user_actor000001']],
+      ['a string instead of an array', OTHER_INVITE],
+      ['an object', { [OTHER_INVITE]: true }],
+      ['null', null],
+    ];
+    for (const [label, list] of cases) {
+      const r = await provision(ACTOR, 'bob', INVITE, list);
+      assert.equal(r.status, 409, label);
+      assert.equal(await holderOf('bob'), 'previous', `${label}: the binding is untouched`);
+    }
+    const adopted = await api('/api/internal/control-plane/participants/adopt', { method: 'POST', apiKey: key, body: { tripId, userId: ACTOR, runtimeUsername: 'bob', deadInviteIds: [...ids(50), OTHER_INVITE] } });
+    assert.equal(adopted.status, 409, 'adopt reads the same rule');
+    const fifty = await provision(ACTOR, 'bob', INVITE, [...ids(49), OTHER_INVITE]);
+    assert.equal(fifty.status, 200, 'exactly 50 is within the bound');
+    assert.equal(await holderOf('bob'), 'actor');
+  });
+});
+
+test('a removed member\'s release: only account + name + invite id together end an invite binding; an owner\'s binding, another trip\'s and a malformed id never do', async () => {
+  await withSite(async () => {
+    assert.equal((await provision(ACTOR, 'bob', INVITE)).status, 200);
+    const token = (await (await exchange(ACTOR, 'bob')).json()).token;
+    assert.equal((await api('/api/auth/me', { token })).status, 200);
+    assert.equal((await release(PREVIOUS, 'bob', INVITE)).status, 200, 'another account');
+    assert.equal(await holderOf('bob'), 'actor');
+    assert.equal((await release(ACTOR, 'bob', OTHER_INVITE)).status, 200, 'another invite');
+    assert.equal(await holderOf('bob'), 'actor');
+    assert.equal((await release(ACTOR, 'eve', INVITE)).status, 200, 'another name');
+    assert.equal(await holderOf('bob'), 'actor');
+    for (const bad of ['', 'not-an-invite', 7, null, `${INVITE}x!`]) assert.equal((await release(ACTOR, 'bob', bad)).status, 400, `malformed: ${JSON.stringify(bad)}`);
+    assert.equal(await holderOf('bob'), 'actor');
+    // the owner's own binding is a role 'owner' row with no invite: no invite id can name it
+    const owner = await release(ownerId, 'alice', INVITE);
+    assert.equal((await owner.json()).released, false);
+    assert.equal((await api('/api/internal/control-plane/session', { method: 'POST', apiKey: key, body: { tripId, userId: ownerId, runtimeUsername: null, role: 'owner' } })).status, 200, 'the owner still opens the site');
+    // the real one: account, name and invite id all match
+    const gone = await release(ACTOR, 'bob', INVITE);
+    assert.equal((await gone.json()).released, true);
+    assert.equal(await holderOf('bob'), 'nobody');
+    assert.equal((await exchange(ACTOR, 'bob')).status, 403, 'the removed account\'s exchange is refused');
+    assert.equal((await api('/api/auth/me', { token })).status, 401, 'a managed token issued before is dead at once');
+    assert.equal((await (await release(ACTOR, 'bob', INVITE)).json()).released, false, 'idempotent');
+    // and the name is free for a new invite and for a claim, with no dead list
+    assert.equal((await provision(PREVIOUS, 'bob', OTHER_INVITE)).status, 200);
+    assert.equal(await holderOf('bob'), 'previous');
+  });
 });

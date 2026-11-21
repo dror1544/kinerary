@@ -806,6 +806,33 @@ test("the invite paths accept only their own verbs and are never proxied to the 
   proxiedAuthorization = before;
 });
 
+test("the trip site's internal routes are unreachable through /t/<trip>/ however the path is spelled: case, percent-encoding (also twice) and slashes are all the gateway's 404, and nothing is proxied", async () => {
+  const cookie = await organizerCookie("once-internal-block");
+  const before = { proxied: proxiedAuthorization, lists: participantListCalls, sessions: sessionBodies.length, bindings: bindingCalls.length };
+  proxiedAuthorization = undefined;
+  const spellings = [
+    "/api/internal/control-plane/participants", "/API/internal/control-plane/participants", "/Api/Internal/control-plane/participants", "/api/INTERNAL/control-plane/participants",
+    "/api%2Finternal/control-plane/participants", "/api%2fINTERNAL/control-plane/participants", "/%61pi/internal/control-plane/participants", "/api/%69nternal/control-plane/participants",
+    "/%41pi/%49nternal/control-plane/session", "/api%252Finternal/control-plane/participants", "/%2561pi/internal/control-plane/participants", "/api//internal/control-plane/participants",
+    "/api/internal", "/API/INTERNAL", "/api/internal%2Fcontrol-plane/session", "/api/internal/../internal/control-plane/session", "/api/%E0%A4%A/internal/control-plane/session",
+  ];
+  for (const path of spellings) {
+    for (const method of ["GET", "POST"]) {
+      const response = await fetch(`${gatewayOrigin}/t/trip_abcdefgh${path}`, { method, headers: { cookie } });
+      assert.equal(response.status, 404, `${method} ${path}`);
+      assert.deepEqual(await response.json(), { error: "NOT_FOUND" }, `${method} ${path}`);
+    }
+  }
+  assert.equal(proxiedAuthorization, undefined, "the trip site never saw any of these");
+  assert.equal(participantListCalls, before.lists);
+  assert.equal(sessionBodies.length, before.sessions);
+  assert.equal(bindingCalls.length, before.bindings);
+  proxiedAuthorization = before.proxied;
+  // an ordinary path that merely contains the word is still proxied
+  const ordinary = await fetch(`${gatewayOrigin}/t/trip_abcdefgh/api/internals-are-not-a-thing`, { headers: { cookie } });
+  assert.equal(ordinary.status, 200);
+});
+
 test("invites: the gateway logs nothing for these calls: no link, no token, no user id", async () => {
   resetInvites();
   const cookie = await organizerCookie("once-invites-log");

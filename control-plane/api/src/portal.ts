@@ -306,7 +306,7 @@ export interface RuntimeAccountAdapter {
    */
   adoptParticipant(input: { tripId: string; userId: string; runtimeUsername: string; deadInviteIds?: string[] }): Promise<"ok" | "refused" | "conflict">;
   /** Ends that binding (only that user's, only a claim's, never an invited member's or an organizer's). Idempotent. Throws when the site cannot be asked. */
-  releaseParticipant(input: { tripId: string; userId: string; runtimeUsername: string }): Promise<void>;
+  releaseParticipant(input: { tripId: string; userId: string; runtimeUsername: string; inviteId?: string }): Promise<void>;
 }
 
 /** How long the control plane waits on the trip site for one of these calls. They run inside a person's launch. */
@@ -341,11 +341,11 @@ export class HttpRuntimeAccountAdapter implements RuntimeAccountAdapter {
     });
   }
 
-  private async binding(action: "adopt" | "release", input: { tripId: string; userId: string; runtimeUsername: string; deadInviteIds?: string[] }): Promise<Response> {
+  private async binding(action: "adopt" | "release", input: { tripId: string; userId: string; runtimeUsername: string; deadInviteIds?: string[]; inviteId?: string }): Promise<Response> {
     return fetch(`${this.runtimeOrigin}/internal/t/${encodeURIComponent(input.tripId)}/participants/${action}`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-api-key": this.apiKey },
-      body: JSON.stringify({ tripId: input.tripId, userId: input.userId, runtimeUsername: input.runtimeUsername, ...(action === "adopt" && input.deadInviteIds?.length ? { deadInviteIds: input.deadInviteIds } : {}) }),
+      body: JSON.stringify({ tripId: input.tripId, userId: input.userId, runtimeUsername: input.runtimeUsername, ...(action === "adopt" && input.deadInviteIds?.length ? { deadInviteIds: input.deadInviteIds } : {}), ...(action === "release" && input.inviteId ? { inviteId: input.inviteId } : {}) }),
       signal: AbortSignal.timeout(this.timeoutMs),
     });
   }
@@ -358,7 +358,7 @@ export class HttpRuntimeAccountAdapter implements RuntimeAccountAdapter {
     throw new Error("RUNTIME_PARTICIPANT_ADOPT_FAILED");
   }
 
-  async releaseParticipant(input: { tripId: string; userId: string; runtimeUsername: string }): Promise<void> {
+  async releaseParticipant(input: { tripId: string; userId: string; runtimeUsername: string; inviteId?: string }): Promise<void> {
     const response = await this.binding("release", input);
     if (!response.ok) throw new Error("RUNTIME_PARTICIPANT_RELEASE_FAILED");
   }
@@ -680,8 +680,15 @@ async function membership(deps: PortalDependencies, tripId: string, userId: stri
 export async function deadInviteIdsFor(db: { query: (text: string, values?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }> }, tripId: string, runtimeUsername: string): Promise<string[]> {
   const result = await db.query(
     `SELECT id FROM control_plane.site_invites
-      WHERE trip_id = $1 AND runtime_username = $2 AND redeemed_by IS NULL AND redeemed_at IS NULL
-        AND (state IN ('revoked', 'expired') OR (state = 'unused' AND expires_at <= now()))
+      WHERE trip_id = $1 AND runtime_username = $2
+        AND ((redeemed_by IS NULL AND redeemed_at IS NULL AND (state IN ('revoked', 'expired') OR (state = 'unused' AND expires_at <= now())))
+          -- a REMOVED member's invite (member removal marks the redeemed invite 'revoked' and keeps redeemed_by): dead only while its
+          -- redeemer has NO active membership of this trip, in any role. Whoever is a member again (revived by any path, re-invited, an
+          -- owner or organizer) is not listed, so a live member's binding is never named; a binding of someone with no active
+          -- membership opens nothing (a launch needs one). 'expired' or 'unused' with a redeemer is never listed.
+          OR (state = 'revoked' AND redeemed_by IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM control_plane.trip_memberships m
+                               WHERE m.trip_id = site_invites.trip_id AND m.user_id = site_invites.redeemed_by AND m.status = 'active')))
       ORDER BY created_at DESC LIMIT 50`,
     [tripId, runtimeUsername]);
   return result.rows.map((row) => String(row.id));
@@ -2292,6 +2299,7 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     if (!target) return reply.code(404).send({ error: "NOT_FOUND" });
     const removal = await removeMember(deps.db, { tripId: params.id ?? "", actorUserId: user.id, targetUserId: target });
     if (!removal.ok) return reply.code(removal.status).send({ error: removal.error });
+    await releaseSiteBindings(removal.releasedInvites.map((row) => ({ tripId: params.id ?? "", userId: target, runtimeUsername: row.runtimeUsername, inviteId: row.inviteId, reason: "invite_revoked" })));
     return { status: "revoked" };
   });
 
@@ -2315,7 +2323,11 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
       "SELECT runtime_username FROM control_plane.trip_participant_claims WHERE trip_id = $1 AND user_id = $2 AND released_at IS NULL", [tripId, target.rows[0].user_id]);
     const removal = await removeMember(deps.db, { tripId, actorUserId: user.id, targetUserId: target.rows[0].user_id });
     if (!removal.ok) return reply.code(removal.status).send({ error: removal.error });
-    await releaseSiteBindings(claimed.rows.map((row) => ({ tripId, userId: target.rows[0]!.user_id, runtimeUsername: row.runtime_username, reason: "membership_ended" })));
+    await releaseSiteBindings([
+      ...claimed.rows.map((row) => ({ tripId, userId: target.rows[0]!.user_id, runtimeUsername: row.runtime_username, reason: "membership_ended" })),
+      // the person's way in may have been a redeemed invite: its binding on the site ends too (account + name + invite id)
+      ...removal.releasedInvites.map((row) => ({ tripId, userId: target.rows[0]!.user_id, runtimeUsername: row.runtimeUsername, inviteId: row.inviteId, reason: "membership_ended" })),
+    ]);
     return { status: "removed" };
   });
 

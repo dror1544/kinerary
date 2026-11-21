@@ -223,7 +223,13 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
     if (!activeUser(runtimeUsername)) return res.status(404).json({ error: 'NOT_FOUND' });
     if (!roleMatchesLocal('member', runtimeUsername)) return res.status(403).json({ error: 'ORGANIZER_BINDING_FORBIDDEN' });
     if (isSecondaryUsername(runtimeUsername)) return res.status(403).json({ error: 'ORGANIZER_BINDING_FORBIDDEN' });
-    const existing = find.get(userId, identity.tripId);
+    let existing = find.get(userId, identity.tripId);
+    // This very account's OWN stale binding on this very name (a removed member re-invited, whose release was lost): its old invite is
+    // named dead by the control plane, so the binding is replaced by the new invite's.
+    if (existing && existing.username === runtimeUsername && staleInviteBinding(existing, deadInviteIdsOf(req.body))) {
+      db.prepare('DELETE FROM control_plane_identities WHERE user_id = ? AND trip_id = ?').run(userId, identity.tripId);
+      existing = undefined;
+    }
     if (existing) {
       if (existing.username === runtimeUsername && existing.role === 'member' && existing.invite_id === inviteId) return res.json({ ok: true });
       return res.status(409).json({ error: 'IDENTITY_CONFLICT' });
@@ -282,8 +288,17 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
   app.post('/api/internal/control-plane/participants/release', internal, (req, res) => {
     const { userId, runtimeUsername } = req.body || {};
     if (!userIdValid(userId) || !usernameValid(runtimeUsername)) return res.status(400).json({ error: 'INVALID_REQUEST' });
-    const gone = db.prepare("DELETE FROM control_plane_identities WHERE user_id = ? AND trip_id = ? AND username = ? AND role = 'member' AND invite_id IS NULL")
-      .run(userId, identity.tripId, runtimeUsername);
+    // A REMOVED MEMBER's invite binding (spec amendment A1: member removal removes the binding): when the call names an `inviteId`, the
+    // binding is ended only if the account, the name AND that invite id ALL match the binding, and it is a member's (never an owner's
+    // or a secondary organizer's, never another account's, never another trip's). Without an `inviteId` this is the claim's release
+    // exactly as before: only a binding that carries no invite. Idempotent either way. A malformed id is a 400, never "no id".
+    const { inviteId } = req.body || {};
+    if (inviteId !== undefined && (typeof inviteId !== 'string' || !/^invite_[A-Za-z0-9]{8,64}$/.test(inviteId))) return res.status(400).json({ error: 'INVALID_REQUEST' });
+    const gone = inviteId === undefined
+      ? db.prepare("DELETE FROM control_plane_identities WHERE user_id = ? AND trip_id = ? AND username = ? AND role = 'member' AND invite_id IS NULL")
+        .run(userId, identity.tripId, runtimeUsername)
+      : db.prepare("DELETE FROM control_plane_identities WHERE user_id = ? AND trip_id = ? AND username = ? AND role = 'member' AND invite_id = ?")
+        .run(userId, identity.tripId, runtimeUsername, inviteId);
     return res.json({ ok: true, released: gone.changes > 0 });
   });
 

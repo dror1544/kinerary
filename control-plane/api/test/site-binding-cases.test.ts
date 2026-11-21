@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import { fakeAdopt, fakeProvision, fakeRelease, newFakeSiteState, type FakeSitePerson } from "./support/fake-site.js";
 
 interface AdoptCase { dead?: string; name: string; participant: string; existing: string; result: "ok" | "refused" | "conflict"; holder: string }
-interface ReleaseCase { name: string; participant: string; existing: string; as: string; released: boolean; holder: string }
+interface ReleaseCase { names?: string; name: string; participant: string; existing: string; as: string; released: boolean; holder: string }
 const table = JSON.parse(readFileSync(fileURLToPath(new URL("../../../tests/fixtures/site-binding-cases.json", import.meta.url)), "utf8")) as { adopt: AdoptCase[]; release: ReleaseCase[]; provision: AdoptCase[] };
 
 const trip = "trip_cases0001";
@@ -50,7 +50,8 @@ test("the fake site answers every RELEASE case of the shared table as the real s
     const state = newFakeSiteState();
     arrange(state, c.existing, c.participant);
     const as = c.as === "actor" ? ACTOR : PREVIOUS;
-    assert.equal(fakeRelease(state, { tripId: trip, userId: as, runtimeUsername: nameOf(c.participant) }), c.released, c.name);
+    const inviteId = c.names === "binding_invite" ? "invite_bindingcases01" : c.names === "other_invite" ? "invite_unrelated0001" : undefined;
+    assert.equal(fakeRelease(state, { tripId: trip, userId: as, runtimeUsername: nameOf(c.participant), ...(inviteId ? { inviteId } : {}) }), c.released, c.name);
     assert.equal(holderOf(state, c.participant), c.holder, `${c.name}: who holds it afterwards`);
   }
 });
@@ -60,6 +61,7 @@ const INVITE = "invite_provisioncase01", OTHER_INVITE = "invite_provisioncase02"
 function arrangeProvision(state: ReturnType<typeof newFakeSiteState>, existing: string, participant: string) {
   const username = nameOf(participant);
   if (existing === "actor_invite") assert.equal(fakeProvision(state, people, { tripId: trip, userId: ACTOR, runtimeUsername: username, inviteId: INVITE }), "ok");
+  if (existing === "actor_other_invite") assert.equal(fakeProvision(state, people, { tripId: trip, userId: ACTOR, runtimeUsername: username, inviteId: OTHER_INVITE }), "ok");
   if (existing === "other_user") fakeAdopt(state, people, { tripId: trip, userId: PREVIOUS, runtimeUsername: username });
   if (existing === "invite") assert.equal(fakeProvision(state, people, { tripId: trip, userId: PREVIOUS, runtimeUsername: username, inviteId: OTHER_INVITE }), "ok");
   if (existing === "actor_on_other_participant") fakeAdopt(state, people, { tripId: trip, userId: ACTOR, runtimeUsername: "eve" });

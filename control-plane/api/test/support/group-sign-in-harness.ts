@@ -87,7 +87,7 @@ export interface Harness {
   siteBindings: Map<string, string>;
   siteFail: { adopt?: "unavailable" | "bind_then_fail" | "refused" | "conflict"; release?: "unavailable"; provision?: "unavailable" | "bind_then_fail" };
   siteHeld: Set<string>;
-  siteCalls: { adopt: { tripId: string; userId: string; runtimeUsername: string; deadInviteIds?: string[] }[]; release: { tripId: string; userId: string; runtimeUsername: string }[]; provision: { tripId: string; userId: string; runtimeUsername: string; inviteId: string; deadInviteIds?: string[] }[] };
+  siteCalls: { adopt: { tripId: string; userId: string; runtimeUsername: string; deadInviteIds?: string[] }[]; release: { tripId: string; userId: string; runtimeUsername: string; inviteId?: string }[]; provision: { tripId: string; userId: string; runtimeUsername: string; inviteId: string; deadInviteIds?: string[] }[] };
   newApp(overrides?: Partial<PortalDependencies>): ReturnType<typeof buildApp>;
   /** The dependencies `newApp` builds the portal from, for a caller of an exported portal function (createSiteInvite). */
   deps(overrides?: Partial<PortalDependencies>): PortalDependencies;
@@ -166,7 +166,7 @@ export async function startHarness(): Promise<Harness> {
         if (fail === "bind_then_fail") throw new Error("RUNTIME_PARTICIPANT_ADOPT_FAILED");
         return answer;
       },
-      releaseParticipant: async (input: { tripId: string; userId: string; runtimeUsername: string }) => {
+      releaseParticipant: async (input: { tripId: string; userId: string; runtimeUsername: string; inviteId?: string }) => {
         siteCalls.release.push(input);
         const fail = siteFail.release; delete siteFail.release;
         if (fail === "unavailable") throw new Error("RUNTIME_PARTICIPANT_RELEASE_FAILED");
