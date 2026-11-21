@@ -817,3 +817,74 @@ class RerenderRequest(unittest.TestCase):
         result = self.rerender(tree=tree)
         self.assertEqual(2, result.returncode)
         self.assertNotIn("RERENDER", result.stdout)
+
+
+class SeededConfigDoesNotBeatTheOverlay(unittest.TestCase):
+    """`hermes profile create` seeds a NEW profile's config.yaml with the host root profile's `model:` block.
+
+    Hermes 2026.9.24 does this (`_seed_model_config`). `merge_overlay` lets the existing config win at the top level,
+    so a companion came up on whatever the host's root profile ran: on the VM the real Alsace trip ran on
+    anthropic/claude-opus-4.6 through OpenRouter (no Anthropic credentials there), and Mac companions got haiku or
+    gpt-5.6-luna. "Existing wins" has to mean something a person or an earlier install wrote, never a block `profile
+    create` merely seeded. The stand-in `hermes` here seeds like the real one does.
+    """
+
+    NAME = "seededtrip2027"
+    ROOT_MODEL = "root-profile-model-that-must-not-leak"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        seed = (f"model:\\n  default: {self.ROOT_MODEL}\\n  provider: openrouter\\n"
+                "providers:\\n  openrouter:\\n    api: root-only\\n_config_version: 99\\n")
+        BridgeRequest._exe(self.bin / "hermes",
+                           '#!/bin/sh\n'
+                           'if [ "$1 $2" = "profile create" ]; then\n'
+                           '  mkdir -p "$HOME/.hermes/profiles/$3"\n'
+                           f'  printf "{seed}" > "$HOME/.hermes/profiles/$3/config.yaml"\n'
+                           'fi\nexit 0\n')
+        BridgeRequest._exe(self.bin / "launchctl", "#!/bin/sh\nexit 0\n")
+        (self.bin / "python3").symlink_to(sys.executable)   # PyYAML for the overlay merge
+        self.profile = self.home / ".hermes" / "profiles" / self.NAME
+        self.handoff = json.loads((REPO / "profile-templates/familytrip-companion/example.handoff.json").read_text())
+        self.handoff["profile"]["name"] = self.NAME
+
+    def run_request(self) -> subprocess.CompletedProcess:
+        env = {"HOME": str(self.home), "PATH": f"{self.bin}:/usr/bin:/bin",
+               "KINERARY_ARCHITECTURE_PROFILE": str(self.home / "none.json")}
+        return subprocess.run(["bash", str(SCRIPT)], input=json.dumps(self.handoff), capture_output=True, text=True,
+                              env=env, timeout=120)
+
+    def load(self, name: str) -> dict:
+        import yaml
+        return yaml.safe_load((self.profile / name).read_text())
+
+    def test_a_new_companion_runs_the_templates_model_not_the_host_roots(self) -> None:
+        result = self.run_request()
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(f"INSTALLED {self.NAME}", result.stdout.strip())
+        overlay = self.load("config.overlay.yaml")
+        cfg = self.load("config.yaml")
+        self.assertEqual(overlay["model"], cfg["model"])
+        self.assertNotIn(self.ROOT_MODEL, (self.profile / "config.yaml").read_text())
+        self.assertNotIn("providers", cfg, "nothing else the root profile seeded rides along either")
+        self.assertNotIn("_config_version", cfg)
+        self.assertEqual(overlay["fallback_providers"], cfg["fallback_providers"],
+                         "the rest of the overlay is merged as before")
+
+    def test_a_model_someone_really_chose_survives_a_reinstall(self) -> None:
+        import yaml
+        self.assertEqual(f"INSTALLED {self.NAME}", self.run_request().stdout.strip())
+        cfg = self.load("config.yaml")
+        cfg["model"] = {"default": "gpt-6.1-terra", "provider": "openai-codex"}
+        (self.profile / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+        result = self.run_request()
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(f"ALREADY_PRESENT {self.NAME}", result.stdout.strip())
+        self.assertEqual("gpt-6.1-terra", self.load("config.yaml")["model"]["default"],
+                         "an existing config a person wrote still wins over the overlay")
