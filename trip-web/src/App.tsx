@@ -84,6 +84,7 @@ import {
   deletePhoto,
   createItineraryItem,
   deleteItineraryItem,
+  setItineraryItemDay,
   ItineraryDay,
   ItineraryItem,
   ItineraryItemInput,
@@ -1163,6 +1164,9 @@ export function JourneyView({
   // One flight is one line on the plan, however many bookings are on it (#549);
   // Reservations keeps a row per booking.
   const dayItems = collapseSameFlight(itinerary?.items.filter((item) => item.date === activeDate && (!activePhase?.id || item.phase_id === activePhase.id)) || []);
+  // Items filed under this phase with no date: an idea nobody has placed, or one a companion added without a day.
+  // They belong to the phase, not to the day on screen, so they are listed apart from the day selector.
+  const undatedItems = activePhase?.id ? (itinerary?.items || []).filter((item) => !item.date && item.phase_id === activePhase.id) : [];
   const activityLinks = useMemo(() => new globalThis.Map((itinerary?.items || []).map(item => [item.item_uid, {
     rsvpId: rsvpForItem(item, config, itinerary)?.id,
     venueId: venueForItem(item, config)?.id,
@@ -1483,7 +1487,91 @@ export function JourneyView({
           ) : <p className="empty-state">{copy(lang, "No structured items for this phase day yet.", "אין עדיין פריטים מתוזמנים ליום הזה.")}</p>}
 
         </div>
+        <UndatedPlanItems
+          items={undatedItems}
+          phaseId={activePhase?.id || ""}
+          dates={phaseDates}
+          revision={itinerary?.revision}
+          isOrganizer={isOrganizer}
+          lang={lang}
+          activityLinks={activityLinks}
+          username={username}
+          botName={botName}
+          telegramUsername={telegramUsername}
+          videoLayout={videoLayout}
+          marks={marks}
+          fresh={fresh}
+          destination={activePhase?.title || ""}
+          onEdit={beginEdit}
+        />
       </section>
+    </section>
+  );
+}
+
+/**
+ * The phase's items that are on no day yet.
+ *
+ * The Plan lists items per date, so an item with no date was in the itinerary and nowhere on the screen: the
+ * companion filed "dinner on the first day" without a date and the organizer saw nothing. Undated is a real state
+ * (an idea nobody has placed), so the group says so in words rather than hiding it, and an organizer can put an
+ * item on one of the phase's days. A member sees the list and nothing to press. With no such item it renders
+ * nothing at all.
+ */
+function UndatedPlanItems({ items, phaseId, dates, revision, isOrganizer, lang, activityLinks, username, botName, telegramUsername, videoLayout, marks, fresh, destination, onEdit }: {
+  items: ItineraryItem[];
+  phaseId: string;
+  dates: string[];
+  revision?: string;
+  isOrganizer?: boolean;
+  lang: Lang;
+  activityLinks: globalThis.Map<string, { rsvpId?: string; venueId?: string }>;
+  username?: string;
+  botName?: string;
+  telegramUsername?: string | null;
+  videoLayout: boolean;
+  marks: boolean;
+  fresh: Set<string>;
+  destination: string;
+  onEdit: (item: ItineraryItem) => void;
+}) {
+  const queryClient = useQueryClient();
+  const place = useMutation({
+    mutationFn: ({ itemUid, date }: { itemUid: string; date: string }) => setItineraryItemDay(itemUid, phaseId, date, revision),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["itinerary"] });
+      void queryClient.invalidateQueries({ queryKey: ["today"] });
+    },
+  });
+  if (!items.length) return null;
+  const title = copy(lang, "Not on a day yet", "עדיין לא שובץ ליום");
+  return (
+    <section className="plan-undated" aria-label={title}>
+      <h3>{title}</h3>
+      <p className="plan-undated-note">{copy(lang, "These are on the plan, but no day has been chosen for them.", "הפריטים האלה בתוכנית, אבל עוד לא נבחר להם יום.")}</p>
+      <div className="timeline">
+        {items.map((item) => (
+          <div className="timeline-item-wrap" id={`itinerary-item-${encodeURIComponent(item.item_uid)}`} key={item.item_uid}>
+            <TimelineItem item={item} {...activityLinks.get(item.item_uid)} username={username} lang={lang} botName={botName} telegramUsername={telegramUsername}
+              videoLayout={videoLayout} marks={marks} fresh={fresh.has(item.item_uid)} destination={destination} />
+            {isOrganizer ? <div className="timeline-editor-actions plan-undated-actions">
+              <label>
+                <MobileSelect
+                  value=""
+                  disabled={place.isPending || !dates.length}
+                  aria-label={copy(lang, `Put "${itemTitle(item, lang)}" on a day`, `שיבוץ "${itemTitle(item, lang)}" ליום`)}
+                  onChange={(event) => { if (event.target.value) place.mutate({ itemUid: item.item_uid, date: event.target.value }); }}
+                >
+                  <option value="">{copy(lang, "Choose a day…", "בחירת יום…")}</option>
+                  {dates.map((date) => <option key={date} value={date}>{dateLabel(date, lang)}</option>)}
+                </MobileSelect>
+              </label>
+              <button type="button" onClick={() => onEdit(item)}><Pencil size={15} /> {copy(lang, "Edit", "עריכה")}</button>
+            </div> : null}
+          </div>
+        ))}
+      </div>
+      {place.isError ? <p className="form-error">{copy(lang, "Could not put the item on a day. Refresh the plan and try again.", "לא ניתן לשבץ את הפריט ליום. רעננו את המסלול ונסו שוב.")}</p> : null}
     </section>
   );
 }

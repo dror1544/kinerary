@@ -1,7 +1,7 @@
 ---
 name: trip-daily-planning
 description: Trip planning skill — general overview, day-by-day plans, weather, and group-ready messages from verified itinerary data.
-version: 1.2.0
+version: 1.3.0
 author: Kinerary / Hermes
 license: MIT
 metadata:
@@ -333,6 +333,14 @@ After generating a day plan (pattern C or D), always offer to update the trip si
 4. After writing, **read back the updated day entry** from the site and confirm it matches the approved plan.
 5. If the site still shows the old plan after writing, say so explicitly and do not claim success.
 
+### Every item you add goes on a day
+
+An item on no day is not on the schedule: it is not on any day the family opens, and the site lists it apart, under "Not on a day yet". A day named in the conversation and a `date` left out of `add_plan_item` is how a companion once told an organizer "added to day 1" about an item that was on no day at all.
+
+1. **Set the day when you add.** If the organizer named or implied one — "the first day", "Thursday", "tomorrow", "the day we land" — work out the date from the phase's dates (`get_config`) and pass it as `date` (YYYY-MM-DD, inside the phase's dates) together with the time.
+2. **No day named?** Either ask which day before you write, or add it and **say plainly that it has no day yet** — "I added it, but it's not on a day yet — which day?" — then put it on the day they pick with `update_plan_item` (its `date`). Do not leave it as if it were scheduled.
+3. **Read it back before you report.** Check the tool's answer and `get_phase_plan` for that day. `unscheduled: true` in the answer means the item is on no day. Say "added to <day>" only when the read-back shows it on that day; if it does not, fix it (`update_plan_item` with the `date`) and read again, or say plainly that it is not on the day yet.
+
 **When NOT to offer a site update:**
 - Ultra-short or overview requests (patterns A, B, E)
 - When the organizer explicitly said "just a suggestion" or "don't update"
@@ -454,6 +462,7 @@ If user asks for shorter: duration + destination sequence + hotel names + key tr
 - Do not plan from the start of the day if it is already afternoon or evening — start from the current local time.
 - Do not suggest activities that are already closed or unreachable given the current local time.
 - Do not write to the trip site without an explicit yes from someone in the conversation — always summarize first and wait for "yes".
+- Do not add a plan item without its `date` when a day was named or implied, and never report "added to day N" unless the read-back shows it on day N.
 - Do not invent parking prices — only mention price if found in a web source.
 - Always offer both Google Maps and Waze nav links (unless user specified one).
 
@@ -470,6 +479,7 @@ If user asks for shorter: duration + destination sequence + hotel names + key tr
 - [ ] Active phase/date computed from live config, not memory?
 - [ ] If planning for today: does the plan start from the current local time, not from morning?
 - [ ] Site update offered after daily plan (C or D)? Summary shown before writing? Approval received?
+- [ ] Every item added carries its day (or was said, plainly, to have none yet)? Read back and seen on that day before "added" was said?
 - [ ] Parking checked for urban attractions? Warning + lot links included if problematic?
 - [ ] En-route stops (gas/coffee/restrooms): on-route or minor detour only? Detour time noted if 5–10 min?
 - [ ] Dead-zone check done for remote/scenic routes? Warning shown + Maps link built if confirmed?
