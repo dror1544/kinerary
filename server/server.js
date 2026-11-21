@@ -1718,6 +1718,7 @@ function verifiedManagedClaim(req) {
   } catch { return null; }
 }
 
+const CLAIMED_ME_FIELDS = ['username', 'name', 'name_en', 'family', 'color', 'avatar_file'];
 app.get('/api/auth/me', authRequired, (req, res) => {
   // Per person and per session (it now carries their dashboard address): no cache, shared or private, may keep it.
   res.setHeader('Cache-Control', 'no-store');
@@ -1729,7 +1730,12 @@ app.get('/api/auth/me', authRequired, (req, res) => {
   // view without the ones that manage people (adding organizers lives on the dashboard, for the main organizer only).
   // A session that came from a group claim is told who the traveller is, not the traveller's third-party identities:
   // the Google subject, address and picture, the raw Telegram id and the removal stamp stay with the real person.
-  const { google_sub: _gs, google_email: _ge, google_picture: _gp, telegram_id: _tg, removed_at: _ra, ...claimedView } = user;
+  // That is an ALLOW-LIST (it was "the row minus five named columns", so a column added to `users` tomorrow would have
+  // reached a claimant by default): the fields the pages draw (trip-web's CurrentUser, the classic page's currentUser) and
+  // nothing else. A column nobody names here is never served to a claimed session; `is_organizer` and the dashboard
+  // address are added below, as for every session.
+  const claimedView = {};
+  for (const field of CLAIMED_ME_FIELDS) if (user[field] !== undefined) claimedView[field] = user[field];
   const body = { ...(req.user.claimedSession ? claimedView : user), is_organizer: organizers.includes(user.username) || secondary, ...(secondary ? { is_secondary_organizer: true } : {}) };
   // Present only for an organizer. authRequired is not an organizer check and
   // carries no claim, so the person is checked again here. Through the dashboard

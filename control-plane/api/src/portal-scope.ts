@@ -103,6 +103,11 @@ export const PORTAL_SCOPE_POLICY: Readonly<Record<string, RouteScope>> = Object.
   // (`trip`) or "DELETE /v1/trips/:id/member-claims/:claimId" (`account`), so a Telegram-minted organizer session lists but never releases.
   "POST /internal/member-claims/list": "open",
   "POST /internal/member-claims/release": "open",
+  // The same hop for "Send a personal invite" (S2, AC-11). Key-authenticated, reads no portal cookie. `create` asks `scopeDecision` for
+  // "POST /v1/trips/:id/site-invites" (`account`, below), so a Telegram-minted organizer session is refused here as it is on the
+  // portal route; `available` is only the question "is this person this trip's organizer", which the button needs to be drawn.
+  "POST /internal/member-invites/available": "open",
+  "POST /internal/member-invites/create": "open",
 
   "GET /v1/me": "session",
   "POST /v1/logout": "session",

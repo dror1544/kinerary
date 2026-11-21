@@ -56,7 +56,7 @@ const profile = validateArchitectureProfile({
 function newApp(overrides: Partial<PortalDependencies> = {}) {
   return buildApp(profile, {
     portal: {
-      db: pool, runtimeAccounts: { participantExists: async () => true, provisionParticipant: async () => {} },
+      db: pool, runtimeAccounts: { participantExists: async () => true, provisionParticipant: async () => {}, listParticipants: async () => [{ username: "x-guest", displayName: "x-guest", role: "member" }] },
       publicOrigin: ORIGIN, runtimeOrigin: "http://runtime.example.test", runtimeExchangeKey: "exchange-key",
       runtimeUpstreamHostSuffixes: ["internal"], telegramBotUsername: "kinerary_bot", sessionTtlSeconds: 3600,
       enrollmentTtlSeconds: 3600, approvalTtlSeconds: 3600,

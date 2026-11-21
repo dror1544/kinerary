@@ -940,6 +940,12 @@ textarea { min-height: 132px; resize: vertical; }
 .member-login-actions button.ghost { color: var(--kit-ink); background: white; }
 .member-login-actions button:disabled { opacity: .55; cursor: not-allowed; }
 .member-login-result { flex-basis: 100%; color: var(--kit-ink-soft); line-height: 1.6; }
+.personal-invite-result { display: grid; gap: 8px; }
+.personal-invite-result code { overflow-wrap: anywhere; }
+.personal-invite-message { display: grid; gap: 4px; }
+.personal-invite-message span { font-weight: 700; color: var(--kit-ink); }
+.personal-invite-message textarea { width: 100%; box-sizing: border-box; border: 1px solid var(--kit-line); border-radius: 12px; padding: 8px 10px; font: inherit; line-height: 1.5; color: var(--kit-ink); background: white; resize: vertical; }
+.personal-invite-message button { justify-self: start; border: 1px solid var(--kit-line); border-radius: 999px; padding: 6px 12px; color: var(--kit-ink); background: white; font-weight: 700; cursor: pointer; }
 .assistant-connect { margin-top: 22px; }
 .assistant-connect h3 { margin: 0 0 4px; font: 800 20px/1.2 var(--kit-font-display); }
 .assistant-connect h4 { margin: 14px 0 6px; font-weight: 800; }

@@ -1,5 +1,5 @@
 // Group sign-in: pick your own name (docs/specs/sprint-9/x-member-sign-in.md, S1). Same harness as MiniAppSignIn.test.tsx.
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
@@ -221,4 +221,128 @@ it("in English the screens are left-to-right", async () => {
   mount("/mini-app", (path) => isLaunch(path) ? offer() : undefined, { authenticated: false });
   await screen.findByRole("heading", { name: "Which traveller are you?" });
   expect(screen.getByTestId("mini-app-sign-in")).toHaveAttribute("dir", "ltr");
+});
+
+// ── S1b test gaps (found in review): what is NEVER on screen, the in-flight guard on its own, and the Hebrew states ─────────────────
+
+/** No id, no code, in the words OR in any attribute: what a person reads and what a script on the page could read. */
+const NO_IDS = /tpc_|trip_|claimId|ALREADY_CLAIMED|NOT_FOUND|TELEGRAM_|MEMBERSHIP_CHECK|SIGN_IN_RATE_LIMITED|INVALID_REQUEST|retryable/;
+const expectNoIds = (container: HTMLElement) => {
+  expect(document.body.textContent).not.toMatch(NO_IDS);
+  expect(container.innerHTML).not.toMatch(NO_IDS);
+};
+
+it("no claim id, trip id or error code is rendered on the empty, confirm and retry screens (words or attributes)", async () => {
+  telegram();
+  // empty
+  const empty = mount("/mini-app", (path) => isLaunch(path) ? offer([]) : undefined, { authenticated: false });
+  await screen.findByRole("heading", { name: "Your name isn't on the list" });
+  expectNoIds(empty.container);
+  empty.unmount();
+  // confirm, then retry (a 503 on the claim)
+  let attempts = 0;
+  const flow = mount("/mini-app", (path) => {
+    if (isLaunch(path)) return offer();
+    if (isClaim(path)) { attempts += 1; return attempts === 1 ? json({ error: "MEMBERSHIP_CHECK_UNAVAILABLE", retryable: true }, 503) : SESSION(); }
+    return undefined;
+  });
+  fireEvent.click(await screen.findByRole("button", { name: "Dana" }));
+  await screen.findByRole("heading", { name: "Is this you?" });
+  expectNoIds(flow.container);
+  fireEvent.click(screen.getByRole("button", { name: "Yes, that's me" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("Please try again");
+  expectNoIds(flow.container);
+  // the working state, too (the claim is in flight)
+  expect(flow.claims()).toHaveLength(1);
+});
+
+it("taps that land before the button is re-rendered as disabled are one claim (the in-flight guard, independent of the disabled attribute)", async () => {
+  telegram();
+  let release!: (response: Response) => void;
+  const { claims } = mount("/mini-app", (path) => {
+    if (isLaunch(path)) return offer();
+    if (isClaim(path)) return new Promise<Response>((resolve) => { release = resolve; });
+    return undefined;
+  });
+  fireEvent.click(await screen.findByRole("button", { name: "Dana" }));
+  const confirm = await screen.findByRole("button", { name: "Yes, that's me" });
+  // Three taps that all land BEFORE React has re-rendered the button as disabled (one batch): React's own disabled check never gets a
+  // chance, so only the component's ref says "one claim is in flight". (Clicks on an already-disabled button are swallowed by React
+  // whatever the DOM attribute says, so the earlier double-tap test cannot tell the guard from the attribute.)
+  act(() => { confirm.click(); confirm.click(); confirm.click(); });
+  await vi.waitFor(() => expect(claims()).toHaveLength(1), WAIT);
+  expect(screen.getByRole("button", { name: "Signing in…" })).toBeDisabled();
+  release(SESSION());
+  await vi.waitFor(() => expect(submissions).toHaveLength(1), WAIT);
+  expect(claims()).toHaveLength(1);
+});
+
+it("the guard lets go when the claim ends in a retry: the next tap is a second claim", async () => {
+  telegram();
+  let attempts = 0;
+  const { claims } = mount("/mini-app", (path) => {
+    if (isLaunch(path)) return offer();
+    if (isClaim(path)) { attempts += 1; return attempts === 1 ? json({ error: "MEMBERSHIP_CHECK_UNAVAILABLE", retryable: true }, 503) : SESSION(); }
+    return undefined;
+  });
+  fireEvent.click(await screen.findByRole("button", { name: "Dana" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Yes, that's me" }));
+  await screen.findByRole("alert");
+  fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+  await vi.waitFor(() => expect(claims()).toHaveLength(2), WAIT);
+});
+
+it("Hebrew: the empty list, a name somebody else took, a stale launch and both retry states are Hebrew, right-to-left, and say no code", async () => {
+  vi.spyOn(window.navigator, "languages", "get").mockReturnValue(["he-IL", "en"]);
+  telegram();
+  // empty
+  const empty = mount("/mini-app", (path) => isLaunch(path) ? offer([]) : undefined, { authenticated: false });
+  expect(await screen.findByRole("heading", { name: "השם שלכם לא ברשימה" })).toBeInTheDocument();
+  expect(screen.getByText("בקשו מהמארגן שישלח לכם הזמנה אישית לטיול.")).toBeInTheDocument();
+  expect(screen.getByTestId("mini-app-sign-in")).toHaveAttribute("dir", "rtl");
+  expectNoIds(empty.container);
+  empty.unmount();
+  // taken: the refreshed list, and the sentence about the name somebody else signed in as
+  let launches = 0;
+  const taken = mount("/mini-app", (path) => {
+    if (isLaunch(path)) { launches += 1; return launches === 1 ? offer([DANA, AVI]) : offer([AVI]); }
+    if (isClaim(path)) return json({ error: "ALREADY_CLAIMED" }, 409);
+    return undefined;
+  }, { authenticated: false });
+  fireEvent.click(await screen.findByRole("button", { name: "Dana" }));
+  fireEvent.click(await screen.findByRole("button", { name: "כן, זה אני" }));
+  expect(await screen.findByText(/מישהו כבר נכנס בתור/)).toHaveTextContent("מישהו כבר נכנס בתור Dana. אם זה לא אתם, פנו למארגן.");
+  expectNoIds(taken.container);
+  taken.unmount();
+  // stale
+  const stale = mount("/mini-app", (path) => isLaunch(path) ? offer() : isClaim(path) ? json({ error: "TELEGRAM_INIT_DATA_STALE" }, 401) : undefined, { authenticated: false });
+  fireEvent.click(await screen.findByRole("button", { name: "Dana" }));
+  fireEvent.click(await screen.findByRole("button", { name: "כן, זה אני" }));
+  expect(await screen.findByRole("heading", { name: "פתחו את Kinerary מחדש" })).toBeInTheDocument();
+  expect(screen.getByText("עבר יותר מדי זמן. סגרו את החלון ופתחו את Kinerary שוב מטלגרם.")).toBeInTheDocument();
+  expectNoIds(stale.container);
+  stale.unmount();
+  // retry on the claim: the notice and the button
+  let attempts = 0;
+  const retry = mount("/mini-app", (path) => {
+    if (isLaunch(path)) return offer();
+    if (isClaim(path)) { attempts += 1; return attempts === 1 ? json({ error: "MEMBERSHIP_CHECK_UNAVAILABLE", retryable: true }, 503) : SESSION(); }
+    return undefined;
+  }, { authenticated: false });
+  fireEvent.click(await screen.findByRole("button", { name: "Dana" }));
+  fireEvent.click(await screen.findByRole("button", { name: "כן, זה אני" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("לא הצלחנו להשלים את זה כרגע. נסו שוב.");
+  expect(screen.getByRole("button", { name: "נסו שוב" })).toBeInTheDocument();
+  expectNoIds(retry.container);
+  retry.unmount();
+  // retry on the launch itself
+  let tries = 0;
+  const launchRetry = mount("/mini-app", (path) => {
+    if (!isLaunch(path)) return undefined;
+    tries += 1;
+    return tries === 1 ? json({ error: "MEMBERSHIP_CHECK_UNAVAILABLE", retryable: true }, 503) : offer();
+  }, { authenticated: false });
+  expect(await screen.findByRole("heading", { name: "לא הצלחנו לבדוק כרגע" })).toBeInTheDocument();
+  expect(screen.getByText("נסו שוב בעוד רגע.")).toBeInTheDocument();
+  expectNoIds(launchRetry.container);
 });

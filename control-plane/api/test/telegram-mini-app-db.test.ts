@@ -38,7 +38,7 @@ const profile = validateArchitectureProfile({
 function portalDeps(db: pg.Pool, overrides: Partial<PortalDependencies> = {}): PortalDependencies {
   return {
     db,
-    runtimeAccounts: { participantExists: async () => true, provisionParticipant: async () => {} },
+    runtimeAccounts: { participantExists: async () => true, provisionParticipant: async () => {}, listParticipants: async () => [...siteNames].map((username) => ({ username, displayName: username, role: "member" })) },
     publicOrigin: ORIGIN, runtimeOrigin: "http://runtime.example.test", runtimeExchangeKey: "exchange-key",
     runtimeUpstreamHostSuffixes: ["internal"], telegramBotUsername: "kinerary_bot", sessionTtlSeconds: 3600,
     enrollmentTtlSeconds: 3600, approvalTtlSeconds: 3600,
@@ -839,7 +839,10 @@ test("an http origin never gets SameSite=None (browsers would drop it): the vari
 
 // ── Phase 2: members link themselves, once, with a credential ──────────────
 
+/** Whom the fake trip site says is a participant: an invite is only made for one (createSiteInvite reads the site's list). */
+const siteNames = new Set<string>();
 async function memberWithInvite(app: App, owner: { cookie: string; csrf: string }, tripId: string, username: string) {
+  siteNames.add(username);
   const created = await app.inject({
     method: "POST", url: `/v1/trips/${tripId}/site-invites`, headers: { cookie: owner.cookie, "x-csrf-token": owner.csrf },
     payload: { displayName: `Guest ${username}`, runtimeUsername: username },

@@ -22,6 +22,10 @@ let checkCalls = 0, checkDown = false;
 const claimsCalls = [];
 const CLAIM = { claimId: "tpc_0123456789abcdef", travellerName: "Dana Levi", telegramFirstName: "Maya", telegramUsername: "maya_tg", via: "group_membership", claimedAt: "2026-11-20T08:00:00.000Z", lastSignedInAt: null };
 let claimsAnswer = { status: 200, list: { claims: [CLAIM] }, release: { status: "released" }, hang: false };
+// The control plane's answer to the personal-invite hop, and what it was asked.
+const invitesCalls = [];
+const INVITE = { id: "invite_0123456789abcdef", joinUrl: "https://app.example.test/join#token=tok_secret_value", displayName: "Dana Levi", expiresAt: "2026-11-28T08:00:00.000Z" };
+let invitesAnswer = { status: 200, available: { available: true }, createStatus: 201, create: INVITE, hang: false };
 const PORTAL = "https://app.example.test";
 const RUNTIME = "https://runtime.example.test";
 // What a browser sends for a page navigation (undici would otherwise say sec-fetch-mode: cors).
@@ -116,6 +120,12 @@ before(async () => {
       if (claimsAnswer.hang) return; // never answers
       res.statusCode = claimsAnswer.status;
       return res.end(JSON.stringify(req.url.endsWith("/list") ? claimsAnswer.list : claimsAnswer.release));
+    }
+    if (req.url === "/internal/member-invites/available" || req.url === "/internal/member-invites/create") {
+      invitesCalls.push({ url: req.url, method: req.method, headers: req.headers, body: await body(req) });
+      if (invitesAnswer.hang) return; // never answers
+      res.statusCode = req.url.endsWith("/create") ? invitesAnswer.createStatus : invitesAnswer.status;
+      return res.end(JSON.stringify(req.url.endsWith("/create") ? invitesAnswer.create : invitesAnswer.available));
     }
     if (req.url === "/internal/runtime-routes/trip_abcdefgh") return res.end(JSON.stringify({ routeRef: "route_abcdefgh", upstreamOrigin, upstreamBasePath: "" }));
     res.statusCode = 404; res.end(JSON.stringify({ error: "missing" }));
@@ -650,4 +660,159 @@ test("claims: nothing is logged by the gateway for these calls", async () => {
   try { await claimsGet(cookie); await claimsDelete(cookie); } finally { for (const [name, fn] of originals) console[name] = fn; }
   assert.equal(logged.join("\n").includes(CLAIM.claimId), false);
   assert.equal(logged.join("\n").includes("user_abcdefgh"), false);
+});
+
+// ── The personal-invite hop: trip-web -> gateway -> control plane (spec S2, AC-11) ───────────────────────────────────
+
+const INVITE_HEADERS = { origin: RUNTIME, "x-kinerary-member-invites": "1" };
+const invitesProbe = (cookie, headers = {}) => fetch(`${gatewayOrigin}/t/trip_abcdefgh/__member-invites`, { headers: { ...(cookie ? { cookie } : {}), ...headers } });
+const invitesCreate = (cookie, username = "dl17", headers = INVITE_HEADERS, path) => fetch(`${gatewayOrigin}${path ?? `/t/trip_abcdefgh/__member-invites/${username}`}`, { method: "POST", headers: { ...(cookie ? { cookie } : {}), ...headers } });
+function resetInvites() { invitesCalls.length = 0; invitesAnswer = { status: 200, available: { available: true }, createStatus: 201, create: INVITE, hang: false }; }
+
+test("invites create: asks the control plane with the gateway's key, the cookie's identity and the traveller in the path, and returns only the link, the name and the expiry", async () => {
+  resetInvites();
+  const cookie = await organizerCookie("once-invites-create");
+  invitesAnswer.create = { ...INVITE, secret: "nope" };
+  const response = await invitesCreate(cookie, "dl17", { ...INVITE_HEADERS, "x-api-key": "attacker-key", "x-user-id": "user_attacker", authorization: "Bearer attacker" });
+  assert.equal(response.status, 201);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.deepEqual(await response.json(), { joinUrl: INVITE.joinUrl, displayName: INVITE.displayName, expiresAt: INVITE.expiresAt }, "no invite id, no extra field");
+  assert.equal(invitesCalls.length, 1);
+  assert.equal(invitesCalls[0].url, "/internal/member-invites/create");
+  assert.equal(invitesCalls[0].method, "POST");
+  assert.equal(invitesCalls[0].headers["x-api-key"], "exchange-key", "the control plane saw the gateway's key, never the browser's");
+  assert.equal(invitesCalls[0].headers["x-user-id"], undefined);
+  assert.equal(invitesCalls[0].headers.authorization, undefined);
+  assert.equal(invitesCalls[0].headers.cookie, undefined, "no browser cookie travels to the control plane");
+  assert.deepEqual(invitesCalls[0].body, { tripId: "trip_abcdefgh", userId: "user_abcdefgh", sessionId: "wsess_devicea0001", runtimeUsername: "dl17" });
+});
+
+test("invites: a body or a query from the browser changes nothing about whom the control plane is asked about", async () => {
+  resetInvites();
+  const cookie = await organizerCookie("once-invites-forge");
+  const response = await fetch(`${gatewayOrigin}/t/trip_abcdefgh/__member-invites/dl17?userId=user_attacker&tripId=trip_otherxyz1&sessionId=wsess_x&runtimeUsername=og01`, {
+    method: "POST", headers: { cookie, ...INVITE_HEADERS, "content-type": "application/json" }, body: JSON.stringify({ userId: "user_attacker", tripId: "trip_otherxyz1", runtimeUsername: "og01", role: "owner" }),
+  });
+  assert.equal(response.status, 201);
+  assert.deepEqual(invitesCalls[0].body, { tripId: "trip_abcdefgh", userId: "user_abcdefgh", sessionId: "wsess_devicea0001", runtimeUsername: "dl17" });
+});
+
+test("invites probe: a GET asks the control plane whether this person is the trip's organizer, and answers {available: true} only", async () => {
+  resetInvites();
+  const cookie = await organizerCookie("once-invites-probe");
+  invitesAnswer.available = { available: true, extra: "nope" };
+  const response = await invitesProbe(cookie);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { available: true });
+  assert.equal(invitesCalls[0].url, "/internal/member-invites/available");
+  assert.deepEqual(invitesCalls[0].body, { tripId: "trip_abcdefgh", userId: "user_abcdefgh", sessionId: "wsess_devicea0001" });
+  invitesAnswer.available = { available: "yes" };
+  assert.equal((await invitesProbe(cookie)).status, 503, "anything but available: true is not an answer");
+});
+
+test("invites: no session, a garbled cookie, another trip's cookie and an ended session are the gateway's ordinary 401, and the control plane is never asked", async () => {
+  resetInvites();
+  const good = await organizerCookie("once-invites-401");
+  const [name, value] = good.split("=");
+  for (const [label, cookie] of [["none", null], ["garbled", `${name}=garbage`], ["tampered", `${name}=${value.slice(0, -4)}AAAA`]]) {
+    const created = await invitesCreate(cookie);
+    assert.equal(created.status, 401, label);
+    assert.deepEqual(await created.json(), { error: "AUTHENTICATION_REQUIRED" }, label);
+    assert.equal((await invitesProbe(cookie)).status, 401, label);
+  }
+  assert.equal((await rawGet("/t/trip_abcdefgh/__member-invites", { ...NAV })).status, 401, "a navigation is not redirected: this is a data route");
+  assert.equal(invitesCalls.length, 0, "refused before the control plane was asked");
+  revokedSessions.add("wsess_devicea0001");
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal((await invitesCreate(good)).status, 401, "a session the portal ended is not an organizer here either");
+    assert.equal(invitesCalls.length, 0);
+  } finally { revokedSessions.delete("wsess_devicea0001"); }
+});
+
+test("invites: whoever the control plane does not accept gets its one 404 with no reason; a Telegram-minted organizer session is told to use the dashboard", async () => {
+  resetInvites();
+  const cookie = await organizerCookie("once-invites-404");
+  invitesAnswer = { ...invitesAnswer, status: 404, available: { error: "NOT_FOUND", why: "x" }, createStatus: 404, create: { error: "NOT_FOUND", why: "x" } };
+  for (const response of [await invitesCreate(cookie), await invitesProbe(cookie)]) {
+    assert.equal(response.status, 404);
+    assert.deepEqual(await response.json(), { error: "NOT_FOUND" });
+  }
+  invitesAnswer = { ...invitesAnswer, createStatus: 403, create: { error: "ACCOUNT_SIGN_IN_REQUIRED", message: "Sign in with your password to do this.", leak: "x" } };
+  const scoped = await invitesCreate(cookie);
+  assert.equal(scoped.status, 403);
+  assert.deepEqual(await scoped.json(), { error: "ACCOUNT_SIGN_IN_REQUIRED" });
+});
+
+test("invites: the named answers an organizer needs pass through, and nothing else the control plane says does", async () => {
+  resetInvites();
+  const cookie = await organizerCookie("once-invites-409");
+  for (const error of ["TRAVELLER_CLAIMED_FROM_GROUP", "INVITE_ALREADY_EXISTS", "RUNTIME_PARTICIPANT_NOT_ELIGIBLE", "RUNTIME_PARTICIPANT_NOT_FOUND", "RUNTIME_NOT_READY"]) {
+    invitesAnswer = { ...invitesAnswer, createStatus: 409, create: { error, detail: "dl17 was claimed by Maya" } };
+    const response = await invitesCreate(cookie);
+    assert.equal(response.status, 409, error);
+    assert.deepEqual(await response.json(), { error }, `${error}: the code, nothing else`);
+  }
+  invitesAnswer = { ...invitesAnswer, createStatus: 409, create: { error: "SOMETHING_NEW_AND_INTERNAL" } };
+  const unknown = await invitesCreate(cookie);
+  assert.equal(unknown.status, 503);
+  assert.deepEqual(await unknown.json(), { error: "RUNTIME_UNAVAILABLE" });
+});
+
+test("invites: an outage, a refusal of the key, a hung control plane and a malformed answer are one 503 that says nothing, never a 201", async () => {
+  resetInvites();
+  const cookie = await organizerCookie("once-invites-503");
+  for (const createStatus of [500, 502, 401]) {
+    invitesAnswer = { ...invitesAnswer, createStatus, create: { error: "x" }, status: createStatus, available: { error: "x" } };
+    const response = await invitesCreate(cookie);
+    assert.equal(response.status, 503, String(createStatus));
+    assert.deepEqual(await response.json(), { error: "RUNTIME_UNAVAILABLE" });
+    assert.equal((await invitesProbe(cookie)).status, 503);
+  }
+  for (const create of [{}, { joinUrl: "javascript:alert(1)", displayName: "x", expiresAt: "y" }, { joinUrl: "https://elsewhere.example/join#token=abc", displayName: "x", expiresAt: "y" }, { joinUrl: INVITE.joinUrl, displayName: 7, expiresAt: "y" }]) {
+    invitesAnswer = { ...invitesAnswer, createStatus: 201, create };
+    assert.equal((await invitesCreate(cookie)).status, 503, `a 201 that is not a link to this portal is not an invite: ${JSON.stringify(create)}`);
+  }
+  invitesAnswer = { ...invitesAnswer, createStatus: 201, create: INVITE, hang: true };
+  assert.equal((await invitesCreate(cookie)).status, 503, "a hung control plane fails within the timeout");
+});
+
+test("invites create: refused without this origin and the custom header, and with a username that is not shaped like one, before the control plane is asked", async () => {
+  resetInvites();
+  const cookie = await organizerCookie("once-invites-csrf");
+  for (const headers of [{}, { origin: RUNTIME }, { "x-kinerary-member-invites": "1" }, { origin: PORTAL, "x-kinerary-member-invites": "1" }, { origin: "null", "x-kinerary-member-invites": "1" }, { origin: "https://evil.example", "x-kinerary-member-invites": "1" }, { origin: RUNTIME, "x-kinerary-member-claims": "1" }]) {
+    const response = await invitesCreate(cookie, "dl17", headers);
+    assert.equal(response.status, 403, JSON.stringify(headers));
+    assert.deepEqual(await response.json(), { error: "ORIGIN_REJECTED" });
+  }
+  for (const bad of ["Dana", "d", "x".repeat(70), "..%2F..", "dl17%00", "dl17/extra", "-dl17"]) {
+    assert.equal((await invitesCreate(cookie, bad)).status, 404, bad);
+  }
+  assert.equal((await invitesCreate(null)).status, 401, "no session: the ordinary 401");
+  assert.equal(invitesCalls.length, 0, "nothing reached the control plane");
+});
+
+test("the invite paths accept only their own verbs and are never proxied to the trip site", async () => {
+  resetInvites();
+  const cookie = await organizerCookie("once-invites-verbs");
+  const before = proxiedAuthorization;
+  proxiedAuthorization = undefined;
+  for (const [method, path] of [["POST", "/t/trip_abcdefgh/__member-invites"], ["DELETE", "/t/trip_abcdefgh/__member-invites"], ["GET", "/t/trip_abcdefgh/__member-invites/dl17"], ["DELETE", "/t/trip_abcdefgh/__member-invites/dl17"], ["PUT", "/t/trip_abcdefgh/__member-invites/dl17"], ["POST", "/t/trip_abcdefgh/__member-invites/a/b"]]) {
+    const response = await fetch(`${gatewayOrigin}${path}`, { method, headers: { cookie, ...INVITE_HEADERS } });
+    assert.equal(response.status, 404, `${method} ${path}`);
+  }
+  assert.equal(proxiedAuthorization, undefined, "the trip site never saw these");
+  assert.equal(invitesCalls.length, 0);
+  proxiedAuthorization = before;
+});
+
+test("invites: the gateway logs nothing for these calls: no link, no token, no user id", async () => {
+  resetInvites();
+  const cookie = await organizerCookie("once-invites-log");
+  const logged = [];
+  const originals = ["log", "error", "warn", "info"].map((name) => [name, console[name]]);
+  for (const [name] of originals) console[name] = (...args) => logged.push(args.join(" "));
+  try { await invitesProbe(cookie); await invitesCreate(cookie); } finally { for (const [name, fn] of originals) console[name] = fn; }
+  const text = logged.join("\n");
+  for (const secret of [INVITE.joinUrl, "tok_secret_value", INVITE.id, "user_abcdefgh", "dl17"]) assert.equal(text.includes(secret), false, secret);
 });

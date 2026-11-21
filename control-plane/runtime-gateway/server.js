@@ -101,7 +101,10 @@ function cookieValue(req, name) {
 async function controlPlane(path, init = {}) {
   const response = await timedFetch(`${CONTROL_PLANE_ORIGIN}${path}`, { ...init, headers: { ...init.headers, "x-api-key": EXCHANGE_KEY } });
   if (!response.ok) {
-    const error = Object.assign(new Error("CONTROL_PLANE_REJECTED"), { statusCode: response.status });
+    // `body` is what the control plane SAID (a callers that maps a refusal reads one named code from it; nothing else is ever
+    // passed on). Unreadable or hung is null: a refusal with no reason.
+    const said = await response.json().catch(() => null);
+    const error = Object.assign(new Error("CONTROL_PLANE_REJECTED"), { statusCode: response.status, body: said });
     throw error;
   }
   return response.json();
@@ -344,6 +347,60 @@ async function memberClaims(req, res, tripId, claimId) {
   return json(res, 200, { claims });
 }
 
+// ORGANIZERS' PERSONAL INVITES: the hop between the trip site's Organizer settings -> Signing in -> "Send a personal invite" and the
+// control plane (docs/specs/sprint-9/x-member-sign-in.md, slice S2, AC-11). The same shape and the same reasons as the claims hop above:
+//
+//   GET  /t/:tripId/__member-invites             may this person send one?   -> control plane POST /internal/member-invites/available
+//   POST /t/:tripId/__member-invites/:username   send one to this traveller  -> control plane POST /internal/member-invites/create
+//
+// THE GATEWAY DECIDES NOTHING ABOUT WHO MAY. It forwards what it knows from its OWN sealed cookie (trip, user, the portal session that
+// opened this trip) plus the one thing only the browser can say, WHICH TRAVELLER (the username in the path, shape-checked here and
+// decided on there), and the control plane re-decides everything from its database. Nothing else the browser sends is forwarded: no
+// header (the key is the gateway's own), no cookie, no query, no body. This is NOT behind the group sign-in switch: a personal invite is a
+// full way in for people who are not on Telegram.
+//
+// The POST needs what the claims Release needs, with its own header name: a header a cross-site form cannot send, and this origin as the
+// request's Origin. What comes back is the link, the name and the expiry, and only a well-formed link to THIS deployment's portal: a
+// control plane that said anything else (or an outage, or a hang) is one 503 that says nothing. The named answers an organizer can act on
+// pass through as their code alone; any other 409 is the same 503.
+const USERNAME_SHAPE = /^[a-z0-9][a-z0-9._-]{1,63}$/;
+const INVITE_ANSWERS = new Set(["TRAVELLER_CLAIMED_FROM_GROUP", "INVITE_ALREADY_EXISTS", "RUNTIME_PARTICIPANT_NOT_ELIGIBLE", "RUNTIME_PARTICIPANT_NOT_FOUND", "RUNTIME_NOT_READY"]);
+async function memberInvites(req, res, tripId, username) {
+  const creating = req.method === "POST";
+  if (creating && (req.headers["x-kinerary-member-invites"] !== "1" || req.headers.origin !== RUNTIME_ORIGIN)) {
+    return json(res, 403, { error: "ORIGIN_REJECTED" });
+  }
+  const session = decodeSession(cookieValue(req, cookieName(tripId)));
+  if (!session || session.tripId !== tripId || typeof session.userId !== "string" || !(await sessionLive(session))) {
+    return json(res, 401, { error: "AUTHENTICATION_REQUIRED" });
+  }
+  // A grant minted before session binding names no portal session: the control plane cannot decide for it, so nothing is offered.
+  if (typeof session.sessionId !== "string") return json(res, 404, { error: "NOT_FOUND" });
+  if (creating && !USERNAME_SHAPE.test(username ?? "")) return json(res, 404, { error: "NOT_FOUND" });
+  let answer;
+  try {
+    answer = await controlPlane(creating ? "/internal/member-invites/create" : "/internal/member-invites/available", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ tripId: session.tripId, userId: session.userId, sessionId: session.sessionId, ...(creating ? { runtimeUsername: username } : {}) }),
+    });
+  } catch (error) {
+    const status = error?.message === "CONTROL_PLANE_REJECTED" ? error.statusCode : 0;
+    if (status === 404) return json(res, 404, { error: "NOT_FOUND" });
+    // A Telegram-minted organizer session may not make an invite: the one refusal that says why, and only to a caller the control
+    // plane has already accepted as this trip's organizer.
+    if (status === 403) return json(res, 403, { error: "ACCOUNT_SIGN_IN_REQUIRED" });
+    if (status === 409 && creating && INVITE_ANSWERS.has(error.body?.error)) return json(res, 409, { error: error.body.error });
+    return json(res, 503, { error: "RUNTIME_UNAVAILABLE" });
+  }
+  if (!creating) return answer?.available === true ? json(res, 200, { available: true }) : json(res, 503, { error: "RUNTIME_UNAVAILABLE" });
+  const link = text(answer?.joinUrl);
+  if (!link || link.length > 2048 || !/^[\x21-\x7e]+$/.test(link) || !link.startsWith(`${PORTAL_ORIGIN}/join#token=`)
+    || text(answer?.displayName) === null || text(answer?.expiresAt) === null) {
+    return json(res, 503, { error: "RUNTIME_UNAVAILABLE" });
+  }
+  return json(res, 201, { joinUrl: link, displayName: answer.displayName, expiresAt: answer.expiresAt });
+}
+
 // Ask again while a stream is open, at half the cache window so a revocation
 // is seen within one window after the cached "live" runs out (30 s + 15 s with
 // the defaults). A negative answer, an outage and a hung control plane all end
@@ -443,6 +500,14 @@ export function createRuntimeGateway() {
         let claimId = null;
         try { claimId = target?.[1] ? decodeURIComponent(target[1]) : null; } catch { return json(res, 404, { error: "NOT_FOUND" }); }
         if (target && ((req.method === "GET" && !target[1]) || (req.method === "DELETE" && target[1]))) return await memberClaims(req, res, tripId, claimId);
+        return json(res, 404, { error: "NOT_FOUND" });
+      }
+      // The organizers' personal-invite hop; same rule: other methods and shapes are never proxied to the trip site with a session on them.
+      if (suffix === "/__member-invites" || suffix.startsWith("/__member-invites/")) {
+        const target = suffix.match(/^\/__member-invites(?:\/([^/]+))?$/);
+        let username = null;
+        try { username = target?.[1] ? decodeURIComponent(target[1]) : null; } catch { return json(res, 404, { error: "NOT_FOUND" }); }
+        if (target && ((req.method === "GET" && !target[1]) || (req.method === "POST" && target[1]))) return await memberInvites(req, res, tripId, username);
         return json(res, 404, { error: "NOT_FOUND" });
       }
       // Internal identity endpoints are exclusively server-to-server.

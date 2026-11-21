@@ -17,7 +17,7 @@ import { issueApproval } from "./plan-approval.js";
 import { removeMember } from "./member-removal.js";
 import { structuredLog } from "./redaction.js";
 import {
-  CLAIM_ID_SHAPE, GROUP_VERIFIED_VIA, TRIP_ID_PATTERN, openGroupChat, claimSessionSlot, claimTravellerInTx, endGroupClaimInTx, enqueueSignInNotice, linkMemberOrSkip,
+  CLAIM_ID_SHAPE, GROUP_VERIFIED_VIA, TRIP_ID_PATTERN, openGroupChat, spokenFor, claimSessionSlot, claimTravellerInTx, endGroupClaimInTx, enqueueSignInNotice, linkMemberOrSkip,
   recordLinkSignIn, resolveMiniAppLaunch, telegramLinksByTrip, unlinkTelegramLink, unlinkedTelegramLinksByTrip,
   type GroupSignInDeps, type LabelVisibility, type ReleasedClaim, type SiteParticipant, type TelegramMiniAppConfig,
 } from "./telegram-mini-app.js";
@@ -366,10 +366,18 @@ export class HttpRuntimeAccountAdapter implements RuntimeAccountAdapter {
       method: "POST",
       headers: { "content-type": "application/json", "x-api-key": this.apiKey },
       body: JSON.stringify(input),
+      signal: AbortSignal.timeout(this.timeoutMs),
     });
+    // The site SAID NO (not a participant, an organizer, the name is held by another invite or this account is bound elsewhere):
+    // a refusal the invite's holder can be told about cleanly. Anything else (an outage, a gateway error, a lost answer) is not an
+    // answer at all, and is retryable.
+    if (response.status === 403 || response.status === 404 || response.status === 409) throw new Error(RUNTIME_PARTICIPANT_REFUSED);
     if (!response.ok) throw new Error("RUNTIME_PARTICIPANT_PROVISION_FAILED");
   }
 }
+
+/** What `provisionParticipant` throws when the trip site refused the binding, as opposed to being unable to answer. */
+export const RUNTIME_PARTICIPANT_REFUSED = "RUNTIME_PARTICIPANT_REFUSED";
 
 export interface PortalDependencies {
   db: pg.Pool;
@@ -657,6 +665,83 @@ async function membership(deps: PortalDependencies, tripId: string, userId: stri
     [tripId, userId],
   );
   return result.rows[0] ?? null;
+}
+
+export type SiteInviteResult =
+  | { ok: true; id: string; joinUrl: string; displayName: string; expiresAt: string }
+  | { ok: false; status: 400 | 404 | 409; error: string };
+
+/**
+ * THE ONE WAY a personal invite for an existing traveller is made (docs/specs/sprint-9/x-member-sign-in.md, slice S2, AC-10): the
+ * portal route `POST /v1/trips/:id/site-invites`, the runtime gateway's hop for an organizer's trip-site session
+ * (`/internal/member-invites/create`) and, next, the companion's organizer-scoped tool all call THIS, so the rules exist once. The
+ * caller authenticates its own person and says who they are (`actorUserId`); this function decides again, from the database, that
+ * the person is an owner or organizer of THIS trip with dashboard access, and answers anyone else with the one 404.
+ *
+ * What it will not make an invite for, and why:
+ *   - a name that is not a participant of the trip site (`RUNTIME_PARTICIPANT_NOT_FOUND`): an invite BINDS an existing participant,
+ *     it never creates one. A new traveller is added on the site first, then invited, exactly as before (D2).
+ *   - an organizer, owner or secondary organizer (`RUNTIME_PARTICIPANT_NOT_ELIGIBLE`): the site says so (its role is not `member`),
+ *     or an owner/organizer account here already holds the name. The site refuses the binding anyway; saying so here gives the
+ *     organizer a clean answer instead of a link that cannot work.
+ *   - a traveller who is CLAIMED from the group right now (`TRAVELLER_CLAIMED_FROM_GROUP`): the organizer releases that sign-in
+ *     first. Only an organizer ever sees this answer, because the 404 above comes first.
+ *   - a traveller who already has a pending invite (`INVITE_ALREADY_EXISTS`) unless `replacePending` (the organizer's "send it
+ *     again": the old pending link is revoked and a new one issued in the same transaction), or a redeemed one (never replaced).
+ *
+ * The trip row is locked (`FOR UPDATE`) for the check and the insert, the lock every group claim also takes, so a claim and an invite
+ * for the same traveller meet here one after the other and cannot both win.
+ */
+export async function createSiteInvite(
+  deps: Pick<PortalDependencies, "db" | "runtimeAccounts" | "publicOrigin">,
+  input: { tripId: string; actorUserId: string; runtimeUsername: string; displayName?: string; replacePending?: boolean },
+): Promise<SiteInviteResult> {
+  const { tripId } = input;
+  const actor = await membership(deps as PortalDependencies, tripId, input.actorUserId);
+  if (!actor || !["owner", "organizer"].includes(actor.role) || !actor.dashboard_access) return { ok: false, status: 404, error: "NOT_FOUND" };
+  const runtimeUsername = typeof input.runtimeUsername === "string" ? input.runtimeUsername.toLowerCase().trim() : "";
+  if (!/^[a-z0-9][a-z0-9._-]{1,63}$/.test(runtimeUsername)) return { ok: false, status: 400, error: "INVALID_REQUEST" };
+  let people: readonly SiteParticipant[];
+  try { people = await deps.runtimeAccounts.listParticipants(tripId); } catch { return { ok: false, status: 409, error: "RUNTIME_NOT_READY" }; }
+  const person = people.find((candidate) => candidate.username === runtimeUsername);
+  if (!person) return { ok: false, status: 409, error: "RUNTIME_PARTICIPANT_NOT_FOUND" };
+  if (person.role !== "member") return { ok: false, status: 409, error: "RUNTIME_PARTICIPANT_NOT_ELIGIBLE" };
+  const given = typeof input.displayName === "string" ? input.displayName.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 120).trim() : "";
+  const displayName = given || person.displayName.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 120).trim();
+  if (!displayName) return { ok: false, status: 400, error: "INVALID_REQUEST" };
+  const token = base64url(32);
+  const inviteId = opaque("invite");
+  const client = await deps.db.connect();
+  try {
+    await client.query("BEGIN");
+    const locked = await client.query("SELECT 1 FROM control_plane.trips WHERE id = $1 FOR UPDATE", [tripId]);
+    if (!locked.rowCount) { await client.query("ROLLBACK"); return { ok: false, status: 404, error: "NOT_FOUND" }; }
+    const claimed = await client.query("SELECT 1 FROM control_plane.trip_participant_claims WHERE trip_id = $1 AND runtime_username = $2 AND released_at IS NULL", [tripId, runtimeUsername]);
+    if (claimed.rowCount) { await client.query("ROLLBACK"); return { ok: false, status: 409, error: "TRAVELLER_CLAIMED_FROM_GROUP" }; }
+    if ((await spokenFor(client, tripId)).organizerSide.has(runtimeUsername)) { await client.query("ROLLBACK"); return { ok: false, status: 409, error: "RUNTIME_PARTICIPANT_NOT_ELIGIBLE" }; }
+    // A pending invite past its expiry is not pending: close it, so the unique index (which counts every 'unused' row) lets a fresh one in.
+    await client.query("UPDATE control_plane.site_invites SET state = 'expired', updated_at = now() WHERE trip_id = $1 AND runtime_username = $2 AND state = 'unused' AND expires_at <= now()", [tripId, runtimeUsername]);
+    if (input.replacePending) {
+      await client.query("UPDATE control_plane.site_invites SET state = 'revoked', updated_at = now() WHERE trip_id = $1 AND runtime_username = $2 AND state = 'unused'", [tripId, runtimeUsername]);
+    }
+    let inserted;
+    try {
+      inserted = await client.query<{ expires_at: Date }>(
+        `INSERT INTO control_plane.site_invites(id, trip_id, created_by, intended_display_name, runtime_username, token_digest, state, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, 'unused', now() + interval '7 days') RETURNING expires_at`,
+        [inviteId, tripId, input.actorUserId, displayName, runtimeUsername, sha256(token)],
+      );
+    } catch (error) {
+      await client.query("ROLLBACK");
+      if ((error as { code?: string }).code === "23505") return { ok: false, status: 409, error: "INVITE_ALREADY_EXISTS" };
+      throw error;
+    }
+    await client.query("COMMIT");
+    return { ok: true, id: inviteId, joinUrl: `${deps.publicOrigin}/join#token=${token}`, displayName, expiresAt: inserted.rows[0]!.expires_at.toISOString() };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally { client.release(); }
 }
 
 // Trip states a terminally failed build can be retried from: `retryProvision`'s own RETRYABLE_STATES, minus
@@ -1450,13 +1535,19 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
   //
   // A member, a claimed member, a stranger, another trip's organizer, a dead or foreign session and an unknown trip are all one
   // byte-identical 404 (steps 2-4); nothing is written before step 5 passes.
-  const claimsActor = async (request: FastifyRequest, reply: FastifyReply, kind: "list" | "release"): Promise<{ tripId: string; claimId: string } | null> => {
+  // The steps every one of the gateway's hops shares (1-3 above, and 5 when a policy row is named), in ONE place so the claims hop and
+  // the personal-invite hop below cannot drift apart. `valid` is the route's own body shape; `gate` an extra condition that, when
+  // false, answers as an unknown trip (the claims hop's feature switch: step 4); `routeKey` the portal route whose scope row applies
+  // to a Telegram-minted session (none: the route has no scope of its own).
+  const hopCaller = async (
+    request: FastifyRequest, reply: FastifyReply,
+    route: { valid: (body: Record<string, unknown>) => boolean; gate?: (tripId: string) => Promise<boolean>; routeKey?: string },
+  ): Promise<{ tripId: string; body: Record<string, unknown> } | null> => {
     reply.header("cache-control", "no-store");
     if (!exchangeKeyMatches(request.headers["x-api-key"], deps.runtimeExchangeKey)) { await reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" }); return null; }
     const body = jsonBody(request);
-    const { tripId, userId, sessionId, claimId } = body;
-    if (typeof tripId !== "string" || !TRIP_ID_PATTERN.test(tripId) || typeof userId !== "string" || typeof sessionId !== "string"
-      || (kind === "release" && typeof claimId !== "string")) {
+    const { tripId, userId, sessionId } = body;
+    if (typeof tripId !== "string" || !TRIP_ID_PATTERN.test(tripId) || typeof userId !== "string" || typeof sessionId !== "string" || !route.valid(body)) {
       await reply.code(400).send({ error: "INVALID_REQUEST" });
       return null;
     }
@@ -1468,19 +1559,26 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
       [sessionId, userId]);
     if (!session.rows[0]) return refused();
     if (!(await organizerOf(tripId, userId))) return refused();
-    if (!groupSignIn || !(await featureEnabled(deps.db, tripId, "member_group_sign_in", miniAppLog))) return refused();
+    if (route.gate && !(await route.gate(tripId))) return refused();
     const telegramLinkId = session.rows[0].telegram_link_id;
-    if (telegramLinkId !== null) {
-      const decision = await scopeDecision(deps.db, {
-        routeKey: kind === "list" ? "GET /v1/trips/:id/member-claims" : "DELETE /v1/trips/:id/member-claims/:claimId",
-        params: { id: tripId }, scope: await readSessionScope(deps, userId, telegramLinkId),
-      });
+    if (telegramLinkId !== null && route.routeKey) {
+      const decision = await scopeDecision(deps.db, { routeKey: route.routeKey, params: { id: tripId }, scope: await readSessionScope(deps, userId, telegramLinkId) });
       if (!decision.allow) {
         await reply.code(decision.status).send(decision.body);
         return null;
       }
     }
-    return { tripId, claimId: typeof claimId === "string" ? claimId : "" };
+    return { tripId, body };
+  };
+
+  const claimsActor = async (request: FastifyRequest, reply: FastifyReply, kind: "list" | "release"): Promise<{ tripId: string; claimId: string } | null> => {
+    const actor = await hopCaller(request, reply, {
+      valid: (body) => kind !== "release" || typeof body.claimId === "string",
+      gate: async (tripId) => Boolean(groupSignIn) && (await featureEnabled(deps.db, tripId, "member_group_sign_in", miniAppLog)),
+      routeKey: kind === "list" ? "GET /v1/trips/:id/member-claims" : "DELETE /v1/trips/:id/member-claims/:claimId",
+    });
+    if (!actor) return null;
+    return { tripId: actor.tripId, claimId: typeof actor.body.claimId === "string" ? actor.body.claimId : "" };
   };
 
   app.post("/internal/member-claims/list", async (request, reply) => {
@@ -1494,6 +1592,41 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     if (!actor) return;
     if (!(await releaseMemberClaim(actor.tripId, actor.claimId))) return reply.code(404).send({ error: "NOT_FOUND" });
     return { status: "released" };
+  });
+
+  // ── "Send a personal invite" for an organizer's TRIP-SITE session (the runtime gateway's hop; S2, AC-11) ─────────
+  //
+  //   POST /internal/member-invites/available  { tripId, userId, sessionId }                   -> 200 { available: true }
+  //   POST /internal/member-invites/create     { tripId, userId, sessionId, runtimeUsername }  -> 201 { id, joinUrl, displayName, expiresAt }
+  //                                                                                              | 409 { error: <one of createSiteInvite's named answers> }
+  //
+  // The same hop as the claims one, decided by the same `hopCaller` (key, a live session that is that user's, owner/organizer of THIS
+  // trip with dashboard access: one byte-identical 404 for everyone else), with two differences that are on purpose:
+  //   - NO feature switch. A personal invite is a full way in for people who are not on Telegram (spec D1); it must work with
+  //     `member_group_sign_in` off and with group sign-in not wired. What gates the button is the gateway being in front of the
+  //     site and the caller being this trip's organizer, nothing else.
+  //   - the scope row is the portal route's own, `POST /v1/trips/:id/site-invites` (`account`): a session a Telegram link minted (an
+  //     organizer in the Mini App) is told 403 ACCOUNT_SIGN_IN_REQUIRED, exactly as the portal route tells it, and only after the
+  //     caller has passed the organizer check. The probe (`available`) applies no scope: the button is drawn and the click says why not.
+  // The create is `createSiteInvite`, the function the portal route and the companion's tool call too; only the traveller's username
+  // comes from the browser (through the gateway). The name on the invite is the trip site's own for that participant, never the caller's.
+  // "Send it again" replaces a pending invite (`replacePending`): the organizer cannot recover a link that is stored only as a digest.
+  app.post("/internal/member-invites/available", async (request, reply) => {
+    const actor = await hopCaller(request, reply, { valid: () => true });
+    if (!actor) return;
+    return { available: true };
+  });
+
+  app.post("/internal/member-invites/create", async (request, reply) => {
+    const actor = await hopCaller(request, reply, {
+      valid: (body) => typeof body.runtimeUsername === "string" && /^[a-z0-9][a-z0-9._-]{1,63}$/.test(body.runtimeUsername),
+      routeKey: "POST /v1/trips/:id/site-invites",
+    });
+    if (!actor) return;
+    const made = await createSiteInvite(deps, { tripId: actor.tripId, actorUserId: actor.body.userId as string, runtimeUsername: actor.body.runtimeUsername as string, replacePending: true });
+    if (!made.ok) return reply.code(made.status).send({ error: made.error });
+    miniAppLog(structuredLog("info", "member_invite.created", {}));
+    return reply.code(201).send({ id: made.id, joinUrl: made.joinUrl, displayName: made.displayName, expiresAt: made.expiresAt });
   });
 
   // Ends one Telegram link — one TRIP's link — of the signed-in user's own, with
@@ -2110,26 +2243,11 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     const displayName = typeof body.displayName === "string" ? body.displayName.trim().slice(0, 120) : "";
     const runtimeUsername = typeof body.runtimeUsername === "string" ? body.runtimeUsername.toLowerCase().trim() : "";
     if (!displayName || !/^[a-z0-9][a-z0-9._-]{1,63}$/.test(runtimeUsername)) return reply.code(400).send({ error: "INVALID_REQUEST" });
-    let participantExists = false;
-    try {
-      participantExists = await deps.runtimeAccounts.participantExists({ tripId, runtimeUsername });
-    } catch {
-      return reply.code(409).send({ error: "RUNTIME_NOT_READY" });
-    }
-    if (!participantExists) return reply.code(409).send({ error: "RUNTIME_PARTICIPANT_NOT_FOUND" });
-    const token = base64url(32);
-    const inviteId = opaque("invite");
-    try {
-      await deps.db.query(
-        `INSERT INTO control_plane.site_invites(id, trip_id, created_by, intended_display_name, runtime_username, token_digest, state, expires_at)
-         VALUES ($1, $2, $3, $4, $5, $6, 'unused', now() + interval '7 days')`,
-        [inviteId, tripId, user.id, displayName, runtimeUsername, sha256(token)],
-      );
-    } catch (error) {
-      if ((error as { code?: string }).code === "23505") return reply.code(409).send({ error: "INVITE_ALREADY_EXISTS" });
-      throw error;
-    }
-    return reply.code(201).send({ id: inviteId, status: "unused", joinUrl: `${deps.publicOrigin}/join#token=${token}` });
+    // The rules (an existing participant, never an organizer, never a claimed traveller, the lock) live in createSiteInvite, which
+    // the runtime gateway's hop and the companion's tool call too.
+    const made = await createSiteInvite(deps, { tripId, actorUserId: user.id, runtimeUsername, displayName });
+    if (!made.ok) return reply.code(made.status).send({ error: made.error });
+    return reply.code(201).send({ id: made.id, status: "unused", joinUrl: made.joinUrl });
   });
 
   app.delete("/v1/trips/:id/site-invites/:inviteId", async (request, reply) => {
@@ -2229,15 +2347,34 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     const client = await deps.db.connect();
     try {
       await client.query("BEGIN");
+      // The trip row first, then the invite: the lock every group claim and every invite creation for this trip also takes, so the
+      // "is anyone signed in as this traveller?" question below cannot be overtaken by a claim that commits a moment later.
+      await client.query("SELECT 1 FROM control_plane.trips WHERE id = $1 FOR UPDATE", [invite.trip_id]);
       const locked = await client.query("SELECT state FROM control_plane.site_invites WHERE id = $1 FOR UPDATE", [invite.id]);
       if (locked.rows[0]?.state !== "unused") { await client.query("ROLLBACK"); return reply.code(409).send({ error: "INVITE_ALREADY_USED" }); }
+      // A LIVE claim from the group holds this traveller (an invite made before the claim existed, or one that lost a race): this
+      // person cannot take the name from it. A refusal that names nothing and writes nothing; the organizer sorts it out
+      // (release the sign-in, send a fresh invite). A claim that has ENDED holds nothing, and the site's leftover binding of it is
+      // replaced by the provision below.
+      const holder = await client.query("SELECT 1 FROM control_plane.trip_participant_claims WHERE trip_id = $1 AND runtime_username = $2 AND released_at IS NULL", [invite.trip_id, invite.runtime_username]);
+      if (holder.rowCount) { await client.query("ROLLBACK"); return reply.code(409).send({ error: "INVITE_UNAVAILABLE" }); }
       if (!signedIn) await client.query("INSERT INTO control_plane.users(id, status, display_name) VALUES ($1, 'active', $2)", [userId, invite.intended_display_name]);
       // The runtime adapter is idempotent by invite id. Holding the invite row
       // lock prevents concurrent redemption; if the database transaction later
       // aborts, the same raw invite may safely retry the runtime enrollment.
-      await deps.runtimeAccounts.provisionParticipant({
-        tripId: invite.trip_id, inviteId: invite.id, userId, runtimeUsername: invite.runtime_username, displayName: invite.intended_display_name,
-      });
+      try {
+        await deps.runtimeAccounts.provisionParticipant({
+          tripId: invite.trip_id, inviteId: invite.id, userId, runtimeUsername: invite.runtime_username, displayName: invite.intended_display_name,
+        });
+      } catch (error) {
+        // Never a raw 500 (a person is looking at the join page). The site SAID NO: one refusal for every reason, naming nothing (an
+        // organizer's name, a name another invite holds, an account bound elsewhere). The site could not be asked, or its answer
+        // was lost: retryable, and the same link works again. Either way nothing is written: the invite stays unused and the account
+        // this transaction would have made is rolled back with it.
+        await client.query("ROLLBACK");
+        if ((error as Error | null)?.message === RUNTIME_PARTICIPANT_REFUSED) return reply.code(409).send({ error: "INVITE_UNAVAILABLE" });
+        return reply.header("retry-after", "5").code(503).send({ error: "RUNTIME_NOT_READY", retryable: true });
+      }
       if (portalPasswordHash) {
         await client.query(
           `INSERT INTO control_plane.web_password_credentials(user_id, trip_id, runtime_username, password_hash)

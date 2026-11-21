@@ -8,11 +8,11 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { fakeAdopt, fakeRelease, newFakeSiteState, type FakeSitePerson } from "./support/fake-site.js";
+import { fakeAdopt, fakeProvision, fakeRelease, newFakeSiteState, type FakeSitePerson } from "./support/fake-site.js";
 
 interface AdoptCase { name: string; participant: string; existing: string; result: "ok" | "refused" | "conflict"; holder: string }
 interface ReleaseCase { name: string; participant: string; existing: string; as: string; released: boolean; holder: string }
-const table = JSON.parse(readFileSync(fileURLToPath(new URL("../../../tests/fixtures/site-binding-cases.json", import.meta.url)), "utf8")) as { adopt: AdoptCase[]; release: ReleaseCase[] };
+const table = JSON.parse(readFileSync(fileURLToPath(new URL("../../../tests/fixtures/site-binding-cases.json", import.meta.url)), "utf8")) as { adopt: AdoptCase[]; release: ReleaseCase[]; provision: AdoptCase[] };
 
 const trip = "trip_cases0001";
 const people: FakeSitePerson[] = [{ username: "bob", role: "member" }, { username: "eve", role: "member" }, { username: "alice", role: "organizer" }];
@@ -47,6 +47,26 @@ test("the fake site answers every RELEASE case of the shared table as the real s
     arrange(state, c.existing, c.participant);
     const as = c.as === "actor" ? ACTOR : PREVIOUS;
     assert.equal(fakeRelease(state, { tripId: trip, userId: as, runtimeUsername: nameOf(c.participant) }), c.released, c.name);
+    assert.equal(holderOf(state, c.participant), c.holder, `${c.name}: who holds it afterwards`);
+  }
+});
+
+// The personal invite for an existing traveller (S2): the INVITE binding. Same fixture, the `provision` section.
+const INVITE = "invite_provisioncase01", OTHER_INVITE = "invite_provisioncase02";
+function arrangeProvision(state: ReturnType<typeof newFakeSiteState>, existing: string, participant: string) {
+  const username = nameOf(participant);
+  if (existing === "actor_invite") assert.equal(fakeProvision(state, people, { tripId: trip, userId: ACTOR, runtimeUsername: username, inviteId: INVITE }), "ok");
+  if (existing === "other_user") fakeAdopt(state, people, { tripId: trip, userId: PREVIOUS, runtimeUsername: username });
+  if (existing === "invite") assert.equal(fakeProvision(state, people, { tripId: trip, userId: PREVIOUS, runtimeUsername: username, inviteId: OTHER_INVITE }), "ok");
+  if (existing === "actor_on_other_participant") fakeAdopt(state, people, { tripId: trip, userId: ACTOR, runtimeUsername: "eve" });
+}
+
+test("the fake site answers every PROVISION case of the shared table as the real site does", () => {
+  assert.ok(Array.isArray(table.provision) && table.provision.length >= 7, "the table has a provision section");
+  for (const c of table.provision) {
+    const state = newFakeSiteState();
+    arrangeProvision(state, c.existing, c.participant);
+    assert.equal(fakeProvision(state, people, { tripId: trip, userId: ACTOR, runtimeUsername: nameOf(c.participant), inviteId: INVITE }), c.result, c.name);
     assert.equal(holderOf(state, c.participant), c.holder, `${c.name}: who holds it afterwards`);
   }
 });

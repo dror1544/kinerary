@@ -9,10 +9,12 @@ export interface FakeSiteState {
   bindings: Map<string, string>;
   /** `<trip>:<username>` bound by an INVITE (never displaced, never released through this path). */
   invited: Set<string>;
+  /** `<trip>:<username>` -> the invite id on an invite binding (what makes a second provision of the same invite idempotent). */
+  inviteIds: Map<string, string>;
 }
 export interface FakeSitePerson { username: string; role?: string | undefined }
 
-export const newFakeSiteState = (): FakeSiteState => ({ bindings: new Map(), invited: new Set() });
+export const newFakeSiteState = (): FakeSiteState => ({ bindings: new Map(), invited: new Set(), inviteIds: new Map() });
 
 export function fakeAdopt(state: FakeSiteState, people: readonly FakeSitePerson[] | undefined, input: { tripId: string; userId: string; runtimeUsername: string }): "ok" | "refused" | "conflict" {
   const key = `${input.tripId}:${input.runtimeUsername}`;
@@ -31,4 +33,29 @@ export function fakeRelease(state: FakeSiteState, input: { tripId: string; userI
   if (state.invited.has(key) || state.bindings.get(key) !== input.userId) return false;
   state.bindings.delete(key);
   return true;
+}
+
+/**
+ * The INVITE binding (POST /api/internal/control-plane/participants): a redeeming account is bound to an existing
+ * participant with the invite's id on the binding. Differs from adopt in that the binding is invite-bound, and that
+ * a leftover claim binding (not invite-bound) on the name is replaced: the control plane has already checked that no
+ * claim is live. Held to the `provision` section of tests/fixtures/site-binding-cases.json.
+ */
+export function fakeProvision(state: FakeSiteState, people: readonly FakeSitePerson[] | undefined, input: { tripId: string; userId: string; runtimeUsername: string; inviteId: string }): "ok" | "refused" | "conflict" {
+  const key = `${input.tripId}:${input.runtimeUsername}`;
+  const person = (people ?? []).find((p) => p.username === input.runtimeUsername);
+  if (!person || person.role !== "member") return "refused";
+  if (state.invited.has(key)) {
+    // The same invite by the same account again is idempotent; anyone else's invite binding is never displaced.
+    return state.bindings.get(key) === input.userId && state.inviteIds.get(key) === input.inviteId ? "ok" : "conflict";
+  }
+  for (const [other, user] of state.bindings) {
+    // This account already stands for a participant (another one, or this one by a claim, which is not an invite's binding).
+    if (user === input.userId && other.startsWith(`${input.tripId}:`)) return "conflict";
+  }
+  // Whatever else is on the name is a leftover claim binding of another account: replaced.
+  state.bindings.set(key, input.userId);
+  state.invited.add(key);
+  state.inviteIds.set(key, input.inviteId);
+  return "ok";
 }

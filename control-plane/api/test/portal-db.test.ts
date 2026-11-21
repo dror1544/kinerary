@@ -34,7 +34,10 @@ function portalDeps(db: pg.Pool): PortalDependencies {
   return {
     db,
     google: { clientId: "test-client.apps.googleusercontent.com", verify: async () => ({ subject: "unused", displayName: "Unused", emailVerified: false }) },
-    runtimeAccounts: { participantExists: async ({ runtimeUsername }) => runtimeUsername !== "missing-user", provisionParticipant: async (input) => {
+    runtimeAccounts: { participantExists: async ({ runtimeUsername }) => runtimeUsername !== "missing-user",
+      // The site answers a list too: createSiteInvite reads the participant's role from it (an organizer is never invited).
+      listParticipants: async () => ["password-guest", "google-guest", "guest-user", "hidden-user"].map((username) => ({ username, displayName: username, role: "member" })),
+      provisionParticipant: async (input) => {
       runtimeEnrollments.push(input);
       if (failNextEnrollment) { failNextEnrollment = false; throw new Error("simulated runtime reply lost"); }
     } },
@@ -145,7 +148,9 @@ test("portal HTTP authorization separates dashboard, tenant and runtime access",
       method: "POST", url: "/v1/site-invites/redeem",
       payload: { token: inviteToken, method: "password", password: "password-guest-secret" },
     });
-    assert.equal(failedRedemption.statusCode, 500);
+    // A reply the site never sent is not an answer: retryable, never a raw 500 (S2: the join page is what a person is looking at).
+    assert.equal(failedRedemption.statusCode, 503);
+    assert.deepEqual(failedRedemption.json(), { error: "RUNTIME_NOT_READY", retryable: true });
     const redeemed = await app.inject({
       method: "POST", url: "/v1/site-invites/redeem",
       payload: { token: inviteToken, method: "password", password: "password-guest-secret" },

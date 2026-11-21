@@ -1,8 +1,8 @@
 {
-  "_about": "The ONE case table for the trip site's adopt/release rules (server/control-plane-auth.js). It is run against the REAL site by tests/control-plane-binding-cases.test.js and against the control-plane tests' FAKE site by control-plane/api/test/site-binding-cases.test.ts, which loads this same file by relative path (the control-plane workflow checks out the whole repository). Edit a rule on one side and the other side's run of this table fails.",
+  "_about": "The ONE case table for the trip site's adopt/release rules (server/control-plane-auth.js; adopt, release and, since S2, provision). It is run against the REAL site by tests/control-plane-binding-cases.test.js and against the control-plane tests' FAKE site by control-plane/api/test/site-binding-cases.test.ts, which loads this same file by relative path (the control-plane workflow checks out the whole repository). Edit a rule on one side and the other side's run of this table fails.",
   "_vocabulary": {
     "participant": "member = a plain member of the trip site; organizer = a configured organizer; unknown = not a participant",
-    "existing": "none | actor | other_user | invite | actor_on_other_participant: what the site already holds for the participant being asked about (the actor is the control-plane user making the call)",
+    "existing": "none | actor | other_user | invite | actor_on_other_participant | actor_invite: what the site already holds for the participant being asked about (the actor is the control-plane user making the call; actor_invite = the actor already bound by THIS invite, the one a provision call names)",
     "holder": "who can open the participant afterwards: actor | previous (whoever held it before) | nobody",
     "order": "cases run in this order against one site; the invite case permanently consumes the second plain member, so it is last"
   },
@@ -20,5 +20,15 @@
     { "name": "another account's release changes nothing", "participant": "member", "existing": "other_user", "as": "actor", "released": false, "holder": "previous" },
     { "name": "releasing what nobody holds is not an error", "participant": "member", "existing": "none", "as": "actor", "released": false, "holder": "nobody" },
     { "name": "an invite-bound binding is never released through this path", "participant": "member2", "existing": "invite", "as": "previous", "released": false, "holder": "previous" }
+  ],
+  "_provision": "The personal invite for an existing traveller (docs/specs/sprint-9/x-member-sign-in.md, AC-10): POST /api/internal/control-plane/participants binds an invite-redeeming account to an existing participant, with the invite's id on the binding. It differs from adopt in two ways: the binding is invite-bound (never displaced, never released through release), and a LEFTOVER claim binding on the name is replaced (the control plane has already checked, under its own lock, that no claim is live). Each provision case runs against a freshly started site, because an invite binding is permanent.",
+  "provision": [
+    { "name": "a free plain member is bound to the invited account", "participant": "member", "existing": "none", "result": "ok", "holder": "actor" },
+    { "name": "the same invite again is not an error", "participant": "member", "existing": "actor_invite", "result": "ok", "holder": "actor" },
+    { "name": "a leftover claim binding of another account is replaced", "participant": "member", "existing": "other_user", "result": "ok", "holder": "actor" },
+    { "name": "another invite's binding is never displaced", "participant": "member", "existing": "invite", "result": "conflict", "holder": "previous" },
+    { "name": "an account already bound to another participant is refused", "participant": "member", "existing": "actor_on_other_participant", "result": "conflict", "holder": "nobody" },
+    { "name": "an organizer is never bound", "participant": "organizer", "existing": "none", "result": "refused", "holder": "nobody" },
+    { "name": "a name that is not a participant is never bound", "participant": "unknown", "existing": "none", "result": "refused", "holder": "nobody" }
   ]
 }

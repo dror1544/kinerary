@@ -23,6 +23,7 @@ import { useTripUpdates, useLiveEditGuard } from "./live-updates";
 import { featureOn } from "./features";
 import { GroupLineToggle } from "./group-line";
 import { MemberClaims } from "./member-claims";
+import { PersonalInviteResult, personalInviteLabel, usePersonalInvites } from "./member-invites";
 import { hasGoChip, mapUrlFor, navUrlFor, wazeUrlFor } from "./nav-links";
 import { useNavApp } from "./trip-settings";
 import { WeatherFlightsCard } from "./today-cards";
@@ -2956,10 +2957,14 @@ export function MoreView({ config, currentUser, isOrganizer, lang, openModule }:
 function MemberLogins({ config, lang, headingId }: { config?: TripConfig; lang: Lang; headingId?: string }) {
   const [pending, setPending] = useState("");
   const [result, setResult] = useState<{ username: string; text: string; link?: string } | null>(null);
+  // "Send a personal invite": offered only when the runtime gateway in front of this site says this person may send one
+  // (member-invites.tsx). Not tied to the Telegram group switch: it is a way in for people who are not on Telegram.
+  const personalInvite = usePersonalInvites();
 
   async function reset(username: string, to?: "trip_password") {
     setPending(username);
     setResult(null);
+    personalInvite.clear();
     try {
       const payload = await resetParticipantPassword(username, to);
       setResult(payload.enrollment_token
@@ -3008,6 +3013,12 @@ function MemberLogins({ config, lang, headingId }: { config?: TripConfig; lang: 
                 onClick={() => reset(participant.username)}>
                 {copy(lang, "One-time link", "קישור חד-פעמי")}
               </button>
+              {personalInvite.available ? (
+                <button type="button" className="ghost" disabled={personalInvite.pending === participant.username || pending === participant.username}
+                  onClick={() => { setResult(null); void personalInvite.send(participant.username, personName(participant, lang)); }}>
+                  {personalInviteLabel(lang)}
+                </button>
+              ) : null}
             </span>
             {result?.username === participant.username ? (
               <span className="member-login-result">
@@ -3015,6 +3026,7 @@ function MemberLogins({ config, lang, headingId }: { config?: TripConfig; lang: 
                 {result.link ? <code>{result.link}</code> : null}
               </span>
             ) : null}
+            {personalInvite.outcome?.username === participant.username ? <PersonalInviteResult outcome={personalInvite.outcome} lang={lang} /> : null}
           </li>
         ))}
       </ul>

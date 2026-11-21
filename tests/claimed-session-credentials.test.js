@@ -9,7 +9,9 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { startTestServer, stopTestServer, api } from './helpers/server.js';
+import { createRequire } from 'node:module';
+import { dirname } from 'node:path';
+import { startTestServer, stopTestServer, api, testTripDir } from './helpers/server.js';
 
 const tripId = 'trip_claimcreds0001', ownerId = 'user_credsowner01';
 const key = 'test-dedicated-exchange-key';
@@ -161,4 +163,32 @@ test('every session that is not a claim: Google link reaches its handler, MCP co
   const secondary = await exchange(secondaryUser, null, 'organizer');
   assert.ok(secondary);
   assert.equal((await setPassword(secondary, 'secondary-new-password')).status, 200);
+});
+
+// ── S2 follow-up: the claimed view is an ALLOW-LIST ─────────────────────────────────────────────────────────────────
+// Until now the claimed-session view of /api/auth/me was "the row minus five named columns": a column added to the users table
+// tomorrow would have reached a claimant by default. It is now the fields the page demonstrably draws (the same ones
+// server/public-user.js hands to other members, plus `family`, which the classic page reads) and nothing else.
+const ALLOWED = ['username', 'name', 'name_en', 'family', 'color', 'avatar_file', 'is_organizer'];
+
+test('a NEW column on the site\'s users row does not reach a claimed session; it still reaches the traveller\'s own login (the allow-list is for claims only)', async () => {
+  const Database = createRequire(import.meta.url)('../server/node_modules/better-sqlite3');
+  const sqlite = new Database(join(dirname(testTripDir()), 'trip.db'));
+  try {
+    sqlite.exec('ALTER TABLE users ADD COLUMN some_future_private_note TEXT');
+    sqlite.prepare("UPDATE users SET some_future_private_note = 'for bob only', age = 41 WHERE username = 'bob'").run();
+  } finally { sqlite.close(); }
+  assert.equal((await internal('participants/adopt', { userId: claimant, runtimeUsername: 'bob' })).status, 200);
+  const claimed = await (await api('/api/auth/me', { token: await exchange(claimant, 'bob') })).json();
+  assert.equal('some_future_private_note' in claimed, false, 'a column nobody named is not served to a claimed session');
+  assert.equal('age' in claimed, false, 'nor is a column that exists but the page does not draw');
+  assert.deepEqual(Object.keys(claimed).filter(key => !ALLOWED.includes(key)), [], 'only the named fields');
+  for (const field of ['username', 'name', 'is_organizer']) assert.ok(field in claimed, `${field} is what the page needs`);
+  assert.equal(claimed.username, 'bob');
+  assert.equal(claimed.is_organizer, false);
+  // the traveller's own login is the whole row, as before (nothing was narrowed for anyone else)
+  const plain = await (await api('/api/auth/me', { token: (await (await login('bob', '1234')).json()).token })).json();
+  assert.equal(plain.some_future_private_note, 'for bob only');
+  assert.equal(plain.age, 41);
+  assert.equal((await internal('participants/release', { userId: claimant, runtimeUsername: 'bob' })).status, 200);
 });

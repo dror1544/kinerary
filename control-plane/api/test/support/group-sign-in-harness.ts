@@ -25,7 +25,7 @@ import { applyMigrations } from "../../src/migrations.js";
 import { sha256, type PortalDependencies } from "../../src/portal.js";
 import { groupMembershipChecker } from "../../src/telegram-group-membership.js";
 import { TEST_BOT_TOKEN, launchFields, signedInitData, userField } from "./mini-app-init-data.js";
-import { fakeAdopt, fakeRelease, newFakeSiteState } from "./fake-site.js";
+import { fakeAdopt, fakeProvision, fakeRelease, newFakeSiteState } from "./fake-site.js";
 import { testPool } from "./test-database.js";
 
 export const ORIGIN = "http://portal.example.test";
@@ -85,10 +85,12 @@ export interface Harness {
    * `siteHeld` names (trip:username) are bound by an invite: never displaced.
    */
   siteBindings: Map<string, string>;
-  siteFail: { adopt?: "unavailable" | "bind_then_fail" | "refused" | "conflict"; release?: "unavailable" };
+  siteFail: { adopt?: "unavailable" | "bind_then_fail" | "refused" | "conflict"; release?: "unavailable"; provision?: "unavailable" };
   siteHeld: Set<string>;
-  siteCalls: { adopt: { tripId: string; userId: string; runtimeUsername: string }[]; release: { tripId: string; userId: string; runtimeUsername: string }[] };
+  siteCalls: { adopt: { tripId: string; userId: string; runtimeUsername: string }[]; release: { tripId: string; userId: string; runtimeUsername: string }[]; provision: { tripId: string; userId: string; runtimeUsername: string; inviteId: string }[] };
   newApp(overrides?: Partial<PortalDependencies>): ReturnType<typeof buildApp>;
+  /** The dependencies `newApp` builds the portal from, for a caller of an exported portal function (createSiteInvite). */
+  deps(overrides?: Partial<PortalDependencies>): PortalDependencies;
   stop(): Promise<void>;
   // fixtures
   mkUser(name: string): Promise<string>;
@@ -131,12 +133,26 @@ export async function startHarness(): Promise<Harness> {
   const siteBindings = siteState.bindings;
   const siteFail: Harness["siteFail"] = {};
   const siteHeld = siteState.invited;
-  const siteCalls: Harness["siteCalls"] = { adopt: [], release: [] };
+  const siteCalls: Harness["siteCalls"] = { adopt: [], release: [], provision: [] };
   const portalDeps = (db: pg.Pool, overrides: Partial<PortalDependencies>): PortalDependencies => ({
     db,
     runtimeAccounts: {
-      participantExists: async () => true,
-      provisionParticipant: async () => {},
+      // A trip the test never described answers as it always did (everyone exists, any invite binds); a described trip answers as the
+      // trip site does (fakeProvision, held to tests/fixtures/site-binding-cases.json): a refusal is the adapter's REFUSED, a lost answer its FAILED.
+      participantExists: async ({ tripId, runtimeUsername }: { tripId: string; runtimeUsername: string }) => {
+        const people = site.get(tripId);
+        if (people === "unreachable") throw new Error("RUNTIME_PARTICIPANT_LOOKUP_FAILED");
+        return people === undefined ? true : people.some((p) => p.username === runtimeUsername);
+      },
+      provisionParticipant: async (input: { tripId: string; inviteId: string; userId: string; runtimeUsername: string; displayName: string }) => {
+        siteCalls.provision.push({ tripId: input.tripId, userId: input.userId, runtimeUsername: input.runtimeUsername, inviteId: input.inviteId });
+        const fail = siteFail.provision; delete siteFail.provision;
+        if (fail === "unavailable") throw new Error("RUNTIME_PARTICIPANT_PROVISION_FAILED");
+        const people = site.get(input.tripId);
+        if (people === undefined) return;
+        if (people === "unreachable") throw new Error("RUNTIME_PARTICIPANT_PROVISION_FAILED");
+        if (fakeProvision(siteState, people, input) !== "ok") throw new Error("RUNTIME_PARTICIPANT_REFUSED");
+      },
       adoptParticipant: async (input: { tripId: string; userId: string; runtimeUsername: string }) => {
         siteCalls.adopt.push(input);
         const fail = siteFail.adopt; delete siteFail.adopt;
@@ -178,6 +194,7 @@ export async function startHarness(): Promise<Harness> {
       calls: async (method) => Number(((await control("/_control/calls")).result as Record<string, number>)[method] ?? 0),
     },
     newApp: (overrides = {}) => buildApp(profile, { portal: portalDeps(pool, overrides) }),
+    deps: (overrides = {}) => portalDeps(pool, overrides),
     stop: async () => {
       child.kill("SIGTERM");
       await pool.end();

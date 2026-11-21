@@ -426,10 +426,10 @@ function cleanDisplayText(value: string, max: number): string | null {
 
 /**
  * Who on this trip is spoken for in the control plane: `held` (a live claim, a redeemed invite or a trip password maps
- * the traveller to an account) and `organizerSide` (the account holding it is an owner or organizer here). Both by
+ * the traveller to an account, or a PENDING personal invite reserves the traveller for the person it was sent to) and `organizerSide` (the account holding it is an owner or organizer here). Both by
  * username, read in the transaction's own snapshot.
  */
-async function spokenFor(client: pg.PoolClient, tripId: string): Promise<{ held: Set<string>; organizerSide: Set<string> }> {
+export async function spokenFor(client: pg.PoolClient, tripId: string): Promise<{ held: Set<string>; organizerSide: Set<string> }> {
   const result = await client.query<{ runtime_username: string; organizer_side: boolean }>(
     `WITH mapped AS (
        SELECT cl.runtime_username, cl.user_id FROM control_plane.trip_participant_claims cl
@@ -437,6 +437,13 @@ async function spokenFor(client: pg.PoolClient, tripId: string): Promise<{ held:
        UNION ALL
        SELECT i.runtime_username, i.redeemed_by FROM control_plane.site_invites i
         WHERE i.trip_id = $1 AND i.state = 'redeemed'
+       UNION ALL
+       -- A PENDING personal invite (unused, unexpired, unrevoked) RESERVES its traveller (S2, docs/specs/sprint-9/x-member-sign-in.md):
+       -- the organizer sent this person a way in, so the group is neither offered the name nor able to claim it by a hand-built id.
+       -- It maps to no account yet (NULL user): it is spoken for, and is not an organizer's. Revoking it, or its expiry (read from
+       -- the clock here, so a row nobody has touched since still frees the name), ends the reservation.
+       SELECT i.runtime_username, NULL::text FROM control_plane.site_invites i
+        WHERE i.trip_id = $1 AND i.state = 'unused' AND i.expires_at > now()
        UNION ALL
        SELECT c.runtime_username, c.user_id FROM control_plane.web_password_credentials c
          JOIN control_plane.users u ON u.id = c.user_id AND u.status = 'active'

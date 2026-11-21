@@ -221,8 +221,18 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
       if (existing.username === runtimeUsername && existing.role === 'member' && existing.invite_id === inviteId) return res.json({ ok: true });
       return res.status(409).json({ error: 'IDENTITY_CONFLICT' });
     }
-    try { insert.run(userId, identity.tripId, runtimeUsername, 'member', inviteId); }
-    catch { return res.status(409).json({ error: 'IDENTITY_CONFLICT' }); }
+    // A LEFTOVER claim binding on this name (a group claim whose release never reached this site) is replaced, exactly as
+    // adopt replaces one: the control plane is the authority on who holds a traveller, and it only asks after checking
+    // under its own lock that no claim on this name is live. Anything else on the name is never displaced: an owner's,
+    // another trip's, or another invite's binding (invite_id set) is a 409.
+    const onName = db.prepare('SELECT * FROM control_plane_identities WHERE username = ?').get(runtimeUsername);
+    if (onName && (onName.role !== 'member' || onName.invite_id !== null || onName.trip_id !== identity.tripId)) return res.status(409).json({ error: 'IDENTITY_CONFLICT' });
+    try {
+      db.transaction(() => {
+        if (onName) db.prepare('DELETE FROM control_plane_identities WHERE user_id = ? AND trip_id = ?').run(onName.user_id, identity.tripId);
+        insert.run(userId, identity.tripId, runtimeUsername, 'member', inviteId);
+      })();
+    } catch { return res.status(409).json({ error: 'IDENTITY_CONFLICT' }); }
     return res.json({ ok: true });
   });
   // GROUP SIGN-IN (docs/specs/sprint-9/x-member-sign-in.md, slice S1): the control plane lets a person in the trip's
