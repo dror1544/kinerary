@@ -210,7 +210,12 @@ jobs:
             gh pr diff "$NUMBER" --name-only > .assessment-context/changed-files.txt
             # The diff itself, capped: a 20k-line diff is not worth the tokens,
             # and the file list plus the tree is enough to reason from.
-            gh pr diff "$NUMBER" | head -c 400000 > .assessment-context/diff.patch
+            # Written whole, then cut: piped into `head`, a diff over the cap
+            # closed the pipe under `gh` and pipefail failed the step (exit 141)
+            # on every PR that rebuilt site/modern.
+            gh pr diff "$NUMBER" > .assessment-context/diff.full
+            head -c 400000 .assessment-context/diff.full > .assessment-context/diff.patch
+            rm -f .assessment-context/diff.full
             git fetch --no-tags origin "$BASE_REF":refs/remotes/origin/"$BASE_REF" || true
             # The model has no shell, so the git facts it would run git for are
             # written here, before it starts.
