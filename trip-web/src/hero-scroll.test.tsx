@@ -10,7 +10,8 @@ import { resolve } from "node:path";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { VideoHero } from "./App";
-import { COMPACT_PX, heroGrowFor, heroOpenExtra, heroScrollState, MAX_PULL_PX, OPEN_AT_PX } from "./hero-scroll";
+import { tokenStore } from "./api";
+import { COMPACT_PX, heroGrowFor, heroIntroExtra, heroOpenExtra, heroScrollState, INTRO_SHARE, markHeroIntroSeen, MAX_PULL_PX, OPEN_AT_PX, resetHeroIntro } from "./hero-scroll";
 
 const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
 const FULL = 200; // the header's height at rest
@@ -25,16 +26,26 @@ function touch(type: "touchstart" | "touchmove" | "touchend", y?: number) {
   event.touches = y === undefined ? [] : [{ clientY: y }];
   act(() => { window.dispatchEvent(event); });
 }
+// React listens for the prefixed name under jsdom (its style object has both), the plain one in a browser: send both.
+function animationEnd(element: Element) {
+  act(() => {
+    for (const name of ["animationend", "webkitAnimationEnd"]) element.dispatchEvent(new Event(name, { bubbles: true }));
+  });
+}
 function reducedMotion(on: boolean) {
   vi.stubGlobal("matchMedia", (query: string) => ({ matches: on && query.includes("reduce"), media: query, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} }));
 }
-function renderHero() {
-  const view = render(<VideoHero config={{ meta: { title: "Alsace" }, phases: [{ id: "colmar", title: { en: "Colmar" } }] } as never}
-    lang="en" placePhaseId="colmar" pageName="Today" active="today" openVideoTab={vi.fn()} openMenu={vi.fn()} />);
+function heroElement(over: { lang?: "en" | "he"; pageKey?: string; photo?: boolean } = {}) {
+  return <VideoHero config={{ meta: { title: "Alsace", ...(over.photo ? { homePhoto: "/api/ui/hero/photo.png" } : {}) }, phases: [{ id: "colmar", title: { en: "Colmar" } }] } as never}
+    lang={over.lang ?? "en"} placePhaseId="colmar" pageName="Today" pageKey={over.pageKey ?? "today"} active="today" openVideoTab={vi.fn()} openMenu={vi.fn()} />;
+}
+function renderHero(over: Parameters<typeof heroElement>[0] = {}) {
+  const view = render(heroElement(over));
   return { ...view, header: view.container.querySelector("header") as HTMLElement };
 }
 
 beforeEach(() => {
+  markHeroIntroSeen(); // these tests are about the header's usual mechanics; the first open has its own describe below
   Object.defineProperty(HTMLElement.prototype, "offsetHeight", { configurable: true, get: () => FULL });
   Object.defineProperty(window, "scrollY", { value: 0, configurable: true });
   reducedMotion(false);
@@ -213,7 +224,7 @@ describe("the stylesheet turns that state into pixels", () => {
   });
 
   it("the photo and its wash stretch upward by the pull; the big line fades with the progress", () => {
-    expect(rule(".video-hero-photo")).toContain("calc(-1 * var(--hero-pull, 0px))");
+    expect(rule(".video-hero-photo-frame")).toContain("calc(-1 * var(--hero-pull, 0px))"); // the frame carries the reach; the photo fills it
     expect(rule(".video-hero-wash")).toContain("calc(-1 * var(--hero-pull, 0px))");
     expect(css).toMatch(/\.video-layout \.video-hero-copy \{ opacity: calc\(1 - var\(--hero-progress, 0\)/);
   });
@@ -229,5 +240,136 @@ describe("the stylesheet turns that state into pixels", () => {
     expect(COMPACT_PX).toBe(64);
     expect(rule(".video-layout .video-hero")).toMatch(/padding-block:\s*14px/);
     expect(rule(".video-layout .topline")).toMatch(/min-height:\s*48px/);
+  });
+});
+
+describe("the first open of a page load (owner, 2026-11-21)", () => {
+  const extra = () => heroIntroExtra(FULL, window.innerHeight);
+  beforeEach(() => {
+    resetHeroIntro();
+    // A real header is as tall as its resting height plus what is open (--hero-grow is bottom padding), so the stub says so.
+    Object.defineProperty(HTMLElement.prototype, "offsetHeight", {
+      configurable: true,
+      get(this: HTMLElement) { return FULL + (parseFloat(this.style.getPropertyValue("--hero-grow")) || 0); },
+    });
+  });
+
+  it("the header starts open, big, before anyone touches it: the same open state a pull makes", () => {
+    const { header } = renderHero();
+    expect(extra()).toBeGreaterThan(0);
+    expect(header.style.getPropertyValue("--hero-grow")).toBe(`${extra()}px`);
+    expect(header.style.getPropertyValue("--hero-stick")).toBe(`${STICK + extra()}px`); // scrolling down reduces it to the compact bar
+    expect(header).not.toHaveClass("is-compact");
+    expect(header).toHaveClass("is-intro"); // and its photo is to fade and scale in
+  });
+
+  it("it fills INTRO_SHARE of the screen: roughly all of it, but never more than the screen", () => {
+    expect(INTRO_SHARE).toBeGreaterThanOrEqual(0.85);
+    expect(INTRO_SHARE).toBeLessThanOrEqual(1);
+    expect(heroIntroExtra(200, 800)).toBe(Math.round(800 * INTRO_SHARE - 200));
+    expect(heroIntroExtra(900, 800)).toBe(0); // a header already taller than the screen is not grown
+  });
+
+  it("once per page load: a header mounted again later starts at its usual size", () => {
+    const first = renderHero();
+    expect(first.header).toHaveClass("is-intro");
+    first.unmount();
+    const second = renderHero();
+    expect(second.header).not.toHaveClass("is-intro");
+    expect(second.header.style.getPropertyValue("--hero-grow")).toBe("");
+    expect(second.header.style.getPropertyValue("--hero-stick")).toBe(`${STICK}px`);
+  });
+
+  it("scrolling down reduces it to the compact bar and lets the opening go; back at the top it is the usual size", async () => {
+    const scrollBy = vi.fn();
+    vi.stubGlobal("scrollBy", scrollBy);
+    const { header } = renderHero();
+    scrollTo(STICK + extra() + 5);
+    await waitFor(() => expect(header).toHaveClass("is-compact"));
+    await waitFor(() => expect(scrollBy).toHaveBeenCalledWith(0, -extra()));
+    expect(header.style.getPropertyValue("--hero-grow")).toBe("0px");
+    scrollTo(0);
+    await waitFor(() => expect(header).not.toHaveClass("is-compact"));
+    expect(header.style.getPropertyValue("--hero-grow")).toBe("0px"); // not big again
+  });
+
+  it("another tab or page lets an open header go: no tab opens to a full-screen photo again", () => {
+    const view = renderHero();
+    expect(view.header.style.getPropertyValue("--hero-grow")).toBe(`${extra()}px`);
+    view.rerender(heroElement({ pageKey: "journey" }));
+    expect(view.header.style.getPropertyValue("--hero-grow")).toBe("0px");
+    view.rerender(heroElement({ pageKey: "today" }));
+    expect(view.header.style.getPropertyValue("--hero-grow")).toBe("0px"); // and coming back to Today does not reopen it
+  });
+
+  it("the language toggle is not a page change: it does not let go of the open header", () => {
+    const view = renderHero();
+    view.rerender(heroElement({ lang: "he" }));
+    expect(view.header.style.getPropertyValue("--hero-grow")).toBe(`${extra()}px`);
+  });
+
+  it("works the same in Hebrew (right to left)", () => {
+    const { header } = renderHero({ lang: "he" });
+    expect(header.style.getPropertyValue("--hero-grow")).toBe(`${extra()}px`);
+    expect(header).toHaveClass("is-intro");
+  });
+
+  it("reduced motion: the header is just as big, with no animation class at all", () => {
+    reducedMotion(true);
+    const { header } = renderHero();
+    expect(header.style.getPropertyValue("--hero-grow")).toBe(`${extra()}px`);
+    expect(header).not.toHaveClass("is-intro");
+  });
+
+  it("the skyline (no photo): still the open header, the intro ends with the skyline's animation and does not replay", async () => {
+    const { header, container } = renderHero();
+    await waitFor(() => expect(header).toHaveAttribute("data-photo-state", "unavailable"));
+    expect(header).toHaveClass("is-intro");
+    animationEnd(container.querySelector(".skyline-motif")!);
+    expect(header).not.toHaveClass("is-intro");
+  });
+
+  it("a photo: it sits in a clipping frame, fades in once, and the intro ends with its animation", async () => {
+    tokenStore.set("private-token");
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, blob: async () => new Blob(["image"], { type: "image/png" }) }));
+    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:intro-hero");
+    vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    vi.stubGlobal("Image", class { src = ""; decode = vi.fn().mockResolvedValue(undefined); });
+    const { header, container } = renderHero({ photo: true });
+    await waitFor(() => expect(header).toHaveAttribute("data-photo-state", "ready"));
+    const photo = container.querySelector(".video-hero-photo-frame .video-hero-photo") as HTMLElement;
+    expect(photo.style.backgroundImage).toContain("blob:intro-hero");
+    expect(header).toHaveClass("is-intro");
+    animationEnd(photo);
+    expect(header).not.toHaveClass("is-intro");
+    tokenStore.clear();
+  });
+});
+
+describe("the first open's stylesheet", () => {
+  it("fades and scales the photo in over 600-900ms, once, and the skyline rises in; reduced motion switches both off", () => {
+    const keyframes = css.slice(css.indexOf("@keyframes hero-intro-photo"), css.indexOf("@keyframes hero-intro-rise"));
+    expect(keyframes).toMatch(/from \{ opacity: 0; transform: scale\(1\.\d+\); \}/);
+    expect(keyframes).toMatch(/to \{ opacity: 1; transform: scale\(1\); \}/);
+    const photoRule = css.match(/\.video-hero\.is-intro \.video-hero-photo \{ animation: hero-intro-photo (\d+)ms [^;]*; \}/);
+    expect(photoRule, "the photo's intro animation rule").not.toBeNull();
+    expect(Number(photoRule![1])).toBeGreaterThanOrEqual(600);
+    expect(Number(photoRule![1])).toBeLessThanOrEqual(900);
+    expect(css).toMatch(/\.video-hero\.is-intro \.skyline-motif \{ animation: hero-intro-rise/);
+    expect(photoRule![0]).not.toMatch(/infinite/); // once, never a loop
+    const reduced = css.slice(css.indexOf("/* The first open is still big"));
+    expect(reduced.slice(0, reduced.indexOf("\n}")).replace(/\s+/g, " ")).toMatch(/\.video-hero\.is-intro \.video-hero-photo, \.video-hero\.is-intro \.skyline-motif \{ animation: none; \}/);
+  });
+
+  it("the photo's frame clips the scale-in and carries the pull's reach, in logical (direction-free) properties", () => {
+    const start = css.indexOf(".video-hero-photo-frame {");
+    const frame = css.slice(start, css.indexOf("}", start));
+    expect(frame).toMatch(/overflow:\s*hidden/);
+    expect(frame).toMatch(/inset-inline:\s*0/);
+    expect(frame).not.toMatch(/(^|[\s;])(left|right):/);
+  });
+
+  it("the skyline motif is capped, so an open header does not blow it up into a few giant roofs", () => {
+    expect(css).toMatch(/\.skyline-motif \{[^}]*height:\s*min\(78%, 170px\)/);
   });
 });

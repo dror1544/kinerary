@@ -3,7 +3,7 @@
 // companion in their own chat. The setting lives on the trip site (trip_settings.group_change_line), is on by
 // default, and the control plane reads it before it sends anything.
 //
-// Shown by MoreView only to an organizer, and only while the trip's switch `plan_change_group_line` is on
+// Shown by the Organizer settings page only to an organizer, and only while the trip's switch `plan_change_group_line` is on
 // (featureOn). The server is the boundary that matters: PATCH /api/settings refuses a member.
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./api";

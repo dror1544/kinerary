@@ -9,7 +9,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MoreView } from "./App";
+import { OrganizerSettings } from "./App";
 
 afterEach(() => {
   cleanup();
@@ -27,7 +27,7 @@ const CONFIG = {
 function renderMore(isOrganizer: boolean) {
   return render(
     <QueryClientProvider client={new QueryClient()}>
-      <MoreView lang="en" isOrganizer={isOrganizer} config={CONFIG} openModule={vi.fn()} />
+      <OrganizerSettings lang="en" isOrganizer={isOrganizer} config={CONFIG} />
     </QueryClientProvider>,
   );
 }

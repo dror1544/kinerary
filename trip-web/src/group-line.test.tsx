@@ -8,7 +8,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MoreView } from "./App";
+import { OrganizerSettings } from "./App";
 
 afterEach(() => {
   cleanup();
@@ -22,7 +22,7 @@ const ON = { ...BASE, features: { plan_change_group_line: true } };
 function renderMore({ isOrganizer, config, lang = "en" }: { isOrganizer: boolean; config: object; lang?: "en" | "he" }) {
   return render(
     <QueryClientProvider client={new QueryClient()}>
-      <MoreView lang={lang} isOrganizer={isOrganizer} config={config} openModule={vi.fn()} />
+      <OrganizerSettings lang={lang} isOrganizer={isOrganizer} config={config} />
     </QueryClientProvider>,
   );
 }

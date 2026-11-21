@@ -4,12 +4,19 @@ import { TripClockPanel, TodayView } from './App';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { TodayContext } from './api';
 afterEach(cleanup);
-it('does not replace an empty next activity with yesterday’s first itinerary item', () => {
+const yesterday = { revision: 'test', days: [], items: [{ item_uid: 'old', phase_id: 'ny', date: '2026-09-11', item_type: 'activity', text_he: 'ארוחת בוקר', text_en: 'Yesterday breakfast' }] };
+it('does not replace an empty next activity with yesterday’s first itinerary item (after the trip, where Today has no day card)', () => {
   const client = new QueryClient({ defaultOptions: { queries: { enabled: false, retry: false } } });
-  client.setQueryData(['today'], { ...today, today: '' });
-  render(<QueryClientProvider client={client}><TodayView lang="en" onOpenItinerary={() => {}} itinerary={{ revision: 'test', days: [], items: [{ item_uid: 'old', phase_id: 'ny', date: '2026-09-11', item_type: 'activity', text_he: 'ארוחת בוקר', text_en: 'Yesterday breakfast' }] }} /></QueryClientProvider>);
+  client.setQueryData(['today'], { ...today, phase: 'post_trip', today: '' });
+  render(<QueryClientProvider client={client}><TodayView lang="en" onOpenItinerary={() => {}} itinerary={yesterday} /></QueryClientProvider>);
   expect(screen.queryByText('Yesterday breakfast')).not.toBeInTheDocument();
   expect(screen.getByText('No upcoming activities scheduled.')).toBeInTheDocument();
+});
+it('and the day card of a trip day does not list it either', () => {
+  const client = new QueryClient({ defaultOptions: { queries: { enabled: false, retry: false } } });
+  client.setQueryData(['today'], { ...today, today: '' });
+  render(<QueryClientProvider client={client}><TodayView lang="en" onOpenItinerary={() => {}} itinerary={yesterday} /></QueryClientProvider>);
+  expect(screen.queryByText('Yesterday breakfast')).not.toBeInTheDocument();
 });
 const today: TodayContext = { today: '2026-09-12', phase: 'active_day', countdown_days: 0, current: null, next: null, events: [], flights: [], companion_message: { date: '2026-09-12', he: 'יש מקום לרגע קטן של גילוי.', en: 'Leave room for a little discovery.' } };
 it.each(['he', 'en'] as const)('shows the companion message in %s', lang => {

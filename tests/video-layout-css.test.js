@@ -5,9 +5,9 @@
  * trip-web's own tests run in jsdom, which loads no CSS, so the three claims that live in
  * styles.css are checked here, on the source file the build ships:
  *
- *   isolation  every rule the video layout adds hangs off `.video-layout` (a root class set
- *              only while the switch is on) or a class only that layout renders, so with the
- *              switch off nothing can match and the current layout is untouched (AC-1);
+ *   isolation  every rule the video layout adds hangs off `.video-layout` (the root class of
+ *              the one layout the site has since 2026-11-21, when the `site_video_layout` switch
+ *              and the classic layout were retired) or a class only that layout renders (AC-1);
  *   mirroring  the new block uses logical properties (inline-start/end), never physical
  *              left/right, so right-to-left mirrors it with no per-language rules (AC-11);
  *   contrast   badge text meets 4.5:1 against its background, and white-on-coral — the

@@ -25,7 +25,7 @@ const ITINERARY = {
 function openEditor(lang: "en" | "he") {
   render(
     <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
-      <JourneyView itinerary={ITINERARY as never} config={CONFIG as never} isOrganizer lang={lang} onHeroPhaseChange={vi.fn()} />
+      <JourneyView itinerary={ITINERARY as never} config={CONFIG as never} isOrganizer lang={lang} />
     </QueryClientProvider>,
   );
   fireEvent.click(screen.getByRole("button", { name: lang === "he" ? /הוספת פריט למסלול/ : /Add itinerary item/ }));
@@ -51,7 +51,7 @@ describe("#545 activity type options follow the site language", () => {
   it("AC-3 the type badge on an item card is in the site language too", () => {
     render(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
-        <JourneyView itinerary={ITINERARY as never} config={CONFIG as never} lang="he" onHeroPhaseChange={vi.fn()} />
+        <JourneyView itinerary={ITINERARY as never} config={CONFIG as never} lang="he" />
       </QueryClientProvider>,
     );
     expect(screen.getByText("זמן חופשי")).toBeInTheDocument();

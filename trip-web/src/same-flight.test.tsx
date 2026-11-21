@@ -88,7 +88,7 @@ describe("#549 the Plan board and the Map show the flight once", () => {
   it("AC-4 the Plan board lists the flight once, with the other day items intact", () => {
     render(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
-        <JourneyView itinerary={ITINERARY as never} config={CONFIG as never} isOrganizer lang="en" onHeroPhaseChange={vi.fn()} />
+        <JourneyView itinerary={ITINERARY as never} config={CONFIG as never} isOrganizer lang="en" />
       </QueryClientProvider>,
     );
     expect(screen.getAllByText("SL 482 Harbortown → Gatecity")).toHaveLength(1);

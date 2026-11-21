@@ -1,10 +1,10 @@
 /**
- * Today in the video layout, three changes from Dror's review (2026-11-17), all behind `site_video_layout`:
+ * Today in the video layout, three changes from Dror's review (2026-11-17):
  *   D. the trip clock and the companion's daily message are an announcement board ABOVE the day card, folded to one
  *      line when there is nothing to announce;
  *   E. weather and flights share one card with two tabs, a dot on Flights only for a real change;
  *   F. the trip conversation is not on Today: it is a page of its own, reached from the header menu or its hash.
- * With the switch off Today is what it was.
+ * (Each had a classic counterpart behind a switch; with the classic layout gone, 2026-11-21, those are gone too.)
  */
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -17,7 +17,7 @@ import type { TodayContext } from "./api";
 beforeEach(() => { useJsdomBasics(); });
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); localStorage.clear(); window.location.hash = ""; });
 
-const VIDEO = { site_video_layout: true };
+const VIDEO = {};
 const flight = (status: unknown, over: Partial<FlightEntry> = {}): FlightEntry => ({
   facts: { id: 7, name: "TLV → FRA", identifier: "LY345" }, source: "flightaware", stale: false, status, ...over,
 });
@@ -114,14 +114,6 @@ describe("D. the announcement board", () => {
     expect(container.querySelector(".clock-board")).toHaveAttribute("aria-expanded", "false");
   });
 
-  it("switch off: the clock is a plain panel inside the focus panel, as it was", async () => {
-    serve({ features: {} });
-    const { container } = renderTrip();
-    await screen.findAllByText("Winery tour");
-    expect(container.querySelector(".clock-panel")).not.toBeNull();
-    expect(container.querySelector(".clock-board")).toBeNull();
-    expect(container.querySelector(".clock-panel")).not.toHaveAttribute("role");
-  });
 });
 
 describe("E. weather and flights, one card, two tabs", () => {
@@ -265,14 +257,6 @@ describe("E. weather and flights, one card, two tabs", () => {
     expect(container.querySelector("#booking-6")).not.toHaveClass("is-focused");
   });
 
-  it("switch off: the two separate panels, no tabs", async () => {
-    serve({ flights: [flight(DELAYED)], features: {} });
-    const { container } = renderTrip();
-    await screen.findAllByText("Winery tour");
-    expect(screen.queryByRole("tablist")).toBeNull();
-    await waitFor(() => expect(container.querySelector(".ops-strip .weather-panel")).not.toBeNull());
-    expect(container.querySelectorAll(".ops-strip > .mini-panel").length).toBeGreaterThanOrEqual(2);
-  });
 });
 
 describe("F. the trip conversation has a page of its own", () => {
@@ -302,18 +286,5 @@ describe("F. the trip conversation has a page of its own", () => {
     renderTrip({ hash: "companion" });
     expect(await screen.findByText("השיחה של הטיול")).toBeInTheDocument();
     expect(document.querySelector(".companion-panel")).not.toBeNull();
-  });
-
-  it("switch off: the conversation stays on Today, the menu has no such entry, and #companion is not a page", async () => {
-    serve({ features: {} });
-    const first = renderTrip();
-    await screen.findAllByText("Winery tour");
-    expect(first.container.querySelector(".companion-panel")).not.toBeNull();
-    first.unmount();
-    serve({ features: {} });
-    const second = renderTrip({ hash: "companion" });
-    await screen.findAllByText("Winery tour");
-    expect(second.container.querySelectorAll(".companion-panel")).toHaveLength(1); // Today's own, not a page of its own
-    expect(screen.queryByRole("heading", { level: 1, name: /Trip conversation/ })).toBeNull();
   });
 });

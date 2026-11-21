@@ -50,3 +50,21 @@ export function bookingTypeLabel(type: string, lang: Lang): string {
   const entry = Object.prototype.hasOwnProperty.call(BOOKING_LABELS, type) ? BOOKING_LABELS[type as (typeof BOOKING_TYPES)[number]] : undefined;
   return entry ? entry[lang === "he" ? 1 : 0] : type;
 }
+
+/**
+ * The icon a booking's type is drawn with (Today's "Trip anchors" card). Keyed on the same closed set as the labels
+ * above, so a type added to BOOKING_TYPES without an icon here fails typechecking, and a type this build does not know
+ * (a newer server) still gets the "other" pin instead of a blank: a booking must never vanish from the card because of
+ * what kind it is.
+ */
+const BOOKING_ICONS: Record<(typeof BOOKING_TYPES)[number], string> = {
+  flight: "✈️",
+  hotel: "🏨",
+  car: "🚗",
+  attraction: "🎟️",
+  other: "📌",
+};
+
+export function bookingTypeIcon(type: string): string {
+  return Object.prototype.hasOwnProperty.call(BOOKING_ICONS, type) ? BOOKING_ICONS[type as (typeof BOOKING_TYPES)[number]] : BOOKING_ICONS.other;
+}
