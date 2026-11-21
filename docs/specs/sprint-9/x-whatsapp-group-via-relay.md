@@ -69,6 +69,15 @@ With the switch off, or with no WhatsApp number configured, nothing changes for 
 
 S1 merges first and alone. S2 and S3 may be built in parallel after it.
 
+Sequencing against work in flight:
+
+- PR #599 changes `relay/connector.ts`, `relay/protocol.ts` and `relay/server.ts`, which
+  S3 also changes. S3 is briefed on a base that already has #599. S1 touches
+  `relay/dispatch.ts` and `relay/poller.ts`, which #599 does not.
+- `x-member-sign-in.md` (its S1, AC-2) requires "exactly one open group binding" and
+  reads group-ness from a negative id. A WhatsApp binding must not count there; whichever
+  of the two lands second adds the test that pins it.
+
 ## Acceptance criteria
 
 **AC-0 (spike, before S3 is briefed).** Two things are read off real systems and recorded
@@ -90,8 +99,10 @@ in this file; if either contradicts a contract below, a spec PR amends it first.
 **S1: one gate**
 
 - AC-1 Given every existing test under `control-plane/api/test`, when S1 is merged, then
-  all pass with no edit to an assertion or a fixture. (`MediaDeps.telegram` keeps its name
-  in S1 for that reason.)
+  all pass with no edit to an assertion or a fixture, and every text the relay produces for
+  a Telegram chat (marks, judge prompt, replies) is byte-identical to before. Names that
+  tests touch (`MediaDeps.telegram`, `Attachment.fileId`) keep their names in S1; the
+  renames and the per-platform wording below land in S3.
 - AC-2 Given the companion path, then the pending-companion branch
   (`dispatch.ts:1742-1805`), addressing, the reply window, the conversation window, the
   group judge and its deferral, overheard context, held attachments and the text marks are
@@ -127,15 +138,17 @@ in this file; if either contradicts a contract below, a spec PR amends it first.
   message does not contain the word, and names the group's title only as "says it is
   called".
 - AC-9 Given a pending request, when the Telegram user the code was issued to types the
-  approval word, as a whole message, in the private Telegram chat the code was issued in,
+  approval word (shape under Contracts), as a whole message, in the private Telegram chat the code was issued in,
   and at that moment that user is still the trip's main organizer, the trip is not
   retired, the switch is on and the chat has no live interview, then one binding row opens
   with `platform = 'whatsapp'` and the trip's companion profile (the rule of
   `openBinding`, `group-binding.ts:422-439`), the request becomes `approved`, and the
   introduction is sent to the WhatsApp group. The introduction never includes the site
   password, whatever `groupIntroIncludesPassword` says.
-- AC-10 Given the approval word from any other Telegram user or chat, or a wrong word,
-  then nothing changes; three wrong words close the request as `declined`. `yes`, `no`
+- AC-10 Given the approval word from any other Telegram user or chat, or a wrong word of
+  the approval-word shape, then nothing changes; three wrong words close the request as
+  `declined`. A message that is not exactly of that shape is never an attempt and is
+  handled as any other message in that chat. `yes`, `no`
   and button taps are not approval forms. Not answered within
   `relay.whatsapp.approval_ttl_seconds` (default 3600), the request expires and the group
   gets one line saying so.
@@ -244,7 +257,9 @@ identify one chat on one platform:
 - The table is platform-neutral by name; only `whatsapp` rows are written in this slice.
 - **Code and word shape.** The code is `KWA-` plus 8 characters of the alphabet the group
   tokens use (`group-binding.ts:50-79`); only a message that is exactly that shape is a
-  code attempt. The approval word is 6 characters of the same alphabet. Failed-attempt
+  code attempt. The approval word is `OK-` plus 6 characters of the same alphabet, and
+  only a message that is exactly that shape, in a chat with a pending request, is an
+  approval attempt; with no pending request it is ordinary text. Failed-attempt
   counts are kept in the relay's memory; a relay restart resets them.
 - The table and column are not renamed. A rename breaks the monitor role's column grants
   (`control-plane/deployment/monitor-db-role.sql:89`), about forty readers in four
@@ -310,7 +325,7 @@ export interface InboundTurn {
   isReplyToAssistant: boolean;
   repliedToSenderId?: string;        // a replied-to document joins only for the same sender
   repliedToText?: string;            // for the reaction-answers-question rule
-  attachment: AttachmentRef | null;  // { ref: string; kind; mime?; filename?; size? }; `ref` replaces Telegram's fileId
+  attachment: AttachmentRef | null;  // S1: today's `Attachment` (with `fileId`). S3: { ref: string; kind; mime?; filename?; size? }
   repliedToAttachment: AttachmentRef | null;
 }
 
@@ -333,11 +348,14 @@ export function companionGate(turn: InboundTurn, outcome: NormalizeOutcome, deps
   them through its own sink; `poller.ts`'s `applyDecision` keeps the Telegram sends. On
   `judge_pending` the loop keeps the `InboundTurn` and calls the gate again in the chat's
   lane, as the Telegram poller does with the raw update today.
-- The group judge's prompt takes the platform's name instead of the literal "Telegram"
-  (`group-judge.ts:150`); `addressedMark` is worded per platform (`stay-silent.ts:56-64`),
-  and the companion template's lines about its Telegram handle and the addressed prefix
-  (`profile-templates/familytrip-companion/templates/SOUL.md.tpl`) are reworded to cover
-  both without changing the pinned prefix.
+- In S3, for WhatsApp turns only: the group judge's prompt names WhatsApp instead of
+  Telegram (`group-judge.ts:150`), and `addressedMark` has a WhatsApp wording
+  (`stay-silent.ts:56-64`) that keeps the pinned `[addressed to you directly` prefix. The
+  Telegram wording of both is untouched. The companion template
+  (`profile-templates/familytrip-companion/templates/SOUL.md.tpl`) is NOT changed in this
+  slice: a template change reaches every Telegram companion at its next build or redeploy
+  and is not behind the switch. The per-turn mark tells the companion it is in a WhatsApp
+  group and to answer in plain text.
 
 ### Sender ids and phone numbers
 
@@ -349,10 +367,13 @@ gateway secret does not change every sender. The same derivation applies to the 
 to the replied-to participant and to anything logged.
 
 - The opaque id is `source.user_id`, the key of the conversation window
-  (`conversation_user_ids`) and of held attachments. A raw participant id exists only in
-  memory in the bridge and the relay.
-- Before message text is used for anything (the gate, overheard context, the judge, the
-  wire), the relay rewrites every @mention of a number: the number's own mention becomes
+  (`conversation_user_ids`) and of held attachments. In the relay a raw participant id
+  exists only in memory. The bridge's session directory is the one place numbers rest on
+  disk: the WhatsApp Web library keeps per-participant key files there (seen in an old
+  session folder: file names carry participant ids). That directory is already a
+  credential under the deployment's care (Configuration).
+- Before message text, a caption or replied-to text is used for anything (the gate,
+  overheard context, the judge, the wire), the relay rewrites every @mention of a number: the number's own mention becomes
   the assistant's first name, anyone else's becomes "someone". (Rewriting to a display
   name is a later refinement.)
 - `senderName` is the sender's WhatsApp display name: unverified, shown to the model as a
@@ -407,7 +428,9 @@ Feature switch `whatsapp_group`: `surfaces: ["relay"]`, `memberVisible: false`, 
 with `featureEnabled(db, tripId, "whatsapp_group")` at four points: code issue
 (`dispatch.ts`), approval, inbound after the route resolves, and outbound inside
 `resolveOutboundRoute` (`outbound-scope.ts`; the connector holds no database handle by
-design). The relay's own messages to a WhatsApp chat (the approval word, the
+design). The outbound read happens only when the route's platform is `whatsapp`: a
+Telegram route never reads the switch, so an unreadable switch cannot refuse a Telegram
+send. The relay's own messages to a WhatsApp chat (the approval word, the
 introduction) do not pass `checkScope` and are sent only from the request flow.
 
 ### Files expected to change
@@ -419,8 +442,7 @@ introduction) do not pass `checkScope` and are sent only from the request flow.
 `plan-change-poller.ts` (comment and test only), `analytics/store.ts`,
 `analytics/contract.ts`, `shared/feature-switches.js`, worker `feature_block.py`, worker
 tests for `gateway_reconcile.py`, `scripts/teardown-trip.py`,
-`.agents/skills/trip-fleet-monitor/fleet-mcp.mjs`,
-`profile-templates/familytrip-companion/templates/SOUL.md.tpl`. New:
+`.agents/skills/trip-fleet-monitor/fleet-mcp.mjs`. New:
 `relay/companion-gate.ts`, `chat-binding-requests.ts`, `relay/whatsapp/*`,
 `control-plane/whatsapp-bridge/`, `control-plane/api/tools/fake-whatsapp.ts`. Retired or
 rewritten in S3: `.agents/skills/trip-bot-messaging-platform-setup/`, which teaches the
@@ -465,8 +487,8 @@ rejected direct pairing.
   WhatsApp participant has an organizer role (AC-20), so nothing organizer-gated can be
   triggered from WhatsApp.
 - **Phone numbers.** A WhatsApp participant id is a phone number, and an @mention writes
-  one into message text. Neither is stored, logged or sent to a gateway or a model
-  (AC-20). A plain hash of a phone number is reversible by enumeration, so the opaque id
+  one into message text. Neither is stored in the database, logged or sent to a gateway or
+  a model (AC-20); the bridge's session directory is the one place they rest. A plain hash of a phone number is reversible by enumeration, so the opaque id
   is keyed.
 - **The bridge receives every message of every group the number is in**, addressed or
   not, and the judge model reads group text at the trip's proactive level, as on Telegram.
