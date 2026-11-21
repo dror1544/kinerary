@@ -141,7 +141,7 @@ class ChildProcess(unittest.TestCase):
             self.assertIn(feature, c)
         self.assertIn("--ignore-user-config", c)
         self.assertIn('model_reasoning_effort="medium"', c)
-        self.assertEqual(c[c.index("-m") + 1], "gpt-5.6-terra")
+        self.assertEqual(c[c.index("-m") + 1], "gpt-6.1-terra")
         self.assertEqual(c[-1], "hi")
 
     def test_rows_are_refused_inside_the_repo(self):
