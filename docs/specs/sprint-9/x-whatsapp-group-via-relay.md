@@ -1,6 +1,6 @@
 # The companion on WhatsApp, in a group or a private chat, through the relay (first slice)
 
-Status: draft (2026-11-21; consult review of 2026-11-20 applied; binding reworked the same day to the owner's dashboard-code design, not yet re-reviewed) · Issue: none yet (file one; this file is renamed to `<n>-whatsapp-group-via-relay.md` then) · Track: unowned (sprint to be named by Dror, open question 1) · Size: L (four slices) · Tier: High
+Status: draft (2026-11-21; consult review of 2026-11-20 applied; binding reworked the same day to the owner's dashboard-code and email-invitation design, not yet re-reviewed) · Issue: none yet (file one; this file is renamed to `<n>-whatsapp-group-via-relay.md` then) · Track: unowned (sprint to be named by Dror, open question 1) · Size: L (four slices) · Tier: High
 Security path: yes (the relay's trust boundary: `control-plane/api/src/relay/`, chat-to-trip resolution, outbound scope) · Migration: yes · Live-trip behaviour: yes (relay behaviour; risk class), switched off by default
 
 Related: `docs/per-trip-gateway-architecture.md` §4; `docs/specs/sprint-9/x-relay-chat-scope.md`
@@ -13,7 +13,11 @@ official Business API cannot join an existing group); the existing binding table
 to carry a platform, not duplicated. 2026-11-21: a WhatsApp chat is bound from the
 organizer dashboard by a one-time code sent as a WhatsApp message, not through Telegram;
 a private chat binds the sender's number to the trip, a group binds the group; several
-codes may be live for one trip.
+codes may be live for one trip. A traveller's code is sent by Kinerary to the email
+address the organizer puts in the invitation, and redeeming it binds the trip, the
+traveller's number and that email; doing it again replaces the earlier binding. The
+organizer gets a group link directly, with no invitation. Traveller invitations are in
+this slice.
 
 ## Problem
 
@@ -50,12 +54,19 @@ has a WhatsApp section with three actions and a list.
    and the companion introduces itself, including one line saying it reads the group's
    messages to know when it is addressed. The introduction never carries the trip site's
    password.
-3. **Invite a traveller on WhatsApp.** The organizer picks an existing traveller and gets
-   a link to forward. Whoever opens it and sends the coded message has their private chat
-   bound to the trip as that traveller.
-4. **Connected chats.** The section lists the trip's WhatsApp groups (by title) and people
-   (by traveller name and the last four digits of the number), each with Remove.
-5. Every code works once and for 15 minutes. Any number of codes can be issued for a trip
+3. **Invite a traveller on WhatsApp.** The organizer picks an existing traveller and
+   enters that person's email address. Kinerary sends the invitation to that address; the
+   organizer never sees the link. The traveller taps it, WhatsApp opens on the bot's chat
+   with the coded message, and they press send. Their private chat is bound to the trip
+   as that traveller, and their number is tied to the account of that email address.
+   Doing it again replaces what was there: a newer invitation redeemed from another
+   number moves the traveller to that number, and a number that redeems a code for
+   another trip moves to that trip.
+4. **Connected chats.** The section lists the trip's WhatsApp groups (by title), people
+   (by traveller name, email and the last four digits of the number) and invitations not
+   yet used, each with Remove.
+5. Every code works once. The organizer's own codes and group codes last 15 minutes; an
+   emailed invitation lasts three days. Any number of codes can be issued for a trip
    over time, so more people and more groups can be added later.
 6. In a bound group the companion behaves as in a Telegram trip group: it answers when
    addressed (its name, a reply to its message, a mention of the number, the conversation
@@ -137,24 +148,39 @@ in this file; if either contradicts a contract below, a spec PR amends it first.
   then the dashboard shows no WhatsApp section and every route below answers 404.
 - AC-7 Given the switch on, when the trip's owner, in a dashboard session signed in by
   password or Google (the "account" policy of `secondary-organizer-link`,
-  `portal.ts`), asks for a code of kind `me`, `group` or `traveller` (with an existing
-  traveller of that trip), then a code is issued that is single-use, expires after
-  `relay.whatsapp.code_ttl_seconds` (default 900), and is stored only as a digest. The
-  answer carries the link to open and the expiry, is `no-store`, and is rate-limited per
-  user as the Telegram link route is. Earlier codes of the trip stay valid; at most 10 are
-  live per trip, and the oldest is expired to make room. Anyone else gets one 404.
+  `portal.ts`), asks for a code of kind `me` or `group`, then a code is issued that is
+  single-use, expires after `relay.whatsapp.code_ttl_seconds` (default 900), and is stored
+  only as a digest. The answer carries the link to open and the expiry, is `no-store`,
+  and is rate-limited per user as the Telegram link route is. Earlier codes of the trip
+  stay valid; at most 10 `me` and `group` codes are live per trip, and the oldest is
+  expired to make room. Anyone else gets one 404.
+- AC-7a Given the same caller, when they invite an existing traveller of the trip with an
+  email address, then a `traveller` code is issued that expires after
+  `relay.whatsapp.invite_ttl_seconds` (default 259200), one email carrying the link is
+  sent to that address through the existing mailer in the trip's language, and the
+  response carries neither the code nor the link. A newer invitation for the same
+  traveller expires the older one. At most 20 invitation emails are sent per trip per
+  day; the address is validated as the portal validates a sign-up address.
 - AC-8 Given a valid code of kind `me` or `traveller` in a message sent in a WhatsApp
-  private chat, then in one transaction the code is spent, any open binding of that chat
-  is closed, one binding row opens for that chat with `platform = 'whatsapp'` and the
-  trip's companion profile (the rule of `openBinding`, `group-binding.ts:422-439`), and
-  one person link is written for the sender: the issuing account and its traveller for
-  `me`, the chosen traveller and no account for `traveller`. The chat gets one fixed
-  confirmation line naming the trip.
+  private chat, then in one transaction: the code is spent; any open binding of that chat
+  is closed (`rebound_by_code`), whatever trip it was for; one binding row opens for that
+  chat with `platform = 'whatsapp'` and the trip's companion profile (the rule of
+  `openBinding`, `group-binding.ts:422-439`); and one person link is written for the
+  sender with the traveller and an account. For `me` the account is the issuing
+  organizer's. For `traveller` it is the account of the invitation's email address,
+  resolved through `resolveOrCreateEmailAccount` and nothing else, with a `member`
+  membership of the trip ensured as a site-invite redemption ensures it today
+  (`portal.ts`, invite redemption); it never raises an existing role and never lowers
+  one. The chat gets one fixed confirmation line naming the trip.
+- AC-8a Given a redemption for trip T and an account that already has a WhatsApp person
+  link on T from a different number, then that earlier link is deleted and its private
+  chat's binding is closed (`rebound_by_code`) in the same transaction: one account has
+  one WhatsApp number per trip.
 - AC-9 Given a valid code of kind `group` in a message sent in a WhatsApp group that has
   no open binding, then the code is spent, one binding row opens for the group, and the
   introduction is sent to the group. The introduction never includes the site password,
   whatever `groupIntroIncludesPassword` says. Who sent the message does not matter
-  (open question 2).
+  (owner's decision, 2026-11-21).
 - AC-10 Given a code whose kind does not fit the chat (a `group` code in a private chat,
   a `me` or `traveller` code in a group), a code that is wrong, expired or already used,
   a `group` code in a group bound to a different trip, a group whose id is not of an
@@ -278,7 +304,9 @@ identify one chat on one platform:
   is added.
 - New table `chat_binding_codes`: `id` (opaque), `trip_id` (FK), `platform`, `kind` in
   (`me`, `traveller`, `group`), `issued_by_user_id`, `participant_username` (for `me` and
-  `traveller`), `code_digest`, `state` in (`issued`, `redeemed`, `expired`), `binding_id`
+  `traveller`), `invited_email_digest` and `invited_user_id` (for `traveller`; the account
+  is resolved when the invitation is created, so the address itself is not kept on the
+  row), `code_digest`, `state` in (`issued`, `redeemed`, `expired`), `binding_id`
   (set when redeemed), `expires_at`, `created_at`, `redeemed_at`. Unique partial index on
   `code_digest` over `issued`; no one-per-trip index.
 - The table is platform-neutral by name; only `whatsapp` rows are written in this slice.
@@ -448,7 +476,8 @@ with Hermes is open question 3.
 
 Architecture profile, `relay.whatsapp` (absent = feature not present):
 `bridge_url`, `bridge_secret_ref`, `sender_id_secret_ref`, `number` (what the dashboard's
-links open; read by the API as well), `code_ttl_seconds`, `code_attempts_per_hour`. `bridge_url` passes a new validator that
+links open; read by the API as well), `code_ttl_seconds`, `invite_ttl_seconds`,
+`code_attempts_per_hour`. `bridge_url` passes a new validator that
 accepts loopback addresses only (`telegramApiRoot` is not reused: it accepts https to any
 host). How a containerised relay shares loopback with the bridge is the deployment's
 concern. The bridge's session directory is the bridge's own argument and holds a
@@ -473,9 +502,16 @@ session policy, the trip's owner only, one 404 for everything else:
 
 | Route | Does |
 |---|---|
-| `POST /v1/trips/:id/whatsapp-codes` `{ kind, participant? }` | issues a code; returns `{ link, expiresAt }` |
-| `GET /v1/trips/:id/whatsapp-connections` | open WhatsApp bindings of the trip: groups with title, people with traveller name and the number's last four digits |
+| `POST /v1/trips/:id/whatsapp-codes` `{ kind }` (`me` or `group`) | issues a code; returns `{ link, expiresAt }` |
+| `POST /v1/trips/:id/whatsapp-invitations` `{ participant, email }` | issues a `traveller` code and emails it; returns `{ expiresAt }` only |
+| `GET /v1/trips/:id/whatsapp-connections` | open WhatsApp bindings of the trip (groups with title; people with traveller name, email and the number's last four digits) and unused invitations |
 | `DELETE /v1/trips/:id/whatsapp-connections/:bindingId` | Remove (AC-12a) |
+| `DELETE /v1/trips/:id/whatsapp-invitations/:codeId` | expires an unused invitation |
+
+The invitation email is a new `PortalMail` kind in `portal-email-templates.ts`, sent
+through `Mailer` (`mailer.ts`); it names the trip and the organizer, says what pressing
+send will do, and carries the link and its expiry. A deployment with no mailer configured
+refuses the invitation route with a clear error and does not issue a code.
 
 Links: `me` and `traveller` open `https://wa.me/<number>?text=<message>`; `group` opens
 `https://wa.me/?text=<message>`, WhatsApp's share screen, because a link cannot target a
@@ -490,7 +526,7 @@ sees the closed binding's chat, or by an outbox row if AC-0 shows that is simple
 `relay/pending-attachments.ts`, `relay/group-judge.ts`, `relay/stay-silent.ts`,
 `relay/connector.ts`, `relay/outbound-scope.ts`, `relay/server.ts`, `chat-router.ts`
 (`ChatRoute.platform`, `resolveTripPerson`), `identity.ts`, `config.ts`, `portal.ts`,
-`web/src/api.ts`, `trip-audience.ts` and
+`portal-email-templates.ts`, `web/src/api.ts`, `trip-audience.ts` and
 `plan-change-poller.ts` (comment and test only), `analytics/store.ts`,
 `analytics/contract.ts`, `shared/feature-switches.js`, worker `feature_block.py`, worker
 tests for `gateway_reconcile.py`, `scripts/teardown-trip.py`,
@@ -535,10 +571,16 @@ rejected direct pairing.
   Consequences that are accepted and stated:
   - A `me` code binds whoever sends it as the issuing organizer. The organizer sends it
     from their own phone seconds after it is minted; it is never meant to be forwarded.
-  - A `traveller` link is meant to be forwarded, so whoever opens it first becomes that
-    traveller in the chat, with a member's view of the trip. Members see all of a trip's
-    data, so this is the disclosure to weigh; the dashboard list and Remove are the
-    control, and the link dies after 15 minutes or one use.
+  - A `traveller` invitation goes only to the email address the organizer typed, so
+    redeeming it shows control of that mailbox, the same evidence an emailed sign-in link
+    gives. A mistyped address, or a forwarded email, lets someone else become that
+    traveller in the chat with a member's view of the trip, and members see all of a
+    trip's data. The controls are: the organizer never holds the link, one use, three
+    days, the list of unused invitations and connected people in the dashboard, and
+    Remove.
+  - The account for an invited address comes only from `resolveOrCreateEmailAccount`, so
+    one address stays one `user_id`; the invitation never mints a user by itself and never
+    touches an existing account's credential.
   - A `group` code is visible to the whole group once sent, and is already spent by then.
   - A wrongly bound chat is visible in the dashboard list at once.
 - **Roles are derived, not stored.** A WhatsApp organizer is an organizer only while the
@@ -580,7 +622,8 @@ Tests are written first, from the criteria.
   with `InboundTurn` for both platforms over the same table of cases.
 - S2: `chat-binding-codes.test.ts` (AC-7 to AC-12a, the lock order under concurrent
   redeem and teardown, as `group-binding`'s deadlock test does); portal route tests for
-  AC-6 and AC-7; `TripWhatsApp.test.tsx`; a migration test for
+  AC-6, AC-7 and AC-7a with a fake mailer (the response never carries the code; one
+  address resolves to one account); `TripWhatsApp.test.tsx`; a migration test for
   AC-3 and AC-4; an old-schema test for AC-5 (the route query against a table without the
   column); `chatKind` cases; `tests/scripts/test_teardown_trip.py` for AC-12b; worker and
   fleet-monitor tests with a WhatsApp row.
@@ -617,15 +660,14 @@ Decisions for Dror before approval.
 
 1. **Which sprint owns this.** Sprint 9's scope is faster delivery. Proposed: its own
    track after Release 1, with S1 allowed earlier because it changes no behaviour.
-2. **Who may send a group code.** As you described it, and as written (AC-9): whoever
-   sends the coded message in the group binds it. A tighter option costs one step: accept
-   a group code only from a number already connected to that trip as an organizer, so
-   "Connect my WhatsApp" comes first. Recommended: as written; the code lives 15 minutes,
-   works once, and the result shows in the dashboard at once.
-2a. **Inviting travellers.** Written in as the third action (AC-8, `traveller`). It is the
-   one part with a forwardable link, and it overlaps the personal invite of
-   `x-member-sign-in.md`. Keep it in this slice, or ship "me" and groups first and add
-   travellers with member sign-in?
+2. **Decided 2026-11-21.** The organizer gets a group link directly in the dashboard, and
+   whoever sends the coded message in the group binds it. Traveller invitations are in
+   this slice and go by email. Still to confirm in that area:
+   - the invitation lifetime (written as three days);
+   - that an invited traveller's account gets a `member` membership of the trip, which is
+     what "binds the trip, his number and the email" is read to mean, and which is also
+     what the personal invite of `x-member-sign-in.md` creates. The two should share one
+     code path; whichever is built second reuses the first.
 3. **Bridge source.** Recommended: our own small sidecar, adapted from the MIT-licensed
    bridge that ships with Hermes, with the library version pinned. The alternative, running
    Hermes's bridge as it is, is faster but makes the relay's intake depend on a file inside
