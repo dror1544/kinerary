@@ -1,0 +1,26 @@
+{
+  "label": "kinerary-trip-exchange:v1:",
+  "algorithm": "hex(HMAC-SHA256(master, label + trip_id))",
+  "vectors": [
+    {
+      "master": "test-master-do-not-use-0001",
+      "tripId": "trip_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "key": "a98f9381bdced8017c52d8e6b4007c8f84773af064fae0dd2c0cb5acf2ce1327"
+    },
+    {
+      "master": "test-master-do-not-use-0001",
+      "tripId": "trip_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "key": "cfdc3473a6c2b410d7c192abb247819a775357e667e8967258f133a30cd22243"
+    },
+    {
+      "master": "another-master-do-not-use-2",
+      "tripId": "trip_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "key": "0e90320db84200ff3f8a5a26d920b11e8fd212428000d4607164b8b719e7e1f2"
+    },
+    {
+      "master": "m",
+      "tripId": "trip_12345678",
+      "key": "91b0a391e5752c9c0f49cde9f2cbfd9ba4bff9df40cff1b8d98eb5a3983bfd18"
+    }
+  ]
+}

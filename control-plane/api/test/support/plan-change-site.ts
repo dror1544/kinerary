@@ -82,6 +82,57 @@ export async function startStubSite(initial: Partial<StubPlan> = {}): Promise<St
   return site;
 }
 
+/** The key a trip's site holds in these tests; the fake gateway sends it, and the control plane never holds it. */
+export const tripKeyFor = (tripId: string) => `trip-key-for-${tripId}`;
+/** Where `seedTrip` pointed each trip: the fake gateway's route table. */
+const siteOrigins = new Map<string, string>();
+
+export interface FakeGateway {
+  /** http://127.0.0.1:<port>: what the poller is given as `runtimeOrigin`. */
+  origin: string;
+  /** Every request the poller made: the control-plane key it carried and the `since` it asked for. */
+  requests: Array<{ url: string; since: string | null; apiKey: string | undefined }>;
+  close(): Promise<void>;
+}
+
+/**
+ * A stand-in for the runtime gateway's `GET /internal/t/<id>/plan-changes` (runtime-gateway/server.js): it checks the
+ * caller's control-plane key, finds the trip's stub site (the origin `seedTrip` registered), and reads it with that
+ * trip's own key, never the caller's. What the site records is therefore what a real site would have been sent.
+ */
+export async function startFakeGateway(callerKey: string): Promise<FakeGateway> {
+  const gateway: FakeGateway = {
+    origin: "",
+    requests: [],
+    close: async () => { await new Promise<void>((resolve) => { server.closeAllConnections(); server.close(() => resolve()); }); },
+  };
+  const server: Server = createServer(async (req: IncomingMessage, res) => {
+    const url = new URL(req.url ?? "/", "http://gateway");
+    const apiKey = req.headers["x-api-key"] as string | undefined;
+    gateway.requests.push({ url: req.url ?? "", since: url.searchParams.get("since"), apiKey });
+    const match = url.pathname.match(/^\/internal\/t\/([^/]+)\/plan-changes$/);
+    if (apiKey !== callerKey) { res.writeHead(401, { "content-type": "application/json" }); return res.end('{"error":"AUTHENTICATION_REQUIRED"}'); }
+    const tripId = match ? decodeURIComponent(match[1]!) : "";
+    const site = siteOrigins.get(tripId);
+    if (!site) { res.writeHead(404, { "content-type": "application/json" }); return res.end('{"error":"NOT_FOUND"}'); }
+    try {
+      const upstream = await fetch(`${site}/api/internal/control-plane/plan-changes${url.search}`, {
+        headers: { "x-api-key": tripKeyFor(tripId), "x-control-plane-trip-id": tripId, accept: "application/json" },
+        redirect: "manual",
+      });
+      res.writeHead(upstream.status, { "content-type": "application/json" });
+      res.end(await upstream.text());
+    } catch {
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end('{"error":"RUNTIME_UNAVAILABLE"}');
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address();
+  gateway.origin = `http://127.0.0.1:${typeof address === "object" && address ? address.port : 0}`;
+  return gateway;
+}
+
 const id = (prefix: string) => `${prefix}_${randomBytes(12).toString("hex")}`;
 
 /** A trip with a ready runtime route to `origin`. Returns the trip id. */
@@ -110,6 +161,7 @@ export async function seedTrip(pool: pg.Pool, slug: string, origin: string): Pro
     "INSERT INTO control_plane.runtime_routes(trip_id, route_ref, state) VALUES ($1, $2, 'ready')",
     [tripId, `route_${randomBytes(8).toString("hex")}`],
   );
+  siteOrigins.set(tripId, origin);
   return tripId;
 }
 

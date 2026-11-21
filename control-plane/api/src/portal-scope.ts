@@ -95,6 +95,8 @@ export const PORTAL_SCOPE_POLICY: Readonly<Record<string, RouteScope>> = Object.
   // exactly like consume above. Added at integration: the two lines were built apart.
   "POST /internal/runtime-sessions/check": "open",
   "GET /internal/runtime-routes/:tripId": "open",
+  // The gateway's host mode asks which trip a Host header names. Exchange-key authenticated, no cookie read.
+  "GET /internal/runtime-routes/by-host/:host": "open",
 
   "GET /v1/me": "session",
   "POST /v1/logout": "session",

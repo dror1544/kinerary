@@ -187,6 +187,78 @@ class Classify(unittest.TestCase):
         self.assertEqual(classify("git push && ~/kinerary-deploy/trips/japan-2026/deploy.sh"), "deploy")
         self.assertEqual(classify("git fetch && git merge origin/main && git push"), "merge")
 
+    def test_moving_a_trip_onto_the_gateway_or_rekeying_a_gateway_is_a_live_change(self):
+        for command in (
+            "scripts/trip-route.py --trip japan-2026 --set --execute",
+            "scripts/trip-route.py --trip japan-2026 --clear --execute --live",
+            "python3 scripts/trip-route.py --trip trip_abc --set --execute",
+            "sudo KINERARY_DEPLOY_ROOT=/srv/deploy python3 scripts/trip-route.py --trip x --set --execute",
+            "sudo env KINERARY_DEPLOY_ROOT=/srv/deploy python3 scripts/trip-route.py --trip x --set --execute",
+            "cd x && KINERARY_DEPLOY_ROOT=/srv/d scripts/trip-route.py --trip x --set --execute",
+            'ssh host "sudo python3 /opt/k/scripts/trip-route.py --trip x --set --execute"',
+            "scripts/relay-rekey.py --all-enrolled --execute",
+            "sudo python3 scripts/relay-rekey.py --profile a,b --execute",
+        ):
+            self.assertEqual(classify(command), "deploy", command)
+
+    def test_no_spelling_of_the_command_or_the_flag_gets_past_the_prompt(self):
+        # Boundary review of #599 (2026-11-19, F1): each of these ran, or would run, the change with no prompt.
+        for command in (
+            "scripts/trip-route.py --trip x --set --exec --li",
+            "scripts/trip-route.py --trip x --clear --e",
+            "scripts/trip-route.py --trip x --set --exe\"\"cute",
+            "scripts/trip-route.py --trip 'a;b' --set --execute",
+            "python3 -u scripts/trip-route.py --trip x --set --execute",
+            "python3.12 scripts/trip-route.py --trip x --set --execute",
+            "/usr/bin/python3 scripts/trip-route.py --trip x --set --execute",
+            "sudo -E python3 scripts/trip-route.py --trip x --set --execute",
+            "timeout 60 scripts/trip-route.py --trip x --set --execute",
+            "uv run scripts/relay-rekey.py --all-enrolled --execute",
+            "scripts/relay-rekey.py --all-enrolled --exec",
+            "scripts/teardown-trip.py --trip x --exec",
+            "ssh host 'sudo -E /usr/bin/python3 /opt/k/scripts/trip-route.py --trip x --set --exec'",
+            "bash -c 'timeout 9 python3 scripts/relay-rekey.py --all-enrolled --execute'",
+        ):
+            self.assertEqual(classify(command), "deploy", command)
+
+    def test_wrappers_comments_and_continuations_do_not_hide_the_flag(self):
+        # Re-check of #599 (2026-11-20): forms the word reader alone missed.
+        T = "python3 scripts/trip-route.py --trip x --set --execute --live"
+        R = "python3 scripts/relay-rekey.py --all-enrolled --execute"
+        for command in (
+            "# move the test trip\nsudo KINERARY_DEPLOY_ROOT=/srv/d " + T,
+            "curl -s http://h/#top >/dev/null; " + R,
+            "python3 scripts/trip-route.py --trip a#b --set --execute",
+            "X=a#b " + T,
+            f"timeout 120 ssh host 'sudo {R}'",
+            f"sshpass -f pw ssh host '{R}'",
+            f"eval '{T}'",
+            f"timeout 60 bash -c '{T}'",
+            f"su root -c '{R}'",
+            f"bash <<< '{T}'",
+            f"echo '{R}' | sh",
+            "python3 scripts/trip-route.py --trip x --set \\\n  --execute --live",
+            "python3 scripts/TRIP-ROUTE.PY --trip x --set --execute",
+        ):
+            self.assertEqual(classify(command), "deploy", command)
+
+    def test_the_scripts_refuse_a_shortened_execute(self):
+        root = Path(__file__).resolve().parents[2] / "scripts"
+        for name in ("trip-route.py", "relay-rekey.py", "teardown-trip.py"):
+            text = (root / name).read_text()
+            self.assertIn("allow_abbrev=False", text, name)
+
+    def test_showing_or_planning_a_route_or_a_rekey_is_read_only(self):
+        for command in (
+            "scripts/trip-route.py --trip japan-2026",
+            "scripts/trip-route.py --trip japan-2026 --set",
+            "sudo KINERARY_DEPLOY_ROOT=/srv/deploy python3 scripts/trip-route.py --trip x --clear",
+            "scripts/relay-rekey.py --all-enrolled",
+            "python3 -m unittest tests/scripts/test_trip_route.py",
+            "grep -n -- --execute scripts/trip-route.py",
+        ):
+            self.assertEqual(classify(command), "none", command)
+
     def test_a_teardown_dry_run_is_read_only(self):
         self.assertEqual(classify("scripts/teardown-trip.py --trip japan-2026"), "none")
 
