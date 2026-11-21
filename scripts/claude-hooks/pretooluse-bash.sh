@@ -5,6 +5,9 @@
 # approval) cannot be checked by a script: they are about intent. What a hook
 # CAN do is make them a prompt every single time, instead of an instruction an
 # agent has to remember. That is what permissionDecision "ask" is for.
+# Since 2026-11-20 the owner's standing approval (CLAUDE.md, "Standing deploy
+# approval") quiets the ROUTINE deploys only, and only when he has opted in; see
+# standing_deploy_ok below.
 #
 # A commit additionally runs the mechanical checks first, so a violation is
 # refused with the reason rather than becoming a prompt someone has to reason
@@ -548,7 +551,7 @@ EOF
 # characters from the command reach the prompt.
 feature_live_note() {
   local re rest tok name="" value="" trip="" scope="" next="" words=() i
-  re='(feature-cli(\.[jt]s)?|run(-script)?[[:space:]]+feature)(([[:space:]]+(--prefix=[^[:space:]]+|(--prefix|-C)[[:space:]]+[^[:space:]]+))*)([[:space:]]+--)?[[:space:]]+set[[:space:]]+([^;&|]*)'
+  re='(feature-cli(\.[jt]s)?|run(-script)?([[:space:]]+-[^[:space:]]+)*[[:space:]]+feature)(([[:space:]]+(--prefix=[^[:space:]]+|(--prefix|-C)[[:space:]]+[^[:space:]]+))*)([[:space:]]+--)?[[:space:]]+set[[:space:]]+([^;&|]*)'
   [[ "$1" =~ $re ]] || return 1
   rest="${BASH_REMATCH[${#BASH_REMATCH[@]}-1]}"   # the last group, whatever the groups before it are
   read -r -a words <<<"$rest"
@@ -580,6 +583,23 @@ Approve only if you meant to change that right now."
   return 0
 }
 
+# The owner's standing approval for routine deploys (CLAUDE.md hard rule 2, Dror,
+# 2026-11-20: "I want fast deployment"). It is the owner's own grant, so it lives in
+# HIS settings, never in this repository: KINERARY_STANDING_DEPLOY_APPROVAL in the
+# `env` of his user-level ~/.claude/settings.json. A second Kinerary, Codex
+# (codex-adapter.py drops the variable) and a subagent (refused above all of this)
+# never inherit it. Unset, every deploy asks exactly as before.
+#
+# Set, a deploy that match-command.py --deploy-class calls `routine` (every deploy
+# verb in it on the routine allow-list, nothing in it that commits, merges or pushes)
+# gets NO decision from this hook: it is not vouched for, only not asked here, so the
+# harness's own permission rules still judge the whole command. Everything else —
+# hard rule 7, data deletion, the VM's version, every-trip switches — asks as before.
+standing_deploy_ok() {
+  case "${KINERARY_STANDING_DEPLOY_APPROVAL:-}" in ''|0|false|no|off) return 1 ;; esac
+  [ "$(printf '%s' "$1" | python3 "$MATCH" --deploy-class 2>/dev/null)" = "routine" ]
+}
+
 if [ -n "$agent" ]; then
   case "$kind" in
     deploy) rule="hard rule 2 — never deploy a live trip site without explicit approval" ;;
@@ -605,6 +625,10 @@ case "$kind" in
     emit ask "Pushing publishes commits to origin: after this they exist for everyone who fetches, and a force push rewrites what they already had. Approve only if you meant to push right now."
     ;;
   deploy)
+    if standing_deploy_ok "$cmd"; then
+      log_decision standing
+      exit 0
+    fi
     # A feature switch set with --live gets a prompt that names what it changes,
     # because "approve a deploy" says nothing about which trips feel it (#567).
     if feature_live_note "$cmd"; then
