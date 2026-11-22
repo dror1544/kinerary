@@ -1,6 +1,6 @@
 # The companion on WhatsApp, in a group or a private chat, through the relay (first slice)
 
-Status: draft (2026-11-21; two consult reviews applied; the owner's answers to the open questions recorded the same day; approval not yet recorded) · Issue: none yet (file one; this file is renamed to `<n>-whatsapp-via-relay.md` then) · Track: its own track, after Release 1 (Dror, 2026-11-21) · Size: L (five slices) · Tier: High
+Status: approved (2026-11-21, by Dror; two consult reviews applied and the owner's answers to the open questions recorded before approval) · Issue: #625 · Track: its own track, built and deployed as each slice is ready (Dror, 2026-11-22: "make all deployable when ready, no more waits"; until then it was "after Release 1") · Size: L (five slices) · Tier: High
 Security path: yes (the relay's trust boundary, chat-to-trip resolution, outbound scope, portal routes, and in S5 an account and membership path) · Migration: yes (S2 and S5) · Live-trip behaviour: yes (relay behaviour; risk class), switched off by default
 
 Related: `docs/per-trip-gateway-architecture.md` §4; `docs/specs/sprint-9/x-relay-chat-scope.md`
@@ -425,8 +425,8 @@ platform-neutral by name; only `whatsapp` rows are written in this slice.
   separate contract step.
 - **The monitor's grants do not change.** It already reads `chat_id`, which now never
   holds a number; `transport_address` is not granted, and a test pins that.
-- **New code on the old schema.** Migrations are a separate step from a restart, and the
-  production release that carries this one waits for the freeze to end. The route query
+- **New code on the old schema.** Migrations are a separate step from a restart, so the
+  new code can run before the production release that carries this migration. The route query
   therefore reads the platform in a form that does not fail when the column is absent
   (absent reads as `telegram`; for example `COALESCE(to_jsonb(b)->>'platform','telegram')`),
   and no query on a path that Telegram traffic uses selects a new column (AC-5).
@@ -817,8 +817,9 @@ Tests are written first, from the criteria.
 - Live trips feel nothing: the switch is off for every trip, no deployment has a
   `relay.whatsapp` block, the migrations are additive, and new code runs on the old
   schema (AC-5). The control-plane release that carries the S2 migration to the
-  production VM is after the Alsace freeze (not before 2026-12-07) and needs the owner's
-  own approval as any migration does.
+  production VM goes when it is ready (Dror, 2026-11-22: the Alsace freeze, which held it
+  until 2026-12-07, is lifted) and takes the usual path: `--dry-run` first, and the owner's
+  own approval if the dry run reports a `breaking` migration.
 - Staging gets it the usual way: merged to `main` switched off, picked up by the nightly
   redeploy. The staging bridge is started and paired by hand from the deployment
   repository. The S4 sitting uses a trip and a Telegram group that the PR #599 sitting
@@ -832,7 +833,8 @@ Tests are written first, from the criteria.
 
 **Answered by Dror, 2026-11-21:**
 
-1. **When.** Its own track, after Release 1.
+1. **When.** Its own track, after Release 1. **Changed 2026-11-22 (Dror):** no wait for
+   Release 1; each slice is built and deployed when it is ready.
 2. **The review's three choices stand.** Only the trip's owner binds a group by adding
    the number, onto the trip their own WhatsApp chat is connected to (AC-28); Remove
    sends nothing (AC-15); the owner's notice goes to WhatsApp, else Telegram, else the

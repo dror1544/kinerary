@@ -3,8 +3,9 @@
 Status: approved (2026-11-19, by Dror) · Issue: none yet (`x-`); folds in #614 · Track: T5 · Size: L · Tier: High
 Security path: yes (Mini App sign-in links, runtime launch exchange, site invites, password recovery) · Migration: yes · Live-trip behaviour: yes, behind a per-trip switch, off by default
 
-> **Build timing.** Built on its own branch, merged to `main` **after 2026-12-06** (the VM is
-> frozen 2026-11-24 to 12-06). Nothing here may reach `main` before then.
+> **Build timing.** Built on its own branch and merged to `main` when it is ready (Dror,
+> 2026-11-22: "make all deployable when ready, no more waits"; the VM freeze of 2026-11-24
+> to 12-06 is lifted). Until then this note said: merged after 2026-12-06, nothing before.
 >
 > **Approved 2026-11-19 by Dror**, with the decisions recorded under "Decisions" at the end.
 
