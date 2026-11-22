@@ -193,6 +193,11 @@ services:
       RUNTIME_PUBLIC_SUFFIXES: ${RUNTIME_PUBLIC_SUFFIXES:-}
       RUNTIME_SAME_SITE_OK: ${RUNTIME_SAME_SITE_OK:-}
       RUNTIME_UPSTREAM_TIMEOUT_MS: ${RUNTIME_UPSTREAM_TIMEOUT_MS:-}
+      # Per-trip keys (docs/runtime-session-exchange.md, "Per-trip keys"). Both optional and unset by default,
+      # which is today's behaviour: every trip site is sent RUNTIME_EXCHANGE_KEY. The master is the same
+      # value the worker is handed below; it never reaches a trip site, the api or a log.
+      RUNTIME_TRIP_KEY_MASTER: ${RUNTIME_TRIP_KEY_MASTER:-}
+      RUNTIME_LEGACY_TRIP_KEY: ${RUNTIME_LEGACY_TRIP_KEY:-}
     ports:
       - "${WEB_BIND_IP:-127.0.0.1}:${RUNTIME_GATEWAY_PORT:-4320}:4320"
     healthcheck:
@@ -261,6 +266,13 @@ services:
       RPI_SSH_KEY: /root/.ssh/id_ed25519_rpi4_hermes
       PROVISIONER_LXC_IP_POOL: ${PROVISIONER_LXC_IP_POOL:-}
       PROVISIONER_LXC_HOSTNAME_DOMAIN: ${PROVISIONER_LXC_HOSTNAME_DOMAIN:-}
+      # Unset means host / per_trip. The worker refuses any other spelling.
+      TRIP_ROUTING: ${TRIP_ROUTING:-}
+      TRIP_MCP_BRIDGE: ${TRIP_MCP_BRIDGE:-}
+      # With TRIP_MCP_BRIDGE=shared: the shared bridge as a trip CONTAINER reaches it, http(s)://<host>:<port>.
+      # Required with `shared`, refused without it (the worker will not start half-set). A new trip's .env
+      # gets HERMES_URL=<this>, and the worker checks from inside the container that the bridge answers.
+      TRIP_MCP_SHARED_SITE_URL: ${TRIP_MCP_SHARED_SITE_URL:-}
       PROVISIONER_LXC_TUNNEL_ID: ${PROVISIONER_LXC_TUNNEL_ID:-}
       # RETIRED (2026-10-15): ignored - every new trip site generates its own
       # password. Passed through only so the worker warns if it is still set.
@@ -271,6 +283,10 @@ services:
       # .env of every trip site it BUILDS from now on, and an existing site is
       # not touched. Empty (the default) writes nothing.
       CONTROL_PLANE_EXCHANGE_KEY: ${RUNTIME_EXCHANGE_KEY:-}
+      # The trip key master, under the gateway's name for it (one value, one name on this VM, like the key
+      # above). Set: a trip BUILT from now on gets derive(master, trip_id) in its .env instead of the key
+      # above, and its route is recorded `derived`. Unset (the default): the key above, as before.
+      CONTROL_PLANE_TRIP_KEY_MASTER: ${RUNTIME_TRIP_KEY_MASTER:-}
       CONTROL_PLANE_OPERATOR_CHAT_ID: ${CONTROL_PLANE_OPERATOR_CHAT_ID:-}
       # The portal's own origin (the API's web.public_origin), written into each
       # trip's identity sidecar so an organizer who opens the trip on its own

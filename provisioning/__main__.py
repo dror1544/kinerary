@@ -32,10 +32,13 @@ def _required_env(name: str) -> str:
 
 
 def build_provisioner(topology: Topology) -> Provisioner:
-    npm = HttpJsonTransport(_required_env("NPM_URL"), {
+    # A topology with no npm:/cloudflare: section (wildcard routing) needs no
+    # NPM or Cloudflare credentials, and none are asked for: the transports are
+    # built only for the sections the topology actually has.
+    npm = None if topology.proxy is None else HttpJsonTransport(_required_env("NPM_URL"), {
         "Authorization": "Bearer " + _required_env("NPM_API_TOKEN"),
     })
-    cloudflare = HttpJsonTransport("https://api.cloudflare.com", {
+    cloudflare = None if topology.cloudflare is None else HttpJsonTransport("https://api.cloudflare.com", {
         "Authorization": "Bearer " + _required_env("CLOUDFLARE_API_TOKEN"),
     })
     # Proxmox itself and the RPi4 that runs cloudflared — confirmed live
@@ -54,8 +57,9 @@ def build_provisioner(topology: Topology) -> Provisioner:
     )
     return Provisioner(
         ProxmoxLxcAdapter(proxmox_ssh),
-        NpmProxyHostAdapter(npm),
-        CloudflareTunnelDnsAdapter(cloudflare, _required_env("CLOUDFLARE_ZONE_ID"), rpi_ssh),
+        None if npm is None else NpmProxyHostAdapter(npm),
+        None if cloudflare is None else CloudflareTunnelDnsAdapter(
+            cloudflare, _required_env("CLOUDFLARE_ZONE_ID"), rpi_ssh),
     )
 
 
@@ -82,11 +86,11 @@ def main(argv: list[str] | None = None) -> int:
         topology = load_topology_file(args.topology)
         provisioner = build_provisioner(topology)
         if args.command == "verify":
-            states = {
-                "proxmox_lxc": provisioner.proxmox.inspect(topology.lxc) is not None,
-                "npm_proxy_host": provisioner.npm.inspect(topology.proxy) is not None,
-                "cloudflare_tunnel": provisioner.cloudflare.inspect(topology.cloudflare) is not None,
-            }
+            states = {"proxmox_lxc": provisioner.proxmox.inspect(topology.lxc) is not None}
+            if topology.proxy is not None:
+                states["npm_proxy_host"] = provisioner.npm.inspect(topology.proxy) is not None
+            if topology.cloudflare is not None:
+                states["cloudflare_tunnel"] = provisioner.cloudflare.inspect(topology.cloudflare) is not None
             print(json.dumps({"topology": topology.name, "verified": states}, indent=2, sort_keys=True))
             return 0 if all(states.values()) else 2
         snapshot = provisioner.plan(topology) if args.command == "plan" else provisioner.apply(topology, execute=args.execute)

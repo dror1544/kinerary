@@ -8,7 +8,8 @@ type ChatRoute = ScopeRoute;
 import { RelayConnector } from "../src/relay/connector.js";
 import { SILENCE_SENTINEL } from "../src/relay/stay-silent.js";
 import type { ReplyObserver } from "../src/analytics/emitter.js";
-import { makeUpgradeToken, type WireMessageEvent } from "../src/relay/protocol.js";
+import { gatewayFromAuthorization } from "../src/companion-mcp.js";
+import { deriveGatewayKey, makeUpgradeToken, type GatewayKeyMode, type WireMessageEvent } from "../src/relay/protocol.js";
 import { digestTelegramId } from "../src/identity.js";
 import { CHAT_NOT_IN_SCOPE, SCOPE_CHECK_FAILED } from "../src/relay/outbound-scope.js";
 import type { ChatInfo, SendResult, TelegramClient } from "../src/relay/telegram-api.js";
@@ -219,6 +220,113 @@ describe("RelayConnector — upgrade auth", () => {
     } finally {
       await connector.close();
     }
+  });
+});
+
+describe("RelayConnector — gateway key mode (#597 K1, AC-K1.2/K1.3/K1.7)", () => {
+  const MEDIA_ID = "0123456789abcdef0123456789abcdef";
+  /** The derivation master: a secret no gateway profile has held. SECRET is what every profile holds. */
+  const MASTER = "derivation-master-no-profile-holds";
+  const tokens = {
+    shared: makeUpgradeToken("gw_1", SECRET, 300),
+    derived: makeUpgradeToken("gw_1", deriveGatewayKey(MASTER, "gw_1"), 300),
+    // Derived from what the profiles hold: never a credential, in any mode.
+    derivedFromShared: makeUpgradeToken("gw_1", deriveGatewayKey(SECRET, "gw_1"), 300),
+    // Signed with the key that belongs to gw_2, naming gw_1.
+    crossed: makeUpgradeToken("gw_1", deriveGatewayKey(MASTER, "gw_2"), 300),
+  };
+  /** What each mode must do with each token, on the upgrade AND the media plane. */
+  const expected: Record<GatewayKeyMode, Record<keyof typeof tokens, boolean>> = {
+    shared: { shared: true, derived: false, derivedFromShared: false, crossed: false },
+    both: { shared: true, derived: true, derivedFromShared: false, crossed: false },
+    derived: { shared: false, derived: true, derivedFromShared: false, crossed: false },
+  };
+
+  async function withMode(mode: GatewayKeyMode | undefined, fn: (c: RelayConnector, port: number) => Promise<void>) {
+    const connector = new RelayConnector({
+      gatewaySecrets: [SECRET],
+      ...(mode ? { gatewayKeyMode: mode, gatewayKeyMasters: [MASTER] } : {}),
+      mediaStore: { get: (id) => (id === MEDIA_ID ? { mime: "text/plain", bytes: Buffer.from("hello") } : null) },
+      telegram: new FakeTelegram(),
+      port: 0,
+    });
+    await connector.listen();
+    try {
+      await fn(connector, connector.address!);
+    } finally {
+      await connector.close();
+    }
+  }
+
+  for (const mode of ["shared", "both", "derived"] as GatewayKeyMode[]) {
+    test(`${mode}: the upgrade and the media plane agree, and agree with the companion control MCP`, async () => {
+      await withMode(mode, async (connector, port) => {
+        for (const [name, token] of Object.entries(tokens) as [keyof typeof tokens, string][]) {
+          const want = expected[mode][name];
+          // WebSocket upgrade.
+          if (want) {
+            const { ws } = await dial(port, token);
+            ws.close();
+          } else {
+            await assert.rejects(dial(port, token), `${mode}/${name}: upgrade must be refused`);
+          }
+          // Media plane.
+          const res = await fetch(`http://127.0.0.1:${port}/relay/media/${MEDIA_ID}`, {
+            headers: { authorization: `Bearer ${token}` },
+          });
+          assert.equal(res.status, want ? 200 : 401, `${mode}/${name}: media`);
+          await res.arrayBuffer();
+          // The other checker, one setting.
+          assert.equal(
+            gatewayFromAuthorization(`Bearer ${token}`, [SECRET], mode, [MASTER]),
+            want ? "gw_1" : null,
+            `${mode}/${name}: companion-mcp`,
+          );
+        }
+        void connector;
+      });
+    });
+  }
+
+  test("derived, after the changeover: a key derived from the old shared secret is refused for every gateway id, on every surface", async () => {
+    await withMode("derived", async (_c, port) => {
+      for (const id of ["gw_1", "gw_2", "japan2026", "interviewer"]) {
+        const token = makeUpgradeToken(id, deriveGatewayKey(SECRET, id), 300);
+        await assert.rejects(dial(port, token), `${id}: upgrade must be refused`);
+        const res = await fetch(`http://127.0.0.1:${port}/relay/media/${MEDIA_ID}`, { headers: { authorization: `Bearer ${token}` } });
+        assert.equal(res.status, 401, `${id}: media`);
+        await res.arrayBuffer();
+        assert.equal(gatewayFromAuthorization(`Bearer ${token}`, [SECRET], "derived", [MASTER]), null, `${id}: companion-mcp`);
+        // ...while the key derived from the new master, for its own id, is accepted.
+        const good = makeUpgradeToken(id, deriveGatewayKey(MASTER, id), 300);
+        const { ws } = await dial(port, good);
+        ws.close();
+        assert.equal(gatewayFromAuthorization(`Bearer ${good}`, [SECRET], "derived", [MASTER]), id);
+      }
+    });
+  });
+
+  test("a connector in both/derived is not built without a derivation master, or with one equal to a shared secret", () => {
+    for (const mode of ["both", "derived"] as GatewayKeyMode[]) {
+      assert.throws(
+        () => new RelayConnector({ gatewaySecrets: [SECRET], gatewayKeyMode: mode, telegram: new FakeTelegram(), port: 0 }),
+        /gateway_key_master_refs/,
+        `${mode}: no master`,
+      );
+      assert.throws(
+        () => new RelayConnector({ gatewaySecrets: [SECRET], gatewayKeyMasters: [SECRET], gatewayKeyMode: mode, telegram: new FakeTelegram(), port: 0 }),
+        (error: Error) => /gateway_key_master_refs.*gateway_secret_refs/.test(error.message) && !error.message.includes(SECRET),
+        `${mode}: equal master`,
+      );
+    }
+  });
+
+  test("no mode given behaves as shared", async () => {
+    await withMode(undefined, async (_c, port) => {
+      const { ws } = await dial(port, tokens.shared);
+      ws.close();
+      await assert.rejects(dial(port, tokens.derived));
+    });
   });
 });
 

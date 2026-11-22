@@ -10,7 +10,7 @@ import { applyMigrations } from "../src/migrations.js";
 import { dispatchPendingTripNotifications } from "../src/outbox-dispatcher.js";
 import { pollPlanChangesOnce } from "../src/plan-change-poller.js";
 import { telegramApiRoot } from "../src/relay/telegram-api.js";
-import { bindGroup, seedTrip, startStubSite, type StubSite } from "./support/plan-change-site.js";
+import { bindGroup, seedTrip, startFakeGateway, startStubSite, type FakeGateway, type StubSite } from "./support/plan-change-site.js";
 import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 // Video Release 1C, "the sending proof from the approved plan" (docs/specs/sprint-9/x-video-r1-group-line.md, Test plan).
@@ -46,6 +46,7 @@ describe("the group line, end to end", { skip }, () => {
   let telegram: ChildProcess;
   let telegramBase: string;
   let adapter: TelegramNotificationAdapter;
+  let gateway: FakeGateway;
   let siteA: StubSite;
   let siteB: StubSite;
   let tripA: string;
@@ -62,7 +63,7 @@ describe("the group line, end to end", { skip }, () => {
   /** One minute of the control plane's life: the poller looks, then the dispatcher sends what it queued. */
   async function minute(advanceMs = min) {
     clock = new Date(clock.getTime() + advanceMs);
-    await pollPlanChangesOnce({ db: pool, exchangeKey: KEY, upstreamHostSuffixes: ["localhost"], now: () => clock, log: (line) => logs.push(line) });
+    await pollPlanChangesOnce({ db: pool, exchangeKey: KEY, runtimeOrigin: gateway.origin, upstreamHostSuffixes: ["localhost"], now: () => clock, log: (line) => logs.push(line) });
     await dispatchPendingTripNotifications(pool, adapter, (line) => logs.push(line));
   }
   const dinner = (time: string, previous = "20:00") => ({ kind: "updated", fields: ["time"], date: "2026-12-03", time, previous_time: previous, text_en: "Dinner", text_he: "ארוחת ערב" });
@@ -71,6 +72,7 @@ describe("the group line, end to end", { skip }, () => {
   };
 
   before(async () => {
+    gateway = await startFakeGateway(KEY);
     pool = testPool();
     const client = await pool.connect();
     try {
@@ -92,6 +94,7 @@ describe("the group line, end to end", { skip }, () => {
   });
   after(async () => {
     telegram?.kill();
+    await gateway?.close();
     await siteA?.close();
     await siteB?.close();
     const client = await pool.connect();
@@ -191,7 +194,7 @@ describe("the group line, end to end", { skip }, () => {
     // Let the poller enqueue, but close the group before the dispatcher runs.
     for (let i = 0; i < 7; i++) {
       clock = new Date(clock.getTime() + min);
-      await pollPlanChangesOnce({ db: pool, exchangeKey: KEY, upstreamHostSuffixes: ["localhost"], now: () => clock, log: (line) => logs.push(line) });
+      await pollPlanChangesOnce({ db: pool, exchangeKey: KEY, runtimeOrigin: gateway.origin, upstreamHostSuffixes: ["localhost"], now: () => clock, log: (line) => logs.push(line) });
     }
     const queued = await pool.query("SELECT count(*)::int AS n FROM control_plane.notification_outbox WHERE trip_id = $1 AND state = 'pending'", [tripA]);
     assert.equal(queued.rows[0].n, 1);
@@ -208,7 +211,7 @@ describe("the group line, end to end", { skip }, () => {
     edit(siteA, "rev_a2", [dinner("19:00")]);
     for (let i = 0; i < 7; i++) {
       clock = new Date(clock.getTime() + min);
-      await pollPlanChangesOnce({ db: pool, exchangeKey: KEY, upstreamHostSuffixes: ["localhost"], now: () => clock, log: (line) => logs.push(line) });
+      await pollPlanChangesOnce({ db: pool, exchangeKey: KEY, runtimeOrigin: gateway.origin, upstreamHostSuffixes: ["localhost"], now: () => clock, log: (line) => logs.push(line) });
     }
     // A bug (or an attacker with a database write) points A's row at B's group.
     await pool.query(

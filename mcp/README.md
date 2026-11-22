@@ -130,6 +130,112 @@ Multiple concurrent sessions (a local agent and a remote connector at the
 same time) are supported — each `/sse` connection gets its own MCP server
 instance server-side.
 
+## Shared mode — one process for every trip
+
+Off unless `MCP_ROUTES_DIR` is set; with it unset this server is the
+single-trip server described above, unchanged. In shared mode **one process
+serves every trip**: each companion profile holds one opaque token, and the
+server resolves the token to that trip's site address and agent key from a
+directory of route files. No tool, header or query parameter names a trip —
+the token is the only thing that selects one, and a session stays bound to the
+trip it opened with. Wiring a trip is writing one file; there is no process and
+no port per trip. (Design: `docs/specs/sprint-9/x-wildcard-host-and-shared-bridge.md`.)
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `MCP_ROUTES_DIR` | unset | Turns shared mode on. An existing directory of route files; the process refuses to start if it is not one. `MCP_API_KEY` is not required, and `API_BASE_URL`, `TRIP_PUBLIC_URL`, `TRIP_API_KEY` and `HERMES_API_KEY` are ignored (the log says so, by name). |
+| `MCP_BIND_HOST` | `127.0.0.1` in shared mode (`0.0.0.0` otherwise) | Address to listen on. Shared mode holds every trip's key, so it listens on loopback until told otherwise; whatever is placed in front of it decides who may reach it. **A trip's own container calls this bridge too (below), so on a deployment where trips run in containers it has to listen on an address those containers can reach**, and whatever is in front of it should admit those containers and the companion host only. |
+| `MCP_TRIP_TIMEOUT_MS` | `120000` | How long one call to a trip site may take before it is abandoned (`ETIMEDOUT`), so one slow trip cannot hold the process. Not applied to a call that carries its own timeout (`/health` keeps its 5 s). |
+| `MCP_EXTRACT_CONCURRENCY` | `2` | At most this many `/extract` and `/enrich` jobs run at once; the rest wait their turn, first in first out. |
+| `MCP_PORT`, `HERMES_EXTRACT_PROFILE`, `HERMES_BIN` | as above | Unchanged. |
+
+### The route file
+
+One file per trip, `<MCP_ROUTES_DIR>/<slug>.json`, mode `0600`:
+
+```json
+{ "schema_version": 1, "trip": "<slug>", "api_base_url": "http://<host>:<port>",
+  "public_url": "https://<host>", "trip_api_key": "<key>", "token_sha256": "<64 hex>" }
+```
+
+- `api_base_url` is where this process reaches the trip site; `public_url` is
+  optional and is used only as that trip's fallback. Both are plain `http(s)`
+  origins: no credentials, path, query or fragment.
+- `trip_api_key` is the trip site's agent key, `[A-Za-z0-9._~+/=-]`, 16 to 256
+  characters. `token_sha256` is the SHA-256 of the companion's token — only the
+  hash is stored, so reading the directory does not let anyone speak as a
+  companion. Compare with `printf %s "$TOKEN" | sha256sum`.
+- A file is **ignored**, with one log line naming the file and the reason and
+  never its contents, when it is a symlink, is accessible to group or others
+  (any `0o077` bit), is not valid JSON, has an unknown `schema_version`, a
+  `trip` that differs from its file name, an `api_base_url` or `public_url`
+  that is not a plain origin, or a `trip_api_key` / `token_sha256` of the wrong
+  shape. Two files with the same `token_sha256` are **both** ignored. An
+  ignored trip is a 401, never a guess.
+- File names ending in anything but `.json`, and names starting with `.`, are
+  not read: write a route as `.<slug>.json.tmp` and `mv` it into place, so the
+  server never sees half a file.
+
+### Adding and removing a trip
+
+Write (or atomically replace) `<slug>.json`; it takes effect within 2 seconds,
+with no restart. Delete the file to remove the trip. Deleting a file, or
+replacing its `token_sha256` (or any other field), also **closes that trip's
+open sessions** within 2 seconds; a client that reconnects is judged afresh. A
+re-written file with identical contents disturbs nothing.
+`scripts/companion-install-host.sh` writes the file and the profile entry when
+the host is set up for shared mode (`KINERARY_SHARED_BRIDGE_ROUTES_DIR` and
+`KINERARY_SHARED_BRIDGE_URL`); teardown is specified to delete it (spec AC-R2.8).
+
+### Endpoints in shared mode
+
+| | |
+|---|---|
+| `GET /sse`, `POST /messages` | As before, with the trip's token as `X-API-Key` (or `Authorization: Bearer`, or `?key=`). A `/messages` POST that carries a token must carry its own session's. |
+| `GET /health` | Behind the token, or the trip site's own key (as `/extract` and `/enrich`), today's body shapes, for that trip only. A key two routes share names no trip and is refused. |
+| `GET /ready` | **No key.** `{ "ok": true }` and nothing else: the process is up. Exists only in shared mode, for a supervisor that holds no token. |
+| `POST /extract`, `POST /enrich` | Accept either a companion's token or the trip site's own key, and run as that trip. |
+
+### The trip site calls the bridge too
+
+The companion's connection (`/sse`) is one direction. The other goes **from the trip's
+container to the bridge**: the trip site calls `${EXTRACTION_SERVICE_URL || HERMES_URL}/extract`
+(booking extraction) and `${HERMES_URL}/enrich` (enrichment, reviews) with its own key
+(`HERMES_API_KEY`), and the bridge resolves the trip from that key. Those three calls, `/extract`,
+`/enrich` and `/health`, are what a trip makes. A per-trip bridge listens on `3000 + vmid`; a shared
+bridge starts no such listener, so a site still pointed at one fails every extraction and
+enrichment call, and nothing in any conversation says why.
+
+- **A new trip.** The worker is told the bridge's address as a container reaches it
+  (`TRIP_MCP_SHARED_SITE_URL`, required with `TRIP_MCP_BRIDGE=shared`), writes it into the trip's
+  `.env` as `HERMES_URL`, and, once the trip is wired, runs a check **inside the container**: the
+  site's own `GET <HERMES_URL>/health` with its own key (read inside the container, handed to curl on
+  stdin, on no command line). One request shows that the container reaches the bridge, that the bridge
+  recognises the key as that trip's, and that the bridge reaches the site. It is recorded as the
+  `site_to_bridge` verification row, and a failure is logged as an error. `scripts/companion-install-host.sh`
+  wires the companion side only and says so; it has no access to the container.
+- **An existing trip** keeps whatever `HERMES_URL` it has (the worker only writes a new `.env`), which
+  is normally its old per-trip bridge port. Moving it is a cutover, per trip and with approval (a
+  deploy): rewrite `HERMES_URL` in the trip's `.env` to the shared bridge's address, restart the trip's
+  server, then from inside the container ask `GET <HERMES_URL>/health` with the site's key and expect
+  `{"ok":true,"site":"reachable"}`. Until then that trip's extraction and enrichment keep calling the
+  per-trip port. (If a trip's `.env` also sets `EXTRACTION_SERVICE_URL`, that wins for `/extract`
+  and has to be moved too; the worker's check reads `HERMES_URL` only.)
+- **Binding beyond loopback** (`MCP_BIND_HOST`) makes `/ready`, which needs no key, reachable from the
+  LAN. It answers `{"ok":true}` and nothing else; every other route wants a token or a site key.
+  `tests/mcp-shared-bridge.test.js` pins both with the bridge bound to `0.0.0.0`.
+- `KINERARY_SHARED_BRIDGE_URL` (the companion host's own view of the bridge) must stay loopback; the
+  address containers use is a different variable, `TRIP_MCP_SHARED_SITE_URL`, on the worker.
+
+### Operating it
+
+- **It must be supervised** (LaunchAgent, systemd, or a compose service with a
+  restart policy). One process is one point of failure for every companion:
+  the platform restarts it, and a monitor should watch `/ready`.
+- It never serves `provision.js` and must not share a process or port with it.
+- Logs name a trip by its slug only. An address, a key or a token is never
+  logged; errors from a trip site are reduced to their error code.
+
 ## Stop tools — changing the trip's structure after the interview
 
 A trip's *stops* — the places it is made of, with their nights and where the

@@ -112,6 +112,8 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "20261107120000_main_telegram_and_secondary_organizers.sql",
       "20261114120000_feature_switches.sql",
       "20261114130000_trip_rollouts.sql",
+      "20261116120000_runtime_route_hosts.sql",
+      "20261116140000_runtime_route_trip_key.sql",
       "20261117090000_trip_audience_outbox.sql",
       "20261117120000_owner_access_backfill.sql",
     ]);
@@ -206,6 +208,8 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "20261107120000_main_telegram_and_secondary_organizers.sql",
       "20261114120000_feature_switches.sql",
       "20261114130000_trip_rollouts.sql",
+      "20261116120000_runtime_route_hosts.sql",
+      "20261116140000_runtime_route_trip_key.sql",
       "20261117090000_trip_audience_outbox.sql",
       "20261117120000_owner_access_backfill.sql",
     ]);
@@ -675,6 +679,71 @@ test("20261114130000 backfills a trip's release from its latest executed provisi
       /already closed/);
     await assert.rejects(client.query("DELETE FROM control_plane.trip_rollouts WHERE id = 'rollout_aaaaaaaa'"), /never deleted/);
     await insert("rollout_bbbbbbbb"); // the previous one is closed, so the trip may run another
+  } finally {
+    await reset(client);
+    client.release();
+    await pool.end();
+  }
+});
+
+test("20261116120000 adds nullable public_host and upstream_url; a row from before behaves as today; the name is a lowercase DNS name, unique", { skip: !databaseUrl }, async () => {
+  const pool = testPool();
+  const client = await pool.connect();
+  try {
+    await reset(client);
+    assert.ok((await applyMigrations(client, migrationsDir)).includes("20261116120000_runtime_route_hosts.sql"));
+    // Un-apply it, so the row below is what a route looked like BEFORE the columns existed.
+    await client.query("DROP INDEX control_plane.runtime_routes_public_host_key");
+    await client.query("ALTER TABLE control_plane.runtime_routes DROP CONSTRAINT runtime_routes_public_host_dns, DROP COLUMN public_host, DROP COLUMN upstream_url");
+    await client.query("DELETE FROM public.control_plane_schema_migrations WHERE version = '20261116120000_runtime_route_hosts.sql'");
+    const trip = (n: number) => `trip_${String(n).repeat(32)}`;
+    for (const n of [1, 2, 3]) await client.query("INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ($1,$2,'ready_private')", [trip(n), `route-host-${n}`]);
+    await client.query("INSERT INTO control_plane.runtime_routes(trip_id, route_ref, state) VALUES ($1,'route_beforehosts1','ready')", [trip(1)]);
+
+    assert.deepEqual(await applyMigrations(client, migrationsDir), ["20261116120000_runtime_route_hosts.sql"]);
+    const earlier = await client.query("SELECT route_ref, state, public_host, upstream_url FROM control_plane.runtime_routes WHERE trip_id = $1", [trip(1)]);
+    assert.deepEqual(earlier.rows, [{ route_ref: "route_beforehosts1", state: "ready", public_host: null, upstream_url: null }], "an old row is untouched and has no host route");
+
+    const insert = (n: number, host: string | null) => client.query(
+      "INSERT INTO control_plane.runtime_routes(trip_id, route_ref, state, public_host, upstream_url) VALUES ($1,$2,'ready',$3,'http://192.0.2.10:8080')", [trip(n), `route_hostcase000${n}`, host]);
+    await insert(2, null); // many rows may have no host
+    await client.query("DELETE FROM control_plane.runtime_routes WHERE trip_id = $1", [trip(2)]);
+    for (const bad of ["Mixed.example.test", "under_score.example.test", "single", "-lead.example.test", "trail-.example.test", "a..example.test", "a.example.test.", `${"x".repeat(64)}.example.test`, "has space.example.test", ""]) {
+      await assert.rejects(insert(2, bad), /runtime_routes_public_host_dns/, `refuses ${JSON.stringify(bad)}`);
+    }
+    await insert(2, "alpha.example.test");
+    await assert.rejects(insert(3, "alpha.example.test"), /runtime_routes_public_host_key/, "one name, one trip");
+    await insert(3, "beta.example.test");
+  } finally {
+    await reset(client);
+    client.release();
+    await pool.end();
+  }
+});
+
+test("20261116140000 adds runtime_routes.trip_key: a route from before holds the shared key, and only shared or derived is accepted", { skip: !databaseUrl }, async () => {
+  const pool = testPool();
+  const client = await pool.connect();
+  try {
+    await reset(client);
+    assert.ok((await applyMigrations(client, migrationsDir)).includes("20261116140000_runtime_route_trip_key.sql"));
+    // Un-apply it, so the row below is what a route looked like BEFORE the column existed.
+    await client.query("ALTER TABLE control_plane.runtime_routes DROP COLUMN trip_key");
+    await client.query("DELETE FROM public.control_plane_schema_migrations WHERE version = '20261116140000_runtime_route_trip_key.sql'");
+    const trip = (n: number) => `trip_${String(n).repeat(32)}`;
+    for (const n of [1, 2]) await client.query("INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ($1,$2,'ready_private')", [trip(n), `route-key-${n}`]);
+    await client.query("INSERT INTO control_plane.runtime_routes(trip_id, route_ref, state) VALUES ($1,'route_beforekeys001','ready')", [trip(1)]);
+
+    assert.deepEqual(await applyMigrations(client, migrationsDir), ["20261116140000_runtime_route_trip_key.sql"]);
+    const earlier = await client.query("SELECT route_ref, state, trip_key FROM control_plane.runtime_routes WHERE trip_id = $1", [trip(1)]);
+    assert.deepEqual(earlier.rows, [{ route_ref: "route_beforekeys001", state: "ready", trip_key: "shared" }], "every route that exists holds the shared key");
+    // An older worker's INSERT, which does not name the column, still works and lands on the default.
+    await client.query("INSERT INTO control_plane.runtime_routes(trip_id, route_ref, state) VALUES ($1,'route_olderworker01','ready')", [trip(2)]);
+    assert.equal((await client.query("SELECT trip_key FROM control_plane.runtime_routes WHERE trip_id = $1", [trip(2)])).rows[0].trip_key, "shared");
+    await client.query("UPDATE control_plane.runtime_routes SET trip_key = 'derived' WHERE trip_id = $1", [trip(2)]);
+    for (const bad of ["legacy", "", "SHARED"]) {
+      await assert.rejects(client.query("UPDATE control_plane.runtime_routes SET trip_key = $2 WHERE trip_id = $1", [trip(2), bad]), /runtime_routes_trip_key_check/);
+    }
   } finally {
     await reset(client);
     client.release();
