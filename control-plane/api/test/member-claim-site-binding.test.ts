@@ -189,7 +189,7 @@ describe("every way a claim ends takes the site binding with it, so another acco
       const gone = await launch(c.app, initDataFor(c.person, { tripId: c.tripId }));
       assert.equal(gone.statusCode, 401, "the person is turned away as ever; a site outage costs the launch nothing");
       assert.equal(h.siteBindings.get(keyOf(c.tripId, "dl17")), c.userId, "the leftover is still on the site");
-      assert.ok(h.logs.some((line) => line.includes("member_claim.site_release_failed")), "and it is said, by kind only");
+      assert.ok(h.logs.some((line) => line.includes("site_release.pending")), "and it is said, by reason only (the release is now durable: site-release-outbox.test.ts)");
       assert.ok(!h.logs.join("\n").includes(c.userId));
       const newUser = await reclaim(c);
       assert.notEqual(newUser, c.userId);

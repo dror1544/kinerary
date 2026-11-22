@@ -3,6 +3,7 @@ import { createNotificationAdapter } from "./adapters/notification.js";
 import { loadArchitectureProfile, validateBeforeProvider } from "./config.js";
 import { createDatabasePool, databaseReadiness } from "./database.js";
 import { dispatchPendingTripNotifications } from "./outbox-dispatcher.js";
+import { startSiteReleasePass } from "./site-release-outbox.js";
 import { startPlanChangePoller } from "./plan-change-poller.js";
 import { telegramApiRoot } from "./relay/telegram-api.js";
 import { createBotUsernameResolver } from "./bot-username.js";
@@ -388,6 +389,14 @@ if (outboxNotification && outboxBotToken) {
       reason: "no web profile with runtime_exchange_key_secret_ref: the group line cannot reach any trip site",
     })}\n`);
   }
+}
+
+// Retries the trip-site releases the portal recorded and could not deliver (site-release-outbox.ts): a removed member's binding
+// on the trip site, which is what ends their assistant's grants there. Needs only the portal (the trip site's door) and the pool,
+// so it runs whether or not Telegram is configured; its rows are claimed with SKIP LOCKED, so a second API process is safe.
+// Where there is no portal block there is no way in to release, and no row is ever written by the portal either.
+if (portal) {
+  startSiteReleasePass({ db: pool, releaser: portal.runtimeAccounts, log: (line) => process.stderr.write(`${line}\n`) });
 }
 
 // Reclaims jobs whose worker died mid-run. `claimJob` sets a 900s lease

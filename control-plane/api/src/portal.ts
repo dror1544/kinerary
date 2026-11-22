@@ -32,6 +32,7 @@ import {
 import { verifyMiniAppInitData, type VerifiedInitData } from "./telegram-webapp-auth.js";
 import { runtimeUpstreamFor } from "./runtime-upstream.js";
 import { applyLinkPassword, attachSession, claimGateVerdict, consumeSignInLink, endClaimLeftGroup, peekClaimLink, purgeSignInLinkLeftovers, signInLinkAvailable, startSignInLink, warnOncePerMinute, type SignInLinkRequest } from "./sign-in-link.js";
+import { SiteReleaseError, attemptSiteRelease, compensateSiteBinding, type SiteReleaseOptions } from "./site-release-outbox.js";
 
 // The gateway's key, compared in constant time (a plain !== leaks how many
 // leading bytes were right).
@@ -361,7 +362,12 @@ export class HttpRuntimeAccountAdapter implements RuntimeAccountAdapter {
 
   async releaseParticipant(input: { tripId: string; userId: string; runtimeUsername: string; inviteId?: string }): Promise<void> {
     const response = await this.binding("release", input);
-    if (!response.ok) throw new Error("RUNTIME_PARTICIPANT_RELEASE_FAILED");
+    // The status travels with the failure (SiteReleaseError): the durable retry (site-release-outbox.ts) gives up on a 400/403/404 that
+    // can never succeed and keeps retrying everything else. A 200 counts only when it is the site's own answer, `{ok:true, released}`
+    // ("nothing to release" is `released:false` and is success); anything else on a 200 (a proxy's page, an empty body) is not an answer.
+    if (!response.ok) throw new SiteReleaseError(response.status);
+    const answer = (await response.json().catch(() => null)) as { ok?: unknown } | null;
+    if (!answer || answer.ok !== true) throw new SiteReleaseError(null);
   }
 
   async provisionParticipant(input: Parameters<RuntimeAccountAdapter["provisionParticipant"]>[0]): Promise<void> {
@@ -1331,20 +1337,22 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     : undefined;
   /**
    * Ends the trip site's binding of travellers whose claims just ended, AFTER the control-plane transaction that ended
-   * them has committed (a rolled-back release must unbind nobody). BEST EFFORT, and safe to miss: the control plane's
-   * own rows are the authority and are already final (membership revoked, link revoked, sessions ended, launch grants
-   * spent), so the old account can get no new grant and the gateway's liveness check refuses what it holds; the next
-   * claim of the same traveller REPLACES a leftover binding (the site's adopt does), so a release that never arrived
-   * can never leave a participant stuck on IDENTITY_CONFLICT. A failure is logged by kind only, no id.
+   * them has committed (a rolled-back release must unbind nobody). The control plane's own rows are the authority and are
+   * already final (membership revoked, link revoked, sessions ended, launch grants spent), so the old account can get no new
+   * grant and the gateway's liveness check refuses what it holds. What the site still holds until it hears is the binding,
+   * and with it the removed person's assistant (MCP) grants and any site token already issued, so the release is DURABLE
+   * (site-release-outbox.ts): the database recorded it in the transaction that ended the claim, this is the prompt attempt
+   * (success marks it done; any failure leaves it pending and says so once, by reason only), and a background pass retries
+   * until the site confirms. A request that triggered it never fails for the site's sake. No id is logged.
    */
+  const siteRelease: SiteReleaseOptions = { db: deps.db, releaser: deps.runtimeAccounts, log: miniAppLog };
   const releaseSiteBindings = async (released: readonly ReleasedClaim[]): Promise<void> => {
     for (const claim of released) {
       // The audit trail (the reason only: no trip, person, traveller, invite or chat id). A removed INVITE member's binding is not a group
       // claim ending, and must not read as one: it has its own event.
       if (claim.inviteId) miniAppLog(structuredLog("info", "member_invite.binding_released", { reason: claim.reason ?? "unknown" }));
       else miniAppLog(structuredLog("info", "mini_app.group_claim", { outcome: "ended", reason: claim.reason ?? "unknown" }));
-      try { await deps.runtimeAccounts.releaseParticipant(claim); }
-      catch { miniAppLog(structuredLog("warn", "member_claim.site_release_failed", {})); }
+      await attemptSiteRelease(siteRelease, claim);
     }
   };
   /**
@@ -1581,7 +1589,7 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
       return { kind: "session", appPath: result.target.appPath };
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
-      if (siteBound && !committed) await releaseSiteBindings([siteBound]);
+      if (siteBound && !committed) await compensateSiteBinding(siteRelease, siteBound);
       // The one error a concurrent claim may legitimately raise past the locks: the unique index said "taken".
       if ((error as { code?: string } | null)?.code === "23505") return reply.code(409).send({ error: "ALREADY_CLAIMED" });
       // Anything else (a failed COMMIT included) is answered with a body that says nothing: the database's own message
