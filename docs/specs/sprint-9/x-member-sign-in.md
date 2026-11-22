@@ -374,6 +374,34 @@ contradicts the text above, the amendment wins.
 - **A12: personal invites are not gated by `member_group_sign_in`** (D1: the invite is a full
   way in for people not on Telegram).
 
+## Amendments (Dror, 2026-11-22, after the reviews of S2 and S3)
+
+- **A13: a secondary organizer's session cannot set a trip-site password or link Google**, the
+  same rule as A2 and A9. A removed secondary organizer could otherwise still log in on the
+  trip's own hostname and read the trip at member level. The owner's session and plain
+  organizer logins are unchanged.
+- **A14: an invited session sees and manages only the assistant connections it approved.**
+  The traveller's own login still sees and can disconnect every connection under their name.
+- **A15: an invited session gets the same restricted view of the traveller's record as a
+  claimed session:** no Google identity, no Telegram id.
+- **A16: a new sign-in-link request does not cancel an earlier link that is still valid.**
+  Otherwise anyone who knows a traveller's name or address can keep killing the link the
+  traveller just asked for.
+- **A17: S3 stays narrow.**
+  - Telegram delivery reaches accounts made by a group claim or holding a Telegram identity.
+  - Email delivery reaches accounts holding a Google identity, at the address typed in the
+    request.
+  - A member who joined by invite or trip password and has neither gets nothing from S3. A
+    member with a password email already has the existing forgot-password route.
+  - Organizers are never sent a link.
+- **A18: S3 ships behind its own switch, `member_sign_in_link`.**
+  - The trip-plus-name door needs it on for that trip.
+  - The email door and the "Send me a sign-in link" control need it on for every trip.
+  - A group claimant's link is also held to A3 and A4.
+- **A19: deploying A9 and A13 changes behaviour for people who are already invited or already
+  secondary organizers.** They can no longer set or change a trip-site password or link Google.
+  Passwords and assistant connections made before the deploy are not touched.
+
 ## Open questions (answered, kept for the record)
 
 Answered in Decisions D1–D4 above.
