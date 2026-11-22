@@ -67,6 +67,7 @@ import {
 import { redeemTelegramLinkToken, telegramLinkTokenFromStartPayload } from "../telegram-link-token.js";
 import { bindSecondaryOrganizerChat, redeemSecondaryOrganizerToken, secondaryOrganizerTokenFromStartPayload } from "../secondary-organizers.js";
 import { isAddressedToAssistant } from "./addressing.js";
+import { handleInvite, inviteInGroupReply, inviteOrganizerFor, inviteUnconfiguredReply, isForwardedMessage, type SiteInviteDeps } from "./invite-command.js";
 import { addressedMark, conversationMark, reactionAnswerMark } from "./stay-silent.js";
 import type { GroupJudge, JudgeOutcome } from "./group-judge.js";
 import { classifyTrigger, inboundFacts, type InboundFacts, type JudgeFacts, type LevelChangeFacts } from "../analytics/relay-facts.js";
@@ -520,6 +521,12 @@ export interface DispatchOptions {
    * the call; the judge is never asked twice.
    */
   judgedOutcome?: JudgeOutcome | null;
+  /**
+   * What `/invite <traveller>` needs to make a personal invite (relay/invite-command.ts): the trip site's participant list and the
+   * origin the join link is built on. Absent, an organizer who types `/invite` is told it is not available, and the relay logs
+   * `trip_bot.invite_command_unconfigured`; nobody else is affected.
+   */
+  siteInvites?: SiteInviteDeps;
 }
 
 /**
@@ -1187,6 +1194,41 @@ export async function dispatchUpdate(
       followUp: groupBindingCommand(issued.token),
       pin: false,
     };
+  }
+
+  // `/invite <traveller>`: an organizer asks, in their OWN private chat, for a traveller's personal invite (x-member-sign-in S2b;
+  // relay/invite-command.ts has the whole contract). Who and where come from the update and the database, never from the text:
+  //   - only a FRESH, plain, unforwarded text message acts (an edit, a forward and a caption are not a command: the link is a credential
+  //     and a replayed or relayed line must not mint one);
+  //   - a group, whoever types, gets one short sentence (the same for everyone in it, so it says nothing about who may);
+  //   - in a private chat only the verified organizer of the chat's own trip, with dashboard access, is answered here;
+  //   - everybody else falls through, untouched, to the answer any unknown command gets: asking confirms nothing.
+  // Deliberately not behind `member_group_sign_in`: the invite is a way in for people who are not on Telegram at all (decision D1).
+  if (
+    parsed.kind === "command" &&
+    parsed.name === "invite" &&
+    update.message === message &&
+    typeof message.text === "string" &&
+    !isForwardedMessage(message)
+  ) {
+    const route = await resolveChatRoute(db, chatId);
+    if (route.kind === "companion") {
+      if (message.chat?.type !== "private") {
+        log(structuredLog("info", "trip_bot.invite_command", { outcome: "in_group" }));
+        return { kind: "reply", reply: inviteInGroupReply(chatId, await tripLanguage(db, route.tripId)) };
+      }
+      const senderId = message.from?.id === undefined ? null : String(message.from.id);
+      const organizerUserId = senderId !== null && senderId === chatId ? await inviteOrganizerFor(db, route.tripId, senderId) : null;
+      if (organizerUserId) {
+        const language = await resolveChatLanguage(db, chatId, message.from?.language_code);
+        if (!options.siteInvites) {
+          return { kind: "reply", reply: inviteUnconfiguredReply(chatId, language, log) };
+        }
+        const replies = await handleInvite(db, options.siteInvites, { chatId, tripId: route.tripId, organizerUserId, argument: parsed.argument, language }, log);
+        return replies.length === 1 ? { kind: "reply", reply: replies[0]! } : { kind: "multi_reply", replies };
+      }
+      log(structuredLog("info", "trip_bot.invite_command", { outcome: "not_organizer" }));
+    }
   }
 
   // "Which trips are mine, and which one is this chat on?" — the two questions
