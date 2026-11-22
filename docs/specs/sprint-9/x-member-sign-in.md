@@ -417,6 +417,26 @@ contradicts the text above, the amendment wins.
 - **A22: the email door of S3 honours a per-trip off.** Nothing is sent to an account that
   holds a member seat on a trip where `member_sign_in_link` is off.
 
+## Rollout decisions (Dror, 2026-11-23)
+
+- **A23: trip sites are redeployed before the control plane.**
+  - A new trip site with an old control plane is fully compatible.
+  - The reverse keeps "invite a traveller" working through a fallback, but a person invited on
+    a not-yet-redeployed site can still set a site password and approve an assistant
+    connection there, and both survive removal.
+- **A24: this rollout is asked step by step**, not under standing approval: the payload
+  rollout to each live trip, the VM upgrade, and every switch-on at `ready_private` or later.
+  It widens who can open a trip and changes credentials for people already on live trips.
+- **A25: switching `member_sign_in_link` off does not cancel links already sent.** They work
+  for their 30 minutes. A group claimant's link still follows A4. The registry note that says
+  switching off "closes the path" is to be corrected to say so.
+- **A26: assistant connections and trip-site passwords made before a trip's redeploy are not
+  touched** (A19). An older connection carries no record of who approved it, so it cannot be
+  attributed to the invited person without risking the traveller's own. The organizer or the
+  traveller can disconnect one by hand.
+- **A27: the "wip" commits are squashed at merge.** The branch's pushed history is not
+  rewritten.
+
 ## Open questions (answered, kept for the record)
 
 Answered in Decisions D1–D4 above.
