@@ -537,3 +537,57 @@ test('an invite-bound session\'s /api/auth/me is the allow-listed view: no Googl
   assert.equal(own.some_future_private_note, 'for bob only');
   assert.equal((await release(PL, 'bob', INVL)).status, 200);
 });
+
+// ── the SAME account under a different invite (the half of the match a different-account test cannot reach) ──────────────
+
+const PS = 'user_invitedpersons1', INVS1 = 'invite_invitecredss01', INVS2 = 'invite_invitecredss02';
+
+test('the same account bound under invite B sees and ends only B\'s connections: a grant still recorded under its OLD invite A is not found', async () => {
+  const require = createRequire(import.meta.url);
+  const Database = require('../server/node_modules/better-sqlite3');
+  // A: bound, approves, released (the release revokes GA, as it must)
+  assert.equal((await provision(PS, 'bob', INVS1)).status, 200);
+  await connect(await exchange(PS, 'bob'));
+  assert.equal((await (await release(PS, 'bob', INVS1)).json()).released, true);
+  // B: the same account, a new invite, its own connection
+  assert.equal((await provision(PS, 'bob', INVS2)).status, 200);
+  const sToken = await exchange(PS, 'bob');
+  const gb = await connect(sToken);
+  // A live grant still carrying the OLD invite (what a release that never arrived would have left): seeded directly, as a
+  // reviewer would. Same account, same username; only the invite id differs from the session's binding.
+  const sqlite = new Database(join(dirname(testTripDir()), 'trip.db'));
+  try {
+    sqlite.prepare("INSERT INTO mcp_oauth_grants (id, client_id, username, created_at, scope, binding_user_id, binding_invite_id) VALUES ('grant_seeded_old_invite', 'mcp_none', 'bob', ?, 'trip:read', ?, ?)").run(Math.floor(Date.now() / 1000), PS, INVS1);
+  } finally { sqlite.close(); }
+  const list = await (await api('/api/mcp/connection', { token: sToken })).json();
+  assert.equal(list.connections.length, 1, 'the session under B lists one connection');
+  assert.equal(list.connections.some(c => c.id === 'grant_seeded_old_invite'), false, 'and not the one recorded under invite A');
+  const del = await api('/api/mcp/connections/grant_seeded_old_invite', { method: 'DELETE', token: sToken });
+  assert.equal(del.status, 404, 'deleting the A-bound grant is not-found');
+  assert.deepEqual(await del.json(), { error: 'not_found' });
+  assert.equal(bindingColumns().some(g => g.binding_invite_id === INVS1 && g.revoked_at === null), true, 'and it was not revoked');
+  assert.equal((await mcp(gb.tokens.access_token)).status, 200);
+  // B's own connection is the one it can end
+  assert.equal((await api(`/api/mcp/connections/${list.connections[0].id}`, { method: 'DELETE', token: sToken })).status, 200);
+  assert.equal((await release(PS, 'bob', INVS2)).status, 200);
+});
+
+test('the connection list never carries the binding columns, for any kind of session', async () => {
+  assert.equal((await provision(PS, 'eve', INVS1)).status, 200);
+  const sToken = await exchange(PS, 'eve');
+  await connect(sToken);
+  const tokens = {
+    'invite-bound': sToken,
+    'the real traveller (plain login)': await loginToken('eve', '1234'),
+    'plain organizer': await loginToken('alice', '1234'),
+    'owner-managed': await exchange(ownerId, null, 'owner'),
+    'secondary organizer': await exchange(SECONDARY, null, 'organizer'),
+  };
+  for (const [who, token] of Object.entries(tokens)) {
+    const r = await api('/api/mcp/connection', { token });
+    assert.equal(r.status, 200, who);
+    const text = JSON.stringify(await r.json());
+    for (const leaked of ['binding_user_id', 'binding_invite_id', 'binding_', PS, INVS1]) assert.equal(text.includes(leaked), false, `${who}: ${leaked}`);
+  }
+  assert.equal((await release(PS, 'eve', INVS1)).status, 200);
+});

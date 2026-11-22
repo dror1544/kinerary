@@ -195,3 +195,37 @@ test('Google disconnect: a refusal leaves the link in place and shows the error 
   assert.equal(s.ctx.currentUser.google_picture, null);
   assert.deepEqual(s.calls, { save: 1, updateUi: 1, showLoggedIn: 1 });
 });
+
+// ── the order must not matter: initGoogleAuth is not awaited, and /api/health can be slow ──────────────────────────────────
+
+test('a managed session opens the avatar screen BEFORE initGoogleAuth resolves: the Google block never appears, and no Google-link request can be made from it', async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const s = screen({
+    realUi: true,
+    google: { accounts: { id: { initialize() {}, renderButton() {} } } },
+    fetch: async () => { await gate; return { json: async () => ({ googleClientId: 'client-id' }) }; },
+  });
+  const init = vm.runInContext('initGoogleAuth()', s.ctx);           // started at page load, not awaited
+  s.ctx.currentUser = { username: 'eve', sign_in_managed: true };
+  vm.runInContext('_applySignInManagedUI(); _updateGoogleConnectUI();', s.ctx); // the avatar screen opens first
+  assert.equal(s.$('avatar-lb-google-wrap').style.display, 'none');
+  release();
+  await init;                                                          // /api/health answers late
+  assert.equal(s.$('avatar-lb-google-wrap').style.display, 'none', 'the late initGoogleAuth must not show the block to a managed session');
+  assert.equal(s.$('avatar-lb-pw-toggle').style.display, 'none');
+  // the Google button lives inside the hidden block, so there is nothing visible to click that sends PUT /api/auth/google-link
+  let el = s.$('avatar-lb-google-btn'), hidden = false;
+  while (el) { if (el.style && el.style.display === 'none') hidden = true; el = el.parentElement; }
+  assert.equal(hidden, true, 'the Google button has a hidden ancestor');
+  // and when the same page then serves a plain user, the block is there (Google IS configured)
+  s.ctx.currentUser = { username: 'eve', google_email: 'eve@example.test' };
+  vm.runInContext('_applySignInManagedUI()', s.ctx);
+  assert.equal(s.$('avatar-lb-google-wrap').style.display, 'flex');
+});
+
+test('the other order (initGoogleAuth first, then the managed screen) hides it too', async () => {
+  const p = await pageWith({ googleConfigured: true });
+  p.as({ username: 'eve', sign_in_managed: true });
+  assert.equal(p.state().googleBlock, false);
+});

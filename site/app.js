@@ -886,12 +886,15 @@ async function initGoogleAuth() {
 
   const googleWrap = document.getElementById('avatar-lb-google-wrap');
   if (googleWrap) {
-    googleWrap.style.display = 'flex';
-    googleWrap.dataset.googleOffered = 'true'; // _applySignInManagedUI may hide the block for a managed session, and restores it from this
+    // Record that Google is offered on this page, and let _applySignInManagedUI decide whether THIS session sees the block: this
+    // function is not awaited and /api/health can be slow, so a managed session may already have opened the avatar screen (and had
+    // the block hidden) by the time it gets here. Showing the block unconditionally would put "Continue with Google" back in
+    // front of a session the site refuses to link.
+    googleWrap.dataset.googleOffered = 'true';
     google.accounts.id.renderButton(document.getElementById('avatar-lb-google-btn'), {
       type: 'standard', theme: 'outline', size: 'medium', text: 'continue_with', width: 220,
     });
-    _updateGoogleConnectUI();
+    _applySignInManagedUI(); // shows the block (and refreshes it) for a session that is not sign_in_managed; hides it for one that is
   }
 }
 
