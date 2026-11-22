@@ -402,6 +402,21 @@ contradicts the text above, the amendment wins.
   secondary organizers.** They can no longer set or change a trip-site password or link Google.
   Passwords and assistant connections made before the deploy are not touched.
 
+- **A20: `/invite` is a recorded exception to "a site invite needs a real sign-in".**
+  - The portal refuses to let a Telegram-minted session create a site invite, because the
+    invite makes an account that outlives that session. `/invite` proves the organizer the
+    same way, by their Telegram account, and does create one.
+  - Accepted, and bounded: private chat only, an organizer with dashboard access, existing
+    travellers only, the link delivered only to that chat, and 5 invites an hour per organizer
+    per trip.
+  - What it costs: whoever holds the organizer's Telegram account can create a way in as a
+    traveller, until the organizer's Telegram is unlinked.
+- **A21: the trip-site release is durable.** When a member is removed and the trip site cannot
+  be told at that moment, the release is retried until it lands. Otherwise a removed person's
+  assistant connection keeps reading the trip until someone else is bound to that traveller.
+- **A22: the email door of S3 honours a per-trip off.** Nothing is sent to an account that
+  holds a member seat on a trip where `member_sign_in_link` is off.
+
 ## Open questions (answered, kept for the record)
 
 Answered in Decisions D1–D4 above.
