@@ -100,7 +100,7 @@ test("Google sign-in is off without web.google_client_id, validates it when set,
   } });
   try {
     const providers = await app.inject({ url: "/v1/auth/capabilities" });
-    assert.deepEqual(providers.json(), { google: false, emailPassword: true, emailSignUp: false, telegramMiniApp: false });
+    assert.deepEqual(providers.json(), { google: false, emailPassword: true, emailSignUp: false, telegramMiniApp: false, signInLink: false });
     const response = await app.inject({ method: "POST", url: "/v1/auth/google", headers: { origin: raw.web.public_origin }, payload: { credential: "x" } });
     assert.equal(response.statusCode, 503);
     assert.deepEqual(response.json(), { error: "GOOGLE_SIGN_IN_UNAVAILABLE" });

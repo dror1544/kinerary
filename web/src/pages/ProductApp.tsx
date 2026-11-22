@@ -72,7 +72,7 @@ function SignIn() {
           {passwordLogin.isError && <Notice>{passwordLogin.error.message}</Notice>}
         </form>}
         {/* A member who cannot get in (docs/specs/sprint-9/x-member-sign-in.md, S3): by name on this trip, or by email. */}
-        <SignInLinkRequest tripId={tripId || undefined} />
+        {capabilities.data?.signInLink === true && <SignInLinkRequest tripId={tripId || undefined} />}
       </main>
     </div>
   );

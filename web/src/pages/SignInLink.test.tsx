@@ -13,7 +13,7 @@ function Probe() { return <output data-testid="route">{useLocation().pathname}</
 
 type Call = { method: string; path: string; body: Record<string, unknown> | null };
 type Handler = (path: string, init?: RequestInit) => Response | undefined;
-function mount(route: string, handler?: Handler, options: { signedIn?: boolean } = {}) {
+function mount(route: string, handler?: Handler, options: { signedIn?: boolean; signInLink?: boolean } = {}) {
   const calls: Call[] = [];
   let signedIn = options.signedIn ?? false;
   vi.stubGlobal("fetch", vi.fn(async (input: unknown, init?: RequestInit) => {
@@ -21,7 +21,7 @@ function mount(route: string, handler?: Handler, options: { signedIn?: boolean }
     calls.push({ method: init?.method || "GET", path, body: typeof init?.body === "string" ? JSON.parse(init.body) : null });
     const custom = handler?.(path, init);
     if (custom) { if (custom.ok && path === "/v1/auth/sign-in-link/redeem") signedIn = true; return custom; }
-    if (path === "/v1/auth/capabilities") return json({ google: false, emailPassword: true, emailSignUp: true });
+    if (path === "/v1/auth/capabilities") return json({ google: false, emailPassword: true, emailSignUp: true, ...(options.signInLink === false ? {} : { signInLink: true }) });
     if (path === "/v1/me") return signedIn ? json({ id: "user_1", displayName: "Dana", scope: "full" }) : json({ error: "AUTHENTICATION_REQUIRED" }, 401);
     if (path === "/v1/trips") return json({ trips: [] });
     return json({ error: "NOT_FOUND" }, 404);
@@ -85,6 +85,13 @@ it("a person on a trip's sign-in can switch to their email, and back", async () 
   expect(requests(calls)[0]!.body).toEqual({ email: "dana@mail.example.test", language: "en" });
 });
 
+it("the control is not drawn at all when capabilities does not say the feature is available (the switch ships off)", async () => {
+  mount(`/sign-in?return_to=/trips/${TRIP}/app`, undefined, { signInLink: false });
+  await screen.findByRole("heading", { name: "Sign in to continue" });
+  await waitFor(() => expect(screen.queryByText("Loading sign-in options…")).toBeNull());
+  expect(screen.queryByRole("button", { name: "Send me a sign-in link" })).toBeNull();
+});
+
 // ── the Mini App's not-linked view ─────────────────────────────────────────
 
 
@@ -92,6 +99,20 @@ const INIT = "query_id=AAH&user=%7B%22id%22%3A1%7D&auth_date=1&hash=abc";
 function telegram() {
   (window as unknown as { Telegram: unknown }).Telegram = { WebApp: { platform: "ios", initData: INIT, initDataUnsafe: {}, ready: vi.fn(), expand: vi.fn() } };
 }
+it("the Mini App's trip-password view does not offer it when the feature is not available", async () => {
+  telegram();
+  try {
+    mount("/mini-app/trips/" + TRIP, (path) => {
+      if (path === "/v1/auth/telegram-mini-app") return json({ error: "TELEGRAM_NOT_LINKED", fallback: "trip_password", tripId: TRIP }, 401);
+      if (path === "/v1/auth/capabilities") return json({ google: false, emailPassword: true });
+      return undefined;
+    });
+    await screen.findByRole("heading", { name: "Sign in to this trip" }, { timeout: 5000 });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(screen.queryByRole("button", { name: "Send me a sign-in link" })).toBeNull();
+  } finally { delete (window as unknown as { Telegram?: unknown }).Telegram; }
+});
+
 it("the Mini App's trip-password view offers it too, by name, for that trip", async () => {
   telegram();
   try {

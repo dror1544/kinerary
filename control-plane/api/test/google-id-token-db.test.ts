@@ -674,13 +674,13 @@ test("a per-IP rate limit answers 429 before any verification", { skip }, async 
 test("capabilities carries google:true and the PUBLIC client id exactly when it is configured", { skip }, async () => {
   const { app } = harness();
   try {
-    assert.deepEqual((await app.inject({ url: "/v1/auth/capabilities" })).json(), { google: true, googleClientId: CLIENT_ID, emailPassword: true, emailSignUp: false, telegramMiniApp: false });
+    assert.deepEqual((await app.inject({ url: "/v1/auth/capabilities" })).json(), { google: true, googleClientId: CLIENT_ID, emailPassword: true, emailSignUp: false, telegramMiniApp: false, signInLink: false });
   } finally { await app.close(); }
   const off = buildApp(profile, { portal: { db: pool, runtimeAccounts: { participantExists: async () => true, provisionParticipant: async () => {} },
     publicOrigin: ORIGIN, runtimeOrigin: "http://runtime.example.test", runtimeExchangeKey: "k", runtimeUpstreamHostSuffixes: ["internal"],
     telegramBotUsername: "kinerary_bot", sessionTtlSeconds: 3600, enrollmentTtlSeconds: 3600, approvalTtlSeconds: 3600 } });
   try {
-    assert.deepEqual((await off.inject({ url: "/v1/auth/capabilities" })).json(), { google: false, emailPassword: true, emailSignUp: false, telegramMiniApp: false });
+    assert.deepEqual((await off.inject({ url: "/v1/auth/capabilities" })).json(), { google: false, emailPassword: true, emailSignUp: false, telegramMiniApp: false, signInLink: false });
   } finally { await off.close(); }
 });
 

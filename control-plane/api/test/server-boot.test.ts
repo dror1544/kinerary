@@ -429,7 +429,7 @@ test("the real portal server boots without Google credentials and advertises ema
   try {
     const response = await fetch(`http://127.0.0.1:${port}/v1/auth/capabilities`);
     assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), { google: false, emailPassword: true, emailSignUp: false, telegramMiniApp: false });
+    assert.deepEqual(await response.json(), { google: false, emailPassword: true, emailSignUp: false, telegramMiniApp: false, signInLink: false });
     const google = await fetch(`http://127.0.0.1:${port}/v1/auth/google`, {
       method: "POST", headers: { "content-type": "application/json", origin: `http://127.0.0.1:${port}` }, body: JSON.stringify({ credential: "x" }),
     });

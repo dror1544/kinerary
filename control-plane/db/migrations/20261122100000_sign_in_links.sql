@@ -1,4 +1,4 @@
--- rollback: compatible — one new table nothing older reads; a link in it opens nothing in the previous release (it has no route that redeems one), so rolling back strands only the links in flight, which expire within 30 minutes
+-- rollback: compatible — two new tables nothing older reads; a link in it opens nothing in the previous release (it has no route that redeems one), so rolling back strands only the links in flight, which expire within 30 minutes
 --
 -- "SEND ME A SIGN-IN LINK" (docs/specs/sprint-9/x-member-sign-in.md, slice S3, AC-14 to AC-16; issue #614).
 --
@@ -25,8 +25,8 @@
 -- what the redemption must honour: the channel, the Telegram link that scopes the session, and the one-shot password
 -- step. Widening the other table to fit would put each concern's constraints on the other.
 --
--- `channel` records where the link was sent, for the per-channel send ceiling (AC-16) and for nothing else: nothing
--- reads it to decide who may redeem.
+-- `channel` records where the link was sent, for nothing but the record: nothing reads it to decide who may redeem. (The
+-- per-channel ceilings of AC-16 do NOT count these rows: see `sign_in_link_requests` below.)
 --
 -- `telegram_link_id` is the `telegram_member_links` row of a GROUP CLAIM (`verified_via = 'mini_app_group_membership'`)
 -- when the account holds one live at the time the link is issued. A session minted from such a link is a SCOPED
@@ -63,3 +63,24 @@ CREATE INDEX sign_in_links_user_idx ON control_plane.sign_in_links (user_id, cre
 CREATE INDEX sign_in_links_channel_idx ON control_plane.sign_in_links (channel, created_at DESC);
 -- The password step finds its link by the session it minted.
 CREATE INDEX sign_in_links_session_idx ON control_plane.sign_in_links (session_id) WHERE session_id IS NOT NULL;
+
+-- THE PER-CHANNEL CEILINGS COUNT REQUESTS, NOT LINKS (AC-16; boundary review of S3, finding 1). If a ceiling counted issued
+-- links, then a person who fills it to one short of full and sends a guess would learn, from whether their OWN link then
+-- arrives, whether the guess qualified for a link (every answer is the same 202, so that was the only tell). So every
+-- admitted request takes one slot in each ceiling it COULD have used, before anything is looked up and whatever it finds:
+-- a name-door request one `telegram` slot; an email-door request one `telegram` and one `email` slot. A request that finds
+-- a ceiling full takes no slot of its own. A row here says only "a request was admitted on this channel's ceiling at this
+-- time": no account, no address, no name, nothing that identifies a request.
+CREATE TABLE control_plane.sign_in_link_requests (
+  channel    text        NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT sign_in_link_requests_channel_check CHECK (channel IN ('telegram', 'email'))
+);
+CREATE INDEX sign_in_link_requests_channel_idx ON control_plane.sign_in_link_requests (channel, created_at DESC);
+
+-- RETENTION. Nothing here is purged by a job: every admitted request purges as it starts, which is cheap and needs no
+-- scheduler. `sign_in_links` rows older than 2 days, `sign_in_link_requests` rows older than 1 hour (the ceilings look back
+-- one minute and the per-account allowance one hour of `sign_in_links`), and any `sign_in_link_notice` outbox row still
+-- pending after the link's 30 minutes (its payload, which holds the token until a dispatcher sends it, and its chat id are
+-- blanked). A deployment that gets no request therefore keeps the rows of its last requests until the next one; a link is
+-- dead after 30 minutes whatever the table holds.

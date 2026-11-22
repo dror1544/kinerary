@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router-dom";
-import { getMe, miniAppClaim, passwordSignIn, safeReturnTo, telegramMiniAppSignIn, type MiniAppSignInResult, type MiniAppTraveller, type MiniAppTrip } from "../api";
+import { getAuthCapabilities, getMe, miniAppClaim, passwordSignIn, safeReturnTo, telegramMiniAppSignIn, type MiniAppSignInResult, type MiniAppTraveller, type MiniAppTrip } from "../api";
 import { ClaimScreen } from "./ClaimScreen";
 import { claimCopy, miniLanguage } from "./claim-copy";
 import { SignInLinkRequest } from "../components/SignInLinkRequest";
@@ -244,6 +244,8 @@ export default function MiniAppSignIn({ sdk, settled, children }: { sdk: MiniSdk
 
 function TripPasswordForm({ tripId, initData, platform, onSignedIn }: { tripId: string; initData: string | null; platform: string | null; onSignedIn: (appPath: string, note: string | null) => void }) {
   const form = useForm<{ runtimeUsername: string; password: string; remember: boolean }>({ defaultValues: { runtimeUsername: "", password: "", remember: false } });
+  // One boolean for the whole deployment ("on at the every-trip level"): it never says which trip has the feature.
+  const capabilities = useQuery({ queryKey: ["auth-capabilities"], queryFn: getAuthCapabilities, retry: false });
   const returnTo = `/mini-app/trips/${tripId}`;
   const signIn = useMutation({
     mutationFn: (values: { runtimeUsername: string; password: string; remember: boolean }) => passwordSignIn({
@@ -270,6 +272,6 @@ function TripPasswordForm({ tripId, initData, platform, onSignedIn }: { tripId: 
       {signIn.isError && <div className="notice" role="alert">{signIn.error.message}</div>}
     </form>
     {/* Outside the form above (a form inside a form is not HTML): a member who forgot the password asks for a link. */}
-    <SignInLinkRequest tripId={tripId} lang={miniLanguage()} />
+    {capabilities.data?.signInLink === true && <SignInLinkRequest tripId={tripId} lang={miniLanguage()} />}
   </>);
 }

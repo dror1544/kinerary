@@ -14,7 +14,6 @@ import { dispatchPendingTripNotifications } from "../src/outbox-dispatcher.js";
 import { digestEmail, hashPassword } from "../src/password-identity.js";
 import { portalMailIdle } from "../src/portal-email-auth.js";
 import { PORTAL_SCOPE_POLICY, scopedSessionDigest } from "../src/portal-scope.js";
-import { SIGN_IN_LINK_ACCOUNT_PER_HOUR, SIGN_IN_LINK_CHANNEL_PER_MINUTE, SIGN_IN_LINK_TTL_SECONDS } from "../src/sign-in-link.js";
 import { GROUP_VERIFIED_VIA } from "../src/telegram-mini-app.js";
 import { ORIGIN, asCookie, cookieOf, id, sha256, startHarness, tg, type Harness, type SitePerson } from "./support/group-sign-in-harness.js";
 import { testDatabaseUrl } from "./support/test-database.js";
@@ -30,7 +29,22 @@ let ipCounter = 0;
 /** A fresh client address per request unless a test is about the per-IP limit: the limiter is in memory, keyed on it. */
 const freshIp = () => `10.${(++ipCounter >> 16) & 255}.${(ipCounter >> 8) & 255}.${ipCounter & 255}`;
 
-before(async () => { if (!skip) h = await startHarness(); });
+before(async () => {
+  if (skip) return;
+  h = await startHarness();
+  // The feature ships OFF; every test below that is not about the switch runs with it on at the "every trip" level (the email door's level).
+  await setSwitch(null, true);
+});
+
+/** `member_sign_in_link` for one trip, or (tripId null) at the "every trip" level. */
+async function setSwitch(tripId: string | null, on: boolean) {
+  await h.pool.query("DELETE FROM control_plane.feature_switch_settings WHERE switch = 'member_sign_in_link' AND scope = $1 AND trip_id IS NOT DISTINCT FROM $2", [tripId ? "trip" : "all_trips", tripId]);
+  await h.pool.query(
+    "INSERT INTO control_plane.feature_switch_settings(switch, scope, trip_id, enabled, changed_by) VALUES ('member_sign_in_link', $1, $2, $3, $4)",
+    [tripId ? "trip" : "all_trips", tripId, on, `sha256:${"0".repeat(64)}`]);
+}
+/** The group a trip's claims are checked against: tripId -> its open group chat. */
+const groupOf = new Map<string, string>();
 after(async () => { if (!skip) { await portalMailIdle(); await h.stop(); } });
 beforeEach(() => { mailer = new LogMailer({ log: () => {} }); logs = []; });
 
@@ -76,6 +90,10 @@ async function mkTrip() {
   const owner = await h.mkUser("Owner");
   await h.mkMember(tripId, owner, "owner");
   h.site.set(tripId, PEOPLE.map((p) => ({ ...p })));
+  // What a claim's trip needs to be usable at all: one open group, `member_group_sign_in` on, and this feature on for the trip.
+  groupOf.set(tripId, await h.bindGroup(tripId));
+  await h.switchOn(tripId);
+  await setSwitch(tripId, true);
   return { tripId, owner };
 }
 
@@ -90,6 +108,9 @@ async function mkClaimAccount(tripId: string, username: string, name: string, te
   await h.pool.query(
     `INSERT INTO control_plane.telegram_member_links(id, user_id, trip_id, telegram_subject_digest, verified_via, first_signed_in_at, last_signed_in_at)
      VALUES ($1, $2, $3, $4, $5, now(), now())`, [linkId, userId, tripId, digestTelegramId(String(telegramId)), GROUP_VERIFIED_VIA]);
+  // And Telegram agrees: the person is in the trip's group.
+  const group = groupOf.get(tripId);
+  if (group) await h.telegram.member(group, telegramId, "member");
   return { userId, linkId, telegramId };
 }
 
@@ -168,6 +189,11 @@ const settle = async () => { await portalMailIdle(); };
 const dropEverything = async () => {
   await h.pool.query("DELETE FROM control_plane.notification_outbox WHERE notification_type = 'sign_in_link_notice'");
   await h.pool.query("DELETE FROM control_plane.sign_in_links");
+  await h.pool.query("DELETE FROM control_plane.sign_in_link_requests");
+};
+const slotCount = async (channel: "telegram" | "email") => Number((await h.pool.query("SELECT count(*)::int AS n FROM control_plane.sign_in_link_requests WHERE channel = $1 AND created_at > now() - interval '1 minute'", [channel])).rows[0].n);
+const fillSlots = async (channel: "telegram" | "email", n: number) => {
+  for (let i = 0; i < n; i++) await h.pool.query("INSERT INTO control_plane.sign_in_link_requests(channel) VALUES ($1)", [channel]);
 };
 
 describe("the migration", { skip }, () => {
@@ -316,7 +342,7 @@ describe("AC-15: which account, which channel", { skip }, () => {
       assert.equal(rows[0].channel, "telegram");
       assert.equal(rows[0].telegram_link_id, person.linkId, "the link remembers the group-claim link that scopes the session it will mint");
       const ttl = (rows[0].expires_at.getTime() - Date.now()) / 1000;
-      assert.ok(ttl > SIGN_IN_LINK_TTL_SECONDS - 60 && ttl <= SIGN_IN_LINK_TTL_SECONDS, `30 minutes, got ${ttl}s`);
+      assert.ok(ttl > 1800 - 60 && ttl <= 1800, `30 minutes (1800 s), got ${ttl}s`);
       // Nothing keeps the token at rest once it is sent: not the outbox row, not the table.
       const notice = (await pendingNotices())[0];
       assert.equal(notice.state, "sent");
@@ -331,7 +357,7 @@ describe("AC-15: which account, which channel", { skip }, () => {
     const app = newApp();
     try {
       const { tripId } = await mkTrip();
-      await mkClaimAccount(tripId, "dl17", "Dana Levi");
+      const person = await mkClaimAccount(tripId, "dl17", "Dana Levi");
       await ask(app, { tripId, travellerName: "Dana Levi" });
       await settle();
       for (let i = 0; i < 4; i++) await dispatch({ fail: true });
@@ -339,6 +365,8 @@ describe("AC-15: which account, which channel", { skip }, () => {
       assert.equal(notice.state, "failed");
       assert.equal(notice.recipient, null);
       assert.equal(notice.payload, null);
+      // The same ending as a mail that could not be sent: nobody holds the link, so it does not stay alive for 30 minutes.
+      assert.ok((await linkRows(person.userId))[0].expires_at.getTime() <= Date.now(), "the link of a message that never arrived is ended");
     } finally { await app.close(); }
   });
 
@@ -670,6 +698,10 @@ describe("AC-15: opening the link", { skip }, () => {
       await h.pool.query("UPDATE control_plane.users SET status = 'suspended' WHERE id = $1", [b.userId]);
       assert.equal((await redeem(app, tokens.get(String(a.telegramId))!)).statusCode, 400);
       assert.equal((await redeem(app, tokens.get(String(b.telegramId))!)).statusCode, 400);
+      // A refusal spends the link: lifting the suspension within the 30 minutes does not bring it back to life.
+      assert.ok((await linkRows(b.userId))[0].used_at, "the suspended account's link is spent");
+      await h.pool.query("UPDATE control_plane.users SET status = 'active' WHERE id = $1", [b.userId]);
+      assert.equal((await redeem(app, tokens.get(String(b.telegramId))!)).statusCode, 400, "and stays refused once the account is active again");
     } finally { await app.close(); }
   });
 
@@ -731,65 +763,175 @@ describe("AC-15: opening the link", { skip }, () => {
 });
 
 describe("AC-16: limits are silent", { skip }, () => {
-  test("per account: past the hourly allowance the answer is the same 202 and nothing more is sent", async () => {
+  test("per account: three links an hour; past that the answer is the same 202 and nothing more is sent", async () => {
     await dropEverything();
     const app = newApp();
     try {
       const { tripId } = await mkTrip();
       const person = await mkClaimAccount(tripId, "dl17", "Dana Levi");
       const answers: string[] = [];
-      for (let i = 0; i < SIGN_IN_LINK_ACCOUNT_PER_HOUR + 3; i++) {
+      for (let i = 0; i < 6; i++) {
         const response = await ask(app, { tripId, travellerName: "Dana Levi" });
         answers.push(`${response.statusCode} ${response.body}`);
         await settle();
       }
       assert.equal(new Set(answers).size, 1, "every answer identical");
-      assert.equal((await linkRows(person.userId)).length, SIGN_IN_LINK_ACCOUNT_PER_HOUR);
-      assert.equal((await pendingNotices()).length, SIGN_IN_LINK_ACCOUNT_PER_HOUR);
+      assert.equal((await linkRows(person.userId)).length, 3);
+      assert.equal((await pendingNotices()).length, 3);
     } finally { await app.close(); }
   });
 
-  test("per IP: every request counts, found or not, so the limiter is no oracle; past it nothing is sent for anyone", async () => {
+  test("per IP: the 10th admitted request from one address is served and the 11th is not; unknown accounts spend the allowance exactly as real ones do", async () => {
     await dropEverything();
     const app = newApp();
     try {
       const { tripId } = await mkTrip();
-      const person = await mkClaimAccount(tripId, "dl17", "Dana Levi");
+      const first = await mkClaimAccount(tripId, "dl17", "Dana Levi");
+      const second = await mkClaimAccount(tripId, "nl23", "Noam Levi");
       const ip = freshIp();
-      // Requests for accounts that do not exist use the allowance up exactly as real ones do.
       const answers: string[] = [];
-      for (let i = 0; i < 10; i++) { const r = await ask(app, { email: addr(`ghost${i}`) }, ip); answers.push(`${r.statusCode} ${r.body}`); }
-      const real = await ask(app, { tripId, travellerName: "Dana Levi" }, ip);
-      answers.push(`${real.statusCode} ${real.body}`);
+      for (let i = 0; i < 9; i++) { const r = await ask(app, { email: addr(`ghost${i}`) }, ip); answers.push(`${r.statusCode} ${r.body}`); }
+      const tenth = await ask(app, { tripId, travellerName: "Dana Levi" }, ip);
+      const eleventh = await ask(app, { tripId, travellerName: "Noam Levi" }, ip);
+      answers.push(`${tenth.statusCode} ${tenth.body}`, `${eleventh.statusCode} ${eleventh.body}`);
       await settle();
-      assert.equal(new Set(answers).size, 1, "the eleventh request, a real account's, is answered like the ten before");
-      assert.equal((await linkRows(person.userId)).length, 0, "and nothing was sent: the unknown addresses spent the allowance");
-      const elsewhere = await ask(app, { tripId, travellerName: "Dana Levi" }, freshIp());
+      assert.equal(new Set(answers).size, 1, "all eleven answers identical");
+      assert.equal((await linkRows(first.userId)).length, 1, "the 10th request was served");
+      assert.equal((await linkRows(second.userId)).length, 0, "the 11th was not: nothing sent");
+      assert.equal((await ask(app, { tripId, travellerName: "Noam Levi" }, freshIp())).body, GENERIC);
       await settle();
-      assert.equal(elsewhere.body, GENERIC);
-      assert.equal((await linkRows(person.userId)).length, 1, "another address is not affected");
+      assert.equal((await linkRows(second.userId)).length, 1, "another address is not affected");
     } finally { await app.close(); }
   });
 
-  test("per channel: a full minute of sends on a channel stops that channel, silently, and not the other", async () => {
+  test("per channel, Telegram: a ceiling of 30 requests a minute: the 30th is served, the 31st is not, and the email channel is a count of its own", async () => {
     await dropEverything();
     const app = newApp();
     try {
       const { tripId } = await mkTrip();
-      const filler = await h.mkUser("Filler");
-      for (let i = 0; i < SIGN_IN_LINK_CHANNEL_PER_MINUTE.telegram; i++) {
-        await h.pool.query("INSERT INTO control_plane.sign_in_links(id, token_digest, user_id, channel, expires_at) VALUES ($1,$2,$3,'telegram', now() + interval '30 minutes')", [id("sil"), sha256(`fill-${i}-${randomBytes(4).toString("hex")}`), filler]);
+      await fillSlots("telegram", 28);
+      const a = await mkClaimAccount(tripId, "dl17", "Dana Levi");
+      const b = await mkClaimAccount(tripId, "nl23", "Noam Levi");
+      const c = await mkClaimAccount(tripId, "tl31", "Tamar Levi");
+      const answers = [];
+      for (const name of ["Dana Levi", "Noam Levi", "Tamar Levi"]) { const r = await ask(app, { tripId, travellerName: name }); answers.push(`${r.statusCode} ${r.body}`); await settle(); }
+      assert.equal(new Set(answers).size, 1);
+      assert.equal((await linkRows(a.userId)).length, 1, "slot 29");
+      assert.equal((await linkRows(b.userId)).length, 1, "slot 30");
+      assert.equal((await linkRows(c.userId)).length, 0, "the ceiling is full: silent, nothing sent");
+      assert.equal(await slotCount("telegram"), 30, "a refused request takes no slot of its own");
+      assert.equal(await slotCount("email"), 0, "a name-door request is never an email");
+    } finally { await app.close(); }
+  });
+
+  test("per channel, email: a ceiling of 20 requests a minute: the 20th is served, the 21st is not", async () => {
+    await dropEverything();
+    const app = newApp();
+    try {
+      const { tripId } = await mkTrip();
+      await fillSlots("email", 19);
+      const one = addr("e1"), two = addr("e2");
+      const a = await mkInviteAccount(tripId, "nl23", "Noam Levi", { email: one, google: true });
+      const b = await mkInviteAccount(tripId, "tl31", "Tamar Levi", { email: two, google: true });
+      const answers = [];
+      for (const email of [one, two]) { const r = await ask(app, { email }); answers.push(`${r.statusCode} ${r.body}`); await settle(); }
+      assert.equal(new Set(answers).size, 1);
+      assert.equal((await linkRows(a.userId)).length, 1, "the 20th");
+      assert.equal((await linkRows(b.userId)).length, 0, "the 21st: the ceiling is full");
+      assert.equal(mailer.outbox.length, 1);
+    } finally { await app.close(); }
+  });
+
+  test("which ceilings a request takes does not depend on the account: a name-door request takes one Telegram slot, an email-door request one Telegram and one email slot, found or not, with or without a channel, organizer or not", async () => {
+    await dropEverything();
+    const app = newApp();
+    try {
+      const { tripId } = await mkTrip();
+      await mkClaimAccount(tripId, "dl17", "Dana Levi");
+      await mkInviteAccount(tripId, "tl31", "Tamar Levi", { password: true });
+      const google = addr("g"), asserted = addr("a"), organizer = addr("o");
+      await mkInviteAccount(tripId, "nl23", "Noam Levi", { email: google, google: true });
+      await mkInviteAccount(tripId, "ghost", "Ghost Member", { email: asserted });
+      await mkOrganizerWithEmail(organizer);
+      const nameDoor = [{ tripId, travellerName: "Dana Levi" }, { tripId, travellerName: "Tamar Levi" }, { tripId, travellerName: "Nobody Here" }, { tripId, travellerName: "The Organizer" }, { tripId: "trip_doesnotexist01", travellerName: "Dana Levi" }];
+      const emailDoor = [{ email: google }, { email: asserted }, { email: addr("nobody") }, { email: organizer }];
+      for (const [door, bodies, perRequest] of [["name", nameDoor, { telegram: 1, email: 0 }], ["email", emailDoor, { telegram: 1, email: 1 }]] as const) {
+        for (const body of bodies) {
+          await h.pool.query("DELETE FROM control_plane.sign_in_link_requests");
+          await h.pool.query("DELETE FROM control_plane.sign_in_links");
+          await ask(app, body);
+          await settle();
+          assert.deepEqual({ telegram: await slotCount("telegram"), email: await slotCount("email") }, perRequest, `${door} door, ${JSON.stringify(body).slice(0, 50)}`);
+        }
       }
-      const person = await mkClaimAccount(tripId, "dl17", "Dana Levi");
-      const address = addr("otherchannel");
-      const mailPerson = await mkInviteAccount(tripId, "nl23", "Noam Levi", { email: address, google: true });
-      const a = await ask(app, { tripId, travellerName: "Dana Levi" });
-      const b = await ask(app, { email: address });
+    } finally { await app.close(); }
+  });
+});
+
+describe("AC-16: the ceilings are not an account-existence oracle (the boundary reviewer's probe)", { skip }, () => {
+  // The probe: fill a ceiling to N-1, send a GUESS, then ask for the attacker's OWN link. Before the fix the guess took the last slot
+  // only if it qualified, so the attacker's own link arrived only when the guess did NOT. Now every admitted request takes its slot
+  // whatever it finds, so the attacker's own outcome is the same for every candidate.
+  const KINDS = ["member with a channel", "member without a channel", "no account", "organizer"] as const;
+  type Door = "name" | "email";
+
+  async function probe(door: Door, kind: (typeof KINDS)[number], fillTo: number): Promise<number> {
+    await dropEverything();
+    const app = newApp();
+    try {
+      const { tripId } = await mkTrip();
+      const ownAddress = addr("attacker");
+      // The attacker's own account: reachable on the very channel whose ceiling is being probed.
+      const own = door === "name"
+        ? await mkClaimAccount(tripId, "ghost", "Ghost Member")
+        : await mkInviteAccount(tripId, "ghost", "Ghost Member", { email: ownAddress, google: true });
+      let guess: Record<string, unknown>;
+      if (door === "name") {
+        if (kind === "member with a channel") { await mkClaimAccount(tripId, "dl17", "Dana Levi"); guess = { tripId, travellerName: "Dana Levi" }; }
+        else if (kind === "member without a channel") { await mkInviteAccount(tripId, "tl31", "Tamar Levi", { password: true }); guess = { tripId, travellerName: "Tamar Levi" }; }
+        else if (kind === "no account") guess = { tripId, travellerName: "Nobody At All" };
+        else guess = { tripId, travellerName: "The Organizer" };
+      } else if (kind === "member with a channel") { const a = addr("w"); await mkInviteAccount(tripId, "nl23", "Noam Levi", { email: a, google: true }); guess = { email: a }; }
+      else if (kind === "member without a channel") { const a = addr("x"); await mkInviteAccount(tripId, "tl31", "Tamar Levi", { email: a }); guess = { email: a }; }
+      else if (kind === "no account") guess = { email: addr("nobody") };
+      else { const a = addr("org"); await mkOrganizerWithEmail(a); guess = { email: a }; }
+      // The ceiling the attacker's own channel runs on: Telegram for the name door, email for the email door.
+      await fillSlots(door === "name" ? "telegram" : "email", fillTo);
+      await ask(app, guess);
       await settle();
-      assert.equal(a.body, GENERIC);
-      assert.equal(b.body, GENERIC);
-      assert.equal((await linkRows(person.userId)).length, 0, "the Telegram channel is full this minute");
-      assert.equal((await linkRows(mailPerson.userId)).length, 1, "the email channel is not");
+      await ask(app, door === "name" ? { tripId, travellerName: "Ghost Member" } : { email: ownAddress });
+      await settle();
+      return (await linkRows(own.userId)).length;
+    } finally { await app.close(); }
+  }
+
+  for (const door of ["name", "email"] as const) {
+    test(`${door} door: with the ceiling one short of full, the attacker's own request ends the same way whatever the guess was`, async () => {
+      const ceiling = door === "name" ? 30 : 20;
+      const outcomes = new Map<string, number>();
+      for (const kind of KINDS) outcomes.set(kind, await probe(door, kind, ceiling - 1));
+      assert.deepEqual([...outcomes.values()], [0, 0, 0, 0], `the guess used the last slot in every case, so the attacker's own link never arrives: ${JSON.stringify([...outcomes])}`);
+    });
+    test(`${door} door, control: with two slots left both requests are served for every guess (the probe measures the ceiling, not something else)`, async () => {
+      const ceiling = door === "name" ? 30 : 20;
+      const outcomes = new Map<string, number>();
+      for (const kind of KINDS) outcomes.set(kind, await probe(door, kind, ceiling - 2));
+      assert.deepEqual([...outcomes.values()], [1, 1, 1, 1], JSON.stringify([...outcomes]));
+    });
+  }
+
+  test("the per-account allowance is keyed on the target and shared with nobody: asking for a victim's link three times changes nothing about another account's", async () => {
+    await dropEverything();
+    const app = newApp();
+    try {
+      const { tripId } = await mkTrip();
+      const victim = await mkClaimAccount(tripId, "dl17", "Dana Levi");
+      const own = await mkClaimAccount(tripId, "ghost", "Ghost Member");
+      for (let i = 0; i < 3; i++) { await ask(app, { tripId, travellerName: "Dana Levi" }); await settle(); }
+      assert.equal((await linkRows(victim.userId)).length, 3);
+      await ask(app, { tripId, travellerName: "Ghost Member" });
+      await settle();
+      assert.equal((await linkRows(own.userId)).length, 1, "the attacker's own request is served as if the victim did not exist");
     } finally { await app.close(); }
   });
 });
@@ -825,5 +967,244 @@ describe("the routes are classified", { skip }, () => {
     assert.equal(PORTAL_SCOPE_POLICY["POST /v1/auth/sign-in-link"], "open");
     assert.equal(PORTAL_SCOPE_POLICY["POST /v1/auth/sign-in-link/redeem"], "open");
     assert.equal(PORTAL_SCOPE_POLICY["POST /v1/auth/sign-in-link/password"], "account");
+  });
+});
+
+// ── Rework round 1 ──────────────────────────────────────────────────────────
+
+describe("a group claimant's link is held to the Mini App's own gate (the switch, and a live seat in the group)", { skip }, () => {
+  async function issued() {
+    await dropEverything();
+    const app = newApp();
+    const { tripId } = await mkTrip();
+    const person = await mkClaimAccount(tripId, "dl17", "Dana Levi");
+    await ask(app, { tripId, travellerName: "Dana Levi" });
+    await settle();
+    const token = tokenIn((await dispatch())[0]!.text);
+    return { app, tripId, person, token, group: groupOf.get(tripId)! };
+  }
+  const claimLive = async (userId: string) => Number((await h.pool.query("SELECT count(*)::int AS n FROM control_plane.trip_participant_claims WHERE user_id = $1 AND released_at IS NULL", [userId])).rows[0].n) === 1;
+  const liveSessions = async (userId: string) => Number((await h.pool.query("SELECT count(*)::int AS n FROM control_plane.web_sessions WHERE user_id = $1 AND revoked_at IS NULL", [userId])).rows[0].n);
+
+  test("`member_group_sign_in` OFF: redemption is the one refusal, no Telegram call, no session left, nothing revoked, the link NOT spent (it works when the switch is back on)", async () => {
+    const { app, tripId, person, token } = await issued();
+    try {
+      await h.switchOn(tripId, false);
+      const before = await h.telegram.calls("getChatMember");
+      const refused = await redeem(app, token);
+      assert.equal(refused.statusCode, 400);
+      assert.equal(refused.body, JSON.stringify({ error: "TOKEN_INVALID" }));
+      assert.equal(refused.headers["set-cookie"], undefined);
+      assert.equal(await h.telegram.calls("getChatMember"), before, "no getChatMember while the group switch is off");
+      assert.equal(await liveSessions(person.userId), 0, "the session minted for the check is ended");
+      assert.ok(await claimLive(person.userId), "nothing was revoked");
+      assert.equal((await linkRows(person.userId))[0].used_at, null, "the link is not spent");
+      await h.switchOn(tripId, true);
+      assert.equal((await redeem(app, token)).statusCode, 200, "and opens once the switch is back on");
+    } finally { await app.close(); }
+  });
+
+  test("the person LEFT the group: refused, and the claim, its link, sessions and membership end exactly as at a Mini App launch; Telegram was asked once", async () => {
+    const { app, person, token, group } = await issued();
+    try {
+      await h.telegram.member(group, person.telegramId, "left");
+      const before = await h.telegram.calls("getChatMember");
+      const refused = await redeem(app, token);
+      assert.equal(refused.statusCode, 400);
+      assert.equal(refused.body, JSON.stringify({ error: "TOKEN_INVALID" }));
+      assert.equal(refused.headers["set-cookie"], undefined);
+      assert.equal(await h.telegram.calls("getChatMember"), before + 1);
+      assert.ok(!(await claimLive(person.userId)), "the claim ended");
+      const link = (await h.pool.query("SELECT revoked_reason FROM control_plane.telegram_member_links WHERE id = $1", [person.linkId])).rows[0];
+      assert.equal(link.revoked_reason, "left_group");
+      assert.equal(await liveSessions(person.userId), 0);
+      assert.equal((await h.pool.query("SELECT status FROM control_plane.trip_memberships WHERE user_id = $1", [person.userId])).rows[0].status, "revoked");
+    } finally { await app.close(); }
+  });
+
+  test("Telegram UNREACHABLE: no session, nothing revoked, the link is not spent, and the answer is the retryable one the Mini App launch gives", async () => {
+    const { app, person, token, group } = await issued();
+    try {
+      await h.telegram.member(group, person.telegramId, "member", { mode: "error" });
+      const down = await redeem(app, token);
+      assert.equal(down.statusCode, 503);
+      assert.deepEqual(down.json(), { error: "MEMBERSHIP_CHECK_UNAVAILABLE", retryable: true });
+      assert.equal(down.headers["retry-after"], "5");
+      assert.equal(down.headers["set-cookie"], undefined);
+      assert.equal(await liveSessions(person.userId), 0);
+      assert.ok(await claimLive(person.userId));
+      assert.equal((await linkRows(person.userId))[0].used_at, null);
+      await h.telegram.member(group, person.telegramId, "member");
+      const ok = await redeem(app, token);
+      assert.equal(ok.statusCode, 200, "the same link works once Telegram answers");
+      assert.equal((await app.inject({ method: "GET", url: "/v1/me", headers: { cookie: asCookie(ok) } })).json().scope, "telegram");
+    } finally { await app.close(); }
+  });
+
+  test("a live seat and the switch on: the session is minted, and it is the claim's scoped one (the control for the three refusals above)", async () => {
+    const { app, person, token } = await issued();
+    try {
+      const ok = await redeem(app, token);
+      assert.equal(ok.statusCode, 200);
+      assert.equal(await liveSessions(person.userId), 1);
+    } finally { await app.close(); }
+  });
+
+  test("at ISSUE time too: a claimant whose group switch is off, or who is not in the group, is sent nothing (the same 202), and nothing is revoked by asking", async () => {
+    await dropEverything();
+    const app = newApp();
+    try {
+      const { tripId } = await mkTrip();
+      const off = await mkClaimAccount(tripId, "dl17", "Dana Levi");
+      const gone = await mkClaimAccount(tripId, "nl23", "Noam Levi");
+      await h.telegram.member(groupOf.get(tripId)!, gone.telegramId, "left");
+      await h.switchOn(tripId, false);
+      const a = await ask(app, { tripId, travellerName: "Dana Levi" });
+      await settle();
+      await h.switchOn(tripId, true);
+      const b = await ask(app, { tripId, travellerName: "Noam Levi" });
+      await settle();
+      assert.equal(a.body, GENERIC); assert.equal(b.body, GENERIC);
+      assert.equal(await allLinkRows(), 0);
+      assert.equal((await pendingNotices()).length, 0);
+      assert.ok(await claimLive(gone.userId) && await claimLive(off.userId), "issuing is not a launch: nothing was ended");
+    } finally { await app.close(); }
+  });
+});
+
+describe("the switch `member_sign_in_link` (ships OFF)", { skip }, () => {
+  test("the name door works only when the switch is on for THAT trip; off, unset and another trip's setting give the same 202, nothing done, and take the same ceiling slot", async () => {
+    await dropEverything();
+    const app = newApp();
+    try {
+      const { tripId } = await mkTrip();
+      const other = await mkTrip();
+      const person = await mkClaimAccount(tripId, "dl17", "Dana Levi");
+      const slotsBefore = await slotCount("telegram");
+      await setSwitch(tripId, false);
+      const off = await ask(app, { tripId, travellerName: "Dana Levi" });
+      await settle();
+      assert.equal(off.statusCode, 202); assert.equal(off.body, GENERIC);
+      assert.equal((await linkRows(person.userId)).length, 0, "off: nothing done");
+      assert.equal(await slotCount("telegram"), slotsBefore + 1, "and it took its slot like any request");
+      await h.pool.query("DELETE FROM control_plane.feature_switch_settings WHERE switch = 'member_sign_in_link' AND trip_id = $1", [tripId]);
+      await setSwitch(null, false);
+      await setSwitch(other.tripId, true);
+      const unset = await ask(app, { tripId, travellerName: "Dana Levi" });
+      await settle();
+      assert.equal(unset.body, GENERIC);
+      assert.equal((await linkRows(person.userId)).length, 0, "unset for this trip (another trip being on does not count): off");
+      assert.equal(await slotCount("telegram"), slotsBefore + 2);
+      await setSwitch(tripId, true);
+      await ask(app, { tripId, travellerName: "Dana Levi" });
+      await settle();
+      assert.equal((await linkRows(person.userId)).length, 1, "on for the trip: served");
+    } finally { await setSwitch(null, true); await app.close(); }
+  });
+
+  test("the email door has no trip, so it works only at the \"every trip\" level: a trip's own setting does not open it", async () => {
+    await dropEverything();
+    const app = newApp();
+    try {
+      const { tripId } = await mkTrip();
+      const address = addr("gated");
+      const person = await mkInviteAccount(tripId, "nl23", "Noam Levi", { email: address, google: true });
+      await setSwitch(null, false);
+      await setSwitch(tripId, true);
+      const off = await ask(app, { email: address });
+      await settle();
+      assert.equal(off.body, GENERIC);
+      assert.equal((await linkRows(person.userId)).length, 0);
+      assert.equal(mailer.outbox.length, 0);
+      assert.equal(await slotCount("email"), 1, "it still took its email slot");
+      await setSwitch(null, true);
+      await ask(app, { email: address });
+      await settle();
+      assert.equal((await linkRows(person.userId)).length, 1);
+    } finally { await setSwitch(null, true); await app.close(); }
+  });
+
+  test("capabilities says whether the feature is available at the \"every trip\" level, to anyone, and says nothing about a single trip", async () => {
+    await dropEverything();
+    const app = newApp();
+    try {
+      const { tripId } = await mkTrip();
+      const caps = async () => (await app.inject({ method: "GET", url: "/v1/auth/capabilities" })).json() as { signInLink?: boolean };
+      assert.equal((await caps()).signInLink, true, "on at the every-trip level");
+      await setSwitch(null, false);
+      assert.equal((await caps()).signInLink, false, "off");
+      await setSwitch(tripId, true);
+      assert.equal((await caps()).signInLink, false, "one trip being on is not 'available at all': it does not leak, and does not show");
+      await h.pool.query("DELETE FROM control_plane.feature_switch_settings WHERE switch = 'member_sign_in_link'");
+      assert.equal((await caps()).signInLink, false, "unset is off");
+    } finally { await setSwitch(null, true); await app.close(); }
+  });
+
+  test("a link issued while the switch was on stays redeemable for its 30 minutes after it goes off, and so does its one password step (only a claimant's follows the group gate)", async () => {
+    await dropEverything();
+    const app = newApp();
+    try {
+      const { tripId } = await mkTrip();
+      const address = addr("later");
+      const person = await mkInviteAccount(tripId, "nl23", "Noam Levi", { email: address, google: true, password: true });
+      await ask(app, { email: address });
+      await settle();
+      const token = tokenIn(mailer.outbox[0]!.text);
+      await setSwitch(null, false);
+      await setSwitch(tripId, false);
+      const ok = await redeem(app, token);
+      assert.equal(ok.statusCode, 200, ok.body);
+      assert.equal((await setPassword(app, sessionOf(ok), NEW_PASSWORD)).statusCode, 200);
+      void person;
+    } finally { await setSwitch(null, true); await app.close(); }
+  });
+});
+
+describe("housekeeping", { skip }, () => {
+  test("every admitted request purges what has outlived its use: links and slots, and a pending notice that nobody sent in 30 minutes is blanked (a deployment with no dispatcher keeps no token)", async () => {
+    await dropEverything();
+    const app = newApp();
+    try {
+      const { tripId } = await mkTrip();
+      const old = await mkClaimAccount(tripId, "dl17", "Dana Levi");
+      await ask(app, { tripId, travellerName: "Dana Levi" });
+      await settle();
+      await h.pool.query("UPDATE control_plane.notification_outbox SET created_at = now() - interval '31 minutes' WHERE notification_type = 'sign_in_link_notice'");
+      await h.pool.query("UPDATE control_plane.sign_in_links SET created_at = now() - interval '3 days'");
+      await h.pool.query("INSERT INTO control_plane.sign_in_link_requests(channel, created_at) VALUES ('telegram', now() - interval '3 hours')");
+      await ask(app, { email: addr("anyone") });
+      await settle();
+      const notice = (await pendingNotices())[0];
+      assert.equal(notice.state, "skipped");
+      assert.equal(notice.payload, null, "the plaintext token is gone though no dispatcher ran");
+      assert.equal(notice.recipient, null);
+      assert.equal((await linkRows(old.userId)).length, 0, "rows older than two days are deleted");
+      assert.equal(Number((await h.pool.query("SELECT count(*)::int AS n FROM control_plane.sign_in_link_requests WHERE created_at < now() - interval '1 hour'")).rows[0].n), 0, "and so are slots older than an hour");
+    } finally { await app.close(); }
+  });
+});
+
+describe("cookies under an https origin", { skip }, () => {
+  test("the redemption's cookies and the password sign-in's are attribute-for-attribute the same, Secure included", async () => {
+    await dropEverything();
+    const origin = "https://portal.example.test";
+    const app = h.newApp({ mailer, emailAuthLog: (line) => logs.push(line), publicOrigin: origin });
+    try {
+      const { tripId } = await mkTrip();
+      const address = addr("https");
+      await mkInviteAccount(tripId, "nl23", "Noam Levi", { email: address, google: true });
+      await app.inject({ method: "POST", url: "/v1/auth/sign-in-link", remoteAddress: freshIp(), payload: JSON.stringify({ email: address }), headers: { "content-type": "application/json", origin } });
+      await settle();
+      const token = tokenIn(mailer.outbox[0]!.text);
+      assert.ok(mailer.outbox[0]!.text.includes(`${origin}/sign-in-link#token=`), "the link uses the https origin");
+      const post = (url: string, body: unknown) => app.inject({ method: "POST", url, remoteAddress: freshIp(), payload: JSON.stringify(body), headers: { "content-type": "application/json", origin } });
+      const link = await post("/v1/auth/sign-in-link/redeem", { token });
+      const password = await post("/v1/auth/email-password", { email: address, password: PASSWORD });
+      assert.equal(link.statusCode, 200); assert.equal(password.statusCode, 200);
+      const shape = (r: { headers: Record<string, unknown> }) => ([] as string[]).concat(r.headers["set-cookie"] as string[]).map((c) => c.replace(/=[^;]*/, "=…")).sort();
+      assert.deepEqual(shape(link), shape(password));
+      assert.ok(shape(link).every((c) => /; Secure/.test(c)), `Secure: ${JSON.stringify(shape(link))}`);
+      assert.ok(shape(link).some((c) => /^kit_session=…; .*HttpOnly/.test(c)));
+    } finally { await app.close(); }
   });
 });
