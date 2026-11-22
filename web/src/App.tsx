@@ -10,6 +10,7 @@ const SignUpPage = lazy(() => import("./pages/SignUpPage"));
 const VerifyEmailPage = lazy(() => import("./pages/VerifyEmailPage"));
 const ForgotPasswordPage = lazy(() => import("./pages/ForgotPasswordPage"));
 const ResetPasswordPage = lazy(() => import("./pages/ResetPasswordPage"));
+const SignInLinkPage = lazy(() => import("./pages/SignInLinkPage"));
 
 function RouteFallback() {
   return (
@@ -29,6 +30,7 @@ function PageTitle() {
     "/verify-email": "Confirm your email — Kinerary",
     "/forgot-password": "Reset your password — Kinerary",
     "/reset-password": "Choose a new password — Kinerary",
+    "/sign-in-link": "Sign in — Kinerary",
     "/trips": "My trips — Kinerary",
     "/trips/new": "Start a trip — Kinerary",
     "/admin": "Super-admin dashboard — Kinerary",
@@ -51,6 +53,7 @@ export function App() {
           <Route path="/verify-email" element={<VerifyEmailPage />} />
           <Route path="/forgot-password" element={<ForgotPasswordPage />} />
           <Route path="/reset-password" element={<ResetPasswordPage />} />
+          <Route path="/sign-in-link" element={<SignInLinkPage />} />
           <Route path="/trips" element={<ProductApp view="trips" />} />
           <Route path="/trips/new" element={<ProductApp view="new-trip" />} />
           <Route path="/trips/:tripId/setup" element={<ProductApp view="trip" />} />

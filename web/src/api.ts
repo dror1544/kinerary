@@ -316,6 +316,19 @@ export const forgotPassword = (input: { email: string; language: "en" | "he" }) 
 export const resetPassword = (input: { token: string; password: string }) =>
   api<{ appPath: string }>("/v1/auth/password/reset", { method: "POST", body: JSON.stringify(input) });
 
+/**
+ * "Send me a sign-in link" (docs/specs/sprint-9/x-member-sign-in.md, S3). The server answers 202 with the same body for every case, so
+ * callers must not read it. Two doors: an email, or a trip plus the name the person has on it.
+ */
+export const requestSignInLink = (input: { email: string; language: "en" | "he" } | { tripId: string; travellerName: string }) =>
+  api<{ status: string }>("/v1/auth/sign-in-link", { method: "POST", body: JSON.stringify(input) });
+/** Spends the link's token (from the URL fragment, only when the person presses the button) and signs them in. */
+export const redeemSignInLink = (input: { token: string }) =>
+  api<{ appPath: string; canSetPassword: boolean }>("/v1/auth/sign-in-link/redeem", { method: "POST", body: JSON.stringify(input) });
+/** The link's one password step, for the session the redemption minted. */
+export const setSignInLinkPassword = (input: { password: string }) =>
+  api<{ ok: true }>("/v1/auth/sign-in-link/password", { method: "POST", body: JSON.stringify(input) });
+
 export function safeReturnTo(value: string | null): string {
   if (!value?.startsWith("/") || value.startsWith("//") || value.includes("\\")) return "/trips";
   try {

@@ -84,6 +84,12 @@ export const PORTAL_SCOPE_POLICY: Readonly<Record<string, RouteScope>> = Object.
   "POST /v1/auth/password/forgot": "open",
   "POST /v1/auth/password/reset": "open",
   "POST /v1/auth/telegram-mini-app": "open",
+  // "Send me a sign-in link" (docs/specs/sprint-9/x-member-sign-in.md, S3). The request and the redemption read no session: the
+  // link's token is the whole authority. The password step belongs to the session the redemption minted and CHANGES the account,
+  // so a Telegram-scoped session (a group claimant's) is refused it: a claimed account is never given a credential.
+  "POST /v1/auth/sign-in-link": "open",
+  "POST /v1/auth/sign-in-link/redeem": "open",
+  "POST /v1/auth/sign-in-link/password": "account",
   // Group sign-in (docs/specs/sprint-9/x-member-sign-in.md, S1). The signed initData is the whole authority; no session is read.
   "POST /v1/mini-app/claim": "open",
   // Sign in with Google (ID token). Never reads the session cookie: the signed token is the whole authority.

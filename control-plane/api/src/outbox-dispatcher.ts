@@ -6,6 +6,7 @@ import { issueGroupBindingToken } from "./group-binding.js";
 import { GROUP_CLAIM_LINK_KIND, SIGN_IN_NOTICE_TYPE, groupClaimNoticeText, signInNoticeText } from "./telegram-mini-app.js";
 import { confirmAudience, skippedLine } from "./trip-audience.js";
 import { renderPlanChangeLine, type PlanChange } from "./plan-change-line.js";
+import { dispatchSignInLinkNotices } from "./sign-in-link.js";
 
 interface OutboxRow {
   id: string;
@@ -245,6 +246,10 @@ export async function dispatchPendingTripNotifications(
   );
 
   let dispatched = 0;
+  // ── Sign-in links (docs/specs/sprint-9/x-member-sign-in.md, S3): a pass of their own, in sign-in-link.ts. Their rows carry a
+  // one-time token, so they are sent, blanked and expired by code that knows that; the query above never selects them.
+  dispatched += await dispatchSignInLinkNotices(db, notification, log, { publicOrigin: options?.publicOrigin ?? null });
+  // ── end of the sign-in links block ──
   for (const row of rows) {
     // A row addressed to a ROLE of the trip, not to a chat. Its `recipient` is never read (the database refuses one
     // beside a target): the chat is the trip's own open binding, re-read now. Everything else below is the path every

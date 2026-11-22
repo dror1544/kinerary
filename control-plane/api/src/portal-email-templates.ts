@@ -12,6 +12,7 @@ export function pickLanguage(requested: unknown, acceptLanguage: unknown): MailL
 export type PortalMail =
   | { kind: "verify"; link: string; ttlHours: number }
   | { kind: "reset"; link: string; ttlMinutes: number }
+  | { kind: "sign_in"; link: string; ttlMinutes: number }
   | { kind: "existing"; signInUrl: string; resetUrl: string };
 
 const escapeHtml = (value: string) => value.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
@@ -32,6 +33,12 @@ function copy(mail: PortalMail, language: MailLanguage): Copy {
         lines: [`קיבלנו בקשה לאפס את הסיסמה לחשבון שלכם. הקישור תקף ל-${mail.ttlMinutes} דקות ופועל פעם אחת בלבד.`],
         action: { label: "בחירת סיסמה חדשה", url: mail.link },
         footer: "אם לא ביקשתם לאפס את הסיסמה, אפשר להתעלם מהמכתב הזה. הסיסמה הנוכחית נשארת כפי שהיא.",
+      };
+      case "sign_in": return {
+        subject: "קישור הכניסה שלכם ל-Kinerary",
+        lines: [`ביקשתם קישור כניסה. הקישור תקף ל-${mail.ttlMinutes} דקות ופועל פעם אחת בלבד; אחרי הכניסה אפשר לבחור סיסמה חדשה.`],
+        action: { label: "כניסה ל-Kinerary", url: mail.link },
+        footer: "אם לא ביקשתם קישור כניסה, אפשר להתעלם מהמכתב הזה. שום דבר לא קורה אלא אם נפתח הקישור.",
       };
       case "existing": return {
         subject: "כבר יש לכם חשבון ב-Kinerary",
@@ -56,6 +63,12 @@ function copy(mail: PortalMail, language: MailLanguage): Copy {
       lines: [`We received a request to reset the password for your account. The link works once and is valid for ${mail.ttlMinutes} minutes.`],
       action: { label: "Choose a new password", url: mail.link },
       footer: "If you didn't ask for this, you can ignore this message. Your current password stays as it is.",
+    };
+    case "sign_in": return {
+      subject: "Your Kinerary sign-in link",
+      lines: [`You asked for a sign-in link. It works once and is valid for ${mail.ttlMinutes} minutes; after you are in you can choose a new password.`],
+      action: { label: "Sign in to Kinerary", url: mail.link },
+      footer: "If you didn't ask for a sign-in link, you can ignore this message. Nothing happens unless the link is opened.",
     };
     case "existing": return {
       subject: "You already have a Kinerary account",

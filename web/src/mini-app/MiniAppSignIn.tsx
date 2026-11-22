@@ -5,6 +5,7 @@ import { useLocation, useNavigate } from "react-router-dom";
 import { getMe, miniAppClaim, passwordSignIn, safeReturnTo, telegramMiniAppSignIn, type MiniAppSignInResult, type MiniAppTraveller, type MiniAppTrip } from "../api";
 import { ClaimScreen } from "./ClaimScreen";
 import { claimCopy, miniLanguage } from "./claim-copy";
+import { SignInLinkRequest } from "../components/SignInLinkRequest";
 import { digestInitData, launchMarker } from "./launch";
 import { isEmbedded, openedByTelegram, readLaunch, stripLaunchFragment, type MiniLaunch, type MiniSdk } from "./sdk";
 import { tripUsernameInputProps, tripUsernameRegisterOptions } from "./username";
@@ -258,7 +259,7 @@ function TripPasswordForm({ tripId, initData, platform, onSignedIn }: { tripId: 
         : null,
     ),
   });
-  return (
+  return (<>
     <form className="compact-form" onSubmit={form.handleSubmit((values) => signIn.mutate(values))}>
       <p>Use the username and password you chose for this trip.</p>
       <label>Trip username<input {...tripUsernameInputProps} {...form.register("runtimeUsername", tripUsernameRegisterOptions)} /></label>
@@ -268,5 +269,7 @@ function TripPasswordForm({ tripId, initData, platform, onSignedIn }: { tripId: 
       <button className="button wide" disabled={signIn.isPending}>{signIn.isPending ? "Signing in…" : "Continue with trip password"}</button>
       {signIn.isError && <div className="notice" role="alert">{signIn.error.message}</div>}
     </form>
-  );
+    {/* Outside the form above (a form inside a form is not HTML): a member who forgot the password asks for a link. */}
+    <SignInLinkRequest tripId={tripId} lang={miniLanguage()} />
+  </>);
 }

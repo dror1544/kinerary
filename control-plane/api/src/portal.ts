@@ -31,6 +31,7 @@ import {
 } from "./portal-scope.js";
 import { verifyMiniAppInitData, type VerifiedInitData } from "./telegram-webapp-auth.js";
 import { runtimeUpstreamFor } from "./runtime-upstream.js";
+import { applyLinkPassword, attachSession, consumeSignInLink, startSignInLink, type SignInLinkRequest } from "./sign-in-link.js";
 
 // The gateway's key, compared in constant time (a plain !== leaks how many
 // leading bytes were right).
@@ -523,12 +524,14 @@ async function createWebSession(client: pg.PoolClient, userId: string, ttlSecond
   // unlinking (or the link ending any other way) can end that session too. Such
   // a session is SCOPED (portal-scope.ts) and is stored under the scoped digest,
   // which no older release can match: a rollback cannot widen it.
+  const sessionId = opaque("wsess");
   await client.query(
     `INSERT INTO control_plane.web_sessions(id, user_id, token_digest, csrf_digest, expires_at, telegram_link_id)
      VALUES ($1, $2, $3, $4, now() + ($5 * interval '1 second'), $6)`,
-    [opaque("wsess"), userId, telegramLinkId ? scopedSessionDigest(sessionToken) : sha256(sessionToken), sha256(csrf), ttlSeconds, telegramLinkId],
+    [sessionId, userId, telegramLinkId ? scopedSessionDigest(sessionToken) : sha256(sessionToken), sha256(csrf), ttlSeconds, telegramLinkId],
   );
-  return { sessionToken, csrf };
+  // `sessionId` is read only by the sign-in link, which remembers which session its redemption minted (sign-in-link.ts).
+  return { sessionToken, csrf, sessionId };
 }
 
 function setWebSessionCookies(
@@ -1154,6 +1157,104 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
       await client.query("COMMIT");
       setWebSessionCookies(reply, deps, session);
       return { appPath: "/trips" };
+    } catch (error) {
+      try { await client.query("ROLLBACK"); } catch { /* ignore */ }
+      throw error;
+    } finally { client.release(); }
+  });
+
+  // ── "Send me a sign-in link" (sign-in-link.ts; docs/specs/sprint-9/x-member-sign-in.md, slice S3, AC-14 to AC-16) ──
+  //
+  //   POST /v1/auth/sign-in-link           { email, language? } | { tripId, travellerName }   202 { status: "request_received" }
+  //   POST /v1/auth/sign-in-link/redeem    { token }                                          200 { appPath, canSetPassword } + session cookies | 400 TOKEN_INVALID
+  //   POST /v1/auth/sign-in-link/password  { password }   (the session the redemption minted)  200 { ok: true } | 400 | 403 | 409
+  //
+  // THE ANSWER IS THE SAME FOR EVERY CASE the work behind it can end in: account found or not, channel or none, trip real or not,
+  // name ambiguous, a ceiling hit, a delivery that failed. It is sent BEFORE any of that work starts (runInBackground), so nothing
+  // about how long it takes depends on the case either. Only a request that is not one of the two shapes (400) or that comes from
+  // another origin (403) is answered differently, and neither depends on any account. Redemption is a POST, from the landing page
+  // the link opens (`/sign-in-link#token=`): a GET never carries the token to the server, so a link previewer cannot spend it.
+  const signInLinkIpAttempts: Attempts = new Map();
+  const signInLinkRedeemIpAttempts: Attempts = new Map();
+  /** One generic answer. A different word for any case would be a way to ask "is there an account?". */
+  const SIGN_IN_LINK_ANSWER = { status: "request_received" } as const;
+  app.post("/v1/auth/sign-in-link", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
+    const body = jsonBody(request);
+    const hasEmail = "email" in body, hasTraveller = "tripId" in body || "travellerName" in body;
+    const emailDoor = hasEmail && !hasTraveller && typeof body.email === "string";
+    const travellerDoor = !hasEmail && typeof body.tripId === "string" && typeof body.travellerName === "string";
+    if (!emailDoor && !travellerDoor) return reply.code(400).send({ error: "INVALID_REQUEST" });
+    // EVERY well-formed request counts against the caller's allowance, an account that does not exist included: a limiter that
+    // only counted real accounts would tell a guess from a hit. Over it, the same 202 and nothing else happens.
+    const admitted = admitEmailIp(signInLinkIpAttempts, request.ip, 10);
+    let input: SignInLinkRequest | null = null;
+    if (emailDoor) {
+      const email = normalizeEmail(body.email);
+      if (email !== null) input = { door: "email", email, language: pickLanguage(body.language, request.headers["accept-language"]) };
+    } else {
+      const travellerName = String(body.travellerName);
+      if (travellerName.length <= 200) input = { door: "traveller", tripId: String(body.tripId), travellerName };
+    }
+    if (admitted && input) {
+      const wanted = input;
+      runInBackground(
+        () => startSignInLink({
+          db: deps.db, mailer: deps.mailer, publicOrigin: deps.publicOrigin,
+          listParticipants: (tripId) => deps.runtimeAccounts.listParticipants(tripId), log: emailAuthLog,
+        }, wanted),
+        (error) => emailAuthLog(structuredLog("error", "sign_in_link.request_failed", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN" })));
+    }
+    return reply.code(202).send(SIGN_IN_LINK_ANSWER);
+  });
+
+  app.post("/v1/auth/sign-in-link/redeem", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    if (!admitEmailIp(signInLinkRedeemIpAttempts, request.ip, 30)) return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
+    if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
+    const token = jsonBody(request).token;
+    const client = await deps.db.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await consumeSignInLink(client, token);
+      if (!result.ok) {
+        // Commit: a link spent by a refusal (its account stopped being a member account, its claim ended) stays spent.
+        await client.query("COMMIT");
+        return reply.code(400).send({ error: "TOKEN_INVALID" });
+      }
+      // A group claimant's link mints the claim's SCOPED session (portal-scope.ts), exactly as a Mini App launch does.
+      const session = await createWebSession(client, result.userId, deps.sessionTtlSeconds, result.telegramLinkId);
+      await attachSession(client, result.linkId, session.sessionId);
+      await client.query("COMMIT");
+      setWebSessionCookies(reply, deps, session);
+      return { appPath: "/trips", canSetPassword: result.canSetPassword };
+    } catch (error) {
+      try { await client.query("ROLLBACK"); } catch { /* ignore */ }
+      throw error;
+    } finally { client.release(); }
+  });
+
+  app.post("/v1/auth/sign-in-link/password", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    const user = await requireMutation(request, reply, deps);
+    if (!user) return;
+    const password = jsonBody(request).password;
+    if (typeof password !== "string" || password.length > PASSWORD_MAX_LENGTH) return reply.code(400).send({ error: "INVALID_REQUEST" });
+    if (password.length < PASSWORD_MIN_LENGTH) return reply.code(400).send({ error: "PASSWORD_TOO_SHORT" });
+    // Before the transaction, so scrypt never runs under a row lock. Each store keeps its own hashing helper.
+    const [hashForEmailCredential, hashForTripCredential] = await Promise.all([hashPassword(password), hashPortalPassword(password)]);
+    const client = await deps.db.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await applyLinkPassword(client, { userId: user.id, sessionId: user.sessionId, hashForEmailCredential, hashForTripCredential });
+      if (result !== "ok") {
+        await client.query("ROLLBACK");
+        if (result === "not_offered") return reply.code(403).send({ error: "PASSWORD_STEP_UNAVAILABLE" });
+        return reply.code(409).send({ error: result === "already_set" ? "PASSWORD_ALREADY_SET" : "NO_PASSWORD_TO_REPLACE" });
+      }
+      await client.query("COMMIT");
+      return { ok: true };
     } catch (error) {
       try { await client.query("ROLLBACK"); } catch { /* ignore */ }
       throw error;
