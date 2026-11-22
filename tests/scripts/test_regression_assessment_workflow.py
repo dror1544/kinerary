@@ -16,8 +16,10 @@ later step still depends on a `configured` output that no longer exists.
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -229,6 +231,28 @@ class TheModelNeverHoldsAGitHubToken(unittest.TestCase):
         ctx = _step_block(_workflow_text(), "Collect context")
         self.assertIn(".assessment-context/commits.txt", ctx)
         self.assertIn(".assessment-context/diff-stat.txt", ctx)
+
+    def test_a_diff_over_the_cap_is_cut_without_failing_the_step(self):
+        # 2026-11-21: `gh pr diff | head -c 400000` under pipefail exited 141 on every PR whose diff passed the cap
+        # (a rebuilt site/modern bundle), so the step failed before any assessment ran.
+        ctx = _step_block(_workflow_text(), "Collect context")
+        self.assertNotRegex(ctx, r"gh pr diff[^\n|]*\|\s*head", "never pipe gh into head under pipefail")
+        lines = [l.strip() for l in ctx.splitlines() if "diff.full" in l or "diff.patch" in l]
+        lines = [l for l in lines if not l.startswith("#")]
+        self.assertTrue(lines, "the diff is still collected")
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = os.path.join(tmp, "gh")
+            with open(fake, "w") as f:
+                f.write("#!/bin/sh\nyes 'diff line padding padding padding' | head -c 2000000\n")
+            os.chmod(fake, 0o755)
+            os.mkdir(os.path.join(tmp, ".assessment-context"))
+            script = "set -euo pipefail\nNUMBER=1\n" + "\n".join(lines) + "\n"
+            run = subprocess.run(["bash", "-c", script], cwd=tmp, capture_output=True, text=True,
+                                 env={**os.environ, "PATH": f"{tmp}:{os.environ['PATH']}"})
+            self.assertEqual(run.returncode, 0, run.stderr)
+            patch = os.path.join(tmp, ".assessment-context", "diff.patch")
+            self.assertEqual(os.path.getsize(patch), 400000)
+            self.assertEqual(os.listdir(os.path.join(tmp, ".assessment-context")), ["diff.patch"], "nothing else left for the model")
 
     def test_assess_is_given_no_github_credential(self):
         block = _step_block(_workflow_text(), "Assess")

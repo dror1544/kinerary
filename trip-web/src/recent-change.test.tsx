@@ -12,7 +12,7 @@ import { config, dayItems, item, PARTICIPANTS, renderTrip, stubTripFetch, todayC
 import { relativeAgo } from "./recent-change";
 import type { ItineraryItem } from "./api";
 
-const BOTH = { site_video_layout: true, plan_change_marks: true };
+const BOTH = { plan_change_marks: true };
 const ago = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
 
 beforeEach(() => { useJsdomBasics(); });
@@ -83,7 +83,7 @@ describe("AC-19: an Updated row and the line under the card", () => {
   });
 
   it("with plan_change_marks off the page ignores a marker it was handed", async () => {
-    serve({ site_video_layout: true }, dayItems(ago(5)));
+    serve({}, dayItems(ago(5)));
     renderTrip();
     await dinnerRow();
     expect(document.querySelector(".change-badge")).toBeNull();
@@ -120,15 +120,6 @@ describe("AC-20: the same treatment on Plan, with the teal provenance only in th
     const detail = dinner.querySelector(".item-detail") as HTMLElement;
     expect(within(detail).getByText("Updated from original")).toBeInTheDocument();
     expect(dinner.querySelector(".item-kicker")?.textContent).not.toContain("Updated from original");
-  });
-
-  it("with the video layout off the provenance stays in the kicker, as today", async () => {
-    const items = dayItems(ago(5)).map((entry) => (entry.item_uid === "dinner" ? { ...entry, provenance: { status: "updated_from_original" } } : entry));
-    stubTripFetch(() => ({ config: config(undefined), today: todayContext(items), items }));
-    renderTrip({ hash: "journey" });
-    const dinner = (await screen.findByRole("heading", { name: "Dinner at the Winstub" })).closest("article") as HTMLElement;
-    expect(dinner.querySelector(".item-kicker")?.textContent).toContain("Updated from original");
-    expect(dinner.querySelector(".change-badge")).toBeNull();
   });
 
   it("a moved item reads \"Moved from <weekday>\"", async () => {

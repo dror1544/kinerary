@@ -24,9 +24,16 @@
 //  while the finger is down, so the spring back is a CSS transition. Growing does resize the header, but only during
 //  a pull at the very top, where there is nothing above it to jump.
 //
+// The first open (owner, 2026-11-21): the site opens with the header already OPEN, as if the person had pulled it —
+// the photo takes INTRO_SHARE of the screen — and the photo fades and scales in (styles.css, `is-intro`). It is the same
+// "open" state a pull makes, so everything above applies to it: scrolling down reduces it to the compact bar and lets it
+// go; back at the top the header is its usual size. It is ONE-SHOT: it happens once per page load (`heroIntroSeen`), and
+// switching tab or page lets it go, so no tab opens to a full-screen photo again.
+//
 // prefers-reduced-motion: no stretch (the pull is never applied), no fade (the big line switches off at the compact
-// threshold, in one step). The header still follows the page, which is scrolling, not an animation.
-import { useEffect, useState, type RefObject } from "react";
+// threshold, in one step), no intro animation (the open header is simply there). The header still follows the page,
+// which is scrolling, not an animation.
+import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from "react";
 
 /** Height of the compact bar: the header's top padding (14px) plus its top line (48px), with a little air. Matches styles.css. */
 export const COMPACT_PX = 64;
@@ -38,6 +45,21 @@ export const PULL_RESISTANCE = 0.5;
 export const OPEN_AT_PX = 56;
 /** Open, the header takes this share of the screen's height. */
 export const OPEN_SHARE = 0.72;
+/** At the first open of a page load the header takes this share: roughly the whole screen, with a sliver of the page under it to say there is more. */
+export const INTRO_SHARE = 0.92;
+
+// Has this page load already had its first open? Module state, not storage: a reload is a new page load, a tab switch is not.
+// It is set from an effect and only READ while rendering, so React's StrictMode double mount cannot use it up.
+let introSeen = false;
+export const heroIntroSeen = () => introSeen;
+export const markHeroIntroSeen = () => { introSeen = true; };
+/** For tests: a new page load. */
+export const resetHeroIntro = () => { introSeen = false; };
+
+/** How much the first open adds to the header's resting height so that it fills INTRO_SHARE of the screen (never negative). */
+export function heroIntroExtra(restingHeight: number, viewportHeight: number): number {
+  return Math.max(Math.round(viewportHeight * INTRO_SHARE - restingHeight), 0);
+}
 
 /** How much an open header adds to its resting height, so that it fills OPEN_SHARE of the screen (never less than a pull's worth). */
 export function heroOpenExtra(restingHeight: number, viewportHeight: number): number {
@@ -65,10 +87,20 @@ export function heroGrowFor(dy: number, reducedMotion: boolean, cap = MAX_PULL_P
   return Math.min(Math.max(dy, 0) * PULL_RESISTANCE, cap);
 }
 
+export type HeroScrollOptions = {
+  /** Start open, as the first open of a page load does. Read once, when the header mounts. */
+  startOpen?: boolean;
+  /** When this changes (another tab, another page) an open header is let go: the first open is not repeated. */
+  releaseKey?: string;
+};
+
 /** Wires the header at `ref` to the page's scroll. Returns whether the header is in its compact state. */
-export function useHeroScroll(ref: RefObject<HTMLElement | null>): boolean {
+export function useHeroScroll(ref: RefObject<HTMLElement | null>, options: HeroScrollOptions = {}): boolean {
   const [compact, setCompact] = useState(false);
-  useEffect(() => {
+  const startOpen = useRef(options.startOpen === true);
+  const release = useRef<() => void>(() => undefined);
+  // Before the first paint, so the open header is never seen at its resting size first.
+  useLayoutEffect(() => {
     const header = ref.current;
     if (!header) return;
     let stick = 0;
@@ -140,6 +172,23 @@ export function useHeroScroll(ref: RefObject<HTMLElement | null>): boolean {
       writeGrow();
     };
 
+    if (startOpen.current) {
+      startOpen.current = false;
+      open = heroIntroExtra(header.offsetHeight, window.innerHeight);
+      if (open) {
+        // No transition for this one: the header is born open, it does not grow.
+        header.setAttribute("data-pulling", "");
+        writeGrow();
+        void header.offsetHeight;
+        window.requestAnimationFrame(() => header.removeAttribute("data-pulling"));
+      }
+    }
+    release.current = () => {
+      if (!open) return;
+      open = 0;
+      writeGrow(); // the transition in styles.css carries it back to the resting size; the ResizeObserver re-measures
+      measure();
+    };
     measure();
     window.addEventListener("scroll", schedule, { passive: true });
     window.addEventListener("resize", measure);
@@ -157,8 +206,15 @@ export function useHeroScroll(ref: RefObject<HTMLElement | null>): boolean {
       window.removeEventListener("touchend", onTouchEnd);
       window.removeEventListener("touchcancel", onTouchEnd);
       observer?.disconnect();
+      release.current = () => undefined;
       if (frame) window.cancelAnimationFrame(frame);
     };
   }, [ref]);
+  const seenKey = useRef(options.releaseKey);
+  useEffect(() => {
+    if (seenKey.current === options.releaseKey) return;
+    seenKey.current = options.releaseKey;
+    release.current();
+  }, [options.releaseKey]);
   return compact;
 }

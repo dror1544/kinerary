@@ -73,11 +73,11 @@ WHAT IS CHECKED, by code, per answer (`classify`):
 
 WHAT IT IS, AND IS NOT — this is a PROXY. Hermes assembles a companion's system prompt from
 SOUL.md, the skill index, memory and context files, calls tools (`get_config`, web search)
-before answering, and falls down a model chain (gpt-5.6-terra first, then free tiers). Here the
+before answering, and falls down a model chain (gpt-6.1-terra first, then free tiers). Here the
 rendered SOUL.md is the system prompt; the two reference files and a `get_config`-shaped roster
 are appended as "already read"; there are no tools, no memory, no skills, no fallback chain,
 and each call is one turn. The runners are the two models this Mac can reach: claude-sonnet-5
-(the interview's configured model) and gpt-5.6-terra (the companion's configured primary).
+(the interview's configured model) and gpt-6.1-terra (the companion's configured primary).
 
 MODEL CHILDREN are spawned the way control-plane/api/src/model-runner.ts spawns them: an
 allow-listed environment (CHILD_ENV mirrors claudeChildEnv / codexChildEnv), a neutral working
@@ -111,7 +111,7 @@ sys.path.insert(0, str(PKG))
 import render_profile  # noqa: E402  (the production renderer, not a copy)
 
 CLAUDE_MODEL = "claude-sonnet-5"
-CODEX_MODEL = "gpt-5.6-terra"
+CODEX_MODEL = "gpt-6.1-terra"
 EFFORT = "medium"
 TIMEOUT_S = 240
 

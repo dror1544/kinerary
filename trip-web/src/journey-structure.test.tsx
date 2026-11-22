@@ -33,6 +33,12 @@ const CONFIG = {
   ],
 };
 
+// The Plan's day strip lists each phase as a group of day buttons (the old rail and day picker are gone).
+const daysOf = (phase: string) => {
+  const group = screen.getByRole("heading", { name: phase }).closest(".plan-strip-group") as HTMLElement;
+  return within(group).getAllByRole("button");
+};
+
 function renderJourney() {
   return render(
     <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
@@ -41,7 +47,7 @@ function renderJourney() {
         config={CONFIG}
         isOrganizer
         lang="en"
-        onHeroPhaseChange={vi.fn()}
+       
       />
     </QueryClientProvider>,
   );
@@ -50,22 +56,20 @@ function renderJourney() {
 describe("a trip with structure and no plan", () => {
   it("offers every day of the selected phase, marked open", () => {
     renderJourney();
-    const strip = screen.getByLabelText("Days in selected phase");
-    const days = within(strip).getAllByRole("button");
+    const days = daysOf("Tokyo");
     expect(days).toHaveLength(3);
-    expect(within(strip).getAllByText("open")).toHaveLength(3);
+    expect(days.filter((day) => /open/.test(day.textContent || ""))).toHaveLength(3);
   });
 
-  it("counts the days on each phase in the rail", () => {
+  it("shows each phase with its own days in the strip (3 in Tokyo, 2 in Kyoto)", () => {
     renderJourney();
-    const rail = screen.getByLabelText("Trip phases");
-    expect(within(rail).getByText("3 days")).toBeInTheDocument();
-    expect(within(rail).getByText("2 days")).toBeInTheDocument();
+    expect(daysOf("Tokyo")).toHaveLength(3);
+    expect(daysOf("Kyoto")).toHaveLength(2);
   });
 
   it("starts a new activity on the day you were looking at", () => {
     renderJourney();
-    fireEvent.click(screen.getByLabelText("Days in selected phase").querySelectorAll("button")[1]!);
+    fireEvent.click(daysOf("Tokyo")[1]!);
     fireEvent.click(screen.getByRole("button", { name: /add itinerary item/i }));
     expect((screen.getByLabelText("Date") as HTMLInputElement).value).toBe("2026-09-20");
     expect((screen.getByLabelText("Phase") as HTMLSelectElement).value).toBe("tokyo");
@@ -88,7 +92,7 @@ describe("a phase with part of its plan written", () => {
           config={CONFIG}
           isOrganizer
           lang="en"
-          onHeroPhaseChange={vi.fn()}
+         
         />
       </QueryClientProvider>,
     );
@@ -96,14 +100,14 @@ describe("a phase with part of its plan written", () => {
 
   it("still offers every day of the phase, not only the planned one", () => {
     renderPartlyPlanned();
-    const strip = screen.getByLabelText("Days in selected phase");
-    expect(within(strip).getAllByRole("button")).toHaveLength(3);
-    expect(within(strip).getAllByText("open")).toHaveLength(2);
+    const days = daysOf("Tokyo");
+    expect(days).toHaveLength(3);
+    expect(days.filter((day) => /open/.test(day.textContent || ""))).toHaveLength(2);
   });
 
-  it("counts the whole leg in the rail", () => {
+  it("shows the whole leg in the strip", () => {
     renderPartlyPlanned();
-    expect(within(screen.getByLabelText("Trip phases")).getByText("3 days")).toBeInTheDocument();
+    expect(daysOf("Tokyo")).toHaveLength(3);
   });
 
   it("keeps a planned day that falls outside the phase's own range", () => {
@@ -114,14 +118,13 @@ describe("a phase with part of its plan written", () => {
           config={CONFIG}
           isOrganizer
           lang="en"
-          onHeroPhaseChange={vi.fn()}
+         
         />
       </QueryClientProvider>,
     );
-    const strip = screen.getByLabelText("Days in selected phase");
-    expect(within(strip).getAllByRole("button")).toHaveLength(4);
+    expect(daysOf("Tokyo")).toHaveLength(4);
     // Sorted, so the stray day sits after the range rather than first.
-    expect(within(strip).getAllByRole("button").at(-1)!.textContent).toMatch(/25/);
+    expect(daysOf("Tokyo").at(-1)!.textContent).toMatch(/25/);
   });
 });
 

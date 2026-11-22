@@ -11,7 +11,7 @@ beforeEach(() => { useJsdomBasics(); });
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); localStorage.clear(); window.location.hash = ""; });
 
 function serve({ items = dayItems(), today, days }: { items?: ItineraryItem[]; today?: TodayContext; days?: ItineraryDay[] } = {}) {
-  stubTripFetch(() => ({ config: config({ site_video_layout: true }), today: today ?? todayContext(items), items, days }));
+  stubTripFetch(() => ({ config: config({}), today: today ?? todayContext(items), items, days }));
 }
 const card = async () => (await screen.findByRole("region", { name: /Thursday|Friday|Wednesday/ }));
 const rows = (root: HTMLElement) => within(root).getAllByRole("listitem");
@@ -50,13 +50,13 @@ describe("AC-7: one card for the whole day", () => {
     expect(window.location.hash).toBe("#journey");
   });
 
-  it("the other Today panels remain: the trip clock (now the board above the card, see today-cards.test.tsx), the weather, readiness", async () => {
+  it("the other Today panels remain: the trip clock (now the board above the card, see today-cards.test.tsx), the weather, trip anchors", async () => {
     serve();
     renderTrip();
     await card();
     expect(document.querySelector(".clock-panel")).not.toBeNull();
     await waitFor(() => expect(document.querySelector(".weather-panel")).not.toBeNull()); // this trip has no flights: weather alone
-    expect(screen.getByRole("heading", { name: "Readiness" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Trip anchors" })).toBeInTheDocument(); // replaced the Readiness band, see trip-anchors.test.tsx
   });
 });
 
@@ -172,14 +172,14 @@ describe("the trip's navigation app (Google Maps | Waze) decides where every Go 
   const wazeSearch = "https://waze.com/ul?q=Dinner%20at%20the%20Winstub%2C%20Colmar&navigate=yes";
 
   it("a site that says nothing about it (or says something unknown) is Google Maps", async () => {
-    stubTripFetch(() => ({ config: config({ site_video_layout: true }), today: todayContext(dayItems()), items: dayItems(), settings: { nav_app: "apple" } }));
+    stubTripFetch(() => ({ config: config({}), today: todayContext(dayItems()), items: dayItems(), settings: { nav_app: "apple" } }));
     renderTrip();
     const day = await card();
     expect(within(day).getByRole("link", { name: `Go to ${winstub}` })).toHaveAttribute("href", "https://www.google.com/maps/search/?api=1&query=Dinner%20at%20the%20Winstub%2C%20Colmar");
   });
 
   it("set to Waze: the item's waze_url when it has one, else a Waze search on title + destination (Today row)", async () => {
-    stubTripFetch(() => ({ config: config({ site_video_layout: true }), today: todayContext(dayItems()), items: dayItems(), settings: { nav_app: "waze" } }));
+    stubTripFetch(() => ({ config: config({}), today: todayContext(dayItems()), items: dayItems(), settings: { nav_app: "waze" } }));
     renderTrip();
     const day = await card();
     await waitFor(() => expect(within(day).getByRole("link", { name: "Go to Winery tour" })).toHaveAttribute("href", "https://waze.com/ul?q=winery"));
@@ -188,7 +188,7 @@ describe("the trip's navigation app (Google Maps | Waze) decides where every Go 
   });
 
   it("set to Waze: the Plan row's Go chip follows it too", async () => {
-    stubTripFetch(() => ({ config: config({ site_video_layout: true }), today: todayContext(dayItems()), items: dayItems(), settings: { nav_app: "waze" } }));
+    stubTripFetch(() => ({ config: config({}), today: todayContext(dayItems()), items: dayItems(), settings: { nav_app: "waze" } }));
     renderTrip({ hash: "journey" });
     const dinner = (await screen.findByRole("heading", { name: winstub })).closest("article") as HTMLElement;
     await waitFor(() => expect(within(dinner).getByRole("link", { name: `Go to ${winstub}` })).toHaveAttribute("href", wazeSearch));
@@ -196,7 +196,7 @@ describe("the trip's navigation app (Google Maps | Waze) decides where every Go 
 
   it("an unsafe waze_url is never used: the Waze search is", async () => {
     const items = [item({ item_uid: "bad", text_en: "Odd stop", time: "09:00", time_sort: 540, waze_url: "javascript:alert(1)" })];
-    stubTripFetch(() => ({ config: config({ site_video_layout: true }), today: todayContext(items), items, settings: { nav_app: "waze" } }));
+    stubTripFetch(() => ({ config: config({}), today: todayContext(items), items, settings: { nav_app: "waze" } }));
     renderTrip();
     const day = await card();
     await waitFor(() => expect(within(day).getByRole("link", { name: "Go to Odd stop" })).toHaveAttribute("href", "https://waze.com/ul?q=Odd%20stop%2C%20Colmar&navigate=yes"));

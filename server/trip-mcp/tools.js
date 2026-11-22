@@ -274,12 +274,17 @@ function registerTools(mcp, site, { write = true, origin } = {}) {
 
   tool('add_plan_item', 'Add to the plan',
     'Add an activity, meal or transfer to the active plan — this is how something appears on a day. If the phase\'s active plan is empty, ' +
-    'adding one item replaces the original plan the family sees, so check get_phase_plan first.',
+    'adding one item replaces the original plan the family sees, so check get_phase_plan first. ' +
+    'DATE: when the organizer names or implies a day ("the first day", "Thursday", "tomorrow", a date), pass that day\'s `date` (YYYY-MM-DD, ' +
+    'inside the phase\'s dates). Omit `date` only for an idea with no day yet — such an item is on NO day: the site lists it under ' +
+    '"Not on a day yet". After adding, check the returned item has the date you meant (a response with `unscheduled: true` has none); if not, ' +
+    'fix it with update_plan_item before you answer, and never say it was added to a day until the item shows that day.',
     WRITE, {
       phase_id: z.string(),
       text_he: z.string().min(1).describe('Description in Hebrew (required by the site)'),
       text_en: z.string().optional(),
-      date: date.optional(), time: time.optional(),
+      date: date.optional().describe('The day this item is on — pass it whenever the organizer named or implied a day; omit only for an idea with no day yet'),
+      time: time.optional(),
       location_url: z.string().url().optional(),
       booking_id: z.number().int().optional().describe('Link an existing booking so its confirmation shows inline'),
       status: z.enum(['confirmed', 'needs_review']).optional(),
@@ -288,7 +293,7 @@ function registerTools(mcp, site, { write = true, origin } = {}) {
 
   tool('update_plan_item', 'Change a plan item',
     'Correct one item\'s text, move it to another date or time, link a booking, or confirm a needs_review item. Moving an item does not move ' +
-    'its day\'s headline; to exchange two whole days use swap_plan_days.',
+    'its day\'s headline; to exchange two whole days use swap_plan_days. An item that is on no day yet (`unscheduled: true`) gets onto one by passing its `date`.',
     WRITE, {
       phase_id: z.string(), id: z.number().int(),
       text_he: z.string().optional(), text_en: z.string().optional(),

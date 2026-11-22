@@ -1003,12 +1003,17 @@ mcp.tool('add_plan_item',
   'active plan is empty should be seeded from the original plan wholesale, not one item at a time. ' +
   'Set location_url to a Waze or Google Maps link after a web search. ' +
   'Set booking_id to link an existing booking (confirmation will appear inline on the site). ' +
-  'Set status to "needs_review" when content is auto-derived and not yet organizer-confirmed.',
+  'Set status to "needs_review" when content is auto-derived and not yet organizer-confirmed. ' +
+  'DATE: when the organizer names or implies a day ("the first day", "Thursday", "tomorrow", a date), pass that day\'s `date` ' +
+  '(YYYY-MM-DD, inside the phase\'s dates). Omit `date` only for an idea with no day yet — such an item is on NO day: the site lists it ' +
+  'under "Not on a day yet" and it is not on any day of the schedule. After adding, check the returned item has the date you meant ' +
+  '(a response with `unscheduled: true` has none); if not, fix it with update_plan_item before you answer, and never tell the organizer ' +
+  'it was added to a day until the item shows that day.',
   {
     phase_id:     z.string().describe('Phase id from get_config'),
     text_he:      z.string().describe('Activity description in Hebrew (required)'),
     text_en:      z.string().optional().describe('Activity description in English'),
-    date:         z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD').optional().describe('Date YYYY-MM-DD — groups this item into a day block'),
+    date:         z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD').optional().describe('Date YYYY-MM-DD — the day this item is on. Pass it whenever the organizer named or implied a day; omit only for an idea with no day yet (it then lists under "Not on a day yet")'),
     time:         z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'time must be HH:MM (24-hour)').optional().describe('Time in 24-hour HH:MM, e.g. "09:00". The server rejects any other shape.'),
     location_url: z.string().url().optional().describe('Waze or Google Maps URL for this location'),
     booking_id:   z.number().optional().describe('Booking ID from get_bookings to link confirmation details'),
@@ -1022,7 +1027,8 @@ mcp.tool('update_plan_item',
   'another date or time, enrich it with location_url, link a booking, or confirm a needs_review item. ' +
   'Changing `date` moves this ONE item; it does not move the day\'s headline, and it is not how two days are exchanged — ' +
   'for that use swap_plan_days, which moves items and headlines together and atomically. ' +
-  'Never reach for update_booking to correct the itinerary; the site renders the active plan over bookings.',
+  'Never reach for update_booking to correct the itinerary; the site renders the active plan over bookings. ' +
+  'To put an item that is on no day yet (`unscheduled: true`, listed on the site under "Not on a day yet") onto a day, pass its `date` (YYYY-MM-DD).',
   {
     phase_id:     z.string().describe('Phase id the item belongs to'),
     id:           z.number().describe('Plan item ID from get_phase_plan'),

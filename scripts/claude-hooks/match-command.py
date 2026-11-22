@@ -53,10 +53,14 @@ COMMIT = re.compile(CMDPOS + r'(?:sudo\s+)?git\b(?:\s+-\S+(?:\s+\S+)?)*\s+commit
 # `--prefix=dir` and `-C dir`, before `run` or after the script name, and
 # `run-script` for `run`.
 _NPM_DIR = r"(?:--prefix(?:=|\s+)\S+|-C\s+\S+)"
+# Any other npm flag (`--silent`, `-s`, `--loglevel=warn`) may sit there too, and the
+# script still runs: `npm run --silent feature -- set … --live` was classified `none`
+# until 2026-11-20, and it is the spelling the VM runbook uses.
+_NPM_OPT = r"(?:" + _NPM_DIR + r"|--?[A-Za-z][\w-]*(?:=\S+)?)"
 # The flag may itself be quoted (`"--live"`, `'--live'`): the shell strips the
 # quotes and the CLI sees the same argv.
 FEATURE_SET_LIVE = (
-    r'\b(?:npm\s+(?:' + _NPM_DIR + r'\s+)*run(?:-script)?\s+feature(?:\s+' + _NPM_DIR + r')*'
+    r'\b(?:npm\s+(?:' + _NPM_OPT + r'\s+)*run(?:-script)?(?:\s+' + _NPM_OPT + r')*\s+feature(?:\s+' + _NPM_DIR + r')*'
     r'|feature-cli(?:\.[jt]s)?)'
     r'\s+(?:--\s+)?set\b(?:\'[^\']*\'|"[^"]*"|[^\n;&|\'"])*?\s["\']?--live(?![\w-])')
 # The same change by HTTP: a request to the admin route whose body says
@@ -69,39 +73,28 @@ FEATURE_ROUTE_LIVE = (
     r'(?m:^(?=' + _LINE + r'/v1/admin/feature-switches)'
     r'(?:(?=' + _LINE + r'\\*"live\\*"\s*:\s*true\b)'
     r'|(?=' + _LINE + r'(?:-d|--data(?:-binary|-raw|-urlencode)?|--json)(?:\s+|=)@)))')
-DEPLOY = re.compile(
-    CMDPOS + r'(?:sudo\s+)?(?:bash\s+|sh\s+)?\S*(?:deploy\.sh|bring-up\.sh|deploy-trip\.sh|retarget-container\.sh)\b'
-    r'|' + CMDPOS + r'(?:sudo\s+)?docker[ -]compose\b[^\n;&|]*\bup\b'
-    r'|' + CMDPOS + r'(?:sudo\s+)?docker\s+restart\b'
-    # Hard rule 7: removing, stopping or recreating a container is Dror's call,
-    # every time. On 2026-11-09 a verifier ran `docker rm -f` on the test
-    # Postgres every session shares, to get a "fresh" one. `docker exec … psql`
-    # (creating or dropping your own cptest_* database inside it) stays quiet.
-    r'|' + CMDPOS + r'(?:sudo\s+)?docker\s+(?:container\s+)?(?:rm|stop|kill)\b'
-    r'|' + CMDPOS + r'(?:sudo\s+)?docker[ -]compose\b[^\n;&|]*\s(?:down|rm|stop|kill|restart)\b'
-    r'|\bforce-recreate\b'
+# Every deploy verb is one of two kinds (owner's standing approval, 2026-11-20):
+#
+#   ROUTINE_DEPLOY — what the lead session runs to get a change to a trip: a trip's
+#     own deploy wrapper, a site restart, a bridge restart, promoting a release, a
+#     feature switch on one trip or on future trips. Each has a way back (the
+#     previous release, the switch off, the same command again).
+#   ASKING_DEPLOY — everything else: hard rule 7 (a container removed, stopped or
+#     recreated), anything that deletes data or a way back, the VM's version
+#     (whose migration may be `breaking`, which the hook cannot see), every-trip
+#     switches, and whole-host operations.
+#
+# The split is an ALLOW-LIST: a verb is routine only by being named here. Anything
+# added to the asking half later, or matched by neither, keeps asking. Both halves
+# are joined into DEPLOY below, so classification itself is unchanged; only
+# `--deploy-class` reads the split, and pretooluse-bash.sh uses it only when the
+# owner's opt-in is set (CLAUDE.md hard rule 2).
+ROUTINE_DEPLOY = (
+    # The per-trip wrappers and the Mac stack's sidecar. preflight-deploy.sh matches
+    # here too (it ends in deploy.sh); its --deploy deploys the checkout to staging.
+    CMDPOS + r'(?:sudo\s+)?(?:bash\s+|sh\s+)?\S*(?:deploy\.sh|bring-up\.sh|deploy-trip\.sh)\b'
     r'|' + CMDPOS + r'(?:sudo\s+)?systemctl\s+restart\s+trip-server\b'
-    # Tearing a trip down (container, DNS, proxy host, profile) is at least as
-    # live as deploying one. Only --execute: its dry run is read-only, and a
-    # prompt that fires on read-only commands teaches people to click through.
-    r'|' + CMDPOS + r'(?:sudo\s+)?(?:python3?\s+)?\S*teardown-trip\.py\b[^\n;&|]*--execute\b'
-    # The production control plane's release tool: every verb that moves the
-    # running version, the database, the trip bridges, or deletes a way back.
-    # Anywhere on the line, not only at a command position, because it is run
-    # through ssh ("ssh <host> sudo kinerary-cp-release upgrade …"). Its
-    # --dry-run, and status/plan/verify, stay prompt-free.
-    r'|\S*(?:vm-release\.py|kinerary-cp-release)\b(?![^\n;&|]*--dry-run\b)[^\n;&|]*'
-    r'\b(?:upgrade|rollback|prune|install|restart-bridges)\b'
-    # Whole-VM restore is plan-only unless --execute.
-    r'|\S*vm-restore-snapshot\.sh\b[^\n;&|]*--execute\b'
-    # Proxmox guest state. A snapshot freezes the guest's filesystems, a
-    # rollback discards data, an unlock clears the lock a stuck task left. Read
-    # verbs (listsnapshot, config, guest cmd …-status) do not match.
-    r'|\bqm\s+(?:snapshot|rollback|delsnapshot|unlock)\b'
-    # A vzdump into an NFS share froze the host's storage VM, every NFS mount and
-    # the control-plane VM on 2026-09-13; any vzdump, direct or over ssh, is a
-    # question for a person.
-    r'|(?:' + CMDPOS + r'|\bssh\b[^\n;&|]*\s)(?:sudo\s+)?vzdump\b'
+    r'|\S*(?:vm-release\.py|kinerary-cp-release)\b(?![^\n;&|]*--dry-run\b)[^\n;&|]*\brestart-bridges\b'
     # Promoting a release to 'available' ships code. That is the pool
     # generatePlan() selects from, so from this moment every trip built or
     # rebuilt runs this tree — while trips already provisioned stay on the
@@ -112,9 +105,56 @@ DEPLOY = re.compile(
     # and for the every-trip and future-trips scopes it is required. Anywhere on
     # the line, because it is run through ssh. Without --live the command only
     # touches a test trip (or the command refuses), and `list`/`show` read, so
-    # those stay prompt-free. pretooluse-bash.sh words the prompt for it.
-    r'|' + FEATURE_SET_LIVE +
+    # those stay prompt-free. pretooluse-bash.sh words the prompt for it. With
+    # --all it is ASKING_DEPLOY as well (below), so it always asks.
+    r'|' + FEATURE_SET_LIVE)
+# --all on a `feature set`: every trip, the families' trips in use included.
+FEATURE_SET_ALL = (
+    r'\b(?:npm\s+(?:' + _NPM_OPT + r'\s+)*run(?:-script)?(?:\s+' + _NPM_OPT + r')*\s+feature(?:\s+' + _NPM_DIR + r')*'
+    r'|feature-cli(?:\.[jt]s)?)'
+    r'\s+(?:--\s+)?set\b(?:\'[^\']*\'|"[^"]*"|[^\n;&|\'"])*?\s["\']?--all(?![\w-])')
+ASKING_DEPLOY = (
+    # Retargeting points a container at another trip and replaces what it serves.
+    CMDPOS + r'(?:sudo\s+)?(?:bash\s+|sh\s+)?\S*retarget-container\.sh\b'
+    # `compose up` recreates whatever changed, and the hook cannot tell which
+    # stack (a shared one, hard rule 7) it reaches.
+    r'|' + CMDPOS + r'(?:sudo\s+)?docker[ -]compose\b[^\n;&|]*\bup\b'
+    r'|' + CMDPOS + r'(?:sudo\s+)?docker\s+restart\b'
+    # Hard rule 7: removing, stopping or recreating a container is Dror's call,
+    # every time. On 2026-11-09 a verifier ran `docker rm -f` on the test
+    # Postgres every session shares, to get a "fresh" one. `docker exec … psql`
+    # (creating or dropping your own cptest_* database inside it) stays quiet.
+    r'|' + CMDPOS + r'(?:sudo\s+)?docker\s+(?:container\s+)?(?:rm|stop|kill)\b'
+    r'|' + CMDPOS + r'(?:sudo\s+)?docker[ -]compose\b[^\n;&|]*\s(?:down|rm|stop|kill|restart)\b'
+    r'|\bforce-recreate\b'
+    # Tearing a trip down (container, DNS, proxy host, profile) is at least as
+    # live as deploying one. Only --execute: its dry run is read-only, and a
+    # prompt that fires on read-only commands teaches people to click through.
+    r'|' + CMDPOS + r'(?:sudo\s+)?(?:python3?\s+)?\S*teardown-trip\.py\b[^\n;&|]*--execute\b'
+    # The production control plane's release tool: every verb that moves the
+    # running version, the database, or deletes a way back. Anywhere on the line,
+    # not only at a command position, because it is run through ssh ("ssh <host>
+    # sudo kinerary-cp-release upgrade …"). Its --dry-run, and status/plan/verify,
+    # stay prompt-free. `upgrade` stays here: a migration in it may be `breaking`
+    # (a missing header reads as breaking), and only the dry run can say so.
+    r'|\S*(?:vm-release\.py|kinerary-cp-release)\b(?![^\n;&|]*--dry-run\b)[^\n;&|]*'
+    r'\b(?:upgrade|rollback|prune|install)\b'
+    # Whole-VM restore is plan-only unless --execute.
+    r'|\S*vm-restore-snapshot\.sh\b[^\n;&|]*--execute\b'
+    # Proxmox guest state. A snapshot freezes the guest's filesystems, a
+    # rollback discards data, an unlock clears the lock a stuck task left. Read
+    # verbs (listsnapshot, config, guest cmd …-status) do not match.
+    r'|\bqm\s+(?:snapshot|rollback|delsnapshot|unlock)\b'
+    # A vzdump into an NFS share froze the host's storage VM, every NFS mount and
+    # the control-plane VM on 2026-09-13; any vzdump, direct or over ssh, is a
+    # question for a person.
+    r'|(?:' + CMDPOS + r'|\bssh\b[^\n;&|]*\s)(?:sudo\s+)?vzdump\b'
+    # The admin route's body may be read from a file or stdin, so its scope is unknown.
     r'|' + FEATURE_ROUTE_LIVE)
+DEPLOY = re.compile(ROUTINE_DEPLOY + r'|' + ASKING_DEPLOY)
+# --all is not a deploy by itself (without --live the command refuses), so it joins
+# only the asking side, never the classification.
+ASKING = re.compile(ASKING_DEPLOY + r'|' + FEATURE_SET_ALL)
 
 # A commit by another name. Each of these creates or rewrites commits on the
 # current branch, so each is hard rule 1 by a route on which the word "commit"
@@ -413,6 +453,20 @@ raw = strip_heredocs(sys.stdin.read())
 # Merge and push follow commit's rule: quotes stripped, prose does not prompt.
 # Order is by consequence, so `git push && deploy.sh` is a deploy and
 # `git merge x && git commit` is a commit.
+# --deploy-class: `routine` when the command is a deploy, every deploy verb in it is
+# on the routine list, and nothing in it commits, merges or pushes; otherwise
+# `asks` (also for a command that is not a deploy at all). Matched with quotes
+# intact, like DEPLOY, so a protected verb inside an ssh payload is still seen.
+# The --execute tools (teardown, route, rekey) always ask: they delete or re-key,
+# which the standing approval leaves to the owner.
+if len(sys.argv) > 1 and sys.argv[1] == "--deploy-class":
+    stripped = strip_quotes(raw)
+    routine = ((DEPLOY.search(raw) or rollout_hit(raw))
+               and not ASKING.search(raw) and not execute_tool_hit(raw)
+               and not COMMIT.search(stripped) and not MERGE.search(stripped) and not PUSH.search(stripped))
+    print("routine" if routine else "asks")
+    sys.exit(0)
+
 if DEPLOY.search(raw) or rollout_hit(raw) or execute_tool_hit(raw):
     print("deploy")
 elif COMMIT.search(strip_quotes(raw)):

@@ -1280,6 +1280,30 @@ because the migrations said so. It also means **the newest `available` site
 release may be newer than the rolled-back worker**; the tool warns when that
 is the case.
 
+### Taking back one change without the rest of the release
+
+`rollback` returns to the previous release whole. When one change in a release
+misbehaves and the rest must stay (during a freeze, say), ship a release that
+is the running commit minus that change instead:
+
+```bash
+# on a workstation, from the commit the VM runs (`status` names it)
+git switch -c release/revert-<topic> <running commit>
+git revert -m 1 <the change's merge commit>     # -m 1 for a merge; drop it for a plain commit
+git push -u origin release/revert-<topic>
+# on the VM
+sudo kinerary-cp-release plan origin/release/revert-<topic>
+sudo kinerary-cp-release upgrade origin/release/revert-<topic> --dry-run
+sudo kinerary-cp-release upgrade origin/release/revert-<topic>
+```
+
+It is an ordinary upgrade: snapshot, dump, the way back recorded. The revert
+must not remove a migration the database already has; `upgrade` refuses that
+as a downgrade, so a change that carries a migration is taken back with
+`rollback`, never this way. `release/**` survives merges (the ruleset), so the
+branch stays as the record of what ran. Merge the same revert into `main`
+afterwards, or the next upgrade from `main` brings the change back.
+
 ### Snapshots: never on NFS, never stuck, never filling the pool
 
 The only failed snapshot-class task on this host was the 2026-09-13 vzdump

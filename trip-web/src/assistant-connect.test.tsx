@@ -6,7 +6,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MoreView } from "./App";
+import { AccountPage } from "./App";
 
 afterEach(() => {
   cleanup();
@@ -20,7 +20,7 @@ const URL_ = "https://orlando.example/mcp";
 function renderMore(isOrganizer = true) {
   return render(
     <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
-      <MoreView lang="en" isOrganizer={isOrganizer} config={CONFIG} openModule={vi.fn()} />
+      <AccountPage lang="en" currentUser={{ username: "alice", name: "אליס", name_en: "Alice", color: "#123456", is_organizer: isOrganizer } as never} config={CONFIG} />
     </QueryClientProvider>,
   );
 }

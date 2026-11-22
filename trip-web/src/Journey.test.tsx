@@ -21,7 +21,7 @@ describe("Journey lodging", () => {
     render(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
         <JourneyView itinerary={{ revision: "test", days: [day], items: [] }}
-          lang={lang} isOrganizer onHeroPhaseChange={() => {}} />
+          lang={lang} isOrganizer />
       </QueryClientProvider>,
     );
     expect(screen.getByRole("heading", { name: "Arrival" })).toBeInTheDocument();
@@ -41,7 +41,7 @@ describe("Journey lodging", () => {
     const today = { today: "2026-10-02", phase: "active_day" as const, countdown_days: 0, current: null, next: null, events: [], flights: [] };
     render(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
-        <JourneyView itinerary={itinerary} today={today} lang="en" onHeroPhaseChange={() => {}} />
+        <JourneyView itinerary={itinerary} today={today} lang="en" />
       </QueryClientProvider>,
     );
     expect(screen.getByRole("heading", { name: "Active day" })).toBeInTheDocument();
@@ -49,7 +49,7 @@ describe("Journey lodging", () => {
     cleanup();
     render(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
-        <JourneyView itinerary={itinerary} today={{ ...today, phase: "pre_trip" }} lang="en" onHeroPhaseChange={() => {}} />
+        <JourneyView itinerary={itinerary} today={{ ...today, phase: "pre_trip" }} lang="en" />
       </QueryClientProvider>,
     );
     expect(screen.getByRole("heading", { name: "First day" })).toBeInTheDocument();
@@ -60,7 +60,7 @@ describe("Tonight follows the effective stop, not the lodging stored on the day"
   const renderDay = (config: unknown, day: ItineraryDay, lang: "en" | "he" = "en") => render(
     <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
       <JourneyView itinerary={{ revision: "test", days: [day], items: [] }} config={config as never}
-        lang={lang} onHeroPhaseChange={() => {}} focus={{ phaseId: day.phase_id, date: day.date }} />
+        lang={lang} focus={{ phaseId: day.phase_id, date: day.date }} />
     </QueryClientProvider>,
   );
 
