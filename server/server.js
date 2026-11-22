@@ -852,6 +852,11 @@ function authRequired(req, res, next) {
     if (controlPlaneAuth.isSecondaryOrganizerPayload(payload)) req.user.secondaryOrganizer = true;
     // A session that came from a GROUP CLAIM (control-plane-auth.js): read from the stored binding, once per request.
     if (controlPlaneAuth.isClaimedSessionPayload(payload)) req.user.claimedSession = true;
+    // ANY managed member session, a group claim or an invite-bound member (S2c): their sign-in lives with the control plane and
+    // ends with it, so they mint no site credential (password, Google link). Same source, same rule: read from the stored
+    // binding on this request. `claimedSession` stays the narrower, claim-only mark (no assistant list, no consent, the
+    // allow-listed /api/auth/me).
+    if (controlPlaneAuth.isManagedMemberPayload(payload)) req.user.managedMember = true;
     next();
   } catch {
     return res.status(401).json({ error: 'invalid_token' });
@@ -1281,6 +1286,7 @@ try { require('./trip-mcp').registerTripMcp({
   app, db, jwt, jwtSecret: JWT_SECRET, jwtSecretIsDefault: JWT_SECRET === 'trip-dev-secret-change-me',
   validManagedPayload: payload => controlPlaneAuth.validManagedPayload(payload),
   claimedPayload: payload => controlPlaneAuth.isClaimedSessionPayload(payload),
+  bindingOf: payload => controlPlaneAuth.inviteBindingOf(payload),
   organizers: () => normalizeOrganizers(TRIP_CONFIG.agent),
   userExists: username => Boolean(getUser(username)) && (TRIP_CONFIG.participants || []).some(p => p.username === username),
   // Never the raw config: whatever the connector says about the trip is what
@@ -1737,6 +1743,11 @@ app.get('/api/auth/me', authRequired, (req, res) => {
   const claimedView = {};
   for (const field of CLAIMED_ME_FIELDS) if (user[field] !== undefined) claimedView[field] = user[field];
   const body = { ...(req.user.claimedSession ? claimedView : user), is_organizer: organizers.includes(user.username) || secondary, ...(secondary ? { is_secondary_organizer: true } : {}) };
+  // `sign_in_managed` tells the page the person's sign-in lives with their Kinerary account (a group claim or a personal
+  // invite), so the site's own password and Google-link controls, which the routes refuse them, are not drawn. Set here, from
+  // the verified session, for exactly those sessions; absent for everyone else. Not config, not a column: never in
+  // sanitizeConfig or CLAIMED_ME_FIELDS.
+  if (req.user.managedMember) body.sign_in_managed = true;
   // Present only for an organizer. authRequired is not an organizer check and
   // carries no claim, so the person is checked again here. Through the dashboard
   // the managed session is verified (signature, binding, active participant,
@@ -1763,11 +1774,13 @@ app.delete('/api/auth/avatar', authRequired, (req, res) => {
   res.json({ ok: true });
 });
 
-// A session that came from a group claim opens the trip as the traveller and nothing more: it may not set a password,
-// link or unlink Google, or (trip-mcp) approve an MCP connection, because each of those outlives the binding and the
-// control plane's Release, leave-the-group and Unlink would never reach it. Refused alike for all of them.
+// A managed MEMBER session (a group claim, or a personal invite's binding) opens the trip as the traveller and mints no
+// site credential: it may not set a password or link or unlink Google, because each outlives the binding and nothing the
+// control plane does on removal, leave-the-group or Unlink would reach it (an invited person already has a portal login, and
+// removal ends it). A group claim additionally may not approve an MCP connection (trip-mcp); an invited member may, and
+// removal revokes what they approved (revokeBindingGrants). Same refusal for all three routes.
 function refuseClaimedSession(req, res) {
-  if (!req.user?.claimedSession) return false;
+  if (!req.user?.managedMember) return false;
   res.status(403).json({ error: 'claimed_session_cannot_change_credentials' });
   return true;
 }

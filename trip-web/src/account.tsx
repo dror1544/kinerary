@@ -343,71 +343,88 @@ export function Account({
         </button>
         <ActionState action={reset} lang={lang} />
       </Section>
-      <Section title={tr(lang, "Trip password", "סיסמת הטיול")}>
-        <p>
-          {tr(
-            lang,
-            "Changes your direct trip login; your portal account stays the same.",
-            "משנה את סיסמת הכניסה הישירה לטיול; חשבון הפורטל נשאר ללא שינוי.",
-          )}
-        </p>
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (password === confirmation) updatePassword.mutate();
-          }}
-        >
-          <label>
-            {tr(lang, "New password", "סיסמה חדשה")}
-            <input
-              type="password"
-              autoComplete="new-password"
-              minLength={4}
-              required
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-            />
-          </label>
-          <label>
-            {tr(lang, "Repeat password", "חזרה על הסיסמה")}
-            <input
-              type="password"
-              autoComplete="new-password"
-              required
-              value={confirmation}
-              onChange={(e) => setConfirmation(e.target.value)}
-            />
-          </label>
-          {confirmation && password !== confirmation && (
-            <p role="alert">
-              {tr(lang, "Passwords do not match.", "הסיסמאות אינן תואמות.")}
+      {user?.sign_in_managed ? (
+        <Section title={tr(lang, "Signing in", "כניסה")}>
+          <p>
+            {tr(
+              lang,
+              "You sign in with your Kinerary account.",
+              "הכניסה שלך היא עם חשבון Kinerary.",
+            )}
+          </p>
+        </Section>
+      ) : (
+        <>
+          <Section title={tr(lang, "Trip password", "סיסמת הטיול")}>
+            <p>
+              {tr(
+                lang,
+                "Changes your direct trip login; your portal account stays the same.",
+                "משנה את סיסמת הכניסה הישירה לטיול; חשבון הפורטל נשאר ללא שינוי.",
+              )}
             </p>
-          )}
-          <button
-            disabled={
-              updatePassword.isPending ||
-              password !== confirmation ||
-              password.length < 4
-            }
-          >
-            {tr(lang, "Change password", "שינוי סיסמה")}
-          </button>
-          <ActionState action={updatePassword} lang={lang} />
-        </form>
-      </Section>
-      <Section title={tr(lang, "Google account", "חשבון Google")}>
-        {user?.google_email ? (
-          <>
-            <p>{user.google_email}</p>
-            <button disabled={unlink.isPending} onClick={() => unlink.mutate()}>
-              {tr(lang, "Unlink Google", "ניתוק Google")}
-            </button>
-            <ActionState action={unlink} lang={lang} />
-          </>
-        ) : (
-          <GoogleSignIn lang={lang} link onSuccess={() => {}} />
-        )}
-      </Section>
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (password === confirmation) updatePassword.mutate();
+              }}
+            >
+              <label>
+                {tr(lang, "New password", "סיסמה חדשה")}
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  minLength={4}
+                  required
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                />
+              </label>
+              <label>
+                {tr(lang, "Repeat password", "חזרה על הסיסמה")}
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  required
+                  value={confirmation}
+                  onChange={(e) => setConfirmation(e.target.value)}
+                />
+              </label>
+              {confirmation && password !== confirmation && (
+                <p role="alert">
+                  {tr(lang, "Passwords do not match.", "הסיסמאות אינן תואמות.")}
+                </p>
+              )}
+              <button
+                disabled={
+                  updatePassword.isPending ||
+                  password !== confirmation ||
+                  password.length < 4
+                }
+              >
+                {tr(lang, "Change password", "שינוי סיסמה")}
+              </button>
+              <ActionState action={updatePassword} lang={lang} />
+            </form>
+          </Section>
+          <Section title={tr(lang, "Google account", "חשבון Google")}>
+            {user?.google_email ? (
+              <>
+                <p>{user.google_email}</p>
+                <button
+                  disabled={unlink.isPending}
+                  onClick={() => unlink.mutate()}
+                >
+                  {tr(lang, "Unlink Google", "ניתוק Google")}
+                </button>
+                <ActionState action={unlink} lang={lang} />
+              </>
+            ) : (
+              <GoogleSignIn lang={lang} link onSuccess={() => {}} />
+            )}
+          </Section>
+        </>
+      )}
     </div>
   );
 }

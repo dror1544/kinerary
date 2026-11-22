@@ -72,11 +72,12 @@ test('redeeming an invite for an existing traveller changes nothing about the tr
     // the exchange is pinned to the name the invite named, and to the role member
     assert.equal((await exchange(ACTOR, 'eve')).status, 403);
     assert.equal((await api('/api/internal/control-plane/session', { method: 'POST', apiKey: key, body: { tripId, userId: ACTOR, runtimeUsername: 'bob', role: 'owner' } })).status, 403);
-    // an invite-bound member is NOT a claimed session: it may set its own password (what the join page offers it), and the
-    // participant record is otherwise untouched
+    // S2c: an invite-bound member may NOT set a site password (it has a portal login that removal ends; a site password would
+    // outlive it). Was: 200 and a working direct login. The participant record is otherwise untouched.
     const set = await api('/api/auth/password', { method: 'PUT', token, body: { password: 'bobs-own-new-password' } });
-    assert.equal(set.status, 200, await set.clone().text());
-    assert.equal((await api('/api/auth/login', { method: 'POST', body: { username: 'bob', password: 'bobs-own-new-password' } })).status, 200);
+    assert.equal(set.status, 403, await set.clone().text());
+    assert.equal((await api('/api/auth/login', { method: 'POST', body: { username: 'bob', password: 'bobs-own-new-password' } })).status, 401);
+    assert.equal((await api('/api/auth/login', { method: 'POST', body: { username: 'bob', password: '1234' } })).status, 200, "bob's own password still works");
     const after = await (await api('/api/auth/me', { token: (await (await exchange(ACTOR, 'bob')).json()).token })).json();
     assert.equal(after.username, 'bob');
     assert.equal(after.name, me.name, 'the display name is the one it always was');

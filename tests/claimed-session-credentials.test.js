@@ -45,7 +45,7 @@ before(async () => {
 });
 after(() => { stopTestServer(); rmSync(temp, { recursive: true, force: true }); });
 
-test('every session that is not a claim keeps changing its own password exactly as before', async () => {
+test('every session that is not a managed member (claim or invite) keeps changing its own password exactly as before', async () => {
   // a plain password login (a real traveller, or an organizer)
   const plainLogin = await login('eve', '1234');
   assert.equal(plainLogin.status, 200, await plainLogin.clone().text());
@@ -56,12 +56,16 @@ test('every session that is not a claim keeps changing its own password exactly 
   assert.equal((await setPassword(organizer, 'alices-new-password')).status, 200);
   // an owner's managed session
   assert.equal((await setPassword(await exchange(ownerId, null, 'owner'), 'alices-third-password')).status, 200);
-  // an INVITE-bound managed member (the existing invite path binds with an invite id)
+  // an INVITE-bound managed member (the existing invite path binds with an invite id). S2c: it is NO LONGER a session that sets a
+  // password (it has a portal login that removal ends; a site password would outlive that). Was: 200 and a working direct login.
   assert.equal((await internal('participants', { userId: invited, runtimeUsername: 'eve', inviteId: 'invite_claimcreds01' })).status, 200);
   const inv = await exchange(invited, 'eve');
   assert.ok(inv);
-  assert.equal((await setPassword(inv, 'eves-invited-password')).status, 200, 'an invite-bound managed member is a member like any other');
-  assert.equal((await login('eve', 'eves-invited-password')).status, 200);
+  const refused = await setPassword(inv, 'eves-invited-password');
+  assert.equal(refused.status, 403, 'an invite-bound managed member mints no site credential');
+  assert.deepEqual(await refused.json(), { error: 'claimed_session_cannot_change_credentials' });
+  assert.equal((await login('eve', 'eves-invited-password')).status, 401);
+  assert.equal((await login('eve', 'eves-new-password')).status, 200, 'the real traveller\'s own password is the one that works');
 });
 
 test('a session that came from a GROUP CLAIM cannot set a password, link or unlink Google, or approve an MCP connection', async () => {
@@ -88,7 +92,7 @@ test('a session that came from a GROUP CLAIM cannot set a password, link or unli
   const claimed = await post('/oauth/authorize/decision', params, { origin: base, authorization: `Bearer ${token}` });
   assert.equal(claimed.status, 401);
   // the same consent for a plain member still works (as before)
-  const eve = (await (await login('eve', 'eves-invited-password')).json()).token;
+  const eve = (await (await login('eve', 'eves-new-password')).json()).token;
   const plain = await post('/oauth/authorize/decision', params, { origin: base, authorization: `Bearer ${eve}` });
   assert.equal(plain.status, 200);
   assert.match((await plain.json()).redirect_to, /code=/);
@@ -149,10 +153,15 @@ test('/api/auth/me tells a claimed session who the traveller is, and none of the
   assert.equal((await internal('participants/release', { userId: claimant, runtimeUsername: 'bob' })).status, 200);
 });
 
-test('every session that is not a claim: Google link reaches its handler, MCP consent works, a secondary organizer keeps its password', async () => {
+test('every session that is not a managed member: Google link reaches its handler, MCP consent works, a secondary organizer keeps its password; an invite-bound member still consents but its Google link is refused (S2c)', async () => {
   const owner = await exchange(ownerId, null, 'owner');
   const organizerLogin = (await (await login('alice', 'alices-third-password')).json()).token;
-  for (const [name, token] of [['invite-bound member', await exchange(invited, 'eve')], ['owner-managed', owner], ['plain organizer', organizerLogin]]) {
+  const inviteBound = await exchange(invited, 'eve');
+  const noGoogle = await api('/api/auth/google-link', { method: 'PUT', token: inviteBound, body: { idToken: 'x' } });
+  assert.equal(noGoogle.status, 403, 'was 503 (reached its handler) before S2c');
+  assert.deepEqual(await noGoogle.json(), { error: 'claimed_session_cannot_change_credentials' });
+  assert.equal((await consent(inviteBound)).status, 200, 'invite-bound member: MCP consent still works');
+  for (const [name, token] of [['owner-managed', owner], ['plain organizer', organizerLogin]]) {
     const google = await api('/api/auth/google-link', { method: 'PUT', token, body: { idToken: 'x' } });
     assert.equal(google.status, 503, `${name}: the Google link reaches its handler (not configured), not the claimed-session refusal`);
     assert.deepEqual(await google.json(), { error: 'google_not_configured' });
@@ -169,7 +178,8 @@ test('every session that is not a claim: Google link reaches its handler, MCP co
 // Until now the claimed-session view of /api/auth/me was "the row minus five named columns": a column added to the users table
 // tomorrow would have reached a claimant by default. It is now the fields the page demonstrably draws (the same ones
 // server/public-user.js hands to other members, plus `family`, which the classic page reads) and nothing else.
-const ALLOWED = ['username', 'name', 'name_en', 'family', 'color', 'avatar_file', 'is_organizer'];
+// `sign_in_managed` (S2c) is set by the route itself for a managed member session, never read from the users row.
+const ALLOWED = ['username', 'name', 'name_en', 'family', 'color', 'avatar_file', 'is_organizer', 'sign_in_managed'];
 
 test('a NEW column on the site\'s users row does not reach a claimed session; it still reaches the traveller\'s own login (the allow-list is for claims only)', async () => {
   const Database = createRequire(import.meta.url)('../server/node_modules/better-sqlite3');

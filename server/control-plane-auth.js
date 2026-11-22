@@ -5,6 +5,7 @@ const path = require('path');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { normalizeOrganizers } = require('../shared/agent-schema');
+const { revokeBindingGrants } = require('./trip-mcp/oauth');
 
 const userIdValid = value => typeof value === 'string' && /^user_[A-Za-z0-9]{8,64}$/.test(value);
 const tripIdValid = value => typeof value === 'string' && /^trip_[A-Za-z0-9]{8,64}$/.test(value);
@@ -109,6 +110,18 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
   const deadInviteIdsOf = body => Array.isArray(body?.deadInviteIds) && body.deadInviteIds.length <= 50 &&
     body.deadInviteIds.every(id => typeof id === 'string' && /^invite_[A-Za-z0-9]{8,64}$/.test(id)) ? body.deadInviteIds : [];
   const staleInviteBinding = (row, dead) => Boolean(row && row.role === 'member' && typeof row.invite_id === 'string' && dead.includes(row.invite_id));
+  // A binding that carries an invite id is ending (released for a removed member, or replaced as a dead invite's leftover): the
+  // assistant connections APPROVED UNDER IT end with it, in the same step, so nobody inherits them (S2c). Only an invite binding
+  // can have approved one (a claim's session may not), so a claim binding has nothing to revoke. Never logs: no id, no name.
+  const endBindingGrants = row => {
+    if (row && row.role === 'member' && typeof row.invite_id === 'string') revokeBindingGrants(db, { userId: row.user_id, inviteId: row.invite_id });
+  };
+  // Remove one binding row, and (when it is an invite binding) the connections approved under it. Inside the caller's transaction
+  // where there is one, so a failed removal does not revoke and a revoked connection is never left behind a removed binding.
+  const dropBinding = row => {
+    db.prepare('DELETE FROM control_plane_identities WHERE user_id = ? AND trip_id = ?').run(row.user_id, identity.tripId);
+    endBindingGrants(row);
+  };
   const activeUser = username => localUser.get(username) &&
     ((config().participants || []).some(p => p.username === username) || isSecondaryUsername(username));
   // A secondary organizer is never a 'member' and never an 'owner': the role on its identity row is 'organizer' and the
@@ -227,7 +240,7 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
     // This very account's OWN stale binding on this very name (a removed member re-invited, whose release was lost): its old invite is
     // named dead by the control plane, so the binding is replaced by the new invite's.
     if (existing && existing.username === runtimeUsername && staleInviteBinding(existing, deadInviteIdsOf(req.body))) {
-      db.prepare('DELETE FROM control_plane_identities WHERE user_id = ? AND trip_id = ?').run(userId, identity.tripId);
+      db.transaction(() => dropBinding(existing))();
       existing = undefined;
     }
     if (existing) {
@@ -243,7 +256,7 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
     if (onName && (onName.role !== 'member' || onName.trip_id !== identity.tripId || (onName.invite_id !== null && !staleInviteBinding(onName, dead)))) return res.status(409).json({ error: 'IDENTITY_CONFLICT' });
     try {
       db.transaction(() => {
-        if (onName) db.prepare('DELETE FROM control_plane_identities WHERE user_id = ? AND trip_id = ?').run(onName.user_id, identity.tripId);
+        if (onName) dropBinding(onName);
         insert.run(userId, identity.tripId, runtimeUsername, 'member', inviteId);
       })();
     } catch { return res.status(409).json({ error: 'IDENTITY_CONFLICT' }); }
@@ -278,7 +291,7 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
     if (ofUser && ofUser.username !== runtimeUsername) return res.status(409).json({ error: 'IDENTITY_CONFLICT' });
     try {
       db.transaction(() => {
-        if (onName) db.prepare('DELETE FROM control_plane_identities WHERE user_id = ? AND trip_id = ?').run(onName.user_id, identity.tripId);
+        if (onName) dropBinding(onName);
         insert.run(userId, identity.tripId, runtimeUsername, 'member', null);
       })();
     } catch { return res.status(409).json({ error: 'IDENTITY_CONFLICT' }); }
@@ -294,12 +307,19 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
     // exactly as before: only a binding that carries no invite. Idempotent either way. A malformed id is a 400, never "no id".
     const { inviteId } = req.body || {};
     if (inviteId !== undefined && (typeof inviteId !== 'string' || !/^invite_[A-Za-z0-9]{8,64}$/.test(inviteId))) return res.status(400).json({ error: 'INVALID_REQUEST' });
-    const gone = inviteId === undefined
-      ? db.prepare("DELETE FROM control_plane_identities WHERE user_id = ? AND trip_id = ? AND username = ? AND role = 'member' AND invite_id IS NULL")
-        .run(userId, identity.tripId, runtimeUsername)
-      : db.prepare("DELETE FROM control_plane_identities WHERE user_id = ? AND trip_id = ? AND username = ? AND role = 'member' AND invite_id = ?")
-        .run(userId, identity.tripId, runtimeUsername, inviteId);
-    return res.json({ ok: true, released: gone.changes > 0 });
+    // An invite binding's release also ends the assistant (MCP) connections approved under that binding (S2c), in the same
+    // transaction as the row's removal: a release that ends the binding and leaves its connections answering is the hole this
+    // closes, and a release that revoked connections but kept the binding would be as wrong. A claim's release (no invite id)
+    // has nothing to revoke: a claimed session cannot approve a connection.
+    const released = db.transaction(() => {
+      const row = inviteId === undefined
+        ? db.prepare("SELECT * FROM control_plane_identities WHERE user_id = ? AND trip_id = ? AND username = ? AND role = 'member' AND invite_id IS NULL").get(userId, identity.tripId, runtimeUsername)
+        : db.prepare("SELECT * FROM control_plane_identities WHERE user_id = ? AND trip_id = ? AND username = ? AND role = 'member' AND invite_id = ?").get(userId, identity.tripId, runtimeUsername, inviteId);
+      if (!row) return false;
+      dropBinding(row);
+      return true;
+    })();
+    return res.json({ ok: true, released });
   });
 
   // Only for a managed session whose claim passed validManagedPayload on this
@@ -340,6 +360,24 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
     const row = find.get(payload.controlPlane.userId, identity.tripId);
     return Boolean(row && row.role === 'member' && (row.invite_id === null || row.invite_id === undefined) && !isSecondaryUsername(row.username));
   }
+  // Is this verified payload ANY managed MEMBER session: a group claim OR an invite-bound member? Both are people whose way in
+  // is the control plane's, and that ends with their membership or claim. Neither may mint a credential on this site that
+  // outlives it: a password (a direct login on the trip's own hostname holds a plain 30-day JWT no removal reaches), a Google
+  // link. Read from the stored binding on every call, never from the token. NOT a plain password login, not an owner's or an
+  // organizer's managed session, not a secondary organizer.
+  function isManagedMemberPayload(payload) {
+    if (!payload || typeof payload !== 'object' || !Object.prototype.hasOwnProperty.call(payload, 'controlPlane')) return false;
+    if (!validManagedPayload(payload)) return false;
+    const row = find.get(payload.controlPlane.userId, identity.tripId);
+    return Boolean(row && row.role === 'member' && !isSecondaryUsername(row.username));
+  }
+  // What an assistant connection approved by this session must remember: { userId, inviteId } of an INVITE binding, else null.
+  // Never from the token's claims alone: the row is read. A claim binding (no invite) returns null, and may not approve anyway.
+  function inviteBindingOf(payload) {
+    if (!isManagedMemberPayload(payload)) return null;
+    const row = find.get(payload.controlPlane.userId, identity.tripId);
+    return row && typeof row.invite_id === 'string' ? { userId: row.user_id, inviteId: row.invite_id } : null;
+  }
   // Is this verified payload a SECONDARY organizer of this trip? Only a managed claim counts - a plain password, Telegram or
   // Google token for a secondary username is nothing (they have none of those) - and it is re-checked against the stored
   // binding on every request, so a removed or never-bound identity is not one.
@@ -352,6 +390,6 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
     return Boolean(row && row.username === payload.username);
   }
   // `internal` is exported so a second module can mount a route behind the same gate (the plan-changes read, video Release 1C).
-  return { internal, validManagedPayload, isClaimedSessionPayload, dashboardUrlFor, dashboardUrlForOrganizer, isSecondaryOrganizerPayload, isSecondaryUsername };
+  return { internal, validManagedPayload, isClaimedSessionPayload, isManagedMemberPayload, inviteBindingOf, dashboardUrlFor, dashboardUrlForOrganizer, isSecondaryOrganizerPayload, isSecondaryUsername };
 }
 module.exports = { createControlPlaneAuth, safeDashboardUrl, safePortalOrigin };

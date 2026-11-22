@@ -41,7 +41,7 @@ function resolveOrigin(raw) {
 }
 
 function registerTripMcp({
-  app, db, env = process.env, jwt, jwtSecret, jwtSecretIsDefault, validManagedPayload, claimedPayload = () => false, organizers, userExists,
+  app, db, env = process.env, jwt, jwtSecret, jwtSecretIsDefault, validManagedPayload, claimedPayload = () => false, bindingOf = () => null, organizers, userExists,
   getPublicConfig, authRequired, listenPort, listenHost,
 }) {
   const wanted = ['1', 'true'].includes(String(env.TRIP_MCP_ENABLED || '').toLowerCase());
@@ -235,7 +235,9 @@ function registerTripMcp({
       if (!payload?.username || !validManagedPayload(payload)) return null;
       // A group-claim session (control-plane-auth.js) may not approve a connection: the grant would outlive the binding.
       if (claimedPayload(payload)) return null;
-      return payload.username;
+      // What the grant must remember about who approved it: the INVITE binding of an invited member (null for every other
+      // session), read from the stored binding now, never from the token. Removal of that binding ends the grant.
+      return { username: payload.username, binding: bindingOf(payload) };
     } catch { return null; }
   }
 
@@ -244,8 +246,9 @@ function registerTripMcp({
     const v = validateAuthRequest(b);
     if (v.fatal) return res.status(400).json({ error: 'invalid_request' });
     if (v.redirectError) return res.json({ redirect_to: redirectWith(v.redirectUri, { error: v.redirectError, state: v.state }) });
-    const username = sessionUser(req);
-    if (!username) return res.status(401).json({ error: 'unauthorized' });
+    const session = sessionUser(req);
+    if (!session) return res.status(401).json({ error: 'unauthorized' });
+    const { username, binding } = session;
     if (!isParticipant(username)) return res.status(403).json({ error: 'not_on_this_trip' });
     if (b.decision !== 'allow') return res.json({ redirect_to: redirectWith(v.redirectUri, { error: 'access_denied', state: v.state }) });
     // Decided here, from who approved — never from the scope the app asked
@@ -253,7 +256,7 @@ function registerTripMcp({
     const scope = isOrganizer(username) ? SCOPE : READ_SCOPE;
     const code = store.createCode({
       clientId: v.client.client_id, username, redirectUri: v.redirectUri,
-      codeChallenge: v.codeChallenge, resource: v.resource, scope,
+      codeChallenge: v.codeChallenge, resource: v.resource, scope, binding,
     });
     console.log(`[trip-mcp] ${username} approved ${v.client.client_name || v.client.client_id} (${new URL(v.redirectUri).hostname}, ${scope})`);
     res.json({ redirect_to: redirectWith(v.redirectUri, { code, state: v.state }) });
@@ -274,7 +277,8 @@ function registerTripMcp({
       if (!pkceMatches(b.code_verifier, row.code_challenge)) return invalid('code_verifier mismatch');
       if (b.resource && !sameResource(b.resource)) return res.status(400).json({ error: 'invalid_target' });
       if (!isParticipant(row.username)) return invalid('no longer on this trip');
-      return res.json(store.startGrant({ clientId: client.client_id, username: row.username, codeHash: row.code_hash, scope: row.scope }).tokens);
+      return res.json(store.startGrant({ clientId: client.client_id, username: row.username, codeHash: row.code_hash, scope: row.scope,
+        binding: row.binding_user_id && row.binding_invite_id ? { userId: row.binding_user_id, inviteId: row.binding_invite_id } : null }).tokens);
     }
     if (b.grant_type === 'refresh_token') {
       if (!b.refresh_token) return invalid();

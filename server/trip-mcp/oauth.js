@@ -124,6 +124,16 @@ function createOAuthStore(db) {
   // Rows from before scopes existed were all organizer grants.
   if (!columns('mcp_oauth_codes').has('scope')) db.exec(`ALTER TABLE mcp_oauth_codes ADD COLUMN scope TEXT NOT NULL DEFAULT '${SCOPE}'`);
   if (!columns('mcp_oauth_grants').has('scope')) db.exec(`ALTER TABLE mcp_oauth_grants ADD COLUMN scope TEXT NOT NULL DEFAULT '${SCOPE}'`);
+  // What APPROVED a connection, for the one kind of approver whose standing can end: a person who came in through a personal
+  // invite (a managed member session whose binding carries an invite id). The control-plane user id and the invite id of that
+  // binding, copied from the code to the grant. NULL on every other grant, and on every grant that existed before these columns:
+  // NULL means "not any binding's", so an upgrade revokes nothing, and the real traveller's own approvals (a password login) are
+  // never touched by someone else's removal. See revokeBindingGrants.
+  for (const table of ['mcp_oauth_codes', 'mcp_oauth_grants']) {
+    for (const column of ['binding_user_id', 'binding_invite_id']) {
+      if (!columns(table).has(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT`);
+    }
+  }
 
   const q = {
     client: db.prepare('SELECT * FROM mcp_oauth_clients WHERE client_id = ?'),
@@ -133,12 +143,12 @@ function createOAuthStore(db) {
       SELECT client_id FROM mcp_oauth_clients WHERE client_id NOT IN (SELECT client_id FROM mcp_oauth_grants WHERE revoked_at IS NULL)
       ORDER BY created_at ASC LIMIT 1)`),
     insertClient: db.prepare('INSERT INTO mcp_oauth_clients (client_id, client_secret_hash, client_name, redirect_uris, token_endpoint_auth_method, created_at) VALUES (?,?,?,?,?,?)'),
-    insertCode: db.prepare('INSERT INTO mcp_oauth_codes (code_hash, client_id, username, redirect_uri, code_challenge, resource, expires_at, scope) VALUES (?,?,?,?,?,?,?,?)'),
+    insertCode: db.prepare('INSERT INTO mcp_oauth_codes (code_hash, client_id, username, redirect_uri, code_challenge, resource, expires_at, scope, binding_user_id, binding_invite_id) VALUES (?,?,?,?,?,?,?,?,?,?)'),
     code: db.prepare('SELECT * FROM mcp_oauth_codes WHERE code_hash = ?'),
     useCode: db.prepare('UPDATE mcp_oauth_codes SET used_at = ? WHERE code_hash = ? AND used_at IS NULL'),
     linkCode: db.prepare('UPDATE mcp_oauth_codes SET grant_id = ? WHERE code_hash = ?'),
     pruneCodes: db.prepare('DELETE FROM mcp_oauth_codes WHERE expires_at < ?'),
-    insertGrant: db.prepare('INSERT INTO mcp_oauth_grants (id, client_id, username, created_at, scope) VALUES (?,?,?,?,?)'),
+    insertGrant: db.prepare('INSERT INTO mcp_oauth_grants (id, client_id, username, created_at, scope, binding_user_id, binding_invite_id) VALUES (?,?,?,?,?,?,?)'),
     grant: db.prepare('SELECT * FROM mcp_oauth_grants WHERE id = ?'),
     touchGrant: db.prepare('UPDATE mcp_oauth_grants SET last_used_at = ? WHERE id = ? AND (last_used_at IS NULL OR last_used_at < ?)'),
     revokeGrant: db.prepare('UPDATE mcp_oauth_grants SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL'),
@@ -179,10 +189,12 @@ function createOAuthStore(db) {
       return { clientId, clientSecret: secret, issuedAt: t };
     },
 
-    createCode({ clientId, username, redirectUri, codeChallenge, resource, scope }) {
+    // `binding` ({ userId, inviteId }) is set only when an invite-bound managed member approved; see the columns above.
+    createCode({ clientId, username, redirectUri, codeChallenge, resource, scope, binding }) {
       const code = randomToken();
       q.pruneCodes.run(now() - CODE_TTL_S);
-      q.insertCode.run(hash(code), clientId, username, redirectUri, codeChallenge, resource || null, now() + CODE_TTL_S, scope);
+      q.insertCode.run(hash(code), clientId, username, redirectUri, codeChallenge, resource || null, now() + CODE_TTL_S, scope,
+        binding?.userId ?? null, binding?.inviteId ?? null);
       return code;
     },
 
@@ -199,9 +211,9 @@ function createOAuthStore(db) {
       return row;
     },
 
-    startGrant({ clientId, username, codeHash, scope }) {
+    startGrant({ clientId, username, codeHash, scope, binding }) {
       const id = `grant_${randomToken(12)}`;
-      q.insertGrant.run(id, clientId, username, now(), scope);
+      q.insertGrant.run(id, clientId, username, now(), scope, binding?.userId ?? null, binding?.inviteId ?? null);
       if (codeHash) q.linkCode.run(id, codeHash);
       return { grantId: id, tokens: issueTokens(id, scope) };
     },
@@ -253,6 +265,30 @@ function createOAuthStore(db) {
   };
 }
 
+// Ends every connection that was approved under one invite binding, and only those: grants and unexchanged codes whose recorded
+// control-plane user id AND invite id both equal the binding's. Called by the site when that binding ends (a removed member's
+// release, or the replacement of a dead invite's binding), whether or not the MCP endpoint is switched on: the tables outlive a
+// restart with it off. Rows with no recorded binding are never matched. Returns how many grants it ended; it never logs or
+// returns an id. A site that never enabled the MCP endpoint has no tables, which is "nothing to revoke".
+function revokeBindingGrants(db, { userId, inviteId }) {
+  if (typeof userId !== 'string' || typeof inviteId !== 'string' || !userId || !inviteId) return 0;
+  const columnsOf = table => db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name);
+  const bound = table => { const c = columnsOf(table); return c.includes('binding_user_id') && c.includes('binding_invite_id'); };
+  // No table, or one from before the columns existed, cannot hold a binding grant.
+  if (!bound('mcp_oauth_grants') || !bound('mcp_oauth_codes') || !columnsOf('mcp_oauth_tokens').length) return 0;
+  const t = now();
+  return db.transaction(() => {
+    const ids = db.prepare('SELECT id FROM mcp_oauth_grants WHERE binding_user_id = ? AND binding_invite_id = ? AND revoked_at IS NULL').all(userId, inviteId);
+    for (const { id } of ids) {
+      db.prepare('UPDATE mcp_oauth_grants SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL').run(t, id);
+      db.prepare('UPDATE mcp_oauth_tokens SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL').run(t, id);
+    }
+    // A code approved but not yet exchanged would otherwise still become a grant; one already exchanged has its grant above.
+    db.prepare('DELETE FROM mcp_oauth_codes WHERE binding_user_id = ? AND binding_invite_id = ? AND used_at IS NULL').run(userId, inviteId);
+    return ids.length;
+  })();
+}
+
 function pkceMatches(verifier, challenge) {
   if (typeof verifier !== 'string' || !/^[A-Za-z0-9._~-]{43,128}$/.test(verifier)) return false;
   return safeEqual(crypto.createHash('sha256').update(verifier).digest('base64url'), challenge);
@@ -281,6 +317,6 @@ function authenticateClient(store, req) {
 }
 
 module.exports = {
-  createOAuthStore, redirectAllowed, isLoopbackHost, pkceMatches, authenticateClient, hash,
+  createOAuthStore, revokeBindingGrants, redirectAllowed, isLoopbackHost, pkceMatches, authenticateClient, hash,
   SCOPE, READ_SCOPE, ACCESS_TTL_S, DEFAULT_REDIRECT_URIS, MAX_URI_LENGTH,
 };
