@@ -1,6 +1,6 @@
 # The companion on WhatsApp, in a group or a private chat, through the relay (first slice)
 
-Status: draft (2026-11-21; two consult reviews applied; the owner's answers to the open questions recorded the same day; approval not yet recorded) · Issue: none yet (file one; this file is renamed to `<n>-whatsapp-via-relay.md` then) · Track: its own track, after Release 1 (Dror, 2026-11-21) · Size: L (five slices) · Tier: High
+Status: approved (2026-11-21, by Dror; two consult reviews applied and the owner's answers to the open questions recorded before approval) · Issue: #625 · Track: its own track, after Release 1 (Dror, 2026-11-21) · Size: L (five slices) · Tier: High
 Security path: yes (the relay's trust boundary, chat-to-trip resolution, outbound scope, portal routes, and in S5 an account and membership path) · Migration: yes (S2 and S5) · Live-trip behaviour: yes (relay behaviour; risk class), switched off by default
 
 Related: `docs/per-trip-gateway-architecture.md` §4; `docs/specs/sprint-9/x-relay-chat-scope.md`
