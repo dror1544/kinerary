@@ -448,6 +448,13 @@ function _applySignInManagedUI() {
   if (!managed) {
     if (note) note.remove();
     if (toggle) toggle.style.display = '';
+    // Put the Google block back to what initGoogleAuth made of it for this page: shown only when Google is configured here
+    // (it marks the block, once), never on a trip with no Google client. A page can go from a managed session to a plain one
+    // without a reload (sign out, pick another person), and initGoogleAuth does not run again.
+    if (googleWrap && googleWrap.dataset.googleOffered === 'true') {
+      googleWrap.style.display = 'flex';
+      _updateGoogleConnectUI();
+    }
     return;
   }
   if (toggle) toggle.style.display = 'none';
@@ -880,6 +887,7 @@ async function initGoogleAuth() {
   const googleWrap = document.getElementById('avatar-lb-google-wrap');
   if (googleWrap) {
     googleWrap.style.display = 'flex';
+    googleWrap.dataset.googleOffered = 'true'; // _applySignInManagedUI may hide the block for a managed session, and restores it from this
     google.accounts.id.renderButton(document.getElementById('avatar-lb-google-btn'), {
       type: 'standard', theme: 'outline', size: 'medium', text: 'continue_with', width: 220,
     });

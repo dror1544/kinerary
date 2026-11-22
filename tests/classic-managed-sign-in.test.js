@@ -43,8 +43,14 @@ function screen(overrides = {}) {
     showLoggedIn: () => { calls.showLoggedIn++; },
     ...overrides,
   });
+  delete ctx.realUi;
+  if (overrides.realUi) delete ctx._updateGoogleConnectUI;
   vm.runInContext(TRANSLATIONS.replace(/^const T\b/m, 'var T'), ctx);
   vm.runInContext(`${extract('_applySignInManagedUI')}\n${extract('disconnectGoogle', true)}`, ctx);
+  if (overrides.realUi) {
+    // The real Google wiring: what initGoogleAuth does once at load, and what refreshes the block afterwards.
+    vm.runInContext(`${extract('_updateGoogleConnectUI')}\n${extract('initGoogleAuth', true)}\nfunction handleGoogleCredential() {}`, ctx);
+  }
   return { win, ctx, calls, $: id => win.document.getElementById(id) };
 }
 
@@ -71,9 +77,89 @@ test('every other session: the password button and the Google block are left exa
   assert.equal(s.$('avatar-lb-sign-in-managed'), null);
 });
 
-test('the avatar screen applies it every time it opens, and the disconnect button runs the checked handler', () => {
+test('the avatar screen applies it every time it opens', () => {
   assert.match(extract('openAvatarLightbox', true), /_applySignInManagedUI\(\)/);
-  assert.match(APP, /getElementById\('avatar-lb-google-disconnect'\)\?\.addEventListener\('click', disconnectGoogle\)/);
+});
+
+test('the real listener registration: clicking Disconnect Google attempts the DELETE, and a refusal shows the error and keeps the link', async () => {
+  for (const [accepted, expectedEmail] of [[false, 'eve@example.test'], [true, null]]) {
+    const sent = [];
+    const s = screen({ realUi: true, fetch: async (path, init) => { sent.push([path, init.method]); return { ok: accepted, status: accepted ? 200 : 403 }; },
+      lbClose() {}, lbGoTo() {} });
+    // initAvatarLightbox is what registers every avatar-screen listener, the disconnect one among them
+    vm.runInContext(extract('initAvatarLightbox'), s.ctx);
+    vm.runInContext('initAvatarLightbox()', s.ctx);
+    s.$('avatar-lb-google-disconnect').dispatchEvent(new s.win.Event('click'));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.deepEqual(sent, [['/api/auth/google-link', 'DELETE']], 'the click reached the handler and the DELETE was attempted');
+    assert.equal(s.ctx.currentUser.google_email, expectedEmail);
+    if (!accepted) assert.ok(s.$('avatar-lb-google-status').textContent.length > 0, 'the refusal is shown');
+  }
+});
+
+// ── one page, several sessions (logout, then another person from the login picker, no reload) ─────────────────────────
+
+async function pageWith({ googleConfigured }) {
+  const s = screen({
+    realUi: true,
+    google: googleConfigured ? { accounts: { id: { initialize() {}, renderButton() {} } } } : undefined,
+    fetch: async () => ({ json: async () => ({ googleClientId: googleConfigured ? 'client-id' : null }) }),
+  });
+  await vm.runInContext('initGoogleAuth()', s.ctx); // once, at page load, exactly as the page does
+  const as = (user) => { s.ctx.currentUser = user; vm.runInContext('_applySignInManagedUI(); _updateGoogleConnectUI();', s.ctx); };
+  const state = () => ({
+    pwButton: s.$('avatar-lb-pw-toggle').style.display !== 'none',
+    googleBlock: s.$('avatar-lb-google-wrap').style.display === 'flex',
+    disconnect: s.$('avatar-lb-google-disconnect').style.display !== 'none',
+    status: s.$('avatar-lb-google-status').textContent,
+    line: Boolean(s.$('avatar-lb-sign-in-managed')),
+  });
+  return { s, as, state };
+}
+const EVE = { username: 'eve', google_email: 'eve@example.test' };
+const FRESH_EVE = { pwButton: true, googleBlock: true, disconnect: true, status: '✓ Connected as eve@example.test', line: false };
+
+test('managed, then a plain user on the SAME page: the Google block comes back exactly as on a fresh page (Google configured)', async () => {
+  const fresh = await pageWith({ googleConfigured: true });
+  fresh.as(EVE);
+  assert.deepEqual(fresh.state(), FRESH_EVE, 'what a fresh page shows the plain user');
+  const p = await pageWith({ googleConfigured: true });
+  p.as({ username: 'eve', sign_in_managed: true });
+  assert.equal(p.state().pwButton, false);
+  assert.equal(p.state().googleBlock, false);
+  assert.equal(p.state().line, true);
+  p.as(EVE);
+  assert.deepEqual(p.state(), FRESH_EVE);
+  // and an unlinked plain user gets the connect button, not the disconnect one
+  p.as({ username: 'eve' });
+  assert.deepEqual(p.state(), { pwButton: true, googleBlock: true, disconnect: false, status: '', line: false });
+});
+
+test('managed, then plain, on a trip with NO Google client: the Google block stays hidden throughout', async () => {
+  const p = await pageWith({ googleConfigured: false });
+  p.as(EVE);
+  assert.equal(p.state().googleBlock, false, 'not offered on a fresh page');
+  p.as({ username: 'eve', sign_in_managed: true });
+  assert.equal(p.state().googleBlock, false);
+  p.as(EVE);
+  assert.equal(p.state().googleBlock, false, 'not offered after the managed session either');
+  assert.equal(p.state().pwButton, true);
+  assert.equal(p.state().line, false);
+  assert.equal(p.s.$('avatar-lb-google-wrap').style.display, 'none', 'still the hidden block the markup ships');
+});
+
+test('plain, managed, plain on one page: every switch lands on what a fresh page shows for that session', async () => {
+  const p = await pageWith({ googleConfigured: true });
+  p.as(EVE);
+  assert.deepEqual(p.state(), FRESH_EVE);
+  p.as({ username: 'bob', sign_in_managed: true });
+  assert.equal(p.state().googleBlock, false);
+  assert.equal(p.state().pwButton, false);
+  p.as(EVE);
+  assert.deepEqual(p.state(), FRESH_EVE);
+  p.as({ username: 'bob', sign_in_managed: true });
+  p.as(EVE);
+  assert.deepEqual(p.state(), FRESH_EVE);
 });
 
 test('Google disconnect: a refusal leaves the link in place and shows the error string; only a success clears it', async () => {
