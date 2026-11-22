@@ -67,7 +67,7 @@ import {
 import { redeemTelegramLinkToken, telegramLinkTokenFromStartPayload } from "../telegram-link-token.js";
 import { bindSecondaryOrganizerChat, redeemSecondaryOrganizerToken, secondaryOrganizerTokenFromStartPayload } from "../secondary-organizers.js";
 import { isAddressedToAssistant } from "./addressing.js";
-import { handleInvite, inviteInGroupReply, inviteOrganizerFor, inviteUnconfiguredReply, isForwardedMessage, type SiteInviteDeps } from "./invite-command.js";
+import { handleInvite, inviteInGroupReply, inviteOrganizerFor, inviteUnconfiguredReply, isIndirectMessage, type SiteInviteDeps } from "./invite-command.js";
 import { addressedMark, conversationMark, reactionAnswerMark } from "./stay-silent.js";
 import type { GroupJudge, JudgeOutcome } from "./group-judge.js";
 import { classifyTrigger, inboundFacts, type InboundFacts, type JudgeFacts, type LevelChangeFacts } from "../analytics/relay-facts.js";
@@ -206,6 +206,12 @@ export type DispatchDecision =
    * answer tells both back. Each message is sent on its own; one that fails does not stop the others.
    */
   | { kind: "multi_reply"; callbackQueryId?: string; ackText?: string; replies: DirectReply[] }
+  /**
+   * `/invite`: a personal invite was just created and its two messages (the summary, then the forwardable one carrying the link) must be
+   * DELIVERED to `chatId`; if either cannot be, the poller revokes invite `inviteId` and says `failed` (relay/invite-command.ts). A
+   * decision of its own because a plain reply cannot undo the invite when the send fails.
+   */
+  | { kind: "invite_messages"; chatId: string; inviteId: string; summary: string; link: string; failed: string }
   /** A tapped inline button that belongs to the interview flow. */
   | {
       kind: "interview_callback";
@@ -1198,8 +1204,8 @@ export async function dispatchUpdate(
 
   // `/invite <traveller>`: an organizer asks, in their OWN private chat, for a traveller's personal invite (x-member-sign-in S2b;
   // relay/invite-command.ts has the whole contract). Who and where come from the update and the database, never from the text:
-  //   - only a FRESH, plain, unforwarded text message acts (an edit, a forward and a caption are not a command: the link is a credential
-  //     and a replayed or relayed line must not mint one);
+  //   - only a FRESH, plain, direct text message acts (an edit, a forward, a caption, `via_bot` and a business message are not a command:
+  //     the link is a credential and a replayed or relayed line must not mint one);
   //   - a group, whoever types, gets one short sentence (the same for everyone in it, so it says nothing about who may);
   //   - in a private chat only the verified organizer of the chat's own trip, with dashboard access, is answered here;
   //   - everybody else falls through, untouched, to the answer any unknown command gets: asking confirms nothing.
@@ -1209,7 +1215,7 @@ export async function dispatchUpdate(
     parsed.name === "invite" &&
     update.message === message &&
     typeof message.text === "string" &&
-    !isForwardedMessage(message)
+    !isIndirectMessage(message)
   ) {
     const route = await resolveChatRoute(db, chatId);
     if (route.kind === "companion") {
@@ -1224,8 +1230,11 @@ export async function dispatchUpdate(
         if (!options.siteInvites) {
           return { kind: "reply", reply: inviteUnconfiguredReply(chatId, language, log) };
         }
-        const replies = await handleInvite(db, options.siteInvites, { chatId, tripId: route.tripId, organizerUserId, argument: parsed.argument, language }, log);
-        return replies.length === 1 ? { kind: "reply", reply: replies[0]! } : { kind: "multi_reply", replies };
+        const answer = await handleInvite(db, options.siteInvites, { chatId, tripId: route.tripId, organizerUserId, argument: parsed.argument, language }, log);
+        if (answer.kind === "created") {
+          return { kind: "invite_messages", chatId, inviteId: answer.inviteId, summary: answer.summary, link: answer.link, failed: answer.failed };
+        }
+        return answer.replies.length === 1 ? { kind: "reply", reply: answer.replies[0]! } : { kind: "multi_reply", replies: answer.replies };
       }
       log(structuredLog("info", "trip_bot.invite_command", { outcome: "not_organizer" }));
     }

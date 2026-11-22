@@ -156,6 +156,13 @@ export const PORTAL_SCOPE_POLICY: Readonly<Record<string, RouteScope>> = Object.
   // A site invite is a join URL that anyone can redeem anonymously with a password: it makes an account
   // that outlives the Unlink of the session that minted it (round 3, MF1). Revoking an invite and removing
   // a member take access away from other people; a forwardee must not do either. All three need a password.
+  //
+  // RECORDED EXCEPTION (owner's decision, Dror, 2026-11-22): the Telegram bot's `/invite <name>` (relay/invite-command.ts) lets an
+  // organizer PROVEN BY TELEGRAM create exactly this kind of invite, without a password session. It does not go through this route or
+  // this policy, so nothing in this table changes; it is a named exception to the rule above, bounded: the organizer's own PRIVATE chat
+  // only, an organizer of that trip WITH dashboard access, 5 invites per organizer per trip per hour, EXISTING travellers only (it binds a
+  // participant the trip site already lists, never creates one), and the link is delivered only to that chat. If this row is ever
+  // loosened or tightened, read that file's header too: the two are one decision.
   "POST /v1/trips/:id/site-invites": "account",
   "DELETE /v1/trips/:id/site-invites/:inviteId": "account",
   "DELETE /v1/trips/:id/members/:membershipId": "account",

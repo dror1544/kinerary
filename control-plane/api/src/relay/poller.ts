@@ -202,7 +202,7 @@ import {
   type DispatchDecision,
   type DispatchStrings,
 } from "./dispatch.js";
-import type { SiteInviteDeps } from "./invite-command.js";
+import { revokeUnsentInvite, type SiteInviteDeps } from "./invite-command.js";
 import { toWireEvent, type TelegramUpdate } from "./normalize.js";
 import { isOurOpenTripMessage, type OpenTripMessage } from "./open-trip.js";
 import { agentTextIsInLanguage } from "./internal-leak.js";
@@ -507,6 +507,30 @@ export async function applyDecision(
           log(structuredLog("warn", "trip_bot.multi_reply_send_failed", { detail: String((error as Error)?.message ?? error).slice(0, 200) }));
         }
       }
+      return;
+    }
+
+    case "invite_messages": {
+      // `/invite` (relay/invite-command.ts): the invite already exists, so a message that cannot be delivered must not leave it pending
+      // with nobody holding the link. The summary goes first, then the link message; if either fails the invite just made is revoked
+      // (the earlier link a replacement killed stays dead) and the organizer is told, best effort. A refused or lost send is an
+      // `{ok:false}` answer OR a throw, and both count. Nothing here logs a message: only the step and whether Telegram called it permanent.
+      const attempt = async (text: string): Promise<{ failed: false } | { failed: true; permanent: boolean }> => {
+        try {
+          const sent = await deps.telegram.sendMessage({ chatId: decision.chatId, text });
+          return sent.ok ? { failed: false } : { failed: true, permanent: sent.permanent === true };
+        } catch {
+          return { failed: true, permanent: false };
+        }
+      };
+      const summary = await attempt(decision.summary);
+      const link = summary.failed ? summary : await attempt(decision.link);
+      if (!link.failed) return;
+      await revokeUnsentInvite(deps.db, decision.inviteId).catch((error) => {
+        log(structuredLog("error", "trip_bot.invite_revoke_failed", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN" }));
+      });
+      log(structuredLog("warn", "trip_bot.invite_delivery_failed", { step: summary.failed ? "summary" : "link", permanent: link.permanent }));
+      await attempt(decision.failed);
       return;
     }
 

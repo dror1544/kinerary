@@ -20,7 +20,7 @@ import { applyMigrations } from "../src/migrations.js";
 import { DEFAULT_STRINGS, dispatchUpdate, type DispatchDecision, type DispatchOptions, type DirectReply } from "../src/relay/dispatch.js";
 import { applyDecision, type TripBotPollerDeps } from "../src/relay/poller.js";
 import { digestTelegramId } from "../src/identity.js";
-import { normalizeTravellerName } from "../src/relay/invite-command.js";
+import { normalizeTravellerName, travellerSkeleton } from "../src/relay/invite-command.js";
 import type { RuntimeAccountAdapter } from "../src/portal.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
 import { testDatabaseUrl, testPool } from "./support/test-database.js";
@@ -130,7 +130,7 @@ async function run(w: World, update: TelegramUpdate, options: DispatchOptions = 
   const decision = await dispatchUpdate(pool, update, DEFAULT_STRINGS, w.log, {}, options);
   // `INVITE_TRACE=<file> npm test ...` appends each update that went in and every message the bot sent out, one JSON line each.
   if (process.env.INVITE_TRACE) {
-    const out = decision.kind === "reply" ? [decision.reply] : decision.kind === "multi_reply" ? decision.replies : [];
+    const out = repliesOf(decision);
     appendFileSync(process.env.INVITE_TRACE, `${JSON.stringify({ update: update.message ?? update.edited_message, decision: decision.kind, sends: out.map((r) => ({ chat_id: r.chatId, text: r.text })) })}\n`);
   }
   return decision;
@@ -138,8 +138,10 @@ async function run(w: World, update: TelegramUpdate, options: DispatchOptions = 
 function repliesOf(decision: DispatchDecision): DirectReply[] {
   if (decision.kind === "reply") return [decision.reply];
   if (decision.kind === "multi_reply") return decision.replies;
+  if (decision.kind === "invite_messages") return [{ chatId: decision.chatId, text: decision.summary }, { chatId: decision.chatId, text: decision.link }];
   return [];
 }
+const EVERY_NAME = ["Dana", "Levi", "Noam", "Maya", "Katz", "יעל", "כהן", "Olga"];
 const textOf = (decision: DispatchDecision) => repliesOf(decision).map((r) => r.text).join("\n---\n");
 const invites = async (tripId: string) =>
   (await pool.query("SELECT id, created_by, runtime_username, state, intended_display_name FROM control_plane.site_invites WHERE trip_id = $1 ORDER BY created_at, id", [tripId])).rows as
@@ -187,7 +189,7 @@ describe("/invite: an organizer, in their own private chat, with dashboard acces
     const w = await world();
     const before = await outboxCount();
     const decision = await run(w, asOwner(w, "/invite Dana Levi"));
-    assert.ok(decision.kind === "reply" || decision.kind === "multi_reply", `answered by the relay itself, not the gateway: ${decision.kind}`);
+    assert.ok(decision.kind === "invite_messages", `answered by the relay itself, not the gateway: ${decision.kind}`);
     assert.ok(repliesOf(decision).every((r) => r.chatId === w.ownerChat), "every message goes to the organizer's private chat");
     const rows = await invites(w.tripId);
     assert.equal(rows.length, 1);
@@ -246,7 +248,15 @@ describe("/invite: an organizer, in their own private chat, with dashboard acces
     const forwarded = await run(w, say(w.ownerTg, w.ownerChat, "/invite Dana Levi", "private", { forward_origin: { type: "user" }, forward_date: 1 }));
     const caption = await run(w, { update_id: 3, message: { message_id: 8, from: { id: w.ownerTg }, chat: { id: w.ownerChat, type: "private" }, caption: "/invite Dana Levi", photo: [{ file_id: "x" }] } as never });
     const bot = await run(w, say(w.ownerTg, w.ownerChat, "/invite Dana Levi", "private", { from: { id: w.ownerTg, is_bot: true } }));
-    for (const d of [edited, forwarded, caption, bot]) assert.doesNotMatch(textOf(d), /join#token/);
+    // Sent through another bot, or by a business bot on somebody's behalf: not a person typing to this bot.
+    const viaBot = await run(w, say(w.ownerTg, w.ownerChat, "/invite Dana Levi", "private", { via_bot: { id: 99, is_bot: true, username: "other_bot" } }));
+    const businessBot = await run(w, say(w.ownerTg, w.ownerChat, "/invite Dana Levi", "private", { sender_business_bot: { id: 98, is_bot: true } }));
+    const businessConnection = await run(w, say(w.ownerTg, w.ownerChat, "/invite Dana Levi", "private", { business_connection_id: "bc_1" }));
+    for (const d of [edited, forwarded, caption, bot, viaBot, businessBot, businessConnection]) {
+      assert.doesNotMatch(textOf(d), /join#token/);
+      assert.ok(!textOf(d).includes("Dana"), "no traveller name either");
+    }
+    for (const d of [viaBot, businessBot, businessConnection]) assert.match(textOf(d), /isn't one of my commands/, "falls through to the unknown-command answer");
     assert.deepEqual(await invites(w.tripId), []);
   });
 
@@ -308,6 +318,18 @@ describe("/invite: who is refused, and where", { skip: SKIP }, () => {
     const kinds: [string, (telegramId: number) => Promise<void>][] = [
       ["plain member", async (n) => { const u = await mkUser("M"); await mkMember(w.tripId, u, "member"); await linkMember(w.tripId, u, n); }],
       ["claimed member", async (n) => { const u = await mkUser("C"); await mkMember(w.tripId, u, "member"); await linkMember(w.tripId, u, n); await pool.query("INSERT INTO control_plane.trip_participant_claims(id, trip_id, user_id, runtime_username, via, telegram_user_id) VALUES ($1, $2, $3, 'mk05', 'group_membership', $4)", [id("tpc"), w.tripId, u, String(n)]); }],
+      ["invited member (redeemed a personal invite)", async (n) => {
+        const u = await mkUser("I"); await mkMember(w.tripId, u, "member");
+        await pool.query("INSERT INTO control_plane.telegram_member_links(id, user_id, trip_id, telegram_subject_digest, verified_via) VALUES ($1, $2, $3, $4, 'mini_app_invite_redemption')", [id("tml"), u, w.tripId, digestTelegramId(String(n))]);
+        await pool.query(
+          `INSERT INTO control_plane.site_invites(id, trip_id, created_by, intended_display_name, runtime_username, token_digest, state, expires_at, redeemed_by, redeemed_at)
+           VALUES ($1, $2, $3, 'Noam Levi', 'nl23', $4, 'redeemed', now() + interval '1 day', $5, now())`, [id("invite"), w.tripId, w.owner, `sha256:${hex().padEnd(64, "0")}`, u]);
+      }],
+      ["a linked organizer whose membership role is plain member (dashboard access or not)", async (n) => { const u = await mkUser("LM"); await mkMember(w.tripId, u, "member", true); await linkOrganizer(w.tripId, u, n); }],
+      ["an organizer link on this trip with an active membership only on ANOTHER trip", async (n) => {
+        const u = await mkUser("LB"); const other = await mkTrip("Other trip");
+        await mkMember(other, u, "owner"); await linkOrganizer(w.tripId, u, n);
+      }],
       ["stranger", async () => undefined],
       ["former organizer", async (n) => { const u = await mkUser("F"); await mkMember(w.tripId, u, "organizer"); await linkOrganizer(w.tripId, u, n, true); }],
       ["secondary organizer without the dashboard", async (n) => { const u = await mkUser("S"); await mkMember(w.tripId, u, "organizer", false); await linkOrganizer(w.tripId, u, n); }],
@@ -325,8 +347,10 @@ describe("/invite: who is refused, and where", { skip: SKIP }, () => {
       assert.match(textOf(d), /isn't one of my commands/, label);
       assert.doesNotMatch(textOf(d), /organizer|dashboard|private chat|Dana|Levi/i, `${label}: nothing that says the command exists for anyone`);
       assert.ok(!(await sentBy(w, d)).some((s) => /join#token/.test(s.text)));
+      // The list of invitable names reaches only a verified organizer: no reply to a refused sender holds any traveller's name.
+      for (const name of EVERY_NAME) assert.ok(!textOf(d).includes(name), `${label}: the reply names ${name}`);
     }
-    assert.deepEqual(await invites(w.tripId), [], "nothing written for any of them");
+    assert.deepEqual((await invites(w.tripId)).map((r) => r.state), ["redeemed"], "nothing written for any of them (the one row is the invited member's own, seeded)");
     // And the owner's own chat did not change.
     assert.match(textOf(await run(w, asOwner(w, "/invite Dana Levi"))), /join#token/);
   });
@@ -535,22 +559,202 @@ describe("/invite: what createSiteInvite answers, in plain words", { skip: SKIP 
 });
 
 describe("/invite: rate limit", { skip: SKIP }, () => {
-  test("30 invites per organizer per trip per hour; the 31st is refused, nothing written; another organizer's allowance is their own", async () => {
-    const w = await world();
-    for (let i = 0; i < 30; i += 1) {
+  // The number is a LITERAL here on purpose: raising the constant in the source must fail this test, not silently follow it.
+  const seedInvites = async (w: World, count: number, ageSql = "now()") => {
+    for (let i = 0; i < count; i += 1) {
       await pool.query(
-        `INSERT INTO control_plane.site_invites(id, trip_id, created_by, intended_display_name, runtime_username, token_digest, state, expires_at)
-         VALUES ($1, $2, $3, 'X', $4, $5, 'revoked', now() + interval '1 day')`,
+        `INSERT INTO control_plane.site_invites(id, trip_id, created_by, intended_display_name, runtime_username, token_digest, state, expires_at, created_at)
+         VALUES ($1, $2, $3, 'X', $4, $5, 'revoked', now() + interval '1 day', ${ageSql})`,
         [id("invite"), w.tripId, w.owner, `xx${String(i).padStart(2, "0")}`, `sha256:${hex().padEnd(64, "0")}`]);
     }
-    const d = await run(w, asOwner(w, "/invite Dana Levi"));
-    assert.match(textOf(d), /too many|later/i);
-    assert.doesNotMatch(textOf(d), /join#token/);
-    assert.equal((await invites(w.tripId)).length, 30);
-    assert.ok(w.logs.some((l) => /"outcome":"rate_limited"/.test(l)));
-    // A second organizer of the same trip is not held back by the first's count.
+  };
+
+  test("5 per organizer per trip per hour: with 4 in the last hour the 5th succeeds; with 5 the next is refused and nothing is written", async () => {
+    const w4 = await world();
+    await seedInvites(w4, 4);
+    assert.match(textOf(await run(w4, asOwner(w4, "/invite Dana Levi"))), /join#token/, "the fifth is allowed");
+    assert.equal((await invites(w4.tripId)).length, 5);
+    const sixth = await run(w4, asOwner(w4, "/invite Noam Levi"));
+    assert.match(textOf(sixth), /too many|later/i);
+    assert.doesNotMatch(textOf(sixth), /join#token/);
+    assert.equal((await invites(w4.tripId)).length, 5, "the sixth wrote nothing");
+    const w5 = await world();
+    await seedInvites(w5, 5);
+    assert.match(textOf(await run(w5, asOwner(w5, "/invite Dana Levi"))), /too many|later/i);
+    assert.equal((await invites(w5.tripId)).length, 5);
+    assert.ok(w5.logs.some((l) => /"outcome":"rate_limited"/.test(l)));
+  });
+
+  test("rows older than an hour do not count", async () => {
+    const w = await world();
+    await seedInvites(w, 5, "now() - interval '61 minutes'");
+    assert.match(textOf(await run(w, asOwner(w, "/invite Dana Levi"))), /join#token/);
+    const edge = await world();
+    await seedInvites(edge, 5, "now() - interval '59 minutes'");
+    assert.match(textOf(await run(edge, asOwner(edge, "/invite Dana Levi"))), /too many|later/i);
+  });
+
+  test("another organizer of the same trip has their own allowance", async () => {
+    const w = await world();
+    await seedInvites(w, 5);
     const second = await mkUser("Second"); await mkMember(w.tripId, second, "organizer", true);
     const secondTg = tg(); await linkOrganizer(w.tripId, second, secondTg); await bind(w.tripId, String(secondTg));
     assert.match(textOf(await run(w, say(secondTg, String(secondTg), "/invite Dana Levi"))), /join#token/);
+  });
+});
+
+describe("/invite: the names it prints are filtered, and look-alikes are never silently resolved", { skip: SKIP }, () => {
+  const BAD = /[‪-‮⁦-⁩​-‏؜﻿]/;
+
+  test("a name that looks like a link is never printed (lists show a placeholder) and the invite is refused through this door, nothing created", async () => {
+    const people: Person[] = [
+      ...PEOPLE,
+      { username: "sm01", displayName: "Sam https://evil.example/pay", role: "member" },
+      { username: "sm02", displayName: "Sue www.evil.example", role: "member" },
+      { username: "sm03", displayName: "Tal t.me/scam_bot", role: "member" },
+      { username: "sm04", displayName: "Uri evil.example/login", role: "member" },
+      { username: "ok05", displayName: "Dr.Cohen Ben", role: "member" },
+    ];
+    const w = await world({ people });
+    const list = textOf(await run(w, asOwner(w, "/invite")));
+    for (const piece of ["evil.example", "://", "www.", "t.me", "scam_bot"]) assert.ok(!list.includes(piece), `the list prints ${piece}`);
+    assert.match(list, /can't be shown here/);
+    assert.ok(list.includes("Dr.Cohen Ben"), "a bare name.tld with no slash is an ordinary name");
+    for (const typed of ["Sam", "Sue", "Tal", "Uri"]) {
+      const d = await run(w, asOwner(w, `/invite ${typed}`));
+      assert.match(textOf(d), /that traveller's name can't be used here — use Organizer settings → Signing in/i, typed);
+      assert.doesNotMatch(textOf(d), /evil|join#token|t\.me/);
+    }
+    assert.deepEqual(await invites(w.tripId), [], "nothing created");
+    assert.match(textOf(await run(w, asOwner(w, "/invite Dr.Cohen Ben"))), /join#token/);
+  });
+
+  test("a bidi override, zero-width and other invisible characters in a site name never reach any message; an over-long name is cut", async () => {
+    const people: Person[] = [
+      { username: "bd01", displayName: "Noa‮m ⁦Cohen⁩​", role: "member" },
+      { username: "bd02", displayName: "L".repeat(200), role: "member" },
+      { username: "bd03", displayName: "Rina‏ Peled؜", role: "member" },
+      { username: "og01", displayName: "Olga Organizer", role: "organizer" },
+    ];
+    const w = await world({ people });
+    const usage = await run(w, asOwner(w, "/invite"));
+    assert.doesNotMatch(textOf(usage), BAD, "the list is clean");
+    assert.ok(textOf(usage).includes("Noam Cohen"));
+    for (const line of textOf(usage).split("\n")) assert.ok(Array.from(line).length <= 70, `a printed name is capped: ${line.length}`);
+    const made = await run(w, asOwner(w, "/invite Noam Cohen"));
+    assert.match(textOf(made), /join#token/);
+    assert.doesNotMatch(textOf(made), BAD, "the summary line and the forwardable message are clean");
+    assert.match(textOf(made), /Hi Noam Cohen,/);
+    const made2 = await run(w, asOwner(w, "/invite Rina Peled"));
+    assert.match(textOf(made2), /Hi Rina Peled,/);
+    assert.doesNotMatch(textOf(made2), BAD);
+  });
+
+  test("two travellers whose names are confusable (Latin and Cyrillic a) are the same-name case, whether the whole name or one word is typed", async () => {
+    const people: Person[] = [
+      { username: "dl17", displayName: "Dana Levi", role: "member" },
+      { username: "dl18", displayName: "Dаna Levi", role: "member" },
+      { username: "mk05", displayName: "Maya Katz", role: "member" },
+    ];
+    const w = await world({ people });
+    for (const typed of ["Dana Levi", "Dаna Levi", "Dana", "Levi", "dana  LEVI"]) {
+      const d = await run(w, asOwner(w, `/invite ${typed}`));
+      assert.match(textOf(d), /More than one traveller has exactly that name/, typed);
+      assert.match(textOf(d), /Invite them from Organizer settings → Signing in/);
+      assert.doesNotMatch(textOf(d), /join#token/);
+    }
+    assert.deepEqual(await invites(w.tripId), []);
+    assert.match(textOf(await run(w, asOwner(w, "/invite Maya"))), /join#token/, "an unrelated name is unaffected");
+  });
+
+  test("the skeleton folds Latin/Cyrillic/Greek look-alikes and nothing else", () => {
+    assert.equal(travellerSkeleton("Dаna"), travellerSkeleton("Dana"));
+    assert.equal(travellerSkeleton("Mοna"), travellerSkeleton("Mona"), "Greek omicron");
+    assert.equal(travellerSkeleton("Ｄana"), travellerSkeleton("Dana"), "full-width (NFKC)");
+    assert.notEqual(travellerSkeleton("Dana"), travellerSkeleton("Dane"));
+    assert.notEqual(travellerSkeleton("Dana"), travellerSkeleton("Dan"));
+    assert.notEqual(travellerSkeleton("Rémi"), travellerSkeleton("Remi"), "accents are letters, still");
+    assert.notEqual(travellerSkeleton("Ilan"), travellerSkeleton("llan"), "I/l is NOT covered");
+  });
+});
+
+describe("/invite: the link message cannot be delivered", { skip: SKIP }, () => {
+  /** A Telegram client that records every attempt and fails the numbered ones (1-based), by an {ok:false} answer or by throwing. */
+  function flaky(failOn: number[], how: "refused" | "throws" | "server_error") {
+    const attempts: { chatId: string; text: string; ok: boolean }[] = [];
+    return {
+      attempts,
+      client: {
+        sendMessage: async (p: { chatId: string; text: string }) => {
+          const n = attempts.length + 1;
+          const fail = failOn.includes(n);
+          attempts.push({ chatId: p.chatId, text: p.text, ok: !fail });
+          if (!fail) return { ok: true, messageId: String(n) };
+          if (how === "throws") throw new Error("connection reset");
+          return how === "refused" ? { ok: false, error: "Forbidden: bot was blocked by the user", permanent: true } : { ok: false, error: "Bad Gateway" };
+        },
+      },
+    };
+  }
+  const deliver = async (w: World, decision: DispatchDecision, client: ReturnType<typeof flaky>) => {
+    await applyDecision(decision, { db: pool, telegram: client.client, connector: { pushInbound: () => true }, log: w.log } as unknown as TripBotPollerDeps);
+  };
+  const states = async (w: World) => (await invites(w.tripId)).map((r) => r.state);
+
+  for (const how of ["refused", "throws", "server_error"] as const) {
+    test(`the second message fails (${how}): the invite is revoked, the organizer is told, and nothing logged holds the link`, async () => {
+      const w = await world();
+      const decision = await run(w, asOwner(w, "/invite Dana Levi"));
+      assert.equal(decision.kind, "invite_messages");
+      const link = linkIn(textOf(decision))!;
+      const client = flaky([2], how);
+      await deliver(w, decision, client);
+      assert.deepEqual(await states(w), ["revoked"], "nothing unreachable is left pending");
+      assert.equal(client.attempts.length, 3, "summary, link (failed), then the failure notice");
+      const delivered = client.attempts.filter((a) => a.ok).map((a) => a.text).join("\n");
+      assert.ok(!delivered.includes("join#token"), "the link never reached anyone");
+      assert.match(client.attempts[0]!.text, /If the next message doesn't arrive, send \/invite again/);
+      assert.match(client.attempts[2]!.text, /couldn't send you the link/);
+      assert.match(client.attempts[2]!.text, /Send \/invite again/);
+      assert.ok(client.attempts.every((a) => a.chatId === w.ownerChat));
+      assert.ok(w.logs.some((l) => /trip_bot\.invite_delivery_failed/.test(l)));
+      const logged = w.logs.join("\n");
+      assert.ok(!logged.includes(link) && !logged.includes(link.split("#token=")[1]!) && !logged.includes(w.ownerChat), "no link, token or chat id in the log");
+      if (how === "refused") console.log("DELIVERY (second send blocked):", JSON.stringify(client.attempts.map((a) => ({ ok: a.ok, text: a.text.slice(0, 80) }))));
+    });
+  }
+
+  test("the FIRST message fails: the link is never even attempted, the invite is revoked", async () => {
+    const w = await world();
+    const decision = await run(w, asOwner(w, "/invite Dana Levi"));
+    const client = flaky([1], "refused");
+    await deliver(w, decision, client);
+    assert.deepEqual(await states(w), ["revoked"]);
+    assert.ok(!client.attempts.some((a) => a.text.includes("join#token")), "the link message was not sent");
+    assert.equal(client.attempts.length, 2, "summary (failed), then a best-effort failure notice");
+    assert.ok(!w.logs.join("\n").includes("join#token"));
+    console.log("DELIVERY (first send blocked):", JSON.stringify(client.attempts.map((a) => ({ ok: a.ok, text: a.text.slice(0, 80) }))));
+  });
+
+  test("both messages delivered: the invite stays pending, in order, to the organizer's chat only", async () => {
+    const w = await world();
+    const decision = await run(w, asOwner(w, "/invite Dana Levi"));
+    const client = flaky([], "refused");
+    await deliver(w, decision, client);
+    assert.deepEqual(await states(w), ["unused"]);
+    assert.equal(client.attempts.length, 2);
+    assert.match(client.attempts[1]!.text, /join#token/);
+    assert.ok(!w.logs.some((l) => /invite_delivery_failed/.test(l)));
+  });
+
+  test("a failed delivery of a REPLACING invite revokes the new one, does not bring back the earlier link, and says so", async () => {
+    const w = await world();
+    await deliver(w, await run(w, asOwner(w, "/invite Dana Levi")), flaky([], "refused"));
+    assert.deepEqual(await states(w), ["unused"]);
+    const again = await run(w, asOwner(w, "/invite Dana Levi"));
+    const client = flaky([2], "refused");
+    await deliver(w, again, client);
+    assert.deepEqual((await states(w)).sort(), ["revoked", "revoked"], "no pending invite is left: the earlier one stays revoked");
+    assert.match(client.attempts[2]!.text, /The earlier link for Dana Levi no longer works/);
   });
 });
