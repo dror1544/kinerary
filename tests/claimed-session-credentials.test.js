@@ -145,15 +145,15 @@ test('/api/auth/me tells a claimed session who the traveller is, and none of the
   assert.equal(claimed.username, 'bob');
   assert.equal(claimed.is_organizer, false);
   for (const field of THIRD_PARTY) assert.equal(field in claimed, false, `${field} is not served to a claimed session`);
-  // a plain login and an invite-bound managed member get the row exactly as before (the fields are there)
+  // a plain login gets the row exactly as before (the fields are there); an invite-bound member gets the claimed view too (S2c round 3)
   const plain = await (await api('/api/auth/me', { token: (await (await login('bob', '1234')).json()).token })).json();
   for (const field of THIRD_PARTY) assert.equal(field in plain, true, `${field} is still served to the traveller's own login`);
   const invitedMe = await (await api('/api/auth/me', { token: await exchange(invited, 'eve') })).json();
-  for (const field of THIRD_PARTY) assert.equal(field in invitedMe, true);
+  for (const field of THIRD_PARTY) assert.equal(field in invitedMe, false, `${field} is not served to an invite-bound session either (was served before round 3)`);
   assert.equal((await internal('participants/release', { userId: claimant, runtimeUsername: 'bob' })).status, 200);
 });
 
-test('every session that is not a managed member: Google link reaches its handler, MCP consent works, a secondary organizer keeps its password; an invite-bound member still consents but its Google link is refused (S2c)', async () => {
+test('every session that is not a managed member: Google link reaches its handler, MCP consent works, a secondary organizer is refused them; an invite-bound member still consents but its Google link is refused (S2c)', async () => {
   const owner = await exchange(ownerId, null, 'owner');
   const organizerLogin = (await (await login('alice', 'alices-third-password')).json()).token;
   const inviteBound = await exchange(invited, 'eve');
@@ -167,11 +167,14 @@ test('every session that is not a managed member: Google link reaches its handle
     assert.deepEqual(await google.json(), { error: 'google_not_configured' });
     assert.equal((await consent(token)).status, 200, `${name}: MCP consent`);
   }
-  // a secondary organizer (bound with no participant): it may set the password it has, exactly as before
+  // a secondary organizer (bound with no participant) is a managed session that may not mint site credentials either (round 3;
+  // was: it set a password, 200). Its other organizer powers are proved in invite-member-credentials.test.js.
   const secondaryUser = 'user_credssecondary1';
   const secondary = await exchange(secondaryUser, null, 'organizer');
   assert.ok(secondary);
-  assert.equal((await setPassword(secondary, 'secondary-new-password')).status, 200);
+  const refused = await setPassword(secondary, 'secondary-new-password');
+  assert.equal(refused.status, 403);
+  assert.deepEqual(await refused.json(), { error: 'claimed_session_cannot_change_credentials' });
 });
 
 // ── S2 follow-up: the claimed view is an ALLOW-LIST ─────────────────────────────────────────────────────────────────

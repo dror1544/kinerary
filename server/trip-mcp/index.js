@@ -412,7 +412,12 @@ function registerTripMcp({
   // companion's context is full of text travellers typed, and one crafted
   // message must not be able to disconnect somebody's assistant.
   // A session that came from a GROUP CLAIM (control-plane-auth.js) may neither list nor end the real traveller's assistant
-  // connections: the list says which apps they connected, and a disconnect is theirs to make.
+  // connections: the list says which apps they connected, and a disconnect is theirs to make. An INVITE-BOUND session
+  // (`req.user.inviteBinding`) sees and ends only the connections approved under ITS OWN binding (the control-plane user id and
+  // invite id recorded on the grant): the real traveller's own, another binding's and any grant with no recorded binding are
+  // theirs to manage, not the invited person's. The traveller's plain login, an organizer and everyone else are unchanged.
+  const ownedByBinding = (req, g) => !req.user?.inviteBinding ||
+    (g.binding_user_id === req.user.inviteBinding.userId && g.binding_invite_id === req.user.inviteBinding.inviteId);
   const person = (req, res, next) => authRequired(req, res, () =>
     (req.user?.isAgent ? res.status(403).json({ error: 'person_only' })
       : req.user?.claimedSession ? res.status(403).json({ error: 'claimed_session_cannot_change_credentials' }) : next()));
@@ -426,7 +431,7 @@ function registerTripMcp({
       // Someone removed from the trip has lost their connection already
       // (requireAccess ends it on next use); do not list it as live.
       connections: store.activeGrants()
-        .filter(g => isParticipant(g.username) && (organizer || g.username === me))
+        .filter(g => isParticipant(g.username) && (organizer || g.username === me) && ownedByBinding(req, g))
         .map(g => {
           let host = null;
           try { host = new URL(JSON.parse(g.redirect_uris || '[]')[0]).hostname; } catch { /* client pruned */ }
@@ -449,6 +454,7 @@ function registerTripMcp({
     // Someone else's connection is "not found" to a member, not "forbidden":
     // the id says nothing about whether it exists.
     if (grant.username !== req.user.username && !isOrganizer(req.user.username)) return res.status(404).json({ error: 'not_found' });
+    if (!ownedByBinding(req, grant)) return res.status(404).json({ error: 'not_found' });
     store.revokeGrant(grant.id);
     console.log(`[trip-mcp] ${req.user.username} disconnected ${grant.id} (${grant.username})`);
     res.json({ ok: true });

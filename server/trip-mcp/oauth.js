@@ -153,7 +153,7 @@ function createOAuthStore(db) {
     touchGrant: db.prepare('UPDATE mcp_oauth_grants SET last_used_at = ? WHERE id = ? AND (last_used_at IS NULL OR last_used_at < ?)'),
     revokeGrant: db.prepare('UPDATE mcp_oauth_grants SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL'),
     revokeGrantTokens: db.prepare('UPDATE mcp_oauth_tokens SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL'),
-    activeGrants: db.prepare(`SELECT g.id, g.username, g.scope, g.created_at, g.last_used_at, c.client_name, c.redirect_uris
+    activeGrants: db.prepare(`SELECT g.id, g.username, g.scope, g.binding_user_id, g.binding_invite_id, g.created_at, g.last_used_at, c.client_name, c.redirect_uris
       FROM mcp_oauth_grants g LEFT JOIN mcp_oauth_clients c ON c.client_id = g.client_id
       WHERE g.revoked_at IS NULL ORDER BY g.created_at DESC`),
     insertToken: db.prepare('INSERT INTO mcp_oauth_tokens (token_hash, grant_id, kind, expires_at) VALUES (?,?,?,?)'),

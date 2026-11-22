@@ -116,7 +116,7 @@ test('a managed MEMBER session, invite-bound or a group claim, is refused on the
   assert.equal((await release(P1, 'eve', INV1)).status, 200);
 });
 
-test('UNCHANGED: a plain password-login session, an owner-managed session and a secondary organizer still set a password', async () => {
+test('UNCHANGED: a plain password-login session, an owner-managed session and a plain organizer still set a password and reach the Google routes', async () => {
   // A plain login for a participant who ALSO has an invite binding (the real traveller, R, next to the invited person, P).
   assert.equal((await provision(P1, 'eve', INV1)).status, 200);
   const plain = await loginToken('eve', '1234');
@@ -126,11 +126,9 @@ test('UNCHANGED: a plain password-login session, an owner-managed session and a 
   const organizer = await loginToken('alice', '1234');
   assert.equal((await setPassword(organizer, 'alices-own-password')).status, 200, 'a plain organizer');
   assert.equal((await setPassword(await exchange(ownerId, null, 'owner'), 'alices-managed-password')).status, 200, 'an owner-managed session');
-  const secondary = await exchange('user_invcredssecondary', null, 'organizer');
-  assert.ok(secondary);
-  assert.equal((await setPassword(secondary, 'secondary-own-password')).status, 200, 'a secondary organizer');
+  assert.equal((await setPassword(await exchange(ownerId, null, 'owner'), '1234')).status, 200, 'and back, so no other test depends on this one');
   // and the Google routes still reach their handler for them: the link (not configured on the test site) and the unlink
-  for (const [who, token] of [['plain login', plain], ['owner-managed', await exchange(ownerId, null, 'owner')], ['plain organizer', organizer], ['secondary organizer', secondary]]) {
+  for (const [who, token] of [['plain login', plain], ['owner-managed', await exchange(ownerId, null, 'owner')], ['plain organizer', organizer]]) {
     const g = await googleLink(token);
     assert.equal(g.status, 503, `${who}: PUT /api/auth/google-link`);
     assert.deepEqual(await g.json(), { error: 'google_not_configured' }, who);
@@ -141,7 +139,7 @@ test('UNCHANGED: a plain password-login session, an owner-managed session and a 
   assert.equal((await release(P1, 'eve', INV1)).status, 200);
 });
 
-test('what stays as it was: an invite-bound session uses the assistant and gets the full /api/auth/me; a claimed one gets neither', async () => {
+test('what stays as it was: an invite-bound session uses the assistant; a claimed one gets neither list, consent nor disconnect', async () => {
   assert.equal((await provision(PX, 'eve', INVX)).status, 200);
   assert.equal((await adopt(CLAIMANT, 'bob')).status, 200);
   const invited = await exchange(PX, 'eve'), claimed = await exchange(CLAIMANT, 'bob');
@@ -149,9 +147,12 @@ test('what stays as it was: an invite-bound session uses the assistant and gets 
   assert.equal((await mcp(tokens.access_token)).status, 200, 'an invite-bound member\'s own assistant works');
   const list = await api('/api/mcp/connection', { token: invited });
   assert.equal(list.status, 200);
-  assert.ok(JSON.stringify(await list.json()).includes('Claude'), 'the invited person sees the connection they made');
+  const listed = await list.json();
+  assert.ok(JSON.stringify(listed).includes('Claude'), 'the invited person sees the connection they made');
+  assert.equal((await api(`/api/mcp/connections/${listed.connections[0].id}`, { method: 'DELETE', token: invited })).status, 200, 'and can disconnect it');
+  assert.equal((await mcp(tokens.access_token)).status, 401);
   const invitedMe = await (await api('/api/auth/me', { token: invited })).json();
-  for (const field of ['google_sub', 'google_email', 'google_picture', 'telegram_id', 'removed_at']) assert.equal(field in invitedMe, true, `${field}: the invite-bound view is unchanged`);
+  assert.equal(invitedMe.username, 'eve');
   // the claimed session: no consent, no list, no disconnect, the allow-listed me
   assert.equal((await consent(claimed)).status, 401);
   for (const r of [await api('/api/mcp/connection', { token: claimed }), await api('/api/mcp/connections/anything', { method: 'DELETE', token: claimed })]) {
@@ -163,7 +164,8 @@ test('what stays as it was: an invite-bound session uses the assistant and gets 
   const meOf = async (token) => (await api('/api/auth/me', { token })).json();
   assert.equal(invitedMe.sign_in_managed, true, 'invite-bound');
   assert.equal((await meOf(claimed)).sign_in_managed, true, 'claimed');
-  for (const [who, token] of [['plain login', await loginToken('eve', '1234')], ['owner-managed', await exchange(ownerId, null, 'owner')], ['secondary organizer', await exchange('user_invcredssecondary', null, 'organizer')]]) {
+  assert.equal((await meOf(await exchange('user_invcredssecondary', null, 'organizer'))).sign_in_managed, true, 'secondary organizer');
+  for (const [who, token] of [['plain login', await loginToken('eve', '1234')], ['owner-managed', await exchange(ownerId, null, 'owner')], ['plain organizer', await loginToken('alice', '1234')]]) {
     assert.equal('sign_in_managed' in await meOf(token), false, who);
   }
   // removal ends exactly the connection this test's invited member made, on this test's own evidence
@@ -419,4 +421,119 @@ test('a site that ran the OLD schema (no binding columns) gets them added at boo
     if (site?.child && site.child.exitCode === null) site.child.kill('SIGTERM');
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ── round 3 (owner's decisions, 2026-11-22) ─────────────────────────────────────────────────────────────────────────────
+// 1. A managed SECONDARY organizer mints no site credential either. 2. An invite-bound session manages only the connections
+// approved under its own binding. 3. An invite-bound session gets the same allow-listed /api/auth/me a claimed one does.
+
+const SECONDARY = 'user_invcredssecondary';
+
+test('a managed SECONDARY organizer is refused on the password route and both Google routes; the owner-managed session and plain logins are not', async () => {
+  const secondary = await exchange(SECONDARY, null, 'organizer');
+  assert.ok(secondary);
+  for (const [name, request] of [['PUT /api/auth/password', () => setPassword(secondary, 'secondary-direct-login')], ['PUT /api/auth/google-link', () => googleLink(secondary)], ['DELETE /api/auth/google-link', () => googleUnlink(secondary)]]) {
+    const r = await request();
+    console.log(`${name} (secondary organizer) -> ${r.status} ${JSON.stringify(await r.clone().json())}`);
+    assert.equal(r.status, 403, name);
+    assert.deepEqual(await r.json(), REFUSAL, name);
+  }
+  // the name they hold here is not a login: no password was set
+  const name = JSON.parse(Buffer.from(secondary.split('.')[1], 'base64url').toString()).username;
+  assert.equal((await login(name, 'secondary-direct-login')).status, 401);
+  // the trip's own accounts are unchanged: owner-managed and a plain organizer login still set a password and unlink Google
+  const owner = await exchange(ownerId, null, 'owner');
+  const ownerSet = await setPassword(owner, '1234');
+  console.log(`PUT /api/auth/password (owner-managed) -> ${ownerSet.status}`);
+  assert.equal(ownerSet.status, 200);
+  assert.equal((await setPassword(await loginToken('alice', '1234'), '1234')).status, 200);
+  assert.equal((await googleUnlink(owner)).status, 200);
+});
+
+test('a live secondary organizer keeps every organizer power it has today, and MCP consent answers what it answered before', async () => {
+  const secondary = await exchange(SECONDARY, null, 'organizer');
+  const me = await (await api('/api/auth/me', { token: secondary })).json();
+  assert.equal(me.is_organizer, true);
+  assert.equal(me.is_secondary_organizer, true);
+  assert.equal(me.sign_in_managed, true, 'the page is told, so it does not offer the refused controls');
+  assert.equal((await api('/api/agent/brief', { token: secondary })).status, 200);
+  assert.equal((await api('/api/stops', { token: secondary })).status, 200);
+  assert.equal((await api('/api/config', { token: secondary })).status, 200);
+  assert.equal((await api('/api/bookings', { token: secondary })).status, 200);
+  // not a participant of this trip's config: the consent step has always said so
+  const c = await consent(secondary);
+  assert.equal(c.status, 403);
+  assert.equal((await api('/api/mcp/connection', { token: secondary })).status, 200);
+});
+
+const PL = 'user_invitedpersonl1', INVL = 'invite_invitecredsl01', PL2 = 'user_invitedpersonl2', INVL2 = 'invite_invitecredsl02';
+
+test('an invite-bound session lists and disconnects only the connections approved under ITS OWN binding; the real traveller still manages every connection under their name', async () => {
+  const r = await connect(await loginToken('eve', '1234'));                      // the real traveller's own
+  assert.equal((await provision(PL2, 'bob', INVL2)).status, 200);               // another binding (another account, another name)
+  const other = await connect(await exchange(PL2, 'bob'));
+  assert.equal((await provision(PL, 'eve', INVL)).status, 200);
+  const pToken = await exchange(PL, 'eve');
+  const p = await connect(pToken);
+  const idsOf = async (token) => (await (await api('/api/mcp/connection', { token })).json()).connections.map(c => c.id);
+  const grantIds = () => bindingColumns();
+  const ids = await idsOf(pToken);
+  assert.equal(ids.length, 1, 'P sees one connection: the one P approved');
+  const rRows = grantIds();
+  assert.equal(rRows.filter(g => g.revoked_at === null && g.username === 'eve').length >= 2, true, 'R\'s and P\'s both exist under the name eve');
+  // find R's grant id and the other binding's from R's own listing
+  const rToken = await loginToken('eve', '1234');
+  const rIds = await idsOf(rToken);
+  assert.ok(rIds.includes(ids[0]), 'the traveller sees P\'s connection (it is under the traveller\'s username)');
+  assert.ok(rIds.length >= 2);
+  const rOwn = rIds.find(id => id !== ids[0]);
+  // P cannot disconnect R's: the same not-found an unknown id gets, and nothing changed
+  const unknown = await api('/api/mcp/connections/grant_doesnotexist', { method: 'DELETE', token: pToken });
+  const notMine = await api(`/api/mcp/connections/${rOwn}`, { method: 'DELETE', token: pToken });
+  console.log(`DELETE /api/mcp/connections/<R's grant> (invited P) -> ${notMine.status} ${JSON.stringify(await notMine.clone().json())}; unknown id -> ${unknown.status} ${JSON.stringify(await unknown.clone().json())}`);
+  assert.equal(notMine.status, 404);
+  assert.deepEqual(await notMine.json(), await unknown.json());
+  assert.equal((await mcp(r.tokens.access_token)).status, 200, 'R\'s connection still works');
+  // nor another binding's
+  const otherId = (await idsOf(await exchange(PL2, 'bob')))[0];
+  assert.equal((await api(`/api/mcp/connections/${otherId}`, { method: 'DELETE', token: pToken })).status, 404);
+  assert.equal((await mcp(other.tokens.access_token)).status, 200);
+  // P can disconnect its own
+  assert.equal((await api(`/api/mcp/connections/${ids[0]}`, { method: 'DELETE', token: pToken })).status, 200);
+  assert.equal((await mcp(p.tokens.access_token)).status, 401);
+  assert.equal((await mcp(r.tokens.access_token)).status, 200);
+  // a connection with no recorded binding (pre-existing) is not P's either: R's was one (a password login records none)
+  assert.equal(bindingColumns().find(g => g.username === 'eve' && g.binding_user_id === null && g.revoked_at === null) !== undefined, true);
+  // R's own session: lists and disconnects what is under their username, an invited person's included
+  const p2 = await connect(await exchange(PL, 'eve'));
+  const p2Id = (await idsOf(rToken)).find(id => !rIds.includes(id));
+  assert.ok(p2Id, 'the traveller sees the invited person\'s new connection too');
+  assert.equal((await api(`/api/mcp/connections/${p2Id}`, { method: 'DELETE', token: rToken })).status, 200, 'and may end it: it is under their account');
+  assert.equal((await mcp(p2.tokens.access_token)).status, 401);
+  // the organizer sees everything, as before
+  assert.ok((await idsOf(await loginToken('alice', '1234'))).length >= 2);
+  assert.equal((await release(PL, 'eve', INVL)).status, 200);
+  assert.equal((await release(PL2, 'bob', INVL2)).status, 200);
+});
+
+test('an invite-bound session\'s /api/auth/me is the allow-listed view: no Google subject, address or picture, no Telegram id, no column nobody named; plus sign_in_managed', async () => {
+  const require = createRequire(import.meta.url);
+  const Database = require('../server/node_modules/better-sqlite3');
+  const sqlite = new Database(join(dirname(testTripDir()), 'trip.db'));
+  try {
+    sqlite.exec('ALTER TABLE users ADD COLUMN some_future_private_note TEXT');
+    sqlite.prepare("UPDATE users SET google_sub = 'sub-bob', google_email = 'bob@example.test', google_picture = 'https://example.test/p.png', telegram_id = '4242', some_future_private_note = 'for bob only', age = 41 WHERE username = 'bob'").run();
+  } finally { sqlite.close(); }
+  assert.equal((await provision(PL, 'bob', INVL)).status, 200);
+  const invited = await (await api('/api/auth/me', { token: await exchange(PL, 'bob') })).json();
+  console.log(`GET /api/auth/me (invite-bound, row seeded with a Google link, telegram_id and an extra column) -> ${JSON.stringify(invited)}`);
+  assert.deepEqual(Object.keys(invited).sort(), ['avatar_file', 'color', 'family', 'is_organizer', 'name', 'name_en', 'sign_in_managed', 'username'].filter(k => k in invited).sort());
+  for (const field of ['google_sub', 'google_email', 'google_picture', 'telegram_id', 'removed_at', 'some_future_private_note', 'age', 'password']) assert.equal(field in invited, false, field);
+  assert.equal(invited.username, 'bob');
+  assert.equal(invited.sign_in_managed, true);
+  // the traveller's own login still gets the whole row
+  const own = await (await api('/api/auth/me', { token: await loginToken('bob', '1234') })).json();
+  assert.equal(own.google_email, 'bob@example.test');
+  assert.equal(own.some_future_private_note, 'for bob only');
+  assert.equal((await release(PL, 'bob', INVL)).status, 200);
 });

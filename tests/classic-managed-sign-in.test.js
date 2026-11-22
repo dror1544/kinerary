@@ -68,6 +68,16 @@ test('a managed session: no password button, no Google block, one line saying wh
   }
 });
 
+test('a secondary organizer (organizer flags plus sign_in_managed) gets the same hiding and the same line, in either language', () => {
+  for (const [lang, line] of [['en', 'You sign in with your Kinerary account.'], ['he', 'הכניסה שלך היא עם חשבון Kinerary.']]) {
+    const s = screen({ currentLang: lang });
+    Object.assign(s.ctx.currentUser, { is_organizer: true, is_secondary_organizer: true, sign_in_managed: true });
+    vm.runInContext('_applySignInManagedUI()', s.ctx);
+    assert.equal(s.$('avatar-lb-pw-toggle').style.display, 'none', lang);
+    assert.equal(s.$('avatar-lb-sign-in-managed').textContent, line, lang);
+  }
+});
+
 test('every other session: the password button and the Google block are left exactly as they were, and no line appears', () => {
   const s = screen();
   s.$('avatar-lb-google-wrap').style.display = 'flex';

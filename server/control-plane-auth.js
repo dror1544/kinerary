@@ -360,16 +360,23 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
     const row = find.get(payload.controlPlane.userId, identity.tripId);
     return Boolean(row && row.role === 'member' && (row.invite_id === null || row.invite_id === undefined) && !isSecondaryUsername(row.username));
   }
-  // Is this verified payload ANY managed MEMBER session: a group claim OR an invite-bound member? Both are people whose way in
-  // is the control plane's, and that ends with their membership or claim. Neither may mint a credential on this site that
-  // outlives it: a password (a direct login on the trip's own hostname holds a plain 30-day JWT no removal reaches), a Google
-  // link. Read from the stored binding on every call, never from the token. NOT a plain password login, not an owner's or an
-  // organizer's managed session, not a secondary organizer.
+  // Is this verified payload ANY managed MEMBER session: a group claim OR an invite-bound member? Read from the stored binding on
+  // every call, never from the token. NOT a plain password login, not an owner's or an organizer's managed session, not a
+  // secondary organizer. (The wider question, "may this session mint a site credential?", is isManagedSignInPayload below.)
   function isManagedMemberPayload(payload) {
     if (!payload || typeof payload !== 'object' || !Object.prototype.hasOwnProperty.call(payload, 'controlPlane')) return false;
     if (!validManagedPayload(payload)) return false;
     const row = find.get(payload.controlPlane.userId, identity.tripId);
     return Boolean(row && row.role === 'member' && !isSecondaryUsername(row.username));
+  }
+  // Is this verified payload a managed session whose ONLY way in is the control plane's, and so may not mint a credential on this
+  // site that outlives it: a group claim, an invite-bound member, or a SECONDARY organizer? Each is a person the control plane
+  // vouches for and can stop vouching for; a site password (a direct login on the trip's own hostname holds a plain 30-day JWT no
+  // removal reaches) or a Google link would outlive that. NOT the trip's own accounts: the owner's managed session and the
+  // configured organizers' plain logins, nor any plain password login. This is the ONE predicate the credential routes and
+  // `sign_in_managed` on /api/auth/me use; the claim-only and invite-only predicates stay narrower, for what is specific to them.
+  function isManagedSignInPayload(payload) {
+    return isManagedMemberPayload(payload) || isSecondaryOrganizerPayload(payload);
   }
   // What an assistant connection approved by this session must remember: { userId, inviteId } of an INVITE binding, else null.
   // Never from the token's claims alone: the row is read. A claim binding (no invite) returns null, and may not approve anyway.
@@ -381,8 +388,8 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
   // Is this verified payload a SECONDARY organizer of this trip? Only a managed claim counts - a plain password, Telegram or
   // Google token for a secondary username is nothing here (nobody knows the random password it is created with, and it has no
   // Telegram or Google link) - and it is re-checked against the stored binding on every request, so a removed or never-bound
-  // identity is not one. A secondary organizer's managed session CAN set a site password and link Google (the credential routes
-  // refuse managed MEMBERS only); whether it should is an open owner decision, so this is a description, not a rule.
+  // identity is not one. Such a session may not set a site password or link Google (isManagedSignInPayload): the control plane
+  // can stop vouching for them, and a site credential would outlive that (owner's decision, 2026-11-22).
   function isSecondaryOrganizerPayload(payload) {
     if (!payload || typeof payload !== 'object' || !Object.prototype.hasOwnProperty.call(payload, 'controlPlane')) return false;
     if (!validManagedPayload(payload)) return false;
@@ -392,6 +399,6 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
     return Boolean(row && row.username === payload.username);
   }
   // `internal` is exported so a second module can mount a route behind the same gate (the plan-changes read, video Release 1C).
-  return { internal, validManagedPayload, isClaimedSessionPayload, isManagedMemberPayload, inviteBindingOf, dashboardUrlFor, dashboardUrlForOrganizer, isSecondaryOrganizerPayload, isSecondaryUsername };
+  return { internal, validManagedPayload, isClaimedSessionPayload, isManagedMemberPayload, isManagedSignInPayload, inviteBindingOf, dashboardUrlFor, dashboardUrlForOrganizer, isSecondaryOrganizerPayload, isSecondaryUsername };
 }
 module.exports = { createControlPlaneAuth, safeDashboardUrl, safePortalOrigin };
