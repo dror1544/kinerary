@@ -10,6 +10,7 @@ import { randomBytes } from "node:crypto";
 import { after, before, beforeEach, describe, test } from "node:test";
 import { digestTelegramId } from "../src/identity.js";
 import { LogMailer } from "../src/mailer.js";
+import { resetSignInLinkWarnThrottle } from "../src/sign-in-link.js";
 import { dispatchPendingTripNotifications } from "../src/outbox-dispatcher.js";
 import { digestEmail, hashPassword } from "../src/password-identity.js";
 import { portalMailIdle } from "../src/portal-email-auth.js";
@@ -46,7 +47,7 @@ async function setSwitch(tripId: string | null, on: boolean) {
 /** The group a trip's claims are checked against: tripId -> its open group chat. */
 const groupOf = new Map<string, string>();
 after(async () => { if (!skip) { await portalMailIdle(); await h.stop(); } });
-beforeEach(() => { mailer = new LogMailer({ log: () => {} }); logs = []; });
+beforeEach(() => { mailer = new LogMailer({ log: () => {} }); logs = []; resetSignInLinkWarnThrottle(); });
 
 const newApp = () => h.newApp({ mailer, emailAuthLog: (line) => logs.push(line) });
 type App = ReturnType<typeof newApp>;
@@ -544,7 +545,7 @@ describe("AC-15: which account, which channel", { skip }, () => {
     } finally { await app.close(); }
   });
 
-  test("asking again ends the older link: only the newest works", async () => {
+  test("a new request does NOT cancel a link that is still valid: each lives its own 30 minutes and is single use (owner decision A16)", async () => {
     await dropEverything();
     const app = newApp();
     try {
@@ -552,13 +553,38 @@ describe("AC-15: which account, which channel", { skip }, () => {
       const person = await mkClaimAccount(tripId, "dl17", "Dana Levi");
       await ask(app, { tripId, travellerName: "Dana Levi" });
       await settle();
-      const first = tokenIn((await dispatch())[0]!.text);
-      await ask(app, { tripId, travellerName: "Dana Levi" });
-      await settle();
-      const second = tokenIn((await dispatch())[0]!.text);
-      assert.notEqual(first, second);
-      assert.equal((await redeem(app, first)).statusCode, 400, "the superseded link is dead");
-      assert.equal((await redeem(app, second)).statusCode, 200);
+      const first = tokenIn((await dispatch())[0]!.text);       // the traveller's own request
+      // Somebody who knows only her name asks twice more (the account's allowance is three an hour).
+      await ask(app, { tripId, travellerName: "Dana Levi" }); await settle();
+      await ask(app, { tripId, travellerName: "dana levi" }); await settle();
+      const others = (await dispatch()).map((m) => tokenIn(m.text));
+      assert.equal(others.length, 2);
+      const rows = await linkRows(person.userId);
+      assert.equal(rows.length, 3);
+      assert.ok(rows.every((r) => r.used_at === null && r.expires_at.getTime() > Date.now() + 1700_000), "all three are live, each for its own 30 minutes");
+      assert.equal((await redeem(app, first)).statusCode, 200, "the link the traveller asked for still opens");
+      assert.equal((await redeem(app, first)).statusCode, 400, "once");
+      assert.equal((await redeem(app, others[1]!)).statusCode, 200, "and each of the others opens too, once");
+      assert.equal((await redeem(app, others[0]!)).statusCode, 200);
+    } finally { await app.close(); }
+  });
+
+  test("the password step is once per link-minted session (each link has its own), and the first step signs the other link's session out", async () => {
+    await dropEverything();
+    const app = newApp();
+    try {
+      const { tripId } = await mkTrip();
+      const address = addr("twolinks");
+      const person = await mkInviteAccount(tripId, "nl23", "Noam Levi", { email: address, google: true, password: true });
+      await ask(app, { email: address }); await settle();
+      await ask(app, { email: address }); await settle();
+      const [one, two] = mailer.outbox.map((m) => tokenIn(m.text));
+      const a = await redeem(app, one!), b = await redeem(app, two!);
+      assert.equal(a.statusCode, 200); assert.equal(b.statusCode, 200);
+      // The first session's password step ended the account's other sessions, the second link's included.
+      assert.equal((await setPassword(app, sessionOf(a), NEW_PASSWORD)).statusCode, 200);
+      assert.equal((await setPassword(app, sessionOf(a), "yet another passphrase")).statusCode, 409, "once for that session");
+      assert.equal((await setPassword(app, sessionOf(b), "a third passphrase here")).statusCode, 401, "the other link's session was signed out by the first step");
       void person;
     } finally { await app.close(); }
   });
@@ -1206,5 +1232,166 @@ describe("cookies under an https origin", { skip }, () => {
       assert.ok(shape(link).every((c) => /; Secure/.test(c)), `Secure: ${JSON.stringify(shape(link))}`);
       assert.ok(shape(link).some((c) => /^kit_session=…; .*HttpOnly/.test(c)));
     } finally { await app.close(); }
+  });
+});
+
+// ── Rework round 2 ──────────────────────────────────────────────────────────
+
+describe("a claimant's redemption asks the group BEFORE any session exists, and nothing is ever un-spent", { skip }, () => {
+  const sessionsOf = async (userId: string) => Number((await h.pool.query("SELECT count(*)::int AS n FROM control_plane.web_sessions WHERE user_id = $1", [userId])).rows[0].n);
+
+  test("while Telegram hangs: no session row, the link unspent, nothing revoked; when it answers, one 200 and then exactly one session", async () => {
+    await dropEverything();
+    let release!: (value: boolean) => void;
+    const gate = new Promise<boolean>((resolve) => { release = resolve; });
+    let asked = 0;
+    const app = h.newApp({ mailer, emailAuthLog: (line) => logs.push(line), memberGroupSignIn: { isActiveMember: async () => { asked++; return await gate; } } });
+    try {
+      const { tripId } = await mkTrip();
+      const person = await mkClaimAccount(tripId, "dl17", "Dana Levi");
+      // Issue needs an answer too: let it through once, then hang the redemption's own question.
+      const issueApp = newApp();
+      await ask(issueApp, { tripId, travellerName: "Dana Levi" }); await settle(); await issueApp.close();
+      const token = tokenIn((await dispatch())[0]!.text);
+      const pending = redeem(app, token);
+      for (let i = 0; i < 50 && asked === 0; i++) await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(asked, 1, "Telegram is being asked");
+      assert.equal(await sessionsOf(person.userId), 0, "no session row exists while the question is open: a crash or an aborted request here leaves nothing behind");
+      assert.equal((await linkRows(person.userId))[0].used_at, null, "and the link is not yet spent");
+      release(true);
+      const ok = await pending;
+      assert.equal(ok.statusCode, 200, ok.body);
+      assert.equal(await sessionsOf(person.userId), 1);
+      assert.ok((await linkRows(person.userId))[0].used_at, "spent by the transaction that minted the session, and by nothing else");
+    } finally { release(true); await app.close(); }
+  });
+
+  test("a client that goes away while Telegram hangs leaves no session and no spent link", async () => {
+    await dropEverything();
+    const app = h.newApp({ mailer, emailAuthLog: (line) => logs.push(line), memberGroupSignIn: { isActiveMember: async () => new Promise<boolean>(() => {}) } });
+    try {
+      const { tripId } = await mkTrip();
+      const person = await mkClaimAccount(tripId, "dl17", "Dana Levi");
+      const issueApp = newApp();
+      await ask(issueApp, { tripId, travellerName: "Dana Levi" }); await settle(); await issueApp.close();
+      const token = tokenIn((await dispatch())[0]!.text);
+      void redeem(app, token);            // never answered: Telegram never replies, and the caller is gone
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      assert.equal(await sessionsOf(person.userId), 0);
+      assert.equal((await linkRows(person.userId))[0].used_at, null);
+    } finally { /* the hanging request is abandoned with the app */ void app.close(); }
+  });
+
+  test("two redeems of one claimant link while Telegram is down: both are told to retry and nothing is spent; after recovery, exactly one 200", async () => {
+    await dropEverything();
+    const app = newApp();
+    try {
+      const { tripId } = await mkTrip();
+      const person = await mkClaimAccount(tripId, "dl17", "Dana Levi");
+      await ask(app, { tripId, travellerName: "Dana Levi" }); await settle();
+      const token = tokenIn((await dispatch())[0]!.text);
+      await h.telegram.member(groupOf.get(tripId)!, person.telegramId, "member", { mode: "error" });
+      const down = await Promise.all([redeem(app, token), redeem(app, token)]);
+      assert.deepEqual(down.map((r) => r.statusCode), [503, 503]);
+      assert.equal((await linkRows(person.userId))[0].used_at, null);
+      assert.equal(await sessionsOf(person.userId), 0);
+      await h.telegram.member(groupOf.get(tripId)!, person.telegramId, "member");
+      const back = await Promise.all([redeem(app, token), redeem(app, token)]);
+      assert.deepEqual(back.map((r) => r.statusCode).sort(), [200, 400], "exactly one wins");
+      assert.equal(await sessionsOf(person.userId), 1, "and exactly one session exists");
+    } finally { await app.close(); }
+  });
+
+  test("an expired link is never revived by anything: not by a recovered Telegram, not by a retry", async () => {
+    await dropEverything();
+    const app = newApp();
+    try {
+      const { tripId } = await mkTrip();
+      const person = await mkClaimAccount(tripId, "dl17", "Dana Levi");
+      await ask(app, { tripId, travellerName: "Dana Levi" }); await settle();
+      const token = tokenIn((await dispatch())[0]!.text);
+      await h.telegram.member(groupOf.get(tripId)!, person.telegramId, "member", { mode: "error" });
+      assert.equal((await redeem(app, token)).statusCode, 503);
+      await h.pool.query("UPDATE control_plane.sign_in_links SET expires_at = now() - interval '1 second' WHERE user_id = $1", [person.userId]);
+      await h.telegram.member(groupOf.get(tripId)!, person.telegramId, "member");
+      assert.equal((await redeem(app, token)).statusCode, 400);
+      assert.equal(await sessionsOf(person.userId), 0);
+    } finally { await app.close(); }
+  });
+});
+
+describe("a ceiling or a limiter that shuts the feature is said out loud, once a minute, and identifies nobody", { skip }, () => {
+  test("a full ceiling logs ONE warn per channel per minute, however many requests it refuses; no id, count or address", async () => {
+    await dropEverything();
+    const app = newApp();
+    try {
+      await mkTrip();
+      await fillSlots("telegram", 30);
+      await fillSlots("email", 20);
+      for (let i = 0; i < 6; i++) await ask(app, { email: addr(`c${i}`) });
+      await ask(app, { tripId: "trip_abcdefgh12", travellerName: "Anyone" });
+      await settle();
+      const lines = logs.filter((l) => l.includes("sign_in_link.channel_ceiling_reached"));
+      assert.equal(lines.length, 2, `one per channel: ${JSON.stringify(lines)}`);
+      assert.ok(lines.some((l) => l.includes('"channel":"telegram"')) && lines.some((l) => l.includes('"channel":"email"')));
+      for (const line of lines) assert.equal(line.includes("@") || /\d{3,}/.test(line.replace(/"ts":"[^"]*"/, "")), false, `no address or number in ${line}`);
+    } finally { await app.close(); }
+  });
+
+  test("the per-IP limiter tripping logs ONE warn a minute with no address; and a request it refuses still purges a stale token", async () => {
+    await dropEverything();
+    const app = newApp();
+    try {
+      const { tripId } = await mkTrip();
+      await mkClaimAccount(tripId, "dl17", "Dana Levi");
+      await ask(app, { tripId, travellerName: "Dana Levi" }); await settle();
+      await h.pool.query("UPDATE control_plane.notification_outbox SET created_at = now() - interval '31 minutes' WHERE notification_type = 'sign_in_link_notice'");
+      const ip = freshIp();
+      for (let i = 0; i < 10; i++) await ask(app, { email: addr(`b${i}`) }, ip);
+      await settle();
+      assert.equal(logs.filter((l) => l.includes("sign_in_link.ip_limit_reached")).length, 0, "not yet over");
+      // The pending notice was already purged by one of the ten admitted requests; leave a fresh stale one for the refused request to find.
+      await h.pool.query("INSERT INTO control_plane.notification_outbox(id, trip_id, kind, recipient, payload, signup_request_id, notification_type, adapter, state, created_at) VALUES ($1, NULL, 'sign_in_link_notice', '700000042', '{\"token\":\"x\"}'::jsonb, NULL, 'sign_in_link_notice', 'control-plane', 'pending', now() - interval '31 minutes')", [id("notif")]);
+      for (let i = 0; i < 4; i++) await ask(app, { email: addr(`refused${i}`) }, ip);
+      await settle();
+      const lines = logs.filter((l) => l.includes("sign_in_link.ip_limit_reached"));
+      assert.equal(lines.length, 1, "one line however many requests it refuses");
+      assert.ok(!lines[0]!.includes(ip));
+      const row = (await h.pool.query("SELECT state, payload, recipient FROM control_plane.notification_outbox WHERE recipient IS NULL AND notification_type = 'sign_in_link_notice' AND state = 'skipped'")).rows;
+      assert.ok(row.length >= 1 && row.every((r) => r.payload === null), "the stale plaintext token was blanked by a request the limiter refused");
+      assert.equal(Number((await h.pool.query("SELECT count(*)::int AS n FROM control_plane.notification_outbox WHERE notification_type = 'sign_in_link_notice' AND payload IS NOT NULL AND state = 'pending' AND created_at < now() - interval '30 minutes'")).rows[0].n), 0);
+    } finally { await app.close(); }
+  });
+});
+
+describe("the email door honours an explicit per-trip OFF", { skip }, () => {
+  test("every-trip on, but ANY trip where the account holds an active member seat resolves the switch to off: nothing is mailed, and the slots were taken all the same", async () => {
+    await dropEverything();
+    const app = newApp();
+    try {
+      const { tripId } = await mkTrip();
+      const other = await mkTrip();
+      const address = addr("pertrip");
+      const person = await mkInviteAccount(tripId, "nl23", "Noam Levi", { email: address, google: true });
+      await h.mkMember(other.tripId, person.userId, "member", { dashboard: false, runtime: true });
+      await ask(app, { email: address }); await settle();
+      assert.equal(mailer.outbox.length, 1, "every-trip on and no per-trip setting: mailed, as before");
+      await dropEverything();
+      await setSwitch(other.tripId, false);
+      const answer = await ask(app, { email: address }); await settle();
+      assert.equal(answer.statusCode, 202); assert.equal(answer.body, GENERIC);
+      assert.equal(mailer.outbox.length, 1, "no second mail");
+      assert.equal((await linkRows(person.userId)).length, 0);
+      assert.equal(await slotCount("email"), 1); assert.equal(await slotCount("telegram"), 1);
+      // An explicit ON for that trip, or a trip where the member seat has ended, does not block.
+      await setSwitch(other.tripId, true);
+      await ask(app, { email: address }); await settle();
+      assert.equal(mailer.outbox.length, 2);
+      await dropEverything();
+      await setSwitch(other.tripId, false);
+      await h.pool.query("UPDATE control_plane.trip_memberships SET status = 'revoked' WHERE trip_id = $1 AND user_id = $2", [other.tripId, person.userId]);
+      await ask(app, { email: address }); await settle();
+      assert.equal(mailer.outbox.length, 3, "a revoked seat on an off trip does not count");
+    } finally { await setSwitch(null, true); await app.close(); }
   });
 });

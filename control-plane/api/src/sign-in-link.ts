@@ -86,7 +86,7 @@ import { structuredLog } from "./redaction.js";
 import type { NotificationAdapter } from "./signup.js";
 import { findSwitch } from "../../../shared/feature-switches.js";
 import type { GroupMembershipCheck } from "./telegram-group-membership.js";
-import { GROUP_VERIFIED_VIA, TRIP_ID_PATTERN, openGroupChat, type SiteParticipant } from "./telegram-mini-app.js";
+import { GROUP_VERIFIED_VIA, TRIP_ID_PATTERN, endGroupClaimInTx, openGroupChat, type ReleasedClaim, type SiteParticipant } from "./telegram-mini-app.js";
 import { NOT_RETIRED_SQL } from "./trip-retirement.js";
 
 export const SIGN_IN_LINK_TTL_SECONDS = 30 * 60;
@@ -291,7 +291,20 @@ export async function signInLinkAvailable(db: Queryable, log: (line: string) => 
   }
 }
 
-/** Opportunistic, on every admitted request, no scheduler: see the migration's RETENTION paragraph. */
+async function noSeatedTripIsOff(ctx: SignInLinkContext, userId: string): Promise<boolean> {
+  const seats = await ctx.db.query<{ trip_id: string }>(
+    "SELECT trip_id FROM control_plane.trip_memberships WHERE user_id = $1 AND role = 'member' AND status = 'active'", [userId]);
+  for (const seat of seats.rows) {
+    if (!(await featureEnabled(ctx.db, seat.trip_id, SIGN_IN_LINK_SWITCH, ctx.log))) return false;
+  }
+  return true;
+}
+
+/**
+ * Opportunistic, on every admitted request AND on one the per-IP limiter refuses (the route calls it for both), no scheduler: see
+ * the migration's RETENTION paragraph.
+ */
+export async function purgeSignInLinkLeftovers(db: pg.Pool): Promise<void> { await purge(db); }
 async function purge(db: pg.Pool): Promise<void> {
   await db.query("DELETE FROM control_plane.sign_in_links WHERE created_at < now() - interval '2 days'");
   await db.query("DELETE FROM control_plane.sign_in_link_requests WHERE created_at < now() - interval '1 hour'");
@@ -318,8 +331,7 @@ async function claimMayOpen(ctx: SignInLinkContext, claim: { tripId: string; tel
 }
 
 /**
- * Counts and writes in one step under one lock (the per-account allowance), ends the account's older
- * links, writes this one and, for Telegram, the notice that carries it, all in one transaction: a link exists if and
+ * Counts and writes in one step under one lock (the per-account allowance), writes this one and, for Telegram, the notice that carries it, all in one transaction: a link exists if and
  * only if its message was queued. Null when a ceiling stopped it.
  */
 async function issueLink(
@@ -340,8 +352,9 @@ async function issueLink(
       await client.query("ROLLBACK");
       return null;
     }
-    // Only the newest link works: a person who asked twice is not left holding two live ones.
-    await client.query("UPDATE control_plane.sign_in_links SET expires_at = now() WHERE user_id = $1 AND used_at IS NULL AND expires_at > now()", [input.userId]);
+    // NO SUPERSESSION (owner decision A16): a new request never cancels an earlier link that is still valid. Anyone who knows a
+    // traveller's name or address could otherwise keep killing the link the traveller just asked for. Each link lives its own 30
+    // minutes and is single use; the per-account allowance above bounds how many are live at once.
     await client.query(
       `INSERT INTO control_plane.sign_in_links(id, token_digest, user_id, channel, telegram_link_id, expires_at)
        VALUES ($1, $2, $3, $4, $5, now() + ($6 * interval '1 second'))`,
@@ -377,6 +390,10 @@ export async function startSignInLink(ctx: SignInLinkContext, request: SignInLin
     // FIRST, and whatever follows: the ceilings' slots. A request takes the same ones for every account state and for either
     // setting of the switch (header). A name-door request could only ever use Telegram; an email-door one either channel.
     const admitted = await reserveSlots(ctx.db, request.door === "email" ? ["telegram", "email"] : ["telegram"]);
+    // Said out loud, once a minute per channel (the feature is otherwise silently off for everybody until the minute turns).
+    for (const channel of request.door === "email" ? (["telegram", "email"] as const) : (["telegram"] as const)) {
+      if (!admitted.has(channel)) warnOncePerMinute(ctx.log, "sign_in_link.channel_ceiling_reached", channel, { channel, effect: "requests on this channel are answered and nothing is sent until the minute turns" });
+    }
     if (admitted.size === 0) return count("ceiling");
     // The switch. Off, unknown and unreadable are all "nothing", after the slot is taken.
     const switchOn = request.door === "email"
@@ -388,6 +405,9 @@ export async function startSignInLink(ctx: SignInLinkContext, request: SignInLin
       ? await accountForEmail(ctx.db, request.email)
       : await accountForTraveller(ctx.db, ctx.listParticipants, request.tripId, request.travellerName);
     if (!userId || !(await isMemberAccount(ctx.db, userId))) return count("nothing_to_send");
+    // The email door has no trip, so it reads the every-trip setting; an EXPLICIT per-trip off still holds. If any trip where this
+    // account has an active member seat resolves the switch to off, nothing is sent (behind the answer, with the slots already taken).
+    if (request.door === "email" && !(await noSeatedTripIsOff(ctx, userId))) return count("nothing_to_send");
 
     const claim = await liveGroupClaim(ctx.db, userId);
     // A group claimant's link is held to the same gate as their Mini App launch: no link that cannot be used.
@@ -497,7 +517,7 @@ export async function dispatchSignInLinkNotices(
 export type RedeemResult =
   /** Unknown, used, expired, superseded, malformed, and "the account is no longer one a link may sign in" are ONE answer. */
   | { ok: false }
-  | { ok: true; linkId: string; userId: string; telegramLinkId: string | null; /** set for a group claimant: the route asks the Mini App's group gate before it hands the session out */ claimTripId: string | null; canSetPassword: boolean };
+  | { ok: true; linkId: string; userId: string; telegramLinkId: string | null; canSetPassword: boolean };
 
 /**
  * Spends a link and says who it signs in and with what scope. The caller owns BEGIN/COMMIT and mints the session in the
@@ -522,16 +542,65 @@ export async function consumeSignInLink(client: pg.PoolClient, token: unknown): 
   const credential = await client.query(
     `SELECT 1 FROM control_plane.password_credentials WHERE user_id = $1
      UNION ALL SELECT 1 FROM control_plane.web_password_credentials WHERE user_id = $1 LIMIT 1`, [row.user_id]);
-  return { ok: true, linkId: row.id, userId: row.user_id, telegramLinkId: claim?.linkId ?? null, claimTripId: claim?.tripId ?? null, canSetPassword: !claim && (credential.rowCount ?? 0) > 0 };
+  return { ok: true, linkId: row.id, userId: row.user_id, telegramLinkId: claim?.linkId ?? null, canSetPassword: !claim && (credential.rowCount ?? 0) > 0 };
 }
 
 /**
- * Gives a link back: its redemption was stopped by something that says nothing about the link or the person (the group switch is
- * off, Telegram could not be reached). The session minted for the check is ended by the caller; the link is live again for what is
- * left of its 30 minutes.
+ * A GROUP CLAIMANT'S LINK is held to the Mini App's gate BEFORE anything is spent or minted. Without spending or locking: is this
+ * token a live link of an account made by a live group claim, and which claim? Null for everything else (unknown, malformed, used,
+ * expired, not a claimant's), which then takes the ordinary path and the one refusal.
+ *
+ * THE INVARIANT: a link is spent by exactly one transaction, the one that mints its session, and nothing ever un-spends one. The
+ * group question is asked first, with no session and no spent link in existence, so a crash, a client that goes away or a Telegram
+ * that hangs leaves nothing behind: no live session nobody holds and no burnt link. (An earlier version minted first and un-spent on
+ * a bad verdict; that revived a superseded link and left a session row behind if the process died inside the wait.)
  */
-export async function unspendLink(db: Queryable, linkId: string): Promise<void> {
-  await db.query("UPDATE control_plane.sign_in_links SET used_at = NULL, session_id = NULL WHERE id = $1", [linkId]);
+export async function peekClaimLink(db: Queryable, token: unknown): Promise<{ userId: string; claim: { tripId: string; telegramUserId: string | null } } | null> {
+  if (typeof token !== "string" || !TOKEN_SHAPE.test(token)) return null;
+  const found = await db.query<{ user_id: string; telegram_link_id: string | null }>(
+    "SELECT user_id, telegram_link_id FROM control_plane.sign_in_links WHERE token_digest = $1 AND used_at IS NULL AND expires_at > now()", [sha(token)]);
+  const row = found.rows[0];
+  if (!row?.telegram_link_id) return null;
+  const claim = await liveGroupClaim(db, row.user_id);
+  if (!claim || claim.linkId !== row.telegram_link_id) return null;
+  return { userId: row.user_id, claim: { tripId: claim.tripId, telegramUserId: claim.telegramUserId } };
+}
+
+/**
+ * The launch's group verdict (`groupLinkVerdict` in telegram-mini-app.ts, which is private and takes a verified launch, so it
+ * cannot be called from here; `groupSessionVerdict` in portal.ts needs an existing session, which is exactly what must not exist
+ * yet), built from the same exported pieces in the same order: the group switch, the trip's one open group, a live
+ * `getChatMember`. "in" carries on; "out" is the person having left (the caller ends the claim, `endClaimLeftGroup`); "unknown"
+ * (Telegram did not say) and "dormant" (switch off or unreadable, no open group, path not wired) revoke nothing and spend nothing.
+ */
+export async function claimGateVerdict(
+  ctx: { db: pg.Pool; groupSignIn: { isActiveMember: GroupMembershipCheck } | undefined; log: (line: string) => void },
+  claim: { tripId: string; telegramUserId: string | null },
+): Promise<"in" | "out" | "unknown" | "dormant"> {
+  if (!ctx.groupSignIn || !claim.telegramUserId) return "dormant";
+  if (!(await featureEnabled(ctx.db, claim.tripId, "member_group_sign_in", ctx.log))) return "dormant";
+  const chat = await openGroupChat(ctx.db, claim.tripId);
+  if (!chat) return "dormant";
+  const member = await ctx.groupSignIn.isActiveMember(chat, claim.telegramUserId);
+  if (member === "unknown") return "unknown";
+  return member === true ? "in" : "out";
+}
+
+/** The person is not in the group: the claim, its link, sessions and membership end as at a Mini App launch, and this account's unspent links with them. */
+export async function endClaimLeftGroup(db: pg.Pool, userId: string, tripId: string): Promise<ReleasedClaim[]> {
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+    const ended = await endGroupClaimInTx(client, { tripId, userId, linkReason: "left_group", claimReason: "left_group" });
+    await client.query("UPDATE control_plane.sign_in_links SET expires_at = now() WHERE user_id = $1 AND used_at IS NULL AND expires_at > now()", [userId]);
+    await client.query("COMMIT");
+    return ended;
+  } catch (error) {
+    try { await client.query("ROLLBACK"); } catch { /* ignore */ }
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 export async function attachSession(client: pg.PoolClient, linkId: string, sessionId: string): Promise<void> {
@@ -565,3 +634,21 @@ export async function applyLinkPassword(
   await client.query("UPDATE control_plane.web_sessions SET revoked_at = now() WHERE user_id = $1 AND id <> $2 AND revoked_at IS NULL", [input.userId, input.sessionId]);
   return "ok";
 }
+
+// ── Saying out loud that the feature is shut (at most once a minute per kind) ───────────────────────────────
+
+const lastWarned = new Map<string, number>();
+/**
+ * One warn line per (event, key) per minute at most, with the fields it is given (the caller gives no address, no id, no count that
+ * identifies anyone): the same posture as `email_auth.global_send_budget_exhausted`. Without it a feature shut by a ceiling or a
+ * shared address is silently off, and the only way to learn is a person who cannot get in.
+ */
+export function warnOncePerMinute(log: (line: string) => void, event: string, key: string, fields: Record<string, unknown>): void {
+  const now = Date.now(), id = `${event}:${key}`;
+  const last = lastWarned.get(id);
+  if (last !== undefined && now - last < 60_000) return;
+  lastWarned.set(id, now);
+  try { log(structuredLog("warn", event, fields)); } catch { /* a log must never be the reason a request fails */ }
+}
+/** For tests: the throttle is process-wide, so one test's warning must not silence the next one's. */
+export function resetSignInLinkWarnThrottle(): void { lastWarned.clear(); }

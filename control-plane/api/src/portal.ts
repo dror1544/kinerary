@@ -31,7 +31,7 @@ import {
 } from "./portal-scope.js";
 import { verifyMiniAppInitData, type VerifiedInitData } from "./telegram-webapp-auth.js";
 import { runtimeUpstreamFor } from "./runtime-upstream.js";
-import { applyLinkPassword, attachSession, consumeSignInLink, signInLinkAvailable, startSignInLink, unspendLink, type SignInLinkRequest } from "./sign-in-link.js";
+import { applyLinkPassword, attachSession, claimGateVerdict, consumeSignInLink, endClaimLeftGroup, peekClaimLink, purgeSignInLinkLeftovers, signInLinkAvailable, startSignInLink, warnOncePerMinute, type SignInLinkRequest } from "./sign-in-link.js";
 
 // The gateway's key, compared in constant time (a plain !== leaks how many
 // leading bytes were right).
@@ -1192,6 +1192,13 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     // EVERY well-formed request counts against the caller's allowance, an account that does not exist included: a limiter that
     // only counted real accounts would tell a guess from a hit. Over it, the same 202 and nothing else happens.
     const admitted = admitEmailIp(signInLinkIpAttempts, request.ip, 10);
+    if (!admitted) {
+      // Said once a minute and without the address; and the housekeeping that every admitted request does still runs, so a limiter
+      // that keeps refusing cannot leave a stale one-time token sitting in the outbox.
+      warnOncePerMinute(emailAuthLog, "sign_in_link.ip_limit_reached", "ip", { effect: "requests from a client address are answered and nothing is sent; a shared address (a family on one connection) shuts the feature for them" });
+      runInBackground(() => purgeSignInLinkLeftovers(deps.db), (error) =>
+        emailAuthLog(structuredLog("error", "sign_in_link.request_failed", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN" })));
+    }
     let input: SignInLinkRequest | null = null;
     if (emailDoor) {
       const email = normalizeEmail(body.email);
@@ -1217,7 +1224,22 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     if (!admitEmailIp(signInLinkRedeemIpAttempts, request.ip, 30)) return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
     if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
     const token = jsonBody(request).token;
-    let minted: { session: { sessionToken: string; csrf: string; sessionId: string }; linkId: string; userId: string; claimTripId: string | null; canSetPassword: boolean } | null = null;
+    // A GROUP CLAIMANT's link is held to the Mini App's gate BEFORE anything is spent or minted (sign-in-link.ts, `peekClaimLink`):
+    // the group is asked while no session and no spent link exist, so a hang, a crash or a client that goes away leaves nothing
+    // behind. "out": the person left, the claim ends exactly as at a launch and the answer is the one refusal. "unknown": Telegram
+    // did not say, so nothing is spent and nothing revoked, and the answer is the retryable one the launch gives. "dormant": the
+    // group switch is off or unreadable, the one refusal, nothing spent, nothing revoked (it works again when the switch does).
+    const peeked = await peekClaimLink(deps.db, token);
+    if (peeked) {
+      const verdict = await claimGateVerdict({ db: deps.db, groupSignIn: deps.memberGroupSignIn, log: emailAuthLog }, peeked.claim);
+      if (verdict === "out") {
+        await releaseSiteBindings(await endClaimLeftGroup(deps.db, peeked.userId, peeked.claim.tripId));
+        return reply.code(400).send({ error: "TOKEN_INVALID" });
+      }
+      if (verdict === "unknown") return reply.header("retry-after", "5").code(503).send({ error: "MEMBERSHIP_CHECK_UNAVAILABLE", retryable: true });
+      if (verdict === "dormant") return reply.code(400).send({ error: "TOKEN_INVALID" });
+    }
+    // THE INVARIANT: a link is spent by exactly one transaction, the one that mints its session. Nothing un-spends a link.
     const client = await deps.db.connect();
     try {
       await client.query("BEGIN");
@@ -1231,38 +1253,12 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
       const session = await createWebSession(client, result.userId, deps.sessionTtlSeconds, result.telegramLinkId);
       await attachSession(client, result.linkId, session.sessionId);
       await client.query("COMMIT");
-      minted = { session, linkId: result.linkId, userId: result.userId, claimTripId: result.claimTripId, canSetPassword: result.canSetPassword };
+      setWebSessionCookies(reply, deps, session);
+      return { appPath: "/trips", canSetPassword: result.canSetPassword };
     } catch (error) {
       try { await client.query("ROLLBACK"); } catch { /* ignore */ }
       throw error;
     } finally { client.release(); }
-    // A GROUP CLAIMANT's session is only as good as their seat in the group, and a link must not be a way round that: the Mini App
-    // launch's own verdict (`groupSessionVerdict`, everyTime) is asked before the session is handed out. The connection is released
-    // first (Telegram is slow); the session exists for these few milliseconds but its cookie has not been sent to anyone.
-    if (minted.claimTripId) {
-      let verdict: Awaited<ReturnType<typeof groupSessionVerdict>>;
-      try {
-        verdict = await groupSessionVerdict({ tripId: minted.claimTripId, userId: minted.userId, sessionId: minted.session.sessionId, everyTime: true });
-      } catch (error) {
-        await deps.db.query("UPDATE control_plane.web_sessions SET revoked_at = now() WHERE id = $1", [minted.session.sessionId]);
-        await unspendLink(deps.db, minted.linkId);
-        throw error;
-      }
-      if (verdict === "revoked") {
-        // The person left the group: the claim, its link, sessions and membership ended inside the verdict, as at a launch. The link stays spent.
-        return reply.code(400).send({ error: "TOKEN_INVALID" });
-      }
-      if (verdict !== "live") {
-        // The group switch is off or unreadable ("dormant", nothing revoked) or Telegram could not say ("unknown", nothing revoked): the
-        // session is ended and the link is NOT spent, so it works when the switch is back or Telegram answers.
-        await deps.db.query("UPDATE control_plane.web_sessions SET revoked_at = now() WHERE id = $1", [minted.session.sessionId]);
-        await unspendLink(deps.db, minted.linkId);
-        if (verdict === "unknown") return reply.header("retry-after", "5").code(503).send({ error: "MEMBERSHIP_CHECK_UNAVAILABLE", retryable: true });
-        return reply.code(400).send({ error: "TOKEN_INVALID" });
-      }
-    }
-    setWebSessionCookies(reply, deps, minted.session);
-    return { appPath: "/trips", canSetPassword: minted.canSetPassword };
   });
 
   app.post("/v1/auth/sign-in-link/password", async (request, reply) => {

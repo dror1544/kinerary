@@ -14,8 +14,11 @@
 --                                `sign_in_link_notice` outbox row that the dispatcher blanks once it is sent or has
 --                                failed for good (sign-in-link.ts). Nothing logs it.
 --   * SHORT AND SINGLE USE     — 30 minutes (`expires_at`), and `used_at` is set under a row lock by the redemption,
---                                so two concurrent redemptions have one winner. Asking again ends the older link of
---                                the same account (`expires_at = now()`): only the newest one works.
+--                                so two concurrent redemptions have one winner, and nothing ever un-spends a link.
+--                                A new request does NOT cancel an earlier link that is still valid (owner decision A16:
+--                                anyone who knows a name or an address could otherwise keep killing the traveller's
+--                                link); each lives its own 30 minutes, and the per-account allowance of 3 an hour bounds
+--                                how many are live.
 --   * ABOUT AN ACCOUNT, NOT A  — there is no trip column: the account is what is being signed in. (`telegram_link_id`
 --     TRIP                       below is the one exception, and it only ever NARROWS what the session may do.)
 --
@@ -57,7 +60,7 @@ CREATE TABLE control_plane.sign_in_links (
   CONSTRAINT sign_in_links_used_shape_check CHECK (session_id IS NULL OR used_at IS NOT NULL)
 );
 
--- "How many links has this account been sent lately?" (the per-account ceiling) and "supersede the older ones".
+-- "How many links has this account been sent lately?" (the per-account ceiling) (nothing supersedes an earlier link).
 CREATE INDEX sign_in_links_user_idx ON control_plane.sign_in_links (user_id, created_at DESC);
 -- The per-channel ceiling and the purge of long-dead rows both ask by time.
 CREATE INDEX sign_in_links_channel_idx ON control_plane.sign_in_links (channel, created_at DESC);
