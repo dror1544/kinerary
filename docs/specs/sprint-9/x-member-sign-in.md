@@ -341,6 +341,39 @@ contradicts the text above, the amendment wins.
 - **A7: the group check uses the relay's bot**, the one that sits in the trip groups. It never
   falls back to the Mini App's token.
 
+## Amendments (Dror, 2026-11-21 and 2026-11-22, while S2 and S3 were built)
+
+- **A8: AC-12 is a bot command, not a companion tool.**
+  - An organizer sends `/invite <traveller name>` in their own private chat with the bot, and
+    the bot replies there with the link.
+  - The companion's control MCP knows only which profile is calling. It cannot tell who typed,
+    or whether the turn came from the group or a private chat, so a tool there cannot prove an
+    organizer asked. The relay reads the sender off Telegram's own update.
+  - The companion's part is to tell an organizer to use the command.
+  - This is a relay behaviour change, so the merge needs a regression plan.
+- **A9: an invited member's session cannot set a trip-site password or link Google**, the same
+  rule as A2.
+  - Redeeming the invite already gives the person a portal login, which removal ends.
+  - Otherwise a removed person keeps a site password and a 30-day site token on the
+    traveller's account.
+  - **Removing an invited member revokes the assistant connections made under that binding.**
+    Invited members keep the assistant while they are members; a claimed session still cannot
+    use it.
+- **A10: invite versus claim.** This settles A6.
+  - A pending personal invite reserves its traveller from group claims. Revoking it, or its
+    expiry, frees the name.
+  - An invite for a traveller who is claimed from the group is refused, and the organizer is
+    told to release that sign-in first.
+  - Redeeming never answers a raw error. An owner or organizer of the trip cannot redeem a
+    member invite.
+  - Removing an invited member ends their trip-site binding and frees the name.
+- **A11: the invite path was never "add a new traveller".** D2 and AC-10 describe today's site
+  invite as adding one. The code already required the traveller to exist on the trip site
+  before an invite could be made, and still does: a new traveller is added on the site first,
+  then invited.
+- **A12: personal invites are not gated by `member_group_sign_in`** (D1: the invite is a full
+  way in for people not on Telegram).
+
 ## Open questions (answered, kept for the record)
 
 Answered in Decisions D1–D4 above.
