@@ -86,7 +86,7 @@ import { structuredLog } from "./redaction.js";
 import type { NotificationAdapter } from "./signup.js";
 import { findSwitch } from "../../../shared/feature-switches.js";
 import type { GroupMembershipCheck } from "./telegram-group-membership.js";
-import { GROUP_VERIFIED_VIA, TRIP_ID_PATTERN, endGroupClaimInTx, openGroupChat, type ReleasedClaim, type SiteParticipant } from "./telegram-mini-app.js";
+import { GROUP_VERIFIED_VIA, TRIP_ID_PATTERN, endGroupClaimInTx, groupSeatVerdict, openGroupChat, type ReleasedClaim, type SiteParticipant } from "./telegram-mini-app.js";
 import { NOT_RETIRED_SQL } from "./trip-retirement.js";
 
 export const SIGN_IN_LINK_TTL_SECONDS = 30 * 60;
@@ -323,11 +323,8 @@ async function purge(db: pg.Pool): Promise<void> {
  * answer, so it is no oracle.
  */
 async function claimMayOpen(ctx: SignInLinkContext, claim: { tripId: string; telegramUserId: string | null }): Promise<boolean> {
-  if (!ctx.groupSignIn || !claim.telegramUserId) return false;
-  if (!(await featureEnabled(ctx.db, claim.tripId, "member_group_sign_in", ctx.log))) return false;
-  const chat = await openGroupChat(ctx.db, claim.tripId);
-  if (!chat) return false;
-  return (await ctx.groupSignIn.isActiveMember(chat, claim.telegramUserId)) === true;
+  // The same rule the redemption and the launch ask (`claimGateVerdict` -> `groupSeatVerdict`), which only reads: an "out" here ends nothing.
+  return (await claimGateVerdict({ db: ctx.db, groupSignIn: ctx.groupSignIn, log: ctx.log }, claim)) === "in";
 }
 
 /**
@@ -567,23 +564,24 @@ export async function peekClaimLink(db: Queryable, token: unknown): Promise<{ us
 }
 
 /**
- * The launch's group verdict (`groupLinkVerdict` in telegram-mini-app.ts, which is private and takes a verified launch, so it
- * cannot be called from here; `groupSessionVerdict` in portal.ts needs an existing session, which is exactly what must not exist
- * yet), built from the same exported pieces in the same order: the group switch, the trip's one open group, a live
- * `getChatMember`. "in" carries on; "out" is the person having left (the caller ends the claim, `endClaimLeftGroup`); "unknown"
+ * The launch's group verdict: the SAME function the Mini App launch asks (`groupSeatVerdict` in telegram-mini-app.ts: the group
+ * switch, the trip's one open group, a live `getChatMember`), here reading the database through the pool.
+ * (`groupSessionVerdict` in portal.ts needs an existing session, which is exactly what must not exist yet.) "in" carries on; "out" is the person having left (the caller ends the claim, `endClaimLeftGroup`); "unknown"
  * (Telegram did not say) and "dormant" (switch off or unreadable, no open group, path not wired) revoke nothing and spend nothing.
  */
 export async function claimGateVerdict(
   ctx: { db: pg.Pool; groupSignIn: { isActiveMember: GroupMembershipCheck } | undefined; log: (line: string) => void },
   claim: { tripId: string; telegramUserId: string | null },
 ): Promise<"in" | "out" | "unknown" | "dormant"> {
-  if (!ctx.groupSignIn || !claim.telegramUserId) return "dormant";
-  if (!(await featureEnabled(ctx.db, claim.tripId, "member_group_sign_in", ctx.log))) return "dormant";
-  const chat = await openGroupChat(ctx.db, claim.tripId);
-  if (!chat) return "dormant";
-  const member = await ctx.groupSignIn.isActiveMember(chat, claim.telegramUserId);
-  if (member === "unknown") return "unknown";
-  return member === true ? "in" : "out";
+  const groupSignIn = ctx.groupSignIn;
+  if (!groupSignIn || !claim.telegramUserId) return "dormant";
+  return groupSeatVerdict(
+    {
+      switchOn: (tripId) => featureEnabled(ctx.db, tripId, "member_group_sign_in", ctx.log),
+      openChat: (tripId) => openGroupChat(ctx.db, tripId),
+      isActiveMember: (chat, telegramUserId) => groupSignIn.isActiveMember(chat, telegramUserId),
+    },
+    { tripId: claim.tripId, telegramUserId: claim.telegramUserId });
 }
 
 /** The person is not in the group: the claim, its link, sessions and membership end as at a Mini App launch, and this account's unspent links with them. */

@@ -19,8 +19,10 @@
  *
  * The trip SITE's binding of the invite they redeemed is ended by the caller after the commit (`releasedInvites`): the site removes it
  * only when account, name and invite id all match, and the token it issued before stops working at once, because the site reads the
- * binding on every request. If that call is lost, `deadInviteIds` (portal.ts) lets the next redemption or claim of the name replace it.
- * Their portal membership is gone, so they cannot mint a new launch either.
+ * binding on every request. That call is the prompt attempt, not the guarantee: revoking the redeemed invite above made the database
+ * write a durable release record in this same transaction (migration 20261122110000, site-release-outbox.ts), and a background pass
+ * retries it until the site confirms. `deadInviteIds` (portal.ts) is the second line: it lets the next redemption or claim of the
+ * name replace a binding whose release is still outstanding. Their portal membership is gone, so they cannot mint a new launch either.
  *
  * Refusals: a caller who is not an owner/organizer of the trip with dashboard
  * access gets the SAME 404 as a trip that does not exist; the owner/organizer
@@ -32,8 +34,8 @@ import type pg from "pg";
 export type RemoveMemberOutcome =
   /**
    * `releasedInvites`: the redeemed site invites that were this person's way in, with the trip-site participant each one bound. The caller
-   * tells the trip site to end THOSE bindings once the transaction has COMMITTED (best effort, as for a claim's release: never before the
-   * commit, so a rolled-back removal unbinds nobody).
+   * tells the trip site to end THOSE bindings once the transaction has COMMITTED (a prompt attempt, as for a claim's release: never before
+   * the commit, so a rolled-back removal unbinds nobody; a lost one is retried from the record the database wrote in this transaction).
    */
   | { ok: true; releasedInvites: { inviteId: string; runtimeUsername: string }[] }
   | { ok: false; status: 404 | 409; error: "NOT_FOUND" | "CANNOT_REMOVE_SELF" | "LAST_OWNER" | "LAST_ORGANIZER" | "OWNER_ONLY" };

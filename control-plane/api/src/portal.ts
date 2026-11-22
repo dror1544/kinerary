@@ -32,7 +32,7 @@ import {
 import { verifyMiniAppInitData, type VerifiedInitData } from "./telegram-webapp-auth.js";
 import { runtimeUpstreamFor } from "./runtime-upstream.js";
 import { applyLinkPassword, attachSession, claimGateVerdict, consumeSignInLink, endClaimLeftGroup, peekClaimLink, purgeSignInLinkLeftovers, signInLinkAvailable, startSignInLink, warnOncePerMinute, type SignInLinkRequest } from "./sign-in-link.js";
-import { SiteReleaseError, attemptSiteRelease, compensateSiteBinding, type SiteReleaseOptions } from "./site-release-outbox.js";
+import { OWN_REFUSALS, SiteReleaseError, attemptSiteRelease, compensateSiteBinding, type SiteReleaseOptions } from "./site-release-outbox.js";
 
 // The gateway's key, compared in constant time (a plain !== leaks how many
 // leading bytes were right).
@@ -314,6 +314,30 @@ export interface RuntimeAccountAdapter {
 /** How long the control plane waits on the trip site for one of these calls. They run inside a person's launch. */
 const RUNTIME_CALL_TIMEOUT_MS = 5000;
 
+/**
+ * The JSON `error` code of a failed answer when the body is an object carrying a string one (the trip site's and the runtime gateway's
+ * own errors all are), else null: HTML, empty, not an object, an over-long string. That is the line between "the site said so" and
+ * "something in between answered" (a proxy, a WAF, Express's default page for a route this payload does not have).
+ */
+async function siteJsonErrorCode(response: Response): Promise<string | null> {
+  const body = (await response.text().catch(() => "")).slice(0, 4096);
+  try {
+    const parsed = JSON.parse(body) as unknown;
+    const said = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as { error?: unknown }).error : undefined;
+    return typeof said === "string" && said.length <= 64 ? said : null;
+  } catch { return null; }
+}
+
+/**
+ * `listParticipants` failed because the route is not there: a 404 that is NOT the site's or gateway's own JSON `NOT_FOUND`. That is an
+ * older trip-site payload (Express's default HTML 404) during the window between a control-plane restart and the trip's redeploy.
+ * Its message is the ordinary list failure, so every caller that just catches fails safe exactly as before; only `createSiteInvite`
+ * looks at the class, to fall back to `participantExists` as `main` did.
+ */
+export class SiteRouteMissingError extends Error {
+  constructor() { super("RUNTIME_PARTICIPANT_LIST_FAILED"); this.name = "SiteRouteMissingError"; }
+}
+
 export class HttpRuntimeAccountAdapter implements RuntimeAccountAdapter {
   constructor(private readonly runtimeOrigin: string, private readonly apiKey: string, private readonly timeoutMs: number = RUNTIME_CALL_TIMEOUT_MS) {}
 
@@ -333,7 +357,10 @@ export class HttpRuntimeAccountAdapter implements RuntimeAccountAdapter {
       headers: { "x-api-key": this.apiKey },
       signal: AbortSignal.timeout(this.timeoutMs),
     });
-    if (!response.ok) throw new Error("RUNTIME_PARTICIPANT_LIST_FAILED");
+    if (!response.ok) {
+      if (response.status === 404 && (await siteJsonErrorCode(response)) !== OWN_REFUSALS[404]) throw new SiteRouteMissingError();
+      throw new Error("RUNTIME_PARTICIPANT_LIST_FAILED");
+    }
     const body = (await response.json()) as { participants?: unknown } | null;
     if (!body || !Array.isArray(body.participants)) throw new Error("RUNTIME_PARTICIPANT_LIST_FAILED");
     // Strings only: anything else is dropped here, so a malformed entry can neither be offered nor crash the caller.
@@ -362,10 +389,12 @@ export class HttpRuntimeAccountAdapter implements RuntimeAccountAdapter {
 
   async releaseParticipant(input: { tripId: string; userId: string; runtimeUsername: string; inviteId?: string }): Promise<void> {
     const response = await this.binding("release", input);
-    // The status travels with the failure (SiteReleaseError): the durable retry (site-release-outbox.ts) gives up on a 400/403/404 that
-    // can never succeed and keeps retrying everything else. A 200 counts only when it is the site's own answer, `{ok:true, released}`
-    // ("nothing to release" is `released:false` and is success); anything else on a 200 (a proxy's page, an empty body) is not an answer.
-    if (!response.ok) throw new SiteReleaseError(response.status);
+    // The status travels with the failure, and so does the body's JSON `error` code when the body is an object carrying a string one
+    // (SiteReleaseError): the durable retry (site-release-outbox.ts) gives up only on the site's or gateway's OWN refusal of that status
+    // and keeps retrying everything else, a proxy's or WAF's 4xx included. A 200 counts only when it is the site's own answer,
+    // `{ok:true, released}` ("nothing to release" is `released:false` and is success); anything else on a 200 (a proxy's page, an
+    // empty body) is not an answer.
+    if (!response.ok) throw new SiteReleaseError(response.status, await siteJsonErrorCode(response));
     const answer = (await response.json().catch(() => null)) as { ok?: unknown } | null;
     if (!answer || answer.ok !== true) throw new SiteReleaseError(null);
   }
@@ -729,7 +758,7 @@ export type SiteInviteResult =
  * for the same traveller meet here one after the other and cannot both win.
  */
 export async function createSiteInvite(
-  deps: Pick<PortalDependencies, "db" | "runtimeAccounts" | "publicOrigin">,
+  deps: Pick<PortalDependencies, "db" | "runtimeAccounts" | "publicOrigin"> & { log?: (line: string) => void },
   input: { tripId: string; actorUserId: string; runtimeUsername: string; displayName?: string; replacePending?: boolean },
 ): Promise<SiteInviteResult> {
   const { tripId } = input;
@@ -737,13 +766,29 @@ export async function createSiteInvite(
   if (!actor || !["owner", "organizer"].includes(actor.role) || !actor.dashboard_access) return { ok: false, status: 404, error: "NOT_FOUND" };
   const runtimeUsername = typeof input.runtimeUsername === "string" ? input.runtimeUsername.toLowerCase().trim() : "";
   if (!/^[a-z0-9][a-z0-9._-]{1,63}$/.test(runtimeUsername)) return { ok: false, status: 400, error: "INVALID_REQUEST" };
-  let people: readonly SiteParticipant[];
-  try { people = await deps.runtimeAccounts.listParticipants(tripId); } catch { return { ok: false, status: 409, error: "RUNTIME_NOT_READY" }; }
-  const person = people.find((candidate) => candidate.username === runtimeUsername);
-  if (!person) return { ok: false, status: 409, error: "RUNTIME_PARTICIPANT_NOT_FOUND" };
-  if (person.role !== "member") return { ok: false, status: 409, error: "RUNTIME_PARTICIPANT_NOT_ELIGIBLE" };
-  const given = typeof input.displayName === "string" ? input.displayName.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 120).trim() : "";
-  const displayName = given || person.displayName.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 120).trim();
+  const clean = (value: string) => value.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 120).trim();
+  const given = typeof input.displayName === "string" ? clean(input.displayName) : "";
+  let displayName: string;
+  try {
+    const people = await deps.runtimeAccounts.listParticipants(tripId);
+    const person = people.find((candidate) => candidate.username === runtimeUsername);
+    if (!person) return { ok: false, status: 409, error: "RUNTIME_PARTICIPANT_NOT_FOUND" };
+    if (person.role !== "member") return { ok: false, status: 409, error: "RUNTIME_PARTICIPANT_NOT_ELIGIBLE" };
+    displayName = given || clean(person.displayName);
+  } catch (error) {
+    // The list is a route an OLDER trip-site payload does not have (mixed versions: the control plane restarts before each trip is
+    // redeployed). Only that falls back, to what `main` asked: does the participant exist. A real outage stays RUNTIME_NOT_READY.
+    // What the fallback cannot read is the SITE's role for the name; the old site itself still refuses to bind an organizer at
+    // redeem (its provision route answers 403 ORGANIZER_BINDING_FORBIDDEN), and the checks below that come from the control plane's
+    // own tables (a group claim, an organizer-side account) are unchanged. The caller must name the traveller, as on `main`.
+    if (!(error instanceof SiteRouteMissingError)) return { ok: false, status: 409, error: "RUNTIME_NOT_READY" };
+    let exists: boolean;
+    try { exists = await deps.runtimeAccounts.participantExists({ tripId, runtimeUsername }); } catch { return { ok: false, status: 409, error: "RUNTIME_NOT_READY" }; }
+    if (!exists) return { ok: false, status: 409, error: "RUNTIME_PARTICIPANT_NOT_FOUND" };
+    (deps.log ?? ((line: string) => process.stderr.write(`${line}\n`)))(
+      structuredLog("info", "site_invite.old_site_fallback", { effect: "the trip site has no participant list: existence checked per participant, as before; its role for the name was not read" }));
+    displayName = given;
+  }
   if (!displayName) return { ok: false, status: 400, error: "INVALID_REQUEST" };
   const token = base64url(32);
   const inviteId = opaque("invite");
@@ -1244,6 +1289,13 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
       }
       if (verdict === "unknown") return reply.header("retry-after", "5").code(503).send({ error: "MEMBERSHIP_CHECK_UNAVAILABLE", retryable: true });
       if (verdict === "dormant") return reply.code(400).send({ error: "TOKEN_INVALID" });
+      // Telegram can be slow, and the caller may have gone while it thought. Spending the link and minting a scoped session for a
+      // connection that is closed would burn the link and leave a live session nobody holds, so nothing is spent: the same link
+      // works for a caller who is there. Same retryable answer as "Telegram did not say" (nobody will read it).
+      if (reply.raw.destroyed || request.raw.socket?.destroyed === true) {
+        emailAuthLog(structuredLog("info", "sign_in_link.client_gone", { effect: "link not spent, no session minted" }));
+        return reply.header("retry-after", "5").code(503).send({ error: "MEMBERSHIP_CHECK_UNAVAILABLE", retryable: true });
+      }
     }
     // THE INVARIANT: a link is spent by exactly one transaction, the one that mints its session. Nothing un-spends a link.
     const client = await deps.db.connect();
@@ -2412,7 +2464,7 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     if (!displayName || !/^[a-z0-9][a-z0-9._-]{1,63}$/.test(runtimeUsername)) return reply.code(400).send({ error: "INVALID_REQUEST" });
     // The rules (an existing participant, never an organizer, never a claimed traveller, the lock) live in createSiteInvite, which
     // the runtime gateway's hop and the companion's tool call too.
-    const made = await createSiteInvite(deps, { tripId, actorUserId: user.id, runtimeUsername, displayName });
+    const made = await createSiteInvite({ ...deps, log: emailAuthLog }, { tripId, actorUserId: user.id, runtimeUsername, displayName });
     if (!made.ok) return reply.code(made.status).send({ error: made.error });
     return reply.code(201).send({ id: made.id, status: "unused", joinUrl: made.joinUrl });
   });
@@ -2508,7 +2560,10 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     const invite = invites.rows[0];
     if (!invite || invite.state !== "unused") return reply.code(404).send({ error: "NOT_FOUND" });
     if (invite.expires_at.getTime() < Date.now()) {
-      await deps.db.query("UPDATE control_plane.site_invites SET state = 'expired', updated_at = now() WHERE id = $1", [invite.id]);
+      // Only an UNUSED invite expires. This write waits on the row lock of a redemption that read the invite while it was still valid
+      // and then lands on the row it just marked redeemed: unguarded, it turned a redeemed invite into `expired` with a redeemer, which
+      // broke that person's launch and (migration 20261122110000 reads "a redeemed invite left redeemed" as a removal) released their binding.
+      await deps.db.query("UPDATE control_plane.site_invites SET state = 'expired', updated_at = now() WHERE id = $1 AND state = 'unused'", [invite.id]);
       return reply.code(410).send({ error: "INVITE_EXPIRED" });
     }
     // Stable across a rolled-back redemption: the runtime may already have

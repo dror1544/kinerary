@@ -17,8 +17,8 @@ import { createServer } from "node:http";
 import { after, before, beforeEach, describe, test } from "node:test";
 import { HttpRuntimeAccountAdapter, createSiteInvite } from "../src/portal.js";
 import {
-  PENDING_OLDER_THAN_15_MINUTES_SQL, SITE_RELEASE_BACKOFF_MS, SiteReleaseError, compensateSiteBinding, runSiteReleasePass,
-  type SiteReleaser,
+  PENDING_OLDER_THAN_15_MINUTES_SQL, SITE_RELEASE_BACKOFF_MS, SiteReleaseError, attemptSiteRelease, compensateSiteBinding, runSiteReleasePass,
+  startSiteReleasePass, type SiteReleaseOptions, type SiteReleaser,
 } from "../src/site-release-outbox.js";
 import { endClaimLeftGroup } from "../src/sign-in-link.js";
 import { ORIGIN, asCookie, claim, cookieOf, id, initDataFor, launch, startHarness, tg, type Harness, type SitePerson } from "./support/group-sign-in-harness.js";
@@ -33,11 +33,17 @@ beforeEach(async () => { if (!skip) await h.pool.query("DELETE FROM control_plan
 
 const PEOPLE: SitePerson[] = [{ username: "dl17", displayName: "Dana Levi", role: "member" }, { username: "nl23", displayName: "Noam Levi", role: "member" }];
 const siteKey = (tripId: string, username: string) => `${tripId}:${username}`;
+/** What the trip site (server/control-plane-auth.js) and the runtime gateway answer, as JSON `error`, for the 4xx a release can get. */
+const OWN_REFUSAL_CODE: Record<number, string> = { 400: "INVALID_REQUEST", 403: "TRIP_MISMATCH", 404: "NOT_FOUND" };
 
 // ── a trip site that can be taken down ──────────────────────────────────────────────────────────────────────────────────
 interface Control {
-  /** "up": the fake site answers. "down": a lost call (timeout, refused). A number: that HTTP status. "malformed": a 200 whose body is not the site's. */
-  mode: "up" | "down" | "malformed" | number;
+  /**
+   * "up": the fake site answers. "down": a lost call (timeout, refused). A number: that HTTP status WITH the trip site's own JSON error
+   * code for it (the codes the site and the gateway really send, OWN_REFUSAL_CODE below). `{ status, code: null }`: that status with a
+   * body that is not the site's (a proxy's HTML, an empty body). "malformed": a 200 whose body is not the site's.
+   */
+  mode: "up" | "down" | "malformed" | number | { status: number; code: string | null };
   /** Every call that reached the site's door, whatever it answered. */
   calls: Array<{ tripId: string; userId: string; runtimeUsername: string; inviteId?: string }>;
   /** Makes each call take this long (a pass racing another one). */
@@ -54,7 +60,8 @@ function control(): Control {
       if (ctl.delayMs) await new Promise((resolve) => setTimeout(resolve, ctl.delayMs));
       if (ctl.mode === "down") throw new Error("RUNTIME_PARTICIPANT_RELEASE_FAILED");
       if (ctl.mode === "malformed") throw new SiteReleaseError(null);
-      if (typeof ctl.mode === "number") throw new SiteReleaseError(ctl.mode);
+      if (typeof ctl.mode === "number") throw new SiteReleaseError(ctl.mode, OWN_REFUSAL_CODE[ctl.mode] ?? null);
+      if (typeof ctl.mode === "object") throw new SiteReleaseError(ctl.mode.status, ctl.mode.code);
       await base.releaseParticipant(input);
     },
   };
@@ -116,6 +123,10 @@ async function inviteMember(ctl: Control, username = "dl17") {
 }
 type Invited = Awaited<ReturnType<typeof inviteMember>>;
 const membershipId = async (tripId: string, userId: string) => (await h.pool.query("SELECT id FROM control_plane.trip_memberships WHERE trip_id = $1 AND user_id = $2", [tripId, userId])).rows[0].id as string;
+
+/** The prompt attempt (`attemptSiteRelease`) for a claimed member's removal, on the given pool. */
+const attemptSiteReleaseFor = (db: SiteReleaseOptions["db"], ctl: Control, c: { tripId: string; userId: string; username: string }, log: (line: string) => void) =>
+  attemptSiteRelease({ db, releaser: ctl.releaser, log }, { tripId: c.tripId, userId: c.userId, runtimeUsername: c.username });
 
 // ═══ 1. every caller that ends a way in leaves a pending release behind, inside the transaction that ended it ═══════════════════
 
@@ -263,6 +274,20 @@ describe("1. a pending release is written in the transaction that ends the claim
     } finally { await ctl.app.close(); }
   });
 
+  test("a redeemed invite updated redeemed -> redeemed (a touch, a repeat write) records nothing: only LEAVING `redeemed` is a removal", async () => {
+    const ctl = control(); const m = await inviteMember(ctl);
+    try {
+      assert.deepEqual(await rowsOf(m.tripId), [], "redeeming recorded nothing");
+      await h.pool.query("UPDATE control_plane.site_invites SET state = 'redeemed', updated_at = now() WHERE id = $1", [m.inviteId]);
+      await h.pool.query("UPDATE control_plane.site_invites SET state = 'redeemed', redeemed_by = redeemed_by WHERE id = $1", [m.inviteId]);
+      assert.deepEqual(await rowsOf(m.tripId), [], "redeemed -> redeemed writes no record");
+      assert.equal(h.siteBindings.get(siteKey(m.tripId, m.username)), m.userId, "and the binding is untouched");
+      // the control: leaving `redeemed` does
+      await h.pool.query("UPDATE control_plane.site_invites SET state = 'revoked' WHERE id = $1", [m.inviteId]);
+      assert.equal((await rowsOf(m.tripId)).length, 1);
+    } finally { await ctl.app.close(); }
+  });
+
   test("ending the same claim twice leaves ONE pending record (the unique index on what is pending)", async () => {
     const ctl = control(); const c = await claimed(ctl);
     try {
@@ -309,6 +334,48 @@ describe("1. a pending release is written in the transaction that ends the claim
       assert.equal(h.siteBindings.has(siteKey(t.tripId, "dl17")), false, "the retry removes it");
       assert.equal((await rowsOf(t.tripId))[0]!.state, "done");
     } finally { await failingApp.close(); await ctl.app.close(); }
+  });
+
+  test("the claim's COMMIT answer is lost but the commit LANDED: the compensating release finds the live claim and does not undo it (superseded: the site is not asked)", async () => {
+    const ctl = control();
+    const t = await trip();
+    const person = tg(); await h.telegram.member(t.chatId, person, "member");
+    const lostAnswer = new Proxy(h.pool, {
+      get(target, prop, receiver) {
+        if (prop === "connect") {
+          return async () => {
+            const client = await target.connect();
+            const original = { query: client.query, release: client.release };
+            const query = client.query.bind(client) as (...a: unknown[]) => Promise<unknown>;
+            // COMMIT really runs, and its answer is lost
+            (client as unknown as { query: unknown }).query = (sql: unknown, ...rest: unknown[]) =>
+              sql === "COMMIT" ? query(sql).then(() => Promise.reject(Object.assign(new Error("connection reset after commit"), { code: "08006" }))) : query(sql, ...rest);
+            (client as unknown as { release: unknown }).release = (...args: unknown[]) => { Object.assign(client, original); return (original.release as (...a: unknown[]) => void).apply(client, args); };
+            return client;
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const app = h.newApp({ db: lostAnswer, runtimeAccounts: { ...h.deps().runtimeAccounts, releaseParticipant: ctl.releaser.releaseParticipant } });
+    try {
+      const offer = (await launch(ctl.app, initDataFor(person, { tripId: t.tripId }))).json() as { travellers: { claimId: string; name: string }[] };
+      h.logs.length = 0;
+      const r = await claim(app, initDataFor(person, { tripId: t.tripId }), t.tripId, offer.travellers.find((x) => x.name === "Dana Levi")!.claimId);
+      assert.equal(r.statusCode, 500, "answered as for any commit failure");
+      const live = (await h.pool.query("SELECT user_id FROM control_plane.trip_participant_claims WHERE trip_id = $1 AND released_at IS NULL", [t.tripId])).rows;
+      assert.equal(live.length, 1, "the claim that committed is still live: the compensation did not undo it");
+      const userId = live[0].user_id as string;
+      assert.equal(h.siteBindings.get(siteKey(t.tripId, "dl17")), userId, "the site still binds the committed claimant");
+      assert.deepEqual(ctl.calls, [], "the site was never asked to release");
+      const [row] = await rowsOf(t.tripId);
+      assert.deepEqual({ reason: row!.reason, state: row!.state, outcome: row!.outcome }, { reason: "claim_commit_failed", state: "done", outcome: "superseded" });
+      assert.equal((await h.pool.query("SELECT status FROM control_plane.trip_memberships WHERE trip_id = $1 AND user_id = $2", [t.tripId, userId])).rows[0].status, "active");
+      // and the person's launch works: nothing about them was undone
+      const again = await launch(ctl.app, initDataFor(person, { tripId: t.tripId }));
+      assert.deepEqual(again.json(), { kind: "session", appPath: `/mini-app/trips/${t.tripId}` });
+    } finally { await app.close(); await ctl.app.close(); }
   });
 
   test("the compensating release when the record cannot be written either (the database is down) still tries the site once, as before, and never throws", async () => {
@@ -425,6 +492,22 @@ describe("3. the background pass", { skip }, () => {
     } finally { await ctl.app.close(); }
   });
 
+  test("only the FIRST failed attempt logs `site_release.pending`: three failures in a row, one line", async () => {
+    const ctl = control(); const c = await claimed(ctl);
+    try {
+      ctl.mode = "down";
+      h.logs.length = 0;
+      await ctl.app.inject({ method: "DELETE", url: `/v1/trips/${c.tripId}/members/${await membershipId(c.tripId, c.userId)}`, headers: ownerHeaders(c) });
+      await pass(ctl, HOUR);
+      await pass(ctl, 2 * HOUR);
+      const [row] = await rowsOf(c.tripId);
+      assert.equal(row!.attempts, 3, "the prompt attempt and two passes all failed");
+      assert.equal(ctl.calls.length, 3);
+      assert.equal(eventsNamed("site_release.pending").length, 1, "one line when it went pending, none for the retries");
+      assert.equal(eventsNamed("site_release.pending")[0]!.level, "warn");
+    } finally { await ctl.app.close(); }
+  });
+
   test("a row that is not due, or is leased by another pass, is not attempted", async () => {
     const ctl = control(); const c = await claimed(ctl);
     try {
@@ -518,6 +601,50 @@ describe("4. permanent answers", { skip }, () => {
     } finally { await ctl.app.close(); await new Promise((resolve) => site.close(resolve)); }
   });
 
+  /** The real adapter against a stand-in for whatever answers at the public hostname, driven by passes; returns what the passes left. */
+  async function liveRemovalAgainst(reply: { status: number; contentType: string; body: string }, laps: number) {
+    const door: string[] = [];
+    const site = createServer((request, response) => { request.resume(); request.on("end", () => { door.push(`${request.method} ${request.url}`); response.writeHead(reply.status, { "content-type": reply.contentType }); response.end(reply.body); }); });
+    await new Promise<void>((resolve) => site.listen(0, "127.0.0.1", resolve));
+    const adapter = new HttpRuntimeAccountAdapter(`http://127.0.0.1:${(site.address() as { port: number }).port}`, "k");
+    const ctl = control(); const c = await claimed(ctl);
+    try {
+      ctl.mode = "down"; // the prompt attempt is lost (it never reaches the stand-in), so the record starts pending with attempts = 1
+      await ctl.app.inject({ method: "DELETE", url: `/v1/trips/${c.tripId}/members/${await membershipId(c.tripId, c.userId)}`, headers: ownerHeaders(c) });
+      h.logs.length = 0;
+      for (let lap = 0; lap < laps; lap += 1) await runSiteReleasePass({ db: h.pool, releaser: adapter, log: (line) => h.logs.push(line), now: clockAt((lap + 1) * HOUR) });
+      const [row] = await rowsOf(c.tripId);
+      return { row: row!, door };
+    } finally { await ctl.app.close(); await new Promise((resolve) => site.close(resolve)); }
+  }
+
+  for (const [status, code] of Object.entries(OWN_REFUSAL_CODE)) {
+    test(`the real adapter: the site's own JSON refusal (${status} ${code}) is given up at the third attempt, with ONE warn`, async () => {
+      const { row, door } = await liveRemovalAgainst({ status: Number(status), contentType: "application/json", body: JSON.stringify({ error: code }) }, 6);
+      assert.deepEqual({ state: row.state, attempts: row.attempts, outcome: row.outcome }, { state: "given_up", attempts: 3, outcome: `refused_${status}` });
+      assert.equal(door.length, 2, "two passes reached the site after the lost prompt attempt, then no more");
+      assert.deepEqual(eventsNamed("site_release.given_up").map((e) => [e.level, e.why]), [["warn", `refused_${status}`]]);
+    });
+  }
+
+  const NOT_THE_SITES: Array<[string, number, string, string]> = [
+    ["a proxy's HTML 404 (an ingress with no route during a rollout)", 404, "text/html", "<html><body><h1>404 Not Found</h1>nginx</body></html>"],
+    ["a WAF's HTML 403", 403, "text/html", "<html><title>Access denied</title></html>"],
+    ["an empty 400", 400, "text/plain", ""],
+    ["a proxy's JSON 403 with a different code", 403, "application/json", '{"error":"FORBIDDEN"}'],
+    ["a proxy's JSON 404 naming a message, not an error code", 404, "application/json", '{"message":"no such route"}'],
+    ["a 404 whose `error` is not a string", 404, "application/json", '{"error":{"code":"NOT_FOUND"}}'],
+    ["the right code on the wrong status (INVALID_REQUEST on a 404)", 404, "application/json", '{"error":"INVALID_REQUEST"}'],
+  ];
+  for (const [label, status, contentType, body] of NOT_THE_SITES) {
+    test(`the real adapter: ${label} is NOT the site's refusal: retried, still pending after 6 attempts, never given up`, async () => {
+      const { row, door } = await liveRemovalAgainst({ status, contentType, body }, 5);
+      assert.deepEqual({ state: row.state, attempts: row.attempts, outcome: row.outcome }, { state: "pending", attempts: 6, outcome: null });
+      assert.equal(door.length, 5, "every pass reached the door and asked again");
+      assert.deepEqual(eventsNamed("site_release.given_up"), []);
+    });
+  }
+
   test("a trip that is retired, or gone, is given up on cleanly without asking the site", async () => {
     const ctl = control();
     const retired = await h.mkTrip("Gone", { retired: true });
@@ -545,10 +672,16 @@ describe("4. permanent answers", { skip }, () => {
     const adapter = new HttpRuntimeAccountAdapter(`http://127.0.0.1:${(site.address() as { port: number }).port}`, "k");
     const input = { tripId: "trip_abcdefgh", userId: "user_abcdefgh", runtimeUsername: "bob" };
     const statusOf = async () => { try { await adapter.releaseParticipant(input); return "ok"; } catch (error) { return error instanceof SiteReleaseError ? error.status : `plain:${(error as Error).message}`; } };
+    const codeOf = async () => { try { await adapter.releaseParticipant(input); return "ok"; } catch (error) { return error instanceof SiteReleaseError ? error.code : `plain:${(error as Error).message}`; } };
     try {
       assert.equal(await statusOf(), "ok");
       reply = { status: 200, body: '{"ok":true,"released":false}' }; assert.equal(await statusOf(), "ok");
-      for (const status of [400, 403, 404, 401, 429, 500, 502, 503]) { reply = { status, body: "{}" }; assert.equal(await statusOf(), status); }
+      for (const status of [400, 403, 404, 401, 429, 500, 502, 503]) { reply = { status, body: "{}" }; assert.equal(await statusOf(), status); assert.equal(await codeOf(), null, "a 4xx whose body names no error code carries none"); }
+      // the error code travels with the status only when the body is a JSON object with a string `error`
+      reply = { status: 403, body: '{"error":"TRIP_MISMATCH"}' }; assert.equal(await codeOf(), "TRIP_MISMATCH");
+      for (const body of ["<html>forbidden</html>", "", "[]", "null", '{"error":42}', '{"error":{"code":"NOT_FOUND"}}', '{"message":"blocked"}', `{"error":"${"X".repeat(200)}"}`]) {
+        reply = { status: 403, body }; assert.equal(await codeOf(), null, `403 with ${JSON.stringify(body.slice(0, 30))} carries no code`);
+      }
       for (const body of ["", "not json", "{}", '{"ok":false}', "[]", "null", "<html>gateway</html>"]) { reply = { status: 200, body }; assert.equal(await statusOf(), null, `200 with ${JSON.stringify(body)} is not the site's answer`); }
     } finally { await new Promise((resolve) => site.close(resolve)); }
   });
@@ -666,6 +799,37 @@ describe("7. observability and retention", { skip }, () => {
     assert.equal(Number((await h.pool.query(PENDING_OLDER_THAN_15_MINUTES_SQL)).rows[0].n) - before, 1);
   });
 
+  test("a release that is stuck is never silent: ONE `site_release.backlog` line per hour while a pending record is over 15 minutes old or a given-up one is under 30 days old, counts only, and nothing when there is none", async () => {
+    const ctl = control();
+    const t = await trip();
+    const user = await h.mkUser("Someone");
+    const T0 = Date.now();
+    let believed = T0;
+    const options: SiteReleaseOptions = { db: h.pool, releaser: ctl.releaser, log: (line) => h.logs.push(line), now: () => new Date(believed) };
+    const lap = async (minutesAfterStart: number) => { believed = T0 + minutesAfterStart * MINUTE; h.logs.length = 0; await runSiteReleasePass(options); return eventsNamed("site_release.backlog"); };
+    try {
+      assert.deepEqual(await lap(0), [], "an empty outbox says nothing");
+      // a pending record 5 minutes old (under the line), parked so no pass attempts it
+      await h.pool.query("INSERT INTO control_plane.site_release_outbox(trip_id, user_id, runtime_username, reason, created_at, next_attempt_at) VALUES ($1, $2, 'dl17', 'organizer_released', $3, now() + interval '1000 days')", [t.tripId, user, new Date(T0 - 5 * MINUTE)]);
+      assert.deepEqual(await lap(1), [], "pending for 6 minutes: not yet");
+      assert.deepEqual(await lap(11), [{ level: "warn", event: "site_release.backlog", pending_over_15m: 1, given_up: 0 }], "16 minutes: the first line, counts only");
+      assert.deepEqual(await lap(30), [], "the same backlog, inside the hour: silent");
+      assert.deepEqual(await lap(70), [], "59 minutes after the line: silent");
+      assert.equal((await lap(72)).length, 1, "an hour after the first line: again");
+      assert.equal((await lap(100)).length, 0);
+      assert.equal((await lap(133)).length, 1, "and the hour after that");
+      // the pending one lands; a given-up one (a rotated key, a refusal) keeps the line coming for 30 days
+      await h.pool.query("UPDATE control_plane.site_release_outbox SET state = 'done', outcome = 'released', completed_at = now() WHERE trip_id = $1", [t.tripId]);
+      await h.pool.query("INSERT INTO control_plane.site_release_outbox(trip_id, user_id, runtime_username, reason, state, outcome, completed_at) VALUES ($1, $2, 'nl23', 'organizer_released', 'given_up', 'refused_403', $3)", [t.tripId, user, new Date(T0)]);
+      assert.deepEqual(await lap(200), [{ level: "warn", event: "site_release.backlog", pending_over_15m: 0, given_up: 1 }]);
+      assert.equal((await lap(230)).length, 0);
+      assert.equal((await lap(262)).length, 1);
+      // 31 days on, the given-up record is older than the line is for, and it stops
+      assert.deepEqual(await lap(31 * 24 * 60), [], "past 30 days a given-up record is no longer young enough to report (the pass purges it by the database clock), so the line stops");
+      assert.equal(h.logs.join("\n").includes("dl17") || h.logs.join("\n").includes(t.tripId), false);
+    } finally { await ctl.app.close(); }
+  });
+
   test("retention: a done record is purged after a day, a given-up one after 30 days, a pending one never", async () => {
     const ctl = control();
     const t = await trip();
@@ -680,6 +844,59 @@ describe("7. observability and retention", { skip }, () => {
       await h.pool.query("UPDATE control_plane.site_release_outbox SET created_at = now() - interval '90 days', next_attempt_at = now() + interval '1000 days' WHERE runtime_username = 'a5'");
       await pass(ctl, 0);
       assert.deepEqual((await rowsOf(t.tripId)).map((r) => r.runtime_username).sort(), ["a1", "a3", "a5"]);
+    } finally { await ctl.app.close(); }
+  });
+
+  test("no username, user id, invite id or trip id in the `superseded`, `attempt_error`, `record_failed` and `pass_error` lines either (each is provoked here, so none is vacuous)", async () => {
+    const lines: string[] = [];
+    const log = (line: string) => { lines.push(line); };
+    const names = (e: string) => lines.map((l) => JSON.parse(l) as Record<string, unknown>).filter((x) => x.event === e);
+    const ctl = control();
+    const failing = (pattern: RegExp) => new Proxy(h.pool, {
+      get(target, prop, receiver) {
+        if (prop === "query") return (sql: unknown, ...rest: unknown[]) => (typeof sql === "string" && pattern.test(sql) ? Promise.reject(Object.assign(new Error("boom dl17"), { code: "XX000" })) : (target.query as (...a: unknown[]) => unknown)(sql, ...rest));
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const secrets: string[] = ["dl17"];
+    try {
+      // superseded: the control plane holds that binding again
+      const c = await claimed(ctl);
+      secrets.push(c.tripId, c.userId);
+      ctl.mode = "down";
+      await ctl.app.inject({ method: "DELETE", url: `/v1/trips/${c.tripId}/members/${await membershipId(c.tripId, c.userId)}`, headers: ownerHeaders(c) });
+      ctl.mode = "up";
+      await h.pool.query("UPDATE control_plane.trip_memberships SET status = 'active' WHERE trip_id = $1 AND user_id = $2", [c.tripId, c.userId]);
+      await h.pool.query("INSERT INTO control_plane.trip_participant_claims(id, trip_id, user_id, runtime_username, via, telegram_user_id) VALUES ($1, $2, $3, 'dl17', 'group_membership', $4)", [id("tpc"), c.tripId, c.userId, String(tg())]);
+      await runSiteReleasePass({ db: h.pool, releaser: ctl.releaser, log, now: clockAt(HOUR) });
+      assert.equal(names("site_release.superseded").length, 1);
+      // attempt_error: the database fails while a row is being settled (the pass, then the prompt attempt)
+      const d = await claimed(ctl);
+      secrets.push(d.tripId, d.userId);
+      ctl.mode = "down";
+      await ctl.app.inject({ method: "DELETE", url: `/v1/trips/${d.tripId}/members/${await membershipId(d.tripId, d.userId)}`, headers: ownerHeaders(d) });
+      await runSiteReleasePass({ db: failing(/SELECT 1 FROM control_plane\.trips t/), releaser: ctl.releaser, log, now: clockAt(2 * HOUR) });
+      await h.pool.query("UPDATE control_plane.site_release_outbox SET claimed_until = NULL WHERE trip_id = $1", [d.tripId]);
+      await attemptSiteReleaseFor(failing(/SELECT 1 FROM control_plane\.trips t/), ctl, d, log);
+      assert.ok(names("site_release.attempt_error").length >= 2, "the pass and the prompt attempt each logged one");
+      // record_failed: the record cannot be written
+      await compensateSiteBinding({ db: failing(/INSERT INTO control_plane\.site_release_outbox/), releaser: ctl.releaser, log }, { tripId: d.tripId, userId: d.userId, runtimeUsername: "dl17" });
+      assert.equal(names("site_release.record_failed").length, 1);
+      // pass_error: the loop's pass itself fails
+      let stop!: () => void;
+      const seen = new Promise<void>((resolve) => {
+        const loop = startSiteReleasePass({ db: failing(/DELETE FROM control_plane\.site_release_outbox/), releaser: ctl.releaser, intervalMs: 5, log: (line) => { log(line); if (line.includes("site_release.pass_error")) resolve(); } });
+        stop = () => loop.stop();
+      });
+      await seen; stop();
+      assert.ok(names("site_release.pass_error").length >= 1);
+      for (const event of ["site_release.superseded", "site_release.attempt_error", "site_release.record_failed", "site_release.pass_error"]) {
+        for (const line of lines.filter((l) => l.includes(event))) {
+          for (const secret of secrets) assert.ok(!line.includes(secret), `${event} carries an identifier: ${line}`);
+          assert.ok(!/dl17|user_|trip_|invite_/.test(line), `${event}: ${line}`);
+        }
+      }
     } finally { await ctl.app.close(); }
   });
 

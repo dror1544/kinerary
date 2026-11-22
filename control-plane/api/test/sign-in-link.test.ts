@@ -7,6 +7,8 @@
  */
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
+import { request as httpRequest } from "node:http";
+import type { AddressInfo } from "node:net";
 import { after, before, beforeEach, describe, test } from "node:test";
 import { digestTelegramId } from "../src/identity.js";
 import { LogMailer } from "../src/mailer.js";
@@ -16,6 +18,7 @@ import { digestEmail, hashPassword } from "../src/password-identity.js";
 import { portalMailIdle } from "../src/portal-email-auth.js";
 import { PORTAL_SCOPE_POLICY, scopedSessionDigest } from "../src/portal-scope.js";
 import { GROUP_VERIFIED_VIA } from "../src/telegram-mini-app.js";
+import { startOldPayloadSite } from "./support/old-payload-site.js";
 import { ORIGIN, asCookie, cookieOf, id, sha256, startHarness, tg, type Harness, type SitePerson } from "./support/group-sign-in-harness.js";
 import { testDatabaseUrl } from "./support/test-database.js";
 
@@ -508,6 +511,23 @@ describe("AC-15: which account, which channel", { skip }, () => {
       assert.equal((await pendingNotices()).length, 0);
       assert.equal(mailer.outbox.length, 0);
     } finally { await app.close(); }
+  });
+
+  test("a trip site with an OLD payload (no participant list: Express's HTML 404) is a site that cannot be asked: the name door sends nothing and never falls back", async () => {
+    await dropEverything();
+    const site = await startOldPayloadSite(["dl17"]);
+    const app = h.newApp({ mailer, emailAuthLog: (line) => logs.push(line), runtimeAccounts: site.adapter });
+    try {
+      const { tripId } = await mkTrip();
+      await mkClaimAccount(tripId, "dl17", "Dana Levi");
+      const answer = await ask(app, { tripId, travellerName: "Dana Levi" });
+      assert.equal(answer.body, GENERIC, "the one answer, as for every other case");
+      await settle();
+      assert.equal(await allLinkRows(), 0, "no link was made");
+      assert.equal((await pendingNotices()).length, 0, "and nothing was queued");
+      assert.ok(site.calls.some((call) => call === `GET /internal/t/${tripId}/participants`), "the list was asked");
+      assert.ok(!site.calls.some((call) => call.endsWith("/participants/dl17")), "and nothing fell back to the per-participant route");
+    } finally { await app.close(); await site.close(); }
   });
 
   test("ambiguous or unmatched names, and a site that cannot be asked, send nothing", async () => {
@@ -1280,6 +1300,58 @@ describe("a claimant's redemption asks the group BEFORE any session exists, and 
       assert.equal(await sessionsOf(person.userId), 0);
       assert.equal((await linkRows(person.userId))[0].used_at, null);
     } finally { /* the hanging request is abandoned with the app */ void app.close(); }
+  });
+
+  test("a client that is ALREADY GONE when Telegram finally says \"member\": the link is not spent and no session is minted for nobody to hold; the same link still works afterwards", async () => {
+    await dropEverything();
+    let release!: (value: boolean) => void;
+    const gate = new Promise<boolean>((resolve) => { release = resolve; });
+    let asked!: () => void;
+    const telegramAsked = new Promise<void>((resolve) => { asked = resolve; });
+    let gone!: () => void;
+    const goneLogged = new Promise<void>((resolve) => { gone = resolve; });
+    const app = h.newApp({
+      mailer,
+      emailAuthLog: (line) => { logs.push(line); if (line.includes("sign_in_link.client_gone")) gone(); },
+      memberGroupSignIn: { isActiveMember: async () => { asked(); return await gate; } },
+    });
+    try {
+      const { tripId } = await mkTrip();
+      const person = await mkClaimAccount(tripId, "dl17", "Dana Levi");
+      const issueApp = newApp();
+      await ask(issueApp, { tripId, travellerName: "Dana Levi" }); await settle(); await issueApp.close();
+      const token = tokenIn((await dispatch())[0]!.text);
+      await app.listen({ port: 0, host: "127.0.0.1" });
+      const port = (app.server.address() as AddressInfo).port;
+      // a real connection, so there is a real socket to close
+      const serverSideClosed = new Promise<void>((resolve) => { app.server.once("connection", (socket) => { socket.once("close", () => resolve()); }); });
+      const clientRequest = httpRequest({ host: "127.0.0.1", port, method: "POST", path: "/v1/auth/sign-in-link/redeem", headers: { "content-type": "application/json", origin: ORIGIN } });
+      clientRequest.on("error", () => { /* the caller goes away on purpose */ });
+      clientRequest.end(JSON.stringify({ token }));
+      await telegramAsked;
+      clientRequest.destroy();
+      await serverSideClosed;
+      // Whichever happens first ends the wait: the new line (the skip), or the link being spent (the defect), so a regression fails here
+      // with a reason instead of hanging.
+      let settled = false;
+      const spent = (async () => { while (!settled) { if ((await linkRows(person.userId))[0].used_at) return "spent"; await new Promise((resolve) => setTimeout(resolve, 10)); } return "skipped"; })();
+      release(true);
+      const first = await Promise.race([goneLogged.then(() => "skipped"), spent]);
+      settled = true;
+      assert.equal(first, "skipped", "the link was spent for a caller who had already gone");
+      assert.equal(await sessionsOf(person.userId), 0, "no session was minted for a caller that is not there");
+      assert.equal((await linkRows(person.userId))[0].used_at, null, "and the link was not spent");
+      assert.ok(logs.some((line) => line.includes("sign_in_link.client_gone")), "said once, loudly enough to count");
+      assert.ok(!logs.join("\n").includes(tripId) && !logs.join("\n").includes(person.userId), "and names nobody");
+      // the control: the same link, from a caller who stays on a real connection, opens (the check does not misfire on a live socket)
+      const status = await new Promise<number>((resolve, reject) => {
+        const live = httpRequest({ host: "127.0.0.1", port, method: "POST", path: "/v1/auth/sign-in-link/redeem", headers: { "content-type": "application/json", origin: ORIGIN } }, (response) => { response.resume(); response.on("end", () => resolve(response.statusCode ?? 0)); });
+        live.on("error", reject);
+        live.end(JSON.stringify({ token }));
+      });
+      assert.equal(status, 200, "the same link opens for a caller who is there");
+      assert.equal(await sessionsOf(person.userId), 1);
+    } finally { release(true); await app.close(); }
   });
 
   test("two redeems of one claimant link while Telegram is down: both are told to retry and nothing is spent; after recovery, exactly one 200", async () => {

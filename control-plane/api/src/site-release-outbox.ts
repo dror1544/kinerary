@@ -21,10 +21,16 @@
  * SAME account bound again to the same traveller with no invite: `releaseIsStale` asks the control plane first.
  *
  * WHAT ENDS A RECORD. The site answering 2xx with its own body (`{ok:true, released:true|false}`: "nothing to release" is
- * success) -> done. A 400/403/404, which can never succeed, three attempts in -> given up, ONE warn. The trip retired or gone ->
+ * success) -> done. The trip site's (or the gateway's) OWN refusal, which can never succeed (see
+ * `OWN_REFUSALS`: a JSON body `{error: <that status's code>}`), three attempts in -> given up, ONE warn. A 4xx that is NOT that
+ * (a proxy's or WAF's HTML page, an empty body, someone else's JSON: production's `runtime_origin` is a public hostname behind an
+ * ingress, which can answer a bare 403/404 during a rollout) says nothing about the site and is transient. The trip retired or gone ->
  * given up, quietly. The control plane holding that very binding again -> done, `superseded`. Everything else (a timeout, a
- * refused connection, a 5xx, a 401, a 429, a 200 that is not the site's answer) is transient and retried for as long as it takes:
- * the operator's query (`PENDING_OLDER_THAN_15_MINUTES_SQL`) is how anyone learns that "as long as it takes" is too long.
+ * refused connection, a 5xx, a 401, a 429, a 4xx that is not the site's own, a 200 that is not the site's answer) is transient and
+ * retried for as long as it takes. "As long as it takes" and a give-up are both LOUD and repeated: the pass logs
+ * `site_release.backlog {pending_over_15m, given_up}` once an hour while a pending record is over 15 minutes old or a given-up one
+ * is under 30 days old (so a rotated key, a 401 for ever, cannot go unnoticed), and the operator's query
+ * (`PENDING_OLDER_THAN_15_MINUTES_SQL`) counts the same.
  * Records are purged by the pass: done after a day, given up after 30 days, pending never.
  *
  * LOGS carry the event, the reason code, and attempt counts. Never a user id, a username, an invite id, a trip id or a token.
@@ -37,8 +43,16 @@ import { NOT_RETIRED_SQL } from "./trip-retirement.js";
 export const SITE_RELEASE_BACKOFF_MS: readonly number[] = [30_000, 120_000, 600_000, 1_800_000];
 /** A refusal that can never succeed is given up on after this many attempts (the prompt one included). */
 export const PERMANENT_REFUSAL_ATTEMPTS = 3;
-/** A 4xx that can never succeed: malformed, a trip mismatch, a route an older site does not have. */
-const PERMANENT_STATUSES: ReadonlySet<number> = new Set([400, 403, 404]);
+/**
+ * The 4xx a release can never recover from, by status, and the JSON `error` code that makes each one the trip site's OR the gateway's
+ * OWN answer: INVALID_REQUEST (a malformed user id, name or invite id, or a body whose trip id is not the URL's: server/control-plane-auth.js
+ * and the gateway's bindingAction), TRIP_MISMATCH (the site's identity is another trip's), NOT_FOUND (the gateway's: not a trip id, not a
+ * route). A 4xx with any other body, or the right code on another status, is some hop in between (a proxy, a WAF, an ingress with no route
+ * yet) and is retried. An older site that lacks the release route answers Express's HTML 404: that is retried too, which is right: the
+ * release lands when the site is upgraded, and the backlog line says it is waiting.
+ */
+export const OWN_REFUSALS: Readonly<Record<number, string>> = { 400: "INVALID_REQUEST", 403: "TRIP_MISMATCH", 404: "NOT_FOUND" };
+const isOwnRefusal = (status: number | null, code: string | null): status is number => status !== null && code !== null && OWN_REFUSALS[status] === code;
 /** How long a pass owns a row it has taken. The site call times out at 5 s; this only has to outlive a dead process's last call. */
 const LEASE_MS = 120_000;
 const PASS_BATCH = 20;
@@ -49,9 +63,12 @@ export const GIVEN_UP_RETENTION = "30 days";
 export const PENDING_OLDER_THAN_15_MINUTES_SQL =
   "SELECT count(*)::int AS n FROM control_plane.site_release_outbox WHERE state = 'pending' AND created_at < now() - interval '15 minutes'";
 
-/** What the site answered when it did answer and the answer was not success; `status` null is "an answer that is not the site's". */
+/**
+ * What the site answered when it did answer and the answer was not success; `status` null is "an answer that is not the site's".
+ * `code` is the body's JSON `error` string when the body is an object carrying one, else null (HTML, empty, not an object).
+ */
 export class SiteReleaseError extends Error {
-  constructor(readonly status: number | null) { super("RUNTIME_PARTICIPANT_RELEASE_FAILED"); this.name = "SiteReleaseError"; }
+  constructor(readonly status: number | null, readonly code: string | null = null) { super("RUNTIME_PARTICIPANT_RELEASE_FAILED"); this.name = "SiteReleaseError"; }
 }
 
 export interface SiteReleaseTarget { tripId: string; userId: string; runtimeUsername: string; inviteId?: string | undefined }
@@ -121,7 +138,7 @@ async function settle(options: SiteReleaseOptions, row: Row): Promise<Outcome> {
   } catch (error) {
     const attempts = row.attempts + 1;
     const status = error instanceof SiteReleaseError ? error.status : null;
-    if (status !== null && PERMANENT_STATUSES.has(status) && attempts >= (options.permanentAttempts ?? PERMANENT_REFUSAL_ATTEMPTS)) {
+    if (error instanceof SiteReleaseError && isOwnRefusal(status, error.code) && attempts >= (options.permanentAttempts ?? PERMANENT_REFUSAL_ATTEMPTS)) {
       await finish(options, row, "given_up", `refused_${status}`);
       options.log(structuredLog("warn", "site_release.given_up", { reason: row.reason, why: `refused_${status}`, attempts }));
       return "given_up";
@@ -218,7 +235,30 @@ export async function runSiteReleasePass(options: SiteReleaseOptions): Promise<P
     else if (outcome === "given_up") result.givenUp += 1;
     else if (outcome === "superseded") result.superseded += 1;
   }
+  await logBacklog(options, now);
   return result;
+}
+
+/** When each options object last logged the backlog line: the loop passes the same object every time, so "once an hour" holds across passes. */
+const lastBacklogLine = new WeakMap<SiteReleaseOptions, number>();
+export const BACKLOG_LINE_EVERY_MS = 3_600_000;
+
+/**
+ * A release that has not landed in 15 minutes, or one that was given up on in the last 30 days, is a removed person whose assistant
+ * and site token may still work. The one warn at give-up is easy to miss, so this repeats, once an hour, with counts only, for as long
+ * as either exists. Nothing is logged when neither does.
+ */
+async function logBacklog(options: SiteReleaseOptions, now: Date): Promise<void> {
+  const last = lastBacklogLine.get(options);
+  if (last !== undefined && now.getTime() - last < BACKLOG_LINE_EVERY_MS) return;
+  const counts = await options.db.query<{ pending_over_15m: number; given_up: number }>(
+    `SELECT count(*) FILTER (WHERE state = 'pending' AND created_at < $1::timestamptz - interval '15 minutes')::int AS pending_over_15m,
+            count(*) FILTER (WHERE state = 'given_up' AND completed_at > $1::timestamptz - interval '${GIVEN_UP_RETENTION}')::int AS given_up
+       FROM control_plane.site_release_outbox`, [now]);
+  const { pending_over_15m, given_up } = counts.rows[0] ?? { pending_over_15m: 0, given_up: 0 };
+  if (pending_over_15m === 0 && given_up === 0) return;
+  lastBacklogLine.set(options, now.getTime());
+  options.log(structuredLog("warn", "site_release.backlog", { pending_over_15m, given_up }));
 }
 
 /**

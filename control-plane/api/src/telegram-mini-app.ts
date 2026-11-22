@@ -485,6 +485,40 @@ async function offerClaim(client: pg.PoolClient, launch: VerifiedInitData, tripI
   return { kind: "claim", tripId, travellers };
 }
 
+/** The seat a person holds in a trip's group, from the group rule below. */
+export type GroupSeatVerdict = "in" | "out" | "unknown" | "dormant";
+
+/** How a caller reads the two database facts the group rule needs (on its own connection or pool) and asks Telegram. */
+export interface GroupSeatReads {
+  /** Is `member_group_sign_in` on for this trip? False on any doubt. */
+  switchOn(tripId: string): Promise<boolean>;
+  /** The trip's one open group chat, or null (`openGroupChat`). */
+  openChat(tripId: string): Promise<string | null>;
+  isActiveMember: GroupMembershipCheck;
+}
+
+/**
+ * THE GROUP RULE, in one place: is this person still in this trip's group? The switch is on, the trip has exactly one open group,
+ * and Telegram, asked live, says so.
+ *   in       the switch is on, there is one open group, and the person is in it.
+ *   out      Telegram said the person is not in it.
+ *   unknown  Telegram did not say (a timeout, an error, a restricted member with no answer): the caller revokes nothing and grants nothing.
+ *   dormant  no wiring, the switch is off or unreadable, or the trip has no single open group: no call to Telegram is made.
+ * The Mini App launch (`groupLinkVerdict`) and the sign-in link's gate (`claimGateVerdict`, sign-in-link.ts) both ask THIS, each
+ * supplying how it reads the database (the launch's transaction, the link's pool); what each does with the answer is its own.
+ */
+export async function groupSeatVerdict(
+  reads: GroupSeatReads | undefined, input: { tripId: string; telegramUserId: string },
+): Promise<GroupSeatVerdict> {
+  if (!reads || !(await reads.switchOn(input.tripId))) return "dormant";
+  const chat = await reads.openChat(input.tripId);
+  if (!chat) return "dormant";
+  const member = await reads.isActiveMember(chat, input.telegramUserId);
+  if (member === true) return "in";
+  if (member === "unknown") return "unknown";
+  return "out";
+}
+
 type GroupLinkVerdict = "in" | "out" | "unreachable" | "dormant";
 
 /**
@@ -499,14 +533,13 @@ type GroupLinkVerdict = "in" | "out" | "unreachable" | "dormant";
  *               opens it for the same links.
  */
 async function groupLinkVerdict(client: pg.PoolClient, launch: VerifiedInitData, row: AccessRow, group: GroupSignInDeps | undefined): Promise<GroupLinkVerdict> {
-  if (!group || !(await switchIsOn(client, group, row.tripId))) return "dormant";
-  const chat = await openGroupChat(client, row.tripId);
-  if (!chat) return "dormant";
-  const member = await group.isActiveMember(chat, launch.telegramUserId);
-  if (member === true) return "in";
-  if (member === "unknown") return "unreachable";
+  const seat = await groupSeatVerdict(
+    group ? { switchOn: (tripId) => switchIsOn(client, group, tripId), openChat: (tripId) => openGroupChat(client, tripId), isActiveMember: (chat, telegramUserId) => group.isActiveMember(chat, telegramUserId) } : undefined,
+    { tripId: row.tripId, telegramUserId: launch.telegramUserId });
+  if (seat === "in" || seat === "dormant") return seat;
+  if (seat === "unknown") return "unreachable";
   const ended = await endGroupClaimInTx(client, { tripId: row.tripId, userId: row.userId, linkReason: "left_group", claimReason: "left_group" });
-  group.released?.push(...ended);
+  group?.released?.push(...ended);
   return "out";
 }
 
@@ -1055,8 +1088,10 @@ export async function endGroupClaimInTx(
 
 /**
  * A claim that just ended in a transaction, for the caller to end the trip site's binding of that traveller once the
- * transaction has COMMITTED (never before: a rolled-back release must not unbind anyone). Best effort by design; see the
- * header of `releaseSiteBindings` in portal.ts for why a release that does not arrive costs nothing.
+ * transaction has COMMITTED (never before: a rolled-back release must not unbind anyone). That prompt attempt is the fast path, not the
+ * guarantee: the database wrote a durable record of the release in the same transaction (site-release-outbox.ts, migration
+ * 20261122110000), so a release that does not arrive is retried by a background pass until the trip site confirms. See the header of
+ * `releaseSiteBindings` in portal.ts.
  */
 export interface ReleasedClaim { tripId: string; userId: string; runtimeUsername: string; /** set for a removed member's INVITE binding: the site ends it only when account, name and this id all match */ inviteId?: string; /** why it ended, for the audit line */ reason?: string }
 

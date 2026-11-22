@@ -650,6 +650,53 @@ describe("/invite: the names it prints are filtered, and look-alikes are never s
     assert.doesNotMatch(textOf(made2), BAD);
   });
 
+  test("control characters in a traveller's name are stripped from every place it is printed: the list, the summary line, the forwardable message and the failure notice", async () => {
+    const people: Person[] = [
+      { username: "cc01", displayName: "Eli\u0007Gold\u001b\u007fRubin\u0085\u009f", role: "member" },
+      { username: "cc02", displayName: "Tamar\u0000Shaw", role: "member" },
+    ];
+    // every C0 and C1 control except the line feed the message templates themselves use
+    const CONTROL_IN_TEXT = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/;
+    const w = await world({ people });
+    const usage = textOf(await run(w, asOwner(w, "/invite")));
+    assert.doesNotMatch(usage, CONTROL_IN_TEXT, "the list is clean");
+    assert.ok(usage.includes("• Eli Gold Rubin"), `the controls became spaces: ${JSON.stringify(usage)}`);
+    assert.ok(usage.includes("• Tamar Shaw"));
+    for (const [typed, printed] of [["Tamar Shaw", "Tamar Shaw"], ["Eli Gold", "Eli Gold Rubin"]] as const) {
+      const made = await run(w, asOwner(w, `/invite ${typed}`));
+      assert.ok(made.kind === "invite_messages", textOf(made));
+      assert.doesNotMatch(textOf(made), CONTROL_IN_TEXT, `${typed}: the summary line and the forwardable message are clean`);
+      assert.match(made.summary, new RegExp(`Personal invite for ${printed} on`));
+      assert.match(made.link, new RegExp(`Hi ${printed},`));
+      assert.doesNotMatch(made.failed, CONTROL_IN_TEXT, `${typed}: and so is the failure notice`);
+    }
+    // the failure notice names the traveller only when an earlier link was replaced: run Tamar's again
+    const again = await run(w, asOwner(w, "/invite Tamar Shaw"));
+    assert.ok(again.kind === "invite_messages");
+    assert.ok(again.failed.includes("The earlier link for Tamar Shaw no longer works"), again.failed);
+    assert.doesNotMatch(again.failed, CONTROL_IN_TEXT);
+  });
+
+  test("the name the invite carries is re-checked AFTER it is made: a name that turned link-like, or invisible, between the two reads of the trip site is never forwarded, and the invite is revoked", async () => {
+    for (const [label, changedTo, leaked] of [
+      ["link-like", "Dana https://evil.example/pay", /evil|https/],
+      ["invisible only", "​⁠", /join#token/],
+    ] as const) {
+      const w = await world();
+      let reads = 0;
+      const flipping = {
+        listParticipants: async () => { reads += 1; return PEOPLE.map((p) => ({ ...p, ...(reads > 1 && p.username === "dl17" ? { displayName: changedTo } : {}) })); },
+      } as unknown as RuntimeAccountAdapter;
+      const decision = await run(w, asOwner(w, "/invite Dana Levi"), { siteInvites: { runtimeAccounts: flipping, publicOrigin: ORIGIN } });
+      assert.ok(reads >= 2, `${label}: the site was read again by createSiteInvite`);
+      assert.equal(decision.kind, "reply", `${label}: answered with a plain reply, nothing to deliver`);
+      assert.match(textOf(decision), /that traveller's name can't be used here/i, label);
+      assert.doesNotMatch(textOf(decision), leaked, label);
+      assert.deepEqual((await invites(w.tripId)).map((r) => r.state), ["revoked"], `${label}: nothing is left pending`);
+      assert.ok(w.logs.some((l) => /"outcome":"name_unusable"/.test(l)), `${label}: logged as name_unusable`);
+    }
+  });
+
   test("two travellers whose names are confusable (Latin and Cyrillic a) are the same-name case, whether the whole name or one word is typed", async () => {
     const people: Person[] = [
       { username: "dl17", displayName: "Dana Levi", role: "member" },
@@ -745,6 +792,15 @@ describe("/invite: the link message cannot be delivered", { skip: SKIP }, () => 
     assert.equal(client.attempts.length, 2);
     assert.match(client.attempts[1]!.text, /join#token/);
     assert.ok(!w.logs.some((l) => /invite_delivery_failed/.test(l)));
+  });
+
+  test("a failed delivery revokes ONLY the invite this command created: another traveller's pending invite on the same trip stays unused", async () => {
+    const w = await world();
+    await deliver(w, await run(w, asOwner(w, "/invite Noam Levi")), flaky([], "refused"));
+    const decision = await run(w, asOwner(w, "/invite Dana Levi"));
+    await deliver(w, decision, flaky([2], "refused"));
+    const byName = Object.fromEntries((await invites(w.tripId)).map((r) => [r.runtime_username, r.state]));
+    assert.deepEqual(byName, { nl23: "unused", dl17: "revoked" }, "Noam's pending invite is untouched; only Dana's undelivered one is revoked");
   });
 
   test("a failed delivery of a REPLACING invite revokes the new one, does not bring back the earlier link, and says so", async () => {

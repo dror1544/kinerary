@@ -3,8 +3,9 @@
  * binding", which was true for claims only), and a lost release cannot strand the name.
  *
  * Both doors reach `removeMember`: DELETE /v1/trips/:id/members/:membershipId and DELETE .../site-invites/:inviteId on a REDEEMED invite.
- * After the COMMIT, best-effort like a claim's release, the control plane tells the site to end THAT binding (account + name + invite id).
- * If that never arrives, `deadInviteIdsFor` names the removed member's revoked invite for the next redemption or claim, because a
+ * After the COMMIT the control plane makes a prompt attempt, like a claim's release, to tell the site to end THAT binding (account + name +
+ * invite id); a lost attempt is retried from the durable record the database wrote in the removal's transaction (site-release-outbox.test.ts
+ * holds that). Independently of the retry, `deadInviteIdsFor` names the removed member's revoked invite for the next redemption or claim, because a
  * redeemed invite whose state is `revoked` and whose redeemer has NO active membership on the trip can only be a removal's, and its
  * binding opens nothing (a launch needs an active membership).
  */

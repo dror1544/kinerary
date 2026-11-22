@@ -12,7 +12,7 @@
  *   D. After an invite is revoked or expires, a group CLAIM of the freed name succeeds (not just the offer).
  */
 import assert from "node:assert/strict";
-import { after, before, describe, test } from "node:test";
+import { after, before, describe, mock, test } from "node:test";
 import { createSiteInvite, deadInviteIdsFor } from "../src/portal.js";
 import { ORIGIN, claim, id, initDataFor, launch, sha256, startHarness, tg, type Harness, type SitePerson } from "./support/group-sign-in-harness.js";
 import { testDatabaseUrl } from "./support/test-database.js";
@@ -216,4 +216,48 @@ describe("D. a freed name can be CLAIMED, not only offered", { skip }, () => {
       } finally { await f.app.close(); }
     });
   }
+});
+
+describe("E. a second redemption at the expiry instant cannot revoke the person who just redeemed", { skip }, () => {
+  test("A holds the invite row (a gated site); B arrives after expires_at and its expiry write waits on A: A stays redeemed, the membership stays active, no release is written, and B is told INVITE_EXPIRED", async () => {
+    const f = await fixture();
+    const base = h.deps().runtimeAccounts;
+    let openGate!: () => void;
+    const gate = new Promise<void>((resolve) => { openGate = resolve; });
+    let reachedSite!: () => void;
+    const aIsInTheSite = new Promise<void>((resolve) => { reachedSite = resolve; });
+    const appA = h.newApp({ runtimeAccounts: { ...base, provisionParticipant: async (input) => { reachedSite(); await gate; return base.provisionParticipant(input); } } });
+    try {
+      const invite = await makeInvite(f);
+      await h.pool.query("DELETE FROM control_plane.site_release_outbox WHERE trip_id = $1", [f.tripId]);
+      const token = tokenOf(invite.joinUrl);
+      // A read the invite while it was valid and now holds the trip row and the invite row, parked inside the trip site's call.
+      const a = redeem(appA, token);
+      await aIsInTheSite;
+      // B arrives after the instant of expiry: its clock is past expires_at (only Date moves; timers and sockets are real), so it
+      // reads the row as unused and expired and writes `expired`, which has to wait for A's row lock.
+      mock.timers.enable({ apis: ["Date"], now: Date.now() + 30 * 24 * 3600_000 });
+      let b: ReturnType<typeof redeem>;
+      try {
+        b = redeem(f.app, token);
+        for (;;) {
+          const waiting = await h.pool.query("SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%state = ''expired''%'");
+          if (waiting.rowCount) break;
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+      } finally { mock.timers.reset(); }
+      openGate();
+      const [ra, rb] = await Promise.all([a, b]);
+      assert.equal(ra.statusCode, 200, `A: ${ra.body}`);
+      assert.equal(rb.statusCode, 410, `B: ${rb.body}`);
+      assert.deepEqual(rb.json(), { error: "INVITE_EXPIRED" });
+      const row = await inviteState(invite.id);
+      assert.equal(row.state, "redeemed", "A's invite stays redeemed");
+      assert.ok(row.redeemed_by, "with its redeemer");
+      const member = (await h.pool.query("SELECT status, runtime_access FROM control_plane.trip_memberships WHERE trip_id = $1 AND user_id = $2", [f.tripId, row.redeemed_by])).rows[0];
+      assert.deepEqual(member, { status: "active", runtime_access: true });
+      assert.equal((await h.pool.query("SELECT 1 FROM control_plane.site_release_outbox WHERE trip_id = $1", [f.tripId])).rowCount, 0, "no release was written: nobody was removed");
+      assert.equal(h.siteBindings.get(siteKey(f.tripId, "dl17")), row.redeemed_by, "and A's binding is still on the site");
+    } finally { mock.timers.reset(); openGate(); await appA.close(); await f.app.close(); }
+  });
 });

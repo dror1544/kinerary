@@ -394,7 +394,9 @@ if (outboxNotification && outboxBotToken) {
 // Retries the trip-site releases the portal recorded and could not deliver (site-release-outbox.ts): a removed member's binding
 // on the trip site, which is what ends their assistant's grants there. Needs only the portal (the trip site's door) and the pool,
 // so it runs whether or not Telegram is configured; its rows are claimed with SKIP LOCKED, so a second API process is safe.
-// Where there is no portal block there is no way in to release, and no row is ever written by the portal either.
+// Where there is no portal block there is no way in to release, so no release is attempted. The database triggers (migration
+// 20261122110000) still write a pending row whenever a claim or a redeemed invite ends, whatever writer ends it; with no portal those
+// rows wait, pending and unretried, until a process that has one starts this pass.
 if (portal) {
   startSiteReleasePass({ db: pool, releaser: portal.runtimeAccounts, log: (line) => process.stderr.write(`${line}\n`) });
 }
