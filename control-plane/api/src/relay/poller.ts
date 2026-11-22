@@ -202,6 +202,7 @@ import {
   type DispatchDecision,
   type DispatchStrings,
 } from "./dispatch.js";
+import type { SiteInviteDeps } from "./invite-command.js";
 import { toWireEvent, type TelegramUpdate } from "./normalize.js";
 import { isOurOpenTripMessage, type OpenTripMessage } from "./open-trip.js";
 import { agentTextIsInLanguage } from "./internal-leak.js";
@@ -240,6 +241,8 @@ export interface TripBotPollerDeps {
   tripAppBotUsername?: string | null;
   /** Whether the Mini App is ready for that bot, asked per update; see DispatchOptions.tripAppReady. */
   tripAppReady?: () => boolean;
+  /** What `/invite <traveller>` needs (relay/invite-command.ts); absent, an organizer is told it is not available. See DispatchOptions.siteInvites. */
+  siteInvites?: SiteInviteDeps;
   /**
    * The Hermes profile that serves written interview answers, from
    * `relay.interviewer_profile`.
@@ -5711,6 +5714,7 @@ export function startTripBotPoller(
         ...(deps.organizerDocumentRoute === true ? { organizerDocumentRoute: true } : {}),
         ...(deps.tripAppBotUsername ? { tripAppBotUsername: deps.tripAppBotUsername } : {}),
         ...(deps.tripAppReady ? { tripAppReady: deps.tripAppReady } : {}),
+        ...(deps.siteInvites ? { siteInvites: deps.siteInvites } : {}),
         // Asked per update rather than cached: a gateway can stop between
         // one message and the next, and a stale "reachable" spends the
         // organizer's turn on a socket that is gone.

@@ -403,6 +403,22 @@ describe("/invite: which traveller", { skip: SKIP }, () => {
     assert.deepEqual(await invites(w.tripId), []);
   });
 
+  test("a single word that is a whole word of exactly one traveller succeeds; a word that belongs only to an ORGANIZER's name is 'no traveller'", async () => {
+    const w = await world();
+    await run(w, asOwner(w, "/invite Katz"));
+    assert.deepEqual((await invites(w.tripId)).map((r) => r.runtime_username), ["mk05"], "one whole-word match is enough");
+    const none = textOf(await run(w, asOwner(w, "/invite Nobody Here")));
+    for (const word of ["Olga", "olga", "Organizer", "ORGANIZER"]) {
+      assert.equal(textOf(await run(w, asOwner(w, `/invite ${word}`))), none, `${word}: the ordinary no-traveller answer`);
+    }
+    assert.equal((await invites(w.tripId)).length, 1);
+    // A first name an organizer shares with a traveller is not ambiguous: the organizer is not a candidate at all.
+    const w2 = await world({ people: [{ username: "dl17", displayName: "Dana Levi", role: "member" }, { username: "db02", displayName: "Dana Boss", role: "organizer" }, { username: "ow03", displayName: "Dana Owner", role: "owner" }] });
+    const d = await run(w2, asOwner(w2, "/invite Dana"));
+    assert.deepEqual((await invites(w2.tripId)).map((r) => r.runtime_username), ["dl17"]);
+    assert.doesNotMatch(textOf(d), /Boss|Owner|which one/i);
+  });
+
   test("several travellers fit: 'which one?' and their display names, and nothing is created", async () => {
     const w = await world();
     const d = await run(w, asOwner(w, "/invite Levi"));

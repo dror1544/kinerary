@@ -26,7 +26,7 @@
  * organizer typed is only ever compared: no reply echoes it, so there is no formatting for it to break and no SQL it reaches.
  */
 import type pg from "pg";
-import { createSiteInvite, type RuntimeAccountAdapter } from "../portal.js";
+import { createSiteInvite, HttpRuntimeAccountAdapter, type RuntimeAccountAdapter } from "../portal.js";
 import { structuredLog } from "../redaction.js";
 import { tripDisplayName } from "../chat-router.js";
 import { digestTelegramId, isPrivateChatId } from "../identity.js";
@@ -38,6 +38,41 @@ import type { DirectReply } from "./dispatch.js";
 export interface SiteInviteDeps {
   runtimeAccounts: Pick<RuntimeAccountAdapter, "listParticipants">;
   publicOrigin: string;
+}
+
+/** The part of the architecture profile's `web` block `/invite` reads (config.ts `web`): nothing is defaulted here. */
+export interface SiteInviteProfile {
+  public_origin: string;
+  runtime_origin: string;
+  runtime_exchange_key_secret_ref: string;
+}
+
+/**
+ * Builds `SiteInviteDeps` for the relay from the profile's `web` block, the way the api builds its own (`server.ts`: the same adapter, the
+ * same two origins, the same secret ref). `resolveSecret` is the relay's own resolver, injected so a test never depends on the
+ * environment. Anything that stops it, no `web` block, a secret that cannot be resolved or one that is blank, leaves the relay UP with
+ * `/invite` unset (an organizer is then told it is not available) and says so as `relay.site_invites_unconfigured`: a reason code and
+ * the error's class name only, never the resolver's message (it can carry the reference or the value) and never the key.
+ */
+export async function siteInviteDepsFromProfile(
+  web: SiteInviteProfile | undefined,
+  resolveSecret: (ref: string) => Promise<string>,
+  log: (line: string) => void,
+): Promise<SiteInviteDeps | undefined> {
+  const unconfigured = (level: "info" | "warn", reason: string, extra: Record<string, unknown> = {}): undefined => {
+    log(structuredLog(level, "relay.site_invites_unconfigured", { reason, effect: "/invite answers 'not available' to organizers", ...extra }));
+    return undefined;
+  };
+  if (!web) return unconfigured("info", "NO_WEB_BLOCK");
+  let key: string;
+  try {
+    key = (await resolveSecret(web.runtime_exchange_key_secret_ref)).trim();
+  } catch (error) {
+    return unconfigured("warn", "SECRET_UNRESOLVED", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN" });
+  }
+  if (!key) return unconfigured("warn", "SECRET_EMPTY");
+  log(structuredLog("info", "relay.site_invites_ready", {}));
+  return { runtimeAccounts: new HttpRuntimeAccountAdapter(web.runtime_origin, key), publicOrigin: web.public_origin };
 }
 
 /**
