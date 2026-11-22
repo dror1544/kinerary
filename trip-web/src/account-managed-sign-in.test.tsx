@@ -32,6 +32,7 @@ it("a managed member session is not offered a password or a Google link, and is 
 it("the same in Hebrew", () => {
   mount({ username: "eve", sign_in_managed: true }, "he");
   expect(screen.queryByLabelText("סיסמה חדשה")).toBeNull();
+  expect(screen.queryByRole("heading", { name: "חשבון Google" })).toBeNull();
   expect(screen.getByText("הכניסה שלך היא עם חשבון Kinerary.")).toBeInTheDocument();
 });
 

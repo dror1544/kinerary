@@ -379,8 +379,10 @@ function createControlPlaneAuth({ app, db, tripDir, config, ready, jwtSecret }) 
     return row && typeof row.invite_id === 'string' ? { userId: row.user_id, inviteId: row.invite_id } : null;
   }
   // Is this verified payload a SECONDARY organizer of this trip? Only a managed claim counts - a plain password, Telegram or
-  // Google token for a secondary username is nothing (they have none of those) - and it is re-checked against the stored
-  // binding on every request, so a removed or never-bound identity is not one.
+  // Google token for a secondary username is nothing here (nobody knows the random password it is created with, and it has no
+  // Telegram or Google link) - and it is re-checked against the stored binding on every request, so a removed or never-bound
+  // identity is not one. A secondary organizer's managed session CAN set a site password and link Google (the credential routes
+  // refuse managed MEMBERS only); whether it should is an open owner decision, so this is a description, not a rule.
   function isSecondaryOrganizerPayload(payload) {
     if (!payload || typeof payload !== 'object' || !Object.prototype.hasOwnProperty.call(payload, 'controlPlane')) return false;
     if (!validManagedPayload(payload)) return false;
