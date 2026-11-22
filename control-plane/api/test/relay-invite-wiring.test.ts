@@ -158,8 +158,6 @@ describe("the poller path", { skip: SKIP }, () => {
     assert.deepEqual(await invitesOf(trip.tripId), [{ created_by: trip.userId, runtime_username: "dl17", state: "unused" }]);
     const token = link.split("#token=")[1]!;
     assert.ok(!logs.join("\n").includes(token) && !logs.join("\n").includes(String(trip.telegramId)), "nothing the relay logged holds the token or the id");
-    console.log("POLLER IN :", JSON.stringify(update(trip.telegramId, "/invite Dana Levi")));
-    console.log("POLLER OUT:", JSON.stringify(sent));
   });
 
   test("not configured: the organizer is told it is not available, nothing is written, the relay logs it; a stranger's answer is the unknown-command one", async () => {

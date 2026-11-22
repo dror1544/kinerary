@@ -24,7 +24,8 @@
  * success) -> done. The trip site's (or the gateway's) OWN refusal, which can never succeed (see
  * `OWN_REFUSALS`: a JSON body `{error: <that status's code>}`), three attempts in -> given up, ONE warn. A 4xx that is NOT that
  * (a proxy's or WAF's HTML page, an empty body, someone else's JSON: production's `runtime_origin` is a public hostname behind an
- * ingress, which can answer a bare 403/404 during a rollout) says nothing about the site and is transient. The trip retired or gone ->
+ * ingress, which can answer a bare 403/404 during a rollout) says nothing about the site and is transient; so is every 404, even the
+ * gateway's own JSON one (an older gateway with no release route). The trip retired or gone ->
  * given up, quietly. The control plane holding that very binding again -> done, `superseded`. Everything else (a timeout, a
  * refused connection, a 5xx, a 401, a 429, a 4xx that is not the site's own, a 200 that is not the site's answer) is transient and
  * retried for as long as it takes. "As long as it takes" and a give-up are both LOUD and repeated: the pass logs
@@ -46,12 +47,15 @@ export const PERMANENT_REFUSAL_ATTEMPTS = 3;
 /**
  * The 4xx a release can never recover from, by status, and the JSON `error` code that makes each one the trip site's OR the gateway's
  * OWN answer: INVALID_REQUEST (a malformed user id, name or invite id, or a body whose trip id is not the URL's: server/control-plane-auth.js
- * and the gateway's bindingAction), TRIP_MISMATCH (the site's identity is another trip's), NOT_FOUND (the gateway's: not a trip id, not a
- * route). A 4xx with any other body, or the right code on another status, is some hop in between (a proxy, a WAF, an ingress with no route
- * yet) and is retried. An older site that lacks the release route answers Express's HTML 404: that is retried too, which is right: the
- * release lands when the site is upgraded, and the backlog line says it is waiting.
+ * and the gateway's bindingAction) and TRIP_MISMATCH (the site's identity is another trip's). A 4xx with any other body, or the right
+ * code on another status, is some hop in between (a proxy, a WAF, an ingress with no route yet) and is retried.
+ *
+ * NO 404, JSON or not. The trip site never answers 404 on the release path; the only JSON `{error:"NOT_FOUND"}` there is a runtime
+ * gateway that has no such route, i.e. one OLDER than the control plane during version skew, and giving up on that would have left the
+ * binding in place for good once the gateway was new. An older site that lacks the release route answers Express's HTML 404: retried
+ * too. Either way the release lands when the hop is upgraded, and the backlog line says it is waiting.
  */
-export const OWN_REFUSALS: Readonly<Record<number, string>> = { 400: "INVALID_REQUEST", 403: "TRIP_MISMATCH", 404: "NOT_FOUND" };
+export const OWN_REFUSALS: Readonly<Record<number, string>> = { 400: "INVALID_REQUEST", 403: "TRIP_MISMATCH" };
 const isOwnRefusal = (status: number | null, code: string | null): status is number => status !== null && code !== null && OWN_REFUSALS[status] === code;
 /** How long a pass owns a row it has taken. The site call times out at 5 s; this only has to outlive a dead process's last call. */
 const LEASE_MS = 120_000;

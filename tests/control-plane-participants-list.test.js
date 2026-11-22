@@ -68,6 +68,16 @@ test('the list is username, display name and role, and nothing else of a partici
   }
 });
 
+test('username and displayName come from the SAME allow-listed participants the public roster serves: same people, same order, same names', async () => {
+  const roster = (await (await fetch(`${process.env.TEST_BASE_URL}/api/config/roster`)).json()).participants;
+  const body = await (await asGateway()).json();
+  assert.ok(roster.length >= 3, 'the fixture has people to compare');
+  assert.deepEqual(
+    body.participants.map(p => [p.username, p.displayName]),
+    roster.map(p => [p.username, typeof p.name === 'string' && p.name.trim() ? p.name.trim() : p.username]),
+    'a participant the roster shows is listed with the roster\'s name; nothing is listed that the roster does not show');
+});
+
 test('a participant who is removed from the trip drops off the list', async () => {
   const before = (await (await asGateway()).json()).participants.map(p => p.username);
   assert.ok(before.includes('eve'));

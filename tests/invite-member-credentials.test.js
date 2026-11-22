@@ -188,7 +188,6 @@ test('P (invited) redeems, cannot set a password, connects an assistant; the org
   assert.equal((await api('/api/auth/me', { token: pToken })).status, 200);
   // ...tries to set a password: refused, and no site login for P exists afterwards.
   const attempt = await setPassword(pToken, 'p-wants-a-direct-login');
-  console.log(`PUT /api/auth/password (invite-bound P) -> ${attempt.status} ${JSON.stringify(await attempt.clone().json())}`);
   assert.equal(attempt.status, 403);
   assert.equal((await login('eve', 'p-wants-a-direct-login')).status, 401);
   // ...approves an assistant grant: works.
@@ -208,19 +207,15 @@ test('P (invited) redeems, cannot set a password, connects an assistant; the org
   // The organizer removes P: the control plane's release, naming the invite.
   const gone = await release(P1, 'eve', INV1);
   const goneBody = await gone.json();
-  console.log(`POST participants/release (account + name + invite) -> ${gone.status} ${JSON.stringify(goneBody)}`);
   assert.equal(gone.status, 200);
   assert.equal(goneBody.released, true);
 
   const me = await api('/api/auth/me', { token: pToken });
-  console.log(`GET /api/auth/me (P's managed token, after removal) -> ${me.status}`);
   assert.equal(me.status, 401, 'P\'s managed session is out');
   assert.equal((await setPassword(pToken, 'too-late')).status, 401);
   const mcpAfter = await mcp(p.tokens.access_token);
-  console.log(`POST /mcp (P's access token, after removal) -> ${mcpAfter.status}`);
   assert.equal(mcpAfter.status, 401, 'P\'s access token is dead');
   const refreshed = await refresh(p.c, p.tokens.refresh_token);
-  console.log(`POST /oauth/token refresh (P's refresh token, after removal) -> ${refreshed.status} ${await refreshed.clone().text()}`);
   assert.equal(refreshed.status, 400, 'P\'s refresh token is refused');
   assert.equal((await exchangeCode(pending, pendingCode)).status, 400, 'a code P approved and nobody exchanged cannot be exchanged now');
   assert.equal(bindingColumns().filter(g => g.binding_user_id === P1 && g.revoked_at === null).length, 0, 'no live grant names the removed binding');
@@ -228,7 +223,6 @@ test('P (invited) redeems, cannot set a password, connects an assistant; the org
   // R is untouched.
   assert.equal((await login('eve', '1234')).status, 200, 'R still logs in with their own password');
   const rMcp = await mcp(r.tokens.access_token);
-  console.log(`POST /mcp (R's access token, after P's removal) -> ${rMcp.status}`);
   assert.equal(rMcp.status, 200, 'R\'s assistant still works');
   assert.equal((await refresh(r.c, r.tokens.refresh_token)).status, 200, 'and R\'s refresh still works');
 });
@@ -333,7 +327,6 @@ test('a revoke that fails leaves the binding AND the grant in place and the rele
     sqlite.exec("CREATE TRIGGER fail_token_revoke BEFORE UPDATE ON mcp_oauth_tokens BEGIN SELECT RAISE(ABORT, 'injected failure'); END;");
     const failed = await release(PE, 'eve', INVE);
     const failedBody = await failed.json();
-    console.log(`POST participants/release (revoke forced to fail) -> ${failed.status} ${JSON.stringify(failedBody)}`);
     assert.equal(failed.status, 500, 'the release says it failed, so the control plane can retry');
     assert.notEqual(failedBody.released, true);
     assert.equal((await api('/api/auth/me', { token: await exchange(PE, 'eve') })).status, 200, 'the binding survived');
@@ -434,7 +427,6 @@ test('a managed SECONDARY organizer is refused on the password route and both Go
   assert.ok(secondary);
   for (const [name, request] of [['PUT /api/auth/password', () => setPassword(secondary, 'secondary-direct-login')], ['PUT /api/auth/google-link', () => googleLink(secondary)], ['DELETE /api/auth/google-link', () => googleUnlink(secondary)]]) {
     const r = await request();
-    console.log(`${name} (secondary organizer) -> ${r.status} ${JSON.stringify(await r.clone().json())}`);
     assert.equal(r.status, 403, name);
     assert.deepEqual(await r.json(), REFUSAL, name);
   }
@@ -444,7 +436,6 @@ test('a managed SECONDARY organizer is refused on the password route and both Go
   // the trip's own accounts are unchanged: owner-managed and a plain organizer login still set a password and unlink Google
   const owner = await exchange(ownerId, null, 'owner');
   const ownerSet = await setPassword(owner, '1234');
-  console.log(`PUT /api/auth/password (owner-managed) -> ${ownerSet.status}`);
   assert.equal(ownerSet.status, 200);
   assert.equal((await setPassword(await loginToken('alice', '1234'), '1234')).status, 200);
   assert.equal((await googleUnlink(owner)).status, 200);
@@ -490,7 +481,6 @@ test('an invite-bound session lists and disconnects only the connections approve
   // P cannot disconnect R's: the same not-found an unknown id gets, and nothing changed
   const unknown = await api('/api/mcp/connections/grant_doesnotexist', { method: 'DELETE', token: pToken });
   const notMine = await api(`/api/mcp/connections/${rOwn}`, { method: 'DELETE', token: pToken });
-  console.log(`DELETE /api/mcp/connections/<R's grant> (invited P) -> ${notMine.status} ${JSON.stringify(await notMine.clone().json())}; unknown id -> ${unknown.status} ${JSON.stringify(await unknown.clone().json())}`);
   assert.equal(notMine.status, 404);
   assert.deepEqual(await notMine.json(), await unknown.json());
   assert.equal((await mcp(r.tokens.access_token)).status, 200, 'R\'s connection still works');
@@ -526,7 +516,6 @@ test('an invite-bound session\'s /api/auth/me is the allow-listed view: no Googl
   } finally { sqlite.close(); }
   assert.equal((await provision(PL, 'bob', INVL)).status, 200);
   const invited = await (await api('/api/auth/me', { token: await exchange(PL, 'bob') })).json();
-  console.log(`GET /api/auth/me (invite-bound, row seeded with a Google link, telegram_id and an extra column) -> ${JSON.stringify(invited)}`);
   assert.deepEqual(Object.keys(invited).sort(), ['avatar_file', 'color', 'family', 'is_organizer', 'name', 'name_en', 'sign_in_managed', 'username'].filter(k => k in invited).sort());
   for (const field of ['google_sub', 'google_email', 'google_picture', 'telegram_id', 'removed_at', 'some_future_private_note', 'age', 'password']) assert.equal(field in invited, false, field);
   assert.equal(invited.username, 'bob');

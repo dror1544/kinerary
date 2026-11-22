@@ -1260,14 +1260,17 @@ journey.registerRoutes(app, { authRequired, organizerOrAgentRequired, internal: 
 // exchange key the gateway holds, the trip id header, the identity manifest. A family member's JWT, the agent key and
 // the Hermes key all get 401, exactly as for the sibling routes in control-plane-auth.js.
 //
-// It does NOT go through sanitizeConfig() and is not a view of the config: it names three fields, written out here,
-// and nothing else of a participant (no telegram_id, no color, no family, no needs) can reach the response. `role`
+// It does NOT go through sanitizeConfig() and is not a view of the config: it names three fields, written out here, taken
+// from the allow-listed participants (`publicConfig`, as the public roster does), and nothing else of a participant (no
+// telegram_id, no color, no family, no needs) can reach the response. `role`
 // is 'organizer' for every configured organizer and 'member' for everyone else; the control plane offers only
 // 'member' and treats any other word, or none, as not offered, so a participant this list cannot classify is never
 // the one it gets wrong.
 app.get('/api/internal/control-plane/participants', controlPlaneAuth.internal, (req, res) => {
   const organizers = normalizeOrganizers(TRIP_CONFIG.agent);
-  const participants = (TRIP_CONFIG.participants || [])
+  // From the ALLOW-LISTED participants (publicConfig, the source /api/config/roster serves from), so a future change to what the
+  // allow-list lets through applies here too; `role` is derived below and reaches only the exchange-key holder.
+  const participants = (publicConfig(TRIP_CONFIG).participants || [])
     .filter(p => p && typeof p.username === 'string' && getUser(p.username))
     .map(p => ({
       username: p.username,

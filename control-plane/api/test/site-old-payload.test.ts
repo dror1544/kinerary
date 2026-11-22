@@ -130,6 +130,19 @@ describe("2. a genuine outage is still RUNTIME_NOT_READY: the fallback is for a 
     } finally { await f.app.close(); }
   });
 
+  test("an OLD GATEWAY (the list route answered with the gateway's own JSON NOT_FOUND) is not a missing site route: RUNTIME_NOT_READY, no fallback", async () => {
+    const f = await fixture();
+    try {
+      f.site.mode = "old_gateway";
+      const r = await f.create("dl17");
+      assert.equal(r.statusCode, 409);
+      assert.deepEqual(r.json(), { error: "RUNTIME_NOT_READY" });
+      assert.equal(existsCalls(f.site, f.tripId, "dl17"), 0, "no per-participant fallback");
+      assert.ok(!logs.some((line) => line.includes("site_invite.old_site_fallback")));
+      assert.deepEqual(await inviteRows(f.tripId), []);
+    } finally { await f.stop(); }
+  });
+
   test("the list's missing route, then the per-participant route itself failing (503): still RUNTIME_NOT_READY", async () => {
     const f = await fixture();
     try {

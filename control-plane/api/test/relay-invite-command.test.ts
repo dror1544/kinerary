@@ -226,7 +226,6 @@ describe("/invite: an organizer, in their own private chat, with dashboard acces
       assert.ok(!all.includes(secret), `a log line contains ${secret.slice(0, 12)}…`);
     }
     assert.match(all, /trip_bot\.invite_command/);
-    console.log("LOG LINES (success):", w.logs);
   });
 
   test("it is consumed by the relay: never handed to the gateway, and the same words inside a sentence are ordinary text", async () => {
@@ -310,7 +309,6 @@ describe("/invite: who is refused, and where", { skip: SKIP }, () => {
     const other = await run(w, say(tg(), group, "/invite Dana Levi", "group"));
     assert.equal(textOf(other), textOf(await run(w, say(w.ownerTg, group, "/invite Dana Levi", "group"))));
     assert.deepEqual(await invites(w.tripId), []);
-    console.log("GROUP reply:", textOf(other));
   });
 
   test("a plain member, an invited or claimed member and a stranger in a private chat bound to the trip get the unknown-command answer, and nothing is written", async () => {
@@ -767,7 +765,6 @@ describe("/invite: the link message cannot be delivered", { skip: SKIP }, () => 
       assert.ok(w.logs.some((l) => /trip_bot\.invite_delivery_failed/.test(l)));
       const logged = w.logs.join("\n");
       assert.ok(!logged.includes(link) && !logged.includes(link.split("#token=")[1]!) && !logged.includes(w.ownerChat), "no link, token or chat id in the log");
-      if (how === "refused") console.log("DELIVERY (second send blocked):", JSON.stringify(client.attempts.map((a) => ({ ok: a.ok, text: a.text.slice(0, 80) }))));
     });
   }
 
@@ -780,7 +777,6 @@ describe("/invite: the link message cannot be delivered", { skip: SKIP }, () => 
     assert.ok(!client.attempts.some((a) => a.text.includes("join#token")), "the link message was not sent");
     assert.equal(client.attempts.length, 2, "summary (failed), then a best-effort failure notice");
     assert.ok(!w.logs.join("\n").includes("join#token"));
-    console.log("DELIVERY (first send blocked):", JSON.stringify(client.attempts.map((a) => ({ ok: a.ok, text: a.text.slice(0, 80) }))));
   });
 
   test("both messages delivered: the invite stays pending, in order, to the organizer's chat only", async () => {

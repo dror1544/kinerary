@@ -32,7 +32,7 @@ import {
 import { verifyMiniAppInitData, type VerifiedInitData } from "./telegram-webapp-auth.js";
 import { runtimeUpstreamFor } from "./runtime-upstream.js";
 import { applyLinkPassword, attachSession, claimGateVerdict, consumeSignInLink, endClaimLeftGroup, peekClaimLink, purgeSignInLinkLeftovers, signInLinkAvailable, startSignInLink, warnOncePerMinute, type SignInLinkRequest } from "./sign-in-link.js";
-import { OWN_REFUSALS, SiteReleaseError, attemptSiteRelease, compensateSiteBinding, type SiteReleaseOptions } from "./site-release-outbox.js";
+import { SiteReleaseError, attemptSiteRelease, compensateSiteBinding, type SiteReleaseOptions } from "./site-release-outbox.js";
 
 // The gateway's key, compared in constant time (a plain !== leaks how many
 // leading bytes were right).
@@ -358,7 +358,8 @@ export class HttpRuntimeAccountAdapter implements RuntimeAccountAdapter {
       signal: AbortSignal.timeout(this.timeoutMs),
     });
     if (!response.ok) {
-      if (response.status === 404 && (await siteJsonErrorCode(response)) !== OWN_REFUSALS[404]) throw new SiteRouteMissingError();
+      // A JSON NOT_FOUND is a GATEWAY that lacks the route (one older than the control plane): not a missing SITE route, no fallback.
+      if (response.status === 404 && (await siteJsonErrorCode(response)) !== "NOT_FOUND") throw new SiteRouteMissingError();
       throw new Error("RUNTIME_PARTICIPANT_LIST_FAILED");
     }
     const body = (await response.json()) as { participants?: unknown } | null;

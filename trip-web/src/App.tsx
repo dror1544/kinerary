@@ -421,7 +421,7 @@ function LoginScreen() {
         <GoogleSignIn lang={lang} onSuccess={()=>window.location.reload()}/>
         {/* AC-17 (docs/specs/sprint-9/x-member-sign-in.md): a static line, nothing more. This site sends no sign-in link and asks
             nothing about accounts; it only says where a traveller with no control-plane account goes next. */}
-        <p className="login-no-account">{copy(lang,"Not on the list here? Open the trip from the Telegram group, or ask the organizer for a personal invite.","לא ברשימה כאן? פתחו את הטיול מקבוצת הטלגרם, או בקשו מהמארגן הזמנה אישית.")}</p>
+        <p className="login-no-account">{copy(lang,"Not on the list here? Ask the organizer for a personal invite, or open the trip from the Telegram group if your organizer has turned that on.","לא ברשימה כאן? בקשו מהמארגן הזמנה אישית, או פתחו את הטיול מקבוצת הטלגרם אם המארגן הפעיל את האפשרות הזו.")}</p>
         <a href="#lostfound">{copy(lang,"Found something belonging to this group?","מצאתם חפץ של הקבוצה?")}</a>
       </section>
     </main>

@@ -34,7 +34,9 @@ beforeEach(async () => { if (!skip) await h.pool.query("DELETE FROM control_plan
 const PEOPLE: SitePerson[] = [{ username: "dl17", displayName: "Dana Levi", role: "member" }, { username: "nl23", displayName: "Noam Levi", role: "member" }];
 const siteKey = (tripId: string, username: string) => `${tripId}:${username}`;
 /** What the trip site (server/control-plane-auth.js) and the runtime gateway answer, as JSON `error`, for the 4xx a release can get. */
-const OWN_REFUSAL_CODE: Record<number, string> = { 400: "INVALID_REQUEST", 403: "TRIP_MISMATCH", 404: "NOT_FOUND" };
+const OWN_REFUSAL_CODE: Record<number, string> = { 400: "INVALID_REQUEST", 403: "TRIP_MISMATCH" };
+/** The trip site never answers 404 on the release path; the only JSON {error:"NOT_FOUND"} there is a gateway with no such route (an OLD gateway). */
+const GATEWAY_NOT_FOUND = '{"error":"NOT_FOUND"}';
 
 // ── a trip site that can be taken down ──────────────────────────────────────────────────────────────────────────────────
 interface Control {
@@ -468,14 +470,14 @@ describe("2. the prompt attempt after the commit is the fast path; success marks
 // ═══ 3. the background pass: backoff, no double work, no lock across the call ════════════════════════════════════════════════════
 
 describe("3. the background pass", { skip }, () => {
-  test("retries with the backoff schedule 30 s, 2 min, 10 min, then every 30 min, and never stops while the site keeps failing transiently (a timeout, a refusal, a 5xx, a 429, a 401, a malformed answer)", async () => {
+  test("retries with the backoff schedule 30 s, 2 min, 10 min, then every 30 min, and never stops while the site keeps failing transiently (a timeout, a refusal, a 5xx, a 429, a 401, a 404 even in the gateway's own JSON, a malformed answer)", async () => {
     assert.deepEqual([...SITE_RELEASE_BACKOFF_MS], [30_000, 120_000, 600_000, 1_800_000]);
     const ctl = control(); const c = await claimed(ctl);
     try {
       ctl.mode = "down";
       await ctl.app.inject({ method: "DELETE", url: `/v1/trips/${c.tripId}/members/${await membershipId(c.tripId, c.userId)}`, headers: ownerHeaders(c) });
       const fixed = new Date(Date.now() + 10 * HOUR);
-      const modes: Control["mode"][] = ["down", 503, "malformed", 500, 429, 401, "down"];
+      const modes: Control["mode"][] = ["down", 503, "malformed", 500, 429, 401, { status: 404, code: "NOT_FOUND" }, "down"];
       const seen: number[] = [];
       for (const mode of modes) {
         ctl.mode = mode;
@@ -488,7 +490,7 @@ describe("3. the background pass", { skip }, () => {
         await h.pool.query("UPDATE control_plane.site_release_outbox SET next_attempt_at = $2 WHERE trip_id = $1", [c.tripId, new Date(fixed.getTime() - 1000)]);
       }
       // attempts so far: 1 (fast path) + the laps; the delay after attempt n is the schedule's nth entry, the last one repeating
-      assert.deepEqual(seen, [120_000, 600_000, 1_800_000, 1_800_000, 1_800_000, 1_800_000, 1_800_000]);
+      assert.deepEqual(seen, [120_000, 600_000, 1_800_000, 1_800_000, 1_800_000, 1_800_000, 1_800_000, 1_800_000]);
     } finally { await ctl.app.close(); }
   });
 
@@ -565,7 +567,7 @@ describe("3. the background pass", { skip }, () => {
 // ═══ 4. a permanent answer is not retried forever ═════════════════════════════════════════════════════════════════════════════════
 
 describe("4. permanent answers", { skip }, () => {
-  for (const status of [400, 403, 404]) {
+  for (const status of [400, 403]) {
     test(`the site answering ${status} (it can never succeed) is given up after 3 attempts, with ONE warn naming the reason and no id`, async () => {
       const ctl = control(); const c = await claimed(ctl);
       try {
@@ -628,6 +630,7 @@ describe("4. permanent answers", { skip }, () => {
   }
 
   const NOT_THE_SITES: Array<[string, number, string, string]> = [
+    ["the gateway's own JSON 404 NOT_FOUND: a gateway with no release route yet (version skew), so it is retried and lands when the gateway is new", 404, "application/json", GATEWAY_NOT_FOUND],
     ["a proxy's HTML 404 (an ingress with no route during a rollout)", 404, "text/html", "<html><body><h1>404 Not Found</h1>nginx</body></html>"],
     ["a WAF's HTML 403", 403, "text/html", "<html><title>Access denied</title></html>"],
     ["an empty 400", 400, "text/plain", ""],

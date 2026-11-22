@@ -8,7 +8,9 @@
  * `POST …/participants/adopt`, `POST …/participants/release`. Express answers those with its default 404, an HTML page; the runtime
  * gateway forwards that status and body untouched.
  *
- * `mode`: "old" = as above. "outage" = every route answers 503. A test closes the server for "connection refused".
+ * `mode`: "old" = as above. "outage" = every route answers 503. "old_gateway" = the per-participant and provision routes work, and a route
+ * the GATEWAY lacks (list, adopt, release) answers the gateway's own JSON `{error:"NOT_FOUND"}` (a gateway older than the control plane).
+ * A test closes the server for "connection refused".
  */
 import { createServer, type Server } from "node:http";
 import { HttpRuntimeAccountAdapter } from "../../src/portal.js";
@@ -18,7 +20,7 @@ export interface OldPayloadSite {
   adapter: HttpRuntimeAccountAdapter;
   /** Every request that reached the door, `METHOD path`. */
   calls: string[];
-  mode: "old" | "outage";
+  mode: "old" | "outage" | "old_gateway";
   close(): Promise<void>;
 }
 
@@ -27,7 +29,7 @@ const EXPRESS_404 = (method: string, path: string) =>
 
 export async function startOldPayloadSite(usernames: readonly string[]): Promise<OldPayloadSite> {
   const calls: string[] = [];
-  const state = { mode: "old" as "old" | "outage" };
+  const state = { mode: "old" as "old" | "outage" | "old_gateway" };
   const server: Server = createServer((request, response) => {
     request.resume();
     request.on("end", () => {
@@ -42,6 +44,7 @@ export async function startOldPayloadSite(usernames: readonly string[]): Promise
         response.writeHead(404, { "content-type": "application/json" }); response.end('{"error":"NOT_FOUND"}'); return;
       }
       if (method === "POST" && /^\/internal\/t\/[^/]+\/participants$/.test(path)) { response.writeHead(200, { "content-type": "application/json" }); response.end('{"ok":true}'); return; }
+      if (state.mode === "old_gateway") { response.writeHead(404, { "content-type": "application/json" }); response.end('{"error":"NOT_FOUND"}'); return; }
       // everything else is a route this payload does not have
       response.writeHead(404, { "content-type": "application/json" }); response.end(EXPRESS_404(method, path));
     });
