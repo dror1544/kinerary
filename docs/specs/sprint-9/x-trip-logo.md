@@ -1,6 +1,6 @@
 # Trip logo: one picture for the header and the installed app
 
-Status: draft (2026-11-24) · Issue: none yet · Track: video look · Size: M · Tier: Normal
+Status: approved (2026-11-24, by Dror: all four recommendations) → in build · Issue: none yet · Track: video look · Size: M · Tier: Normal
 Security path: yes (a new upload that a public, pre-login route serves; organizer-only writes) · Migration: no
 (trip SQLite gains columns; no control-plane migration) · Live-trip behaviour: no until the switch is on for a trip
 
@@ -82,6 +82,8 @@ Organizers only, on every path. Members see the logo and cannot change it.
   companion refuses and names who can. When an organizer asks for a generated logo and no image tool is
   present, the companion says it cannot make one and offers the alternative. It never calls
   `upload_trip_logo` with an image the organizer has not approved.
+- AC-14 Given a trip title, when the manifest is requested, then `name` is the trip title and `short_name` its
+  first 12 characters (trimmed); with no title, both stay "Kinerary" (D2).
 
 ## Contracts
 
@@ -175,18 +177,18 @@ and the last green nightly are the evidence. Ships with `trip_logo` off. It goes
 for the Alsace trip (a switch on a trip at `ready_private` or later counts as a deploy, under standing
 approval), then as the default for future trips.
 
-## Decisions for Dror
+## Decisions (Dror, 2026-11-24 — every recommendation agreed)
 
-- **D1 · Group photo: automatic or on request?** The spec in `x-trip-group-photo.md` assumes *on request*: the
+- **D1 · Group photo — on request.** Was: automatic or on request? The spec in `x-trip-group-photo.md` assumes *on request*: the
   companion and the website offer "also make it the group photo" after a logo change. Recommended, because it
   replaces a photo the family chose and the bot cannot put the old one back.
-- **D2 · App name.** The installed app is called "Kinerary" on every trip. Should it take the trip's title
+- **D2 · App name — the trip title (AC-14).** The installed app is called "Kinerary" on every trip. Should it take the trip's title
   (short name: first 12 characters)? Recommended yes: a family with two trips installed sees two apps called
   "Kinerary". The title already shows on the public login page.
-- **D3 · Generating a logo.** No VM companion can generate an image today. (a) Ship without it: the companion
+- **D3 · Generating a logo — (a), no provider now.** No VM companion can generate an image today. (a) Ship without it: the companion
   says it cannot, and the skill uses a tool if one ever appears. (b) Turn on Hermes image generation with a
   provider key in `kinerary-deploy`. That adds a new provider, a cost, and images a model drew that children
   see. (c) A site-side "generate a logo" function on an existing model provider. Recommended (a) now, with (b)
   or (c) as its own spec if you want it.
-- **D4 · Claude/ChatGPT path.** Is an upload link (open it, pick the file) acceptable as "upload via the
+- **D4 · Claude/ChatGPT path — the upload link.** Is an upload link (open it, pick the file) acceptable as "upload via the
   connector"? It is the only path that works in both clients today. Recommended yes.
