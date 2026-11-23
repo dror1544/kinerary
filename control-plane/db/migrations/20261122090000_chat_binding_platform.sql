@@ -1,5 +1,26 @@
 -- rollback: compatible — additive columns with defaults and one new table; the previous release never routes a WhatsApp-shaped row (its fleet monitor would mislabel one as a private chat, which a rollback note covers)
 --
+-- ROLLBACK NOTE (the verdict above stands: the schema is additive and a code-only rollback keeps this database). Rolling back
+-- to a release OLDER than this one has three catches, all about WHATSAPP ROWS THAT ALREADY EXIST:
+--   1. An older `scripts/teardown-trip.py` closes a trip's bindings without clearing `transport_address`, and this file's CHECK
+--      refuses a closed row that still holds one: its transaction fails (23514) for a trip with an open WhatsApp binding.
+--   2. An older gateway reconciler does not count a WhatsApp-only owner as current, so that trip's companion would stop.
+--   3. An older config schema is strict and refuses a profile that carries a `relay.whatsapp` block.
+-- So BEFORE rolling back past this release: remove any `relay.whatsapp` block from the profile, and close every WhatsApp binding
+-- with its address cleared, in ONE statement (the CHECK needs both in the same UPDATE):
+--     UPDATE control_plane.telegram_chat_bindings
+--        SET closed_at = now(), closed_reason = 'rolled_back', transport_address = NULL, phone_last4 = NULL
+--      WHERE platform = 'whatsapp' AND closed_at IS NULL;
+-- (the person links and unused codes may stay: the older release reads a person link only by a numeric Telegram id, so a
+-- `wa_` link matches none of its lookups, and its fleet monitor only counts links by role; it has no code table reader.)
+--
+-- LOCK HAZARD. The ALTERs below take ACCESS EXCLUSIVE locks on `telegram_chat_bindings` and `trip_person_links` while the old
+-- API and relay are still serving, and production has `lock_timeout = 0`: a session idle in a transaction on either table would
+-- stall this file, and every chat lookup after it would queue behind the stalled ALTER. `applyMigrations` runs each file in one
+-- transaction, so the SET LOCAL below is effective and scoped to it: the migration FAILS after 5 seconds (55P03, everything in
+-- the file rolled back, nothing half applied) instead of waiting forever, and is simply run again. No other migration in this
+-- repository sets a lock or statement timeout, so none is added for statements.
+--
 -- WHATSAPP, SLICE S2 (docs/specs/sprint-9/625-whatsapp-via-relay.md, "Migration, S2"): the binding table and the
 -- person-link table learn which platform a chat is on, and one new table holds the one-time codes that bind a WhatsApp
 -- chat from the dashboard.
@@ -23,6 +44,8 @@
 -- THE PREVIOUS RELEASE keeps running on this schema: every column below is added with a default or as nullable, every
 -- writer that names no platform gets 'telegram', and the CHECKs refuse such a writer a WhatsApp id instead of letting a
 -- re-inserted row turn one into a Telegram row.
+
+SET LOCAL lock_timeout = '5s';
 
 -- ── telegram_chat_bindings ──────────────────────────────────────────────────────────────────────────────────────────
 

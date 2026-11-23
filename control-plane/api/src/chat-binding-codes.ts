@@ -17,15 +17,21 @@
  * the suffix. The one place a real address rests is `transport_address` of an OPEN binding, group or private (for an old
  * group the real id contains its creator's number), written from a parameter the relay passes in and cleared whenever the
  * binding closes. For a group, the real id is the one thing the accepted-shape rule is judged on. Nothing in this file
- * logs it or returns it. The last four digits the dashboard shows (AC-16) are an OPTIONAL value passed in at binding time
- * (`phone_last4`), null when the bridge reported no phone number.
+ * logs it, and exactly ONE thing returns it: a `me` redemption by an owner that closed that owner's earlier connection
+ * hands back the earlier chat's alias and address (`replacedOwnerChat`), read under the same lock that closes the row, so
+ * the relay can tell the owner in that chat (owner's decision 2026-11-23) after the row has forgotten it. It goes back to
+ * the process that passed it in, in memory, for one send; it is non-enumerable, so a logged or serialised result does not
+ * carry it, and it is never written anywhere (not to the outbox, not to a retry). The last four digits the dashboard shows
+ * (AC-16) are an OPTIONAL value passed in at binding time (`phone_last4`), null when the bridge reported no phone number.
  *
  * OLD SCHEMA. Functions that run on a Telegram-only path in a deployment that has not applied the S2 migration yet
  * (`closeEndedMembershipBindings`, called from `removeMember`) ask `whatsappSchemaPresent` first and do nothing when the
  * schema is the old one.
  *
- * LOCK ORDER (spec "Lock order"). Redemption: the code row FOR UPDATE, then the open binding(s) for the chat FOR UPDATE,
- * in `chat_id` order where more than one is closed, then the insert (whose foreign key touches `trips`). Teardown and
+ * LOCK ORDER (spec "Lock order"). Redemption: the code row FOR UPDATE, then the issuing account's own active membership
+ * FOR SHARE (so `removeMember`, which locks the trip's memberships FOR UPDATE before it closes bindings, cannot commit
+ * between the entitlement check and the binding), then the open binding(s) for the chat FOR UPDATE, in `chat_id` order
+ * where more than one is closed, then the insert (whose foreign key touches `trips`). Teardown and
  * clear expire the trip's codes FIRST, the order REVOKE_GROUP_TOKENS documents (issue #175). Issuance expires the
  * oldest live codes BEFORE its INSERT for the same reason.
  */
@@ -236,10 +242,31 @@ export type RedeemFailure =
 
 export interface Traveller { username: string; displayName: string | null }
 
+/**
+ * The owner's earlier WhatsApp private chat on the trip, which a `me` redemption just closed: its alias, and its real
+ * address as it was on the row the moment before the close cleared it. `transportAddress` is NON-ENUMERABLE: reading it
+ * works, but `JSON.stringify`, `util.inspect` and a spread leave it out, so a result that is logged carries no address.
+ * Hand it to `notifyOwnersOfNewBinding` and drop it.
+ */
+export interface ReplacedConnection { readonly chatId: string; readonly transportAddress: string }
+
+function replacedConnection(chatId: string, transportAddress: string): ReplacedConnection {
+  const value = { chatId } as { chatId: string; transportAddress: string };
+  Object.defineProperty(value, "transportAddress", { value: transportAddress, enumerable: false, writable: false });
+  return Object.freeze(value);
+}
+
 export type RedeemResult =
   | {
       ok: true; kind: "me"; tripId: string; tripTitle: string | null; bindingId: string; accountUserId: string;
       traveller: Traveller | null; closedBindingIds: string[];
+      /**
+       * Set ONLY when the issuing account holds an active `owner` membership of the trip and this redemption closed that
+       * account's earlier WhatsApp connection to it (AC-9's `rebound_by_code`, from another chat or the same one). Null
+       * for a first connection, and always null for a member or a secondary organizer, whose replacement is announced
+       * the ordinary way. The owner is told in the chat it names (owner's decision 2026-11-23).
+       */
+      replacedOwnerChat: ReplacedConnection | null;
     }
   | { ok: true; kind: "group"; tripId: string; tripTitle: string | null; bindingId: string; alreadyConnected: boolean }
   | {
@@ -333,6 +360,19 @@ export async function redeemChatBindingCode(db: pg.Pool, input: RedeemInput): Pr
     };
     if (row.trip_retired || !(await featureEnabled(client, row.trip_id, WHATSAPP_SWITCH, input.log))) return await burn("TRIP_UNAVAILABLE");
     // The issuing account must still be entitled: a member removed since the code was minted binds nothing (fail closed).
+    // THE READ IS LOCKED: `removeMember` takes the trip's memberships FOR UPDATE and then closes the member's WhatsApp
+    // bindings, so an unlocked check here could pass, `removeMember` commit, and this transaction then commit a new binding for
+    // a revoked member. FOR SHARE makes the two take turns: either this transaction already holds the row (removeMember waits,
+    // then sees and closes the binding this one opened) or removeMember committed first (the re-read finds the row no longer
+    // 'active' and the lock query returns nothing). Lock order: code row, then this membership, then the bindings below,
+    // which is the direction removeMember takes (memberships, then bindings), and teardown never locks a membership.
+    const held = await client.query<{ role: string }>(
+      "SELECT role FROM control_plane.trip_memberships WHERE trip_id = $1 AND user_id = $2 AND status = 'active' FOR SHARE",
+      [row.trip_id, row.issued_by_user_id],
+    );
+    // An active `owner` membership: the role AC-13 turns into `organizer` in the chat, and the set `notifyOwnersOfNewBinding`
+    // tells. Read under the same lock, so it is the role the binding below is made with.
+    const issuerIsOwner = held.rows.some((r) => r.role === "owner");
     const issuer = await tripEntitlement(client, row.trip_id, row.issued_by_user_id);
     if (!issuer.member || (row.kind === "group" && !issuer.owner)) return await burn("ISSUER_NOT_ENTITLED");
 
@@ -371,12 +411,28 @@ export async function redeemChatBindingCode(db: pg.Pool, input: RedeemInput): Pr
     );
     const chatsToLock = [input.chatId, ...others.rows.map((r) => `${r.telegram_user_id}@p`)];
     // One statement, `chat_id` order: the chat's own open binding (whatever trip it was for) and the replaced ones.
-    const open = await client.query<{ id: string; chat_id: string; trip_id: string }>(
-      `SELECT id, chat_id, trip_id FROM control_plane.telegram_chat_bindings
+    const open = await client.query<{ id: string; chat_id: string; trip_id: string; transport_address: string | null }>(
+      `SELECT id, chat_id, trip_id, transport_address FROM control_plane.telegram_chat_bindings
         WHERE chat_id = ANY($1::text[]) AND closed_at IS NULL
         ORDER BY chat_id FOR UPDATE`,
       [chatsToLock],
     );
+    // AN OWNER'S EARLIER CONNECTION (owner's decision 2026-11-23): a stolen owner code would otherwise give organizer role
+    // with no notice, so when the account replacing its connection is an owner, the chat it replaces is captured here,
+    // under the lock and before the close below clears its address, for the notice. Only the binding of THIS trip whose
+    // person link names THIS account counts; the chat's own binding to another trip, or a group claim of the same
+    // traveller (both also closed here), is not the owner's earlier connection.
+    let replacedOwnerChat: ReplacedConnection | null = null;
+    if (issuerIsOwner) {
+      const mine = await client.query<{ telegram_user_id: string }>(
+        `SELECT telegram_user_id FROM control_plane.trip_person_links
+          WHERE trip_id = $1 AND platform = 'whatsapp' AND account_user_id = $2`,
+        [row.trip_id, row.issued_by_user_id],
+      );
+      const senders = new Set(mine.rows.map((r) => r.telegram_user_id));
+      const earlier = open.rows.find((b) => b.trip_id === row.trip_id && senders.has(b.chat_id.slice(0, -2)) && b.transport_address);
+      if (earlier) replacedOwnerChat = replacedConnection(earlier.chat_id, earlier.transport_address!);
+    }
     await closeBindings(client, open.rows.map((r) => r.id), CLOSE_REASONS.reboundByCode);
     // Their person links go with them: the old binding's link (whatever trip), the sender's link on this trip, and the
     // conflicting ones found above (even when no open binding is left for them).
@@ -406,7 +462,7 @@ export async function redeemChatBindingCode(db: pg.Pool, input: RedeemInput): Pr
     await client.query("COMMIT");
     return {
       ok: true, kind: "me", tripId: row.trip_id, tripTitle: row.trip_title, bindingId, accountUserId: row.issued_by_user_id,
-      traveller, closedBindingIds: open.rows.map((r) => r.id),
+      traveller, closedBindingIds: open.rows.map((r) => r.id), replacedOwnerChat,
     };
   } catch (error) {
     await rollback();
@@ -669,13 +725,29 @@ export async function removeWhatsAppConnection(
 /** Sends one text to a WhatsApp private chat (its alias). Supplied by the relay (S3); this slice has no transport. */
 export type WhatsAppSink = (chatId: string, text: string) => Promise<void>;
 
+/**
+ * Sends one text to a WhatsApp private chat whose binding has ALREADY CLOSED, so the alias alone no longer resolves to an
+ * address: the target carries the address `redeemChatBindingCode` captured before the close (`ReplacedConnection`). It must
+ * not log or keep the address. Supplied by the relay (S3); optional, and when it is absent or fails the notice falls
+ * through to Telegram, then to the dashboard.
+ */
+export type WhatsAppAddressedSink = (target: { chatId: string; transportAddress: string }, text: string) => Promise<void>;
+
 /** The outbox type of the Telegram fallback; its wording is `whatsappConnectionNoticeText`. */
 export const CONNECTION_NOTICE_TYPE = "whatsapp_connection_notice";
 
-export function whatsappConnectionNoticeText(payload: { kind?: unknown; name?: unknown; trip_title?: unknown; language?: unknown }): string | null {
+export function whatsappConnectionNoticeText(payload: { kind?: unknown; name?: unknown; trip_title?: unknown; language?: unknown; last4?: unknown }): string | null {
   const name = cleanChatText(payload.name, 80);
   const trip = cleanChatText(payload.trip_title, 80);
   const he = payload.language === "he";
+  if (payload.kind === "replaced") {
+    // An owner's own connection replaced by a new one: the trip and, when the bridge reported it, the new number's last
+    // four digits. Never a number, an address, an alias or a code.
+    const last4 = cleanLast4(payload.last4);
+    return he
+      ? `החיבור שלך בוואטסאפ ל${trip ? `-"${trip}"` : "טיול"} הוחלף בחיבור חדש${last4 ? ` (המספר החדש מסתיים ב-${last4})` : ""}. אם לא את/ה חיברת אותו, אפשר להסיר אותו בעמוד הוואטסאפ של הטיול.`
+      : `Your WhatsApp connection to ${trip ? `"${trip}"` : "your trip"} was replaced by a new one${last4 ? ` (the new number ends in ${last4})` : ""}. If that was not you, remove it on the trip's WhatsApp page.`;
+  }
   if (payload.kind === "group") {
     const group = name ? `"${name}"` : (he ? "קבוצת וואטסאפ" : "A WhatsApp group");
     return he
@@ -697,22 +769,29 @@ export type OwnerNotice = { userId: string; channel: "whatsapp" | "telegram" | "
  * Tells the trip's owner(s) that a group or a person was connected, ONCE, however the binding was made (AC-18). The
  * notice names the group's title or the traveller and never a number. It goes to the owner's connected WhatsApp private
  * chat (through `sendWhatsApp`) when there is one; otherwise through the existing outbox to the owner's Telegram private
- * chat when there is one; otherwise nowhere (the dashboard list shows it). The owner's OWN `me` connection is not
- * announced to them. Everything is derived from the binding row, so a binding made by adding the number (AC-28) or by a
- * traveller from the group (AC-29) is announced by the same call.
+ * chat when there is one; otherwise nowhere (the dashboard list shows it). Everything is derived from the binding row, so a
+ * binding made by adding the number (AC-28) or by a traveller from the group (AC-29) is announced by the same call.
+ *
+ * THE OWNER'S OWN `me` CONNECTION is not announced to them when it is their first. When it REPLACED an earlier connection of
+ * theirs to the trip (`input.replaced`, the redemption's `replacedOwnerChat`), it is (owner's decision 2026-11-23: a stolen
+ * owner code otherwise gives organizer role with no notice): "your connection was replaced", with the new number's last
+ * four when known, sent to the PREVIOUS chat through `sendWhatsAppToAddress`, else through the outbox to Telegram, else
+ * the dashboard only. NEVER to the owner's currently connected WhatsApp chat: that is the new one, the chat a stolen code's
+ * holder is in. A member's or a secondary organizer's replacement is announced to the owner the ordinary way.
  *
  * A failed WhatsApp send falls through to Telegram, never to a second WhatsApp attempt.
  */
 export async function notifyOwnersOfNewBinding(
   db: pg.Pool,
-  deps: { sendWhatsApp: WhatsAppSink; log?: (line: string) => void },
-  input: { bindingId: string },
+  deps: { sendWhatsApp: WhatsAppSink; sendWhatsAppToAddress?: WhatsAppAddressedSink; log?: (line: string) => void },
+  input: { bindingId: string; replaced?: ReplacedConnection | null },
 ): Promise<OwnerNotice[]> {
   const log = deps.log ?? (() => {});
   const b = await db.query<{
     trip_id: string; chat_id: string; chat_title: string | null; person_name: string | null; person_account: string | null; trip_title: string | null;
+    phone_last4: string | null;
   }>(
-    `SELECT b.trip_id, b.chat_id, b.chat_title, l.account_user_id AS person_account,
+    `SELECT b.trip_id, b.chat_id, b.chat_title, b.phone_last4, l.account_user_id AS person_account,
             coalesce(l.display_name, l.participant_username, u.display_name) AS person_name,
             coalesce(t.title, t.destination_label) AS trip_title
        FROM control_plane.telegram_chat_bindings b
@@ -737,10 +816,48 @@ export async function notifyOwnersOfNewBinding(
       WHERE m.trip_id = $1 AND m.role = 'owner' AND m.status = 'active'`,
     [row.trip_id],
   );
+  /** The Telegram fallback through the existing outbox, else the dashboard only. */
+  const viaTelegramOrDashboard = async (ownerId: string, notice: Record<string, unknown>): Promise<OwnerNotice> => {
+    const tg = await db.query<{ chat_id: string }>(
+      `SELECT b3.chat_id FROM control_plane.telegram_chat_bindings b3
+         JOIN control_plane.telegram_organizer_links o
+           ON o.user_id = $2 AND o.telegram_subject_digest = 'sha256:' || encode(sha256(convert_to(b3.chat_id, 'UTF8')), 'hex')
+        WHERE b3.trip_id = $1 AND b3.closed_at IS NULL AND b3.chat_id ~ '^[0-9]{1,20}$'
+        ORDER BY b3.created_at DESC LIMIT 1`,
+      [row.trip_id, ownerId],
+    );
+    if (!tg.rows[0]) return { userId: ownerId, channel: "dashboard_only" };
+    await db.query(
+      `INSERT INTO control_plane.notification_outbox
+         (id, trip_id, kind, recipient, payload, signup_request_id, notification_type, adapter, state)
+       VALUES ($1, $2, $3, $4, $5::jsonb, NULL, $3, 'control-plane', 'pending')`,
+      [opaque("notif"), row.trip_id, CONNECTION_NOTICE_TYPE, tg.rows[0].chat_id, JSON.stringify(notice)],
+    );
+    return { userId: ownerId, channel: "telegram" };
+  };
+
   const notices: OwnerNotice[] = [];
   for (const { user_id: ownerId } of owners.rows) {
-    // The owner's own connection is not announced to them.
-    if (!isGroup && row.person_account === ownerId) continue;
+    if (!isGroup && row.person_account === ownerId) {
+      // The owner's own FIRST connection is not announced to them.
+      if (!input.replaced) continue;
+      // It replaced an earlier one: tell them in the PREVIOUS chat, never in this new one. The payload (which the outbox
+      // stores for the Telegram fallback) carries the trip, the language and the last four; the address stays in memory.
+      const replacedNotice = { kind: "replaced", last4: cleanLast4(row.phone_last4), trip_title: row.trip_title, language };
+      const replacedText = whatsappConnectionNoticeText(replacedNotice);
+      if (!replacedText) continue;
+      if (deps.sendWhatsAppToAddress) {
+        try {
+          await deps.sendWhatsAppToAddress({ chatId: input.replaced.chatId, transportAddress: input.replaced.transportAddress }, replacedText);
+          notices.push({ userId: ownerId, channel: "whatsapp" });
+          continue;
+        } catch (error) {
+          log(structuredLog("warn", "whatsapp.owner_notice_failed", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN", notice: "replaced", fallback: "telegram" }));
+        }
+      }
+      notices.push(await viaTelegramOrDashboard(ownerId, replacedNotice));
+      continue;
+    }
     const wa = await db.query<{ chat_id: string }>(
       `SELECT b2.chat_id FROM control_plane.telegram_chat_bindings b2
          JOIN control_plane.trip_person_links l2
@@ -758,25 +875,7 @@ export async function notifyOwnersOfNewBinding(
         log(structuredLog("warn", "whatsapp.owner_notice_failed", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN", fallback: "telegram" }));
       }
     }
-    const tg = await db.query<{ chat_id: string }>(
-      `SELECT b3.chat_id FROM control_plane.telegram_chat_bindings b3
-         JOIN control_plane.telegram_organizer_links o
-           ON o.user_id = $2 AND o.telegram_subject_digest = 'sha256:' || encode(sha256(convert_to(b3.chat_id, 'UTF8')), 'hex')
-        WHERE b3.trip_id = $1 AND b3.closed_at IS NULL AND b3.chat_id ~ '^[0-9]{1,20}$'
-        ORDER BY b3.created_at DESC LIMIT 1`,
-      [row.trip_id, ownerId],
-    );
-    if (tg.rows[0]) {
-      await db.query(
-        `INSERT INTO control_plane.notification_outbox
-           (id, trip_id, kind, recipient, payload, signup_request_id, notification_type, adapter, state)
-         VALUES ($1, $2, $3, $4, $5::jsonb, NULL, $3, 'control-plane', 'pending')`,
-        [opaque("notif"), row.trip_id, CONNECTION_NOTICE_TYPE, tg.rows[0].chat_id, JSON.stringify(payload)],
-      );
-      notices.push({ userId: ownerId, channel: "telegram" });
-      continue;
-    }
-    notices.push({ userId: ownerId, channel: "dashboard_only" });
+    notices.push(await viaTelegramOrDashboard(ownerId, payload));
   }
   return notices;
 }

@@ -717,9 +717,11 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
       // session is never told which accounts were Unlinked, because it cannot restore one (portal-scope.ts).
       ...(opts.restorable ? { unlinked: (await unlinkedTelegramLinksByTrip(deps.db, userId, [tripId])).get(tripId) ?? [] } : {}),
     },
-    // The WhatsApp section (spec 625): present ONLY when this deployment has a number, the trip's `whatsapp` switch is on
-    // and the viewer runs the trip. Absent otherwise, so a trip with the switch off shows no trace of the feature (AC-6).
-    ...(deps.whatsapp && trip.dashboard_access && isOrganizerSide(trip.role) && (await featureEnabled(deps.db, tripId, WHATSAPP_SWITCH))
+    // The WhatsApp section (spec 625): present ONLY when this deployment has a number, the trip's `whatsapp` switch is on,
+    // the viewer runs the trip AND the session can use the routes behind it. A Telegram-minted (scoped) session gets 403 on all
+    // three, and `opts.restorable` is exactly "a full session" (the caller's own gate for Restore), so it is the same condition:
+    // a page must not offer buttons that will fail. Absent otherwise, so a trip with the switch off shows no trace of the feature (AC-6).
+    ...(opts.restorable && deps.whatsapp && trip.dashboard_access && isOrganizerSide(trip.role) && (await featureEnabled(deps.db, tripId, WHATSAPP_SWITCH))
       ? { whatsapp: { number: deps.whatsapp.number, owner: trip.role === "owner" } }
       : {}),
     // Secondary organizers (#523), named for the MAIN organizer's page only: an owner on a full session. A Telegram-minted session
@@ -1515,6 +1517,21 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
   // profile, with the trip's switch off, for a non-member, for a non-owner where the owner is required, for a trip that does
   // not exist or is retired: one 404. No response carries a code except the one just minted for the asker, and no response
   // carries a phone number but the deployment's own (the number a code's link opens).
+  // NEW CODE ON THE OLD SCHEMA (the switch on, the migration not yet applied): an undefined table or column (42P01 / 42703)
+  // is the same thing, to a caller, as "the feature is not present": the same 404, never a 500 that Fastify's default handler
+  // would fill with the database's own words (`relation ... does not exist`). One warn line names the event and the SQLSTATE
+  // and carries no SQL. This wraps ONLY the three WhatsApp routes; every other error still propagates, and there is no global handler.
+  async function whatsappRoute(reply: FastifyReply, route: string, run: () => Promise<unknown>): Promise<unknown> {
+    try {
+      return await run();
+    } catch (error) {
+      const sqlstate = (error as { code?: unknown } | null)?.code;
+      if (sqlstate !== "42P01" && sqlstate !== "42703") throw error;
+      (deps.emailAuthLog ?? ((line: string) => process.stderr.write(`${line}\n`)))(
+        structuredLog("warn", "whatsapp.schema_missing", { route, sqlstate, effect: "answered 404 NOT_FOUND as if the feature were not present; apply the WhatsApp migration" }));
+      return reply.code(404).send({ error: "NOT_FOUND" });
+    }
+  }
   const whatsappCodeAttempts: Attempts = new Map();
   app.post("/v1/trips/:id/whatsapp-codes", async (request, reply) => {
     const user = await requireMutation(request, reply, deps);
@@ -1527,14 +1544,17 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     }
     const tripId = (request.params as { id?: string }).id ?? "";
     const body = (request.body ?? {}) as Record<string, unknown>;
-    const issued = await issueChatBindingCode(deps.db, {
-      tripId, userId: user.id, kind: body.kind, ttlSeconds: deps.whatsapp.codeTtlSeconds, log: deps.emailAuthLog,
-    });
-    if (!issued.ok) return issued.reason === "INVALID_KIND" ? reply.code(400).send({ error: "INVALID_REQUEST" }) : reply.code(404).send({ error: "NOT_FOUND" });
-    const language = pickLanguage(body.language, request.headers["accept-language"]);
-    return reply.code(201).send({
-      link: whatsappLink(issued.kind, deps.whatsapp.number, issued.code, language),
-      expiresAt: issued.expiresAt.toISOString(),
+    const whatsapp = deps.whatsapp;
+    return whatsappRoute(reply, "POST /v1/trips/:id/whatsapp-codes", async () => {
+      const issued = await issueChatBindingCode(deps.db, {
+        tripId, userId: user.id, kind: body.kind, ttlSeconds: whatsapp.codeTtlSeconds, log: deps.emailAuthLog,
+      });
+      if (!issued.ok) return issued.reason === "INVALID_KIND" ? reply.code(400).send({ error: "INVALID_REQUEST" }) : reply.code(404).send({ error: "NOT_FOUND" });
+      const language = pickLanguage(body.language, request.headers["accept-language"]);
+      return reply.code(201).send({
+        link: whatsappLink(issued.kind, whatsapp.number, issued.code, language),
+        expiresAt: issued.expiresAt.toISOString(),
+      });
     });
   });
 
@@ -1550,8 +1570,10 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     if (!user) return;
     reply.header("cache-control", "private, no-store");
     const tripId = (request.params as { id?: string }).id ?? "";
-    if (!(await whatsappOwnerOf(tripId, user.id))) return reply.code(404).send({ error: "NOT_FOUND" });
-    return { connections: await listWhatsAppConnections(deps.db, tripId) };
+    return whatsappRoute(reply, "GET /v1/trips/:id/whatsapp-connections", async () => {
+      if (!(await whatsappOwnerOf(tripId, user.id))) return reply.code(404).send({ error: "NOT_FOUND" });
+      return { connections: await listWhatsAppConnections(deps.db, tripId) };
+    });
   });
 
   app.delete("/v1/trips/:id/whatsapp-connections/:bindingId", async (request, reply) => {
@@ -1560,10 +1582,12 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     reply.header("cache-control", "private, no-store");
     const params = request.params as { id?: string; bindingId?: string };
     const tripId = params.id ?? "";
-    if (!(await whatsappOwnerOf(tripId, user.id))) return reply.code(404).send({ error: "NOT_FOUND" });
-    const removed = await removeWhatsAppConnection(deps.db, { tripId, bindingId: params.bindingId ?? "" });
-    if (!removed.ok) return reply.code(404).send({ error: "NOT_FOUND" });
-    return { status: "removed" };
+    return whatsappRoute(reply, "DELETE /v1/trips/:id/whatsapp-connections/:bindingId", async () => {
+      if (!(await whatsappOwnerOf(tripId, user.id))) return reply.code(404).send({ error: "NOT_FOUND" });
+      const removed = await removeWhatsAppConnection(deps.db, { tripId, bindingId: params.bindingId ?? "" });
+      if (!removed.ok) return reply.code(404).send({ error: "NOT_FOUND" });
+      return { status: "removed" };
+    });
   });
 
   // A TRIP LINK for a secondary organizer (#523): the trip's MAIN organizer (its owner, with dashboard access) hands it to

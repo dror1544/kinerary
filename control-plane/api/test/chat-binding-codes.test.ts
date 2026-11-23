@@ -677,6 +677,260 @@ describe("chat binding codes against PostgreSQL", { skip: SKIP }, () => {
     });
   });
 
+  describe("AC-18, owner's decision 2026-11-23: an owner's own connection that REPLACES an earlier one is announced", () => {
+    const ADDRESS_A = "100000000000071@lid";
+    const ADDRESS_B = "100000000000072@lid";
+    /** Both sinks: the alias-only one (an OPEN binding's chat) and the addressed one (a chat whose binding just closed). */
+    const sinks = (opts: { addressed?: "ok" | "throws" | "absent" } = {}) => {
+      const byAlias: { chatId: string; text: string }[] = [];
+      const byAddress: { chatId: string; transportAddress: string; text: string }[] = [];
+      return {
+        byAlias, byAddress,
+        sendWhatsApp: async (chatId: string, text: string) => { byAlias.push({ chatId, text }); },
+        ...(opts.addressed === "absent" ? {} : {
+          sendWhatsAppToAddress: async (target: { chatId: string; transportAddress: string }, text: string) => {
+            if (opts.addressed === "throws") throw new Error("the old chat is unreachable");
+            byAddress.push({ chatId: target.chatId, transportAddress: target.transportAddress, text });
+          },
+        }),
+      };
+    };
+    const telegramFor = async (tripId: string, userId: string, tgId: string) => {
+      await pool.query(
+        "INSERT INTO control_plane.telegram_organizer_links(id,user_id,telegram_subject_digest,verified_via) VALUES ($1,$2,$3,'enrollment_redemption')",
+        [uid("otl"), userId, `sha256:${createHash("sha256").update(tgId).digest("hex")}`]);
+      await openBinding(pool, { tripId, chatId: tgId });
+    };
+    const meOk = async (tripId: string, userId: string, s: { chatId: string; senderId: string }, extra: Record<string, unknown>) => {
+      const code = await issue(tripId, userId, "me");
+      const r = await redeem(code, s.chatId, s.senderId, extra);
+      assert.ok(r.ok && r.kind === "me", JSON.stringify(r));
+      return { result: r as Extract<RedeemResult, { kind: "me" }>, code };
+    };
+    const noSecrets = (text: string, secrets: string[]) => {
+      for (const secret of secrets) assert.ok(!text.includes(secret), `leaked ${secret} in: ${text}`);
+      assert.doesNotMatch(text, /\d{5,}/, "never a full number");
+    };
+
+    test("replaced from another chat: the notice goes to the owner's PREVIOUS chat by its address, names the new number's last four, and never reaches the new chat", async () => {
+      const { tripId, ownerId } = await mkWhatsappTrip(pool, { title: "Alsace" });
+      const a = waSender(), b = waSender();
+      const first = await meOk(tripId, ownerId, a, { transportAddress: ADDRESS_A });
+      assert.equal(first.result.replacedOwnerChat, null, "a first connection replaced nothing");
+      const second = await meOk(tripId, ownerId, b, { transportAddress: ADDRESS_B, phoneLast4: FIXTURE_PHONE_LAST4 });
+      const replaced = second.result.replacedOwnerChat;
+      assert.ok(replaced, "the redemption reports the chat it replaced");
+      assert.equal(replaced.chatId, a.chatId);
+      assert.equal(replaced.transportAddress, ADDRESS_A, "captured before the close cleared it from the row");
+      assert.equal((await bindingsOf(a.chatId))[0].transport_address, null, "and the row itself no longer holds it");
+      assert.ok(!JSON.stringify(second.result).includes(ADDRESS_A), "the address does not serialise with the result (a logged result carries no address)");
+      assert.ok(!JSON.stringify(replaced).includes(ADDRESS_A));
+
+      const s = sinks();
+      const notices = await notifyOwnersOfNewBinding(pool, s, { bindingId: second.result.bindingId, replaced });
+      assert.deepEqual(notices, [{ userId: ownerId, channel: "whatsapp" }]);
+      assert.deepEqual(s.byAlias, [], "never the NEW chat: a stolen code's holder must not be the one told");
+      assert.equal(s.byAddress.length, 1);
+      assert.equal(s.byAddress[0]!.chatId, a.chatId);
+      assert.equal(s.byAddress[0]!.transportAddress, ADDRESS_A);
+      const text = s.byAddress[0]!.text;
+      console.log(`EVIDENCE replaced owner connection, previous chat gets: ${text}`);
+      assert.match(text, /WhatsApp connection to "Alsace" was replaced by a new one/);
+      assert.match(text, new RegExp(`\\(the new number ends in ${FIXTURE_PHONE_LAST4}\\)`));
+      noSecrets(text, [a.chatId, b.chatId, a.senderId, b.senderId, ADDRESS_A, ADDRESS_B, first.code, second.code, second.code.slice(4)]);
+      assert.equal((await pool.query("SELECT 1 FROM control_plane.notification_outbox WHERE trip_id=$1 AND notification_type='whatsapp_connection_notice'", [tripId])).rowCount, 0);
+    });
+
+    test("replaced, and the previous chat cannot be reached (no addressed sink, or it fails): Telegram through the outbox with the last four only; with neither, the dashboard", async () => {
+      for (const addressed of ["absent", "throws"] as const) {
+        const { tripId, ownerId } = await mkWhatsappTrip(pool, { title: "Alsace" });
+        const tgId = addressed === "absent" ? "5550071" : "5550072";
+        await telegramFor(tripId, ownerId, tgId);
+        const a = waSender(), b = waSender();
+        await meOk(tripId, ownerId, a, { transportAddress: ADDRESS_A });
+        const second = await meOk(tripId, ownerId, b, { transportAddress: ADDRESS_B, phoneLast4: FIXTURE_PHONE_LAST4 });
+        const s = sinks({ addressed });
+        const lines: string[] = [];
+        const notices = await notifyOwnersOfNewBinding(pool, { ...s, log: (l) => lines.push(l) }, { bindingId: second.result.bindingId, replaced: second.result.replacedOwnerChat });
+        assert.deepEqual(notices, [{ userId: ownerId, channel: "telegram" }], addressed);
+        assert.deepEqual(s.byAlias, [], `${addressed}: never the new chat`);
+        assert.deepEqual(s.byAddress, []);
+        const rows = (await pool.query("SELECT recipient, payload FROM control_plane.notification_outbox WHERE trip_id=$1 AND notification_type='whatsapp_connection_notice'", [tripId])).rows;
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].recipient, tgId);
+        assert.deepEqual(Object.keys(rows[0].payload).sort(), ["kind", "language", "last4", "trip_title"], "the payload carries the trip, the language and the last four, nothing else");
+        assert.equal(rows[0].payload.kind, "replaced");
+        noSecrets(JSON.stringify(rows[0].payload), [a.chatId, b.chatId, a.senderId, b.senderId, ADDRESS_A, ADDRESS_B]);
+        for (const l of lines) noSecrets(l, [a.chatId, b.chatId, ADDRESS_A, ADDRESS_B]);
+        if (addressed === "throws") assert.equal(lines.filter((l) => l.includes("whatsapp.owner_notice_failed")).length, 1);
+      }
+      const adapter = new FakeNotificationAdapter();
+      await dispatchPendingTripNotifications(pool, adapter);
+      const sent = adapter.messageCalls.filter((c) => c.chatId === "5550071" || c.chatId === "5550072");
+      assert.equal(sent.length, 2, "the outbox dispatcher sends the replaced notice (it knows the kind)");
+      for (const c of sent) {
+        assert.match(c.text, /WhatsApp connection to "Alsace" was replaced by a new one \(the new number ends in 4567\)/);
+        noSecrets(c.text, [ADDRESS_A, ADDRESS_B]);
+      }
+
+      const { tripId, ownerId } = await mkWhatsappTrip(pool);
+      const a = waSender(), b = waSender();
+      await meOk(tripId, ownerId, a, { transportAddress: ADDRESS_A });
+      const second = await meOk(tripId, ownerId, b, { transportAddress: ADDRESS_B });
+      const s = sinks({ addressed: "absent" });
+      assert.deepEqual(await notifyOwnersOfNewBinding(pool, s, { bindingId: second.result.bindingId, replaced: second.result.replacedOwnerChat }), [{ userId: ownerId, channel: "dashboard_only" }]);
+      assert.deepEqual(s.byAlias, []);
+    });
+
+    test("the new number's last four are named only when known, and the Hebrew trip gets Hebrew", () => {
+      const en = whatsappConnectionNoticeText({ kind: "replaced", trip_title: "Alsace", language: "en" })!;
+      assert.equal(en, `Your WhatsApp connection to "Alsace" was replaced by a new one. If that was not you, remove it on the trip's WhatsApp page.`);
+      assert.match(whatsappConnectionNoticeText({ kind: "replaced", last4: "4567", trip_title: "Alsace" })!, /\(the new number ends in 4567\)/);
+      for (const bad of ["12345", "45a7", "+4567", 4567, null]) {
+        assert.doesNotMatch(whatsappConnectionNoticeText({ kind: "replaced", last4: bad, trip_title: "Alsace" })!, /ends in/, String(bad));
+      }
+      const he = whatsappConnectionNoticeText({ kind: "replaced", last4: "4567", trip_title: "אלזס", language: "he" })!;
+      assert.match(he, /הוחלף/);
+      assert.match(he, /4567/);
+    });
+
+    test("a FIRST owner connection (nothing replaced) stays unannounced, as the spec says", async () => {
+      const { tripId, ownerId } = await mkWhatsappTrip(pool);
+      await telegramFor(tripId, ownerId, "5550073");
+      const a = waSender();
+      const first = await meOk(tripId, ownerId, a, { transportAddress: ADDRESS_A, phoneLast4: FIXTURE_PHONE_LAST4 });
+      assert.equal(first.result.replacedOwnerChat, null);
+      const s = sinks();
+      assert.deepEqual(await notifyOwnersOfNewBinding(pool, s, { bindingId: first.result.bindingId, replaced: first.result.replacedOwnerChat }), []);
+      assert.deepEqual(await notifyOwnersOfNewBinding(pool, s, { bindingId: first.result.bindingId }), []);
+      assert.deepEqual([s.byAlias, s.byAddress], [[], []]);
+      assert.equal((await pool.query("SELECT 1 FROM control_plane.notification_outbox WHERE trip_id=$1 AND notification_type='whatsapp_connection_notice'", [tripId])).rowCount, 0);
+    });
+
+    test("the SAME chat sending a new owner code replaces the earlier connection too, so it is announced (to that same chat, by its address)", async () => {
+      const { tripId, ownerId } = await mkWhatsappTrip(pool, { title: "Alsace" });
+      const a = waSender();
+      await meOk(tripId, ownerId, a, { transportAddress: ADDRESS_A });
+      const again = await meOk(tripId, ownerId, a, { transportAddress: ADDRESS_A, phoneLast4: FIXTURE_PHONE_LAST4 });
+      assert.equal(again.result.replacedOwnerChat?.chatId, a.chatId);
+      const s = sinks();
+      assert.deepEqual(await notifyOwnersOfNewBinding(pool, s, { bindingId: again.result.bindingId, replaced: again.result.replacedOwnerChat }), [{ userId: ownerId, channel: "whatsapp" }]);
+      assert.equal(s.byAddress.length, 1);
+      assert.deepEqual(s.byAlias, []);
+    });
+
+    test("unchanged: a member or a secondary organizer replacing their OWN connection gets no replaced-notice and no address; the owner is told \"<name> connected their WhatsApp\" as before, in the owner's own chat", async () => {
+      const { tripId, ownerId } = await mkWhatsappTrip(pool, { title: "Alsace" });
+      const ownerChat = waSender();
+      await meOk(tripId, ownerId, ownerChat, { transportAddress: ADDRESS_A });
+      for (const [role, name] of [["member", "Noa"], ["organizer", "Sec"]] as const) {
+        const user = await mkUser(pool, name); await mkMember(pool, tripId, user, role);
+        const a = waSender(), b = waSender();
+        await meOk(tripId, user, a, { transportAddress: ADDRESS_B });
+        const second = await meOk(tripId, user, b, { transportAddress: ADDRESS_B, phoneLast4: FIXTURE_PHONE_LAST4 });
+        assert.equal(second.result.replacedOwnerChat, null, `${role}: the address is returned only for an owner's replaced chat`);
+        assert.deepEqual(second.result.closedBindingIds.length, 1, `${role}: the earlier chat was still closed (AC-9)`);
+        const s = sinks();
+        assert.deepEqual(await notifyOwnersOfNewBinding(pool, s, { bindingId: second.result.bindingId, replaced: second.result.replacedOwnerChat }), [{ userId: ownerId, channel: "whatsapp" }], role);
+        assert.deepEqual(s.byAddress, []);
+        assert.equal(s.byAlias.length, 1);
+        assert.equal(s.byAlias[0]!.chatId, ownerChat.chatId, "to the owner's own connected chat");
+        assert.match(s.byAlias[0]!.text, new RegExp(`^${name} connected their WhatsApp to "Alsace"`));
+      }
+    });
+
+    test("unchanged for a co-owner: another owner replacing their connection is told to the co-owner as \"<name> connected\", and the replaced notice goes only to the owner it concerns", async () => {
+      const { tripId, ownerId } = await mkWhatsappTrip(pool, { title: "Alsace" });
+      const coOwner = await mkUser(pool, "Dana"); await mkMember(pool, tripId, coOwner, "owner");
+      const coChat = waSender();
+      await meOk(tripId, coOwner, coChat, { transportAddress: ADDRESS_B });
+      const a = waSender(), b = waSender();
+      await meOk(tripId, ownerId, a, { transportAddress: ADDRESS_A });
+      const second = await meOk(tripId, ownerId, b, { transportAddress: ADDRESS_A, phoneLast4: FIXTURE_PHONE_LAST4 });
+      const s = sinks();
+      const notices = await notifyOwnersOfNewBinding(pool, s, { bindingId: second.result.bindingId, replaced: second.result.replacedOwnerChat });
+      assert.deepEqual([...notices].sort((x, y) => x.userId.localeCompare(y.userId)), [{ userId: ownerId, channel: "whatsapp" }, { userId: coOwner, channel: "whatsapp" }].sort((x, y) => x.userId.localeCompare(y.userId)));
+      assert.deepEqual(s.byAddress.map((m) => m.chatId), [a.chatId], "the replaced notice: only the owner whose connection it was, in their previous chat");
+      assert.deepEqual(s.byAlias.map((m) => m.chatId), [coChat.chatId], "the co-owner: the ordinary notice in the co-owner's chat");
+      assert.match(s.byAlias[0]!.text, /connected their WhatsApp to "Alsace"/);
+    });
+  });
+
+  describe("AC-14 / lock order: a membership removed while a redemption is in flight", () => {
+    /** Waits until `n` backends of this database are waiting on a lock (a deterministic point, not a sleep). */
+    const waitForLockWaiters = async (n: number) => {
+      const deadline = Date.now() + 15_000;
+      for (;;) {
+        const r = await pool.query("SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'");
+        if (r.rows[0].n >= n) return;
+        if (Date.now() > deadline) throw new Error(`only ${r.rows[0].n} backends waiting on a lock`);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    };
+    const noOpenBindingForRevoked = async (tripId: string, userId: string) => {
+      const rows = (await pool.query(
+        `SELECT 1 FROM control_plane.trip_person_links l
+           JOIN control_plane.telegram_chat_bindings b ON b.trip_id = l.trip_id AND b.chat_id = l.telegram_user_id || '@p' AND b.closed_at IS NULL
+          WHERE l.trip_id = $1 AND l.account_user_id = $2 AND l.platform = 'whatsapp'
+            AND NOT EXISTS (SELECT 1 FROM control_plane.trip_memberships m WHERE m.trip_id = l.trip_id AND m.user_id = l.account_user_id AND m.status = 'active')`,
+        [tripId, userId])).rowCount;
+      assert.equal(rows, 0, "a revoked membership with an open WhatsApp binding and link");
+    };
+
+    test("AC-14: the removal commits first, then the redemption that already issued its code fails as ISSUER_NOT_ENTITLED (the membership read is locked, not a stale check)", async () => {
+      const { tripId, ownerId } = await mkWhatsappTrip(pool);
+      const member = await mkUser(pool, "Noa"); await mkMember(pool, tripId, member, "member");
+      const code = await issue(tripId, member, "me");
+      const s = waSender();
+      // A stands in for removeMember part-way through: it holds the member's row and has revoked it, uncommitted.
+      const a = await pool.connect();
+      try {
+        await a.query("BEGIN");
+        await a.query("SELECT 1 FROM control_plane.trip_memberships WHERE trip_id = $1 AND user_id = $2 FOR UPDATE", [tripId, member]);
+        await a.query("UPDATE control_plane.trip_memberships SET status = 'revoked' WHERE trip_id = $1 AND user_id = $2", [tripId, member]);
+        const redemption = redeem(code, s.chatId, s.senderId);
+        await waitForLockWaiters(1);
+        await a.query("COMMIT");
+        const result = await redemption;
+        assert.equal(result.ok, false);
+        assert.equal((result as { reason: string }).reason, "ISSUER_NOT_ENTITLED");
+      } finally { a.release(); }
+      assert.equal((await bindingsOf(s.chatId)).length, 0);
+      await noOpenBindingForRevoked(tripId, member);
+      void ownerId;
+    });
+
+    test("AC-14: the redemption holds the membership first, so removeMember waits for it and then CLOSES the new binding: never a revoked member with an open binding", async () => {
+      const { tripId, ownerId } = await mkWhatsappTrip(pool);
+      const member = await mkUser(pool, "Noa"); await mkMember(pool, tripId, member, "member");
+      const other = await mkWhatsappTrip(pool);
+      const s = waSender();
+      // The chat is already bound elsewhere, and B holds that binding's row: the redemption will pass its membership check
+      // and then wait at the binding lock, which is exactly the window the race needs.
+      await redeem(await issue(other.tripId, other.ownerId, "me"), s.chatId, s.senderId);
+      const code = await issue(tripId, member, "me");
+      const b = await pool.connect();
+      try {
+        await b.query("BEGIN");
+        await b.query("SELECT 1 FROM control_plane.telegram_chat_bindings WHERE chat_id = $1 AND closed_at IS NULL FOR UPDATE", [s.chatId]);
+        const redemption = redeem(code, s.chatId, s.senderId);
+        await waitForLockWaiters(1);
+        // removeMember starts now: it must queue behind the redemption's hold on the member's row.
+        const removal = removeMember(pool, { tripId, actorUserId: ownerId, targetUserId: member });
+        await waitForLockWaiters(2);
+        await b.query("COMMIT");
+        const [redeemed, removed] = await Promise.all([redemption, removal]);
+        assert.ok(redeemed.ok, JSON.stringify(redeemed));
+        assert.deepEqual(removed, { ok: true });
+      } finally { b.release(); }
+      const mine = (await bindingsOf(s.chatId)).find((r) => r.trip_id === tripId)!;
+      assert.equal(mine.closed_reason, "membership_ended", "removeMember closed the binding the redemption opened");
+      assert.equal(mine.transport_address, null);
+      assert.equal((await linksOf(tripId)).length, 0);
+      await noOpenBindingForRevoked(tripId, member);
+    });
+  });
+
   describe("Lock order (spec 'Lock order')", () => {
     /** The statements `teardown-trip.py`'s retire_in_db runs, in its order: codes first, then bindings, then the trip. */
     const teardown = async (tripId: string, pauseMs = 0) => {

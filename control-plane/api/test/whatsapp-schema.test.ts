@@ -45,7 +45,7 @@ describe("chatKind", () => {
     }
   });
   test("the alias derivation: HMAC of the real id under the SAME key as sender ids, 32 hex, @g for a group and @p for a person; the key is passed in", () => {
-    const key = "test-key-a";
+    const key = "test-key-a-0123456789-0123456789-xy"; // 32+ bytes
     const person = whatsappOpaqueId(key, "100000000000001@lid");
     assert.match(person, /^wa_[0-9a-f]{32}$/);
     assert.equal(whatsappChatAlias(key, "100000000000001@lid", "private"), `${person}@p`);
@@ -58,15 +58,39 @@ describe("chatKind", () => {
       assert.equal(whatsappChatAlias(key, realId, "group"), alias, "deterministic: the relay needs no lookup to receive");
       assert.ok(!alias.includes(realId.split("@")[0]!.split("-")[0]!.slice(0, 8)), "the number does not show through the alias");
     }
-    assert.notEqual(whatsappChatAlias("test-key-b", real, "group"), whatsappChatAlias(key, real, "group"), "a different key gives a different alias");
+    assert.notEqual(whatsappChatAlias("test-key-b-0123456789-0123456789-xy", real, "group"), whatsappChatAlias(key, real, "group"), "a different key gives a different alias");
     assert.notEqual(whatsappChatAlias(key, real, "group"), whatsappChatAlias(key, old, "group"));
-    assert.equal(whatsappChatAlias(Buffer.from("test-key-a"), real, "group"), whatsappChatAlias(key, real, "group"), "a Buffer key is the same key");
+    assert.equal(whatsappChatAlias(Buffer.from(key), real, "group"), whatsappChatAlias(key, real, "group"), "a Buffer key is the same key");
     // fail loud: no key, no id, or a group id of no accepted shape
-    assert.throws(() => whatsappOpaqueId("", "x@lid"), /key is required/);
-    assert.throws(() => whatsappOpaqueId(undefined as never, "x@lid"), /key is required/);
+    assert.throws(() => whatsappOpaqueId("", "x@lid"), /at least 32 bytes/);
+    assert.throws(() => whatsappOpaqueId(undefined as never, "x@lid"), /at least 32 bytes/);
     assert.throws(() => whatsappOpaqueId(key, ""), /id is required/);
     assert.throws(() => whatsappChatAlias(key, "100000000000001@lid", "group"), /not an accepted/);
     assert.throws(() => whatsappChatAlias(key, "-1001234567", "group"), /not an accepted/);
+  });
+  test("the alias key must be at least 32 BYTES (a short or guessable key makes ids enumerable); a Buffer counts bytes, not characters", () => {
+    for (const short of ["a", "x".repeat(31), Buffer.alloc(31, 7), Buffer.alloc(0)]) {
+      assert.throws(() => whatsappOpaqueId(short, "100000000000001@lid"), /at least 32 bytes/);
+      assert.throws(() => whatsappChatAlias(short, waGroupAddress(), "group"), /at least 32 bytes/);
+    }
+    assert.match(whatsappOpaqueId("x".repeat(32), "100000000000001@lid"), /^wa_[0-9a-f]{32}$/);
+    assert.match(whatsappOpaqueId(Buffer.alloc(32, 7), "100000000000001@lid"), /^wa_[0-9a-f]{32}$/);
+    // multi-byte characters count as bytes: 16 two-byte characters are 32 bytes
+    assert.match(whatsappOpaqueId("é".repeat(16), "100000000000001@lid"), /^wa_[0-9a-f]{32}$/);
+    assert.throws(() => whatsappOpaqueId("é".repeat(15), "100000000000001@lid"), /at least 32 bytes/);
+  });
+  test("a NON-canonical id fails loudly instead of minting a second identity: whitespace, upper case and a device suffix are rejected, nothing is repaired", () => {
+    const key = "x".repeat(32);
+    const canonical = whatsappOpaqueId(key, "100000000000001@lid");
+    for (const [bad, why] of [[" 100000000000001@lid", "whitespace"], ["100000000000001@lid ", "whitespace"], ["100000000000001@lid\n", "whitespace"], ["1000000000 00001@lid", "whitespace"],
+      ["100000000000001@LID", "upper-case"], ["ABC@lid", "upper-case"], ["100000000000001:12@lid", "device suffix"], ["100000000000001:0@s.whatsapp.net", "device suffix"]] as const) {
+      assert.throws(() => whatsappOpaqueId(key, bad), new RegExp(`not canonical \\(${why}`), bad);
+      assert.throws(() => whatsappChatAlias(key, bad, "private"), /not canonical/, bad);
+    }
+    assert.equal(whatsappOpaqueId(key, "100000000000001@lid"), canonical, "the canonical form still hashes");
+    // a group's real id is validated by shape first: an upper-case or padded one is refused as not accepted
+    assert.throws(() => whatsappChatAlias(key, ` ${waGroupAddress()}`, "group"), /not an accepted/);
+    assert.throws(() => whatsappChatAlias(key, waGroupAddress().toUpperCase(), "group"), /not an accepted/);
   });
   test("chatKind: isPrivateChatId keeps meaning a TELEGRAM private chat; a WhatsApp private chat is never one", () => {
     assert.equal(isPrivateChatId(`wa_${"a".repeat(32)}@p`), false);
@@ -222,6 +246,95 @@ describe("AC-3: rows the previous release wrote", { skip: SKIP }, () => {
       assert.deepEqual(b.rows, [{ platform: "telegram" }]);
       const l = await old.query("SELECT DISTINCT platform FROM control_plane.trip_person_links");
       assert.deepEqual(l.rows, [{ platform: "telegram" }]);
+    } finally { await old.end(); }
+  });
+});
+
+describe("E: the migration cannot stall a serving database (lock hazard)", { skip: SKIP }, () => {
+  test("the file's first statement is `SET LOCAL lock_timeout`, and its first line is still the rollback header", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const { MIGRATIONS_DIR, S2_MIGRATION } = await import("./support/whatsapp-fixture.js");
+    const text = await readFile(`${MIGRATIONS_DIR}${S2_MIGRATION}`, "utf8");
+    assert.match(text.split("\n")[0]!, /^-- rollback: compatible — \S/);
+    const statements = text.split("\n").filter((l) => l.trim() && !l.trim().startsWith("--"));
+    assert.equal(statements[0], "SET LOCAL lock_timeout = '5s';");
+    assert.match(text, /ROLLBACK NOTE[\s\S]*relay\.whatsapp[\s\S]*UPDATE control_plane\.telegram_chat_bindings[\s\S]*transport_address = NULL/);
+  });
+
+  test("D: the rollback note's one statement, run exactly as the file prints it, closes every open WhatsApp binding (group and private, with last four) and leaves the Telegram ones open", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const { MIGRATIONS_DIR, S2_MIGRATION } = await import("./support/whatsapp-fixture.js");
+    const text = await readFile(`${MIGRATIONS_DIR}${S2_MIGRATION}`, "utf8");
+    const lines = text.split("\n");
+    const start = lines.findIndex((l) => /^--\s+UPDATE control_plane\.telegram_chat_bindings\s*$/.test(l));
+    assert.ok(start > 0, "the note prints the statement");
+    const statement: string[] = [];
+    for (let i = start; i < lines.length; i += 1) {
+      statement.push(lines[i]!.replace(/^--\s?/, ""));
+      if (lines[i]!.trim().endsWith(";")) break;
+    }
+    const pool = await freshDatabase();
+    try {
+      const trip = await mkTrip(pool);
+      const p = waSender(), g = waGroupId();
+      await openBinding(pool, { tripId: trip, chatId: p.chatId, platform: "whatsapp", transportAddress: FIXTURE_ADDRESS, phoneLast4: "4567" });
+      await openBinding(pool, { tripId: trip, chatId: g, platform: "whatsapp", transportAddress: waOldGroupAddress() });
+      await openBinding(pool, { tripId: trip, chatId: "-100555" });
+      const r = await pool.query(statement.join("\n"));
+      assert.equal(r.rowCount, 2);
+      const rows = (await pool.query("SELECT platform, closed_at IS NULL AS open, closed_reason, transport_address, phone_last4 FROM control_plane.telegram_chat_bindings WHERE trip_id = $1 ORDER BY platform", [trip])).rows;
+      assert.deepEqual(rows, [
+        { platform: "telegram", open: true, closed_reason: null, transport_address: null, phone_last4: null },
+        { platform: "whatsapp", open: false, closed_reason: "rolled_back", transport_address: null, phone_last4: null },
+        { platform: "whatsapp", open: false, closed_reason: "rolled_back", transport_address: null, phone_last4: null },
+      ]);
+      // and an OLDER teardown's plain close now has nothing WhatsApp left to trip over (it would have failed 23514 before)
+      await pool.query("UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed' WHERE trip_id = $1 AND closed_at IS NULL", [trip]);
+    } finally { await pool.end(); }
+  });
+
+  test("D: without that statement, an older teardown's plain close fails its transaction on an open WhatsApp binding (23514), which is why the note exists", async () => {
+    const pool = await freshDatabase();
+    try {
+      const trip = await mkTrip(pool);
+      await openBinding(pool, { tripId: trip, chatId: waSender().chatId, platform: "whatsapp", transportAddress: FIXTURE_ADDRESS });
+      await assert.rejects(
+        pool.query("UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed' WHERE trip_id = $1 AND closed_at IS NULL", [trip]),
+        { code: "23514", constraint: "telegram_chat_bindings_transport_address_ck" });
+    } finally { await pool.end(); }
+  });
+
+  test("a session idle in a transaction on the table fails the migration after about 5 seconds, rolled back whole, instead of stalling; run again it applies to the populated old schema", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const { MIGRATIONS_DIR, S2_MIGRATION } = await import("./support/whatsapp-fixture.js");
+    const old = await freshDatabase({ oldSchema: true });
+    try {
+      const trip = await mkTrip(old);
+      await old.query("INSERT INTO control_plane.telegram_chat_bindings (id, chat_id, trip_id, hermes_profile) VALUES ($1,'-100901',$2,'gw-a'),($3,'901',$2,'gw-a')", [uid("tcb"), trip, uid("tcb")]);
+      await old.query(
+        `INSERT INTO control_plane.trip_person_links (id, trip_id, telegram_user_id, participant_username, role, verified_via)
+         VALUES ($1,$2,'901','ron','organizer','interview_chat')`, [uid("tpl"), trip]);
+      const sql = await readFile(`${MIGRATIONS_DIR}${S2_MIGRATION}`, "utf8");
+      const applyOnce = async () => {
+        const c = await old.connect();
+        try { await c.query("BEGIN"); await c.query(sql); await c.query("COMMIT"); } catch (e) { await c.query("ROLLBACK").catch(() => undefined); throw e; } finally { c.release(); }
+      };
+      // The idle session: a reader that never ended its transaction holds ACCESS SHARE on the table.
+      const idle = await old.connect();
+      try {
+        await idle.query("BEGIN");
+        await idle.query("SELECT count(*) FROM control_plane.telegram_chat_bindings");
+        const started = Date.now();
+        await assert.rejects(applyOnce(), { code: "55P03" });
+        const waited = Date.now() - started;
+        assert.ok(waited >= 4_000 && waited < 12_000, `failed after ${waited} ms: the 5 s lock timeout, not an unbounded wait`);
+        // nothing half applied: no column, no table
+        assert.equal((await old.query("SELECT 1 FROM information_schema.columns WHERE table_schema='control_plane' AND column_name IN ('platform','transport_address','account_user_id') AND table_name IN ('telegram_chat_bindings','trip_person_links')")).rowCount, 0);
+        assert.equal((await old.query("SELECT to_regclass('control_plane.chat_binding_codes') AS t")).rows[0].t, null);
+      } finally { await idle.query("ROLLBACK").catch(() => undefined); idle.release(); }
+      await applyOnce();
+      assert.deepEqual((await old.query("SELECT DISTINCT platform FROM control_plane.telegram_chat_bindings")).rows, [{ platform: "telegram" }]);
+      assert.deepEqual((await old.query("SELECT platform, account_user_id FROM control_plane.trip_person_links")).rows, [{ platform: "telegram", account_user_id: null }]);
     } finally { await old.end(); }
   });
 });

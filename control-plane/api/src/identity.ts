@@ -212,17 +212,27 @@ export const isAcceptedWhatsAppGroupId = (realId: unknown): realId is string => 
 export const WHATSAPP_GROUP_CHAT_ID_SQL = "^wa_[0-9a-f]{32}@g$";
 export const TELEGRAM_GROUP_CHAT_ID_SQL = "^-[0-9]{1,20}$";
 
+/** The shortest sender-id key the helpers accept, in bytes: a short or guessable key makes the opaque ids enumerable. */
+export const WHATSAPP_MIN_KEY_BYTES = 32;
+
 /**
  * The opaque id of a WhatsApp person: `wa_` plus the first 32 hex characters of HMAC-SHA256(key, canonical id). It is
  * `source.user_id` for the sender, the key of the person link, and with `@p` appended the person's private chat id.
  *
  * THE KEY IS PASSED IN. It is its own secret (`relay.whatsapp.sender_id_secret_ref`); this helper never reads the
- * environment, and an empty key or id throws rather than hashing under a key nobody set. Rotating the key orphans every
- * WhatsApp private binding and person link.
+ * environment, throws on a key shorter than 32 BYTES, and throws on an empty id, rather than hashing under a key nobody set.
+ * Rotating the key orphans every WhatsApp private binding and person link.
+ *
+ * NO CANONICALISATION HERE: the bridge supplies canonical ids. A non-canonical one is REJECTED, not repaired, because hashing
+ * `"X@lid"` and `"x@lid"` (or a device-suffixed form `"123:4@lid"`) would mint a second identity for one person: surrounding
+ * whitespace, upper-case letters and a device suffix (`:<digits>@`) all throw.
  */
 export function whatsappOpaqueId(key: string | Buffer, canonicalId: string): string {
-  if (!key || key.length === 0) throw new Error("whatsappOpaqueId: the sender-id key is required");
+  if (!key || Buffer.byteLength(key) < WHATSAPP_MIN_KEY_BYTES) throw new Error(`whatsappOpaqueId: the sender-id key must be at least ${WHATSAPP_MIN_KEY_BYTES} bytes`);
   if (typeof canonicalId !== "string" || canonicalId.length === 0) throw new Error("whatsappOpaqueId: an id is required");
+  if (canonicalId !== canonicalId.trim() || /\s/.test(canonicalId)) throw new Error("whatsappOpaqueId: the id is not canonical (whitespace)");
+  if (/[A-Z]/.test(canonicalId)) throw new Error("whatsappOpaqueId: the id is not canonical (upper-case letters)");
+  if (/:[0-9]+@/.test(canonicalId)) throw new Error("whatsappOpaqueId: the id is not canonical (device suffix)");
   return `wa_${createHmac("sha256", key).update(canonicalId).digest("hex").slice(0, 32)}`;
 }
 
@@ -242,7 +252,7 @@ export type ChatKind = "private" | "group" | "unknown";
 
 /**
  * Private, group or unknown, from the SHAPE of the id alone (so no reader needs the platform column).
- * Telegram: digits are private, minus-digits a group. WhatsApp: `@g.us` a group, `@p` private. Anything else is
+ * Telegram: digits are private, minus-digits a group. WhatsApp: `wa_<hex>@g` a group, `wa_<hex>@p` private. Anything else is
  * `unknown`, which every caller treats as the most restrictive answer. `isPrivateChatId` keeps meaning "a TELEGRAM
  * private chat": a WhatsApp private chat is never an interview handover and never a Mini App chat.
  */

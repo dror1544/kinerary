@@ -207,6 +207,25 @@ describe("whatsapp portal routes", { skip: SKIP }, () => {
     assert.ok(!JSON.stringify((await call(f.memberS, "GET", "/v1/trips")).json()).toLowerCase().includes("whatsapp"));
   });
 
+  test("AC-6 / AC-7: the trip page offers the WhatsApp section only to a session that can use it: a full account session gets it, a Telegram-minted (scoped) session does not", async () => {
+    const f = await fixture();
+    const scoped = await telegramSession(f.ownerId, f.tripId);
+    const full = await call(f.owner, "GET", `/v1/trips/${f.tripId}`);
+    const viaTelegram = await call(scoped, "GET", `/v1/trips/${f.tripId}`);
+    console.log(`EVIDENCE trip detail, account session: HTTP ${full.statusCode} whatsapp=${JSON.stringify(full.json().whatsapp)}`);
+    console.log(`EVIDENCE trip detail, Telegram-minted session: HTTP ${viaTelegram.statusCode} has whatsapp key=${"whatsapp" in viaTelegram.json()}`);
+    assert.equal(full.statusCode, 200);
+    assert.deepEqual(full.json().whatsapp, { number: FIXTURE_NUMBER, owner: true });
+    assert.equal(viaTelegram.statusCode, 200, "the scoped session still reads its own trip");
+    assert.ok(!("whatsapp" in viaTelegram.json()), "the page must not offer buttons that will answer 403");
+    assert.ok(!JSON.stringify(viaTelegram.json()).toLowerCase().includes("whatsapp"));
+    assert.equal((await call(scoped, "POST", `/v1/trips/${f.tripId}/whatsapp-codes`, { kind: "me" })).statusCode, 403, "and the routes would indeed refuse it");
+    // a secondary organizer on a full account session still gets it (not as owner): its `me` route answers 201
+    const secondary = await call(f.secondaryS, "GET", `/v1/trips/${f.tripId}`);
+    assert.equal(secondary.statusCode, 200);
+    assert.deepEqual(secondary.json().whatsapp, { number: FIXTURE_NUMBER, owner: false });
+  });
+
   test("AC-7: the per-user rate limit answers 429 after ten codes in a minute", async () => {
     const f = await fixture();
     let last = 0;
