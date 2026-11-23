@@ -856,7 +856,9 @@ pairing.
 - **The bridge receives every message of every group the number is in**, addressed or
   not, and the judge model reads group text at the trip's proactive level, as on Telegram.
   The introduction says so in one line (AC-10). The privacy policy drafts in the notes
-  folder do not mention WhatsApp (still open).
+  folder do not mention WhatsApp; a WhatsApp paragraph is deferred until a group outside
+  the owner's family and friends is to be bound (Dror, 2026-11-23), and is then required
+  before that binding.
 - **The session directory is a credential** that gives full control of the WhatsApp
   account. It is deployment state, never in this repository, never in a container image.
 - **Boundary review** is required for S2, S3 and S5, with live request/response evidence
@@ -948,10 +950,16 @@ Tests are written first, from the criteria.
    changed its id format carries its creator's number in its id. Every group chat id is
    now an alias, with the real id in `transport_address` (Chat ids, AC-4, AC-11).
 
+8. **Privacy wording (2026-11-23).** The use is not commercial: the owner's family and
+   friends. The one line in the group introduction saying the companion reads the group's
+   messages to know when it is addressed stays required (AC-10), because the other people
+   in a group agreed to nothing. A WhatsApp paragraph in the published privacy policy is
+   deferred until a group outside family and friends is to be bound.
+
 **Still open, none blocks the build on staging:**
 
-- **Privacy wording.** The exact introduction line, and whether the published privacy
-  policy needs a WhatsApp paragraph before a group outside the owner's family is bound.
+- **The introduction's exact sentence.** That the line is there is decided (8, above);
+  its wording is written with S3 and shown to the owner at the S4 sitting.
 - **Production.** The unofficial client breaks WhatsApp's terms and the number can be
   banned without notice; a ban also cuts every connected private chat. This spec stops
   at staging; whether and when a real family's group gets it is a later decision, with a
