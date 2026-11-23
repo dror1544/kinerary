@@ -102,9 +102,15 @@ async function withFixture(fn: (fix: Fixture) => Promise<void>): Promise<void> {
   }
 }
 
+/** What `resolveInbound` hands a routed turn: a companion route with a profile. */
+type RoutedRoute = Extract<GateOutcome, { kind: "event" }>["route"];
+
 function route(fix: Fixture, hermesProfile: string | null = PROFILE): ChatRoute {
   return { kind: "companion", tripId: fix.tripId, hermesProfile, assistantNames: NAMES };
 }
+
+/** A decision only a platform hook can add (Telegram's organizer-document route is one). */
+type PlatformDecision = { kind: "platform_route"; note: string };
 
 interface TurnSpec {
   text?: string;
@@ -147,6 +153,7 @@ function turnFor(platform: Platform, spec: TurnSpec = {}): InboundTurn {
 
 /** What a platform's own normalisation hands the gate: the wire event for the turn, and the resolved route. */
 function eventOutcome(turn: InboundTurn, fix: Fixture): GateOutcome & { kind: "event" } {
+  // `GateOutcome`'s event arm has no `attachment`: the gate reads the turn's.
   const event: WireMessageEvent = {
     text: turn.text,
     message_type: "text",
@@ -163,7 +170,7 @@ function eventOutcome(turn: InboundTurn, fix: Fixture): GateOutcome & { kind: "e
     },
     message_id: turn.messageId,
   };
-  return { kind: "event", event, route: route(fix), attachment: turn.attachment };
+  return { kind: "event", event, route: route(fix) as RoutedRoute };
 }
 
 function scriptedJudge(...outcomes: JudgeOutcome[]): GroupJudge & { calls: string[] } {
@@ -179,7 +186,7 @@ function scriptedJudge(...outcomes: JudgeOutcome[]): GroupJudge & { calls: strin
   };
 }
 
-function depsFor(fix: Fixture, extra: Partial<GateDeps> = {}): GateDeps {
+function depsFor(fix: Fixture, extra: Partial<GateDeps<PlatformDecision>> = {}): GateDeps<PlatformDecision> {
   return {
     db: fix.pool,
     log: () => {},
@@ -197,7 +204,7 @@ function depsFor(fix: Fixture, extra: Partial<GateDeps> = {}): GateDeps {
  * happens to equal a DM chat id): the chat ids, and `source.platform`, which
  * is the turn's own and is passed through, not decided.
  */
-function shape(decision: GateDecision | GateDecision[], platform: Platform): unknown {
+function shape(decision: GateDecision<PlatformDecision> | GateDecision<PlatformDecision>[], platform: Platform): unknown {
   const chatKeys = new Set(["chatId", "chat_id", "chatKey"]);
   return JSON.parse(
     JSON.stringify(decision, (key, value) => {
@@ -218,7 +225,7 @@ function shape(decision: GateDecision | GateDecision[], platform: Platform): unk
  */
 interface Case {
   name: string;
-  run(platform: Platform, fix: Fixture): Promise<GateDecision | GateDecision[]>;
+  run(platform: Platform, fix: Fixture): Promise<GateDecision<PlatformDecision> | GateDecision<PlatformDecision>[]>;
   expect(shaped: unknown, platform: Platform): void;
 }
 
@@ -334,7 +341,7 @@ const CASES: Case[] = [
       const judge = scriptedJudge(YES);
       const turn = turnFor(platform, { text: "\u{1F44D}" });
       const decision = await companionGate(turn, eventOutcome(turn, fix), depsFor(fix, { groupJudge: judge }));
-      return [decision, { kind: "drop", reason: `judge asked ${judge.calls.length}` } as GateDecision];
+      return [decision, { kind: "drop", reason: `judge asked ${judge.calls.length}` } as GateDecision<PlatformDecision>];
     },
     expect(d) {
       const [decision, asked] = d as unknown as Array<{ kind: string; reason?: string }>;
@@ -386,7 +393,7 @@ const CASES: Case[] = [
       const again = turnFor(platform, { text: "does anyone know the wifi password?" });
       const second = await companionGate(again, eventOutcome(again, fix), depsFor(fix, { groupJudge: judge, judgedOutcome: verdict }));
       assert.equal(judge.calls.length, 1, "never asked twice");
-      return [{ kind: "drop", reason: "pending", ...{ chatId: (first as { chatId: string }).chatId } } as unknown as GateDecision, second];
+      return [{ kind: "drop", reason: "pending", ...{ chatId: (first as { chatId: string }).chatId } } as unknown as GateDecision<PlatformDecision>, second];
     },
     expect(d) {
       const [pending, second] = d as unknown as Array<{ chatId?: string; kind: string; event?: WireMessageEvent }>;
@@ -454,16 +461,16 @@ const CASES: Case[] = [
           resolvePerson: async () => ({ username: "ann", displayName: "Ann (organizer)", role: "organizer" }),
           beforeMarks: async (_turn, routed, ctx) => {
             seen.push(`${routed.tripId === fix.tripId}|${ctx.event.source.user_name}|${ctx.event.text}`);
-            return { kind: "reply", reply: { chatId: turn.chatId, text: "handled elsewhere" } };
+            return { kind: "platform_route", note: "handled elsewhere" };
           },
         }),
       );
-      return [decision, { kind: "drop", reason: seen.join(",") } as GateDecision];
+      return [decision, { kind: "drop", reason: seen.join(",") } as GateDecision<PlatformDecision>];
     },
     expect(d) {
-      const [decision, seen] = d as unknown as Array<{ kind: string; reply?: { text: string }; reason?: string }>;
-      assert.equal(decision!.kind, "reply");
-      assert.equal(decision!.reply!.text, "handled elsewhere");
+      const [decision, seen] = d as unknown as Array<{ kind: string; note?: string; reason?: string }>;
+      assert.equal(decision!.kind, "platform_route");
+      assert.equal(decision!.note, "handled elsewhere");
       assert.equal(seen!.reason, "true|Ann (organizer)|Liv, add this");
     },
   },
@@ -556,6 +563,45 @@ const CASES: Case[] = [
       assert.deepEqual(namedAgain, { kind: "drop", reason: "COMPANION_UNAVAILABLE_NOTICE_LIMITED" });
     },
   },
+  // ── F1/F3: the gate does not trust its caller for the route, the profile, the chat or the sender ──
+  ...(
+    [
+      ["an unbound route", (o: Record<string, unknown>, fix: Fixture) => { o.route = { kind: "unbound" }; void fix; }],
+      ["an interview route", (o: Record<string, unknown>, fix: Fixture) => { o.route = { kind: "interview", sessionId: "s", tripId: fix.tripId }; }],
+      ["a profile that is not the route's", (o: Record<string, unknown>) => { (o.event as WireMessageEvent).source.profile = "companion-someone-else"; }],
+      ["a route with no profile", (o: Record<string, unknown>, fix: Fixture) => { o.route = route(fix, null); }],
+      ["an event for a different chat", (o: Record<string, unknown>) => { (o.event as WireMessageEvent).source.chat_id = "-1009999999"; }],
+      ["an event from a different sender", (o: Record<string, unknown>) => { (o.event as WireMessageEvent).source.user_id = "999"; }],
+    ] as const
+  ).map(([what, tamper]): Case => ({
+    name: `ROUTE_MISMATCH: ${what} is dropped before anything is read, written or forwarded`,
+    async run(platform, fix) {
+      const lines: string[] = [];
+      const judge = scriptedJudge(YES);
+      const context = new GroupContext();
+      const turn = turnFor(platform, { text: "Liv, where is the hotel?" });
+      const outcome = eventOutcome(turn, fix) as unknown as Record<string, unknown>;
+      tamper(outcome, fix);
+      await fix.pool.query("UPDATE control_plane.telegram_chat_bindings SET proactive_level = 3 WHERE chat_id = $1", [turn.chatId]);
+      const decision = await companionGate(
+        turn,
+        outcome as unknown as GateOutcome,
+        depsFor(fix, { log: (line) => lines.push(line), groupJudge: judge, groupContext: context, assistantEvents: true, beforeMarks: async () => { lines.push("beforeMarks ran"); return null; } }),
+      );
+      // No window was opened for the sender, the judge was never asked, and the one line logged names no text or id.
+      const opened = await fix.pool.query("SELECT 1 FROM control_plane.telegram_chat_bindings WHERE chat_id = $1 AND conversation_until IS NOT NULL", [turn.chatId]);
+      assert.equal(opened.rowCount, 0, "no conversation window was opened");
+      assert.equal(judge.calls.length, 0);
+      assert.ok(!lines.includes("beforeMarks ran"), "the platform hook did not run");
+      assert.equal(lines.length, 1);
+      assert.match(lines[0]!, /trip_bot\.route_mismatch/);
+      assert.ok(!lines[0]!.includes("hotel") && !lines[0]!.includes(turn.chatId) && !lines[0]!.includes(fix.tripId), "the log line carries no text and no id");
+      return decision;
+    },
+    expect(d) {
+      assert.deepEqual(d, { kind: "drop", reason: "ROUTE_MISMATCH" });
+    },
+  })),
   {
     name: "every other drop reason is a drop with that reason",
     async run(platform, fix) {

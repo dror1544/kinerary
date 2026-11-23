@@ -54,6 +54,9 @@ export type { AttachmentRef, HeldAttachment };
 /** The companion route of a chat: the trip, its assistant's profile and wake-words. */
 export type CompanionRoute = Extract<ChatRoute, { kind: "companion" }>;
 
+/** A companion route whose assistant is installed: the only route a turn is forwarded on. */
+export type RoutedCompanionRoute = CompanionRoute & { hermesProfile: string };
+
 /**
  * One inbound message, in the platform-neutral shape the gate reads. A platform
  * builds it from its own message; the gate never sees the message itself.
@@ -107,8 +110,12 @@ export type GateOutcome =
       kind: "event";
       /** Text only. Media is attached here, once the turn is known to go to the assistant. */
       event: WireMessageEvent;
-      route: ChatRoute;
-      attachment?: AttachmentRef | null;
+      /**
+       * A companion route with a profile - what `resolveInbound` returns for a
+       * routed chat. The type says so and the gate checks it anyway (see
+       * `routeMismatch`): a second platform's loop is a second caller.
+       */
+      route: RoutedCompanionRoute;
     }
   | { kind: "dropped"; reason: string; route?: ChatRoute };
 
@@ -130,8 +137,8 @@ export type GateDecision<Extra = never> =
 
 /** What `beforeMarks` is handed beyond the turn and route: the event as it stands, and the analytics builders. */
 export interface BeforeMarksContext {
-  /** The wire event for this turn, sender already named as the trip knows them. */
-  event: WireMessageEvent;
+  /** The wire event for this turn, sender already named as the trip knows them. Read-only: only the gate edits it. */
+  readonly event: Readonly<WireMessageEvent>;
   /** The gate's verdict as metadata, for the sender's link role. */
   facts(linkRole: string | null | undefined): InboundFacts;
   /** Spreads `{ analytics }` only while assistant events are on; a throwing `build` costs the descriptor, never the decision. */
@@ -147,10 +154,13 @@ export interface GateDeps<Extra = never> {
   /**
    * The platform's own route, run after the sender is identified and the
    * conversation window written, and before any mark. A decision ends the turn;
-   * null lets the marks and the forward go on. Telegram supplies the organizer's
+   * null lets the marks and the forward go on. It can return only the platform's
+   * own decision type (`Extra`), never one of the gate's: a hook that could
+   * return `to_gateway` would skip the marks, the overheard block and the
+   * attachment scoping. Telegram supplies the organizer's
    * document route here, at the position it always had.
    */
-  beforeMarks?(turn: InboundTurn, route: CompanionRoute, context: BeforeMarksContext): Promise<GateDecision<Extra> | null>;
+  beforeMarks?(turn: InboundTurn, route: CompanionRoute, context: BeforeMarksContext): Promise<Extra | null>;
   /** Downloads one attachment by its reference. With `mediaStore` and `mediaBaseUrl`, switches re-hosting on. */
   fetchAttachment?(ref: string, maxBytes: number): Promise<FetchedFile | null>;
   mediaStore?: MediaStore;
@@ -197,6 +207,12 @@ async function eventTurn<Extra>(
   deps: GateDeps<Extra>,
 ): Promise<GateDecision<Extra>> {
   const { log, db } = deps;
+  const mismatch = routeMismatch(turn, outcome);
+  if (mismatch) {
+    // The reason only: no text, no id. The drop itself is logged again by the loop that applies it.
+    log(structuredLog("warn", "trip_bot.route_mismatch", { check: mismatch }));
+    return { kind: "drop", reason: "ROUTE_MISMATCH" };
+  }
   const chatId = turn.chatId;
   const attachment = turn.attachment;
   // The relevance gate. A DM is addressed by construction; a group message
@@ -211,22 +227,19 @@ async function eventTurn<Extra>(
   // unconditionally, ahead of the ordinary gate below: the atomic claim also
   // clears the window on a hit, so a second message, even one still inside the
   // window, finds nothing left to claim (one-shot).
-  // `route.kind === "companion"` is structural, not a real branch here -
-  // normalisation never reaches this point for an interview or unbound chat -
-  // mirrored only to match the ternary just below it.
-  //
   // It also reads the group's proactive level (level 1 admits nothing through
   // it), a column a relay running ahead of its migration does not have: a
   // failed claim degrades to "no window", as the conversation window's reads
   // below do, rather than failing the update.
-  const senderId = outcome.event.source.user_id;
-  const inGroup = outcome.route.kind === "companion" && outcome.event.source.chat_type !== "dm";
+  // The sender is the turn's; `routeMismatch` has checked the event says the same.
+  const senderId = turn.senderId;
+  const inGroup = outcome.event.source.chat_type !== "dm";
   // EXPLICIT addressing: the assistant's name, an @mention of the bot, or a reply
   // to one of its messages. Decided on the message alone - no window, no model.
   const explicitlyAddressed = isAddressedToAssistant({
     chatType: outcome.event.source.chat_type,
     text: outcome.event.text,
-    assistantNames: outcome.route.kind === "companion" ? outcome.route.assistantNames : [],
+    assistantNames: outcome.route.assistantNames,
     botUsername: deps.assistantHandle,
     isReplyToAssistant,
   });
@@ -250,14 +263,12 @@ async function eventTurn<Extra>(
   const explicitHere = explicitlyAddressed && (!reactionOnly || reactionAnswersQuestion);
 
   let capturedAsReply = false;
-  if (outcome.route.kind === "companion") {
-    try {
-      capturedAsReply = await consumeExpectsReplyWindow(db, chatId);
-    } catch (error) {
-      log(structuredLog("warn", "trip_bot.reply_window_read_failed", {
-        safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
-      }));
-    }
+  try {
+    capturedAsReply = await consumeExpectsReplyWindow(db, chatId);
+  } catch (error) {
+    log(structuredLog("warn", "trip_bot.reply_window_read_failed", {
+      safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+    }));
   }
 
   // Booleans only in the log: no chat or user id beyond what other events carry.
@@ -298,7 +309,7 @@ async function eventTurn<Extra>(
   let judged: JudgeOutcome | null = null;
   if (
     !addressedOtherwise && !capturedByConversation && inGroup && senderId &&
-    deps.groupJudge?.model() && outcome.route.kind === "companion" && judgeableText(outcome.event.text)
+    deps.groupJudge?.model() && judgeableText(outcome.event.text)
   ) {
     if (deps.judgedOutcome !== undefined) {
       // Second pass of a deferred judgement: the verdict is already in.
@@ -316,9 +327,8 @@ async function eventTurn<Extra>(
   // `withAnalytics`, which never calls it while assistant events are off.
   // The text is taken here, before anything is prefixed to it.
   const heardText = outcome.event.text;
-  const routedTripId = outcome.route.kind === "companion" ? outcome.route.tripId : null;
+  const routedTripId = outcome.route.tripId;
   const seen = (linkRole: string | null | undefined): InboundFacts => {
-    if (!routedTripId) throw new Error("NOT_COMPANION_ROUTE");
     const facts = inboundFacts({
       tripId: routedTripId,
       // The platform's own type for the channel; the gate's mapped one for the trigger.
@@ -330,7 +340,7 @@ async function eventTurn<Extra>(
         capturedByJudge,
         chatType: outcome.event.source.chat_type,
         text: heardText,
-        assistantNames: outcome.route.kind === "companion" ? outcome.route.assistantNames : [],
+        assistantNames: outcome.route.assistantNames,
         botUsername: deps.assistantHandle,
         isReplyToAssistant,
       }),
@@ -377,7 +387,7 @@ async function eventTurn<Extra>(
       kind: "drop",
       reason: "NOT_ADDRESSED",
       ...(await withAnalytics(deps.assistantEvents, log, async () => ({
-        ...seen(senderId && routedTripId ? (await deps.resolvePerson(routedTripId, senderId))?.role : null),
+        ...seen(senderId ? (await deps.resolvePerson(routedTripId, senderId))?.role : null),
         ...(held ? { documentHeld: true } : {}),
       }))),
     };
@@ -409,8 +419,8 @@ async function eventTurn<Extra>(
   // their family calls them, and the alternative is a blank where a person
   // should be.
   let senderLinkRole: string | null = null;
-  if (outcome.route.kind === "companion" && outcome.event.source.user_id) {
-    const person = await deps.resolvePerson(outcome.route.tripId, outcome.event.source.user_id);
+  if (senderId) {
+    const person = await deps.resolvePerson(outcome.route.tripId, senderId);
     senderLinkRole = person?.role ?? null;
     if (person?.displayName) {
       outcome.event.source.user_name = person.displayName;
@@ -421,7 +431,7 @@ async function eventTurn<Extra>(
   // the organizer after confirmation, which is read and proposed back rather than
   // handed to the companion). It runs here: after the sender is identified, before
   // anything is marked, and only for a turn that is going to the assistant.
-  if (outcome.route.kind === "companion" && deps.beforeMarks) {
+  if (deps.beforeMarks) {
     const early = await deps.beforeMarks(turn, outcome.route, {
       event: outcome.event,
       facts: seen,
@@ -498,6 +508,30 @@ async function eventTurn<Extra>(
       documents: (forwarded.media ?? []).filter((m) => m.kind === "document").length,
     }))),
   };
+}
+
+/**
+ * Whether the caller's outcome contradicts itself, and which check said so.
+ *
+ * The gate forwards `outcome.event` to the gateway stamped with the profile it
+ * carries - the Trip Context Gateway decision - so the event must be the one
+ * the route belongs to: the route a companion with an installed assistant, the
+ * profile on the event that route's, the chat the turn's own, and the sender
+ * the turn's. A caller that built the event from one message and the route from
+ * another would otherwise get a turn delivered to the wrong trip's assistant.
+ * Nothing in production can do that today (the Telegram path builds both from
+ * one chat id); the check is there for the second platform's loop. The values
+ * returned are codes, never ids.
+ */
+function routeMismatch(turn: InboundTurn, outcome: GateOutcome & { kind: "event" }): string | null {
+  const route: ChatRoute = outcome.route;
+  if (route.kind !== "companion") return "route_kind";
+  if (!route.hermesProfile) return "no_profile";
+  const source = outcome.event.source;
+  if (source.profile !== route.hermesProfile) return "profile";
+  if (source.chat_id !== turn.chatId) return "chat";
+  if (source.user_id !== turn.senderId) return "sender";
+  return null;
 }
 
 // ── The pending-companion branch ────────────────────────────────────────────────

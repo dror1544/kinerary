@@ -19,7 +19,7 @@
 import type pg from "pg";
 import { resolveChatRoute, type ChatRoute } from "../chat-router.js";
 import type { MediaKind } from "./media-store.js";
-import { attachMediaWith, sniffContentType, type RehostDeps } from "./companion-gate.js";
+import { attachMediaWith, sniffContentType, type RehostDeps, type RoutedCompanionRoute } from "./companion-gate.js";
 import type { AttachmentRef } from "./pending-attachments.js";
 import type { ChatType, WireMessageEvent, WireSessionSource } from "./protocol.js";
 
@@ -192,7 +192,7 @@ export type NormalizeOutcome =
       kind: "event";
       /** Text only. Media is attached by the caller, once it knows the turn goes to the assistant. */
       event: WireMessageEvent;
-      route: ChatRoute;
+      route: RoutedCompanionRoute;
       /** What the message carries, as a reference — nothing has been downloaded. */
       attachment: Attachment | null;
     }
@@ -357,7 +357,7 @@ export type ReachabilityCheck = (profile: string) => boolean;
  * `normalizeUpdate` leaves it off (its shape is pinned).
  */
 export type InboundResolution =
-  | { kind: "routed"; route: Extract<ChatRoute, { kind: "companion" }> & { hermesProfile: string } }
+  | { kind: "routed"; route: RoutedCompanionRoute }
   | { kind: "dropped"; reason: "UNROUTED" | "INTERVIEW" | "COMPANION_PENDING"; route?: ChatRoute };
 
 export async function resolveInbound(
@@ -402,7 +402,7 @@ export async function resolveInbound(
   if (canReach && !canReach(route.hermesProfile)) return { kind: "dropped", reason: "COMPANION_PENDING", route };
 
   // The very object the lookup returned (tests compare routes), narrowed by the check above.
-  return { kind: "routed", route: route as Extract<ChatRoute, { kind: "companion" }> & { hermesProfile: string } };
+  return { kind: "routed", route: route as RoutedCompanionRoute };
 }
 
 /**
