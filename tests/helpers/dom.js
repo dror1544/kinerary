@@ -48,7 +48,11 @@ function getRenderCode() {
  *   a few plan strings doesn't drop the defaults every other test relies on.
  */
 export function createRenderContext(html = '', cfg = {}, lang = 'he', extra = {}) {
-  const win = new Window({ url: 'http://localhost/' });
+  // No script file is ever fetched: renderTelegramLogin() injects the Telegram
+  // widget's <script src=https://telegram.org/...>, and happy-dom would load it
+  // over the network. The tests read that element's attributes, never its
+  // result, so a live fetch only made the suite depend on a third party.
+  const win = new Window({ url: 'http://localhost/', settings: { disableJavaScriptFileLoading: true } });
   const doc = win.document;
   doc.body.innerHTML = html;
 
