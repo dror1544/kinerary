@@ -812,7 +812,9 @@ is different — the exchange key is written into a site's `.env` when the worke
 **builds** it, so a trip built before the key was set cannot be launched from the
 portal until its identity sidecar and key are installed (see
 `docs/runtime-session-exchange.md`, "Existing runtimes need…"). Set the key before
-the trips that should be reachable are built, or install it on the existing ones.
+the trips that should be reachable are built, or install it on the existing ones. Turning
+on per-trip keys is a rotation of this key, in the order set out under "Rolling it out" in
+`docs/runtime-session-exchange.md`; it is not "copy the current key into the legacy variable".
 
 ### What to set (`vm.env`; names only — `vm.env.example` has the commented list)
 
@@ -821,7 +823,9 @@ the trips that should be reachable are built, or install it on the existing ones
 | `COMPOSE_PROFILES` | `web` switches the two services on. The release tool reads it from `provisioning.env`/`vm.env` (later wins), so upgrade, verify and rollback follow it |
 | `KINERARY_ARCHITECTURE_PROFILE` | absolute path of the architecture profile **with** a `web` block. Unset, the stack mounts the repository's `architecture.local.example.json` as before |
 | `PORTAL_ORIGIN`, `RUNTIME_ORIGIN` | the two public `https://` origins, exactly as the profile's `web.public_origin` / `web.runtime_origin` |
-| `RUNTIME_EXCHANGE_KEY` | one secret shared by the api (`env://RUNTIME_EXCHANGE_KEY` in the profile), the gateway and every trip site; the worker is handed it as `CONTROL_PLANE_EXCHANGE_KEY` |
+| `RUNTIME_EXCHANGE_KEY` | the secret the api (`env://RUNTIME_EXCHANGE_KEY` in the profile) and the gateway share; the worker is handed it as `CONTROL_PLANE_EXCHANGE_KEY`. Every trip site holds it too **until per-trip keys are on**; from then on a trip site holds a key of its own (or, if it has not been re-keyed, the previous value of this one, as `RUNTIME_LEGACY_TRIP_KEY`), and turning them on means **rotating this key** (see the paragraph above) |
+| `RUNTIME_TRIP_KEY_MASTER`, `RUNTIME_LEGACY_TRIP_KEY` | optional, off when empty: per-trip keys (`docs/runtime-session-exchange.md`, "Per-trip keys"). The master goes to the gateway and the worker only (the worker reads it as `CONTROL_PLANE_TRIP_KEY_MASTER`); the legacy key, to the gateway only, is the **previous** `RUNTIME_EXCHANGE_KEY`. With the master set the gateway refuses to start if any two of the exchange key, the master and the legacy key are equal, and the worker refuses to start if the master equals the exchange key |
+| `TRIP_MCP_BRIDGE`, `TRIP_MCP_SHARED_SITE_URL` | `TRIP_MCP_BRIDGE=shared` puts every trip behind one bridge process (`mcp/README.md`, "Shared mode"). `TRIP_MCP_SHARED_SITE_URL`, `http(s)://<host>:<port>`, is the bridge as a trip **container** reaches it: required with `shared`, refused without it. A new trip's `.env` gets `HERMES_URL=<it>`, and the worker checks from inside the container, after the trip is wired, that the bridge answers there. The bridge must listen on an address containers can reach (`MCP_BIND_HOST`, loopback by default) |
 | `RUNTIME_COOKIE_SECRET` | the gateway's cookie-sealing secret: at least 32 random bytes, independent of every other secret |
 | `WEB_BIND_IP`, `PORTAL_PORT`, `RUNTIME_GATEWAY_PORT` | where the ingress reaches the two services. Loopback (`127.0.0.1`), `4173` and `4320` unless set — the same posture as `CONTROL_PLANE_BIND_IP` for the api |
 | `RUNTIME_PUBLIC_SUFFIXES`, `RUNTIME_SAME_SITE_OK`, `RUNTIME_UPSTREAM_TIMEOUT_MS` | gateway tuning, usually unset (see "Same site" below) |

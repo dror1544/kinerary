@@ -9,6 +9,11 @@
 #     string is whatever the caller typed after `ssh host …`, and honouring any
 #     part of it is what turns a single-purpose key into general host
 #     execution. It is not read, not logged, not branched on.
+#   - Which KIND of bridge a companion is wired to (one `mcp.js` per trip, or the
+#     one shared process) is this host's own decision, read from this script's
+#     environment (KINERARY_SHARED_BRIDGE_ROUTES_DIR and _URL; see "The SHARED
+#     trip-mcp bridge" below). No request field can turn it on or choose where it
+#     writes or what it talks to.
 #   - No arguments are accepted. Invocation shape is fixed.
 #   - Every host-side path is derived here. The handoff names a profile; it
 #     does not choose where anything is written.
@@ -619,9 +624,114 @@ PY
     return 0
   fi
 
-  local secret
-  secret="$(cat "$secret_file")"
-  [ -n "$secret" ] || {
+  # `relay.gateway_key_mode` (#597 K1) from the SAME profile the relay reads, so
+  # what is written here and what the relay accepts cannot be set apart. Absent
+  # is `shared`: the shared secret itself, as before. `both` and `derived` write
+  # derive(DERIVATION master, this profile's id) instead, where the derivation
+  # master is `relay.gateway_key_master_refs[0]`: a secret no gateway profile has
+  # held, never the shared secret, and it never reaches a profile's .env. Anything
+  # else is refused rather than guessed at: writing the shared secret under a mode
+  # this script does not know is the downgrade to avoid, and the relay refuses to
+  # load such a profile anyway.
+  local key_mode
+  key_mode="$(/usr/bin/python3 - "$ARCH_PROFILE" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1])).get("relay") or {}
+mode = r["gateway_key_mode"] if "gateway_key_mode" in r else "shared"
+print(mode if mode in ("shared", "both", "derived") else "INVALID")
+PY
+  )" || key_mode="INVALID"
+  if [ "$key_mode" = INVALID ]; then
+    printf 'companion-install-host: relay.gateway_key_mode in %s is not shared, both or derived; %s left UNENROLLED\n' \
+      "$ARCH_PROFILE" "$name" >&2
+    return 0
+  fi
+
+  # In `both` and `derived` the key is derived from the derivation master, not
+  # from the shared secret every profile holds. Refused, with nothing written,
+  # when it is missing, unreadable, not a file:// reference, or EQUAL to a shared
+  # secret (the relay refuses to start on that too). Only paths go on argv here;
+  # the values are compared inside the Python and never printed. A gateway id the
+  # derivation does not accept (a ':' in it, or one beginning with the label) is
+  # refused the same way.
+  if [ "$key_mode" != shared ]; then
+    local master_check master_verdict
+    master_check="$(/usr/bin/python3 - "$ARCH_PROFILE" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1])).get("relay") or {}
+refs = [x for x in (r.get("gateway_key_master_refs") or []) if isinstance(x, str)]
+if not refs:
+    print("MISSING"); sys.exit(0)
+if not refs[0].startswith("file://"):
+    print("NOTFILE"); sys.exit(0)
+
+
+def read(ref):
+    try:
+        with open(ref[len("file://"):]) as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+import os
+
+
+def read_shared(ref):
+    if isinstance(ref, str) and ref.startswith("env://"):
+        return os.environ.get(ref[len("env://"):], "").strip() or None
+    return read(ref) if isinstance(ref, str) and ref.startswith("file://") else None
+
+
+masters = [read(x) if x.startswith("file://") else None for x in refs]
+if not masters[0]:
+    print("UNREADABLE"); sys.exit(0)
+# Every master and every shared secret must be READ before a key is written, as
+# relay-rekey.py does: one that cannot be read here (vault://, an unset variable,
+# an unreadable file) cannot be proved different, and a master equal to a shared
+# secret writes a key no running relay accepts.
+if not all(masters):
+    print("MASTERUNREADABLE"); sys.exit(0)
+shared_refs = r.get("gateway_secret_refs")
+shared = [read_shared(x) for x in (shared_refs if isinstance(shared_refs, list) else [])]
+if not all(shared):
+    print("SHAREDUNREADABLE"); sys.exit(0)
+if any(m == s for m in masters for s in shared):
+    print("EQUAL"); sys.exit(0)
+print("OK")
+print(refs[0][len("file://"):])
+PY
+    )" || master_check="UNREADABLE"
+    master_verdict="${master_check%%$'\n'*}"
+    case "$master_verdict" in
+      OK) secret_file="${master_check#*$'\n'}" ;;
+      MISSING)
+        printf 'companion-install-host: relay.gateway_key_mode is %s but relay.gateway_key_master_refs is missing in %s; %s left UNENROLLED\n' \
+          "$key_mode" "$ARCH_PROFILE" "$name" >&2
+        return 0 ;;
+      SHAREDUNREADABLE)
+        printf 'companion-install-host: a relay.gateway_secret_refs entry in %s cannot be read here (only file:// and env:// can), so the derivation master cannot be proved different from it; %s left UNENROLLED\n' \
+          "$ARCH_PROFILE" "$name" >&2
+        return 0 ;;
+      EQUAL)
+        printf 'companion-install-host: a relay.gateway_key_master_refs secret equals a relay.gateway_secret_refs secret in %s (the derivation master must be one no gateway profile has held); %s left UNENROLLED\n' \
+          "$ARCH_PROFILE" "$name" >&2
+        return 0 ;;
+      *)
+        printf 'companion-install-host: relay.gateway_key_master_refs in %s is not readable file:// references (%s); %s left UNENROLLED\n' \
+          "$ARCH_PROFILE" "$master_verdict" "$name" >&2
+        return 0 ;;
+    esac
+    case "$name" in
+      *:*|kinerary-relay-gateway:*)
+        printf 'companion-install-host: gateway id %s cannot take a derived key; %s left UNENROLLED\n' "$name" "$name" >&2
+        return 0 ;;
+    esac
+  fi
+
+  # The key itself is read from its file by the Python below and never passes
+  # through a shell variable or a command line: argv is visible to `ps`.
+  [ -n "$(tr -d '[:space:]' < "$secret_file")" ] || {
     printf 'companion-install-host: relay secret file is empty; %s left UNENROLLED\n' "$name" >&2
     return 0
   }
@@ -644,9 +754,34 @@ PY
   # copies of GATEWAY_RELAY_ID with different values is a worse state than none.
   umask 077
   touch "$env_file"
-  /usr/bin/python3 - "$env_file" "$relay_url" "$name" "$secret" "$sandbox_dir" <<'PY'
+  /usr/bin/python3 - "$env_file" "$relay_url" "$name" "$secret_file" "$sandbox_dir" "$key_mode" <<'PY'
 import base64, hashlib, hmac, sys
-env_path, url, gid, secret, sandbox_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+env_path, url, gid, secret_file, sandbox_dir, key_mode = sys.argv[1:7]
+with open(secret_file) as fh:
+    # `shared`: the shared secret. `both`/`derived`: the DERIVATION master
+    # (relay.gateway_key_master_refs[0]), chosen by the caller above.
+    master = fh.read().strip()
+if not master:
+    sys.exit("relay secret file is empty")
+
+
+def derive_gateway_key(master_key, gateway_id):
+    # hex(HMAC-SHA256(master, "kinerary-relay-gateway:v1:" + id)): the same
+    # function as deriveGatewayKey in control-plane/api/src/relay/protocol.ts,
+    # pinned to it by control-plane/api/test/fixtures/relay-key-vectors.json. The
+    # hex string is then used as the HMAC KEY STRING, exactly as the master was.
+    # An id with ':' has no derived key (derived keys and token signatures are
+    # kept in separate domains), and neither does one that begins with the label.
+    label = "kinerary-relay-gateway:v1:"
+    if not gateway_id or ":" in gateway_id:
+        sys.exit("a gateway id with ':' has no derived key")
+    return hmac.new(master_key.encode(), (label + gateway_id).encode(), hashlib.sha256).hexdigest()
+
+
+# `shared` hands the shared secret out; `both` and `derived` hand out only the
+# key derived for this id, so neither the shared secret nor the derivation master
+# is added to a profile's .env by this script in those modes.
+secret = master if key_mode == "shared" else derive_gateway_key(master, gid)
 
 
 def control_token(gateway_id, key):
@@ -977,6 +1112,347 @@ gateway_registered_trip_mcp() {
   return 1
 }
 
+# ── The SHARED trip-mcp bridge (docs/specs/sprint-9/x-wildcard-host-and-shared-bridge.md, B2) ──
+#
+# One `mcp.js` process (MCP_ROUTES_DIR set) serves every trip. Wiring a companion
+# to it starts no process and allocates no port: it writes ONE route file into
+# the directory that process reads (the trip's site address and agent key, and
+# only the HASH of the companion's token) and ONE `mcp_servers.trip-mcp` entry
+# into the profile, whose header names the token rather than holding it.
+#
+# WHETHER THIS HOST DOES THAT IS THIS HOST'S DECISION, never the request's: it is
+# on only when this script's own environment sets BOTH variables below. A request
+# can name a slug and a profile; it cannot name a mode, a directory or a URL. Set
+# the variables for the forced command in authorized_keys the same way
+# KINERARY_DEPLOY_ROOT is.
+#
+#   KINERARY_SHARED_BRIDGE_ROUTES_DIR  an absolute path to an existing directory
+#                                      (not a symlink) the shared bridge reads
+#   KINERARY_SHARED_BRIDGE_URL         http://127.0.0.1:<port> or http://localhost:<port>
+#
+# Loopback only, and that is a security rule rather than a convenience: the
+# companion's token and every health probe travel on this URL in the clear, so it
+# must never be a hop on a network. A shared bridge on another machine needs a
+# transport this script does not pretend to have.
+#
+# One variable without the other is NOT shared mode and is said so, loudly: an
+# unset flag that quietly downgrades a path is this repository's recurring bug
+# class. A bad value for both is a refusal, never a fallback to per-trip wiring.
+SHARED_BRIDGE_STATE=""     # "" = not decided yet, then "on" or "off"
+SHARED_ROUTES_DIR=""
+SHARED_URL=""
+
+shared_bridge_decide() {
+  local dir="${KINERARY_SHARED_BRIDGE_ROUTES_DIR:-}" url="${KINERARY_SHARED_BRIDGE_URL:-}" re port
+  SHARED_BRIDGE_STATE=off
+  [ -n "$dir" ] || [ -n "$url" ] || return 0
+  if [ -z "$dir" ] || [ -z "$url" ]; then
+    printf 'companion-install-host: only one of KINERARY_SHARED_BRIDGE_ROUTES_DIR and KINERARY_SHARED_BRIDGE_URL is set; shared mode is OFF and companions are wired per trip\n' >&2
+    return 0
+  fi
+  case "$dir" in
+    /*) ;;
+    *) die "KINERARY_SHARED_BRIDGE_ROUTES_DIR is not an absolute path" ;;
+  esac
+  # The directory becomes a path argument and a log fragment: ASCII path
+  # characters and the space a macOS home directory may hold, nothing a line
+  # break or a quote could use.
+  case "$dir" in
+    *[!A-Za-z0-9._/' '-]*) die "KINERARY_SHARED_BRIDGE_ROUTES_DIR holds a character a path here may not" ;;
+  esac
+  if [ -L "$dir" ] || [ ! -d "$dir" ]; then
+    die "KINERARY_SHARED_BRIDGE_ROUTES_DIR is not an existing directory, or is a symlink"
+  fi
+  [ -w "$dir" ] || die "KINERARY_SHARED_BRIDGE_ROUTES_DIR is not writable by this user"
+  # The pattern lives in a variable: bash 3.2 (the macOS /bin/bash) treats a quoted
+  # right-hand side of =~ as a literal string.
+  re='^http://(127\.0\.0\.1|localhost):([0-9]{1,5})$'
+  if ! [[ "$url" =~ $re ]]; then
+    die "KINERARY_SHARED_BRIDGE_URL must be http://127.0.0.1:<port> or http://localhost:<port> (loopback only: the token travels on it in the clear)"
+  fi
+  port="${BASH_REMATCH[2]}"
+  if [ "$((10#$port))" -lt 1 ] || [ "$((10#$port))" -gt 65535 ]; then
+    die "KINERARY_SHARED_BRIDGE_URL has a port outside 1-65535"
+  fi
+  SHARED_ROUTES_DIR="$dir"
+  SHARED_URL="$url"
+  SHARED_BRIDGE_STATE=on
+}
+
+# Call at top level (`if shared_bridge_on; then`), never inside $( ): a die in a
+# command substitution would end only the substitution.
+shared_bridge_on() {
+  [ -n "$SHARED_BRIDGE_STATE" ] || shared_bridge_decide
+  [ "$SHARED_BRIDGE_STATE" = on ]
+}
+
+# The shared bridge's own "is the process up" question. No key: /ready is the
+# route that exists so a supervisor holding no token can ask it.
+shared_bridge_ready() {
+  local body
+  body="$(curl -sS --max-time 5 "$SHARED_URL/ready" 2>/dev/null || true)"
+  case "$body" in
+    *'"ok":true'*) return 0 ;;
+  esac
+  return 1
+}
+
+# The companion's token, from ITS profile's .env, if there and well formed; empty
+# otherwise. Well formed matters beyond tidiness: the value is placed inside a
+# curl config file, where a quote would end the string it sits in.
+shared_profile_token() {
+  local t
+  t="$(sed -n 's/^TRIP_MCP_TOKEN=//p' "$HOME/.hermes/profiles/$PROFILE_NAME/.env" 2>/dev/null | head -1 | tr -d "\"'\\r" || true)"
+  case "$t" in
+    ''|*[!A-Za-z0-9._~+/=-]*) return 0 ;;
+  esac
+  if [ "${#t}" -ge 16 ] && [ "${#t}" -le 256 ]; then printf '%s' "$t"; fi
+  return 0
+}
+
+# CAN THE SHARED BRIDGE REACH THIS TRIP, asked with THIS trip's token. Sets
+# BRIDGE_HEALTH / BRIDGE_HEALTH_CODE like bridge_reaches_trip does, so the install
+# path and the probe read one vocabulary, plus two codes of its own:
+#   NO_ROUTE   there is no route file for the trip in the bridge's directory
+#   NO_KEY     the profile holds no (well-formed) TRIP_MCP_TOKEN to ask with
+# BRIDGE_401 here means the bridge does not know the token: the route file is not
+# the one it is reading, or has not been picked up yet (it rescans once a second).
+shared_bridge_health() {
+  local token body
+  BRIDGE_HEALTH_CODE=""
+  if [ ! -f "$SHARED_ROUTES_DIR/$TRIP_SLUG.json" ]; then
+    BRIDGE_HEALTH="no route file for $TRIP_SLUG"
+    BRIDGE_HEALTH_CODE="NO_ROUTE"
+    return 1
+  fi
+  token="$(shared_profile_token)"
+  if [ -z "$token" ]; then
+    BRIDGE_HEALTH="no TRIP_MCP_TOKEN in the profile for $TRIP_SLUG"
+    BRIDGE_HEALTH_CODE="NO_KEY"
+    return 1
+  fi
+  # `--config -`: the token arrives on stdin and never on a command line.
+  body="$(printf 'url = "%s/health"\nheader = "X-API-Key: %s"\nsilent\nshow-error\nmax-time = 15\n' \
+            "$SHARED_URL" "$token" | curl --config - 2>/dev/null || true)"
+  case "$body" in
+    *'"ok":true'*) return 0 ;;
+  esac
+  BRIDGE_HEALTH="${body:-no answer from the shared bridge}"
+  BRIDGE_HEALTH_CODE="$(bridge_health_code "$body")"
+  return 1
+}
+
+# The trip's agent key, into $WORK/trip-key (a file in the 0700 temp dir, so it
+# is never a command-line argument and never printed). A deployment hook first:
+# it lives in the deployment's own repository, outside this one, because where
+# trip keys are kept is that deployment's business. A hook that exists and fails
+# is a failure, NOT a reason to fall back to whatever an old mcp/.env still holds:
+# that is how a rotated key silently stays the old one. Without the hook, the
+# trip's own mcp/.env (TRIP_API_KEY, then MCP_API_KEY).
+shared_trip_key_file() {
+  local hook="$DEPLOY_ROOT/trip-agent-key.sh" envf="$TRIP_DIR/mcp/.env" name k=""
+  if [ -f "$hook" ] && [ -x "$hook" ]; then
+    # At most 4 KiB: the validator below refuses anything long, and a runaway hook
+    # must not fill the disk through the forced command.
+    "$hook" "$TRIP_SLUG" < /dev/null 2>/dev/null | head -c 4097 > "$WORK/trip-key" \
+      || die "trip-agent-key.sh failed for $TRIP_SLUG"
+    return 0
+  fi
+  for name in TRIP_API_KEY MCP_API_KEY; do
+    k="$(sed -n "s/^${name}=//p" "$envf" 2>/dev/null | head -1 | tr -d "\"'\\r" || true)"
+    [ -z "$k" ] || break
+  done
+  [ -n "$k" ] || die "no agent key for $TRIP_SLUG: there is no executable trip-agent-key.sh in $DEPLOY_ROOT, and no TRIP_API_KEY or MCP_API_KEY in $envf"
+  printf '%s\n' "$k" > "$WORK/trip-key"
+}
+
+# Written to a file for the same macOS bash 3.2 reason as the topology reader.
+# Every value that matters arrives as a FILE or an argument that is not a secret:
+# the key from $WORK/trip-key, the token from (and into) the profile's .env.
+write_shared_wire_script() {
+  cat > "$WORK/shared_wire.py" <<'PYWIRE'
+import hashlib, json, os, re, secrets, sys, tempfile
+import yaml
+
+KEY_RE = re.compile(r"[A-Za-z0-9._~+/=-]{16,256}")
+routes_dir, slug, api_base, keyfile, profile_dir, bridge_url = sys.argv[1:7]
+
+
+def fail(message):
+    print("companion-install-host: " + message, file=sys.stderr)
+    raise SystemExit(2)
+
+
+def atomic_write(path, text, mode):
+    """Temp file in the SAME directory (so the rename cannot cross a filesystem),
+    created 0600 and exclusively, then renamed over the target."""
+    fd, tmp = tempfile.mkstemp(prefix="." + os.path.basename(path) + ".", suffix=".tmp", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# 1. The trip's agent key: one line, in the allowed alphabet, and nothing else.
+raw = open(keyfile, "rb").read()
+try:
+    text = raw.decode("ascii")
+except UnicodeDecodeError:
+    fail("the agent key is not plain ASCII")
+if text.endswith("\n"):
+    text = text[:-1]
+if "\n" in text or "\r" in text:
+    fail("the agent key is not a single line")
+if not KEY_RE.fullmatch(text):
+    fail("the agent key is not 16-256 characters of [A-Za-z0-9._~+/=-]")
+trip_key = text
+
+# 2. The companion's token: the one its profile already holds, else a new one.
+env_path = os.path.join(profile_dir, ".env")
+if os.path.islink(env_path):
+    fail("the profile's .env is a symlink")
+token = None
+env_text = ""
+if os.path.exists(env_path):
+    env_text = open(env_path, encoding="utf-8", errors="replace").read()
+    for line in env_text.splitlines():
+        if line.startswith("TRIP_MCP_TOKEN="):
+            token = line.split("=", 1)[1].strip().strip("\"'")
+            break
+if token is not None and not KEY_RE.fullmatch(token):
+    fail("TRIP_MCP_TOKEN in the profile's .env is malformed; remove that line to have a new token made")
+if token is None:
+    token = secrets.token_hex(32)
+    lead = "\n" if env_text and not env_text.endswith("\n") else ""
+    fd = os.open(env_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "a") as fh:
+        fh.write(f"{lead}TRIP_MCP_TOKEN={token}\n")
+    os.chmod(env_path, 0o600)
+
+# 3. The route file: only the hash of the token, mode 0600, replaced atomically.
+if os.path.islink(routes_dir) or not os.path.isdir(routes_dir):
+    fail("the routes directory is not a real directory")
+route = {
+    "schema_version": 1,
+    "trip": slug,
+    "api_base_url": api_base,
+    "trip_api_key": trip_key,
+    "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+}
+atomic_write(os.path.join(routes_dir, slug + ".json"), json.dumps(route) + "\n", 0o600)
+
+# 4. The profile's trip-mcp entry, replacing any earlier one and touching nothing
+# else. The header holds the NAME of the token, which Hermes reads from the
+# profile's .env; the token itself is not written here.
+cfg_path = os.path.join(profile_dir, "config.yaml")
+if os.path.islink(cfg_path):
+    fail("the profile's config.yaml is a symlink")
+try:
+    cfg = yaml.safe_load(open(cfg_path)) or {}
+    mode = os.stat(cfg_path).st_mode & 0o777
+except FileNotFoundError:
+    cfg, mode = {}, 0o600
+if not isinstance(cfg, dict):
+    fail("the profile's config.yaml is not a mapping")
+servers = cfg.get("mcp_servers")
+if servers is None:
+    servers = {}
+if not isinstance(servers, dict):
+    fail("mcp_servers in the profile's config.yaml is not a mapping")
+servers["trip-mcp"] = {
+    "transport": "sse",
+    "url": bridge_url + "/sse",
+    "headers": {"X-API-Key": "${TRIP_MCP_TOKEN}"},
+}
+cfg["mcp_servers"] = servers
+atomic_write(cfg_path, yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True), mode)
+PYWIRE
+}
+
+# What every successful wiring ends with, per trip or shared: the provenance
+# record and the WIRED line the worker parses.
+#
+# WHICH CHECKOUT BUILT THIS COMPANION. The forced command in authorized_keys
+# decides that, and on 2026-09-20 it named a feature branch 12 commits behind —
+# so a run reported on two branches at once and nothing anywhere said so. Printed
+# on the WIRED line because that is what the worker already reads, and written
+# beside the trip because a log line ages out.
+# The provenance record is the evidence the backfill trusts to mark a profile as
+# this system's, so it is written only for a profile that already carries the
+# marker (a fresh install writes the marker first). A bridge request naming
+# somebody's own, unmarked profile must not be able to mint that evidence.
+finish_wired() {
+  if [ -f "$HOME/.hermes/profiles/$PROFILE_NAME/$GATEWAY_MARKER" ] \
+       && [ ! -L "$HOME/.hermes/profiles/$PROFILE_NAME/$GATEWAY_MARKER" ] \
+       && [ ! -L "$HOME/.hermes/profiles/$PROFILE_NAME" ] && ! gateway_denied "$PROFILE_NAME"; then
+    companion_provenance "$TRIP_DIR" "$PROFILE_NAME"
+  else
+    printf 'companion-install-host: provenance not recorded: %s carries no provenance marker\n' "$PROFILE_NAME" >&2
+  fi
+  printf 'WIRED %s %s\n' "$PROFILE_NAME" "$(repo_commit)"
+  exit 0
+}
+
+# Wire one companion to the shared bridge (read_trip_wiring has already run).
+# Order: ask whether the bridge is up BEFORE writing anything; write the route and
+# the profile entry; wait until the bridge has picked the route up BEFORE the
+# gateway is started (a gateway refused three times parks its trip-mcp for life,
+# and the bridge rescans only once a second); restart the gateway; wait for it to
+# register the tools; then ask the bridge, with the trip's own token, whether it
+# can reach the trip.
+wire_shared_bridge() {
+  local py api profile_dir limit waited=0
+  api="http://$SITE_IP:$SITE_PORT"
+  profile_dir="$HOME/.hermes/profiles/$PROFILE_NAME"
+  py="$(find_yaml_python)" || die "no python with PyYAML to write $PROFILE_NAME's trip-mcp entry"
+  shared_bridge_ready || die "the shared bridge is not answering /ready at $SHARED_URL; nothing was written"
+  shared_trip_key_file
+  write_shared_wire_script
+  "$py" "$WORK/shared_wire.py" "$SHARED_ROUTES_DIR" "$TRIP_SLUG" "$api" "$WORK/trip-key" "$profile_dir" "$SHARED_URL" \
+    || die "could not write the shared-bridge route and profile entry for $TRIP_SLUG"
+  rm -f "$WORK/trip-key"
+
+  limit="${KINERARY_SHARED_BRIDGE_ROUTE_WAIT_SECONDS:-10}"
+  case "$limit" in ''|*[!0-9]*) limit=10 ;; esac
+  while :; do
+    shared_bridge_health && break
+    [ "$BRIDGE_HEALTH_CODE" = BRIDGE_401 ] || break   # any other answer means the bridge knows the token
+    [ "$waited" -lt "$limit" ] || die "the shared bridge does not accept the route written for $TRIP_SLUG after ${limit}s: is it reading the directory KINERARY_SHARED_BRIDGE_ROUTES_DIR names?"
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  GATEWAY_LOG="$HOME/.hermes/profiles/$PROFILE_NAME/logs/agent.log"
+  LOG_FROM=$(( $(wc -l < "$GATEWAY_LOG" 2>/dev/null || echo 0) + 1 ))
+  start_gateway "$PROFILE_NAME"
+  if gateway_registered_trip_mcp "$PROFILE_NAME" "$LOG_FROM"; then
+    # BOTH HOPS, as for a per-trip bridge: the agent can see the tools; now prove
+    # the tools can see the trip.
+    if ! shared_bridge_health; then
+      printf 'companion-install-host: the shared trip-mcp bridge cannot reach %s — /health said: %s\n' \
+        "$TRIP_SLUG" "$BRIDGE_HEALTH" >&2
+      die "trip-mcp (shared bridge) wired for $TRIP_SLUG but it cannot reach the trip site"
+    fi
+    # The other direction is not this host's to wire: booking extraction and enrichment go FROM the trip's
+    # container TO the bridge (the site's HERMES_URL), and this host has no access to the container. The
+    # worker writes that address into a new trip's .env and checks it from inside the container.
+    printf 'companion-install-host: shared mode wires the companion side only; the trip site calls the bridge itself (HERMES_URL, for booking extraction and enrichment), which the worker wires and checks from inside the trip container, not this host\n' >&2
+    finish_wired
+  fi
+  printf 'companion-install-host: %s gateway registered no trip-mcp tools after restart\n' "$PROFILE_NAME" >&2
+  tail -5 "$GATEWAY_LOG" >&2 2>/dev/null || true
+  die "trip-mcp wired for $TRIP_SLUG but $PROFILE_NAME's gateway did not register its tools"
+}
+
 # ── The trip-mcp bridge, wired on THIS host ──────────────────────────────────
 #
 # The bridge is `node mcp.js` plus a `hermes mcp add` into the companion's
@@ -1004,16 +1480,27 @@ read_trip_wiring() {
   # sshd runs a forced command with — mis-parses quotes inside a here-document
   # inside a command substitution, and one apostrophe in a comment made this
   # whole script unparseable.
-  "$py" - "$TRIP_DIR/topology.yaml" "$TRIP_SLUG" > "$WORK/wiring" <<'PYTOPO' || die "could not read $TRIP_SLUG's topology"
+  # Whether this host runs the SHARED bridge is its own decision (the two
+  # KINERARY_SHARED_BRIDGE_* variables), taken before anything of the request is
+  # trusted, and called here at top level, not in a command substitution, so a
+  # bad value dies the script instead of a subshell.
+  local mode=per_trip
+  if shared_bridge_on; then mode=shared; fi
+  "$py" - "$TRIP_DIR/topology.yaml" "$TRIP_SLUG" "$mode" > "$WORK/wiring" <<'PYTOPO' || die "could not read $TRIP_SLUG's topology"
 import re, sys, yaml
 topo = yaml.safe_load(open(sys.argv[1])) or {}
 slug = sys.argv[2]
+shared = sys.argv[3] == "shared"
 lxc = ((topo.get("proxmox") or {}).get("lxc") or {})
 if topo.get("name") != slug or lxc.get("name") != f"trip-{slug}":
     print(f"topology does not describe {slug}", file=sys.stderr); raise SystemExit(2)
 vmid = str((topo.get("proxmox") or {}).get("vmid") or "")
 ipv4 = str(lxc.get("ipv4") or "")
 fport = str((topo.get("npm") or {}).get("forward_port") or "")
+if shared:
+    # A wildcard-routed trip has no npm section: the site port is the LXC's own,
+    # with the npm one as the fallback for a topology written before that.
+    fport = str(lxc.get("forward_port") or "") or fport
 # EVERY VALUE IS CHECKED AGAINST AN ASCII PATTERN before it is printed. These
 # travel tab-separated, and the fourth field is the port the bridge's KEY is
 # sent to: an address carrying a tab once shifted the fields so the trip
@@ -1022,9 +1509,19 @@ fport = str((topo.get("npm") or {}).get("forward_port") or "")
 # because `$` would allow a trailing newline. The values are never echoed.
 OCTET = r"(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
 ok = (
-    re.fullmatch(r"[0-9]{1,4}", vmid) is not None
-    and re.fullmatch(rf"{OCTET}(\.{OCTET}){{3}}(/[0-9]{{1,2}})?", ipv4) is not None
+    re.fullmatch(rf"{OCTET}(\.{OCTET}){{3}}(/[0-9]{{1,2}})?", ipv4) is not None
     and re.fullmatch(r"[0-9]{1,5}", fport) is not None and 1 <= int(fport) <= 65535
+)
+if shared:
+    # No bridge port is derived: one process serves every trip, so the
+    # 3000 + vmid window (and the vmid it needs) does not apply.
+    if not ok:
+        print(f"topology for {slug} lacks a usable ip/port", file=sys.stderr); raise SystemExit(2)
+    print(f"\t{ipv4.split('/')[0]}\t{fport}\t")
+    raise SystemExit(0)
+ok = (
+    ok
+    and re.fullmatch(r"[0-9]{1,4}", vmid) is not None
     # The port rule is mcp_bridge.mcp_port_for_vmid's: 3000 + vmid, inside
     # 3100-3999, clear of the hand-provisioned bridges below 3100.
     and 3100 <= 3000 + int(vmid) <= 3999
@@ -1038,11 +1535,14 @@ PYTOPO
   VMID="$(printf '%s' "$wiring" | cut -f1)"; SITE_IP="$(printf '%s' "$wiring" | cut -f2)"
   SITE_PORT="$(printf '%s' "$wiring" | cut -f3)"; MCP_PORT="$(printf '%s' "$wiring" | cut -f4)"
   # Belt and braces on the one value the key follows: exactly four ASCII
-  # digits, spelled out rather than [0-9], which some locales widen.
-  case "$MCP_PORT" in
-    [0123456789][0123456789][0123456789][0123456789]) ;;
-    *) die "topology for $TRIP_SLUG gave no usable bridge port" ;;
-  esac
+  # digits, spelled out rather than [0-9], which some locales widen. Not asked
+  # of the shared bridge, which has no per-trip port (MCP_PORT is empty there).
+  if [ "$mode" = per_trip ]; then
+    case "$MCP_PORT" in
+      [0123456789][0123456789][0123456789][0123456789]) ;;
+      *) die "topology for $TRIP_SLUG gave no usable bridge port" ;;
+    esac
+  fi
 }
 
 # ── The bridge probe: is an already-wired bridge still reaching its trip? ─────
@@ -1129,9 +1629,18 @@ gateway_wait_for() {  # name up|down
 # report, not a reason to withhold the companion. Returns 1 if it could not be
 # brought back: starting the gateway would only repeat the silent failure.
 revive_bridge_before_start() {  # slug
-  local slug="$1" root="${KINERARY_DEPLOY_ROOT:-$HOME/kinerary-deploy}"
+  local slug="$1" root="${KINERARY_DEPLOY_ROOT:-$HOME/kinerary-deploy}" shared=0
   [ -n "$slug" ] || return 0
-  [ -f "$root/trips/$slug/topology.yaml" ] && [ -f "$root/trips/$slug/mcp/.env" ] || return 0
+  # Shared mode (AC-B2.5): there is no per-trip bridge to bring back, so this
+  # starts and restarts NOTHING. A trip "has a bridge" when it has a route file in
+  # the shared bridge's directory; one without just starts, as a per-trip trip with
+  # no mcp/.env does.
+  if shared_bridge_on; then
+    shared=1
+    [ -f "$root/trips/$slug/topology.yaml" ] && [ -f "$SHARED_ROUTES_DIR/$slug.json" ] || return 0
+  else
+    [ -f "$root/trips/$slug/topology.yaml" ] && [ -f "$root/trips/$slug/mcp/.env" ] || return 0
+  fi
   # The slug came from the caller: it must be THIS profile's trip before anything
   # of that trip is touched. The provenance record the bridge wiring writes names
   # the profile; a trip that does not, or is reached through a symlink, is refused.
@@ -1139,6 +1648,15 @@ revive_bridge_before_start() {  # slug
        || ! grep -Fq "\"profile\":\"$PROFILE_NAME\"" "$root/trips/$slug/companion-provenance.json" 2>/dev/null; then
     gateway_note "trip $slug has no provenance record naming $PROFILE_NAME"
     return 2
+  fi
+  if [ "$shared" -eq 1 ]; then
+    # A gateway started while the shared bridge is down is refused three times and
+    # parks its trip-mcp for the life of the process, so the start waits on the
+    # bridge rather than racing it. Whether it can reach this trip is the probe's
+    # to report, exactly as for a per-trip bridge that answers.
+    shared_bridge_ready && return 0
+    gateway_note "the shared bridge is not answering /ready; not starting $PROFILE_NAME's gateway without it"
+    return 1
   fi
   TRIP_SLUG="$slug"
   read_trip_wiring
@@ -1190,6 +1708,9 @@ if [ "$REQUEST_KIND" = "companion_gateway_action" ]; then
     if [ "$bridge_status" -eq 2 ]; then
       gateway_result "$name" start refused "that trip's provenance record does not name this profile"; exit 0
     elif [ "$bridge_status" -ne 0 ]; then
+      if shared_bridge_on; then
+        gateway_result "$name" start failed "the shared trip-mcp bridge is down"; exit 0
+      fi
       gateway_result "$name" start failed "its trip-mcp bridge is down and could not be restarted"; exit 0
     fi
     run_bounded "$limit" hermes -p "$name" gateway start || true
@@ -1210,6 +1731,16 @@ fi
 
 if [ "$REQUEST_KIND" = "trip_mcp_bridge_probe" ]; then
   read_trip_wiring
+  if shared_bridge_on; then
+    # Asked of the shared bridge with THIS trip's token, still one line. It never
+    # asks /ready (that is the process, not the trip) and never needs the agent key.
+    if shared_bridge_health; then
+      printf 'HEALTH ok\n'
+    else
+      printf 'HEALTH fail %s\n' "${BRIDGE_HEALTH_CODE:-UNRECOGNIZED}"
+    fi
+    exit 0
+  fi
   if bridge_reaches_trip "$MCP_PORT" "$TRIP_DIR"; then
     printf 'HEALTH ok\n'
   else
@@ -1220,6 +1751,9 @@ fi
 
 if [ "$REQUEST_KIND" = "trip_mcp_bridge_request" ]; then
   read_trip_wiring
+  if shared_bridge_on; then
+    wire_shared_bridge
+  fi
   [ -x "$DEPLOY_ROOT/setup-mcp.sh" ] || die "no setup-mcp.sh in $DEPLOY_ROOT"
   # REPO_ROOT: the bridge runs this checkout's mcp.js, the same checkout whose
   # templates rendered the companion. stdin from /dev/null so the backgrounded
@@ -1260,29 +1794,9 @@ if [ "$REQUEST_KIND" = "trip_mcp_bridge_request" ]; then
           "$MCP_PORT" "$TRIP_SLUG" "$BRIDGE_HEALTH" >&2
         die "trip-mcp wired for $TRIP_SLUG but it cannot reach the trip site"
       fi
-      # WHICH CHECKOUT BUILT THIS COMPANION. The forced command in
-      # authorized_keys decides that, and on 2026-09-20 it named a feature
-      # branch 12 commits behind — so a run reported on two branches at once
-      # and nothing anywhere said so. Not the worker's log, not the trip's
-      # mcp/.env, not the profile. Hours went into establishing by hand what
-      # this one field says.
-      #
-      # Printed on the WIRED line because that is what the worker already
-      # reads, and written beside the trip because a log line ages out.
-      # The provenance record is the evidence the backfill trusts to mark a
-      # profile as this system's, so it is written only for a profile that
-      # already carries the marker (a fresh install writes the marker first). A
-      # bridge request naming somebody's own, unmarked profile must not be able
-      # to mint that evidence.
-      if [ -f "$HOME/.hermes/profiles/$PROFILE_NAME/$GATEWAY_MARKER" ] \
-           && [ ! -L "$HOME/.hermes/profiles/$PROFILE_NAME/$GATEWAY_MARKER" ] \
-           && [ ! -L "$HOME/.hermes/profiles/$PROFILE_NAME" ] && ! gateway_denied "$PROFILE_NAME"; then
-        companion_provenance "$TRIP_DIR" "$PROFILE_NAME"
-      else
-        printf 'companion-install-host: provenance not recorded: %s carries no provenance marker\n' "$PROFILE_NAME" >&2
-      fi
-      printf 'WIRED %s %s\n' "$PROFILE_NAME" "$(repo_commit)"
-      exit 0
+      # Provenance record and the WIRED line: finish_wired (above), shared with
+      # the shared-bridge path so the two cannot drift.
+      finish_wired
     fi
     # Wired but not reachable BY THE AGENT, which is the only sense that
     # matters. Reported as a failure rather than a WIRED with an asterisk: the

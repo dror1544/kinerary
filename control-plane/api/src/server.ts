@@ -195,7 +195,7 @@ if (profile.web) {
       miniAppLog(structuredLog("error", "email_auth.key_unresolved", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN", effect: "sign-up and password reset answer 503 SIGN_UP_UNAVAILABLE" }));
     }
   }
-  portal = { db: pool, google, telegramMiniApp, mailer, emailAuthLog: miniAppLog, runtimeAccounts: new HttpRuntimeAccountAdapter(profile.web.runtime_origin, runtimeExchangeKey), publicOrigin: profile.web.public_origin, runtimeOrigin: profile.web.runtime_origin, runtimeExchangeKey, runtimeUpstreamHostSuffixes: profile.web.runtime_upstream_host_suffixes, telegramBotUsername: profile.web.telegram_bot_username, sessionTtlSeconds: profile.web.session_ttl_seconds, enrollmentTtlSeconds: profile.signup?.enrollment_ttl_seconds ?? 86400, approvalTtlSeconds: 86400, operatorChatId };
+  portal = { db: pool, google, telegramMiniApp, mailer, emailAuthLog: miniAppLog, runtimeAccounts: new HttpRuntimeAccountAdapter(profile.web.runtime_origin, runtimeExchangeKey), publicOrigin: profile.web.public_origin, runtimeOrigin: profile.web.runtime_origin, runtimeExchangeKey, runtimeUpstreamHostSuffixes: profile.web.runtime_upstream_host_suffixes, runtimeUpstreamAllowedHosts: profile.web.runtime_upstream_allowed_hosts, telegramBotUsername: profile.web.telegram_bot_username, sessionTtlSeconds: profile.web.session_ttl_seconds, enrollmentTtlSeconds: profile.signup?.enrollment_ttl_seconds ?? 86400, approvalTtlSeconds: 86400, operatorChatId };
 }
 
 // The interviewer agent's chat-addressed interview routes, which the MCP
@@ -353,14 +353,17 @@ if (outboxNotification && outboxBotToken) {
   }, OUTBOX_POLL_INTERVAL_MS);
   timer.unref();
 
-  // The group line's trigger (video Release 1C). It only enqueues; the dispatcher above is the one sender. It needs
-  // the portal's runtime exchange key (the key every trip site checks) and its host allow-list, so a deployment
-  // without a web profile has no group line, and says so once here rather than never sending without a word.
+  // The group line's trigger (video Release 1C). It only enqueues; the dispatcher above is the one sender. It reads
+  // each trip's plan through the runtime gateway (portal.runtimeOrigin) with the control-plane exchange key, and
+  // never calls a trip site itself, so a deployment without a web profile has no group line, and says so once here
+  // rather than never sending without a word.
   if (portal?.runtimeExchangeKey) {
     startPlanChangePoller({
       db: pool,
       exchangeKey: portal.runtimeExchangeKey,
+      runtimeOrigin: portal.runtimeOrigin,
       upstreamHostSuffixes: portal.runtimeUpstreamHostSuffixes,
+      upstreamAllowedHosts: portal.runtimeUpstreamAllowedHosts,
       log: (line) => process.stderr.write(`${line}\n`),
     });
   } else {

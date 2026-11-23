@@ -500,10 +500,14 @@ class ShellMcpBridgeAdapter:
         # failure when nothing had failed except the clock. Four provisions in
         # a row lost their MCP wiring to it.
         timeout: int = 900,
+        # TRIP_MCP_BRIDGE=shared: one bridge process serves every trip, so the
+        # per-trip port is not this trip's to derive. See setup().
+        shared_bridge: bool = False,
     ) -> None:
         self._deploy_root = deploy_root
         self._vmid_map = vmid_map
         self._timeout = timeout
+        self._shared_bridge = shared_bridge
 
     def setup(self, slug: str, profile_name: str) -> bool:
         trip_dir = os.path.join(self._deploy_root, "trips", slug)
@@ -520,14 +524,19 @@ class ShellMcpBridgeAdapter:
             return False
 
         port = mcp_port_for_vmid(vmid)
-        if port is None:
+        if port is None and not self._shared_bridge:
             return False
+        # A per-trip bridge needs its own port, and a vmid that gives no sane one
+        # (outside 3100-3999) must not be guessed at - so it is skipped, above.
+        # A shared bridge has no per-trip port to collide on: the request is
+        # still made, with the port left out when none can be derived.
+        port_args = ["--port", str(port)] if port is not None else []
 
         setup_mcp_sh = os.path.join(self._deploy_root, "setup-mcp.sh")
         result = subprocess.run(
             [
                 setup_mcp_sh, profile_name, local_url,
-                "--vmid", vmid, "--trip-dir", trip_dir, "--port", str(port),
+                "--vmid", vmid, "--trip-dir", trip_dir, *port_args,
             ],
             capture_output=True,
             text=True,

@@ -977,5 +977,90 @@ class AdapterTests(unittest.TestCase):
         self.assertIn("other.example.invalid", rendered)
 
 
+DERIVED_KEY = "d" * 64   # stands in for derive(trip master, trip_id); the adapter never derives
+SHARED_KEY = "s" * 64
+INSTALLED_SPEC = LxcSpec(
+    "trip-kinerary", "pve", "t", "s", 2, 1024, 8, "vmbr0", "ip", "gw", "ns", "h", "m", "kinerary",
+)
+
+
+class _ReadingSsh(FakeProxmoxSsh):
+    """A container whose /opt/kinerary/.env holds `env`."""
+
+    def __init__(self, env: str) -> None:
+        super().__init__()
+        self.env = env
+
+    def run(self, command, *, secrets=()):
+        if command.startswith("pct exec 201 -- ") and "/opt/kinerary/.env" in command:
+            self.commands.append(command)
+            return self.env
+        return super().run(command, secrets=secrets)
+
+
+class PerTripExchangeKeyTests(unittest.TestCase):
+    """A trip site holds ONE key, written once, when its .env is made (AC-K2.4, AC-K2.5)."""
+
+    def test_the_key_is_written_only_when_the_env_is_new_so_a_re_provision_never_rewrites_it(self) -> None:
+        ssh = FakeProxmoxSsh(nextid="203")
+        ProxmoxLxcAdapter(ssh, control_plane_exchange_key=DERIVED_KEY).create(LXC_SPEC)
+        bootstrap = ssh.commands[3]
+        guard = bootstrap.index("if [ ! -f /opt/kinerary/.env ]; then")
+        write = bootstrap.index(f"printf 'CONTROL_PLANE_EXCHANGE_KEY=%s\\n' {DERIVED_KEY}")
+        end = bootstrap.index("\nfi\n", guard)
+        self.assertTrue(guard < write < end, "the key line is inside the 'no .env yet' branch")
+        # and the .env is never overwritten outside it
+        self.assertEqual(1, bootstrap.count("cat > /opt/kinerary/.env"), "one write of the whole file, inside the guard")
+        self.assertEqual(1, bootstrap.count("CONTROL_PLANE_EXCHANGE_KEY="))
+
+    def test_the_derived_key_is_redacted_and_never_on_a_command_line(self) -> None:
+        seen: list[tuple[str, ...]] = []
+
+        class Recording(FakeProxmoxSsh):
+            def run(self, command, *, secrets=()):
+                if "BOOTSTRAP_INNER" in command:
+                    seen.append(secrets)
+                return super().run(command, secrets=secrets)
+
+        ssh = Recording(nextid="203")
+        ProxmoxLxcAdapter(ssh, control_plane_exchange_key=DERIVED_KEY).create(LXC_SPEC)
+        self.assertIn(DERIVED_KEY, seen[0])
+        # Every other command (pct create, mkdir, ...) is short and carries no key; the key is only in the stdin script.
+        self.assertEqual([c for c in ssh.commands if DERIVED_KEY in c], [ssh.commands[3]])
+
+    def test_exchange_key_kind_names_which_candidate_the_container_holds(self) -> None:
+        candidates = {"derived": DERIVED_KEY, "shared": SHARED_KEY}
+        for held, kind in ((DERIVED_KEY, "derived"), (SHARED_KEY, "shared")):
+            ssh = _ReadingSsh(f"SEED_PASSWORD=x\nCONTROL_PLANE_EXCHANGE_KEY={held}\n")
+            self.assertEqual(kind, ProxmoxLxcAdapter(ssh).exchange_key_kind(INSTALLED_SPEC, candidates))
+            # nothing secret travels in the command that reads it
+            self.assertNotIn(held, ssh.commands[-1])
+
+    def test_exchange_key_kind_is_none_when_it_cannot_say(self) -> None:
+        candidates = {"derived": DERIVED_KEY, "shared": SHARED_KEY}
+        for env in ("PORT=3000\n", "CONTROL_PLANE_EXCHANGE_KEY=\n", f"CONTROL_PLANE_EXCHANGE_KEY={'x' * 64}\n",
+                    f"CONTROL_PLANE_EXCHANGE_KEY={DERIVED_KEY}extra\n"):
+            with self.subTest(env=env):
+                self.assertIsNone(ProxmoxLxcAdapter(_ReadingSsh(env)).exchange_key_kind(INSTALLED_SPEC, candidates))
+        # an empty candidate (an unset key) never matches an empty or missing line
+        self.assertIsNone(ProxmoxLxcAdapter(_ReadingSsh("CONTROL_PLANE_EXCHANGE_KEY=\n")).exchange_key_kind(
+            INSTALLED_SPEC, {"shared": ""}))
+        # no such container -> None, not an exception
+        self.assertIsNone(ProxmoxLxcAdapter(FakeProxmoxSsh()).exchange_key_kind(LXC_SPEC, candidates))
+
+    def test_a_failed_read_does_not_carry_the_key_in_its_error(self) -> None:
+        class Failing(FakeProxmoxSsh):
+            def run(self, command, *, secrets=()):
+                if command.startswith("pct exec 201 -- ") and "/opt/kinerary/.env" in command:
+                    raise RuntimeError(f"ssh command failed (exit 255): CONTROL_PLANE_EXCHANGE_KEY={DERIVED_KEY}")
+                return super().run(command, secrets=secrets)
+
+        with self.assertRaises(RuntimeError) as caught:
+            ProxmoxLxcAdapter(Failing()).exchange_key_kind(INSTALLED_SPEC, {"derived": DERIVED_KEY})
+        self.assertNotIn(DERIVED_KEY, str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertTrue(caught.exception.__suppress_context__)
+
+
 if __name__ == "__main__":
     unittest.main()

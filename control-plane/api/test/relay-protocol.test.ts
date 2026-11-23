@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { randomBytes } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
@@ -8,8 +9,12 @@ import { issueEnrollment } from "../src/enrollment.js";
 import { migrateChatBinding, resolveChatRoute, startFromDeepLink } from "../src/chat-router.js";
 import {
   CONTRACT_VERSION,
+  GATEWAY_KEY_LABEL,
   decodeFrame,
+  deriveGatewayKey,
   encodeFrame,
+  gatewayKeyMasterProblem,
+  type GatewayKeyMode,
   makeUpgradeToken,
   parseOutboundAction,
   splitFrames,
@@ -115,6 +120,210 @@ describe("verifyUpgradeToken", () => {
   test("an empty secret in the list never validates", () => {
     const token = makeUpgradeToken("gw_abc", "", 0);
     assert.equal(verifyUpgradeToken(token, [""]), null);
+  });
+});
+
+// ── Per-gateway keys (#597 K1) ───────────────────────────────────────────────
+
+interface KeyVector { master: string; id: string; derived: string; token: string }
+const KEY_VECTORS = JSON.parse(
+  readFileSync(fileURLToPath(new URL("./fixtures/relay-key-vectors.json", import.meta.url)), "utf8"),
+) as { label: string; vectors: KeyVector[]; refused_ids: string[] };
+
+/**
+ * What the Hermes gateway does today, written out rather than reused: the
+ * secret it is configured with is a STRING handed to HMAC as the key, over
+ * "<id>:<exp>". It has no idea whether that string is a master or a derived
+ * key, which is the whole reason the gateway side does not change.
+ */
+function mintLikeHermes(gatewayId: string, secretString: string, exp = 0): string {
+  const signed = `${gatewayId}:${exp}`;
+  const sig = createHmac("sha256", secretString).update(signed, "utf8").digest("hex");
+  return Buffer.from(`${signed}:${sig}`, "utf8").toString("base64url");
+}
+
+describe("deriveGatewayKey (AC-K1.1)", () => {
+  test("matches the shared vector file, which the Python tests also read", () => {
+    assert.equal(KEY_VECTORS.label, GATEWAY_KEY_LABEL);
+    assert.ok(KEY_VECTORS.vectors.length >= 5);
+    for (const v of KEY_VECTORS.vectors) {
+      assert.equal(deriveGatewayKey(v.master, v.id), v.derived, v.id);
+    }
+  });
+
+  test("a gateway minting the way Hermes does, with the derived string as its key, verifies", () => {
+    for (const v of KEY_VECTORS.vectors) {
+      assert.equal(mintLikeHermes(v.id, v.derived), v.token, `${v.id}: vector token is what Hermes would send`);
+      assert.equal(verifyUpgradeToken(v.token, [], undefined, "derived", [v.master]), v.id, v.id);
+    }
+  });
+
+  test("an id with ':' or the derivation label has no derived key (domain separation, AC-K1.9)", () => {
+    assert.ok(KEY_VECTORS.refused_ids.length >= 2);
+    for (const id of KEY_VECTORS.refused_ids) {
+      assert.throws(() => deriveGatewayKey("m", id), id);
+    }
+  });
+
+  test("is a lowercase 64-hex string and differs per id and per master", () => {
+    const a = deriveGatewayKey("m", "a");
+    assert.match(a, /^[0-9a-f]{64}$/);
+    assert.notEqual(a, deriveGatewayKey("m", "b"));
+    assert.notEqual(a, deriveGatewayKey("n", "a"));
+  });
+
+  test("refuses an empty master or id rather than deriving from nothing", () => {
+    assert.throws(() => deriveGatewayKey("", "a"));
+    assert.throws(() => deriveGatewayKey("m", ""));
+  });
+});
+
+describe("verifyUpgradeToken by gateway key mode (AC-K1.2, AC-K1.7)", () => {
+  // SHARED is what every gateway profile holds in `shared` mode. MASTER is the
+  // derivation master: a different secret, one no profile has held.
+  const SHARED = "shared-secret-every-profile-holds";
+  const MASTER = "derivation-master-no-profile-holds";
+  const OLD_MASTER = "derivation-master-previous";
+  const A = "gw-a";
+  const B = "gw-b";
+  const MODES: GatewayKeyMode[] = ["shared", "both", "derived"];
+  const sharedTokenA = mintLikeHermes(A, SHARED);
+  const derivedTokenA = mintLikeHermes(A, deriveGatewayKey(MASTER, A));
+  // Derived from what the profiles hold: valid in no mode.
+  const derivedFromSharedA = mintLikeHermes(A, deriveGatewayKey(SHARED, A));
+  // Signed with the key that belongs to B, but naming A.
+  const crossToken = mintLikeHermes(A, deriveGatewayKey(MASTER, B));
+  const verify = (token: string, mode?: GatewayKeyMode, now?: number) =>
+    verifyUpgradeToken(token, [SHARED], now, mode, [MASTER]);
+
+  test("shared: only a shared-secret-signed token verifies; the derivation master is not consulted", () => {
+    assert.equal(verify(sharedTokenA, "shared"), A);
+    assert.equal(verify(derivedTokenA, "shared"), null);
+    assert.equal(verify(mintLikeHermes(A, MASTER), "shared"), null);
+  });
+
+  test("derived: only derive(master, A) verifies; the shared secret is not consulted at all", () => {
+    assert.equal(verify(derivedTokenA, "derived"), A);
+    assert.equal(verify(sharedTokenA, "derived"), null);
+    // What the old shared secret opens in `derived`: nothing, for any id.
+    for (const id of [A, B, "interviewer", "japan2026"]) {
+      assert.equal(verify(mintLikeHermes(id, SHARED), "derived"), null, `shared-signed ${id}`);
+      assert.equal(verify(mintLikeHermes(id, deriveGatewayKey(SHARED, id)), "derived"), null, `derived-from-shared ${id}`);
+      assert.equal(verify(mintLikeHermes(id, deriveGatewayKey(MASTER, id)), "derived"), id, `derived-from-master ${id}`);
+    }
+    // Even with no shared secret in the list at all, derived still works.
+    assert.equal(verifyUpgradeToken(derivedTokenA, [], undefined, "derived", [MASTER]), A);
+  });
+
+  test("both: a shared-signed or master-derived token verifies; one derived from the shared secret does not", () => {
+    assert.equal(verify(sharedTokenA, "both"), A);
+    assert.equal(verify(derivedTokenA, "both"), A);
+    assert.equal(verify(derivedFromSharedA, "both"), null);
+  });
+
+  test("a key derived from the shared secret verifies in no mode", () => {
+    for (const mode of MODES) assert.equal(verify(derivedFromSharedA, mode), null, mode);
+  });
+
+  test("a token signed with derive(master, B) and naming A is refused in every mode", () => {
+    for (const mode of MODES) assert.equal(verify(crossToken, mode), null, mode);
+    // ...while the same key does verify for B itself, so the refusal is the id and not the key.
+    assert.equal(verify(mintLikeHermes(B, deriveGatewayKey(MASTER, B)), "derived"), B);
+  });
+
+  test("rotation: either derivation master works where derived keys are accepted; either shared secret where shared ones are", () => {
+    const masters = [MASTER, OLD_MASTER];
+    const shared = [SHARED, "shared-previous"];
+    assert.equal(verifyUpgradeToken(mintLikeHermes(A, "shared-previous"), shared, undefined, "shared", masters), A);
+    assert.equal(verifyUpgradeToken(mintLikeHermes(A, deriveGatewayKey(OLD_MASTER, A)), shared, undefined, "derived", masters), A);
+    assert.equal(verifyUpgradeToken(mintLikeHermes(A, "shared-previous"), shared, undefined, "both", masters), A);
+    assert.equal(verifyUpgradeToken(mintLikeHermes(A, deriveGatewayKey(OLD_MASTER, A)), shared, undefined, "both", masters), A);
+    assert.equal(verifyUpgradeToken(mintLikeHermes(A, "shared-previous"), shared, undefined, "derived", masters), null);
+  });
+
+  test("the default mode is shared, so every existing caller is unchanged", () => {
+    assert.equal(verifyUpgradeToken(sharedTokenA, [SHARED]), A);
+    assert.equal(verifyUpgradeToken(derivedTokenA, [SHARED], undefined, undefined, [MASTER]), null);
+  });
+
+  test("an unrecognised mode at runtime fails closed", () => {
+    for (const bad of ["", "Derived", "any", null]) {
+      assert.equal(verify(sharedTokenA, bad as never), null, String(bad));
+      assert.equal(verify(derivedTokenA, bad as never), null, String(bad));
+    }
+  });
+
+  test("expiry still applies to a derived token", () => {
+    const now = 1_800_000_000;
+    const expired = mintLikeHermes(A, deriveGatewayKey(MASTER, A), now - 1);
+    assert.equal(verify(expired, "derived", now), null);
+  });
+
+  test("a match is found wherever it sits in a rotation list, first or last", () => {
+    const masters = ["m1", "m2", "m3"];
+    for (const m of masters) {
+      assert.equal(verifyUpgradeToken(mintLikeHermes(A, deriveGatewayKey(m, A)), [SHARED], undefined, "both", masters), A, m);
+    }
+  });
+});
+
+describe("domain separation of derived keys and token signatures (AC-K1.9)", () => {
+  const SHARED = "shared-secret-every-profile-holds";
+  const MASTER = "derivation-master-no-profile-holds";
+  const MODES: GatewayKeyMode[] = ["shared", "both", "derived"];
+
+  test("a shared-mode token with a colon id still verifies in shared (the conformance vector is unchanged)", () => {
+    const token = mintLikeHermes("gw:with:colons", "k");
+    assert.equal(verifyUpgradeToken(token, ["k"], undefined, "shared"), "gw:with:colons");
+  });
+
+  test("an id that begins with the derivation label is refused in every mode, even when correctly signed", () => {
+    for (const id of ["kinerary-relay-gateway:v1:x", "kinerary-relay-gateway:", "kinerary-relay-gateway:v1:gw:0"]) {
+      for (const mode of MODES) {
+        for (const key of [SHARED, deriveGatewayKey(SHARED, "x"), MASTER, deriveGatewayKey(MASTER, "x")]) {
+          assert.equal(verifyUpgradeToken(mintLikeHermes(id, key), [SHARED, key], undefined, mode, [MASTER, key]), null, `${mode}/${id}`);
+        }
+      }
+    }
+  });
+
+  test("the signing input and the derivation input do not overlap: a label-prefixed id is refused in every mode", () => {
+    // Pins the requirement: the token signing input for this id equals the
+    // derivation input for another id, so the label is refused as an id prefix.
+    const id = `${GATEWAY_KEY_LABEL}x`;
+    const token = mintLikeHermes(id, SHARED);
+    const signature = Buffer.from(token, "base64url").toString("utf8").split(":").pop();
+    assert.equal(signature, createHmac("sha256", SHARED).update(`${GATEWAY_KEY_LABEL}x:0`, "utf8").digest("hex"));
+    for (const mode of MODES) assert.equal(verifyUpgradeToken(token, [SHARED], undefined, mode, [MASTER]), null, mode);
+  });
+
+  test("an id containing ':' has no derived key: derived refuses it, both falls back to shared only", () => {
+    const id = "gw:with:colons";
+    const derivedLooking = mintLikeHermes(id, createHmac("sha256", MASTER).update(GATEWAY_KEY_LABEL + id, "utf8").digest("hex"));
+    assert.equal(verifyUpgradeToken(derivedLooking, [SHARED], undefined, "derived", [MASTER]), null);
+    assert.equal(verifyUpgradeToken(derivedLooking, [SHARED], undefined, "both", [MASTER]), null);
+    // `both` still honours a shared-signed token for that id (it is the shared scheme).
+    assert.equal(verifyUpgradeToken(mintLikeHermes(id, SHARED), [SHARED], undefined, "both", [MASTER]), id);
+    assert.equal(verifyUpgradeToken(mintLikeHermes(id, SHARED), [SHARED], undefined, "derived", [MASTER]), null);
+  });
+});
+
+describe("gatewayKeyMasterProblem (AC-K1.7)", () => {
+  test("shared has nothing to check; both and derived need a master that is not a shared secret", () => {
+    assert.equal(gatewayKeyMasterProblem("shared", ["s"], []), null);
+    assert.equal(gatewayKeyMasterProblem("shared", ["s"], ["s"]), null);
+    for (const mode of ["both", "derived"] as GatewayKeyMode[]) {
+      assert.match(gatewayKeyMasterProblem(mode, ["s"], []) ?? "", /gateway_key_master_refs/);
+      assert.equal(gatewayKeyMasterProblem(mode, ["s"], ["m"]), null);
+      const equal = gatewayKeyMasterProblem(mode, ["s1", "s2"], ["m", "s2"]);
+      assert.match(equal ?? "", /gateway_key_master_refs.*gateway_secret_refs/);
+    }
+  });
+
+  test("the message names fields and never a value", () => {
+    const problem = gatewayKeyMasterProblem("derived", ["super-secret-value"], ["super-secret-value"]) ?? "";
+    assert.ok(problem.length > 0);
+    assert.ok(!problem.includes("super-secret-value"));
   });
 });
 

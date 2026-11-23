@@ -45,7 +45,9 @@ import {
   splitFrames,
   parseOutboundAction,
   TELEGRAM_DESCRIPTOR,
+  gatewayKeyMasterProblem,
   verifyUpgradeToken,
+  type GatewayKeyMode,
   type OutboundResult,
   type WireMessageEvent,
 } from "./protocol.js";
@@ -126,8 +128,26 @@ export interface ConnectorOptions {
    * media rather than a reason to fail startup.
    */
   mediaStore?: { get(id: string): { mime: string; bytes: Buffer; filename?: string } | null };
-  /** HMAC verify list for the upgrade token. Multiple entries support rotation. */
+  /**
+   * HMAC verify list for the upgrade token in `shared` and `both` mode
+   * (`relay.gateway_secret_refs`). Multiple entries support rotation. Not
+   * consulted in `derived` mode.
+   */
   gatewaySecrets: readonly string[];
+  /**
+   * The derivation masters (`relay.gateway_key_master_refs`, #597 K1): what
+   * `both` and `derived` derive per-gateway keys from. Required in those modes
+   * (the constructor refuses without it) and never equal to a `gatewaySecrets`
+   * entry: a derivation master is one no gateway profile has held.
+   */
+  gatewayKeyMasters?: readonly string[];
+  /**
+   * Which key a gateway signs with (`relay.gateway_key_mode`, #597 K1).
+   * Absent is `shared`: a token is signed with a secret itself, as before. One
+   * value for both bearer checks, the upgrade and the media plane, because two
+   * settings would be two ways to leave one of them on the weaker scheme.
+   */
+  gatewayKeyMode?: GatewayKeyMode;
   /**
    * The gateway that receives turns no per-trip gateway serves.
    *
@@ -250,6 +270,15 @@ export class RelayConnector {
   private readonly path: string;
 
   constructor(private readonly options: ConnectorOptions) {
+    // A connector in `both`/`derived` with no usable derivation master, or one
+    // that equals a shared secret, would authenticate nothing it should: refuse
+    // to be built (field names only, never a value).
+    const masterProblem = gatewayKeyMasterProblem(
+      options.gatewayKeyMode ?? "shared",
+      options.gatewaySecrets,
+      options.gatewayKeyMasters ?? [],
+    );
+    if (masterProblem) throw new Error(masterProblem);
     this.log = options.log ?? (() => {});
     this.path = options.path ?? "/relay";
     this.http = createServer((req, res) => {
@@ -340,7 +369,13 @@ export class RelayConnector {
     if (typeof header !== "string") return null;
     const match = /^Bearer\s+(.+)$/i.exec(header.trim());
     if (!match?.[1]) return null;
-    return verifyUpgradeToken(match[1], this.options.gatewaySecrets) ?? null;
+    return verifyUpgradeToken(
+      match[1],
+      this.options.gatewaySecrets,
+      undefined,
+      this.options.gatewayKeyMode ?? "shared",
+      this.options.gatewayKeyMasters ?? [],
+    ) ?? null;
   }
 
   /** Gateway ids already warned about as matching no identity: once per id per process, not once per reconnect. */

@@ -1,6 +1,6 @@
 # The companion on WhatsApp, in a group or a private chat, through the relay (first slice)
 
-Status: approved (2026-11-21, by Dror; two consult reviews applied and the owner's answers to the open questions recorded before approval) · Issue: #625 · Track: its own track, after Release 1 (Dror, 2026-11-21) · Size: L (five slices) · Tier: High
+Status: approved (2026-11-21, by Dror; two consult reviews applied and the owner's answers to the open questions recorded before approval) · Issue: #625 · Track: its own track, built and deployed as each slice is ready (Dror, 2026-11-22: "make all deployable when ready, no more waits"; until then it was "after Release 1") · Size: L (five slices) · Tier: High
 Security path: yes (the relay's trust boundary, chat-to-trip resolution, outbound scope, portal routes, and in S5 an account and membership path) · Migration: yes (S2 and S5) · Live-trip behaviour: yes (relay behaviour; risk class), switched off by default
 
 Related: `docs/per-trip-gateway-architecture.md` §4; `docs/specs/sprint-9/x-relay-chat-scope.md`
@@ -132,6 +132,71 @@ a finding contradicts a contract below, a spec PR amends it first.
   the id shape of an old group and a new one; and how an @mention of a person appears in
   message text (the Sender ids contract assumes it is the person's number written out).
 
+**AC-0, the Hermes half: recorded 2026-11-22** (Hermes on the staging Mac, commit
+`4097709b`, reported as v0.21.5; read from source and probed by calling the code paths
+with hand-built events and a stand-in relay on loopback; no full gateway turn with a
+model was run, and the production VM's Hermes build has not been checked yet).
+
+- *Decision: the relay stamps the gateway's primary platform, not `"whatsapp"`.* With a
+  `"whatsapp"` stamp the gateway runs both ids through its own WhatsApp id
+  canonicaliser, which rejects the underscore in the `wa_…` alias and raises; the relay
+  socket's read loop ends and re-dials on every such message, and a reply in flight on
+  that socket is lost. With the primary stamp the same ids reach the handler and are
+  answered. The relay alone knows a chat is WhatsApp, from the binding row.
+- *Session key.* It includes the platform, the chat id and, in a group, the sender id.
+  Under the primary stamp a WhatsApp chat cannot share a session with a Telegram chat,
+  because the ids differ in shape.
+- *Authorization.* A relayed event is trusted as the relay's, before any of the
+  gateway's own allow-lists, policies or pairing, whichever platform it is stamped with.
+- *Reply egress.* The reply returns over the relay socket with the same `chat_id`; no
+  native adapter is tried. The relay routes by `chat_id`, never by the frame's platform
+  tag (which is absent for a chat the gateway has not seen since it started).
+- *Descriptor.* The primary (Telegram) descriptor governs length and op gating. The
+  gateway does not convert formatting on a relayed send, so the relay owns WhatsApp
+  formatting and length, as AC-19 already says.
+- *What the model is told.* Under the primary stamp the system prompt says Telegram; the
+  per-turn mark (S3) says WhatsApp and plain text. Under a `"whatsapp"` stamp the gateway
+  would also switch tool-progress messages on and stop applying the companion's
+  Telegram-keyed settings, which is a second reason not to use it.
+- *Where ids land.* The chat id is in the session key and session file, and in a private
+  chat's system prompt; a sender's display name and a group's title go to the model as
+  sent. So the alias keeps numbers out only as long as the relay never puts one in a
+  name or title field (Sender ids already requires an empty name over a number).
+- *Not settled.* Sends the companion starts by itself (a reminder, a scheduled job) are
+  not served for a relayed chat under today's gateway configuration, for Telegram ids
+  and WhatsApp ids alike in the probe; whether reminders reach a WhatsApp chat is read
+  off a staging companion in S4. The session database, memory files and analytics were
+  not inspected for the chat id.
+
+**AC-0, the capture half: recorded 2026-11-22** (a listen-only linked device on staging;
+library `@whiskeysockets/baileys` 7.0.0-rc13; one private chat each from two people, one
+group created that day, one group created in 2016; numbers masked before anything was
+written down).
+
+- *Who added the number.* The event for joining a group carries the adder twice: as a
+  linked-identity id (`<digits>@lid`) and as a phone id. Seen for a new group and for the
+  old one. Not seen: an adder who is not the group's creator (in both groups the same
+  person created the group and added the number), so `addedBy` stays "when known" and
+  AC-28 keeps refusing when it is absent. The event for the number being removed names the
+  remover by linked-identity id only.
+- *Private sender against the group's list.* They match directly. A private chat's
+  address is the person's linked-identity id; a group's participant list gives each
+  participant's linked-identity id with the phone id beside it; a group message names its
+  sender the same way. The linked-identity id was present in every event; the phone id
+  was absent in one. **This contradicts "preferring the phone form"** in Sender ids, which
+  is amended below: the linked-identity form is the canonical one.
+- *Group id shapes.* New group: 18 digits, `@g.us`. Old group: `<12 digits>-<10 digits>@g.us`,
+  the first part being its creator's number and the second its creation time. Both as the
+  Chat ids contract assumed.
+- *@mentions.* The text carries `@` followed by the mentioned person's linked-identity
+  digits, not their phone number, and the message lists the mentioned ids separately. A
+  mention of the number itself arrives the same way, as the number's own linked-identity
+  id. Sender ids is amended to say so.
+- *Not asked, but seen.* On pairing, the linked device is sent the phone's address book
+  (names with numbers) and history-sync notices, although full history sync is off; and
+  messages typed on the number's own phone arrive marked as its own. Security notes gain
+  a line for the first; the second is already dropped by the relay.
+
 **S1: one gate**
 
 - AC-1 Given every existing test under `control-plane/api/test`, when S1 is merged, then
@@ -223,7 +288,7 @@ a finding contradicts a contract below, a spec PR amends it first.
   unbound chat, so a person who is still in the trip's group can connect again (AC-29).
 - AC-16 Given the connections route, then each row carries only: binding id, kind, the
   group's title or the traveller's name, how it was made, when, and for a person the last
-  four digits of the number. No response of any route carries a full number or a code.
+  four digits of the number when they are known (`phone_last4`; absent otherwise). No response of any route carries a full number or a code.
 - AC-17 Given `teardown-trip.py --execute`, then the trip's live codes are expired before
   any other statement in the transaction (the lock order of `REVOKE_GROUP_TOKENS`), and
   its WhatsApp bindings close with the same reason as its Telegram ones, with
@@ -256,7 +321,8 @@ a finding contradicts a contract below, a spec PR amends it first.
   as `CHAT_NOT_IN_SCOPE`.
 - AC-23 Given a bound chat with the switch on, then a message reaches the trip's
   companion under exactly the conditions a Telegram message would (AC-2's gate), with
-  `source.platform = "whatsapp"` (subject to AC-0), the chat's id as `chat_id`
+  `source.platform` set to the gateway's primary platform (`"telegram"` today; AC-0 found
+  that a `"whatsapp"` stamp crashes the gateway), the chat's id as `chat_id`
   (Contracts), an opaque sender id and the sender's WhatsApp display name; a group
   message that is not addressed is held as overheard context exactly as on Telegram.
 - AC-24 Given a gateway `send` to a bound WhatsApp chat, then it passes the same scope
@@ -375,7 +441,9 @@ identify one chat on one platform:
 - Older WhatsApp groups carry their creator's phone number in the id
   (`<phone>-<timestamp>@g.us`). Those are not accepted in this slice: a code there gets
   one fixed line (AC-11), adding the number binds nothing, and nothing is stored. AC-0
-  confirms the shapes.
+  confirmed both shapes on 2026-11-22; a group made in 2016 has the old one, so a
+  long-standing family group is likely to be refused. Whether to accept them (behind an
+  alias, as private chats are) is an open question at the end of this file.
 
 ### Migration, S2 (one file, `YYYYMMDDHHMMSS_chat_binding_platform.sql`)
 
@@ -391,7 +459,12 @@ identify one chat on one platform:
   Telegram row. Staging holds no row that fails either (checked 2026-11-21: 125 rows,
   none); the production count is read before the release that carries the migration.
 - CHECK: `transport_address` is NULL unless the row is a WhatsApp private binding, and is
-  NULL on every closed row.
+  NULL on every closed row. It holds the address the bridge reports for the chat, as an
+  opaque string; since AC-0 that is normally a linked-identity address, not a number.
+- `phone_last4 text`, nullable: the last four digits of the person's number when the
+  bridge reported a phone id at binding time, else NULL. CHECK `^[0-9]{4}$`, and NULL
+  under the same conditions as `transport_address`. It is what AC-16 shows; nothing
+  derives digits from `transport_address`. Not granted to the monitor.
 - New close reasons: `dashboard_removed`, `rebound_by_code`, `left_group`,
   `membership_ended`. `closed_reason` has no enum (`0029`), and no existing reader
   branches on any of them.
@@ -425,8 +498,8 @@ platform-neutral by name; only `whatsapp` rows are written in this slice.
   separate contract step.
 - **The monitor's grants do not change.** It already reads `chat_id`, which now never
   holds a number; `transport_address` is not granted, and a test pins that.
-- **New code on the old schema.** Migrations are a separate step from a restart, and the
-  production release that carries this one waits for the freeze to end. The route query
+- **New code on the old schema.** Migrations are a separate step from a restart, so the
+  new code can run before the production release that carries this migration. The route query
   therefore reads the platform in a form that does not fail when the column is absent
   (absent reads as `telegram`; for example `COALESCE(to_jsonb(b)->>'platform','telegram')`),
   and no query on a path that Telegram traffic uses selects a new column (AC-5).
@@ -542,7 +615,12 @@ export function companionGate(turn: InboundTurn, outcome: NormalizeOutcome, deps
 ### Sender ids and phone numbers
 
 WhatsApp gives a participant as a phone id or a linked-identity id, sometimes both. The
-bridge reduces it to one canonical form, preferring the phone form when both are present.
+bridge reduces it to one canonical form, preferring the linked-identity form when both are
+present (amended 2026-11-22 after AC-0: it was present in every captured event and the
+phone form was not; the first draft preferred the phone form). A person who is ever seen
+with only a phone id would get a second opaque id; the bridge keeps the library's
+id-mapping to resolve one to the other, and a sender it cannot resolve is treated as
+unknown.
 The relay derives one opaque id from it: `wa_` + the first 32 hex characters of
 HMAC-SHA256(key, canonical id).
 
@@ -557,9 +635,11 @@ HMAC-SHA256(key, canonical id).
   WhatsApp Web library keeps per-participant key files there. That directory is a
   credential under the deployment's care (Configuration).
 - Before message text, a caption or replied-to text is used for anything (the gate,
-  overheard context, the judge, the wire), the relay rewrites every @mention of a number:
-  the number's own mention becomes the assistant's first name, anyone else's becomes
-  "someone". (Rewriting to a display name is a later refinement.)
+  overheard context, the judge, the wire), the relay rewrites every @mention: the text
+  carries `@` and the mentioned id's digits (a linked-identity id since AC-0, a phone
+  number on older clients), and the message lists the mentioned ids. Each listed id's
+  token, and any other `@` followed by seven or more digits, is rewritten: the number's
+  own mention becomes the assistant's first name, anyone else's becomes "someone". (Rewriting to a display name is a later refinement.)
 - `senderName` is the sender's WhatsApp display name: unverified, shown to the model as a
   name, never used for a decision, and empty rather than a number when the name is absent.
 - The number's own identity has two forms as well; reply-to-assistant and
@@ -754,9 +834,16 @@ pairing.
 - **Everyone in a bound group can talk to the companion**, as in a Telegram group. An
   organizer-gated action from WhatsApp is allowed exactly when AC-13 gives the sender
   the role that action needs on Telegram.
-- **Phone numbers** rest in one database column, `transport_address` of open private
-  bindings, and in the bridge's session directory (AC-27). An @mention writes a number
-  into message text, so text is rewritten before use. A plain hash of a phone number is
+- **Phone numbers** rest in the bridge's session directory (AC-27) and, in the database,
+  only as the four digits of `phone_last4` and in `transport_address` on the rare open
+  private binding whose address is a phone id (since AC-0 it is normally a
+  linked-identity address, which is still a personal identifier and is handled the same
+  way). An @mention writes an id into message text, so text is rewritten before use.
+- **Pairing hands the bridge the phone's address book** (names with numbers) and
+  history-sync notices (AC-0). The bridge discards both: it stores and forwards neither,
+  and S3 has a test that a contacts or history event produces no message, no log line with
+  a name or number, and no file outside the session directory. The number used is a
+  dedicated one with an empty address book. A plain hash of a phone number is
   reversible by enumeration, so the opaque id is keyed.
 - **The bridge receives every message of every group the number is in**, addressed or
   not, and the judge model reads group text at the trip's proactive level, as on Telegram.
@@ -817,8 +904,9 @@ Tests are written first, from the criteria.
 - Live trips feel nothing: the switch is off for every trip, no deployment has a
   `relay.whatsapp` block, the migrations are additive, and new code runs on the old
   schema (AC-5). The control-plane release that carries the S2 migration to the
-  production VM is after the Alsace freeze (not before 2026-12-07) and needs the owner's
-  own approval as any migration does.
+  production VM goes when it is ready (Dror, 2026-11-22: the Alsace freeze, which held it
+  until 2026-12-07, is lifted) and takes the usual path: `--dry-run` first, and the owner's
+  own approval if the dry run reports a `breaking` migration.
 - Staging gets it the usual way: merged to `main` switched off, picked up by the nightly
   redeploy. The staging bridge is started and paired by hand from the deployment
   repository. The S4 sitting uses a trip and a Telegram group that the PR #599 sitting
@@ -832,7 +920,8 @@ Tests are written first, from the criteria.
 
 **Answered by Dror, 2026-11-21:**
 
-1. **When.** Its own track, after Release 1.
+1. **When.** Its own track, after Release 1. **Changed 2026-11-22 (Dror):** no wait for
+   Release 1; each slice is built and deployed when it is ready.
 2. **The review's three choices stand.** Only the trip's owner binds a group by adding
    the number, onto the trip their own WhatsApp chat is connected to (AC-28); Remove
    sends nothing (AC-15); the owner's notice goes to WhatsApp, else Telegram, else the
@@ -847,7 +936,13 @@ Tests are written first, from the criteria.
 6. **Dependence on member sign-in.** Agreed: if WhatsApp is built first, S3 builds the
    traveller list to that spec's contract.
 
-**Still open, neither blocks the build on staging:**
+**Still open, none blocks the build on staging:**
+
+- **Old groups (raised by AC-0, 2026-11-22).** A group made before WhatsApp changed its
+  id format carries its creator's phone number in its id and is refused in this slice. A
+  family group that has existed for years is likely to be one. Accepting them means an
+  alias for group chat ids too, with the real id in `transport_address`: a change to the
+  Chat ids contract, AC-4 and AC-11. The owner decides whether that joins this track.
 
 - **Privacy wording.** The exact introduction line, and whether the published privacy
   policy needs a WhatsApp paragraph before a group outside the owner's family is bound.
