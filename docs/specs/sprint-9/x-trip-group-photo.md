@@ -1,6 +1,6 @@
 # The bot sets the trip group's Telegram photo from the trip logo
 
-Status: draft (2026-11-24) · Issue: none yet · Track: video look · Size: M · Tier: High
+Status: approved (2026-11-24, by Dror; D1 of x-trip-logo.md: on request) → in build after x-trip-logo · Issue: none yet · Track: video look · Size: M · Tier: High
 Security path: yes (control plane acts in a family's Telegram group) · Migration: probably (see Contracts) ·
 Live-trip behaviour: yes, once the switch is on for a trip
 
