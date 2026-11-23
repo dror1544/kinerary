@@ -1,6 +1,6 @@
 import { buildApp, type SignupDependencies, type InterviewDependencies, type PlannerDependencies, type ProvisionerDependencies, type ChatRoutingDependencies, type InterviewAgentDependencies, type OperatorDependencies, type AdminDependencies, type AssistantEventsIngestDependencies } from "./app.js";
 import { createNotificationAdapter } from "./adapters/notification.js";
-import { loadArchitectureProfile, validateBeforeProvider } from "./config.js";
+import { loadArchitectureProfile, validateBeforeProvider, whatsappPortalSettings } from "./config.js";
 import { createDatabasePool, databaseReadiness } from "./database.js";
 import { dispatchPendingTripNotifications } from "./outbox-dispatcher.js";
 import { startPlanChangePoller } from "./plan-change-poller.js";
@@ -197,6 +197,11 @@ if (profile.web) {
   }
   portal = { db: pool, google, telegramMiniApp, mailer, emailAuthLog: miniAppLog, runtimeAccounts: new HttpRuntimeAccountAdapter(profile.web.runtime_origin, runtimeExchangeKey), publicOrigin: profile.web.public_origin, runtimeOrigin: profile.web.runtime_origin, runtimeExchangeKey, runtimeUpstreamHostSuffixes: profile.web.runtime_upstream_host_suffixes, telegramBotUsername: profile.web.telegram_bot_username, sessionTtlSeconds: profile.web.session_ttl_seconds, enrollmentTtlSeconds: profile.signup?.enrollment_ttl_seconds ?? 86400, approvalTtlSeconds: 86400, operatorChatId };
 }
+
+// WhatsApp (spec 625): the deployment's number and the code lifetime, from `relay.whatsapp`, handed to the portal. Absent when
+// the profile has no such block (or no `web` block, and so no portal), and then every WhatsApp route answers 404 and no trip
+// page shows a section.
+if (portal) portal.whatsapp = whatsappPortalSettings(profile);
 
 // The interviewer agent's chat-addressed interview routes, which the MCP
 // sidecar forwards `get_interview_for_chat` / `submit_answer_for_chat` to.

@@ -239,13 +239,18 @@ class RetireInDbWhatsApp(unittest.TestCase):
             tx = self.render(trip)
             self.assertIn("IF to_regclass('control_plane.chat_binding_codes') IS NOT NULL THEN", tx)
 
-    def test_AC17_whatsapp_addresses_are_cleared_before_the_bindings_close_with_the_same_reason(self):
+    def test_AC17_every_whatsapp_binding_is_closed_and_cleared_in_one_statement_with_the_same_reason(self):
+        # The database requires `transport_address` on an OPEN WhatsApp row (group or private) and refuses it on a closed one,
+        # so it cannot be cleared first and closed after: one UPDATE does both, before the statement every platform shares.
         for trip in self.TRIPS:
             tx = self.render(trip)
-            self.assertIn("SET transport_address = NULL, phone_last4 = NULL", tx)
-            self.assertLess(tx.index("SET transport_address = NULL"), tx.index("closed_reason = 'trip_destroyed'"))
-            # one close statement for every platform, so one reason
-            self.assertEqual(tx.count("closed_reason = 'trip_destroyed'"), 1)
+            self.assertIn("SET closed_at = now(), closed_reason = 'trip_destroyed', transport_address = NULL, phone_last4 = NULL", tx)
+            self.assertIn("AND closed_at IS NULL AND platform = 'whatsapp'", tx)
+            self.assertNotIn("SET transport_address = NULL, phone_last4 = NULL\n", tx, "no clear-then-close pair")
+            wa = tx.index("platform = 'whatsapp'")
+            shared = tx.index("UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed'")
+            self.assertLess(wa, shared)
+            self.assertEqual(tx.count("closed_reason = 'trip_destroyed'"), 2, "one reason for both platforms")
 
     def test_AC17_the_dry_run_counts_live_whatsapp_codes_and_an_older_stack_counts_none(self):
         row = json.dumps({"id": "trip_abcdefgh12", "slug": "japan-2026", "lifecycle_state": "ready_private"})

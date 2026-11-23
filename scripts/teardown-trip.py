@@ -703,23 +703,24 @@ BEGIN
 END
 $wa_codes$"""
 
-# An open WhatsApp private binding holds the person's address in `transport_address` (and, optionally, the last four digits
-# of the number): the database refuses a CLOSED row that still holds either, so they are cleared BEFORE the bindings close,
-# in the same transaction. The close itself stays the one statement every platform shares, with the same reason.
-CLEAR_WHATSAPP_ADDRESSES = """DO $wa_addr$
+# EVERY open WhatsApp binding, group or private, holds the chat's real address in `transport_address` (spec 625; for an old
+# group it contains its creator's number), and the database both REQUIRES it on an open WhatsApp row and REFUSES it on a
+# closed one. So a WhatsApp binding cannot be cleared first and closed after: it is CLOSED AND CLEARED IN ONE STATEMENT, here,
+# with the same reason as every other binding. The statement after it (the shared close) then finds only Telegram rows.
+# Guarded like the code expiry, for a database without the columns.
+CLOSE_WHATSAPP_BINDINGS = """DO $wa_close$
 BEGIN
   IF to_regclass('control_plane.chat_binding_codes') IS NOT NULL THEN
     UPDATE control_plane.telegram_chat_bindings
-       SET transport_address = NULL, phone_last4 = NULL
-     WHERE trip_id = '{id}' AND closed_at IS NULL
-       AND (transport_address IS NOT NULL OR phone_last4 IS NOT NULL);
+       SET closed_at = now(), closed_reason = 'trip_destroyed', transport_address = NULL, phone_last4 = NULL
+     WHERE trip_id = '{id}' AND closed_at IS NULL AND platform = 'whatsapp';
   END IF;
 END
-$wa_addr$"""
+$wa_close$"""
 
 
 def retire_in_db(trip: dict) -> str:
-    # LOCK ORDER (issue #387), both branches: WhatsApp binding codes (spec 625: the first lock a redemption takes), group-binding tokens, intake
+    # LOCK ORDER (issue #387), both branches: group-binding tokens, intake
     # sessions, chat bindings, `trips` (rename branch), then the teardown-pin
     # clear LAST. It must agree with `executeClear` (control-plane/api/src/
     # trip-clear.ts: tokens, enrollments, sessions, bindings, `trips` LAST) and
@@ -742,7 +743,7 @@ def retire_in_db(trip: dict) -> str:
 {EXPIRE_CHAT_BINDING_CODES.format(id=trip['id'])};
 {REVOKE_GROUP_TOKENS.format(id=trip['id'])};
 {CLOSE_SESSIONS.format(id=trip['id'])};
-{CLEAR_WHATSAPP_ADDRESSES.format(id=trip['id'])};
+{CLOSE_WHATSAPP_BINDINGS.format(id=trip['id'])};
 UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed'
  WHERE trip_id = '{trip['id']}' AND closed_at IS NULL;
 {CLEAR_TEARDOWN_PIN.format(id=trip['id'])};
@@ -758,7 +759,7 @@ COMMIT;""")
 {EXPIRE_CHAT_BINDING_CODES.format(id=trip['id'])};
 {REVOKE_GROUP_TOKENS.format(id=trip['id'])};
 {CLOSE_SESSIONS.format(id=trip['id'])};
-{CLEAR_WHATSAPP_ADDRESSES.format(id=trip['id'])};
+{CLOSE_WHATSAPP_BINDINGS.format(id=trip['id'])};
 UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed'
  WHERE trip_id = '{trip['id']}' AND closed_at IS NULL;
 UPDATE control_plane.trips SET slug = '{new}', updated_at = now()

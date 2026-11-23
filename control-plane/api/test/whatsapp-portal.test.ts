@@ -15,7 +15,7 @@ import { sha256, type PortalDependencies } from "../src/portal.js";
 import { PORTAL_SCOPE_POLICY } from "../src/portal-scope.js";
 import { TEST_BOT_TOKEN, launchFields, signedInitData } from "./support/mini-app-init-data.js";
 import { testDatabaseUrl } from "./support/test-database.js";
-import { freshDatabase, mkMember, mkTrip, mkUser, mkWhatsappTrip, setWhatsappSwitch, uid, waSender } from "./support/whatsapp-fixture.js";
+import { freshDatabase, mkMember, mkTrip, mkUser, mkWhatsappTrip, setWhatsappSwitch, uid, waGroupId, waOldGroupAddress, waSender } from "./support/whatsapp-fixture.js";
 
 const SKIP = !testDatabaseUrl();
 const ORIGIN = "http://portal.example.test";
@@ -133,7 +133,7 @@ describe("whatsapp portal routes", { skip: SKIP }, () => {
     // the code really redeems, as that member
     const s = waSender();
     const code = /KWA-[A-HJ-NP-Z2-9]{8}/.exec(text)![0];
-    const redeemed = await redeemChatBindingCode(pool, { text, chatId: s.chatId, senderId: s.senderId });
+    const redeemed = await redeemChatBindingCode(pool, { text, chatId: s.chatId, senderId: s.senderId, transportAddress: "100000000000008@lid" });
     assert.ok(redeemed.ok && redeemed.kind === "me" && redeemed.accountUserId === f.member);
     void code;
   });
@@ -217,10 +217,10 @@ describe("whatsapp portal routes", { skip: SKIP }, () => {
   test("AC-16: the connections route carries only id, kind, name, how, when and the last four digits; no full number, no code, no chat id", async () => {
     const f = await fixture();
     const code = (kind: string) => call(f.owner, "POST", `/v1/trips/${f.tripId}/whatsapp-codes`, { kind }).then((r) => /KWA-[A-HJ-NP-Z2-9]{8}/.exec(decodeURIComponent(r.json().link))![0]);
-    const person = waSender(), groupChat = `${Math.floor(1e17 + Math.random() * 8e17)}@g.us`;
+    const person = waSender(), groupChat = waGroupId(), groupReal = waOldGroupAddress();
     const meCode = await code("me"), groupCode = await code("group");
     assert.ok((await redeemChatBindingCode(pool, { code: meCode, chatId: person.chatId, senderId: person.senderId, transportAddress: "100000000000001@lid", phoneLast4: "4567" })).ok);
-    assert.ok((await redeemChatBindingCode(pool, { code: groupCode, chatId: groupChat, senderId: person.senderId, chatTitle: "Family" })).ok);
+    assert.ok((await redeemChatBindingCode(pool, { code: groupCode, chatId: groupChat, senderId: person.senderId, chatTitle: "Family", transportAddress: groupReal })).ok);
     const r = await call(f.owner, "GET", `/v1/trips/${f.tripId}/whatsapp-connections`);
     evidence("owner GET whatsapp-connections", r);
     assert.equal(r.statusCode, 200);
@@ -229,7 +229,7 @@ describe("whatsapp portal routes", { skip: SKIP }, () => {
     assert.equal(list.length, 2);
     assert.deepEqual(list.map((c: { kind: string; name: string; via: string; lastFour?: string }) => [c.kind, c.name, c.via, c.lastFour ?? null]), [
       ["person", "Dana Owner", "dashboard_code", "4567"], ["group", "Family", "group_code", null]]);
-    for (const secret of [person.senderId, person.chatId, groupChat, "100000000000001", meCode, groupCode, meCode.slice(4), groupCode.slice(4), FIXTURE_NUMBER]) {
+    for (const secret of [person.senderId, person.chatId, groupChat, groupReal, groupReal.split("-")[0]!, "100000000000001", meCode, groupCode, meCode.slice(4), groupCode.slice(4), FIXTURE_NUMBER]) {
       assert.ok(!r.body.includes(secret), `the response carries ${secret.slice(0, 6)}...`);
     }
   });

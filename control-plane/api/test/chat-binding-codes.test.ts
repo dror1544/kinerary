@@ -15,10 +15,12 @@ import {
 } from "../src/chat-binding-codes.js";
 import { redeemGroupBindingToken, issueGroupBindingToken } from "../src/group-binding.js";
 import { removeMember } from "../src/member-removal.js";
+import { FakeNotificationAdapter } from "../src/adapters/notification.js";
+import { dispatchPendingTripNotifications } from "../src/outbox-dispatcher.js";
 import { testDatabaseUrl } from "./support/test-database.js";
 import {
   FIXTURE_ADDRESS, FIXTURE_PHONE_LAST4, freshDatabase, mkMember, mkTrip, mkUser, mkWhatsappTrip, openBinding, setWhatsappSwitch, uid,
-  waGroupId, waSender,
+  waGroupAddress, waGroupId, waOldGroupAddress, waSender,
 } from "./support/whatsapp-fixture.js";
 
 const SKIP = !testDatabaseUrl();
@@ -72,8 +74,9 @@ describe("chat binding codes against PostgreSQL", { skip: SKIP }, () => {
     assert.equal(r.ok, true, JSON.stringify(r));
     return (r as { code: string }).code;
   };
+  // The relay passes the chat's REAL address for a group as well as a private chat (it is required); a default for tests that do not care.
   const redeem = (code: string, chatId: string, senderId: string, extra: Record<string, unknown> = {}) =>
-    redeemChatBindingCode(pool, { text: `my code ${code}`, chatId, senderId, ...extra });
+    redeemChatBindingCode(pool, { text: `my code ${code}`, chatId, senderId, transportAddress: chatId.endsWith("@g") ? waGroupAddress() : FIXTURE_ADDRESS, ...extra });
   const codeRow = async (code: string) =>
     (await pool.query("SELECT * FROM control_plane.chat_binding_codes WHERE code_digest = $1 ORDER BY created_at DESC", [`sha256:${createHash("sha256").update(code).digest("hex")}`])).rows[0];
 
@@ -255,16 +258,17 @@ describe("chat binding codes against PostgreSQL", { skip: SKIP }, () => {
       await pool.query(
         "UPDATE control_plane.trips SET companion_intro = $2::jsonb WHERE id = $1",
         [tripId, JSON.stringify({ assistant_name: "Ziv", trip_title: "Alsace", private_url: "https://trip.example/alsace", language: "en", login_password: "hunter2-secret", organizer: "Dana", login_usernames: [{ name: "Dana", username: "dana" }] })]);
-      const group = waGroupId();
+      const group = waGroupId(), real = waGroupAddress();
       const stranger = waSender();
       const code = await issue(tripId, ownerId, "group");
-      const r = await redeem(code, group, stranger.senderId, { chatTitle: "  Family\ntrip  " });
+      const r = await redeem(code, group, stranger.senderId, { chatTitle: "  Family\ntrip  ", transportAddress: real });
       assert.ok(r.ok && r.kind === "group" && !r.alreadyConnected, "who sends it does not matter");
       const rows = await bindingsOf(group);
       assert.equal(rows.length, 1);
       assert.equal(rows[0].platform, "whatsapp");
       assert.equal(rows[0].chat_title, "Family trip");
-      assert.equal(rows[0].transport_address, null);
+      assert.equal(rows[0].chat_id, group, "the alias is the chat id; the real id is never stored there");
+      assert.equal(rows[0].transport_address, real, "the real id rests in transport_address on a group too");
       assert.equal((await codeRow(code)).state, "redeemed");
       assert.equal(redeemReplyLine(r), null, "the introduction, not a reply line, answers a new group");
       const intro = (await composeWhatsAppGroupIntroduction(pool, tripId))!;
@@ -273,6 +277,24 @@ describe("chat binding codes against PostgreSQL", { skip: SKIP }, () => {
       assert.doesNotMatch(intro, /hunter2-secret/);
       assert.doesNotMatch(intro, /KWA-/);
       assert.equal(await composeWhatsAppGroupIntroduction(pool, await mkTrip(pool)), null, "no stored facts, nothing to introduce");
+    });
+
+    test("AC-10 / AC-11: an OLD group (its real id carries its creator's number) binds behind its alias, and the number never reaches chat_id, the title or any response", async () => {
+      const { tripId, ownerId } = await mkWhatsappTrip(pool);
+      const group = waGroupId(), old = waOldGroupAddress();
+      assert.match(old, /^[0-9]{12}-[0-9]{10}@g\.us$/);
+      const r = await redeem(await issue(tripId, ownerId, "group"), group, waSender().senderId, { transportAddress: old });
+      assert.ok(r.ok && r.kind === "group", JSON.stringify(r));
+      const row = (await bindingsOf(group))[0];
+      assert.equal(row.transport_address, old);
+      assert.ok(!row.chat_id.includes(old.split("-")[0]!));
+      const listed = JSON.stringify(await listWhatsAppConnections(pool, tripId));
+      assert.ok(!listed.includes(old) && !listed.includes(old.split("-")[0]!), "the real id is not in the list");
+      assert.deepEqual((await listWhatsAppConnections(pool, tripId)).map((c) => c.name), [null], "a group with no title shows no name, never its address");
+      // Remove clears the address on a group too
+      const [conn] = await listWhatsAppConnections(pool, tripId);
+      assert.deepEqual(await removeWhatsAppConnection(pool, { tripId, bindingId: conn!.bindingId }), { ok: true });
+      assert.equal((await bindingsOf(group))[0].transport_address, null);
     });
 
     test("AC-10: the Hebrew introduction carries the disclosure line too and no password", async () => {
@@ -338,15 +360,25 @@ describe("chat binding codes against PostgreSQL", { skip: SKIP }, () => {
       assert.equal((await bindingsOf(g)).length, 1);
     });
 
-    test("AC-11: a group id that is not of an accepted shape binds nothing and spends nothing", async () => {
+    test("AC-11: a group whose REAL id is not of an accepted shape (or a chat with no address) binds nothing and spends nothing", async () => {
       const { tripId, ownerId } = await mkWhatsappTrip(pool);
       const code = await issue(tripId, ownerId, "group");
       const s = waSender();
-      for (const bad of ["12345678901-1234567890@g.us", "-1001234567", "100000000000001@lid", "120363025246125486@s.whatsapp.net"]) {
+      for (const bad of ["-1001234567", "100000000000001@lid", "120363025246125486@s.whatsapp.net", "123@g.us", "12345678901-@g.us", "12345678901-1234567890-5@g.us", "abc@g.us", "", "x".repeat(300)]) {
+        expectRefused(await redeem(code, waGroupId(), s.senderId, { transportAddress: bad }), "BAD_CHAT_ID", false);
+      }
+      expectRefused(await redeem(code, waGroupId(), s.senderId, { transportAddress: null }), "BAD_CHAT_ID", false);
+      // a raw real id is never a chat id, and a malformed alias is not one either
+      for (const bad of [waGroupAddress(), waOldGroupAddress(), `wa_${"a".repeat(31)}@g`, `wa_${"a".repeat(32)}@x`, "-100123"]) {
         expectRefused(await redeem(code, bad, s.senderId), "BAD_CHAT_ID", false);
       }
-      expectRefused(await redeem(await issue(tripId, ownerId, "me"), `${waSender().senderId}@p`, s.senderId), "BAD_CHAT_ID", false);
+      const me = await issue(tripId, ownerId, "me");
+      expectRefused(await redeem(me, `${waSender().senderId}@p`, s.senderId), "BAD_CHAT_ID", false);
+      expectRefused(await redeem(me, s.chatId, s.senderId, { transportAddress: null }), "BAD_CHAT_ID", false);
       assert.equal((await codeRow(code)).state, "issued");
+      assert.equal((await codeRow(me)).state, "issued");
+      // and both styles of a real group id are accepted
+      assert.ok((await redeem(code, waGroupId(), s.senderId, { transportAddress: waOldGroupAddress() })).ok);
     });
 
     test("AC-11: a trip retired, or switched off, at that moment binds nothing; the code was of the right kind so it is spent", async () => {
@@ -387,15 +419,15 @@ describe("chat binding codes against PostgreSQL", { skip: SKIP }, () => {
       const { tripId, ownerId } = await mkWhatsappTrip(pool);
       const limiter = new CodeAttemptLimiter({ perChatPerHour: 2 });
       const s = waSender();
-      assert.deepEqual(await handleCodeMessage(pool, limiter, { text: "hello there", chatId: s.chatId, senderId: s.senderId }), { handled: false });
+      assert.deepEqual(await handleCodeMessage(pool, limiter, { text: "hello there", chatId: s.chatId, senderId: s.senderId, transportAddress: FIXTURE_ADDRESS }), { handled: false });
       for (let i = 0; i < 3; i += 1) {
-        const out = await handleCodeMessage(pool, limiter, { text: "KWA-ABCD2345", chatId: s.chatId, senderId: s.senderId });
+        const out = await handleCodeMessage(pool, limiter, { text: "KWA-ABCD2345", chatId: s.chatId, senderId: s.senderId, transportAddress: FIXTURE_ADDRESS });
         assert.ok(out.handled && !out.silenced && out.reply);
       }
-      const silent = await handleCodeMessage(pool, limiter, { text: await issue(tripId, ownerId, "me"), chatId: s.chatId, senderId: s.senderId });
+      const silent = await handleCodeMessage(pool, limiter, { text: await issue(tripId, ownerId, "me"), chatId: s.chatId, senderId: s.senderId, transportAddress: FIXTURE_ADDRESS });
       assert.deepEqual(silent, { handled: true, silenced: true, reply: null }, "even a correct code is not handled once silenced");
       const other = waSender();
-      const good = await handleCodeMessage(pool, limiter, { text: `code ${await issue(tripId, ownerId, "me")}`, chatId: other.chatId, senderId: other.senderId });
+      const good = await handleCodeMessage(pool, limiter, { text: `code ${await issue(tripId, ownerId, "me")}`, chatId: other.chatId, senderId: other.senderId, transportAddress: FIXTURE_ADDRESS });
       assert.ok(good.handled && !good.silenced && good.result.ok);
     });
   });
@@ -506,9 +538,9 @@ describe("chat binding codes against PostgreSQL", { skip: SKIP }, () => {
     test("AC-16: each row carries only binding id, kind, name, how, when and the last four digits; never a chat id, address, sender id or code", async () => {
       const { tripId, ownerId } = await mkWhatsappTrip(pool);
       const noa = await mkUser(pool, "Noa Levi"); await mkMember(pool, tripId, noa, "member");
-      const p1 = waSender(), p2 = waSender(), g1 = waGroupId(), g2 = waGroupId();
+      const p1 = waSender(), p2 = waSender(), g1 = waGroupId(), g2 = waGroupId(), g1Real = waOldGroupAddress();
       const gcode = await issue(tripId, ownerId, "group");
-      assert.ok((await redeem(gcode, g1, p1.senderId, { chatTitle: "Family <b>group</b>" })).ok);
+      assert.ok((await redeem(gcode, g1, p1.senderId, { chatTitle: "Family <b>group</b>", transportAddress: g1Real })).ok);
       await openBinding(pool, { tripId, chatId: g2, platform: "whatsapp", title: "Added by the owner" });
       const mecode = await issue(tripId, noa, "me");
       assert.ok((await redeem(mecode, p1.chatId, p1.senderId, { transportAddress: FIXTURE_ADDRESS, phoneLast4: FIXTURE_PHONE_LAST4 })).ok);
@@ -525,7 +557,7 @@ describe("chat binding codes against PostgreSQL", { skip: SKIP }, () => {
       ]);
       for (const c of list) assert.deepEqual(Object.keys(c).filter((k) => !["bindingId", "kind", "name", "via", "connectedAt", "lastFour"].includes(k)), []);
       const text = JSON.stringify(list);
-      for (const secret of [p1.senderId, p2.senderId, p1.chatId, g1, g2, FIXTURE_ADDRESS, mecode, gcode, mecode.slice(4)]) assert.ok(!text.includes(secret), `leaked ${secret}`);
+      for (const secret of [p1.senderId, p2.senderId, p1.chatId, g1, g2, g1Real, g1Real.split("-")[0]!, FIXTURE_ADDRESS, mecode, gcode, mecode.slice(4)]) assert.ok(!text.includes(secret), `leaked ${secret}`);
       // other trips' connections are not listed
       assert.deepEqual(await listWhatsAppConnections(pool, (await mkWhatsappTrip(pool)).tripId), []);
     });
@@ -584,6 +616,36 @@ describe("chat binding codes against PostgreSQL", { skip: SKIP }, () => {
       assert.equal(rows[0].payload.name, "Noa");
       assert.ok(!JSON.stringify(rows[0].payload).includes(FIXTURE_PHONE_LAST4), "not even the last four digits");
       assert.match(whatsappConnectionNoticeText(rows[0].payload)!, /Noa connected their WhatsApp/);
+    });
+
+    test("AC-18: the Telegram fallback is actually SENT by the outbox dispatcher (not skipped), naming the group title or the traveller and never a number", async () => {
+      const { tripId, ownerId } = await mkWhatsappTrip(pool, { title: "Alsace" });
+      const tgId = "5550003";
+      await pool.query(
+        "INSERT INTO control_plane.telegram_organizer_links(id,user_id,telegram_subject_digest,verified_via) VALUES ($1,$2,$3,'enrollment_redemption')",
+        [uid("otl"), ownerId, `sha256:${createHash("sha256").update(tgId).digest("hex")}`]);
+      await openBinding(pool, { tripId, chatId: tgId });
+      const noa = await mkUser(pool, "Noa"); await mkMember(pool, tripId, noa, "member");
+      const person = waSender();
+      const personBinding = ((await redeem(await issue(tripId, noa, "me"), person.chatId, person.senderId, { transportAddress: FIXTURE_ADDRESS, phoneLast4: FIXTURE_PHONE_LAST4 })) as { bindingId: string }).bindingId;
+      const old = waOldGroupAddress();
+      const groupBinding = ((await redeem(await issue(tripId, ownerId, "group"), waGroupId(), person.senderId, { chatTitle: "Family", transportAddress: old })) as { bindingId: string }).bindingId;
+      const none = sink();
+      for (const bindingId of [personBinding, groupBinding]) await notifyOwnersOfNewBinding(pool, none, { bindingId });
+      assert.equal(none.sent.length, 0);
+      const adapter = new FakeNotificationAdapter();
+      const dispatched = await dispatchPendingTripNotifications(pool, adapter);
+      assert.ok(dispatched >= 2, "both notices were dispatched (earlier tests may have left others pending)");
+      const mine = adapter.messageCalls.filter((c) => c.chatId === tgId);
+      assert.equal(mine.length, 2);
+      const [first, second] = mine.map((c) => c.text);
+      assert.match(first!, /Noa connected their WhatsApp to "Alsace"/);
+      assert.match(second!, /"Family" was connected to "Alsace" on WhatsApp/);
+      for (const text of [first!, second!]) {
+        assert.ok(!text.includes(FIXTURE_PHONE_LAST4) && !text.includes(old.split("-")[0]!) && !/\d{5,}/.test(text), `a number in: ${text}`);
+      }
+      const states = (await pool.query("SELECT state FROM control_plane.notification_outbox WHERE trip_id=$1 AND notification_type='whatsapp_connection_notice'", [tripId])).rows;
+      assert.deepEqual(states, [{ state: "sent" }, { state: "sent" }]);
     });
 
     test("AC-18: with neither, only the dashboard list shows it; and the owner's own `me` connection is not announced to them", async () => {

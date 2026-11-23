@@ -625,10 +625,11 @@ class SweepTests(unittest.TestCase):
             "verified_via, platform, account_user_id) VALUES (%s, %s, %s, NULL, 'participant', 'dashboard_code', %s, %s)",
             (f"tpl_{rnd(8)}", trip["trip_id"], sender, platform, user_id))
         self.conn.execute(
-            "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile, platform, closed_at, closed_reason) "
-            "VALUES (%s, %s, %s, %s, 'whatsapp', %s, %s)",
-            (f"tcb_{rnd(8)}", sender + "@p", trip["trip_id"], trip["profile"], self.now if closed else None,
-             "dashboard_removed" if closed else None))
+            "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile, platform, "
+            "transport_address, closed_at, closed_reason) VALUES (%s, %s, %s, %s, 'whatsapp', %s, %s, %s)",
+            (f"tcb_{rnd(8)}", sender + "@p", trip["trip_id"], trip["profile"],
+             None if closed else "100000000000001@lid",           # an open WhatsApp binding always holds its address
+             self.now if closed else None, "dashboard_removed" if closed else None))
         return sender
 
     def test_AC19_an_open_whatsapp_private_binding_of_the_owner_makes_the_trip_current(self) -> None:
@@ -650,10 +651,11 @@ class SweepTests(unittest.TestCase):
         self.wa_private(closed_trip, owner_closed, closed=True)      # removed
         self.organizer(group_trip, "7105", role="owner")
         self.conn.execute(                                           # a WhatsApp GROUP is not a private chat
-            "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile, platform) "
-            "VALUES (%s, %s, %s, %s, 'whatsapp')",
-            (f"tcb_{rnd(8)}", "".join(secrets.choice("0123456789") for _ in range(18)) + "@g.us",
-             group_trip["trip_id"], group_trip["profile"]))
+            "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile, platform, transport_address) "
+            "VALUES (%s, %s, %s, %s, 'whatsapp', %s)",
+            (f"tcb_{rnd(8)}", "wa_" + secrets.token_hex(16) + "@g",      # every group is behind an alias
+             group_trip["trip_id"], group_trip["profile"],
+             "".join(secrets.choice("0123456789") for _ in range(18)) + "@g.us"))
         self.wa_private(nolink_trip, None)                           # a claim from the group: no account
         self.sweep().run()
         for t in (member_trip, closed_trip, group_trip, nolink_trip):

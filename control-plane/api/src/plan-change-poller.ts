@@ -342,6 +342,8 @@ export async function pollPlanChangesOnce(deps: PlanChangePollerDeps): Promise<P
   const summary: PollSummary = { polled: 0, enqueued: 0, failed: 0 };
   const eligible: string[] = [];
   try {
+    // Telegram groups only: `^-[0-9]{1,20}$` does not match a WhatsApp group's alias (`wa_<hex>@g`), so a trip whose only group
+    // is a WhatsApp one has nothing to post to and is not polled (spec 625; pinned by whatsapp-exclusions.test.ts).
     const candidates = await deps.db.query<{ trip_id: string }>(
       `SELECT DISTINCT trip_id FROM control_plane.telegram_chat_bindings
        WHERE closed_at IS NULL AND chat_id ~ '^-[0-9]{1,20}$'

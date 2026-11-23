@@ -4,6 +4,7 @@ import { structuredLog } from "./redaction.js";
 import { organizerIntroMessages, type IntroMessage, type ProactiveSettings } from "./companion-intro.js";
 import { issueGroupBindingToken } from "./group-binding.js";
 import { SIGN_IN_NOTICE_TYPE, signInNoticeText } from "./telegram-mini-app.js";
+import { CONNECTION_NOTICE_TYPE, whatsappConnectionNoticeText } from "./chat-binding-codes.js";
 import { confirmAudience, skippedLine } from "./trip-audience.js";
 import { renderPlanChangeLine, type PlanChange } from "./plan-change-line.js";
 
@@ -127,6 +128,9 @@ function operatorMessageTextFor(row: OutboxRow): string | null {
 function messageTextFor(row: OutboxRow, options?: DispatchOptions): string | IntroMessage[] | null {
   if (row.notification_type.startsWith("operator_")) return operatorMessageTextFor(row);
   if (row.notification_type === TRIP_PLAN_CHANGED_TYPE) return planChangedText(row);
+  // WhatsApp (spec 625, AC-18): the owner's Telegram fallback for "a group or a person connected". Wording lives with the code
+  // that queues it; the payload carries a title or a traveller's name and never a number.
+  if (row.notification_type === CONNECTION_NOTICE_TYPE) return whatsappConnectionNoticeText(row.payload ?? {});
   if (row.notification_type === SIGN_IN_NOTICE_TYPE) {
     // About an account, not a trip (trip_id is NULL). Wording lives with the
     // sign-in code that queues it.

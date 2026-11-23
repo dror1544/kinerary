@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import type pg from "pg";
 import { issueChatBindingCode, redeemChatBindingCode } from "../src/chat-binding-codes.js";
 import { testDatabaseUrl } from "./support/test-database.js";
-import { freshDatabase, mkTrip, mkWhatsappTrip, openBinding, waGroupId, waSender } from "./support/whatsapp-fixture.js";
+import { freshDatabase, mkTrip, mkWhatsappTrip, openBinding, waGroupId, waOldGroupAddress, waSender } from "./support/whatsapp-fixture.js";
 
 const SKIP = !testDatabaseUrl();
 const SCRIPT = fileURLToPath(new URL("../../../scripts/teardown-trip.py", import.meta.url));
@@ -45,7 +45,7 @@ describe("teardown-trip.py's transaction, run for real", { skip: SKIP }, () => {
     const spare = await issueChatBindingCode(pool, { tripId, userId: ownerId, kind: "me" });
     assert.ok(me.ok && grp.ok && spare.ok);
     assert.ok((await redeemChatBindingCode(pool, { code: me.code, chatId: s.chatId, senderId: s.senderId, transportAddress: "100000000000006@lid", phoneLast4: "4567" })).ok);
-    assert.ok((await redeemChatBindingCode(pool, { code: grp.code, chatId: g, senderId: s.senderId, chatTitle: "Family" })).ok);
+    assert.ok((await redeemChatBindingCode(pool, { code: grp.code, chatId: g, senderId: s.senderId, chatTitle: "Family", transportAddress: waOldGroupAddress() })).ok);
     await openBinding(pool, { tripId, chatId: "-1001000000077" });
     const slug = (await pool.query("SELECT slug FROM control_plane.trips WHERE id=$1", [tripId])).rows[0].slug;
 
@@ -55,6 +55,7 @@ describe("teardown-trip.py's transaction, run for real", { skip: SKIP }, () => {
     assert.equal((await pool.query("SELECT count(*)::int AS n FROM control_plane.chat_binding_codes WHERE trip_id=$1 AND state='issued'", [tripId])).rows[0].n, 0);
     const bindings = (await pool.query("SELECT chat_id, platform, closed_reason, transport_address, phone_last4 FROM control_plane.telegram_chat_bindings WHERE trip_id=$1 ORDER BY created_at", [tripId])).rows;
     assert.equal(bindings.length, 3);
+    assert.equal(bindings.filter((b) => b.platform === "whatsapp" && b.chat_id.endsWith("@g")).length, 1, "a group binding is among them");
     for (const b of bindings) {
       assert.equal(b.closed_reason, "trip_destroyed", `${b.platform} bindings close with the same reason`);
       assert.equal(b.transport_address, null);

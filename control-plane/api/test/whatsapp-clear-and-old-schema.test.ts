@@ -106,7 +106,7 @@ describe("AC-5: new code on the OLD schema", { skip: SKIP }, () => {
     await assert.rejects(issueChatBindingCode(pool, { tripId, userId: ownerId, kind: "me" }), { code: "42P01" });
     const s = waSender();
     // a code of the right shape is looked up in a table that is not there: an error, never a bound chat
-    await assert.rejects(redeemChatBindingCode(pool, { text: "KWA-ABCD2345", chatId: s.chatId, senderId: s.senderId }), { code: "42P01" });
+    await assert.rejects(redeemChatBindingCode(pool, { text: "KWA-ABCD2345", chatId: s.chatId, senderId: s.senderId, transportAddress: "100000000000007@lid" }), { code: "42P01" });
     await setWhatsappSwitch(pool, tripId, false);
   });
 });

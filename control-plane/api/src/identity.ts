@@ -189,19 +189,53 @@ export function isPrivateChatId(chatId: string): boolean {
   return /^\d{1,20}$/.test(chatId);
 }
 
-// ── WhatsApp chat ids: ONE place (docs/specs/sprint-9/625-whatsapp-via-relay.md, "Chat ids") ────────────────────────
-// A chat id identifies one chat on one platform and is never a phone number. The migration
-// (20261122090000_chat_binding_platform.sql) repeats these shapes in its CHECKs; change them together.
+// ── WhatsApp chat ids: ONE place (docs/specs/sprint-9/625-whatsapp-via-relay.md, "Contracts > Chat ids") ───────────
+// EVERY WhatsApp chat id is an alias built from a keyed hash, and never a phone number or a real WhatsApp id: a private
+// chat is `wa_<32 hex>@p`, a group is `wa_<32 hex>@g` (owner's decision 2026-11-23: old groups, whose real id carries
+// their creator's number, are supported behind the same alias). The real address goes in `transport_address`. The
+// migration (20261122090000_chat_binding_platform.sql) repeats the two alias shapes in its CHECKs; change them together.
 
-/** A WhatsApp group as stored and sent on the wire: its id with the suffix kept. Older, phone-carrying ids do not match. */
-export const WHATSAPP_GROUP_CHAT_ID = /^[0-9]{5,40}@g\.us$/;
+/** A WhatsApp group's chat id as stored and sent on the wire: the alias of its real id. */
+export const WHATSAPP_GROUP_CHAT_ID = /^wa_[0-9a-f]{32}@g$/;
 /** A WhatsApp private chat: the person's opaque id plus `@p`. */
 export const WHATSAPP_PRIVATE_CHAT_ID = /^wa_[0-9a-f]{32}@p$/;
 /** The person's opaque sender id (the key of a WhatsApp person link). */
 export const WHATSAPP_SENDER_ID = /^wa_[0-9a-f]{32}$/;
-/** SQL (POSIX regex) forms of the same shapes, for queries that classify a `chat_id` column. */
-export const WHATSAPP_GROUP_CHAT_ID_SQL = String.raw`^[0-9]{5,40}@g\.us$`;
+/**
+ * The REAL id of a WhatsApp group, as the bridge reports it and as `transport_address` holds it: a new group is digits,
+ * an old one is `<creator's number>-<creation time>`, both with `@g.us`. Anything else is "not of an accepted shape".
+ * This is what a group is judged on, never its alias.
+ */
+export const WHATSAPP_REAL_GROUP_ID = /^[0-9]{5,40}(-[0-9]{5,20})?@g\.us$/;
+export const isAcceptedWhatsAppGroupId = (realId: unknown): realId is string => typeof realId === "string" && WHATSAPP_REAL_GROUP_ID.test(realId);
+/** SQL (POSIX regex) forms of the chat-id shapes, for queries that classify a `chat_id` column. */
+export const WHATSAPP_GROUP_CHAT_ID_SQL = "^wa_[0-9a-f]{32}@g$";
 export const TELEGRAM_GROUP_CHAT_ID_SQL = "^-[0-9]{1,20}$";
+
+/**
+ * The opaque id of a WhatsApp person: `wa_` plus the first 32 hex characters of HMAC-SHA256(key, canonical id). It is
+ * `source.user_id` for the sender, the key of the person link, and with `@p` appended the person's private chat id.
+ *
+ * THE KEY IS PASSED IN. It is its own secret (`relay.whatsapp.sender_id_secret_ref`); this helper never reads the
+ * environment, and an empty key or id throws rather than hashing under a key nobody set. Rotating the key orphans every
+ * WhatsApp private binding and person link.
+ */
+export function whatsappOpaqueId(key: string | Buffer, canonicalId: string): string {
+  if (!key || key.length === 0) throw new Error("whatsappOpaqueId: the sender-id key is required");
+  if (typeof canonicalId !== "string" || canonicalId.length === 0) throw new Error("whatsappOpaqueId: an id is required");
+  return `wa_${createHmac("sha256", key).update(canonicalId).digest("hex").slice(0, 32)}`;
+}
+
+/**
+ * A WhatsApp chat's alias, the only form of its id that is stored, logged or sent to a gateway. `private`: the person's
+ * canonical id, hashed, plus `@p` (equal to `whatsappOpaqueId(key, id) + "@p"`). `group`: the group's real id (which must be
+ * of an accepted shape, old or new), hashed with the SAME key, plus `@g`. No lookup is needed in either direction of a
+ * receive: the relay computes the alias from what the bridge reports and reads the address off the open binding to send.
+ */
+export function whatsappChatAlias(key: string | Buffer, realId: string, kind: "private" | "group"): string {
+  if (kind === "group" && !isAcceptedWhatsAppGroupId(realId)) throw new Error("whatsappChatAlias: not an accepted WhatsApp group id");
+  return `${whatsappOpaqueId(key, realId)}@${kind === "group" ? "g" : "p"}`;
+}
 
 export type ChatPlatform = "telegram" | "whatsapp";
 export type ChatKind = "private" | "group" | "unknown";

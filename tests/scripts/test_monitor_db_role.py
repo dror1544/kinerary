@@ -287,6 +287,15 @@ VALUES ('ntf_seed00001', 'trip_ready', 'telegram', 'failed', 3, 3, 'trip_seed000
         '{"text": "CANARY-PAYLOAD"}');
 INSERT INTO control_plane.telegram_chat_bindings (id, chat_id, trip_id, hermes_profile)
 VALUES ('tcb_seed00001', '-1009', 'trip_seed0001', 'seedprofile');
+-- WhatsApp (spec 625): a group and a private chat, both behind aliases, each holding its real address in
+-- transport_address (the group's id here is an old-style one, which carries its creator's number) and a title / four digits
+-- the role must never read. The canaries are what the assertions below look for.
+INSERT INTO control_plane.telegram_chat_bindings (id, chat_id, trip_id, hermes_profile, platform, chat_title,
+                                                  transport_address, phone_last4)
+VALUES ('tcb_seed00002', 'wa_' || repeat('a', 32) || '@g', 'trip_seed0001', 'seedprofile', 'whatsapp', 'CANARY-GROUP-TITLE',
+        '15550100123-1500000000@g.us', NULL),
+       ('tcb_seed00003', 'wa_' || repeat('b', 32) || '@p', 'trip_seed0001', 'seedprofile', 'whatsapp', NULL,
+        'CANARY-PERSON-ADDRESS@lid', '4321');
 INSERT INTO control_plane.trip_person_links (id, trip_id, telegram_user_id, participant_username, display_name, role,
                                              verified_via)
 VALUES ('tpl_seed00001', 'trip_seed0001', '1001', 'CANARY-USERNAME', 'CANARY-NAME', 'organizer', 'interview_chat');
@@ -604,6 +613,25 @@ class AgainstPostgres(unittest.TestCase):
             self.assertIn(section, alerts, "the seed no longer exercises every alert query")
 
     @unittest.skipUnless(NODE, "node is not installed")
+    def test_whatsapp_chats_are_classified_by_the_shape_of_their_alias_and_no_address_or_title_reaches_the_monitor(self):
+        """Spec 625: `trip_detail` shows a WhatsApp group as a group and a WhatsApp private chat as private, decided from the
+        id's shape, and none of `transport_address`, `chat_title`, `phone_last4`, the alias itself or an old group's embedded
+        number appears in any tool's output. A WhatsApp private chat does not satisfy "the organizer has a Telegram private
+        chat", so a live trip with only one still raises the "no private chat bound" alert."""
+        code, detail, err = self.fleet(self.url(), ["--tool", "trip_detail", "--trip", "seed-live-2026"])
+        self.assertEqual(code, 0, err)
+        section = detail.split("TELEGRAM BINDINGS", 1)[1].split("\n\n", 1)[0]
+        kinds = [word for line in section.splitlines()[1:] for word in line.split()[:1] if word in ("group", "private", "unknown")]
+        self.assertEqual(sorted(kinds), ["group", "group", "private"], section)
+        for call in FLEET_CALLS + [["--tool", "alerts"]]:
+            _, out, _ = self.fleet(self.url(), call)
+            for secret in ("CANARY-GROUP-TITLE", "CANARY-PERSON-ADDRESS", "15550100123", "1500000000", "4321",
+                           "wa_" + "a" * 32, "wa_" + "b" * 32):
+                self.assertNotIn(secret, out, f"{' '.join(call)} leaked {secret}")
+        _, alerts, _ = self.fleet(self.url(), ["--tool", "alerts"])
+        self.assertIn("seed-live-2026 — site is up, no private chat bound", alerts)
+
+    @unittest.skipUnless(NODE, "node is not installed")
     def test_companion_usage_is_counted_correctly_by_the_real_query_as_the_role(self):
         """The stand-in psql cannot tell whether the SQL is right; this can. A wrong query would not fail the
         tool (a usage failure is reported in words, the digest carries on), so the text is asserted, not the exit."""
@@ -733,6 +761,9 @@ class AgainstPostgres(unittest.TestCase):
             "SELECT display_name, participant_username, telegram_user_id FROM control_plane.trip_person_links",
             "SELECT source_text FROM control_plane.interview_interpretations",
             "SELECT recipient, payload FROM control_plane.notification_outbox",
+            "SELECT transport_address FROM control_plane.telegram_chat_bindings",
+            "SELECT phone_last4, chat_title, platform FROM control_plane.telegram_chat_bindings",
+            "SELECT * FROM control_plane.chat_binding_codes",
             "SELECT data FROM control_plane.intake_versions",
             "SELECT applied_at FROM public.control_plane_schema_migrations",
         ]

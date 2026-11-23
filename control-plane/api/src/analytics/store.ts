@@ -517,7 +517,7 @@ export async function rollupAssistantEvents(
   }
 
   // The groups' CURRENT levels, one read for every trip in the result. A group is a group by the shape of its id, the SQL
-  // form of `chatKind` (identity.ts): a Telegram group's id is negative, a WhatsApp group's ends `@g.us`. A private chat's
+  // form of `chatKind` (identity.ts): a Telegram group's id is negative, a WhatsApp group's is the alias `wa_<hex>@g`. A private chat's
   // binding, on either platform, is not a group and has no level to show. Neither pattern reads the platform column, so
   // this runs on a database from before the WhatsApp migration.
   const tripIds = [...new Set([...days.values()].map((d) => d.trip_id))];

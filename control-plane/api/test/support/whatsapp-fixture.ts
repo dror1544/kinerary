@@ -70,9 +70,19 @@ export function waSender(): { senderId: string; chatId: string } {
   return { senderId, chatId: `${senderId}@p` };
 }
 
-/** A new-style WhatsApp group id (18 digits). */
+/** A WhatsApp group's chat id: the ALIAS (`wa_<32 hex>@g`), the only form stored in `chat_id`. */
 export function waGroupId(): string {
+  return `wa_${randomBytes(16).toString("hex")}@g`;
+}
+
+/** A group's REAL id as the bridge reports it, new style (18 digits). Rests only in `transport_address`. */
+export function waGroupAddress(): string {
   return `${Math.floor(1e17 + Math.random() * 8e17)}@g.us`;
+}
+
+/** An OLD-style group's real id: its creator's number, a dash and its creation time. A test value, not a real number. */
+export function waOldGroupAddress(): string {
+  return `${Math.floor(1e11 + Math.random() * 8e11)}-${Math.floor(1e9 + Math.random() * 8e9)}@g.us`;
 }
 
 /** A WhatsApp address as the bridge reports it. A fixture value: the code treats it as opaque. */
@@ -84,11 +94,14 @@ export async function openBinding(pool: pg.Pool, input: {
   transportAddress?: string | null; phoneLast4?: string | null;
 }): Promise<string> {
   const id = uid("tcb");
+  // An open WhatsApp binding always carries the real address (the database requires it): a default for a fixture that does not care.
+  const address = input.transportAddress !== undefined ? input.transportAddress
+    : input.platform === "whatsapp" ? (input.chatId.endsWith("@g") ? waGroupAddress() : FIXTURE_ADDRESS) : null;
   await pool.query(
     `INSERT INTO control_plane.telegram_chat_bindings (id, chat_id, trip_id, hermes_profile, platform, chat_title, transport_address, phone_last4)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
     [id, input.chatId, input.tripId, input.profile === undefined ? "gw-test" : input.profile, input.platform ?? "telegram",
-      input.title ?? null, input.transportAddress ?? null, input.phoneLast4 ?? null],
+      input.title ?? null, address, input.phoneLast4 ?? null],
   );
   return id;
 }

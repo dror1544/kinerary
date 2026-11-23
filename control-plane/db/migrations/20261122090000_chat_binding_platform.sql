@@ -8,14 +8,17 @@
 -- `telegram_chat_bindings_active_chat_idx` (group-binding.ts matches that name). A rename would break the fleet monitor's
 -- column grants (deployment/monitor-db-role.sql), about forty readers in four languages, and the `compatible` header.
 --
--- THE CHAT ID NEVER HOLDS A PHONE NUMBER. A WhatsApp group is `<digits>@g.us`; a WhatsApp private chat is the alias
--- `wa_<32 hex>@p`, built from a keyed hash of the person's id. The three shapes (Telegram digits, with an optional
--- minus; the group; the alias) cannot overlap, so one unique index over open `chat_id`s still means "one open binding
--- per chat" across platforms, and a chat id alone selects its row without anyone passing a platform in.
+-- THE CHAT ID NEVER HOLDS A PHONE NUMBER. Every WhatsApp chat id is an ALIAS built from a keyed hash: a private chat is
+-- `wa_<32 hex>@p` (the person's opaque id plus `@p`), a group is `wa_<32 hex>@g` (a hash of the group's real id plus
+-- `@g`). A group's real id is not stored in `chat_id`, old or new: an old group's id is `<creator's number>-<creation
+-- time>@g.us` (owner's decision 2026-11-23: old groups are supported, so they are behind an alias too). The three shapes
+-- (Telegram digits, with an optional minus; the group alias; the private alias) cannot overlap, so one unique index over
+-- open `chat_id`s still means "one open binding per chat" across platforms, and a chat id alone selects its row without
+-- anyone passing a platform in.
 --
--- THE ONE COLUMN THAT HOLDS A NUMBER is `transport_address`, on an open WhatsApp private binding, because the relay
--- needs it to send. The database refuses it anywhere else and on every closed row, and the monitor's role is not granted
--- it (a test pins that).
+-- THE REAL ADDRESS rests in `transport_address`, on EVERY open WhatsApp binding, group or private, because the relay needs
+-- it to send (for an old group it contains its creator's number). The database REQUIRES it on an open WhatsApp row and
+-- refuses it anywhere else and on every closed row, and the monitor's role is not granted it (a test pins that).
 --
 -- THE PREVIOUS RELEASE keeps running on this schema: every column below is added with a default or as nullable, every
 -- writer that names no platform gets 'telegram', and the CHECKs refuse such a writer a WhatsApp id instead of letting a
@@ -30,7 +33,7 @@ ALTER TABLE control_plane.telegram_chat_bindings
   -- AC-16: the last four digits of the person's phone number, shown to the owner so they can tell their own phone from
   -- a stranger's. OPTIONAL: a person's WhatsApp id is normally a linked-identity (LID) address, not a phone number, so
   -- `transport_address` is an opaque string and nothing is parsed out of it. The relay passes this in at binding time
-  -- when the bridge reported a phone number, and it is NULL otherwise. Same lifetime as `transport_address`.
+  -- when the bridge reported a phone number, and it is NULL otherwise. Only on an open WhatsApp PRIVATE binding.
   ADD COLUMN phone_last4       text;
 
 ALTER TABLE control_plane.telegram_chat_bindings
@@ -40,15 +43,15 @@ ALTER TABLE control_plane.telegram_chat_bindings
   -- without a platform from turning a WhatsApp id into a Telegram row.
   ADD CONSTRAINT telegram_chat_bindings_platform_chat_shape_ck
     CHECK (
-      (platform = 'whatsapp' AND (chat_id ~ '^[0-9]{5,40}@g\.us$' OR chat_id ~ '^wa_[0-9a-f]{32}@p$'))
+      (platform = 'whatsapp' AND (chat_id ~ '^wa_[0-9a-f]{32}@g$' OR chat_id ~ '^wa_[0-9a-f]{32}@p$'))
       OR (platform = 'telegram' AND chat_id !~ '@')
     ),
-  -- A real address only on an OPEN WhatsApp private binding; NULL on everything else and on every closed row.
+  -- The real address is set on every OPEN WhatsApp binding and nowhere else: NULL on a Telegram row and on every closed
+  -- row, and required on an open WhatsApp row (the relay could not send without it).
   ADD CONSTRAINT telegram_chat_bindings_transport_address_ck
     CHECK (
-      transport_address IS NULL
-      OR (platform = 'whatsapp' AND chat_id ~ '^wa_[0-9a-f]{32}@p$' AND closed_at IS NULL
-          AND char_length(transport_address) BETWEEN 1 AND 256)
+      (transport_address IS NOT NULL) = (platform = 'whatsapp' AND closed_at IS NULL)
+      AND (transport_address IS NULL OR char_length(transport_address) BETWEEN 1 AND 256)
     ),
   ADD CONSTRAINT telegram_chat_bindings_phone_last4_ck
     CHECK (

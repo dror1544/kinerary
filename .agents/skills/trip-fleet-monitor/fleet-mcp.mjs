@@ -1164,11 +1164,12 @@ async function tripDetail({ stack = CONFIG.defaultStack, trip }) {
                           coalesce(to_char(n.sent_at,'MM-DD HH24:MI'),'-')
                      FROM control_plane.notification_outbox n JOIN control_plane.trips t ON t.id = n.trip_id
                     WHERE ${match} ORDER BY n.created_at DESC LIMIT 20;`),
-    // chat_id is TEXT, so the sign is read from the string (Telegram groups are
-    // negative). `b.chat_id < 0` is a type error, and before ON_ERROR_STOP that
-    // error surfaced here as "(none)". The raw id is not returned: the agent
-    // needs to know a chat exists, not which one.
-    runSql(stack, `SELECT CASE WHEN b.chat_id LIKE '-%' THEN 'group' ELSE 'private' END,
+    // chat_id is TEXT, so the kind is read from the SHAPE of the string (chatKindSql: a Telegram group is minus-digits, a
+    // WhatsApp group is the alias `wa_<hex>@g`, a WhatsApp private chat `wa_<hex>@p`). `b.chat_id < 0` is a type error, and
+    // before ON_ERROR_STOP that error surfaced here as "(none)". The raw id is not returned: the agent needs to know a chat
+    // exists, not which one. The monitor's role is not granted `chat_title` or `transport_address`, so no free text and no
+    // address is selected here; a free-text column added later must be folded with foldSql, like the reports below.
+    runSql(stack, `SELECT ${chatKindSql("b.chat_id")},
                           coalesce(b.hermes_profile,'-'),
                           CASE WHEN b.closed_at IS NULL THEN 'open' ELSE 'closed: ' || coalesce(b.closed_reason,'?') END,
                           to_char(b.created_at,'MM-DD HH24:MI')
@@ -1824,6 +1825,17 @@ async function columnExists(stack, table, column) {
  * the field boundary, and this protects the row boundary.
  */
 const NL = "\x1e";
+/**
+ * A chat's kind from the SHAPE of its id (spec 625, "Chat kind"), as SQL: a group is a Telegram group (minus-digits) or a
+ * WhatsApp group alias, private is a Telegram private chat (digits) or a WhatsApp private alias, and anything else is
+ * 'unknown' (shown, never guessed at). Reads no platform column, which the monitor's role does not have.
+ */
+function chatKindSql(col) {
+  return `CASE WHEN ${col} ~ '^-[0-9]{1,20}$' OR ${col} ~ '^wa_[0-9a-f]{32}@g$' THEN 'group'
+               WHEN ${col} ~ '^[0-9]{1,20}$' OR ${col} ~ '^wa_[0-9a-f]{32}@p$' THEN 'private'
+               ELSE 'unknown' END`;
+}
+
 const foldSql = (col) => `replace(replace(replace(${col}, E'\\r', ''), E'\\n', E'\\x1e'), E'\\x1f', ' ')`;
 const unfold = (value) => String(value ?? "").split(NL);
 
@@ -1933,12 +1945,14 @@ async function loadAlerts(stack, h) {
     // assistant behind it. This is exactly how the 2026-09-15 trip failed.
     // chat_id is TEXT: this check was written as `b.chat_id > 0`, a type error
     // that — before ON_ERROR_STOP — returned no rows, so it could never fire.
+    // "Private chat" here is the organizer's TELEGRAM private chat (plain digits): a WhatsApp private chat (`wa_<hex>@p`)
+    // does not satisfy it, because the question is whether the Telegram companion has anyone to talk to.
     runSql(stack, `SELECT t.slug
                      FROM control_plane.trips t
                     WHERE t.lifecycle_state = 'ready_private' AND ${tripClassSql(stack)} = 'live'
                       AND NOT EXISTS (SELECT 1 FROM control_plane.telegram_chat_bindings b
                                        WHERE b.trip_id = t.id AND b.closed_at IS NULL
-                                         AND b.chat_id NOT LIKE '-%')
+                                         AND b.chat_id ~ '^[0-9]{1,20}$')
                     ORDER BY t.slug;`),
     // A live interview whose model calls are failing. Nothing else here would
     // show it: the router covers for a failed call by asking its own question,

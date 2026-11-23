@@ -12,11 +12,13 @@
  * sender id and a message text passed in as plain arguments; the relay (S3) calls them and sends what they return. The
  * only thing injected is the sink an owner notice is sent through (`WhatsAppSink`).
  *
- * WHAT NEVER APPEARS HERE: a phone number. A chat id is a group's id or an alias (`wa_<32 hex>@p`); a sender id is the
- * same opaque alias without the suffix. The one place a real address rests is `transport_address` of an open private
- * binding, written from a parameter the relay passes in and cleared whenever the binding closes. Nothing in this file
- * parses it, logs it, or returns it. The last four digits the dashboard shows (AC-16) are an OPTIONAL value passed in at
- * binding time (`phone_last4`), null when the bridge reported no phone number.
+ * WHAT NEVER APPEARS HERE: a phone number or a real WhatsApp id. EVERY chat id is an alias (`wa_<32 hex>@p` for a person,
+ * `wa_<32 hex>@g` for a group, computed by the relay with `whatsappChatAlias`); a sender id is the person's alias without
+ * the suffix. The one place a real address rests is `transport_address` of an OPEN binding, group or private (for an old
+ * group the real id contains its creator's number), written from a parameter the relay passes in and cleared whenever the
+ * binding closes. For a group, the real id is the one thing the accepted-shape rule is judged on. Nothing in this file
+ * logs it or returns it. The last four digits the dashboard shows (AC-16) are an OPTIONAL value passed in at binding time
+ * (`phone_last4`), null when the bridge reported no phone number.
  *
  * OLD SCHEMA. Functions that run on a Telegram-only path in a deployment that has not applied the S2 migration yet
  * (`closeEndedMembershipBindings`, called from `removeMember`) ask `whatsappSchemaPresent` first and do nothing when the
@@ -33,7 +35,7 @@ import { companionIntroFacts, companionIntroLoginUsernames } from "./chat-router
 import { groupIntroText, type CompanionIntroFacts } from "./companion-intro.js";
 import { featureEnabled } from "./feature-switches.js";
 import { TOKEN_ALPHABET, openBinding } from "./group-binding.js";
-import { WHATSAPP_GROUP_CHAT_ID, WHATSAPP_PRIVATE_CHAT_ID, WHATSAPP_SENDER_ID, chatKind } from "./identity.js";
+import { WHATSAPP_GROUP_CHAT_ID, WHATSAPP_PRIVATE_CHAT_ID, WHATSAPP_SENDER_ID, chatKind, isAcceptedWhatsAppGroupId } from "./identity.js";
 import { structuredLog } from "./redaction.js";
 import { SECONDARY_ORGANIZER_ROLE } from "./organizer-trips.js";
 import { NOT_RETIRED_SQL } from "./trip-retirement.js";
@@ -203,11 +205,16 @@ export interface RedeemInput {
   text?: string | null;
   /** Or the code itself, already extracted. */
   code?: string | null;
-  /** The WhatsApp chat id: a group's id, or the private chat's alias. */
+  /** The WhatsApp chat's ALIAS: `wa_<32 hex>@g` for a group, `wa_<32 hex>@p` for a private chat. Never a real WhatsApp id. */
   chatId: string;
   /** The sender's opaque id (`wa_<32 hex>`). For a private chat, `chatId` must be this plus `@p`. */
   senderId: string;
-  /** What the relay needs in order to send to a private chat, written to `transport_address`. Opaque; never parsed. */
+  /**
+   * The chat's REAL address, written to `transport_address` (the relay needs it to send), for a group as well as a private
+   * chat. REQUIRED. For a group it must be a real group id of an accepted shape (`isAcceptedWhatsAppGroupId`, old
+   * groups included): the accepted-shape rule is judged on THIS, not on the alias. For a private chat it is whatever
+   * address the bridge reports, an opaque string that is never parsed.
+   */
   transportAddress?: string | null;
   /** The last four digits of the sender's phone number when the bridge reported one (AC-16). Optional. */
   phoneLast4?: string | null;
@@ -287,9 +294,12 @@ export async function redeemChatBindingCode(db: pg.Pool, input: RedeemInput): Pr
   const kindOfChat = chatKind(input.chatId);
   const isGroup = WHATSAPP_GROUP_CHAT_ID.test(input.chatId);
   const isPrivate = WHATSAPP_PRIVATE_CHAT_ID.test(input.chatId);
-  // An id that is not of an accepted WhatsApp shape (an old, phone-carrying group id, a Telegram id) binds nothing and
-  // spends nothing: we cannot even say which kind of code would fit it.
+  // A chat id that is not an alias of an accepted WhatsApp shape (a real group id, a Telegram id) binds nothing and spends
+  // nothing: we cannot even say which kind of code would fit it. The same for a group whose REAL id (the address the relay
+  // passes in) is not of an accepted shape, old style included, and for any chat with no address to send to.
   if ((!isGroup && !isPrivate) || kindOfChat === "unknown") return { ok: false, reason: "BAD_CHAT_ID", spent: false };
+  const address = typeof input.transportAddress === "string" && input.transportAddress.length > 0 && input.transportAddress.length <= 256 ? input.transportAddress : null;
+  if (address === null || (isGroup && !isAcceptedWhatsAppGroupId(address))) return { ok: false, reason: "BAD_CHAT_ID", spent: false };
   if (isPrivate && (!WHATSAPP_SENDER_ID.test(input.senderId) || input.chatId !== `${input.senderId}@p`)) {
     return { ok: false, reason: "BAD_CHAT_ID", spent: false };
   }
@@ -343,7 +353,7 @@ export async function redeemChatBindingCode(db: pg.Pool, input: RedeemInput): Pr
         await client.query("COMMIT");
         return { ok: true, kind: "group", tripId: row.trip_id, tripTitle: row.trip_title, bindingId: bound.id, alreadyConnected: true };
       }
-      const bindingId = await openBinding(client, input.chatId, row.trip_id, { chatTitle: cleanChatText(input.chatTitle) });
+      const bindingId = await openBinding(client, input.chatId, row.trip_id, { chatTitle: cleanChatText(input.chatTitle), transportAddress: address });
       await spend(bindingId);
       await client.query("COMMIT");
       return { ok: true, kind: "group", tripId: row.trip_id, tripTitle: row.trip_title, bindingId, alreadyConnected: false };
@@ -383,7 +393,7 @@ export async function redeemChatBindingCode(db: pg.Pool, input: RedeemInput): Pr
     }
 
     const bindingId = await openBinding(client, input.chatId, row.trip_id, {
-      transportAddress: typeof input.transportAddress === "string" && input.transportAddress ? input.transportAddress : null,
+      transportAddress: address,
       phoneLast4: cleanLast4(input.phoneLast4),
     });
     await client.query(
