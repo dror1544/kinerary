@@ -940,6 +940,24 @@ const HOME_CURRENCY = (() => {
   return c && c !== 'USD' ? c : null;
 })();
 const CURRENCY_CACHE_MS = 24 * 60 * 60 * 1000;
+// Upstream base. CURRENCY_RATES_BASE_URL overrides it so tests can point the
+// route at a local stand-in; it is a server-side fetch, so only https, or http
+// to a loopback host, is accepted. Anything else (and any credentials, query or
+// fragment) is refused: logged, never fetched, and the route answers its usual
+// 502. The value itself is not logged, as it could carry credentials.
+const CURRENCY_RATES_BASE = (() => {
+  const raw = process.env.CURRENCY_RATES_BASE_URL;
+  if (!raw) return 'https://api.frankfurter.dev';
+  let u = null;
+  try { u = new URL(raw); } catch { /* refused below */ }
+  const loopback = u && (u.hostname === 'localhost' || u.hostname === '[::1]' || /^127(\.\d{1,3}){3}$/.test(u.hostname));
+  if (!u || u.username || u.password || u.search || u.hash
+      || !(u.protocol === 'https:' || (u.protocol === 'http:' && loopback))) {
+    console.error('[currency-rates] CURRENCY_RATES_BASE_URL refused (https, or http to a loopback host, only) — rate lookups disabled');
+    return null;
+  }
+  return u.origin + u.pathname.replace(/\/+$/, '');
+})();
 let currencyRatesCache = null; // { base, home, rates, date, fetchedAt }
 
 function destinationCurrencyCodes() {
@@ -961,7 +979,8 @@ async function getCurrencyRates() {
   if (HOME_CURRENCY && !codes.includes(HOME_CURRENCY)) codes.push(HOME_CURRENCY);
   if (!codes.length) return { base: 'USD', home: HOME_CURRENCY, rates: {}, date: null };
 
-  const r = await fetch(`https://api.frankfurter.dev/v1/latest?from=USD&to=${codes.join(',')}`, { timeout: 8000 });
+  if (!CURRENCY_RATES_BASE) throw new Error('rate lookup disabled (CURRENCY_RATES_BASE_URL refused)');
+  const r = await fetch(`${CURRENCY_RATES_BASE}/v1/latest?from=USD&to=${codes.join(',')}`, { timeout: 8000 });
   if (!r.ok) throw new Error(`rate lookup → ${r.status}`);
   const data = await r.json();
   currencyRatesCache = { base: 'USD', home: HOME_CURRENCY, rates: data.rates || {}, date: data.date, fetchedAt: Date.now() };

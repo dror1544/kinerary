@@ -5,11 +5,18 @@
  * current exchange rate" can hallucinate. Fixed by having the model report
  * only the raw amount + ISO currency code, and doing the actual conversion
  * here against a real, free, keyless exchange-rate API (frankfurter.dev).
- * These tests hit that real API — no mocking — since the entire point is
- * proving the number is real, not reimplementing the same guess.
+ *
+ * These tests no longer call that API: a third party being down failed the
+ * nightly preflight (2026-11-23), and the claim under test is that the number
+ * comes from a rate lookup and the code's arithmetic, not from the model. They
+ * run against a local stand-in with ballpark-real rates (helpers/rates-stand-in.js)
+ * that answers the same URL shape — and the fetch handed to resolveCost()
+ * asserts it is still asked for the real service's URL before redirecting it
+ * there, so the production request is still pinned. mcp/mcp.js is untouched.
  */
-import { test, describe } from 'node:test';
+import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { startRatesStandIn } from './helpers/rates-stand-in.js';
 import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -26,14 +33,39 @@ function extractResolveCost() {
   return src.slice(start, end);
 }
 
+const REAL_BASE = 'https://api.frankfurter.dev';
+let standIn;
+before(async () => { standIn = await startRatesStandIn(); });
+after(() => standIn.close());
+
+// resolveCost() calls the global `fetch` of the context it runs in; this one
+// refuses any URL that is not the real service's, and serves it from the stand-in.
+function standInFetch(url, opts) {
+  assert.ok(String(url).startsWith(`${REAL_BASE}/v1/latest?`), `resolveCost() called an unexpected URL: ${url}`);
+  return fetch(standIn.url + String(url).slice(REAL_BASE.length), opts);
+}
+
 function makeContext() {
-  const ctx = vm.createContext({ fetch, console });
+  const ctx = vm.createContext({ fetch: standInFetch, console });
   vm.runInContext(extractResolveCost(), ctx, { filename: 'mcp.js (resolveCost)' });
   return ctx;
 }
 
 describe('resolveCost()', () => {
-  test('converts a real foreign amount via a live exchange rate, and strips the raw fields', async () => {
+  test('a rate-service failure leaves cost unset with an explanatory note, never a guess', async () => {
+    standIn.setMode('error');
+    try {
+      const ctx = makeContext();
+      const parsed = { name: 'Some hotel', cost_amount: 500, cost_currency: 'EUR' };
+      await ctx.resolveCost(parsed);
+      assert.equal(parsed.cost, undefined);
+      assert.match(parsed.notes, /⚠️.*500 EUR.*rate lookup → 502.*enter the USD cost manually/);
+    } finally {
+      standIn.setMode('ok');
+    }
+  });
+
+  test('converts a foreign amount via the exchange-rate lookup, and strips the raw fields', async () => {
     const ctx = makeContext();
     const parsed = { name: 'Park Hyatt Tokyo', cost_amount: 145000, cost_currency: 'JPY' };
     await ctx.resolveCost(parsed);
@@ -41,9 +73,11 @@ describe('resolveCost()', () => {
     assert.ok(!('cost_amount' in parsed), 'internal cost_amount must not leak into the response');
     assert.ok(!('cost_currency' in parsed), 'internal cost_currency must not leak into the response');
     assert.equal(typeof parsed.cost, 'number');
-    // Real, live-rate conversion — assert a sane ballpark (JPY/USD hasn't
-    // been outside roughly 100-200 in recent history), not an exact number.
+    // A sane ballpark (JPY/USD hasn't been outside roughly 100-200 in recent
+    // history), plus the exact figure the stand-in's rate (150.25/USD) implies:
+    // the rounding to cents is resolveCost()'s own arithmetic.
     assert.ok(parsed.cost > 500 && parsed.cost < 2000, `¥145,000 should land well under $2000, got ${parsed.cost}`);
+    assert.equal(parsed.cost, 965.06);
     assert.match(parsed.notes, /145000 JPY.*USD/);
   });
 
