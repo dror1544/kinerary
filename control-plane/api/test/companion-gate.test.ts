@@ -55,8 +55,9 @@ const NO: JudgeOutcome = { kind: "no", confidence: 0.9, ms: 250, model: "fake/ju
 const DOC: AttachmentRef = { fileId: "file-1", kind: "document", mime: "application/pdf", filename: "plan.pdf" };
 
 /** One chat id per platform: the shape a binding of that platform has. */
-const GROUP_ID: Record<Platform, string> = { telegram: "-1004100001", whatsapp: "120363041000001@g.us" };
-const DM_ID: Record<Platform, string> = { telegram: "101", whatsapp: "972500000001@p" };
+// A WhatsApp chat id is ALWAYS an alias (`wa_<32 hex>@g` / `@p`, spec 625 "Chat ids"); the real address is `transport_address`.
+const GROUP_ID: Record<Platform, string> = { telegram: "-1004100001", whatsapp: `wa_${"1".repeat(32)}@g` };
+const DM_ID: Record<Platform, string> = { telegram: "101", whatsapp: `wa_${"2".repeat(32)}@p` };
 
 interface Fixture {
   pool: pg.Pool;
@@ -90,9 +91,10 @@ async function withFixture(fn: (fix: Fixture) => Promise<void>): Promise<void> {
     await pool.query("UPDATE control_plane.trips SET assistant_names = $2 WHERE id = $1", [tripId, NAMES]);
     for (const platform of PLATFORMS) {
       for (const chatId of [GROUP_ID[platform], DM_ID[platform]]) {
+        // The binding names its platform; an open WhatsApp binding holds its real address (the database requires it).
         await pool.query(
-          "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, $3)",
-          [chatId, tripId, PROFILE],
+          "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile, platform, transport_address) VALUES ('tcb_' || md5(random()::text), $1, $2, $3, $4, $5)",
+          [chatId, tripId, PROFILE, platform, platform === "whatsapp" ? (chatId.endsWith("@g") ? "120363041000001@g.us" : "100000000000001@lid") : null],
         );
       }
     }
