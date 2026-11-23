@@ -165,6 +165,65 @@ describe("typed changes: propose, validate, confirm, apply (#206)", opts, () => 
     });
   });
 
+  test("a typed message that changes nothing is not shown as a change, and the interview goes on (#647)", async () => {
+    await withChats(async (pool, a) => {
+      // PR #633 staging test: "GU-4471 is the hotel's confirmation" - the stay already says so.
+      const held = [{ name: "Ljubljana", start: "2027-05-10", end: "2027-05-17", accommodation: { name: "Grand Hotel Union", confirmation: "GU-4471" } }];
+      await hold(pool, a, "phases", held);
+      const tg = new Telegram();
+      const model = fakeModel(() => [{ op: "update_stop", target: { name: "Ljubljana" }, fields: { accommodation: { confirmation: "GU-4471" } } }]);
+      const logs: string[] = [];
+      seq += 1;
+      await queueInboundMessage(pool, a.chatId, { text: "GU-4471 is the hotel's confirmation, not a flight", message_id: `m${seq}` } as never);
+      await flushSettledInboundBursts(
+        { db: pool, telegram: tg, connector: { pushInbound: () => true }, modelRunner: model.runner, log: (l: string) => { logs.push(l); } } as never,
+        (l: string) => { logs.push(l); },
+        0,
+      );
+      assert.ok(logs.some((l) => l.includes("interview.change_noop")), `logged as a no-op: ${logs.filter((l) => l.includes("change_")).join(" | ")}`);
+      assert.ok(!logs.some((l) => l.includes("interview.change_proposed") || l.includes("interview.change_shown")), "never proposed, never shown");
+      assert.ok(tg.sent.length > 0, "the interview did not go quiet");
+      for (const m of tg.sent) {
+        assert.ok(!m.text.includes(uiString("change.header", "en")), `no change preview - sent: ${m.text}`);
+        assert.ok(!m.buttons.some((b) => b.callback_data.startsWith("pc:")), "no confirm button");
+      }
+      assert.equal((await pool.query("SELECT count(*)::int AS n FROM control_plane.intake_pending_changes")).rows[0].n, 0, "no draft is left waiting");
+      assert.deepEqual(await stored(pool, a, "phases"), held, "nothing was written");
+    });
+  });
+
+  test("a follow-up that undoes the waiting change cancels it like a No: the old buttons come off and the interview goes on (#647)", async () => {
+    await withChats(async (pool, a) => {
+      const held = [stop("Tokyo", "2026-05-19", "2026-05-24"), stop("Kyoto", "2026-05-27", "2026-05-30")];
+      await hold(pool, a, "phases", held);
+      const edits: string[] = [];
+      const tg = new Telegram();
+      tg.editMessageText = async (p: { text?: string }) => { edits.push(p.text ?? ""); return { ok: true as const }; };
+      let ops: unknown[] = [{ op: "update_stop", target: { name: "Tokyo" }, fields: { end: "2026-05-25" } }];
+      const model = fakeModel(() => ops);
+      await say(pool, a, "Tokyo ends on the 25th", tg, model);
+      assert.ok(tg.button("a"), "the preview is up");
+      const before = tg.sent.length;
+
+      ops = [{ op: "update_stop", target: { name: "Tokyo" }, fields: { end: "2026-05-24" } }];
+      const logs: string[] = [];
+      seq += 1;
+      await queueInboundMessage(pool, a.chatId, { text: "no wait, the 24th", message_id: `m${seq}` } as never);
+      await flushSettledInboundBursts(
+        { db: pool, telegram: tg, connector: { pushInbound: () => true }, modelRunner: model.runner, log: (l: string) => { logs.push(l); } } as never,
+        (l: string) => { logs.push(l); },
+        0,
+      );
+      assert.ok(logs.some((l) => l.includes("interview.change_noop") && l.includes('"merged":true')), `logged: ${logs.filter((l) => l.includes("change_")).join(" | ")}`);
+      assert.equal(edits.length, 1, "the old preview lost its buttons");
+      assert.ok(edits[0]!.includes(uiString("change.cancelled", "en")));
+      assert.ok(tg.sent.slice(before).some((m) => m.text === uiString("change.cancelled", "en")), "they are told it was cancelled");
+      assert.ok(tg.sent.length > before + 1, "and the interview went on after it");
+      assert.equal((await pool.query("SELECT count(*)::int AS n FROM control_plane.intake_pending_changes WHERE status = 'pending'")).rows[0].n, 0);
+      assert.deepEqual(await stored(pool, a, "phases"), held);
+    });
+  });
+
   test("traveller age correction: Ruth 70 -> 71, Avi kept, applied only on confirmation", async () => {
     await withChats(async (pool, a) => {
       await hold(pool, a, "travelers", [{ name: "Ruth Cohen", age: 70 }, { name: "Avi Cohen" }]);

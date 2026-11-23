@@ -1479,8 +1479,9 @@ const ANCHOR_KEEPS_PLACES: readonly string[] = [
   `  never fill in a place they did not say.`,
   `- A rental car keeps where it is picked up and where it is returned, in`,
   `  "name", in the person's own words and language: the car as they called it,`,
-  `  then the pick-up place and, if they said one, the return place. Never fill`,
-  `  in a place they did not say.`,
+  `  then the pick-up place and, if they said one, the return place. When the`,
+  `  return place is the same as the pick-up place, write that place once.`,
+  `  Never fill in a place they did not say.`,
 ];
 
 /**

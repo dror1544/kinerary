@@ -79,6 +79,100 @@ describe("flightDesignatorsIn — what counts as a flight the organizer typed", 
   });
 });
 
+// #646 — found in the PR #633 staging test, 2026-11-23: a hotel's confirmation
+// `GU-4471` has the exact shape of flight GU4471 (GU is an airline code and the
+// hyphen form is accepted), and the interview asked the organizer to "re-enter
+// flight GU4471". Two rules, in two places: the words around a code decide at
+// note time (before the reader has proposed anything), and what the reader's own
+// proposal holds decides at owed time (the proposal arrives after the noting).
+const LJUBLJANA_TEXT = "טיסה LY5143 מתל אביב ללובליאנה ב-10 במאי 2027 ב-08:00, וחזרה LY5144 ב-17 במאי ב-16:00. מלון Grand Hotel Union בלובליאנה, אישור GU-4471";
+
+describe("a confirmation is not a flight (#646)", () => {
+  test("the exact staging text: only the two flights are noted", () => {
+    assert.deepEqual(flightDesignatorsIn(LJUBLJANA_TEXT), ["LY5143", "LY5144"]);
+  });
+
+  test("confirmation words before the code — Hebrew and English, with or without a colon, a number or a hash", () => {
+    for (const text of [
+      "מלון Union, אישור GU-4471",
+      "מלון Union, מספר אישור GU-4471",
+      "מלון Union, מספר אישור: GU4471",
+      "Hotel Union, confirmation GU-4471",
+      "Hotel Union, Confirmation number: GU-4471",
+      "Hotel Union conf. GU-4471",
+      "Hotel Union, conf #GU-4471",
+      "Hotel Union, ref: GU-4471",
+      "Hotel Union, reference no. GU-4471",
+      "Hotel Union, booking ref GU-4471",
+      "Hotel Union, booking number GU-4471",
+    ]) {
+      assert.deepEqual(flightDesignatorsIn(text), [], text);
+    }
+  });
+
+  test("the words are only a veto for the code right after them: a flight in the same message is still found", () => {
+    assert.deepEqual(flightDesignatorsIn("confirmation GU-4471, and we fly LY5143"), ["LY5143"]);
+    assert.deepEqual(flightDesignatorsIn("אישור GU-4471 וטיסה LY5143"), ["LY5143"]);
+  });
+
+  test("narrow on purpose: a flight is still a flight when the confirmation word is only nearby, or is part of another word", () => {
+    // "booking" alone is how people introduce a flight too, so it is not a veto.
+    assert.deepEqual(flightDesignatorsIn("our booking is flight LY5143"), ["LY5143"]);
+    assert.deepEqual(flightDesignatorsIn("confirmation 4471, flight GU-4471"), ["GU4471"]);
+    assert.deepEqual(flightDesignatorsIn("pref LY5143 and href LY5144"), ["LY5143", "LY5144"]);
+    assert.deepEqual(flightDesignatorsIn("אישור הגיע. טיסה LY5143"), ["LY5143"]);
+  });
+
+  test("Hebrew prefixes on the word still count: 'האישור', 'ואישור', 'מספר האישור'", () => {
+    for (const text of ["מספר האישור GU-4471", "ואישור GU-4471", "מלון Union והאישור: GU-4471"]) {
+      assert.deepEqual(flightDesignatorsIn(text), [], text);
+    }
+  });
+
+  test("a sentence that ends on a confirmation word does not hide the flight that starts the next one", () => {
+    assert.deepEqual(flightDesignatorsIn("We got the confirmation. LY5143 leaves at 08:00"), ["LY5143"]);
+    assert.deepEqual(flightDesignatorsIn("קיבלנו אישור. LY5143 ממריאה ב-08:00"), ["LY5143"]);
+    assert.deepEqual(flightDesignatorsIn("Hotel Union, conf. GU-4471 and flight LY5143"), ["LY5143"]);
+  });
+
+  test("the same code typed twice, once as a confirmation and once as a flight, is a flight", () => {
+    assert.deepEqual(flightDesignatorsIn("אישור GU-4471; and the flight GU-4471"), ["GU4471"]);
+  });
+});
+
+describe("flightsOwed — a code the reader's proposal holds as another booking's confirmation is not a flight (#646)", () => {
+  const stay = (confirmation: string) => ({
+    phases: {
+      kind: "structured", schema_version: 3,
+      data: [{ name: "לובליאנה", start: "2027-05-10", end: "2027-05-17", accommodation: { name: "Grand Hotel Union", confirmation } }],
+    } as never,
+  }) as AnswerStore;
+  const bookings = (...entries: Record<string, unknown>[]): AnswerStore => ({
+    travel_anchors: { kind: "structured", schema_version: 3, data: entries } as never,
+  });
+
+  test("a stop's accommodation confirmation, in any spelling: not owed", () => {
+    assert.deepEqual(flightsOwed(stay("GU-4471"), { typedFlights: ["GU4471"] }), []);
+    assert.deepEqual(flightsOwed(stay("gu 4471"), { typedFlights: ["GU4471"] }), []);
+  });
+
+  test("a non-flight booking's confirmation: not owed", () => {
+    assert.deepEqual(flightsOwed(bookings({ type: "hotel", name: "Union", confirmation: "GU-4471" }), { typedFlights: ["GU4471"] }), []);
+    assert.deepEqual(flightsOwed(bookings({ type: "car", name: "Hertz", confirmation: "GU4471" }), { typedFlights: ["GU4471"] }), []);
+  });
+
+  test("equality, never a substring: a longer or shorter reference does not hide a flight", () => {
+    assert.deepEqual(flightsOwed(stay("GU-44712"), { typedFlights: ["GU4471"] }), ["GU4471"]);
+    assert.deepEqual(flightsOwed(stay("XGU-4471"), { typedFlights: ["GU4471"] }), ["GU4471"]);
+    assert.deepEqual(flightsOwed(stay("GU-447"), { typedFlights: ["GU4471"] }), ["GU4471"]);
+  });
+
+  test("the other flight is still owed, and a stay with no confirmation hides nothing", () => {
+    assert.deepEqual(flightsOwed(stay("GU-4471"), { typedFlights: ["LY5143", "GU4471"] }), ["LY5143"]);
+    assert.deepEqual(flightsOwed({ phases: { kind: "structured", schema_version: 3, data: [{ name: "X", accommodation: { name: "Union" } }, "junk", null] } as never }, { typedFlights: ["GU4471"] }), ["GU4471"]);
+  });
+});
+
 describe("flightsOwed — typed, not represented, not yet asked", () => {
   const anchors = (...names: string[]): AnswerStore => ({
     travel_anchors: { kind: "structured", schema_version: 3, data: names.map((name) => ({ type: "flight", name })) } as never,
@@ -423,6 +517,59 @@ describe("a typed flight the reader did not file is asked about", { skip: SKIP ?
       const view = await getSessionForChat(pool, chatId);
       assert.ok(view.ok);
       assert.equal(view.view.lastPrompt, "q:travel_anchors:flights");
+    });
+  });
+});
+
+// #646, through the real router: the exact message from the PR #633 staging test.
+// The reader here files the stops WITH the hotel's confirmation (the typed path;
+// the contract shape `phases[].planned` vs `venues` is not touched - this is the
+// intake answer, upstream of the transformer).
+describe("a hotel's confirmation typed beside two flights is not asked about as a flight (#646)", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABASE_URL" : false }, () => {
+  const stops = [{
+    name: "לובליאנה", name_en: "Ljubljana", start: "2027-05-10", end: "2027-05-17",
+    accommodation: { name: "Grand Hotel Union", confirmation: "GU-4471" },
+  }];
+
+  test("stops only: only the two flights are noted and asked, GU-4471 never", async () => {
+    await withInterview(async (pool, chatId) => {
+      await stopsOnScreen(pool, chatId, "he");
+      const telegram = new Recorder();
+      const logs: string[] = [];
+      await say(pool, chatId, LJUBLJANA_TEXT, telegram, runnerProposing({
+        questionId: "phases", confidence: 0.95, evidence: "מלון Grand Hotel Union בלובליאנה, אישור GU-4471",
+        value: { kind: "structured", data: stops },
+      }), logs);
+
+      const store = await answersForChat(pool, chatId);
+      assert.deepEqual(store!.ui.typedFlights, ["LY5143", "LY5144"]);
+      const asked = telegram.sent.at(-1)!;
+      assert.equal(asked.text, `${flightsOwedLead(["LY5143", "LY5144"], "he")}\n\n${plainQuestion("travel_anchors", "he").text}`);
+      assert.ok(telegram.sent.every((m) => !m.text.includes("GU4471") && !m.text.includes("GU-4471")),
+        `GU4471 is never asked about - sent: ${JSON.stringify(telegram.sent.map((m) => m.text))}`);
+      assert.ok(logs.some((l) => l.includes("interview.typed_flights_noted") && l.includes("LY5143") && !l.includes("GU4471")));
+    });
+  });
+
+  test("the code was noted by an earlier build (typed_flights already carries it): the held stay still clears it", async () => {
+    await withInterview(async (pool, chatId) => {
+      await answerRequiredExcept(pool, chatId, ["phases"]);
+      await pool.query(
+        `UPDATE control_plane.intake_sessions
+            SET answers = answers || jsonb_build_object('phases', $2::jsonb)
+          WHERE telegram_chat_id = $1`,
+        [chatId, JSON.stringify({ kind: "structured", schema_version: 3, data: stops })],
+      );
+      await pool.query(
+        `UPDATE control_plane.intake_sessions
+            SET language = 'he', awaiting = 'person', phase = 'optional',
+                ui_state = jsonb_build_object('last_prompt', 'optional_offer', 'offered_more', true, 'car_asked', true,
+                                              'typed_flights', jsonb_build_array('GU4471'))
+          WHERE telegram_chat_id = $1`,
+        [chatId],
+      );
+      const store = await answersForChat(pool, chatId);
+      assert.deepEqual(flightsOwed(store!.answers, store!.ui), []);
     });
   });
 });

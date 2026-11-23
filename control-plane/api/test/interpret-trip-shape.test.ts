@@ -153,6 +153,12 @@ describe("a booked flight or car keeps its places (star e2e, 2026-10-14)", () =>
       assert.match(text, /rental car keeps where it is picked up and where it is returned/i);
       assert.match(text, /never fill in a place they did not say/i);
     });
+
+    // #648: the code repairs a doubled place (`withoutRepeatedPlaceInCarName`); the prompt
+    // asks for it once as well, so the repair is the fallback and not the usual path.
+    test(`the ${where} prompt says a return place equal to the pick-up place is written once`, () => {
+      assert.match(text, /return place is the same as the pick-up place, write that place once/i);
+    });
   }
 
   test("the route rule is not spent on a prompt that asks for neither stops nor bookings", () => {

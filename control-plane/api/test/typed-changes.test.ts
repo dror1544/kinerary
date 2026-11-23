@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { identityFold, reconcileStructured, samePerson } from "../src/answer-merge.js";
 import { cleanText, safeText } from "../src/typed-changes.js";
+import { previewText, renderDraft } from "../src/typed-changes-render.js";
 import type { AnswerStore } from "../src/interview.js";
 import {
   applyOps,
@@ -16,6 +17,7 @@ import {
   openQuestion,
   parseOps,
   resolveRef,
+  showsNoChange,
   wordsOf,
   type ApplyOutcome,
   type Line,
@@ -637,5 +639,63 @@ describe("invisible characters (item 5b)", () => {
     assert.equal(lists.stops[1]!.id, "s2");
     assert.ok(!/[\n\u202E]/.test(lists.stops[1]!.label), JSON.stringify(lists.stops[1]));
     assert.ok(!/\n/.test(lists.travellers[0]!.label));
+  });
+});
+
+// #647 - found in the PR #633 staging test, 2026-11-23: after "GU-4471 is the
+// hotel's confirmation, not a flight" the interview showed the change header, an
+// EMPTY body and "update?". Which half was at fault: the renderer dropping lines,
+// or a preview with none? The preview had none: the stay already carried the
+// code, so the edit is a no-op, and nothing in `describe` has a line to write.
+describe("a change that re-asserts what is held shows no difference (#647)", () => {
+  const held = store({
+    phases: [stop("Ljubljana", "2027-05-10", "2027-05-17", { accommodation: { name: "Grand Hotel Union", confirmation: "GU-4471" } })],
+  });
+  const restate: Op[] = [{ op: "update_stop", target: { name: "Ljubljana" }, fields: { accommodation: { confirmation: "GU-4471" } } }];
+
+  test("the preview of the restatement has no line at all, and the renderer is not what drops it", () => {
+    const outcome = ok(applyOps(held, restate));
+    assert.deepEqual(outcome.preview, []);
+    assert.equal(showsNoChange(outcome.preview), true);
+    assert.deepEqual(previewText(outcome.preview, "he"), []);
+    const draft = { id: "pchg_x", preview: outcome.preview, unresolved: [], blocked: [], base: {}, ops: restate, result: outcome.result };
+    const lines = renderDraft(draft as never, "he").text.split("\n").filter((l) => l.trim() !== "");
+    assert.equal(lines.length, 2, `only the header and the footer: ${JSON.stringify(lines)}`);
+  });
+
+  test("beside untouched stops it is still a no-op: 'what stays as it is' is not a difference", () => {
+    const two = store({
+      phases: [
+        stop("Ljubljana", "2027-05-10", "2027-05-17", { accommodation: { name: "Grand Hotel Union", confirmation: "GU-4471" } }),
+        stop("Bled", "2027-05-17", "2027-05-19"),
+      ],
+    });
+    const outcome = ok(applyOps(two, restate));
+    assert.deepEqual(keys(outcome.preview), ["preview.unchanged"]);
+    assert.equal(showsNoChange(outcome.preview), true);
+  });
+
+  test("a warning about a touched stop does not make a restatement a change", () => {
+    // The stop starts before the trip's own departure: `describe` warns for any stop the change touches.
+    const early = store(
+      { phases: [stop("Ljubljana", "2027-05-10", "2027-05-17", { accommodation: { name: "Grand Hotel Union", confirmation: "GU-4471" } })] },
+      { departure_date: text("2027-05-12") },
+    );
+    const outcome = ok(applyOps(early, restate));
+    assert.ok(keys(outcome.preview).includes("warn.outsideTripDates"), `the warning is there: ${JSON.stringify(keys(outcome.preview))}`);
+    assert.equal(showsNoChange(outcome.preview), true);
+    assert.deepEqual((outcome.result.phases as { data: unknown[] }).data, (early.phases as { data: unknown[] }).data, "and the result is what is held");
+  });
+
+  test("a real difference is shown: a changed code, an added stop, a removal", () => {
+    const base = store({ phases: [stop("Ljubljana", "2027-05-10", "2027-05-17", { accommodation: { name: "Grand Hotel Union", confirmation: "GU-4471" } }), stop("Bled")] });
+    for (const ops of [
+      [{ op: "update_stop", target: { name: "Ljubljana" }, fields: { accommodation: { confirmation: "GU-4472" } } }],
+      [{ op: "add_stop", fields: { name: "Piran" } }],
+      [{ op: "remove_stop", target: { name: "Bled" } }],
+    ] as Op[][]) {
+      const outcome = ok(applyOps(base, ops));
+      assert.equal(showsNoChange(outcome.preview), false, JSON.stringify(ops));
+    }
   });
 });

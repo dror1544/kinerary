@@ -911,6 +911,26 @@ export function draftDigest(draft: {
     .slice(0, 8);
 }
 
+/**
+ * Does this preview show NO difference? True when nothing in it says what would
+ * change: it has no lines, or only "what stays as it is" (`preview.unchanged`).
+ *
+ * A change that re-asserts what is already held - "GU-4471 is the hotel's
+ * confirmation" when the stay already carries it - validates, has a result, and
+ * describes nothing: every field of the touched entry is equal, so no line is
+ * written, and the touched entry is not counted as "unchanged" either. Shown, it
+ * is the header, an empty body and "update?" (#647, PR #633 staging test). It is
+ * not a change, and is never offered as one. Every edit a typed message can make
+ * (`STOP_FIELDS`, `TRAVELLER_FIELDS`, add, remove, replace, move) yields a line
+ * when it differs from what is held, so an empty preview IS the absence of one.
+ */
+export function showsNoChange(preview: readonly Line[]): boolean {
+  // Only the `preview.*` lines say what changes; a `warn.*` or `effect.*` line is
+  // computed for any entry the change TOUCHES (a stop that starts before the trip
+  // does, whatever was restated), so it cannot make a restatement a change.
+  return preview.every((l) => !l.key.startsWith("preview.") || l.key === "preview.unchanged");
+}
+
 /** The lines of a preview that warn about, or describe an effect on, the rest of the trip. */
 export function warningLines(preview: readonly Line[]): Line[] {
   return preview.filter((l) => l.key.startsWith("warn.") || l.key.startsWith("effect."));
