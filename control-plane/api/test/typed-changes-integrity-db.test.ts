@@ -1169,7 +1169,7 @@ async function atTheBoundary(pool: pg.Pool, chat: Chat) {
     );
   }
   await pool.query(
-    "UPDATE control_plane.intake_sessions SET phase = 'optional', ui_state = ui_state || jsonb_build_object('pending_entry', 'optional') WHERE id = $1",
+    "UPDATE control_plane.intake_sessions SET phase = 'optional', ui_state = ui_state || jsonb_build_object('pending_entry', 'optional', 'car_asked', true) WHERE id = $1",
     [chat.sessionId],
   );
 }

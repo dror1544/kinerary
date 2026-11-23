@@ -33,6 +33,7 @@ import {
   queueInboundMessage,
   recordLastPromptForChat,
   setFinishRequestedForChat,
+  markCarAskedForChat,
   INTAKE_QUESTIONS,
 } from "../src/interview.js";
 import { uiString } from "../src/intake-copy.js";
@@ -104,6 +105,8 @@ async function withSummary(language: "he" | "en", fn: (pool: pg.Pool, chat: Chat
     await put(pool, chat, "departure_date", { kind: "text", schema_version: 3, text: "2026-11-14" });
     await put(pool, chat, "return_date", { kind: "text", schema_version: 3, text: "2026-11-21" });
     await pool.query("UPDATE control_plane.intake_sessions SET language = $2 WHERE telegram_chat_id = $1", [chatId, language]);
+    // These tests are about the summary, not the rental-car question that stands before it.
+    await markCarAskedForChat(pool, chatId);
     await setFinishRequestedForChat(pool, chatId, true);
     await recordLastPromptForChat(pool, chatId, "recap");
     const view = await getSessionForChat(pool, chatId);

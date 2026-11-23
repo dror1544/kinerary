@@ -34,6 +34,7 @@ import {
   queueInboundMessage,
   recordLastPromptForChat,
   setFinishRequestedForChat,
+  markCarAskedForChat,
   INTAKE_QUESTIONS,
 } from "../src/interview.js";
 import { uiString } from "../src/intake-copy.js";
@@ -113,6 +114,8 @@ async function answered(pool: pg.Pool, chat: Chat) {
 /** The summary on screen: finish requested, phase recap, last prompt `recap`. */
 async function recapOnScreen(pool: pg.Pool, chat: Chat) {
   await answered(pool, chat);
+  // These tests are about the summary, not the rental-car question that stands before it.
+  await markCarAskedForChat(pool, chat.chatId);
   await setFinishRequestedForChat(pool, chat.chatId, true);
   await recordLastPromptForChat(pool, chat.chatId, "recap");
   const view = await getSessionForChat(pool, chat.chatId);
@@ -125,7 +128,7 @@ async function offerOnScreen(pool: pg.Pool, chat: Chat) {
   await pool.query(
     `UPDATE control_plane.intake_sessions
         SET state = 'interviewing', awaiting = 'person', phase = 'optional',
-            ui_state = jsonb_build_object('offered_more', true, 'last_prompt', $2::text)
+            ui_state = jsonb_build_object('offered_more', true, 'last_prompt', $2::text, 'car_asked', true)
       WHERE telegram_chat_id = $1`,
     [chat.chatId, OPTIONAL_OFFER_PROMPT],
   );
