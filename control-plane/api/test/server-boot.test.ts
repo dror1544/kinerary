@@ -429,7 +429,7 @@ test("the real portal server boots without Google credentials and advertises ema
   try {
     const response = await fetch(`http://127.0.0.1:${port}/v1/auth/capabilities`);
     assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), { google: false, emailPassword: true, emailSignUp: false, telegramMiniApp: false });
+    assert.deepEqual(await response.json(), { google: false, emailPassword: true, emailSignUp: false, telegramMiniApp: false, signInLink: false });
     const google = await fetch(`http://127.0.0.1:${port}/v1/auth/google`, {
       method: "POST", headers: { "content-type": "application/json", origin: `http://127.0.0.1:${port}` }, body: JSON.stringify({ credential: "x" }),
     });
@@ -443,6 +443,9 @@ test("the real portal server boots without Google credentials and advertises ema
       method: "POST", headers: { "content-type": "application/json", origin: `http://127.0.0.1:${port}` }, body: "{}",
     });
     assert.equal(miniApp.status, 503);
+    // The durable-release retry (site-release-outbox.ts) runs wherever a portal does, Telegram or not. A loop that never started would
+    // be silent (a removed member's binding stays on the trip site and nothing says so), so the boot log says it did.
+    assert.match(server.stderr(), /"event":"site_release.pass_started"/);
   } finally { await server.stop(); }
 });
 

@@ -30,6 +30,7 @@ import { structuredLog } from "../redaction.js";
 import { resolveSecretRef } from "../secrets.js";
 import type { SignupConfig } from "../signup.js";
 import { RelayConnector } from "./connector.js";
+import { siteInviteDepsFromProfile, type SiteInviteDeps } from "./invite-command.js";
 import { gatewayKeyMasterProblem, type GatewayKeyMode } from "./protocol.js";
 import { renewCompanionConversation, setCompanionExpectsReply } from "../chat-router.js";
 import { outboundScopeOptions } from "./outbound-scope.js";
@@ -118,6 +119,11 @@ interface Runtime {
   tripAppBotUsername?: string;
   /** Whether the Mini App is ready for that bot, re-evaluated over time. */
   tripApp?: TripAppReadiness;
+  /**
+   * What `/invite <traveller>` needs, built from the profile's `web` block (relay/invite-command.ts). Absent - no `web` block, or the
+   * runtime exchange key cannot be resolved here - leaves the relay up and `/invite` answering "not available" to organizers.
+   */
+  siteInvites?: SiteInviteDeps;
   /** From `relay.interviewer_profile`; absent disables interview forwarding. */
   interviewerProfile?: string;
   /**
@@ -247,6 +253,10 @@ async function serveRuntime(path: string): Promise<Runtime> {
     }));
   }
 
+  // `/invite <traveller>`: the same participant list and join-link origin the api's portal uses, from the same `web` block. A failure to
+  // build it never costs the relay: it is logged (relay.site_invites_unconfigured) and an organizer is told "not available".
+  const siteInvites = await siteInviteDepsFromProfile(profile.web, resolveSecretRef, log);
+
   // Publish the ⌘ menu here — once, at boot, beside the other call that asks
   // Telegram about ourselves — rather than per message. Awaited so the log
   // lines stay in order, and deliberately not guarded: publishCommandMenu owns
@@ -288,6 +298,7 @@ async function serveRuntime(path: string): Promise<Runtime> {
     botIdentity: identity ? { username: identity.username, id: identity.id } : undefined,
     ...(tripAppBotUsername ? { tripAppBotUsername } : {}),
     tripApp,
+    ...(siteInvites ? { siteInvites } : {}),
     interviewerProfile: relay.interviewer_profile,
     multiplexGatewayId: relay.multiplex_gateway_id,
     approvals,
@@ -510,6 +521,7 @@ async function main(): Promise<void> {
       botIdentity: runtime.botIdentity,
       ...(runtime.tripAppBotUsername ? { tripAppBotUsername: runtime.tripAppBotUsername } : {}),
       ...(runtime.tripApp ? { tripAppReady: () => runtime.tripApp!.ready() } : {}),
+      ...(runtime.siteInvites ? { siteInvites: runtime.siteInvites } : {}),
       interviewerProfile: runtime.interviewerProfile,
       approvals: runtime.approvals,
       media: { telegram: runtime.telegram, store: mediaStore, baseUrl: mediaBaseUrl, log },

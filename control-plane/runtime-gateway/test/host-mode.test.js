@@ -227,6 +227,7 @@ test("AC-R1.7: /api/internal/* on a trip host is 404 and never reaches the upstr
   const paths = [
     "/api/internal/control-plane/session", "/api/internal", "/api/internal/", "/API/Internal/x", "/api/%69nternal/x", "/api/%2569nternal/x",
     "//api/internal/x", "/api//internal/x", "/api/./internal/x", "/x/../api/internal/x", "/api/internal%2Fx", "/api\\internal/x", "/api/internal?x=1",
+    "/api%5cinternal/x", "/api/internal;x/x", "/api;x/internal/x", "/api/internal%3bx/x", "/api%3bx/internal/x",
   ];
   const pages = [];
   for (const path of paths) {
@@ -239,6 +240,7 @@ test("AC-R1.7: /api/internal/* on a trip host is 404 and never reaches the upstr
   assert.deepEqual(lookups, [], "refused before any lookup, so the answer cannot tell a known trip from an unknown one");
   const near = await send({ host: `alpha.${SUFFIX}`, path: "/api/internals/x" });
   assert.equal(near.status, 200, "a different segment that merely starts the same is an ordinary path");
+  for (const path of ["/api/internal-notes", "/api/internals-x", "/apix/internal/x"]) assert.equal((await send({ host: `alpha.${SUFFIX}`, path })).status, 200, path);
   const percent = await send({ host: `alpha.${SUFFIX}`, path: "/photos/100%25.jpg" });
   assert.equal(percent.status, 200, "an encoded percent sign in a file name is an ordinary path, not an unreadable one");
 });

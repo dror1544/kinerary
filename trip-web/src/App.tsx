@@ -22,6 +22,8 @@ import { heroCandidates, useHeroPhoto } from "./hero-photo";
 import { useTripUpdates, useLiveEditGuard } from "./live-updates";
 import { featureOn } from "./features";
 import { GroupLineToggle } from "./group-line";
+import { MemberClaims } from "./member-claims";
+import { PersonalInviteResult, personalInviteLabel, usePersonalInvites } from "./member-invites";
 import { hasGoChip, mapUrlFor, navUrlFor, wazeUrlFor } from "./nav-links";
 import { useNavApp } from "./trip-settings";
 import { WeatherFlightsCard } from "./today-cards";
@@ -405,6 +407,9 @@ function LoginScreen() {
           <button className="primary-action" type="submit">{copy(lang,"Sign in","כניסה")}</button>
         </form>
         <GoogleSignIn lang={lang} onSuccess={()=>window.location.reload()}/>
+        {/* AC-17 (docs/specs/sprint-9/x-member-sign-in.md): a static line, nothing more. This site sends no sign-in link and asks
+            nothing about accounts; it only says where a traveller with no control-plane account goes next. */}
+        <p className="login-no-account">{copy(lang,"Not on the list here? Ask the organizer for a personal invite, or open the trip from the Telegram group if your organizer has turned that on.","לא ברשימה כאן? בקשו מהמארגן הזמנה אישית, או פתחו את הטיול מקבוצת הטלגרם אם המארגן הפעיל את האפשרות הזו.")}</p>
         <a href="#lostfound">{copy(lang,"Found something belonging to this group?","מצאתם חפץ של הקבוצה?")}</a>
       </section>
     </main>
@@ -2787,10 +2792,14 @@ export function OrganizerSettings({ config, isOrganizer, lang }: { config?: Trip
 function MemberLogins({ config, lang, headingId }: { config?: TripConfig; lang: Lang; headingId?: string }) {
   const [pending, setPending] = useState("");
   const [result, setResult] = useState<{ username: string; text: string; link?: string } | null>(null);
+  // "Send a personal invite": offered only when the runtime gateway in front of this site says this person may send one
+  // (member-invites.tsx). Not tied to the Telegram group switch: it is a way in for people who are not on Telegram.
+  const personalInvite = usePersonalInvites();
 
   async function reset(username: string, to?: "trip_password") {
     setPending(username);
     setResult(null);
+    personalInvite.clear();
     try {
       const payload = await resetParticipantPassword(username, to);
       setResult(payload.enrollment_token
@@ -2839,6 +2848,12 @@ function MemberLogins({ config, lang, headingId }: { config?: TripConfig; lang: 
                 onClick={() => reset(participant.username)}>
                 {copy(lang, "One-time link", "קישור חד-פעמי")}
               </button>
+              {personalInvite.available ? (
+                <button type="button" className="ghost" disabled={personalInvite.pending === participant.username || pending === participant.username}
+                  onClick={() => { setResult(null); void personalInvite.send(participant.username, personName(participant, lang)); }}>
+                  {personalInviteLabel(lang)}
+                </button>
+              ) : null}
             </span>
             {result?.username === participant.username ? (
               <span className="member-login-result">
@@ -2846,9 +2861,12 @@ function MemberLogins({ config, lang, headingId }: { config?: TripConfig; lang: 
                 {result.link ? <code>{result.link}</code> : null}
               </span>
             ) : null}
+            {personalInvite.outcome?.username === participant.username ? <PersonalInviteResult outcome={personalInvite.outcome} lang={lang} /> : null}
           </li>
         ))}
       </ul>
+      {/* Who signed in from the trip's Telegram group, with Release. Draws nothing unless the gateway answers with a list. */}
+      <MemberClaims lang={lang} />
     </div>
   );
 }

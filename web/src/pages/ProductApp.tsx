@@ -7,6 +7,7 @@ import { z } from "zod";
 import { api, getMe, getTrip, getTrips, passwordSignIn, getAuthCapabilities, emailPasswordSignIn, safeReturnTo, type TripSummary, type InterviewLinkState, ApiError } from "../api";
 import { Brand } from "../components/Brand";
 import { NamePrompt } from "../components/NamePrompt";
+import { SignInLinkRequest } from "../components/SignInLinkRequest";
 import { GoogleSignInButton } from "../components/GoogleSignInButton";
 import { tripUsernameInputProps, tripUsernameRegisterOptions } from "../mini-app/username";
 import { isEmbedded } from "../mini-app/sdk";
@@ -70,6 +71,8 @@ function SignIn() {
           <button className="button wide" disabled={passwordLogin.isPending}>{passwordLogin.isPending ? "Signing in…" : "Continue with trip password"}</button>
           {passwordLogin.isError && <Notice>{passwordLogin.error.message}</Notice>}
         </form>}
+        {/* A member who cannot get in (docs/specs/sprint-9/x-member-sign-in.md, S3): by name on this trip, or by email. */}
+        {capabilities.data?.signInLink === true && <SignInLinkRequest tripId={tripId || undefined} />}
       </main>
     </div>
   );

@@ -45,7 +45,7 @@ const profile = validateArchitectureProfile({
 });
 const newApp = () => buildApp(profile, {
   portal: {
-    db: pool, runtimeAccounts: { participantExists: async () => true, provisionParticipant: async () => {} },
+    db: pool, runtimeAccounts: { participantExists: async () => true, provisionParticipant: async () => {}, listParticipants: async () => ["guest-mf1", "guest-one", "guest-origin", "planted-one"].map((username) => ({ username, displayName: username, role: "member" })) },
     publicOrigin: ORIGIN, runtimeOrigin: "http://runtime.example.test", runtimeExchangeKey: "exchange-key",
     runtimeUpstreamHostSuffixes: ["internal"], telegramBotUsername: "kinerary_bot", sessionTtlSeconds: 3600,
     enrollmentTtlSeconds: 3600, approvalTtlSeconds: 3600,

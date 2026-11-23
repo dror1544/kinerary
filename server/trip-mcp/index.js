@@ -41,7 +41,7 @@ function resolveOrigin(raw) {
 }
 
 function registerTripMcp({
-  app, db, env = process.env, jwt, jwtSecret, jwtSecretIsDefault, validManagedPayload, organizers, userExists,
+  app, db, env = process.env, jwt, jwtSecret, jwtSecretIsDefault, validManagedPayload, claimedPayload = () => false, bindingOf = () => null, organizers, userExists,
   getPublicConfig, authRequired, listenPort, listenHost,
 }) {
   const wanted = ['1', 'true'].includes(String(env.TRIP_MCP_ENABLED || '').toLowerCase());
@@ -233,7 +233,11 @@ function registerTripMcp({
     try {
       const payload = jwt.verify(m[1], jwtSecret, { algorithms: ['HS256'] });
       if (!payload?.username || !validManagedPayload(payload)) return null;
-      return payload.username;
+      // A group-claim session (control-plane-auth.js) may not approve a connection: the grant would outlive the binding.
+      if (claimedPayload(payload)) return null;
+      // What the grant must remember about who approved it: the INVITE binding of an invited member (null for every other
+      // session), read from the stored binding now, never from the token. Removal of that binding ends the grant.
+      return { username: payload.username, binding: bindingOf(payload) };
     } catch { return null; }
   }
 
@@ -242,8 +246,9 @@ function registerTripMcp({
     const v = validateAuthRequest(b);
     if (v.fatal) return res.status(400).json({ error: 'invalid_request' });
     if (v.redirectError) return res.json({ redirect_to: redirectWith(v.redirectUri, { error: v.redirectError, state: v.state }) });
-    const username = sessionUser(req);
-    if (!username) return res.status(401).json({ error: 'unauthorized' });
+    const session = sessionUser(req);
+    if (!session) return res.status(401).json({ error: 'unauthorized' });
+    const { username, binding } = session;
     if (!isParticipant(username)) return res.status(403).json({ error: 'not_on_this_trip' });
     if (b.decision !== 'allow') return res.json({ redirect_to: redirectWith(v.redirectUri, { error: 'access_denied', state: v.state }) });
     // Decided here, from who approved — never from the scope the app asked
@@ -251,7 +256,7 @@ function registerTripMcp({
     const scope = isOrganizer(username) ? SCOPE : READ_SCOPE;
     const code = store.createCode({
       clientId: v.client.client_id, username, redirectUri: v.redirectUri,
-      codeChallenge: v.codeChallenge, resource: v.resource, scope,
+      codeChallenge: v.codeChallenge, resource: v.resource, scope, binding,
     });
     console.log(`[trip-mcp] ${username} approved ${v.client.client_name || v.client.client_id} (${new URL(v.redirectUri).hostname}, ${scope})`);
     res.json({ redirect_to: redirectWith(v.redirectUri, { code, state: v.state }) });
@@ -272,7 +277,8 @@ function registerTripMcp({
       if (!pkceMatches(b.code_verifier, row.code_challenge)) return invalid('code_verifier mismatch');
       if (b.resource && !sameResource(b.resource)) return res.status(400).json({ error: 'invalid_target' });
       if (!isParticipant(row.username)) return invalid('no longer on this trip');
-      return res.json(store.startGrant({ clientId: client.client_id, username: row.username, codeHash: row.code_hash, scope: row.scope }).tokens);
+      return res.json(store.startGrant({ clientId: client.client_id, username: row.username, codeHash: row.code_hash, scope: row.scope,
+        binding: row.binding_user_id && row.binding_invite_id ? { userId: row.binding_user_id, inviteId: row.binding_invite_id } : null }).tokens);
     }
     if (b.grant_type === 'refresh_token') {
       if (!b.refresh_token) return invalid();
@@ -405,8 +411,16 @@ function registerTripMcp({
   // else sees and disconnects their own. A person, never the agent key: the
   // companion's context is full of text travellers typed, and one crafted
   // message must not be able to disconnect somebody's assistant.
+  // A session that came from a GROUP CLAIM (control-plane-auth.js) may neither list nor end the real traveller's assistant
+  // connections: the list says which apps they connected, and a disconnect is theirs to make. An INVITE-BOUND session
+  // (`req.user.inviteBinding`) sees and ends only the connections approved under ITS OWN binding (the control-plane user id and
+  // invite id recorded on the grant): the real traveller's own, another binding's and any grant with no recorded binding are
+  // theirs to manage, not the invited person's. The traveller's plain login, an organizer and everyone else are unchanged.
+  const ownedByBinding = (req, g) => !req.user?.inviteBinding ||
+    (g.binding_user_id === req.user.inviteBinding.userId && g.binding_invite_id === req.user.inviteBinding.inviteId);
   const person = (req, res, next) => authRequired(req, res, () =>
-    (req.user?.isAgent ? res.status(403).json({ error: 'person_only' }) : next()));
+    (req.user?.isAgent ? res.status(403).json({ error: 'person_only' })
+      : req.user?.claimedSession ? res.status(403).json({ error: 'claimed_session_cannot_change_credentials' }) : next()));
   app.get('/api/mcp/connection', person, (req, res) => {
     const me = req.user.username, organizer = isOrganizer(me);
     res.set('Cache-Control', 'no-store');
@@ -417,7 +431,7 @@ function registerTripMcp({
       // Someone removed from the trip has lost their connection already
       // (requireAccess ends it on next use); do not list it as live.
       connections: store.activeGrants()
-        .filter(g => isParticipant(g.username) && (organizer || g.username === me))
+        .filter(g => isParticipant(g.username) && (organizer || g.username === me) && ownedByBinding(req, g))
         .map(g => {
           let host = null;
           try { host = new URL(JSON.parse(g.redirect_uris || '[]')[0]).hostname; } catch { /* client pruned */ }
@@ -440,6 +454,7 @@ function registerTripMcp({
     // Someone else's connection is "not found" to a member, not "forbidden":
     // the id says nothing about whether it exists.
     if (grant.username !== req.user.username && !isOrganizer(req.user.username)) return res.status(404).json({ error: 'not_found' });
+    if (!ownedByBinding(req, grant)) return res.status(404).json({ error: 'not_found' });
     store.revokeGrant(grant.id);
     console.log(`[trip-mcp] ${req.user.username} disconnected ${grant.id} (${grant.username})`);
     res.json({ ok: true });

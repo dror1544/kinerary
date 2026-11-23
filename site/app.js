@@ -433,7 +433,39 @@ async function openAvatarLightbox(username) {
   const lb = document.getElementById('avatar-lightbox');
   if (lb) lb.classList.add('open');
   _updateLightboxUI();
+  _applySignInManagedUI();
   _updateGoogleConnectUI();
+}
+
+// A session that came in through a Kinerary account (a group claim or a personal invite: /api/auth/me says
+// `sign_in_managed`) is refused by the site on the password and Google-link routes, so this screen does not offer them and
+// says where the person's sign-in lives. Every other session is left exactly as it was. Same line as the modern page.
+function _applySignInManagedUI() {
+  const managed = Boolean(currentUser && currentUser.sign_in_managed);
+  const toggle = document.getElementById('avatar-lb-pw-toggle');
+  const googleWrap = document.getElementById('avatar-lb-google-wrap');
+  let note = document.getElementById('avatar-lb-sign-in-managed');
+  if (!managed) {
+    if (note) note.remove();
+    if (toggle) toggle.style.display = '';
+    // Put the Google block back to what initGoogleAuth made of it for this page: shown only when Google is configured here
+    // (it marks the block, once), never on a trip with no Google client. A page can go from a managed session to a plain one
+    // without a reload (sign out, pick another person), and initGoogleAuth does not run again.
+    if (googleWrap && googleWrap.dataset.googleOffered === 'true') {
+      googleWrap.style.display = 'flex';
+      _updateGoogleConnectUI();
+    }
+    return;
+  }
+  if (toggle) toggle.style.display = 'none';
+  if (googleWrap) googleWrap.style.display = 'none'; // _updateGoogleConnectUI treats a wrap that is not 'flex' as "Google not offered"
+  if (!note && toggle) {
+    note = document.createElement('div');
+    note.id = 'avatar-lb-sign-in-managed';
+    note.className = 'avatar-lb-crop-status';
+    toggle.insertAdjacentElement('afterend', note);
+  }
+  if (note) note.textContent = currentLang === 'en' ? 'You sign in with your Kinerary account.' : 'הכניסה שלך היא עם חשבון Kinerary.';
 }
 
 // Reflects current link state whenever the avatar lightbox is (re)opened or
@@ -762,20 +794,7 @@ function initAvatarLightbox() {
   pwCancel?.addEventListener('click', _hidePwPanel);
 
   // ── Connect / disconnect Google ──────────────────────────────────────────
-  document.getElementById('avatar-lb-google-disconnect')?.addEventListener('click', async () => {
-    const token = localStorage.getItem('trip-token');
-    if (!token) return;
-    try {
-      await fetch('/api/auth/google-link', { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
-      if (currentUser) {
-        currentUser.google_email = null;
-        currentUser.google_picture = null;
-        saveTripUser(currentUser);
-      }
-      _updateGoogleConnectUI();
-      showLoggedIn(); // fall back to the file-based avatar now that Google is disconnected
-    } catch {}
-  });
+  document.getElementById('avatar-lb-google-disconnect')?.addEventListener('click', disconnectGoogle);
 
   pwSave?.addEventListener('click', async () => {
     const tr = (T[currentLang] || T['he']) || {};
@@ -824,6 +843,28 @@ function initAvatarLightbox() {
 // One GIS callback handles both flows, told apart by whether currentUser is
 // already set: logged out → login with a linked Google account; logged in →
 // link the Google account onto the current (already-predefined) user.
+// The link is cleared locally only when the server says it was: a refusal (a managed session, an expired token) or a network
+// failure leaves it in place and shows the error string, instead of claiming "disconnected" for a link that is still there.
+async function disconnectGoogle() {
+  const token = localStorage.getItem('trip-token');
+  if (!token) return;
+  const tr = T[currentLang] || T['he'];
+  const statusEl = document.getElementById('avatar-lb-google-status');
+  try {
+    const res = await fetch('/api/auth/google-link', { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) throw new Error('google unlink failed');
+    if (currentUser) {
+      currentUser.google_email = null;
+      currentUser.google_picture = null;
+      saveTripUser(currentUser);
+    }
+    _updateGoogleConnectUI();
+    showLoggedIn(); // fall back to the file-based avatar now that Google is disconnected
+  } catch {
+    if (statusEl) statusEl.textContent = tr.avatar_google_error || 'Could not connect Google account';
+  }
+}
+
 async function initGoogleAuth() {
   let clientId = null;
   try {
@@ -845,11 +886,15 @@ async function initGoogleAuth() {
 
   const googleWrap = document.getElementById('avatar-lb-google-wrap');
   if (googleWrap) {
-    googleWrap.style.display = 'flex';
+    // Record that Google is offered on this page, and let _applySignInManagedUI decide whether THIS session sees the block: this
+    // function is not awaited and /api/health can be slow, so a managed session may already have opened the avatar screen (and had
+    // the block hidden) by the time it gets here. Showing the block unconditionally would put "Continue with Google" back in
+    // front of a session the site refuses to link.
+    googleWrap.dataset.googleOffered = 'true';
     google.accounts.id.renderButton(document.getElementById('avatar-lb-google-btn'), {
       type: 'standard', theme: 'outline', size: 'medium', text: 'continue_with', width: 220,
     });
-    _updateGoogleConnectUI();
+    _applySignInManagedUI(); // shows the block (and refreshes it) for a session that is not sign_in_managed; hides it for one that is
   }
 }
 

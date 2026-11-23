@@ -3,9 +3,10 @@ import type { NotificationAdapter } from "./signup.js";
 import { structuredLog } from "./redaction.js";
 import { organizerIntroMessages, type IntroMessage, type ProactiveSettings } from "./companion-intro.js";
 import { issueGroupBindingToken } from "./group-binding.js";
-import { SIGN_IN_NOTICE_TYPE, signInNoticeText } from "./telegram-mini-app.js";
+import { GROUP_CLAIM_LINK_KIND, SIGN_IN_NOTICE_TYPE, groupClaimNoticeText, signInNoticeText } from "./telegram-mini-app.js";
 import { confirmAudience, skippedLine } from "./trip-audience.js";
 import { renderPlanChangeLine, type PlanChange } from "./plan-change-line.js";
+import { dispatchSignInLinkNotices } from "./sign-in-link.js";
 
 interface OutboxRow {
   id: string;
@@ -130,6 +131,8 @@ function messageTextFor(row: OutboxRow, options?: DispatchOptions): string | Int
   if (row.notification_type === SIGN_IN_NOTICE_TYPE) {
     // About an account, not a trip (trip_id is NULL). Wording lives with the
     // sign-in code that queues it.
+    // A group claim (docs/specs/sprint-9/x-member-sign-in.md, AC-7) tells the organizers in the trip's language.
+    if (payloadString(row, "link_kind") === GROUP_CLAIM_LINK_KIND) return groupClaimNoticeText(row.payload);
     return signInNoticeText({
       accountName: payloadString(row, "account_name") ?? "your account",
       linkKind: payloadString(row, "link_kind") === "member" ? "member" : "organizer",
@@ -243,6 +246,10 @@ export async function dispatchPendingTripNotifications(
   );
 
   let dispatched = 0;
+  // ── Sign-in links (docs/specs/sprint-9/x-member-sign-in.md, S3): a pass of their own, in sign-in-link.ts. Their rows carry a
+  // one-time token, so they are sent, blanked and expired by code that knows that; the query above never selects them.
+  dispatched += await dispatchSignInLinkNotices(db, notification, log, { publicOrigin: options?.publicOrigin ?? null });
+  // ── end of the sign-in links block ──
   for (const row of rows) {
     // A row addressed to a ROLE of the trip, not to a chat. Its `recipient` is never read (the database refuses one
     // beside a target): the chat is the trip's own open binding, re-read now. Everything else below is the path every

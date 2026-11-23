@@ -1,4 +1,4 @@
-import { createHash, randomBytes, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type pg from "pg";
@@ -17,10 +17,12 @@ import { issueApproval } from "./plan-approval.js";
 import { removeMember } from "./member-removal.js";
 import { structuredLog } from "./redaction.js";
 import {
-  TRIP_ID_PATTERN, claimSessionSlot, enqueueSignInNotice, linkMemberOrSkip,
+  CLAIM_ID_SHAPE, GROUP_VERIFIED_VIA, TRIP_ID_PATTERN, openGroupChat, spokenFor, claimSessionSlot, claimTravellerInTx, endGroupClaimInTx, enqueueSignInNotice, linkMemberOrSkip,
   recordLinkSignIn, resolveMiniAppLaunch, telegramLinksByTrip, unlinkTelegramLink, unlinkedTelegramLinksByTrip,
-  type LabelVisibility, type TelegramMiniAppConfig,
+  type GroupSignInDeps, type LabelVisibility, type ReleasedClaim, type SiteParticipant, type TelegramMiniAppConfig,
 } from "./telegram-mini-app.js";
+import { featureEnabled } from "./feature-switches.js";
+import type { GroupMembershipCheck } from "./telegram-group-membership.js";
 import { issueTelegramLinkToken, restoreTelegramLink } from "./telegram-link-token.js";
 import { issueSecondaryOrganizerToken, listSecondaryOrganizers, removeSecondaryOrganizer } from "./secondary-organizers.js";
 import {
@@ -29,6 +31,8 @@ import {
 } from "./portal-scope.js";
 import { verifyMiniAppInitData, type VerifiedInitData } from "./telegram-webapp-auth.js";
 import { runtimeUpstreamFor, UPSTREAM_SHARED_SQL, upstreamHostAllowed } from "./runtime-upstream.js";
+import { applyLinkPassword, attachSession, claimGateVerdict, consumeSignInLink, endClaimLeftGroup, peekClaimLink, purgeSignInLinkLeftovers, signInLinkAvailable, startSignInLink, warnOncePerMinute, type SignInLinkRequest } from "./sign-in-link.js";
+import { SiteReleaseError, attemptSiteRelease, compensateSiteBinding, type SiteReleaseOptions } from "./site-release-outbox.js";
 
 export { upstreamHostAllowed };
 
@@ -288,14 +292,84 @@ export interface RuntimeAccountAdapter {
     userId: string;
     runtimeUsername: string;
     displayName: string;
+    /** Invite ids the control plane has checked are dead for this name (see `deadInviteIds`); omitted when there are none. */
+    deadInviteIds?: string[];
   }): Promise<void>;
+  /**
+   * The trip site's participants: username, display name and ROLE as the site says it. Group sign-in
+   * (telegram-mini-app.ts) offers only the ones the site calls `member`. Throws when the site cannot be asked; a caller
+   * treats that as "no list", never as "an empty list".
+   */
+  listParticipants(tripId: string): Promise<SiteParticipant[]>;
+  /**
+   * Binds a control-plane user to a participant that ALREADY EXISTS on the trip site, so the session exchange for that
+   * user finds an identity (the invite path gets one from `provisionParticipant`; a claim has no invite). It never
+   * creates a participant and never changes one: the site refuses an organizer, a name that is not a participant, and a
+   * name an invite holds. "ok" = bound; "refused" = not a plain member there (or not there at all); "conflict" = an
+   * invite-bound or owner binding holds the name. THROWS when the site cannot be asked: nothing is known, and a caller
+   * must not read that as either answer. The personal invite for an existing traveller (spec AC-10) reuses this.
+   */
+  adoptParticipant(input: { tripId: string; userId: string; runtimeUsername: string; deadInviteIds?: string[] }): Promise<"ok" | "refused" | "conflict">;
+  /** Ends that binding (only that user's, only a claim's, never an invited member's or an organizer's). Idempotent. Throws when the site cannot be asked. */
+  releaseParticipant(input: { tripId: string; userId: string; runtimeUsername: string; inviteId?: string }): Promise<void>;
+}
+
+/** How long the control plane waits on the trip site for one of these calls. They run inside a person's launch. */
+const RUNTIME_CALL_TIMEOUT_MS = 5000;
+
+/**
+ * The JSON `error` code of a failed answer when the body is an object carrying a string one (the trip site's and the runtime gateway's
+ * own errors all are), else null: HTML, empty, not an object, an over-long string. That is the line between "the site said so" and
+ * "something in between answered" (a proxy, a WAF, Express's default page for a route this payload does not have).
+ */
+async function siteJsonErrorCode(response: Response): Promise<string | null> {
+  const body = (await response.text().catch(() => "")).slice(0, 4096);
+  try {
+    const parsed = JSON.parse(body) as unknown;
+    const said = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as { error?: unknown }).error : undefined;
+    return typeof said === "string" && said.length <= 64 ? said : null;
+  } catch { return null; }
+}
+
+/**
+ * `listParticipants` failed because the route is not there: a 404 that is NOT the site's or gateway's own JSON `NOT_FOUND`. That is an
+ * older trip-site payload (Express's default HTML 404) during the window between a control-plane restart and the trip's redeploy.
+ * Its message is the ordinary list failure, so every caller that just catches fails safe exactly as before; only `createSiteInvite`
+ * looks at the class, to fall back to `participantExists` as `main` did.
+ */
+export class SiteRouteMissingError extends Error {
+  constructor() { super("RUNTIME_PARTICIPANT_LIST_FAILED"); this.name = "SiteRouteMissingError"; }
+}
+
+/**
+ * What the adapter's own fetch throws when the gateway answered with a redirect. Every call here carries the control-plane key in
+ * `x-api-key`, and Node's fetch forwards that header to wherever a redirect points (it drops only `authorization` and `cookie` across
+ * origins), after which the adapter would have believed the foreign answer. A redirect is therefore never followed and never an answer:
+ * the same failure as a site that cannot be reached, which every caller already treats as the safe one (retry, or "not ready").
+ */
+export class RuntimeRedirectRefusedError extends Error {
+  constructor(readonly status: number) { super("RUNTIME_GATEWAY_REDIRECT"); this.name = "RuntimeRedirectRefusedError"; }
 }
 
 export class HttpRuntimeAccountAdapter implements RuntimeAccountAdapter {
-  constructor(private readonly runtimeOrigin: string, private readonly apiKey: string) {}
+  constructor(private readonly runtimeOrigin: string, private readonly apiKey: string, private readonly timeoutMs: number = RUNTIME_CALL_TIMEOUT_MS) {}
+
+  /**
+   * The only way this class calls the gateway. `redirect: "manual"`, then any 3xx is refused here, by status range: Node 20 and 22
+   * hand back the 3xx itself, a browser-style runtime would hand back an opaque redirect (type "opaqueredirect", status 0), and the
+   * range check does not depend on which. Nothing past this point sees a redirect as an answer.
+   */
+  private async call(path: string, init: { method: "GET" | "POST"; headers: Record<string, string>; body?: string; signal?: AbortSignal }): Promise<Response> {
+    const response = await fetch(`${this.runtimeOrigin}${path}`, { ...init, redirect: "manual" });
+    if ((response.status >= 300 && response.status < 400) || response.type === "opaqueredirect") {
+      await response.body?.cancel().catch(() => {});
+      throw new RuntimeRedirectRefusedError(response.status);
+    }
+    return response;
+  }
 
   async participantExists(input: { tripId: string; runtimeUsername: string }): Promise<boolean> {
-    const response = await fetch(`${this.runtimeOrigin}/internal/t/${encodeURIComponent(input.tripId)}/participants/${encodeURIComponent(input.runtimeUsername)}`, {
+    const response = await this.call(`/internal/t/${encodeURIComponent(input.tripId)}/participants/${encodeURIComponent(input.runtimeUsername)}`, {
       method: "GET",
       headers: { "x-api-key": this.apiKey },
     });
@@ -304,15 +378,78 @@ export class HttpRuntimeAccountAdapter implements RuntimeAccountAdapter {
     return true;
   }
 
+  async listParticipants(tripId: string): Promise<SiteParticipant[]> {
+    const response = await this.call(`/internal/t/${encodeURIComponent(tripId)}/participants`, {
+      method: "GET",
+      headers: { "x-api-key": this.apiKey },
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+    if (!response.ok) {
+      // A JSON NOT_FOUND is a GATEWAY that lacks the route (one older than the control plane): not a missing SITE route, no fallback.
+      if (response.status === 404 && (await siteJsonErrorCode(response)) !== "NOT_FOUND") throw new SiteRouteMissingError();
+      throw new Error("RUNTIME_PARTICIPANT_LIST_FAILED");
+    }
+    const body = (await response.json()) as { participants?: unknown } | null;
+    if (!body || !Array.isArray(body.participants)) throw new Error("RUNTIME_PARTICIPANT_LIST_FAILED");
+    // Strings only: anything else is dropped here, so a malformed entry can neither be offered nor crash the caller.
+    return body.participants.flatMap((entry: unknown) => {
+      const { username, displayName, role } = (entry ?? {}) as Record<string, unknown>;
+      return typeof username === "string" && typeof displayName === "string" && typeof role === "string" ? [{ username, displayName, role }] : [];
+    });
+  }
+
+  private async binding(action: "adopt" | "release", input: { tripId: string; userId: string; runtimeUsername: string; deadInviteIds?: string[]; inviteId?: string }): Promise<Response> {
+    return this.call(`/internal/t/${encodeURIComponent(input.tripId)}/participants/${action}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": this.apiKey },
+      body: JSON.stringify({ tripId: input.tripId, userId: input.userId, runtimeUsername: input.runtimeUsername, ...(action === "adopt" && input.deadInviteIds?.length ? { deadInviteIds: input.deadInviteIds } : {}), ...(action === "release" && input.inviteId ? { inviteId: input.inviteId } : {}) }),
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+  }
+
+  async adoptParticipant(input: { tripId: string; userId: string; runtimeUsername: string; deadInviteIds?: string[] }): Promise<"ok" | "refused" | "conflict"> {
+    const response = await this.binding("adopt", input);
+    if (response.ok) return "ok";
+    if (response.status === 404 || response.status === 403) return "refused";
+    if (response.status === 409) return "conflict";
+    throw new Error("RUNTIME_PARTICIPANT_ADOPT_FAILED");
+  }
+
+  async releaseParticipant(input: { tripId: string; userId: string; runtimeUsername: string; inviteId?: string }): Promise<void> {
+    let response: Response;
+    // A redirect is not an answer and the key went nowhere (`call`): retryable, never `done` and never given up (the outbox gives up only
+    // on the site's own 400/403 with its own code; this carries the 3xx status and no code).
+    try { response = await this.binding("release", input); } catch (error) {
+      if (error instanceof RuntimeRedirectRefusedError) throw new SiteReleaseError(error.status);
+      throw error;
+    }
+    // The status travels with the failure, and so does the body's JSON `error` code when the body is an object carrying a string one
+    // (SiteReleaseError): the durable retry (site-release-outbox.ts) gives up only on the site's or gateway's OWN refusal of that status
+    // and keeps retrying everything else, a proxy's or WAF's 4xx included. A 200 counts only when it is the site's own answer,
+    // `{ok:true, released}` ("nothing to release" is `released:false` and is success); anything else on a 200 (a proxy's page, an
+    // empty body) is not an answer.
+    if (!response.ok) throw new SiteReleaseError(response.status, await siteJsonErrorCode(response));
+    const answer = (await response.json().catch(() => null)) as { ok?: unknown } | null;
+    if (!answer || answer.ok !== true) throw new SiteReleaseError(null);
+  }
+
   async provisionParticipant(input: Parameters<RuntimeAccountAdapter["provisionParticipant"]>[0]): Promise<void> {
-    const response = await fetch(`${this.runtimeOrigin}/internal/t/${encodeURIComponent(input.tripId)}/participants`, {
+    const response = await this.call(`/internal/t/${encodeURIComponent(input.tripId)}/participants`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-api-key": this.apiKey },
       body: JSON.stringify(input),
+      signal: AbortSignal.timeout(this.timeoutMs),
     });
+    // The site SAID NO (not a participant, an organizer, the name is held by another invite or this account is bound elsewhere):
+    // a refusal the invite's holder can be told about cleanly. Anything else (an outage, a gateway error, a lost answer) is not an
+    // answer at all, and is retryable.
+    if (response.status === 403 || response.status === 404 || response.status === 409) throw new Error(RUNTIME_PARTICIPANT_REFUSED);
     if (!response.ok) throw new Error("RUNTIME_PARTICIPANT_PROVISION_FAILED");
   }
 }
+
+/** What `provisionParticipant` throws when the trip site refused the binding, as opposed to being unable to answer. */
+export const RUNTIME_PARTICIPANT_REFUSED = "RUNTIME_PARTICIPANT_REFUSED";
 
 export interface PortalDependencies {
   db: pg.Pool;
@@ -337,6 +474,13 @@ export interface PortalDependencies {
    * so: the feature is off, and says it is off.
    */
   telegramMiniApp?: TelegramMiniAppConfig & { log?: (line: string) => void };
+  /**
+   * Group sign-in (docs/specs/sprint-9/x-member-sign-in.md, slice S1): how to ask Telegram whether a person is live in a
+   * trip's group, with the bot that is IN the group. Absent means the path does not exist: every launch and every claim
+   * behaves as if the feature had never been written, whatever the per-trip switch says. The switch itself
+   * (`member_group_sign_in`) is read per trip on `db`; this is only the wiring that makes it meaningful.
+   */
+  memberGroupSignIn?: { isActiveMember: GroupMembershipCheck };
   /** How long a dashboard-issued Telegram link works. Defaults to 15 minutes. */
   telegramLinkTtlSeconds?: number;
   /**
@@ -361,6 +505,8 @@ interface PortalUser {
   sessionDigest: string;
   sessionId: string;
   sessionCreatedAt: Date;
+  /** The Telegram link that minted this session, if one did (group sign-in asks the group again through it). */
+  telegramLinkId: string | null;
   /**
    * NULL for a full (password / Google) session. For a session a Telegram link
    * minted, the trips that Telegram account is linked to - possibly none. See
@@ -437,6 +583,7 @@ async function portalUser(request: FastifyRequest, deps: PortalDependencies): Pr
     sessionDigest: row.session_digest,
     sessionId: row.session_id,
     sessionCreatedAt: row.session_created_at,
+    telegramLinkId: row.telegram_link_id,
     scope,
   };
 }
@@ -448,12 +595,14 @@ async function createWebSession(client: pg.PoolClient, userId: string, ttlSecond
   // unlinking (or the link ending any other way) can end that session too. Such
   // a session is SCOPED (portal-scope.ts) and is stored under the scoped digest,
   // which no older release can match: a rollback cannot widen it.
+  const sessionId = opaque("wsess");
   await client.query(
     `INSERT INTO control_plane.web_sessions(id, user_id, token_digest, csrf_digest, expires_at, telegram_link_id)
      VALUES ($1, $2, $3, $4, now() + ($5 * interval '1 second'), $6)`,
-    [opaque("wsess"), userId, telegramLinkId ? scopedSessionDigest(sessionToken) : sha256(sessionToken), sha256(csrf), ttlSeconds, telegramLinkId],
+    [sessionId, userId, telegramLinkId ? scopedSessionDigest(sessionToken) : sha256(sessionToken), sha256(csrf), ttlSeconds, telegramLinkId],
   );
-  return { sessionToken, csrf };
+  // `sessionId` is read only by the sign-in link, which remembers which session its redemption minted (sign-in-link.ts).
+  return { sessionToken, csrf, sessionId };
 }
 
 function setWebSessionCookies(
@@ -592,6 +741,124 @@ async function membership(deps: PortalDependencies, tripId: string, userId: stri
     [tripId, userId],
   );
   return result.rows[0] ?? null;
+}
+
+/**
+ * The invite ids that are DEAD for one traveller of one trip: revoked or expired (by state, or by the clock while still `unused`) AND
+ * never redeemed. Sent to the trip site with an invite provision or a claim's adopt so that it can replace an invite-bound binding that
+ * a redemption which never completed here (a lost answer; the organizer then "sent it again") left behind: the site replaces an
+ * invite-bound binding only when its invite id is on this list. A REDEEMED invite is a person on the trip and is never on it, nor is
+ * a pending invite. Read inside the caller's trip-row lock (a redemption and a claim both hold it), so the list cannot go stale
+ * between the question and the call. Bounded (50): the site refuses a longer list as no list.
+ */
+export async function deadInviteIdsFor(db: { query: (text: string, values?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }> }, tripId: string, runtimeUsername: string): Promise<string[]> {
+  const result = await db.query(
+    `SELECT id FROM control_plane.site_invites
+      WHERE trip_id = $1 AND runtime_username = $2
+        AND ((redeemed_by IS NULL AND redeemed_at IS NULL AND (state IN ('revoked', 'expired') OR (state = 'unused' AND expires_at <= now())))
+          -- a REMOVED member's invite (member removal marks the redeemed invite 'revoked' and keeps redeemed_by): dead only while its
+          -- redeemer has NO active membership of this trip, in any role. Whoever is a member again (revived by any path, re-invited, an
+          -- owner or organizer) is not listed, so a live member's binding is never named; a binding of someone with no active
+          -- membership opens nothing (a launch needs one). 'expired' or 'unused' with a redeemer is never listed.
+          OR (state = 'revoked' AND redeemed_by IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM control_plane.trip_memberships m
+                               WHERE m.trip_id = site_invites.trip_id AND m.user_id = site_invites.redeemed_by AND m.status = 'active')))
+      ORDER BY created_at DESC LIMIT 50`,
+    [tripId, runtimeUsername]);
+  return result.rows.map((row) => String(row.id));
+}
+
+export type SiteInviteResult =
+  | { ok: true; id: string; joinUrl: string; displayName: string; expiresAt: string }
+  | { ok: false; status: 400 | 404 | 409; error: string };
+
+/**
+ * THE ONE WAY a personal invite for an existing traveller is made (docs/specs/sprint-9/x-member-sign-in.md, slice S2, AC-10): the
+ * portal route `POST /v1/trips/:id/site-invites`, the runtime gateway's hop for an organizer's trip-site session
+ * (`/internal/member-invites/create`) and, next, the companion's organizer-scoped tool all call THIS, so the rules exist once. The
+ * caller authenticates its own person and says who they are (`actorUserId`); this function decides again, from the database, that
+ * the person is an owner or organizer of THIS trip with dashboard access, and answers anyone else with the one 404.
+ *
+ * What it will not make an invite for, and why:
+ *   - a name that is not a participant of the trip site (`RUNTIME_PARTICIPANT_NOT_FOUND`): an invite BINDS an existing participant,
+ *     it never creates one. A new traveller is added on the site first, then invited, exactly as before (D2).
+ *   - an organizer, owner or secondary organizer (`RUNTIME_PARTICIPANT_NOT_ELIGIBLE`): the site says so (its role is not `member`),
+ *     or an owner/organizer account here already holds the name. The site refuses the binding anyway; saying so here gives the
+ *     organizer a clean answer instead of a link that cannot work.
+ *   - a traveller who is CLAIMED from the group right now (`TRAVELLER_CLAIMED_FROM_GROUP`): the organizer releases that sign-in
+ *     first. Only an organizer ever sees this answer, because the 404 above comes first.
+ *   - a traveller who already has a pending invite (`INVITE_ALREADY_EXISTS`) unless `replacePending` (the organizer's "send it
+ *     again": the old pending link is revoked and a new one issued in the same transaction), or a redeemed one (never replaced).
+ *
+ * The trip row is locked (`FOR UPDATE`) for the check and the insert, the lock every group claim also takes, so a claim and an invite
+ * for the same traveller meet here one after the other and cannot both win.
+ */
+export async function createSiteInvite(
+  deps: Pick<PortalDependencies, "db" | "runtimeAccounts" | "publicOrigin"> & { log?: (line: string) => void },
+  input: { tripId: string; actorUserId: string; runtimeUsername: string; displayName?: string; replacePending?: boolean },
+): Promise<SiteInviteResult> {
+  const { tripId } = input;
+  const actor = await membership(deps as PortalDependencies, tripId, input.actorUserId);
+  if (!actor || !["owner", "organizer"].includes(actor.role) || !actor.dashboard_access) return { ok: false, status: 404, error: "NOT_FOUND" };
+  const runtimeUsername = typeof input.runtimeUsername === "string" ? input.runtimeUsername.toLowerCase().trim() : "";
+  if (!/^[a-z0-9][a-z0-9._-]{1,63}$/.test(runtimeUsername)) return { ok: false, status: 400, error: "INVALID_REQUEST" };
+  const clean = (value: string) => value.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 120).trim();
+  const given = typeof input.displayName === "string" ? clean(input.displayName) : "";
+  let displayName: string;
+  try {
+    const people = await deps.runtimeAccounts.listParticipants(tripId);
+    const person = people.find((candidate) => candidate.username === runtimeUsername);
+    if (!person) return { ok: false, status: 409, error: "RUNTIME_PARTICIPANT_NOT_FOUND" };
+    if (person.role !== "member") return { ok: false, status: 409, error: "RUNTIME_PARTICIPANT_NOT_ELIGIBLE" };
+    displayName = given || clean(person.displayName);
+  } catch (error) {
+    // The list is a route an OLDER trip-site payload does not have (mixed versions: the control plane restarts before each trip is
+    // redeployed). Only that falls back, to what `main` asked: does the participant exist. A real outage stays RUNTIME_NOT_READY.
+    // What the fallback cannot read is the SITE's role for the name; the old site itself still refuses to bind an organizer at
+    // redeem (its provision route answers 403 ORGANIZER_BINDING_FORBIDDEN), and the checks below that come from the control plane's
+    // own tables (a group claim, an organizer-side account) are unchanged. The caller must name the traveller, as on `main`.
+    if (!(error instanceof SiteRouteMissingError)) return { ok: false, status: 409, error: "RUNTIME_NOT_READY" };
+    let exists: boolean;
+    try { exists = await deps.runtimeAccounts.participantExists({ tripId, runtimeUsername }); } catch { return { ok: false, status: 409, error: "RUNTIME_NOT_READY" }; }
+    if (!exists) return { ok: false, status: 409, error: "RUNTIME_PARTICIPANT_NOT_FOUND" };
+    (deps.log ?? ((line: string) => process.stderr.write(`${line}\n`)))(
+      structuredLog("info", "site_invite.old_site_fallback", { effect: "the trip site has no participant list: existence checked per participant, as before; its role for the name was not read" }));
+    displayName = given;
+  }
+  if (!displayName) return { ok: false, status: 400, error: "INVALID_REQUEST" };
+  const token = base64url(32);
+  const inviteId = opaque("invite");
+  const client = await deps.db.connect();
+  try {
+    await client.query("BEGIN");
+    const locked = await client.query("SELECT 1 FROM control_plane.trips WHERE id = $1 FOR UPDATE", [tripId]);
+    if (!locked.rowCount) { await client.query("ROLLBACK"); return { ok: false, status: 404, error: "NOT_FOUND" }; }
+    const claimed = await client.query("SELECT 1 FROM control_plane.trip_participant_claims WHERE trip_id = $1 AND runtime_username = $2 AND released_at IS NULL", [tripId, runtimeUsername]);
+    if (claimed.rowCount) { await client.query("ROLLBACK"); return { ok: false, status: 409, error: "TRAVELLER_CLAIMED_FROM_GROUP" }; }
+    if ((await spokenFor(client, tripId)).organizerSide.has(runtimeUsername)) { await client.query("ROLLBACK"); return { ok: false, status: 409, error: "RUNTIME_PARTICIPANT_NOT_ELIGIBLE" }; }
+    // A pending invite past its expiry is not pending: close it, so the unique index (which counts every 'unused' row) lets a fresh one in.
+    await client.query("UPDATE control_plane.site_invites SET state = 'expired', updated_at = now() WHERE trip_id = $1 AND runtime_username = $2 AND state = 'unused' AND expires_at <= now()", [tripId, runtimeUsername]);
+    if (input.replacePending) {
+      await client.query("UPDATE control_plane.site_invites SET state = 'revoked', updated_at = now() WHERE trip_id = $1 AND runtime_username = $2 AND state = 'unused'", [tripId, runtimeUsername]);
+    }
+    let inserted;
+    try {
+      inserted = await client.query<{ expires_at: Date }>(
+        `INSERT INTO control_plane.site_invites(id, trip_id, created_by, intended_display_name, runtime_username, token_digest, state, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, 'unused', now() + interval '7 days') RETURNING expires_at`,
+        [inviteId, tripId, input.actorUserId, displayName, runtimeUsername, sha256(token)],
+      );
+    } catch (error) {
+      await client.query("ROLLBACK");
+      if ((error as { code?: string }).code === "23505") return { ok: false, status: 409, error: "INVITE_ALREADY_EXISTS" };
+      throw error;
+    }
+    await client.query("COMMIT");
+    return { ok: true, id: inviteId, joinUrl: `${deps.publicOrigin}/join#token=${token}`, displayName, expiresAt: inserted.rows[0]!.expires_at.toISOString() };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally { client.release(); }
 }
 
 // Trip states a terminally failed build can be retried from: `retryProvision`'s own RETRYABLE_STATES, minus
@@ -788,6 +1055,9 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     // Whether the portal can send the verification / reset message at all. False renders "Sign-up isn't open yet".
     emailSignUp: Boolean(deps.mailer),
     telegramMiniApp: Boolean(deps.telegramMiniApp?.enabled()),
+    // "Send me a sign-in link" (slice S3) is on at the EVERY-TRIP level. One boolean, the same for every caller: it says nothing
+    // about any single trip, so an anonymous page cannot use it to learn where the feature is on.
+    signInLink: await signInLinkAvailable(deps.db, (line) => (deps.emailAuthLog ?? ((l: string) => process.stderr.write(`${l}\n`)))(line)),
   }));
 
   // Bound both expensive credential checks and limiter memory. Use the socket
@@ -983,6 +1253,134 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     } finally { client.release(); }
   });
 
+  // ── "Send me a sign-in link" (sign-in-link.ts; docs/specs/sprint-9/x-member-sign-in.md, slice S3, AC-14 to AC-16) ──
+  //
+  //   POST /v1/auth/sign-in-link           { email, language? } | { tripId, travellerName }   202 { status: "request_received" }
+  //   POST /v1/auth/sign-in-link/redeem    { token }                                          200 { appPath, canSetPassword } + session cookies | 400 TOKEN_INVALID
+  //   POST /v1/auth/sign-in-link/password  { password }   (the session the redemption minted)  200 { ok: true } | 400 | 403 | 409
+  //
+  // THE ANSWER IS THE SAME FOR EVERY CASE the work behind it can end in: account found or not, channel or none, trip real or not,
+  // name ambiguous, a ceiling hit, a delivery that failed. It is sent BEFORE any of that work starts (runInBackground), so nothing
+  // about how long it takes depends on the case either. Only a request that is not one of the two shapes (400) or that comes from
+  // another origin (403) is answered differently, and neither depends on any account. Redemption is a POST, from the landing page
+  // the link opens (`/sign-in-link#token=`): a GET never carries the token to the server, so a link previewer cannot spend it.
+  const signInLinkIpAttempts: Attempts = new Map();
+  const signInLinkRedeemIpAttempts: Attempts = new Map();
+  /** One generic answer. A different word for any case would be a way to ask "is there an account?". */
+  const SIGN_IN_LINK_ANSWER = { status: "request_received" } as const;
+  app.post("/v1/auth/sign-in-link", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
+    const body = jsonBody(request);
+    const hasEmail = "email" in body, hasTraveller = "tripId" in body || "travellerName" in body;
+    const emailDoor = hasEmail && !hasTraveller && typeof body.email === "string";
+    const travellerDoor = !hasEmail && typeof body.tripId === "string" && typeof body.travellerName === "string";
+    if (!emailDoor && !travellerDoor) return reply.code(400).send({ error: "INVALID_REQUEST" });
+    // EVERY well-formed request counts against the caller's allowance, an account that does not exist included: a limiter that
+    // only counted real accounts would tell a guess from a hit. Over it, the same 202 and nothing else happens.
+    const admitted = admitEmailIp(signInLinkIpAttempts, request.ip, 10);
+    if (!admitted) {
+      // Said once a minute and without the address; and the housekeeping that every admitted request does still runs, so a limiter
+      // that keeps refusing cannot leave a stale one-time token sitting in the outbox.
+      warnOncePerMinute(emailAuthLog, "sign_in_link.ip_limit_reached", "ip", { effect: "requests from a client address are answered and nothing is sent; a shared address (a family on one connection) shuts the feature for them" });
+      runInBackground(() => purgeSignInLinkLeftovers(deps.db), (error) =>
+        emailAuthLog(structuredLog("error", "sign_in_link.request_failed", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN" })));
+    }
+    let input: SignInLinkRequest | null = null;
+    if (emailDoor) {
+      const email = normalizeEmail(body.email);
+      if (email !== null) input = { door: "email", email, language: pickLanguage(body.language, request.headers["accept-language"]) };
+    } else {
+      const travellerName = String(body.travellerName);
+      if (travellerName.length <= 200) input = { door: "traveller", tripId: String(body.tripId), travellerName };
+    }
+    if (admitted && input) {
+      const wanted = input;
+      runInBackground(
+        () => startSignInLink({
+          db: deps.db, mailer: deps.mailer, publicOrigin: deps.publicOrigin,
+          listParticipants: (tripId) => deps.runtimeAccounts.listParticipants(tripId), groupSignIn: deps.memberGroupSignIn, log: emailAuthLog,
+        }, wanted),
+        (error) => emailAuthLog(structuredLog("error", "sign_in_link.request_failed", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN" })));
+    }
+    return reply.code(202).send(SIGN_IN_LINK_ANSWER);
+  });
+
+  app.post("/v1/auth/sign-in-link/redeem", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    if (!admitEmailIp(signInLinkRedeemIpAttempts, request.ip, 30)) return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
+    if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
+    const token = jsonBody(request).token;
+    // A GROUP CLAIMANT's link is held to the Mini App's gate BEFORE anything is spent or minted (sign-in-link.ts, `peekClaimLink`):
+    // the group is asked while no session and no spent link exist, so a hang, a crash or a client that goes away leaves nothing
+    // behind. "out": the person left, the claim ends exactly as at a launch and the answer is the one refusal. "unknown": Telegram
+    // did not say, so nothing is spent and nothing revoked, and the answer is the retryable one the launch gives. "dormant": the
+    // group switch is off or unreadable, the one refusal, nothing spent, nothing revoked (it works again when the switch does).
+    const peeked = await peekClaimLink(deps.db, token);
+    if (peeked) {
+      const verdict = await claimGateVerdict({ db: deps.db, groupSignIn: deps.memberGroupSignIn, log: emailAuthLog }, peeked.claim);
+      if (verdict === "out") {
+        await releaseSiteBindings(await endClaimLeftGroup(deps.db, peeked.userId, peeked.claim.tripId));
+        return reply.code(400).send({ error: "TOKEN_INVALID" });
+      }
+      if (verdict === "unknown") return reply.header("retry-after", "5").code(503).send({ error: "MEMBERSHIP_CHECK_UNAVAILABLE", retryable: true });
+      if (verdict === "dormant") return reply.code(400).send({ error: "TOKEN_INVALID" });
+      // Telegram can be slow, and the caller may have gone while it thought. Spending the link and minting a scoped session for a
+      // connection that is closed would burn the link and leave a live session nobody holds, so nothing is spent: the same link
+      // works for a caller who is there. Same retryable answer as "Telegram did not say" (nobody will read it).
+      if (reply.raw.destroyed || request.raw.socket?.destroyed === true) {
+        emailAuthLog(structuredLog("info", "sign_in_link.client_gone", { effect: "link not spent, no session minted" }));
+        return reply.header("retry-after", "5").code(503).send({ error: "MEMBERSHIP_CHECK_UNAVAILABLE", retryable: true });
+      }
+    }
+    // THE INVARIANT: a link is spent by exactly one transaction, the one that mints its session. Nothing un-spends a link.
+    const client = await deps.db.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await consumeSignInLink(client, token);
+      if (!result.ok) {
+        // Commit: a link spent by a refusal (its account stopped being a member account, its claim ended) stays spent.
+        await client.query("COMMIT");
+        return reply.code(400).send({ error: "TOKEN_INVALID" });
+      }
+      // A group claimant's link mints the claim's SCOPED session (portal-scope.ts), exactly as a Mini App launch does.
+      const session = await createWebSession(client, result.userId, deps.sessionTtlSeconds, result.telegramLinkId);
+      await attachSession(client, result.linkId, session.sessionId);
+      await client.query("COMMIT");
+      setWebSessionCookies(reply, deps, session);
+      return { appPath: "/trips", canSetPassword: result.canSetPassword };
+    } catch (error) {
+      try { await client.query("ROLLBACK"); } catch { /* ignore */ }
+      throw error;
+    } finally { client.release(); }
+  });
+
+  app.post("/v1/auth/sign-in-link/password", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    const user = await requireMutation(request, reply, deps);
+    if (!user) return;
+    const password = jsonBody(request).password;
+    if (typeof password !== "string" || password.length > PASSWORD_MAX_LENGTH) return reply.code(400).send({ error: "INVALID_REQUEST" });
+    if (password.length < PASSWORD_MIN_LENGTH) return reply.code(400).send({ error: "PASSWORD_TOO_SHORT" });
+    // Before the transaction, so scrypt never runs under a row lock. Each store keeps its own hashing helper.
+    const [hashForEmailCredential, hashForTripCredential] = await Promise.all([hashPassword(password), hashPortalPassword(password)]);
+    const client = await deps.db.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await applyLinkPassword(client, { userId: user.id, sessionId: user.sessionId, hashForEmailCredential, hashForTripCredential });
+      if (result !== "ok") {
+        await client.query("ROLLBACK");
+        if (result === "not_offered") return reply.code(403).send({ error: "PASSWORD_STEP_UNAVAILABLE" });
+        return reply.code(409).send({ error: result === "already_set" ? "PASSWORD_ALREADY_SET" : "NO_PASSWORD_TO_REPLACE" });
+      }
+      await client.query("COMMIT");
+      return { ok: true };
+    } catch (error) {
+      try { await client.query("ROLLBACK"); } catch { /* ignore */ }
+      throw error;
+    } finally { client.release(); }
+  });
+
   // ── Telegram Mini App sign-in (#442) ──────────────────────────────────────
   //
   // POST /v1/auth/telegram-mini-app  { initData, tripId? }
@@ -999,23 +1397,113 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
   // all in onRequest, before the body is even parsed), then ONE HMAC, and only
   // then anything keyed on the person.
   const miniAppLog = (line: string) => (deps.telegramMiniApp?.log ?? ((l: string) => process.stderr.write(`${l}\n`)))(line);
+  // The structural gates both Mini App POSTs share (this one and POST /v1/mini-app/claim below).
+  const miniAppGates = async (request: FastifyRequest, reply: FastifyReply) => {
+    reply.header("cache-control", "private, no-store");
+    if (!deps.telegramMiniApp?.enabled()) return reply.code(503).send({ error: "TELEGRAM_MINI_APP_UNAVAILABLE" });
+    if (!admitLogin(miniAppIpAttempts, request.ip, 100)) {
+      return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
+    }
+    // A login-CSRF vector: another site could otherwise post a victim's own
+    // initData (or an attacker's) from the victim's browser. Missing and the
+    // literal "null" (sandboxed iframes, file:, redirects) are refused too.
+    if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
+    if (!/^application\/json(?:\s*;.*)?$/i.test(String(request.headers["content-type"] ?? ""))) {
+      return reply.code(415).send({ error: "UNSUPPORTED_MEDIA_TYPE" });
+    }
+  };
+  // Group sign-in (slice S1 of docs/specs/sprint-9/x-member-sign-in.md). Not wired, or no exchange key to derive the
+  // claim ids from, and the path does not exist. The per-trip switch is read on the launch's own connection, inside a
+  // savepoint (telegram-mini-app.ts, switchIsOn), so a read that fails costs one answer, off, and not the transaction.
+  const groupSignIn: GroupSignInDeps | undefined = deps.memberGroupSignIn && deps.runtimeExchangeKey
+    ? {
+      switchOn: (db, tripId) => featureEnabled(db, tripId, "member_group_sign_in", miniAppLog),
+      isActiveMember: deps.memberGroupSignIn.isActiveMember,
+      listParticipants: (tripId) => deps.runtimeAccounts.listParticipants(tripId),
+      claimIdKey: createHmac("sha256", deps.runtimeExchangeKey).update("kinerary:member-claim-id:v1").digest(),
+    }
+    : undefined;
+  /**
+   * Ends the trip site's binding of travellers whose claims just ended, AFTER the control-plane transaction that ended
+   * them has committed (a rolled-back release must unbind nobody). The control plane's own rows are the authority and are
+   * already final (membership revoked, link revoked, sessions ended, launch grants spent), so the old account can get no new
+   * grant and the gateway's liveness check refuses what it holds. What the site still holds until it hears is the binding,
+   * and with it the removed person's assistant (MCP) grants and any site token already issued, so the release is DURABLE
+   * (site-release-outbox.ts): the database recorded it in the transaction that ended the claim, this is the prompt attempt
+   * (success marks it done; any failure leaves it pending and says so once, by reason only), and a background pass retries
+   * until the site confirms. A request that triggered it never fails for the site's sake. No id is logged.
+   */
+  const siteRelease: SiteReleaseOptions = { db: deps.db, releaser: deps.runtimeAccounts, log: miniAppLog };
+  const releaseSiteBindings = async (released: readonly ReleasedClaim[]): Promise<void> => {
+    for (const claim of released) {
+      // The audit trail (the reason only: no trip, person, traveller, invite or chat id). A removed INVITE member's binding is not a group
+      // claim ending, and must not read as one: it has its own event.
+      if (claim.inviteId) miniAppLog(structuredLog("info", "member_invite.binding_released", { reason: claim.reason ?? "unknown" }));
+      else miniAppLog(structuredLog("info", "mini_app.group_claim", { outcome: "ended", reason: claim.reason ?? "unknown" }));
+      await attemptSiteRelease(siteRelease, claim);
+    }
+  };
+  /**
+   * GROUP SESSIONS STAY AS GOOD AS THE SEAT IN THE GROUP (spec S1, owner's decisions of 2026-11-20). A session a group claim
+   * minted is asked about at two moments that are not a Mini App launch: when it asks for a runtime grant
+   * (`POST /v1/trips/:id/launch`, every time) and when the gateway asks whether the trip session it opened is still live
+   * (`/internal/runtime-sessions/check`, at most once per 10 minutes per claim: `last_group_check_at`). Never a Telegram
+   * call for any other session: the first query decides, and a session that is not wholly a group session is `not_group`.
+   *   live     Telegram said "in" (now, or inside the last 10 minutes): carry on.
+   *   revoked  Telegram said "not in": the link, claim, sessions and membership end HERE (as at a Mini App launch,
+   *            `left_group`), the site binding is released after commit, and the caller refuses like any revoked session.
+   *   unknown  Telegram did not say: no grant for a launch (retry), STILL LIVE for the liveness check, nothing revoked, and
+   *            `last_group_check_at` is not advanced so the next check asks again (an outage must not log a family out).
+   *   dormant  the switch is off or unreadable, the group is not exactly one, or the path is not wired: not live, nothing
+   *            revoked, no Telegram call. Switching the feature back on makes the same session work again.
+   */
+  const GROUP_RECHECK_INTERVAL = "10 minutes";
+  const GROUP_LIVENESS_TIMEOUT_MS = 2000;
+  const groupSessionVerdict = async (input: { tripId: string; userId: string; sessionId: string | null; everyTime: boolean }): Promise<"not_group" | "live" | "revoked" | "unknown" | "dormant"> => {
+    const sessions = await deps.db.query<{ is_group: boolean | null }>(
+      `SELECT (l.verified_via = $3) AS is_group
+         FROM control_plane.web_sessions s
+         LEFT JOIN control_plane.telegram_member_links l ON l.id = s.telegram_link_id
+        WHERE s.user_id = $1 AND s.revoked_at IS NULL AND s.expires_at > now() AND ($2::text IS NULL OR s.id = $2::text)`,
+      [input.userId, input.sessionId, GROUP_VERIFIED_VIA]);
+    if (sessions.rows.length === 0 || !sessions.rows.every((row) => row.is_group === true)) return "not_group";
+    if (!groupSignIn || !(await featureEnabled(deps.db, input.tripId, "member_group_sign_in", miniAppLog))) return "dormant";
+    const claim = await deps.db.query<{ telegram_user_id: string | null; fresh: boolean }>(
+      `SELECT telegram_user_id, (last_group_check_at IS NOT NULL AND last_group_check_at > now() - interval '${GROUP_RECHECK_INTERVAL}') AS fresh
+         FROM control_plane.trip_participant_claims WHERE trip_id = $1 AND user_id = $2 AND released_at IS NULL`,
+      [input.tripId, input.userId]);
+    const telegramUserId = claim.rows[0]?.telegram_user_id;
+    if (!telegramUserId) return "dormant";
+    if (!input.everyTime && claim.rows[0]!.fresh) return "live";
+    const chat = await openGroupChat(deps.db, input.tripId);
+    if (!chat) return "dormant";
+    // The liveness path answers the gateway, which gives up after 5 s: its Telegram wait is shorter than a launch's, so a slow
+    // database cannot tip a Telegram hang into a logout.
+    const member = await groupSignIn.isActiveMember(chat, telegramUserId, input.everyTime ? undefined : { timeoutMs: GROUP_LIVENESS_TIMEOUT_MS });
+    if (member === "unknown") return "unknown";
+    if (member === true) {
+      await deps.db.query("UPDATE control_plane.trip_participant_claims SET last_group_check_at = now() WHERE trip_id = $1 AND user_id = $2 AND released_at IS NULL", [input.tripId, input.userId]);
+      return "live";
+    }
+    const client = await deps.db.connect();
+    let ended: ReleasedClaim[];
+    try {
+      await client.query("BEGIN");
+      ended = await endGroupClaimInTx(client, { tripId: input.tripId, userId: input.userId, linkReason: "left_group", claimReason: "left_group" });
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+    await releaseSiteBindings(ended);
+    return "revoked";
+  };
   app.post("/v1/auth/telegram-mini-app", {
     // initData is capped at 4096 bytes; a body that cannot hold one is not one.
     bodyLimit: 65536,
-    onRequest: async (request, reply) => {
-      reply.header("cache-control", "private, no-store");
-      if (!deps.telegramMiniApp?.enabled()) return reply.code(503).send({ error: "TELEGRAM_MINI_APP_UNAVAILABLE" });
-      if (!admitLogin(miniAppIpAttempts, request.ip, 100)) {
-        return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
-      }
-      // A login-CSRF vector: another site could otherwise post a victim's own
-      // initData (or an attacker's) from the victim's browser. Missing and the
-      // literal "null" (sandboxed iframes, file:, redirects) are refused too.
-      if (!originIsOurs(request, deps)) return reply.code(403).send({ error: "ORIGIN_INVALID" });
-      if (!/^application\/json(?:\s*;.*)?$/i.test(String(request.headers["content-type"] ?? ""))) {
-        return reply.code(415).send({ error: "UNSUPPORTED_MEDIA_TYPE" });
-      }
-    },
+    onRequest: miniAppGates,
   }, async (request, reply) => {
     const cfg = deps.telegramMiniApp!;
     const body = request.body && typeof request.body === "object" && !Array.isArray(request.body) ? request.body as Record<string, unknown> : {};
@@ -1046,7 +1534,16 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     const client = await deps.db.connect();
     try {
       await client.query("BEGIN");
-      const outcome = await resolveMiniAppLaunch(client, launch, requestedTripId);
+      const requestGroup = groupSignIn ? { ...groupSignIn, released: [] as ReleasedClaim[] } : undefined;
+      const outcome = await resolveMiniAppLaunch(client, launch, requestedTripId, requestGroup);
+      if (outcome.kind === "unavailable") {
+        // Committed, not rolled back: a group link this launch found the person had LEFT was ended in this transaction.
+        // No cookie is touched and nothing here names the trip.
+        await client.query("COMMIT");
+        await releaseSiteBindings(requestGroup?.released ?? []);
+        miniAppLog(structuredLog("warn", "mini_app.sign_in", { outcome: "unavailable" }));
+        return reply.header("retry-after", "5").code(503).send({ error: "MEMBERSHIP_CHECK_UNAVAILABLE", retryable: true });
+      }
       if (outcome.kind === "session") {
         if (!(await claimSessionSlot(client, launch, cfg.maxAgeSeconds))) {
           // The launch has minted its allowance. Same answer as any other bad initData.
@@ -1069,15 +1566,19 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
           : 0;
         await revokeIncoming(client);
         await client.query("COMMIT");
+        await releaseSiteBindings(requestGroup?.released ?? []);
         setWebSessionCookies(reply, deps, session, { embedded: embeddedRequest(body) });
         miniAppLog(structuredLog("info", "mini_app.sign_in", { outcome: "session", link_kind: outcome.target.linkKind, first_use: used.first, notices_queued: noticesQueued }));
         return { kind: "session", appPath: outcome.target.appPath, ...(outcome.notice ? { notice: outcome.notice } : {}) };
       }
       await revokeIncoming(client);
       await client.query("COMMIT");
+      await releaseSiteBindings(requestGroup?.released ?? []);
       if (incoming) clearWebSessionCookies(reply, deps);
       miniAppLog(structuredLog("info", "mini_app.sign_in", { outcome: outcome.kind }));
       if (outcome.kind === "choose") return { kind: "choose", trips: outcome.trips, ...(outcome.notice ? { notice: outcome.notice } : {}) };
+      // An offer to pick a name. No cookie, no user id; the claim ids mean nothing without the server's key.
+      if (outcome.kind === "claim") return { kind: "claim", tripId: outcome.tripId, travellers: outcome.travellers };
       return reply.code(401).send({ error: "TELEGRAM_NOT_LINKED", fallback: outcome.fallback, ...(outcome.tripId ? { tripId: outcome.tripId } : {}) });
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
@@ -1085,6 +1586,302 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     } finally {
       client.release();
     }
+  });
+
+  // ── Group sign-in: the claim (slice S1 of docs/specs/sprint-9/x-member-sign-in.md) ────────────────────────────
+  //
+  // POST /v1/mini-app/claim  { initData, tripId, claimId }
+  //
+  //   200 { kind: "session", appPath }  + the ordinary scoped session cookies (as a linked launch)
+  //   409 { error: "ALREADY_CLAIMED" }  the traveller (or this Telegram account on this trip) is taken; nothing written
+  //   404 { error: "NOT_FOUND" }        ONE refusal for: switch off, no single open group, not in it (or Telegram did
+  //                                     not say so), a claimId that is not this trip's, a role that is not `member`
+  //   401 { error: "TELEGRAM_INIT_DATA_STALE" }    valid but older than LINK_MAX_AUTH_AGE_SECONDS: open the app again
+  //   401 { error: "TELEGRAM_INIT_DATA_INVALID" }  as the launch route
+  //   400 INVALID_REQUEST (a tripId or claimId that is not shaped like one) · 403 · 415 · 429 · 503 as the launch route
+  //
+  // Same gates as the launch (miniAppGates), the same per-person budget, then ONE transaction (claimTravellerInTx) that
+  // either writes everything or nothing. `open` in portal-scope.ts: the signed initData is the whole authority and the
+  // route reads no session, so a scoped session gets nothing more or less from it than a stranger.
+  app.post("/v1/mini-app/claim", { bodyLimit: 65536, onRequest: miniAppGates }, async (request, reply) => {
+    const cfg = deps.telegramMiniApp!;
+    const body = jsonBody(request);
+    const verified = verifyMiniAppInitData(body.initData, cfg.botToken, { maxAgeSeconds: cfg.maxAgeSeconds });
+    if (!verified.ok) {
+      miniAppLog(structuredLog("warn", "mini_app.init_data_rejected", { reason: verified.reason }));
+      return reply.code(401).send({ error: "TELEGRAM_INIT_DATA_INVALID" });
+    }
+    const launch: VerifiedInitData = verified.data;
+    if (!admitLogin(miniAppUserAttempts, sha256(`miniapp:${launch.telegramUserId}`), 20)) {
+      return reply.header("retry-after", "60").code(429).send({ error: "SIGN_IN_RATE_LIMITED" });
+    }
+    if (typeof body.tripId !== "string" || !TRIP_ID_PATTERN.test(body.tripId) || typeof body.claimId !== "string" || !CLAIM_ID_SHAPE.test(body.claimId)) {
+      return reply.code(400).send({ error: "INVALID_REQUEST" });
+    }
+    const tripId = body.tripId, claimId = body.claimId;
+    if (!groupSignIn) return reply.code(404).send({ error: "NOT_FOUND" });
+    const incoming = parseCookies(request.headers.cookie).kit_session;
+    const client = await deps.db.connect();
+    // Set once the trip site holds the binding, so anything that fails AFTER it (the commit itself) can undo it.
+    let siteBound: { tripId: string; userId: string; runtimeUsername: string } | null = null;
+    let committed = false;
+    try {
+      await client.query("BEGIN");
+      const result = await claimTravellerInTx(client, { launch, maxAgeSeconds: cfg.maxAgeSeconds, tripId, claimId, group: groupSignIn, log: miniAppLog });
+      if (result.kind !== "claimed") {
+        await client.query("ROLLBACK");
+        miniAppLog(structuredLog("info", "mini_app.group_claim", { outcome: result.kind }));
+        if (result.kind === "stale") return reply.code(401).send({ error: "TELEGRAM_INIT_DATA_STALE" });
+        if (result.kind === "already_claimed") return reply.code(409).send({ error: "ALREADY_CLAIMED" });
+        // The site could not say who is on the trip: nothing is known, so say "try again", not "no".
+        if (result.kind === "unavailable") return reply.header("retry-after", "5").code(503).send({ error: "MEMBERSHIP_CHECK_UNAVAILABLE", retryable: true });
+        return reply.code(404).send({ error: "NOT_FOUND" });
+      }
+      if (!(await claimSessionSlot(client, launch, cfg.maxAgeSeconds))) {
+        await client.query("ROLLBACK");
+        miniAppLog(structuredLog("warn", "mini_app.init_data_rejected", { reason: "REPLAY_CAP" }));
+        return reply.code(401).send({ error: "TELEGRAM_INIT_DATA_INVALID" });
+      }
+      const session = await createWebSession(client, result.target.userId, deps.sessionTtlSeconds, result.target.linkId);
+      // A verified claim replaces whatever session this WebView held, exactly as a verified launch does.
+      if (incoming) await client.query("UPDATE control_plane.web_sessions SET revoked_at = now() WHERE token_digest = ANY($1::text[]) AND revoked_at IS NULL", [sessionDigests(incoming)]);
+      // THE SITE BINDING, LAST BEFORE THE COMMIT. A claim opens the trip only if the trip site knows the new account, so
+      // the claim is not final until the site says so: every control-plane write above is still inside this open
+      // transaction, and nothing has been sent to the person. The three ways this can end:
+      //   the site binds          -> COMMIT; the person has a session and the site can be opened. (If the COMMIT itself
+      //                              then fails, the catch below unbinds; if even that fails, nothing is stuck: the leftover
+      //                              names an account that was never committed, and the next adopt of the traveller replaces it.)
+      //   the site says no        -> ROLLBACK; no claim, no account, no session. "refused" is the 404 every refusal gets;
+      //                              "conflict" is 409 ALREADY_CLAIMED (an invite holds the name).
+      //   the site cannot be asked -> ROLLBACK; the retryable 503 that names nothing, and the person tries again.
+      // Never "session minted but the site cannot be opened", and never "site bound but the claim rolled back and stuck".
+      const wanted = { tripId, userId: result.target.userId, runtimeUsername: result.runtimeUsername };
+      // An invite for this name that was revoked or expired without ever being redeemed may have left an invite-bound binding on the site
+      // (a lost answer): the site replaces it only when told, here, under this transaction's trip lock, that its invite is dead.
+      const deadInviteIds = await deadInviteIdsFor(client, tripId, result.runtimeUsername);
+      let bound: "ok" | "refused" | "conflict" | "unavailable";
+      try { bound = await deps.runtimeAccounts.adoptParticipant({ ...wanted, ...(deadInviteIds.length ? { deadInviteIds } : {}) }); } catch { bound = "unavailable"; }
+      if (bound !== "ok") {
+        await client.query("ROLLBACK");
+        miniAppLog(structuredLog("info", "mini_app.group_claim", { outcome: `site_${bound}` }));
+        if (bound === "unavailable") return reply.header("retry-after", "5").code(503).send({ error: "MEMBERSHIP_CHECK_UNAVAILABLE", retryable: true });
+        if (bound === "conflict") return reply.code(409).send({ error: "ALREADY_CLAIMED" });
+        return reply.code(404).send({ error: "NOT_FOUND" });
+      }
+      siteBound = wanted;
+      await client.query("COMMIT");
+      committed = true;
+      // Logged AFTER the commit: a claim that failed to commit must never have said it was made.
+      miniAppLog(structuredLog("info", "mini_app.group_claim", { outcome: "claimed" }));
+      setWebSessionCookies(reply, deps, session, { embedded: embeddedRequest(body) });
+      return { kind: "session", appPath: result.target.appPath };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      if (siteBound && !committed) await compensateSiteBinding(siteRelease, siteBound);
+      // The one error a concurrent claim may legitimately raise past the locks: the unique index said "taken".
+      if ((error as { code?: string } | null)?.code === "23505") return reply.code(409).send({ error: "ALREADY_CLAIMED" });
+      // Anything else (a failed COMMIT included) is answered with a body that says nothing: the database's own message
+      // can quote a constraint, a column or a value. The kind is logged; nothing is echoed.
+      miniAppLog(structuredLog("error", "mini_app.group_claim", { outcome: "error", safe_error_code: (error as { code?: string } | null)?.code ?? "UNKNOWN" }));
+      return reply.code(500).send({ error: "INTERNAL_ERROR" });
+    } finally {
+      client.release();
+    }
+  });
+
+  // The organizers' side of a group claim. Both routes answer a member, a stranger and a trip that does not exist with
+  // the same 404, and say nothing else. `GET` is `trip` scope (an organizer's own Mini App session may look); `DELETE`
+  // is `account` scope like every route that takes access away from another person (portal-scope.ts).
+  const organizerOf = async (tripId: string, userId: string): Promise<boolean> => {
+    const member = await membership(deps, tripId, userId);
+    return Boolean(member && ["owner", "organizer"].includes(member.role) && member.dashboard_access);
+  };
+
+  // The list and the release are ONE implementation with two doors: the portal routes below (an organizer's own portal session) and
+  // the internal routes after them (the runtime gateway, for an organizer's TRIP-SITE session). Neither door decides who may ask
+  // the way the other does; both call these once they have decided, so the SQL and its effects exist once.
+  const listMemberClaims = async (tripId: string) => {
+    const result = await deps.db.query<{
+      id: string; via: string; created_at: Date; display_name: string;
+      telegram_first_name: string | null; telegram_username: string | null; last_signed_in_at: Date | null;
+    }>(
+      `SELECT c.id, c.via, c.created_at, u.display_name, l.telegram_first_name, l.telegram_username, l.last_signed_in_at
+         FROM control_plane.trip_participant_claims c
+         JOIN control_plane.users u ON u.id = c.user_id
+         LEFT JOIN control_plane.telegram_member_links l
+                ON l.trip_id = c.trip_id AND l.user_id = c.user_id AND l.verified_via = $2 AND l.revoked_at IS NULL
+        WHERE c.trip_id = $1 AND c.released_at IS NULL
+        ORDER BY c.created_at, c.id`,
+      [tripId, GROUP_VERIFIED_VIA],
+    );
+    return {
+      claims: result.rows.map((row) => ({
+        claimId: row.id, travellerName: row.display_name,
+        telegramFirstName: row.telegram_first_name, telegramUsername: row.telegram_username,
+        via: row.via, claimedAt: row.created_at.toISOString(), lastSignedInAt: row.last_signed_in_at ? row.last_signed_in_at.toISOString() : null,
+      })),
+    };
+  };
+
+  /** Ends the claim, revokes its link, ends the sessions it minted and frees the traveller (endGroupClaimInTx). False: no such live claim on this trip. */
+  const releaseMemberClaim = async (tripId: string, claimId: string): Promise<boolean> => {
+    if (!/^tpc_[A-Za-z0-9]{8,64}$/.test(claimId)) return false;
+    const client = await deps.db.connect();
+    try {
+      await client.query("BEGIN");
+      const claim = await client.query<{ user_id: string }>(
+        "SELECT user_id FROM control_plane.trip_participant_claims WHERE id = $1 AND trip_id = $2 AND released_at IS NULL FOR UPDATE",
+        [claimId, tripId]);
+      if (!claim.rows[0]) { await client.query("ROLLBACK"); return false; }
+      const ended = await endGroupClaimInTx(client, { tripId, userId: claim.rows[0].user_id, linkReason: "claim_released", claimReason: "organizer_released" });
+      await client.query("COMMIT");
+      await releaseSiteBindings(ended);
+      miniAppLog(structuredLog("info", "mini_app.group_claim", { outcome: "released" }));
+      return true;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  };
+
+  // GET /v1/trips/:id/member-claims  ->  200 { claims: [{ claimId, travellerName, telegramFirstName, telegramUsername,
+  //                                                       via, claimedAt, lastSignedInAt }] } | 404 NOT_FOUND
+  app.get("/v1/trips/:id/member-claims", async (request, reply) => {
+    const user = await requireUser(request, reply, deps);
+    if (!user) return;
+    reply.header("cache-control", "private, no-store");
+    const tripId = (request.params as { id?: string }).id ?? "";
+    if (!(await organizerOf(tripId, user.id))) return reply.code(404).send({ error: "NOT_FOUND" });
+    return listMemberClaims(tripId);
+  });
+
+  // DELETE /v1/trips/:id/member-claims/:claimId  ->  200 { status: "released" } | 404 NOT_FOUND
+  app.delete("/v1/trips/:id/member-claims/:claimId", async (request, reply) => {
+    const user = await requireMutation(request, reply, deps);
+    if (!user) return;
+    reply.header("cache-control", "private, no-store");
+    const params = request.params as { id?: string; claimId?: string };
+    const tripId = params.id ?? "";
+    if (!(await organizerOf(tripId, user.id)) || !(await releaseMemberClaim(tripId, params.claimId ?? ""))) return reply.code(404).send({ error: "NOT_FOUND" });
+    return { status: "released" };
+  });
+
+  // ── The same two operations for an organizer's TRIP-SITE session (the runtime gateway's hop) ─────────────────
+  //
+  //   POST /internal/member-claims/list     { tripId, userId, sessionId }            -> 200 { claims: [...] }
+  //   POST /internal/member-claims/release  { tripId, userId, sessionId, claimId }   -> 200 { status: "released" }
+  //
+  // `trip-web` talks only to the trip site, and the trip site cannot call this service, so the runtime gateway (which holds the
+  // person's sealed session: user, trip, portal session id) asks on the person's behalf, with the exchange key. The gateway is
+  // trusted for WHO IT HEARD FROM (a sealed cookie it made), never for what that person may do: everything is decided again here,
+  // from the database, on every call:
+  //
+  //   1. the key (401 AUTHENTICATION_REQUIRED, as every internal route);
+  //   2. the portal session `sessionId` is that user's own, live, and the user is active;
+  //   3. the user is owner or organizer of THIS trip with dashboard access (`organizerOf`, exactly the portal routes' rule);
+  //   4. `member_group_sign_in` is on for the trip and the path is wired. Off or absent is the answer an unknown trip gets: the
+  //      name of an unreleased feature is withheld, and no claim is shown that no longer grants anything (A4);
+  //   5. the session's SCOPE, by the portal routes' own policy rows (portal-scope.ts, the one source): a session a Telegram link
+  //      minted (an organizer in the Mini App) may list a trip in its scope (GET policy `trip`) but may NOT release (DELETE policy
+  //      `account`, as for removing a member): answered 403 ACCOUNT_SIGN_IN_REQUIRED, and ONLY to a caller who passed 2-4, so it
+  //      tells a stranger nothing. A scope that cannot be read is the empty scope.
+  //
+  // A member, a claimed member, a stranger, another trip's organizer, a dead or foreign session and an unknown trip are all one
+  // byte-identical 404 (steps 2-4); nothing is written before step 5 passes.
+  // The steps every one of the gateway's hops shares (1-3 above, and 5 when a policy row is named), in ONE place so the claims hop and
+  // the personal-invite hop below cannot drift apart. `valid` is the route's own body shape; `gate` an extra condition that, when
+  // false, answers as an unknown trip (the claims hop's feature switch: step 4); `routeKey` the portal route whose scope row applies
+  // to a Telegram-minted session (none: the route has no scope of its own).
+  const hopCaller = async (
+    request: FastifyRequest, reply: FastifyReply,
+    route: { valid: (body: Record<string, unknown>) => boolean; gate?: (tripId: string) => Promise<boolean>; routeKey?: string },
+  ): Promise<{ tripId: string; body: Record<string, unknown> } | null> => {
+    reply.header("cache-control", "no-store");
+    if (!exchangeKeyMatches(request.headers["x-api-key"], deps.runtimeExchangeKey)) { await reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" }); return null; }
+    const body = jsonBody(request);
+    const { tripId, userId, sessionId } = body;
+    if (typeof tripId !== "string" || !TRIP_ID_PATTERN.test(tripId) || typeof userId !== "string" || typeof sessionId !== "string" || !route.valid(body)) {
+      await reply.code(400).send({ error: "INVALID_REQUEST" });
+      return null;
+    }
+    const refused = async () => { await reply.code(404).send({ error: "NOT_FOUND" }); return null; };
+    const session = await deps.db.query<{ telegram_link_id: string | null }>(
+      `SELECT s.telegram_link_id FROM control_plane.web_sessions s
+         JOIN control_plane.users u ON u.id = s.user_id AND u.status = 'active'
+        WHERE s.id = $1 AND s.user_id = $2 AND s.revoked_at IS NULL AND s.expires_at > now()`,
+      [sessionId, userId]);
+    if (!session.rows[0]) return refused();
+    if (!(await organizerOf(tripId, userId))) return refused();
+    if (route.gate && !(await route.gate(tripId))) return refused();
+    const telegramLinkId = session.rows[0].telegram_link_id;
+    if (telegramLinkId !== null && route.routeKey) {
+      const decision = await scopeDecision(deps.db, { routeKey: route.routeKey, params: { id: tripId }, scope: await readSessionScope(deps, userId, telegramLinkId) });
+      if (!decision.allow) {
+        await reply.code(decision.status).send(decision.body);
+        return null;
+      }
+    }
+    return { tripId, body };
+  };
+
+  const claimsActor = async (request: FastifyRequest, reply: FastifyReply, kind: "list" | "release"): Promise<{ tripId: string; claimId: string } | null> => {
+    const actor = await hopCaller(request, reply, {
+      valid: (body) => kind !== "release" || typeof body.claimId === "string",
+      gate: async (tripId) => Boolean(groupSignIn) && (await featureEnabled(deps.db, tripId, "member_group_sign_in", miniAppLog)),
+      routeKey: kind === "list" ? "GET /v1/trips/:id/member-claims" : "DELETE /v1/trips/:id/member-claims/:claimId",
+    });
+    if (!actor) return null;
+    return { tripId: actor.tripId, claimId: typeof actor.body.claimId === "string" ? actor.body.claimId : "" };
+  };
+
+  app.post("/internal/member-claims/list", async (request, reply) => {
+    const actor = await claimsActor(request, reply, "list");
+    if (!actor) return;
+    return listMemberClaims(actor.tripId);
+  });
+
+  app.post("/internal/member-claims/release", async (request, reply) => {
+    const actor = await claimsActor(request, reply, "release");
+    if (!actor) return;
+    if (!(await releaseMemberClaim(actor.tripId, actor.claimId))) return reply.code(404).send({ error: "NOT_FOUND" });
+    return { status: "released" };
+  });
+
+  // ── "Send a personal invite" for an organizer's TRIP-SITE session (the runtime gateway's hop; S2, AC-11) ─────────
+  //
+  //   POST /internal/member-invites/available  { tripId, userId, sessionId }                   -> 200 { available: true }
+  //   POST /internal/member-invites/create     { tripId, userId, sessionId, runtimeUsername }  -> 201 { id, joinUrl, displayName, expiresAt }
+  //                                                                                              | 409 { error: <one of createSiteInvite's named answers> }
+  //
+  // The same hop as the claims one, decided by the same `hopCaller` (key, a live session that is that user's, owner/organizer of THIS
+  // trip with dashboard access: one byte-identical 404 for everyone else), with two differences that are on purpose:
+  //   - NO feature switch. A personal invite is a full way in for people who are not on Telegram (spec D1); it must work with
+  //     `member_group_sign_in` off and with group sign-in not wired. What gates the button is the gateway being in front of the
+  //     site and the caller being this trip's organizer, nothing else.
+  //   - the scope row is the portal route's own, `POST /v1/trips/:id/site-invites` (`account`): a session a Telegram link minted (an
+  //     organizer in the Mini App) is told 403 ACCOUNT_SIGN_IN_REQUIRED, exactly as the portal route tells it, and only after the
+  //     caller has passed the organizer check. The probe (`available`) applies no scope: the button is drawn and the click says why not.
+  // The create is `createSiteInvite`, the function the portal route and the companion's tool call too; only the traveller's username
+  // comes from the browser (through the gateway). The name on the invite is the trip site's own for that participant, never the caller's.
+  // "Send it again" replaces a pending invite (`replacePending`): the organizer cannot recover a link that is stored only as a digest.
+  app.post("/internal/member-invites/available", async (request, reply) => {
+    const actor = await hopCaller(request, reply, { valid: () => true });
+    if (!actor) return;
+    return { available: true };
+  });
+
+  app.post("/internal/member-invites/create", async (request, reply) => {
+    const actor = await hopCaller(request, reply, {
+      valid: (body) => typeof body.runtimeUsername === "string" && /^[a-z0-9][a-z0-9._-]{1,63}$/.test(body.runtimeUsername),
+      routeKey: "POST /v1/trips/:id/site-invites",
+    });
+    if (!actor) return;
+    const made = await createSiteInvite(deps, { tripId: actor.tripId, actorUserId: actor.body.userId as string, runtimeUsername: actor.body.runtimeUsername as string, replacePending: true });
+    if (!made.ok) return reply.code(made.status).send({ error: made.error });
+    miniAppLog(structuredLog("info", "member_invite.created", {}));
+    return reply.code(201).send({ id: made.id, joinUrl: made.joinUrl, displayName: made.displayName, expiresAt: made.expiresAt });
   });
 
   // Ends one Telegram link — one TRIP's link — of the signed-in user's own, with
@@ -1095,7 +1892,9 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     if (!user) return;
     reply.header("cache-control", "private, no-store");
     const linkId = (request.params as { linkId?: string }).linkId ?? "";
-    if (!(await unlinkTelegramLink(deps.db, user.id, linkId))) return reply.code(404).send({ error: "NOT_FOUND" });
+    const released: ReleasedClaim[] = [];
+    if (!(await unlinkTelegramLink(deps.db, user.id, linkId, released))) return reply.code(404).send({ error: "NOT_FOUND" });
+    await releaseSiteBindings(released);
     return { status: "unlinked" };
   });
 
@@ -1699,26 +2498,11 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     const displayName = typeof body.displayName === "string" ? body.displayName.trim().slice(0, 120) : "";
     const runtimeUsername = typeof body.runtimeUsername === "string" ? body.runtimeUsername.toLowerCase().trim() : "";
     if (!displayName || !/^[a-z0-9][a-z0-9._-]{1,63}$/.test(runtimeUsername)) return reply.code(400).send({ error: "INVALID_REQUEST" });
-    let participantExists = false;
-    try {
-      participantExists = await deps.runtimeAccounts.participantExists({ tripId, runtimeUsername });
-    } catch {
-      return reply.code(409).send({ error: "RUNTIME_NOT_READY" });
-    }
-    if (!participantExists) return reply.code(409).send({ error: "RUNTIME_PARTICIPANT_NOT_FOUND" });
-    const token = base64url(32);
-    const inviteId = opaque("invite");
-    try {
-      await deps.db.query(
-        `INSERT INTO control_plane.site_invites(id, trip_id, created_by, intended_display_name, runtime_username, token_digest, state, expires_at)
-         VALUES ($1, $2, $3, $4, $5, $6, 'unused', now() + interval '7 days')`,
-        [inviteId, tripId, user.id, displayName, runtimeUsername, sha256(token)],
-      );
-    } catch (error) {
-      if ((error as { code?: string }).code === "23505") return reply.code(409).send({ error: "INVITE_ALREADY_EXISTS" });
-      throw error;
-    }
-    return reply.code(201).send({ id: inviteId, status: "unused", joinUrl: `${deps.publicOrigin}/join#token=${token}` });
+    // The rules (an existing participant, never an organizer, never a claimed traveller, the lock) live in createSiteInvite, which
+    // the runtime gateway's hop and the companion's tool call too.
+    const made = await createSiteInvite({ ...deps, log: emailAuthLog }, { tripId, actorUserId: user.id, runtimeUsername, displayName });
+    if (!made.ok) return reply.code(made.status).send({ error: made.error });
+    return reply.code(201).send({ id: made.id, status: "unused", joinUrl: made.joinUrl });
   });
 
   app.delete("/v1/trips/:id/site-invites/:inviteId", async (request, reply) => {
@@ -1740,6 +2524,7 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     if (!target) return reply.code(404).send({ error: "NOT_FOUND" });
     const removal = await removeMember(deps.db, { tripId: params.id ?? "", actorUserId: user.id, targetUserId: target });
     if (!removal.ok) return reply.code(removal.status).send({ error: removal.error });
+    await releaseSiteBindings(removal.releasedInvites.map((row) => ({ tripId: params.id ?? "", userId: target, runtimeUsername: row.runtimeUsername, inviteId: row.inviteId, reason: "invite_revoked" })));
     return { status: "revoked" };
   });
 
@@ -1757,8 +2542,17 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     if (!actor || !["owner", "organizer"].includes(actor.role) || !actor.dashboard_access || !target.rows[0]) {
       return reply.code(404).send({ error: "NOT_FOUND" });
     }
+    // A member who is a group claim also holds a binding on the trip site; the membership ending releases the claim in the
+    // database (trigger of migration 20261119120000), and the site's binding is ended here once the removal has succeeded.
+    const claimed = await deps.db.query<{ runtime_username: string }>(
+      "SELECT runtime_username FROM control_plane.trip_participant_claims WHERE trip_id = $1 AND user_id = $2 AND released_at IS NULL", [tripId, target.rows[0].user_id]);
     const removal = await removeMember(deps.db, { tripId, actorUserId: user.id, targetUserId: target.rows[0].user_id });
     if (!removal.ok) return reply.code(removal.status).send({ error: removal.error });
+    await releaseSiteBindings([
+      ...claimed.rows.map((row) => ({ tripId, userId: target.rows[0]!.user_id, runtimeUsername: row.runtime_username, reason: "membership_ended" })),
+      // the person's way in may have been a redeemed invite: its binding on the site ends too (account + name + invite id)
+      ...removal.releasedInvites.map((row) => ({ tripId, userId: target.rows[0]!.user_id, runtimeUsername: row.runtimeUsername, inviteId: row.inviteId, reason: "membership_ended" })),
+    ]);
     return { status: "removed" };
   });
 
@@ -1802,7 +2596,10 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     const invite = invites.rows[0];
     if (!invite || invite.state !== "unused") return reply.code(404).send({ error: "NOT_FOUND" });
     if (invite.expires_at.getTime() < Date.now()) {
-      await deps.db.query("UPDATE control_plane.site_invites SET state = 'expired', updated_at = now() WHERE id = $1", [invite.id]);
+      // Only an UNUSED invite expires. This write waits on the row lock of a redemption that read the invite while it was still valid
+      // and then lands on the row it just marked redeemed: unguarded, it turned a redeemed invite into `expired` with a redeemer, which
+      // broke that person's launch and (migration 20261122110000 reads "a redeemed invite left redeemed" as a removal) released their binding.
+      await deps.db.query("UPDATE control_plane.site_invites SET state = 'expired', updated_at = now() WHERE id = $1 AND state = 'unused'", [invite.id]);
       return reply.code(410).send({ error: "INVITE_EXPIRED" });
     }
     // Stable across a rolled-back redemption: the runtime may already have
@@ -1813,15 +2610,44 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     const client = await deps.db.connect();
     try {
       await client.query("BEGIN");
+      // The trip row first, then the invite: the lock every group claim and every invite creation for this trip also takes, so the
+      // "is anyone signed in as this traveller?" question below cannot be overtaken by a claim that commits a moment later.
+      await client.query("SELECT 1 FROM control_plane.trips WHERE id = $1 FOR UPDATE", [invite.trip_id]);
       const locked = await client.query("SELECT state FROM control_plane.site_invites WHERE id = $1 FOR UPDATE", [invite.id]);
       if (locked.rows[0]?.state !== "unused") { await client.query("ROLLBACK"); return reply.code(409).send({ error: "INVITE_ALREADY_USED" }); }
+      // A LIVE claim from the group holds this traveller (an invite made before the claim existed, or one that lost a race): this
+      // person cannot take the name from it. A refusal that names nothing and writes nothing; the organizer sorts it out
+      // (release the sign-in, send a fresh invite). A claim that has ENDED holds nothing, and the site's leftover binding of it is
+      // replaced by the provision below.
+      const holder = await client.query("SELECT 1 FROM control_plane.trip_participant_claims WHERE trip_id = $1 AND runtime_username = $2 AND released_at IS NULL", [invite.trip_id, invite.runtime_username]);
+      if (holder.rowCount) { await client.query("ROLLBACK"); return reply.code(409).send({ error: "INVITE_UNAVAILABLE" }); }
+      // An owner or organizer of THIS trip (a secondary organizer included, and one whose membership was ended: the membership row
+      // would be revived below) cannot take a MEMBER invite with their own account: the site would bind their user to the traveller,
+      // their own launch would then fail on the role, and the traveller would be stuck. The same refusal as any other; nothing is
+      // written and the site is not asked.
+      if (signedIn) {
+        const organizing = await client.query("SELECT 1 FROM control_plane.trip_memberships WHERE trip_id = $1 AND user_id = $2 AND role IN ('owner', 'organizer')", [invite.trip_id, signedIn.id]);
+        if (organizing.rowCount) { await client.query("ROLLBACK"); return reply.code(409).send({ error: "INVITE_UNAVAILABLE" }); }
+      }
+      const deadInviteIds = await deadInviteIdsFor(client, invite.trip_id, invite.runtime_username);
       if (!signedIn) await client.query("INSERT INTO control_plane.users(id, status, display_name) VALUES ($1, 'active', $2)", [userId, invite.intended_display_name]);
       // The runtime adapter is idempotent by invite id. Holding the invite row
       // lock prevents concurrent redemption; if the database transaction later
       // aborts, the same raw invite may safely retry the runtime enrollment.
-      await deps.runtimeAccounts.provisionParticipant({
-        tripId: invite.trip_id, inviteId: invite.id, userId, runtimeUsername: invite.runtime_username, displayName: invite.intended_display_name,
-      });
+      try {
+        await deps.runtimeAccounts.provisionParticipant({
+          tripId: invite.trip_id, inviteId: invite.id, userId, runtimeUsername: invite.runtime_username, displayName: invite.intended_display_name,
+          ...(deadInviteIds.length ? { deadInviteIds } : {}),
+        });
+      } catch (error) {
+        // Never a raw 500 (a person is looking at the join page). The site SAID NO: one refusal for every reason, naming nothing (an
+        // organizer's name, a name another invite holds, an account bound elsewhere). The site could not be asked, or its answer
+        // was lost: retryable, and the same link works again. Either way nothing is written: the invite stays unused and the account
+        // this transaction would have made is rolled back with it.
+        await client.query("ROLLBACK");
+        if ((error as Error | null)?.message === RUNTIME_PARTICIPANT_REFUSED) return reply.code(409).send({ error: "INVITE_UNAVAILABLE" });
+        return reply.header("retry-after", "5").code(503).send({ error: "RUNTIME_NOT_READY", retryable: true });
+      }
       if (portalPasswordHash) {
         await client.query(
           `INSERT INTO control_plane.web_password_credentials(user_id, trip_id, runtime_username, password_hash)
@@ -1873,6 +2699,13 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     const tripId = (request.params as { id?: string }).id ?? "";
     const member = await membership(deps, tripId, user.id);
     if (!member?.runtime_access) return reply.code(404).send({ error: "NOT_FOUND" });
+    // A session a group claim minted gets no runtime grant unless its person is still in the group (groupSessionVerdict).
+    if (user.telegramLinkId) {
+      const verdict = await groupSessionVerdict({ tripId, userId: user.id, sessionId: user.sessionId, everyTime: true });
+      if (verdict === "dormant") return reply.code(404).send({ error: "NOT_FOUND" });
+      if (verdict === "revoked") return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+      if (verdict === "unknown") return reply.header("retry-after", "5").code(503).send({ error: "MEMBERSHIP_CHECK_UNAVAILABLE", retryable: true });
+    }
     const token = base64url(32);
     await deps.db.query(
       `INSERT INTO control_plane.runtime_launch_grants(id, trip_id, user_id, token_digest, audience, expires_at, session_id)
@@ -1893,9 +2726,15 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
        WHERE g.token_digest = $1 AND g.consumed_at IS NULL AND g.expires_at > now()
          AND m.trip_id = g.trip_id AND m.user_id = g.user_id AND m.status = 'active' AND m.runtime_access = true
        RETURNING g.id, g.trip_id, g.user_id, g.session_id, m.role, m.dashboard_access,
-         (SELECT i.runtime_username FROM control_plane.site_invites i
-          WHERE i.trip_id = g.trip_id AND i.redeemed_by = g.user_id AND i.state = 'redeemed'
-          ORDER BY i.redeemed_at DESC LIMIT 1) AS runtime_username`, [sha256(token)]);
+         -- Which trip-site participant this account stands for: a live group claim first (slice S1 of
+         -- docs/specs/sprint-9/x-member-sign-in.md), then a redeemed site invite, as before.
+         COALESCE(
+           (SELECT c.runtime_username FROM control_plane.trip_participant_claims c
+             WHERE c.trip_id = g.trip_id AND c.user_id = g.user_id AND c.released_at IS NULL
+             ORDER BY c.created_at DESC LIMIT 1),
+           (SELECT i.runtime_username FROM control_plane.site_invites i
+             WHERE i.trip_id = g.trip_id AND i.redeemed_by = g.user_id AND i.state = 'redeemed'
+             ORDER BY i.redeemed_at DESC LIMIT 1)) AS runtime_username`, [sha256(token)]);
     const row = result.rows[0];
     if (!row) return reply.code(401).send({ error: "LAUNCH_INVALID" });
     // The way back to the dashboard, from this deployment's own configured
@@ -1940,6 +2779,10 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     if (!(await sessionMayOpenTrip(deps, { userId, tripId, sessionId: typeof sessionId === "string" ? sessionId : null }))) {
       return reply.code(401).send({ error: "SESSION_REVOKED" });
     }
+    // A group-claim session is only as live as the person's seat in the group (at most one Telegram question per 10
+    // minutes per claim; none for any other session). A Telegram outage answers LIVE: it must not log a family out.
+    const group = await groupSessionVerdict({ tripId, userId, sessionId: typeof sessionId === "string" ? sessionId : null, everyTime: false });
+    if (group === "dormant" || group === "revoked") return reply.code(401).send({ error: "SESSION_REVOKED" });
     return { live: true };
   });
 

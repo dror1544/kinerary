@@ -1,0 +1,44 @@
+{
+  "_about": "The ONE case table for the trip site's adopt/release rules (server/control-plane-auth.js; adopt, release and, since S2, provision). It is run against the REAL site by tests/control-plane-binding-cases.test.js and against the control-plane tests' FAKE site by control-plane/api/test/site-binding-cases.test.ts, which loads this same file by relative path (the control-plane workflow checks out the whole repository). Edit a rule on one side and the other side's run of this table fails.",
+  "_vocabulary": {
+    "participant": "member = a plain member of the trip site; organizer = a configured organizer; unknown = not a participant",
+    "existing": "none | actor | other_user | invite | actor_on_other_participant | actor_invite | actor_other_invite: what the site already holds for the participant being asked about (the actor is the control-plane user making the call; actor_invite = the actor already bound by THIS invite, the one a provision call names; actor_other_invite = the actor already bound by ANOTHER invite)",
+    "dead": "what the control plane sends as deadInviteIds (invite ids it has checked, under its trip lock, are revoked or expired AND never redeemed): none = the field is omitted | binding_invite = the invite id the existing binding carries | other_invite = an id the binding does not carry",
+    "names": "release only: the inviteId the call names: none = omitted (a claim's release: only a binding with no invite) | binding_invite = the invite id the existing binding carries | other_invite = an id it does not carry",
+    "holder": "who can open the participant afterwards: actor | previous (whoever held it before) | nobody",
+    "order": "cases run in this order against one site; the invite case permanently consumes the second plain member, so it is last"
+  },
+  "adopt": [
+    { "name": "a free plain member is bound to the actor", "participant": "member", "existing": "none", "result": "ok", "holder": "actor" },
+    { "name": "the same actor adopting again is not an error", "participant": "member", "existing": "actor", "result": "ok", "holder": "actor" },
+    { "name": "a leftover binding of another account is replaced", "participant": "member", "existing": "other_user", "result": "ok", "holder": "actor" },
+    { "name": "an actor already bound to another participant is refused", "participant": "member", "existing": "actor_on_other_participant", "result": "conflict", "holder": "nobody" },
+    { "name": "an organizer is never bound", "participant": "organizer", "existing": "none", "result": "refused", "holder": "nobody" },
+    { "name": "a name that is not a participant is never bound", "participant": "unknown", "existing": "none", "result": "refused", "holder": "nobody" },
+    { "name": "a stale invite binding whose invite the control plane names dead is replaced", "participant": "member2", "existing": "invite", "dead": "binding_invite", "result": "ok", "holder": "actor" },
+    { "name": "an invite-bound binding is never displaced", "participant": "member2", "existing": "invite", "result": "conflict", "holder": "previous" },
+    { "name": "an invite-bound binding is not displaced when the dead list names another invite (a redeemed member is safe)", "participant": "member2", "existing": "invite", "dead": "other_invite", "result": "conflict", "holder": "previous" }
+  ],
+  "release": [
+    { "name": "the actor releases its own binding", "participant": "member", "existing": "actor", "as": "actor", "released": true, "holder": "nobody" },
+    { "name": "another account's release changes nothing", "participant": "member", "existing": "other_user", "as": "actor", "released": false, "holder": "previous" },
+    { "name": "releasing what nobody holds is not an error", "participant": "member", "existing": "none", "as": "actor", "released": false, "holder": "nobody" },
+    { "name": "an invite-bound binding is never released through this path", "participant": "member2", "existing": "invite", "as": "previous", "released": false, "holder": "previous" },
+    { "name": "an invite-bound binding IS released when the account, the name and the invite id all match (a removed member)", "participant": "member2", "existing": "invite", "as": "previous", "names": "binding_invite", "released": true, "holder": "nobody" },
+    { "name": "...but not when the invite id named is another", "participant": "member2", "existing": "invite", "as": "previous", "names": "other_invite", "released": false, "holder": "previous" },
+    { "name": "...and not another account's binding, even naming the right invite", "participant": "member2", "existing": "invite", "as": "actor", "names": "binding_invite", "released": false, "holder": "previous" }
+  ],
+  "_provision": "The personal invite for an existing traveller (docs/specs/sprint-9/x-member-sign-in.md, AC-10): POST /api/internal/control-plane/participants binds an invite-redeeming account to an existing participant, with the invite's id on the binding. It differs from adopt in two ways: the binding is invite-bound (never displaced, never released through release), and a LEFTOVER claim binding on the name is replaced (the control plane has already checked, under its own lock, that no claim is live). Each provision case runs against a freshly started site, because an invite binding is permanent.",
+  "provision": [
+    { "name": "a free plain member is bound to the invited account", "participant": "member", "existing": "none", "result": "ok", "holder": "actor" },
+    { "name": "the same invite again is not an error", "participant": "member", "existing": "actor_invite", "result": "ok", "holder": "actor" },
+    { "name": "a leftover claim binding of another account is replaced", "participant": "member", "existing": "other_user", "result": "ok", "holder": "actor" },
+    { "name": "another invite's binding is never displaced", "participant": "member", "existing": "invite", "result": "conflict", "holder": "previous" },
+    { "name": "another invite's binding is replaced when the control plane names that invite dead (a lost answer then \"send it again\")", "participant": "member", "existing": "invite", "dead": "binding_invite", "result": "ok", "holder": "actor" },
+    { "name": "the same account's own stale binding of a dead invite is replaced by its new invite (a removed member re-invited, the release lost)", "participant": "member", "existing": "actor_other_invite", "dead": "binding_invite", "result": "ok", "holder": "actor" },
+    { "name": "another invite's binding is not displaced when the dead list names a different invite (a redeemed member is safe)", "participant": "member", "existing": "invite", "dead": "other_invite", "result": "conflict", "holder": "previous" },
+    { "name": "an account already bound to another participant is refused", "participant": "member", "existing": "actor_on_other_participant", "result": "conflict", "holder": "nobody" },
+    { "name": "an organizer is never bound", "participant": "organizer", "existing": "none", "result": "refused", "holder": "nobody" },
+    { "name": "a name that is not a participant is never bound", "participant": "unknown", "existing": "none", "result": "refused", "holder": "nobody" }
+  ]
+}

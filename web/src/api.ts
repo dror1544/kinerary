@@ -112,6 +112,10 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
       PASSWORD_TOO_SHORT: "Use at least 8 characters for the password.",
       TOKEN_INVALID: "This link has expired or was already used.",
       ACCOUNT_EXISTS: "You already have an account. Sign in, or reset your password.",
+      // The join page's refusals (portal.ts, /v1/site-invites/redeem): one for every reason the invitation cannot be used, and one for
+      // a trip site that did not answer. This page is English only, like the rest of this file.
+      INVITE_UNAVAILABLE: "This link can't be used. Ask the organizer for a new one.",
+      RUNTIME_NOT_READY: "The trip isn't answering right now. Please try again in a moment.",
     };
     throw new ApiError(typeof payload.error === "string" ? payload.error : "REQUEST_FAILED", messages[payload.error] || payload.message || payload.error || "The request could not be completed.");
   }
@@ -185,6 +189,10 @@ export type MiniAppTrip = { tripId: string; title: string; destination: string |
 export type MiniAppSignInResult =
   | { kind: "session"; appPath: string; notice?: "TRIP_UNAVAILABLE" }
   | { kind: "choose"; trips: MiniAppTrip[]; notice?: "TRIP_UNAVAILABLE" }
+  /** Group sign-in: the person is in the trip's Telegram group and may pick their own name. `travellers` can be EMPTY ("ask the organizer"). */
+  | { kind: "claim"; tripId: string; travellers: MiniAppTraveller[] }
+  /** The server could not check the group (or the trip site) right now: nothing was decided, try again. */
+  | { kind: "retry" }
   | { kind: "not_linked"; fallback: "trip_password" | "none"; tripId?: string }
   /** Telegram's signature did not verify, or the launch has been used up: reopen from Telegram. */
   | { kind: "invalid" }
@@ -192,6 +200,11 @@ export type MiniAppSignInResult =
   /** Feature off, wrong origin, network: nothing to retry in place. */
   | { kind: "unavailable" };
 
+/** A name the person may pick. `claimId` is opaque and means nothing outside the claim request; it is never shown. */
+export type MiniAppTraveller = { claimId: string; name: string };
+const claimIdPattern = /^tpc_[A-Za-z0-9]{8,64}$/;
+const tripIdShape = /^trip_[A-Za-z0-9]{8,64}$/;
+const miniAppTravellerSchema = z.object({ claimId: z.string().regex(claimIdPattern), name: z.string().min(1).max(200) });
 const miniAppTripSchema = z.object({ tripId: z.string(), title: z.string(), destination: z.string().nullable(), startDate: z.string().nullable(), endDate: z.string().nullable() });
 const miniAppAppPath = /^\/mini-app(?:\/trips\/trip_[A-Za-z0-9]{8,64})?$/;
 
@@ -211,6 +224,7 @@ export async function telegramMiniAppSignIn(input: { initData: string; tripId?: 
   } catch { return { kind: "unavailable" }; }
   const body = await response.json().catch(() => ({})) as Record<string, unknown>;
   if (response.status === 429) return { kind: "limited" };
+  if (response.status === 503 && body.error === "MEMBERSHIP_CHECK_UNAVAILABLE") return { kind: "retry" };
   if (response.status === 401 && body.error === "TELEGRAM_INIT_DATA_INVALID") return { kind: "invalid" };
   if (response.status === 401 && body.error === "TELEGRAM_NOT_LINKED") {
     const tripId = typeof body.tripId === "string" && /^trip_[A-Za-z0-9]{8,64}$/.test(body.tripId) ? body.tripId : undefined;
@@ -223,6 +237,48 @@ export async function telegramMiniAppSignIn(input: { initData: string; tripId?: 
     const trips = z.array(miniAppTripSchema).safeParse(body.trips);
     if (trips.success) return { kind: "choose", trips: trips.data, ...(notice ? { notice } : {}) };
   }
+  if (body.kind === "claim" && typeof body.tripId === "string" && tripIdShape.test(body.tripId)) {
+    const travellers = z.array(miniAppTravellerSchema).safeParse(body.travellers);
+    if (travellers.success) return { kind: "claim", tripId: body.tripId, travellers: travellers.data };
+  }
+  return { kind: "unavailable" };
+}
+
+export type MiniAppClaimResult =
+  | { kind: "session"; appPath: string }
+  /** Somebody else holds that name now (or this Telegram account already holds one on this trip). */
+  | { kind: "taken" }
+  /** The one refusal for everything else: switch off, not in the group, a name that is not on the list. */
+  | { kind: "not_found" }
+  /** The launch string is older than the claim allows: the person must reopen the Mini App. */
+  | { kind: "stale" }
+  | { kind: "invalid" }
+  | { kind: "limited" }
+  /** Telegram or the trip site could not be asked: nothing was written, try again. */
+  | { kind: "retry" }
+  | { kind: "unavailable" };
+
+/**
+ * Picks a name from a group-sign-in offer. The launch string is sent in the POST body only, like the exchange above, and
+ * the server decides everything: whether the person is in the group, whether the name is still free, what they become.
+ */
+export async function miniAppClaim(input: { initData: string; tripId: string; claimId: string; embedded?: boolean }): Promise<MiniAppClaimResult> {
+  let response: Response;
+  try {
+    response = await fetch("/v1/mini-app/claim", {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ initData: input.initData, tripId: input.tripId, claimId: input.claimId, ...(input.embedded ? { embedded: true } : {}) }),
+    });
+  } catch { return { kind: "unavailable" }; }
+  const body = await response.json().catch(() => ({})) as Record<string, unknown>;
+  if (response.status === 429) return { kind: "limited" };
+  if (response.status === 503 && body.error === "MEMBERSHIP_CHECK_UNAVAILABLE") return { kind: "retry" };
+  if (response.status === 409 && body.error === "ALREADY_CLAIMED") return { kind: "taken" };
+  if (response.status === 404) return { kind: "not_found" };
+  if (response.status === 401 && body.error === "TELEGRAM_INIT_DATA_STALE") return { kind: "stale" };
+  if (response.status === 401 && body.error === "TELEGRAM_INIT_DATA_INVALID") return { kind: "invalid" };
+  if (response.ok && body.kind === "session" && typeof body.appPath === "string" && miniAppAppPath.test(body.appPath)) return { kind: "session", appPath: body.appPath };
   return { kind: "unavailable" };
 }
 
@@ -245,7 +301,7 @@ export const getMe = () => api<unknown>("/v1/me").then((value) => meSchema.parse
 export const getTrips = () => api<unknown>("/v1/trips").then((value) => z.object({ trips: z.array(z.union([tripSchema, memberTripSchema])) }).parse(value));
 export const getTrip = (id: string) => api<unknown>(`/v1/trips/${encodeURIComponent(id)}`).then((value) => tripSchema.parse(value));
 
-export const getAuthCapabilities = () => api<unknown>("/v1/auth/capabilities").then(value => z.object({ google: z.boolean(), googleClientId: z.string().optional(), emailPassword: z.boolean(), emailSignUp: z.boolean().optional(), telegramMiniApp: z.boolean().optional() }).parse(value));
+export const getAuthCapabilities = () => api<unknown>("/v1/auth/capabilities").then(value => z.object({ google: z.boolean(), googleClientId: z.string().optional(), emailPassword: z.boolean(), emailSignUp: z.boolean().optional(), telegramMiniApp: z.boolean().optional(), signInLink: z.boolean().optional() }).parse(value));
 export const emailPasswordSignIn = (input: { email: string; password: string; returnTo: string; embedded?: true }) => api<{ appPath: string }>("/v1/auth/email-password", { method: "POST", body: JSON.stringify(input) });
 
 /** Creates nothing yet, and takes no password and no name: the server emails a link, and the person chooses the name and password on the page it opens. */
@@ -259,6 +315,19 @@ export const forgotPassword = (input: { email: string; language: "en" | "he" }) 
 /** Spends the emailed token, sets the password, ends the other sessions and signs the person in. */
 export const resetPassword = (input: { token: string; password: string }) =>
   api<{ appPath: string }>("/v1/auth/password/reset", { method: "POST", body: JSON.stringify(input) });
+
+/**
+ * "Send me a sign-in link" (docs/specs/sprint-9/x-member-sign-in.md, S3). The server answers 202 with the same body for every case, so
+ * callers must not read it. Two doors: an email, or a trip plus the name the person has on it.
+ */
+export const requestSignInLink = (input: { email: string; language: "en" | "he" } | { tripId: string; travellerName: string }) =>
+  api<{ status: string }>("/v1/auth/sign-in-link", { method: "POST", body: JSON.stringify(input) });
+/** Spends the link's token (from the URL fragment, only when the person presses the button) and signs them in. */
+export const redeemSignInLink = (input: { token: string }) =>
+  api<{ appPath: string; canSetPassword: boolean }>("/v1/auth/sign-in-link/redeem", { method: "POST", body: JSON.stringify(input) });
+/** The link's one password step, for the session the redemption minted. */
+export const setSignInLinkPassword = (input: { password: string }) =>
+  api<{ ok: true }>("/v1/auth/sign-in-link/password", { method: "POST", body: JSON.stringify(input) });
 
 export function safeReturnTo(value: string | null): string {
   if (!value?.startsWith("/") || value.startsWith("//") || value.includes("\\")) return "/trips";

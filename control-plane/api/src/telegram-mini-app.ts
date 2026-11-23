@@ -24,15 +24,29 @@
  *     excluded, never ranked last: a future `viewer` or `guest` must not become
  *     a session by falling through a comparison.
  *
+ *   - GROUP SIGN-IN (docs/specs/sprint-9/x-member-sign-in.md, slice S1; switch
+ *     `member_group_sign_in`, off unless set) is a second way to a link, and it
+ *     obeys the same rules. Being live in the trip's Telegram group is not a
+ *     credential on its own: it lets a person CHOOSE which unclaimed traveller
+ *     they are (`claimTravellerInTx`), and what they get is a `member` link
+ *     scoped to that one trip. `start_param` still only selects the trip; the
+ *     grant comes from Telegram's own `getChatMember` answer about the chat the
+ *     trip's OWN open binding names, which the person cannot choose. Anything
+ *     uncertain (the switch, the binding count, Telegram, the site's participant
+ *     list) is the restrictive answer, and a refusal is the same answer whether
+ *     or not the trip exists, the group is bound or the person is in it. The
+ *     group is asked again at EVERY later launch of a group-proved link.
+ *
  * Nothing here logs an initData string, a hash, a Telegram id or the digest of
- * one. A digest of a short numeric id is brute-forceable, so it is an
- * identifier in the same class as the id itself.
+ * one, a chat id, or a claim id. A digest of a short numeric id is
+ * brute-forceable, so it is an identifier in the same class as the id itself.
  */
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import type pg from "pg";
 import { digestTelegramId, isPrivateChatId, type TelegramName } from "./identity.js";
 import { structuredLog } from "./redaction.js";
 import { TELEGRAM_API_ROOT } from "./relay/telegram-api.js";
+import type { GroupMembershipCheck } from "./telegram-group-membership.js";
 import { endSecondaryBindingInTx } from "./secondary-organizers.js";
 import { NOT_RETIRED_SQL } from "./trip-retirement.js";
 import type { VerifiedInitData } from "./telegram-webapp-auth.js";
@@ -177,6 +191,8 @@ interface AccessRow {
   membershipCreatedAt: number;
   linkId: string;
   linkKind: LinkKind;
+  /** How the link was proved; null for an organizer link. Decides whether the group is asked again. */
+  verifiedVia: string | null;
 }
 
 export interface ChooserTrip {
@@ -198,10 +214,24 @@ export interface SessionTarget {
   tripTitle: string | null;
 }
 
+/** One unclaimed traveller as the claim screen sees them: a name and an id that says nothing about who they are. */
+export interface ClaimableTraveller {
+  /** `pick_<48 hex>`: an HMAC of (trip, username) under a server secret. Not the username, not guessable, not valid on another trip. */
+  claimId: string;
+  name: string;
+}
+
 export type MiniAppOutcome =
   | { kind: "session"; target: SessionTarget; notice?: "TRIP_UNAVAILABLE" }
   | { kind: "choose"; trips: ChooserTrip[]; notice?: "TRIP_UNAVAILABLE" }
-  | { kind: "not_linked"; fallback: "trip_password" | "none"; tripId?: string };
+  | { kind: "not_linked"; fallback: "trip_password" | "none"; tripId?: string }
+  /** Group sign-in: the person is live in the trip's group and has no link yet. `travellers` may be empty. */
+  | { kind: "claim"; tripId: string; travellers: ClaimableTraveller[] }
+  /**
+   * A group-proved link could not be re-checked (Telegram unreachable), or the site's participant list could not be
+   * read for a person already proven to be in the group. No session, nothing revoked; the page may try again.
+   */
+  | { kind: "unavailable" };
 
 function startParamTrip(startParam: string | null): string | null {
   return startParam && TRIP_ID_PATTERN.test(startParam) ? startParam : null;
@@ -232,21 +262,21 @@ async function loadAccess(client: pg.PoolClient, digest: string): Promise<{ link
   const result = await client.query<{
     trip_id: string; title: string; destination_label: string | null; start_date: string | null; end_date: string | null;
     user_id: string; display_name: string; role: string; runtime_access: boolean; membership_created_at: Date;
-    link_id: string; link_kind: LinkKind;
+    link_id: string; link_kind: LinkKind; verified_via: string | null;
   }>(
     `WITH linked AS (
-       SELECT l.id AS link_id, 'organizer'::text AS link_kind, l.user_id, l.trip_id AS only_trip
+       SELECT l.id AS link_id, 'organizer'::text AS link_kind, l.user_id, l.trip_id AS only_trip, NULL::text AS verified_via
          FROM control_plane.telegram_organizer_trip_links l
         WHERE l.telegram_subject_digest = $1 AND l.revoked_at IS NULL
        UNION ALL
-       SELECT m.id, 'member'::text, m.user_id, m.trip_id
+       SELECT m.id, 'member'::text, m.user_id, m.trip_id, m.verified_via
          FROM control_plane.telegram_member_links m
         WHERE m.telegram_subject_digest = $1 AND m.revoked_at IS NULL
      )
      SELECT t.id AS trip_id, COALESCE(t.title, t.destination_label, 'Untitled trip') AS title,
             t.destination_label, t.start_date::text AS start_date, t.end_date::text AS end_date,
             tm.user_id, u.display_name, tm.role, tm.runtime_access, tm.created_at AS membership_created_at,
-            linked.link_id, linked.link_kind
+            linked.link_id, linked.link_kind, linked.verified_via
        FROM linked
        JOIN control_plane.users u ON u.id = linked.user_id AND u.status = 'active'
        JOIN control_plane.trip_memberships tm
@@ -269,33 +299,302 @@ async function loadAccess(client: pg.PoolClient, digest: string): Promise<{ link
       tripId: row.trip_id, title: row.title, destination: row.destination_label,
       startDate: row.start_date, endDate: row.end_date, userId: row.user_id, userDisplayName: row.display_name,
       role: row.role, runtimeAccess: row.runtime_access, membershipCreatedAt: row.membership_created_at.getTime(),
-      linkId: row.link_id, linkKind: row.link_kind,
+      linkId: row.link_id, linkKind: row.link_kind, verifiedVia: row.verified_via,
     });
   }
   return { linked: true, rows };
 }
 
+// ── Group sign-in (slice S1 of docs/specs/sprint-9/x-member-sign-in.md) ──────
+
+/** `telegram_member_links.verified_via` of a link a group claim wrote. The one value that makes a launch ask the group again. */
+export const GROUP_VERIFIED_VIA = "mini_app_group_membership";
+/** The `link_kind` of the payload of the outbox row that tells the organizers about a claim. */
+export const GROUP_CLAIM_LINK_KIND = "group_claim";
+
+/** One participant of the trip site, as the runtime adapter reports it. */
+export interface SiteParticipant {
+  username: string;
+  displayName: string;
+  role: string;
+}
+
+/** What the group path needs from the deployment. Absent, the path does not exist and every launch is today's. */
+export interface GroupSignInDeps {
+  /**
+   * Is `member_group_sign_in` on for this trip? Asked on `db`, which is the launch's own connection (`switchIsOn`
+   * wraps it in a savepoint): a second connection from the pool, held while this one waits, is how a burst of
+   * launches would starve the pool. False on any doubt.
+   */
+  switchOn(db: Pick<pg.PoolClient, "query">, tripId: string): Promise<boolean>;
+  /** Live membership of a group, from Telegram (telegram-group-membership.ts). */
+  isActiveMember: GroupMembershipCheck;
+  /** The trip site's participants (RuntimeAccountAdapter.listParticipants). May throw. */
+  listParticipants(tripId: string): Promise<readonly SiteParticipant[]>;
+  /** Secret behind the opaque claim ids. Server-side only; ids are an HMAC under it, so they cannot be derived from a name. */
+  claimIdKey: Buffer;
+  /** PER-REQUEST collector (the route passes a copy with a fresh array): claims a launch ended, to unbind on the site after commit. */
+  released?: ReleasedClaim[];
+}
+
+/**
+ * The switch, read inside the caller's transaction but never able to spoil it. `featureEnabled` never throws: a read
+ * that fails (a function that is missing, a connection that died) is logged and answers off. But a failed statement
+ * inside a transaction leaves the TRANSACTION aborted, and every later query on it would fail with it; the savepoint is
+ * what turns "the switch could not be read" into one answer (off) instead of a 500 for the launch. Rolled back whether
+ * the read worked or not: it wrote nothing.
+ */
+async function switchIsOn(client: pg.PoolClient, group: GroupSignInDeps, tripId: string): Promise<boolean> {
+  await client.query("SAVEPOINT group_switch_read");
+  try {
+    return (await group.switchOn(client, tripId)) === true;
+  } catch {
+    return false;
+  } finally {
+    await client.query("ROLLBACK TO SAVEPOINT group_switch_read");
+    await client.query("RELEASE SAVEPOINT group_switch_read");
+  }
+}
+
+const USERNAME_SHAPE = /^[a-z0-9][a-z0-9._-]{1,63}$/;
+export const CLAIM_ID_SHAPE = /^pick_[0-9a-f]{48}$/;
+const TRAVELLER_LIMIT = 200;
+
+/** The id the claim screen shows for a traveller: stable per (trip, username), meaningless without the key. */
+export function claimIdFor(key: Buffer, tripId: string, username: string): string {
+  return `pick_${createHmac("sha256", key).update(`claim:v1\0${tripId}\0${username}`).digest("hex").slice(0, 48)}`;
+}
+
+/** Equal-time comparison of two claim ids of the same shape; anything else is simply not equal. */
+function sameClaimId(a: string, b: string): boolean {
+  if (!CLAIM_ID_SHAPE.test(a) || !CLAIM_ID_SHAPE.test(b)) return false;
+  return timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
+/**
+ * The chat the trip's own binding names — and ONLY if there is exactly one open group binding on a live trip. Two
+ * would not say which group is "the" group; none means no group to ask; a retired or destroyed trip has none. The
+ * caller treats null as "no", which is the answer for every one of those, so nothing tells them apart.
+ */
+export async function openGroupChat(client: Pick<pg.PoolClient, "query">, tripId: string): Promise<string | null> {
+  const result = await client.query<{ chat_id: string }>(
+    `SELECT b.chat_id
+       FROM control_plane.telegram_chat_bindings b
+       JOIN control_plane.trips t ON t.id = b.trip_id
+      WHERE b.trip_id = $1 AND b.closed_at IS NULL AND b.chat_id ~ '^-[0-9]{1,20}$'
+        AND ${NOT_RETIRED_SQL}
+        AND NOT EXISTS (
+              SELECT 1 FROM control_plane.telegram_chat_bindings d
+               WHERE d.trip_id = t.id AND d.closed_reason = 'trip_destroyed')`,
+    [tripId],
+  );
+  return result.rows.length === 1 ? result.rows[0]!.chat_id : null;
+}
+
+interface Candidate { username: string; displayName: string; claimId: string }
+
+/**
+ * The trip site's plain `member`s, each with its claim id. THE ROLE ALLOW-LIST: a participant is a candidate only if
+ * the site says `member` AND `member` is a name `ROLE_RANK` holds. A missing role, another case ("Member"), an unknown
+ * one ("viewer", "guest") or an inherited property name ("constructor") is not a candidate: fail safe, never
+ * "not an organizer, therefore a member". Returns null when the site cannot be read.
+ */
+async function siteCandidates(group: GroupSignInDeps, tripId: string): Promise<Candidate[] | null> {
+  let people: readonly SiteParticipant[];
+  try { people = await group.listParticipants(tripId); } catch { return null; }
+  if (!Array.isArray(people)) return null;
+  const seen = new Set<string>();
+  const out: Candidate[] = [];
+  for (const person of people) {
+    if (!person || typeof person !== "object") continue;
+    const { username, displayName, role } = person as Partial<SiteParticipant>;
+    if (typeof username !== "string" || !USERNAME_SHAPE.test(username) || seen.has(username)) continue;
+    if (typeof role !== "string" || role !== "member" || !Object.prototype.hasOwnProperty.call(ROLE_RANK, role)) continue;
+    const name = typeof displayName === "string" ? cleanDisplayText(displayName, 120) : null;
+    if (!name) continue;
+    seen.add(username);
+    out.push({ username, displayName: name, claimId: claimIdFor(group.claimIdKey, tripId, username) });
+  }
+  return out;
+}
+
+/** Display text from outside (a site's participant name, a Telegram first name): no control or bidi-override characters, one line, bounded. */
+function cleanDisplayText(value: string, max: number): string | null {
+  const cleaned = value.replace(/[\u0000-\u001f\u007f-\u009f‪-‮⁦-⁩]/g, " ").replace(/\s+/g, " ").trim().slice(0, max).trim();
+  return cleaned === "" ? null : cleaned;
+}
+
+/**
+ * Who on this trip is spoken for in the control plane: `held` (a live claim, a redeemed invite or a trip password maps
+ * the traveller to an account, or a PENDING personal invite reserves the traveller for the person it was sent to) and `organizerSide` (the account holding it is an owner or organizer here). Both by
+ * username, read in the transaction's own snapshot.
+ */
+export async function spokenFor(client: pg.PoolClient, tripId: string): Promise<{ held: Set<string>; organizerSide: Set<string> }> {
+  const result = await client.query<{ runtime_username: string; organizer_side: boolean }>(
+    `WITH mapped AS (
+       SELECT cl.runtime_username, cl.user_id FROM control_plane.trip_participant_claims cl
+        WHERE cl.trip_id = $1 AND cl.released_at IS NULL
+       UNION ALL
+       SELECT i.runtime_username, i.redeemed_by FROM control_plane.site_invites i
+        WHERE i.trip_id = $1 AND i.state = 'redeemed'
+       UNION ALL
+       -- A PENDING personal invite (unused, unexpired, unrevoked) RESERVES its traveller (S2, docs/specs/sprint-9/x-member-sign-in.md):
+       -- the organizer sent this person a way in, so the group is neither offered the name nor able to claim it by a hand-built id.
+       -- It maps to no account yet (NULL user): it is spoken for, and is not an organizer's. Revoking it, or its expiry (read from
+       -- the clock here, so a row nobody has touched since still frees the name), ends the reservation.
+       SELECT i.runtime_username, NULL::text FROM control_plane.site_invites i
+        WHERE i.trip_id = $1 AND i.state = 'unused' AND i.expires_at > now()
+       UNION ALL
+       SELECT c.runtime_username, c.user_id FROM control_plane.web_password_credentials c
+         JOIN control_plane.users u ON u.id = c.user_id AND u.status = 'active'
+        WHERE c.trip_id = $1
+     )
+     SELECT mapped.runtime_username,
+            EXISTS (SELECT 1 FROM control_plane.trip_memberships tm
+                     WHERE tm.trip_id = $1 AND tm.user_id = mapped.user_id AND tm.status = 'active'
+                       AND tm.role IN ('owner', 'organizer')) AS organizer_side
+       FROM mapped`,
+    [tripId],
+  );
+  const held = new Set<string>(), organizerSide = new Set<string>();
+  for (const row of result.rows) {
+    held.add(row.runtime_username);
+    if (row.organizer_side) organizerSide.add(row.runtime_username);
+  }
+  return { held, organizerSide };
+}
+
+/**
+ * The person is proven to be in the trip's group and has no link: the names they may pick from. Null is "this path
+ * says nothing" (the caller answers as it always did): switch off or unreadable, no single open group, or the person
+ * is not clearly in it. `unavailable` is only for someone ALREADY PROVEN in the group whose list cannot be drawn.
+ */
+async function offerClaim(client: pg.PoolClient, launch: VerifiedInitData, tripId: string, group: GroupSignInDeps): Promise<MiniAppOutcome | null> {
+  if (!(await switchIsOn(client, group, tripId))) return null;
+  const chat = await openGroupChat(client, tripId);
+  if (!chat) return null;
+  if ((await group.isActiveMember(chat, launch.telegramUserId)) !== true) return null;
+  const candidates = await siteCandidates(group, tripId);
+  if (!candidates) return { kind: "unavailable" };
+  const { held, organizerSide } = await spokenFor(client, tripId);
+  const travellers = candidates
+    .filter((c) => !held.has(c.username) && !organizerSide.has(c.username))
+    .map(({ claimId, displayName }) => ({ claimId, name: displayName }))
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : a.claimId < b.claimId ? -1 : 1))
+    .slice(0, TRAVELLER_LIMIT);
+  return { kind: "claim", tripId, travellers };
+}
+
+/** The seat a person holds in a trip's group, from the group rule below. */
+export type GroupSeatVerdict = "in" | "out" | "unknown" | "dormant";
+
+/** How a caller reads the two database facts the group rule needs (on its own connection or pool) and asks Telegram. */
+export interface GroupSeatReads {
+  /** Is `member_group_sign_in` on for this trip? False on any doubt. */
+  switchOn(tripId: string): Promise<boolean>;
+  /** The trip's one open group chat, or null (`openGroupChat`). */
+  openChat(tripId: string): Promise<string | null>;
+  isActiveMember: GroupMembershipCheck;
+}
+
+/**
+ * THE GROUP RULE, in one place: is this person still in this trip's group? The switch is on, the trip has exactly one open group,
+ * and Telegram, asked live, says so.
+ *   in       the switch is on, there is one open group, and the person is in it.
+ *   out      Telegram said the person is not in it.
+ *   unknown  Telegram did not say (a timeout, an error, a restricted member with no answer): the caller revokes nothing and grants nothing.
+ *   dormant  no wiring, the switch is off or unreadable, or the trip has no single open group: no call to Telegram is made.
+ * The Mini App launch (`groupLinkVerdict`) and the sign-in link's gate (`claimGateVerdict`, sign-in-link.ts) both ask THIS, each
+ * supplying how it reads the database (the launch's transaction, the link's pool); what each does with the answer is its own.
+ */
+export async function groupSeatVerdict(
+  reads: GroupSeatReads | undefined, input: { tripId: string; telegramUserId: string },
+): Promise<GroupSeatVerdict> {
+  if (!reads || !(await reads.switchOn(input.tripId))) return "dormant";
+  const chat = await reads.openChat(input.tripId);
+  if (!chat) return "dormant";
+  const member = await reads.isActiveMember(chat, input.telegramUserId);
+  if (member === true) return "in";
+  if (member === "unknown") return "unknown";
+  return "out";
+}
+
+type GroupLinkVerdict = "in" | "out" | "unreachable" | "dormant";
+
+/**
+ * AC-6: a link a group claim wrote is only as good as the person's seat in the group, so each launch asks again.
+ *   in          keep it.
+ *   out         the person left (or was removed): the link, its claim, its sessions and its membership end HERE, in the
+ *               launch's transaction, and the row is dropped from this launch.
+ *   unreachable Telegram did not give a clear answer: the row is dropped from this launch (no session) and NOTHING is
+ *               revoked; a Telegram outage must neither sign someone in nor throw them out.
+ *   dormant     the switch is off, the group is no longer exactly one, or the path is not wired: the row is dropped
+ *               without a call and without revoking. Switching the feature off closes the door; switching it back on
+ *               opens it for the same links.
+ */
+async function groupLinkVerdict(client: pg.PoolClient, launch: VerifiedInitData, row: AccessRow, group: GroupSignInDeps | undefined): Promise<GroupLinkVerdict> {
+  const seat = await groupSeatVerdict(
+    group ? { switchOn: (tripId) => switchIsOn(client, group, tripId), openChat: (tripId) => openGroupChat(client, tripId), isActiveMember: (chat, telegramUserId) => group.isActiveMember(chat, telegramUserId) } : undefined,
+    { tripId: row.tripId, telegramUserId: launch.telegramUserId });
+  if (seat === "in" || seat === "dormant") return seat;
+  if (seat === "unknown") return "unreachable";
+  const ended = await endGroupClaimInTx(client, { tripId: row.tripId, userId: row.userId, linkReason: "left_group", claimReason: "left_group" });
+  group?.released?.push(...ended);
+  return "out";
+}
+
+async function enforceGroupLinks(
+  client: pg.PoolClient, launch: VerifiedInitData, rows: AccessRow[], group: GroupSignInDeps | undefined,
+): Promise<{ rows: AccessRow[]; unreachable: Set<string> }> {
+  const kept: AccessRow[] = [];
+  const unreachable = new Set<string>();
+  const verdicts = new Map<string, GroupLinkVerdict>();
+  for (const row of rows) {
+    if (!(row.linkKind === "member" && row.verifiedVia === GROUP_VERIFIED_VIA)) { kept.push(row); continue; }
+    let verdict = verdicts.get(row.tripId);
+    if (!verdict) { verdict = await groupLinkVerdict(client, launch, row, group); verdicts.set(row.tripId, verdict); }
+    if (verdict === "in") kept.push(row);
+    else if (verdict === "unreachable") unreachable.add(row.tripId);
+  }
+  return { rows: kept, unreachable };
+}
+
 /**
  * Decides what a verified Telegram launch gets. Pure over the database state in
- * `client`'s transaction; mints nothing.
+ * `client`'s transaction, with ONE exception: a group-proved link whose person
+ * has left the group is ended here (`enforceGroupLinks`), in that transaction,
+ * so the launch that finds out is the launch that closes it. Mints nothing.
  *
  * `requestedTripId` is the chooser follow-up's trip (already pattern-checked by
  * the route). It selects within the person's accessible set and can never
  * widen it.
+ *
+ * `group` is the deployment's group sign-in wiring. Absent, nothing about it
+ * exists: the outcome is what it was before the feature.
  */
 export async function resolveMiniAppLaunch(
   client: pg.PoolClient,
   launch: VerifiedInitData,
   requestedTripId: string | null,
+  group?: GroupSignInDeps,
 ): Promise<MiniAppOutcome> {
   const digest = digestTelegramId(launch.telegramUserId);
-  const { linked, rows } = await loadAccess(client, digest);
+  const loaded = await loadAccess(client, digest);
+  const { linked } = loaded;
   const signedTrip = startParamTrip(launch.startParam);
   const requested = requestedTripId ?? signedTrip;
+  const checked = linked ? await enforceGroupLinks(client, launch, loaded.rows, group) : { rows: [] as AccessRow[], unreachable: new Set<string>() };
+  const rows = checked.rows;
 
   if (!linked || rows.length === 0) {
-    // One answer, whether or not the trip exists or the person has ever been
-    // linked to anything: nothing here depends on the trip's existence.
+    if (requested && checked.unreachable.has(requested)) return { kind: "unavailable" };
+    // A person with nothing yet, who named a trip: the group may let them pick a name. Anything else is the one answer
+    // that depends on nothing about the trip: not on its existence, nor on the person's links elsewhere.
+    if (requested && group) {
+      const offer = await offerClaim(client, launch, requested, group);
+      if (offer) return offer;
+    }
+    if (checked.unreachable.size > 0) return { kind: "unavailable" };
     return requested
       ? { kind: "not_linked", fallback: "trip_password", tripId: requested }
       : { kind: "not_linked", fallback: "none" };
@@ -319,7 +618,16 @@ export async function resolveMiniAppLaunch(
     // Not a trip this person can open. Whether it exists, was retired, belongs
     // to somebody else or never did, they are told the same thing, and only
     // when they named it.
-    if (requested) notice = "TRIP_UNAVAILABLE";
+    if (requested) {
+      // ...unless it is a trip whose group link we could not re-check (try again, do not pretend it is somebody else's)
+      // or one whose group they are in (they may pick a name).
+      if (checked.unreachable.has(requested)) return { kind: "unavailable" };
+      if (group) {
+        const offer = await offerClaim(client, launch, requested, group);
+        if (offer) return offer;
+      }
+      notice = "TRIP_UNAVAILABLE";
+    }
   }
 
   const bestPerTrip = new Map<string, AccessRow>();
@@ -560,9 +868,236 @@ export async function linkMemberOrSkip(
   }
 }
 
+// ── Group sign-in: the claim, the notice, and ending a claim ─────────────────
+
+export type ClaimResult =
+  | { kind: "claimed"; target: SessionTarget; runtimeUsername: string }
+  /** The trip site cannot be asked who is on the trip: nothing is known, so nothing is written; retryable. */
+  | { kind: "unavailable" }
+  /** Every way of being refused that must look the same: switch off, no single group, not in it, no such traveller, a stale race. */
+  | { kind: "refused" }
+  | { kind: "already_claimed" }
+  /** The initData is older than `LINK_MAX_AUTH_AGE_SECONDS`. Signed, so saying so confirms nothing. */
+  | { kind: "stale" };
+
+/**
+ * AC-5, one transaction (the caller's): re-check the group live, re-check that the traveller is free (the trip row is
+ * locked `FOR UPDATE`, so two claims of one traveller meet here one after the other, and the second reads the first's
+ * committed row), then write the account, its member membership, the claim and the link. The caller mints the scoped
+ * session and commits; on anything but `claimed` it ROLLS BACK, so a refused claim leaves nothing behind.
+ *
+ * What a claim can ever be: a `member`, `dashboard_access = false`, `runtime_access = true`, for ONE trip. Nothing in
+ * the site's participant record reaches the role: a traveller is a candidate only when the site says `member`
+ * (`siteCandidates`), and the INSERT below names `member` literally.
+ *
+ * The order is the information a refusal gives away: stale first (it needs a valid signature, so it tells nobody
+ * anything), then the switch, the binding and Telegram (all of which a stranger fails identically), and only for a
+ * person proven to be in the group do the traveller's state (`already_claimed`) and a bad id (`refused`) differ.
+ */
+export async function claimTravellerInTx(
+  client: pg.PoolClient,
+  input: {
+    launch: VerifiedInitData;
+    maxAgeSeconds: number;
+    nowMs?: number;
+    tripId: string;
+    claimId: string;
+    group: GroupSignInDeps;
+    log?: (line: string) => void;
+  },
+): Promise<ClaimResult> {
+  const { launch, group, tripId } = input;
+  const age = (input.nowMs ?? Date.now()) / 1000 - launch.authDate;
+  if (age > LINK_MAX_AUTH_AGE_SECONDS || age < -LINK_MAX_AUTH_AGE_SECONDS) return { kind: "stale" };
+  if (!(await switchIsOn(client, group, tripId))) return { kind: "refused" };
+  const chat = await openGroupChat(client, tripId);
+  if (!chat) return { kind: "refused" };
+  // Not "unknown" either: a person mid-claim whose Telegram check wobbles is refused like a stranger, and tries again.
+  if ((await group.isActiveMember(chat, launch.telegramUserId)) !== true) return { kind: "refused" };
+  const candidates = await siteCandidates(group, tripId);
+  if (!candidates) return { kind: "unavailable" };
+  // No early exit: how long the comparison takes does not say how far down the list a guess matched.
+  let picked: Candidate | undefined;
+  for (const candidate of candidates) if (sameClaimId(candidate.claimId, input.claimId)) picked = candidate;
+  if (!picked) return { kind: "refused" };
+
+  // From here the rows are locked. The trip row is the lock: every claim on the trip passes through it.
+  const locked = await client.query("SELECT 1 FROM control_plane.trips t WHERE t.id = $1 AND " + NOT_RETIRED_SQL + " FOR UPDATE OF t", [tripId]);
+  if (!locked.rowCount) return { kind: "refused" };
+  const { held, organizerSide } = await spokenFor(client, tripId);
+  if (organizerSide.has(picked.username)) return { kind: "refused" };
+  if (held.has(picked.username)) return { kind: "already_claimed" };
+  const digest = digestTelegramId(launch.telegramUserId);
+  // One Telegram account, one traveller per trip: a parent claiming the children's names is what the personal invite is for.
+  const holds = await client.query(
+    `SELECT 1 FROM control_plane.telegram_member_links WHERE telegram_subject_digest = $1 AND trip_id = $2 AND revoked_at IS NULL
+     UNION ALL
+     SELECT 1 FROM control_plane.telegram_organizer_trip_links WHERE telegram_subject_digest = $1 AND trip_id = $2 AND revoked_at IS NULL`,
+    [digest, tripId],
+  );
+  if (holds.rowCount) return { kind: "already_claimed" };
+  // One link-writing action per launch, as linkMemberInTx has: a replayed initData writes nothing a second time.
+  if (!(await claimLinkSlot(client, launch, input.maxAgeSeconds))) return { kind: "refused" };
+
+  const userId = opaqueId("user");
+  await client.query("INSERT INTO control_plane.users(id, status, display_name) VALUES ($1, 'active', $2)", [userId, picked.displayName]);
+  await client.query(
+    `INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status, dashboard_access, runtime_access)
+     VALUES ($1, $2, $3, 'member', 'active', false, true)`,
+    [opaqueId("memb"), tripId, userId],
+  );
+  try {
+    await client.query(
+      `INSERT INTO control_plane.trip_participant_claims(id, trip_id, user_id, runtime_username, via, telegram_user_id, last_group_check_at)
+       VALUES ($1, $2, $3, $4, 'group_membership', $5, now())`,
+      [opaqueId("tpc"), tripId, userId, picked.username, launch.telegramUserId],
+    );
+  } catch (error) {
+    // The partial unique index is the last word: the check above is not the only thing keeping one traveller to one person.
+    if ((error as { code?: string } | null)?.code === "23505") return { kind: "already_claimed" };
+    throw error;
+  }
+  const linkId = opaqueId("tml");
+  await client.query(
+    `INSERT INTO control_plane.telegram_member_links
+       (id, user_id, trip_id, telegram_subject_digest, verified_via, first_signed_in_at, last_signed_in_at, telegram_first_name, telegram_username)
+     VALUES ($1, $2, $3, $4, $5, now(), now(), $6, $7)`,
+    [linkId, userId, tripId, digest, GROUP_VERIFIED_VIA, launch.name?.firstName ?? null, launch.name?.username ?? null],
+  );
+  const trip = await client.query<{ title: string; language: string | null }>(
+    `SELECT COALESCE(title, destination_label, 'Untitled trip') AS title, companion_intro ->> 'language' AS language
+       FROM control_plane.trips WHERE id = $1`,
+    [tripId],
+  );
+  const tripTitle = trip.rows[0]?.title ?? null;
+  const noticed = await enqueueGroupClaimNotice(client, {
+    tripId, travellerName: picked.displayName, telegramFirstName: launch.name?.firstName ?? null,
+    tripTitle, language: trip.rows[0]?.language === "he" ? "he" : "en",
+  });
+  void noticed;
+  return {
+    kind: "claimed",
+    runtimeUsername: picked.username,
+    target: { userId, userDisplayName: picked.displayName, linkId, linkKind: "member", appPath: `/mini-app/trips/${tripId}`, tripId, tripTitle },
+  };
+}
+
+/**
+ * AC-7's notice: "<Telegram first name> signed in as <traveller> from the trip group", in the trip's language, to the
+ * organizers' own Telegram chats: the trip's open PRIVATE bindings (the organizers' direct chats with the bot), never
+ * the group (it is the audience that just took a name) and never the claimer's own chat. One outbox row per chat, the
+ * same `mini_app_sign_in_notice` rows `enqueueSignInNotice` writes (so the same dispatcher sends them and nulls the raw
+ * chat id once sent), told apart by `payload.link_kind = 'group_claim'`. Sent after commit by the ordinary outbox
+ * dispatcher: a Telegram outage must not delay or fail a claim, and a rolled-back claim must not announce itself.
+ */
+async function enqueueGroupClaimNotice(
+  client: pg.PoolClient,
+  input: { tripId: string; travellerName: string; telegramFirstName: string | null; tripTitle: string | null; language: "he" | "en" },
+): Promise<number> {
+  const bound = await client.query<{ chat_id: string }>(
+    `SELECT DISTINCT b.chat_id FROM control_plane.telegram_chat_bindings b
+       JOIN control_plane.trips t ON t.id = b.trip_id
+      WHERE b.trip_id = $1 AND b.closed_at IS NULL AND b.chat_id ~ '^[0-9]{1,20}$' AND ${NOT_RETIRED_SQL}`,
+    [input.tripId],
+  );
+  const payload = JSON.stringify({
+    link_kind: GROUP_CLAIM_LINK_KIND, traveller_name: input.travellerName,
+    telegram_first_name: input.telegramFirstName ? cleanDisplayText(input.telegramFirstName, 64) : null,
+    trip_title: input.tripTitle, language: input.language, at: new Date().toISOString(),
+  });
+  for (const row of bound.rows) {
+    await client.query(
+      `INSERT INTO control_plane.notification_outbox
+         (id, trip_id, kind, recipient, payload, signup_request_id, notification_type, adapter, state)
+       VALUES ($1, NULL, 'mini_app_sign_in_notice', $2, $3::jsonb, NULL, 'mini_app_sign_in_notice', 'control-plane', 'pending')`,
+      [opaqueId("notif"), row.chat_id, payload],
+    );
+  }
+  return bound.rows.length;
+}
+
+/** The words of a group-claim notice, from its outbox payload. One language, the trip's: Hebrew for "he", English otherwise. */
+export function groupClaimNoticeText(payload: Record<string, unknown> | null): string {
+  const text = (key: string) => (typeof payload?.[key] === "string" && (payload[key] as string).trim() ? (payload[key] as string) : null);
+  const traveller = text("traveller_name") ?? "a traveller";
+  const first = text("telegram_first_name");
+  const trip = text("trip_title");
+  if (text("language") === "he") {
+    return [
+      `${first ?? "מישהו"} נכנס/ה בתור ${traveller} מקבוצת הטיול${trip ? ` (${trip})` : ""}.`,
+      "אם זה לא נכון, אפשר לשחרר את הכניסה בהגדרות המארגן של הטיול, תחת \"כניסה\".",
+    ].join("\n");
+  }
+  return [
+    `${first ?? "Someone"} signed in as ${traveller} from the trip group${trip ? ` (${trip})` : ""}.`,
+    "If that is not right, release it in the trip's Organizer settings, under Signing in.",
+  ].join("\n");
+}
+
+/**
+ * Ends a group claim in the caller's transaction: the person's links for the trip (revoked in place, with
+ * `linkReason`), the sessions those links minted, the claim (released, with `claimReason`, so the traveller can be
+ * claimed again), any unspent launch grant, the membership the claim created, and — because that account was made for
+ * this one trip and holds nothing else — every other session it has. Shared by the three ways a claim ends that this
+ * code starts (the person left the group, an organizer's Release, the person's own Unlink); a fourth, the membership
+ * ending by itself, is the database trigger of migration 20261119120000, which finds nothing left to do here.
+ */
+export async function endGroupClaimInTx(
+  client: pg.PoolClient,
+  input: {
+    tripId: string;
+    userId: string;
+    linkReason: "left_group" | "claim_released" | "owner_unlinked";
+    claimReason: "left_group" | "organizer_released" | "unlinked";
+  },
+): Promise<ReleasedClaim[]> {
+  const links = await client.query<{ id: string }>(
+    `UPDATE control_plane.telegram_member_links SET revoked_at = now(), revoked_reason = $3
+      WHERE trip_id = $1 AND user_id = $2 AND verified_via = $4 AND revoked_at IS NULL
+      RETURNING id`,
+    [input.tripId, input.userId, input.linkReason, GROUP_VERIFIED_VIA],
+  );
+  if (links.rowCount) {
+    await client.query(
+      "UPDATE control_plane.web_sessions SET revoked_at = now() WHERE telegram_link_id = ANY($1::text[]) AND revoked_at IS NULL",
+      [links.rows.map((row) => row.id)],
+    );
+  }
+  const released = await client.query<{ runtime_username: string }>(
+    `UPDATE control_plane.trip_participant_claims SET released_at = now(), released_reason = $3, telegram_user_id = NULL
+      WHERE trip_id = $1 AND user_id = $2 AND released_at IS NULL
+      RETURNING runtime_username`,
+    [input.tripId, input.userId, input.claimReason],
+  );
+  await client.query(
+    "UPDATE control_plane.runtime_launch_grants SET consumed_at = now() WHERE trip_id = $1 AND user_id = $2 AND consumed_at IS NULL",
+    [input.tripId, input.userId],
+  );
+  await client.query(
+    "UPDATE control_plane.trip_memberships SET status = 'revoked' WHERE trip_id = $1 AND user_id = $2 AND status = 'active'",
+    [input.tripId, input.userId],
+  );
+  await client.query(
+    `UPDATE control_plane.web_sessions SET revoked_at = now()
+      WHERE user_id = $1 AND revoked_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM control_plane.trip_memberships m WHERE m.user_id = $1 AND m.status = 'active')`,
+    [input.userId],
+  );
+  return released.rows.map((row) => ({ tripId: input.tripId, userId: input.userId, runtimeUsername: row.runtime_username, reason: input.claimReason }));
+}
+
+/**
+ * A claim that just ended in a transaction, for the caller to end the trip site's binding of that traveller once the
+ * transaction has COMMITTED (never before: a rolled-back release must not unbind anyone). That prompt attempt is the fast path, not the
+ * guarantee: the database wrote a durable record of the release in the same transaction (site-release-outbox.ts, migration
+ * 20261122110000), so a release that does not arrive is retried by a background pass until the trip site confirms. See the header of
+ * `releaseSiteBindings` in portal.ts.
+ */
+export interface ReleasedClaim { tripId: string; userId: string; runtimeUsername: string; /** set for a removed member's INVITE binding: the site ends it only when account, name and this id all match */ inviteId?: string; /** why it ended, for the audit line */ reason?: string }
+
 // ── The owner's view: the trip card's Telegram status, and Unlink ───────────
 
-export type LinkVia = "interview_link" | "earlier_interview" | "dashboard_link" | "dashboard_restore" | "trip_password" | "invite";
+export type LinkVia = "interview_link" | "earlier_interview" | "dashboard_link" | "dashboard_restore" | "trip_password" | "invite" | "group";
 
 /**
  * Whose names a caller may be shown. A FULL session sees every label on the user's own links; a
@@ -600,6 +1135,7 @@ const VIA: Record<string, LinkVia> = {
   dashboard_restore: "dashboard_restore",
   mini_app_trip_password: "trip_password",
   mini_app_invite_redemption: "invite",
+  mini_app_group_membership: "group",
 };
 
 /**
@@ -742,19 +1278,25 @@ export async function unlinkedTelegramLinksByTrip(
  * `false` for a link that is not theirs, does not exist or is already gone —
  * the same answer for all three.
  */
-export async function unlinkTelegramLink(db: pg.Pool, userId: string, linkId: string): Promise<boolean> {
+export async function unlinkTelegramLink(db: pg.Pool, userId: string, linkId: string, released?: ReleasedClaim[]): Promise<boolean> {
   const kind: LinkKind | null = linkId.startsWith("otl_") ? "organizer" : linkId.startsWith("tml_") ? "member" : null;
   if (!kind) return false;
   const client = await db.connect();
   try {
     await client.query("BEGIN");
     if (kind === "member") {
-      const revoked = await client.query(
+      const revoked = await client.query<{ trip_id: string; verified_via: string }>(
         `UPDATE control_plane.telegram_member_links SET revoked_at = now(), revoked_reason = 'owner_unlinked'
-          WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL`,
+          WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
+          RETURNING trip_id, verified_via`,
         [linkId, userId],
       );
       if (!revoked.rowCount) { await client.query("ROLLBACK"); return false; }
+      // A link a group claim wrote IS the way into an account that was made for it, so Unlinking it ends the claim as
+      // well, and the traveller can be claimed again. Without this the name would stay held by an account nobody can open.
+      if (revoked.rows[0]!.verified_via === GROUP_VERIFIED_VIA) {
+        released?.push(...(await endGroupClaimInTx(client, { tripId: revoked.rows[0]!.trip_id, userId, linkReason: "owner_unlinked", claimReason: "unlinked" })));
+      }
       // A SECONDARY ORGANIZER (#523) unlinking the member link their Mini App access rests on RESIGNS: the binding ends with it
       // (the Telegram organizer actions, the DM route, the membership). The alternative, refusing, would leave a person who
       // wants to leave with no way to; and leaving the binding alive would leave an organizer in Telegram with no Mini App,

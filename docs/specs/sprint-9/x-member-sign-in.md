@@ -304,6 +304,150 @@ Write the tests first, from the ACs.
 - **D4, from Q4: no organizer approval per claim.** The notice (AC-7) and Release are the
   control.
 
+## Amendments (Dror, 2026-11-20, after two boundary-review rounds on S1)
+
+Each was found with live request/response evidence while S1's server half was built. Where one
+contradicts the text above, the amendment wins.
+
+- **A1: a claim binds the site, and every way a claim ends unbinds it.**
+  - The claim binds the new account to the *existing* trip-site participant before it commits
+    (an adopt route on the site, forwarded by the runtime gateway, internal key only). Without
+    it the site refuses the session exchange with `IDENTITY_MISMATCH`.
+  - Adopt never creates a participant, never changes a role, password or data, and never
+    displaces an owner, organizer or invite-bound binding.
+  - Release, leaving the group, Unlink and member removal remove the binding.
+  - S2's invite for an existing traveller (AC-10) reuses this pair.
+- **A2: a session from a group claim cannot set a password or link Google on the trip site.**
+  - Otherwise a claimant sets the traveller's password, logs in directly, and holds a 30-day
+    site token that Release cannot end, which defeats D4.
+  - This narrows "the trip-site routes stay exactly as they are": they stay as they are for
+    every session that exists today. A claimed member who wants a password uses S2.
+- **A3: leaving the group ends existing access, not only the next Mini App launch.** This
+  extends AC-6.
+  - Minting a trip launch from a group-link session re-checks the group live.
+  - The session liveness check re-asks Telegram at most once per 10 minutes per link.
+  - Telegram unreachable: no new launch, nothing revoked, and an open session stays live until
+    the next check. An outage must not sign a whole family out.
+- **A4: switching `member_group_sign_in` off closes existing group-claim access too.** The
+  links are dormant, not revoked: no launch, not live, no Telegram call. They work again when
+  the switch is back on.
+- **A5: the claims list stays in the trip site's Organizer settings**, as written above. The
+  runtime gateway forwards the list and Release to the control plane
+  (`/t/:tripId/__member-claims`), because `trip-web` talks only to the trip site and the trip
+  site has no way to call the control plane. The gateway passes only the user, trip and session
+  from its own sealed cookie, and the control plane re-decides that the caller is an organizer
+  of that trip. Opened on the trip site's own hostname, the list does not render.
+- **A6: whether a pending personal invite reserves its traveller from group claims is decided
+  in S2.** Today only a redeemed invite does (AC-4).
+- **A7: the group check uses the relay's bot**, the one that sits in the trip groups. It never
+  falls back to the Mini App's token.
+
+## Amendments (Dror, 2026-11-21 and 2026-11-22, while S2 and S3 were built)
+
+- **A8: AC-12 is a bot command, not a companion tool.**
+  - An organizer sends `/invite <traveller name>` in their own private chat with the bot, and
+    the bot replies there with the link.
+  - The companion's control MCP knows only which profile is calling. It cannot tell who typed,
+    or whether the turn came from the group or a private chat, so a tool there cannot prove an
+    organizer asked. The relay reads the sender off Telegram's own update.
+  - The companion's part is to tell an organizer to use the command.
+  - This is a relay behaviour change, so the merge needs a regression plan.
+- **A9: an invited member's session cannot set a trip-site password or link Google**, the same
+  rule as A2.
+  - Redeeming the invite already gives the person a portal login, which removal ends.
+  - Otherwise a removed person keeps a site password and a 30-day site token on the
+    traveller's account.
+  - **Removing an invited member revokes the assistant connections made under that binding.**
+    Invited members keep the assistant while they are members; a claimed session still cannot
+    use it.
+- **A10: invite versus claim.** This settles A6.
+  - A pending personal invite reserves its traveller from group claims. Revoking it, or its
+    expiry, frees the name.
+  - An invite for a traveller who is claimed from the group is refused, and the organizer is
+    told to release that sign-in first.
+  - Redeeming never answers a raw error. An owner or organizer of the trip cannot redeem a
+    member invite.
+  - Removing an invited member ends their trip-site binding and frees the name.
+- **A11: the invite path was never "add a new traveller".** D2 and AC-10 describe today's site
+  invite as adding one. The code already required the traveller to exist on the trip site
+  before an invite could be made, and still does: a new traveller is added on the site first,
+  then invited.
+- **A12: personal invites are not gated by `member_group_sign_in`** (D1: the invite is a full
+  way in for people not on Telegram).
+
+## Amendments (Dror, 2026-11-22, after the reviews of S2 and S3)
+
+- **A13: a secondary organizer's session cannot set a trip-site password or link Google**, the
+  same rule as A2 and A9. A removed secondary organizer could otherwise still log in on the
+  trip's own hostname and read the trip at member level. The owner's session and plain
+  organizer logins are unchanged.
+- **A14: an invited session sees and manages only the assistant connections it approved.**
+  The traveller's own login still sees and can disconnect every connection under their name.
+- **A15: an invited session gets the same restricted view of the traveller's record as a
+  claimed session:** no Google identity, no Telegram id.
+- **A16: a new sign-in-link request does not cancel an earlier link that is still valid.**
+  Otherwise anyone who knows a traveller's name or address can keep killing the link the
+  traveller just asked for.
+- **A17: S3 stays narrow.**
+  - Telegram delivery reaches accounts made by a group claim or holding a Telegram identity.
+  - Email delivery reaches accounts holding a Google identity, at the address typed in the
+    request.
+  - A member who joined by invite or trip password and has neither gets nothing from S3. A
+    member with a password email already has the existing forgot-password route.
+  - Organizers are never sent a link.
+- **A18: S3 ships behind its own switch, `member_sign_in_link`.**
+  - The trip-plus-name door needs it on for that trip.
+  - The email door and the "Send me a sign-in link" control need it on for every trip.
+  - A group claimant's link is also held to A3 and A4.
+- **A19: deploying A9 and A13 changes behaviour for people who are already invited or already
+  secondary organizers.** They can no longer set or change a trip-site password or link Google.
+  Passwords and assistant connections made before the deploy are not touched.
+
+- **A20: `/invite` is a recorded exception to "a site invite needs a real sign-in".**
+  - The portal refuses to let a Telegram-minted session create a site invite, because the
+    invite makes an account that outlives that session. `/invite` proves the organizer the
+    same way, by their Telegram account, and does create one.
+  - Accepted, and bounded: private chat only, an organizer with dashboard access, existing
+    travellers only, the link delivered only to that chat, and 5 invites an hour per organizer
+    per trip.
+  - What it costs: whoever holds the organizer's Telegram account can create a way in as a
+    traveller, until the organizer's Telegram is unlinked.
+- **A21: the trip-site release is durable.** When a member is removed and the trip site cannot
+  be told at that moment, the release is retried until it lands. Otherwise a removed person's
+  assistant connection keeps reading the trip until someone else is bound to that traveller.
+- **A22: the email door of S3 honours a per-trip off.** Nothing is sent to an account that
+  holds a member seat on a trip where `member_sign_in_link` is off.
+
+## Rollout decisions (Dror, 2026-11-23)
+
+- **A23: trip sites are redeployed before the control plane.**
+  - A new trip site with an old control plane is fully compatible.
+  - The reverse keeps "invite a traveller" working through a fallback, but a person invited on
+    a not-yet-redeployed site can still set a site password and approve an assistant
+    connection there, and both survive removal.
+- **A24: this rollout is asked step by step**, not under standing approval: the payload
+  rollout to each live trip, the VM upgrade, and every switch-on at `ready_private` or later.
+  It widens who can open a trip and changes credentials for people already on live trips.
+- **A25: switching `member_sign_in_link` off does not cancel links already sent.** They work
+  for their 30 minutes. A group claimant's link still follows A4. The registry note that says
+  switching off "closes the path" is to be corrected to say so.
+- **A26: assistant connections and trip-site passwords made before a trip's redeploy are not
+  touched** (A19). An older connection carries no record of who approved it, so it cannot be
+  attributed to the invited person without risking the traveller's own. The organizer or the
+  traveller can disconnect one by hand.
+- **A27: the "wip" commits are squashed at merge.** The branch's pushed history is not
+  rewritten.
+- **A28 (2026-11-23, after the merge with main's per-trip keys): which key reaches which door,
+  and no keyed call follows a redirect.** A1's "internal key only" is read under main's key model
+  (`docs/runtime-session-exchange.md`): the gateway calls the trip site's adopt, release, list and
+  provision routes with THAT TRIP'S OWN key (derived, or the legacy key on a `shared` route). The
+  control-plane key is used only between the API, the relay and the gateway's own `/internal/t/*`
+  routes, and from the gateway to the control plane. No keyed call follows a redirect: the API's
+  runtime adapter and the gateway's `timedFetch` use `redirect: "manual"`, and a 3xx fails closed
+  (an unreachable site for the API's callers, a retryable release for the outbox, a `502
+  UPSTREAM_REDIRECT` from the gateway). Held by `runtime-account-adapter-redirects.test.ts`,
+  `runtime-adapter-redirect-flows.test.ts` and the gateway's `redirects.test.js`.
+
 ## Open questions (answered, kept for the record)
 
 Answered in Decisions D1–D4 above.

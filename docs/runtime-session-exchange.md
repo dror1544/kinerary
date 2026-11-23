@@ -356,8 +356,10 @@ The trip site's own code does not change: it compares the key it is sent with it
 records the kind its trip holds, `runtime_routes.trip_key` (`shared`, the default, or
 `derived`; migration `20261116140000_runtime_route_trip_key.sql`), and both route
 lookups return it as `tripKey` (a kind, never a key; only behind the exchange key).
-With the master set, for the four calls the gateway makes to a trip (the launch's
-`session`, `participants`, `participants/<name>` and the group line's `plan-changes`):
+With the master set, for the calls the gateway makes to a trip (the launch's
+`session`, `participants`, `participants/<name>`, the group line's `plan-changes`, and the
+member sign-in's participant list `GET participants`, `participants/adopt` and
+`participants/release`, docs/specs/sprint-9/x-member-sign-in.md):
 
 | route's `tripKey` | sent to the trip |
 |---|---|

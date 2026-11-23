@@ -850,6 +850,17 @@ function authRequired(req, res, next) {
     // #523: a SECONDARY organizer (added by the main organizer with a trip link) is an organizer of THIS trip only. The mark
     // exists only on a verified managed session whose binding is on file for this trip; it is read, never taken from a request.
     if (controlPlaneAuth.isSecondaryOrganizerPayload(payload)) req.user.secondaryOrganizer = true;
+    // A session that came from a GROUP CLAIM (control-plane-auth.js): read from the stored binding, once per request.
+    if (controlPlaneAuth.isClaimedSessionPayload(payload)) req.user.claimedSession = true;
+    // A managed session whose only way in is the control plane's: a group claim, an invite-bound member or a SECONDARY organizer
+    // (S2c). They mint no site credential (password, Google link): removal at the control plane would never reach it. Same
+    // source, same rule: read from the stored binding on this request. `claimedSession` stays the narrower, claim-only mark (no
+    // assistant list, no consent, the allow-listed /api/auth/me); `inviteBinding` is the invite-only one (below).
+    if (controlPlaneAuth.isManagedSignInPayload(payload)) req.user.managedSignIn = true;
+    // An invite-bound member: { userId, inviteId } of its binding. It manages only the assistant connections approved under it
+    // (trip-mcp) and gets the allow-listed /api/auth/me.
+    const inviteBinding = controlPlaneAuth.inviteBindingOf(payload);
+    if (inviteBinding) req.user.inviteBinding = inviteBinding;
     next();
   } catch {
     return res.status(401).json({ error: 'invalid_token' });
@@ -1261,6 +1272,32 @@ app.post('/api/ui-settings/hero', organizerOrAgentRequired, heroUpload.single('h
 });
 
 journey.registerRoutes(app, { authRequired, organizerOrAgentRequired, internal: controlPlaneAuth.internal });
+
+// Who is on this trip, for the control plane's group sign-in (docs/specs/sprint-9/x-member-sign-in.md, slice S1): the
+// control plane offers a Telegram person in the trip's group the travellers nobody has claimed, and needs to know
+// who they are and whether the site calls them a plain member. Behind `internal` and nothing else: the dedicated
+// exchange key the gateway holds, the trip id header, the identity manifest. A family member's JWT, the agent key and
+// the Hermes key all get 401, exactly as for the sibling routes in control-plane-auth.js.
+//
+// It does NOT go through sanitizeConfig() and is not a view of the config: it names three fields, written out here, taken
+// from the allow-listed participants (`publicConfig`, as the public roster does), and nothing else of a participant (no
+// telegram_id, no color, no family, no needs) can reach the response. `role`
+// is 'organizer' for every configured organizer and 'member' for everyone else; the control plane offers only
+// 'member' and treats any other word, or none, as not offered, so a participant this list cannot classify is never
+// the one it gets wrong.
+app.get('/api/internal/control-plane/participants', controlPlaneAuth.internal, (req, res) => {
+  const organizers = normalizeOrganizers(TRIP_CONFIG.agent);
+  // From the ALLOW-LISTED participants (publicConfig, the source /api/config/roster serves from), so a future change to what the
+  // allow-list lets through applies here too; `role` is derived below and reaches only the exchange-key holder.
+  const participants = (publicConfig(TRIP_CONFIG).participants || [])
+    .filter(p => p && typeof p.username === 'string' && getUser(p.username))
+    .map(p => ({
+      username: p.username,
+      displayName: typeof p.name === 'string' && p.name.trim() ? p.name.trim() : p.username,
+      role: organizers.includes(p.username) ? 'organizer' : 'member',
+    }));
+  res.json({ participants });
+});
 // GET /api/stops and the stop writes: organizer or agent only — provenance,
 // conflicts and history are never served to a member.
 tripStructure.registerRoutes(app, { organizerOrAgentRequired });
@@ -1274,6 +1311,8 @@ require('./companion-control').registerCompanionControl({ app, authRequired, org
 try { require('./trip-mcp').registerTripMcp({
   app, db, jwt, jwtSecret: JWT_SECRET, jwtSecretIsDefault: JWT_SECRET === 'trip-dev-secret-change-me',
   validManagedPayload: payload => controlPlaneAuth.validManagedPayload(payload),
+  claimedPayload: payload => controlPlaneAuth.isClaimedSessionPayload(payload),
+  bindingOf: payload => controlPlaneAuth.inviteBindingOf(payload),
   organizers: () => normalizeOrganizers(TRIP_CONFIG.agent),
   userExists: username => Boolean(getUser(username)) && (TRIP_CONFIG.participants || []).some(p => p.username === username),
   // Never the raw config: whatever the connector says about the trip is what
@@ -1711,6 +1750,7 @@ function verifiedManagedClaim(req) {
   } catch { return null; }
 }
 
+const CLAIMED_ME_FIELDS = ['username', 'name', 'name_en', 'family', 'color', 'avatar_file'];
 app.get('/api/auth/me', authRequired, (req, res) => {
   // Per person and per session (it now carries their dashboard address): no cache, shared or private, may keep it.
   res.setHeader('Cache-Control', 'no-store');
@@ -1720,7 +1760,21 @@ app.get('/api/auth/me', authRequired, (req, res) => {
   const secondary = Boolean(req.user.secondaryOrganizer);
   // `is_secondary_organizer` (#523) tells the page which organizer controls to offer: a secondary organizer gets the organizer
   // view without the ones that manage people (adding organizers lives on the dashboard, for the main organizer only).
-  const body = { ...user, is_organizer: organizers.includes(user.username) || secondary, ...(secondary ? { is_secondary_organizer: true } : {}) };
+  // A session that came from a group claim OR a personal invite (an invite-bound member) is told who the traveller is, not the
+  // traveller's third-party identities:
+  // the Google subject, address and picture, the raw Telegram id and the removal stamp stay with the real person.
+  // That is an ALLOW-LIST (it was "the row minus five named columns", so a column added to `users` tomorrow would have
+  // reached a claimant by default): the fields the pages draw (trip-web's CurrentUser, the classic page's currentUser) and
+  // nothing else. A column nobody names here is never served to a claimed or invite-bound session; `is_organizer` and the dashboard
+  // address are added below, as for every session.
+  const claimedView = {};
+  for (const field of CLAIMED_ME_FIELDS) if (user[field] !== undefined) claimedView[field] = user[field];
+  const body = { ...(req.user.claimedSession || req.user.inviteBinding ? claimedView : user), is_organizer: organizers.includes(user.username) || secondary, ...(secondary ? { is_secondary_organizer: true } : {}) };
+  // `sign_in_managed` tells the page the person's sign-in lives with their Kinerary account (a group claim or a personal
+  // invite), so the site's own password and Google-link controls, which the routes refuse them, are not drawn. Set here, from
+  // the verified session, for exactly those sessions; absent for everyone else. Not config, not a column: never in
+  // sanitizeConfig or CLAIMED_ME_FIELDS.
+  if (req.user.managedSignIn) body.sign_in_managed = true;
   // Present only for an organizer. authRequired is not an organizer check and
   // carries no claim, so the person is checked again here. Through the dashboard
   // the managed session is verified (signature, binding, active participant,
@@ -1747,7 +1801,19 @@ app.delete('/api/auth/avatar', authRequired, (req, res) => {
   res.json({ ok: true });
 });
 
+// A managed session whose only way in is the control plane's (a group claim, a personal invite's binding, or a secondary
+// organizer) mints no site credential: it may not set a password or link or unlink Google, because each outlives the binding
+// and nothing the control plane does on removal, leave-the-group or Unlink would reach it (such a person already has a portal
+// login, and removal ends it). A group claim additionally may not approve an MCP connection (trip-mcp); an invited member
+// may, and removal revokes what they approved (revokeBindingGrants). Same refusal for all three routes.
+function refuseClaimedSession(req, res) {
+  if (!req.user?.managedSignIn) return false;
+  res.status(403).json({ error: 'claimed_session_cannot_change_credentials' });
+  return true;
+}
+
 app.put('/api/auth/password', authRequired, async (req, res) => {
+  if (refuseClaimedSession(req, res)) return;
   const { password } = req.body || {};
   if (!password || password.length < 4) return res.status(400).json({ error: 'password_too_short' });
   const hash = await bcrypt.hash(password, 10);
@@ -1759,6 +1825,7 @@ app.put('/api/auth/password', authRequired, async (req, res) => {
 // This never creates accounts — it only links a Google identity onto a
 // username the trip admin already seeded in trip.config.json.
 app.put('/api/auth/google-link', authRequired, async (req, res) => {
+  if (refuseClaimedSession(req, res)) return;
   if (!googleClient) return res.status(503).json({ error: 'google_not_configured' });
   const { idToken } = req.body || {};
   if (!idToken) return res.status(400).json({ error: 'missing_id_token' });
@@ -1777,6 +1844,7 @@ app.put('/api/auth/google-link', authRequired, async (req, res) => {
 });
 
 app.delete('/api/auth/google-link', authRequired, (req, res) => {
+  if (refuseClaimedSession(req, res)) return;
   db.prepare('UPDATE users SET google_sub = NULL, google_email = NULL, google_picture = NULL WHERE username = ?').run(req.user.username);
   res.json({ ok: true });
 });

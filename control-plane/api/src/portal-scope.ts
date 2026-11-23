@@ -84,6 +84,14 @@ export const PORTAL_SCOPE_POLICY: Readonly<Record<string, RouteScope>> = Object.
   "POST /v1/auth/password/forgot": "open",
   "POST /v1/auth/password/reset": "open",
   "POST /v1/auth/telegram-mini-app": "open",
+  // "Send me a sign-in link" (docs/specs/sprint-9/x-member-sign-in.md, S3). The request and the redemption read no session: the
+  // link's token is the whole authority. The password step belongs to the session the redemption minted and CHANGES the account,
+  // so a Telegram-scoped session (a group claimant's) is refused it: a claimed account is never given a credential.
+  "POST /v1/auth/sign-in-link": "open",
+  "POST /v1/auth/sign-in-link/redeem": "open",
+  "POST /v1/auth/sign-in-link/password": "account",
+  // Group sign-in (docs/specs/sprint-9/x-member-sign-in.md, S1). The signed initData is the whole authority; no session is read.
+  "POST /v1/mini-app/claim": "open",
   // Sign in with Google (ID token). Never reads the session cookie: the signed token is the whole authority.
   "POST /v1/auth/google": "open",
   // The single-use nonce for it: sets a random cookie and returns its hash. Reads no session.
@@ -95,6 +103,17 @@ export const PORTAL_SCOPE_POLICY: Readonly<Record<string, RouteScope>> = Object.
   // exactly like consume above. Added at integration: the two lines were built apart.
   "POST /internal/runtime-sessions/check": "open",
   "GET /internal/runtime-routes/:tripId": "open",
+  // The runtime gateway's hop for an organizer's TRIP-SITE session (docs/specs/sprint-9/x-member-sign-in.md, A5). Authenticated by the
+  // exchange key and never reads the portal cookie, so `open` here is only "no portal session is read". The handler holds the person to
+  // the SAME rows as the portal routes: it loads the session's scope and asks `scopeDecision` for "GET /v1/trips/:id/member-claims"
+  // (`trip`) or "DELETE /v1/trips/:id/member-claims/:claimId" (`account`), so a Telegram-minted organizer session lists but never releases.
+  "POST /internal/member-claims/list": "open",
+  "POST /internal/member-claims/release": "open",
+  // The same hop for "Send a personal invite" (S2, AC-11). Key-authenticated, reads no portal cookie. `create` asks `scopeDecision` for
+  // "POST /v1/trips/:id/site-invites" (`account`, below), so a Telegram-minted organizer session is refused here as it is on the
+  // portal route; `available` is only the question "is this person this trip's organizer", which the button needs to be drawn.
+  "POST /internal/member-invites/available": "open",
+  "POST /internal/member-invites/create": "open",
   // The gateway's host mode asks which trip a Host header names. Exchange-key authenticated, no cookie read.
   "GET /internal/runtime-routes/by-host/:host": "open",
 
@@ -117,6 +136,10 @@ export const PORTAL_SCOPE_POLICY: Readonly<Record<string, RouteScope>> = Object.
 
   "GET /v1/trips/:id": "trip",
   "GET /v1/trips/:id/interview-link": "trip",
+  // The organizers' list of group claims. The handler itself answers 404 to anyone who is not an organizer with dashboard access.
+  "GET /v1/trips/:id/member-claims": "trip",
+  // Releasing a claim takes a way in from another person, like removing a member: a password or Google sign-in only.
+  "DELETE /v1/trips/:id/member-claims/:claimId": "account",
   // These three MINT a way into the account: an interview link or a Telegram link redeemed by
   // another Telegram account becomes a link of its own, one that outlives the Unlink of the
   // session's own account (boundary review round 2, M1). They need a password or Google sign-in.
@@ -135,6 +158,13 @@ export const PORTAL_SCOPE_POLICY: Readonly<Record<string, RouteScope>> = Object.
   // A site invite is a join URL that anyone can redeem anonymously with a password: it makes an account
   // that outlives the Unlink of the session that minted it (round 3, MF1). Revoking an invite and removing
   // a member take access away from other people; a forwardee must not do either. All three need a password.
+  //
+  // RECORDED EXCEPTION (owner's decision, Dror, 2026-11-22): the Telegram bot's `/invite <name>` (relay/invite-command.ts) lets an
+  // organizer PROVEN BY TELEGRAM create exactly this kind of invite, without a password session. It does not go through this route or
+  // this policy, so nothing in this table changes; it is a named exception to the rule above, bounded: the organizer's own PRIVATE chat
+  // only, an organizer of that trip WITH dashboard access, 5 invites per organizer per trip per hour, EXISTING travellers only (it binds a
+  // participant the trip site already lists, never creates one), and the link is delivered only to that chat. If this row is ever
+  // loosened or tightened, read that file's header too: the two are one decision.
   "POST /v1/trips/:id/site-invites": "account",
   "DELETE /v1/trips/:id/site-invites/:inviteId": "account",
   "DELETE /v1/trips/:id/members/:membershipId": "account",

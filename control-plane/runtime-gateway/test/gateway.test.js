@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 let upstream, controlPlane, gateway;
 let upstreamOrigin, gatewayOrigin;
 let proxiedAuthorization;
+let participantListCalls = 0, participantListHeaders;
+const bindingCalls = [];
 let eventStreamClosed = false;
 const sessionBodies = [];
 const consumed = new Set();
@@ -16,7 +18,16 @@ const outOfScopeTrips = new Set(); // trips a Telegram-scoped session no longer 
 let lastCheck;
 let currentRole = "owner", hangControlPlane = false;
 let checkCalls = 0, checkDown = false;
+// The control plane's answer to the organizers' claims hop, and what it was asked.
+const claimsCalls = [];
+const CLAIM = { claimId: "tpc_0123456789abcdef", travellerName: "Dana Levi", telegramFirstName: "Maya", telegramUsername: "maya_tg", via: "group_membership", claimedAt: "2026-11-20T08:00:00.000Z", lastSignedInAt: null };
+let claimsAnswer = { status: 200, list: { claims: [CLAIM] }, release: { status: "released" }, hang: false };
+// The control plane's answer to the personal-invite hop, and what it was asked.
+const invitesCalls = [];
+const INVITE = { id: "invite_0123456789abcdef", joinUrl: "https://app.example.test/join#token=tok_secret_value", displayName: "Dana Levi", expiresAt: "2026-11-28T08:00:00.000Z" };
+let invitesAnswer = { status: 200, available: { available: true }, createStatus: 201, create: INVITE, hang: false };
 const PORTAL = "https://app.example.test";
+const RUNTIME = "https://runtime.example.test";
 // What a browser sends for a page navigation (undici would otherwise say sec-fetch-mode: cors).
 const NAV = { "sec-fetch-mode": "navigate", "sec-fetch-dest": "document", accept: "text/html" };
 
@@ -48,6 +59,17 @@ before(async () => {
       sessionBodies.push(await body(req));
       res.setHeader("content-type", "application/json");
       return res.end(JSON.stringify({ token: "runtime-jwt" }));
+    }
+    if (req.url === "/api/internal/control-plane/participants/adopt" || req.url === "/api/internal/control-plane/participants/release") {
+      bindingCalls.push({ url: req.url, method: req.method, key: req.headers["x-api-key"], body: await body(req) });
+      res.setHeader("content-type", "application/json");
+      return res.end(JSON.stringify({ ok: true }));
+    }
+    if (req.url === "/api/internal/control-plane/participants") {
+      participantListCalls += 1;
+      participantListHeaders = { "x-api-key": req.headers["x-api-key"], "x-control-plane-trip-id": req.headers["x-control-plane-trip-id"] };
+      res.setHeader("content-type", "application/json");
+      return res.end(JSON.stringify({ participants: [{ username: "bob", displayName: "Bob", role: "member" }] }));
     }
     if (req.url === "/api/internal/control-plane/participants/bob") {
       assert.equal(req.headers["x-api-key"], "exchange-key");
@@ -92,6 +114,18 @@ before(async () => {
       if (checkDown) { res.statusCode = 500; return res.end("{}"); }
       if (revokedUsers.has(payload.userId) || revokedSessions.has(payload.sessionId) || outOfScopeTrips.has(payload.tripId)) { res.statusCode = 401; return res.end(JSON.stringify({ error: "SESSION_REVOKED" })); }
       return res.end(JSON.stringify({ live: true }));
+    }
+    if (req.url === "/internal/member-claims/list" || req.url === "/internal/member-claims/release") {
+      claimsCalls.push({ url: req.url, method: req.method, headers: req.headers, body: await body(req) });
+      if (claimsAnswer.hang) return; // never answers
+      res.statusCode = claimsAnswer.status;
+      return res.end(JSON.stringify(req.url.endsWith("/list") ? claimsAnswer.list : claimsAnswer.release));
+    }
+    if (req.url === "/internal/member-invites/available" || req.url === "/internal/member-invites/create") {
+      invitesCalls.push({ url: req.url, method: req.method, headers: req.headers, body: await body(req) });
+      if (invitesAnswer.hang) return; // never answers
+      res.statusCode = req.url.endsWith("/create") ? invitesAnswer.createStatus : invitesAnswer.status;
+      return res.end(JSON.stringify(req.url.endsWith("/create") ? invitesAnswer.create : invitesAnswer.available));
     }
     if (req.url === "/internal/runtime-routes/trip_abcdefgh") return res.end(JSON.stringify({ routeRef: "route_abcdefgh", upstreamOrigin, upstreamBasePath: "" }));
     res.statusCode = 404; res.end(JSON.stringify({ error: "missing" }));
@@ -407,6 +441,42 @@ test("rejects trip paths without a valid gateway session", async () => {
   assert.equal(response.status, 401);
 });
 
+test("forwards the participant list for group sign-in, behind the same key, with the trip's id as the trip site expects it", async () => {
+  const response = await fetch(`${gatewayOrigin}/internal/t/trip_abcdefgh/participants`, { headers: { "x-api-key": "exchange-key" } });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { participants: [{ username: "bob", displayName: "Bob", role: "member" }] });
+  assert.deepEqual(participantListHeaders, { "x-api-key": "exchange-key", "x-control-plane-trip-id": "trip_abcdefgh" });
+});
+
+test("the participant list is refused without the key, with a wrong key, and for a malformed trip id; nothing is forwarded", async () => {
+  const before = participantListCalls;
+  for (const headers of [{}, { "x-api-key": "wrong" }, { "x-api-key": "" }]) {
+    const response = await fetch(`${gatewayOrigin}/internal/t/trip_abcdefgh/participants`, { headers });
+    assert.equal(response.status, 401);
+    assert.deepEqual(await response.json(), { error: "AUTHENTICATION_REQUIRED" });
+  }
+  const malformed = await fetch(`${gatewayOrigin}/internal/t/not-a-trip/participants`, { headers: { "x-api-key": "exchange-key" } });
+  assert.equal(malformed.status, 404);
+  assert.equal(participantListCalls, before, "no request reached the trip site");
+  // the cookie-bearing trip surface does not serve it either
+  const viaTrip = await fetch(`${gatewayOrigin}/t/trip_abcdefgh/api/internal/control-plane/participants`, { headers: { "x-api-key": "exchange-key" } });
+  assert.equal(viaTrip.status, 404);
+});
+
+test("adopt and release (a claim's binding on the trip site) are forwarded with the gateway's own key and the body untouched, and only behind the key", async () => {
+  const body = { tripId: "trip_abcdefgh", userId: "user_abcdefgh", runtimeUsername: "bob" };
+  for (const action of ["adopt", "release"]) {
+    const response = await fetch(`${gatewayOrigin}/internal/t/trip_abcdefgh/participants/${action}`, { method: "POST", headers: { "x-api-key": "exchange-key", "content-type": "application/json" }, body: JSON.stringify(body) });
+    assert.equal(response.status, 200);
+    assert.deepEqual(bindingCalls.at(-1), { url: `/api/internal/control-plane/participants/${action}`, method: "POST", key: "exchange-key", body });
+    const noKey = await fetch(`${gatewayOrigin}/internal/t/trip_abcdefgh/participants/${action}`, { method: "POST", headers: { "x-api-key": "wrong", "content-type": "application/json" }, body: JSON.stringify(body) });
+    assert.equal(noKey.status, 401);
+    const otherTrip = await fetch(`${gatewayOrigin}/internal/t/trip_abcdefgh/participants/${action}`, { method: "POST", headers: { "x-api-key": "exchange-key", "content-type": "application/json" }, body: JSON.stringify({ ...body, tripId: "trip_someoneelse1" }) });
+    assert.equal(otherTrip.status, 400);
+  }
+  assert.equal(bindingCalls.length, 2, "only the two well-formed, keyed requests reached the trip site");
+});
+
 test("forwards internal participant existence checks", async () => {
   const response = await fetch(`${gatewayOrigin}/internal/t/trip_abcdefgh/participants/bob`, { headers: { "x-api-key": "exchange-key" } });
   assert.equal(response.status, 200);
@@ -437,4 +507,363 @@ test("streams authenticated events without buffering, scopes the cookie, and clo
     for (let attempt = 0; attempt < 100 && !eventStreamClosed; attempt++) await new Promise(resolve => setTimeout(resolve, 10));
     assert.equal(eventStreamClosed, true);
   } finally { clearTimeout(timeout); controller.abort(); }
+});
+
+// ── The organizers' claims hop: trip-web -> gateway -> control plane (spec A5) ─────────────────────────────────────
+
+const SAME_ORIGIN_DELETE = { origin: RUNTIME, "x-kinerary-member-claims": "1" };
+async function organizerCookie(token = "valid-grant") { return (await formLaunch(token)).headers.get("set-cookie").split(";")[0]; }
+const claimsGet = (cookie, headers = {}, path = "/t/trip_abcdefgh/__member-claims") => fetch(`${gatewayOrigin}${path}`, { headers: { ...(cookie ? { cookie } : {}), ...headers } });
+const claimsDelete = (cookie, claimId = CLAIM.claimId, headers = SAME_ORIGIN_DELETE) => fetch(`${gatewayOrigin}/t/trip_abcdefgh/__member-claims/${claimId}`, { method: "DELETE", headers: { ...(cookie ? { cookie } : {}), ...headers } });
+function resetClaims() { claimsCalls.length = 0; claimsAnswer = { status: 200, list: { claims: [CLAIM] }, release: { status: "released" }, hang: false }; }
+
+test("claims list: asks the control plane with the gateway's own key and only what its sealed cookie says, and returns only the fields the page shows", async () => {
+  resetClaims();
+  const cookie = await organizerCookie("once-claims-list");
+  claimsAnswer.list = { claims: [{ ...CLAIM, secret: "nope", runtimeUsername: "dl17" }, { ...CLAIM, claimId: "not-a-claim" }], extra: "nope" };
+  const response = await claimsGet(cookie);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.deepEqual(await response.json(), { claims: [CLAIM] }, "one well-formed row, no extra fields, no extra keys");
+  assert.equal(claimsCalls.length, 1);
+  assert.equal(claimsCalls[0].url, "/internal/member-claims/list");
+  assert.equal(claimsCalls[0].method, "POST");
+  assert.equal(claimsCalls[0].headers["x-api-key"], "exchange-key");
+  assert.deepEqual(claimsCalls[0].body, { tripId: "trip_abcdefgh", userId: "user_abcdefgh", sessionId: "wsess_devicea0001" }, "trip, user and portal session from the sealed cookie, nothing else");
+});
+
+test("claims list: nothing the browser supplies is trusted or forwarded (key, user id, cookie, query, body)", async () => {
+  resetClaims();
+  const cookie = await organizerCookie("once-claims-forge");
+  const response = await fetch(`${gatewayOrigin}/t/trip_abcdefgh/__member-claims?userId=user_attacker&tripId=trip_otherxyz1&sessionId=wsess_x`, {
+    headers: {
+      cookie: `${cookie}; kit_session=portal-cookie`, "x-api-key": "attacker-key", "x-user-id": "user_attacker", "x-trip-id": "trip_otherxyz1",
+      authorization: "Bearer attacker", "x-forwarded-user": "user_attacker",
+    },
+  });
+  assert.equal(response.status, 200);
+  assert.equal(claimsCalls.length, 1);
+  assert.equal(claimsCalls[0].headers["x-api-key"], "exchange-key", "the control plane saw the gateway's key, never the browser's");
+  assert.equal(claimsCalls[0].headers["x-user-id"], undefined);
+  assert.equal(claimsCalls[0].headers.authorization, undefined);
+  assert.equal(claimsCalls[0].headers.cookie, undefined, "no browser cookie travels to the control plane");
+  assert.deepEqual(claimsCalls[0].body, { tripId: "trip_abcdefgh", userId: "user_abcdefgh", sessionId: "wsess_devicea0001" });
+});
+
+test("claims list: no session, a garbled cookie, another trip's cookie and an ended session are the gateway's ordinary 401, and the control plane is never asked", async () => {
+  resetClaims();
+  const good = await organizerCookie("once-claims-401");
+  const [name, value] = good.split("=");
+  const other = `__Host-kit_rt_trip_otherxyz1=${value}`; // this trip's sealed session presented under another trip's cookie name
+  for (const [label, cookie] of [["none", null], ["garbled", `${name}=garbage`], ["a cookie for another trip", other], ["tampered", `${name}=${value.slice(0, -4)}AAAA`]]) {
+    // This trip's own sealed session, planted under another trip's cookie name and aimed at that trip, must not open it.
+    const response = await claimsGet(cookie, {}, cookie === other ? "/t/trip_otherxyz1/__member-claims" : undefined);
+    assert.equal(response.status, 401, label);
+    assert.deepEqual(await response.json(), { error: "AUTHENTICATION_REQUIRED" }, label);
+  }
+  // A page navigation is not redirected to the portal either: this is a data route.
+  const nav = await rawGet("/t/trip_abcdefgh/__member-claims", { ...NAV });
+  assert.equal(nav.status, 401);
+  assert.equal(claimsCalls.length, 0, "refused before the control plane was asked");
+  revokedSessions.add("wsess_devicea0001");
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal((await claimsGet(good)).status, 401, "a session the portal ended is not an organizer here either");
+    assert.equal(claimsCalls.length, 0);
+  } finally { revokedSessions.delete("wsess_devicea0001"); }
+});
+
+test("claims: whoever the control plane does not accept (a member, a claimed member, a stranger, another trip's organizer) gets its one 404, with no reason", async () => {
+  resetClaims();
+  const cookie = await organizerCookie("once-claims-404");
+  claimsAnswer = { ...claimsAnswer, status: 404, list: { error: "NOT_FOUND", why: "x" }, release: { error: "NOT_FOUND" } };
+  const listed = await claimsGet(cookie);
+  assert.equal(listed.status, 404);
+  assert.deepEqual(await listed.json(), { error: "NOT_FOUND" });
+  const released = await claimsDelete(cookie);
+  assert.equal(released.status, 404);
+  assert.deepEqual(await released.json(), { error: "NOT_FOUND" });
+});
+
+test("claims: an outage, a refusal of the key, a hung control plane and a malformed answer are one 503 that says nothing, never a 200", async () => {
+  resetClaims();
+  const cookie = await organizerCookie("once-claims-503");
+  for (const status of [500, 502, 401]) {
+    claimsAnswer = { status, list: { error: "x" }, release: { error: "x" }, hang: false };
+    const response = await claimsGet(cookie);
+    assert.equal(response.status, 503, String(status));
+    assert.deepEqual(await response.json(), { error: "RUNTIME_UNAVAILABLE" });
+  }
+  claimsAnswer = { status: 200, list: { claims: "not-a-list" }, release: {}, hang: false };
+  assert.equal((await claimsGet(cookie)).status, 503, "a 200 without a list is not an empty list");
+  assert.equal((await claimsDelete(cookie)).status, 503, "a 200 that does not say released is not a release");
+  claimsAnswer = { ...claimsAnswer, hang: true };
+  assert.equal((await claimsGet(cookie)).status, 503, "a hung control plane fails within the timeout");
+});
+
+test("claims release: forwards ONE release for the claim in the path, with the gateway's key and the cookie's identity", async () => {
+  resetClaims();
+  const cookie = await organizerCookie("once-claims-release");
+  const response = await claimsDelete(cookie, CLAIM.claimId, { ...SAME_ORIGIN_DELETE, "x-api-key": "attacker-key", "x-user-id": "user_attacker" });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { status: "released" });
+  assert.equal(claimsCalls.length, 1);
+  assert.equal(claimsCalls[0].url, "/internal/member-claims/release");
+  assert.equal(claimsCalls[0].headers["x-api-key"], "exchange-key");
+  assert.deepEqual(claimsCalls[0].body, { tripId: "trip_abcdefgh", userId: "user_abcdefgh", sessionId: "wsess_devicea0001", claimId: CLAIM.claimId });
+});
+
+test("claims release: a Telegram-minted organizer session is told to use the dashboard (the control plane's 403), and nothing else is passed on", async () => {
+  resetClaims();
+  const cookie = await organizerCookie("once-claims-403");
+  claimsAnswer = { ...claimsAnswer, status: 403, release: { error: "ACCOUNT_SIGN_IN_REQUIRED", message: "Sign in with your password to do this.", leak: "x" } };
+  const response = await claimsDelete(cookie);
+  assert.equal(response.status, 403);
+  assert.deepEqual(await response.json(), { error: "ACCOUNT_SIGN_IN_REQUIRED" });
+});
+
+test("claims release: refused without this origin and the custom header, and with a claim id that is not shaped like one, before the control plane is asked", async () => {
+  resetClaims();
+  const cookie = await organizerCookie("once-claims-csrf");
+  for (const headers of [{}, { origin: RUNTIME }, { "x-kinerary-member-claims": "1" }, { origin: PORTAL, "x-kinerary-member-claims": "1" }, { origin: "null", "x-kinerary-member-claims": "1" }, { origin: "https://evil.example", "x-kinerary-member-claims": "1" }]) {
+    const response = await claimsDelete(cookie, CLAIM.claimId, headers);
+    assert.equal(response.status, 403, JSON.stringify(headers));
+    assert.deepEqual(await response.json(), { error: "ORIGIN_REJECTED" });
+  }
+  for (const bad of ["x", "tpc_", "tpc_..%2F..", "pick_0123456789abcdef", "tpc_0123456789abcdef%00"]) {
+    assert.equal((await claimsDelete(cookie, bad)).status, 404, bad);
+  }
+  assert.equal((await claimsDelete(null)).status, 401, "no session: the ordinary 401");
+  assert.equal(claimsCalls.length, 0, "nothing reached the control plane");
+});
+
+test("the claims paths accept only their own verbs and are never proxied to the trip site", async () => {
+  resetClaims();
+  const cookie = await organizerCookie("once-claims-verbs");
+  const before = proxiedAuthorization;
+  proxiedAuthorization = undefined;
+  for (const [method, path] of [["POST", "/t/trip_abcdefgh/__member-claims"], ["PUT", "/t/trip_abcdefgh/__member-claims"], ["GET", `/t/trip_abcdefgh/__member-claims/${CLAIM.claimId}`], ["DELETE", "/t/trip_abcdefgh/__member-claims"], ["GET", "/t/trip_abcdefgh/__member-claims/a/b"]]) {
+    const response = await fetch(`${gatewayOrigin}${path}`, { method, headers: { cookie, ...SAME_ORIGIN_DELETE } });
+    assert.equal(response.status, 404, `${method} ${path}`);
+  }
+  assert.equal(proxiedAuthorization, undefined, "the trip site never saw these");
+  assert.equal(claimsCalls.length, 0);
+  proxiedAuthorization = before;
+});
+
+test("claims: nothing is logged by the gateway for these calls", async () => {
+  resetClaims();
+  const cookie = await organizerCookie("once-claims-log");
+  const logged = [];
+  const originals = ["log", "error", "warn", "info"].map((name) => [name, console[name]]);
+  for (const [name] of originals) console[name] = (...args) => logged.push(args.join(" "));
+  try { await claimsGet(cookie); await claimsDelete(cookie); } finally { for (const [name, fn] of originals) console[name] = fn; }
+  assert.equal(logged.join("\n").includes(CLAIM.claimId), false);
+  assert.equal(logged.join("\n").includes("user_abcdefgh"), false);
+});
+
+// ── The personal-invite hop: trip-web -> gateway -> control plane (spec S2, AC-11) ───────────────────────────────────
+
+const INVITE_HEADERS = { origin: RUNTIME, "x-kinerary-member-invites": "1" };
+const invitesProbe = (cookie, headers = {}) => fetch(`${gatewayOrigin}/t/trip_abcdefgh/__member-invites`, { headers: { ...(cookie ? { cookie } : {}), ...headers } });
+const invitesCreate = (cookie, username = "dl17", headers = INVITE_HEADERS, path) => fetch(`${gatewayOrigin}${path ?? `/t/trip_abcdefgh/__member-invites/${username}`}`, { method: "POST", headers: { ...(cookie ? { cookie } : {}), ...headers } });
+function resetInvites() { invitesCalls.length = 0; invitesAnswer = { status: 200, available: { available: true }, createStatus: 201, create: INVITE, hang: false }; }
+
+test("invites create: asks the control plane with the gateway's key, the cookie's identity and the traveller in the path, and returns only the link, the name and the expiry", async () => {
+  resetInvites();
+  const cookie = await organizerCookie("once-invites-create");
+  invitesAnswer.create = { ...INVITE, secret: "nope" };
+  const response = await invitesCreate(cookie, "dl17", { ...INVITE_HEADERS, "x-api-key": "attacker-key", "x-user-id": "user_attacker", authorization: "Bearer attacker" });
+  assert.equal(response.status, 201);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.deepEqual(await response.json(), { joinUrl: INVITE.joinUrl, displayName: INVITE.displayName, expiresAt: INVITE.expiresAt }, "no invite id, no extra field");
+  assert.equal(invitesCalls.length, 1);
+  assert.equal(invitesCalls[0].url, "/internal/member-invites/create");
+  assert.equal(invitesCalls[0].method, "POST");
+  assert.equal(invitesCalls[0].headers["x-api-key"], "exchange-key", "the control plane saw the gateway's key, never the browser's");
+  assert.equal(invitesCalls[0].headers["x-user-id"], undefined);
+  assert.equal(invitesCalls[0].headers.authorization, undefined);
+  assert.equal(invitesCalls[0].headers.cookie, undefined, "no browser cookie travels to the control plane");
+  assert.deepEqual(invitesCalls[0].body, { tripId: "trip_abcdefgh", userId: "user_abcdefgh", sessionId: "wsess_devicea0001", runtimeUsername: "dl17" });
+});
+
+test("invites: a body or a query from the browser changes nothing about whom the control plane is asked about", async () => {
+  resetInvites();
+  const cookie = await organizerCookie("once-invites-forge");
+  const response = await fetch(`${gatewayOrigin}/t/trip_abcdefgh/__member-invites/dl17?userId=user_attacker&tripId=trip_otherxyz1&sessionId=wsess_x&runtimeUsername=og01`, {
+    method: "POST", headers: { cookie, ...INVITE_HEADERS, "content-type": "application/json" }, body: JSON.stringify({ userId: "user_attacker", tripId: "trip_otherxyz1", runtimeUsername: "og01", role: "owner" }),
+  });
+  assert.equal(response.status, 201);
+  assert.deepEqual(invitesCalls[0].body, { tripId: "trip_abcdefgh", userId: "user_abcdefgh", sessionId: "wsess_devicea0001", runtimeUsername: "dl17" });
+});
+
+test("invites probe: a GET asks the control plane whether this person is the trip's organizer, and answers {available: true} only", async () => {
+  resetInvites();
+  const cookie = await organizerCookie("once-invites-probe");
+  invitesAnswer.available = { available: true, extra: "nope" };
+  const response = await invitesProbe(cookie);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { available: true });
+  assert.equal(invitesCalls[0].url, "/internal/member-invites/available");
+  assert.deepEqual(invitesCalls[0].body, { tripId: "trip_abcdefgh", userId: "user_abcdefgh", sessionId: "wsess_devicea0001" });
+  invitesAnswer.available = { available: "yes" };
+  assert.equal((await invitesProbe(cookie)).status, 503, "anything but available: true is not an answer");
+});
+
+test("invites: no session, a garbled cookie, another trip's cookie and an ended session are the gateway's ordinary 401, and the control plane is never asked", async () => {
+  resetInvites();
+  const good = await organizerCookie("once-invites-401");
+  const [name, value] = good.split("=");
+  for (const [label, cookie] of [["none", null], ["garbled", `${name}=garbage`], ["tampered", `${name}=${value.slice(0, -4)}AAAA`]]) {
+    const created = await invitesCreate(cookie);
+    assert.equal(created.status, 401, label);
+    assert.deepEqual(await created.json(), { error: "AUTHENTICATION_REQUIRED" }, label);
+    assert.equal((await invitesProbe(cookie)).status, 401, label);
+  }
+  assert.equal((await rawGet("/t/trip_abcdefgh/__member-invites", { ...NAV })).status, 401, "a navigation is not redirected: this is a data route");
+  assert.equal(invitesCalls.length, 0, "refused before the control plane was asked");
+  revokedSessions.add("wsess_devicea0001");
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal((await invitesCreate(good)).status, 401, "a session the portal ended is not an organizer here either");
+    assert.equal(invitesCalls.length, 0);
+  } finally { revokedSessions.delete("wsess_devicea0001"); }
+});
+
+test("invites: whoever the control plane does not accept gets its one 404 with no reason; a Telegram-minted organizer session is told to use the dashboard", async () => {
+  resetInvites();
+  const cookie = await organizerCookie("once-invites-404");
+  invitesAnswer = { ...invitesAnswer, status: 404, available: { error: "NOT_FOUND", why: "x" }, createStatus: 404, create: { error: "NOT_FOUND", why: "x" } };
+  for (const response of [await invitesCreate(cookie), await invitesProbe(cookie)]) {
+    assert.equal(response.status, 404);
+    assert.deepEqual(await response.json(), { error: "NOT_FOUND" });
+  }
+  invitesAnswer = { ...invitesAnswer, createStatus: 403, create: { error: "ACCOUNT_SIGN_IN_REQUIRED", message: "Sign in with your password to do this.", leak: "x" } };
+  const scoped = await invitesCreate(cookie);
+  assert.equal(scoped.status, 403);
+  assert.deepEqual(await scoped.json(), { error: "ACCOUNT_SIGN_IN_REQUIRED" });
+});
+
+test("invites: the named answers an organizer needs pass through, and nothing else the control plane says does", async () => {
+  resetInvites();
+  const cookie = await organizerCookie("once-invites-409");
+  for (const error of ["TRAVELLER_CLAIMED_FROM_GROUP", "INVITE_ALREADY_EXISTS", "RUNTIME_PARTICIPANT_NOT_ELIGIBLE", "RUNTIME_PARTICIPANT_NOT_FOUND", "RUNTIME_NOT_READY"]) {
+    invitesAnswer = { ...invitesAnswer, createStatus: 409, create: { error, detail: "dl17 was claimed by Maya" } };
+    const response = await invitesCreate(cookie);
+    assert.equal(response.status, 409, error);
+    assert.deepEqual(await response.json(), { error }, `${error}: the code, nothing else`);
+  }
+  invitesAnswer = { ...invitesAnswer, createStatus: 409, create: { error: "SOMETHING_NEW_AND_INTERNAL" } };
+  const unknown = await invitesCreate(cookie);
+  assert.equal(unknown.status, 503);
+  assert.deepEqual(await unknown.json(), { error: "RUNTIME_UNAVAILABLE" });
+});
+
+test("invites: an outage, a refusal of the key, a hung control plane and a malformed answer are one 503 that says nothing, never a 201", async () => {
+  resetInvites();
+  const cookie = await organizerCookie("once-invites-503");
+  for (const createStatus of [500, 502, 401]) {
+    invitesAnswer = { ...invitesAnswer, createStatus, create: { error: "x" }, status: createStatus, available: { error: "x" } };
+    const response = await invitesCreate(cookie);
+    assert.equal(response.status, 503, String(createStatus));
+    assert.deepEqual(await response.json(), { error: "RUNTIME_UNAVAILABLE" });
+    assert.equal((await invitesProbe(cookie)).status, 503);
+  }
+  for (const create of [{}, { joinUrl: "javascript:alert(1)", displayName: "x", expiresAt: "y" }, { joinUrl: "https://elsewhere.example/join#token=abc", displayName: "x", expiresAt: "y" }, { joinUrl: INVITE.joinUrl, displayName: 7, expiresAt: "y" }]) {
+    invitesAnswer = { ...invitesAnswer, createStatus: 201, create };
+    assert.equal((await invitesCreate(cookie)).status, 503, `a 201 that is not a link to this portal is not an invite: ${JSON.stringify(create)}`);
+  }
+  invitesAnswer = { ...invitesAnswer, createStatus: 201, create: INVITE, hang: true };
+  assert.equal((await invitesCreate(cookie)).status, 503, "a hung control plane fails within the timeout");
+});
+
+test("invites create: refused without this origin and the custom header, and with a username that is not shaped like one, before the control plane is asked", async () => {
+  resetInvites();
+  const cookie = await organizerCookie("once-invites-csrf");
+  for (const headers of [{}, { origin: RUNTIME }, { "x-kinerary-member-invites": "1" }, { origin: PORTAL, "x-kinerary-member-invites": "1" }, { origin: "null", "x-kinerary-member-invites": "1" }, { origin: "https://evil.example", "x-kinerary-member-invites": "1" }, { origin: RUNTIME, "x-kinerary-member-claims": "1" }]) {
+    const response = await invitesCreate(cookie, "dl17", headers);
+    assert.equal(response.status, 403, JSON.stringify(headers));
+    assert.deepEqual(await response.json(), { error: "ORIGIN_REJECTED" });
+  }
+  for (const bad of ["Dana", "d", "x".repeat(70), "..%2F..", "dl17%00", "dl17/extra", "-dl17"]) {
+    assert.equal((await invitesCreate(cookie, bad)).status, 404, bad);
+  }
+  assert.equal((await invitesCreate(null)).status, 401, "no session: the ordinary 401");
+  assert.equal(invitesCalls.length, 0, "nothing reached the control plane");
+});
+
+test("the invite paths accept only their own verbs and are never proxied to the trip site", async () => {
+  resetInvites();
+  const cookie = await organizerCookie("once-invites-verbs");
+  const before = proxiedAuthorization;
+  proxiedAuthorization = undefined;
+  for (const [method, path] of [["POST", "/t/trip_abcdefgh/__member-invites"], ["DELETE", "/t/trip_abcdefgh/__member-invites"], ["GET", "/t/trip_abcdefgh/__member-invites/dl17"], ["DELETE", "/t/trip_abcdefgh/__member-invites/dl17"], ["PUT", "/t/trip_abcdefgh/__member-invites/dl17"], ["POST", "/t/trip_abcdefgh/__member-invites/a/b"]]) {
+    const response = await fetch(`${gatewayOrigin}${path}`, { method, headers: { cookie, ...INVITE_HEADERS } });
+    assert.equal(response.status, 404, `${method} ${path}`);
+  }
+  assert.equal(proxiedAuthorization, undefined, "the trip site never saw these");
+  assert.equal(invitesCalls.length, 0);
+  proxiedAuthorization = before;
+});
+
+test("the trip site's internal routes are unreachable through /t/<trip>/ however the path is spelled: case, percent-encoding (also twice) and slashes are all the gateway's 404, and nothing is proxied", async () => {
+  const cookie = await organizerCookie("once-internal-block");
+  const before = { proxied: proxiedAuthorization, lists: participantListCalls, sessions: sessionBodies.length, bindings: bindingCalls.length };
+  proxiedAuthorization = undefined;
+  const spellings = [
+    "/api/internal/control-plane/participants", "/API/internal/control-plane/participants", "/Api/Internal/control-plane/participants", "/api/INTERNAL/control-plane/participants",
+    "/api%2Finternal/control-plane/participants", "/api%2fINTERNAL/control-plane/participants", "/%61pi/internal/control-plane/participants", "/api/%69nternal/control-plane/participants",
+    "/%41pi/%49nternal/control-plane/session", "/api%252Finternal/control-plane/participants", "/%2561pi/internal/control-plane/participants", "/api//internal/control-plane/participants",
+    "/api/internal", "/API/INTERNAL", "/api/internal%2Fcontrol-plane/session", "/api/internal/../internal/control-plane/session", "/api/internal/%E0%A4%A", "/api/internal/%zz", "/API/INTERNAL/%zz/x", "/api/internal%2F%zz",
+    // The spellings host mode (`internalApiPath`) always blocked and this mode let through to the site (found 2026-11-23): a backslash, a path parameter on
+    // either segment (Express ignores `;x`), and the same behind percent-encoding. Both modes now read one normalisation.
+    "/api%5cinternal/control-plane/participants", "/api%5Cinternal/control-plane/participants", "/api\\internal/control-plane/participants", "/api/internal;x/control-plane/participants", "/api;x/internal/control-plane/participants",
+    "/api/internal%3bx/control-plane/participants", "/api%3bx/internal/control-plane/participants", "/api%255cinternal/control-plane/participants", "/api/internal/..;/internal/control-plane/session",
+  ];
+  for (const path of spellings) {
+    for (const method of ["GET", "POST"]) {
+      const response = await fetch(`${gatewayOrigin}/t/trip_abcdefgh${path}`, { method, headers: { cookie } });
+      assert.equal(response.status, 404, `${method} ${path}`);
+      assert.deepEqual(await response.json(), { error: "NOT_FOUND" }, `${method} ${path}`);
+    }
+  }
+  assert.equal(proxiedAuthorization, undefined, "the trip site never saw any of these");
+  assert.equal(participantListCalls, before.lists);
+  assert.equal(sessionBodies.length, before.sessions);
+  assert.equal(bindingCalls.length, before.bindings);
+  proxiedAuthorization = before.proxied;
+  // an ordinary path that merely contains the word is still proxied
+  for (const path of ["/api/internals-are-not-a-thing", "/api/internal-notes", "/api/internals-x", "/api/not-internal/x", "/apix/internal/x"]) {
+    const ordinary = await fetch(`${gatewayOrigin}/t/trip_abcdefgh${path}`, { headers: { cookie } });
+    assert.equal(ordinary.status, 200, path);
+  }
+});
+
+test("a correctly encoded literal percent sign in an ordinary path is NOT mistaken for an internal route: 100%25.jpg and friends are proxied", async () => {
+  const cookie = await organizerCookie("once-percent-paths");
+  for (const name of ["100%25.jpg", "100%25%20fun.jpg", "50%25off.jpg", "100%2525.jpg", "a%252Fb.jpg", "%E2%82%AC5.jpg"]) {
+    proxiedAuthorization = undefined;
+    const response = await fetch(`${gatewayOrigin}/t/trip_abcdefgh/api/photos/file/${name}`, { headers: { cookie } });
+    assert.equal(response.status, 200, name);
+    assert.deepEqual(await response.json(), { path: `/api/photos/file/${name}` }, `${name}: reached the trip site unchanged`);
+    assert.ok(proxiedAuthorization, `${name}: proxied with the session`);
+  }
+  // ...while a malformed escape beside the internal prefix, or an internal prefix reached by decoding, is still the gateway's 404
+  for (const path of ["/api/internal/100%25.jpg", "/API/internal/%zz", "/%2561pi/internal/100%25.jpg", "/api%2Finternal/%E0%A4%A"]) {
+    proxiedAuthorization = undefined;
+    const response = await fetch(`${gatewayOrigin}/t/trip_abcdefgh${path}`, { headers: { cookie } });
+    assert.equal(response.status, 404, path);
+    assert.equal(proxiedAuthorization, undefined, `${path}: not proxied`);
+  }
+});
+
+test("invites: the gateway logs nothing for these calls: no link, no token, no user id", async () => {
+  resetInvites();
+  const cookie = await organizerCookie("once-invites-log");
+  const logged = [];
+  const originals = ["log", "error", "warn", "info"].map((name) => [name, console[name]]);
+  for (const [name] of originals) console[name] = (...args) => logged.push(args.join(" "));
+  try { await invitesProbe(cookie); await invitesCreate(cookie); } finally { for (const [name, fn] of originals) console[name] = fn; }
+  const text = logged.join("\n");
+  for (const secret of [INVITE.joinUrl, "tok_secret_value", INVITE.id, "user_abcdefgh", "dl17"]) assert.equal(text.includes(secret), false, secret);
 });

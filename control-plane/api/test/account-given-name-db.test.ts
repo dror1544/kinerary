@@ -66,7 +66,10 @@ function harness() {
   const portal: PortalDependencies = {
     db: pool,
     google: new GoogleIdTokenClient(CLIENT_ID, stubbedOAuthClient()),
-    runtimeAccounts: { participantExists: async () => true, provisionParticipant: async () => {} },
+    runtimeAccounts: {
+      participantExists: async () => true, provisionParticipant: async () => {},
+      listParticipants: async () => [], adoptParticipant: async () => "refused", releaseParticipant: async () => {},
+    },
     publicOrigin: ORIGIN, runtimeOrigin: "http://runtime.example.test", runtimeExchangeKey: "exchange-key",
     runtimeUpstreamHostSuffixes: ["internal"], telegramBotUsername: "kinerary_bot", sessionTtlSeconds: 3600,
     enrollmentTtlSeconds: 3600, approvalTtlSeconds: 3600, mailer, emailAuthLog: () => {},

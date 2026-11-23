@@ -22,6 +22,8 @@
  *   POST /_control/tap       {chatId, messageId, data}         they tap a button
  *   POST /_control/join      {chatId, fromId, status?}         the bot is added to a group
  *   GET  /_control/sent?chatId=&after=                         what the bot said
+ *   POST /_control/member  {chatId, userId, status?, isMember?, mode?}  who is in a group, as getChatMember answers it
+ *   GET  /_control/calls                                       how many times each Bot API method was called
  *
  * A negative `chatId` is a GROUP, where the trip is actually discussed and
  * where a file has to earn the assistant's attention. There the sender is a
@@ -65,6 +67,13 @@ const sent: Sent[] = [];
 const files = new Map<string, { path: string; bytes: Buffer; mime: string; name: string }>();
 const waiters: (() => void)[] = [];
 const unknownMethods = new Set<string>();
+// getChatMember: what the bot is told about one person in one group. `mode` makes the stand-in misbehave the two ways
+// the real API can: an error answer ('error') and no answer at all ('timeout': held open until the caller gives up).
+// A pair nobody has set answers `left`, which is what Telegram says of a person who is not in the room.
+type MemberStatus = "creator" | "administrator" | "member" | "restricted" | "left" | "kicked";
+const MEMBER_STATUSES: readonly string[] = ["creator", "administrator", "member", "restricted", "left", "kicked"];
+const members = new Map<string, { status: MemberStatus; isMember?: boolean; mode?: "error" | "timeout" }>();
+const calls = new Map<string, number>();
 
 function push(...batch: Omit<Update, "update_id">[]): void {
   // All at once, then wake the pollers: an album is several updates Telegram
@@ -160,6 +169,18 @@ async function botMethod(method: string, params: Record<string, unknown>, url: U
       return bad(res, "Bad Request: not enough rights to export chat invite link");
     case "getChat":
       return ok(res, { id: Number(params.chat_id), type: "private", first_name: "E2E Organizer" });
+    case "getChatMember": {
+      const chatId = String(url.searchParams.get("chat_id") ?? params.chat_id ?? "");
+      const userId = String(url.searchParams.get("user_id") ?? params.user_id ?? "");
+      const entry = members.get(`${chatId}:${userId}`) ?? { status: "left" as MemberStatus };
+      if (entry.mode === "error") return bad(res, "Bad Request: chat not found");
+      // Never answers. The connection is left open until the caller hangs up, as a stalled Telegram does.
+      if (entry.mode === "timeout") return;
+      return ok(res, {
+        user: { id: Number(userId), is_bot: false, first_name: "Member" }, status: entry.status,
+        ...(entry.status === "restricted" && entry.isMember !== undefined ? { is_member: entry.isMember } : {}),
+      });
+    }
     case "getFile": {
       const file = files.get(String(params.file_id));
       if (!file) return bad(res, "Bad Request: invalid file_id");
@@ -177,6 +198,21 @@ async function botMethod(method: string, params: Record<string, unknown>, url: U
 
 async function control(path: string, req: IncomingMessage, url: URL, res: ServerResponse): Promise<void> {
   if (path === "/_control/health") return ok(res, { updatesQueued: updates.length, sent: sent.length });
+  if (path === "/_control/calls") return ok(res, Object.fromEntries(calls));
+  if (path === "/_control/member") {
+    const m = await body(req);
+    const chatId = String(m.chatId ?? ""), userId = String(m.userId ?? "");
+    if (!/^-\d{1,16}$/.test(chatId) || !/^\d{1,16}$/.test(userId)) return bad(res, "member needs a negative group chatId and a numeric userId");
+    if (m.mode !== undefined && m.mode !== "error" && m.mode !== "timeout") return bad(res, "mode is error or timeout");
+    const status = String(m.status ?? "member");
+    if (!MEMBER_STATUSES.includes(status)) return bad(res, `status is one of ${MEMBER_STATUSES.join(", ")}`);
+    members.set(`${chatId}:${userId}`, {
+      status: status as MemberStatus,
+      ...(typeof m.isMember === "boolean" ? { isMember: m.isMember } : {}),
+      ...(m.mode ? { mode: m.mode as "error" | "timeout" } : {}),
+    });
+    return ok(res, { set: true });
+  }
   if (path === "/_control/sent") {
     const chatId = url.searchParams.get("chatId");
     const after = Number(url.searchParams.get("after") ?? 0);
@@ -274,6 +310,7 @@ const server = createServer(async (req, res) => {
     }
     const m = /^\/bot[^/]+\/([A-Za-z]+)$/.exec(url.pathname);
     if (!m) return bad(res, "Not Found");
+    calls.set(m[1]!, (calls.get(m[1]!) ?? 0) + 1);
     return await botMethod(m[1]!, req.method === "POST" ? await body(req) : {}, url, res);
   } catch (error) {
     return reply(res, 500, { ok: false, description: error instanceof Error ? error.message : "error" });

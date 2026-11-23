@@ -24,6 +24,20 @@
 // not change an allow-list, `normalizeVisibility`, or which auth middleware a
 // route uses.
 //
+// ONE RECORDED EXCEPTION (Dror, 2026-11-19, decision D3 of
+// docs/specs/sprint-9/x-member-sign-in.md): a switch may gate a NEW SIGN-IN PATH,
+// as long as it never changes an allow-list, a role or a visibility rule. A
+// sign-in path is a permission path by nature (it decides who can open a trip),
+// so the rule above cannot hold for it; what must hold is that the path is
+// switched OFF unless set, that the person it admits holds no role beyond the
+// one the code grants (ROLE_RANK stays an allow-list), and that turning the
+// switch off closes the path again. `member_group_sign_in` below is the first
+// switch to use this exception; a second one needs its own spec and its own
+// line here. `member_sign_in_link` (slice S3 of the same spec: "Send me a
+// sign-in link", a recovery path for member accounts) is the second: it adds no
+// way in that a person did not already have, only a way back to one, and it
+// changes no allow-list, role or visibility rule.
+//
 // CommonJS, like the other shared/ modules, so the trip site (`require`) and
 // the control plane (`import`, via feature-switches.d.ts) read the same list.
 
@@ -54,6 +68,23 @@ const FEATURE_SWITCHES = Object.freeze([
     summary: 'Control plane posts one merged line to the trip group when the plan changes; organizer toggle on the site',
     surfaces: Object.freeze(['control_plane', 'site', 'companion']),
     memberVisible: true,
+  }),
+  // Trip members sign in without a password (docs/specs/sprint-9/x-member-sign-in.md, slice S1). The one switch that
+  // uses the sign-in exception in the header. Control plane only: the trip site never reads it, so it is not
+  // member-visible and its name is withheld from /api/config.
+  Object.freeze({
+    name: 'member_group_sign_in',
+    summary: 'A person live in the trip\'s Telegram group may open the Mini App, pick their own name from the unclaimed travellers, and sign in as a member',
+    surfaces: Object.freeze(['control_plane']),
+    memberVisible: false,
+  }),
+  // "Send me a sign-in link" (docs/specs/sprint-9/x-member-sign-in.md, slice S3, #614). Control plane only, not member-visible.
+  // The name door is gated per trip; the email door has no trip and is gated at the every-trip level (sign-in-link.ts).
+  Object.freeze({
+    name: 'member_sign_in_link',
+    summary: 'A member who cannot get in may ask for a one-time sign-in link, sent to their linked Telegram chat or verified email',
+    surfaces: Object.freeze(['control_plane']),
+    memberVisible: false,
   }),
 ]);
 

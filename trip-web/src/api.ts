@@ -211,6 +211,9 @@ export type CurrentUser = {
   is_secondary_organizer?: boolean;
   /** Only for an owner/organizer session opened from the dashboard. */
   dashboard_url?: string;
+  /** Set by the site for a session that came in through a Kinerary account (a group claim or a personal invite): its
+   *  password and Google-link routes refuse it, so the account page does not offer them (S2c). */
+  sign_in_managed?: boolean;
 };
 export type ItineraryDay = {
   phase_id: string;

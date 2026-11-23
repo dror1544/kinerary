@@ -40,7 +40,20 @@ const secureCookie = RUNTIME_ORIGIN.startsWith("https://");
 const routeCache = new Map();
 // A hung control plane or trip must fail closed quickly, not hold every request open.
 const UPSTREAM_TIMEOUT_MS = Math.max(50, Number(process.env.RUNTIME_UPSTREAM_TIMEOUT_MS ?? 5000) || 5000);
-const timedFetch = (url, init = {}) => fetch(url, { ...init, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
+// EVERY call made with this carries a key (a trip site is sent that trip's own key, the control plane RUNTIME_EXCHANGE_KEY), and fetch's
+// default is to follow a redirect and forward `x-api-key` to whatever origin it points at (Node drops only `authorization` and `cookie`
+// across origins), then to believe the answer. So a redirect is never followed here, whatever the caller passes: it comes back as the 3xx
+// itself. A caller that talks to a trip site answers it as a 502 UPSTREAM_REDIRECT (`refuseRedirect`); the control-plane calls already
+// treat any non-2xx as a failure. The browser-facing reverse proxy is node:http (`proxy`, `proxyToHost`), not this, and still passes a
+// site's own 3xx on to the browser.
+const timedFetch = (url, init = {}) => fetch(url, { ...init, redirect: "manual", signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
+const isRedirect = (response) => response.status >= 300 && response.status < 400;
+// A trip site (or what stands in front of it) answered 3xx to a keyed call: answer 502, say so in the log (trip id and status only), end the body.
+async function refuseRedirect(res, response, tripId, call) {
+  await response.body?.cancel().catch(() => {});
+  console.error(`runtime_gateway.upstream_redirect: trip=${tripId} call=${call} status=${response.status}`);
+  return json(res, 502, { error: "UPSTREAM_REDIRECT" });
+}
 
 // The per-trip cookie is SameSite=Strict, so the portal and this origin must be
 // the same SITE: from another site the browser stores the cookie after the launch
@@ -128,7 +141,10 @@ function cookieValue(req, name) {
 async function controlPlane(path, init = {}) {
   const response = await timedFetch(`${CONTROL_PLANE_ORIGIN}${path}`, { ...init, headers: { ...init.headers, "x-api-key": EXCHANGE_KEY } });
   if (!response.ok) {
-    const error = Object.assign(new Error("CONTROL_PLANE_REJECTED"), { statusCode: response.status });
+    // `body` is what the control plane SAID (a callers that maps a refusal reads one named code from it; nothing else is ever
+    // passed on). Unreadable or hung is null: a refusal with no reason.
+    const said = await response.json().catch(() => null);
+    const error = Object.assign(new Error("CONTROL_PLANE_REJECTED"), { statusCode: response.status, body: said });
     throw error;
   }
   return response.json();
@@ -271,6 +287,11 @@ async function launch(req, res, tripId) {
     method: "POST", headers: { "content-type": "application/json", "x-api-key": tripKeyFor(tripId, route) },
     body: JSON.stringify(identity),
   });
+  if (isRedirect(sessionResponse)) {
+    await sessionResponse.body?.cancel().catch(() => {});
+    console.error(`runtime_gateway.upstream_redirect: trip=${tripId} call=session status=${sessionResponse.status}`);
+    return launchRefused(res, 503);
+  }
   if (!sessionResponse.ok) return launchRefused(res, [400, 401, 403].includes(sessionResponse.status) ? 401 : 503);
   const runtime = await sessionResponse.json();
   if (typeof runtime.token !== "string") return launchRefused(res, 503);
@@ -293,6 +314,7 @@ async function provisionParticipant(req, res, tripId) {
   const response = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants`, {
     method: "POST", headers: { "content-type": "application/json", "x-api-key": tripKeyFor(tripId, route) }, body: JSON.stringify(body),
   });
+  if (isRedirect(response)) return refuseRedirect(res, response, tripId, "provision");
   const payload = await response.text();
   res.writeHead(response.status, { "content-type": "application/json", "cache-control": "no-store" });
   res.end(payload);
@@ -306,6 +328,7 @@ async function participantExists(req, res, tripId, runtimeUsername) {
   const response = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants/${encodeURIComponent(runtimeUsername)}`, {
     method: "GET", headers: { "x-api-key": tripKeyFor(tripId, route), "x-control-plane-trip-id": tripId },
   });
+  if (isRedirect(response)) return refuseRedirect(res, response, tripId, "exists");
   const payload = await response.text();
   res.writeHead(response.status, { "content-type": "application/json", "cache-control": "no-store" });
   res.end(payload);
@@ -367,6 +390,192 @@ async function planChanges(req, res, tripId, searchParams) {
   }
   res.writeHead(response.status, { "content-type": "application/json", "cache-control": "no-store" });
   res.end(payload);
+}
+
+// ADOPT and RELEASE: bind a control-plane user to an EXISTING participant of the trip site, and end that binding (group
+// sign-in's claim and its release; the personal invite for an existing traveller reuses them). The CALLER is
+// checked with the control-plane key like the rest of /internal/t/... (sameKey); the trip site is sent the key THIS ROUTE'S trip
+// holds (tripKeyFor, never RUNTIME_EXCHANGE_KEY once per-trip keys are on), and the body is forwarded untouched with the trip id in it,
+// as `provisionParticipant` does.
+async function bindingAction(req, res, tripId, action) {
+  if (!sameKey(req.headers["x-api-key"])) return json(res, 401, { error: "AUTHENTICATION_REQUIRED" });
+  if (!/^trip_[A-Za-z0-9]{8,64}$/.test(tripId)) return json(res, 404, { error: "NOT_FOUND" });
+  const route = await routeFor(tripId);
+  const body = await readJson(req);
+  if (body.tripId !== tripId) return json(res, 400, { error: "INVALID_REQUEST" });
+  const response = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants/${action}`, {
+    method: "POST", headers: { "content-type": "application/json", "x-api-key": tripKeyFor(tripId, route) }, body: JSON.stringify(body),
+  });
+  if (isRedirect(response)) return refuseRedirect(res, response, tripId, action);
+  const payload = await response.text();
+  res.writeHead(response.status, { "content-type": "application/json", "cache-control": "no-store" });
+  res.end(payload);
+}
+
+// The trip site's participants (username, display name, role), for the control plane's group sign-in: who a person in
+// the trip's Telegram group may pick as themselves. The caller is checked with the control-plane key, the trip site is
+// sent the trip's own key (tripKeyFor), and the site checks that key and the trip id again (the id travels in a header on a GET, as for `participantExists`). The body is the
+// trip site's own three-field list, passed through untouched.
+async function listParticipants(req, res, tripId) {
+  if (!sameKey(req.headers["x-api-key"])) return json(res, 401, { error: "AUTHENTICATION_REQUIRED" });
+  if (!/^trip_[A-Za-z0-9]{8,64}$/.test(tripId)) return json(res, 404, { error: "NOT_FOUND" });
+  const route = await routeFor(tripId);
+  const response = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants`, {
+    method: "GET", headers: { "x-api-key": tripKeyFor(tripId, route), "x-control-plane-trip-id": tripId },
+  });
+  if (isRedirect(response)) return refuseRedirect(res, response, tripId, "list");
+  const payload = await response.text();
+  res.writeHead(response.status, { "content-type": "application/json", "cache-control": "no-store" });
+  res.end(payload);
+}
+
+// ORGANIZERS' GROUP CLAIMS: the hop between the trip site's Organizer settings and the control plane (docs/specs/sprint-9/
+// x-member-sign-in.md, amendment A5). `trip-web` talks only to the trip site, and the trip site cannot call the control
+// plane, so the gateway, which holds the person's sealed session, asks on their behalf:
+//
+//   GET    /t/:tripId/__member-claims            the live claims          -> control plane POST /internal/member-claims/list
+//   DELETE /t/:tripId/__member-claims/:claimId   release one              -> control plane POST /internal/member-claims/release
+//
+// THE GATEWAY DECIDES NOTHING ABOUT WHO MAY. It forwards three facts it knows from its OWN sealed cookie (trip, user, the
+// portal session that opened this trip) and the control plane re-decides everything from its database: a live session that is
+// that user's, owner/organizer of that trip, the feature on, the session's scope. Nothing the browser sends is forwarded: no
+// header (the key is the gateway's own, set last), no cookie, no query, no user id, no body. A caller without a session gets
+// the gateway's ordinary 401; anyone the control plane does not accept gets its one 404, whoever they are.
+// Release additionally needs what the gateway's own POSTs need (logout): a header a cross-site form cannot send, and this
+// origin as the request's Origin.
+const CLAIM_ID_SHAPE = /^tpc_[A-Za-z0-9]{8,64}$/;
+const text = (value) => (typeof value === "string" ? value : null);
+async function memberClaims(req, res, tripId, claimId) {
+  const releasing = req.method === "DELETE";
+  if (releasing && (req.headers["x-kinerary-member-claims"] !== "1" || req.headers.origin !== RUNTIME_ORIGIN)) {
+    return json(res, 403, { error: "ORIGIN_REJECTED" });
+  }
+  const session = decodeSession(cookieValue(req, cookieName(tripId)));
+  if (!session || session.tripId !== tripId || typeof session.userId !== "string" || !(await sessionLive(session))) {
+    return json(res, 401, { error: "AUTHENTICATION_REQUIRED" });
+  }
+  // A grant minted before session binding names no portal session: the control plane cannot decide for it, so nothing is shown.
+  if (typeof session.sessionId !== "string") return json(res, 404, { error: "NOT_FOUND" });
+  if (releasing && !CLAIM_ID_SHAPE.test(claimId ?? "")) return json(res, 404, { error: "NOT_FOUND" });
+  let answer;
+  try {
+    answer = await controlPlane(releasing ? "/internal/member-claims/release" : "/internal/member-claims/list", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ tripId: session.tripId, userId: session.userId, sessionId: session.sessionId, ...(releasing ? { claimId } : {}) }),
+    });
+  } catch (error) {
+    const status = error?.message === "CONTROL_PLANE_REJECTED" ? error.statusCode : 0;
+    if (status === 404) return json(res, 404, { error: "NOT_FOUND" });
+    // A Telegram-minted organizer session may look but not release: the one refusal that says why, and only to a caller the
+    // control plane has already accepted as this trip's organizer.
+    if (status === 403) return json(res, 403, { error: "ACCOUNT_SIGN_IN_REQUIRED" });
+    return json(res, 503, { error: "RUNTIME_UNAVAILABLE" });
+  }
+  if (releasing) return answer?.status === "released" ? json(res, 200, { status: "released" }) : json(res, 503, { error: "RUNTIME_UNAVAILABLE" });
+  if (!Array.isArray(answer?.claims)) return json(res, 503, { error: "RUNTIME_UNAVAILABLE" });
+  // Only the fields the page shows, and only rows shaped like claims: whatever else the control plane says stops here.
+  const claims = answer.claims.filter((c) => CLAIM_ID_SHAPE.test(c?.claimId ?? "")).map((c) => ({
+    claimId: c.claimId, travellerName: text(c.travellerName) ?? "", telegramFirstName: text(c.telegramFirstName), telegramUsername: text(c.telegramUsername),
+    via: text(c.via), claimedAt: text(c.claimedAt), lastSignedInAt: text(c.lastSignedInAt),
+  }));
+  return json(res, 200, { claims });
+}
+
+// ORGANIZERS' PERSONAL INVITES: the hop between the trip site's Organizer settings -> Signing in -> "Send a personal invite" and the
+// control plane (docs/specs/sprint-9/x-member-sign-in.md, slice S2, AC-11). The same shape and the same reasons as the claims hop above:
+//
+//   GET  /t/:tripId/__member-invites             may this person send one?   -> control plane POST /internal/member-invites/available
+//   POST /t/:tripId/__member-invites/:username   send one to this traveller  -> control plane POST /internal/member-invites/create
+//
+// THE GATEWAY DECIDES NOTHING ABOUT WHO MAY. It forwards what it knows from its OWN sealed cookie (trip, user, the portal session that
+// opened this trip) plus the one thing only the browser can say, WHICH TRAVELLER (the username in the path, shape-checked here and
+// decided on there), and the control plane re-decides everything from its database. Nothing else the browser sends is forwarded: no
+// header (the key is the gateway's own), no cookie, no query, no body. This is NOT behind the group sign-in switch: a personal invite is a
+// full way in for people who are not on Telegram.
+//
+// The POST needs what the claims Release needs, with its own header name: a header a cross-site form cannot send, and this origin as the
+// request's Origin. What comes back is the link, the name and the expiry, and only a well-formed link to THIS deployment's portal: a
+// control plane that said anything else (or an outage, or a hang) is one 503 that says nothing. The named answers an organizer can act on
+// pass through as their code alone; any other 409 is the same 503.
+const USERNAME_SHAPE = /^[a-z0-9][a-z0-9._-]{1,63}$/;
+const INVITE_ANSWERS = new Set(["TRAVELLER_CLAIMED_FROM_GROUP", "INVITE_ALREADY_EXISTS", "RUNTIME_PARTICIPANT_NOT_ELIGIBLE", "RUNTIME_PARTICIPANT_NOT_FOUND", "RUNTIME_NOT_READY"]);
+async function memberInvites(req, res, tripId, username) {
+  const creating = req.method === "POST";
+  if (creating && (req.headers["x-kinerary-member-invites"] !== "1" || req.headers.origin !== RUNTIME_ORIGIN)) {
+    return json(res, 403, { error: "ORIGIN_REJECTED" });
+  }
+  const session = decodeSession(cookieValue(req, cookieName(tripId)));
+  if (!session || session.tripId !== tripId || typeof session.userId !== "string" || !(await sessionLive(session))) {
+    return json(res, 401, { error: "AUTHENTICATION_REQUIRED" });
+  }
+  // A grant minted before session binding names no portal session: the control plane cannot decide for it, so nothing is offered.
+  if (typeof session.sessionId !== "string") return json(res, 404, { error: "NOT_FOUND" });
+  if (creating && !USERNAME_SHAPE.test(username ?? "")) return json(res, 404, { error: "NOT_FOUND" });
+  let answer;
+  try {
+    answer = await controlPlane(creating ? "/internal/member-invites/create" : "/internal/member-invites/available", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ tripId: session.tripId, userId: session.userId, sessionId: session.sessionId, ...(creating ? { runtimeUsername: username } : {}) }),
+    });
+  } catch (error) {
+    const status = error?.message === "CONTROL_PLANE_REJECTED" ? error.statusCode : 0;
+    if (status === 404) return json(res, 404, { error: "NOT_FOUND" });
+    // A Telegram-minted organizer session may not make an invite: the one refusal that says why, and only to a caller the control
+    // plane has already accepted as this trip's organizer.
+    if (status === 403) return json(res, 403, { error: "ACCOUNT_SIGN_IN_REQUIRED" });
+    if (status === 409 && creating && INVITE_ANSWERS.has(error.body?.error)) return json(res, 409, { error: error.body.error });
+    return json(res, 503, { error: "RUNTIME_UNAVAILABLE" });
+  }
+  if (!creating) return answer?.available === true ? json(res, 200, { available: true }) : json(res, 503, { error: "RUNTIME_UNAVAILABLE" });
+  const link = text(answer?.joinUrl);
+  if (!link || link.length > 2048 || !/^[\x21-\x7e]+$/.test(link) || !link.startsWith(`${PORTAL_ORIGIN}/join#token=`)
+    || text(answer?.displayName) === null || text(answer?.expiresAt) === null) {
+    return json(res, 503, { error: "RUNTIME_UNAVAILABLE" });
+  }
+  return json(res, 201, { joinUrl: link, displayName: answer.displayName, expiresAt: answer.expiresAt });
+}
+
+// Is this path (under /t/:trip) one of the trip site's INTERNAL routes? The site's router is case-insensitive and may decode what it is
+// given, so the gateway's block has to match the SAME paths. Every form the path can take is looked at: the raw path, then each round of
+// percent-decoding (up to ten, so a many-times-encoded spelling is seen), each lower-cased with repeated slashes collapsed; if ANY of them
+// is `/api/internal` or under it, the path is internal. A round that cannot be decoded (a malformed escape such as `%zz`, or a literal
+// percent sign that an earlier round produced, as in `100%25.jpg`) does NOT make the path internal and does not stop the look: it is
+// decoded leniently instead (valid `%XX` escapes only, anything else left as it is), so `/%2561pi/internal/100%25.jpg` is still seen as
+// `/api/internal/...` while `/api/photos/file/100%25.jpg` never becomes anything internal. Previously `/API/internal/...` got past a
+// case-sensitive prefix test and was held only because the gateway strips x-api-key; a first version of this treated any decode failure as
+// internal, which blocked ordinary file names with a literal percent sign.
+//
+// WHAT "LOOKS LIKE /api/internal" MEANS is ONE function for both modes, `spellsInternal` (this mode's `isInternalPath` and host mode's
+// `internalApiPath` differ only in how they DECODE: this one leniently, so a file name with a literal percent sign is served; that one
+// strictly, answering 400 for what cannot be read). It reads the way Express routes: segments split on `/` and on `\`, a path parameter
+// (`;x`) dropped from a segment, case ignored, empty and `.` segments ignored, `..` resolved. It answers yes when the first two segments
+// are `api`, `internal` either before `..` is resolved or after: so `/api/internal/../x` (this mode always blocked it) and
+// `/x/../api/internal/x` (host mode always blocked it) both stay blocked. Until 2026-11-23 this mode had its own prefix test and
+// let `/api%5cinternal/..`, `/api/internal;x/..` and `/api;x/internal/..` through to the site (harmless then, with no key and a 404,
+// but the two checkers disagreed about the same request).
+function spellsInternal(path) {
+  const raw = [], resolved = [];
+  for (const piece of path.replace(/\\/g, "/").split("/")) {
+    const segment = piece.split(";")[0].toLowerCase();
+    if (segment === "" || segment === ".") continue;
+    raw.push(segment);
+    if (segment === "..") resolved.pop(); else resolved.push(segment);
+  }
+  const under = (segments) => segments[0] === "api" && segments[1] === "internal";
+  return under(raw) || under(resolved);
+}
+const isInternalForm = spellsInternal;
+const lenientDecode = (value) => value.replace(/%([0-9a-fA-F]{2})/g, (_match, hex) => String.fromCharCode(parseInt(hex, 16)));
+export function isInternalPath(suffix) {
+  let path = String(suffix);
+  for (let round = 0; round < 10; round += 1) {
+    if (isInternalForm(path)) return true;
+    let decoded;
+    try { decoded = decodeURIComponent(path); } catch { decoded = lenientDecode(path); }
+    if (decoded === path) return false;
+    path = decoded;
+  }
+  return isInternalForm(path);
 }
 
 // Ask again while a stream is open, at half the cache window so a revocation
@@ -499,14 +708,7 @@ function internalApiPath(target) {
     path = decoded;
   }
   if (!settled) return "unreadable";
-  const segments = [];
-  for (const raw of path.replace(/\\/g, "/").split("/")) {
-    const segment = raw.split(";")[0].toLowerCase();
-    if (segment === "" || segment === ".") continue;
-    if (segment === "..") { segments.pop(); continue; }
-    segments.push(segment);
-  }
-  return segments[0] === "api" && segments[1] === "internal";
+  return spellsInternal(path);
 }
 
 function hostRouteFromBody(body) {
@@ -649,6 +851,9 @@ export function createRuntimeGateway() {
       if (url.pathname === "/health") return json(res, 200, { ok: true });
       const internal = url.pathname.match(/^\/internal\/t\/([^/]+)\/participants$/);
       if (internal && req.method === "POST") return await provisionParticipant(req, res, decodeURIComponent(internal[1]));
+      if (internal && req.method === "GET") return await listParticipants(req, res, decodeURIComponent(internal[1]));
+      const binding = url.pathname.match(/^\/internal\/t\/([^/]+)\/participants\/(adopt|release)$/);
+      if (binding && req.method === "POST") return await bindingAction(req, res, decodeURIComponent(binding[1]), binding[2]);
       const internalPlanChanges = url.pathname.match(/^\/internal\/t\/([^/]+)\/plan-changes$/);
       if (internalPlanChanges && req.method === "GET") return await planChanges(req, res, decodeURIComponent(internalPlanChanges[1]), url.searchParams);
       const internalParticipant = url.pathname.match(/^\/internal\/t\/([^/]+)\/participants\/([^/]+)$/);
@@ -679,8 +884,25 @@ export function createRuntimeGateway() {
         res.setHeader("set-cookie", `${cookieName(tripId)}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secureCookie ? "; Secure" : ""}`);
         return json(res, 200, { portalUrl: PORTAL_ORIGIN });
       }
+      // The organizers' claims hop. Any other method on these paths is not proxied to the trip site with a session on it.
+      if (suffix === "/__member-claims" || suffix.startsWith("/__member-claims/")) {
+        const target = suffix.match(/^\/__member-claims(?:\/([^/]+))?$/);
+        let claimId = null;
+        try { claimId = target?.[1] ? decodeURIComponent(target[1]) : null; } catch { return json(res, 404, { error: "NOT_FOUND" }); }
+        if (target && ((req.method === "GET" && !target[1]) || (req.method === "DELETE" && target[1]))) return await memberClaims(req, res, tripId, claimId);
+        return json(res, 404, { error: "NOT_FOUND" });
+      }
+      // The organizers' personal-invite hop; same rule: other methods and shapes are never proxied to the trip site with a session on them.
+      if (suffix === "/__member-invites" || suffix.startsWith("/__member-invites/")) {
+        const target = suffix.match(/^\/__member-invites(?:\/([^/]+))?$/);
+        let username = null;
+        try { username = target?.[1] ? decodeURIComponent(target[1]) : null; } catch { return json(res, 404, { error: "NOT_FOUND" }); }
+        if (target && ((req.method === "GET" && !target[1]) || (req.method === "POST" && target[1]))) return await memberInvites(req, res, tripId, username);
+        return json(res, 404, { error: "NOT_FOUND" });
+      }
       // Internal identity endpoints are exclusively server-to-server.
-      if (suffix.startsWith("/api/internal/")) return json(res, 404, { error: "NOT_FOUND" });
+      if (isInternalPath(suffix)) return json(res, 404, { error: "NOT_FOUND" });
+
 
       let session = decodeSession(cookieValue(req, cookieName(tripId)));
       if (session && session.tripId !== tripId) session = null;
