@@ -21,7 +21,6 @@ site/*.ogg
 
 # Booking confirmation PDFs — deployed via rsync, not git
 site/confirmations/
-scripts/__pycache__/
 
 # Design references — local only, not committed.
 # Anchored: unanchored this matched any references/ at any depth, and silently
@@ -29,23 +28,18 @@ scripts/__pycache__/
 /references/
 scripts/hermes-pipeline/.last-answers.json
 .venv-telegram-manager/
-provisioning/__pycache__/
-tests/provisioning/__pycache__/
-tests/scripts/__pycache__/
-# tests/scripts imports the deployment tools by path, so bytecode lands beside them.
-control-plane/deployment/__pycache__/
-telegram_manager/__pycache__/
 control-plane/api/dist/
 control-plane/api/releases/
-control-plane/worker/**/__pycache__/
-control-plane/api/**/__pycache__/
 control-plane/worker/.venv/
 # No trailing slash on purpose: with one this matches only a real directory, so
 # in a worktree — where the secrets live in the main checkout and this is a
 # SYMLINK to them — it fell through and showed up as stageable.
 control-plane/deployment/.local-secrets
-profile-templates/**/__pycache__/
 .hermes-pr3-architecture-review.md
 
 # live-run driver state (.agents/skills/live-run) — run scratch, never committed
 .live-runs/
+
+# Python bytecode, wherever an import or a test leaves it.
+__pycache__/
+*.py[cod]
