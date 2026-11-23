@@ -179,7 +179,7 @@ pass "python $("$PY" -c 'import sys;print(sys.version.split()[0])') + worker req
 
 is_worktree() { [ "$(git rev-parse --git-common-dir)" != "$(git rev-parse --git-dir)" ]; }
 NEED_LINK=0
-for pkg in server tests mcp control-plane/api web trip-web control-plane/runtime-gateway; do
+for pkg in server tests mcp control-plane/api web trip-web control-plane/runtime-gateway control-plane/whatsapp-bridge; do
   [ -f "$pkg/package.json" ] || continue
   if [ -e "$pkg/node_modules" ]; then
     if [ -L "$pkg/node_modules" ]; then
@@ -265,6 +265,12 @@ fi
 
 step "Runtime gateway"
 run "runtime-gateway tests"    control-plane/runtime-gateway npm test
+
+# Its own package, so nothing else runs these: the bridge's privacy tests, the
+# pinned event list and the session-directory checks. The library socket is
+# faked; nothing here connects to WhatsApp.
+step "WhatsApp bridge"
+run "whatsapp-bridge tests"    control-plane/whatsapp-bridge npm test
 
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 step "What this would ship"
