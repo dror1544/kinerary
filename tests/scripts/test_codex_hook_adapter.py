@@ -70,6 +70,13 @@ class CodexAdapter(Harness):
                 self.assertEqual(result.get("permissionDecision"), "ask", result)
                 self.assertTrue(result.get("permissionDecisionReason"), result)
 
+    def test_the_owners_standing_deploy_approval_does_not_reach_codex(self):
+        """2026-11-20: the opt-in is for the owner's Claude Code lead session; a Codex
+        session started from that shell inherits it unless the adapter drops it."""
+        self.env["KINERARY_STANDING_DEPLOY_APPROVAL"] = "1"
+        result = self.bash("kinerary-deploy/trips/alpha-2026/deploy.sh")
+        self.assertEqual(result.get("permissionDecision"), "ask", result)
+
     def test_a_hanging_notes_vault_yields_ask_not_a_timeout_denial(self):
         """2026-10-20: a stalled notes-folder read ran past the adapter's 20s budget and the
         deploy prompt became `deny ... TimeoutExpired`. The hook now bounds that read itself."""

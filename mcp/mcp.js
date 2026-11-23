@@ -34,24 +34,77 @@ const { execFile }           = require('child_process');
 const pdfParse               = require('pdf-parse');
 const { hermesChildEnv }     = require('../shared/child-env.js');
 
+const { AsyncLocalStorage }  = require('async_hooks');
+
 const MCP_PORT    = parseInt(process.env.MCP_PORT || '3001');
-const API_BASE    = (process.env.API_BASE_URL || 'http://trip-server:3000').replace(/\/$/, '');
+
+// ── Shared mode ───────────────────────────────────────────────────────────────
+// MCP_ROUTES_DIR set => ONE process serves every trip: each companion holds an
+// opaque token, and mcp/shared-routes.js resolves it to that trip's site address
+// and agent key from a directory of route files (mcp/README.md, "Shared mode").
+// Unset => exactly the single-trip server this file has always been.
+//
+// In shared mode the four per-trip constants below are deliberately EMPTY, not
+// merely unused: a helper that reached for one by mistake would send no key to
+// no address and fail loudly, instead of quietly serving one trip's data to
+// another trip's companion. The trip a call belongs to lives in `tripContext`
+// and nowhere else (see currentTrip()).
+const ROUTES_DIR = (process.env.MCP_ROUTES_DIR || '').trim();
+const SHARED     = ROUTES_DIR !== '';
+
+const API_BASE    = SHARED ? '' : (process.env.API_BASE_URL || 'http://trip-server:3000').replace(/\/$/, '');
 // Public HTTPS fallback for when API_BASE (usually a Docker-internal host) is
 // unreachable from wherever this MCP server actually runs — e.g. Claude Cowork.
 // No hardcoded default: every deployment has a different public URL, or none.
-const PUBLIC_API_BASE = (process.env.TRIP_PUBLIC_URL || '').trim().replace(/\/$/, '');
+const PUBLIC_API_BASE = SHARED ? '' : (process.env.TRIP_PUBLIC_URL || '').trim().replace(/\/$/, '');
 // MCP_API_KEY is the generic name; HERMES_API_KEY still works as a fallback
 // for existing deployments so nobody has to rename an env var mid-trip.
-const API_KEY      = process.env.MCP_API_KEY || process.env.HERMES_API_KEY || ''; // agent → MCP auth
-const TRIP_API_KEY = process.env.TRIP_API_KEY || API_KEY;                          // MCP → trip website auth (falls back to same key)
+const API_KEY      = SHARED ? '' : (process.env.MCP_API_KEY || process.env.HERMES_API_KEY || ''); // agent → MCP auth
+const TRIP_API_KEY = SHARED ? '' : (process.env.TRIP_API_KEY || API_KEY);                          // MCP → trip website auth (falls back to same key)
 
-if (!API_KEY) {
+if (!SHARED && !API_KEY) {
   process.stderr.write('[trip-mcp] MCP_API_KEY is not set — exiting\n');
   process.exit(1);
 }
 
+function envPositiveInt(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) {
+    process.stderr.write(`[trip-mcp] ${name} must be a positive integer — exiting\n`);
+    process.exit(1);
+  }
+  return n;
+}
+
+const tripContext = new AsyncLocalStorage();
+const TRIP_TIMEOUT_MS     = SHARED ? envPositiveInt('MCP_TRIP_TIMEOUT_MS', 120000) : 0;
+const EXTRACT_CONCURRENCY = SHARED ? envPositiveInt('MCP_EXTRACT_CONCURRENCY', 2) : 0;
+
+// Single mode: the one trip this process was started for, in the same shape a
+// shared-mode route has, so every helper below reads one thing either way.
+const SINGLE_TRIP = Object.freeze({ slug: null, apiBase: API_BASE, publicBase: PUBLIC_API_BASE, tripKey: TRIP_API_KEY });
+
+/**
+ * The trip the running call belongs to. In shared mode it is the route the
+ * request was authenticated as — set at /sse for the session's lifetime and
+ * re-applied at every /messages from the SESSION's record, never from whoever
+ * sent the POST. With no context there is no trip: throw rather than fall back
+ * to anything, because a fallback here is a cross-trip read.
+ */
+function currentTrip() {
+  if (!SHARED) return SINGLE_TRIP;
+  const trip = tripContext.getStore();
+  if (!trip) throw new Error('internal: no trip context for this call');
+  return trip;
+}
+
+// Log lines name a trip by slug only — never an address, a key or a token.
+const tripTag = () => (SHARED ? ` trip=${currentTrip().slug}` : '');
+
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
-const h = () => ({ 'x-api-key': TRIP_API_KEY, 'content-type': 'application/json' });
+const h = () => ({ 'x-api-key': currentTrip().tripKey, 'content-type': 'application/json' });
 
 async function errorSuffix(r) {
   try {
@@ -63,21 +116,42 @@ async function errorSuffix(r) {
   }
 }
 
+/**
+ * node-fetch's own error text carries the URL it failed on, which in shared
+ * mode is a trip's LAN address. What reaches a log or a tool result there is
+ * the error's code and nothing else — the same thin vocabulary /health uses.
+ */
+function tripFetchFailure(err) {
+  const named = err && (err.code || (err.cause && err.cause.code));
+  const timedOut = err && (err.name === 'AbortError' || err.name === 'TimeoutError');
+  const code = named || (timedOut ? 'ETIMEDOUT' : 'UNKNOWN');
+  const e = new Error(`trip site request failed (${code})`);
+  e.code = code;
+  return e;
+}
+
 async function fetchTrip(path, options = {}) {
-  const targets = [API_BASE, ...(PUBLIC_API_BASE && PUBLIC_API_BASE !== API_BASE ? [PUBLIC_API_BASE] : [])];
+  const trip = currentTrip();
+  const targets = [trip.apiBase, ...(trip.publicBase && trip.publicBase !== trip.apiBase ? [trip.publicBase] : [])];
   let lastErr;
 
   for (let i = 0; i < targets.length; i++) {
     const base = targets[i];
+    // One slow trip must not hold a slot of this shared process for ever. A
+    // caller that brought its own signal (/health's 5 s) keeps it.
+    const opts = SHARED && !options.signal
+      ? { ...options, signal: AbortSignal.timeout(TRIP_TIMEOUT_MS) }
+      : options;
     try {
-      return await fetch(`${base}${path}`, options);
+      return await fetch(`${base}${path}`, opts);
     } catch (err) {
-      lastErr = err;
+      lastErr = SHARED ? tripFetchFailure(err) : err;
       if (i < targets.length - 1) {
-        process.stderr.write(`[trip-mcp] ${base}${path} failed (${err.message}); retrying via ${targets[i + 1]}\n`);
+        if (SHARED) process.stderr.write(`[trip-mcp]${tripTag()} ${path} failed (${lastErr.code}); retrying via the public url\n`);
+        else process.stderr.write(`[trip-mcp] ${base}${path} failed (${err.message}); retrying via ${targets[i + 1]}\n`);
         continue;
       }
-      throw err;
+      throw lastErr;
     }
   }
 
@@ -121,7 +195,7 @@ async function apiPostFile(path, filePath, fieldName, contentType, fields = {}) 
   }
   const r = await fetchTrip(path, {
     method: 'POST',
-    headers: { 'x-api-key': TRIP_API_KEY, ...form.getHeaders() },
+    headers: { 'x-api-key': currentTrip().tripKey, ...form.getHeaders() },
     body: form,
   });
   if (!r.ok) throw new Error(`POST ${path} → ${r.status}${await errorSuffix(r)}`);
@@ -131,7 +205,7 @@ async function apiPostPdf(path, filePath) {
   return apiPostFile(path, filePath, 'file', 'application/pdf');
 }
 async function apiGetBuffer(path) {
-  const r = await fetchTrip(path, { headers: { 'x-api-key': TRIP_API_KEY } });
+  const r = await fetchTrip(path, { headers: { 'x-api-key': currentTrip().tripKey } });
   if (!r.ok) throw new Error(`GET ${path} → ${r.status}${await errorSuffix(r)}`);
   return r.buffer();
 }
@@ -929,12 +1003,17 @@ mcp.tool('add_plan_item',
   'active plan is empty should be seeded from the original plan wholesale, not one item at a time. ' +
   'Set location_url to a Waze or Google Maps link after a web search. ' +
   'Set booking_id to link an existing booking (confirmation will appear inline on the site). ' +
-  'Set status to "needs_review" when content is auto-derived and not yet organizer-confirmed.',
+  'Set status to "needs_review" when content is auto-derived and not yet organizer-confirmed. ' +
+  'DATE: when the organizer names or implies a day ("the first day", "Thursday", "tomorrow", a date), pass that day\'s `date` ' +
+  '(YYYY-MM-DD, inside the phase\'s dates). Omit `date` only for an idea with no day yet — such an item is on NO day: the site lists it ' +
+  'under "Not on a day yet" and it is not on any day of the schedule. After adding, check the returned item has the date you meant ' +
+  '(a response with `unscheduled: true` has none); if not, fix it with update_plan_item before you answer, and never tell the organizer ' +
+  'it was added to a day until the item shows that day.',
   {
     phase_id:     z.string().describe('Phase id from get_config'),
     text_he:      z.string().describe('Activity description in Hebrew (required)'),
     text_en:      z.string().optional().describe('Activity description in English'),
-    date:         z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD').optional().describe('Date YYYY-MM-DD — groups this item into a day block'),
+    date:         z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD').optional().describe('Date YYYY-MM-DD — the day this item is on. Pass it whenever the organizer named or implied a day; omit only for an idea with no day yet (it then lists under "Not on a day yet")'),
     time:         z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'time must be HH:MM (24-hour)').optional().describe('Time in 24-hour HH:MM, e.g. "09:00". The server rejects any other shape.'),
     location_url: z.string().url().optional().describe('Waze or Google Maps URL for this location'),
     booking_id:   z.number().optional().describe('Booking ID from get_bookings to link confirmation details'),
@@ -948,7 +1027,8 @@ mcp.tool('update_plan_item',
   'another date or time, enrich it with location_url, link a booking, or confirm a needs_review item. ' +
   'Changing `date` moves this ONE item; it does not move the day\'s headline, and it is not how two days are exchanged — ' +
   'for that use swap_plan_days, which moves items and headlines together and atomically. ' +
-  'Never reach for update_booking to correct the itinerary; the site renders the active plan over bookings.',
+  'Never reach for update_booking to correct the itinerary; the site renders the active plan over bookings. ' +
+  'To put an item that is on no day yet (`unscheduled: true`, listed on the site under "Not on a day yet") onto a day, pass its `date` (YYYY-MM-DD).',
   {
     phase_id:     z.string().describe('Phase id the item belongs to'),
     id:           z.number().describe('Plan item ID from get_phase_plan'),
@@ -1234,6 +1314,46 @@ return mcp;
 const app      = express();
 const sessions = new Map();
 
+// Shared mode: the route registry, and the one rule that keeps revocation
+// honest — a session whose route is no longer the registry's current route for
+// that trip (file deleted, token replaced, key or address rotated, file turned
+// invalid) is closed. The client reconnects and is judged afresh.
+let registry = null;
+if (SHARED) {
+  let dirStat = null;
+  try { dirStat = require('fs').statSync(ROUTES_DIR); } catch { /* reported below */ }
+  if (!dirStat || !dirStat.isDirectory()) {
+    process.stderr.write('[trip-mcp] MCP_ROUTES_DIR is not an existing directory — exiting\n');
+    process.exit(1);
+  }
+  registry = require('./shared-routes.js').createRouteRegistry({
+    dir: ROUTES_DIR,
+    log: (line) => process.stderr.write(`[trip-mcp] ${line}\n`),
+    onChange: () => closeStaleSessions(),
+  });
+
+  // A request-scoped promise that rejects (a malformed POST, a client that
+  // vanished) must not take every trip's companion down with it. Logged by
+  // name and code only: a message can carry a URL.
+  process.removeAllListeners('unhandledRejection');
+  process.on('unhandledRejection', (e) => {
+    process.stderr.write(`[trip-mcp] unhandledRejection (shared mode, continuing): ${(e && (e.code || e.name)) || 'unknown'}\n`);
+  });
+
+  for (const v of ['MCP_API_KEY', 'HERMES_API_KEY', 'TRIP_API_KEY', 'API_BASE_URL', 'TRIP_PUBLIC_URL']) {
+    if (process.env[v]) process.stderr.write(`[trip-mcp] ${v} is set and ignored in shared mode\n`);
+  }
+}
+
+function closeStaleSessions() {
+  for (const [id, session] of sessions) {
+    if (session.route && registry.get(session.route.slug) !== session.route) {
+      process.stderr.write(`[trip-mcp] trip=${session.route.slug} route changed; closing session\n`);
+      disposeSession(id, { closeTransport: true }).catch(() => {});
+    }
+  }
+}
+
 async function disposeSession(sessionId, { closeTransport = false } = {}) {
   const session = sessions.get(sessionId);
   if (!session || session.closing) return;
@@ -1328,9 +1448,53 @@ function keyMatches(presented, expected) {
 }
 
 function requireKey(req, res, next) {
+  if (SHARED) {
+    // The token IS the trip: whatever route it resolves to is the only trip
+    // this request can touch. Nothing else in the request names one.
+    registry.refresh();
+    const route = registry.resolveToken(presentedKey(req));
+    if (!route) return res.status(401).json({ error: 'unauthorized' });
+    req.tripRoute = route;
+    return next();
+  }
   if (!keyMatches(presentedKey(req), API_KEY)) return res.status(401).json({ error: 'unauthorized' });
   next();
 }
+
+/**
+ * Run a handler inside its trip's context (shared mode). Called explicitly in
+ * each handler's own chain rather than once in the auth middleware, because a
+ * body parser between the two resumes on the socket's event, which does not
+ * carry the async context of the request that started it.
+ */
+const inTrip = (fn) => (req, res, next) =>
+  (SHARED ? tripContext.run(req.tripRoute, () => fn(req, res, next)) : fn(req, res, next));
+
+/**
+ * Shared mode: at most MCP_EXTRACT_CONCURRENCY extraction/enrichment jobs at a
+ * time, the rest queued first-in first-out. Each one spawns a Hermes child and
+ * can parse a 30 MB document; without a bound, one busy trip starves the rest.
+ * Single mode is unbounded, as it always was.
+ */
+const extractGate = (() => {
+  let running = 0;
+  const waiting = [];
+  const release = () => {
+    running--;
+    const next = waiting.shift();
+    if (next) next();
+  };
+  return (fn) => (req, res, next) => {
+    if (!SHARED) return fn(req, res, next);
+    const go = () => {
+      running++;
+      // The client may have gone while it waited; do not spend a slot on it.
+      if (res.destroyed) { release(); return; }
+      Promise.resolve(fn(req, res, next)).catch(() => {}).finally(release);
+    };
+    if (running < EXTRACT_CONCURRENCY) go(); else waiting.push(go);
+  };
+})();
 
 // /extract is called by the trip site itself (server.js's /api/bookings/extract
 // proxy), not by an agent — it has no MCP_API_KEY to present, only the
@@ -1340,6 +1504,16 @@ function requireKey(req, res, next) {
 // and kept in sync just to unlock one HTTP route.
 function requireSiteOrAgentKey(req, res, next) {
   const key = presentedKey(req);
+  if (SHARED) {
+    // Either credential still names exactly one trip: a companion's token, or
+    // the trip site's own key (which the site already holds). A key shared by
+    // two routes names none, and is refused.
+    registry.refresh();
+    const route = registry.resolveToken(key) || registry.resolveTripKey(key);
+    if (!route) return res.status(401).json({ error: 'unauthorized' });
+    req.tripRoute = route;
+    return next();
+  }
   if (!keyMatches(key, API_KEY) && !keyMatches(key, TRIP_API_KEY)) return res.status(401).json({ error: 'unauthorized' });
   next();
 }
@@ -1449,7 +1623,10 @@ async function resolveCost(parsed) {
   }
 }
 
-app.post('/extract', requireSiteOrAgentKey, express.json({ limit: '30mb' }), async (req, res) => {
+// extractGate OUTSIDE inTrip, on purpose: a queued job starts later, from some
+// other request's async context, so the trip context must be applied at the
+// moment the job actually starts — not when it was queued.
+app.post('/extract', requireSiteOrAgentKey, express.json({ limit: '30mb' }), extractGate(inTrip(async (req, res) => {
   if (!HERMES_EXTRACT_PROFILE) return res.status(503).json({ error: 'HERMES_EXTRACT_PROFILE not set for trip-mcp' });
 
   const { url, pdf_base64, pdf_name } = req.body || {};
@@ -1505,10 +1682,10 @@ app.post('/extract', requireSiteOrAgentKey, express.json({ limit: '30mb' }), asy
 
     res.json(parsed);
   } catch (e) {
-    console.error('[extract]', e.message);
+    console.error(`[extract]${tripTag()}`, e.message);
     res.status(500).json({ error: e.message });
   }
-});
+})));
 
 // ── /enrich — links for a plan item ──────────────────────────────────────────
 // Called by the trip site's enrichment worker (server.js), not by an agent
@@ -1621,7 +1798,7 @@ function buildScheduleReviewPrompt({ context, days }) {
   ].filter(Boolean).join('\n');
 }
 
-app.post('/enrich', requireSiteOrAgentKey, express.json({ limit: '256kb' }), async (req, res) => {
+app.post('/enrich', requireSiteOrAgentKey, express.json({ limit: '256kb' }), extractGate(inTrip(async (req, res) => {
   if (!HERMES_EXTRACT_PROFILE) return res.status(503).json({ error: 'HERMES_EXTRACT_PROFILE not set for trip-mcp' });
   const { kind, text, text_he, date, context, items, days } = req.body || {};
   const isDay    = kind === 'day';
@@ -1703,10 +1880,10 @@ app.post('/enrich', requireSiteOrAgentKey, express.json({ limit: '256kb' }), asy
     }
     res.json(out);
   } catch (e) {
-    process.stderr.write(`[trip-mcp] /enrich failed: ${e.message}\n`);
+    process.stderr.write(`[trip-mcp]${tripTag()} /enrich failed: ${e.message}\n`);
     res.status(500).json({ error: e.message });
   }
-});
+})));
 
 /**
  * CAN THIS BRIDGE REACH THE TRIP IT WAS CONFIGURED FOR?
@@ -1740,7 +1917,14 @@ app.post('/enrich', requireSiteOrAgentKey, express.json({ limit: '256kb' }), asy
  * and does not belong in this repo's output), never a key, never anything
  * about the trip.
  */
-app.get('/health', requireKey, async (_req, res) => {
+// Shared mode only: /health also accepts the trip SITE's own key, the one /extract and /enrich take
+// (requireSiteOrAgentKey). The site is the caller that matters for the direction the companion's own
+// connection does not cover: a request from the trip's container to this bridge, with the key the
+// site itself holds, shows that the container can reach it, that the bridge recognises that key as that
+// trip, and that the bridge can reach the site (the worker makes it after wiring a trip; spec F3).
+// Single-trip mode is unchanged: only the agent key opens it.
+const requireHealthKey = (req, res, next) => (SHARED ? requireSiteOrAgentKey(req, res, next) : requireKey(req, res, next));
+app.get('/health', requireHealthKey, inTrip(async (_req, res) => {
   try {
     const r = await fetchTrip('/api/config', { headers: h(), signal: AbortSignal.timeout(5000) });
     // A reply of any kind means the hop works. 401 is a key problem, not a
@@ -1752,14 +1936,20 @@ app.get('/health', requireKey, async (_req, res) => {
     const code = e?.cause?.code || e?.code || (e?.name === 'TimeoutError' ? 'ETIMEDOUT' : 'UNKNOWN');
     return res.status(503).json({ ok: false, site: 'unreachable', code });
   }
-});
+}));
 
-app.get('/sse', requireKey, async (req, res) => {
+// Shared mode only: "is the PROCESS up", answerable by a supervisor that holds
+// no token. It says that and nothing else — not how many trips, not which.
+// (/health above is the trip-specific question and stays behind the token.)
+if (SHARED) app.get('/ready', (_req, res) => res.json({ ok: true }));
+
+app.get('/sse', requireKey, inTrip(async (req, res) => {
   // Allow more than one client at a time — a persistent always-on agent session
   // alongside short-lived CLI diagnostics shouldn't close each other's session.
   const transport = new SSEServerTransport('/messages', res);
   const server = buildMcpServer();
-  sessions.set(transport.sessionId, { transport, server, closing: false });
+  // `route` is the session's trip, fixed here for its whole life.
+  sessions.set(transport.sessionId, { transport, server, closing: false, route: req.tripRoute || null });
   transport.onclose = () => {
     disposeSession(transport.sessionId).catch(() => {});
   };
@@ -1767,14 +1957,44 @@ app.get('/sse', requireKey, async (req, res) => {
     disposeSession(transport.sessionId).catch(() => {});
   });
   await server.connect(transport);
-});
+}));
 
 app.post('/messages', express.json(), async (req, res) => {
   const session = sessions.get(req.query.sessionId);
   if (!session) return res.status(404).json({ error: 'session_not_found' });
+  if (SHARED) {
+    // The message runs as the SESSION's trip — never as whatever the POST's own
+    // credentials would resolve to. A POST that does present a token must be
+    // the session's own token; a mismatch is refused, not re-routed.
+    registry.refresh();
+    if (registry.get(session.route.slug) !== session.route) {
+      disposeSession(req.query.sessionId, { closeTransport: true }).catch(() => {});
+      return res.status(404).json({ error: 'session_not_found' });
+    }
+    const presented = presentedKey(req);
+    if (presented && registry.resolveToken(presented) !== session.route) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    try {
+      await tripContext.run(session.route, () => session.transport.handlePostMessage(req, res, req.body));
+    } catch (e) {
+      process.stderr.write(`[trip-mcp] trip=${session.route.slug} /messages failed: ${(e && (e.code || e.name)) || 'unknown'}\n`);
+      if (!res.headersSent) res.status(500).json({ error: 'internal' });
+    }
+    return;
+  }
   await session.transport.handlePostMessage(req, res, req.body);
 });
 
-app.listen(MCP_PORT, '0.0.0.0', () => {
-  console.log(`[trip-mcp] listening on 0.0.0.0:${MCP_PORT}  →  API: ${API_BASE}`);
+// Shared mode listens on loopback unless told otherwise: it holds every trip's
+// key, and the supervisor/proxy in front of it decides who may reach it.
+const BIND_HOST = process.env.MCP_BIND_HOST || (SHARED ? '127.0.0.1' : '0.0.0.0');
+if (SHARED) registry.start();
+
+app.listen(MCP_PORT, BIND_HOST, () => {
+  if (SHARED) {
+    console.log(`[trip-mcp] listening on ${BIND_HOST}:${MCP_PORT}  →  shared mode, ${registry.size} route(s)`);
+    return;
+  }
+  console.log(`[trip-mcp] listening on ${BIND_HOST}:${MCP_PORT}  →  API: ${API_BASE}`);
 });

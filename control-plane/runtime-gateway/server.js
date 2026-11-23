@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import http from "node:http";
 import https from "node:https";
 
@@ -6,6 +6,33 @@ const PORT = Number(process.env.PORT || 4320);
 const BIND_HOST = process.env.BIND_HOST || "127.0.0.1";
 const CONTROL_PLANE_ORIGIN = required("CONTROL_PLANE_INTERNAL_ORIGIN").replace(/\/$/, "");
 const EXCHANGE_KEY = required("RUNTIME_EXCHANGE_KEY");
+// Per-trip exchange keys (docs/runtime-session-exchange.md, "Per-trip keys"). EXCHANGE_KEY is the
+// control-plane key: it authenticates this gateway to the control plane and the control plane (and the
+// worker's tools) to this gateway's own /internal/t/* routes, and nothing else. What a TRIP SITE is sent
+// is a separate key per trip. OFF unless RUNTIME_TRIP_KEY_MASTER is set: unset, every trip is sent
+// EXCHANGE_KEY, as before.
+const TRIP_KEY_MASTER = process.env.RUNTIME_TRIP_KEY_MASTER || "";
+const LEGACY_TRIP_KEY = process.env.RUNTIME_LEGACY_TRIP_KEY || "";
+if (!TRIP_KEY_MASTER && LEGACY_TRIP_KEY) {
+  // A legacy key with no master is a half-made change of keys, and nothing else would say so.
+  console.error("runtime_gateway.trip_keys_off: RUNTIME_LEGACY_TRIP_KEY is set but RUNTIME_TRIP_KEY_MASTER is not; every trip is sent RUNTIME_EXCHANGE_KEY");
+}
+// With per-trip keys on, the three secrets must be three different values. A legacy key equal to the
+// control-plane key leaves every legacy trip holding a credential the control plane and this gateway's own
+// /internal/t/* routes accept, which is the exposure per-trip keys exist to end; a master equal to either
+// would make every derived key a function of a key that is already shared. The rollout is therefore a
+// ROTATION: the current key becomes the legacy key and a NEW exchange key goes to the API and this gateway
+// (docs/runtime-session-exchange.md, "Rolling it out"). Refused at start, naming variables, never a value.
+if (TRIP_KEY_MASTER) {
+  const held = [["RUNTIME_EXCHANGE_KEY", EXCHANGE_KEY], ["RUNTIME_TRIP_KEY_MASTER", TRIP_KEY_MASTER], ["RUNTIME_LEGACY_TRIP_KEY", LEGACY_TRIP_KEY]].filter(([, value]) => value);
+  const equal = [];
+  for (let i = 0; i < held.length; i += 1) for (let j = i + 1; j < held.length; j += 1) if (held[i][1] === held[j][1]) equal.push(`${held[i][0]} and ${held[j][0]}`);
+  if (equal.length) {
+    const message = `${equal.join("; ")} hold the same value; with RUNTIME_TRIP_KEY_MASTER set the three must all differ (rotate RUNTIME_EXCHANGE_KEY: the current value becomes RUNTIME_LEGACY_TRIP_KEY and a new one goes to the API and the gateway)`;
+    console.error(`runtime_gateway.trip_keys_not_distinct: ${message}`);
+    throw new Error(message);
+  }
+}
 const COOKIE_SECRET = required("RUNTIME_COOKIE_SECRET");
 const PORTAL_ORIGIN = required("PORTAL_ORIGIN").replace(/\/$/, "");
 const RUNTIME_ORIGIN = required("RUNTIME_ORIGIN").replace(/\/$/, "");
@@ -108,6 +135,31 @@ async function controlPlane(path, init = {}) {
     throw error;
   }
   return response.json();
+}
+
+// derive(master, trip_id) = hex(HMAC-SHA256(master, "kinerary-trip-exchange:v1:" + trip_id)). The worker
+// computes the same value into a new trip's .env (test/fixtures/trip-key-vectors.json is read by both tests).
+export function deriveTripKey(master, tripId) {
+  return createHmac("sha256", master).update(`kinerary-trip-exchange:v1:${tripId}`).digest("hex");
+}
+
+// The key to send to ONE trip site, chosen by what the control plane recorded for that trip's route
+// (`tripKey`), never by anything the client sent and never by what the trip answered. `tripId` is the id the
+// route was looked up for. A trip that holds a key other than the one chosen answers 401 and that is the
+// end of it: no second key is tried, so a trip cannot be made to ask for the legacy key.
+// With a master set, anything but "derived" or "shared" (a kind this gateway does not know, or an older
+// control plane that does not say) is refused rather than guessed, and so is a "shared" trip when there is
+// no legacy key to send. Nothing is sent in any of those cases.
+function tripKeyFor(tripId, route) {
+  if (!TRIP_KEY_MASTER) return EXCHANGE_KEY;
+  let reason;
+  if (route?.tripKey === "derived") return deriveTripKey(TRIP_KEY_MASTER, tripId);
+  if (route?.tripKey === "shared") {
+    if (LEGACY_TRIP_KEY) return LEGACY_TRIP_KEY;
+    reason = "shared_trip_no_legacy_key";
+  } else reason = "route_key_kind_unknown";
+  console.error(`runtime_gateway.trip_key_unavailable: trip=${tripId} reason=${reason}`);
+  throw Object.assign(new Error("TRIP_KEY_UNAVAILABLE"), { statusCode: 503 });
 }
 
 async function routeFor(tripId) {
@@ -219,7 +271,7 @@ async function launch(req, res, tripId) {
   if (grant.dashboardUrl === `${PORTAL_ORIGIN}/trips/${tripId}/setup`) identity.dashboardUrl = grant.dashboardUrl;
   else if (grant.role === "owner" || grant.role === "organizer") logDashboardDropped(tripId, grant);
   const sessionResponse = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/session`, {
-    method: "POST", headers: { "content-type": "application/json", "x-api-key": EXCHANGE_KEY },
+    method: "POST", headers: { "content-type": "application/json", "x-api-key": tripKeyFor(tripId, route) },
     body: JSON.stringify(identity),
   });
   if (!sessionResponse.ok) return launchRefused(res, [400, 401, 403].includes(sessionResponse.status) ? 401 : 503);
@@ -242,7 +294,7 @@ async function provisionParticipant(req, res, tripId) {
   const body = await readJson(req);
   if (body.tripId !== tripId) return json(res, 400, { error: "INVALID_REQUEST" });
   const response = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants`, {
-    method: "POST", headers: { "content-type": "application/json", "x-api-key": EXCHANGE_KEY }, body: JSON.stringify(body),
+    method: "POST", headers: { "content-type": "application/json", "x-api-key": tripKeyFor(tripId, route) }, body: JSON.stringify(body),
   });
   const payload = await response.text();
   res.writeHead(response.status, { "content-type": "application/json", "cache-control": "no-store" });
@@ -255,16 +307,76 @@ async function participantExists(req, res, tripId, runtimeUsername) {
   if (!/^[a-z0-9][a-z0-9._-]{1,63}$/.test(runtimeUsername)) return json(res, 400, { error: "INVALID_REQUEST" });
   const route = await routeFor(tripId);
   const response = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants/${encodeURIComponent(runtimeUsername)}`, {
-    method: "GET", headers: { "x-api-key": EXCHANGE_KEY, "x-control-plane-trip-id": tripId },
+    method: "GET", headers: { "x-api-key": tripKeyFor(tripId, route), "x-control-plane-trip-id": tripId },
   });
   const payload = await response.text();
   res.writeHead(response.status, { "content-type": "application/json", "cache-control": "no-store" });
   res.end(payload);
 }
 
+// The group line's read (video Release 1C): the control plane asks what changed in a trip's plan since the
+// revision the group last heard about. The control plane never holds a trip's key, so it asks HERE, with
+// RUNTIME_EXCHANGE_KEY like the participant routes, and this gateway reads the trip's own site with the key the
+// ROUTE says that trip holds (tripKeyFor). Only `since` is carried over, and only in the shape the site accepts
+// (server/living-journey.js REVISION_ID_RE). The answer is JSON passed through at the site's status; a redirect
+// is never followed (the trip's key rides this request and goes nowhere else) and is a 502, as is a body over
+// PLAN_CHANGES_MAX_BYTES (the same cap the poller applies) or a 2xx that is not JSON.
+const PLAN_CHANGES_MAX_BYTES = 512 * 1024;
+const REVISION_ID_RE = /^[A-Za-z0-9_-]{1,100}$/;
+
+async function readCapped(response, limit) {
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > limit) { await response.body?.cancel().catch(() => {}); return null; }
+  const chunks = [];
+  let size = 0;
+  if (response.body) {
+    for await (const chunk of response.body) {
+      size += chunk.length;
+      if (size > limit) { await response.body.cancel().catch(() => {}); return null; }
+      chunks.push(chunk);
+    }
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function planChanges(req, res, tripId, searchParams) {
+  if (!sameKey(req.headers["x-api-key"])) return json(res, 401, { error: "AUTHENTICATION_REQUIRED" });
+  if (!/^trip_[A-Za-z0-9]{8,64}$/.test(tripId)) return json(res, 404, { error: "NOT_FOUND" });
+  const sinceValues = searchParams.getAll("since");
+  if (sinceValues.length > 1 || (sinceValues.length === 1 && !REVISION_ID_RE.test(sinceValues[0]))) return json(res, 400, { error: "INVALID_REQUEST" });
+  const route = await routeFor(tripId);
+  const key = tripKeyFor(tripId, route); // throws 503 before any request to the trip
+  const query = sinceValues.length ? `?since=${encodeURIComponent(sinceValues[0])}` : "";
+  const response = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/plan-changes${query}`, {
+    method: "GET", redirect: "manual",
+    headers: { "x-api-key": key, "x-control-plane-trip-id": tripId, accept: "application/json" },
+  });
+  if (response.status >= 300 && response.status < 400) {
+    await response.body?.cancel().catch(() => {});
+    console.error(`runtime_gateway.plan_changes_redirect: trip=${tripId} status=${response.status}`);
+    return json(res, 502, { error: "UPSTREAM_REDIRECT" });
+  }
+  const payload = await readCapped(response, PLAN_CHANGES_MAX_BYTES);
+  if (payload === null) {
+    console.error(`runtime_gateway.plan_changes_body_too_large: trip=${tripId}`);
+    return json(res, 502, { error: "UPSTREAM_BODY_TOO_LARGE" });
+  }
+  let parsedOk = true;
+  try { JSON.parse(payload); } catch { parsedOk = false; }
+  if (!parsedOk) {
+    // A site's own error page keeps its status; a 2xx that is not an answer is the gateway's 502.
+    if (response.ok) return json(res, 502, { error: "UPSTREAM_NOT_JSON" });
+    return json(res, response.status, { error: "UPSTREAM_ERROR" });
+  }
+  res.writeHead(response.status, { "content-type": "application/json", "cache-control": "no-store" });
+  res.end(payload);
+}
+
 // ADOPT and RELEASE: bind a control-plane user to an EXISTING participant of the trip site, and end that binding (group
-// sign-in's claim and its release; the personal invite for an existing traveller reuses them). Same key as the rest of
-// /internal/t/..., and the body is forwarded untouched with the trip id in it, as `provisionParticipant` does.
+// sign-in's claim and its release; the personal invite for an existing traveller reuses them). The CALLER is
+// checked with the control-plane key like the rest of /internal/t/... (sameKey); the trip site is sent the key THIS ROUTE'S trip
+// holds (tripKeyFor, never RUNTIME_EXCHANGE_KEY once per-trip keys are on), and the body is forwarded untouched with the trip id in it,
+// as `provisionParticipant` does.
 async function bindingAction(req, res, tripId, action) {
   if (!sameKey(req.headers["x-api-key"])) return json(res, 401, { error: "AUTHENTICATION_REQUIRED" });
   if (!/^trip_[A-Za-z0-9]{8,64}$/.test(tripId)) return json(res, 404, { error: "NOT_FOUND" });
@@ -272,7 +384,7 @@ async function bindingAction(req, res, tripId, action) {
   const body = await readJson(req);
   if (body.tripId !== tripId) return json(res, 400, { error: "INVALID_REQUEST" });
   const response = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants/${action}`, {
-    method: "POST", headers: { "content-type": "application/json", "x-api-key": EXCHANGE_KEY }, body: JSON.stringify(body),
+    method: "POST", headers: { "content-type": "application/json", "x-api-key": tripKeyFor(tripId, route) }, body: JSON.stringify(body),
   });
   const payload = await response.text();
   res.writeHead(response.status, { "content-type": "application/json", "cache-control": "no-store" });
@@ -280,15 +392,15 @@ async function bindingAction(req, res, tripId, action) {
 }
 
 // The trip site's participants (username, display name, role), for the control plane's group sign-in: who a person in
-// the trip's Telegram group may pick as themselves. Behind the same key as the lookup above, and the trip site checks
-// that key and the trip id again (the id travels in a header on a GET, as for `participantExists`). The body is the
+// the trip's Telegram group may pick as themselves. The caller is checked with the control-plane key, the trip site is
+// sent the trip's own key (tripKeyFor), and the site checks that key and the trip id again (the id travels in a header on a GET, as for `participantExists`). The body is the
 // trip site's own three-field list, passed through untouched.
 async function listParticipants(req, res, tripId) {
   if (!sameKey(req.headers["x-api-key"])) return json(res, 401, { error: "AUTHENTICATION_REQUIRED" });
   if (!/^trip_[A-Za-z0-9]{8,64}$/.test(tripId)) return json(res, 404, { error: "NOT_FOUND" });
   const route = await routeFor(tripId);
   const response = await timedFetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants`, {
-    method: "GET", headers: { "x-api-key": EXCHANGE_KEY, "x-control-plane-trip-id": tripId },
+    method: "GET", headers: { "x-api-key": tripKeyFor(tripId, route), "x-control-plane-trip-id": tripId },
   });
   const payload = await response.text();
   res.writeHead(response.status, { "content-type": "application/json", "cache-control": "no-store" });
@@ -482,9 +594,227 @@ async function proxy(req, res, tripId, suffix, session) {
   req.pipe(upstream);
 }
 
+// ---------------------------------------------------------------------------
+// Host mode (docs/runtime-session-exchange.md, "Host mode"; spec
+// docs/specs/sprint-9/x-wildcard-host-and-shared-bridge.md, R1).
+//
+// One wildcard name points at this gateway and the Host header picks the trip:
+// <label>.<TRIP_HOST_SUFFIX> is looked up in the control plane's registry
+// (GET /internal/runtime-routes/by-host/:host) and proxied, transparently, to
+// the upstream the registry holds for that exact name. Each trip is its own
+// origin, so Cookie, Authorization and Set-Cookie pass straight through: the
+// session cookie and launch flow above are not involved.
+//
+// OFF unless TRIP_HOST_SUFFIX is set. Unset, none of this code runs.
+// ---------------------------------------------------------------------------
+const DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+const TRIP_HOST_SUFFIX = (() => {
+  const raw = String(process.env.TRIP_HOST_SUFFIX ?? "").trim().toLowerCase().replace(/^\./, "");
+  if (!raw) return "";
+  // A malformed suffix is a configuration error, not a reason to quietly route nothing.
+  if (raw.length > 200 || !raw.split(".").every((label) => DNS_LABEL.test(label))) throw new Error("TRIP_HOST_SUFFIX must be a lowercase DNS name such as trips.example.org");
+  return raw;
+})();
+const RUNTIME_HOSTNAME = new URL(RUNTIME_ORIGIN).hostname.toLowerCase();
+const HOST_HIT_TTL_MS = 30_000;
+const HOST_MISS_TTL_MS = 5_000;
+const HOST_CACHE_MAX = 2000;
+// Once the whole request has been sent, how long the upstream may stay silent
+// before the answer is 502. Not a bound on uploads or streams: it starts at the
+// end of the request body and stops at the first response byte.
+const HOST_RESPONSE_TIMEOUT_MS = Math.max(50, Number(process.env.TRIP_HOST_RESPONSE_TIMEOUT_MS ?? 120_000) || 120_000);
+const hostRouteCache = new Map(); // host -> { route | null, expiresAt }
+const hostLookupsInFlight = new Map();
+// A fresh connection per request: a stale pooled socket would turn a photo upload into a 502.
+const hostHttpAgent = new http.Agent({ keepAlive: false });
+const hostHttpsAgent = new https.Agent({ keepAlive: false });
+const HOP_BY_HOP = new Set(["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"]);
+
+// null: not a host-mode request (today's handling). { valid: false }: under the
+// suffix but cannot be a trip (the bare suffix, a deeper name, not a DNS label).
+function hostModeFor(req) {
+  if (!TRIP_HOST_SUFFIX) return null;
+  const header = String(req.headers.host ?? "").toLowerCase();
+  if (!header || header.startsWith("[")) return null;
+  const name = header.replace(/:\d*$/, "");
+  if (name === RUNTIME_HOSTNAME) return null;
+  if (name === TRIP_HOST_SUFFIX) return { valid: false };
+  if (!name.endsWith(`.${TRIP_HOST_SUFFIX}`)) return null;
+  const label = name.slice(0, -(TRIP_HOST_SUFFIX.length + 1));
+  return DNS_LABEL.test(label) ? { valid: true, host: name } : { valid: false };
+}
+
+// The same small page for every name that is not a ready trip, so the gateway is
+// no oracle for which trips exist. Nothing the client sent is reflected.
+const HOST_NOT_FOUND_BODY = Buffer.from('<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Not found</title></head><body><p>There is nothing here.</p></body></html>');
+function hostNotFound(res) {
+  res.writeHead(404, { "content-type": "text/html; charset=utf-8", "content-length": HOST_NOT_FOUND_BODY.length, "cache-control": "no-store", "referrer-policy": "no-referrer", "x-content-type-options": "nosniff" });
+  res.end(HOST_NOT_FOUND_BODY);
+}
+
+// Is this request target under /api/internal/, however it is spelled? Express
+// (the trip site) matches case-insensitively and decodes percent-escapes, and a
+// proxy in front may collapse "//" and resolve dots, so every one of those is
+// applied here before looking. Returns "unreadable" for what cannot be decoded.
+function internalApiPath(target) {
+  const cut = target.search(/[?#]/);
+  let path = cut === -1 ? target : target.slice(0, cut);
+  let settled = false;
+  for (let round = 0; round < 4 && !settled; round += 1) {
+    let decoded;
+    // Only the first round can be unreadable. A later round failing means the
+    // path held an encoded "%" (a file called 100%.jpg), which is a real path.
+    try { decoded = decodeURIComponent(path); } catch { if (round === 0) return "unreadable"; settled = true; break; }
+    settled = decoded === path;
+    path = decoded;
+  }
+  if (!settled) return "unreadable";
+  const segments = [];
+  for (const raw of path.replace(/\\/g, "/").split("/")) {
+    const segment = raw.split(";")[0].toLowerCase();
+    if (segment === "" || segment === ".") continue;
+    if (segment === "..") { segments.pop(); continue; }
+    segments.push(segment);
+  }
+  return segments[0] === "api" && segments[1] === "internal";
+}
+
+function hostRouteFromBody(body) {
+  const origin = body?.upstreamOrigin;
+  if (typeof origin !== "string" || typeof body?.tripId !== "string") return null;
+  let url;
+  try { url = new URL(origin); } catch { return null; }
+  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.pathname !== "/" || url.search || url.hash) return null;
+  return { tripId: body.tripId, upstreamOrigin: url.origin };
+}
+
+// Every "cannot route this name" answer is a null route, so the caller answers the one uniform 404 page: a
+// registry that says the registered upstream is invalid (503 RUNTIME_ROUTE_INVALID), and an answer this
+// gateway's own origin validation refuses. The real reason is logged here, once per lookup, and the null is
+// cached no longer than any other miss. Only "the control plane could not be asked" throws (503).
+function hostRouteInvalid(host, reason) {
+  console.error(`runtime_gateway.host_route_invalid host=${host} reason=${reason}`);
+  return null;
+}
+
+async function lookUpHost(host) {
+  let response;
+  try {
+    response = await timedFetch(`${CONTROL_PLANE_ORIGIN}/internal/runtime-routes/by-host/${encodeURIComponent(host)}`, { headers: { "x-api-key": EXCHANGE_KEY } });
+  } catch { throw Object.assign(new Error("HOST_LOOKUP_UNAVAILABLE"), { statusCode: 503 }); }
+  if (response.status === 404) { await response.body?.cancel(); return null; }
+  if (response.status === 503) {
+    let reported;
+    try { reported = (await response.json())?.error; } catch { reported = undefined; }
+    if (reported === "RUNTIME_ROUTE_INVALID") return hostRouteInvalid(host, "registry_route_invalid");
+    throw Object.assign(new Error("HOST_LOOKUP_UNAVAILABLE"), { statusCode: 503 });
+  }
+  if (!response.ok) { await response.body?.cancel(); throw Object.assign(new Error("HOST_LOOKUP_UNAVAILABLE"), { statusCode: 503 }); }
+  let body;
+  try { body = await response.json(); } catch { throw Object.assign(new Error("HOST_LOOKUP_UNAVAILABLE"), { statusCode: 503 }); }
+  const route = hostRouteFromBody(body);
+  if (!route) return hostRouteInvalid(host, "origin_refused");
+  return route;
+}
+
+// A route, or null for "no usable route for this name". Throws with a statusCode
+// when the registry cannot be asked; that is never cached.
+async function hostRouteFor(host) {
+  const cached = hostRouteCache.get(host);
+  if (cached && cached.expiresAt > Date.now()) return cached.route;
+  let pending = hostLookupsInFlight.get(host);
+  if (!pending) {
+    pending = lookUpHost(host).then((route) => {
+      hostRouteCache.delete(host);
+      hostRouteCache.set(host, { route, expiresAt: Date.now() + (route ? HOST_HIT_TTL_MS : HOST_MISS_TTL_MS) });
+      if (hostRouteCache.size > HOST_CACHE_MAX) {
+        for (const [key, entry] of hostRouteCache) if (entry.expiresAt <= Date.now()) hostRouteCache.delete(key);
+        for (const key of hostRouteCache.keys()) { if (hostRouteCache.size <= HOST_CACHE_MAX) break; hostRouteCache.delete(key); }
+      }
+      return route;
+    }).finally(() => hostLookupsInFlight.delete(host));
+    hostLookupsInFlight.set(host, pending);
+  }
+  return pending;
+}
+
+function hostFailure(res, status) {
+  if (res.headersSent) return res.destroy();
+  const data = Buffer.from(JSON.stringify({ error: "RUNTIME_UNAVAILABLE" }));
+  // Close the connection: the request body may be unread, and it is not worth draining.
+  res.writeHead(status, { "content-type": "application/json", "content-length": data.length, "cache-control": "no-store", connection: "close" });
+  res.end(data);
+}
+
+// A trip origin may only set host-only cookies: the Domain attribute (any case, any spacing, with or
+// without a leading dot) is removed from every upstream Set-Cookie and the rest of the cookie is kept.
+function hostOnlyCookie(cookie) {
+  const [pair, ...attributes] = String(cookie).split(";");
+  return [pair, ...attributes.filter((attribute) => !/^\s*domain\s*(?:=|$)/i.test(attribute))].join(";");
+}
+
+function proxyToHost(req, res, host, route) {
+  const origin = new URL(route.upstreamOrigin);
+  const headers = {};
+  const named = String(req.headers.connection ?? "").toLowerCase().split(",").map((token) => token.trim()).filter(Boolean);
+  for (const [name, value] of Object.entries(req.headers)) if (!HOP_BY_HOP.has(name) && !named.includes(name)) headers[name] = value;
+  delete headers["x-forwarded-prefix"];
+  headers.host = req.headers.host; // unchanged: the trip sees the name the browser used
+  headers["x-forwarded-host"] = req.headers.host;
+  // The scheme of the public side. A client's own X-Forwarded-Proto is never believed.
+  headers["x-forwarded-proto"] = secureCookie ? "https" : "http";
+  const peer = req.socket.remoteAddress ?? "";
+  headers["x-forwarded-for"] = [req.headers["x-forwarded-for"], peer].filter(Boolean).join(", ");
+  const secure = origin.protocol === "https:";
+  const upstream = (secure ? https : http).request({ protocol: origin.protocol, hostname: origin.hostname, port: origin.port || undefined, method: req.method, path: req.url, headers, agent: secure ? hostHttpsAgent : hostHttpAgent });
+  let connectTimer = null, responseTimer = null;
+  const clearTimers = () => { clearTimeout(connectTimer); clearTimeout(responseTimer); };
+  upstream.on("socket", (socket) => {
+    if (!socket.connecting) return;
+    connectTimer = setTimeout(() => upstream.destroy(new Error("UPSTREAM_CONNECT_TIMEOUT")), UPSTREAM_TIMEOUT_MS);
+    socket.once("connect", () => clearTimeout(connectTimer));
+  });
+  upstream.on("finish", () => { responseTimer = setTimeout(() => upstream.destroy(new Error("UPSTREAM_RESPONSE_TIMEOUT")), HOST_RESPONSE_TIMEOUT_MS); });
+  upstream.on("response", (upstreamResponse) => {
+    clearTimers();
+    const out = {};
+    const hopNamed = String(upstreamResponse.headers.connection ?? "").toLowerCase().split(",").map((token) => token.trim()).filter(Boolean);
+    for (const [name, value] of Object.entries(upstreamResponse.headers)) if (!HOP_BY_HOP.has(name) && !hopNamed.includes(name)) out[name] = value;
+    if (out["set-cookie"]) out["set-cookie"] = [].concat(out["set-cookie"]).map(hostOnlyCookie);
+    res.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.statusMessage, out);
+    upstreamResponse.pipe(res);
+    upstreamResponse.on("error", () => res.destroy());
+    upstreamResponse.on("close", () => { if (!upstreamResponse.complete) res.destroy(); });
+  });
+  upstream.on("error", () => { clearTimers(); console.error(`runtime_gateway.host_upstream_unavailable: host=${host}`); hostFailure(res, 502); });
+  // A closed browser must release the upstream, whether it was uploading or holding a stream open.
+  res.on("close", () => { clearTimers(); upstream.destroy(); });
+  req.on("error", () => upstream.destroy());
+  req.pipe(upstream);
+}
+
+async function handleHostMode(req, res, mode) {
+  if (!mode.valid) return hostNotFound(res);
+  if (typeof req.url !== "string" || !req.url.startsWith("/")) return json(res, 400, { error: "BAD_REQUEST" });
+  // Before any lookup, so a known trip and an unknown name answer identically.
+  const internal = internalApiPath(req.url);
+  if (internal === "unreadable") return json(res, 400, { error: "BAD_REQUEST" });
+  if (internal) return hostNotFound(res);
+  let route;
+  try { route = await hostRouteFor(mode.host); }
+  catch (error) {
+    console.error(`runtime_gateway.host_lookup_failed: host=${mode.host} status=${error?.statusCode ?? 503}`);
+    return hostFailure(res, 503);
+  }
+  if (!route) return hostNotFound(res);
+  return proxyToHost(req, res, mode.host, route);
+}
+
 export function createRuntimeGateway() {
   return http.createServer(async (req, res) => {
     try {
+      const hostMode = hostModeFor(req);
+      if (hostMode) return await handleHostMode(req, res, hostMode);
       const url = new URL(req.url, RUNTIME_ORIGIN);
       if (url.pathname === "/health") return json(res, 200, { ok: true });
       const internal = url.pathname.match(/^\/internal\/t\/([^/]+)\/participants$/);
@@ -492,6 +822,8 @@ export function createRuntimeGateway() {
       if (internal && req.method === "GET") return await listParticipants(req, res, decodeURIComponent(internal[1]));
       const binding = url.pathname.match(/^\/internal\/t\/([^/]+)\/participants\/(adopt|release)$/);
       if (binding && req.method === "POST") return await bindingAction(req, res, decodeURIComponent(binding[1]), binding[2]);
+      const internalPlanChanges = url.pathname.match(/^\/internal\/t\/([^/]+)\/plan-changes$/);
+      if (internalPlanChanges && req.method === "GET") return await planChanges(req, res, decodeURIComponent(internalPlanChanges[1]), url.searchParams);
       const internalParticipant = url.pathname.match(/^\/internal\/t\/([^/]+)\/participants\/([^/]+)$/);
       if (internalParticipant && req.method === "GET") return await participantExists(req, res, decodeURIComponent(internalParticipant[1]), decodeURIComponent(internalParticipant[2]));
       const match = url.pathname.match(/^\/t\/([^/]+)(\/.*)?$/);
@@ -538,6 +870,7 @@ export function createRuntimeGateway() {
       }
       // Internal identity endpoints are exclusively server-to-server.
       if (isInternalPath(suffix)) return json(res, 404, { error: "NOT_FOUND" });
+
 
       let session = decodeSession(cookieValue(req, cookieName(tripId)));
       if (session && session.tripId !== tripId) session = null;

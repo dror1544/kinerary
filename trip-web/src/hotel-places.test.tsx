@@ -29,7 +29,7 @@ describe("Journey 'Tonight'", () => {
     render(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
         <JourneyView itinerary={{ revision: "t", days: [{ phase_id: "colmar", date: "2090-03-11", label_en: "Walk", lodging_context: null }], items: [] }}
-          config={config(resolved, { lat: 48.0794, lng: 7.3585, name: "Colmar" })} lang="en" onHeroPhaseChange={() => {}} focus={{ phaseId: "colmar", date: "2090-03-11" }} />
+          config={config(resolved, { lat: 48.0794, lng: 7.3585, name: "Colmar" })} lang="en" focus={{ phaseId: "colmar", date: "2090-03-11" }} />
       </QueryClientProvider>,
     );
     const tonight = document.querySelector(".tonight-lodging") as HTMLElement;
@@ -69,7 +69,7 @@ describe("Journey item editor", () => {
     render(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
         <JourneyView itinerary={{ revision: "t", days: [{ phase_id: "colmar", date: "2090-03-10", label_en: "Arrive" }], items: [item] }}
-          config={config(resolved)} lang="en" isOrganizer onHeroPhaseChange={() => {}} focus={{ phaseId: "colmar", date: "2090-03-10" }} />
+          config={config(resolved)} lang="en" isOrganizer focus={{ phaseId: "colmar", date: "2090-03-10" }} />
       </QueryClientProvider>,
     );
     fireEvent.click(screen.getByRole("button", { name: /Edit$/ }));

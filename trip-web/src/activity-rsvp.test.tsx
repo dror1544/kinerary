@@ -22,10 +22,12 @@ it("opens RSVP inside the marked Journey card and saves to its existing RSVP rec
   const fetch = vi.fn(async () => new Response(JSON.stringify([]), { headers: { "content-type": "application/json" } }));
   vi.stubGlobal("fetch", fetch);
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  render(<QueryClientProvider client={client}><JourneyView config={config} itinerary={{ revision: "r1", days: [{ phase_id: "ny", date: item.date! }], items: [item, { ...item, item_uid: "other", text_en: "Lunch" }] }} lang="en" onHeroPhaseChange={vi.fn()} /></QueryClientProvider>);
+  render(<QueryClientProvider client={client}><JourneyView config={config} itinerary={{ revision: "r1", days: [{ phase_id: "ny", date: item.date! }], items: [item, { ...item, item_uid: "other", text_en: "Lunch" }] }} lang="en" /></QueryClientProvider>);
   expect(screen.queryByRole("link", { name: /Activity RSVPs/ })).not.toBeInTheDocument();
   expect(screen.getAllByRole("button", { name: "RSVP" })).toHaveLength(1);
-  expect(fetch).not.toHaveBeenCalled();
+  // Nothing about RSVPs or ratings is fetched until the panel is opened. (The Go chip asks for the trip's navigation-app
+  // setting; that is the day's row, not this panel.)
+  expect(fetch.mock.calls.filter((call) => !String((call as unknown as [string])[0]).includes("/api/settings"))).toEqual([]);
   const card = screen.getByRole("heading", { name: "Museum" }).closest("article")!;
   fireEvent.click(within(card).getByRole("button", { name: "RSVP" }));
   fireEvent.click(within(card).getByRole("button", { name: "Going" }));
@@ -53,8 +55,10 @@ it("saves an inline rating to the linked venue and shows the user's selection", 
   });
   vi.stubGlobal("fetch", fetch);
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  render(<QueryClientProvider client={client}><JourneyView config={{ phases: [{ id: "ny", venues: [{ id: "museum-venue", name: "Museum" }] }] }} itinerary={{ revision: "r1", days: [{ phase_id: "ny", date: item.date! }], items: [item] }} username="alice" lang="en" onHeroPhaseChange={vi.fn()} /></QueryClientProvider>);
-  expect(fetch).not.toHaveBeenCalled();
+  render(<QueryClientProvider client={client}><JourneyView config={{ phases: [{ id: "ny", venues: [{ id: "museum-venue", name: "Museum" }] }] }} itinerary={{ revision: "r1", days: [{ phase_id: "ny", date: item.date! }], items: [item] }} username="alice" lang="en" /></QueryClientProvider>);
+  // Nothing about RSVPs or ratings is fetched until the panel is opened. (The Go chip asks for the trip's navigation-app
+  // setting; that is the day's row, not this panel.)
+  expect(fetch.mock.calls.filter((call) => !String((call as unknown as [string])[0]).includes("/api/settings"))).toEqual([]);
   const card = screen.getByRole("heading", { name: "Museum" }).closest("article")!;
   fireEvent.click(within(card).getByRole("button", { name: "Rate" }));
   await waitFor(() => expect(within(card).getByRole("radio", { name: "5 out of 5 stars" })).toBeEnabled());
@@ -69,7 +73,7 @@ it("collapses activity panels, returns focus, and keeps unsaved input when reope
   vi.stubGlobal("fetch", vi.fn(async (url: string) => new Response(JSON.stringify(url === "/api/ratings" ? {} : []), { headers: { "content-type": "application/json" } })));
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const combined = { phases: [{ ...config.phases![0], venues: [{ id: "museum-venue", name: "Museum" }] }] };
-  render(<QueryClientProvider client={client}><JourneyView config={combined} itinerary={{ revision: "r1", days: [{ phase_id: "ny", date: item.date! }], items: [item] }} lang="en" onHeroPhaseChange={vi.fn()} /></QueryClientProvider>);
+  render(<QueryClientProvider client={client}><JourneyView config={combined} itinerary={{ revision: "r1", days: [{ phase_id: "ny", date: item.date! }], items: [item] }} lang="en" /></QueryClientProvider>);
   fireEvent.click(screen.getByRole("button", { name: "RSVP" }));
   fireEvent.change(screen.getByLabelText("RSVP note (optional)"), { target: { value: "Keep my note" } });
   fireEvent.click(screen.getByRole("button", { name: "Collapse RSVP" }));

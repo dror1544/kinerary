@@ -3369,6 +3369,18 @@ function ensurePlanDay(phaseId, date) {
   ).run(phaseId, date, HERMES_URL ? 'pending' : 'none');
 }
 
+// An item on no day is legitimate (an idea nobody has placed yet; the site lists it under
+// "Not on a day yet"), but a caller that meant a day and left the date out used to get a
+// response identical to success. The fields ride at the top level, next to the item's own,
+// so the one that reads the response cannot miss them. Only when the stored row has no date.
+function unscheduledNotice(row) {
+  if (row && row.date) return {};
+  return {
+    unscheduled: true,
+    note: "This item is on no day; the site lists it under 'Not on a day yet'. Pass date (YYYY-MM-DD) to put it on a day.",
+  };
+}
+
 app.post('/api/phases/:phase_id/plan', organizerOrAgentRequired, (req, res) => {
   if (!knownPhase(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
   const body = req.body || {};
@@ -3405,7 +3417,7 @@ app.post('/api/phases/:phase_id/plan', organizerOrAgentRequired, (req, res) => {
   ensurePlanDay(req.params.phase_id, date || null);
   journey.syncFromLegacy('legacy-plan-create');
   kickEnrichmentSoon();
-  res.status(201).json(joinBooking(created, { includeDrafts: true }));
+  res.status(201).json({ ...joinBooking(created, { includeDrafts: true }), ...unscheduledNotice(created) });
 });
 
 app.patch('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res) => {
@@ -3479,7 +3491,7 @@ app.patch('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res)
   const review = phaseMoved
     ? { review: { status: HERMES_URL ? 'queued' : 'unavailable', scope: 'phases', phases: [req.params.phase_id, targetPhase] } }
     : dateMoved ? { review: { status: HERMES_URL ? 'queued' : 'unavailable', scope: 'phase' } } : {};
-  res.json({ ...joinBooking(updated, { includeDrafts: true }), ...review });
+  res.json({ ...joinBooking(updated, { includeDrafts: true }), ...unscheduledNotice(updated), ...review });
 });
 
 app.delete('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res) => {

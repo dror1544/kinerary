@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
-from .models import CloudflareSpec, LxcSpec, ProxySpec, Topology
+from .models import CloudflareSpec, LxcSpec, ProvisioningError, ProxySpec, Topology
 
 
 class ProxmoxAdapter(Protocol):
@@ -71,17 +71,42 @@ class Provisioner:
     in an adapter rather than being silently applied by onboarding.
     """
 
-    def __init__(self, proxmox: ProxmoxAdapter, npm: NpmAdapter, cloudflare: CloudflareAdapter) -> None:
+    def __init__(
+        self,
+        proxmox: ProxmoxAdapter,
+        npm: NpmAdapter | None = None,
+        cloudflare: CloudflareAdapter | None = None,
+    ) -> None:
+        # npm and cloudflare are None for a deployment in wildcard routing: no
+        # proxy host, DNS record or tunnel rule is ever created for a trip, so no
+        # transport to NPM or Cloudflare is built (or needs credentials).
         self.proxmox = proxmox
         self.npm = npm
         self.cloudflare = cloudflare
 
-    def plan(self, topology: Topology) -> RollbackSnapshot:
-        candidates = [
-            ("proxmox_lxc", self.proxmox, topology.lxc),
+    def _candidates(self, topology: Topology) -> list[tuple[str, Any, Any]]:
+        """The resources this topology owns, in the order they are created.
+
+        Presence decides, not the `routing` label: a topology with no `npm:` or
+        `cloudflare:` section plans nothing for them, and one that has the
+        section plans it exactly as before. A section with no adapter to act on
+        it is refused rather than skipped - a skipped resource is a trip whose
+        hostname silently points nowhere.
+        """
+        candidates: list[tuple[str, Any, Any]] = [("proxmox_lxc", self.proxmox, topology.lxc)]
+        for resource, adapter, spec in (
             ("npm_proxy_host", self.npm, topology.proxy),
             ("cloudflare_tunnel_dns", self.cloudflare, topology.cloudflare),
-        ]
+        ):
+            if spec is None:
+                continue
+            if adapter is None:
+                raise ProvisioningError(f"topology {topology.name!r} has a {resource} but this provisioner has no adapter for it")
+            candidates.append((resource, adapter, spec))
+        return candidates
+
+    def plan(self, topology: Topology) -> RollbackSnapshot:
+        candidates = self._candidates(topology)
         changes: list[Change] = []
         rollback: list[RollbackEntry] = []
         lxc_prior: dict[str, Any] | None = None

@@ -1897,7 +1897,7 @@ async function loadAlerts(stack, h) {
 
   const [
     unreachable, jobs, notifications, stuck, awaiting, companionless, modelFailing, reported,
-    verificationFailed, bridgeCheckFailed, awaitingApproval, reachabilityStale, gatewaysDown, reconcilerSilent,
+    verificationFailed, bridgeCheckFailed, siteBridgeFailed, awaitingApproval, reachabilityStale, gatewaysDown, reconcilerSilent,
   ] = await Promise.all([
     runSql(stack, `SELECT t.slug, coalesce(t.unreachable_reason,'-')
                      FROM control_plane.trips t
@@ -2008,6 +2008,25 @@ async function loadAlerts(stack, h) {
                           AND ${tripClassSql(stack)} = 'live'
                         ORDER BY t.slug;`)
       : Promise.resolve([]),
+    // A live trip whose site cannot reach the SHARED trip-mcp bridge (the
+    // opposite direction to mcp_isolation): booking extraction and enrichment
+    // will fail. Recorded after the companion attaches, like mcp_isolation,
+    // so it is informational at the gate and only alerted here. Only a
+    // deployment with TRIP_MCP_BRIDGE=shared ever writes this check, so a
+    // per-trip deployment never sees the section. Latest row only, live trips
+    // only, granted columns only — the same shape as the query above.
+    hasVerification
+      ? runSql(stack, `SELECT t.slug,
+                              to_char(ve.observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI') || ' UTC'
+                         FROM control_plane.verification_evidence ve
+                         JOIN control_plane.trips t ON t.id = ve.trip_id
+                        WHERE ve.check_name = 'site_to_bridge'
+                          AND ve.outcome = 'failed'
+                          AND ve.observed_at = (SELECT max(ve2.observed_at) FROM control_plane.verification_evidence ve2
+                                                 WHERE ve2.trip_id = ve.trip_id AND ve2.check_name = ve.check_name)
+                          AND ${tripClassSql(stack)} = 'live'
+                        ORDER BY t.slug;`)
+      : Promise.resolve([]),
     // A job sitting in waiting_for_user_action for a while — a fresh plan
     // nobody has approved yet, or (2026-10-06) an approval that expired,
     // including while the trip was suspended: resumeTrip reverts that case
@@ -2063,7 +2082,7 @@ async function loadAlerts(stack, h) {
   ]);
   return {
     unreachable, jobs, notifications, stuck, awaiting, companionless, modelFailing, reported,
-    verificationFailed, awaitingApproval, bridgeCheckFailed, reachabilityStale, gatewaysDown, reconcilerSilent,
+    verificationFailed, awaitingApproval, bridgeCheckFailed, siteBridgeFailed, reachabilityStale, gatewaysDown, reconcilerSilent,
   };
 }
 
@@ -2090,7 +2109,7 @@ const GATEWAY_ALERT_TEXT = {
  */
 function alertSections({
   unreachable, jobs, notifications, stuck, awaiting, companionless, modelFailing, reported,
-  verificationFailed, awaitingApproval, bridgeCheckFailed, reachabilityStale, gatewaysDown = [], reconcilerSilent = [],
+  verificationFailed, awaitingApproval, bridgeCheckFailed, siteBridgeFailed = [], reachabilityStale, gatewaysDown = [], reconcilerSilent = [],
 }) {
   return [
     { title: "UNREACHABLE", label: "unreachable", rows: unreachable,
@@ -2121,6 +2140,11 @@ function alertSections({
     { title: "COMPANION BRIDGE CHECK FAILED", label: "companion bridge check failed", rows: bridgeCheckFailed,
       text: (r) => `${r[0]} — mcp_isolation failed as of ${r[1]}; the site is up, but its companion's bridge could not be confirmed able to reach the trip`,
       digest: (r) => `${md(r[0])} — mcp_isolation failed as of ${md(r[1])}; the site is up, but its companion's bridge could not be confirmed able to reach the trip` },
+    // The other direction: the trip site calling the shared bridge for booking
+    // extraction and enrichment (site_to_bridge, worker verification).
+    { title: "SITE CANNOT REACH SHARED BRIDGE", label: "site cannot reach shared bridge", rows: siteBridgeFailed,
+      text: (r) => `${r[0]} — site_to_bridge failed as of ${r[1]}; the site is up, but it could not be confirmed able to reach the shared trip-mcp bridge, so booking extraction and enrichment will fail`,
+      digest: (r) => `${md(r[0])} — site_to_bridge failed as of ${md(r[1])}; the site is up, but it could not be confirmed able to reach the shared trip-mcp bridge, so booking extraction and enrichment will fail` },
     // Distinct from a suspend/resume cycle, which handles its own expired
     // approval inline (admin-mutations.ts) — this is the trip that was never
     // suspended at all and just sat unapproved too long. (2026-10-06)

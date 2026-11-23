@@ -144,6 +144,27 @@ GATEWAY_RELAY_ID       this gateway's id, the HMAC token payload
 GATEWAY_RELAY_SECRET   per-gateway signing secret for the WS upgrade
 ```
 
+**What to put in `GATEWAY_RELAY_SECRET`** depends on the relay's
+`relay.gateway_key_mode` (architecture profile; #597 K1):
+
+| Mode | Value |
+|---|---|
+| `shared` (or the field absent) | the shared secret (`relay.gateway_secret_refs`) |
+| `both` or `derived` | `hex(HMAC-SHA256(<derivation master>, "kinerary-relay-gateway:v1:" + <GATEWAY_RELAY_ID>))`, the key derived for this gateway's own id |
+
+The derivation master is `relay.gateway_key_master_refs[0]`: a different secret
+from the shared one, one no gateway profile has held (the relay and the
+installer refuse to run when they are equal). The gateway signs `<id>:<exp>`
+with whatever string is there, so the same Hermes code works in every mode.
+This applies to the multiplexing gateway too: derive from its
+`GATEWAY_RELAY_ID` (the interviewer's declared id), not its profile name. Do not
+compute it by hand: `scripts/relay-rekey.py --profile <name>` plans and
+`--execute` writes it (only in `both` or `derived`; it restarts nothing, so
+restart the gateway afterwards). What the old shared secret opens: in `both`,
+still a gateway connection; in `derived`, nothing: a gateway left holding it is
+refused at the upgrade. Order: add the new derivation master, set `both`, re-key,
+restart the gateways, set `derived`.
+
 Put them in the profile's `.env`: `hermes_cli/env_loader.py` (~499) loads it
 into `os.environ` with `override=True`, so a value there becomes a genuine
 process global and reaches every served profile's sweep.

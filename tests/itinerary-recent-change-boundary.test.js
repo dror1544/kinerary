@@ -5,7 +5,7 @@
  *
  * This file is the evidence the boundary review reads. It starts the real trip
  * server three times — `features` absent, `plan_change_marks` on, and only
- * `site_video_layout` on — makes real plan edits through the agent key, and reads
+ * only the RETIRED `site_video_layout` named — makes real plan edits through the agent key, and reads
  * /api/itinerary/active and /api/today back as each kind of caller.
  *
  *   - a member never learns who changed or who added an item: no `recent_change`
@@ -140,14 +140,25 @@ describe('switches off: the pages are what they were, minus the author', () => {
     });
   });
 
-  test('AC-4: only site_video_layout on -> the server serves no recent_change', async () => {
-    await withServer({ site_video_layout: true }, async ({ member, agent, call, dataDir }) => {
+  // site_video_layout was retired on 2026-11-21 (the video layout is the only layout). A trip whose file still says it —
+  // every trip rolled out before the retirement — must keep working: the name is unregistered, so the site drops it at
+  // boot (logged, counted in the warnings, never named to a client) and nothing else changes.
+  test('AC-4 (retired switch): a trip file still naming site_video_layout boots, serves no recent_change, and tells the member nothing about it', async () => {
+    await withServer({ site_video_layout: true }, async ({ member, agent, call, dataDir, log }) => {
       await makeEdits({ agent, call, dataDir });
       for (const path of ['/api/itinerary/active', '/api/today']) {
-        assert.ok(!(await call(member, path)).text.includes('recent_change'));
+        const r = await call(member, path);
+        assert.equal(r.status, 200);
+        assert.ok(!r.text.includes('recent_change'));
       }
-      const cfg = (await call(member, '/api/config')).body;
-      assert.deepEqual(cfg.features, { site_video_layout: true }, 'the member page is told its layout switch and nothing more');
+      const cfg = await call(member, '/api/config');
+      assert.equal(cfg.status, 200);
+      assert.ok(!('features' in cfg.body), 'an unregistered name is not served: the member page gets no features node at all');
+      assert.ok(!cfg.text.includes('site_video_layout'), 'the retired name never reaches a member');
+      const warnings = await call(member, '/api/config/warnings');
+      assert.ok(!warnings.text.includes('site_video_layout'), 'the name is not in the warnings body either');
+      assert.match(warnings.text, /1 features entry is not honoured/, 'the entry is counted, so a stale file is visible to an organizer');
+      assert.match(log(), /"features\.site_video_layout" is not a registered switch/, 'and named once, in the server log');
     });
   });
 });

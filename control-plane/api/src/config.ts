@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { z } from "zod";
+import { GATEWAY_KEY_MODES } from "./relay/protocol.js";
 
 const secretReference = z.string().regex(
   // vault:// carries a #field selector because a KV secret holds several
@@ -25,6 +26,38 @@ function originOf(value: string, ctx: z.RefinementCtx): string {
   }
   return origin;
 }
+
+/**
+ * One entry of `web.runtime_upstream_allowed_hosts`: an exact hostname, an IPv4 address, or an IPv4 CIDR
+ * block (`10.0.0.0/16`). IPv6 is not supported: an IPv6 entry is refused at load rather than ignored, and
+ * a CIDR prefix shorter than /8 is refused because it would allow most of the address space. Lower-cased.
+ */
+const upstreamAllowedHost = z.string().trim().min(1).max(253).transform((value) => value.toLowerCase()).superRefine((value, ctx) => {
+  const cidr = /^(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})$/.exec(value);
+  const address = cidr?.[1] ?? value;
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(address)) {
+    if (!address.split(".").every((octet) => Number(octet) <= 255 && String(Number(octet)) === octet)) ctx.addIssue({ code: "custom", message: `${value} is not a dotted-quad IPv4 address` });
+    else if (cidr && (Number(cidr[2]) < 8 || Number(cidr[2]) > 32)) ctx.addIssue({ code: "custom", message: `${value}: the CIDR prefix must be between /8 and /32` });
+    return;
+  }
+  if (value.includes(":") || value.includes("/")) {
+    ctx.addIssue({ code: "custom", message: `${value}: only exact hostnames, IPv4 addresses and IPv4 CIDR blocks are supported` });
+    return;
+  }
+  // An IPv4 lookalike (octal or hex octets, fewer than four parts, one big number) is how a URL parser
+  // reads a host whose last label is numeric. Loaded as a hostname it would match nothing, so refuse it
+  // here and say what to write instead.
+  const labels = value.split(".");
+  const numericLabel = /^(?:\d+|0x[0-9a-f]*)$/;
+  if (numericLabel.test(labels[labels.length - 1] ?? "") || labels.every((label) => numericLabel.test(label))) {
+    ctx.addIssue({
+      code: "custom",
+      message: `${value} looks like an IPv4 address but is not a canonical dotted quad; write it as four decimal octets without leading zeros, for example 192.0.2.10`,
+    });
+    return;
+  }
+  if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/.test(value)) ctx.addIssue({ code: "custom", message: `${value} is not a hostname` });
+});
 
 export const GOOGLE_CLIENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*\.apps\.googleusercontent\.com$/;
 
@@ -141,6 +174,14 @@ export const architectureProfileSchema = z.object({
     google_client_secret_ref: removedGoogleField("google_client_secret_ref"),
     runtime_exchange_key_secret_ref: secretReference,
     runtime_upstream_host_suffixes: z.array(z.string().min(1).max(253).regex(/^[A-Za-z0-9.-]+$/)).min(1),
+    /**
+     * Where the host-mode route lookup (`GET /internal/runtime-routes/by-host/:host`) may send the gateway:
+     * exact hostnames, IPv4 addresses and IPv4 CIDR blocks (IPv6 is not supported), matched against the
+     * registered upstream's host. ABSENT or empty allows nothing, so that endpoint answers 503
+     * RUNTIME_ROUTE_INVALID for every host until an operator names the addresses trips live at. Separate from
+     * `runtime_upstream_host_suffixes`, which the per-trip-id endpoint keeps using unchanged.
+     */
+    runtime_upstream_allowed_hosts: z.array(upstreamAllowedHost).max(256).optional(),
     telegram_bot_username: z.string().regex(/^[A-Za-z0-9_]{5,32}$/),
     /**
      * The token of the bot whose Mini App signs people in. OPTIONAL, and absent
@@ -203,6 +244,32 @@ export const architectureProfileSchema = z.object({
      */
     gateway_secret_refs: z.array(secretReference).min(1),
     /**
+     * The DERIVATION masters (#597 K1; `deriveGatewayKey`), newest first: a
+     * rotation list like `gateway_secret_refs`, but a different secret that no
+     * gateway profile has ever held. `gateway_secret_refs` means "the
+     * shared-mode secrets" and nothing else; per-gateway keys are derived from
+     * these. Required when `gateway_key_mode` is `both` or `derived` (config
+     * load fails without it), and the relay and the companion control MCP
+     * refuse to start when one of these resolves to the same value as a
+     * `gateway_secret_refs` secret.
+     */
+    gateway_key_master_refs: z.array(secretReference).min(1).optional(),
+    /**
+     * Which key a gateway holds (#597 K1; `deriveGatewayKey`).
+     * `shared`: a gateway signs its token with a `gateway_secret_refs` secret
+     * itself, so a credential held for one gateway id is valid for every id.
+     * `derived`: a gateway holds `derive(gateway_key_master_refs[0], its id)`;
+     * `gateway_secret_refs` is not consulted, so a token signed with the shared
+     * secret is refused. `both`: either, for the changeover.
+     *
+     * One setting, read by both checkers: the relay connector (WebSocket
+     * upgrade and media plane) and the companion control MCP. A value that is
+     * not one of the three fails config load: an unknown mode quietly meaning
+     * "accept" is the failure to avoid. Absent is `shared`, today's behaviour,
+     * so shipping this switches nothing on.
+     */
+    gateway_key_mode: z.enum(GATEWAY_KEY_MODES).default("shared"),
+    /**
      * The shared trip bot's token, kept as its own ref because signup and trip
      * are distinct ROLES — not because they are guaranteed to be distinct bots.
      *
@@ -254,6 +321,23 @@ export const architectureProfileSchema = z.object({
       [profile.public_api.port, "public_api.port"],
       [profile.worker.health_port, "worker.health_port"],
     ]);
+    if (profile.relay.gateway_key_mode !== "shared") {
+      const masterRefs = profile.relay.gateway_key_master_refs;
+      if (!masterRefs || masterRefs.length === 0) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["relay", "gateway_key_master_refs"],
+          message: `relay.gateway_key_master_refs is required when relay.gateway_key_mode is ${profile.relay.gateway_key_mode}: `
+            + "per-gateway keys are derived from a secret no gateway profile has held, not from gateway_secret_refs",
+        });
+      } else if (masterRefs.some((ref) => profile.relay!.gateway_secret_refs.includes(ref))) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["relay", "gateway_key_master_refs"],
+          message: "relay.gateway_key_master_refs must not name a reference that is also in relay.gateway_secret_refs",
+        });
+      }
+    }
     const clash = taken.get(profile.relay.port);
     if (clash) {
       ctx.addIssue({

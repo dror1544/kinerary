@@ -30,9 +30,11 @@ import {
   type SessionScope,
 } from "./portal-scope.js";
 import { verifyMiniAppInitData, type VerifiedInitData } from "./telegram-webapp-auth.js";
-import { runtimeUpstreamFor } from "./runtime-upstream.js";
+import { runtimeUpstreamFor, UPSTREAM_SHARED_SQL, upstreamHostAllowed } from "./runtime-upstream.js";
 import { applyLinkPassword, attachSession, claimGateVerdict, consumeSignInLink, endClaimLeftGroup, peekClaimLink, purgeSignInLinkLeftovers, signInLinkAvailable, startSignInLink, warnOncePerMinute, type SignInLinkRequest } from "./sign-in-link.js";
 import { SiteReleaseError, attemptSiteRelease, compensateSiteBinding, type SiteReleaseOptions } from "./site-release-outbox.js";
+
+export { upstreamHostAllowed };
 
 // The gateway's key, compared in constant time (a plain !== leaks how many
 // leading bytes were right).
@@ -41,6 +43,7 @@ function exchangeKeyMatches(supplied: unknown, expected: string): boolean {
   const a = Buffer.from(supplied), b = Buffer.from(expected);
   return a.length === b.length && timingSafeEqual(a, b);
 }
+
 
 function opaque(prefix: string, bytes = 16): string {
   return `${prefix}_${randomBytes(bytes).toString("hex")}`;
@@ -427,6 +430,8 @@ export interface PortalDependencies {
   runtimeOrigin: string;
   runtimeExchangeKey: string;
   runtimeUpstreamHostSuffixes: readonly string[];
+  /** `web.runtime_upstream_allowed_hosts`: what the host-mode lookup may return. Absent allows nothing. */
+  runtimeUpstreamAllowedHosts?: readonly string[];
   telegramBotUsername: string;
   sessionTtlSeconds: number;
   enrollmentTtlSeconds: number;
@@ -2751,12 +2756,50 @@ function registerPortalRouteHandlers(app: FastifyInstance, deps: PortalDependenc
     return { live: true };
   });
 
+  // The by-trip-ID lookup answers where the gateway SENDS a trip's calls (session exchange, participant
+  // provisioning, session checks), not where a browser goes. A wildcard trip's private_url is its PUBLIC
+  // hostname, which host mode answers 404 for /api/internal/* - so when the route row registered a LAN
+  // upstream_url, that LAN origin is the answer, validated by the same
+  // upstreamHostAllowed the by-host lookup uses. A registered upstream that is not on the list, any upstream
+  // when there is no list, and one another ready route shares, are RUNTIME_ROUTE_INVALID - never a fall-back
+  // to the public URL. With no upstream_url (every row written before R2, every host-routed trip's) the answer
+  // is the private_url one it always was. private_url itself is untouched.
   app.get("/internal/runtime-routes/:tripId", async (request, reply) => {
     if (!exchangeKeyMatches(request.headers["x-api-key"], deps.runtimeExchangeKey)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
     const tripId = (request.params as { tripId?: string }).tripId ?? "";
-    // One lookup, shared with the group-line poller (runtime-upstream.ts), so both apply the same host allow-list.
-    const upstream = await runtimeUpstreamFor(deps.db, tripId, deps.runtimeUpstreamHostSuffixes);
+    // One lookup, shared with the group-line poller (runtime-upstream.ts), so both apply the same host allow-list
+    // and both reach a wildcard-routed trip at its registered LAN address. tripKey is the KIND of key, never a key.
+    const upstream = await runtimeUpstreamFor(deps.db, tripId, deps.runtimeUpstreamHostSuffixes, deps.runtimeUpstreamAllowedHosts);
     if (!upstream.ok) return reply.code(upstream.status).send({ error: upstream.error });
-    return { routeRef: upstream.routeRef, upstreamOrigin: upstream.upstreamOrigin, upstreamBasePath: upstream.upstreamBasePath };
+    return { routeRef: upstream.routeRef, upstreamOrigin: upstream.upstreamOrigin, upstreamBasePath: upstream.upstreamBasePath, tripKey: upstream.tripKey };
+  });
+
+  // The gateway's host mode asks "which trip is this Host?" (docs/runtime-session-exchange.md, "Host mode").
+  // The static `by-host` segment and the `:tripId` parameter cannot capture each other: this path has one more
+  // segment than that one, and a trip id that spelled "by-host" would still reach the other handler.
+  // Every "no" is the same 404 with the same body (no such host, not ready, no upstream, not a name), so the
+  // answer says nothing about which names exist. upstream_url is returned as an origin only, to the gateway,
+  // and only when its host is on the operator's allow-list.
+  app.get("/internal/runtime-routes/by-host/:host", async (request, reply) => {
+    if (!exchangeKeyMatches(request.headers["x-api-key"], deps.runtimeExchangeKey)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+    const notReady = () => reply.code(404).send({ error: "RUNTIME_NOT_READY" });
+    const host = String((request.params as { host?: string }).host ?? "").toLowerCase();
+    if (host.length > 253 || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(host)) return notReady();
+    const result = await deps.db.query<{ trip_id: string; route_ref: string; upstream_url: string; trip_key: string; shared: boolean }>(
+      `SELECT r.trip_id, r.route_ref, r.upstream_url, r.trip_key, ${UPSTREAM_SHARED_SQL} AS shared
+       FROM control_plane.runtime_routes r
+       WHERE r.public_host = $1 AND r.state = 'ready' AND r.upstream_url IS NOT NULL`, [host]);
+    const row = result.rows[0];
+    if (!row) return notReady();
+    // One LAN address, one trip: two ready routes on one address send each other's visitors (and keys) to one
+    // container, so neither is answered until an operator fixes the rows (boundary review of #599, F2).
+    if (row.shared) return reply.code(503).send({ error: "RUNTIME_ROUTE_INVALID" });
+    let upstream: URL;
+    try { upstream = new URL(row.upstream_url); } catch { return reply.code(503).send({ error: "RUNTIME_ROUTE_INVALID" }); }
+    if (!["http:", "https:"].includes(upstream.protocol) || upstream.username || upstream.password || upstream.pathname !== "/"
+      || upstream.search || upstream.hash || /[?#]/.test(row.upstream_url) || !upstreamHostAllowed(upstream.hostname, deps.runtimeUpstreamAllowedHosts)) {
+      return reply.code(503).send({ error: "RUNTIME_ROUTE_INVALID" });
+    }
+    return { tripId: row.trip_id, routeRef: row.route_ref, upstreamOrigin: upstream.origin, tripKey: row.trip_key };
   });
 }

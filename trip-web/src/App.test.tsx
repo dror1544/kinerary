@@ -21,7 +21,7 @@ import {
   uploadBookingAppleWallet,
   uploadBookingConfirmation,
 } from "./api";
-import App, { avatarUrl, BookingCreatePanel, BookingEditPanel, BudgetView, classicHrefForLocation, coordinatesFromLocationUrl, dailyMapStops, mapPins, MoreView, PhotosView, safeExternalUrl, wrappedMapIndex } from "./App";
+import App, { avatarUrl, BookingCreatePanel, BookingEditPanel, BudgetView, classicHrefForLocation, coordinatesFromLocationUrl, dailyMapStops, mapPins, AccountPage, PhotosView, safeExternalUrl, wrappedMapIndex } from "./App";
 
 afterEach(() => {
   cleanup();
@@ -145,14 +145,13 @@ describe("Modern trip SPA", () => {
 
     render(
       <QueryClientProvider client={new QueryClient()}>
-        <MoreView
+        <AccountPage
           lang="en"
           currentUser={{ username: "alice", name: "אליס", name_en: "Alice" }}
           config={{ participants: [
             { username: "alice", name: "אליס", name_en: "Alice", color: "#123456" },
             { username: "ben", name: "בן", name_en: "Ben", color: "#654321" },
           ] }}
-          openModule={vi.fn()}
         />
       </QueryClientProvider>,
     );
@@ -161,7 +160,6 @@ describe("Modern trip SPA", () => {
     expect(screen.getByText("Alice")).toBeInTheDocument();
     expect(screen.getByText("Ben")).toBeInTheDocument();
     expect(screen.getByText("You")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: /readiness/i })).toHaveAttribute("href", "#readiness");
   });
 
   it("fetches protected booking documents with the stored bearer token", async () => {

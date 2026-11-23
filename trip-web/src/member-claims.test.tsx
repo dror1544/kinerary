@@ -12,7 +12,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemberClaims } from "./member-claims";
-import { MoreView } from "./App";
+import { OrganizerSettings } from "./App";
 
 const BASE = "/t/trip_abcdefgh";
 const DANA = { claimId: "tpc_danaaaaaaaaa", travellerName: "Dana Levi", telegramFirstName: "Maya", telegramUsername: "maya_tg", via: "group_membership", claimedAt: "2026-11-20T08:00:00.000Z", lastSignedInAt: null };
@@ -191,7 +191,7 @@ describe("where it sits", () => {
   function renderMore(isOrganizer: boolean) {
     return render(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
-        <MoreView lang="en" isOrganizer={isOrganizer} config={{ participants: [{ username: "alice", name: "אליס", name_en: "Alice", color: "#123456" }] }} openModule={vi.fn()} />
+        <OrganizerSettings lang="en" isOrganizer={isOrganizer} config={{ participants: [{ username: "alice", name: "אליס", name_en: "Alice", color: "#123456" }] }} />
       </QueryClientProvider>,
     );
   }

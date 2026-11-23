@@ -6,7 +6,6 @@ import { api, type ActiveItinerary, type TripConfig } from "./api";
 import { useLiveEditGuard } from "./live-updates";
 import { StopsEditor } from "./stops-editor";
 import { NavAppSetting } from "./trip-settings";
-import { featureOn } from "./features";
 import { describeStopError, getStops, moveDay, stopTitle, STOP_CHANGE_KEYS, type StopRefusal } from "./stops";
 import {
   bi,
@@ -220,7 +219,7 @@ export function PlanTools({
         {tr(lang, "Back to trip planning", "חזרה לתכנון הטיול")}
       </a>
       <StopsEditor isOrganizer={isOrganizer} lang={lang} />
-      {isOrganizer && featureOn(config, "site_video_layout") ? <Section title={tr(lang, "Navigation app", "אפליקציית ניווט")}><NavAppSetting lang={lang} /></Section> : null}
+      {isOrganizer ? <Section title={tr(lang, "Navigation app", "אפליקציית ניווט")}><NavAppSetting lang={lang} /></Section> : null}
       <Section title={tr(lang, "Organizer plan tools", "כלי מסלול למארגן")}>
         <div className="parity-fields">
           <label>

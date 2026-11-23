@@ -390,6 +390,12 @@ export const getItinerary = () => api<unknown>("/api/itinerary/active").then((va
 }).parse(value) as ActiveItinerary);
 export const createItineraryItem = (input: ItineraryItemInput) => api<ItineraryMutation>("/api/itinerary/items", { method: "POST", body: JSON.stringify(input), headers: input.expected_revision ? {"If-Match":input.expected_revision} : {} });
 export const updateItineraryItem = (itemUid: string, input: ItineraryItemInput) => api<ItineraryMutation>(`/api/itinerary/items/${encodeURIComponent(itemUid)}`, { method: "PATCH", body: JSON.stringify(input), headers: input.expected_revision ? {"If-Match":input.expected_revision} : {} });
+/**
+ * Put an item that is on no day yet onto one. Only the phase and the day travel: the server's PATCH changes what
+ * it is sent, and the item's text is not being edited (sending it would also queue a re-enrichment).
+ */
+export const setItineraryItemDay = (itemUid: string, phaseId: string, date: string, revision?: string) =>
+  api<ItineraryMutation>(`/api/itinerary/items/${encodeURIComponent(itemUid)}`, { method: "PATCH", body: JSON.stringify({ phase_id: phaseId, date }), headers: revision ? { "If-Match": revision } : {} });
 export const deleteItineraryItem = (itemUid: string, revision?: string) => api<{ ok: true; revision: string }>(`/api/itinerary/items/${encodeURIComponent(itemUid)}`, { method: "DELETE", headers: revision ? {"If-Match": revision} : {} });
 export const getBookings = () => api<unknown>("/api/bookings").then((value) => z.array(bookingSchema).parse(value));
 export async function getAuthenticatedDocument(path: string) {

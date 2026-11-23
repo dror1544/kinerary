@@ -17,7 +17,10 @@ the one place the rules live, not two files kept in sync by hand.
    `trip-server`, etc. Ask "ready to deploy?" after committing; a commit
    instruction does not imply a deploy instruction.
    (Since 2026-11-14 one approval may cover a whole named rollout, and a
-   feature switch on a test trip needs none — see "Faster delivery" below.)
+   feature switch on a test trip needs none — see "Faster delivery" below.
+   Since 2026-11-20 the owner's **standing approval** covers routine deploys
+   by the lead session: it acts, verifies and reports afterwards, and asks
+   only for what "Standing deploy approval" below still names.)
 3. **Never commit binary files (PDFs, images, audio) into git.** They belong
    outside the repo — NFS, iCloud, wherever the deployment already syncs media
    from — not in the tree.
@@ -245,7 +248,48 @@ before it is briefed):
 request/response evidence for security paths; migration naming and the
 `-- rollback:` header; `kinerary-cp-release` with its snapshot before any VM
 upgrade; and the owner's own approval for a production deploy that carries a
-migration, which a rollout approval never implies.
+`breaking` migration, which a rollout approval never implies (narrowed on
+2026-11-20 from "any migration" — see below).
+
+## Standing deploy approval (owner's decision, 2026-11-20)
+
+Dror, after a day of per-step questions on the VM: *"Do not hold back anymore,
+I want fast deployment."* Every VM and trip change already has a way back — the
+release snapshot, the previous release kept on the trip, a switch turned off,
+the same command run again — so a question per step cost more than it guarded.
+
+**The lead session deploys without asking first, then verifies and reports**:
+a trip's deploy wrapper, a site or bridge restart, a rollout, promoting a
+release to `available`, a feature switch on one trip or on future trips, a VM
+upgrade whose `--dry-run` reports no `breaking` migration, a bot's settings.
+The report names what changed, what was checked and how to undo it.
+
+**It still asks first**, by the owner's same decision:
+
+- deleting a real trip or travellers' data (`teardown-trip.py --execute` on a
+  trip in use, anything that drops rows a person wrote);
+- a VM upgrade that carries a `breaking` migration, and a rollback that would
+  discard the database;
+- removing, stopping or recreating a shared container (hard rule 7, unchanged);
+- a feature switch for **every** trip (`--all`), which reaches the families'
+  trips in use at once.
+
+**A subagent still deploys nothing**, and Codex is not covered: the approval is
+the owner's to his lead session.
+
+**How the hook knows.** The grant is the owner's own, so it is set in *his*
+user settings, never in this repository: `KINERARY_STANDING_DEPLOY_APPROVAL=1`
+in the `env` of his `~/.claude/settings.json`. A second Kinerary does not
+inherit it, `codex-adapter.py` drops it, and unset every deploy asks exactly as
+before. Set, `pretooluse-bash.sh` gives **no decision** on a deploy that
+`match-command.py --deploy-class` calls `routine`, so the harness's own
+permission rules still judge the command; it never vouches for one. `routine`
+is an allow-list (`ROUTINE_DEPLOY`): a deploy verb not named there, any verb in
+`ASKING_DEPLOY`, and any command that also commits, merges or pushes still
+asks. `kinerary-cp-release upgrade` stays on the asking side, because only its
+dry run can see a `breaking` migration (a missing header reads as breaking):
+that is one click per VM release, after the dry run has said what it carries.
+Quiet deploys are logged as `standing` in the decision log.
 
 ## What this repo is
 
@@ -398,7 +442,8 @@ test database is dropped, a test Postgres it started is stopped, the tracked
 goes (kept, and named, when the run failed).
 
 `--deploy` **is** a deploy — hard rule 2 applies, and the hook prompts on this
-script whatever its flags. It refuses uncommitted tracked changes (a deploy has
+script whatever its flags, unless the owner's standing approval is set (it is on
+the routine list; see "Standing deploy approval"). It refuses uncommitted tracked changes (a deploy has
 to be a commit you can name) and a provisioning job that is mid-build.
 `--cleanup` removes only the trip whose id this run's signup returned, through
 `scripts/teardown-trip.py` — see below. If you touch a
@@ -757,7 +802,8 @@ Every rule in "Hard Rules" above is now checked by
 - **`.claude/settings.json` hooks** — Claude Code, early enough to steer rather
   than refuse. `git commit` and deploy verbs additionally become a *prompt*
   every time (bar the MVP-phase exemptions above: docs-only work and
-  feature-branch commits and pushes), because rules 1 and 2 are about intent
+  feature-branch commits and pushes; and routine deploys under the owner's
+  standing approval, 2026-11-20), because rules 1 and 2 are about intent
   and no script can check intent. Command classification lives in `scripts/claude-hooks/match-command.py`,
   which strips heredocs and quotes first — matching the bare words "git" and
   "commit" refuses any command that merely *writes documentation about* them.

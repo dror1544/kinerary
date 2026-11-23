@@ -39,7 +39,7 @@ class Harness(unittest.TestCase):
         for name in ("pretooluse-bash.sh", "match-command.py"):
             shutil.copy2(REPO / "scripts/claude-hooks" / name, self.root / "scripts/claude-hooks" / name)
         # Never the developer's own notes folder (a synced, slow share on some machines): see NotesDirIsNeverTheDevelopersOwn.
-        self.env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_") and k != "KINERARY_NOTES_DIR"}
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_") and k not in ("KINERARY_NOTES_DIR", "KINERARY_STANDING_DEPLOY_APPROVAL")}
         self.env["HERMES_HOME"] = self.hermes.name
         self.log = self.root.parent / (self.root.name + "-decisions.tsv")
         self.env["KINERARY_HOOK_LOG"] = str(self.log)  # never the real log
@@ -1046,6 +1046,102 @@ class OneRolloutIsOneApproval(Harness):
         self.hook(self.execute(digest))
         rows = [line.split("\t") for line in self.log.read_text().splitlines()]
         self.assertEqual(("lead", "deploy", "ask"), tuple(rows[-1][2:5]))
+
+
+
+class StandingDeployApproval(Harness):
+    """Dror, 2026-11-20 ("I want fast deployment"): with the owner's opt-in
+    (KINERARY_STANDING_DEPLOY_APPROVAL, set in HIS user settings, never in the repo) a
+    routine deploy in the lead session is not asked by this hook. It is not vouched for
+    either: the hook gives no decision, so the harness still judges the command. Hard
+    rule 7, data deletion, the VM's version and every-trip switches ask as before; a
+    subagent is refused as before; unset, nothing changes."""
+
+    ROUTINE = (
+        "kinerary-deploy/trips/alpha-2026/deploy.sh",
+        "bash ~/kinerary-deploy/bring-up.sh",
+        "scripts/preflight-deploy.sh --deploy --auto --scenario none",
+        "ssh h 'sudo systemctl restart trip-server'",
+        "ssh h 'sudo kinerary-cp-release restart-bridges'",
+        "ssh h 'cd /opt/k/control-plane/api && sudo env A=b npm run --silent release -- promote rls_1 --to available'",
+        "ssh h 'cd /opt/k/control-plane/api && sudo env A=b npm run --silent feature -- set video on --trip alpha-2026 --live --by dror'",
+        "npm run feature -- set video on --new-trips --live --by dror",
+        "python3 scripts/trip-rollout.py execute --plan-file p.json --plan-digest sha256:" + "a" * 64,
+        "cd ~/kinerary-deploy && ./setup-mcp.sh --restart-only --trip-dir ./trips/alpha-2026",
+        "launchctl kickstart -k gui/501/ai.hermes.gateway-alpha",
+    )
+    STILL_ASKS = (
+        "docker rm -f kinerary-sprint5-testdb",
+        "docker stop kinerary-cp-api-1",
+        "docker compose -f x.yml down",
+        "docker compose -f x.yml up -d --build",
+        "docker restart kinerary-cp-api-1",
+        "docker compose up -d --force-recreate api",
+        "scripts/teardown-trip.py --trip alpha-2026 --execute",
+        "ssh h 'sudo kinerary-cp-release upgrade c7b6e7ac'",
+        "ssh h 'sudo kinerary-cp-release rollback'",
+        "ssh h 'sudo kinerary-cp-release prune'",
+        "control-plane/deployment/vm-restore-snapshot.sh --execute pre-x",
+        "ssh root@pve 'qm rollback 110 pre-x'",
+        "ssh root@pve vzdump 110",
+        "npm run feature -- set video on --all --live --by dror",
+        "kinerary-deploy/retarget-container.sh alpha beta",
+        "curl -X POST https://cp/v1/admin/feature-switches -d @body.json",
+    )
+    CHAINED = (
+        "kinerary-deploy/trips/a/deploy.sh && docker rm -f kinerary-sprint5-testdb",
+        "ssh h 'sudo systemctl restart trip-server; sudo kinerary-cp-release rollback'",
+        "kinerary-deploy/trips/a/deploy.sh && git push --force origin main",
+        "kinerary-deploy/trips/a/deploy.sh; git commit -m x",
+        "kinerary-deploy/trips/a/deploy.sh && gh pr merge 1",
+    )
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(self.log.unlink, missing_ok=True)
+
+    def opt_in(self, value="1"):
+        self.env["KINERARY_STANDING_DEPLOY_APPROVAL"] = value
+
+    def test_unset_every_routine_deploy_still_asks(self):
+        for command in self.ROUTINE:
+            self.assertEqual(self.hook(command).get("permissionDecision"), "ask", command)
+
+    def test_opted_in_a_routine_deploy_gets_no_decision_at_all(self):
+        self.opt_in()
+        for command in self.ROUTINE:
+            self.assertEqual(self.hook(command), {}, command)  # not "allow": the harness still judges it
+
+    def test_opted_in_the_protected_verbs_still_ask(self):
+        self.opt_in()
+        for command in self.STILL_ASKS:
+            self.assertEqual(self.hook(command).get("permissionDecision"), "ask", command)
+
+    def test_opted_in_a_protected_verb_chained_to_a_routine_one_still_asks(self):
+        self.opt_in()
+        for command in self.CHAINED:
+            self.assertEqual(self.hook(command).get("permissionDecision"), "ask", command)
+
+    def test_opted_in_a_subagent_is_still_refused(self):
+        self.opt_in()
+        for command in self.ROUTINE[:3]:
+            self.assertEqual(self.hook(command, agent_type="developer").get("permissionDecision"), "deny", command)
+
+    def test_a_falsy_value_is_not_an_opt_in(self):
+        for value in ("0", "false", "no", "off", ""):
+            self.opt_in(value)
+            self.assertEqual(self.hook(self.ROUTINE[0]).get("permissionDecision"), "ask", value)
+
+    def test_a_quiet_deploy_is_still_counted(self):
+        self.opt_in()
+        self.hook(self.ROUTINE[0])
+        rows = [line.split("\t") for line in self.log.read_text().splitlines()]
+        self.assertEqual(("lead", "deploy", "standing"), tuple(rows[-1][2:5]))
+
+    def test_commits_and_pushes_are_untouched_by_the_opt_in(self):
+        self.opt_in()
+        self.assertEqual(self.hook("git push origin main").get("permissionDecision"), "ask")
+        self.assertEqual(self.hook("gh pr merge 1").get("permissionDecision"), "ask")
 
 
 if __name__ == "__main__":

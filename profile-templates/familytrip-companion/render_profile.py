@@ -200,6 +200,15 @@ def install(bundle,name,release=None):
  home=Path.home()/'.hermes/profiles'/name
  if home.exists(): bad(f'refusing to overwrite existing profile: {home}')
  subprocess.run(['hermes','profile','create',name,'--no-skills','--description',f'Trip companion for {name}'],check=True)
+ # Hermes 2026.9.24's `profile create` seeds the NEW profile's config.yaml with the host root profile's `model:` block.
+ # The overlay merge (scripts/companion-install-host.sh) lets an existing config win, so the seed beat the template's
+ # model: the real Alsace companion ran the root's anthropic/claude-opus-4.6 with no Anthropic credentials, Mac
+ # companions got haiku or gpt-5.6-luna. Nothing here has been written by a person or an earlier install (the refusal
+ # above means this directory did not exist a moment ago), so whatever config.yaml is in it IS the seed, and goes: "the
+ # existing config wins" then only ever means a config somebody wrote. A missing config.yaml is the state the merge
+ # already handles (it writes the overlay).
+ seeded=home/'config.yaml'
+ if seeded.is_symlink() or seeded.is_file(): seeded.unlink()
  for rel in ('SOUL.md','profile.yaml','references','skills','INSTALL.md','config.overlay.yaml'):
   s=bundle/rel; q=home/rel
   shutil.copytree(s,q,dirs_exist_ok=True) if s.is_dir() else shutil.copy2(s,q)

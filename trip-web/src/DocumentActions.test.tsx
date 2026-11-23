@@ -32,7 +32,7 @@ beforeEach(() => {
   render(
     <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
       <JourneyView itinerary={{ revision: "t", days: [{ phase_id: "colmar", date: "2090-03-10", label_en: "Arrive" }], items: [item] }}
-        lang="en" onHeroPhaseChange={() => {}} focus={{ phaseId: "colmar", date: "2090-03-10" }} />
+        lang="en" focus={{ phaseId: "colmar", date: "2090-03-10" }} />
     </QueryClientProvider>,
   );
 });

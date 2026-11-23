@@ -114,6 +114,8 @@ export const PORTAL_SCOPE_POLICY: Readonly<Record<string, RouteScope>> = Object.
   // portal route; `available` is only the question "is this person this trip's organizer", which the button needs to be drawn.
   "POST /internal/member-invites/available": "open",
   "POST /internal/member-invites/create": "open",
+  // The gateway's host mode asks which trip a Host header names. Exchange-key authenticated, no cookie read.
+  "GET /internal/runtime-routes/by-host/:host": "open",
 
   "GET /v1/me": "session",
   "POST /v1/logout": "session",

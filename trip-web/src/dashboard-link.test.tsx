@@ -8,7 +8,7 @@ afterEach(cleanup);
 
 const noop = vi.fn();
 function renderMenu(currentUser: CurrentUser | undefined, lang: "en" | "he" = "en") {
-  return render(<AppMenu open lang={lang} currentUser={currentUser} isOrganizer={Boolean(currentUser?.is_organizer)} setOpen={noop} setLang={noop} openTab={noop} openModule={noop} />);
+  return render(<AppMenu open lang={lang} currentUser={currentUser} isOrganizer={Boolean(currentUser?.is_organizer)} setOpen={noop} setLang={noop} openModule={noop} openVideoTab={noop} />);
 }
 
 describe("the organizer's way back to the dashboard", () => {

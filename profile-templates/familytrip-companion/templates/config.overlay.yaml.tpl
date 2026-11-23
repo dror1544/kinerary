@@ -15,7 +15,8 @@
 # reach tools it could not see is what a free overloaded model does under
 # pressure; the model chain is the reason it was under pressure.
 #
-# `gpt-5.6-terra` is verified against this deployment's own Codex login (a
+# `gpt-6.1-terra` is the primary since 2026-11-21 (owner's choice; before it,
+# `gpt-5.6-terra`). It is verified against this deployment's own Codex login (a
 # one-word prompt, exit 0). Anthropic is NOT in the chain: the credential lists
 # in `hermes auth list` and still does not resolve in the agent runtime — on the
 # VM root profile as well as in a companion — so an entry for it buys a failed
@@ -25,7 +26,7 @@
 # The free tiers stay as LAST resorts rather than second choices: a slow answer
 # from a real model beats a fast one from an overloaded free endpoint.
 model:
-  default: gpt-5.6-terra
+  default: gpt-6.1-terra
   provider: openai-codex
 fallback_providers:
   - provider: ollama-cloud
@@ -61,7 +62,7 @@ context_file_max_chars: 120000
 # Same account, same reason as the chain above: a delegation configured onto a
 # provider with no working credential fails at the moment it is needed.
 delegation:
-  model: gpt-5.6-terra
+  model: gpt-6.1-terra
   provider: openai-codex
 mcp_servers:
   $SITE_CONNECTION_NAME:

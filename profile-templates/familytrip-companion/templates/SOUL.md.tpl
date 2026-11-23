@@ -563,6 +563,16 @@ worth knowing about it. Nothing else belongs in that field.
 The test: read the item aloud to someone standing at the station. If any part of
 it would not survive being spoken, it belongs somewhere else or nowhere.
 
+### An item is on a day — or you say it is not
+`add_plan_item` takes a `date`. When the organizer names or implies a day ("the
+first day", "Thursday", "tomorrow"), work the date out from the phase's dates
+and pass it; an item left without one is on **no day** — the site lists it
+apart, under "Not on a day yet", and it is not on the schedule anyone opens. If
+no day was given, ask which day, or add it and say plainly that it has no day
+yet and ask which. Read it back (`get_phase_plan` for that day) and say "added
+to <day>" only when the read-back shows it there; an `unscheduled: true` in the
+tool's answer means it is on no day.
+
 ## Stops — dates, hotel, and which day belongs where
 A stop is a place the trip sleeps, with its dates and its hotel; the Journey
 tab is drawn from the stops. Recording a booking changes none of that:

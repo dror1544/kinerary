@@ -1,6 +1,6 @@
 /// <reference types="node" />
 /**
- * Video Release 1, look polish (Dror's review of the live staging site, 2026-11-17), all behind `site_video_layout`:
+ * Video Release 1, look polish (Dror's review of the live staging site, 2026-11-17):
  *   1. the hero photo shows (no teal wash over it); the teal gradient stays over the skyline when there is no photo;
  *   2. the navigation-app setting lives in Plan tools, organizer only (the Go chips are pinned in day-card.test.tsx);
  *   3. no "More" kicker above the More page's heading;
@@ -70,7 +70,7 @@ describe("3. the header's More button is the menu icon alone", () => {
   };
 
   it("video layout: no visible word, still named for assistive tech, and the More page's own label is untouched", async () => {
-    serve({ site_video_layout: true });
+    serve({});
     const { container } = renderTrip();
     const button = await screen.findByRole("button", { name: "More" });
     expect(button).toHaveAttribute("aria-label", "More");
@@ -81,17 +81,10 @@ describe("3. the header's More button is the menu icon alone", () => {
 
   it("Hebrew: the button is named עוד and shows no word", async () => {
     localStorage.setItem("tripLang", "he");
-    serve({ site_video_layout: true });
+    serve({});
     renderTrip();
     const button = await screen.findByRole("button", { name: "עוד" });
     expect(button.textContent?.trim()).toBe("");
-  });
-
-  it("the More page keeps its label above the heading", async () => {
-    serve({ site_video_layout: true });
-    const { container } = renderTrip({ hash: "more" });
-    await screen.findByRole("heading", { name: "Everything for your trip" });
-    expect(container.querySelector(".more-layout .section-heading .panel-label")?.textContent).toContain("More");
   });
 
   it("the tap target is at least 44px", () => {
@@ -102,7 +95,7 @@ describe("3. the header's More button is the menu icon alone", () => {
 });
 
 describe("2. the navigation app setting in Plan tools", () => {
-  const serve = (user?: Record<string, unknown>, features: Record<string, boolean> = { site_video_layout: true }) => {
+  const serve = (user?: Record<string, unknown>, features: Record<string, boolean> = {}) => {
     const items = dayItems();
     return stubTripFetch(() => ({ config: config(features), today: todayContext(items), items, user, settings: { nav_app: "google" } }));
   };
@@ -135,20 +128,13 @@ describe("2. the navigation app setting in Plan tools", () => {
     await screen.findByText("Organizer access required.");
     expect(screen.queryByRole("combobox", { name: "Navigation app" })).toBeNull();
   });
-
-  it("with the switch off Plan tools has no navigation setting (there is no Go chip to steer)", async () => {
-    serve(undefined, {});
-    renderTrip({ hash: "plan-tools" });
-    await screen.findByRole("link", { name: /Back to trip planning/ });
-    expect(screen.queryByRole("combobox", { name: "Navigation app" })).toBeNull();
-  });
 });
 
 describe("4. no arrow on a row: the row itself is the control", () => {
   const withProvenance = () => dayItems().map((entry) => (entry.item_uid === "dinner" ? { ...entry, provenance: { status: "updated_from_original" } } : entry));
   const servePlan = () => {
     const items = withProvenance();
-    stubTripFetch(() => ({ config: config({ site_video_layout: true, plan_change_marks: true }), today: todayContext(items), items }));
+    stubTripFetch(() => ({ config: config({ plan_change_marks: true }), today: todayContext(items), items }));
   };
   const dinnerRow = async () => (await screen.findByRole("heading", { name: "Dinner at the Winstub" })).closest("article") as HTMLElement;
 
@@ -222,7 +208,7 @@ describe("5. room under the fixed bottom bar", () => {
   });
 
   it("the app root carries the video-layout class only with the switch on", async () => {
-    stubTripFetch(() => ({ config: config({ site_video_layout: true }), today: todayContext(dayItems()), items: dayItems() }));
+    stubTripFetch(() => ({ config: config({}), today: todayContext(dayItems()), items: dayItems() }));
     const on = renderTrip();
     await screen.findByRole("region", { name: /Thursday/ });
     expect(on.container.querySelector(".modern-trip-app.video-layout")).not.toBeNull();

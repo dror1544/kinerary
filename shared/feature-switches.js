@@ -51,12 +51,10 @@ const FEATURE_SWITCHES = Object.freeze([
     surfaces: Object.freeze(['site']),
     memberVisible: true,
   }),
-  Object.freeze({
-    name: 'site_video_layout',
-    summary: 'Modern site: video layout (Today · Plan · Bookings · Photos, day card, Go chip)',
-    surfaces: Object.freeze(['site']),
-    memberVisible: true,
-  }),
+  // `site_video_layout` is RETIRED (owner, 2026-11-21: the classic layout is gone, the video layout is the only one, so
+  // there is nothing left to switch). Removed from this list with its off branch, as 567-feature-switches.md decision 3
+  // says a finished switch is. A trip file or a stored setting that still names it is harmless: an unregistered name is
+  // off, the site drops it at boot with a log line, and the operator command refuses to set it.
   Object.freeze({
     name: 'plan_change_marks',
     summary: 'Plan items carry recent_change; Updated/New badges and "Updated for everyone" on the site',

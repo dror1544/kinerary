@@ -1,9 +1,9 @@
 /**
- * The tabs and the header of the video layout (AC-5, AC-6, and AC-1's "the current layout when off" /
- * AC-4's "the layout ignores the markers when only plan_change_marks is on").
+ * The tabs and the header of the video layout (AC-5, AC-6). It is the only layout since 2026-11-21: there is no
+ * switch for it, and a trip file that still names the retired `site_video_layout` gets the same page.
  *
- * The whole App, against a fetch stand-in: the switch arrives the way it does in life, in the `features`
- * node of GET /api/config, and is read through `featureOn` (literal true, or off).
+ * The whole App, against a fetch stand-in: `plan_change_marks`, the one switch left, arrives the way it does in life,
+ * in the `features` node of GET /api/config, and is read through `featureOn` (literal true, or off).
  */
 import { cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -19,45 +19,40 @@ function serve(features?: Record<string, unknown>, user?: Record<string, unknown
 const nav = () => screen.getByRole("navigation", { name: "Primary" });
 const tabNames = () => within(nav()).getAllByRole("link").map((link) => link.textContent?.trim());
 
-describe("switches off: the current layout (AC-1, AC-4)", () => {
-  it("shows Today · Journey · Moments · More, the current header, and no video-layout root", async () => {
+describe("the video layout is the only layout (owner, 2026-11-21)", () => {
+  it("a trip with no `features` at all gets it, from the first paint, before the config has even arrived", async () => {
     serve(undefined);
     const { container } = renderTrip();
-    await screen.findByText("Colmar", { selector: "h1" }).catch(() => undefined);
-    expect(tabNames()).toEqual(["Today", "Journey", "Moments", "More"]);
-    await waitFor(() => expect(container.querySelector(".modern-trip-app")).not.toBeNull());
-    expect(container.querySelector(".video-layout")).toBeNull();
-    expect(container.querySelector(".video-hero")).toBeNull();
-    expect(screen.queryByRole("link", { name: /^Go to / })).toBeNull();
+    // Synchronously after render: nothing has been fetched yet, so the config is still undefined.
+    expect(container.querySelector(".modern-trip-app.video-layout")).not.toBeNull();
+    expect(container.querySelector(".video-hero")).not.toBeNull();
+    expect(within(nav()).getAllByRole("link").map((link) => link.textContent?.trim())).toEqual(["Today", "Plan", "Bookings", "Photos"]);
+    expect(await screen.findByRole("heading", { level: 1, name: "Colmar · Today" })).toBeInTheDocument();
   });
 
-  it("with only plan_change_marks on the layout is still the current one and the markers are ignored without error", async () => {
-    serve({ plan_change_marks: true });
-    const { container } = renderTrip();
-    // The current Today shows only the next item; markers on the data change nothing about it.
-    await waitFor(() => expect(screen.getAllByText("Winery tour").length).toBeGreaterThan(0));
-    expect(tabNames()).toEqual(["Today", "Journey", "Moments", "More"]);
-    expect(container.querySelector(".video-layout")).toBeNull();
-    expect(screen.queryByText("Updated")).toBeNull();
-    expect(container.querySelector(".change-badge")).toBeNull();
-    expect(container.querySelector("del")).toBeNull();
-  });
-
-  it("anything but the literal true is off", async () => {
-    for (const value of ["true", 1, "yes", {}]) {
+  it("the retired `site_video_layout` switch, whatever a trip's file still says, changes nothing", async () => {
+    for (const value of [true, false, "true", 1, "yes", {}]) {
       serve({ site_video_layout: value });
       const { container, unmount } = renderTrip();
-      await waitFor(() => expect(container.querySelector(".modern-trip-app")).not.toBeNull());
-      await new Promise((resolve) => setTimeout(resolve, 30));
-      expect(tabNames(), JSON.stringify(value)).toEqual(["Today", "Journey", "Moments", "More"]);
+      expect(await screen.findByRole("heading", { level: 1, name: "Colmar · Today" }), JSON.stringify(value)).toBeInTheDocument();
+      expect(tabNames(), JSON.stringify(value)).toEqual(["Today", "Plan", "Bookings", "Photos"]);
+      expect(container.querySelector(".modern-trip-app.video-layout"), JSON.stringify(value)).not.toBeNull();
       unmount();
     }
+  });
+
+  it("the change marks still follow their own switch: off, a marker the server handed is not drawn", async () => {
+    serve(undefined);
+    const { container } = renderTrip();
+    await screen.findByRole("region", { name: /Thursday/ });
+    expect(container.querySelector(".change-badge")).toBeNull();
+    expect(container.querySelector("del")).toBeNull();
   });
 });
 
 describe("AC-5: the video layout", () => {
   it("bottom bar reads Today · Plan · Bookings · Photos and the header says \"Colmar · Today\"", async () => {
-    serve({ site_video_layout: true });
+    serve();
     const { container } = renderTrip();
     expect(await screen.findByRole("heading", { level: 1, name: "Colmar · Today" })).toBeInTheDocument();
     expect(tabNames()).toEqual(["Today", "Plan", "Bookings", "Photos"]);
@@ -67,7 +62,7 @@ describe("AC-5: the video layout", () => {
   });
 
   it("More is a header button; its menu lists the modules that are no longer tabs, and Organizer settings", async () => {
-    serve({ site_video_layout: true });
+    serve();
     renderTrip();
     const more = await screen.findByRole("button", { name: "More" });
     fireEvent.click(more);
@@ -82,8 +77,19 @@ describe("AC-5: the video layout", () => {
     expect(within(menu).getByRole("link", { name: "Open Classic organizer fallback" })).toBeInTheDocument();
   });
 
+  it("Readiness (tasks, packing, useful information) is a menu entry that opens #readiness, for a member too", async () => {
+    serve(undefined, { username: "bat", name_en: "Bat", is_organizer: false });
+    renderTrip();
+    fireEvent.click(await screen.findByRole("button", { name: "More" }));
+    const menu = await screen.findByRole("dialog", { name: "Trip menu" });
+    fireEvent.click(within(menu).getByRole("button", { name: "Readiness" }));
+    expect(window.location.hash).toBe("#readiness");
+    expect(await screen.findByRole("heading", { level: 1, name: "Colmar · Readiness" })).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Trip menu" })).toBeNull();
+  });
+
   it("a member's menu has no Plan tools and no Classic link", async () => {
-    serve({ site_video_layout: true }, { username: "bat", name_en: "Bat", is_organizer: false });
+    serve(undefined, { username: "bat", name_en: "Bat", is_organizer: false });
     renderTrip();
     fireEvent.click(await screen.findByRole("button", { name: "More" }));
     const menu = await screen.findByRole("dialog", { name: "Trip menu" });
@@ -93,7 +99,7 @@ describe("AC-5: the video layout", () => {
 
   it("Hebrew: היום · תוכנית · הזמנות · תמונות, right-to-left", async () => {
     localStorage.setItem("tripLang", "he");
-    serve({ site_video_layout: true });
+    serve();
     renderTrip();
     expect(await screen.findByRole("heading", { level: 1, name: "קולמר · היום" })).toBeInTheDocument();
     expect(tabNames()).toEqual(["היום", "תוכנית", "הזמנות", "תמונות"]);
@@ -102,7 +108,7 @@ describe("AC-5: the video layout", () => {
   });
 
   it("the tabs navigate: Plan, Bookings, Photos, and the header follows", async () => {
-    serve({ site_video_layout: true });
+    serve();
     renderTrip();
     await screen.findByRole("heading", { level: 1, name: "Colmar · Today" });
     fireEvent.click(within(nav()).getByRole("link", { name: "Plan" }));
@@ -118,7 +124,7 @@ describe("AC-5: the video layout", () => {
 
 describe("AC-6: old addresses keep working", () => {
   it("#journey opens Plan", async () => {
-    serve({ site_video_layout: true });
+    serve();
     renderTrip({ hash: "journey" });
     expect(await screen.findByRole("heading", { level: 1, name: "Colmar · Plan" })).toBeInTheDocument();
     expect(within(nav()).getByRole("link", { name: "Plan" })).toHaveClass("active");
@@ -126,31 +132,24 @@ describe("AC-6: old addresses keep working", () => {
   });
 
   it("#moments opens Photos, with Moments as a section inside it", async () => {
-    serve({ site_video_layout: true });
+    serve();
     renderTrip({ hash: "moments" });
     expect(await screen.findByRole("heading", { level: 1, name: "Colmar · Photos" })).toBeInTheDocument();
     expect(within(nav()).getByRole("link", { name: "Photos" })).toHaveClass("active");
     expect(await screen.findByText("Capture the day while it is still fresh.")).toBeInTheDocument();
   });
 
-  it("with the switch off #moments is still the Moments tab", async () => {
-    serve(undefined);
-    renderTrip({ hash: "moments" });
-    expect(await screen.findByText("Capture the day while it is still fresh.")).toBeInTheDocument();
-    expect(within(nav()).getByRole("link", { name: "Moments" })).toHaveClass("active");
-  });
-
   it.each([
     ["bookings", "Bookings"], ["budget", "Budget"], ["photos", "Photos"], ["readiness", "Readiness"],
     ["account", "Account"], ["activities", "Group activities"], ["trivia", "Trivia"], ["plan-tools", "Plan tools"],
   ])("#%s still opens its module", async (hash, label) => {
-    serve({ site_video_layout: true });
+    serve();
     renderTrip({ hash });
     expect(await screen.findByRole("heading", { level: 1, name: `Colmar · ${label}` })).toBeInTheDocument();
   });
 
   it("#lostfound and #map (the two the menu reaches) are still modules", async () => {
-    serve({ site_video_layout: true });
+    serve();
     renderTrip({ hash: "lostfound" });
     expect(await screen.findByRole("heading", { level: 1, name: "Colmar · Lost & Found" })).toBeInTheDocument();
   });

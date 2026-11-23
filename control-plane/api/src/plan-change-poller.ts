@@ -11,8 +11,11 @@ import { dayInZone, minutesInZone } from "./plan-change-line.js";
  *
  * Once a minute the control plane asks each switched-on trip's own site "what changed since the plan the group
  * last heard about?" through one read-only `internal()` route, waits until the plan has settled, and enqueues
- * ONE message for the trip's group. The site never calls out and holds no key for this: the control plane already
- * holds the exchange key the site checks, and already knows each trip's private address (runtime-upstream.ts).
+ * ONE message for the trip's group. The site never calls out and holds no key for this. The control plane does not
+ * call the site either: it asks the runtime gateway (`GET <runtimeOrigin>/internal/t/<trip id>/plan-changes`, the way
+ * portal.ts asks it about participants) with the control-plane exchange key, and the gateway reads the site with the
+ * key that trip holds (docs/specs/sprint-9/597-per-gateway-and-per-trip-keys.md, K2). The control-plane key is sent to
+ * the gateway and nowhere else; no trip site's address is built here.
  *
  * THE GATE. A line is sent for a trip only when ALL of these hold, and anything uncertain counts as off:
  *   1. the switch `plan_change_group_line` is on for the trip (feature-switches.ts: unknown, failed read = off);
@@ -41,7 +44,8 @@ export const NIGHT_END_MINUTES = 8 * 60;
 export const POLL_INTERVAL_MS = 60_000;
 const SITE_TIMEOUT_MS = 5_000;
 const MAX_BODY_BYTES = 512 * 1024;
-const ROUTE = "/api/internal/control-plane/plan-changes";
+/** The gateway's route for the read (runtime-gateway/server.js planChanges), which reads the trip's own site with that trip's key. */
+const ROUTE = "/plan-changes";
 
 const text = (max: number) => z.string().max(max);
 const day = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
@@ -113,16 +117,33 @@ export function keepValidEntries(entries: readonly unknown[]): { kept: PlanChang
 
 export interface PlanChangePollerDeps {
   db: pg.Pool;
-  /** The key the trip sites check on their `internal()` routes (the portal's runtime exchange key). */
+  /** The control-plane exchange key (the portal's runtime exchange key): what the runtime gateway checks on its `/internal/t/*` routes. It is sent to `runtimeOrigin` and to nothing else. */
   exchangeKey: string;
-  /** The hosts a site may live on: the same allow-list the runtime gateway's route lookup applies. */
+  /** The runtime gateway's own origin (`web.runtime_origin`): the only address this module sends a request to. */
+  runtimeOrigin: string;
+  /** With the next field, only the readiness check: is there a ready route for this trip? The address it finds is never used. */
   upstreamHostSuffixes: readonly string[];
+  upstreamAllowedHosts?: readonly string[];
   fetchImpl?: typeof fetch;
   now?: () => Date;
   log?: (line: string) => void;
   /** Overrides the switch read (tests). Absent: feature-switches.ts, which fails to off. */
   switchOn?: (tripId: string) => Promise<boolean>;
+  /**
+   * Where the last `plan_change_poll.gateway_suspect` line was written, so a gateway that is down for an hour is
+   * one line in ten minutes and not sixty. One per poller (`startPlanChangePoller` makes it); a caller that passes
+   * none gets the line on every tick that earns it.
+   */
+  gatewaySuspect?: { lastLoggedAt: number | null };
 }
+
+/** Every poll of a tick failing with one of these says "the gateway", not "this trip": see the aggregate line below. */
+export const GATEWAY_SUSPECT_CODES: readonly string[] = ["SITE_UNREACHABLE", "SITE_HTTP_404", "SITE_HTTP_502", "SITE_HTTP_503"];
+/** At most one `gateway_suspect` line in this long. */
+export const GATEWAY_SUSPECT_EVERY_MS = 10 * 60_000;
+/** The start-up probe of `GET <runtimeOrigin>/health`. */
+const GATEWAY_PROBE_TIMEOUT_MS = 3_000;
+const GATEWAY_CONSEQUENCE = "the group line cannot reach any trip until the runtime gateway answers";
 
 export interface PollSummary {
   /** Trips whose switch was on and that have an open group. */
@@ -142,20 +163,50 @@ const minutesOf = (hhmm: string) => Number(hhmm.slice(0, 2)) * 60 + Number(hhmm.
 
 type SiteResult = { ok: true; body: PlanChangesResponse; invalid: number; surplus: number } | { ok: false; code: string };
 
+/**
+ * The body as text, read no further than `maxBytes` BYTES: a larger declared length is refused before reading, and a
+ * stream that runs past the cap is cancelled there (boundary review of #599, F5 - the whole body used to be read
+ * first, and its UTF-16 length compared). The gateway caps bodies too; this does not rely on it.
+ */
+export async function readCapped(response: Response, maxBytes: number): Promise<string | "too_large" | "unreachable"> {
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    await response.body?.cancel().catch(() => {});
+    return "too_large";
+  }
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {});
+        return "too_large";
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return "unreachable";
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 async function readSite(
   deps: PlanChangePollerDeps,
-  origin: string,
-  basePath: string,
   tripId: string,
   since: string | null,
 ): Promise<SiteResult> {
   const fetchImpl = deps.fetchImpl ?? fetch;
-  const url = `${origin}${basePath}${ROUTE}${since ? `?since=${encodeURIComponent(since)}` : ""}`;
+  const url = `${deps.runtimeOrigin.replace(/\/$/, "")}/internal/t/${encodeURIComponent(tripId)}${ROUTE}${since ? `?since=${encodeURIComponent(since)}` : ""}`;
   let response: Response;
   try {
     response = await fetchImpl(url, {
       method: "GET",
-      headers: { "x-api-key": deps.exchangeKey, "x-control-plane-trip-id": tripId, accept: "application/json" },
+      headers: { "x-api-key": deps.exchangeKey, accept: "application/json" },
       // The key rides this request: it is never forwarded to wherever a redirect points.
       redirect: "manual",
       signal: AbortSignal.timeout(SITE_TIMEOUT_MS),
@@ -164,9 +215,9 @@ async function readSite(
     return { ok: false, code: "SITE_UNREACHABLE" };
   }
   if (!response.ok) return { ok: false, code: `SITE_HTTP_${response.status}` };
-  let raw: string;
-  try { raw = await response.text(); } catch { return { ok: false, code: "SITE_UNREACHABLE" }; }
-  if (raw.length > MAX_BODY_BYTES) return { ok: false, code: "SITE_BODY_INVALID" };
+  const raw = await readCapped(response, MAX_BODY_BYTES);
+  if (raw === "unreachable") return { ok: false, code: "SITE_UNREACHABLE" };
+  if (raw === "too_large") return { ok: false, code: "SITE_BODY_INVALID" };
   let json: unknown;
   try { json = JSON.parse(raw); } catch { return { ok: false, code: "SITE_BODY_INVALID" }; }
   const parsed = planChangesEnvelopeSchema.safeParse(json);
@@ -177,15 +228,18 @@ async function readSite(
 }
 
 /** One trip, one tick. Everything here is a read, a cursor write, or one transactional enqueue. */
-async function pollTrip(deps: PlanChangePollerDeps, tripId: string, now: Date, log: (line: string) => void): Promise<"enqueued" | "ok" | "failed"> {
+async function pollTrip(deps: PlanChangePollerDeps, tripId: string, now: Date, log: (line: string) => void, codes: string[]): Promise<"enqueued" | "ok" | "failed"> {
   const { db } = deps;
   const fail = (code: string) => {
     log(structuredLog("warn", "plan_change_poll.failed", { trip_id: tripId, safe_error_code: code }));
+    codes.push(code);
     return "failed" as const;
   };
 
-  const upstream = await runtimeUpstreamFor(db, tripId, deps.upstreamHostSuffixes);
-  if (!upstream.ok) return fail(upstream.error);
+  // Readiness only: a trip with no ready route, or one the gateway's own lookup would refuse, is not polled, and the
+  // code says which. The address this finds is deliberately not used: the gateway looks the site up itself.
+  const ready = await runtimeUpstreamFor(db, tripId, deps.upstreamHostSuffixes, deps.upstreamAllowedHosts);
+  if (!ready.ok) return fail(ready.error);
 
   const cursorRow = await db.query<Cursor>(
     "SELECT revision_id, pending_since, held_for_night FROM control_plane.plan_change_cursors WHERE trip_id = $1",
@@ -193,7 +247,7 @@ async function pollTrip(deps: PlanChangePollerDeps, tripId: string, now: Date, l
   );
   const cursor = cursorRow.rows[0] ?? null;
 
-  const site = await readSite(deps, upstream.upstreamOrigin, upstream.upstreamBasePath, tripId, cursor?.revision_id ?? null);
+  const site = await readSite(deps, tripId, cursor?.revision_id ?? null);
   if (!site.ok) return fail(site.code); // the cursor does not move: the next good poll sends the net difference
   const plan = site.body;
   // An entry that did not fit the contract, or arrived past the cap, was left out and the trip carries on: say so once,
@@ -303,6 +357,7 @@ async function pollTrip(deps: PlanChangePollerDeps, tripId: string, now: Date, l
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
     log(structuredLog("error", "plan_change_poll.enqueue_failed", { trip_id: tripId, safe_error_code: error instanceof Error ? error.name : "UNKNOWN" }));
+    codes.push("ENQUEUE_FAILED");
     return "failed";
   } finally {
     client.release();
@@ -365,26 +420,109 @@ export async function pollPlanChangesOnce(deps: PlanChangePollerDeps): Promise<P
     log(structuredLog("error", "plan_change_poll.tick_failed", { safe_error_code: error instanceof Error ? error.name : "UNKNOWN" }));
     return summary;
   }
+  const codes: string[] = [];
   for (const tripId of eligible) {
     summary.polled++;
     try {
-      const outcome = await pollTrip(deps, tripId, now, log);
+      const outcome = await pollTrip(deps, tripId, now, log, codes);
       if (outcome === "enqueued") summary.enqueued++;
       if (outcome === "failed") summary.failed++;
     } catch (error) {
       summary.failed++;
-      log(structuredLog("warn", "plan_change_poll.failed", { trip_id: tripId, safe_error_code: error instanceof Error ? error.name : "UNKNOWN" }));
+      const code = error instanceof Error ? error.name : "UNKNOWN";
+      codes.push(code);
+      log(structuredLog("warn", "plan_change_poll.failed", { trip_id: tripId, safe_error_code: code }));
     }
   }
+  reportGatewaySuspect(deps, now, summary, codes, log);
   return summary;
+}
+
+/**
+ * N trips failing one by one reads as N trips in trouble. When EVERY poll of a tick failed, and each one with a
+ * code that points at the road (the gateway not answering, or answering 404/502/503 for a route it does not have
+ * or cannot reach), it is one thing, and this says so once: a count and the codes, never an address or a key.
+ * It is a suspicion on purpose: one trip whose own site is down looks the same from here when it is the only trip.
+ */
+function reportGatewaySuspect(deps: PlanChangePollerDeps, now: Date, summary: PollSummary, codes: readonly string[], log: (line: string) => void): void {
+  if (summary.polled === 0 || codes.length !== summary.polled || !codes.every((code) => GATEWAY_SUSPECT_CODES.includes(code))) return;
+  const state = deps.gatewaySuspect;
+  if (state && state.lastLoggedAt !== null && now.getTime() - state.lastLoggedAt < GATEWAY_SUSPECT_EVERY_MS) return;
+  if (state) state.lastLoggedAt = now.getTime();
+  const counts = new Map<string, number>();
+  for (const code of codes) counts.set(code, (counts.get(code) ?? 0) + 1);
+  log(structuredLog("warn", "plan_change_poll.gateway_suspect", {
+    failed: summary.failed,
+    safe_error_codes: [...counts].map(([code, count]) => `${code}=${count}`).join(","),
+    consequence: GATEWAY_CONSEQUENCE,
+  }));
+}
+
+async function probeGateway(deps: Pick<PlanChangePollerDeps, "runtimeOrigin" | "fetchImpl">): Promise<string | null> {
+  try {
+    const response = await (deps.fetchImpl ?? fetch)(`${deps.runtimeOrigin.replace(/\/$/, "")}/health`, {
+      method: "GET",
+      redirect: "manual",
+      signal: AbortSignal.timeout(GATEWAY_PROBE_TIMEOUT_MS),
+    });
+    await response.body?.cancel().catch(() => {});
+    return response.ok ? null : `GATEWAY_HTTP_${response.status}`;
+  } catch (error) {
+    return error instanceof Error && error.name === "TimeoutError" ? "GATEWAY_TIMEOUT" : "GATEWAY_UNREACHABLE";
+  }
+}
+
+export interface GatewayProbeOptions {
+  /** How many times to ask before saying so. On the VM the API starts before the gateway, so one try warns on every boot. */
+  attempts?: number;
+  /** The wait between tries. */
+  retryMs?: number;
+  /** Stops the retries (the poller was stopped). */
+  stopped?: () => boolean;
+}
+
+/** At start: about a minute of tries, which covers a normal cold start where the gateway comes up after the API. */
+export const GATEWAY_START_PROBE: Required<Omit<GatewayProbeOptions, "stopped">> = { attempts: 7, retryMs: 10_000 };
+
+/**
+ * Asks the runtime gateway's `GET /health` (no key: the route needs none, and the control-plane key is sent only to
+ * the routes that do), up to `attempts` times, and says so ONCE, only when the last try also fails. The reason is a
+ * code from a closed set, never the driver's message (Node's fetch errors quote the address). It never throws.
+ */
+export async function checkGatewayReachable(
+  deps: Pick<PlanChangePollerDeps, "runtimeOrigin" | "fetchImpl" | "log">,
+  options: GatewayProbeOptions = {},
+): Promise<boolean> {
+  const log = deps.log ?? (() => {});
+  const attempts = Math.max(1, options.attempts ?? 1);
+  let reason: string | null = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    if (options.stopped?.()) return false;
+    reason = await probeGateway(deps);
+    if (reason === null) return true;
+    if (attempt < attempts) await new Promise((resolve) => setTimeout(resolve, options.retryMs ?? 0).unref?.());
+  }
+  if (options.stopped?.()) return false;
+  log(structuredLog("warn", "plan_change_poll.gateway_unreachable", { safe_error_code: reason, consequence: GATEWAY_CONSEQUENCE }));
+  return false;
 }
 
 /**
  * Starts the loop beside the outbox dispatcher: every minute, one tick at a time (a slow site cannot stack ticks),
  * `unref`'d so it never keeps the process alive. Returns the function that stops it.
  */
-export function startPlanChangePoller(deps: PlanChangePollerDeps, intervalMs = POLL_INTERVAL_MS): () => void {
+export function startPlanChangePoller(
+  deps: PlanChangePollerDeps,
+  intervalMs = POLL_INTERVAL_MS,
+  startupProbe: Omit<GatewayProbeOptions, "stopped"> = GATEWAY_START_PROBE,
+): () => void {
   let running = false;
+  let stopped = false;
+  // A readiness probe at start, in the background: a gateway that is still not there after about a minute is said
+  // once, here, and not left to surface as one failure per trip per minute. Retried because on the VM the API starts
+  // before the gateway. It does not delay the loop and never rejects.
+  void checkGatewayReachable(deps, { ...startupProbe, stopped: () => stopped }).catch(() => {});
+  deps = { ...deps, gatewaySuspect: deps.gatewaySuspect ?? { lastLoggedAt: null } };
   const timer = setInterval(() => {
     if (running) return;
     running = true;
@@ -393,5 +531,5 @@ export function startPlanChangePoller(deps: PlanChangePollerDeps, intervalMs = P
       .finally(() => { running = false; });
   }, intervalMs);
   timer.unref();
-  return () => clearInterval(timer);
+  return () => { stopped = true; clearInterval(timer); };
 }

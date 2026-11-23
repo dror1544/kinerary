@@ -13,7 +13,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { MoreView } from "./App";
+import { OrganizerSettings } from "./App";
 
 const BASE = "/t/trip_abcdefgh";
 const LINK = "https://app.example.test/join#token=tok_personal_link_value";
@@ -45,7 +45,7 @@ const creates = (calls: Call[]) => calls.filter((call) => call.method === "POST"
 function mount(lang: "en" | "he" = "en") {
   return render(
     <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
-      <MoreView lang={lang} isOrganizer config={CONFIG} openModule={vi.fn()} />
+      <OrganizerSettings lang={lang} isOrganizer config={CONFIG} />
     </QueryClientProvider>,
   );
 }
