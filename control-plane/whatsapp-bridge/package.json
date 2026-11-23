@@ -1,0 +1,22 @@
+{
+  "name": "@kinerary/whatsapp-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Loopback-only WhatsApp Web sidecar for the Kinerary relay (adapted from the MIT-licensed Hermes Agent bridge; see NOTICE.md)",
+  "scripts": {
+    "start": "node src/bridge.js",
+    "pair": "node src/bridge.js --pair-only",
+    "test": "node --test --test-timeout=60000 test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "7.0.0-rc13",
+    "qrcode-terminal": "0.12.0"
+  },
+  "overrides": {
+    "protobufjs": "^7.5.5"
+  }
+}

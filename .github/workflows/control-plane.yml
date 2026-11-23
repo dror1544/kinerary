@@ -82,12 +82,25 @@ jobs:
           cache: npm
           cache-dependency-path: |
             control-plane/api/package-lock.json
+            control-plane/whatsapp-bridge/package-lock.json
             server/package-lock.json
             mcp/package-lock.json
 
       - name: Install API dependencies
         run: npm ci
         working-directory: control-plane/api
+
+      # The WhatsApp bridge sidecar is its own package, so the WhatsApp Web
+      # library stays out of the API's dependency tree. Its tests (privacy,
+      # the pinned event list, the session directory) run nowhere else, and
+      # they never connect out: the library socket is faked.
+      - name: Install WhatsApp bridge dependencies
+        run: npm ci
+        working-directory: control-plane/whatsapp-bridge
+
+      - name: Test the WhatsApp bridge (no database, no network)
+        run: npm test
+        working-directory: control-plane/whatsapp-bridge
 
       - name: Install trip server dependencies
         run: npm ci
