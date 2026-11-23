@@ -752,8 +752,10 @@ traveller reaches it. The invitation email is a new `PortalMail` kind in
 
 ### Lock order
 
-- Code redemption: code row `FOR UPDATE`, then the open binding for the chat
-  `FOR UPDATE`, then the binding insert. Where two binding rows are closed in one
+- Code redemption: code row `FOR UPDATE`, then the issuer's own membership row
+  `FOR SHARE` (so a member's removal cannot commit between the entitlement check and
+  the binding; `removeMember` locks memberships and then bindings, the same direction),
+  then the open binding for the chat `FOR UPDATE`, then the binding insert. Where two binding rows are closed in one
   transaction (AC-8, AC-9) they are locked in `chat_id` order.
 - No-code bindings (AC-28, AC-29): the open binding for the chat `FOR UPDATE`, then an
   insert that selects the trip only if it is not retired. That leaves the residual race
