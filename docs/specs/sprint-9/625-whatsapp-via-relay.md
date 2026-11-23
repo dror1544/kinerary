@@ -132,10 +132,46 @@ a finding contradicts a contract below, a spec PR amends it first.
   the id shape of an old group and a new one; and how an @mention of a person appears in
   message text (the Sender ids contract assumes it is the person's number written out).
 
+**AC-0, the Hermes half: recorded 2026-11-22** (Hermes on the staging Mac, commit
+`4097709b`, reported as v0.21.5; read from source and probed by calling the code paths
+with hand-built events and a stand-in relay on loopback; no full gateway turn with a
+model was run, and the production VM's Hermes build has not been checked yet).
+
+- *Decision: the relay stamps the gateway's primary platform, not `"whatsapp"`.* With a
+  `"whatsapp"` stamp the gateway runs both ids through its own WhatsApp id
+  canonicaliser, which rejects the underscore in the `wa_…` alias and raises; the relay
+  socket's read loop ends and re-dials on every such message, and a reply in flight on
+  that socket is lost. With the primary stamp the same ids reach the handler and are
+  answered. The relay alone knows a chat is WhatsApp, from the binding row.
+- *Session key.* It includes the platform, the chat id and, in a group, the sender id.
+  Under the primary stamp a WhatsApp chat cannot share a session with a Telegram chat,
+  because the ids differ in shape.
+- *Authorization.* A relayed event is trusted as the relay's, before any of the
+  gateway's own allow-lists, policies or pairing, whichever platform it is stamped with.
+- *Reply egress.* The reply returns over the relay socket with the same `chat_id`; no
+  native adapter is tried. The relay routes by `chat_id`, never by the frame's platform
+  tag (which is absent for a chat the gateway has not seen since it started).
+- *Descriptor.* The primary (Telegram) descriptor governs length and op gating. The
+  gateway does not convert formatting on a relayed send, so the relay owns WhatsApp
+  formatting and length, as AC-19 already says.
+- *What the model is told.* Under the primary stamp the system prompt says Telegram; the
+  per-turn mark (S3) says WhatsApp and plain text. Under a `"whatsapp"` stamp the gateway
+  would also switch tool-progress messages on and stop applying the companion's
+  Telegram-keyed settings, which is a second reason not to use it.
+- *Where ids land.* The chat id is in the session key and session file, and in a private
+  chat's system prompt; a sender's display name and a group's title go to the model as
+  sent. So the alias keeps numbers out only as long as the relay never puts one in a
+  name or title field (Sender ids already requires an empty name over a number).
+- *Not settled.* Sends the companion starts by itself (a reminder, a scheduled job) are
+  not served for a relayed chat under today's gateway configuration, for Telegram ids
+  and WhatsApp ids alike in the probe; whether reminders reach a WhatsApp chat is read
+  off a staging companion in S4. The session database, memory files and analytics were
+  not inspected for the chat id.
+
 **AC-0, the capture half: recorded 2026-11-22** (a listen-only linked device on staging;
 library `@whiskeysockets/baileys` 7.0.0-rc13; one private chat each from two people, one
 group created that day, one group created in 2016; numbers masked before anything was
-written down). The Hermes half is recorded separately when it is done.
+written down).
 
 - *Who added the number.* The event for joining a group carries the adder twice: as a
   linked-identity id (`<digits>@lid`) and as a phone id. Seen for a new group and for the
@@ -252,7 +288,7 @@ written down). The Hermes half is recorded separately when it is done.
   unbound chat, so a person who is still in the trip's group can connect again (AC-29).
 - AC-16 Given the connections route, then each row carries only: binding id, kind, the
   group's title or the traveller's name, how it was made, when, and for a person the last
-  four digits of the number when they are known (`address_hint`; absent otherwise). No response of any route carries a full number or a code.
+  four digits of the number when they are known (`phone_last4`; absent otherwise). No response of any route carries a full number or a code.
 - AC-17 Given `teardown-trip.py --execute`, then the trip's live codes are expired before
   any other statement in the transaction (the lock order of `REVOKE_GROUP_TOKENS`), and
   its WhatsApp bindings close with the same reason as its Telegram ones, with
@@ -285,7 +321,8 @@ written down). The Hermes half is recorded separately when it is done.
   as `CHAT_NOT_IN_SCOPE`.
 - AC-23 Given a bound chat with the switch on, then a message reaches the trip's
   companion under exactly the conditions a Telegram message would (AC-2's gate), with
-  `source.platform = "whatsapp"` (subject to AC-0), the chat's id as `chat_id`
+  `source.platform` set to the gateway's primary platform (`"telegram"` today; AC-0 found
+  that a `"whatsapp"` stamp crashes the gateway), the chat's id as `chat_id`
   (Contracts), an opaque sender id and the sender's WhatsApp display name; a group
   message that is not addressed is held as overheard context exactly as on Telegram.
 - AC-24 Given a gateway `send` to a bound WhatsApp chat, then it passes the same scope
@@ -424,7 +461,7 @@ identify one chat on one platform:
 - CHECK: `transport_address` is NULL unless the row is a WhatsApp private binding, and is
   NULL on every closed row. It holds the address the bridge reports for the chat, as an
   opaque string; since AC-0 that is normally a linked-identity address, not a number.
-- `address_hint text`, nullable: the last four digits of the person's number when the
+- `phone_last4 text`, nullable: the last four digits of the person's number when the
   bridge reported a phone id at binding time, else NULL. CHECK `^[0-9]{4}$`, and NULL
   under the same conditions as `transport_address`. It is what AC-16 shows; nothing
   derives digits from `transport_address`. Not granted to the monitor.
@@ -798,7 +835,7 @@ pairing.
   organizer-gated action from WhatsApp is allowed exactly when AC-13 gives the sender
   the role that action needs on Telegram.
 - **Phone numbers** rest in the bridge's session directory (AC-27) and, in the database,
-  only as the four digits of `address_hint` and in `transport_address` on the rare open
+  only as the four digits of `phone_last4` and in `transport_address` on the rare open
   private binding whose address is a phone id (since AC-0 it is normally a
   linked-identity address, which is still a personal identifier and is handled the same
   way). An @mention writes an id into message text, so text is rewritten before use.
