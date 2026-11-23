@@ -300,7 +300,12 @@ written down).
   owner is told once, naming the group's title or the traveller and never a number: in
   the owner's connected WhatsApp private chat when there is one; otherwise through the
   existing outbox to the owner's Telegram private chat when there is one; otherwise only
-  the dashboard list shows it. The owner's own `me` connection is not announced to them.
+  the dashboard list shows it. The owner's own first `me` connection is not announced to
+  them. One that replaces an earlier WhatsApp connection of theirs on the trip is: the
+  notice says the connection was replaced and, when known, gives the new number's last
+  four digits, and goes to the chat that was replaced when it can still be reached, else
+  Telegram, else the dashboard (Dror, 2026-11-23: a code sent from someone else's phone
+  would otherwise give the owner's role with no word to the owner).
 - AC-19 Given the gateway reconciler (`gateway_reconcile.py`, `FACTS_SQL`), then an open
   WhatsApp private binding of the trip's owner counts as the organizer's private chat
   when it decides whether a trip's companion is current, so a trip whose organizer uses
@@ -955,6 +960,10 @@ Tests are written first, from the criteria.
    messages to know when it is addressed stays required (AC-10), because the other people
    in a group agreed to nothing. A WhatsApp paragraph in the published privacy policy is
    deferred until a group outside family and friends is to be bound.
+
+9. **A replaced owner connection is announced (2026-11-23).** Raised by S2's boundary
+   review: an owner's `me` code sent from another phone connects that phone as the owner,
+   and the owner was told nothing. AC-18 now announces a replacement to the owner.
 
 **Still open, none blocks the build on staging:**
 
