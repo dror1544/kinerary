@@ -38,6 +38,7 @@ from .companion_profile import (
 from .compute import ComputeAdapter, NullComputeAdapter
 from .feature_block import resolve_features, with_features
 from .mcp_bridge import McpBridgeAdapter, NullMcpBridgeAdapter, log_fields
+from .trip_timezone import warn_if_unresolved
 from .release_source import ReleaseSourceError, materialize_release_source
 from . import verification
 from .transformer import (
@@ -1437,6 +1438,9 @@ class ProvisionerWorker:
                 config = self._enrich(config, intake_destination(answers))
             except Exception:  # pragma: no cover - enrich_config self-guards
                 logger.warning("provisioner.enrichment_failed", exc_info=True)
+            # A trip with no usable zone runs on UTC and looks complete; say so
+            # here, where the trip id is known, whichever way enrichment went.
+            warn_if_unresolved(config, trip_id=str(trip_id), destination=intake_destination(answers))
 
             # Sidecar files that live beside trip.config.json in the trip
             # dir. trivia_questions.json is always written empty: control-
@@ -2461,6 +2465,9 @@ class ProvisionerWorker:
                 config = self._enrich(config, intake_destination(answers))
             except Exception:  # pragma: no cover - enrich_config self-guards
                 logger.warning("provisioner.enrichment_failed", exc_info=True)
+            # A trip with no usable zone runs on UTC and looks complete; say so
+            # here, where the trip id is known, whichever way enrichment went.
+            warn_if_unresolved(config, trip_id=str(trip_id), destination=intake_destination(answers))
             if not (config.get("agent") or {}).get("organizers"):
                 raise ValueError(
                     f"trip {trip_id!r}: the latest confirmed intake names no traveller as organizer — correct it first"

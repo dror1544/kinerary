@@ -43,6 +43,7 @@ from collections.abc import Mapping
 from typing import Any, Callable
 
 from .transformer import essence_phase_id
+from .trip_timezone import apply_timezone_from_coordinates
 
 logger = logging.getLogger("control_plane_worker.enrichment")
 
@@ -508,6 +509,16 @@ def enrich_config(
         _build_map(out)
     except Exception:
         logger.warning("enrichment.map_failed", exc_info=True)
+
+    # The trip's zone, from where it is. The transformer can only answer from
+    # words (a typed zone, a country name), so a destination that is a region
+    # — "Alsace", "אלזס" — reaches here with none, and the site would run on
+    # UTC. Runs after the map: it reads the pins the geocoding just produced.
+    # A zone already present is left alone; see trip_timezone.
+    try:
+        apply_timezone_from_coordinates(out)
+    except Exception:
+        logger.warning("enrichment.timezone_failed", exc_info=True)
 
     return out
 
