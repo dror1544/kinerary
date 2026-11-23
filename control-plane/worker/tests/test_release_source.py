@@ -180,6 +180,76 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class LinkedWorktreeTests(unittest.TestCase):
+    """#650: the worker is handed a checkout through a bind mount. When that checkout is
+    a linked worktree, its `.git` file points at the main repository's directory, which
+    the mount does not carry, and every git call said only "not a git repository"."""
+
+    def setUp(self) -> None:
+        self.base = tempfile.mkdtemp(prefix="rs-wt-")
+        self.main = os.path.join(self.base, "main")
+        os.makedirs(self.main)
+        _git(self.main, "init", "-q")
+        _git(self.main, "config", "user.email", "t@example.test")
+        _git(self.main, "config", "user.name", "Test")
+        os.makedirs(os.path.join(self.main, "site"))
+        with open(os.path.join(self.main, "site/app.js"), "w", encoding="utf-8") as fh:
+            fh.write("const x = 1;\n")
+        _git(self.main, "add", "-A")
+        _git(self.main, "commit", "-qm", "c1")
+        self.rev = _git(self.main, "rev-parse", "HEAD").strip()
+        self.worktree = os.path.join(self.base, "wt")
+        _git(self.main, "worktree", "add", "-q", "--detach", self.worktree, self.rev)
+        self._made: list[str] = []
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.base, ignore_errors=True)
+        for d in self._made:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def _mounted_without_the_main_repo(self) -> str:
+        """What the container sees: the worktree's files, and a `.git` pointer into a
+        directory that is not there."""
+        seen = os.path.join(self.base, "as-mounted")
+        shutil.copytree(self.worktree, seen)
+        shutil.move(self.main, os.path.join(self.base, "moved-away"))
+        return seen
+
+    def test_a_worktree_whose_gitdir_is_not_reachable_is_refused_with_its_own_code(self) -> None:
+        seen = self._mounted_without_the_main_repo()
+        self.assertTrue(os.path.isfile(os.path.join(seen, ".git")))
+        with self.assertRaises(ReleaseSourceError) as ctx:
+            materialize_release_source(seen, self.rev)
+        self.assertEqual(ctx.exception.safe_error_code, "RELEASE_REPO_IS_LINKED_WORKTREE")
+        message = str(ctx.exception)
+        self.assertIn("linked git worktree", message)
+        self.assertIn("main clone", message)
+        self.assertIn(".git/worktrees/", message)  # names the pointer that dangles
+
+    def test_every_git_entry_point_names_the_cause_not_just_materialize(self) -> None:
+        seen = self._mounted_without_the_main_repo()
+        with self.assertRaises(ReleaseSourceError) as ctx:
+            tree_digest(seen, self.rev)
+        self.assertEqual(ctx.exception.safe_error_code, "RELEASE_REPO_IS_LINKED_WORKTREE")
+
+    def test_a_worktree_whose_gitdir_is_reachable_works(self) -> None:
+        dest = materialize_release_source(self.worktree, self.rev)
+        self._made.append(dest)
+        self.assertTrue(os.path.isfile(os.path.join(dest, "site/app.js")))
+
+    def test_a_missing_revision_in_an_ordinary_clone_keeps_its_own_code(self) -> None:
+        with self.assertRaises(ReleaseSourceError) as ctx:
+            materialize_release_source(self.main, "0" * 40)
+        self.assertEqual(ctx.exception.safe_error_code, "RELEASE_REVISION_UNAVAILABLE")
+
+    def test_a_directory_that_is_not_a_repository_keeps_its_own_code(self) -> None:
+        empty = os.path.join(self.base, "empty")
+        os.makedirs(empty)
+        with self.assertRaises(ReleaseSourceError) as ctx:
+            materialize_release_source(empty, self.rev)
+        self.assertEqual(ctx.exception.safe_error_code, "RELEASE_REVISION_UNAVAILABLE")
+
+
 class GitOwnershipTests(unittest.TestCase):
     """On the Proxmox VM the worker runs as root against /repo, a bind mount
     owned by the operator's uid. git refuses such a repository ("detected
