@@ -214,12 +214,16 @@ DOCKER_EXEC_VALUE_OPTIONS = {"-u", "--user", "-w", "--workdir", "-e", "--env", "
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
 
 
-def _statements(text):
+def _statements(text, comments=True):
     """The words of each simple command in `text`, quotes resolved the way a shell
-    resolves them. None when the text cannot be read as words."""
+    resolves them. None when the text cannot be read as words. comments=False keeps
+    `#` as an ordinary character: shlex would otherwise drop everything after one,
+    even mid-word, where bash does not."""
     import shlex
     lex = shlex.shlex(text.replace("\n", " ; "), posix=True, punctuation_chars=True)
     lex.whitespace_split = True
+    if not comments:
+        lex.commenters = ""
     try:
         words = list(lex)
     except ValueError:
@@ -284,6 +288,51 @@ def embedded_commands(raw):
                 if re.match(r'^-[A-Za-z]*c$', w) and k + 1 < len(words):
                     found.append(words[k + 1])
     return found
+
+
+# Plan-by-default tools whose --execute changes something people use: tearing a trip
+# down, moving a trip's public name onto or off the gateway (#599), re-keying the
+# companions' gateways (#599). Read as WORDS, the way the shell will hand them to the
+# script, so nothing in front of the script matters (sudo -E, env, VAR=value,
+# timeout, python3.12 -u, /usr/bin/python3, uv run …) and shell quoting cannot split
+# the flag (`--exe""cute` is `--execute`). A statement is one when a word names the
+# script and a LATER word is --execute, or anything argparse could have expanded to it
+# (the scripts set allow_abbrev=False; this does not rely on that). `grep -- --execute
+# scripts/trip-route.py` names the flag before the script and stays quiet; the show
+# and plan modes have no such word and stay quiet. A command that cannot be read as
+# words, and names a script and something like the flag, is asked: a spurious prompt
+# costs a keystroke. ssh / sh -c / docker exec payloads are read as their own commands.
+EXECUTE_TOOLS = re.compile(r'(?:^|/)(?:teardown-trip|trip-route|relay-rekey)\.py$', re.I)
+
+
+def _is_execute_flag(word):
+    flag = word.split("=", 1)[0]
+    return len(flag) >= 3 and "--execute".startswith(flag)
+
+
+# The line-based half, kept alongside the word reader (re-check of #599, 2026-11-20: the
+# word reader alone missed a comment line, `timeout … ssh`, `eval`, `bash <<<` and
+# `$(…)`, which this catches). Anywhere on the line, like the release tool's entry,
+# because these run through ssh and wrappers; backslash-newline continuations are
+# joined first; the script name in any case (the Mac's file system ignores it).
+EXECUTE_TOOL_LINE = re.compile(
+    r'(?:teardown-trip|trip-route|relay-rekey)\.py\b[^\n;&|]*--execute\b', re.I)
+
+
+def execute_tool_hit(raw, depth=0):
+    joined = raw.replace("\\\n", " ")
+    if EXECUTE_TOOL_LINE.search(joined):
+        return True
+    statements = _statements(joined, comments=False)
+    if statements is None:
+        return bool(re.search(r'(?:teardown-trip|trip-route|relay-rekey)\.py\b[^\n]*--e', joined, re.I))
+    for words in statements:
+        for i, word in enumerate(words):
+            if EXECUTE_TOOLS.search(word) and any(_is_execute_flag(w) for w in words[i + 1:]):
+                return True
+    if depth < 3:
+        return any(execute_tool_hit(payload, depth + 1) for payload in embedded_commands(raw))
+    return False
 
 
 def rollout_hit(raw, depth=0):
@@ -408,15 +457,17 @@ raw = strip_heredocs(sys.stdin.read())
 # on the routine list, and nothing in it commits, merges or pushes; otherwise
 # `asks` (also for a command that is not a deploy at all). Matched with quotes
 # intact, like DEPLOY, so a protected verb inside an ssh payload is still seen.
+# The --execute tools (teardown, route, rekey) always ask: they delete or re-key,
+# which the standing approval leaves to the owner.
 if len(sys.argv) > 1 and sys.argv[1] == "--deploy-class":
     stripped = strip_quotes(raw)
     routine = ((DEPLOY.search(raw) or rollout_hit(raw))
-               and not ASKING.search(raw)
+               and not ASKING.search(raw) and not execute_tool_hit(raw)
                and not COMMIT.search(stripped) and not MERGE.search(stripped) and not PUSH.search(stripped))
     print("routine" if routine else "asks")
     sys.exit(0)
 
-if DEPLOY.search(raw) or rollout_hit(raw):
+if DEPLOY.search(raw) or rollout_hit(raw) or execute_tool_hit(raw):
     print("deploy")
 elif COMMIT.search(strip_quotes(raw)):
     print("commit")

@@ -75,6 +75,12 @@ MCP_ISOLATION = "mcp_isolation"
 MESSAGING_BINDING = "messaging_binding"
 BACKUP_CHECKPOINT = "backup_checkpoint"
 
+#: The trip SITE -> shared bridge direction (booking extraction, enrichment), proved from inside the trip's
+#: container once the companion step has wired the trip's bridge route. Recorded by `record_post_attach_evidence`
+#: only when a shared bridge is configured; deliberately NOT in CHECK_NAMES, which is the six every provision
+#: records, and not a hard gate: the route it needs does not exist before `_attach_companion` (see above).
+SITE_TO_BRIDGE = "site_to_bridge"
+
 CHECK_NAMES = (
     RELEASE_COMPATIBILITY, RUNTIME_HEALTH, RENDERED_DATA,
     MCP_ISOLATION, MESSAGING_BINDING, BACKUP_CHECKPOINT,
@@ -356,6 +362,24 @@ def check_mcp_isolation(adapter: Any, slug: str, hermes_profile: str | None) -> 
     return CheckResult(MCP_ISOLATION, "failed", f"HEALTH fail {code} slug={slug} profile={hermes_profile}")
 
 
+def check_site_to_bridge(check: Callable[[], "tuple[bool, str] | None"]) -> CheckResult | None:
+    """The shared-bridge direction `check_mcp_isolation` cannot see: the trip SITE calling the bridge with
+    its own key, from inside its own container. `check` returns (ok, evidence), or None when there is
+    nothing to check (no shared bridge for this trip), which records nothing.
+
+    A check that could not run is `failed`, not `skipped`: a trip whose site cannot use the bridge fails
+    every booking extraction with nothing in any conversation to say why, so "could not look" has to be
+    as visible as "looked and it is down". The evidence never carries a key or an address."""
+    try:
+        answer = check()
+    except Exception as exc:
+        return CheckResult(SITE_TO_BRIDGE, "failed", f"the check could not run: {type(exc).__name__}: {exc}")
+    if answer is None:
+        return None
+    ok, evidence = answer
+    return CheckResult(SITE_TO_BRIDGE, "passed" if ok else "failed", evidence)
+
+
 def check_messaging_binding(conn: Any, trip_id: str) -> CheckResult:
     """An open `telegram_chat_bindings` row for this trip IS the existing,
     pre-this-task check for this signal (docs/sprint6-tracks.md:472 names it
@@ -545,6 +569,7 @@ def record_post_attach_evidence(
     slug: str,
     hermes_profile: str | None,
     mcp_bridge_adapter: Any,
+    site_bridge_check: Callable[[], "tuple[bool, str] | None"] | None = None,
 ) -> list[CheckResult]:
     """Real evidence for `mcp_isolation` and `messaging_binding`, recorded
     right after `_attach_companion` finishes. Informational only: it never
@@ -556,5 +581,8 @@ def record_post_attach_evidence(
         check_mcp_isolation(mcp_bridge_adapter, slug, hermes_profile),
         check_messaging_binding(conn, trip_id),
     ]
+    site_to_bridge = check_site_to_bridge(site_bridge_check) if site_bridge_check is not None else None
+    if site_to_bridge is not None:
+        results.append(site_to_bridge)
     record_evidence(conn, trip_id=trip_id, deployment_ref=deployment_ref, results=results)
     return results

@@ -71,7 +71,7 @@ describe("GET /internal/runtime-routes/:tripId", { skip }, () => {
     const res = await get(tripId);
     assert.equal(res.statusCode, 200);
     const body = res.json();
-    assert.deepEqual(Object.keys(body).sort(), ["routeRef", "upstreamBasePath", "upstreamOrigin"]);
+    assert.deepEqual(Object.keys(body).sort(), ["routeRef", "tripKey", "upstreamBasePath", "upstreamOrigin"]);
     assert.match(body.routeRef, /^route_[0-9a-f]{16}$/);
     assert.equal(body.upstreamOrigin, "http://site.internal:3000");
     assert.equal(body.upstreamBasePath, "/base");
@@ -82,7 +82,7 @@ describe("GET /internal/runtime-routes/:tripId", { skip }, () => {
     const res = await get(tripId);
     assert.equal(res.statusCode, 200);
     const { routeRef: _ref, ...rest } = res.json();
-    assert.deepEqual(rest, { upstreamOrigin: "https://a.b.internal", upstreamBasePath: "" });
+    assert.deepEqual(rest, { upstreamOrigin: "https://a.b.internal", upstreamBasePath: "", tripKey: "shared" });
   });
 
   test("no key and a wrong key are 401 AUTHENTICATION_REQUIRED, and say nothing about the trip", async () => {

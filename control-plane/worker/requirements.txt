@@ -1,2 +1,6 @@
 psycopg[binary]>=3.2,<4
 PyYAML>=6.0,<7
+# Offline coordinates -> IANA zone (trip_timezone.py). Both pinned: the polygon
+# data is a separate package, and a silent bump of either changes answers.
+timezonefinder==9.2.0
+timezonefinder-data==4.2026.6

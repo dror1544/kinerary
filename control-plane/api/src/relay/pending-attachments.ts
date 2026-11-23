@@ -25,7 +25,20 @@
  * In memory on purpose: a relay restart forgets pending documents, which costs
  * the sender one resend and keeps no family file reference on disk.
  */
-import type { Attachment } from "./normalize.js";
+import type { MediaKind } from "./media-store.js";
+
+/**
+ * A file a message carries, by reference. S1 keeps the shape the Telegram side
+ * has always had (`fileId` is the platform's handle for fetching it); the
+ * WhatsApp slice changes it. Lives here, not in normalize.ts, so the neutral
+ * companion gate and this holding area import no Telegram module.
+ */
+export interface AttachmentRef {
+  fileId: string;
+  kind: MediaKind;
+  mime: string;
+  filename?: string;
+}
 
 /** Long enough for the live case (272 s), short enough to stay one interaction. */
 export const PENDING_ATTACHMENT_TTL_MS = 5 * 60 * 1000;
@@ -37,7 +50,7 @@ export const PENDING_ATTACHMENTS_PER_SENDER = 5;
 export const PENDING_ATTACHMENT_SENDERS_MAX = 1000;
 
 /** A held document: where to fetch it from, and what its own message said about it. */
-export type HeldAttachment = Attachment & { caption?: string };
+export type HeldAttachment = AttachmentRef & { caption?: string };
 
 interface Entry extends HeldAttachment {
   heldAt: number;
@@ -66,7 +79,7 @@ export class PendingAttachments {
   }
 
   /** Remembers a document `senderId` sent to `chatId` that addressed nobody. */
-  hold(chatId: string, senderId: string, attachment: Attachment, context: { caption?: string } = {}): void {
+  hold(chatId: string, senderId: string, attachment: AttachmentRef, context: { caption?: string } = {}): void {
     const now = this.now();
     this.prune(now);
     const key = keyOf(chatId, senderId);

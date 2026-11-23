@@ -34,7 +34,6 @@ import {
   renderQuestion,
   resolveChatRoute,
   startFromDeepLink,
-  type ChatRoute,
   type InlineKeyboard,
   migrateChatBinding,
   companionIntroFacts,
@@ -43,10 +42,6 @@ import {
   renderTripList,
   resolveChatLanguage,
   tripDisplayName,
-  consumeExpectsReplyWindow,
-  inCompanionConversation,
-  openCompanionConversation,
-  groupProactiveLevel,
   groupProactiveLevelSetting,
   setGroupProactiveLevel,
   PROACTIVE_JOINS_IN,
@@ -67,9 +62,9 @@ import {
 import { redeemTelegramLinkToken, telegramLinkTokenFromStartPayload } from "../telegram-link-token.js";
 import { bindSecondaryOrganizerChat, redeemSecondaryOrganizerToken, secondaryOrganizerTokenFromStartPayload } from "../secondary-organizers.js";
 import { isAddressedToAssistant } from "./addressing.js";
-import { addressedMark, conversationMark, reactionAnswerMark } from "./stay-silent.js";
+import { companionGate, type GateDecision, type GateDeps, type InboundTurn } from "./companion-gate.js";
 import type { GroupJudge, JudgeOutcome } from "./group-judge.js";
-import { classifyTrigger, inboundFacts, type InboundFacts, type JudgeFacts, type LevelChangeFacts } from "../analytics/relay-facts.js";
+import type { InboundFacts, LevelChangeFacts } from "../analytics/relay-facts.js";
 import { coerceLanguage, uiString, type Language } from "../intake-copy.js";
 import {
   companionHelpText,
@@ -99,16 +94,17 @@ import {
   attachMedia,
   botJoinedGroup,
   describeAttachment,
+  displayName,
   mapChatType,
   migrationOf,
   normalizeUpdate,
+  rehostDeps,
   toWireEventWithMedia,
-  type Attachment,
   type MediaDeps,
   type TelegramMessage,
   type TelegramUpdate,
 } from "./normalize.js";
-import type { HeldAttachment, PendingAttachments } from "./pending-attachments.js";
+import type { PendingAttachments } from "./pending-attachments.js";
 import type { GroupContext } from "./group-context.js";
 import { getSessionForChat, setFinishRequestedForChat, type SessionView } from "../interview.js";
 import { organizerDocumentRoute } from "../document-correction.js";
@@ -116,7 +112,7 @@ import { visionProcessingConfig } from "../document-vision.js";
 import { digestTelegramId, telegramDisplayName, type TelegramName } from "../identity.js";
 import type { StructuredModelRunner } from "../model-runner.js";
 import { handleModelCommand, isSwitchableRunner } from "../model-task-settings.js";
-import { looksLikeAQuestion, type ChatType, type WireMessageEvent } from "./protocol.js";
+import type { WireMessageEvent } from "./protocol.js";
 import { asksForTripApp, couldAskForTripApp, openTripMessage, type OpenTripMessage } from "./open-trip.js";
 import { normaliseBotUsername } from "../bot-username.js";
 
@@ -1353,351 +1349,15 @@ export async function dispatchUpdate(
 
   const outcome = await normalizeUpdate(db, update, options.canReachProfile);
   if (outcome.kind === "event") {
-    // The relevance gate. A DM is addressed by construction; a group message
-    // has to actually address the assistant, or the shared bot answers a
-    // family talking among themselves. See addressing.ts for why this cannot
-    // be left to Hermes's mention_patterns under the relay.
-    const isReplyToAssistant = repliesToAssistant(message, botIdentity);
-
-    // Migration 0053: the assistant's own last message here may have asked a
-    // question it wants answered, in which case the VERY NEXT message in this
-    // chat is addressed to it, whoever sends it — no @mention/name/reply-to
-    // needed. Attempted unconditionally, ahead of the ordinary gate below: the
-    // atomic claim also clears the window on a hit, so a second message, even
-    // one still inside the window, finds nothing left to claim (one-shot).
-    // `route.kind === "companion"` is structural, not a real branch here —
-    // normalizeUpdate never reaches this point for an interview or unbound
-    // chat — mirrored only to match the ternary just below it.
-    //
-    // It now also reads the group's proactive level (level 1 admits nothing
-    // through it), a column a relay running ahead of its migration does not have:
-    // a failed claim degrades to "no window", as the conversation window's reads
-    // below do, rather than failing the update.
-    const senderId = outcome.event.source.user_id;
-    const inGroup = outcome.route.kind === "companion" && outcome.event.source.chat_type !== "dm";
-    // EXPLICIT addressing: the assistant's name, an @mention of the bot, or a reply
-    // to one of its messages. Decided on the message alone - no window, no model.
-    const explicitlyAddressed = isAddressedToAssistant({
-      chatType: outcome.event.source.chat_type,
-      text: outcome.event.text,
-      assistantNames: outcome.route.kind === "companion" ? outcome.route.assistantNames : [],
-      botUsername: botIdentity.username,
-      isReplyToAssistant,
-    });
-    // A group message with no letter or digit and no attachment (a laugh, a
-    // thumbs-up, a lone "?") is a reaction, not a request - EXCEPT as the answer
-    // to a question the assistant asked ("Should I update the site?" - 👍 is
-    // consent, owner's decision 2026-10-17). Exactly two things make one an
-    // answer: the one-shot "?" window is open (the assistant's latest send ended
-    // in a question, unanswered, inside 150 s - consumed below, as for any
-    // message), or it is a Telegram reply to an assistant message that itself
-    // ended in a question. Anything else - a laugh, a thumbs-up to a statement,
-    // a reply to a statement - is chatter: the conversation window and the judge
-    // never admit it. "The assistant's latest message was a question" is NOT
-    // stored anywhere new: the "?" window IS that state, and a reply carries the
-    // text it replies to.
-    const reactionOnly = inGroup && !outcome.attachment && outcome.event.text.trim() !== "" &&
-      !judgeableText(outcome.event.text);
-    const repliedToText = message.reply_to_message?.text ?? message.reply_to_message?.caption ?? "";
-    const reactionAnswersQuestion = reactionOnly && isReplyToAssistant && looksLikeAQuestion(repliedToText);
-    // Explicit addressing as it counts for THIS message: a reaction that replies
-    // to a statement is not explicit, whoever's message it replies to.
-    const explicitHere = explicitlyAddressed && (!reactionOnly || reactionAnswersQuestion);
-
-    let capturedAsReply = false;
-    if (outcome.route.kind === "companion") {
-      try {
-        capturedAsReply = await consumeExpectsReplyWindow(db, chatId);
-      } catch (error) {
-        log(structuredLog("warn", "trip_bot.reply_window_read_failed", {
-          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
-        }));
-      }
-    }
-
-    // Booleans only in the log: no chat or user id beyond what other events carry.
-    if (capturedAsReply) log(structuredLog("info", "trip_bot.reply_window_hit", {}));
-
-    if (reactionOnly && !capturedAsReply && !explicitHere) log(structuredLog("info", "trip_bot.reaction_not_forwarded", {}));
-    const addressedOtherwise = capturedAsReply || explicitHere;
-
-    // The per-person conversation window (2026-10-16). Consulted LAST, only for
-    // a group message every other route has refused: is the sender the one
-    // member the assistant is in conversation with here, inside the window?
-    // The sender is the Telegram user id the update carried, never anything
-    // read from the text. A pure read - the forward below is what renews it.
-    //
-    // A failed lookup degrades to "not in the window" - today's behaviour -
-    // rather than failing the whole update: a relay that runs before the
-    // migration is applied (a restart applies none) would otherwise throw on
-    // every untagged group message and lose its held documents and overheard
-    // context with them. Same rule as the writes.
-    let capturedByConversation = false;
-    if (!addressedOtherwise && inGroup && senderId && !reactionOnly) {
-      try {
-        capturedByConversation = await inCompanionConversation(db, chatId, senderId);
-      } catch (error) {
-        log(structuredLog("warn", "trip_bot.conversation_window_read_failed", {
-          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
-        }));
-      }
-    }
-    if (capturedByConversation) log(structuredLog("info", "trip_bot.conversation_window_hit", {}));
-
-    // The group judge (2026-10-16): LAST of all, and only for a group message
-    // every rule above has refused. Existing rules first - anything one of them
-    // addressed never reaches a model. Text and captions only: an uncaptioned
-    // photo or file has nothing to judge and keeps today's hold-until-addressed
-    // behaviour. Every way it can fail ends in NOT_ADDRESSED.
-    let capturedByJudge = false;
-    let judged: JudgeOutcome | null = null;
-    if (
-      !addressedOtherwise && !capturedByConversation && inGroup && senderId &&
-      options.groupJudge?.model() && outcome.route.kind === "companion" && judgeableText(outcome.event.text)
-    ) {
-      if (options.judgedOutcome !== undefined) {
-        // Second pass of a deferred judgement: the verdict is already in.
-        judged = options.judgedOutcome;
-      } else {
-        const ask = await prepareGroupJudge(db, options.groupJudge, outcome.route, chatId, outcome.event.text, log);
-        if (ask === null) judged = null;
-        else if (options.deferJudge) return { kind: "judge_pending", chatId, ask };
-        else judged = await ask();
-      }
-      capturedByJudge = judged?.kind === "yes";
-    }
-    const addressed = addressedOtherwise || capturedByConversation || capturedByJudge;
-    // #177: the gate's verdict, as metadata. Only ever called through
-    // `withAnalytics`, which never calls it while assistant events are off.
-    // The text is taken here, before anything is prefixed to it.
-    const heardText = outcome.event.text;
-    const routedTripId = outcome.route.kind === "companion" ? outcome.route.tripId : null;
-    const seen = (linkRole: string | null | undefined): InboundFacts => {
-      if (!routedTripId) throw new Error("NOT_COMPANION_ROUTE");
-      const facts = inboundFacts({
-        tripId: routedTripId,
-        // Telegram's own type for the channel; the gate's mapped one for the trigger.
-        telegramChatType: message.chat?.type,
-        trigger: classifyTrigger({
-          addressed,
-          capturedAsReply,
-          capturedByConversation,
-          capturedByJudge,
-          chatType: outcome.event.source.chat_type,
-          text: heardText,
-          assistantNames: outcome.route.kind === "companion" ? outcome.route.assistantNames : [],
-          botUsername: botIdentity.username,
-          isReplyToAssistant,
-        }),
-        linkRole,
-        attachmentKind: outcome.attachment?.kind ?? null,
-        textLength: heardText.length,
-      });
-      // Memory-only keys (relay-facts.ts): they let the emitter notice that the
-      // same sender, right after a judge_no, then addressed the assistant by name.
-      return {
-        ...facts,
-        chatKey: chatId,
-        ...(senderId ? { senderKey: senderId } : {}),
-        ...(judged ? { judge: judgeFactsOf(judged) } : {}),
-      };
-    };
-    if (!addressed) {
-      // Not for the assistant, so nothing is downloaded. A DOCUMENT is still
-      // remembered, by reference, for its sender's next addressed message —
-      // "send the file, then say what it is for" is one interaction to the
-      // person doing it. Photos are not: in a family group they are the family
-      // talking, and a photo followed by an unrelated question is the common case.
-      // Remembered, not delivered. Nothing is sent and no model turn happens;
-      // this only means the NEXT addressed message knows what it is replying
-      // into. Groups only — a DM is addressed by construction, so nothing is
-      // ever dropped there.
-      // A bare reaction (an emoji, a "?") is not kept either: it adds nothing the
-      // companion could use and would only lengthen the block that leads its prompt.
-      if (options.groupContext && outcome.event.source.chat_type !== "dm" && outcome.event.text && !reactionOnly) {
-        options.groupContext.hold(
-          chatId,
-          outcome.event.source.user_name || "someone",
-          outcome.event.text,
-        );
-      }
-      const held = Boolean(options.pendingAttachments && senderId && outcome.attachment?.kind === "document");
-      if (options.pendingAttachments && senderId && outcome.attachment?.kind === "document") {
-        options.pendingAttachments.hold(chatId, senderId, outcome.attachment, {
-          ...(message.caption ? { caption: message.caption } : {}),
-        });
-        log(structuredLog("info", "trip_bot.attachment_held", { kind: outcome.attachment.kind }));
-      }
-      return {
-        kind: "ignore",
-        reason: "NOT_ADDRESSED",
-        ...(await withAnalytics(options.assistantEvents, log, async () => ({
-          ...seen(senderId && routedTripId ? (await resolveTripPerson(db, routedTripId, senderId))?.role : null),
-          ...(held ? { documentHeld: true } : {}),
-        }))),
-      };
-    }
-
-    // This sender is now one of the members the assistant is talking with in this group:
-    // they join the conversation (nobody is displaced) and its shared deadline is extended. Written
-    // when the message is FORWARDED, not when the assistant answers, so a
-    // follow-up sent while it is still working counts. Whatever route
-    // addressed the message - name, mention, reply, the "?" window or this
-    // window itself. A failed write is logged and never costs the message.
-    if (inGroup && senderId) {
-      try {
-        await openCompanionConversation(db, chatId, senderId);
-      } catch (error) {
-        log(structuredLog("warn", "trip_bot.conversation_window_write_failed", {
-          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
-        }));
-      }
-    }
-
-    // WHOSE VOICE THIS IS, when the trip knows. `user_name` arrives from
-    // Telegram, where every sender writes their own — so the assistant was
-    // being told "Dror" by the one party with an interest in the answer, and
-    // in a family group it had nothing else to go on at all. A trip person
-    // link is the control plane's own record (migration 0051), written at
-    // provisioning from the interview chat, so it outranks anything the
-    // update carries. Unknown senders keep their Telegram name: it is what
-    // their family calls them, and the alternative is a blank where a person
-    // should be.
-    let senderLinkRole: string | null = null;
-    if (outcome.route.kind === "companion" && outcome.event.source.user_id) {
-      const person = await resolveTripPerson(
-        db, outcome.route.tripId, outcome.event.source.user_id,
-      );
-      senderLinkRole = person?.role ?? null;
-      if (person?.displayName) {
-        outcome.event.source.user_name = person.displayName;
-        log(structuredLog("info", "trip_bot.sender_identified", { role: person.role }));
-      }
-    }
-    // A FILE FROM THE ORGANIZER, AFTER CONFIRMATION, is this relay's to read —
-    // proposed back to them for approval, never handed to the companion to
-    // write onto the site on its own. Only the organizer's own private chat,
-    // from the organizer; a group's or a member's file keeps its route.
-    // ONLY WITH THE ROUTE SWITCHED ON (ORGANIZER_DOCUMENT_ROUTE_ENABLED=1): an
-    // Approve re-provisions the site, which on a live trip is a mid-trip
-    // redeploy. Off — the default — `organizerDocumentRoute` answers null
-    // before anything is downloaded, and the file takes the companion route
-    // below exactly as it did before #178.
-    if (outcome.route.kind === "companion") {
-      const organizer = await organizerDocumentRoute(db, {
-        tripId: outcome.route.tripId,
-        chatId,
-        chatType: message.chat?.type,
-        fromId: message.from?.id === undefined ? undefined : String(message.from.id),
-        // The message's OWN attachment, as normalisation described it. The wire
-        // event has no media yet - `attachMedia` runs only once the turn is
-        // known to go somewhere - so asking it (as this did until #178) was
-        // always "no media", and this route never fired.
-        mediaKinds: outcome.attachment ? [outcome.attachment.kind] : [],
-        hasMedia: outcome.attachment !== null,
-        hasRunner: Boolean(options.modelRunner),
-        canReadImages: visionProcessingConfig(options.modelRunner) !== null,
-        // Strictly `true`: absent — every caller that never heard of the flag —
-        // is off.
-        enabled: options.organizerDocumentRoute === true,
-        log,
-      });
-      // The reader needs the file itself, so re-host it now. A download that
-      // failed leaves nothing to read: fall through to the companion, which
-      // tells the organizer it could not read the file.
-      const readable = organizer && outcome.attachment
-        ? await attachMedia(
-            outcome.event,
-            [{ ...outcome.attachment, ...(message.caption ? { caption: message.caption } : {}) }],
-            options.media,
-          )
-        : null;
-      if (organizer && readable && (readable.media_urls?.length ?? 0) > 0) {
-        return {
-          kind: "document_correction",
-          chatId,
-          tripId: outcome.route.tripId,
-          sessionId: organizer.sessionId,
-          language: organizer.language,
-          event: readable,
-          // The route itself proves the organizer: their own private chat,
-          // from them, on the trip's confirmed interview chat.
-          ...(await withAnalytics(options.assistantEvents, log, () => ({
-            ...seen("organizer"),
-            documents: outcome.attachment ? 1 : 0,
-          }))),
-        };
-      }
-    }
-
-    // A message that got here ONLY because its sender is in conversation with
-    // the assistant (no name, @mention, reply-to or "?" window) is marked, so the
-    // companion can tell a remark to the family from a message to it, and may
-    // answer with the silence sentinel (stay-silent.ts; the connector drops it).
-    // Named / mentioned / replying messages never get this mark (see addressedMark below). Text is the only
-    // field that reaches the model, so the mark is a fenced line on the text,
-    // put on BEFORE the overheard block so that block still leads. An empty
-    // text (a photo or file with no caption) gets the mark alone.
-    // The judge's yes is marked the same way, for the same reason: the companion
-    // is told it was not addressed by name and may stay silent (the second guard
-    // against a wrong yes).
-    if (capturedByConversation || capturedByJudge) {
-      outcome.event.text = `${conversationMark()}\n\n${outcome.event.text}`.trimEnd();
-    }
-    // The opposite fence (2026-10-17, A3 of the staging run): a group message
-    // that EXPLICITLY addressed the assistant - its name, an @mention, a reply to
-    // it - says so. The companion's prompt never named its own @handle, so it read
-    // "@<bot> where is the hotel?" as meant for someone else and answered with the
-    // silence sentinel, twice. Said as a fenced line on the text (the only field
-    // that reaches the model), carrying the bot's handle so the companion learns
-    // it, and ordered exactly like the conversation mark. The "?" window is NOT
-    // explicit - the next message after a question may be anyone's remark - so it
-    // keeps today's unmarked form. A DM is addressed by construction, never marked.
-    const explicit = inGroup && explicitHere;
-    if (explicit) {
-      outcome.event.text = `${addressedMark(botIdentity.username)}\n\n${outcome.event.text}`.trimEnd();
-    } else if (inGroup && reactionOnly && capturedAsReply) {
-      // A reaction that took the "?" window: not addressed by name, so a silence
-      // is allowed, but it is told what the bare emoji answers.
-      outcome.event.text = `${reactionAnswerMark()}\n\n${outcome.event.text}`.trimEnd();
-    }
-
-    // The turns this message is a reply INTO. Prefixed onto the text rather
-    // than carried in its own field because the gateway forwards `text` and
-    // nothing else reaches the model — a new inbound field would be ignored
-    // exactly as `expects_reply` was (#122). Clearly fenced and named as
-    // overheard so it reads as background, never as something said to the
-    // assistant or asked of it. Empty when there is nothing to carry, so a
-    // quiet group's turns look exactly as they did before.
-    if (options.groupContext && outcome.event.source.chat_type !== "dm") {
-      const overheard = options.groupContext.take(chatId);
-      if (overheard.length) {
-        const lines = overheard.map((m) => `${m.sender}: ${m.text}`).join("\n");
-        outcome.event.text =
-          `[overheard in the group since you last spoke — background only, not addressed to you]\n` +
-          `${lines}\n[end of overheard]\n\n${outcome.event.text}`;
-        log(structuredLog("info", "trip_bot.group_context_carried", { turns: overheard.length }));
-      }
-    }
-
-    const attachments = attachmentsForAddressedTurn(message, outcome.attachment, chatId, senderId, options.pendingAttachments);
-    if (attachments.joined > 0) {
-      log(structuredLog("info", "trip_bot.attachments_joined", {
-        held: attachments.held,
-        replied: attachments.replied,
-      }));
-    }
-    const forwarded = await attachMedia(outcome.event, attachments.list, options.media);
-    return {
-      kind: "to_gateway",
-      event: forwarded,
-      ...(explicit ? { explicit: true } : {}),
-      ...(await withAnalytics(options.assistantEvents, log, () => ({
-        ...seen(senderLinkRole),
-        attachmentsJoined: attachments.joined,
-        documents: (forwarded.media ?? []).filter((m) => m.kind === "document").length,
-      }))),
-    };
+    // The companion path - addressing, the windows, the judge, overheard context,
+    // held files, the marks - is decided by the platform-neutral gate
+    // (companion-gate.ts); this builds its input from the Telegram message and
+    // applies what it decides.
+    return fromGate(await companionGate(
+      telegramTurn(message, chatId, botIdentity),
+      outcome,
+      telegramGateDeps(db, message, chatId, strings, log, botIdentity, options),
+    ));
   }
 
   switch (outcome.reason) {
@@ -1740,250 +1400,149 @@ export async function dispatchUpdate(
       return { kind: "reply", reply: list ?? { chatId, text: strings.unbound } };
     }
     case "COMPANION_PENDING": {
-      // Two different situations arrive here, and the family is owed different
-      // words for each:
-      //   - the trip has NO companion yet (never installed, or mid-install):
-      //     the honest "still finishing your assistant", said to whoever writes;
-      //   - the trip HAS one and its gateway is not connected right now (an
-      //     outage or a restart): the generic line - and never to a family
-      //     talking among themselves (#179).
+      // The branch itself is the gate's. The route is resolved here, as it always
+      // was: `normalizeUpdate`'s outcome for a drop is pinned and carries none.
       const route = await resolveChatRoute(db, chatId);
-      const chatType = mapChatType(
-        message.chat?.type,
-        message.is_topic_message === true && message.message_thread_id !== undefined,
-      );
-      // The relevance gate's verdict, once, for the reply decision and for the
-      // record. The expects-reply window is not consulted (claiming it is a
-      // write): during an outage the assistant has said nothing to be replied to.
-      const gate = {
-        chatType,
-        text,
-        assistantNames: route.kind === "companion" ? route.assistantNames : [],
-        botUsername: botIdentity.username,
-        isReplyToAssistant: repliesToAssistant(message, botIdentity),
-      };
-      const addressed = route.kind === "companion" && isAddressedToAssistant(gate);
-      const facts = () => companionPendingFacts(db, route, message, gate, addressed);
-
-      // "Has this trip's assistant ever been announced as up?" - the organizer's
-      // `companion_ready` message, sent only after the companion exists. Without
-      // it a profile is merely stamped: a first-time organizer must not be told
-      // "I'm off for now" about an assistant that has not come up yet. Trips
-      // that predate that message also keep the honest wording during an outage
-      // (the safe direction).
-      const announced = route.kind === "companion" && route.hermesProfile
-        ? await companionAnnounced(db, route.tripId)
-        : false;
-      if (route.kind !== "companion" || !announced) {
-        return {
-          kind: "reply",
-          reply: { chatId, text: strings.companionPending },
-          ...(await withAnalytics(options.assistantEvents, log, facts)),
-        };
-      }
-
-      if (chatType !== "dm" && !addressed) {
-        // Chatter is never answered, outage or not.
-        return {
-          kind: "ignore",
-          reason: "NOT_ADDRESSED",
-          ...(await withAnalytics(options.assistantEvents, log, facts)),
-        };
-      }
-      if (chatType !== "dm" && !(options.outageNotices ?? processOutageNotices).allow(chatId)) {
-        // Addressed, but this chat was told a moment ago. NO analytics on
-        // purpose: an `ignore` carrying facts is recorded as chatter, and this
-        // was a lost turn - an absent event undercounts, a wrong one misleads.
-        return { kind: "ignore", reason: "COMPANION_UNAVAILABLE_NOTICE_LIMITED" };
-      }
-      const intro = await companionIntroFacts(db, route.tripId);
-      return {
-        kind: "reply",
-        reply: { chatId, text: uiString("companionUnavailable", intro?.language === "he" ? "he" : "en") },
-        ...(await withAnalytics(options.assistantEvents, log, facts)),
-      };
+      return fromGate(await companionGate(
+        telegramTurn(message, chatId, botIdentity),
+        { kind: "dropped", reason: "COMPANION_PENDING", route },
+        telegramGateDeps(db, message, chatId, strings, log, botIdentity, options),
+      ));
     }
     default:
       return { kind: "ignore", reason: outcome.reason };
   }
 }
 
-/** A message worth a model call: it carries at least one letter or digit. A lone emoji or "?" is a reaction. */
-function judgeableText(text: string): boolean {
-  return /[\p{L}\p{N}]/u.test(text);
-}
+/** The decision the Telegram-only document route adds to the gate's own. */
+type DocumentCorrectionDecision = Extract<DispatchDecision, { kind: "document_correction" }>;
 
 /**
- * Prepares the judge's question about one unaddressed group message: null when it
- * must not be asked - the group's level is below 3 (`/proactive`; a trip that opted
- * out of reply capture reads as level 1), or the level could not be read (fail
- * closed: a relay running ahead of its migration judges nothing) - otherwise the
- * function that asks. The reads happen here, now; only the model call is left to
- * `ask`, which never throws, logs the verdict and its speed (never the text), and
- * may be run later and off the caller's loop.
+ * The Telegram sink for the gate's decisions: a `drop` is an `ignore`, and every
+ * other decision is already a `DispatchDecision`, passed through untouched.
+ * Nothing is added to either shape - `analytics` appears only when the gate set it.
  */
-async function prepareGroupJudge(
-  db: pg.Pool,
-  judge: GroupJudge,
-  route: Extract<ChatRoute, { kind: "companion" }>,
-  chatId: string,
-  text: string,
-  log: (line: string) => void,
-): Promise<(() => Promise<JudgeOutcome>) | null> {
-  try {
-    if ((await groupProactiveLevel(db, chatId)) !== PROACTIVE_JOINS_IN) return null;
-  } catch (error) {
-    log(structuredLog("warn", "trip_bot.group_judge_level_read_failed", {
-      safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
-    }));
-    return null;
-  }
-  const language = await tripLanguage(db, route.tripId).catch(() => "en" as const);
-  return async () => {
-    const judged = await judge.judge({ chatId, text, assistantNames: route.assistantNames, language });
-    log(structuredLog("info", "trip_bot.group_judged", {
-      verdict: judged.kind,
-      latency_ms: judged.ms,
-      model: judged.model,
-      ...(judged.kind === "fallback" ? { reason: judged.reason } : { confidence: judged.confidence }),
-      ...(judged.kind === "no" && judged.belowThreshold ? { below_threshold: true } : {}),
-    }));
-    return judged;
+function fromGate(decision: GateDecision<DocumentCorrectionDecision>): DispatchDecision {
+  if (decision.kind !== "drop") return decision;
+  return {
+    kind: "ignore",
+    reason: decision.reason,
+    ...(decision.analytics ? { analytics: decision.analytics } : {}),
   };
 }
 
-/** A judge outcome as the analytics descriptor names it. */
-function judgeFactsOf(judged: JudgeOutcome): JudgeFacts {
-  const base = { latencyMs: judged.ms, model: judged.model };
-  if (judged.kind === "yes") {
-    return { ...base, outcome: "judge_yes", confidencePct: Math.round(judged.confidence * 100) };
-  }
-  if (judged.kind === "no") {
-    return {
-      ...base,
-      outcome: "judge_no",
-      confidencePct: Math.round(judged.confidence * 100),
-      ...(judged.belowThreshold ? { belowThreshold: true } : {}),
-    };
-  }
-  return { ...base, outcome: "judge_fallback", fallbackReason: judged.reason };
-}
-
-/**
- * The `analytics` field to spread into a decision — or nothing (#177).
- *
- * Off, it returns `{}` without calling `build`, so the decision is exactly
- * what it was before assistant events existed. On, a `build` that throws (a
- * failed lookup, a route that is not a companion's) costs the descriptor and
- * a log line, never the decision.
- */
-async function withAnalytics(
-  enabled: boolean | undefined,
-  log: (line: string) => void,
-  build: () => InboundFacts | Promise<InboundFacts>,
-): Promise<{ analytics?: InboundFacts }> {
-  if (!enabled) return {};
-  try {
-    return { analytics: await build() };
-  } catch (error) {
-    log(structuredLog("warn", "trip_bot.assistant_event_facts_failed", {
-      safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
-    }));
-    return {};
-  }
-}
-
-/** Whether the organizer has been told this trip's assistant is up (outbox `companion_ready`, delivered). */
-async function companionAnnounced(db: pg.Pool, tripId: string): Promise<boolean> {
-  const { rows } = await db.query(
-    `SELECT 1 FROM control_plane.notification_outbox
-      WHERE trip_id = $1 AND notification_type = 'companion_ready' AND sent_at IS NOT NULL
-      LIMIT 1`,
-    [tripId],
-  );
-  return rows.length > 0;
-}
-
-/**
- * The facts of a message the router answered, or deliberately did not, because
- * the companion is not connected - a lost turn when it was addressed. The
- * verdict is the caller's, computed once (see the COMPANION_PENDING case), so
- * the record and the reply cannot disagree about who was addressed.
- */
-async function companionPendingFacts(
-  db: pg.Pool,
-  route: ChatRoute,
-  message: TelegramMessage,
-  gate: {
-    chatType: ChatType;
-    text: string;
-    assistantNames: readonly string[];
-    botUsername?: string;
-    isReplyToAssistant: boolean;
-  },
-  addressed: boolean,
-): Promise<InboundFacts> {
-  if (route.kind !== "companion") throw new Error("NOT_COMPANION_ROUTE");
-  const senderId = message.from?.id === undefined ? null : String(message.from.id);
-  return inboundFacts({
-    tripId: route.tripId,
-    telegramChatType: message.chat?.type,
-    trigger: classifyTrigger({ addressed, capturedAsReply: false, ...gate }),
-    linkRole: senderId ? (await resolveTripPerson(db, route.tripId, senderId))?.role : null,
-    attachmentKind: describeAttachment(message)?.kind ?? null,
-    textLength: gate.text.length,
-  });
-}
-
-/**
- * The files an addressed message brings to the assistant, oldest first and
- * each once:
- *
- *   1. documents this sender left in this chat, unaddressed, within the window;
- *   2. the document this message replies to — only when the sender sent it;
- *   3. whatever this message carries itself.
- *
- * Every source is scoped to the sender. Another person's document is never
- * attached to this request: not from the holding area, and not by replying to
- * it, since a reply is a gesture at a message, not a claim on someone else's
- * file. A sender Telegram does not identify brings only their own attachment.
- */
-function attachmentsForAddressedTurn(
-  message: TelegramMessage,
-  own: Attachment | null,
-  chatId: string,
-  senderId: string | null,
-  pending: PendingAttachments | undefined,
-): { list: HeldAttachment[]; held: number; replied: boolean; joined: number } {
-  const list: HeldAttachment[] = [];
-  const seen = new Set<string>();
-  const add = (attachment: HeldAttachment): boolean => {
-    if (seen.has(attachment.fileId)) return false;
-    seen.add(attachment.fileId);
-    list.push(attachment);
-    return true;
+/** One Telegram message as the neutral `InboundTurn` the gate reads. */
+function telegramTurn(message: TelegramMessage, chatId: string, botIdentity: BotIdentity): InboundTurn {
+  const repliedTo = message.reply_to_message;
+  const repliedAttachment = repliedTo ? describeAttachment(repliedTo) : null;
+  const repliedToText = repliedTo?.text ?? repliedTo?.caption ?? "";
+  return {
+    platform: "telegram",
+    chatId,
+    chatType: mapChatType(
+      message.chat?.type,
+      message.is_topic_message === true && message.message_thread_id !== undefined,
+    ),
+    rawChatType: message.chat?.type ?? "",
+    chatName: message.chat?.title ?? message.chat?.username ?? null,
+    senderId: message.from?.id !== undefined ? String(message.from.id) : null,
+    senderName: displayName(message.from),
+    text: message.text ?? message.caption ?? "",
+    ...(message.caption ? { caption: message.caption } : {}),
+    messageId: message.message_id !== undefined ? String(message.message_id) : "",
+    ...(repliedTo?.message_id !== undefined ? { replyToMessageId: String(repliedTo.message_id) } : {}),
+    isReplyToAssistant: repliesToAssistant(message, botIdentity),
+    ...(repliedTo?.from?.id !== undefined ? { repliedToSenderId: String(repliedTo.from.id) } : {}),
+    ...(repliedToText ? { repliedToText } : {}),
+    attachment: describeAttachment(message),
+    repliedToAttachment: repliedAttachment
+      ? { ...repliedAttachment, ...(repliedTo?.caption ? { caption: repliedTo.caption } : {}) }
+      : null,
   };
+}
 
-  let held = 0;
-  let replied = false;
-  if (senderId) {
-    for (const attachment of pending?.take(chatId, senderId) ?? []) {
-      if (add(attachment)) held += 1;
-    }
-    const repliedTo = message.reply_to_message;
-    const repliedAttachment = repliedTo ? describeAttachment(repliedTo) : null;
-    if (
-      repliedAttachment?.kind === "document"
-      && repliedTo?.from?.id !== undefined
-      && String(repliedTo.from.id) === senderId
-    ) {
-      add({ ...repliedAttachment, ...(repliedTo.caption ? { caption: repliedTo.caption } : {}) });
-      replied = true;
-    }
-  }
-  if (own) add({ ...own, ...(message.caption ? { caption: message.caption } : {}) });
-
-  return { list, held, replied, joined: held + (replied ? 1 : 0) };
+/** What the gate needs from this relay's Telegram side: its stores, its media plane, its organizer-document route. */
+function telegramGateDeps(
+  db: pg.Pool,
+  message: TelegramMessage,
+  chatId: string,
+  strings: DispatchStrings,
+  log: (line: string) => void,
+  botIdentity: BotIdentity,
+  options: DispatchOptions,
+): GateDeps<DocumentCorrectionDecision> {
+  return {
+    db,
+    log,
+    assistantHandle: botIdentity.username,
+    resolvePerson: (tripId, senderId) => resolveTripPerson(db, tripId, senderId),
+    // A FILE FROM THE ORGANIZER, AFTER CONFIRMATION, is this relay's to read -
+    // proposed back to them for approval, never handed to the companion to
+    // write onto the site on its own. Only the organizer's own private chat,
+    // from the organizer; a group's or a member's file keeps its route.
+    // ONLY WITH THE ROUTE SWITCHED ON (ORGANIZER_DOCUMENT_ROUTE_ENABLED=1): an
+    // Approve re-provisions the site, which on a live trip is a mid-trip
+    // redeploy. Off - the default - `organizerDocumentRoute` answers null
+    // before anything is downloaded, and the file takes the companion route
+    // exactly as it did before #178. The gate runs this after the sender is
+    // identified and before any mark, where it always sat.
+    beforeMarks: async (turn, route, context) => {
+      const organizer = await organizerDocumentRoute(db, {
+        tripId: route.tripId,
+        chatId,
+        chatType: message.chat?.type,
+        fromId: message.from?.id === undefined ? undefined : String(message.from.id),
+        // The message's OWN attachment, as normalisation described it. The wire
+        // event has no media yet - `attachMedia` runs only once the turn is
+        // known to go somewhere - so asking it (as this did until #178) was
+        // always "no media", and this route never fired.
+        mediaKinds: turn.attachment ? [turn.attachment.kind] : [],
+        hasMedia: turn.attachment !== null,
+        hasRunner: Boolean(options.modelRunner),
+        canReadImages: visionProcessingConfig(options.modelRunner) !== null,
+        // Strictly `true`: absent - every caller that never heard of the flag -
+        // is off.
+        enabled: options.organizerDocumentRoute === true,
+        log,
+      });
+      // The reader needs the file itself, so re-host it now. A download that
+      // failed leaves nothing to read: fall through to the companion, which
+      // tells the organizer it could not read the file.
+      const readable = organizer && turn.attachment
+        ? await attachMedia(
+            context.event,
+            [{ ...turn.attachment, ...(message.caption ? { caption: message.caption } : {}) }],
+            options.media,
+          )
+        : null;
+      if (organizer && readable && (readable.media_urls?.length ?? 0) > 0) {
+        return {
+          kind: "document_correction",
+          chatId,
+          tripId: route.tripId,
+          sessionId: organizer.sessionId,
+          language: organizer.language,
+          event: readable,
+          // The route itself proves the organizer: their own private chat,
+          // from them, on the trip's confirmed interview chat.
+          ...(await context.withAnalytics(() => ({
+            ...context.facts("organizer"),
+            documents: turn.attachment ? 1 : 0,
+          }))),
+        };
+      }
+      return null;
+    },
+    ...(options.media ? rehostDeps(options.media) : {}),
+    ...(options.pendingAttachments ? { pendingAttachments: options.pendingAttachments } : {}),
+    ...(options.groupContext ? { groupContext: options.groupContext } : {}),
+    ...(options.groupJudge ? { groupJudge: options.groupJudge } : {}),
+    ...(options.deferJudge ? { deferJudge: true } : {}),
+    ...(options.judgedOutcome !== undefined ? { judgedOutcome: options.judgedOutcome } : {}),
+    ...(options.assistantEvents ? { assistantEvents: true } : {}),
+    outageNotices: options.outageNotices ?? processOutageNotices,
+    companionPendingText: strings.companionPending,
+  };
 }
 
 /**

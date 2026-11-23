@@ -697,6 +697,24 @@ class ProvisionerHappyPathTests(unittest.TestCase):
             self.fake_deploy.deployed[0]["config"]["travel_info"]["countries"]["Japan"]["flag"],
         )
 
+    def test_a_trip_that_ends_up_with_no_timezone_is_logged_with_its_trip_id(self) -> None:
+        # Loud-gap contract of trip_timezone: a config with no usable zone runs
+        # on UTC and looks complete, so the provision says so, naming the trip.
+        def strip_zone(config: dict, destination: str) -> dict:
+            config["meta"].pop("timezone", None)
+            (config.get("agent") or {}).pop("timezone", None)
+            return config
+
+        worker = ProvisionerWorker(
+            db_url=DB_URL, deploy=self.fake_deploy, worker_id="test-tz-unresolved",
+            enrich=strip_zone,
+        )
+        with self.assertLogs("control_plane_worker.trip_timezone", level="WARNING") as logs:
+            worker.run_once()
+        record = next(r for r in logs.records if r.getMessage() == "timezone.unresolved")
+        self.assertEqual(str(self.fix["trip_id"]), record.trip_id)
+        self.assertNotIn("timezone", self.fake_deploy.deployed[0]["config"]["meta"])
+
     def test_a_raising_enrich_hook_does_not_fail_the_job(self) -> None:
         def boom(config: dict, destination: str) -> dict:
             raise RuntimeError("enrichment exploded")

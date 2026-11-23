@@ -11,6 +11,8 @@ kinerary-deploy/deploy.sh via subprocess.
 """
 from __future__ import annotations
 
+import dataclasses
+import ipaddress
 import json
 import logging
 import os
@@ -24,6 +26,8 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 import psycopg
+import psycopg.errors
+import yaml
 from psycopg.rows import dict_row
 
 from .companion_profile import (
@@ -34,6 +38,7 @@ from .companion_profile import (
 from .compute import ComputeAdapter, NullComputeAdapter
 from .feature_block import resolve_features, with_features
 from .mcp_bridge import McpBridgeAdapter, NullMcpBridgeAdapter, log_fields
+from .trip_timezone import warn_if_unresolved
 from .release_source import ReleaseSourceError, materialize_release_source
 from . import verification
 from .transformer import (
@@ -110,6 +115,99 @@ class DeployAdapter(Protocol):
         documents: Sequence[TripDocumentFile] | None = None,
         trip_id: str | None = None,
     ) -> str: ...
+
+
+# ── Where a trip's site is, for the runtime gateway ─────────────────────────
+
+#: A lower-case DNS name of two or more labels - the shape the runtime_routes
+#: public_host column accepts. A value that does not match is not recorded.
+_PUBLIC_HOST = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+")
+
+
+@dataclasses.dataclass(frozen=True)
+class TripRoute:
+    """What the runtime gateway needs to reach one trip's site.
+
+    `public_host` is the hostname the family uses; `upstream_url` is where the
+    site listens on the LAN, `http://<container address>:<port>`. `routing` is
+    the topology's own (`host` or `wildcard`): in `wildcard` nothing else makes
+    the hostname reach the container, so the route is not optional there.
+    """
+
+    public_host: str
+    upstream_url: str
+    routing: str = "host"
+
+
+def topology_public_hostname(raw: Any) -> str | None:
+    """The trip's own public hostname from a parsed topology.yaml, or None.
+
+    `proxmox.lxc.public_hostname` when the topology has no proxy host (wildcard
+    routing), otherwise `npm.hostname`, as every older file records it. An
+    unresolved `${VAR}` placeholder is not a hostname."""
+    if not isinstance(raw, Mapping):
+        return None
+    lxc = (raw.get("proxmox") or {}).get("lxc") if isinstance(raw.get("proxmox"), Mapping) else None
+    npm = raw.get("npm")
+    for source, key in ((lxc, "public_hostname"), (npm, "hostname")):
+        if isinstance(source, Mapping):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip() and not value.strip().startswith("$"):
+                return value.strip()
+    return None
+
+
+def topology_route(raw: Any) -> TripRoute | None:
+    """The route a parsed topology.yaml describes, or None when it does not
+    describe one (a hand-written topology with no usable address or port, a
+    DHCP container, an unresolved placeholder). Nothing is guessed: every part
+    is checked, and a part that fails makes the whole answer None."""
+    hostname = topology_public_hostname(raw)
+    if hostname is None:
+        return None
+    hostname = hostname.lower()
+    if not _PUBLIC_HOST.fullmatch(hostname):
+        return None
+    proxmox = raw.get("proxmox") if isinstance(raw.get("proxmox"), Mapping) else {}
+    lxc = proxmox.get("lxc") if isinstance(proxmox.get("lxc"), Mapping) else {}
+    npm = raw.get("npm") if isinstance(raw.get("npm"), Mapping) else {}
+    ipv4 = lxc.get("ipv4")
+    if not isinstance(ipv4, str):
+        return None
+    try:
+        address = ipaddress.IPv4Address(ipv4.split("/", 1)[0].strip())
+    except ValueError:
+        return None
+    port = lxc.get("forward_port", npm.get("forward_port"))
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        return None
+    routing = raw.get("routing", "host")
+    return TripRoute(
+        public_host=hostname, upstream_url=f"http://{address}:{port}",
+        routing=routing if routing in ("host", "wildcard") else "host",
+    )
+
+
+#: The two database objects that can refuse a route's hostname (migration runtime_route_hosts).
+#: The slug teardown gives a trip (scripts/teardown-trip.py: `retired-<slug>-<yyyymmdd>`, plus `-N` on a second
+#: teardown the same day). A POSIX regex for `~`; a slug that merely STARTS with "retired-" is a live trip's.
+_RETIRED_SLUG = r"^retired-.+-[0-9]{8}(-[0-9]+)?$"
+_PUBLIC_HOST_KEY = "runtime_routes_public_host_key"
+_PUBLIC_HOST_DNS = "runtime_routes_public_host_dns"
+
+
+def _violated_constraint(error: psycopg.Error) -> str | None:
+    """The name of the constraint a refused statement violated, as the server reported it."""
+    return getattr(getattr(error, "diag", None), "constraint_name", None)
+
+
+class RouteHostError(RuntimeError):
+    """A wildcard-routed trip's hostname could not be recorded. `safe_error_code` is what the job keeps; the
+    message (never the database's own text) is what the log keeps."""
+
+    def __init__(self, safe_error_code: str, message: str) -> None:
+        super().__init__(message)
+        self.safe_error_code = safe_error_code
 
 
 # ── Reachability ─────────────────────────────────────────────────────────────
@@ -470,6 +568,27 @@ class ShellDeployAdapter:
             return None
         return self._compute.site_login_password(slug)
 
+    def site_trip_key(self, slug: str) -> str | None:
+        """Which kind of exchange key this trip's site holds ("shared" or
+        "derived"), as its own container reports it; None when nothing can say
+        - a vmid_map trip (a hand-built box this worker never keyed), a compute
+        adapter that does not read it back, or per-trip keys being off. None
+        leaves the trip's route as it is."""
+        if self._vmid_map.get(slug):
+            return None
+        reader = getattr(self._compute, "site_trip_key", None)
+        return reader(slug) if callable(reader) else None
+
+    def verify_site_bridge(self, slug: str) -> "tuple[bool, str] | None":
+        """Ask the compute side to prove, from inside the trip's container, that the
+        trip site reaches the shared bridge and the bridge knows its key. None: no
+        shared bridge is configured, or this is a hand-built vmid_map box this worker
+        never wrote a HERMES_URL into."""
+        if self._vmid_map.get(slug):
+            return None
+        reader = getattr(self._compute, "verify_site_bridge", None)
+        return reader(slug) if callable(reader) else None
+
     def deploy(
         self,
         slug: str,
@@ -580,7 +699,30 @@ class ShellDeployAdapter:
 
         return self._private_url(trip_dir)
 
+    def _load_topology_dict(self, trip_dir: str) -> dict | None:
+        """topology.yaml as plain data, or None when there is none to read.
+
+        Not `provisioning.models.load_topology`: that raises on a hand-written
+        legacy topology that lacks fields the compute adapter writes (see
+        `_trip_nfs_dirname`), and that is exactly the file this has to read."""
+        try:
+            with open(os.path.join(trip_dir, "topology.yaml"), encoding="utf-8") as fh:
+                raw = yaml.safe_load(fh)
+        except (FileNotFoundError, yaml.YAMLError):
+            return None
+        return raw if isinstance(raw, dict) else None
+
     def _private_url(self, trip_dir: str) -> str:
+        """https://<the trip's own hostname>, read from its topology.yaml.
+
+        The topology's own hostname - `proxmox.lxc.public_hostname`, which a
+        wildcard-routed trip has instead of an `npm:` section, else
+        `npm.hostname`, which every older file has. A file the YAML reader
+        cannot make a hostname from falls back to the old line scan, so a legacy
+        file gives the value it always did."""
+        hostname = topology_public_hostname(self._load_topology_dict(trip_dir))
+        if hostname:
+            return f"https://{hostname}"
         topology_path = os.path.join(trip_dir, "topology.yaml")
         try:
             with open(topology_path, encoding="utf-8") as fh:
@@ -594,6 +736,26 @@ class ShellDeployAdapter:
         except FileNotFoundError:
             pass
         raise ValueError(f"could not determine private URL from {topology_path}")
+
+    def route_for(self, slug: str) -> TripRoute | None:
+        """The gateway route this trip's topology.yaml describes, or None.
+
+        None for a trip whose topology cannot give a usable address and port -
+        a vmid_map trip, say - which then keeps exactly the runtime_routes row
+        it has always had. For a `wildcard` trip None is not an answer: nothing
+        else makes its hostname reach the container, so it raises and the job
+        fails where someone looks, instead of finishing as a trip whose
+        hostname answers 404."""
+        trip_dir = os.path.join(self._deploy_root, "trips", slug)
+        raw = self._load_topology_dict(trip_dir)
+        route = topology_route(raw) if raw is not None else None
+        wildcard = isinstance(raw, dict) and raw.get("routing") == "wildcard"
+        if route is None and wildcard:
+            raise ValueError(
+                f"{slug}'s topology.yaml is wildcard-routed but gives no usable hostname, "
+                "container address and forward_port to record as its route"
+            )
+        return route
 
 
 def _generate_notif_id() -> str:
@@ -1276,6 +1438,9 @@ class ProvisionerWorker:
                 config = self._enrich(config, intake_destination(answers))
             except Exception:  # pragma: no cover - enrich_config self-guards
                 logger.warning("provisioner.enrichment_failed", exc_info=True)
+            # A trip with no usable zone runs on UTC and looks complete; say so
+            # here, where the trip id is known, whichever way enrichment went.
+            warn_if_unresolved(config, trip_id=str(trip_id), destination=intake_destination(answers))
 
             # Sidecar files that live beside trip.config.json in the trip
             # dir. trivia_questions.json is always written empty: control-
@@ -1372,6 +1537,9 @@ class ProvisionerWorker:
             # people already use). Per trip - there is no deployment-wide one.
             # Held in a local and passed on; never logged.
             site_password = self._site_login_password(slug)
+            # Which kind of exchange key the site holds, as its container
+            # reports it (None: not known, leave the route's as it is).
+            trip_key = self._site_trip_key(slug)
 
             # Verification aggregator (Sprint 6, docs/sprint6-tracks.md:472):
             # a real gate before `ready_private`, not the unconditional UPDATE
@@ -1385,6 +1553,18 @@ class ProvisionerWorker:
             # See verification.py's module docstring for why isolation,
             # messaging binding and backup checkpoint are not hard-gated yet.
             deployment_ref = plan_desired.get("release_source_revision") or plan_desired.get("release_id")
+            # Where the gateway will reach this trip (None for a trip whose
+            # topology gives no usable address, which keeps its old route row).
+            route = self._route_for(slug)
+            # A wildcard-routed trip is reachable by its hostname only THROUGH the
+            # gateway, and the gateway routes only a trip whose runtime_routes row
+            # says so - which is written below, in the transaction that marks the
+            # trip ready. Probing the public name here would ask a door that
+            # cannot open yet, so such a trip is verified at its own address: the
+            # same /api/health, roster and deployment-nonce checks, one hop closer.
+            verification_url = (
+                route.upstream_url if route is not None and route.routing == "wildcard" else private_url
+            )
             # #review 2026-10-03 [P2], round 1: rendered_data used to accept
             # ANY reachable trip's nonempty roster, so a misrouted
             # private_url (a stale ingress entry, two trips racing onto the
@@ -1409,7 +1589,7 @@ class ProvisionerWorker:
             meta = config.get("meta") or {}
             verification.gate_ready_private(
                 conn, trip_id=trip_id, deployment_ref=deployment_ref,
-                plan_desired=plan_desired, private_url=private_url,
+                plan_desired=plan_desired, private_url=verification_url,
                 http_get=self._verification_http_get,
                 expected_usernames=expected_usernames,
                 expected_deployment_nonce=meta.get("deploymentNonce"),
@@ -1423,6 +1603,7 @@ class ProvisionerWorker:
                 conn, job_id, plan_id, trip_id, private_url,
                 slug=slug, config=config, intake_version_id=intake_version_id,
                 deployment_ref=deployment_ref, site_password=site_password,
+                route=route, trip_key=trip_key,
             )
 
             # Hand the deployed plan to the post-deploy review pass
@@ -1454,6 +1635,20 @@ class ProvisionerWorker:
         """Ask the deploy adapter for this trip's site password. An adapter that
         has no such notion (a fake, a hand-built trip) simply reports none."""
         reader = getattr(self._deploy, "site_login_password", None)
+        return reader(slug) if callable(reader) else None
+
+    def _site_trip_key(self, slug: str) -> str | None:
+        """Ask the deploy adapter which kind of exchange key this trip's site
+        holds. An adapter with no such notion (a fake, a hand-built trip) says
+        nothing, and the route keeps the kind it has."""
+        reader = getattr(self._deploy, "site_trip_key", None)
+        answer = reader(slug) if callable(reader) else None
+        return answer if answer in ("shared", "derived") else None
+
+    def _site_bridge_check(self, slug: str) -> "tuple[bool, str] | None":
+        """The trip site -> shared bridge check (verification.SITE_TO_BRIDGE), or None when the deploy
+        adapter has none to make (a fake, a hand-built trip, no shared bridge configured)."""
+        reader = getattr(self._deploy, "verify_site_bridge", None)
         return reader(slug) if callable(reader) else None
 
     def _materialize_release_if_verified(
@@ -1796,6 +1991,239 @@ class ProvisionerWorker:
                 exc_info=True,
             )
 
+    def _route_for(self, slug: str) -> TripRoute | None:
+        """The deploy adapter's answer to "where is this trip's site", if it
+        has one. An adapter without `route_for` (a test double, a future
+        orchestrator) records no hosts and the route row is what it always was."""
+        route_for = getattr(self._deploy, "route_for", None)
+        return route_for(slug) if callable(route_for) else None
+
+    def _register_runtime_route(
+        self, conn: psycopg.Connection, cur: psycopg.Cursor, trip_id: str, route: TripRoute | None,
+    ) -> None:
+        """Register the runtime in the same transaction that marks the
+        deployment successful. Migration 0034 backfilled old jobs, but without
+        this writer every newly provisioned trip stayed permanently invisible
+        to the gateway, invitations, and the dashboard's real launch path.
+        Re-provisioning keeps the opaque route_ref stable and only restores
+        readiness - and, with a route, rewrites the trip's host and upstream.
+
+        `public_host` / `upstream_url` are what the gateway routes the trip's
+        own hostname by. They come from migration `runtime_route_hosts`: a worker
+        newer than its schema must not turn a finished deploy into a failed one
+        over them, EXCEPT where they are the only thing that makes the hostname
+        work (a wildcard-routed trip), which fails loudly instead.
+        """
+        legacy = """
+            INSERT INTO control_plane.runtime_routes
+              (trip_id, route_ref, state)
+            VALUES (%s, %s, 'ready')
+            ON CONFLICT (trip_id) DO UPDATE
+            SET state = 'ready', updated_at = now()
+        """
+        if route is None:
+            cur.execute(legacy, (trip_id, _generate_route_id()))
+            return
+
+        # A row's `upstream_url` means "this trip's public name is served THROUGH the gateway" (AC-R2.5): the
+        # by-host lookup routes only a row that has one, and the by-trip lookup then answers with that LAN origin
+        # (AC-R1.11). So a host-routed trip, which its own proxy host still serves, records its name and NOT its
+        # address - unless it was already moved behind the gateway (scripts/trip-route.py --set), in which case a
+        # rebuild keeps it there and refreshes the address from the same topology that command reads.
+        upstream: str | None = None
+
+        def behind_gateway_upstream() -> str | None:
+            """The upstream_url this write records: the route's for a wildcard trip or one already behind the gateway,
+            None otherwise. One LAN address is one trip (boundary review of #599, F2): another trip's row that holds
+            the same address and is not in use gives it up; one that is in use refuses the write, because the gateway
+            would send this trip's visitors - and its key - to that trip's container."""
+            with conn.transaction():
+                if route.routing != "wildcard":
+                    cur.execute("SELECT upstream_url FROM control_plane.runtime_routes WHERE trip_id = %s", (trip_id,))
+                    found = cur.fetchone()
+                    had = (found["upstream_url"] if isinstance(found, Mapping) else found[0]) if found else None
+                    if not had:
+                        return None
+                cur.execute(
+                    """
+                    UPDATE control_plane.runtime_routes r
+                    SET    upstream_url = NULL, updated_at = now()
+                    FROM   control_plane.trips t
+                    WHERE  t.id = r.trip_id AND r.trip_id <> %s AND r.upstream_url = %s
+                      AND  (r.state <> 'ready' OR t.slug ~ %s)
+                    RETURNING r.trip_id
+                    """,
+                    (trip_id, route.upstream_url, _RETIRED_SLUG),
+                )
+                for row in cur.fetchall():
+                    logger.warning(log_fields(
+                        "provisioner.route_upstream_released", trip_id=trip_id,
+                        released_from_trip_id=row["trip_id"] if isinstance(row, Mapping) else row[0],
+                        effect="the other trip's route row no longer names this address",
+                    ))
+                cur.execute(
+                    "SELECT trip_id FROM control_plane.runtime_routes WHERE upstream_url = %s AND trip_id <> %s LIMIT 1",
+                    (route.upstream_url, trip_id),
+                )
+                holder = cur.fetchone()
+            if holder is not None:
+                other = holder["trip_id"] if isinstance(holder, Mapping) else holder[0]
+                message = log_fields(
+                    "provisioner.route_upstream_refused", trip_id=trip_id, conflicting_trip_id=other,
+                    reason="upstream_in_use",
+                    effect="another trip's live route has this LAN address; the job fails instead of routing "
+                           "this trip's name to that trip's container (check both topology.yaml files)",
+                )
+                logger.warning(message)
+                raise RouteHostError("ROUTE_UPSTREAM_IN_USE", message)
+            return route.upstream_url
+
+        def write_hosts() -> None:
+            with conn.transaction():  # a savepoint: a refused statement leaves the outer transaction usable
+                cur.execute(
+                    """
+                    INSERT INTO control_plane.runtime_routes
+                      (trip_id, route_ref, state, public_host, upstream_url)
+                    VALUES (%s, %s, 'ready', %s, %s)
+                    ON CONFLICT (trip_id) DO UPDATE
+                    SET state = 'ready', public_host = excluded.public_host,
+                        upstream_url = excluded.upstream_url, updated_at = now()
+                    """,
+                    (trip_id, _generate_route_id(), route.public_host, upstream),
+                )
+
+        try:
+            try:
+                upstream = behind_gateway_upstream()
+                write_hosts()
+            except psycopg.errors.UniqueViolation as exc:
+                if _violated_constraint(exc) != _PUBLIC_HOST_KEY:
+                    raise
+                # Another trip's row holds this hostname. One that is no longer in use (suspended, pending, or a
+                # retired trip's) gives it up, and the write is made once more; one that is in use does not.
+                if not self._release_stale_public_host(conn, cur, trip_id, route.public_host):
+                    raise
+                write_hosts()
+        except psycopg.errors.UndefinedColumn:
+            if route.routing == "wildcard":
+                raise
+            logger.warning(log_fields(
+                "provisioner.route_hosts_not_recorded", trip_id=trip_id, host=route.public_host,
+                reason="control_plane.runtime_routes has no public_host/upstream_url columns",
+                effect="the route row is written as before; apply migration runtime_route_hosts "
+                       "before moving this trip behind the gateway",
+            ))
+            cur.execute(legacy, (trip_id, _generate_route_id()))
+        except psycopg.errors.UniqueViolation as exc:
+            if _violated_constraint(exc) != _PUBLIC_HOST_KEY:
+                raise
+            self._host_not_recordable(cur, trip_id, route, "public_host_in_use", legacy)
+        except psycopg.errors.CheckViolation as exc:
+            if _violated_constraint(exc) != _PUBLIC_HOST_DNS:
+                raise
+            self._host_not_recordable(cur, trip_id, route, "public_host_invalid", legacy)
+
+    def _release_stale_public_host(
+        self, conn: psycopg.Connection, cur: psycopg.Cursor, trip_id: str, public_host: str,
+    ) -> bool:
+        """Clears `public_host` and `upstream_url` on every OTHER trip's row that holds this hostname and is not
+        in use: its route is not `ready` (suspended or pending: the gateway does not answer it), or its trip was
+        retired (teardown renames the slug `retired-<slug>-<yyyymmdd>[-N]`, which is the only way a trip is marked
+        torn down; its lifecycle_state keeps whatever it had). The whole shape is matched, not the prefix: a trip
+        to "Retired in Lisbon" is `retired-in-lisbon-2026` and is not torn down (boundary review of #599, F6). A
+        `ready` route of a trip that is not retired is in use, and anything this cannot tell is treated as in use. Returns whether any row was released.
+
+        Inside the caller's transaction, so the clear stands or falls with the write that follows it. The log line
+        carries both trip ids and never the hostname or an address."""
+        with conn.transaction():
+            cur.execute(
+                """
+                UPDATE control_plane.runtime_routes r
+                SET    public_host = NULL, upstream_url = NULL, updated_at = now()
+                FROM   control_plane.trips t
+                WHERE  t.id = r.trip_id AND r.trip_id <> %s AND r.public_host = %s
+                  AND  (r.state <> 'ready' OR t.slug ~ %s)
+                RETURNING r.trip_id, r.state, (t.slug ~ %s) AS retired
+                """,
+                (trip_id, public_host, _RETIRED_SLUG, _RETIRED_SLUG),
+            )
+            released = cur.fetchall()
+        for row in released:
+            other, state, retired = (row["trip_id"], row["state"], row["retired"]) if isinstance(row, Mapping) else row
+            logger.warning(log_fields(
+                "provisioner.route_host_released", trip_id=trip_id, released_from_trip_id=other,
+                reason="trip_retired" if retired else f"route_{state}",
+                effect="the other trip's route row no longer names this hostname",
+            ))
+        return bool(released)
+
+    def _host_not_recordable(
+        self, cur: psycopg.Cursor, trip_id: str, route: TripRoute, reason: str, legacy: str,
+    ) -> None:
+        """The hostname cannot be recorded for this trip: in use by another trip's live route, or not a name
+        the column accepts. A host-routed trip does not need it recorded to work, so its job is not failed: the
+        row is written without the host columns and the line says why. A wildcard trip has no other way in, so
+        its job fails, naming the other trip when there is one. The refused statement was rolled back by its
+        savepoint, so the outer transaction (the ready_private mark, the job's own success) is still usable."""
+        other: str | None = None
+        if reason == "public_host_in_use":
+            cur.execute(
+                "SELECT trip_id FROM control_plane.runtime_routes WHERE public_host = %s AND trip_id <> %s",
+                (route.public_host, trip_id),
+            )
+            found = cur.fetchone()
+            if found is not None:
+                other = found["trip_id"] if isinstance(found, Mapping) else found[0]
+        if route.routing == "wildcard":
+            code = "ROUTE_PUBLIC_HOST_IN_USE" if reason == "public_host_in_use" else "ROUTE_PUBLIC_HOST_INVALID"
+            message = log_fields(
+                "provisioner.route_host_refused", trip_id=trip_id, reason=reason, conflicting_trip_id=other,
+                effect="a wildcard-routed trip has no other route, so the job fails instead of finishing unrouted",
+            )
+            logger.warning(message)
+            # `from None`: the database's DETAIL quotes the other row, upstream address included.
+            raise RouteHostError(code, message) from None
+        logger.warning(log_fields(
+            "provisioner.route_hosts_not_recorded", trip_id=trip_id, reason=reason, conflicting_trip_id=other,
+            effect="the route row is written as before, without its host and upstream; the trip works as a "
+                   "host-routed one, and the gateway cannot route its hostname until this is resolved",
+        ))
+        cur.execute(legacy, (trip_id, _generate_route_id()))
+
+    def _record_trip_key(
+        self, conn: psycopg.Connection, cur: psycopg.Cursor, trip_id: str, trip_key: str | None,
+    ) -> None:
+        """Record which kind of exchange key the trip's site holds on its route
+        (migration `runtime_route_trip_key`), in the transaction that marks the
+        trip ready. `None` writes nothing: a re-provision that did not look, or
+        could not tell, keeps the kind the route already has, and a new row
+        holds the column's default, `shared`.
+
+        The kind is what the site's own container reported, so a re-provision
+        records the key the site holds, not the one this worker would have
+        written: bootstrap never rewrites an existing .env.
+
+        A worker newer than its schema: "shared" is what the missing column
+        would have meant anyway, so that is a warning; "derived" is the only
+        thing that tells the gateway which key to send, so that fails the job."""
+        if trip_key is None:
+            return
+        try:
+            with conn.transaction():  # a savepoint: a refused statement leaves the outer transaction usable
+                cur.execute(
+                    "UPDATE control_plane.runtime_routes SET trip_key = %s, updated_at = now() WHERE trip_id = %s",
+                    (trip_key, trip_id),
+                )
+        except psycopg.errors.UndefinedColumn:
+            if trip_key == "derived":
+                raise
+            logger.warning(log_fields(
+                "provisioner.trip_key_not_recorded", trip_id=trip_id, trip_key=trip_key,
+                reason="control_plane.runtime_routes has no trip_key column",
+                effect="the route reads as shared, which is what this trip holds; apply migration "
+                       "runtime_route_trip_key before giving any trip a derived key",
+            ))
+
     def _complete(
         self,
         conn: psycopg.Connection,
@@ -1808,6 +2236,8 @@ class ProvisionerWorker:
         intake_version_id: str,
         deployment_ref: str | None = None,
         site_password: str | None = None,
+        route: TripRoute | None = None,
+        trip_key: str | None = None,
     ) -> None:
         result_json = json.dumps({"private_url": private_url})
         with conn.transaction():
@@ -1866,16 +2296,8 @@ class ProvisionerWorker:
                 # permanently invisible to the gateway, invitations, and the
                 # dashboard's real launch path. Re-provisioning keeps the
                 # opaque route_ref stable and only restores readiness.
-                cur.execute(
-                    """
-                    INSERT INTO control_plane.runtime_routes
-                      (trip_id, route_ref, state)
-                    VALUES (%s, %s, 'ready')
-                    ON CONFLICT (trip_id) DO UPDATE
-                    SET state = 'ready', updated_at = now()
-                    """,
-                    (trip_id, _generate_route_id()),
-                )
+                self._register_runtime_route(conn, cur, trip_id, route)
+                self._record_trip_key(conn, cur, trip_id, trip_key)
 
                 # Enqueue organizer notification. recipient is the owner's real,
                 # sendable Telegram chat id when one is on file (added in
@@ -2043,6 +2465,9 @@ class ProvisionerWorker:
                 config = self._enrich(config, intake_destination(answers))
             except Exception:  # pragma: no cover - enrich_config self-guards
                 logger.warning("provisioner.enrichment_failed", exc_info=True)
+            # A trip with no usable zone runs on UTC and looks complete; say so
+            # here, where the trip id is known, whichever way enrichment went.
+            warn_if_unresolved(config, trip_id=str(trip_id), destination=intake_destination(answers))
             if not (config.get("agent") or {}).get("organizers"):
                 raise ValueError(
                     f"trip {trip_id!r}: the latest confirmed intake names no traveller as organizer — correct it first"
@@ -2110,6 +2535,9 @@ class ProvisionerWorker:
         # written, so a successful chat binding cannot overwrite the fact that
         # the companion cannot read its own trip (issue #119).
         bridge_failed = False
+        # Set when the bridge request went through and the adapter said it wired the trip: only then is
+        # there a route for the trip site's own call to be recognised by (the site -> shared bridge check).
+        bridge_wired = False
         try:
             provenance = self._load_intake_provenance(conn, intake_version_id)
             handoff = build_companion_handoff(
@@ -2172,6 +2600,7 @@ class ProvisionerWorker:
                     # trip-mcp tools yet.
                     try:
                         wired = self._mcp_bridge.setup(slug, hermes_profile)
+                        bridge_wired = bool(wired)
                         built_from = getattr(self._mcp_bridge, "built_from", "unreported")
                         logger.info(
                             # built_from is in the MESSAGE too: LOG_FORMAT drops extra= (#127, #201).
@@ -2429,10 +2858,24 @@ class ProvisionerWorker:
         # recording failure must not cost the trip its companion, so this is
         # best-effort like every other side effect in this function.
         try:
-            verification.record_post_attach_evidence(
+            results = verification.record_post_attach_evidence(
                 conn, trip_id=trip_id, deployment_ref=deployment_ref,
                 slug=slug, hermes_profile=hermes_profile, mcp_bridge_adapter=self._mcp_bridge,
+                site_bridge_check=(lambda: self._site_bridge_check(slug)) if bridge_wired else None,
             )
+            for result in results or []:
+                if result.check_name == verification.SITE_TO_BRIDGE and result.outcome == "failed":
+                    # The trip is already ready_private (the companion step runs after that commit, by
+                    # design), so this cannot fail the job; it is a failed evidence row AND an error line
+                    # naming what stops working, so it is read, not discovered by an organizer. The
+                    # consequence is in the MESSAGE: LOG_FORMAT drops extra= (#127, #201).
+                    logger.error(
+                        "provisioner.site_bridge_check_failed trip_id=%s consequence=%s",
+                        trip_id,
+                        "booking extraction and enrichment on this trip's site will fail: the site cannot "
+                        "use the shared bridge (see the site_to_bridge evidence)",
+                        extra={"trip_id": trip_id},
+                    )
         except Exception:
             logger.warning(
                 "provisioner.post_attach_verification_failed",

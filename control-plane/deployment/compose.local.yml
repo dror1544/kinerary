@@ -204,6 +204,13 @@ services:
       RPI_SSH_KEY: /root/.ssh/id_ed25519_rpi4_hermes
       PROVISIONER_LXC_IP_POOL: ${PROVISIONER_LXC_IP_POOL:-}
       PROVISIONER_LXC_HOSTNAME_DOMAIN: ${PROVISIONER_LXC_HOSTNAME_DOMAIN:-}
+      # Unset means host / per_trip. The worker refuses any other spelling.
+      TRIP_ROUTING: ${TRIP_ROUTING:-}
+      TRIP_MCP_BRIDGE: ${TRIP_MCP_BRIDGE:-}
+      # With TRIP_MCP_BRIDGE=shared: the shared bridge as a trip CONTAINER reaches it, http(s)://<host>:<port>.
+      # Required with `shared`, refused without it (the worker will not start half-set). A new trip's .env
+      # gets HERMES_URL=<this>, and the worker checks from inside the container that the bridge answers.
+      TRIP_MCP_SHARED_SITE_URL: ${TRIP_MCP_SHARED_SITE_URL:-}
       # RETIRED (2026-10-15). This used to become the login of EVERY new trip
       # site. Each site now generates its own password at bootstrap and the
       # organizer is told it; this value is ignored. It is still passed through
@@ -211,6 +218,9 @@ services:
       # (otherwise the change would be silent). Remove it from provisioning.env.
       PROVISIONER_SEED_PASSWORD: ${PROVISIONER_SEED_PASSWORD:-}
       CONTROL_PLANE_EXCHANGE_KEY: ${CONTROL_PLANE_EXCHANGE_KEY:-}
+      # Optional. Set: a NEW trip's site gets derive(master, trip_id) as its key, not the one above, and its
+      # route is recorded `derived` (docs/runtime-session-exchange.md, "Per-trip keys"). Unset: as before.
+      CONTROL_PLANE_TRIP_KEY_MASTER: ${CONTROL_PLANE_TRIP_KEY_MASTER:-}
       # The portal's own origin (the API's web.public_origin), written into each
       # trip's identity sidecar so an organizer who opens the trip on its own
       # hostname still gets an "Organizer dashboard" link. Unset: no link for a

@@ -60,6 +60,26 @@ The three things most likely to bite, in short:
   Only the env form disables directly-connected adapters. The config form keeps
   them running beside the relay.
 
+### The interviewer's relay key
+
+The installer stamps only `GATEWAY_RELAY_URL`. The gateway also needs
+`GATEWAY_RELAY_ID` (its declared id, which is not necessarily the profile name)
+and `GATEWAY_RELAY_SECRET`, and what that secret is depends on the relay's
+`relay.gateway_key_mode` in its architecture profile:
+
+- `shared` (or the field absent): the shared secret (`relay.gateway_secret_refs`).
+- `both` or `derived`: the key derived for this gateway's id,
+  `hex(HMAC-SHA256(<derivation master>, "kinerary-relay-gateway:v1:" + GATEWAY_RELAY_ID))`,
+  where the derivation master is `relay.gateway_key_master_refs[0]`: a different
+  secret, one no gateway profile has held. Neither secret is put in this profile.
+
+Re-key an existing interviewer profile with `scripts/relay-rekey.py --profile
+<name>` (a plan) and `--execute`, then restart its gateway; the script works for
+any enrolled profile and uses the id in the profile's `.env`. In `derived` the
+old shared secret opens nothing. Order: add the new derivation master, set
+`both`, re-key, restart the gateways, set `derived`. Details:
+`docs/per-trip-gateway-architecture.md`.
+
 `gateway.profile_routes` is no longer the routing input: the connector stamps
 `source.profile` per inbound chat and the gateway serves that turn from that
 profile. The static route table is vestigial under the relay.

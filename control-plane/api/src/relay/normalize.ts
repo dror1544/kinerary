@@ -18,9 +18,10 @@
  */
 import type pg from "pg";
 import { resolveChatRoute, type ChatRoute } from "../chat-router.js";
-import { MEDIA_MAX_BYTES, type MediaKind } from "./media-store.js";
+import type { MediaKind } from "./media-store.js";
+import { attachMediaWith, sniffContentType, type RehostDeps, type RoutedCompanionRoute } from "./companion-gate.js";
+import type { AttachmentRef } from "./pending-attachments.js";
 import type { ChatType, WireMessageEvent, WireSessionSource } from "./protocol.js";
-import { structuredLog } from "../redaction.js";
 
 /** The subset of Telegram's Update we consume. */
 export interface TelegramUser {
@@ -191,7 +192,7 @@ export type NormalizeOutcome =
       kind: "event";
       /** Text only. Media is attached by the caller, once it knows the turn goes to the assistant. */
       event: WireMessageEvent;
-      route: ChatRoute;
+      route: RoutedCompanionRoute;
       /** What the message carries, as a reference — nothing has been downloaded. */
       attachment: Attachment | null;
     }
@@ -236,12 +237,8 @@ export interface MediaDeps {
   log?: (line: string) => void;
 }
 
-export interface Attachment {
-  fileId: string;
-  kind: MediaKind;
-  mime: string;
-  filename?: string;
-}
+/** The shape lives with the neutral gate's holding area (pending-attachments.ts); the name stays here for the Telegram side. */
+export type Attachment = AttachmentRef;
 
 /**
  * Picks the one attachment a Telegram message carries, if any.
@@ -284,46 +281,9 @@ export function describeAttachment(message: TelegramMessage): Attachment | null 
   return null;
 }
 
-/**
- * Recognizes a document by its leading bytes when Telegram's own metadata
- * did not say what it was.
- *
- * `document.mime_type`/`file_name` are both optional Telegram fields, and go
- * missing often enough for a file exported from a phone's "save/share as
- * PDF" flow — issue #163 traced a real upload that arrived with neither,
- * fell back to `application/octet-stream` with no filename, and was
- * rejected downstream (Hermes's reader saw a useless `.bin` extension).
- * Only signatures unambiguous enough to bet on are worth checking; anything
- * else is left as octet-stream rather than a wrong guess.
- */
-export function sniffContentType(bytes: Buffer): { mime: string; extension: string } | null {
-  if (bytes.length >= 5 && bytes.subarray(0, 5).toString("latin1") === "%PDF-") {
-    return { mime: "application/pdf", extension: "pdf" };
-  }
-  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
-    return { mime: "image/jpeg", extension: "jpg" };
-  }
-  if (
-    bytes.length >= 8 &&
-    bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
-  ) {
-    return { mime: "image/png", extension: "png" };
-  }
-  if (
-    bytes.length >= 6 &&
-    (bytes.subarray(0, 6).toString("latin1") === "GIF87a" || bytes.subarray(0, 6).toString("latin1") === "GIF89a")
-  ) {
-    return { mime: "image/gif", extension: "gif" };
-  }
-  return null;
-}
-
-/** message_type reflects the first attachment's kind (contract §"Phase 2 media ingress"). */
-function messageTypeFor(kind: MediaKind): "image" | "audio" | "document" {
-  if (kind === "image") return "image";
-  if (kind === "voice" || kind === "audio") return "audio";
-  return "document";
-}
+// `sniffContentType` moved to the neutral gate (companion-gate.ts) with the re-host
+// it serves; the name stays importable from here.
+export { sniffContentType };
 
 /**
  * Builds the wire event, re-hosting an attachment when one is present.
@@ -361,64 +321,21 @@ export async function attachMedia(
   deps?: MediaDeps,
 ): Promise<WireMessageEvent> {
   if (attachments.length === 0 || !deps) return event;
+  return attachMediaWith(event, attachments, rehostDeps(deps));
+}
 
-  const urls: string[] = [];
-  const descriptors: NonNullable<WireMessageEvent["media"]> = [];
-  let firstKind: MediaKind | null = null;
-  for (const attachment of attachments) {
-    const file = await deps.telegram.fetchFile(attachment.fileId, MEDIA_MAX_BYTES);
-    if (!file) {
-      // Degrade, never drop: the turn still goes over so the agent can say it
-      // could not read the file, rather than the organizer's upload vanishing.
-      // But it must not vanish from the LOGS too.
-      deps.log?.(structuredLog("warn", "relay.media_rehost_failed", {
-        stage: "fetch",
-        kind: attachment.kind,
-        has_filename: Boolean(attachment.filename),
-      }));
-      continue;
-    }
-
-    let mime = file.mime || attachment.mime;
-    let filename = attachment.filename;
-    if (!mime || mime === "application/octet-stream") {
-      const sniffed = sniffContentType(file.bytes);
-      if (sniffed) {
-        mime = sniffed.mime;
-        filename ??= `document.${sniffed.extension}`;
-      }
-    }
-
-    const id = deps.store.put({
-      kind: attachment.kind,
-      mime,
-      size: file.bytes.length,
-      ...(filename ? { filename } : {}),
-      ...(attachment.caption ? { caption: attachment.caption } : {}),
-      bytes: file.bytes,
-    });
-    if (!id) {
-      deps.log?.(structuredLog("warn", "relay.media_rehost_failed", {
-        stage: "store",
-        kind: attachment.kind,
-        size: file.bytes.length,
-      }));
-      continue;
-    }
-
-    firstKind ??= attachment.kind;
-    urls.push(`${deps.baseUrl.replace(/\/$/, "")}/relay/media/${id}`);
-    descriptors.push({
-      kind: attachment.kind,
-      mime,
-      size: file.bytes.length,
-      ...(filename ? { filename } : {}),
-      ...(attachment.caption ? { caption: attachment.caption } : {}),
-    });
-  }
-
-  if (firstKind === null) return event;
-  return { ...event, message_type: messageTypeFor(firstKind), media_urls: urls, media: descriptors };
+/**
+ * The media plane as the neutral gate's re-host reads it. The re-host itself is
+ * platform-neutral and lives in the gate; this adapts the Telegram client's
+ * `fetchFile` to it, called as a method so it keeps its `this`.
+ */
+export function rehostDeps(deps: MediaDeps): RehostDeps {
+  return {
+    fetchAttachment: (ref, maxBytes) => deps.telegram.fetchFile(ref, maxBytes),
+    mediaStore: deps.store,
+    mediaBaseUrl: deps.baseUrl,
+    ...(deps.log ? { mediaLog: deps.log } : {}),
+  };
 }
 
 /**
@@ -429,6 +346,64 @@ export async function attachMedia(
  * binding was taken to imply a destination.
  */
 export type ReachabilityCheck = (profile: string) => boolean;
+
+/**
+ * Which trip, and which assistant, a chat's turns go to - or why none can.
+ * The platform-neutral half of normalisation (#625): it reads only the chat id,
+ * so any platform's loop can call it, and `normalizeUpdate` below does.
+ *
+ * `route` rides along on a COMPANION_PENDING drop because the gate's
+ * pending-companion branch needs the trip; the Telegram outcome of
+ * `normalizeUpdate` leaves it off (its shape is pinned).
+ */
+export type InboundResolution =
+  | { kind: "routed"; route: RoutedCompanionRoute }
+  | { kind: "dropped"; reason: "UNROUTED" | "INTERVIEW" | "COMPANION_PENDING"; route?: ChatRoute };
+
+export async function resolveInbound(
+  db: pg.Pool,
+  chatId: string,
+  canReach?: ReachabilityCheck,
+): Promise<InboundResolution> {
+  const route = await resolveChatRoute(db, chatId);
+
+  // Fail closed. On a shared bot, "no trip resolved" can never mean "use the
+  // default" — the default would be somebody else's trip.
+  if (route.kind === "unbound") return { kind: "dropped", reason: "UNROUTED" };
+  // Dropped here, rebuilt by dispatch.ts — which is why `describeAttachment`
+  // and `toWireEventWithMedia` are exported rather than private to this
+  // module. The interview route is the one that ASKS for a document, and it
+  // spent 2026-09-04's run handing the agent an empty message because this
+  // branch returned before the re-host and dispatch rebuilt the event without
+  // it. Whatever this branch skips, that one has to do itself.
+  if (route.kind === "interview") return { kind: "dropped", reason: "INTERVIEW" };
+
+  // Bound to a trip, but no assistant installed behind it yet (migration
+  // 0043). Distinct from UNROUTED on purpose: "I don't have a trip for this
+  // chat" would be a lie — we know exactly which trip this is, and the
+  // organizer's site is already up. Answering honestly is the difference
+  // between a system that looks broken and one that says what it is doing.
+  if (!route.hermesProfile) return { kind: "dropped", reason: "COMPANION_PENDING", route };
+
+  // Installed is not running. Under one gateway process per trip
+  // (`docs/per-trip-gateway-architecture.md`) a stopped companion is an
+  // ordinary, recoverable state — `gateway start`, no re-provision. It shares
+  // the reason code of a trip whose companion was never installed, so
+  // normalisation stays one decision: "no assistant can take this turn".
+  //
+  // Deliberately NOT its own reason HERE: the reply is chosen one layer down.
+  // The gate (companion-gate.ts, pending branch) tells the two apart — a trip whose
+  // assistant was never announced as up gets the "still finishing" wording,
+  // while one that was announced and is now unreachable gets the shorter
+  // "I'm off for now" line (`companionUnavailable`), at most once per chat per
+  // window and never to a family talking among themselves (#178, #179). The
+  // operational distinction is also recorded as reachability (migration 0042),
+  // where it can be acted on.
+  if (canReach && !canReach(route.hermesProfile)) return { kind: "dropped", reason: "COMPANION_PENDING", route };
+
+  // The very object the lookup returned (tests compare routes), narrowed by the check above.
+  return { kind: "routed", route: route as RoutedCompanionRoute };
+}
 
 /**
  * Downloads nothing. Whether an attachment is fetched depends on whether the
@@ -463,43 +438,11 @@ export async function normalizeUpdate(
   // organizer's document vanished with no error on either side.
   if (!text.trim() && !attachment) return { kind: "dropped", reason: "NO_TEXT" };
 
-  const route = await resolveChatRoute(db, chatId);
-
-  // Fail closed. On a shared bot, "no trip resolved" can never mean "use the
-  // default" — the default would be somebody else's trip.
-  if (route.kind === "unbound") return { kind: "dropped", reason: "UNROUTED" };
-  // Dropped here, rebuilt by dispatch.ts — which is why `describeAttachment`
-  // and `toWireEventWithMedia` are exported rather than private to this
-  // module. The interview route is the one that ASKS for a document, and it
-  // spent 2026-09-04's run handing the agent an empty message because this
-  // branch returned before the re-host and dispatch rebuilt the event without
-  // it. Whatever this branch skips, that one has to do itself.
-  if (route.kind === "interview") return { kind: "dropped", reason: "INTERVIEW" };
-
-  // Bound to a trip, but no assistant installed behind it yet (migration
-  // 0043). Distinct from UNROUTED on purpose: "I don't have a trip for this
-  // chat" would be a lie — we know exactly which trip this is, and the
-  // organizer's site is already up. Answering honestly is the difference
-  // between a system that looks broken and one that says what it is doing.
-  if (!route.hermesProfile) return { kind: "dropped", reason: "COMPANION_PENDING" };
-
-  // Installed is not running. Under one gateway process per trip
-  // (`docs/per-trip-gateway-architecture.md`) a stopped companion is an
-  // ordinary, recoverable state — `gateway start`, no re-provision. It shares
-  // the reason code of a trip whose companion was never installed, so
-  // normalisation stays one decision: "no assistant can take this turn".
-  //
-  // Deliberately NOT its own reason HERE: the reply is chosen one layer down.
-  // `dispatch.ts` (COMPANION_PENDING) tells the two apart — a trip whose
-  // assistant was never announced as up gets the "still finishing" wording,
-  // while one that was announced and is now unreachable gets the shorter
-  // "I'm off for now" line (`companionUnavailable`), at most once per chat per
-  // window and never to a family talking among themselves (#178, #179). The
-  // operational distinction is also recorded as reachability (migration 0042),
-  // where it can be acted on.
-  if (canReach && !canReach(route.hermesProfile)) {
-    return { kind: "dropped", reason: "COMPANION_PENDING" };
-  }
+  const resolved = await resolveInbound(db, chatId, canReach);
+  // Dropped without the route: this outcome's shape is pinned by tests, and the one
+  // caller that needs the route of a COMPANION_PENDING turn resolves it again.
+  if (resolved.kind === "dropped") return { kind: "dropped", reason: resolved.reason };
+  const route = resolved.route;
 
   return {
     kind: "event",
