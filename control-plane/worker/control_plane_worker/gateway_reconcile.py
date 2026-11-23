@@ -483,9 +483,14 @@ WITH named AS (
    WHERE n.profile ~ '^[a-z0-9][a-z0-9-]{1,62}$'
      AND t.lifecycle_state <> ALL(%(pre)s)
 ), org AS (
+  -- The per-trip link table is the source of truth since 20261021120000 (#641);
+  -- the account-wide `telegram_organizer_links` has had no writer since. A link
+  -- speaks for ITS trip only, and only while its owner still holds an active
+  -- owner/organizer membership of that same trip.
   SELECT DISTINCT m.trip_id, l.telegram_subject_digest AS digest
     FROM control_plane.trip_memberships m
-    JOIN control_plane.telegram_organizer_links l ON l.user_id = m.user_id
+    JOIN control_plane.telegram_organizer_trip_links l
+      ON l.user_id = m.user_id AND l.trip_id = m.trip_id AND l.revoked_at IS NULL
    WHERE m.role IN ('owner', 'organizer') AND m.status = 'active'
 ), dm AS (
   SELECT b.chat_id, b.trip_id, b.created_at, b.closed_at, b.closed_reason,

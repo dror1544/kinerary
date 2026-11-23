@@ -451,7 +451,6 @@ class SweepTests(unittest.TestCase):
         self.trips: list[str] = []
         self.users: list[str] = []
         self.profiles: list[str] = []
-        self.tg_ids: list[str] = []
 
     def tearDown(self) -> None:
         c = self.conn
@@ -460,14 +459,13 @@ class SweepTests(unittest.TestCase):
             c.execute("DELETE FROM control_plane.companion_gateways WHERE hermes_profile = %s", (profile,))
         c.execute("DELETE FROM control_plane.companion_gateway_events WHERE event = 'SWEEP'")
         for trip_id in self.trips:
+            c.execute("DELETE FROM control_plane.telegram_organizer_trip_links WHERE trip_id = %s", (trip_id,))
             c.execute("DELETE FROM control_plane.assistant_events WHERE trip_id = %s", (trip_id,))
             c.execute("DELETE FROM control_plane.trip_memberships WHERE trip_id = %s", (trip_id,))
             c.execute("DELETE FROM control_plane.telegram_chat_bindings WHERE trip_id = %s", (trip_id,))
             c.execute("DELETE FROM control_plane.trips WHERE id = %s", (trip_id,))
-        for tg in self.tg_ids:
-            c.execute("DELETE FROM control_plane.telegram_organizer_links WHERE telegram_subject_digest = %s",
-                      (digest(tg),))
         for user_id in self.users:
+            c.execute("DELETE FROM control_plane.telegram_organizer_trip_links WHERE user_id = %s", (user_id,))
             c.execute("DELETE FROM control_plane.telegram_organizer_links WHERE user_id = %s", (user_id,))
             c.execute("DELETE FROM control_plane.users WHERE id = %s", (user_id,))
 
@@ -493,20 +491,44 @@ class SweepTests(unittest.TestCase):
         self.profiles.append(profile)
         return {"trip_id": trip_id, "slug": slug, "profile": profile}
 
-    def organizer(self, trip: dict[str, str], tg_id: str, *, role: str = "owner", user_id: str | None = None) -> str:
+    def organizer(self, trip: dict[str, str], tg_id: str, *, role: str = "owner", user_id: str | None = None,
+                  link: str = "trip", member_status: str = "active") -> str:
+        """A member of the trip with a Telegram identity. `link` says how the
+        Telegram identity is recorded: "trip" is the live per-trip row
+        (`telegram_organizer_trip_links`, the source of truth since
+        20261021120000), "revoked" the same row after an owner's Unlink, "old"
+        ONLY the account-wide row nothing has written since 2026-10-18, "none"
+        no link at all."""
         user_id = user_id or f"user_{rnd(8)}"
         if user_id not in self.users:
             self.conn.execute("INSERT INTO control_plane.users(id, status, display_name) VALUES (%s, 'active', 'x')",
                               (user_id,))
             self.users.append(user_id)
+        if link == "old":
             self.conn.execute(
                 "INSERT INTO control_plane.telegram_organizer_links(id, user_id, telegram_subject_digest, verified_via) "
-                "VALUES (%s, %s, %s, 'enrollment_redemption')", (f"tol_{rnd(8)}", user_id, digest(tg_id)))
-            self.tg_ids.append(tg_id)
+                "VALUES (%s, %s, %s, 'enrollment_redemption') ON CONFLICT DO NOTHING",
+                (f"tol_{rnd(8)}", user_id, digest(tg_id)))
+        elif link in ("trip", "revoked"):
+            self.conn.execute(
+                "INSERT INTO control_plane.telegram_organizer_trip_links"
+                "(id, user_id, trip_id, telegram_subject_digest, verified_via, revoked_at, revoked_reason) "
+                "VALUES (%s, %s, %s, %s, 'enrollment_redemption', %s, %s)",
+                (f"otl_{rnd(8)}", user_id, trip["trip_id"], digest(tg_id),
+                 self.now if link == "revoked" else None, "owner_unlinked" if link == "revoked" else None))
         self.conn.execute(
             "INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status) "
-            "VALUES (%s, %s, %s, %s, 'active')", (f"tm_{rnd(8)}", trip["trip_id"], user_id, role))
+            "VALUES (%s, %s, %s, %s, %s)", (f"tm_{rnd(8)}", trip["trip_id"], user_id, role, member_status))
         return user_id
+
+    def link_trip(self, trip: dict[str, str], tg_id: str, user_id: str) -> None:
+        """A live per-trip Telegram link for `user_id` on `trip`, whatever their
+        membership of it is (or is not)."""
+        self.conn.execute(
+            "INSERT INTO control_plane.telegram_organizer_trip_links"
+            "(id, user_id, trip_id, telegram_subject_digest, verified_via) "
+            "VALUES (%s, %s, %s, %s, 'enrollment_redemption')",
+            (f"otl_{rnd(8)}", user_id, trip["trip_id"], digest(tg_id)))
 
     def bind(self, trip: dict[str, str], chat_id: str, *, created_ago: timedelta = timedelta(0),
              closed_ago: timedelta | None = None, reason: str = "organizer_switch") -> None:
@@ -607,6 +629,53 @@ class SweepTests(unittest.TestCase):
         self.sweep().run()
         self.assertEqual(self.row(member_trip)["reason"], "NOT_CURRENT")
         self.assertEqual(self.row(group_trip)["reason"], "NOT_CURRENT")
+
+    # --- #641: the organizer is found from the PER-TRIP link table ---
+
+    def test_a_link_that_exists_only_per_trip_makes_the_trip_current(self) -> None:
+        t = self.trip(undated=True)
+        self.organizer(t, "7101", link="trip")
+        self.bind(t, "7101")
+        self.assertEqual(self.conn.execute("SELECT count(*) AS n FROM control_plane.telegram_organizer_links "
+                                           "WHERE telegram_subject_digest = %s", (digest("7101"),)).fetchone()["n"], 0)
+        self.sweep().run()
+        self.assertEqual(self.row(t)["reason"], "CURRENT_TRIP")
+
+    def test_the_account_wide_table_alone_is_no_longer_enough(self) -> None:
+        t = self.trip(undated=True)
+        self.organizer(t, "7102", link="old")
+        self.bind(t, "7102")
+        self.sweep().run()
+        self.assertEqual((self.row(t)["desired"], self.row(t)["reason"]), ("stopped", "NOT_CURRENT"))
+
+    def test_a_revoked_per_trip_link_does_not_make_the_trip_current(self) -> None:
+        t = self.trip(undated=True)
+        self.organizer(t, "7103", link="revoked")
+        self.bind(t, "7103")
+        self.sweep().run()
+        self.assertEqual(self.row(t)["reason"], "NOT_CURRENT")
+
+    def test_a_per_trip_link_without_an_active_owner_or_organizer_membership_of_that_trip_does_not_count(self) -> None:
+        ended, plain, none = self.trip(undated=True), self.trip(undated=True), self.trip(undated=True)
+        self.organizer(ended, "7104", member_status="revoked")
+        self.organizer(plain, "7105", role="member")
+        stranger = self.organizer(self.trip(undated=True), "7106")     # owns some OTHER trip
+        self.link_trip(none, "7106", stranger)                          # a link for `none`, no membership of it
+        self.bind(ended, "7104")
+        self.bind(plain, "7105")
+        self.bind(none, "7106")
+        self.sweep().run()
+        for t in (ended, plain, none):
+            self.assertEqual(self.row(t)["reason"], "NOT_CURRENT")
+
+    def test_a_link_for_one_trip_does_not_make_another_trip_of_the_same_user_current(self) -> None:
+        a, b = self.trip(undated=True), self.trip(undated=True)
+        user = self.organizer(a, "7107", link="trip")                   # linked for A
+        self.organizer(b, "7107", user_id=user, link="none")           # owns B too, but B was Unlinked / never linked
+        self.bind(b, "7107")
+        self.sweep().run()
+        self.assertEqual(self.row(b)["reason"], "NOT_CURRENT")
+        self.assertEqual(self.row(a)["reason"], "NOT_CURRENT")         # the DM is bound to B, not A
 
     def test_a_group_chat_never_counts_even_if_its_id_were_somebodys_linked_identity(self) -> None:
         t = self.trip(undated=True)
