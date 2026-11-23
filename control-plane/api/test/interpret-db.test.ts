@@ -716,6 +716,7 @@ describe("a reply that answers nothing", { skip: SKIP ? "no CONTROL_PLANE_TEST_D
                 ui_state = jsonb_build_object(
                   'offered_more', true,
                   'last_prompt', 'q:planning_help',
+                  'car_asked', true,
                   'skipped', $2::jsonb)
           WHERE telegram_chat_id = $1`,
         [a.chatId, JSON.stringify(optionalIds)],
@@ -1260,7 +1261,7 @@ describe("the boundary, answered in words", { skip: SKIP ? "no CONTROL_PLANE_TES
     await pool.query(
       `UPDATE control_plane.intake_sessions
           SET language = $2, state = 'interviewing', awaiting = 'person', phase = 'optional',
-              ui_state = jsonb_build_object('offered_more', true, 'last_prompt', $3::text)
+              ui_state = jsonb_build_object('offered_more', true, 'last_prompt', $3::text, 'car_asked', true)
         WHERE telegram_chat_id = $1`,
       [chatId, language, OPTIONAL_OFFER_PROMPT],
     );

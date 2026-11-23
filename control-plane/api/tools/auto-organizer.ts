@@ -559,6 +559,7 @@ async function main(): Promise<number> {
   const deadline = Date.now() + totalMinutes * 60_000;
   const lateCorrectionsSent = new Set<string>();
   let walkedOptional = false;
+  let carBookingSent = false;
   say(`== organizer: ${scenarioName} (${s.language}) as chat ${chatId}`);
   phoneLanguage = chaos ? "en" : s.language;
 
@@ -642,6 +643,21 @@ async function main(): Promise<number> {
       continue;
     }
     if (v.awaiting === "machine") { await sleep(2000); await drain(); continue; }
+
+    // THE RENTAL CAR (2026-11-21): before the summary the interview asks, once, whether a car is booked - the bookings
+    // question under its own prompt key. A person answers it: in words when the scenario has a booking to describe,
+    // otherwise with "No rental car". Nothing else on this screen is answerable, so without this a run would sit on
+    // it (its "Finished" was already tapped) until the deadline.
+    if (v.state === "interviewing" && v.lastPrompt === "q:travel_anchors:car") {
+      const since = seenSeq;
+      if (s.carBooking && !carBookingSent) {
+        carBookingSent = true;
+        await type(s.carBooking, phoneLanguage);
+        await settle(before, "describing the rental car", since);
+        continue;
+      }
+      if (await tap("c:nocar")) { await settle(before, "no rental car"); continue; }
+    }
 
     const q = v.nextQuestion ?? v.pendingAsk ?? (chaos ? onScreen(v) : null);
     if (q) {

@@ -210,7 +210,7 @@ async function stopsOnScreen(pool: pg.Pool, chatId: string, language: Language):
   await pool.query(
     `UPDATE control_plane.intake_sessions
         SET language = $2, awaiting = 'person', phase = 'essentials',
-            ui_state = jsonb_build_object('last_prompt', 'q:phases')
+            ui_state = jsonb_build_object('last_prompt', 'q:phases', 'car_asked', true)
       WHERE telegram_chat_id = $1`,
     [chatId, language],
   );
@@ -306,7 +306,7 @@ describe("a typed flight the reader did not file is asked about", { skip: SKIP ?
       await pool.query(
         `UPDATE control_plane.intake_sessions
             SET language = 'he', awaiting = 'person', phase = 'optional',
-                ui_state = jsonb_build_object('last_prompt', 'optional_offer', 'offered_more', true,
+                ui_state = jsonb_build_object('last_prompt', 'optional_offer', 'offered_more', true, 'car_asked', true,
                                               'typed_flights', jsonb_build_array('LY8801', 'LY8802'))
           WHERE telegram_chat_id = $1`,
         [chatId],

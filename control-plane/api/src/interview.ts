@@ -1261,6 +1261,43 @@ export function flightsOwedLead(designators: readonly string[], language: Langua
   return (designators.length === 1 ? phrases.one : phrases.many).replace("{flights}", designators.join(", "));
 }
 
+// ── A rental car is asked about, once, before the summary ──
+//
+// Dror, 2026-11-21, on the real Alsace trip: "the car reservation is not there,
+// this information is also important for the travel planning." The bookings had
+// been filled from two flight PDFs and a hotel document, and `travel_anchors` is
+// optional, so nothing ever asked about the car the family had booked.
+//
+// The same shape as the typed flights above, and deliberately so: a rule in code
+// (no LLM decides whether to ask), asked ONCE through the bookings question
+// itself, so the same reader files the answer and the same merge appends it to
+// what is already held. What differs is what it is a rule ABOUT: the flights rule
+// reads what the organizer typed; this one reads what the bookings lack.
+//
+// It always asks, including for a trip that plainly needs no car (a cruise). A
+// guess at that would be a judgement, and the cost of a wrong ask is one tap.
+
+/** Is there a booking of type `car` among the organizer's bookings? The TYPE decides, never a word in a name. */
+export function hasCarAnchor(answers: AnswerStore): boolean {
+  const answer = answers.travel_anchors;
+  if (!answer || answer.kind !== "structured" || !Array.isArray(answer.data)) return false;
+  return answer.data.some((entry) =>
+    typeof entry === "object" && entry !== null
+    && typeof (entry as { type?: unknown }).type === "string"
+    && (entry as { type: string }).type.trim().toLowerCase() === "car");
+}
+
+/**
+ * Whether the rental-car question is owed: on the interpret path, no booking of
+ * type `car`, and not asked yet. Off the interpret path it is never owed - the
+ * agent path has no router turn that would ask it, and a hold with no asker is an
+ * interview that can never reach its summary. "Asked" is once and for good: an
+ * organizer who says there is no car, or not yet, is believed.
+ */
+export function carOwed(answers: AnswerStore, ui: InterviewUiState): boolean {
+  return ui.interpretPath === true && ui.carAsked !== true && !hasCarAnchor(answers);
+}
+
 /**
  * Keeps a flight number out of a booking's `confirmation`.
  *
@@ -1916,6 +1953,12 @@ export interface SessionView {
    */
   flightsOwed?: string[];
   /**
+   * The rental-car question is due NOW: owed (`carOwed`), the interview is at the end of its optional questions (the
+   * organizer asked to finish, or none are left) and nothing required is open. The router asks the bookings question
+   * about the car before the summary; once it has, this is false for good. False off the interpret path.
+   */
+  carDue?: boolean;
+  /**
    * Where the interview is, as a phase it entered rather than a value
    * recomputed from the answers. The source of truth; `state` is its
    * projection into the older three-value vocabulary.
@@ -2028,6 +2071,17 @@ export interface InterviewUiState {
   typedFlights?: string[];
   /** The typed flights the organizer has been asked about. Once is enough. */
   flightsAsked?: string[];
+  /**
+   * The rental-car follow-up has been put to the organizer (or answered). Once is
+   * enough: "no rental car" is believed, and the interview never asks again. See `carOwed`.
+   */
+  carAsked?: boolean;
+  /**
+   * Whether this session is on the interpret path (`intake_sessions.interpret_path`). NOT part of the stored
+   * `ui_state`: it is read from its own column on every load and never written back (`serializeUiState` leaves
+   * it out), so it cannot go stale. The car follow-up exists only on that path - see `carOwed`.
+   */
+  interpretPath?: boolean;
   skipped?: string[];
   /**
    * Required questions that were asked and not answered, stepped aside so the
@@ -2234,8 +2288,8 @@ function withoutSuggestion(ui: InterviewUiState, questionId: string): InterviewU
   return Object.keys(rest).length > 0 ? { ...others, suggestions: rest } : others;
 }
 
-function parseUiState(raw: unknown): InterviewUiState {
-  if (typeof raw !== "object" || raw === null) return {};
+function parseUiState(raw: unknown, interpretPath?: boolean): InterviewUiState {
+  if (typeof raw !== "object" || raw === null) return interpretPath === true ? { interpretPath: true } : {};
   const record = raw as Record<string, unknown>;
   const skipped = Array.isArray(record.skipped)
     ? record.skipped.filter((id): id is string => typeof id === "string")
@@ -2256,6 +2310,8 @@ function parseUiState(raw: unknown): InterviewUiState {
     ...(record.finish_requested === true ? { finishRequested: true } : {}),
     ...(typedFlights.length > 0 ? { typedFlights } : {}),
     ...(flightsAsked.length > 0 ? { flightsAsked } : {}),
+    ...(record.car_asked === true ? { carAsked: true } : {}),
+    ...(interpretPath === true ? { interpretPath: true } : {}),
     ...(skipped && skipped.length > 0 ? { skipped } : {}),
     ...(deferred && deferred.length > 0 ? { deferred } : {}),
     ...(typeof record.pending_ask === "string" ? { pendingAsk: record.pending_ask } : {}),
@@ -2283,6 +2339,7 @@ function serializeUiState(ui: InterviewUiState): string {
     ...(ui.finishRequested ? { finish_requested: true } : {}),
     ...(ui.typedFlights && ui.typedFlights.length > 0 ? { typed_flights: ui.typedFlights } : {}),
     ...(ui.flightsAsked && ui.flightsAsked.length > 0 ? { flights_asked: ui.flightsAsked } : {}),
+    ...(ui.carAsked ? { car_asked: true } : {}),
     ...(ui.skipped && ui.skipped.length > 0 ? { skipped: ui.skipped } : {}),
     ...(ui.deferred && ui.deferred.length > 0 ? { deferred: ui.deferred } : {}),
     ...(ui.pendingAsk ? { pending_ask: ui.pendingAsk } : {}),
@@ -2320,6 +2377,7 @@ function serializeUiState(ui: InterviewUiState): string {
  *   offeredMore            "essentials done: more, or the summary?" was already put to them
  *   flightsAsked           typed flights already asked about ("once is enough")
  *   typedFlights           the flights they typed, which `flightsAsked` is a record about
+ *   carAsked               the rental-car follow-up was put to them ("once is enough"; "no car" is believed)
  *   multiPending           a multi-select they were still ticking: its stored selection is NOT an answer until Done
  *
  * NOT CARRIED -- on screen, in flight, or derived per read; each would assert something that is no longer true:
@@ -2343,6 +2401,7 @@ function carriedUiState(ui: InterviewUiState): InterviewUiState {
     ...(ui.offeredMore ? { offeredMore: true } : {}),
     ...(ui.flightsAsked && ui.flightsAsked.length > 0 ? { flightsAsked: ui.flightsAsked } : {}),
     ...(ui.typedFlights && ui.typedFlights.length > 0 ? { typedFlights: ui.typedFlights } : {}),
+    ...(ui.carAsked ? { carAsked: true } : {}),
     ...(ui.multiPending ? { multiPending: ui.multiPending } : {}),
   };
 }
@@ -2726,9 +2785,13 @@ export function nextPhase(
   // lacks a flight the organizer wrote — and a confirmed intake is immutable.
   // Asking is what releases it (`flightsAsked`), so this cannot hold forever.
   const flightsPending = flightsOwed(answers, ui).length > 0;
+  // THE RENTAL CAR, once (`carOwed`). Held on the way TO the summary only: a
+  // summary already on screen is never reopened for it, or every interview
+  // sitting at its summary when this shipped would have been pulled back.
+  const carPending = carOwed(answers, ui);
 
   if (current === "optional") {
-    if (flightsPending) return "optional";
+    if (flightsPending || carPending) return "optional";
     if (ui.finishRequested) return "recap";
     // Running out is the other way in. Confirmation is gated on the REQUIRED
     // set alone, so arriving here early skips nothing that matters.
@@ -2767,12 +2830,15 @@ function deriveSessionState(
   answers: AnswerStore,
   questions: readonly IntakeQuestion[],
   ui: InterviewUiState = {},
+  phase?: InterviewPhase,
 ): SessionState {
   const allRequired = questions.filter((q) => q.required);
   const allAnswered = allRequired.every((q) => isAnswered(q, answers));
   if (!allAnswered) return "interviewing";
   // Same hold as `nextPhase`: the stored `state` must not run ahead of the phase.
   if (flightsOwed(answers, ui).length > 0) return "interviewing";
+  // The car holds the way to the summary, not a summary already up (`nextPhase`).
+  if (phase !== "recap" && carOwed(answers, ui)) return "interviewing";
   if (ui.finishRequested) return "awaiting_confirmation";
   return unansweredOptionalQuestions(answers, questions, ui).length === 0
     ? "awaiting_confirmation"
@@ -3129,6 +3195,7 @@ export async function startSessionInTx(
     const carriedUi = prior ? carriedUiState(parseUiState(prior.ui_state)) : {};
     const uiState: InterviewUiState = {
       ...carriedUi,
+      ...(interpretPathDefault() ? { interpretPath: true } : {}),
       ...(organizerName && !carriedUi.organizerName ? { organizerName } : {}),
       // The opening of a resumed interview is over before it begins: the document offer is not made twice.
       ...(prior ? { openingDone: true } : {}),
@@ -3276,9 +3343,10 @@ export async function getSession(
     awaiting: string;
     answers: AnswerStore;
     ui_state: unknown;
+    interpret_path: boolean | null;
     language: string | null;
   }>(
-    `SELECT id, trip_id, user_id, state, phase, awaiting, answers, ui_state, language
+    `SELECT id, trip_id, user_id, state, phase, awaiting, answers, ui_state, interpret_path, language
      FROM control_plane.intake_sessions
      WHERE session_token_digest = $1`,
     [digest],
@@ -3293,7 +3361,7 @@ export async function getSession(
       session.trip_id,
       session.state,
       session.answers,
-      parseUiState(session.ui_state),
+      parseUiState(session.ui_state, session.interpret_path === true),
       coerceLanguage(session.language) ?? DEFAULT_LANGUAGE,
       isInterviewPhase(session.phase) ? session.phase : "opening",
       session.awaiting === "machine" ? "machine" : "person",
@@ -3375,9 +3443,10 @@ export async function getSessionForChat(db: pg.Pool, chatId: string): Promise<Ge
     awaiting: string;
     answers: AnswerStore;
     ui_state: unknown;
+    interpret_path: boolean | null;
     language: string | null;
   }>(
-    `SELECT id, trip_id, state, phase, awaiting, answers, ui_state, language
+    `SELECT id, trip_id, state, phase, awaiting, answers, ui_state, interpret_path, language
      FROM control_plane.intake_sessions
      WHERE ${LIVE_INTAKE_SESSION_PREDICATE}`,
     [chatId],
@@ -3391,7 +3460,7 @@ export async function getSessionForChat(db: pg.Pool, chatId: string): Promise<Ge
       session.trip_id,
       session.state,
       session.answers,
-      parseUiState(session.ui_state),
+      parseUiState(session.ui_state, session.interpret_path === true),
       coerceLanguage(session.language) ?? DEFAULT_LANGUAGE,
       isInterviewPhase(session.phase) ? session.phase : "opening",
       session.awaiting === "machine" ? "machine" : "person",
@@ -3845,9 +3914,10 @@ export async function getSessionForAgent(db: pg.Pool, chatId: string): Promise<G
     awaiting: string;
     answers: AnswerStore;
     ui_state: unknown;
+    interpret_path: boolean | null;
     language: string | null;
   }>(
-    `SELECT s.id, s.trip_id, s.state, s.phase, s.awaiting, s.answers, s.ui_state, s.language
+    `SELECT s.id, s.trip_id, s.state, s.phase, s.awaiting, s.answers, s.ui_state, s.interpret_path, s.language
      FROM control_plane.intake_sessions s
      JOIN control_plane.interview_agent_turns t
        ON t.session_id = s.id
@@ -3866,7 +3936,7 @@ export async function getSessionForAgent(db: pg.Pool, chatId: string): Promise<G
       session.trip_id,
       session.state,
       session.answers,
-      parseUiState(session.ui_state),
+      parseUiState(session.ui_state, session.interpret_path === true),
       coerceLanguage(session.language) ?? DEFAULT_LANGUAGE,
       isInterviewPhase(session.phase) ? session.phase : "opening",
       session.awaiting === "machine" ? "machine" : "person",
@@ -3981,6 +4051,9 @@ function buildSessionView(
     language,
     offeredMore: ui.offeredMore === true,
     flightsOwed: flightsOwed(answers, ui),
+    carDue: state === "interviewing" && phase === "optional" && carOwed(answers, ui)
+      && !nextUnansweredQuestion(answers, INTAKE_QUESTIONS, ui)
+      && (ui.finishRequested === true || unansweredOptionalQuestions(answers, INTAKE_QUESTIONS, ui).length === 0),
     recapMarker: ui.recapMarker ?? null,
     lastPrompt: ui.lastPrompt ?? null,
     phase,
@@ -4029,6 +4102,7 @@ interface LockedSession {
   state: SessionState;
   answers: AnswerStore;
   ui_state: unknown;
+  interpret_path: boolean | null;
   language: string | null;
   source_document: unknown;
   /**
@@ -4073,7 +4147,7 @@ async function lockSession(
   client: pg.PoolClient,
   locator: SessionLocator,
 ): Promise<LockedSession | null> {
-  const columns = "id, trip_id, user_id, state, answers, ui_state, language, source_document, phase, awaiting";
+  const columns = "id, trip_id, user_id, state, answers, ui_state, interpret_path, language, source_document, phase, awaiting";
   if (locator.by === "token") {
     const row = await client.query<LockedSession>(
       `SELECT ${columns}
@@ -4333,8 +4407,8 @@ async function updateUiStateForChat(
     if (!session) { await client.query("ROLLBACK"); return { ok: false, reason: "NOT_FOUND" }; }
     if (session.state === "confirmed") { await client.query("ROLLBACK"); return { ok: false, reason: "NOT_FOUND" }; }
 
-    const ui = mutate(parseUiState(session.ui_state));
-    const newState = deriveSessionState(session.answers, INTAKE_QUESTIONS, ui);
+    const ui = mutate(parseUiState(session.ui_state, session.interpret_path === true));
+    const newState = deriveSessionState(session.answers, INTAKE_QUESTIONS, ui, session.phase);
     await client.query(
       "UPDATE control_plane.intake_sessions SET ui_state = $1, state = $2, updated_at = now() WHERE id = $3",
       [serializeUiState(ui), newState, session.id],
@@ -4530,14 +4604,14 @@ export async function answersForChat(
   db: pg.Pool,
   chatId: string,
 ): Promise<{ answers: AnswerStore; ui: InterviewUiState } | null> {
-  const row = await db.query<{ answers: AnswerStore; ui_state: unknown }>(
-    `SELECT answers, ui_state FROM control_plane.intake_sessions
+  const row = await db.query<{ answers: AnswerStore; ui_state: unknown; interpret_path: boolean | null }>(
+    `SELECT answers, ui_state, interpret_path FROM control_plane.intake_sessions
       WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND expired_at IS NULL`,
     [chatId],
   );
   const [session] = row.rows;
   if (!session) return null;
-  return { answers: session.answers, ui: parseUiState(session.ui_state) };
+  return { answers: session.answers, ui: parseUiState(session.ui_state, session.interpret_path === true) };
 }
 
 /** Marks an entry action as performed, so the router does not repeat it. */
@@ -4710,6 +4784,11 @@ export async function markFlightsAskedForChat(
     ...ui,
     flightsAsked: [...new Set([...(ui.flightsAsked ?? []), ...designators])].slice(-40),
   }));
+}
+
+/** Records that the rental-car question has been put to the organizer, so it is never asked twice. */
+export async function markCarAskedForChat(db: pg.Pool, chatId: string): Promise<void> {
+  await updateUiStateForChat(db, chatId, (ui) => ({ ...ui, carAsked: true }));
 }
 
 /** Records that the "essentials done" choice has been shown, so it is shown once. */
@@ -5032,7 +5111,7 @@ async function submitAnswerVia(
     }
 
     const updatedAnswers = canonicalized({ ...session.answers, [questionId]: validation.answer });
-    const stored = parseUiState(session.ui_state);
+    const stored = parseUiState(session.ui_state, session.interpret_path === true);
     // Ticking keeps the question current; anything else is a finished answer,
     // and a finished answer on the question being ticked ends the ticking.
     // Any answer to a question, a tick included, is the organizer answering it
@@ -5045,7 +5124,7 @@ async function submitAnswerVia(
       : withoutOther.multiPending === undefined
         ? withoutOther
         : (({ multiPending: _drop, ...rest }) => rest)(withoutOther), questionId);
-    const newState = deriveSessionState(updatedAnswers, INTAKE_QUESTIONS, ui);
+    const newState = deriveSessionState(updatedAnswers, INTAKE_QUESTIONS, ui, session.phase);
 
     await client.query(
       "UPDATE control_plane.intake_sessions SET answers = $1, state = $2, ui_state = $3::jsonb, updated_at = now() WHERE id = $4",
@@ -5190,8 +5269,8 @@ export async function applyPendingChangeForChat(
     }
 
     const updatedAnswers = canonicalized({ ...session.answers, ...written });
-    const ui = questionIds.reduce((u, questionId) => withoutSuggestion(u, questionId), parseUiState(session.ui_state));
-    const newState = deriveSessionState(updatedAnswers, INTAKE_QUESTIONS, ui);
+    const ui = questionIds.reduce((u, questionId) => withoutSuggestion(u, questionId), parseUiState(session.ui_state, session.interpret_path === true));
+    const newState = deriveSessionState(updatedAnswers, INTAKE_QUESTIONS, ui, session.phase);
     await client.query(
       "UPDATE control_plane.intake_sessions SET answers = $1, state = $2, ui_state = $3::jsonb, updated_at = now() WHERE id = $4",
       [JSON.stringify(updatedAnswers), newState, serializeUiState(ui), session.id],

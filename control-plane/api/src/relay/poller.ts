@@ -21,6 +21,7 @@
 import type pg from "pg";
 import {
   conflictCallbackData,
+  carShortcutRows,
   cutWhole,
   findQuestion,
   parseCallbackData,
@@ -82,6 +83,7 @@ import {
   reaskLead,
   flightsOwedLead,
   markFlightsAskedForChat,
+  markCarAskedForChat,
   noteTypedFlightsForChat,
   buildRecap,
   selectedOptionIds,
@@ -1458,6 +1460,38 @@ async function applyInterviewCallback(
     }
     await ack();
     await respond(view.view);
+    return;
+  }
+
+  if (parsed.kind === "no_car") {
+    // "No rental car" / "Not booked yet": believed, nothing to file, never asked again. Acted on only while the car
+    // question is what is on screen (or due): a stale button must not mark a question asked that never was.
+    const before = await getSessionForChat(deps.db, decision.chatId);
+    if (!before.ok) {
+      await ack("I couldn't do that — try again.");
+      return;
+    }
+    const language = before.view.language;
+    const live = stripReask(before.view.lastPrompt) === CAR_PROMPT || before.view.carDue === true;
+    if (live) {
+      await markCarAskedForChat(deps.db, decision.chatId);
+      await advancePhaseForChat(deps.db, decision.chatId);
+      log(structuredLog("info", "interview.rental_car_declined", { session_id: decision.sessionId, choice: parsed.choice }));
+    } else {
+      log(structuredLog("info", "interview.rental_car_stale_button", { session_id: decision.sessionId }));
+    }
+    await ack();
+    // Only a tap that did something collapses the keyboard to "chosen": a stale button must not claim it did.
+    if (live && decision.messageId) {
+      await deps.telegram.editMessageText({
+        chatId: decision.chatId,
+        messageId: decision.messageId,
+        text: `${uiString("carOwedLead", language)}\n\n✅ ${uiString(parsed.choice === "none" ? "noRentalCar" : "carNotBookedYet", language)}`,
+        replyMarkup: undefined,
+      });
+    }
+    const settled = await getSessionForChat(deps.db, decision.chatId);
+    await respond({ ...(settled.ok ? settled.view : before.view), awaiting: "machine" });
     return;
   }
 
@@ -3119,6 +3153,12 @@ const REASK_SUFFIX = /:(?:reask:(\d+)|raised)$/;
  */
 export const FLIGHTS_PROMPT = "q:travel_anchors:flights";
 
+/**
+ * The same bookings question, asked BECAUSE the bookings carry no car (`carOwed`). Its own key for the same reason
+ * as `FLIGHTS_PROMPT`: the plain question may already be on screen or answered, and the dedupe would swallow it.
+ */
+export const CAR_PROMPT = "q:travel_anchors:car";
+
 /** A prompt key without its re-ask suffix: the key the question itself would carry. */
 export function stripReask(prompt: string | null | undefined): string {
   return (prompt ?? "").replace(REASK_SUFFIX, "");
@@ -3587,7 +3627,12 @@ async function runInterpretPath(
     const held = recorded ? heldRefLists(recorded.answers) : { stops: [], travellers: [] };
     const result = await interpretBurst(deps.modelRunner, {
       sourceText,
-      outstanding: state.outstanding,
+      // The rental-car question is the bookings question: the reader has to be shown it even when documents have
+      // already filled the bookings, or a typed car would find nowhere to go (`state.outstanding` holds only what
+      // is unanswered). What it proposes is merged into the bookings held, never over them (`applyProposals`).
+      outstanding: onScreen === "travel_anchors" && session.ok && stripReask(session.view.lastPrompt) === CAR_PROMPT
+        ? [...new Set([...state.outstanding, "travel_anchors"])]
+        : state.outstanding,
       language,
       onScreen,
       messageIds,
@@ -3879,6 +3924,14 @@ async function runInterpretPath(
     if (onScreen === "travel_anchors" && session.ok && session.view.lastPrompt === FLIGHTS_PROMPT) {
       await advancePhaseForChat(deps.db, burst.chatId);
     }
+  }
+
+  // THE RENTAL CAR HAS BEEN ANSWERED, whatever the answer was: a booking filed, or words that file nothing ("we
+  // have no car"). Asking is what released the hold (`carAsked`), and the phase only moves when something moves it,
+  // so it is moved here - without this a "no" in words, to an already-answered bookings question, passes nothing
+  // over and nothing advances. Never reopens a summary (`nextPhase`).
+  if (onScreen === "travel_anchors" && session.ok && stripReask(session.view.lastPrompt) === CAR_PROMPT) {
+    await advancePhaseForChat(deps.db, burst.chatId);
   }
 
   // THE SILENCE. A REQUIRED question cannot be skipped, so when the organizer
@@ -5325,11 +5378,19 @@ export async function sendNextStep(
     : [];
   const flightQuestion = owedFlights.length > 0 ? INTAKE_QUESTIONS.find((q) => q.id === "travel_anchors") ?? null : null;
 
-  const offerOutstanding = onInterpretPath && !flightQuestion && boundaryOnScreen(view) !== null;
+  // THE RENTAL CAR comes after the flights and before the summary, through the same bookings question
+  // (`carOwed`). Due only once the optional walk is over or the organizer asked to finish (`view.carDue`), so it
+  // never jumps the offer or the questions they chose to answer. Once: marked asked when delivered, below.
+  const carQuestion = onInterpretPath && !flightQuestion && view.carDue === true
+    ? INTAKE_QUESTIONS.find((q) => q.id === "travel_anchors") ?? null
+    : null;
+
+  const offerOutstanding = onInterpretPath && !flightQuestion && !carQuestion && boundaryOnScreen(view) !== null;
 
   const question =
     view.nextQuestion
     ?? flightQuestion
+    ?? carQuestion
     ?? view.pendingAsk
     ?? (offerOutstanding
       ? null
@@ -5349,7 +5410,7 @@ export async function sendNextStep(
   // loop this branch exists to end.
   const promptKey = offerOutstanding
     ? view.lastPrompt ?? OPTIONAL_OFFER_PROMPT
-    : flightQuestion ? FLIGHTS_PROMPT : routerPromptKey(view, question);
+    : flightQuestion ? FLIGHTS_PROMPT : carQuestion ? CAR_PROMPT : routerPromptKey(view, question);
   // A re-ask of this question (`…:reask:<n>`, `…:raised`) IS this question on
   // screen: compared without its suffix, or a tick would send the plain
   // question straight back on top of the re-ask.
@@ -5542,7 +5603,7 @@ export async function sendNextStep(
     // the summary.
     // Interpret path only: with an interviewer, the agent nominates the optional
     // questions and the boundary message below is still the router's one offer.
-    const announcesOptional = onInterpretPath && !flightQuestion && !question.required && view.state === "interviewing" && !view.nextQuestion
+    const announcesOptional = onInterpretPath && !flightQuestion && !carQuestion && !question.required && view.state === "interviewing" && !view.nextQuestion
       && (view.pendingEntry === "optional" || (view.pendingEntry === null && !view.offeredMore));
     if (announcesOptional) {
       // THE BOUNDARY IS ITS OWN MESSAGE, and it asks nothing yet. Folding it
@@ -5559,8 +5620,11 @@ export async function sendNextStep(
       // `offerOutstanding` above is what keeps it unasked until they choose.
       return sendOptionalOffer(view, chatId, deps);
     }
-    text = flightQuestion ? `${flightsOwedLead(owedFlights, view.language)}\n\n${rendered.text}` : rendered.text;
+    text = flightQuestion ? `${flightsOwedLead(owedFlights, view.language)}\n\n${rendered.text}`
+      : carQuestion ? `${uiString("carOwedLead", view.language)}\n\n${rendered.text}` : rendered.text;
     replyMarkup = rendered.replyMarkup ?? undefined;
+    // The two shortcuts above the bookings question's own "Skip" and "Finished".
+    if (carQuestion) replyMarkup = { inline_keyboard: [...carShortcutRows(view.language), ...(rendered.replyMarkup?.inline_keyboard ?? [])] };
     // The nomination is spent once it has been ASKED - cleared below, after the
     // send, not here: a send Telegram did not take has asked nothing, and the
     // retry has to find the same question to ask (#225 item 9).
@@ -5587,6 +5651,11 @@ export async function sendNextStep(
       session_id: view.sessionId,
       flights: owedFlights,
     }));
+  }
+  if (carQuestion) {
+    // Asked, so never owed again: a booking files itself, and "no" or "not yet" is believed.
+    await markCarAskedForChat(deps.db, chatId);
+    (deps.log ?? (() => {}))(structuredLog("info", "interview.rental_car_asked", { session_id: view.sessionId }));
   }
   if (askedNomination) {
     // Only if it is still THIS nomination: one made while the send was in
